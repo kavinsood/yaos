@@ -6,7 +6,8 @@
  *   - Diff between snapshot and modified doc
  *   - Soft restore (content replace + undelete + blob re-point)
  *
- * Category 2: Live server endpoints (needs SYNC_TOKEN + R2)
+ * Category 2: Live server endpoints (needs a claimed server; snapshot/blob
+ * subtests additionally need R2)
  *   - Auth rejection
  *   - /vault/:vaultId/snapshots, /vault/:vaultId/snapshots/maybe
  *   - Download actual snapshot payload from the Worker
@@ -15,7 +16,8 @@
  * Usage:
  *   node --import jiti/register tests/snapshots.ts
  *
- * Reads server/.env for local defaults when present.
+ * Reads server/.env for local defaults when present, then falls back to
+ * process env.
  * Uses a dedicated test vault ID unless YAOS_TEST_VAULT_ID is provided.
  */
 
@@ -42,7 +44,7 @@ try {
 		}
 	}
 } catch {
-	console.warn("Could not read server/.env — Category 2 tests will be skipped.");
+	console.warn("Could not read server/.env — falling back to process env for live endpoint tests.");
 }
 
 const HOST = process.env.YAOS_TEST_HOST ?? envVars.YAOS_TEST_HOST ?? "http://127.0.0.1:8787";

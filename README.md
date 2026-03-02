@@ -10,6 +10,8 @@ That design choice is the whole point. Git, cloud drives, timer-based sync plugi
 
 For the deeper design rationale and recent hardening work, see **[ENGINEERING.md](ENGINEERING.md)**.
 
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/kavinsood/yaos)
+
 ## Why YAOS exists
 
 Most alternatives solve a different problem:
@@ -40,22 +42,24 @@ It keeps that footprint by externalizing Obsidian and CodeMirror, so the shipped
 
 - Obsidian 1.5.0+
 - A sync server (see [Server setup](#server-setup))
-- For attachment sync / snapshots: R2 bucket configured on the server
+- For attachment sync / snapshots: an R2 bucket bound to the server
 
-## Choose your setup path
+## One-click self-hosting
 
-YAOS currently has two sensible hosting modes:
+The default **Deploy to Cloudflare** button above gives you the fastest supported path:
 
-- **Quickstart**: deploy to PartyKit-managed hosting and get markdown sync working first. This is the fastest path and does not require your own Cloudflare account.
-- **Full self-hosted**: deploy to your own Cloudflare account. This is the better fit if you want attachments, snapshots, a custom domain, or full control over the infrastructure.
+- It deploys the Worker from this repo to your Cloudflare account.
+- The default deploy is **text sync first**. No R2 bucket is required up front.
+- On first visit to the deployed URL, the server starts in **unclaimed** mode and shows a small setup page.
+- That page generates a token in the browser and gives you an `obsidian://yaos?...` setup link you can open on desktop or mobile.
 
-The recommended order is simple: get markdown sync working first, then add R2-powered attachments and snapshots only if you want them.
+Later, if you want attachments and snapshots, add an R2 binding named `YAOS_BUCKET` in the Cloudflare dashboard and redeploy. The same deployed Worker will begin reporting those features as available.
 
 ## Installation
 
 ### Manual install (recommended for personal use)
 
-1. Download `yaos.zip` from the [latest release](https://github.com/kavinsood/do-sync/releases).
+1. Download `yaos.zip` from the [latest release](https://github.com/kavinsood/yaos/releases).
 
 2. Create the plugin folder in your vault:
    ```
@@ -71,8 +75,8 @@ To update: download the latest `yaos.zip` and replace the old plugin files.
 ### Build from source
 
 ```bash
-git clone https://github.com/kavinsood/do-sync.git
-cd do-sync
+git clone https://github.com/kavinsood/yaos.git
+cd yaos
 npm install
 npm run build
 ```
@@ -86,7 +90,7 @@ After enabling, go to **Settings → YAOS**:
 | Setting | Description |
 |---------|-------------|
 | **Server host** | Your server URL (e.g., `https://sync.yourdomain.com`) |
-| **Token** | Shared secret — must match `SYNC_TOKEN` on the server |
+| **Token** | Paste the token from the YAOS setup link (or from a manual `SYNC_TOKEN` override if you use one) |
 | **Vault ID** | Unique ID for this vault (auto-generated if blank). Same ID = same vault across devices. |
 | **Device name** | Shown in remote cursors |
 
@@ -143,16 +147,16 @@ If sync seems stuck after switching networks, use "Reconnect to sync server" fro
 
 ## Server setup
 
-The plugin needs a PartyKit server. See **[server/README.md](server/README.md)** for:
+The plugin needs the YAOS Cloudflare Worker server. See **[server/README.md](server/README.md)** for:
 
 - Local development setup
-- PartyKit-managed quickstart
-- Full self-hosted deploys on your own Cloudflare account
-- R2 setup for attachments and snapshots
-- Secret management and rotation
+- The default Deploy to Cloudflare flow
+- Manual `wrangler` deploys on your own Cloudflare account
+- Post-deploy R2 setup for attachments and snapshots
+- Optional `SYNC_TOKEN` override for local dev or power users
 - Server-side limits and hardening behavior
 
-YAOS is intended to be self-deployed. Your server host, PartyKit service name, custom domain, and R2 bucket name can be whatever you control; the names shown in the docs are examples, not required identifiers.
+YAOS is intended to be self-deployed. Your server host, custom domain, and R2 bucket name can be whatever you control; the names shown in the docs are examples, not required identifiers.
 
 ## How it works
 
@@ -160,7 +164,7 @@ YAOS is intended to be self-deployed. Your server host, PartyKit service name, c
 2. Today, those per-file `Y.Text` values live inside one shared vault-level `Y.Doc`, which keeps collaboration simple and fast for normal-sized note vaults
 3. Local markdown filesystem events are coalesced by path and drained into the CRDT at I/O speed, so bursty create/modify storms do not trigger one import per event
 4. Live editor edits flow through the Yjs binding to that shared document
-5. One vault maps to one PartyKit room backed by a Durable Object, so the shared state survives server restarts
+5. One vault maps to one Durable Object-backed sync room, so the shared state survives server restarts
 6. Offline edits are stored in IndexedDB and sync on reconnect
 7. Attachments sync separately via content-addressed R2 storage instead of being forced through the text CRDT
 8. Daily and on-demand snapshots exist as a safety net, not as the primary sync mechanism
@@ -196,7 +200,7 @@ If you want the detailed architecture and the reasoning behind these tradeoffs, 
 
 **"Unauthorized" errors**: Token mismatch between plugin and server. Check both match exactly.
 
-**"R2 not configured"**: Server doesn't have R2 env vars. See server README for setup.
+**"R2 not configured"**: The server does not have a `YAOS_BUCKET` binding yet. See the server README for setup.
 
 **Sync stops on mobile**: Use "Reconnect to sync server" command. Check you have network connectivity.
 

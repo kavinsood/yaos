@@ -2,6 +2,8 @@
 
 Cloudflare Worker server for the YAOS Obsidian plugin. It relays Yjs CRDT updates through a Durable Object and stores attachments plus snapshots in R2.
 
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/kavinsood/yaos)
+
 ## Architecture
 
 - One vault maps to one Durable Object-backed sync room.
@@ -9,40 +11,62 @@ Cloudflare Worker server for the YAOS Obsidian plugin. It relays Yjs CRDT update
 - Durable Object storage persists the live CRDT snapshot.
 - Attachments are uploaded through the Worker and stored in R2.
 - Snapshots are gzipped CRDT archives stored in R2.
-- Auth is a shared bearer token (`SYNC_TOKEN`).
+- Auth uses the claimed setup token by default, with `SYNC_TOKEN` as an optional hard override.
 
 ## Local development
 
 ```bash
 cd server
-bun install
-bun run dev -- --var SYNC_TOKEN:dev-sync-token
+npm install
+npm run dev -- --var SYNC_TOKEN:dev-sync-token
 ```
 
 The local Worker will be served by Wrangler. Use its printed local URL as the plugin's **Server host**.
 
+Passing `SYNC_TOKEN` locally is optional. If you omit it, the server starts unclaimed and you can claim it in a browser.
+
 ## Deploy to Cloudflare
 
-```bash
-cd server
-bun install
-bunx wrangler secret put SYNC_TOKEN -c ../wrangler.toml
-bun run deploy
-```
+Use the **Deploy to Cloudflare** button above for the default setup.
 
 The repo-root `../wrangler.toml` defines:
 
 - the Worker entrypoint (`server/src/index.ts`)
 - the `VaultSyncServer` Durable Object binding
-- the `YAOS_BUCKET` R2 bucket binding
+- the `ServerConfig` Durable Object binding
 
-Update `bucket_name` in the repo-root `wrangler.toml` before the first deploy if you do not want to use the default `yaos` bucket name.
+The default deploy is text-only:
+
+- no `SYNC_TOKEN` secret is required up front
+- no R2 binding is required up front
+- the first browser visit shows the claim page
+
+That claim page generates a token in the browser and returns an `obsidian://yaos?...` setup link you can use to configure the plugin.
+
+### Manual CLI deploy
+
+```bash
+cd server
+npm install
+npm run deploy
+```
+
+### Optional post-deploy R2 setup
+
+If you want attachments and snapshots later:
+
+1. Create an R2 bucket in the Cloudflare dashboard.
+2. Open your Worker in **Workers & Pages**.
+3. Add an R2 binding named `YAOS_BUCKET`.
+4. Redeploy.
+
+The same Worker will then begin reporting attachments and snapshots as available.
 
 ## Endpoints
 
 ### WebSocket sync
 
-- `wss://<host>/vault/sync/<vaultId>?token=<SYNC_TOKEN>`
+- `wss://<host>/vault/sync/<vaultId>?token=<setup-token>`
 
 ### Blob APIs
 
@@ -61,7 +85,9 @@ Update `bucket_name` in the repo-root `wrangler.toml` before the first deploy if
 
 - `GET /vault/<vaultId>/debug/recent`
 
-All HTTP endpoints require `Authorization: Bearer <SYNC_TOKEN>`.
+All HTTP endpoints require `Authorization: Bearer <setup-token>` once the server has been claimed.
+
+If you set `SYNC_TOKEN`, that environment value becomes the required token instead.
 
 ## Operational safeguards
 
@@ -72,4 +98,4 @@ All HTTP endpoints require `Authorization: Bearer <SYNC_TOKEN>`.
 
 ## Deploy button note
 
-The canonical infrastructure config lives at the repo root in `wrangler.toml`, and the Deploy to Cloudflare button should point at the repo root. If you eventually want the cleanest possible one-click self-hosting UX, splitting the Worker into its own repo is still a reasonable future simplification.
+The canonical infrastructure config lives at the repo root in `wrangler.toml`, and the Deploy to Cloudflare button should point at the repo root.
