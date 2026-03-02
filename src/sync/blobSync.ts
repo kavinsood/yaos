@@ -487,6 +487,11 @@ export class BlobSyncManager {
 		this.uploadDraining = true;
 		try {
 			while (this.uploadQueue.size > 0) {
+				// Intentionally coarse batching:
+				// we prefer predictable, bounded progress over a custom worker-pool
+				// state machine with extra retry/persistence edge cases. One slow
+				// item can delay the next batch, but this shape is easier to reason
+				// about and much harder to deadlock or leak slots.
 				// Take up to maxConcurrency items
 				const batch: UploadItem[] = [];
 				for (const [, item] of this.uploadQueue) {
@@ -643,6 +648,9 @@ export class BlobSyncManager {
 		this.downloadDraining = true;
 		try {
 			while (this.downloadQueue.size > 0) {
+				// Same tradeoff as uploads: keep the scheduler boring and
+				// deterministic. We can revisit this only if real-world attachment
+				// throughput becomes a user-visible problem.
 				const batch: DownloadItem[] = [];
 				for (const [, item] of this.downloadQueue) {
 					batch.push(item);
