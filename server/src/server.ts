@@ -1,15 +1,25 @@
 import * as Y from "yjs";
 import { YServer } from "y-partyserver";
+import { ChunkedDocStore } from "./chunkedDocStore";
 
-const DOCUMENT_KEY = "document";
 const DEBUG_TRACE_RING_KEY = "debugTraceRing";
 const MAX_DEBUG_TRACE_EVENTS = 200;
+const JOURNAL_COMPACT_MAX_ENTRIES = 50;
+const JOURNAL_COMPACT_MAX_BYTES = 1 * 1024 * 1024;
 
 interface ServerTraceEntry {
 	ts: string;
 	event: string;
 	roomId: string;
 	[key: string]: unknown;
+}
+
+function equalBytes(a: Uint8Array, b: Uint8Array): boolean {
+	if (a.byteLength !== b.byteLength) return false;
+	for (let i = 0; i < a.byteLength; i++) {
+		if (a[i] !== b[i]) return false;
+	}
+	return true;
 }
 
 function json(body: unknown, status = 200): Response {
@@ -22,33 +32,34 @@ function json(body: unknown, status = 200): Response {
 	});
 }
 
-function normalizeBytes(data: ArrayBuffer | ArrayBufferView): Uint8Array {
-	if (data instanceof Uint8Array) {
-		return data;
-	}
-	if (ArrayBuffer.isView(data)) {
-		return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-	}
-	return new Uint8Array(data);
-}
-
 export class VaultSyncServer extends YServer {
 	static options = {
 		hibernate: true,
 	};
 
 	private documentLoaded = false;
+	private chunkedDocStore: ChunkedDocStore | null = null;
+	private saveChain: Promise<void> = Promise.resolve();
+	private lastSavedStateVector: Uint8Array | null = null;
 
 	async onLoad(): Promise<void> {
 		await this.ensureDocumentLoaded();
 	}
 
 	async onSave(): Promise<void> {
-		this.documentLoaded = true;
-		await this.ctx.storage.put(
-			DOCUMENT_KEY,
-			Y.encodeStateAsUpdate(this.document),
-		);
+		await this.ensureDocumentLoaded();
+		const baseStateVector = this.lastSavedStateVector;
+		const persistedStateVector = Y.encodeStateVector(this.document);
+		if (baseStateVector && equalBytes(baseStateVector, persistedStateVector)) {
+			return;
+		}
+		const delta = baseStateVector
+			? Y.encodeStateAsUpdate(this.document, baseStateVector)
+			: Y.encodeStateAsUpdate(this.document);
+		if (delta.byteLength === 0) {
+			return;
+		}
+		await this.enqueueSave(delta, persistedStateVector);
 	}
 
 	async fetch(request: Request): Promise<Response> {
@@ -96,15 +107,47 @@ export class VaultSyncServer extends YServer {
 	private async ensureDocumentLoaded(): Promise<void> {
 		if (this.documentLoaded) return;
 
-		const data = await this.ctx.storage.get<Uint8Array | ArrayBuffer>(DOCUMENT_KEY);
-		if (data) {
-			const bytes = normalizeBytes(data);
-			if (bytes.byteLength > 0) {
-				Y.applyUpdate(this.document, bytes);
-			}
+		const state = await this.getChunkedDocStore().loadState();
+		if (state.checkpoint) {
+			Y.applyUpdate(this.document, state.checkpoint);
+		}
+		for (const update of state.journalUpdates) {
+			Y.applyUpdate(this.document, update);
 		}
 
+		this.lastSavedStateVector = (
+			state.checkpointStateVector && state.journalUpdates.length === 0
+		)
+			? state.checkpointStateVector.slice()
+			: Y.encodeStateVector(this.document);
 		this.documentLoaded = true;
+	}
+
+	private getChunkedDocStore(): ChunkedDocStore {
+		if (!this.chunkedDocStore) {
+			this.chunkedDocStore = new ChunkedDocStore(this.ctx.storage);
+		}
+		return this.chunkedDocStore;
+	}
+
+	private enqueueSave(delta: Uint8Array, persistedStateVector: Uint8Array): Promise<void> {
+		const run = this.saveChain.then(async () => {
+			const store = this.getChunkedDocStore();
+			const journalStats = await store.appendUpdate(delta);
+			if (
+				journalStats.entryCount > JOURNAL_COMPACT_MAX_ENTRIES
+				|| journalStats.totalBytes > JOURNAL_COMPACT_MAX_BYTES
+			) {
+				const checkpointUpdate = Y.encodeStateAsUpdate(this.document);
+				const checkpointStateVector = Y.encodeStateVector(this.document);
+				await store.rewriteCheckpoint(checkpointUpdate, checkpointStateVector);
+				this.lastSavedStateVector = checkpointStateVector;
+				return;
+			}
+			this.lastSavedStateVector = persistedStateVector;
+		});
+		this.saveChain = run.catch(() => undefined);
+		return run;
 	}
 
 	private async recordTrace(
