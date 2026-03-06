@@ -1,6 +1,6 @@
 {
 	"name": "yaos",
-	"version": "0.2.0",
+	"version": "1.0.0",
 	"description": "Real-time collaborative Obsidian sync across devices using Yjs CRDTs and Cloudflare Durable Objects.",
 	"main": "main.js",
 	"type": "module",
