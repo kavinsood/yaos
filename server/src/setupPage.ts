@@ -17,10 +17,26 @@ function escapeHtml(value: string): string {
 		.replace(/"/g, "&quot;");
 }
 
+const IS_MARKETPLACE_APPROVED = false;
+const DEPLOY_REPO = "kavinsood/yaos";
+
 export function renderSetupPage(options: SetupPageOptions): string {
 	const safeHost = escapeHtml(options.host);
 	const releaseZipUrl = "https://github.com/kavinsood/yaos/releases/latest/download/yaos.zip";
-	const installGuideUrl = "https://github.com/kavinsood/yaos#installation";
+	const installationStep = IS_MARKETPLACE_APPROVED
+		? `<div class="step">
+              <strong>Step 1: Install YAOS plugin</strong>
+              In Obsidian, open <em>Settings → Community plugins</em>, search for <strong>YAOS</strong>, install it, and make sure it is <strong>enabled</strong>.
+            </div>`
+		: `<div class="step">
+              <strong>Step 1: Install YAOS plugin (beta via BRAT)</strong>
+              <ol>
+                <li>In Obsidian, open <em>Settings → Community plugins</em> and install <strong>BRAT</strong>.</li>
+                <li>Open BRAT settings, select <em>Add beta plugin</em>, then paste <code>${DEPLOY_REPO}</code>.</li>
+                <li>Go back to Community plugins and make sure <strong>YAOS</strong> is installed and <strong>enabled</strong>.</li>
+              </ol>
+              <p class="micro-left">Prefer manual installation? <a href="${releaseZipUrl}">Download the zip here</a>.</p>
+            </div>`;
 	return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -248,6 +264,61 @@ export function renderSetupPage(options: SetupPageOptions): string {
       color: #f4f7fb;
       font-size: 13px;
     }
+    .step ol {
+      margin: 0;
+      padding-left: 18px;
+      color: #d9e6f4;
+      line-height: 1.45;
+    }
+    .step li + li {
+      margin-top: 6px;
+    }
+    .micro-left {
+      margin: 10px 0 0;
+      font-size: 12px;
+      color: #a9c0d8;
+    }
+    .micro-left a {
+      color: #bdeffd;
+    }
+    .ack {
+      border-radius: 14px;
+      padding: 12px 14px;
+      border: 1px solid rgba(161, 205, 255, 0.2);
+      background: rgba(4, 10, 18, 0.45);
+      display: flex;
+      gap: 10px;
+      align-items: flex-start;
+    }
+    .ack input[type="checkbox"] {
+      margin-top: 2px;
+    }
+    .step2 {
+      border-radius: 14px;
+      padding: 12px;
+      border: 1px solid rgba(161, 205, 255, 0.2);
+      background: rgba(4, 10, 18, 0.45);
+      opacity: 1;
+      transition: opacity 120ms ease;
+    }
+    .step2.disabled {
+      opacity: 0.45;
+    }
+    .step2.disabled .cta,
+    .step2.disabled button,
+    .step2.disabled textarea {
+      pointer-events: none;
+    }
+    .warning {
+      margin: 0;
+      border-radius: 12px;
+      padding: 10px 12px;
+      background: rgba(255, 216, 168, 0.12);
+      border: 1px solid rgba(255, 216, 168, 0.35);
+      color: #ffd8a8;
+      font-size: 12px;
+      line-height: 1.4;
+    }
     @media (min-width: 780px) {
       .success-grid {
         grid-template-columns: minmax(0, 1.3fr) minmax(220px, 0.7fr);
@@ -292,43 +363,39 @@ export function renderSetupPage(options: SetupPageOptions): string {
       <div class="success-layout">
         <div class="success-header">
           <div class="success-badge">Server claimed</div>
-          <p><strong>Enjoy.</strong> Your server is now locked in and ready. Open the setup link in Obsidian, or copy it to another device.</p>
+          <p><strong>Keep this page open.</strong> Your server is ready, but Obsidian still needs to be linked.</p>
+          <p class="warning"><strong>⚠️ Save this deep link or token now.</strong> This page will lock permanently when you leave.</p>
         </div>
         <div class="success-grid">
           <div class="stack">
-            <div class="row">
-              <a id="open" class="cta" href="#">Open in Obsidian</a>
-              <button id="mark-ready" class="ghost" type="button">I scanned it</button>
-            </div>
-            <div class="row">
-              <a class="ghost" href="${releaseZipUrl}">Download plugin zip</a>
-              <a class="ghost" href="${installGuideUrl}">How to install</a>
-            </div>
             <div class="steps">
-              <div class="step">
-                <strong>Install YAOS if you have not yet</strong>
-                Download <code>yaos.zip</code>, place <code>main.js</code>, <code>manifest.json</code>, and <code>styles.css</code> in <code>.obsidian/plugins/yaos/</code>, then reload Obsidian.
-              </div>
-              <div class="step">
-                <strong>Connect this device</strong>
-                Use <em>Open in Obsidian</em> to hand the host and token straight to the plugin.
-              </div>
-              <div class="step">
-                <strong>Connect another device</strong>
-                Copy the setup link below into another device and open it there.
-              </div>
+              ${installationStep}
             </div>
-            <label>
-              <span class="hint">Token</span>
-              <textarea id="token" readonly></textarea>
+            <label class="ack">
+              <input id="installed" type="checkbox" />
+              <span>I have installed and <strong>enabled</strong> the YAOS plugin in Obsidian.</span>
             </label>
-            <label>
-              <span class="hint">Obsidian setup link</span>
-              <textarea id="pair" readonly></textarea>
-            </label>
-            <div class="row">
-              <button id="copy-token" class="ghost" type="button">Copy token</button>
-              <button id="copy-link" class="ghost" type="button">Copy link</button>
+            <div id="step2" class="step2 disabled">
+              <div class="step">
+                <strong>Step 2: Connect your vault</strong>
+                Use <em>Auto-configure Obsidian</em> on this device, or scan the QR on another device.
+              </div>
+              <div class="row">
+                <a id="open" class="cta" href="#" aria-disabled="true">Auto-configure Obsidian</a>
+                <button id="mark-ready" class="ghost" type="button">I scanned it</button>
+              </div>
+              <label>
+                <span class="hint">Token</span>
+                <textarea id="token" readonly></textarea>
+              </label>
+              <label>
+                <span class="hint">Obsidian setup link</span>
+                <textarea id="pair" readonly></textarea>
+              </label>
+              <div class="row">
+                <button id="copy-token" class="ghost" type="button">Copy token</button>
+                <button id="copy-link" class="ghost" type="button">Copy link</button>
+              </div>
             </div>
             <div id="done" class="done" aria-live="polite"></div>
           </div>
@@ -352,6 +419,8 @@ export function renderSetupPage(options: SetupPageOptions): string {
     const pairEl = document.getElementById("pair");
     const openEl = document.getElementById("open");
     const markReadyEl = document.getElementById("mark-ready");
+    const installedEl = document.getElementById("installed");
+    const step2El = document.getElementById("step2");
     const copyTokenEl = document.getElementById("copy-token");
     const copyLinkEl = document.getElementById("copy-link");
     const qrEl = document.getElementById("qr");
@@ -393,6 +462,16 @@ export function renderSetupPage(options: SetupPageOptions): string {
       statusEl.textContent = "YAOS is ready. You can close this tab.";
     }
 
+    function setStep2Enabled(enabled) {
+      step2El.classList.toggle("disabled", !enabled);
+      openEl.setAttribute("aria-disabled", String(!enabled));
+      if (!enabled) {
+        openEl.removeAttribute("href");
+      } else if (pairEl.value) {
+        openEl.href = pairEl.value;
+      }
+    }
+
     claimButton.addEventListener("click", async () => {
       claimButton.disabled = true;
       statusEl.textContent = "Claiming server...";
@@ -411,20 +490,24 @@ export function renderSetupPage(options: SetupPageOptions): string {
 
         tokenEl.value = token;
         pairEl.value = data.obsidianUrl || "";
-        openEl.href = data.obsidianUrl || "#";
+        setStep2Enabled(Boolean(installedEl.checked));
         successEl.classList.add("show");
         cardEl.classList.add("claimed");
         claimButton.closest(".hero-actions").style.display = "none";
         renderQr(data.obsidianUrl || "");
-        statusEl.textContent = "Server claimed. Open the link in Obsidian, or scan the QR code on another device.";
+        statusEl.textContent = "Server claimed. Complete Step 1, then continue with Step 2 to link Obsidian.";
       } catch (error) {
         statusEl.textContent = "Claim failed: " + (error && error.message ? error.message : String(error));
         claimButton.disabled = false;
       }
     });
+    installedEl.addEventListener("change", () => {
+      setStep2Enabled(installedEl.checked);
+    });
     copyTokenEl.addEventListener("click", () => copy(tokenEl.value));
     copyLinkEl.addEventListener("click", () => copy(pairEl.value));
     openEl.addEventListener("click", () => {
+      if (!installedEl.checked) return;
       showReadyState("Obsidian should open now. If it did, you can close this tab.");
     });
     markReadyEl.addEventListener("click", () => {
