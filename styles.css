@@ -8,6 +8,198 @@
 }
 
 /*
+ * Settings tab and modal layout
+ */
+
+.yaos-settings-card-row {
+	display: flex;
+	justify-content: space-between;
+	gap: 12px;
+	padding: 8px 0;
+	border-top: 1px solid var(--background-modifier-border);
+}
+
+.yaos-settings-card-label {
+	color: var(--text-muted);
+}
+
+.yaos-settings-card-value {
+	font-weight: 600;
+	text-align: right;
+	word-break: break-word;
+}
+
+.yaos-settings-details {
+	margin-bottom: 16px;
+}
+
+.yaos-settings-details-summary {
+	cursor: pointer;
+	font-weight: 600;
+	margin-bottom: 8px;
+}
+
+.yaos-settings-details-body {
+	margin-top: 8px;
+}
+
+.yaos-modal-copy {
+	margin-bottom: 12px;
+}
+
+.yaos-pair-device-qr-wrap {
+	display: flex;
+	justify-content: center;
+	align-items: center;
+	padding: 12px;
+	margin: 8px 0 12px;
+	background: var(--background-secondary);
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 12px;
+	min-height: 240px;
+}
+
+.yaos-pair-device-loading {
+	color: var(--text-muted);
+}
+
+.yaos-pair-device-qr-canvas {
+	display: block;
+	max-width: 100%;
+	height: auto;
+}
+
+.yaos-settings-modal-textarea {
+	width: 100%;
+	margin-bottom: 8px;
+	box-sizing: border-box;
+}
+
+.yaos-settings-callout {
+	margin-bottom: 12px;
+}
+
+.yaos-settings-setup-callout {
+	margin-bottom: 16px;
+}
+
+.yaos-settings-setup-hint {
+	margin-top: -4px;
+}
+
+.yaos-settings-status-card {
+	margin-bottom: 16px;
+	padding: 14px 16px;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 12px;
+	background: var(--background-secondary);
+}
+
+.yaos-settings-status-line {
+	display: flex;
+	justify-content: space-between;
+	align-items: center;
+	gap: 12px;
+}
+
+.yaos-settings-status-copy {
+	min-width: 0;
+}
+
+.yaos-settings-status-title {
+	font-weight: 700;
+}
+
+.yaos-settings-status-subtitle {
+	color: var(--text-muted);
+	font-size: 12px;
+	margin-top: 2px;
+}
+
+.yaos-settings-status-badge {
+	font-weight: 700;
+	white-space: nowrap;
+}
+
+.yaos-settings-status-badge.is-connected {
+	color: var(--color-green);
+}
+
+.yaos-settings-status-badge.is-busy {
+	color: var(--color-orange);
+}
+
+.yaos-settings-status-badge.is-error {
+	color: var(--text-error);
+}
+
+.yaos-settings-status-badge.is-idle {
+	color: var(--text-muted);
+}
+
+.yaos-settings-status-actions {
+	margin-top: 12px;
+}
+
+.yaos-settings-attachment-note {
+	color: var(--text-muted);
+	font-size: 12px;
+	margin-top: -8px;
+}
+
+.yaos-settings-security-warning {
+	color: var(--text-error);
+	font-size: 12px;
+	margin-top: -8px;
+}
+
+/*
+ * Snapshot modals
+ */
+
+.snapshot-list {
+	margin-top: 8px;
+}
+
+.snapshot-list-item {
+	padding: 8px 0;
+	border-bottom: 1px solid var(--background-modifier-border);
+	cursor: pointer;
+	border-radius: 6px;
+	transition: background-color 120ms ease;
+}
+
+.snapshot-list-item:hover {
+	background-color: var(--background-modifier-hover);
+}
+
+.snapshot-diff-section {
+	margin-top: 16px;
+}
+
+.snapshot-diff-select-all-row {
+	margin-bottom: 4px;
+}
+
+.snapshot-diff-actions {
+	margin-top: 16px;
+}
+
+.snapshot-diff-path-row {
+	padding: 2px 0;
+}
+
+.snapshot-diff-path-label {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+}
+
+.snapshot-diff-path-checkbox {
+	margin: 0;
+}
+
+/*
  * Remote cursor / selection styling (y-codemirror.next)
  *
  * Hidden by default. Shown when body has .vault-crdt-show-cursors

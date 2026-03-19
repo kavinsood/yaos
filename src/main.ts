@@ -3525,6 +3525,7 @@ class SnapshotListModal extends Modal {
 	onOpen() {
 		const { contentEl } = this;
 		contentEl.empty();
+		contentEl.addClass("snapshot-list-modal");
 
 		contentEl.createEl("h3", { text: "Available snapshots" });
 		contentEl.createEl("p", {
@@ -3536,9 +3537,6 @@ class SnapshotListModal extends Modal {
 
 		for (const snap of this.snapshots) {
 			const item = list.createDiv({ cls: "snapshot-list-item" });
-			item.style.padding = "8px 0";
-			item.style.borderBottom = "1px solid var(--background-modifier-border)";
-			item.style.cursor = "pointer";
 
 			const date = new Date(snap.createdAt);
 			const dateStr = date.toLocaleDateString(undefined, {
@@ -3567,14 +3565,6 @@ class SnapshotListModal extends Modal {
 			item.addEventListener("click", () => {
 				this.close();
 				void this.onSelect(snap);
-			});
-
-			// Hover effect
-			item.addEventListener("mouseenter", () => {
-				item.style.backgroundColor = "var(--background-modifier-hover)";
-			});
-			item.addEventListener("mouseleave", () => {
-				item.style.backgroundColor = "";
 			});
 		}
 	}
@@ -3607,6 +3597,7 @@ class SnapshotDiffModal extends Modal {
 	onOpen() {
 		const { contentEl } = this;
 		contentEl.empty();
+		contentEl.addClass("snapshot-diff-modal");
 
 		const date = new Date(this.snapshot.createdAt);
 		const dateStr = date.toLocaleDateString(undefined, {
@@ -3693,8 +3684,7 @@ class SnapshotDiffModal extends Modal {
 		}
 
 		// --- Restore button ---
-		const buttonRow = contentEl.createDiv({ cls: "modal-button-container" });
-		buttonRow.style.marginTop = "16px";
+		const buttonRow = contentEl.createDiv({ cls: "modal-button-container snapshot-diff-actions" });
 
 		buttonRow
 			.createEl("button", { text: "Cancel" })
@@ -3725,12 +3715,11 @@ class SnapshotDiffModal extends Modal {
 		paths: string[],
 		selectedSet: Set<string>,
 	): void {
-		const section = container.createDiv();
+		const section = container.createDiv({ cls: "snapshot-diff-section" });
 		section.createEl("h4", { text: `${title} (${paths.length})` });
 
 		// Select all toggle
-		const toggleRow = section.createDiv();
-		toggleRow.style.marginBottom = "4px";
+		const toggleRow = section.createDiv({ cls: "snapshot-diff-select-all-row" });
 		const selectAll = toggleRow.createEl("a", { text: "Select all", href: "#" });
 		selectAll.addEventListener("click", (e) => {
 			e.preventDefault();
@@ -3742,11 +3731,12 @@ class SnapshotDiffModal extends Modal {
 		});
 
 		for (const path of paths) {
-			const row = section.createDiv();
-			row.style.padding = "2px 0";
-			const label = row.createEl("label");
-			const cb = label.createEl("input", { type: "checkbox" });
-			cb.style.marginRight = "6px";
+			const row = section.createDiv({ cls: "snapshot-diff-path-row" });
+			const label = row.createEl("label", { cls: "snapshot-diff-path-label" });
+			const cb = label.createEl("input", {
+				type: "checkbox",
+				cls: "snapshot-diff-path-checkbox",
+			});
 			label.appendText(path);
 
 			cb.addEventListener("change", () => {
