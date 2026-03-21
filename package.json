@@ -1,6 +1,6 @@
 {
 	"name": "yaos",
-	"version": "1.2.0",
+	"version": "1.2.1",
 	"description": "A zero-terminal, real-time sync engine powered by your own Cloudflare Worker.",
 	"main": "main.js",
 	"type": "module",
