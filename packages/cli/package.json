@@ -13,10 +13,12 @@
   },
   "dependencies": {
     "chokidar": "^4.0.3",
-    "commander": "^14.0.0"
+    "commander": "^14.0.0",
+    "ws": "^8.18.2"
   },
   "devDependencies": {
     "@types/node": "^16.11.6",
+    "@types/ws": "^8.18.0",
     "esbuild": "0.25.5",
     "typescript": "^5.8.3"
   }

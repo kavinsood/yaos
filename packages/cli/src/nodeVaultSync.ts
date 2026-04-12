@@ -1,3 +1,5 @@
+import WebSocket from "ws";
+
 import type { VaultSyncSettings } from "../../../src/settings";
 import {
 	VaultSync,
@@ -24,6 +26,7 @@ export function createNodeVaultSync(
 ): VaultSync {
 	return new VaultSync(toVaultSyncSettings(config), {
 		...options,
+webSocketPolyfill: WebSocket as unknown as typeof globalThis.WebSocket,
 		persistenceFactory: () => createNoopPersistence(),
 		logPersistenceOpenError: false,
 	});

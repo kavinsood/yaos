@@ -48,6 +48,7 @@ export interface VaultSyncOptions {
 	trace?: TraceRecord;
 	persistenceFactory?: VaultSyncPersistenceFactory;
 	logPersistenceOpenError?: boolean;
+	webSocketPolyfill?: typeof WebSocket;
 }
 
 function createIndexedDbPersistence(name: string, doc: Y.Doc): VaultSyncPersistence {
@@ -261,6 +262,7 @@ export class VaultSync {
 			params,
 			connect: true,
 			maxBackoffTime: MAX_BACKOFF_TIME_MS,
+			WebSocketPolyfill: options?.webSocketPolyfill,
 		});
 
 		// Track connection generations for reconnect detection
