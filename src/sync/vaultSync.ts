@@ -1,12 +1,12 @@
 import * as Y from "yjs";
 import YSyncProvider from "y-partyserver/provider";
 import { IndexeddbPersistence } from "y-indexeddb";
-import { normalizePath } from "obsidian";
 import { type FileMeta, type BlobRef, type BlobMeta, type BlobTombstone, ORIGIN_SEED } from "../types";
 import type { VaultSyncSettings } from "../settings";
 import type { TraceHttpContext, TraceRecord } from "../debug/trace";
 import { randomBase64Url } from "../utils/base64url";
 import { formatUnknown } from "../utils/format";
+import { normalizeVaultPath } from "../utils/normalizeVaultPath";
 
 /** Current schema version. Stored in sys.schemaVersion. */
 export const SCHEMA_VERSION = 2;
@@ -27,6 +27,33 @@ const MAX_BACKOFF_TIME_MS = 30_000;
 /** Debounce window for batching rename events (folder renames). */
 const RENAME_BATCH_MS = 50;
 
+/** Persistence adapter contract shared by browser and headless clients. */
+export interface VaultSyncPersistenceDatabase {
+	addEventListener(
+		type: "error",
+		listener: (event: { target: { error?: unknown } | null }) => void,
+	): void;
+}
+
+export interface VaultSyncPersistence {
+	once(event: "synced", listener: () => void): void;
+	destroy(): Promise<void> | void;
+	_db: Promise<VaultSyncPersistenceDatabase>;
+}
+
+export type VaultSyncPersistenceFactory = (name: string, doc: Y.Doc) => VaultSyncPersistence;
+
+export interface VaultSyncOptions {
+	traceContext?: TraceHttpContext;
+	trace?: TraceRecord;
+	persistenceFactory?: VaultSyncPersistenceFactory;
+	logPersistenceOpenError?: boolean;
+}
+
+function createIndexedDbPersistence(name: string, doc: Y.Doc): VaultSyncPersistence {
+	return new IndexeddbPersistence(name, doc) as unknown as VaultSyncPersistence;
+}
+
 /** Reconciliation mode determines what operations are safe. */
 export type ReconcileMode = "conservative" | "authoritative";
 type FatalAuthCode = "unauthorized" | "server_misconfigured" | "unclaimed" | "update_required";
@@ -37,7 +64,6 @@ interface FatalAuthMessage {
 	roomSchemaVersion: number | null;
 	reason: string | null;
 }
-
 const FATAL_AUTH_CODES = new Set<FatalAuthCode>([
 	"unauthorized",
 	"server_misconfigured",
@@ -102,7 +128,7 @@ interface IndexedDbErrorDetails {
 export class VaultSync {
 	readonly ydoc: Y.Doc;
 	readonly provider: YSyncProvider;
-	readonly persistence: IndexeddbPersistence;
+	readonly persistence: VaultSyncPersistence;
 
 	readonly pathToId: Y.Map<string>;
 	readonly idToText: Y.Map<Y.Text>;
@@ -165,10 +191,7 @@ export class VaultSync {
 
 	constructor(
 		settings: VaultSyncSettings,
-		options?: {
-			traceContext?: TraceHttpContext;
-			trace?: TraceRecord;
-		},
+		options?: VaultSyncOptions,
 	) {
 		this.debug = settings.debug;
 		this._device = settings.deviceName || undefined;
@@ -194,19 +217,22 @@ export class VaultSync {
 		this.log(`IndexedDB database: ${idbName}`);
 
 		// Start both persistence and provider in parallel.
-		this.persistence = new IndexeddbPersistence(idbName, this.ydoc);
+		const persistenceFactory = options?.persistenceFactory ?? createIndexedDbPersistence;
+		this.persistence = persistenceFactory(idbName, this.ydoc);
+		const persistenceDb = this.persistence._db;
 
 		// Catch IndexedDB open/write failures (unavailable, quota, permissions).
 		// y-indexeddb's internal _db promise rejects if IDB can't open.
 		// We also listen for unhandled IDB transaction errors.
-		(this.persistence as unknown as { _db: Promise<IDBDatabase> })._db
-			.catch((err: unknown) => {
-				this.captureIndexedDbError(err, "open");
+		persistenceDb.catch((err: unknown) => {
+			this.captureIndexedDbError(err, "open");
+			if (options?.logPersistenceOpenError !== false) {
 				console.error("[yaos] IndexedDB failed to open:", err);
-			});
+			}
+		});
 
-		(this.persistence as unknown as { _db: Promise<IDBDatabase> })._db
-			.then((db: IDBDatabase) => {
+		persistenceDb
+			.then((db) => {
 				db.addEventListener("error", (event) => {
 					const target = event.target as { error?: unknown } | null;
 					this.captureIndexedDbError(
@@ -307,13 +333,12 @@ export class VaultSync {
 			});
 
 			// Also resolve (false) if IDB errors out after we started waiting
-			(this.persistence as unknown as { _db: Promise<IDBDatabase> })._db
-				.catch(() => {
-					clearTimeout(timeout);
-					this.captureIndexedDbError(new Error("IndexedDB failed during waitForLocalPersistence"), "wait");
-					this.log("IndexedDB errored during wait — proceeding without cache");
-					resolve(false);
-				});
+			this.persistence._db.catch(() => {
+				clearTimeout(timeout);
+				this.captureIndexedDbError(new Error("IndexedDB failed during waitForLocalPersistence"), "wait");
+				this.log("IndexedDB errored during wait — proceeding without cache");
+				resolve(false);
+			});
 		});
 	}
 
@@ -426,7 +451,7 @@ export class VaultSync {
 
 	/** Normalize a vault-relative path for consistent CRDT keys. */
 	private normPath(path: string): string {
-		return normalizePath(path);
+		return normalizeVaultPath(path);
 	}
 
 	isFileMetaDeleted(meta: FileMeta | undefined): boolean {
