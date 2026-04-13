@@ -77,15 +77,19 @@ export async function resolveCliConfig(options: CliCommandOptions): Promise<Reso
 	const fileConfig = await readConfigFile(configPath);
 	const envConfig = readEnvConfig(process.env);
 
-	return {
+	const raw = {
 		...DEFAULTS,
 		...fileConfig,
 		...envConfig,
 		...pickDefined(options),
 		configPath,
 	};
-}
 
+	return {
+		...raw,
+		dir: raw.dir ? nodePath.resolve(raw.dir) : raw.dir,
+	};
+}
 export function requireRuntimeConfig(
 	config: ResolvedCliConfig,
 	requirements: { requireDir: boolean },
@@ -194,13 +198,21 @@ function assignNumber<K extends keyof CliFileConfig>(
 	}
 }
 
+const VALID_EXTERNAL_EDIT_POLICIES = ["always", "closed-only", "never"] as const;
+
 function assignExternalEditPolicy(
 	target: CliFileConfig,
 	value: unknown,
 ): void {
-	if (value === "always" || value === "closed-only" || value === "never") {
-		target.externalEditPolicy = value;
+	if (value == null) return;
+	if (typeof value === "string" && VALID_EXTERNAL_EDIT_POLICIES.includes(value as ExternalEditPolicy)) {
+		target.externalEditPolicy = value as ExternalEditPolicy;
+		return;
 	}
+	const display = typeof value === "string" ? `"${value}"` : typeof value;
+	throw new Error(
+		`Invalid externalEditPolicy: ${display}. Must be one of: ${VALID_EXTERNAL_EDIT_POLICIES.join(", ")}`,
+	);
 }
 
 function parseBooleanEnv(value: string | undefined): boolean | undefined {

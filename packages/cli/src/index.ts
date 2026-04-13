@@ -10,7 +10,8 @@ const program = new Command();
 program
 	.name("yaos-cli")
 	.description("Headless YAOS client for filesystem-backed Markdown vaults")
-	.showHelpAfterError();
+	.showHelpAfterError()
+	.exitOverride();
 
 addCommonOptions(
 	program
@@ -61,7 +62,8 @@ addCommonOptions(
 		.description("Show current connection and local-cache status")
 		.action(async (options: CliCommandOptions) => {
 			const resolved = await resolveCliConfig(options);
-			const vaultSync = createNodeVaultSync(resolved);
+			const runtime = requireRuntimeConfig(resolved, { requireDir: false });
+			const vaultSync = createNodeVaultSync(runtime);
 			try {
 				const localLoaded = await vaultSync.waitForLocalPersistence();
 				const providerSynced = await vaultSync.waitForProviderSync();
@@ -86,7 +88,15 @@ addCommonOptions(
 	{ includeDir: false },
 );
 
-void program.parseAsync(process.argv);
+program.parseAsync(process.argv).catch((error: unknown) => {
+	const message = error instanceof Error ? error.message : String(error);
+	// CommanderError carries its own exitCode (0 for --help, 1 for errors).
+	const exitCode = (error as { exitCode?: number })?.exitCode ?? 1;
+	if (exitCode !== 0) {
+		process.stderr.write(`error: ${message}\n`);
+	}
+	process.exit(exitCode);
+});
 
 function addCommonOptions<T extends Command>(
 	command: T,

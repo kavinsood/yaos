@@ -3,5 +3,6 @@ export function normalizeVaultPath(path: string): string {
 		.replace(/\\/g, "/")
 		.replace(/\/{2,}/g, "/")
 		.replace(/^(\.\/)+/, "")
-		.replace(/^\/+/, "");
+		.replace(/^\/+/, "")
+		.replace(/\/+$/, "");
 }

@@ -507,12 +507,18 @@ export class NodeDiskMirror {
 				this.writeQueue.delete(path);
 			}
 
-			await Promise.all(
+			const results = await Promise.allSettled(
 				batch.map((path) => {
 					const force = this.forcedWritePaths.delete(path);
 					return this.flushWrite(path, force);
 				}),
 			);
+			for (let i = 0; i < results.length; i++) {
+				const result = results[i];
+				if (result != null && result.status === "rejected") {
+					console.error(`[yaos-cli] write failed for "${batch[i]}":`, result.reason);
+				}
+			}
 		}
 	}
 
@@ -604,6 +610,9 @@ export class NodeDiskMirror {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
 				this.log(`remote rename fell back to write for "${oldPath}" -> "${newPath}"`);
 			}
+			// Remove the old file to prevent stale content from being
+			// seeded back into the CRDT on the next reconciliation pass.
+			await fs.rm(oldAbsolutePath, { force: true }).catch(() => undefined);
 		}
 		this.queueImmediateWrite(newPath, "remote-rename", true);
 	}
@@ -737,7 +746,13 @@ export class NodeDiskMirror {
 				relativeDir ? `${relativeDir}/${entry.name}` : entry.name,
 			);
 			const absolutePath = this.toAbsolutePath(relativePath);
-			const stats = await fs.lstat(absolutePath);
+			let stats: Stats;
+			try {
+				stats = await fs.lstat(absolutePath);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+				throw error;
+			}
 			if (stats.isDirectory()) {
 				if (isExcluded(`${relativePath}/`, this.options.excludePatterns, this.configDir)) {
 					continue;
@@ -748,7 +763,13 @@ export class NodeDiskMirror {
 			if (!stats.isFile()) continue;
 			if (!this.isMarkdownPathSyncable(relativePath)) continue;
 			presentPaths.add(relativePath);
-			const content = await fs.readFile(absolutePath, "utf8");
+			let content: string;
+			try {
+				content = await fs.readFile(absolutePath, "utf8");
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+				throw error;
+			}
 			if (this.maxFileSize > 0 && content.length > this.maxFileSize) {
 				continue;
 			}

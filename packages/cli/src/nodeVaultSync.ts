@@ -21,7 +21,7 @@ export interface HeadlessStartupResult {
 }
 
 export function createNodeVaultSync(
-	config: ResolvedCliConfig,
+	config: RuntimeCliConfig,
 	options?: Omit<VaultSyncOptions, "persistenceFactory">,
 ): VaultSync {
 	return new VaultSync(toVaultSyncSettings(config), {
@@ -60,6 +60,13 @@ export class HeadlessYaosClient {
 	}
 
 	async startup(options: { watch: boolean }): Promise<HeadlessStartupResult> {
+		if (options.watch) {
+			// Install reconnection handler before any async waits so that
+			// late provider sync events are never missed between timeouts
+			// and handler installation.
+			this.installReconnectionHandler();
+		}
+
 		const localLoaded = await this.vaultSync.waitForLocalPersistence();
 		const providerSynced = await this.vaultSync.waitForProviderSync();
 		if (this.vaultSync.fatalAuthError) {
@@ -67,13 +74,33 @@ export class HeadlessYaosClient {
 		}
 
 		const mode = this.vaultSync.getSafeReconcileMode();
-		const reconcileResult = await this.diskMirror.reconcileFromDisk(mode);
+
+		// Start CRDT observers before reconciliation so that remote edits
+		// arriving while we scan disk are immediately mirrored to disk.
+		// Safe because observers filter out local origins (ORIGIN_SEED).
+		if (options.watch) {
+			this.diskMirror.startMapObservers();
+		}
+
+		this.reconcileInFlight = true;
+		let reconcileResult: ReconcileResult;
+		try {
+			reconcileResult = await this.diskMirror.reconcileFromDisk(mode);
+		} finally {
+			this.reconcileInFlight = false;
+		}
 		this.lastReconciledGeneration = this.vaultSync.connectionGeneration;
 		this.awaitingFirstProviderSyncAfterStartup = !providerSynced;
 
+		// Drain any deferred reconciliation that was requested during startup.
+		if (this.reconcilePending && !this.stopped) {
+			this.reconcilePending = false;
+			if (this.vaultSync.connectionGeneration > this.lastReconciledGeneration) {
+				void this.runReconnectReconciliation(this.vaultSync.connectionGeneration);
+			}
+		}
+
 		if (options.watch) {
-			this.diskMirror.startMapObservers();
-			this.installReconnectionHandler();
 			await this.diskMirror.startWatching();
 		}
 
@@ -150,11 +177,11 @@ export class HeadlessYaosClient {
 	}
 }
 
-function toVaultSyncSettings(config: ResolvedCliConfig): VaultSyncSettings {
+function toVaultSyncSettings(config: RuntimeCliConfig): VaultSyncSettings {
 	return {
-		host: config.host ?? "",
-		token: config.token ?? "",
-		vaultId: config.vaultId ?? "",
+		host: config.host,
+		token: config.token,
+		vaultId: config.vaultId,
 		deviceName: config.deviceName,
 		debug: config.debug,
 		frontmatterGuardEnabled: config.frontmatterGuardEnabled,
