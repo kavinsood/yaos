@@ -191,7 +191,7 @@ export class NodeDiskMirror {
 				stabilityThreshold: WATCHER_STABILITY_MS,
 				pollInterval: WATCHER_POLL_MS,
 			},
-			ignored: (rawPath, stats) => this.shouldIgnoreWatchPath(rawPath, stats ?? null),
+			ignored: [(rawPath, stats) => this.shouldIgnoreWatchPath(rawPath, stats ?? null)],
 		});
 
 		watcher
@@ -765,6 +765,15 @@ export class NodeDiskMirror {
 	private shouldIgnoreNormalizedPath(path: string, stats: Stats | null): boolean {
 		if (stats?.isDirectory()) {
 			return isExcluded(`${path}/`, this.options.excludePatterns, this.configDir);
+		}
+		// When stats are unavailable, only ignore if we can definitively determine
+		// the path is not a syncable markdown file. If there's no extension match
+		// but stats are missing, it might be a directory — don't prune it.
+		if (stats === null) {
+			// Cannot determine if directory; only ignore known non-markdown files
+			// that have an extension (i.e., are definitely files).
+			if (path.includes(".") && !path.endsWith(".md")) return true;
+			return false;
 		}
 		return !this.isMarkdownPathSyncable(path);
 	}
