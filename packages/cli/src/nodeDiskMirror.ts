@@ -603,6 +603,7 @@ export class NodeDiskMirror {
 
 		const oldAbsolutePath = this.toAbsolutePath(oldPath);
 		const newAbsolutePath = this.toAbsolutePath(newPath);
+		let needsWriteFallback = false;
 		try {
 			await fs.mkdir(nodePath.dirname(newAbsolutePath), { recursive: true });
 			await fs.rename(oldAbsolutePath, newAbsolutePath);
@@ -610,11 +611,19 @@ export class NodeDiskMirror {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
 				this.log(`remote rename fell back to write for "${oldPath}" -> "${newPath}"`);
 			}
-			// Remove the old file to prevent stale content from being
-			// seeded back into the CRDT on the next reconciliation pass.
-			await fs.rm(oldAbsolutePath, { force: true }).catch(() => undefined);
+			needsWriteFallback = true;
 		}
-		this.queueImmediateWrite(newPath, "remote-rename", true);
+
+		if (needsWriteFallback) {
+			// Write the new file first, then delete the old file after the
+			// write completes. Deleting before the write risks losing both
+			// files if the write also fails.
+			this.queueImmediateWrite(newPath, "remote-rename", true);
+			await this.kickWriteDrain();
+			await fs.rm(oldAbsolutePath, { force: true }).catch(() => undefined);
+		} else {
+			this.queueImmediateWrite(newPath, "remote-rename", true);
+		}
 	}
 
 	private consumeDeleteSuppression(path: string): boolean {
@@ -787,13 +796,10 @@ export class NodeDiskMirror {
 		if (stats?.isDirectory()) {
 			return isExcluded(`${path}/`, this.options.excludePatterns, this.configDir);
 		}
-		// When stats are unavailable, only ignore if we can definitively determine
-		// the path is not a syncable markdown file. If there's no extension match
-		// but stats are missing, it might be a directory — don't prune it.
 		if (stats === null) {
-			// Cannot determine if directory; only ignore known non-markdown files
-			// that have an extension (i.e., are definitely files).
-			if (path.includes(".") && !path.endsWith(".md")) return true;
+			// No stats available yet — don't prune. Chokidar will re-evaluate
+			// with stats once it has them, so directories like "notes.v2" are
+			// not incorrectly excluded.
 			return false;
 		}
 		return !this.isMarkdownPathSyncable(path);
@@ -812,7 +818,12 @@ export class NodeDiskMirror {
 		const parts = normalizeVaultPath(vaultPath)
 			.split("/")
 			.filter((segment) => segment.length > 0);
-		return nodePath.join(this.rootDir, ...parts);
+		const absolute = nodePath.join(this.rootDir, ...parts);
+		const relative = nodePath.relative(this.rootDir, absolute);
+		if (relative.startsWith("..") || nodePath.isAbsolute(relative)) {
+			throw new Error(`Path traversal rejected: "${vaultPath}" resolves outside vault root`);
+		}
+		return absolute;
 	}
 
 	private async readFileIfExists(absolutePath: string): Promise<string | null> {

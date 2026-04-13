@@ -38,6 +38,7 @@ export class HeadlessYaosClient {
 	private reconcileInFlight = false;
 	private reconcilePending = false;
 	private awaitingFirstProviderSyncAfterStartup = false;
+	private startupInitialized = false;
 	private lastReconciledGeneration = 0;
 	private reconnectionHandlerInstalled = false;
 	private stopped = false;
@@ -91,6 +92,7 @@ export class HeadlessYaosClient {
 		}
 		this.lastReconciledGeneration = this.vaultSync.connectionGeneration;
 		this.awaitingFirstProviderSyncAfterStartup = !providerSynced;
+		this.startupInitialized = true;
 
 		// Drain any deferred reconciliation that was requested during startup.
 		if (this.reconcilePending && !this.stopped) {
@@ -139,6 +141,11 @@ export class HeadlessYaosClient {
 		this.reconnectionHandlerInstalled = true;
 		this.vaultSync.onProviderSync((generation) => {
 			if (this.stopped) return;
+			if (!this.startupInitialized) {
+				// Defer until startup has initialized its state.
+				this.reconcilePending = true;
+				return;
+			}
 			if (this.awaitingFirstProviderSyncAfterStartup) {
 				this.awaitingFirstProviderSyncAfterStartup = false;
 				if (this.reconcileInFlight) {

@@ -87,9 +87,10 @@ export async function resolveCliConfig(options: CliCommandOptions): Promise<Reso
 
 	return {
 		...raw,
-		dir: raw.dir ? nodePath.resolve(raw.dir) : raw.dir,
+		dir: raw.dir ? nodePath.resolve(raw.dir.replace(/^~/, os.homedir())) : raw.dir,
 	};
 }
+
 export function requireRuntimeConfig(
 	config: ResolvedCliConfig,
 	requirements: { requireDir: boolean },
@@ -164,7 +165,9 @@ function readEnvConfig(env: NodeJS.ProcessEnv): CliFileConfig {
 
 function pickDefined<T extends object>(value: T): Partial<T> {
 	return Object.fromEntries(
-		Object.entries(value as Record<string, unknown>).filter(([, entry]) => entry !== undefined),
+		Object.entries(value as Record<string, unknown>).filter(
+			([, entry]) => entry !== undefined && entry !== "",
+		),
 	) as Partial<T>;
 }
 

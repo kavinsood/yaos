@@ -126,11 +126,10 @@ function addCommonOptions<T extends Command>(
 }
 
 function parsePositiveInteger(value: string): number {
-	const parsed = Number.parseInt(value, 10);
-	if (!Number.isFinite(parsed) || parsed <= 0) {
+	if (!/^[1-9]\d*$/.test(value)) {
 		throw new InvalidOptionArgumentError(`Expected a positive integer, received ${value}`);
 	}
-	return parsed;
+	return Number.parseInt(value, 10);
 }
 
 function summarizeConfig(config: ResolvedCliConfig): Record<string, unknown> {

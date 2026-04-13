@@ -25,7 +25,9 @@ export function isExcluded(path: string, patterns: string[], configDir: string):
 		if (normalizedPath.startsWith(prefix)) return true;
 	}
 	for (const prefix of patterns) {
-		if (normalizedPath.startsWith(normalizeVaultPath(prefix))) return true;
+		const normalizedPrefix = normalizeVaultPath(prefix);
+		const matchPrefix = prefix.endsWith("/") ? normalizedPrefix + "/" : normalizedPrefix;
+		if (normalizedPath.startsWith(matchPrefix)) return true;
 	}
 	return false;
 }
