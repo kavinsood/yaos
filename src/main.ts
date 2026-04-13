@@ -394,8 +394,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		}
 
 		// Parse exclude patterns and file size limit from settings
-		this.excludePatterns = parseExcludePatterns(this.settings.excludePatterns);
-		this.maxFileSize = this.settings.maxFileSizeKB * 1024;
+		this.refreshRuntimeSettings();
 
 		this.applyCursorVisibility();
 
@@ -2420,6 +2419,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	 * The actual cursor styles from y-codemirror.next are hidden when the
 	 * class is absent; we add it when showRemoteCursors is true.
 	 */
+	refreshRuntimeSettings(): void {
+		this.excludePatterns = parseExcludePatterns(this.settings.excludePatterns);
+		this.maxFileSize = this.settings.maxFileSizeKB * 1024;
+	}
 	applyCursorVisibility(): void {
 		document.body.toggleClass(
 			"vault-crdt-show-cursors",
