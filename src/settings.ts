@@ -463,7 +463,8 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 						.setValue(this.plugin.settings.excludePatterns)
 						.onChange(async (value) => {
 							this.plugin.settings.excludePatterns = value;
-						await this.plugin.saveSettings();
+							await this.plugin.saveSettings();
+							this.plugin.refreshRuntimeSettings();
 					}),
 			);
 
@@ -479,6 +480,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 						if (!isNaN(n) && n > 0) {
 							this.plugin.settings.maxFileSizeKB = n;
 							await this.plugin.saveSettings();
+							this.plugin.refreshRuntimeSettings();
 						}
 					}),
 			);
