@@ -16,6 +16,7 @@ import type { FileMeta, BlobRef } from "../types";
 import { appendTraceParams, type TraceHttpContext } from "../debug/trace";
 import { obsidianRequest } from "../utils/http";
 import { yTextToString } from "../utils/format";
+import { normalizeVaultPath } from "../utils/normalizeVaultPath";
 
 // -------------------------------------------------------------------
 // Types (mirrors server SnapshotIndex)
@@ -64,13 +65,6 @@ export interface SnapshotDiff {
 	blobsChanged: Array<{ path: string; snapshotHash: string; currentHash: string }>;
 }
 
-function normalizeVaultPath(path: string): string {
-	return path
-		.replace(/\\/g, "/")
-		.replace(/\/{2,}/g, "/")
-		.replace(/^\.\//, "")
-		.replace(/^\/+/, "");
-}
 
 function getStoredSchemaVersion(doc: Y.Doc): number | null {
 	const stored = doc.getMap("sys").get("schemaVersion");
