@@ -17,6 +17,7 @@ class MarkdownIngestHarness {
 		this.markdownDrainPromise = null;
 		this.disk = new Map();
 		this.synced = new Map();
+		this.tombstonedPaths = new Set();
 		this.processCount = 0;
 		this.processedReasons = [];
 		this.onProcessStart = null;
@@ -28,6 +29,10 @@ class MarkdownIngestHarness {
 
 	getSynced(path) {
 		return this.synced.get(path);
+	}
+
+	tombstonePath(path) {
+		this.tombstonedPaths.add(path);
 	}
 
 	async markMarkdownDirty(path, reason) {
@@ -79,6 +84,13 @@ class MarkdownIngestHarness {
 		this.processedReasons.push(reason);
 		if (this.onProcessStart) {
 			await this.onProcessStart(path, reason, this.processCount);
+		}
+		if (this.tombstonedPaths.has(path)) {
+			if (reason === "create") {
+				this.tombstonedPaths.delete(path);
+			} else {
+				return;
+			}
 		}
 		const content = this.disk.get(path);
 		if (typeof content === "string") {
@@ -132,6 +144,25 @@ console.log("\n--- Test: markdown dirty-set coalesces modify bursts under backpr
 		"final synced content matches the latest disk content",
 	);
 	assert(harness.dirtyMarkdownPaths.size === 0, "dirty map empty after drain settles");
+}
+
+console.log("\n--- Test: tombstoned paths revive on create intent (not modify) ---");
+{
+	const harness = new MarkdownIngestHarness();
+	const path = "restore.md";
+
+	harness.setDisk(path, "v1");
+	await harness.markMarkdownDirty(path, "create");
+	assert(harness.getSynced(path) === "v1", "initial create synced");
+
+	harness.tombstonePath(path);
+	harness.setDisk(path, "v2");
+
+	await harness.markMarkdownDirty(path, "modify");
+	assert(harness.getSynced(path) === "v1", "modify event keeps tombstoned path blocked");
+
+	await harness.markMarkdownDirty(path, "create");
+	assert(harness.getSynced(path) === "v2", "create event revives tombstoned path");
 }
 
 console.log("\n──────────────────────────────────────────────────");

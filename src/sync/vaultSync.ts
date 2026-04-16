@@ -871,8 +871,15 @@ export class VaultSync {
 		return randomBase64Url(12);
 	}
 
-	ensureFile(path: string, currentContent: string, device?: string): Y.Text | null {
+	ensureFile(
+		path: string,
+		currentContent: string,
+		device?: string,
+		options?: { reviveTombstone?: boolean; reviveReason?: string },
+	): Y.Text | null {
 		path = this.normPath(path);
+		const reviveTombstone = options?.reviveTombstone === true;
+		const reviveReason = options?.reviveReason ?? "unknown";
 
 		const existingId = this.getFileId(path);
 		if (!existingId) {
@@ -907,13 +914,31 @@ export class VaultSync {
 		// backed by a live pathToId entry handled above.
 		const tombstoneIds = this.getMarkdownTombstoneIds(path);
 		if (tombstoneIds.length > 0) {
-			this.trace?.("sync", "ensureFile-tombstone-blocked", {
-				path,
-				tombstoneIds,
-				device: device ?? null,
-			});
-			this.log(`ensureFile: "${path}" is tombstoned, refusing to create`);
-			return null;
+			if (reviveTombstone) {
+				this.ydoc.transact(() => {
+					for (const tombstoneId of tombstoneIds) {
+						this.meta.delete(tombstoneId);
+					}
+				}, ORIGIN_SEED);
+				this._pathIndexesDirty = true;
+				this.trace?.("sync", "ensureFile-tombstone-revived", {
+					path,
+					tombstoneIds,
+					device: device ?? null,
+					reason: reviveReason,
+				});
+				this.log(
+					`ensureFile: "${path}" revived from tombstone (${tombstoneIds.length}) due to ${reviveReason}`,
+				);
+			} else {
+				this.trace?.("sync", "ensureFile-tombstone-blocked", {
+					path,
+					tombstoneIds,
+					device: device ?? null,
+				});
+				this.log(`ensureFile: "${path}" is tombstoned, refusing to create`);
+				return null;
+			}
 		}
 
 		const fileId = this.generateFileId();

@@ -1882,10 +1882,13 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			}
 		}
 
-		await this.syncFileFromDisk(abstractFile);
+		await this.syncFileFromDisk(abstractFile, reason);
 	}
 
-	private async syncFileFromDisk(file: TFile): Promise<void> {
+	private async syncFileFromDisk(
+		file: TFile,
+		sourceReason: "create" | "modify" = "modify",
+	): Promise<void> {
 		if (!this.vaultSync) return;
 		if (!this.isMarkdownPathSyncable(file.path)) return;
 
@@ -1932,6 +1935,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					content,
 					existingText,
 					openViews,
+					sourceReason,
 				);
 				if (handledBound) {
 					await this.updateDiskIndexForPath(file.path);
@@ -1974,6 +1978,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					file.path,
 					content,
 					this.settings.deviceName,
+					{
+						reviveTombstone: sourceReason === "create",
+						reviveReason: sourceReason === "create" ? "local-create-event" : undefined,
+					},
 				);
 			}
 
@@ -2004,6 +2012,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		content: string,
 		existingText: ReturnType<VaultSync["getTextForPath"]>,
 		openViews: MarkdownView[] = this.getOpenMarkdownViewsForPath(file.path),
+		sourceReason: "create" | "modify" = "modify",
 	): boolean {
 		const now = Date.now();
 		const lockUntil = this.boundRecoveryLocks.get(file.path) ?? 0;
@@ -2110,6 +2119,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					file.path,
 					content,
 					this.settings.deviceName,
+					{
+						reviveTombstone: sourceReason === "create",
+						reviveReason: sourceReason === "create" ? "local-create-event" : undefined,
+					},
 				);
 			}
 			this.boundRecoveryLocks.set(file.path, Date.now() + BOUND_RECOVERY_LOCK_MS);
@@ -2180,6 +2193,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					file.path,
 					content,
 					this.settings.deviceName,
+					{
+						reviveTombstone: sourceReason === "create",
+						reviveReason: sourceReason === "create" ? "local-create-event" : undefined,
+					},
 				);
 			}
 			this.boundRecoveryLocks.set(file.path, Date.now() + BOUND_RECOVERY_LOCK_MS);
