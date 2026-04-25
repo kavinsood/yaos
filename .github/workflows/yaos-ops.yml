@@ -1,0 +1,16 @@
+name: YAOS Server Ops
+on:
+  workflow_dispatch:
+    inputs:
+      action: { type: choice, required: true, default: update, options: [update, revert] }
+      version: { type: string, required: false }
+      release_repo: { type: string, required: false, default: kavinsood/yaos }
+permissions:
+  contents: write
+jobs:
+  run:
+    uses: kavinsood/yaos/.github/workflows/yaos-ops-reusable.yml@main
+    with:
+      action: ${{ github.event.inputs.action }}
+      version: ${{ github.event.inputs.version }}
+      release_repo: ${{ github.event.inputs.release_repo }}
