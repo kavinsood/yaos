@@ -470,6 +470,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						previousContent,
 						nextContent,
 					),
+				(path) => this.isMarkdownPathSyncable(path),
 			);
 			this.diskMirror.startMapObservers();
 

@@ -112,8 +112,32 @@ export class DiskMirror {
 			previousContent: string | null,
 			nextContent: string,
 		) => void,
+		private isMarkdownPathSyncable: (path: string) => boolean = () => true,
 	) {
 		this.debug = debug;
+	}
+
+	private isPathSyncable(path: string): boolean {
+		return this.isMarkdownPathSyncable(normalizePath(path));
+	}
+
+	private clearPendingWrites(path: string): void {
+		const normalized = normalizePath(path);
+		this.pendingOpenWrites.delete(normalized);
+		this.writeQueue.delete(normalized);
+		this.forcedWritePaths.delete(normalized);
+
+		const pending = this.debounceTimers.get(normalized);
+		if (pending) {
+			clearTimeout(pending);
+			this.debounceTimers.delete(normalized);
+		}
+
+		const openPending = this.openWriteTimers.get(normalized);
+		if (openPending) {
+			clearTimeout(openPending);
+			this.openWriteTimers.delete(normalized);
+		}
 	}
 
 	// -------------------------------------------------------------------
@@ -186,7 +210,8 @@ export class DiskMirror {
 				const meta = this.vaultSync.meta.get(fileId);
 				if (!meta || this.vaultSync.isFileMetaDeleted(meta)) continue;
 
-				const path = meta.path;
+				const path = normalizePath(meta.path);
+				if (!this.isPathSyncable(path)) continue;
 
 					// Skip if this path is already open (handled by per-file observer policy)
 					if (this.openPaths.has(path)) continue;
@@ -302,6 +327,11 @@ export class DiskMirror {
 
 	scheduleWrite(path: string): void {
 		path = normalizePath(path);
+		if (!this.isPathSyncable(path)) {
+			this.clearPendingWrites(path);
+			this.log(`scheduleWrite: "${path}" outside sync scope, skipping`);
+			return;
+		}
 		if (this.openPaths.has(path)) {
 			this.scheduleOpenWrite(path);
 			return;
@@ -417,6 +447,11 @@ export class DiskMirror {
 
 	async flushWrite(path: string, force = false): Promise<void> {
 		path = normalizePath(path);
+		if (!this.isPathSyncable(path)) {
+			this.clearPendingWrites(path);
+			this.log(`flushWrite: "${path}" outside sync scope, skipping`);
+			return;
+		}
 		return this.runPathWriteLocked(path, () => this.flushWriteUnlocked(path, force));
 	}
 
@@ -511,24 +546,17 @@ export class DiskMirror {
 
 	private async handleRemoteDelete(path: string): Promise<void> {
 		const normalized = normalizePath(path);
+		if (!this.isPathSyncable(normalized)) {
+			this.clearPendingWrites(normalized);
+			this.log(`handleRemoteDelete: "${normalized}" outside sync scope, skipping`);
+			return;
+		}
 		const wasOpen = this.openPaths.has(normalized);
 		const wasObserved = this.textObservers.has(normalized);
 		const wasSuppressed = this.isSuppressed(normalized);
 		this.unobserveText(normalized);
 		this.openPaths.delete(normalized);
-		this.pendingOpenWrites.delete(normalized);
-		this.writeQueue.delete(normalized);
-		this.forcedWritePaths.delete(normalized);
-		const pending = this.debounceTimers.get(normalized);
-		if (pending) {
-			clearTimeout(pending);
-			this.debounceTimers.delete(normalized);
-		}
-		const openPending = this.openWriteTimers.get(normalized);
-		if (openPending) {
-			clearTimeout(openPending);
-			this.openWriteTimers.delete(normalized);
-		}
+		this.clearPendingWrites(normalized);
 		this.trace?.("disk", "remote-delete", {
 			path,
 			normalizedPath: normalized,
@@ -558,6 +586,12 @@ export class DiskMirror {
 		const oldNormalized = normalizePath(oldPath);
 		const newNormalized = normalizePath(newPath);
 		if (oldNormalized === newNormalized) return;
+		if (!this.isPathSyncable(oldNormalized) || !this.isPathSyncable(newNormalized)) {
+			this.clearPendingWrites(oldNormalized);
+			this.clearPendingWrites(newNormalized);
+			this.log(`handleRemoteRename: "${oldNormalized}" -> "${newNormalized}" outside sync scope, skipping`);
+			return;
+		}
 
 		const wasOpen = this.openPaths.delete(oldNormalized);
 		if (wasOpen) {
