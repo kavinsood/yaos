@@ -645,8 +645,8 @@ export class NodeDiskMirror {
 		const oldAbsolutePath = this.toAbsolutePath(oldPath);
 		const newAbsolutePath = this.toAbsolutePath(newPath);
 		let needsWriteFallback = false;
+		await this.assertSafeParentPath(oldAbsolutePath, oldPath);
 		try {
-			await this.assertSafeParentPath(oldAbsolutePath, oldPath);
 			await ensureDirectoryDurable(nodePath.dirname(newAbsolutePath));
 			await this.assertSafeParentPath(newAbsolutePath, newPath);
 			await renameFileDurable(oldAbsolutePath, newAbsolutePath);
@@ -661,8 +661,7 @@ export class NodeDiskMirror {
 			// Write the new file first, then delete the old file after the
 			// write completes. Deleting before the write risks losing both
 			// files if the write also fails.
-			this.queueImmediateWrite(newPath, "remote-rename", true);
-			await this.kickWriteDrain();
+			await this.flushWrite(newPath, true);
 			await removeFileDurable(oldAbsolutePath).catch(() => undefined);
 		} else {
 			this.queueImmediateWrite(newPath, "remote-rename", true);
@@ -909,22 +908,37 @@ export class NodeDiskMirror {
 	}
 
 	private async assertSafeParentPath(absolutePath: string, vaultPath: string): Promise<void> {
-		let parentRealPath: string;
-		try {
-			parentRealPath = await fs.realpath(nodePath.dirname(absolutePath));
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
-			throw error;
-		}
 		const rootRealPath = await this.getRootRealPath();
+		const parentRealPath = await this.getNearestExistingAncestorRealPath(
+			nodePath.dirname(absolutePath),
+		);
 		const relative = nodePath.relative(rootRealPath, parentRealPath);
 		if (relative.startsWith("..") || nodePath.isAbsolute(relative)) {
 			throw new Error(`Symlink traversal rejected: "${vaultPath}" resolves outside vault root`);
 		}
 	}
 
+	private async getNearestExistingAncestorRealPath(absolutePath: string): Promise<string> {
+		let current = absolutePath;
+		while (true) {
+			try {
+				return await fs.realpath(current);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+					throw error;
+				}
+				const parent = nodePath.dirname(current);
+				if (parent === current) {
+					throw error;
+				}
+				current = parent;
+			}
+		}
+	}
+
 	private async getRootRealPath(): Promise<string> {
 		if (this.rootRealPath == null) {
+			await ensureDirectoryDurable(this.rootDir);
 			this.rootRealPath = await fs.realpath(this.rootDir);
 		}
 		return this.rootRealPath;
