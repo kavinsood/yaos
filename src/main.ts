@@ -1085,9 +1085,17 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				this.log(`importUntracked: "${path}" now in CRDT, skipping`);
 				continue;
 			}
+			if (!this.isMarkdownPathSyncable(path)) {
+				this.log(`importUntracked: "${path}" no longer syncable, skipping`);
+				continue;
+			}
 
 			const file = this.app.vault.getAbstractFileByPath(path);
 			if (!(file instanceof TFile)) continue;
+			if (this.maxFileSize > 0 && file.stat.size > this.maxFileSize) {
+				this.log(`importUntracked: "${path}" now exceeds file-size limit, skipping`);
+				continue;
+			}
 
 			try {
 				const content = await this.app.vault.read(file);
@@ -2414,15 +2422,32 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		}
 	}
 
+	/** Refresh derived runtime filters after persisted settings change. */
+	refreshRuntimeSettings(): void {
+		this.excludePatterns = parseExcludePatterns(this.settings.excludePatterns);
+		this.maxFileSize = this.settings.maxFileSizeKB * 1024;
+		this.refreshUntrackedFileFilters();
+	}
+
+	private refreshUntrackedFileFilters(): void {
+		const before = this.untrackedFiles.length;
+		this.untrackedFiles = this.untrackedFiles.filter((path) => {
+			if (!this.isMarkdownPathSyncable(path)) return false;
+			const file = this.app.vault.getAbstractFileByPath(path);
+			if (!(file instanceof TFile)) return false;
+			return this.maxFileSize <= 0 || file.stat.size <= this.maxFileSize;
+		});
+		const removed = before - this.untrackedFiles.length;
+		if (removed > 0) {
+			this.log(`Filtered ${removed} stale untracked file(s) after settings refresh`);
+		}
+	}
+
 	/**
 	 * Toggle remote cursor visibility via a CSS class on the document body.
 	 * The actual cursor styles from y-codemirror.next are hidden when the
 	 * class is absent; we add it when showRemoteCursors is true.
 	 */
-	refreshRuntimeSettings(): void {
-		this.excludePatterns = parseExcludePatterns(this.settings.excludePatterns);
-		this.maxFileSize = this.settings.maxFileSizeKB * 1024;
-	}
 	applyCursorVisibility(): void {
 		document.body.toggleClass(
 			"vault-crdt-show-cursors",
