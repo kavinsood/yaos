@@ -1,6 +1,7 @@
 import chokidar, { type FSWatcher } from "chokidar";
 import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
+import { ensureDirectoryDurable, writeFileAtomic } from "./fs";
 import type { Dirent, Stats } from "node:fs";
 import * as nodePath from "node:path";
 import * as Y from "yjs";
@@ -536,9 +537,9 @@ export class NodeDiskMirror {
 		if (currentContent === content) return;
 		if (this.shouldBlockFrontmatterWrite(path, currentContent, content)) return;
 
-		await fs.mkdir(nodePath.dirname(absolutePath), { recursive: true });
+		await ensureDirectoryDurable(nodePath.dirname(absolutePath));
 		await this.suppressWrite(path, content);
-		await fs.writeFile(absolutePath, content, "utf8");
+		await writeFileAtomic(absolutePath, content);
 	}
 
 	private shouldBlockFrontmatterWrite(
@@ -605,7 +606,7 @@ export class NodeDiskMirror {
 		const newAbsolutePath = this.toAbsolutePath(newPath);
 		let needsWriteFallback = false;
 		try {
-			await fs.mkdir(nodePath.dirname(newAbsolutePath), { recursive: true });
+			await ensureDirectoryDurable(nodePath.dirname(newAbsolutePath));
 			await fs.rename(oldAbsolutePath, newAbsolutePath);
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
