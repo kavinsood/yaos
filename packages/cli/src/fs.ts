@@ -24,6 +24,9 @@ export async function writeFileAtomic(
 	try {
 		const fh = await fs.open(tmpPath, "wx", mode);
 		try {
+			if (mode !== undefined) {
+				await fh.chmod(mode);
+			}
 			await fh.writeFile(content);
 			await fh.datasync();
 		} finally {
@@ -46,6 +49,21 @@ export async function ensureDirectoryDurable(dir: string): Promise<void> {
 	await syncCreatedDirectoryParents(created, dir);
 }
 
+export async function removeFileDurable(absolutePath: string): Promise<void> {
+	await fs.rm(absolutePath, { force: true });
+	await syncDirectoryIfPresent(nodePath.dirname(absolutePath));
+}
+
+export async function renameFileDurable(oldAbsolutePath: string, newAbsolutePath: string): Promise<void> {
+	await fs.rename(oldAbsolutePath, newAbsolutePath);
+	const oldDir = nodePath.dirname(oldAbsolutePath);
+	const newDir = nodePath.dirname(newAbsolutePath);
+	await syncDirectoryBestEffort(oldDir);
+	if (newDir !== oldDir) {
+		await syncDirectoryBestEffort(newDir);
+	}
+}
+
 async function readExistingMode(absolutePath: string): Promise<number | undefined> {
 	try {
 		const stats = await fs.stat(absolutePath);
@@ -66,6 +84,16 @@ async function syncCreatedDirectoryParents(firstCreated: string, targetDir: stri
 		const nextSegment = target.slice(current.length + 1).split(nodePath.sep)[0];
 		if (!nextSegment) return;
 		current = nodePath.join(current, nextSegment);
+	}
+}
+
+async function syncDirectoryIfPresent(dir: string): Promise<void> {
+	try {
+		await syncDirectoryBestEffort(dir);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+			throw error;
+		}
 	}
 }
 

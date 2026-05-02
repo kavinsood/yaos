@@ -48,6 +48,8 @@ export class HeadlessYaosClient {
 	readonly diskMirror: NodeDiskMirror;
 	private readonly loadedState: LoadedStateUpdate;
 	private lastPersistedState: StatePersistenceMetadata | null = null;
+	private readonly fatalAuthPromise: Promise<HeadlessCliError>;
+	private removeFatalAuthHandler: () => void = () => undefined;
 	private reconcileInFlight = false;
 	private reconcilePending = false;
 	private awaitingFirstProviderSyncAfterStartup = false;
@@ -60,6 +62,14 @@ export class HeadlessYaosClient {
 		this.loadedState = loadStateUpdate(config.dir, { host: config.host, vaultId: config.vaultId });
 		this.vaultSync = createNodeVaultSync(config, {
 			initialStateUpdate: this.loadedState.update,
+		});
+		this.fatalAuthPromise = new Promise((resolve) => {
+			this.removeFatalAuthHandler = this.vaultSync.onFatalAuth(() => {
+				resolve(new HeadlessCliError(
+					formatFatalAuthError(this.vaultSync),
+					this.vaultSync.fatalAuthCode,
+				));
+			});
 		});
 		this.diskMirror = new NodeDiskMirror(this.vaultSync, {
 			rootDir: config.dir,
@@ -110,13 +120,7 @@ export class HeadlessYaosClient {
 		this.awaitingFirstProviderSyncAfterStartup = !providerSynced;
 		this.startupInitialized = true;
 
-		// Drain any deferred reconciliation that was requested during startup.
-		if (this.reconcilePending && !this.stopped) {
-			this.reconcilePending = false;
-			if (this.vaultSync.connectionGeneration > this.lastReconciledGeneration) {
-				void this.runReconnectReconciliation(this.vaultSync.connectionGeneration);
-			}
-		}
+		this.drainPendingReconciliation();
 
 		if (options.watch) {
 			await this.diskMirror.startWatching();
@@ -138,6 +142,7 @@ export class HeadlessYaosClient {
 				await this.persistState();
 			}
 		} finally {
+			this.removeFatalAuthHandler();
 			this.vaultSync.destroy();
 		}
 	}
@@ -167,6 +172,16 @@ export class HeadlessYaosClient {
 			stateVectorHash: this.loadedState.stateVectorHash,
 			lastPersisted: this.lastPersistedState,
 		};
+	}
+
+	waitForFatalAuth(): Promise<HeadlessCliError> {
+		if (this.vaultSync.fatalAuthError) {
+			return Promise.resolve(new HeadlessCliError(
+				formatFatalAuthError(this.vaultSync),
+				this.vaultSync.fatalAuthCode,
+			));
+		}
+		return this.fatalAuthPromise;
 	}
 
 	private async persistState(): Promise<void> {
@@ -224,11 +239,19 @@ export class HeadlessYaosClient {
 			this.awaitingFirstProviderSyncAfterStartup = false;
 		} finally {
 			this.reconcileInFlight = false;
-			if (!this.reconcilePending || this.stopped) return;
-			this.reconcilePending = false;
-			if (this.vaultSync.connectionGeneration > this.lastReconciledGeneration) {
-				void this.runReconnectReconciliation(this.vaultSync.connectionGeneration);
-			}
+			this.drainPendingReconciliation();
+		}
+	}
+
+	private drainPendingReconciliation(): void {
+		if (!this.reconcilePending || this.stopped) return;
+		this.reconcilePending = false;
+		if (this.awaitingFirstProviderSyncAfterStartup) {
+			void this.runReconnectReconciliation(this.vaultSync.connectionGeneration);
+			return;
+		}
+		if (this.vaultSync.connectionGeneration > this.lastReconciledGeneration) {
+			void this.runReconnectReconciliation(this.vaultSync.connectionGeneration);
 		}
 	}
 }

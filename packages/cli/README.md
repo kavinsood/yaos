@@ -21,7 +21,9 @@ yaos-cli status --host <url> --token <token> --vault-id <id>
 - `.yaos-state.bin` — operational Yjs update cache used on the next startup for delta sync.
 - `.yaos-state.json` — human-readable metadata about the last persisted state.
 
-If `.yaos-state.bin` is missing, `yaos-cli sync` must download the current room state before reconciling. Future runs reuse the cache.
+If `.yaos-state.bin` is missing, `yaos-cli sync` warns because it must fetch room state before it can delta-sync.
+If provider sync times out, the CLI continues in conservative mode rather than pretending it has current room state.
+Future runs reuse the cache after a synced state is persisted.
 If the file is corrupt, the CLI fails loudly instead of silently pretending the cache loaded; delete the file only when you intentionally want a full resync.
 
 ## Runtime support constraints

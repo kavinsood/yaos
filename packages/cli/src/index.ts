@@ -163,11 +163,18 @@ function summarizeConfig(config: ResolvedCliConfig): Record<string, unknown> {
 }
 
 async function waitForShutdown(client: HeadlessYaosClient): Promise<void> {
-	await new Promise<void>((resolve, reject) => {
+	let cleanup = () => undefined;
+	let stopping = false;
+	const stopClient = async () => {
+		if (stopping) return;
+		stopping = true;
+		cleanup();
+		await client.stop();
+	};
+	const signalPromise = new Promise<void>((resolve, reject) => {
 		const finish = async () => {
-			cleanup();
 			try {
-				await client.stop();
+				await stopClient();
 				resolve();
 			} catch (error) {
 				reject(error);
@@ -180,7 +187,7 @@ async function waitForShutdown(client: HeadlessYaosClient): Promise<void> {
 		const onSigterm = () => {
 			void finish();
 		};
-		const cleanup = () => {
+		cleanup = () => {
 			process.off("SIGINT", onSigint);
 			process.off("SIGTERM", onSigterm);
 		};
@@ -188,4 +195,11 @@ async function waitForShutdown(client: HeadlessYaosClient): Promise<void> {
 		process.on("SIGINT", onSigint);
 		process.on("SIGTERM", onSigterm);
 	});
+
+	const fatalAuthPromise = client.waitForFatalAuth().then(async (error) => {
+		await stopClient();
+		throw error;
+	});
+
+	await Promise.race([signalPromise, fatalAuthPromise]);
 }

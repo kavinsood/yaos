@@ -161,6 +161,7 @@ export class VaultSync {
 	 */
 	private _connectionGeneration = 0;
 	private _providerSyncWaiters = new Set<(value: boolean) => void>();
+	private _fatalAuthWaiters = new Set<() => void>();
 
 	/**
 	 * True if the server sent an explicit auth error message.
@@ -295,6 +296,9 @@ export class VaultSync {
 			}
 			this.provider.disconnect();
 			this.resolvePendingProviderSyncWaiters(false);
+			if (firstFatal) {
+				this.resolvePendingFatalAuthWaiters();
+			}
 		};
 
 		// y-partyserver emits "__YPS:" control payloads via "custom-message".
@@ -395,6 +399,17 @@ export class VaultSync {
 			this.log(`onProviderSync callback firing (gen=${this._connectionGeneration})`);
 			callback(this._connectionGeneration);
 		});
+	}
+
+	onFatalAuth(callback: () => void): () => void {
+		if (this._fatalAuthError) {
+			queueMicrotask(callback);
+			return () => undefined;
+		}
+		this._fatalAuthWaiters.add(callback);
+		return () => {
+			this._fatalAuthWaiters.delete(callback);
+		};
 	}
 
 	// -------------------------------------------------------------------
@@ -1479,6 +1494,7 @@ export class VaultSync {
 		this.log("Destroying VaultSync");
 		if (this._renameTimer) clearTimeout(this._renameTimer);
 		this.clearPendingRenames();
+		this._fatalAuthWaiters.clear();
 		this.provider.destroy();
 		void this.persistence.destroy();
 		this.ydoc.destroy();
@@ -1559,6 +1575,19 @@ export class VaultSync {
 		for (const waiter of waiters) {
 			try {
 				waiter(value);
+			} catch {
+				// Ignore waiter errors; each promise handles its own lifecycle.
+			}
+		}
+	}
+
+	private resolvePendingFatalAuthWaiters(): void {
+		if (this._fatalAuthWaiters.size === 0) return;
+		const waiters = Array.from(this._fatalAuthWaiters);
+		this._fatalAuthWaiters.clear();
+		for (const waiter of waiters) {
+			try {
+				waiter();
 			} catch {
 				// Ignore waiter errors; each promise handles its own lifecycle.
 			}

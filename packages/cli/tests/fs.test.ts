@@ -57,6 +57,24 @@ test("writeFileAtomic preserves an existing file mode", async () => {
 	}
 });
 
+test("writeFileAtomic preserves an existing file mode under a restrictive umask", async () => {
+	const tempRoot = await mkdtemp(nodePath.join(os.tmpdir(), "yaos-cli-atomic-"));
+	const previousUmask = process.umask(0o077);
+	try {
+		const target = nodePath.join(tempRoot, "shared.md");
+		await writeFile(target, "shared\n", "utf8");
+		await chmod(target, 0o664);
+
+		await writeFileAtomic(target, "updated\n");
+
+		assert.equal(await readFile(target, "utf8"), "updated\n");
+		assert.equal((await stat(target)).mode & 0o777, 0o664);
+	} finally {
+		process.umask(previousUmask);
+		await rm(tempRoot, { recursive: true, force: true });
+	}
+});
+
 async function listTempFiles(dir: string): Promise<string[]> {
 	return (await readdir(dir)).filter((entry) => entry.includes(".tmp"));
 }

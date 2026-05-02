@@ -1,7 +1,7 @@
 import chokidar, { type FSWatcher } from "chokidar";
 import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
-import { ensureDirectoryDurable, writeFileAtomic } from "./fs";
+import { ensureDirectoryDurable, removeFileDurable, renameFileDurable, writeFileAtomic } from "./fs";
 import type { Dirent, Stats } from "node:fs";
 import * as nodePath from "node:path";
 import * as Y from "yjs";
@@ -70,6 +70,16 @@ export interface NodeDiskMirrorDebugSnapshot {
 	suppressedCount: number;
 }
 
+export function splitSafeVaultPathParts(originalPath: string, normalizedPath: string): string[] {
+	const parts = normalizedPath
+		.split("/")
+		.filter((segment) => segment.length > 0);
+	if (parts.some((segment) => segment === "." || segment === "..")) {
+		throw new Error(`Path traversal rejected: "${originalPath}" contains dot segments`);
+	}
+	return parts;
+}
+
 function isLocalOrigin(origin: unknown, provider: unknown): boolean {
 	if (origin === provider) return false;
 	if (typeof origin === "string") return LOCAL_STRING_ORIGINS.has(origin);
@@ -95,6 +105,7 @@ export class NodeDiskMirror {
 	private debounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
 	private writeDrainPromise: Promise<void> | null = null;
 	private pathWriteLocks = new Map<string, Promise<void>>();
+	private rootRealPath: string | null = null;
 
 	constructor(
 		private readonly vaultSync: VaultSync,
@@ -214,16 +225,6 @@ export class NodeDiskMirror {
 	}
 
 	async stop(): Promise<void> {
-		if (this.markdownDrainTimer) {
-			clearTimeout(this.markdownDrainTimer);
-			this.markdownDrainTimer = null;
-		}
-		for (const timer of this.debounceTimers.values()) {
-			clearTimeout(timer);
-		}
-		this.debounceTimers.clear();
-		await this.markdownDrainPromise;
-		await this.writeDrainPromise;
 		if (this.watcher) {
 			await this.watcher.close();
 			this.watcher = null;
@@ -233,12 +234,48 @@ export class NodeDiskMirror {
 			cleanup();
 		}
 		this.mapObserverCleanups = [];
+
+		await this.flushPendingWorkBeforeStop();
+
 		this.dirtyMarkdownPaths.clear();
 		this.deletedMarkdownPaths.clear();
 		this.writeQueue.clear();
 		this.forcedWritePaths.clear();
 		this.suppressedPaths.clear();
 		this.pathWriteLocks.clear();
+	}
+
+	private async flushPendingWorkBeforeStop(): Promise<void> {
+		if (this.markdownDrainTimer) {
+			clearTimeout(this.markdownDrainTimer);
+			this.markdownDrainTimer = null;
+		}
+
+		while (
+			this.markdownDrainPromise
+			|| this.dirtyMarkdownPaths.size > 0
+			|| this.deletedMarkdownPaths.size > 0
+		) {
+			if (this.markdownDrainPromise) {
+				await this.markdownDrainPromise;
+			} else {
+				await this.kickMarkdownDrain();
+			}
+		}
+
+		for (const [path, timer] of this.debounceTimers.entries()) {
+			clearTimeout(timer);
+			this.writeQueue.add(path);
+		}
+		this.debounceTimers.clear();
+
+		while (this.writeDrainPromise || this.writeQueue.size > 0) {
+			if (this.writeDrainPromise) {
+				await this.writeDrainPromise;
+			} else {
+				await this.kickWriteDrain();
+			}
+		}
 	}
 
 	getDebugSnapshot(): NodeDiskMirrorDebugSnapshot {
@@ -398,16 +435,16 @@ export class NodeDiskMirror {
 	private async readDirtyFile(path: string, reason: DirtyReason): Promise<DirtyFile | null> {
 		const absolutePath = this.toAbsolutePath(path);
 		try {
-			const [stats, content] = await Promise.all([
-				fs.stat(absolutePath),
-				fs.readFile(absolutePath, "utf8"),
-			]);
-			if (this.maxFileSize > 0 && content.length > this.maxFileSize) {
+			const stats = await fs.lstat(absolutePath);
+			if (!stats.isFile()) return null;
+			if (this.maxFileSize > 0 && stats.size > this.maxFileSize) {
 				this.log(
-					`syncFileFromDisk: skipping "${path}" (${Math.round(content.length / 1024)} KB exceeds limit)`,
+					`syncFileFromDisk: skipping "${path}" (${Math.round(stats.size / 1024)} KB exceeds limit)`,
 				);
 				return null;
 			}
+			await this.assertSafeParentPath(absolutePath, path);
+			const content = await fs.readFile(absolutePath, "utf8");
 			return { path, reason, content, stats };
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
@@ -533,11 +570,13 @@ export class NodeDiskMirror {
 		if (!ytext) return;
 		const content = ytext.toJSON();
 		const absolutePath = this.toAbsolutePath(path);
+		await this.assertSafeParentPath(absolutePath, path);
 		const currentContent = await this.readFileIfExists(absolutePath);
 		if (currentContent === content) return;
 		if (this.shouldBlockFrontmatterWrite(path, currentContent, content)) return;
 
 		await ensureDirectoryDurable(nodePath.dirname(absolutePath));
+		await this.assertSafeParentPath(absolutePath, path);
 		await this.suppressWrite(path, content);
 		await writeFileAtomic(absolutePath, content);
 	}
@@ -572,7 +611,8 @@ export class NodeDiskMirror {
 		this.suppressDelete(path);
 		const absolutePath = this.toAbsolutePath(path);
 		try {
-			await fs.rm(absolutePath, { force: true });
+			await this.assertSafeParentPath(absolutePath, path);
+			await removeFileDurable(absolutePath);
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
 				console.error(`[yaos-cli] remote delete failed for "${path}":`, error);
@@ -606,8 +646,10 @@ export class NodeDiskMirror {
 		const newAbsolutePath = this.toAbsolutePath(newPath);
 		let needsWriteFallback = false;
 		try {
+			await this.assertSafeParentPath(oldAbsolutePath, oldPath);
 			await ensureDirectoryDurable(nodePath.dirname(newAbsolutePath));
-			await fs.rename(oldAbsolutePath, newAbsolutePath);
+			await this.assertSafeParentPath(newAbsolutePath, newPath);
+			await renameFileDurable(oldAbsolutePath, newAbsolutePath);
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
 				this.log(`remote rename fell back to write for "${oldPath}" -> "${newPath}"`);
@@ -621,7 +663,7 @@ export class NodeDiskMirror {
 			// files if the write also fails.
 			this.queueImmediateWrite(newPath, "remote-rename", true);
 			await this.kickWriteDrain();
-			await fs.rm(oldAbsolutePath, { force: true }).catch(() => undefined);
+			await removeFileDurable(oldAbsolutePath).catch(() => undefined);
 		} else {
 			this.queueImmediateWrite(newPath, "remote-rename", true);
 		}
@@ -780,15 +822,15 @@ export class NodeDiskMirror {
 			if (!stats.isFile()) continue;
 			if (!this.isMarkdownPathSyncable(relativePath)) continue;
 			presentPaths.add(relativePath);
+			if (this.maxFileSize > 0 && stats.size > this.maxFileSize) {
+				continue;
+			}
 			let content: string;
 			try {
 				content = await fs.readFile(absolutePath, "utf8");
 			} catch (error) {
 				if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
 				throw error;
-			}
-			if (this.maxFileSize > 0 && content.length > this.maxFileSize) {
-				continue;
 			}
 			contents.set(relativePath, content);
 		}
@@ -840,9 +882,24 @@ export class NodeDiskMirror {
 	}
 
 	private toAbsoluteRawPath(vaultPath: string): string {
-		const parts = this.normalizePathWithoutUnicode(vaultPath)
-			.split("/")
-			.filter((segment) => segment.length > 0);
+		return this.toAbsolutePathFromParts(vaultPath, this.safeVaultPathParts(
+			vaultPath,
+			this.normalizePathWithoutUnicode(vaultPath),
+		));
+	}
+
+	private toAbsolutePath(vaultPath: string): string {
+		return this.toAbsolutePathFromParts(vaultPath, this.safeVaultPathParts(
+			vaultPath,
+			normalizeVaultPath(vaultPath),
+		));
+	}
+
+	private safeVaultPathParts(originalPath: string, normalizedPath: string): string[] {
+		return splitSafeVaultPathParts(originalPath, normalizedPath);
+	}
+
+	private toAbsolutePathFromParts(vaultPath: string, parts: string[]): string {
 		const absolute = nodePath.join(this.rootDir, ...parts);
 		const relative = nodePath.relative(this.rootDir, absolute);
 		if (relative.startsWith("..") || nodePath.isAbsolute(relative)) {
@@ -851,16 +908,26 @@ export class NodeDiskMirror {
 		return absolute;
 	}
 
-	private toAbsolutePath(vaultPath: string): string {
-		const parts = normalizeVaultPath(vaultPath)
-			.split("/")
-			.filter((segment) => segment.length > 0);
-		const absolute = nodePath.join(this.rootDir, ...parts);
-		const relative = nodePath.relative(this.rootDir, absolute);
-		if (relative.startsWith("..") || nodePath.isAbsolute(relative)) {
-			throw new Error(`Path traversal rejected: "${vaultPath}" resolves outside vault root`);
+	private async assertSafeParentPath(absolutePath: string, vaultPath: string): Promise<void> {
+		let parentRealPath: string;
+		try {
+			parentRealPath = await fs.realpath(nodePath.dirname(absolutePath));
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+			throw error;
 		}
-		return absolute;
+		const rootRealPath = await this.getRootRealPath();
+		const relative = nodePath.relative(rootRealPath, parentRealPath);
+		if (relative.startsWith("..") || nodePath.isAbsolute(relative)) {
+			throw new Error(`Symlink traversal rejected: "${vaultPath}" resolves outside vault root`);
+		}
+	}
+
+	private async getRootRealPath(): Promise<string> {
+		if (this.rootRealPath == null) {
+			this.rootRealPath = await fs.realpath(this.rootDir);
+		}
+		return this.rootRealPath;
 	}
 
 	private async readFileIfExists(absolutePath: string): Promise<string | null> {
