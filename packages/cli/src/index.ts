@@ -41,6 +41,14 @@ addCommonOptions(
 			const resolved = await resolveCliConfig(options);
 			const runtime = requireRuntimeConfig(resolved, { requireDir: true });
 			const client = new HeadlessYaosClient(runtime);
+			const stateStatus = client.getStatePersistenceStatus();
+			if (!stateStatus.loaded) {
+				console.warn(
+					"WARN: No local YAOS state cache found. Downloading full vault history. " +
+					"Future runs will use '.yaos-state.bin' for delta sync. " +
+					"For continuous updates, use 'yaos-cli daemon' to prevent rate-limiting.",
+				);
+			}
 			try {
 				const startup = await client.startup({ watch: false });
 				console.log(JSON.stringify({

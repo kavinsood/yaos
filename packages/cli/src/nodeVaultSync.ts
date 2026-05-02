@@ -1,5 +1,6 @@
 import WebSocket from "ws";
 
+import * as Y from "yjs";
 import type { VaultSyncSettings } from "../../../src/settings";
 import {
 	VaultSync,
@@ -9,9 +10,17 @@ import {
 	type VaultSyncPersistence,
 } from "../../../src/sync/vaultSync";
 import { NodeDiskMirror } from "./nodeDiskMirror";
-import type { ResolvedCliConfig, RuntimeCliConfig } from "./config";
+import type { RuntimeCliConfig } from "./config";
+import {
+	loadStateUpdate,
+	persistStateUpdate,
+	type LoadedStateUpdate,
+	type StatePersistenceMetadata,
+} from "./statePersistence";
 
-const NOOP_INDEXEDDB_ERROR = new Error("IndexedDB is unavailable in the headless Node runtime");
+interface CreateNodeVaultSyncOptions extends Omit<VaultSyncOptions, "persistenceFactory"> {
+	initialStateUpdate?: Uint8Array | null;
+}
 
 export interface HeadlessStartupResult {
 	localLoaded: boolean;
@@ -22,12 +31,13 @@ export interface HeadlessStartupResult {
 
 export function createNodeVaultSync(
 	config: RuntimeCliConfig,
-	options?: Omit<VaultSyncOptions, "persistenceFactory">,
+	options?: CreateNodeVaultSyncOptions,
 ): VaultSync {
+	const { initialStateUpdate, ...vaultSyncOptions } = options ?? {};
 	return new VaultSync(toVaultSyncSettings(config), {
-		...options,
-webSocketPolyfill: WebSocket as unknown as typeof globalThis.WebSocket,
-		persistenceFactory: () => createNoopPersistence(),
+		...vaultSyncOptions,
+		webSocketPolyfill: WebSocket as unknown as typeof globalThis.WebSocket,
+		persistenceFactory: (_name, doc) => createHeadlessPersistence(doc, initialStateUpdate),
 		logPersistenceOpenError: false,
 	});
 }
@@ -35,6 +45,8 @@ webSocketPolyfill: WebSocket as unknown as typeof globalThis.WebSocket,
 export class HeadlessYaosClient {
 	readonly vaultSync: VaultSync;
 	readonly diskMirror: NodeDiskMirror;
+	private readonly loadedState: LoadedStateUpdate;
+	private lastPersistedState: StatePersistenceMetadata | null = null;
 	private reconcileInFlight = false;
 	private reconcilePending = false;
 	private awaitingFirstProviderSyncAfterStartup = false;
@@ -44,7 +56,10 @@ export class HeadlessYaosClient {
 	private stopped = false;
 
 	constructor(private readonly config: RuntimeCliConfig) {
-		this.vaultSync = createNodeVaultSync(config);
+		this.loadedState = loadStateUpdate(config.dir, { host: config.host, vaultId: config.vaultId });
+		this.vaultSync = createNodeVaultSync(config, {
+			initialStateUpdate: this.loadedState.update,
+		});
 		this.diskMirror = new NodeDiskMirror(this.vaultSync, {
 			rootDir: config.dir,
 			deviceName: config.deviceName,
@@ -116,8 +131,14 @@ export class HeadlessYaosClient {
 
 	async stop(): Promise<void> {
 		this.stopped = true;
-		await this.diskMirror.stop();
-		this.vaultSync.destroy();
+		try {
+			await this.diskMirror.stop();
+			if (this.startupInitialized) {
+				await this.persistState();
+			}
+		} finally {
+			this.vaultSync.destroy();
+		}
 	}
 
 	getStatus(): Record<string, unknown> {
@@ -133,7 +154,33 @@ export class HeadlessYaosClient {
 			fatalAuthError: this.vaultSync.fatalAuthError,
 			fatalAuthCode: this.vaultSync.fatalAuthCode,
 			diskMirror: this.diskMirror.getDebugSnapshot(),
+			statePersistence: this.getStatePersistenceStatus(),
 		};
+	}
+
+	getStatePersistenceStatus(): Record<string, unknown> {
+		return {
+			loaded: this.loadedState.loaded,
+			path: this.loadedState.updatePath,
+			byteLength: this.loadedState.byteLength,
+			stateVectorHash: this.loadedState.stateVectorHash,
+			lastPersisted: this.lastPersistedState,
+		};
+	}
+
+	private async persistState(): Promise<void> {
+		if (!this.canPersistState()) return;
+		this.lastPersistedState = await persistStateUpdate(this.config.dir, this.vaultSync.ydoc, {
+			host: this.config.host,
+			vaultId: this.config.vaultId,
+			schemaVersion: this.vaultSync.storedSchemaVersion,
+			activePathCount: this.vaultSync.getActiveMarkdownPaths().length,
+		});
+	}
+
+	private canPersistState(): boolean {
+		if (this.vaultSync.providerSynced) return true;
+		return this.loadedState.loaded && this.vaultSync.isInitialized;
 	}
 
 	private installReconnectionHandler(): void {
@@ -172,6 +219,7 @@ export class HeadlessYaosClient {
 		try {
 			await this.diskMirror.reconcileFromDisk("authoritative");
 			this.lastReconciledGeneration = generation;
+			await this.persistState();
 			this.awaitingFirstProviderSyncAfterStartup = false;
 		} finally {
 			this.reconcileInFlight = false;
@@ -205,17 +253,26 @@ function toVaultSyncSettings(config: RuntimeCliConfig): VaultSyncSettings {
 	};
 }
 
-function createNoopPersistence(): VaultSyncPersistence {
-	const db = Promise.reject(NOOP_INDEXEDDB_ERROR);
-	db.catch(() => undefined);
+function createHeadlessPersistence(
+	doc: Y.Doc,
+	initialStateUpdate: Uint8Array | null | undefined,
+): VaultSyncPersistence {
+	const loaded = initialStateUpdate != null && initialStateUpdate.byteLength > 0;
+	if (loaded) {
+		Y.applyUpdate(doc, initialStateUpdate);
+	}
 	return {
-		once() {
-			// Headless v1 intentionally skips local CRDT persistence.
+		once(_event, listener) {
+			queueMicrotask(listener);
 		},
 		destroy() {
 			return;
 		},
-		_db: db,
+		_db: Promise.resolve({
+			addEventListener() {
+				return;
+			},
+		}),
 	};
 }
 

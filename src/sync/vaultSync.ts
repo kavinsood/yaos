@@ -346,6 +346,10 @@ export class VaultSync {
 
 	waitForProviderSync(): Promise<boolean> {
 		if (this._providerSynced) return Promise.resolve(true);
+		if (this.provider.synced) {
+			this._providerSynced = true;
+			return Promise.resolve(true);
+		}
 		if (this._fatalAuthError) return Promise.resolve(false);
 
 		return new Promise((resolve) => {
