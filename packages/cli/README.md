@@ -14,6 +14,42 @@ yaos-cli status --host <url> --token <token> --vault-id <id>
 - `sync` performs one reconciliation pass and exits.
 - `status` connects to YAOS and prints current connection/cache state as JSON.
 
+## State persistence
+
+`sync` and `daemon` persist local Yjs state in the mirrored vault directory:
+
+- `.yaos-state.bin` — operational Yjs update cache used on the next startup for delta sync.
+- `.yaos-state.json` — human-readable metadata about the last persisted state.
+
+If `.yaos-state.bin` is missing, `yaos-cli sync` must download the current room state before reconciling. Future runs reuse the cache.
+If the file is corrupt, the CLI fails loudly instead of silently pretending the cache loaded; delete the file only when you intentionally want a full resync.
+
+## Runtime support constraints
+
+Supported:
+
+- Linux on a local filesystem.
+- One YAOS headless process per vault directory.
+
+Unsupported:
+
+- NFS, SMB, FUSE, cloud-drive mounts, or other non-local filesystems.
+- Running two `yaos-cli daemon` processes against the same vault directory.
+- Running `yaos-cli daemon` against a directory that an Obsidian YAOS plugin instance is also writing through a shared drive.
+- Attachment/blob sync. The CLI is markdown-only for now.
+- `.obsidian` settings/plugin sync.
+
+These constraints are correctness boundaries, not performance suggestions. Multiple writers against the same filesystem path can generate colliding file IDs and orphan CRDT state.
+
+## systemd restart behavior
+
+If the server reports `update_required`, the CLI exits with status `2`. For systemd services, prevent restart loops with:
+
+```ini
+Restart=always
+RestartPreventExitStatus=2
+```
+
 ## Configuration precedence
 
 1. CLI flags
