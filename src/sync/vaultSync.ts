@@ -1,12 +1,12 @@
 import * as Y from "yjs";
 import YSyncProvider from "y-partyserver/provider";
 import { IndexeddbPersistence } from "y-indexeddb";
-import { normalizePath } from "obsidian";
 import { type FileMeta, type BlobRef, type BlobMeta, type BlobTombstone, ORIGIN_SEED } from "../types";
 import type { VaultSyncSettings } from "../settings";
 import type { TraceHttpContext, TraceRecord } from "../debug/trace";
 import { randomBase64Url } from "../utils/base64url";
 import { formatUnknown } from "../utils/format";
+import { normalizeVaultPath } from "../utils/normalizeVaultPath";
 
 /** Current schema version. Stored in sys.schemaVersion. */
 export const SCHEMA_VERSION = 2;
@@ -27,6 +27,34 @@ const MAX_BACKOFF_TIME_MS = 30_000;
 /** Debounce window for batching rename events (folder renames). */
 const RENAME_BATCH_MS = 50;
 
+/** Persistence adapter contract shared by browser and headless clients. */
+export interface VaultSyncPersistenceDatabase {
+	addEventListener(
+		type: "error",
+		listener: (event: { target: { error?: unknown } | null }) => void,
+	): void;
+}
+
+export interface VaultSyncPersistence {
+	once(event: "synced", listener: () => void): void;
+	destroy(): Promise<void> | void;
+	_db: Promise<VaultSyncPersistenceDatabase>;
+}
+
+export type VaultSyncPersistenceFactory = (name: string, doc: Y.Doc) => VaultSyncPersistence;
+
+export interface VaultSyncOptions {
+	traceContext?: TraceHttpContext;
+	trace?: TraceRecord;
+	persistenceFactory?: VaultSyncPersistenceFactory;
+	logPersistenceOpenError?: boolean;
+	webSocketPolyfill?: typeof WebSocket;
+}
+
+function createIndexedDbPersistence(name: string, doc: Y.Doc): VaultSyncPersistence {
+	return new IndexeddbPersistence(name, doc) as unknown as VaultSyncPersistence;
+}
+
 /** Reconciliation mode determines what operations are safe. */
 export type ReconcileMode = "conservative" | "authoritative";
 type FatalAuthCode = "unauthorized" | "server_misconfigured" | "unclaimed" | "update_required";
@@ -37,7 +65,6 @@ interface FatalAuthMessage {
 	roomSchemaVersion: number | null;
 	reason: string | null;
 }
-
 const FATAL_AUTH_CODES = new Set<FatalAuthCode>([
 	"unauthorized",
 	"server_misconfigured",
@@ -102,7 +129,7 @@ interface IndexedDbErrorDetails {
 export class VaultSync {
 	readonly ydoc: Y.Doc;
 	readonly provider: YSyncProvider;
-	readonly persistence: IndexeddbPersistence;
+	readonly persistence: VaultSyncPersistence;
 
 	readonly pathToId: Y.Map<string>;
 	readonly idToText: Y.Map<Y.Text>;
@@ -134,6 +161,7 @@ export class VaultSync {
 	 */
 	private _connectionGeneration = 0;
 	private _providerSyncWaiters = new Set<(value: boolean) => void>();
+	private _fatalAuthWaiters = new Set<() => void>();
 
 	/**
 	 * True if the server sent an explicit auth error message.
@@ -165,10 +193,7 @@ export class VaultSync {
 
 	constructor(
 		settings: VaultSyncSettings,
-		options?: {
-			traceContext?: TraceHttpContext;
-			trace?: TraceRecord;
-		},
+		options?: VaultSyncOptions,
 	) {
 		this.debug = settings.debug;
 		this._device = settings.deviceName || undefined;
@@ -194,19 +219,22 @@ export class VaultSync {
 		this.log(`IndexedDB database: ${idbName}`);
 
 		// Start both persistence and provider in parallel.
-		this.persistence = new IndexeddbPersistence(idbName, this.ydoc);
+		const persistenceFactory = options?.persistenceFactory ?? createIndexedDbPersistence;
+		this.persistence = persistenceFactory(idbName, this.ydoc);
+		const persistenceDb = this.persistence._db;
 
 		// Catch IndexedDB open/write failures (unavailable, quota, permissions).
 		// y-indexeddb's internal _db promise rejects if IDB can't open.
 		// We also listen for unhandled IDB transaction errors.
-		(this.persistence as unknown as { _db: Promise<IDBDatabase> })._db
-			.catch((err: unknown) => {
-				this.captureIndexedDbError(err, "open");
+		persistenceDb.catch((err: unknown) => {
+			this.captureIndexedDbError(err, "open");
+			if (options?.logPersistenceOpenError !== false) {
 				console.error("[yaos] IndexedDB failed to open:", err);
-			});
+			}
+		});
 
-		(this.persistence as unknown as { _db: Promise<IDBDatabase> })._db
-			.then((db: IDBDatabase) => {
+		persistenceDb
+			.then((db) => {
 				db.addEventListener("error", (event) => {
 					const target = event.target as { error?: unknown } | null;
 					this.captureIndexedDbError(
@@ -235,6 +263,7 @@ export class VaultSync {
 			params,
 			connect: true,
 			maxBackoffTime: MAX_BACKOFF_TIME_MS,
+			WebSocketPolyfill: options?.webSocketPolyfill,
 		});
 
 		// Track connection generations for reconnect detection
@@ -267,6 +296,9 @@ export class VaultSync {
 			}
 			this.provider.disconnect();
 			this.resolvePendingProviderSyncWaiters(false);
+			if (firstFatal) {
+				this.resolvePendingFatalAuthWaiters();
+			}
 		};
 
 		// y-partyserver emits "__YPS:" control payloads via "custom-message".
@@ -307,18 +339,21 @@ export class VaultSync {
 			});
 
 			// Also resolve (false) if IDB errors out after we started waiting
-			(this.persistence as unknown as { _db: Promise<IDBDatabase> })._db
-				.catch(() => {
-					clearTimeout(timeout);
-					this.captureIndexedDbError(new Error("IndexedDB failed during waitForLocalPersistence"), "wait");
-					this.log("IndexedDB errored during wait — proceeding without cache");
-					resolve(false);
-				});
+			this.persistence._db.catch(() => {
+				clearTimeout(timeout);
+				this.captureIndexedDbError(new Error("IndexedDB failed during waitForLocalPersistence"), "wait");
+				this.log("IndexedDB errored during wait — proceeding without cache");
+				resolve(false);
+			});
 		});
 	}
 
 	waitForProviderSync(): Promise<boolean> {
 		if (this._providerSynced) return Promise.resolve(true);
+		if (this.provider.synced) {
+			this._providerSynced = true;
+			return Promise.resolve(true);
+		}
 		if (this._fatalAuthError) return Promise.resolve(false);
 
 		return new Promise((resolve) => {
@@ -364,6 +399,17 @@ export class VaultSync {
 			this.log(`onProviderSync callback firing (gen=${this._connectionGeneration})`);
 			callback(this._connectionGeneration);
 		});
+	}
+
+	onFatalAuth(callback: () => void): () => void {
+		if (this._fatalAuthError) {
+			queueMicrotask(callback);
+			return () => undefined;
+		}
+		this._fatalAuthWaiters.add(callback);
+		return () => {
+			this._fatalAuthWaiters.delete(callback);
+		};
 	}
 
 	// -------------------------------------------------------------------
@@ -426,7 +472,7 @@ export class VaultSync {
 
 	/** Normalize a vault-relative path for consistent CRDT keys. */
 	private normPath(path: string): string {
-		return normalizePath(path);
+		return normalizeVaultPath(path);
 	}
 
 	isFileMetaDeleted(meta: FileMeta | undefined): boolean {
@@ -1448,6 +1494,7 @@ export class VaultSync {
 		this.log("Destroying VaultSync");
 		if (this._renameTimer) clearTimeout(this._renameTimer);
 		this.clearPendingRenames();
+		this._fatalAuthWaiters.clear();
 		this.provider.destroy();
 		void this.persistence.destroy();
 		this.ydoc.destroy();
@@ -1528,6 +1575,19 @@ export class VaultSync {
 		for (const waiter of waiters) {
 			try {
 				waiter(value);
+			} catch {
+				// Ignore waiter errors; each promise handles its own lifecycle.
+			}
+		}
+	}
+
+	private resolvePendingFatalAuthWaiters(): void {
+		if (this._fatalAuthWaiters.size === 0) return;
+		const waiters = Array.from(this._fatalAuthWaiters);
+		this._fatalAuthWaiters.clear();
+		for (const waiter of waiters) {
+			try {
+				waiter();
 			} catch {
 				// Ignore waiter errors; each promise handles its own lifecycle.
 			}
