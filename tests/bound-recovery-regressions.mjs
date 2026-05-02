@@ -105,6 +105,44 @@ console.log("\n--- Test 2: repeated disk-authority recovery does not amplify sta
 	state.doc.destroy();
 }
 
+console.log("\n--- Test 3: post-recovery health retries stay bounded without editor rewrites ---");
+{
+	const crdt = [
+		"---",
+		"timeEstimate: 2",
+		"kind: op",
+		"---",
+		"",
+	].join("\n");
+	const disk = [
+		"---",
+		"timeEstimate: 20",
+		"kind: op",
+		"---",
+		"",
+	].join("\n");
+	const staleEditor = [
+		"---",
+		"timeEstimate: 200",
+		"kind: op",
+		"---",
+		"",
+	].join("\n");
+
+	const state = makeText(crdt);
+	for (let i = 0; i < 5; i++) {
+		const before = state.ytext.toString();
+		applyDiffToYText(state.ytext, before, disk, "disk-sync-recover-bound");
+		// Automatic health retries should be repair/rebind only and therefore
+		// should not write stale editor content back into Y.Text.
+		const afterRecovery = state.ytext.toString();
+		assert(afterRecovery === disk, `recovery cycle ${i + 1} keeps disk authority`);
+		assert(afterRecovery !== staleEditor, `recovery cycle ${i + 1} does not replay stale editor`);
+	}
+	assert(state.ytext.toString().length === disk.length, "repeated recover+health cycles remain bounded");
+	state.doc.destroy();
+}
+
 console.log(`\n${"-".repeat(50)}`);
 console.log(`Results: ${passed} passed, ${failed} failed`);
 console.log(`${"-".repeat(50)}\n`);

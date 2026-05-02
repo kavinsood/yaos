@@ -152,6 +152,8 @@ Access via command palette (Ctrl/Cmd+P):
 
 **"R2 not configured"**: The server doesn't have a `YAOS_BUCKET` binding yet. See the [R2 setup video](https://youtu.be/Z7xCMEYfdFM).
 
+**Cloudflare deploy/dashboard issues**: If build queue or dashboard behavior is flaky, see [server troubleshooting notes](./server/README.md#transient-cloudflare-deployment-issues), including the `wrangler.toml` R2-binding fallback.
+
 **Sync stops on mobile**: Use "Reconnect to sync server" command. Check you have network connectivity.
 
 **Files not syncing**: Check exclude patterns. Files over max size are skipped. Use debug logging to see what's happening, and then raise an issue on GitHub.
@@ -161,3 +163,5 @@ Access via command palette (Ctrl/Cmd+P):
 ## License
 
 [0-BSD](LICENSE)
+
+**Acknowledgements:** The initial landing page design was heavily inspired by and utilizes assets from the excellent folks at [superwhisper](https://superwhisper.com). Huge thanks to their creator for permitting temporary use while we fully redesign. (P.S. They are hiring!).

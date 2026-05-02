@@ -6,6 +6,8 @@ export interface FrontmatterQuarantineEntry {
 	reasons: string[];
 	prevHash?: string;
 	nextHash?: string;
+	lastNoticeAt?: number;
+	lastNotifiedFingerprint?: string;
 	count: number;
 }
 
@@ -46,6 +48,8 @@ export function upsertFrontmatterQuarantineEntry(
 			reasons: normalized.reasons,
 			prevHash: normalized.prevHash,
 			nextHash: normalized.nextHash,
+			lastNoticeAt: normalized.lastNoticeAt ?? existing.lastNoticeAt,
+			lastNotifiedFingerprint: normalized.lastNotifiedFingerprint ?? existing.lastNotifiedFingerprint,
 			count: existing.count + 1,
 		};
 	} else {
@@ -70,8 +74,14 @@ export function buildFrontmatterQuarantineDebugLines(
 	const visibleEntries = entries.slice(0, limit);
 	const lines = [`Frontmatter quarantines: ${entries.length}`];
 	for (const entry of visibleEntries) {
+		const noticeAt = entry.lastNoticeAt
+			? new Date(entry.lastNoticeAt).toISOString()
+			: "never";
+		const noticeFingerprint = entry.lastNotifiedFingerprint
+			? entry.lastNotifiedFingerprint.slice(0, 24)
+			: "none";
 		lines.push(
-			`Frontmatter quarantine: ${entry.path} [${entry.direction}] x${entry.count} ${entry.reasons.join(", ")}`,
+			`Frontmatter quarantine: ${entry.path} [${entry.direction}] x${entry.count} ${entry.reasons.join(", ")} (lastNotice=${noticeAt}, noticeFingerprint=${noticeFingerprint})`,
 		);
 	}
 	return lines;
@@ -102,6 +112,10 @@ function sanitizeEntry(value: unknown): FrontmatterQuarantineEntry | null {
 		reasons,
 		prevHash: typeof candidate.prevHash === "string" ? candidate.prevHash : undefined,
 		nextHash: typeof candidate.nextHash === "string" ? candidate.nextHash : undefined,
+		lastNoticeAt: typeof candidate.lastNoticeAt === "number" ? candidate.lastNoticeAt : undefined,
+		lastNotifiedFingerprint: typeof candidate.lastNotifiedFingerprint === "string"
+			? candidate.lastNotifiedFingerprint
+			: undefined,
 		count: candidate.count,
 	};
 }

@@ -1,0 +1,49 @@
+name: Deploy or sync bug report
+description: Report Cloudflare deploy failures, R2 setup issues, or runtime sync bugs.
+title: "[Bug] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting this. Please include the exact versions/commit below so we can debug quickly.
+
+  - type: input
+    id: yaos_version
+    attributes:
+      label: YAOS plugin version
+      description: From Obsidian → Settings → Community plugins → YAOS.
+      placeholder: "Example: 1.5.1"
+    validations:
+      required: true
+
+  - type: input
+    id: server_commit_sha
+    attributes:
+      label: Server deployment commit SHA
+      description: In Cloudflare Workers & Pages, open the failed deployment and copy the Commit value.
+      placeholder: "Example: a1b2c3d4 (7+ chars is fine)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs or error text
+      description: Paste the key failing lines from Cloudflare build logs or YAOS debug output.
+      placeholder: "Paste logs here"
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: What you did
+      description: Short step list that reproduces the issue.
+      placeholder: |
+        1. Clicked Deploy to Cloudflare
+        2. Build failed at npm clean-install
+        3. Saw ERESOLVE for wrangler/workers-types
+    validations:
+      required: true

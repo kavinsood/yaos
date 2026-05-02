@@ -233,6 +233,8 @@ Minimum accepted patch:
 - after applying disk content to CRDT, do not call content-writing `heal()`
 - either call non-writing `repair()` or rebind
 - schedule a later health check after the editor has observed the CRDT update
+- release gate: no automatic health/audit/recovery path may apply editor buffer
+  content to CRDT after a disk-authority recovery decision
 
 ### 2. Add a regression test for recovery amplification
 

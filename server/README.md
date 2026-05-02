@@ -75,6 +75,36 @@ If you want attachments and snapshots later:
 
 The same Worker will then begin reporting attachments and snapshots as available.
 
+If the Cloudflare dashboard UI is transiently failing when attaching the bucket, use this fallback in your generated deploy repo:
+
+1. Edit `wrangler.toml`.
+2. Add this block (replace bucket name):
+
+```toml
+[[r2_buckets]]
+binding = "YAOS_BUCKET"
+bucket_name = "your-bucket-name"
+```
+
+3. Commit and push. Cloudflare redeploys from that commit.
+
+After deploy, refresh your Worker URL. YAOS should report attachments/snapshots as available.
+
+## Transient Cloudflare deployment issues
+
+Cloudflare can occasionally show temporary dashboard/build instability. Common examples:
+
+- build queue delays, then the deploy eventually succeeds
+- temporary dashboard failure when adding an R2 binding
+
+Recommended workflow:
+
+1. Retry once after a short wait.
+2. If it still fails, use repo-backed fallback paths (like `wrangler.toml` binding edits) and push a new commit.
+3. Capture the failed deployment commit SHA from Cloudflare (**Workers & Pages** → deployment → **Commit**) when opening an issue.
+
+The commit SHA lets us verify the exact server snapshot Cloudflare built, which is critical for debugging intermittent failures.
+
 ## Endpoints
 
 ### WebSocket sync

@@ -502,17 +502,6 @@ export class DiskMirror {
 		);
 		if (!isFrontmatterBlocked(validation)) return false;
 
-		this.trace?.("trace", "frontmatter-quarantined", {
-			path,
-			direction: "crdt-to-disk",
-			reason: "flush-write",
-			risk: validation.risk,
-			reasons: validation.reasons,
-			previousLength: previousContent?.length ?? null,
-			nextLength: nextContent.length,
-			previousFrontmatterLength: validation.previousFrontmatterLength ?? null,
-			nextFrontmatterLength: validation.frontmatterLength,
-		});
 		this.log(
 			`frontmatter write blocked for "${path}" ` +
 			`(${validation.reasons.join(", ") || validation.risk})`,

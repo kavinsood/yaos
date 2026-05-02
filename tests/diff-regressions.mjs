@@ -99,6 +99,47 @@ console.log("\n--- Test 4: line endings and trailing newline changes are preserv
 	doc.destroy();
 }
 
+console.log("\n--- Test 5: inline task priority icon change keeps adjacent line boundary ---");
+{
+	const oldText = "- [ ] 🔺 task item\nnext line\n";
+	const newText = "- [ ] 🔹 task item\nnext line\n";
+	const { value, doc } = applyAndCapture(oldText, newText, "disk-sync-task-priority");
+	assert(value === newText, "priority icon swap keeps newline boundary intact");
+	assert(
+		value.includes("task item\nnext line"),
+		"priority icon swap does not merge task line with the next line",
+	);
+	doc.destroy();
+}
+
+console.log("\n--- Test 6: stale-base disk patch does not duplicate task icons or merge lines ---");
+{
+	const oldText = "- [ ] 🔺 task item\nnext line\n";
+	const remoteText = "- [ ] 🔺 task item\nnext line changed remotely\n";
+	const diskPluginText = "- [ ] 🔹 task item\nnext line\n";
+	const doc = new Y.Doc();
+	const ytext = doc.getText("content");
+	ytext.insert(0, oldText);
+
+	applyDiffToYText(ytext, oldText, remoteText, "remote");
+	applyDiffToYText(ytext, oldText, diskPluginText, "disk-sync");
+
+	const merged = ytext.toString();
+	assert(
+		merged.includes("- [ ] 🔹 task item\n"),
+		"stale-base patch keeps one task line with the updated icon",
+	);
+	assert(
+		merged.includes("next line changed remotely\n"),
+		"stale-base patch preserves remote adjacent-line content",
+	);
+	assert(
+		!merged.includes("🔹🔹"),
+		"stale-base patch does not duplicate inline task icons",
+	);
+	doc.destroy();
+}
+
 console.log(`\n${"─".repeat(50)}`);
 console.log(`Results: ${passed} passed, ${failed} failed`);
 console.log(`${"─".repeat(50)}\n`);

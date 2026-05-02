@@ -186,7 +186,7 @@ export class EditorBindingManager {
 				`bind: repairing unhealthy binding "${file.path}" ` +
 				`(leaf=${leafId}, cm=${cmId}, issues=${reason})`,
 			);
-			if (this.heal(view, deviceName, `bind-health:${reason}`)) {
+			if (this.repair(view, deviceName, `bind-health:${reason}`)) {
 				return;
 			}
 
@@ -795,12 +795,12 @@ export class EditorBindingManager {
 		);
 
 		try {
-			const healed = this.heal(
+			const repaired = this.repair(
 				binding.view,
 				this.lastDeviceName,
 				`${source}:${issues}`,
 			);
-			if (!healed) {
+			if (!repaired) {
 				this.rebind(binding.view, this.lastDeviceName, `${source}:${issues}`);
 			}
 			const latestBinding = this.bindings.get(leafId);
@@ -831,12 +831,12 @@ export class EditorBindingManager {
 					? "unbound-tombstone"
 					: (postHealth?.settling
 						? "settling"
-						: (healed
+						: (repaired
 							? (!latestBinding
 								? "unbound"
 								: (latestBinding.path === binding.path
 									&& latestBinding.fileId === binding.fileId
-									? "heal"
+									? "repair-only"
 									: "rebound-target"))
 							: "rebind")),
 				postIssues: postHealth?.issues ?? [],
