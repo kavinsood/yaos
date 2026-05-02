@@ -752,10 +752,17 @@ export class NodeDiskMirror {
 		}
 
 		for (const entry of entries) {
-			const relativePath = normalizeVaultPath(
+			const rawRelativePath = this.normalizePathWithoutUnicode(
 				relativeDir ? `${relativeDir}/${entry.name}` : entry.name,
 			);
-			const absolutePath = this.toAbsolutePath(relativePath);
+			const relativePath = normalizeVaultPath(rawRelativePath);
+			if (rawRelativePath !== relativePath) {
+				throw new Error(
+					`Non-NFC filesystem path is unsupported by yaos-cli: "${rawRelativePath}". ` +
+					`Rename it to "${relativePath}" before syncing.`,
+				);
+			}
+			const absolutePath = this.toAbsoluteRawPath(rawRelativePath);
 			let stats: Stats;
 			try {
 				stats = await fs.lstat(absolutePath);
@@ -811,8 +818,37 @@ export class NodeDiskMirror {
 	}
 
 	private normalizeEventPath(rawPath: string): string | null {
+		const rawNormalized = this.normalizePathWithoutUnicode(rawPath);
 		const normalized = normalizeVaultPath(rawPath);
+		if (rawNormalized !== normalized) {
+			console.error(
+				`[yaos-cli] ignoring non-NFC filesystem path "${rawNormalized}"; ` +
+				`rename it to "${normalized}" before syncing.`,
+			);
+			return null;
+		}
 		return normalized.length > 0 ? normalized : null;
+	}
+
+	private normalizePathWithoutUnicode(path: string): string {
+		return path
+			.replace(/\\/g, "/")
+			.replace(/\/{2,}/g, "/")
+			.replace(/^(\.\/)+/, "")
+			.replace(/^\/+/, "")
+			.replace(/\/+$/, "");
+	}
+
+	private toAbsoluteRawPath(vaultPath: string): string {
+		const parts = this.normalizePathWithoutUnicode(vaultPath)
+			.split("/")
+			.filter((segment) => segment.length > 0);
+		const absolute = nodePath.join(this.rootDir, ...parts);
+		const relative = nodePath.relative(this.rootDir, absolute);
+		if (relative.startsWith("..") || nodePath.isAbsolute(relative)) {
+			throw new Error(`Path traversal rejected: "${vaultPath}" resolves outside vault root`);
+		}
+		return absolute;
 	}
 
 	private toAbsolutePath(vaultPath: string): string {
