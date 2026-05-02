@@ -1,4 +1,4 @@
-import { type App, arrayBufferToHex, MarkdownView, TFile, normalizePath } from "obsidian";
+import { type App, MarkdownView, TFile } from "obsidian";
 import * as Y from "yjs";
 import type { VaultSync } from "./vaultSync";
 import type { EditorBindingManager } from "./editorBinding";
@@ -11,6 +11,7 @@ import {
 	validateFrontmatterTransition,
 	type FrontmatterValidationResult,
 } from "./frontmatterGuard";
+import { VaultFsError, type VaultFs } from "./vaultFs";
 
 /**
  * Handles writeback from Y.Text -> disk with:
@@ -64,6 +65,12 @@ function describeOrigin(origin: unknown, provider: unknown): string {
 	return formatUnknown(origin);
 }
 
+function bufferToHex(buffer: ArrayBuffer): string {
+	return Array.from(new Uint8Array(buffer))
+		.map((byte) => byte.toString(16).padStart(2, "0"))
+		.join("");
+}
+
 interface SuppressionEntry {
 	kind: "write" | "delete";
 	expiresAt: number;
@@ -92,6 +99,7 @@ export class DiskMirror {
 		string,
 		{ ytext: import("yjs").Text; handler: (event: import("yjs").YTextEvent, txn: import("yjs").Transaction) => void }
 	>();
+	private fallbackTexts = new Map<string, Y.Text>();
 
 	private mapObserverCleanups: (() => void)[] = [];
 
@@ -99,6 +107,7 @@ export class DiskMirror {
 
 	constructor(
 		private app: App,
+		private vaultFs: VaultFs,
 		private vaultSync: VaultSync,
 		private editorBindings: EditorBindingManager,
 		debug: boolean,
@@ -128,8 +137,8 @@ export class DiskMirror {
 			event.changes.keys.forEach((change, fileId) => {
 				const oldMeta = change.oldValue as import("../types").FileMeta | undefined;
 				const newMeta = this.vaultSync.meta.get(fileId);
-				const oldPath = typeof oldMeta?.path === "string" ? normalizePath(oldMeta.path) : null;
-				const newPath = typeof newMeta?.path === "string" ? normalizePath(newMeta.path) : null;
+				const oldPath = typeof oldMeta?.path === "string" ? this.vaultFs.normalize(oldMeta.path) : null;
+				const newPath = typeof newMeta?.path === "string" ? this.vaultFs.normalize(newMeta.path) : null;
 				const wasDeleted = this.vaultSync.isFileMetaDeleted(oldMeta);
 				const isDeleted = this.vaultSync.isFileMetaDeleted(newMeta);
 
@@ -177,6 +186,7 @@ export class DiskMirror {
 
 			for (const [changedType] of txn.changed) {
 				if (!(changedType instanceof Y.Text)) continue;
+				if (this.isObservedYText(changedType)) continue;
 
 				// Reverse lookup: find the fileId that owns this Y.Text
 				const fileId = this.findFileIdForText(changedType);
@@ -186,7 +196,7 @@ export class DiskMirror {
 				const meta = this.vaultSync.meta.get(fileId);
 				if (!meta || this.vaultSync.isFileMetaDeleted(meta)) continue;
 
-				const path = meta.path;
+				const path = this.vaultFs.normalize(meta.path);
 
 					// Skip if this path is already open (handled by per-file observer policy)
 					if (this.openPaths.has(path)) continue;
@@ -224,7 +234,7 @@ export class DiskMirror {
 	// -------------------------------------------------------------------
 
 	notifyFileOpened(path: string): void {
-		path = normalizePath(path);
+		path = this.vaultFs.normalize(path);
 		this.trace?.("disk", "notifyFileOpened", { path });
 		this.openPaths.add(path);
 		if (this.writeQueue.delete(path)) {
@@ -242,7 +252,7 @@ export class DiskMirror {
 	}
 
 	notifyFileClosed(path: string): void {
-		path = normalizePath(path);
+		path = this.vaultFs.normalize(path);
 		this.trace?.("disk", "notifyFileClosed", { path });
 		this.openPaths.delete(path);
 		// Flush any pending debounce for this path
@@ -267,7 +277,7 @@ export class DiskMirror {
 	private observeText(path: string): void {
 		if (this.textObservers.has(path)) return;
 
-		const ytext = this.vaultSync.getTextForPath(path);
+		const ytext = this.getTextForWrite(path);
 		if (!ytext) return;
 
 		const handler = (_event: import("yjs").YTextEvent, txn: import("yjs").Transaction) => {
@@ -289,6 +299,7 @@ export class DiskMirror {
 			this.textObservers.delete(path);
 			this.log(`unobserveText: stopped watching "${path}"`);
 		}
+		this.fallbackTexts.delete(path);
 	}
 
 	/** Set of currently observed paths (for external cleanup). */
@@ -301,7 +312,7 @@ export class DiskMirror {
 	// -------------------------------------------------------------------
 
 	scheduleWrite(path: string): void {
-		path = normalizePath(path);
+		path = this.vaultFs.normalize(path);
 		if (this.openPaths.has(path)) {
 			this.scheduleOpenWrite(path);
 			return;
@@ -340,7 +351,7 @@ export class DiskMirror {
 					this.openWriteTimers.delete(path);
 					if (!this.pendingOpenWrites.has(path)) return;
 
-					const ytext = this.vaultSync.getTextForPath(path);
+					const ytext = this.getTextForWrite(path);
 					const crdtContent = yTextToString(ytext);
 					if (
 						this.isActivelyViewedPath(path)
@@ -416,12 +427,12 @@ export class DiskMirror {
 	// -------------------------------------------------------------------
 
 	async flushWrite(path: string, force = false): Promise<void> {
-		path = normalizePath(path);
+		path = this.vaultFs.normalize(path);
 		return this.runPathWriteLocked(path, () => this.flushWriteUnlocked(path, force));
 	}
 
 	private async flushWriteUnlocked(path: string, force: boolean): Promise<void> {
-		const ytext = this.vaultSync.getTextForPath(path);
+		const ytext = this.getTextForWrite(path);
 		if (!ytext) {
 			this.log(`flushWrite: no Y.Text for "${path}", skipping`);
 			return;
@@ -444,12 +455,9 @@ export class DiskMirror {
 			}
 		}
 
-		const normalized = normalizePath(path);
-
 		try {
-			const existing = this.app.vault.getAbstractFileByPath(normalized);
-			if (existing instanceof TFile) {
-				const currentContent = await this.app.vault.read(existing);
+			const currentContent = await this.vaultFs.readText(path);
+			if (currentContent !== null) {
 				if (currentContent === content) {
 					this.log(`flushWrite: "${path}" unchanged, skipping`);
 					return;
@@ -459,22 +467,14 @@ export class DiskMirror {
 				}
 
 				await this.suppressWrite(path, content);
-				await this.app.vault.modify(existing, content);
+				await this.vaultFs.writeText(path, content);
 				this.log(`flushWrite: updated "${path}" (${content.length} chars)`);
 			} else {
 				if (this.shouldBlockFrontmatterWrite(path, null, content)) {
 					return;
 				}
 				await this.suppressWrite(path, content);
-				const dir = normalized.substring(0, normalized.lastIndexOf("/"));
-				if (dir) {
-					const dirExists =
-						this.app.vault.getAbstractFileByPath(normalizePath(dir));
-					if (!dirExists) {
-						await this.app.vault.createFolder(dir);
-					}
-				}
-				await this.app.vault.create(normalized, content);
+				await this.vaultFs.writeText(path, content);
 				this.log(
 					`flushWrite: created "${path}" on disk (${content.length} chars)`,
 				);
@@ -510,7 +510,7 @@ export class DiskMirror {
 	}
 
 	private async handleRemoteDelete(path: string): Promise<void> {
-		const normalized = normalizePath(path);
+		const normalized = this.vaultFs.normalize(path);
 		const wasOpen = this.openPaths.has(normalized);
 		const wasObserved = this.textObservers.has(normalized);
 		const wasSuppressed = this.isSuppressed(normalized);
@@ -539,30 +539,32 @@ export class DiskMirror {
 		// Unbind editor before suppressed delete so the vault `delete` event
 		// (which skips unbind due to suppression) doesn't leave a stale binding.
 		this.editorBindings.unbindByPath(normalized);
-		const file = this.app.vault.getAbstractFileByPath(normalized);
-		if (file instanceof TFile) {
-			try {
-				this.suppressDelete(path);
-				await this.app.vault.delete(file);
+		try {
+			const stats = await this.vaultFs.stat(normalized);
+			if (stats?.isFile) {
+				this.suppressDelete(normalized);
+				await this.vaultFs.delete(normalized);
 				this.log(`handleRemoteDelete: deleted "${path}" from disk`);
-			} catch (err) {
-				console.error(
-					`[yaos] handleRemoteDelete failed for "${path}":`,
-					err,
-				);
 			}
+		} catch (err) {
+			console.error(
+				`[yaos] handleRemoteDelete failed for "${path}":`,
+				err,
+			);
 		}
 	}
 
 	private async handleRemoteRename(oldPath: string, newPath: string): Promise<void> {
-		const oldNormalized = normalizePath(oldPath);
-		const newNormalized = normalizePath(newPath);
+		const oldNormalized = this.vaultFs.normalize(oldPath);
+		const newNormalized = this.vaultFs.normalize(newPath);
 		if (oldNormalized === newNormalized) return;
 
 		const wasOpen = this.openPaths.delete(oldNormalized);
-		if (wasOpen) {
-			this.openPaths.add(newNormalized);
-		}
+		const hadPendingOldWrite =
+			this.pendingOpenWrites.has(oldNormalized)
+			|| this.writeQueue.has(oldNormalized)
+			|| this.debounceTimers.has(oldNormalized)
+			|| this.openWriteTimers.has(oldNormalized);
 		this.pendingOpenWrites.delete(oldNormalized);
 
 		const oldDebounce = this.debounceTimers.get(oldNormalized);
@@ -578,34 +580,54 @@ export class DiskMirror {
 
 		this.writeQueue.delete(oldNormalized);
 		this.forcedWritePaths.delete(oldNormalized);
+		const oldObserver = this.textObservers.get(oldNormalized) ?? null;
 		this.unobserveText(oldNormalized);
+
+
+
+		let shouldWriteTarget = true;
+		try {
+			const oldStats = await this.vaultFs.stat(oldNormalized);
+			if (oldStats?.isFile) {
+				try {
+					await this.vaultFs.rename(oldNormalized, newNormalized);
+				} catch (err) {
+					if (err instanceof VaultFsError && err.code === "target_exists") {
+						const targetStats = await this.vaultFs.stat(newNormalized);
+						if (!targetStats?.isFile) {
+							throw err;
+						}
+						// Preserve pre-VaultFs behavior for destination-file collisions:
+						// remove the old source, then let the final target write converge
+						// the existing destination file to the remote CRDT content.
+						this.suppressDelete(oldNormalized);
+						await this.vaultFs.delete(oldNormalized);
+					} else {
+						throw err;
+					}
+				}
+				this.log(`handleRemoteRename: "${oldNormalized}" -> "${newNormalized}"`);
+			}
+		} catch (err) {
+			console.error(`[yaos] handleRemoteRename failed for "${oldNormalized}" -> "${newNormalized}":`, err);
+			shouldWriteTarget = false;
+		}
+
+		if (!shouldWriteTarget || !(await this.canMaterializeTargetPath(newNormalized))) {
+			if (wasOpen) {
+				this.openPaths.add(oldNormalized);
+				this.restoreTextObserver(oldNormalized, oldObserver);
+				if (hadPendingOldWrite) {
+					this.scheduleOpenWrite(oldNormalized);
+				}
+			}
+			return;
+		}
 
 		this.editorBindings.updatePathsAfterRename(new Map([[oldNormalized, newNormalized]]));
 
-		const oldFile = this.app.vault.getAbstractFileByPath(oldNormalized);
-		if (oldFile instanceof TFile) {
-			try {
-				const target = this.app.vault.getAbstractFileByPath(newNormalized);
-				if (target instanceof TFile) {
-					this.suppressDelete(oldNormalized);
-					await this.app.vault.delete(oldFile);
-				} else {
-					const dir = newNormalized.substring(0, newNormalized.lastIndexOf("/"));
-					if (dir) {
-						const dirNode = this.app.vault.getAbstractFileByPath(normalizePath(dir));
-						if (!dirNode) {
-							await this.app.vault.createFolder(dir);
-						}
-					}
-					await this.app.fileManager.renameFile(oldFile, newNormalized);
-				}
-				this.log(`handleRemoteRename: "${oldNormalized}" -> "${newNormalized}"`);
-			} catch (err) {
-				console.error(`[yaos] handleRemoteRename failed for "${oldNormalized}" -> "${newNormalized}":`, err);
-			}
-		}
-
 		if (wasOpen) {
+			this.openPaths.add(newNormalized);
 			this.observeText(newNormalized);
 			this.scheduleOpenWrite(newNormalized);
 		} else {
@@ -630,7 +652,7 @@ export class DiskMirror {
 	}
 
 	consumeDeleteSuppression(path: string): boolean {
-		path = normalizePath(path);
+		path = this.vaultFs.normalize(path);
 		const entry = this.getActiveSuppression(path);
 		if (!entry) return false;
 
@@ -662,7 +684,7 @@ export class DiskMirror {
 	}
 
 	async flushOpenPath(path: string, reason: string): Promise<void> {
-		path = normalizePath(path);
+		path = this.vaultFs.normalize(path);
 		const timer = this.openWriteTimers.get(path);
 		const hadTimer = !!timer;
 		if (timer) {
@@ -739,6 +761,7 @@ export class DiskMirror {
 			obs.ytext.unobserve(obs.handler);
 		}
 		this.textObservers.clear();
+		this.fallbackTexts.clear();
 
 		for (const timer of this.debounceTimers.values()) {
 			clearTimeout(timer);
@@ -774,7 +797,7 @@ export class DiskMirror {
 	private hasFocusedEditorUnflushedChanges(path: string, expectedCrdtContent: string | null): boolean {
 		if (expectedCrdtContent == null) return false;
 		const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
-		if (activeView?.file?.path !== path) return false;
+		if (!activeView?.file || this.vaultFs.normalize(activeView.file.path) !== path) return false;
 		try {
 			return activeView.editor.getValue() !== expectedCrdtContent;
 		} catch {
@@ -788,11 +811,53 @@ export class DiskMirror {
 			return false;
 		}
 		const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
-		return activeView?.file?.path === path;
+		return !!activeView?.file && this.vaultFs.normalize(activeView.file.path) === path;
+	}
+
+	private async canMaterializeTargetPath(path: string): Promise<boolean> {
+		const normalized = this.vaultFs.normalize(path);
+		const targetStats = await this.vaultFs.stat(normalized);
+		if (targetStats?.isDirectory) return false;
+
+		const parts = normalized.split("/");
+		let current = "";
+		for (const part of parts.slice(0, -1)) {
+			current = current ? `${current}/${part}` : part;
+			const parentStats = await this.vaultFs.stat(current);
+			if (parentStats?.isFile) return false;
+		}
+		return true;
+	}
+
+	private getTextForWrite(path: string): Y.Text | null {
+		const normalized = this.vaultFs.normalize(path);
+		return this.fallbackTexts.get(normalized) ?? this.vaultSync.getTextForPath(normalized) ?? null;
+	}
+
+	private restoreTextObserver(
+		path: string,
+		observer: { ytext: Y.Text; handler: (event: Y.YTextEvent, txn: Y.Transaction) => void } | null,
+	): void {
+		if (this.textObservers.has(path)) return;
+		if (!observer) {
+			this.observeText(path);
+			return;
+		}
+		observer.ytext.observe(observer.handler);
+		this.textObservers.set(path, observer);
+		this.fallbackTexts.set(path, observer.ytext);
+		this.log(`observeText: restored "${path}" (remote-only)`);
+	}
+
+	private isObservedYText(ytext: Y.Text): boolean {
+		for (const observer of this.textObservers.values()) {
+			if (observer.ytext === ytext) return true;
+		}
+		return false;
 	}
 
 	private queueImmediateWrite(path: string, reason: string, force = false): void {
-		path = normalizePath(path);
+		path = this.vaultFs.normalize(path);
 		if (force) {
 			this.forcedWritePaths.add(path);
 		}
@@ -802,7 +867,7 @@ export class DiskMirror {
 	}
 
 	private getActiveSuppression(path: string): SuppressionEntry | null {
-		path = normalizePath(path);
+		path = this.vaultFs.normalize(path);
 		const entry = this.suppressedPaths.get(path);
 		if (!entry) return null;
 		if (Date.now() < entry.expiresAt) {
@@ -816,7 +881,7 @@ export class DiskMirror {
 		// Record the exact content we wrote so vault modify/create events can
 		// acknowledge our own write by observed state, not just timing.
 		const fingerprint = await this.fingerprintContent(content);
-		this.suppressedPaths.set(normalizePath(path), {
+		this.suppressedPaths.set(this.vaultFs.normalize(path), {
 			kind: "write",
 			expiresAt: Date.now() + SUPPRESS_MS,
 			expectedBytes: fingerprint.bytes,
@@ -825,7 +890,7 @@ export class DiskMirror {
 	}
 
 	private suppressDelete(path: string): void {
-		this.suppressedPaths.set(normalizePath(path), {
+		this.suppressedPaths.set(this.vaultFs.normalize(path), {
 			kind: "delete",
 			expiresAt: Date.now() + SUPPRESS_MS,
 		});
@@ -835,7 +900,7 @@ export class DiskMirror {
 		file: TFile,
 		event: "modify" | "create",
 	): Promise<boolean> {
-		const path = normalizePath(file.path);
+		const path = this.vaultFs.normalize(file.path);
 		const entry = this.getActiveSuppression(path);
 		if (!entry) return false;
 
@@ -861,7 +926,12 @@ export class DiskMirror {
 		try {
 			// Read back the file only when a suppression candidate exists. This
 			// keeps the hot path cheap while making self-event detection causal.
-			const content = await this.app.vault.read(file);
+			const content = await this.vaultFs.readText(path);
+			if (content === null) {
+				this.suppressedPaths.delete(path);
+				this.log(`suppression: "${path}" ${event} file missing`);
+				return false;
+			}
 			const fingerprint = await this.fingerprintContent(content);
 			if (
 				fingerprint.bytes === entry.expectedBytes
@@ -885,7 +955,7 @@ export class DiskMirror {
 		const digest = await crypto.subtle.digest("SHA-256", bytes);
 		return {
 			bytes: bytes.length,
-			hash: arrayBufferToHex(digest),
+			hash: bufferToHex(digest),
 		};
 	}
 

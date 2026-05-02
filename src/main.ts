@@ -9,6 +9,7 @@ import { VaultSync, type ReconcileMode } from "./sync/vaultSync";
 import { SCHEMA_VERSION } from "./sync/vaultSync";
 import { EditorBindingManager } from "./sync/editorBinding";
 import { DiskMirror } from "./sync/diskMirror";
+import { ObsidianVaultFs } from "./sync/vaultFs";
 import { BlobSyncManager, type BlobQueueSnapshot } from "./sync/blobSync";
 import { parseExcludePatterns } from "./sync/exclude";
 import {
@@ -454,8 +455,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			);
 
 			// 4. DiskMirror
+			const vaultFs = new ObsidianVaultFs(this.app);
 			this.diskMirror = new DiskMirror(
 				this.app,
+				vaultFs,
 				this.vaultSync,
 				this.editorBindings,
 				this.settings.debug,
