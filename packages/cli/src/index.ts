@@ -3,6 +3,7 @@
 import { Command, InvalidOptionArgumentError, Option } from "commander";
 import type { CliCommandOptions, ResolvedCliConfig } from "./config";
 import { requireRuntimeConfig, resolveCliConfig } from "./config";
+import { exitCodeForError, HeadlessCliError } from "./errors";
 import { createNodeVaultSync, HeadlessYaosClient } from "./nodeVaultSync";
 
 const program = new Command();
@@ -75,6 +76,12 @@ addCommonOptions(
 			try {
 				const localLoaded = await vaultSync.waitForLocalPersistence();
 				const providerSynced = await vaultSync.waitForProviderSync();
+				if (vaultSync.fatalAuthError) {
+					throw new HeadlessCliError(
+						`Provider rejected the connection (${vaultSync.fatalAuthCode ?? "unknown"})`,
+						vaultSync.fatalAuthCode,
+					);
+				}
 				console.log(JSON.stringify({
 					mode: "status",
 					config: summarizeConfig(resolved),
@@ -98,8 +105,7 @@ addCommonOptions(
 
 program.parseAsync(process.argv).catch((error: unknown) => {
 	const message = error instanceof Error ? error.message : String(error);
-	// CommanderError carries its own exitCode (0 for --help, 1 for errors).
-	const exitCode = (error as { exitCode?: number })?.exitCode ?? 1;
+	const exitCode = exitCodeForError(error);
 	if (exitCode !== 0) {
 		process.stderr.write(`error: ${message}\n`);
 	}

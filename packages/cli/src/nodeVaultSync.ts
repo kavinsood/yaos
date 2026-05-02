@@ -9,6 +9,7 @@ import {
 	type VaultSyncOptions,
 	type VaultSyncPersistence,
 } from "../../../src/sync/vaultSync";
+import { HeadlessCliError } from "./errors";
 import { NodeDiskMirror } from "./nodeDiskMirror";
 import type { RuntimeCliConfig } from "./config";
 import {
@@ -86,7 +87,7 @@ export class HeadlessYaosClient {
 		const localLoaded = await this.vaultSync.waitForLocalPersistence();
 		const providerSynced = await this.vaultSync.waitForProviderSync();
 		if (this.vaultSync.fatalAuthError) {
-			throw new Error(formatFatalAuthError(this.vaultSync));
+			throw new HeadlessCliError(formatFatalAuthError(this.vaultSync), this.vaultSync.fatalAuthCode);
 		}
 
 		const mode = this.vaultSync.getSafeReconcileMode();
