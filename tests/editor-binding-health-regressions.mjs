@@ -81,6 +81,22 @@ console.log("\n--- Test 4: editor-health-heal origin remains manual-only ---");
 	);
 }
 
+console.log("\n--- Test 5: CM resolution is precise and patient ---");
+{
+	assert(
+		bindingSource.includes("editorInfoField"),
+		"CM resolution uses Obsidian editorInfoField",
+	);
+	assert(
+		bindingSource.includes("CM_RESOLVE_MAX_RETRIES = 8"),
+		"CM resolution waits beyond initial layout churn",
+	);
+	assert(
+		bindingSource.includes("CM_RESOLVE_DEGRADED_NOTICE_COOLDOWN_MS"),
+		"CM degraded notices are rate-limited",
+	);
+}
+
 console.log(`\n${"-".repeat(50)}`);
 console.log(`Results: ${passed} passed, ${failed} failed`);
 console.log(`${"-".repeat(50)}\n`);
