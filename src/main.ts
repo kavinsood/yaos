@@ -2683,6 +2683,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			reason,
 			trace: this.getTraceHttpContext() ?? null,
 			settings: {
+				pluginId: this.manifest.id,
+				pluginVersion: this.manifest.version,
 				host: this.settings.host,
 				vaultId: this.settings.vaultId,
 				deviceName: this.settings.deviceName,
@@ -3880,6 +3882,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			generationMs: Date.now() - startedAt,
 			trace: this.getTraceHttpContext() ?? null,
 			settings: {
+				pluginId: this.manifest.id,
+				pluginVersion: this.manifest.version,
 				host: this.settings.host,
 				tokenPrefix: this.settings.token ? `${this.settings.token.slice(0, 8)}...` : "",
 				vaultId: this.settings.vaultId,
