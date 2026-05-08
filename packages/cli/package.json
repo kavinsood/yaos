@@ -1,0 +1,27 @@
+{
+  "name": "@yaos/cli",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "yaos-cli": "dist/index.cjs"
+  },
+  "scripts": {
+    "dev": "esbuild src/index.ts --bundle --platform=node --format=cjs --outfile=dist/index.cjs --watch",
+    "prepare": "esbuild src/index.ts --bundle --platform=node --format=cjs --outfile=dist/index.cjs",
+    "build": "esbuild src/index.ts --bundle --platform=node --format=cjs --outfile=dist/index.cjs",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "node --import jiti/register --test tests/*.ts"
+  },
+  "dependencies": {
+    "chokidar": "^5.0.0",
+    "commander": "^14.0.0",
+    "ws": "^8.18.2"
+  },
+  "devDependencies": {
+    "@types/node": "^16.11.6",
+    "@types/ws": "^8.18.0",
+    "esbuild": "0.25.5",
+    "typescript": "^5.8.3"
+  }
+}
