@@ -2,7 +2,7 @@ import { Compartment, type Extension } from "@codemirror/state";
 import { EditorView, ViewPlugin, type ViewUpdate } from "@codemirror/view";
 import { yCollab, ySyncFacet } from "y-codemirror.next";
 import * as Y from "yjs";
-import { Notice, type MarkdownView } from "obsidian";
+import { editorInfoField, Notice, type MarkdownFileInfo, type MarkdownView } from "obsidian";
 import type { VaultSync } from "./vaultSync";
 import { applyDiffToYText } from "./diff";
 import type { TraceRecord } from "../debug/trace";
@@ -26,8 +26,9 @@ const FAST_SWITCH_BINDING_SETTLE_WINDOW_MS = 1600;
 const FAST_SWITCH_WINDOW_MS = 2000;
 const POST_BIND_HEALTH_GRACE_MS = 100;
 const LIVE_UPDATE_HEALTH_RETRY_DELAY_MS = 120;
-const CM_RESOLVE_RETRY_DELAY_MS = 80;
-const CM_RESOLVE_MAX_RETRIES = 2;
+const CM_RESOLVE_RETRY_DELAY_MS = 100;
+const CM_RESOLVE_MAX_RETRIES = 8;
+const CM_RESOLVE_DEGRADED_NOTICE_COOLDOWN_MS = 60_000;
 
 /** Map from MarkdownView instance id to its binding state. */
 interface EditorBinding {
@@ -99,7 +100,7 @@ export class EditorBindingManager {
 	private pendingHealthChecks = new Map<string, ReturnType<typeof setTimeout>>();
 	private healthWorkInFlight = new Set<string>();
 	private lastDeviceName = "unknown";
-	private cmDegradedWarned = false;
+	private lastCmDegradedNoticeAtMs = 0;
 	private cmResolveAttempts = new Map<string, number>();
 	private pendingCmResolveRetries = new Map<string, ReturnType<typeof setTimeout>>();
 
@@ -161,7 +162,6 @@ export class EditorBindingManager {
 			return;
 		}
 		this.clearCmResolveRetry(leafId);
-		this.cmDegradedWarned = false;
 		const cmId = this.getCmId(cm);
 		const existing = this.bindings.get(leafId);
 
@@ -244,7 +244,6 @@ export class EditorBindingManager {
 			return true;
 		}
 		this.clearCmResolveRetry(leafId);
-		this.cmDegradedWarned = false;
 
 		const existing = this.bindings.get(leafId);
 		if (!existing) {
@@ -544,7 +543,6 @@ export class EditorBindingManager {
 		type SyncFacetLike = {
 			ytext?: Y.Text;
 			awareness?: unknown;
-			undoManager?: Y.UndoManager;
 		} | undefined;
 
 		let syncFacet: SyncFacetLike;
@@ -554,7 +552,6 @@ export class EditorBindingManager {
 			syncFacet = undefined;
 		}
 
-		const binding = this.bindings.get(leafId);
 		const expectedText = this.vaultSync.getTextForPath(file.path);
 		const expectedFileId =
 			this.vaultSync.getFileId(file.path)
@@ -564,11 +561,6 @@ export class EditorBindingManager {
 		const facetFileId =
 			facetText instanceof Y.Text
 				? (this.vaultSync.getFileIdForText(facetText) ?? null)
-				: null;
-
-		const facetUndoManager =
-			syncFacet && "undoManager" in syncFacet
-				? (syncFacet.undoManager ?? null)
 				: null;
 
 		return {
@@ -582,11 +574,10 @@ export class EditorBindingManager {
 			yTextMatchesExpected: syncFacet
 				? (expectedText ? syncFacet.ytext === expectedText : false)
 				: null,
-			undoManagerMatchesFacet: syncFacet
-				? ("undoManager" in syncFacet
-					? (binding ? facetUndoManager === binding.undoManager : null)
-					: null)
-				: null,
+			// y-codemirror.next keeps the active UndoManager on an internal
+			// yUndoManagerFacet, not ySyncFacet. The package does not export
+			// that facet, so diagnostics cannot compare it reliably here.
+			undoManagerMatchesFacet: null,
 			facetFileId,
 			expectedFileId,
 			facetTextLength:
@@ -608,8 +599,8 @@ export class EditorBindingManager {
 
 	/**
 	 * Get the CM6 EditorView from a MarkdownView.
-	 * Resolution is based on DOM containment over a set of known CM6 views
-	 * registered by our global ViewPlugin. This avoids private Obsidian APIs.
+	 * Resolution is based on Obsidian's public editorInfoField first, with
+	 * DOM containment as a fallback for older/partial editor states.
 	 */
 	private getCmView(view: MarkdownView): EditorView | null {
 		const container = view.containerEl;
@@ -628,12 +619,16 @@ export class EditorBindingManager {
 			}
 		}
 
+		const infoMatches: EditorView[] = [];
 		const matches: EditorView[] = [];
 		const stale: EditorView[] = [];
 		for (const cm of this.knownCmViews) {
 			if (!cm.dom.isConnected) {
 				stale.push(cm);
 				continue;
+			}
+			if (this.cmBelongsToView(cm, view)) {
+				infoMatches.push(cm);
 			}
 			if (container.contains(cm.dom)) {
 				matches.push(cm);
@@ -644,15 +639,17 @@ export class EditorBindingManager {
 			this.cmToLeafId.delete(cm);
 		}
 
+		if (infoMatches.length === 1) return infoMatches[0]!;
+		if (infoMatches.length > 1) {
+			const focusedInfoMatch = this.findFocusedCm(infoMatches);
+			if (focusedInfoMatch) return focusedInfoMatch;
+		}
+
 		if (matches.length === 0) return null;
 		if (matches.length === 1) return matches[0]!;
 
-		const activeElement =
-			typeof document !== "undefined" ? document.activeElement : null;
-		const focused = matches.filter((cm) =>
-			cm.hasFocus || (activeElement ? cm.dom.contains(activeElement) : false),
-		);
-		if (focused.length === 1) return focused[0]!;
+		const focused = this.findFocusedCm(matches);
+		if (focused) return focused;
 
 		const ids = matches.map((cm) => this.getCmId(cm));
 		this.trace?.("editor", "cm-resolution-ambiguous", {
@@ -669,8 +666,11 @@ export class EditorBindingManager {
 	}
 
 	private warnCmDegraded(): void {
-		if (this.cmDegradedWarned) return;
-		this.cmDegradedWarned = true;
+		const now = Date.now();
+		if (now - this.lastCmDegradedNoticeAtMs < CM_RESOLVE_DEGRADED_NOTICE_COOLDOWN_MS) {
+			return;
+		}
+		this.lastCmDegradedNoticeAtMs = now;
 		new Notice(
 			"YAOS: Could not resolve the active editor instance. " +
 			"Live collaborative editing is unavailable. Background sync may still continue, " +
@@ -680,6 +680,28 @@ export class EditorBindingManager {
 		console.error(
 			"[yaos] Critical: Could not locate CodeMirror 6 EditorView. Live binding disabled.",
 		);
+	}
+
+	private cmBelongsToView(cm: EditorView, view: MarkdownView): boolean {
+		let info: MarkdownFileInfo | undefined;
+		try {
+			info = cm.state.field(editorInfoField, false);
+		} catch {
+			info = undefined;
+		}
+
+		if (!info) return false;
+		if (info === view) return true;
+		return info.file === view.file && info.editor === view.editor;
+	}
+
+	private findFocusedCm(cms: EditorView[]): EditorView | null {
+		const activeElement =
+			typeof document !== "undefined" ? document.activeElement : null;
+		const focused = cms.filter((cm) =>
+			cm.hasFocus || (activeElement ? cm.dom.contains(activeElement) : false),
+		);
+		return focused.length === 1 ? focused[0]! : null;
 	}
 
 	private getCmId(cm: EditorView): string {
