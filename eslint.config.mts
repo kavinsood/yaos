@@ -33,6 +33,12 @@ export default tseslint.config(
 		},
 	},
 	{
+		files: ["package.json"],
+		rules: {
+			"depend/ban-dependencies": "off",
+		},
+	},
+	{
 		files: ["server/src/**/*.ts"],
 		languageOptions: {
 			globals: {

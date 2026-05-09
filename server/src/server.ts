@@ -21,7 +21,7 @@ const JOURNAL_COMPACT_MAX_BYTES = 1 * 1024 * 1024;
 const TRACE_DEBUG_LIMIT = 100;
 const LOG_PREFIX = "[yaos-sync:server]";
 
-interface ServerTraceEntry extends StoredTraceEntry {}
+type ServerTraceEntry = StoredTraceEntry;
 
 interface ServerEnv {
 	YAOS_BUCKET?: R2Bucket;
@@ -307,12 +307,12 @@ export class VaultSyncServer extends YServer {
 		event: string,
 		data: Record<string, unknown>,
 	): Promise<void> {
-		const entry = prepareTraceEntryForStorage({
-			...data,
-			ts: new Date().toISOString(),
-			event,
-			roomId: this.getRoomId(),
-		}) as ServerTraceEntry;
+			const entry: ServerTraceEntry = prepareTraceEntryForStorage({
+				...data,
+				ts: new Date().toISOString(),
+				event,
+				roomId: this.getRoomId(),
+			});
 
 		console.debug(JSON.stringify({
 			source: "yaos-sync/server",

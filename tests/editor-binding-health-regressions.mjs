@@ -22,19 +22,19 @@ function sliceBetween(source, startMarker, endMarker) {
 	return source.slice(start, end);
 }
 
-const mainSource = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
+const workspaceSource = readFileSync(new URL("../src/runtime/editorWorkspaceOrchestrator.ts", import.meta.url), "utf8");
 const bindingSource = readFileSync(new URL("../src/sync/editorBinding.ts", import.meta.url), "utf8");
 
-console.log("\n--- Test 1: validateAllOpenBindings uses repair-only flow ---");
+console.log("\n--- Test 1: validateOpenBindings uses repair-only flow ---");
 {
 	const section = sliceBetween(
-		mainSource,
-		"private validateAllOpenBindings(reason: string): void {",
-		"private trackOpenFile(path: string): void {",
+		workspaceSource,
+		"validateOpenBindings(reason: string): void {",
+		"auditBindings(reason: string): number {",
 	);
-	assert(section !== null, "validateAllOpenBindings section found");
-	assert(section?.includes("this.editorBindings?.repair("), "validateAllOpenBindings calls repair");
-	assert(!section?.includes("this.editorBindings?.heal("), "validateAllOpenBindings does not call heal");
+	assert(section !== null, "validateOpenBindings section found");
+	assert(section?.includes("editorBindings.repair("), "validateOpenBindings calls repair");
+	assert(!section?.includes("editorBindings.heal("), "validateOpenBindings does not call heal");
 }
 
 console.log("\n--- Test 2: bind unhealthy path uses repair, not heal ---");

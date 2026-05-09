@@ -113,7 +113,16 @@ function normalizeTraceValue(value: unknown, depth = 0): unknown {
 		}
 		return normalized;
 	}
-	return truncateUtf8(String(value), MAX_TRACE_STRING_BYTES);
+	if (typeof value === "string") {
+		return truncateUtf8(value, MAX_TRACE_STRING_BYTES);
+	}
+	if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") {
+		return value;
+	}
+	if (typeof value === "symbol") {
+		return truncateUtf8(value.description ?? "symbol", MAX_TRACE_STRING_BYTES);
+	}
+	return null;
 }
 
 export function prepareTraceEntryForStorage(entry: TraceEntry): TraceEntry {

@@ -148,12 +148,6 @@ export function getFieldPolicy(fieldName: string): FieldPolicy {
 	return FIELD_POLICIES[normalizeFieldName(fieldName)] ?? "opaque";
 }
 
-function getFrontmatterLength(content: string | null | undefined): number | null {
-	if (content == null) return null;
-	const block = extractFrontmatter(content);
-	return block.kind === "present" ? block.frontmatterText.length : null;
-}
-
 function analyzeFrontmatter(frontmatterText: string): { blockReasons: string[]; warnReasons: string[] } {
 	const blockReasons = new Set<string>();
 	const warnReasons = new Set<string>();

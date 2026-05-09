@@ -541,10 +541,12 @@ export class DiskMirror {
 		this.editorBindings.unbindByPath(normalized);
 		const file = this.app.vault.getAbstractFileByPath(normalized);
 		if (file instanceof TFile) {
-			try {
-				this.suppressDelete(path);
-				await this.app.vault.delete(file);
-				this.log(`handleRemoteDelete: deleted "${path}" from disk`);
+				try {
+					this.suppressDelete(path);
+					// Remote sync deletes must remove the local replica, not move it to the user's trash.
+					// eslint-disable-next-line obsidianmd/prefer-file-manager-trash-file
+					await this.app.vault.delete(file);
+					this.log(`handleRemoteDelete: deleted "${path}" from disk`);
 			} catch (err) {
 				console.error(
 					`[yaos] handleRemoteDelete failed for "${path}":`,
@@ -585,11 +587,13 @@ export class DiskMirror {
 		const oldFile = this.app.vault.getAbstractFileByPath(oldNormalized);
 		if (oldFile instanceof TFile) {
 			try {
-				const target = this.app.vault.getAbstractFileByPath(newNormalized);
-				if (target instanceof TFile) {
-					this.suppressDelete(oldNormalized);
-					await this.app.vault.delete(oldFile);
-				} else {
+					const target = this.app.vault.getAbstractFileByPath(newNormalized);
+					if (target instanceof TFile) {
+						this.suppressDelete(oldNormalized);
+						// Rename conflict cleanup removes the superseded local replica intentionally.
+						// eslint-disable-next-line obsidianmd/prefer-file-manager-trash-file
+						await this.app.vault.delete(oldFile);
+					} else {
 					const dir = newNormalized.substring(0, newNormalized.lastIndexOf("/"));
 					if (dir) {
 						const dirNode = this.app.vault.getAbstractFileByPath(normalizePath(dir));

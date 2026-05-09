@@ -1020,10 +1020,12 @@ export class BlobSyncManager {
 		const normalized = normalizePath(path);
 		const file = this.app.vault.getAbstractFileByPath(normalized);
 		if (file instanceof TFile) {
-			try {
-				this.suppress(path);
-				await this.app.vault.delete(file);
-				this.log(`handleRemoteDelete: deleted "${path}" from disk`);
+				try {
+					this.suppress(path);
+					// Remote sync deletes must remove the local replica, not move it to the user's trash.
+					// eslint-disable-next-line obsidianmd/prefer-file-manager-trash-file
+					await this.app.vault.delete(file);
+					this.log(`handleRemoteDelete: deleted "${path}" from disk`);
 			} catch (err) {
 				console.error(
 					`[yaos:blob] handleRemoteDelete failed for "${path}":`,
