@@ -68,11 +68,12 @@ async function startupTracker(
 }
 
 // Flush pending microtasks (lets async store.save() in _persistAsync complete).
-// Two ticks required: one for the promise chain to propagate, one for the
-// .then/.catch handler to execute.
+// With the serialized persistence chain, we need enough microtask ticks for
+// the chain .then() handler to settle and for the store.save() to complete.
 async function flushMicrotasks(): Promise<void> {
-	await Promise.resolve();
-	await Promise.resolve();
+	for (let i = 0; i < 10; i++) {
+		await Promise.resolve();
+	}
 }
 
 // ── Test 1: local update while connected captures candidate, state=false ───────
@@ -675,6 +676,77 @@ console.log("\n--- Test 22: baseline behind then postApply dominating confirms c
 	assert(isStateVectorGe(postApplyServerSv, Y.encodeStateVector(clientDoc)), "postApply server SV dominates candidate");
 	tracker.recordServerSvEcho(postApplyServerSv);
 	assert(tracker.serverAppliedLocalState === true, "dominating postApply echo confirms candidate");
+}
+
+// ── Test 23: slow save racing clear — clear wins ─────────────────────────────
+
+console.log("\n--- Test 23: slow save racing clear — clear wins ---");
+{
+	let saveResolve: (() => void) | null = null;
+	let clearCalled = false;
+	const slowStore = {
+		async load() { return null; },
+		async save(_state: unknown) {
+			// Artificially delay save so clear can race ahead
+			await new Promise<void>((resolve) => { saveResolve = resolve; });
+		},
+		async clear() {
+			clearCalled = true;
+		},
+	};
+
+	const doc = makeDoc(123);
+	const provider = {};
+	const tracker = new ServerAckTracker();
+	attachTracker(tracker, doc, provider, null);
+	await tracker.onStartup(slowStore, BASE_SCOPE);
+
+	// Trigger a candidate capture (enqueues a slow save)
+	doc.getText("t").insert(0, "candidate before clear");
+
+	// Let the chain start executing (the save will block on our promise)
+	await Promise.resolve();
+	await Promise.resolve();
+
+	// Now call clearLocalReceiptState — it enqueues clear after the slow save
+	const clearPromise = tracker.clearLocalReceiptState();
+
+	// Give the chain a tick so clear is queued but blocked behind save
+	await Promise.resolve();
+
+	// Let the slow save finish — clear should execute after it
+	assert(saveResolve !== null, "slow save is in flight");
+	saveResolve!();
+
+	// Wait for clear to complete
+	await clearPromise;
+
+	assert(clearCalled, "clear was called after slow save finished");
+	assert(tracker.serverAppliedLocalState === null, "state is null after clear");
+	assert(tracker.candidatePersistenceFailureCount === 0, "clear resets failure count");
+	assert(tracker.candidatePersistenceHealthy === true, "persistence healthy after successful clear");
+}
+
+// ── Test 24: clearLocalReceiptState resets failure count ──────────────────────
+
+console.log("\n--- Test 24: clearLocalReceiptState resets failure count ---");
+{
+	const store = new InMemoryCandidateStore();
+	store.simulateWriteFailure = true;
+
+	const doc = makeDoc(124);
+	const provider = {};
+	const tracker = new ServerAckTracker();
+	attachTracker(tracker, doc, provider, null);
+	await tracker.onStartup(store, BASE_SCOPE);
+
+	doc.getText("t").insert(0, "edit");
+	await flushMicrotasks();
+	assert(tracker.candidatePersistenceFailureCount > 0, "failure count incremented after write failure");
+
+	store.simulateWriteFailure = false;
+	await tracker.clearLocalReceiptState();
+	assert(tracker.candidatePersistenceFailureCount === 0, "clear resets failure count to 0");
 }
 
 // ── Summary ───────────────────────────────────────────────────────────────────

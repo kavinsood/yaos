@@ -14,6 +14,7 @@ import { isStateVectorGe } from "./stateVectorAck";
 import { encodeBytesBase64, decodeBytesBase64 } from "./svEchoMessage";
 import { isAckTrackedLocalOrigin } from "./ackOrigins";
 import type { CandidateStore, ScopeKey, ScopeMetadata, PersistedCandidateState } from "./candidateStore";
+import type { TraceRecord } from "../debug/trace";
 
 export type { ScopeKey, ScopeMetadata, PersistedCandidateState } from "./candidateStore";
 
@@ -43,6 +44,8 @@ export class ServerAckTracker {
 	private _store: CandidateStore | null = null;
 	private _scope: (ScopeKey & ScopeMetadata) | null = null;
 
+	constructor(private readonly trace?: TraceRecord) {}
+
 	/**
 	 * Attach to a Y.Doc update event stream. Must be called before onStartup.
 	 *
@@ -64,6 +67,11 @@ export class ServerAckTracker {
 				this._lastUnconfirmedCandidateSv = encodeStateVector();
 				this._candidateCapturedAt = Date.now();
 				this._serverAppliedLocalState = false;
+				this.trace?.("receipt", "receipt-candidate-captured", {
+					candidateBytes: this._lastUnconfirmedCandidateSv.byteLength,
+					candidateCapturedAt: this._candidateCapturedAt,
+					originType: typeof origin,
+				});
 				this._persistAsync();
 			}
 		});
@@ -85,6 +93,9 @@ export class ServerAckTracker {
 		try {
 			stored = await store.load(scope);
 		} catch {
+			this.trace?.("receipt", "receipt-startup-load-failed", {
+				scopeKnown: Boolean(scope.vaultIdHash && scope.serverHostHash && scope.localDeviceId),
+			});
 			stored = null;
 		}
 
@@ -113,13 +124,22 @@ export class ServerAckTracker {
 	 */
 	recordServerSvEcho(serverSv: Uint8Array): void {
 		this._lastServerReceiptEchoAt = Date.now();
+		let confirmed: boolean | null = null;
 		if (this._lastUnconfirmedCandidateSv !== null) {
-			const confirmed = isStateVectorGe(serverSv, this._lastUnconfirmedCandidateSv);
+			confirmed = isStateVectorGe(serverSv, this._lastUnconfirmedCandidateSv);
 			this._serverAppliedLocalState = confirmed;
 			if (confirmed) {
 				this._lastKnownServerReceiptEchoAt = this._lastServerReceiptEchoAt;
 			}
 		}
+		this.trace?.("receipt", "receipt-server-echo", {
+			serverSvBytes: serverSv.byteLength,
+			candidateBytes: this._lastUnconfirmedCandidateSv?.byteLength ?? null,
+			hasCandidate: this._lastUnconfirmedCandidateSv !== null,
+			serverDominatesCandidate: confirmed,
+			serverAppliedLocalState: this._serverAppliedLocalState,
+			lastServerReceiptEchoAt: this._lastServerReceiptEchoAt,
+		});
 		this._persistAsync();
 	}
 
@@ -128,7 +148,12 @@ export class ServerAckTracker {
 	get lastKnownServerReceiptEchoAt(): number | null { return this._lastKnownServerReceiptEchoAt; }
 	get candidatePersistenceHealthy(): boolean { return this._candidatePersistenceHealthy; }
 	get candidatePersistenceFailureCount(): number { return this._candidatePersistenceFailureCount; }
-	get hasUnconfirmedCandidate(): boolean { return this._lastUnconfirmedCandidateSv !== null; }
+	get hasUnconfirmedCandidate(): boolean {
+		return (
+			this._lastUnconfirmedCandidateSv !== null &&
+			this._serverAppliedLocalState !== true
+		);
+	}
 	get candidateCapturedAt(): number | null { return this._candidateCapturedAt; }
 
 	getState(): ServerAckState {
@@ -138,7 +163,7 @@ export class ServerAckTracker {
 			lastKnownServerReceiptEchoAt: this._lastKnownServerReceiptEchoAt,
 			candidatePersistenceHealthy: this._candidatePersistenceHealthy,
 			candidatePersistenceFailureCount: this._candidatePersistenceFailureCount,
-			hasUnconfirmedCandidate: this._lastUnconfirmedCandidateSv !== null,
+			hasUnconfirmedCandidate: this.hasUnconfirmedCandidate,
 			candidateCapturedAt: this._candidateCapturedAt,
 		};
 	}
@@ -149,14 +174,14 @@ export class ServerAckTracker {
 		this._serverAppliedLocalState = null;
 		this._lastServerReceiptEchoAt = null;
 		this._lastKnownServerReceiptEchoAt = null;
+		this._candidatePersistenceFailureCount = 0;
 		if (clearStore && this._store) {
-			try {
-				await this._store.clear();
-				this._candidatePersistenceHealthy = true;
-			} catch {
-				this._candidatePersistenceFailureCount++;
-				this._candidatePersistenceHealthy = false;
-			}
+			// Enqueue the clear through the same persistence chain so it
+			// cannot race with in-flight saves. A slow save that lands
+			// after a direct clear would resurrect stale state.
+			await this._enqueuePersistence(async () => {
+				await this._store!.clear();
+			});
 		}
 	}
 
@@ -170,6 +195,9 @@ export class ServerAckTracker {
 
 		if (docDominatesCandidate && candidateDominatesDoc) {
 			// Equal — candidate is valid; wait for fresh echo.
+			this.trace?.("receipt", "receipt-startup-candidate-validation", {
+				outcome: "equal",
+			});
 			return;
 		}
 
@@ -181,22 +209,63 @@ export class ServerAckTracker {
 			this._lastUnconfirmedCandidateSv = currentSv;
 			this._candidateCapturedAt = Date.now();
 			this._serverAppliedLocalState = false;
+			this.trace?.("receipt", "receipt-startup-candidate-validation", {
+				outcome: "doc-ahead-replaced",
+				candidateBytes: currentSv.byteLength,
+			});
 			this._persistAsync();
 			return;
 		}
 
 		// candidateAheadOfDoc or incomparable — discard, fail closed.
+		this.trace?.("receipt", "receipt-startup-candidate-validation", {
+			outcome: "discarded",
+			candidateAheadOfDoc: candidateDominatesDoc && !docDominatesCandidate,
+		});
 		this._lastUnconfirmedCandidateSv = null;
 		this._candidateCapturedAt = null;
 		this._serverAppliedLocalState = null;
 		this._persistAsync();
 	}
 
+	private _persistChain: Promise<void> = Promise.resolve();
+
+	/**
+	 * Enqueue a persistence operation through the shared chain.
+	 * ALL persistence mutations (saves AND clears) MUST go through this
+	 * helper to prevent out-of-order completions. The operation is wrapped
+	 * in try/catch so the chain promise never rejects — preventing a single
+	 * IndexedDB failure from permanently poisoning all subsequent writes.
+	 */
+	private _enqueuePersistence(op: () => Promise<void>): Promise<void> {
+		this._persistChain = this._persistChain.then(async () => {
+			try {
+				await op();
+				if (!this._candidatePersistenceHealthy) {
+					this._candidatePersistenceHealthy = true;
+				}
+			} catch {
+				this._candidatePersistenceFailureCount++;
+				this._candidatePersistenceHealthy = false;
+			}
+		});
+		return this._persistChain;
+	}
+
+	/** Wait for all queued persistence writes to complete. */
+	async flushReceiptPersistence(): Promise<void> {
+		await this._persistChain;
+	}
+
+	/** Exposed for tests: wait for all queued persistence writes to complete. */
+	async _flushPersistence(): Promise<void> {
+		await this.flushReceiptPersistence();
+	}
+
 	private _persistAsync(): void {
 		if (!this._store || !this._scope) return;
-		// Restart-safe receipt after offline edits depends on this async write
-		// completing before shutdown. Until it does, the in-memory candidate is
-		// authoritative only for the current plugin session.
+		// Serialize persistence writes through a promise chain to prevent
+		// out-of-order completions from clobbering newer state with older state.
 		const state: PersistedCandidateState = {
 			schema: 1,
 			...this._scope,
@@ -206,13 +275,8 @@ export class ServerAckTracker {
 			candidateCapturedAt: this._candidateCapturedAt,
 			lastKnownServerReceiptEchoAt: this._lastKnownServerReceiptEchoAt,
 		};
-		this._store.save(state).then(() => {
-			if (!this._candidatePersistenceHealthy) {
-				this._candidatePersistenceHealthy = true;
-			}
-		}).catch(() => {
-			this._candidatePersistenceFailureCount++;
-			this._candidatePersistenceHealthy = false;
+		this._enqueuePersistence(async () => {
+			await this._store!.save(state);
 		});
 	}
 }
