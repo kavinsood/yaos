@@ -268,7 +268,7 @@ export class VaultSync {
 			this.provider,
 			this.persistence,
 		);
-		this.serverAckTracker = new ServerAckTracker();
+		this.serverAckTracker = new ServerAckTracker(this.trace);
 
 		// Track connection generations for reconnect detection
 		this.provider.on("status", (event: { status: string }) => {
@@ -1460,6 +1460,10 @@ export class VaultSync {
 	}
 	get hasUnconfirmedServerReceiptCandidate(): boolean { return this.serverAckTracker.hasUnconfirmedCandidate; }
 	get serverReceiptCandidateCapturedAt(): number | null { return this.serverAckTracker.candidateCapturedAt; }
+
+	async flushReceiptPersistence(): Promise<void> {
+		await this.serverAckTracker.flushReceiptPersistence();
+	}
 	get serverReceiptStartupValidation(): ServerReceiptStartupValidation { return this._serverReceiptStartupValidation; }
 	get svEchoCounters(): SvEchoCounters { return { ...this._svEchoCounters }; }
 
@@ -1568,12 +1572,13 @@ export class VaultSync {
 		});
 	}
 
-	destroy(): void {
+	async destroy(): Promise<void> {
 		this.log("Destroying VaultSync");
 		if (this._renameTimer) clearTimeout(this._renameTimer);
 		this.clearPendingRenames();
+		await this.flushReceiptPersistence();
 		this.provider.destroy();
-		void this.persistence.destroy();
+		await this.persistence.destroy();
 		this.ydoc.destroy();
 	}
 
