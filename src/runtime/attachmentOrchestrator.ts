@@ -5,6 +5,7 @@ import type { VaultSync } from "../sync/vaultSync";
 import type { RuntimeConfig } from "./runtimeConfig";
 import { formatUnknown } from "../utils/format";
 import type { TraceHttpContext, TraceRecord } from "../debug/trace";
+import type { PreservedUnresolvedEntry } from "../sync/preservedUnresolved";
 
 interface AttachmentOrchestratorDeps {
 	app: App;
@@ -16,6 +17,8 @@ interface AttachmentOrchestratorDeps {
 	getExcludePatterns(): string[];
 	persistBlobQueue(snapshot: BlobQueueSnapshot): Promise<void>;
 	clearPersistedBlobQueue(): Promise<void>;
+	getPreservedUnresolvedEntries(): PreservedUnresolvedEntry[];
+	onPreservedUnresolvedChanged(): void;
 	trace: TraceRecord;
 	scheduleTraceStateSnapshot(reason: string): void;
 	refreshStatusBar(): void;
@@ -73,6 +76,8 @@ export class AttachmentOrchestrator {
 			},
 			this.deps.getBlobHashCache(),
 			this.deps.trace,
+			this.deps.getPreservedUnresolvedEntries(),
+			this.deps.onPreservedUnresolvedChanged,
 		);
 
 		this.blobSync = blobSync;

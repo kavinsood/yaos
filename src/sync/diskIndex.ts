@@ -126,10 +126,15 @@ export async function collectFileStats(
 export function updateIndex(
 	index: DiskIndex,
 	allStats: Map<string, { mtime: number; size: number }>,
+	options: { excludePaths?: Iterable<string> } = {},
 ): DiskIndex {
+	const excluded = new Set(options.excludePaths ?? []);
 	const newIndex: DiskIndex = {};
 
 	for (const [path, stat] of allStats) {
+		if (excluded.has(path)) {
+			continue;
+		}
 		newIndex[path] = { mtime: stat.mtime, size: stat.size };
 	}
 

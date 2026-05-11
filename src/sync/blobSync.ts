@@ -13,7 +13,14 @@
  *   Upload: detect change → hash → check exists → PUT to Worker → set CRDT
  *   Download: CRDT observer fires → check disk → GET from Worker → write disk
  */
-import { type App, TFile, normalizePath, requestUrl, arrayBufferToHex } from "obsidian";
+import {
+	type App,
+	TFile,
+	normalizePath,
+	requestUrl,
+	arrayBufferToHex,
+	Notice,
+} from "obsidian";
 import type { VaultSync } from "./vaultSync";
 import { isBlobSyncable, type BlobRef } from "../types";
 import { ORIGIN_SEED } from "./origins";
@@ -28,13 +35,24 @@ import {
 	setCachedHash,
 	removeCachedHash,
 } from "./blobHashCache";
+import { PreservedUnresolvedRegistry, type PreservedUnresolvedEntry, type PreservedUnresolvedReason } from "./preservedUnresolved";
 
 // -------------------------------------------------------------------
 // Config
 // -------------------------------------------------------------------
 
+/**
+ * Three-way decision for blob remote-delete handling.
+ * Discriminated union — NOT a boolean dirty flag.
+ */
+export type BlobRemoteDeleteDecision =
+	| { kind: "apply-delete" }
+	| { kind: "preserve-revive" }
+	| { kind: "preserve-unresolved" };
+
 const DEBOUNCE_MS = 500;
 const MAX_RETRIES = 3;
+const MAX_RERUN_RESETS = 5;
 const RETRY_BASE_MS = 1000;
 const SUPPRESS_MS = 1000;
 const EXISTS_TIMEOUT_MS = 30_000;
@@ -73,10 +91,15 @@ async function withTimeout<T>(
 
 function transferTimeoutMs(sizeBytes?: number): number {
 	if (!sizeBytes || sizeBytes <= 0) return MIN_TRANSFER_TIMEOUT_MS;
-	const transferMs = Math.ceil((sizeBytes / MIN_TRANSFER_BYTES_PER_SEC) * 1000);
+	const transferMs = Math.ceil(
+		(sizeBytes / MIN_TRANSFER_BYTES_PER_SEC) * 1000,
+	);
 	return Math.min(
 		MAX_TRANSFER_TIMEOUT_MS,
-		Math.max(MIN_TRANSFER_TIMEOUT_MS, TRANSFER_SETUP_BUDGET_MS + transferMs),
+		Math.max(
+			MIN_TRANSFER_TIMEOUT_MS,
+			TRANSFER_SETUP_BUDGET_MS + transferMs,
+		),
 	);
 }
 
@@ -218,6 +241,35 @@ function isAlreadyExistsError(error: unknown): boolean {
 	return message.toLowerCase().includes("exists");
 }
 
+function hashPrefix(hash: string | null | undefined): string | null {
+	return typeof hash === "string" ? hash.slice(0, 12) : null;
+}
+
+function conflictPathFor(path: string, date = new Date()): string {
+	const normalized = normalizePath(path);
+	const slash = normalized.lastIndexOf("/");
+	const dir = slash >= 0 ? normalized.slice(0, slash + 1) : "";
+	const name = slash >= 0 ? normalized.slice(slash + 1) : normalized;
+	const dot = name.lastIndexOf(".");
+	const stamp = date
+		.toISOString()
+		.replace(/\.\d{3}Z$/, "Z")
+		.replace(/[:]/g, "-");
+	const suffix = ` (YAOS remote conflict ${stamp})`;
+	const ext = dot > 0 ? name.slice(dot) : "";
+	const base = dot > 0 ? name.slice(0, dot) : name;
+	// Cap base name to prevent filesystem path length issues (255 byte limit)
+	const maxBase = Math.max(20, 255 - suffix.length - ext.length - 4);
+	const cappedBase = base.length > maxBase ? base.slice(0, maxBase) : base;
+	return `${dir}${cappedBase}${suffix}${ext}`;
+}
+
+function isBlobConflictArtifactPath(path: string): boolean {
+	const normalized = normalizePath(path);
+	const name = normalized.split("/").pop() ?? normalized;
+	return /^.+ \(YAOS remote conflict \d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z\)(?:\.[^/.]+)?$/.test(name);
+}
+
 // -------------------------------------------------------------------
 // Queue item types
 // -------------------------------------------------------------------
@@ -229,6 +281,8 @@ interface UploadItem {
 	status: "pending" | "processing";
 	readyAt: number;
 	needsRerun?: boolean;
+	/** How many times this item has been reset via needsRerun. Capped at MAX_RERUN_RESETS. */
+	rerunResets: number;
 }
 
 interface DownloadItem {
@@ -239,6 +293,8 @@ interface DownloadItem {
 	status: "pending" | "processing";
 	readyAt: number;
 	needsRerun?: boolean;
+	/** How many times this item has been reset via needsRerun. Capped at MAX_RERUN_RESETS. */
+	rerunResets: number;
 }
 
 /**
@@ -253,6 +309,7 @@ export interface BlobQueueSnapshot {
 		status?: "pending" | "processing";
 		readyAt?: number;
 		needsRerun?: boolean;
+		rerunResets?: number;
 	}[];
 	downloads: {
 		path: string;
@@ -262,6 +319,7 @@ export interface BlobQueueSnapshot {
 		status?: "pending" | "processing";
 		readyAt?: number;
 		needsRerun?: boolean;
+		rerunResets?: number;
 	}[];
 }
 
@@ -302,9 +360,33 @@ export class BlobSyncManager {
 	/** Total transfers queued in the current batch (for N/M display). */
 	private _totalUploadsThisCycle = 0;
 	private _totalDownloadsThisCycle = 0;
+	/** Permanent failure counters (never reset — lifetime of plugin session). */
+	private _permanentUploadFailures = 0;
+	private _permanentDownloadFailures = 0;
+	/** Local-only conflict artifact counter (never reset — lifetime of plugin session). */
+	private _blobConflictArtifacts = 0;
+	private localOnlyBlobConflictPaths = new Set<string>();
+	private remoteDeleteInFlight = new Set<string>();
+	private remoteDeleteHashesByTransaction = new WeakMap<
+		import("yjs").Transaction,
+		Map<string, string>
+	>();
 
 	/** CRDT map observer cleanup functions. */
 	private observerCleanups: (() => void)[] = [];
+
+	/**
+	 * Paths where a remote-delete was received but no known hash baseline was
+	 * available to verify local state. These files were preserved on disk but
+	 * must NOT be auto-uploaded or have their tombstones cleared by later
+	 * scan/upload/import passes.
+	 *
+	 * Cleared when the user explicitly modifies the file (non-suppressed vault
+	 * event), deletes the file locally, or a future remote-delete arrives with
+	 * a real baseline hash.
+	 */
+	private preservedUnresolved: PreservedUnresolvedRegistry;
+	readonly preservedUnresolvedPaths: ReadonlySet<string>;
 
 	private readonly maxConcurrency: number;
 	private readonly maxSize: number;
@@ -327,6 +409,8 @@ export class BlobSyncManager {
 		},
 		hashCache: BlobHashCache,
 		private trace?: TraceRecord,
+		initialPreservedUnresolved: PreservedUnresolvedEntry[] = [],
+		private onPreservedUnresolvedChanged?: () => void,
 	) {
 		this.blobClient = new BlobHttpClient(
 			settings.host,
@@ -338,6 +422,10 @@ export class BlobSyncManager {
 		this.maxSize = settings.maxAttachmentSizeKB * 1024;
 		this.debug = settings.debug;
 		this.hashCache = hashCache;
+		this.preservedUnresolved = new PreservedUnresolvedRegistry(
+			initialPreservedUnresolved.filter((entry) => entry.kind === "blob"),
+		);
+		this.preservedUnresolvedPaths = this.preservedUnresolved.paths;
 	}
 
 	// -------------------------------------------------------------------
@@ -357,12 +445,27 @@ export class BlobSyncManager {
 					if (event.transaction.origin === ORIGIN_SEED) return;
 					const ref = this.vaultSync.pathToBlob.get(path);
 					if (!ref) return;
-					this.log(`observer: remote blob ref for "${path}" hash=${ref.hash.slice(0, 12)}…`);
+					this.log(
+						`observer: remote blob ref for "${path}" hash=${ref.hash.slice(0, 12)}…`,
+					);
 					this.scheduleDownload(path, ref.hash, ref.size);
 				}
 				if (change.action === "delete") {
 					if (event.transaction.origin === ORIGIN_SEED) return;
-					void this.handleRemoteDelete(path);
+					const oldRef = change.oldValue as BlobRef | undefined;
+					if (oldRef?.hash) {
+						let transactionHashes =
+							this.remoteDeleteHashesByTransaction.get(event.transaction);
+						if (!transactionHashes) {
+							transactionHashes = new Map();
+							this.remoteDeleteHashesByTransaction.set(
+								event.transaction,
+								transactionHashes,
+							);
+						}
+						transactionHashes.set(path, oldRef.hash);
+					}
+					void this.handleRemoteDelete(path, oldRef?.hash ?? null);
 				}
 			});
 		};
@@ -372,11 +475,18 @@ export class BlobSyncManager {
 		);
 
 		// blobTombstones observer: remote tombstone → delete from disk
-		const tombObserver = (event: import("yjs").YMapEvent<import("../types").BlobTombstone>) => {
+		const tombObserver = (
+			event: import("yjs").YMapEvent<import("../types").BlobTombstone>,
+		) => {
 			event.changes.keys.forEach((change, path) => {
 				if (change.action === "add" || change.action === "update") {
 					if (event.transaction.origin === ORIGIN_SEED) return;
-					void this.handleRemoteDelete(path);
+					const transactionHashes =
+						this.remoteDeleteHashesByTransaction.get(event.transaction);
+					if (transactionHashes?.has(path)) return;
+					// Try to find known hash from pathToBlob (may already be deleted)
+					const ref = this.vaultSync.pathToBlob.get(path);
+					void this.handleRemoteDelete(path, ref?.hash ?? null);
 				}
 			});
 		};
@@ -408,10 +518,16 @@ export class BlobSyncManager {
 			retries,
 			status: "pending",
 			readyAt: 0,
+			rerunResets: 0,
 		});
 	}
 
-	private enqueueDownload(path: string, hash: string, sizeBytes?: number, retries = 0): void {
+	private enqueueDownload(
+		path: string,
+		hash: string,
+		sizeBytes?: number,
+		retries = 0,
+	): void {
 		const existing = this.downloadQueue.get(path);
 		if (existing) {
 			existing.hash = hash;
@@ -433,6 +549,7 @@ export class BlobSyncManager {
 			retries,
 			status: "pending",
 			readyAt: 0,
+			rerunResets: 0,
 		});
 	}
 
@@ -445,9 +562,32 @@ export class BlobSyncManager {
 	 * Debounces and queues upload.
 	 */
 	handleFileChange(file: TFile): void {
+		if (
+			this.localOnlyBlobConflictPaths.has(file.path) ||
+			isBlobConflictArtifactPath(file.path)
+		) {
+			this.log(`handleFileChange: local-only blob conflict "${file.path}"`);
+			return;
+		}
+
 		if (this.isSuppressed(file.path)) {
 			this.log(`handleFileChange: suppressed "${file.path}"`);
 			return;
+		}
+
+		// If the user explicitly modifies a preserved-unresolved file, that
+		// constitutes intentional user action. Clear the guard and allow upload.
+		if (this.preservedUnresolvedPaths.has(file.path)) {
+			if (this.preservedUnresolved.resolve(file.path)) {
+				this.onPreservedUnresolvedChanged?.();
+			}
+			this.trace?.("blob", "preserved-unresolved-cleared", {
+				path: file.path,
+				reason: "user-modify-event",
+			});
+			this.log(
+				`handleFileChange: cleared preserved-unresolved for "${file.path}" (user modify)`,
+			);
 		}
 
 		// Clear existing debounce
@@ -476,10 +616,41 @@ export class BlobSyncManager {
 		this.uploadDebounce.delete(path);
 		this.uploadQueue.delete(path);
 
+		// If user deletes a preserved-unresolved file, that resolves the conflict.
+		if (this.preservedUnresolved.resolve(path)) {
+			this.onPreservedUnresolvedChanged?.();
+		}
+
 		// Remove from hash cache
 		removeCachedHash(this.hashCache, path);
 
 		this.vaultSync.deleteBlobRef(path, device);
+	}
+
+	/**
+	 * Returns true if this path was preserved during a remote-delete because
+	 * no hash baseline was available to verify local state.
+	 */
+	isPreservedUnresolved(path: string): boolean {
+		return this.preservedUnresolvedPaths.has(path);
+	}
+
+	/**
+	 * Clear the preserved-unresolved marker for a path.
+	 * Called when a future remote-delete arrives with a real baseline hash.
+	 */
+	clearPreservedUnresolved(path: string): void {
+		if (this.preservedUnresolved.resolve(path)) {
+			this.onPreservedUnresolvedChanged?.();
+			this.trace?.("blob", "preserved-unresolved-cleared", {
+				path,
+				reason: "baseline-now-available",
+			});
+		}
+	}
+
+	getPreservedUnresolvedEntries(): PreservedUnresolvedEntry[] {
+		return this.preservedUnresolved.getEntries();
 	}
 
 	/**
@@ -499,10 +670,25 @@ export class BlobSyncManager {
 		// Collect non-md, non-excluded disk files
 		const diskBlobs = new Map<string, TFile>();
 		for (const file of this.app.vault.getFiles()) {
-			if (!isBlobSyncable(file.path, excludePatterns, this.app.vault.configDir)) continue;
+			if (
+				!isBlobSyncable(
+					file.path,
+					excludePatterns,
+					this.app.vault.configDir,
+				)
+			)
+				continue;
 
 			// Size check
 			if (this.maxSize > 0 && file.stat.size > this.maxSize) continue;
+
+			if (
+				this.localOnlyBlobConflictPaths.has(file.path) ||
+				isBlobConflictArtifactPath(file.path)
+			) {
+				skipped++;
+				continue;
+			}
 
 			diskBlobs.set(file.path, file);
 		}
@@ -535,14 +721,29 @@ export class BlobSyncManager {
 				continue;
 			}
 
+			// Skip preserved-unresolved paths: these were preserved during a
+			// remote-delete with unknown baseline and must not be auto-uploaded
+			// until the user explicitly modifies them.
+			if (this.preservedUnresolvedPaths.has(path)) {
+				skipped++;
+				continue;
+			}
+
 			if (crdtBlobPaths.has(path)) {
 				// Both sides have this path — check for hash mismatch
 				// (file was modified while offline, e.g. image edited externally)
 				if (mode === "authoritative") {
 					const ref = this.vaultSync.pathToBlob.get(path);
 					if (ref) {
-						const fileStat = { mtime: file.stat.mtime, size: file.stat.size };
-						const cachedHash = getCachedHash(this.hashCache, path, fileStat);
+						const fileStat = {
+							mtime: file.stat.mtime,
+							size: file.stat.size,
+						};
+						const cachedHash = getCachedHash(
+							this.hashCache,
+							path,
+							fileStat,
+						);
 
 						if (cachedHash) {
 							// Cache hit: compare hashes directly (no read needed)
@@ -566,8 +767,8 @@ export class BlobSyncManager {
 				this.enqueueUpload(path, 0, file.stat.size);
 				uploadQueued++;
 			} else {
-					skipped++;
-				}
+				skipped++;
+			}
 		}
 
 		// Kick drains if anything was queued
@@ -583,7 +784,7 @@ export class BlobSyncManager {
 
 		this.log(
 			`reconcile: ${uploadQueued} uploads queued, ` +
-			`${downloadQueued} downloads queued, ${skipped} skipped`,
+				`${downloadQueued} downloads queued, ${skipped} skipped`,
 		);
 
 		return { uploadQueued, downloadQueued, skipped };
@@ -611,7 +812,10 @@ export class BlobSyncManager {
 					let p: Promise<void>;
 					p = this.processUpload(item)
 						.catch((err) => {
-							console.error(`[yaos:blob] Unexpected upload failure for "${item.path}":`, err);
+							console.error(
+								`[yaos:blob] Unexpected upload failure for "${item.path}":`,
+								err,
+							);
 						})
 						.finally(() => {
 							inFlight.delete(p);
@@ -637,9 +841,48 @@ export class BlobSyncManager {
 
 	private async processUpload(item: UploadItem): Promise<void> {
 		const start = Date.now();
-		this.log(`upload: started "${item.path}" (attempt ${item.retries + 1})`);
+		this.log(
+			`upload: started "${item.path}" (attempt ${item.retries + 1})`,
+		);
 		try {
 			const normalized = normalizePath(item.path);
+
+			// Guard: do not upload preserved-unresolved paths or local-only
+			// blob conflict artifacts. This can happen
+			// if a queue snapshot was restored with a stale entry for a path
+			// that was later guarded by conflict handling.
+			if (
+				this.localOnlyBlobConflictPaths.has(normalized) ||
+				this.localOnlyBlobConflictPaths.has(item.path) ||
+				isBlobConflictArtifactPath(normalized) ||
+				isBlobConflictArtifactPath(item.path) ||
+				this.preservedUnresolvedPaths.has(normalized) ||
+				this.preservedUnresolvedPaths.has(item.path)
+			) {
+				this.uploadQueue.delete(item.path);
+				const isLocalOnlyConflict =
+					this.localOnlyBlobConflictPaths.has(normalized) ||
+					this.localOnlyBlobConflictPaths.has(item.path) ||
+					isBlobConflictArtifactPath(normalized) ||
+					isBlobConflictArtifactPath(item.path);
+				this.trace?.(
+					"blob",
+					isLocalOnlyConflict
+						? "upload-skipped-local-guard"
+						: "upload-skipped-preserved-unresolved",
+					{
+						path: normalized,
+						reason: isLocalOnlyConflict
+							? "local-only-conflict-artifact"
+							: "preserved-unresolved",
+					},
+				);
+				this.log(
+					`upload: "${item.path}" is guarded local-only, skipping`,
+				);
+				return;
+			}
+
 			const file = this.app.vault.getAbstractFileByPath(normalized);
 			if (!(file instanceof TFile)) {
 				this.uploadQueue.delete(item.path);
@@ -651,7 +894,9 @@ export class BlobSyncManager {
 			// Size guard
 			if (this.maxSize > 0 && file.stat.size > this.maxSize) {
 				this.uploadQueue.delete(item.path);
-				this.log(`upload: "${item.path}" too large (${file.stat.size} bytes), skipping`);
+				this.log(
+					`upload: "${item.path}" too large (${file.stat.size} bytes), skipping`,
+				);
 				return;
 			}
 			item.sizeBytes = file.stat.size;
@@ -676,11 +921,15 @@ export class BlobSyncManager {
 					item.status = "pending";
 					item.retries = 0;
 					item.readyAt = 0;
-					this.log(`upload: "${item.path}" unchanged on this pass; running queued rerun`);
+					this.log(
+						`upload: "${item.path}" unchanged on this pass; running queued rerun`,
+					);
 					this.kickUploadDrain();
 				} else {
 					this.uploadQueue.delete(item.path);
-					this.log(`upload: "${item.path}" unchanged (hash match), skipping`);
+					this.log(
+						`upload: "${item.path}" unchanged (hash match), skipping`,
+					);
 				}
 				return;
 			}
@@ -698,9 +947,13 @@ export class BlobSyncManager {
 				const uploadTimeoutMs = transferTimeoutMs(item.sizeBytes);
 				await this.blobClient.upload(hash, mime, data, uploadTimeoutMs);
 
-				this.log(`upload: "${item.path}" uploaded (${data.byteLength} bytes)`);
+				this.log(
+					`upload: "${item.path}" uploaded (${data.byteLength} bytes)`,
+				);
 			} else {
-				this.log(`upload: "${item.path}" already in R2 (dedup), updating CRDT only`);
+				this.log(
+					`upload: "${item.path}" already in R2 (dedup), updating CRDT only`,
+				);
 			}
 
 			// Two-phase commit: update CRDT only after successful upload
@@ -712,11 +965,15 @@ export class BlobSyncManager {
 				item.status = "pending";
 				item.retries = 0;
 				item.readyAt = 0;
-				this.log(`upload: success "${item.path}" in ${Date.now() - start}ms (queued rerun)`);
+				this.log(
+					`upload: success "${item.path}" in ${Date.now() - start}ms (queued rerun)`,
+				);
 				this.kickUploadDrain();
 			} else {
 				this.uploadQueue.delete(item.path);
-				this.log(`upload: success "${item.path}" in ${Date.now() - start}ms`);
+				this.log(
+					`upload: success "${item.path}" in ${Date.now() - start}ms`,
+				);
 			}
 		} catch (err) {
 			const reason = err instanceof Error ? err.message : String(err);
@@ -724,23 +981,33 @@ export class BlobSyncManager {
 				const delay = RETRY_BASE_MS * Math.pow(4, item.retries);
 				this.log(
 					`upload: failed "${item.path}" in ${Date.now() - start}ms ` +
-					`(attempt ${item.retries + 1}): ${reason}; retrying in ${delay}ms`,
+						`(attempt ${item.retries + 1}): ${reason}; retrying in ${delay}ms`,
 				);
 				item.retries++;
 				item.status = "pending";
 				item.readyAt = Date.now() + delay;
 				this.scheduleRetryKick(delay, "upload");
 			} else {
-				if (item.needsRerun) {
+				if (item.needsRerun && item.rerunResets < MAX_RERUN_RESETS) {
 					item.needsRerun = false;
 					item.status = "pending";
 					item.retries = 0;
 					item.readyAt = 0;
-					this.log(`upload: "${item.path}" had pending rerun; restarting fresh`);
+					item.rerunResets++;
+					this.log(
+						`upload: "${item.path}" had pending rerun (reset ${item.rerunResets}/${MAX_RERUN_RESETS}); restarting fresh`,
+					);
 					this.kickUploadDrain();
 					return;
 				}
 				this.uploadQueue.delete(item.path);
+				this._permanentUploadFailures++;
+				this.trace?.("blob", "upload-permanently-failed", {
+					path: item.path,
+					retries: item.retries,
+					error: err instanceof Error ? err.message : String(err),
+					totalPermanentFailures: this._permanentUploadFailures,
+				});
 				console.error(
 					`[yaos:blob] Upload failed permanently for "${item.path}":`,
 					err,
@@ -769,7 +1036,11 @@ export class BlobSyncManager {
 	// Download drain
 	// -------------------------------------------------------------------
 
-	private scheduleDownload(path: string, hash: string, sizeBytes?: number): void {
+	private scheduleDownload(
+		path: string,
+		hash: string,
+		sizeBytes?: number,
+	): void {
 		this.enqueueDownload(path, hash, sizeBytes);
 		this.kickDownloadDrain();
 	}
@@ -786,7 +1057,9 @@ export class BlobSyncManager {
 			if (this.downloadQueue.has(path)) continue;
 
 			// Check if file exists on disk already
-			const existing = this.app.vault.getAbstractFileByPath(normalizePath(path));
+			const existing = this.app.vault.getAbstractFileByPath(
+				normalizePath(path),
+			);
 			if (existing instanceof TFile) continue;
 
 			// Look up the blob ref in the CRDT
@@ -799,7 +1072,9 @@ export class BlobSyncManager {
 		}
 
 		if (queued > 0) {
-			this.log(`prioritizeDownloads: queued ${queued} prefetch downloads`);
+			this.log(
+				`prioritizeDownloads: queued ${queued} prefetch downloads`,
+			);
 			this.kickDownloadDrain();
 		}
 		return queued;
@@ -824,7 +1099,10 @@ export class BlobSyncManager {
 					let p: Promise<void>;
 					p = this.processDownload(item)
 						.catch((err) => {
-							console.error(`[yaos:blob] Unexpected download failure for "${item.path}":`, err);
+							console.error(
+								`[yaos:blob] Unexpected download failure for "${item.path}":`,
+								err,
+							);
 						})
 						.finally(() => {
 							inFlight.delete(p);
@@ -850,36 +1128,65 @@ export class BlobSyncManager {
 
 	private async processDownload(item: DownloadItem): Promise<void> {
 		const start = Date.now();
-		this.log(`download: started "${item.path}" (attempt ${item.retries + 1})`);
+		this.log(
+			`download: started "${item.path}" (attempt ${item.retries + 1})`,
+		);
 		try {
 			const normalized = normalizePath(item.path);
 
 			// Check if file already exists with matching hash
 			const existing = this.app.vault.getAbstractFileByPath(normalized);
+			let diskHashBefore: string | null = null;
 			if (existing instanceof TFile) {
 				// Try hash cache first
-				const fileStat = { mtime: existing.stat.mtime, size: existing.stat.size };
-				let diskHash = getCachedHash(this.hashCache, item.path, fileStat);
+				const fileStat = {
+					mtime: existing.stat.mtime,
+					size: existing.stat.size,
+				};
+				let diskHash = getCachedHash(
+					this.hashCache,
+					item.path,
+					fileStat,
+				);
 
 				if (!diskHash) {
 					try {
 						const data = await this.app.vault.readBinary(existing);
 						diskHash = await hashArrayBuffer(data);
-						setCachedHash(this.hashCache, item.path, fileStat, diskHash);
+						setCachedHash(
+							this.hashCache,
+							item.path,
+							fileStat,
+							diskHash,
+						);
 					} catch {
 						// Can't read — download anyway
 					}
 				}
+				diskHashBefore = diskHash ?? null;
 
 				if (diskHash === item.hash) {
 					this.downloadQueue.delete(item.path);
-					this.log(`download: "${item.path}" already matches, skipping`);
+					this.log(
+						`download: "${item.path}" already matches, skipping`,
+					);
+					this.trace?.("blob", "download-overwrite-decision", {
+						path: item.path,
+						hashPrefix: hashPrefix(item.hash),
+						diskHashBeforePrefix: hashPrefix(diskHashBefore),
+						action: "skip-existing-match",
+						sizeBytes: item.sizeBytes ?? null,
+					});
 					return;
 				}
 			}
 
 			const downloadTimeoutMs = transferTimeoutMs(item.sizeBytes);
-			const data = await this.blobClient.download(item.hash, downloadTimeoutMs);
+			const data = await this.blobClient.download(
+				item.hash,
+				downloadTimeoutMs,
+			);
+			let targetHasRemoteBytes = false;
 
 			// Verify hash of downloaded data
 			const downloadHash = await hashArrayBuffer(data);
@@ -894,13 +1201,66 @@ export class BlobSyncManager {
 
 			// Write to disk
 			if (existing instanceof TFile) {
-				await this.app.vault.modifyBinary(existing, data);
-				this.log(`download: updated "${item.path}" (${data.byteLength} bytes) in ${Date.now() - start}ms`);
+				const diskHashAfterDownload = await this.hashExistingFile(
+					existing,
+					item.path,
+				);
+				if (
+					diskHashBefore !== null &&
+					diskHashAfterDownload !== null &&
+					diskHashAfterDownload !== diskHashBefore
+				) {
+					const conflictPath =
+						await this.writeDownloadConflictArtifact(
+							normalized,
+							data,
+							"existing-changed-during-download",
+						);
+					this.trace?.("blob", "download-conflict-quarantined", {
+						path: item.path,
+						conflictPath,
+						hashPrefix: hashPrefix(item.hash),
+						diskHashBeforePrefix: hashPrefix(diskHashBefore),
+						diskHashAfterPrefix: hashPrefix(diskHashAfterDownload),
+						reason: "existing-changed-during-download",
+						sizeBytes: data.byteLength,
+					});
+					this.log(
+						`download: conflict artifact "${conflictPath}" for "${item.path}" ` +
+							`(local file changed during download)`,
+					);
+				} else {
+					this.trace?.("blob", "download-overwrite-decision", {
+						path: item.path,
+						hashPrefix: hashPrefix(item.hash),
+						diskHashBeforePrefix: hashPrefix(diskHashBefore),
+						diskHashAfterPrefix: hashPrefix(diskHashAfterDownload),
+						action: "overwrite-existing",
+						sizeBytes: data.byteLength,
+					});
+					await this.app.vault.modifyBinary(existing, data);
+					targetHasRemoteBytes = true;
+					this.log(
+						`download: updated "${item.path}" (${data.byteLength} bytes) in ${Date.now() - start}ms`,
+					);
+				}
 			} else {
+				this.trace?.("blob", "download-overwrite-decision", {
+					path: item.path,
+					hashPrefix: hashPrefix(item.hash),
+					diskHashBeforePrefix: null,
+					action: "create-missing",
+					sizeBytes: data.byteLength,
+				});
 				// Ensure parent directory exists
-				const dir = normalized.substring(0, normalized.lastIndexOf("/"));
+				const dir = normalized.substring(
+					0,
+					normalized.lastIndexOf("/"),
+				);
 				if (dir) {
-					const dirExists = this.app.vault.getAbstractFileByPath(normalizePath(dir));
+					const dirExists = this.app.vault.getAbstractFileByPath(
+						normalizePath(dir),
+					);
 					if (!dirExists) {
 						try {
 							await this.app.vault.createFolder(dir);
@@ -911,30 +1271,68 @@ export class BlobSyncManager {
 				}
 				try {
 					await this.app.vault.createBinary(normalized, data);
-					this.log(`download: created "${item.path}" (${data.byteLength} bytes) in ${Date.now() - start}ms`);
+					targetHasRemoteBytes = true;
+					this.log(
+						`download: created "${item.path}" (${data.byteLength} bytes) in ${Date.now() - start}ms`,
+					);
 				} catch (err) {
 					if (!isAlreadyExistsError(err)) throw err;
-					const resolved = this.app.vault.getAbstractFileByPath(normalized);
+					const resolved =
+						this.app.vault.getAbstractFileByPath(normalized);
 					if (!(resolved instanceof TFile)) throw err;
 
-					const fileStat = { mtime: resolved.stat.mtime, size: resolved.stat.size };
-					let diskHash = getCachedHash(this.hashCache, item.path, fileStat);
+					const fileStat = {
+						mtime: resolved.stat.mtime,
+						size: resolved.stat.size,
+					};
+					let diskHash = getCachedHash(
+						this.hashCache,
+						item.path,
+						fileStat,
+					);
 					if (!diskHash) {
-						const existingData = await this.app.vault.readBinary(resolved);
+						const existingData =
+							await this.app.vault.readBinary(resolved);
 						diskHash = await hashArrayBuffer(existingData);
-						setCachedHash(this.hashCache, item.path, fileStat, diskHash);
+						setCachedHash(
+							this.hashCache,
+							item.path,
+							fileStat,
+							diskHash,
+						);
 					}
 
 					if (diskHash === item.hash) {
+						this.trace?.("blob", "download-overwrite-decision", {
+							path: item.path,
+							hashPrefix: hashPrefix(item.hash),
+							diskHashBeforePrefix: hashPrefix(diskHash),
+							action: "skip-create-race-match",
+							sizeBytes: data.byteLength,
+						});
 						this.log(
 							`download: "${item.path}" already matches after create race, skipping ` +
-							`in ${Date.now() - start}ms`,
+								`in ${Date.now() - start}ms`,
 						);
+						targetHasRemoteBytes = true;
 					} else {
-						await this.app.vault.modifyBinary(resolved, data);
+						const conflictPath =
+							await this.writeDownloadConflictArtifact(
+								normalized,
+								data,
+								"create-race-mismatch",
+							);
+						this.trace?.("blob", "download-conflict-quarantined", {
+							path: item.path,
+							conflictPath,
+							hashPrefix: hashPrefix(item.hash),
+							diskHashBeforePrefix: hashPrefix(diskHash),
+							reason: "create-race-mismatch",
+							sizeBytes: data.byteLength,
+						});
 						this.log(
-							`download: updated "${item.path}" after create race ` +
-							`(${data.byteLength} bytes) in ${Date.now() - start}ms`,
+							`download: conflict artifact "${conflictPath}" after create race for "${item.path}" ` +
+								`(${data.byteLength} bytes) in ${Date.now() - start}ms`,
 						);
 					}
 				}
@@ -942,17 +1340,22 @@ export class BlobSyncManager {
 
 			// Update hash cache with the freshly-written file's hash.
 			// Use stat from disk to get the actual mtime the OS assigned.
-			try {
-				const freshStat = await this.app.vault.adapter.stat(normalized);
-				if (freshStat) {
-					setCachedHash(
-						this.hashCache,
-						item.path,
-						{ mtime: freshStat.mtime, size: freshStat.size },
-						item.hash,
-					);
+			if (targetHasRemoteBytes) {
+				try {
+					const freshStat =
+						await this.app.vault.adapter.stat(normalized);
+					if (freshStat) {
+						setCachedHash(
+							this.hashCache,
+							item.path,
+							{ mtime: freshStat.mtime, size: freshStat.size },
+							item.hash,
+						);
+					}
+				} catch {
+					/* stat failed, cache will miss next time — fine */
 				}
-			} catch { /* stat failed, cache will miss next time — fine */ }
+			}
 
 			this._completedDownloads++;
 			if (item.needsRerun) {
@@ -960,7 +1363,9 @@ export class BlobSyncManager {
 				item.status = "pending";
 				item.retries = 0;
 				item.readyAt = 0;
-				this.log(`download: success "${item.path}" in ${Date.now() - start}ms (queued rerun)`);
+				this.log(
+					`download: success "${item.path}" in ${Date.now() - start}ms (queued rerun)`,
+				);
 				this.kickDownloadDrain();
 			} else {
 				this.downloadQueue.delete(item.path);
@@ -971,29 +1376,122 @@ export class BlobSyncManager {
 				const delay = RETRY_BASE_MS * Math.pow(4, item.retries);
 				this.log(
 					`download: failed "${item.path}" in ${Date.now() - start}ms ` +
-					`(attempt ${item.retries + 1}): ${reason}; retrying in ${delay}ms`,
+						`(attempt ${item.retries + 1}): ${reason}; retrying in ${delay}ms`,
 				);
 				item.retries++;
 				item.status = "pending";
 				item.readyAt = Date.now() + delay;
 				this.scheduleRetryKick(delay, "download");
 			} else {
-				if (item.needsRerun) {
+				if (item.needsRerun && item.rerunResets < MAX_RERUN_RESETS) {
 					item.needsRerun = false;
 					item.status = "pending";
 					item.retries = 0;
 					item.readyAt = 0;
-					this.log(`download: "${item.path}" had pending rerun; restarting fresh`);
+					item.rerunResets++;
+					this.log(
+						`download: "${item.path}" had pending rerun (reset ${item.rerunResets}/${MAX_RERUN_RESETS}); restarting fresh`,
+					);
 					this.kickDownloadDrain();
 					return;
 				}
 				this.downloadQueue.delete(item.path);
+				this._permanentDownloadFailures++;
+				this.trace?.("blob", "download-permanently-failed", {
+					path: item.path,
+					retries: item.retries,
+					error: err instanceof Error ? err.message : String(err),
+					totalPermanentFailures: this._permanentDownloadFailures,
+				});
 				console.error(
 					`[yaos:blob] Download failed permanently for "${item.path}":`,
 					err,
 				);
 			}
 		}
+	}
+
+	private async hashExistingFile(
+		file: TFile,
+		path: string,
+	): Promise<string | null> {
+		const fileStat = { mtime: file.stat.mtime, size: file.stat.size };
+		const cachedHash = getCachedHash(this.hashCache, path, fileStat);
+		if (cachedHash) return cachedHash;
+		try {
+			const data = await this.app.vault.readBinary(file);
+			const hash = await hashArrayBuffer(data);
+			setCachedHash(this.hashCache, path, fileStat, hash);
+			return hash;
+		} catch {
+			return null;
+		}
+	}
+
+	/**
+	 * Write remote blob bytes to a conflict artifact instead of overwriting the
+	 * target file.
+	 *
+	 * Policy: blob conflict artifacts are LOCAL-ONLY safety artifacts. They are
+	 * suppressed from upload so they do not sync back to the server or other
+	 * devices. This is intentional — the artifact exists only to preserve remote
+	 * bytes that could not safely overwrite the local file. The user can inspect,
+	 * rename, or delete the artifact. If they want the remote version to sync,
+	 * they should replace the original file manually.
+	 *
+	 * Markdown conflict artifacts (from ReconciliationController) are created via
+	 * vault.create() WITHOUT suppression, so they DO sync. This difference is
+	 * deliberate: Markdown conflicts involve CRDT state that is already part of
+	 * the sync model, while blob conflicts involve raw binary data racing against
+	 * a local file change.
+	 */
+	private async writeDownloadConflictArtifact(
+		targetPath: string,
+		data: ArrayBuffer,
+		reason: "existing-changed-during-download" | "create-race-mismatch",
+	): Promise<string> {
+		const baseConflictPath = conflictPathFor(targetPath);
+		for (let i = 0; i < 100; i++) {
+			const conflictPath =
+				i === 0
+					? baseConflictPath
+					: baseConflictPath.replace(/(\.[^/.]+)?$/, ` ${i + 1}$1`);
+			if (this.app.vault.getAbstractFileByPath(conflictPath)) continue;
+			try {
+				this.suppress(conflictPath);
+				await this.app.vault.createBinary(conflictPath, data);
+				this.localOnlyBlobConflictPaths.add(conflictPath);
+				const freshStat =
+					await this.app.vault.adapter.stat(conflictPath);
+				if (freshStat) {
+					const hash = await hashArrayBuffer(data);
+					setCachedHash(
+						this.hashCache,
+						conflictPath,
+						{ mtime: freshStat.mtime, size: freshStat.size },
+						hash,
+					);
+				}
+				this._blobConflictArtifacts++;
+				// Notify the user — blob conflict artifacts are local-only
+				// and will NOT sync to other devices.
+				try {
+					new Notice(
+						`YAOS: Local-only attachment conflict preserved — "${conflictPath.split("/").pop()}" (this device only)`,
+						8000,
+					);
+				} catch {
+					// Notice may fail in testing or headless environments.
+				}
+				return conflictPath;
+			} catch (err) {
+				if (isAlreadyExistsError(err)) continue;
+				throw err;
+			}
+		}
+		throw new Error(
+			`could not create blob conflict artifact for ${reason}`,
+		);
 	}
 
 	private nextPendingDownload(): DownloadItem | null {
@@ -1016,26 +1514,206 @@ export class BlobSyncManager {
 	// Remote delete handler
 	// -------------------------------------------------------------------
 
-	private async handleRemoteDelete(path: string): Promise<void> {
+	private async handleRemoteDelete(
+		path: string,
+		knownHash: string | null,
+	): Promise<void> {
 		const normalized = normalizePath(path);
+		if (this.remoteDeleteInFlight.has(normalized) && !knownHash) {
+			this.trace?.("blob", "remote-delete-duplicate-ignored", {
+				path: normalized,
+				reason: "unknown-baseline-handler-already-in-flight",
+			});
+			return;
+		}
+		this.remoteDeleteInFlight.add(normalized);
 		const file = this.app.vault.getAbstractFileByPath(normalized);
+		if (!(file instanceof TFile)) {
+			this.remoteDeleteInFlight.delete(normalized);
+			return;
+		}
 		if (file instanceof TFile) {
-				try {
-					this.suppress(path);
-					// Remote sync deletes must remove the local replica, not move it to the user's trash.
-					// eslint-disable-next-line obsidianmd/prefer-file-manager-trash-file
-					await this.app.vault.delete(file);
-					this.log(`handleRemoteDelete: deleted "${path}" from disk`);
+			try {
+				// Remote delete decision: three-way typed decision avoids
+				// conflating "known dirty" with "unknown baseline".
+				let decision: BlobRemoteDeleteDecision = {
+					kind: "apply-delete",
+				};
+				let unresolvedReason: PreservedUnresolvedReason | null = null;
+
+				if (knownHash) {
+					try {
+						const fileStat =
+							await this.app.vault.adapter.stat(normalized);
+						if (fileStat) {
+							let localHash = getCachedHash(
+								this.hashCache,
+								normalized,
+								fileStat,
+							);
+							if (!localHash) {
+								try {
+									const data = await this.app.vault.readBinary(file);
+									localHash = await hashArrayBuffer(data);
+									setCachedHash(
+										this.hashCache,
+										normalized,
+										{
+											mtime: fileStat.mtime,
+											size: fileStat.size,
+										},
+										localHash,
+									);
+								} catch {
+									decision = { kind: "preserve-unresolved" };
+									unresolvedReason = "remote-delete-hash-read-failed";
+									this.trace?.(
+										"blob",
+										"remote-delete-conflict-preserved",
+										{
+											path: normalized,
+											knownHash: knownHash?.slice(0, 12) ?? null,
+											reason: "read-failed-cannot-verify",
+										},
+									);
+									this.log(
+										`handleRemoteDelete: preserved "${normalized}" (read failed — cannot verify local state)`,
+									);
+								}
+							}
+							if (localHash && localHash !== knownHash) {
+								// Known baseline exists, local hash differs → known dirty.
+								decision = { kind: "preserve-revive" };
+							}
+						}
+					} catch {
+						// Stat failed — file might be locked, busy, or inaccessible.
+						// We have a baseline hash but cannot verify local state.
+						// Treat as unresolved to avoid deleting potentially modified data.
+						decision = { kind: "preserve-unresolved" };
+						unresolvedReason = "remote-delete-stat-failed";
+						this.trace?.(
+							"blob",
+							"remote-delete-conflict-preserved",
+							{
+								path: normalized,
+								knownHash: knownHash?.slice(0, 12) ?? null,
+								reason: "stat-failed-cannot-verify",
+							},
+						);
+						this.log(
+							`handleRemoteDelete: preserved "${normalized}" (stat failed — cannot verify local state)`,
+						);
+					}
+				} else {
+					// No known hash — cannot verify local file is unmodified.
+					// Preserve but do NOT auto-clear tombstone. This prevents
+					// phantom resurrection of legitimately deleted files when
+					// hash state is transiently unavailable.
+					decision = { kind: "preserve-unresolved" };
+					unresolvedReason = "remote-delete-missing-baseline";
+				}
+
+				if (decision.kind === "apply-delete") {
+					// Clear any prior unresolved marker — we now have a baseline.
+					if (this.preservedUnresolved.resolve(normalized)) {
+						this.onPreservedUnresolvedChanged?.();
+					}
+					this.suppress(normalized);
+					const deleteMode = await this.deleteLocalReplica(file);
+					this.trace?.("blob", "remote-delete-applied", {
+						path: normalized,
+						deleteMode,
+						reason: "remote-delete",
+					});
+					this.log(
+						`handleRemoteDelete: deleted "${normalized}" from disk`,
+					);
+				} else if (decision.kind === "preserve-revive") {
+					// Clear any prior unresolved marker — we now have a baseline.
+					if (this.preservedUnresolved.resolve(normalized)) {
+						this.onPreservedUnresolvedChanged?.();
+					}
+					// Known dirty: local file intentionally differs from baseline.
+					// Clear tombstone so it re-enters sync.
+					this.trace?.("blob", "remote-delete-conflict-preserved", {
+						path: normalized,
+						knownHash: knownHash?.slice(0, 12) ?? null,
+						reason: "local-file-modified-since-last-sync",
+					});
+					this.log(
+						`handleRemoteDelete: preserved locally modified "${normalized}" (hash mismatch with known ${knownHash!.slice(0, 12)}…)`,
+					);
+					if (this.vaultSync.isBlobTombstoned?.(normalized)) {
+						this.vaultSync.blobTombstones.delete(normalized);
+						this.trace?.(
+							"blob",
+							"remote-delete-preserved-tombstone-cleared",
+							{
+								path: normalized,
+								reason: "local-dirty-file-revived",
+							},
+						);
+					}
+				} else {
+					// preserve-unresolved: file stays, tombstone stays.
+					// DO NOT auto-clear tombstone. Later reconcile/import passes
+					// keep it in limbo until explicit user action or a future
+					// remote event provides a new decision point.
+					this.preservedUnresolved.record({
+						path: normalized,
+						kind: "blob",
+						reason: unresolvedReason ?? "unknown",
+						knownRemoteHash: knownHash,
+					});
+					this.onPreservedUnresolvedChanged?.();
+					this.trace?.("blob", "remote-delete-conflict-preserved", {
+						path: normalized,
+						knownHash: null,
+						reason: "no-known-hash-baseline",
+					});
+					this.log(
+						`handleRemoteDelete: preserved "${normalized}" (no known hash baseline — unresolved)`,
+					);
+				}
 			} catch (err) {
 				console.error(
 					`[yaos:blob] handleRemoteDelete failed for "${path}":`,
 					err,
 				);
+			} finally {
+				this.remoteDeleteInFlight.delete(normalized);
 			}
 		}
 	}
 
-	private scheduleRetryKick(delayMs: number, channel: "upload" | "download"): void {
+	private async deleteLocalReplica(file: TFile): Promise<"trash" | "delete"> {
+		const fileManager = (
+			this.app as unknown as {
+				fileManager?: {
+					trashFile?: (
+						file: TFile,
+						system?: boolean,
+					) => Promise<void>;
+				};
+			}
+		).fileManager;
+		if (fileManager?.trashFile) {
+			try {
+				await fileManager.trashFile(file, true);
+				return "trash";
+			} catch {
+				// Some adapters do not support system trash; fall back to delete.
+			}
+		}
+		await this.app.vault.delete(file);
+		return "delete";
+	}
+
+	private scheduleRetryKick(
+		delayMs: number,
+		channel: "upload" | "download",
+	): void {
 		const timer = setTimeout(() => {
 			this.retryTimers.delete(timer);
 			if (channel === "upload") this.kickUploadDrain();
@@ -1083,13 +1761,24 @@ export class BlobSyncManager {
 			this.pendingUploadCount() +
 			this.uploadDebounce.size +
 			this.inflightUploads.size;
-		if (upPending > 0 || this._completedUploads < this._totalUploadsThisCycle) {
-			parts.push(`↑${this._completedUploads}/${this._totalUploadsThisCycle}`);
+		if (
+			upPending > 0 ||
+			this._completedUploads < this._totalUploadsThisCycle
+		) {
+			parts.push(
+				`↑${this._completedUploads}/${this._totalUploadsThisCycle}`,
+			);
 		}
 
-		const downPending = this.pendingDownloadCount() + this.inflightDownloads.size;
-		if (downPending > 0 || this._completedDownloads < this._totalDownloadsThisCycle) {
-			parts.push(`↓${this._completedDownloads}/${this._totalDownloadsThisCycle}`);
+		const downPending =
+			this.pendingDownloadCount() + this.inflightDownloads.size;
+		if (
+			downPending > 0 ||
+			this._completedDownloads < this._totalDownloadsThisCycle
+		) {
+			parts.push(
+				`↓${this._completedDownloads}/${this._totalDownloadsThisCycle}`,
+			);
 		}
 
 		return parts.length > 0 ? parts.join(" ") : null;
@@ -1120,14 +1809,7 @@ export class BlobSyncManager {
 	 * Processing items are restored as pending on load.
 	 */
 	exportQueue(): BlobQueueSnapshot {
-		const uploads: {
-			path: string;
-			sizeBytes?: number;
-			retries?: number;
-			status?: "pending" | "processing";
-			readyAt?: number;
-			needsRerun?: boolean;
-		}[] = [];
+		const uploads: BlobQueueSnapshot["uploads"] = [];
 		for (const [, item] of this.uploadQueue) {
 			uploads.push({
 				path: item.path,
@@ -1136,24 +1818,23 @@ export class BlobSyncManager {
 				status: item.status,
 				readyAt: item.readyAt,
 				needsRerun: item.needsRerun,
+				rerunResets: item.rerunResets,
 			});
 		}
 		// Also include items in debounce (not yet in queue but pending)
 		for (const [path] of this.uploadDebounce) {
 			if (!this.uploadQueue.has(path)) {
-				uploads.push({ path, retries: 0, status: "pending", readyAt: 0 });
+				uploads.push({
+					path,
+					retries: 0,
+					status: "pending",
+					readyAt: 0,
+					rerunResets: 0,
+				});
 			}
 		}
 
-		const downloads: {
-			path: string;
-			hash: string;
-			sizeBytes?: number;
-			retries?: number;
-			status?: "pending" | "processing";
-			readyAt?: number;
-			needsRerun?: boolean;
-		}[] = [];
+		const downloads: BlobQueueSnapshot["downloads"] = [];
 		for (const [, item] of this.downloadQueue) {
 			downloads.push({
 				path: item.path,
@@ -1163,6 +1844,7 @@ export class BlobSyncManager {
 				status: item.status,
 				readyAt: item.readyAt,
 				needsRerun: item.needsRerun,
+				rerunResets: item.rerunResets,
 			});
 		}
 
@@ -1178,7 +1860,10 @@ export class BlobSyncManager {
 
 		if (snapshot.uploads) {
 			for (const item of snapshot.uploads) {
-				if (!this.uploadQueue.has(item.path) && !this.uploadDebounce.has(item.path)) {
+				if (
+					!this.uploadQueue.has(item.path) &&
+					!this.uploadDebounce.has(item.path)
+				) {
 					this.uploadQueue.set(item.path, {
 						path: item.path,
 						sizeBytes: item.sizeBytes,
@@ -1186,6 +1871,7 @@ export class BlobSyncManager {
 						status: "pending",
 						readyAt: 0,
 						needsRerun: item.needsRerun ?? false,
+						rerunResets: item.rerunResets ?? 0,
 					});
 					restored++;
 				}
@@ -1203,6 +1889,7 @@ export class BlobSyncManager {
 						status: "pending",
 						readyAt: 0,
 						needsRerun: item.needsRerun ?? false,
+						rerunResets: item.rerunResets ?? 0,
 					});
 					restored++;
 				}
@@ -1222,10 +1909,14 @@ export class BlobSyncManager {
 		this.log(`Download gate opened (${reason})`);
 		const dropped = this.pruneSatisfiedQueuedDownloads();
 		if (dropped > 0) {
-			this.log(`Download gate: dropped ${dropped} stale queued downloads`);
+			this.log(
+				`Download gate: dropped ${dropped} stale queued downloads`,
+			);
 		}
 		if (this.downloadQueue.size > 0) {
-			this.log(`Download gate: draining ${this.downloadQueue.size} queued downloads`);
+			this.log(
+				`Download gate: draining ${this.downloadQueue.size} queued downloads`,
+			);
 		}
 		this.kickDownloadDrain();
 	}
@@ -1234,10 +1925,15 @@ export class BlobSyncManager {
 		let dropped = 0;
 		for (const [path, item] of this.downloadQueue) {
 			if (item.status !== "pending") continue;
-			const existing = this.app.vault.getAbstractFileByPath(normalizePath(path));
+			const existing = this.app.vault.getAbstractFileByPath(
+				normalizePath(path),
+			);
 			if (!(existing instanceof TFile)) continue;
 
-			const fileStat = { mtime: existing.stat.mtime, size: existing.stat.size };
+			const fileStat = {
+				mtime: existing.stat.mtime,
+				size: existing.stat.size,
+			};
 			const cachedHash = getCachedHash(this.hashCache, path, fileStat);
 			if (cachedHash !== item.hash) continue;
 
@@ -1271,22 +1967,30 @@ export class BlobSyncManager {
 		this.inflightUploads.clear();
 		this.inflightDownloads.clear();
 		this.suppressedPaths.clear();
+		this.localOnlyBlobConflictPaths.clear();
+		this.remoteDeleteInFlight.clear();
+		this.preservedUnresolved.clear();
 		this.log("BlobSyncManager destroyed");
 	}
 
 	getDebugSnapshot(): {
 		pendingUploads: number;
-			pendingDownloads: number;
-			processingUploads: number;
-			processingDownloads: number;
-			uploadDraining: boolean;
-			downloadDraining: boolean;
-			downloadGateOpen: boolean;
-			suppressedCount: number;
-			uploadQueue: string[];
-			downloadQueue: string[];
-			inflightUploads: string[];
-			inflightDownloads: string[];
+		pendingDownloads: number;
+		processingUploads: number;
+		processingDownloads: number;
+		uploadDraining: boolean;
+		downloadDraining: boolean;
+		downloadGateOpen: boolean;
+		suppressedCount: number;
+		permanentUploadFailures: number;
+		permanentDownloadFailures: number;
+		blobConflictArtifacts: number;
+		localOnlyBlobConflictPaths: number;
+		preservedUnresolved: ReturnType<PreservedUnresolvedRegistry["getSummary"]>;
+		uploadQueue: string[];
+		downloadQueue: string[];
+		inflightUploads: string[];
+		inflightDownloads: string[];
 	} {
 		return {
 			pendingUploads: this.pendingUploadCount(),
@@ -1297,6 +2001,11 @@ export class BlobSyncManager {
 			downloadDraining: this.downloadDraining,
 			downloadGateOpen: this.downloadGateOpen,
 			suppressedCount: this.suppressedPaths.size,
+			permanentUploadFailures: this._permanentUploadFailures,
+			permanentDownloadFailures: this._permanentDownloadFailures,
+			blobConflictArtifacts: this._blobConflictArtifacts,
+			localOnlyBlobConflictPaths: this.localOnlyBlobConflictPaths.size,
+			preservedUnresolved: this.preservedUnresolved.getSummary(),
 			uploadQueue: Array.from(this.uploadQueue.values())
 				.filter((item) => item.status === "pending")
 				.map((item) => item.path),
