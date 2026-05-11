@@ -50,37 +50,6 @@ From the claim page, open the setup link or scan the QR code. YAOS fills in the 
 
 That's it. Your vault is syncing.
 
-## Server receipt status
-
-YAOS now shows a small server receipt signal in the status bar. It answers one
-narrow question:
-
-> Has the server's in-memory Y.Doc received this device's latest local CRDT state?
-
-When it says **Receipt: received**, the server room has
-echoed a state vector that includes this device's latest local candidate. This is
-useful for poor connectivity and offline/reconnect workflows.
-
-It does **not** mean:
-
-- the update is durably written to the server journal or checkpoint
-- another device has already received or applied the update
-- every device is up to date
-- there are zero queued updates
-
-Other states are intentionally conservative:
-
-| Status | Meaning |
-|--------|---------|
-| **Receipt: waiting** | Local state exists that the server has not yet echoed back as received. If this stays stuck while online, reconnect and check diagnostics. |
-| **Receipt: not tracked** | No local receipt candidate has been observed in this session. |
-| **Receipt: offline, last echo ...** | You are offline now; YAOS only knows when the last fresh server receipt echo arrived. |
-| **Receipt: restart unchecked** | Local Yjs cache replay timed out, so YAOS did not trust persisted receipt state this session. |
-| **persistence degraded** | Current-session receipt tracking can still work, but restart continuity for receipt state may be unavailable. |
-
-This is a Level 3 server receipt: server Y.Doc memory only. It is not a Level 4
-durability guarantee.
-
 ## Attachments and snapshots
 
 Text sync works out of the box. To sync images, PDFs, and other attachments, add a Cloudflare R2 bucket — it takes about a minute.
