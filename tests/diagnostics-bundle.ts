@@ -69,6 +69,11 @@ const KNOWN_PATH_2        = "Inbox/private-note.md";
 // This exercises the regex-based redactor path for unseeded paths in free-form
 // log messages (not known-path key redaction).
 const SERVER_TRACE_ONLY_PATH = "Attachments/private-image.png";
+const HISTORICAL_EVENT_ONLY_PATH = "Deleted Medical Notes/old-result.md";
+const STRUCTURED_TRACE_ONLY_PATH = "Archive/structured-secret.md";
+const CONFLICT_PATH = "Notes/important (YAOS conflict from Laptop 2026-05-11T12-00-00Z).md";
+const NORMALIZED_PATH = "Notes/some-file.md";
+const FULL_CONTENT_HASH = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 function makeInput(overrides: Partial<DiagnosticsBundleInput> = {}): DiagnosticsBundleInput {
 	const diskHashes = new Map<string, { hash: string; length: number }>([
@@ -141,11 +146,32 @@ function makeInput(overrides: Partial<DiagnosticsBundleInput> = {}): Diagnostics
 		crdtHashes,
 		eventRing: [
 			{ ts: "2026-05-10T00:00:00.000Z", msg: `synced "${KNOWN_PATH_1}"` },
+			{ ts: "2026-05-10T00:00:01.000Z", msg: `failed to read "${HISTORICAL_EVENT_ONLY_PATH}"` },
 		],
 		syncEvents: [],
 		serverTrace: [
 			// Path only in serverTrace — not in diskHashes/crdtHashes (unseeded path)
 			{ event: "blob-synced", msg: `blob uploaded: "${SERVER_TRACE_ONLY_PATH}"` },
+			{
+				source: "reconcile",
+				msg: "reconcile-safety-brake-blocked",
+				details: {
+					affectedPathSample: [STRUCTURED_TRACE_ONLY_PATH],
+					blockedUpdatePathSample: [STRUCTURED_TRACE_ONLY_PATH],
+					hash: FULL_CONTENT_HASH,
+					diskHashBefore: FULL_CONTENT_HASH,
+				},
+			},
+			{
+				source: "conflict",
+				msg: "conflict-artifact-needed",
+				details: {
+					path: KNOWN_PATH_1,
+					conflictPath: CONFLICT_PATH,
+					normalizedPath: NORMALIZED_PATH,
+					reason: "bound-file-ambiguous-divergence",
+				},
+			},
 		],
 		openFiles: [
 			{ path: KNOWN_PATH_1, status: "open" },
@@ -332,11 +358,56 @@ console.log("\n--- Test 8: safe mode — unseeded path in serverTrace is redacte
 		!serialized.includes(SERVER_TRACE_ONLY_PATH),
 		`safe mode: unseeded serverTrace path "${SERVER_TRACE_ONLY_PATH}" not in bundle (regex redactor caught it)`,
 	);
+	assert(
+		!serialized.includes(HISTORICAL_EVENT_ONLY_PATH),
+		`safe mode: stale historical event path "${HISTORICAL_EVENT_ONLY_PATH}" not in bundle`,
+	);
+	assert(
+		!serialized.includes(STRUCTURED_TRACE_ONLY_PATH),
+		`safe mode: structured trace path sample "${STRUCTURED_TRACE_ONLY_PATH}" not in bundle`,
+	);
+	assert(
+		!serialized.includes(CONFLICT_PATH),
+		`safe mode: conflictPath "${CONFLICT_PATH}" not in bundle`,
+	);
+	assert(
+		!serialized.includes(NORMALIZED_PATH),
+		`safe mode: normalizedPath "${NORMALIZED_PATH}" not in bundle`,
+	);
+	assert(
+		!serialized.includes(FULL_CONTENT_HASH),
+		"safe mode: full content hashes are not in bundle",
+	);
+	assert(
+		serialized.includes(`${FULL_CONTENT_HASH.slice(0, 12)}…`),
+		"safe mode: content hash prefix remains for correlation",
+	);
 	// Same path IS present in full mode
 	const { bundle: fullBundle } = await buildDiagnosticsBundle(makeInput(), { includeFilenames: true });
+	const fullSerialized = JSON.stringify(fullBundle);
 	assert(
-		JSON.stringify(fullBundle).includes(SERVER_TRACE_ONLY_PATH),
+		fullSerialized.includes(SERVER_TRACE_ONLY_PATH),
 		`full mode: unseeded serverTrace path "${SERVER_TRACE_ONLY_PATH}" is present`,
+	);
+	assert(
+		fullSerialized.includes(HISTORICAL_EVENT_ONLY_PATH),
+		`full mode: stale historical event path "${HISTORICAL_EVENT_ONLY_PATH}" is present`,
+	);
+	assert(
+		fullSerialized.includes(STRUCTURED_TRACE_ONLY_PATH),
+		`full mode: structured trace path sample "${STRUCTURED_TRACE_ONLY_PATH}" is present`,
+	);
+	assert(
+		fullSerialized.includes(CONFLICT_PATH),
+		`full mode: conflictPath "${CONFLICT_PATH}" is present`,
+	);
+	assert(
+		fullSerialized.includes(NORMALIZED_PATH),
+		`full mode: normalizedPath "${NORMALIZED_PATH}" is present`,
+	);
+	assert(
+		fullSerialized.includes(FULL_CONTENT_HASH),
+		"full mode: full content hashes are present",
 	);
 }
 

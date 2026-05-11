@@ -140,6 +140,9 @@ export async function buildDiagnosticsBundle(
 		? createPassthroughRedactor()
 		: await createPathRedactor(salt, input.sha256Hex, { knownPaths });
 
+	const safeHash = (hash: string) =>
+		options.includeFilenames ? hash : `${hash.slice(0, 12)}…`;
+
 	const rawDiagnostics: Record<string, unknown> = {
 		generatedAt: input.generatedAt,
 		generationMs: input.generationMs,
@@ -187,7 +190,11 @@ export async function buildDiagnosticsBundle(
 		hashDiff: {
 			missingOnDisk,
 			missingInCrdt,
-			hashMismatches,
+			hashMismatches: hashMismatches.map((entry) => ({
+				...entry,
+				diskHash: safeHash(entry.diskHash),
+				crdtHash: safeHash(entry.crdtHash),
+			})),
 			matchingCount: allPaths.size - missingOnDisk.length - missingInCrdt.length - hashMismatches.length,
 			totalCompared: allPaths.size,
 		},
@@ -202,7 +209,10 @@ export async function buildDiagnosticsBundle(
 		frontmatterQuarantine: buildFrontmatterQuarantineDebugLines(input.frontmatterQuarantine),
 	};
 
-	const bundle = redactor.redactDeep(rawDiagnostics) as Record<string, unknown>;
+	const bundle = redactContentFingerprints(
+		redactor.redactDeep(rawDiagnostics),
+		options.includeFilenames,
+	) as Record<string, unknown>;
 
 	// Post-redaction leak check (INV-SEC-02): abort if any known vault path
 	// survived into the serialised safe bundle.
@@ -224,4 +234,38 @@ export async function buildDiagnosticsBundle(
 		missingInCrdtCount: missingInCrdt.length,
 		hashMismatchCount: hashMismatches.length,
 	};
+}
+
+const CONTENT_FINGERPRINT_KEYS = new Set([
+	"hash",
+	"diskHash",
+	"crdtHash",
+	"diskHashBefore",
+	"diskHashAfter",
+	"expectedHash",
+	"localHash",
+	"remoteHash",
+]);
+
+function redactContentFingerprints(value: unknown, includeFull: boolean): unknown {
+	if (includeFull || value === null) return value;
+	if (Array.isArray(value)) {
+		return value.map((item) => redactContentFingerprints(item, includeFull));
+	}
+	if (typeof value === "object") {
+		const out: Record<string, unknown> = {};
+		for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
+			if (
+				CONTENT_FINGERPRINT_KEYS.has(key) &&
+				typeof nested === "string" &&
+				/^[0-9a-f]{64}$/i.test(nested)
+			) {
+				out[key] = `${nested.slice(0, 12)}…`;
+			} else {
+				out[key] = redactContentFingerprints(nested, includeFull);
+			}
+		}
+		return out;
+	}
+	return value;
 }

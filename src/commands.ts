@@ -9,6 +9,7 @@ export interface CommandsRuntimeHost {
 	getConnectionController(): ConnectionController | null;
 	getDiagnosticsService(): DiagnosticsService | null;
 	getSnapshotService(): SnapshotService | null;
+	getFilesNeedingAttentionText(): string;
 	getUntrackedFileCount(): number;
 	isDebugEnabled(): boolean;
 	runReconciliation(mode: ReconcileMode): Promise<void>;
@@ -76,6 +77,16 @@ export function registerCommands(
 			const text = host.getDiagnosticsService()?.buildRecentEventsText(80) ?? "No events recorded yet.";
 			new Notice("Recent sync events printed to console.", 5000);
 			console.debug("[yaos] Recent sync events:\n" + text);
+		},
+	});
+
+	registrar.addCommand({
+		id: "show-files-needing-attention",
+		name: "Show files needing attention",
+		callback: () => {
+			const text = host.getFilesNeedingAttentionText();
+			new Notice("Files needing attention printed to console.", 7000);
+			console.debug("[yaos] Files needing attention:\n" + text);
 		},
 	});
 
