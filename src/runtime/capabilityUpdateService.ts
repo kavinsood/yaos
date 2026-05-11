@@ -9,6 +9,7 @@ import {
 	type UpdateManifest,
 } from "../update/updateManifest";
 import type { VaultSyncSettings } from "../settings";
+import { attachmentSizeCapKB } from "../settings/settingsStore";
 import { obsidianRequest } from "../utils/http";
 import { formatUnknown } from "../utils/format";
 import { compareSemver } from "../utils/semver";
@@ -76,6 +77,10 @@ export function isServerCapabilities(value: unknown): value is ServerCapabilitie
 		(candidate.authMode === "env" || candidate.authMode === "claim" || candidate.authMode === "unclaimed") &&
 		typeof candidate.attachments === "boolean" &&
 		typeof candidate.snapshots === "boolean" &&
+		(candidate.maxBlobUploadBytes === undefined ||
+			(typeof candidate.maxBlobUploadBytes === "number" &&
+				Number.isSafeInteger(candidate.maxBlobUploadBytes) &&
+				candidate.maxBlobUploadBytes > 0)) &&
 		typeof candidate.serverVersion === "string" &&
 		(candidate.minPluginVersion === null || typeof candidate.minPluginVersion === "string") &&
 		(candidate.recommendedPluginVersion === null || typeof candidate.recommendedPluginVersion === "string") &&
@@ -455,7 +460,7 @@ export class CapabilityUpdateService {
 		}
 
 		try {
-			this.serverCapabilities = await fetchServerCapabilities(settings.host);
+			this.serverCapabilities = await fetchServerCapabilities(settings.host, settings.token);
 			const serverVersion = (this.serverCapabilities as { serverVersion?: unknown } | null)?.serverVersion;
 			if (typeof serverVersion === "string" && serverVersion.trim()) {
 				this.legacyServerDetected = false;
@@ -510,9 +515,20 @@ export class CapabilityUpdateService {
 			previous?.claimed !== next?.claimed ||
 			previous?.serverVersion !== next?.serverVersion ||
 			previous?.migrationRequired !== next?.migrationRequired ||
+			previous?.maxBlobUploadBytes !== next?.maxBlobUploadBytes ||
 			previous?.updateProvider !== next?.updateProvider ||
 			previous?.updateRepoUrl !== next?.updateRepoUrl ||
 			previous?.updateRepoBranch !== next?.updateRepoBranch;
+		const capKB = attachmentSizeCapKB(next?.maxBlobUploadBytes);
+		const settings = this.deps.getSettings();
+		if (settings.maxAttachmentSizeKB > capKB) {
+			this.deps.log(
+				`Clamping max attachment size from ${settings.maxAttachmentSizeKB} KB to server cap ${capKB} KB`,
+			);
+			await this.deps.updateSettings((nextSettings) => {
+				nextSettings.maxAttachmentSizeKB = capKB;
+			}, `capability-attachment-cap:${reason}`);
+		}
 		await this.hydrateUpdateMetadataFromCapabilities(`capability-change:${reason}`);
 		if (!changed) return;
 
