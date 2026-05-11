@@ -31,3 +31,9 @@ server/.env
 .wrangler
 server/.partykit
 server/.wrangler
+
+# Agent/session artifacts
+session-*.md
+plan.md
+codex-md.py
+*.session.md
