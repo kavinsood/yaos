@@ -32,6 +32,8 @@ interface TraceEvent {
 
 const FLUSH_DELAY_MS = 400;
 const STATE_WRITE_DELAY_MS = 600;
+const MAX_PENDING_LINES = 2_000;
+const MAX_PENDING_CHARS_APPROX = 512 * 1024;
 
 function randomId(prefix: string): string {
 	return `${prefix}-${randomBase64Url(10)}`;
@@ -84,6 +86,8 @@ export class PersistentTraceLogger {
 	private stateTimer: ReturnType<typeof setTimeout> | null = null;
 	private latestState: unknown = null;
 	private seq = 0;
+	private pendingCharsApprox = 0;
+	private droppedPendingEvents = 0;
 	private writeChain: Promise<void> = Promise.resolve();
 
 	constructor(
@@ -129,7 +133,7 @@ export class PersistentTraceLogger {
 			details,
 		};
 
-		this.pendingLines.push(JSON.stringify(event) + "\n");
+		this.queueLine(JSON.stringify(event) + "\n");
 		this.scheduleFlush();
 	}
 
@@ -200,13 +204,49 @@ export class PersistentTraceLogger {
 	}
 
 	private async flushNow(): Promise<void> {
-		if (!this.enabled || this.pendingLines.length === 0) return;
+		if (!this.enabled) return;
+		if (this.droppedPendingEvents > 0) {
+			const droppedEvent: TraceEvent = {
+				ts: new Date().toISOString(),
+				seq: ++this.seq,
+				source: "trace",
+				msg: "trace-events-dropped",
+				traceId: this.context.traceId,
+				bootId: this.context.bootId,
+				deviceName: this.context.deviceName,
+				vaultId: this.context.vaultId,
+				details: {
+					count: this.droppedPendingEvents,
+					reason: "pending-buffer-cap",
+				},
+			};
+			this.droppedPendingEvents = 0;
+			this.queueLine(JSON.stringify(droppedEvent) + "\n");
+		}
+		if (this.pendingLines.length === 0) return;
+
 		const chunk = this.pendingLines.join("");
 		this.pendingLines = [];
+		this.pendingCharsApprox = 0;
 		await this.enqueueWrite(async () => {
 			await ensureDirRecursive(this.app, this.sessionDir());
 			await this.app.vault.adapter.append(this.sessionPath(), chunk);
 		});
+	}
+
+	private queueLine(line: string): void {
+		this.pendingLines.push(line);
+		this.pendingCharsApprox += line.length;
+
+		while (
+			this.pendingLines.length > MAX_PENDING_LINES ||
+			this.pendingCharsApprox > MAX_PENDING_CHARS_APPROX
+		) {
+			const dropped = this.pendingLines.shift();
+			if (!dropped) break;
+			this.pendingCharsApprox -= dropped.length;
+			this.droppedPendingEvents++;
+		}
 	}
 
 	private enqueueWrite(task: () => Promise<void>): Promise<void> {
