@@ -2,7 +2,7 @@
 
 **A zero-terminal, real-time sync engine for Obsidian, powered by your own Cloudflare Worker.**
 
-Your notes sync live across devices, with CRDT merge semantics instead of conflicted-copy workflows, delayed file sync, or database-heavy self-hosting.
+Your notes sync live across devices, with CRDT merge semantics instead of conflicted-copy workflows, delayed file sync, or database-heavy hosted services.
 
 <img src="https://github.com/user-attachments/assets/ee937050-8a05-4d56-9c5f-3ae5003496fc" alt="YAOS syncing a note across desktop and mobile in real time" width="720" />
 
@@ -14,19 +14,19 @@ No terminal, no `.env` files, no database setup required.
 
 ## How it compares
 
-Most ways to sync Obsidian pick a trade-off. YAOS picks none.
+YAOS chooses live Markdown CRDT sync on infrastructure you deploy in your Cloudflare account. That gives fast cross-device editing, with explicit limits around durability receipts, attachments, empty folders, and non-Markdown plugin files.
 
-| | Conflicts | Real-time | Self-hosted | No terminal | Free |
+| | Conflicts | Real-time | Deployment | No terminal | Free |
 |---|:---:|:---:|:---:|:---:|:---:|
 | **iCloud / Dropbox** | Conflicted copies | No | No | Yes | Yes |
 | **Obsidian Sync** | Rare | Delayed | No | Yes | $96/yr |
-| **Git / LiveSync** | Manual | Varies | Yes | No | Yes |
+| **Git / LiveSync** | Manual | Varies | Self-hosted / self-deployed | No | Yes |
 | **Relay / Screengarden** | No | Yes | No | Yes | Freemium |
-| **YAOS** | **CRDT merge** | **Yes** | **Yes** | **Yes** | **$0** |
+| **YAOS** | **CRDT merge** | **Yes** | **Self-deployed Cloudflare** | **Yes** | **$0** |
 
 YAOS uses [Yjs CRDTs](https://yjs.dev) to keep one live vault state moving across devices instead of asking them to take polite turns uploading files and hoping nothing collides.
 
-If you want the official, fully managed experience, pay for Obsidian Sync and support the team. If you want a fast, self-hosted, local-first alternative that you fully control, this is YAOS.
+If you want the official, fully managed experience, pay for Obsidian Sync and support the team. If you want a fast, self-deployed, local-first alternative on your own Cloudflare account, this is YAOS.
 
 ## Get started
 
@@ -155,7 +155,7 @@ After enabling, go to **Settings → YAOS**.
 | **Exclude paths** | Comma-separated prefixes to skip (e.g. `templates/, .trash/`) |
 | **Max text file size** | Skip text files larger than this for live document sync |
 | **Sync attachments** | Enable R2 sync for images, PDFs, and other non-markdown files |
-| **Max attachment size** | Skip attachments larger than this (default 10 MB) |
+| **Max attachment size** | Skip attachments larger than this (default and current server cap: 10 MB) |
 | **Parallel transfers** | Number of simultaneous attachment upload/download slots |
 | **Show remote cursors** | Display cursor positions and selections from other devices |
 | **Edits from other apps** | Control how YAOS handles changes from git, scripts, or other editors |
