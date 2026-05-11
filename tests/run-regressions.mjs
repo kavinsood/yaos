@@ -47,12 +47,20 @@ const suites = [
 	[JITI, "tests/disk-mirror-origin-classification.ts"],
 	[NODE, "tests/server-pre-auth-trace.mjs"],
 	[JITI, "tests/diagnostics-redaction.mjs"],
+	[JITI, "tests/persistent-trace-logger.ts"],
+	[JITI, "tests/typed-trace-schema.ts"],
+	[JITI, "tests/trace-event-behavior.ts"],
+	[JITI, "tests/reconciliation-safety-brake.ts"],
+	[JITI, "tests/blob-download-conflicts.ts"],
+	[JITI, "tests/closed-file-conflict.ts"],
+	[JITI, "tests/preserved-unresolved-registry.ts"],
 	[NODE, "tests/markdown-ingest-regressions.mjs"],
 	[JITI, "tests/closed-file-mirror.ts"],
 	[JITI, "tests/folder-rename.ts"],
 	[JITI, "tests/chunked-doc-store.ts"],
 	[JITI, "tests/trace-store.ts"],
 	[JITI, "tests/server-hardening.ts"],
+	[JITI, "tests/settings-hardening.ts"],
 	[JITI, "tests/v2-offline-rename-regressions.mjs"],
 	[JITI, "tests/sync-facts.ts"],
 	[JITI, "tests/offline-handoff.ts"],
@@ -70,6 +78,7 @@ const suites = [
 	[JITI, "tests/sv-echo-client-receiver.ts"],
 	[JITI, "tests/server-ack-tracker.ts"],
 	[JITI, "tests/indexed-db-candidate-store.ts"],
+	[JITI, "tests/tombstone-revive.ts"],
 ];
 
 let totalPassed = 0;

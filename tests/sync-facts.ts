@@ -13,7 +13,7 @@
 //   Verify the three key honesty invariants:
 //     1. serverReachable is null when neither connected nor auth error received.
 //     2. authAccepted is false for explicit server rejections.
-//     3. pendingLocalCount is 0 when connected, null when offline.
+//     3. pendingLocalCount stays null even when connected; socket-open is not server receipt.
 
 import * as Y from "yjs";
 import { UpdateTracker } from "../src/sync/updateTracker";

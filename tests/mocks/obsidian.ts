@@ -22,6 +22,11 @@ export class MarkdownView {}
 /** Stub class. Used in instanceof checks inside DiskMirror's vault event handlers. */
 export class TFile {}
 
+/** Notice constructor used by runtime controllers. */
+export class Notice {
+	constructor(_message: string, _timeout?: number) {}
+}
+
 /** Stub class. Type-only in DiskMirror but exported for completeness. */
 export class App {}
 
@@ -33,6 +38,8 @@ export class Modal {
 }
 
 /** Not called in observer/scheduling paths — stub for completeness. */
-export function arrayBufferToHex(_buf: ArrayBuffer): string {
-	return "";
+export function arrayBufferToHex(buf: ArrayBuffer): string {
+	return Array.from(new Uint8Array(buf), (byte) =>
+		byte.toString(16).padStart(2, "0")
+	).join("");
 }
