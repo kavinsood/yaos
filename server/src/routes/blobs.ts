@@ -1,13 +1,28 @@
 import { mapWithConcurrency } from "../concurrency";
+import { MAX_BLOB_UPLOAD_BYTES } from "../contracts";
 import { blobKey } from "../snapshot";
 import type { Env, JsonResponse } from "./types";
 
-const MAX_BLOB_UPLOAD_BYTES = 10 * 1024 * 1024;
 const EXISTS_BATCH_LIMIT = 50;
 const R2_HEAD_CONCURRENCY = 4;
 
 function isValidHash(hash: string): boolean {
 	return /^[0-9a-f]{64}$/.test(hash);
+}
+
+async function sha256Hex(bytes: ArrayBuffer): Promise<string> {
+	const digest = await crypto.subtle.digest("SHA-256", bytes);
+	return Array.from(new Uint8Array(digest), (byte) =>
+		byte.toString(16).padStart(2, "0")
+	).join("");
+}
+
+function parseContentLength(value: string | null): { kind: "missing" } | { kind: "invalid" } | { kind: "ok"; value: number } {
+	if (value === null) return { kind: "missing" };
+	const trimmed = value.trim();
+	if (!/^\d+$/.test(trimmed)) return { kind: "invalid" };
+	const parsed = Number(trimmed);
+	return Number.isSafeInteger(parsed) ? { kind: "ok", value: parsed } : { kind: "invalid" };
 }
 
 export async function handleBlobRoute(
@@ -92,6 +107,16 @@ async function handleBlobUpload(
 		return json({ error: "invalid hash: must be 64 hex chars (SHA-256)" }, 400);
 	}
 
+	const contentLength = parseContentLength(req.headers.get("Content-Length"));
+	if (contentLength.kind === "invalid") {
+		return json({ error: "invalid Content-Length" }, 400);
+	}
+	if (contentLength.kind === "ok" && contentLength.value > MAX_BLOB_UPLOAD_BYTES) {
+		return json({
+			error: `contentLength exceeds max upload size (${MAX_BLOB_UPLOAD_BYTES} bytes)`,
+		}, 413);
+	}
+
 	const body = await req.arrayBuffer();
 	if (!body.byteLength) {
 		return json({ error: "missing request body" }, 400);
@@ -100,6 +125,10 @@ async function handleBlobUpload(
 		return json({
 			error: `contentLength exceeds max upload size (${MAX_BLOB_UPLOAD_BYTES} bytes)`,
 		}, 413);
+	}
+	const actualHash = await sha256Hex(body);
+	if (actualHash !== hash) {
+		return json({ error: "hash mismatch" }, 400);
 	}
 
 	await env.YAOS_BUCKET.put(

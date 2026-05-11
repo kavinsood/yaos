@@ -10,6 +10,7 @@ import {
 } from "../version";
 import { json } from "./http";
 import type { AuthState, Env, UpdateProvider } from "./types";
+import { MAX_BLOB_UPLOAD_BYTES } from "../contracts";
 
 export function getHttpAuthToken(req: Request): string | null {
 	const auth = req.headers.get("Authorization");
@@ -161,11 +162,17 @@ function buildObsidianSetupUrl(host: string, token: string, vaultId?: string): s
 	return `obsidian://yaos?${params.toString()}`;
 }
 
-export function getCapabilities(auth: AuthState, env: Env, config: StoredServerConfig | null = null): {
+export function getCapabilities(
+	auth: AuthState,
+	env: Env,
+	config: StoredServerConfig | null = null,
+	options: { includePrivateUpdateMetadata?: boolean } = {},
+): {
 	claimed: boolean;
 	authMode: "env" | "claim" | "unclaimed";
 	attachments: boolean;
 	snapshots: boolean;
+	maxBlobUploadBytes: number;
 	serverVersion: string;
 	minPluginVersion: string | null;
 	recommendedPluginVersion: string | null;
@@ -182,15 +189,16 @@ export function getCapabilities(auth: AuthState, env: Env, config: StoredServerC
 		authMode: auth.mode,
 		attachments: bucketEnabled,
 		snapshots: bucketEnabled,
+		maxBlobUploadBytes: MAX_BLOB_UPLOAD_BYTES,
 		serverVersion: SERVER_VERSION,
 		minPluginVersion: SERVER_MIN_PLUGIN_VERSION,
 		recommendedPluginVersion: SERVER_RECOMMENDED_PLUGIN_VERSION,
 		minSchemaVersion: SERVER_MIN_SCHEMA_VERSION,
 		maxSchemaVersion: SERVER_MAX_SCHEMA_VERSION,
 		migrationRequired: SERVER_MIGRATION_REQUIRED,
-		updateProvider: config?.updateProvider ?? null,
-		updateRepoUrl: config?.updateRepoUrl ?? null,
-		updateRepoBranch: config?.updateRepoBranch ?? null,
+		updateProvider: options.includePrivateUpdateMetadata ? (config?.updateProvider ?? null) : null,
+		updateRepoUrl: options.includePrivateUpdateMetadata ? (config?.updateRepoUrl ?? null) : null,
+		updateRepoBranch: options.includePrivateUpdateMetadata ? (config?.updateRepoBranch ?? null) : null,
 	};
 }
 
@@ -233,7 +241,12 @@ export async function handleClaimRoute(req: Request, env: Env, authState: AuthSt
 		ok: true,
 		host: url.origin,
 		obsidianUrl: buildObsidianSetupUrl(url.origin, token, vaultId || undefined),
-		capabilities: getCapabilities({ mode: "claim", claimed: true, tokenHash }, env, claimedConfig),
+		capabilities: getCapabilities(
+			{ mode: "claim", claimed: true, tokenHash },
+			env,
+			claimedConfig,
+			{ includePrivateUpdateMetadata: true },
+		),
 	});
 }
 
@@ -275,6 +288,6 @@ export async function handleUpdateMetadataRoute(req: Request, env: Env, authStat
 
 	return json({
 		ok: true,
-		capabilities: getCapabilities(authState, env, updatedConfig),
+		capabilities: getCapabilities(authState, env, updatedConfig, { includePrivateUpdateMetadata: true }),
 	});
 }

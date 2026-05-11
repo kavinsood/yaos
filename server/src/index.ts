@@ -9,6 +9,7 @@ import {
 	getStoredServerConfig,
 	handleClaimRoute,
 	handleUpdateMetadataRoute,
+	isAuthorized,
 	rejectUnauthorizedVaultRequest,
 	supportsBuckets,
 } from "./routes/auth";
@@ -69,14 +70,16 @@ async function rejectAndLogUnauthorizedVaultRequest(
 	return rejection?.response ?? null;
 }
 
-async function handleCapabilities(env: Env, authState: AuthState): Promise<Response> {
+async function handleCapabilities(req: Request, env: Env, authState: AuthState): Promise<Response> {
 	let config: StoredServerConfig | null = null;
 	try {
 		config = await getStoredServerConfig(env);
 	} catch (err) {
 		console.warn(`${LOG_PREFIX} config fetch failed for capabilities:`, err);
 	}
-	return json(getCapabilities(authState, env, config));
+	const includePrivateUpdateMetadata = authState.claimed
+		&& await isAuthorized(authState, getHttpAuthToken(req));
+	return json(getCapabilities(authState, env, config, { includePrivateUpdateMetadata }));
 }
 
 const worker = {
@@ -116,7 +119,7 @@ const worker = {
 		}
 
 		if (req.method === "GET" && url.pathname === "/api/capabilities") {
-			return withCors(await handleCapabilities(env, authState));
+			return withCors(await handleCapabilities(req, env, authState));
 		}
 
 		if (req.method === "POST" && url.pathname === "/claim") {
