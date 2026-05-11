@@ -11,7 +11,12 @@ import type { ReconcileMode, VaultSync } from "../sync/vaultSync";
 import type { VaultSyncSettings } from "../settings";
 import type { RuntimeConfig } from "./runtimeConfig";
 import type { EditorBindingManager } from "../sync/editorBinding";
-import { applyDiffToYText } from "../sync/diff";
+import {
+	applyDiffToYText,
+	applyDiffToYTextWithPostcondition,
+	forceReplaceYText,
+	type DiffPostconditionResult,
+} from "../sync/diff";
 import { decideExternalEditImport } from "../sync/externalEditPolicy";
 import { yTextToString } from "../utils/format";
 import {
@@ -19,6 +24,7 @@ import {
 	ORIGIN_DISK_SYNC_RECOVER_BOUND,
 	ORIGIN_DISK_SYNC_OPEN_IDLE_RECOVER,
 } from "../sync/origins";
+import { decideClosedFileConflict } from "../sync/closedFileConflict";
 
 export interface ReconciliationStats {
 	at: string;
@@ -38,6 +44,10 @@ export interface ReconciliationState {
 	lastReconcileStats: ReconciliationStats | null;
 	lastReconciledGeneration: number;
 	untrackedFileCount: number;
+	blockedDivergenceCount: number;
+	lastBlockedDivergenceAt: string | null;
+	/** Safe sample of blocked paths: extensions + fingerprint hashes (no raw filenames). */
+	blockedDivergenceSample: Array<{ ext: string; hash: string }>;
 }
 
 interface ReconciliationControllerDeps {
@@ -73,6 +83,82 @@ const RECONCILE_COOLDOWN_MS = 10_000;
 const MARKDOWN_DIRTY_SETTLE_MS = 350;
 const OPEN_FILE_EXTERNAL_EDIT_IDLE_GRACE_MS = 1200;
 const BOUND_RECOVERY_LOCK_MS = 1500;
+const TRACE_PATH_SAMPLE_LIMIT = 50;
+const MAX_REPEATED_RECOVERY_FINGERPRINTS = 3;
+const MAX_RECOVERY_FINGERPRINT_MAP_SIZE = 200;
+/** Time-to-live for recovery fingerprint counts. If the same fingerprint
+ *  recurs after this window, the count resets to 1 — preventing stale
+ *  attempts from hours ago from poisoning future legitimate edits. */
+const RECOVERY_FINGERPRINT_TTL_MS = 10 * 60_000; // 10 minutes
+
+/**
+ * Cheap FNV-1a-ish 32-bit hash for content fingerprinting.
+ * NOT cryptographic — only for equality deduplication inside recovery
+ * quarantine and conflict artifact dedupe. This is a cheap loop detector
+ * and coalescing key, NOT a content identity or security primitive.
+ * False collisions are possible but acceptable: the worst case is a
+ * missed quarantine or an extra conflict artifact, not data corruption.
+ * We deliberately avoid storing full note contents in the long-lived
+ * map; only this fixed-size hash + content length is kept.
+ */
+function contentFingerprint(text: string): string {
+	let h = 0x811c9dc5;
+	for (let i = 0; i < text.length; i++) {
+		h ^= text.charCodeAt(i);
+		h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0;
+	}
+	return h.toString(16).padStart(8, "0") + ":" + text.length;
+}
+
+function tracePathList(prefix: string, paths: string[]): Record<string, unknown> {
+	return {
+		[`${prefix}PathCount`]: paths.length,
+		[`${prefix}PathSample`]: paths.slice(0, TRACE_PATH_SAMPLE_LIMIT),
+		[`${prefix}PathsTruncated`]: paths.length > TRACE_PATH_SAMPLE_LIMIT,
+	};
+}
+
+function traceRecoveryPostcondition(
+	trace: ReconciliationControllerDeps["trace"],
+	path: string,
+	reason: string,
+	origin: string,
+	expectedLength: number,
+	result: DiffPostconditionResult,
+): void {
+	trace("recovery", "recovery-postcondition-observed", {
+		path,
+		reason,
+		origin,
+		expectedLength,
+		actualLength: result.finalLength,
+		matchesExpected: result.finalMatchesExpected,
+		matchesAfterDiff: result.matchesAfterDiff,
+		diffSkippedDueToStaleBase: result.diffSkippedDueToStaleBase,
+		enforced: true,
+		forceReplaceApplied: result.forceReplaceApplied,
+	});
+	if (result.forceReplaceApplied) {
+		trace("recovery", "recovery-force-replace-applied", {
+			path,
+			reason,
+			origin,
+			expectedLength,
+			actualLength: result.finalLength,
+			finalMatchesExpected: result.finalMatchesExpected,
+			diffSkippedDueToStaleBase: result.diffSkippedDueToStaleBase,
+		});
+	}
+	if (!result.finalMatchesExpected) {
+		trace("recovery", "recovery-postcondition-failed", {
+			path,
+			reason,
+			origin,
+			expectedLength,
+			actualLength: result.finalLength,
+		});
+	}
+}
 
 export class ReconciliationController {
 	private reconciled = false;
@@ -89,6 +175,17 @@ export class ReconciliationController {
 	private markdownDrainTimer: ReturnType<typeof setTimeout> | null = null;
 	private lastMarkdownDirtyAt = 0;
 	private boundRecoveryLocks = new Map<string, number>();
+	private recoveryFingerprints = new Map<string, { fingerprint: string; count: number; lastAt: number }>();
+	private lastConflictFingerprints = new Map<string, string>();
+	private blockedDivergenceCount = 0;
+	private lastBlockedDivergenceAt: string | null = null;
+	private blockedDivergenceSample: Array<{ ext: string; hash: string }> = [];
+	private readonly diagnosticPathSalt =
+		Math.random().toString(36).slice(2) + Date.now().toString(36);
+	/** Conflict notice throttle: suppress repeat notices within window. */
+	private lastConflictNoticeAt = 0;
+	private conflictNoticeSuppressionCount = 0;
+	private static readonly CONFLICT_NOTICE_COOLDOWN_MS = 30_000;
 
 	constructor(private readonly deps: ReconciliationControllerDeps) {}
 
@@ -124,6 +221,9 @@ export class ReconciliationController {
 			lastReconcileStats: this.lastReconcileStats,
 			lastReconciledGeneration: this.lastReconciledGeneration,
 			untrackedFileCount: this.untrackedFiles.length,
+			blockedDivergenceCount: this.blockedDivergenceCount,
+			lastBlockedDivergenceAt: this.lastBlockedDivergenceAt,
+			blockedDivergenceSample: this.blockedDivergenceSample,
 		};
 	}
 
@@ -151,6 +251,13 @@ export class ReconciliationController {
 		this.closedOnlyDeferredImports.clear();
 		this.markdownDrainPromise = null;
 		this.lastMarkdownDirtyAt = 0;
+		this.recoveryFingerprints.clear();
+		this.lastConflictFingerprints.clear();
+		this.blockedDivergenceCount = 0;
+		this.lastBlockedDivergenceAt = null;
+		this.blockedDivergenceSample = [];
+		this.lastConflictNoticeAt = 0;
+		this.conflictNoticeSuppressionCount = 0;
 		this.boundRecoveryLocks.clear();
 	}
 
@@ -300,6 +407,17 @@ export class ReconciliationController {
 				`diskLoaded=${diskFiles.size} (${changed.length} read) vs ` +
 				`${vaultSync.getActiveMarkdownPaths().length} CRDT paths`,
 			);
+			this.deps.trace("reconcile", "reconcile-scan-complete", {
+				mode,
+				diskPresentCount: diskPresentPaths.size,
+				diskLoadedCount: diskFiles.size,
+				changedCount: changed.length,
+				unchangedCount: unchanged.length,
+				skippedByIndex,
+				excludedCount,
+				oversizedCount,
+				crdtPathCount: vaultSync.getActiveMarkdownPaths().length,
+			});
 
 			const result = vaultSync.reconcileVault(
 				diskFiles,
@@ -329,6 +447,14 @@ export class ReconciliationController {
 					`YAOS: Reconcile safety brake — ${safetyBrakeReason}. ` +
 					`Additive creates will continue. Export diagnostics and inspect logs.`,
 				);
+				this.deps.trace("reconcile", "reconcile-safety-brake-blocked", {
+					mode,
+					destructiveCount,
+					destructiveRatio,
+					localFileCount,
+					reason: safetyBrakeReason,
+					...tracePathList("affected", result.updatedOnDisk),
+				});
 			}
 
 			for (const path of result.createdOnDisk) {
@@ -336,7 +462,61 @@ export class ReconciliationController {
 				flushedCreates++;
 			}
 			if (!safetyBrakeTriggered) {
+				const updatesToFlush: string[] = [];
 				for (const path of result.updatedOnDisk) {
+					const diskContent = diskFiles.get(path);
+					const ytext = vaultSync.getTextForPath(path);
+					const isOpenOrBound =
+						(this.deps.getEditorBindings()?.isBound(path) ?? false) ||
+						this.getOpenMarkdownViewsForPath(path).length > 0;
+					if (
+						mode === "authoritative" &&
+						!isOpenOrBound &&
+						diskContent !== undefined &&
+						ytext
+					) {
+						const crdtContent = yTextToString(ytext) ?? "";
+						const decision = decideClosedFileConflict({
+							baselineHash: null,
+							diskHash: contentFingerprint(diskContent),
+							crdtHash: contentFingerprint(crdtContent),
+						});
+						if (decision.kind === "preserve-conflict") {
+							try {
+								const conflictPath = await this.createMarkdownConflictArtifact(
+									path,
+									crdtContent,
+									`closed-file-${decision.reason}`,
+									"crdt",
+								);
+								forceReplaceYText(ytext, diskContent, ORIGIN_DISK_SYNC_RECOVER_BOUND);
+								this.deps.trace("conflict", "closed-file-conflict-preserved", {
+									path,
+									conflictPath,
+									reason: decision.reason,
+									winner: decision.winner,
+									diskLength: diskContent.length,
+									crdtLength: crdtContent.length,
+								});
+								flushedUpdates++;
+								continue;
+							} catch (err) {
+								diskMirror.recordPreservedUnresolved(
+									path,
+									"conflict-artifact-write-failed",
+								);
+								this.deps.trace("conflict", "closed-file-conflict-preserve-failed", {
+									path,
+									reason: decision.reason,
+									error: err instanceof Error ? err.message : String(err),
+								});
+								continue;
+							}
+						}
+					}
+					updatesToFlush.push(path);
+				}
+				for (const path of updatesToFlush) {
 					await diskMirror.flushWrite(path);
 					flushedUpdates++;
 				}
@@ -352,11 +532,51 @@ export class ReconciliationController {
 				safetyBrakeTriggered,
 				safetyBrakeReason,
 			};
+			this.deps.trace("reconcile", "reconcile-authority-summary", {
+				mode,
+				seededToCrdtCount: result.seededToCrdt.length,
+				createdOnDiskCount: result.createdOnDisk.length,
+				updatedOnDiskCount: result.updatedOnDisk.length,
+				flushedCreates,
+				flushedUpdates,
+				untrackedCount: result.untracked.length,
+				tombstoneSkippedCount: result.skipped,
+				safetyBrakeTriggered,
+				safetyBrakeReason,
+				...tracePathList("created", result.createdOnDisk),
+				...tracePathList("blockedUpdate", safetyBrakeTriggered ? result.updatedOnDisk : []),
+			});
 
 			this.untrackedFiles = result.untracked;
 			this.reconciled = true;
 
-			this.deps.setDiskIndex(updateIndex(this.deps.getDiskIndex(), allStats));
+			const blockedIndexPaths = safetyBrakeTriggered ? result.updatedOnDisk : [];
+			if (safetyBrakeTriggered) {
+				this.blockedDivergenceCount = blockedIndexPaths.length;
+				this.lastBlockedDivergenceAt = new Date().toISOString();
+				// Keep a privacy-safer sample: extensions + session-salted
+				// fingerprints (no raw filenames or stable cross-export IDs).
+				this.blockedDivergenceSample = blockedIndexPaths.slice(0, 10).map((p) => {
+					const dot = p.lastIndexOf(".");
+					const ext = dot >= 0 ? p.slice(dot) : "(none)";
+					return { ext, hash: contentFingerprint(`${this.diagnosticPathSalt}:${p}`) };
+				});
+			} else {
+				this.blockedDivergenceCount = 0;
+				// Do NOT clear lastBlockedDivergenceAt — it serves as "last seen"
+				// historical marker. Do NOT clear sample — it remains
+				// available as "last blocked sample" even when count resets.
+			}
+			this.deps.setDiskIndex(updateIndex(this.deps.getDiskIndex(), allStats, {
+				excludePaths: blockedIndexPaths,
+			}));
+			if (blockedIndexPaths.length > 0) {
+				this.deps.trace("reconcile", "reconcile-disk-index-advance-blocked", {
+					mode,
+					blockedCount: blockedIndexPaths.length,
+					...tracePathList("blocked", blockedIndexPaths),
+				});
+			}
 			void this.deps.saveDiskIndex();
 
 			const integrity = vaultSync.runIntegrityChecks();
@@ -402,6 +622,7 @@ export class ReconciliationController {
 		const vaultSync = this.deps.getVaultSync();
 		if (!vaultSync) return;
 
+		const diskMirror = this.deps.getDiskMirror();
 		const toImport = [...this.untrackedFiles];
 		this.untrackedFiles = [];
 		let imported = 0;
@@ -412,13 +633,40 @@ export class ReconciliationController {
 				continue;
 			}
 
+			// Guard: do NOT auto-revive paths that were preserved during a
+			// remote-delete with unknown baseline. These files sit on disk to
+			// avoid data loss, but auto-importing them would resurrect the
+			// tombstoned entry — exactly the zombie-file bug we fixed.
+			if (diskMirror?.isPreservedUnresolved(path)) {
+				this.deps.log(`importUntracked: "${path}" is preserved-unresolved remote delete, skipping auto-revive`);
+				this.deps.trace("reconcile", "import-untracked-skipped-preserved-unresolved", {
+					path,
+				});
+				continue;
+			}
+
 			const file = this.deps.app.vault.getAbstractFileByPath(path);
 			if (!(file instanceof TFile)) continue;
 
 			try {
 				const content = await this.deps.app.vault.read(file);
-				vaultSync.ensureFile(path, content, this.deps.getSettings().deviceName);
-				imported++;
+				// Untracked files exist on disk but have no CRDT entry. If the
+				// path is tombstoned, the user explicitly placed the file after
+				// deletion — that is a deliberate revive, not a stale ghost.
+				const result = vaultSync.ensureFile(
+					path,
+					content,
+					this.deps.getSettings().deviceName,
+					{
+						reviveTombstone: true,
+						reviveReason: "import-untracked-local-file",
+					},
+				);
+				if (result) {
+					imported++;
+				} else {
+					this.deps.log(`importUntracked: "${path}" could not be imported (ensureFile returned null)`);
+				}
 			} catch (err) {
 				console.error(`[yaos] importUntracked failed for "${path}":`, err);
 			}
@@ -552,6 +800,14 @@ export class ReconciliationController {
 		if (!vaultSync) return;
 		if (!this.deps.isMarkdownPathSyncable(file.path)) return;
 
+		// If the user modifies or creates a file that was previously
+		// preserved-unresolved, that is intentional user action. Clear the
+		// guard so future reconcile/import treats it as a normal local file.
+		const diskMirror = this.deps.getDiskMirror();
+		if (diskMirror?.isPreservedUnresolved(file.path)) {
+			diskMirror.clearPreservedUnresolved(file.path);
+		}
+
 		let wasBound = editorBindings?.isBound(file.path) ?? false;
 		const openViews = this.getOpenMarkdownViewsForPath(file.path);
 		const isOpenInEditor = openViews.length > 0;
@@ -586,7 +842,7 @@ export class ReconciliationController {
 			const existingText = vaultSync.getTextForPath(file.path);
 
 			if (wasBound && isOpenInEditor) {
-				const handledBound = this.handleBoundFileSyncGap(
+				const handledBound = await this.handleBoundFileSyncGap(
 					file,
 					content,
 					existingText,
@@ -656,19 +912,24 @@ export class ReconciliationController {
 		return views;
 	}
 
-	private handleBoundFileSyncGap(
+	private async handleBoundFileSyncGap(
 		file: TFile,
 		content: string,
 		existingText: ReturnType<VaultSync["getTextForPath"]>,
 		openViews: MarkdownView[] = this.getOpenMarkdownViewsForPath(file.path),
 		sourceReason: "create" | "modify" = "modify",
-	): boolean {
+	): Promise<boolean> {
 		const editorBindings = this.deps.getEditorBindings();
 		const vaultSync = this.deps.getVaultSync();
 		const now = Date.now();
 		const lockUntil = this.boundRecoveryLocks.get(file.path) ?? 0;
 		if (lockUntil > now) {
 			this.deps.log(`syncFileFromDisk: skipping "${file.path}" (editor-bound, recovery lock)`);
+			this.deps.trace("recovery", "recovery-postcondition-skipped", {
+				path: file.path,
+				reason: "recovery-lock-active",
+				lockRemainingMs: lockUntil - now,
+			});
 			return true;
 		}
 		if (lockUntil > 0) {
@@ -751,7 +1012,28 @@ export class ReconciliationController {
 					diskLength: content.length,
 					crdtLength: crdtContent?.length ?? null,
 				});
-				applyDiffToYText(existingText, crdtContent ?? "", content, ORIGIN_DISK_SYNC_RECOVER_BOUND);
+				if (this.shouldQuarantineRepeatedRecovery(
+					file.path,
+					"bound-file-local-only-divergence",
+					crdtContent ?? "",
+					content,
+				)) {
+					return true;
+				}
+				const recoveryResult = applyDiffToYTextWithPostcondition(
+					existingText,
+					crdtContent ?? "",
+					content,
+					ORIGIN_DISK_SYNC_RECOVER_BOUND,
+				);
+				traceRecoveryPostcondition(
+					this.deps.trace,
+					file.path,
+					"bound-file-local-only-divergence",
+					ORIGIN_DISK_SYNC_RECOVER_BOUND,
+					content.length,
+					recoveryResult,
+				);
 			} else {
 				if (this.deps.shouldBlockFrontmatterIngest(
 					file.path,
@@ -766,6 +1048,14 @@ export class ReconciliationController {
 					`syncFileFromDisk: recovering "${file.path}" ` +
 					`(editor-bound, missing CRDT text: seeding ${content.length} chars)`,
 				);
+				if (this.shouldQuarantineRepeatedRecovery(
+					file.path,
+					"bound-file-local-only-seed",
+					"",
+					content,
+				)) {
+					return true;
+				}
 				vaultSync?.ensureFile(
 					file.path,
 					content,
@@ -775,6 +1065,18 @@ export class ReconciliationController {
 						reviveReason: sourceReason === "create" ? "local-create-event" : undefined,
 					},
 				);
+				const recoveredContent = yTextToString(vaultSync?.getTextForPath(file.path));
+				this.deps.trace("recovery", "recovery-postcondition-observed", {
+					path: file.path,
+					reason: "bound-file-local-only-seed",
+					origin: "ensureFile",
+					expectedLength: content.length,
+					actualLength: recoveredContent?.length ?? null,
+					matchesExpected: recoveredContent === content,
+					matchesAfterDiff: recoveredContent === content,
+					enforced: false,
+					forceReplaceApplied: false,
+				});
 			}
 			this.boundRecoveryLocks.set(file.path, Date.now() + BOUND_RECOVERY_LOCK_MS);
 
@@ -823,7 +1125,28 @@ export class ReconciliationController {
 					`syncFileFromDisk: recovering "${file.path}" ` +
 					`(editor-bound external disk edit while idle: ${crdtContent?.length ?? 0} -> ${content.length} chars)`,
 				);
-				applyDiffToYText(existingText, crdtContent ?? "", content, ORIGIN_DISK_SYNC_OPEN_IDLE_RECOVER);
+				if (this.shouldQuarantineRepeatedRecovery(
+					file.path,
+					"bound-file-open-idle-disk-recovery",
+					crdtContent ?? "",
+					content,
+				)) {
+					return true;
+				}
+				const recoveryResult = applyDiffToYTextWithPostcondition(
+					existingText,
+					crdtContent ?? "",
+					content,
+					ORIGIN_DISK_SYNC_OPEN_IDLE_RECOVER,
+				);
+				traceRecoveryPostcondition(
+					this.deps.trace,
+					file.path,
+					"bound-file-open-idle-disk-recovery",
+					ORIGIN_DISK_SYNC_OPEN_IDLE_RECOVER,
+					content.length,
+					recoveryResult,
+				);
 			} else {
 				if (this.deps.shouldBlockFrontmatterIngest(
 					file.path,
@@ -838,6 +1161,14 @@ export class ReconciliationController {
 					`syncFileFromDisk: recovering "${file.path}" ` +
 					`(editor-bound idle disk edit, missing CRDT text: seeding ${content.length} chars)`,
 				);
+				if (this.shouldQuarantineRepeatedRecovery(
+					file.path,
+					"bound-file-open-idle-seed",
+					"",
+					content,
+				)) {
+					return true;
+				}
 				vaultSync?.ensureFile(
 					file.path,
 					content,
@@ -847,6 +1178,18 @@ export class ReconciliationController {
 						reviveReason: sourceReason === "create" ? "local-create-event" : undefined,
 					},
 				);
+				const recoveredContent = yTextToString(vaultSync?.getTextForPath(file.path));
+				this.deps.trace("recovery", "recovery-postcondition-observed", {
+					path: file.path,
+					reason: "bound-file-open-idle-seed",
+					origin: "ensureFile",
+					expectedLength: content.length,
+					actualLength: recoveredContent?.length ?? null,
+					matchesExpected: recoveredContent === content,
+					matchesAfterDiff: recoveredContent === content,
+					enforced: false,
+					forceReplaceApplied: false,
+				});
 			}
 			this.boundRecoveryLocks.set(file.path, Date.now() + BOUND_RECOVERY_LOCK_MS);
 			this.deps.scheduleTraceStateSnapshot("bound-file-open-idle-disk-recovery");
@@ -872,9 +1215,216 @@ export class ReconciliationController {
 				expectedFileId: state.collab?.expectedFileId ?? null,
 			})),
 		});
+		const distinctEditorContents = [...new Set(viewStates.map((state) => state.editorContent))];
+		const editorAuthority: string | null = distinctEditorContents.length === 1
+			? distinctEditorContents[0]!
+			: null;
+		if (editorAuthority === null) {
+			this.deps.getDiskMirror()?.recordPreservedUnresolved(
+				file.path,
+				"multiple-editor-authorities",
+			);
+		}
+		let conflictPath: string | null = null;
+		let diskConflictPath: string | null = null;
+		let conflictError: string | null = null;
+		let conflictSkippedDedupe = false;
+		if (crdtContent != null) {
+			// Dedupe: if the same ambiguous fingerprint was already turned into
+			// a conflict artifact, do not create another one. This prevents
+			// infinite conflict artifact spam when convergence fails.
+			// Include editor hash to catch cases where editor content differs
+			// from disk between attempts (editor is the local authority being
+			// applied during convergence). Use sorted distinct hashes of ALL
+			// open views, not just the first — multiple panes may have different
+			// unsaved content.
+			const editorHashes = [...new Set(
+				viewStates.map((s) => contentFingerprint(s.editorContent)),
+			)].sort();
+			const editorFp = editorHashes.length > 0
+				? editorHashes.join("+")
+				: "no-editor";
+			const conflictFingerprint = `${contentFingerprint(crdtContent)}\x00${contentFingerprint(content)}\x00${editorFp}`;
+			const previousConflictFingerprint = this.lastConflictFingerprints.get(file.path);
+			if (previousConflictFingerprint === conflictFingerprint) {
+				conflictSkippedDedupe = true;
+			} else {
+				try {
+					conflictPath = await this.createMarkdownConflictArtifact(
+						file.path,
+						crdtContent,
+						"bound-file-ambiguous-divergence",
+						"crdt",
+					);
+					if (
+						editorAuthority !== null &&
+						content !== editorAuthority &&
+						content !== crdtContent
+					) {
+						diskConflictPath = await this.createMarkdownConflictArtifact(
+							file.path,
+							content,
+							"bound-file-ambiguous-divergence",
+							"disk",
+						);
+					}
+					this.lastConflictFingerprints.set(file.path, conflictFingerprint);
+					// Notify the user — conflict artifacts can be surprising.
+					// Throttled: only one Notice per 30s window; suppressed
+					// conflicts are counted and reported in the next notice.
+					this.showConflictNotice(
+						`Conflict detected for "${file.path.split("/").pop()}" — ` +
+						`competing version preserved as conflict note.`,
+					);
+				} catch (err) {
+					conflictError = err instanceof Error ? err.message : String(err);
+				}
+			}
+		}
+
+		// After preserving competing versions as conflict artifacts, converge
+		// the original path's CRDT to the visible editor content. This
+		// prevents the same ambiguity from re-triggering on the next reconcile
+		// and creating infinite conflict copies.
+		//
+		// Also attempt convergence when dedupe skipped artifact creation —
+		// the earlier artifact already preserved the losing side; retry
+		// convergence so the path can become stable.
+		let convergenceApplied = false;
+		if ((conflictPath !== null || conflictSkippedDedupe) && editorAuthority !== null) {
+			const existingText = vaultSync?.getTextForPath(file.path);
+			if (existingText) {
+				forceReplaceYText(existingText, editorAuthority, ORIGIN_DISK_SYNC_RECOVER_BOUND);
+				convergenceApplied = existingText.toString() === editorAuthority;
+				if (convergenceApplied) {
+					// Convergence succeeded — the original path now matches disk.
+					// Clear the conflict fingerprint so a genuinely new divergence
+					// (different content) can still create a fresh artifact.
+					this.lastConflictFingerprints.delete(file.path);
+				}
+			}
+		}
+
+		this.deps.trace("conflict", "conflict-artifact-needed", {
+			path: file.path,
+			conflictPath,
+			diskConflictPath,
+			reason: "bound-file-ambiguous-divergence",
+			diskLength: content.length,
+			crdtLength: crdtContent?.length ?? null,
+			editorViewCount: viewStates.length,
+			distinctEditorContentCount: distinctEditorContents.length,
+			chosenSource: editorAuthority === null ? "none-multiple-editor-contents" : "editor",
+			conflictArtifactCreated: conflictPath !== null,
+			conflictSkippedDedupe,
+			convergenceApplied,
+			error: conflictError,
+		});
 		this.deps.log(`syncFileFromDisk: skipping "${file.path}" (editor-bound, ambiguous divergence)`);
 		this.deps.scheduleTraceStateSnapshot("bound-file-ambiguous");
 		return true;
+	}
+
+	private shouldQuarantineRepeatedRecovery(
+		path: string,
+		reason: string,
+		previousContent: string,
+		nextContent: string,
+	): boolean {
+		const fingerprint = `${reason}\x00${contentFingerprint(previousContent)}\x00${contentFingerprint(nextContent)}`;
+		const now = Date.now();
+		const previous = this.recoveryFingerprints.get(path);
+		// Same fingerprint within the TTL window → increment.
+		// Same fingerprint beyond the TTL → treat as fresh (count = 1).
+		// Different fingerprint → always reset.
+		const sameFingerprint = previous?.fingerprint === fingerprint;
+		const withinTtl = sameFingerprint && (now - (previous?.lastAt ?? 0)) < RECOVERY_FINGERPRINT_TTL_MS;
+		const count = withinTtl ? previous!.count + 1 : 1;
+		this.recoveryFingerprints.set(path, { fingerprint, count, lastAt: now });
+
+		// Cap map size: evict oldest entries when exceeded
+		if (this.recoveryFingerprints.size > MAX_RECOVERY_FINGERPRINT_MAP_SIZE) {
+			let oldestPath: string | null = null;
+			let oldestAt = Infinity;
+			for (const [p, entry] of this.recoveryFingerprints) {
+				if (entry.lastAt < oldestAt) {
+					oldestAt = entry.lastAt;
+					oldestPath = p;
+				}
+			}
+			if (oldestPath) this.recoveryFingerprints.delete(oldestPath);
+		}
+
+		if (count < MAX_REPEATED_RECOVERY_FINGERPRINTS) return false;
+
+		this.deps.trace("recovery", "recovery-quarantined", {
+			path,
+			reason,
+			repeatCount: count,
+			previousLength: previousContent.length,
+			nextLength: nextContent.length,
+			previousHashPrefix: contentFingerprint(previousContent),
+			nextHashPrefix: contentFingerprint(nextContent),
+		});
+		this.deps.log(
+			`syncFileFromDisk: quarantined repeated recovery for "${path}" ` +
+			`(${reason}, ${count} attempts)`,
+		);
+		this.deps.scheduleTraceStateSnapshot("recovery-quarantined");
+		return true;
+	}
+
+	private async createMarkdownConflictArtifact(
+		path: string,
+		content: string,
+		reason: string,
+		source?: "crdt" | "disk" | "editor",
+	): Promise<string> {
+		const basePath = this.conflictArtifactPath(path, source);
+		for (let i = 0; i < 100; i++) {
+			const candidate = i === 0
+				? basePath
+				: basePath.replace(/(\.md)?$/, ` ${i + 1}$1`);
+			if (this.deps.app.vault.getAbstractFileByPath(candidate)) continue;
+			await this.deps.app.vault.create(candidate, content);
+			this.deps.trace("conflict", "conflict-artifact-created", {
+				path,
+				conflictPath: candidate,
+				reason,
+				source: source ?? null,
+				contentLength: content.length,
+			});
+			return candidate;
+		}
+		throw new Error(`could not create conflict artifact for ${path}`);
+	}
+
+	private conflictArtifactPath(path: string, source?: "crdt" | "disk" | "editor"): string {
+		const slash = path.lastIndexOf("/");
+		const dir = slash >= 0 ? path.slice(0, slash + 1) : "";
+		const name = slash >= 0 ? path.slice(slash + 1) : path;
+		const dot = name.toLowerCase().endsWith(".md") ? name.length - 3 : -1;
+		const base = dot >= 0 ? name.slice(0, dot) : name;
+		const ext = dot >= 0 ? name.slice(dot) : ".md";
+		// Cap device name to 50 chars to prevent overly long paths
+		const device = (this.deps.getSettings().deviceName
+			.replace(/[\\/:*?"<>|]/g, "-")
+			.trim() || "unknown-device").slice(0, 50);
+		const stamp = new Date().toISOString()
+			.replace(/\.\d{3}Z$/, "Z")
+			.replace(/[:]/g, "-");
+		// Cap base name to 100 chars to prevent filesystem path length issues
+		const cappedBase = base.slice(0, 100);
+		const sourcePart = source ? ` - ${source}` : "";
+		const suffix = ` (YAOS conflict${sourcePart} from ${device} ${stamp})`;
+		// Guard total filename length: suffix + ext + base + margin for
+		// counter suffix (" 99") ≈ suffix.length + ext.length + 4.
+		// Most filesystems cap at 255 bytes per component.
+		const maxBase = Math.max(20, 255 - suffix.length - ext.length - 4);
+		const finalBase = cappedBase.length > maxBase
+			? cappedBase.slice(0, maxBase)
+			: cappedBase;
+		return `${dir}${finalBase}${suffix}${ext}`;
 	}
 
 	private async updateDiskIndexForPath(path: string): Promise<void> {
@@ -890,5 +1440,25 @@ export class ReconciliationController {
 		} catch {
 			// Stat failed, index will be stale for this path.
 		}
+	}
+
+	/**
+	 * Show a conflict notice with rate-limiting. Only one notice per
+	 * CONFLICT_NOTICE_COOLDOWN_MS window; suppressed conflicts are
+	 * counted and mentioned in the next notice.
+	 */
+	private showConflictNotice(message: string): void {
+		const now = Date.now();
+		if (now - this.lastConflictNoticeAt < ReconciliationController.CONFLICT_NOTICE_COOLDOWN_MS) {
+			this.conflictNoticeSuppressionCount++;
+			return;
+		}
+		const suppressed = this.conflictNoticeSuppressionCount;
+		this.conflictNoticeSuppressionCount = 0;
+		this.lastConflictNoticeAt = now;
+		const suffix = suppressed > 0
+			? ` (and ${suppressed} other conflict${suppressed > 1 ? "s" : ""} in the last 30s)`
+			: "";
+		new Notice(`YAOS: ${message}${suffix}`, 10000);
 	}
 }
