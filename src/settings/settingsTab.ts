@@ -1,7 +1,11 @@
 import { App, Notice, Plugin, PluginSettingTab, Setting } from "obsidian";
 import { PairDeviceModal } from "./PairDeviceModal";
 import { RecoveryKitModal } from "./RecoveryKitModal";
-import type { ExternalEditPolicy, VaultSyncSettings } from "./settingsStore";
+import {
+	attachmentSizeCapKB,
+	type ExternalEditPolicy,
+	type VaultSyncSettings,
+} from "./settingsStore";
 
 type SettingsAuthMode = "env" | "claim" | "unclaimed" | "unknown";
 type SettingsStatusState = "disconnected" | "loading" | "syncing" | "connected" | "offline" | "error" | "unauthorized";
@@ -25,6 +29,7 @@ export interface VaultSyncSettingsHost {
 	settings: VaultSyncSettings;
 	serverAuthMode: SettingsAuthMode;
 	serverSupportsAttachments: boolean;
+	serverMaxBlobUploadBytes: number | null;
 	updateSettings(mutator: (settings: VaultSyncSettings) => void, reason?: string): Promise<void>;
 	refreshServerCapabilities(reason?: string): Promise<void>;
 	refreshUpdateManifest(reason?: string, force?: boolean): Promise<void>;
@@ -111,6 +116,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 		containerEl.addClass("yaos-settings-tab");
 		const authMode = this.host.serverAuthMode;
 		const attachmentsAvailable = this.host.serverSupportsAttachments;
+		const attachmentCapKB = attachmentSizeCapKB(this.host.serverMaxBlobUploadBytes);
 		const setupIncomplete = !this.host.settings.host || !this.host.settings.token;
 		const syncStatus = this.host.getSettingsStatusSummary();
 
@@ -363,7 +369,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 			if ((attachmentsAvailable || !this.host.settings.host) && this.host.settings.enableAttachmentSync) {
 				new Setting(containerEl)
 					.setName("Max attachment size in kilobytes")
-					.setDesc("Attachments larger than this are skipped.")
+					.setDesc(`Attachments larger than this are skipped. Maximum ${attachmentCapKB} KB.`)
 				.addText((text) =>
 					text
 						.setPlaceholder("10240")
@@ -372,7 +378,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 							const n = parseInt(value, 10);
 							if (!isNaN(n) && n > 0) {
 								await this.host.updateSettings((settings) => {
-									settings.maxAttachmentSizeKB = n;
+									settings.maxAttachmentSizeKB = Math.min(Math.floor(n), attachmentCapKB);
 								}, "settings:max-attachment-size");
 							}
 						}),

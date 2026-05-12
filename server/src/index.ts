@@ -10,6 +10,7 @@ import {
 	handleClaimRoute,
 	handleUpdateMetadataRoute,
 	isAuthorized,
+	rejectUnauthorizedVaultRequest,
 	supportsBuckets,
 } from "./routes/auth";
 import { handleBlobRoute } from "./routes/blobs";
@@ -32,48 +33,53 @@ function parseVaultPath(pathname: string): { vaultId: string; rest: string[] } |
 	};
 }
 
-async function rejectUnauthorizedVaultRequest(
+/**
+ * Pre-auth rejection telemetry MUST NOT touch Durable Object storage
+ * (INV-SEC-01, INV-OBS-02). Calls to recordVaultTrace from this path
+ * would create or wake the DO and write a storage entry per unauthorized
+ * request — the documented root cause of issue #40 (DO request explosion).
+ *
+ * Rejections are logged via console.warn so Cloudflare worker logs still
+ * capture them, but no per-room state is mutated before authentication
+ * succeeds.
+ */
+function logVaultRejection(
+	req: Request,
+	vaultId: string,
+	reason: "unclaimed" | "server_misconfigured" | "unauthorized",
+): void {
+	// Truncate vaultId so it cannot become a correlation handle in exported
+	// worker logs, while still being useful for debugging.
+	const vaultIdHint = vaultId.slice(0, 8);
+	console.warn(
+		`${LOG_PREFIX} vault rejected pre-auth: ` +
+		JSON.stringify({ vaultIdHint, reason, method: req.method }),
+	);
+}
+
+async function rejectAndLogUnauthorizedVaultRequest(
 	req: Request,
 	env: Env,
 	authState: AuthState,
 	vaultId: string,
 ): Promise<Response | null> {
-	const url = new URL(req.url);
-	const token = getHttpAuthToken(req);
-	if (!authState.claimed) {
-		await recordVaultTrace(env, vaultId, "http-rejected", {
-			reason: "unclaimed",
-			method: req.method,
-			path: url.pathname,
-		});
-		return json({ error: "unclaimed" }, 503);
+	const rejection = await rejectUnauthorizedVaultRequest(req, env, authState, vaultId);
+	if (rejection) {
+		logVaultRejection(req, vaultId, rejection.reason);
 	}
-	if (authState.mode === "env" && !authState.envToken) {
-		await recordVaultTrace(env, vaultId, "http-rejected", {
-			reason: "server_misconfigured",
-			method: req.method,
-			path: url.pathname,
-		});
-		return json({ error: "server_misconfigured" }, 503);
-	}
-	if (!(await isAuthorized(authState, token))) {
-		await recordVaultTrace(env, vaultId, "http-unauthorized", {
-			method: req.method,
-			path: url.pathname,
-		});
-		return json({ error: "unauthorized" }, 401);
-	}
-	return null;
+	return rejection?.response ?? null;
 }
 
-async function handleCapabilities(env: Env, authState: AuthState): Promise<Response> {
+async function handleCapabilities(req: Request, env: Env, authState: AuthState): Promise<Response> {
 	let config: StoredServerConfig | null = null;
 	try {
 		config = await getStoredServerConfig(env);
 	} catch (err) {
 		console.warn(`${LOG_PREFIX} config fetch failed for capabilities:`, err);
 	}
-	return json(getCapabilities(authState, env, config));
+	const includePrivateUpdateMetadata = authState.claimed
+		&& await isAuthorized(authState, getHttpAuthToken(req));
+	return json(getCapabilities(authState, env, config, { includePrivateUpdateMetadata }));
 }
 
 const worker = {
@@ -113,7 +119,7 @@ const worker = {
 		}
 
 		if (req.method === "GET" && url.pathname === "/api/capabilities") {
-			return withCors(await handleCapabilities(env, authState));
+			return withCors(await handleCapabilities(req, env, authState));
 		}
 
 		if (req.method === "POST" && url.pathname === "/claim") {
@@ -134,7 +140,7 @@ const worker = {
 			return withCors(json({ error: "not found" }, 404));
 		}
 
-		const authFailure = await rejectUnauthorizedVaultRequest(
+		const authFailure = await rejectAndLogUnauthorizedVaultRequest(
 			req,
 			env,
 			authState,

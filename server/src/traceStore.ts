@@ -7,6 +7,64 @@ const MAX_TRACE_ARRAY_ITEMS = 20;
 const MAX_TRACE_OBJECT_KEYS = 20;
 const MAX_TRACE_DEPTH = 4;
 
+/**
+ * INV-OBS-02: bounded per-room trace budget. Pathological clients (or hot
+ * loops) emitting traces faster than this rate are dropped. Drops are
+ * counted and surfaced via a single throttled summary entry the next time
+ * an admit succeeds, so the loss is observable but does not itself cause
+ * unbounded writes.
+ *
+ * The default budget (600 events / 60s) is the draft target named in
+ * sync-invariants.md and tightenable per workload. Constructor allows
+ * tests and DO code to override.
+ */
+export const DEFAULT_TRACE_RATE_LIMIT_PER_WINDOW = 600;
+export const DEFAULT_TRACE_RATE_WINDOW_MS = 60_000;
+export const TRACE_RATE_THROTTLE_EVENT = "trace-throttled";
+
+export class TraceRateLimiter {
+	private readonly admitted: number[] = [];
+	private dropped = 0;
+
+	constructor(
+		private readonly maxPerWindow: number = DEFAULT_TRACE_RATE_LIMIT_PER_WINDOW,
+		private readonly windowMs: number = DEFAULT_TRACE_RATE_WINDOW_MS,
+	) {}
+
+	/**
+	 * Try to admit a trace event. Returns true if admitted (caller should
+	 * proceed to write); false if dropped (caller should not write).
+	 */
+	admit(now: number = Date.now()): boolean {
+		this.compactWindow(now);
+		if (this.admitted.length >= this.maxPerWindow) {
+			this.dropped++;
+			return false;
+		}
+		this.admitted.push(now);
+		return true;
+	}
+
+	/**
+	 * Returns the drop count accumulated since the last drain and resets
+	 * it to zero. Callers use this to decide whether to emit a single
+	 * throttled-summary entry.
+	 */
+	drainDropped(): number {
+		const value = this.dropped;
+		this.dropped = 0;
+		return value;
+	}
+
+	private compactWindow(now: number): void {
+		const cutoff = now - this.windowMs;
+		// Sliding window is small (bounded by maxPerWindow); shift is fine.
+		while (this.admitted.length > 0 && this.admitted[0] < cutoff) {
+			this.admitted.shift();
+		}
+	}
+}
+
 export interface TraceEntry {
 	ts: string;
 	event: string;

@@ -1,7 +1,11 @@
 import * as Y from "yjs";
 
 const diffModule = await import("../src/sync/diff.ts");
-const { applyDiffToYText } = diffModule.default;
+const {
+	applyDiffToYText,
+	applyDiffToYTextWithPostcondition,
+	forceReplaceYText,
+} = diffModule.default;
 
 let passed = 0;
 let failed = 0;
@@ -137,6 +141,39 @@ console.log("\n--- Test 6: stale-base disk patch does not duplicate task icons o
 		!merged.includes("🔹🔹"),
 		"stale-base patch does not duplicate inline task icons",
 	);
+	doc.destroy();
+}
+
+console.log("\n--- Test 7: recovery postcondition force-replaces stale-base mismatch ---");
+{
+	const doc = new Y.Doc();
+	const ytext = doc.getText("content");
+	ytext.insert(0, "abcX");
+
+	const result = applyDiffToYTextWithPostcondition(
+		ytext,
+		"abc",
+		"abcY",
+		"disk-sync-recover-bound",
+	);
+
+	assert(ytext.toString() === "abcY", "postcondition helper lands exact expected content");
+	assert(result.diffSkippedDueToStaleBase, "stale-base patch is skipped before mutation");
+	assert(!result.matchesAfterDiff, "stale-base patch mismatch is detected");
+	assert(result.forceReplaceApplied, "force replace is applied after mismatch");
+	assert(result.finalMatchesExpected, "force replace satisfies the postcondition");
+	doc.destroy();
+}
+
+console.log("\n--- Test 8: forceReplaceYText replaces the whole Y.Text exactly ---");
+{
+	const doc = new Y.Doc();
+	const ytext = doc.getText("content");
+	ytext.insert(0, "old content");
+
+	forceReplaceYText(ytext, "new", "disk-sync-open-idle-recover");
+
+	assert(ytext.toString() === "new", "forceReplaceYText replaces old content exactly");
 	doc.destroy();
 }
 

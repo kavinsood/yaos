@@ -1,5 +1,6 @@
 import * as Y from "yjs";
 import { YServer } from "y-partyserver";
+import type { Connection, ConnectionContext, WSMessage } from "partyserver";
 import { runSerialized, runSingleFlight } from "./asyncConcurrency";
 import { ChunkedDocStore } from "./chunkedDocStore";
 import { readRoomMeta, type RoomMeta, writeRoomMeta } from "./roomMeta";
@@ -12,8 +13,12 @@ import {
 	appendTraceEntry,
 	listRecentTraceEntries,
 	prepareTraceEntryForStorage,
+	TRACE_RATE_THROTTLE_EVENT,
+	TraceRateLimiter,
 	type TraceEntry as StoredTraceEntry,
 } from "./traceStore";
+import { trySendSvEcho, type SvEchoSendResult } from "./svEcho";
+import { isUpdateBearingSyncMessage } from "./syncMessageClassifier";
 
 const MAX_DEBUG_TRACE_EVENTS = 200;
 const JOURNAL_COMPACT_MAX_ENTRIES = 50;
@@ -26,6 +31,17 @@ type ServerTraceEntry = StoredTraceEntry;
 interface ServerEnv {
 	YAOS_BUCKET?: R2Bucket;
 }
+
+type SvEchoCounters = {
+	baselineSent: number;
+	postApplySent: number;
+	failed: number;
+	bytesTotal: number;
+	bytesMax: number;
+	failureNotOpen: number;
+	failureOversize: number;
+	failureSendFailed: number;
+};
 
 function equalBytes(a: Uint8Array, b: Uint8Array): boolean {
 	if (a.byteLength !== b.byteLength) return false;
@@ -58,6 +74,17 @@ export class VaultSyncServer extends YServer {
 	private snapshotMaybeChain: Promise<void> = Promise.resolve();
 	private lastSavedStateVector: Uint8Array | null = null;
 	private roomMeta: RoomMeta | null = null;
+	private readonly traceRateLimiter = new TraceRateLimiter();
+	private readonly svEchoCounters: SvEchoCounters = {
+		baselineSent: 0,
+		postApplySent: 0,
+		failed: 0,
+		bytesTotal: 0,
+		bytesMax: 0,
+		failureNotOpen: 0,
+		failureOversize: 0,
+		failureSendFailed: 0,
+	};
 
 	async onLoad(): Promise<void> {
 		await this.ensureDocumentLoaded();
@@ -78,6 +105,19 @@ export class VaultSyncServer extends YServer {
 		}
 		await this.enqueueSave(delta, persistedStateVector);
 		await this.syncRoomMetaFromDocument();
+	}
+
+	async onConnect(connection: Connection, ctx: ConnectionContext): Promise<void> {
+		await super.onConnect(connection, ctx);
+		this.recordSvEchoResult(trySendSvEcho(connection, this.document, "baseline"));
+	}
+
+	handleMessage(connection: Connection, message: WSMessage): void {
+		const shouldEcho = isUpdateBearingSyncMessage(message);
+		super.handleMessage(connection, message);
+		if (shouldEcho) {
+			this.recordSvEchoResult(trySendSvEcho(connection, this.document, "postApply"));
+		}
 	}
 
 	async fetch(request: Request): Promise<Response> {
@@ -106,6 +146,7 @@ export class VaultSyncServer extends YServer {
 			return json({
 				roomId: this.getRoomId(),
 				recent,
+				svEcho: { ...this.svEchoCounters },
 			});
 		}
 
@@ -138,6 +179,20 @@ export class VaultSyncServer extends YServer {
 
 		await this.ensureDocumentLoaded();
 		return super.fetch(request);
+	}
+
+	private recordSvEchoResult(result: SvEchoSendResult): void {
+		if (result.ok) {
+			if (result.kind === "baseline") this.svEchoCounters.baselineSent++;
+			if (result.kind === "postApply") this.svEchoCounters.postApplySent++;
+			this.svEchoCounters.bytesTotal += result.bytes;
+			this.svEchoCounters.bytesMax = Math.max(this.svEchoCounters.bytesMax, result.bytes);
+			return;
+		}
+		this.svEchoCounters.failed++;
+		if (result.failure === "not_open") this.svEchoCounters.failureNotOpen++;
+		if (result.failure === "oversize") this.svEchoCounters.failureOversize++;
+		if (result.failure === "send_failed") this.svEchoCounters.failureSendFailed++;
 	}
 
 	private async ensureDocumentLoaded(): Promise<void> {
@@ -307,12 +362,21 @@ export class VaultSyncServer extends YServer {
 		event: string,
 		data: Record<string, unknown>,
 	): Promise<void> {
-			const entry: ServerTraceEntry = prepareTraceEntryForStorage({
-				...data,
-				ts: new Date().toISOString(),
-				event,
-				roomId: this.getRoomId(),
-			});
+		// INV-OBS-02: per-room budget. Drop over-budget events; surface the
+		// drop count via a single throttled-summary entry the next time an
+		// admit succeeds. Throttle-summary entries themselves bypass the
+		// rate limiter (otherwise drops could become unobservable).
+		const isThrottleSummary = event === TRACE_RATE_THROTTLE_EVENT;
+		if (!isThrottleSummary && !this.traceRateLimiter.admit()) {
+			return;
+		}
+
+		const entry: ServerTraceEntry = prepareTraceEntryForStorage({
+			...data,
+			ts: new Date().toISOString(),
+			event,
+			roomId: this.getRoomId(),
+		});
 
 		console.debug(JSON.stringify({
 			source: "yaos-sync/server",
@@ -323,6 +387,14 @@ export class VaultSyncServer extends YServer {
 			await appendTraceEntry(this.ctx.storage, entry, MAX_DEBUG_TRACE_EVENTS);
 		} catch (err) {
 			console.error(`${LOG_PREFIX} trace persist failed:`, err);
+		}
+
+		// Drain accumulated drops as a single bounded summary.
+		if (!isThrottleSummary) {
+			const dropped = this.traceRateLimiter.drainDropped();
+			if (dropped > 0) {
+				await this.recordTrace(TRACE_RATE_THROTTLE_EVENT, { dropped });
+			}
 		}
 	}
 

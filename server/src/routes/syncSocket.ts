@@ -77,6 +77,24 @@ function returnSocketResponse(req: Request, response: Response): Response {
 	return isWebSocketRequest(req) ? response : withCors(response);
 }
 
+/**
+ * Pre-auth rejection telemetry MUST NOT touch Durable Object storage
+ * (INV-SEC-01, INV-OBS-02). See server/src/index.ts for the long-form
+ * comment and root-cause history (issue #40).
+ */
+function logSocketRejection(
+	vaultId: string,
+	reason: "unclaimed" | "server_misconfigured" | "unauthorized",
+): void {
+	// Truncate vaultId so it cannot become a correlation handle in exported
+	// worker logs.
+	const vaultIdHint = vaultId.slice(0, 8);
+	console.warn(
+		`[yaos-sync:worker] ws rejected pre-auth: ` +
+		JSON.stringify({ vaultIdHint, reason }),
+	);
+}
+
 export async function handleSyncSocketRoute(
 	req: Request,
 	env: Env,
@@ -87,21 +105,15 @@ export async function handleSyncSocketRoute(
 	const token = getSocketAuthToken(req);
 	const clientSchema = parseClientSchemaVersion(url);
 	if (!authState.claimed) {
-		await recordVaultTrace(env, vaultId, "ws-rejected", {
-			reason: "unclaimed",
-		});
+		logSocketRejection(vaultId, "unclaimed");
 		return returnSocketResponse(req, rejectSocket(req, "unclaimed"));
 	}
 	if (authState.mode === "env" && !authState.envToken) {
-		await recordVaultTrace(env, vaultId, "ws-rejected", {
-			reason: "server_misconfigured",
-		});
+		logSocketRejection(vaultId, "server_misconfigured");
 		return returnSocketResponse(req, rejectSocket(req, "server_misconfigured"));
 	}
 	if (!(await isAuthorized(authState, token))) {
-		await recordVaultTrace(env, vaultId, "ws-rejected", {
-			reason: "unauthorized",
-		});
+		logSocketRejection(vaultId, "unauthorized");
 		return returnSocketResponse(req, rejectSocket(req, "unauthorized"));
 	}
 	if (!clientSchema) {

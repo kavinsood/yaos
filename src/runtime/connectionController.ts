@@ -1,5 +1,6 @@
 import { VaultSync } from "../sync/vaultSync";
 import type { TraceRecord } from "../debug/trace";
+import { deriveSyncFacts, type SyncFacts } from "./connectionFacts";
 
 export type OfflineReason =
 	| "provider_disconnected"
@@ -89,6 +90,30 @@ export class ConnectionController {
 		}
 		sync.provider.disconnect();
 		void sync.provider.connect();
+	}
+
+	getSyncFacts(blobPendingUploads = 0): SyncFacts {
+		const sync = this.deps.getVaultSync();
+		const state = this.getState();
+		return deriveSyncFacts(
+			{
+				connected: sync?.connected ?? false,
+				fatalAuthError: sync?.fatalAuthError ?? false,
+				fatalAuthCode: sync?.fatalAuthCode ?? null,
+				lastLocalUpdateAt: sync?.lastLocalUpdateAt ?? null,
+				lastLocalUpdateWhileConnectedAt: sync?.lastLocalUpdateWhileConnectedAt ?? null,
+				lastRemoteUpdateAt: sync?.lastRemoteUpdateAt ?? null,
+				pendingBlobUploads: blobPendingUploads,
+				serverAppliedLocalState: sync?.serverAppliedLocalState ?? null,
+				lastServerReceiptEchoAt: sync?.lastServerReceiptEchoAt ?? null,
+				lastKnownServerReceiptEchoAt: sync?.lastKnownServerReceiptEchoAt ?? null,
+				candidatePersistenceHealthy: sync?.candidatePersistenceHealthy ?? null,
+				candidatePersistenceFailureCount: sync?.candidatePersistenceFailureCount ?? null,
+				hasUnconfirmedServerReceiptCandidate: sync?.hasUnconfirmedServerReceiptCandidate ?? false,
+				serverReceiptCandidateCapturedAt: sync?.serverReceiptCandidateCapturedAt ?? null,
+			},
+			state.kind,
+		);
 	}
 
 	getState(): ConnectionState {

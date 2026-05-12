@@ -9,6 +9,7 @@
 		"typecheck": "tsc --noEmit"
 	},
 	"dependencies": {
+		"@noble/hashes": "1.7.1",
 		"fflate": "^0.8.2",
 		"partyserver": "0.3.2",
 		"y-partyserver": "2.1.2",

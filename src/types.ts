@@ -71,7 +71,9 @@ export interface BlobTombstone {
 
 /** Origin string used for Yjs transactions initiated by this plugin. */
 export const ORIGIN_LOCAL = "vault-crdt-local";
-export const ORIGIN_SEED = "vault-crdt-seed";
+// Canonical declaration lives in src/sync/origins.ts — re-exported here for
+// legacy importers. New code should import directly from origins.ts.
+export { ORIGIN_SEED } from "./sync/origins";
 
 // -------------------------------------------------------------------
 // File classification

@@ -70,14 +70,21 @@ console.log("\n--- Test 4: editor-health-heal origin remains manual-only ---");
 		"rebind(view: MarkdownView, deviceName: string, reason: string): void {",
 	);
 	assert(healSection !== null, "heal section found");
+	// After the origin-constants refactor the call site uses ORIGIN_EDITOR_HEALTH_HEAL
+	// (imported from src/sync/origins.ts) instead of the raw string. Check for the
+	// constant name rather than the literal.
 	assert(
-		healSection?.includes('"editor-health-heal"'),
-		"editor-health-heal origin exists only in heal() implementation",
+		healSection?.includes("ORIGIN_EDITOR_HEALTH_HEAL"),
+		"editor-health-heal origin used via named constant in heal() implementation",
 	);
+	// Strip the heal section then check that applyDiffToYText is NOT called
+	// with ORIGIN_EDITOR_HEALTH_HEAL outside it. The import declaration
+	// is allowed to remain (it's not a call site). Use [^\n)]* to stay
+	// on the same line and avoid spurious cross-line matches.
 	const strippedSource = bindingSource.replace(healSection ?? "", "");
 	assert(
-		!strippedSource.includes('"editor-health-heal"'),
-		"editor-health-heal origin not used outside heal()",
+		!strippedSource.match(/applyDiffToYText[^\n)]*ORIGIN_EDITOR_HEALTH_HEAL/),
+		"ORIGIN_EDITOR_HEALTH_HEAL not passed to applyDiffToYText outside heal()",
 	);
 }
 

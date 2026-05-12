@@ -16,6 +16,7 @@ import type { FileMeta, BlobRef } from "../types";
 import { appendTraceParams, type TraceHttpContext } from "../debug/trace";
 import { obsidianRequest } from "../utils/http";
 import { yTextToString } from "../utils/format";
+import { ORIGIN_RESTORE } from "./origins";
 
 // -------------------------------------------------------------------
 // Types (mirrors server SnapshotIndex)
@@ -384,8 +385,7 @@ export function diffSnapshot(
 // Restore
 // -------------------------------------------------------------------
 
-/** Origin for restore transactions, so disk mirror and other observers can identify them. */
-export const ORIGIN_RESTORE = "snapshot-restore";
+// ORIGIN_RESTORE canonical declaration is in src/sync/origins.ts — imported above.
 
 export interface RestoreOptions {
 	/** Paths of markdown files to restore from the snapshot. */

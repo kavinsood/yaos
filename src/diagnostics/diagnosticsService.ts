@@ -1,4 +1,6 @@
 import { App, Notice, normalizePath } from "obsidian";
+import { deriveSyncFacts } from "../runtime/connectionFacts";
+import { formatUnknown } from "../utils/format";
 import { BlobSyncManager } from "../sync/blobSync";
 import { DiskMirror } from "../sync/diskMirror";
 import { VaultSync, type ReconcileMode } from "../sync/vaultSync";
@@ -8,6 +10,9 @@ import {
 	buildFrontmatterQuarantineDebugLines,
 	type FrontmatterQuarantineEntry,
 } from "../sync/frontmatterQuarantine";
+import { ConfirmModal } from "../ui/ConfirmModal";
+import { buildDiagnosticsBundle } from "./diagnosticsBundle";
+import type { DiagnosticsBundleInput } from "./diagnosticsBundle";
 
 type EventEntry = { ts: string; msg: string };
 
@@ -21,6 +26,21 @@ type LastReconcileStats = {
 	safetyBrakeTriggered: boolean;
 	safetyBrakeReason: string | null;
 };
+
+function describeServerReceiptStartupValidation(state: string | null): string {
+	switch (state) {
+		case "validated":
+			return "validated";
+		case "skipped_local_yjs_timeout":
+			return "skipped: local Yjs cache did not finish loading; persisted receipt candidate was not trusted this session";
+		case "unavailable":
+			return "unavailable";
+		case "not_started":
+			return "not started";
+		default:
+			return state ?? "unknown";
+	}
+}
 
 interface DiagnosticsServiceDeps {
 	app: App;
@@ -59,13 +79,71 @@ export class DiagnosticsService {
 		const blobSync = this.deps.getBlobSync();
 		const trace = this.deps.getTraceHttpContext();
 
+		const facts = deriveSyncFacts(
+			{
+				connected: vaultSync.connected,
+				fatalAuthError: vaultSync.fatalAuthError,
+				fatalAuthCode: vaultSync.fatalAuthCode,
+				lastLocalUpdateAt: vaultSync.lastLocalUpdateAt,
+				lastLocalUpdateWhileConnectedAt: vaultSync.lastLocalUpdateWhileConnectedAt,
+				lastRemoteUpdateAt: vaultSync.lastRemoteUpdateAt,
+				pendingBlobUploads: blobSync?.pendingUploads ?? 0,
+				serverAppliedLocalState: vaultSync.serverAppliedLocalState,
+				lastServerReceiptEchoAt: vaultSync.lastServerReceiptEchoAt,
+				lastKnownServerReceiptEchoAt: vaultSync.lastKnownServerReceiptEchoAt,
+				candidatePersistenceHealthy: vaultSync.candidatePersistenceHealthy,
+				candidatePersistenceFailureCount: vaultSync.candidatePersistenceFailureCount,
+				hasUnconfirmedServerReceiptCandidate: vaultSync.hasUnconfirmedServerReceiptCandidate,
+				serverReceiptCandidateCapturedAt: vaultSync.serverReceiptCandidateCapturedAt,
+			},
+			vaultSync.connected
+				? (state.reconciled ? "online" : "connecting")
+				: (vaultSync.fatalAuthError ? "auth_failed" : "offline"),
+		);
+
+		function fmtTs(ms: number | null): string {
+			if (ms === null) return "(none)";
+			return new Date(ms).toISOString();
+		}
+
+		// NOTE: buildDebugInfo() is local/sensitive — it includes the server URL,
+		// vault ID, and device name. It is NOT safe for sharing. Use
+		// exportDiagnostics() (safe mode) for shareable output.
 		return [
+			`[local debug — includes server URL and vault ID]`,
 			`Host: ${settings.host || "(not set)"}`,
 			`Vault ID: ${settings.vaultId || "(not set)"}`,
 			`Device: ${settings.deviceName || "(unnamed)"}`,
 			`Trace ID: ${trace?.traceId ?? "(disabled)"}`,
 			`Boot ID: ${trace?.bootId ?? "(disabled)"}`,
-			`Connected: ${vaultSync.connected}`,
+			// Connection facts (INV-AUTH-01, INV-ACK-01)
+			`Headline: ${facts.headlineState}`,
+			`Server reachable: ${facts.serverReachable ?? "unknown"}`,
+			`Auth accepted: ${facts.authAccepted ?? "unknown"}`,
+			`WebSocket open: ${facts.websocketOpen}`,
+			`Auth reject code: ${facts.lastAuthRejectCode ?? "(none)"}`,
+			`Last local CRDT update: ${fmtTs(facts.lastLocalUpdateAt)}`,
+			`Last local update while connected: ${fmtTs(facts.lastLocalUpdateWhileConnectedAt)}`,
+			`Last remote update observed: ${fmtTs(facts.lastRemoteUpdateAt)}`,
+			`Server receipt wire: active (Level 3 server Y.Doc receipt; not durable)`,
+			`Server receipt active state: ${facts.serverAppliedLocalState ?? "unknown"}`,
+			`Last server receipt echo observed: ${fmtTs(facts.lastServerReceiptEchoAt)}`,
+			`Last known server receipt: ${fmtTs(facts.lastKnownServerReceiptEchoAt)}`,
+			`Server receipt candidate captured: ${fmtTs(facts.serverReceiptCandidateCapturedAt)}`,
+			`Server receipt candidate present: ${facts.hasUnconfirmedServerReceiptCandidate}`,
+			`Server receipt persistence healthy: ${facts.candidatePersistenceHealthy ?? "unknown"}`,
+			`Server receipt persistence failures: ${facts.candidatePersistenceFailureCount ?? "unknown"}`,
+			`Server receipt startup validation: ${describeServerReceiptStartupValidation(vaultSync.serverReceiptStartupValidation)}`,
+			`Custom messages seen: ${vaultSync.svEchoCounters.customMessageSeenCount}`,
+			`Server receipt echo seen: ${vaultSync.svEchoCounters.svEchoSeenCount}`,
+			`Server receipt echo accepted: ${vaultSync.svEchoCounters.acceptedCount}`,
+			`Server receipt echo rejected: ${vaultSync.svEchoCounters.rejectedCount}`,
+			`Server receipt echo rejected oversize: ${vaultSync.svEchoCounters.rejectedOversizeCount}`,
+			`Server receipt echo rejected invalid: ${vaultSync.svEchoCounters.rejectedInvalidCount}`,
+			`Server receipt echo max bytes: ${vaultSync.svEchoCounters.bytesMax}`,
+			`Pending local updates: unknown (latest-state receipt, no queue count)`,
+			`Pending blob uploads: ${facts.pendingBlobUploads}`,
+			// Detailed internal state
 			`Local ready: ${vaultSync.localReady}`,
 			`Provider synced: ${vaultSync.providerSynced}`,
 			`Initialized (sentinel): ${vaultSync.isInitialized}`,
@@ -73,8 +151,6 @@ export class DiagnosticsService {
 			`Reconciled: ${state.reconciled}`,
 			`Connection generation: ${vaultSync.connectionGeneration}`,
 			`Last reconciled gen: ${state.lastReconciledGeneration}`,
-			`Fatal auth error: ${vaultSync.fatalAuthError}`,
-			`Fatal auth code: ${vaultSync.fatalAuthCode ?? "(none)"}`,
 			`IndexedDB error: ${vaultSync.idbError}`,
 			`IndexedDB error kind: ${vaultSync.idbErrorDetails?.kind ?? "(none)"}`,
 			`IndexedDB error phase: ${vaultSync.idbErrorDetails?.phase ?? "(none)"}`,
@@ -88,7 +164,6 @@ export class DiagnosticsService {
 			`External edit policy: ${settings.externalEditPolicy}`,
 			`Attachment sync: ${settings.enableAttachmentSync ? "enabled" : "disabled"}`,
 			...(blobSync ? [
-				`Pending uploads: ${blobSync.pendingUploads}`,
 				`Pending downloads: ${blobSync.pendingDownloads}`,
 			] : []),
 			`Open files: ${state.openFileCount}`,
@@ -112,14 +187,56 @@ export class DiagnosticsService {
 		return merged.slice(-limit).join("\n");
 	}
 
+	/**
+	 * Default diagnostics export. Vault paths are redacted to stable
+	 * per-bundle salted hashes; no filenames or vault content appear in
+	 * the output (INV-SEC-02).
+	 */
 	async exportDiagnostics(): Promise<void> {
+		await this.runExport({ includeFilenames: false });
+	}
+
+	/**
+	 * Filename-inclusive diagnostics export. Requires explicit confirmation
+	 * before writing. Output contains raw vault paths and is intended for
+	 * direct sharing with the maintainer when path structure is needed to
+	 * reproduce a bug.
+	 */
+	async exportDiagnosticsWithFilenames(): Promise<void> {
+		await new Promise<void>((resolve) => {
+			new ConfirmModal(
+				this.deps.app,
+				"Export diagnostics with filenames?",
+				"This export includes raw vault file names and your server URL. Do not share publicly without reviewing the file first.",
+				async () => {
+					try {
+						await this.runExport({ includeFilenames: true });
+					} catch (err) {
+						this.deps.log(`diagnostics export failed: ${formatUnknown(err)}`);
+						new Notice("Diagnostics export failed. Check console.", 10000);
+					} finally {
+						resolve();
+					}
+				},
+				"Export with filenames",
+				"Cancel",
+				() => resolve(),
+			).open();
+		});
+	}
+
+	private async runExport(options: { includeFilenames: boolean }): Promise<void> {
 		const vaultSync = this.deps.getVaultSync();
 		if (!vaultSync) {
 			new Notice("Sync not initialized");
 			return;
 		}
 
-		new Notice("Exporting sync diagnostics...");
+		new Notice(
+			options.includeFilenames
+				? "Exporting full sync diagnostics (with filenames)..."
+				: "Exporting safe sync diagnostics...",
+		);
 		const startedAt = Date.now();
 		const settings = this.deps.getSettings();
 		const state = this.deps.getState();
@@ -157,55 +274,46 @@ export class DiagnosticsService {
 			});
 		}
 
-		const allPaths = new Set<string>([
-			...Array.from(diskHashes.keys()),
-			...Array.from(crdtHashes.keys()),
-		]);
+		const blobSync = this.deps.getBlobSync();
+		const syncFacts = deriveSyncFacts(
+			{
+				connected: vaultSync.connected,
+				fatalAuthError: vaultSync.fatalAuthError,
+				fatalAuthCode: vaultSync.fatalAuthCode,
+				lastLocalUpdateAt: vaultSync.lastLocalUpdateAt,
+				lastLocalUpdateWhileConnectedAt: vaultSync.lastLocalUpdateWhileConnectedAt,
+				lastRemoteUpdateAt: vaultSync.lastRemoteUpdateAt,
+				pendingBlobUploads: blobSync?.pendingUploads ?? 0,
+				serverAppliedLocalState: vaultSync.serverAppliedLocalState,
+				lastServerReceiptEchoAt: vaultSync.lastServerReceiptEchoAt,
+				lastKnownServerReceiptEchoAt: vaultSync.lastKnownServerReceiptEchoAt,
+				candidatePersistenceHealthy: vaultSync.candidatePersistenceHealthy,
+				candidatePersistenceFailureCount: vaultSync.candidatePersistenceFailureCount,
+				hasUnconfirmedServerReceiptCandidate: vaultSync.hasUnconfirmedServerReceiptCandidate,
+				serverReceiptCandidateCapturedAt: vaultSync.serverReceiptCandidateCapturedAt,
+			},
+			vaultSync.connected
+				? (state.reconciled ? "online" : "connecting")
+				: (vaultSync.fatalAuthError ? "auth_failed" : "offline"),
+		);
 
-		const missingOnDisk: string[] = [];
-		const missingInCrdt: string[] = [];
-		const hashMismatches: Array<{ path: string; diskHash: string; crdtHash: string; diskLength: number; crdtLength: number }> = [];
-
-		for (const path of allPaths) {
-			const disk = diskHashes.get(path);
-			const crdt = crdtHashes.get(path);
-			if (!disk && crdt) {
-				missingOnDisk.push(path);
-				continue;
-			}
-			if (disk && !crdt) {
-				missingInCrdt.push(path);
-				continue;
-			}
-			if (disk && crdt && disk.hash !== crdt.hash) {
-				hashMismatches.push({
-					path,
-					diskHash: disk.hash,
-					crdtHash: crdt.hash,
-					diskLength: disk.length,
-					crdtLength: crdt.length,
-				});
-			}
-		}
-
-		const diagnostics = {
+		const input: DiagnosticsBundleInput = {
 			generatedAt: new Date().toISOString(),
 			generationMs: Date.now() - startedAt,
-			trace: this.deps.getTraceHttpContext() ?? null,
 			settings: {
 				host: settings.host,
-				tokenPrefix: settings.token ? `${settings.token.slice(0, 8)}...` : "",
+				token: settings.token,
 				vaultId: settings.vaultId,
 				deviceName: settings.deviceName,
 				debug: settings.debug,
 				enableAttachmentSync: settings.enableAttachmentSync,
 				externalEditPolicy: settings.externalEditPolicy,
 			},
-			state: {
+			stateSnapshot: {
 				reconciled: state.reconciled,
 				reconcileInFlight: state.reconcileInFlight,
 				reconcilePending: state.reconcilePending,
-				lastReconcile: state.lastReconcileStats,
+				lastReconcileStats: state.lastReconcileStats,
 				awaitingFirstProviderSyncAfterStartup: state.awaitingFirstProviderSyncAfterStartup,
 				lastReconciledGeneration: state.lastReconciledGeneration,
 				connected: vaultSync.connected,
@@ -217,6 +325,8 @@ export class DiagnosticsService {
 				fatalAuthDetails: vaultSync.fatalAuthDetails,
 				idbError: vaultSync.idbError,
 				idbErrorDetails: vaultSync.idbErrorDetails,
+				serverReceiptStartupValidation: vaultSync.serverReceiptStartupValidation,
+				svEcho: vaultSync.svEchoCounters,
 				pathToIdCount: vaultSync.pathToId.size,
 				activePathCount: vaultSync.getActiveMarkdownPaths().length,
 				blobPathCount: vaultSync.pathToBlob.size,
@@ -227,35 +337,57 @@ export class DiagnosticsService {
 					storedInDoc: vaultSync.storedSchemaVersion,
 				},
 			},
-			hashDiff: {
-				missingOnDisk,
-				missingInCrdt,
-				hashMismatches,
-				matchingCount: allPaths.size - missingOnDisk.length - missingInCrdt.length - hashMismatches.length,
-				totalCompared: allPaths.size,
-			},
-			recentEvents: {
-				plugin: this.deps.getEventRing().slice(-240),
-				sync: vaultSync.getRecentEvents(240),
-			},
-			openFiles: await this.deps.collectOpenFileTraceState(),
-			diskMirror: this.deps.getDiskMirror()?.getDebugSnapshot() ?? null,
-			blobSync: this.deps.getBlobSync()?.getDebugSnapshot() ?? null,
+			syncFacts,
+			trace: this.deps.getTraceHttpContext(),
+			diskHashes,
+			crdtHashes,
+			eventRing: this.deps.getEventRing(),
+			syncEvents: vaultSync.getRecentEvents(240),
 			serverTrace: this.deps.getRecentServerTrace(),
+			openFiles: await this.deps.collectOpenFileTraceState(),
+			diskMirrorSnapshot: this.deps.getDiskMirror()?.getDebugSnapshot() ?? null,
+			blobSyncSnapshot: blobSync?.getDebugSnapshot() ?? null,
+			frontmatterQuarantine: this.deps.getFrontmatterQuarantineEntries(),
+			sha256Hex: this.deps.sha256Hex.bind(this.deps),
 		};
+
+		const { bundle: diagnostics, leakDetected, missingOnDiskCount, missingInCrdtCount, hashMismatchCount } = await buildDiagnosticsBundle(input, options);
+
+		if (leakDetected) {
+			this.deps.log(`diagnostics: redaction leak detected, aborting safe export`);
+			new Notice(
+				"Safe diagnostics export failed: a vault path survived redaction. Check the console.",
+				10000,
+			);
+			return;
+		}
 
 		const diagDir = await this.ensureDiagnosticsDir();
 
 		const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-		const fileName = `sync-diagnostics-${stamp}-${settings.deviceName || "device"}.json`;
+		const variant = options.includeFilenames ? "with-filenames" : "safe";
+		// Device name is excluded from the safe filename to avoid leaking it
+		// in filesystem metadata. Full mode retains it for easier file sorting.
+		const fileName = options.includeFilenames
+			? `sync-diagnostics-with-filenames-${stamp}-${settings.deviceName || "device"}.json`
+			: `sync-diagnostics-safe-${stamp}.json`;
 		const outPath = normalizePath(`${diagDir}/${fileName}`);
 		await this.deps.app.vault.adapter.write(outPath, JSON.stringify(diagnostics, null, 2));
 
+		// Do not log outPath in safe mode: the path is a vault path and would
+		// itself constitute a leak if plugin logs are later included in a
+		// diagnostics bundle.
 		this.deps.log(
-			`Diagnostics exported: ${outPath} ` +
-			`(missingOnDisk=${missingOnDisk.length}, missingInCrdt=${missingInCrdt.length}, mismatches=${hashMismatches.length})`,
+			options.includeFilenames
+				? `Diagnostics exported (${variant}): ${outPath} (missingOnDisk=${missingOnDiskCount}, missingInCrdt=${missingInCrdtCount}, mismatches=${hashMismatchCount})`
+				: `Diagnostics exported (${variant}): missingOnDisk=${missingOnDiskCount}, missingInCrdt=${missingInCrdtCount}, mismatches=${hashMismatchCount}`,
 		);
-		new Notice(`Sync diagnostics exported to ${outPath}`, 10000);
+		new Notice(
+			options.includeFilenames
+				? `Full sync diagnostics (with filenames) exported to ${outPath}`
+				: `Safe sync diagnostics exported. File saved in plugin diagnostics folder.`,
+			10000,
+		);
 	}
 
 	async ensureDiagnosticsDir(): Promise<string> {

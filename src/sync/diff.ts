@@ -55,6 +55,78 @@ export function applyDiffToYText(
 	}, origin);
 }
 
+export interface DiffPostconditionResult {
+	diffSkippedDueToStaleBase: boolean;
+	matchesAfterDiff: boolean;
+	forceReplaceApplied: boolean;
+	finalMatchesExpected: boolean;
+	finalLength: number;
+}
+
+export function applyDiffToYTextWithPostcondition(
+	ytext: Y.Text,
+	oldText: string,
+	newText: string,
+	origin: string,
+): DiffPostconditionResult {
+	const currentText = ytext.toString();
+	if (currentText !== oldText) {
+		forceReplaceYText(ytext, newText, origin);
+		const afterForce = ytext.toString();
+		return {
+			diffSkippedDueToStaleBase: true,
+			matchesAfterDiff: false,
+			forceReplaceApplied: true,
+			finalMatchesExpected: afterForce === newText,
+			finalLength: afterForce.length,
+		};
+	}
+
+	applyDiffToYText(ytext, oldText, newText, origin);
+
+	const afterDiff = ytext.toString();
+	if (afterDiff === newText) {
+		return {
+			diffSkippedDueToStaleBase: false,
+			matchesAfterDiff: true,
+			forceReplaceApplied: false,
+			finalMatchesExpected: true,
+			finalLength: afterDiff.length,
+		};
+	}
+
+	forceReplaceYText(ytext, newText, origin);
+	const afterForce = ytext.toString();
+	return {
+		diffSkippedDueToStaleBase: false,
+		matchesAfterDiff: false,
+		forceReplaceApplied: true,
+		finalMatchesExpected: afterForce === newText,
+		finalLength: afterForce.length,
+	};
+}
+
+export function forceReplaceYText(
+	ytext: Y.Text,
+	newText: string,
+	origin: string,
+): void {
+	// Recovery-only. Do not use for normal sync/edit propagation.
+	// Callers must already have chosen newText as the authority. This fallback
+	// intentionally discards current Y.Text content when a targeted recovery
+	// diff cannot satisfy its postcondition.
+	const replace = () => {
+		const currentLength = ytext.length;
+		if (currentLength > 0) ytext.delete(0, currentLength);
+		if (newText.length > 0) ytext.insert(0, newText);
+	};
+	if (ytext.doc) {
+		ytext.doc.transact(replace, origin);
+	} else {
+		replace();
+	}
+}
+
 function diffToCharOps(segments: Array<[-1 | 0 | 1, string]>): DiffOp[] {
 	const ops: DiffOp[] = [];
 

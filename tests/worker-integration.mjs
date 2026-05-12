@@ -148,6 +148,9 @@ async function main() {
 			"tests/schema-guard.mjs",
 		], token);
 		await runCommand("node", [
+			"tests/provider-manual-connect.mjs",
+		], token);
+		await runCommand("node", [
 			"--import",
 			"jiti/register",
 			"tests/sync-client.ts",

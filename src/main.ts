@@ -36,6 +36,7 @@ import {
 	type BlobHashCache,
 	moveCachedHashes,
 } from "./sync/blobHashCache";
+import type { PreservedUnresolvedEntry } from "./sync/preservedUnresolved";
 import {
 	SnapshotService,
 } from "./snapshots/snapshotService";
@@ -70,6 +71,7 @@ import { TraceRuntimeController } from "./runtime/traceRuntimeController";
 import { registerCommands } from "./commands";
 import {
 	getSyncStatusLabel,
+	renderConnectionState,
 	renderSyncStatus,
 	type SyncStatus,
 } from "./status/statusBarController";
@@ -85,6 +87,7 @@ type PersistedPluginState = Partial<VaultSyncSettings> & {
 	_serverCapabilitiesCache?: PersistedServerCapabilitiesCache;
 	_updateManifestCache?: PersistedUpdateManifestCache;
 	_frontmatterQuarantine?: FrontmatterQuarantineEntry[];
+	_preservedUnresolved?: PreservedUnresolvedEntry[];
 };
 
 export default class VaultCrdtSyncPlugin extends Plugin {
@@ -123,6 +126,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	/** Persisted blob queue snapshot for crash resilience. */
 	private savedBlobQueue: BlobQueueSnapshot | null = null;
+	private preservedUnresolvedEntries: PreservedUnresolvedEntry[] = [];
 	private persistedState: PersistedPluginState = {};
 	private persistWriteChain: Promise<void> = Promise.resolve();
 
@@ -210,7 +214,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			triggerDailySnapshot: () => { void this.snapshotService?.triggerDailySnapshot(); },
 			stopSyncRuntimeForCompatibility: () => {
 				if (this.vaultSync) {
-					this.teardownSync();
+					void this.teardownSync();
 				}
 			},
 			setStatusError: () => this.updateStatusBar("error"),
@@ -259,6 +263,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				awaitingFirstProviderSyncAfterStartup: this.awaitingFirstProviderSyncAfterStartup,
 				lastReconciledGeneration: this.reconciliationController.getState().lastReconciledGeneration,
 				untrackedFileCount: this.reconciliationController.getState().untrackedFileCount,
+				blockedDivergenceCount: this.reconciliationController.getState().blockedDivergenceCount,
+				lastBlockedDivergenceAt: this.reconciliationController.getState().lastBlockedDivergenceAt,
 				openFileCount: this.editorWorkspace?.openFileCount ?? 0,
 			}),
 			isMarkdownPathSyncable: (path) => this.isMarkdownPathSyncable(path),
@@ -306,6 +312,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			getExcludePatterns: () => this.excludePatterns,
 			persistBlobQueue: (snapshot) => this.persistBlobQueueSnapshot(snapshot),
 			clearPersistedBlobQueue: () => this.clearSavedBlobQueue(),
+			getPreservedUnresolvedEntries: () => this.preservedUnresolvedEntries,
+			onPreservedUnresolvedChanged: () => this.persistPreservedUnresolvedState(),
 			trace: (source, msg, details) => this.trace(source, msg, details),
 			scheduleTraceStateSnapshot: (reason) => this.scheduleTraceStateSnapshot(reason),
 			refreshStatusBar: () => this.refreshStatusBar(),
@@ -430,6 +438,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						previousContent,
 						nextContent,
 					),
+				() => this.settings.deviceName,
+				this.preservedUnresolvedEntries,
+				() => this.persistPreservedUnresolvedState(),
 			);
 			this.diskMirror.startMapObservers();
 
@@ -499,12 +510,14 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					getConnectionController: () => this.connectionController,
 					getDiagnosticsService: () => this.diagnosticsService,
 					getSnapshotService: () => this.snapshotService,
+					getFilesNeedingAttentionText: () => this.buildFilesNeedingAttentionText(),
 					getUntrackedFileCount: () => this.reconciliationController.untrackedFileCount,
 					isDebugEnabled: () => this.settings.debug,
 					runReconciliation: (mode) => this.runReconciliation(mode),
 					runSchemaMigrationToV2: () => this.runSchemaMigrationToV2(),
 					runVfsTortureTest: () => this.runVfsTortureTest(),
 					importUntrackedFiles: () => this.importUntrackedFiles(),
+					clearLocalServerReceiptState: () => this.clearLocalServerReceiptState(),
 					resetLocalCache: () => this.resetLocalCache(),
 					nuclearReset: () => this.nuclearReset(),
 				});
@@ -530,6 +543,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			this.log("Waiting for IndexedDB persistence...");
 			const localLoaded = await this.vaultSync.waitForLocalPersistence();
 			this.log(`IndexedDB: ${localLoaded ? "loaded" : "timed out"}`);
+			await this.vaultSync.initializeServerAckTracking(this.settings, this.manifest.version, {
+				localYjsPersistenceLoaded: localLoaded,
+			});
 
 			// Schema version check — refuse to run if a newer plugin wrote this data
 			const schemaError = this.vaultSync.checkSchemaVersion();
@@ -608,6 +624,15 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	private async importUntrackedFiles(): Promise<void> {
 		await this.reconciliationController.importUntrackedFiles();
+	}
+
+	private async clearLocalServerReceiptState(): Promise<"cleared_persistent" | "cleared_memory_only" | "failed" | undefined> {
+		if (!this.vaultSync) return;
+		const result = await this.vaultSync.clearLocalServerReceiptState();
+		this.log(`Cleared local server-receipt state: ${result}`);
+		this.scheduleTraceStateSnapshot("clear-local-server-receipt-state");
+		this.refreshStatusBar();
+		return result;
 	}
 
 	// -------------------------------------------------------------------
@@ -743,7 +768,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	 * destroy provider + persistence + ydoc, reset all flags.
 	 * After this, the plugin is in the same state as before initSync().
 	 */
-	private teardownSync(): void {
+	private async teardownSync(): Promise<void> {
 		this.log("teardownSync: tearing down all sync state");
 
 		this.editorBindings?.unbindAll();
@@ -758,7 +783,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.reconciliationController.reset();
 		this.connectionController?.stop();
 
-		this.vaultSync?.destroy();
+		await this.vaultSync?.destroy();
 
 		this.vaultSync = null;
 		this.connectionController = null;
@@ -787,7 +812,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				this.log("Reset cache: starting");
 				new Notice("Clearing cache and syncing again...");
 
-				this.teardownSync();
+				await this.teardownSync();
 
 				try {
 					await VaultSync.deleteIdb(vaultId);
@@ -831,7 +856,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				await new Promise((r) => setTimeout(r, 500));
 
 				const vaultId = this.settings.vaultId;
-				this.teardownSync();
+				await this.teardownSync();
 
 				try {
 					await VaultSync.deleteIdb(vaultId);
@@ -1037,7 +1062,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		previousLength: number | null,
 		nextLength: number,
 	): void {
-		this.trace("trace", "frontmatter-quarantined", {
+		this.trace("quarantine", "frontmatter-quarantined", {
 			path,
 			direction,
 			reason,
@@ -1085,7 +1110,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		const nextEntries = clearFrontmatterQuarantinePath(this.frontmatterQuarantineEntries, path);
 		if (nextEntries.length === this.frontmatterQuarantineEntries.length) return;
 		this.frontmatterQuarantineEntries = nextEntries;
-		this.trace("trace", "frontmatter-quarantine-cleared", {
+		this.trace("quarantine", "frontmatter-quarantine-cleared", {
 			path,
 			reason,
 		});
@@ -1147,9 +1172,42 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		};
 	}
 
-	private updateStatusBar(state: SyncStatus): void {
+	private updateStatusBar(_coarseState: SyncStatus): void {
 		if (!this.statusBarEl) return;
-		renderSyncStatus(this.statusBarEl, state, this.getBlobSync()?.transferStatus);
+		const connectionState = this.connectionController?.getState();
+		const transferStatus = this.getBlobSync()?.transferStatus;
+		const diskAttention =
+			(this.diskMirror?.getDebugSnapshot().preservedUnresolved.totalCount ?? 0);
+		const blobAttention =
+			(this.getBlobSync()?.getDebugSnapshot().preservedUnresolved.totalCount ?? 0);
+		const attentionCount = diskAttention + blobAttention;
+		const vaultSync = this.vaultSync;
+		const serverReceipt = vaultSync ? {
+			serverAppliedLocalState: vaultSync.serverAppliedLocalState,
+			lastServerReceiptEchoAt: vaultSync.lastServerReceiptEchoAt,
+			lastKnownServerReceiptEchoAt: vaultSync.lastKnownServerReceiptEchoAt,
+			candidatePersistenceHealthy: vaultSync.candidatePersistenceHealthy,
+			serverReceiptStartupValidation: vaultSync.serverReceiptStartupValidation,
+		} : null;
+		if (connectionState) {
+			renderConnectionState(this.statusBarEl, connectionState, transferStatus, serverReceipt, attentionCount);
+		} else {
+			renderSyncStatus(this.statusBarEl, _coarseState, transferStatus, attentionCount);
+		}
+	}
+
+	private buildFilesNeedingAttentionText(): string {
+		const entries = this.collectPreservedUnresolvedEntries()
+			.sort((a, b) => b.lastSeenAt - a.lastSeenAt);
+		if (entries.length === 0) return "No files currently need attention.";
+		return entries.map((entry) => [
+			entry.path,
+			`  kind: ${entry.kind}`,
+			`  reason: ${entry.reason}`,
+			`  first seen: ${new Date(entry.firstSeenAt).toLocaleString()}`,
+			`  last seen: ${new Date(entry.lastSeenAt).toLocaleString()}`,
+			"  suggested action: inspect the local file and conflict artifacts, then edit/save to keep local content or delete it to accept the remote delete.",
+		].join("\n")).join("\n\n");
 	}
 
 	private setupTraceRuntime(): void {
@@ -1311,7 +1369,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.log("Unloading plugin");
 		void this.traceRuntime?.shutdown();
 		document.body.removeClass("vault-crdt-show-cursors");
-		this.teardownSync();
+		void this.teardownSync();
 	}
 
 	async loadSettings() {
@@ -1330,6 +1388,19 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		// Load persisted blob queue
 		if (data && typeof data._blobQueue === "object" && data._blobQueue !== null) {
 			this.savedBlobQueue = data._blobQueue;
+		}
+		if (Array.isArray(data?._preservedUnresolved)) {
+			this.preservedUnresolvedEntries = data._preservedUnresolved.filter(
+				(entry): entry is PreservedUnresolvedEntry =>
+					typeof entry === "object" &&
+					entry !== null &&
+					typeof (entry as PreservedUnresolvedEntry).path === "string" &&
+					((entry as PreservedUnresolvedEntry).kind === "markdown" ||
+						(entry as PreservedUnresolvedEntry).kind === "blob") &&
+					typeof (entry as PreservedUnresolvedEntry).reason === "string" &&
+					typeof (entry as PreservedUnresolvedEntry).firstSeenAt === "number" &&
+					typeof (entry as PreservedUnresolvedEntry).lastSeenAt === "number",
+			);
 		}
 		const cachedCapabilities = readPersistedServerCapabilitiesCache(data?._serverCapabilitiesCache);
 		const cachedUpdateManifest = readPersistedUpdateManifestCache(data?._updateManifestCache);
@@ -1382,6 +1453,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	get serverSupportsSnapshots(): boolean {
 		return this.capabilityUpdateService?.supportsSnapshots ?? true;
+	}
+
+	get serverMaxBlobUploadBytes(): number | null {
+		return this.capabilityUpdateService?.capabilities?.maxBlobUploadBytes ?? null;
 	}
 
 	buildSetupDeepLink(): string | null {
@@ -1552,7 +1627,37 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		} else {
 			delete nextState._frontmatterQuarantine;
 		}
+		const preserved = this.collectPreservedUnresolvedEntries();
+		if (preserved.length > 0) {
+			nextState._preservedUnresolved = preserved;
+		} else {
+			delete nextState._preservedUnresolved;
+		}
 		this.persistedState = nextState;
+	}
+
+	private collectPreservedUnresolvedEntries(): PreservedUnresolvedEntry[] {
+		const entries = new Map<string, PreservedUnresolvedEntry>();
+		const hasDiskRegistry = this.diskMirror !== null;
+		const hasBlobRegistry = this.getBlobSync() !== null;
+		for (const entry of this.preservedUnresolvedEntries) {
+			if (entry.kind === "markdown" && hasDiskRegistry) continue;
+			if (entry.kind === "blob" && hasBlobRegistry) continue;
+			entries.set(`${entry.kind}:${entry.path}`, entry);
+		}
+		for (const entry of this.diskMirror?.getPreservedUnresolvedEntries() ?? []) {
+			entries.set(`${entry.kind}:${entry.path}`, entry);
+		}
+		for (const entry of this.getBlobSync()?.getPreservedUnresolvedEntries() ?? []) {
+			entries.set(`${entry.kind}:${entry.path}`, entry);
+		}
+		this.preservedUnresolvedEntries = Array.from(entries.values());
+		return this.preservedUnresolvedEntries;
+	}
+
+	private persistPreservedUnresolvedState(): void {
+		void this.persistPluginState();
+		this.refreshStatusBar();
 	}
 
 	private async persistPluginState(

@@ -5,6 +5,7 @@ export interface ServerCapabilities {
 	authMode: "env" | "claim" | "unclaimed";
 	attachments: boolean;
 	snapshots: boolean;
+	maxBlobUploadBytes?: number;
 	serverVersion: string;
 	minPluginVersion: string | null;
 	recommendedPluginVersion: string | null;
@@ -16,11 +17,12 @@ export interface ServerCapabilities {
 	updateRepoBranch?: string | null;
 }
 
-export async function fetchServerCapabilities(host: string): Promise<ServerCapabilities> {
+export async function fetchServerCapabilities(host: string, token?: string): Promise<ServerCapabilities> {
 	const base = host.replace(/\/$/, "");
 	const res = await obsidianRequest({
 		url: `${base}/api/capabilities`,
 		method: "GET",
+		headers: token ? { Authorization: `Bearer ${token}` } : undefined,
 	});
 	if (res.status !== 200) {
 		throw new Error(`capabilities request failed (${res.status})`);

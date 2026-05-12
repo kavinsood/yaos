@@ -2,11 +2,21 @@ import * as Y from "yjs";
 import YSyncProvider from "y-partyserver/provider";
 import { IndexeddbPersistence } from "y-indexeddb";
 import { normalizePath } from "obsidian";
-import { type FileMeta, type BlobRef, type BlobMeta, type BlobTombstone, ORIGIN_SEED } from "../types";
+import { type FileMeta, type BlobRef, type BlobMeta, type BlobTombstone } from "../types";
+import { ORIGIN_SEED } from "./origins";
 import type { VaultSyncSettings } from "../settings";
 import type { TraceHttpContext, TraceRecord } from "../debug/trace";
 import { randomBase64Url } from "../utils/base64url";
 import { formatUnknown } from "../utils/format";
+import { UpdateTracker } from "./updateTracker";
+import { ServerAckTracker } from "./serverAckTracker";
+import { IndexedDbCandidateStore, getOrCreateLocalDeviceId, sha256Hex } from "./indexedDbCandidateStore";
+import {
+	createSvEchoCounters,
+	handleSvEchoCustomMessage,
+	type SvEchoCounters,
+} from "./svEchoMessage";
+import type { CandidateStore, ScopeKey, ScopeMetadata } from "./candidateStore";
 
 /** Current schema version. Stored in sys.schemaVersion. */
 export const SCHEMA_VERSION = 2;
@@ -86,6 +96,12 @@ interface IndexedDbErrorDetails {
 	at: string;
 }
 
+type ServerReceiptStartupValidation =
+	| "not_started"
+	| "validated"
+	| "skipped_local_yjs_timeout"
+	| "unavailable";
+
 /**
  * Manages the vault-wide Y.Doc, the Worker sync provider, IndexedDB
  * persistence, and the shared Yjs maps.
@@ -103,6 +119,8 @@ export class VaultSync {
 	readonly ydoc: Y.Doc;
 	readonly provider: YSyncProvider;
 	readonly persistence: IndexeddbPersistence;
+	readonly updateTracker: UpdateTracker;
+	readonly serverAckTracker: ServerAckTracker;
 
 	readonly pathToId: Y.Map<string>;
 	readonly idToText: Y.Map<Y.Text>;
@@ -150,6 +168,11 @@ export class VaultSync {
 	/** True if IndexedDB encountered an error (unavailable, quota, etc). */
 	private _idbError = false;
 	private _idbErrorDetails: IndexedDbErrorDetails | null = null;
+	private _serverAckStore: CandidateStore | null = null;
+	private _serverAckScope: (ScopeKey & ScopeMetadata) | null = null;
+	private _serverAckPersistenceUnavailable = false;
+	private _serverReceiptStartupValidation: ServerReceiptStartupValidation = "not_started";
+	private readonly _svEchoCounters = createSvEchoCounters();
 
 	/** Buffered renames for batch flush. */
 	private _renameBatch: Map<string, string> = new Map(); // oldPath -> newPath
@@ -233,9 +256,19 @@ export class VaultSync {
 		this.provider = new YSyncProvider(settings.host, roomId, this.ydoc, {
 			prefix: syncPrefix,
 			params,
-			connect: true,
+			connect: false,
 			maxBackoffTime: MAX_BACKOFF_TIME_MS,
 		});
+
+		// Wire update tracker before any Y.Doc events so timestamps are captured.
+		this.updateTracker = new UpdateTracker();
+		this.updateTracker.attach(
+			this.ydoc,
+			() => this.connected,
+			this.provider,
+			this.persistence,
+		);
+		this.serverAckTracker = new ServerAckTracker(this.trace);
 
 		// Track connection generations for reconnect detection
 		this.provider.on("status", (event: { status: string }) => {
@@ -272,11 +305,22 @@ export class VaultSync {
 		// y-partyserver emits "__YPS:" control payloads via "custom-message".
 		(this.provider as unknown as { on: (event: string, cb: (payload: string) => void) => void })
 			.on("custom-message", handleFatalAuthPayload);
+		(this.provider as unknown as { on: (event: string, cb: (payload: string) => void) => void })
+			.on("custom-message", (payload: string) => {
+				// SV echoes are Level 3 receipt signals only. They are not durable;
+				// ServerAckTracker's state-vector dominance check remains the truth gate.
+				handleSvEchoCustomMessage(payload, this._svEchoCounters, (sv) => {
+					this.serverAckTracker.recordServerSvEcho(sv);
+				});
+			});
 		// Fallback for servers that still send plain text JSON frames.
 		this.provider.on("message", (event: MessageEvent) => {
 			if (typeof event.data === "string") {
 				handleFatalAuthPayload(event.data);
 			}
+		});
+		void this.provider.connect().catch((err: unknown) => {
+			this.log(`Provider connect failed: ${formatUnknown(err)}`);
 		});
 	}
 
@@ -350,6 +394,55 @@ export class VaultSync {
 				finish(false);
 			}
 		});
+	}
+
+	async initializeServerAckTracking(
+		settings: VaultSyncSettings,
+		pluginVersion: string,
+		options: { localYjsPersistenceLoaded: boolean },
+	): Promise<void> {
+		if (this._serverAckScope) return;
+		try {
+			const [vaultIdHash, serverHostHash, localDeviceId] = await Promise.all([
+				sha256Hex(settings.vaultId),
+				sha256Hex(settings.host),
+				getOrCreateLocalDeviceId(),
+			]);
+			const scope: ScopeKey & ScopeMetadata = {
+				vaultIdHash,
+				serverHostHash,
+				localDeviceId,
+				// Phase A uses the current y-partyserver room key. Since this is
+				// derived from vaultId, it does not detect server reset/reclaim by
+				// itself; the manual clear command remains the escape hatch until a
+				// server generation/claim ID exists.
+				roomName: settings.vaultId,
+				docSchemaVersion: SCHEMA_VERSION,
+				pluginVersion,
+				ackStoreVersion: 1,
+			};
+			const store = new IndexedDbCandidateStore(scope);
+			this._serverAckStore = store;
+			this._serverAckScope = scope;
+			this.serverAckTracker.attach(
+				this.ydoc,
+				() => Y.encodeStateVector(this.ydoc),
+				this.provider,
+				this.persistence,
+			);
+			if (options.localYjsPersistenceLoaded) {
+				await this.serverAckTracker.onStartup(store, scope);
+				this._serverReceiptStartupValidation = "validated";
+				this.log("Server receipt tracker initialized");
+			} else {
+				this._serverReceiptStartupValidation = "skipped_local_yjs_timeout";
+				this.log("Server receipt startup validation skipped: local Yjs persistence timed out");
+			}
+		} catch (err) {
+			this._serverAckPersistenceUnavailable = true;
+			this._serverReceiptStartupValidation = "unavailable";
+			this.log(`Server receipt tracker unavailable: ${formatUnknown(err)}`);
+		}
 	}
 
 	/**
@@ -1350,6 +1443,41 @@ export class VaultSync {
 		return this._connectionGeneration;
 	}
 
+	// Update-tracking getters (delegated to UpdateTracker — INV-ACK-01)
+	get lastLocalUpdateAt(): number | null { return this.updateTracker.lastLocalUpdateAt; }
+	get lastLocalUpdateWhileConnectedAt(): number | null { return this.updateTracker.lastLocalUpdateWhileConnectedAt; }
+	get lastRemoteUpdateAt(): number | null { return this.updateTracker.lastRemoteUpdateAt; }
+	get serverAppliedLocalState(): boolean | null { return this.serverAckTracker.serverAppliedLocalState; }
+	get lastServerReceiptEchoAt(): number | null { return this.serverAckTracker.lastServerReceiptEchoAt; }
+	get lastKnownServerReceiptEchoAt(): number | null { return this.serverAckTracker.lastKnownServerReceiptEchoAt; }
+	get candidatePersistenceHealthy(): boolean | null {
+		if (!this._serverAckScope && !this._serverAckPersistenceUnavailable) return null;
+		if (this._serverAckPersistenceUnavailable) return false;
+		return this.serverAckTracker.candidatePersistenceHealthy;
+	}
+	get candidatePersistenceFailureCount(): number {
+		return this.serverAckTracker.candidatePersistenceFailureCount + (this._serverAckPersistenceUnavailable ? 1 : 0);
+	}
+	get hasUnconfirmedServerReceiptCandidate(): boolean { return this.serverAckTracker.hasUnconfirmedCandidate; }
+	get serverReceiptCandidateCapturedAt(): number | null { return this.serverAckTracker.candidateCapturedAt; }
+
+	async flushReceiptPersistence(): Promise<void> {
+		await this.serverAckTracker.flushReceiptPersistence();
+	}
+	get serverReceiptStartupValidation(): ServerReceiptStartupValidation { return this._serverReceiptStartupValidation; }
+	get svEchoCounters(): SvEchoCounters { return { ...this._svEchoCounters }; }
+
+	async clearLocalServerReceiptState(): Promise<"cleared_persistent" | "cleared_memory_only" | "failed"> {
+		if (!this._serverAckStore) {
+			await this.serverAckTracker.clearLocalReceiptState(false);
+			return "cleared_memory_only";
+		}
+		const beforeFailures = this.serverAckTracker.candidatePersistenceFailureCount;
+		await this.serverAckTracker.clearLocalReceiptState(true);
+		if (this.serverAckTracker.candidatePersistenceFailureCount > beforeFailures) return "failed";
+		return "cleared_persistent";
+	}
+
 	get fatalAuthError(): boolean {
 		return this._fatalAuthError;
 	}
@@ -1444,12 +1572,13 @@ export class VaultSync {
 		});
 	}
 
-	destroy(): void {
+	async destroy(): Promise<void> {
 		this.log("Destroying VaultSync");
 		if (this._renameTimer) clearTimeout(this._renameTimer);
 		this.clearPendingRenames();
+		await this.flushReceiptPersistence();
 		this.provider.destroy();
-		void this.persistence.destroy();
+		await this.persistence.destroy();
 		this.ydoc.destroy();
 	}
 
@@ -1503,6 +1632,9 @@ export class VaultSync {
 		tombstonedPathCount: number;
 		storedSchemaVersion: number | null;
 		blobPathCount: number;
+		serverReceipt: ReturnType<ServerAckTracker["getState"]> & { persistenceUnavailable: boolean };
+		serverReceiptStartupValidation: ServerReceiptStartupValidation;
+		svEcho: SvEchoCounters;
 	} {
 		this.ensurePathIndexes();
 		return {
@@ -1518,6 +1650,12 @@ export class VaultSync {
 			tombstonedPathCount: this._deletedPathIndex.size,
 			storedSchemaVersion: this.storedSchemaVersion,
 			blobPathCount: this.pathToBlob.size,
+			serverReceipt: {
+				...this.serverAckTracker.getState(),
+				persistenceUnavailable: this._serverAckPersistenceUnavailable,
+			},
+			serverReceiptStartupValidation: this._serverReceiptStartupValidation,
+			svEcho: this.svEchoCounters,
 		};
 	}
 

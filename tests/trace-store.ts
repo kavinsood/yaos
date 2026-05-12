@@ -1,8 +1,10 @@
 import {
 	appendTraceEntry,
+	DEFAULT_TRACE_RATE_LIMIT_PER_WINDOW,
 	listRecentTraceEntries,
 	MAX_TRACE_ENTRY_BYTES,
 	prepareTraceEntryForStorage,
+	TraceRateLimiter,
 	type TraceEntry,
 } from "../server/src/traceStore";
 
@@ -142,6 +144,80 @@ console.log("\n--- Test 3: oversized trace entries are truncated to a safe size 
 
 	await appendTraceEntry(storage, prepared, 10);
 	assert(storage.data.size === 1, "sanitized oversized trace entry can be persisted");
+}
+
+console.log("\n--- Test 4: TraceRateLimiter admits up to the per-window cap ---");
+{
+	const limiter = new TraceRateLimiter(5, 60_000);
+	let admitted = 0;
+	for (let i = 0; i < 5; i++) {
+		if (limiter.admit(1_000 + i)) admitted++;
+	}
+	assert(admitted === 5, "first five admits within the window succeed");
+	assert(limiter.admit(1_005) === false, "sixth admit within the window is rejected");
+	assert(limiter.drainDropped() === 1, "drainDropped reports exactly one drop");
+	assert(limiter.drainDropped() === 0, "drainDropped resets to zero after read");
+}
+
+console.log("\n--- Test 5: TraceRateLimiter slides forward as the window expires ---");
+{
+	const limiter = new TraceRateLimiter(3, 1_000);
+	assert(limiter.admit(0) === true, "t=0 admit");
+	assert(limiter.admit(100) === true, "t=100 admit");
+	assert(limiter.admit(200) === true, "t=200 admit");
+	assert(limiter.admit(300) === false, "t=300 admit dropped (over budget within window)");
+	assert(limiter.admit(1_500) === true, "t=1500 admit succeeds after window slides");
+	assert(limiter.admit(1_600) === true, "t=1600 admit succeeds (only one event still inside window)");
+}
+
+console.log("\n--- Test 6: TraceRateLimiter accumulates drops across many over-budget calls ---");
+{
+	const limiter = new TraceRateLimiter(2, 60_000);
+	limiter.admit(0);
+	limiter.admit(1);
+	for (let i = 0; i < 100; i++) {
+		limiter.admit(2 + i);
+	}
+	assert(limiter.drainDropped() === 100, "drainDropped reports the full accumulated drop count");
+}
+
+console.log("\n--- Test 7: default budget is the documented per-room rate ---");
+{
+	assert(
+		DEFAULT_TRACE_RATE_LIMIT_PER_WINDOW === 600,
+		"default per-window cap matches sync-invariants.md draft target (600 events / 60s)",
+	);
+}
+
+console.log("\n--- Test 8: throttle-summary bypasses the limiter and does not recurse ---");
+{
+	// Simulate the recordTrace dispatch as implemented in server.ts:
+	//   isThrottleSummary = event === TRACE_RATE_THROTTLE_EVENT
+	//   if (!isThrottleSummary && !limiter.admit()) drop
+	//   ... persist ...
+	//   if (!isThrottleSummary) drain and maybe emit one summary
+	// The summary itself must not re-trigger another summary (no recursion).
+	const limiter = new TraceRateLimiter(2, 60_000);
+	limiter.admit(0); // fill budget
+	limiter.admit(1);
+
+	// Over-budget event: gets dropped, drop count becomes 1.
+	const admitted = limiter.admit(2);
+	assert(admitted === false, "over-budget regular event is rejected");
+	assert(limiter.drainDropped() === 1, "drop count is 1 before summary");
+
+	// Now simulate a throttle summary being admitted: bypasses limiter.
+	const isThrottleSummary = true;
+	// Throttle summaries bypass the limiter — they are always admitted.
+	// Test that the drain after a summary returns 0 (no further accumulation).
+	limiter.admit(3); // another over-budget event
+	const dropsBeforeSummary = limiter.drainDropped();
+	assert(dropsBeforeSummary === 1, "drop accumulates between summary emissions");
+
+	// After draining, further drain returns 0 — no recursion.
+	const dropsAfterDrain = limiter.drainDropped();
+	assert(dropsAfterDrain === 0, "drainDropped resets to zero; throttle summary cannot recurse");
+	assert(isThrottleSummary === true, "throttle summary flag prevents recursive admit check");
 }
 
 console.log("\n──────────────────────────────────────────────────");

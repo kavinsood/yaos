@@ -6,6 +6,7 @@ import { Notice, type MarkdownView } from "obsidian";
 import type { VaultSync } from "./vaultSync";
 import { applyDiffToYText } from "./diff";
 import type { TraceRecord } from "../debug/trace";
+import { ORIGIN_EDITOR_HEALTH_HEAL } from "./origins";
 
 /**
  * Manages per-editor CM6 bindings via yCollab.
@@ -312,7 +313,7 @@ export class EditorBindingManager {
 				`heal: applying local editor content to "${file.path}" ` +
 				`(${crdtContent.length} -> ${currentContent.length} chars, reason=${reason})`,
 			);
-			applyDiffToYText(target.ytext, crdtContent, currentContent, "editor-health-heal");
+			applyDiffToYText(target.ytext, crdtContent, currentContent, ORIGIN_EDITOR_HEALTH_HEAL);
 		}
 
 		return this.repair(view, deviceName, reason);

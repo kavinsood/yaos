@@ -85,6 +85,13 @@ function assertEqual(actual: unknown, expected: unknown, msg: string): void {
 	}
 }
 
+async function sha256Hex(bytes: Uint8Array): Promise<string> {
+	const digest = await crypto.subtle.digest("SHA-256", bytes);
+	return Array.from(new Uint8Array(digest), (byte) =>
+		byte.toString(16).padStart(2, "0")
+	).join("");
+}
+
 // -------------------------------------------------------------------
 // Category 1: Pure CRDT logic
 // -------------------------------------------------------------------
@@ -603,23 +610,19 @@ async function testCategory2(): Promise<void> {
 	console.log("\n--- Test: Blob PUT → exists → GET ---");
 	{
 		const testData = new TextEncoder().encode("Hello from CLI test " + Date.now());
-		// Compute a fake hash (not real SHA-256, just valid hex for testing)
-		const fakeHash = Array.from(testData.slice(0, 32))
-			.map((b) => b.toString(16).padStart(2, "0"))
-			.join("")
-			.padEnd(64, "0");
+		const blobHash = await sha256Hex(testData);
 
 		// 1. Direct PUT through the Worker
-		const putResult = await serverPutBytes(`blobs/${fakeHash}`, testData, "text/plain");
+		const putResult = await serverPutBytes(`blobs/${blobHash}`, testData, "text/plain");
 		assertEqual(putResult.status, 204, "blob PUT returns 204");
 
 		// 2. Check exists
 		const existsResult = await serverPost("blobs/exists", {
-			hashes: [fakeHash, "0".repeat(64)],
+			hashes: [blobHash, "0".repeat(64)],
 		});
 		assertEqual(existsResult.status, 200, "blobs/exists returns 200");
 		assert(
-			Array.isArray(existsResult.data?.present) && existsResult.data.present.includes(fakeHash),
+			Array.isArray(existsResult.data?.present) && existsResult.data.present.includes(blobHash),
 			"uploaded blob found in exists check",
 		);
 		assert(
@@ -628,7 +631,7 @@ async function testCategory2(): Promise<void> {
 		);
 
 		// 3. Direct GET through the Worker
-		const downloadRes = await serverGetBytes(`blobs/${fakeHash}`);
+		const downloadRes = await serverGetBytes(`blobs/${blobHash}`);
 		assertEqual(downloadRes.status, 200, "blob GET returns 200");
 		assertEqual(downloadRes.bytes.byteLength, testData.byteLength, "downloaded size matches");
 
