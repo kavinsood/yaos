@@ -7,17 +7,88 @@ Full RCA and context for each item is in `qa-followups.md`.
 
 ---
 
+## GitHub issues to create
+
+Two items below have been promoted to GitHub issues because they are correctness
+risks, not polish, and the acceptance criteria are well-defined.
+
+### Issue 1: No-event reconcile admission ← **create this now**
+
+**Title:** `QA: file appearing on disk without vault create event must be admitted by reconcile`
+
+**Why:** A file can appear in a syncable vault path without YAOS receiving a normal
+Obsidian vault create event. This happens on mobile adapters, on any platform when
+files are written or moved via adapter APIs, and on excluded→syncable renames where
+the OS watcher may not fire (iOS/Android). If reconcile does not perform a full vault
+scan, these files are silently invisible to sync — they exist on one device's disk
+but never enter CRDT, and therefore never reach other devices.
+
+S09b passed on Linux because inotify fired a create event. That is a platform detail,
+not a product guarantee.
+
+**Acceptance criteria:**
+- Write a syncable `.md` file via a path that bypasses the vault create event pipeline
+- Run startup / full reconcile
+- Assert CRDT admits the file (`getCrdtHash(path)` non-null)
+- Assert disk hash == CRDT hash
+- Assert no conflict artifact
+- Passes on Linux; explicit note if not yet verified on mobile
+
+**Scenario:** `s09d-reconcile-admits-adapter-written-file` (see QA-15)
+
+**Priority:** Correctness. Ship-blocking for mobile if reconcile is delta-only.
+
+---
+
+### Issue 2: Rename syncable→excluded must not create transient active CRDT path ← **create this now**
+
+**Title:** `Refactor: prevent syncable→excluded rename from creating transient active CRDT identity`
+
+**Why:** Current S09a fix is final-state safe — the excluded destination is tombstoned
+and dirty work is dropped. But the current path is promote-then-tombstone: `applyRenameBatch`
+makes the excluded path briefly active in CRDT (one Yjs transaction), then
+`onRenameBatchFlushed` tombstones it (a second Yjs transaction). These are not atomic.
+
+In the window between the two transactions, remote peers syncing via the provider
+could observe an active CRDT entry at `.trash/something`. Flight traces contain a state
+that should never have existed. The `active-excluded-path` analyzer rule was added
+specifically to catch this, which means the rule is acknowledging a tolerated bug
+rather than asserting an invariant that is never violated.
+
+The correct model: rename syncable → excluded = deletion from sync. The CRDT identity
+should be tombstoned at the old syncable path without ever being promoted to the
+excluded path.
+
+**Acceptance criteria:**
+- `syncable→excluded` rename does not emit or produce active CRDT state for the
+  excluded destination (no `crdt.file.renamed` with `excludedByPolicy: true` in trace)
+- Old syncable CRDT identity is tombstoned correctly
+- `s09a-rename-into-excluded` remains green
+- `active-excluded-path` analyzer rule remains green in `qa-safe` traces
+- No regression in `s09b`, `s09c`, or the S07g rename suite
+
+**Where to fix:** Filter the rename batch in `main.ts` before calling
+`applyRenameBatch` — if `newPath` is not syncable, tombstone `oldPath` directly and
+remove the entry from the batch. This keeps `VaultSync` pure while enforcing the
+correct caller contract: "never ask VaultSync to make an excluded path active."
+
+**Priority:** Architecture correctness. Not user-visible today but affects remote
+observability and makes analyzer invariants honest.
+
+---
+
 ## Priority order
 
-| ID | Item | Priority | Blocked by |
+| ID | Item | Priority | Status |
 |---|---|---|---|
-| QA-15 | No-event reconcile admission (s09d) | **Next** | Nothing — runnable today |
-| QA-7 | NFC/NFD path normalization (s08e) | High | Nothing |
-| QA-12 | S09b platform coverage — macOS/iOS/Android | High | QA-15 result informs mobile risk |
-| QA-13 | Transient active excluded CRDT state (architecture) | Medium | Design decision |
-| QA-14 | No-event mobile import | Medium | QA-15 result |
-| QA-4 | Real Templater plugin invocation | Low | QA vault profile + pinned Templater |
-| — | True overwrite/collision test | Low | Behavior definition |
+| QA-15 | No-event reconcile admission (s09d) | **Next** | → GitHub Issue 1 |
+| QA-13 | Transient active excluded CRDT state | **Next** | → GitHub Issue 2 |
+| QA-7 | NFC/NFD path normalization (s08e) | High | Runnable today |
+| QA-12 | S09b platform coverage — macOS/iOS/Android | High | Blocked on QA-15 result |
+| — | Blob lifecycle after reference (S07j follow-up) | Medium | New — see below |
+| QA-4 | Real Templater plugin invocation | Low | Blocked on QA vault profile |
+| — | True overwrite/collision test | Low | Needs behavior definition |
+| — | Multi-device offline handoff | Separate track | Two-device environment needed |
 | — | Multi-device offline handoff | Separate track | Two-device QA environment |
 
 ---
@@ -28,8 +99,8 @@ Full RCA and context for each item is in `qa-followups.md`.
 assert file enters CRDT without any create event firing.
 
 **Why first:** Answers whether reconcile does a full vault scan or only processes
-event deltas. This determines the mobile safety of S09b (rename-from-excluded) and
-any other "file appears on disk without Obsidian noticing" scenario.
+event deltas. This determines the mobile safety of S09b and any other "file appears
+on disk without Obsidian noticing" scenario. **Promoted to GitHub Issue 1.**
 
 **If PASS:** Mobile risk for S09b is low — reconcile catches files that appear without
 events.
@@ -84,11 +155,12 @@ on QA-15 result first.
 
 ---
 
-## QA-13: Transient active excluded CRDT state (architecture debt)
+## QA-13: Transient active excluded CRDT state
 
 **What:** The current S09a fix is promote-then-tombstone. `applyRenameBatch` moves
 the CRDT identity to `.trash/trash-dst` (briefly active), then `onRenameBatchFlushed`
-immediately tombstones it. Two separate Yjs transactions — not atomic.
+immediately tombstones it. Two separate Yjs transactions — not atomic. **Promoted to
+GitHub Issue 2.**
 
 **Why it matters:** Remote peers syncing in the window between the two transactions
 could observe a live CRDT entry at an excluded path. Flight traces contain a state
@@ -127,7 +199,49 @@ coverage from S07a–S07h is a reasonable substitute until this is set up.
 
 ---
 
-## True overwrite/collision test (untracked)
+## QA-4: Real Templater plugin invocation
+
+**What:** S07 simulates Templater-style behavior — create-empty-then-fill, delayed
+writes, rename after fill. It does not prove the actual Templater plugin, Tasks,
+Dataview, Periodic Notes, etc. behave the same under real Obsidian lifecycle timing.
+
+**Why this is low priority:** The pattern coverage from S07a–S07h already covers the
+failure classes. The real plugin test raises confidence, not correctness knowledge.
+
+**Blocked:** Needs a pinned Templater version + reproducible QA vault profile. Do not
+implement against a floating plugin version that can update under the test.
+
+---
+
+## Blob lifecycle after reference (new)
+
+**What:** S07j proves that markdown with `![[image.png]]` syncs stably when the blob
+is missing. It does not prove the full lifecycle:
+
+```
+1. Markdown syncs first (blob missing → S07j behavior)
+2. Blob upload completes
+3. Markdown content remains stable after blob arrival
+4. Attachment sync status is honest (not stuck "uploading")
+5. No conflict copy, no silent discard
+```
+
+**Why medium priority:** Attachment sync is part of the product promise. Several user
+reports were confused about R2/blob status. This is not a known bug, but the absence
+of a full lifecycle test means any regression in the blob→markdown handoff would be
+silent.
+
+**Test shape:**
+- Create markdown with attachment reference
+- Wait for markdown CRDT admission
+- Separately upload the blob (trigger blob sync pipeline)
+- Assert markdown hash unchanged before and after blob arrival
+- Assert blob is retrievable (getCrdtHash on blob path returns non-null)
+- Assert no conflict copies
+
+---
+
+## True overwrite/collision test (new)
 
 **What:** S09c is honest — it tests rename into a vacated path, not a true collision.
 A real collision requires A.md dirty + B.md exists + move A over B at the adapter
