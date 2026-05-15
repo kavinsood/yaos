@@ -591,6 +591,37 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 				// Move blob hash cache entries
 				moveCachedHashes(this.blobHashCache, renames);
+
+				// Redirect any pending dirty creates or modifies from oldPath → newPath.
+				// Two race classes this handles:
+				//   1. Pre-CRDT race: rename fires before create is processed →
+				//      pending create at oldPath redirected to newPath (ensureFile runs there).
+				//   2. Modify-then-rename race: modify queued, rename fires before drain →
+				//      pending modify at oldPath redirected to newPath (syncFileFromDisk runs there).
+				// Without this, both cases leave newPath with stale or missing CRDT content.
+				for (const [oldPath, newPath] of renames) {
+					this.reconciliationController.redirectPendingDirtyPath(oldPath, newPath);
+				}
+
+				// Tombstone any CRDT entries that applyRenameBatch moved to an excluded path,
+				// and drop any dirty work redirected there.
+				//
+				// Contract: the caller must never leave an excluded path active in CRDT.
+				// applyRenameBatch has no access to path exclusion rules, so the caller
+				// enforces policy here after every flush.
+				//
+				// dropDirtyPath is unconditional — "excluded path" means "do not sync this
+				// path", regardless of whether a CRDT identity exists there. The tombstone
+				// only fires if applyRenameBatch actually promoted a fileId to newPath.
+				for (const [, newPath] of renames) {
+					if (!this.isMarkdownPathSyncable(newPath)) {
+						this.reconciliationController.dropDirtyPath(newPath);
+						if (this.vaultSync?.getFileId(newPath)) {
+							this.log(`onRenameBatchFlushed: tombstoning excluded destination "${newPath}"`);
+							this.vaultSync.handleDelete(newPath);
+						}
+					}
+				}
 			});
 
 			// -----------------------------------------------------------
@@ -771,6 +802,34 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				const oldSyncable = this.isMarkdownPathSyncable(oldPath)
 					|| this.isBlobPathSyncable(oldPath);
 				if (!newSyncable && !oldSyncable) return;
+				const renameOpId = this.newOpId();
+				if (this.isMarkdownPathSyncable(oldPath) || this.isMarkdownPathSyncable(file.path)) {
+					// Emit two disk.rename.observed events sharing the same opId so the
+					// analyzer can reconstruct full old→new lineage without raw paths.
+					// Both are tracked by pendingPathPromises and flushed before export.
+					this.recordFlightPathEvent({
+						priority: "important",
+						kind: FLIGHT_KIND.diskRenameObserved,
+						severity: "info",
+						scope: "file",
+						source: "vaultEvents",
+						layer: "disk",
+						opId: renameOpId,
+						path: oldPath,   // resolves to oldPathId
+						data: { renameRole: "source", wasMarkdownSyncable: this.isMarkdownPathSyncable(oldPath) },
+					});
+					this.recordFlightPathEvent({
+						priority: "important",
+						kind: FLIGHT_KIND.diskRenameObserved,
+						severity: "info",
+						scope: "file",
+						source: "vaultEvents",
+						layer: "disk",
+						opId: renameOpId,
+						path: file.path, // resolves to newPathId
+						data: { renameRole: "target", isBlobSyncable: this.isBlobPathSyncable(file.path) },
+					});
+				}
 				this.vaultSync?.queueRename(oldPath, file.path);
 				this.log(`Rename queued: "${oldPath}" -> "${file.path}"`);
 			}),
@@ -1364,6 +1423,31 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	}
 
 	private recordFlightPathEvent(event: import("./debug/flightEvents").FlightPathEventInput): void {
+		// Augment CRDT admission events and rename target events with path policy metadata.
+		// This allows the analyzer to detect active excluded paths in safe-mode traces
+		// (where raw paths are redacted to pathIds) without duplicating exclusion logic.
+		// The product already knows the policy decision at the event source — embed it here.
+		const admissionKinds = new Set([
+			"crdt.file.created",
+			"crdt.file.renamed",
+			"crdt.file.revived",
+		]);
+		const isAdmissionOrRenameTarget =
+			admissionKinds.has(event.kind) ||
+			(event.kind === "disk.rename.observed" &&
+				(event.data as Record<string, unknown> | undefined)?.renameRole === "target");
+
+		if (isAdmissionOrRenameTarget) {
+			const excludedByPolicy = !this.isMarkdownPathSyncable(event.path);
+			event = {
+				...event,
+				data: {
+					...(event.data as Record<string, unknown> | undefined ?? {}),
+					excludedByPolicy,
+				},
+			};
+		}
+
 		void this.flightTrace?.recordPath(event);
 	}
 
@@ -2019,6 +2103,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			getReconciliationController: () => this.reconciliationController,
 			getConnectionController: () => this.connectionController,
 			getFlightTraceController: () => this.flightTrace,
+			getEditorBindings: () => this.editorBindings,
 			getDiagnosticsDir: () => this.diagnosticsService?.ensureDiagnosticsDir(),
 			sha256Hex: (text) => this.sha256Hex(text),
 			startQaFlightTrace: (mode) => this.startQaFlightTrace(mode),

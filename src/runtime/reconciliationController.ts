@@ -873,29 +873,74 @@ export class ReconciliationController {
 	}
 
 	/**
-	 * Redirect a pending dirty create/modify from oldPath to newPath.
+	 * Redirect any pending dirty entry (create or modify) from oldPath to newPath.
 	 *
-	 * Called by the rename batch flush callback when a rename arrives before
-	 * YAOS has processed the create event for oldPath (the Templater race).
-	 * In that case:
-	 *   1. applyRenameBatch found no fileId for oldPath → rename dropped.
-	 *   2. processDirtyMarkdownPath(oldPath) later finds oldPath gone → skipped.
-	 *   3. newPath never gets ensureFile → CRDT entry never created.
+	 * Called by the rename batch flush callback for every rename in the batch,
+	 * regardless of whether the CRDT rename succeeded.
 	 *
-	 * This method ensures the pending create is redirected to newPath so it
-	 * is processed by syncFileFromDisk at the correct final location.
+	 * Two cases:
+	 *
+	 * Case A — pre-CRDT race (no fileId, rename dropped):
+	 *   A pending create for oldPath is redirected to newPath. syncFileFromDisk
+	 *   will run ensureFile at newPath, seeding the CRDT entry there.
+	 *
+	 * Case B — normal rename (fileId existed, CRDT rename succeeded):
+	 *   A pending modify for oldPath is redirected to newPath. Without this,
+	 *   processDirtyMarkdownPath(oldPath) would find the file gone and skip,
+	 *   leaving the CRDT at the pre-modify content even though disk has the
+	 *   updated content at newPath.
+	 *
+	 * Safety:
+	 *   - For creates: only redirect if reason === "create" (pre-CRDT race path).
+	 *   - For modifies: redirect regardless — a modify at a renamed-away path
+	 *     always needs to be re-evaluated at the new path.
+	 *   - If newPath is already dirty, merge (never overwrite), preserving
+	 *     "create" priority and coalescing op IDs.
+	 *   - If no entry exists for oldPath, this is a no-op.
 	 */
-	redirectPendingCreate(oldPath: string, newPath: string): void {
+	redirectPendingDirtyPath(oldPath: string, newPath: string): void {
 		const entry = this.dirtyMarkdownPaths.get(oldPath);
 		if (!entry) return;
+
 		this.dirtyMarkdownPaths.delete(oldPath);
-		// Only redirect creates — a pending modify for a non-existent old path
-		// would fail anyway. The new path will have its own create event.
-		if (entry.reason !== "create") return;
-		if (!this.dirtyMarkdownPaths.has(newPath)) {
+
+		const existing = this.dirtyMarkdownPaths.get(newPath);
+		if (existing) {
+			// Merge — preserve create priority, coalesce op IDs.
+			this.dirtyMarkdownPaths.set(newPath, {
+				reason: existing.reason === "create" || entry.reason === "create" ? "create" : "modify",
+				primaryOpId: existing.primaryOpId ?? entry.primaryOpId,
+				coalescedOpIds: Array.from(new Set([
+					...existing.coalescedOpIds,
+					...entry.coalescedOpIds,
+				])),
+			});
+		} else {
 			this.dirtyMarkdownPaths.set(newPath, entry);
-			this.deps.log(`redirectPendingCreate: "${oldPath}" -> "${newPath}" (race recovery)`);
-			this.scheduleMarkdownDrain();
+		}
+
+		const label = entry.reason === "create" ? "race recovery" : "modify redirect";
+		this.deps.log(`redirectPendingDirtyPath(${entry.reason}): "${oldPath}" -> "${newPath}" (${label})`);
+		this.scheduleMarkdownDrain();
+	}
+
+	/** @deprecated Use redirectPendingDirtyPath. Kept for compatibility during transition. */
+	redirectPendingCreate(oldPath: string, newPath: string): void {
+		this.redirectPendingDirtyPath(oldPath, newPath);
+	}
+
+	/**
+	 * Drop a pending dirty entry for path without redirecting.
+	 *
+	 * Called after an excluded-path tombstone is applied — the dirty entry was
+	 * redirected to an excluded path by redirectPendingDirtyPath, but that path
+	 * must not be synced. Dropping it prevents the drain from attempting
+	 * syncFileFromDisk at an excluded path (which would be a no-op anyway,
+	 * but is noisy and unnecessary).
+	 */
+	dropDirtyPath(path: string): void {
+		if (this.dirtyMarkdownPaths.delete(path)) {
+			this.deps.log(`dropDirtyPath: dropped excluded dirty entry for "${path}"`);
 		}
 	}
 
