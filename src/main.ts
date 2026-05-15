@@ -454,7 +454,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				() => this.persistPreservedUnresolvedState(),
 			);
 			this.diskMirror.startMapObservers();
-			this.diskMirror.setFlightEventHandler((event) => this.recordFlightEvent(event as import("./debug/flightEvents").FlightEventInput));
+			this.diskMirror.setFlightEventHandler((event) => this.recordFlightPathEvent(event as import("./debug/flightEvents").FlightPathEventInput));
 
 			// 4b. BlobSyncManager (if attachment sync is enabled)
 			this.attachmentOrchestrator?.start("startup", false);

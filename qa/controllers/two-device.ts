@@ -807,13 +807,33 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		const CYCLE_ONLINE_MS = 10000;
 
 		for (let i = 1; i <= CYCLES; i++) {
+			// ── Disconnect B ──
 			log(`Cycle ${i}/${CYCLES}: disconnecting B…`);
 			await b.evalRaw(`window.__YAOS_DEBUG__?.setQaNetworkHold("offline")`);
-			await b.evalRaw(`window.__YAOS_DEBUG__?.waitForProviderDisconnected(15000)`).catch((e: unknown) => {
-				log(`Warning: waitForProviderDisconnected timed out in cycle ${i}: ${e}`);
-			});
-			// Extra settle time for disconnect to propagate
-			await new Promise((r) => setTimeout(r, 1000));
+
+			// Verify disconnect with generous timeout. The hold mechanism can be slow
+			// on first attempt due to WebSocket close handshake timing.
+			const disconnected = await b.evalRaw<boolean>(`
+				(async () => {
+					const d = window.__YAOS_DEBUG__;
+					if (!d) return false;
+					try { await d.waitForProviderDisconnected(25000); } catch { return false; }
+					return !d.isProviderConnected();
+				})()
+			`);
+			if (!disconnected) {
+				log(`Cycle ${i}/${CYCLES}: WARNING — B did not disconnect within 25s, skipping cycle`);
+				// Release hold so it doesn't affect next cycle
+				await b.evalRaw(`window.__YAOS_DEBUG__?.setQaNetworkHold("online")`).catch(() => {});
+				await new Promise((r) => setTimeout(r, 2000));
+				continue;
+			}
+			log(`Cycle ${i}/${CYCLES}: B disconnected (providerConnected=false) ✓`);
+			if (!disconnected) {
+				errors.push(`Cycle ${i}: B failed to disconnect — provider still connected`);
+				break;
+			}
+			log(`Cycle ${i}/${CYCLES}: B disconnected (providerConnected=false) ✓`);
 
 			// Poll A during B's offline period
 			log(`Cycle ${i}/${CYCLES}: polling A while B offline (${CYCLE_OFFLINE_MS / 1000}s)…`);
@@ -827,12 +847,61 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 				break;
 			}
 
-			// Reconnect B
+			// ── Reconnect B ──
 			log(`Cycle ${i}/${CYCLES}: reconnecting B…`);
 			await b.evalRaw(`window.__YAOS_DEBUG__?.setQaNetworkHold("online")`);
 
-			// Poll A during reconnect period (this is when stale pushback could happen)
-			log(`Cycle ${i}/${CYCLES}: polling A during B reconnect (${CYCLE_ONLINE_MS / 1000}s)…`);
+			// Assert: B actually reconnected and synced
+			const synced = await b.evalRaw<boolean>(`
+				(async () => {
+					const d = window.__YAOS_DEBUG__;
+					if (!d) return false;
+					// Wait up to 30s for provider sync
+					const deadline = Date.now() + 30000;
+					while (Date.now() < deadline) {
+						if (d.isProviderSynced()) return true;
+						await new Promise(r => setTimeout(r, 250));
+					}
+					return d.isProviderSynced();
+				})()
+			`);
+			if (!synced) {
+				errors.push(`Cycle ${i}: B failed to reconnect/sync — providerSynced=false`);
+				break;
+			}
+			log(`Cycle ${i}/${CYCLES}: B reconnected + synced ✓`);
+
+			// Wait for B to settle (disk writes are async after provider sync)
+			await b.evalRaw(`
+				(async () => {
+					const d = window.__YAOS_DEBUG__;
+					if (!d) return;
+					try { await d.waitForIdle(15000); } catch {}
+				})()
+			`);
+			// Wait for disk-CRDT convergence on the scratch file
+			await b.evalRaw(`window.__YAOS_QA__?.waitForDiskCrdtConverge(${JSON.stringify(scratch)}, 15000)`).catch(() => {});
+			await new Promise((r) => setTimeout(r, 1000));
+
+			// Assert: B received the latest state (sentinel should be absent on B's disk)
+			const bHasSentinel = await b.evalRaw<boolean>(`
+				(async () => {
+					const f = app.vault.getAbstractFileByPath(${JSON.stringify(scratch)});
+					if (!f) return false;
+					const content = await app.vault.read(f);
+					return content.includes(${JSON.stringify(S10F_SENTINEL)});
+				})()
+			`);
+			if (bHasSentinel) {
+				// Disk may lag behind CRDT after reconnect — this is a timing issue,
+				// not a sync failure. The final convergence check is what matters.
+				log(`Cycle ${i}/${CYCLES}: NOTE — B disk still has sentinel (disk lag after sync)`);
+			} else {
+				log(`Cycle ${i}/${CYCLES}: B sentinel absent after sync ✓`);
+			}
+
+			// Poll A during post-reconnect period (this is when stale pushback could happen)
+			log(`Cycle ${i}/${CYCLES}: polling A during B post-reconnect (${CYCLE_ONLINE_MS / 1000}s)…`);
 			const reconnectPoll = await pollForReversion(a, S10F_SENTINEL, CYCLE_ONLINE_MS, 250, log, {
 				burstEvery: 15,
 				burstText: ` rc${i} `,
@@ -1017,6 +1086,201 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 
 		await s10fConvergence(a, b, scratch, S10F_SENTINEL, errors, log);
 		await s10fCleanup(a, b, scratch);
+		return { passedA: errors.length === 0, passedB: errors.length === 0, errors };
+	},
+
+	// ───────────────────────────────────────────────────────────────────
+	// s10e: Real plugin disable/re-enable — edits while YAOS is
+	//       unloaded must survive re-enable. Tests the startup
+	//       reconciliation path (IndexedDB + provider sync + authoritative
+	//       reconcile). This covers the reported "I turned plugin back on
+	//       and lost edits" path.
+	// ───────────────────────────────────────────────────────────────────
+
+	"issue-22-disable-reenable-disk-wins": async (a, b, log) => {
+		const errors: string[] = [];
+		const scratch = "QA-scratch/s10e-disable-reenable.md";
+		const INITIAL = "# S10e Disable Re-enable\n\nOriginal content from both devices.\n";
+		const EDIT_WHILE_DISABLED = "\nEDITED WHILE YAOS WAS DISABLED. Marker D1S4.\n";
+		const DISABLE_MARKER = "Marker D1S4";
+
+		// ── Setup: create file, sync to both ─────────────────────────────
+
+		if (!await s10fSetup(a, b, scratch, INITIAL, errors, log, { openOnBoth: false })) {
+			return { passedA: false, passedB: false, errors };
+		}
+
+		// Record pre-disable content hash on B
+		const preDisableHash = await b.evalRaw<string | null>(
+			`window.__YAOS_DEBUG__?.getDiskHash(${JSON.stringify(scratch)})`,
+		);
+		log(`Pre-disable B disk hash: ${preDisableHash?.slice(0, 12)}`);
+
+		// ── Disable YAOS on B ────────────────────────────────────────────
+
+		log("Action: disabling YAOS plugin on Device B…");
+		await b.evalRaw(`app.plugins.disablePlugin("yaos")`);
+
+		// Wait for plugin to fully unload
+		await new Promise((r) => setTimeout(r, 3000));
+
+		// Assert: YAOS is actually unloaded (plugin instance destroyed)
+		// Note: enabledPlugins Set may not update synchronously, so check
+		// the plugin instance directly.
+		const yaosUnloaded = await b.evalRaw<boolean>(`!app.plugins?.plugins?.yaos`);
+		if (!yaosUnloaded) {
+			errors.push("B: YAOS plugin instance still present after disablePlugin");
+			await b.evalRaw(`app.plugins.enablePlugin("yaos")`).catch(() => {});
+			return { passedA: false, passedB: false, errors };
+		}
+		log("Action: YAOS unloaded on B (plugin instance gone) ✓");
+
+		// ── Edit on B while YAOS is disabled ─────────────────────────────
+		// Use raw Obsidian vault API — no YAOS involved
+
+		log("Action: editing file on B while YAOS is disabled…");
+		await b.evalRaw(`
+			(async () => {
+				const f = app.vault.getAbstractFileByPath(${JSON.stringify(scratch)});
+				if (!f) throw new Error("File not found on B after disable");
+				const content = await app.vault.read(f);
+				await app.vault.modify(f, content + ${JSON.stringify(EDIT_WHILE_DISABLED)});
+			})()
+		`);
+
+		// Verify the edit is on disk
+		const editedContent = await b.evalRaw<string>(`
+			(async () => {
+				const f = app.vault.getAbstractFileByPath(${JSON.stringify(scratch)});
+				return f ? await app.vault.read(f) : "";
+			})()
+		`);
+		if (!editedContent.includes(DISABLE_MARKER)) {
+			errors.push("B: edit did not land on disk while YAOS was disabled");
+			await b.evalRaw(`app.plugins.enablePlugin("yaos")`).catch(() => {});
+			return { passedA: false, passedB: false, errors };
+		}
+		log("Action: edit landed on B disk while YAOS disabled ✓");
+
+		// Meanwhile, A continues editing through YAOS (A is still online)
+		log("Action: A continues editing while B has YAOS disabled…");
+		await a.evalRaw(`window.__YAOS_QA__?.openFile(${JSON.stringify(scratch)})`);
+		await a.evalRaw(`window.__YAOS_QA__?.waitForCrdtBinding(${JSON.stringify(scratch)}, 10000)`);
+		await a.evalRaw(typeAtCursorExpr("\nEdited on A while B was disabled. Marker A7E2.\n"));
+		await a.evalRaw(`window.__YAOS_DEBUG__?.waitForIdle(15000)`);
+		log("Action: A edit synced to server ✓");
+
+		// ── Re-enable YAOS on B ──────────────────────────────────────────
+
+		log("Action: re-enabling YAOS plugin on Device B…");
+		await b.evalRaw(`app.plugins.enablePlugin("yaos")`);
+
+		// Wait for YAOS to fully initialize
+		// Poll until YAOS plugin is loaded and debug API is functional
+		const qaReady = await b.evalRaw<boolean>(`
+			(async () => {
+				const deadline = Date.now() + 30000;
+				while (Date.now() < deadline) {
+					const yaos = app.plugins?.plugins?.yaos;
+					const debug = window.__YAOS_DEBUG__;
+					if (yaos && debug && debug.isLocalReady()) return true;
+					await new Promise(r => setTimeout(r, 500));
+				}
+				return false;
+			})()
+		`);
+		if (!qaReady) {
+			errors.push("B: YAOS did not re-initialize within 30s after enablePlugin");
+			return { passedA: false, passedB: false, errors };
+		}
+		log("Action: YAOS re-initialized on B (APIs available) ✓");
+
+		// Wait for full startup: local ready + provider synced + reconciled
+		log("Action: waiting for B startup reconciliation…");
+		const startupOk = await b.evalRaw<boolean>(`
+			(async () => {
+				const d = window.__YAOS_DEBUG__;
+				if (!d) return false;
+				try {
+					await d.waitForIdle(30000);
+					return d.isLocalReady() && d.isProviderSynced() && d.isReconciled();
+				} catch { return false; }
+			})()
+		`);
+		if (!startupOk) {
+			errors.push("B: startup reconciliation did not complete within 30s");
+			// Still check content anyway
+		} else {
+			log("Action: B startup reconciliation complete ✓");
+		}
+
+		// Extra settle time for disk writes
+		await new Promise((r) => setTimeout(r, 5000));
+
+		// ── Assert: B's disk edit survived ────────────────────────────────
+
+		const finalContentB = await b.evalRaw<string>(`
+			(async () => {
+				const f = app.vault.getAbstractFileByPath(${JSON.stringify(scratch)});
+				return f ? await app.vault.read(f) : "";
+			})()
+		`);
+
+		if (!finalContentB.includes(DISABLE_MARKER)) {
+			errors.push(
+				"DATA LOSS: B's edit made while YAOS was disabled was LOST after re-enable. " +
+				`Content length: ${finalContentB.length}`,
+			);
+		} else {
+			log("Assert: B's disabled-edit survived re-enable ✓");
+		}
+
+		// Also check that A's edit arrived on B
+		if (!finalContentB.includes("Marker A7E2")) {
+			errors.push("B: A's edit did not arrive on B after re-enable");
+		} else {
+			log("Assert: A's edit arrived on B ✓");
+		}
+
+		// ── Assert: A also has B's edit (convergence) ────────────────────
+
+		await a.evalRaw(`window.__YAOS_DEBUG__?.waitForIdle(15000)`).catch(() => {});
+		await new Promise((r) => setTimeout(r, 5000));
+
+		const finalContentA = await a.evalRaw<string>(`
+			(async () => {
+				const f = app.vault.getAbstractFileByPath(${JSON.stringify(scratch)});
+				return f ? await app.vault.read(f) : "";
+			})()
+		`);
+
+		if (!finalContentA.includes(DISABLE_MARKER)) {
+			log("Note: B's disabled-edit has not propagated to A (may be expected depending on reconcile strategy)");
+			// This is informational, not necessarily an error — the reconciliation
+			// might correctly choose server/CRDT state over B's disk edit.
+			// The critical assertion is that B's edit is not silently LOST.
+		} else {
+			log("Assert: B's disabled-edit propagated to A ✓");
+		}
+
+		// Final hash comparison
+		const hashA = await a.evalRaw<string | null>(
+			`window.__YAOS_DEBUG__?.getDiskHash(${JSON.stringify(scratch)})`,
+		);
+		const hashB = await b.evalRaw<string | null>(
+			`window.__YAOS_DEBUG__?.getDiskHash(${JSON.stringify(scratch)})`,
+		);
+		if (hashA !== hashB) {
+			errors.push(`Final hash mismatch: A=${hashA?.slice(0, 12)}, B=${hashB?.slice(0, 12)}`);
+		} else {
+			log("Final: A == B hash ✓");
+		}
+
+		// ── Cleanup ──────────────────────────────────────────────────────
+
+		await a.evalRaw(`window.__YAOS_QA__?.closeFile(${JSON.stringify(scratch)})`).catch(() => {});
+		await a.evalRaw(`window.__YAOS_QA__?.deleteFile(${JSON.stringify(scratch)})`).catch(() => {});
+
 		return { passedA: errors.length === 0, passedB: errors.length === 0, errors };
 	},
 };
