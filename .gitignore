@@ -4,6 +4,7 @@
 # Intellij
 *.iml
 .idea
+.kiro
 
 # npm / bun
 node_modules
