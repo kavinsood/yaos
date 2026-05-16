@@ -10,6 +10,7 @@ import {
 	type FrontmatterValidationResult,
 } from "./frontmatterGuard";
 import { isLocalOrigin } from "./origins";
+import { contentBaselineHash } from "./diskIndex";
 import { PreservedUnresolvedRegistry, type PreservedUnresolvedEntry, type PreservedUnresolvedReason } from "./preservedUnresolved";
 export { isLocalOrigin };
 
@@ -103,6 +104,15 @@ export class DiskMirror {
 
 	private _flightEventHandler: ((event: Record<string, unknown>) => void) | null = null;
 
+	/**
+	 * Called after every successful `flushWrite` with the normalized path and
+	 * the SHA-256 content hash of what was written.
+	 *
+	 * The hash is pre-computed here (where the content is in scope) to keep
+	 * the caller free of crypto concerns. Use to update disk index baselines.
+	 */
+	private _onDiskWriteCallback: ((path: string, contentHash: string) => void) | null = null;
+
 	private readonly debug: boolean;
 
 	constructor(
@@ -133,6 +143,16 @@ export class DiskMirror {
 
 	setFlightEventHandler(handler: (event: Record<string, unknown>) => void): void {
 		this._flightEventHandler = handler;
+	}
+
+	/**
+	 * Register a callback that fires after every successful `flushWrite`.
+	 * The callback receives the normalized path and the SHA-256 hash of the
+	 * content written (pre-computed in diskMirror to avoid redundant re-reads).
+	 * Use this to update content-hash baselines in the disk index.
+	 */
+	setDiskWriteCallback(callback: (path: string, contentHash: string) => void): void {
+		this._onDiskWriteCallback = callback;
 	}
 
 	// -------------------------------------------------------------------
@@ -481,6 +501,7 @@ export class DiskMirror {
 				await this.suppressWrite(path, content);
 				await this.app.vault.modify(existing, content);
 				this.log(`flushWrite: updated "${path}" (${content.length} chars)`);
+				this._onDiskWriteCallback?.(normalized, await contentBaselineHash(content));
 				this._flightEventHandler?.({
 					priority: "important",
 					kind: "disk.write.ok",
@@ -508,6 +529,7 @@ export class DiskMirror {
 				this.log(
 					`flushWrite: created "${path}" on disk (${content.length} chars)`,
 				);
+				this._onDiskWriteCallback?.(normalized, await contentBaselineHash(content));
 				this._flightEventHandler?.({
 					priority: "important",
 					kind: "disk.write.ok",
@@ -1023,6 +1045,61 @@ export class DiskMirror {
 	// -------------------------------------------------------------------
 	// Cleanup
 	// -------------------------------------------------------------------
+
+	/**
+	 * Flush all pending writes and await completion before teardown.
+	 *
+	 * Safe ordering for plugin unload:
+	 *   1. flushAllPendingWrites()  ← all writes complete, callbacks fire, hashes recorded
+	 *   2. caller saves disk index  ← persists content hashes to data.json
+	 *   3. destroy()                ← nothing pending, safe to clear state
+	 *
+	 * Covers:
+	 *   - writeQueue (debounced bulk writes)
+	 *   - pendingOpenWrites / openWriteTimers (deferred editor writes)
+	 *   - existing drain promise (if already draining)
+	 */
+	async flushAllPendingWrites(): Promise<void> {
+		// 1. Flush all pending open-file writes immediately (cancel their timers,
+		//    flush now with force=true so editor guards don't defer again).
+		const openPending = new Set<string>([
+			...this.pendingOpenWrites,
+			...this.openWriteTimers.keys(),
+		]);
+		for (const timer of this.openWriteTimers.values()) {
+			clearTimeout(timer);
+		}
+		this.openWriteTimers.clear();
+		this.pendingOpenWrites.clear();
+		if (openPending.size > 0) {
+			await Promise.all([...openPending].map((p) => this.flushWrite(p, true)));
+		}
+
+		// 2. Also flush anything sitting in the debounce timer queue (those
+		//    haven't made it into writeQueue yet).
+		const debouncePending = new Set<string>(this.debounceTimers.keys());
+		for (const timer of this.debounceTimers.values()) {
+			clearTimeout(timer);
+		}
+		this.debounceTimers.clear();
+		for (const path of debouncePending) {
+			this.writeQueue.add(path);
+		}
+
+		// 3. Drain the write queue. If a drain is already running, await it
+		//    then do one more pass to catch any items added during this flush.
+		if (this.drainPromise) {
+			await this.drainPromise;
+		}
+		if (this.writeQueue.size > 0) {
+			await this.kickDrain();
+		}
+
+		// 4. Await any outstanding per-path write locks.
+		if (this.pathWriteLocks.size > 0) {
+			await Promise.allSettled(this.pathWriteLocks.values());
+		}
+	}
 
 	destroy(): void {
 		const pendingFinalWrites = new Set<string>();

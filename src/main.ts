@@ -455,6 +455,21 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			);
 			this.diskMirror.startMapObservers();
 			this.diskMirror.setFlightEventHandler((event) => this.recordFlightPathEvent(event as import("./debug/flightEvents").FlightPathEventInput));
+			// Track SHA-256 baseline hash after every successful flushWrite.
+			// Used by decideClosedFileConflict on startup/re-enable to determine
+			// which side actually changed from the last known stable state.
+			this.diskMirror.setDiskWriteCallback((path, contentHash) => {
+				const existing = this.diskIndex[path];
+				if (existing) {
+					existing.contentHash = contentHash;
+				} else {
+					// New file: create minimal entry with contentHash.
+					// mtime/size=0 triggers re-stat on next reconcile (harmless
+					// extra read) but contentHash is immediately available as
+					// baseline for the next startup reconcile.
+					this.diskIndex[path] = { mtime: 0, size: 0, contentHash };
+				}
+			});
 
 			// 4b. BlobSyncManager (if attachment sync is enabled)
 			this.attachmentOrchestrator?.start("startup", false);
@@ -939,6 +954,15 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	 */
 	private async teardownSync(): Promise<void> {
 		this.log("teardownSync: tearing down all sync state");
+
+		// Safe teardown ordering for disk index baseline persistence:
+		//   1. Flush all pending disk writes (callbacks fire, hashes recorded in memory)
+		//   2. Save disk index to data.json (hashes now current for next startup)
+		//   3. Destroy sync state (nothing pending left to flush)
+		if (this.diskMirror) {
+			await this.diskMirror.flushAllPendingWrites();
+		}
+		await this.saveDiskIndex();
 
 		this.editorBindings?.unbindAll();
 		this.diskMirror?.destroy();
@@ -1609,6 +1633,12 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		void this.flightTrace?.stop();
 		void this.traceRuntime?.shutdown();
 		document.body.removeClass("vault-crdt-show-cursors");
+		// Remove plugin-owned debug global to prevent stale API references
+		// from confusing test harnesses after plugin reload.
+		const win = window as unknown as Record<string, unknown>;
+		if (win.__YAOS_DEBUG__) {
+			delete win.__YAOS_DEBUG__;
+		}
 		void this.teardownSync();
 	}
 

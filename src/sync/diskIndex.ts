@@ -1,5 +1,5 @@
 /**
- * Disk index: tracks {mtime, size} per file path for efficient
+ * Disk index: tracks {mtime, size, contentHash} per file path for efficient
  * reconciliation. Only files whose stat changed since last reconcile
  * need to be read from disk.
  *
@@ -11,11 +11,69 @@ import { mapWithConcurrency } from "../utils/concurrency";
 
 const DEFAULT_STAT_CONCURRENCY = 16;
 
+/**
+ * Cheap FNV-1a-ish 32-bit fingerprint for diagnostics and loop detection.
+ *
+ * Use ONLY for:
+ *   - recovery-loop deduplication (recoverySignature)
+ *   - conflict-artifact dedupe keys
+ *   - diagnostics bucketing
+ *
+ * Do NOT use for three-way authority decisions (baseline vs disk vs CRDT).
+ * For that, use contentBaselineHash() which is collision-resistant.
+ *
+ * False collisions are tolerable here: the worst case is a missed quarantine
+ * entry or a duplicate conflict artifact, not data corruption.
+ */
+export function contentFingerprint(text: string): string {
+	let h = 0x811c9dc5;
+	for (let i = 0; i < text.length; i++) {
+		h ^= text.charCodeAt(i);
+		h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0;
+	}
+	return h.toString(16).padStart(8, "0") + ":" + text.length;
+}
+
+/**
+ * SHA-256 content hash for three-way authority decisions.
+ *
+ * Used as the baseline in startup/re-enable reconciliation:
+ *
+ *   disk == baseline, crdt != baseline → apply-remote-to-disk (crdt wins cleanly)
+ *   crdt == baseline, disk != baseline → import-disk-to-crdt  (disk wins cleanly)
+ *   both != baseline                  → preserve-conflict/both-changed
+ *   baseline null (first run)         → preserve-conflict/missing-baseline (safe fallback)
+ *
+ * Collisions must be practically impossible — a false equality could cause
+ * YAOS to decide "disk unchanged" and overwrite a local edit without conflict
+ * preservation, resulting in silent data loss.
+ *
+ * Implementation: Web Crypto API (`globalThis.crypto.subtle`).
+ * This is the same path used by blobSync, diskMirror.fingerprintContent, and
+ * indexedDbCandidateStore.sha256Hex — proven to work on iOS, Android, and desktop.
+ * Does NOT use Node's `crypto` module, which is unavailable in mobile WebViews.
+ */
+export async function contentBaselineHash(content: string): Promise<string> {
+	const bytes = new TextEncoder().encode(content);
+	const digest = await globalThis.crypto.subtle.digest("SHA-256", bytes);
+	return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 export interface DiskIndexEntry {
 	/** Last known mtime in ms. */
 	mtime: number;
 	/** Last known file size in bytes. */
 	size: number;
+	/**
+	 * SHA-256 hash of the file content at last clean settlement.
+	 *
+	 * Persisted across plugin unload/reload to serve as the three-way baseline
+	 * in startup reconciliation. Only set via contentBaselineHash().
+	 *
+	 * Absence (undefined) means the baseline is unknown for this file —
+	 * reconciliation falls back to the safe preserve-conflict/missing-baseline path.
+	 */
+	contentHash?: string;
 }
 
 export type DiskIndex = Record<string, DiskIndexEntry>;
@@ -122,11 +180,18 @@ export async function collectFileStats(
 
 /**
  * Update the disk index with fresh stats after a successful reconcile.
+ *
+ * @param settledHashes - Content fingerprints for files that were cleanly
+ *   settled this reconcile (no conflict, authority is certain). These become
+ *   the baseline for the next startup reconcile.
+ *   - If a path is in settledHashes: store that hash.
+ *   - If a path's stat is unchanged from the old index: carry the old hash.
+ *   - If a path's stat changed but no settled hash: clear the hash (stale).
  */
 export function updateIndex(
 	index: DiskIndex,
 	allStats: Map<string, { mtime: number; size: number }>,
-	options: { excludePaths?: Iterable<string> } = {},
+	options: { excludePaths?: Iterable<string>; settledHashes?: Map<string, string> } = {},
 ): DiskIndex {
 	const excluded = new Set(options.excludePaths ?? []);
 	const newIndex: DiskIndex = {};
@@ -135,7 +200,30 @@ export function updateIndex(
 		if (excluded.has(path)) {
 			continue;
 		}
-		newIndex[path] = { mtime: stat.mtime, size: stat.size };
+		const oldEntry = index[path];
+		const settledHash = options.settledHashes?.get(path);
+
+		// Determine content hash for this entry:
+		// 1. If a settled hash was recorded for this reconcile, use it.
+		// 2. Else if the stat is unchanged from before, the old hash is still valid.
+		// 3. Else (stat changed, no new settled hash): clear hash — it's stale.
+		let contentHash: string | undefined;
+		if (settledHash !== undefined) {
+			contentHash = settledHash;
+		} else if (
+			oldEntry !== undefined &&
+			oldEntry.mtime === stat.mtime &&
+			oldEntry.size === stat.size
+		) {
+			contentHash = oldEntry.contentHash;
+		}
+		// else: stat changed without a settled hash → omit contentHash
+
+		newIndex[path] = {
+			mtime: stat.mtime,
+			size: stat.size,
+			...(contentHash !== undefined && { contentHash }),
+		};
 	}
 
 	return newIndex;

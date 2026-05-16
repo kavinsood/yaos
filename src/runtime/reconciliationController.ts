@@ -4,6 +4,8 @@ import type { DiskMirror } from "../sync/diskMirror";
 import {
 	type DiskIndex,
 	collectFileStats,
+	contentBaselineHash,
+	contentFingerprint,
 	filterChangedFiles,
 	updateIndex,
 } from "../sync/diskIndex";
@@ -97,23 +99,8 @@ const RECOVERY_FINGERPRINT_TTL_MS = 10 * 60_000; // 10 minutes
 
 /**
  * Cheap FNV-1a-ish 32-bit hash for content fingerprinting.
- * NOT cryptographic — only for equality deduplication inside recovery
- * quarantine and conflict artifact dedupe. This is a cheap loop detector
- * and coalescing key, NOT a content identity or security primitive.
- * False collisions are possible but acceptable: the worst case is a
- * missed quarantine or an extra conflict artifact, not data corruption.
- * We deliberately avoid storing full note contents in the long-lived
- * map; only this fixed-size hash + content length is kept.
+ * @see diskIndex.contentFingerprint — exported from there, imported above.
  */
-function contentFingerprint(text: string): string {
-	let h = 0x811c9dc5;
-	for (let i = 0; i < text.length; i++) {
-		h ^= text.charCodeAt(i);
-		h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0;
-	}
-	return h.toString(16).padStart(8, "0") + ":" + text.length;
-}
-
 function recoverySignature(reason: string, previousContent: string, nextContent: string): string {
 	return `${reason}\x00${contentFingerprint(previousContent)}\x00${contentFingerprint(nextContent)}`;
 }
@@ -499,41 +486,8 @@ export class ReconciliationController {
 				});
 			}
 
-			// Emit reconcile.file.decision for ALL outcomes so the analyzer sees every path.
-			for (const path of result.createdOnDisk) {
-				this.deps.recordFlightPathEvent?.({
-					priority: "important",
-					kind: FLIGHT_KIND.reconcileFileDecision,
-					severity: "info",
-					scope: "file",
-					source: "reconciliationController",
-					layer: "reconcile",
-					path,
-					data: {
-						decision: "write-crdt-to-disk",
-						reason: "crdt-file-missing-on-disk",
-						conflictRisk: "none",
-					},
-				});
-				await diskMirror.flushWrite(path);
-				flushedCreates++;
-			}
-			for (const path of result.seededToCrdt) {
-				this.deps.recordFlightPathEvent?.({
-					priority: "important",
-					kind: FLIGHT_KIND.reconcileFileDecision,
-					severity: "info",
-					scope: "file",
-					source: "reconciliationController",
-					layer: "reconcile",
-					path,
-					data: {
-						decision: "seed-disk-to-crdt",
-						reason: "disk-file-not-in-crdt",
-						conflictRisk: "none",
-					},
-				});
-			}
+			// Emit reconcile.file.decision for tombstoned and untracked paths
+			// (diagnostic only — no side effects, safe outside safetyBrake guard).
 			for (const conflict of result.tombstonedDiskConflicts ?? []) {
 				this.deps.recordFlightPathEvent?.({
 					priority: "important",
@@ -568,7 +522,57 @@ export class ReconciliationController {
 				});
 			}
 			if (!safetyBrakeTriggered) {
+				// Content hashes for files settled cleanly this reconcile.
+				// Stored in the disk index as the three-way baseline for the
+				// next startup reconcile (after plugin disable/re-enable).
+				const settledHashes = new Map<string, string>();
+
 				const updatesToFlush: string[] = [];
+				for (const path of result.createdOnDisk) {
+					this.deps.recordFlightPathEvent?.({
+						priority: "important",
+						kind: FLIGHT_KIND.reconcileFileDecision,
+						severity: "info",
+						scope: "file",
+						source: "reconciliationController",
+						layer: "reconcile",
+						path,
+						data: {
+							decision: "write-crdt-to-disk",
+							reason: "crdt-file-missing-on-disk",
+							conflictRisk: "none",
+						},
+					});
+					await diskMirror.flushWrite(path);
+					flushedCreates++;
+					// Record settled baseline hash: CRDT content was written to disk
+					const ytext = vaultSync.getTextForPath(path);
+					if (ytext) {
+						const crdtContent = yTextToString(ytext) ?? "";
+						settledHashes.set(path, await contentBaselineHash(crdtContent));
+					}
+				}
+				for (const path of result.seededToCrdt) {
+					this.deps.recordFlightPathEvent?.({
+						priority: "important",
+						kind: FLIGHT_KIND.reconcileFileDecision,
+						severity: "info",
+						scope: "file",
+						source: "reconciliationController",
+						layer: "reconcile",
+						path,
+						data: {
+							decision: "seed-disk-to-crdt",
+							reason: "disk-file-not-in-crdt",
+							conflictRisk: "none",
+						},
+					});
+					// Record settled baseline hash: disk content was the authority
+					const diskContent = diskFiles.get(path);
+					if (diskContent !== undefined) {
+						settledHashes.set(path, await contentBaselineHash(diskContent));
+					}
+				}
 				for (const path of result.updatedOnDisk) {
 					const diskContent = diskFiles.get(path);
 					const ytext = vaultSync.getTextForPath(path);
@@ -582,10 +586,21 @@ export class ReconciliationController {
 						ytext
 					) {
 						const crdtContent = yTextToString(ytext) ?? "";
+						// SHA-256 hashes for three-way authority decision.
+						// Must be collision-resistant — a false equality means
+						// "unchanged" which could silently overwrite a local edit.
+						const diskHash = await contentBaselineHash(diskContent);
+						const crdtHash = await contentBaselineHash(crdtContent);
+						// Use persisted baseline hash to determine what actually changed:
+						//   disk == baseline → CRDT changed only → apply-remote-to-disk
+						//   crdt == baseline → disk changed only → import-disk-to-crdt (clean win)
+						//   both != baseline → both changed      → preserve-conflict/both-changed
+						//   baseline null    → unknown           → preserve-conflict/missing-baseline
+						const baselineHash = this.deps.getDiskIndex()[path]?.contentHash ?? null;
 						const decision = decideClosedFileConflict({
-							baselineHash: null,
-							diskHash: contentFingerprint(diskContent),
-							crdtHash: contentFingerprint(crdtContent),
+							baselineHash,
+							diskHash,
+							crdtHash,
 						});
 					this.deps.recordFlightPathEvent?.({
 						priority: decision.kind === "preserve-conflict" ? "critical" : "important",
@@ -601,10 +616,10 @@ export class ReconciliationController {
 							winner: "winner" in decision ? decision.winner : null,
 							diskLength: diskContent.length,
 							crdtLength: crdtContent.length,
-							diskHash: contentFingerprint(diskContent),
-							crdtHash: contentFingerprint(crdtContent),
-							// diskChangedSinceBaseline: always unknown here (baseline=null)
-							diskChangedSinceBaseline: null,
+							diskHash,
+							crdtHash,
+							baselineHash,
+							diskChangedSinceBaseline: baselineHash !== null ? diskHash !== baselineHash : null,
 							conflictRisk:
 								decision.kind === "preserve-conflict"
 									? "reason" in decision && decision.reason === "both-changed"
@@ -625,8 +640,11 @@ export class ReconciliationController {
 								);
 								if (decision.winner === "disk") {
 									forceReplaceYText(ytext, diskContent, ORIGIN_DISK_SYNC_RECOVER_BOUND);
+									// Disk wins main file; record disk content as new settled baseline
+									settledHashes.set(path, diskHash);
 								} else {
 									updatesToFlush.push(path);
+									// CRDT wins main file; flushed below, record hash after flush
 								}
 								this.deps.trace("conflict", "closed-file-conflict-preserved", {
 									path,
@@ -654,13 +672,64 @@ export class ReconciliationController {
 								continue;
 							}
 						}
+						if (decision.kind === "import-disk-to-crdt") {
+							// Disk changed, CRDT is still at baseline. Disk wins cleanly.
+							// Import disk content into CRDT — no conflict artifact needed.
+							forceReplaceYText(ytext, diskContent, ORIGIN_DISK_SYNC_RECOVER_BOUND);
+							settledHashes.set(path, diskHash);
+							this.deps.trace("reconcile", "closed-file-disk-wins-clean", {
+								path,
+								reason: decision.reason,
+								diskLength: diskContent.length,
+								crdtLength: crdtContent.length,
+							});
+							flushedUpdates++;
+							continue;
+						}
+						// decision.kind === "apply-remote-to-disk" or "no-op":
+						// CRDT wins or nothing to do. Fall through to flush.
 					}
 					updatesToFlush.push(path);
 				}
 				for (const path of updatesToFlush) {
 					await diskMirror.flushWrite(path);
 					flushedUpdates++;
+					// Record settled baseline hash: CRDT content was written to disk
+					const ytext = vaultSync.getTextForPath(path);
+					if (ytext) {
+						settledHashes.set(path, await contentBaselineHash(yTextToString(ytext) ?? ""));
+					}
 				}
+
+				// Pass settled hashes to disk index so they survive plugin reload
+				// and serve as the three-way baseline next startup reconcile.
+				const blockedIndexPathsInner: string[] = [];
+				this.blockedDivergenceCount = 0;
+				// Do NOT clear lastBlockedDivergenceAt — it serves as "last seen"
+				// historical marker. Do NOT clear sample — remains available as
+				// "last blocked sample" even when count resets.
+				this.deps.setDiskIndex(updateIndex(this.deps.getDiskIndex(), allStats, {
+					excludePaths: blockedIndexPathsInner,
+					settledHashes,
+				}));
+			} else {
+				// Safety brake triggered: exclude all planned updates from index.
+				const blockedIndexPaths = result.updatedOnDisk;
+				this.blockedDivergenceCount = blockedIndexPaths.length;
+				this.lastBlockedDivergenceAt = new Date().toISOString();
+				this.blockedDivergenceSample = blockedIndexPaths.slice(0, 10).map((p) => {
+					const dot = p.lastIndexOf(".");
+					const ext = dot >= 0 ? p.slice(dot) : "(none)";
+					return { ext, hash: contentFingerprint(`${this.diagnosticPathSalt}:${p}`) };
+				});
+				this.deps.setDiskIndex(updateIndex(this.deps.getDiskIndex(), allStats, {
+					excludePaths: blockedIndexPaths,
+				}));
+				this.deps.trace("reconcile", "reconcile-disk-index-advance-blocked", {
+					mode,
+					blockedCount: blockedIndexPaths.length,
+					...tracePathList("blocked", blockedIndexPaths),
+				});
 			}
 
 			this.lastReconcileStats = {
@@ -690,34 +759,6 @@ export class ReconciliationController {
 
 			this.untrackedFiles = result.untracked;
 			this.reconciled = true;
-
-			const blockedIndexPaths = safetyBrakeTriggered ? result.updatedOnDisk : [];
-			if (safetyBrakeTriggered) {
-				this.blockedDivergenceCount = blockedIndexPaths.length;
-				this.lastBlockedDivergenceAt = new Date().toISOString();
-				// Keep a privacy-safer sample: extensions + session-salted
-				// fingerprints (no raw filenames or stable cross-export IDs).
-				this.blockedDivergenceSample = blockedIndexPaths.slice(0, 10).map((p) => {
-					const dot = p.lastIndexOf(".");
-					const ext = dot >= 0 ? p.slice(dot) : "(none)";
-					return { ext, hash: contentFingerprint(`${this.diagnosticPathSalt}:${p}`) };
-				});
-			} else {
-				this.blockedDivergenceCount = 0;
-				// Do NOT clear lastBlockedDivergenceAt — it serves as "last seen"
-				// historical marker. Do NOT clear sample — it remains
-				// available as "last blocked sample" even when count resets.
-			}
-			this.deps.setDiskIndex(updateIndex(this.deps.getDiskIndex(), allStats, {
-				excludePaths: blockedIndexPaths,
-			}));
-			if (blockedIndexPaths.length > 0) {
-				this.deps.trace("reconcile", "reconcile-disk-index-advance-blocked", {
-					mode,
-					blockedCount: blockedIndexPaths.length,
-					...tracePathList("blocked", blockedIndexPaths),
-				});
-			}
 			void this.deps.saveDiskIndex();
 
 			const integrity = vaultSync.runIntegrityChecks();
@@ -1172,7 +1213,7 @@ export class ReconciliationController {
 				});
 			}
 
-			await this.updateDiskIndexForPath(file.path);
+			await this.updateDiskIndexForPath(file.path, content);
 		} catch (err) {
 			console.error(`[yaos] syncFileFromDisk failed for "${file.path}":`, err);
 		}
@@ -1930,15 +1971,27 @@ export class ReconciliationController {
 		return `${dir}${finalBase}${suffix}${ext}`;
 	}
 
-	private async updateDiskIndexForPath(path: string): Promise<void> {
+	private async updateDiskIndexForPath(path: string, settledContent?: string): Promise<void> {
 		try {
 			const stat = await this.deps.app.vault.adapter.stat(path);
 			if (stat) {
-				const nextIndex = {
-					...this.deps.getDiskIndex(),
-					[path]: { mtime: stat.mtime, size: stat.size },
+				const existing = this.deps.getDiskIndex()[path];
+				const nextEntry: import("../sync/diskIndex").DiskIndexEntry = {
+					mtime: stat.mtime,
+					size: stat.size,
+					// Advance the baseline hash if settled content is provided.
+					// This covers disk→CRDT imports (external edits while YAOS is running).
+					contentHash: settledContent !== undefined
+						? await contentBaselineHash(settledContent)
+						: existing?.contentHash,
 				};
-				this.deps.setDiskIndex(nextIndex);
+				if (nextEntry.contentHash === undefined) {
+					delete nextEntry.contentHash;
+				}
+				this.deps.setDiskIndex({
+					...this.deps.getDiskIndex(),
+					[path]: nextEntry,
+				});
 			}
 		} catch {
 			// Stat failed, index will be stale for this path.
