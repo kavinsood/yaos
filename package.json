@@ -18,6 +18,7 @@
 		"qa:manifest": "bun run qa/scripts/manifest.ts",
 		"qa:compare": "bun run qa/scripts/compare.ts",
 		"qa:analyze": "bun run qa/analyzers/analyzer.ts",
+		"qa:analyze-bundles": "bun run qa/scripts/analyze-bundles.ts",
 		"qa:prepare": "bun run qa/scripts/prepare-vault.ts",
 		"qa:obsidian": "bun run qa/controllers/single-device.ts",
 		"qa:two-device": "bun run qa/controllers/two-device.ts",
