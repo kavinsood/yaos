@@ -25,6 +25,12 @@ export interface CommandsRuntimeHost {
 	clearLocalServerReceiptState(): Promise<"cleared_persistent" | "cleared_memory_only" | "failed" | undefined>;
 	resetLocalCache(): void;
 	nuclearReset(): void;
+	// Phase 3 QA commands (gated by qaDebugMode)
+	qaExportWitnessBundle?(): Promise<void>;
+	qaExportWitnessBundleUnsafe?(): Promise<void>;
+	qaShowDeviceIdentity?(): void;
+	qaSetScenarioRunId?(): Promise<void>;
+	qaAdvanceScenarioStep?(): Promise<void>;
 }
 
 export function registerCommands(
@@ -255,4 +261,46 @@ export function registerCommands(
 			host.nuclearReset();
 		},
 	});
+
+	// Phase 3 QA commands — only registered when the host provides them
+	if (host.qaExportWitnessBundle) {
+		const exportBundle = host.qaExportWitnessBundle;
+		registrar.addCommand({
+			id: "qa-export-witness-bundle",
+			name: "YAOS QA: Export witness bundle",
+			callback: () => { void exportBundle(); },
+		});
+	}
+	if (host.qaExportWitnessBundleUnsafe) {
+		const exportBundleUnsafe = host.qaExportWitnessBundleUnsafe;
+		registrar.addCommand({
+			id: "qa-export-witness-bundle-unsafe",
+			name: "YAOS QA: Export witness bundle (unsafe local debug)",
+			callback: () => { void exportBundleUnsafe(); },
+		});
+	}
+	if (host.qaShowDeviceIdentity) {
+		const showIdentity = host.qaShowDeviceIdentity;
+		registrar.addCommand({
+			id: "qa-show-device-identity",
+			name: "YAOS QA: Show device identity for QA",
+			callback: () => { showIdentity(); },
+		});
+	}
+	if (host.qaSetScenarioRunId) {
+		const setRunId = host.qaSetScenarioRunId;
+		registrar.addCommand({
+			id: "qa-set-scenario-run-id",
+			name: "YAOS QA: Set scenario run ID",
+			callback: () => { void setRunId(); },
+		});
+	}
+	if (host.qaAdvanceScenarioStep) {
+		const advanceStep = host.qaAdvanceScenarioStep;
+		registrar.addCommand({
+			id: "qa-advance-scenario-step",
+			name: "YAOS QA: Advance scenario step",
+			callback: () => { void advanceStep(); },
+		});
+	}
 }

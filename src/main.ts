@@ -600,12 +600,20 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					clearLocalServerReceiptState: () => this.clearLocalServerReceiptState(),
 					resetLocalCache: () => this.resetLocalCache(),
 					nuclearReset: () => this.nuclearReset(),
-				startQaFlightTrace: (mode?: string) => this.startQaFlightTrace(mode),
-				stopQaFlightTrace: () => this.stopQaFlightTrace(),
-				exportSafeFlightTrace: () => this.exportSafeFlightTrace(),
-				exportFullFlightTrace: () => this.exportFullFlightTrace(),
-				showTimelineForCurrentFile: () => this.showTimelineForCurrentFile(),
-				clearFlightLogs: () => this.clearFlightLogs(),
+					startQaFlightTrace: (mode?: string) => this.startQaFlightTrace(mode),
+					stopQaFlightTrace: () => this.stopQaFlightTrace(),
+					exportSafeFlightTrace: () => this.exportSafeFlightTrace(),
+					exportFullFlightTrace: () => this.exportFullFlightTrace(),
+					showTimelineForCurrentFile: () => this.showTimelineForCurrentFile(),
+					clearFlightLogs: () => this.clearFlightLogs(),
+					// Phase 3 QA commands (only wired when qaDebugMode is on)
+					...(this.settings.qaDebugMode ? {
+						qaExportWitnessBundle: () => this._qaExportWitnessBundle("safe"),
+						qaExportWitnessBundleUnsafe: () => this._qaExportWitnessBundle("unsafe-local"),
+						qaShowDeviceIdentity: () => this._qaShowDeviceIdentity(),
+						qaSetScenarioRunId: () => this._qaSetScenarioRunId(),
+						qaAdvanceScenarioStep: () => this._qaAdvanceScenarioStep(),
+					} : {}),
 				});
 				this.commandsRegistered = true;
 			}
@@ -2056,9 +2064,209 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	}
 
 	private async stopQaFlightTrace(): Promise<void> {
+		// Phase 3: persist checkpoint segments to filesystem on trace stop (opt-in, fail-closed)
+		await this._persistCheckpointSegmentsIfSafe();
 		this._stopDeviceWitnessTracker();
 		await this.flightTrace?.stop();
 		new Notice("QA flight trace stopped.", 4000);
+	}
+
+	// -----------------------------------------------------------------------
+	// Phase 3: witness bundle export + identity command + scenario commands
+	// -----------------------------------------------------------------------
+
+	private _buildBundleHeader(privacyMode: "safe" | "unsafe-local"): Record<string, unknown> {
+		const ftc = this.flightTrace;
+		const ctx = ftc?.context;
+		const tracker = this.deviceWitnessTracker;
+		const segments = tracker?.getCheckpointSegments() ?? [];
+		const eventCount = segments.reduce((n, s) => {
+			return n + s.content.split("\n").filter((l) => {
+				if (!l.trim()) return false;
+				try { const o = JSON.parse(l) as Record<string, unknown>; return o.kind !== "checkpoint.segment.header"; } catch { return false; }
+			}).length;
+		}, 0);
+		const scenarioState = tracker?.getScenarioStepState();
+		return {
+			kind: "bundle.header",
+			bundleSchemaVersion: 1,
+			createdAt: new Date().toISOString(),
+			pluginVersion: this.manifest.version,
+			deviceId: ctx?.deviceId ?? "unknown",
+			deviceLabel: this.settings.deviceName ?? "unknown",
+			platform: "desktop",
+			runtimeState: tracker?.getRuntimeState() ?? "unknown",
+			localTraceId: ctx?.traceId ?? "unknown",
+			scenarioRunId: scenarioState?.scenarioRunId ?? null,
+			scenarioId: scenarioState?.scenarioId ?? null,
+			qaTraceSecretHash: this._qaTraceSecretHash ?? "(no qaTraceSecret configured)",
+			flightMode: ftc?.currentRecorder?.mode ?? "safe",
+			eventCount,
+			containsRawPaths: privacyMode === "unsafe-local",
+			hashDomain: "witness-state-v1",
+			privacyMode,
+		};
+	}
+
+	private _buildBundleString(privacyMode: "safe" | "unsafe-local"): string {
+		const header = this._buildBundleHeader(privacyMode);
+		const tracker = this.deviceWitnessTracker;
+		const segments = tracker?.getCheckpointSegments() ?? [];
+		const lines = [JSON.stringify(header)];
+		for (const seg of segments) {
+			lines.push(seg.content.trimEnd());
+		}
+		return lines.join("\n") + "\n";
+	}
+
+	private async _qaExportWitnessBundle(privacyMode: "safe" | "unsafe-local"): Promise<void> {
+		if (!this.settings.qaDebugMode) return;
+		const tracker = this.deviceWitnessTracker;
+		const ftc = this.flightTrace;
+		if (!tracker || !ftc?.context) {
+			new Notice("No active flight trace; nothing to export", 5000);
+			return;
+		}
+		const bundleStr = this._buildBundleString(privacyMode);
+
+		// Primary: clipboard
+		let clipboardOk = false;
+		try {
+			await navigator.clipboard.writeText(bundleStr);
+			clipboardOk = true;
+		} catch { /* fall through */ }
+
+		// Optional: filesystem write (fail-closed when inside vault root)
+		const configDir = this.app.vault.configDir;
+		const vaultRoot = (this.app.vault.adapter as unknown as { basePath?: string }).basePath ?? "";
+		const bundleDir = `${configDir}/plugins/yaos/witness-bundles`;
+		const isInsideVault = vaultRoot ? bundleDir.startsWith(vaultRoot) : true;
+
+		if (!isInsideVault) {
+			try {
+				const ctx = ftc.context;
+				const scenarioState = tracker.getScenarioStepState();
+				const runId = scenarioState.scenarioRunId ?? "no-run-id";
+				const ts = new Date().toISOString().replace(/[:.]/g, "-");
+				const filename = `${runId}-${ctx.deviceId}-${ts}.ndjson`;
+				const fullPath = `${bundleDir}/${filename}`;
+				await this.app.vault.adapter.mkdir(bundleDir);
+				await this.app.vault.adapter.write(fullPath, bundleStr);
+				if (clipboardOk) {
+					new Notice(`Witness bundle copied to clipboard and written to: ${fullPath}`, 8000);
+				} else {
+					new Notice(`Witness bundle written to: ${fullPath}`, 8000);
+				}
+				return;
+			} catch (e) {
+				const reason = e instanceof Error ? e.message : String(e);
+				new Notice(`Witness bundle delivered via clipboard/share-sheet; filesystem write unavailable: ${reason}`, 8000);
+				return;
+			}
+		}
+
+		if (clipboardOk) {
+			new Notice("Witness bundle copied to clipboard; filesystem write unavailable: path inside vault root", 7000);
+		} else {
+			new Notice("Witness bundle export failed: clipboard unavailable and path inside vault root", 7000);
+		}
+	}
+
+	private _qaShowDeviceIdentity(): void {
+		if (!this.settings.qaDebugMode) return;
+		const ftc = this.flightTrace;
+		const ctx = ftc?.context;
+		const tracker = this.deviceWitnessTracker;
+		const secretHash = this._qaTraceSecretHash;
+		const truncatedHash = secretHash?.startsWith("sha256:")
+			? `sha256:${secretHash.slice(7, 19)}…${secretHash.slice(-4)}`
+			: secretHash ?? "(no qaTraceSecret configured)";
+
+		const configDir = this.app.vault.configDir;
+		const vaultRoot = (this.app.vault.adapter as unknown as { basePath?: string }).basePath ?? "";
+		const bundleDir = `${configDir}/plugins/yaos/witness-bundles`;
+		const isInsideVault = vaultRoot ? bundleDir.startsWith(vaultRoot) : true;
+		const fsStatus = isInsideVault ? "unavailable_inside_vault" : "available";
+
+		const lines = [
+			`deviceId: ${ctx?.deviceId ?? "unknown"}`,
+			`Device label (display-only — never used as a key): ${this.settings.deviceName ?? "unknown"}`,
+			`Device name (display-only — never used as a key): ${this.settings.deviceName ?? "unknown"}`,
+			`pluginVersion: ${this.manifest.version}`,
+			`platform: desktop`,
+			`flightMode: ${ftc?.currentRecorder?.mode ?? "(no active trace)"}`,
+			`traceActive: ${!!ctx}`,
+			`qaTraceSecretHash: ${truncatedHash}`,
+			`runtimeState: ${tracker?.getRuntimeState() ?? "unknown"}`,
+			`bundleExportAvailable: ${!!(tracker && (tracker.getCheckpointSegments().length > 0))}`,
+			`filesystemPersistenceStatus: ${fsStatus}`,
+		].join("\n");
+
+		new Notice(lines, 12000);
+		console.debug("[yaos] Device identity for QA:\n" + lines);
+
+		// Copy full hash to clipboard
+		const fullPayload = lines.replace(truncatedHash, secretHash ?? "(no qaTraceSecret configured)");
+		navigator.clipboard.writeText(fullPayload).catch(() => { /* best-effort */ });
+	}
+
+	private async _qaSetScenarioRunId(): Promise<void> {
+		if (!this.settings.qaDebugMode) return;
+		const tracker = this.deviceWitnessTracker;
+		if (!tracker) {
+			new Notice("No active flight trace. Start a trace first.", 5000);
+			return;
+		}
+		// Simple prompt via Notice + console — no Modal dependency needed for QA tooling
+		const runId = prompt("Enter scenarioRunId (UUID or kebab-case label):");
+		if (!runId?.trim()) { new Notice("Cancelled.", 3000); return; }
+		const scenarioId = prompt("Enter scenarioId:");
+		if (!scenarioId?.trim()) { new Notice("Cancelled.", 3000); return; }
+		tracker.setScenarioRunId(runId.trim(), scenarioId.trim());
+		new Notice(`Scenario run ID set: ${runId.trim()} / ${scenarioId.trim()}`, 5000);
+	}
+
+	private async _qaAdvanceScenarioStep(): Promise<void> {
+		if (!this.settings.qaDebugMode) return;
+		const api = (window as unknown as Record<string, unknown>).__YAOS_DEBUG__ as import("./qaDebugApi").YaosQaDebugApi | undefined;
+		if (!api) {
+			new Notice("QA debug API not mounted. Enable qaDebugMode and start a trace.", 5000);
+			return;
+		}
+		const stepStr = prompt("Enter scenarioStepIndex (non-negative integer):");
+		if (stepStr === null) { new Notice("Cancelled.", 3000); return; }
+		const stepIndex = parseInt(stepStr, 10);
+		if (isNaN(stepIndex)) { new Notice("Invalid step index.", 4000); return; }
+		const label = prompt("Enter step label (optional, press OK to skip):") ?? undefined;
+		api.__qaOnlyAdvanceScenarioStepUnsafe?.(stepIndex, label?.trim() || undefined);
+		new Notice(`Scenario step advanced to ${stepIndex}${label ? ` (${label})` : ""}`, 4000);
+	}
+
+	private async _persistCheckpointSegmentsIfSafe(): Promise<void> {
+		const tracker = this.deviceWitnessTracker;
+		const ftc = this.flightTrace;
+		if (!tracker || !ftc?.context) return;
+		const configDir = this.app.vault.configDir;
+		const vaultRoot = (this.app.vault.adapter as unknown as { basePath?: string }).basePath ?? "";
+		const ctx = ftc.context;
+		const checkpointDir = `${configDir}/plugins/yaos/witness-checkpoints/${ctx.traceId}/${ctx.deviceId}`;
+		const isInsideVault = vaultRoot ? checkpointDir.startsWith(vaultRoot) : true;
+		if (isInsideVault) {
+			// fail-closed — already emitted checkpoint_path_inside_vault divergence from tracker
+			return;
+		}
+		const segments = tracker.getCheckpointSegments();
+		try {
+			await this.app.vault.adapter.mkdir(checkpointDir);
+		} catch { return; }
+		for (const seg of segments) {
+			const filename = String(seg.index).padStart(6, "0") + ".ndjson";
+			try {
+				await this.app.vault.adapter.write(`${checkpointDir}/${filename}`, seg.content);
+			} catch {
+				tracker.markDirty("__checkpoint_write_failed__", "disk-write");
+			}
+		}
 	}
 
 	private _startDeviceWitnessTracker(mode: FlightMode): void {
