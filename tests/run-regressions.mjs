@@ -86,6 +86,17 @@ const suites = [
 	[JITI, "tests/device-witness-tracker.ts"],
 	[JITI, "tests/device-witness-tracker-lifecycle.ts"],
 	[JITI, "tests/device-witness-qa-api.ts"],
+	// Phase 2 verification gates
+	[JITI, "tests/witness-schema.ts"],
+	[JITI, "tests/witness-hash-normalization.ts"],
+	[JITI, "tests/witness-checkpoint-isolation.ts"],
+	[JITI, "tests/witness-checkpoint-rotation.ts"],
+	[JITI, "tests/witness-analyzer-purity.ts"],
+	[JITI, "tests/witness-readonly-spy.ts"],
+	[JITI, "tests/witness-mobile-background.ts"],
+	[JITI, "tests/witness-checkpoint-offline.ts"],
+	[JITI, "tests/witness-quorum-eventually.ts"],
+	[JITI, "tests/witness-s11b-semantics.ts"],
 ];
 
 let totalPassed = 0;
