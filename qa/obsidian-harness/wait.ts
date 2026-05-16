@@ -196,3 +196,33 @@ export function witnessDeviceSettled(
 ): Promise<void> {
 	return yaos.witnessDeviceSettled(path, options);
 }
+
+// -----------------------------------------------------------------------
+// Phase 2 cross-device primitives (re-exported from witness-primitives.ts)
+// -----------------------------------------------------------------------
+
+export {
+	witnessQuorum,
+	witnessQuorumEventually,
+	noStaleHashAfterNewerWitness,
+	noRecoveryEmittedOldHash,
+	editorStableDuring,
+	crossDeviceHashesEqual,
+	witnessCheckpointReader,
+} from "./witness-primitives";
+
+export type {
+	DeviceHandle,
+	DeviceId,
+	QuorumPolicy,
+	QuorumResult,
+	QuorumSuccess,
+	QuorumFailure,
+	AnalyzerResult,
+	Evidence,
+	WitnessQuorumOptions,
+	WitnessQuorumEventuallyResult,
+	NegativeWindowOptions,
+	CrossDeviceHashesEqualOptions,
+	CheckpointReadResult,
+} from "./witness-primitives";
