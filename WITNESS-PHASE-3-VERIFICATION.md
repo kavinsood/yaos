@@ -12,9 +12,13 @@ Phase 3 adds QA-only collection, export, and offline-analysis capabilities:
 ### Source changes
 - `src/debug/flightEvents.ts` — taxonomy v7→8, new `qa.scenario.step` FlightKind
 - `src/diagnostics/deviceWitnessTracker.ts` — Phase 3 state: `_scenarioRunId`, `_scenarioId`, `_scenarioStepIndex`, `_scenarioStepLabel`; new methods: `setScenarioRunId`, `advanceScenarioStep`, `getScenarioStepState`; optional fields on emitted events: `scenarioStepIndex`, `scenarioStepLabel`, `scenarioRunId`, `scenarioId`
-- `src/qaDebugApi.ts` — new methods: `__qaOnlySetScenarioRunIdUnsafe`, `__qaOnlyAdvanceScenarioStepUnsafe`
+- `src/qaDebugApi.ts` — new methods: `__qaOnlySetScenarioRunIdUnsafe`, `__qaOnlyAdvanceScenarioStepUnsafe`; `qa.scenario.step` event carries `monotonicMs` (per-device)
 - `src/commands.ts` — Phase 3 QA commands: `YAOS QA: Export witness bundle`, `YAOS QA: Export witness bundle (unsafe local debug)`, `YAOS QA: Show device identity for QA`, `YAOS QA: Set scenario run ID`, `YAOS QA: Advance scenario step`
-- `src/main.ts` — Phase 3 command handlers: `_qaExportWitnessBundle`, `_qaShowDeviceIdentity`, `_qaSetScenarioRunId`, `_qaAdvanceScenarioStep`, `_persistCheckpointSegmentsIfSafe`, `_buildBundleHeader`, `_buildBundleString`
+- `src/main.ts` — Phase 3 command handlers: `_qaExportWitnessBundle`, `_qaShowDeviceIdentity`, `_qaSetScenarioRunId`, `_qaAdvanceScenarioStep`, `_persistCheckpointSegmentsIfSafe`, `_buildBundleHeader`, `_buildBundleString`; absolute bundle path in Notice; vault-root fail-closed
+- `qa/analyzers/rules/quorum-incomplete.ts` — accepts both `stepIndex` (legacy) and `scenarioStepIndex` (Phase 3) as deadline mechanism (Req 10.5)
+- `qa/scripts/analyze-bundles.ts` — uses earliest `createdAt` across accepted bundles for default output path (Req 5.4)
+- `package.json` — `qa:analyze-bundles` script; extended `guard:checkpoint-path` to also check `main.ts` bundle export (Req 15.5)
+- `engineering/multi-device-witness-runbook.md` — refreshed with all Req 6 criteria including manual-vs-CDP section (Req 6.7)
 
 ### New files
 - `qa/analyzers/rules/convergence-evidence.ts` — `analyzeConvergenceEvidence` positive-evidence rule
@@ -73,12 +77,12 @@ These failures predate Layer 4 and are unrelated to witness/Phase 3 changes.
 ## D5 — Static Guard Output
 
 ```
-npm run guard:witness-readonly   → PASS
-npm run guard:checkpoint-path    → PASS
-npm run guard:no-vault-doc-diagnostics → PASS
+npm run guard:witness-readonly   → PASS: no forbidden calls in deviceWitnessTracker.ts
+npm run guard:checkpoint-path    → PASS: checkpoint and bundle export paths do not write to vault root
+npm run guard:no-vault-doc-diagnostics → PASS: no vault doc diagnostics map found
 ```
 
-All three guards pass. Phase 3 adds no vault writes to `deviceWitnessTracker.ts`.
+All three guards pass. Phase 3 extends `guard:checkpoint-path` to also verify `main.ts` bundle export checks `isInsideVault` (Requirement 15.5).
 
 ## D6 — Acceptance Proof
 
