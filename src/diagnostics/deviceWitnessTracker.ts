@@ -1,5 +1,5 @@
 /**
- * DeviceWitnessTracker — Layer 4 Phase 1
+ * DeviceWitnessTracker — Layer 4 Phase 1 + Phase 2
  *
  * A strictly read-only diagnostics module that emits `device.witness.settled`
  * and `device.witness.diverged` flight events after observing that a device's
@@ -14,15 +14,28 @@
  *   INV-SAFETY-02: no self-write round-trip
  *
  * Hash construction: session-salted SHA-256 pseudonym (not HMAC).
- *   SHA-256(secret || "\0yaos-state-v1\0" || content)
+ *   SHA-256(secret || "\0yaos-state-v1\0" || normalizedContent)
+ * Normalization: Unicode NFC then \n line endings (Requirement 4.1).
  * Domain separator is intentionally distinct from PathIdentityResolver's "\0"
  * so path pseudonyms and content pseudonyms never share an input domain.
  * For qa-safe mode the shared qaTraceSecret is used so two devices in the
  * same QA run produce comparable hashes.
+ *
+ * Phase 2 additions:
+ *   - causedByEvents seq linkage on every emitted witness event (Req 12)
+ *   - runtimeState field on every emitted witness event (Req 19)
+ *   - mobile-background guard: emits unavailable instead of settled/diverged (Req 19)
+ *   - recoveryStateHash precision path for recovery_emitted_old_hash (Req 11)
+ *   - checkpoint NDJSON export while flight trace active (Req 22-25)
+ *   - Three new DivergenceReasons: checkpoint_write_failed, unavailable, checkpoint_path_inside_vault
  */
 
 import { FLIGHT_KIND } from "../debug/flightEvents";
 import type { FlightSink, TraceContext } from "../debug/flightEvents";
+import {
+	computeWitnessStateHash as _computeWitnessStateHash,
+	computeDeletedWitnessStateHash,
+} from "./witnessStateHash";
 
 // -----------------------------------------------------------------------
 // Public types
@@ -51,7 +64,24 @@ export type DivergenceReason =
 	| "read_failed"
 	| "hash_failed"
 	| "editor_unhealthy"
-	| "missing_file_id";
+	| "missing_file_id"
+	// Phase 2 additive entries (Requirement 1.2):
+	| "checkpoint_write_failed"
+	| "unavailable"
+	| "checkpoint_path_inside_vault";
+
+/** Phase 2: runtime state for mobile-background detection (Requirement 19). */
+export type RuntimeState = "foreground" | "background" | "suspended" | "unknown";
+
+/** Phase 2: causedByEvents seq linkage (Requirement 12). */
+export interface CausedByEvents {
+	lastDiskWriteSeq?: number;
+	lastCrdtUpdateSeq?: number;
+	lastRecoverySeq?: number;
+	lastRemoteApplySeq?: number;
+	lastConflictArtifactSeq?: number;
+	lastTombstoneSeq?: number;
+}
 
 export interface FileObservation {
 	crdtHash: string | undefined;
@@ -108,6 +138,20 @@ export interface WitnessTrackerConfig {
 	maxHistoryPerFile?: number;
 	/** Max suppression set size. Default: 5000 */
 	maxSuppressedEntries?: number;
+	/**
+	 * Phase 2: Resolve a salted pathId for a raw path.
+	 * Used to include pathId in checkpoint lines without raw path leakage.
+	 * If not provided, pathId is omitted from checkpoint lines.
+	 */
+	getPathId?(path: string): Promise<string | null>;
+	/**
+	 * Phase 2: Max checkpoint segment size in bytes before rotation. Default: 10MB.
+	 */
+	checkpointSegmentMaxBytes?: number;
+	/**
+	 * Phase 2: Max retained segments per (traceId, deviceId). Default: 5.
+	 */
+	checkpointMaxSegments?: number;
 }
 
 // -----------------------------------------------------------------------
@@ -149,6 +193,15 @@ interface PendingObservation {
 	lastRemoteApplyAt?: number;
 	lastDiskWriteAt?: number;
 	lastRecoveryAt?: number;
+	// Phase 2: causedByEvents seq tracking (Requirement 12)
+	lastDiskWriteSeq?: number;
+	lastCrdtUpdateSeq?: number;
+	lastRecoverySeq?: number;
+	lastRemoteApplySeq?: number;
+	lastConflictArtifactSeq?: number;
+	lastTombstoneSeq?: number;
+	// Phase 2: seq at which the stability window opened (for causedByEvents scoping)
+	windowOpenSeq: number;
 }
 
 interface WitnessRecord {
@@ -157,33 +210,15 @@ interface WitnessRecord {
 }
 
 // -----------------------------------------------------------------------
-// Hash construction — session-salted SHA-256 pseudonym (not HMAC)
+// Hash construction — delegated to shared witnessStateHash module (Phase 2 Req 10.3)
 // -----------------------------------------------------------------------
 
-const STATE_DOMAIN_SEP = "\0yaos-state-v1\0";
-
 async function computeStateHash(secret: string, content: string): Promise<string | null> {
-	try {
-		const input = `${secret}${STATE_DOMAIN_SEP}${content}`;
-		const bytes = new TextEncoder().encode(input);
-		const digest = await globalThis.crypto.subtle.digest("SHA-256", bytes);
-		const hex = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
-		return `h:${hex.slice(0, 32)}`;
-	} catch {
-		return null;
-	}
+	return _computeWitnessStateHash(secret, content);
 }
 
 async function computeDeletedStateHash(secret: string, fileId: string): Promise<string | null> {
-	try {
-		const input = `${secret}${STATE_DOMAIN_SEP}deleted\0${fileId}`;
-		const bytes = new TextEncoder().encode(input);
-		const digest = await globalThis.crypto.subtle.digest("SHA-256", bytes);
-		const hex = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
-		return `h:${hex.slice(0, 32)}`;
-	} catch {
-		return null;
-	}
+	return computeDeletedWitnessStateHash(secret, fileId);
 }
 
 // -----------------------------------------------------------------------
@@ -219,6 +254,15 @@ export class DeviceWitnessTracker {
 	/** Monotonically increasing local seq counter. */
 	private localSeq = 0;
 
+	// Phase 2: in-memory checkpoint segments (no filesystem — avoids vault-root issues)
+	private readonly checkpointSegmentMaxBytes: number;
+	private readonly checkpointMaxSegments: number;
+	private checkpointSegmentIndex = 1;
+	private checkpointSegmentSize = 0;
+	private checkpointWriteFailedAt = 0;
+	/** In-memory checkpoint segments: segmentIndex → NDJSON string */
+	private checkpointSegments = new Map<number, string>();
+
 	constructor(private readonly config: WitnessTrackerConfig) {
 		this.stableAfterMs = config.stableAfterMs ?? (config.platform === "mobile" ? 4000 : 2000);
 		this.editorSettleGraceMs = config.editorSettleGraceMs ?? 750;
@@ -229,6 +273,8 @@ export class DeviceWitnessTracker {
 		this.maxWitnessBufferEvents = config.maxWitnessBufferEvents ?? 1000;
 		this.maxHistoryPerFile = config.maxHistoryPerFile ?? 20;
 		this.maxSuppressedEntries = config.maxSuppressedEntries ?? 5000;
+		this.checkpointSegmentMaxBytes = config.checkpointSegmentMaxBytes ?? 10 * 1024 * 1024;
+		this.checkpointMaxSegments = config.checkpointMaxSegments ?? 5;
 	}
 
 	// -----------------------------------------------------------------------
@@ -243,6 +289,47 @@ export class DeviceWitnessTracker {
 		if (this.disposed) return;
 		try {
 			this._markDirty(path, originClass);
+		} catch { /* fail-open */ }
+	}
+
+	/**
+	 * Phase 2: Notify the tracker of a precursor event seq for causedByEvents linkage.
+	 * Call this when a relevant flight event is emitted for a path.
+	 * Safe to call from any sync path — never throws.
+	 */
+	notifyPrecursorEvent(
+		path: string,
+		kind: "disk-write" | "crdt-update" | "recovery" | "remote-apply" | "conflict-artifact" | "tombstone",
+		seq: number,
+	): void {
+		if (this.disposed) return;
+		try {
+			const obs = this.pending.get(path);
+			if (!obs) return;
+			switch (kind) {
+				case "disk-write": obs.lastDiskWriteSeq = seq; break;
+				case "crdt-update": obs.lastCrdtUpdateSeq = seq; break;
+				case "recovery": obs.lastRecoverySeq = seq; break;
+				case "remote-apply": obs.lastRemoteApplySeq = seq; break;
+				case "conflict-artifact": obs.lastConflictArtifactSeq = seq; break;
+				case "tombstone": obs.lastTombstoneSeq = seq; break;
+			}
+		} catch { /* fail-open */ }
+	}
+
+	/**
+	 * Phase 2: Handle a recovery.decision event with recoveryStateHash for precision path.
+	 * Requirement 11: immediate detection of stale-recovery emission.
+	 * recoverySeq is unused — causedByEvents.lastRecoverySeq is populated by
+	 * notifyPrecursorEvent when the flight recorder seq is available.
+	 */
+	handleRecoveryDecision(path: string, recoveryStateHash: string | undefined): void {
+		if (this.disposed) return;
+		if (!recoveryStateHash) return;
+		// Req 11.4: only accept values with the witness-domain prefix "h:"
+		if (!recoveryStateHash.startsWith("h:")) return;
+		try {
+			this._handleRecoveryDecisionPrecisionPath(path, recoveryStateHash);
 		} catch { /* fail-open */ }
 	}
 
@@ -282,6 +369,40 @@ export class DeviceWitnessTracker {
 		return h;
 	}
 
+	/**
+	 * Phase 2 QA: Clear suppression for a path so the next markDirty re-emits
+	 * a settled event even if the content hasn't changed.
+	 * Use this before triggering a dirty event in witnessQuorum setup.
+	 */
+	clearSuppressionForPath(path: string): void {
+		if (this.disposed) return;
+		const fileId = this.config.getFileId(path);
+		if (!fileId) return;
+		for (const stateKind of ["present", "deleted"] as const) {
+			const histKey = `${fileId}|${stateKind}`;
+			const latest = this.latestSettled.get(histKey);
+			if (latest) {
+				const suppressKey = `${this.sessionId}|${fileId}|${stateKind}|${latest.stateHash}`;
+				this.suppressed.delete(suppressKey);
+			}
+		}
+	}
+
+	/** Phase 2: Get current runtime state for mobile-background detection. */
+	getRuntimeState(): RuntimeState {
+		return this._getRuntimeState();
+	}
+
+	/**
+	 * Phase 2: Read in-memory checkpoint segments for QA API export.
+	 * Returns segments sorted by index. Each segment is a NDJSON string.
+	 */
+	getCheckpointSegments(): Array<{ index: number; content: string }> {
+		return [...this.checkpointSegments.entries()]
+			.sort((a, b) => a[0] - b[0])
+			.map(([index, content]) => ({ index, content }));
+	}
+
 	/** Dispose: cancel all timers, clear all state. Terminal — markDirty is a no-op after this. */
 	dispose(): void {
 		this.disposed = true;
@@ -295,6 +416,7 @@ export class DeviceWitnessTracker {
 		this.witnessHistory.clear();
 		this.latestSettled.clear();
 		this.witnessBuffer = [];
+		// Keep checkpoint segments after dispose — they are read-only artifacts
 	}
 
 	// -----------------------------------------------------------------------
@@ -326,6 +448,7 @@ export class DeviceWitnessTracker {
 				pendingFileIdTimer: null,
 				settlingTimer: null,
 				lastDirtyAt: now,
+				windowOpenSeq: this.localSeq,
 			};
 			this._updateTimestamps(obs, originClass, now);
 
@@ -392,8 +515,15 @@ export class DeviceWitnessTracker {
 
 	private async _evaluateWithFileId(path: string, obs: PendingObservation): Promise<void> {
 		const fileId = obs.fileId!;
+
+		// Phase 2: mobile-background guard (Requirement 19)
+		const runtimeState = this._getRuntimeState();
+		const isUnavailable = runtimeState !== "foreground";
+
 		const observation = await this._observeNow(path);
 		const { crdtHash, diskHash, editorHash, editorSampleKind, stateKind } = observation;
+
+		const causedByEvents = this._buildCausedByEvents(obs);
 
 		const commonData: Record<string, unknown> = {
 			stateKind,
@@ -401,11 +531,22 @@ export class DeviceWitnessTracker {
 			fileOpen: observation.fileOpen,
 			originClass: obs.originClass,
 			stableAfterMs: this.stableAfterMs,
+			runtimeState,
+			causedByEvents,
 		};
 		if (obs.lastLocalEditAt !== undefined) commonData.lastLocalEditAt = obs.lastLocalEditAt;
 		if (obs.lastRemoteApplyAt !== undefined) commonData.lastRemoteApplyAt = obs.lastRemoteApplyAt;
 		if (obs.lastDiskWriteAt !== undefined) commonData.lastDiskWriteAt = obs.lastDiskWriteAt;
 		if (obs.lastRecoveryAt !== undefined) commonData.lastRecoveryAt = obs.lastRecoveryAt;
+
+		// Phase 2: if unavailable, emit unavailable divergence instead of normal evaluation
+		if (isUnavailable) {
+			await this._emitDiverged(path, fileId, "unavailable", {
+				...commonData,
+				suppressedReason: "unavailable",
+			});
+			return;
+		}
 
 		// hash_failed / read_failed for CRDT.
 		if (crdtHash === undefined && stateKind === "present") {
@@ -528,6 +669,9 @@ export class DeviceWitnessTracker {
 
 		// Add to buffer (with cap).
 		this._pushBuffer({ kind: "settled", path, seq, data });
+
+		// Phase 2: checkpoint write — fire-and-forget, never blocks witness emission (B4)
+		void this._appendCheckpoint({ kind: "settled", path, seq, data });
 
 		try {
 			await this.config.sink.recordPath({
@@ -654,6 +798,8 @@ export class DeviceWitnessTracker {
 	): Promise<void> {
 		const seq = ++this.localSeq;
 		this._pushBuffer({ kind: "diverged", path, seq, data: { ...data, reason } });
+		// Phase 2: checkpoint write — fire-and-forget, never blocks witness emission (B4)
+		void this._appendCheckpoint({ kind: "diverged", path, seq, data: { ...data, reason } });
 		try {
 			await this.config.sink.recordPath({
 				kind: FLIGHT_KIND.deviceWitnessDiverged,
@@ -706,5 +852,204 @@ export class DeviceWitnessTracker {
 		if (!path.endsWith(".md")) return false;
 		if (path.startsWith(".obsidian/")) return false;
 		return true;
+	}
+
+	// -----------------------------------------------------------------------
+	// Phase 2: runtime state (Requirement 19)
+	// -----------------------------------------------------------------------
+
+	private _getRuntimeState(): RuntimeState {
+		if (this.config.platform === "mobile") {
+			try {
+				if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+					return "background";
+				}
+			} catch {
+				return "unknown";
+			}
+		}
+		return "foreground";
+	}
+
+	// -----------------------------------------------------------------------
+	// Phase 2: causedByEvents (Requirement 12)
+	// -----------------------------------------------------------------------
+
+	private _buildCausedByEvents(obs: PendingObservation): CausedByEvents {
+		const result: CausedByEvents = {};
+		if (obs.lastDiskWriteSeq !== undefined && obs.lastDiskWriteSeq > obs.windowOpenSeq) {
+			result.lastDiskWriteSeq = obs.lastDiskWriteSeq;
+		}
+		if (obs.lastCrdtUpdateSeq !== undefined && obs.lastCrdtUpdateSeq > obs.windowOpenSeq) {
+			result.lastCrdtUpdateSeq = obs.lastCrdtUpdateSeq;
+		}
+		if (obs.lastRecoverySeq !== undefined && obs.lastRecoverySeq > obs.windowOpenSeq) {
+			result.lastRecoverySeq = obs.lastRecoverySeq;
+		}
+		if (obs.lastRemoteApplySeq !== undefined && obs.lastRemoteApplySeq > obs.windowOpenSeq) {
+			result.lastRemoteApplySeq = obs.lastRemoteApplySeq;
+		}
+		if (obs.lastConflictArtifactSeq !== undefined && obs.lastConflictArtifactSeq > obs.windowOpenSeq) {
+			result.lastConflictArtifactSeq = obs.lastConflictArtifactSeq;
+		}
+		if (obs.lastTombstoneSeq !== undefined && obs.lastTombstoneSeq > obs.windowOpenSeq) {
+			result.lastTombstoneSeq = obs.lastTombstoneSeq;
+		}
+		return result;
+	}
+
+	// -----------------------------------------------------------------------
+	// Phase 2: recoveryStateHash precision path (Requirement 11)
+	// -----------------------------------------------------------------------
+
+	private _handleRecoveryDecisionPrecisionPath(
+		path: string,
+		recoveryStateHash: string,
+	): void {
+		if (!this._isMarkdownPath(path)) return;
+		const fileId = this.config.getFileId(path);
+		if (!fileId) return;
+
+		// Check both present and deleted stateKinds
+		for (const stateKind of ["present", "deleted"] as const) {
+			const histKey = `${fileId}|${stateKind}`;
+			const latest = this.latestSettled.get(histKey);
+			if (!latest) continue;
+
+			const history = this.witnessHistory.get(histKey) ?? [];
+			// Find a prior settled record with this hash that is strictly older than latest
+			const priorEntry = history.find(
+				(r) => r.stateHash === recoveryStateHash && r.seq < latest.seq,
+			);
+			if (!priorEntry) continue;
+
+			// Precision path: emit recovery_emitted_old_hash immediately.
+			// causedByEvents is empty here — notifyPrecursorEvent populates lastRecoverySeq
+			// when the flight recorder seq is available (B11: no magic 0).
+			const runtimeState = this._getRuntimeState();
+			const causedByEvents: CausedByEvents = {};
+			const data: Record<string, unknown> = {
+				stateKind,
+				originClass: "recovery",
+				stableAfterMs: this.stableAfterMs,
+				runtimeState,
+				causedByEvents,
+				recoveryStateHash,
+				priorLatestStateHash: latest.stateHash,
+				priorLatestSeq: latest.seq,
+				precisionPath: true,
+			};
+			const seq = ++this.localSeq;
+			this._pushBuffer({ kind: "diverged", path, seq, data: { ...data, reason: "recovery_emitted_old_hash" } });
+			void this._appendCheckpoint({ kind: "diverged", path, seq, data: { ...data, reason: "recovery_emitted_old_hash" } });
+			try {
+				void this.config.sink.recordPath({
+					kind: FLIGHT_KIND.deviceWitnessDiverged,
+					scope: "file",
+					source: "deviceWitness",
+					layer: "diagnostics",
+					priority: "important",
+					severity: "warn",
+					decision: "diverged",
+					reason: "recovery_emitted_old_hash",
+					opId: `witness-${seq}`,
+					fileId,
+					path,
+					data,
+				});
+			} catch { /* fail-open */ }
+			return; // only emit once per decision
+		}
+	}
+
+	// -----------------------------------------------------------------------
+	// Phase 2: in-memory checkpoint segments (Requirements 22-25)
+	//
+	// Checkpoint segments are stored in-memory (not on filesystem) to avoid
+	// vault-root path issues. The QA API reads them via getCheckpointSegments().
+	// This is the correct approach for Phase 2: no filesystem dependency,
+	// no vault.adapter with absolute paths, no fail-closed path guard needed.
+	// -----------------------------------------------------------------------
+
+	private async _appendCheckpoint(entry: WitnessBufferEntry): Promise<void> {
+		if (this.disposed) return;
+		try {
+			// Resolve pathId before writing — no async patching after the fact (Fix 2)
+			const fileId = this.config.getFileId(entry.path);
+			let pathId: string | null = null;
+			if (this.config.getPathId && entry.path) {
+				try {
+					pathId = await this.config.getPathId(entry.path);
+				} catch { /* best-effort */ }
+			}
+
+			// Write header if this is a new segment (size === 0)
+			if (this.checkpointSegmentSize === 0) {
+				const header = JSON.stringify({
+					kind: "checkpoint.segment.header",
+					traceId: this.config.traceContext.traceId,
+					deviceId: this.config.traceContext.deviceId,
+					segmentIndex: this.checkpointSegmentIndex,
+					firstSeq: entry.seq,
+				}) + "\n";
+				const existing = this.checkpointSegments.get(this.checkpointSegmentIndex) ?? "";
+				this.checkpointSegments.set(this.checkpointSegmentIndex, existing + header);
+				this.checkpointSegmentSize += header.length;
+			}
+
+			// Build line once with all fields resolved — no patching later
+			const lineObj: Record<string, unknown> = {
+				kind: entry.kind === "settled" ? "device.witness.settled" : "device.witness.diverged",
+				seq: entry.seq,
+				fileId: fileId ?? null,
+				data: entry.data,
+			};
+			if (pathId) lineObj.pathId = pathId;
+			const line = JSON.stringify(lineObj) + "\n";
+
+			const existing = this.checkpointSegments.get(this.checkpointSegmentIndex) ?? "";
+			this.checkpointSegments.set(this.checkpointSegmentIndex, existing + line);
+			this.checkpointSegmentSize += line.length;
+
+			// Rotate if over size limit
+			if (this.checkpointSegmentSize >= this.checkpointSegmentMaxBytes) {
+				this._rotateCheckpointSegment();
+			}
+		} catch {
+			this._emitCheckpointWriteFailed();
+		}
+	}
+
+	private _rotateCheckpointSegment(): void {
+		this.checkpointSegmentIndex++;
+		this.checkpointSegmentSize = 0;
+		// Delete oldest segment if over max
+		const oldestIndex = this.checkpointSegmentIndex - this.checkpointMaxSegments;
+		if (oldestIndex >= 1) {
+			this.checkpointSegments.delete(oldestIndex);
+		}
+	}
+
+	private _emitCheckpointWriteFailed(): void {
+		if (this.disposed) return;
+		const now = Date.now();
+		if (now - this.checkpointWriteFailedAt < 60_000) return;
+		this.checkpointWriteFailedAt = now;
+		const seq = ++this.localSeq;
+		this._pushBuffer({ kind: "diverged", path: "", seq, data: { reason: "checkpoint_write_failed" } });
+		try {
+			this.config.sink.record({
+				kind: FLIGHT_KIND.deviceWitnessDiverged,
+				scope: "diagnostics",
+				source: "deviceWitness",
+				layer: "diagnostics",
+				priority: "important",
+				severity: "warn",
+				decision: "diverged",
+				reason: "checkpoint_write_failed",
+				opId: `witness-${seq}`,
+				data: { reason: "checkpoint_write_failed" },
+			});
+		} catch { /* fail-open */ }
 	}
 }
