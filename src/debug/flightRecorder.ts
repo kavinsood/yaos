@@ -229,6 +229,11 @@ export class FlightRecorder {
 		return ++this.seq;
 	}
 
+	/** Current seq (last assigned). Does not increment. */
+	get currentSeq(): number {
+		return this.seq;
+	}
+
 	record(event: FlightEventInput, options?: { reservedSeq?: number }): void {
 		// Token and qaTraceSecret are forbidden in ALL modes, not just safe.
 		if (event.data) {

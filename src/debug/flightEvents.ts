@@ -1,5 +1,5 @@
 export const FLIGHT_EVENT_SCHEMA_VERSION = 1;
-export const FLIGHT_TAXONOMY_VERSION = 6; // bumped: device.witness events (Layer 4 Phase 1)
+export const FLIGHT_TAXONOMY_VERSION = 7; // bumped: Phase 2 — recoveryStateHash on recovery.decision, causedByEvents + runtimeState on device.witness.*
 
 export type FlightSeverity = "debug" | "info" | "warn" | "error";
 export type FlightScope =

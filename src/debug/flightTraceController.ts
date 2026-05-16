@@ -83,6 +83,11 @@ export class FlightTraceController {
 		return this.recorder?.context ?? null;
 	}
 
+	/** Current seq counter (last assigned seq). Used for causedByEvents linkage. */
+	get currentSeq(): number {
+		return this.recorder?.currentSeq ?? 0;
+	}
+
 	/**
 	 * Start a trace. If called from the manual command, manualStart=true so
 	 * that refreshFromSettings() will not stop it on the next settings save.
@@ -202,6 +207,19 @@ export class FlightTraceController {
 		this.pendingPathPromises.add(p);
 		void p.finally(() => this.pendingPathPromises.delete(p));
 		return p;
+	}
+
+	/**
+	 * Reserve a seq and record a path-scoped event, returning the reserved seq.
+	 * Use this when the caller needs the seq for causedByEvents linkage.
+	 * The seq is reserved synchronously before any async work.
+	 */
+	reserveAndRecordPath(event: FlightPathEventInput): number {
+		const seq = this.recorder?.reserveSeq() ?? 0;
+		const p = this.resolveAndRecordWithSeq(event, seq);
+		this.pendingPathPromises.add(p);
+		void p.finally(() => this.pendingPathPromises.delete(p));
+		return seq;
 	}
 
 	/** @deprecated Use recordPath(). Kept for backward compatibility. */
@@ -356,6 +374,14 @@ export class FlightTraceController {
 		// Reserve seq synchronously so causal order is preserved regardless of
 		// async path identity resolution time.
 		const reservedSeq = this.recorder?.reserveSeq();
+		await this._resolveAndRecordCore(event, reservedSeq);
+	}
+
+	private async resolveAndRecordWithSeq(event: FlightPathEventInput, reservedSeq: number): Promise<void> {
+		await this._resolveAndRecordCore(event, reservedSeq);
+	}
+
+	private async _resolveAndRecordCore(event: FlightPathEventInput, reservedSeq: number | undefined): Promise<void> {
 		const identity = await this.getPathId(event.path);
 		const { path: _removedPath, ...rest } = event;
 		this.recorder?.record(
