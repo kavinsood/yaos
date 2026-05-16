@@ -118,6 +118,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private traceRuntime: TraceRuntimeController | null = null;
 	private flightTrace: FlightTraceController | null = null;
 	private deviceWitnessTracker: import("./diagnostics/deviceWitnessTracker").DeviceWitnessTracker | null = null;
+	/** SHA-256 hash of the active qaTraceSecret for cross-device identity verification. */
+	private _qaTraceSecretHash: string | null = null;
 	private statusBarEl: HTMLElement | null = null;
 	private statusInterval: ReturnType<typeof setInterval> | null = null;
 
@@ -187,6 +189,15 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			log: (message) => this.log(message),
 			recordFlightEvent: (event) => this.recordFlightEvent(event as import("./debug/flightEvents").FlightEventInput),
 			recordFlightPathEvent: (event) => this.recordFlightPathEvent(event),
+			computeRecoveryStateHash: async (path, content) => {
+				const tracker = this.deviceWitnessTracker;
+				if (!tracker) return null;
+				try {
+					return await tracker.computeWitnessStateHash(content);
+				} catch {
+					return null;
+				}
+			},
 		});
 		return this.reconciliationController;
 	}
@@ -1483,6 +1494,22 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		) {
 			this.deviceWitnessTracker?.markDirty(event.path, "recovery");
 		}
+
+		// Phase 2 Req 11 + Fix 4: precision path for recovery_emitted_old_hash.
+		// reserveAndRecordPath reserves seq synchronously and returns it — no currentSeq inference.
+		if (event.kind === "recovery.decision" && event.path.endsWith(".md")) {
+			const data = event.data as Record<string, unknown> | undefined;
+			const recoveryStateHash = data?.recoveryStateHash as string | undefined;
+			if (this.flightTrace) {
+				// Use reserveAndRecordPath to get the actual seq for this event
+				const recoverySeq = this.flightTrace.reserveAndRecordPath(event);
+				this.deviceWitnessTracker?.notifyPrecursorEvent(event.path, "recovery", recoverySeq);
+				this.deviceWitnessTracker?.handleRecoveryDecision(event.path, recoveryStateHash);
+			} else {
+				this.deviceWitnessTracker?.handleRecoveryDecision(event.path, recoveryStateHash);
+			}
+			return; // already recorded above
+		}
 	}
 
 	private scheduleTraceStateSnapshot(reason: string): void {
@@ -2014,6 +2041,16 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		await this.flightTrace?.start(resolved, this.settings.qaTraceSecret || null, {
 			manualStart: true,
 		});
+		// Compute SHA-256 of qaTraceSecret for cross-device identity verification (Fix 3)
+		const secret = this.settings.qaTraceSecret ?? "";
+		try {
+			const bytes = new TextEncoder().encode(`yaos-qa-trace-secret:${secret}`);
+			const digest = await globalThis.crypto.subtle.digest("SHA-256", bytes);
+			const hex = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+			this._qaTraceSecretHash = `sha256:${hex}`;
+		} catch {
+			this._qaTraceSecretHash = `len:${secret.length}`;
+		}
 		this._startDeviceWitnessTracker(resolved);
 		new Notice(`QA flight trace started (mode: ${resolved}).`, 4000);
 	}
@@ -2037,6 +2074,15 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			sink,
 			traceContext: ctx,
 			platform: "desktop",
+			// Fix 2: provide pathId resolver so checkpoint lines include pathId
+			getPathId: async (path) => {
+				try {
+					const result = await this.flightTrace?.getPathId(path);
+					return result?.pathId ?? null;
+				} catch {
+					return null;
+				}
+			},
 			readCrdtContent: (path) => {
 				const vs = this.vaultSync;
 				if (!vs) return null;
@@ -2299,6 +2345,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				);
 			},
 			getDeviceWitnessTracker: () => this.deviceWitnessTracker,
+			getQaTraceSecretHash: () => this._qaTraceSecretHash,
 		});
 		(window as unknown as Record<string, unknown>).__YAOS_DEBUG__ = api;
 		this.log("QA debug API mounted at window.__YAOS_DEBUG__");

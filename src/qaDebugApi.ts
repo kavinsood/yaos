@@ -192,6 +192,67 @@ export interface YaosQaDebugApi {
 	computeWitnessStateHash(content: string): Promise<string>;
 
 	/**
+	 * Phase 2: Get the stable local deviceId for this device.
+	 * Constant for the duration of the active flight trace session.
+	 */
+	getDeviceId(): string;
+
+	/**
+	 * Phase 2: Get active trace identity for cross-device trace verification.
+	 * Returns null if no trace is active.
+	 * qaTraceSecretHash is SHA-256("yaos-qa-trace-secret:" + qaTraceSecret).
+	 * hasQaTraceSecret is false when no qaTraceSecret is set.
+	 */
+	getActiveTraceInfo(): { traceId: string; qaTraceSecretHash: string; deviceId: string; hasQaTraceSecret: boolean } | null;
+
+	/**
+	 * Phase 2: Get the current runtime state for mobile-background detection.
+	 */
+	getRuntimeState(): "foreground" | "background" | "suspended" | "unknown";
+
+	/**
+	 * Phase 2: Read the in-memory witness buffer (for cross-device primitives).
+	 * Returns undefined if no tracker is active.
+	 */
+	getWitnessBuffer?(): ReadonlyArray<import("./diagnostics/deviceWitnessTracker").WitnessBufferEntry> | undefined;
+
+	/**
+	 * Phase 2: Current local witness seq (for seq-anchoring in cross-device primitives).
+	 */
+	currentWitnessSeq?(): number;
+
+	/**
+	 * Phase 2: Read witness checkpoint segments for a traceId through this device's
+	 * QA debug API. The desktop controller calls this once per device with that
+	 * device's handle — devices never read each other's filesystem (Requirement 26).
+	 */
+	readWitnessCheckpoint?(traceId: string): Promise<{
+		segments: Array<{ index: number; content: string }>;
+		deviceId: string;
+		status: "ok" | "tracker_inactive" | "trace_not_found";
+	}>;
+
+	/**
+	 * Phase 2: Export in-memory witness segments as a single NDJSON string.
+	 * Use this for manual mobile/desktop export when CDP is not available.
+	 * Returns null if no tracker is active or no segments exist.
+	 */
+	exportWitnessSegments?(traceId: string): string | null;
+
+	/**
+	 * QA-ONLY. Unsafe. Clear witness suppression for a path so the tracker
+	 * re-emits a settled event on the next markDirty even if content is unchanged.
+	 * Use before triggering dirty in witnessQuorum setup.
+	 */
+	__qaOnlyClearWitnessSuppressionUnsafe?(path: string): void;
+
+	/**
+	 * QA-ONLY. Unsafe. Trigger a witness dirty event for a path.
+	 * Use after clearing suppression to force re-evaluation.
+	 */
+	__qaOnlyTriggerWitnessDirtyUnsafe?(path: string): void;
+
+	/**
 	 * QA-ONLY. Unsafe.
 	 *
 	 * Sets an in-memory-only external edit policy override.
@@ -224,6 +285,8 @@ interface PluginHandle {
 	disconnectProvider(reason?: string): void;
 	connectProvider(reason?: string): void;
 	getDeviceWitnessTracker?(): import("./diagnostics/deviceWitnessTracker").DeviceWitnessTracker | null;
+	/** SHA-256 hash of the active qaTraceSecret, computed at trace start. */
+	getQaTraceSecretHash?(): string | null;
 }
 
 // -----------------------------------------------------------------------
@@ -546,8 +609,15 @@ export function buildQaDebugApi(plugin: PluginHandle): YaosQaDebugApi {
 		// -- Flight trace -------------------------------------------------------
 
 		async startFlightTrace(mode, secret): Promise<void> {
+			// If a secret is provided, update settings before starting the trace
+			if (secret) {
+				const p = plugin as unknown as { settings?: { qaTraceSecret?: string }; saveData?: (d: unknown) => Promise<void> };
+				if (p.settings) {
+					p.settings.qaTraceSecret = secret;
+					await p.saveData?.(p.settings);
+				}
+			}
 			await plugin.startQaFlightTrace(mode);
-			void secret; // secret is handled via settings for now
 		},
 
 		async stopFlightTrace(): Promise<void> {
@@ -663,6 +733,87 @@ export function buildQaDebugApi(plugin: PluginHandle): YaosQaDebugApi {
 			const tracker = plugin.getDeviceWitnessTracker?.();
 			if (!tracker) throw Object.assign(new Error("computeWitnessStateHash: no active flight trace"), { reason: "no_active_trace" });
 			return tracker.computeWitnessStateHash(content);
+		},
+
+		getDeviceId(): string {
+			// deviceId is the stable local UUID from the active flight trace context
+			const ftc = plugin.getFlightTraceController();
+			return ftc?.context?.deviceId ?? "unknown";
+		},
+
+		getActiveTraceInfo() {
+			const ftc = plugin.getFlightTraceController();
+			const ctx = ftc?.context;
+			if (!ctx) return null;
+			const qaTraceSecretHash = plugin.getQaTraceSecretHash?.();
+			if (!qaTraceSecretHash) {
+				return { traceId: ctx.traceId, qaTraceSecretHash: "", deviceId: ctx.deviceId, hasQaTraceSecret: false };
+			}
+			// hasQaTraceSecret: true if the hash is a real SHA-256 (starts with "sha256:"), not a fallback
+			const hasQaTraceSecret = qaTraceSecretHash.startsWith("sha256:");
+			return { traceId: ctx.traceId, qaTraceSecretHash, deviceId: ctx.deviceId, hasQaTraceSecret };
+		},
+
+		getRuntimeState(): "foreground" | "background" | "suspended" | "unknown" {
+			const tracker = plugin.getDeviceWitnessTracker?.();
+			if (!tracker) return "unknown";
+			return tracker.getRuntimeState();
+		},
+
+		getWitnessBuffer() {
+			return plugin.getDeviceWitnessTracker?.()?.getWitnessBuffer();
+		},
+
+		currentWitnessSeq() {
+			return plugin.getDeviceWitnessTracker?.()?.currentWitnessSeq() ?? 0;
+		},
+
+		__qaOnlyClearWitnessSuppressionUnsafe(path: string): void {
+			plugin.getDeviceWitnessTracker?.()?.clearSuppressionForPath(path);
+		},
+
+		__qaOnlyTriggerWitnessDirtyUnsafe(path: string): void {
+			plugin.getDeviceWitnessTracker?.()?.markDirty(path, "disk-write");
+		},
+
+		async readWitnessCheckpoint(traceId: string) {
+			const deviceId = api.getDeviceId();
+			const tracker = plugin.getDeviceWitnessTracker?.();
+			if (!tracker) {
+				return { segments: [], deviceId, status: "tracker_inactive" as const };
+			}
+			// Read from in-memory witness segment buffer (no filesystem)
+			const segments = tracker.getCheckpointSegments();
+			const filtered = segments.filter((seg) => {
+				const firstLine = seg.content.split("\n")[0];
+				if (!firstLine) return false;
+				try {
+					const header = JSON.parse(firstLine) as Record<string, unknown>;
+					return header.traceId === traceId;
+				} catch {
+					return false;
+				}
+			});
+			return {
+				segments: filtered,
+				deviceId,
+				status: filtered.length > 0 ? "ok" as const : "trace_not_found" as const,
+			};
+		},
+
+		exportWitnessSegments(traceId: string): string | null {
+			const tracker = plugin.getDeviceWitnessTracker?.();
+			if (!tracker) return null;
+			const segments = tracker.getCheckpointSegments().filter((seg) => {
+				const firstLine = seg.content.split("\n")[0];
+				if (!firstLine) return false;
+				try {
+					const header = JSON.parse(firstLine) as Record<string, unknown>;
+					return header.traceId === traceId;
+				} catch { return false; }
+			});
+			if (segments.length === 0) return null;
+			return segments.map((s) => s.content).join("");
 		},
 	};
 
