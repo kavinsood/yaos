@@ -29,8 +29,8 @@ export interface CommandsRuntimeHost {
 	qaExportWitnessBundle?(): Promise<void>;
 	qaExportWitnessBundleUnsafe?(): Promise<void>;
 	qaShowDeviceIdentity?(): void;
-	qaSetScenarioRunId?(): Promise<void>;
-	qaAdvanceScenarioStep?(): Promise<void>;
+	qaSetScenarioRunId?(): void;
+	qaAdvanceScenarioStep?(): void;
 }
 
 export function registerCommands(

@@ -1,4 +1,4 @@
-import { MarkdownView, Notice, Plugin, TFile, arrayBufferToHex } from "obsidian";
+import { MarkdownView, Modal, Notice, Plugin, TFile, arrayBufferToHex } from "obsidian";
 import {
 	DEFAULT_SETTINGS,
 	VaultSyncSettingTab,
@@ -2146,17 +2146,26 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	}
 
 	private _showBundleModal(bundleStr: string): void {
-		// Inline modal with a <textarea> — selectable on mobile when clipboard is unavailable
-		const { Modal } = require("obsidian") as typeof import("obsidian");
+		const tracker = this.deviceWitnessTracker;
+		const scenarioState = tracker?.getScenarioStepState();
+		const segments = tracker?.getCheckpointSegments() ?? [];
+		const eventCount = segments.reduce((n, s) => n + s.content.split("\n").filter((l) => {
+			if (!l.trim()) return false;
+			try { return (JSON.parse(l) as Record<string, unknown>).kind !== "checkpoint.segment.header"; } catch { return false; }
+		}).length, 0);
 		const modal = new Modal(this.app);
-		modal.titleEl.setText("Witness Bundle — copy this text");
+		modal.titleEl.setText("YAOS QA: Witness Bundle");
+		const info = modal.contentEl.createEl("div", { attr: { style: "font-size:11px;font-family:monospace;background:var(--background-secondary);padding:8px;border-radius:4px;margin-bottom:8px;" } });
+		info.createEl("div", { text: `deviceId: ${this.flightTrace?.context?.deviceId ?? "unknown"}` });
+		info.createEl("div", { text: `scenarioRunId: ${scenarioState?.scenarioRunId ?? "(not set)"}` });
+		info.createEl("div", { text: `scenarioId: ${scenarioState?.scenarioId ?? "(not set)"}` });
+		info.createEl("div", { text: `events: ${eventCount}  |  privacyMode: safe` });
 		const ta = modal.contentEl.createEl("textarea", {
-			attr: { rows: "20", style: "width:100%;font-size:10px;font-family:monospace;white-space:pre;" },
+			attr: { rows: "18", style: "width:100%;font-size:9px;font-family:monospace;white-space:pre;" },
 		});
 		ta.value = bundleStr;
-		modal.contentEl.createEl("p", { text: "Select all and copy, then share the text to your analysis machine.", attr: { style: "font-size:12px;color:var(--text-muted);" } });
+		modal.contentEl.createEl("p", { text: "Select all → copy → share to your analysis machine.", attr: { style: "font-size:11px;color:var(--text-muted);margin-top:6px;" } });
 		modal.open();
-		// Auto-select for convenience
 		setTimeout(() => { ta.select(); }, 50);
 	}
 
@@ -2197,36 +2206,65 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		navigator.clipboard.writeText(fullPayload).catch(() => { /* best-effort */ });
 	}
 
-	private async _qaSetScenarioRunId(): Promise<void> {
+	private _qaSetScenarioRunId(): void {
 		if (!this.settings.qaDebugMode) return;
 		const tracker = this.deviceWitnessTracker;
 		if (!tracker) {
 			new Notice("No active flight trace. Start a trace first.", 5000);
 			return;
 		}
-		// Simple prompt via Notice + console — no Modal dependency needed for QA tooling
-		const runId = prompt("Enter scenarioRunId (UUID or kebab-case label):");
-		if (!runId?.trim()) { new Notice("Cancelled.", 3000); return; }
-		const scenarioId = prompt("Enter scenarioId:");
-		if (!scenarioId?.trim()) { new Notice("Cancelled.", 3000); return; }
-		tracker.setScenarioRunId(runId.trim(), scenarioId.trim());
-		new Notice(`Scenario run ID set: ${runId.trim()} / ${scenarioId.trim()}`, 5000);
+		const modal = new Modal(this.app);
+		modal.titleEl.setText("YAOS QA: Set Scenario Run ID");
+		const addField = (label: string, placeholder: string): HTMLInputElement => {
+			modal.contentEl.createEl("label", { text: label, attr: { style: "display:block;font-size:12px;margin-top:10px;margin-bottom:2px;" } });
+			return modal.contentEl.createEl("input", { attr: { type: "text", placeholder, style: "width:100%;padding:4px;font-size:13px;" } });
+		};
+		const runIdInput = addField("scenarioRunId (shared across all devices)", "e.g. s12a-run-2026-05-19");
+		const scenarioIdInput = addField("scenarioId", "e.g. s12a-three-device-passive-quorum");
+		const btn = modal.contentEl.createEl("button", { text: "Set", attr: { style: "margin-top:14px;padding:6px 16px;" } });
+		btn.addEventListener("click", () => {
+			const runId = runIdInput.value.trim();
+			const scenarioId = scenarioIdInput.value.trim();
+			if (!runId || !scenarioId) { new Notice("Both fields are required.", 3000); return; }
+			tracker.setScenarioRunId(runId, scenarioId);
+			new Notice(`Scenario run ID set: ${runId} / ${scenarioId}`, 5000);
+			modal.close();
+		});
+		modal.open();
+		setTimeout(() => { runIdInput.focus(); }, 50);
 	}
 
-	private async _qaAdvanceScenarioStep(): Promise<void> {
+	private _qaAdvanceScenarioStep(): void {
 		if (!this.settings.qaDebugMode) return;
 		const api = (window as unknown as Record<string, unknown>).__YAOS_DEBUG__ as import("./qaDebugApi").YaosQaDebugApi | undefined;
 		if (!api) {
 			new Notice("QA debug API not mounted. Enable qaDebugMode and start a trace.", 5000);
 			return;
 		}
-		const stepStr = prompt("Enter scenarioStepIndex (non-negative integer):");
-		if (stepStr === null) { new Notice("Cancelled.", 3000); return; }
-		const stepIndex = parseInt(stepStr, 10);
-		if (isNaN(stepIndex)) { new Notice("Invalid step index.", 4000); return; }
-		const label = prompt("Enter step label (optional, press OK to skip):") ?? undefined;
-		api.__qaOnlyAdvanceScenarioStepUnsafe?.(stepIndex, label?.trim() || undefined);
-		new Notice(`Scenario step advanced to ${stepIndex}${label ? ` (${label})` : ""}`, 4000);
+		const tracker = this.deviceWitnessTracker;
+		const currentStep = tracker?.getScenarioStepState().stepIndex ?? null;
+		const modal = new Modal(this.app);
+		modal.titleEl.setText("YAOS QA: Advance Scenario Step");
+		if (currentStep !== null) {
+			modal.contentEl.createEl("p", { text: `Current step: ${currentStep}`, attr: { style: "font-size:12px;color:var(--text-muted);margin-bottom:8px;" } });
+		}
+		const addField = (label: string, placeholder: string): HTMLInputElement => {
+			modal.contentEl.createEl("label", { text: label, attr: { style: "display:block;font-size:12px;margin-top:8px;margin-bottom:2px;" } });
+			return modal.contentEl.createEl("input", { attr: { type: "text", placeholder, style: "width:100%;padding:4px;font-size:13px;" } });
+		};
+		const stepInput = addField("scenarioStepIndex (must be > current)", `e.g. ${(currentStep ?? 0) + 1}`);
+		const labelInput = addField("stepLabel (optional)", "e.g. pre-action-baseline");
+		const btn = modal.contentEl.createEl("button", { text: "Advance", attr: { style: "margin-top:14px;padding:6px 16px;" } });
+		btn.addEventListener("click", () => {
+			const stepIndex = parseInt(stepInput.value.trim(), 10);
+			if (isNaN(stepIndex) || stepIndex < 0) { new Notice("Enter a non-negative integer.", 4000); return; }
+			const label = labelInput.value.trim() || undefined;
+			api.__qaOnlyAdvanceScenarioStepUnsafe?.(stepIndex, label);
+			new Notice(`Scenario step advanced to ${stepIndex}${label ? ` (${label})` : ""}`, 4000);
+			modal.close();
+		});
+		modal.open();
+		setTimeout(() => { stepInput.focus(); }, 50);
 	}
 
 	private async _persistCheckpointSegmentsIfSafe(): Promise<void> {
