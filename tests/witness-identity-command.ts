@@ -50,10 +50,12 @@ function buildIdentityData(opts: {
 	pluginVersion: string;
 	flightMode: string | null;
 	traceActive: boolean;
+	localTraceId?: string;
+	scenarioRunId?: string | null;
+	scenarioId?: string | null;
 	qaTraceSecretHash: string | null;
 	runtimeState: string;
 	bundleExportAvailable: boolean;
-	filesystemPersistenceStatus: "available" | "unavailable_inside_vault" | "disabled";
 }): { display: string; clipboard: string } {
 	const secretHash = opts.qaTraceSecretHash;
 	const truncatedHash = secretHash?.startsWith("sha256:")
@@ -68,10 +70,13 @@ function buildIdentityData(opts: {
 		`platform: desktop`,
 		`flightMode: ${opts.flightMode ?? "(no active trace)"}`,
 		`traceActive: ${opts.traceActive}`,
+		`localTraceId: ${opts.localTraceId ?? "(none)"}`,
+		`scenarioRunId: ${opts.scenarioRunId ?? "(not set)"}`,
+		`scenarioId: ${opts.scenarioId ?? "(not set)"}`,
 		`qaTraceSecretHash: ${truncatedHash}`,
 		`runtimeState: ${opts.runtimeState}`,
 		`bundleExportAvailable: ${opts.bundleExportAvailable}`,
-		`filesystemPersistenceStatus: ${opts.filesystemPersistenceStatus}`,
+		`filesystemPersistenceStatus: unavailable_inside_vault`,
 	].join("\n");
 
 	const clipboard = lines.replace(truncatedHash, secretHash ?? "(no qaTraceSecret configured)");
@@ -90,10 +95,12 @@ test("identity modal shows all required fields", async () => {
 		pluginVersion: "1.6.1",
 		flightMode: "qa-safe",
 		traceActive: true,
+		localTraceId: "trace-001",
+		scenarioRunId: "run-001",
+		scenarioId: "s12a",
 		qaTraceSecretHash: "sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
 		runtimeState: tracker.getRuntimeState(),
 		bundleExportAvailable: false,
-		filesystemPersistenceStatus: "unavailable_inside_vault",
 	});
 
 	assert.ok(display.includes("deviceId:"), "Missing deviceId");
@@ -101,10 +108,13 @@ test("identity modal shows all required fields", async () => {
 	assert.ok(display.includes("platform:"), "Missing platform");
 	assert.ok(display.includes("flightMode:"), "Missing flightMode");
 	assert.ok(display.includes("traceActive:"), "Missing traceActive");
+	assert.ok(display.includes("localTraceId:"), "Missing localTraceId");
+	assert.ok(display.includes("scenarioRunId:"), "Missing scenarioRunId");
+	assert.ok(display.includes("scenarioId:"), "Missing scenarioId");
 	assert.ok(display.includes("qaTraceSecretHash:"), "Missing qaTraceSecretHash");
 	assert.ok(display.includes("runtimeState:"), "Missing runtimeState");
 	assert.ok(display.includes("bundleExportAvailable:"), "Missing bundleExportAvailable");
-	assert.ok(display.includes("filesystemPersistenceStatus:"), "Missing filesystemPersistenceStatus");
+	assert.ok(display.includes("filesystemPersistenceStatus: unavailable_inside_vault"), "Must always show unavailable_inside_vault");
 	tracker.dispose();
 });
 
@@ -123,7 +133,6 @@ test("identity modal never shows raw secrets", async () => {
 		qaTraceSecretHash: "sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
 		runtimeState: "foreground",
 		bundleExportAvailable: false,
-		filesystemPersistenceStatus: "unavailable_inside_vault",
 	});
 
 	for (const payload of [display, clipboard]) {
@@ -145,14 +154,10 @@ test("display shows truncated hash, clipboard shows full hash", async () => {
 		qaTraceSecretHash: FULL_HASH,
 		runtimeState: "foreground",
 		bundleExportAvailable: false,
-		filesystemPersistenceStatus: "unavailable_inside_vault",
 	});
 
-	// Display should have truncated form
 	assert.ok(!display.includes(FULL_HASH), "Display should not contain full hash");
 	assert.ok(display.includes("sha256:abcdef123456…"), "Display should contain truncated hash");
-
-	// Clipboard should have full hash
 	assert.ok(clipboard.includes(FULL_HASH), "Clipboard should contain full hash");
 });
 
@@ -166,7 +171,6 @@ test("deviceName is labeled as display-only", async () => {
 		qaTraceSecretHash: null,
 		runtimeState: "unknown",
 		bundleExportAvailable: false,
-		filesystemPersistenceStatus: "disabled",
 	});
 
 	assert.ok(display.includes("display-only"), "deviceName must be labeled display-only");
@@ -183,28 +187,20 @@ test("no qaTraceSecret configured shows placeholder", async () => {
 		qaTraceSecretHash: null,
 		runtimeState: "unknown",
 		bundleExportAvailable: false,
-		filesystemPersistenceStatus: "disabled",
 	});
 
 	assert.ok(display.includes("(no qaTraceSecret configured)"), "Must show placeholder when no secret");
-	// Must not compute hash of empty string
 	assert.ok(!display.includes("sha256:e3b0"), "Must not hash empty string");
 });
 
-test("filesystemPersistenceStatus reflects vault-root detection", async () => {
-	const { display: insideVault } = buildIdentityData({
+test("filesystemPersistenceStatus is always unavailable_inside_vault", async () => {
+	// .obsidian is always inside the vault root — filesystem write is always fail-closed
+	const { display } = buildIdentityData({
 		deviceId: "d1", deviceName: "d", pluginVersion: "1.0", flightMode: null,
 		traceActive: false, qaTraceSecretHash: null, runtimeState: "unknown",
-		bundleExportAvailable: false, filesystemPersistenceStatus: "unavailable_inside_vault",
+		bundleExportAvailable: false,
 	});
-	assert.ok(insideVault.includes("unavailable_inside_vault"));
-
-	const { display: available } = buildIdentityData({
-		deviceId: "d1", deviceName: "d", pluginVersion: "1.0", flightMode: null,
-		traceActive: false, qaTraceSecretHash: null, runtimeState: "unknown",
-		bundleExportAvailable: false, filesystemPersistenceStatus: "available",
-	});
-	assert.ok(available.includes("available"));
+	assert.ok(display.includes("unavailable_inside_vault"), "Must always show unavailable_inside_vault");
 });
 
 // -----------------------------------------------------------------------

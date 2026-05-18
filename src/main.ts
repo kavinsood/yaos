@@ -2134,43 +2134,30 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		try {
 			await navigator.clipboard.writeText(bundleStr);
 			clipboardOk = true;
-		} catch { /* fall through */ }
-
-		// Optional: filesystem write (fail-closed when inside vault root)
-		const configDir = this.app.vault.configDir;
-		const vaultRoot = (this.app.vault.adapter as unknown as { basePath?: string }).basePath ?? "";
-		const bundleDir = `${configDir}/plugins/yaos/witness-bundles`;
-		const isInsideVault = vaultRoot ? bundleDir.startsWith(vaultRoot) : true;
-
-		if (!isInsideVault) {
-			try {
-				const ctx = ftc.context;
-				const scenarioState = tracker.getScenarioStepState();
-				const runId = scenarioState.scenarioRunId ?? "no-run-id";
-				const ts = new Date().toISOString().replace(/[:.]/g, "-");
-				const filename = `${runId}-${ctx.deviceId}-${ts}.ndjson`;
-				const fullPath = `${bundleDir}/${filename}`;
-				const absolutePath = vaultRoot ? `${vaultRoot}/${fullPath}` : fullPath;
-				await this.app.vault.adapter.mkdir(bundleDir);
-				await this.app.vault.adapter.write(fullPath, bundleStr);
-				if (clipboardOk) {
-					new Notice(`Witness bundle copied to clipboard and written to: ${absolutePath}`, 8000);
-				} else {
-					new Notice(`Witness bundle written to: ${absolutePath}`, 8000);
-				}
-				return;
-			} catch (e) {
-				const reason = e instanceof Error ? e.message : String(e);
-				new Notice(`Witness bundle delivered via clipboard/share-sheet; filesystem write unavailable: ${reason}`, 8000);
-				return;
-			}
-		}
+		} catch { /* fall through to modal */ }
 
 		if (clipboardOk) {
-			new Notice("Witness bundle copied to clipboard; filesystem write unavailable: path inside vault root", 7000);
-		} else {
-			new Notice("Witness bundle export failed: clipboard unavailable and path inside vault root", 7000);
+			new Notice("Witness bundle copied to clipboard.", 5000);
+			return;
 		}
+
+		// Fallback: modal with selectable text (reliable on mobile when clipboard is unavailable)
+		this._showBundleModal(bundleStr);
+	}
+
+	private _showBundleModal(bundleStr: string): void {
+		// Inline modal with a <textarea> — selectable on mobile when clipboard is unavailable
+		const { Modal } = require("obsidian") as typeof import("obsidian");
+		const modal = new Modal(this.app);
+		modal.titleEl.setText("Witness Bundle — copy this text");
+		const ta = modal.contentEl.createEl("textarea", {
+			attr: { rows: "20", style: "width:100%;font-size:10px;font-family:monospace;white-space:pre;" },
+		});
+		ta.value = bundleStr;
+		modal.contentEl.createEl("p", { text: "Select all and copy, then share the text to your analysis machine.", attr: { style: "font-size:12px;color:var(--text-muted);" } });
+		modal.open();
+		// Auto-select for convenience
+		setTimeout(() => { ta.select(); }, 50);
 	}
 
 	private _qaShowDeviceIdentity(): void {
@@ -2183,11 +2170,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			? `sha256:${secretHash.slice(7, 19)}…${secretHash.slice(-4)}`
 			: secretHash ?? "(no qaTraceSecret configured)";
 
-		const configDir = this.app.vault.configDir;
-		const vaultRoot = (this.app.vault.adapter as unknown as { basePath?: string }).basePath ?? "";
-		const bundleDir = `${configDir}/plugins/yaos/witness-bundles`;
-		const isInsideVault = vaultRoot ? bundleDir.startsWith(vaultRoot) : true;
-		const fsStatus = isInsideVault ? "unavailable_inside_vault" : "available";
+		const scenarioState = tracker?.getScenarioStepState();
 
 		const lines = [
 			`deviceId: ${ctx?.deviceId ?? "unknown"}`,
@@ -2197,10 +2180,13 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			`platform: desktop`,
 			`flightMode: ${ftc?.currentRecorder?.mode ?? "(no active trace)"}`,
 			`traceActive: ${!!ctx}`,
+			`localTraceId: ${ctx?.traceId ?? "(none)"}`,
+			`scenarioRunId: ${scenarioState?.scenarioRunId ?? "(not set)"}`,
+			`scenarioId: ${scenarioState?.scenarioId ?? "(not set)"}`,
 			`qaTraceSecretHash: ${truncatedHash}`,
 			`runtimeState: ${tracker?.getRuntimeState() ?? "unknown"}`,
 			`bundleExportAvailable: ${!!(tracker && (tracker.getCheckpointSegments().length > 0))}`,
-			`filesystemPersistenceStatus: ${fsStatus}`,
+			`filesystemPersistenceStatus: unavailable_inside_vault`,
 		].join("\n");
 
 		new Notice(lines, 12000);
@@ -2244,30 +2230,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	}
 
 	private async _persistCheckpointSegmentsIfSafe(): Promise<void> {
-		const tracker = this.deviceWitnessTracker;
-		const ftc = this.flightTrace;
-		if (!tracker || !ftc?.context) return;
-		const configDir = this.app.vault.configDir;
-		const vaultRoot = (this.app.vault.adapter as unknown as { basePath?: string }).basePath ?? "";
-		const ctx = ftc.context;
-		const checkpointDir = `${configDir}/plugins/yaos/witness-checkpoints/${ctx.traceId}/${ctx.deviceId}`;
-		const isInsideVault = vaultRoot ? checkpointDir.startsWith(vaultRoot) : true;
-		if (isInsideVault) {
-			// fail-closed — already emitted checkpoint_path_inside_vault divergence from tracker
-			return;
-		}
-		const segments = tracker.getCheckpointSegments();
-		try {
-			await this.app.vault.adapter.mkdir(checkpointDir);
-		} catch { return; }
-		for (const seg of segments) {
-			const filename = String(seg.index).padStart(6, "0") + ".ndjson";
-			try {
-				await this.app.vault.adapter.write(`${checkpointDir}/${filename}`, seg.content);
-			} catch {
-				tracker.markDirty("__checkpoint_write_failed__", "disk-write");
-			}
-		}
+		// Filesystem persistence is always fail-closed on desktop: configDir (.obsidian) is
+		// inside the vault root. In-memory segments are the canonical store; bundle export
+		// via clipboard/modal is the primary export channel (Requirement 4.0).
+		// No-op: segments remain in-memory until the tracker is disposed.
 	}
 
 	private _startDeviceWitnessTracker(mode: FlightMode): void {

@@ -113,25 +113,31 @@ test("deviceWitnessTracker.ts contains no vault.adapter.write calls (static guar
 });
 
 test("segment files are not written to vault root (static guard extended)", async () => {
-	// Verify main.ts _persistCheckpointSegmentsIfSafe checks isInsideVault before writing
+	// _persistCheckpointSegmentsIfSafe must be a no-op (filesystem write removed — always fail-closed)
 	const { readFileSync } = await import("node:fs");
 	const src = readFileSync("src/main.ts", "utf-8");
-	// The persistence function must check isInsideVault before calling adapter.write
-	assert.ok(src.includes("isInsideVault"), "main.ts must check isInsideVault before writing checkpoint segments");
 	assert.ok(src.includes("_persistCheckpointSegmentsIfSafe"), "main.ts must have _persistCheckpointSegmentsIfSafe");
+	// Must NOT contain vault.adapter.write inside the persistence function
+	const fnIdx = src.lastIndexOf("private async _persistCheckpointSegmentsIfSafe");
+	assert.ok(fnIdx >= 0, "Must find _persistCheckpointSegmentsIfSafe definition");
+	const fnBody = src.slice(fnIdx, fnIdx + 500);
+	assert.ok(!fnBody.includes("vault.adapter.write"), "Persistence function must not write via vault adapter");
 });
 
-test("bundle export path also checks isInsideVault before writing", async () => {
+test("bundle export uses clipboard/modal only — no vault.adapter.write", async () => {
 	const { readFileSync } = await import("node:fs");
 	const src = readFileSync("src/main.ts", "utf-8");
 	assert.ok(src.includes("_qaExportWitnessBundle"), "main.ts must have _qaExportWitnessBundle");
-	// The function must check isInsideVault — search the whole file
-	assert.ok(src.includes("isInsideVault"), "Bundle export must check isInsideVault");
-	// Verify the check appears in the export function (not just persistence function)
+	// The export function must NOT write via vault adapter (clipboard/modal only)
 	const exportFnIdx = src.lastIndexOf("private async _qaExportWitnessBundle");
-	assert.ok(exportFnIdx >= 0, "Must find _qaExportWitnessBundle function definition");
-	const exportFnBody = src.slice(exportFnIdx, exportFnIdx + 3000);
-	assert.ok(exportFnBody.includes("isInsideVault"), "Bundle export function must check isInsideVault");
+	assert.ok(exportFnIdx >= 0, "Must find _qaExportWitnessBundle definition");
+	const exportFnBody = src.slice(exportFnIdx, exportFnIdx + 1500);
+	assert.ok(!exportFnBody.includes("vault.adapter.write"), "Bundle export must not write via vault adapter");
+	assert.ok(!exportFnBody.includes("vault.adapter.mkdir"), "Bundle export must not mkdir via vault adapter");
+	// Must use clipboard
+	assert.ok(exportFnBody.includes("clipboard.writeText"), "Bundle export must use clipboard");
+	// Must have modal fallback
+	assert.ok(exportFnBody.includes("_showBundleModal"), "Bundle export must have modal fallback");
 });
 
 // -----------------------------------------------------------------------

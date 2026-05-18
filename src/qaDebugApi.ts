@@ -12,6 +12,7 @@
  */
 
 import type { App, MarkdownView } from "obsidian";
+import { Notice } from "obsidian";
 import type { VaultSync } from "./sync/vaultSync";
 import type { ReconciliationController } from "./runtime/reconciliationController";
 import type { ConnectionController } from "./runtime/connectionController";
@@ -198,12 +199,22 @@ export interface YaosQaDebugApi {
 	getDeviceId(): string;
 
 	/**
-	 * Phase 2: Get active trace identity for cross-device trace verification.
+	 * Phase 2+3: Get active trace identity for cross-device trace verification.
 	 * Returns null if no trace is active.
 	 * qaTraceSecretHash is SHA-256("yaos-qa-trace-secret:" + qaTraceSecret).
 	 * hasQaTraceSecret is false when no qaTraceSecret is set.
+	 * scenarioRunId/scenarioId are null when not set via Set scenario run ID command.
 	 */
-	getActiveTraceInfo(): { traceId: string; qaTraceSecretHash: string; deviceId: string; hasQaTraceSecret: boolean } | null;
+	getActiveTraceInfo(): {
+		localTraceId: string;
+		/** @deprecated use localTraceId */
+		traceId: string;
+		qaTraceSecretHash: string;
+		deviceId: string;
+		hasQaTraceSecret: boolean;
+		scenarioRunId: string | null;
+		scenarioId: string | null;
+	} | null;
 
 	/**
 	 * Phase 2: Get the current runtime state for mobile-background detection.
@@ -762,12 +773,19 @@ export function buildQaDebugApi(plugin: PluginHandle): YaosQaDebugApi {
 			const ctx = ftc?.context;
 			if (!ctx) return null;
 			const qaTraceSecretHash = plugin.getQaTraceSecretHash?.();
-			if (!qaTraceSecretHash) {
-				return { traceId: ctx.traceId, qaTraceSecretHash: "", deviceId: ctx.deviceId, hasQaTraceSecret: false };
-			}
-			// hasQaTraceSecret: true if the hash is a real SHA-256 (starts with "sha256:"), not a fallback
-			const hasQaTraceSecret = qaTraceSecretHash.startsWith("sha256:");
-			return { traceId: ctx.traceId, qaTraceSecretHash, deviceId: ctx.deviceId, hasQaTraceSecret };
+			const tracker = plugin.getDeviceWitnessTracker?.();
+			const scenarioState = tracker?.getScenarioStepState();
+			const hash = qaTraceSecretHash ?? "";
+			const hasQaTraceSecret = hash.startsWith("sha256:");
+			return {
+				localTraceId: ctx.traceId,
+				traceId: ctx.traceId, // backward compat
+				qaTraceSecretHash: hash,
+				deviceId: ctx.deviceId,
+				hasQaTraceSecret,
+				scenarioRunId: scenarioState?.scenarioRunId ?? null,
+				scenarioId: scenarioState?.scenarioId ?? null,
+			};
 		},
 
 		getRuntimeState(): "foreground" | "background" | "suspended" | "unknown" {
@@ -840,17 +858,16 @@ export function buildQaDebugApi(plugin: PluginHandle): YaosQaDebugApi {
 			const tracker = plugin.getDeviceWitnessTracker?.();
 			if (!tracker) return;
 			const state = tracker.getScenarioStepState();
-			const NoticeClass = (app as unknown as { Notice?: new (msg: string) => void }).Notice;
 			if (!state.scenarioRunId) {
-				if (NoticeClass) new NoticeClass("set scenarioRunId via 'YAOS QA: Set scenario run ID' first");
+				new Notice("set scenarioRunId via 'YAOS QA: Set scenario run ID' first");
 				return;
 			}
 			if (!Number.isInteger(stepIndex) || stepIndex < 0) {
-				if (NoticeClass) new NoticeClass(`scenarioStepIndex must be a non-negative integer, got: ${stepIndex}`);
+				new Notice(`scenarioStepIndex must be a non-negative integer, got: ${stepIndex}`);
 				return;
 			}
 			if (state.stepIndex !== null && stepIndex <= state.stepIndex) {
-				if (NoticeClass) new NoticeClass(`scenarioStepIndex must be strictly greater than current (${state.stepIndex}), got: ${stepIndex}`);
+				new Notice(`scenarioStepIndex must be strictly greater than current (${state.stepIndex}), got: ${stepIndex}`);
 				return;
 			}
 			const ok = tracker.advanceScenarioStep(stepIndex, label);
