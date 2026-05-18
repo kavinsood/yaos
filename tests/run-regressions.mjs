@@ -91,17 +91,13 @@ const suites = [
 	[JITI, "tests/witness-hash-normalization.ts"],
 	[JITI, "tests/witness-checkpoint-isolation.ts"],
 	[JITI, "tests/witness-checkpoint-rotation.ts"],
-	[JITI, "tests/witness-analyzer-purity.ts"],
 	[JITI, "tests/witness-readonly-spy.ts"],
 	[JITI, "tests/witness-mobile-background.ts"],
-	[JITI, "tests/witness-checkpoint-offline.ts"],
-	[JITI, "tests/witness-quorum-eventually.ts"],
 	[JITI, "tests/witness-s11b-semantics.ts"],
 	// Phase 3 verification gates
 	[JITI, "tests/witness-bundle-export.ts"],
 	[JITI, "tests/witness-identity-command.ts"],
 	[JITI, "tests/witness-persistence-isolation.ts"],
-	[JITI, "tests/witness-offline-analyzer-integrity.ts"],
 	[JITI, "tests/witness-scenario-step.ts"],
 ];
 

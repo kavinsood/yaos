@@ -42,15 +42,8 @@ codex-md.py
 # QA run artifacts (flight traces, manifests, reports)
 qa-runs/
 
-# QA harness compiled plugin
-qa/obsidian-harness/main.js
-
 # TypeScript compilation artifacts (compiled .js next to .ts source)
 # Build outputs are not committed; only .ts source is tracked.
-qa/analyzers/*.js
-qa/analyzers/rules/*.js
-qa/obsidian-harness/*.js
-qa/obsidian-harness/scenarios/*.js
 src/debug/*.js
 src/runtime/*.js
 src/settings/*.js
@@ -62,3 +55,36 @@ tests/*.js
 # Temp/session artifacts
 25#.json
 review_25hash.json
+
+# Local working files (not for public repo)
+rca/
+QA/
+qa/
+tools/
+.agents/
+.codex/
+.claude/
+WITNESS-PHASE-2-VERIFICATION.md
+WITNESS-PHASE-3-VERIFICATION.md
+tests/regression-baseline.md
+tests/witness-analyzer-purity.ts
+tests/witness-checkpoint-offline.ts
+tests/witness-quorum-eventually.ts
+tests/witness-offline-analyzer-integrity.ts
+
+# Engineering docs hidden from public (volatile / QA-related)
+engineering/do-hardening-implementation.md
+engineering/do-hardening-rfc.md
+engineering/flight-recorder-spec.md
+engineering/frontmatter-integrity-rfc.md
+engineering/mobile-qa-checklist.md
+engineering/multi-device-witness-runbook.md
+engineering/phase-1-followups.md
+engineering/qa-history.md
+engineering/server-ack-design.md
+engineering/server-ack-spike.md
+engineering/sync-contract.md
+engineering/sync-invariants.md
+engineering/sync-verification-v0.5.md
+engineering/sync-vocabulary.md
+engineering/update-pipeline-implementation-1.4.0.md

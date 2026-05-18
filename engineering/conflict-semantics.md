@@ -1,13 +1,9 @@
 # YAOS Conflict Semantics
 
-Last updated: 2026-05-11
-
 ## Overview
 
 YAOS has four conflict classes, each with a defined policy. This document
 is the single source of truth for conflict resolution behavior.
-
----
 
 ## 1. Markdown ambiguous divergence
 
@@ -41,8 +37,6 @@ genuinely new divergences create fresh artifacts.
 **Sync behavior:** Markdown conflict artifacts sync normally via
 `vault.create()`. Other devices receive them.
 
----
-
 ## 2. Blob download conflict
 
 **Trigger:** During blob download, either:
@@ -73,8 +67,6 @@ normally.
 **Rationale:** Binary conflict artifacts may be large (images, PDFs) and
 uploading them could create confusion on other devices. The local device
 that experienced the conflict is responsible for resolving it.
-
----
 
 ## 3. Remote delete conflict (local-dirty preservation)
 
@@ -197,8 +189,6 @@ When baseline is unknown, YAOS preserves locally but does NOT resurrect.
 This prevents "deleted folders coming back" from transient CRDT
 unavailability.
 
----
-
 ## 4. Safety brake (blocked remote overwrites)
 
 **Trigger:** Reconcile would overwrite >20 local files AND >25% of the
@@ -222,8 +212,6 @@ vault. This indicates a possible bulk corruption from a remote device.
 resets to 0. UI/status must treat count as current and timestamp as
 "last time this happened."
 
----
-
 ## Naming conventions
 
 Both Markdown and blob conflict artifacts cap component lengths to prevent
@@ -231,8 +219,6 @@ filesystem path length issues (255-byte component limit):
 - Device name: max 50 characters
 - Base name: max 100 characters (further reduced if suffix is long)
 - Illegal filesystem characters are replaced with `-`
-
----
 
 ## Recovery quarantine
 
