@@ -613,6 +613,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						qaShowDeviceIdentity: () => this._qaShowDeviceIdentity(),
 						qaSetScenarioRunId: () => this._qaSetScenarioRunId(),
 						qaAdvanceScenarioStep: () => this._qaAdvanceScenarioStep(),
+						qaRefreshWitnessCurrentFile: () => this._qaRefreshWitnessCurrentFile(),
 					} : {}),
 				});
 				this.commandsRegistered = true;
@@ -2272,6 +2273,25 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		// inside the vault root. In-memory segments are the canonical store; bundle export
 		// via clipboard/modal is the primary export channel (Requirement 4.0).
 		// No-op: segments remain in-memory until the tracker is disposed.
+	}
+
+	private _qaRefreshWitnessCurrentFile(): void {
+		if (!this.settings.qaDebugMode) return;
+		const tracker = this.deviceWitnessTracker;
+		if (!tracker) {
+			new Notice("No active flight trace. Start a trace first.", 5000);
+			return;
+		}
+		const file = this.app.workspace.getActiveFile();
+		if (!file || !file.path.endsWith(".md")) {
+			new Notice("Open a Markdown file first.", 4000);
+			return;
+		}
+		const path = file.path;
+		tracker.clearSuppressionForPath(path);
+		tracker.markDirty(path, "disk-write");
+		const fileId = this.vaultSync?.getFileId(path);
+		new Notice(`Witness refresh triggered: ${path}${fileId ? ` (fileId: ${fileId.slice(0, 8)}…)` : ""}`, 5000);
 	}
 
 	private _startDeviceWitnessTracker(mode: FlightMode): void {

@@ -31,6 +31,7 @@ export interface CommandsRuntimeHost {
 	qaShowDeviceIdentity?(): void;
 	qaSetScenarioRunId?(): void;
 	qaAdvanceScenarioStep?(): void;
+	qaRefreshWitnessCurrentFile?(): void;
 }
 
 export function registerCommands(
@@ -301,6 +302,14 @@ export function registerCommands(
 			id: "qa-advance-scenario-step",
 			name: "YAOS QA: Advance scenario step",
 			callback: () => { void advanceStep(); },
+		});
+	}
+	if (host.qaRefreshWitnessCurrentFile) {
+		const refresh = host.qaRefreshWitnessCurrentFile;
+		registrar.addCommand({
+			id: "qa-refresh-witness-current-file",
+			name: "YAOS QA: Refresh witness for current file",
+			callback: () => { refresh(); },
 		});
 	}
 }
