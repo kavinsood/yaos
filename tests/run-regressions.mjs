@@ -28,9 +28,13 @@ const OBSIDIAN_MOCK = fileURLToPath(new URL("./mocks/obsidian.ts", import.meta.u
 // that calls it causes the test to fail loudly (FU-4 invariant).
 const PARTYSERVER_MOCK = fileURLToPath(new URL("./mocks/partyserver.ts", import.meta.url));
 
+// lib0 and y-protocols are transitive dependencies (nested in pnpm structure)
+const LIB0_PATH = fileURLToPath(new URL("../node_modules/.pnpm/lib0@0.2.117/node_modules/lib0", import.meta.url));
+const Y_PROTOCOLS_PATH = fileURLToPath(new URL("../node_modules/.pnpm/y-protocols@1.0.7_yjs@13.6.30/node_modules/y-protocols", import.meta.url));
+
 const JITI_ENV = {
 	...process.env,
-	JITI_ALIAS: JSON.stringify({ yjs: ROOT_YJS, obsidian: OBSIDIAN_MOCK, partyserver: PARTYSERVER_MOCK }),
+	JITI_ALIAS: JSON.stringify({ yjs: ROOT_YJS, obsidian: OBSIDIAN_MOCK, partyserver: PARTYSERVER_MOCK, "lib0": LIB0_PATH, "y-protocols": Y_PROTOCOLS_PATH }),
 };
 
 const JITI = "node --import jiti/register";
@@ -99,6 +103,9 @@ const suites = [
 	[JITI, "tests/witness-identity-command.ts"],
 	[JITI, "tests/witness-persistence-isolation.ts"],
 	[JITI, "tests/witness-scenario-step.ts"],
+	// INV-SAFETY-02 and INV-EDIT-02 integration gates (FU-14)
+	[JITI, "tests/inv-safety-02-round-trip.ts"],
+	[JITI, "tests/inv-edit-02-heal-after-recovery.ts"],
 ];
 
 let totalPassed = 0;

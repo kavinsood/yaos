@@ -312,6 +312,16 @@ export class ReconciliationController {
 		}
 	}
 
+	isDiskAuthorityRecoveryActive(path: string): boolean {
+		const lockUntil = this.boundRecoveryLocks.get(path);
+		if (!lockUntil) return false;
+		if (Date.now() > lockUntil) {
+			this.boundRecoveryLocks.delete(path);
+			return false;
+		}
+		return true;
+	}
+
 	async runReconciliation(mode: ReconcileMode): Promise<void> {
 		const vaultSync = this.deps.getVaultSync();
 		const diskMirror = this.deps.getDiskMirror();

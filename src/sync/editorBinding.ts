@@ -293,7 +293,12 @@ export class EditorBindingManager {
 		});
 	}
 
-	heal(view: MarkdownView, deviceName: string, reason: string): boolean {
+	heal(
+		view: MarkdownView,
+		deviceName: string,
+		reason: string,
+		isDiskAuthorityRecoveryActive?: (path: string) => boolean,
+	): boolean {
 		this.lastDeviceName = deviceName;
 		const file = view.file;
 		if (!file) return false;
@@ -306,6 +311,12 @@ export class EditorBindingManager {
 		);
 		if (!target) {
 			return this.isHardTombstonedPath(file.path);
+		}
+
+		// New guard: reject heal during active disk-authority recovery
+		if (isDiskAuthorityRecoveryActive?.(file.path)) {
+			this.log(`heal: skipped for "${file.path}" (disk-authority recovery active, reason=${reason})`);
+			return this.repair(view, deviceName, reason);
 		}
 
 		const currentContent = view.editor.getValue();
