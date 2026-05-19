@@ -66,7 +66,7 @@ console.log("\n--- Test 4: editor-health-heal origin remains manual-only ---");
 {
 	const healSection = sliceBetween(
 		bindingSource,
-		"heal(view: MarkdownView, deviceName: string, reason: string): boolean {",
+		"heal(",
 		"rebind(view: MarkdownView, deviceName: string, reason: string): void {",
 	);
 	assert(healSection !== null, "heal section found");

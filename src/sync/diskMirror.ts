@@ -94,6 +94,13 @@ export class DiskMirror {
 	private drainPromise: Promise<void> | null = null;
 	private pathWriteLocks = new Map<string, Promise<void>>();
 
+	/**
+	 * Tracks recent local-repair writes to CRDT. When a provider echo arrives
+	 * with matching content, we skip scheduling a disk write to avoid the
+	 * S-A race window.
+	 */
+	private recentRepairEchoes = new Map<string, { contentHash: string; expiresAt: number }>();
+
 	/** Per-file Y.Text observers. Only attached for open/active files. */
 	private textObservers = new Map<
 		string,
@@ -143,6 +150,32 @@ export class DiskMirror {
 
 	setFlightEventHandler(handler: (event: Record<string, unknown>) => void): void {
 		this._flightEventHandler = handler;
+	}
+
+	/**
+	 * Record a local-repair write to CRDT so that its provider echo can be suppressed.
+	 * TTL is SUPPRESS_MS + DEBOUNCE_BURST_MS (typically 1.5s).
+	 */
+	async recordRepairEcho(path: string, content: string): Promise<void> {
+		const normalized = normalizePath(path);
+		const hash = await contentBaselineHash(content);
+		this.recentRepairEchoes.set(normalized, {
+			contentHash: hash,
+			expiresAt: Date.now() + SUPPRESS_MS + DEBOUNCE_BURST_MS,
+		});
+		if (this.debug) {
+			this.log(`recordRepairEcho: registered for "${normalized}" (hash=${hashPrefix(hash)})`);
+		}
+	}
+
+	private getActiveRepairEcho(path: string): { contentHash: string } | null {
+		const entry = this.recentRepairEchoes.get(path);
+		if (!entry) return null;
+		if (Date.now() > entry.expiresAt) {
+			this.recentRepairEchoes.delete(path);
+			return null;
+		}
+		return entry;
 	}
 
 	/**
@@ -212,7 +245,7 @@ export class DiskMirror {
 		// reverse-maps them to paths, and schedules writes for any path
 		// that doesn't already have a per-file observer (i.e. closed).
 		// ---------------------------------------------------------------
-		const afterTxnHandler = (txn: Y.Transaction) => {
+		const afterTxnHandler = async (txn: Y.Transaction) => {
 			if (isLocalOrigin(txn.origin, this.vaultSync.provider)) return;
 
 			for (const [changedType] of txn.changed) {
@@ -228,8 +261,19 @@ export class DiskMirror {
 
 				const path = meta.path;
 
-					// Skip if this path is already open (handled by per-file observer policy)
-					if (this.openPaths.has(path)) continue;
+				// Check if this is a provider echo of a recent local repair.
+				const echo = this.getActiveRepairEcho(path);
+				if (echo) {
+					const crdtContent = changedType.toJSON();
+					const crdtHash = await contentBaselineHash(crdtContent);
+					if (crdtHash === echo.contentHash) {
+						this.log(`afterTxn: skipping echo disk write for repair on "${path}"`);
+						continue;
+					}
+				}
+
+				// Skip if this path is already open (handled by per-file observer policy)
+				if (this.openPaths.has(path)) continue;
 
 				this.log(`afterTxn: remote content change to closed file "${path}"`);
 				this.scheduleWrite(path);
