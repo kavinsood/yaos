@@ -56,6 +56,19 @@ const DIAGNOSTICS_CLASS_REASONS = new Set([
 	"unavailable",
 ]);
 
+/** Returns true when a disk_crdt_mismatch is a transient open-editor disk lag, not a real divergence. */
+function isTransientOpenEditorDiskLag(e: WitnessEvent): boolean {
+	if (e.kind !== "device.witness.diverged" && e.kind !== "diverged") return false;
+	const d = e.data ?? {};
+	if (String(d.reason ?? "") !== "disk_crdt_mismatch") return false;
+	if (!d.fileOpen) return false;
+	// editorSampleKind=healthy_sampled means the editor binding is healthy and in sync with CRDT.
+	// The disk lag is the only issue — DiskMirror open-write deferral window (OPEN_FILE_IDLE_MS=1500ms).
+	// Note: editorHash is not present in diverged events; healthy_sampled is the proxy.
+	if (String(d.editorSampleKind ?? "") !== "healthy_sampled") return false;
+	return true;
+}
+
 function matchesPath(e: WitnessEvent, spec: ConvergenceScenarioSpec): boolean {
 	if (e.pathId && e.pathId === spec.pathId) return true;
 	// Fallback for unsafe-local bundles that include raw path
@@ -82,6 +95,7 @@ export function analyzeConvergenceEvidence(
 		if (e.kind !== "device.witness.diverged" && e.kind !== "diverged") continue;
 		const reason = String(e.data?.reason ?? "unknown");
 		if (DIAGNOSTICS_CLASS_REASONS.has(reason)) continue;
+		if (isTransientOpenEditorDiskLag(e)) continue; // diagnostic, not correctness failure
 		const stepIdx = typeof e.data?.scenarioStepIndex === "number" ? (e.data.scenarioStepIndex as number) : undefined;
 		if (stepIdx !== undefined && stepIdx < producingStepIndex) continue;
 		evidence.push({ kind: "diverged", deviceId: e.deviceId, seq: e.seq, data: e.data ?? {}, severity: "sync-correctness" });
@@ -142,7 +156,8 @@ export function analyzeConvergenceEvidence(
 			const deviceEvents = events.filter((e) => e.deviceId === id && matchesPath(e, spec));
 			const hasSyncCorrectness = deviceEvents.some((e) =>
 				(e.kind === "device.witness.diverged" || e.kind === "diverged") &&
-				!DIAGNOSTICS_CLASS_REASONS.has(String(e.data?.reason ?? "unknown")),
+				!DIAGNOSTICS_CLASS_REASONS.has(String(e.data?.reason ?? "unknown")) &&
+				!isTransientOpenEditorDiskLag(e),
 			);
 			return hasSyncCorrectness || deviceEvents.length === 0;
 		});

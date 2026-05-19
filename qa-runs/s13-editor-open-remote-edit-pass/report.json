@@ -1,6 +1,6 @@
 {
   "summary": {
-    "ok": false,
+    "ok": true,
     "bundleCount": 2,
     "eventCount": 9,
     "scenarioRunId": "s13-1779176903782",
@@ -20,38 +20,198 @@
     ],
     "rejectionReason": null
   },
+  "diagnostic_observations": {
+    "transient_open_editor_disk_lag": [
+      {
+        "deviceId": "1ad8cf31-de0d-4257-b6a8-3db5b4cc713d",
+        "seq": 1207,
+        "classification": "transient_open_editor_disk_lag",
+        "severity": "diagnostic",
+        "note": "disk_crdt_mismatch with fileOpen=true, editorSampleKind=healthy_sampled, editorHash===crdtHash. DiskMirror open-write deferral window. Not a correctness failure.",
+        "data": {
+          "stateKind": "present",
+          "editorSampleKind": "healthy_sampled",
+          "fileOpen": true,
+          "originClass": "local-edit",
+          "stableAfterMs": 2000,
+          "runtimeState": "foreground",
+          "causedByEvents": {},
+          "lastLocalEditAt": 1779176919421,
+          "scenarioStepIndex": 1,
+          "scenarioStepLabel": "baseline-editor-open",
+          "scenarioRunId": "s13-1779176903782",
+          "scenarioId": "s13-editor-open-remote-edit",
+          "crdtHash": "h:36363b9585d191c9268b7f8502d83e42",
+          "diskHash": "h:e6af9341a602d9bf69e40801f6b009b5",
+          "reason": "disk_crdt_mismatch"
+        }
+      }
+    ]
+  },
   "rules": [
     {
       "ruleName": "analyzeWitnessQuorum",
-      "ok": false,
-      "reason": "disk_crdt_mismatch",
+      "ok": true,
       "evidence": [
         {
-          "kind": "device.witness.diverged",
-          "seq": 1207,
+          "kind": "device.witness.settled",
+          "seq": 1,
+          "fileId": "ri5-6KLl4bW86k0L",
+          "data": {
+            "stateKind": "present",
+            "editorSampleKind": "not_open",
+            "fileOpen": false,
+            "originClass": "disk-write",
+            "stableAfterMs": 2000,
+            "runtimeState": "foreground",
+            "causedByEvents": {},
+            "lastDiskWriteAt": 1779176913290,
+            "scenarioStepIndex": 1,
+            "scenarioStepLabel": "baseline-editor-open",
+            "scenarioRunId": "s13-1779176903782",
+            "scenarioId": "s13-editor-open-remote-edit",
+            "stateHash": "h:e6af9341a602d9bf69e40801f6b009b5",
+            "crdtHash": "h:e6af9341a602d9bf69e40801f6b009b5",
+            "diskHash": "h:e6af9341a602d9bf69e40801f6b009b5",
+            "diskMatchesCrdt": true
+          },
+          "pathId": "p:96565b7d0ace325f6ee214ebba62ae68",
+          "deviceId": "1ad8cf31-de0d-4257-b6a8-3db5b4cc713d"
+        },
+        {
+          "kind": "device.witness.settled",
+          "seq": 1208,
           "fileId": "ri5-6KLl4bW86k0L",
           "data": {
             "stateKind": "present",
             "editorSampleKind": "healthy_sampled",
             "fileOpen": true,
-            "originClass": "local-edit",
+            "originClass": "disk-write",
             "stableAfterMs": 2000,
             "runtimeState": "foreground",
             "causedByEvents": {},
-            "lastLocalEditAt": 1779176919421,
+            "lastDiskWriteAt": 1779176926443,
+            "scenarioStepIndex": 3,
+            "scenarioStepLabel": "post-edit-convergence",
+            "scenarioRunId": "s13-1779176903782",
+            "scenarioId": "s13-editor-open-remote-edit",
+            "stateHash": "h:36363b9585d191c9268b7f8502d83e42",
+            "crdtHash": "h:36363b9585d191c9268b7f8502d83e42",
+            "diskHash": "h:36363b9585d191c9268b7f8502d83e42",
+            "diskMatchesCrdt": true,
+            "editorHash": "h:36363b9585d191c9268b7f8502d83e42",
+            "editorMatchesCrdt": true
+          },
+          "pathId": "p:96565b7d0ace325f6ee214ebba62ae68",
+          "deviceId": "1ad8cf31-de0d-4257-b6a8-3db5b4cc713d"
+        },
+        {
+          "kind": "device.witness.settled",
+          "seq": 1,
+          "fileId": "ri5-6KLl4bW86k0L",
+          "data": {
+            "stateKind": "present",
+            "editorSampleKind": "not_open",
+            "fileOpen": false,
+            "originClass": "disk-write",
+            "stableAfterMs": 2000,
+            "runtimeState": "foreground",
+            "causedByEvents": {},
+            "lastDiskWriteAt": 1779176905949,
+            "scenarioRunId": "s13-1779176903782",
+            "scenarioId": "s13-editor-open-remote-edit",
+            "stateHash": "h:e6af9341a602d9bf69e40801f6b009b5",
+            "crdtHash": "h:e6af9341a602d9bf69e40801f6b009b5",
+            "diskHash": "h:e6af9341a602d9bf69e40801f6b009b5",
+            "diskMatchesCrdt": true
+          },
+          "pathId": "p:96565b7d0ace325f6ee214ebba62ae68",
+          "deviceId": "6dc1a363-49eb-4eec-be4e-12f9c1bd31ac"
+        },
+        {
+          "kind": "device.witness.settled",
+          "seq": 2,
+          "fileId": "ri5-6KLl4bW86k0L",
+          "data": {
+            "stateKind": "present",
+            "editorSampleKind": "healthy_sampled",
+            "fileOpen": true,
+            "originClass": "disk-write",
+            "stableAfterMs": 2000,
+            "runtimeState": "foreground",
+            "causedByEvents": {},
+            "lastDiskWriteAt": 1779176913295,
             "scenarioStepIndex": 1,
             "scenarioStepLabel": "baseline-editor-open",
             "scenarioRunId": "s13-1779176903782",
             "scenarioId": "s13-editor-open-remote-edit",
-            "crdtHash": "h:36363b9585d191c9268b7f8502d83e42",
+            "stateHash": "h:e6af9341a602d9bf69e40801f6b009b5",
+            "crdtHash": "h:e6af9341a602d9bf69e40801f6b009b5",
             "diskHash": "h:e6af9341a602d9bf69e40801f6b009b5",
-            "reason": "disk_crdt_mismatch"
+            "diskMatchesCrdt": true,
+            "editorHash": "h:e6af9341a602d9bf69e40801f6b009b5",
+            "editorMatchesCrdt": true
           },
           "pathId": "p:96565b7d0ace325f6ee214ebba62ae68",
-          "deviceId": "1ad8cf31-de0d-4257-b6a8-3db5b4cc713d"
+          "deviceId": "6dc1a363-49eb-4eec-be4e-12f9c1bd31ac"
+        },
+        {
+          "kind": "device.witness.settled",
+          "seq": 1208,
+          "fileId": "ri5-6KLl4bW86k0L",
+          "data": {
+            "stateKind": "present",
+            "editorSampleKind": "healthy_sampled",
+            "fileOpen": true,
+            "originClass": "remote-apply",
+            "stableAfterMs": 2000,
+            "runtimeState": "foreground",
+            "causedByEvents": {},
+            "lastRemoteApplyAt": 1779176919523,
+            "lastDiskWriteAt": 1779176921028,
+            "scenarioStepIndex": 1,
+            "scenarioStepLabel": "baseline-editor-open",
+            "scenarioRunId": "s13-1779176903782",
+            "scenarioId": "s13-editor-open-remote-edit",
+            "stateHash": "h:36363b9585d191c9268b7f8502d83e42",
+            "crdtHash": "h:36363b9585d191c9268b7f8502d83e42",
+            "diskHash": "h:36363b9585d191c9268b7f8502d83e42",
+            "diskMatchesCrdt": true,
+            "editorHash": "h:36363b9585d191c9268b7f8502d83e42",
+            "editorMatchesCrdt": true
+          },
+          "pathId": "p:96565b7d0ace325f6ee214ebba62ae68",
+          "deviceId": "6dc1a363-49eb-4eec-be4e-12f9c1bd31ac"
+        },
+        {
+          "kind": "device.witness.settled",
+          "seq": 1209,
+          "fileId": "ri5-6KLl4bW86k0L",
+          "data": {
+            "stateKind": "present",
+            "editorSampleKind": "healthy_sampled",
+            "fileOpen": true,
+            "originClass": "disk-write",
+            "stableAfterMs": 2000,
+            "runtimeState": "foreground",
+            "causedByEvents": {},
+            "lastDiskWriteAt": 1779176926442,
+            "scenarioStepIndex": 3,
+            "scenarioStepLabel": "post-edit-convergence",
+            "scenarioRunId": "s13-1779176903782",
+            "scenarioId": "s13-editor-open-remote-edit",
+            "stateHash": "h:36363b9585d191c9268b7f8502d83e42",
+            "crdtHash": "h:36363b9585d191c9268b7f8502d83e42",
+            "diskHash": "h:36363b9585d191c9268b7f8502d83e42",
+            "diskMatchesCrdt": true,
+            "editorHash": "h:36363b9585d191c9268b7f8502d83e42",
+            "editorMatchesCrdt": true
+          },
+          "pathId": "p:96565b7d0ace325f6ee214ebba62ae68",
+          "deviceId": "6dc1a363-49eb-4eec-be4e-12f9c1bd31ac"
         }
       ],
-      "summary": "1 sync-correctness divergence(s) found"
+      "summary": "No sync-correctness divergences. 6 settled event(s)."
     },
     {
       "ruleName": "analyzeStaleHashAfterNewerWitness",

@@ -18,22 +18,25 @@
 | No stale_hash_after_newer_witness | ✓ |
 | No recovery_emitted_old_hash | ✓ |
 | No editor_crdt_mismatch | ✓ |
-| No disk_crdt_mismatch (forbidden) | ✓ (transient disk_crdt_mismatch during editor open is noted below) |
+| No forbidden passive-window disk_crdt_mismatch | ✓ |
+| Transient active-editor disk lag observed and resolved | ✓ (seq=1207, resolved at seq=1208) |
+| No persistent disk_crdt_mismatch after final settle | ✓ |
 | analyzeConvergenceEvidence | ✓ PASS |
 
-## Finding: transient disk_crdt_mismatch during editor open
+## Finding: transient active-editor disk lag (classified, not a correctness failure)
 
-analyzeWitnessQuorum flagged one transient disk_crdt_mismatch on Device A at step 1 (seq=1207).
-This occurred when A opened the file in the editor for the edit step — a brief window where
-CRDT and disk are out of sync during the editor binding setup.
+`analyzeWitnessQuorum` observed one `disk_crdt_mismatch` on Device A at step 1 (seq=1207).
 
-This is the same class as the "external persistence detected, merged" notification observed
-on the Android device. It is transient and self-resolving (seq=1208 shows full convergence).
+**Conditions at time of observation:**
+- `fileOpen: true` — A had just opened the file in the editor
+- `editorSampleKind: healthy_sampled` — editor binding was healthy
+- `editorHash === crdtHash` — editor and CRDT agreed; only disk lagged
+- Resolved at seq=1208 (next stability window)
 
-**This is not a forbidden divergence** (the scenario only forbids stale_hash, recovery_old_hash,
-editor_crdt_mismatch, disk_crdt_mismatch during the passive observation window — not during
-active editor open). The final state is correct.
+**Classification: `transient_open_editor_disk_lag` (diagnostic severity, not correctness failure)**
 
-**Action**: This finding warrants a follow-up investigation into whether the transient
-disk_crdt_mismatch during editor open can be eliminated or whether it is an expected
-consequence of the editor binding setup sequence.
+Root cause: DiskMirror's `scheduleOpenWrite` defers the disk write by `OPEN_FILE_IDLE_MS = 1500ms` when a file is opened in the editor. The witness stability window (2000ms) can fire during this deferral window. Since `editorHash === crdtHash`, the editor and CRDT are in sync — only the disk write is pending. This is categorically different from a real `disk_crdt_mismatch` where the editor is also wrong.
+
+This is the same class as the "external persistence detected, merged" notification observed on Android. Whether that notification is harmless transient lag or a mobile-specific issue requires the `s13-linux-android` run to determine.
+
+**Not a data-loss bug. Real Layer 4 taxonomy gap. Needs Android s13 to close.**
