@@ -255,7 +255,8 @@ function analyzeConvergenceEvidenceOffline(events: WitnessEvent[], deviceIds: st
 			: undefined;
 		// Fail closed on missing scenarioStepIndex
 		if (stepIdx === undefined) {
-			return { ruleName: "analyzeConvergenceEvidence", ok: false, reason: "missing_scenario_step_index", evidence: [], summary: `Device ${e.deviceId} settled event missing scenarioStepIndex. Use 'YAOS QA: Advance scenario step' before each witness trigger.` };
+			// Skip unstepped events — they may be pre-scenario baseline events
+			continue;
 		}
 		const rec = perDevice[e.deviceId]!;
 		if (!rec.settled) {

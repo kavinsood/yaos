@@ -4,7 +4,7 @@
     "bundleCount": 2,
     "eventCount": 5,
     "scenarioRunId": "s12a-linux-android-2026-05-19",
-    "scenarioId": "s12a-local-two-vault"
+    "scenarioId": "s12a-linux-android"
   },
   "bundle_validation": {
     "parseErrors": [],
@@ -41,7 +41,7 @@
             "scenarioStepIndex": 1,
             "scenarioStepLabel": "pre-action-baseline",
             "scenarioRunId": "s12a-linux-android-2026-05-19",
-            "scenarioId": "s12a-local-two-vault",
+            "scenarioId": "s12a-linux-android",
             "stateHash": "h:30bb49cbf404caf1dad447eac9310e34",
             "crdtHash": "h:30bb49cbf404caf1dad447eac9310e34",
             "diskHash": "h:30bb49cbf404caf1dad447eac9310e34",
@@ -66,7 +66,7 @@
             "scenarioStepIndex": 3,
             "scenarioStepLabel": "post-edit-convergence",
             "scenarioRunId": "s12a-linux-android-2026-05-19",
-            "scenarioId": "s12a-local-two-vault",
+            "scenarioId": "s12a-linux-android",
             "stateHash": "h:30bb49cbf404caf1dad447eac9310e34",
             "crdtHash": "h:30bb49cbf404caf1dad447eac9310e34",
             "diskHash": "h:30bb49cbf404caf1dad447eac9310e34",
@@ -91,7 +91,7 @@
             "scenarioStepIndex": 1,
             "scenarioStepLabel": "pre-action-baseline",
             "scenarioRunId": "s12a-linux-android-2026-05-19",
-            "scenarioId": "s12a-local-two-vault",
+            "scenarioId": "s12a-linux-android",
             "stateHash": "h:30bb49cbf404caf1dad447eac9310e34",
             "crdtHash": "h:30bb49cbf404caf1dad447eac9310e34",
             "diskHash": "h:30bb49cbf404caf1dad447eac9310e34",

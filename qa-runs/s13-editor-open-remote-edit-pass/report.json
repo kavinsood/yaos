@@ -1,0 +1,105 @@
+{
+  "summary": {
+    "ok": false,
+    "bundleCount": 2,
+    "eventCount": 9,
+    "scenarioRunId": "s13-1779176903782",
+    "scenarioId": "s13-editor-open-remote-edit"
+  },
+  "bundle_validation": {
+    "parseErrors": [],
+    "validation": [
+      {
+        "filePath": "/home/kavin/github/do-sync/qa-runs/s13-editor-open-remote-edit-pass/device-a.ndjson",
+        "accepted": true
+      },
+      {
+        "filePath": "/home/kavin/github/do-sync/qa-runs/s13-editor-open-remote-edit-pass/device-b.ndjson",
+        "accepted": true
+      }
+    ],
+    "rejectionReason": null
+  },
+  "rules": [
+    {
+      "ruleName": "analyzeWitnessQuorum",
+      "ok": false,
+      "reason": "disk_crdt_mismatch",
+      "evidence": [
+        {
+          "kind": "device.witness.diverged",
+          "seq": 1207,
+          "fileId": "ri5-6KLl4bW86k0L",
+          "data": {
+            "stateKind": "present",
+            "editorSampleKind": "healthy_sampled",
+            "fileOpen": true,
+            "originClass": "local-edit",
+            "stableAfterMs": 2000,
+            "runtimeState": "foreground",
+            "causedByEvents": {},
+            "lastLocalEditAt": 1779176919421,
+            "scenarioStepIndex": 1,
+            "scenarioStepLabel": "baseline-editor-open",
+            "scenarioRunId": "s13-1779176903782",
+            "scenarioId": "s13-editor-open-remote-edit",
+            "crdtHash": "h:36363b9585d191c9268b7f8502d83e42",
+            "diskHash": "h:e6af9341a602d9bf69e40801f6b009b5",
+            "reason": "disk_crdt_mismatch"
+          },
+          "pathId": "p:96565b7d0ace325f6ee214ebba62ae68",
+          "deviceId": "1ad8cf31-de0d-4257-b6a8-3db5b4cc713d"
+        }
+      ],
+      "summary": "1 sync-correctness divergence(s) found"
+    },
+    {
+      "ruleName": "analyzeStaleHashAfterNewerWitness",
+      "ok": true,
+      "evidence": [],
+      "summary": "No stale hash regressions."
+    },
+    {
+      "ruleName": "analyzeRecoveryEmittedOldHash",
+      "ok": true,
+      "evidence": [],
+      "summary": "No recovery-old-hash regressions."
+    },
+    {
+      "ruleName": "analyzeEditorStability",
+      "ok": true,
+      "evidence": [],
+      "summary": "No editor stability issues."
+    },
+    {
+      "ruleName": "analyzeCrossDeviceHashesEqual",
+      "ok": true,
+      "evidence": [
+        {
+          "1ad8cf31-de0d-4257-b6a8-3db5b4cc713d": "h:36363b9585d191c9268b7f8502d83e42",
+          "6dc1a363-49eb-4eec-be4e-12f9c1bd31ac": "h:36363b9585d191c9268b7f8502d83e42"
+        }
+      ],
+      "summary": "All devices agree on hash: h:36363b9585d191c9268b7f8502d83e42"
+    },
+    {
+      "ruleName": "analyzeConvergenceEvidence",
+      "ok": true,
+      "evidence": [
+        {
+          "1ad8cf31-de0d-4257-b6a8-3db5b4cc713d": {
+            "settled": true,
+            "seq": 1,
+            "scenarioStepIndex": 1
+          },
+          "6dc1a363-49eb-4eec-be4e-12f9c1bd31ac": {
+            "settled": true,
+            "seq": 2,
+            "scenarioStepIndex": 1
+          }
+        }
+      ],
+      "summary": "Device 1ad8cf31-de0d-4257-b6a8-3db5b4cc713d settled with h:e6af9341a602d9bf69e40801f6b009b5 at step 1 (seq 1). Device 6dc1a363-49eb-4eec-be4e-12f9c1bd31ac settled with h:e6af9341a602d9bf69e40801f6b009b5 at step 1 (seq 2). No stale rewinds detected. No recovery emitted old hash."
+    }
+  ]
+}

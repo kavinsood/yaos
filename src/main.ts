@@ -1,4 +1,4 @@
-import { MarkdownView, Modal, Notice, Plugin, TFile, arrayBufferToHex } from "obsidian";
+import { MarkdownView, Modal, Notice, Platform, Plugin, TFile, arrayBufferToHex } from "obsidian";
 import {
 	DEFAULT_SETTINGS,
 	VaultSyncSettingTab,
@@ -2095,7 +2095,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			pluginVersion: this.manifest.version,
 			deviceId: ctx?.deviceId ?? "unknown",
 			deviceLabel: this.settings.deviceName ?? "unknown",
-			platform: "desktop",
+			platform: Platform.isMobile ? (Platform.isIosApp ? "ios" : "android") : "desktop",
 			runtimeState: tracker?.getRuntimeState() ?? "unknown",
 			localTraceId: ctx?.traceId ?? "unknown",
 			scenarioRunId: scenarioState?.scenarioRunId ?? null,
@@ -2175,19 +2175,27 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		const ftc = this.flightTrace;
 		const ctx = ftc?.context;
 		const tracker = this.deviceWitnessTracker;
-		const secretHash = this._qaTraceSecretHash;
+		const scenarioState = tracker?.getScenarioStepState();
+		const platform = Platform.isMobile ? (Platform.isIosApp ? "ios" : "android") : "desktop";
+
+		// Use cached hash if trace is active, otherwise compute from settings secret
+		const secretHash = this._qaTraceSecretHash ?? (() => {
+			const secret = this.settings.qaTraceSecret;
+			if (!secret) return null;
+			// Synchronous fallback: show length only (async SHA-256 not available here)
+			// The full hash is only available after startFlightTrace
+			return `len:${secret.length} (start trace for full sha256)`;
+		})();
+
 		const truncatedHash = secretHash?.startsWith("sha256:")
 			? `sha256:${secretHash.slice(7, 19)}…${secretHash.slice(-4)}`
 			: secretHash ?? "(no qaTraceSecret configured)";
 
-		const scenarioState = tracker?.getScenarioStepState();
-
 		const lines = [
-			`deviceId: ${ctx?.deviceId ?? "unknown"}`,
+			`deviceId: ${ctx?.deviceId ?? "unknown (start trace to get deviceId)"}`,
 			`Device label (display-only — never used as a key): ${this.settings.deviceName ?? "unknown"}`,
-			`Device name (display-only — never used as a key): ${this.settings.deviceName ?? "unknown"}`,
 			`pluginVersion: ${this.manifest.version}`,
-			`platform: desktop`,
+			`platform: ${platform}`,
 			`flightMode: ${ftc?.currentRecorder?.mode ?? "(no active trace)"}`,
 			`traceActive: ${!!ctx}`,
 			`localTraceId: ${ctx?.traceId ?? "(none)"}`,
@@ -2196,15 +2204,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			`qaTraceSecretHash: ${truncatedHash}`,
 			`runtimeState: ${tracker?.getRuntimeState() ?? "unknown"}`,
 			`bundleExportAvailable: ${!!(tracker && (tracker.getCheckpointSegments().length > 0))}`,
-			`filesystemPersistenceStatus: unavailable_inside_vault`,
 		].join("\n");
 
 		new Notice(lines, 12000);
 		console.debug("[yaos] Device identity for QA:\n" + lines);
-
-		// Copy full hash to clipboard
-		const fullPayload = lines.replace(truncatedHash, secretHash ?? "(no qaTraceSecret configured)");
-		navigator.clipboard.writeText(fullPayload).catch(() => { /* best-effort */ });
+		navigator.clipboard.writeText(lines).catch(() => { /* best-effort */ });
 	}
 
 	private _qaSetScenarioRunId(): void {
@@ -2306,7 +2310,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			flightMode: mode,
 			sink,
 			traceContext: ctx,
-			platform: "desktop",
+			platform: Platform.isMobile ? "mobile" : "desktop",
 			// Fix 2: provide pathId resolver so checkpoint lines include pathId
 			getPathId: async (path) => {
 				try {
