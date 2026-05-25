@@ -1,0 +1,213 @@
+{
+  "summary": {
+    "ok": true,
+    "bundleCount": 2,
+    "eventCount": 7,
+    "scenarioRunId": "s12c-conflict-1779746543538",
+    "scenarioId": "s12c-conflict"
+  },
+  "bundle_validation": {
+    "parseErrors": [],
+    "validation": [
+      {
+        "filePath": "/home/kavin/github/do-sync/qa-runs/s12c-conflict-pass/device-a.ndjson",
+        "accepted": true
+      },
+      {
+        "filePath": "/home/kavin/github/do-sync/qa-runs/s12c-conflict-pass/device-b.ndjson",
+        "accepted": true
+      }
+    ],
+    "rejectionReason": null
+  },
+  "diagnostic_observations": {
+    "transient_open_editor_disk_lag": [
+      {
+        "deviceId": "abe2a07d-4af3-433f-a81d-abf843f8c6f0",
+        "seq": 2,
+        "classification": "transient_open_editor_disk_lag",
+        "severity": "diagnostic",
+        "note": "disk_crdt_mismatch with fileOpen=true, editorSampleKind=healthy_sampled, editorHash===crdtHash. DiskMirror open-write deferral window. Not a correctness failure.",
+        "data": {
+          "stateKind": "present",
+          "editorSampleKind": "healthy_sampled",
+          "fileOpen": true,
+          "originClass": "local-edit",
+          "stableAfterMs": 2000,
+          "runtimeState": "foreground",
+          "causedByEvents": {},
+          "lastLocalEditAt": 1779746558155,
+          "scenarioStepIndex": 1,
+          "scenarioStepLabel": "baseline-quorum",
+          "scenarioRunId": "s12c-conflict-1779746543538",
+          "scenarioId": "s12c-conflict",
+          "crdtHash": "h:7584dea9fd52997a21aea279976d60d4",
+          "diskHash": "h:2eb048dfef66e4d5b0cd877a7428babe",
+          "reason": "disk_crdt_mismatch"
+        }
+      }
+    ]
+  },
+  "rules": [
+    {
+      "ruleName": "analyzeWitnessQuorum",
+      "ok": true,
+      "evidence": [
+        {
+          "kind": "device.witness.settled",
+          "seq": 1,
+          "fileId": "0B9x5KOnVGoV3UAd",
+          "data": {
+            "stateKind": "present",
+            "editorSampleKind": "not_open",
+            "fileOpen": false,
+            "originClass": "disk-write",
+            "stableAfterMs": 2000,
+            "runtimeState": "foreground",
+            "causedByEvents": {},
+            "lastDiskWriteAt": 1779746548078,
+            "scenarioStepIndex": 1,
+            "scenarioStepLabel": "baseline-quorum",
+            "scenarioRunId": "s12c-conflict-1779746543538",
+            "scenarioId": "s12c-conflict",
+            "stateHash": "h:2eb048dfef66e4d5b0cd877a7428babe",
+            "crdtHash": "h:2eb048dfef66e4d5b0cd877a7428babe",
+            "diskHash": "h:2eb048dfef66e4d5b0cd877a7428babe",
+            "diskMatchesCrdt": true
+          },
+          "pathId": "p:0a2183b606b21402ee7ee9f830f0a095",
+          "deviceId": "abe2a07d-4af3-433f-a81d-abf843f8c6f0"
+        },
+        {
+          "kind": "device.witness.settled",
+          "seq": 3,
+          "fileId": "0B9x5KOnVGoV3UAd",
+          "data": {
+            "stateKind": "present",
+            "editorSampleKind": "healthy_sampled",
+            "fileOpen": true,
+            "originClass": "remote-apply",
+            "stableAfterMs": 2000,
+            "runtimeState": "foreground",
+            "causedByEvents": {},
+            "lastRemoteApplyAt": 1779746563222,
+            "lastDiskWriteAt": 1779746564731,
+            "scenarioStepIndex": 1,
+            "scenarioStepLabel": "baseline-quorum",
+            "scenarioRunId": "s12c-conflict-1779746543538",
+            "scenarioId": "s12c-conflict",
+            "stateHash": "h:f1e05473a578fd6ec286422473546260",
+            "crdtHash": "h:f1e05473a578fd6ec286422473546260",
+            "diskHash": "h:f1e05473a578fd6ec286422473546260",
+            "diskMatchesCrdt": true,
+            "editorHash": "h:f1e05473a578fd6ec286422473546260",
+            "editorMatchesCrdt": true
+          },
+          "pathId": "p:0a2183b606b21402ee7ee9f830f0a095",
+          "deviceId": "abe2a07d-4af3-433f-a81d-abf843f8c6f0"
+        },
+        {
+          "kind": "device.witness.settled",
+          "seq": 4,
+          "fileId": "0B9x5KOnVGoV3UAd",
+          "data": {
+            "stateKind": "present",
+            "editorSampleKind": "healthy_sampled",
+            "fileOpen": true,
+            "originClass": "disk-write",
+            "stableAfterMs": 2000,
+            "runtimeState": "foreground",
+            "causedByEvents": {},
+            "lastDiskWriteAt": 1779746573745,
+            "scenarioStepIndex": 3,
+            "scenarioStepLabel": "post-resync-convergence",
+            "scenarioRunId": "s12c-conflict-1779746543538",
+            "scenarioId": "s12c-conflict",
+            "stateHash": "h:f1e05473a578fd6ec286422473546260",
+            "crdtHash": "h:f1e05473a578fd6ec286422473546260",
+            "diskHash": "h:f1e05473a578fd6ec286422473546260",
+            "diskMatchesCrdt": true,
+            "editorHash": "h:f1e05473a578fd6ec286422473546260",
+            "editorMatchesCrdt": true
+          },
+          "pathId": "p:0a2183b606b21402ee7ee9f830f0a095",
+          "deviceId": "abe2a07d-4af3-433f-a81d-abf843f8c6f0"
+        },
+        {
+          "kind": "device.witness.settled",
+          "seq": 1,
+          "fileId": "0B9x5KOnVGoV3UAd",
+          "data": {
+            "stateKind": "present",
+            "editorSampleKind": "not_open",
+            "fileOpen": false,
+            "originClass": "disk-write",
+            "stableAfterMs": 2000,
+            "runtimeState": "foreground",
+            "causedByEvents": {},
+            "lastDiskWriteAt": 1779746573747,
+            "scenarioStepIndex": 3,
+            "scenarioStepLabel": "post-resync-convergence",
+            "scenarioRunId": "s12c-conflict-1779746543538",
+            "scenarioId": "s12c-conflict",
+            "stateHash": "h:f1e05473a578fd6ec286422473546260",
+            "crdtHash": "h:f1e05473a578fd6ec286422473546260",
+            "diskHash": "h:f1e05473a578fd6ec286422473546260",
+            "diskMatchesCrdt": true
+          },
+          "pathId": "p:f0338176f0b795676f799171b1142b48",
+          "deviceId": "7f8dcb15-15bd-47f7-aac7-7c68197ad486"
+        }
+      ],
+      "summary": "No sync-correctness divergences. 4 settled event(s)."
+    },
+    {
+      "ruleName": "analyzeStaleHashAfterNewerWitness",
+      "ok": true,
+      "evidence": [],
+      "summary": "No stale hash regressions."
+    },
+    {
+      "ruleName": "analyzeRecoveryEmittedOldHash",
+      "ok": true,
+      "evidence": [],
+      "summary": "No recovery-old-hash regressions."
+    },
+    {
+      "ruleName": "analyzeEditorStability",
+      "ok": true,
+      "evidence": [],
+      "summary": "No editor stability issues."
+    },
+    {
+      "ruleName": "analyzeCrossDeviceHashesEqual",
+      "ok": true,
+      "evidence": [
+        {
+          "abe2a07d-4af3-433f-a81d-abf843f8c6f0": "h:f1e05473a578fd6ec286422473546260",
+          "7f8dcb15-15bd-47f7-aac7-7c68197ad486": "h:f1e05473a578fd6ec286422473546260"
+        }
+      ],
+      "summary": "All devices agree on hash: h:f1e05473a578fd6ec286422473546260"
+    },
+    {
+      "ruleName": "analyzeConvergenceEvidence",
+      "ok": true,
+      "evidence": [
+        {
+          "abe2a07d-4af3-433f-a81d-abf843f8c6f0": {
+            "settled": true,
+            "seq": 3,
+            "scenarioStepIndex": 1
+          },
+          "7f8dcb15-15bd-47f7-aac7-7c68197ad486": {
+            "settled": true,
+            "seq": 1,
+            "scenarioStepIndex": 3
+          }
+        }
+      ],
+      "summary": "Device abe2a07d-4af3-433f-a81d-abf843f8c6f0 settled with h:f1e05473a578fd6ec286422473546260 at step 1 (seq 3). Device 7f8dcb15-15bd-47f7-aac7-7c68197ad486 settled with h:f1e05473a578fd6ec286422473546260 at step 3 (seq 1). No stale rewinds detected. No recovery emitted old hash."
+    }
+  ]
+}

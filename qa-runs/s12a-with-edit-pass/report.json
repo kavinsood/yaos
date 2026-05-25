@@ -1,0 +1,246 @@
+{
+  "summary": {
+    "ok": true,
+    "bundleCount": 2,
+    "eventCount": 8,
+    "scenarioRunId": "s12a-edit-1779746388463",
+    "scenarioId": "s12a-with-edit"
+  },
+  "bundle_validation": {
+    "parseErrors": [],
+    "validation": [
+      {
+        "filePath": "/home/kavin/github/do-sync/qa-runs/s12a-with-edit-pass/device-a.ndjson",
+        "accepted": true
+      },
+      {
+        "filePath": "/home/kavin/github/do-sync/qa-runs/s12a-with-edit-pass/device-b.ndjson",
+        "accepted": true
+      }
+    ],
+    "rejectionReason": null
+  },
+  "diagnostic_observations": {
+    "transient_open_editor_disk_lag": []
+  },
+  "rules": [
+    {
+      "ruleName": "analyzeWitnessQuorum",
+      "ok": true,
+      "evidence": [
+        {
+          "kind": "device.witness.settled",
+          "seq": 1,
+          "fileId": "ETm2wI3eXK5862nH",
+          "data": {
+            "stateKind": "present",
+            "editorSampleKind": "healthy_sampled",
+            "fileOpen": true,
+            "originClass": "disk-write",
+            "stableAfterMs": 2000,
+            "runtimeState": "foreground",
+            "causedByEvents": {},
+            "lastDiskWriteAt": 1779746399188,
+            "scenarioStepIndex": 1,
+            "scenarioStepLabel": "pre-edit-baseline",
+            "scenarioRunId": "s12a-edit-1779746388463",
+            "scenarioId": "s12a-with-edit",
+            "stateHash": "h:841294017e56468675c825673797bb34",
+            "crdtHash": "h:841294017e56468675c825673797bb34",
+            "diskHash": "h:841294017e56468675c825673797bb34",
+            "diskMatchesCrdt": true,
+            "editorHash": "h:841294017e56468675c825673797bb34",
+            "editorMatchesCrdt": true
+          },
+          "pathId": "p:b1e0ba533e57facc75143c10c8793c89",
+          "deviceId": "abe2a07d-4af3-433f-a81d-abf843f8c6f0"
+        },
+        {
+          "kind": "device.witness.settled",
+          "seq": 2,
+          "fileId": "ETm2wI3eXK5862nH",
+          "data": {
+            "stateKind": "present",
+            "editorSampleKind": "healthy_sampled",
+            "fileOpen": true,
+            "originClass": "local-edit",
+            "stableAfterMs": 2000,
+            "runtimeState": "foreground",
+            "causedByEvents": {},
+            "lastLocalEditAt": 1779746407429,
+            "scenarioStepIndex": 1,
+            "scenarioStepLabel": "pre-edit-baseline",
+            "scenarioRunId": "s12a-edit-1779746388463",
+            "scenarioId": "s12a-with-edit",
+            "stateHash": "h:74dd35f1691533698ca91846fe57936e",
+            "crdtHash": "h:74dd35f1691533698ca91846fe57936e",
+            "diskHash": "h:74dd35f1691533698ca91846fe57936e",
+            "diskMatchesCrdt": true,
+            "editorHash": "h:74dd35f1691533698ca91846fe57936e",
+            "editorMatchesCrdt": true
+          },
+          "pathId": "p:b1e0ba533e57facc75143c10c8793c89",
+          "deviceId": "abe2a07d-4af3-433f-a81d-abf843f8c6f0"
+        },
+        {
+          "kind": "device.witness.settled",
+          "seq": 3,
+          "fileId": "ETm2wI3eXK5862nH",
+          "data": {
+            "stateKind": "present",
+            "editorSampleKind": "healthy_sampled",
+            "fileOpen": true,
+            "originClass": "disk-write",
+            "stableAfterMs": 2000,
+            "runtimeState": "foreground",
+            "causedByEvents": {},
+            "lastDiskWriteAt": 1779746414462,
+            "scenarioStepIndex": 3,
+            "scenarioStepLabel": "post-edit-convergence",
+            "scenarioRunId": "s12a-edit-1779746388463",
+            "scenarioId": "s12a-with-edit",
+            "stateHash": "h:74dd35f1691533698ca91846fe57936e",
+            "crdtHash": "h:74dd35f1691533698ca91846fe57936e",
+            "diskHash": "h:74dd35f1691533698ca91846fe57936e",
+            "diskMatchesCrdt": true,
+            "editorHash": "h:74dd35f1691533698ca91846fe57936e",
+            "editorMatchesCrdt": true
+          },
+          "pathId": "p:b1e0ba533e57facc75143c10c8793c89",
+          "deviceId": "abe2a07d-4af3-433f-a81d-abf843f8c6f0"
+        },
+        {
+          "kind": "device.witness.settled",
+          "seq": 1,
+          "fileId": "ETm2wI3eXK5862nH",
+          "data": {
+            "stateKind": "present",
+            "editorSampleKind": "healthy_sampled",
+            "fileOpen": true,
+            "originClass": "disk-write",
+            "stableAfterMs": 2000,
+            "runtimeState": "foreground",
+            "causedByEvents": {},
+            "lastDiskWriteAt": 1779746399192,
+            "scenarioStepIndex": 1,
+            "scenarioStepLabel": "pre-edit-baseline",
+            "scenarioRunId": "s12a-edit-1779746388463",
+            "scenarioId": "s12a-with-edit",
+            "stateHash": "h:841294017e56468675c825673797bb34",
+            "crdtHash": "h:841294017e56468675c825673797bb34",
+            "diskHash": "h:841294017e56468675c825673797bb34",
+            "diskMatchesCrdt": true,
+            "editorHash": "h:841294017e56468675c825673797bb34",
+            "editorMatchesCrdt": true
+          },
+          "pathId": "p:b1e0ba533e57facc75143c10c8793c89",
+          "deviceId": "7f8dcb15-15bd-47f7-aac7-7c68197ad486"
+        },
+        {
+          "kind": "device.witness.settled",
+          "seq": 2,
+          "fileId": "ETm2wI3eXK5862nH",
+          "data": {
+            "stateKind": "present",
+            "editorSampleKind": "healthy_sampled",
+            "fileOpen": true,
+            "originClass": "remote-apply",
+            "stableAfterMs": 2000,
+            "runtimeState": "foreground",
+            "causedByEvents": {},
+            "lastRemoteApplyAt": 1779746407567,
+            "lastDiskWriteAt": 1779746409039,
+            "scenarioStepIndex": 1,
+            "scenarioStepLabel": "pre-edit-baseline",
+            "scenarioRunId": "s12a-edit-1779746388463",
+            "scenarioId": "s12a-with-edit",
+            "stateHash": "h:74dd35f1691533698ca91846fe57936e",
+            "crdtHash": "h:74dd35f1691533698ca91846fe57936e",
+            "diskHash": "h:74dd35f1691533698ca91846fe57936e",
+            "diskMatchesCrdt": true,
+            "editorHash": "h:74dd35f1691533698ca91846fe57936e",
+            "editorMatchesCrdt": true
+          },
+          "pathId": "p:b1e0ba533e57facc75143c10c8793c89",
+          "deviceId": "7f8dcb15-15bd-47f7-aac7-7c68197ad486"
+        },
+        {
+          "kind": "device.witness.settled",
+          "seq": 3,
+          "fileId": "ETm2wI3eXK5862nH",
+          "data": {
+            "stateKind": "present",
+            "editorSampleKind": "healthy_sampled",
+            "fileOpen": true,
+            "originClass": "disk-write",
+            "stableAfterMs": 2000,
+            "runtimeState": "foreground",
+            "causedByEvents": {},
+            "lastDiskWriteAt": 1779746414463,
+            "scenarioStepIndex": 3,
+            "scenarioStepLabel": "post-edit-convergence",
+            "scenarioRunId": "s12a-edit-1779746388463",
+            "scenarioId": "s12a-with-edit",
+            "stateHash": "h:74dd35f1691533698ca91846fe57936e",
+            "crdtHash": "h:74dd35f1691533698ca91846fe57936e",
+            "diskHash": "h:74dd35f1691533698ca91846fe57936e",
+            "diskMatchesCrdt": true,
+            "editorHash": "h:74dd35f1691533698ca91846fe57936e",
+            "editorMatchesCrdt": true
+          },
+          "pathId": "p:b1e0ba533e57facc75143c10c8793c89",
+          "deviceId": "7f8dcb15-15bd-47f7-aac7-7c68197ad486"
+        }
+      ],
+      "summary": "No sync-correctness divergences. 6 settled event(s)."
+    },
+    {
+      "ruleName": "analyzeStaleHashAfterNewerWitness",
+      "ok": true,
+      "evidence": [],
+      "summary": "No stale hash regressions."
+    },
+    {
+      "ruleName": "analyzeRecoveryEmittedOldHash",
+      "ok": true,
+      "evidence": [],
+      "summary": "No recovery-old-hash regressions."
+    },
+    {
+      "ruleName": "analyzeEditorStability",
+      "ok": true,
+      "evidence": [],
+      "summary": "No editor stability issues."
+    },
+    {
+      "ruleName": "analyzeCrossDeviceHashesEqual",
+      "ok": true,
+      "evidence": [
+        {
+          "abe2a07d-4af3-433f-a81d-abf843f8c6f0": "h:74dd35f1691533698ca91846fe57936e",
+          "7f8dcb15-15bd-47f7-aac7-7c68197ad486": "h:74dd35f1691533698ca91846fe57936e"
+        }
+      ],
+      "summary": "All devices agree on hash: h:74dd35f1691533698ca91846fe57936e"
+    },
+    {
+      "ruleName": "analyzeConvergenceEvidence",
+      "ok": true,
+      "evidence": [
+        {
+          "abe2a07d-4af3-433f-a81d-abf843f8c6f0": {
+            "settled": true,
+            "seq": 2,
+            "scenarioStepIndex": 1
+          },
+          "7f8dcb15-15bd-47f7-aac7-7c68197ad486": {
+            "settled": true,
+            "seq": 2,
+            "scenarioStepIndex": 1
+          }
+        }
+      ],
+      "summary": "Device abe2a07d-4af3-433f-a81d-abf843f8c6f0 settled with h:74dd35f1691533698ca91846fe57936e at step 1 (seq 2). Device 7f8dcb15-15bd-47f7-aac7-7c68197ad486 settled with h:74dd35f1691533698ca91846fe57936e at step 1 (seq 2). No stale rewinds detected. No recovery emitted old hash."
+    }
+  ]
+}

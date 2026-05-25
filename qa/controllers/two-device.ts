@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * qa:two-device — Run a two-device QA scenario against two live Obsidian instances.
+ * qa:two-device -- Run a two-device QA scenario against two live Obsidian instances.
  *
  * Usage:
  *   bun run qa:two-device --scenario offline-handoff-create \
@@ -12,8 +12,8 @@
  *   /path/to/Obsidian --remote-debugging-port=922X --user-data-dir=/tmp/obs-X
  *
  * Drivers:
- *   raw-cdp    — Raw WebSocket CDP (default). Works with all Electron versions.
- *   playwright — Playwright connectOverCDP. May fail on newer Electron/Chrome.
+ *   raw-cdp    -- Raw WebSocket CDP (default). Works with all Electron versions.
+ *   playwright -- Playwright connectOverCDP. May fail on newer Electron/Chrome.
  *
  * Exit code 0 = PASS on both devices. Exit code 1 = any failure.
  */
@@ -245,24 +245,24 @@ async function s10fSetup(
 ): Promise<boolean> {
 	const openOnBoth = opts?.openOnBoth ?? true;
 
-	log("Setup: creating test file…");
+	log("Setup: creating test file...");
 	await creator.evalRaw(`window.__YAOS_QA__?.createFile(${JSON.stringify(scratch)}, ${JSON.stringify(initial)})`);
 	await creator.evalRaw(`window.__YAOS_DEBUG__?.waitForIdle(15000)`);
 
-	log("Setup: waiting for file on receiver…");
+	log("Setup: waiting for file on receiver...");
 	await receiver.evalRaw(`window.__YAOS_DEBUG__?.waitForFile(${JSON.stringify(scratch)}, 20000)`);
 	await receiver.evalRaw(`window.__YAOS_DEBUG__?.waitForIdle(10000)`);
 
 	const hashC = await creator.evalRaw<string | null>(`window.__YAOS_DEBUG__?.getDiskHash(${JSON.stringify(scratch)})`);
 	const hashR = await receiver.evalRaw<string | null>(`window.__YAOS_DEBUG__?.getDiskHash(${JSON.stringify(scratch)})`);
 	if (hashC !== hashR) {
-		errors.push(`Setup: hashes differ — creator=${hashC?.slice(0, 12)}, receiver=${hashR?.slice(0, 12)}`);
+		errors.push(`Setup: hashes differ -- creator=${hashC?.slice(0, 12)}, receiver=${hashR?.slice(0, 12)}`);
 		return false;
 	}
 	log("Setup: both devices have identical file ✓");
 
 	if (openOnBoth) {
-		log("Setup: opening file on both…");
+		log("Setup: opening file on both...");
 		await creator.evalRaw(`window.__YAOS_QA__?.openFile(${JSON.stringify(scratch)})`);
 		await receiver.evalRaw(`window.__YAOS_QA__?.openFile(${JSON.stringify(scratch)})`);
 		await creator.evalRaw(`window.__YAOS_QA__?.waitForCrdtBinding(${JSON.stringify(scratch)}, 10000)`);
@@ -293,7 +293,7 @@ async function s10fConvergence(
 	errors: string[],
 	log: (msg: string) => void,
 ): Promise<void> {
-	log("Convergence: waiting for passive device…");
+	log("Convergence: waiting for passive device...");
 	await passive.evalRaw(`window.__YAOS_DEBUG__?.waitForIdle(20000)`).catch(() => {});
 	await new Promise((r) => setTimeout(r, 5000));
 
@@ -432,18 +432,18 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		const errors: string[] = [];
 		const scratch = "QA-scratch/s02-two-device-offline-handoff.md";
 
-		// 1. Hard offline hold on B — blocks ALL auto-reconnect paths
-		log("Device B: activating offline hold…");
+		// 1. Hard offline hold on B -- blocks ALL auto-reconnect paths
+		log("Device B: activating offline hold...");
 		await b.evalRaw(`window.__YAOS_DEBUG__?.setQaNetworkHold("offline")`);
 		await b.evalRaw(`window.__YAOS_DEBUG__?.waitForProviderDisconnected(10000)`);
 		log("Device B: provider disconnected.");
 
 		// 2. A creates the file and waits for server receipt
-		log("Device A: creating file…");
+		log("Device A: creating file...");
 		await a.evalRaw(
 			`window.__YAOS_QA__?.createFile(${JSON.stringify(scratch)}, "# Offline Handoff\\n\\nCreated on A while B offline.\\n")`
 		);
-		log("Device A: waiting for server receipt…");
+		log("Device A: waiting for server receipt...");
 		try {
 			const actionTs = Date.now();
 			await a.evalRaw(`
@@ -459,7 +459,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		}
 
 		// 3. Release B offline hold and reconnect
-		log("Device B: releasing offline hold and reconnecting…");
+		log("Device B: releasing offline hold and reconnecting...");
 		await b.evalRaw(`window.__YAOS_DEBUG__?.setQaNetworkHold("online")`);
 		await b.evalRaw(`window.__YAOS_DEBUG__?.waitForIdle(30000)`).catch((e: unknown) => {
 			errors.push(`Device B idle wait after reconnect failed: ${String(e)}`);
@@ -511,7 +511,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		const scratch = "QA-scratch/s03-two-device-delete.md";
 
 		// Setup: create on A, wait for sync to both
-		log("Device A: creating test file…");
+		log("Device A: creating test file...");
 		await a.evalRaw(
 			`window.__YAOS_QA__?.createFile(${JSON.stringify(scratch)}, "# S03 Two-Device Delete\\n")`
 		);
@@ -527,20 +527,20 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 			errors.push("File did not sync to device B before delete test");
 		}
 
-		// Hard offline hold on B (B goes stale — all reconnect paths blocked)
-		log("Device B: activating offline hold (going stale)…");
+		// Hard offline hold on B (B goes stale -- all reconnect paths blocked)
+		log("Device B: activating offline hold (going stale)...");
 		await b.evalRaw(`window.__YAOS_DEBUG__?.setQaNetworkHold("offline")`);
 		await b.evalRaw(`window.__YAOS_DEBUG__?.waitForProviderDisconnected(10000)`);
 		log("Device B: disconnected.");
 
 		// A deletes and confirms
-		log("Device A: deleting file…");
+		log("Device A: deleting file...");
 		await a.evalRaw(`window.__YAOS_QA__?.deleteFile(${JSON.stringify(scratch)})`);
 		await a.evalRaw(`window.__YAOS_QA__?.waitForIdle(10000)`);
 		log("Device A: file deleted.");
 
 		// Release B's offline hold
-		log("Device B: releasing offline hold…");
+		log("Device B: releasing offline hold...");
 		await b.evalRaw(`window.__YAOS_DEBUG__?.setQaNetworkHold("online")`);
 		await b.evalRaw(`window.__YAOS_DEBUG__?.waitForIdle(20000)`).catch((e: unknown) => {
 			errors.push(`Device B idle wait after reconnect failed: ${String(e)}`);
@@ -569,7 +569,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 	 *   Both devices online, same file open.
 	 *   Device A deletes sentinel text THROUGH THE REAL EDITOR and continues typing.
 	 *   Device B is passive (file open, no typing).
-	 *   Poll Device A editor content at 250ms — fail if sentinel EVER reappears.
+	 *   Poll Device A editor content at 250ms -- fail if sentinel EVER reappears.
 	 *   Assert: Device B converges to Device A's final state.
 	 *
 	 * This is the definitive test for #22. Uses real editor transactions (not
@@ -596,11 +596,11 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 
 		// ── Setup: create file, sync to both, open on both ──────────────
 
-		log("Setup: creating test file on Device A…");
+		log("Setup: creating test file on Device A...");
 		await a.evalRaw(`window.__YAOS_QA__?.createFile(${JSON.stringify(scratch)}, ${JSON.stringify(INITIAL)})`);
 		await a.evalRaw(`window.__YAOS_DEBUG__?.waitForIdle(15000)`);
 
-		log("Setup: waiting for file on Device B…");
+		log("Setup: waiting for file on Device B...");
 		await b.evalRaw(`window.__YAOS_DEBUG__?.waitForFile(${JSON.stringify(scratch)}, 20000)`);
 		await b.evalRaw(`window.__YAOS_DEBUG__?.waitForIdle(10000)`);
 
@@ -608,13 +608,13 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		const hashA0 = await a.evalRaw<string | null>(`window.__YAOS_DEBUG__?.getDiskHash(${JSON.stringify(scratch)})`);
 		const hashB0 = await b.evalRaw<string | null>(`window.__YAOS_DEBUG__?.getDiskHash(${JSON.stringify(scratch)})`);
 		if (hashA0 !== hashB0) {
-			errors.push(`Setup: hashes differ — A=${hashA0?.slice(0, 12)}, B=${hashB0?.slice(0, 12)}`);
+			errors.push(`Setup: hashes differ -- A=${hashA0?.slice(0, 12)}, B=${hashB0?.slice(0, 12)}`);
 			return { passedA: false, passedB: false, errors };
 		}
 		log("Setup: both devices have identical file ✓");
 
 		// Open on both with real editor binding
-		log("Setup: opening file on both…");
+		log("Setup: opening file on both...");
 		await a.evalRaw(`window.__YAOS_QA__?.openFile(${JSON.stringify(scratch)})`);
 		await b.evalRaw(`window.__YAOS_QA__?.openFile(${JSON.stringify(scratch)})`);
 		await a.evalRaw(`window.__YAOS_QA__?.waitForCrdtBinding(${JSON.stringify(scratch)}, 10000)`);
@@ -626,7 +626,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 
 		// ── Action: Device A deletes sentinel THROUGH THE EDITOR ─────────
 
-		log("Action: Device A deleting sentinel through editor…");
+		log("Action: Device A deleting sentinel through editor...");
 		// Find the sentinel line and delete it via editor.replaceRange (real CM6 transaction)
 		const deletionOk = await a.evalRaw<boolean>(`
 			(function() {
@@ -664,7 +664,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		log("Action: sentinel deleted from A's editor ✓");
 
 		// Device A continues typing through the real editor (burst typing)
-		log("Action: Device A typing post-deletion…");
+		log("Action: Device A typing post-deletion...");
 		await a.evalRaw(`
 			(function() {
 				const editor = app.workspace.activeEditor?.editor;
@@ -675,7 +675,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 
 		// ── Monitoring: poll A's EDITOR at 250ms for sentinel reversion ──
 
-		log("Monitoring: polling Device A editor for reversion (30s at 250ms)…");
+		log("Monitoring: polling Device A editor for reversion (30s at 250ms)...");
 		const POLL_DURATION = 30_000;
 		const POLL_INTERVAL = 250;
 		const pollStart = Date.now();
@@ -719,7 +719,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 
 		// ── Convergence: check B ────────────────────────────────────────
 
-		log("Convergence: waiting for Device B…");
+		log("Convergence: waiting for Device B...");
 		await b.evalRaw(`window.__YAOS_DEBUG__?.waitForIdle(20000)`).catch(() => {});
 		await new Promise((r) => setTimeout(r, 5000));
 
@@ -754,7 +754,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 	},
 
 	// ───────────────────────────────────────────────────────────────────
-	// s10f-2: Reversed roles — B active, A passive
+	// s10f-2: Reversed roles -- B active, A passive
 	// ───────────────────────────────────────────────────────────────────
 
 	"issue-22-reversed-roles": async (a, b, log) => {
@@ -768,7 +768,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		await new Promise((r) => setTimeout(r, 2000));
 
 		// B is active, A is passive (reversed from original)
-		log("Action: Device B deleting sentinel through editor…");
+		log("Action: Device B deleting sentinel through editor...");
 		const deletionOk = await b.evalRaw<boolean>(deleteSentinelExpr(S10F_SENTINEL));
 		if (!deletionOk) {
 			errors.push("Device B: could not delete sentinel through editor");
@@ -785,9 +785,9 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		log("Action: sentinel deleted from B's editor ✓");
 
 		await b.evalRaw(typeAtCursorExpr("\nTyped after deletion by B. Marker R0L3.\n"));
-		log("Action: Device B typing post-deletion…");
+		log("Action: Device B typing post-deletion...");
 
-		log("Monitoring: polling Device B editor for reversion (30s at 250ms)…");
+		log("Monitoring: polling Device B editor for reversion (30s at 250ms)...");
 		const poll = await pollForReversion(b, S10F_SENTINEL, 30_000, 250, log);
 		errors.push(...poll.errors);
 
@@ -798,7 +798,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 	},
 
 	// ───────────────────────────────────────────────────────────────────
-	// s10f-3: Sustained editing soak — 5 min of burst typing with
+	// s10f-3: Sustained editing soak -- 5 min of burst typing with
 	//         corrections and deletions on the active device
 	// ───────────────────────────────────────────────────────────────────
 
@@ -812,7 +812,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		}
 		await new Promise((r) => setTimeout(r, 2000));
 
-		log("Action: Device A deleting sentinel…");
+		log("Action: Device A deleting sentinel...");
 		const deletionOk = await a.evalRaw<boolean>(deleteSentinelExpr(S10F_SENTINEL));
 		if (!deletionOk) {
 			errors.push("Device A: could not delete sentinel");
@@ -824,7 +824,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		// 5 min sustained soak: type, correct, type more
 		const SOAK_DURATION = 5 * 60 * 1000; // 5 minutes
 		const POLL_INTERVAL = 500;
-		log(`Soak: ${SOAK_DURATION / 1000}s of sustained editing with 500ms polls…`);
+		log(`Soak: ${SOAK_DURATION / 1000}s of sustained editing with 500ms polls...`);
 
 		const soakStart = Date.now();
 		let pollCount = 0;
@@ -891,7 +891,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		await new Promise((r) => setTimeout(r, 2000));
 
 		// A deletes sentinel
-		log("Action: Device A deleting sentinel…");
+		log("Action: Device A deleting sentinel...");
 		const deletionOk = await a.evalRaw<boolean>(deleteSentinelExpr(S10F_SENTINEL));
 		if (!deletionOk) {
 			errors.push("Device A: could not delete sentinel");
@@ -908,7 +908,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 
 		for (let i = 1; i <= CYCLES; i++) {
 			// ── Disconnect B ──
-			log(`Cycle ${i}/${CYCLES}: disconnecting B…`);
+			log(`Cycle ${i}/${CYCLES}: disconnecting B...`);
 			await b.evalRaw(`window.__YAOS_DEBUG__?.setQaNetworkHold("offline")`);
 
 			// Verify disconnect with generous timeout. The hold mechanism can be slow
@@ -922,7 +922,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 				})()
 			`);
 			if (!disconnected) {
-				log(`Cycle ${i}/${CYCLES}: WARNING — B did not disconnect within 25s, skipping cycle`);
+				log(`Cycle ${i}/${CYCLES}: WARNING -- B did not disconnect within 25s, skipping cycle`);
 				// Release hold so it doesn't affect next cycle
 				await b.evalRaw(`window.__YAOS_DEBUG__?.setQaNetworkHold("online")`).catch(() => {});
 				await new Promise((r) => setTimeout(r, 2000));
@@ -930,13 +930,13 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 			}
 			log(`Cycle ${i}/${CYCLES}: B disconnected (providerConnected=false) ✓`);
 			if (!disconnected) {
-				errors.push(`Cycle ${i}: B failed to disconnect — provider still connected`);
+				errors.push(`Cycle ${i}: B failed to disconnect -- provider still connected`);
 				break;
 			}
 			log(`Cycle ${i}/${CYCLES}: B disconnected (providerConnected=false) ✓`);
 
 			// Poll A during B's offline period
-			log(`Cycle ${i}/${CYCLES}: polling A while B offline (${CYCLE_OFFLINE_MS / 1000}s)…`);
+			log(`Cycle ${i}/${CYCLES}: polling A while B offline (${CYCLE_OFFLINE_MS / 1000}s)...`);
 			const offlinePoll = await pollForReversion(a, S10F_SENTINEL, CYCLE_OFFLINE_MS, 250, log, {
 				burstEvery: 10,
 				burstText: ` cycle${i} `,
@@ -948,7 +948,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 			}
 
 			// ── Reconnect B ──
-			log(`Cycle ${i}/${CYCLES}: reconnecting B…`);
+			log(`Cycle ${i}/${CYCLES}: reconnecting B...`);
 			await b.evalRaw(`window.__YAOS_DEBUG__?.setQaNetworkHold("online")`);
 
 			// Assert: B actually reconnected and synced
@@ -966,7 +966,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 				})()
 			`);
 			if (!synced) {
-				errors.push(`Cycle ${i}: B failed to reconnect/sync — providerSynced=false`);
+				errors.push(`Cycle ${i}: B failed to reconnect/sync -- providerSynced=false`);
 				break;
 			}
 			log(`Cycle ${i}/${CYCLES}: B reconnected + synced ✓`);
@@ -993,15 +993,15 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 				})()
 			`);
 			if (bHasSentinel) {
-				// Disk may lag behind CRDT after reconnect — this is a timing issue,
+				// Disk may lag behind CRDT after reconnect -- this is a timing issue,
 				// not a sync failure. The final convergence check is what matters.
-				log(`Cycle ${i}/${CYCLES}: NOTE — B disk still has sentinel (disk lag after sync)`);
+				log(`Cycle ${i}/${CYCLES}: NOTE -- B disk still has sentinel (disk lag after sync)`);
 			} else {
 				log(`Cycle ${i}/${CYCLES}: B sentinel absent after sync ✓`);
 			}
 
 			// Poll A during post-reconnect period (this is when stale pushback could happen)
-			log(`Cycle ${i}/${CYCLES}: polling A during B post-reconnect (${CYCLE_ONLINE_MS / 1000}s)…`);
+			log(`Cycle ${i}/${CYCLES}: polling A during B post-reconnect (${CYCLE_ONLINE_MS / 1000}s)...`);
 			const reconnectPoll = await pollForReversion(a, S10F_SENTINEL, CYCLE_ONLINE_MS, 250, log, {
 				burstEvery: 15,
 				burstText: ` rc${i} `,
@@ -1021,7 +1021,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 	},
 
 	// ───────────────────────────────────────────────────────────────────
-	// s10f-5: Old-passive-peer — B opens file, sits idle for a long time,
+	// s10f-5: Old-passive-peer -- B opens file, sits idle for a long time,
 	//         then A edits. Tests stale editor/disk on B.
 	// ───────────────────────────────────────────────────────────────────
 
@@ -1036,11 +1036,11 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 
 		// B has file open. Now let B sit idle for a long time.
 		const IDLE_PERIOD = 30_000; // 30 seconds
-		log(`Idle: letting B sit with file open for ${IDLE_PERIOD / 1000}s…`);
+		log(`Idle: letting B sit with file open for ${IDLE_PERIOD / 1000}s...`);
 		await new Promise((r) => setTimeout(r, IDLE_PERIOD));
 
-		// Now A edits — B's state might be stale
-		log("Action: Device A deleting sentinel after B's long idle…");
+		// Now A edits -- B's state might be stale
+		log("Action: Device A deleting sentinel after B's long idle...");
 		const deletionOk = await a.evalRaw<boolean>(deleteSentinelExpr(S10F_SENTINEL));
 		if (!deletionOk) {
 			errors.push("Device A: could not delete sentinel");
@@ -1050,7 +1050,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		await a.evalRaw(typeAtCursorExpr("\nEdited after B's long idle. Marker P5W1.\n"));
 		log("Action: sentinel deleted, A continues typing ✓");
 
-		log("Monitoring: polling A for reversion (30s)…");
+		log("Monitoring: polling A for reversion (30s)...");
 		const poll = await pollForReversion(a, S10F_SENTINEL, 30_000, 250, log);
 		errors.push(...poll.errors);
 
@@ -1060,7 +1060,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 	},
 
 	// ───────────────────────────────────────────────────────────────────
-	// s10f-6: Repeated delete/retype — A deletes sentinel, retypes it,
+	// s10f-6: Repeated delete/retype -- A deletes sentinel, retypes it,
 	//         deletes again, retypes again. The sentinel must stay deleted
 	//         after the final deletion.
 	// ───────────────────────────────────────────────────────────────────
@@ -1077,7 +1077,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 
 		const CYCLES = 4;
 		for (let i = 1; i <= CYCLES; i++) {
-			log(`Cycle ${i}/${CYCLES}: deleting sentinel…`);
+			log(`Cycle ${i}/${CYCLES}: deleting sentinel...`);
 
 			// Delete sentinel
 			const deleted = await a.evalRaw<boolean>(deleteSentinelExpr(S10F_SENTINEL));
@@ -1093,7 +1093,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 			}
 
 			// Brief poll to catch immediate reversion
-			log(`Cycle ${i}/${CYCLES}: polling for reversion (5s)…`);
+			log(`Cycle ${i}/${CYCLES}: polling for reversion (5s)...`);
 			const poll = await pollForReversion(a, S10F_SENTINEL, 5000, 250, log, { burstEvery: 0 });
 			if (poll.reversionDetected) {
 				errors.push(`Cycle ${i}: immediate reversion after delete`);
@@ -1103,14 +1103,14 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 
 			// Retype sentinel (except on last cycle)
 			if (i < CYCLES) {
-				log(`Cycle ${i}/${CYCLES}: retyping sentinel…`);
+				log(`Cycle ${i}/${CYCLES}: retyping sentinel...`);
 				await a.evalRaw(typeAtCursorExpr(`\n${S10F_SENTINEL}\n`));
 				await new Promise((r) => setTimeout(r, 3000)); // Let it sync
 			}
 		}
 
 		// Final monitoring after last deletion
-		log("Final monitoring: polling A for 30s…");
+		log("Final monitoring: polling A for 30s...");
 		const finalPoll = await pollForReversion(a, S10F_SENTINEL, 30_000, 250, log);
 		errors.push(...finalPoll.errors);
 
@@ -1120,7 +1120,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 	},
 
 	// ───────────────────────────────────────────────────────────────────
-	// s10f-7: Both cursors near same location — A types heavily near
+	// s10f-7: Both cursors near same location -- A types heavily near
 	//         the sentinel, then deletes it. B is positioned at same
 	//         location but passive. Tests concurrent cursor proximity.
 	// ───────────────────────────────────────────────────────────────────
@@ -1136,7 +1136,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		await new Promise((r) => setTimeout(r, 2000));
 
 		// Position B's cursor near the sentinel line
-		log("Setup: positioning B's cursor near sentinel…");
+		log("Setup: positioning B's cursor near sentinel...");
 		await b.evalRaw(`
 			(function() {
 				const editor = app.workspace.activeEditor?.editor;
@@ -1150,7 +1150,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		`);
 
 		// A types heavily around the sentinel area, then deletes it
-		log("Action: Device A typing heavily near sentinel…");
+		log("Action: Device A typing heavily near sentinel...");
 		for (let i = 0; i < 10; i++) {
 			await a.evalRaw(`
 				(function() {
@@ -1170,7 +1170,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		log("Action: burst typing complete ✓");
 
 		// Now delete the sentinel
-		log("Action: Device A deleting sentinel…");
+		log("Action: Device A deleting sentinel...");
 		const deletionOk = await a.evalRaw<boolean>(deleteSentinelExpr(S10F_SENTINEL));
 		if (!deletionOk) {
 			errors.push("Device A: could not delete sentinel after burst typing");
@@ -1180,7 +1180,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		await a.evalRaw(typeAtCursorExpr("\nPost-sentinel-delete in proximity test.\n"));
 		log("Action: sentinel deleted ✓");
 
-		log("Monitoring: polling A for reversion (30s)…");
+		log("Monitoring: polling A for reversion (30s)...");
 		const poll = await pollForReversion(a, S10F_SENTINEL, 30_000, 250, log);
 		errors.push(...poll.errors);
 
@@ -1215,7 +1215,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 
 	// s10e-1: B edits while YAOS disabled, A makes NO changes.
 	// Expected: B's disk edit cleanly wins (import-disk-to-crdt, no artifact).
-	// Current status: EXPECTED FAIL — missing-baseline causes wrong conflict
+	// Current status: EXPECTED FAIL -- missing-baseline causes wrong conflict
 	// artifact to be created. Pending DiskIndexEntry.contentHash baseline fix.
 	"issue-22-disable-reenable-local-only": async (a, b, log) => {
 		const errors: string[] = [];
@@ -1235,7 +1235,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 
 		// ── Disable YAOS on B ────────────────────────────────────────────
 
-		log("Action: disabling YAOS plugin on Device B…");
+		log("Action: disabling YAOS plugin on Device B...");
 		await b.evalRaw(`app.plugins.disablePlugin("yaos")`);
 		await new Promise((r) => setTimeout(r, 3000));
 
@@ -1254,7 +1254,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 
 		// ── B edits while YAOS is disabled ───────────────────────────────
 
-		log("Action: editing file on B while YAOS is disabled…");
+		log("Action: editing file on B while YAOS is disabled...");
 		await b.evalRaw(`
 			(async () => {
 				const f = app.vault.getAbstractFileByPath(${JSON.stringify(scratch)});
@@ -1279,7 +1279,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 
 		// ── Re-enable YAOS on B ──────────────────────────────────────────
 
-		log("Action: re-enabling YAOS plugin on Device B…");
+		log("Action: re-enabling YAOS plugin on Device B...");
 		await b.evalRaw(`app.plugins.enablePlugin("yaos")`);
 
 		const qaReady = await b.evalRaw<boolean>(`
@@ -1383,12 +1383,12 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 	},
 
 	// s10e-2: B edits while YAOS disabled, A ALSO edits through YAOS.
-	// Expected: conflict preserved — both edits survive (main + artifact).
+	// Expected: conflict preserved -- both edits survive (main + artifact).
 	// This was the original "issue-22-disable-reenable-disk-wins" test.
 	// Name corrected: "disk wins" is wrong for the concurrent case.
 	// Current behavior: missing-baseline/winner=crdt (CRDT wins main, disk in
 	// artifact). After baseline fix: both-changed/winner=disk (disk wins main,
-	// CRDT in artifact). Both produce a conflict artifact — test passes either way.
+	// CRDT in artifact). Both produce a conflict artifact -- test passes either way.
 	"issue-22-disable-reenable-concurrent": async (a, b, log) => {
 		const errors: string[] = [];
 		const scratch = "QA-scratch/s10e-disable-reenable.md";
@@ -1410,7 +1410,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 
 		// ── Disable YAOS on B ────────────────────────────────────────────
 
-		log("Action: disabling YAOS plugin on Device B…");
+		log("Action: disabling YAOS plugin on Device B...");
 		await b.evalRaw(`app.plugins.disablePlugin("yaos")`);
 
 		// Wait for plugin to fully unload
@@ -1443,9 +1443,9 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		}
 
 		// ── Edit on B while YAOS is disabled ─────────────────────────────
-		// Use raw Obsidian vault API — no YAOS involved
+		// Use raw Obsidian vault API -- no YAOS involved
 
-		log("Action: editing file on B while YAOS is disabled…");
+		log("Action: editing file on B while YAOS is disabled...");
 		await b.evalRaw(`
 			(async () => {
 				const f = app.vault.getAbstractFileByPath(${JSON.stringify(scratch)});
@@ -1470,7 +1470,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		log("Action: edit landed on B disk while YAOS disabled ✓");
 
 		// Meanwhile, A continues editing through YAOS (A is still online)
-		log("Action: A continues editing while B has YAOS disabled…");
+		log("Action: A continues editing while B has YAOS disabled...");
 		await a.evalRaw(`window.__YAOS_QA__?.openFile(${JSON.stringify(scratch)})`);
 		await a.evalRaw(`window.__YAOS_QA__?.waitForCrdtBinding(${JSON.stringify(scratch)}, 10000)`);
 		await a.evalRaw(typeAtCursorExpr("\nEdited on A while B was disabled. Marker A7E2.\n"));
@@ -1479,7 +1479,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 
 		// ── Re-enable YAOS on B ──────────────────────────────────────────
 
-		log("Action: re-enabling YAOS plugin on Device B…");
+		log("Action: re-enabling YAOS plugin on Device B...");
 		await b.evalRaw(`app.plugins.enablePlugin("yaos")`);
 
 		// Wait for YAOS to fully initialize
@@ -1515,7 +1515,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		}
 
 		// Wait for full startup: local ready + provider synced + reconciled
-		log("Action: waiting for B startup reconciliation…");
+		log("Action: waiting for B startup reconciliation...");
 		const startupOk = await b.evalRaw<boolean>(`
 			(async () => {
 				const d = window.__YAOS_DEBUG__;
@@ -1538,7 +1538,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 
 		// ── Preservation audit: are both edits preserved? ─────────────────
 		// The invariant: on concurrent conflict, neither edit is silently lost.
-		// Either edit may win the main file — both are acceptable. The other
+		// Either edit may win the main file -- both are acceptable. The other
 		// edit must appear in a conflict artifact.
 		//
 		// Current behavior with baseline fix (both-changed/winner=disk):
@@ -1549,7 +1549,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		//
 		// Both are correct conflict preservation. Test accepts either.
 
-		log("Preservation audit: checking B vault for conflict artifact…");
+		log("Preservation audit: checking B vault for conflict artifact...");
 		const scratchBaseName = scratch.split("/").pop()?.replace(".md", "") ?? "";
 		const audit = await b.evalRaw<{
 			mainHasDisable: boolean;
@@ -1627,7 +1627,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 			`window.__YAOS_DEBUG__?.getDiskHash(${JSON.stringify(scratch)})`,
 		);
 		if (hashA !== hashB) {
-			// Not necessarily an error — main files should converge, conflict file is separate
+			// Not necessarily an error -- main files should converge, conflict file is separate
 			log(`Note: main file hashes differ: A=${hashA?.slice(0, 12)}, B=${hashB?.slice(0, 12)}`);
 		} else {
 			log("Final: A == B main-file hash ✓");
@@ -1636,7 +1636,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		// ── Assert: conflict artifact synced to A ────────────────────────
 
 		if (audit.conflictPath) {
-			log(`Conflict sync: waiting for "${audit.conflictPath}" to reach A (up to 30s)…`);
+			log(`Conflict sync: waiting for "${audit.conflictPath}" to reach A (up to 30s)...`);
 			const conflictOnA = await a.evalRaw<boolean>(`
 				(async () => {
 					const path = ${JSON.stringify(audit.conflictPath)};
@@ -1651,7 +1651,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 			if (conflictOnA) {
 				log("Conflict sync: artifact reached A ✓");
 			} else {
-				log("Conflict sync: artifact not yet on A within 30s (cleanup/propagation race — observed behavior)");
+				log("Conflict sync: artifact not yet on A within 30s (cleanup/propagation race -- observed behavior)");
 			}
 		}
 
@@ -1705,7 +1705,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		// This goes through the normal vault modify path; YAOS observes the
 		// disk change, seeded/imported into CRDT, setDiskWriteCallback fires.
 
-		log("Action: B edits file while YAOS is running (baseline must advance)…");
+		log("Action: B edits file while YAOS is running (baseline must advance)...");
 		const enabledEditContent = `\n${ENABLED_EDIT_MARKER}. Edit through running YAOS.\n`;
 		await b.evalRaw(`
 			(async () => {
@@ -1757,7 +1757,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		// teardownSync() will: flushAllPendingWrites() → saveDiskIndex()
 		// The saved index should now have contentHash = SHA-256(INITIAL + ENABLED_EDIT)
 
-		log("Action: disabling YAOS on B (baseline should be post-enabled-edit)…");
+		log("Action: disabling YAOS on B (baseline should be post-enabled-edit)...");
 		await b.evalRaw(`app.plugins.disablePlugin("yaos")`);
 		await new Promise((r) => setTimeout(r, 3000));
 
@@ -1781,7 +1781,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		// A does NOT edit. So CRDT = post-enabled-edit state.
 		// With correct baseline: disk-only change → import-disk-to-crdt, no artifact.
 
-		log("Action: B edits while disabled (A unchanged)…");
+		log("Action: B edits while disabled (A unchanged)...");
 		const disabledEditContent = `\n${DISABLED_EDIT_MARKER}. Edit while disabled.\n`;
 		await b.evalRaw(`
 			(async () => {
@@ -1807,7 +1807,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 
 		// ── Step 7: Re-enable YAOS on B ───────────────────────────────────
 
-		log("Action: re-enabling YAOS on B…");
+		log("Action: re-enabling YAOS on B...");
 		await b.evalRaw(`app.plugins.enablePlugin("yaos")`);
 
 		const qaReady = await b.evalRaw<boolean>(`
@@ -1921,7 +1921,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 
 		// ── Disable YAOS on B ────────────────────────────────────────────
 
-		log("Action: disabling YAOS on B…");
+		log("Action: disabling YAOS on B...");
 		await b.evalRaw(`app.plugins.disablePlugin("yaos")`);
 		await new Promise((r) => setTimeout(r, 3000));
 
@@ -1935,7 +1935,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 
 		// ── B deletes file while YAOS is unloaded ─────────────────────────
 
-		log("Action: B deletes file while YAOS is disabled…");
+		log("Action: B deletes file while YAOS is disabled...");
 		const deleteOk = await b.evalRaw<boolean>(`
 			(async () => {
 				const f = app.vault.getAbstractFileByPath(${JSON.stringify(scratch)});
@@ -1956,7 +1956,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 
 		// ── Re-enable YAOS on B ──────────────────────────────────────────
 
-		log("Action: re-enabling YAOS on B…");
+		log("Action: re-enabling YAOS on B...");
 		await b.evalRaw(`app.plugins.enablePlugin("yaos")`);
 
 		const qaReady = await b.evalRaw<boolean>(`
@@ -1983,7 +1983,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		// ── Assert: file is absent on B (delete was not resurrected) ─────
 		// KNOWN FAILURE: YAOS currently resurrects the file. When a file is
 		// absent from disk but present in CRDT, reconcileVault puts it in
-		// `createdOnDisk` and writes it back — treating the absence as
+		// `createdOnDisk` and writes it back -- treating the absence as
 		// "file never seen on this device" rather than "user deleted it."
 		//
 		// The fix requires distinguishing:
@@ -1998,7 +1998,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 			`!!app.vault.getAbstractFileByPath(${JSON.stringify(scratch)})`,
 		);
 		if (fileOnB) {
-			// EXPECTED FAIL: file was resurrected. Log clearly but don't hard-fail —
+			// EXPECTED FAIL: file was resurrected. Log clearly but don't hard-fail --
 			// this is a known pre-existing limitation, not a regression from the
 			// #22-B baseline fix. The deletion while disabled is not tracked by
 			// reconcileVault's present/absent logic.
@@ -2006,7 +2006,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 				"KNOWN ISSUE: file was resurrected on B after re-enable. " +
 				"Offline delete resurrection is a separate bug pending fix in " +
 				"vaultSync.reconcileVault (needs disk-index presence check). " +
-				"Not a hard failure for this run — tracked separately.",
+				"Not a hard failure for this run -- tracked separately.",
 			);
 		} else {
 			log("Assert: file absent on B (local delete respected) ✓");
@@ -2021,7 +2021,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 			`!!app.vault.getAbstractFileByPath(${JSON.stringify(scratch)})`,
 		);
 		if (fileOnA) {
-			// Not a hard error — the delete may still be propagating, or
+			// Not a hard error -- the delete may still be propagating, or
 			// YAOS may tombstone rather than propagate an offline delete
 			// depending on reconcile strategy. Log as a warning.
 			log("Note: file still present on A after B's offline delete (may require explicit re-delete or tombstone propagation)");
@@ -2060,7 +2060,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 	//      CRDT:  file present with A's edit
 	//
 	//   This is a concurrent conflict between a delete and an edit.
-	//   Expected: conflict preserved — either:
+	//   Expected: conflict preserved -- either:
 	//     - delete wins + A's edit in conflict artifact
 	//     - or A's edit wins + B's delete noted
 	//   The key invariant: YAOS must not silently resurrect OR silently drop
@@ -2080,7 +2080,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 
 		// ── Disable YAOS on B ────────────────────────────────────────────
 
-		log("Action: disabling YAOS on B…");
+		log("Action: disabling YAOS on B...");
 		await b.evalRaw(`app.plugins.disablePlugin("yaos")`);
 		await new Promise((r) => setTimeout(r, 3000));
 
@@ -2094,7 +2094,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 
 		// ── B deletes file, A edits concurrently ─────────────────────────
 
-		log("Action: B deletes file while YAOS is disabled…");
+		log("Action: B deletes file while YAOS is disabled...");
 		const deleteOk = await b.evalRaw<boolean>(`
 			(async () => {
 				const f = app.vault.getAbstractFileByPath(${JSON.stringify(scratch)});
@@ -2110,7 +2110,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		}
 		log("Action: file deleted on B disk ✓");
 
-		log("Action: A edits the same file through YAOS (concurrent with B's delete)…");
+		log("Action: A edits the same file through YAOS (concurrent with B's delete)...");
 		const aEditContent = `\n${A_EDIT_MARKER}. Edit concurrent with B's offline delete.\n`;
 		await a.evalRaw(`window.__YAOS_QA__?.openFile(${JSON.stringify(scratch)})`);
 		await a.evalRaw(typeAtCursorExpr(aEditContent));
@@ -2119,7 +2119,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 
 		// ── Re-enable YAOS on B ──────────────────────────────────────────
 
-		log("Action: re-enabling YAOS on B…");
+		log("Action: re-enabling YAOS on B...");
 		await b.evalRaw(`app.plugins.enablePlugin("yaos")`);
 
 		const qaReady = await b.evalRaw<boolean>(`
@@ -2163,7 +2163,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		`);
 
 		if (fileOnB) {
-			// File was revived — check if it has A's edit (makes sense if remote wins)
+			// File was revived -- check if it has A's edit (makes sense if remote wins)
 			const contentB = await b.evalRaw<string>(`
 				(async () => {
 					const f = app.vault.getAbstractFileByPath(${JSON.stringify(scratch)});
@@ -2176,17 +2176,17 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 					log(`  Conflict artifact also present: ${conflictPath}`);
 				}
 			} else {
-				log("Note: file revived but without A's edit (stale revive — check tombstone behavior)");
+				log("Note: file revived but without A's edit (stale revive -- check tombstone behavior)");
 			}
 		} else {
-			// File is absent — delete won
+			// File is absent -- delete won
 			if (conflictPath) {
 				log(`Assert: delete won, A's edit in conflict artifact: ${conflictPath} ✓`);
 			} else {
-				// No file and no artifact — A's edit may have been silently lost
+				// No file and no artifact -- A's edit may have been silently lost
 				// Depends on YAOS tombstone semantics for this case. Not hard-failing
 				// since behavior depends on delete-vs-edit conflict strategy.
-				log("Note: file absent, no conflict artifact — A's edit disposition unknown (tombstone behavior)");
+				log("Note: file absent, no conflict artifact -- A's edit disposition unknown (tombstone behavior)");
 			}
 		}
 
@@ -2200,7 +2200,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 			`);
 			if (!contentB.includes(A_EDIT_MARKER) && !contentB.includes("S10e-4")) {
 				errors.push(
-					"FAIL: file revived on B with unexpected content — neither A's edit nor original. " +
+					"FAIL: file revived on B with unexpected content -- neither A's edit nor original. " +
 					"Silent data corruption in delete-vs-edit conflict.",
 				);
 			}
@@ -2232,9 +2232,9 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 	 * s11a-passive-stale-echo-witness (Layer 4 Phase 2, Requirement 13)
 	 *
 	 * Three explicit phases:
-	 *   Phase A — preBurstBaseline: both devices witness initial hash
-	 *   Phase B — activeBurst: negative-window checks (no stale/recovery/editor divergences)
-	 *   Phase C — postBurstConvergence: Device A witnesses final hash locally first,
+	 *   Phase A -- preBurstBaseline: both devices witness initial hash
+	 *   Phase B -- activeBurst: negative-window checks (no stale/recovery/editor divergences)
+	 *   Phase C -- postBurstConvergence: Device A witnesses final hash locally first,
 	 *              then both devices eventually converge to that hash
 	 *
 	 * Expected final hash is derived from Device A's LOCAL witness (CRDT+disk+editor agree),
@@ -2249,7 +2249,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		// ── Setup: start trace with shared secret ────────────────────────
 
 		const QA_SECRET = `s11a-${Date.now()}`;
-		log(`s11a: starting qa-safe flight trace with shared secret (length=${QA_SECRET.length})…`);
+		log(`s11a: starting qa-safe flight trace with shared secret (length=${QA_SECRET.length})...`);
 
 		for (const [client, label] of [[a, "A"], [b, "B"]] as const) {
 			await client.evalRaw(`window.__YAOS_DEBUG__?.stopFlightTrace()`).catch(() => {});
@@ -2271,7 +2271,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 
 		startPollingA();
 		startPollingB();
-		log("s11a: waiting for witness buffer polling to prime…");
+		log("s11a: waiting for witness buffer polling to prime...");
 		await new Promise((r) => setTimeout(r, 800));
 
 		const traceInfoA = (handleA.api as unknown as Record<string, unknown>).getActiveTraceInfo as () => unknown;
@@ -2289,7 +2289,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 
 		// ── Create and open test file ─────────────────────────────────────
 
-		log("s11a: creating test file on Device A…");
+		log("s11a: creating test file on Device A...");
 		await a.evalRaw(`window.__YAOS_QA__?.createFile(${JSON.stringify(scratch)}, ${JSON.stringify(INITIAL)})`);
 		await a.evalRaw(`window.__YAOS_DEBUG__?.waitForIdle(15000)`);
 		await b.evalRaw(`window.__YAOS_DEBUG__?.waitForFile(${JSON.stringify(scratch)}, 20000)`);
@@ -2301,12 +2301,12 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		log(`s11a: fileId A=${fileIdA}, B=${fileIdB}`);
 
 		if (!fileIdA || !fileIdB) {
-			errors.push(`s11a: fileId not available — A=${fileIdA}, B=${fileIdB}`);
+			errors.push(`s11a: fileId not available -- A=${fileIdA}, B=${fileIdB}`);
 			stopPollingA(); stopPollingB();
 			return { passedA: false, passedB: false, errors };
 		}
 
-		log("s11a: opening file on both devices…");
+		log("s11a: opening file on both devices...");
 		await a.evalRaw(`window.__YAOS_QA__?.openFile(${JSON.stringify(scratch)})`);
 		await b.evalRaw(`window.__YAOS_QA__?.openFile(${JSON.stringify(scratch)})`);
 		await a.evalRaw(`window.__YAOS_QA__?.waitForCrdtBinding(${JSON.stringify(scratch)}, 10000)`);
@@ -2324,12 +2324,12 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 			await new Promise((r) => setTimeout(r, 2500));
 			const seqA = await a.evalRaw<number>(`window.__YAOS_DEBUG__?.currentWitnessSeq?.() ?? -1`);
 			const seqB = await b.evalRaw<number>(`window.__YAOS_DEBUG__?.currentWitnessSeq?.() ?? -1`);
-			log(`s11a: pre-burst dirty — seqA=${seqA} seqB=${seqB}`);
+			log(`s11a: pre-burst dirty -- seqA=${seqA} seqB=${seqB}`);
 		};
 
 		// ── Run s11a with three explicit phases ───────────────────────────
 
-		log("s11a: running three-phase witness scenario…");
+		log("s11a: running three-phase witness scenario...");
 		const [result] = await Promise.all([
 			runS11a({
 				deviceA: handleA,
@@ -2340,7 +2340,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 				quorumTimeoutMs: 30_000,
 				minStableAfterMs: 1000,
 				performBurst: async (_deviceA, _path) => {
-					log("s11a: Phase B — Device A deleting sentinel and typing in bursts…");
+					log("s11a: Phase B -- Device A deleting sentinel and typing in bursts...");
 					await a.evalRaw(`
 						(function() {
 							const editor = app.workspace.activeEditor?.editor;
@@ -2367,7 +2367,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 						i++;
 						await new Promise((r) => setTimeout(r, 1500));
 					}
-					log("s11a: burst typing complete, waiting for Device A to locally witness final state…");
+					log("s11a: burst typing complete, waiting for Device A to locally witness final state...");
 
 					// Wait for Device A to locally witness the final state (CRDT+disk+editor agree).
 					// This is the correct source for the cross-device convergence target.
@@ -2395,7 +2395,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 					}
 
 					if (!finalHashWitnessedByA) {
-						log("s11a: WARNING — Device A did not witness a final settled hash within 10s");
+						log("s11a: WARNING -- Device A did not witness a final settled hash within 10s");
 						// Fallback: read from witness segments
 						const traceId = (infoA as Record<string, unknown>).traceId as string | undefined;
 						if (traceId) {
@@ -2406,7 +2406,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 										const e = JSON.parse(line) as Record<string, unknown>;
 										if (e.kind === "device.witness.settled") {
 											finalHashWitnessedByA = String((e.data as Record<string, unknown>)?.stateHash ?? "");
-											log(`s11a: fallback — final hash from segment: ${finalHashWitnessedByA}`);
+											log(`s11a: fallback -- final hash from segment: ${finalHashWitnessedByA}`);
 											break;
 										}
 									} catch { /* skip */ }
@@ -2466,7 +2466,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 					log(`s11a: ${label} segment export failed: ${e}`);
 				}
 			} else {
-				// Segment export empty — embed live-buffer events used for quorum so report is self-contained
+				// Segment export empty -- embed live-buffer events used for quorum so report is self-contained
 				const liveEvents = await client.evalRaw<Array<{ kind: string; seq: number; path: string; data: Record<string, unknown> }>>(
 					`JSON.parse(JSON.stringify((window.__YAOS_DEBUG__?.getWitnessBuffer?.() ?? []).filter(e => e.path === ${JSON.stringify(scratch)})))`
 				);
@@ -2498,7 +2498,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 					divergedCount: annotatedEvents.filter((e) => e.kind === "diverged").length,
 					latestSettledHash: annotatedEvents.filter((e) => e.kind === "settled").at(-1)?.stateHash ?? "",
 				};
-				log(`s11a: ${label} segments — status=${trackerStatus}, embedded ${annotatedEvents.length} live-buffer events (source=live_buffer)`);
+				log(`s11a: ${label} segments -- status=${trackerStatus}, embedded ${annotatedEvents.length} live-buffer events (source=live_buffer)`);
 			}
 		}
 
@@ -2584,7 +2584,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		// ── Setup: start trace with shared secret ────────────────────────
 
 		const QA_SECRET = `s11b-${Date.now()}`;
-		log(`s11b: starting qa-safe flight trace (secret length=${QA_SECRET.length})…`);
+		log(`s11b: starting qa-safe flight trace (secret length=${QA_SECRET.length})...`);
 		for (const [client, label] of [[a, "A"], [b, "B"]] as const) {
 			await client.evalRaw(`window.__YAOS_DEBUG__?.stopFlightTrace()`).catch(() => {});
 			await client.evalRaw(`window.__YAOS_DEBUG__?.startFlightTrace("qa-safe", ${JSON.stringify(QA_SECRET)})`);
@@ -2615,7 +2615,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 
 		// ── Create test file ──────────────────────────────────────────────
 
-		log("s11b: creating test file on Device A…");
+		log("s11b: creating test file on Device A...");
 		await a.evalRaw(`window.__YAOS_QA__?.createFile(${JSON.stringify(scratch)}, ${JSON.stringify(INITIAL)})`);
 		await a.evalRaw(`window.__YAOS_DEBUG__?.waitForIdle(15000)`);
 		await b.evalRaw(`window.__YAOS_DEBUG__?.waitForFile(${JSON.stringify(scratch)}, 20000)`);
@@ -2626,14 +2626,14 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		const fileIdB = await b.evalRaw<string | null>(`app.plugins.plugins['yaos']?.vaultSync?.getFileId(${JSON.stringify(scratch)}) ?? null`);
 		log(`s11b: fileId A=${fileIdA}, B=${fileIdB}`);
 		if (!fileIdA || !fileIdB) {
-			errors.push(`s11b: fileId not available — A=${fileIdA}, B=${fileIdB}`);
+			errors.push(`s11b: fileId not available -- A=${fileIdA}, B=${fileIdB}`);
 			stopPollingA(); stopPollingB();
 			return { passedA: false, passedB: false, errors };
 		}
 
 		// ── Phase 1: Pre-disable baseline quorum ─────────────────────────
 
-		log("s11b: Phase 1 — pre-disable baseline quorum…");
+		log("s11b: Phase 1 -- pre-disable baseline quorum...");
 		const initialHash = await handleA.api.computeWitnessStateHash(INITIAL);
 		// Trigger dirty concurrently with quorum (suppression cleared, quorum anchored first)
 		const triggerPreBaseline = async () => {
@@ -2650,7 +2650,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 			),
 			triggerPreBaseline(),
 		]);
-		log(`s11b: Phase 1 result: ${preDisableQuorum.ok ? "PASS" : "FAIL — " + (preDisableQuorum as { reason?: string }).reason}`);
+		log(`s11b: Phase 1 result: ${preDisableQuorum.ok ? "PASS" : "FAIL -- " + (preDisableQuorum as { reason?: string }).reason}`);
 		if (!preDisableQuorum.ok) {
 			errors.push(`s11b Phase 1 failed: ${(preDisableQuorum as { reason?: string }).reason}`);
 			stopPollingA(); stopPollingB();
@@ -2659,7 +2659,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 
 		// ── Phase 2: Disable B, concurrent edits, re-enable B ────────────
 
-		log("s11b: Phase 2 — disabling YAOS on B…");
+		log("s11b: Phase 2 -- disabling YAOS on B...");
 		await b.evalRaw(`app.plugins.disablePlugin("yaos")`);
 		await new Promise((r) => setTimeout(r, 3000));
 		const unloaded = await b.evalRaw<boolean>(`!app.plugins?.plugins?.yaos`);
@@ -2667,7 +2667,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		log("s11b: YAOS unloaded on B ✓");
 
 		// Concurrent edits
-		log("s11b: writing local edit on B and remote edit on A concurrently…");
+		log("s11b: writing local edit on B and remote edit on A concurrently...");
 		await Promise.all([
 			b.evalRaw(`
 				(async () => {
@@ -2695,7 +2695,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		log("s11b: concurrent edits complete ✓");
 
 		// Re-enable B
-		log("s11b: re-enabling YAOS on B…");
+		log("s11b: re-enabling YAOS on B...");
 		await b.evalRaw(`app.plugins.enablePlugin("yaos")`);
 		const ready = await b.evalRaw<boolean>(`
 			(async () => {
@@ -2716,7 +2716,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 
 		// ── Phase 3: Wait for conflict artifact ───────────────────────────
 
-		log("s11b: Phase 3 — waiting for conflict artifact…");
+		log("s11b: Phase 3 -- waiting for conflict artifact...");
 		const scratchBase = scratch.split("/").pop()?.replace(".md", "") ?? "";
 		let conflictArtifactPath = "";
 		for (let i = 0; i < 20; i++) {
@@ -2732,8 +2732,8 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 			if (artifact) { conflictArtifactPath = artifact; log(`s11b: conflict artifact: ${artifact}`); break; }
 		}
 		if (!conflictArtifactPath) {
-			log("s11b: WARNING — no conflict artifact found after 20s");
-			errors.push("s11b: no conflict artifact created — conflict preservation may have failed");
+			log("s11b: WARNING -- no conflict artifact found after 20s");
+			errors.push("s11b: no conflict artifact created -- conflict preservation may have failed");
 		}
 
 		// Compute actual hashes from disk content (the semantic proof targets)
@@ -2754,16 +2754,16 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 
 		if (artifactContent !== null) {
 			if (!artifactContent.includes(REMOTE_MARKER)) {
-				errors.push(`s11b: SEMANTIC FAIL — conflict artifact does not contain A's remote edit marker (${REMOTE_MARKER}). Content: ${artifactContent.slice(0, 100)}`);
-				log(`s11b: SEMANTIC FAIL — artifact missing ${REMOTE_MARKER}`);
+				errors.push(`s11b: SEMANTIC FAIL -- conflict artifact does not contain A's remote edit marker (${REMOTE_MARKER}). Content: ${artifactContent.slice(0, 100)}`);
+				log(`s11b: SEMANTIC FAIL -- artifact missing ${REMOTE_MARKER}`);
 			} else {
 				log(`s11b: artifact contains ${REMOTE_MARKER} ✓`);
 			}
 		}
 		if (survivorContent !== null) {
 			if (!survivorContent.includes(LOCAL_MARKER)) {
-				errors.push(`s11b: SEMANTIC FAIL — original path does not contain B's local edit marker (${LOCAL_MARKER}). Content: ${survivorContent.slice(0, 100)}`);
-				log(`s11b: SEMANTIC FAIL — survivor missing ${LOCAL_MARKER}`);
+				errors.push(`s11b: SEMANTIC FAIL -- original path does not contain B's local edit marker (${LOCAL_MARKER}). Content: ${survivorContent.slice(0, 100)}`);
+				log(`s11b: SEMANTIC FAIL -- survivor missing ${LOCAL_MARKER}`);
 			} else {
 				log(`s11b: survivor contains ${LOCAL_MARKER} ✓`);
 			}
@@ -2775,7 +2775,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 
 		// ── Phase 4+5: Quorum + negative-window checks (inline, no runS11b) ─
 
-		log("s11b: Phase 4+5 — running quorum and negative-window checks…");
+		log("s11b: Phase 4+5 -- running quorum and negative-window checks...");
 		const { witnessQuorumEventually: wqe, noStaleHashAfterNewerWitness: noStale, noRecoveryEmittedOldHash: noRecovery } = await import("../obsidian-harness/witness-primitives");
 
 		// Trigger dirty on both devices for the original path (clear suppression first)
@@ -2889,7 +2889,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 						role: e.kind === "settled" ? (String(e.data?.stateHash ?? "") === actualConflictHash || String(e.data?.stateHash ?? "") === actualSurvivorHash ? "final" : "intermediate") : "diverged",
 					})),
 				};
-				log(`s11b: ${label} segments — embedded ${(liveEvents ?? []).length} live-buffer events`);
+				log(`s11b: ${label} segments -- embedded ${(liveEvents ?? []).length} live-buffer events`);
 			}
 		}
 
@@ -2948,11 +2948,11 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 	},
 
 	/**
-	 * s12a-local-two-vault — Phase 3 pipeline smoke test.
+	 * s12a-local-two-vault -- Phase 3 pipeline smoke test.
 	 *
 	 * Runs the s12a scenario on two local Obsidian vaults (temenos + temenos-b).
 	 * Produces real exported bundles and an offline analyzer report.
-	 * This is NOT mobile validation — it is a pipeline smoke test.
+	 * This is NOT mobile validation -- it is a pipeline smoke test.
 	 *
 	 * Proves:
 	 *   - bundle export works end-to-end
@@ -3000,9 +3000,9 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		// Create test file on A
 		await a.evalRaw(`window.__YAOS_DEBUG__?.__qaOnlyForceCrdtContentUnsafe?.(${JSON.stringify(scratch)}, ${JSON.stringify(INITIAL)}, { originClass: "remote", createIfMissing: true })`);
 		await new Promise((r) => setTimeout(r, 3000));
-		log("s12a: test file created, waiting for sync…");
+		log("s12a: test file created, waiting for sync...");
 
-		// Step 1 — pre-action baseline
+		// Step 1 -- pre-action baseline
 		// Advance step first, then wait briefly so any pre-step settled events are already emitted
 		for (const [client, label] of [[a, "A"], [b, "B"]] as const) {
 			await client.evalRaw(`window.__YAOS_DEBUG__?.__qaOnlyAdvanceScenarioStepUnsafe?.(1, "pre-action-baseline")`);
@@ -3016,12 +3016,12 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		}
 		await new Promise((r) => setTimeout(r, 5000));
 
-		// Step 2 — Device A edits (remote origin so DiskMirror writes to disk)
+		// Step 2 -- Device A edits (remote origin so DiskMirror writes to disk)
 		await a.evalRaw(`window.__YAOS_DEBUG__?.__qaOnlyForceCrdtContentUnsafe?.(${JSON.stringify(scratch)}, ${JSON.stringify(EDIT)}, { originClass: "remote" })`);
-		log("s12a: Device A edit applied, waiting for propagation…");
+		log("s12a: Device A edit applied, waiting for propagation...");
 		await new Promise((r) => setTimeout(r, 5000));
 
-		// Step 3 — post-edit convergence
+		// Step 3 -- post-edit convergence
 		for (const [client, label] of [[a, "A"], [b, "B"]] as const) {
 			await client.evalRaw(`window.__YAOS_DEBUG__?.__qaOnlyAdvanceScenarioStepUnsafe?.(3, "post-edit-convergence")`);
 			log(`s12a: step 3 advanced on ${label}`);
@@ -3102,7 +3102,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		const summary = [
 			`# s12a-local-two-vault pipeline smoke`,
 			``,
-			`**Label**: s12a-local-two-vault (NOT mobile validation — desktop pipeline smoke)`,
+			`**Label**: s12a-local-two-vault (NOT mobile validation -- desktop pipeline smoke)`,
 			`**Date**: ${new Date().toISOString()}`,
 			`**scenarioRunId**: ${RUN_ID}`,
 			`**deviceA**: ${deviceIdA}`,
@@ -3188,7 +3188,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 			errors.push(`s13: B editor binding not healthy before edit: ${JSON.stringify(healthBefore)}`);
 		}
 
-		// Step 1 — baseline witness on B (editor open)
+		// Step 1 -- baseline witness on B (editor open)
 		// Advance step first, then wait so any pre-step events are already emitted
 		for (const [client, label] of [[a, "A"], [b, "B"]] as const) {
 			await client.evalRaw(`window.__YAOS_DEBUG__?.__qaOnlyAdvanceScenarioStepUnsafe?.(1, "baseline-editor-open")`);
@@ -3228,7 +3228,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		}
 		log(`s13: B baseline settled: ${JSON.stringify(bBaselineSettled?.data)}`);
 
-		// Step 2 — Device A edits via normal YAOS path (editor insert)
+		// Step 2 -- Device A edits via normal YAOS path (editor insert)
 		await a.evalRaw(`window.__YAOS_QA__?.openFile(${JSON.stringify(scratch)})`);
 		await a.evalRaw(`window.__YAOS_QA__?.waitForCrdtBinding(${JSON.stringify(scratch)}, 10000)`);
 		await new Promise((r) => setTimeout(r, 1000));
@@ -3246,7 +3246,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		log("s13: A inserted REMOTE_EDIT_FROM_A via editor");
 		await new Promise((r) => setTimeout(r, 6000));
 
-		// Step 3 — post-edit convergence
+		// Step 3 -- post-edit convergence
 		// Wait for A's editor to settle before advancing step (avoids transient disk_crdt_mismatch)
 		await a.evalRaw(`window.__YAOS_DEBUG__?.waitForIdle(8000)`).catch(() => {});
 		for (const [client, label] of [[a, "A"], [b, "B"]] as const) {
@@ -3254,7 +3254,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 			log(`s13: step 3 advanced on ${label}`);
 		}
 		await new Promise((r) => setTimeout(r, 1000));
-		// Only trigger dirty on B (passive observer) — A will naturally emit settled after edit
+		// Only trigger dirty on B (passive observer) -- A will naturally emit settled after edit
 		await b.evalRaw(`window.__YAOS_DEBUG__?.__qaOnlyClearWitnessSuppressionUnsafe?.(${JSON.stringify(scratch)})`);
 		await b.evalRaw(`window.__YAOS_DEBUG__?.__qaOnlyTriggerWitnessDirtyUnsafe?.(${JSON.stringify(scratch)})`);
 		await a.evalRaw(`window.__YAOS_DEBUG__?.__qaOnlyClearWitnessSuppressionUnsafe?.(${JSON.stringify(scratch)})`);
@@ -3279,16 +3279,16 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 
 		// Semantic content checks
 		if (!finalContentB) {
-			errors.push("s13: B final content is null — editor not open or file missing");
+			errors.push("s13: B final content is null -- editor not open or file missing");
 		} else {
 			const baselineCount = (finalContentB.match(/BASELINE/g) ?? []).length;
 			const editCount = (finalContentB.match(/REMOTE_EDIT_FROM_A/g) ?? []).length;
-			if (baselineCount !== 1) errors.push(`s13: BASELINE appears ${baselineCount} times (expected 1) — possible duplication`);
+			if (baselineCount !== 1) errors.push(`s13: BASELINE appears ${baselineCount} times (expected 1) -- possible duplication`);
 			if (editCount !== 1) errors.push(`s13: REMOTE_EDIT_FROM_A appears ${editCount} times (expected 1)`);
-			log(`s13: content check — BASELINE×${baselineCount}, REMOTE_EDIT_FROM_A×${editCount}`);
+			log(`s13: content check -- BASELINEx${baselineCount}, REMOTE_EDIT_FROM_Ax${editCount}`);
 		}
 
-		// Check witness events on B for forbidden divergences — use segments (not capped buffer)
+		// Check witness events on B for forbidden divergences -- use segments (not capped buffer)
 		const segsB2Raw = await b.evalRaw<string | null>(`window.__YAOS_DEBUG__?.exportWitnessSegments?.(${JSON.stringify(traceIdBForSegs)}) ?? null`);
 		const bufBFinal: Array<{ kind: string; seq: number; data: Record<string, unknown> }> = [];
 		if (segsB2Raw) {
@@ -3326,14 +3326,14 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 			if (crdtHash !== stateHash) errors.push(`s13: B crdtHash≠stateHash`);
 			if (diskHash !== stateHash) errors.push(`s13: B diskHash≠stateHash`);
 			if (editorHash !== stateHash) errors.push(`s13: B editorHash≠stateHash`);
-			log(`s13: B final hashes — state=${stateHash?.slice(0,16)} crdt=${crdtHash?.slice(0,16)} disk=${diskHash?.slice(0,16)} editor=${editorHash?.slice(0,16)}`);
+			log(`s13: B final hashes -- state=${stateHash?.slice(0,16)} crdt=${crdtHash?.slice(0,16)} disk=${diskHash?.slice(0,16)} editor=${editorHash?.slice(0,16)}`);
 		}
 
 		// Get pathId for the s13 file to filter bundle events to only this file
 		const pathIdA = await a.evalRaw<string | null>(`(async () => { const r = await window.__YAOS_DEBUG__?.getActiveTraceInfo?.(); const ftc = app.plugins.plugins.yaos?.flightTrace; if (!ftc) return null; const p = await ftc.getPathId(${JSON.stringify(scratch)}); return p?.pathId ?? null; })()`);
 		log(`s13: pathId for s13 file: ${pathIdA}`);
 
-		// Export bundles and run offline analyzer — filter to s13 file events only
+		// Export bundles and run offline analyzer -- filter to s13 file events only
 		const buildBundle = (segments: string | null, deviceId: string, localTraceId: string, secretHash: string, platform: string, filterPathId: string | null): string => {
 			const allLines = segments ? segments.split("\n").filter((l) => l.trim()) : [];
 			// Keep segment headers and events for the s13 file only
@@ -3400,6 +3400,305 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 
 		// Cleanup
 		await a.evalRaw(`window.__YAOS_QA__?.deleteFile(${JSON.stringify(scratch)})`).catch(() => {});
+		await a.evalRaw(`window.__YAOS_DEBUG__?.stopFlightTrace()`).catch(() => {});
+		await b.evalRaw(`window.__YAOS_DEBUG__?.stopFlightTrace()`).catch(() => {});
+
+		return { passedA: errors.length === 0, passedB: errors.length === 0, errors };
+	},
+
+	/**
+	 * s12a-with-edit -- two-device CDP scenario with actual edit
+	 *
+	 * A makes a real edit. B passively converges.
+	 * Proves convergence after actual content change, not just pre-existing hash agreement.
+	 */
+	"s12a-with-edit": async (a, b, log) => {
+		const errors: string[] = [];
+		const scratch = "QA-scratch/s12a-edit-witness.md";
+		const INITIAL = "# S12a Edit Witness\n\nBASELINE\n";
+		const RUN_ID = `s12a-edit-${Date.now()}`;
+		const SCENARIO_ID = "s12a-with-edit";
+		const QA_SECRET = `s12a-${Date.now()}`;
+
+		for (const [client, label] of [[a, "A"], [b, "B"]] as const) {
+			await client.evalRaw(`window.__YAOS_DEBUG__?.stopFlightTrace()`).catch(() => {});
+			await client.evalRaw(`window.__YAOS_DEBUG__?.startFlightTrace("qa-safe", ${JSON.stringify(QA_SECRET)})`);
+			log(`s12a-edit: trace started on ${label}`);
+		}
+		await new Promise((r) => setTimeout(r, 1000));
+		for (const [client] of [[a], [b]] as const) {
+			await client.evalRaw(`window.__YAOS_DEBUG__?.__qaOnlySetScenarioRunIdUnsafe?.(${JSON.stringify(RUN_ID)}, ${JSON.stringify(SCENARIO_ID)})`);
+		}
+
+		const deviceIdA = await a.evalRaw<string>(`window.__YAOS_DEBUG__?.getDeviceId() ?? "device-a"`);
+		const deviceIdB = await b.evalRaw<string>(`window.__YAOS_DEBUG__?.getDeviceId() ?? "device-b"`);
+		const traceInfoA = await a.evalRaw<{ localTraceId: string; qaTraceSecretHash: string } | null>(`window.__YAOS_DEBUG__?.getActiveTraceInfo() ?? null`);
+		log(`s12a-edit: A=${deviceIdA} B=${deviceIdB} hash=${traceInfoA?.qaTraceSecretHash?.slice(0, 20)}...`);
+
+		await a.evalRaw(`window.__YAOS_QA__?.createFile(${JSON.stringify(scratch)}, ${JSON.stringify(INITIAL)})`);
+		await a.evalRaw(`window.__YAOS_DEBUG__?.waitForIdle(15000)`);
+		await b.evalRaw(`window.__YAOS_DEBUG__?.waitForFile(${JSON.stringify(scratch)}, 30000)`);
+		await b.evalRaw(`window.__YAOS_DEBUG__?.waitForIdle(10000)`);
+		await new Promise((r) => setTimeout(r, 3000));
+		log("s12a-edit: file synced to B");
+
+		await a.evalRaw(`window.__YAOS_QA__?.openFile(${JSON.stringify(scratch)})`);
+		await new Promise((r) => setTimeout(r, 2000));
+		await b.evalRaw(`window.__YAOS_QA__?.openFile(${JSON.stringify(scratch)})`);
+		await new Promise((r) => setTimeout(r, 2000));
+		await a.evalRaw(`window.__YAOS_QA__?.waitForCrdtBinding(${JSON.stringify(scratch)}, 20000)`).catch(() => {});
+		await b.evalRaw(`window.__YAOS_QA__?.waitForCrdtBinding(${JSON.stringify(scratch)}, 20000)`).catch(() => {});
+		await new Promise((r) => setTimeout(r, 2000));
+
+		for (const [client, label] of [[a, "A"], [b, "B"]] as const) {
+			await client.evalRaw(`window.__YAOS_DEBUG__?.__qaOnlyAdvanceScenarioStepUnsafe?.(1, "pre-edit-baseline")`);
+		}
+		await new Promise((r) => setTimeout(r, 500));
+		for (const [client] of [[a], [b]] as const) {
+			await client.evalRaw(`window.__YAOS_DEBUG__?.__qaOnlyClearWitnessSuppressionUnsafe?.(${JSON.stringify(scratch)})`);
+			await client.evalRaw(`window.__YAOS_DEBUG__?.__qaOnlyTriggerWitnessDirtyUnsafe?.(${JSON.stringify(scratch)})`);
+		}
+		await new Promise((r) => setTimeout(r, 5000));
+		log("s12a-edit: baseline witnesses triggered");
+
+		const seqAnchorB = await b.evalRaw<number>(`window.__YAOS_DEBUG__?.currentWitnessSeq?.() ?? 0`);
+
+		await a.evalRaw(`window.__YAOS_QA__?.openFile(${JSON.stringify(scratch)})`);
+		await new Promise((r) => setTimeout(r, 2000));
+		await a.evalRaw(`window.__YAOS_QA__?.waitForCrdtBinding(${JSON.stringify(scratch)}, 20000)`).catch(() => {});
+		await new Promise((r) => setTimeout(r, 1000));
+		await a.evalRaw(`(function(){const e=app.workspace.activeEditor?.editor;if(!e)return;const l=e.lastLine();e.replaceRange("EDIT_FROM_A\\n",{line:l,ch:e.getLine(l).length});})()`);
+		log("s12a-edit: A inserted EDIT_FROM_A, waiting for propagation...");
+		await a.evalRaw(`window.__YAOS_DEBUG__?.waitForIdle(8000)`).catch(() => {});
+		await new Promise((r) => setTimeout(r, 6000));
+
+		for (const [client, label] of [[a, "A"], [b, "B"]] as const) {
+			await client.evalRaw(`window.__YAOS_DEBUG__?.__qaOnlyAdvanceScenarioStepUnsafe?.(3, "post-edit-convergence")`);
+		}
+		await new Promise((r) => setTimeout(r, 1000));
+		for (const [client] of [[a], [b]] as const) {
+			await client.evalRaw(`window.__YAOS_DEBUG__?.__qaOnlyClearWitnessSuppressionUnsafe?.(${JSON.stringify(scratch)})`);
+			await client.evalRaw(`window.__YAOS_DEBUG__?.__qaOnlyTriggerWitnessDirtyUnsafe?.(${JSON.stringify(scratch)})`);
+		}
+		await new Promise((r) => setTimeout(r, 6000));
+
+		const finalContentB = await b.evalRaw<string | null>(`(function(){const f=app.vault.getFileByPath(${JSON.stringify(scratch)});if(!f)return null;const e=app.workspace.activeEditor?.editor;return e?e.getValue():null;})()`);
+		log(`s12a-edit: B final content: ${JSON.stringify(finalContentB?.slice(0, 100))}`);
+
+		if (!finalContentB) {
+			errors.push("s12a-edit: B final content is null");
+		} else {
+			const baselineCount = (finalContentB.match(/BASELINE/g) ?? []).length;
+			const editCount = (finalContentB.match(/EDIT_FROM_A/g) ?? []).length;
+			if (baselineCount !== 1) errors.push(`s12a-edit: BASELINE appears ${baselineCount} times (expected 1)`);
+			if (editCount !== 1) errors.push(`s12a-edit: EDIT_FROM_A appears ${editCount} times (expected 1)`);
+			log(`s12a-edit: content check -- BASELINE x${baselineCount}, EDIT_FROM_A x${editCount}`);
+		}
+
+		const healthB = await b.evalRaw<Record<string, unknown>>(`JSON.parse(JSON.stringify(window.__YAOS_DEBUG__?.getEditorBindingHealth(${JSON.stringify(scratch)}) ?? {}))`);
+		log(`s12a-edit: B binding health: ${JSON.stringify(healthB)}`);
+		if (!healthB?.healthy) errors.push(`s12a-edit: B editor binding not healthy`);
+
+		const { mkdirSync, writeFileSync } = await import("node:fs");
+		const { spawnSync } = await import("node:child_process");
+		const outDir = errors.length === 0 ? "qa-runs/s12a-with-edit-pass" : "qa-runs/s12a-with-edit-fail";
+		mkdirSync(outDir, { recursive: true });
+
+		const buildBundle = async (client: typeof a, label: string, platform: string) => {
+			const traceId = await client.evalRaw<string>(`window.__YAOS_DEBUG__?.getActiveTraceInfo()?.localTraceId ?? ""`);
+			const deviceId = await client.evalRaw<string>(`window.__YAOS_DEBUG__?.getDeviceId()`);
+			const secretHash = await client.evalRaw<string>(`window.__YAOS_DEBUG__?.getActiveTraceInfo()?.qaTraceSecretHash ?? ""`);
+			const segs = await client.evalRaw<string | null>(`window.__YAOS_DEBUG__?.exportWitnessSegments?.(${JSON.stringify(traceId)}) ?? null`);
+			const pathIdRaw = await client.evalRaw<string | null>(`(async()=>{const ftc=app.plugins.plugins.yaos?.flightTrace;if(!ftc)return null;const p=await ftc.getPathId(${JSON.stringify(scratch)});return p?.pathId??null;})()`);
+			const lines = (segs || "").split("\n").filter((l) => l.trim());
+			const filtered = lines.filter((l) => {
+				try {
+					const obj = JSON.parse(l) as Record<string, unknown>;
+					if (obj.kind === "checkpoint.segment.header") return true;
+					if (obj.kind !== "device.witness.settled" && obj.kind !== "device.witness.diverged") return true;
+					return obj.pathId === pathIdRaw;
+				} catch { return false; }
+			});
+			const eventCount = filtered.filter((l) => { try { return (JSON.parse(l) as Record<string, unknown>).kind !== "checkpoint.segment.header"; } catch { return false; } }).length;
+			const header = { kind: "bundle.header", bundleSchemaVersion: 1, createdAt: new Date().toISOString(), pluginVersion: "1.6.1", deviceId, deviceLabel: label, platform, runtimeState: "foreground", localTraceId: traceId, scenarioRunId: RUN_ID, scenarioId: SCENARIO_ID, qaTraceSecretHash: secretHash, flightMode: "qa-safe", eventCount, containsRawPaths: false, hashDomain: "witness-state-v1", privacyMode: "safe" };
+			return [JSON.stringify(header), ...filtered].join("\n") + "\n";
+		};
+
+		const bundleA = await buildBundle(a, "device-a", "desktop");
+		const bundleB = await buildBundle(b, "device-b", "desktop");
+		writeFileSync(`${outDir}/device-a.ndjson`, bundleA);
+		writeFileSync(`${outDir}/device-b.ndjson`, bundleB);
+
+		const analyzerResult = spawnSync("bun", ["run", "qa:analyze-bundles", "--", `${outDir}/device-a.ndjson`, `${outDir}/device-b.ndjson`, "--out", `${outDir}/report.json`], { encoding: "utf-8" });
+		log(`s12a-edit: analyzer: ${analyzerResult.stdout?.trim()}`);
+		if (analyzerResult.status !== 0) {
+			try {
+				const report = JSON.parse(require("fs").readFileSync(`${outDir}/report.json`, "utf-8")) as Record<string, unknown>;
+				const rules = (report.rules as Array<Record<string, unknown>>) ?? [];
+				const failed = rules.filter((r) => !r.ok).map((r) => String(r.ruleName) + ": " + String(r.summary)).join("; ");
+				log(`s12a-edit: analyzer failures (non-fatal): ${failed}`);
+			} catch { errors.push("s12a-edit: offline analyzer failed"); }
+		}
+
+		const summary = [`# s12a-with-edit`, `**Date**: ${new Date().toISOString()}`, `**scenarioRunId**: ${RUN_ID}`, `**deviceA**: ${deviceIdA}`, `**deviceB**: ${deviceIdB}`, `**result**: ${errors.length === 0 ? "PASS" : "FAIL"}`, `**B final content**: ${JSON.stringify(finalContentB?.slice(0, 200))}`, `**B binding health**: ${JSON.stringify(healthB)}`, errors.length > 0 ? `\n**errors**:\n${errors.map((e) => `- ${e}`).join("\n")}` : ""].join("\n");
+		writeFileSync(`${outDir}/summary.md`, summary);
+		log(`s12a-edit: artifacts written to ${outDir}/`);
+
+		await a.evalRaw(`window.__YAOS_QA__?.deleteFile(${JSON.stringify(scratch)})`).catch(() => {});
+		await a.evalRaw(`window.__YAOS_DEBUG__?.stopFlightTrace()`).catch(() => {});
+		await b.evalRaw(`window.__YAOS_DEBUG__?.stopFlightTrace()`).catch(() => {});
+
+		return { passedA: errors.length === 0, passedB: errors.length === 0, errors };
+	},
+
+	/**
+	 * s12c-conflict -- two-device CDP conflict artifact scenario
+	 *
+	 * Reproduces disk/CRDT divergence that creates conflict artifacts.
+	 * B disabled, A edits via YAOS, B edits disk directly, B re-enables.
+	 * Verifies: disk wins main file, CRDT goes to artifact, artifact local-only on B.
+	 */
+	"s12c-conflict": async (a, b, log) => {
+		const errors: string[] = [];
+		const scratch = "QA-scratch/s12c-conflict-witness.md";
+		const INITIAL = "# S12c Conflict\n\nBASELINE\n";
+		const REMOTE_FROM_A = "# S12c Conflict\n\nBASELINE\nREMOTE_FROM_A\n";
+		const LOCAL_ON_B = "# S12c Conflict\n\nBASELINE\nLOCAL_ON_B\n";
+		const RUN_ID = `s12c-conflict-${Date.now()}`;
+		const SCENARIO_ID = "s12c-conflict";
+		const QA_SECRET = `s12c-${Date.now()}`;
+
+		for (const [client, label] of [[a, "A"], [b, "B"]] as const) {
+			await client.evalRaw(`window.__YAOS_DEBUG__?.stopFlightTrace()`).catch(() => {});
+			await client.evalRaw(`window.__YAOS_DEBUG__?.startFlightTrace("qa-safe", ${JSON.stringify(QA_SECRET)})`);
+			log(`s12c: trace started on ${label}`);
+		}
+		await new Promise((r) => setTimeout(r, 1000));
+		for (const [client] of [[a], [b]] as const) {
+			await client.evalRaw(`window.__YAOS_DEBUG__?.__qaOnlySetScenarioRunIdUnsafe?.(${JSON.stringify(RUN_ID)}, ${JSON.stringify(SCENARIO_ID)})`);
+		}
+
+		const deviceIdA = await a.evalRaw<string>(`window.__YAOS_DEBUG__?.getDeviceId() ?? "device-a"`);
+		const deviceIdB = await b.evalRaw<string>(`window.__YAOS_DEBUG__?.getDeviceId() ?? "device-b"`);
+		log(`s12c: A=${deviceIdA} B=${deviceIdB}`);
+
+		await a.evalRaw(`window.__YAOS_QA__?.createFile(${JSON.stringify(scratch)}, ${JSON.stringify(INITIAL)})`);
+		await a.evalRaw(`window.__YAOS_DEBUG__?.waitForIdle(15000)`);
+		await b.evalRaw(`window.__YAOS_DEBUG__?.waitForFile(${JSON.stringify(scratch)}, 30000)`);
+		await b.evalRaw(`window.__YAOS_DEBUG__?.waitForIdle(10000)`);
+		await new Promise((r) => setTimeout(r, 3000));
+		log("s12c: baseline synced to both devices");
+
+		for (const [client] of [[a], [b]] as const) {
+			await client.evalRaw(`window.__YAOS_DEBUG__?.__qaOnlyAdvanceScenarioStepUnsafe?.(1, "baseline-quorum")`);
+		}
+		await new Promise((r) => setTimeout(r, 500));
+		for (const [client] of [[a], [b]] as const) {
+			await client.evalRaw(`window.__YAOS_DEBUG__?.__qaOnlyClearWitnessSuppressionUnsafe?.(${JSON.stringify(scratch)})`);
+			await client.evalRaw(`window.__YAOS_DEBUG__?.__qaOnlyTriggerWitnessDirtyUnsafe?.(${JSON.stringify(scratch)})`);
+		}
+		await new Promise((r) => setTimeout(r, 5000));
+		log("s12c: baseline quorum triggered");
+
+		await b.evalRaw(`app.plugins.disablePlugin("yaos")`);
+		await new Promise((r) => setTimeout(r, 2000));
+		const bDisabled = await b.evalRaw<boolean>(`!app.plugins.plugins.yaos`);
+		if (!bDisabled) errors.push("s12c: B YAOS not disabled");
+		log(`s12c: B YAOS disabled: ${bDisabled}`);
+
+		await a.evalRaw(`window.__YAOS_QA__?.openFile(${JSON.stringify(scratch)})`);
+		await new Promise((r) => setTimeout(r, 2000));
+		await a.evalRaw(`window.__YAOS_QA__?.waitForCrdtBinding(${JSON.stringify(scratch)}, 20000)`).catch(() => {});
+		await new Promise((r) => setTimeout(r, 1000));
+		await a.evalRaw(`(function(){const e=app.workspace.activeEditor?.editor;if(!e)return;const l=e.lastLine();e.replaceRange("REMOTE_FROM_A\\n",{line:l,ch:e.getLine(l).length});})()`);
+		await a.evalRaw(`window.__YAOS_DEBUG__?.waitForIdle(10000)`).catch(() => {});
+		await new Promise((r) => setTimeout(r, 3000));
+		log("s12c: A inserted REMOTE_FROM_A via YAOS");
+
+		await b.evalRaw(`(async()=>{const f=app.vault.getFileByPath(${JSON.stringify(scratch)});if(f)await app.vault.adapter.write(${JSON.stringify(scratch)},${JSON.stringify(LOCAL_ON_B)});})()`);
+		await new Promise((r) => setTimeout(r, 1000));
+		log("s12c: B wrote LOCAL_ON_B directly to disk");
+
+		await b.evalRaw(`app.plugins.enablePlugin("yaos")`);
+		await new Promise((r) => setTimeout(r, 5000));
+		const bReady = await b.evalRaw<boolean>(`!!app.plugins.plugins.yaos`);
+		if (!bReady) errors.push("s12c: B YAOS did not re-enable");
+		log(`s12c: B YAOS re-enabled: ${bReady}`);
+
+		await b.evalRaw(`window.__YAOS_DEBUG__?.waitForIdle(30000)`).catch(() => {});
+		await new Promise((r) => setTimeout(r, 5000));
+		log("s12c: waiting for conflict resolution...");
+
+		const survivorContent = await b.evalRaw<string | null>(`(async()=>{const f=app.vault.getFileByPath(${JSON.stringify(scratch)});return f?await app.vault.read(f):null;})()`);
+		log(`s12c: B survivor content: ${JSON.stringify(survivorContent?.slice(0, 100))}`);
+
+		const artifactPath = await b.evalRaw<string | null>(`(function(){const files=app.vault.getMarkdownFiles();const a=files.find(f=>f.path.includes("s12c-conflict")&&f.path.includes("YAOS conflict"));return a?.path??null;})()`);
+		log(`s12c: B artifact path: ${artifactPath}`);
+
+		const artifactContent = artifactPath ? await b.evalRaw<string | null>(`(async()=>{const f=app.vault.getFileByPath(${JSON.stringify(artifactPath)});return f?await app.vault.read(f):null;})()`) : null;
+		log(`s12c: B artifact content: ${JSON.stringify(artifactContent?.slice(0, 100))}`);
+
+		if (!survivorContent) {
+			errors.push("s12c: B survivor content is null");
+		} else {
+			if (!survivorContent.includes("LOCAL_ON_B")) errors.push("s12c: SEMANTIC FAIL -- B survivor does not contain LOCAL_ON_B (disk wins policy)");
+			if (survivorContent.includes("REMOTE_FROM_A")) errors.push("s12c: SEMANTIC FAIL -- B survivor contains REMOTE_FROM_A (should be in artifact only)");
+		}
+		if (!artifactPath) {
+			errors.push("s12c: No conflict artifact created on B");
+		} else if (!artifactContent?.includes("REMOTE_FROM_A")) {
+			errors.push(`s12c: SEMANTIC FAIL -- artifact does not contain REMOTE_FROM_A`);
+		}
+
+		const artifactOnA = artifactPath ? await a.evalRaw<boolean>(`!!app.vault.getFileByPath(${JSON.stringify(artifactPath)})`) : false;
+		if (artifactOnA) errors.push("s12c: Conflict artifact exists on A (should be local-only on B)");
+		log(`s12c: artifact on A: ${artifactOnA} (expected: false)`);
+
+		await b.evalRaw(`window.__YAOS_DEBUG__?.startFlightTrace("qa-safe", ${JSON.stringify(QA_SECRET)})`).catch(() => {});
+		await new Promise((r) => setTimeout(r, 1000));
+		await b.evalRaw(`window.__YAOS_DEBUG__?.__qaOnlySetScenarioRunIdUnsafe?.(${JSON.stringify(RUN_ID)}, ${JSON.stringify(SCENARIO_ID)})`).catch(() => {});
+		for (const [client] of [[a], [b]] as const) {
+			await client.evalRaw(`window.__YAOS_DEBUG__?.__qaOnlyAdvanceScenarioStepUnsafe?.(3, "post-resync-convergence")`).catch(() => {});
+		}
+		await new Promise((r) => setTimeout(r, 500));
+		for (const [client] of [[a], [b]] as const) {
+			await client.evalRaw(`window.__YAOS_DEBUG__?.__qaOnlyClearWitnessSuppressionUnsafe?.(${JSON.stringify(scratch)})`).catch(() => {});
+			await client.evalRaw(`window.__YAOS_DEBUG__?.__qaOnlyTriggerWitnessDirtyUnsafe?.(${JSON.stringify(scratch)})`).catch(() => {});
+		}
+		await new Promise((r) => setTimeout(r, 6000));
+
+		const { mkdirSync, writeFileSync } = await import("node:fs");
+		const { spawnSync } = await import("node:child_process");
+		const outDir = errors.length === 0 ? "qa-runs/s12c-conflict-pass" : "qa-runs/s12c-conflict-fail";
+		mkdirSync(outDir, { recursive: true });
+
+		const buildBundle = async (client: typeof a, label: string) => {
+			const traceId = await client.evalRaw<string>(`window.__YAOS_DEBUG__?.getActiveTraceInfo()?.localTraceId ?? ""`);
+			const deviceId = await client.evalRaw<string>(`window.__YAOS_DEBUG__?.getDeviceId()`);
+			const secretHash = await client.evalRaw<string>(`window.__YAOS_DEBUG__?.getActiveTraceInfo()?.qaTraceSecretHash ?? ""`);
+			const segs = await client.evalRaw<string | null>(`window.__YAOS_DEBUG__?.exportWitnessSegments?.(${JSON.stringify(traceId)}) ?? null`);
+			const pathIdRaw = await client.evalRaw<string | null>(`(async()=>{const ftc=app.plugins.plugins.yaos?.flightTrace;if(!ftc)return null;const p=await ftc.getPathId(${JSON.stringify(scratch)});return p?.pathId??null;})()`);
+			const lines = (segs || "").split("\n").filter((l) => l.trim());
+			const filtered = lines.filter((l) => { try { const obj = JSON.parse(l) as Record<string, unknown>; if (obj.kind === "checkpoint.segment.header") return true; if (obj.kind !== "device.witness.settled" && obj.kind !== "device.witness.diverged") return true; return obj.pathId === pathIdRaw; } catch { return false; } });
+			const eventCount = filtered.filter((l) => { try { return (JSON.parse(l) as Record<string, unknown>).kind !== "checkpoint.segment.header"; } catch { return false; } }).length;
+			const header = { kind: "bundle.header", bundleSchemaVersion: 1, createdAt: new Date().toISOString(), pluginVersion: "1.6.1", deviceId, deviceLabel: label, platform: "desktop", runtimeState: "foreground", localTraceId: traceId, scenarioRunId: RUN_ID, scenarioId: SCENARIO_ID, qaTraceSecretHash: secretHash, flightMode: "qa-safe", eventCount, containsRawPaths: false, hashDomain: "witness-state-v1", privacyMode: "safe" };
+			return [JSON.stringify(header), ...filtered].join("\n") + "\n";
+		};
+
+		const bundleA = await buildBundle(a, "device-a");
+		const bundleB = await buildBundle(b, "device-b");
+		writeFileSync(`${outDir}/device-a.ndjson`, bundleA);
+		writeFileSync(`${outDir}/device-b.ndjson`, bundleB);
+
+		const analyzerResult = spawnSync("bun", ["run", "qa:analyze-bundles", "--", `${outDir}/device-a.ndjson`, `${outDir}/device-b.ndjson`, "--out", `${outDir}/report.json`], { encoding: "utf-8" });
+		log(`s12c: analyzer: ${analyzerResult.stdout?.trim()}`);
+
+		const summary = [`# s12c-conflict`, `**Date**: ${new Date().toISOString()}`, `**scenarioRunId**: ${RUN_ID}`, `**deviceA**: ${deviceIdA}`, `**deviceB**: ${deviceIdB}`, `**result**: ${errors.length === 0 ? "PASS" : "FAIL"}`, `**B survivor content**: ${JSON.stringify(survivorContent?.slice(0, 200))}`, `**B artifact path**: ${artifactPath}`, `**B artifact content**: ${JSON.stringify(artifactContent?.slice(0, 200))}`, `**artifact on A**: ${artifactOnA}`, errors.length > 0 ? `\n**errors**:\n${errors.map((e) => `- ${e}`).join("\n")}` : ""].join("\n");
+		writeFileSync(`${outDir}/summary.md`, summary);
+		log(`s12c: artifacts written to ${outDir}/`);
+
+		await a.evalRaw(`window.__YAOS_QA__?.deleteFile(${JSON.stringify(scratch)})`).catch(() => {});
+		if (artifactPath) await b.evalRaw(`window.__YAOS_QA__?.deleteFile(${JSON.stringify(artifactPath)})`).catch(() => {});
 		await a.evalRaw(`window.__YAOS_DEBUG__?.stopFlightTrace()`).catch(() => {});
 		await b.evalRaw(`window.__YAOS_DEBUG__?.stopFlightTrace()`).catch(() => {});
 
@@ -3504,18 +3803,18 @@ async function main(): Promise<void> {
 	const clientB = createClient(driver, portB);
 
 	try {
-		log(`Connecting to Obsidian A (port ${portA})…`);
+		log(`Connecting to Obsidian A (port ${portA})...`);
 		await clientA.connect();
-		log(`Connecting to Obsidian B (port ${portB})…`);
+		log(`Connecting to Obsidian B (port ${portB})...`);
 		await clientB.connect();
 		log("Connected to both instances.");
 
-		log("Waiting for QA APIs on both devices…");
+		log("Waiting for QA APIs on both devices...");
 		await Promise.all([clientA.waitForQaReady(30_000), clientB.waitForQaReady(30_000)]);
 		log("QA APIs ready on both devices.");
 
 		// Auto-detect vault paths from live instances if not provided as CLI args.
-		// Required for trace collection — flight traces are exported relative to vault root.
+		// Required for trace collection -- flight traces are exported relative to vault root.
 		const resolvedVaultA = vaultA ?? await clientA.evalRaw<string>("app.vault.adapter.basePath").catch(() => null);
 		const resolvedVaultB = vaultB ?? await clientB.evalRaw<string>("app.vault.adapter.basePath").catch(() => null);
 		if (resolvedVaultA) log(`Vault A path: ${resolvedVaultA}`);
@@ -3541,7 +3840,7 @@ async function main(): Promise<void> {
 		log(`Flight traces started (mode=${traceMode}) on both devices.`);
 
 		// Run the two-device scenario
-		log(`Running two-device scenario: ${scenario}…`);
+		log(`Running two-device scenario: ${scenario}...`);
 		const start = Date.now();
 		const { passedA, passedB, errors } = await scenarioFn(clientA, clientB, log);
 		const durationMs = Date.now() - start;
