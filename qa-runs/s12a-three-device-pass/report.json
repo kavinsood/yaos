@@ -1,0 +1,172 @@
+{
+  "summary": {
+    "ok": true,
+    "bundleCount": 3,
+    "eventCount": 6,
+    "scenarioRunId": "s12a-three-device-2026-05-24",
+    "scenarioId": "s12a-three-device-passive-quorum"
+  },
+  "bundle_validation": {
+    "parseErrors": [],
+    "validation": [
+      {
+        "filePath": "/home/kavin/github/do-sync/qa-runs/s12a-three-device-pass/linux.ndjson",
+        "accepted": true
+      },
+      {
+        "filePath": "/home/kavin/github/do-sync/qa-runs/s12a-three-device-pass/android.ndjson",
+        "accepted": true
+      },
+      {
+        "filePath": "/home/kavin/github/do-sync/qa-runs/s12a-three-device-pass/ipad.ndjson",
+        "accepted": true
+      }
+    ],
+    "rejectionReason": null
+  },
+  "diagnostic_observations": {
+    "transient_open_editor_disk_lag": []
+  },
+  "rules": [
+    {
+      "ruleName": "analyzeWitnessQuorum",
+      "ok": true,
+      "evidence": [
+        {
+          "kind": "device.witness.settled",
+          "seq": 1,
+          "fileId": "31U9fLe3eJZ2mHZI",
+          "data": {
+            "stateKind": "present",
+            "editorSampleKind": "not_open",
+            "fileOpen": false,
+            "originClass": "disk-write",
+            "stableAfterMs": 2000,
+            "runtimeState": "foreground",
+            "causedByEvents": {},
+            "lastDiskWriteAt": 1779742474719,
+            "scenarioStepIndex": 1,
+            "scenarioStepLabel": "pre-action-baseline",
+            "scenarioRunId": "s12a-three-device-2026-05-24",
+            "scenarioId": "s12a-three-device-passive-quorum",
+            "stateHash": "h:c4c292502ca862862feb170318ebcba4",
+            "crdtHash": "h:c4c292502ca862862feb170318ebcba4",
+            "diskHash": "h:c4c292502ca862862feb170318ebcba4",
+            "diskMatchesCrdt": true
+          },
+          "pathId": "p:ac33ba873d8660edf104e6525c5933c6",
+          "deviceId": "abe2a07d-4af3-433f-a81d-abf843f8c6f0"
+        },
+        {
+          "kind": "device.witness.settled",
+          "seq": 1208,
+          "fileId": "31U9fLe3eJZ2mHZI",
+          "data": {
+            "stateKind": "present",
+            "editorSampleKind": "healthy_sampled",
+            "fileOpen": true,
+            "originClass": "disk-write",
+            "stableAfterMs": 4000,
+            "runtimeState": "foreground",
+            "causedByEvents": {},
+            "lastDiskWriteAt": 1779742593982,
+            "scenarioStepIndex": 3,
+            "scenarioStepLabel": "post-baseline-quorum",
+            "scenarioRunId": "s12a-three-device-2026-05-24",
+            "scenarioId": "s12a-three-device-passive-quorum",
+            "stateHash": "h:c4c292502ca862862feb170318ebcba4",
+            "crdtHash": "h:c4c292502ca862862feb170318ebcba4",
+            "diskHash": "h:c4c292502ca862862feb170318ebcba4",
+            "diskMatchesCrdt": true,
+            "editorHash": "h:c4c292502ca862862feb170318ebcba4",
+            "editorMatchesCrdt": true
+          },
+          "pathId": "p:ac33ba873d8660edf104e6525c5933c6",
+          "deviceId": "0e2465b7-a496-44bc-9155-9169b7df42af"
+        },
+        {
+          "kind": "device.witness.settled",
+          "seq": 1,
+          "fileId": "31U9fLe3eJZ2mHZI",
+          "data": {
+            "stateKind": "present",
+            "editorSampleKind": "healthy_sampled",
+            "fileOpen": true,
+            "originClass": "disk-write",
+            "stableAfterMs": 4000,
+            "runtimeState": "foreground",
+            "causedByEvents": {},
+            "lastDiskWriteAt": 1779742540345,
+            "scenarioStepIndex": 3,
+            "scenarioStepLabel": "post-baseline-quorum",
+            "scenarioRunId": "s12a-three-device-2026-05-24",
+            "scenarioId": "s12a-three-device-passive-quorum",
+            "stateHash": "h:c4c292502ca862862feb170318ebcba4",
+            "crdtHash": "h:c4c292502ca862862feb170318ebcba4",
+            "diskHash": "h:c4c292502ca862862feb170318ebcba4",
+            "diskMatchesCrdt": true,
+            "editorHash": "h:c4c292502ca862862feb170318ebcba4",
+            "editorMatchesCrdt": true
+          },
+          "pathId": "p:ac33ba873d8660edf104e6525c5933c6",
+          "deviceId": "ab2e5c97-93d0-4371-8e00-48a45ea02a00"
+        }
+      ],
+      "summary": "No sync-correctness divergences. 3 settled event(s)."
+    },
+    {
+      "ruleName": "analyzeStaleHashAfterNewerWitness",
+      "ok": true,
+      "evidence": [],
+      "summary": "No stale hash regressions."
+    },
+    {
+      "ruleName": "analyzeRecoveryEmittedOldHash",
+      "ok": true,
+      "evidence": [],
+      "summary": "No recovery-old-hash regressions."
+    },
+    {
+      "ruleName": "analyzeEditorStability",
+      "ok": true,
+      "evidence": [],
+      "summary": "No editor stability issues."
+    },
+    {
+      "ruleName": "analyzeCrossDeviceHashesEqual",
+      "ok": true,
+      "evidence": [
+        {
+          "abe2a07d-4af3-433f-a81d-abf843f8c6f0": "h:c4c292502ca862862feb170318ebcba4",
+          "0e2465b7-a496-44bc-9155-9169b7df42af": "h:c4c292502ca862862feb170318ebcba4",
+          "ab2e5c97-93d0-4371-8e00-48a45ea02a00": "h:c4c292502ca862862feb170318ebcba4"
+        }
+      ],
+      "summary": "All devices agree on hash: h:c4c292502ca862862feb170318ebcba4"
+    },
+    {
+      "ruleName": "analyzeConvergenceEvidence",
+      "ok": true,
+      "evidence": [
+        {
+          "abe2a07d-4af3-433f-a81d-abf843f8c6f0": {
+            "settled": true,
+            "seq": 1,
+            "scenarioStepIndex": 1
+          },
+          "0e2465b7-a496-44bc-9155-9169b7df42af": {
+            "settled": true,
+            "seq": 1208,
+            "scenarioStepIndex": 3
+          },
+          "ab2e5c97-93d0-4371-8e00-48a45ea02a00": {
+            "settled": true,
+            "seq": 1,
+            "scenarioStepIndex": 3
+          }
+        }
+      ],
+      "summary": "Device abe2a07d-4af3-433f-a81d-abf843f8c6f0 settled with h:c4c292502ca862862feb170318ebcba4 at step 1 (seq 1). Device 0e2465b7-a496-44bc-9155-9169b7df42af settled with h:c4c292502ca862862feb170318ebcba4 at step 3 (seq 1208). Device ab2e5c97-93d0-4371-8e00-48a45ea02a00 settled with h:c4c292502ca862862feb170318ebcba4 at step 3 (seq 1). No stale rewinds detected. No recovery emitted old hash."
+    }
+  ]
+}
