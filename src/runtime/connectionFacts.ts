@@ -21,7 +21,7 @@
  *     outbound candidates today. A local Y.Doc update that happened while the
  *     WebSocket was open is "eligible" to have been sent — but we have no provider-
  *     level send hook or server receipt to prove it was actually delivered. Do NOT
- *     label this "sent" in UI copy. See FU-8 in engineering/phase-1-followups.md
+ *     label this "sent" in UI copy. See receipt followups in engineering/followups.md
  *     for the server receipt mechanism needed to make stronger claims.
  *
  *   pendingLocalCount — null always until a real server ack/queue mechanism exists.
@@ -125,7 +125,7 @@ export function deriveSyncFacts(
 	// pendingLocalCount: always null. "WebSocket open" proves only that the transport
 	// is up — not that the outbound buffer is empty, not that the server received
 	// anything, not that updates persisted. A real pending count requires a server
-	// ack/receipt mechanism (see FU-8 in engineering/phase-1-followups.md).
+	// ack/receipt mechanism (see engineering/followups.md).
 	const pendingLocalCount = null;
 
 	return {
