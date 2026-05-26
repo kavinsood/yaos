@@ -1,10 +1,12 @@
 # YAOS server
 
-Cloudflare Worker server for the YAOS Obsidian plugin. It relays Yjs CRDT updates through a Durable Object and stores attachments plus snapshots in R2.
+Cloudflare Worker / Durable Object backend for the YAOS Obsidian plugin. It relays
+Yjs CRDT updates, optionally stores attachments in R2, and stores snapshots when R2
+is configured.
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/kavinsood/yaos/tree/main/server)
 
-## Architecture
+## What this server does
 
 - One vault maps to one Durable Object-backed sync room.
 - Yjs sync runs through `y-partyserver`.
@@ -13,19 +15,7 @@ Cloudflare Worker server for the YAOS Obsidian plugin. It relays Yjs CRDT update
 - Snapshots are gzipped CRDT archives stored in R2.
 - Auth uses the claimed setup token by default, with `SYNC_TOKEN` as an optional hard override.
 
-## Local development
-
-```bash
-cd server
-npm install
-npm run dev -- --var SYNC_TOKEN:dev-sync-token
-```
-
-The local Worker will be served by Wrangler. Use its printed local URL as the plugin's **Server host**.
-
-Passing `SYNC_TOKEN` locally is optional. If you omit it, the server starts unclaimed and you can claim it in a browser.
-
-## Deploy to Cloudflare
+## Standard deploy
 
 Use the **Deploy to Cloudflare** button above for the default setup. It targets the `server/` subdirectory so Cloudflare treats this folder as the project root.
 This repo intentionally keeps `.env.example` free of assignments so the deploy flow does not prompt for `SYNC_TOKEN` by default.
@@ -44,7 +34,7 @@ The default deploy is text-only:
 
 That claim page generates a token in the browser and returns an `obsidian://yaos?...` setup link you can use to configure the plugin.
 
-### How updates work after deploy
+## Updating an existing deploy
 
 The Deploy to Cloudflare button creates a new repository in your own Git account and connects this Worker to that new repo.
 
@@ -57,15 +47,7 @@ To pick up new YAOS changes later:
 3. Use **Open update action** from plugin settings and run the update workflow.
 4. Cloudflare redeploys automatically after the workflow push.
 
-### Manual CLI deploy
-
-```bash
-cd server
-npm install
-npm run deploy
-```
-
-### Optional post-deploy R2 setup
+## Optional R2 setup
 
 If you want attachments and snapshots later:
 
@@ -90,7 +72,27 @@ bucket_name = "your-bucket-name"
 
 After deploy, refresh your Worker URL. YAOS should report attachments/snapshots as available.
 
-## Transient Cloudflare deployment issues
+## Local development
+
+```bash
+cd server
+npm install
+npm run dev -- --var SYNC_TOKEN:dev-sync-token
+```
+
+The local Worker will be served by Wrangler. Use its printed local URL as the plugin's **Server host**.
+
+Passing `SYNC_TOKEN` locally is optional. If you omit it, the server starts unclaimed and you can claim it in a browser.
+
+## Manual deploy
+
+```bash
+cd server
+npm install
+npm run deploy
+```
+
+## Cloudflare deployment quirks
 
 Cloudflare can occasionally show temporary dashboard/build instability. Common examples:
 
@@ -138,7 +140,3 @@ If you set `SYNC_TOKEN`, that environment value becomes the required token inste
 - Blob existence checks use bounded concurrency.
 - Snapshot creation is daily-idempotent through the `/snapshots/maybe` route.
 - Snapshot archives are stored compressed to keep R2 usage modest.
-
-## Deploy button note
-
-The canonical infrastructure config lives in this `server/` directory, and the Deploy to Cloudflare button should target the `server/` subdirectory path in GitHub.

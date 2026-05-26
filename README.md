@@ -43,7 +43,7 @@ Click **Deploy to Cloudflare** above. Cloudflare creates a Worker in your accoun
 Open the Worker URL. Click **Claim** to lock the server to you and generate your setup token.
 
 **3. Install the plugin**
-YAOS is in the Obsidian Marketplace review queue. To install today, add it through [BRAT](https://github.com/TfTHacker/obsidian42-brat): open BRAT settings → **Add Beta plugin** → paste `kavinsood/yaos`.
+Install YAOS from the Obsidian Marketplace.
 
 **4. Connect your vault**
 From the claim page, open the setup link or scan the QR code. YAOS fills in the connection details automatically.
@@ -95,6 +95,11 @@ In practice, that means your vault still exists locally as normal files, Obsidia
 ## Engineering
 
 This repository keeps deep architecture notes under [`engineering/`](./engineering). These aren't afterthoughts — they capture the design rationale, trade-offs, and failure modes behind a production CRDT sync engine on Cloudflare Workers.
+
+Contributors looking for current project truth should start with:
+- [`engineering/active-threads.md`](./engineering/active-threads.md)
+- [`engineering/followups.md`](./engineering/followups.md)
+- [`engineering/bug-rca-ledger.md`](./engineering/bug-rca-ledger.md)
 
 - **[Monolithic vault CRDT](./engineering/monolith.md)** — Why one vault-level `Y.Doc`, what we gain (ACID cross-file transactions), and what we consciously trade off.
 - **[Filesystem bridge](./engineering/filesystem-bridge.md)** — How noisy Obsidian file events are converted into safe CRDT updates with dirty-set draining and content-acknowledged suppression.
@@ -161,18 +166,19 @@ Access via command palette (Ctrl/Cmd+P):
 
 **Conflicts after offline edits**: CRDTs merge automatically but the result depends on operation order. Review merged content if needed.
 
-**Server receipt is unknown or waiting**: Reconnect first. If local cache replay timed out, wait for the vault to finish loading and reconnect again. If you recently reset, reclaimed, or migrated the server, run **Clear local server-receipt state** from the command palette; Phase A receipt state cannot automatically detect every same-vault server reset.
+**Server receipt is unknown or waiting**: Reconnect first. If local cache replay timed out, wait for the vault to finish loading and reconnect again. Server receipt reflects server-side confirmation of this device's recent local state; it does not mean another device has applied the change, and it is not the same as snapshot durability. If you recently reset, reclaimed, or migrated the server, run **Clear local server-receipt state** from the command palette; the local receipt state cannot automatically detect every same-vault server reset.
 
 **Diagnostics**: Use **Show sync debug info** for local inspection. Safe diagnostics exports redact server URL, vault ID, device name, and vault paths; filename-inclusive diagnostics require explicit confirmation before writing.
 
 ## Current limits
 
-YAOS currently syncs Markdown text through the CRDT engine and attachments through
-R2 when configured. It does not try to sync every `.obsidian` setting/plugin file.
-Empty folders are not synced in v0 because the CRDT tracks files and blob
-references, not folder-only objects. Avoid running another live file-sync engine
-such as iCloud, Dropbox, Syncthing, or Git auto-sync against the same vault at the
-same time unless you understand the interaction.
+YAOS currently treats Markdown text as the first-class live sync surface and syncs
+attachments separately through R2 when configured. It does not try to act as a
+general `.obsidian` settings/plugin-state sync engine. Empty folders are not synced
+in v0 because the CRDT tracks files and blob references, not folder-only objects.
+Avoid running another live file-sync engine such as iCloud, Dropbox, Syncthing, or
+Git auto-sync against the same vault at the same time unless you understand the
+interaction.
 
 ## License
 
