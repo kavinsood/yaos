@@ -23,7 +23,7 @@ function escapeHtml(value: string): string {
 		.replace(/"/g, "&quot;");
 }
 
-const IS_MARKETPLACE_APPROVED = false;
+const IS_MARKETPLACE_APPROVED = true;
 const DEFAULT_DEPLOY_REPO = "kavinsood/yaos";
 
 function normalizeDeployRepo(value: string | undefined): string {
@@ -38,20 +38,10 @@ function normalizeDeployRepo(value: string | undefined): string {
 
 export function renderSetupPage(options: SetupPageOptions): string {
 	const safeHost = escapeHtml(options.host);
-	const deployRepo = normalizeDeployRepo(options.deployRepo);
-	const releaseZipUrl = `https://github.com/${deployRepo}/releases/latest/download/yaos.zip`;
 
 	// Cleaned up the installation copy slightly for better reading
-	const installationStep = IS_MARKETPLACE_APPROVED
-		? `<div class="step-text">
+	const installationStep = `<div class="step-text">
               In Obsidian, open <em>Settings → Community plugins</em>, search for <strong>YAOS</strong>, install it, and make sure it is <strong>enabled</strong>.
-           </div>`
-		: `<div class="step-text">
-              <ol>
-                <li>After opening BRAT, select <em>Add beta plugin</em> and paste <code>${deployRepo}</code>.</li>
-                <li>Return to Community plugins and make sure <strong>YAOS</strong> is installed and <strong>enabled</strong>.</li>
-              </ol>
-              <p class="micro-text">Prefer manual installation? <a href="${releaseZipUrl}">Download the zip</a>.</p>
            </div>`;
 
 	return `<!DOCTYPE html>
@@ -338,10 +328,6 @@ export function renderSetupPage(options: SetupPageOptions): string {
           <h2>Get the YAOS plugin</h2>
         </div>
         ${installationStep}
-        <div class="step-recovery">
-          <a class="ghost-btn ghost-btn--light" href="obsidian://show-plugin?id=obsidian42-brat">Open BRAT</a>
-          <button id="copy-repo-desktop" class="ghost-btn" type="button">Copy repo slug</button>
-        </div>
         <label class="checkbox-wrapper">
           <input id="installed" type="checkbox" />
           <span>I have installed and <strong>enabled</strong> YAOS.</span>
@@ -414,8 +400,6 @@ export function renderSetupPage(options: SetupPageOptions): string {
 	    const copyHostBtn = document.getElementById("copy-host");
 	    const copyTokenBtn = document.getElementById("copy-token");
 	    const copyVaultBtn = document.getElementById("copy-vault");
-	    const copyRepoDesktopBtn = document.getElementById("copy-repo-desktop");
-	    const repoSlug = ${JSON.stringify(deployRepo)};
 
 	    function randomToken() {
 	      const bytes = new Uint8Array(32);
@@ -492,13 +476,6 @@ export function renderSetupPage(options: SetupPageOptions): string {
 	      setTimeout(() => copyVaultBtn.textContent = originalText, 2000);
 	    });
 
-    copyRepoDesktopBtn.addEventListener("click", async () => {
-      await navigator.clipboard.writeText(repoSlug);
-      const originalText = copyRepoDesktopBtn.textContent;
-      copyRepoDesktopBtn.textContent = "Copied!";
-      setTimeout(() => copyRepoDesktopBtn.textContent = originalText, 2000);
-    });
-
 	    claimButton.addEventListener("click", async () => {
 	      claimButton.disabled = true;
 	      statusEl.textContent = "Claiming server...";
@@ -545,7 +522,6 @@ export function renderSetupPage(options: SetupPageOptions): string {
 
 export function renderMobileSetupPage(options: MobileSetupPageOptions): string {
 	const safeHost = escapeHtml(options.host);
-	const deployRepo = normalizeDeployRepo(options.deployRepo);
 	return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -637,13 +613,9 @@ export function renderMobileSetupPage(options: MobileSetupPageOptions): string {
     <div id="status" class="status">Loading setup data...</div>
     <div class="recovery">
       <p>Don't have YAOS installed on this phone yet?</p>
-      <p style="margin-top: 6px;">1. Open BRAT in Obsidian.</p>
-      <p style="margin-top: 4px;">2. Add repo <code style="font-size:12px;">${deployRepo}</code>.</p>
-      <p style="margin-top: 4px; margin-bottom: 10px;">3. Enable YAOS, then come back and tap <strong>Connect Obsidian</strong>.</p>
-      <div class="row">
-        <a class="ghost" href="obsidian://show-plugin?id=obsidian42-brat">Open BRAT</a>
-        <button id="copy-repo" class="ghost" type="button">Copy repo slug</button>
-      </div>
+      <p style="margin-top: 6px;">1. In Obsidian, open <strong>Community plugins</strong>.</p>
+      <p style="margin-top: 4px;">2. Search for <strong>YAOS</strong>, install it, and enable it.</p>
+      <p style="margin-top: 4px; margin-bottom: 0;">3. Come back here and tap <strong>Connect Obsidian</strong>.</p>
     </div>
 
 	    <details>
@@ -666,8 +638,6 @@ export function renderMobileSetupPage(options: MobileSetupPageOptions): string {
 	    const hostInput = document.getElementById("host-input");
 	    const tokenInput = document.getElementById("token-input");
 	    const vaultInput = document.getElementById("vault-input");
-	    const copyRepoBtn = document.getElementById("copy-repo");
-	    const repoSlug = ${JSON.stringify(deployRepo)};
 
     function parseHash() {
       const hash = window.location.hash.startsWith("#") ? window.location.hash.slice(1) : window.location.hash;
@@ -696,17 +666,8 @@ export function renderMobileSetupPage(options: MobileSetupPageOptions): string {
       // Scrub the URL history to hide the token fragment immediately
       window.history.replaceState(null, "", window.location.pathname);
 
-      statusEl.textContent = "Ready. Install YAOS via BRAT if needed, then tap Connect Obsidian.";
+      statusEl.textContent = "Ready. Install YAOS from Community plugins if needed, then tap Connect Obsidian.";
     }
-
-    copyRepoBtn.addEventListener("click", async () => {
-      await navigator.clipboard.writeText(repoSlug);
-      const oldText = copyRepoBtn.textContent;
-      copyRepoBtn.textContent = "Copied!";
-      setTimeout(() => {
-        copyRepoBtn.textContent = oldText;
-      }, 1800);
-    });
   </script>
 </body>
 </html>`;

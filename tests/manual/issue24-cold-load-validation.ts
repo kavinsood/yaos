@@ -26,7 +26,7 @@
  *     node --import jiti/register tests/manual/issue24-cold-load-validation.ts
  *
  *   # Redeploy the staging Worker (kills all DOs, forces cold load)
- *   cd server && npx wrangler deploy --config wrangler.staging.toml ...
+ *   cd server && npx wrangler deploy ...
  *
  *   # Phase 2: validate
  *   PHASE=validate YAOS_TEST_HOST=https://staging.workers.dev \
