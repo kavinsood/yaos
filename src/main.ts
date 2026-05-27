@@ -883,6 +883,36 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 				if (this.isMarkdownPathSyncable(file.path)) {
 					const opId = this.newOpId();
+					// Writer attribution for the disk modify event.
+					// suppressWindowActive: did YAOS issue a write whose
+					// suppression entry is still live at this moment?
+					// lastDiskWriteOkAtMs: monotonic ms timestamp of our
+					// last successful flushWrite for this path (null if
+					// YAOS has never written it this session).
+					// writerGuess: a coarse classification combining both.
+					// "yaos-write" is high-confidence; "external" is
+					// "no suppression active and our last write was either
+					// long ago or never"; "unknown" is the fallback when
+					// the diskMirror is not yet wired (early-startup race).
+					const dm = this.getDiskMirror();
+					const suppressWindowActive = !!dm?.isSuppressed(file.path);
+					const lastDiskWriteOkAtMs = dm?.getLastDiskWriteOkAt(file.path) ?? null;
+					const dtSinceWrite = lastDiskWriteOkAtMs === null
+						? null
+						: Date.now() - lastDiskWriteOkAtMs;
+					let writerGuess: "yaos-write" | "external" | "unknown";
+					if (!dm) {
+						writerGuess = "unknown";
+					} else if (suppressWindowActive) {
+						writerGuess = "yaos-write";
+					} else if (dtSinceWrite !== null && dtSinceWrite < 500) {
+						// Suppression entry may have expired between vault.modify
+						// dispatch and our handler. If our last write was very
+						// recent, attribute the modify to YAOS conservatively.
+						writerGuess = "yaos-write";
+					} else {
+						writerGuess = "external";
+					}
 					this.recordFlightPathEvent({
 						priority: "important",
 						kind: FLIGHT_KIND.diskModifyObserved,
@@ -892,7 +922,13 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						layer: "disk",
 						opId,
 						path: file.path,
-						data: { size: file.stat?.size ?? null },
+						data: {
+							size: file.stat?.size ?? null,
+							writerGuess,
+							suppressWindowActive,
+							lastDiskWriteOkAtMs,
+							msSinceLastDiskWriteOk: dtSinceWrite,
+						},
 					});
 					this.reconciliationController.markMarkdownDirty(file, "modify", opId);
 				} else {
@@ -1479,7 +1515,18 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			};
 		}
 
-		void this.flightTrace?.recordPath(event);
+		// recovery.decision uses the precision path (reserveAndRecordPath)
+		// so the witness can correlate the recoveryStateHash with the
+		// reserved seq synchronously. Recording it twice (once via
+		// recordPath, then again via reserveAndRecordPath) is a logging
+		// bug — duplicates pollute the trace and confuse analyzers. Route
+		// the event through exactly one recorder per kind.
+		const isRecoveryDecisionMd =
+			event.kind === "recovery.decision" && event.path.endsWith(".md");
+
+		if (!isRecoveryDecisionMd) {
+			void this.flightTrace?.recordPath(event);
+		}
 
 		// Req 17.3: mark dirty for recovery.decision and recovery.apply.done.
 		if (
@@ -1491,18 +1538,22 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 		// Phase 2 Req 11 + Fix 4: precision path for recovery_emitted_old_hash.
 		// reserveAndRecordPath reserves seq synchronously and returns it — no currentSeq inference.
-		if (event.kind === "recovery.decision" && event.path.endsWith(".md")) {
+		if (isRecoveryDecisionMd) {
 			const data = event.data as Record<string, unknown> | undefined;
 			const recoveryStateHash = data?.recoveryStateHash as string | undefined;
 			if (this.flightTrace) {
-				// Use reserveAndRecordPath to get the actual seq for this event
+				// Use reserveAndRecordPath to record AND get the actual seq.
+				// This is the only recording path for recovery.decision events.
 				const recoverySeq = this.flightTrace.reserveAndRecordPath(event);
 				this.deviceWitnessTracker?.notifyPrecursorEvent(event.path, "recovery", recoverySeq);
 				this.deviceWitnessTracker?.handleRecoveryDecision(event.path, recoveryStateHash);
 			} else {
+				// No flight trace active — still notify the witness, but the
+				// event is not persisted (consistent with other kinds when
+				// flightTrace is undefined).
 				this.deviceWitnessTracker?.handleRecoveryDecision(event.path, recoveryStateHash);
 			}
-			return; // already recorded above
+			return;
 		}
 	}
 

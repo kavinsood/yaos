@@ -113,6 +113,15 @@ export class DiskMirror {
 	 */
 	private _onDiskWriteCallback: ((path: string, contentHash: string) => void) | null = null;
 
+	/**
+	 * Per-path timestamp of the most recent successful `flushWrite`. Updated
+	 * on every `vault.modify` and `vault.create` we issue. Read by the main
+	 * vault.on("modify") handler so `disk.modify.observed` events can carry
+	 * a writerGuess (yaos-write vs external) for RCA. See spec:
+	 * .kiro/specs/editor-bound-localonly-amplifier-guard/requirements.md (R8).
+	 */
+	private lastDiskWriteOkAt = new Map<string, number>();
+
 	private readonly debug: boolean;
 
 	constructor(
@@ -501,6 +510,7 @@ export class DiskMirror {
 				await this.suppressWrite(path, content);
 				await this.app.vault.modify(existing, content);
 				this.log(`flushWrite: updated "${path}" (${content.length} chars)`);
+				this.lastDiskWriteOkAt.set(normalized, Date.now());
 				this._onDiskWriteCallback?.(normalized, await contentBaselineHash(content));
 				this._flightEventHandler?.({
 					priority: "important",
@@ -529,6 +539,7 @@ export class DiskMirror {
 				this.log(
 					`flushWrite: created "${path}" on disk (${content.length} chars)`,
 				);
+				this.lastDiskWriteOkAt.set(normalized, Date.now());
 				this._onDiskWriteCallback?.(normalized, await contentBaselineHash(content));
 				this._flightEventHandler?.({
 					priority: "important",
@@ -901,6 +912,18 @@ export class DiskMirror {
 		return this.getActiveSuppression(path) !== null;
 	}
 
+	/**
+	 * Per-path timestamp of the most recent successful YAOS-issued
+	 * `flushWrite`. Returns null if YAOS has never written this path in
+	 * this session. Used by main.ts to label `disk.modify.observed` events
+	 * with writer attribution. See spec:
+	 * .kiro/specs/editor-bound-localonly-amplifier-guard/requirements.md (R8).
+	 */
+	getLastDiskWriteOkAt(path: string): number | null {
+		const v = this.lastDiskWriteOkAt.get(normalizePath(path));
+		return v === undefined ? null : v;
+	}
+
 	async shouldSuppressModify(file: TFile): Promise<boolean> {
 		return this.shouldSuppressWriteEvent(file, "modify");
 	}
@@ -1139,6 +1162,7 @@ export class DiskMirror {
 		this.suppressedPaths.clear();
 		this.preservedUnresolved.clear();
 		this.pathWriteLocks.clear();
+		this.lastDiskWriteOkAt.clear();
 		this.log("DiskMirror destroyed");
 	}
 

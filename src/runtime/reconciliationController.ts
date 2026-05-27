@@ -162,6 +162,56 @@ function tracePathList(prefix: string, paths: string[]): Record<string, unknown>
 	};
 }
 
+/**
+ * Closed-shape result of the binding-health predicate. `reasons` is empty
+ * when `healthy === true`. The same shape is recorded in trace events so
+ * future RCAs can read why the controller chose to repair (or not).
+ */
+interface BindingHealthResult {
+	healthy: boolean;
+	reasons: string[];
+}
+
+/**
+ * Inspect captured binding/collab debug info and decide whether the
+ * editor binding is actually broken. The localOnly recovery branch uses
+ * this to skip `editorBindings.repair()` when the binding looks fine —
+ * unconditional reconfigure on every recovery cycle was a contributor to
+ * the typing-cadence amplifier loop.
+ *
+ * Healthy when ALL of:
+ *   - `binding.cmMatches !== false` (the EditorView is the one we tracked)
+ *   - `collab.hasSyncFacet !== false` (yCollab compartment is attached)
+ *   - `collab.yTextMatchesExpected !== false` (facet points at our ytext)
+ *   - `collab.awarenessMatchesProvider !== false` (awareness wired)
+ *
+ * Null values are treated as "not signal" — they neither confirm nor
+ * deny health. They do not flip the verdict.
+ *
+ * If `binding` or `collab` themselves are null we fall back to "unhealthy"
+ * because we have no evidence the binding is wired at all.
+ *
+ * See spec:
+ * .kiro/specs/editor-bound-localonly-amplifier-guard/requirements.md R7.
+ */
+function classifyBindingHealth(
+	binding: { cmMatches: boolean | null; leafId?: string | null } | null | undefined,
+	collab: {
+		hasSyncFacet: boolean;
+		yTextMatchesExpected: boolean | null;
+		awarenessMatchesProvider: boolean | null;
+	} | null | undefined,
+): BindingHealthResult {
+	const reasons: string[] = [];
+	if (binding == null) reasons.push("missing-binding-info");
+	if (collab == null) reasons.push("missing-collab-info");
+	if (binding && binding.cmMatches === false) reasons.push("cm-mismatch");
+	if (collab && collab.hasSyncFacet === false) reasons.push("missing-sync-facet");
+	if (collab && collab.yTextMatchesExpected === false) reasons.push("ytext-mismatch");
+	if (collab && collab.awarenessMatchesProvider === false) reasons.push("awareness-mismatch");
+	return { healthy: reasons.length === 0, reasons };
+}
+
 function traceRecoveryPostcondition(
 	trace: ReconciliationControllerDeps["trace"],
 	recordFlightPathEvent: ReconciliationControllerDeps["recordFlightPathEvent"],
@@ -257,6 +307,10 @@ export class ReconciliationController {
 	private lastConflictNoticeAt = 0;
 	private conflictNoticeSuppressionCount = 0;
 	private static readonly CONFLICT_NOTICE_COOLDOWN_MS = 30_000;
+	/** Amplification-quarantine notice throttle. Independent from conflict notices. */
+	private lastAmplificationNoticeAt = 0;
+	private amplificationNoticeSuppressionCount = 0;
+	private static readonly AMPLIFICATION_NOTICE_COOLDOWN_MS = 60_000;
 
 	constructor(private readonly deps: ReconciliationControllerDeps) {}
 
@@ -330,6 +384,8 @@ export class ReconciliationController {
 		this.blockedDivergenceSample = [];
 		this.lastConflictNoticeAt = 0;
 		this.conflictNoticeSuppressionCount = 0;
+		this.lastAmplificationNoticeAt = 0;
+		this.amplificationNoticeSuppressionCount = 0;
 		this.boundRecoveryLocks.clear();
 	}
 
@@ -1577,6 +1633,14 @@ export class ReconciliationController {
 				});
 			// recovery.decision: emit before quarantine check so even quarantined cases are visible
 			const _rsh1 = await this.deps.computeRecoveryStateHash?.(file.path, content) ?? undefined;
+			// Snapshot binding health across all localOnly views. Surfaces in
+			// the trace why we may or may not also call repair() on the views
+			// after the diff applies. See spec R7.
+			const _localOnlyHealth = localOnlyViews.map((state) => ({
+				leafId: state.binding?.leafId ?? null,
+				...classifyBindingHealth(state.binding, state.collab),
+			}));
+			const _localOnlyAnyUnhealthy = _localOnlyHealth.some((h) => !h.healthy);
 			this.deps.recordFlightPathEvent?.({
 				priority: "important",
 				kind: FLIGHT_KIND.recoveryDecision,
@@ -1596,6 +1660,11 @@ export class ReconciliationController {
 					editorEqualsCrdt: false,
 					diskFingerprintPrefix: contentFingerprint(content).slice(0, 8),
 					crdtFingerprintPrefix: crdtContent ? contentFingerprint(crdtContent).slice(0, 8) : null,
+					// Binding-health diagnostic surface (Reviewer item 2/3): lets
+					// future RCAs see why repair was or wasn't called per view
+					// without grepping the source.
+					bindingHealth: _localOnlyHealth,
+					anyBindingUnhealthy: _localOnlyAnyUnhealthy,
 					...(_rsh1 ? { recoveryStateHash: _rsh1 } : {}),
 				},
 			});
@@ -1742,7 +1811,41 @@ export class ReconciliationController {
 			}
 			this.boundRecoveryLocks.set(file.path, Date.now() + BOUND_RECOVERY_LOCK_MS);
 
+			// Binding-health-conditional repair.
+			//
+			// The original code reconfigured the CodeMirror compartment via
+			// editorBindings.repair() on EVERY localOnly recovery cycle, even
+			// when the binding was healthy. Each reconfigure adds jitter to
+			// the editor↔ytext propagation and contributed to the typing-
+			// cadence amplifier loop captured in the 2026-05-27 iPad trace.
+			//
+			// New rule: only repair when the captured binding/collab debug
+			// info shows actual unhealth. A healthy binding does NOT need
+			// to be reconfigured just because content recovery happened.
+			//
+			// Two operations are now distinct:
+			//   - content recovery (always run when the predicate is met)
+			//   - editor binding repair (run only when health markers fail)
+			//
+			// See spec:
+			// .kiro/specs/editor-bound-localonly-amplifier-guard/requirements.md R7.
 			for (const state of localOnlyViews) {
+				const health = classifyBindingHealth(state.binding, state.collab);
+				if (health.healthy) {
+					this.deps.trace("recovery", "binding-healthy-skipped-repair", {
+						path: file.path,
+						leafId: state.binding?.leafId ?? null,
+						cmMatches: state.binding?.cmMatches ?? null,
+						hasSyncFacet: state.collab?.hasSyncFacet ?? null,
+						yTextMatchesExpected: state.collab?.yTextMatchesExpected ?? null,
+					});
+					continue;
+				}
+				this.deps.trace("recovery", "binding-unhealthy-repairing", {
+					path: file.path,
+					leafId: state.binding?.leafId ?? null,
+					reasons: health.reasons,
+				});
 				const repaired = editorBindings?.repair(
 					state.view,
 					this.deps.getSettings().deviceName,
@@ -2334,6 +2437,15 @@ export class ReconciliationController {
 			},
 		});
 		this.deps.scheduleTraceStateSnapshot("recovery-amplification-quarantined");
+		// User-visible notice. Throttled and silent on every cycle in
+		// production, but the user gets at least one warning per minute
+		// when amplification quarantine is firing — better than a silent
+		// quarantine.
+		const fileName = path.split("/").pop() ?? path;
+		this.showAmplificationNotice(
+			`Recovery loop detected for "${fileName}" — paused content recovery. ` +
+			`Try closing and reopening the note, or wait for sync to settle.`,
+		);
 		// Drop the path's history so subsequent recoveries are evaluated
 		// against a fresh window (the path has been quarantined; analyzer
 		// or user intervention will resolve the divergence).
@@ -2439,5 +2551,29 @@ export class ReconciliationController {
 			? ` (and ${suppressed} other conflict${suppressed > 1 ? "s" : ""} in the last 30s)`
 			: "";
 		new Notice(`YAOS: ${message}${suffix}`, 10000);
+	}
+
+	/**
+	 * Show an amplification-quarantine notice with rate-limiting. Independent
+	 * from showConflictNotice — these two surfaces are different: a conflict
+	 * preserved a competing version, an amplification quarantine paused
+	 * content recovery on a file that looked like it was looping.
+	 *
+	 * One notice per AMPLIFICATION_NOTICE_COOLDOWN_MS window; suppressed
+	 * fires are counted and reported in the next notice.
+	 */
+	private showAmplificationNotice(message: string): void {
+		const now = Date.now();
+		if (now - this.lastAmplificationNoticeAt < ReconciliationController.AMPLIFICATION_NOTICE_COOLDOWN_MS) {
+			this.amplificationNoticeSuppressionCount++;
+			return;
+		}
+		const suppressed = this.amplificationNoticeSuppressionCount;
+		this.amplificationNoticeSuppressionCount = 0;
+		this.lastAmplificationNoticeAt = now;
+		const suffix = suppressed > 0
+			? ` (and ${suppressed} other quarantine${suppressed > 1 ? "s" : ""} in the last 60s)`
+			: "";
+		new Notice(`YAOS: ${message}${suffix}`, 12000);
 	}
 }
