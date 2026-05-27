@@ -1201,6 +1201,9 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 	//     disabled. On re-enable, disk should cleanly win: B's edit goes
 	//     into CRDT/server, no conflict artifact needed.
 	//     INVARIANT: local disk changed, remote unchanged → disk wins.
+	//     STATUS: PASSES via the clean-disable baseline path.
+	//             teardownSync persists the baseline before kill; reconcile
+	//             sees crdt-at-baseline → import-disk-to-crdt.
 	//
 	//   s10e-2 (issue-22-disable-reenable-concurrent):
 	//     B edits while YAOS is disabled. A ALSO edits through YAOS while
@@ -1208,15 +1211,19 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 	//     conflict preserved. Neither edit silently lost.
 	//     INVARIANT: both changed from baseline → preserve-conflict.
 	//
-	// REQUIRES BASELINE FIX: s10e-1 currently fails (missing-baseline
-	// causes CRDT to overwrite disk, conflict artifact created incorrectly).
-	// See: src/sync/diskIndex.ts DiskIndexEntry.contentHash (pending fix).
+	// COLD-RELAUNCH VARIANT (missing-baseline):
+	//     If the process is killed before teardownSync runs (e.g. iOS
+	//     suspend/kill), the baseline is not persisted. The
+	//     missing-baseline path now uses diskMtime evidence:
+	//     if diskMtime > lastDiskIndexPersistedAt → disk wins.
+	//     Repro: qa/scripts/repro-missing-baseline-kill.ts
+	//     See also: engineering/bug-rca-ledger.md Issue #22-B cold-relaunch variant
 	// ───────────────────────────────────────────────────────────────────
 
 	// s10e-1: B edits while YAOS disabled, A makes NO changes.
 	// Expected: B's disk edit cleanly wins (import-disk-to-crdt, no artifact).
-	// Current status: EXPECTED FAIL -- missing-baseline causes wrong conflict
-	// artifact to be created. Pending DiskIndexEntry.contentHash baseline fix.
+	// Status: PASSES. The baseline is persisted by teardownSync on clean disable,
+	// so reconcile sees crdt-at-baseline → import-disk-to-crdt. No artifact needed.
 	"issue-22-disable-reenable-local-only": async (a, b, log) => {
 		const errors: string[] = [];
 		const scratch = "QA-scratch/s10e-local-only.md";
@@ -1330,8 +1337,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		if (!finalContentB.includes(DISABLE_MARKER)) {
 			errors.push(
 				"FAIL: B's disk edit was overwritten on re-enable. " +
-				"Expected local-only disk edit to win cleanly (import-disk-to-crdt). " +
-				"[EXPECTED FAIL pending DiskIndexEntry.contentHash baseline fix]",
+				"Expected local-only disk edit to win cleanly (import-disk-to-crdt).",
 			);
 		} else {
 			log("Assert: B's disk edit survived re-enable in main file ✓");
@@ -1351,8 +1357,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		if (conflictPath) {
 			errors.push(
 				`FAIL: conflict artifact was created for a local-only change (no server edit). ` +
-				`Artifact: ${conflictPath}. ` +
-				`[EXPECTED FAIL pending DiskIndexEntry.contentHash baseline fix]`,
+				`Artifact: ${conflictPath}.`,
 			);
 			// Cleanup artifact
 			await a.evalRaw(`window.__YAOS_QA__?.deleteFile(${JSON.stringify(conflictPath)})`).catch(() => {});

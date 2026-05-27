@@ -89,6 +89,8 @@ interface ReconciliationControllerDeps {
 	 * Returns the Unix ms timestamp of the last successful saveDiskIndex() call.
 	 * Used by decideClosedFileConflict to detect disk edits made while YAOS
 	 * was inactive (missing-baseline tie-breaking). Returns 0 if never saved.
+	 * Naming: getLastDiskIndexPersistedAt — this is the last save, not last
+	 * plugin activity; conflating them creates false certainty.
 	 */
 	getLastSaveDiskIndexAt?(): number;
 	trace(source: string, msg: string, details?: Record<string, unknown>): void;
@@ -643,12 +645,14 @@ export class ReconciliationController {
 						//   both != baseline → both changed      → preserve-conflict/both-changed
 						//   baseline null    → unknown           → preserve-conflict/missing-baseline
 						const baselineHash = this.deps.getDiskIndex()[path]?.contentHash ?? null;
+						const diskMtimeRaw = allStats.get(path)?.mtime;
+						const lastDiskIndexPersistedAt = this.deps.getLastSaveDiskIndexAt?.() ?? undefined;
 						const decision = decideClosedFileConflict({
 							baselineHash,
 							diskHash,
 							crdtHash,
-							diskMtime: allStats.get(path)?.mtime,
-							lastSaveDiskIndexAt: this.deps.getLastSaveDiskIndexAt?.() ?? undefined,
+							diskMtime: diskMtimeRaw,
+							lastDiskIndexPersistedAt,
 						});
 					this.deps.recordFlightPathEvent?.({
 						priority: decision.kind === "preserve-conflict" ? "critical" : "important",
@@ -674,6 +678,15 @@ export class ReconciliationController {
 										? "high"
 										: "ambiguous"
 									: "none",
+							// Missing-baseline diagnostic fields — only present when
+							// reason === "missing-baseline". Explains exactly why disk or
+							// CRDT was chosen so future trace readers don't have to guess.
+							...(decision.kind === "preserve-conflict" && decision.reason === "missing-baseline" && {
+								missingBaselinePolicy: (decision as { _missingBaselinePolicy?: string })._missingBaselinePolicy ?? null,
+								diskMtime: diskMtimeRaw ?? null,
+								lastDiskIndexPersistedAt: lastDiskIndexPersistedAt ?? null,
+								mtimeEvidence: diskMtimeRaw !== undefined && lastDiskIndexPersistedAt !== undefined,
+							}),
 						},
 					});
 						if (decision.kind === "preserve-conflict") {

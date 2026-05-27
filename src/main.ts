@@ -91,11 +91,14 @@ type PersistedPluginState = Partial<VaultSyncSettings> & {
 	_blobHashCache?: BlobHashCache;
 	/**
 	 * Unix ms timestamp of the last successful saveDiskIndex() call.
-	 * Used by decideClosedFileConflict to detect "disk file was edited
-	 * while YAOS was inactive" when baselineHash is missing.
-	 * See: src/sync/closedFileConflict.ts ClosedFileConflictInput.lastSaveDiskIndexAt
+	 * Semantically: "the last time YAOS durably persisted its disk-index
+	 * baselines to data.json." Used by decideClosedFileConflict to detect
+	 * "disk file was edited while YAOS was inactive" when baselineHash is
+	 * missing. This is a heuristic timestamp — it is the last save, not
+	 * necessarily the last time YAOS observed the specific file.
+	 * See: src/sync/closedFileConflict.ts ClosedFileConflictInput.lastDiskIndexPersistedAt
 	 */
-	_lastSaveDiskIndexAt?: number;
+	_lastDiskIndexPersistedAt?: number;
 	_blobQueue?: BlobQueueSnapshot;
 	_serverCapabilitiesCache?: PersistedServerCapabilitiesCache;
 	_updateManifestCache?: PersistedUpdateManifestCache;
@@ -137,8 +140,15 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	/** Persisted disk index: {path -> {mtime, size}}. */
 	private diskIndex: DiskIndex = {};
-	/** Unix ms timestamp of the last saveDiskIndex() that completed successfully. */
-	private lastSaveDiskIndexAt = 0;
+	/**
+	 * Unix ms timestamp of the last saveDiskIndex() that completed successfully.
+	 * Semantics: "last time YAOS durably persisted disk-index state."
+	 * This is a global (not per-file) heuristic timestamp used only as a
+	 * tie-breaker in the missing-baseline closed-file conflict path.
+	 * Naming: lastDiskIndexPersistedAt, not lastPluginActiveAt — these are
+	 * not the same thing, and conflating them creates false certainty.
+	 */
+	private lastDiskIndexPersistedAt = 0;
 
 	/** Persisted blob hash cache: {path -> {mtime, size, hash}}. */
 	private blobHashCache: BlobHashCache = {};
@@ -192,7 +202,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			},
 			saveDiskIndex: () => this.saveDiskIndex(),
 			refreshStatusBar: () => this.refreshStatusBar(),
-			getLastSaveDiskIndexAt: () => this.lastSaveDiskIndexAt,
+			getLastSaveDiskIndexAt: () => this.lastDiskIndexPersistedAt,
 			trace: (source, msg, details) => this.trace(source, msg, details),
 			scheduleTraceStateSnapshot: (reason) => this.scheduleTraceStateSnapshot(reason),
 			log: (message) => this.log(message),
@@ -1672,9 +1682,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		if (data && typeof data._diskIndex === "object" && data._diskIndex !== null) {
 			this.diskIndex = data._diskIndex;
 		}
-		// Load lastSaveDiskIndexAt for missing-baseline conflict tie-breaking
-		if (data && typeof data._lastSaveDiskIndexAt === "number" && data._lastSaveDiskIndexAt > 0) {
-			this.lastSaveDiskIndexAt = data._lastSaveDiskIndexAt;
+		// Load lastDiskIndexPersistedAt for missing-baseline conflict tie-breaking
+		if (data && typeof data._lastDiskIndexPersistedAt === "number" && data._lastDiskIndexPersistedAt > 0) {
+			this.lastDiskIndexPersistedAt = data._lastDiskIndexPersistedAt;
 		}
 		// Load blob hash cache
 		if (data && typeof data._blobHashCache === "object" && data._blobHashCache !== null) {
@@ -1878,7 +1888,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		}
 
 	private async saveDiskIndex(): Promise<void> {
-		this.lastSaveDiskIndexAt = Date.now();
+		this.lastDiskIndexPersistedAt = Date.now();
 		await this.persistPluginState();
 	}
 
@@ -1906,7 +1916,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			...this.settingsStore.withSettings(this.persistedState, this.settings),
 			_diskIndex: this.diskIndex,
 			_blobHashCache: this.blobHashCache,
-			...(this.lastSaveDiskIndexAt > 0 && { _lastSaveDiskIndexAt: this.lastSaveDiskIndexAt }),
+			...(this.lastDiskIndexPersistedAt > 0 && { _lastDiskIndexPersistedAt: this.lastDiskIndexPersistedAt }),
 		};
 		const cachedCapabilities = this.capabilityUpdateService?.getPersistedServerCapabilitiesCache();
 		if (cachedCapabilities) {
