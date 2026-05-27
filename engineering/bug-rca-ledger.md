@@ -104,6 +104,54 @@ Repo-validated bug / incident ledger as of 2026-05-27.
   - forced local-only and open-idle recovery branches converge
   - the natural repeated-anchor symptom test no longer reproduces the growth loop
 
+#### `#25` typing-cadence localOnly amplifier variant — fingerprint-changing growth
+
+- Status: fixed 2026-05-28
+- Failure shape: while a Markdown file was open in the editor and the user
+  was typing, the controller's `bound-file-local-only-divergence` branch ran
+  every ~2.36s. CRDT length and disk length each grew by exactly +5 chars per
+  cycle. Each cycle satisfied its postcondition (`matchesExpected: true`),
+  applied an apply-diff under `ORIGIN_DISK_SYNC_RECOVER_BOUND`, and called
+  `editorBindings.repair()`. The witness fired `device.witness.diverged`
+  ~2 seconds after each `recovery.apply.done` because the next typing burst
+  had landed disk in the meantime. Loops at ~2.36s cadence forever while
+  typing continues.
+- Existing protections did not catch it:
+  - `BOUND_RECOVERY_LOCK_MS` (1500ms) lock expires before the next 2.36s cycle.
+  - `shouldQuarantineRepeatedRecovery` is fingerprint-keyed; each cycle's
+    `(prev, next)` lengths are unique and prefixes change, so `count` never
+    reaches the threshold of 3.
+  - `OPEN_FILE_EXTERNAL_EDIT_IDLE_GRACE_MS` (1200ms) idle guard exists in
+    the `crdtOnly` branch but not in `localOnly`.
+- Real-device evidence:
+  - `~/temenos/.obsidian/plugins/yaos/flight-logs/2026-05-27/boot-wL7i012vR4mGXA-1.ndjson`
+  - pathId `p:476818d2ecba90d4e95e2a0c4f3ad1eb`
+  - timeline reproducible via `qa/scripts/issue22b-loop-summary.mjs`
+  - full RCA at `engineering/issue-25-localonly-amplifier-timeline.md`
+- Fix:
+  - `OPEN_FILE_LOCAL_ONLY_RECOVERY_IDLE_MS = 3000ms`. New idle guard added to
+    the localOnly branch, symmetric to the crdtOnly branch's existing 1200ms
+    guard. Threshold is intentionally longer because localOnly is the
+    typing-cadence amplifier shape; quenching it requires a window longer
+    than a typical human typing burst. Emits `recovery.skipped` with reason
+    `recent-editor-activity-local-only`.
+  - Monotonic-growth amplification quarantine. New per-path detector
+    independent of fingerprint identity. Trips when 3 consecutive
+    `bound-file-local-only-divergence` recoveries within 15s exhibit
+    non-decreasing prevLen and nextLen with strictly positive deltas AND
+    end values strictly larger than start values. Emits new flight kind
+    `recovery.amplification.quarantined` (taxonomy bumped to 10) plus the
+    existing `recovery.loop.detected`.
+  - Pauses (idle-guard skip, crdt-current no-op, recovery-lock skip) reset
+    the amplification history. Legitimate one-shot recoveries do not count
+    toward future quarantines.
+- Spec: `.kiro/specs/editor-bound-localonly-amplifier-guard/requirements.md`
+- Regression: `tests/controller-recovery-orchestration-amplifier.ts`
+  (4 deterministic Node scenarios in `npm run test:regressions`).
+- iPad proof: still pending. Desktop coverage proves the predicate, the
+  flight kind, and the timing. Real-device validation required before
+  closing this variant fully for mobile.
+
 ### Stale compiled `src/*.js` artifacts causing false regression failures
 
 - Status: fixed and guarded

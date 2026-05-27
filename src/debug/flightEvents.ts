@@ -1,5 +1,5 @@
 export const FLIGHT_EVENT_SCHEMA_VERSION = 1;
-export const FLIGHT_TAXONOMY_VERSION = 9; // bumped: controller recovery orchestration — recovery.skipped, editor.repair.applied, editor.heal.applied
+export const FLIGHT_TAXONOMY_VERSION = 10; // bumped: editor-bound localOnly amplifier guard — recovery.amplification.quarantined
 
 export type FlightSeverity = "debug" | "info" | "warn" | "error";
 export type FlightScope =
@@ -112,6 +112,15 @@ export const FLIGHT_KIND = {
 	recoveryLoopDetected: "recovery.loop.detected",
 	recoveryQuarantined: "recovery.quarantined",
 	/**
+	 * Emitted when the monotonic-growth amplification detector trips.
+	 * Distinct from `recovery.quarantined` (fingerprint-keyed) — this
+	 * fires when N consecutive bound-file-local-only-divergence
+	 * recoveries within a window all exhibit non-decreasing prevLen and
+	 * nextLen with strictly positive deltas. See spec:
+	 * .kiro/specs/editor-bound-localonly-amplifier-guard/requirements.md R3.
+	 */
+	recoveryAmplificationQuarantined: "recovery.amplification.quarantined",
+	/**
 	 * Emitted when the controller short-circuits a recovery pass without
 	 * entering any recovery branch. `data.reason` is constrained at the
 	 * type level by `RecoverySkippedReason`. When `reason` is
@@ -171,6 +180,7 @@ export type RecoverySkippedReason =
 	| "crdt-current-no-op"
 	| "recovery-lock-active"
 	| "recent-editor-activity"
+	| "recent-editor-activity-local-only"
 	| "frontmatter-ingest-blocked";
 
 /**

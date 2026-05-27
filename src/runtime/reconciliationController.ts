@@ -107,6 +107,18 @@ interface ReconciliationControllerDeps {
 const RECONCILE_COOLDOWN_MS = 10_000;
 const MARKDOWN_DIRTY_SETTLE_MS = 350;
 const OPEN_FILE_EXTERNAL_EDIT_IDLE_GRACE_MS = 1200;
+/**
+ * Idle window for the bound-file-local-only-divergence branch.
+ *
+ * Distinct from OPEN_FILE_EXTERNAL_EDIT_IDLE_GRACE_MS (1200ms, used only by
+ * the crdtOnly branch). The localOnly branch is the typing-cadence amplifier
+ * shape — Obsidian autosave landing keystrokes faster than the y-codemirror
+ * plumbing propagates them into Y.Text. Quenching that loop requires a
+ * window longer than a typical human typing burst; 3000ms is conservative.
+ *
+ * See spec: .kiro/specs/editor-bound-localonly-amplifier-guard/requirements.md R2.
+ */
+const OPEN_FILE_LOCAL_ONLY_RECOVERY_IDLE_MS = 3000;
 const BOUND_RECOVERY_LOCK_MS = 1500;
 const TRACE_PATH_SAMPLE_LIMIT = 50;
 const MAX_REPEATED_RECOVERY_FINGERPRINTS = 3;
@@ -115,6 +127,24 @@ const MAX_RECOVERY_FINGERPRINT_MAP_SIZE = 200;
  *  recurs after this window, the count resets to 1 — preventing stale
  *  attempts from hours ago from poisoning future legitimate edits. */
 const RECOVERY_FINGERPRINT_TTL_MS = 10 * 60_000; // 10 minutes
+
+/**
+ * Monotonic-growth amplification quarantine.
+ *
+ * Independent of fingerprint identity. Catches recovery loops where every
+ * cycle has a different fingerprint but lengths and prefixes grow along the
+ * same axis (typing-cadence amplifier). See spec:
+ * .kiro/specs/editor-bound-localonly-amplifier-guard/requirements.md R3.
+ */
+const MAX_AMPLIFICATION_HISTORY_ENTRIES = 5;
+const AMPLIFICATION_QUARANTINE_THRESHOLD = 3;
+const AMPLIFICATION_WINDOW_MS = 15_000;
+
+interface AmplificationEntry {
+	prevLen: number;
+	nextLen: number;
+	at: number;
+}
 
 /**
  * Cheap FNV-1a-ish 32-bit hash for content fingerprinting.
@@ -208,6 +238,13 @@ export class ReconciliationController {
 	private lastMarkdownDirtyAt = 0;
 	private boundRecoveryLocks = new Map<string, number>();
 	private recoveryFingerprints = new Map<string, { fingerprint: string; count: number; lastAt: number }>();
+	/**
+	 * Per-path amplification history for the monotonic-growth quarantine.
+	 * Independent of `recoveryFingerprints` — fingerprint quarantine catches
+	 * "same diff repeating," this catches "growing diff repeating." See spec:
+	 * .kiro/specs/editor-bound-localonly-amplifier-guard/requirements.md R3.
+	 */
+	private amplificationHistory = new Map<string, AmplificationEntry[]>();
 	/** QA-ONLY: in-memory external edit policy override. Never persisted. */
 	private __qaExternalEditPolicyOverride: import("../settings").ExternalEditPolicy | null = null;
 	private lastConflictFingerprints = new Map<string, string>();
@@ -286,6 +323,7 @@ export class ReconciliationController {
 		this.markdownDrainPromise = null;
 		this.lastMarkdownDirtyAt = 0;
 		this.recoveryFingerprints.clear();
+		this.amplificationHistory.clear();
 		this.lastConflictFingerprints.clear();
 		this.blockedDivergenceCount = 0;
 		this.lastBlockedDivergenceAt = null;
@@ -1394,6 +1432,9 @@ export class ReconciliationController {
 					lockRemainingMs: lockUntil - now,
 				},
 			});
+			// Pauses (or quenched cycles) reset the amplification detector.
+			// See spec: .kiro/specs/editor-bound-localonly-amplifier-guard/requirements.md R3.8.
+			this.amplificationHistory.delete(file.path);
 			return true;
 		}
 		if (lockUntil > 0) {
@@ -1428,6 +1469,9 @@ export class ReconciliationController {
 					wasBound: true,
 				},
 			});
+			// Convergence reached: amplification detector is reset.
+			// See spec: .kiro/specs/editor-bound-localonly-amplifier-guard/requirements.md R3.8.
+			this.amplificationHistory.delete(file.path);
 			return true;
 		}
 
@@ -1469,6 +1513,45 @@ export class ReconciliationController {
 			});
 
 			if (existingText) {
+				// Localized idle guard: defer recovery if the user just typed.
+				// The localOnly branch is the typing-cadence amplifier shape:
+				// editor matches disk but CRDT trails, repeatedly, because
+				// Obsidian autosave lands keystrokes faster than the
+				// y-codemirror.next plumbing propagates them into Y.Text.
+				// Quenching that loop requires a window longer than a typical
+				// human typing burst.
+				//
+				// See spec:
+				// .kiro/specs/editor-bound-localonly-amplifier-guard/requirements.md R2.
+				const lastEditorActivityLocalOnly =
+					editorBindings?.getLastEditorActivityForPath(file.path) ?? null;
+				if (
+					lastEditorActivityLocalOnly !== null
+					&& (Date.now() - lastEditorActivityLocalOnly) < OPEN_FILE_LOCAL_ONLY_RECOVERY_IDLE_MS
+				) {
+					const idleMs = Date.now() - lastEditorActivityLocalOnly;
+					this.deps.log(
+						`syncFileFromDisk: deferring "${file.path}" ` +
+						`(editor-bound local-only, recent typing ${idleMs}ms ago)`,
+					);
+					this.deps.recordFlightPathEvent?.({
+						priority: "verbose",
+						kind: FLIGHT_KIND.recoverySkipped,
+						severity: "info",
+						scope: "file",
+						source: "reconciliationController",
+						layer: "recovery",
+						path: file.path,
+						data: {
+							reason: "recent-editor-activity-local-only",
+							idleMs,
+						},
+					});
+					// Pauses reset the amplification detector. See spec R3.8.
+					this.amplificationHistory.delete(file.path);
+					return true;
+				}
+
 				if (this.deps.shouldBlockFrontmatterIngest(
 					file.path,
 					crdtContent ?? "",
@@ -1516,6 +1599,19 @@ export class ReconciliationController {
 					...(_rsh1 ? { recoveryStateHash: _rsh1 } : {}),
 				},
 			});
+				// Monotonic-growth amplification quarantine: independent of
+				// fingerprint identity. Catches typing-cadence loops where every
+				// cycle has a different (prevLen, nextLen) but the lengths grow
+				// along the same axis. See spec:
+				// .kiro/specs/editor-bound-localonly-amplifier-guard/requirements.md R3.
+				if (this.shouldQuarantineAmplification(
+					file.path,
+					"bound-file-local-only-divergence",
+					crdtContent?.length ?? 0,
+					content.length,
+				)) {
+					return true;
+				}
 				if (this.shouldQuarantineRepeatedRecovery(
 					file.path,
 					"bound-file-local-only-divergence",
@@ -2097,6 +2193,151 @@ export class ReconciliationController {
 			},
 		});
 		this.deps.scheduleTraceStateSnapshot("recovery-quarantined");
+		return true;
+	}
+
+	/**
+	 * Monotonic-growth amplification quarantine.
+	 *
+	 * Independent of fingerprint identity. Catches loops where every cycle
+	 * has a different `(prevLen, nextLen)` fingerprint but the lengths grow
+	 * along the same axis — the typing-cadence amplifier shape captured in
+	 * the 2026-05-27 iPad trace at pathId p:476818d2ecba90d4e95e2a0c4f3ad1eb.
+	 *
+	 * Predicate: the most recent `AMPLIFICATION_QUARANTINE_THRESHOLD` history
+	 * entries (including the just-appended entry) all fall within
+	 * `AMPLIFICATION_WINDOW_MS` and exhibit non-decreasing prevLen, non-
+	 * decreasing nextLen, and strictly positive (nextLen - prevLen) deltas.
+	 *
+	 * See spec:
+	 *   .kiro/specs/editor-bound-localonly-amplifier-guard/requirements.md R3.
+	 */
+	private shouldQuarantineAmplification(
+		path: string,
+		reason: string,
+		prevLen: number,
+		nextLen: number,
+	): boolean {
+		const now = Date.now();
+		const entry: AmplificationEntry = { prevLen, nextLen, at: now };
+
+		const existing = this.amplificationHistory.get(path) ?? [];
+		existing.push(entry);
+		// Keep at most MAX_AMPLIFICATION_HISTORY_ENTRIES, evict oldest.
+		while (existing.length > MAX_AMPLIFICATION_HISTORY_ENTRIES) {
+			existing.shift();
+		}
+		this.amplificationHistory.set(path, existing);
+
+		// Cap global map size — share the same limit as recoveryFingerprints
+		// so a single tunable governs both detectors' memory footprint.
+		if (this.amplificationHistory.size > MAX_RECOVERY_FINGERPRINT_MAP_SIZE) {
+			let oldestPath: string | null = null;
+			let oldestAt = Infinity;
+			for (const [p, entries] of this.amplificationHistory) {
+				const last = entries[entries.length - 1];
+				if (last && last.at < oldestAt) {
+					oldestAt = last.at;
+					oldestPath = p;
+				}
+			}
+			if (oldestPath && oldestPath !== path) {
+				this.amplificationHistory.delete(oldestPath);
+			}
+		}
+
+		if (existing.length < AMPLIFICATION_QUARANTINE_THRESHOLD) return false;
+
+		const slice = existing.slice(-AMPLIFICATION_QUARANTINE_THRESHOLD);
+		const last = slice[slice.length - 1]!;
+		// All entries must be within the window of the most recent one.
+		const inWindow = slice.every((e) => last.at - e.at <= AMPLIFICATION_WINDOW_MS);
+		if (!inWindow) return false;
+
+		// Strictly positive delta in every entry.
+		let allPositiveDelta = true;
+		for (const e of slice) {
+			if (e.nextLen - e.prevLen <= 0) {
+				allPositiveDelta = false;
+				break;
+			}
+		}
+		if (!allPositiveDelta) return false;
+
+		// Non-decreasing prevLen and non-decreasing nextLen across the slice.
+		let monotonicPrev = true;
+		let monotonicNext = true;
+		for (let i = 1; i < slice.length; i++) {
+			if (slice[i]!.prevLen < slice[i - 1]!.prevLen) monotonicPrev = false;
+			if (slice[i]!.nextLen < slice[i - 1]!.nextLen) monotonicNext = false;
+		}
+		if (!monotonicPrev || !monotonicNext) return false;
+
+		// Distinguish growth from stationary. Stationary same-fingerprint
+		// loops are the fingerprint quarantine's job. The amplification
+		// detector requires genuine growth across the window: both prevLen
+		// and nextLen must be STRICTLY larger at the end of the slice
+		// than at the beginning.
+		const grew = slice[slice.length - 1]!.prevLen > slice[0]!.prevLen
+			&& slice[slice.length - 1]!.nextLen > slice[0]!.nextLen;
+		if (!grew) return false;
+
+		// Diagnostic: did every entry have the same delta?
+		const firstDelta = slice[0]!.nextLen - slice[0]!.prevLen;
+		const consistentDelta = slice.every((e) => (e.nextLen - e.prevLen) === firstDelta);
+
+		this.deps.trace("recovery", "recovery-amplification-quarantined", {
+			path,
+			reason,
+			entries: slice.length,
+			windowMs: AMPLIFICATION_WINDOW_MS,
+			firstPrevLen: slice[0]!.prevLen,
+			lastNextLen: last.nextLen,
+			consistentDelta,
+		});
+		this.deps.log(
+			`syncFileFromDisk: amplification-quarantined "${path}" ` +
+			`(${reason}, ${slice.length} cycles, ${slice[0]!.prevLen} -> ${last.nextLen}, ` +
+			`consistentDelta=${consistentDelta})`,
+		);
+		this.deps.recordFlightPathEvent?.({
+			priority: "critical",
+			kind: FLIGHT_KIND.recoveryAmplificationQuarantined,
+			severity: "warn",
+			scope: "file",
+			source: "reconciliationController",
+			layer: "recovery",
+			path,
+			data: {
+				reason,
+				entries: slice.length,
+				windowMs: AMPLIFICATION_WINDOW_MS,
+				firstPrevLen: slice[0]!.prevLen,
+				lastNextLen: last.nextLen,
+				consistentDelta,
+			},
+		});
+		// Also emit recovery.loop.detected so existing loop-detection consumers
+		// see this case. See spec R3.5.
+		this.deps.recordFlightPathEvent?.({
+			priority: "critical",
+			kind: FLIGHT_KIND.recoveryLoopDetected,
+			severity: "warn",
+			scope: "file",
+			source: "reconciliationController",
+			layer: "recovery",
+			path,
+			data: {
+				reason,
+				detector: "amplification",
+				entries: slice.length,
+			},
+		});
+		this.deps.scheduleTraceStateSnapshot("recovery-amplification-quarantined");
+		// Drop the path's history so subsequent recoveries are evaluated
+		// against a fresh window (the path has been quarantined; analyzer
+		// or user intervention will resolve the divergence).
+		this.amplificationHistory.delete(path);
 		return true;
 	}
 
