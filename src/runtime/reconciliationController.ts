@@ -14,7 +14,12 @@ import type { VaultSyncSettings } from "../settings";
 import type { RuntimeConfig } from "./runtimeConfig";
 import type { EditorBindingManager } from "../sync/editorBinding";
 import { FLIGHT_KIND } from "../debug/flightEvents";
-import type { FlightEventInput, FlightPathEventInput } from "../debug/flightEvents";
+import type {
+	FlightEventInput,
+	FlightPathEventInput,
+	FrontmatterIngestBlockBranch,
+	RecoverySkippedFrontmatterData,
+} from "../debug/flightEvents";
 import {
 	applyDiffToYText,
 	applyDiffToYTextWithPostcondition,
@@ -459,6 +464,42 @@ export class ReconciliationController {
 				diskPresentPaths,
 				mode,
 				this.deps.getSettings().deviceName,
+				/**
+				 * Spec: .kiro/specs/no-event-reconcile-admission/requirements.md R2.
+				 *
+				 * Architectural decision: Option (b) — opId-factory callback.
+				 * For every authoritative-lane `seed-to-crdt` decision, mint a
+				 * shared `opId` and fire `reconcile.file.decision` BEFORE the
+				 * CRDT mutation. `vaultSync.reconcileVault` then threads the
+				 * same opId into `ensureFile`, so the resulting
+				 * `crdt.file.created` envelope carries it. The post-loop
+				 * `seededToCrdt` iterator below performs only the
+				 * `settledHashes` baseline bookkeeping for these paths — the
+				 * decision emission has already happened here.
+				 */
+				(path) => {
+					const opId = `op-reconcile-seed-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+					return {
+						opId,
+						emitDecision: () => {
+							this.deps.recordFlightPathEvent?.({
+								priority: "important",
+								kind: FLIGHT_KIND.reconcileFileDecision,
+								severity: "info",
+								scope: "file",
+								source: "reconciliationController",
+								layer: "reconcile",
+								path,
+								opId,
+								data: {
+									decision: "seed-disk-to-crdt",
+									reason: "disk-file-not-in-crdt",
+									conflictRisk: "none",
+								},
+							});
+						},
+					};
+				},
 			);
 
 			let flushedCreates = 0;
@@ -559,20 +600,13 @@ export class ReconciliationController {
 					}
 				}
 				for (const path of result.seededToCrdt) {
-					this.deps.recordFlightPathEvent?.({
-						priority: "important",
-						kind: FLIGHT_KIND.reconcileFileDecision,
-						severity: "info",
-						scope: "file",
-						source: "reconciliationController",
-						layer: "reconcile",
-						path,
-						data: {
-							decision: "seed-disk-to-crdt",
-							reason: "disk-file-not-in-crdt",
-							conflictRisk: "none",
-						},
-					});
+					// Spec R2 / Option (b): the `reconcile.file.decision`
+					// emission for seeded paths is now produced by the
+					// admission-opId factory passed into `reconcileVault`
+					// above (BEFORE the `ensureFile` call) so the decision
+					// envelope shares an `opId` with the resulting
+					// `crdt.file.created`. This loop handles only the
+					// settled-baseline bookkeeping.
 					// Record settled baseline hash: disk content was the authority
 					const diskContent = diskFiles.get(path);
 					if (diskContent !== undefined) {
@@ -859,6 +893,11 @@ export class ReconciliationController {
 
 			try {
 				const content = await this.deps.app.vault.read(file);
+				// Spec: .kiro/specs/no-event-reconcile-admission/requirements.md R2.7.
+				// Mint a per-path `op-import-untracked-*` opId BEFORE the CRDT
+				// mutation so the resulting `crdt.file.created` envelope is
+				// causally linkable to this admission attempt.
+				const opId = `op-import-untracked-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 				// Untracked files exist on disk but have no CRDT entry. If the
 				// path is tombstoned, the user explicitly placed the file after
 				// deletion — that is a deliberate revive, not a stale ghost.
@@ -869,6 +908,7 @@ export class ReconciliationController {
 					{
 						reviveTombstone: true,
 						reviveReason: "import-untracked-local-file",
+						opId,
 					},
 				);
 				if (result) {
@@ -1161,13 +1201,31 @@ export class ReconciliationController {
 
 			if (existingText) {
 				const crdtContent = existingText.toJSON();
-				if (crdtContent === content) return;
+				if (crdtContent === content) {
+					// recovery.skipped: CRDT and disk already agree (unbound second-pass no-op).
+					// See spec: .kiro/specs/controller-recovery-orchestration/requirements.md R2.1
+					this.deps.recordFlightPathEvent?.({
+						priority: "verbose",
+						kind: FLIGHT_KIND.recoverySkipped,
+						severity: "info",
+						scope: "file",
+						source: "reconciliationController",
+						layer: "recovery",
+						path: file.path,
+						data: {
+							reason: "crdt-current-no-op",
+							wasBound: false,
+						},
+					});
+					return;
+				}
 				if (this.deps.shouldBlockFrontmatterIngest(
 					file.path,
 					crdtContent,
 					content,
 					"disk-to-crdt",
 				)) {
+					this.recordFrontmatterIngestBlocked(file.path, false, "disk-to-crdt-existing");
 					await this.updateDiskIndexForPath(file.path);
 					return;
 				}
@@ -1202,6 +1260,7 @@ export class ReconciliationController {
 					content,
 					"disk-to-crdt-seed",
 				)) {
+					this.recordFrontmatterIngestBlocked(file.path, false, "disk-to-crdt-seed");
 					await this.updateDiskIndexForPath(file.path);
 					return;
 				}
@@ -1299,6 +1358,21 @@ export class ReconciliationController {
 				reason: "recovery-lock-active",
 				lockRemainingMs: lockUntil - now,
 			});
+			// recovery.skipped: bound recovery lock active.
+			// See spec: .kiro/specs/controller-recovery-orchestration/requirements.md R2.2
+			this.deps.recordFlightPathEvent?.({
+				priority: "verbose",
+				kind: FLIGHT_KIND.recoverySkipped,
+				severity: "info",
+				scope: "file",
+				source: "reconciliationController",
+				layer: "recovery",
+				path: file.path,
+				data: {
+					reason: "recovery-lock-active",
+					lockRemainingMs: lockUntil - now,
+				},
+			});
 			return true;
 		}
 		if (lockUntil > 0) {
@@ -1318,6 +1392,21 @@ export class ReconciliationController {
 		if (crdtContent === content) {
 			this.boundRecoveryLocks.delete(file.path);
 			this.deps.log(`syncFileFromDisk: skipping "${file.path}" (editor-bound, crdt-current)`);
+			// recovery.skipped: CRDT and disk already agree (bound second-pass no-op).
+			// See spec: .kiro/specs/controller-recovery-orchestration/requirements.md R2.1
+			this.deps.recordFlightPathEvent?.({
+				priority: "verbose",
+				kind: FLIGHT_KIND.recoverySkipped,
+				severity: "info",
+				scope: "file",
+				source: "reconciliationController",
+				layer: "recovery",
+				path: file.path,
+				data: {
+					reason: "crdt-current-no-op",
+					wasBound: true,
+				},
+			});
 			return true;
 		}
 
@@ -1365,6 +1454,7 @@ export class ReconciliationController {
 					content,
 					"bound-file-local-only-divergence",
 				)) {
+					this.recordFrontmatterIngestBlocked(file.path, true, "bound-file-local-only-divergence");
 					this.deps.scheduleTraceStateSnapshot("frontmatter-ingest-blocked");
 					return true;
 				}
@@ -1468,6 +1558,7 @@ export class ReconciliationController {
 					content,
 					"bound-file-local-only-seed",
 				)) {
+					this.recordFrontmatterIngestBlocked(file.path, true, "bound-file-local-only-seed");
 					this.deps.scheduleTraceStateSnapshot("frontmatter-ingest-blocked");
 					return true;
 				}
@@ -1562,6 +1653,21 @@ export class ReconciliationController {
 				&& (Date.now() - lastEditorActivity) < OPEN_FILE_EXTERNAL_EDIT_IDLE_GRACE_MS;
 			if (hasRecentEditorActivity) {
 				this.deps.log(`syncFileFromDisk: skipping "${file.path}" (editor-bound, disk lag)`);
+				// recovery.skipped: crdtOnly branch idle-grace bail.
+				// See spec: .kiro/specs/controller-recovery-orchestration/requirements.md R2.3
+				this.deps.recordFlightPathEvent?.({
+					priority: "verbose",
+					kind: FLIGHT_KIND.recoverySkipped,
+					severity: "info",
+					scope: "file",
+					source: "reconciliationController",
+					layer: "recovery",
+					path: file.path,
+					data: {
+						reason: "recent-editor-activity",
+						idleMs: Date.now() - lastEditorActivity!,
+					},
+				});
 				return true;
 			}
 
@@ -1572,6 +1678,7 @@ export class ReconciliationController {
 					content,
 					"bound-file-open-idle-disk-recovery",
 				)) {
+					this.recordFrontmatterIngestBlocked(file.path, true, "bound-file-open-idle-disk-recovery");
 					this.deps.scheduleTraceStateSnapshot("frontmatter-ingest-blocked");
 					return true;
 				}
@@ -1664,6 +1771,7 @@ export class ReconciliationController {
 					content,
 					"bound-file-open-idle-seed",
 				)) {
+					this.recordFrontmatterIngestBlocked(file.path, true, "bound-file-open-idle-seed");
 					this.deps.scheduleTraceStateSnapshot("frontmatter-ingest-blocked");
 					return true;
 				}
@@ -1850,6 +1958,45 @@ export class ReconciliationController {
 		this.deps.log(`syncFileFromDisk: skipping "${file.path}" (editor-bound, ambiguous divergence)`);
 		this.deps.scheduleTraceStateSnapshot("bound-file-ambiguous");
 		return true;
+	}
+
+	/**
+	 * Single private helper that owns every `recovery.skipped` emission
+	 * with `data.reason === "frontmatter-ingest-blocked"`.
+	 *
+	 * Invoked from each of the six `shouldBlockFrontmatterIngest` block
+	 * branches (two in `syncFileFromDisk` for the unbound disk→CRDT
+	 * branches, four in `handleBoundFileSyncGap` for the bound recovery
+	 * branches). The `branch` parameter is a closed-enum literal covering
+	 * the six call sites; new emission sites are not permitted without
+	 * extending the `FrontmatterIngestBlockBranch` union.
+	 *
+	 * The pre-existing `scheduleTraceStateSnapshot("frontmatter-ingest-blocked")`
+	 * calls in the four bound branches are intentionally retained as a
+	 * legacy diagnostic channel; this helper is additive.
+	 *
+	 * See spec: .kiro/specs/frontmatter-guard-orchestration/requirements.md R2.
+	 */
+	private recordFrontmatterIngestBlocked(
+		path: string,
+		wasBound: boolean,
+		branch: FrontmatterIngestBlockBranch,
+	): void {
+		const data: RecoverySkippedFrontmatterData = {
+			reason: "frontmatter-ingest-blocked",
+			wasBound,
+			branch,
+		};
+		this.deps.recordFlightPathEvent?.({
+			priority: "important",
+			kind: FLIGHT_KIND.recoverySkipped,
+			severity: "info",
+			scope: "file",
+			source: "reconciliationController",
+			layer: "recovery",
+			path,
+			data,
+		});
 	}
 
 	private shouldQuarantineRepeatedRecovery(
