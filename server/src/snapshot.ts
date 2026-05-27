@@ -172,21 +172,80 @@ export async function listSnapshots(
 		.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 }
 
+/**
+ * Derive the UTC calendar day (`YYYY-MM-DD`) encoded in a snapshot ID.
+ *
+ * Snapshot IDs are generated as `${Date.now().toString(36)}-${8hexRandom}`.
+ * `Number.prototype.toString(36)` produces only lowercase `0-9` and `a-z`,
+ * and the random suffix is always 4 bytes rendered as 8 lowercase hex chars.
+ *
+ * Strict validation rules (all must pass, no bucket I/O is ever attempted
+ * for invalid input):
+ *   - Shape: `^([0-9a-z]+)-([0-9a-f]{8,})$`
+ *   - Timestamp segment parses to a safe positive integer
+ *   - Resulting `Date` has a finite time value (guards against overflow edge
+ *     cases beyond Number.MAX_SAFE_INTEGER where `new Date()` would be Invalid)
+ *
+ * Returns `null` for any input that fails these rules.
+ */
+export function dayFromSnapshotId(snapshotId: string): string | null {
+	// Validate the full shape before any numeric parsing.  This rejects
+	// uppercase prefixes, symbol characters, empty segments, and short or
+	// missing random suffixes in a single step.
+	const match = /^([0-9a-z]+)-([0-9a-f]{8,})$/.exec(snapshotId);
+	if (!match) return null;
+
+	const tsMs = Number.parseInt(match[1], 36);
+	// Number.isSafeInteger guards against overflow values that parseInt
+	// would accept but that lose precision as IEEE-754 doubles.
+	if (!Number.isSafeInteger(tsMs) || tsMs <= 0) return null;
+
+	const d = new Date(tsMs);
+	// Extra guard: new Date() returns "Invalid Date" for values outside the
+	// ECMAScript time range (±8.64e15 ms).  isSafeInteger already covers
+	// most such cases, but this defends against future edge cases.
+	if (!Number.isFinite(d.getTime())) return null;
+
+	return d.toISOString().slice(0, 10);
+}
+
+/**
+ * Fetch a single snapshot by ID using O(1) R2 operations.
+ *
+ * The snapshot day is derived directly from the timestamp embedded in the
+ * snapshot ID, so no bucket listing is required.  Both the index and the
+ * CRDT payload are fetched in parallel with two `bucket.get()` calls.
+ *
+ * Schema contract (locked):
+ *   `createSnapshot` always writes exactly two objects per snapshot:
+ *     `v1/{vaultId}/snapshots/{day}/{snapshotId}/index.json`  — SnapshotIndex
+ *     `v1/{vaultId}/snapshots/{day}/{snapshotId}/crdt.bin.gz` — gzip CRDT update
+ *   The payload key `crdt.bin.gz` is unconditional; it is not stored in the
+ *   index and is not configurable.  Any change to the payload key format
+ *   must be accompanied by a migration and a bumped schema version.
+ *
+ * Returns `null` when the snapshot ID is malformed, or when either the
+ * `index.json` or `crdt.bin.gz` object is absent from the bucket.
+ */
 export async function getSnapshotPayload(
 	vaultId: string,
 	snapshotId: string,
 	bucket: R2Bucket,
 ): Promise<{ index: SnapshotIndex; payload: Uint8Array } | null> {
-	const snapshots = await listSnapshots(vaultId, bucket);
-	const index = snapshots.find((entry) => entry.snapshotId === snapshotId);
-	if (!index) return null;
+	const day = dayFromSnapshotId(snapshotId);
+	if (!day) return null;
 
-	const object = await bucket.get(
-		`${snapshotPrefix(vaultId, index.day, snapshotId)}/crdt.bin.gz`,
-	);
-	if (!object) return null;
+	const prefix = snapshotPrefix(vaultId, day, snapshotId);
 
-	const body = await object.arrayBuffer();
+	const [indexObject, payloadObject] = await Promise.all([
+		bucket.get(`${prefix}/index.json`),
+		bucket.get(`${prefix}/crdt.bin.gz`),
+	]);
+
+	if (!indexObject || !payloadObject) return null;
+
+	const index = JSON.parse(await indexObject.text()) as SnapshotIndex;
+	const body = await payloadObject.arrayBuffer();
 	return {
 		index,
 		payload: normalizeBytes(body),

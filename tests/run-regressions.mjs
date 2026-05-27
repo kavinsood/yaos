@@ -79,6 +79,7 @@ const suites = [
 	[JITI, "tests/trace-store.ts"],
 	[JITI, "tests/server-hardening.ts"],
 	[JITI, "tests/settings-hardening.ts"],
+	[JITI, "tests/snapshot-lookup.ts"],
 	[JITI, "tests/v2-offline-rename-regressions.mjs"],
 	[JITI, "tests/sync-facts.ts"],
 	[JITI, "tests/offline-handoff.ts"],
