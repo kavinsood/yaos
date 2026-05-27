@@ -583,6 +583,8 @@ console.log("\n--- Test 15: destroy during in-flight does not resurrect ---");
 {
 	const { manager, files, put, traces } = makeHarness();
 	put("inflight.png", bytes("data"));
+	const remoteData = bytes("remote");
+	const remoteHash = await sha256Hex(remoteData);
 
 	let resolveDownload: (() => void) | null = null;
 	const downloadPromise = new Promise<void>((resolve) => {
@@ -592,15 +594,15 @@ console.log("\n--- Test 15: destroy during in-flight does not resurrect ---");
 	(manager as any).blobClient = {
 		download: async () => {
 			// download started — destroy while in flight
-			(manager as any).destroy();
+			manager.destroy();
 			await downloadPromise; // wait until test signals
-			return bytes("remote");
+			return remoteData;
 		},
 	};
 
 	const item = {
 		path: "inflight.png",
-		hash: "abc123",
+		hash: remoteHash,
 		sizeBytes: 6,
 		status: "processing" as const,
 		retries: 0,
@@ -630,6 +632,10 @@ console.log("\n--- Test 15: destroy during in-flight does not resurrect ---");
 		(manager as any).inflightDownloads.size === 0,
 		"inflight tracking cleared by destroy",
 	);
+
+	// Clear any deferred queue work that may have been scheduled after the
+	// in-flight operation resolved.
+	manager.destroy();
 }
 
 // ── Test 16: kickUploadDrain does not start duplicate drain loops ────────────
@@ -713,14 +719,17 @@ console.log("\n--- Test 18: conflict artifact does not pollute target hash cache
 
 	// Simulate download that creates a conflict artifact
 	const remoteData = bytes("remote version");
+	const remoteHash = await sha256Hex(remoteData);
 	(manager as any).blobClient = {
-		download: async () => remoteData,
+		download: async () => {
+			put("target.png", bytes("local changed during download"));
+			return remoteData;
+		},
 	};
 
-	// Modify the file mid-download to trigger conflict path
 	const item = {
 		path: "target.png",
-		hash: "remote-hash-abc",
+		hash: remoteHash,
 		sizeBytes: remoteData.byteLength,
 		status: "processing" as const,
 		retries: 0,
@@ -743,13 +752,15 @@ console.log("\n--- Test 18: conflict artifact does not pollute target hash cache
 	// Verify target hash cache was NOT updated to remote hash
 	const targetEntry = (manager as any).hashCache["target.png"];
 	assert(
-		targetEntry?.hash !== "remote-hash-abc",
+		targetEntry?.hash !== remoteHash,
 		"target hash cache NOT updated to remote hash after conflict",
 	);
 	assert(
-		targetEntry?.hash === "different-from-remote",
-		"target hash cache retains its original value",
+		typeof targetEntry?.hash === "string" && targetEntry.hash.length > 0,
+		"target hash cache keeps a local-file hash after conflict",
 	);
+
+	manager.destroy();
 }
 
 console.log("\n--- Test 19: Multi-pass: unknown-baseline preserved blob is NOT re-uploaded by reconcile scan ---");
@@ -847,6 +858,8 @@ console.log("\n--- Test 19: Multi-pass: unknown-baseline preserved blob is NOT r
 		!(manager as any).preservedUnresolvedPaths.has("attachments/preserved.png"),
 		"preserved-unresolved cleared after user modify event (handleFileChange)",
 	);
+
+	manager.destroy();
 }
 
 console.log("\n--- Test 20: Multi-pass: stat-failure during blob remote-delete becomes preserve-unresolved ---");
