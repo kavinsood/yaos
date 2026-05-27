@@ -1734,6 +1734,22 @@ export class VaultSync {
 		if (this._renameTimer) clearTimeout(this._renameTimer);
 		this.clearPendingRenames();
 		await this.flushReceiptPersistence();
+
+		const provider = this.provider as any;
+		const ws = provider.ws;
+
+		// Force terminate the WebSocket to skip the 30s close handshake timeout in "ws" library (Node/Electron).
+		// Safe because it's a targeted call on our own instance.
+		if (ws && typeof ws.terminate === "function") {
+			ws.terminate();
+		}
+
+		// Ensure Awareness interval is cleared (using public API).
+		// This is defensive; awareness-protocol already binds to doc destroy.
+		if (this.provider.awareness) {
+			this.provider.awareness.destroy();
+		}
+
 		this.provider.destroy();
 		await this.persistence.destroy();
 		this.ydoc.destroy();
