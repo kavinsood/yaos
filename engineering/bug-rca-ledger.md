@@ -126,8 +126,9 @@ Repo-validated bug / incident ledger as of 2026-05-27.
 - Real-device evidence:
   - `~/temenos/.obsidian/plugins/yaos/flight-logs/2026-05-27/boot-wL7i012vR4mGXA-1.ndjson`
   - pathId `p:476818d2ecba90d4e95e2a0c4f3ad1eb`
-  - timeline reproducible via `qa/scripts/issue22b-loop-summary.mjs`
-  - full RCA at `engineering/issue-25-localonly-amplifier-timeline.md`
+  - timeline reproducible locally via `qa/scripts/issue22b-loop-summary.mjs`
+    (script lives outside the repo because `qa/` is gitignored; rebuild
+    from the trace if needed)
 - Fix:
   - `OPEN_FILE_LOCAL_ONLY_RECOVERY_IDLE_MS = 3000ms`. New idle guard added to
     the localOnly branch, symmetric to the crdtOnly branch's existing 1200ms

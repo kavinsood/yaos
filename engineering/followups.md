@@ -148,3 +148,57 @@ If `y-partyserver` or `y-indexeddb` are upgraded, re-check the origin contract.
 
 Older phase-specific followup ledgers also contained many addressed items. Those were
 not copied here verbatim; this file is intentionally for live followups.
+
+### Bound-path conflict-artifact gap on re-enable while file is open
+
+`handleBoundFileSyncGap` does not have a `both-changed` analog. When YAOS is
+disabled cleanly, the user types into the open file (Obsidian autosave lands
+the change on disk while YAOS is off), and YAOS is re-enabled, the file
+re-binds and the bound path runs — not the closed-file path. So
+`decideClosedFileConflict` is never consulted.
+
+The bound branches today:
+
+- `crdtContent === content` → no-op
+- `localOnly` (editor matches disk, editor != crdt) → recover disk into CRDT
+- `crdtOnly` (editor matches crdt, editor != disk) and idle ≥ 1.2s → recover
+  disk into CRDT
+- ambiguous (multiple editor authorities or all three disagree) → conflict
+  artifact
+
+None of these create a conflict artifact when editor matches one side and
+the OTHER side carries a real divergent change. The bound path silently picks
+a winner. For one common ordering on iPad re-enable, that winner is the
+remote CRDT and the user's local edit disappears without an artifact.
+
+Concrete iPad case from the 2026-05-27 trace: user types `LOCAL_ON_IPAD`
+while YAOS is disabled; provider streams `REMOTE_FROM_DESKTOP` into CRDT
+on re-enable; the file is open so the bound path runs; the user-visible
+end state is `BASELINE_PROOF\n\nREMOTE_FROM_DESKTOP\n` with no conflict
+artifact preserving `LOCAL_ON_IPAD`. The Issue #22-B ledger entry in
+`engineering/bug-rca-ledger.md` carries the durable record.
+
+The closed-file `_lastDiskIndexPersistedAt` mtime tie-break (commits 7cb4cc2
++ 17864ce) does NOT cover this case, because `baselineHash` is non-null on
+the clean-disable path — the disable flow runs `teardownSync →
+flushAllPendingWrites → saveDiskIndex` before the user types.
+
+Proposed fix shape:
+- The bound path computes `baselineHash`, `diskHash`, `crdtHash` (same
+  inputs as `decideClosedFileConflict`) and runs the same classifier.
+- When the classifier returns `preserve-conflict`, the bound path
+  preserves the loser as an artifact and applies the winner. This must
+  override the existing `localOnly` / `crdtOnly` heuristics; do not let
+  the editor-equals-disk shortcut silently demote the other side.
+- Bound `crdt-current-no-op` and `recovery-lock-active` skips remain
+  unchanged. The classifier replaces only the localOnly / crdtOnly arms
+  for the case where `baselineHash` is present and both diskHash and
+  crdtHash differ from it.
+
+Real-device validation (iPad re-enable while file is open) is required
+before the fix can be claimed closed. Desktop CDP is not sufficient on
+its own because the timing race depends on provider-sync-vs-reconcile
+ordering, which is platform-specific.
+
+This is its own spec; it is not Issue #25 and is not the
+`_lastDiskIndexPersistedAt` cold-kill fix.
