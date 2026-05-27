@@ -109,6 +109,7 @@ interface Fixture {
 	setDiskContent(content: string): void;
 	setEditorContent(content: string): void;
 	setLastEditorActivity(value: number | null): void;
+	setBindingHealthy(healthy: boolean): void;
 	clearBoundRecoveryLocks(): void;
 }
 
@@ -118,11 +119,13 @@ function buildFixture(initial: {
 	editor: string;
 	crdt: string;
 	lastEditorActivity?: number | null;
+	bindingHealthy?: boolean;
 }): Fixture {
 	const path = initial.path;
 	let diskContent = initial.disk;
 	let editorContent = initial.editor;
 	let lastEditorActivity: number | null = initial.lastEditorActivity ?? null;
+	let bindingHealthy = initial.bindingHealthy ?? true;
 
 	const doc = new Y.Doc();
 	const ytext = doc.getText("content");
@@ -157,13 +160,13 @@ function buildFixture(initial: {
 			leafId: "stub-leaf-1",
 			storedCmId: "stub-cm-1",
 			liveCmId: "stub-cm-1",
-			cmMatches: true,
+			cmMatches: bindingHealthy,
 		}),
 		getCollabDebugInfoForView: () => ({
-			hasSyncFacet: true,
-			awarenessMatchesProvider: true,
-			yTextMatchesExpected: true,
-			undoManagerMatchesFacet: true,
+			hasSyncFacet: bindingHealthy,
+			awarenessMatchesProvider: bindingHealthy,
+			yTextMatchesExpected: bindingHealthy,
+			undoManagerMatchesFacet: bindingHealthy,
 			facetFileId: null,
 			expectedFileId: null,
 		}),
@@ -266,6 +269,7 @@ function buildFixture(initial: {
 		setDiskContent: (c) => { diskContent = c; },
 		setEditorContent: (c) => { editorContent = c; },
 		setLastEditorActivity: (v) => { lastEditorActivity = v; },
+		setBindingHealthy: (h) => { bindingHealthy = h; },
 		clearBoundRecoveryLocks: () => {
 			(controller as unknown as { boundRecoveryLocks: Map<string, number> })
 				.boundRecoveryLocks.clear();
@@ -341,7 +345,11 @@ console.log("\n--- Scenario 1: localOnly idle guard defers when editor typed rec
 	assert(decision !== undefined, "second pass: recovery.decision emitted");
 	assert(applyStart !== undefined, "second pass: recovery.apply.start emitted");
 	assert(applyDone !== undefined, "second pass: recovery.apply.done emitted");
-	assert(repair !== undefined, "second pass: editor.repair.applied emitted");
+	// Healthy binding: repair must NOT be called. Reviewer item:
+	// "Stop unconditional editor repair unless binding health is bad."
+	assert(repair === undefined, "second pass: NO editor.repair.applied (binding healthy)");
+	// recovery.decision now carries a binding-health snapshot for RCA.
+	assertEq(decision?.data.anyBindingUnhealthy, false, "second pass: anyBindingUnhealthy === false");
 
 	assertEq(fix.ytext.toString(), "DDDDD", "Y.Text equals disk after second pass");
 }
@@ -394,7 +402,10 @@ console.log("\n--- Scenario 2: monotonic-growth quarantine fires on cycle 3 ---"
 	assertEq(decisions.length, 3, "three recovery.decision events (one per cycle)");
 	assertEq(applyStarts.length, 2, "only the first two cycles entered apply.start");
 	assertEq(applyDones.length, 2, "only the first two cycles emitted apply.done");
-	assertEq(repairs.length, 2, "only the first two cycles emitted editor.repair.applied");
+	// Healthy binding throughout, so repair is never called even though
+	// recovery applied the diff. This is the conditional-repair rule:
+	// content recovery and binding repair are independent operations.
+	assertEq(repairs.length, 0, "binding healthy throughout: no editor.repair.applied");
 	assertEq(ampQuarantined.length, 1, "exactly one recovery.amplification.quarantined event");
 	assertEq(loopDetected.length, 1, "exactly one recovery.loop.detected event");
 	assertEq(fingerprintQuarantined.length, 0, "fingerprint quarantine did NOT fire (different fingerprints)");
@@ -508,10 +519,59 @@ console.log("\n--- Scenario 4: pause from idle guard resets the amplification de
 	assert(finalDecision !== undefined, "final cycle: recovery.decision emitted");
 	assert(finalApplyStart !== undefined, "final cycle: recovery.apply.start emitted");
 	assert(finalApplyDone !== undefined, "final cycle: recovery.apply.done emitted");
-	assert(finalRepair !== undefined, "final cycle: editor.repair.applied emitted");
+	// Binding healthy → no repair (conditional-repair rule).
+	assert(finalRepair === undefined, "final cycle: NO editor.repair.applied (binding healthy)");
 	assert(finalAmpQuarantined === undefined, "final cycle: NO recovery.amplification.quarantined (history cleared)");
 
 	assertEq(fix.ytext.toString(), "z".repeat(60), "Y.Text equals final disk after recovery");
+}
+
+// -------------------------------------------------------------------
+// Scenario 5 — unhealthy binding gets repaired
+// -------------------------------------------------------------------
+
+console.log("\n--- Scenario 5: unhealthy binding triggers editor.repair.applied ---");
+{
+	const fix = buildFixture({
+		path: "Notes/scenario-5.md",
+		disk: "DDDDD",
+		editor: "DDDDD",
+		crdt: "CCC",
+		lastEditorActivity: null, // disable idle guard
+		bindingHealthy: false,    // force unhealthy from start
+	});
+
+	await fix.controller.__qaOnlyForceSyncFileFromDiskUnsafe(fix.path, "modify");
+
+	const decision = fix.captured.find((e) => e.kind === FLIGHT_KIND.recoveryDecision);
+	const applyDone = fix.captured.find((e) => e.kind === FLIGHT_KIND.recoveryApplyDone);
+	const repair = fix.captured.find((e) => e.kind === FLIGHT_KIND.editorRepairApplied);
+
+	assert(decision !== undefined, "unhealthy: recovery.decision emitted");
+	assert(applyDone !== undefined, "unhealthy: recovery.apply.done emitted");
+	// Unhealthy binding → repair IS called.
+	assert(repair !== undefined, "unhealthy binding: editor.repair.applied emitted");
+	assertEq(decision?.data.anyBindingUnhealthy, true, "anyBindingUnhealthy === true");
+	const health = decision?.data.bindingHealth as Array<{ healthy: boolean; reasons: string[] }>;
+	assert(Array.isArray(health) && health.length === 1, "bindingHealth array has one entry");
+	assert(health[0]?.healthy === false, "bindingHealth[0].healthy === false");
+	assert(health[0]?.reasons.length > 0, "bindingHealth[0].reasons populated");
+
+	// Now flip to healthy and force another recovery — repair must NOT
+	// be called this time even though content recovery applies.
+	fix.setBindingHealthy(true);
+	fix.clearBoundRecoveryLocks();
+	fix.ytext.delete(0, fix.ytext.length);
+	fix.ytext.insert(0, "EEE"); // re-establish localOnly divergence
+	const beforeCount = fix.captured.length;
+	await fix.controller.__qaOnlyForceSyncFileFromDiskUnsafe(fix.path, "modify");
+	const newEvents = fix.captured.slice(beforeCount);
+	const newDecision = newEvents.find((e) => e.kind === FLIGHT_KIND.recoveryDecision);
+	const newApplyDone = newEvents.find((e) => e.kind === FLIGHT_KIND.recoveryApplyDone);
+	const newRepair = newEvents.find((e) => e.kind === FLIGHT_KIND.editorRepairApplied);
+	assert(newDecision !== undefined, "healthy pass: recovery.decision emitted");
+	assert(newApplyDone !== undefined, "healthy pass: recovery.apply.done emitted");
+	assert(newRepair === undefined, "healthy pass: NO editor.repair.applied");
 }
 
 // -------------------------------------------------------------------

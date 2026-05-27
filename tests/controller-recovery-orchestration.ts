@@ -167,16 +167,22 @@ function buildFixture(initial: {
 	// editorBindings stub. Mimics the real EditorBindingManager wiring:
 	// repair() succeeds and emits an editor.repair.applied flight event
 	// through the same callback the real manager uses (see src/main.ts).
+	//
+	// NOTE: this fixture intentionally reports an UNHEALTHY binding so the
+	// localOnly recovery branch's binding-health-conditional repair fires.
+	// Healthy-binding behavior (no repair on every recovery) is exercised
+	// by tests/controller-recovery-orchestration-amplifier.ts. See spec:
+	// .kiro/specs/editor-bound-localonly-amplifier-guard/requirements.md R7.
 	const editorBindings = {
 		isBound: () => true,
 		getBindingDebugInfoForView: () => ({
 			leafId: "stub-leaf-1",
 			storedCmId: "stub-cm-1",
 			liveCmId: "stub-cm-1",
-			cmMatches: true,
+			cmMatches: false, // force unhealthy → repair is called
 		}),
 		getCollabDebugInfoForView: () => ({
-			hasSyncFacet: true,
+			hasSyncFacet: false, // force unhealthy
 			awarenessMatchesProvider: true,
 			yTextMatchesExpected: true,
 			undoManagerMatchesFacet: true,

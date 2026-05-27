@@ -223,10 +223,14 @@ function buildFrontmatterFixture(options: FixtureOptions): FrontmatterFixture {
 			leafId: "stub-leaf-1",
 			storedCmId: "stub-cm-1",
 			liveCmId: "stub-cm-1",
-			cmMatches: true,
+			// Force unhealthy so the localOnly branch's binding-health-
+			// conditional repair fires. Healthy-binding skip is exercised
+			// by tests/controller-recovery-orchestration-amplifier.ts. See:
+			// .kiro/specs/editor-bound-localonly-amplifier-guard/requirements.md R7.
+			cmMatches: false,
 		}),
 		getCollabDebugInfoForView: () => ({
-			hasSyncFacet: true,
+			hasSyncFacet: false,
 			awarenessMatchesProvider: true,
 			yTextMatchesExpected: true,
 			undoManagerMatchesFacet: true,
