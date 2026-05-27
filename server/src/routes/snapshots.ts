@@ -85,14 +85,24 @@ export async function handleSnapshotRoute(
 		const url = new URL(req.url);
 		const limitParam = url.searchParams.get("limit");
 		const limit = limitParam ? Math.min(Math.max(1, parseInt(limitParam, 10) || 50), 200) : 50;
+		const format = url.searchParams.get("format");
 
 		const { snapshots, totalIndexKeys, limited } = await listSnapshots(vaultId, env.YAOS_BUCKET, limit);
-		return json({
-			snapshots,
-			totalIndexKeys,
-			fetchedCount: snapshots.length,
-			limited,
-		});
+
+		// Legacy compatibility: default response is { snapshots: [...] }
+		// which old clients destructure as `result.snapshots`.
+		// New clients can request ?format=v2 for richer metadata.
+		if (format === "v2") {
+			return json({
+				snapshots,
+				totalIndexKeys,
+				fetchedCount: snapshots.length,
+				limited,
+			});
+		}
+
+		// Default: legacy-compatible shape (old clients expect { snapshots })
+		return json({ snapshots });
 	}
 
 	if (req.method === "GET" && rest.length === 1 && rest[0] === "status") {
@@ -105,14 +115,22 @@ export async function handleSnapshotRoute(
 		const { snapshots: all, totalIndexKeys, limited } = await listSnapshots(vaultId, env.YAOS_BUCKET, 200);
 		const fetchedBytes = all.reduce((sum, s) => sum + s.crdtSizeBytes, 0);
 
+		const pinnedCount = all.filter((s) => s.pinned).length;
+
 		return json({
+			// New honest fields (prefer these in new clients)
 			snapshotCountLowerBound: totalIndexKeys,
 			listedSnapshotCount: all.length,
 			listingLimited: limited,
 			estimatedStorageBytesLowerBound: fetchedBytes,
+			pinnedCountLowerBound: pinnedCount,
+			// Legacy aliases (kept for old clients — same values, less honest names)
+			snapshotCount: totalIndexKeys,
+			estimatedStorageBytes: fetchedBytes,
+			pinnedCount,
+			// Common fields
 			latestSnapshotId: latest?.snapshotId ?? null,
 			latestCreatedAt: latest?.createdAt ?? null,
-			pinnedCountLowerBound: all.filter((s) => s.pinned).length,
 		});
 	}
 
@@ -225,5 +243,7 @@ async function createSnapshotFromLiveDoc(
 		snapshotId: index.snapshotId,
 		index,
 		snapshotIdenticalToLatest,
+		// Legacy alias for old clients that check this field
+		semanticUnchanged: snapshotIdenticalToLatest,
 	};
 }

@@ -85,7 +85,9 @@ export class SnapshotService {
 				this.deps.getTraceHttpContext(),
 			);
 			if (result.status === "created" && result.index) {
-				const unchangedNote = result.snapshotIdenticalToLatest
+				// Handle both new and old server response field names
+				const identical = result.snapshotIdenticalToLatest ?? result.semanticUnchanged;
+				const unchangedNote = identical
 					? " (note: identical to latest snapshot)"
 					: "";
 				new Notice(

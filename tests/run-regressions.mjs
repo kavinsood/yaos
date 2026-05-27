@@ -120,6 +120,7 @@ const suites = [
 	// Snapshot safety tests (Phase 0 tourniquet)
 	[JITI, "tests/snapshot-retention.ts"],
 	[JITI, "tests/snapshots.ts"],
+	[JITI, "tests/snapshot-compat.ts"],
 	[NODE, "tests/snapshot-r2-runner.mjs"],
 ];
 

@@ -251,13 +251,20 @@ export async function requestSnapshotNow(
 
 /**
  * List all available snapshots, newest first (bounded by server limit).
+ * Handles both old server (returns { snapshots: [...] }) and new server
+ * (returns { snapshots, totalIndexKeys, fetchedCount, limited } with ?format=v2).
  */
 export async function listSnapshots(
 	settings: VaultSyncSettings,
 	trace?: TraceHttpContext,
 ): Promise<SnapshotIndex[]> {
-	const result = await serverGet(settings, "snapshots?limit=50", trace) as { snapshots: SnapshotIndex[] };
-	return result.snapshots ?? [];
+	const result = await serverGet(settings, "snapshots?limit=50", trace);
+	// Handle both shapes: old servers return { snapshots }, new servers
+	// also return { snapshots } by default. Array response is not expected
+	// but handle it defensively for any edge case.
+	if (Array.isArray(result)) return result as SnapshotIndex[];
+	const obj = result as { snapshots?: SnapshotIndex[] };
+	return obj.snapshots ?? [];
 }
 
 /**
@@ -272,7 +279,8 @@ export async function requestPrune(
 
 /**
  * Get snapshot storage status summary.
- * Fields are honest lower bounds when the listing was capped.
+ * Handles both old servers (snapshotCount, estimatedStorageBytes, pinnedCount)
+ * and new servers (LowerBound suffixed fields). Prefers new fields when available.
  */
 export interface SnapshotStatus {
 	snapshotCountLowerBound: number;
@@ -288,7 +296,25 @@ export async function getSnapshotStatus(
 	settings: VaultSyncSettings,
 	trace?: TraceHttpContext,
 ): Promise<SnapshotStatus> {
-	return await serverGet(settings, "snapshots/status", trace) as SnapshotStatus;
+	const raw = await serverGet(settings, "snapshots/status", trace) as Record<string, unknown>;
+
+	// Parse with fallbacks for old server field names
+	return {
+		snapshotCountLowerBound:
+			(raw.snapshotCountLowerBound as number) ?? (raw.snapshotCount as number) ?? 0,
+		listedSnapshotCount:
+			(raw.listedSnapshotCount as number) ?? (raw.snapshotCount as number) ?? 0,
+		listingLimited:
+			(raw.listingLimited as boolean) ?? false,
+		estimatedStorageBytesLowerBound:
+			(raw.estimatedStorageBytesLowerBound as number) ?? (raw.estimatedStorageBytes as number) ?? 0,
+		latestSnapshotId:
+			(raw.latestSnapshotId as string | null) ?? null,
+		latestCreatedAt:
+			(raw.latestCreatedAt as string | null) ?? null,
+		pinnedCountLowerBound:
+			(raw.pinnedCountLowerBound as number) ?? (raw.pinnedCount as number) ?? 0,
+	};
 }
 
 // -------------------------------------------------------------------

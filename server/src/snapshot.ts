@@ -53,6 +53,8 @@ export interface SnapshotResult {
 	index?: SnapshotIndex;
 	/** True if manual snapshot is byte-for-byte identical to latest. */
 	snapshotIdenticalToLatest?: boolean;
+	/** @deprecated Legacy alias for snapshotIdenticalToLatest. Kept for old clients. */
+	semanticUnchanged?: boolean;
 }
 
 export interface CreateSnapshotOptions {
