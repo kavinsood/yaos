@@ -889,6 +889,65 @@ export class VaultSync {
 		diskPresentPaths: Set<string>,
 		mode: ReconcileMode,
 		device?: string,
+		/**
+		 * Optional admission-opId factory invoked at each authoritative-lane
+		 * `seed-to-crdt` decision point BEFORE the CRDT mutation runs.
+		 *
+		 * Spec: .kiro/specs/no-event-reconcile-admission/requirements.md R2 (Option b).
+		 *
+		 * ## Contract
+		 *
+		 * 1. **Optionality.** When the parameter is omitted, `reconcileVault`
+		 *    behaves EXACTLY as it did before this hook existed: no opId,
+		 *    no decision emission from inside the seed loop, and the seed
+		 *    mutation runs unchanged. Callers that do not care about
+		 *    decision-before-mutation ordering MUST NOT pass it.
+		 *
+		 * 2. **Frequency.** When supplied, the callback is invoked EXACTLY
+		 *    ONCE per `seed-to-crdt` admission decision per call to
+		 *    `reconcileVault`. It is NOT invoked for `skip-in-crdt`,
+		 *    `tombstone-conflict`, or `untracked` classifications. It is
+		 *    NOT invoked for `createdOnDisk` or `updatedOnDisk` paths
+		 *    (those are post-result loops in the controller).
+		 *
+		 * 3. **Ordering.** Within a single seed-to-crdt branch, the seed
+		 *    loop calls `mintAdmissionOpId(path)` first, then invokes the
+		 *    returned `emitDecision()` thunk, then calls `ensureFile`
+		 *    with `{ opId }`. The decision emission therefore precedes the
+		 *    `crdt.file.created` envelope, and both events carry the same
+		 *    `opId` value — the load-bearing causality property the spec
+		 *    asserts in Scenario A.
+		 *
+		 * 4. **Side-effect surface.** The factory and `emitDecision()` are
+		 *    free to read state and emit flight events. They MUST NOT
+		 *    mutate any field on this `VaultSync` instance, MUST NOT call
+		 *    back into `ensureFile`, and MUST NOT call back into
+		 *    `reconcileVault` (recursion is undefined).
+		 *
+		 * 5. **Failure semantics.** If `mintAdmissionOpId(path)` throws OR
+		 *    if `emitDecision()` throws, the exception propagates UP out
+		 *    of `reconcileVault` synchronously. The current path's
+		 *    `ensureFile` SHALL NOT run, the path SHALL NOT be appended
+		 *    to `seededToCrdt`, AND any subsequent paths in `diskPresentPaths`
+		 *    are NOT classified or seeded. Recovery is the caller's
+		 *    responsibility — `runReconciliation` runs inside a single
+		 *    `try { ... } finally { reconcileInFlight = false; ... }`
+		 *    block, so a throw here will mark the reconcile as failed
+		 *    rather than half-applied.
+		 *
+		 *    Rationale: the seed mutation and the decision emission are
+		 *    paired. If the controller cannot record the decision, we
+		 *    refuse to perform the mutation. Letting the mutation through
+		 *    would create a `crdt.file.created` event with no preceding
+		 *    `reconcile.file.decision` — exactly the silent admission the
+		 *    spec was written to prevent.
+		 *
+		 * 6. **No new origins / suppression / UI.** The callback is a
+		 *    causality-tracking hook only. It MUST NOT introduce a new
+		 *    Yjs transaction origin, a new disk-event suppression rule,
+		 *    or any user-visible surface.
+		 */
+		mintAdmissionOpId?: (path: string) => { opId: string; emitDecision: () => void },
 	): ReconcileResult {
 		const createdOnDisk: string[] = [];
 		const updatedOnDisk: string[] = [];
@@ -954,7 +1013,24 @@ export class VaultSync {
 						this.log(`reconcile: "${path}" present on disk but content not loaded, skipping seed`);
 						continue;
 					}
-					this.ensureFile(path, content, device);
+					// Spec R2 / Option (b): when an admission-opId factory is
+					// supplied, emit `reconcile.file.decision` BEFORE the CRDT
+					// mutation and thread the shared opId into ensureFile so
+					// the resulting `crdt.file.created` carries it.
+					//
+					// Failure semantics (see callback contract on this method):
+					// if `mintAdmissionOpId` or `emitDecision` throws, the
+					// exception propagates and the path's `ensureFile` is
+					// NOT called, so we never emit a `crdt.file.created`
+					// without a preceding `reconcile.file.decision`. The
+					// path is also NOT appended to `seededToCrdt`.
+					const minted = mintAdmissionOpId?.(path);
+					if (minted) {
+						minted.emitDecision();
+						this.ensureFile(path, content, device, { opId: minted.opId });
+					} else {
+						this.ensureFile(path, content, device);
+					}
 					seededToCrdt.push(path);
 					continue;
 				}
