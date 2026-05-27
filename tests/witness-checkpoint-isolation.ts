@@ -18,6 +18,8 @@ let passed = 0;
 let failed = 0;
 
 const tests: Array<[string, () => Promise<void>]> = [];
+const WAIT_FOR_STABLE_MS = 60;
+const WAIT_FOR_ROTATION_MS = 35;
 
 function test(name: string, fn: () => Promise<void>): void {
 	tests.push([name, fn]);
@@ -59,11 +61,11 @@ test("checkpoint segments are stored in-memory (no filesystem)", async () => {
 		getFileId: () => "file-id-1",
 		readCrdtContent: () => "hello world",
 		readDiskContent: async () => "hello world",
-		stableAfterMs: 100,
+		stableAfterMs: 20,
 	}));
 
 	tracker.markDirty("test.md", "disk-write");
-	await new Promise((r) => setTimeout(r, 500));
+	await new Promise((r) => setTimeout(r, WAIT_FOR_STABLE_MS));
 
 	const segments = tracker.getCheckpointSegments();
 	// Segments should exist in memory
@@ -85,11 +87,11 @@ test("checkpoint lines contain fileId, not raw path", async () => {
 		getFileId: () => "file-id-abc",
 		readCrdtContent: () => "hello",
 		readDiskContent: async () => "hello",
-		stableAfterMs: 100,
+		stableAfterMs: 20,
 	}));
 
 	tracker.markDirty("Notes/secret-path.md", "disk-write");
-	await new Promise((r) => setTimeout(r, 500));
+	await new Promise((r) => setTimeout(r, WAIT_FOR_STABLE_MS));
 
 	const segments = tracker.getCheckpointSegments();
 	assert.ok(segments.length >= 1);
@@ -108,11 +110,11 @@ test("checkpoint segments are retained after dispose", async () => {
 		getFileId: () => "file-id-1",
 		readCrdtContent: () => "hello",
 		readDiskContent: async () => "hello",
-		stableAfterMs: 100,
+		stableAfterMs: 20,
 	}));
 
 	tracker.markDirty("test.md", "disk-write");
-	await new Promise((r) => setTimeout(r, 500));
+	await new Promise((r) => setTimeout(r, WAIT_FOR_STABLE_MS));
 
 	const beforeDispose = tracker.getCheckpointSegments().length;
 	tracker.dispose();
@@ -127,18 +129,18 @@ test("checkpoint segment rotation: 6th segment causes deletion of oldest", async
 		getFileId: () => "file-id-1",
 		readCrdtContent: () => `content-${contentCounter++}`,
 		readDiskContent: async () => `content-${contentCounter - 1}`,
-		stableAfterMs: 100,
+		stableAfterMs: 20,
 		checkpointSegmentMaxBytes: 1, // force rotation on every write
 		checkpointMaxSegments: 5,
 	}));
 
 	// Trigger enough events to create 6+ segments
-	for (let i = 0; i < 20; i++) {
+	for (let i = 0; i < 7; i++) {
 		tracker.markDirty("test.md", "disk-write");
-		await new Promise((r) => setTimeout(r, 150));
+		await new Promise((r) => setTimeout(r, WAIT_FOR_ROTATION_MS));
 	}
 
-	await new Promise((r) => setTimeout(r, 500));
+	await new Promise((r) => setTimeout(r, WAIT_FOR_STABLE_MS));
 
 	const segments = tracker.getCheckpointSegments();
 	// Should have at most 5 segments
@@ -183,7 +185,7 @@ test("checkpoint path does not reach vault APIs (spy test)", async () => {
 		getFileId: () => "file-id-spy",
 		readCrdtContent: () => "hello",
 		readDiskContent: async () => "hello",
-		stableAfterMs: 100,
+		stableAfterMs: 20,
 		// These callbacks must NOT be called by checkpoint logic
 		// (they are disk/CRDT read callbacks, not write callbacks)
 		// We verify by checking that no unexpected side effects occur
@@ -200,7 +202,7 @@ test("checkpoint path does not reach vault APIs (spy test)", async () => {
 	});
 
 	tracker.markDirty("test.md", "disk-write");
-	await new Promise((r) => setTimeout(r, 500));
+	await new Promise((r) => setTimeout(r, WAIT_FOR_STABLE_MS));
 
 	// Checkpoint writes must not emit checkpoint_write_failed (which would indicate a write error)
 	const checkpointErrors = sinkCalls.filter((r) => r === "checkpoint_write_failed");
@@ -225,11 +227,11 @@ test("two rapid events with delayed getPathId each get correct pathId (hostile t
 		getFileId: (path) => `fid-${path}`,
 		readCrdtContent: () => "hello",
 		readDiskContent: async () => "hello",
-		stableAfterMs: 50,
+		stableAfterMs: 20,
 		checkpointSegmentMaxBytes: 1, // force rotation between events
-		// A resolves after 100ms, B resolves after 10ms — B resolves first
+		// A resolves after 40ms, B resolves after 5ms — B resolves first
 		getPathId: async (path) => {
-			const delay = path.includes("note-a") ? 100 : 10;
+			const delay = path.includes("note-a") ? 40 : 5;
 			await new Promise<void>((r) => setTimeout(r, delay));
 			resolveOrder.push(path);
 			return `pid-${path}`;
@@ -238,9 +240,9 @@ test("two rapid events with delayed getPathId each get correct pathId (hostile t
 
 	// Fire both events close together
 	tracker.markDirty("note-a.md", "disk-write");
-	await new Promise((r) => setTimeout(r, 60)); // let A evaluate
+	await new Promise((r) => setTimeout(r, 25)); // let A evaluate
 	tracker.markDirty("note-b.md", "disk-write");
-	await new Promise((r) => setTimeout(r, 250)); // wait for both pathIds to resolve
+	await new Promise((r) => setTimeout(r, 80)); // wait for both pathIds to resolve
 
 	// B should have resolved before A (hostile ordering)
 	assert.ok(resolveOrder.indexOf("note-b.md") < resolveOrder.indexOf("note-a.md"),

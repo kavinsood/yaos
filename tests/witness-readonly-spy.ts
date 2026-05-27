@@ -18,6 +18,7 @@ let passed = 0;
 let failed = 0;
 
 const tests: Array<[string, () => Promise<void>]> = [];
+const WAIT_FOR_STABLE_MS = 200;
 
 function test(name: string, fn: () => Promise<void>): void {
 	tests.push([name, fn]);
@@ -85,7 +86,7 @@ test("no forbidden API calls during remote-apply burst", async () => {
 		tracker.markDirty("test.md", "remote-apply");
 	}
 
-	await new Promise((r) => setTimeout(r, 500));
+	await new Promise((r) => setTimeout(r, WAIT_FOR_STABLE_MS));
 	tracker.dispose();
 
 	assert.equal(FORBIDDEN_CALLS.length, 0, `Forbidden calls: ${FORBIDDEN_CALLS.join(", ")}`);
@@ -101,7 +102,7 @@ test("no forbidden API calls during disk-write follow-ups", async () => {
 		await new Promise((r) => setTimeout(r, 50));
 	}
 
-	await new Promise((r) => setTimeout(r, 500));
+	await new Promise((r) => setTimeout(r, WAIT_FOR_STABLE_MS));
 	tracker.dispose();
 
 	assert.equal(FORBIDDEN_CALLS.length, 0, `Forbidden calls: ${FORBIDDEN_CALLS.join(", ")}`);
@@ -114,7 +115,7 @@ test("no forbidden API calls during recovery-decision emissions", async () => {
 	tracker.markDirty("test.md", "recovery");
 	tracker.handleRecoveryDecision("test.md", "h:some-hash");
 
-	await new Promise((r) => setTimeout(r, 500));
+	await new Promise((r) => setTimeout(r, WAIT_FOR_STABLE_MS));
 	tracker.dispose();
 
 	assert.equal(FORBIDDEN_CALLS.length, 0, `Forbidden calls: ${FORBIDDEN_CALLS.join(", ")}`);
@@ -126,7 +127,7 @@ test("no forbidden API calls during conflict-artifact creation", async () => {
 
 	tracker.markDirty("test.md", "conflict-artifact");
 
-	await new Promise((r) => setTimeout(r, 500));
+	await new Promise((r) => setTimeout(r, WAIT_FOR_STABLE_MS));
 	tracker.dispose();
 
 	assert.equal(FORBIDDEN_CALLS.length, 0, `Forbidden calls: ${FORBIDDEN_CALLS.join(", ")}`);
@@ -142,7 +143,7 @@ test("no forbidden API calls during tombstone events", async () => {
 
 	tracker.markDirty("test.md", "tombstone");
 
-	await new Promise((r) => setTimeout(r, 500));
+	await new Promise((r) => setTimeout(r, WAIT_FOR_STABLE_MS));
 	tracker.dispose();
 
 	assert.equal(FORBIDDEN_CALLS.length, 0, `Forbidden calls: ${FORBIDDEN_CALLS.join(", ")}`);

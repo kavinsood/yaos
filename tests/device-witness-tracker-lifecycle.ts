@@ -141,11 +141,11 @@ await test("after dispose, pending timers are cancelled and no new events emit",
 	};
 	const sink = makeSink();
 	// Long stability window so the timer is still pending when we dispose.
-	const tracker = new DeviceWitnessTracker(makeConfig(state, sink, "trace-2", { stableAfterMs: 500 }));
+	const tracker = new DeviceWitnessTracker(makeConfig(state, sink, "trace-2", { stableAfterMs: 80 }));
 
 	tracker.markDirty("notes/smoke.md", "remote-apply");
 	tracker.dispose();
-	await sleep(600);
+	await sleep(120);
 	assert.equal(tracker.getWitnessBuffer().length, 0, "No events after dispose cancels pending timer");
 });
 
@@ -160,7 +160,7 @@ await test("dispose then markDirty => no event (disposed guard)", async () => {
 	const tracker = new DeviceWitnessTracker(makeConfig(state, sink, "trace-2b"));
 	tracker.dispose();
 	tracker.markDirty("notes/smoke.md", "remote-apply");
-	await sleep(200);
+	await sleep(60);
 	assert.equal(tracker.getWitnessBuffer().length, 0, "markDirty after dispose is a no-op");
 });
 

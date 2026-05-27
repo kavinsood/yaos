@@ -41,9 +41,12 @@ function makeConfig(overrides: Partial<WitnessTrackerConfig> = {}): WitnessTrack
 		getFileId: () => "file-bundle-001",
 		readDiskContent: async () => "bundle test content",
 		sampleEditor: () => ({ kind: "not_open", content: null }),
+		stableAfterMs: 50,
 		...overrides,
 	};
 }
+
+const WAIT_FOR_SEGMENT_MS = 150;
 
 function buildBundleString(
 	tracker: DeviceWitnessTracker,
@@ -103,7 +106,7 @@ function buildBundleString(
 test("bundle.header first line has all required fields", async () => {
 	const tracker = new DeviceWitnessTracker(makeConfig());
 	tracker.markDirty("Notes/test.md", "local-edit");
-	await new Promise((r) => setTimeout(r, 2500));
+	await new Promise((r) => setTimeout(r, WAIT_FOR_SEGMENT_MS));
 
 	const bundle = buildBundleString(tracker, {
 		traceId: "trace-bundle-test",
@@ -142,7 +145,7 @@ test("safe bundle contains no sentinel secret values", async () => {
 
 	const tracker = new DeviceWitnessTracker(makeConfig());
 	tracker.markDirty("Notes/test.md", "local-edit");
-	await new Promise((r) => setTimeout(r, 2500));
+	await new Promise((r) => setTimeout(r, WAIT_FOR_SEGMENT_MS));
 
 	const bundle = buildBundleString(tracker, {
 		traceId: "trace-bundle-test",
@@ -163,7 +166,7 @@ test("safe bundle contains no sentinel secret values", async () => {
 test("bundle parses as valid NDJSON with header on line 1", async () => {
 	const tracker = new DeviceWitnessTracker(makeConfig());
 	tracker.markDirty("Notes/test.md", "local-edit");
-	await new Promise((r) => setTimeout(r, 2500));
+	await new Promise((r) => setTimeout(r, WAIT_FOR_SEGMENT_MS));
 
 	const bundle = buildBundleString(tracker, {
 		traceId: "trace-bundle-test",
@@ -192,7 +195,7 @@ test("bundle parses as valid NDJSON with header on line 1", async () => {
 test("bundle includes all retained segment lines", async () => {
 	const tracker = new DeviceWitnessTracker(makeConfig());
 	tracker.markDirty("Notes/test.md", "local-edit");
-	await new Promise((r) => setTimeout(r, 2500));
+	await new Promise((r) => setTimeout(r, WAIT_FOR_SEGMENT_MS));
 
 	const segments = tracker.getCheckpointSegments();
 	const bundle = buildBundleString(tracker, {
@@ -218,7 +221,7 @@ test("bundle includes all retained segment lines", async () => {
 test("bundle eventCount matches actual event lines", async () => {
 	const tracker = new DeviceWitnessTracker(makeConfig());
 	tracker.markDirty("Notes/test.md", "local-edit");
-	await new Promise((r) => setTimeout(r, 2500));
+	await new Promise((r) => setTimeout(r, WAIT_FOR_SEGMENT_MS));
 
 	const bundle = buildBundleString(tracker, {
 		traceId: "trace-bundle-test",
@@ -245,7 +248,7 @@ test("bundle eventCount matches actual event lines", async () => {
 test("round-trip: event lines parse to FlightEvent-compatible shape", async () => {
 	const tracker = new DeviceWitnessTracker(makeConfig());
 	tracker.markDirty("Notes/test.md", "local-edit");
-	await new Promise((r) => setTimeout(r, 2500));
+	await new Promise((r) => setTimeout(r, WAIT_FOR_SEGMENT_MS));
 
 	const bundle = buildBundleString(tracker, {
 		traceId: "trace-bundle-test",

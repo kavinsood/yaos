@@ -41,9 +41,12 @@ function makeConfig(overrides: Partial<WitnessTrackerConfig> = {}): WitnessTrack
 		getFileId: () => "file-persist-001",
 		readDiskContent: async () => "persist test content",
 		sampleEditor: () => ({ kind: "not_open", content: null }),
+		stableAfterMs: 50,
 		...overrides,
 	};
 }
+
+const WAIT_FOR_SEGMENT_MS = 150;
 
 // -----------------------------------------------------------------------
 // Tests
@@ -52,7 +55,7 @@ function makeConfig(overrides: Partial<WitnessTrackerConfig> = {}): WitnessTrack
 test("in-memory segments survive dispose and are still readable", async () => {
 	const tracker = new DeviceWitnessTracker(makeConfig());
 	tracker.markDirty("Notes/test.md", "local-edit");
-	await new Promise((r) => setTimeout(r, 2500));
+	await new Promise((r) => setTimeout(r, WAIT_FOR_SEGMENT_MS));
 
 	const segsBefore = tracker.getCheckpointSegments();
 	assert.ok(segsBefore.length > 0, "Should have segments before dispose");

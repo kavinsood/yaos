@@ -14,6 +14,7 @@ import type { WitnessTrackerConfig } from "../src/diagnostics/deviceWitnessTrack
 
 let passed = 0;
 let failed = 0;
+const WAIT_FOR_EVENT_MS = 200;
 
 // Sequential test runner (tests share mockVisibilityState)
 const tests: Array<[string, () => Promise<void>]> = [];
@@ -102,7 +103,7 @@ test("mobile-backgrounded tracker emits unavailable instead of settled", async (
 	}));
 
 	tracker.markDirty("test.md", "disk-write");
-	await new Promise((r) => setTimeout(r, 500));
+	await new Promise((r) => setTimeout(r, WAIT_FOR_EVENT_MS));
 	tracker.dispose();
 
 	const unavailable = emitted.filter((e) => e.kind === "diverged" && e.data.reason === "unavailable");
@@ -128,7 +129,7 @@ test("unavailable event has runtimeState field set to background", async () => {
 	}));
 
 	tracker.markDirty("test.md", "disk-write");
-	await new Promise((r) => setTimeout(r, 500));
+	await new Promise((r) => setTimeout(r, WAIT_FOR_EVENT_MS));
 	tracker.dispose();
 
 	const unavailable = emitted.find((e) => e.data.reason === "unavailable");
@@ -154,7 +155,7 @@ test("foreground tracker emits settled normally", async () => {
 	}));
 
 	tracker.markDirty("test.md", "disk-write");
-	await new Promise((r) => setTimeout(r, 500));
+	await new Promise((r) => setTimeout(r, WAIT_FOR_EVENT_MS));
 	tracker.dispose();
 
 	const settled = emitted.filter((e) => e.kind === "settled");
@@ -177,7 +178,7 @@ test("every emitted event has runtimeState field", async () => {
 	}));
 
 	tracker.markDirty("test.md", "disk-write");
-	await new Promise((r) => setTimeout(r, 500));
+	await new Promise((r) => setTimeout(r, WAIT_FOR_EVENT_MS));
 	tracker.dispose();
 
 	assert.ok(emitted.length > 0, "Should have emitted at least one event");
@@ -205,7 +206,7 @@ test("every emitted event has causedByEvents object", async () => {
 	}));
 
 	tracker.markDirty("test.md", "disk-write");
-	await new Promise((r) => setTimeout(r, 500));
+	await new Promise((r) => setTimeout(r, WAIT_FOR_EVENT_MS));
 	tracker.dispose();
 
 	assert.ok(emitted.length > 0, "Should have emitted at least one event");

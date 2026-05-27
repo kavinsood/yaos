@@ -41,9 +41,12 @@ function makeConfig(overrides: Partial<WitnessTrackerConfig> = {}): WitnessTrack
 		getFileId: () => "file-step-001",
 		readDiskContent: async () => "step test content",
 		sampleEditor: () => ({ kind: "not_open", content: null }),
+		stableAfterMs: 50,
 		...overrides,
 	};
 }
+
+const WAIT_FOR_EVENT_MS = 150;
 
 // -----------------------------------------------------------------------
 // Tests
@@ -62,7 +65,7 @@ test("setScenarioRunId stamps scenarioRunId and scenarioId on emitted events", a
 
 	tracker.setScenarioRunId("run-001", "s12a");
 	tracker.markDirty("Notes/test.md", "local-edit");
-	await new Promise((r) => setTimeout(r, 2500));
+	await new Promise((r) => setTimeout(r, WAIT_FOR_EVENT_MS));
 
 	assert.ok(emittedData.length > 0, "Should have emitted events");
 	const settled = emittedData.find((d) => d.stateHash !== undefined);
@@ -88,7 +91,7 @@ test("advanceScenarioStep stamps scenarioStepIndex on emitted events", async () 
 	assert.equal(ok, true, "advanceScenarioStep should succeed");
 
 	tracker.markDirty("Notes/test.md", "local-edit");
-	await new Promise((r) => setTimeout(r, 2500));
+	await new Promise((r) => setTimeout(r, WAIT_FOR_EVENT_MS));
 
 	const settled = emittedData.find((d) => d.stateHash !== undefined);
 	assert.ok(settled, "Should have a settled event");
