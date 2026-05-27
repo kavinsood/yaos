@@ -7,6 +7,20 @@
 // `node --import jiti/register tests/foo.ts` — the JITI_ALIAS env injected
 // below (yjs deduplication, obsidian mock, partyserver mock) will be absent
 // and you may see the "Yjs was already imported" warning or import failures.
+//
+// CLI flags:
+//   --only <substring>   Run only suites whose path contains <substring>.
+//                        Repeatable. May also be passed as --only=<substring>.
+//                        With no --only flags, all suites run.
+//                        If no suite matches, the runner exits non-zero.
+//   --list               Print every suite path the runner knows about (one
+//                        per line) and exit 0 without running anything.
+//                        Honors --only filters when listing.
+//   --help, -h           Print this usage block and exit 0.
+//
+// Unknown flags or positional args cause the runner to exit non-zero with
+// a clear message, so a typo like `--ony` will not silently run the full
+// suite.
 
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -43,6 +57,7 @@ const suites = [
 	[JITI, "tests/editor-binding-health-regressions.mjs"],
 	[JITI, "tests/frontmatter-guard-regressions.mjs"],
 	[JITI, "tests/frontmatter-quarantine-regressions.mjs"],
+	[JITI, "tests/frontmatter-guard-orchestration.ts"],
 	[NODE, "tests/disk-mirror-regressions.mjs"],
 	[JITI, "tests/disk-mirror-origin-classification.ts"],
 	[NODE, "tests/server-pre-auth-trace.mjs"],
@@ -51,6 +66,8 @@ const suites = [
 	[JITI, "tests/typed-trace-schema.ts"],
 	[JITI, "tests/trace-event-behavior.ts"],
 	[JITI, "tests/reconciliation-safety-brake.ts"],
+	[JITI, "tests/no-event-reconcile-admission.ts"],
+	[JITI, "tests/controller-recovery-orchestration.ts"],
 	[JITI, "tests/blob-download-conflicts.ts"],
 	[JITI, "tests/markdown-remote-delete-trash-preference.ts"],
 	[JITI, "tests/closed-file-conflict.ts"],
@@ -105,7 +122,81 @@ const suites = [
 let totalPassed = 0;
 let totalFailed = 0;
 
-for (const [runner, suitePath] of suites) {
+// -----------------------------------------------------------------------
+// CLI argument parsing — fail fast on unknown args, support --only filter.
+// -----------------------------------------------------------------------
+
+function printUsage() {
+	console.log("Usage: node tests/run-regressions.mjs [--only <substring>]... [--list] [--help]");
+	console.log("");
+	console.log("  --only <substring>   Run only suites whose path contains <substring>.");
+	console.log("                       Repeatable. May also be passed as --only=<substring>.");
+	console.log("  --list               Print every suite path (filtered by --only if given)");
+	console.log("                       and exit without running anything.");
+	console.log("  --help, -h           Print this usage block and exit.");
+}
+
+const argv = process.argv.slice(2);
+const onlyFilters = [];
+let listOnly = false;
+
+for (let i = 0; i < argv.length; i++) {
+	const arg = argv[i];
+	if (arg === "--help" || arg === "-h") {
+		printUsage();
+		process.exit(0);
+	}
+	if (arg === "--list") {
+		listOnly = true;
+		continue;
+	}
+	if (arg === "--only") {
+		const next = argv[i + 1];
+		if (next === undefined || next.startsWith("--")) {
+			console.error(`Error: --only requires a value (e.g. --only frontmatter-guard)`);
+			process.exit(2);
+		}
+		onlyFilters.push(next);
+		i += 1;
+		continue;
+	}
+	if (arg.startsWith("--only=")) {
+		const value = arg.slice("--only=".length);
+		if (value.length === 0) {
+			console.error(`Error: --only requires a non-empty value`);
+			process.exit(2);
+		}
+		onlyFilters.push(value);
+		continue;
+	}
+	console.error(`Error: unknown argument "${arg}"`);
+	console.error("");
+	printUsage();
+	process.exit(2);
+}
+
+const selectedSuites = onlyFilters.length === 0
+	? suites
+	: suites.filter(([, path]) => onlyFilters.some((needle) => path.includes(needle)));
+
+if (onlyFilters.length > 0 && selectedSuites.length === 0) {
+	console.error(`Error: no suite path matched --only filter(s): ${onlyFilters.map((f) => `"${f}"`).join(", ")}`);
+	console.error(`Hint: run with --list to see every known suite path.`);
+	process.exit(2);
+}
+
+if (listOnly) {
+	for (const [, path] of selectedSuites) {
+		console.log(path);
+	}
+	process.exit(0);
+}
+
+if (onlyFilters.length > 0) {
+	console.log(`Running ${selectedSuites.length} of ${suites.length} suite(s) matching --only filter(s): ${onlyFilters.map((f) => `"${f}"`).join(", ")}`);
+}
+
+for (const [runner, suitePath] of selectedSuites) {
 	const [cmd, ...cmdArgs] = runner.split(" ");
 	const result = spawnSync(cmd, [...cmdArgs, suitePath], {
 		stdio: "inherit",
