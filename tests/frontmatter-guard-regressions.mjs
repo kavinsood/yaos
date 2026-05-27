@@ -83,8 +83,10 @@ console.log("\n--- Test 2: duplicate frontmatter keys are blocked ---");
 	assert(result.reasons.includes("duplicate-key:taskSourceType"), "duplicate key reason is reported");
 }
 
-console.log("\n--- Test 3: repeated bare key bursts are blocked ---");
+console.log("\n--- Test 3: bare top-level scalars in frontmatter are blocked ---");
 {
+	// js-yaml folds multiple bare scalars into a single string.  A document
+	// whose root is not a mapping is invalid Obsidian frontmatter: blocked.
 	const next = [
 		"---",
 		"taskSourceType",
@@ -94,10 +96,10 @@ console.log("\n--- Test 3: repeated bare key bursts are blocked ---");
 		"body",
 	].join("\n");
 	const result = validateFrontmatterTransition(null, next);
-	assert(isFrontmatterBlocked(result), "repeated bare key burst is blocked");
+	assert(isFrontmatterBlocked(result), "bare scalars where a map is expected are blocked");
 	assert(
-		result.reasons.includes("repeated-bare-key-burst:taskSourceType"),
-		"bare key burst reason is reported",
+		result.reasons.includes("frontmatter-non-map-root"),
+		"non-map root reason is reported",
 	);
 }
 
@@ -115,8 +117,12 @@ console.log("\n--- Test 4: quoted duplicate frontmatter keys are blocked ---");
 	assert(result.reasons.includes("duplicate-key:task source"), "quoted duplicate key reason is reported");
 }
 
-console.log("\n--- Test 5: unknown top-level YAML warns instead of blocking ---");
+console.log("\n--- Test 5: valid but unusual YAML syntax is accepted by the parser ---");
 {
+	// Explicit/complex key syntax (? key : value) is uncommon in Obsidian
+	// frontmatter but is valid YAML.  After removing the regex pre-pass the
+	// real parser handles it correctly: the document parses to { complex: "value" }
+	// and no block or warn reasons are produced.
 	const next = [
 		"---",
 		"? complex",
@@ -125,8 +131,8 @@ console.log("\n--- Test 5: unknown top-level YAML warns instead of blocking ---"
 		"body",
 	].join("\n");
 	const result = validateFrontmatterTransition(null, next);
-	assert(result.risk === "warn", "unknown top-level YAML is a warning");
-	assert(!isFrontmatterBlocked(result), "unknown top-level YAML is not blocked");
+	assert(result.risk === "ok", "valid YAML with explicit key syntax is accepted");
+	assert(!isFrontmatterBlocked(result), "explicit key syntax is not blocked");
 }
 
 console.log("\n--- Test 6: malformed frontmatter fence is blocked ---");

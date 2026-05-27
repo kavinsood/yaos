@@ -243,6 +243,51 @@ console.log("\n--- Test 7: blob uploads reject malformed Content-Length ---");
 	assert(putCalls === 0, "malformed Content-Length upload is not written to R2");
 }
 
+console.log("\n--- Test 7b: blob uploads reject oversized body when Content-Length header is absent (post-buffer fallback) ---");
+{
+	// When Content-Length is absent the pre-check at blobs.ts:114 is not
+	// reachable — parseContentLength returns kind:"missing" and falls through.
+	// The Worker must buffer the full body via arrayBuffer() before the
+	// post-buffer size check at blobs.ts:124 can fire.  This is a Cloudflare
+	// Workers platform constraint: there is no application-level streaming
+	// hook that would let us abort an in-flight body read mid-stream.
+	//
+	// This test documents and locks that fallback behaviour: oversized bodies
+	// are still rejected with 413 and never written to R2, but only after
+	// buffering.  A client that omits Content-Length causes the Worker to pay
+	// the full memory cost of the request body before the rejection occurs.
+	let putCalls = 0;
+	const bucket = {
+		put: async () => {
+			putCalls++;
+		},
+	};
+	const env = { YAOS_BUCKET: bucket } as any;
+	// Body exceeds MAX_BLOB_UPLOAD_BYTES by one byte.  All bytes are zero so
+	// construction is fast; the exact content does not matter because the test
+	// fails at the size check, never reaching the hash-integrity check.
+	const oversizedBody = new Uint8Array(MAX_BLOB_UPLOAD_BYTES + 1);
+	// "aaa...a" (64 chars) is a syntactically valid hex hash for the URL;
+	// it will not be validated for content-address correctness because the
+	// handler returns early on the size check.
+	const placeholderHash = "a".repeat(64);
+	const res = await handleBlobRoute(
+		env,
+		"vault",
+		new Request(`https://example.test/vault/vault/blobs/${placeholderHash}`, {
+			method: "PUT",
+			// Deliberately no Content-Length header — exercises the post-buffer
+			// fallback path.  The Node.js Request constructor does not
+			// automatically populate Content-Length for buffered bodies.
+			body: oversizedBody,
+		}),
+		[placeholderHash],
+		json,
+	);
+	assert(res.status === 413, "blob upload without Content-Length but oversized body is rejected 413");
+	assert(putCalls === 0, "oversized blob body without Content-Length is not written to R2");
+}
+
 console.log("\n--- Test 8: public capabilities do not expose private update metadata ---");
 {
 	const env = { YAOS_BUCKET: {} } as any;

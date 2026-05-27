@@ -16,17 +16,15 @@ import {
 } from "./sync/serverCapabilities";
 import { isMarkdownSyncable, isBlobSyncable } from "./types";
 import {
-	isFrontmatterBlocked,
-	validateFrontmatterTransition,
-	extractFrontmatter,
 	type FrontmatterValidationResult,
 } from "./sync/frontmatterGuard";
 import {
-	clearFrontmatterQuarantinePath,
 	readPersistedFrontmatterQuarantine,
-	upsertFrontmatterQuarantineEntry,
 	type FrontmatterQuarantineEntry,
 } from "./sync/frontmatterQuarantine";
+import {
+	FrontmatterGuardCoordinator,
+} from "./sync/frontmatterGuardCoordinator";
 import {
 	type DiskIndex,
 	moveIndexEntries,
@@ -150,7 +148,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private capabilityUpdateService: CapabilityUpdateService | null = null;
 	private commandsRegistered = false;
 	private idbDegradedHandled = false;
-	private frontmatterGuardNoticeFingerprints = new Map<string, string>();
+	private frontmatterGuardCoordinator!: FrontmatterGuardCoordinator;
 	private frontmatterQuarantineEntries: FrontmatterQuarantineEntry[] = [];
 
 	/**
@@ -245,6 +243,16 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		});
 		await this.loadSettings();
 		this.applyRuntimeSettings("load-settings");
+		const self = this;
+		this.frontmatterGuardCoordinator = new FrontmatterGuardCoordinator({
+			get frontmatterGuardEnabled() { return self.settings.frontmatterGuardEnabled; },
+			trace: (source, event, data) => this.trace(source, event, data),
+			persistPluginState: () => this.persistPluginState(),
+			getFrontmatterQuarantineEntries: () => this.frontmatterQuarantineEntries,
+			setFrontmatterQuarantineEntries: (entries) => {
+				this.frontmatterQuarantineEntries = entries;
+			},
+		});
 		this.createReconciliationController();
 		this.editorWorkspace = new EditorWorkspaceOrchestrator({
 			app: this.app,
@@ -1163,23 +1171,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		nextContent: string,
 		reason: string,
 	): boolean {
-		if (!this.settings.frontmatterGuardEnabled) return false;
-
-		const validation = validateFrontmatterTransition(previousContent, nextContent);
-		this.handleFrontmatterValidation(
-			path,
-			"disk-to-crdt",
-			reason,
-			validation,
-			previousContent,
-			nextContent,
+		return this.frontmatterGuardCoordinator.shouldBlockFrontmatterIngest(
+			path, previousContent, nextContent, reason,
 		);
-		if (!isFrontmatterBlocked(validation)) return false;
-		this.log(
-			`Frontmatter ingest blocked for "${path}" ` +
-			`(${validation.reasons.join(", ") || validation.risk})`,
-		);
-		return true;
 	}
 
 	private handleFrontmatterValidation(
@@ -1190,62 +1184,19 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		previousContent: string | null,
 		nextContent: string,
 	): void {
-		if (validation.risk === "ok") {
-			this.clearFrontmatterNoticeFingerprint(path, direction);
-			void this.clearFrontmatterQuarantine(path, `${direction}:${reason}`);
-			return;
-		}
-
-		if (!isFrontmatterBlocked(validation)) return;
-
-		const noticeFingerprint = this.buildFrontmatterNoticeFingerprint(
-			validation,
-		);
-		const shouldNotify = this.shouldNotifyFrontmatterQuarantine(
-			path,
-			direction,
-			noticeFingerprint,
-		);
-		const notifiedAt = shouldNotify ? Date.now() : null;
-
-		this.traceFrontmatterQuarantine(
-			path,
-			direction,
-			reason,
-			validation,
-			previousContent?.length ?? null,
-			nextContent.length,
-		);
-		if (shouldNotify) {
-			this.showFrontmatterGuardNotice(path);
-		}
-		void this.persistFrontmatterQuarantine(
-			path,
-			direction,
-			validation,
-			previousContent,
-			nextContent,
-			noticeFingerprint,
-			notifiedAt,
+		this.frontmatterGuardCoordinator.handleFrontmatterValidation(
+			path, direction, reason, validation, previousContent, nextContent,
 		);
 	}
 
 	private showFrontmatterGuardNotice(path: string): void {
-		new Notice(
-			`YAOS paused a properties update in "${path}" because the frontmatter looked unsafe. Check diagnostics before accepting the change.`,
-			12_000,
-		);
+		this.frontmatterGuardCoordinator.showFrontmatterGuardNotice(path);
 	}
 
 	private buildFrontmatterNoticeFingerprint(
 		validation: FrontmatterValidationResult,
 	): string {
-		const reasons = [...validation.reasons].sort().join("|");
-		return [
-			reasons,
-			String(validation.previousFrontmatterLength ?? "none"),
-			String(validation.frontmatterLength ?? "none"),
-		].join("#");
+		return this.frontmatterGuardCoordinator.buildFrontmatterNoticeFingerprint(validation);
 	}
 
 	private shouldNotifyFrontmatterQuarantine(
@@ -1253,21 +1204,16 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		direction: "disk-to-crdt" | "crdt-to-disk",
 		noticeFingerprint: string,
 	): boolean {
-		const key = `${direction}:${path}`;
-		const previousFingerprint = this.frontmatterGuardNoticeFingerprints.get(key);
-		if (previousFingerprint === noticeFingerprint) {
-			return false;
-		}
-		this.frontmatterGuardNoticeFingerprints.set(key, noticeFingerprint);
-		return true;
+		return this.frontmatterGuardCoordinator.shouldNotifyFrontmatterQuarantine(
+			path, direction, noticeFingerprint,
+		);
 	}
 
 	private clearFrontmatterNoticeFingerprint(
 		path: string,
 		direction: "disk-to-crdt" | "crdt-to-disk",
 	): void {
-		const key = `${direction}:${path}`;
-		this.frontmatterGuardNoticeFingerprints.delete(key);
+		this.frontmatterGuardCoordinator.clearFrontmatterNoticeFingerprint(path, direction);
 	}
 
 	private traceFrontmatterQuarantine(
@@ -1278,17 +1224,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		previousLength: number | null,
 		nextLength: number,
 	): void {
-		this.trace("quarantine", "frontmatter-quarantined", {
-			path,
-			direction,
-			reason,
-			risk: validation.risk,
-			reasons: validation.reasons,
-			previousLength,
-			nextLength,
-			previousFrontmatterLength: validation.previousFrontmatterLength ?? null,
-			nextFrontmatterLength: validation.frontmatterLength,
-		});
+		this.frontmatterGuardCoordinator.traceFrontmatterQuarantine(
+			path, direction, reason, validation, previousLength, nextLength,
+		);
 	}
 
 	private async persistFrontmatterQuarantine(
@@ -1300,37 +1238,14 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		lastNotifiedFingerprint: string,
 		lastNoticeAt: number | null,
 	): Promise<void> {
-		const now = Date.now();
-		const prevHash = await this.hashFrontmatterContent(previousContent);
-		const nextHash = await this.hashFrontmatterContent(nextContent);
-		this.frontmatterQuarantineEntries = upsertFrontmatterQuarantineEntry(
-			this.frontmatterQuarantineEntries,
-			{
-				path,
-				firstSeenAt: now,
-				lastSeenAt: now,
-				direction,
-				reasons: validation.reasons,
-				prevHash,
-				nextHash,
-				lastNotifiedFingerprint,
-				lastNoticeAt: lastNoticeAt ?? undefined,
-				count: 1,
-			},
+		await this.frontmatterGuardCoordinator.persistFrontmatterQuarantine(
+			path, direction, validation, previousContent, nextContent,
+			lastNotifiedFingerprint, lastNoticeAt,
 		);
-		await this.persistPluginState();
 	}
 
 	private async clearFrontmatterQuarantine(path: string, reason: string): Promise<void> {
-		if (this.frontmatterQuarantineEntries.length === 0) return;
-		const nextEntries = clearFrontmatterQuarantinePath(this.frontmatterQuarantineEntries, path);
-		if (nextEntries.length === this.frontmatterQuarantineEntries.length) return;
-		this.frontmatterQuarantineEntries = nextEntries;
-		this.trace("quarantine", "frontmatter-quarantine-cleared", {
-			path,
-			reason,
-		});
-		await this.persistPluginState();
+		await this.frontmatterGuardCoordinator.clearFrontmatterQuarantine(path, reason);
 	}
 
 	/**
@@ -1999,13 +1914,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		const data = new TextEncoder().encode(text);
 		const digest = await crypto.subtle.digest("SHA-256", data);
 		return arrayBufferToHex(digest);
-	}
-
-	private async hashFrontmatterContent(content: string | null): Promise<string | undefined> {
-		if (content == null) return undefined;
-		const block = extractFrontmatter(content);
-		if (block.kind !== "present") return undefined;
-		return await this.sha256Hex(block.frontmatterText);
 	}
 
 	private runSchemaMigrationToV2(): void {

@@ -31,7 +31,6 @@ type ValueKind = "null" | "scalar" | "array" | "object";
 
 const FRONTMATTER_OPEN = "---";
 const FRONTMATTER_CLOSE = new Set(["---", "..."]);
-const REPEATED_KEY_BURST_THRESHOLD = 3;
 
 const FIELD_POLICIES: Record<string, FieldPolicy> = {
 	aliases: "ordered-list",
@@ -70,9 +69,6 @@ export function validateFrontmatterTransition(
 
 	const blockReasons = new Set<string>();
 	const warnReasons = new Set<string>();
-	const heuristicAnalysis = analyzeFrontmatter(next.frontmatterText);
-	addReasons(blockReasons, heuristicAnalysis.blockReasons);
-	addReasons(warnReasons, heuristicAnalysis.warnReasons);
 
 	const nextLength = next.frontmatterText.length;
 	if (
@@ -148,54 +144,34 @@ export function getFieldPolicy(fieldName: string): FieldPolicy {
 	return FIELD_POLICIES[normalizeFieldName(fieldName)] ?? "opaque";
 }
 
-function analyzeFrontmatter(frontmatterText: string): { blockReasons: string[]; warnReasons: string[] } {
-	const blockReasons = new Set<string>();
-	const warnReasons = new Set<string>();
-	const topLevelKeys = new Map<string, number>();
-	const bareTopLevelKeys = new Map<string, number>();
-
-	for (const rawLine of frontmatterText.split(/\r?\n/)) {
-		const line = rawLine.trimEnd();
-		const trimmed = line.trim();
-		if (!trimmed || trimmed.startsWith("#")) continue;
-
-		if (/^\s/.test(line) || trimmed.startsWith("- ")) continue;
-
-		const keyMatch = /^([A-Za-z0-9_-][A-Za-z0-9_-]*)\s*:/.exec(trimmed);
-		const quotedKeyMatch = /^["']([^"']+)["']\s*:/.exec(trimmed);
-		const key = keyMatch?.[1] ?? quotedKeyMatch?.[1];
-		if (key) {
-			const count = (topLevelKeys.get(key) ?? 0) + 1;
-			topLevelKeys.set(key, count);
-			if (count > 1) blockReasons.add(`duplicate-key:${key}`);
-			continue;
+/**
+ * Extract a specific block reason from a js-yaml duplicate-key exception.
+ *
+ * js-yaml throws "duplicated mapping key (line:col)" when it encounters a
+ * duplicate key.  The key name is absent from the message string, but
+ * `err.mark.line` (0-indexed) points to the offending line in the parsed text,
+ * so we can extract the key name directly from the source without a second
+ * parse.  Falls back to the generic "yaml-parse-duplicate-key" if position
+ * information is unavailable or extraction fails.
+ */
+function duplicateKeyReason(err: unknown, frontmatterText: string): string {
+	if (!(err instanceof Error)) return "yaml-parse-error";
+	if (!err.message.includes("duplicated mapping key")) return "yaml-parse-error";
+	try {
+		const mark = (err as { mark?: { line: number } }).mark;
+		if (mark != null) {
+			const line = (frontmatterText.split("\n")[mark.line] ?? "").trim();
+			// Quoted key: "foo": ... or 'foo': ...
+			const quotedMatch = /^(["'])(.+?)\1\s*:/.exec(line);
+			if (quotedMatch) return `duplicate-key:${quotedMatch[2]}`;
+			// Unquoted key: foo: ...  (first colon is the key-value separator)
+			const colonIdx = line.indexOf(":");
+			if (colonIdx > 0) return `duplicate-key:${line.slice(0, colonIdx).trim()}`;
 		}
-
-		const bareKeyMatch = /^([A-Za-z0-9_-][A-Za-z0-9_-]*)$/.exec(trimmed);
-		if (bareKeyMatch?.[1]) {
-			const key = bareKeyMatch[1];
-			const count = (bareTopLevelKeys.get(key) ?? 0) + 1;
-			bareTopLevelKeys.set(key, count);
-			blockReasons.add(`bare-top-level-scalar:${key}`);
-			if (count >= REPEATED_KEY_BURST_THRESHOLD) {
-				blockReasons.add(`repeated-bare-key-burst:${key}`);
-			}
-			continue;
-		}
-
-		warnReasons.add("unknown-top-level-yaml");
+	} catch {
+		// Position extraction failed; return the generic duplicate reason.
 	}
-
-	for (const [key, count] of topLevelKeys) {
-		if (count >= REPEATED_KEY_BURST_THRESHOLD) {
-			blockReasons.add(`repeated-key-burst:${key}`);
-		}
-	}
-
-	return {
-		blockReasons: Array.from(blockReasons),
-		warnReasons: Array.from(warnReasons),
-	};
+	return "yaml-parse-duplicate-key";
 }
 
 function parseFrontmatter(frontmatterText: string): ParsedFrontmatter {
@@ -209,11 +185,14 @@ function parseFrontmatter(frontmatterText: string): ParsedFrontmatter {
 			};
 		}
 
+		// A frontmatter block must be a YAML mapping (key-value pairs).
+		// Bare scalars, sequences, and any other non-map root type are invalid
+		// Obsidian frontmatter and must be blocked, not merely warned about.
 		if (!isPlainObject(parsed)) {
 			return {
 				root: null,
-				blockReasons: [],
-				warnReasons: ["frontmatter-non-map-root"],
+				blockReasons: ["frontmatter-non-map-root"],
+				warnReasons: [],
 			};
 		}
 
@@ -223,13 +202,9 @@ function parseFrontmatter(frontmatterText: string): ParsedFrontmatter {
 			warnReasons: [],
 		};
 	} catch (error) {
-		const message = error instanceof Error ? error.message : String(error);
-		const reason = message.includes("duplicated mapping key")
-			? "yaml-parse-duplicate-key"
-			: "yaml-parse-error";
 		return {
 			root: null,
-			blockReasons: [reason],
+			blockReasons: [duplicateKeyReason(error, frontmatterText)],
 			warnReasons: [],
 		};
 	}

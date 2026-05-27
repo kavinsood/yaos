@@ -117,6 +117,14 @@ async function handleBlobUpload(
 		}, 413);
 	}
 
+	// Post-buffer fallback: when Content-Length is absent the pre-check above
+	// cannot fire, so we must buffer the full body before we can measure it.
+	// Cloudflare Workers provide no application-level streaming hook to abort
+	// an in-flight body read, so the Worker pays the memory cost of any
+	// oversized request whose sender omitted the Content-Length header.
+	// The check below still rejects the request and prevents an R2 write, but
+	// the protection is weaker than the header pre-check for the missing-header
+	// case.  Clients should always send Content-Length; the plugin does.
 	const body = await req.arrayBuffer();
 	if (!body.byteLength) {
 		return json({ error: "missing request body" }, 400);

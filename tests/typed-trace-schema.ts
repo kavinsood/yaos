@@ -24,14 +24,15 @@ console.log("\n--- Test 1: dangerous transitions have typed trace events ---");
 	const diskMirror = file("src/sync/diskMirror.ts");
 	const serverAck = file("src/sync/serverAckTracker.ts");
 	const main = file("src/main.ts");
+	const fmCoordinator = file("src/sync/frontmatterGuardCoordinator.ts");
 
 	assert(reconciliation.includes('"recovery-postcondition-observed"'), "recovery postcondition observations are traced");
 	assert(reconciliation.includes('"recovery-force-replace-applied"'), "recovery force-replace fallback is traced");
 	assert(reconciliation.includes('"recovery-postcondition-failed"'), "recovery postcondition failure is traced");
 	assert(reconciliation.includes('"recovery-postcondition-skipped"'), "recovery lock skips are traced");
 	assert(reconciliation.includes('"conflict-artifact-needed"'), "ambiguous divergence conflict need is traced");
-	assert(main.includes('this.trace("quarantine", "frontmatter-quarantined"'), "frontmatter quarantine uses quarantine trace source");
-	assert(main.includes('this.trace("quarantine", "frontmatter-quarantine-cleared"'), "frontmatter quarantine clear uses quarantine trace source");
+	assert(fmCoordinator.includes('"frontmatter-quarantined"'), "frontmatter quarantine uses quarantine trace source");
+	assert(fmCoordinator.includes('"frontmatter-quarantine-cleared"'), "frontmatter quarantine clear uses quarantine trace source");
 	assert(blobSync.includes('"download-overwrite-decision"'), "attachment download overwrite decisions are traced");
 	assert(blobSync.includes('"download-conflict-quarantined"'), "attachment download conflicts are quarantined and traced");
 	assert(serverAck.includes('"receipt-candidate-captured"'), "receipt candidate capture is traced");
