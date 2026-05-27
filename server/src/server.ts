@@ -9,7 +9,6 @@ import {
 	hasSnapshotForDay,
 	getLatestSnapshotIndex,
 	computeStateVectorHash,
-	computeSemanticHash,
 	applyRetention,
 	type SnapshotResult,
 } from "./snapshot";
@@ -593,18 +592,26 @@ export class VaultSyncServer extends YServer {
 
 				const vaultId = this.getRoomId();
 
-				// Fast path: check if semantic state has changed since latest snapshot.
+				// Skip only if the CRDT state vector is completely unchanged.
+				// State vector changes on ANY Yjs operation — content edits,
+				// metadata changes, path changes, blob changes. If it hasn't
+				// changed, literally nothing happened.
+				//
+				// We do NOT skip based on semanticHash alone because it uses
+				// path:fileId pairs as keys and would miss content edits to
+				// existing files. The semanticHash is stored for future use
+				// by the CAS manifest system (dedup of file-level content).
 				const latest = await getLatestSnapshotIndex(vaultId, bucket);
-				if (latest?.semanticHash) {
-					const currentSemanticHash = await computeSemanticHash(this.document);
-					if (latest.semanticHash === currentSemanticHash) {
+				if (latest?.stateVectorHash) {
+					const currentSvHash = await computeStateVectorHash(this.document);
+					if (latest.stateVectorHash === currentSvHash) {
 						return {
 							status: "noop",
-							reason: "Semantic vault state unchanged since last snapshot",
+							reason: "No changes since last snapshot",
 						} satisfies SnapshotResult;
 					}
-				} else {
-					// Legacy path: fall back to day-based dedup if no semantic hash.
+				} else if (latest) {
+					// Legacy path: fall back to day-based dedup if no hashes stored.
 					const currentDay = new Date().toISOString().slice(0, 10);
 					if (await hasSnapshotForDay(vaultId, currentDay, bucket)) {
 						return {
