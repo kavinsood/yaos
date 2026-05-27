@@ -54,6 +54,116 @@ console.log("\n--- Test 2: reconciliation traces safety and authority summaries 
 	assert(reconciliation.includes('tracePathList("blockedUpdate"'), "blocked update path samples are included in trace details");
 }
 
+console.log("\n--- Test 3: source-grep static guard for recovery.skipped frontmatter-ingest-blocked wiring ---");
+//
+// This is a static-text guard, not a runtime schema validator. It catches
+// accidental drift in the controller's frontmatter-ingest-blocked
+// instrumentation by checking that the typed exports exist in the
+// taxonomy module, the helper exists in the controller, and the helper
+// is invoked exactly six times. Real type-level enforcement comes from
+// `RecoverySkippedFrontmatterData` and `FrontmatterIngestBlockBranch` in
+// src/debug/flightEvents.ts; the runtime invariants are asserted by
+// tests/frontmatter-guard-orchestration.ts.
+{
+	const reconciliation = file("src/runtime/reconciliationController.ts");
+	const flight = file("src/debug/flightEvents.ts");
+
+	// Typed taxonomy exports live in src/debug/flightEvents.ts (the helper
+	// imports them; the test asserts they exist there, not in the
+	// controller, so accidental local copies in the controller are caught).
+	assert(
+		flight.includes("export type RecoverySkippedReason ="),
+		"flightEvents.ts exports RecoverySkippedReason union",
+	);
+	assert(
+		flight.includes("export type FrontmatterIngestBlockBranch ="),
+		"flightEvents.ts exports FrontmatterIngestBlockBranch union",
+	);
+	assert(
+		flight.includes("export type RecoverySkippedFrontmatterData ="),
+		"flightEvents.ts exports RecoverySkippedFrontmatterData payload type",
+	);
+
+	// Closed-enum branch type covers exactly the six block sites.
+	const branchTypeMatch = flight.match(
+		/export type FrontmatterIngestBlockBranch =\s*([\s\S]*?);/,
+	);
+	assert(branchTypeMatch !== null, "FrontmatterIngestBlockBranch declaration parses");
+	const branchSrc = branchTypeMatch?.[1] ?? "";
+	for (const literal of [
+		"disk-to-crdt-existing",
+		"disk-to-crdt-seed",
+		"bound-file-local-only-divergence",
+		"bound-file-local-only-seed",
+		"bound-file-open-idle-disk-recovery",
+		"bound-file-open-idle-seed",
+	]) {
+		assert(
+			branchSrc.includes(`"${literal}"`),
+			`FrontmatterIngestBlockBranch includes "${literal}"`,
+		);
+	}
+
+	// RecoverySkippedReason carries every reason the controller emits today.
+	const reasonTypeMatch = flight.match(
+		/export type RecoverySkippedReason =\s*([\s\S]*?);/,
+	);
+	assert(reasonTypeMatch !== null, "RecoverySkippedReason declaration parses");
+	const reasonSrc = reasonTypeMatch?.[1] ?? "";
+	for (const literal of [
+		"crdt-current-no-op",
+		"recovery-lock-active",
+		"recent-editor-activity",
+		"frontmatter-ingest-blocked",
+	]) {
+		assert(
+			reasonSrc.includes(`"${literal}"`),
+			`RecoverySkippedReason includes "${literal}"`,
+		);
+	}
+
+	// Controller imports the typed exports from the taxonomy module
+	// (production code does NOT redeclare a local copy of the branch type).
+	assert(
+		reconciliation.includes("FrontmatterIngestBlockBranch"),
+		"controller references FrontmatterIngestBlockBranch",
+	);
+	assert(
+		reconciliation.includes("RecoverySkippedFrontmatterData"),
+		"controller uses the typed RecoverySkippedFrontmatterData payload",
+	);
+	assert(
+		!reconciliation.includes("type FrontmatterIngestBlockBranch ="),
+		"controller does NOT redeclare FrontmatterIngestBlockBranch locally",
+	);
+
+	// Helper exists and the helper is the only emitter of the new reason
+	// value (one declaration of the literal in the helper plus the typed
+	// payload above brings the count to two; six call sites do not contain
+	// the literal directly).
+	assert(
+		reconciliation.includes("private recordFrontmatterIngestBlocked("),
+		"ReconciliationController defines recordFrontmatterIngestBlocked helper",
+	);
+	assert(
+		reconciliation.includes('reason: "frontmatter-ingest-blocked"'),
+		"helper builds payload with reason: \"frontmatter-ingest-blocked\"",
+	);
+
+	// Helper is invoked exactly six times (once per block site).
+	const helperInvocations = reconciliation.match(/this\.recordFrontmatterIngestBlocked\(/g) ?? [];
+	assert(
+		helperInvocations.length === 6,
+		`recordFrontmatterIngestBlocked invoked exactly six times in controller (got ${helperInvocations.length})`,
+	);
+
+	// FLIGHT_TAXONOMY_VERSION is unchanged at 9 (no taxonomy bump).
+	assert(
+		flight.includes("export const FLIGHT_TAXONOMY_VERSION = 9"),
+		"FLIGHT_TAXONOMY_VERSION remains 9",
+	);
+}
+
 console.log("\n──────────────────────────────────────────────────");
 console.log(`Results: ${passed} passed, ${failed} failed`);
 console.log("──────────────────────────────────────────────────");
