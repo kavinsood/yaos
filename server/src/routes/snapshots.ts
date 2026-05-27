@@ -6,7 +6,6 @@ import {
 	listSnapshots,
 	applyRetention,
 	getLatestSnapshotIndex,
-	computeStructureHash,
 	type SnapshotResult,
 } from "../snapshot";
 import type { Env, JsonResponse } from "./types";
@@ -113,7 +112,7 @@ export async function handleSnapshotRoute(
 			estimatedStorageBytesLowerBound: fetchedBytes,
 			latestSnapshotId: latest?.snapshotId ?? null,
 			latestCreatedAt: latest?.createdAt ?? null,
-			pinnedCount: all.filter((s) => s.pinned).length,
+			pinnedCountLowerBound: all.filter((s) => s.pinned).length,
 		});
 	}
 
@@ -122,11 +121,21 @@ export async function handleSnapshotRoute(
 			return json({ error: "snapshots_unavailable" }, 503);
 		}
 
-		const result = await applyRetention(vaultId, env.YAOS_BUCKET);
+		let body: { pruneLegacy?: boolean } = {};
+		try {
+			body = await req.json();
+		} catch {
+			body = {};
+		}
+
+		const result = await applyRetention(vaultId, env.YAOS_BUCKET, undefined, {
+			pruneLegacy: body.pruneLegacy === true,
+		});
 		await options.recordVaultTrace(env, vaultId, "snapshot-retention-applied", {
 			kept: result.kept,
 			pruned: result.pruned,
 			failed: result.failed,
+			pruneLegacy: body.pruneLegacy === true,
 			errors: result.errors.slice(0, 10),
 		});
 		return json({ kept: result.kept, pruned: result.pruned, failed: result.failed });
@@ -167,7 +176,7 @@ async function createSnapshotFromLiveDoc(
 	vaultId: string,
 	triggeredBy: string | undefined,
 	fetchVaultDocument: (env: Env, vaultId: string) => Promise<Uint8Array>,
-): Promise<SnapshotResult & { structureUnchanged?: boolean }> {
+): Promise<SnapshotResult> {
 	if (!env.YAOS_BUCKET) {
 		return {
 			status: "unavailable",
@@ -189,15 +198,20 @@ async function createSnapshotFromLiveDoc(
 		pinned: true,
 	});
 
-	// Use structureHash for the "unchanged" hint. This honestly tells the user
-	// "the file structure hasn't changed" but does NOT claim content is identical.
-	const prevHash = previous?.structureHash ?? previous?.semanticHash;
-	const structureUnchanged = !!(prevHash && index.structureHash && prevHash === index.structureHash);
+	// Use fullUpdateHash for the "identical" check. This is meaningful:
+	// it means the entire CRDT state (including content and delete set) is
+	// byte-for-byte identical to the latest snapshot. Only then do we say
+	// "snapshot identical to latest."
+	const snapshotIdenticalToLatest = !!(
+		previous?.fullUpdateHash &&
+		index.fullUpdateHash &&
+		previous.fullUpdateHash === index.fullUpdateHash
+	);
 
 	return {
 		status: "created",
 		snapshotId: index.snapshotId,
 		index,
-		structureUnchanged,
+		snapshotIdenticalToLatest,
 	};
 }

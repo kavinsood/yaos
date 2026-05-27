@@ -51,8 +51,8 @@ export interface SnapshotResult {
 	snapshotId?: string;
 	reason?: string;
 	index?: SnapshotIndex;
-	/** True if manual snapshot has same structure as previous (content may differ). */
-	structureUnchanged?: boolean;
+	/** True if manual snapshot is byte-for-byte identical to latest. */
+	snapshotIdenticalToLatest?: boolean;
 }
 
 export interface CreateSnapshotOptions {
@@ -60,6 +60,16 @@ export interface CreateSnapshotOptions {
 	reason?: SnapshotReason;
 	/** Explicitly set pinned status. Defaults: manual=true, daily=false. */
 	pinned?: boolean;
+	/**
+	 * Precomputed raw CRDT update to avoid double-encoding.
+	 * If provided, createSnapshot will not call Y.encodeStateAsUpdate again.
+	 */
+	precomputedRawUpdate?: Uint8Array;
+	/**
+	 * Precomputed SHA-256 hex of the raw update.
+	 * Must correspond to precomputedRawUpdate if both are provided.
+	 */
+	precomputedFullUpdateHash?: string;
 }
 
 // -------------------------------------------------------------------
@@ -77,6 +87,18 @@ export const DEFAULT_RETENTION: RetentionPolicy = {
 	keepWeekly: 4,
 	keepMonthly: 12,
 };
+
+export interface RetentionOptions {
+	/**
+	 * If true, legacy snapshots (without a `reason` field) are eligible for
+	 * pruning. Default: false (legacy snapshots are conservatively kept).
+	 *
+	 * Only set this to true when the user explicitly requests pruning of
+	 * legacy snapshots (e.g., via a dedicated "prune legacy" command with
+	 * clear warnings).
+	 */
+	pruneLegacy?: boolean;
+}
 
 const SNAPSHOT_FETCH_CONCURRENCY = 4;
 
@@ -96,7 +118,7 @@ function generateSnapshotId(): string {
 	return `${ts}-${rand}`;
 }
 
-function snapshotPrefix(vaultId: string, day: string, snapshotId: string): string {
+export function snapshotPrefix(vaultId: string, day: string, snapshotId: string): string {
 	return `v1/${vaultId}/snapshots/${day}/${snapshotId}`;
 }
 
@@ -233,6 +255,26 @@ export async function getLatestSnapshotIndex(
 }
 
 /**
+ * Verify that the snapshot referenced by a latest-index pointer actually
+ * exists in storage (both payload and index objects are present).
+ *
+ * This prevents "poisoned pointer" scenarios where latest-index.json
+ * references a snapshot whose payload was never durably written.
+ */
+export async function verifySnapshotExists(
+	vaultId: string,
+	index: SnapshotIndex,
+	bucket: R2Bucket,
+): Promise<boolean> {
+	const prefix = snapshotPrefix(vaultId, index.day, index.snapshotId);
+	const [payloadHead, indexHead] = await Promise.all([
+		bucket.head(`${prefix}/crdt.bin.gz`),
+		bucket.head(`${prefix}/index.json`),
+	]);
+	return payloadHead !== null && indexHead !== null;
+}
+
+/**
  * Persist the latest snapshot index pointer for fast retrieval.
  * MUST be called only after payload and index are durably written.
  */
@@ -268,7 +310,8 @@ export async function createSnapshot(
 	const snapshotId = generateSnapshotId();
 	const prefix = snapshotPrefix(vaultId, day, snapshotId);
 
-	const rawUpdate = Y.encodeStateAsUpdate(ydoc);
+	// Use precomputed raw update if available (avoids double O(doc) encode)
+	const rawUpdate = opts.precomputedRawUpdate ?? Y.encodeStateAsUpdate(ydoc);
 	const compressed = gzipSync(rawUpdate);
 
 	const pathToId = ydoc.getMap<string>("pathToId");
@@ -284,9 +327,10 @@ export async function createSnapshot(
 		}
 	});
 
-	// Hash the already-encoded update (avoids double-encoding)
 	const [fullUpdateHash, structureHash] = await Promise.all([
-		sha256Hex(rawUpdate),
+		opts.precomputedFullUpdateHash
+			? Promise.resolve(opts.precomputedFullUpdateHash)
+			: sha256Hex(rawUpdate),
 		computeStructureHash(ydoc),
 	]);
 
@@ -387,6 +431,9 @@ export async function getSnapshotPayload(
 	snapshotId: string,
 	bucket: R2Bucket,
 ): Promise<{ index: SnapshotIndex; payload: Uint8Array } | null> {
+	// NOTE: Still does full listing by snapshot ID. Without a catalog or
+	// day-aware route, we must scan to find the day prefix for this ID.
+	// Known unbounded. Fix requires client passing day or a by-id index.
 	const { snapshots } = await listSnapshots(vaultId, bucket);
 	const index = snapshots.find((entry) => entry.snapshotId === snapshotId);
 	if (!index) return null;
@@ -409,13 +456,13 @@ export async function getSnapshotPayload(
 
 /**
  * Given a list of snapshot indexes (sorted newest-first), determine which
- * to keep and which to prune based on the default retention policy.
+ * to keep and which to prune based on the retention policy.
  *
  * Rules:
  *   - Always keep the latest snapshot.
  *   - Always keep pinned snapshots.
- *   - Never automatically prune legacy snapshots without a reason field
- *     (they may have been manual snapshots from before reason tracking).
+ *   - Unless pruneLegacy=true, keep all snapshots without a `reason` field
+ *     (they may be old manual snapshots from before reason tracking).
  *   - Keep all snapshots from the last `keepDays` days.
  *   - Keep the newest snapshot per rough week for `keepWeekly` weeks.
  *   - Keep the newest snapshot per month for `keepMonthly` months.
@@ -425,9 +472,11 @@ export function selectRetention(
 	snapshots: SnapshotIndex[],
 	policy: RetentionPolicy = DEFAULT_RETENTION,
 	now: Date = new Date(),
+	options: RetentionOptions = {},
 ): { keep: SnapshotIndex[]; prune: SnapshotIndex[] } {
 	if (snapshots.length === 0) return { keep: [], prune: [] };
 
+	const { pruneLegacy = false } = options;
 	const keepSet = new Set<string>();
 
 	// Always keep latest
@@ -438,15 +487,18 @@ export function selectRetention(
 		if (s.pinned) keepSet.add(s.snapshotId);
 	}
 
-	// Protect legacy snapshots: if no reason field, assume potentially manual.
-	// Only prune snapshots that we explicitly know are "daily" (automated).
+	// Protect legacy snapshots unless explicitly asked to prune them.
+	if (!pruneLegacy) {
+		for (const s of snapshots) {
+			if (!s.reason) {
+				keepSet.add(s.snapshotId);
+			}
+		}
+	}
+
+	// Keep all non-daily reasons (manual, pre-upgrade, etc.) regardless
 	for (const s of snapshots) {
-		if (!s.reason) {
-			// Legacy snapshot — no metadata about how it was created.
-			// Conservatively keep it. Users can prune via manual command.
-			keepSet.add(s.snapshotId);
-		} else if (s.reason !== "daily") {
-			// Explicit non-daily reason: keep (manual, pre-upgrade, etc.)
+		if (s.reason && s.reason !== "daily") {
 			keepSet.add(s.snapshotId);
 		}
 	}
@@ -537,9 +589,10 @@ export async function applyRetention(
 	vaultId: string,
 	bucket: R2Bucket,
 	policy: RetentionPolicy = DEFAULT_RETENTION,
+	options: RetentionOptions = {},
 ): Promise<{ kept: number; pruned: number; failed: number; errors: string[] }> {
 	const { snapshots: all } = await listSnapshots(vaultId, bucket);
-	const { keep, prune } = selectRetention(all, policy);
+	const { keep, prune } = selectRetention(all, policy, new Date(), options);
 	if (prune.length === 0) return { kept: keep.length, pruned: 0, failed: 0, errors: [] };
 	const result = await pruneSnapshots(vaultId, prune, bucket);
 	return { kept: keep.length, pruned: result.deleted, failed: result.failed, errors: result.errors };

@@ -49,9 +49,11 @@ export interface SnapshotResult {
 	reason?: string;
 	index?: SnapshotIndex;
 	error?: string;
-	/** True if the manual snapshot has the same file structure as the previous one. */
+	/** True if the snapshot is byte-for-byte identical to the latest snapshot. */
+	snapshotIdenticalToLatest?: boolean;
+	/** @deprecated Use snapshotIdenticalToLatest */
 	structureUnchanged?: boolean;
-	/** @deprecated Use structureUnchanged */
+	/** @deprecated Use snapshotIdenticalToLatest */
 	semanticUnchanged?: boolean;
 }
 
@@ -279,7 +281,7 @@ export interface SnapshotStatus {
 	estimatedStorageBytesLowerBound: number;
 	latestSnapshotId: string | null;
 	latestCreatedAt: string | null;
-	pinnedCount: number;
+	pinnedCountLowerBound: number;
 }
 
 export async function getSnapshotStatus(

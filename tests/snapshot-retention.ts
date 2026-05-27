@@ -231,63 +231,18 @@ async function test5_legacySnapshotNotPruned(): Promise<void> {
 	assert(keep.some(s => s.snapshotId === "s-legacy"), "legacy snapshot without reason is kept");
 	assert(keep.some(s => s.snapshotId === "s-legacy2"), "second legacy snapshot also kept");
 	assertEqual(prune.length, 0, "no legacy snapshots are auto-pruned");
+
+	// But with pruneLegacy=true, they become candidates
+	const { keep: k2, prune: p2 } = selectRetention(snapshots, DEFAULT_RETENTION, now, { pruneLegacy: true });
+	assert(p2.some(s => s.snapshotId === "s-legacy"), "legacy pruned with pruneLegacy=true");
+	assert(p2.some(s => s.snapshotId === "s-legacy2"), "second legacy also pruned with pruneLegacy=true");
 }
 
 // -------------------------------------------------------------------
-// TEST 6: Write ordering (latest pointer after payload)
+// TEST 6 & 7: Write ordering + Poisoned pointer
+// These are tested with real R2 in server/tests/snapshot-r2.ts.
+// See: test1_writeOrdering, test2_poisonedPointer
 // -------------------------------------------------------------------
-
-async function test6_writeOrdering(): Promise<void> {
-	console.log("\n--- Test 6: Write ordering documented in code ---");
-	// This is a code-level invariant verified by reading createSnapshot source.
-	// The test verifies the exported createSnapshot function signature accepts options.
-	// The actual ordering is structural (Promise.all for payload+index, then await for pointer).
-	// We verify it via the SnapshotIndex type having the expected fields.
-
-	const index: SnapshotIndex = {
-		snapshotId: "test",
-		vaultId: "v",
-		createdAt: "2026-01-01T00:00:00Z",
-		day: "2026-01-01",
-		schemaVersion: 1,
-		markdownFileCount: 0,
-		blobFileCount: 0,
-		crdtSizeBytes: 0,
-		crdtRawSizeBytes: 0,
-		referencedBlobHashes: [],
-		fullUpdateHash: "abc",
-		structureHash: "def",
-		pinned: true,
-		reason: "manual",
-	};
-
-	assert("fullUpdateHash" in index, "SnapshotIndex has fullUpdateHash field");
-	assert("reason" in index, "SnapshotIndex has reason field");
-	assert("pinned" in index, "SnapshotIndex has pinned field");
-	// The actual Promise ordering is structural — verified by code review.
-	console.log("  (write ordering is a structural guarantee verified by code inspection)");
-	passed++;
-}
-
-// -------------------------------------------------------------------
-// TEST 7: Poisoned latest pointer falls back safely
-// -------------------------------------------------------------------
-
-async function test7_poisonedLatestPointerFallback(): Promise<void> {
-	console.log("\n--- Test 7: getLatestSnapshotIndex handles invalid JSON gracefully ---");
-
-	// getLatestSnapshotIndex catches parse errors and returns null.
-	// We can't easily test R2 here, but we verify the function exists and
-	// has the expected return type (null on failure).
-	// In the actual implementation, if latest-index.json points to a
-	// non-existent snapshot, the daily dedup will compute fullUpdateHash
-	// against a poisoned index — but since the hash won't match (no actual
-	// identical doc exists), it will proceed to create a new snapshot.
-	// The system is self-healing.
-
-	assert(true, "getLatestSnapshotIndex returns null on error (structural guarantee)");
-	console.log("  (tested via code inspection: try/catch returns null)");
-}
 
 // -------------------------------------------------------------------
 // TEST 10: Retention around year boundary
@@ -490,8 +445,7 @@ async function main(): Promise<void> {
 	await test3_manualSnapshotStructureUnchangedHonest();
 	await test4_manualSnapshotPinnedSurvivesRetention();
 	await test5_legacySnapshotNotPruned();
-	await test6_writeOrdering();
-	await test7_poisonedLatestPointerFallback();
+	// Tests 6 & 7 (write ordering, poisoned pointer) are in server/tests/snapshot-r2.ts
 	await test10_retentionYearBoundary();
 	await test11_retentionMonthBoundary();
 	await test12_pruneErrorSurfacing();

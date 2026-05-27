@@ -8,6 +8,7 @@ import {
 	createSnapshot,
 	hasSnapshotForDay,
 	getLatestSnapshotIndex,
+	verifySnapshotExists,
 	computeFullUpdateHash,
 	applyRetention,
 	type SnapshotResult,
@@ -23,6 +24,7 @@ import {
 import { trySendSvEcho, type SvEchoSendResult } from "./svEcho";
 import { isUpdateBearingSyncMessage } from "./syncMessageClassifier";
 import { bytesToHex } from "./hex";
+import { sha256Hex } from "./hex";
 import {
 	PersistenceCoordinator,
 	type PersistenceHealth,
@@ -600,13 +602,54 @@ export class VaultSyncServer extends YServer {
 				// Cost: O(doc size) to encode + hash. Acceptable at daily frequency.
 				const latest = await getLatestSnapshotIndex(vaultId, bucket);
 				if (latest?.fullUpdateHash) {
-					const currentHash = await computeFullUpdateHash(this.document);
+					const rawUpdate = Y.encodeStateAsUpdate(this.document);
+					const currentHash = await sha256Hex(rawUpdate);
 					if (latest.fullUpdateHash === currentHash) {
-						return {
-							status: "noop",
-							reason: "No changes since last snapshot (full CRDT state identical)",
-						} satisfies SnapshotResult;
+						// Before skipping: verify the pointed snapshot actually exists.
+						// A poisoned latest pointer (payload never written) would
+						// otherwise cause us to skip forever.
+						const exists = await verifySnapshotExists(vaultId, latest, bucket);
+						if (exists) {
+							return {
+								status: "noop",
+								reason: "No changes since last snapshot (full CRDT state identical)",
+							} satisfies SnapshotResult;
+						}
+						// Pointer is poisoned — fall through to create a new snapshot.
+						// The precomputed update is still valid, pass it along.
 					}
+					// Hash changed — create snapshot. Pass precomputed values to avoid re-encoding.
+					const index = await createSnapshot(
+						this.document,
+						vaultId,
+						bucket,
+						{
+							triggeredBy,
+							reason: "daily",
+							pinned: false,
+							precomputedRawUpdate: rawUpdate,
+							precomputedFullUpdateHash: currentHash,
+						},
+					);
+
+					// Retention: await so failures are observable.
+					try {
+						const retentionResult = await applyRetention(vaultId, bucket);
+						if (retentionResult.failed > 0) {
+							console.error(
+								`${LOG_PREFIX} retention: ${retentionResult.failed} delete(s) failed:`,
+								retentionResult.errors.slice(0, 5),
+							);
+						}
+					} catch (err) {
+						console.error(`${LOG_PREFIX} retention failed:`, err);
+					}
+
+					return {
+						status: "created",
+						snapshotId: index.snapshotId,
+						index,
+					} satisfies SnapshotResult;
 				} else if (latest?.stateVectorHash) {
 					// Transitional: old snapshot has stateVectorHash but no fullUpdateHash.
 					// Cannot safely skip — state vector misses deletes.
@@ -629,8 +672,7 @@ export class VaultSyncServer extends YServer {
 					{ triggeredBy, reason: "daily", pinned: false },
 				);
 
-				// Retention: await it so failures are observable, but do not
-				// fail the snapshot creation response. Log errors for diagnostics.
+				// Retention: await so failures are observable.
 				try {
 					const retentionResult = await applyRetention(vaultId, bucket);
 					if (retentionResult.failed > 0) {

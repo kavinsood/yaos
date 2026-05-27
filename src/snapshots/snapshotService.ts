@@ -85,8 +85,8 @@ export class SnapshotService {
 				this.deps.getTraceHttpContext(),
 			);
 			if (result.status === "created" && result.index) {
-				const unchangedNote = (result.structureUnchanged || result.semanticUnchanged)
-					? " (note: file structure unchanged since last snapshot — content may still differ)"
+				const unchangedNote = result.snapshotIdenticalToLatest
+					? " (note: identical to latest snapshot)"
 					: "";
 				new Notice(
 					`Snapshot created: ${result.index.markdownFileCount} notes, ` +
