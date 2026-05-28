@@ -461,54 +461,59 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				trace: (source, msg, details) => this.trace(source, msg, details),
 				onFlightEvent: (event) => this.recordFlightEvent(event as import("./debug/flightEvents").FlightEventInput),
 				onFlightPathEvent: (event) => this.recordFlightPathEvent(event),
-				getSocketTicket: (() => {
-					// Each VaultSync instance gets its own ticket cache.  The cache
-					// is discarded when VaultSync is torn down and recreated.
-					const ticketCache = createSocketTicketCache();
-					const self = this;
-					return async (): Promise<string | null> => {
-						const socketTicketAuth =
-							self.capabilityUpdateService?.capabilities?.socketTicketAuth;
+			getSocketTicket: (() => {
+				// Each VaultSync instance gets its own ticket cache.  The cache
+				// is discarded when VaultSync is torn down and recreated.
+				const ticketCache = createSocketTicketCache();
+				const self = this;
+				return async (force = false): Promise<{ value: string; expiresAt: number } | null> => {
+					const socketTicketAuth =
+						self.capabilityUpdateService?.capabilities?.socketTicketAuth;
 
-						// Known old server that explicitly signals no ticket support.
-						if (socketTicketAuth === false) return null;
+					// Known old server that explicitly signals no ticket support.
+					if (socketTicketAuth === false) return null;
 
-						// Already confirmed this server does not have the ticket
-						// endpoint — skip the network probe.
-						if (ticketCache.isUnsupported()) return null;
+					// Already confirmed this server does not have the ticket
+					// endpoint — skip the network probe.
+					if (ticketCache.isUnsupported()) return null;
 
-						// socketTicketAuth === true  → confirmed support.
-						// socketTicketAuth === undefined → capability not yet fetched
-						//   (first run, empty cache, slow background poll).
-						// Both: try the ticket endpoint.
-						//
-						// On a clean "endpoint not found" signal (404/405/501) from an
-						// unknown-capability server, mark the cache unsupported and fall
-						// back to ?token= for this connection.  Any other failure (auth,
-						// network, 5xx) must propagate — never silently downgrade to the
-						// long-lived token.
-						try {
-							return await ticketCache.get(
-								self.settings.host,
-								self.settings.token,
-								self.settings.vaultId,
-							);
-						} catch (err) {
-							if (
-								socketTicketAuth === undefined
-								&& isTicketEndpointUnsupported(err)
-							) {
-								// Old server confirmed: stop probing on future reconnects.
-								ticketCache.markUnsupported();
-								self.log("socket ticket endpoint not found; using legacy ?token= for this connection");
-								return null;
-							}
-							// Real failure — propagate.
-							self.log(`socket ticket fetch failed: ${String(err)}`);
-							throw err;
+					// socketTicketAuth === true  → confirmed support.
+					// socketTicketAuth === undefined → capability not yet fetched
+					//   (first run, empty cache, slow background poll).
+					// Both: try the ticket endpoint.
+					//
+					// On a clean "endpoint not found" signal (404/405/501) from an
+					// unknown-capability server, mark the cache unsupported and fall
+					// back to ?token= for this connection.  Any other failure (auth,
+					// network, 5xx) must propagate — never silently downgrade to the
+					// long-lived token.
+					//
+					// force=true is used by VaultSync's proactive refresh timer to
+					// bypass the cache and always obtain a fresh ticket.
+					if (force) ticketCache.invalidate();
+
+					try {
+						return await ticketCache.get(
+							self.settings.host,
+							self.settings.token,
+							self.settings.vaultId,
+						);
+					} catch (err) {
+						if (
+							socketTicketAuth === undefined
+							&& isTicketEndpointUnsupported(err)
+						) {
+							// Old server confirmed: stop probing on future reconnects.
+							ticketCache.markUnsupported();
+							self.log("socket ticket endpoint not found; using legacy ?token= for this connection");
+							return null;
 						}
-					};
-				})(),
+						// Real failure — propagate.
+						self.log(`socket ticket fetch failed: ${String(err)}`);
+						throw err;
+					}
+				};
+			})(),
 			});
 
 			// 2. EditorBindingManager

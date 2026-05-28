@@ -19,6 +19,7 @@ import {
 import type { CandidateStore, ScopeKey, ScopeMetadata } from "./candidateStore";
 import { FLIGHT_KIND } from "../debug/flightEvents";
 import type { FlightPathEventInput } from "../debug/flightEvents";
+import { TICKET_REFRESH_BUFFER_MS, patchTicketInUrl } from "./socketTicket";
 
 /** Current schema version. Stored in sys.schemaVersion. */
 export const SCHEMA_VERSION = 2;
@@ -190,6 +191,16 @@ export class VaultSync {
 	private readonly onFlightEvent?: (event: Record<string, unknown>) => void;
 	private readonly onFlightPathEvent?: (event: FlightPathEventInput) => void;
 
+	/**
+	 * Stored callback for obtaining (and force-refreshing) short-lived tickets.
+	 * Kept on the instance so the proactive refresh timer can call it after
+	 * the constructor's params() closure is no longer in scope.
+	 */
+	private _getSocketTicket: ((force?: boolean) => Promise<{ value: string; expiresAt: number } | null>) | null = null;
+
+	/** Timer handle for the proactive provider URL ticket refresh. */
+	private _socketTicketRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+
 	constructor(
 		settings: VaultSyncSettings,
 		options?: {
@@ -197,6 +208,18 @@ export class VaultSync {
 			trace?: TraceRecord;
 			onFlightEvent?: (event: Record<string, unknown>) => void;
 			onFlightPathEvent?: (event: FlightPathEventInput) => void;
+			/**
+			 * Optional callback returning a short-lived WebSocket ticket.
+			 * Called once during initial connection via async params().
+			 * After that, VaultSync proactively refreshes provider.url via a
+			 * timer so reconnects always find a live ticket — y-partyserver's
+			 * internal reconnect loop reuses provider.url directly without
+			 * re-calling params().
+			 *
+			 * Pass force=true to bypass the ticket cache and always fetch fresh.
+			 * If the callback returns null the provider falls back to ?token=.
+			 */
+			getSocketTicket?: (force?: boolean) => Promise<{ value: string; expiresAt: number } | null>;
 		},
 	) {
 		this.debug = settings.debug;
@@ -250,20 +273,43 @@ export class VaultSync {
 				// Open failure is already captured above.
 			});
 
-		const params: Record<string, string> = {
-			token: settings.token,
-			schemaVersion: String(SCHEMA_VERSION),
-		};
-		if (options?.traceContext) {
-			params.device = options.traceContext.deviceName;
-			params.trace = options.traceContext.traceId;
-			params.boot = options.traceContext.bootId;
-		}
+		this._getSocketTicket = options?.getSocketTicket ?? null;
+		const longLivedToken = settings.token;
 		const syncPrefix = `/vault/sync/${encodeURIComponent(roomId)}`;
 
 		this.provider = new YSyncProvider(settings.host, roomId, this.ydoc, {
 			prefix: syncPrefix,
-			params,
+			params: async () => {
+				// Build base params (schema version + optional trace context).
+				const p: Record<string, string> = {
+					schemaVersion: String(SCHEMA_VERSION),
+				};
+				if (options?.traceContext) {
+					p.device = options.traceContext.deviceName;
+					p.trace = options.traceContext.traceId;
+					p.boot = options.traceContext.bootId;
+				}
+				// Prefer a short-lived ticket when available; fall back to the
+				// long-lived token for servers that do not yet support tickets.
+				//
+				// NOTE: this callback is invoked once by YProvider.connect() on
+				// initial connection.  y-partyserver's internal reconnect loop
+				// (setupWS) reuses provider.url directly without re-calling
+				// params().  VaultSync keeps provider.url fresh via
+				// scheduleSocketTicketRefresh so reconnects always carry a live
+				// ticket.  See engineering/zero-config-auth.md § "Reconnect
+				// behavior" and engineering/warts-and-limits.md § "Pragmatic
+				// compromises".
+				const ticketResult = this._getSocketTicket ? await this._getSocketTicket() : null;
+				if (ticketResult) {
+					p.ticket = ticketResult.value;
+					// Schedule proactive URL refresh before this ticket expires.
+					this.scheduleSocketTicketRefresh(ticketResult);
+				} else {
+					p.token = longLivedToken;
+				}
+				return p;
+			},
 			connect: false,
 			maxBackoffTime: MAX_BACKOFF_TIME_MS,
 		});
@@ -287,6 +333,12 @@ export class VaultSync {
 			if (event.status === "connected") {
 				this._connectionGeneration++;
 				this.log(`Connection generation: ${this._connectionGeneration}`);
+			} else if (event.status === "disconnected" && this._getSocketTicket) {
+				// Best-effort: refresh provider.url before the reconnect timer fires.
+				// The proactive timer (scheduleSocketTicketRefresh) is the primary
+				// mechanism; this handles edge cases like laptop sleep where the
+				// disconnect happens without the timer having had a chance to fire.
+				void this.refreshProviderTicketUrl(true);
 			}
 		});
 
@@ -1729,9 +1781,81 @@ export class VaultSync {
 		});
 	}
 
+	// -------------------------------------------------------------------
+	// Socket ticket proactive refresh
+	// -------------------------------------------------------------------
+
+	/**
+	 * Schedule a timer to refresh provider.url with a fresh ticket before the
+	 * current one expires.  Fires at expiresAt - TICKET_REFRESH_BUFFER_MS,
+	 * which is the same threshold the cache uses to decide a ticket is stale.
+	 *
+	 * This is the primary mechanism ensuring reconnects use a live ticket.
+	 * y-partyserver's setupWS loop reads provider.url directly without
+	 * re-calling the async params() callback.
+	 */
+	private scheduleSocketTicketRefresh(ticket: { value: string; expiresAt: number }): void {
+		this.clearSocketTicketRefreshTimer();
+		const msUntilRefresh = Math.max(5_000, ticket.expiresAt - Date.now() - TICKET_REFRESH_BUFFER_MS);
+		this._socketTicketRefreshTimer = setTimeout(() => {
+			this._socketTicketRefreshTimer = null;
+			void this.refreshProviderTicketUrl(true);
+		}, msUntilRefresh);
+	}
+
+	private clearSocketTicketRefreshTimer(): void {
+		if (this._socketTicketRefreshTimer !== null) {
+			clearTimeout(this._socketTicketRefreshTimer);
+			this._socketTicketRefreshTimer = null;
+		}
+	}
+
+	/**
+	 * Replace the ticket value in provider.url, removing any legacy ?token=.
+	 * Preserves all other query params (schemaVersion, _pk, device, trace, boot).
+	 */
+	private patchProviderTicket(value: string): void {
+		try {
+			this.provider.url = patchTicketInUrl(this.provider.url, value);
+			this.log("socket ticket refreshed in provider URL");
+		} catch (err) {
+			this.log(`patchProviderTicket: failed to update provider URL: ${formatUnknown(err)}`);
+		}
+	}
+
+	/**
+	 * Fetch a fresh ticket (optionally bypassing the cache) and patch
+	 * provider.url.  Reschedules the refresh timer on success.
+	 * On transient failure, retries after TICKET_REFRESH_BUFFER_MS so the
+	 * proactive refresh cycle survives intermittent network errors.
+	 */
+	private async refreshProviderTicketUrl(force = false): Promise<void> {
+		if (!this._getSocketTicket) return;
+		try {
+			const ticket = await this._getSocketTicket(force);
+			if (ticket) {
+				this.patchProviderTicket(ticket.value);
+				this.scheduleSocketTicketRefresh(ticket);
+			}
+		} catch (err) {
+			this.log(`socket ticket refresh failed: ${formatUnknown(err)}`);
+			// Clear any existing timer before scheduling the retry so we never
+			// lose a handle and fire duplicate refreshes.  This matters when the
+			// disconnected best-effort path calls here while the proactive timer
+			// is already scheduled: without the clear, the proactive timer
+			// handle is overwritten but the timer still fires.
+			this.clearSocketTicketRefreshTimer();
+			this._socketTicketRefreshTimer = setTimeout(() => {
+				this._socketTicketRefreshTimer = null;
+				void this.refreshProviderTicketUrl(true);
+			}, TICKET_REFRESH_BUFFER_MS);
+		}
+	}
+
 	async destroy(): Promise<void> {
 		this.log("Destroying VaultSync");
 		if (this._renameTimer) clearTimeout(this._renameTimer);
+		this.clearSocketTicketRefreshTimer();
 		this.clearPendingRenames();
 		await this.flushReceiptPersistence();
 
