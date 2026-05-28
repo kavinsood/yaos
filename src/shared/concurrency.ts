@@ -1,11 +1,9 @@
 /**
  * Bounded-concurrency parallel map.
  *
- * SOURCE OF TRUTH: src/shared/concurrency.ts
- *
- * This file exists because the server build boundary (server/tsconfig.json)
- * cannot import from the client src/ tree. The function body must remain
- * identical to the canonical implementation. If you change one, change both.
+ * This is the single canonical implementation. If a copy exists elsewhere
+ * (e.g. server/src/concurrency.ts), it must be kept byte-identical to this
+ * function body or replaced with a re-export when build boundaries allow.
  */
 export async function mapWithConcurrency<T, R>(
 	items: readonly T[],
