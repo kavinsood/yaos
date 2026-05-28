@@ -1,4 +1,5 @@
 import type { VaultSyncServer } from "../server";
+import type { StoredServerConfig } from "../config";
 
 export interface Env {
 	SYNC_TOKEN?: string;
@@ -29,8 +30,23 @@ export type JsonResponse = (body: unknown, status?: number) => Response;
 
 export type AuthState =
 	| { mode: "env"; claimed: true; envToken: string }
-	| { mode: "claim"; claimed: true; tokenHash: string }
-	| { mode: "unclaimed"; claimed: false };
+	| { mode: "claim"; claimed: true; tokenHash: string; config?: StoredServerConfig }
+	| { mode: "unclaimed"; claimed: false; config?: StoredServerConfig };
+
+/**
+ * Narrower variant returned by getAuthStateCached().  Claim/unclaimed modes
+ * always carry the full StoredServerConfig (required, not optional) because
+ * the cached path fetches it once and attaches it to the state.  This avoids
+ * the "optional config" footgun where callers can't tell whether config is
+ * present without checking.
+ *
+ * AuthStateCached is assignable to AuthState — all existing handlers that
+ * accept AuthState continue to work when called with AuthStateCached values.
+ */
+export type AuthStateCached =
+	| { mode: "env"; claimed: true; envToken: string }
+	| { mode: "claim"; claimed: true; tokenHash: string; config: StoredServerConfig }
+	| { mode: "unclaimed"; claimed: false; config: StoredServerConfig };
 
 export type FatalAuthCode = "unauthorized" | "server_misconfigured" | "unclaimed" | "update_required";
 
