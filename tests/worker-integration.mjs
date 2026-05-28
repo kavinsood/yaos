@@ -115,15 +115,19 @@ async function main() {
 			persistDir,
 			"--log-level",
 			"error",
+			// Short ticket TTL for the ws-ticket-reconnect smoke test — allows
+			// post-expiry reconnect to be exercised in seconds, not 5 minutes.
+			"--var",
+			"YAOS_TICKET_TTL_MS:8000",
 		],
 		{
 			cwd: resolve("server"),
 			stdio: ["ignore", "pipe", "pipe"],
 			env: {
 				...process.env,
-				CLOUDFLARE_INCLUDE_PROCESS_ENV: "true",
-				CLOUDFLARE_LOAD_DEV_VARS_FROM_DOT_ENV: "false",
-				SYNC_TOKEN: envToken,
+			CLOUDFLARE_INCLUDE_PROCESS_ENV: "true",
+			CLOUDFLARE_LOAD_DEV_VARS_FROM_DOT_ENV: "false",
+			SYNC_TOKEN: envToken,
 			},
 		},
 	);
@@ -171,6 +175,9 @@ async function main() {
 		], token);
 		await runCommand("node", [
 			"tests/hardening-worker.mjs",
+		], token);
+		await runCommand("node", [
+			"tests/ws-ticket-reconnect.mjs",
 		], token);
 	} catch (err) {
 		if (output.trim()) {
