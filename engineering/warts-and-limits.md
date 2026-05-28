@@ -100,7 +100,9 @@ This is a contained hack, explicitly documented, and should be replaced if upstr
 
 These are deliberate compromises to preserve correctness and operability in real environments:
 
-- WebSocket auth currently accepts query param token flow because browser/WebView socket APIs make header-based auth inconsistent in practice. We keep this bounded via explicit server checks and fail-closed behavior, but treat it as transitional architecture.
+- WebSocket auth uses short-lived HMAC-signed tickets (`?ticket=`) instead of the long-lived bearer token.  Old clients are still accepted via `?token=` during the migration window; set `YAOS_DISABLE_LEGACY_WS_TOKEN=true` in `wrangler.toml` once all clients have upgraded.  Ticket signing currently derives the HMAC key from the existing auth secret (token or tokenHash) rather than a dedicated per-server signing secret; the correct long-term fix is a random secret generated at claim time and stored in the Config DO.
+
+- `y-partyserver`'s `YProvider.connect()` evaluates async `params()` once and mutates `provider.url` in place.  The internal reconnect loop (`setupWS`) reuses `provider.url` directly on every subsequent reconnect without re-calling `params()`.  This means a ticket placed in `provider.url` on initial connection will be stale after its 5-minute TTL.  The workaround is `scheduleSocketTicketRefresh` in `VaultSync`: a proactive timer fires at `expiresAt - TICKET_REFRESH_BUFFER_MS` and patches `provider.url` via `patchTicketInUrl` before the old ticket expires.  A secondary best-effort patch fires on `"disconnected"` status events.  **If `y-partyserver` is upgraded, verify whether this behavior has changed** — if the library ever re-calls `params()` on reconnect, the proactive timer becomes harmless redundancy rather than a required correctness fix.
 - Filesystem-facing sync paths are intentionally mixed:
   markdown ingest uses a dirty-set drain loop for backpressure-aware coalescing,
   while some blob paths keep quiet-window checks because partial attachment reads are costlier and noisier than text edits.

@@ -134,6 +134,44 @@ outcome" section of the spec.
 
 ## Manual / operational followups
 
+### WebSocket ticket auth: real reconnect smoke test required before release
+
+The reconnect fix (proactive `provider.url` refresh via `scheduleSocketTicketRefresh`) is unit-tested at the URL-patching and error-classification level, but the integration behavior has not been observed against a live `YSyncProvider`.
+
+Required before release:
+
+1. Start server and plugin.
+2. Confirm initial WebSocket connection uses `?ticket=` (not `?token=`).
+3. Either wait until `TICKET_REFRESH_BUFFER_MS` before expiry, or temporarily lower ticket TTL in a test build.
+4. Force a WebSocket disconnect (network drop, server bounce, or `provider.ws.close()`).
+5. Confirm the reconnect succeeds without plugin reload.
+6. Confirm the reconnect URL contains a new ticket value, not the original one.
+
+This is the release gate. Not more architecture.
+
+### WebSocket ticket auth: sleep/wake or long-idle smoke test required before release
+
+Normal Obsidian users close laptops, background phones, and switch Wi-Fi. The disconnect best-effort refresh races the first 100ms reconnect attempt and may lose. Later retries should use the patched URL.
+
+Required: observe one of the following succeed without plugin reload:
+- Laptop sleep longer than ticket TTL (5 minutes), then wake.
+- Disable network for longer than TTL, then restore.
+- Manually close WebSocket after ticket expiry.
+
+Expected behavior: reconnect eventually succeeds (possibly after one or two failed attempts) without requiring reload.
+
+### WebSocket ticket auth: strict-mode smoke test required before release
+
+`YAOS_DISABLE_LEGACY_WS_TOKEN=true` must be tested with a real deployment before the migration-complete announcement.
+
+Required:
+1. Deploy server with `YAOS_DISABLE_LEGACY_WS_TOKEN = "true"` set in `wrangler.toml`.
+2. Connect a new (ticket-aware) plugin — should connect successfully via `?ticket=`.
+3. Connect an old (pre-ticket) plugin — should be rejected with HTTP 401 before the Durable Object wakes.
+4. Confirm the Worker log contains `ws rejected pre-auth` for the old client, not a DO error.
+
+This gate only applies when operators are ready to close the legacy migration window.  It is not required for the initial ticket-auth release (where the flag remains commented out).
+
 ### WebSocket upgrade runtime path remains only partially covered
 
 The pre-auth runtime tests cover the non-WebSocket path well. The Cloudflare-only

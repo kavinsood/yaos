@@ -23,30 +23,70 @@ When deployed, the YAOS server boots into an "Unclaimed" state.
 
 For subsequent authentication, the plugin uses `Authorization: Bearer <token>` for HTTP endpoints.
 
-For WebSocket sync transport, YAOS currently includes the token as a query parameter for compatibility across browser/WebView socket APIs. This is an explicit, documented compromise for v1 and should be replaced by an explicit post-connect auth handshake in a future revision.
+For WebSocket sync transport, the plugin uses **short-lived connection tickets** issued by the server.  Before opening a WebSocket connection the plugin calls `POST /vault/:vaultId/auth/ticket` with the long-lived bearer token in the Authorization header.  The server returns a ticket valid for 5 minutes, scoped to the specific vault, and signed with HMAC-SHA256.  Only the ticket appears in the WebSocket URL query parameter — the long-lived token never touches a URL.
 
-## Current transport model (v1)
+Old plugin versions that predate ticket auth continue to work during the migration window: the server accepts either a valid ticket (`?ticket=`) or a valid long-lived token (`?token=`) and emits a warning to Worker logs when the legacy path is used.
+
+## Current transport model
 
 - HTTP routes (`/vault/*`, setup helpers, snapshot APIs) authenticate with `Authorization: Bearer <token>`.
-- WebSocket sync (`/vault/sync/:room`) currently accepts a query token for compatibility with constrained mobile/webview environments.
+- WebSocket sync (`/vault/sync/:room`) authenticates with a short-lived `?ticket=` signed by the server.  Legacy `?token=` is accepted during the migration window.
 - All traffic is expected over HTTPS/WSS in normal deployment.
 
-## Threat model notes (v1)
+## Ticket auth detail
 
-This compromise is acceptable for YAOS v1's current self-hosted model when:
+The server issues tickets at `POST /vault/:vaultId/auth/ticket` (requires valid Bearer auth).  The ticket payload is:
 
-- TLS is enabled end-to-end (HTTPS/WSS).
-- Server/operator logs are private and access-controlled.
-- The shared token is treated as a secret and rotated when exposed.
+```json
+{ "v": 1, "aud": "yaos-ws", "vaultId": "...", "iat": <ms>, "exp": <ms>, "nonce": "<random>" }
+```
 
-It is still not ideal because URL parameters can appear in application/server logs, browser debugging surfaces, and proxy instrumentation. For that reason, query-token auth should be treated as transitional rather than final architecture.
+Signed as `base64url(payload).base64url(HMAC-SHA256(signingKey, base64url(payload)))`.  The signing key is derived from the server's existing auth secret so no additional deployment secret is required.
 
-## Planned hardening (post-v1)
+The plugin caches the ticket and refreshes it when less than 30 seconds remain, so reconnects reuse a valid cached ticket without an extra HTTP round-trip.
 
-- Move WebSocket auth to an explicit post-connect handshake frame.
-- Prefer short-lived session credentials derived from the long-lived setup token.
+## Reconnect behavior and the y-partyserver constraint
+
+`YProvider.connect()` evaluates the async `params()` callback exactly once, mutates `provider.url` with the result, then calls the base `WebsocketProvider.connect()`.  The internal reconnect loop (`setupWS`) reads `provider.url` directly on every subsequent reconnect without re-invoking `params()`.
+
+This means the ticket inserted on the initial connection would become stale after its 5-minute TTL, causing all reconnects after that point to present an expired ticket and receive 401 responses — permanently, until plugin reload.
+
+The fix is a proactive refresh manager in `VaultSync`:
+
+1. After the initial `params()` call succeeds with a ticket, `scheduleSocketTicketRefresh` sets a timer at `expiresAt - TICKET_REFRESH_BUFFER_MS` (i.e. 30 seconds before expiry).
+2. When the timer fires, it calls the ticket callback with `force=true`, which bypasses the cache and fetches a fresh ticket from the server.
+3. `patchProviderTicket` replaces `?ticket=` in `provider.url` with the new value and removes any legacy `?token=` if present.  Other query parameters (schemaVersion, `_pk`, trace context) are preserved.
+4. The timer reschedules itself based on the new ticket's `expiresAt`.
+5. On every `"disconnected"` status event, a best-effort refresh also fires before the internal reconnect timer retries.  This secondary path handles sleep/wake and abrupt network drops where the proactive timer may not have fired in time.  It races the first reconnect attempt (100ms backoff), but subsequent retries will use the updated URL.
+
+The `force=true` flag causes `ticketCache.invalidate()` to run before `ticketCache.get()`, guaranteeing a network fetch rather than returning the still-cached (but about-to-expire) ticket.
+
+If `y-partyserver` is upgraded, verify whether this behavior has changed — see also `engineering/warts-and-limits.md`.
+
+## Threat model notes
+
+The long-lived token is no longer placed in any URL.  A leaked ticket is bounded by the 5-minute TTL — useless by the time a log rotation or audit sees it.
+
+For legacy clients still using `?token=`, the risk profile is unchanged from v1: acceptable when TLS is enabled end-to-end and server logs are access-controlled.
+
+## Migration path: disabling legacy token auth
+
+Once all plugin clients in your deployment have upgraded to the ticket-aware version (identifiable by Worker logs no longer containing `"legacy ?token= WebSocket auth"`), set the operator flag to close the legacy path permanently:
+
+```toml
+# server/wrangler.toml
+[vars]
+YAOS_DISABLE_LEGACY_WS_TOKEN = "true"
+```
+
+When set, connections using `?token=` are rejected with 401 before the vault Durable Object is woken.  Ticket-authenticated connections are unaffected.
+
+The `wrangler.toml` included with the server contains this setting as a commented-out example with upgrade guidance.
+
+## Planned hardening (post-current)
+
+- Replace `tokenHash`-as-signing-key with a random per-server ticket signing secret generated at claim time and stored in the Config DO.  This removes the promotion of the token verifier hash to signing authority.  Existing deployments would backfill lazily on next claim.
 - Ensure auth material is redacted from traces and diagnostics by default.
-- Add an operator option to disable query-token WebSocket auth once clients support handshake auth.
 
 For the broader list of accepted compromises and tracked debt, see
 `engineering/warts-and-limits.md`.
