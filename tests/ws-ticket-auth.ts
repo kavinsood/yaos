@@ -173,9 +173,10 @@ console.log("\n--- handleTicketRoute: issues ticket for authenticated caller ---
 	});
 	const res = await handleTicketRoute(req, ENV_AUTH, VAULT_ID, json);
 	assertEqual(res.status, 200, "ticket route returns 200");
-	const body = await res.json() as { ticket?: unknown; expiresAt?: unknown };
+	const body = await res.json() as { ticket?: unknown; expiresAt?: unknown; ttlMs?: unknown };
 	assert(typeof body.ticket === "string", "response includes ticket string");
 	assert(typeof body.expiresAt === "number", "response includes expiresAt number");
+	assert(typeof body.ttlMs === "number", "response includes ttlMs number");
 	// Verify the issued ticket is actually valid.
 	const valid = await verifyTicket(body.ticket as string, ENV_AUTH, VAULT_ID);
 	assert(valid, "issued ticket verifies correctly");

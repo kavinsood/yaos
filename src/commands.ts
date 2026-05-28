@@ -256,6 +256,14 @@ export function registerCommands(
 	});
 
 	registrar.addCommand({
+		id: "snapshot-prune",
+		name: "Cleanup old snapshots (apply retention policy)",
+		callback: async () => {
+			await host.getSnapshotService()?.pruneSnapshots();
+		},
+	});
+
+	registrar.addCommand({
 		id: "nuclear-reset",
 		name: "Nuclear reset (wipe sync state and reseed from disk)",
 		callback: () => {

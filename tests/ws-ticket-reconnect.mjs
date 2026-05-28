@@ -61,10 +61,14 @@ async function fetchTicket(vaultId) {
 		throw new Error(`ticket fetch failed (${res.status})${body ? `: ${body}` : ""}`);
 	}
 	const json = await res.json();
-	if (typeof json?.ticket !== "string" || typeof json?.expiresAt !== "number") {
+	if (
+		typeof json?.ticket !== "string" ||
+		typeof json?.expiresAt !== "number" ||
+		typeof json?.ttlMs !== "number"
+	) {
 		throw new Error(`malformed ticket response: ${JSON.stringify(json)}`);
 	}
-	return { ticket: json.ticket, expiresAt: json.expiresAt };
+	return { ticket: json.ticket, expiresAt: json.expiresAt, ttlMs: json.ttlMs };
 }
 
 /**
@@ -168,8 +172,8 @@ function waitForReconnected(provider, label) {
 
 console.log("\n=== Test 1: initial connect uses ?ticket= ===");
 {
-	const { ticket, expiresAt } = await fetchTicket(ROOM_ID);
-	const ttlRemaining = expiresAt - Date.now();
+	const { ticket, ttlMs } = await fetchTicket(ROOM_ID);
+	const ttlRemaining = ttlMs;
 	console.log(`  ticket fetched; TTL remaining: ${ttlRemaining}ms`);
 	if (ttlRemaining < 500) throw new Error("Test 1: ticket expired immediately — check YAOS_TICKET_TTL_MS");
 
@@ -287,8 +291,8 @@ console.log("\n=== Test 2: patched provider.url used on reconnect ===");
 
 console.log("\n=== Test 3: post-expiry reconnect (sleep/wake simulation) ===");
 {
-	const { ticket: ticketA, expiresAt } = await fetchTicket(ROOM_ID);
-	const ttl = expiresAt - Date.now();
+	const { ticket: ticketA, ttlMs } = await fetchTicket(ROOM_ID);
+	const ttl = ttlMs;
 	console.log(`  ticket TTL: ${ttl}ms — waiting for expiry...`);
 
 	const ydoc = new Y.Doc();

@@ -34,6 +34,12 @@ export interface SnapshotIndex {
 	crdtRawSizeBytes: number;
 	referencedBlobHashes: string[];
 	triggeredBy?: string;
+	stateVectorHash?: string;
+	semanticHash?: string;
+	structureHash?: string;
+	fullUpdateHash?: string;
+	pinned?: boolean;
+	reason?: string;
 }
 
 export interface SnapshotResult {
@@ -43,6 +49,12 @@ export interface SnapshotResult {
 	reason?: string;
 	index?: SnapshotIndex;
 	error?: string;
+	/** True if the snapshot is byte-for-byte identical to the latest snapshot. */
+	snapshotIdenticalToLatest?: boolean;
+	/** @deprecated Use snapshotIdenticalToLatest */
+	structureUnchanged?: boolean;
+	/** @deprecated Use snapshotIdenticalToLatest */
+	semanticUnchanged?: boolean;
 }
 
 /**
@@ -238,14 +250,108 @@ export async function requestSnapshotNow(
 // -------------------------------------------------------------------
 
 /**
- * List all available snapshots, newest first.
+ * List all available snapshots, newest first (bounded by server limit).
+ * Handles both old server (returns { snapshots: [...] }) and new server
+ * (returns { snapshots, totalIndexKeys, fetchedCount, limited } with ?format=v2).
  */
 export async function listSnapshots(
 	settings: VaultSyncSettings,
 	trace?: TraceHttpContext,
 ): Promise<SnapshotIndex[]> {
-	const result = await serverGet(settings, "snapshots", trace) as { snapshots: SnapshotIndex[] };
-	return result.snapshots ?? [];
+	const result = await serverGet(settings, "snapshots?limit=50", trace);
+	return normalizeSnapshotListResponse(result);
+}
+
+/**
+ * Normalize a raw snapshot list response into a SnapshotIndex array.
+ * Handles: bare array, { snapshots: [...] }, or { snapshots: [...], ...metadata }.
+ */
+export function normalizeSnapshotListResponse(raw: unknown): SnapshotIndex[] {
+	if (Array.isArray(raw)) return raw as SnapshotIndex[];
+	if (raw && typeof raw === "object" && "snapshots" in raw) {
+		const arr = (raw as { snapshots?: unknown }).snapshots;
+		if (Array.isArray(arr)) return arr as SnapshotIndex[];
+	}
+	return [];
+}
+
+/**
+ * Request server-side retention pruning.
+ */
+export async function requestPrune(
+	settings: VaultSyncSettings,
+	trace?: TraceHttpContext,
+): Promise<{ kept: number; pruned: number; failed: number }> {
+	return await serverPost(settings, "snapshots/prune", {}, trace) as { kept: number; pruned: number; failed: number };
+}
+
+/**
+ * Get snapshot storage status summary.
+ * Handles both old servers (snapshotCount, estimatedStorageBytes, pinnedCount)
+ * and new servers (LowerBound suffixed fields). Prefers new fields when available.
+ */
+export interface SnapshotStatus {
+	snapshotCountLowerBound: number;
+	listedSnapshotCount: number;
+	listingLimited: boolean;
+	estimatedStorageBytesLowerBound: number;
+	latestSnapshotId: string | null;
+	latestCreatedAt: string | null;
+	pinnedCountLowerBound: number;
+}
+
+export async function getSnapshotStatus(
+	settings: VaultSyncSettings,
+	trace?: TraceHttpContext,
+): Promise<SnapshotStatus> {
+	const raw = await serverGet(settings, "snapshots/status", trace);
+	return normalizeSnapshotStatusResponse(raw);
+}
+
+/**
+ * Normalize a raw status response into SnapshotStatus.
+ * Falls back to old field names (snapshotCount, estimatedStorageBytes, pinnedCount)
+ * when new LowerBound-suffixed fields are absent.
+ */
+export function normalizeSnapshotStatusResponse(raw: unknown): SnapshotStatus {
+	if (!raw || typeof raw !== "object") {
+		return {
+			snapshotCountLowerBound: 0,
+			listedSnapshotCount: 0,
+			listingLimited: false,
+			estimatedStorageBytesLowerBound: 0,
+			latestSnapshotId: null,
+			latestCreatedAt: null,
+			pinnedCountLowerBound: 0,
+		};
+	}
+	const r = raw as Record<string, unknown>;
+	return {
+		snapshotCountLowerBound:
+			(r.snapshotCountLowerBound as number) ?? (r.snapshotCount as number) ?? 0,
+		listedSnapshotCount:
+			(r.listedSnapshotCount as number) ?? (r.snapshotCount as number) ?? 0,
+		listingLimited:
+			(r.listingLimited as boolean) ?? false,
+		estimatedStorageBytesLowerBound:
+			(r.estimatedStorageBytesLowerBound as number) ?? (r.estimatedStorageBytes as number) ?? 0,
+		latestSnapshotId:
+			(r.latestSnapshotId as string | null) ?? null,
+		latestCreatedAt:
+			(r.latestCreatedAt as string | null) ?? null,
+		pinnedCountLowerBound:
+			(r.pinnedCountLowerBound as number) ?? (r.pinnedCount as number) ?? 0,
+	};
+}
+
+/**
+ * Normalize the "identical to latest" field from a manual snapshot response.
+ * Handles both new (snapshotIdenticalToLatest) and old (semanticUnchanged) field names.
+ */
+export function normalizeSnapshotUnchanged(raw: unknown): boolean {
+	if (!raw || typeof raw !== "object") return false;
+	const r = raw as Record<string, unknown>;
+	return !!(r.snapshotIdenticalToLatest ?? r.semanticUnchanged);
 }
 
 // -------------------------------------------------------------------

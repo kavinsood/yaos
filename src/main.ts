@@ -466,7 +466,12 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				// is discarded when VaultSync is torn down and recreated.
 				const ticketCache = createSocketTicketCache();
 				const self = this;
-				return async (force = false): Promise<{ value: string; expiresAt: number } | null> => {
+				return async (force = false): Promise<{
+					value: string;
+					expiresAt: number;
+					localExpiresAt: number;
+					ttlMs: number;
+				} | null> => {
 					const socketTicketAuth =
 						self.capabilityUpdateService?.capabilities?.socketTicketAuth;
 
@@ -899,7 +904,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					// "no suppression active and our last write was either
 					// long ago or never"; "unknown" is the fallback when
 					// the diskMirror is not yet wired (early-startup race).
-					const dm = this.getDiskMirror();
+						const dm = this.diskMirror;
 					const suppressWindowActive = !!dm?.isSuppressed(file.path);
 					const lastDiskWriteOkAtMs = dm?.getLastDiskWriteOkAt(file.path) ?? null;
 					const dtSinceWrite = lastDiskWriteOkAtMs === null
@@ -1944,8 +1949,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		}
 
 	private async saveDiskIndex(): Promise<void> {
-		this.lastDiskIndexPersistedAt = Date.now();
-		await this.persistPluginState();
+		const persistedAt = Date.now();
+		await this.persistPluginState((state) => {
+			state._lastDiskIndexPersistedAt = persistedAt;
+		});
+		this.lastDiskIndexPersistedAt = persistedAt;
 	}
 
 	private async persistBlobQueueSnapshot(snapshot: BlobQueueSnapshot): Promise<void> {

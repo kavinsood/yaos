@@ -7,7 +7,9 @@ import {
 	listSnapshots as fetchSnapshotList,
 	requestDailySnapshot,
 	requestSnapshotNow,
+	requestPrune,
 	restoreFromSnapshot,
+	normalizeSnapshotUnchanged,
 	type SnapshotIndex,
 } from "../sync/snapshotClient";
 import { VaultSync } from "../sync/vaultSync";
@@ -84,10 +86,15 @@ export class SnapshotService {
 				this.deps.getTraceHttpContext(),
 			);
 			if (result.status === "created" && result.index) {
+				// Handle both new and old server response field names
+				const identical = normalizeSnapshotUnchanged(result);
+				const unchangedNote = identical
+					? " (note: identical to latest snapshot)"
+					: "";
 				new Notice(
 					`Snapshot created: ${result.index.markdownFileCount} notes, ` +
 					`${result.index.blobFileCount} attachments ` +
-					`(${Math.round(result.index.crdtSizeBytes / 1024)} KB)`,
+					`(${Math.round(result.index.crdtSizeBytes / 1024)} KB)${unchangedNote}`,
 				);
 			} else if (result.status === "unavailable") {
 				new Notice(`Snapshot unavailable: ${result.reason ?? "R2 not configured"}`);
@@ -137,6 +144,41 @@ export class SnapshotService {
 		} catch (err) {
 			console.error("[yaos] Failed to list snapshots:", err);
 			new Notice(`Failed to list snapshots: ${formatUnknown(err)}`);
+		}
+	}
+
+	/**
+	 * Run server-side retention pruning. Exposed as a user command.
+	 */
+	async pruneSnapshots(): Promise<void> {
+		if (!this.deps.getServerSupportsSnapshots()) {
+			new Notice("Snapshots are unavailable until object storage is configured on the server.");
+			return;
+		}
+		const vaultSync = this.deps.getVaultSync();
+		if (!vaultSync?.connected) {
+			new Notice("Not connected to server.");
+			return;
+		}
+
+		new Notice("Running snapshot cleanup...");
+		try {
+			const result = await requestPrune(
+				this.deps.getSettings(),
+				this.deps.getTraceHttpContext(),
+			);
+			if (result.pruned === 0) {
+				new Notice("No snapshots to prune — retention policy already satisfied.");
+			} else {
+				new Notice(
+					`Cleanup complete: ${result.pruned} old snapshot(s) removed, ${result.kept} retained.` +
+					(result.failed > 0 ? ` (${result.failed} failed)` : ""),
+				);
+			}
+			this.deps.log(`Snapshot prune: kept=${result.kept} pruned=${result.pruned} failed=${result.failed}`);
+		} catch (err) {
+			console.error("[yaos] Snapshot prune failed:", err);
+			new Notice(`Snapshot cleanup failed: ${formatUnknown(err)}`);
 		}
 	}
 

@@ -740,7 +740,15 @@ export class ReconciliationController {
 						//   baseline null    → unknown           → preserve-conflict/missing-baseline
 						const baselineHash = this.deps.getDiskIndex()[path]?.contentHash ?? null;
 						const diskMtimeRaw = allStats.get(path)?.mtime;
-						const lastDiskIndexPersistedAt = this.deps.getLastSaveDiskIndexAt?.() ?? undefined;
+						const rawLastSave = this.deps.getLastSaveDiskIndexAt?.();
+						const now = Date.now();
+						const lastDiskIndexPersistedAt =
+							typeof rawLastSave === "number" &&
+							Number.isFinite(rawLastSave) &&
+							rawLastSave > 0 &&
+							rawLastSave <= now
+								? rawLastSave
+								: undefined;
 						const decision = decideClosedFileConflict({
 							baselineHash,
 							diskHash,

@@ -42,6 +42,14 @@ const TICKET_AUD = "yaos-ws";
 /** Default TTL.  Long enough for slow mobile reconnects; short enough to
  *  limit the damage from a logged value. */
 export const TICKET_TTL_MS = 5 * 60 * 1_000; // 5 minutes
+const MAX_REASONABLE_TICKET_TTL_MS = 24 * 60 * 60 * 1_000; // 24 hours
+
+function readTicketTtlMs(raw: string | undefined): number {
+	if (!raw) return TICKET_TTL_MS;
+	const parsed = Number(raw);
+	if (!Number.isFinite(parsed)) return TICKET_TTL_MS;
+	return Math.min(MAX_REASONABLE_TICKET_TTL_MS, Math.max(1_000, Math.floor(parsed)));
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -94,7 +102,7 @@ export async function createTicket(
 	authState: AuthState,
 	vaultId: string,
 	ttlMs = TICKET_TTL_MS,
-): Promise<{ ticket: string; expiresAt: number }> {
+): Promise<{ ticket: string; expiresAt: number; ttlMs: number }> {
 	const key = await deriveSigningKey(authState);
 	if (!key) throw new Error("cannot sign ticket: server is unclaimed");
 
@@ -123,6 +131,7 @@ export async function createTicket(
 	return {
 		ticket: `${encodedPayload}.${encodedSig}`,
 		expiresAt: exp,
+		ttlMs,
 	};
 }
 
@@ -222,14 +231,12 @@ export async function handleTicketRoute(
 	json: (body: unknown, status?: number) => Response,
 	env?: Env,
 ): Promise<Response> {
-	try {
-		// Allow a short test TTL override so the integration harness can exercise
-		// the proactive refresh path without waiting 5 minutes.
-		const ttlMs = env?.YAOS_TICKET_TTL_MS
-			? Math.max(1_000, parseInt(env.YAOS_TICKET_TTL_MS, 10))
-			: TICKET_TTL_MS;
-		const result = await createTicket(authState, vaultId, ttlMs);
-		return json(result);
+		try {
+			// Allow a short test TTL override so the integration harness can exercise
+			// the proactive refresh path without waiting 5 minutes.
+			const ttlMs = readTicketTtlMs(env?.YAOS_TICKET_TTL_MS);
+			const result = await createTicket(authState, vaultId, ttlMs);
+			return json(result);
 	} catch (err) {
 		const message = err instanceof Error ? err.message : "ticket creation failed";
 		console.error("[yaos-sync:worker] ticket creation error:", message);

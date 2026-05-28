@@ -68,10 +68,13 @@ export function isTicketEndpointUnsupported(err: unknown): boolean {
  * is in place before the current one becomes unusable.
  */
 export const TICKET_REFRESH_BUFFER_MS = 30_000;
+const MAX_REASONABLE_TICKET_TTL_MS = 24 * 60 * 60 * 1_000; // 24 hours
 
 export interface CachedSocketTicket {
 	value: string;
 	expiresAt: number;
+	localExpiresAt: number;
+	ttlMs: number;
 }
 
 export interface SocketTicketCache {
@@ -111,7 +114,7 @@ export function createSocketTicketCache(): SocketTicketCache {
 				throw new SocketTicketHttpError(404); // already confirmed missing
 			}
 			const now = Date.now();
-			if (cached && cached.expiresAt - now > TICKET_REFRESH_BUFFER_MS) {
+			if (cached && cached.localExpiresAt - now > TICKET_REFRESH_BUFFER_MS) {
 				return cached;
 			}
 			const fresh = await fetchSocketTicket(host, token, vaultId);
@@ -171,10 +174,23 @@ async function fetchSocketTicket(
 		throw new SocketTicketHttpError(res.status);
 	}
 
-	const body = res.json as { ticket?: unknown; expiresAt?: unknown };
-	if (typeof body?.ticket !== "string" || typeof body?.expiresAt !== "number") {
+	const body = res.json as { ticket?: unknown; expiresAt?: unknown; ttlMs?: unknown };
+	if (
+		typeof body?.ticket !== "string" ||
+		typeof body?.expiresAt !== "number" ||
+		typeof body?.ttlMs !== "number" ||
+		!Number.isFinite(body.ttlMs) ||
+		body.ttlMs <= 0 ||
+		body.ttlMs > MAX_REASONABLE_TICKET_TTL_MS
+	) {
 		throw new Error("socket ticket response malformed");
 	}
 
-	return { value: body.ticket, expiresAt: body.expiresAt };
+	const receivedAt = Date.now();
+	return {
+		value: body.ticket,
+		expiresAt: body.expiresAt,
+		localExpiresAt: receivedAt + body.ttlMs,
+		ttlMs: body.ttlMs,
+	};
 }

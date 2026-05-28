@@ -196,7 +196,12 @@ export class VaultSync {
 	 * Kept on the instance so the proactive refresh timer can call it after
 	 * the constructor's params() closure is no longer in scope.
 	 */
-	private _getSocketTicket: ((force?: boolean) => Promise<{ value: string; expiresAt: number } | null>) | null = null;
+	private _getSocketTicket: ((force?: boolean) => Promise<{
+		value: string;
+		expiresAt: number;
+		localExpiresAt: number;
+		ttlMs: number;
+	} | null>) | null = null;
 
 	/** Timer handle for the proactive provider URL ticket refresh. */
 	private _socketTicketRefreshTimer: ReturnType<typeof setTimeout> | null = null;
@@ -219,7 +224,12 @@ export class VaultSync {
 			 * Pass force=true to bypass the ticket cache and always fetch fresh.
 			 * If the callback returns null the provider falls back to ?token=.
 			 */
-			getSocketTicket?: (force?: boolean) => Promise<{ value: string; expiresAt: number } | null>;
+				getSocketTicket?: (force?: boolean) => Promise<{
+					value: string;
+					expiresAt: number;
+					localExpiresAt: number;
+					ttlMs: number;
+				} | null>;
 		},
 	) {
 		this.debug = settings.debug;
@@ -1794,9 +1804,16 @@ export class VaultSync {
 	 * y-partyserver's setupWS loop reads provider.url directly without
 	 * re-calling the async params() callback.
 	 */
-	private scheduleSocketTicketRefresh(ticket: { value: string; expiresAt: number }): void {
+	private scheduleSocketTicketRefresh(ticket: {
+		value: string;
+		expiresAt: number;
+		localExpiresAt: number;
+		ttlMs: number;
+	}): void {
 		this.clearSocketTicketRefreshTimer();
-		const msUntilRefresh = Math.max(5_000, ticket.expiresAt - Date.now() - TICKET_REFRESH_BUFFER_MS);
+		const ttlRemaining = ticket.localExpiresAt - Date.now();
+		const buffer = Math.min(TICKET_REFRESH_BUFFER_MS, Math.floor(ttlRemaining / 2));
+		const msUntilRefresh = Math.max(250, ttlRemaining - buffer);
 		this._socketTicketRefreshTimer = setTimeout(() => {
 			this._socketTicketRefreshTimer = null;
 			void this.refreshProviderTicketUrl(true);
