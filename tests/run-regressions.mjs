@@ -126,6 +126,10 @@ const suites = [
 	[JITI, "tests/snapshot-retention.ts"],
 	[JITI, "tests/snapshot-compat.ts"],
 	[NODE, "tests/snapshot-r2-runner.mjs"],
+	// Autophagy: shared utilities and policy modules
+	[JITI, "tests/map-with-concurrency.ts"],
+	[JITI, "tests/rename-admission-policy.ts"],
+	[JITI, "tests/rename-admission-wiring.ts"],
 ];
 
 let totalPassed = 0;

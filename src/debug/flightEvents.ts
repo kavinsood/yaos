@@ -88,6 +88,8 @@ export const FLIGHT_KIND = {
 
 	// Disk — rename
 	diskRenameObserved: "disk.rename.observed",
+	/** Emitted when an excluded markdown destination reaches applyRenameBatch despite admission policy. Bug. */
+	renameAdmissionInvariantFailed: "rename.admission.invariant_failed",
 
 	// CRDT
 	crdtFileCreated: "crdt.file.created",

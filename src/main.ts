@@ -15,6 +15,8 @@ import {
 	type ServerCapabilities,
 } from "./sync/serverCapabilities";
 import { isMarkdownSyncable, isBlobSyncable } from "./types";
+import { admitMarkdownPath } from "./sync/policy/pathAdmissionPolicy";
+import { decideRenameAdmission, planRenameAction } from "./sync/policy/renameAdmissionPolicy";
 import {
 	type FrontmatterValidationResult,
 } from "./sync/frontmatterGuard";
@@ -728,21 +730,30 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					this.reconciliationController.redirectPendingDirtyPath(oldPath, newPath);
 				}
 
-				// Tombstone any CRDT entries that applyRenameBatch moved to an excluded path,
-				// and drop any dirty work redirected there.
-				//
-				// Contract: the caller must never leave an excluded path active in CRDT.
-				// applyRenameBatch has no access to path exclusion rules, so the caller
-				// enforces policy here after every flush.
-				//
-				// dropDirtyPath is unconditional — "excluded path" means "do not sync this
-				// path", regardless of whether a CRDT identity exists there. The tombstone
-				// only fires if applyRenameBatch actually promoted a fileId to newPath.
+				// Defensive assertion: after rename admission policy (enforced at
+				// queue time), applyRenameBatch should never contain an excluded
+				// markdown destination. If one slips through, fail loudly in QA mode
+				// and tombstone as a production fallback.
 				for (const [, newPath] of renames) {
-					if (!this.isMarkdownPathSyncable(newPath)) {
+					if (!this.isMarkdownPathSyncable(newPath) && newPath.endsWith(".md")) {
+						const msg = `[BUG] onRenameBatchFlushed: excluded markdown destination reached applyRenameBatch: "${newPath}"`;
+						if (this.settings.qaDebugMode) {
+							throw new Error(msg);
+						}
+						this.log(`${msg} — tombstoning as fallback`);
+						this.recordFlightPathEvent({
+							priority: "critical",
+							kind: FLIGHT_KIND.renameAdmissionInvariantFailed,
+							severity: "error",
+							scope: "file",
+							source: "vaultEvents",
+							layer: "policy",
+							opId: undefined,
+							path: newPath,
+							data: { bug: "excluded-destination-reached-applyRenameBatch" },
+						});
 						this.reconciliationController.dropDirtyPath(newPath);
 						if (this.vaultSync?.getFileId(newPath)) {
-							this.log(`onRenameBatchFlushed: tombstoning excluded destination "${newPath}"`);
 							this.vaultSync.handleDelete(newPath);
 						}
 					}
@@ -950,24 +961,27 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			}),
 		);
 
-		// Rename: use batched queueRename for atomic folder renames.
-		// Both markdown and blob files go through the same rename batch
-		// since folder renames affect both types atomically.
+		// Rename: apply admission policy BEFORE queueing to ensure
+		// applyRenameBatch never receives an excluded markdown destination.
+		// Blob renames still go through the batch (blob exclusion is separate).
 		this.registerEvent(
 			this.app.vault.on("rename", (file, oldPath) => {
 				if (!this.reconciliationController.isReconciled) return;
 				if (!(file instanceof TFile)) return;
-				// Rename is relevant if either the old or new path is syncable
-				const newSyncable = this.isMarkdownPathSyncable(file.path)
-					|| this.isBlobPathSyncable(file.path);
-				const oldSyncable = this.isMarkdownPathSyncable(oldPath)
-					|| this.isBlobPathSyncable(oldPath);
-				if (!newSyncable && !oldSyncable) return;
+
+				const isOldBlob = this.isBlobPathSyncable(oldPath);
+				const isNewBlob = this.isBlobPathSyncable(file.path);
+				const isOldMd = this.isMarkdownPathSyncable(oldPath);
+				const isNewMd = this.isMarkdownPathSyncable(file.path);
+
+				// Skip entirely if neither path is syncable in either dimension.
+				if (!isOldMd && !isNewMd && !isOldBlob && !isNewBlob) return;
+
 				const renameOpId = this.newOpId();
-				if (this.isMarkdownPathSyncable(oldPath) || this.isMarkdownPathSyncable(file.path)) {
-					// Emit two disk.rename.observed events sharing the same opId so the
-					// analyzer can reconstruct full old→new lineage without raw paths.
-					// Both are tracked by pendingPathPromises and flushed before export.
+
+				// --- Markdown admission ---
+				if (isOldMd || isNewMd) {
+					// Emit trace events for the rename (both sides, for lineage).
 					this.recordFlightPathEvent({
 						priority: "important",
 						kind: FLIGHT_KIND.diskRenameObserved,
@@ -976,8 +990,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						source: "vaultEvents",
 						layer: "disk",
 						opId: renameOpId,
-						path: oldPath,   // resolves to oldPathId
-						data: { renameRole: "source", wasMarkdownSyncable: this.isMarkdownPathSyncable(oldPath) },
+						path: oldPath,
+						data: { renameRole: "source", wasMarkdownSyncable: isOldMd },
 					});
 					this.recordFlightPathEvent({
 						priority: "important",
@@ -987,12 +1001,51 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						source: "vaultEvents",
 						layer: "disk",
 						opId: renameOpId,
-						path: file.path, // resolves to newPathId
-						data: { renameRole: "target", isBlobSyncable: this.isBlobPathSyncable(file.path) },
+						path: file.path,
+						data: { renameRole: "target", isBlobSyncable: isNewBlob },
 					});
+
+					// Decide admission before any CRDT mutation.
+					const oldAdmission = admitMarkdownPath(oldPath, this.excludePatterns, this.getRuntimeConfig().vaultConfigDir);
+					const newAdmission = admitMarkdownPath(file.path, this.excludePatterns, this.getRuntimeConfig().vaultConfigDir);
+					const decision = decideRenameAdmission({ oldPath, newPath: file.path, oldAdmission, newAdmission });
+					const action = planRenameAction(decision);
+
+					// Execute the planned action.
+					switch (action.kind) {
+						case "queue-rename":
+							this.vaultSync?.queueRename(action.oldPath, action.newPath);
+							this.log(`Rename queued (syncable→syncable): "${oldPath}" -> "${file.path}"`);
+							break;
+
+						case "tombstone-old":
+							for (const p of action.dropDirty) this.reconciliationController.dropDirtyPath(p);
+							this.vaultSync?.handleDelete(action.oldPath, this.settings.deviceName, renameOpId);
+							this.log(`Rename admission: tombstoning old path (destination excluded): "${oldPath}" -> "${file.path}"`);
+							break;
+
+						case "admit-new":
+							for (const p of action.dropDirty) this.reconciliationController.dropDirtyPath(p);
+							this.reconciliationController.markMarkdownDirty(file, "create", renameOpId);
+							this.log(`Rename admission: admitting new path (source excluded): "${oldPath}" -> "${file.path}"`);
+							break;
+
+						case "ignore":
+							this.log(`Rename admission: ignoring (excluded→excluded): "${oldPath}" -> "${file.path}"`);
+							break;
+					}
 				}
-				this.vaultSync?.queueRename(oldPath, file.path);
-				this.log(`Rename queued: "${oldPath}" -> "${file.path}"`);
+
+				// --- Blob admission ---
+				// Blob renames still use the batch path. Only queue if at least one
+				// side is blob-syncable AND this is NOT a markdown path (markdown
+				// paths are never blob-syncable by definition in isBlobSyncable,
+				// but guard explicitly to prevent category confusion).
+				const isBlobOnlyRename = (isOldBlob || isNewBlob) && !isOldMd && !isNewMd;
+				if (isBlobOnlyRename) {
+					this.vaultSync?.queueRename(oldPath, file.path);
+					this.log(`Rename queued (blob): "${oldPath}" -> "${file.path}"`);
+				}
 			}),
 		);
 
