@@ -87,18 +87,26 @@ console.log("\n--- Test 1b: rejectAndLogUnauthorizedVaultRequest (index.ts) logs
 	);
 }
 
-console.log("\n--- Test 2: handleSyncSocketRoute rejects without DO trace writes pre-auth ---");
+console.log("\n--- Test 2: handleSyncSocketRoute has no recordVaultTrace calls at all ---");
 {
 	const source = readFileSync(syncSocketPath, "utf8");
 	const body = extractFunctionBody(source, "handleSyncSocketRoute");
 	assert(body !== null, "handleSyncSocketRoute declaration is parseable");
 
-	// The function as a whole DOES call recordVaultTrace post-auth (for
-	// schema-skew rejection and ws-connected). What must hold is that the
-	// three pre-auth rejection branches — !authState.claimed,
-	// authState.mode === "env" && !authState.envToken, and
-	// !(await isAuthorized(...)) — do not emit recordVaultTrace before
-	// returning.
+	// Issue #40 Phase 2 fix: ALL WebSocket admission events (ws-connected,
+	// ws-rejected) were moved to console-only logging.  The function must
+	// contain zero recordVaultTrace calls.  A reconnect storm must not
+	// produce a YAOS_SYNC trace write on every socket open/reject.
+	//
+	// Historical note: the function previously called recordVaultTrace for
+	// ws-connected (every successful connect) and ws-rejected (post-auth
+	// schema-skew).  Both were removed in the issue #40 amplification fix.
+	assert(
+		body !== null && !/recordVaultTrace\s*\(/.test(body),
+		"handleSyncSocketRoute body contains no recordVaultTrace calls (INV-SEC-01, INV-OBS-02)",
+	);
+
+	// Redundantly verify the pre-auth slice specifically — belt-and-suspenders.
 	const preAuthSlice = body?.split(/if\s*\(\s*!\s*clientSchema\s*\)/)[0] ?? "";
 	assert(
 		preAuthSlice.length > 0,

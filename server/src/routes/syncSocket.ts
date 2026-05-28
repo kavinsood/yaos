@@ -1,7 +1,7 @@
 import { getServerByName } from "partyserver";
 import { getSocketAuthToken, isAuthorized } from "./auth";
 import { json, withCors } from "./http";
-import { fetchVaultSchemaVersion, recordVaultTrace } from "./trace";
+import { fetchVaultSchemaVersion } from "./trace";
 import { verifyTicket } from "./ticket";
 import type { AuthState, Env, FatalAuthCode } from "./types";
 
@@ -183,11 +183,18 @@ export async function handleSyncSocketRoute(
 	}
 
 	if (!clientSchema) {
-		await recordVaultTrace(env, vaultId, "ws-rejected", {
-			reason: "update_required",
-			detail: "invalid_client_schema",
-			rawSchema: url.searchParams.get("schemaVersion") ?? url.searchParams.get("schema") ?? null,
-		});
+		// WebSocket admission events must not write to YAOS_SYNC storage
+		// (issue #40 — a schema-mismatch loop would hammer the DO on every
+		// reconnect attempt).  Log only via console for worker-level visibility.
+		console.warn(
+			`[yaos-sync:worker] ws rejected (update_required): ` +
+			JSON.stringify({
+				vaultIdHint: vaultId.slice(0, 8),
+				reason: "update_required",
+				detail: "invalid_client_schema",
+				rawSchema: url.searchParams.get("schemaVersion") ?? url.searchParams.get("schema") ?? null,
+			}),
+		);
 		return returnSocketResponse(req, rejectSocket(req, "update_required", {
 			reason: "invalid_client_schema",
 			clientSchemaVersion: null,
@@ -197,13 +204,19 @@ export async function handleSyncSocketRoute(
 
 	const roomSchemaVersion = await fetchVaultSchemaVersion(env, vaultId);
 	if (roomSchemaVersion !== null && clientSchema.version < roomSchemaVersion) {
-		await recordVaultTrace(env, vaultId, "ws-rejected", {
-			reason: "update_required",
-			detail: "client_schema_older_than_room",
-			clientSchemaVersion: clientSchema.version,
-			clientSchemaSource: clientSchema.source,
-			roomSchemaVersion,
-		});
+		// Schema-skew rejection — console only, no YAOS_SYNC write (issue #40).
+		// A retry loop here would otherwise fan out one DO subrequest per attempt.
+		console.warn(
+			`[yaos-sync:worker] ws rejected (update_required): ` +
+			JSON.stringify({
+				vaultIdHint: vaultId.slice(0, 8),
+				reason: "update_required",
+				detail: "client_schema_older_than_room",
+				clientSchemaVersion: clientSchema.version,
+				clientSchemaSource: clientSchema.source,
+				roomSchemaVersion,
+			}),
+		);
 		return returnSocketResponse(req, rejectSocket(req, "update_required", {
 			reason: "client_schema_older_than_room",
 			clientSchemaVersion: clientSchema.version,
@@ -211,14 +224,21 @@ export async function handleSyncSocketRoute(
 		}));
 	}
 
-	await recordVaultTrace(env, vaultId, "ws-connected", {
-		userAgent: req.headers.get("user-agent") ?? undefined,
-		cfRay: req.headers.get("cf-ray") ?? undefined,
-		clientSchemaVersion: clientSchema.version,
-		clientSchemaSource: clientSchema.source,
-		roomSchemaVersion,
-		authMethod: authResult.method,
-	});
+	// Successful connection — console only, no YAOS_SYNC trace write (issue #40).
+	// A reconnect storm would otherwise produce:
+	//   YAOS_CONFIG auth + YAOS_SYNC schema check + YAOS_SYNC trace write
+	// on every connect, burning ~3 subrequests per socket open.
+	console.info(
+		`[yaos-sync:worker] ws connected: ` +
+		JSON.stringify({
+			vaultIdHint: vaultId.slice(0, 8),
+			clientSchemaVersion: clientSchema.version,
+			clientSchemaSource: clientSchema.source,
+			roomSchemaVersion,
+			authMethod: authResult.method,
+			cfRay: req.headers.get("cf-ray") ?? undefined,
+		}),
+	);
 
 	const stub = await getServerByName(env.YAOS_SYNC, vaultId);
 	return await stub.fetch(req);

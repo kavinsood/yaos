@@ -50,13 +50,10 @@ async function main() {
 
 	const oversizedDebug = await getJson(`/vault/${encodeURIComponent(traceRoomId)}/debug/recent`);
 	assert(oversizedDebug.res.ok, "debug endpoint returns successfully after oversized trace payload");
-	const oversizedRecent = Array.isArray(oversizedDebug.payload?.recent) ? oversizedDebug.payload.recent : [];
-	const oversizedReject = oversizedRecent.find((entry) => entry?.event === "ws-rejected");
-	assert(Boolean(oversizedReject), "oversized schema rejection is still traced");
-	assert(
-		typeof oversizedReject?.rawSchema === "string" && oversizedReject.rawSchema.length < hugeSchema.length,
-		"oversized trace field is truncated before persistence",
-	);
+	// Note: ws-rejected events are no longer persisted to YAOS_SYNC (issue #40
+	// amplification fix — a schema-mismatch loop must not hammer the DO).
+	// They are logged via console.warn only.  The trace list may be empty or
+	// contain unrelated room events; we only verify the endpoint is healthy.
 }
 
 main().catch((err) => {
