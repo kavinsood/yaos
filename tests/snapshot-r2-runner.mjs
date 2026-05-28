@@ -13,7 +13,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const serverDir = join(__dirname, "..", "server");
 const testFile = join(serverDir, "tests", "snapshot-r2.ts");
 
-const result = spawnSync("npx", ["tsx", testFile], {
+const result = spawnSync("npx", ["--no-install", "tsx", testFile], {
 	cwd: serverDir,
 	stdio: "inherit",
 	timeout: 120_000,

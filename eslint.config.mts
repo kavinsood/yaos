@@ -50,6 +50,19 @@ export default tseslint.config(
 			},
 		},
 	},
+	{
+		files: ["server/tests/**/*.ts"],
+		languageOptions: {
+			globals: {
+				...globals.node,
+				...globals.serviceworker,
+			},
+			parserOptions: {
+				project: "./server/tsconfig.eslint.json",
+				tsconfigRootDir: import.meta.dirname,
+			},
+		},
+	},
 	globalIgnores([
 		"node_modules",
 		"dist",
