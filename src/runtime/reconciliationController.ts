@@ -43,6 +43,12 @@ import {
 	FINGERPRINT_MAP_MAX_SIZE,
 	type FingerprintEntry,
 } from "./reconcile/fingerprintQuarantinePolicy";
+import {
+	evaluateAmplificationQuarantine,
+	findOldestAmplificationEntry,
+	AMPLIFICATION_WINDOW_MS,
+	type AmplificationEntry,
+} from "./reconcile/amplificationQuarantinePolicy";
 
 export interface ReconciliationStats {
 	at: string;
@@ -130,24 +136,6 @@ const OPEN_FILE_EXTERNAL_EDIT_IDLE_GRACE_MS = 1200;
 const OPEN_FILE_LOCAL_ONLY_RECOVERY_IDLE_MS = 3000;
 const BOUND_RECOVERY_LOCK_MS = 1500;
 const TRACE_PATH_SAMPLE_LIMIT = 50;
-
-/**
- * Monotonic-growth amplification quarantine.
- *
- * Independent of fingerprint identity. Catches recovery loops where every
- * cycle has a different fingerprint but lengths and prefixes grow along the
- * same axis (typing-cadence amplifier). See spec:
- * .kiro/specs/editor-bound-localonly-amplifier-guard/requirements.md R3.
- */
-const MAX_AMPLIFICATION_HISTORY_ENTRIES = 5;
-const AMPLIFICATION_QUARANTINE_THRESHOLD = 3;
-const AMPLIFICATION_WINDOW_MS = 15_000;
-
-interface AmplificationEntry {
-	prevLen: number;
-	nextLen: number;
-	at: number;
-}
 
 
 function tracePathList(prefix: string, paths: string[]): Record<string, unknown> {
@@ -2351,11 +2339,6 @@ export class ReconciliationController {
 	 * along the same axis — the typing-cadence amplifier shape captured in
 	 * the 2026-05-27 iPad trace at pathId p:476818d2ecba90d4e95e2a0c4f3ad1eb.
 	 *
-	 * Predicate: the most recent `AMPLIFICATION_QUARANTINE_THRESHOLD` history
-	 * entries (including the just-appended entry) all fall within
-	 * `AMPLIFICATION_WINDOW_MS` and exhibit non-decreasing prevLen, non-
-	 * decreasing nextLen, and strictly positive (nextLen - prevLen) deltas.
-	 *
 	 * See spec:
 	 *   .kiro/specs/editor-bound-localonly-amplifier-guard/requirements.md R3.
 	 */
@@ -2366,85 +2349,50 @@ export class ReconciliationController {
 		nextLen: number,
 	): boolean {
 		const now = Date.now();
-		const entry: AmplificationEntry = { prevLen, nextLen, at: now };
-
 		const existing = this.amplificationHistory.get(path) ?? [];
-		existing.push(entry);
-		// Keep at most MAX_AMPLIFICATION_HISTORY_ENTRIES, evict oldest.
-		while (existing.length > MAX_AMPLIFICATION_HISTORY_ENTRIES) {
-			existing.shift();
-		}
-		this.amplificationHistory.set(path, existing);
 
-		// Cap global map size — share the same limit as recoveryFingerprints
-		// so a single tunable governs both detectors' memory footprint.
-		if (this.amplificationHistory.size > FINGERPRINT_MAP_MAX_SIZE) {
-			let oldestPath: string | null = null;
-			let oldestAt = Infinity;
-			for (const [p, entries] of this.amplificationHistory) {
-				const last = entries[entries.length - 1];
-				if (last && last.at < oldestAt) {
-					oldestAt = last.at;
-					oldestPath = p;
+		// Evaluate using pure policy function.
+		const decision = evaluateAmplificationQuarantine({
+			prevLen,
+			nextLen,
+			now,
+			history: existing,
+		});
+
+		if (!decision.quarantined) {
+			// Update state (side effect kept in controller).
+			this.amplificationHistory.set(path, decision.newHistory);
+
+			// Cap global map size — share the same limit as recoveryFingerprints
+			// so a single tunable governs both detectors' memory footprint.
+			if (this.amplificationHistory.size > FINGERPRINT_MAP_MAX_SIZE) {
+				const oldestPath = findOldestAmplificationEntry(
+					this.amplificationHistory,
+					path, // exclude current path from eviction
+				);
+				if (oldestPath) {
+					this.amplificationHistory.delete(oldestPath);
 				}
 			}
-			if (oldestPath && oldestPath !== path) {
-				this.amplificationHistory.delete(oldestPath);
-			}
+
+			return false;
 		}
 
-		if (existing.length < AMPLIFICATION_QUARANTINE_THRESHOLD) return false;
-
-		const slice = existing.slice(-AMPLIFICATION_QUARANTINE_THRESHOLD);
-		const last = slice[slice.length - 1]!;
-		// All entries must be within the window of the most recent one.
-		const inWindow = slice.every((e) => last.at - e.at <= AMPLIFICATION_WINDOW_MS);
-		if (!inWindow) return false;
-
-		// Strictly positive delta in every entry.
-		let allPositiveDelta = true;
-		for (const e of slice) {
-			if (e.nextLen - e.prevLen <= 0) {
-				allPositiveDelta = false;
-				break;
-			}
-		}
-		if (!allPositiveDelta) return false;
-
-		// Non-decreasing prevLen and non-decreasing nextLen across the slice.
-		let monotonicPrev = true;
-		let monotonicNext = true;
-		for (let i = 1; i < slice.length; i++) {
-			if (slice[i]!.prevLen < slice[i - 1]!.prevLen) monotonicPrev = false;
-			if (slice[i]!.nextLen < slice[i - 1]!.nextLen) monotonicNext = false;
-		}
-		if (!monotonicPrev || !monotonicNext) return false;
-
-		// Distinguish growth from stationary. Stationary same-fingerprint
-		// loops are the fingerprint quarantine's job. The amplification
-		// detector requires genuine growth across the window: both prevLen
-		// and nextLen must be STRICTLY larger at the end of the slice
-		// than at the beginning.
-		const grew = slice[slice.length - 1]!.prevLen > slice[0]!.prevLen
-			&& slice[slice.length - 1]!.nextLen > slice[0]!.nextLen;
-		if (!grew) return false;
-
-		// Diagnostic: did every entry have the same delta?
-		const firstDelta = slice[0]!.nextLen - slice[0]!.prevLen;
-		const consistentDelta = slice.every((e) => (e.nextLen - e.prevLen) === firstDelta);
+		// Quarantine triggered — emit side effects.
+		const { triggerSlice, consistentDelta, firstPrevLen, lastNextLen } = decision;
 
 		this.deps.trace("recovery", "recovery-amplification-quarantined", {
 			path,
 			reason,
-			entries: slice.length,
+			entries: triggerSlice.length,
 			windowMs: AMPLIFICATION_WINDOW_MS,
-			firstPrevLen: slice[0]!.prevLen,
-			lastNextLen: last.nextLen,
+			firstPrevLen,
+			lastNextLen,
 			consistentDelta,
 		});
 		this.deps.log(
 			`syncFileFromDisk: amplification-quarantined "${path}" ` +
-			`(${reason}, ${slice.length} cycles, ${slice[0]!.prevLen} -> ${last.nextLen}, ` +
+			`(${reason}, ${triggerSlice.length} cycles, ${firstPrevLen} -> ${lastNextLen}, ` +
 			`consistentDelta=${consistentDelta})`,
 		);
 		this.deps.recordFlightPathEvent?.({
@@ -2457,10 +2405,10 @@ export class ReconciliationController {
 			path,
 			data: {
 				reason,
-				entries: slice.length,
+				entries: triggerSlice.length,
 				windowMs: AMPLIFICATION_WINDOW_MS,
-				firstPrevLen: slice[0]!.prevLen,
-				lastNextLen: last.nextLen,
+				firstPrevLen,
+				lastNextLen,
 				consistentDelta,
 			},
 		});
@@ -2477,7 +2425,7 @@ export class ReconciliationController {
 			data: {
 				reason,
 				detector: "amplification",
-				entries: slice.length,
+				entries: triggerSlice.length,
 			},
 		});
 		this.deps.scheduleTraceStateSnapshot("recovery-amplification-quarantined");

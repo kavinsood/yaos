@@ -146,6 +146,8 @@ const suites = [
 	[JITI, "tests/safety-brake-policy.ts"],
 	// Autophagy: Fingerprint quarantine policy
 	[JITI, "tests/fingerprint-quarantine-policy.ts"],
+	// Autophagy: Amplification quarantine policy
+	[JITI, "tests/amplification-quarantine-policy.ts"],
 ];
 
 let totalPassed = 0;
