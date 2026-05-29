@@ -137,6 +137,34 @@ console.log("\n--- Test 13: Small vault, all files ---");
 	assert(result.destructiveRatio === 1.0, "ratio is 1.0 (100%)");
 }
 
+console.log("\n--- Test 14: Exact reason string (golden test) ---");
+{
+	// 21 of 80 = 26.25% ratio -> rounds to 26%
+	const result = evaluateSafetyBrake({ destructiveCount: 21, localFileCount: 80 });
+	assert(result.triggered === true, "triggered for golden test");
+	if (result.triggered) {
+		const expected = "refusing to overwrite 21 local files (26% of disk files)";
+		assert(
+			result.reason === expected,
+			`exact reason string matches: got "${result.reason}"`,
+		);
+	}
+}
+
+console.log("\n--- Test 15: Exact reason string with different values ---");
+{
+	// 150 of 500 = 30% ratio
+	const result = evaluateSafetyBrake({ destructiveCount: 150, localFileCount: 500 });
+	assert(result.triggered === true, "triggered for second golden test");
+	if (result.triggered) {
+		const expected = "refusing to overwrite 150 local files (30% of disk files)";
+		assert(
+			result.reason === expected,
+			`exact reason string matches: got "${result.reason}"`,
+		);
+	}
+}
+
 console.log("\n───────────────────────────────────────────────────────");
 console.log(`Results: ${passed} passed, ${failed} failed`);
 console.log("───────────────────────────────────────────────────────\n");
