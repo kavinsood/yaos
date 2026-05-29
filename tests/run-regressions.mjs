@@ -128,7 +128,6 @@ const suites = [
 	[NODE, "tests/snapshot-r2-runner.mjs"],
 	// Autophagy: shared utilities and policy modules
 	[JITI, "tests/map-with-concurrency.ts"],
-	[JITI, "tests/rename-admission-policy.ts"],
 	[JITI, "tests/rename-admission-wiring.ts"],
 	// Autophagy: canonical path identity
 	[JITI, "tests/canonical-path.ts"],

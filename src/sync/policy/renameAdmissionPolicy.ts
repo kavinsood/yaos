@@ -7,64 +7,7 @@
  * an excluded destination.
  */
 
-import type { PathAdmission } from "./pathAdmissionPolicy";
 import type { PathSyncCategory } from "../../paths/pathCategory";
-
-/**
- * @deprecated Remove after autophagy campaign 2. No production caller remains.
- * Only kept for test coverage of the legacy decision matrix.
- * Removal target: next deletion pass after TraceSink second cluster.
- */
-export type RenameAdmissionDecision =
-	| { kind: "rename"; oldPath: string; newPath: string }
-	| { kind: "tombstone-old"; oldPath: string; newPath: string; reason: string }
-	| { kind: "admit-new"; oldPath: string; newPath: string; reason: string }
-	| { kind: "ignore"; oldPath: string; newPath: string; reason: string };
-
-/**
- * Decide what to do with a rename given the admission status of both paths.
- *
- * @deprecated Remove after autophagy campaign 2. No production caller remains.
- * Use planCategoryRenameAction for new code.
- */
-export function decideRenameAdmission(input: {
-	oldPath: string;
-	newPath: string;
-	oldAdmission: PathAdmission;
-	newAdmission: PathAdmission;
-}): RenameAdmissionDecision {
-	const oldSyncable = input.oldAdmission.kind === "syncable";
-	const newSyncable = input.newAdmission.kind === "syncable";
-
-	if (oldSyncable && newSyncable) {
-		return { kind: "rename", oldPath: input.oldPath, newPath: input.newPath };
-	}
-
-	if (oldSyncable && !newSyncable) {
-		return {
-			kind: "tombstone-old",
-			oldPath: input.oldPath,
-			newPath: input.newPath,
-			reason: `destination-excluded: ${(input.newAdmission as { reason: string }).reason}`,
-		};
-	}
-
-	if (!oldSyncable && newSyncable) {
-		return {
-			kind: "admit-new",
-			oldPath: input.oldPath,
-			newPath: input.newPath,
-			reason: `source-excluded: ${(input.oldAdmission as { reason: string }).reason}`,
-		};
-	}
-
-	return {
-		kind: "ignore",
-		oldPath: input.oldPath,
-		newPath: input.newPath,
-		reason: "excluded-to-excluded",
-	};
-}
 
 // -----------------------------------------------------------------------
 // Category-aware rename planning.
