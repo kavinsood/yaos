@@ -15,8 +15,7 @@ import {
 	type ServerCapabilities,
 } from "./sync/serverCapabilities";
 import { isMarkdownSyncable, isBlobSyncable } from "./types";
-import { admitMarkdownPath } from "./sync/policy/pathAdmissionPolicy";
-import { decideRenameAdmission, planRenameAction, planCategoryRenameAction } from "./sync/policy/renameAdmissionPolicy";
+import { planCategoryRenameAction } from "./sync/policy/renameAdmissionPolicy";
 import { classifySyncPath } from "./paths/pathCategory";
 import type { TraceSink } from "./observability/traceSink";
 import { FlightTraceSink } from "./debug/flightTraceSink";
