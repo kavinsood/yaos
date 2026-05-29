@@ -34,6 +34,7 @@ import {
 	ORIGIN_DISK_SYNC_OPEN_IDLE_RECOVER,
 } from "../sync/origins";
 import { planClosedFileReconcile } from "./reconcile/closedFilePlanner";
+import { planBaselineAdvancement, type BaselineActionKind } from "./reconcile/baselineAdvancementPolicy";
 
 export interface ReconciliationStats {
 	at: string;
@@ -698,7 +699,16 @@ export class ReconciliationController {
 					const ytext = vaultSync.getTextForPath(path);
 					if (ytext) {
 						const crdtContent = yTextToString(ytext) ?? "";
-						settledHashes.set(path, await contentBaselineHash(crdtContent));
+						const crdtHash = await contentBaselineHash(crdtContent);
+						const baselineAction = planBaselineAdvancement({
+							actionKind: "crdt-created-on-disk",
+							diskHash: null,
+							crdtHash,
+							previousBaselineHash: null,
+						});
+						if (baselineAction.kind === "advance") {
+							settledHashes.set(path, baselineAction.hash);
+						}
 					}
 				}
 				for (const path of result.seededToCrdt) {
@@ -712,7 +722,16 @@ export class ReconciliationController {
 					// Record settled baseline hash: disk content was the authority
 					const diskContent = diskFiles.get(path);
 					if (diskContent !== undefined) {
-						settledHashes.set(path, await contentBaselineHash(diskContent));
+						const diskHash = await contentBaselineHash(diskContent);
+						const baselineAction = planBaselineAdvancement({
+							actionKind: "disk-seeded-to-crdt",
+							diskHash,
+							crdtHash: null,
+							previousBaselineHash: null,
+						});
+						if (baselineAction.kind === "advance") {
+							settledHashes.set(path, baselineAction.hash);
+						}
 					}
 				}
 				for (const path of result.updatedOnDisk) {
@@ -801,7 +820,15 @@ export class ReconciliationController {
 								);
 								if (action.winner === "disk") {
 									forceReplaceYText(ytext, diskContent, ORIGIN_DISK_SYNC_RECOVER_BOUND);
-									settledHashes.set(path, diskHash);
+									const baselineAction = planBaselineAdvancement({
+										actionKind: "conflict-disk-wins",
+										diskHash,
+										crdtHash,
+										previousBaselineHash: baselineHash,
+									});
+									if (baselineAction.kind === "advance") {
+										settledHashes.set(path, baselineAction.hash);
+									}
 								} else {
 									updatesToFlush.push(path);
 								}
@@ -828,12 +855,23 @@ export class ReconciliationController {
 									reason: action.reason,
 									error: err instanceof Error ? err.message : String(err),
 								});
+								// Baseline advancement: defer on artifact creation failure
+								// (planBaselineAdvancement would return defer, but we skip calling it
+								// since we're not setting any hash anyway - the path is dropped)
 								continue;
 							}
 						}
 						if (action.kind === "import-disk-to-crdt") {
 							forceReplaceYText(ytext, diskContent, ORIGIN_DISK_SYNC_RECOVER_BOUND);
-							settledHashes.set(path, diskHash);
+							const baselineAction = planBaselineAdvancement({
+								actionKind: "import-disk-to-crdt",
+								diskHash,
+								crdtHash,
+								previousBaselineHash: baselineHash,
+							});
+							if (baselineAction.kind === "advance") {
+								settledHashes.set(path, baselineAction.hash);
+							}
 							this.deps.trace("reconcile", "closed-file-disk-wins-clean", {
 								path,
 								reason: action.reason,
@@ -854,7 +892,19 @@ export class ReconciliationController {
 					// Record settled baseline hash: CRDT content was written to disk
 					const ytext = vaultSync.getTextForPath(path);
 					if (ytext) {
-						settledHashes.set(path, await contentBaselineHash(yTextToString(ytext) ?? ""));
+						const crdtHash = await contentBaselineHash(yTextToString(ytext) ?? "");
+						// All paths in updatesToFlush are CRDT-wins scenarios:
+						// - conflict-crdt-wins, apply-remote-to-disk, no-op, defer-to-crdt-flush
+						// All advance with crdtHash. Use defer-to-crdt-flush as the generic action.
+						const baselineAction = planBaselineAdvancement({
+							actionKind: "defer-to-crdt-flush",
+							diskHash: null,
+							crdtHash,
+							previousBaselineHash: null,
+						});
+						if (baselineAction.kind === "advance") {
+							settledHashes.set(path, baselineAction.hash);
+						}
 					}
 				}
 
