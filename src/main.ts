@@ -8,6 +8,7 @@ import {
 import { SettingsStore } from "./settings/settingsStore";
 import { VaultSync, type ReconcileMode } from "./sync/vaultSync";
 import { SCHEMA_VERSION } from "./sync/vaultSync";
+import { getMetaPath, isFileMetaDeletedValue } from "./sync/fileMeta";
 import { EditorBindingManager } from "./sync/editorBinding";
 import { DiskMirror } from "./sync/diskMirror";
 import { type BlobQueueSnapshot, type BlobSyncManager } from "./sync/blobSync";
@@ -770,6 +771,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				return;
 			}
 
+			// Mark schema v3 if room is still at v2 (lazy, no metadata migration).
+			this.vaultSync.markSchemaV3(this.settings.deviceName);
+
 			// Check for fatal auth error before waiting for provider
 			if (this.vaultSync.fatalAuthError) {
 				this.log("Fatal auth error during startup");
@@ -964,6 +968,13 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					|| this.isBlobPathSyncable(oldPath);
 				if (!newSyncable && !oldSyncable) return;
 				const renameOpId = this.newOpId();
+				// Consume the remote-rename marker once. If DiskMirror originated this
+					// disk rename (passive receiver of a remote CRDT rename), we must:
+					//   1. Mark the trace event with remoteOrigin:true (analyzer exemption)
+					//   2. Skip queueRename entirely (the rename is already in CRDT)
+					// Consume-on-use matches the suppressedPaths/consumeDeleteSuppression pattern.
+					const isRemoteRename = this.diskMirror?.consumeRemoteRename(file.path) ?? false;
+
 				if (this.isMarkdownPathSyncable(oldPath) || this.isMarkdownPathSyncable(file.path)) {
 					// Emit two disk.rename.observed events sharing the same opId so the
 					// analyzer can reconstruct full old→new lineage without raw paths.
@@ -988,8 +999,21 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						layer: "disk",
 						opId: renameOpId,
 						path: file.path, // resolves to newPathId
-						data: { renameRole: "target", isBlobSyncable: this.isBlobPathSyncable(file.path) },
+						data: {
+							renameRole: "target",
+							isBlobSyncable: this.isBlobPathSyncable(file.path),
+							// remoteOrigin:true exempts this event from the orphan-after-rename
+							// analyzer rule — passive receivers have no crdt.file.renamed.
+							remoteOrigin: isRemoteRename,
+						},
 					});
+				}
+
+				if (isRemoteRename) {
+					// DiskMirror renamed the disk file in response to a remote CRDT rename.
+					// The rename already exists in CRDT — do not feed it back via queueRename.
+					this.log(`Remote-origin rename observed, skipping queueRename: "${oldPath}" -> "${file.path}"`);
+					return;
 				}
 				this.vaultSync?.queueRename(oldPath, file.path);
 				this.log(`Rename queued: "${oldPath}" -> "${file.path}"`);
@@ -2435,8 +2459,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				const handler = (_event: unknown, txn: { origin: unknown }) => {
 					// Find path for this fileId.
 					let path: string | undefined;
-					vs.meta.forEach((meta, id) => {
-						if (id === fileId && typeof meta.path === "string") path = meta.path;
+					vs.meta.forEach((value: unknown, id: string) => {
+						if (id === fileId) {
+							const p = getMetaPath(value);
+							if (p) path = p;
+						}
 					});
 					if (!path || !path.endsWith(".md")) return;
 					const originClass = isLocalOrigin(txn.origin, vs.provider) ? "local-edit" : "remote-apply";
@@ -2457,23 +2484,29 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			this._witnessIdToTextHandler = idToTextHandler;
 
 			// Observe meta map for tombstone transitions (Req 3.4).
-			const metaHandler = () => {
-				vs.meta.forEach((meta, fileId) => {
-					void fileId;
-					const path = typeof meta.path === "string" ? meta.path : undefined;
-					if (!path || !path.endsWith(".md")) return;
-					if (vs.isFileMetaDeleted(meta)) {
-						tracker?.markDirty(path, "tombstone");
+			// Uses observeMetaChanges (observeDeep-backed, incremental diff) so
+			// nested Y.Map field mutations (v3 entries) trigger correctly.
+			// The witness tracker intentionally observes BOTH local and remote
+			// tombstones — it tracks what this device believes about each file.
+			const unsubscribeMetaChanges = vs.observeMetaChanges((batch) => {
+				for (const change of batch.changes) {
+					if (change.kind === "deleted") {
+						const { path } = change;
+						if (path.endsWith(".md")) {
+							tracker?.markDirty(path, "tombstone");
+						}
 					}
-				});
-			};
-			vs.meta.observe(metaHandler);
+				}
+			});
+			// Store unsubscribe as a wrapped function so the teardown path works.
+			const metaHandler = unsubscribeMetaChanges;
 			this._witnessMetaHandler = metaHandler;
 		}
 	}
 
 	private _witnessTextObservers: Map<string, { ytext: import("yjs").Text; handler: (...args: unknown[]) => void }> | null = null;
 	private _witnessIdToTextHandler: (() => void) | null = null;
+	/** Unsubscribe function returned by observeMetaChanges, or null if not subscribed. */
 	private _witnessMetaHandler: (() => void) | null = null;
 
 	private _stopDeviceWitnessTracker(): void {
@@ -2487,8 +2520,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			try { this.vaultSync.idToText.unobserve(this._witnessIdToTextHandler); } catch { /* ignore */ }
 			this._witnessIdToTextHandler = null;
 		}
-		if (this._witnessMetaHandler && this.vaultSync) {
-			try { this.vaultSync.meta.unobserve(this._witnessMetaHandler); } catch { /* ignore */ }
+		if (this._witnessMetaHandler) {
+			// _witnessMetaHandler is now an unsubscribe function (not a Yjs callback).
+			try { this._witnessMetaHandler(); } catch { /* ignore */ }
 			this._witnessMetaHandler = null;
 		}
 		this.deviceWitnessTracker?.dispose();

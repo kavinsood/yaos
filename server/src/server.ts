@@ -555,22 +555,14 @@ export class VaultSyncServer extends YServer {
 		}
 	}
 
-	/** Count active (non-deleted) paths in a Y.Doc using the YAOS schema. */
+	/** Count active (non-deleted) paths in a Y.Doc using the YAOS schema. Dual-reads flat and nested metadata. */
 	private countActivePathsInDoc(doc: Y.Doc): number {
 		const meta = doc.getMap("meta");
 		let count = 0;
 		meta.forEach((value: unknown) => {
-			if (
-				typeof value === "object"
-				&& value !== null
-				&& "path" in value
-				&& typeof (value as { path: unknown }).path === "string"
-			) {
-				const m = value as { deleted?: boolean; deletedAt?: number };
-				const isDeleted = m.deleted === true
-					|| (typeof m.deletedAt === "number" && Number.isFinite(m.deletedAt));
-				if (!isDeleted) count++;
-			}
+			const path = this.readMetaPath(value);
+			if (!path) return;
+			if (!this.isMetaDeleted(value)) count++;
 		});
 		return count;
 	}
@@ -583,6 +575,40 @@ export class VaultSyncServer extends YServer {
 		if (pathToId.size > 0) return true;
 		const idToText = doc.getMap("idToText");
 		if (idToText.size > 0) return true;
+		return false;
+	}
+
+	/**
+	 * Read the path from a metadata value. Handles both flat objects (v2) and nested Y.Map (v3).
+	 * Server must dual-read because persisted rooms may contain either shape.
+	 */
+	private readMetaPath(value: unknown): string | null {
+		if (value instanceof Y.Map) {
+			const path = value.get("path");
+			return typeof path === "string" && path.length > 0 ? path : null;
+		}
+		if (typeof value === "object" && value !== null && "path" in value) {
+			const path = (value as { path: unknown }).path;
+			return typeof path === "string" && path.length > 0 ? path : null;
+		}
+		return null;
+	}
+
+	/**
+	 * Check if a metadata value represents a deleted/tombstoned entry.
+	 * Handles both flat objects (v2) and nested Y.Map (v3).
+	 */
+	private isMetaDeleted(value: unknown): boolean {
+		if (value instanceof Y.Map) {
+			const deletedAt = value.get("deletedAt");
+			if (typeof deletedAt === "number" && Number.isFinite(deletedAt)) return true;
+			return value.get("deleted") === true;
+		}
+		if (typeof value === "object" && value !== null) {
+			const m = value as { deleted?: boolean; deletedAt?: unknown };
+			if (typeof m.deletedAt === "number" && Number.isFinite(m.deletedAt)) return true;
+			return m.deleted === true;
+		}
 		return false;
 	}
 
@@ -638,6 +664,12 @@ export class VaultSyncServer extends YServer {
 		/** pathToId entries that have no corresponding active meta entry. */
 		pathToIdWithoutActiveMeta: number;
 		schemaVersion: unknown;
+		/** v3 observability: metadata entries stored as flat JSON objects. */
+		flatMetaEntries: number;
+		/** v3 observability: metadata entries stored as nested Y.Map. */
+		nestedMetaEntries: number;
+		/** v3 observability: metadata entries that could not be decoded. */
+		invalidMetaEntries: number;
 	} {
 		const meta = this.document.getMap("meta");
 		const pathToId = this.document.getMap<string>("pathToId");
@@ -648,33 +680,38 @@ export class VaultSyncServer extends YServer {
 		let activePathsWithText = 0;
 		let activePathsMissingFromPathToId = 0;
 		let activePathsMissingText = 0;
+		let flatMetaEntries = 0;
+		let nestedMetaEntries = 0;
+		let invalidMetaEntries = 0;
 
 		// Walk meta to count active/tombstoned and check consistency
 		const activeMetaPaths = new Set<string>();
 		meta.forEach((value: unknown) => {
-			if (
-				typeof value === "object"
-				&& value !== null
-				&& "path" in value
-				&& typeof (value as { path: unknown }).path === "string"
-			) {
-				const path = (value as { path: string }).path;
-				const m = value as { deleted?: boolean; deletedAt?: number };
-				const isDeleted = m.deleted === true
-					|| (typeof m.deletedAt === "number" && Number.isFinite(m.deletedAt));
-				if (isDeleted) {
-					tombstonedPathCount++;
+			const path = this.readMetaPath(value);
+			if (!path) {
+				invalidMetaEntries++;
+				return;
+			}
+
+			// Classify shape
+			if (value instanceof Y.Map) {
+				nestedMetaEntries++;
+			} else {
+				flatMetaEntries++;
+			}
+			const isDeleted = this.isMetaDeleted(value);
+			if (isDeleted) {
+				tombstonedPathCount++;
+			} else {
+				activePathCount++;
+				activeMetaPaths.add(path);
+				const id = pathToId.get(path);
+				if (!id) {
+					activePathsMissingFromPathToId++;
+				} else if (!idToText.has(id)) {
+					activePathsMissingText++;
 				} else {
-					activePathCount++;
-					activeMetaPaths.add(path);
-					const id = pathToId.get(path);
-					if (!id) {
-						activePathsMissingFromPathToId++;
-					} else if (!idToText.has(id)) {
-						activePathsMissingText++;
-					} else {
-						activePathsWithText++;
-					}
+					activePathsWithText++;
 				}
 			}
 		});
@@ -698,6 +735,9 @@ export class VaultSyncServer extends YServer {
 			activePathsMissingText,
 			pathToIdWithoutActiveMeta,
 			schemaVersion: this.document.getMap("sys").get("schemaVersion") ?? null,
+			flatMetaEntries,
+			nestedMetaEntries,
+			invalidMetaEntries,
 		};
 	}
 

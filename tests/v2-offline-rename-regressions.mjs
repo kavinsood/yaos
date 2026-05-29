@@ -1,6 +1,9 @@
 import * as Y from "yjs";
 const snapshotModule = await import("../src/sync/snapshotClient.ts");
 const { diffSnapshot, restoreFromSnapshot } = snapshotModule.default ?? snapshotModule;
+const fileMetaModule = await import("../src/sync/fileMeta.ts");
+const getMetaPath = fileMetaModule.getMetaPath ?? fileMetaModule.default?.getMetaPath;
+const getMetaDeletedAt = fileMetaModule.getMetaDeletedAt ?? fileMetaModule.default?.getMetaDeletedAt;
 
 let passed = 0;
 let failed = 0;
@@ -161,8 +164,9 @@ console.log("\n--- Test 3: v2 restore undeletes without writing legacy pathToId 
 	const restoredText = liveIdToText.get(fileId)?.toString();
 	assert(restored.markdownUndeleted === 1, "restore undeleted one markdown file");
 	assert(restoredText === "Recovered", "restore replaced stale content");
-	assert(restoredMeta?.path === "notes/recover.md", "restore kept expected path");
-	assert(typeof restoredMeta?.deletedAt !== "number", "restore cleared tombstone state");
+	// Use helper to read both flat (v2) and nested (v3) metadata shapes.
+	assert(getMetaPath(restoredMeta) === "notes/recover.md", "restore kept expected path");
+	assert(getMetaDeletedAt(restoredMeta) === null, "restore cleared tombstone state");
 	assert(livePathToId.size === 0, "restore did not write legacy pathToId in schema v2");
 
 	snapshotDoc.destroy();
