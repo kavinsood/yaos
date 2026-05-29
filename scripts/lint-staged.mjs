@@ -12,6 +12,17 @@
  *   - Uses the working-tree version of staged files (so edits you've staged
  *     but also modified further are linted in their current state).
  *
+ * IMPORTANT LIMITATION:
+ *   This is FILE-LEVEL linting, not CHANGED-LINE linting. If you touch a file
+ *   with pre-existing baseline lint debt (e.g., reconciliationController.ts),
+ *   this script will fail on those old errors even if your changes are clean.
+ *
+ *   For files with baseline debt, use lint:changed which only gates NEW files.
+ *   This script is most useful for:
+ *     - Newly created files (no baseline debt)
+ *     - Clean legacy files (no pre-existing errors)
+ *     - Verifying a file is fully clean before committing
+ *
  * Usage:
  *   node scripts/lint-staged.mjs              # lint staged files
  *   node scripts/lint-staged.mjs --worktree   # lint all modified files (staged + unstaged)
