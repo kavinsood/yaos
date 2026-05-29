@@ -35,22 +35,3 @@ export function admitMarkdownPath(
 	}
 	return { kind: "syncable", path };
 }
-
-/**
- * Decide if a blob (non-markdown) path is admissible for sync.
- * Normalizes the path before checking (NFC + separators).
- */
-export function admitBlobPath(
-	path: string,
-	excludePatterns: string[],
-	configDir: string,
-): PathAdmission {
-	const canonical = canonicalizeVaultPath(path);
-	if (canonical.normalizedPath.endsWith(".md")) {
-		return { kind: "excluded", path, reason: "is-markdown" };
-	}
-	if (isExcluded(canonical.normalizedPath, excludePatterns, configDir)) {
-		return { kind: "excluded", path, reason: "excluded-by-pattern" };
-	}
-	return { kind: "syncable", path };
-}

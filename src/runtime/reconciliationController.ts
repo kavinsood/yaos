@@ -34,7 +34,6 @@ import {
 	ORIGIN_DISK_SYNC_OPEN_IDLE_RECOVER,
 } from "../sync/origins";
 import { planClosedFileReconcile } from "./reconcile/closedFilePlanner";
-import type { ClosedFileReconcileAction } from "./reconcile/closedFilePlanner";
 
 export interface ReconciliationStats {
 	at: string;

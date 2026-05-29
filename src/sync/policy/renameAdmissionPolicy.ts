@@ -89,36 +89,6 @@ export type RenameAction =
 	| { kind: "ignore" };
 
 /**
- * Plan rename action from a RenameAdmissionDecision (legacy path).
- *
- * @deprecated Remove after autophagy campaign 2. No production caller remains.
- * Used only by tests exercising the legacy decision matrix.
- */
-export function planRenameAction(decision: RenameAdmissionDecision): RenameAction {
-	switch (decision.kind) {
-		case "rename":
-			return { kind: "queue-markdown-rename", oldPath: decision.oldPath, newPath: decision.newPath };
-
-		case "tombstone-old":
-			return {
-				kind: "tombstone-markdown",
-				oldPath: decision.oldPath,
-				dropDirty: [decision.oldPath, decision.newPath],
-			};
-
-		case "admit-new":
-			return {
-				kind: "admit-markdown",
-				newPath: decision.newPath,
-				dropDirty: [decision.oldPath],
-			};
-
-		case "ignore":
-			return { kind: "ignore" };
-	}
-}
-
-/**
  * Plan rename action from PathSyncCategory objects (preferred API).
  *
  * Uses displayPath for all execution paths. Canonical keys are used
