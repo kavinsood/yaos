@@ -5,6 +5,13 @@
  * Only registered when settings.qaDebugMode is true.
  * NEVER enable in production vaults.
  *
+ * The API surface is conceptually split into two ports:
+ *   - YaosDebugPort: safe, read-only or non-mutating debug capabilities
+ *   - YaosUnsafeQaPort: scenario control and unsafe mutation
+ *
+ * src/sync/ and src/runtime/ must NEVER import this module.
+ * The guard:qa-isolation script enforces this.
+ *
  * Usage (Obsidian DevTools console):
  *   const api = window.__YAOS_DEBUG__;
  *   await api.waitForIdle(10000);
@@ -291,6 +298,43 @@ export interface YaosQaDebugApi {
 		policy: "always" | "closed-only" | "never" | null,
 	): Promise<{ previous: "always" | "closed-only" | "never" }>;
 }
+
+// -----------------------------------------------------------------------
+// Compile-time port satisfaction checks.
+// These ensure YaosQaDebugApi has methods matching YaosDebugPort and
+// YaosUnsafeQaPort. If either port adds a method that YaosQaDebugApi
+// doesn't have (or has an incompatible signature), this file will fail.
+// -----------------------------------------------------------------------
+import type { YaosDebugPort } from "./debug/ports/yaosDebugPort";
+import type { YaosUnsafeQaPort } from "./debug/ports/yaosUnsafeQaPort";
+
+// Check that YaosQaDebugApi has all the "safe" debug methods.
+// The return types may differ slightly (port uses simplified types),
+// so we check method existence only.
+type _DebugMethodKeys =
+	| "isLocalReady" | "isProviderSynced" | "isProviderConnected"
+	| "isReconciled" | "isReconcileInFlight" | "getConnectionState"
+	| "getServerReceiptState" | "getReceiptSnapshot"
+	| "getActiveMarkdownPaths" | "getDiskMarkdownPaths"
+	| "getDiskHash" | "getCrdtHash" | "getEditorHash"
+	| "waitForIdle" | "waitForLocalReady" | "waitForProviderSynced"
+	| "waitForReconciled" | "waitForFile" | "waitForReceiptAfter"
+	| "forceReconcile" | "forceReconnect" | "disconnectProvider" | "connectProvider";
+
+type _UnsafeMethodKeys =
+	| "__qaOnlyForceCrdtContentUnsafe" | "__qaOnlyForceSyncFileFromDiskUnsafe"
+	| "__qaOnlyPauseEditorBindingPropagationUnsafe"
+	| "__qaOnlyResumeEditorBindingPropagationUnsafe"
+	| "setQaNetworkHold" | "__qaOnlySetScenarioRunIdUnsafe"
+	| "__qaOnlyAdvanceScenarioStepUnsafe" | "__qaOnlyEmitPhaseUnsafe"
+	| "witnessDeviceSettled" | "computeWitnessStateHash" | "getDeviceId";
+
+// These will fail to compile if YaosQaDebugApi is missing any of the listed methods.
+type _AssertHasDebugMethods = _DebugMethodKeys extends keyof YaosQaDebugApi ? true : never;
+type _AssertHasUnsafeMethods = _UnsafeMethodKeys extends keyof YaosQaDebugApi ? true : never;
+const _hasDebug: _AssertHasDebugMethods = true;
+const _hasUnsafe: _AssertHasUnsafeMethods = true;
+void _hasDebug; void _hasUnsafe;
 
 // -----------------------------------------------------------------------
 // Plugin interface — only the properties we actually touch

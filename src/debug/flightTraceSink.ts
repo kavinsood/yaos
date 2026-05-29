@@ -49,9 +49,11 @@ export class FlightTraceSink implements TraceSink {
 	recordPath(event: DomainPathTraceEvent): void {
 		const flightKind = DOMAIN_TO_FLIGHT_KIND[event.kind];
 		if (!flightKind) {
-			// Unknown domain event — no flight mapping. Silent drop.
-			// This is intentional: domain events that predate their flight
-			// mapping are simply not recorded until the adapter is updated.
+			// Unknown domain event — no flight mapping.
+			// TODO: In QA/dev mode, emit a debug counter or log so dropped events
+			// are visible during development. Silent drops in production are
+			// acceptable, but invisible drops during RCA are not.
+			// See: engineering/autophagy-plan.md follow-ups.
 			return;
 		}
 

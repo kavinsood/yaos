@@ -136,6 +136,8 @@ const suites = [
 	[JITI, "tests/path-category.ts"],
 	// Autophagy: TraceSink dependency inversion
 	[JITI, "tests/trace-sink.ts"],
+	// Autophagy: QA port fencing
+	[JITI, "tests/qa-port-fencing.ts"],
 ];
 
 let totalPassed = 0;
