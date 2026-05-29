@@ -202,6 +202,57 @@ console.log("\n--- Test 13: Below threshold does not quarantine ---");
 	assert(result.newEntry.count === 2, "count is 2");
 }
 
+console.log("\n--- Test 14: Exact TTL boundary - exactly at TTL resets ---");
+{
+	const fingerprint = computeRecoveryFingerprint("test", "a", "b");
+	const previous: FingerprintEntry = { fingerprint, count: 2, lastAt: 1000 };
+	// Exactly at TTL boundary: (now - lastAt) === TTL
+	// The code uses < TTL, so === TTL should reset
+	const now = 1000 + FINGERPRINT_QUARANTINE_TTL_MS;
+	const result = evaluateFingerprintQuarantine({
+		fingerprint,
+		now,
+		previous,
+	});
+	assert(result.quarantined === false, "exactly at TTL boundary resets count");
+	assert(result.newEntry.count === 1, "count reset to 1 at exact TTL");
+}
+
+console.log("\n--- Test 15: Different fingerprint within TTL resets count ---");
+{
+	const fp1 = computeRecoveryFingerprint("test", "content-a", "content-b");
+	const fp2 = computeRecoveryFingerprint("test", "content-a", "content-c"); // different next
+	const previous: FingerprintEntry = { fingerprint: fp1, count: 2, lastAt: 1000 };
+	// Same path, within TTL, but different fingerprint
+	const result = evaluateFingerprintQuarantine({
+		fingerprint: fp2,
+		now: 2000, // well within TTL
+		previous,
+	});
+	assert(result.quarantined === false, "different fingerprint within TTL does not quarantine");
+	assert(result.newEntry.count === 1, "count reset to 1 for different fingerprint");
+	assert(result.newEntry.fingerprint === fp2, "new fingerprint stored");
+}
+
+console.log("\n--- Test 16: Exact reason string (golden test) ---");
+{
+	const fingerprint = computeRecoveryFingerprint("test", "a", "b");
+	const previous: FingerprintEntry = { fingerprint, count: 2, lastAt: 1000 };
+	const result = evaluateFingerprintQuarantine({
+		fingerprint,
+		now: 2000,
+		previous,
+	});
+	assert(result.quarantined === true, "quarantined for golden test");
+	if (result.quarantined) {
+		const expected = "repeated recovery fingerprint (3 attempts)";
+		assert(
+			result.reason === expected,
+			`exact reason string matches: got "${result.reason}"`,
+		);
+	}
+}
+
 console.log("\n───────────────────────────────────────────────────────");
 console.log(`Results: ${passed} passed, ${failed} failed`);
 console.log("───────────────────────────────────────────────────────\n");
