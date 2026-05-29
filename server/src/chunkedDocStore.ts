@@ -14,8 +14,10 @@ const JOURNAL_META_KEY = "document:journal:meta";
 const JOURNAL_MANIFEST_PREFIX = "document:journal:manifest:";
 const JOURNAL_CHUNK_PREFIX = "document:journal:chunk:";
 
-const DEFAULT_CHUNK_SIZE_BYTES = 512 * 1024;
+const DEFAULT_CHUNK_SIZE_BYTES = 64 * 1024; // 64KB — safe margin under CF DO per-value limit
 const DEFAULT_MAX_KEYS_PER_OPERATION = 128;
+/** Max keys per put when writing large binary chunks to avoid exceeding per-call size limits. */
+const MAX_CHUNK_KEYS_PER_PUT = 16;
 
 interface ManifestPointer {
 	version: number;
@@ -225,7 +227,7 @@ async function putChunkedPayloadBatched(
 	bytes: Uint8Array,
 	chunkSizeBytes: number,
 	chunkKeyForIndex: (index: number) => string,
-	maxKeysPerOperation: number,
+	_maxKeysPerOperation: number,
 ): Promise<number> {
 	const chunkCount = bytes.byteLength === 0
 		? 0
@@ -233,14 +235,18 @@ async function putChunkedPayloadBatched(
 
 	if (chunkCount === 0) return 0;
 
-	for (let chunkStart = 0; chunkStart < chunkCount; chunkStart += maxKeysPerOperation) {
-		const chunkEnd = Math.min(chunkStart + maxKeysPerOperation, chunkCount);
+	// Use a smaller batch size for binary chunk writes to avoid exceeding
+	// per-call total size limits (e.g., 16 * 64KB = 1MB per put call).
+	const batchSize = MAX_CHUNK_KEYS_PER_PUT;
+	for (let chunkStart = 0; chunkStart < chunkCount; chunkStart += batchSize) {
+		const chunkEnd = Math.min(chunkStart + batchSize, chunkCount);
 		const record: Record<string, Uint8Array> = {};
 		for (let i = chunkStart; i < chunkEnd; i++) {
 			const start = i * chunkSizeBytes;
 			const end = Math.min(start + chunkSizeBytes, bytes.byteLength);
-			// subarray avoids eagerly copying chunk bytes into transient arrays.
-			record[chunkKeyForIndex(i)] = bytes.subarray(start, end);
+			// .slice() creates an independent copy — avoids issues with
+			// structured clone of views sharing a large underlying buffer.
+			record[chunkKeyForIndex(i)] = bytes.slice(start, end);
 		}
 		await target.put(record);
 	}
@@ -420,85 +426,85 @@ export class ChunkedDocStore {
 		const updateHash = await sha256Hex(updateBytes);
 		const stateVectorHash = await sha256Hex(stateVectorBytes);
 
-		await this.storage.transaction(async (txn) => {
-			const cleanupKeys = new Set<string>();
-			const existingPointerRaw = await txn.get<unknown>(CHECKPOINT_POINTER_KEY);
-			const existingPointer = existingPointerRaw === undefined
-				? null
-				: isManifestPointer(existingPointerRaw)
-					? existingPointerRaw
-					: (() => {
-						throw new Error("checkpoint pointer is invalid");
-					})();
+		// ── Pre-compute: determine new version and collect cleanup keys ──────
+		const existingPointerRaw = await this.storage.get<unknown>(CHECKPOINT_POINTER_KEY);
+		const existingPointer = existingPointerRaw === undefined
+			? null
+			: isManifestPointer(existingPointerRaw)
+				? existingPointerRaw
+				: (() => { throw new Error("checkpoint pointer is invalid"); })();
 
-			if (existingPointer) {
-				const oldManifestKey = checkpointManifestKey(existingPointer.version);
-				const oldManifestRaw = await txn.get<unknown>(oldManifestKey);
-				if (!isChunkedManifest(oldManifestRaw)) {
-					throw new Error(`checkpoint manifest missing or invalid for version ${existingPointer.version}`);
-				}
-				cleanupKeys.add(oldManifestKey);
+		const newVersion = existingPointer ? existingPointer.version + 1 : 1;
+
+		// Collect cleanup keys (old checkpoint + journal entries)
+		const cleanupKeys = new Set<string>();
+		if (existingPointer) {
+			const oldManifestRaw = await this.storage.get<unknown>(checkpointManifestKey(existingPointer.version));
+			if (isChunkedManifest(oldManifestRaw)) {
+				cleanupKeys.add(checkpointManifestKey(existingPointer.version));
 				cleanupKeys.add(checkpointStateVectorKey(existingPointer.version));
 				for (let i = 0; i < oldManifestRaw.chunkCount; i++) {
 					cleanupKeys.add(checkpointChunkKey(oldManifestRaw.version, i));
 				}
 			}
+		}
 
-			const journalMeta = await this.readJournalMeta(txn);
-			if (journalMeta.entryCount > 0) {
-				const seqs = expectedJournalSeqs(journalMeta);
-				const manifestKeys = seqs.map((seq) => journalManifestKey(seq));
-				const manifestMap = await getManyBatched<unknown>(txn, manifestKeys, this.maxKeysPerOperation);
-				if (manifestMap.size !== manifestKeys.length) {
-					throw new Error(
-						`journal compact failed: expected ${manifestKeys.length} manifests, found ${manifestMap.size}`,
-					);
-				}
-				for (const seq of seqs) {
-					const key = journalManifestKey(seq);
-					const manifestRaw = manifestMap.get(key);
-					if (!isJournalEntryManifest(manifestRaw) || manifestRaw.seq !== seq) {
-						throw new Error(`journal compact failed: invalid manifest for seq ${seq}`);
-					}
-					cleanupKeys.add(key);
-					for (let i = 0; i < manifestRaw.chunkCount; i++) {
-						cleanupKeys.add(journalChunkKey(seq, i));
-					}
-				}
+		const journalMeta = await this.readJournalMeta(this.storage);
+		if (journalMeta.entryCount > 0) {
+			const seqs = expectedJournalSeqs(journalMeta);
+			for (const seq of seqs) {
+				cleanupKeys.add(journalManifestKey(seq));
+				cleanupKeys.add(journalChunkKey(seq, 0));
 			}
+		}
 
-			const newVersion = existingPointer
-				? existingPointer.version + 1
-				: 1;
-			const now = new Date().toISOString();
-			const chunkCount = await putChunkedPayloadBatched(
+		// ── Phase 1: Write new checkpoint chunks (non-transactional) ─────────
+		// These keys are not referenced by anything yet — safe to write outside
+		// a transaction.  If we crash here, they're orphaned (harmless).
+		const chunkCount = await putChunkedPayloadBatched(
+			this.storage,
+			updateBytes,
+			this.chunkSizeBytes,
+			(i) => checkpointChunkKey(newVersion, i),
+			this.maxKeysPerOperation,
+		);
+
+		// ── Phase 2: Atomic pointer swap (small transaction) ─────────────────
+		// This is the critical section.  It atomically:
+		// - Publishes the new checkpoint (manifest + pointer)
+		// - Resets the journal to empty
+		// If this fails, the chunks from Phase 1 are orphaned (harmless).
+		const now = new Date().toISOString();
+		const manifest: CheckpointManifest = {
+			format: CHECKPOINT_FORMAT,
+			version: newVersion,
+			chunkSizeBytes: this.chunkSizeBytes,
+			chunkCount,
+			byteLength: updateBytes.byteLength,
+			sha256: updateHash,
+			stateVectorByteLength: stateVectorBytes.byteLength,
+			stateVectorSha256: stateVectorHash,
+			updatedAt: now,
+		};
+
+		await this.storage.transaction(async (txn) => {
+			await putEntriesBatched(
 				txn,
-				updateBytes,
-				this.chunkSizeBytes,
-				(i) => checkpointChunkKey(newVersion, i),
+				[
+					[checkpointManifestKey(newVersion), manifest],
+					[checkpointStateVectorKey(newVersion), stateVectorBytes],
+					[CHECKPOINT_POINTER_KEY, { version: newVersion } satisfies ManifestPointer],
+					[JOURNAL_META_KEY, emptyJournalMeta(now)],
+				],
 				this.maxKeysPerOperation,
 			);
-
-			const entries: Array<[string, unknown]> = [];
-			const manifest: CheckpointManifest = {
-				format: CHECKPOINT_FORMAT,
-				version: newVersion,
-				chunkSizeBytes: this.chunkSizeBytes,
-				chunkCount,
-				byteLength: updateBytes.byteLength,
-				sha256: updateHash,
-				stateVectorByteLength: stateVectorBytes.byteLength,
-				stateVectorSha256: stateVectorHash,
-				updatedAt: now,
-			};
-			entries.push([checkpointManifestKey(newVersion), manifest]);
-			entries.push([checkpointStateVectorKey(newVersion), stateVectorBytes]);
-			entries.push([CHECKPOINT_POINTER_KEY, { version: newVersion } satisfies ManifestPointer]);
-			entries.push([JOURNAL_META_KEY, emptyJournalMeta(now)]);
-
-			await putEntriesBatched(txn, entries, this.maxKeysPerOperation);
-			await deleteKeysBatched(txn, Array.from(cleanupKeys), this.maxKeysPerOperation);
 		});
+
+		// ── Phase 3: Non-transactional cleanup ───────────────────────────────
+		// Delete orphaned keys.  Safe to fail — they're unreachable.
+		if (cleanupKeys.size > 0) {
+			await deleteKeysBatched(this.storage, Array.from(cleanupKeys), this.maxKeysPerOperation);
+		}
 	}
 
 	async loadLatest(): Promise<Uint8Array | null> {
