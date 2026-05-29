@@ -142,6 +142,8 @@ const suites = [
 	[JITI, "tests/closed-file-planner.ts"],
 	// Autophagy: Baseline advancement policy
 	[JITI, "tests/baseline-advancement-policy.ts"],
+	// Autophagy: Safety brake policy
+	[JITI, "tests/safety-brake-policy.ts"],
 ];
 
 let totalPassed = 0;

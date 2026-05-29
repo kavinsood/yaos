@@ -35,6 +35,7 @@ import {
 } from "../sync/origins";
 import { planClosedFileReconcile } from "./reconcile/closedFilePlanner";
 import { planBaselineAdvancement, type BaselineActionKind } from "./reconcile/baselineAdvancementPolicy";
+import { evaluateSafetyBrake } from "./reconcile/safetyBrakePolicy";
 
 export interface ReconciliationStats {
 	at: string;
@@ -610,16 +611,14 @@ export class ReconciliationController {
 			let safetyBrakeTriggered = false;
 			let safetyBrakeReason: string | null = null;
 
-			const localFileCount = diskPresentPaths.size;
-			const destructiveCount = result.updatedOnDisk.length;
-			const destructiveRatio = localFileCount > 0
-				? destructiveCount / localFileCount
-				: 0;
-			if (destructiveCount > 20 && destructiveRatio > 0.25) {
+			// Evaluate safety brake using pure policy function.
+			const safetyBrakeDecision = evaluateSafetyBrake({
+				destructiveCount: result.updatedOnDisk.length,
+				localFileCount: diskPresentPaths.size,
+			});
+			if (safetyBrakeDecision.triggered) {
 				safetyBrakeTriggered = true;
-				safetyBrakeReason =
-					`refusing to overwrite ${destructiveCount} local files ` +
-					`(${Math.round(destructiveRatio * 100)}% of disk files)`;
+				safetyBrakeReason = safetyBrakeDecision.reason;
 				this.deps.log(`Reconcile safety brake: ${safetyBrakeReason}.`);
 				console.error(`[yaos] Reconcile safety brake: ${safetyBrakeReason}.`);
 				new Notice(
@@ -628,9 +627,9 @@ export class ReconciliationController {
 				);
 				this.deps.trace("reconcile", "reconcile-safety-brake-blocked", {
 					mode,
-					destructiveCount,
-					destructiveRatio,
-					localFileCount,
+					destructiveCount: result.updatedOnDisk.length,
+					destructiveRatio: safetyBrakeDecision.destructiveRatio,
+					localFileCount: diskPresentPaths.size,
 					reason: safetyBrakeReason,
 					...tracePathList("affected", result.updatedOnDisk),
 				});
