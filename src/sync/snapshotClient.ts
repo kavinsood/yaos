@@ -17,6 +17,12 @@ import { appendTraceParams, type TraceHttpContext } from "../debug/trace";
 import { obsidianRequest } from "../utils/http";
 import { yTextToString } from "../utils/format";
 import { ORIGIN_RESTORE } from "./origins";
+import {
+	getMetaPath,
+	getMetaMtime,
+	isFileMetaDeletedValue,
+	createNestedActiveMeta,
+} from "./fileMeta";
 
 // -------------------------------------------------------------------
 // Types (mirrors server SnapshotIndex)
@@ -98,12 +104,12 @@ function usesV2MetaPathModel(doc: Y.Doc): boolean {
 
 function isCandidateMetaNewer(
 	candidateId: string,
-	candidateMeta: FileMeta,
+	candidateValue: unknown,
 	existingId: string,
-	existingMeta: FileMeta | undefined,
+	existingValue: unknown,
 ): boolean {
-	const candidateMtime = typeof candidateMeta.mtime === "number" ? candidateMeta.mtime : 0;
-	const existingMtime = typeof existingMeta?.mtime === "number" ? existingMeta.mtime : 0;
+	const candidateMtime = getMetaMtime(candidateValue) ?? 0;
+	const existingMtime = getMetaMtime(existingValue) ?? 0;
 	if (candidateMtime !== existingMtime) return candidateMtime > existingMtime;
 	return candidateId > existingId;
 }
@@ -115,22 +121,24 @@ function isCandidateMetaNewer(
  * v1/legacy: prefer pathToId, then backfill from active meta entries.
  */
 function collectActiveMarkdownPaths(doc: Y.Doc): Map<string, string> {
-	const meta = doc.getMap<FileMeta>("meta");
+	const meta = doc.getMap("meta");
 	const pathToId = doc.getMap<string>("pathToId");
 	const resolved = new Map<string, string>();
 
 	if (usesV2MetaPathModel(doc)) {
-		meta.forEach((entry, fileId) => {
-			if (isDeletedMeta(entry) || typeof entry.path !== "string") return;
-			const path = normalizeVaultPath(entry.path);
+		meta.forEach((value: unknown, fileId: string) => {
+			if (isFileMetaDeletedValue(value)) return;
+			const rawPath = getMetaPath(value);
+			if (!rawPath) return;
+			const path = normalizeVaultPath(rawPath);
 			if (!path) return;
 			const existingId = resolved.get(path);
 			if (!existingId) {
 				resolved.set(path, fileId);
 				return;
 			}
-			const existingMeta = meta.get(existingId);
-			if (isCandidateMetaNewer(fileId, entry, existingId, existingMeta)) {
+			const existingValue = meta.get(existingId);
+			if (isCandidateMetaNewer(fileId, value, existingId, existingValue)) {
 				resolved.set(path, fileId);
 			}
 		});
@@ -142,14 +150,16 @@ function collectActiveMarkdownPaths(doc: Y.Doc): Map<string, string> {
 		const path = normalizeVaultPath(rawPath);
 		if (!path) return;
 		const entry = meta.get(fileId);
-		if (isDeletedMeta(entry)) return;
+		if (isFileMetaDeletedValue(entry)) return;
 		resolved.set(path, fileId);
 	});
 
 	// Backfill paths that only exist in meta (mixed/partially migrated states).
-	meta.forEach((entry, fileId) => {
-		if (isDeletedMeta(entry) || typeof entry.path !== "string") return;
-		const path = normalizeVaultPath(entry.path);
+	meta.forEach((value: unknown, fileId: string) => {
+		if (isFileMetaDeletedValue(value)) return;
+		const rawPath = getMetaPath(value);
+		if (!rawPath) return;
+		const path = normalizeVaultPath(rawPath);
 		if (!path || resolved.has(path)) return;
 		resolved.set(path, fileId);
 	});
@@ -531,7 +541,7 @@ export function restoreFromSnapshot(
 
 	const livePathToId = liveDoc.getMap<string>("pathToId");
 	const liveIdToText = liveDoc.getMap<Y.Text>("idToText");
-	const liveMeta = liveDoc.getMap<FileMeta>("meta");
+	const liveMeta = liveDoc.getMap("meta");
 	const livePathToBlob = liveDoc.getMap<BlobRef>("pathToBlob");
 	const liveBlobTombstones = liveDoc.getMap("blobTombstones");
 	const liveUsesV2 = usesV2MetaPathModel(liveDoc);
@@ -568,13 +578,8 @@ export function restoreFromSnapshot(
 						result.markdownRestored++;
 
 						// Update metadata
-						liveMeta.set(liveFileId, {
-							path,
-							deleted: undefined,
-							deletedAt: undefined,
-							mtime: Date.now(),
-							device: options.device,
-						});
+						const metaEntry = createNestedActiveMeta(path, Date.now(), options.device);
+						liveMeta.set(liveFileId, metaEntry);
 					}
 				}
 				if (!liveUsesV2) {
@@ -605,11 +610,11 @@ export function restoreFromSnapshot(
 
 				// Drop stale tombstones for this path to avoid path-squat ghosts.
 				const staleTombstones: string[] = [];
-				liveMeta.forEach((entry, fileId) => {
+				liveMeta.forEach((value: unknown, fileId: string) => {
 					if (
 						fileId !== snapFileId
-						&& entry.path === path
-						&& isDeletedMeta(entry)
+						&& getMetaPath(value) === path
+						&& isFileMetaDeletedValue(value)
 					) {
 						staleTombstones.push(fileId);
 					}
@@ -619,13 +624,8 @@ export function restoreFromSnapshot(
 				}
 
 				// Clear tombstone and set fresh metadata
-				liveMeta.set(snapFileId, {
-					path,
-					deleted: undefined,
-					deletedAt: undefined,
-					mtime: Date.now(),
-					device: options.device,
-				});
+				const reviveEntry = createNestedActiveMeta(path, Date.now(), options.device);
+				liveMeta.set(snapFileId, reviveEntry);
 				livePaths.set(path, snapFileId);
 
 				result.markdownUndeleted++;
@@ -650,7 +650,4 @@ export function restoreFromSnapshot(
 
 	return result;
 }
-function isDeletedMeta(meta: FileMeta | undefined): boolean {
-	if (!meta) return false;
-	return meta.deleted === true || (typeof meta.deletedAt === "number" && Number.isFinite(meta.deletedAt));
-}
+

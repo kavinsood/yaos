@@ -89,6 +89,7 @@ const suites = [
 	[JITI, "tests/status-label.ts"],
 	[JITI, "tests/recovery-amplifier.ts"],
 	[JITI, "tests/disk-mirror-observer.ts"],
+	[JITI, "tests/meta-diskmirror-integration.ts"],
 	[JITI, "tests/server-pre-auth-runtime.ts"],
 	[JITI, "tests/server-route-classification-runtime.ts"],
 	[JITI, "tests/server-sync-message-classifier.ts"],

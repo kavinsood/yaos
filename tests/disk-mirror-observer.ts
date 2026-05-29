@@ -42,6 +42,14 @@ import {
 	ORIGIN_RESTORE,
 	ORIGIN_SEED,
 } from "../src/sync/origins";
+import {
+	buildMetaSnapshot,
+	extractAffectedFileIds,
+	computeIncrementalMetaChanges,
+	isFileMetaDeletedValue,
+	type MetaChangeBatch,
+} from "../src/sync/fileMeta";
+import { isLocalOrigin } from "../src/sync/origins";
 
 let passed = 0;
 let failed = 0;
@@ -80,6 +88,26 @@ function makeHarness() {
 		getFileIdForText: (text: Y.Text) => (text === ytext ? FILE_ID : null),
 		idToText: { entries: () => new Map([[FILE_ID, ytext]]).entries() },
 		isFileMetaDeleted: (m: { deleted?: boolean } | undefined) => Boolean(m?.deleted),
+		// Minimal semantic observer: existing tests only test afterTransaction / text observers.
+		// Provide a real implementation so DiskMirror.startMapObservers() doesn't crash.
+		observeMetaChanges: (() => {
+			let snapshot = buildMetaSnapshot(meta as Y.Map<unknown>);
+			const listeners = new Set<(batch: MetaChangeBatch) => void>();
+			(meta as Y.Map<unknown>).observeDeep((events: Y.YEvent<Y.AbstractType<unknown>>[]) => {
+				const origin = events[0]?.transaction.origin;
+				const isLocal = isLocalOrigin(origin, fakeProvider);
+				const affected = extractAffectedFileIds(events, meta as Y.Map<unknown>);
+				if (!affected) return;
+				const changes = computeIncrementalMetaChanges(snapshot, meta as Y.Map<unknown>, affected);
+				if (changes.length === 0) return;
+				const batch: MetaChangeBatch = { origin, isLocal, changes };
+				for (const l of listeners) l(batch);
+			});
+			return (cb: (batch: MetaChangeBatch) => void) => {
+				listeners.add(cb);
+				return () => { listeners.delete(cb); };
+			};
+		})(),
 	};
 
 	const fakeEditorBindings = {
