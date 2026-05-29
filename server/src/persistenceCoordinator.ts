@@ -10,8 +10,22 @@
  */
 
 import * as Y from "yjs";
-import type { ChunkedDocStore, JournalStats } from "./chunkedDocStore.js";
 import { bytesToHex } from "./hex.js";
+
+// Re-export for backwards compatibility with existing test imports
+export type { DocStoreJournalStats as JournalStats };
+
+/** Minimal storage interface that both ChunkedDocStore and SqlDocStore implement. */
+export interface DocStore {
+	appendUpdate(update: Uint8Array): Promise<DocStoreJournalStats | null> | DocStoreJournalStats | null;
+	rewriteCheckpoint(update: Uint8Array, stateVector?: Uint8Array): Promise<void> | void;
+	getJournalStats(): Promise<DocStoreJournalStats> | DocStoreJournalStats;
+}
+
+export interface DocStoreJournalStats {
+	entryCount: number;
+	totalBytes: number;
+}
 
 export const CHECKPOINT_FALLBACK_DELTA_BYTES = 2 * 1024 * 1024; // 2MB
 export const CHECKPOINT_FALLBACK_AFTER_FAILURES = 2;
@@ -56,7 +70,7 @@ export interface SaveResult {
 	success: boolean;
 	method: "append" | "checkpoint-fallback" | "immediate-fallback" | "skipped";
 	error?: string;
-	journalStats?: JournalStats;
+	journalStats?: DocStoreJournalStats;
 }
 
 function equalBytes(a: Uint8Array, b: Uint8Array): boolean {
@@ -104,7 +118,7 @@ export class PersistenceCoordinator {
 
 	constructor(
 		private readonly document: Y.Doc,
-		private readonly store: ChunkedDocStore,
+		private readonly store: DocStore,
 		private readonly trace?: (event: string, data: Record<string, unknown>) => void,
 		options?: PersistenceCoordinatorOptions,
 	) {
@@ -214,6 +228,7 @@ export class PersistenceCoordinator {
 			// Success — update state
 			this.lastPersistedStateVector = checkpointStateVector;
 			this.consecutiveSaveFailures = 0;
+			this.consecutiveCompactionFailures = 0; // Reset circuit breaker
 			this.health.status = "healthy";
 			this.health.lastSaveSucceededAt = new Date().toISOString();
 			this.health.lastSaveError = null; // Clear stale error on recovery
@@ -256,10 +271,23 @@ export class PersistenceCoordinator {
 		delta: Uint8Array,
 		currentStateVector: Uint8Array,
 	): Promise<SaveResult> {
-		let journalStats: JournalStats;
+		let journalStats: DocStoreJournalStats;
 
 		try {
-			journalStats = await this.store.appendUpdate(delta);
+			const result = await this.store.appendUpdate(delta);
+
+			// null means the delta exceeded the store's per-entry size limit.
+			// Route directly to checkpoint fallback — this is expected control
+			// flow for large deltas, not an error.
+			if (result === null) {
+				this.trace?.("save.append_oversized", {
+					deltaBytes: delta.byteLength,
+					note: "delta exceeds journal entry size limit, routing to checkpoint",
+				});
+				return this.executeCheckpointFallback(delta);
+			}
+
+			journalStats = result;
 		} catch (appendErr) {
 			const errorMessage = appendErr instanceof Error ? appendErr.message : String(appendErr);
 			const errorClass = appendErr instanceof Error ? appendErr.constructor.name : typeof appendErr;
@@ -338,6 +366,7 @@ export class PersistenceCoordinator {
 			// Success
 			this.lastPersistedStateVector = checkpointStateVector;
 			this.consecutiveSaveFailures = 0;
+			this.consecutiveCompactionFailures = 0; // Reset circuit breaker
 			this.health.status = "healthy";
 			this.health.lastSaveSucceededAt = new Date().toISOString();
 			this.health.lastSaveError = null; // Clear stale error on recovery
@@ -369,11 +398,27 @@ export class PersistenceCoordinator {
 		}
 	}
 
-	private async executeCompaction(journalStats: JournalStats): Promise<void> {
+	private consecutiveCompactionFailures = 0;
+
+	private async executeCompaction(journalStats: DocStoreJournalStats): Promise<void> {
 		const compactionReason =
 			journalStats.entryCount > this.journalCompactMaxEntries
 				? "entry_count_exceeded"
 				: "byte_size_exceeded";
+
+		// Circuit breaker: stop attempting compaction after 3 consecutive failures.
+		// The next successful checkpoint-fallback (triggered by append failures)
+		// will reset the counter via resetCompactionCircuitBreaker().
+		if (this.consecutiveCompactionFailures >= 3) {
+			this.trace?.("save.compaction_circuit_breaker", {
+				reason: compactionReason,
+				consecutiveCompactionFailures: this.consecutiveCompactionFailures,
+				journalEntryCount: journalStats.entryCount,
+				journalBytes: journalStats.totalBytes,
+				note: "compaction suspended until next successful checkpoint write",
+			});
+			return;
+		}
 
 		try {
 			const checkpointUpdate = Y.encodeStateAsUpdate(this.document);
@@ -387,6 +432,7 @@ export class PersistenceCoordinator {
 			this.health.lastCompactionAt = new Date().toISOString();
 			this.health.lastCompactionReason = compactionReason;
 			this.health.lastCompactionError = null;
+			this.consecutiveCompactionFailures = 0;
 
 			const compactedStats = await this.store.getJournalStats();
 			this.health.journalEntryCount = compactedStats.entryCount;
@@ -397,20 +443,35 @@ export class PersistenceCoordinator {
 				persistedStateVectorHash: checkpointSvHash,
 			});
 		} catch (err) {
-			// Compaction failure after successful append is NOT a data-loss event
+			// Compaction failure after successful append is NOT a data-loss event,
+			// but it IS an operational issue that must be visible.  The journal
+			// will grow until compaction succeeds.
 			const errorMessage = err instanceof Error ? err.message : String(err);
 			const errorClass = err instanceof Error ? err.constructor.name : typeof err;
 
+			this.consecutiveCompactionFailures++;
 			this.health.lastCompactionAt = new Date().toISOString();
 			this.health.lastCompactionReason = compactionReason;
 			this.health.lastCompactionError = `${errorClass}: ${errorMessage}`;
+
+			console.error(
+				`[yaos-sync:persistence] compaction failed (attempt ${this.consecutiveCompactionFailures}/3):`,
+				errorMessage,
+			);
 
 			this.trace?.("save.compaction_failed", {
 				reason: compactionReason,
 				errorClass,
 				message: errorMessage,
-				note: "append was successful, data is durable, compaction can be retried",
+				consecutiveCompactionFailures: this.consecutiveCompactionFailures,
+				journalEntryCount: journalStats.entryCount,
+				journalBytes: journalStats.totalBytes,
 			});
 		}
+	}
+
+	/** Reset the compaction circuit breaker after a successful checkpoint write. */
+	resetCompactionCircuitBreaker(): void {
+		this.consecutiveCompactionFailures = 0;
 	}
 }

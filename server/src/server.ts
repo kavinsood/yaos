@@ -3,6 +3,7 @@ import { YServer } from "y-partyserver";
 import type { Connection, ConnectionContext, WSMessage } from "partyserver";
 import { runSerialized, runSingleFlight } from "./asyncConcurrency";
 import { ChunkedDocStore } from "./chunkedDocStore";
+import { SqlDocStore } from "./sqlDocStore";
 import { readRoomMeta, type RoomMeta, writeRoomMeta } from "./roomMeta";
 import {
 	createSnapshot,
@@ -29,6 +30,7 @@ import {
 	PersistenceCoordinator,
 	type PersistenceHealth,
 } from "./persistenceCoordinator";
+import type { LoadedDocState } from "./sqlDocStore";
 
 const MAX_DEBUG_TRACE_EVENTS = 200;
 const JOURNAL_COMPACT_MAX_ENTRIES = 50;
@@ -103,6 +105,7 @@ export class VaultSyncServer extends YServer {
 	private loadPromise: Promise<void> | null = null;
 	private roomIdHint: string | null = null;
 	private chunkedDocStore: ChunkedDocStore | null = null;
+	private sqlDocStore: SqlDocStore | null = null;
 	private persistence: PersistenceCoordinator | null = null;
 	private snapshotMaybeChain: Promise<void> = Promise.resolve();
 	private roomMeta: RoomMeta | null = null;
@@ -121,12 +124,31 @@ export class VaultSyncServer extends YServer {
 	private loadedStateVectorHash: string | null = null;
 	private legacyDocumentMigrated = false;
 
+	/** Storage migration observability fields. */
+	private storageMode: "sql" | "kv-migrated" | "fresh" | "kv-fallback" | null = null;
+	private migrationStatus: "not_started" | "migrated" | "already_sql" | "failed" | null = null;
+	private migrationAt: string | null = null;
+	private migrationDurationMs: number | null = null;
+	private coldLoadDurationMs: number | null = null;
+	private oversizedDeltaCount = 0;
+
 	async onLoad(): Promise<void> {
 		await this.ensureDocumentLoaded();
 	}
 
 	async onSave(): Promise<void> {
 		await this.ensureDocumentLoaded();
+
+		// If SQL storage is broken and we're serving from KV fallback,
+		// do NOT attempt persistence.  The coordinator would try to write
+		// to the broken SQL store, fail, and log noise.  More importantly,
+		// accepting writes into memory while persistence is unavailable
+		// creates a data-loss waiting room.  Instead, skip silently —
+		// the Y.Doc in memory is ephemeral and clients are the authority.
+		if (this.storageMode === "kv-fallback") {
+			return;
+		}
+
 		// Delegate to PersistenceCoordinator — the single source of truth
 		// for save orchestration, fallback, and health tracking.
 		//
@@ -159,7 +181,12 @@ export class VaultSyncServer extends YServer {
 		if (shouldEcho) {
 			const svAfter = Y.encodeStateVector(this.document);
 			const docChanged = svBefore !== null && !equalBytes(svBefore, svAfter);
-			this.recordSvEchoResult(trySendSvEcho(connection, this.document, "postApply"));
+			// Do NOT send SV echoes in kv-fallback mode.  SV echoes signal
+			// "server durably received your state."  In fallback mode persistence
+			// is broken — sending echoes would give clients false confidence.
+			if (this.storageMode !== "kv-fallback") {
+				this.recordSvEchoResult(trySendSvEcho(connection, this.document, "postApply"));
+			}
 			// Fire-and-forget trace: do not block message processing.
 			void this.recordTrace("server.ydoc.update_observed", {
 				updateBytes: typeof message === "string" ? message.length : (message as ArrayBuffer).byteLength,
@@ -208,6 +235,15 @@ export class VaultSyncServer extends YServer {
 				svEcho: { ...this.svEchoCounters },
 				persistence: serverHealth,
 				documentSummary: this.documentLoaded ? this.getDocumentSummary() : null,
+				storage: {
+					mode: this.storageMode,
+					migrationStatus: this.migrationStatus,
+					migrationAt: this.migrationAt,
+					migrationDurationMs: this.migrationDurationMs,
+					coldLoadDurationMs: this.coldLoadDurationMs,
+					oversizedDeltaCount: this.oversizedDeltaCount,
+					migrationMeta: this.documentLoaded ? this.getSqlDocStore().getMigrationMeta() : null,
+				},
 			});
 		}
 
@@ -225,6 +261,22 @@ export class VaultSyncServer extends YServer {
 
 			await this.recordTrace(body.event, body.data ?? {});
 			return json({ ok: true });
+		}
+
+		if (request.method === "POST" && url.pathname === "/__yaos/compact") {
+			if (!(this.env as any).YAOS_ENABLE_ADMIN_ROUTES) {
+				return json({ error: "not found" }, 404);
+			}
+			await this.ensureDocumentLoaded();
+			return json(await this.executeEmergencyCompact());
+		}
+
+		if (request.method === "POST" && url.pathname === "/__yaos/cleanup-kv") {
+			if (!(this.env as any).YAOS_ENABLE_ADMIN_ROUTES) {
+				return json({ error: "not found" }, 404);
+			}
+			await this.ensureDocumentLoaded();
+			return json(await this.cleanupLegacyKvKeys());
 		}
 
 		if (request.method === "POST" && url.pathname === "/__yaos/snapshot-maybe") {
@@ -274,23 +326,114 @@ export class VaultSyncServer extends YServer {
 		const run = runSingleFlight(gate, async () => {
 			if (this.documentLoaded) return;
 
-			const store = this.getChunkedDocStore();
-			const state = await store.loadState();
+			const coldLoadStart = performance.now();
 
-			// First, load chunked state into a temporary doc to assess its richness
-			const chunkedDoc = new Y.Doc();
-			if (state.checkpoint) {
-				Y.applyUpdate(chunkedDoc, state.checkpoint);
+			const sqlStore = this.getSqlDocStore();
+			let sqlState: LoadedDocState | null = null;
+			try {
+				sqlState = sqlStore.loadState();
+			} catch (sqlErr) {
+				// SQL load failed (corrupt table, missing column after bad migration, etc.)
+				// Attempt KV fallback — do not rethrow here.
+				await this.recordTrace("sql-load-failed", {
+					error: sqlErr instanceof Error ? sqlErr.message : String(sqlErr),
+					note: "attempting KV fallback",
+				});
 			}
-			for (const update of state.journalUpdates) {
-				Y.applyUpdate(chunkedDoc, update);
-			}
-			const chunkedPathCount = this.countActivePathsInDoc(chunkedDoc);
 
-			// Legacy migration: check for pre-ChunkedDocStore "document" key.
-			// Migrate if legacy has real content but chunked only has sentinel state.
-			// The reporter's pathological shape was: legacy=full vault, chunked=2 tiny
-			// sys/init entries. We must not let tiny chunked writes block migration.
+			// Check if SQL has data (post-migration).
+			// Evaluated AFTER the try/catch: a null sqlState (SQL failure) correctly
+			// reports no SQL data and routes to the KV fallback below.
+			const sqlHasData = sqlState !== null && (sqlState.snapshot !== null || sqlState.journalUpdates.length > 0);
+
+			if (sqlHasData) {
+				// ── Normal SQL path ──────────────────────────────────────────
+				// sqlState is guaranteed non-null here (sqlHasData implies sqlState !== null)
+				if (sqlState!.snapshot) {
+					Y.applyUpdate(this.document, sqlState!.snapshot);
+				}
+				for (const update of sqlState!.journalUpdates) {
+					Y.applyUpdate(this.document, update);
+				}
+
+				const loadedSV = Y.encodeStateVector(this.document);
+				this.getPersistenceCoordinator().setInitialStateVector(loadedSV);
+				this.loadedStateVectorHash = bytesToHex(loadedSV.slice(0, 16));
+				this.getPersistenceCoordinator().health.journalEntryCount = sqlState!.journalStats.entryCount;
+				this.getPersistenceCoordinator().health.journalBytes = sqlState!.journalStats.totalBytes;
+				this.documentLoaded = true;
+				this.storageMode = "sql";
+				this.migrationStatus = "already_sql";
+				this.coldLoadDurationMs = performance.now() - coldLoadStart;
+				await this.syncRoomMetaFromDocument();
+				await this.recordTrace("checkpoint-load", {
+					storage: "sql",
+					hasSnapshot: sqlState!.snapshot !== null,
+					journalEntryCount: sqlState!.journalStats.entryCount,
+					journalBytes: sqlState!.journalStats.totalBytes,
+				});
+				return;
+			}
+
+			// ── SQL failed: attempt KV fallback (read-only, no SQL write-back) ──
+			if (sqlState === null) {
+				// SQL load threw — check if KV still has usable data.
+				const kvStore = this.getChunkedDocStore();
+				const kvState = await kvStore.loadState();
+				const kvHasData = kvState.checkpoint !== null || kvState.journalUpdates.length > 0;
+
+				if (kvHasData) {
+					// Load from KV — this is a degraded but functional state.
+					// Do NOT write back to SQL; leave that for a human operator.
+					if (kvState.checkpoint) Y.applyUpdate(this.document, kvState.checkpoint);
+					for (const update of kvState.journalUpdates) Y.applyUpdate(this.document, update);
+
+					const loadedSV = Y.encodeStateVector(this.document);
+					this.getPersistenceCoordinator().setInitialStateVector(loadedSV);
+					this.loadedStateVectorHash = bytesToHex(loadedSV.slice(0, 16));
+					this.getPersistenceCoordinator().health.journalEntryCount = kvState.journalStats.entryCount;
+					this.getPersistenceCoordinator().health.journalBytes = kvState.journalStats.totalBytes;
+					this.getPersistenceCoordinator().health.status = "degraded";
+					this.documentLoaded = true;
+					this.storageMode = "kv-fallback";
+					this.migrationStatus = "failed";
+					this.coldLoadDurationMs = performance.now() - coldLoadStart;
+					await this.syncRoomMetaFromDocument();
+					await this.recordTrace("kv-fallback-activated", {
+						kvCheckpointBytes: kvState.checkpoint?.byteLength ?? 0,
+						kvJournalEntries: kvState.journalStats.entryCount,
+						kvJournalBytes: kvState.journalStats.totalBytes,
+						activePathCount: this.countActivePathsInDoc(this.document),
+						note: "SQL load failed; serving from KV in degraded read-only mode",
+					});
+					return;
+				}
+
+				// Neither SQL nor KV has recoverable data — storage is unrecoverable.
+				// Fail-open with an empty document so the DO doesn't brick entirely.
+				const loadedSV = Y.encodeStateVector(this.document);
+				this.getPersistenceCoordinator().setInitialStateVector(loadedSV);
+				this.loadedStateVectorHash = bytesToHex(loadedSV.slice(0, 16));
+				this.getPersistenceCoordinator().health.journalEntryCount = 0;
+				this.getPersistenceCoordinator().health.journalBytes = 0;
+				this.getPersistenceCoordinator().health.status = "degraded";
+				this.documentLoaded = true;
+				this.storageMode = "kv-fallback";
+				this.migrationStatus = "failed";
+				this.coldLoadDurationMs = performance.now() - coldLoadStart;
+				await this.syncRoomMetaFromDocument();
+				await this.recordTrace("storage-unrecoverable", {
+					note: "SQL load failed and KV has no data; starting with empty document",
+				});
+				return;
+			}
+
+			// ── Migration path: load from old KV storage, write to SQL ───────
+			const kvStore = this.getChunkedDocStore();
+			const kvState = await kvStore.loadState();
+			const kvHasData = kvState.checkpoint !== null || kvState.journalUpdates.length > 0;
+
+			// Also check legacy "document" key
 			const legacyRaw = await this.ctx.storage.get<unknown>(LEGACY_DOCUMENT_KEY);
 			let legacyBytes: Uint8Array | null = null;
 			if (legacyRaw !== undefined) {
@@ -307,99 +450,101 @@ export class VaultSyncServer extends YServer {
 				}
 			}
 
-			if (legacyBytes && legacyBytes.byteLength > 0) {
-				const legacyDoc = new Y.Doc();
-				Y.applyUpdate(legacyDoc, legacyBytes);
-				const legacyPathCount = this.countActivePathsInDoc(legacyDoc);
-				const chunkedHasFileState = this.hasAnyFileStateInDoc(chunkedDoc);
+			if (kvHasData || (legacyBytes && legacyBytes.byteLength > 0)) {
+				const migrationStart = performance.now();
 
-				// Migrate if:
-				// - legacy has real files
-				// - chunked has no active paths
-				// - chunked has no semantic file state (tombstones, pathToId, meta)
-				// This prevents resurrecting deleted files if chunked has tombstones.
-				if (legacyPathCount > 0 && chunkedPathCount === 0 && !chunkedHasFileState) {
-					// Merge: apply legacy first, then chunked on top (to preserve any
-					// sys/schema updates that may have happened in chunked)
-					Y.applyUpdate(this.document, legacyBytes);
-					if (state.checkpoint) {
-						Y.applyUpdate(this.document, state.checkpoint);
-					}
-					for (const update of state.journalUpdates) {
-						Y.applyUpdate(this.document, update);
-					}
-					// Persist merged state into chunked format
-					const checkpointUpdate = Y.encodeStateAsUpdate(this.document);
-					const checkpointSV = Y.encodeStateVector(this.document);
-					await store.rewriteCheckpoint(checkpointUpdate, checkpointSV);
+				// Load into document from KV (same logic as before)
+				if (legacyBytes && legacyBytes.byteLength > 0) {
+					const legacyDoc = new Y.Doc();
+					Y.applyUpdate(legacyDoc, legacyBytes);
+					const legacyPathCount = this.countActivePathsInDoc(legacyDoc);
 
-					// Delete legacy key after successful migration — best-effort
-					// If deletion fails, the room should still load from chunked checkpoint.
-					try {
-						await this.ctx.storage.delete([LEGACY_DOCUMENT_KEY]);
-					} catch (deleteErr) {
-						await this.recordTrace("legacy-document-delete-failed", {
-							errorMessage: deleteErr instanceof Error ? deleteErr.message : String(deleteErr),
-							note: "migration completed, room will load from chunked checkpoint",
-						});
-					}
+					const chunkedDoc = new Y.Doc();
+					if (kvState.checkpoint) Y.applyUpdate(chunkedDoc, kvState.checkpoint);
+					for (const update of kvState.journalUpdates) Y.applyUpdate(chunkedDoc, update);
+					const chunkedPathCount = this.countActivePathsInDoc(chunkedDoc);
+					const chunkedHasFileState = this.hasAnyFileStateInDoc(chunkedDoc);
 
-					this.getPersistenceCoordinator().setInitialStateVector(checkpointSV);
-					this.legacyDocumentMigrated = true;
-					this.loadedStateVectorHash = bytesToHex(checkpointSV.slice(0, 16));
-					this.getPersistenceCoordinator().health.journalEntryCount = 0;
-					this.getPersistenceCoordinator().health.journalBytes = 0;
-					this.documentLoaded = true;
-					await this.syncRoomMetaFromDocument();
-					await this.recordTrace("legacy-document-migrated", {
-						legacyBytes: legacyBytes.byteLength,
-						legacyPathCount,
-						chunkedPathCount,
-						chunkedHasFileState,
-						chunkedJournalEntries: state.journalStats.entryCount,
-						checkpointBytes: checkpointUpdate.byteLength,
-					});
+					if (legacyPathCount > 0 && chunkedPathCount === 0 && !chunkedHasFileState) {
+						// Legacy wins: merge legacy + chunked
+						Y.applyUpdate(this.document, legacyBytes);
+						if (kvState.checkpoint) Y.applyUpdate(this.document, kvState.checkpoint);
+						for (const update of kvState.journalUpdates) Y.applyUpdate(this.document, update);
+					} else {
+						// Chunked wins: use KV state
+						if (kvState.checkpoint) Y.applyUpdate(this.document, kvState.checkpoint);
+						for (const update of kvState.journalUpdates) Y.applyUpdate(this.document, update);
+					}
 					legacyDoc.destroy();
 					chunkedDoc.destroy();
-					return;
+					this.legacyDocumentMigrated = true;
+				} else {
+					// Pure KV state
+					if (kvState.checkpoint) Y.applyUpdate(this.document, kvState.checkpoint);
+					for (const update of kvState.journalUpdates) Y.applyUpdate(this.document, update);
 				}
-				legacyDoc.destroy();
+
+				// Migrate to SQL: write full state as a clean snapshot
+				const migratedUpdate = Y.encodeStateAsUpdate(this.document);
+				sqlStore.rewriteCheckpoint(migratedUpdate);
+
+				const loadedSV = Y.encodeStateVector(this.document);
+				this.getPersistenceCoordinator().setInitialStateVector(loadedSV);
+				this.loadedStateVectorHash = bytesToHex(loadedSV.slice(0, 16));
+				this.getPersistenceCoordinator().health.journalEntryCount = 0;
+				this.getPersistenceCoordinator().health.journalBytes = 0;
+				this.documentLoaded = true;
+				this.storageMode = "kv-migrated";
+				this.migrationStatus = "migrated";
+				this.migrationAt = new Date().toISOString();
+				this.migrationDurationMs = performance.now() - migrationStart;
+				this.coldLoadDurationMs = performance.now() - coldLoadStart;
+
+				// Record migration marker in SQL so future loads can distinguish
+				// "migrated room" from "fresh room" from "interrupted migration."
+				sqlStore.recordMigration({
+					sourceFormat: legacyBytes ? "legacy+kv" : "kv",
+					sourceEntries: kvState.journalStats.entryCount,
+					sourceBytes: kvState.journalStats.totalBytes,
+					snapshotBytes: migratedUpdate.byteLength,
+					activePathCount: this.countActivePathsInDoc(this.document),
+					migratedAt: this.migrationAt,
+				});
+
+				await this.syncRoomMetaFromDocument();
+				await this.recordTrace("kv-to-sql-migration", {
+					hadLegacyKey: legacyBytes !== null,
+					kvJournalEntries: kvState.journalStats.entryCount,
+					kvJournalBytes: kvState.journalStats.totalBytes,
+					migratedBytes: migratedUpdate.byteLength,
+					activePathCount: this.countActivePathsInDoc(this.document),
+					migrationDurationMs: this.migrationDurationMs,
+				});
+
+				// Best-effort: delete legacy key (don't fail if this errors)
+				if (legacyBytes) {
+					try { await this.ctx.storage.delete([LEGACY_DOCUMENT_KEY]); } catch {}
+				}
+				return;
 			}
 
-			// Normal path: use chunked state
-			// (chunkedDoc already has the state, just copy to this.document)
-			if (state.checkpoint) {
-				Y.applyUpdate(this.document, state.checkpoint);
-			}
-			for (const update of state.journalUpdates) {
-				Y.applyUpdate(this.document, update);
-			}
-			chunkedDoc.destroy();
-
-			const loadedSV = (
-				state.checkpointStateVector && state.journalUpdates.length === 0
-			)
-				? state.checkpointStateVector.slice()
-				: Y.encodeStateVector(this.document);
+			// ── Empty state: fresh DO ────────────────────────────────────────
+			const loadedSV = Y.encodeStateVector(this.document);
 			this.getPersistenceCoordinator().setInitialStateVector(loadedSV);
 			this.loadedStateVectorHash = bytesToHex(loadedSV.slice(0, 16));
-			this.getPersistenceCoordinator().health.journalEntryCount = state.journalStats.entryCount;
-			this.getPersistenceCoordinator().health.journalBytes = state.journalStats.totalBytes;
+			this.getPersistenceCoordinator().health.journalEntryCount = 0;
+			this.getPersistenceCoordinator().health.journalBytes = 0;
 			this.documentLoaded = true;
+			this.storageMode = "fresh";
+			this.migrationStatus = "not_started";
+			this.coldLoadDurationMs = performance.now() - coldLoadStart;
 			await this.syncRoomMetaFromDocument();
 			await this.recordTrace("checkpoint-load", {
-				hasCheckpoint: state.checkpoint !== null,
-				checkpointStateVectorBytes: state.checkpointStateVector?.byteLength ?? 0,
-				journalEntryCount: state.journalStats.entryCount,
-				journalBytes: state.journalStats.totalBytes,
-				replayMode:
-					state.checkpoint !== null && state.journalUpdates.length > 0
-						? "checkpoint+journal"
-						: state.checkpoint !== null
-							? "checkpoint-only"
-							: state.journalUpdates.length > 0
-								? "journal-only"
-								: "empty",
+				storage: "sql",
+				hasSnapshot: false,
+				journalEntryCount: 0,
+				journalBytes: 0,
+				note: "fresh DO, no existing state",
 			});
 		});
 		this.loadPromise = gate.inFlight;
@@ -448,12 +593,22 @@ export class VaultSyncServer extends YServer {
 		return this.chunkedDocStore;
 	}
 
+	private getSqlDocStore(): SqlDocStore {
+		if (!this.sqlDocStore) {
+			this.sqlDocStore = new SqlDocStore(this.ctx.storage as any);
+		}
+		return this.sqlDocStore;
+	}
+
 	private getPersistenceCoordinator(): PersistenceCoordinator {
 		if (!this.persistence) {
 			this.persistence = new PersistenceCoordinator(
 				this.document,
-				this.getChunkedDocStore(),
+				this.getSqlDocStore(),
 				(event, data) => {
+					if (event === "save.append_oversized") {
+						this.oversizedDeltaCount++;
+					}
 					void this.recordTrace(`server.${event}`, data);
 				},
 				{
@@ -707,6 +862,131 @@ export class VaultSyncServer extends YServer {
 		);
 		this.snapshotMaybeChain = serialized.chain;
 		return await run;
+	}
+
+	private async executeEmergencyCompact(): Promise<{
+		status: string;
+		journalBefore: { entryCount: number; totalBytes: number };
+		journalAfter?: { entryCount: number; totalBytes: number };
+		error?: string;
+	}> {
+		const store = this.getSqlDocStore();
+		const statsBefore = store.getJournalStats();
+
+		if (statsBefore.entryCount === 0) {
+			return {
+				status: "noop",
+				journalBefore: statsBefore,
+				journalAfter: statsBefore,
+			};
+		}
+
+		try {
+			const checkpointUpdate = Y.encodeStateAsUpdate(this.document);
+			store.rewriteCheckpoint(checkpointUpdate);
+
+			// Update coordinator state
+			const coordinator = this.getPersistenceCoordinator();
+			const checkpointStateVector = Y.encodeStateVector(this.document);
+			coordinator.setInitialStateVector(checkpointStateVector);
+			coordinator.resetCompactionCircuitBreaker();
+
+			const statsAfter = store.getJournalStats();
+			coordinator.health.journalEntryCount = statsAfter.entryCount;
+			coordinator.health.journalBytes = statsAfter.totalBytes;
+			coordinator.health.lastCompactionAt = new Date().toISOString();
+			coordinator.health.lastCompactionReason = "emergency_compact";
+			coordinator.health.lastCompactionError = null;
+
+			await this.recordTrace("server.emergency_compact_succeeded", {
+				journalEntriesBefore: statsBefore.entryCount,
+				journalBytesBefore: statsBefore.totalBytes,
+				journalEntriesAfter: statsAfter.entryCount,
+				journalBytesAfter: statsAfter.totalBytes,
+				checkpointBytes: checkpointUpdate.byteLength,
+			});
+
+			return {
+				status: "compacted",
+				journalBefore: statsBefore,
+				journalAfter: statsAfter,
+			};
+		} catch (err) {
+			const errorMessage = err instanceof Error ? err.message : String(err);
+
+			await this.recordTrace("server.emergency_compact_failed", {
+				error: errorMessage,
+				journalEntryCount: statsBefore.entryCount,
+				journalBytes: statsBefore.totalBytes,
+			});
+
+			return {
+				status: "failed",
+				journalBefore: statsBefore,
+				error: errorMessage,
+			};
+		}
+	}
+
+	/**
+	 * One-shot cleanup of legacy KV storage keys left from the pre-SQL era.
+	 * Only safe to run AFTER confirming SQL storage is healthy (document loads,
+	 * sync works, journal appends succeed).
+	 *
+	 * Deletes: document:checkpoint:*, document:journal:*, and the legacy "document" key.
+	 */
+	private async cleanupLegacyKvKeys(): Promise<{
+		status: string;
+		keysDeleted: number;
+		error?: string;
+	}> {
+		// Safety: verify SQL has data before wiping KV
+		const sqlStore = this.getSqlDocStore();
+		const sqlState = sqlStore.loadState();
+		if (sqlState.snapshot === null && sqlState.journalUpdates.length === 0) {
+			return {
+				status: "aborted",
+				keysDeleted: 0,
+				error: "SQL storage is empty — refusing to delete KV data (would cause data loss)",
+			};
+		}
+
+		try {
+			// List all KV keys matching the old storage patterns
+			const allKeys = await this.ctx.storage.list();
+			const kvKeysToDelete: string[] = [];
+
+			for (const key of allKeys.keys()) {
+				if (
+					key === LEGACY_DOCUMENT_KEY ||
+					key.startsWith("document:checkpoint:") ||
+					key.startsWith("document:journal:")
+				) {
+					kvKeysToDelete.push(key);
+				}
+			}
+
+			if (kvKeysToDelete.length === 0) {
+				return { status: "noop", keysDeleted: 0 };
+			}
+
+			// Delete in batches of 128 (CF limit per delete call)
+			let deleted = 0;
+			for (let i = 0; i < kvKeysToDelete.length; i += 128) {
+				const batch = kvKeysToDelete.slice(i, i + 128);
+				deleted += await this.ctx.storage.delete(batch);
+			}
+
+			await this.recordTrace("server.kv_cleanup_succeeded", {
+				keysFound: kvKeysToDelete.length,
+				keysDeleted: deleted,
+			});
+
+			return { status: "cleaned", keysDeleted: deleted };
+		} catch (err) {
+			const errorMessage = err instanceof Error ? err.message : String(err);
+			return { status: "failed", keysDeleted: 0, error: errorMessage };
+		}
 	}
 
 	private async recordTrace(

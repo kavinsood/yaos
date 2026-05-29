@@ -82,3 +82,13 @@ export async function fetchVaultDebug(env: Env, vaultId: string): Promise<Respon
 	const stub = await getServerByName(env.YAOS_SYNC, vaultId);
 	return await stub.fetch("https://internal/__yaos/debug");
 }
+
+export async function compactVault(env: Env, vaultId: string): Promise<Response> {
+	const stub = await getServerByName(env.YAOS_SYNC, vaultId);
+	return await stub.fetch("https://internal/__yaos/compact", { method: "POST" });
+}
+
+export async function cleanupVaultKv(env: Env, vaultId: string): Promise<Response> {
+	const stub = await getServerByName(env.YAOS_SYNC, vaultId);
+	return await stub.fetch("https://internal/__yaos/cleanup-kv", { method: "POST" });
+}

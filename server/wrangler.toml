@@ -14,6 +14,10 @@ class_name = "ServerConfig"
 tag = "v1"
 new_sqlite_classes = ["VaultSyncServer", "ServerConfig"]
 
+[[r2_buckets]]
+binding = "YAOS_BUCKET"
+bucket_name = "yaos"
+
 [observability.logs]
 enabled = true
 
@@ -40,3 +44,18 @@ enabled = true
 #
 # [vars]
 # YAOS_DISABLE_LEGACY_WS_TOKEN = "true"
+
+# ---------------------------------------------------------------------------
+# Admin / debug route gating
+# ---------------------------------------------------------------------------
+#
+# Uncomment YAOS_ENABLE_ADMIN_ROUTES to enable the destructive admin routes:
+#   POST /__yaos/compact      — force an emergency journal compaction
+#   POST /__yaos/cleanup-kv   — delete legacy KV storage keys after SQL migration
+#
+# When this variable is absent or empty these routes return HTTP 404, keeping
+# them dark in production.  The read-only GET /__yaos/debug endpoint is always
+# available regardless of this setting.
+#
+# [vars]
+# YAOS_ENABLE_ADMIN_ROUTES = "true"
