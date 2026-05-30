@@ -14,7 +14,7 @@ import {
 } from "../sync/snapshotClient";
 import { VaultSync } from "../sync/vaultSync";
 import type { VaultSyncSettings } from "../settings";
-import type { TraceHttpContext } from "../debug/trace";
+import type { TraceHttpContext } from "../observability/traceContext";
 import { formatUnknown } from "../utils/format";
 import { SnapshotDiffModal, SnapshotListModal } from "./snapshotModals";
 

@@ -1,5 +1,5 @@
 import { VaultSync } from "../sync/vaultSync";
-import type { TraceRecord } from "../debug/trace";
+import type { TraceRecord } from "../observability/traceContext";
 import { deriveSyncFacts, type SyncFacts } from "./connectionFacts";
 
 export type OfflineReason =

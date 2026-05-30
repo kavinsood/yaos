@@ -7,7 +7,8 @@
  * 3. Port interfaces correctly categorize safe vs unsafe operations
  */
 
-import type { YaosDebugPort, YaosUnsafeQaPort } from "../src/debug/ports";
+import type { YaosDebugPort } from "../src/telemetry/debug/ports/yaosDebugPort";
+import type { YaosUnsafeQaPort } from "../qa/harness/ports/yaosUnsafeQaPort";
 
 let passed = 0;
 let failed = 0;

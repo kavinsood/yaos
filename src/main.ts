@@ -17,8 +17,8 @@ import {
 import { isMarkdownSyncable, isBlobSyncable } from "./types";
 import { planCategoryRenameAction } from "./sync/policy/renameAdmissionPolicy";
 import { classifySyncPath } from "./paths/pathCategory";
-import type { TraceSink } from "./observability/traceSink";
-import { FlightTraceSink } from "./debug/flightTraceSink";
+import type { TraceSink, ProductFlightPathEventInput } from "./observability/traceSink";
+import { NoopTraceSink } from "./observability/noopTraceSink";
 import {
 	type FrontmatterValidationResult,
 } from "./sync/frontmatterGuard";
@@ -43,11 +43,10 @@ import type { PreservedUnresolvedEntry } from "./sync/preservedUnresolved";
 import {
 	SnapshotService,
 } from "./snapshots/snapshotService";
-import {
-	type TraceEventDetails,
-	type TraceHttpContext,
-} from "./debug/trace";
-import { DiagnosticsService } from "./diagnostics/diagnosticsService";
+import type {
+	TraceEventDetails,
+	TraceHttpContext,
+} from "./observability/traceContext";
 import {
 	CapabilityUpdateService,
 	readPersistedServerCapabilitiesCache,
@@ -71,8 +70,6 @@ import { AttachmentOrchestrator } from "./runtime/attachmentOrchestrator";
 import { EditorWorkspaceOrchestrator } from "./runtime/editorWorkspaceOrchestrator";
 import { SetupLinkController } from "./runtime/setupLinkController";
 import { TraceRuntimeController } from "./runtime/traceRuntimeController";
-import { FlightTraceController } from "./debug/flightTraceController";
-import type { FlightMode } from "./debug/flightEvents";
 import { registerCommands } from "./commands";
 import {
 	getSyncStatusLabel,
@@ -83,11 +80,18 @@ import {
 import { formatUnknown, yTextToString } from "./utils/format";
 import { randomBase64Url } from "./utils/base64url";
 import { ConfirmModal } from "./ui/ConfirmModal";
-import { runVfsTortureTest } from "./dev/vfsTortureTest";
 import { runSchemaMigrationToV2 } from "./migrations/schemaV2";
-import { buildQaDebugApi } from "./qaDebugApi";
-import { DeviceWitnessTracker } from "./diagnostics/deviceWitnessTracker";
 import { isLocalOrigin } from "./sync/origins";
+import type { TelemetryRuntimeHandle } from "./telemetry/installTelemetryRuntime";
+import type { EngineControlPort, DiskIngestPort } from "./runtime/engineControlPort";
+import type { BindingPropagationGate } from "./sync/editorBinding";
+
+// Build-time constant injected by esbuild.
+//   production build (main.js):          define __YAOS_QA_HARNESS_ENABLED__ = false
+//   QA product build (product-main.js):  define __YAOS_QA_HARNESS_ENABLED__ = true
+// When false, esbuild dead-code-eliminates all blocks gated on this constant.
+// The declare tells TypeScript the type; the actual value comes from the esbuild define.
+declare const __YAOS_QA_HARNESS_ENABLED__: boolean;
 
 type PersistedPluginState = Partial<VaultSyncSettings> & {
 	_diskIndex?: DiskIndex;
@@ -124,16 +128,34 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private attachmentOrchestrator: AttachmentOrchestrator | null = null;
 	private editorWorkspace: EditorWorkspaceOrchestrator | null = null;
 	private snapshotService: SnapshotService | null = null;
-	private diagnosticsService: DiagnosticsService | null = null;
 	private reconciliationController!: ReconciliationController;
 	private setupLinkController: SetupLinkController | null = null;
 	private traceRuntime: TraceRuntimeController | null = null;
-	private flightTrace: FlightTraceController | null = null;
-	/** Domain-level trace sink. Adapts to flight recorder. */
-	private traceSink: TraceSink = new FlightTraceSink((event) => this.recordFlightPathEvent(event));
-	private deviceWitnessTracker: import("./diagnostics/deviceWitnessTracker").DeviceWitnessTracker | null = null;
-	/** SHA-256 hash of the active qaTraceSecret for cross-device identity verification. */
-	private _qaTraceSecretHash: string | null = null;
+	/** Telemetry runtime handle — null until dynamically loaded. */
+	private lab: TelemetryRuntimeHandle | null = null;
+
+	// ---------------------------------------------------------------------------
+	// QA harness state — only populated when __YAOS_QA_HARNESS_ENABLED__ is true.
+	//
+	// In production (main.js), esbuild defines __YAOS_QA_HARNESS_ENABLED__=false
+	// and dead-code-eliminates every block gated on it.  This field itself is
+	// declared here so TypeScript is satisfied; the constructor initialises it to
+	// null (one innocent assignment), and every meaningful access lives inside a
+	// gated block that disappears from main.js entirely.
+	//
+	// In the QA product build (product-main.js), __YAOS_QA_HARNESS_ENABLED__=true
+	// and the full state object is constructed in onload() before the first
+	// createReconciliationController() call.
+	// ---------------------------------------------------------------------------
+	private _qaState: {
+		diskIngestPort: DiskIngestPort | null;
+		externalEditPolicyOverride: import("./settings").ExternalEditPolicy | null;
+		pausedEditorPropagationPaths: Set<string>;
+		bindingReconfigureHook: ((path: string, deviceName: string, action: "pause" | "resume") => void) | null;
+		controlPort: EngineControlPort;
+	} | null = null;
+	/** Domain-level trace sink. Routes to lab when active, noop otherwise. */
+	private traceSink: TraceSink = new NoopTraceSink();
 	private statusBarEl: HTMLElement | null = null;
 	private statusInterval: ReturnType<typeof setInterval> | null = null;
 
@@ -211,15 +233,21 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			trace: (source, msg, details) => this.trace(source, msg, details),
 			scheduleTraceStateSnapshot: (reason) => this.scheduleTraceStateSnapshot(reason),
 			log: (message) => this.log(message),
-			recordFlightEvent: (event) => this.recordFlightEvent(event as import("./debug/flightEvents").FlightEventInput),
+			recordFlightEvent: (event) => this.recordFlightEvent(event as import("./telemetry/debug/flightEvents").FlightEventInput),
 			recordFlightPathEvent: (event) => this.recordFlightPathEvent(event),
-			computeRecoveryStateHash: async (path, content) => {
-				const tracker = this.deviceWitnessTracker;
-				if (!tracker) return null;
-				try {
-					return await tracker.computeWitnessStateHash(content);
-				} catch {
-					return null;
+			computeRecoveryStateHash: async (_path, content) => {
+				return this.lab?.computeWitnessStateHash(content) ?? null;
+			},
+			getEffectiveExternalEditPolicy: (runtimePolicy) => {
+				if (__YAOS_QA_HARNESS_ENABLED__) {
+					const override = this._qaState?.externalEditPolicyOverride;
+					if (override != null) return override;
+				}
+				return runtimePolicy;
+			},
+			registerDiskIngestPort: (port) => {
+				if (__YAOS_QA_HARNESS_ENABLED__ && this._qaState) {
+					this._qaState.diskIngestPort = port;
 				}
 			},
 		});
@@ -247,6 +275,53 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	async onload() {
 		const onloadStartedAt = Date.now();
+
+		// Initialize QA harness state before any component construction so that
+		// registerDiskIngestPort (called from createReconciliationController) and
+		// BindingPropagationGate hooks can store into _qaState.
+		// In production this block is dead code — esbuild eliminates it entirely.
+		if (__YAOS_QA_HARNESS_ENABLED__) {
+			this._qaState = {
+				diskIngestPort: null,
+				externalEditPolicyOverride: null,
+				pausedEditorPropagationPaths: new Set(),
+				bindingReconfigureHook: null,
+				controlPort: {
+					ingestDiskFileNow: async (path, reason = "modify") => {
+						if (!this._qaState?.diskIngestPort) throw new Error("DiskIngestPort not registered (reconciliation controller not started?)");
+						await this._qaState.diskIngestPort.ingestDiskFileNow(path, reason);
+					},
+					pauseEditorPropagation: (path) => {
+						if (!this._qaState) return false;
+						if (this._qaState.pausedEditorPropagationPaths.has(path)) return false;
+						this._qaState.pausedEditorPropagationPaths.add(path);
+						this._qaState.bindingReconfigureHook?.(path, this.settings.deviceName, "pause");
+						return true;
+					},
+					resumeEditorPropagation: (path) => {
+						if (!this._qaState) return false;
+						if (!this._qaState.pausedEditorPropagationPaths.has(path)) return false;
+						this._qaState.pausedEditorPropagationPaths.delete(path);
+						this._qaState.bindingReconfigureHook?.(path, this.settings.deviceName, "resume");
+						return true;
+					},
+					setExternalEditPolicyOverride: (policy) => {
+						if (!this._qaState) throw new Error("QA state not initialised");
+						const previous = this._qaState.externalEditPolicyOverride ?? this.getRuntimeConfig().externalEditPolicy;
+						this._qaState.externalEditPolicyOverride = policy;
+						return previous;
+					},
+				},
+			};
+			// Attach the accessor as an instance property so the method name
+			// never appears on the class prototype in production bundles.
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(this as any).getEngineControlPort = (): EngineControlPort => {
+				if (!this._qaState) throw new Error("QA harness state not initialised");
+				return this._qaState.controlPort;
+			};
+		}
+
 		this.capabilityUpdateService = new CapabilityUpdateService({
 			getSettings: () => this.settings,
 			pluginVersion: this.manifest.version,
@@ -301,33 +376,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			log: (message) => this.log(message),
 			onEditorsNeedReconcile: (reason) => this.editorWorkspace?.onReconciled(reason),
 		});
-		this.diagnosticsService = new DiagnosticsService({
-			app: this.app,
-			getSettings: () => this.settings,
-			getTraceHttpContext: () => this.getTraceHttpContext(),
-			getVaultSync: () => this.vaultSync,
-			getDiskMirror: () => this.diskMirror,
-			getBlobSync: () => this.getBlobSync(),
-			getEventRing: () => this.eventRing,
-			getRecentServerTrace: () => this.traceRuntime?.getRecentServerTrace() ?? [],
-			getFrontmatterQuarantineEntries: () => this.frontmatterQuarantineEntries,
-			getState: () => ({
-				reconciled: this.reconciliationController.getState().reconciled,
-				reconcileInFlight: this.reconciliationController.getState().reconcileInFlight,
-				reconcilePending: this.reconciliationController.getState().reconcilePending,
-				lastReconcileStats: this.reconciliationController.getState().lastReconcileStats,
-				awaitingFirstProviderSyncAfterStartup: this.awaitingFirstProviderSyncAfterStartup,
-				lastReconciledGeneration: this.reconciliationController.getState().lastReconciledGeneration,
-				untrackedFileCount: this.reconciliationController.getState().untrackedFileCount,
-				blockedDivergenceCount: this.reconciliationController.getState().blockedDivergenceCount,
-				lastBlockedDivergenceAt: this.reconciliationController.getState().lastBlockedDivergenceAt,
-				openFileCount: this.editorWorkspace?.openFileCount ?? 0,
-			}),
-			isMarkdownPathSyncable: (path) => this.isMarkdownPathSyncable(path),
-			collectOpenFileTraceState: () => this.collectOpenFileTraceState(),
-			sha256Hex: (text) => this.sha256Hex(text),
-			log: (message) => this.log(message),
-		});
 		this.setupLinkController = new SetupLinkController({
 			app: this.app,
 			getSettings: () => this.settings,
@@ -357,7 +405,66 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			}, "startup-generate-device-name");
 		}
 
+		// Install telemetry runtime when debug or qaDebugMode is enabled.
+		// Dynamic load keeps telemetry code out of the product bundle on normal startup.
+		if (this.settings.debug || this.settings.qaDebugMode) {
+			// Load telemetry.js by reading the file and evaluating it in the current
+			// module scope.  This is necessary because:
+			//   - import() in Obsidian's renderer uses app://obsidian.md scheme, which
+			//     cannot serve arbitrary filesystem paths outside the ASAR bundle.
+			//   - require() loads the file but the sub-module's own require doesn't
+			//     have Obsidian's patched require in scope, so require("obsidian") fails.
+			// Evaluating with new Function() and the current require passes Obsidian's
+			// patched require to the telemetry module so it can resolve "obsidian".
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const pluginDir = `${(this.app.vault.adapter as any).basePath}/${this.manifest.dir}`;
+			const telemetryBundlePath = `${pluginDir}/telemetry.js`;
+			// eslint-disable-next-line @typescript-eslint/no-require-imports
+			const fs = require("fs") as typeof import("fs");
+			const telemetryCode = fs.readFileSync(telemetryBundlePath, "utf-8");
+			const telemetryModule = { exports: {} as Record<string, unknown> };
+			// eslint-disable-next-line no-new-func, @typescript-eslint/no-implied-eval
+			const telemetryFn = new Function("require", "module", "exports", "__filename", "__dirname", telemetryCode);
+			telemetryFn(require, telemetryModule, telemetryModule.exports, telemetryBundlePath, pluginDir);
+			const { installTelemetryRuntime } = telemetryModule.exports as typeof import("./telemetry/installTelemetryRuntime");
+			this.lab = await installTelemetryRuntime({
+				app: this.app,
+				getSettings: () => this.settings,
+				getVaultSync: () => this.vaultSync,
+				getReconciliationController: () => this.reconciliationController,
+				getConnectionController: () => this.connectionController,
+				getEditorBindings: () => this.editorBindings,
+				getTraceSink: () => this.traceSink,
+				getTraceHttpContext: () => this.getTraceHttpContext(),
+				getDiskMirror: () => this.diskMirror,
+				getBlobSync: () => this.getBlobSync(),
+				getEventRing: () => this.eventRing,
+				getRecentServerTrace: () => this.traceRuntime?.getRecentServerTrace() ?? [],
+				getFrontmatterQuarantineEntries: () => this.frontmatterQuarantineEntries,
+				getRuntimeDiagnosticsState: () => ({
+					reconciled: this.reconciliationController.getState().reconciled,
+					reconcileInFlight: this.reconciliationController.getState().reconcileInFlight,
+					reconcilePending: this.reconciliationController.getState().reconcilePending,
+					lastReconcileStats: this.reconciliationController.getState().lastReconcileStats,
+					awaitingFirstProviderSyncAfterStartup: this.awaitingFirstProviderSyncAfterStartup,
+					lastReconciledGeneration: this.reconciliationController.getState().lastReconciledGeneration,
+					untrackedFileCount: this.reconciliationController.untrackedFileCount,
+					openFileCount: this.editorWorkspace?.openFileCount ?? 0,
+				}),
+				collectOpenFileTraceState: () => this.collectOpenFileTraceState(),
+				sha256Hex: (text) => this.sha256Hex(text),
+				getPluginVersion: () => this.manifest.version,
+				isMarkdownPathSyncable: (path) => this.isMarkdownPathSyncable(path),
+				registerCleanup: (cleanup) => this.register(cleanup),
+				log: (msg) => this.log(msg),
+			});
+			// Replace noop traceSink with telemetry's FlightTraceSink
+			this.traceSink = this.lab.traceSink;
+		}
+
+		// setupTraceRuntime after telemetry install so createLogger can reference this.lab
 		this.setupTraceRuntime();
+
 		this.setupFlightTrace();
 		this.attachmentOrchestrator = new AttachmentOrchestrator({
 			app: this.app,
@@ -464,7 +571,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			this.vaultSync = new VaultSync(this.settings, {
 				traceContext: this.getTraceHttpContext(),
 				trace: (source, msg, details) => this.trace(source, msg, details),
-				onFlightEvent: (event) => this.recordFlightEvent(event as import("./debug/flightEvents").FlightEventInput),
+				onFlightEvent: (event) => this.recordFlightEvent(event as import("./telemetry/debug/flightEvents").FlightEventInput),
 				onFlightPathEvent: (event) => this.recordFlightPathEvent(event),
 			getSocketTicket: (() => {
 				// Each VaultSync instance gets its own ticket cache.  The cache
@@ -527,11 +634,25 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			});
 
 			// 2. EditorBindingManager
+			const bindingPropagationGate: BindingPropagationGate = {
+				isPaused: (path) => {
+					if (__YAOS_QA_HARNESS_ENABLED__ && this._qaState) {
+						return this._qaState.pausedEditorPropagationPaths.has(path);
+					}
+					return false;
+				},
+				registerReconfigureHook: (fn) => {
+					if (__YAOS_QA_HARNESS_ENABLED__ && this._qaState) {
+						this._qaState.bindingReconfigureHook = fn;
+					}
+				},
+			};
 			this.editorBindings = new EditorBindingManager(
 				this.vaultSync,
 				this.settings.debug,
 				(source, msg, details) => this.trace(source, msg, details),
 				(event) => this.recordFlightPathEvent(event),
+				bindingPropagationGate,
 			);
 
 			// 3. Global CM6 extension
@@ -561,7 +682,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				() => this.persistPreservedUnresolvedState(),
 			);
 			this.diskMirror.startMapObservers();
-			this.diskMirror.setFlightEventHandler((event) => this.recordFlightPathEvent(event as import("./debug/flightEvents").FlightPathEventInput));
+			this.diskMirror.setFlightEventHandler((event) => this.recordFlightPathEvent(event as import("./telemetry/debug/flightEvents").FlightPathEventInput));
 			// Track SHA-256 baseline hash after every successful flushWrite.
 			// Used by decideClosedFileConflict on startup/re-enable to determine
 			// which side actually changed from the last known stable state.
@@ -574,7 +695,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				}
 				// Req 17.2: mark dirty after post-readback verification succeeds.
 				// contentHash is baselineHash-domain — NOT published as diskHash.
-				this.deviceWitnessTracker?.markDirty(path, "disk-write");
+				this.lab?.markWitnessDirty(path, "disk-write");
 			});
 
 			// 4b. BlobSyncManager (if attachment sync is enabled)
@@ -681,34 +802,19 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				registerCommands(this, {
 					getVaultSync: () => this.vaultSync,
 					getConnectionController: () => this.connectionController,
-					getDiagnosticsService: () => this.diagnosticsService,
+					getDiagnosticsService: () => this.lab?.diagnosticsService as import("./telemetry/diagnostics/diagnosticsService").DiagnosticsService ?? null,
 					getSnapshotService: () => this.snapshotService,
 					getFilesNeedingAttentionText: () => this.buildFilesNeedingAttentionText(),
 					getUntrackedFileCount: () => this.reconciliationController.untrackedFileCount,
-					isDebugEnabled: () => this.settings.debug,
 					runReconciliation: (mode) => this.runReconciliation(mode),
 					runSchemaMigrationToV2: () => this.runSchemaMigrationToV2(),
-					runVfsTortureTest: () => this.runVfsTortureTest(),
 					importUntrackedFiles: () => this.importUntrackedFiles(),
 					clearLocalServerReceiptState: () => this.clearLocalServerReceiptState(),
 					resetLocalCache: () => this.resetLocalCache(),
 					nuclearReset: () => this.nuclearReset(),
-					startQaFlightTrace: (mode?: string) => this.startQaFlightTrace(mode),
-					stopQaFlightTrace: () => this.stopQaFlightTrace(),
-					exportSafeFlightTrace: () => this.exportSafeFlightTrace(),
-					exportFullFlightTrace: () => this.exportFullFlightTrace(),
-					showTimelineForCurrentFile: () => this.showTimelineForCurrentFile(),
-					clearFlightLogs: () => this.clearFlightLogs(),
-					// Phase 3 QA commands (only wired when qaDebugMode is on)
-					...(this.settings.qaDebugMode ? {
-						qaExportWitnessBundle: () => this._qaExportWitnessBundle("safe"),
-						qaExportWitnessBundleUnsafe: () => this._qaExportWitnessBundle("unsafe-local"),
-						qaShowDeviceIdentity: () => this._qaShowDeviceIdentity(),
-						qaSetScenarioRunId: () => this._qaSetScenarioRunId(),
-						qaAdvanceScenarioStep: () => this._qaAdvanceScenarioStep(),
-						qaRefreshWitnessCurrentFile: () => this._qaRefreshWitnessCurrentFile(),
-					} : {}),
 				});
+				// Lab/QA commands are registered separately by the lab runtime.
+				this.lab?.registerCommands(this);
 				this.commandsRegistered = true;
 			}
 
@@ -779,6 +885,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				this.updateStatusBar("error");
 				return;
 			}
+
+			// Mark schema v3 if room is still at v2 (lazy, no metadata migration).
+			this.vaultSync.markSchemaV3(this.settings.deviceName);
 
 			// Check for fatal auth error before waiting for provider
 			if (this.vaultSync.fatalAuthError) {
@@ -1455,19 +1564,17 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			isObsidianFileMetadataRaceError: (err) => this.isObsidianFileMetadataRaceError(err),
 			handleIndexedDbDegraded: (source, err) => this.handleIndexedDbDegraded(source, err),
 			registerCleanup: (cleanup) => this.register(cleanup),
+			createLogger: this.lab
+				? (config) => this.lab!.createTraceLogger(this.app, config)
+				: undefined,
 		});
 		this.traceRuntime.start();
 	}
 
 	private setupFlightTrace(): void {
-		this.flightTrace = new FlightTraceController({
-			app: this.app,
-			getSettings: () => this.settings,
-			getPluginVersion: () => this.manifest.version,
+		this.lab?.setupFlightTrace({
 			getDocSchemaVersion: () => this.vaultSync?.storedSchemaVersion ?? null,
 			buildCheckpoint: () => this.buildFlightCheckpoint(),
-			registerCleanup: (cleanup) => this.register(cleanup),
-			log: (message) => this.log(message),
 		});
 		void this.refreshFlightTraceState("startup");
 	}
@@ -1484,76 +1591,12 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.traceRuntime?.record(source, msg, details);
 	}
 
-	private recordFlightEvent(event: import("./debug/flightEvents").FlightEventInput): void {
-		this.flightTrace?.record(event);
+	private recordFlightEvent(event: import("./telemetry/debug/flightEvents").FlightEventInput): void {
+		this.lab?.recordFlightEvent(event);
 	}
 
-	private recordFlightPathEvent(event: import("./debug/flightEvents").FlightPathEventInput): void {
-		// Augment CRDT admission events and rename target events with path policy metadata.
-		// This allows the analyzer to detect active excluded paths in safe-mode traces
-		// (where raw paths are redacted to pathIds) without duplicating exclusion logic.
-		// The product already knows the policy decision at the event source — embed it here.
-		const admissionKinds = new Set([
-			"crdt.file.created",
-			"crdt.file.renamed",
-			"crdt.file.revived",
-		]);
-		const isAdmissionOrRenameTarget =
-			admissionKinds.has(event.kind) ||
-			(event.kind === "disk.rename.observed" &&
-				(event.data as Record<string, unknown> | undefined)?.renameRole === "target");
-
-		if (isAdmissionOrRenameTarget) {
-			const excludedByPolicy = !this.isMarkdownPathSyncable(event.path);
-			event = {
-				...event,
-				data: {
-					...(event.data as Record<string, unknown> | undefined ?? {}),
-					excludedByPolicy,
-				},
-			};
-		}
-
-		// recovery.decision uses the precision path (reserveAndRecordPath)
-		// so the witness can correlate the recoveryStateHash with the
-		// reserved seq synchronously. Recording it twice (once via
-		// recordPath, then again via reserveAndRecordPath) is a logging
-		// bug — duplicates pollute the trace and confuse analyzers. Route
-		// the event through exactly one recorder per kind.
-		const isRecoveryDecisionMd =
-			event.kind === "recovery.decision" && event.path.endsWith(".md");
-
-		if (!isRecoveryDecisionMd) {
-			void this.flightTrace?.recordPath(event);
-		}
-
-		// Req 17.3: mark dirty for recovery.decision and recovery.apply.done.
-		if (
-			(event.kind === "recovery.decision" || event.kind === "recovery.apply.done") &&
-			event.path.endsWith(".md")
-		) {
-			this.deviceWitnessTracker?.markDirty(event.path, "recovery");
-		}
-
-		// Phase 2 Req 11 + Fix 4: precision path for recovery_emitted_old_hash.
-		// reserveAndRecordPath reserves seq synchronously and returns it — no currentSeq inference.
-		if (isRecoveryDecisionMd) {
-			const data = event.data as Record<string, unknown> | undefined;
-			const recoveryStateHash = data?.recoveryStateHash as string | undefined;
-			if (this.flightTrace) {
-				// Use reserveAndRecordPath to record AND get the actual seq.
-				// This is the only recording path for recovery.decision events.
-				const recoverySeq = this.flightTrace.reserveAndRecordPath(event);
-				this.deviceWitnessTracker?.notifyPrecursorEvent(event.path, "recovery", recoverySeq);
-				this.deviceWitnessTracker?.handleRecoveryDecision(event.path, recoveryStateHash);
-			} else {
-				// No flight trace active — still notify the witness, but the
-				// event is not persisted (consistent with other kinds when
-				// flightTrace is undefined).
-				this.deviceWitnessTracker?.handleRecoveryDecision(event.path, recoveryStateHash);
-			}
-			return;
-		}
+	private recordFlightPathEvent(event: ProductFlightPathEventInput | import("./telemetry/debug/flightEvents").FlightPathEventInput): void {
+		this.lab?.recordFlightPathEvent(event);
 	}
 
 	private scheduleTraceStateSnapshot(reason: string): void {
@@ -1616,8 +1659,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	}
 
 	private async refreshFlightTraceState(reason: string): Promise<void> {
-		if (!this.flightTrace) return;
-		await this.flightTrace.refreshFromSettings(reason);
+		await this.lab?.refreshFlightTraceState(reason);
 	}
 
 	private async collectOpenFileTraceState(): Promise<Array<Record<string, unknown>>> {
@@ -1711,7 +1753,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	onunload() {
 		this.log("Unloading plugin");
-		void this.flightTrace?.stop();
+		this.lab?.dispose();   // dispose stops flight trace, witness, and QA API
 		void this.traceRuntime?.shutdown();
 		document.body.removeClass("vault-crdt-show-cursors");
 		// Remove plugin-owned debug global to prevent stale API references
@@ -2053,7 +2095,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			app: this.app,
 			vaultSync: this.vaultSync,
 			settings: this.settings,
-			diagnosticsService: this.diagnosticsService,
+			diagnosticsService: this.lab?.diagnosticsService as import("./telemetry/diagnostics/diagnosticsService").DiagnosticsService ?? null,
 			log: (msg) => this.log(msg),
 			runReconciliation: async () => {
 				const mode = this.vaultSync?.getSafeReconcileMode();
@@ -2063,580 +2105,25 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		});
 	}
 
-	private async runVfsTortureTest(): Promise<void> {
-		if (!this.vaultSync) {
-			new Notice("Sync not initialized");
-			return;
-		}
-		await runVfsTortureTest({
-			app: this.app,
-			vaultSync: this.vaultSync,
-			settings: this.settings,
-			reconciliationController: this.reconciliationController,
-			editorWorkspace: this.editorWorkspace,
-			diagnosticsService: this.diagnosticsService,
-			getBlobSync: () => this.getBlobSync(),
-			getTraceHttpContext: () => this.getTraceHttpContext(),
-			eventRing: this.eventRing,
-			log: (msg) => this.log(msg),
-		});
-	}
-
-	private async startQaFlightTrace(mode?: string): Promise<void> {
-		const resolved = (mode ?? this.settings.qaTraceMode) as FlightMode;
-		await this.flightTrace?.start(resolved, this.settings.qaTraceSecret || null, {
-			manualStart: true,
-		});
-		// Compute SHA-256 of qaTraceSecret for cross-device identity verification (Fix 3)
-		const secret = this.settings.qaTraceSecret ?? "";
-		try {
-			const bytes = new TextEncoder().encode(`yaos-qa-trace-secret:${secret}`);
-			const digest = await globalThis.crypto.subtle.digest("SHA-256", bytes);
-			const hex = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
-			this._qaTraceSecretHash = `sha256:${hex}`;
-		} catch {
-			this._qaTraceSecretHash = `len:${secret.length}`;
-		}
-		this._startDeviceWitnessTracker(resolved);
-		new Notice(`QA flight trace started (mode: ${resolved}).`, 4000);
-	}
-
-	private async stopQaFlightTrace(): Promise<void> {
-		// Phase 3: persist checkpoint segments to filesystem on trace stop (opt-in, fail-closed)
-		await this._persistCheckpointSegmentsIfSafe();
-		this._stopDeviceWitnessTracker();
-		await this.flightTrace?.stop();
-		new Notice("QA flight trace stopped.", 4000);
-	}
-
-	// -----------------------------------------------------------------------
-	// Phase 3: witness bundle export + identity command + scenario commands
-	// -----------------------------------------------------------------------
-
-	private _buildBundleHeader(privacyMode: "safe" | "unsafe-local"): Record<string, unknown> {
-		const ftc = this.flightTrace;
-		const ctx = ftc?.context;
-		const tracker = this.deviceWitnessTracker;
-		const segments = tracker?.getCheckpointSegments() ?? [];
-		const eventCount = segments.reduce((n, s) => {
-			return n + s.content.split("\n").filter((l) => {
-				if (!l.trim()) return false;
-				try { const o = JSON.parse(l) as Record<string, unknown>; return o.kind !== "checkpoint.segment.header"; } catch { return false; }
-			}).length;
-		}, 0);
-		const scenarioState = tracker?.getScenarioStepState();
-		return {
-			kind: "bundle.header",
-			bundleSchemaVersion: 1,
-			createdAt: new Date().toISOString(),
-			pluginVersion: this.manifest.version,
-			deviceId: ctx?.deviceId ?? "unknown",
-			deviceLabel: this.settings.deviceName ?? "unknown",
-			platform: Platform.isMobile ? (Platform.isIosApp ? "ios" : "android") : "desktop",
-			runtimeState: tracker?.getRuntimeState() ?? "unknown",
-			localTraceId: ctx?.traceId ?? "unknown",
-			scenarioRunId: scenarioState?.scenarioRunId ?? null,
-			scenarioId: scenarioState?.scenarioId ?? null,
-			qaTraceSecretHash: this._qaTraceSecretHash ?? "(no qaTraceSecret configured)",
-			flightMode: ftc?.currentRecorder?.mode ?? "safe",
-			eventCount,
-			containsRawPaths: privacyMode === "unsafe-local",
-			hashDomain: "witness-state-v1",
-			privacyMode,
-		};
-	}
-
-	private _buildBundleString(privacyMode: "safe" | "unsafe-local"): string {
-		const header = this._buildBundleHeader(privacyMode);
-		const tracker = this.deviceWitnessTracker;
-		const segments = tracker?.getCheckpointSegments() ?? [];
-		const lines = [JSON.stringify(header)];
-		for (const seg of segments) {
-			lines.push(seg.content.trimEnd());
-		}
-		return lines.join("\n") + "\n";
-	}
-
-	private async _qaExportWitnessBundle(privacyMode: "safe" | "unsafe-local"): Promise<void> {
-		if (!this.settings.qaDebugMode) return;
-		const tracker = this.deviceWitnessTracker;
-		const ftc = this.flightTrace;
-		if (!tracker || !ftc?.context) {
-			new Notice("No active flight trace; nothing to export", 5000);
-			return;
-		}
-		const bundleStr = this._buildBundleString(privacyMode);
-
-		// Primary: clipboard
-		let clipboardOk = false;
-		try {
-			await navigator.clipboard.writeText(bundleStr);
-			clipboardOk = true;
-		} catch { /* fall through to modal */ }
-
-		if (clipboardOk) {
-			new Notice("Witness bundle copied to clipboard.", 5000);
-			return;
-		}
-
-		// Fallback: modal with selectable text (reliable on mobile when clipboard is unavailable)
-		this._showBundleModal(bundleStr);
-	}
-
-	private _showBundleModal(bundleStr: string): void {
-		const tracker = this.deviceWitnessTracker;
-		const scenarioState = tracker?.getScenarioStepState();
-		const segments = tracker?.getCheckpointSegments() ?? [];
-		const eventCount = segments.reduce((n, s) => n + s.content.split("\n").filter((l) => {
-			if (!l.trim()) return false;
-			try { return (JSON.parse(l) as Record<string, unknown>).kind !== "checkpoint.segment.header"; } catch { return false; }
-		}).length, 0);
-		const modal = new Modal(this.app);
-		modal.titleEl.setText("YAOS QA: Witness Bundle");
-		const info = modal.contentEl.createEl("div", { attr: { style: "font-size:11px;font-family:monospace;background:var(--background-secondary);padding:8px;border-radius:4px;margin-bottom:8px;" } });
-		info.createEl("div", { text: `deviceId: ${this.flightTrace?.context?.deviceId ?? "unknown"}` });
-		info.createEl("div", { text: `scenarioRunId: ${scenarioState?.scenarioRunId ?? "(not set)"}` });
-		info.createEl("div", { text: `scenarioId: ${scenarioState?.scenarioId ?? "(not set)"}` });
-		info.createEl("div", { text: `events: ${eventCount}  |  privacyMode: safe` });
-		const ta = modal.contentEl.createEl("textarea", {
-			attr: { rows: "18", style: "width:100%;font-size:9px;font-family:monospace;white-space:pre;" },
-		});
-		ta.value = bundleStr;
-		modal.contentEl.createEl("p", { text: "Select all → copy → share to your analysis machine.", attr: { style: "font-size:11px;color:var(--text-muted);margin-top:6px;" } });
-		modal.open();
-		setTimeout(() => { ta.select(); }, 50);
-	}
-
-	private _qaShowDeviceIdentity(): void {
-		if (!this.settings.qaDebugMode) return;
-		const ftc = this.flightTrace;
-		const ctx = ftc?.context;
-		const tracker = this.deviceWitnessTracker;
-		const scenarioState = tracker?.getScenarioStepState();
-		const platform = Platform.isMobile ? (Platform.isIosApp ? "ios" : "android") : "desktop";
-
-		// Use cached hash if trace is active, otherwise compute from settings secret
-		const secretHash = this._qaTraceSecretHash ?? (() => {
-			const secret = this.settings.qaTraceSecret;
-			if (!secret) return null;
-			// Synchronous fallback: show length only (async SHA-256 not available here)
-			// The full hash is only available after startFlightTrace
-			return `len:${secret.length} (start trace for full sha256)`;
-		})();
-
-		const truncatedHash = secretHash?.startsWith("sha256:")
-			? `sha256:${secretHash.slice(7, 19)}…${secretHash.slice(-4)}`
-			: secretHash ?? "(no qaTraceSecret configured)";
-
-		const lines = [
-			`deviceId: ${ctx?.deviceId ?? "unknown (start trace to get deviceId)"}`,
-			`Device label (display-only — never used as a key): ${this.settings.deviceName ?? "unknown"}`,
-			`pluginVersion: ${this.manifest.version}`,
-			`platform: ${platform}`,
-			`flightMode: ${ftc?.currentRecorder?.mode ?? "(no active trace)"}`,
-			`traceActive: ${!!ctx}`,
-			`localTraceId: ${ctx?.traceId ?? "(none)"}`,
-			`scenarioRunId: ${scenarioState?.scenarioRunId ?? "(not set)"}`,
-			`scenarioId: ${scenarioState?.scenarioId ?? "(not set)"}`,
-			`qaTraceSecretHash: ${truncatedHash}`,
-			`runtimeState: ${tracker?.getRuntimeState() ?? "unknown"}`,
-			`bundleExportAvailable: ${!!(tracker && (tracker.getCheckpointSegments().length > 0))}`,
-		].join("\n");
-
-		new Notice(lines, 12000);
-		console.debug("[yaos] Device identity for QA:\n" + lines);
-		navigator.clipboard.writeText(lines).catch(() => { /* best-effort */ });
-	}
-
-	private _qaSetScenarioRunId(): void {
-		if (!this.settings.qaDebugMode) return;
-		const tracker = this.deviceWitnessTracker;
-		if (!tracker) {
-			new Notice("No active flight trace. Start a trace first.", 5000);
-			return;
-		}
-		const modal = new Modal(this.app);
-		modal.titleEl.setText("YAOS QA: Set Scenario Run ID");
-		const addField = (label: string, placeholder: string): HTMLInputElement => {
-			modal.contentEl.createEl("label", { text: label, attr: { style: "display:block;font-size:12px;margin-top:10px;margin-bottom:2px;" } });
-			return modal.contentEl.createEl("input", { attr: { type: "text", placeholder, style: "width:100%;padding:4px;font-size:13px;" } });
-		};
-		const runIdInput = addField("scenarioRunId (shared across all devices)", "e.g. s12a-run-2026-05-19");
-		const scenarioIdInput = addField("scenarioId", "e.g. s12a-three-device-passive-quorum");
-		const btn = modal.contentEl.createEl("button", { text: "Set", attr: { style: "margin-top:14px;padding:6px 16px;" } });
-		btn.addEventListener("click", () => {
-			const runId = runIdInput.value.trim();
-			const scenarioId = scenarioIdInput.value.trim();
-			if (!runId || !scenarioId) { new Notice("Both fields are required.", 3000); return; }
-			tracker.setScenarioRunId(runId, scenarioId);
-			new Notice(`Scenario run ID set: ${runId} / ${scenarioId}`, 5000);
-			modal.close();
-		});
-		modal.open();
-		setTimeout(() => { runIdInput.focus(); }, 50);
-	}
-
-	private _qaAdvanceScenarioStep(): void {
-		if (!this.settings.qaDebugMode) return;
-		const api = (window as unknown as Record<string, unknown>).__YAOS_DEBUG__ as import("./qaDebugApi").YaosQaDebugApi | undefined;
-		if (!api) {
-			new Notice("QA debug API not mounted. Enable qaDebugMode and start a trace.", 5000);
-			return;
-		}
-		const tracker = this.deviceWitnessTracker;
-		const currentStep = tracker?.getScenarioStepState().stepIndex ?? null;
-		const modal = new Modal(this.app);
-		modal.titleEl.setText("YAOS QA: Advance Scenario Step");
-		if (currentStep !== null) {
-			modal.contentEl.createEl("p", { text: `Current step: ${currentStep}`, attr: { style: "font-size:12px;color:var(--text-muted);margin-bottom:8px;" } });
-		}
-		const addField = (label: string, placeholder: string): HTMLInputElement => {
-			modal.contentEl.createEl("label", { text: label, attr: { style: "display:block;font-size:12px;margin-top:8px;margin-bottom:2px;" } });
-			return modal.contentEl.createEl("input", { attr: { type: "text", placeholder, style: "width:100%;padding:4px;font-size:13px;" } });
-		};
-		const stepInput = addField("scenarioStepIndex (must be > current)", `e.g. ${(currentStep ?? 0) + 1}`);
-		const labelInput = addField("stepLabel (optional)", "e.g. pre-action-baseline");
-		const btn = modal.contentEl.createEl("button", { text: "Advance", attr: { style: "margin-top:14px;padding:6px 16px;" } });
-		btn.addEventListener("click", () => {
-			const stepIndex = parseInt(stepInput.value.trim(), 10);
-			if (isNaN(stepIndex) || stepIndex < 0) { new Notice("Enter a non-negative integer.", 4000); return; }
-			if (currentStep !== null && stepIndex <= currentStep) {
-				new Notice(`Step must be greater than current step (${currentStep}).`, 4000);
-				return;
-			}
-			const label = labelInput.value.trim() || undefined;
-			api.__qaOnlyAdvanceScenarioStepUnsafe?.(stepIndex, label);
-			new Notice(`Scenario step advanced to ${stepIndex}${label ? ` (${label})` : ""}`, 4000);
-			modal.close();
-		});
-		modal.open();
-		setTimeout(() => { stepInput.focus(); }, 50);
-	}
-
-	private async _persistCheckpointSegmentsIfSafe(): Promise<void> {
-		// Filesystem persistence is always fail-closed on desktop: configDir (.obsidian) is
-		// inside the vault root. In-memory segments are the canonical store; bundle export
-		// via clipboard/modal is the primary export channel (Requirement 4.0).
-		// No-op: segments remain in-memory until the tracker is disposed.
-	}
-
-	private _qaRefreshWitnessCurrentFile(): void {
-		if (!this.settings.qaDebugMode) return;
-		const tracker = this.deviceWitnessTracker;
-		if (!tracker) {
-			new Notice("No active flight trace. Start a trace first.", 5000);
-			return;
-		}
-		const file = this.app.workspace.getActiveFile();
-		if (!file || !file.path.endsWith(".md")) {
-			new Notice("Open a Markdown file first.", 4000);
-			return;
-		}
-		const path = file.path;
-		tracker.clearSuppressionForPath(path);
-		tracker.markDirty(path, "disk-write");
-		const fileId = this.vaultSync?.getFileId(path);
-		new Notice(`Witness refresh triggered: ${path}${fileId ? ` (fileId: ${fileId.slice(0, 8)}…)` : ""}`, 5000);
-	}
-
-	private _startDeviceWitnessTracker(mode: FlightMode): void {
-		this._stopDeviceWitnessTracker();
-		const sink = this.flightTrace;
-		const ctx = this.flightTrace?.context;
-		if (!sink || !ctx) return;
-
-		this.deviceWitnessTracker = new DeviceWitnessTracker({
-			stateSecret: randomBase64Url(16),
-			qaTraceSecret: this.settings.qaTraceSecret || null,
-			flightMode: mode,
-			sink,
-			traceContext: ctx,
-			platform: Platform.isMobile ? "mobile" : "desktop",
-			// Fix 2: provide pathId resolver so checkpoint lines include pathId
-			getPathId: async (path) => {
-				try {
-					const result = await this.flightTrace?.getPathId(path);
-					return result?.pathId ?? null;
-				} catch {
-					return null;
-				}
-			},
-			readCrdtContent: (path) => {
-				const vs = this.vaultSync;
-				if (!vs) return null;
-				const text = vs.getTextForPath(path);
-				if (!text) return null;
-				return yTextToString(text);
-			},
-			isCrdtTombstoned: (path) => {
-				return this.vaultSync?.isMarkdownTombstoned(path) ?? false;
-			},
-			getFileId: (path) => {
-				return this.vaultSync?.getFileId(path);
-			},
-			readDiskContent: async (path) => {
-				const file = this.app.vault.getFileByPath(path);
-				if (!file) return null;
-				try {
-					return await this.app.vault.read(file);
-				} catch {
-					return null;
-				}
-			},
-			sampleEditor: (path) => {
-				const editorBindings = this.editorBindings;
-				if (!editorBindings) return { kind: "not_open", content: null };
-
-				let targetView: MarkdownView | null = null;
-				this.app.workspace.iterateAllLeaves((leaf) => {
-					if (targetView) return;
-					const view = leaf.view as unknown as { file?: { path?: string } };
-					if (view?.file?.path === path) {
-						targetView = leaf.view as unknown as MarkdownView;
-					}
-				});
-				if (!targetView) return { kind: "not_open", content: null };
-
-				const health = editorBindings.getBindingHealthForView(targetView);
-				if (!health.bound) return { kind: "not_open", content: null };
-				if (health.settling) return { kind: "settling", content: null };
-				if (!health.healthy) return { kind: "unhealthy", content: null };
-
-				let content: string | null = null;
-				try {
-					const view = targetView as unknown as { editor?: { getValue?: () => string } };
-					content = view.editor?.getValue?.() ?? null;
-				} catch {
-					content = null;
-				}
-				return { kind: "healthy_sampled", content };
-			},
-		});
-
-		// Wire Y.Text observers for any-origin transaction dirty triggers (Req 3.1).
-		const vs = this.vaultSync;
-		if (vs) {
-			this._witnessTextObservers = new Map();
-			const tracker = this.deviceWitnessTracker;
-
-			const attachTextObserver = (fileId: string, ytext: import("yjs").Text) => {
-				if (this._witnessTextObservers?.has(fileId)) return;
-				const handler = (_event: unknown, txn: { origin: unknown }) => {
-					// Find path for this fileId.
-					let path: string | undefined;
-					vs.meta.forEach((meta, id) => {
-						if (id === fileId && typeof meta.path === "string") path = meta.path;
-					});
-					if (!path || !path.endsWith(".md")) return;
-					const originClass = isLocalOrigin(txn.origin, vs.provider) ? "local-edit" : "remote-apply";
-					tracker?.markDirty(path, originClass);
-				};
-				(ytext as unknown as { observe: (h: typeof handler) => void }).observe(handler);
-				this._witnessTextObservers?.set(fileId, { ytext, handler });
-			};
-
-			// Attach to all existing texts.
-			vs.idToText.forEach((ytext, fileId) => attachTextObserver(fileId, ytext));
-
-			// Observe new texts added to idToText.
-			const idToTextHandler = () => {
-				vs.idToText.forEach((ytext, fileId) => attachTextObserver(fileId, ytext));
-			};
-			vs.idToText.observe(idToTextHandler);
-			this._witnessIdToTextHandler = idToTextHandler;
-
-			// Observe meta map for tombstone transitions (Req 3.4).
-			const metaHandler = () => {
-				vs.meta.forEach((meta, fileId) => {
-					void fileId;
-					const path = typeof meta.path === "string" ? meta.path : undefined;
-					if (!path || !path.endsWith(".md")) return;
-					if (vs.isFileMetaDeleted(meta)) {
-						tracker?.markDirty(path, "tombstone");
-					}
-				});
-			};
-			vs.meta.observe(metaHandler);
-			this._witnessMetaHandler = metaHandler;
-		}
-	}
-
-	private _witnessTextObservers: Map<string, { ytext: import("yjs").Text; handler: (...args: unknown[]) => void }> | null = null;
-	private _witnessIdToTextHandler: (() => void) | null = null;
-	private _witnessMetaHandler: (() => void) | null = null;
-
-	private _stopDeviceWitnessTracker(): void {
-		if (this._witnessTextObservers) {
-			for (const { ytext, handler } of this._witnessTextObservers.values()) {
-				try { (ytext as unknown as { unobserve: (h: typeof handler) => void }).unobserve(handler); } catch { /* ignore */ }
-			}
-			this._witnessTextObservers = null;
-		}
-		if (this._witnessIdToTextHandler && this.vaultSync) {
-			try { this.vaultSync.idToText.unobserve(this._witnessIdToTextHandler); } catch { /* ignore */ }
-			this._witnessIdToTextHandler = null;
-		}
-		if (this._witnessMetaHandler && this.vaultSync) {
-			try { this.vaultSync.meta.unobserve(this._witnessMetaHandler); } catch { /* ignore */ }
-			this._witnessMetaHandler = null;
-		}
-		this.deviceWitnessTracker?.dispose();
-		this.deviceWitnessTracker = null;
-	}
-
-	private async exportSafeFlightTrace(): Promise<void> {
-		await this.exportFlightTrace("safe");
-	}
-
-	private async exportFullFlightTrace(): Promise<void> {
-		await new Promise<void>((resolve) => {
-			new ConfirmModal(
-				this.app,
-				"Export flight trace with filenames?",
-				"This export includes vault file names. It never includes note contents or sync tokens. Review before sharing.",
-				async () => {
-					try {
-						await this.exportFlightTrace("full");
-					} catch (err) {
-						this.log(`flight trace export failed: ${String(err)}`);
-						new Notice("Flight trace export failed. Check console.", 10000);
-					} finally {
-						resolve();
-					}
-				},
-				"Export with filenames",
-				"Cancel",
-				() => resolve(),
-			).open();
-		});
-	}
-
-	private async exportFlightTrace(requestedPrivacy: "safe" | "full"): Promise<void> {
-		const controller = this.flightTrace;
-		if (!controller?.isEnabled) {
-			new Notice("QA flight trace is not active. Start it first.", 6000);
-			return;
-		}
-		const diagDir = await this.diagnosticsService?.ensureDiagnosticsDir();
-		if (!diagDir) {
-			new Notice("Diagnostics directory unavailable.", 6000);
-			return;
-		}
-		new Notice("Exporting QA flight trace…");
-		const result = await controller.exportTrace({ requestedPrivacy, diagDir });
-		if (!result.ok) {
-			switch (result.reason) {
-				case "trace-not-active":
-					new Notice("QA flight trace is not active.", 6000);
-					break;
-				case "trace-unsafe-for-safe-export": {
-					const mode = controller.currentRecorder?.mode ?? "unknown";
-					new Notice(
-						`This trace was recorded in "${mode}" mode and includes filenames. ` +
-						`Export with filenames instead, or start a new safe trace.`,
-						10000,
-					);
-					break;
-				}
-				case "trace-not-exportable":
-					new Notice(
-						"Local-private traces cannot be exported. Start a new trace in safe or qa-safe mode.",
-						10000,
-					);
-					break;
-				case "flush-failed":
-					new Notice("Failed to flush trace buffer before export. Check console.", 10000);
-					break;
-				default:
-					new Notice("Flight trace export failed. Check console.", 10000);
-					break;
-			}
-			this.log(`flight trace export failed: ${result.reason}`);
-			return;
-		}
-		const outName = result.path.split("/").pop() ?? result.path;
-		new Notice(`Flight trace exported: ${outName}`, 8000);
-		this.log(`Flight trace exported (${requestedPrivacy}) to: ${result.path}`);
-	}
-
-	private async clearFlightLogs(): Promise<void> {
-		await this.flightTrace?.clearLogs();
-	}
-
-	private showTimelineForCurrentFile(): void {
-		const controller = this.flightTrace;
-		if (!controller?.isEnabled) {
-			new Notice("QA flight trace is not active.", 5000);
-			return;
-		}
-		const file = this.app.workspace.getActiveFile();
-		if (!file) {
-			new Notice("No active file.", 4000);
-			return;
-		}
-		void controller.getPathId(file.path).then(({ pathId }) => {
-			const recorder = controller.currentRecorder;
-			if (!recorder) {
-				new Notice("Recorder not available.", 4000);
-				return;
-			}
-			const events = recorder.getRecentEventsForPath(pathId, 100);
-			if (events.length === 0) {
-				new Notice(`No flight trace events for this file yet (${pathId}).`, 6000);
-				console.debug(`[yaos] No flight events for pathId=${pathId} (${file.path})`);
-				return;
-			}
-			const lines = events.map((e) => `${new Date(e.ts).toISOString()} [${e.severity}] ${e.kind}${e.reason ? ` reason=${e.reason}` : ""}${e.decision ? ` decision=${e.decision}` : ""}`);
-			const summary = lines.join("\n");
-			new Notice(`Timeline for ${file.path} (${events.length} events) printed to console.`, 6000);
-			console.debug(`[yaos] Flight timeline for ${file.path} (pathId=${pathId}):\n${summary}`);
-		});
-	}
-
 	// -------------------------------------------------------------------
 	// QA debug API surface
 	// -------------------------------------------------------------------
 
 	private mountQaDebugApi(): void {
 		if (!this.settings.qaDebugMode) return;
-		const api = buildQaDebugApi({
-			app: this.app,
-			getVaultSync: () => this.vaultSync,
-			getReconciliationController: () => this.reconciliationController,
-			getConnectionController: () => this.connectionController,
-			getFlightTraceController: () => this.flightTrace,
-			getEditorBindings: () => this.editorBindings,
-			getDiagnosticsDir: () => this.diagnosticsService?.ensureDiagnosticsDir(),
-			sha256Hex: (text) => this.sha256Hex(text),
-			startQaFlightTrace: (mode) => this.startQaFlightTrace(mode),
-			stopQaFlightTrace: () => this.stopQaFlightTrace(),
-			exportFlightTrace: (privacy) => this.exportFlightTraceForApi(privacy),
-			runReconciliation: () => this.runReconciliation(this.vaultSync?.getSafeReconcileMode() ?? "conservative"),
-			disconnectProvider: (reason) => {
-				this.log(`QA: disconnectProvider(${reason ?? ""})`);
-				this.vaultSync?.provider.disconnect();
-			},
-			connectProvider: (reason) => {
-				this.log(`QA: connectProvider(${reason ?? ""})`);
-				void this.vaultSync?.provider.connect().catch((e) =>
-					this.log(`QA connectProvider error: ${String(e)}`),
-				);
-			},
-			getDeviceWitnessTracker: () => this.deviceWitnessTracker,
-			getQaTraceSecretHash: () => this._qaTraceSecretHash,
-		});
-		(window as unknown as Record<string, unknown>).__YAOS_DEBUG__ = api;
-		this.log("QA debug API mounted at window.__YAOS_DEBUG__");
-		new Notice("YAOS: QA debug mode active. window.__YAOS_DEBUG__ is available.", 6000);
+		// window.__YAOS_DEBUG__ is the Puppeteer harness API.
+		// It is NOT part of the production telemetry runtime (telemetry.js).
+		// The Puppeteer harness (qa/harness/installPuppeteerRuntime.ts) mounts
+		// it when loaded externally for QA scenarios.
+		// In this product build, no mutation API is available — log explicitly
+		// so developers know what happened instead of silently finding no API.
+		this.log("qaDebugMode enabled, but window.__YAOS_DEBUG__ is not mounted by this build. Load the Puppeteer harness from qa/harness/ to get the QA debug API.");
+		new Notice("YAOS: qaDebugMode active — QA debug API not available in this build. See qa/harness/.", 8000);
 	}
 
 	private async exportFlightTraceForApi(privacy: "safe" | "full"): Promise<string | null> {
-		const controller = this.flightTrace;
-		if (!controller?.isEnabled) return null;
-		const diagDir = await this.diagnosticsService?.ensureDiagnosticsDir();
-		if (!diagDir) return null;
-		const result = await controller.exportTrace({ requestedPrivacy: privacy, diagDir });
-		return result.ok ? result.path : null;
+		void privacy;
+		return null;
 	}
 
 	private log(msg: string): void {

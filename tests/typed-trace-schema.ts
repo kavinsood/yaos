@@ -63,13 +63,13 @@ console.log("\n--- Test 3: source-grep static guard for recovery.skipped frontma
 // taxonomy module, the helper exists in the controller, and the helper
 // is invoked exactly six times. Real type-level enforcement comes from
 // `RecoverySkippedFrontmatterData` and `FrontmatterIngestBlockBranch` in
-// src/debug/flightEvents.ts; the runtime invariants are asserted by
+// src/telemetry/debug/flightEvents.ts; the runtime invariants are asserted by
 // tests/frontmatter-guard-orchestration.ts.
 {
 	const reconciliation = file("src/runtime/reconciliationController.ts");
-	const flight = file("src/debug/flightEvents.ts");
+	const flight = file("src/telemetry/debug/flightEvents.ts");
 
-	// Typed taxonomy exports live in src/debug/flightEvents.ts (the helper
+	// Typed taxonomy exports live in src/telemetry/debug/flightEvents.ts (the helper
 	// imports them; the test asserts they exist there, not in the
 	// controller, so accidental local copies in the controller are caught).
 	assert(

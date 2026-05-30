@@ -1,7 +1,7 @@
 import { Notice, type App, TFile } from "obsidian";
 import type { VaultSyncSettings } from "../settings";
 import type { VaultSync } from "../sync/vaultSync";
-import type { DiagnosticsService } from "../diagnostics/diagnosticsService";
+import type { DiagnosticsService } from "../telemetry/diagnostics/diagnosticsService";
 import { ConfirmModal } from "../ui/ConfirmModal";
 
 export interface SchemaV2MigrationContext {

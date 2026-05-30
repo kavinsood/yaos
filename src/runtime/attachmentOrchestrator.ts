@@ -4,7 +4,7 @@ import type { BlobHashCache } from "../sync/blobHashCache";
 import type { VaultSync } from "../sync/vaultSync";
 import type { RuntimeConfig } from "./runtimeConfig";
 import { formatUnknown } from "../utils/format";
-import type { TraceHttpContext, TraceRecord } from "../debug/trace";
+import type { TraceHttpContext, TraceRecord } from "../observability/traceContext";
 import type { PreservedUnresolvedEntry } from "../sync/preservedUnresolved";
 
 interface AttachmentOrchestratorDeps {

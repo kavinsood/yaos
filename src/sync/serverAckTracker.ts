@@ -14,7 +14,7 @@ import { isStateVectorGe } from "./stateVectorAck";
 import { encodeBytesBase64, decodeBytesBase64 } from "./svEchoMessage";
 import { isAckTrackedLocalOrigin } from "./ackOrigins";
 import type { CandidateStore, ScopeKey, ScopeMetadata, PersistedCandidateState } from "./candidateStore";
-import type { TraceRecord } from "../debug/trace";
+import type { TraceRecord } from "../observability/traceContext";
 
 export type { ScopeKey, ScopeMetadata, PersistedCandidateState } from "./candidateStore";
 

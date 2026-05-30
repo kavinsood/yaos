@@ -160,9 +160,9 @@ class FakeIndexedDBFactory {
 // Now import the real modules
 // ---------------------------------------------------------------------------
 
-import { FlightRecorder } from "../src/debug/flightRecorder";
-import { FlightTraceController, type FlightTraceDeps } from "../src/debug/flightTraceController";
-import { FLIGHT_KIND, type FlightEvent } from "../src/debug/flightEvents";
+import { FlightRecorder } from "../src/telemetry/debug/flightRecorder";
+import { FlightTraceController, type FlightTraceDeps } from "../src/telemetry/debug/flightTraceController";
+import { FLIGHT_KIND, type FlightEvent } from "../src/telemetry/debug/flightEvents";
 
 let passed = 0;
 let failed = 0;

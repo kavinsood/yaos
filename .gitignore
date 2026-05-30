@@ -15,6 +15,14 @@ server/bun.lock
 # They should be uploaded to GitHub releases instead.
 main.js
 
+# telemetry.js is the Observer bundle, emitted by esbuild alongside main.js.
+# It is a generated release artifact — not tracked source.
+telemetry.js
+
+# lab.js is the legacy name for the telemetry bundle (now telemetry.js).
+# It must never reappear. If it does, esbuild.config.mjs has regressed.
+lab.js
+
 # Exclude sourcemaps
 *.map
 
@@ -42,6 +50,10 @@ codex-md.py
 # QA run artifacts (flight traces, manifests, reports)
 qa-runs/
 
+# QA harness build output (compiled from .ts by qa/obsidian-harness/esbuild.mjs)
+qa/**/*.js
+qa/**/*.js.map
+
 # TypeScript compilation artifacts (compiled .js next to .ts source)
 # Build outputs are not committed; only .ts source is tracked.
 src/debug/*.js
@@ -59,7 +71,8 @@ review_25hash.json
 # Local working files (not for public repo)
 rca/
 QA/
-qa/
+# qa/ harness source IS tracked (canonical Puppeteer harness, scenarios, controllers)
+# qa-runs/ are ignored above (generated flight traces, run artifacts, evidence bundles)
 tools/
 .agents/
 .codex/

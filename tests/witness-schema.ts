@@ -12,7 +12,7 @@
  */
 
 import assert from "node:assert/strict";
-import type { DivergenceReason, RuntimeState, CausedByEvents } from "../src/diagnostics/deviceWitnessTracker";
+import type { DivergenceReason, RuntimeState, CausedByEvents } from "../src/telemetry/diagnostics/deviceWitnessTracker";
 
 let passed = 0;
 let failed = 0;

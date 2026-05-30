@@ -26,12 +26,13 @@
 import { MarkdownView, TFile } from "obsidian";
 import * as Y from "yjs";
 import { ReconciliationController } from "../src/runtime/reconciliationController";
+import type { DiskIngestPort } from "../src/runtime/engineControlPort";
 import {
 	FLIGHT_KIND,
 	FLIGHT_TAXONOMY_VERSION,
 	type FlightEventInput,
 	type FlightPathEventInput,
-} from "../src/debug/flightEvents";
+} from "../src/telemetry/debug/flightEvents";
 
 let passed = 0;
 let failed = 0;
@@ -111,6 +112,7 @@ interface Fixture {
 	setLastEditorActivity(value: number | null): void;
 	setBindingHealthy(healthy: boolean): void;
 	clearBoundRecoveryLocks(): void;
+	ingestDiskFileNow(reason?: "create" | "modify"): Promise<void>;
 }
 
 function buildFixture(initial: {
@@ -124,6 +126,7 @@ function buildFixture(initial: {
 	const path = initial.path;
 	let diskContent = initial.disk;
 	let editorContent = initial.editor;
+	let diskIngestPort: DiskIngestPort | null = null;
 	let lastEditorActivity: number | null = initial.lastEditorActivity ?? null;
 	let bindingHealthy = initial.bindingHealthy ?? true;
 
@@ -254,6 +257,7 @@ function buildFixture(initial: {
 		log: () => {},
 		recordFlightEvent,
 		recordFlightPathEvent,
+		registerDiskIngestPort: (p: DiskIngestPort) => { diskIngestPort = p; },
 	});
 
 	return {
@@ -273,6 +277,10 @@ function buildFixture(initial: {
 		clearBoundRecoveryLocks: () => {
 			(controller as unknown as { boundRecoveryLocks: Map<string, number> })
 				.boundRecoveryLocks.clear();
+		},
+		ingestDiskFileNow: (reason: "create" | "modify" = "modify") => {
+			if (!diskIngestPort) throw new Error("diskIngestPort not registered");
+			return diskIngestPort.ingestDiskFileNow(path, reason);
 		},
 	};
 }
@@ -305,7 +313,7 @@ console.log("\n--- Scenario 1: localOnly idle guard defers when editor typed rec
 		lastEditorActivity: Date.now() - 200, // 200ms ago, well within 3000ms guard
 	});
 
-	await fix.controller.__qaOnlyForceSyncFileFromDiskUnsafe(fix.path, "modify");
+	await fix.ingestDiskFileNow("modify");
 
 	const skipped = fix.captured.filter((e) => e.kind === FLIGHT_KIND.recoverySkipped);
 	const localOnlySkip = skipped.find(
@@ -335,7 +343,7 @@ console.log("\n--- Scenario 1: localOnly idle guard defers when editor typed rec
 	// Now move the simulated activity outside the 3000ms guard and try again.
 	fix.setLastEditorActivity(Date.now() - 5000);
 	const beforeCount = fix.captured.length;
-	await fix.controller.__qaOnlyForceSyncFileFromDiskUnsafe(fix.path, "modify");
+	await fix.ingestDiskFileNow("modify");
 	const newEvents = fix.captured.slice(beforeCount);
 
 	const decision = newEvents.find((e) => e.kind === FLIGHT_KIND.recoveryDecision);
@@ -369,7 +377,7 @@ console.log("\n--- Scenario 2: monotonic-growth quarantine fires on cycle 3 ---"
 	});
 
 	// Cycle 1: prev=45, next=50
-	await fix.controller.__qaOnlyForceSyncFileFromDiskUnsafe(fix.path, "modify");
+	await fix.ingestDiskFileNow("modify");
 
 	// Reset CRDT to trail by 5 again, advance disk and editor by +5.
 	// Clear the bound recovery lock so the next attempt re-enters.
@@ -380,7 +388,7 @@ console.log("\n--- Scenario 2: monotonic-growth quarantine fires on cycle 3 ---"
 	fix.setEditorContent("y".repeat(55));
 
 	// Cycle 2: prev=50, next=55
-	await fix.controller.__qaOnlyForceSyncFileFromDiskUnsafe(fix.path, "modify");
+	await fix.ingestDiskFileNow("modify");
 
 	fix.clearBoundRecoveryLocks();
 	fix.ytext.delete(0, fix.ytext.length);
@@ -389,7 +397,7 @@ console.log("\n--- Scenario 2: monotonic-growth quarantine fires on cycle 3 ---"
 	fix.setEditorContent("z".repeat(60));
 
 	// Cycle 3: prev=55, next=60 — should quarantine, NOT apply.
-	await fix.controller.__qaOnlyForceSyncFileFromDiskUnsafe(fix.path, "modify");
+	await fix.ingestDiskFileNow("modify");
 
 	const decisions = fix.captured.filter((e) => e.kind === FLIGHT_KIND.recoveryDecision);
 	const applyStarts = fix.captured.filter((e) => e.kind === FLIGHT_KIND.recoveryApplyStart);
@@ -446,7 +454,7 @@ console.log("\n--- Scenario 3: fingerprint quarantine still trips on its shape -
 			fix.ytext.insert(0, "BBB");
 		}
 		fix.clearBoundRecoveryLocks();
-		await fix.controller.__qaOnlyForceSyncFileFromDiskUnsafe(fix.path, "modify");
+		await fix.ingestDiskFileNow("modify");
 	}
 
 	const fingerprint = fix.captured.filter((e) => e.kind === FLIGHT_KIND.recoveryQuarantined);
@@ -470,7 +478,7 @@ console.log("\n--- Scenario 4: pause from idle guard resets the amplification de
 	});
 
 	// Cycle 1: monotonic-growth recovery (prev=45, next=50)
-	await fix.controller.__qaOnlyForceSyncFileFromDiskUnsafe(fix.path, "modify");
+	await fix.ingestDiskFileNow("modify");
 
 	// Cycle 2: monotonic-growth recovery (prev=50, next=55)
 	fix.clearBoundRecoveryLocks();
@@ -478,7 +486,7 @@ console.log("\n--- Scenario 4: pause from idle guard resets the amplification de
 	fix.ytext.insert(0, "x".repeat(50));
 	fix.setDiskContent("y".repeat(55));
 	fix.setEditorContent("y".repeat(55));
-	await fix.controller.__qaOnlyForceSyncFileFromDiskUnsafe(fix.path, "modify");
+	await fix.ingestDiskFileNow("modify");
 
 	const beforePauseCount = fix.captured.length;
 
@@ -489,7 +497,7 @@ console.log("\n--- Scenario 4: pause from idle guard resets the amplification de
 	fix.ytext.insert(0, "y".repeat(55));
 	fix.setDiskContent("z".repeat(60));
 	fix.setEditorContent("z".repeat(60));
-	await fix.controller.__qaOnlyForceSyncFileFromDiskUnsafe(fix.path, "modify");
+	await fix.ingestDiskFileNow("modify");
 
 	const pauseEvents = fix.captured.slice(beforePauseCount);
 	const pauseSkip = pauseEvents.find(
@@ -507,7 +515,7 @@ console.log("\n--- Scenario 4: pause from idle guard resets the amplification de
 	// Final cycle: the user resumes. Amplification history was cleared
 	// by the pause skip, so this single cycle SHOULD apply normally and
 	// SHOULD NOT trip amplification quarantine.
-	await fix.controller.__qaOnlyForceSyncFileFromDiskUnsafe(fix.path, "modify");
+	await fix.ingestDiskFileNow("modify");
 
 	const finalEvents = fix.captured.slice(beforeFinalCount);
 	const finalDecision = finalEvents.find((e) => e.kind === FLIGHT_KIND.recoveryDecision);
@@ -541,7 +549,7 @@ console.log("\n--- Scenario 5: unhealthy binding triggers editor.repair.applied 
 		bindingHealthy: false,    // force unhealthy from start
 	});
 
-	await fix.controller.__qaOnlyForceSyncFileFromDiskUnsafe(fix.path, "modify");
+	await fix.ingestDiskFileNow("modify");
 
 	const decision = fix.captured.find((e) => e.kind === FLIGHT_KIND.recoveryDecision);
 	const applyDone = fix.captured.find((e) => e.kind === FLIGHT_KIND.recoveryApplyDone);
@@ -564,7 +572,7 @@ console.log("\n--- Scenario 5: unhealthy binding triggers editor.repair.applied 
 	fix.ytext.delete(0, fix.ytext.length);
 	fix.ytext.insert(0, "EEE"); // re-establish localOnly divergence
 	const beforeCount = fix.captured.length;
-	await fix.controller.__qaOnlyForceSyncFileFromDiskUnsafe(fix.path, "modify");
+	await fix.ingestDiskFileNow("modify");
 	const newEvents = fix.captured.slice(beforeCount);
 	const newDecision = newEvents.find((e) => e.kind === FLIGHT_KIND.recoveryDecision);
 	const newApplyDone = newEvents.find((e) => e.kind === FLIGHT_KIND.recoveryApplyDone);

@@ -13,13 +13,16 @@ import type { ReconcileMode, VaultSync } from "../sync/vaultSync";
 import type { VaultSyncSettings } from "../settings";
 import type { RuntimeConfig } from "./runtimeConfig";
 import type { EditorBindingManager } from "../sync/editorBinding";
-import { FLIGHT_KIND } from "../debug/flightEvents";
 import type {
-	FlightEventInput,
-	FlightPathEventInput,
+	ProductFlightEventInput,
+	ProductFlightPathEventInput,
+} from "../observability/traceSink";
+import { PRODUCT_EVENT_KIND } from "../observability/productEventKinds";
+// Types only — no FLIGHT_KIND enum import.
+import type {
 	FrontmatterIngestBlockBranch,
 	RecoverySkippedFrontmatterData,
-} from "../debug/flightEvents";
+} from "../observability/recoveryEventTypes";
 import {
 	applyDiffToYText,
 	applyDiffToYTextWithPostcondition,
@@ -74,6 +77,8 @@ export interface ReconciliationState {
 	blockedDivergenceSample: Array<{ ext: string; hash: string }>;
 }
 
+import { type DiskIngestPort } from "./engineControlPort";
+
 interface ReconciliationControllerDeps {
 	app: App;
 	getSettings(): VaultSyncSettings;
@@ -94,8 +99,8 @@ interface ReconciliationControllerDeps {
 	refreshServerCapabilities(reason: string): Promise<void>;
 	validateOpenEditorBindings(reason: string): void;
 	onReconciled(reason: string): void;
-	recordFlightEvent?(event: FlightEventInput): void;
-	recordFlightPathEvent?(event: FlightPathEventInput): void;
+	recordFlightEvent?(event: ProductFlightEventInput): void;
+	recordFlightPathEvent?(event: ProductFlightPathEventInput): void;
 	getAwaitingFirstProviderSyncAfterStartup(): boolean;
 	setAwaitingFirstProviderSyncAfterStartup(value: boolean): void;
 	saveDiskIndex(): Promise<void>;
@@ -117,6 +122,23 @@ interface ReconciliationControllerDeps {
 	 * Returns null if no trace is active or hash computation fails.
 	 */
 	computeRecoveryStateHash?(path: string, content: string): Promise<string | null>;
+	/**
+	 * Optional: override the external edit policy used inside syncFileFromDisk.
+	 * Absent in production. Supplied by the QA harness to set a transient
+	 * in-memory override without persisting or pushing settings metadata.
+	 * When present, this callback is called with the runtime policy and may
+	 * return a different value; returning null/undefined falls back to the
+	 * runtime policy.
+	 */
+	getEffectiveExternalEditPolicy?(runtimePolicy: import("../settings").ExternalEditPolicy): import("../settings").ExternalEditPolicy | null | undefined;
+	/**
+	 * Optional: harness registration hook for disk-ingest control.
+	 * Called once during reconciliation setup. The callback receives a
+	 * control port that the QA harness can store and call to trigger
+	 * syncFileFromDisk deterministically, bypassing the dirty-queue pipeline.
+	 * Must not be wired in production main.ts.
+	 */
+	registerDiskIngestPort?(port: DiskIngestPort): void;
 }
 
 const RECONCILE_COOLDOWN_MS = 10_000;
@@ -239,7 +261,7 @@ function traceRecoveryPostcondition(
 		// Also emit via typed FlightSink so the analyzer can detect it
 		recordFlightPathEvent?.({
 			priority: "critical",
-			kind: FLIGHT_KIND.recoveryPostconditionFailed,
+			kind: PRODUCT_EVENT_KIND.recoveryPostconditionFailed,
 			severity: "error",
 			scope: "file",
 			source: "reconciliationController",
@@ -279,8 +301,6 @@ export class ReconciliationController {
 	 * .kiro/specs/editor-bound-localonly-amplifier-guard/requirements.md R3.
 	 */
 	private amplificationHistory = new Map<string, AmplificationEntry[]>();
-	/** QA-ONLY: in-memory external edit policy override. Never persisted. */
-	private __qaExternalEditPolicyOverride: import("../settings").ExternalEditPolicy | null = null;
 	private lastConflictFingerprints = new Map<string, string>();
 	private blockedDivergenceCount = 0;
 	private lastBlockedDivergenceAt: string | null = null;
@@ -296,7 +316,19 @@ export class ReconciliationController {
 	private amplificationNoticeSuppressionCount = 0;
 	private static readonly AMPLIFICATION_NOTICE_COOLDOWN_MS = 60_000;
 
-	constructor(private readonly deps: ReconciliationControllerDeps) {}
+	constructor(private readonly deps: ReconciliationControllerDeps) {
+		// If a QA harness is attached, register the disk-ingest control port now.
+		// In normal production, registerDiskIngestHarnessPort is absent.
+		deps.registerDiskIngestPort?.({
+			ingestDiskFileNow: async (path, reason) => {
+				const abstractFile = this.deps.app.vault.getAbstractFileByPath(path);
+				if (!(abstractFile instanceof TFile)) {
+					throw new Error(`ingestDiskFileNow: not a file: ${path}`);
+				}
+				await this.syncFileFromDisk(abstractFile, reason);
+			},
+		});
+	}
 
 	get isReconciled(): boolean {
 		return this.reconciled;
@@ -437,7 +469,7 @@ export class ReconciliationController {
 		try {
 			this.deps.recordFlightEvent?.({
 				priority: "important",
-				kind: "reconcile.start",
+				kind: PRODUCT_EVENT_KIND.reconcileStart,
 				severity: "info",
 				scope: "vault",
 				source: "reconciliationController",
@@ -570,7 +602,7 @@ export class ReconciliationController {
 						emitDecision: () => {
 							this.deps.recordFlightPathEvent?.({
 								priority: "important",
-								kind: FLIGHT_KIND.reconcileFileDecision,
+								kind: PRODUCT_EVENT_KIND.reconcileFileDecision,
 								severity: "info",
 								scope: "file",
 								source: "reconciliationController",
@@ -622,7 +654,7 @@ export class ReconciliationController {
 			for (const conflict of result.tombstonedDiskConflicts ?? []) {
 				this.deps.recordFlightPathEvent?.({
 					priority: "important",
-					kind: FLIGHT_KIND.reconcileFileDecision,
+					kind: PRODUCT_EVENT_KIND.reconcileFileDecision,
 					severity: "info",
 					scope: "file",
 					source: "reconciliationController",
@@ -639,7 +671,7 @@ export class ReconciliationController {
 			for (const path of result.untracked) {
 				this.deps.recordFlightPathEvent?.({
 					priority: "verbose",
-					kind: FLIGHT_KIND.reconcileFileDecision,
+					kind: PRODUCT_EVENT_KIND.reconcileFileDecision,
 					severity: "info",
 					scope: "file",
 					source: "reconciliationController",
@@ -665,7 +697,7 @@ export class ReconciliationController {
 				for (const path of result.createdOnDisk) {
 					this.deps.recordFlightPathEvent?.({
 						priority: "important",
-						kind: FLIGHT_KIND.reconcileFileDecision,
+						kind: PRODUCT_EVENT_KIND.reconcileFileDecision,
 						severity: "info",
 						scope: "file",
 						source: "reconciliationController",
@@ -761,7 +793,7 @@ export class ReconciliationController {
 						// Emit flight event for the decision.
 						this.deps.recordFlightPathEvent?.({
 							priority: action.kind === "create-conflict-artifact" ? "critical" : "important",
-							kind: FLIGHT_KIND.reconcileFileDecision,
+							kind: PRODUCT_EVENT_KIND.reconcileFileDecision,
 							severity: "info",
 							scope: "file",
 							source: "reconciliationController",
@@ -971,7 +1003,7 @@ export class ReconciliationController {
 
 			this.deps.recordFlightEvent?.({
 				priority: safetyBrakeTriggered ? "critical" : "important",
-				kind: safetyBrakeTriggered ? "reconcile.safety_brake.triggered" : "reconcile.complete",
+				kind: safetyBrakeTriggered ? PRODUCT_EVENT_KIND.reconcileSafetyBrakeTriggered : PRODUCT_EVENT_KIND.reconcileComplete,
 				severity: safetyBrakeTriggered ? "warn" : "info",
 				scope: "vault",
 				source: "reconciliationController",
@@ -1313,7 +1345,9 @@ export class ReconciliationController {
 			wasBound = false;
 		}
 
-		const effectivePolicy = this.__qaExternalEditPolicyOverride ?? runtimeConfig.externalEditPolicy;
+		const effectivePolicy =
+			this.deps.getEffectiveExternalEditPolicy?.(runtimeConfig.externalEditPolicy)
+			?? runtimeConfig.externalEditPolicy;
 		const policyDecision = decideExternalEditImport(effectivePolicy, isOpenInEditor);
 		if (!policyDecision.allowImport) {
 			const reason = policyDecision.reason === "policy-never"
@@ -1356,7 +1390,7 @@ export class ReconciliationController {
 					// See spec: .kiro/specs/controller-recovery-orchestration/requirements.md R2.1
 					this.deps.recordFlightPathEvent?.({
 						priority: "verbose",
-						kind: FLIGHT_KIND.recoverySkipped,
+						kind: PRODUCT_EVENT_KIND.recoverySkipped,
 						severity: "info",
 						scope: "file",
 						source: "reconciliationController",
@@ -1390,15 +1424,15 @@ export class ReconciliationController {
 				const fileId = vaultSync.getFileIdForText(existingText) ?? undefined;
 				this.deps.recordFlightPathEvent?.({
 					priority: "important",
-					kind: FLIGHT_KIND.crdtFileUpdated,
+					kind: PRODUCT_EVENT_KIND.crdtFileUpdated,
 					severity: "info",
 					scope: "file",
 					source: "reconciliationController",
 					layer: "crdt",
 					path: file.path,
 					opId,
-					fileId,
 					data: {
+						fileId,
 						originKind: "disk-sync",
 						...(coalescedOpIds && coalescedOpIds.length > 1 ? { coalescedOpIds } : {}),
 					},
@@ -1432,49 +1466,6 @@ export class ReconciliationController {
 		} catch (err) {
 			console.error(`[yaos] syncFileFromDisk failed for "${file.path}":`, err);
 		}
-	}
-
-	/**
-	 * QA-ONLY. Unsafe. Do not call from production code.
-	 *
-	 * Forces a disk→CRDT sync pass for a single path, deterministically
-	 * exercising editor-bound recovery paths without waiting for a real
-	 * filesystem event. Used only in forced-recovery regression scenarios.
-	 */
-	async __qaOnlyForceSyncFileFromDiskUnsafe(path: string, reason: "create" | "modify" = "modify"): Promise<void> {
-		const abstractFile = this.deps.app.vault.getAbstractFileByPath(path);
-		if (!(abstractFile instanceof TFile)) {
-			throw new Error(`__qaOnlyForceSyncFileFromDiskUnsafe: not a file: ${path}`);
-		}
-		await this.syncFileFromDisk(abstractFile, reason);
-	}
-
-	/** QA-ONLY. Unsafe. Pause editor->CRDT propagation while keeping bound state. */
-	__qaOnlyPauseEditorBindingPropagationUnsafe(path: string): boolean {
-		return this.deps.getEditorBindings()?.__qaOnlyPauseBindingPropagationUnsafe(path) ?? false;
-	}
-
-	/** QA-ONLY. Unsafe. Resume editor->CRDT propagation after a pause. */
-	__qaOnlyResumeEditorBindingPropagationUnsafe(path: string): boolean {
-		return this.deps.getEditorBindings()?.__qaOnlyResumeBindingPropagationUnsafe(
-			path,
-			this.deps.getSettings().deviceName,
-		) ?? false;
-	}
-
-	/**
-	 * QA-ONLY. Unsafe. Sets an in-memory-only override for the external edit policy.
-	 * Does NOT persist, does NOT push update metadata, does NOT dirty settings.
-	 * Returns the previous effective policy (override or real setting).
-	 * Pass null to clear the override.
-	 */
-	__qaOnlySetExternalEditPolicyOverrideUnsafe(
-		policy: import("../settings").ExternalEditPolicy | null,
-	): import("../settings").ExternalEditPolicy {
-		const previous = this.__qaExternalEditPolicyOverride
-			?? this.deps.getRuntimeConfig().externalEditPolicy;
-		this.__qaExternalEditPolicyOverride = policy;
-		return previous;
 	}
 
 	private getOpenMarkdownViewsForPath(path: string): MarkdownView[] {
@@ -1512,7 +1503,7 @@ export class ReconciliationController {
 			// See spec: .kiro/specs/controller-recovery-orchestration/requirements.md R2.2
 			this.deps.recordFlightPathEvent?.({
 				priority: "verbose",
-				kind: FLIGHT_KIND.recoverySkipped,
+				kind: PRODUCT_EVENT_KIND.recoverySkipped,
 				severity: "info",
 				scope: "file",
 				source: "reconciliationController",
@@ -1549,7 +1540,7 @@ export class ReconciliationController {
 			// See spec: .kiro/specs/controller-recovery-orchestration/requirements.md R2.1
 			this.deps.recordFlightPathEvent?.({
 				priority: "verbose",
-				kind: FLIGHT_KIND.recoverySkipped,
+				kind: PRODUCT_EVENT_KIND.recoverySkipped,
 				severity: "info",
 				scope: "file",
 				source: "reconciliationController",
@@ -1627,7 +1618,7 @@ export class ReconciliationController {
 					);
 					this.deps.recordFlightPathEvent?.({
 						priority: "verbose",
-						kind: FLIGHT_KIND.recoverySkipped,
+						kind: PRODUCT_EVENT_KIND.recoverySkipped,
 						severity: "info",
 						scope: "file",
 						source: "reconciliationController",
@@ -1678,7 +1669,7 @@ export class ReconciliationController {
 			const _localOnlyAnyUnhealthy = _localOnlyHealth.some((h) => !h.healthy);
 			this.deps.recordFlightPathEvent?.({
 				priority: "important",
-				kind: FLIGHT_KIND.recoveryDecision,
+				kind: PRODUCT_EVENT_KIND.recoveryDecision,
 				severity: "info",
 				scope: "file",
 				source: "reconciliationController",
@@ -1727,7 +1718,7 @@ export class ReconciliationController {
 				// recovery.apply.start: before the actual diff application
 				this.deps.recordFlightPathEvent?.({
 					priority: "important",
-					kind: FLIGHT_KIND.recoveryApplyStart,
+					kind: PRODUCT_EVENT_KIND.recoveryApplyStart,
 					severity: "info",
 					scope: "file",
 					source: "reconciliationController",
@@ -1757,7 +1748,7 @@ export class ReconciliationController {
 			);
 				this.deps.recordFlightPathEvent?.({
 					priority: recoveryResult.forceReplaceApplied ? "critical" : "important",
-					kind: FLIGHT_KIND.recoveryApplyDone,
+					kind: PRODUCT_EVENT_KIND.recoveryApplyDone,
 					severity: recoveryResult.finalMatchesExpected ? "info" : "warn",
 					scope: "file",
 					source: "reconciliationController",
@@ -1790,7 +1781,7 @@ export class ReconciliationController {
 				const _rsh2 = await this.deps.computeRecoveryStateHash?.(file.path, content) ?? undefined;
 				this.deps.recordFlightPathEvent?.({
 					priority: "important",
-					kind: FLIGHT_KIND.recoveryDecision,
+					kind: PRODUCT_EVENT_KIND.recoveryDecision,
 					severity: "info",
 					scope: "file",
 					source: "reconciliationController",
@@ -1814,7 +1805,7 @@ export class ReconciliationController {
 				}
 				this.deps.recordFlightPathEvent?.({
 					priority: "important",
-					kind: FLIGHT_KIND.recoveryApplyStart,
+					kind: PRODUCT_EVENT_KIND.recoveryApplyStart,
 					severity: "info",
 					scope: "file",
 					source: "reconciliationController",
@@ -1912,7 +1903,7 @@ export class ReconciliationController {
 				// See spec: .kiro/specs/controller-recovery-orchestration/requirements.md R2.3
 				this.deps.recordFlightPathEvent?.({
 					priority: "verbose",
-					kind: FLIGHT_KIND.recoverySkipped,
+					kind: PRODUCT_EVENT_KIND.recoverySkipped,
 					severity: "info",
 					scope: "file",
 					source: "reconciliationController",
@@ -1944,7 +1935,7 @@ export class ReconciliationController {
 			const _rsh3 = await this.deps.computeRecoveryStateHash?.(file.path, content) ?? undefined;
 			this.deps.recordFlightPathEvent?.({
 				priority: "important",
-				kind: FLIGHT_KIND.recoveryDecision,
+				kind: PRODUCT_EVENT_KIND.recoveryDecision,
 				severity: "info",
 				scope: "file",
 				source: "reconciliationController",
@@ -1974,7 +1965,7 @@ export class ReconciliationController {
 				}
 				this.deps.recordFlightPathEvent?.({
 					priority: "important",
-					kind: FLIGHT_KIND.recoveryApplyStart,
+					kind: PRODUCT_EVENT_KIND.recoveryApplyStart,
 					severity: "info",
 					scope: "file",
 					source: "reconciliationController",
@@ -2004,7 +1995,7 @@ export class ReconciliationController {
 			);
 				this.deps.recordFlightPathEvent?.({
 					priority: recoveryResult.forceReplaceApplied ? "critical" : "important",
-					kind: FLIGHT_KIND.recoveryApplyDone,
+					kind: PRODUCT_EVENT_KIND.recoveryApplyDone,
 					severity: recoveryResult.finalMatchesExpected ? "info" : "warn",
 					scope: "file",
 					source: "reconciliationController",
@@ -2037,7 +2028,7 @@ export class ReconciliationController {
 				const _rsh4 = await this.deps.computeRecoveryStateHash?.(file.path, content) ?? undefined;
 				this.deps.recordFlightPathEvent?.({
 					priority: "important",
-					kind: FLIGHT_KIND.recoveryDecision,
+					kind: PRODUCT_EVENT_KIND.recoveryDecision,
 					severity: "info",
 					scope: "file",
 					source: "reconciliationController",
@@ -2244,7 +2235,7 @@ export class ReconciliationController {
 		};
 		this.deps.recordFlightPathEvent?.({
 			priority: "important",
-			kind: FLIGHT_KIND.recoverySkipped,
+			kind: PRODUCT_EVENT_KIND.recoverySkipped,
 			severity: "info",
 			scope: "file",
 			source: "reconciliationController",
@@ -2299,7 +2290,7 @@ export class ReconciliationController {
 		);
 		this.deps.recordFlightPathEvent?.({
 			priority: "critical",
-			kind: FLIGHT_KIND.recoveryQuarantined,
+			kind: PRODUCT_EVENT_KIND.recoveryQuarantined,
 			severity: "warn",
 			scope: "file",
 			source: "reconciliationController",
@@ -2315,7 +2306,7 @@ export class ReconciliationController {
 		});
 		this.deps.recordFlightPathEvent?.({
 			priority: "critical",
-			kind: FLIGHT_KIND.recoveryLoopDetected,
+			kind: PRODUCT_EVENT_KIND.recoveryLoopDetected,
 			severity: "warn",
 			scope: "file",
 			source: "reconciliationController",
@@ -2397,7 +2388,7 @@ export class ReconciliationController {
 		);
 		this.deps.recordFlightPathEvent?.({
 			priority: "critical",
-			kind: FLIGHT_KIND.recoveryAmplificationQuarantined,
+			kind: PRODUCT_EVENT_KIND.recoveryAmplificationQuarantined,
 			severity: "warn",
 			scope: "file",
 			source: "reconciliationController",
@@ -2416,7 +2407,7 @@ export class ReconciliationController {
 		// see this case. See spec R3.5.
 		this.deps.recordFlightPathEvent?.({
 			priority: "critical",
-			kind: FLIGHT_KIND.recoveryLoopDetected,
+			kind: PRODUCT_EVENT_KIND.recoveryLoopDetected,
 			severity: "warn",
 			scope: "file",
 			source: "reconciliationController",

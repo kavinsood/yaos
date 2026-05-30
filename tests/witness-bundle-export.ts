@@ -7,11 +7,17 @@
  *   - bundle parses as valid NDJSON with header on line 1
  *   - bundle includes all retained segment lines
  *   - round-trip: events parse back to FlightEvent-compatible shape
+ *
+ * Architecture note:
+ *   Scenario state mutation was moved OUT of DeviceWitnessTracker (Observer)
+ *   into ScenarioStateController (Puppeteer). The buildBundleString helper
+ *   now reads scenario state from the controller, not the tracker.
  */
 
 import assert from "node:assert/strict";
-import { DeviceWitnessTracker } from "../src/diagnostics/deviceWitnessTracker";
-import type { WitnessTrackerConfig } from "../src/diagnostics/deviceWitnessTracker";
+import { DeviceWitnessTracker } from "../src/telemetry/diagnostics/deviceWitnessTracker";
+import type { WitnessTrackerConfig } from "../src/telemetry/diagnostics/deviceWitnessTracker";
+import { ScenarioStateController } from "../qa/harness/scenarioStateController";
 
 let passed = 0;
 let failed = 0;
@@ -21,7 +27,10 @@ function test(name: string, fn: () => Promise<void>): void {
 	tests.push([name, fn]);
 }
 
-function makeConfig(overrides: Partial<WitnessTrackerConfig> = {}): WitnessTrackerConfig {
+function makeConfig(
+	scenario?: ScenarioStateController,
+	overrides: Partial<WitnessTrackerConfig> = {},
+): WitnessTrackerConfig {
 	return {
 		stateSecret: "test-state-secret",
 		flightMode: "qa-safe",
@@ -42,6 +51,7 @@ function makeConfig(overrides: Partial<WitnessTrackerConfig> = {}): WitnessTrack
 		readDiskContent: async () => "bundle test content",
 		sampleEditor: () => ({ kind: "not_open", content: null }),
 		stableAfterMs: 50,
+		getScenarioContext: scenario ? () => scenario : undefined,
 		...overrides,
 	};
 }
@@ -50,6 +60,7 @@ const WAIT_FOR_SEGMENT_MS = 150;
 
 function buildBundleString(
 	tracker: DeviceWitnessTracker,
+	scenario: ScenarioStateController | null,
 	opts: {
 		traceId: string;
 		deviceId: string;
@@ -72,7 +83,8 @@ function buildBundleString(
 			} catch { return false; }
 		}).length;
 	}, 0);
-	const scenarioState = tracker.getScenarioStepState();
+	// Read scenario state from the Puppeteer controller, not the Observer tracker
+	const scenarioState = scenario?.getScenarioStepState() ?? null;
 	const header = {
 		kind: "bundle.header",
 		bundleSchemaVersion: 1,
@@ -83,8 +95,8 @@ function buildBundleString(
 		platform: "desktop",
 		runtimeState: tracker.getRuntimeState(),
 		localTraceId: opts.traceId,
-		scenarioRunId: opts.scenarioRunId ?? scenarioState.scenarioRunId ?? null,
-		scenarioId: opts.scenarioId ?? scenarioState.scenarioId ?? null,
+		scenarioRunId: opts.scenarioRunId ?? scenarioState?.scenarioRunId ?? null,
+		scenarioId: opts.scenarioId ?? scenarioState?.scenarioId ?? null,
 		qaTraceSecretHash: opts.qaTraceSecretHash,
 		flightMode: opts.flightMode,
 		eventCount,
@@ -108,7 +120,7 @@ test("bundle.header first line has all required fields", async () => {
 	tracker.markDirty("Notes/test.md", "local-edit");
 	await new Promise((r) => setTimeout(r, WAIT_FOR_SEGMENT_MS));
 
-	const bundle = buildBundleString(tracker, {
+	const bundle = buildBundleString(tracker, null, {
 		traceId: "trace-bundle-test",
 		deviceId: "device-bundle-001",
 		pluginVersion: "1.6.1",
@@ -147,7 +159,7 @@ test("safe bundle contains no sentinel secret values", async () => {
 	tracker.markDirty("Notes/test.md", "local-edit");
 	await new Promise((r) => setTimeout(r, WAIT_FOR_SEGMENT_MS));
 
-	const bundle = buildBundleString(tracker, {
+	const bundle = buildBundleString(tracker, null, {
 		traceId: "trace-bundle-test",
 		deviceId: "device-bundle-001",
 		pluginVersion: "1.6.1",
@@ -168,7 +180,7 @@ test("bundle parses as valid NDJSON with header on line 1", async () => {
 	tracker.markDirty("Notes/test.md", "local-edit");
 	await new Promise((r) => setTimeout(r, WAIT_FOR_SEGMENT_MS));
 
-	const bundle = buildBundleString(tracker, {
+	const bundle = buildBundleString(tracker, null, {
 		traceId: "trace-bundle-test",
 		deviceId: "device-bundle-001",
 		pluginVersion: "1.6.1",
@@ -198,7 +210,7 @@ test("bundle includes all retained segment lines", async () => {
 	await new Promise((r) => setTimeout(r, WAIT_FOR_SEGMENT_MS));
 
 	const segments = tracker.getCheckpointSegments();
-	const bundle = buildBundleString(tracker, {
+	const bundle = buildBundleString(tracker, null, {
 		traceId: "trace-bundle-test",
 		deviceId: "device-bundle-001",
 		pluginVersion: "1.6.1",
@@ -223,7 +235,7 @@ test("bundle eventCount matches actual event lines", async () => {
 	tracker.markDirty("Notes/test.md", "local-edit");
 	await new Promise((r) => setTimeout(r, WAIT_FOR_SEGMENT_MS));
 
-	const bundle = buildBundleString(tracker, {
+	const bundle = buildBundleString(tracker, null, {
 		traceId: "trace-bundle-test",
 		deviceId: "device-bundle-001",
 		pluginVersion: "1.6.1",
@@ -250,7 +262,7 @@ test("round-trip: event lines parse to FlightEvent-compatible shape", async () =
 	tracker.markDirty("Notes/test.md", "local-edit");
 	await new Promise((r) => setTimeout(r, WAIT_FOR_SEGMENT_MS));
 
-	const bundle = buildBundleString(tracker, {
+	const bundle = buildBundleString(tracker, null, {
 		traceId: "trace-bundle-test",
 		deviceId: "device-bundle-001",
 		pluginVersion: "1.6.1",
@@ -273,7 +285,7 @@ test("round-trip: event lines parse to FlightEvent-compatible shape", async () =
 test("unsafe-local bundle sets containsRawPaths: true and privacyMode: unsafe-local", async () => {
 	const tracker = new DeviceWitnessTracker(makeConfig());
 
-	const bundle = buildBundleString(tracker, {
+	const bundle = buildBundleString(tracker, null, {
 		traceId: "trace-bundle-test",
 		deviceId: "device-bundle-001",
 		pluginVersion: "1.6.1",
@@ -293,7 +305,7 @@ test("empty bundle (no segments) still has valid header with eventCount: 0", asy
 	const tracker = new DeviceWitnessTracker(makeConfig());
 	// No markDirty — no segments
 
-	const bundle = buildBundleString(tracker, {
+	const bundle = buildBundleString(tracker, null, {
 		traceId: "trace-bundle-test",
 		deviceId: "device-bundle-001",
 		pluginVersion: "1.6.1",

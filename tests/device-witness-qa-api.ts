@@ -9,9 +9,9 @@
  */
 
 import assert from "node:assert/strict";
-import { DeviceWitnessTracker } from "../src/diagnostics/deviceWitnessTracker.js";
-import type { WitnessTrackerConfig } from "../src/diagnostics/deviceWitnessTracker.js";
-import type { FlightSink, TraceContext } from "../src/debug/flightEvents.js";
+import { DeviceWitnessTracker } from "../src/telemetry/diagnostics/deviceWitnessTracker.js";
+import type { WitnessTrackerConfig } from "../src/telemetry/diagnostics/deviceWitnessTracker.js";
+import type { FlightSink, TraceContext } from "../src/telemetry/debug/flightEvents.js";
 
 // -----------------------------------------------------------------------
 // Harness

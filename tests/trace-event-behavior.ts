@@ -3,7 +3,7 @@ import { TFile } from "obsidian";
 import { DiskMirror } from "../src/sync/diskMirror";
 import { ServerAckTracker } from "../src/sync/serverAckTracker";
 import { InMemoryCandidateStore, type ScopeKey, type ScopeMetadata } from "../src/sync/candidateStore";
-import type { TraceEventDetails } from "../src/debug/trace";
+import type { TraceEventDetails } from "../src/telemetry/debug/trace";
 
 let passed = 0;
 let failed = 0;

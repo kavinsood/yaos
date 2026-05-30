@@ -1,5 +1,5 @@
 import { Notice, type Plugin } from "obsidian";
-import type { DiagnosticsService } from "./diagnostics/diagnosticsService";
+import type { DiagnosticsService } from "./telemetry/diagnostics/diagnosticsService";
 import type { ConnectionController } from "./runtime/connectionController";
 import type { SnapshotService } from "./snapshots/snapshotService";
 import type { ReconcileMode, VaultSync } from "./sync/vaultSync";
@@ -11,27 +11,12 @@ export interface CommandsRuntimeHost {
 	getSnapshotService(): SnapshotService | null;
 	getFilesNeedingAttentionText(): string;
 	getUntrackedFileCount(): number;
-	isDebugEnabled(): boolean;
-	startQaFlightTrace(mode?: string): Promise<void>;
-	stopQaFlightTrace(): Promise<void>;
-	exportSafeFlightTrace(): Promise<void>;
-	exportFullFlightTrace(): Promise<void>;
-	showTimelineForCurrentFile(): void;
-	clearFlightLogs(): Promise<void>;
 	runReconciliation(mode: ReconcileMode): Promise<void>;
 	runSchemaMigrationToV2(): void;
-	runVfsTortureTest(): Promise<void>;
 	importUntrackedFiles(): Promise<void>;
 	clearLocalServerReceiptState(): Promise<"cleared_persistent" | "cleared_memory_only" | "failed" | undefined>;
 	resetLocalCache(): void;
 	nuclearReset(): void;
-	// Phase 3 QA commands (gated by qaDebugMode)
-	qaExportWitnessBundle?(): Promise<void>;
-	qaExportWitnessBundleUnsafe?(): Promise<void>;
-	qaShowDeviceIdentity?(): void;
-	qaSetScenarioRunId?(): void;
-	qaAdvanceScenarioStep?(): void;
-	qaRefreshWitnessCurrentFile?(): void;
 }
 
 export function registerCommands(
@@ -46,56 +31,6 @@ export function registerCommands(
 				host.getConnectionController()?.reconnect("manual-command");
 				new Notice("Reconnecting...");
 			}
-		},
-	});
-
-	registrar.addCommand({
-		id: "qa-flight-trace-start",
-		name: "Start QA flight trace",
-		callback: () => {
-			void host.startQaFlightTrace();
-		},
-	});
-
-	registrar.addCommand({
-		id: "qa-flight-trace-stop",
-		name: "Stop QA flight trace",
-		callback: () => {
-			void host.stopQaFlightTrace();
-		},
-	});
-
-	registrar.addCommand({
-		id: "qa-flight-trace-export-safe",
-		name: "Export safe QA flight trace",
-		callback: () => {
-			void host.exportSafeFlightTrace();
-		},
-	});
-
-	registrar.addCommand({
-		id: "qa-flight-trace-export-full",
-		name: "Export QA flight trace with filenames",
-		callback: () => {
-			void host.exportFullFlightTrace();
-		},
-	});
-
-	registrar.addCommand({
-		id: "qa-flight-trace-timeline-current-file",
-		name: "Show timeline for current file",
-		callback: () => {
-			host.showTimelineForCurrentFile();
-		},
-	});
-
-	registrar.addCommand({
-		id: "qa-flight-trace-clear-logs",
-		name: "Clear flight logs",
-		callback: () => {
-			void host.clearFlightLogs().then(() => {
-				new Notice("Flight logs cleared.", 4000);
-			});
 		},
 	});
 
@@ -174,18 +109,6 @@ export function registerCommands(
 		name: "Migrate sync schema to v2",
 		callback: () => {
 			host.runSchemaMigrationToV2();
-		},
-	});
-
-	registrar.addCommand({
-		id: "debug-vfs-torture-test",
-		name: "Run filesystem torture test (debug)",
-		checkCallback: (checking: boolean) => {
-			if (!host.isDebugEnabled()) return false;
-			if (!checking) {
-				void host.runVfsTortureTest();
-			}
-			return true;
 		},
 	});
 
@@ -270,54 +193,4 @@ export function registerCommands(
 			host.nuclearReset();
 		},
 	});
-
-	// Phase 3 QA commands — only registered when the host provides them
-	if (host.qaExportWitnessBundle) {
-		const exportBundle = host.qaExportWitnessBundle;
-		registrar.addCommand({
-			id: "qa-export-witness-bundle",
-			name: "YAOS QA: Export witness bundle",
-			callback: () => { void exportBundle(); },
-		});
-	}
-	if (host.qaExportWitnessBundleUnsafe) {
-		const exportBundleUnsafe = host.qaExportWitnessBundleUnsafe;
-		registrar.addCommand({
-			id: "qa-export-witness-bundle-unsafe",
-			name: "YAOS QA: Export witness bundle (unsafe local debug)",
-			callback: () => { void exportBundleUnsafe(); },
-		});
-	}
-	if (host.qaShowDeviceIdentity) {
-		const showIdentity = host.qaShowDeviceIdentity;
-		registrar.addCommand({
-			id: "qa-show-device-identity",
-			name: "YAOS QA: Show device identity for QA",
-			callback: () => { showIdentity(); },
-		});
-	}
-	if (host.qaSetScenarioRunId) {
-		const setRunId = host.qaSetScenarioRunId;
-		registrar.addCommand({
-			id: "qa-set-scenario-run-id",
-			name: "YAOS QA: Set scenario run ID",
-			callback: () => { void setRunId(); },
-		});
-	}
-	if (host.qaAdvanceScenarioStep) {
-		const advanceStep = host.qaAdvanceScenarioStep;
-		registrar.addCommand({
-			id: "qa-advance-scenario-step",
-			name: "YAOS QA: Advance scenario step",
-			callback: () => { void advanceStep(); },
-		});
-	}
-	if (host.qaRefreshWitnessCurrentFile) {
-		const refresh = host.qaRefreshWitnessCurrentFile;
-		registrar.addCommand({
-			id: "qa-refresh-witness-current-file",
-			name: "YAOS QA: Refresh witness for current file",
-			callback: () => { refresh(); },
-		});
-	}
 }

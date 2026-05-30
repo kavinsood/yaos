@@ -26,12 +26,13 @@ import { fileURLToPath } from "node:url";
 import { MarkdownView, TFile } from "obsidian";
 import * as Y from "yjs";
 import { ReconciliationController } from "../src/runtime/reconciliationController";
+import type { DiskIngestPort } from "../src/runtime/engineControlPort";
 import {
 	FLIGHT_KIND,
 	FLIGHT_TAXONOMY_VERSION,
 	type FlightEventInput,
 	type FlightPathEventInput,
-} from "../src/debug/flightEvents";
+} from "../src/telemetry/debug/flightEvents";
 import {
 	ORIGIN_DISK_SYNC_RECOVER_BOUND,
 	isLocalOrigin,
@@ -119,6 +120,7 @@ interface Fixture {
 	setDiskContent(content: string): void;
 	setEditorContent(content: string): void;
 	getCurrentDiskContent(): string;
+	ingestDiskFileNow(reason?: "create" | "modify"): Promise<void>;
 }
 
 function buildFixture(initial: {
@@ -130,6 +132,7 @@ function buildFixture(initial: {
 	const path = initial.path;
 	let diskContent = initial.disk;
 	let editorContent = initial.editor;
+	let diskIngestPort: DiskIngestPort | null = null;
 
 	const doc = new Y.Doc();
 	const ytext = doc.getText("content");
@@ -273,6 +276,7 @@ function buildFixture(initial: {
 		log: () => {},
 		recordFlightEvent,
 		recordFlightPathEvent,
+		registerDiskIngestPort: (p: DiskIngestPort) => { diskIngestPort = p; },
 	});
 
 	return {
@@ -288,6 +292,10 @@ function buildFixture(initial: {
 		setDiskContent: (c) => { diskContent = c; },
 		setEditorContent: (c) => { editorContent = c; },
 		getCurrentDiskContent: () => diskContent,
+		ingestDiskFileNow: (reason: "create" | "modify" = "modify") => {
+			if (!diskIngestPort) throw new Error("diskIngestPort not registered");
+			return diskIngestPort.ingestDiskFileNow(path, reason);
+		},
 	};
 }
 
@@ -336,7 +344,7 @@ console.log("\n--- Test 2: localOnly recovery flight-event timeline ---");
 		crdt: "CCCC",
 	});
 
-	await fix.controller.__qaOnlyForceSyncFileFromDiskUnsafe(fix.path, "modify");
+	await fix.ingestDiskFileNow("modify");
 
 	const recoveryKinds = fix.captured
 		.filter((e) => e.layer === "recovery" || e.layer === "editor")
@@ -407,7 +415,7 @@ console.log("\n--- Test 3: second pass on converged file emits only recovery.ski
 		crdt: "DIFF",
 	});
 
-	await fix.controller.__qaOnlyForceSyncFileFromDiskUnsafe(fix.path, "modify");
+	await fix.ingestDiskFileNow("modify");
 	const firstPassCount = fix.captured.length;
 	assert(firstPassCount > 0, "first pass produced events");
 
@@ -416,7 +424,7 @@ console.log("\n--- Test 3: second pass on converged file emits only recovery.ski
 		.boundRecoveryLocks.clear();
 
 	// Now editor and disk and CRDT all agree on "SAME". Drive a second pass.
-	await fix.controller.__qaOnlyForceSyncFileFromDiskUnsafe(fix.path, "modify");
+	await fix.ingestDiskFileNow("modify");
 
 	const secondPassEvents = fix.captured.slice(firstPassCount);
 	assertEq(secondPassEvents.length, 1, "second pass emits exactly one event");
@@ -448,7 +456,7 @@ console.log("\n--- Test 4: recovery-lock-active bail emits recovery.skipped ---"
 	});
 
 	// Drive one recovery to set the lock, then drive a second one immediately.
-	await fix.controller.__qaOnlyForceSyncFileFromDiskUnsafe(fix.path, "modify");
+	await fix.ingestDiskFileNow("modify");
 	const firstPassCount = fix.captured.length;
 
 	// Force a fresh divergence so the second pass would otherwise enter the
@@ -458,7 +466,7 @@ console.log("\n--- Test 4: recovery-lock-active bail emits recovery.skipped ---"
 
 	// Lock is still active (1500ms window, set by first pass). Second pass
 	// should bail with recovery.skipped(reason=recovery-lock-active).
-	await fix.controller.__qaOnlyForceSyncFileFromDiskUnsafe(fix.path, "modify");
+	await fix.ingestDiskFileNow("modify");
 
 	const secondPassEvents = fix.captured.slice(firstPassCount);
 	assertEq(secondPassEvents.length, 1, "lock-active second pass emits exactly one event");
@@ -501,7 +509,7 @@ console.log("\n--- Test 5: crdtOnly idle-grace bail emits recovery.skipped ---")
 	eb.getLastEditorActivityForPath = () => Date.now() - 200; // 200ms ago
 
 	try {
-		await fix.controller.__qaOnlyForceSyncFileFromDiskUnsafe(fix.path, "modify");
+		await fix.ingestDiskFileNow("modify");
 	} finally {
 		eb.getLastEditorActivityForPath = original;
 	}
@@ -547,7 +555,7 @@ console.log("\n--- Test 6: third identical recovery is quarantined ---");
 		// Clear the lock so each attempt re-enters the recovery branch.
 		(fix.controller as unknown as { boundRecoveryLocks: Map<string, number> })
 			.boundRecoveryLocks.clear();
-		await fix.controller.__qaOnlyForceSyncFileFromDiskUnsafe(fix.path, "modify");
+		await fix.ingestDiskFileNow("modify");
 	}
 
 	const decisions = fix.captured.filter((e) => e.kind === FLIGHT_KIND.recoveryDecision);
@@ -629,7 +637,7 @@ console.log("\n--- Test 7: bound recovery does not round-trip as disk.write ---"
 		crdt: "CRDTCRDT",
 	});
 
-	await fix.controller.__qaOnlyForceSyncFileFromDiskUnsafe(fix.path, "modify");
+	await fix.ingestDiskFileNow("modify");
 
 	// Wait one tick to drain any microtask-scheduled disk emission.
 	await new Promise((r) => setTimeout(r, 50));
@@ -658,12 +666,12 @@ console.log("\n--- Test 8: source-grep regressions on EditorBindingManager emit 
 
 	// Constructor accepts the optional flight callback.
 	assert(
-		src.includes("private recordFlightPathEvent?: (event: FlightPathEventInput) => void"),
+		src.includes("private recordFlightPathEvent?: (event: ProductFlightPathEventInput) => void"),
 		"constructor accepts optional recordFlightPathEvent callback",
 	);
 	assert(
-		src.includes('import { FLIGHT_KIND, type FlightPathEventInput } from "../debug/flightEvents"'),
-		"FLIGHT_KIND and FlightPathEventInput imported",
+		src.includes('import type { ProductFlightPathEventInput } from "../observability/traceSink"'),
+		"ProductFlightPathEventInput imported from observability",
 	);
 
 	// applyBinding emits editor.repair.applied for action==="repair" only.
@@ -673,8 +681,8 @@ console.log("\n--- Test 8: source-grep regressions on EditorBindingManager emit 
 	assert(applyBindingIdx > 0, "applyBinding method present");
 	const applyBindingTail = src.slice(applyBindingIdx, applyBindingIdx + 4500);
 	assert(
-		applyBindingTail.includes("FLIGHT_KIND.editorRepairApplied"),
-		"applyBinding emits FLIGHT_KIND.editorRepairApplied",
+		applyBindingTail.includes("PRODUCT_EVENT_KIND.editorRepairApplied"),
+		"applyBinding emits PRODUCT_EVENT_KIND.editorRepairApplied",
 	);
 	assert(
 		applyBindingTail.includes('if (action === "repair")'),
@@ -691,12 +699,12 @@ console.log("\n--- Test 8: source-grep regressions on EditorBindingManager emit 
 	assert(healIdx > 0, "heal method present");
 	const healBody = src.slice(healIdx, healIdx + 2500);
 	const applyDiffIdx = healBody.indexOf("applyDiffToYText(target.ytext, crdtContent, currentContent, ORIGIN_EDITOR_HEALTH_HEAL)");
-	const healEmitIdx = healBody.indexOf("FLIGHT_KIND.editorHealApplied");
+	const healEmitIdx = healBody.indexOf("PRODUCT_EVENT_KIND.editorHealApplied");
 	assert(applyDiffIdx > 0, "heal() calls applyDiffToYText with ORIGIN_EDITOR_HEALTH_HEAL");
-	assert(healEmitIdx > 0, "heal() emits FLIGHT_KIND.editorHealApplied");
+	assert(healEmitIdx > 0, "heal() emits PRODUCT_EVENT_KIND.editorHealApplied");
 	assert(
 		healEmitIdx > applyDiffIdx,
-		"editor.heal.applied emit follows applyDiffToYText",
+		"PRODUCT_EVENT_KIND.editorHealApplied emit follows applyDiffToYText",
 	);
 	// editor.heal.applied is NOT gated on the diff branch — the emit must
 	// be after the if (diffApplied) block, not inside it. We assert this by
@@ -728,7 +736,7 @@ console.log("\n--- Test 8: source-grep regressions on EditorBindingManager emit 
 	assert(closeIdx > 0, "heal() if(diffApplied) block closing brace found");
 	assert(
 		healEmitIdx > closeIdx,
-		"editor.heal.applied emit is OUTSIDE if(diffApplied) block (fires on every successful entry)",
+		"PRODUCT_EVENT_KIND.editorHealApplied emit is OUTSIDE if(diffApplied) block (fires on every successful entry)",
 	);
 }
 

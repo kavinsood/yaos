@@ -14,7 +14,7 @@ import {
 	computeWitnessStateHash,
 	computeDeletedWitnessStateHash,
 	normalizeContent,
-} from "../src/diagnostics/witnessStateHash";
+} from "../src/telemetry/diagnostics/witnessStateHash";
 
 let passed = 0;
 let failed = 0;

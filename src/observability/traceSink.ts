@@ -40,3 +40,58 @@ export interface TraceSink {
 	/** Flush pending async work (HMAC, redaction). Only async boundary. */
 	flush?(): Promise<void>;
 }
+
+// -----------------------------------------------------------------------
+// Product event input types
+//
+// These types mirror FlightEventInput/FlightPathEventInput but use
+// string literals for kind instead of the FlightKind enum. Product code
+// imports these; the adapter (FlightTraceSink) maps to flight schema.
+// -----------------------------------------------------------------------
+
+export type ProductFlightScope = "file" | "folder" | "vault" | "blob" | "connection";
+export type ProductFlightSeverity = "debug" | "info" | "warn" | "error";
+export type ProductFlightPriority = "critical" | "important" | "verbose";
+export type ProductFlightLayer =
+	| "lifecycle"
+	| "disk"
+	| "crdt"
+	| "provider"
+	| "server"
+	| "reconcile"
+	| "recovery"
+	| "policy"
+	| "editor"
+	| "blob";
+export type ProductFlightSource =
+	| "vaultSync"
+	| "vaultEvents"
+	| "diskMirror"
+	| "editorBinding"
+	| "reconciliationController"
+	| "connectionController"
+	| "blobSync"
+	| "serverAckTracker";
+
+/**
+ * Product event input — used by sync/runtime code.
+ * kind is a string literal (e.g., "crdt.file.created") not an enum import.
+ */
+export interface ProductFlightEventInput {
+	readonly kind: string;
+	readonly severity: ProductFlightSeverity;
+	readonly scope: ProductFlightScope;
+	readonly source: ProductFlightSource;
+	readonly layer: ProductFlightLayer;
+	readonly priority?: ProductFlightPriority;
+	readonly opId?: string;
+	readonly data?: Record<string, unknown>;
+}
+
+/**
+ * Product path event input — used by sync/runtime code for file-scoped events.
+ */
+export interface ProductFlightPathEventInput extends ProductFlightEventInput {
+	readonly scope: "file" | "folder";
+	readonly path: string;
+}

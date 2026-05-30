@@ -1,10 +1,10 @@
 import { type App } from "obsidian";
+import type { TraceLoggerPort, TraceLoggerConfig } from "../observability/traceLogger";
 import {
 	appendTraceParams,
-	PersistentTraceLogger,
 	type TraceEventDetails,
 	type TraceHttpContext,
-} from "../debug/trace";
+} from "../observability/traceContext";
 import type { VaultSyncSettings } from "../settings";
 import { obsidianRequest } from "../utils/http";
 
@@ -16,10 +16,12 @@ interface TraceRuntimeDeps {
 	isObsidianFileMetadataRaceError(err: unknown): boolean;
 	handleIndexedDbDegraded(source: string, err?: unknown): void;
 	registerCleanup(cleanup: () => void): void;
+	/** Provided by lab when settings.debug is true. Absent → no persistent logging. */
+	createLogger?(config: TraceLoggerConfig): TraceLoggerPort;
 }
 
 export class TraceRuntimeController {
-	private logger: PersistentTraceLogger | null = null;
+	private logger: TraceLoggerPort | null = null;
 	private stateInterval: ReturnType<typeof setInterval> | null = null;
 	private stateTimer: ReturnType<typeof setTimeout> | null = null;
 	private serverInterval: ReturnType<typeof setInterval> | null = null;
@@ -39,9 +41,9 @@ export class TraceRuntimeController {
 
 	start(): void {
 		const settings = this.deps.getSettings();
-		if (!settings.debug) return;
+		if (!settings.debug || !this.deps.createLogger) return;
 
-		this.logger = new PersistentTraceLogger(this.deps.app, {
+		this.logger = this.deps.createLogger({
 			enabled: settings.debug,
 			deviceName: settings.deviceName || "unknown-device",
 			vaultId: settings.vaultId || "unknown-vault",

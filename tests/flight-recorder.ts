@@ -8,8 +8,8 @@
  *   - Event model: FLIGHT_KIND constants, FlightKind type
  */
 
-import { PathIdentityResolver } from "../src/debug/pathIdentity";
-import { FLIGHT_KIND } from "../src/debug/flightEvents";
+import { PathIdentityResolver } from "../src/telemetry/debug/pathIdentity";
+import { FLIGHT_KIND } from "../src/telemetry/debug/flightEvents";
 
 let passed = 0;
 let failed = 0;
@@ -180,7 +180,7 @@ console.log("\n--- Test 7: PathIdentityResolver uses crypto hash, not FNV ---");
 // ---------------------------------------------------------------------------
 console.log("\n--- Test 8: FlightRecorder safeToShare / includesFilenames ---");
 {
-	const { FlightRecorder } = await import("../src/debug/flightRecorder");
+	const { FlightRecorder } = await import("../src/telemetry/debug/flightRecorder");
 	const mockApp = {
 		vault: {
 			configDir: ".obsidian",
@@ -232,7 +232,7 @@ console.log("\n--- Test 8: FlightRecorder safeToShare / includesFilenames ---");
 // ---------------------------------------------------------------------------
 console.log("\n--- Test 9: validateSafeEvent drops events with raw path in data ---");
 {
-	const { FlightRecorder } = await import("../src/debug/flightRecorder");
+	const { FlightRecorder } = await import("../src/telemetry/debug/flightRecorder");
 	const writtenLines: string[] = [];
 	const mockApp = {
 		vault: {
@@ -295,7 +295,7 @@ console.log("\n--- Test 9: validateSafeEvent drops events with raw path in data 
 // ---------------------------------------------------------------------------
 console.log("\n--- Test 10: Critical events survive full-buffer pressure ---");
 {
-	const { FlightRecorder } = await import("../src/debug/flightRecorder");
+	const { FlightRecorder } = await import("../src/telemetry/debug/flightRecorder");
 	const written: string[] = [];
 	const mockApp = {
 		vault: {
@@ -365,7 +365,7 @@ console.log("\n--- Test 10: Critical events survive full-buffer pressure ---");
 // ---------------------------------------------------------------------------
 console.log("\n--- Test 11: Verbose events dropped before important events ---");
 {
-	const { FlightRecorder } = await import("../src/debug/flightRecorder");
+	const { FlightRecorder } = await import("../src/telemetry/debug/flightRecorder");
 	const written: string[] = [];
 	const mockApp = {
 		vault: {
@@ -417,7 +417,7 @@ console.log("\n--- Test 11: Verbose events dropped before important events ---")
 // ---------------------------------------------------------------------------
 console.log("\n--- Test 12: flight.events.dropped includes droppedByPriority ---");
 {
-	const { FlightRecorder } = await import("../src/debug/flightRecorder");
+	const { FlightRecorder } = await import("../src/telemetry/debug/flightRecorder");
 	const written: string[] = [];
 	const mockApp = {
 		vault: {
@@ -478,7 +478,7 @@ console.log("\n--- Test 12: flight.events.dropped includes droppedByPriority ---
 // ---------------------------------------------------------------------------
 console.log("\n--- Test 13: Map indexes rebuild after ring trim ---");
 {
-	const { FlightRecorder } = await import("../src/debug/flightRecorder");
+	const { FlightRecorder } = await import("../src/telemetry/debug/flightRecorder");
 	const mockApp = {
 		vault: {
 			configDir: ".obsidian",
@@ -547,7 +547,7 @@ console.log("\n--- Test 14: FLIGHT_KIND taxonomy constants ---");
 // ---------------------------------------------------------------------------
 console.log("\n--- Test 15: qaTraceSecret never leaks into NDJSON ---");
 {
-	const { FlightRecorder } = await import("../src/debug/flightRecorder");
+	const { FlightRecorder } = await import("../src/telemetry/debug/flightRecorder");
 	const written: string[] = [];
 	const mockApp = {
 		vault: {

@@ -2,16 +2,22 @@
  * Verification Gate — scenarioStepIndex and scenarioRunId (Phase 3 Requirements 10, 14)
  *
  * Tests that:
- *   - setScenarioRunId stamps scenarioRunId/scenarioId on emitted events
- *   - advanceScenarioStep stamps scenarioStepIndex on emitted events
+ *   - ScenarioStateController.setScenarioRunId stamps scenarioRunId/scenarioId on emitted events
+ *   - ScenarioStateController.advanceScenarioStep stamps scenarioStepIndex on emitted events
  *   - Backwards step index is rejected
  *   - advanceScenarioStep without scenarioRunId is rejected
  *   - scenarioStepIndex is strictly increasing per device
+ *
+ * Architecture note:
+ *   Scenario state mutation was moved OUT of DeviceWitnessTracker (Observer)
+ *   into ScenarioStateController (Puppeteer). The tracker reads scenario
+ *   context passively via getScenarioContext() config callback.
  */
 
 import assert from "node:assert/strict";
-import { DeviceWitnessTracker } from "../src/diagnostics/deviceWitnessTracker";
-import type { WitnessTrackerConfig } from "../src/diagnostics/deviceWitnessTracker";
+import { DeviceWitnessTracker } from "../src/telemetry/diagnostics/deviceWitnessTracker";
+import type { WitnessTrackerConfig } from "../src/telemetry/diagnostics/deviceWitnessTracker";
+import { ScenarioStateController } from "../qa/harness/scenarioStateController";
 
 let passed = 0;
 let failed = 0;
@@ -21,7 +27,10 @@ function test(name: string, fn: () => Promise<void>): void {
 	tests.push([name, fn]);
 }
 
-function makeConfig(overrides: Partial<WitnessTrackerConfig> = {}): WitnessTrackerConfig {
+function makeConfig(
+	scenario: ScenarioStateController,
+	overrides: Partial<WitnessTrackerConfig> = {},
+): WitnessTrackerConfig {
 	return {
 		stateSecret: "test-secret",
 		flightMode: "qa-safe",
@@ -42,6 +51,8 @@ function makeConfig(overrides: Partial<WitnessTrackerConfig> = {}): WitnessTrack
 		readDiskContent: async () => "step test content",
 		sampleEditor: () => ({ kind: "not_open", content: null }),
 		stableAfterMs: 50,
+		// Inject the Puppeteer-owned scenario controller into the Observer tracker
+		getScenarioContext: () => scenario,
 		...overrides,
 	};
 }
@@ -54,16 +65,19 @@ const WAIT_FOR_EVENT_MS = 150;
 
 test("setScenarioRunId stamps scenarioRunId and scenarioId on emitted events", async () => {
 	const emittedData: Record<string, unknown>[] = [];
-	const tracker = new DeviceWitnessTracker(makeConfig({
+	const scenario = new ScenarioStateController();
+	const tracker = new DeviceWitnessTracker({
+		...makeConfig(scenario),
 		sink: {
 			record: () => {},
 			recordPath: async (e) => {
 				if (e.data) emittedData.push(e.data as Record<string, unknown>);
 			},
 		},
-	}));
+	});
 
-	tracker.setScenarioRunId("run-001", "s12a");
+	// Puppeteer sets scenario state via controller (not via tracker)
+	scenario.setScenarioRunId("run-001", "s12a");
 	tracker.markDirty("Notes/test.md", "local-edit");
 	await new Promise((r) => setTimeout(r, WAIT_FOR_EVENT_MS));
 
@@ -77,17 +91,19 @@ test("setScenarioRunId stamps scenarioRunId and scenarioId on emitted events", a
 
 test("advanceScenarioStep stamps scenarioStepIndex on emitted events", async () => {
 	const emittedData: Record<string, unknown>[] = [];
-	const tracker = new DeviceWitnessTracker(makeConfig({
+	const scenario = new ScenarioStateController();
+	const tracker = new DeviceWitnessTracker({
+		...makeConfig(scenario),
 		sink: {
 			record: () => {},
 			recordPath: async (e) => {
 				if (e.data) emittedData.push(e.data as Record<string, unknown>);
 			},
 		},
-	}));
+	});
 
-	tracker.setScenarioRunId("run-002", "s12a");
-	const ok = tracker.advanceScenarioStep(1, "baseline");
+	scenario.setScenarioRunId("run-002", "s12a");
+	const ok = scenario.advanceScenarioStep(1, "baseline");
 	assert.equal(ok, true, "advanceScenarioStep should succeed");
 
 	tracker.markDirty("Notes/test.md", "local-edit");
@@ -101,67 +117,62 @@ test("advanceScenarioStep stamps scenarioStepIndex on emitted events", async () 
 });
 
 test("advanceScenarioStep without scenarioRunId returns false", async () => {
-	const tracker = new DeviceWitnessTracker(makeConfig());
+	const scenario = new ScenarioStateController();
 	// No setScenarioRunId called
-	const ok = tracker.advanceScenarioStep(1);
+	const ok = scenario.advanceScenarioStep(1);
 	assert.equal(ok, false, "Should reject when no scenarioRunId set");
-	tracker.dispose();
 });
 
 test("backwards step index is rejected", async () => {
-	const tracker = new DeviceWitnessTracker(makeConfig());
-	tracker.setScenarioRunId("run-003", "s12a");
+	const scenario = new ScenarioStateController();
+	scenario.setScenarioRunId("run-003", "s12a");
 
-	const ok1 = tracker.advanceScenarioStep(5);
+	const ok1 = scenario.advanceScenarioStep(5);
 	assert.equal(ok1, true);
 
-	const ok2 = tracker.advanceScenarioStep(3); // backwards
+	const ok2 = scenario.advanceScenarioStep(3); // backwards
 	assert.equal(ok2, false, "Backwards step must be rejected");
 
-	const ok3 = tracker.advanceScenarioStep(5); // same value
+	const ok3 = scenario.advanceScenarioStep(5); // same value
 	assert.equal(ok3, false, "Same step index must be rejected");
 
-	const ok4 = tracker.advanceScenarioStep(6); // forward
+	const ok4 = scenario.advanceScenarioStep(6); // forward
 	assert.equal(ok4, true, "Forward step must be accepted");
-	tracker.dispose();
 });
 
 test("getScenarioStepState returns current state", async () => {
-	const tracker = new DeviceWitnessTracker(makeConfig());
-	tracker.setScenarioRunId("run-004", "s12b");
-	tracker.advanceScenarioStep(2, "setup");
+	const scenario = new ScenarioStateController();
+	scenario.setScenarioRunId("run-004", "s12b");
+	scenario.advanceScenarioStep(2, "setup");
 
-	const state = tracker.getScenarioStepState();
+	const state = scenario.getScenarioStepState();
 	assert.equal(state.scenarioRunId, "run-004");
 	assert.equal(state.scenarioId, "s12b");
 	assert.equal(state.stepIndex, 2);
 	assert.equal(state.stepLabel, "setup");
-	tracker.dispose();
 });
 
 test("scenarioStepIndex is strictly increasing per device", async () => {
-	const tracker = new DeviceWitnessTracker(makeConfig());
-	tracker.setScenarioRunId("run-005", "s12c");
+	const scenario = new ScenarioStateController();
+	scenario.setScenarioRunId("run-005", "s12c");
 
 	const steps = [1, 2, 3, 5, 10];
 	for (const s of steps) {
-		const ok = tracker.advanceScenarioStep(s);
+		const ok = scenario.advanceScenarioStep(s);
 		assert.equal(ok, true, `Step ${s} should be accepted`);
 	}
 
 	// Verify final state
-	const state = tracker.getScenarioStepState();
+	const state = scenario.getScenarioStepState();
 	assert.equal(state.stepIndex, 10);
-	tracker.dispose();
 });
 
 test("non-integer step index is rejected", async () => {
-	const tracker = new DeviceWitnessTracker(makeConfig());
-	tracker.setScenarioRunId("run-006", "s12a");
+	const scenario = new ScenarioStateController();
+	scenario.setScenarioRunId("run-006", "s12a");
 
-	assert.equal(tracker.advanceScenarioStep(1.5), false, "Float must be rejected");
-	assert.equal(tracker.advanceScenarioStep(-1), false, "Negative must be rejected");
-	tracker.dispose();
+	assert.equal(scenario.advanceScenarioStep(1.5), false, "Float must be rejected");
+	assert.equal(scenario.advanceScenarioStep(-1), false, "Negative must be rejected");
 });
 
 // -----------------------------------------------------------------------

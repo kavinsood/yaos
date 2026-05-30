@@ -28,7 +28,7 @@ import {
 	appendTraceParams,
 	type TraceHttpContext,
 	type TraceRecord,
-} from "../debug/trace";
+} from "../observability/traceContext";
 import {
 	type BlobHashCache,
 	getCachedHash,

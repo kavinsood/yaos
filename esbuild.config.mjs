@@ -10,12 +10,10 @@ if you want to view the source, please visit the github repository of this plugi
 `;
 
 const prod = (process.argv[2] === "production");
+const qaProduct = (process.argv[2] === "qa-product");
 
-const context = await esbuild.context({
-	banner: {
-		js: banner,
-	},
-	entryPoints: ["src/main.ts"],
+const sharedConfig = {
+	banner: { js: banner },
 	bundle: true,
 	external: [
 		"obsidian",
@@ -38,15 +36,69 @@ const context = await esbuild.context({
 	format: "cjs",
 	target: "es2018",
 	logLevel: "info",
-	sourcemap: prod ? false : "inline",
+	sourcemap: (prod || qaProduct) ? false : "inline",
 	treeShaking: true,
+	minify: (prod || qaProduct),
+};
+
+// ---------------------------------------------------------------------------
+// QA product build — NOT a release artifact.
+//
+// Built with __YAOS_QA_HARNESS_ENABLED__=true so esbuild keeps the Engine
+// control port code. Used for Puppeteer/Obsidian scenario runs only.
+// Output: qa/obsidian-harness/product-main.js
+//
+// Usage:
+//   node esbuild.config.mjs qa-product        # one-shot QA product build
+//   npm run build:qa-product                   # tsc typecheck + QA product build
+// ---------------------------------------------------------------------------
+if (qaProduct) {
+	const qaProductContext = await esbuild.context({
+		...sharedConfig,
+		entryPoints: ["src/main.ts"],
+		outfile: "qa/obsidian-harness/product-main.js",
+		define: {
+			// true → esbuild KEEPS the EngineControlPort block for harness use
+			"__YAOS_QA_HARNESS_ENABLED__": "true",
+		},
+	});
+	await qaProductContext.rebuild();
+	process.exit(0);
+}
+
+// ---------------------------------------------------------------------------
+// Product bundle — shipped to users. Must not contain Engine control capabilities.
+// __YAOS_QA_HARNESS_ENABLED__=false → esbuild dead-code-eliminates the port.
+// ---------------------------------------------------------------------------
+const mainContext = await esbuild.context({
+	...sharedConfig,
+	entryPoints: ["src/main.ts"],
 	outfile: "main.js",
-	minify: prod,
+	define: {
+		// false → esbuild eliminates getEngineControlPort, ingestDiskFileNow, etc.
+		"__YAOS_QA_HARNESS_ENABLED__": "false",
+	},
+});
+
+// Telemetry/Observer bundle — FlightRecorder, DeviceWitnessTracker, DiagnosticsService
+// Loaded dynamically by main.ts only when settings.debug or settings.qaDebugMode.
+// Must NOT contain VFS torture, scenario steppers, unsafe CRDT/sync, network holds,
+// or any mutation harness code. Mutation harness (Puppeteer) lives in qa/.
+const telemetryContext = await esbuild.context({
+	...sharedConfig,
+	entryPoints: ["src/telemetry/installTelemetryRuntime.ts"],
+	outfile: "telemetry.js",
 });
 
 if (prod) {
-	await context.rebuild();
+	await Promise.all([
+		mainContext.rebuild(),
+		telemetryContext.rebuild(),
+	]);
 	process.exit(0);
 } else {
-	await context.watch();
+	await Promise.all([
+		mainContext.watch(),
+		telemetryContext.watch(),
+	]);
 }

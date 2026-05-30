@@ -35,7 +35,7 @@ if (typeof globalThis.crypto === "undefined") {
 }
 
 // Import from the pure module directly — no Obsidian imports, no ConfirmModal.
-import { buildDiagnosticsBundle, type DiagnosticsBundleInput } from "../src/diagnostics/diagnosticsBundle";
+import { buildDiagnosticsBundle, type DiagnosticsBundleInput } from "../src/telemetry/diagnostics/diagnosticsBundle";
 
 let passed = 0;
 let failed = 0;

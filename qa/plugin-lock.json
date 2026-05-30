@@ -1,0 +1,24 @@
+{
+  "_comment": "Pinned community plugin versions for QA fixture vaults. Update when a regression is introduced by a new plugin version.",
+  "presets": {
+    "minimal": [],
+    "tasks": [
+      { "id": "obsidian-tasks-plugin", "minVersion": "7.0.0" }
+    ],
+    "dataview": [
+      { "id": "dataview", "minVersion": "0.5.67" }
+    ],
+    "templater": [
+      { "id": "templater-obsidian", "minVersion": "2.10.0" }
+    ],
+    "tasks-dataview": [
+      { "id": "obsidian-tasks-plugin", "minVersion": "7.0.0" },
+      { "id": "dataview", "minVersion": "0.5.67" }
+    ],
+    "full": [
+      { "id": "obsidian-tasks-plugin", "minVersion": "7.0.0" },
+      { "id": "dataview", "minVersion": "0.5.67" },
+      { "id": "templater-obsidian", "minVersion": "2.10.0" }
+    ]
+  }
+}

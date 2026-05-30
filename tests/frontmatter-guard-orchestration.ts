@@ -52,11 +52,12 @@
 import { MarkdownView, TFile } from "obsidian";
 import * as Y from "yjs";
 import { ReconciliationController } from "../src/runtime/reconciliationController";
+import type { DiskIngestPort } from "../src/runtime/engineControlPort";
 import {
 	FLIGHT_KIND,
 	type FlightEventInput,
 	type FlightPathEventInput,
-} from "../src/debug/flightEvents";
+} from "../src/telemetry/debug/flightEvents";
 import {
 	ORIGIN_DISK_SYNC_RECOVER_BOUND,
 	ORIGIN_DISK_SYNC_OPEN_IDLE_RECOVER,
@@ -151,6 +152,7 @@ interface FrontmatterFixture {
 	setEditorContent(content: string): void;
 	setShouldBlock(predicate: BlockPredicate): void;
 	clearBoundRecoveryLock(): void;
+	ingestDiskFileNow(reason?: "create" | "modify"): Promise<void>;
 }
 
 type BlockPredicate = (
@@ -183,6 +185,7 @@ function buildFrontmatterFixture(options: FixtureOptions): FrontmatterFixture {
 	let diskContent = options.disk;
 	let editorContent = options.editor;
 	let blockPredicate: BlockPredicate = options.shouldBlock;
+	let diskIngestPort: DiskIngestPort | null = null;
 
 	const doc = new Y.Doc();
 	let ytext: Y.Text | null = null;
@@ -352,6 +355,7 @@ function buildFrontmatterFixture(options: FixtureOptions): FrontmatterFixture {
 		log: () => {},
 		recordFlightEvent,
 		recordFlightPathEvent,
+		registerDiskIngestPort: (p: DiskIngestPort) => { diskIngestPort = p; },
 	});
 
 	return {
@@ -377,6 +381,10 @@ function buildFrontmatterFixture(options: FixtureOptions): FrontmatterFixture {
 			(controller as unknown as { boundRecoveryLocks: Map<string, number> })
 				.boundRecoveryLocks.clear();
 		},
+		ingestDiskFileNow: (reason: "create" | "modify" = "modify") => {
+			if (!diskIngestPort) throw new Error("diskIngestPort not registered");
+			return diskIngestPort.ingestDiskFileNow(path, reason);
+		},
 	};
 }
 
@@ -395,7 +403,7 @@ const scenarioAFix = buildFrontmatterFixture({
 		reason === "bound-file-local-only-divergence",
 });
 
-await scenarioAFix.controller.__qaOnlyForceSyncFileFromDiskUnsafe(scenarioAFix.path, "modify");
+await await scenarioAFix.ingestDiskFileNow("modify");
 
 {
 	const skipped = scenarioAFix.captured.filter(
@@ -472,7 +480,7 @@ const scenarioBFix = buildFrontmatterFixture({
 	// lastEditorActivityAgoMs unset -> null -> idle-grace bail does NOT fire.
 });
 
-await scenarioBFix.controller.__qaOnlyForceSyncFileFromDiskUnsafe(scenarioBFix.path, "modify");
+await await scenarioBFix.ingestDiskFileNow("modify");
 
 {
 	const skipped = scenarioBFix.captured.filter(
@@ -539,7 +547,7 @@ const scenarioCFix = buildFrontmatterFixture({
 		reason === "bound-file-local-only-seed",
 });
 
-await scenarioCFix.controller.__qaOnlyForceSyncFileFromDiskUnsafe(scenarioCFix.path, "modify");
+await await scenarioCFix.ingestDiskFileNow("modify");
 
 {
 	const skipped = scenarioCFix.captured.filter(
@@ -596,10 +604,7 @@ console.log("\n--- Scenario D: clear-and-readmit cycle ---");
 	// Clear bound recovery lock so the lock-active bail does not fire.
 	scenarioAFix.clearBoundRecoveryLock();
 
-	await scenarioAFix.controller.__qaOnlyForceSyncFileFromDiskUnsafe(
-		scenarioAFix.path,
-		"modify",
-	);
+	await scenarioAFix.ingestDiskFileNow("modify");
 
 	const secondPassEvents = scenarioAFix.captured.slice(firstPassCount);
 	const secondPassPathEvents = secondPassEvents.filter((e) => e.path === scenarioAFix.path);

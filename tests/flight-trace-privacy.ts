@@ -28,8 +28,8 @@ function assert(condition: boolean, msg: string): void {
 	}
 }
 
-import { FLIGHT_EVENT_SCHEMA_VERSION, FLIGHT_TAXONOMY_VERSION, FLIGHT_KIND } from "../src/debug/flightEvents";
-import { PathIdentityResolver } from "../src/debug/pathIdentity";
+import { FLIGHT_EVENT_SCHEMA_VERSION, FLIGHT_TAXONOMY_VERSION, FLIGHT_KIND } from "../src/telemetry/debug/flightEvents";
+import { PathIdentityResolver } from "../src/telemetry/debug/pathIdentity";
 import { createHash } from "node:crypto";
 
 async function sha256Hex(input: string): Promise<string> {
@@ -240,7 +240,7 @@ console.log("\n--- Test 7: Different QA run secrets are uncorrelated ---");
 // ---------------------------------------------------------------------------
 console.log("\n--- Test 8: Safe export refused for full-mode recorder ---");
 {
-	const { FlightRecorder } = await import("../src/debug/flightRecorder");
+	const { FlightRecorder } = await import("../src/telemetry/debug/flightRecorder");
 	const recorder = new FlightRecorder({
 		vault: {
 			configDir: ".obsidian",
@@ -275,7 +275,7 @@ console.log("\n--- Test 8: Safe export refused for full-mode recorder ---");
 // ---------------------------------------------------------------------------
 console.log("\n--- Test 9: Local-private recorder is not exportable ---");
 {
-	const { FlightRecorder } = await import("../src/debug/flightRecorder");
+	const { FlightRecorder } = await import("../src/telemetry/debug/flightRecorder");
 	const recorder = new FlightRecorder({
 		vault: {
 			configDir: ".obsidian",
@@ -308,7 +308,7 @@ console.log("\n--- Test 9: Local-private recorder is not exportable ---");
 // ---------------------------------------------------------------------------
 console.log("\n--- Test 10: CRDT event in safe mode: no raw path in output ---");
 {
-	const { FlightRecorder } = await import("../src/debug/flightRecorder");
+	const { FlightRecorder } = await import("../src/telemetry/debug/flightRecorder");
 	const written: string[] = [];
 	const recorder = new FlightRecorder({
 		vault: {

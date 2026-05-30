@@ -1,0 +1,9 @@
+{
+  "id": "yaos-qa-harness",
+  "name": "YAOS QA Harness",
+  "version": "0.1.0",
+  "minAppVersion": "1.0.0",
+  "description": "Internal QA harness for YAOS. DO NOT install in production vaults.",
+  "author": "YAOS dev",
+  "isDesktopOnly": true
+}

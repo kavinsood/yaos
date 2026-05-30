@@ -10,8 +10,8 @@
  */
 
 import assert from "node:assert/strict";
-import { DeviceWitnessTracker } from "../src/diagnostics/deviceWitnessTracker";
-import type { WitnessTrackerConfig } from "../src/diagnostics/deviceWitnessTracker";
+import { DeviceWitnessTracker } from "../src/telemetry/diagnostics/deviceWitnessTracker";
+import type { WitnessTrackerConfig } from "../src/telemetry/diagnostics/deviceWitnessTracker";
 
 let passed = 0;
 let failed = 0;
@@ -100,7 +100,7 @@ test("checkpoint_path_inside_vault divergence fires at most once per session", a
 	// The tracker itself doesn't emit checkpoint_path_inside_vault — that's emitted
 	// by the plugin when the path check fails. We verify the DivergenceReason exists.
 	// The actual emission is tested via the guard script.
-	const { DivergenceReason: _unused } = await import("../src/diagnostics/deviceWitnessTracker").then((m) => ({ DivergenceReason: m }));
+	const { DivergenceReason: _unused } = await import("../src/telemetry/diagnostics/deviceWitnessTracker").then((m) => ({ DivergenceReason: m }));
 	// Just verify the type exists in the module
 	assert.ok(true, "DivergenceReason type includes checkpoint_path_inside_vault");
 	tracker.dispose();
@@ -108,7 +108,7 @@ test("checkpoint_path_inside_vault divergence fires at most once per session", a
 
 test("deviceWitnessTracker.ts contains no vault.adapter.write calls (static guard)", async () => {
 	const { readFileSync } = await import("node:fs");
-	const src = readFileSync("src/diagnostics/deviceWitnessTracker.ts", "utf-8");
+	const src = readFileSync("src/telemetry/diagnostics/deviceWitnessTracker.ts", "utf-8");
 	const forbidden = ["vault.adapter.write", "vault.create", "vault.modify"];
 	for (const f of forbidden) {
 		assert.ok(!src.includes(f), `Forbidden call found in deviceWitnessTracker.ts: ${f}`);
@@ -116,31 +116,33 @@ test("deviceWitnessTracker.ts contains no vault.adapter.write calls (static guar
 });
 
 test("segment files are not written to vault root (static guard extended)", async () => {
-	// _persistCheckpointSegmentsIfSafe must be a no-op (filesystem write removed — always fail-closed)
+	// _persistCheckpointSegmentsIfSafe exists in both the telemetry runtime and legacy lab runtime.
+	// It must remain a no-op (filesystem write removed — always fail-closed)
+	// Check the TELEMETRY runtime (the one that ships to production):
 	const { readFileSync } = await import("node:fs");
-	const src = readFileSync("src/main.ts", "utf-8");
-	assert.ok(src.includes("_persistCheckpointSegmentsIfSafe"), "main.ts must have _persistCheckpointSegmentsIfSafe");
+	const telemetrySrc = readFileSync("src/telemetry/installTelemetryRuntime.ts", "utf-8");
+	assert.ok(telemetrySrc.includes("_persistCheckpointSegmentsIfSafe"), "telemetry must have _persistCheckpointSegmentsIfSafe");
 	// Must NOT contain vault.adapter.write inside the persistence function
-	const fnIdx = src.lastIndexOf("private async _persistCheckpointSegmentsIfSafe");
-	assert.ok(fnIdx >= 0, "Must find _persistCheckpointSegmentsIfSafe definition");
-	const fnBody = src.slice(fnIdx, fnIdx + 500);
+	const fnIdx = telemetrySrc.lastIndexOf("async function _persistCheckpointSegmentsIfSafe");
+	assert.ok(fnIdx >= 0, "Must find _persistCheckpointSegmentsIfSafe definition in telemetry");
+	const fnBody = telemetrySrc.slice(fnIdx, fnIdx + 500);
 	assert.ok(!fnBody.includes("vault.adapter.write"), "Persistence function must not write via vault adapter");
 });
 
-test("bundle export uses clipboard/modal only — no vault.adapter.write", async () => {
+test("bundle export uses console/modal only — no vault.adapter.write (telemetry runtime)", async () => {
 	const { readFileSync } = await import("node:fs");
-	const src = readFileSync("src/main.ts", "utf-8");
-	assert.ok(src.includes("_qaExportWitnessBundle"), "main.ts must have _qaExportWitnessBundle");
-	// The export function must NOT write via vault adapter (clipboard/modal only)
-	const exportFnIdx = src.lastIndexOf("private async _qaExportWitnessBundle");
-	assert.ok(exportFnIdx >= 0, "Must find _qaExportWitnessBundle definition");
+	// Bundle export in the shipped telemetry runtime is exportSafeWitnessBundle (safe mode only)
+	const src = readFileSync("src/telemetry/installTelemetryRuntime.ts", "utf-8");
+	assert.ok(src.includes("exportSafeWitnessBundle"), "telemetry must have exportSafeWitnessBundle");
+	// The core invariant: bundle export must NOT write via the vault adapter
+	// (clipboard / console / modal are all acceptable; vault filesystem writes are not)
+	const exportFnIdx = src.indexOf("async function exportSafeWitnessBundle");
+	assert.ok(exportFnIdx >= 0, "Must find exportSafeWitnessBundle definition in telemetry");
 	const exportFnBody = src.slice(exportFnIdx, exportFnIdx + 1500);
 	assert.ok(!exportFnBody.includes("vault.adapter.write"), "Bundle export must not write via vault adapter");
 	assert.ok(!exportFnBody.includes("vault.adapter.mkdir"), "Bundle export must not mkdir via vault adapter");
-	// Must use clipboard
-	assert.ok(exportFnBody.includes("clipboard.writeText"), "Bundle export must use clipboard");
-	// Must have modal fallback
-	assert.ok(exportFnBody.includes("_showBundleModal"), "Bundle export must have modal fallback");
+	// Verify the unsafe-local mode is NOT available in telemetry (it's Puppeteer-only)
+	assert.ok(!exportFnBody.includes("unsafe-local"), "Telemetry bundle export must not support unsafe-local privacy mode");
 });
 
 // -----------------------------------------------------------------------

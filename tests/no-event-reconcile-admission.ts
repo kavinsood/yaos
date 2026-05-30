@@ -124,7 +124,7 @@ import {
 	FLIGHT_TAXONOMY_VERSION,
 	type FlightEventInput,
 	type FlightPathEventInput,
-} from "../src/debug/flightEvents";
+} from "../src/telemetry/debug/flightEvents";
 
 // -------------------------------------------------------------------
 // Assertion harness (matches tests/reconciliation-safety-brake.ts)
@@ -180,7 +180,7 @@ function asPathEvent(e: FlightPathEventInput): CapturedEvent {
 		source: e.source,
 		layer: e.layer,
 		opId: (e as { opId?: string }).opId,
-		fileId: (e as { fileId?: string }).fileId,
+		fileId: (e as { fileId?: string }).fileId ?? (e.data as Record<string, unknown>)?.fileId as string | undefined,
 		data: (e.data as Record<string, unknown>) ?? {},
 	};
 }
