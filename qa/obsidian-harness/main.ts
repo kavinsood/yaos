@@ -3,8 +3,12 @@
  *
  * This plugin:
  *   1. Registers window.__YAOS_QA__ with the full QaConsoleApi
- *   2. Registers Obsidian commands for common QA operations
- *   3. Loads all known scenarios into the registry
+ *   2. Mounts window.__YAOS_DEBUG__ by assembling a PluginHandle from the
+ *      product plugin (yaos) + its TelemetryRuntimeHandle.  This is the
+ *      single canonical mount point for the QA debug API — it is NOT mounted
+ *      by the product plugin itself, which ships as a passive black box.
+ *   3. Registers Obsidian commands for common QA operations
+ *   4. Loads all known scenarios into the registry
  *
  * Install this plugin alongside YAOS in a QA vault with qaDebugMode enabled.
  * DO NOT use in production vaults.
@@ -13,6 +17,8 @@
 import { Plugin, Notice } from "obsidian";
 import { buildQaConsoleApi } from "./api";
 import type { QaScenario } from "./types";
+import { buildQaDebugApi } from "../harness/qaDebugApi";
+import { ScenarioStateController } from "../harness/scenarioStateController";
 
 // Scenario imports
 import { s01SingleDeviceBasicEdit } from "./scenarios/s01-single-device-basic-edit";
@@ -112,6 +118,7 @@ const ALL_SCENARIOS: QaScenario[] = [
 
 export default class YaosQaHarnessPlugin extends Plugin {
 	private scenarioRegistry = new Map<string, QaScenario>();
+	private scenarioController = new ScenarioStateController();
 
 	async onload(): Promise<void> {
 		// Register all scenarios
@@ -119,14 +126,21 @@ export default class YaosQaHarnessPlugin extends Plugin {
 			this.scenarioRegistry.set(scenario.id, scenario);
 		}
 
-		// Mount global API
+		// Mount window.__YAOS_QA__ (harness console API)
 		const api = buildQaConsoleApi(this.app, this.scenarioRegistry);
 		(window as unknown as Record<string, unknown>).__YAOS_QA__ = api;
+
+		// Mount window.__YAOS_DEBUG__ (product QA debug API).
+		// The product plugin ships as a passive black box — it never mounts
+		// __YAOS_DEBUG__ itself.  The harness is responsible for this mount
+		// because it is the only in-repo Puppeteer consumer.
+		this.mountYaosDebugApi();
 
 		new Notice("YAOS QA Harness loaded. window.__YAOS_QA__ is available.", 5000);
 		console.log(
 			"[YAOS QA] Harness loaded. " +
 			`${this.scenarioRegistry.size} scenarios registered. ` +
+			"window.__YAOS_QA__ available. " +
 			"Type YAOS_QA.help() in console.",
 		);
 
@@ -215,6 +229,73 @@ export default class YaosQaHarnessPlugin extends Plugin {
 
 	onunload(): void {
 		delete (window as unknown as Record<string, unknown>).__YAOS_QA__;
+		delete (window as unknown as Record<string, unknown>).__YAOS_DEBUG__;
 		console.log("[YAOS QA] Harness unloaded.");
+	}
+
+	/**
+	 * Assembles a PluginHandle from the product plugin instance and its
+	 * TelemetryRuntimeHandle, then calls buildQaDebugApi and mounts the
+	 * result at window.__YAOS_DEBUG__.
+	 *
+	 * The product plugin ID is "yaos".  The harness requires the product plugin
+	 * to be loaded first (enforce ordering in the vault's community-plugins.json).
+	 *
+	 * The TelemetryRuntimeHandle is stored as `lab` (private) on the product
+	 * plugin.  We access it via `as any` — acceptable in a QA-only file.
+	 */
+	private mountYaosDebugApi(): void {
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const product = (this.app.plugins as any).plugins?.["yaos"] as Record<string, unknown> | undefined;
+		if (!product) {
+			console.error("[YAOS QA] Product plugin 'yaos' not found — window.__YAOS_DEBUG__ not mounted. " +
+				"Ensure 'yaos' is listed before 'yaos-qa-harness' in community-plugins.json.");
+			new Notice("YAOS QA: product plugin not found — __YAOS_DEBUG__ unavailable.", 8000);
+			return;
+		}
+
+		// Access the TelemetryRuntimeHandle stored as this.lab (private field).
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const lab = (product as any).lab as Record<string, unknown> | null | undefined;
+
+		const scenarioController = this.scenarioController;
+
+		const debugApi = buildQaDebugApi({
+			app: this.app,
+			getVaultSync: () => (product as any).vaultSync ?? null,
+			getReconciliationController: () => (product as any).reconciliationController,
+			getConnectionController: () => (product as any).connectionController ?? null,
+			getFlightTraceController: () => (lab as any)?.getFlightTraceController?.() ?? null,
+			getEditorBindings: () => (product as any).editorBindings ?? null,
+			getDiagnosticsDir: () => undefined,
+			sha256Hex: (text: string) => (product as any).sha256Hex(text) as Promise<string>,
+			startQaFlightTrace: (mode?: string) =>
+				((lab as any)?.startTelemetryTrace?.(mode ?? "qa-safe") ?? Promise.resolve()) as Promise<void>,
+			stopQaFlightTrace: () =>
+				((lab as any)?.stopTelemetryTrace?.() ?? Promise.resolve()) as Promise<void>,
+			exportFlightTrace: async (privacy: "safe" | "full") => {
+				if (privacy === "safe") await (lab as any)?.exportSafeFlightTrace?.();
+				else await (lab as any)?.exportFullFlightTrace?.();
+				return null;
+			},
+			runReconciliation: async () => {
+				const rc = (product as any).reconciliationController;
+				await rc?.runReconciliation("conservative");
+			},
+			disconnectProvider: () =>
+				void (product as any).connectionController?.setQaNetworkHold("offline"),
+			connectProvider: () =>
+				void (product as any).connectionController?.setQaNetworkHold("online"),
+			getDeviceWitnessTracker: () =>
+				(lab as any)?.getDeviceWitnessTracker?.() ?? null,
+			getScenarioController: () => scenarioController,
+			getQaTraceSecretHash: () =>
+				((lab as any)?.getQaTraceSecretHash?.() ?? null) as string | null,
+			getEngineControlPort: () => (product as any).getEngineControlPort(),
+		});
+
+		(window as unknown as Record<string, unknown>).__YAOS_DEBUG__ = debugApi;
+		console.log("[YAOS QA] window.__YAOS_DEBUG__ mounted.");
+		new Notice("YAOS: window.__YAOS_DEBUG__ is available.", 4000);
 	}
 }

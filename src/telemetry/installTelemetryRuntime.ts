@@ -78,6 +78,17 @@ export interface TelemetryRuntimeHandle {
 	// QA trace secret hash (for cross-device identity verification — read-only)
 	getQaTraceSecretHash(): string | null;
 
+	// ---------------------------------------------------------------------------
+	// QA harness accessors — read-only references to internal Observer objects.
+	// Used by qa/obsidian-harness/ to assemble window.__YAOS_DEBUG__.
+	// Optional so existing callers are unaffected.
+	// ---------------------------------------------------------------------------
+
+	/** Returns the DeviceWitnessTracker instance (for QA harness witness primitives). */
+	getDeviceWitnessTracker?(): import("./diagnostics/deviceWitnessTracker").DeviceWitnessTracker | null;
+	/** Returns the FlightTraceController instance (for QA harness phase recording). */
+	getFlightTraceController?(): import("./debug/flightTraceController").FlightTraceController | null;
+
 	// Diagnostics — typed as unknown to avoid nominal type mismatch between
 	// src/telemetry/diagnostics/diagnosticsService and src/diagnostics/diagnosticsService.
 	// They are structurally identical; call sites cast as needed.
@@ -556,6 +567,8 @@ export async function installTelemetryRuntime(host: TelemetryRuntimeHost): Promi
 		getQaTraceSecretHash(): string | null {
 			return _qaTraceSecretHash;
 		},
+		getDeviceWitnessTracker: () => deviceWitnessTracker,
+		getFlightTraceController: () => flightTrace,
 		diagnosticsService,
 		dispose,
 		createTraceLogger(app: App, config: TraceLoggerConfig): TraceLoggerPort {
