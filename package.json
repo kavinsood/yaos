@@ -10,7 +10,7 @@
 		"build:qa-product": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs qa-product",
 		"build:server-release": "node build-server-release.mjs",
 		"test:server-update-local": "npm run build:server-release && node tests/server-update-local.mjs",
-		"test:regressions": "npm run guard:no-src-js-artifacts && npm run guard:concurrency-drift && npm run guard:qa-isolation && node tests/run-regressions.mjs",
+		"test:regressions": "npm run guard:no-src-js-artifacts && npm run guard:concurrency-drift && npm run guard:qa-isolation && npm run guard:schema-version && node tests/run-regressions.mjs",
 		"test:ci": "npm run test:regressions && npm run test:integration:worker",
 		"test:integration:worker": "node tests/worker-integration.mjs",
 		"build:harness": "node qa/obsidian-harness/esbuild.mjs production",
@@ -39,6 +39,7 @@
 		"guard:no-src-js-artifacts": "node scripts/guard-no-src-js-artifacts.mjs",
 		"guard:concurrency-drift": "node scripts/guard-concurrency-drift.mjs",
 		"guard:qa-isolation": "node scripts/guard-qa-isolation.mjs",
+		"guard:schema-version": "node scripts/guard-schema-version.mjs",
 		"clean:src-js-artifacts": "find src -name '*.js' -o -name '*.js.map' | xargs rm -f 2>/dev/null; echo 'cleaned'"
 	},
 	"keywords": [],

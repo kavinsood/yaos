@@ -266,24 +266,34 @@ export async function installTelemetryRuntime(host: TelemetryRuntimeHost): Promi
 		// Wire Y.Doc observers
 		if (vaultSync) {
 			_witnessTextObservers = new Map();
+			// NOTE: per-Y.Text content observers (attachTextObserver in v3 main.ts)
+			// are not wired here — that logic was in main.ts before P1 refactor and
+			// was not moved to installTelemetryRuntime.ts.  The idToText handler
+			// below provides a coarser fallback that marks all paths dirty on any
+			// idToText change.  Fine-grained per-text origin attribution is a
+			// follow-up item.
 
 			// Use observeMetaChanges (observeDeep-backed, handles both v2 flat
 			// and v3 nested Y.Map entries) instead of a shallow meta.observe.
 			const unsubscribeMeta = vaultSync.observeMetaChanges((batch) => {
-				if (batch.isLocal) return; // ignore local writes
+				// Witness tracker observes BOTH local and remote changes — it tracks
+				// what this device believes about each file's state.
 				for (const change of batch.changes) {
-					// Extract the affected path based on the change variant.
-					let path: string | null = null;
-					if (change.kind === "added") {
-						path = change.next.path ?? null;
+					if (change.kind === "deleted") {
+						// Tombstone transition — mark as "tombstone" origin so the
+						// witness knows to check isCrdtTombstoned().
+						if (change.path.endsWith(".md")) {
+							deviceWitnessTracker?.markDirty(change.path, "tombstone");
+						}
+					} else if (change.kind === "added") {
+						if (change.next.path) deviceWitnessTracker?.markDirty(change.next.path, "remote-apply");
 					} else if (change.kind === "path-changed") {
-						path = change.nextPath;
-					} else if ("path" in change && typeof change.path === "string") {
-						// deleted, mtime-changed, device-changed all have .path
-						if (change.kind !== "deleted") path = change.path;
+						deviceWitnessTracker?.markDirty(change.nextPath, "remote-apply");
+					} else if ("path" in change) {
+						// mtime-changed, device-changed
+						deviceWitnessTracker?.markDirty((change as { path: string }).path, "remote-apply");
 					}
-					// "removed" — file no longer known; skip witness marking
-					if (path) deviceWitnessTracker?.markDirty(path, "remote-apply");
+					// "removed" — entry fully expunged; skip
 				}
 			});
 			// Store as an unsubscribe function (not a Yjs callback)
