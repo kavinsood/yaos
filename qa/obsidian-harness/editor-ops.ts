@@ -53,9 +53,29 @@ function getViewForPath(app: App, path: string): MarkdownView {
 }
 
 /**
- * Type text into a file's editor one character at a time.
- * Use this for live-sync tests (exercises the y-codemirror binding).
- * Do NOT use replaceFileContent() for live-sync tests.
+ * Append text to a file's editor via a single atomic document replacement.
+ *
+ * This function exercises the editor→CRDT propagation path: a CodeMirror 6
+ * document replacement triggers one y-codemirror reconciliation pass that
+ * applies the change to the Y.Text.
+ *
+ * What it tests:
+ *   - y-codemirror binding connectivity (editor ↔ Y.Text)
+ *   - CRDT update from a single editor transaction
+ *   - DiskMirror write from the resulting Y.Text change
+ *
+ * What it does NOT test:
+ *   - Per-keystroke incremental sync
+ *   - Debounced write behavior
+ *   - Cursor-sensitive or partial-transaction behavior
+ *
+ * Implementation note: character-by-character replaceRange was replaced with
+ * atomic setValue because headless CDP runs have no OS window focus, causing
+ * getCursor() to return {line:0,ch:0} on every call and inserting all characters
+ * at position 0 (reversing the text). Atomic setValue avoids this and also
+ * eliminates intermediate Y.js states from N partial transactions.
+ *
+ * The intervalMs option is kept for API compatibility but is unused.
  */
 export async function typeIntoFile(
 	app: App,
@@ -63,12 +83,13 @@ export async function typeIntoFile(
 	text: string,
 	opts: { intervalMs?: number } = {},
 ): Promise<void> {
+	void opts; // intervalMs unused: atomic mode, no per-character delay
 	const view = getViewForPath(app, path);
-	const intervalMs = opts.intervalMs ?? 20;
-	for (const ch of text) {
-		view.editor.replaceRange(ch, view.editor.getCursor());
-		await sleep(intervalMs);
-	}
+	const current = view.editor.getValue();
+	view.editor.setValue(current + text);
+	// Allow the y-codemirror binding one microtask to propagate the transaction
+	// to Y.Text before the caller proceeds.
+	await sleep(50);
 }
 
 /**

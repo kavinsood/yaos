@@ -14,6 +14,7 @@
 		"test:ci": "npm run test:regressions && npm run test:integration:worker",
 		"test:integration:worker": "node tests/worker-integration.mjs",
 		"build:harness": "node qa/obsidian-harness/esbuild.mjs production",
+		"qa:smoke-ready": "npm run build && npm run build:qa-product && npm run build:harness && node qa/controllers/run-smoke-ready.mjs",
 		"dev:harness": "node qa/obsidian-harness/esbuild.mjs",
 		"qa:manifest": "bun run qa/scripts/manifest.ts",
 		"qa:compare": "bun run qa/scripts/compare.ts",

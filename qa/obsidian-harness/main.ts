@@ -21,6 +21,7 @@ import { buildQaDebugApi } from "../harness/qaDebugApi";
 import { ScenarioStateController } from "../harness/scenarioStateController";
 
 // Scenario imports
+import { s00SmokeTraceExport } from "./scenarios/s00-smoke-trace-export";
 import { s01SingleDeviceBasicEdit } from "./scenarios/s01-single-device-basic-edit";
 import { s02OfflineHandoffCreate } from "./scenarios/s02-offline-handoff-create";
 import { s03DeleteDoesNotResurrect } from "./scenarios/s03-delete-does-not-resurrect";
@@ -71,6 +72,7 @@ import { s10dRecoveryAmplifierOrchestration } from "./scenarios/s10d-recovery-am
 import { s10gSuppressionDelayRace } from "./scenarios/s10g-suppression-delay-race";
 
 const ALL_SCENARIOS: QaScenario[] = [
+	s00SmokeTraceExport,
 	s01SingleDeviceBasicEdit,
 	s02OfflineHandoffCreate,
 	s03DeleteDoesNotResurrect,
