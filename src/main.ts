@@ -86,6 +86,13 @@ import type { TelemetryRuntimeHandle } from "./telemetry/installTelemetryRuntime
 import type { EngineControlPort, DiskIngestPort } from "./runtime/engineControlPort";
 import type { BindingPropagationGate } from "./sync/editorBinding";
 
+// Build-time constant injected by esbuild.
+//   production build (main.js):          define __YAOS_QA_HARNESS_ENABLED__ = false
+//   QA product build (product-main.js):  define __YAOS_QA_HARNESS_ENABLED__ = true
+// When false, esbuild dead-code-eliminates all blocks gated on this constant.
+// The declare tells TypeScript the type; the actual value comes from the esbuild define.
+declare const __YAOS_QA_HARNESS_ENABLED__: boolean;
+
 type PersistedPluginState = Partial<VaultSyncSettings> & {
 	_diskIndex?: DiskIndex;
 	_blobHashCache?: BlobHashCache;
@@ -128,47 +135,25 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private lab: TelemetryRuntimeHandle | null = null;
 
 	// ---------------------------------------------------------------------------
-	// Private Engine control state — QA harness only.
-	// All null in normal production sessions. Populated only when qaDebugMode is
-	// active and the Puppeteer harness calls getEngineControlPort().
+	// QA harness state — only populated when __YAOS_QA_HARNESS_ENABLED__ is true.
+	//
+	// In production (main.js), esbuild defines __YAOS_QA_HARNESS_ENABLED__=false
+	// and dead-code-eliminates every block gated on it.  This field itself is
+	// declared here so TypeScript is satisfied; the constructor initialises it to
+	// null (one innocent assignment), and every meaningful access lives inside a
+	// gated block that disappears from main.js entirely.
+	//
+	// In the QA product build (product-main.js), __YAOS_QA_HARNESS_ENABLED__=true
+	// and the full state object is constructed in onload() before the first
+	// createReconciliationController() call.
 	// ---------------------------------------------------------------------------
-	/** Stored by createReconciliationController when controller fires registerDiskIngestPort. */
-	private diskIngestPort: DiskIngestPort | null = null;
-	/** Transient external edit policy override. Never persisted. */
-	private externalEditPolicyOverride: import("./settings").ExternalEditPolicy | null = null;
-	/** Set of editor paths with propagation currently paused by the harness. */
-	private pausedEditorPropagationPaths = new Set<string>();
-	/** Reconfigure hook registered by EditorBindingManager for gate actions. */
-	private bindingReconfigureHook: ((path: string, deviceName: string, action: "pause" | "resume") => void) | null = null;
-
-	/**
-	 * Assembled Engine control port — used only by the QA/Puppeteer harness.
-	 * Not exposed through telemetry, not mounted on window, not a product command.
-	 * Wired into qaDebugApi.ts via PluginHandle.getEngineControlPort().
-	 */
-	private readonly engineControlPort: EngineControlPort = {
-		ingestDiskFileNow: async (path, reason = "modify") => {
-			if (!this.diskIngestPort) throw new Error("DiskIngestPort not registered (reconciliation controller not started?)");
-			await this.diskIngestPort.ingestDiskFileNow(path, reason);
-		},
-		pauseEditorPropagation: (path) => {
-			if (this.pausedEditorPropagationPaths.has(path)) return false;
-			this.pausedEditorPropagationPaths.add(path);
-			this.bindingReconfigureHook?.(path, this.settings.deviceName, "pause");
-			return true;
-		},
-		resumeEditorPropagation: (path) => {
-			if (!this.pausedEditorPropagationPaths.has(path)) return false;
-			this.pausedEditorPropagationPaths.delete(path);
-			this.bindingReconfigureHook?.(path, this.settings.deviceName, "resume");
-			return true;
-		},
-		setExternalEditPolicyOverride: (policy) => {
-			const previous = this.externalEditPolicyOverride ?? this.getRuntimeConfig().externalEditPolicy;
-			this.externalEditPolicyOverride = policy;
-			return previous;
-		},
-	};
+	private _qaState: {
+		diskIngestPort: DiskIngestPort | null;
+		externalEditPolicyOverride: import("./settings").ExternalEditPolicy | null;
+		pausedEditorPropagationPaths: Set<string>;
+		bindingReconfigureHook: ((path: string, deviceName: string, action: "pause" | "resume") => void) | null;
+		controlPort: EngineControlPort;
+	} | null = null;
 	/** Domain-level trace sink. Routes to lab when active, noop otherwise. */
 	private traceSink: TraceSink = new NoopTraceSink();
 	private statusBarEl: HTMLElement | null = null;
@@ -253,10 +238,17 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			computeRecoveryStateHash: async (_path, content) => {
 				return this.lab?.computeWitnessStateHash(content) ?? null;
 			},
-			getEffectiveExternalEditPolicy: (runtimePolicy) =>
-				this.externalEditPolicyOverride ?? runtimePolicy,
+			getEffectiveExternalEditPolicy: (runtimePolicy) => {
+				if (__YAOS_QA_HARNESS_ENABLED__) {
+					const override = this._qaState?.externalEditPolicyOverride;
+					if (override != null) return override;
+				}
+				return runtimePolicy;
+			},
 			registerDiskIngestPort: (port) => {
-				this.diskIngestPort = port;
+				if (__YAOS_QA_HARNESS_ENABLED__ && this._qaState) {
+					this._qaState.diskIngestPort = port;
+				}
 			},
 		});
 		return this.reconciliationController;
@@ -283,6 +275,53 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	async onload() {
 		const onloadStartedAt = Date.now();
+
+		// Initialize QA harness state before any component construction so that
+		// registerDiskIngestPort (called from createReconciliationController) and
+		// BindingPropagationGate hooks can store into _qaState.
+		// In production this block is dead code — esbuild eliminates it entirely.
+		if (__YAOS_QA_HARNESS_ENABLED__) {
+			this._qaState = {
+				diskIngestPort: null,
+				externalEditPolicyOverride: null,
+				pausedEditorPropagationPaths: new Set(),
+				bindingReconfigureHook: null,
+				controlPort: {
+					ingestDiskFileNow: async (path, reason = "modify") => {
+						if (!this._qaState?.diskIngestPort) throw new Error("DiskIngestPort not registered (reconciliation controller not started?)");
+						await this._qaState.diskIngestPort.ingestDiskFileNow(path, reason);
+					},
+					pauseEditorPropagation: (path) => {
+						if (!this._qaState) return false;
+						if (this._qaState.pausedEditorPropagationPaths.has(path)) return false;
+						this._qaState.pausedEditorPropagationPaths.add(path);
+						this._qaState.bindingReconfigureHook?.(path, this.settings.deviceName, "pause");
+						return true;
+					},
+					resumeEditorPropagation: (path) => {
+						if (!this._qaState) return false;
+						if (!this._qaState.pausedEditorPropagationPaths.has(path)) return false;
+						this._qaState.pausedEditorPropagationPaths.delete(path);
+						this._qaState.bindingReconfigureHook?.(path, this.settings.deviceName, "resume");
+						return true;
+					},
+					setExternalEditPolicyOverride: (policy) => {
+						if (!this._qaState) throw new Error("QA state not initialised");
+						const previous = this._qaState.externalEditPolicyOverride ?? this.getRuntimeConfig().externalEditPolicy;
+						this._qaState.externalEditPolicyOverride = policy;
+						return previous;
+					},
+				},
+			};
+			// Attach the accessor as an instance property so the method name
+			// never appears on the class prototype in production bundles.
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(this as any).getEngineControlPort = (): EngineControlPort => {
+				if (!this._qaState) throw new Error("QA harness state not initialised");
+				return this._qaState.controlPort;
+			};
+		}
+
 		this.capabilityUpdateService = new CapabilityUpdateService({
 			getSettings: () => this.settings,
 			pluginVersion: this.manifest.version,
@@ -587,9 +626,16 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 			// 2. EditorBindingManager
 			const bindingPropagationGate: BindingPropagationGate = {
-				isPaused: (path) => this.pausedEditorPropagationPaths.has(path),
+				isPaused: (path) => {
+					if (__YAOS_QA_HARNESS_ENABLED__ && this._qaState) {
+						return this._qaState.pausedEditorPropagationPaths.has(path);
+					}
+					return false;
+				},
 				registerReconfigureHook: (fn) => {
-					this.bindingReconfigureHook = fn;
+					if (__YAOS_QA_HARNESS_ENABLED__ && this._qaState) {
+						this._qaState.bindingReconfigureHook = fn;
+					}
 				},
 			};
 			this.editorBindings = new EditorBindingManager(
@@ -2061,15 +2107,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		// so developers know what happened instead of silently finding no API.
 		this.log("qaDebugMode enabled, but window.__YAOS_DEBUG__ is not mounted by this build. Load the Puppeteer harness from qa/harness/ to get the QA debug API.");
 		new Notice("YAOS: qaDebugMode active — QA debug API not available in this build. See qa/harness/.", 8000);
-	}
-
-	/**
-	 * Returns the private Engine control port for the Puppeteer QA harness.
-	 * Not a product feature. Not exposed through telemetry or commands.
-	 * Called only by qa/harness/installPuppeteerRuntime.ts via duck-typing.
-	 */
-	getEngineControlPort(): EngineControlPort {
-		return this.engineControlPort;
 	}
 
 	private async exportFlightTraceForApi(privacy: "safe" | "full"): Promise<string | null> {

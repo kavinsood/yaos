@@ -6,7 +6,6 @@ import type { EditorBindingManager } from "../sync/editorBinding";
 import type { VaultSyncSettings } from "../settings";
 import type { TraceSink } from "../observability/traceSink";
 import type { TraceHttpContext } from "../observability/traceContext";
-import type { EngineControlPort } from "../runtime/engineControlPort";
 
 export interface LabRuntimeHost {
 	readonly app: App;
@@ -27,10 +26,4 @@ export interface LabRuntimeHost {
 	/** Register a cleanup to run on plugin unload. */
 	registerCleanup(cleanup: () => void): void;
 	log(msg: string): void;
-	/**
-	 * Engine control port — available only when qaDebugMode is active.
-	 * Absent in normal production. Not part of telemetry host.
-	 * The Puppeteer harness calls this to drive Engine internals.
-	 */
-	getEngineControlPort(): EngineControlPort;
 }

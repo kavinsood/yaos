@@ -18,6 +18,7 @@
 import type { App, MarkdownView, Plugin } from "obsidian";
 import { Notice } from "obsidian";
 import type { LabRuntimeHost } from "../../src/lab/labRuntimeHost";
+import type { EngineControlPort } from "../../src/runtime/engineControlPort";
 import { FlightTraceController } from "../../src/lab/debug/flightTraceController";
 import { FlightTraceSink } from "../../src/lab/debug/flightTraceSink";
 import { DeviceWitnessTracker } from "../../src/lab/diagnostics/deviceWitnessTracker";
@@ -28,6 +29,20 @@ import type { FlightMode, FlightPathEventInput, FlightEventInput } from "../../s
 import type { ProductFlightPathEventInput } from "../../src/observability/traceSink";
 import type { TraceEventDetails } from "../../src/observability/traceContext";
 import { PersistentTraceLogger } from "../../src/lab/debug/trace";
+
+/**
+ * PuppeteerRuntimeHost extends LabRuntimeHost with the Engine control port.
+ *
+ * This interface is local to qa/harness/ — it is never visible in src/.
+ * The product plugin satisfies it only when built with __YAOS_QA_HARNESS_ENABLED__=true
+ * (i.e., via `npm run build:qa-product`).  The method is dynamically attached
+ * to the plugin instance in main.ts inside the QA gate block.
+ *
+ * Callers must cast: `installLabRuntime(plugin as unknown as PuppeteerRuntimeHost)`
+ */
+interface PuppeteerRuntimeHost extends LabRuntimeHost {
+	getEngineControlPort(): EngineControlPort;
+}
 import type { TraceLoggerPort, TraceLoggerConfig } from "../../src/observability/traceLogger";
 import { ScenarioStateController } from "./scenarioStateController";
 
@@ -101,7 +116,7 @@ export interface LabRuntimeHandle {
 	registerCommands(plugin: Pick<Plugin, "addCommand">): void;
 }
 
-export async function installLabRuntime(host: LabRuntimeHost): Promise<LabRuntimeHandle> {
+export async function installLabRuntime(host: PuppeteerRuntimeHost): Promise<LabRuntimeHandle> {
 	let flightTrace: FlightTraceController | null = null;
 	let deviceWitnessTracker: DeviceWitnessTracker | null = null;
 	let _qaTraceSecretHash: string | null = null;

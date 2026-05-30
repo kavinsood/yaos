@@ -23,7 +23,10 @@ const REPO_ROOT = resolve(import.meta.dir, "../..");
 const FIXTURES_DIR = join(REPO_ROOT, "qa", "fixtures", "vaults");
 const HARNESS_BUILD = join(REPO_ROOT, "qa", "obsidian-harness", "main.js");
 const HARNESS_MANIFEST = join(REPO_ROOT, "qa", "obsidian-harness", "manifest.json");
-const YAOS_BUILD = join(REPO_ROOT, "main.js");
+// QA scenarios load the QA-enabled product build (includes EngineControlPort).
+// Production main.js strips the control port via __YAOS_QA_HARNESS_ENABLED__=false.
+// Build with: npm run build:qa-product
+const YAOS_BUILD = join(REPO_ROOT, "qa", "obsidian-harness", "product-main.js");
 const YAOS_MANIFEST = join(REPO_ROOT, "manifest.json");
 const PLUGIN_LOCK = join(REPO_ROOT, "qa", "plugin-lock.json");
 
@@ -110,9 +113,10 @@ async function main(): Promise<void> {
 	}
 	if (existsSync(YAOS_BUILD)) {
 		await cp(YAOS_BUILD, join(yaosPluginDir, "main.js"));
-		console.log("Installed YAOS plugin (built).");
+		console.log("Installed YAOS plugin (QA-enabled build).");
 	} else {
-		console.warn("Warning: YAOS not built. Run: bun run build");
+		console.warn("Warning: QA-enabled YAOS build not found. Run: npm run build:qa-product");
+		console.warn(`Expected: ${YAOS_BUILD}`);
 	}
 
 	// Write YAOS settings with qaDebugMode enabled

@@ -8,47 +8,51 @@
  *
  * Run after build:
  *   node scripts/guard-production-bundles.mjs          # strict (default)
- *   node scripts/guard-production-bundles.mjs --transitional  # warn on Engine test seams
+ *   node scripts/guard-production-bundles.mjs --transitional  # warn on transitional seams
  *
  * == Modes ==
  *
  *   strict (default, used in CI):
  *     Fails if any forbidden symbol is found in any bundle, including the
- *     known-deferred Engine test seams (__qaOnly / Unsafe / ForceSync).
- *     Use this in CI to detect regressions. Will fail until Engine test seams
- *     are removed (separate architectural phase).
+ *     known-transitional seams listed in MAIN_FORBIDDEN_DEFERRED.
  *
  *   transitional (--transitional flag):
- *     Fails on new forbidden symbols. Warns on the known-deferred Engine
- *     test seams listed below. Use locally when working on other changes
- *     that should not require fixing Engine test seams first.
+ *     Fails on hard-forbidden symbols. Warns on transitional seams.
+ *     Use locally when working on changes that should not require fixing
+ *     transitional seams first.
  *
  * == Architecture ==
  *
- *   main.js      = Engine only.
- *                  Must NOT contain telemetry implementations or Puppeteer code.
+ *   main.js            = Engine only. Production artifact shipped to users.
+ *                        Must NOT contain telemetry implementations, Puppeteer
+ *                        code, or Engine control capabilities.
  *
- *   telemetry.js = passive Observer only.
- *                  May contain FlightRecorder, DeviceWitnessTracker, etc.
- *                  Must NOT contain mutation harness code (Puppeteer).
+ *   telemetry.js       = passive Observer only.
+ *                        May contain FlightRecorder, DeviceWitnessTracker, etc.
+ *                        Must NOT contain mutation harness code (Puppeteer).
  *
- *   qa/          = Puppeteer harness only. Not shipped.
- *                  May contain dangerous names.
+ *   qa/obsidian-harness/product-main.js
+ *                      = QA-enabled product build. NOT a release artifact.
+ *                        Built with __YAOS_QA_HARNESS_ENABLED__=true.
+ *                        May contain Engine control capabilities.
  *
- * == Known deferred Engine test seams in main.js ==
+ *   qa/                = Puppeteer harness only. Not shipped.
+ *                        May contain dangerous names.
  *
- * BLOCKER (separate phase): These __qaOnly / Unsafe / ForceSync symbols
- * exist on product classes (ReconciliationController, EditorBindingManager)
- * and cannot be removed without injected unsafe capability ports.
+ * == P2 complete: __qaOnly / Unsafe / ForceSync seams removed ==
  *
- *   src/runtime/reconciliationController.ts:1447 __qaOnlyForceSyncFileFromDiskUnsafe
- *   src/runtime/reconciliationController.ts:1456 __qaOnlyPauseEditorBindingPropagationUnsafe
- *   src/runtime/reconciliationController.ts:1461 __qaOnlyResumeEditorBindingPropagationUnsafe
- *   src/runtime/reconciliationController.ts:1474 __qaOnlySetExternalEditPolicyOverrideUnsafe
- *   src/sync/editorBinding.ts:891               __qaOnlyPauseBindingPropagationUnsafe
- *   src/sync/editorBinding.ts:913               __qaOnlyResumeBindingPropagationUnsafe
+ * All six __qaOnly*Unsafe methods were removed from src/ in P2 and replaced
+ * with injected ports (DiskIngestPort, BindingPropagationGate).
+ * MAIN_FORBIDDEN_DEFERRED retains these strings as a permanent regression guard
+ * so they can never be re-introduced.
  *
- * Count: 6 methods, touching 3 symbol strings (ForceSync, Unsafe, __qaOnly).
+ * == P3 complete: Engine control capabilities removed from production bundle ==
+ *
+ * getEngineControlPort and the four Engine control capability methods are now
+ * gated behind __YAOS_QA_HARNESS_ENABLED__ (esbuild define, false in production).
+ * Dead-code elimination removes them entirely from main.js.
+ * MAIN_FORBIDDEN bans them permanently so they cannot re-enter the product bundle.
+ *
  * Do NOT add new entries to MAIN_FORBIDDEN_DEFERRED without explicit sign-off.
  */
 
@@ -84,14 +88,27 @@ const MAIN_FORBIDDEN = [
 	// Force operations
 	"ForceCrdt",
 	"forceCrdt",
+	// Engine control capabilities — must never ship in production bundle.
+	// Production builds use __YAOS_QA_HARNESS_ENABLED__=false (esbuild define),
+	// which dead-code-eliminates these. QA builds use product-main.js instead.
+	//
+	// NOTE: `ingestDiskFileNow` is intentionally NOT listed here — it is a method
+	// name on DiskIngestPort, an internal interface legitimately present inside
+	// ReconciliationController.  The dangerous public accessor was `getEngineControlPort`,
+	// which IS banned below.  Without getEngineControlPort, the internal
+	// DiskIngestPort is unreachable from outside.
+	"getEngineControlPort",
+	"pauseEditorPropagation",
+	"resumeEditorPropagation",
+	"setExternalEditPolicyOverride",
 ];
 
-// Known deferred Engine test seams (see header for full list and blocker note).
+// P2 regression guard — these seams were removed in P2 and must never return.
 // In strict mode these FAIL. In transitional mode these WARN.
 const MAIN_FORBIDDEN_DEFERRED = [
-	"ForceSync",   // __qaOnlyForceSyncFileFromDiskUnsafe
-	"Unsafe",      // all __qaOnly*Unsafe methods
-	"__qaOnly",    // all __qaOnly methods
+	"ForceSync",   // was: __qaOnlyForceSyncFileFromDiskUnsafe
+	"Unsafe",      // was: all __qaOnly*Unsafe methods
+	"__qaOnly",    // was: all __qaOnly methods
 ];
 
 // ---------------------------------------------------------------------------
@@ -131,11 +148,11 @@ function checkBundle(bundlePath, forbidden, deferred, bundleName) {
 
 	if (deferredHits.length > 0) {
 		if (TRANSITIONAL) {
-			console.warn(`WARN [${bundleName}]: Engine test seams present (deferred — see BLOCKER in guard script):`);
+			console.warn(`WARN [${bundleName}]: transitional symbols present (P2 regression guard):`);
 			deferredHits.forEach((v) => console.warn(`  - ${v}`));
 		} else {
-			console.error(`FAIL [${bundleName}]: Engine test seams present (fix required or use --transitional):`);
-			deferredHits.forEach((v) => console.error(`  - ${v}  (deferred Engine test seam — see BLOCKER in guard script)`));
+			console.error(`FAIL [${bundleName}]: P2 regression guard — symbols must not re-enter bundle:`);
+			deferredHits.forEach((v) => console.error(`  - ${v}  (P2 regression guard — see guard script header)`));
 		}
 	}
 
@@ -143,7 +160,7 @@ function checkBundle(bundlePath, forbidden, deferred, bundleName) {
 	if (totalFail > 0) return totalFail;
 
 	const sizeKb = (content.length / 1024).toFixed(1);
-	const note = deferredHits.length > 0 ? ` [${deferredHits.length} Engine test seam(s) deferred]` : "";
+	const note = deferredHits.length > 0 ? ` [${deferredHits.length} transitional symbol(s) present]` : "";
 	console.log(`PASS [${bundleName}] (${sizeKb} KB)${note}`);
 	return 0;
 }
@@ -191,7 +208,7 @@ function scanSrcForQaImports(dir) {
 let failures = 0;
 
 if (TRANSITIONAL) {
-	console.log("Mode: transitional (Engine test seams warn, not fail)\n");
+	console.log("Mode: transitional (P2 regression seams warn, not fail)\n");
 }
 
 failures += checkBundle("main.js", MAIN_FORBIDDEN, MAIN_FORBIDDEN_DEFERRED, "main.js");
@@ -209,7 +226,7 @@ if (failures > 0) {
 	console.error(`\nFAIL: ${failures} production bundle violation(s).`);
 	process.exit(1);
 } else if (TRANSITIONAL) {
-	console.log("\nPARTIAL PASS (transitional): Observer bundle clean; Engine test seams remain.\nRun without --transitional to see full failure list.");
+	console.log("\nPARTIAL PASS (transitional): Observer bundle clean; P2 regression symbols flagged as warnings.\nRun without --transitional to see full failure list.");
 	process.exit(0);
 } else {
 	console.log("\nPASS: all production bundle guards passed.");

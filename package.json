@@ -7,6 +7,7 @@
 	"scripts": {
 		"dev": "node esbuild.config.mjs",
 		"build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+		"build:qa-product": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs qa-product",
 		"build:server-release": "node build-server-release.mjs",
 		"test:server-update-local": "npm run build:server-release && node tests/server-update-local.mjs",
 		"test:regressions": "npm run guard:no-src-js-artifacts && npm run guard:concurrency-drift && npm run guard:qa-isolation && node tests/run-regressions.mjs",
