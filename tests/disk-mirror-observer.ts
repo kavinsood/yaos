@@ -80,6 +80,8 @@ function makeHarness() {
 		getFileIdForText: (text: Y.Text) => (text === ytext ? FILE_ID : null),
 		idToText: { entries: () => new Map([[FILE_ID, ytext]]).entries() },
 		isFileMetaDeleted: (m: { deleted?: boolean } | undefined) => Boolean(m?.deleted),
+		// v3: semantic change subscription used by DiskMirror.startMapObservers()
+		observeMetaChanges: (_cb: unknown) => () => { /* no-op unsubscribe in tests */ },
 	};
 
 	const fakeEditorBindings = {

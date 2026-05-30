@@ -267,17 +267,27 @@ export async function installTelemetryRuntime(host: TelemetryRuntimeHost): Promi
 		if (vaultSync) {
 			_witnessTextObservers = new Map();
 
-			const metaHandler = () => {
-				const vs = host.getVaultSync();
-				if (!vs) return;
-				for (const [fileId] of vs.meta.entries()) {
-					const meta = vs.meta.get(fileId);
-					if (!meta || vs.isFileMetaDeleted(meta)) continue;
-					deviceWitnessTracker?.markDirty(meta.path, "remote-apply");
+			// Use observeMetaChanges (observeDeep-backed, handles both v2 flat
+			// and v3 nested Y.Map entries) instead of a shallow meta.observe.
+			const unsubscribeMeta = vaultSync.observeMetaChanges((batch) => {
+				if (batch.isLocal) return; // ignore local writes
+				for (const change of batch.changes) {
+					// Extract the affected path based on the change variant.
+					let path: string | null = null;
+					if (change.kind === "added") {
+						path = change.next.path ?? null;
+					} else if (change.kind === "path-changed") {
+						path = change.nextPath;
+					} else if ("path" in change && typeof change.path === "string") {
+						// deleted, mtime-changed, device-changed all have .path
+						if (change.kind !== "deleted") path = change.path;
+					}
+					// "removed" — file no longer known; skip witness marking
+					if (path) deviceWitnessTracker?.markDirty(path, "remote-apply");
 				}
-			};
-			_witnessMetaHandler = metaHandler;
-			vaultSync.meta.observe(metaHandler);
+			});
+			// Store as an unsubscribe function (not a Yjs callback)
+			_witnessMetaHandler = unsubscribeMeta;
 
 			const idToTextHandler = () => {
 				deviceWitnessTracker?.markDirty("*", "remote-apply");
@@ -288,7 +298,8 @@ export async function installTelemetryRuntime(host: TelemetryRuntimeHost): Promi
 
 	function _stopDeviceWitnessTracker(): void {
 		if (_witnessMetaHandler) {
-			host.getVaultSync()?.meta.unobserve(_witnessMetaHandler);
+			// _witnessMetaHandler is the unsubscribe function returned by observeMetaChanges
+			try { _witnessMetaHandler(); } catch { /* ignore */ }
 			_witnessMetaHandler = null;
 		}
 		_witnessIdToTextHandler = null;

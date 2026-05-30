@@ -886,6 +886,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				return;
 			}
 
+			// Mark schema v3 if room is still at v2 (lazy, no metadata migration).
+			this.vaultSync.markSchemaV3(this.settings.deviceName);
+
 			// Check for fatal auth error before waiting for provider
 			if (this.vaultSync.fatalAuthError) {
 				this.log("Fatal auth error during startup");

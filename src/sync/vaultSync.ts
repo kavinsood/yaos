@@ -3,11 +3,27 @@ import YSyncProvider from "y-partyserver/provider";
 import { IndexeddbPersistence } from "y-indexeddb";
 import { normalizePath } from "obsidian";
 import { type FileMeta, type BlobRef, type BlobMeta, type BlobTombstone } from "../types";
-import { ORIGIN_SEED } from "./origins";
+import {
+	decodeFileMeta,
+	getMetaPath,
+	getMetaMtime,
+	isFileMetaDeletedValue,
+	ensureNestedMetaEntry,
+	createNestedActiveMeta,
+	createNestedDeletedMeta,
+	buildMetaSnapshot,
+	computeMetaSemanticChanges,
+	computeMetaShapeStats,
+	extractAffectedFileIds,
+	computeIncrementalMetaChanges,
+	type DecodedFileMeta,
+	type MetaSemanticChange,
+	type MetaChangeBatch,
+	type MetaShapeStats,
+} from "./fileMeta";
+import { ORIGIN_SEED, isLocalOrigin } from "./origins";
 import type { VaultSyncSettings } from "../settings";
 import type { TraceHttpContext, TraceRecord } from "../observability/traceContext";
-import type { ProductFlightPathEventInput } from "../observability/traceSink";
-import { PRODUCT_EVENT_KIND } from "../observability/productEventKinds";
 import { randomBase64Url } from "../utils/base64url";
 import { formatUnknown } from "../utils/format";
 import { UpdateTracker } from "./updateTracker";
@@ -19,10 +35,13 @@ import {
 	type SvEchoCounters,
 } from "./svEchoMessage";
 import type { CandidateStore, ScopeKey, ScopeMetadata } from "./candidateStore";
+import { FLIGHT_KIND } from "../telemetry/debug/flightEvents";
+import type { FlightPathEventInput } from "../telemetry/debug/flightEvents";
 import { TICKET_REFRESH_BUFFER_MS, patchTicketInUrl } from "./socketTicket";
 
 /** Current schema version. Stored in sys.schemaVersion. */
-export const SCHEMA_VERSION = 2;
+export { SCHEMA_VERSION } from "./schema";
+import { SCHEMA_VERSION } from "./schema";
 
 /** Timeouts for the startup sequence. */
 const LOCAL_PERSISTENCE_TIMEOUT_MS = 3_000;
@@ -127,7 +146,7 @@ export class VaultSync {
 
 	readonly pathToId: Y.Map<string>;
 	readonly idToText: Y.Map<Y.Text>;
-	readonly meta: Y.Map<FileMeta>;
+	readonly meta: Y.Map<unknown>;
 	readonly sys: Y.Map<unknown>;
 
 	// Blob / attachment maps (additive — schema version stays at 1)
@@ -145,6 +164,66 @@ export class VaultSync {
 	private _pathIndex = new Map<string, string>(); // path -> fileId (active only)
 	private _deletedPathIndex = new Set<string>(); // tombstoned paths
 	private _pathIndexesDirty = true;
+
+	/**
+	 * Snapshot of decoded metadata used by the semantic observer.
+	 * Maintained by `_metaDeepObserver` and used to compute semantic diffs.
+	 */
+	private _metaSnapshot = new Map<string, DecodedFileMeta>();
+
+	/**
+	 * Counts how many times the `_metaDeepObserver` fell back to a full snapshot diff
+	 * because event paths were ambiguous. Should be zero in normal operation.
+	 * Exposed in debug stats so operators can confirm the incremental path is taken.
+	 */
+	private _metaObserverFallbackCount = 0;
+	private _metaSemanticListeners = new Set<(batch: MetaChangeBatch) => void>();
+
+	/**
+	 * The single shared `observeDeep` handler on the meta map.
+	 *
+	 * Uses incremental diffing: reads event paths to determine which fileIds
+	 * changed, then decodes only those entries. Falls back to a full snapshot
+	 * diff only if event paths are ambiguous.
+	 *
+	 * Preserves transaction origin so consumers can distinguish local from remote.
+	 */
+	private _metaDeepObserver = (events: Y.YEvent<Y.AbstractType<unknown>>[]) => {
+		const origin = events[0]?.transaction.origin;
+		const isLocal = isLocalOrigin(origin, this.provider);
+
+		let changes: MetaSemanticChange[];
+
+		// Try incremental diff first (O(k) where k = affected entries).
+		const affected = extractAffectedFileIds(events, this.meta);
+		if (affected !== null) {
+			changes = computeIncrementalMetaChanges(this._metaSnapshot, this.meta, affected);
+		} else {
+			// Fallback: full snapshot diff (O(N)). Increment counter for observability.
+			this._metaObserverFallbackCount++;
+			const nextSnapshot = buildMetaSnapshot(this.meta);
+			changes = computeMetaSemanticChanges(this._metaSnapshot, nextSnapshot);
+			this._metaSnapshot = nextSnapshot;
+		}
+
+		if (changes.length === 0) return;
+
+		// Invalidate path indexes for structural changes only.
+		for (const change of changes) {
+			if (change.kind !== "mtime-changed" && change.kind !== "device-changed") {
+				this._pathIndexesDirty = true;
+				break;
+			}
+		}
+
+		// Dispatch to all registered listeners.
+		if (this._metaSemanticListeners.size > 0) {
+			const batch: MetaChangeBatch = { origin, isLocal, changes };
+			for (const listener of this._metaSemanticListeners) {
+				listener(batch);
+			}
+		}
+	};
 
 	private _localReady = false;
 	private _providerSynced = false;
@@ -189,7 +268,7 @@ export class VaultSync {
 	private _eventRing: Array<{ ts: string; msg: string }> = [];
 	private readonly trace?: TraceRecord;
 	private readonly onFlightEvent?: (event: Record<string, unknown>) => void;
-	private readonly onFlightPathEvent?: (event: ProductFlightPathEventInput) => void;
+	private readonly onFlightPathEvent?: (event: FlightPathEventInput) => void;
 
 	/**
 	 * Stored callback for obtaining (and force-refreshing) short-lived tickets.
@@ -212,7 +291,7 @@ export class VaultSync {
 			traceContext?: TraceHttpContext;
 			trace?: TraceRecord;
 			onFlightEvent?: (event: Record<string, unknown>) => void;
-			onFlightPathEvent?: (event: ProductFlightPathEventInput) => void;
+			onFlightPathEvent?: (event: FlightPathEventInput) => void;
 			/**
 			 * Optional callback returning a short-lived WebSocket ticket.
 			 * Called once during initial connection via async params().
@@ -241,15 +320,18 @@ export class VaultSync {
 		this.ydoc = new Y.Doc();
 		this.pathToId = this.ydoc.getMap<string>("pathToId");
 		this.idToText = this.ydoc.getMap<Y.Text>("idToText");
-		this.meta = this.ydoc.getMap<FileMeta>("meta");
+		this.meta = this.ydoc.getMap("meta");
 		this.sys = this.ydoc.getMap("sys");
 
 		this.pathToBlob = this.ydoc.getMap<BlobRef>("pathToBlob");
 		this.blobMeta = this.ydoc.getMap<BlobMeta>("blobMeta");
 		this.blobTombstones = this.ydoc.getMap<BlobTombstone>("blobTombstones");
-		this.meta.observe(() => {
-			this._pathIndexesDirty = true;
-		});
+
+		// Single shared observeDeep handler. Computes semantic diffs and dispatches
+		// to listeners. Also drives path index invalidation so we only dirty it
+		// for structurally relevant changes (not mtime/device churn).
+		this._metaSnapshot = buildMetaSnapshot(this.meta);
+		this.meta.observeDeep(this._metaDeepObserver);
 
 		const roomId = settings.vaultId;
 		const idbName = `yaos:${settings.vaultId}`;
@@ -583,6 +665,55 @@ export class VaultSync {
 		return stored;
 	}
 
+	/**
+	 * Write the schema v3 marker if not already at v3+.
+	 * This does NOT convert metadata — it only signals that this room
+	 * may contain nested metadata and must only be accessed by v3-aware clients.
+	 * Safe to call concurrently from multiple v3 clients (idempotent small write).
+	 */
+	markSchemaV3(device?: string): void {
+		const current = this.currentSchemaVersion();
+		if (current >= 3) return;
+
+		this.ydoc.transact(() => {
+			this.sys.set("schemaVersion", 3);
+			this.sys.set("schemaUpdatedAt", Date.now());
+			if (device) this.sys.set("schemaUpdatedBy", device);
+		}, ORIGIN_SEED);
+
+		this.log(`schema: marked v3 (was ${current})`);
+	}
+
+	/**
+	 * Compute metadata shape statistics for debug/diagnostics.
+	 * Returns counts of flat vs nested entries, active vs tombstones, etc.
+	 */
+	getMetaShapeStats(): MetaShapeStats & { metaObserverFallbackCount: number } {
+		return {
+			...computeMetaShapeStats(this.meta, this.storedSchemaVersion),
+			metaObserverFallbackCount: this._metaObserverFallbackCount,
+		};
+	}
+
+	/**
+	 * Subscribe to semantic metadata change events.
+	 *
+	 * The callback receives a `MetaChangeBatch` for each Yjs transaction
+	 * that changes metadata. The batch includes:
+	 *   - `origin`: the Yjs transaction origin
+	 *   - `isLocal`: true for locally-originated changes (DiskMirror must skip these)
+	 *   - `changes`: pre-classified MetaSemanticChange[] for this transaction
+	 *
+	 * Works correctly for both flat (v2) and nested (v3) metadata entries.
+	 * Powered by `observeDeep` with incremental diffing internally.
+	 *
+	 * Returns an unsubscribe function.
+	 */
+	observeMetaChanges(callback: (batch: MetaChangeBatch) => void): () => void {
+		this._metaSemanticListeners.add(callback);
+		return () => { this._metaSemanticListeners.delete(callback); };
+	}
+
 	// -------------------------------------------------------------------
 	// Path normalization
 	// -------------------------------------------------------------------
@@ -592,9 +723,9 @@ export class VaultSync {
 		return normalizePath(path);
 	}
 
-	isFileMetaDeleted(meta: FileMeta | undefined): boolean {
+	isFileMetaDeleted(meta: unknown): boolean {
 		if (!meta) return false;
-		return meta.deleted === true || (typeof meta.deletedAt === "number" && Number.isFinite(meta.deletedAt));
+		return isFileMetaDeletedValue(meta);
 	}
 
 	private currentSchemaVersion(): number {
@@ -615,33 +746,34 @@ export class VaultSync {
 		this._pathIndex.clear();
 		this._deletedPathIndex.clear();
 
-		this.meta.forEach((meta, fileId) => {
-			const path = typeof meta.path === "string" ? this.normPath(meta.path) : "";
+		this.meta.forEach((value: unknown, fileId: string) => {
+			const path = getMetaPath(value);
 			if (!path) return;
+			const normalizedPath = this.normPath(path);
 
-			if (this.isFileMetaDeleted(meta)) {
-				if (!this._pathIndex.has(path)) {
-					this._deletedPathIndex.add(path);
+			if (isFileMetaDeletedValue(value)) {
+				if (!this._pathIndex.has(normalizedPath)) {
+					this._deletedPathIndex.add(normalizedPath);
 				}
 				return;
 			}
 
-			const existingId = this._pathIndex.get(path);
+			const existingId = this._pathIndex.get(normalizedPath);
 			if (!existingId) {
-				this._pathIndex.set(path, fileId);
-				this._deletedPathIndex.delete(path);
+				this._pathIndex.set(normalizedPath, fileId);
+				this._deletedPathIndex.delete(normalizedPath);
 				return;
 			}
 
-			const existingMeta = this.meta.get(existingId);
-			const existingMtime = typeof existingMeta?.mtime === "number" ? existingMeta.mtime : 0;
-			const candidateMtime = typeof meta.mtime === "number" ? meta.mtime : 0;
+			const existingValue = this.meta.get(existingId);
+			const existingMtime = getMetaMtime(existingValue) ?? 0;
+			const candidateMtime = getMetaMtime(value) ?? 0;
 
 			// If we see active path collisions, deterministically choose one winner.
 			if (candidateMtime > existingMtime || (candidateMtime === existingMtime && fileId > existingId)) {
-				this._pathIndex.set(path, fileId);
+				this._pathIndex.set(normalizedPath, fileId);
 			}
-			this._deletedPathIndex.delete(path);
+			this._deletedPathIndex.delete(normalizedPath);
 		});
 
 		this._pathIndexesDirty = false;
@@ -649,35 +781,53 @@ export class VaultSync {
 
 	private setMetaActive(fileId: string, path: string, device?: string): void {
 		const normalizedPath = this.normPath(path);
-		this.meta.set(fileId, {
+		const now = Date.now();
+
+		const entry = ensureNestedMetaEntry(this.meta, fileId, {
+			shape: "flat",
 			path: normalizedPath,
-			deleted: undefined,
-			deletedAt: undefined,
-			mtime: Date.now(),
-			device,
+			mtime: now,
+			...(device ? { device } : {}),
 		});
+
+		if (!entry) {
+			// Should not happen since we always provide a fallback
+			this.log(`setMetaActive: failed to ensure nested entry for ${fileId}`);
+			return;
+		}
+
+		entry.set("path", normalizedPath);
+		entry.delete("deleted");
+		entry.delete("deletedAt");
+		entry.set("mtime", now);
+
+		if (device) {
+			entry.set("device", device);
+		} else {
+			entry.delete("device");
+		}
 	}
 
 	private setMetaDeleted(fileId: string, path: string, device?: string): void {
 		const normalizedPath = this.normPath(path);
 		const deletedAt = Date.now();
-		const useLegacyFlag = this.currentSchemaVersion() < 2;
-		if (useLegacyFlag) {
-			this.meta.set(fileId, {
-				path: normalizedPath,
-				deleted: true,
-				deletedAt,
-				mtime: deletedAt,
-				device,
-			});
-			return;
-		}
 
-		// v2 tombstone payload is intentionally minimal for long-term size control.
-		this.meta.set(fileId, {
+		const entry = ensureNestedMetaEntry(this.meta, fileId, {
+			shape: "flat",
 			path: normalizedPath,
 			deletedAt,
 		});
+
+		if (!entry) {
+			this.log(`setMetaDeleted: failed to ensure nested entry for ${fileId}`);
+			return;
+		}
+
+		entry.set("path", normalizedPath);
+		entry.set("deletedAt", deletedAt);
+		entry.delete("deleted");
+		entry.delete("mtime");
+		entry.delete("device");
 	}
 
 	migrateSchemaToV2(device?: string): {
@@ -710,8 +860,8 @@ export class VaultSync {
 			});
 
 			for (const [fileId, paths] of pathsById) {
-				const meta = this.meta.get(fileId);
-				const preferred = typeof meta?.path === "string" ? this.normPath(meta.path) : "";
+				const metaValue = this.meta.get(fileId);
+				const preferred = getMetaPath(metaValue) ? this.normPath(getMetaPath(metaValue)!) : "";
 				const canonical = preferred && paths.includes(preferred)
 					? preferred
 					: paths.slice().sort()[0]!;
@@ -724,64 +874,75 @@ export class VaultSync {
 			}
 
 			for (const [fileId, normalizedPath] of canonicalPathById) {
-				const currentMeta = this.meta.get(fileId);
+				const currentMeta = decodeFileMeta(this.meta.get(fileId));
 				if (!currentMeta) {
+					// Write flat v2 object — this is a v1→v2 migration, not a v3 upgrade.
+					// The lazy v3 conversion will upgrade this entry when it is next touched.
 					this.meta.set(fileId, {
 						path: normalizedPath,
 						deletedAt: undefined,
 						deleted: undefined,
 						mtime: now,
 						device,
-					});
+					} as unknown);
 					metaCreated++;
 					return;
 				}
 
-				const isDeleted = this.isFileMetaDeleted(currentMeta);
+				const isDeleted = currentMeta.deleted === true || typeof currentMeta.deletedAt === "number";
 				if (!isDeleted && currentMeta.path !== normalizedPath) {
-					this.meta.set(fileId, {
-						...currentMeta,
-						path: normalizedPath,
-						deleted: undefined,
-						deletedAt: undefined,
-						mtime: currentMeta.mtime ?? now,
-						device: currentMeta.device ?? device,
-					});
+					// Update path in-place on nested map; write flat if still flat.
+					const existing = this.meta.get(fileId);
+					if (existing instanceof Y.Map) {
+						existing.set("path", normalizedPath);
+					} else {
+						this.meta.set(fileId, {
+							...(currentMeta as object),
+							path: normalizedPath,
+							deleted: undefined,
+							deletedAt: undefined,
+							mtime: currentMeta.mtime ?? now,
+							device: currentMeta.device ?? device,
+						} as unknown);
+					}
 					metaUpdated++;
 				}
 			}
 
-			this.meta.forEach((meta, fileId) => {
-				if (meta.deleted && meta.deletedAt === undefined) {
+			this.meta.forEach((value: unknown, fileId: string) => {
+				const decoded = decodeFileMeta(value);
+				if (!decoded) return;
+				if (decoded.deleted && decoded.deletedAt === undefined) {
+					// Convert legacy deleted:true to v2 flat tombstone.
 					this.meta.set(fileId, {
-						path: this.normPath(meta.path),
-						deletedAt: typeof meta.mtime === "number" ? meta.mtime : now,
-					});
+						path: this.normPath(decoded.path),
+						deletedAt: typeof decoded.mtime === "number" ? decoded.mtime : now,
+					} as unknown);
 					tombstonesConverted++;
 					return;
 				}
-				if (this.isFileMetaDeleted(meta) && (meta.deleted !== undefined || meta.mtime !== undefined || meta.device !== undefined)) {
+				const isDel = decoded.deleted === true || typeof decoded.deletedAt === "number";
+				if (isDel && (decoded.deleted !== undefined || decoded.mtime !== undefined || decoded.device !== undefined)) {
+					// Strip extra fields from tombstone, keep as flat v2.
 					this.meta.set(fileId, {
-						path: this.normPath(meta.path),
-						deletedAt: typeof meta.deletedAt === "number" ? meta.deletedAt : now,
-					});
+						path: this.normPath(decoded.path),
+						deletedAt: typeof decoded.deletedAt === "number" ? decoded.deletedAt : now,
+					} as unknown);
 					metaUpdated++;
 				}
 			});
 
-			// Explicit tombstones for dropped alias paths.
+			// Explicit tombstones for dropped alias paths — write flat v2.
 			const existingActivePaths = new Set<string>();
-			this.meta.forEach((meta) => {
-				if (this.isFileMetaDeleted(meta)) return;
-				existingActivePaths.add(this.normPath(meta.path));
+			this.meta.forEach((value: unknown) => {
+				if (isFileMetaDeletedValue(value)) return;
+				const path = getMetaPath(value);
+				if (path) existingActivePaths.add(this.normPath(path));
 			});
 			for (const loserPath of loserPaths) {
 				if (existingActivePaths.has(loserPath)) continue;
 				const tombstoneId = this.generateFileId();
-				this.meta.set(tombstoneId, {
-					path: loserPath,
-					deletedAt: now,
-				});
+				this.meta.set(tombstoneId, { path: loserPath, deletedAt: now } as unknown);
 			}
 
 			this.sys.set("schemaVersion", 2);
@@ -851,18 +1012,15 @@ export class VaultSync {
 					const newId = this.generateFileId();
 					const newText = new Y.Text();
 
-					this.ydoc.transact(() => {
-						if (sourceText) {
-							newText.insert(0, sourceText.toJSON());
-						}
-						this.pathToId.set(dupPath, newId);
-						this.idToText.set(newId, newText);
-						this.meta.set(newId, {
-							path: dupPath,
-							mtime: Date.now(),
-							device: this._device,
-						});
-					}, ORIGIN_SEED);
+				this.ydoc.transact(() => {
+					if (sourceText) {
+						newText.insert(0, sourceText.toJSON());
+					}
+					this.pathToId.set(dupPath, newId);
+					this.idToText.set(newId, newText);
+					const dupMeta = createNestedActiveMeta(dupPath, Date.now(), this._device);
+					this.meta.set(newId, dupMeta);
+				}, ORIGIN_SEED);
 
 					this.log(
 						`integrity: gave "${dupPath}" new id=${newId} (was sharing ${fileId} with "${keepPath}")`,
@@ -880,8 +1038,8 @@ export class VaultSync {
 
 		// Also keep tombstoned IDs (they're intentionally orphaned from pathToId)
 		const tombstonedIds = new Set<string>();
-		this.meta.forEach((meta, fileId) => {
-			if (this.isFileMetaDeleted(meta)) {
+		this.meta.forEach((value: unknown, fileId: string) => {
+			if (isFileMetaDeletedValue(value)) {
 				tombstonedIds.add(fileId);
 			}
 		});
@@ -1186,7 +1344,7 @@ export class VaultSync {
 			});
 			this.onFlightPathEvent?.({
 				priority: "critical",
-				kind: PRODUCT_EVENT_KIND.crdtFileRevived,
+				kind: FLIGHT_KIND.crdtFileRevived,
 				severity: "info",
 				scope: "file",
 				source: "vaultSync",
@@ -1226,14 +1384,14 @@ export class VaultSync {
 		this._textToFileId.set(ytext, fileId);
 		this.onFlightPathEvent?.({
 			priority: "important",
-			kind: PRODUCT_EVENT_KIND.crdtFileCreated,
+			kind: FLIGHT_KIND.crdtFileCreated,
 			severity: "info",
 			scope: "file",
 			source: "vaultSync",
 			layer: "crdt",
 			path,
+			fileId,
 			opId,
-			data: { fileId },
 		});
 		return ytext;
 	}
@@ -1521,13 +1679,14 @@ export class VaultSync {
 		for (const { newPath, fileId } of renamedIds) {
 			this.onFlightPathEvent?.({
 				priority: "important",
-				kind: PRODUCT_EVENT_KIND.crdtFileRenamed,
+				kind: FLIGHT_KIND.crdtFileRenamed,
 				severity: "info",
 				scope: "file",
 				source: "vaultSync",
 				layer: "crdt",
 				path: newPath,
-				data: { fileId, batchSize: batch.size },
+				fileId,
+				data: { batchSize: batch.size },
 			});
 		}
 
@@ -1536,11 +1695,11 @@ export class VaultSync {
 
 	private clearMarkdownTombstonesForPath(path: string, keepFileId?: string): number {
 		const tombstonedIds: string[] = [];
-		this.meta.forEach((meta, fileId) => {
+		this.meta.forEach((value: unknown, fileId: string) => {
 			if (
 				fileId !== keepFileId
-				&& meta.path === path
-				&& this.isFileMetaDeleted(meta)
+				&& getMetaPath(value) === path
+				&& isFileMetaDeletedValue(value)
 			) {
 				tombstonedIds.push(fileId);
 			}
@@ -1556,8 +1715,8 @@ export class VaultSync {
 	private getMarkdownTombstoneIds(path: string): string[] {
 		const normalizedPath = this.normPath(path);
 		const tombstonedIds: string[] = [];
-		this.meta.forEach((meta, fileId) => {
-			if (meta.path === normalizedPath && this.isFileMetaDeleted(meta)) {
+		this.meta.forEach((value: unknown, fileId: string) => {
+			if (getMetaPath(value) === normalizedPath && isFileMetaDeletedValue(value)) {
 				tombstonedIds.push(fileId);
 			}
 		});
@@ -1626,14 +1785,14 @@ export class VaultSync {
 		});
 		this.onFlightPathEvent?.({
 			priority: "critical",
-			kind: PRODUCT_EVENT_KIND.crdtFileTombstoned,
+			kind: FLIGHT_KIND.crdtFileTombstoned,
 			severity: "info",
 			scope: "file",
 			source: "vaultSync",
 			layer: "crdt",
 			path: resolvedPath,
+			fileId,
 			opId,
-			data: { fileId },
 		});
 
 		this.log(`handleDelete: "${resolvedPath}" marked deleted (id=${fileId})`);

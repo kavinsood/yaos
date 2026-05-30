@@ -3,7 +3,8 @@ import * as Y from "yjs";
 import type { VaultSync } from "./vaultSync";
 import type { EditorBindingManager } from "./editorBinding";
 import type { TraceRecord } from "../observability/traceContext";
-import { PRODUCT_EVENT_KIND } from "../observability/productEventKinds";
+import { getMetaPath, isFileMetaDeletedValue } from "./fileMeta";
+import type { MetaChangeBatch } from "./fileMeta";
 import { formatUnknown, yTextToString } from "../utils/format";
 import {
 	isFrontmatterBlocked,
@@ -66,6 +67,31 @@ function hashPrefix(hash: string | null | undefined): string | null {
 export class DiskMirror {
 	private suppressedPaths = new Map<string, SuppressionEntry>();
 	private openPaths = new Set<string>();
+
+	/**
+	 * Tracks new paths being renamed by DiskMirror in response to remote
+	 * metadata changes (handleRemoteRename). Consumed by the vault rename
+	 * event handler in main.ts via consumeRemoteRename(), which both reads
+	 * and removes the marker in a single call (consume-on-use, matching the
+	 * suppressedPaths / consumeDeleteSuppression pattern).
+	 */
+	private _pendingRemoteRenameNewPaths = new Set<string>();
+
+	/**
+	 * Consume the remote-rename marker for `newPath` if present.
+	 * Returns true if the rename was DiskMirror-originated (passive receiver).
+	 * Removes the marker atomically — safe to call from the vault rename handler.
+	 *
+	 * @internal Used by main.ts vault rename handler.
+	 */
+	consumeRemoteRename(newPath: string): boolean {
+		const normalized = normalizePath(newPath);
+		if (this._pendingRemoteRenameNewPaths.has(normalized)) {
+			this._pendingRemoteRenameNewPaths.delete(normalized);
+			return true;
+		}
+		return false;
+	}
 
 	/** Deduped write queue. Order doesn't matter — deduplication does. */
 	private writeQueue = new Set<string>();
@@ -170,47 +196,57 @@ export class DiskMirror {
 	// -------------------------------------------------------------------
 
 	startMapObservers(): void {
-		const metaObserver = (event: import("yjs").YMapEvent<import("../types").FileMeta>) => {
-			if (isLocalOrigin(event.transaction.origin, this.vaultSync.provider)) {
-				return;
+		// ---------------------------------------------------------------
+		// Semantic metadata observer.
+		//
+		// Subscribes to pre-classified MetaSemanticChange events from
+		// VaultSync.observeMetaChanges(), which is powered by observeDeep
+		// internally. This correctly fires for both flat (v2) object
+		// replacements AND nested Y.Map field mutations (v3), where a
+		// shallow meta.observe() would have silently dropped the event.
+		// ---------------------------------------------------------------
+		const unsubscribeMetaChanges = this.vaultSync.observeMetaChanges((batch) => {
+			// Only react to remote changes. Local metadata writes (disk sync,
+			// seed, restore) must not feed back into DiskMirror as remote events.
+			if (batch.isLocal) return;
+
+			for (const change of batch.changes) {
+				switch (change.kind) {
+					case "deleted": {
+						const path = normalizePath(change.path);
+						const baselineText = this.vaultSync.idToText.get(change.fileId)?.toString() ?? null;
+						void this.handleRemoteDelete(path, { baselineText });
+						break;
+					}
+					case "revived": {
+						this.scheduleWrite(normalizePath(change.path));
+						break;
+					}
+					case "path-changed": {
+						// Only rename on disk when the entry is active.
+						// Tombstone path changes (e.g. from migrateSchemaToV2) must not
+						// trigger a disk rename — there is no live file to rename.
+						if (!change.isDeleted) {
+							void this.handleRemoteRename(
+								normalizePath(change.previousPath),
+								normalizePath(change.nextPath),
+							);
+						}
+						break;
+					}
+					case "added": {
+						// New file received from remote — schedule write if active.
+						if (!change.next.deletedAt && !change.next.deleted) {
+							this.scheduleWrite(normalizePath(change.next.path));
+						}
+						break;
+					}
+					// mtime-changed, device-changed, removed, invalid:
+					// no disk side effect needed.
+				}
 			}
-			event.changes.keys.forEach((change, fileId) => {
-				const oldMeta = change.oldValue as import("../types").FileMeta | undefined;
-				const newMeta = this.vaultSync.meta.get(fileId);
-				const oldPath = typeof oldMeta?.path === "string" ? normalizePath(oldMeta.path) : null;
-				const newPath = typeof newMeta?.path === "string" ? normalizePath(newMeta.path) : null;
-				const wasDeleted = this.vaultSync.isFileMetaDeleted(oldMeta);
-				const isDeleted = this.vaultSync.isFileMetaDeleted(newMeta);
-
-				// Remote tombstone transition.
-				if (newPath && isDeleted && !wasDeleted) {
-					const baselineText = this.vaultSync.idToText.get(fileId)?.toString() ?? null;
-					void this.handleRemoteDelete(newPath, { baselineText });
-					return;
-				}
-
-				// Remote undelete/restore transition.
-				if (newPath && !isDeleted && wasDeleted) {
-					this.scheduleWrite(newPath);
-					return;
-				}
-
-				// Remote rename/move transition from meta.path.
-				if (oldPath && newPath && oldPath !== newPath && !isDeleted) {
-					void this.handleRemoteRename(oldPath, newPath);
-					return;
-				}
-
-				// Remote create/update where the file is active.
-				if ((change.action === "add" || change.action === "update") && newPath && !isDeleted) {
-					this.scheduleWrite(newPath);
-				}
-			});
-		};
-		this.vaultSync.meta.observe(metaObserver);
-		this.mapObserverCleanups.push(() =>
-			this.vaultSync.meta.unobserve(metaObserver),
-		);
+		});
+		this.mapObserverCleanups.push(unsubscribeMetaChanges);
 
 		// ---------------------------------------------------------------
 		// afterTransaction: catch remote content edits to CLOSED files.
@@ -233,13 +269,14 @@ export class DiskMirror {
 				if (!fileId) continue;
 
 				// Map fileId → path via meta (pathToId is path→id, not id→path)
-				const meta = this.vaultSync.meta.get(fileId);
-				if (!meta || this.vaultSync.isFileMetaDeleted(meta)) continue;
+				const metaValue = this.vaultSync.meta.get(fileId);
+				if (!metaValue || isFileMetaDeletedValue(metaValue)) continue;
 
-				const path = meta.path;
+				const path = getMetaPath(metaValue);
+				if (!path) continue;
 
-					// Skip if this path is already open (handled by per-file observer policy)
-					if (this.openPaths.has(path)) continue;
+				// Skip if this path is already open (handled by per-file observer policy)
+				if (this.openPaths.has(path)) continue;
 
 				this.log(`afterTxn: remote content change to closed file "${path}"`);
 				this.scheduleWrite(path);
@@ -515,7 +552,7 @@ export class DiskMirror {
 				this._onDiskWriteCallback?.(normalized, await contentBaselineHash(content));
 				this._flightEventHandler?.({
 					priority: "important",
-					kind: PRODUCT_EVENT_KIND.diskWriteOk,
+					kind: "disk.write.ok",
 					severity: "info",
 					scope: "file",
 					source: "diskMirror",
@@ -544,7 +581,7 @@ export class DiskMirror {
 				this._onDiskWriteCallback?.(normalized, await contentBaselineHash(content));
 				this._flightEventHandler?.({
 					priority: "important",
-					kind: PRODUCT_EVENT_KIND.diskWriteOk,
+					kind: "disk.write.ok",
 					severity: "info",
 					scope: "file",
 					source: "diskMirror",
@@ -557,7 +594,7 @@ export class DiskMirror {
 			console.error(`[yaos] flushWrite failed for "${path}":`, err);
 			this._flightEventHandler?.({
 				priority: "critical",
-				kind: PRODUCT_EVENT_KIND.diskWriteFailed,
+				kind: "disk.write.failed",
 				severity: "error",
 				scope: "file",
 				source: "diskMirror",
@@ -859,11 +896,11 @@ export class DiskMirror {
 		const oldFile = this.app.vault.getAbstractFileByPath(oldNormalized);
 		if (oldFile instanceof TFile) {
 			try {
-					const target = this.app.vault.getAbstractFileByPath(newNormalized);
-					if (target instanceof TFile) {
-						this.suppressDelete(oldNormalized);
-						await this.deleteLocalReplica(oldFile);
-					} else {
+				const target = this.app.vault.getAbstractFileByPath(newNormalized);
+				if (target instanceof TFile) {
+					this.suppressDelete(oldNormalized);
+					await this.deleteLocalReplica(oldFile);
+				} else {
 					const dir = newNormalized.substring(0, newNormalized.lastIndexOf("/"));
 					if (dir) {
 						const dirNode = this.app.vault.getAbstractFileByPath(normalizePath(dir));
@@ -871,7 +908,17 @@ export class DiskMirror {
 							await this.app.vault.createFolder(dir);
 						}
 					}
-					await this.app.fileManager.renameFile(oldFile, newNormalized);
+					// Mark this rename as remote-originated before the vault event fires,
+					// so main.ts can consume the marker and skip queueRename.
+					// consumeRemoteRename() in the vault handler removes the marker on use.
+					// On error (rename throws), the vault event won't fire, so clean up here.
+					this._pendingRemoteRenameNewPaths.add(newNormalized);
+					try {
+						await this.app.fileManager.renameFile(oldFile, newNormalized);
+					} catch (renameErr) {
+						this._pendingRemoteRenameNewPaths.delete(newNormalized);
+						throw renameErr;
+					}
 				}
 				this.log(`handleRemoteRename: "${oldNormalized}" -> "${newNormalized}"`);
 			} catch (err) {
@@ -1260,7 +1307,7 @@ export class DiskMirror {
 			});
 			this._flightEventHandler?.({
 				priority: "critical",
-				kind: PRODUCT_EVENT_KIND.diskEventNotSuppressed,
+				kind: "disk.event.not_suppressed",
 				severity: "warn",
 				scope: "file",
 				source: "diskMirror",
@@ -1291,7 +1338,7 @@ export class DiskMirror {
 			});
 			this._flightEventHandler?.({
 				priority: "critical",
-				kind: PRODUCT_EVENT_KIND.diskEventNotSuppressed,
+				kind: "disk.event.not_suppressed",
 				severity: "warn",
 				scope: "file",
 				source: "diskMirror",
@@ -1350,7 +1397,7 @@ export class DiskMirror {
 		});
 		this._flightEventHandler?.({
 			priority: "critical",
-			kind: PRODUCT_EVENT_KIND.diskEventNotSuppressed,
+			kind: "disk.event.not_suppressed",
 			severity: "warn",
 			scope: "file",
 			source: "diskMirror",
