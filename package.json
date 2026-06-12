@@ -4,6 +4,7 @@
 	"description": "A zero-terminal, real-time sync engine powered by your own Cloudflare Worker.",
 	"main": "main.js",
 	"type": "module",
+	"packageManager": "pnpm@9.15.0",
 	"scripts": {
 		"dev": "node esbuild.config.mjs",
 		"build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
