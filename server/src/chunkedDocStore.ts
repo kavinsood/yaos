@@ -9,6 +9,8 @@ const CHECKPOINT_POINTER_KEY = "document:checkpoint:current";
 const CHECKPOINT_MANIFEST_PREFIX = "document:checkpoint:manifest:";
 const CHECKPOINT_CHUNK_PREFIX = "document:checkpoint:chunk:";
 const CHECKPOINT_STATE_VECTOR_PREFIX = "document:checkpoint:state-vector:";
+const CHECKPOINT_STATE_VECTOR_DESCRIPTOR_PREFIX = "document:checkpoint:state-vector-descriptor:";
+const CHECKPOINT_STATE_VECTOR_CHUNK_PREFIX = "document:checkpoint:state-vector-chunk:";
 
 const JOURNAL_META_KEY = "document:journal:meta";
 const JOURNAL_MANIFEST_PREFIX = "document:journal:manifest:";
@@ -16,6 +18,8 @@ const JOURNAL_CHUNK_PREFIX = "document:journal:chunk:";
 
 const DEFAULT_CHUNK_SIZE_BYTES = 512 * 1024;
 const DEFAULT_MAX_KEYS_PER_OPERATION = 128;
+const MAX_CHUNK_BYTES_PER_PUT = 4 * 1024 * 1024;
+const DIRECT_STATE_VECTOR_MAX_BYTES = 1024 * 1024;
 
 interface ManifestPointer {
 	version: number;
@@ -30,6 +34,7 @@ interface CheckpointManifest {
 	sha256: string;
 	stateVectorByteLength: number;
 	stateVectorSha256: string;
+	stateVectorStorage?: "direct" | "chunked";
 	updatedAt: string;
 }
 
@@ -73,6 +78,12 @@ interface ChunkDescriptor {
 	sha256: string;
 }
 
+interface StateVectorDescriptor extends ChunkDescriptor {
+	format: "yaos-doc-state-vector-v1";
+	version: number;
+	updatedAt: string;
+}
+
 export interface ChunkedDocStoreOptions {
 	chunkSizeBytes?: number;
 	maxKeysPerOperation?: number;
@@ -82,6 +93,19 @@ export interface JournalStats {
 	entryCount: number;
 	totalBytes: number;
 	nextSeq: number;
+}
+
+export interface ChunkWriteStats {
+	chunkCount: number;
+	maxChunkBytes: number;
+	maxBackingBufferBytes: number;
+	maxPutBytes: number;
+	putCount: number;
+}
+
+export interface CheckpointCompactionResult {
+	stateVector: Uint8Array;
+	journalStats: JournalStats;
 }
 
 export interface LoadedDocState {
@@ -101,6 +125,14 @@ function checkpointChunkKey(version: number, index: number): string {
 
 function checkpointStateVectorKey(version: number): string {
 	return `${CHECKPOINT_STATE_VECTOR_PREFIX}${version}`;
+}
+
+function checkpointStateVectorDescriptorKey(version: number): string {
+	return `${CHECKPOINT_STATE_VECTOR_DESCRIPTOR_PREFIX}${version}`;
+}
+
+function checkpointStateVectorChunkKey(version: number, index: number): string {
+	return `${CHECKPOINT_STATE_VECTOR_CHUNK_PREFIX}${version}:${index}`;
 }
 
 function journalManifestKey(seq: number): string {
@@ -144,7 +176,25 @@ function isChunkedManifest(value: unknown): value is CheckpointManifest {
 	if (typeof m.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(m.sha256)) return false;
 	if (!Number.isInteger(m.stateVectorByteLength) || m.stateVectorByteLength < 0) return false;
 	if (typeof m.stateVectorSha256 !== "string" || !/^[0-9a-f]{64}$/.test(m.stateVectorSha256)) return false;
+	if (
+		m.stateVectorStorage !== undefined
+		&& m.stateVectorStorage !== "direct"
+		&& m.stateVectorStorage !== "chunked"
+	) return false;
 	if (typeof m.updatedAt !== "string" || m.updatedAt.length === 0) return false;
+	return true;
+}
+
+function isStateVectorDescriptor(value: unknown): value is StateVectorDescriptor {
+	if (typeof value !== "object" || value === null) return false;
+	const d = value as StateVectorDescriptor;
+	if (d.format !== "yaos-doc-state-vector-v1") return false;
+	if (!Number.isInteger(d.version) || d.version <= 0) return false;
+	if (!Number.isInteger(d.chunkSizeBytes) || d.chunkSizeBytes <= 0) return false;
+	if (!Number.isInteger(d.chunkCount) || d.chunkCount < 0) return false;
+	if (!Number.isInteger(d.byteLength) || d.byteLength < 0) return false;
+	if (typeof d.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(d.sha256)) return false;
+	if (typeof d.updatedAt !== "string" || d.updatedAt.length === 0) return false;
 	return true;
 }
 
@@ -220,32 +270,64 @@ async function deleteKeysBatched(
 	}
 }
 
+function copyChunk(bytes: Uint8Array, start: number, end: number): Uint8Array {
+	const chunk = new Uint8Array(end - start);
+	chunk.set(bytes.subarray(start, end));
+	return chunk;
+}
+
 async function putChunkedPayloadBatched(
 	target: StorageLike | TransactionLike,
 	bytes: Uint8Array,
 	chunkSizeBytes: number,
 	chunkKeyForIndex: (index: number) => string,
 	maxKeysPerOperation: number,
-): Promise<number> {
+): Promise<ChunkWriteStats> {
 	const chunkCount = bytes.byteLength === 0
 		? 0
 		: Math.ceil(bytes.byteLength / chunkSizeBytes);
+	const stats: ChunkWriteStats = {
+		chunkCount,
+		maxChunkBytes: 0,
+		maxBackingBufferBytes: 0,
+		maxPutBytes: 0,
+		putCount: 0,
+	};
 
-	if (chunkCount === 0) return 0;
+	if (chunkCount === 0) return stats;
 
-	for (let chunkStart = 0; chunkStart < chunkCount; chunkStart += maxKeysPerOperation) {
-		const chunkEnd = Math.min(chunkStart + maxKeysPerOperation, chunkCount);
+	let chunkStart = 0;
+	while (chunkStart < chunkCount) {
 		const record: Record<string, Uint8Array> = {};
-		for (let i = chunkStart; i < chunkEnd; i++) {
+		let recordBytes = 0;
+		let recordKeys = 0;
+		while (chunkStart < chunkCount && recordKeys < maxKeysPerOperation) {
+			const i = chunkStart;
 			const start = i * chunkSizeBytes;
 			const end = Math.min(start + chunkSizeBytes, bytes.byteLength);
-			// subarray avoids eagerly copying chunk bytes into transient arrays.
-			record[chunkKeyForIndex(i)] = bytes.subarray(start, end);
+			const chunkBytes = end - start;
+			if (recordKeys > 0 && recordBytes + chunkBytes > MAX_CHUNK_BYTES_PER_PUT) {
+				break;
+			}
+			// Storage serialization must never retain the full backing buffer
+			// of a large update.
+			const chunk = copyChunk(bytes, start, end);
+			record[chunkKeyForIndex(i)] = chunk;
+			stats.maxChunkBytes = Math.max(stats.maxChunkBytes, chunk.byteLength);
+			stats.maxBackingBufferBytes = Math.max(
+				stats.maxBackingBufferBytes,
+				chunk.buffer.byteLength,
+			);
+			recordBytes += chunkBytes;
+			recordKeys++;
+			chunkStart++;
 		}
+		stats.maxPutBytes = Math.max(stats.maxPutBytes, recordBytes);
+		stats.putCount++;
 		await target.put(record);
 	}
 
-	return chunkCount;
+	return stats;
 }
 
 function emptyJournalMeta(now = new Date().toISOString()): JournalMeta {
@@ -264,6 +346,38 @@ function journalStatsFromMeta(meta: JournalMeta): JournalStats {
 		totalBytes: meta.totalBytes,
 		nextSeq: meta.nextSeq,
 	};
+}
+
+function emptyChunkWriteStats(): ChunkWriteStats {
+	return {
+		chunkCount: 0,
+		maxChunkBytes: 0,
+		maxBackingBufferBytes: 0,
+		maxPutBytes: 0,
+		putCount: 0,
+	};
+}
+
+function combineChunkWriteStats(...items: ChunkWriteStats[]): ChunkWriteStats {
+	const out = emptyChunkWriteStats();
+	for (const item of items) {
+		out.chunkCount += item.chunkCount;
+		out.maxChunkBytes = Math.max(out.maxChunkBytes, item.maxChunkBytes);
+		out.maxBackingBufferBytes = Math.max(
+			out.maxBackingBufferBytes,
+			item.maxBackingBufferBytes,
+		);
+		out.maxPutBytes = Math.max(out.maxPutBytes, item.maxPutBytes);
+		out.putCount += item.putCount;
+	}
+	return out;
+}
+
+function assertPositiveInteger(value: number, label: string): number {
+	if (!Number.isInteger(value) || value <= 0) {
+		throw new Error(`${label} must be a positive integer`);
+	}
+	return value;
 }
 
 function expectedJournalSeqs(meta: JournalMeta): number[] {
@@ -340,13 +454,24 @@ async function readChunkedPayload(
 export class ChunkedDocStore {
 	private readonly chunkSizeBytes: number;
 	private readonly maxKeysPerOperation: number;
+	private lastWriteStats: ChunkWriteStats | null = null;
 
 	constructor(
 		private readonly storage: StorageLike,
 		options: ChunkedDocStoreOptions = {},
 	) {
-		this.chunkSizeBytes = options.chunkSizeBytes ?? DEFAULT_CHUNK_SIZE_BYTES;
-		this.maxKeysPerOperation = options.maxKeysPerOperation ?? DEFAULT_MAX_KEYS_PER_OPERATION;
+		this.chunkSizeBytes = assertPositiveInteger(
+			options.chunkSizeBytes ?? DEFAULT_CHUNK_SIZE_BYTES,
+			"chunkSizeBytes",
+		);
+		this.maxKeysPerOperation = assertPositiveInteger(
+			options.maxKeysPerOperation ?? DEFAULT_MAX_KEYS_PER_OPERATION,
+			"maxKeysPerOperation",
+		);
+	}
+
+	getLastWriteStats(): ChunkWriteStats | null {
+		return this.lastWriteStats;
 	}
 
 	async loadState(): Promise<LoadedDocState> {
@@ -376,19 +501,20 @@ export class ChunkedDocStore {
 			const seq = meta.nextSeq;
 			const hash = await sha256Hex(bytes);
 
-			const chunkCount = await putChunkedPayloadBatched(
+			const writeStats = await putChunkedPayloadBatched(
 				txn,
 				bytes,
 				this.chunkSizeBytes,
 				(i) => journalChunkKey(seq, i),
 				this.maxKeysPerOperation,
 			);
+			this.lastWriteStats = writeStats;
 
 			const manifest: JournalEntryManifest = {
 				format: JOURNAL_ENTRY_FORMAT,
 				seq,
 				chunkSizeBytes: this.chunkSizeBytes,
-				chunkCount,
+				chunkCount: writeStats.chunkCount,
 				byteLength: bytes.byteLength,
 				sha256: hash,
 				updatedAt: now,
@@ -439,6 +565,19 @@ export class ChunkedDocStore {
 				}
 				cleanupKeys.add(oldManifestKey);
 				cleanupKeys.add(checkpointStateVectorKey(existingPointer.version));
+				if ((oldManifestRaw.stateVectorStorage ?? "direct") === "chunked") {
+					const descriptorKey = checkpointStateVectorDescriptorKey(existingPointer.version);
+					const rawDescriptor = await txn.get<unknown>(descriptorKey);
+					if (!isStateVectorDescriptor(rawDescriptor)) {
+						throw new Error(
+							`checkpoint state vector descriptor missing or invalid for version ${existingPointer.version}`,
+						);
+					}
+					cleanupKeys.add(descriptorKey);
+					for (let i = 0; i < rawDescriptor.chunkCount; i++) {
+						cleanupKeys.add(checkpointStateVectorChunkKey(existingPointer.version, i));
+					}
+				}
 				for (let i = 0; i < oldManifestRaw.chunkCount; i++) {
 					cleanupKeys.add(checkpointChunkKey(oldManifestRaw.version, i));
 				}
@@ -471,28 +610,56 @@ export class ChunkedDocStore {
 				? existingPointer.version + 1
 				: 1;
 			const now = new Date().toISOString();
-			const chunkCount = await putChunkedPayloadBatched(
+			const updateWriteStats = await putChunkedPayloadBatched(
 				txn,
 				updateBytes,
 				this.chunkSizeBytes,
 				(i) => checkpointChunkKey(newVersion, i),
 				this.maxKeysPerOperation,
 			);
+			let stateVectorStorage: "direct" | "chunked" = "direct";
+			let stateVectorWriteStats = emptyChunkWriteStats();
 
 			const entries: Array<[string, unknown]> = [];
+			if (stateVectorBytes.byteLength > DIRECT_STATE_VECTOR_MAX_BYTES) {
+				stateVectorStorage = "chunked";
+				stateVectorWriteStats = await putChunkedPayloadBatched(
+					txn,
+					stateVectorBytes,
+					this.chunkSizeBytes,
+					(i) => checkpointStateVectorChunkKey(newVersion, i),
+					this.maxKeysPerOperation,
+				);
+				const stateVectorDescriptor: StateVectorDescriptor = {
+					format: "yaos-doc-state-vector-v1",
+					version: newVersion,
+					chunkSizeBytes: this.chunkSizeBytes,
+					chunkCount: stateVectorWriteStats.chunkCount,
+					byteLength: stateVectorBytes.byteLength,
+					sha256: stateVectorHash,
+					updatedAt: now,
+				};
+				entries.push([checkpointStateVectorDescriptorKey(newVersion), stateVectorDescriptor]);
+			} else {
+				entries.push([
+					checkpointStateVectorKey(newVersion),
+					copyChunk(stateVectorBytes, 0, stateVectorBytes.byteLength),
+				]);
+			}
+			this.lastWriteStats = combineChunkWriteStats(updateWriteStats, stateVectorWriteStats);
 			const manifest: CheckpointManifest = {
 				format: CHECKPOINT_FORMAT,
 				version: newVersion,
 				chunkSizeBytes: this.chunkSizeBytes,
-				chunkCount,
+				chunkCount: updateWriteStats.chunkCount,
 				byteLength: updateBytes.byteLength,
 				sha256: updateHash,
 				stateVectorByteLength: stateVectorBytes.byteLength,
 				stateVectorSha256: stateVectorHash,
+				stateVectorStorage,
 				updatedAt: now,
 			};
 			entries.push([checkpointManifestKey(newVersion), manifest]);
-			entries.push([checkpointStateVectorKey(newVersion), stateVectorBytes]);
 			entries.push([CHECKPOINT_POINTER_KEY, { version: newVersion } satisfies ManifestPointer]);
 			entries.push([JOURNAL_META_KEY, emptyJournalMeta(now)]);
 
@@ -509,7 +676,7 @@ export class ChunkedDocStore {
 		}
 		updates.push(...state.journalUpdates);
 		if (updates.length === 0) return null;
-			if (updates.length === 1) return updates[0] ?? null;
+		if (updates.length === 1) return updates[0] ?? null;
 		return Y.mergeUpdates(updates);
 	}
 
@@ -520,6 +687,29 @@ export class ChunkedDocStore {
 			Y.applyUpdate(doc, bytes);
 		}
 		await this.rewriteCheckpoint(bytes, Y.encodeStateVector(doc));
+	}
+
+	async compactJournalToCheckpoint(): Promise<CheckpointCompactionResult> {
+		const state = await this.loadState();
+		const updates: Uint8Array[] = [];
+		if (state.checkpoint) updates.push(state.checkpoint);
+		updates.push(...state.journalUpdates);
+		if (updates.length === 0) {
+			const emptyDoc = new Y.Doc();
+			const stateVector = Y.encodeStateVector(emptyDoc);
+			emptyDoc.destroy();
+			return {
+				stateVector,
+				journalStats: state.journalStats,
+			};
+		}
+		const merged = updates.length === 1 ? updates[0]! : Y.mergeUpdates(updates);
+		const stateVector = Y.encodeStateVectorFromUpdate(merged);
+		await this.rewriteCheckpoint(merged, stateVector);
+		return {
+			stateVector,
+			journalStats: await this.getJournalStats(),
+		};
 	}
 
 	private async loadCheckpoint(): Promise<{
@@ -552,11 +742,36 @@ export class ChunkedDocStore {
 			this.maxKeysPerOperation,
 		);
 
-		const rawStateVector = await this.storage.get<unknown>(checkpointStateVectorKey(rawManifest.version));
-		if (rawStateVector === undefined) {
-			throw new Error(`checkpoint state vector missing for version ${rawManifest.version}`);
+		const stateVectorStorage = rawManifest.stateVectorStorage ?? "direct";
+		let stateVector: Uint8Array;
+		if (stateVectorStorage === "chunked") {
+			const descriptorKey = checkpointStateVectorDescriptorKey(rawManifest.version);
+			const rawDescriptor = await this.storage.get<unknown>(descriptorKey);
+			if (!isStateVectorDescriptor(rawDescriptor)) {
+				throw new Error(`checkpoint state vector descriptor missing or invalid for version ${rawManifest.version}`);
+			}
+			if (rawDescriptor.byteLength !== rawManifest.stateVectorByteLength) {
+				throw new Error(
+					`checkpoint state vector descriptor length mismatch (expected ${rawManifest.stateVectorByteLength}, got ${rawDescriptor.byteLength})`,
+				);
+			}
+			if (rawDescriptor.sha256 !== rawManifest.stateVectorSha256) {
+				throw new Error("checkpoint state vector descriptor sha256 mismatch");
+			}
+			stateVector = await readChunkedPayload(
+				this.storage,
+				rawDescriptor,
+				(i) => checkpointStateVectorChunkKey(rawManifest.version, i),
+				"checkpoint state vector",
+				this.maxKeysPerOperation,
+			);
+		} else {
+			const rawStateVector = await this.storage.get<unknown>(checkpointStateVectorKey(rawManifest.version));
+			if (rawStateVector === undefined) {
+				throw new Error(`checkpoint state vector missing for version ${rawManifest.version}`);
+			}
+			stateVector = normalizeBytes(rawStateVector, checkpointStateVectorKey(rawManifest.version));
 		}
-		const stateVector = normalizeBytes(rawStateVector, checkpointStateVectorKey(rawManifest.version));
 		if (stateVector.byteLength !== rawManifest.stateVectorByteLength) {
 			throw new Error(
 				`checkpoint state vector length mismatch (expected ${rawManifest.stateVectorByteLength}, got ${stateVector.byteLength})`,

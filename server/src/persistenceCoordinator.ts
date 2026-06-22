@@ -10,10 +10,9 @@
  */
 
 import * as Y from "yjs";
-import type { ChunkedDocStore, JournalStats } from "./chunkedDocStore.js";
+import type { ChunkedDocStore, ChunkWriteStats, JournalStats } from "./chunkedDocStore.js";
 import { bytesToHex } from "./hex.js";
 
-export const CHECKPOINT_FALLBACK_DELTA_BYTES = 2 * 1024 * 1024; // 2MB
 export const CHECKPOINT_FALLBACK_AFTER_FAILURES = 2;
 export const JOURNAL_COMPACT_MAX_ENTRIES = 50;
 export const JOURNAL_COMPACT_MAX_BYTES = 1 * 1024 * 1024; // 1MB
@@ -21,8 +20,6 @@ export const JOURNAL_COMPACT_MAX_BYTES = 1 * 1024 * 1024; // 1MB
 export type PersistenceStatus = "healthy" | "degraded";
 
 export interface PersistenceCoordinatorOptions {
-	/** Byte threshold for full-checkpoint fallback instead of journal append. Default: 2MB */
-	checkpointFallbackDeltaBytes?: number;
 	/** Number of consecutive append failures before checkpoint fallback. Default: 2 */
 	checkpointFallbackAfterFailures?: number;
 	/** Max journal entries before compaction. Default: 50 */
@@ -43,6 +40,13 @@ export interface PersistenceHealth {
 	pendingPersistence: boolean;
 	queuedSaveCount: number;
 	lastDeltaBytes: number | null;
+	lastCheckpointUpdateBytes: number | null;
+	lastStateVectorBytes: number | null;
+	lastEncodeMs: number | null;
+	lastStorageWriteMs: number | null;
+	lastChunkPutMaxBytes: number | null;
+	lastSavePhase: string | null;
+	lastFailurePhase: string | null;
 	lastPersistedStateVectorHash: string | null;
 	journalEntryCount: number | null;
 	journalBytes: number | null;
@@ -67,16 +71,20 @@ function equalBytes(a: Uint8Array, b: Uint8Array): boolean {
 	return true;
 }
 
+function nowMs(): number {
+	return Date.now();
+}
+
 /**
  * PersistenceCoordinator manages the save chain for a Y.Doc.
  * Extracted from VaultSyncServer for testability.
  */
 export class PersistenceCoordinator {
 	private saveChain: Promise<void> = Promise.resolve();
+	private pendingUpdates: Uint8Array[] = [];
 	private lastPersistedStateVector: Uint8Array | null = null;
 	private consecutiveSaveFailures = 0;
 
-	private readonly checkpointFallbackDeltaBytes: number;
 	private readonly checkpointFallbackAfterFailures: number;
 	private readonly journalCompactMaxEntries: number;
 	private readonly journalCompactMaxBytes: number;
@@ -93,6 +101,13 @@ export class PersistenceCoordinator {
 		pendingPersistence: false,
 		queuedSaveCount: 0,
 		lastDeltaBytes: null,
+		lastCheckpointUpdateBytes: null,
+		lastStateVectorBytes: null,
+		lastEncodeMs: null,
+		lastStorageWriteMs: null,
+		lastChunkPutMaxBytes: null,
+		lastSavePhase: null,
+		lastFailurePhase: null,
 		lastPersistedStateVectorHash: null,
 		journalEntryCount: null,
 		journalBytes: null,
@@ -108,8 +123,6 @@ export class PersistenceCoordinator {
 		private readonly trace?: (event: string, data: Record<string, unknown>) => void,
 		options?: PersistenceCoordinatorOptions,
 	) {
-		this.checkpointFallbackDeltaBytes =
-			options?.checkpointFallbackDeltaBytes ?? CHECKPOINT_FALLBACK_DELTA_BYTES;
 		this.checkpointFallbackAfterFailures =
 			options?.checkpointFallbackAfterFailures ?? CHECKPOINT_FALLBACK_AFTER_FAILURES;
 		this.journalCompactMaxEntries =
@@ -129,6 +142,44 @@ export class PersistenceCoordinator {
 		return this.lastPersistedStateVector;
 	}
 
+	recordIncrementalUpdate(update: Uint8Array): void {
+		if (update.byteLength === 0) return;
+		this.pendingUpdates.push(update);
+		this.health.pendingPersistence = true;
+	}
+
+	private setPhase(phase: string): void {
+		this.health.lastSavePhase = phase;
+	}
+
+	private updateLastChunkWriteStats(): ChunkWriteStats | null {
+		const stats = this.store.getLastWriteStats?.() ?? null;
+		this.health.lastChunkPutMaxBytes = stats?.maxPutBytes ?? null;
+		return stats;
+	}
+
+	private chunkTraceFields(stats: ChunkWriteStats | null): Record<string, number | null> {
+		return {
+			chunkCount: stats?.chunkCount ?? null,
+			chunkMaxBytes: stats?.maxChunkBytes ?? null,
+			chunkBackingBufferMaxBytes: stats?.maxBackingBufferBytes ?? null,
+			chunkPutMaxBytes: stats?.maxPutBytes ?? null,
+			chunkPutCount: stats?.putCount ?? null,
+		};
+	}
+
+	private drainPendingUpdates(): Uint8Array[] {
+		const updates = this.pendingUpdates;
+		this.pendingUpdates = [];
+		return updates;
+	}
+
+	private restorePendingUpdates(updates: Uint8Array[]): void {
+		if (updates.length === 0) return;
+		this.pendingUpdates = updates.concat(this.pendingUpdates);
+		this.health.pendingPersistence = true;
+	}
+
 	/**
 	 * Enqueue a save operation. Returns a promise that resolves when the save
 	 * completes (successfully or not).
@@ -146,8 +197,11 @@ export class PersistenceCoordinator {
 				// pendingPersistence is true if:
 				// - more saves are queued, OR
 				// - we're in degraded state (document has unpersisted state)
+				// - incremental updates arrived while this save was running
 				this.health.pendingPersistence =
-					this.health.queuedSaveCount > 0 || this.health.status === "degraded";
+					this.health.queuedSaveCount > 0
+					|| this.health.status === "degraded"
+					|| this.pendingUpdates.length > 0;
 			}
 		});
 
@@ -158,45 +212,80 @@ export class PersistenceCoordinator {
 
 	private async executeSave(): Promise<SaveResult> {
 		this.health.lastSaveStartedAt = new Date().toISOString();
+		this.health.lastFailurePhase = null;
+		this.health.lastEncodeMs = null;
+		this.health.lastStorageWriteMs = null;
+		this.health.lastCheckpointUpdateBytes = null;
+		this.health.lastChunkPutMaxBytes = null;
 
 		// Compute delta inside serialized save task
 		const baseStateVector = this.lastPersistedStateVector;
+		this.setPhase("encode_state_vector");
+		const stateVectorStartedAt = nowMs();
 		const currentStateVector = Y.encodeStateVector(this.document);
+		this.health.lastStateVectorBytes = currentStateVector.byteLength;
+		this.health.lastEncodeMs = nowMs() - stateVectorStartedAt;
 
-		if (baseStateVector && equalBytes(baseStateVector, currentStateVector)) {
+		const pendingUpdates = this.drainPendingUpdates();
+		if (baseStateVector && equalBytes(baseStateVector, currentStateVector) && pendingUpdates.length === 0) {
+			this.setPhase("skipped_equal_sv");
 			this.trace?.("save.skipped_equal_sv", {});
 			return { success: true, method: "skipped" };
 		}
 
-		const delta = baseStateVector
-			? Y.encodeStateAsUpdate(this.document, baseStateVector)
-			: Y.encodeStateAsUpdate(this.document);
+		let delta: Uint8Array;
+		if (pendingUpdates.length > 0) {
+			this.setPhase("delta_incremental");
+			const pendingBytes = pendingUpdates.reduce((sum, update) => sum + update.byteLength, 0);
+			const mergeStartedAt = nowMs();
+			delta = pendingUpdates.length === 1 ? pendingUpdates[0]! : Y.mergeUpdates(pendingUpdates);
+			this.health.lastEncodeMs = (this.health.lastEncodeMs ?? 0) + (nowMs() - mergeStartedAt);
+			this.trace?.("save.delta_computed", {
+				source: "pending_incremental",
+				pendingUpdateCount: pendingUpdates.length,
+				pendingBytes,
+				deltaBytes: delta.byteLength,
+			});
+		} else {
+			this.setPhase("delta_fallback");
+			const fallbackStartedAt = nowMs();
+			delta = baseStateVector
+				? Y.encodeStateAsUpdate(this.document, baseStateVector)
+				: Y.encodeStateAsUpdate(this.document);
+			this.health.lastEncodeMs = (this.health.lastEncodeMs ?? 0) + (nowMs() - fallbackStartedAt);
+			this.trace?.("save.delta_fallback", { deltaBytes: delta.byteLength });
+		}
 
 		if (delta.byteLength === 0) {
+			this.setPhase("skipped_empty_delta");
 			this.trace?.("save.skipped_empty_delta", {});
 			return { success: true, method: "skipped" };
 		}
 
-		this.trace?.("save.delta_computed", { deltaBytes: delta.byteLength });
+		this.health.lastDeltaBytes = delta.byteLength;
 
-		// Strategy: checkpoint fallback for large deltas or consecutive failures
+		// Strategy: checkpoint fallback only after repeated append failures.
 		const useCheckpointFallback =
-			delta.byteLength > this.checkpointFallbackDeltaBytes ||
 			this.consecutiveSaveFailures >= this.checkpointFallbackAfterFailures;
 
 		if (useCheckpointFallback) {
-			return this.executeCheckpointFallback(delta);
+			const result = await this.executeCheckpointFallback(delta);
+			if (!result.success) {
+				this.restorePendingUpdates(pendingUpdates);
+			}
+			return result;
 		}
 
 		// Normal path: journal append
-		return this.executeAppend(delta, currentStateVector);
+		const result = await this.executeAppend(delta, currentStateVector);
+		if (!result.success) {
+			this.restorePendingUpdates(pendingUpdates);
+		}
+		return result;
 	}
 
 	private async executeCheckpointFallback(delta: Uint8Array): Promise<SaveResult> {
-		const reason =
-			delta.byteLength > this.checkpointFallbackDeltaBytes
-				? "delta_exceeds_threshold"
-				: "consecutive_failures";
+		const reason = "consecutive_failures";
 
 		this.trace?.("save.checkpoint_fallback", {
 			reason,
@@ -204,12 +293,22 @@ export class PersistenceCoordinator {
 			consecutiveFailures: this.consecutiveSaveFailures,
 		});
 
+		let chunkStats: ChunkWriteStats | null = null;
 		try {
+			this.setPhase("checkpoint_fallback_encode");
+			const encodeStartedAt = nowMs();
 			const checkpointUpdate = Y.encodeStateAsUpdate(this.document);
 			const checkpointStateVector = Y.encodeStateVector(this.document);
+			this.health.lastCheckpointUpdateBytes = checkpointUpdate.byteLength;
+			this.health.lastStateVectorBytes = checkpointStateVector.byteLength;
+			this.health.lastEncodeMs = (this.health.lastEncodeMs ?? 0) + (nowMs() - encodeStartedAt);
 			const checkpointSvHash = bytesToHex(checkpointStateVector.slice(0, 16));
 
+			this.setPhase("checkpoint_fallback_write");
+			const storageStartedAt = nowMs();
 			await this.store.rewriteCheckpoint(checkpointUpdate, checkpointStateVector);
+			this.health.lastStorageWriteMs = nowMs() - storageStartedAt;
+			chunkStats = this.updateLastChunkWriteStats();
 
 			// Success — update state
 			this.lastPersistedStateVector = checkpointStateVector;
@@ -229,6 +328,10 @@ export class PersistenceCoordinator {
 
 			this.trace?.("save.checkpoint_fallback_succeeded", {
 				persistedStateVectorHash: checkpointSvHash,
+				checkpointUpdateBytes: checkpointUpdate.byteLength,
+				stateVectorBytes: checkpointStateVector.byteLength,
+				storageWriteMs: this.health.lastStorageWriteMs,
+				...this.chunkTraceFields(chunkStats),
 			});
 
 			return { success: true, method: "checkpoint-fallback", journalStats: stats };
@@ -242,6 +345,7 @@ export class PersistenceCoordinator {
 			this.health.failedSaveCount++;
 			this.health.consecutiveSaveFailures = this.consecutiveSaveFailures;
 			this.health.status = "degraded";
+			this.health.lastFailurePhase = this.health.lastSavePhase;
 
 			this.trace?.("save.checkpoint_fallback_failed", {
 				errorClass,
@@ -257,9 +361,14 @@ export class PersistenceCoordinator {
 		currentStateVector: Uint8Array,
 	): Promise<SaveResult> {
 		let journalStats: JournalStats;
+		let chunkStats: ChunkWriteStats | null = null;
 
 		try {
+			this.setPhase("append");
+			const storageStartedAt = nowMs();
 			journalStats = await this.store.appendUpdate(delta);
+			this.health.lastStorageWriteMs = nowMs() - storageStartedAt;
+			chunkStats = this.updateLastChunkWriteStats();
 		} catch (appendErr) {
 			const errorMessage = appendErr instanceof Error ? appendErr.message : String(appendErr);
 			const errorClass = appendErr instanceof Error ? appendErr.constructor.name : typeof appendErr;
@@ -270,6 +379,7 @@ export class PersistenceCoordinator {
 			this.health.failedSaveCount++;
 			this.health.consecutiveSaveFailures = this.consecutiveSaveFailures;
 			this.health.status = "degraded";
+			this.health.lastFailurePhase = this.health.lastSavePhase;
 
 			this.trace?.("save.append_failed", {
 				errorClass,
@@ -314,6 +424,8 @@ export class PersistenceCoordinator {
 			journalBytes: journalStats.totalBytes,
 			deltaBytes: delta.byteLength,
 			persistedStateVectorHash: svHash,
+			storageWriteMs: this.health.lastStorageWriteMs,
+			...this.chunkTraceFields(chunkStats),
 		});
 
 		// Compaction if needed
@@ -321,19 +433,29 @@ export class PersistenceCoordinator {
 			journalStats.entryCount > this.journalCompactMaxEntries ||
 			journalStats.totalBytes > this.journalCompactMaxBytes
 		) {
-			await this.executeCompaction(journalStats);
+			this.scheduleCompaction(journalStats);
 		}
 
 		return { success: true, method: "append", journalStats };
 	}
 
 	private async executeImmediateFallback(delta: Uint8Array): Promise<SaveResult> {
+		let chunkStats: ChunkWriteStats | null = null;
 		try {
+			this.setPhase("immediate_checkpoint_fallback_encode");
+			const encodeStartedAt = nowMs();
 			const checkpointUpdate = Y.encodeStateAsUpdate(this.document);
 			const checkpointStateVector = Y.encodeStateVector(this.document);
+			this.health.lastCheckpointUpdateBytes = checkpointUpdate.byteLength;
+			this.health.lastStateVectorBytes = checkpointStateVector.byteLength;
+			this.health.lastEncodeMs = (this.health.lastEncodeMs ?? 0) + (nowMs() - encodeStartedAt);
 			const checkpointSvHash = bytesToHex(checkpointStateVector.slice(0, 16));
 
+			this.setPhase("immediate_checkpoint_fallback_write");
+			const storageStartedAt = nowMs();
 			await this.store.rewriteCheckpoint(checkpointUpdate, checkpointStateVector);
+			this.health.lastStorageWriteMs = nowMs() - storageStartedAt;
+			chunkStats = this.updateLastChunkWriteStats();
 
 			// Success
 			this.lastPersistedStateVector = checkpointStateVector;
@@ -353,12 +475,17 @@ export class PersistenceCoordinator {
 
 			this.trace?.("save.immediate_checkpoint_fallback_succeeded", {
 				persistedStateVectorHash: checkpointSvHash,
+				checkpointUpdateBytes: checkpointUpdate.byteLength,
+				stateVectorBytes: checkpointStateVector.byteLength,
+				storageWriteMs: this.health.lastStorageWriteMs,
+				...this.chunkTraceFields(chunkStats),
 			});
 
 			return { success: true, method: "immediate-fallback", journalStats: stats };
 		} catch (err) {
 			const errorMessage = err instanceof Error ? err.message : String(err);
 			const errorClass = err instanceof Error ? err.constructor.name : typeof err;
+			this.health.lastFailurePhase = this.health.lastSavePhase;
 
 			this.trace?.("save.immediate_checkpoint_fallback_failed", {
 				errorClass,
@@ -369,6 +496,12 @@ export class PersistenceCoordinator {
 		}
 	}
 
+	private scheduleCompaction(journalStats: JournalStats): void {
+		this.saveChain = this.saveChain.then(async () => {
+			await this.executeCompaction(journalStats);
+		}).catch(() => {});
+	}
+
 	private async executeCompaction(journalStats: JournalStats): Promise<void> {
 		const compactionReason =
 			journalStats.entryCount > this.journalCompactMaxEntries
@@ -376,25 +509,31 @@ export class PersistenceCoordinator {
 				: "byte_size_exceeded";
 
 		try {
-			const checkpointUpdate = Y.encodeStateAsUpdate(this.document);
-			const checkpointStateVector = Y.encodeStateVector(this.document);
+			this.setPhase("compaction_binary");
+			const storageStartedAt = nowMs();
+			const result = await this.store.compactJournalToCheckpoint();
+			this.health.lastStorageWriteMs = nowMs() - storageStartedAt;
+			const chunkStats = this.updateLastChunkWriteStats();
+			const checkpointStateVector = result.stateVector;
 			const checkpointSvHash = bytesToHex(checkpointStateVector.slice(0, 16));
 
-			await this.store.rewriteCheckpoint(checkpointUpdate, checkpointStateVector);
-
 			this.lastPersistedStateVector = checkpointStateVector;
+			this.consecutiveSaveFailures = 0;
+			this.health.status = "healthy";
 			this.health.lastPersistedStateVectorHash = checkpointSvHash;
 			this.health.lastCompactionAt = new Date().toISOString();
 			this.health.lastCompactionReason = compactionReason;
 			this.health.lastCompactionError = null;
 
-			const compactedStats = await this.store.getJournalStats();
-			this.health.journalEntryCount = compactedStats.entryCount;
-			this.health.journalBytes = compactedStats.totalBytes;
+			this.health.journalEntryCount = result.journalStats.entryCount;
+			this.health.journalBytes = result.journalStats.totalBytes;
 
 			this.trace?.("save.compaction_succeeded", {
 				reason: compactionReason,
 				persistedStateVectorHash: checkpointSvHash,
+				stateVectorBytes: checkpointStateVector.byteLength,
+				storageWriteMs: this.health.lastStorageWriteMs,
+				...this.chunkTraceFields(chunkStats),
 			});
 		} catch (err) {
 			// Compaction failure after successful append is NOT a data-loss event
@@ -404,6 +543,7 @@ export class PersistenceCoordinator {
 			this.health.lastCompactionAt = new Date().toISOString();
 			this.health.lastCompactionReason = compactionReason;
 			this.health.lastCompactionError = `${errorClass}: ${errorMessage}`;
+			this.health.lastFailurePhase = this.health.lastSavePhase;
 
 			this.trace?.("save.compaction_failed", {
 				reason: compactionReason,

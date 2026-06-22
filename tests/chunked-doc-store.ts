@@ -6,6 +6,12 @@ class FakeStorage {
 	maxGetBatch = 0;
 	maxPutBatch = 0;
 	maxDeleteBatch = 0;
+	maxPutBytes = 0;
+
+	constructor(
+		private readonly maxSerializedValueBytes = Infinity,
+		private readonly serializeFullBackingBuffer = false,
+	) {}
 
 	private trackGetBatch(n: number) {
 		this.maxGetBatch = Math.max(this.maxGetBatch, n);
@@ -20,6 +26,15 @@ class FakeStorage {
 	private trackDeleteBatch(n: number) {
 		this.maxDeleteBatch = Math.max(this.maxDeleteBatch, n);
 		if (n > 128) throw new Error(`delete batch too large: ${n}`);
+	}
+
+	private serializedValueBytes(value: unknown): number {
+		if (value instanceof Uint8Array) {
+			return this.serializeFullBackingBuffer
+				? value.buffer.byteLength
+				: value.byteLength;
+		}
+		return new TextEncoder().encode(JSON.stringify(value)).byteLength;
 	}
 
 	async get<T = unknown>(key: string): Promise<T | undefined>;
@@ -39,9 +54,19 @@ class FakeStorage {
 	async put<T>(entries: Record<string, T>): Promise<void> {
 		const keys = Object.keys(entries);
 		this.trackPutBatch(keys.length);
+		let bytes = 0;
 		for (const key of keys) {
-			this.data.set(key, entries[key]);
+			const value = entries[key];
+			const serializedBytes = this.serializedValueBytes(value);
+			if (serializedBytes > this.maxSerializedValueBytes) {
+				throw new Error(`SQLITE_TOOBIG: ${key} ${serializedBytes} > ${this.maxSerializedValueBytes}`);
+			}
+			if (value instanceof Uint8Array) {
+				bytes += value.byteLength;
+			}
+			this.data.set(key, value);
 		}
+		this.maxPutBytes = Math.max(this.maxPutBytes, bytes);
 	}
 
 	async delete(keys: string[]): Promise<number> {
@@ -102,6 +127,36 @@ function docsEqual(a: Y.Doc, b: Y.Doc): boolean {
 	return equalBytes(ua, ub);
 }
 
+function assertChunkBackingBuffersBounded(
+	storage: FakeStorage,
+	prefix: string,
+	maxChunkBytes: number,
+	msg: string,
+): void {
+	const chunks = Array.from(storage.data.entries())
+		.filter(([key]) => key.startsWith(prefix));
+	let failure: string | null = chunks.length === 0 ? "no chunks found" : null;
+	for (const [key, value] of chunks) {
+		if (!(value instanceof Uint8Array)) {
+			failure = `${key} is not Uint8Array`;
+			break;
+		}
+		if (value.byteLength > maxChunkBytes) {
+			failure = `${key} byteLength ${value.byteLength} exceeds ${maxChunkBytes}`;
+			break;
+		}
+		if (value.byteOffset !== 0) {
+			failure = `${key} byteOffset ${value.byteOffset} is non-zero`;
+			break;
+		}
+		if (value.buffer.byteLength !== value.byteLength) {
+			failure = `${key} backing buffer ${value.buffer.byteLength} differs from chunk ${value.byteLength}`;
+			break;
+		}
+	}
+	assert(failure === null, failure ? `${msg}: ${failure}` : msg);
+}
+
 let passed = 0;
 let failed = 0;
 
@@ -125,6 +180,33 @@ async function expectThrows(
 		assert(false, msg);
 	} catch (err) {
 		assert(pattern.test(String(err)), msg);
+	}
+}
+
+function expectThrowsSync(
+	fn: () => unknown,
+	pattern: RegExp,
+	msg: string,
+) {
+	try {
+		fn();
+		assert(false, msg);
+	} catch (err) {
+		assert(pattern.test(String(err)), msg);
+	}
+}
+
+async function writeSubarrayStyleChunks(
+	storage: FakeStorage,
+	bytes: Uint8Array,
+	chunkSizeBytes: number,
+): Promise<void> {
+	for (let i = 0; i * chunkSizeBytes < bytes.byteLength; i++) {
+		const start = i * chunkSizeBytes;
+		const end = Math.min(start + chunkSizeBytes, bytes.byteLength);
+		await storage.put({
+			[`old-style-chunk:${i}`]: bytes.subarray(start, end),
+		});
 	}
 }
 
@@ -159,12 +241,129 @@ console.log("\n--- Test 2: checkpoint save/load works beyond 128 chunk keys ---"
 	assert(loaded !== null, "chunked payload loads");
 	assert(loaded !== null && equalBytes(loaded, payload), "chunked payload round-trips exactly");
 	assert(state.journalStats.entryCount === 0, "checkpoint save resets journal");
+	assertChunkBackingBuffersBounded(
+		storage,
+		"document:checkpoint:chunk:",
+		64,
+		"checkpoint chunks use bounded backing buffers",
+	);
 	assert(storage.maxPutBatch <= 128, `put batching capped at 128 (got ${storage.maxPutBatch})`);
 	assert(storage.maxGetBatch <= 128, `get batching capped at 128 (got ${storage.maxGetBatch})`);
 	assert(storage.maxDeleteBatch <= 128, `delete batching capped at 128 (got ${storage.maxDeleteBatch})`);
 }
 
-console.log("\n--- Test 3: append journal update replays with checkpoint ---");
+console.log("\n--- Test 3: checkpoint chunk writes respect byte budget ---");
+{
+	const storage = new FakeStorage();
+	const store = new ChunkedDocStore(
+		storage as unknown as DurableObjectStorage,
+		{ chunkSizeBytes: 1024 * 1024 },
+	);
+
+	await store.rewriteCheckpoint(makeBytes(10 * 1024 * 1024), new Uint8Array([1]));
+
+	assert(
+		storage.maxPutBytes <= 4 * 1024 * 1024,
+		`chunk put byte budget capped at 4 MiB (got ${storage.maxPutBytes})`,
+	);
+	assertChunkBackingBuffersBounded(
+		storage,
+		"document:checkpoint:chunk:",
+		1024 * 1024,
+		"large checkpoint chunks use bounded backing buffers",
+	);
+}
+
+console.log("\n--- Test 4: old subarray chunks reproduce backing-buffer SQLITE_TOOBIG ---");
+{
+	const storage = new FakeStorage(2 * 1024 * 1024, true);
+	const payload = makeBytes(3 * 1024 * 1024);
+
+	await expectThrows(
+		() => writeSubarrayStyleChunks(storage, payload, 512 * 1024),
+		/SQLITE_TOOBIG/,
+		"subarray chunks can serialize as the full backing buffer",
+	);
+}
+
+console.log("\n--- Test 5: copied chunks avoid backing-buffer SQLITE_TOOBIG ---");
+{
+	const storage = new FakeStorage(2 * 1024 * 1024, true);
+	const store = new ChunkedDocStore(
+		storage as unknown as DurableObjectStorage,
+		{ chunkSizeBytes: 512 * 1024 },
+	);
+
+	await store.rewriteCheckpoint(makeBytes(3 * 1024 * 1024), new Uint8Array([1]));
+
+	assert(
+		storage.maxPutBytes <= 4 * 1024 * 1024,
+		`copied chunk put byte budget capped at 4 MiB (got ${storage.maxPutBytes})`,
+	);
+	assertChunkBackingBuffersBounded(
+		storage,
+		"document:checkpoint:chunk:",
+		512 * 1024,
+		"copied checkpoint chunks serialize below value limit",
+	);
+}
+
+console.log("\n--- Test 6: large checkpoint state vector uses chunked storage ---");
+{
+	const storage = new FakeStorage(2 * 1024 * 1024, true);
+	const store = new ChunkedDocStore(
+		storage as unknown as DurableObjectStorage,
+		{ chunkSizeBytes: 512 * 1024 },
+	);
+	const stateVector = makeBytes(3 * 1024 * 1024);
+
+	await expectThrows(
+		() => storage.put({ directStateVector: stateVector }),
+		/SQLITE_TOOBIG/,
+		"fake storage rejects direct large state vector",
+	);
+	await store.rewriteCheckpoint(makeBytes(1024), stateVector);
+
+	const loaded = await store.loadState();
+	assert(
+		loaded.checkpointStateVector !== null
+			&& equalBytes(loaded.checkpointStateVector, stateVector),
+		"chunked state vector round-trips exactly",
+	);
+	assert(
+		[...storage.data.keys()].some((key) => key.startsWith("document:checkpoint:state-vector-descriptor:")),
+		"chunked state vector descriptor is stored",
+	);
+	assertChunkBackingBuffersBounded(
+		storage,
+		"document:checkpoint:state-vector-chunk:",
+		512 * 1024,
+		"large state vector chunks use bounded backing buffers",
+	);
+}
+
+console.log("\n--- Test 7: invalid chunking options fail fast ---");
+{
+	const storage = new FakeStorage();
+	expectThrowsSync(
+		() => new ChunkedDocStore(
+			storage as unknown as DurableObjectStorage,
+			{ chunkSizeBytes: 0 },
+		),
+		/positive integer/,
+		"chunkSizeBytes must be positive",
+	);
+	expectThrowsSync(
+		() => new ChunkedDocStore(
+			storage as unknown as DurableObjectStorage,
+			{ maxKeysPerOperation: 0 },
+		),
+		/positive integer/,
+		"maxKeysPerOperation must be positive",
+	);
+}
+
+console.log("\n--- Test 8: append journal update replays with checkpoint ---");
 {
 	const storage = new FakeStorage();
 	const store = new ChunkedDocStore(
@@ -181,11 +380,17 @@ console.log("\n--- Test 3: append journal update replays with checkpoint ---");
 	const live = new Y.Doc();
 	Y.applyUpdate(live, Y.encodeStateAsUpdate(base));
 	const baseline = Y.encodeStateVector(live);
-	live.getText("t").insert(5, " world");
+	live.getText("t").insert(5, " world".repeat(20));
 	const delta = Y.encodeStateAsUpdate(live, baseline);
 	const stats = await store.appendUpdate(delta);
 	assert(stats.entryCount === 1, "appendUpdate increments journal entry count");
 	assert(stats.totalBytes > 0, "appendUpdate tracks journal bytes");
+	assertChunkBackingBuffersBounded(
+		storage,
+		"document:journal:chunk:",
+		64,
+		"journal chunks use bounded backing buffers",
+	);
 
 	const loaded = await store.loadState();
 	const restored = new Y.Doc();
@@ -194,7 +399,7 @@ console.log("\n--- Test 3: append journal update replays with checkpoint ---");
 	assert(docsEqual(restored, live), "checkpoint + journal replay reconstructs latest state");
 }
 
-console.log("\n--- Test 4: rewriteCheckpoint clears journal and stores state vector ---");
+console.log("\n--- Test 9: rewriteCheckpoint clears journal and stores state vector ---");
 {
 	const storage = new FakeStorage();
 	const store = new ChunkedDocStore(
@@ -231,7 +436,7 @@ console.log("\n--- Test 4: rewriteCheckpoint clears journal and stores state vec
 	assert(storage.maxDeleteBatch <= 128, `journal cleanup delete batching capped at 128 (got ${storage.maxDeleteBatch})`);
 }
 
-console.log("\n--- Test 5: fail closed when a checkpoint chunk is missing ---");
+console.log("\n--- Test 10: fail closed when a checkpoint chunk is missing ---");
 {
 	const storage = new FakeStorage();
 	const store = new ChunkedDocStore(
@@ -253,7 +458,7 @@ console.log("\n--- Test 5: fail closed when a checkpoint chunk is missing ---");
 	);
 }
 
-console.log("\n--- Test 6: fail closed when journal chunk bytes are tampered ---");
+console.log("\n--- Test 11: fail closed when journal chunk bytes are tampered ---");
 {
 	const storage = new FakeStorage();
 	const store = new ChunkedDocStore(

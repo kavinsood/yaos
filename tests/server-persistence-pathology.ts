@@ -224,6 +224,14 @@ function populateVault(vault: VaultDoc, fileCount: number, contentSizeBytes: num
 	}
 }
 
+function makeBytes(size: number): Uint8Array {
+	const out = new Uint8Array(size);
+	for (let i = 0; i < size; i++) {
+		out[i] = i % 251;
+	}
+	return out;
+}
+
 /**
  * Simulate the server onSave path: compute delta from last persisted SV,
  * append to journal, return stats. This mirrors VaultSyncServer.onSave() +
@@ -1108,6 +1116,187 @@ console.log("\n--- Test 15: PersistenceCoordinator — pendingPersistence stays 
 	// Now pendingPersistence should be false
 	assert(coordinator.health.status === "healthy", "status is healthy");
 	assert(coordinator.health.pendingPersistence === false, "pendingPersistence is false when healthy and queue empty");
+}
+
+// ── Test 16: PersistenceCoordinator — pending incremental update avoids fallback encode ───────
+
+console.log("\n--- Test 16: PersistenceCoordinator — pending incremental update uses append path ---");
+{
+	const { PersistenceCoordinator } = await import("../server/src/persistenceCoordinator.js");
+
+	const traces: string[] = [];
+	const savedUpdates: Uint8Array[] = [];
+	const mockStore = {
+		async appendUpdate(update: Uint8Array) {
+			savedUpdates.push(update);
+			return { entryCount: savedUpdates.length, totalBytes: update.byteLength };
+		},
+		async rewriteCheckpoint(_update: Uint8Array, _sv: Uint8Array) {
+			throw new Error("checkpoint should not be used");
+		},
+		async getJournalStats() {
+			return { entryCount: savedUpdates.length, totalBytes: 0 };
+		},
+		getLastWriteStats() {
+			return { chunkCount: 1, maxChunkBytes: 10, maxBackingBufferBytes: 10, maxPutBytes: 10, putCount: 1 };
+		},
+	};
+
+	const doc = new Y.Doc();
+	const coordinator = new PersistenceCoordinator(
+		doc,
+		mockStore as never,
+		(event) => traces.push(event),
+	);
+	doc.on("update", (update: Uint8Array) => {
+		coordinator.recordIncrementalUpdate(update);
+	});
+
+	doc.getText("t").insert(0, "incremental");
+	const result = await coordinator.enqueueSave();
+
+	assert(result.success, "save succeeds");
+	assert(result.method === "append", "pending update is appended");
+	assert(savedUpdates.length === 1, "one pending update was written");
+	assert(traces.includes("save.delta_computed"), "trace records incremental delta computation");
+	assert(!traces.includes("save.delta_fallback"), "fallback full-update encode was not used");
+	assert(coordinator.health.lastSavePhase === "append", "last phase is append");
+	assert(coordinator.health.lastChunkPutMaxBytes === 10, "chunk put max bytes are surfaced");
+}
+
+// ── Test 17: PersistenceCoordinator — no pending update falls back with trace ───────
+
+console.log("\n--- Test 17: PersistenceCoordinator — recovery path records delta_fallback ---");
+{
+	const { PersistenceCoordinator } = await import("../server/src/persistenceCoordinator.js");
+
+	const traces: string[] = [];
+	let appendCallCount = 0;
+	const mockStore = {
+		async appendUpdate(_update: Uint8Array) {
+			appendCallCount++;
+			return { entryCount: appendCallCount, totalBytes: 100 };
+		},
+		async rewriteCheckpoint(_update: Uint8Array, _sv: Uint8Array) {},
+		async getJournalStats() {
+			return { entryCount: appendCallCount, totalBytes: 100 };
+		},
+		getLastWriteStats() {
+			return null;
+		},
+	};
+
+	const doc = new Y.Doc();
+	doc.getText("t").insert(0, "loaded-before-listener");
+	const coordinator = new PersistenceCoordinator(
+		doc,
+		mockStore as never,
+		(event) => traces.push(event),
+	);
+
+	const result = await coordinator.enqueueSave();
+
+	assert(result.success, "fallback save succeeds");
+	assert(result.method === "append", "fallback delta still appends to journal");
+	assert(appendCallCount === 1, "fallback delta was appended once");
+	assert(traces.includes("save.delta_fallback"), "trace records fallback delta encode");
+	assert(coordinator.health.lastSavePhase === "append", "fallback save completes in append phase");
+}
+
+// ── Test 18: PersistenceCoordinator — large pending delta no longer forces checkpoint ───────
+
+console.log("\n--- Test 18: PersistenceCoordinator — large pending delta still appends ---");
+{
+	const { PersistenceCoordinator } = await import("../server/src/persistenceCoordinator.js");
+
+	let appendCallCount = 0;
+	let checkpointCallCount = 0;
+	const mockStore = {
+		async appendUpdate(update: Uint8Array) {
+			appendCallCount++;
+			return { entryCount: appendCallCount, totalBytes: update.byteLength };
+		},
+		async rewriteCheckpoint(_update: Uint8Array, _sv: Uint8Array) {
+			checkpointCallCount++;
+		},
+		async getJournalStats() {
+			return { entryCount: appendCallCount, totalBytes: 0 };
+		},
+		getLastWriteStats() {
+			return null;
+		},
+	};
+
+	const doc = new Y.Doc();
+	const coordinator = new PersistenceCoordinator(
+		doc,
+		mockStore as never,
+		undefined,
+		{
+			checkpointFallbackAfterFailures: 999,
+			journalCompactMaxBytes: Number.MAX_SAFE_INTEGER,
+			journalCompactMaxEntries: Number.MAX_SAFE_INTEGER,
+		},
+	);
+	coordinator.recordIncrementalUpdate(makeBytes(3 * 1024 * 1024));
+
+	const result = await coordinator.enqueueSave();
+
+	assert(result.success, "large pending delta save succeeds");
+	assert(result.method === "append", "large pending delta uses journal append");
+	assert(appendCallCount === 1, "large delta appended once");
+	assert(checkpointCallCount === 0, "large delta did not force checkpoint fallback");
+	assert(
+		(coordinator.health.lastDeltaBytes ?? 0) > 2 * 1024 * 1024,
+		"health records large delta byte count",
+	);
+}
+
+// ── Test 19: PersistenceCoordinator — compaction failure is not save failure ───────
+
+console.log("\n--- Test 19: PersistenceCoordinator — compaction failure stays best-effort ---");
+{
+	const { PersistenceCoordinator } = await import("../server/src/persistenceCoordinator.js");
+
+	let compactCallCount = 0;
+	const mockStore = {
+		async appendUpdate(update: Uint8Array) {
+			return { entryCount: 51, totalBytes: update.byteLength };
+		},
+		async rewriteCheckpoint(_update: Uint8Array, _sv: Uint8Array) {},
+		async compactJournalToCheckpoint() {
+			compactCallCount++;
+			throw new Error("SIMULATED_COMPACTION_FAILURE");
+		},
+		async getJournalStats() {
+			return { entryCount: 51, totalBytes: 10 };
+		},
+		getLastWriteStats() {
+			return null;
+		},
+	};
+
+	const doc = new Y.Doc();
+	const coordinator = new PersistenceCoordinator(
+		doc,
+		mockStore as never,
+		undefined,
+		{ journalCompactMaxEntries: 1, journalCompactMaxBytes: Number.MAX_SAFE_INTEGER },
+	);
+	coordinator.recordIncrementalUpdate(new Uint8Array([1, 2, 3]));
+
+	const result = await coordinator.enqueueSave();
+	await new Promise((resolve) => setTimeout(resolve, 0));
+
+	assert(result.success, "append save succeeds even when compaction later fails");
+	assert(result.method === "append", "save result remains append");
+	assert(compactCallCount === 1, "compaction was attempted");
+	assert(coordinator.health.status === "healthy", "compaction failure does not degrade durability health");
+	assert(
+		coordinator.health.lastCompactionError?.includes("SIMULATED_COMPACTION_FAILURE") === true,
+		"compaction error is recorded for operations",
+	);
+	assert(coordinator.health.pendingPersistence === false, "pendingPersistence remains false after durable append");
 }
 
 // ── Summary ──────────────────────────────────────────────────────────────────

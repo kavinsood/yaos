@@ -43,13 +43,6 @@ const LOG_PREFIX = "[yaos-sync:server]";
  */
 const CHECKPOINT_FALLBACK_AFTER_FAILURES = 2;
 
-/**
- * If the computed delta exceeds this byte threshold, skip the journal append
- * entirely and write a full checkpoint. A delta this large is effectively a
- * checkpoint anyway, and appending it risks hitting storage/memory constraints.
- */
-const CHECKPOINT_FALLBACK_DELTA_BYTES = 2 * 1024 * 1024;
-
 /** Legacy storage key used before ChunkedDocStore was introduced. */
 const LEGACY_DOCUMENT_KEY = "document";
 
@@ -104,6 +97,7 @@ export class VaultSyncServer extends YServer {
 	private roomIdHint: string | null = null;
 	private chunkedDocStore: ChunkedDocStore | null = null;
 	private persistence: PersistenceCoordinator | null = null;
+	private documentUpdateListenerAttached = false;
 	private snapshotMaybeChain: Promise<void> = Promise.resolve();
 	private roomMeta: RoomMeta | null = null;
 	private readonly traceRateLimiter = new TraceRateLimiter();
@@ -269,7 +263,10 @@ export class VaultSyncServer extends YServer {
 	}
 
 	private async ensureDocumentLoaded(): Promise<void> {
-		if (this.documentLoaded) return;
+		if (this.documentLoaded) {
+			this.attachDocumentUpdateListener();
+			return;
+		}
 		const gate = { inFlight: this.loadPromise };
 		const run = runSingleFlight(gate, async () => {
 			if (this.documentLoaded) return;
@@ -350,6 +347,7 @@ export class VaultSyncServer extends YServer {
 					this.getPersistenceCoordinator().health.journalEntryCount = 0;
 					this.getPersistenceCoordinator().health.journalBytes = 0;
 					this.documentLoaded = true;
+					this.attachDocumentUpdateListener();
 					await this.syncRoomMetaFromDocument();
 					await this.recordTrace("legacy-document-migrated", {
 						legacyBytes: legacyBytes.byteLength,
@@ -386,6 +384,7 @@ export class VaultSyncServer extends YServer {
 			this.getPersistenceCoordinator().health.journalEntryCount = state.journalStats.entryCount;
 			this.getPersistenceCoordinator().health.journalBytes = state.journalStats.totalBytes;
 			this.documentLoaded = true;
+			this.attachDocumentUpdateListener();
 			await this.syncRoomMetaFromDocument();
 			await this.recordTrace("checkpoint-load", {
 				hasCheckpoint: state.checkpoint !== null,
@@ -457,7 +456,6 @@ export class VaultSyncServer extends YServer {
 					void this.recordTrace(`server.${event}`, data);
 				},
 				{
-					checkpointFallbackDeltaBytes: CHECKPOINT_FALLBACK_DELTA_BYTES,
 					checkpointFallbackAfterFailures: CHECKPOINT_FALLBACK_AFTER_FAILURES,
 					journalCompactMaxEntries: JOURNAL_COMPACT_MAX_ENTRIES,
 					journalCompactMaxBytes: JOURNAL_COMPACT_MAX_BYTES,
@@ -747,6 +745,14 @@ export class VaultSyncServer extends YServer {
 				await this.recordTrace(TRACE_RATE_THROTTLE_EVENT, { dropped });
 			}
 		}
+	}
+
+	private attachDocumentUpdateListener(): void {
+		if (this.documentUpdateListenerAttached) return;
+		this.documentUpdateListenerAttached = true;
+		this.document.on("update", (update: Uint8Array) => {
+			this.getPersistenceCoordinator().recordIncrementalUpdate(update);
+		});
 	}
 
 	private getRoomId(): string {
