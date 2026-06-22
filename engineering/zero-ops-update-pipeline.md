@@ -65,7 +65,14 @@ Updater reads `yaos-server-manifest.json`. If `migrationRequired: true`, automat
 
 Updater compares release `wrangler.toml` expectations against local config and warns when required bindings/vars are missing.
 
-### 3) Compatibility guard
+### 3) Schema compatibility preflight
+
+Release artifacts include the server schema range they support. The updater
+compares that range with the currently deployed server before applying files.
+If there is no overlap, the update aborts unless the release is explicitly
+marked migration-required or the operator intentionally bypasses the guard.
+
+### 4) Runtime compatibility guard
 
 Server exposes compatibility metadata via `/api/capabilities`. Plugin blocks only incompatible combinations. Legacy/missing version metadata does not hard-block sync.
 
@@ -89,4 +96,3 @@ Deploy is an install primitive, not an in-place update primitive. Re-deploy can 
 - Normal update: click **Open update action**, run workflow with `update`.
 - Rollback: run workflow with `revert`.
 - Migration-required release: workflow fails safely with explicit guidance.
-

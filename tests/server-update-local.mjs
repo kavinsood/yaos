@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -16,8 +16,58 @@ function run(command, args, options = {}) {
 	});
 }
 
+function runExpectFailure(command, args, options = {}) {
+	try {
+		execFileSync(command, args, {
+			cwd: repoDir,
+			encoding: "utf8",
+			stdio: "pipe",
+			...options,
+		});
+	} catch (err) {
+		return `${err.stdout ?? ""}${err.stderr ?? ""}`;
+	}
+	throw new Error(`Expected command to fail: ${command} ${args.join(" ")}`);
+}
+
 function read(relativePath) {
 	return readFileSync(join(repoDir, relativePath), "utf8");
+}
+
+function readRequiredNumberConst(source, name) {
+	const match = source.match(new RegExp(`export const ${name}\\s*=\\s*(\\d+)`));
+	if (!match) {
+		throw new Error(`Unable to read ${name} from src/version.ts`);
+	}
+	return Number(match[1]);
+}
+
+function buildBadSchemaArtifact(baselineVersion, schemaVersion) {
+	const badReleaseDir = join(tempDir, "bad-schema-release");
+	const badArtifactPath = join(tempDir, "bad-schema-server.zip");
+	mkdirSync(join(badReleaseDir, "src"), { recursive: true });
+	const badVersion = baselineVersion
+		.replace(/SERVER_VERSION = "[^"]+"/, 'SERVER_VERSION = "99.0.0"')
+		.replace(/SERVER_MIN_SCHEMA_VERSION\s*=\s*\d+/, `SERVER_MIN_SCHEMA_VERSION = ${schemaVersion}`)
+		.replace(/SERVER_MAX_SCHEMA_VERSION\s*=\s*\d+/, `SERVER_MAX_SCHEMA_VERSION = ${schemaVersion}`);
+	writeFileSync(join(badReleaseDir, "src/version.ts"), badVersion);
+	writeFileSync(
+		join(badReleaseDir, "yaos-server-manifest.json"),
+		`${JSON.stringify({
+			serverVersion: "99.0.0",
+			pluginVersion: "99.0.0",
+			serverMinSchemaVersion: schemaVersion,
+			serverMaxSchemaVersion: schemaVersion,
+			protectedFiles: ["wrangler.toml"],
+			updateOwnedPaths: ["src/version.ts"],
+			migrationRequired: false,
+		}, null, 2)}\n`,
+	);
+	execFileSync("zip", ["-qr", badArtifactPath, "."], {
+		cwd: badReleaseDir,
+		stdio: "inherit",
+	});
+	return badArtifactPath;
 }
 
 try {
@@ -36,13 +86,20 @@ try {
 		throw new Error("Unable to read current server version from src/version.ts");
 	}
 	const currentServerVersion = currentServerVersionMatch[1];
+	const currentMinSchemaVersion = readRequiredNumberConst(baselineVersion, "SERVER_MIN_SCHEMA_VERSION");
+	const currentMaxSchemaVersion = readRequiredNumberConst(baselineVersion, "SERVER_MAX_SCHEMA_VERSION");
 
 	writeFileSync(
 		join(repoDir, "src/version.ts"),
-		baselineVersion.replace(
-			`SERVER_VERSION = "${currentServerVersion}"`,
-			'SERVER_VERSION = "0.1.9"',
-		),
+		baselineVersion
+			.replace(
+				`SERVER_VERSION = "${currentServerVersion}"`,
+				'SERVER_VERSION = "0.1.9"',
+			)
+			.replace(
+				/SERVER_MAX_SCHEMA_VERSION\s*=\s*\d+/,
+				`SERVER_MAX_SCHEMA_VERSION = ${currentMinSchemaVersion}`,
+			),
 	);
 	writeFileSync(join(repoDir, "wrangler.toml"), `${baselineWrangler}\n# local-test-preserved\n`);
 	run("git", ["add", "-A"]);
@@ -77,6 +134,21 @@ try {
 	const revertedWrangler = read("wrangler.toml");
 	if (!revertedWrangler.includes("# local-test-preserved")) {
 		throw new Error("Revert test failed: protected wrangler.toml changes were lost");
+	}
+
+	const badArtifactPath = buildBadSchemaArtifact(baselineVersion, currentMaxSchemaVersion + 100);
+	const badUpdateOutput = runExpectFailure("node", ["scripts/update-from-release.mjs"], {
+		env: {
+			...process.env,
+			YAOS_RELEASE_FILE: badArtifactPath,
+		},
+	});
+	if (!badUpdateOutput.includes("schema compatibility gap")) {
+		throw new Error(`Expected schema gap rejection, got:\n${badUpdateOutput}`);
+	}
+	const afterBadUpdateVersion = read("src/version.ts");
+	if (!afterBadUpdateVersion.includes('SERVER_VERSION = "0.1.9"')) {
+		throw new Error("Schema gap test failed: rejected update still modified src/version.ts");
 	}
 
 	console.log("Local YAOS server update/revert smoke test passed.");

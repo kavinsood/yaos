@@ -2,7 +2,7 @@
 
 ## What the guard does
 
-`scripts/guard-schema-version.mjs` runs 5 checks to prevent the P1 regression
+`scripts/guard-schema-version.mjs` runs schema-version checks to prevent the P1 regression
 where `src/sync/schema.ts` was deleted and `SCHEMA_VERSION` was re-inlined as a
 literal `2` directly in `vaultSync.ts`:
 
@@ -12,9 +12,9 @@ literal `2` directly in `vaultSync.ts`:
 | 2 | `src/sync/vaultSync.ts` imports from `"./schema"` | Import removed or path changed |
 | 3 | `vaultSync.ts` does NOT contain `export const SCHEMA_VERSION = N` | Constant re-inlined as a literal |
 | 4 | `SCHEMA_VERSION` value in `schema.ts` equals `EXPECTED_SCHEMA_VERSION` | Version bumped in source but guard not updated, or vice versa |
-| 5 | `server/src/version.ts` `SERVER_MIN_SCHEMA_VERSION` equals expected | Server and plugin disagree |
-| 6 | `server/src/version.ts` `SERVER_MAX_SCHEMA_VERSION` equals expected | Server and plugin disagree |
-| 7 | (implicit) Both server min and max agree with each other | Min/max drift on server side |
+| 5 | `server/src/version.ts` `SERVER_MAX_SCHEMA_VERSION` equals expected | Server cannot serve the latest plugin schema |
+| 6 | `server/src/version.ts` `SERVER_MIN_SCHEMA_VERSION` is a valid compatibility floor | Server rejects an intended rolling-upgrade window, or min is invalid |
+| 7 | (implicit) Server min is not greater than max | Min/max drift on server side |
 
 The guard exits non-zero if any check fails and prints `FAIL: <reason>` for
 each violation.
@@ -55,20 +55,18 @@ export const SCHEMA_VERSION = 4;
 
 Find:
 ```
-SERVER_MIN_SCHEMA_VERSION = 3
 SERVER_MAX_SCHEMA_VERSION = 3
 ```
-Set both to:
+Set max to:
 ```
-SERVER_MIN_SCHEMA_VERSION = 4
 SERVER_MAX_SCHEMA_VERSION = 4
 ```
 
 Note: if the server is designed to accept a range of plugin versions during a
 transition window, set `SERVER_MIN_SCHEMA_VERSION` to the oldest still-supported
-version and `SERVER_MAX_SCHEMA_VERSION` to the new version. In that case you
-must also update the guard's expected value to match the new max, and document
-the transition window explicitly.
+version and `SERVER_MAX_SCHEMA_VERSION` to the new version. This is the normal
+choice for rolling schema upgrades, because existing rooms may stay on the old
+schema until a newer plugin marks that room upgraded.
 
 ### 3. `scripts/guard-schema-version.mjs`
 
@@ -89,7 +87,7 @@ version bump.
 | File | Pattern to find | New value |
 |------|----------------|-----------|
 | `src/sync/schema.ts` | `export const SCHEMA_VERSION = 3` | `= 4` |
-| `server/src/version.ts` | `SERVER_MIN_SCHEMA_VERSION = 3` | `= 4` |
+| `server/src/version.ts` | `SERVER_MIN_SCHEMA_VERSION = N` | oldest schema still supported during rollout |
 | `server/src/version.ts` | `SERVER_MAX_SCHEMA_VERSION = 3` | `= 4` |
 | `scripts/guard-schema-version.mjs` | `EXPECTED_SCHEMA_VERSION = 3` | `= 4` |
 
@@ -110,9 +108,9 @@ PASS: src/sync/schema.ts exists
 PASS: src/sync/schema.ts: SCHEMA_VERSION = 4
 PASS: src/sync/vaultSync.ts imports from "./schema"
 PASS: src/sync/vaultSync.ts has no inlined SCHEMA_VERSION literal
-PASS: server/src/version.ts: SERVER_MIN_SCHEMA_VERSION = 4
+PASS: server/src/version.ts: SERVER_MIN_SCHEMA_VERSION = 3
 PASS: server/src/version.ts: SERVER_MAX_SCHEMA_VERSION = 4
-PASS: server and plugin schema versions agree: v4
+PASS: server schema range v3-v4 includes plugin schema v4
 
 PASS: schema version guard — all checks passed.
 ```

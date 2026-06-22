@@ -47,6 +47,10 @@ To pick up new YAOS changes later:
 3. Use **Open update action** from plugin settings and run the update workflow.
 4. Cloudflare redeploys automatically after the workflow push.
 
+Server updates are published through the main YAOS GitHub release stream. See
+[`engineering/version-release-management.md`](../engineering/version-release-management.md)
+for how plugin, server, and schema versions are bumped together.
+
 ## Optional R2 setup
 
 If you want attachments and snapshots later:

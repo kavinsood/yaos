@@ -10,8 +10,10 @@ const serverTempDir = join(tempDir, "server");
 
 const rootPackage = JSON.parse(readFileSync(resolve(rootDir, "package.json"), "utf8"));
 const pluginManifest = JSON.parse(readFileSync(resolve(rootDir, "manifest.json"), "utf8"));
+const pluginVersions = JSON.parse(readFileSync(resolve(rootDir, "versions.json"), "utf8"));
 const serverPackage = JSON.parse(readFileSync(resolve(rootDir, "server/package.json"), "utf8"));
 const serverVersionSource = readFileSync(resolve(rootDir, "server/src/version.ts"), "utf8");
+const pluginSchemaSource = readFileSync(resolve(rootDir, "src/sync/schema.ts"), "utf8");
 
 function readStringConst(source, name) {
 	const match = source.match(new RegExp(`export const ${name} = "([^"]*)";`));
@@ -29,6 +31,14 @@ function readBooleanConst(source, name) {
 	return match[1] === "true";
 }
 
+function readNumberConst(source, name, sourceLabel) {
+	const match = source.match(new RegExp(`export const ${name}\\s*=\\s*(\\d+)`));
+	if (!match) {
+		throw new Error(`Unable to read number constant ${name} from ${sourceLabel}`);
+	}
+	return Number(match[1]);
+}
+
 const serverVersion = readStringConst(serverVersionSource, "SERVER_VERSION");
 const minCompatibleServerVersionForPlugin = readStringConst(
 	serverVersionSource,
@@ -42,10 +52,47 @@ const migrationRequired = readBooleanConst(
 	serverVersionSource,
 	"SERVER_MIGRATION_REQUIRED",
 );
+const pluginSchemaVersion = readNumberConst(pluginSchemaSource, "SCHEMA_VERSION", "src/sync/schema.ts");
+const serverMinSchemaVersion = readNumberConst(
+	serverVersionSource,
+	"SERVER_MIN_SCHEMA_VERSION",
+	"server/src/version.ts",
+);
+const serverMaxSchemaVersion = readNumberConst(
+	serverVersionSource,
+	"SERVER_MAX_SCHEMA_VERSION",
+	"server/src/version.ts",
+);
+
+if (serverMinSchemaVersion > serverMaxSchemaVersion) {
+	throw new Error(
+		`server schema range is invalid: min ${serverMinSchemaVersion} > max ${serverMaxSchemaVersion}`,
+	);
+}
+if (pluginSchemaVersion > serverMaxSchemaVersion) {
+	throw new Error(
+		`plugin schema ${pluginSchemaVersion} exceeds server max schema ${serverMaxSchemaVersion}`,
+	);
+}
+if (pluginSchemaVersion < serverMinSchemaVersion) {
+	throw new Error(
+		`plugin schema ${pluginSchemaVersion} is below server min schema ${serverMinSchemaVersion}`,
+	);
+}
 
 if (serverPackage.version !== serverVersion) {
 	throw new Error(
 		`server/package.json version (${serverPackage.version}) does not match SERVER_VERSION (${serverVersion})`,
+	);
+}
+if (rootPackage.version !== pluginManifest.version) {
+	throw new Error(
+		`package.json version (${rootPackage.version}) does not match manifest.json version (${pluginManifest.version})`,
+	);
+}
+if (pluginVersions[rootPackage.version] !== pluginManifest.minAppVersion) {
+	throw new Error(
+		`versions.json is missing ${rootPackage.version} -> ${pluginManifest.minAppVersion}. Run npm version so version-bump.mjs registers the plugin version.`,
 	);
 }
 
@@ -57,6 +104,9 @@ const updateManifest = {
 	autoUpdateEligible: false,
 	minCompatibleServerVersionForPlugin,
 	minCompatiblePluginVersionForServer,
+	latestPluginSchemaVersion: pluginSchemaVersion,
+	latestServerMinSchemaVersion: serverMinSchemaVersion,
+	latestServerMaxSchemaVersion: serverMaxSchemaVersion,
 	upgradeOrder: "either",
 	releaseNotesUrl: `https://github.com/kavinsood/yaos/releases/tag/${rootPackage.version}`,
 	upgradeGuideUrl: "https://github.com/kavinsood/yaos#updating-your-server",
@@ -65,6 +115,9 @@ const updateManifest = {
 const serverZipManifest = {
 	serverVersion,
 	pluginVersion: pluginManifest.version,
+	pluginSchemaVersion,
+	serverMinSchemaVersion,
+	serverMaxSchemaVersion,
 	protectedFiles: ["wrangler.toml"],
 	updateOwnedPaths: [
 		".gitlab-ci.yml",

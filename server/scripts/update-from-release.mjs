@@ -37,6 +37,7 @@ const zipPath = join(tempDir, "yaos-server.zip");
 const extractDir = join(tempDir, "extract");
 const protectedPrefixes = [".github", ".github/"];
 const allowMigrationUpdate = process.env.YAOS_ALLOW_MIGRATION_UPDATE?.trim().toLowerCase() === "true";
+const allowSchemaRangeUpdate = process.env.YAOS_ALLOW_SCHEMA_RANGE_UPDATE?.trim().toLowerCase() === "true";
 
 function collectTomlArrayBindingValues(source, sectionName, keyName) {
 	const values = new Set();
@@ -80,6 +81,84 @@ function missingItems(requiredSet, existingSet) {
 		}
 	}
 	return missing.sort();
+}
+
+function readNumberConst(source, name) {
+	const match = source.match(new RegExp(`export const ${name}\\s*=\\s*(\\d+)`));
+	return match ? Number(match[1]) : null;
+}
+
+function readLocalSchemaRange() {
+	const localVersionPath = join(repoRoot, "src/version.ts");
+	if (!existsSync(localVersionPath)) {
+		return null;
+	}
+	const source = readFileSync(localVersionPath, "utf8");
+	const min = readNumberConst(source, "SERVER_MIN_SCHEMA_VERSION");
+	const max = readNumberConst(source, "SERVER_MAX_SCHEMA_VERSION");
+	if (min === null || max === null) {
+		return null;
+	}
+	return { min, max };
+}
+
+function readArtifactSchemaRange(rawManifest) {
+	const min = rawManifest.serverMinSchemaVersion;
+	const max = rawManifest.serverMaxSchemaVersion;
+	if (min === undefined && max === undefined) {
+		return null;
+	}
+	if (!Number.isInteger(min) || min < 0 || !Number.isInteger(max) || max < 0 || min > max) {
+		throw new Error(
+			`Artifact manifest has invalid server schema range: min=${String(min)} max=${String(max)}`,
+		);
+	}
+	return { min, max };
+}
+
+function formatSchemaRange(range) {
+	return `v${range.min}-v${range.max}`;
+}
+
+function schemaRangesOverlap(a, b) {
+	return a.min <= b.max && b.min <= a.max;
+}
+
+function enforceSchemaRangeUpdateGate(rawManifest) {
+	const artifactRange = readArtifactSchemaRange(rawManifest);
+	if (!artifactRange) {
+		console.warn("WARNING: artifact manifest has no server schema range; cannot preflight schema compatibility.");
+		return;
+	}
+
+	const localRange = readLocalSchemaRange();
+	if (!localRange) {
+		console.warn("WARNING: local server schema range not found; cannot preflight schema compatibility.");
+		return;
+	}
+
+	if (schemaRangesOverlap(localRange, artifactRange)) {
+		console.log(
+			`Schema compatibility preflight passed: local ${formatSchemaRange(localRange)} -> release ${formatSchemaRange(artifactRange)}`,
+		);
+		return;
+	}
+
+	if (rawManifest.migrationRequired === true || allowSchemaRangeUpdate) {
+		console.warn(
+			`WARNING: schema compatibility gap accepted: local ${formatSchemaRange(localRange)} -> release ${formatSchemaRange(artifactRange)}`,
+		);
+		return;
+	}
+
+	throw new Error(
+		[
+			"STOP: this YAOS server release has a schema compatibility gap.",
+			`Local server supports ${formatSchemaRange(localRange)}; release supports ${formatSchemaRange(artifactRange)}.`,
+			"Automatic update is disabled unless the release is marked migration-required.",
+			"If you intentionally want to bypass this guard, set YAOS_ALLOW_SCHEMA_RANGE_UPDATE=true.",
+		].join(" "),
+	);
 }
 
 function collectWranglerDriftWarnings(localWranglerPath, upstreamWranglerPath) {
@@ -186,6 +265,7 @@ async function main() {
 			].join(" "),
 		);
 	}
+	enforceSchemaRangeUpdateGate(rawManifest);
 	const wranglerWarnings = collectWranglerDriftWarnings(
 		join(repoRoot, "wrangler.toml"),
 		join(extractDir, "wrangler.toml"),
