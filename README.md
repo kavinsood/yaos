@@ -70,7 +70,7 @@ A one-time setup installs a GitHub Actions workflow in your deployment repo. Aft
 2. **Update**: YAOS notifies you when a new version ships. Click **Open update action** → **Run workflow** with `update`.
 3. **Rollback**: same workflow, change action to `revert`.
 
-Some releases require manual migration steps. The updater will abort with a clear warning — read the release notes before retrying. Re-clicking Deploy to Cloudflare is not a safe update path for a stateful server; YAOS uses a Git-driven workflow so the same Worker identity, Durable Object bindings, and history are preserved.
+Some releases require manual migration steps. The updater will also stop if a server artifact does not overlap the currently deployed schema range. In both cases it aborts with a clear warning — read the release notes before retrying. Re-clicking Deploy to Cloudflare is not a safe update path for a stateful server; YAOS uses a Git-driven workflow so the same Worker identity, Durable Object bindings, and history are preserved.
 
 ## Works with scripts and AI agents
 
@@ -107,6 +107,7 @@ Contributors looking for current project truth should start with:
 - **[Attachment sync](./engineering/attachment-sync.md)** — Native Worker proxy uploads, capability negotiation, and bounded fan-out under Cloudflare connection limits.
 - **[Zero-config auth](./engineering/zero-config-auth.md)** — Browser claim UX, `obsidian://yaos` deep-link pairing, and env-token override behavior.
 - **[Zero-ops update pipeline](./engineering/zero-ops-update-pipeline.md)** — Why detached deploy repos need bootstrap injection, reusable workflows, and migration safety gates.
+- **[Version and release management](./engineering/version-release-management.md)** — How plugin, server, schema, and GitHub release versions are registered and shipped.
 - **[Warts and limits](./engineering/warts-and-limits.md)** — Canonical limits, safety invariants, and the pragmatic compromises currently in production.
 
 ## Limits

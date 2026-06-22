@@ -8,6 +8,9 @@ export interface UpdateManifest {
 	autoUpdateEligible: boolean;
 	minCompatibleServerVersionForPlugin: string | null;
 	minCompatiblePluginVersionForServer: string | null;
+	latestPluginSchemaVersion?: number;
+	latestServerMinSchemaVersion?: number;
+	latestServerMaxSchemaVersion?: number;
 	upgradeOrder: "either" | "server-first" | "plugin-first";
 	releaseNotesUrl: string;
 	upgradeGuideUrl: string;
@@ -27,6 +30,12 @@ export function isUpdateManifest(value: unknown): value is UpdateManifest {
 			typeof candidate.minCompatibleServerVersionForPlugin === "string") &&
 		(candidate.minCompatiblePluginVersionForServer === null ||
 			typeof candidate.minCompatiblePluginVersionForServer === "string") &&
+		(candidate.latestPluginSchemaVersion === undefined ||
+			typeof candidate.latestPluginSchemaVersion === "number") &&
+		(candidate.latestServerMinSchemaVersion === undefined ||
+			typeof candidate.latestServerMinSchemaVersion === "number") &&
+		(candidate.latestServerMaxSchemaVersion === undefined ||
+			typeof candidate.latestServerMaxSchemaVersion === "number") &&
 		(candidate.upgradeOrder === "either" ||
 			candidate.upgradeOrder === "server-first" ||
 			candidate.upgradeOrder === "plugin-first") &&

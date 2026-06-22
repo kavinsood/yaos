@@ -4,6 +4,7 @@ import { json, withCors } from "./http";
 import { fetchVaultSchemaVersion } from "./trace";
 import { verifyTicket } from "./ticket";
 import type { AuthState, Env, FatalAuthCode } from "./types";
+import { SERVER_MAX_SCHEMA_VERSION, SERVER_MIN_SCHEMA_VERSION } from "../version";
 
 const LEGACY_CLIENT_SCHEMA_VERSION = 1;
 
@@ -202,6 +203,35 @@ export async function handleSyncSocketRoute(
 		}));
 	}
 
+	if (
+		clientSchema.version < SERVER_MIN_SCHEMA_VERSION ||
+		clientSchema.version > SERVER_MAX_SCHEMA_VERSION
+	) {
+		const detail = clientSchema.version < SERVER_MIN_SCHEMA_VERSION
+			? "client_schema_older_than_server"
+			: "client_schema_newer_than_server";
+		// Server schema-range rejection — console only, no YAOS_SYNC write.
+		console.warn(
+			`[yaos-sync:worker] ws rejected (update_required): ` +
+			JSON.stringify({
+				vaultIdHint: vaultId.slice(0, 8),
+				reason: "update_required",
+				detail,
+				clientSchemaVersion: clientSchema.version,
+				clientSchemaSource: clientSchema.source,
+				serverMinSchemaVersion: SERVER_MIN_SCHEMA_VERSION,
+				serverMaxSchemaVersion: SERVER_MAX_SCHEMA_VERSION,
+			}),
+		);
+		return returnSocketResponse(req, rejectSocket(req, "update_required", {
+			reason: detail,
+			clientSchemaVersion: clientSchema.version,
+			roomSchemaVersion: null,
+			serverMinSchemaVersion: SERVER_MIN_SCHEMA_VERSION,
+			serverMaxSchemaVersion: SERVER_MAX_SCHEMA_VERSION,
+		}));
+	}
+
 	const roomSchemaVersion = await fetchVaultSchemaVersion(env, vaultId);
 	if (roomSchemaVersion !== null && clientSchema.version < roomSchemaVersion) {
 		// Schema-skew rejection — console only, no YAOS_SYNC write (issue #40).
@@ -243,4 +273,3 @@ export async function handleSyncSocketRoute(
 	const stub = await getServerByName(env.YAOS_SYNC, vaultId);
 	return await stub.fetch(req);
 }
-

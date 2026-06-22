@@ -25,6 +25,7 @@ import { handleSyncSocketRoute } from "../server/src/routes/syncSocket";
 import { json } from "../server/src/routes/http";
 import { isTicketEndpointUnsupported, SocketTicketHttpError, patchTicketInUrl } from "../src/sync/socketTicket";
 import type { AuthState, Env } from "../server/src/routes/types";
+import { SERVER_MAX_SCHEMA_VERSION, SERVER_MIN_SCHEMA_VERSION } from "../server/src/version";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -328,6 +329,48 @@ console.log("\n--- WS route: no ticket and no token → rejected before DO wake 
 		assert(false, "DO was touched for unauthenticated request");
 	}
 	assert(!doTouched, "no auth: DO namespace not touched");
+}
+
+console.log("\n--- WS route: client schema below server range rejected before DO wake ---");
+{
+	const trapEnv = makeTrapEnv();
+	const staleSchema = SERVER_MIN_SCHEMA_VERSION - 1;
+	const req = new Request(
+		`https://example.test/vault/sync/${VAULT_ID}?token=${encodeURIComponent(ENV_AUTH.envToken)}&schemaVersion=${staleSchema}`,
+	);
+
+	let doTouched = false;
+	try {
+		const res = await worker.fetch(req, trapEnv);
+		const body = await res.json() as { reason?: unknown };
+		assertEqual(res.status, 426, "stale schema returns 426");
+		assertEqual(body.reason, "client_schema_older_than_server", "stale schema reason is explicit");
+	} catch {
+		doTouched = true;
+		assert(false, "DO was touched for stale schema");
+	}
+	assert(!doTouched, "stale schema: DO namespace not touched");
+}
+
+console.log("\n--- WS route: client schema above server range rejected before DO wake ---");
+{
+	const trapEnv = makeTrapEnv();
+	const futureSchema = SERVER_MAX_SCHEMA_VERSION + 1;
+	const req = new Request(
+		`https://example.test/vault/sync/${VAULT_ID}?token=${encodeURIComponent(ENV_AUTH.envToken)}&schemaVersion=${futureSchema}`,
+	);
+
+	let doTouched = false;
+	try {
+		const res = await worker.fetch(req, trapEnv);
+		const body = await res.json() as { reason?: unknown };
+		assertEqual(res.status, 426, "future schema returns 426");
+		assertEqual(body.reason, "client_schema_newer_than_server", "future schema reason is explicit");
+	} catch {
+		doTouched = true;
+		assert(false, "DO was touched for future schema");
+	}
+	assert(!doTouched, "future schema: DO namespace not touched");
 }
 
 // ---------------------------------------------------------------------------
