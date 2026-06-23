@@ -153,7 +153,7 @@ class FailingTransaction {
 	}
 }
 
-// ── YAOS vault schema helpers ────────────────────────────────────────────────
+// ── KAOS vault schema helpers ────────────────────────────────────────────────
 
 type FileMeta = { path: string; deleted?: boolean };
 

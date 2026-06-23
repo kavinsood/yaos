@@ -255,7 +255,7 @@ function conflictPathFor(path: string, date = new Date()): string {
 		.toISOString()
 		.replace(/\.\d{3}Z$/, "Z")
 		.replace(/[:]/g, "-");
-	const suffix = ` (YAOS remote conflict ${stamp})`;
+	const suffix = ` (KAOS remote conflict ${stamp})`;
 	const ext = dot > 0 ? name.slice(dot) : "";
 	const base = dot > 0 ? name.slice(0, dot) : name;
 	// Cap base name to prevent filesystem path length issues (255 byte limit)
@@ -267,7 +267,7 @@ function conflictPathFor(path: string, date = new Date()): string {
 function isBlobConflictArtifactPath(path: string): boolean {
 	const normalized = normalizePath(path);
 	const name = normalized.split("/").pop() ?? normalized;
-	return /^.+ \(YAOS remote conflict \d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z\)(?:\.[^/.]+)?$/.test(name);
+	return /^.+ \(KAOS remote conflict \d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z\)(?:\.[^/.]+)?$/.test(name);
 }
 
 // -------------------------------------------------------------------
@@ -1477,7 +1477,7 @@ export class BlobSyncManager {
 				// and will NOT sync to other devices.
 				try {
 					new Notice(
-						`YAOS: Local-only attachment conflict preserved — "${conflictPath.split("/").pop()}" (this device only)`,
+						`KAOS: Local-only attachment conflict preserved — "${conflictPath.split("/").pop()}" (this device only)`,
 						8000,
 					);
 				} catch {

@@ -207,7 +207,7 @@ export const runVfsTortureTest = async (context: VfsTortureTestContext): Promise
 	};
 
 	const diagDir = await context.diagnosticsService?.ensureDiagnosticsDir()
-		?? normalizePath(`${context.app.vault.configDir}/plugins/yaos/diagnostics`);
+		?? normalizePath(`${context.app.vault.configDir}/plugins/kaos/diagnostics`);
 	const stamp = new Date().toISOString().replace(/[:.]/g, "-");
 	const outPath = normalizePath(
 		`${diagDir}/vfs-torture-${stamp}-${context.settings.deviceName || "device"}.json`,

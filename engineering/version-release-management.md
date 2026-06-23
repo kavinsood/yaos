@@ -1,12 +1,12 @@
 # Version and Release Management
 
-YAOS ships two runtimes from one GitHub release:
+KAOS ships two runtimes from one GitHub release:
 
 - the Obsidian plugin, versioned by the root `package.json` and `manifest.json`
 - the Cloudflare Worker server, versioned by `server/package.json` and `server/src/version.ts`
 
 The GitHub release tag is always the plugin version. Server artifacts ride inside
-that same release as `yaos-server.zip` plus `update-manifest.json`.
+that same release as `kaos-server.zip` plus `update-manifest.json`.
 
 ## Version Fields
 
@@ -30,8 +30,8 @@ There is one public GitHub release stream, keyed by plugin version tags such as
 
 That release contains:
 
-- plugin assets: `main.js`, `telemetry.js`, `manifest.json`, `styles.css`, `yaos.zip`
-- server assets: `yaos-server.zip`, `update-manifest.json`
+- plugin assets: `main.js`, `telemetry.js`, `manifest.json`, `styles.css`, `kaos.zip`
+- server assets: `kaos-server.zip`, `update-manifest.json`
 
 Because GitHub's `/releases/latest/download/update-manifest.json` points at the
 latest tag, a server-only release still needs a plugin patch version bump as a
@@ -141,7 +141,7 @@ builds both runtimes, runs CI, and uploads plugin and server assets.
 The plugin fetches:
 
 ```text
-https://github.com/kavinsood/yaos/releases/latest/download/update-manifest.json
+https://github.com/adtstack/kaos/releases/latest/download/update-manifest.json
 ```
 
 The manifest advertises:
@@ -152,10 +152,10 @@ The manifest advertises:
 - compatibility versions
 - server schema range
 
-The server updater reads `yaos-server-manifest.json` from `yaos-server.zip`.
+The server updater reads `kaos-server-manifest.json` from `kaos-server.zip`.
 It aborts before applying files when:
 
-- `migrationRequired` is true and `YAOS_ALLOW_MIGRATION_UPDATE=true` is not set
+- `migrationRequired` is true and `KAOS_ALLOW_MIGRATION_UPDATE=true` is not set
 - the current server schema range does not overlap the artifact schema range
 - required artifact metadata is malformed
 
@@ -166,5 +166,5 @@ It aborts before applying files when:
 - `server/package.json` version equals `SERVER_VERSION`.
 - `SCHEMA_VERSION` is covered by `SERVER_MIN/MAX_SCHEMA_VERSION`.
 - Server-only releases still have a new plugin carrier version.
-- `update-manifest.json` and `yaos-server-manifest.json` include the expected
+- `update-manifest.json` and `kaos-server-manifest.json` include the expected
   server and schema versions.

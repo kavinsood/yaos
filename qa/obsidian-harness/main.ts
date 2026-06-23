@@ -250,21 +250,21 @@ export default class YaosQaHarnessPlugin extends Plugin {
 	 * waitForQaReady() will never resolve, making the failure visible immediately
 	 * rather than letting it surface as a mysterious mid-scenario crash.
 	 *
-	 * The product plugin ID is "yaos".  Enforce load order: "yaos" must appear
+	 * The product plugin ID is "kaos".  Enforce load order: "kaos" must appear
 	 * before "yaos-qa-harness" in the vault's community-plugins.json.
 	 *
 	 * Private fields are accessed via `as any` — acceptable in a QA-only file.
 	 */
 	private mountYaosDebugApi(): void {
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		const product = (this.app.plugins as any).plugins?.["yaos"] as Record<string, unknown> | undefined;
+		const product = (this.app.plugins as any).plugins?.["kaos"] as Record<string, unknown> | undefined;
 
 		// Guard 1: product plugin must be loaded
 		if (!product) {
 			console.error(
-				"[YAOS QA] FATAL: product plugin 'yaos' not found. " +
+				"[KAOS QA] FATAL: product plugin 'kaos' not found. " +
 				"window.__YAOS_DEBUG__ will NOT be mounted. " +
-				"Ensure 'yaos' appears before 'yaos-qa-harness' in community-plugins.json.",
+				"Ensure 'kaos' appears before 'yaos-qa-harness' in community-plugins.json.",
 			);
 			new Notice("YAOS QA FATAL: product plugin not found — __YAOS_DEBUG__ unavailable. " +
 				"Check plugin load order.", 15000);
@@ -290,9 +290,9 @@ export default class YaosQaHarnessPlugin extends Plugin {
 			console.error(
 				"[YAOS QA] FATAL: product.lab (TelemetryRuntimeHandle) is null. " +
 				"The product vault settings must have qaDebugMode: true. " +
-				"Check qa/scripts/prepare-vault.ts — it must write qaDebugMode into the YAOS settings.",
+				"Check qa/scripts/prepare-vault.ts — it must write qaDebugMode into the KAOS settings.",
 			);
-			new Notice("YAOS QA FATAL: product.lab missing — set qaDebugMode: true in YAOS settings.", 15000);
+			new Notice("KAOS QA FATAL: product.lab missing — set qaDebugMode: true in KAOS settings.", 15000);
 			return;
 		}
 

@@ -248,7 +248,7 @@ async function main() {
 		// 4. QA product build loaded (getEngineControlPort callable)
 		// ----------------------------------------------------------------
 		const hasEngineControlPort = await client.eval(
-			`typeof app?.plugins?.plugins?.["yaos"]?.getEngineControlPort === "function"`,
+			`typeof app?.plugins?.plugins?.["kaos"]?.getEngineControlPort === "function"`,
 		);
 		require(
 			"QA product build loaded (getEngineControlPort)",
@@ -321,7 +321,7 @@ async function main() {
 		// ----------------------------------------------------------------
 		if (tracePathValid && VAULT_PATH) {
 			// tracePath may be absolute or vault-relative
-			// tracePath is vault-relative (e.g. ".obsidian/plugins/yaos/diagnostics/...")
+			// tracePath is vault-relative (e.g. ".obsidian/plugins/kaos/diagnostics/...")
 			// or absolute. Join with vault root directly — do not prepend .obsidian again.
 			const absTracePath = tracePath.startsWith("/")
 				? tracePath

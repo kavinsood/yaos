@@ -2,11 +2,11 @@
 
 Self-hosted software usually dies at the onboarding step. Forcing a user to open a terminal, run OpenSSL to generate a 32-byte cryptographic secret, and paste it into a .env file guarantees a 90% abandonment rate.
 
-YAOS implements a consumer-grade, zero-terminal claim flow, while gracefully handling the realities of infrastructure paywalls.
+KAOS implements a consumer-grade, zero-terminal claim flow, while gracefully handling the realities of infrastructure paywalls.
 
 ## The Framework Migration: Killing the CLI
 
-The first version of YAOS was built on PartyKit. PartyKit provided an incredible early abstraction - it wrapped Cloudflare's complex Durable Objects behind a simple "Room" API and made real-time multiplayer trivially easy to bootstrap.
+The first version of KAOS was built on PartyKit. PartyKit provided an incredible early abstraction - it wrapped Cloudflare's complex Durable Objects behind a simple "Room" API and made real-time multiplayer trivially easy to bootstrap.
 
 However, the deployment worked exclusively through their proprietary CLI. The problem is that users must login through partykit-cli to deploy, meaning we couldn't utilize Cloudflare's "One-Click Deployment" button. This violated our core onboarding goal: Zero-terminal, consumer-grade self-hosting.
 
@@ -14,7 +14,7 @@ To unlock the deploy button, we stripped out the PartyKit framework and ported t
 
 # The Single-Use Claim Architecture
 
-When deployed, the YAOS server boots into an "Unclaimed" state.
+When deployed, the KAOS server boots into an "Unclaimed" state.
 - The user visits the Worker URL in their browser and is greeted by a lightweight, dependency-free HTML setup page.
 - The browser utilizes crypto.getRandomValues() to generate a high-entropy token locally.
 - The user clicks "Claim". The token is sent to the server.
@@ -38,7 +38,7 @@ Old plugin versions that predate ticket auth continue to work during the migrati
 The server issues tickets at `POST /vault/:vaultId/auth/ticket` (requires valid Bearer auth).  The ticket payload is:
 
 ```json
-{ "v": 1, "aud": "yaos-ws", "vaultId": "...", "iat": <ms>, "exp": <ms>, "nonce": "<random>" }
+{ "v": 1, "aud": "kaos-ws", "vaultId": "...", "iat": <ms>, "exp": <ms>, "nonce": "<random>" }
 ```
 
 Signed as `base64url(payload).base64url(HMAC-SHA256(signingKey, base64url(payload)))`.  The signing key is derived from the server's existing auth secret so no additional deployment secret is required.
@@ -76,7 +76,7 @@ Once all plugin clients in your deployment have upgraded to the ticket-aware ver
 ```toml
 # server/wrangler.toml
 [vars]
-YAOS_DISABLE_LEGACY_WS_TOKEN = "true"
+KAOS_DISABLE_LEGACY_WS_TOKEN = "true"
 ```
 
 When set, connections using `?token=` are rejected with 401 before the vault Durable Object is woken.  Ticket-authenticated connections are unaffected.
@@ -93,20 +93,20 @@ For the broader list of accepted compromises and tracked debt, see
 
 # The URI Protocol Handshake
 
-To completely eliminate the copy-paste step, the setup page generates a custom deep-link: `obsidian://yaos?action=setup&host=...&token=....`
+To completely eliminate the copy-paste step, the setup page generates a custom deep-link: `obsidian://kaos?action=setup&host=...&token=....`
 
 When clicked, the OS routes this directly to the Obsidian plugin, which intercepts the URI, configures its internal settings, and immediately boots the sync engine.
 
 # Graceful Degradation and the Credit Card Wall
 
-Because YAOS utilizes native `wrangler.toml` bindings, Cloudflare can automatically provision Durable Objects and R2 buckets upon deployment. 
+Because KAOS utilizes native `wrangler.toml` bindings, Cloudflare can automatically provision Durable Objects and R2 buckets upon deployment.
 
-However, we made the intentional product decision **not** to force the R2 bucket binding in the default deployment template. Cloudflare enforces a strict requirement: users must have a primary payment method (credit card) on file to provision an R2 bucket. If YAOS required this binding by default, the "Deploy to Cloudflare" button would hit a billing wall, and users without a configured payment profile would abandon the setup.
+However, we made the intentional product decision **not** to force the R2 bucket binding in the default deployment template. Cloudflare enforces a strict requirement: users must have a primary payment method (credit card) on file to provision an R2 bucket. If KAOS required this binding by default, the "Deploy to Cloudflare" button would hit a billing wall, and users without a configured payment profile would abandon the setup.
 
 We solved this via Capability Negotiation:
-- The default YAOS deployment provisions only the text-sync CRDT engine (Worker + Durable Object). It requires no credit card.
+- The default KAOS deployment provisions only the text-sync CRDT engine (Worker + Durable Object). It requires no credit card.
 - When the Obsidian plugin connects, it performs a capability probe (`GET /api/capabilities`).
-- If the server lacks the `YAOS_BUCKET` binding, it returns `{ attachments: false, snapshots: false }`.
+- If the server lacks the `KAOS_BUCKET` binding, it returns `{ attachments: false, snapshots: false }`.
 - The plugin reads this and gracefully disables the attachment and snapshot UI. It continues to sync markdown text flawlessly.
 
 ![Deploy-button resilience without mandatory R2](./diagrams/deploy-button-resilience-without-mandatory-r2.webp)

@@ -4,7 +4,7 @@
  * Spec: .kiro/specs/editor-bound-localonly-amplifier-guard/requirements.md
  *
  * Defends against the topology captured in the 2026-05-27 iPad trace
- * (~/temenos/.obsidian/plugins/yaos/flight-logs/2026-05-27/
+ * (~/temenos/.obsidian/plugins/kaos/flight-logs/2026-05-27/
  *  boot-wL7i012vR4mGXA-1.ndjson, pathId p:476818d2ecba90d4e95e2a0c4f3ad1eb).
  *
  * The bound-file-local-only-divergence branch ran every ~2.36s while the

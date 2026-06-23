@@ -7,7 +7,7 @@ The trickiest part of this plugin is maintaining a bidirectional bridge between 
 
 Bridging an eventual-consistency file watcher to a strong-consistency state machine is notoriously difficult. I spoke to the founders of the two largest commercial Obsidian sync plugins (Relay and Screengarden), and they both explicitly acknowledged this bottleneck.
 
-YAOS solves the problem natively by abandoning time-based heuristics in favor of content-addressed state acknowledgment.
+KAOS solves the problem natively by abandoning time-based heuristics in favor of content-addressed state acknowledgment.
 
 ![Filesystem bridge control loops and invariants (Disk <-> CRDT)](./diagrams/filesystem-bridge-control-loops-diagram-with-invariants-disk-crdt.webp)
 

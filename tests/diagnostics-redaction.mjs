@@ -244,7 +244,7 @@ console.log("\n--- Test 8: salted hash is not the raw path even after JSON seria
 	assert(!out.includes(salt), "serialized output does not contain the salt");
 }
 
-console.log("\n--- Test 9: file extensions covered include all routed YAOS file types ---");
+console.log("\n--- Test 9: file extensions covered include all routed KAOS file types ---");
 {
 	const required = ["md", "canvas", "excalidraw", "base", "png", "jpg", "pdf"];
 	const salt = generateBundleSalt();

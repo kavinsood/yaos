@@ -146,7 +146,7 @@ console.log("\n--- Test 4: blob uploads reject poisoned content-addressed keys -
 			putCalls++;
 		},
 	};
-	const env = { YAOS_BUCKET: bucket } as any;
+	const env = { KAOS_BUCKET: bucket } as any;
 	const body = new TextEncoder().encode("not the bytes for this hash");
 	const wrongHash = "0".repeat(64);
 	const res = await handleBlobRoute(
@@ -171,7 +171,7 @@ console.log("\n--- Test 5: blob uploads reject oversized Content-Length before R
 			putCalls++;
 		},
 	};
-	const env = { YAOS_BUCKET: bucket } as any;
+	const env = { KAOS_BUCKET: bucket } as any;
 	const body = new TextEncoder().encode("small body");
 	const hash = await sha256Hex(body);
 	const res = await handleBlobRoute(
@@ -199,7 +199,7 @@ console.log("\n--- Test 6: blob uploads accept bytes whose body matches the addr
 			writtenKey = key;
 		},
 	};
-	const env = { YAOS_BUCKET: bucket } as any;
+	const env = { KAOS_BUCKET: bucket } as any;
 	const body = new TextEncoder().encode("correct content-addressed bytes");
 	const hash = await sha256Hex(body);
 	const res = await handleBlobRoute(
@@ -225,7 +225,7 @@ console.log("\n--- Test 7: blob uploads reject malformed Content-Length ---");
 			putCalls++;
 		},
 	};
-	const env = { YAOS_BUCKET: bucket } as any;
+	const env = { KAOS_BUCKET: bucket } as any;
 	const body = new TextEncoder().encode("small body");
 	const hash = await sha256Hex(body);
 	const res = await handleBlobRoute(
@@ -262,7 +262,7 @@ console.log("\n--- Test 7b: blob uploads reject oversized body when Content-Leng
 			putCalls++;
 		},
 	};
-	const env = { YAOS_BUCKET: bucket } as any;
+	const env = { KAOS_BUCKET: bucket } as any;
 	// Body exceeds MAX_BLOB_UPLOAD_BYTES by one byte.  All bytes are zero so
 	// construction is fast; the exact content does not matter because the test
 	// fails at the size check, never reaching the hash-integrity check.
@@ -290,7 +290,7 @@ console.log("\n--- Test 7b: blob uploads reject oversized body when Content-Leng
 
 console.log("\n--- Test 8: public capabilities do not expose private update metadata ---");
 {
-	const env = { YAOS_BUCKET: {} } as any;
+	const env = { KAOS_BUCKET: {} } as any;
 	const auth = { mode: "claim", claimed: true, tokenHash: "hash" } as const;
 	const config = {
 		claimed: true,
@@ -316,15 +316,15 @@ console.log("\n--- Test 9: /api/capabilities route splits public and authenticat
 	const token = "correct-token";
 	const env = {
 		SYNC_TOKEN: token,
-		YAOS_BUCKET: {},
-		YAOS_CONFIG: makeConfigNamespace({
+		KAOS_BUCKET: {},
+		KAOS_CONFIG: makeConfigNamespace({
 			claimed: true,
 			tokenHash: "unused-env-token-mode",
 			updateProvider: "github",
 			updateRepoUrl: "https://github.com/private/fork",
 			updateRepoBranch: "secret-branch",
 		}),
-		YAOS_SYNC: {},
+		KAOS_SYNC: {},
 	} as any;
 
 	const publicRes = await worker.fetch(new Request("https://example.test/api/capabilities"), env);

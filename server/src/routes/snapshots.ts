@@ -60,7 +60,7 @@ export async function handleSnapshotRoute(
 			body = {};
 		}
 
-		const stub = await getServerByName(env.YAOS_SYNC, vaultId);
+		const stub = await getServerByName(env.KAOS_SYNC, vaultId);
 		const res = await stub.fetch("https://internal/__yaos/snapshot-maybe", {
 			method: "POST",
 			headers: {
@@ -78,7 +78,7 @@ export async function handleSnapshotRoute(
 	}
 
 	if (req.method === "GET" && rest.length === 0) {
-		if (!env.YAOS_BUCKET) {
+		if (!env.KAOS_BUCKET) {
 			return json({ error: "snapshots_unavailable" }, 503);
 		}
 
@@ -87,7 +87,7 @@ export async function handleSnapshotRoute(
 		const limit = limitParam ? Math.min(Math.max(1, parseInt(limitParam, 10) || 50), 200) : 50;
 		const format = url.searchParams.get("format");
 
-		const { snapshots, totalIndexKeys, limited } = await listSnapshots(vaultId, env.YAOS_BUCKET, limit);
+		const { snapshots, totalIndexKeys, limited } = await listSnapshots(vaultId, env.KAOS_BUCKET, limit);
 
 		// Legacy compatibility: default response is { snapshots: [...] }
 		// which old clients destructure as `result.snapshots`.
@@ -106,13 +106,13 @@ export async function handleSnapshotRoute(
 	}
 
 	if (req.method === "GET" && rest.length === 1 && rest[0] === "status") {
-		if (!env.YAOS_BUCKET) {
+		if (!env.KAOS_BUCKET) {
 			return json({ error: "snapshots_unavailable" }, 503);
 		}
 
-		const latest = await getLatestSnapshotIndex(vaultId, env.YAOS_BUCKET);
+		const latest = await getLatestSnapshotIndex(vaultId, env.KAOS_BUCKET);
 		// Use a high limit but be honest that it's a lower bound.
-		const { snapshots: all, totalIndexKeys, limited } = await listSnapshots(vaultId, env.YAOS_BUCKET, 200);
+		const { snapshots: all, totalIndexKeys, limited } = await listSnapshots(vaultId, env.KAOS_BUCKET, 200);
 		const fetchedBytes = all.reduce((sum, s) => sum + s.crdtSizeBytes, 0);
 
 		const pinnedCount = all.filter((s) => s.pinned).length;
@@ -135,7 +135,7 @@ export async function handleSnapshotRoute(
 	}
 
 	if (req.method === "POST" && rest.length === 1 && rest[0] === "prune") {
-		if (!env.YAOS_BUCKET) {
+		if (!env.KAOS_BUCKET) {
 			return json({ error: "snapshots_unavailable" }, 503);
 		}
 
@@ -158,7 +158,7 @@ export async function handleSnapshotRoute(
 			}, 400);
 		}
 
-		const result = await applyRetention(vaultId, env.YAOS_BUCKET, undefined, {
+		const result = await applyRetention(vaultId, env.KAOS_BUCKET, undefined, {
 			pruneLegacy,
 		});
 		await options.recordVaultTrace(env, vaultId, "snapshot-retention-applied", {
@@ -172,7 +172,7 @@ export async function handleSnapshotRoute(
 	}
 
 	if (req.method === "GET" && rest.length === 1) {
-		if (!env.YAOS_BUCKET) {
+		if (!env.KAOS_BUCKET) {
 			return json({ error: "snapshots_unavailable" }, 503);
 		}
 
@@ -183,7 +183,7 @@ export async function handleSnapshotRoute(
 		const result = await getSnapshotPayload(
 			vaultId,
 			snapshotId,
-			env.YAOS_BUCKET,
+			env.KAOS_BUCKET,
 		);
 		if (!result) {
 			return json({ error: "not found" }, 404);
@@ -193,7 +193,7 @@ export async function handleSnapshotRoute(
 			headers: {
 				"Content-Type": "application/gzip",
 				"Cache-Control": "no-store",
-				"X-YAOS-Snapshot-Day": result.index.day,
+				"X-KAOS-Snapshot-Day": result.index.day,
 			},
 		});
 	}
@@ -207,14 +207,14 @@ async function createSnapshotFromLiveDoc(
 	triggeredBy: string | undefined,
 	fetchVaultDocument: (env: Env, vaultId: string) => Promise<Uint8Array>,
 ): Promise<SnapshotResult> {
-	if (!env.YAOS_BUCKET) {
+	if (!env.KAOS_BUCKET) {
 		return {
 			status: "unavailable",
 			reason: "R2 bucket not configured",
 		};
 	}
 
-	const previous = await getLatestSnapshotIndex(vaultId, env.YAOS_BUCKET);
+	const previous = await getLatestSnapshotIndex(vaultId, env.KAOS_BUCKET);
 
 	const update = await fetchVaultDocument(env, vaultId);
 	const doc = new Y.Doc();
@@ -222,7 +222,7 @@ async function createSnapshotFromLiveDoc(
 		Y.applyUpdate(doc, update);
 	}
 
-	const index = await createSnapshot(doc, vaultId, env.YAOS_BUCKET, {
+	const index = await createSnapshot(doc, vaultId, env.KAOS_BUCKET, {
 		triggeredBy,
 		reason: "manual",
 		pinned: true,

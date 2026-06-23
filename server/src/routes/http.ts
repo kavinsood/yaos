@@ -1,6 +1,6 @@
 const CORS_ALLOW_HEADERS = "Authorization, Content-Type";
 const CORS_ALLOW_METHODS = "GET, POST, PUT, OPTIONS";
-const CORS_EXPOSE_HEADERS = "X-YAOS-Snapshot-Day";
+const CORS_EXPOSE_HEADERS = "X-KAOS-Snapshot-Day";
 
 export function json(body: unknown, status = 200): Response {
 	return new Response(JSON.stringify(body), {

@@ -71,7 +71,7 @@ test("vault-root path detection: configDir inside vault root is detected", async
 	// Simulate the vault-root check logic from main.ts
 	const vaultRoot = "/home/user/vault";
 	const configDir = "/home/user/vault/.obsidian";
-	const bundleDir = `${configDir}/plugins/yaos/witness-bundles`;
+	const bundleDir = `${configDir}/plugins/kaos/witness-bundles`;
 	const isInsideVault = vaultRoot ? bundleDir.startsWith(vaultRoot) : true;
 	assert.equal(isInsideVault, true, "configDir inside vault root should be detected");
 });
@@ -79,7 +79,7 @@ test("vault-root path detection: configDir inside vault root is detected", async
 test("vault-root path detection: external configDir is not inside vault root", async () => {
 	const vaultRoot = "/home/user/vault";
 	const configDir = "/home/user/.config/obsidian";
-	const bundleDir = `${configDir}/plugins/yaos/witness-bundles`;
+	const bundleDir = `${configDir}/plugins/kaos/witness-bundles`;
 	const isInsideVault = vaultRoot ? bundleDir.startsWith(vaultRoot) : true;
 	assert.equal(isInsideVault, false, "External configDir should not be inside vault root");
 });

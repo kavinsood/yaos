@@ -96,7 +96,7 @@ console.log("\n--- Test 2: handleSyncSocketRoute has no recordVaultTrace calls a
 	// Issue #40 Phase 2 fix: ALL WebSocket admission events (ws-connected,
 	// ws-rejected) were moved to console-only logging.  The function must
 	// contain zero recordVaultTrace calls.  A reconnect storm must not
-	// produce a YAOS_SYNC trace write on every socket open/reject.
+	// produce a KAOS_SYNC trace write on every socket open/reject.
 	//
 	// Historical note: the function previously called recordVaultTrace for
 	// ws-connected (every successful connect) and ws-rejected (post-auth

@@ -272,13 +272,13 @@ export class RawCdpObsidianClient {
 	}> {
 		return this.evalRaw(`
 			(async function() {
-				const manifest = app.plugins?.plugins?.yaos?.manifest;
+				const manifest = app.plugins?.plugins?.kaos?.manifest;
 				let bundleHash = "unknown";
 				try {
 					const basePath = app.vault.adapter.basePath;
 					const fs = require("fs");
 					const crypto = require("crypto");
-					const buf = fs.readFileSync(basePath + "/.obsidian/plugins/yaos/main.js");
+					const buf = fs.readFileSync(basePath + "/.obsidian/plugins/kaos/main.js");
 					bundleHash = crypto.createHash("sha256").update(buf).digest("hex");
 				} catch (e) { /* mobile or missing */ }
 				return {

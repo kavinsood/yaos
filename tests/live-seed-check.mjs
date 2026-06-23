@@ -71,7 +71,7 @@ provider.on("sync", (synced) => {
 			ytext.delete(0, ytext.length);
 			ytext.insert(
 				0,
-				`YAOS redeploy durability test\nts=${new Date().toISOString()}\nvault=${room}\nmode=${mode}`,
+				`KAOS redeploy durability test\nts=${new Date().toISOString()}\nvault=${room}\nmode=${mode}`,
 			);
 			meta.set(fileId, { path: "redeploy-test.md", mtime: Date.now() });
 		});

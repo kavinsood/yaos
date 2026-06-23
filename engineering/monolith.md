@@ -1,6 +1,6 @@
 # Monolithic Architecture
 
-The current YAOS architecture uses a single, shared Y.Doc for the entire vault - file metadata, folder structures, blob references, and all markdown Y.Text values.
+The current KAOS architecture uses a single, shared Y.Doc for the entire vault - file metadata, folder structures, blob references, and all markdown Y.Text values.
 
 ![Single-vault monolithic Y.Doc vs sharded two-tier CRDT model](./diagrams/single-vault-monolithic-y-doc-vs-sharded-two-tier-crdt-model.webp)
 
@@ -11,7 +11,7 @@ For small and medium personal vaults (upto ~40-50 MB of raw text), this gives:
 - easy snapshotting
 - and perfect cross-vault ACID transactions.
 
-If a user renames a folder containing 50 markdown files, YAOS batches that into a single ydoc.transact() block. Either all 50 files move, or none of them move. The vault structure can't tear.
+If a user renames a folder containing 50 markdown files, KAOS batches that into a single ydoc.transact() block. Either all 50 files move, or none of them move. The vault structure can't tear.
 
 The tradeoff is that this design has a scaling ceiling. Over time, retained tombstones and document history will pay more in startup cost and memory usage.
 
@@ -19,7 +19,7 @@ We estimate that 70-80% of Obsidian users write notes like normal humans and wan
 
 Loading a 10GB vault's history into a single in-memory CRDT graph would immediately trigger an Out of Memory crash on mobile devices. This is why Obsidian Sync uses dumb, debounced file-level syncing, because it has an O(1) memory ceiling per file. It doesn't care if your vault is 1MB or 50GB; it just moves files around and relies on "File modified externally" popups when things collide.
 
-We made the opposite trade. YAOS trades infinite scalability for perfect real-time ergonomics.
+We made the opposite trade. KAOS trades infinite scalability for perfect real-time ergonomics.
 
 To bypass the memory ceiling while keeping real-time sync, *we could shard the CRDT per-file*, which is actually how Apple Notes works:
 
@@ -28,7 +28,7 @@ To bypass the memory ceiling while keeping real-time sync, *we could shard the C
 - Dumb Metadata Sync: The folder hierarchy and note metadata (creation date, tags) do not use CRDTs. They use standard CloudKit conflict resolution, which is usually just Last-Writer-Wins (LWW) based on timestamps.
 - Aggressive Garbage Collection: Unlike Yjs, which retains every deletion tombstone forever (unless you explicitly write a garbage collection layer), Apple Notes aggressively prunes edit history once the CloudKit server confirms the sync. This keeps the protocol buffer payloads tiny.
 
-To achieve this in YAOS, we would have to build a Two-Tier CRDT System:
+To achieve this in KAOS, we would have to build a Two-Tier CRDT System:
 
 **Tier 1 (The Master Index)**: A vault-level CRDT holding only metadata (fileID -> path). It syncs immediately on startup.
 
@@ -46,6 +46,6 @@ By sharding the state, you downgrade the system's cross-vault guarantees from *s
 
 Enterprise systems like Figma and Notion accept this tearing. They trade strong consistency for identity preservation and memory scalability. Because the content is bound to a stable fileID rather than a fragile file path, no data is permanently lost. However, they write defensive UI code to hide broken references, handle dangling pointers, and mask the eventual consistency delay from the user.
 
-YAOS has a debug mode, which shows vault-footprint. After doing QA, I saw that my vault's `encodedDocBytes` was 25KB larger than the total live markdown text, which is roughly a **1.9% overhead.** Essentially, the CRDT state is lean, and history/tombstones are not bloating the document much at all.
+KAOS has a debug mode, which shows vault-footprint. After doing QA, I saw that my vault's `encodedDocBytes` was 25KB larger than the total live markdown text, which is roughly a **1.9% overhead.** Essentially, the CRDT state is lean, and history/tombstones are not bloating the document much at all.
 
 When the overhead is 2%, abandoning the monolith's ACID guarantees is severe over-engineering. We will cherish the monolith until the profiler proves we have no other choice.

@@ -11,14 +11,14 @@ const lastUpdateCommit = read("git", [
 	"log",
 	"--fixed-strings",
 	"--grep",
-	"yaos(server): update to ",
+	"kaos(server): update to ",
 	"-n",
 	"1",
 	"--format=%H",
 ]);
 
 if (!lastUpdateCommit) {
-	throw new Error("No previous YAOS server update commit was found");
+	throw new Error("No previous KAOS server update commit was found");
 }
 
 console.log(`Reverting ${lastUpdateCommit}`);

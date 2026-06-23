@@ -45,7 +45,7 @@ Open follow-up from the closure: see "Retire `mintAdmissionOpId` callback in fav
 
 ### NFC / NFD path normalization
 
-We still want an explicit scenario proving how YAOS behaves when filesystems normalize
+We still want an explicit scenario proving how KAOS behaves when filesystems normalize
 Unicode path forms differently.
 
 ## Status / semantics / diagnostics
@@ -162,10 +162,10 @@ Expected behavior: reconnect eventually succeeds (possibly after one or two fail
 
 ### WebSocket ticket auth: strict-mode smoke test required before release
 
-`YAOS_DISABLE_LEGACY_WS_TOKEN=true` must be tested with a real deployment before the migration-complete announcement.
+`KAOS_DISABLE_LEGACY_WS_TOKEN=true` must be tested with a real deployment before the migration-complete announcement.
 
 Required:
-1. Deploy server with `YAOS_DISABLE_LEGACY_WS_TOKEN = "true"` set in `wrangler.toml`.
+1. Deploy server with `KAOS_DISABLE_LEGACY_WS_TOKEN = "true"` set in `wrangler.toml`.
 2. Connect a new (ticket-aware) plugin — should connect successfully via `?ticket=`.
 3. Connect an old (pre-ticket) plugin — should be rejected with HTTP 401 before the Durable Object wakes.
 4. Confirm the Worker log contains `ws rejected pre-auth` for the old client, not a DO error.
@@ -189,9 +189,9 @@ not copied here verbatim; this file is intentionally for live followups.
 
 ### Bound-path conflict-artifact gap on re-enable while file is open
 
-`handleBoundFileSyncGap` does not have a `both-changed` analog. When YAOS is
+`handleBoundFileSyncGap` does not have a `both-changed` analog. When KAOS is
 disabled cleanly, the user types into the open file (Obsidian autosave lands
-the change on disk while YAOS is off), and YAOS is re-enabled, the file
+the change on disk while KAOS is off), and KAOS is re-enabled, the file
 re-binds and the bound path runs — not the closed-file path. So
 `decideClosedFileConflict` is never consulted.
 
@@ -210,7 +210,7 @@ a winner. For one common ordering on iPad re-enable, that winner is the
 remote CRDT and the user's local edit disappears without an artifact.
 
 Concrete iPad case from the 2026-05-27 trace: user types `LOCAL_ON_IPAD`
-while YAOS is disabled; provider streams `REMOTE_FROM_DESKTOP` into CRDT
+while KAOS is disabled; provider streams `REMOTE_FROM_DESKTOP` into CRDT
 on re-enable; the file is open so the bound path runs; the user-visible
 end state is `BASELINE_PROOF\n\nREMOTE_FROM_DESKTOP\n` with no conflict
 artifact preserving `LOCAL_ON_IPAD`. The Issue #22-B ledger entry in

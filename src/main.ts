@@ -98,11 +98,11 @@ type PersistedPluginState = Partial<VaultSyncSettings> & {
 	_blobHashCache?: BlobHashCache;
 	/**
 	 * Unix ms timestamp of the last successful saveDiskIndex() call.
-	 * Semantically: "the last time YAOS durably persisted its disk-index
+	 * Semantically: "the last time KAOS durably persisted its disk-index
 	 * baselines to data.json." Used by decideClosedFileConflict to detect
-	 * "disk file was edited while YAOS was inactive" when baselineHash is
+	 * "disk file was edited while KAOS was inactive" when baselineHash is
 	 * missing. This is a heuristic timestamp — it is the last save, not
-	 * necessarily the last time YAOS observed the specific file.
+	 * necessarily the last time KAOS observed the specific file.
 	 * See: src/sync/closedFileConflict.ts ClosedFileConflictInput.lastDiskIndexPersistedAt
 	 */
 	_lastDiskIndexPersistedAt?: number;
@@ -169,7 +169,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private diskIndex: DiskIndex = {};
 	/**
 	 * Unix ms timestamp of the last saveDiskIndex() that completed successfully.
-	 * Semantics: "last time YAOS durably persisted disk-index state."
+	 * Semantics: "last time KAOS durably persisted disk-index state."
 	 * This is a global (not per-file) heuristic timestamp used only as a
 	 * tie-breaker in the missing-baseline closed-file conflict path.
 	 * Naming: lastDiskIndexPersistedAt, not lastPluginActiveAt — these are
@@ -387,7 +387,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				void this.initSync();
 			},
 		});
-		this.registerObsidianProtocolHandler("yaos", (params) => {
+		this.registerObsidianProtocolHandler("kaos", (params) => {
 			void this.setupLinkController?.handleSetupLink(params);
 		});
 
@@ -449,6 +449,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					awaitingFirstProviderSyncAfterStartup: this.awaitingFirstProviderSyncAfterStartup,
 					lastReconciledGeneration: this.reconciliationController.getState().lastReconciledGeneration,
 					untrackedFileCount: this.reconciliationController.untrackedFileCount,
+					unresolvedStructuralChangeCount: this.reconciliationController.getState().unresolvedStructuralChangeCount,
+					unresolvedStructuralChangeSample: this.reconciliationController.getState().unresolvedStructuralChangeSample,
 					openFileCount: this.editorWorkspace?.openFileCount ?? 0,
 				}),
 				collectOpenFileTraceState: () => this.collectOpenFileTraceState(),
@@ -521,10 +523,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		if (!this.settings.token) {
 			this.log("Token not configured — sync disabled");
 			const message = this.serverAuthMode === "env"
-				? "YAOS: configure the server token in settings to enable sync."
+				? "KAOS: configure the server token in settings to enable sync."
 				: this.serverAuthMode === "claim" || this.serverAuthMode === "unclaimed"
-						? "YAOS: claim the server in a browser, then use the YAOS setup link to fill in the token."
-						: "YAOS: configure a token in settings, or claim the server in a browser first.";
+						? "KAOS: claim the server in a browser, then use the KAOS setup link to fill in the token."
+						: "KAOS: configure a token in settings, or claim the server in a browser first.";
 			new Notice(message, 10000);
 			finishOnload("missing-token");
 			return;
@@ -881,7 +883,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			const schemaError = this.vaultSync.checkSchemaVersion();
 			if (schemaError) {
 				console.error(`[yaos] ${schemaError}`);
-				new Notice(`YAOS: ${schemaError}`);
+				new Notice(`KAOS: ${schemaError}`);
 				this.updateStatusBar("error");
 				return;
 			}
@@ -946,7 +948,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			}
 		} catch (err) {
 			console.error("[yaos] Failed to initialize sync:", err);
-			new Notice(`YAOS: failed to initialize — ${formatUnknown(err)}`);
+			new Notice(`KAOS: failed to initialize — ${formatUnknown(err)}`);
 			this.updateStatusBar("error");
 		}
 	}
@@ -1013,11 +1015,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				if (this.isMarkdownPathSyncable(file.path)) {
 					const opId = this.newOpId();
 					// Writer attribution for the disk modify event.
-					// suppressWindowActive: did YAOS issue a write whose
+					// suppressWindowActive: did KAOS issue a write whose
 					// suppression entry is still live at this moment?
 					// lastDiskWriteOkAtMs: monotonic ms timestamp of our
 					// last successful flushWrite for this path (null if
-					// YAOS has never written it this session).
+					// KAOS has never written it this session).
 					// writerGuess: a coarse classification combining both.
 					// "yaos-write" is high-confidence; "external" is
 					// "no suppression active and our last write was either
@@ -1037,7 +1039,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					} else if (dtSinceWrite !== null && dtSinceWrite < 500) {
 						// Suppression entry may have expired between vault.modify
 						// dispatch and our handler. If our last write was very
-						// recent, attribute the modify to YAOS conservatively.
+						// recent, attribute the modify to KAOS conservatively.
 						writerGuess = "yaos-write";
 					} else {
 						writerGuess = "external";
@@ -1364,7 +1366,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				this.log("Nuclear reset: reinitializing (will re-seed from disk)");
 				await this.initSync();
 				new Notice(
-					`YAOS: nuclear reset complete. ` +
+					`KAOS: nuclear reset complete. ` +
 					`Re-seeded ${this.vaultSync?.getActiveMarkdownPaths().length ?? 0} files from disk.`,
 				);
 			},
@@ -1524,7 +1526,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			(this.diskMirror?.getDebugSnapshot().preservedUnresolved.totalCount ?? 0);
 		const blobAttention =
 			(this.getBlobSync()?.getDebugSnapshot().preservedUnresolved.totalCount ?? 0);
-		const attentionCount = diskAttention + blobAttention;
+		const structuralAttention =
+			this.reconciliationController.getState().unresolvedStructuralChangeCount;
+		const attentionCount = diskAttention + blobAttention + structuralAttention;
 		const vaultSync = this.vaultSync;
 		const serverReceipt = vaultSync ? {
 			serverAppliedLocalState: vaultSync.serverAppliedLocalState,
@@ -1543,15 +1547,26 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private buildFilesNeedingAttentionText(): string {
 		const entries = this.collectPreservedUnresolvedEntries()
 			.sort((a, b) => b.lastSeenAt - a.lastSeenAt);
-		if (entries.length === 0) return "No files currently need attention.";
-		return entries.map((entry) => [
+		const structural = this.reconciliationController.getState().unresolvedStructuralChangeSample;
+		if (entries.length === 0 && structural.length === 0) return "No files currently need attention.";
+		const preservedText = entries.map((entry) => [
 			entry.path,
 			`  kind: ${entry.kind}`,
 			`  reason: ${entry.reason}`,
 			`  first seen: ${new Date(entry.firstSeenAt).toLocaleString()}`,
 			`  last seen: ${new Date(entry.lastSeenAt).toLocaleString()}`,
 			"  suggested action: inspect the local file and conflict artifacts, then edit/save to keep local content or delete it to accept the remote delete.",
-		].join("\n")).join("\n\n");
+		].join("\n"));
+		const structuralText = structural.map((entry, idx) => [
+			`Structural change ${idx + 1}`,
+			`  kind: markdown-structural-change`,
+			`  reason: ${entry.reason}`,
+			`  old paths: ${entry.oldPaths.join(", ") || "(none)"}`,
+			`  new paths: ${entry.newPaths.join(", ") || "(none)"}`,
+			`  content hash: ${entry.contentHashPrefix}`,
+			"  suggested action: inspect the old/new paths, then manually rename or edit/save the intended file.",
+		].join("\n"));
+		return [...preservedText, ...structuralText].join("\n\n");
 	}
 
 	private setupTraceRuntime(): void {
@@ -1625,6 +1640,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				reconcilePending: this.reconciliationController.getState().reconcilePending,
 				awaitingFirstProviderSyncAfterStartup: this.awaitingFirstProviderSyncAfterStartup,
 				lastReconciledGeneration: this.reconciliationController.getState().lastReconciledGeneration,
+				unresolvedStructuralChangeCount: this.reconciliationController.getState().unresolvedStructuralChangeCount,
+				unresolvedStructuralChangeSample: this.reconciliationController.getState().unresolvedStructuralChangeSample,
 				openFileCount: this.editorWorkspace?.openFileCount ?? 0,
 			},
 			sync: this.vaultSync?.getDebugSnapshot() ?? null,
@@ -1868,7 +1885,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			token,
 			vaultId,
 		});
-		return `obsidian://yaos?${params.toString()}`;
+		return `obsidian://kaos?${params.toString()}`;
 	}
 
 	buildMobileSetupUrl(): string | null {
@@ -1890,7 +1907,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		const vaultId = this.settings.vaultId?.trim();
 		if (!host || !token || !vaultId) return null;
 		return [
-			"YAOS Recovery Kit",
+			"KAOS Recovery Kit",
 			`Created: ${new Date().toISOString()}`,
 			"",
 			`Host: ${host}`,
@@ -1930,7 +1947,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			updateRepoUrl: null,
 			updateActionUrl: null,
 			updateBootstrapUrl: null,
-			updateActionLabel: "YAOS settings",
+			updateActionLabel: "KAOS settings",
 			legacyServerDetected: false,
 			pluginCompatibilityWarning: null,
 		};
@@ -1969,8 +1986,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					? ` (client=${details.clientSchemaVersion ?? "unknown"}, room=${details.roomSchemaVersion ?? "unknown"})`
 					: "";
 			new Notice(
-				`YAOS: this vault was upgraded by a newer plugin schema${detailText}. ` +
-				"Update YAOS on this device to continue syncing.",
+				`KAOS: this vault was upgraded by a newer plugin schema${detailText}. ` +
+				"Update KAOS on this device to continue syncing.",
 				12000,
 			);
 			return;
@@ -2118,7 +2135,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		// In this product build, no mutation API is available — log explicitly
 		// so developers know what happened instead of silently finding no API.
 		this.log("qaDebugMode enabled, but window.__YAOS_DEBUG__ is not mounted by this build. Load the Puppeteer harness from qa/harness/ to get the QA debug API.");
-		new Notice("YAOS: qaDebugMode active — QA debug API not available in this build. See qa/harness/.", 8000);
+		new Notice("KAOS: qaDebugMode active — QA debug API not available in this build. See qa/harness/.", 8000);
 	}
 
 	private async exportFlightTraceForApi(privacy: "safe" | "full"): Promise<string | null> {
@@ -2180,8 +2197,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		void this.attachmentOrchestrator?.stop("idb-degraded");
 
 		const notice = kind === "quota_exceeded"
-			? "YAOS: Device storage is full. Sync durability is degraded and attachment transfers are paused. Free up storage, then restart Obsidian."
-			: "YAOS: IndexedDB persistence failed. Sync durability is degraded and attachment transfers are paused.";
+			? "KAOS: Device storage is full. Sync durability is degraded and attachment transfers are paused. Free up storage, then restart Obsidian."
+			: "KAOS: IndexedDB persistence failed. Sync durability is degraded and attachment transfers are paused.";
 		new Notice(notice, 12000);
 	}
 }

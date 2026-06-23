@@ -1,12 +1,12 @@
-# YAOS
+# KAOS
 
 **A zero-terminal, real-time sync engine for Obsidian, powered by your own Cloudflare Worker.**
 
 Your notes sync live across devices, with CRDT merge semantics instead of conflicted-copy workflows, delayed file sync, or database-heavy hosted services.
 
-<img src="https://github.com/user-attachments/assets/ee937050-8a05-4d56-9c5f-3ae5003496fc" alt="YAOS syncing a note across desktop and mobile in real time" width="720" />
+<img src="https://github.com/user-attachments/assets/ee937050-8a05-4d56-9c5f-3ae5003496fc" alt="KAOS syncing a note across desktop and mobile in real time" width="720" />
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/kavinsood/yaos/tree/main/server)
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/adtstack/kaos/tree/main/server)
 
 [![License: 0-BSD](https://img.shields.io/badge/license-0--BSD-green)](LICENSE)
 
@@ -14,7 +14,7 @@ No terminal, no `.env` files, no database setup required.
 
 ## How it compares
 
-YAOS chooses live Markdown CRDT sync on infrastructure you deploy in your Cloudflare account. That gives fast cross-device editing, with explicit limits around durability receipts, attachments, empty folders, and non-Markdown plugin files.
+KAOS chooses live Markdown CRDT sync on infrastructure you deploy in your Cloudflare account. That gives fast cross-device editing, with explicit limits around durability receipts, attachments, empty folders, and non-Markdown plugin files.
 
 | | Conflicts | Real-time | Deployment | No terminal | Free |
 |---|:---:|:---:|:---:|:---:|:---:|
@@ -22,15 +22,15 @@ YAOS chooses live Markdown CRDT sync on infrastructure you deploy in your Cloudf
 | **Obsidian Sync** | Rare | Delayed | No | Yes | $96/yr |
 | **Git / LiveSync** | Manual | Varies | Self-hosted / self-deployed | No | Yes |
 | **Relay / Screengarden** | No | Yes | No | Yes | Freemium |
-| **YAOS** | **CRDT merge** | **Yes** | **Self-deployed Cloudflare** | **Yes** | **$0** |
+| **KAOS** | **CRDT merge** | **Yes** | **Self-deployed Cloudflare** | **Yes** | **$0** |
 
-YAOS uses [Yjs CRDTs](https://yjs.dev) to keep one live vault state moving across devices instead of asking them to take polite turns uploading files and hoping nothing collides.
+KAOS uses [Yjs CRDTs](https://yjs.dev) to keep one live vault state moving across devices instead of asking them to take polite turns uploading files and hoping nothing collides.
 
-If you want the official, fully managed experience, pay for Obsidian Sync and support the team. If you want a fast, self-deployed, local-first alternative on your own Cloudflare account, this is YAOS.
+If you want the official, fully managed experience, pay for Obsidian Sync and support the team. If you want a fast, self-deployed, local-first alternative on your own Cloudflare account, this is KAOS.
 
 ## Get started
 
-YAOS has two parts: an Obsidian plugin and a small Cloudflare server you deploy to your own account. The Worker setup page walks you through the remaining steps, so you don't need to memorize this.
+KAOS has two parts: an Obsidian plugin and a small Cloudflare server you deploy to your own account. The Worker setup page walks you through the remaining steps, so you don't need to memorize this.
 
 <a href="https://youtu.be/xeS126_XK9Q">
   <img src="https://img.youtube.com/vi/xeS126_XK9Q/maxresdefault.jpg" width="480" alt="Watch the setup walkthrough" />
@@ -43,10 +43,10 @@ Click **Deploy to Cloudflare** above. Cloudflare creates a Worker in your accoun
 Open the Worker URL. Click **Claim** to lock the server to you and generate your setup token.
 
 **3. Install the plugin**
-Install YAOS from the Obsidian Marketplace.
+Install KAOS from the Obsidian Marketplace.
 
 **4. Connect your vault**
-From the claim page, open the setup link or scan the QR code. YAOS fills in the connection details automatically.
+From the claim page, open the setup link or scan the QR code. KAOS fills in the connection details automatically.
 
 That's it. Your vault is syncing.
 
@@ -62,25 +62,25 @@ R2 also enables daily automatic snapshots and on-demand point-in-time backups. Y
 
 ## Updating your server
 
-YAOS is designed to be zero-terminal, but because you own your infrastructure, you control when updates apply.
+KAOS is designed to be zero-terminal, but because you own your infrastructure, you control when updates apply.
 
 A one-time setup installs a GitHub Actions workflow in your deployment repo. After that, updates are a single click.
 
-1. **One-time**: click **Initialize updater** in YAOS settings → **Advanced**. GitHub opens with a pre-filled workflow file. Commit it.
-2. **Update**: YAOS notifies you when a new version ships. Click **Open update action** → **Run workflow** with `update`.
+1. **One-time**: click **Initialize updater** in KAOS settings → **Advanced**. GitHub opens with a pre-filled workflow file. Commit it.
+2. **Update**: KAOS notifies you when a new version ships. Click **Open update action** → **Run workflow** with `update`.
 3. **Rollback**: same workflow, change action to `revert`.
 
-Some releases require manual migration steps. The updater will also stop if a server artifact does not overlap the currently deployed schema range. In both cases it aborts with a clear warning — read the release notes before retrying. Re-clicking Deploy to Cloudflare is not a safe update path for a stateful server; YAOS uses a Git-driven workflow so the same Worker identity, Durable Object bindings, and history are preserved.
+Some releases require manual migration steps. The updater will also stop if a server artifact does not overlap the currently deployed schema range. In both cases it aborts with a clear warning — read the release notes before retrying. Re-clicking Deploy to Cloudflare is not a safe update path for a stateful server; KAOS uses a Git-driven workflow so the same Worker identity, Durable Object bindings, and history are preserved.
 
 ## Works with scripts and AI agents
 
-Because Obsidian vaults are just local Markdown files, YAOS plays unusually well with scripts, CLI tools, and AI agents that edit files directly on disk. The CRDT state stays aligned with the filesystem, so changes from any source — git, shell scripts, agents writing to disk — propagate cleanly across devices instead of falling back to conflicted-copy workflows.
+Because Obsidian vaults are just local Markdown files, KAOS plays unusually well with scripts, CLI tools, and AI agents that edit files directly on disk. The CRDT state stays aligned with the filesystem, so changes from any source — git, shell scripts, agents writing to disk — propagate cleanly across devices instead of falling back to conflicted-copy workflows.
 
-If you're building agentic workflows on top of Obsidian vaults, YAOS gives you the sync infrastructure so you don't have to wire up your own.
+If you're building agentic workflows on top of Obsidian vaults, KAOS gives you the sync infrastructure so you don't have to wire up your own.
 
 ## How it works
 
-YAOS keeps your vault as normal local files, while also maintaining a shared real-time state for sync.
+KAOS keeps your vault as normal local files, while also maintaining a shared real-time state for sync.
 
 1. Each markdown file gets a stable ID and a `Y.Text` CRDT for its content.
 2. All per-file CRDTs live inside one shared vault-level `Y.Doc` — this keeps cross-file operations transactional. A folder rename is atomic across all files; the vault structure can't tear.
@@ -90,7 +90,7 @@ YAOS keeps your vault as normal local files, while also maintaining a shared rea
 6. Attachments sync separately via content-addressed R2 storage instead of being forced through the text CRDT.
 7. Daily and on-demand snapshots exist as a safety net.
 
-In practice, that means your vault still exists locally as normal files, Obsidian keeps behaving like Obsidian, and YAOS keeps the disk mirror and the shared CRDT state aligned instead of asking devices to take polite turns uploading files later.
+In practice, that means your vault still exists locally as normal files, Obsidian keeps behaving like Obsidian, and KAOS keeps the disk mirror and the shared CRDT state aligned instead of asking devices to take polite turns uploading files later.
 
 ## Engineering
 
@@ -105,22 +105,22 @@ Contributors looking for current project truth should start with:
 - **[Filesystem bridge](./engineering/filesystem-bridge.md)** — How noisy Obsidian file events are converted into safe CRDT updates with dirty-set draining and content-acknowledged suppression.
 - **[Checkpoint + journal persistence](./engineering/checkpoint-journal.md)** — The storage-engine rewrite that removed full-state rewrites and introduced state-vector-anchored delta journaling.
 - **[Attachment sync](./engineering/attachment-sync.md)** — Native Worker proxy uploads, capability negotiation, and bounded fan-out under Cloudflare connection limits.
-- **[Zero-config auth](./engineering/zero-config-auth.md)** — Browser claim UX, `obsidian://yaos` deep-link pairing, and env-token override behavior.
+- **[Zero-config auth](./engineering/zero-config-auth.md)** — Browser claim UX, `obsidian://kaos` deep-link pairing, and env-token override behavior.
 - **[Zero-ops update pipeline](./engineering/zero-ops-update-pipeline.md)** — Why detached deploy repos need bootstrap injection, reusable workflows, and migration safety gates.
 - **[Version and release management](./engineering/version-release-management.md)** — How plugin, server, schema, and GitHub release versions are registered and shipped.
 - **[Warts and limits](./engineering/warts-and-limits.md)** — Canonical limits, safety invariants, and the pragmatic compromises currently in production.
 
 ## Limits
 
-YAOS is optimized for personal or small-team note vaults, not for arbitrarily huge text archives. The monolithic `Y.Doc` design gives excellent real-time ergonomics and simpler cross-file behavior, but it creates a practical ceiling for very large vaults.
+KAOS is optimized for personal or small-team note vaults, not for arbitrarily huge text archives. The monolithic `Y.Doc` design gives excellent real-time ergonomics and simpler cross-file behavior, but it creates a practical ceiling for very large vaults.
 
-If your vault is normal notes, drafts, research, and attachments, YAOS is a great fit. If you want to sync giant text dumps or archival datasets, a simpler file-sync tool is a better choice.
+If your vault is normal notes, drafts, research, and attachments, KAOS is a great fit. If you want to sync giant text dumps or archival datasets, a simpler file-sync tool is a better choice.
 
 Rule of thumb: around 50 MB of raw text (not counting attachments like images and PDFs) is a comfortable target.
 
 ## Configuration
 
-After enabling, go to **Settings → YAOS**.
+After enabling, go to **Settings → KAOS**.
 
 | Setting | Description |
 |---------|-------------|
@@ -133,7 +133,7 @@ After enabling, go to **Settings → YAOS**.
 | **Max attachment size** | Skip attachments larger than this (default and current server cap: 10 MB) |
 | **Parallel transfers** | Number of simultaneous attachment upload/download slots |
 | **Show remote cursors** | Display cursor positions and selections from other devices |
-| **Edits from other apps** | Control how YAOS handles changes from git, scripts, or other editors |
+| **Edits from other apps** | Control how KAOS handles changes from git, scripts, or other editors |
 | **Debug logging** | Verbose console output for troubleshooting |
 
 `Manual connection` and `Advanced` sections are available in the settings UI when you need to inspect or override connection details.
@@ -157,7 +157,7 @@ Access via command palette (Ctrl/Cmd+P):
 
 **"Unauthorized" errors**: Token mismatch between plugin and server. Check both match exactly.
 
-**"R2 not configured"**: The server doesn't have a `YAOS_BUCKET` binding yet. See the [R2 setup video](https://youtu.be/Z7xCMEYfdFM).
+**"R2 not configured"**: The server doesn't have a `KAOS_BUCKET` binding yet. See the [R2 setup video](https://youtu.be/Z7xCMEYfdFM).
 
 **Cloudflare deploy/dashboard issues**: If build queue or dashboard behavior is flaky, see [server troubleshooting notes](./server/README.md#transient-cloudflare-deployment-issues), including the `wrangler.toml` R2-binding fallback.
 
@@ -173,7 +173,7 @@ Access via command palette (Ctrl/Cmd+P):
 
 ## Current limits
 
-YAOS currently treats Markdown text as the first-class live sync surface and syncs
+KAOS currently treats Markdown text as the first-class live sync surface and syncs
 attachments separately through R2 when configured. It does not try to act as a
 general `.obsidian` settings/plugin-state sync engine. Empty folders are not synced
 in v0 because the CRDT tracks files and blob references, not folder-only objects.

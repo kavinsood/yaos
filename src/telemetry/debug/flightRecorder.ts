@@ -520,7 +520,7 @@ export class FlightRecorder {
 	}
 
 	private logsRoot(): string {
-		return ensurePrefixDir(`${this.app.vault.configDir}/plugins/yaos/flight-logs`);
+		return ensurePrefixDir(`${this.app.vault.configDir}/plugins/kaos/flight-logs`);
 	}
 
 	/**
@@ -642,7 +642,7 @@ export class FlightRecorder {
 
 	/**
 	 * Delete all files under the flight-logs root.
-	 * Called by "YAOS: Clear flight logs" command.
+	 * Called by "KAOS: Clear flight logs" command.
 	 */
 	async clearAllLogs(): Promise<void> {
 		const root = this.logsRoot();

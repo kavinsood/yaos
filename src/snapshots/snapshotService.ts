@@ -216,7 +216,7 @@ export class SnapshotService {
 					if (!liveVaultSync) return;
 
 					const backupDir = normalizePath(
-						`${this.deps.app.vault.configDir}/plugins/yaos/restore-backups/${new Date().toISOString().replace(/[:.]/g, "-")}`,
+						`${this.deps.app.vault.configDir}/plugins/kaos/restore-backups/${new Date().toISOString().replace(/[:.]/g, "-")}`,
 					);
 					let backedUp = 0;
 					for (const path of markdownPaths) {

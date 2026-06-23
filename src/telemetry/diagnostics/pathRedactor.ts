@@ -18,7 +18,7 @@
 /**
  * Extensions that the redactor recognises as path-shaped string suffixes.
  * Order does not matter; the regex below is built from this list. New
- * blob/text formats added to YAOS routing should be added here so they
+ * blob/text formats added to KAOS routing should be added here so they
  * are caught by the in-text scanner.
  */
 const PATH_EXTENSIONS = [

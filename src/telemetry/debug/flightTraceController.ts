@@ -453,7 +453,7 @@ export class FlightTraceController {
  * or vaultId required. The logs directory is deterministic.
  */
 export async function clearFlightLogs(app: App): Promise<void> {
-	const root = `${app.vault.configDir}/plugins/yaos/flight-logs`;
+	const root = `${app.vault.configDir}/plugins/kaos/flight-logs`;
 	try {
 		const exists = await app.vault.adapter.exists(root);
 		if (!exists) return;

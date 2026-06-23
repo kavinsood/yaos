@@ -7,7 +7,7 @@
  *   - original path missing S11B-LOCAL → fail
  *   - both markers present → pass
  *
- * YAOS conflict policy for s11b (both-changed/winner=disk):
+ * KAOS conflict policy for s11b (both-changed/winner=disk):
  *   - Disk wins main file → original path has S11B-LOCAL (B's local edit)
  *   - CRDT edit goes to artifact → artifact has S11B-REMOTE (A's remote edit)
  */

@@ -4,8 +4,8 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 const rootDir = resolve(".");
-const artifactPath = resolve(rootDir, "dist/release-assets/yaos-server.zip");
-const tempDir = mkdtempSync(join(tmpdir(), "yaos-server-update-test-"));
+const artifactPath = resolve(rootDir, "dist/release-assets/kaos-server.zip");
+const tempDir = mkdtempSync(join(tmpdir(), "kaos-server-update-test-"));
 const repoDir = join(tempDir, "repo");
 
 function run(command, args, options = {}) {
@@ -52,7 +52,7 @@ function buildBadSchemaArtifact(baselineVersion, schemaVersion) {
 		.replace(/SERVER_MAX_SCHEMA_VERSION\s*=\s*\d+/, `SERVER_MAX_SCHEMA_VERSION = ${schemaVersion}`);
 	writeFileSync(join(badReleaseDir, "src/version.ts"), badVersion);
 	writeFileSync(
-		join(badReleaseDir, "yaos-server-manifest.json"),
+		join(badReleaseDir, "kaos-server-manifest.json"),
 		`${JSON.stringify({
 			serverVersion: "99.0.0",
 			pluginVersion: "99.0.0",
@@ -74,8 +74,8 @@ try {
 	cpSync(resolve(rootDir, "server"), repoDir, { recursive: true });
 
 	run("git", ["init", "-q"]);
-	run("git", ["config", "user.name", "YAOS Local Test"]);
-	run("git", ["config", "user.email", "local-test@yaos"]);
+	run("git", ["config", "user.name", "KAOS Local Test"]);
+	run("git", ["config", "user.email", "local-test@kaos"]);
 	run("git", ["add", "-A"]);
 	run("git", ["commit", "-qm", "baseline"]);
 
@@ -108,7 +108,7 @@ try {
 	run("node", ["scripts/update-from-release.mjs"], {
 		env: {
 			...process.env,
-			YAOS_RELEASE_FILE: artifactPath,
+			KAOS_RELEASE_FILE: artifactPath,
 		},
 	});
 
@@ -123,7 +123,7 @@ try {
 	}
 
 	run("git", ["add", "-A"]);
-	run("git", ["commit", "-qm", `yaos(server): update to ${currentServerVersion}`]);
+	run("git", ["commit", "-qm", `kaos(server): update to ${currentServerVersion}`]);
 	run("node", ["scripts/revert-last-update.mjs"]);
 
 	const revertedVersion = read("src/version.ts");
@@ -140,7 +140,7 @@ try {
 	const badUpdateOutput = runExpectFailure("node", ["scripts/update-from-release.mjs"], {
 		env: {
 			...process.env,
-			YAOS_RELEASE_FILE: badArtifactPath,
+			KAOS_RELEASE_FILE: badArtifactPath,
 		},
 	});
 	if (!badUpdateOutput.includes("schema compatibility gap")) {
@@ -151,7 +151,7 @@ try {
 		throw new Error("Schema gap test failed: rejected update still modified src/version.ts");
 	}
 
-	console.log("Local YAOS server update/revert smoke test passed.");
+	console.log("Local KAOS server update/revert smoke test passed.");
 } finally {
 	rmSync(tempDir, { recursive: true, force: true });
 }

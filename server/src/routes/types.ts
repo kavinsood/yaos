@@ -3,10 +3,10 @@ import type { StoredServerConfig } from "../config";
 
 export interface Env {
 	SYNC_TOKEN?: string;
-	YAOS_CANONICAL_REPO?: string;
-	YAOS_SYNC: DurableObjectNamespace<VaultSyncServer>;
-	YAOS_CONFIG: DurableObjectNamespace;
-	YAOS_BUCKET?: R2Bucket;
+	KAOS_CANONICAL_REPO?: string;
+	KAOS_SYNC: DurableObjectNamespace<VaultSyncServer>;
+	KAOS_CONFIG: DurableObjectNamespace;
+	KAOS_BUCKET?: R2Bucket;
 	/**
 	 * Set to any non-empty string to reject WebSocket connections that use
 	 * the legacy ?token= query parameter instead of a short-lived ticket.
@@ -15,7 +15,7 @@ export interface Env {
 	 * auth attempt even when not set, so you can monitor adoption before
 	 * disabling.
 	 */
-	YAOS_DISABLE_LEGACY_WS_TOKEN?: string;
+	KAOS_DISABLE_LEGACY_WS_TOKEN?: string;
 	/**
 	 * Override the ticket TTL (milliseconds) for testing.
 	 * When set, the ticket endpoint issues tickets with this TTL instead of
@@ -23,7 +23,7 @@ export interface Env {
 	 * Used by the local wrangler dev integration harness to make the proactive
 	 * refresh timer fire in seconds rather than minutes.
 	 */
-	YAOS_TICKET_TTL_MS?: string;
+	KAOS_TICKET_TTL_MS?: string;
 }
 
 export type JsonResponse = (body: unknown, status?: number) => Response;

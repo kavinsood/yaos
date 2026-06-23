@@ -76,7 +76,7 @@ async function main() {
 		(async () => {
 			const deadline = Date.now() + 30000;
 			while (Date.now() < deadline) {
-				const yaos = app.plugins.plugins.yaos;
+				const yaos = app.plugins.plugins.kaos;
 				if (!yaos) return false;
 				const text = yaos.vaultSync?.getTextForPath?.(${JSON.stringify(SCRATCH)});
 				if (text && text.toString().length > 0) return true;
@@ -91,7 +91,7 @@ async function main() {
 	// Check B's baseline hash BEFORE we disable — this is the key diagnostic
 	const baselineBeforeDisable = await b.evalRaw<string | null>(`
 		(function() {
-			const plugin = app.plugins.plugins.yaos;
+			const plugin = app.plugins.plugins.kaos;
 			if (!plugin) return "NO_PLUGIN";
 			const idx = plugin.getDiskIndex?.() ?? plugin._diskIndex ?? null;
 			if (!idx) return "NO_INDEX";
@@ -117,9 +117,9 @@ async function main() {
 	// -----------------------------------------------------------------------
 
 	log("Phase 2: Disabling YAOS on B...");
-	await b.evalRaw(`app.plugins.disablePlugin("yaos")`);
+	await b.evalRaw(`app.plugins.disablePlugin("kaos")`);
 	await new Promise((r) => setTimeout(r, 2000));
-	const bDisabled = await b.evalRaw<boolean>(`!app.plugins.plugins.yaos`);
+	const bDisabled = await b.evalRaw<boolean>(`!app.plugins.plugins.kaos`);
 	log(`B YAOS disabled: ${bDisabled}`);
 
 	// -----------------------------------------------------------------------
@@ -168,9 +168,9 @@ async function main() {
 	// -----------------------------------------------------------------------
 
 	log("Phase 5: Re-enabling YAOS on B...");
-	await b.evalRaw(`app.plugins.enablePlugin("yaos")`);
+	await b.evalRaw(`app.plugins.enablePlugin("kaos")`);
 	await new Promise((r) => setTimeout(r, 5000));
-	const bReady = await b.evalRaw<boolean>(`!!app.plugins.plugins.yaos`);
+	const bReady = await b.evalRaw<boolean>(`!!app.plugins.plugins.kaos`);
 	log(`B YAOS re-enabled: ${bReady}`);
 
 	// Wait for reconciliation to complete
@@ -180,7 +180,7 @@ async function main() {
 	// Read the reconcile.file.decision flight event to see exactly which path ran
 	const recentDecision = await b.evalRaw<{kind: string; data: Record<string, unknown>} | null>(`
 		(function() {
-			const plugin = app.plugins.plugins.yaos;
+			const plugin = app.plugins.plugins.kaos;
 			if (!plugin) return null;
 			const recorder = plugin.flightTrace?.currentRecorder;
 			if (!recorder) return null;
@@ -200,7 +200,7 @@ async function main() {
 	// Also read the FULL disk index for our path
 	const diskIndexEntry = await b.evalRaw<unknown>(`
 		(function() {
-			const plugin = app.plugins.plugins.yaos;
+			const plugin = app.plugins.plugins.kaos;
 			if (!plugin) return "NO_PLUGIN";
 			// Try multiple access paths
 			const idx1 = plugin.getDiskIndex?.();
@@ -231,7 +231,7 @@ async function main() {
 	// What decision was made?
 	const baselineAfter = await b.evalRaw<string | null>(`
 		(function() {
-			const plugin = app.plugins.plugins.yaos;
+			const plugin = app.plugins.plugins.kaos;
 			if (!plugin) return "NO_PLUGIN";
 			const idx = plugin.getDiskIndex?.() ?? plugin._diskIndex ?? null;
 			if (!idx) return "NO_INDEX";

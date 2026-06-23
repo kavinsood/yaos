@@ -1,7 +1,7 @@
 # RFC: Replace Opaque CRDT Snapshots with File-Level Recovery Manifests and Separate Bootstrap Checkpoints
 
 **Status:** In Progress
-**Target repository:** YAOS / Obsidian CRDT sync
+**Target repository:** KAOS / Obsidian CRDT sync
 **Date:** 2026-05-27
 **Owner:** TBD
 **Reviewers:** TBD
@@ -21,7 +21,7 @@
 
 ## 1. Summary
 
-The current YAOS snapshot system stores one full compressed Yjs document update per snapshot. Automatic snapshots are deduplicated only by UTC calendar day, manual snapshots bypass deduplication entirely, listing snapshots scans all snapshot keys, and there is no retention or garbage collection policy. This is not a sustainable backup architecture. It conflates three separate concerns:
+The current KAOS snapshot system stores one full compressed Yjs document update per snapshot. Automatic snapshots are deduplicated only by UTC calendar day, manual snapshots bypass deduplication entirely, listing snapshots scans all snapshot keys, and there is no retention or garbage collection policy. This is not a sustainable backup architecture. It conflates three separate concerns:
 
 1. **Live sync state:** the current CRDT document and update journal used for real-time convergence.
 2. **Bootstrap checkpoints:** compact CRDT state used to initialize a new device quickly.
@@ -164,7 +164,7 @@ Required capabilities:
 * Show side-by-side current vs historical content.
 * Allow manual copy/paste or selective file restore.
 
-### 6.4 Bad YAOS Migration / Client Bug
+### 6.4 Bad KAOS Migration / Client Bug
 
 A migration, path model bug, tombstone bug, or restore bug damages live state.
 
@@ -222,7 +222,7 @@ Required capabilities:
 
 ## 8. Proposed Architecture
 
-YAOS should maintain three independent storage tracks.
+KAOS should maintain three independent storage tracks.
 
 ### 8.1 Track A: Live Sync Persistence
 
@@ -847,7 +847,7 @@ Default behavior should be conservative: skip changed-during-review files unless
 
 Keep the current local backup behavior, but make it explicit:
 
-* Before replacing any disk-backed Markdown file, write current content to `.obsidian/plugins/yaos/restore-backups/{timestamp}/{path}`.
+* Before replacing any disk-backed Markdown file, write current content to `.obsidian/plugins/kaos/restore-backups/{timestamp}/{path}`.
 * Do not let backup failure silently proceed for destructive overwrites unless the file is missing and this is an undelete.
 
 ### 17.4 Restore Origin
@@ -1243,7 +1243,7 @@ The old design has fundamental product failures. The proposed CAS design has sca
 
 ## 28. General Audience Release Strategy
 
-The recovery redesign must not ship to the general YAOS audience as one giant replacement. It should ship in controlled stages with explicit kill switches, compatibility gates, and measurable acceptance criteria.
+The recovery redesign must not ship to the general KAOS audience as one giant replacement. It should ship in controlled stages with explicit kill switches, compatibility gates, and measurable acceptance criteria.
 
 ### 28.1 Release Principle
 

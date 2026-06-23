@@ -163,7 +163,7 @@ export async function handleSyncSocketRoute(
 	const token = getSocketAuthToken(req);
 	const ticket = url.searchParams.get("ticket");
 	const clientSchema = parseClientSchemaVersion(url);
-	const disableLegacyToken = !!env.YAOS_DISABLE_LEGACY_WS_TOKEN;
+	const disableLegacyToken = !!env.KAOS_DISABLE_LEGACY_WS_TOKEN;
 
 	const authResult = await authenticateSocketRequest(
 		ticket, token, authState, vaultId, disableLegacyToken,
@@ -175,16 +175,16 @@ export async function handleSyncSocketRoute(
 	}
 
 	// Warn on every legacy-token connection so operators can monitor adoption
-	// before enabling YAOS_DISABLE_LEGACY_WS_TOKEN.
+	// before enabling KAOS_DISABLE_LEGACY_WS_TOKEN.
 	if (authResult.method === "legacy-token") {
 		console.warn(
 			`[yaos-sync:worker] legacy ?token= WebSocket auth for vault ${vaultId.slice(0, 8)} — ` +
-			`upgrade client to use short-lived tickets, or set YAOS_DISABLE_LEGACY_WS_TOKEN to enforce`,
+			`upgrade client to use short-lived tickets, or set KAOS_DISABLE_LEGACY_WS_TOKEN to enforce`,
 		);
 	}
 
 	if (!clientSchema) {
-		// WebSocket admission events must not write to YAOS_SYNC storage
+		// WebSocket admission events must not write to KAOS_SYNC storage
 		// (issue #40 — a schema-mismatch loop would hammer the DO on every
 		// reconnect attempt).  Log only via console for worker-level visibility.
 		console.warn(
@@ -210,7 +210,7 @@ export async function handleSyncSocketRoute(
 		const detail = clientSchema.version < SERVER_MIN_SCHEMA_VERSION
 			? "client_schema_older_than_server"
 			: "client_schema_newer_than_server";
-		// Server schema-range rejection — console only, no YAOS_SYNC write.
+		// Server schema-range rejection — console only, no KAOS_SYNC write.
 		console.warn(
 			`[yaos-sync:worker] ws rejected (update_required): ` +
 			JSON.stringify({
@@ -234,7 +234,7 @@ export async function handleSyncSocketRoute(
 
 	const roomSchemaVersion = await fetchVaultSchemaVersion(env, vaultId);
 	if (roomSchemaVersion !== null && clientSchema.version < roomSchemaVersion) {
-		// Schema-skew rejection — console only, no YAOS_SYNC write (issue #40).
+		// Schema-skew rejection — console only, no KAOS_SYNC write (issue #40).
 		// A retry loop here would otherwise fan out one DO subrequest per attempt.
 		console.warn(
 			`[yaos-sync:worker] ws rejected (update_required): ` +
@@ -254,9 +254,9 @@ export async function handleSyncSocketRoute(
 		}));
 	}
 
-	// Successful connection — console only, no YAOS_SYNC trace write (issue #40).
+	// Successful connection — console only, no KAOS_SYNC trace write (issue #40).
 	// A reconnect storm would otherwise produce:
-	//   YAOS_CONFIG auth + YAOS_SYNC schema check + YAOS_SYNC trace write
+	//   KAOS_CONFIG auth + KAOS_SYNC schema check + KAOS_SYNC trace write
 	// on every connect, burning ~3 subrequests per socket open.
 	console.info(
 		`[yaos-sync:worker] ws connected: ` +
@@ -270,6 +270,6 @@ export async function handleSyncSocketRoute(
 		}),
 	);
 
-	const stub = await getServerByName(env.YAOS_SYNC, vaultId);
+	const stub = await getServerByName(env.KAOS_SYNC, vaultId);
 	return await stub.fetch(req);
 }

@@ -43,7 +43,7 @@ const REMOTE_FROM_A = `REMOTE_FROM_A_${RUN_ID}\n`;
 const LOCAL_ON_B = `LOCAL_ON_B_${RUN_ID}\n`;
 
 const VAULT_B = `${process.env.HOME}/temenos-b`;
-const DATA_JSON_B = `${VAULT_B}/.obsidian/plugins/yaos/data.json`;
+const DATA_JSON_B = `${VAULT_B}/.obsidian/plugins/kaos/data.json`;
 const PORT_A = 9222;
 const PORT_B = 9223;
 const USER_DATA_B = "/tmp/obs-b";
@@ -220,10 +220,10 @@ async function main() {
 	b = await relaunchB();
 
 	// YAOS may need to be re-enabled if it was in a disabled state
-	const bPluginPresent = await b.evalRaw<boolean>(`!!app.plugins.plugins.yaos`).catch(() => false);
+	const bPluginPresent = await b.evalRaw<boolean>(`!!app.plugins.plugins.kaos`).catch(() => false);
 	if (!bPluginPresent) {
 		log("B YAOS plugin not present — re-enabling...");
-		await b.evalRaw(`app.plugins.enablePlugin("yaos")`);
+		await b.evalRaw(`app.plugins.enablePlugin("kaos")`);
 		await waitMs(5000);
 	}
 
@@ -250,7 +250,7 @@ async function main() {
 
 	const decisionEvent = await b.evalRaw<Record<string, unknown> | null>(`
 		(function() {
-			const plugin = app.plugins.plugins.yaos;
+			const plugin = app.plugins.plugins.kaos;
 			if (!plugin) return null;
 			const recorder = plugin.flightTrace?.currentRecorder;
 			if (!recorder) return null;

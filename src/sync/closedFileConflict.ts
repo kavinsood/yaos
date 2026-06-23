@@ -17,14 +17,14 @@ export interface ClosedFileConflictInput {
 	/**
 	 * mtime (Unix ms) of the disk file at reconciliation time.
 	 * Used together with lastDiskIndexPersistedAt to detect "edited while
-	 * YAOS was inactive" in the missing-baseline path.
+	 * KAOS was inactive" in the missing-baseline path.
 	 * Optional — when absent, mtime evidence is not used.
 	 */
 	diskMtime?: number;
 	/**
 	 * Unix ms timestamp of the last successful saveDiskIndex() call.
 	 * Persisted in data.json as _lastDiskIndexPersistedAt.
-	 * Semantics: "last time YAOS durably persisted disk-index baselines."
+	 * Semantics: "last time KAOS durably persisted disk-index baselines."
 	 * This is a GLOBAL heuristic — not per-file. It can produce false negatives
 	 * when an unrelated file triggers a save after the target file was modified
 	 * (see engineering/bug-rca-ledger.md Issue #22-B for the known limits).
@@ -53,12 +53,12 @@ export function decideClosedFileConflict(
 		// No persisted baseline — unknown who changed what.
 		//
 		// Use mtime evidence to break the tie. Heuristic:
-		//   If the disk file's mtime is strictly AFTER the last time YAOS
+		//   If the disk file's mtime is strictly AFTER the last time KAOS
 		//   durably persisted its disk-index state, the file was likely edited
-		//   while YAOS was inactive/killed/suspended. Disk wins the main file;
+		//   while KAOS was inactive/killed/suspended. Disk wins the main file;
 		//   CRDT remote content is preserved as a conflict artifact.
 		//
-		//   This addresses Issue #22-B ("I turned YAOS off, edited my note,
+		//   This addresses Issue #22-B ("I turned KAOS off, edited my note,
 		//   turned it back on, and lost my edits" — the cold-relaunch / process-
 		//   killed variant where no baseline was persisted before death).
 		//

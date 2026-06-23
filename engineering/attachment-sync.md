@@ -4,11 +4,11 @@ Markdown text belongs in the CRDT. Images, PDFs and other binary file-types are 
 
 ### The Native Worker Proxy
 
-Earlier iterations of YAOS used a complex two-phase commit involving S3 presigned URLs, because PartyKit's managed infrastructure obscured the underlying Cloudflare bindings, our server could not natively talk to our R2 storage bucket. We had to treat R2 like a generic external AWS S3 bucket.
+Earlier iterations of KAOS used a complex two-phase commit involving S3 presigned URLs, because PartyKit's managed infrastructure obscured the underlying Cloudflare bindings, our server could not natively talk to our R2 storage bucket. We had to treat R2 like a generic external AWS S3 bucket.
 
 The client would ask the server for permission, the server would cryptographically sign an AWS S3 fetch URL, and the client would talk directly to the bucket.
 
-We deleted that brittle state machine. YAOS now utilizes direct native R2 bindings inside the Cloudflare Worker. The client computes the SHA-256 hash of the file and does a simple authenticated `PUT` directly to the Worker. The Worker then natively proxies the bytes to `env.YAOS_BUCKET`.
+We deleted that brittle state machine. KAOS now utilizes direct native R2 bindings inside the Cloudflare Worker. The client computes the SHA-256 hash of the file and does a simple authenticated `PUT` directly to the Worker. The Worker then natively proxies the bytes to `env.KAOS_BUCKET`.
 
 This native proxy approach drastically simplifies the client logic, eliminates the need for external `aws4fetch` signing libraries, and completely removes the need to parse S3 XML responses.
 
@@ -20,7 +20,7 @@ When checking which blobs already exist in R2 (to achieve content-addressed dedu
 
 This is an anti-pattern for Cloudflare Workers. A single Worker invocation is strictly limited to 6 simultaneous open connections. Native R2 operations—including `head()`, `get()`, `put()`, `delete()`, and `list()`—all count toward that absolute ceiling. Unbounded scatter/gather bursts consume the subrequest budget, create massive connection pressure, and cause the Worker to crash.
 
-To solve this, YAOS uses a strict, concurrency-limited worker pool. Concurrent R2 operations are capped at 4. This intentionally sits below Cloudflare's 6-connection ceiling, ensuring the Worker always maintains headroom for other concurrent tasks and gracefully handles high-volume existence checks without dropping requests.
+To solve this, KAOS uses a strict, concurrency-limited worker pool. Concurrent R2 operations are capped at 4. This intentionally sits below Cloudflare's 6-connection ceiling, ensuring the Worker always maintains headroom for other concurrent tasks and gracefully handles high-volume existence checks without dropping requests.
 
 ### The Block-Level Chunking Trap
 
@@ -30,13 +30,13 @@ Imagine you had a 50 MB PDF, and you open it to read, and you make one highlight
 
 If a user deletes or modifies that PDF, the server must track which of those 1MB chunks are now orphaned and which are still actively shared by other files in the vault. We would have to build a highly-available Reference Counting Garbage Collector. A single race condition in the GC would permanently corrupt users' files by deleting a chunk that is still in use.
 
-Moreover, building this in JS would be really inefficient. Bandwidth is cheap; distributed garbage collection is a nightmare. Instead, YAOS uses standard Last-Writer-Wins full file overwrites.
+Moreover, building this in JS would be really inefficient. Bandwidth is cheap; distributed garbage collection is a nightmare. Instead, KAOS uses standard Last-Writer-Wins full file overwrites.
 
-![Why YAOS avoids block-level chunking](./diagrams/why-yaos-avoids-block-level-chunking.webp)
+![Why KAOS avoids block-level chunking](./diagrams/why-yaos-avoids-block-level-chunking.webp)
 
 ## Blob Sync Queues
 
-Attachment synchronization in YAOS intentionally avoids complex asynchronous scheduling in favor of a simple batch-based queue.
+Attachment synchronization in KAOS intentionally avoids complex asynchronous scheduling in favor of a simple batch-based queue.
 
 If a user uploads a 50MB video and a 50KB image in the same batch, the image file waits for the video to finish before the *next* batch can start.
 

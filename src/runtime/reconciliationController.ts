@@ -107,7 +107,7 @@ interface ReconciliationControllerDeps {
 	refreshStatusBar(): void;
 	/**
 	 * Returns the Unix ms timestamp of the last successful saveDiskIndex() call.
-	 * Used by planClosedFileReconcile to detect disk edits made while YAOS
+	 * Used by planClosedFileReconcile to detect disk edits made while KAOS
 	 * was inactive (missing-baseline tie-breaking). Returns 0 if never saved.
 	 * Naming: getLastDiskIndexPersistedAt — this is the last save, not last
 	 * plugin activity; conflating them creates false certainty.
@@ -554,7 +554,7 @@ export class ReconciliationController {
 			}
 			if (oversizedCount > 0) {
 				this.deps.log(`reconcile: skipped ${oversizedCount} oversized files`);
-				new Notice(`YAOS: skipped ${oversizedCount} files exceeding ${runtimeConfig.maxFileSizeKB} KB size limit.`);
+				new Notice(`KAOS: skipped ${oversizedCount} files exceeding ${runtimeConfig.maxFileSizeKB} KB size limit.`);
 			}
 			if (skippedByIndex > 0) {
 				this.deps.log(`reconcile: ${skippedByIndex} files unchanged (stat match), ${changed.length} changed`);
@@ -636,7 +636,7 @@ export class ReconciliationController {
 				this.deps.log(`Reconcile safety brake: ${safetyBrakeReason}.`);
 				console.error(`[yaos] Reconcile safety brake: ${safetyBrakeReason}.`);
 				new Notice(
-					`YAOS: Reconcile safety brake — ${safetyBrakeReason}. ` +
+					`KAOS: Reconcile safety brake — ${safetyBrakeReason}. ` +
 					`Additive creates will continue. Export diagnostics and inspect logs.`,
 				);
 				this.deps.trace("reconcile", "reconcile-safety-brake-blocked", {
@@ -1111,7 +1111,7 @@ export class ReconciliationController {
 		this.deps.log(`Imported ${imported} previously untracked files`);
 
 		if (imported > 0) {
-			new Notice(`YAOS: imported ${imported} files after server sync.`);
+			new Notice(`KAOS: imported ${imported} files after server sync.`);
 		}
 	}
 
@@ -2478,7 +2478,7 @@ export class ReconciliationController {
 		// Cap base name to 100 chars to prevent filesystem path length issues
 		const cappedBase = base.slice(0, 100);
 		const sourcePart = source ? ` - ${source}` : "";
-		const suffix = ` (YAOS conflict${sourcePart} from ${device} ${stamp})`;
+		const suffix = ` (KAOS conflict${sourcePart} from ${device} ${stamp})`;
 		// Guard total filename length: suffix + ext + base + margin for
 		// counter suffix (" 99") ≈ suffix.length + ext.length + 4.
 		// Most filesystems cap at 255 bytes per component.
@@ -2498,7 +2498,7 @@ export class ReconciliationController {
 					mtime: stat.mtime,
 					size: stat.size,
 					// Advance the baseline hash if settled content is provided.
-					// This covers disk→CRDT imports (external edits while YAOS is running).
+					// This covers disk→CRDT imports (external edits while KAOS is running).
 					contentHash: settledContent !== undefined
 						? await contentBaselineHash(settledContent)
 						: existing?.contentHash,
@@ -2533,7 +2533,7 @@ export class ReconciliationController {
 		const suffix = suppressed > 0
 			? ` (and ${suppressed} other conflict${suppressed > 1 ? "s" : ""} in the last 30s)`
 			: "";
-		new Notice(`YAOS: ${message}${suffix}`, 10000);
+		new Notice(`KAOS: ${message}${suffix}`, 10000);
 	}
 
 	/**
@@ -2557,6 +2557,6 @@ export class ReconciliationController {
 		const suffix = suppressed > 0
 			? ` (and ${suppressed} other quarantine${suppressed > 1 ? "s" : ""} in the last 60s)`
 			: "";
-		new Notice(`YAOS: ${message}${suffix}`, 12000);
+		new Notice(`KAOS: ${message}${suffix}`, 12000);
 	}
 }

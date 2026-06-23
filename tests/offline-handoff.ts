@@ -7,7 +7,7 @@
  *
  * SCOPE — what this test proves:
  *   Y.Doc (A) → delta/checkpoint/journal → ChunkedDocStore → Y.Doc (B)
- *   The YAOS vault schema (pathToId / idToText / meta) survives the round-trip.
+ *   The KAOS vault schema (pathToId / idToText / meta) survives the round-trip.
  *   B can read A's file content, path mappings, and tombstones without A online.
  *
  * SCOPE — what this test does NOT prove (FU-9b, still open):
@@ -100,7 +100,7 @@ class FakeTransaction {
 	}
 }
 
-// ── YAOS vault schema helpers ─────────────────────────────────────────────────
+// ── KAOS vault schema helpers ─────────────────────────────────────────────────
 
 type FileMeta = { path: string; deleted?: boolean };
 

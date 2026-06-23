@@ -28,13 +28,13 @@ const LOG_PREFIX = "[yaos-sync:worker]";
 // INVARIANT (issue #40): unknown routes MUST return 404 before any Durable
 // Object namespace is touched.  classifyWorkerRoute() is a pure function that
 // inspects only the request method and pathname.  getAuthStateCached() — which
-// contacts YAOS_CONFIG — is only called for routes that classifyWorkerRoute
-// recognises as valid YAOS routes.  Junk paths (/wp-login.php, /favicon.ico,
+// contacts KAOS_CONFIG — is only called for routes that classifyWorkerRoute
+// recognises as valid KAOS routes.  Junk paths (/wp-login.php, /favicon.ico,
 // /random-garbage) never reach the DO.
 //
 // Vault resource whitelist: only the four known resources can proceed to auth.
 // /vault/:id/<anything-else> is classified as not-found here, before any
-// YAOS_CONFIG or YAOS_SYNC access, so vault-shaped scanner traffic (/vault/foo/
+// KAOS_CONFIG or KAOS_SYNC access, so vault-shaped scanner traffic (/vault/foo/
 // probe, /vault/foo/wp-login.php) is as cheap as a plain unknown path.
 
 type WorkerRoute =
@@ -62,11 +62,11 @@ const VALID_VAULT_RESOURCES = new Set(["auth", "debug", "blobs", "snapshots"]);
 // routes/snapshots.ts, etc.  The duplication exists so structurally invalid
 // requests (wrong method, unknown subpath) can be rejected here — before any
 // auth check or Durable Object access — rather than reaching a handler that
-// would 404 after paying the YAOS_CONFIG round-trip.
+// would 404 after paying the KAOS_CONFIG round-trip.
 //
 // Consequence: any new /vault/:id/* handler route MUST also be added here,
 // with a corresponding trap-env regression test proving the invalid shape
-// still does not touch YAOS_CONFIG or YAOS_SYNC.  Forgetting this step causes
+// still does not touch KAOS_CONFIG or KAOS_SYNC.  Forgetting this step causes
 // a "security gate forgot the new endpoint" bug: the new route works fine in
 // handler unit tests but gets pre-auth 404'd in production by the classifier.
 //
@@ -119,7 +119,7 @@ function isKnownSnapshotRouteShape(method: string, rest: string[]): boolean {
  *   blobs:     GET|PUT /blobs/:hash,  POST /blobs/exists
  *              (GET|PUT /blobs/exists are structurally valid — the blob handler
  *               treats "exists" as a hash and rejects/misses it after auth,
- *               without touching YAOS_SYNC or hydrating the room)
+ *               without touching KAOS_SYNC or hydrating the room)
  *   snapshots: see isKnownSnapshotRouteShape above
  *
  * See the SECURITY/BILLING INVARIANT comment above before adding new shapes.
@@ -202,7 +202,7 @@ function classifyWorkerRoute(req: Request, url: URL): WorkerRoute {
 		}
 		// Full shape validation: wrong method or unknown subpath also 404 before
 		// auth.  POST /debug/recent, GET /debug/evil, GET /auth/random, etc. are
-		// structurally invalid and must not touch YAOS_CONFIG or YAOS_SYNC.
+		// structurally invalid and must not touch KAOS_CONFIG or KAOS_SYNC.
 		if (!isKnownVaultRouteShape(req.method, vaultRoute.resource, vaultRoute.rest)) {
 			return { kind: "not-found" };
 		}
@@ -247,7 +247,7 @@ function logWorkerRequest(args: {
 }): void {
 	// Sample not_found at 1% — scanner/probe traffic is high-volume and
 	// an always-on access log for 404s turns into dashboard noise fast.
-	// All recognised YAOS routes are always logged for triage.
+	// All recognised KAOS routes are always logged for triage.
 	if (args.route.kind === "not-found" && Math.random() >= 0.01) {
 		return;
 	}
@@ -348,7 +348,7 @@ const worker = {
 		const isWebSocket = req.headers.get("upgrade")?.toLowerCase() === "websocket";
 		const cfRay = req.headers.get("cf-ray");
 
-		// Unknown routes 404 immediately — no YAOS_CONFIG, no YAOS_SYNC.
+		// Unknown routes 404 immediately — no KAOS_CONFIG, no KAOS_SYNC.
 		// This is the primary fix for issue #40: scanner/probe traffic no longer
 		// wakes Durable Objects.
 		if (route.kind === "cors-preflight") {

@@ -124,7 +124,7 @@ Repo-validated bug / incident ledger as of 2026-05-27.
   - `OPEN_FILE_EXTERNAL_EDIT_IDLE_GRACE_MS` (1200ms) idle guard exists in
     the `crdtOnly` branch but not in `localOnly`.
 - Real-device evidence:
-  - `~/temenos/.obsidian/plugins/yaos/flight-logs/2026-05-27/boot-wL7i012vR4mGXA-1.ndjson`
+  - `~/temenos/.obsidian/plugins/kaos/flight-logs/2026-05-27/boot-wL7i012vR4mGXA-1.ndjson`
   - pathId `p:476818d2ecba90d4e95e2a0c4f3ad1eb`
   - timeline reproducible locally via `qa/scripts/issue22b-loop-summary.mjs`
     (script lives outside the repo because `qa/` is gitignored; rebuild

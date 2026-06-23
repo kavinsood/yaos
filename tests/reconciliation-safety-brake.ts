@@ -442,11 +442,11 @@ console.log("\n--- Test 6: bound ambiguous divergence creates a conflict artifac
 	await (controller as any).syncFileFromDisk(file, "modify");
 
 	const createdPath = Array.from(createdFiles.keys()).find((candidate) =>
-		candidate.startsWith("ambiguous (YAOS conflict - crdt from Test Device ") &&
+		candidate.startsWith("ambiguous (KAOS conflict - crdt from Test Device ") &&
 		candidate.endsWith(".md")
 	);
 	const diskCreatedPath = Array.from(createdFiles.keys()).find((candidate) =>
-		candidate.startsWith("ambiguous (YAOS conflict - disk from Test Device ") &&
+		candidate.startsWith("ambiguous (KAOS conflict - disk from Test Device ") &&
 		candidate.endsWith(".md")
 	);
 	const neededTrace = traces.find((event) => event.msg === "conflict-artifact-needed");

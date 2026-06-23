@@ -49,8 +49,8 @@ export const runSchemaMigrationToV2 = (context: SchemaV2MigrationContext): void 
 	new ConfirmModal(
 		context.app,
 		"Migrate sync schema to v2",
-		"This will switch this vault to schema v2 and block older YAOS clients from syncing " +
-			"until they are upgraded. YAOS will export diagnostics before and after migration. Continue?",
+		"This will switch this vault to schema v2 and block older KAOS clients from syncing " +
+			"until they are upgraded. KAOS will export diagnostics before and after migration. Continue?",
 		async () => {
 			const activeVaultSync = context.vaultSync as VaultSync | null;
 			if (!activeVaultSync) return;
@@ -85,9 +85,9 @@ export const runSchemaMigrationToV2 = (context: SchemaV2MigrationContext): void 
 			}
 
 			new Notice(
-				`YAOS: schema v2 migration complete` +
+				`KAOS: schema v2 migration complete` +
 					(loserCleanupCount > 0 ? ` (${loserCleanupCount} local alias file(s) cleaned).` : ".") +
-					" Update YAOS on your other devices before reconnecting them.",
+					" Update KAOS on your other devices before reconnecting them.",
 				12000,
 			);
 		},

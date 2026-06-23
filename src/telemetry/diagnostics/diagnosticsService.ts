@@ -60,6 +60,13 @@ interface DiagnosticsServiceDeps {
 		awaitingFirstProviderSyncAfterStartup: boolean;
 		lastReconciledGeneration: number;
 		untrackedFileCount: number;
+		unresolvedStructuralChangeCount: number;
+		unresolvedStructuralChangeSample: Array<{
+			oldPaths: string[];
+			newPaths: string[];
+			reason: string;
+			contentHashPrefix: string;
+		}>;
 		openFileCount: number;
 	};
 	isMarkdownPathSyncable(path: string): boolean;
@@ -160,6 +167,13 @@ export class DiagnosticsService {
 			`CRDT paths: ${vaultSync.getActiveMarkdownPaths().length}`,
 			`Blob paths: ${vaultSync.pathToBlob.size}`,
 			`Untracked files: ${state.untrackedFileCount}`,
+			`Unresolved structural changes: ${state.unresolvedStructuralChangeCount}`,
+			...state.unresolvedStructuralChangeSample.flatMap((entry, idx) => [
+				`Unresolved structural change ${idx + 1}: ${entry.reason}`,
+				`  old paths: ${entry.oldPaths.join(", ") || "(none)"}`,
+				`  new paths: ${entry.newPaths.join(", ") || "(none)"}`,
+				`  content hash: ${entry.contentHashPrefix}`,
+			]),
 			`Active disk observers: ${this.deps.getDiskMirror()?.activeObserverCount ?? 0}`,
 			`External edit policy: ${settings.externalEditPolicy}`,
 			`Attachment sync: ${settings.enableAttachmentSync ? "enabled" : "disabled"}`,
@@ -391,7 +405,7 @@ export class DiagnosticsService {
 	}
 
 	async ensureDiagnosticsDir(): Promise<string> {
-		const diagDir = normalizePath(`${this.deps.app.vault.configDir}/plugins/yaos/diagnostics`);
+		const diagDir = normalizePath(`${this.deps.app.vault.configDir}/plugins/kaos/diagnostics`);
 		if (!(await this.deps.app.vault.adapter.exists(diagDir))) {
 			await this.deps.app.vault.adapter.mkdir(diagDir);
 		}

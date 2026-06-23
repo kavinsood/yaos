@@ -1,5 +1,5 @@
 /**
- * YAOS CRDT schema version constant.
+ * KAOS CRDT schema version constant.
  *
  * This module is intentionally Obsidian-free so it can be imported
  * in Node regression tests and server code without the Obsidian dependency.

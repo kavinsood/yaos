@@ -105,21 +105,21 @@ async function main(): Promise<void> {
 		JSON.stringify({ theme: "obsidian" }, null, 2),
 	);
 
-	// Install YAOS plugin
-	const yaosPluginDir = join(obsidianDir, "plugins", "do-sync");
+	// Install KAOS plugin
+	const yaosPluginDir = join(obsidianDir, "plugins", "kaos");
 	await mkdir(yaosPluginDir, { recursive: true });
 	if (existsSync(YAOS_MANIFEST)) {
 		await cp(YAOS_MANIFEST, join(yaosPluginDir, "manifest.json"));
 	}
 	if (existsSync(YAOS_BUILD)) {
 		await cp(YAOS_BUILD, join(yaosPluginDir, "main.js"));
-		console.log("Installed YAOS plugin (QA-enabled build).");
+		console.log("Installed KAOS plugin (QA-enabled build).");
 	} else {
-		console.warn("Warning: QA-enabled YAOS build not found. Run: npm run build:qa-product");
+		console.warn("Warning: QA-enabled KAOS build not found. Run: npm run build:qa-product");
 		console.warn(`Expected: ${YAOS_BUILD}`);
 	}
 
-	// Write YAOS settings with qaDebugMode enabled
+	// Write KAOS settings with qaDebugMode enabled
 	// Use a fresh vaultId so each prepared vault is isolated.
 	const vaultId = randomId();
 	const yaosSettings = {
@@ -148,7 +148,7 @@ async function main(): Promise<void> {
 		join(yaosPluginDir, "data.json"),
 		JSON.stringify(yaosSettings, null, 2),
 	);
-	console.log("Wrote YAOS data.json with qaDebugMode=true.");
+	console.log("Wrote KAOS data.json with qaDebugMode=true.");
 	console.log(`  vaultId: ${vaultId} — set host+token in Obsidian settings before syncing.`);
 
 	// Install harness plugin stub
@@ -163,7 +163,7 @@ async function main(): Promise<void> {
 	} else {
 		await writeFile(
 			join(harnessPluginDir, "main.js"),
-			`// YAOS QA Harness — build first with: bun run build:harness\n` +
+			`// KAOS QA Harness — build first with: bun run build:harness\n` +
 			`new obsidian.Plugin().onload = () => console.warn('[YAOS QA] Harness not built yet');\n`,
 		);
 		console.warn("Warning: harness not built. Run: bun run build:harness");
@@ -174,7 +174,7 @@ async function main(): Promise<void> {
 	const enabledPlugins: string[] = existsSync(communityPluginsFile)
 		? JSON.parse(await readFile(communityPluginsFile, "utf-8")) as string[]
 		: [];
-	for (const id of ["do-sync", "yaos-qa-harness"]) {
+	for (const id of ["kaos", "yaos-qa-harness"]) {
 		if (!enabledPlugins.includes(id)) enabledPlugins.push(id);
 	}
 	await writeFile(communityPluginsFile, JSON.stringify(enabledPlugins, null, 2));
@@ -199,7 +199,7 @@ async function main(): Promise<void> {
 	console.log("Next steps:");
 	console.log("  1. Open vault in Obsidian");
 	console.log("  2. Enable community plugins (plugins are pre-installed)");
-	console.log("  3. Set host + token in YAOS settings (qaDebugMode already enabled)");
+	console.log("  3. Set host + token in KAOS settings (qaDebugMode already enabled)");
 	console.log("  4. Launch with remote debugging: Obsidian --remote-debugging-port=9222");
 	console.log("  5. Open DevTools and run: __YAOS_QA__.help()");
 }

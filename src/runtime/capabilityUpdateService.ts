@@ -42,26 +42,26 @@ export type UpdateState = {
 };
 
 const UPDATE_MANIFEST_URLS = [
-	"https://github.com/kavinsood/yaos/releases/latest/download/update-manifest.json",
+	"https://github.com/adtstack/kaos/releases/latest/download/update-manifest.json",
 ] as const;
 const UPDATE_MANIFEST_CACHE_MS = 24 * 60 * 60 * 1000;
 export const CAPABILITY_REFRESH_INTERVAL_MS = 30_000;
-const GITHUB_OPS_WORKFLOW_PATH = ".github/workflows/yaos-ops.yml";
+const GITHUB_OPS_WORKFLOW_PATH = ".github/workflows/kaos-ops.yml";
 
 function buildGithubOpsBootstrapWorkflowYaml(): string {
 	return [
-		"name: YAOS Server Ops",
+		"name: KAOS Server Ops",
 		"on:",
 		"  workflow_dispatch:",
 		"    inputs:",
 		"      action: { type: choice, required: true, default: update, options: [update, revert] }",
 		"      version: { type: string, required: false }",
-		"      release_repo: { type: string, required: false, default: kavinsood/yaos }",
+		"      release_repo: { type: string, required: false, default: adtstack/kaos }",
 		"permissions:",
 		"  contents: write",
 		"jobs:",
 		"  run:",
-		"    uses: kavinsood/yaos/.github/workflows/yaos-ops-reusable.yml@main",
+		"    uses: adtstack/kaos/.github/workflows/kaos-ops-reusable.yml@main",
 		"    with:",
 		"      action: ${{ github.event.inputs.action }}",
 		"      version: ${{ github.event.inputs.version }}",
@@ -237,7 +237,7 @@ export class CapabilityUpdateService {
 		this.compatibilityBlockReason = blockReason;
 		this.deps.log(`Compatibility guard (${reason}): ${blockReason}`);
 		if (firstBlock) {
-			new Notice(`YAOS: ${blockReason}`, 12000);
+			new Notice(`KAOS: ${blockReason}`, 12000);
 		}
 
 		this.deps.stopSyncRuntimeForCompatibility();
@@ -294,7 +294,7 @@ export class CapabilityUpdateService {
 		const minPluginVersion = this.serverCapabilities?.minPluginVersion ?? null;
 		if (minPluginVersion && compareSemver(this.deps.pluginVersion, minPluginVersion) === -1) {
 			pluginCompatibilityWarning =
-				`This server requires YAOS plugin ${minPluginVersion} or newer.`;
+				`This server requires KAOS plugin ${minPluginVersion} or newer.`;
 		} else {
 			const minSchemaVersion = this.serverCapabilities?.minSchemaVersion ?? null;
 			const maxSchemaVersion = this.serverCapabilities?.maxSchemaVersion ?? null;
@@ -323,7 +323,7 @@ export class CapabilityUpdateService {
 				? effectiveProvider === "gitlab"
 					? "your GitLab pipeline"
 					: "your GitHub workflow"
-				: "YAOS settings",
+				: "KAOS settings",
 			legacyServerDetected: this.legacyServerDetected,
 			pluginCompatibilityWarning,
 		};
@@ -337,7 +337,7 @@ export class CapabilityUpdateService {
 		const normalizedRepoUrl = repoUrl.replace(/\/+$/, "").replace(/\.git$/, "");
 		const branch = settings.updateRepoBranch.trim() || this.serverCapabilities?.updateRepoBranch || "main";
 		if (provider === "github") {
-			return `${normalizedRepoUrl}/actions/workflows/yaos-ops.yml`;
+			return `${normalizedRepoUrl}/actions/workflows/kaos-ops.yml`;
 		}
 		if (provider === "gitlab") {
 			return `${normalizedRepoUrl}/-/pipelines/new?ref=${encodeURIComponent(branch)}`;
@@ -409,7 +409,7 @@ export class CapabilityUpdateService {
 
 		const minPluginVersion = this.serverCapabilities.minPluginVersion;
 		if (minPluginVersion && compareSemver(this.deps.pluginVersion, minPluginVersion) === -1) {
-			return `This server requires YAOS plugin ${minPluginVersion} or newer. Update this plugin before syncing.`;
+			return `This server requires KAOS plugin ${minPluginVersion} or newer. Update this plugin before syncing.`;
 		}
 
 		const minSchemaVersion = this.serverCapabilities.minSchemaVersion;
@@ -432,7 +432,7 @@ export class CapabilityUpdateService {
 		const pluginVsLatest = compareSemver(this.deps.pluginVersion, latestPluginVersion);
 		const serverVsRequired = compareSemver(serverVersion, minCompatibleServer);
 		if (pluginVsLatest !== null && serverVsRequired !== null && pluginVsLatest >= 0 && serverVsRequired === -1) {
-			return `This plugin requires YAOS server ${minCompatibleServer} or newer. Update server first.`;
+			return `This plugin requires KAOS server ${minCompatibleServer} or newer. Update server first.`;
 		}
 		return null;
 	}
@@ -551,8 +551,8 @@ export class CapabilityUpdateService {
 		if (gainedR2) {
 			new Notice(
 				this.deps.getSettings().enableAttachmentSync
-					? "YAOS: R2 backend detected. Attachments and snapshots are now available."
-					: "YAOS: R2 backend detected. Attachments and snapshots are available if you enable them in settings.",
+					? "KAOS: R2 backend detected. Attachments and snapshots are now available."
+					: "KAOS: R2 backend detected. Attachments and snapshots are available if you enable them in settings.",
 				7000,
 			);
 			if (this.deps.isSyncConnectedAndProviderSynced() && this.supportsSnapshots) {
@@ -679,16 +679,16 @@ export class CapabilityUpdateService {
 			if (this.lastServerUpdateNoticeVersion !== updateState.latestServerVersion) {
 				if (!updateState.updateActionUrl) {
 					new Notice(
-						`YAOS: server update ${updateState.latestServerVersion} is available. ` +
-						"Set your deployment repo URL in YAOS settings to enable 1-click updates.",
+						`KAOS: server update ${updateState.latestServerVersion} is available. ` +
+						"Set your deployment repo URL in KAOS settings to enable 1-click updates.",
 						12000,
 					);
 				} else {
 					const actionLabel = updateState.updateActionLabel;
 					new Notice(
 						updateState.migrationRequired
-							? `YAOS: a server migration update (${updateState.latestServerVersion}) is available. Open ${actionLabel} before updating.`
-							: `YAOS: a server update (${updateState.latestServerVersion}) is available. Open ${actionLabel} to update when ready.`,
+							? `KAOS: a server migration update (${updateState.latestServerVersion}) is available. Open ${actionLabel} before updating.`
+							: `KAOS: a server update (${updateState.latestServerVersion}) is available. Open ${actionLabel} to update when ready.`,
 						10000,
 					);
 				}
@@ -702,7 +702,7 @@ export class CapabilityUpdateService {
 		if (updateState.pluginUpdateRecommended && updateState.latestPluginVersion) {
 			if (this.lastPluginUpdateNoticeVersion !== updateState.latestPluginVersion) {
 				new Notice(
-					`YAOS: plugin update recommended (${updateState.latestPluginVersion}). Update this device to stay current with server compatibility guidance.`,
+					`KAOS: plugin update recommended (${updateState.latestPluginVersion}). Update this device to stay current with server compatibility guidance.`,
 					10000,
 				);
 				this.lastPluginUpdateNoticeVersion = updateState.latestPluginVersion;

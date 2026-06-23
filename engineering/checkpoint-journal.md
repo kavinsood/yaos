@@ -1,6 +1,6 @@
 # Checkpoint & Journal Architecture
 
-A naive CRDT persistence layer rewrites the entire state graph on every save. To avoid catastrophic write-amplification, YAOS implements a checkpoint and journal architecture.
+A naive CRDT persistence layer rewrites the entire state graph on every save. To avoid catastrophic write-amplification, KAOS implements a checkpoint and journal architecture.
 
 ## Migration reality check (PartyKit -> y-partyserver)
 
@@ -74,7 +74,7 @@ If anything is missing, malformed, out-of-sequence, or hash-mismatched, we fail 
 
 `y-partykit`-style per-event append can be correct, but it generates high operation counts for note-taking workloads.
 
-YAOS chooses coalescing at `onSave()` cadence:
+KAOS chooses coalescing at `onSave()` cadence:
 
 - lower IOPS and lower storage thrash
 - much better fit for personal markdown editing bursts

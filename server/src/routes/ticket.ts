@@ -234,7 +234,7 @@ export async function handleTicketRoute(
 		try {
 			// Allow a short test TTL override so the integration harness can exercise
 			// the proactive refresh path without waiting 5 minutes.
-			const ttlMs = readTicketTtlMs(env?.YAOS_TICKET_TTL_MS);
+			const ttlMs = readTicketTtlMs(env?.KAOS_TICKET_TTL_MS);
 			const result = await createTicket(authState, vaultId, ttlMs);
 			return json(result);
 	} catch (err) {

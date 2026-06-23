@@ -396,7 +396,7 @@ async function testMapDelete(): Promise<void> {
 
 	const hashBefore = await computeFullUpdateHash(doc);
 
-	// Delete a file entirely (this is how file deletion works in YAOS)
+	// Delete a file entirely (this is how file deletion works in KAOS)
 	doc.transact(() => {
 		doc.getMap<string>("pathToId").delete("b.md");
 	});

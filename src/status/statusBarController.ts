@@ -39,36 +39,36 @@ export function getLabelFromConnectionState(
 	let base: string;
 	switch (state.kind) {
 		case "disconnected":
-			base = "YAOS: Disconnected";
+			base = "KAOS: Disconnected";
 			break;
 		case "loading_cache":
-			base = "YAOS: Loading...";
+			base = "KAOS: Loading...";
 			break;
 		case "connecting":
-			base = "YAOS: Connecting...";
+			base = "KAOS: Connecting...";
 			break;
 		case "online":
-			base = "YAOS: Connected";
+			base = "KAOS: Connected";
 			break;
 		case "offline":
-			base = "YAOS: Offline";
+			base = "KAOS: Offline";
 			break;
 		case "auth_failed":
 			switch (state.code) {
 				case "unclaimed":
-					base = "YAOS: Server unclaimed";
+					base = "KAOS: Server unclaimed";
 					break;
 				case "server_misconfigured":
-					base = "YAOS: Server misconfigured";
+					base = "KAOS: Server misconfigured";
 					break;
 				case "unauthorized":
 				default:
-					base = "YAOS: Auth rejected";
+					base = "KAOS: Auth rejected";
 					break;
 			}
 			break;
 		case "server_update_required":
-			base = "YAOS: Update required";
+			base = "KAOS: Update required";
 			break;
 	}
 	if (transferStatus) base = `${base} (${transferStatus})`;

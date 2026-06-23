@@ -49,7 +49,7 @@ const LEGACY_DOCUMENT_KEY = "document";
 type ServerTraceEntry = StoredTraceEntry;
 
 interface ServerEnv {
-	YAOS_BUCKET?: R2Bucket;
+	KAOS_BUCKET?: R2Bucket;
 }
 
 type SvEchoCounters = {
@@ -409,7 +409,7 @@ export class VaultSyncServer extends YServer {
 		}
 	}
 
-	/** Count active (non-deleted) paths in a Y.Doc using the YAOS schema. */
+	/** Count active (non-deleted) paths in a Y.Doc using the KAOS schema. */
 	private countActivePathsInDoc(doc: Y.Doc): number {
 		const meta = doc.getMap("meta");
 		let count = 0;
@@ -595,7 +595,7 @@ export class VaultSyncServer extends YServer {
 		const run = runSerialized(
 			serialized,
 			async () => {
-				const bucket = (this.env as ServerEnv).YAOS_BUCKET;
+				const bucket = (this.env as ServerEnv).KAOS_BUCKET;
 				if (!bucket) {
 					return {
 						status: "unavailable",

@@ -11,7 +11,7 @@ export async function recordVaultTrace(
 	data: Record<string, unknown> = {},
 ): Promise<void> {
 	try {
-		const stub = await getServerByName(env.YAOS_SYNC, vaultId);
+		const stub = await getServerByName(env.KAOS_SYNC, vaultId);
 		await stub.fetch("https://internal/__yaos/trace", {
 			method: "POST",
 			headers: {
@@ -25,7 +25,7 @@ export async function recordVaultTrace(
 }
 
 export async function fetchVaultDocument(env: Env, vaultId: string): Promise<Uint8Array> {
-	const stub = await getServerByName(env.YAOS_SYNC, vaultId);
+	const stub = await getServerByName(env.KAOS_SYNC, vaultId);
 	const res = await stub.fetch("https://internal/__yaos/document");
 	if (!res.ok) {
 		throw new Error(`document fetch failed (${res.status})`);
@@ -36,7 +36,7 @@ export async function fetchVaultDocument(env: Env, vaultId: string): Promise<Uin
 async function fetchVaultRoomMeta(env: Env, vaultId: string): Promise<{
 	schemaVersion: number | null;
 } | null> {
-	const stub = await getServerByName(env.YAOS_SYNC, vaultId);
+	const stub = await getServerByName(env.KAOS_SYNC, vaultId);
 	const res = await stub.fetch("https://internal/__yaos/meta");
 	if (!res.ok) {
 		throw new Error(`room meta fetch failed (${res.status})`);
@@ -79,6 +79,6 @@ export async function fetchVaultSchemaVersion(env: Env, vaultId: string): Promis
 }
 
 export async function fetchVaultDebug(env: Env, vaultId: string): Promise<Response> {
-	const stub = await getServerByName(env.YAOS_SYNC, vaultId);
+	const stub = await getServerByName(env.KAOS_SYNC, vaultId);
 	return await stub.fetch("https://internal/__yaos/debug");
 }

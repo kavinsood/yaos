@@ -236,7 +236,7 @@ console.log("\n--- Test 1: key shape and hash helper ---");
 		buildCandidateStoreKey(BASE_SCOPE) === `yaos-ack-v1:${"b".repeat(64)}:${"a".repeat(64)}:local-device`,
 		"candidate key uses serverHostHash, vaultIdHash, localDeviceId",
 	);
-	const hash = await sha256Hex("YAOS");
+	const hash = await sha256Hex("KAOS");
 	assert(/^[0-9a-f]{64}$/.test(hash), "sha256Hex returns lowercase 64-char hex");
 }
 

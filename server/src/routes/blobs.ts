@@ -58,7 +58,7 @@ async function handleBlobExists(
 	req: Request,
 	json: JsonResponse,
 ): Promise<Response> {
-	const bucket = env.YAOS_BUCKET;
+	const bucket = env.KAOS_BUCKET;
 	if (!bucket) {
 		return json({ error: "attachments_unavailable" }, 503);
 	}
@@ -99,7 +99,7 @@ async function handleBlobUpload(
 	req: Request,
 	json: JsonResponse,
 ): Promise<Response> {
-	if (!env.YAOS_BUCKET) {
+	if (!env.KAOS_BUCKET) {
 		return json({ error: "attachments_unavailable" }, 503);
 	}
 
@@ -139,7 +139,7 @@ async function handleBlobUpload(
 		return json({ error: "hash mismatch" }, 400);
 	}
 
-	await env.YAOS_BUCKET.put(
+	await env.KAOS_BUCKET.put(
 		blobKey(vaultId, hash),
 		body,
 		{
@@ -158,7 +158,7 @@ async function handleBlobDownload(
 	hash: string,
 	json: JsonResponse,
 ): Promise<Response> {
-	if (!env.YAOS_BUCKET) {
+	if (!env.KAOS_BUCKET) {
 		return json({ error: "attachments_unavailable" }, 503);
 	}
 
@@ -166,7 +166,7 @@ async function handleBlobDownload(
 		return json({ error: "invalid hash: must be 64 hex chars (SHA-256)" }, 400);
 	}
 
-	const object = await env.YAOS_BUCKET.get(blobKey(vaultId, hash));
+	const object = await env.KAOS_BUCKET.get(blobKey(vaultId, hash));
 	if (!object) {
 		return json({ error: "not found" }, 404);
 	}

@@ -31,12 +31,12 @@ function label(state: ConnectionState, transfer?: string): string {
 	return getLabelFromConnectionState(state, transfer);
 }
 
-console.log("\n--- Test 1: baseline connection state labels use YAOS: prefix ---");
-assert(label({ kind: "disconnected" }).startsWith("YAOS:"), "disconnected starts with YAOS:");
-assert(label({ kind: "loading_cache" }).startsWith("YAOS:"), "loading_cache starts with YAOS:");
-assert(label({ kind: "connecting" }).startsWith("YAOS:"), "connecting starts with YAOS:");
-assert(label({ kind: "online", generation: 1 }).startsWith("YAOS:"), "online starts with YAOS:");
-assert(label({ kind: "offline", reason: "provider_disconnected", generation: 1 }).startsWith("YAOS:"), "offline starts with YAOS:");
+console.log("\n--- Test 1: baseline connection state labels use KAOS: prefix ---");
+assert(label({ kind: "disconnected" }).startsWith("KAOS:"), "disconnected starts with KAOS:");
+assert(label({ kind: "loading_cache" }).startsWith("KAOS:"), "loading_cache starts with KAOS:");
+assert(label({ kind: "connecting" }).startsWith("KAOS:"), "connecting starts with KAOS:");
+assert(label({ kind: "online", generation: 1 }).startsWith("KAOS:"), "online starts with KAOS:");
+assert(label({ kind: "offline", reason: "provider_disconnected", generation: 1 }).startsWith("KAOS:"), "offline starts with KAOS:");
 assert(label({ kind: "disconnected" }).includes("Disconnected"), "disconnected label readable");
 assert(label({ kind: "loading_cache" }).includes("Loading"), "loading_cache label readable");
 assert(label({ kind: "connecting" }).includes("Connecting"), "connecting label readable");
@@ -145,7 +145,7 @@ const errorWithReceipt = getLabelFromConnectionState(
 );
 assert(!errorWithReceipt.includes("Receipt:"), "auth/error labels omit receipt suffix");
 
-console.log("\n--- Test 5: every ConnectionState kind produces a distinct YAOS: label ---");
+console.log("\n--- Test 5: every ConnectionState kind produces a distinct KAOS: label ---");
 const allStates: ConnectionState[] = [
 	{ kind: "disconnected" },
 	{ kind: "loading_cache" },
@@ -160,7 +160,7 @@ const allStates: ConnectionState[] = [
 const seen = new Set<string>();
 for (const state of allStates) {
 	const l = label(state);
-	assert(l.startsWith("YAOS:"), `label for ${state.kind} starts with "YAOS:" (not "CRDT:")`);
+	assert(l.startsWith("KAOS:"), `label for ${state.kind} starts with "KAOS:" (not "CRDT:")`);
 	assert(!l.includes("CRDT"), `label for ${state.kind} does not contain implementation detail "CRDT"`);
 	assert(l.length > 6, `label for ${state.kind} has content`);
 	assert(!seen.has(l), `label for ${state.kind} is distinct from previous labels`);

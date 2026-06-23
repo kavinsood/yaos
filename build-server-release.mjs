@@ -5,7 +5,7 @@ import { join, resolve } from "node:path";
 
 const rootDir = resolve(".");
 const outputDir = resolve(rootDir, "dist/release-assets");
-const tempDir = mkdtempSync(join(tmpdir(), "yaos-server-release-"));
+const tempDir = mkdtempSync(join(tmpdir(), "kaos-server-release-"));
 const serverTempDir = join(tempDir, "server");
 
 const rootPackage = JSON.parse(readFileSync(resolve(rootDir, "package.json"), "utf8"));
@@ -108,8 +108,8 @@ const updateManifest = {
 	latestServerMinSchemaVersion: serverMinSchemaVersion,
 	latestServerMaxSchemaVersion: serverMaxSchemaVersion,
 	upgradeOrder: "either",
-	releaseNotesUrl: `https://github.com/kavinsood/yaos/releases/tag/${rootPackage.version}`,
-	upgradeGuideUrl: "https://github.com/kavinsood/yaos#updating-your-server",
+	releaseNotesUrl: `https://github.com/adtstack/kaos/releases/tag/${rootPackage.version}`,
+	upgradeGuideUrl: "https://github.com/adtstack/kaos#updating-your-server",
 };
 
 const serverZipManifest = {
@@ -148,7 +148,7 @@ for (const relativePath of [
 }
 
 writeFileSync(
-	join(serverTempDir, "yaos-server-manifest.json"),
+	join(serverTempDir, "kaos-server-manifest.json"),
 	`${JSON.stringify(serverZipManifest, null, 2)}\n`,
 );
 writeFileSync(
@@ -156,7 +156,7 @@ writeFileSync(
 	`${JSON.stringify(updateManifest, null, 2)}\n`,
 );
 
-const zipPath = resolve(outputDir, "yaos-server.zip");
+const zipPath = resolve(outputDir, "kaos-server.zip");
 rmSync(zipPath, { force: true });
 execFileSync("zip", ["-qr", zipPath, "."], {
 	cwd: serverTempDir,

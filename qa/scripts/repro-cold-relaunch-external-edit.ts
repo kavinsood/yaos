@@ -37,7 +37,7 @@ const REMOTE_FROM_A = `REMOTE_FROM_A_${RUN_ID}\n`;
 const LOCAL_ON_B = `LOCAL_ON_B_${RUN_ID}\n`;
 
 const VAULT_B = `${process.env.HOME}/temenos-b`;
-const DATA_JSON_B = `${VAULT_B}/.obsidian/plugins/yaos/data.json`;
+const DATA_JSON_B = `${VAULT_B}/.obsidian/plugins/kaos/data.json`;
 const PORT_A = 9222;
 const PORT_B = 9223;
 const USER_DATA_B = "/tmp/obs-b";
@@ -215,9 +215,9 @@ async function main() {
 	// --- Phase 2: Disable YAOS on B (before killing) ---
 
 	log("Phase 2: Disabling YAOS on B (plugin only, process still alive)...");
-	await b.evalRaw(`app.plugins.disablePlugin("yaos")`);
+	await b.evalRaw(`app.plugins.disablePlugin("kaos")`);
 	await waitMs(2000);
-	const bPluginDisabled = await b.evalRaw<boolean>(`!app.plugins.plugins.yaos`);
+	const bPluginDisabled = await b.evalRaw<boolean>(`!app.plugins.plugins.kaos`);
 	log(`B plugin disabled: ${bPluginDisabled}`);
 
 	// Wait for data.json to be written after plugin unload
@@ -297,10 +297,10 @@ async function main() {
 	log(`B YAOS ready after cold relaunch: ${bYaosReady}`);
 
 	// YAOS may have been disabled before kill — re-enable it
-	const bPluginPresent = await b.evalRaw<boolean>(`!!app.plugins.plugins.yaos`).catch(() => false);
+	const bPluginPresent = await b.evalRaw<boolean>(`!!app.plugins.plugins.kaos`).catch(() => false);
 	if (!bPluginPresent) {
 		log("B YAOS plugin not present after relaunch — re-enabling...");
-		await b.evalRaw(`app.plugins.enablePlugin("yaos")`);
+		await b.evalRaw(`app.plugins.enablePlugin("kaos")`);
 		await waitMs(5000);
 		const bYaosReady2 = await b.evalRaw<boolean>(`
 			(async () => {
@@ -334,7 +334,7 @@ async function main() {
 	// What reconcile decision was made?
 	const decisionEvent = await b.evalRaw<{decision: string; reason: string; baselineHash: string | null; diskHash: string; crdtHash: string} | null>(`
 		(function() {
-			const plugin = app.plugins.plugins.yaos;
+			const plugin = app.plugins.plugins.kaos;
 			if (!plugin) return null;
 			const recorder = plugin.flightTrace?.currentRecorder;
 			if (!recorder) return null;

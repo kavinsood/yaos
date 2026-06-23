@@ -1,4 +1,4 @@
-# YAOS Autophagy Plan
+# KAOS Autophagy Plan
 
 ## Behavior freeze
 

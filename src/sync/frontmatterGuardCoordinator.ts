@@ -131,7 +131,7 @@ export class FrontmatterGuardCoordinator {
 
 	showFrontmatterGuardNotice(path: string): void {
 		new Notice(
-			`YAOS paused a properties update in "${path}" because the frontmatter looked unsafe. Check diagnostics before accepting the change.`,
+			`KAOS paused a properties update in "${path}" because the frontmatter looked unsafe. Check diagnostics before accepting the change.`,
 			12_000,
 		);
 	}

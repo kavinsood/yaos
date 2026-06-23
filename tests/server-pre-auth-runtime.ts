@@ -3,8 +3,8 @@
  *
  * The static test (tests/server-pre-auth-trace.mjs) proves the rejection
  * functions do not contain recordVaultTrace calls by parsing source. This
- * test proves the same property at runtime: a fake Env whose YAOS_SYNC and
- * YAOS_CONFIG namespaces throw on any access is passed into the rejection
+ * test proves the same property at runtime: a fake Env whose KAOS_SYNC and
+ * KAOS_CONFIG namespaces throw on any access is passed into the rejection
  * paths. If any pre-auth code touches the Durable Object namespace, the
  * test throws with a clear "INV-SEC-01 violation" error rather than a
  * silent pass.
@@ -53,7 +53,7 @@ function assert(condition: boolean, msg: string) {
 
 const DO_TOUCHED = "Durable Object namespace accessed before authentication (INV-SEC-01)";
 
-function makeTrapNamespace(): Env["YAOS_SYNC"] {
+function makeTrapNamespace(): Env["KAOS_SYNC"] {
 	const trap = {
 		idFromName(_name: string): never { throw new Error(DO_TOUCHED); },
 		idFromString(_id: string): never { throw new Error(DO_TOUCHED); },
@@ -61,12 +61,12 @@ function makeTrapNamespace(): Env["YAOS_SYNC"] {
 		newUniqueId(): never { throw new Error(DO_TOUCHED); },
 		jurisdiction(_j: string): never { throw new Error(DO_TOUCHED); },
 	};
-	return trap as unknown as Env["YAOS_SYNC"];
+	return trap as unknown as Env["KAOS_SYNC"];
 }
 
 const fakeEnv: Env = {
-	YAOS_SYNC: makeTrapNamespace(),
-	YAOS_CONFIG: makeTrapNamespace() as unknown as Env["YAOS_CONFIG"],
+	KAOS_SYNC: makeTrapNamespace(),
+	KAOS_CONFIG: makeTrapNamespace() as unknown as Env["KAOS_CONFIG"],
 	SYNC_TOKEN: undefined,
 };
 
@@ -176,7 +176,7 @@ console.log("\n--- Test 8: DO trap summary — none of the above rejection paths
 	// If any of tests 1-7 had called DO methods, they would have thrown and
 	// the process would have exited with an unhandled error before reaching here.
 	// Reaching this point proves all seven rejection paths respected INV-SEC-01.
-	assert(true, "all pre-auth rejections completed without touching YAOS_SYNC or YAOS_CONFIG");
+	assert(true, "all pre-auth rejections completed without touching KAOS_SYNC or KAOS_CONFIG");
 }
 
 // ── Summary ───────────────────────────────────────────────────────────────────

@@ -131,7 +131,7 @@ console.log("\n--- Test 1: existing attachment changed during download is quaran
 	});
 
 	const conflict = Array.from(files.keys()).find((path) =>
-		path.startsWith("img (YAOS remote conflict") && path.endsWith(".png")
+		path.startsWith("img (KAOS remote conflict") && path.endsWith(".png")
 	);
 	assert(text(files.get("img.png")!.data) === "local-new", "local changed attachment is preserved");
 	assert(!!conflict, "remote bytes are written to a conflict artifact");
@@ -151,7 +151,7 @@ console.log("\n--- Test 2: unchanged existing attachment can be overwritten ---"
 	put("img.png", bytes("local-old"));
 	await runDownload(manager, "img.png", bytes("remote"));
 
-	const conflict = Array.from(files.keys()).find((path) => path.includes("YAOS remote conflict"));
+	const conflict = Array.from(files.keys()).find((path) => path.includes("KAOS remote conflict"));
 	assert(text(files.get("img.png")!.data) === "remote", "unchanged attachment is overwritten by remote bytes");
 	assert(!conflict, "no conflict artifact is created for unchanged overwrite");
 	assert(
@@ -182,7 +182,7 @@ console.log("\n--- Test 3: create race mismatch is quarantined instead of overwr
 	await runDownload(manager, "img.png", bytes("remote"));
 
 	const conflict = Array.from(files.keys()).find((path) =>
-		path.startsWith("img (YAOS remote conflict") && path.endsWith(".png")
+		path.startsWith("img (KAOS remote conflict") && path.endsWith(".png")
 	);
 	assert(text(files.get("img.png")!.data) === "local-race", "create-race local attachment is preserved");
 	assert(!!conflict, "remote bytes are written to a conflict artifact after create race");
@@ -215,7 +215,7 @@ console.log("\n--- Test 4: create race same hash is skipped ---");
 
 	await runDownload(manager, "img.png", remote);
 
-	const conflict = Array.from(files.keys()).find((path) => path.includes("YAOS remote conflict"));
+	const conflict = Array.from(files.keys()).find((path) => path.includes("KAOS remote conflict"));
 	assert(text(files.get("img.png")!.data) === "remote", "matching create-race attachment remains in place");
 	assert(!conflict, "matching create-race does not create conflict artifact");
 	assert(

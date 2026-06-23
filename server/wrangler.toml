@@ -1,13 +1,13 @@
-name = "yaos"
+name = "kaos"
 main = "src/index.ts"
 compatibility_date = "2026-03-02"
 
 [[durable_objects.bindings]]
-name = "YAOS_SYNC"
+name = "KAOS_SYNC"
 class_name = "VaultSyncServer"
 
 [[durable_objects.bindings]]
-name = "YAOS_CONFIG"
+name = "KAOS_CONFIG"
 class_name = "ServerConfig"
 
 [[migrations]]
@@ -21,7 +21,7 @@ enabled = true
 # Optional hardening variables
 # ---------------------------------------------------------------------------
 #
-# Uncomment YAOS_DISABLE_LEGACY_WS_TOKEN once all plugin clients in your
+# Uncomment KAOS_DISABLE_LEGACY_WS_TOKEN once all plugin clients in your
 # deployment have upgraded to a version that supports short-lived WebSocket
 # tickets (plugin Release N or later, identified by the capabilities response
 # containing "socketTicketAuth": true).
@@ -39,4 +39,4 @@ enabled = true
 #   4. Keep the emergency fallback: if clients break, comment it out again.
 #
 # [vars]
-# YAOS_DISABLE_LEGACY_WS_TOKEN = "true"
+# KAOS_DISABLE_LEGACY_WS_TOKEN = "true"

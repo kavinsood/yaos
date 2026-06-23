@@ -2,9 +2,9 @@
 
 Sync is nice. Recovery is the real reason you self-host your data.
 
-Obsidian's local File Recovery plugin is excellent for small "oops" moments (like accidentally deleting a paragraph). YAOS does not try to replace it. YAOS snapshots are designed for catastrophic recovery: *"I accidentally wiped my folder structure and need to intelligently restore the vault to yesterday's state."*
+Obsidian's local File Recovery plugin is excellent for small "oops" moments (like accidentally deleting a paragraph). KAOS does not try to replace it. KAOS snapshots are designed for catastrophic recovery: *"I accidentally wiped my folder structure and need to intelligently restore the vault to yesterday's state."*
 
-Snapshots are the operational safety-net for the CRDT graph, not a second attachment transport. YAOS serializes the full `Y.Doc` state, gzips the payload, and writes two objects to R2:
+Snapshots are the operational safety-net for the CRDT graph, not a second attachment transport. KAOS serializes the full `Y.Doc` state, gzips the payload, and writes two objects to R2:
 - `crdt.bin.gz` (the compressed CRDT state)
 - `index.json` (snapshot metadata and blob references)
 

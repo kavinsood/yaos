@@ -59,7 +59,7 @@ const VAULT_ID = "test-vault-abc";
 const OTHER_VAULT_ID = "other-vault-xyz";
 
 /**
- * Trap env: YAOS_SYNC and YAOS_CONFIG throw if any method is called.
+ * Trap env: KAOS_SYNC and KAOS_CONFIG throw if any method is called.
  * Used to prove the DO is never woken on rejection paths.
  */
 function makeTrapEnv(extra: Partial<Env> = {}): Env {
@@ -70,8 +70,8 @@ function makeTrapEnv(extra: Partial<Env> = {}): Env {
 	});
 	return {
 		SYNC_TOKEN: ENV_AUTH.envToken,
-		YAOS_SYNC: trap as unknown as Env["YAOS_SYNC"],
-		YAOS_CONFIG: trap as unknown as Env["YAOS_CONFIG"],
+		KAOS_SYNC: trap as unknown as Env["KAOS_SYNC"],
+		KAOS_CONFIG: trap as unknown as Env["KAOS_CONFIG"],
 		...extra,
 	};
 }
@@ -197,8 +197,8 @@ console.log("\n--- WS route: valid ticket passes auth gate (does not produce 401
 	// NOT reject at the auth gate.
 	const env: Env = {
 		SYNC_TOKEN: ENV_AUTH.envToken,
-		YAOS_SYNC: {} as unknown as Env["YAOS_SYNC"],
-		YAOS_CONFIG: {} as unknown as Env["YAOS_CONFIG"],
+		KAOS_SYNC: {} as unknown as Env["KAOS_SYNC"],
+		KAOS_CONFIG: {} as unknown as Env["KAOS_CONFIG"],
 	};
 
 	const { ticket } = await createTicket(ENV_AUTH, VAULT_ID);
@@ -291,8 +291,8 @@ console.log("\n--- WS route: legacy ?token= still accepted (migration path) ---"
 	// handleSyncSocketRoute directly and catch the expected throw.
 	const env: Env = {
 		SYNC_TOKEN: ENV_AUTH.envToken,
-		YAOS_SYNC: {} as unknown as Env["YAOS_SYNC"],
-		YAOS_CONFIG: {} as unknown as Env["YAOS_CONFIG"],
+		KAOS_SYNC: {} as unknown as Env["KAOS_SYNC"],
+		KAOS_CONFIG: {} as unknown as Env["KAOS_CONFIG"],
 	};
 
 	const wsUrl = `https://example.test/vault/sync/${VAULT_ID}?token=${encodeURIComponent(ENV_AUTH.envToken)}&schemaVersion=2`;
@@ -427,12 +427,12 @@ console.log("\n--- authenticateSocketRequest: server_misconfigured → not ok --
 }
 
 // ---------------------------------------------------------------------------
-// Legacy disable switch (YAOS_DISABLE_LEGACY_WS_TOKEN)
+// Legacy disable switch (KAOS_DISABLE_LEGACY_WS_TOKEN)
 // ---------------------------------------------------------------------------
 
-console.log("\n--- WS route: legacy ?token= rejected when YAOS_DISABLE_LEGACY_WS_TOKEN is set ---");
+console.log("\n--- WS route: legacy ?token= rejected when KAOS_DISABLE_LEGACY_WS_TOKEN is set ---");
 {
-	const trapEnv = makeTrapEnv({ YAOS_DISABLE_LEGACY_WS_TOKEN: "true" });
+	const trapEnv = makeTrapEnv({ KAOS_DISABLE_LEGACY_WS_TOKEN: "true" });
 	const req = new Request(
 		`https://example.test/vault/sync/${VAULT_ID}?token=${encodeURIComponent(ENV_AUTH.envToken)}&schemaVersion=2`,
 	);
@@ -455,8 +455,8 @@ console.log("\n--- WS route: legacy warning logged on successful legacy auth ---
 	// The partyserver mock throws post-auth (expected); we catch it.
 	const env: Env = {
 		SYNC_TOKEN: ENV_AUTH.envToken,
-		YAOS_SYNC: {} as unknown as Env["YAOS_SYNC"],
-		YAOS_CONFIG: {} as unknown as Env["YAOS_CONFIG"],
+		KAOS_SYNC: {} as unknown as Env["KAOS_SYNC"],
+		KAOS_CONFIG: {} as unknown as Env["KAOS_CONFIG"],
 	};
 	const req = new Request(
 		`https://example.test/vault/sync/${VAULT_ID}?token=${encodeURIComponent(ENV_AUTH.envToken)}&schemaVersion=2`,
@@ -609,7 +609,7 @@ console.log("\n--- 500 from ticket endpoint: isTicketEndpointUnsupported is fals
 
 console.log("\n--- capabilities: socketTicketAuth: true is advertised ---");
 {
-	const env = { YAOS_BUCKET: {} } as unknown as Env;
+	const env = { KAOS_BUCKET: {} } as unknown as Env;
 	const auth: AuthState = { mode: "env", claimed: true, envToken: "token" };
 	const caps = getCapabilities(auth, env);
 	assertEqual(caps.socketTicketAuth, true, "capabilities include socketTicketAuth: true");
@@ -619,8 +619,8 @@ console.log("\n--- capabilities route: socketTicketAuth visible unauthenticated 
 {
 	const env: Env = {
 		SYNC_TOKEN: "correct-token",
-		YAOS_SYNC: {} as unknown as Env["YAOS_SYNC"],
-		YAOS_CONFIG: {
+		KAOS_SYNC: {} as unknown as Env["KAOS_SYNC"],
+		KAOS_CONFIG: {
 			idFromName: () => "id",
 			get: () => ({
 				fetch: async () => new Response(JSON.stringify({
@@ -628,7 +628,7 @@ console.log("\n--- capabilities route: socketTicketAuth visible unauthenticated 
 					tokenHash: "hash",
 				}), { status: 200 }),
 			}),
-		} as unknown as Env["YAOS_CONFIG"],
+		} as unknown as Env["KAOS_CONFIG"],
 	};
 	const res = await worker.fetch(new Request("https://example.test/api/capabilities"), env);
 	const caps = await res.json() as Record<string, unknown>;

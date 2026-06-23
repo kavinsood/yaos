@@ -45,7 +45,7 @@ export function contentFingerprint(text: string): string {
  *   baseline null (first run)         → preserve-conflict/missing-baseline (safe fallback)
  *
  * Collisions must be practically impossible — a false equality could cause
- * YAOS to decide "disk unchanged" and overwrite a local edit without conflict
+ * KAOS to decide "disk unchanged" and overwrite a local edit without conflict
  * preservation, resulting in silent data loss.
  *
  * Implementation: Web Crypto API (`globalThis.crypto.subtle`).

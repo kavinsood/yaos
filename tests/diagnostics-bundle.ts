@@ -71,7 +71,7 @@ const KNOWN_PATH_2        = "Inbox/private-note.md";
 const SERVER_TRACE_ONLY_PATH = "Attachments/private-image.png";
 const HISTORICAL_EVENT_ONLY_PATH = "Deleted Medical Notes/old-result.md";
 const STRUCTURED_TRACE_ONLY_PATH = "Archive/structured-secret.md";
-const CONFLICT_PATH = "Notes/important (YAOS conflict from Laptop 2026-05-11T12-00-00Z).md";
+const CONFLICT_PATH = "Notes/important (KAOS conflict from Laptop 2026-05-11T12-00-00Z).md";
 const NORMALIZED_PATH = "Notes/some-file.md";
 const FULL_CONTENT_HASH = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 

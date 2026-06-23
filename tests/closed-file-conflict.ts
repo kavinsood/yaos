@@ -75,7 +75,7 @@ assert.deepEqual(
 assertPolicy(decideClosedFileConflict({ baselineHash: null, diskHash: "B", crdtHash: "C", lastDiskIndexPersistedAt: 1000 }),
 	"crdt-default-no-evidence", "only lastDiskIndexPersistedAt");
 
-// --- missing-baseline: diskMtime AFTER last save → disk edited while YAOS inactive → disk wins ---
+// --- missing-baseline: diskMtime AFTER last save → disk edited while KAOS inactive → disk wins ---
 
 assert.deepEqual(
 	stripPolicy(decideClosedFileConflict({
@@ -86,7 +86,7 @@ assert.deepEqual(
 		lastDiskIndexPersistedAt: 1000,
 	})),
 	{ ...diskWinsPreserveCrdt },
-	"missing-baseline, diskMtime > lastDiskIndexPersistedAt → disk edited while YAOS inactive → disk wins",
+	"missing-baseline, diskMtime > lastDiskIndexPersistedAt → disk edited while KAOS inactive → disk wins",
 );
 assertPolicy(decideClosedFileConflict({ baselineHash: null, diskHash: "B", crdtHash: "C", diskMtime: 2000, lastDiskIndexPersistedAt: 1000 }),
 	"disk-mtime-after-last-index-save", "disk newer than last save");
@@ -173,7 +173,7 @@ console.log("\n--- Test 2: stale disk (no mtime evidence) → CRDT canonical ---
 	);
 }
 
-console.log("\n--- Test 3: user edited while YAOS inactive (mtime evidence) → disk wins ---");
+console.log("\n--- Test 3: user edited while KAOS inactive (mtime evidence) → disk wins ---");
 {
 	const localEdit = "my offline note edits";
 	const remoteContent = "newer remote server state";

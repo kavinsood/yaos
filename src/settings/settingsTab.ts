@@ -42,7 +42,7 @@ export interface VaultSyncSettingsHost {
 	buildRecoveryKitText(): string | null;
 }
 
-const CLOUDFLARE_DEPLOY_URL = "https://deploy.workers.cloudflare.com/?url=https://github.com/kavinsood/yaos/tree/main/server";
+const CLOUDFLARE_DEPLOY_URL = "https://deploy.workers.cloudflare.com/?url=https://github.com/adtstack/kaos/tree/main/server";
 
 /** Returns true if the host URL is unencrypted and not localhost. */
 function isInsecureRemoteHost(host: string): boolean {
@@ -121,7 +121,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 		const setupIncomplete = !this.host.settings.host || !this.host.settings.token;
 		const syncStatus = this.host.getSettingsStatusSummary();
 
-		addSectionHeading(containerEl, "YAOS");
+		addSectionHeading(containerEl, "KAOS");
 
 		if (setupIncomplete) {
 			const callout = containerEl.createDiv({ cls: "callout yaos-settings-setup-callout" });
@@ -222,7 +222,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 					? "A migration-sensitive server update is available. Use the guided update path."
 					: "A server update is available."
 				: updateState.pluginUpdateRecommended
-					? "This device should update the YAOS plugin soon."
+					? "This device should update the KAOS plugin soon."
 					: "Server and plugin are up to date with the latest cached manifest.";
 			updateCard.createEl("p", {
 				text: summaryText,
@@ -487,7 +487,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 
 			new Setting(advancedBody)
 				.setName("Deployment repo URL")
-				.setDesc("Optional. Example: https://github.com/you/yaos-server. Provider is inferred from this URL.")
+				.setDesc("Optional. Example: https://github.com/you/kaos-server. Provider is inferred from this URL.")
 				.addText((text) =>
 					text
 						.setPlaceholder("Paste the generated GitHub or GitLab repo URL")

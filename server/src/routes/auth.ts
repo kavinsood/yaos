@@ -31,18 +31,18 @@ async function hashToken(token: string): Promise<string> {
 }
 
 export function supportsBuckets(env: Env): boolean {
-	return env.YAOS_BUCKET !== undefined;
+	return env.KAOS_BUCKET !== undefined;
 }
 
 export function canonicalRepoForSetup(env: Env): string | undefined {
-	const raw = env.YAOS_CANONICAL_REPO?.trim();
+	const raw = env.KAOS_CANONICAL_REPO?.trim();
 	if (!raw) return undefined;
 	return /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(raw) ? raw : undefined;
 }
 
 export async function getStoredServerConfig(env: Env): Promise<StoredServerConfig> {
-	const id = env.YAOS_CONFIG.idFromName("global-config");
-	const stub = env.YAOS_CONFIG.get(id);
+	const id = env.KAOS_CONFIG.idFromName("global-config");
+	const stub = env.KAOS_CONFIG.get(id);
 	const res = await stub.fetch("https://internal/__yaos/config");
 	if (!res.ok) {
 		throw new Error(`config fetch failed (${res.status})`);
@@ -55,7 +55,7 @@ export async function getStoredServerConfig(env: Env): Promise<StoredServerConfi
 // getStoredServerConfig() does a live Durable Object fetch every call.  In
 // claim mode that fires on every Worker request.  Cache the config for a short
 // TTL so a reconnect storm or scanner traffic does not each become a separate
-// YAOS_CONFIG subrequest.
+// KAOS_CONFIG subrequest.
 //
 // Security note: we cache the *stored* config (tokenHash, updateProvider etc.),
 // not the auth decision itself.  Token verification still runs on every request
@@ -95,8 +95,8 @@ export async function getStoredServerConfigCached(env: Env): Promise<StoredServe
 }
 
 async function claimServerConfig(env: Env, tokenHash: string): Promise<boolean> {
-	const id = env.YAOS_CONFIG.idFromName("global-config");
-	const stub = env.YAOS_CONFIG.get(id);
+	const id = env.KAOS_CONFIG.idFromName("global-config");
+	const stub = env.KAOS_CONFIG.get(id);
 	const res = await stub.fetch("https://internal/__yaos/claim", {
 		method: "POST",
 		headers: {
@@ -112,8 +112,8 @@ async function setServerUpdateMetadata(env: Env, metadata: {
 	updateRepoUrl?: unknown;
 	updateRepoBranch?: unknown;
 }): Promise<StoredServerConfig> {
-	const id = env.YAOS_CONFIG.idFromName("global-config");
-	const stub = env.YAOS_CONFIG.get(id);
+	const id = env.KAOS_CONFIG.idFromName("global-config");
+	const stub = env.KAOS_CONFIG.get(id);
 	const res = await stub.fetch("https://internal/__yaos/update-metadata", {
 		method: "POST",
 		headers: {
@@ -148,7 +148,7 @@ export async function getAuthState(env: Env): Promise<AuthState> {
 
 /**
  * Cached variant of getAuthState.  Uses getStoredServerConfigCached so that
- * repeated requests within AUTH_CONFIG_CACHE_TTL_MS share a single YAOS_CONFIG
+ * repeated requests within AUTH_CONFIG_CACHE_TTL_MS share a single KAOS_CONFIG
  * subrequest instead of each paying a DO round-trip.  The cached AuthState
  * carries the full StoredServerConfig in claim/unclaimed modes so callers can
  * reuse it without a second fetch (e.g. /api/capabilities).
@@ -224,7 +224,7 @@ function buildObsidianSetupUrl(host: string, token: string, vaultId?: string): s
 	if (vaultId) {
 		params.set("vaultId", vaultId);
 	}
-	return `obsidian://yaos?${params.toString()}`;
+	return `obsidian://kaos?${params.toString()}`;
 }
 
 export function getCapabilities(

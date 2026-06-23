@@ -8,7 +8,7 @@
 // amplification patterns:
 //
 //   1. syncSocket.ts must not call recordVaultTrace at all (ws admission events
-//      are console-only; a reconnect storm must not burn YAOS_SYNC writes).
+//      are console-only; a reconnect storm must not burn KAOS_SYNC writes).
 //   2. index.ts must classify routes before calling getAuthStateCached.
 //   3. auth.ts must have a TTL cache around getStoredServerConfig.
 //   4. server.ts must bypass ensureDocumentLoaded for /cdn-cgi/partyserver/.
@@ -48,7 +48,7 @@ console.log("\n--- Test 1: syncSocket.ts has no recordVaultTrace calls (WebSocke
 	);
 	assert(
 		!source.includes('"ws-connected"'),
-		"syncSocket.ts does not trace 'ws-connected' string (not persisted to YAOS_SYNC)",
+		"syncSocket.ts does not trace 'ws-connected' string (not persisted to KAOS_SYNC)",
 	);
 	assert(
 		!/import.*recordVaultTrace/.test(source),
@@ -136,7 +136,7 @@ console.log("\n--- Test 2: index.ts classifies routes before auth (unknown paths
 }
 
 // ── Test 3: auth.ts has TTL cache ─────────────────────────────────────────────
-console.log("\n--- Test 3: auth.ts has TTL cache for YAOS_CONFIG fetches ---");
+console.log("\n--- Test 3: auth.ts has TTL cache for KAOS_CONFIG fetches ---");
 {
 	const source = readFileSync(authPath, "utf8");
 

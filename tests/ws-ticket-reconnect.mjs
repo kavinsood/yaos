@@ -16,7 +16,7 @@
  *      disconnect, the reconnect succeeds.  This is the sleep/wake scenario.
  *
  * The server is expected to be running under wrangler dev with
- * YAOS_TICKET_TTL_MS=8000 injected via the worker-integration harness.
+ * KAOS_TICKET_TTL_MS=8000 injected via the worker-integration harness.
  * This makes tickets expire in 8 seconds so that post-expiry reconnect
  * can be tested without a 5-minute wait.
  *
@@ -175,7 +175,7 @@ console.log("\n=== Test 1: initial connect uses ?ticket= ===");
 	const { ticket, ttlMs } = await fetchTicket(ROOM_ID);
 	const ttlRemaining = ttlMs;
 	console.log(`  ticket fetched; TTL remaining: ${ttlRemaining}ms`);
-	if (ttlRemaining < 500) throw new Error("Test 1: ticket expired immediately — check YAOS_TICKET_TTL_MS");
+	if (ttlRemaining < 500) throw new Error("Test 1: ticket expired immediately — check KAOS_TICKET_TTL_MS");
 
 	const ydoc = new Y.Doc();
 	const provider = new YSyncProvider(HOST, ROOM_ID, ydoc, {
@@ -283,7 +283,7 @@ console.log("\n=== Test 2: patched provider.url used on reconnect ===");
 // ---------------------------------------------------------------------------
 // Test 3: Post-expiry reconnect — sleep/wake scenario
 //
-// With YAOS_TICKET_TTL_MS=8000 the ticket expires in 8 seconds.
+// With KAOS_TICKET_TTL_MS=8000 the ticket expires in 8 seconds.
 // We wait past expiry, fetch a fresh ticket, patch the URL, then reconnect.
 // This proves that an expired ticket does not permanently break sync when
 // the URL is refreshed before the next reconnect attempt.

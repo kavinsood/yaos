@@ -72,14 +72,14 @@ export const FLIGHT_KIND = {
 	serverSvEchoSeen: "server.sv_echo.seen",
 	serverReceiptConfirmed: "server.receipt.confirmed",
 
-	// Disk — local observations (external edits, not YAOS self-writes)
+	// Disk — local observations (external edits, not KAOS self-writes)
 	diskCreateObserved: "disk.create.observed",
 	diskModifyObserved: "disk.modify.observed",
 	diskDeleteObserved: "disk.delete.observed",
-	diskEventSuppressed: "disk.event.suppressed",         // meta: YAOS decided to suppress
+	diskEventSuppressed: "disk.event.suppressed",         // meta: KAOS decided to suppress
 	diskEventNotSuppressed: "disk.event.not_suppressed",  // meta: suppression failed (priority: critical)
 
-	// Disk — YAOS writes
+	// Disk — KAOS writes
 	diskWriteOk: "disk.write.ok",
 	diskWriteFailed: "disk.write.failed",                  // priority: critical
 

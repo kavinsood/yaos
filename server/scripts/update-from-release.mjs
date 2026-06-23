@@ -12,32 +12,42 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
-const defaultReleaseRepo = "kavinsood/yaos";
-const releaseRepo = process.env.YAOS_RELEASE_REPO?.trim() || defaultReleaseRepo;
-const releaseVersion = process.env.YAOS_RELEASE_VERSION?.trim() ?? "";
+const defaultReleaseRepo = "adtstack/kaos";
+const releaseRepo = process.env.KAOS_RELEASE_REPO?.trim() || process.env.YAOS_RELEASE_REPO?.trim() || defaultReleaseRepo;
+const releaseVersion = process.env.KAOS_RELEASE_VERSION?.trim() ?? process.env.YAOS_RELEASE_VERSION?.trim() ?? "";
 const explicitArtifactInput =
-	process.env.YAOS_RELEASE_FILE?.trim() ?? process.env.YAOS_RELEASE_URL?.trim() ?? "";
+	process.env.KAOS_RELEASE_FILE?.trim() ??
+	process.env.KAOS_RELEASE_URL?.trim() ??
+	process.env.YAOS_RELEASE_FILE?.trim() ??
+	process.env.YAOS_RELEASE_URL?.trim() ??
+	"";
 const artifactSource = explicitArtifactInput
 	? resolveArtifactSource(explicitArtifactInput)
 	: releaseVersion
 		? {
 				type: "remote",
 				label: `GitHub release ${releaseRepo}@${releaseVersion}`,
-				value: `https://github.com/${releaseRepo}/releases/download/${releaseVersion}/yaos-server.zip`,
+				value: `https://github.com/${releaseRepo}/releases/download/${releaseVersion}/kaos-server.zip`,
 			}
 		: {
 				type: "remote",
 				label: `latest GitHub release from ${releaseRepo}`,
-				value: `https://github.com/${releaseRepo}/releases/latest/download/yaos-server.zip`,
+				value: `https://github.com/${releaseRepo}/releases/latest/download/kaos-server.zip`,
 			};
 
 const repoRoot = resolve(".");
-const tempDir = mkdtempSync(join(tmpdir(), "yaos-server-update-"));
-const zipPath = join(tempDir, "yaos-server.zip");
+const tempDir = mkdtempSync(join(tmpdir(), "kaos-server-update-"));
+const zipPath = join(tempDir, "kaos-server.zip");
 const extractDir = join(tempDir, "extract");
 const protectedPrefixes = [".github", ".github/"];
-const allowMigrationUpdate = process.env.YAOS_ALLOW_MIGRATION_UPDATE?.trim().toLowerCase() === "true";
-const allowSchemaRangeUpdate = process.env.YAOS_ALLOW_SCHEMA_RANGE_UPDATE?.trim().toLowerCase() === "true";
+const allowMigrationUpdate =
+	(process.env.KAOS_ALLOW_MIGRATION_UPDATE ?? process.env.YAOS_ALLOW_MIGRATION_UPDATE)
+		?.trim()
+		.toLowerCase() === "true";
+const allowSchemaRangeUpdate =
+	(process.env.KAOS_ALLOW_SCHEMA_RANGE_UPDATE ?? process.env.YAOS_ALLOW_SCHEMA_RANGE_UPDATE)
+		?.trim()
+		.toLowerCase() === "true";
 
 function collectTomlArrayBindingValues(source, sectionName, keyName) {
 	const values = new Set();
@@ -153,10 +163,10 @@ function enforceSchemaRangeUpdateGate(rawManifest) {
 
 	throw new Error(
 		[
-			"STOP: this YAOS server release has a schema compatibility gap.",
+			"STOP: this KAOS server release has a schema compatibility gap.",
 			`Local server supports ${formatSchemaRange(localRange)}; release supports ${formatSchemaRange(artifactRange)}.`,
 			"Automatic update is disabled unless the release is marked migration-required.",
-			"If you intentionally want to bypass this guard, set YAOS_ALLOW_SCHEMA_RANGE_UPDATE=true.",
+			"If you intentionally want to bypass this guard, set KAOS_ALLOW_SCHEMA_RANGE_UPDATE=true.",
 		].join(" "),
 	);
 }
@@ -209,23 +219,23 @@ function resolveArtifactSource(input) {
 	const normalizedPath = input.startsWith("file://") ? new URL(input) : resolve(input);
 	const filePath = normalizedPath instanceof URL ? normalizedPath : normalizedPath;
 	if (!existsSync(filePath)) {
-		throw new Error(`Local YAOS server artifact was not found: ${filePath}`);
+		throw new Error(`Local KAOS server artifact was not found: ${filePath}`);
 	}
 	return { type: "local", label: String(filePath), value: String(filePath) };
 }
 
 async function stageArtifactZip() {
 	if (artifactSource.type === "local") {
-		console.log(`Using local YAOS server artifact from ${artifactSource.label}`);
+		console.log(`Using local KAOS server artifact from ${artifactSource.label}`);
 		cpSync(artifactSource.value, zipPath);
 		return;
 	}
 
-	console.log(`Downloading YAOS server artifact from ${artifactSource.label}`);
+	console.log(`Downloading KAOS server artifact from ${artifactSource.label}`);
 	const response = await fetch(artifactSource.value, {
 		redirect: "follow",
 		headers: {
-			"User-Agent": "yaos-server-updater",
+			"User-Agent": "kaos-server-updater",
 		},
 	});
 	if (!response.ok) {
@@ -235,7 +245,7 @@ async function stageArtifactZip() {
 				[
 					baseMessage,
 					"Expected release assets were not found.",
-					"Make sure the selected release includes BOTH 'yaos-server.zip' and 'update-manifest.json'.",
+					"Make sure the selected release includes BOTH 'kaos-server.zip' and 'update-manifest.json'.",
 					`release_repo=${releaseRepo}${releaseVersion ? ` version=${releaseVersion}` : " version=latest"}`,
 				].join(" "),
 			);
@@ -250,7 +260,7 @@ async function main() {
 	mkdirSync(extractDir, { recursive: true });
 	execFileSync("unzip", ["-q", zipPath, "-d", extractDir], { stdio: "inherit" });
 
-	const manifestPath = join(extractDir, "yaos-server-manifest.json");
+	const manifestPath = join(extractDir, "kaos-server-manifest.json");
 	const rawManifest = JSON.parse(readFileSync(manifestPath, "utf8"));
 	if (!Array.isArray(rawManifest.updateOwnedPaths)) {
 		throw new Error("Artifact manifest is missing updateOwnedPaths");
@@ -258,10 +268,10 @@ async function main() {
 	if (rawManifest.migrationRequired === true && !allowMigrationUpdate) {
 		throw new Error(
 			[
-				"STOP: this YAOS release is marked as migration-required.",
+				"STOP: this KAOS release is marked as migration-required.",
 				"Automatic updates are disabled for migration-required releases to protect Durable Object/SQLite state.",
 				"Read the upgrade guide and apply the migration manually before re-running this updater.",
-				"If you intentionally want to bypass this guard, set YAOS_ALLOW_MIGRATION_UPDATE=true.",
+				"If you intentionally want to bypass this guard, set KAOS_ALLOW_MIGRATION_UPDATE=true.",
 			].join(" "),
 		);
 	}
@@ -300,7 +310,7 @@ async function main() {
 	}
 
 	console.log(
-		`Applied YAOS server artifact${rawManifest.serverVersion ? ` ${rawManifest.serverVersion}` : ""}`,
+		`Applied KAOS server artifact${rawManifest.serverVersion ? ` ${rawManifest.serverVersion}` : ""}`,
 	);
 }
 

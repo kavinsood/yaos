@@ -961,8 +961,8 @@ export class DiskMirror {
 	}
 
 	/**
-	 * Per-path timestamp of the most recent successful YAOS-issued
-	 * `flushWrite`. Returns null if YAOS has never written this path in
+	 * Per-path timestamp of the most recent successful KAOS-issued
+	 * `flushWrite`. Returns null if KAOS has never written this path in
 	 * this session. Used by main.ts to label `disk.modify.observed` events
 	 * with writer attribution. See spec:
 	 * .kiro/specs/editor-bound-localonly-amplifier-guard/requirements.md (R8).

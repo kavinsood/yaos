@@ -1,8 +1,8 @@
-# YAOS Conflict Semantics
+# KAOS Conflict Semantics
 
 ## Overview
 
-YAOS has four conflict classes, each with a defined policy. This document
+KAOS has four conflict classes, each with a defined policy. This document
 is the single source of truth for conflict resolution behavior.
 
 ## 1. Markdown ambiguous divergence
@@ -14,7 +14,7 @@ and no single authority can be chosen (the "ambiguous divergence" path in
 **Policy:**
 
 1. Preserve the CRDT version as a sibling conflict note:
-   `<base> (YAOS conflict from <device> <timestamp>).md`
+   `<base> (KAOS conflict from <device> <timestamp>).md`
 2. Force-replace the original path's CRDT to match the disk/editor content
    using `ORIGIN_DISK_SYNC_RECOVER_BOUND`.
 3. Trace `conflict-artifact-needed` with `convergenceApplied: true/false`.
@@ -48,7 +48,7 @@ genuinely new divergences create fresh artifacts.
 **Policy:**
 
 1. Write the remote bytes as a local-only conflict artifact:
-   `<base> (YAOS remote conflict <timestamp>).<ext>`
+   `<base> (KAOS remote conflict <timestamp>).<ext>`
 2. Preserve the local version at the original path.
 3. Mark the conflict artifact as local-only and suppress the immediate
    vault event from upload.
@@ -60,7 +60,7 @@ preserved as a local-only artifact.
 
 **Sync behavior:** Blob conflict artifacts are **local-only**. They are
 skipped by upload/reconcile paths using both the session-local guard and
-the `"(YAOS remote conflict "` filename marker, so the local-only policy
+the `"(KAOS remote conflict "` filename marker, so the local-only policy
 survives plugin restart. This differs from Markdown artifacts which sync
 normally.
 
@@ -181,11 +181,11 @@ not proof of cleanliness.
 ### Important product consequence
 
 > Remote delete does NOT win over locally modified content when the
-> baseline is known. YAOS preserves and revives the local version.
+> baseline is known. KAOS preserves and revives the local version.
 > This means deleted files CAN come back if they were locally modified.
 > This is intentional and documented behavior.
 
-When baseline is unknown, YAOS preserves locally but does NOT resurrect.
+When baseline is unknown, KAOS preserves locally but does NOT resurrect.
 This prevents "deleted folders coming back" from transient CRDT
 unavailability.
 
@@ -251,6 +251,6 @@ clears all fingerprint state. This means:
 
 **Incorrect / overclaiming wording:**
 > Recovery loops are fixed forever.
-> YAOS guarantees no repeated recovery.
+> KAOS guarantees no repeated recovery.
 
 The quarantine is a practical safety net, not a correctness proof.

@@ -63,13 +63,13 @@ async function collectBuildIdentity(
 
 	const buildIdentityExpr = `
 		(async function() {
-			const manifest = app.plugins?.plugins?.yaos?.manifest;
+			const manifest = app.plugins?.plugins?.kaos?.manifest;
 			let bundleHash = "unknown";
 			try {
 				const basePath = app.vault.adapter.basePath;
 				const fs = require("fs");
 				const crypto = require("crypto");
-				const buf = fs.readFileSync(basePath + "/.obsidian/plugins/yaos/main.js");
+				const buf = fs.readFileSync(basePath + "/.obsidian/plugins/kaos/main.js");
 				bundleHash = crypto.createHash("sha256").update(buf).digest("hex");
 			} catch (e) { /* mobile or missing */ }
 			return {
@@ -1243,13 +1243,13 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		// ── Disable YAOS on B ────────────────────────────────────────────
 
 		log("Action: disabling YAOS plugin on Device B...");
-		await b.evalRaw(`app.plugins.disablePlugin("yaos")`);
+		await b.evalRaw(`app.plugins.disablePlugin("kaos")`);
 		await new Promise((r) => setTimeout(r, 3000));
 
-		const yaosUnloaded = await b.evalRaw<boolean>(`!app.plugins?.plugins?.yaos`);
+		const yaosUnloaded = await b.evalRaw<boolean>(`!app.plugins?.plugins?.kaos`);
 		if (!yaosUnloaded) {
 			errors.push("B: YAOS plugin instance still present after disablePlugin");
-			await b.evalRaw(`app.plugins.enablePlugin("yaos")`).catch(() => {});
+			await b.evalRaw(`app.plugins.enablePlugin("kaos")`).catch(() => {});
 			return { passedA: false, passedB: false, errors };
 		}
 		log("Action: YAOS unloaded on B ✓");
@@ -1279,7 +1279,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		`);
 		if (!editedContent.includes(DISABLE_MARKER)) {
 			errors.push("B: edit did not land on disk while YAOS was disabled");
-			await b.evalRaw(`app.plugins.enablePlugin("yaos")`).catch(() => {});
+			await b.evalRaw(`app.plugins.enablePlugin("kaos")`).catch(() => {});
 			return { passedA: false, passedB: false, errors };
 		}
 		log("Action: edit landed on B disk while YAOS disabled ✓");
@@ -1287,13 +1287,13 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		// ── Re-enable YAOS on B ──────────────────────────────────────────
 
 		log("Action: re-enabling YAOS plugin on Device B...");
-		await b.evalRaw(`app.plugins.enablePlugin("yaos")`);
+		await b.evalRaw(`app.plugins.enablePlugin("kaos")`);
 
 		const qaReady = await b.evalRaw<boolean>(`
 			(async () => {
 				const deadline = Date.now() + 30000;
 				while (Date.now() < deadline) {
-					const yaos = app.plugins?.plugins?.yaos;
+					const yaos = app.plugins?.plugins?.kaos;
 					const debug = window.__YAOS_DEBUG__;
 					if (yaos && debug && debug.isLocalReady()) return true;
 					await new Promise(r => setTimeout(r, 500));
@@ -1416,7 +1416,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		// ── Disable YAOS on B ────────────────────────────────────────────
 
 		log("Action: disabling YAOS plugin on Device B...");
-		await b.evalRaw(`app.plugins.disablePlugin("yaos")`);
+		await b.evalRaw(`app.plugins.disablePlugin("kaos")`);
 
 		// Wait for plugin to fully unload
 		await new Promise((r) => setTimeout(r, 3000));
@@ -1424,10 +1424,10 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		// Assert: YAOS is actually unloaded (plugin instance destroyed)
 		// Note: enabledPlugins Set may not update synchronously, so check
 		// the plugin instance directly.
-		const yaosUnloaded = await b.evalRaw<boolean>(`!app.plugins?.plugins?.yaos`);
+		const yaosUnloaded = await b.evalRaw<boolean>(`!app.plugins?.plugins?.kaos`);
 		if (!yaosUnloaded) {
 			errors.push("B: YAOS plugin instance still present after disablePlugin");
-			await b.evalRaw(`app.plugins.enablePlugin("yaos")`).catch(() => {});
+			await b.evalRaw(`app.plugins.enablePlugin("kaos")`).catch(() => {});
 			return { passedA: false, passedB: false, errors };
 		}
 		log("Action: YAOS unloaded on B (plugin instance gone) ✓");
@@ -1469,7 +1469,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		`);
 		if (!editedContent.includes(DISABLE_MARKER)) {
 			errors.push("B: edit did not land on disk while YAOS was disabled");
-			await b.evalRaw(`app.plugins.enablePlugin("yaos")`).catch(() => {});
+			await b.evalRaw(`app.plugins.enablePlugin("kaos")`).catch(() => {});
 			return { passedA: false, passedB: false, errors };
 		}
 		log("Action: edit landed on B disk while YAOS disabled ✓");
@@ -1485,7 +1485,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		// ── Re-enable YAOS on B ──────────────────────────────────────────
 
 		log("Action: re-enabling YAOS plugin on Device B...");
-		await b.evalRaw(`app.plugins.enablePlugin("yaos")`);
+		await b.evalRaw(`app.plugins.enablePlugin("kaos")`);
 
 		// Wait for YAOS to fully initialize
 		// Poll until YAOS plugin is loaded and debug API is functional
@@ -1493,7 +1493,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 			(async () => {
 				const deadline = Date.now() + 30000;
 				while (Date.now() < deadline) {
-					const yaos = app.plugins?.plugins?.yaos;
+					const yaos = app.plugins?.plugins?.kaos;
 					const debug = window.__YAOS_DEBUG__;
 					if (yaos && debug && debug.isLocalReady()) return true;
 					await new Promise(r => setTimeout(r, 500));
@@ -1763,13 +1763,13 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		// The saved index should now have contentHash = SHA-256(INITIAL + ENABLED_EDIT)
 
 		log("Action: disabling YAOS on B (baseline should be post-enabled-edit)...");
-		await b.evalRaw(`app.plugins.disablePlugin("yaos")`);
+		await b.evalRaw(`app.plugins.disablePlugin("kaos")`);
 		await new Promise((r) => setTimeout(r, 3000));
 
-		const yaosUnloaded = await b.evalRaw<boolean>(`!app.plugins?.plugins?.yaos`);
+		const yaosUnloaded = await b.evalRaw<boolean>(`!app.plugins?.plugins?.kaos`);
 		if (!yaosUnloaded) {
 			errors.push("B: YAOS still present after disablePlugin");
-			await b.evalRaw(`app.plugins.enablePlugin("yaos")`).catch(() => {});
+			await b.evalRaw(`app.plugins.enablePlugin("kaos")`).catch(() => {});
 			return { passedA: false, passedB: false, errors };
 		}
 		log("Action: YAOS unloaded ✓");
@@ -1805,7 +1805,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		`);
 		if (!editedContent.includes(DISABLED_EDIT_MARKER)) {
 			errors.push("B: disabled-time edit did not land on disk");
-			await b.evalRaw(`app.plugins.enablePlugin("yaos")`).catch(() => {});
+			await b.evalRaw(`app.plugins.enablePlugin("kaos")`).catch(() => {});
 			return { passedA: false, passedB: false, errors };
 		}
 		log("Action: disabled-time edit on disk ✓");
@@ -1813,13 +1813,13 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		// ── Step 7: Re-enable YAOS on B ───────────────────────────────────
 
 		log("Action: re-enabling YAOS on B...");
-		await b.evalRaw(`app.plugins.enablePlugin("yaos")`);
+		await b.evalRaw(`app.plugins.enablePlugin("kaos")`);
 
 		const qaReady = await b.evalRaw<boolean>(`
 			(async () => {
 				const deadline = Date.now() + 30000;
 				while (Date.now() < deadline) {
-					const yaos = app.plugins?.plugins?.yaos;
+					const yaos = app.plugins?.plugins?.kaos;
 					const debug = window.__YAOS_DEBUG__;
 					if (yaos && debug && debug.isLocalReady()) return true;
 					await new Promise(r => setTimeout(r, 500));
@@ -1927,13 +1927,13 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		// ── Disable YAOS on B ────────────────────────────────────────────
 
 		log("Action: disabling YAOS on B...");
-		await b.evalRaw(`app.plugins.disablePlugin("yaos")`);
+		await b.evalRaw(`app.plugins.disablePlugin("kaos")`);
 		await new Promise((r) => setTimeout(r, 3000));
 
-		const yaosUnloaded = await b.evalRaw<boolean>(`!app.plugins?.plugins?.yaos`);
+		const yaosUnloaded = await b.evalRaw<boolean>(`!app.plugins?.plugins?.kaos`);
 		if (!yaosUnloaded) {
 			errors.push("B: YAOS still present after disablePlugin");
-			await b.evalRaw(`app.plugins.enablePlugin("yaos")`).catch(() => {});
+			await b.evalRaw(`app.plugins.enablePlugin("kaos")`).catch(() => {});
 			return { passedA: false, passedB: false, errors };
 		}
 		log("Action: YAOS unloaded ✓");
@@ -1951,7 +1951,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		`);
 		if (!deleteOk) {
 			errors.push("B: could not delete file while YAOS was disabled");
-			await b.evalRaw(`app.plugins.enablePlugin("yaos")`).catch(() => {});
+			await b.evalRaw(`app.plugins.enablePlugin("kaos")`).catch(() => {});
 			return { passedA: false, passedB: false, errors };
 		}
 		log("Action: file deleted on B disk ✓");
@@ -1962,13 +1962,13 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		// ── Re-enable YAOS on B ──────────────────────────────────────────
 
 		log("Action: re-enabling YAOS on B...");
-		await b.evalRaw(`app.plugins.enablePlugin("yaos")`);
+		await b.evalRaw(`app.plugins.enablePlugin("kaos")`);
 
 		const qaReady = await b.evalRaw<boolean>(`
 			(async () => {
 				const deadline = Date.now() + 30000;
 				while (Date.now() < deadline) {
-					const yaos = app.plugins?.plugins?.yaos;
+					const yaos = app.plugins?.plugins?.kaos;
 					const debug = window.__YAOS_DEBUG__;
 					if (yaos && debug && debug.isLocalReady()) return true;
 					await new Promise(r => setTimeout(r, 500));
@@ -2086,13 +2086,13 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		// ── Disable YAOS on B ────────────────────────────────────────────
 
 		log("Action: disabling YAOS on B...");
-		await b.evalRaw(`app.plugins.disablePlugin("yaos")`);
+		await b.evalRaw(`app.plugins.disablePlugin("kaos")`);
 		await new Promise((r) => setTimeout(r, 3000));
 
-		const yaosUnloaded = await b.evalRaw<boolean>(`!app.plugins?.plugins?.yaos`);
+		const yaosUnloaded = await b.evalRaw<boolean>(`!app.plugins?.plugins?.kaos`);
 		if (!yaosUnloaded) {
 			errors.push("B: YAOS still present after disablePlugin");
-			await b.evalRaw(`app.plugins.enablePlugin("yaos")`).catch(() => {});
+			await b.evalRaw(`app.plugins.enablePlugin("kaos")`).catch(() => {});
 			return { passedA: false, passedB: false, errors };
 		}
 		log("Action: YAOS unloaded ✓");
@@ -2110,7 +2110,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		`);
 		if (!deleteOk) {
 			errors.push("B: could not delete file while YAOS was disabled");
-			await b.evalRaw(`app.plugins.enablePlugin("yaos")`).catch(() => {});
+			await b.evalRaw(`app.plugins.enablePlugin("kaos")`).catch(() => {});
 			return { passedA: false, passedB: false, errors };
 		}
 		log("Action: file deleted on B disk ✓");
@@ -2125,13 +2125,13 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		// ── Re-enable YAOS on B ──────────────────────────────────────────
 
 		log("Action: re-enabling YAOS on B...");
-		await b.evalRaw(`app.plugins.enablePlugin("yaos")`);
+		await b.evalRaw(`app.plugins.enablePlugin("kaos")`);
 
 		const qaReady = await b.evalRaw<boolean>(`
 			(async () => {
 				const deadline = Date.now() + 30000;
 				while (Date.now() < deadline) {
-					const yaos = app.plugins?.plugins?.yaos;
+					const yaos = app.plugins?.plugins?.kaos;
 					const debug = window.__YAOS_DEBUG__;
 					if (yaos && debug && debug.isLocalReady()) return true;
 					await new Promise(r => setTimeout(r, 500));
@@ -2301,8 +2301,8 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		await b.evalRaw(`window.__YAOS_DEBUG__?.waitForIdle(10000)`);
 		await new Promise((r) => setTimeout(r, 3000));
 
-		const fileIdA = await a.evalRaw<string | null>(`app.plugins.plugins['yaos']?.vaultSync?.getFileId(${JSON.stringify(scratch)}) ?? null`);
-		const fileIdB = await b.evalRaw<string | null>(`app.plugins.plugins['yaos']?.vaultSync?.getFileId(${JSON.stringify(scratch)}) ?? null`);
+		const fileIdA = await a.evalRaw<string | null>(`app.plugins.plugins['kaos']?.vaultSync?.getFileId(${JSON.stringify(scratch)}) ?? null`);
+		const fileIdB = await b.evalRaw<string | null>(`app.plugins.plugins['kaos']?.vaultSync?.getFileId(${JSON.stringify(scratch)}) ?? null`);
 		log(`s11a: fileId A=${fileIdA}, B=${fileIdB}`);
 
 		if (!fileIdA || !fileIdB) {
@@ -2477,7 +2477,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 				);
 				const trackerStatus = await client.evalRaw<string>(`
 					(function() {
-						const t = app.plugins.plugins['yaos']?.deviceWitnessTracker;
+						const t = app.plugins.plugins['kaos']?.deviceWitnessTracker;
 						if (!t) return 'tracker_inactive';
 						return 'active_no_segments';
 					})()
@@ -2627,8 +2627,8 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		await b.evalRaw(`window.__YAOS_DEBUG__?.waitForIdle(10000)`);
 		await new Promise((r) => setTimeout(r, 3000));
 
-		const fileIdA = await a.evalRaw<string | null>(`app.plugins.plugins['yaos']?.vaultSync?.getFileId(${JSON.stringify(scratch)}) ?? null`);
-		const fileIdB = await b.evalRaw<string | null>(`app.plugins.plugins['yaos']?.vaultSync?.getFileId(${JSON.stringify(scratch)}) ?? null`);
+		const fileIdA = await a.evalRaw<string | null>(`app.plugins.plugins['kaos']?.vaultSync?.getFileId(${JSON.stringify(scratch)}) ?? null`);
+		const fileIdB = await b.evalRaw<string | null>(`app.plugins.plugins['kaos']?.vaultSync?.getFileId(${JSON.stringify(scratch)}) ?? null`);
 		log(`s11b: fileId A=${fileIdA}, B=${fileIdB}`);
 		if (!fileIdA || !fileIdB) {
 			errors.push(`s11b: fileId not available -- A=${fileIdA}, B=${fileIdB}`);
@@ -2665,9 +2665,9 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		// ── Phase 2: Disable B, concurrent edits, re-enable B ────────────
 
 		log("s11b: Phase 2 -- disabling YAOS on B...");
-		await b.evalRaw(`app.plugins.disablePlugin("yaos")`);
+		await b.evalRaw(`app.plugins.disablePlugin("kaos")`);
 		await new Promise((r) => setTimeout(r, 3000));
-		const unloaded = await b.evalRaw<boolean>(`!app.plugins?.plugins?.yaos`);
+		const unloaded = await b.evalRaw<boolean>(`!app.plugins?.plugins?.kaos`);
 		if (!unloaded) { errors.push("s11b: YAOS did not unload on B"); stopPollingA(); stopPollingB(); return { passedA: false, passedB: false, errors }; }
 		log("s11b: YAOS unloaded on B ✓");
 
@@ -2701,7 +2701,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 
 		// Re-enable B
 		log("s11b: re-enabling YAOS on B...");
-		await b.evalRaw(`app.plugins.enablePlugin("yaos")`);
+		await b.evalRaw(`app.plugins.enablePlugin("kaos")`);
 		const ready = await b.evalRaw<boolean>(`
 			(async () => {
 				for (let i = 0; i < 60; i++) {
@@ -3337,7 +3337,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		}
 
 		// Get pathId for the s13 file to filter bundle events to only this file
-		const pathIdA = await a.evalRaw<string | null>(`(async () => { const r = await window.__YAOS_DEBUG__?.getActiveTraceInfo?.(); const ftc = app.plugins.plugins.yaos?.flightTrace; if (!ftc) return null; const p = await ftc.getPathId(${JSON.stringify(scratch)}); return p?.pathId ?? null; })()`);
+		const pathIdA = await a.evalRaw<string | null>(`(async () => { const r = await window.__YAOS_DEBUG__?.getActiveTraceInfo?.(); const ftc = app.plugins.plugins.kaos?.flightTrace; if (!ftc) return null; const p = await ftc.getPathId(${JSON.stringify(scratch)}); return p?.pathId ?? null; })()`);
 		log(`s13: pathId for s13 file: ${pathIdA}`);
 
 		// Export bundles and run offline analyzer -- filter to s13 file events only
@@ -3515,7 +3515,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 			const deviceId = await client.evalRaw<string>(`window.__YAOS_DEBUG__?.getDeviceId()`);
 			const secretHash = await client.evalRaw<string>(`window.__YAOS_DEBUG__?.getActiveTraceInfo()?.qaTraceSecretHash ?? ""`);
 			const segs = await client.evalRaw<string | null>(`window.__YAOS_DEBUG__?.exportWitnessSegments?.(${JSON.stringify(traceId)}) ?? null`);
-			const pathIdRaw = await client.evalRaw<string | null>(`(async()=>{const ftc=app.plugins.plugins.yaos?.flightTrace;if(!ftc)return null;const p=await ftc.getPathId(${JSON.stringify(scratch)});return p?.pathId??null;})()`);
+			const pathIdRaw = await client.evalRaw<string | null>(`(async()=>{const ftc=app.plugins.plugins.kaos?.flightTrace;if(!ftc)return null;const p=await ftc.getPathId(${JSON.stringify(scratch)});return p?.pathId??null;})()`);
 			const lines = (segs || "").split("\n").filter((l) => l.trim());
 			const filtered = lines.filter((l) => {
 				try {
@@ -3609,9 +3609,9 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		await new Promise((r) => setTimeout(r, 5000));
 		log("s12c: baseline quorum triggered");
 
-		await b.evalRaw(`app.plugins.disablePlugin("yaos")`);
+		await b.evalRaw(`app.plugins.disablePlugin("kaos")`);
 		await new Promise((r) => setTimeout(r, 2000));
-		const bDisabled = await b.evalRaw<boolean>(`!app.plugins.plugins.yaos`);
+		const bDisabled = await b.evalRaw<boolean>(`!app.plugins.plugins.kaos`);
 		if (!bDisabled) errors.push("s12c: B YAOS not disabled");
 		log(`s12c: B YAOS disabled: ${bDisabled}`);
 
@@ -3628,9 +3628,9 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		await new Promise((r) => setTimeout(r, 1000));
 		log("s12c: B wrote LOCAL_ON_B directly to disk");
 
-		await b.evalRaw(`app.plugins.enablePlugin("yaos")`);
+		await b.evalRaw(`app.plugins.enablePlugin("kaos")`);
 		await new Promise((r) => setTimeout(r, 5000));
-		const bReady = await b.evalRaw<boolean>(`!!app.plugins.plugins.yaos`);
+		const bReady = await b.evalRaw<boolean>(`!!app.plugins.plugins.kaos`);
 		if (!bReady) errors.push("s12c: B YAOS did not re-enable");
 		log(`s12c: B YAOS re-enabled: ${bReady}`);
 
@@ -3688,7 +3688,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 			const deviceId = await client.evalRaw<string>(`window.__YAOS_DEBUG__?.getDeviceId()`);
 			const secretHash = await client.evalRaw<string>(`window.__YAOS_DEBUG__?.getActiveTraceInfo()?.qaTraceSecretHash ?? ""`);
 			const segs = await client.evalRaw<string | null>(`window.__YAOS_DEBUG__?.exportWitnessSegments?.(${JSON.stringify(traceId)}) ?? null`);
-			const pathIdRaw = await client.evalRaw<string | null>(`(async()=>{const ftc=app.plugins.plugins.yaos?.flightTrace;if(!ftc)return null;const p=await ftc.getPathId(${JSON.stringify(scratch)});return p?.pathId??null;})()`);
+			const pathIdRaw = await client.evalRaw<string | null>(`(async()=>{const ftc=app.plugins.plugins.kaos?.flightTrace;if(!ftc)return null;const p=await ftc.getPathId(${JSON.stringify(scratch)});return p?.pathId??null;})()`);
 			const lines = (segs || "").split("\n").filter((l) => l.trim());
 			const filtered = lines.filter((l) => { try { const obj = JSON.parse(l) as Record<string, unknown>; if (obj.kind === "checkpoint.segment.header") return true; if (obj.kind !== "device.witness.settled" && obj.kind !== "device.witness.diverged") return true; return obj.pathId === pathIdRaw; } catch { return false; } });
 			const eventCount = filtered.filter((l) => { try { return (JSON.parse(l) as Record<string, unknown>).kind !== "checkpoint.segment.header"; } catch { return false; } }).length;

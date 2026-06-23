@@ -742,7 +742,7 @@ export class EditorBindingManager {
 		if (this.cmDegradedWarned) return;
 		this.cmDegradedWarned = true;
 		new Notice(
-			"YAOS: Could not resolve the active editor instance. " +
+			"KAOS: Could not resolve the active editor instance. " +
 			"Live collaborative editing is unavailable. Background sync may still continue, " +
 			"but live cursors and editor binding are degraded. Please check for a plugin update.",
 			10000,

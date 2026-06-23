@@ -3,11 +3,11 @@
  *
  * Verifies at runtime that unknown/junk request paths return 404 without
  * touching any Durable Object namespace.  A trap env is used — any access to
- * YAOS_CONFIG or YAOS_SYNC throws with a clear error message so the test fails
+ * KAOS_CONFIG or KAOS_SYNC throws with a clear error message so the test fails
  * loudly rather than silently passing if the DO access is swallowed.
  *
  * Also verifies that the /api/capabilities endpoint in claim mode only calls
- * YAOS_CONFIG once (auth + capabilities reuse the same fetched config).
+ * KAOS_CONFIG once (auth + capabilities reuse the same fetched config).
  */
 
 import worker from "../server/src/index";
@@ -45,13 +45,13 @@ function makeTrapNamespace() {
 }
 
 const trapEnv: Env = {
-	YAOS_SYNC: makeTrapNamespace() as unknown as Env["YAOS_SYNC"],
-	YAOS_CONFIG: makeTrapNamespace() as unknown as Env["YAOS_CONFIG"],
+	KAOS_SYNC: makeTrapNamespace() as unknown as Env["KAOS_SYNC"],
+	KAOS_CONFIG: makeTrapNamespace() as unknown as Env["KAOS_CONFIG"],
 	SYNC_TOKEN: undefined,
 };
 
 // ── Test 1: junk paths return 404 without touching any DO ─────────────────────
-console.log("\n--- Test 1: junk paths return 404 without touching YAOS_CONFIG or YAOS_SYNC ---");
+console.log("\n--- Test 1: junk paths return 404 without touching KAOS_CONFIG or KAOS_SYNC ---");
 {
 	const junkPaths = [
 		"/wp-login.php",
@@ -87,7 +87,7 @@ console.log("\n--- Test 1: junk paths return 404 without touching YAOS_CONFIG or
 console.log("\n--- Test 2: vault-shaped garbage paths return 404 without DO access ---");
 {
 	// These are the paths the reviewer explicitly flagged as still potentially
-	// hitting YAOS_CONFIG after the first pass of the fix:
+	// hitting KAOS_CONFIG after the first pass of the fix:
 	//   /vault/foo              — no resource
 	//   /vault/foo/random       — unknown resource
 	//   /vault/foo/wp-login.php — garbage resource with plausible vault prefix
@@ -121,7 +121,7 @@ console.log("\n--- Test 2: vault-shaped garbage paths return 404 without DO acce
 	}
 }
 
-// ── Test 3: Two claim-mode requests within TTL share one YAOS_CONFIG fetch ────
+// ── Test 3: Two claim-mode requests within TTL share one KAOS_CONFIG fetch ────
 //
 // This is the core issue #40 TTL cache runtime proof.  In claim mode, the
 // first request populates the cache; the second request within the TTL window
@@ -130,7 +130,7 @@ console.log("\n--- Test 2: vault-shaped garbage paths return 404 without DO acce
 // Both requests go through getAuthStateCached (one fetch) AND
 // handleCapabilities which reuses authState.config (zero extra fetch).
 // Total fetches for two requests: 1.  Before the fix it was 4 (2×2).
-console.log("\n--- Test 3: two claim-mode requests within TTL share one YAOS_CONFIG fetch ---");
+console.log("\n--- Test 3: two claim-mode requests within TTL share one KAOS_CONFIG fetch ---");
 {
 	invalidateStoredServerConfigCache();
 
@@ -144,8 +144,8 @@ console.log("\n--- Test 3: two claim-mode requests within TTL share one YAOS_CON
 	};
 
 	const countingEnv: Env = {
-		YAOS_SYNC: makeTrapNamespace() as unknown as Env["YAOS_SYNC"],
-		YAOS_CONFIG: {
+		KAOS_SYNC: makeTrapNamespace() as unknown as Env["KAOS_SYNC"],
+		KAOS_CONFIG: {
 			idFromName: () => "global-config" as unknown as DurableObjectId,
 			idFromString: (_id: string) => _id as unknown as DurableObjectId,
 			get: (_id: unknown) => ({
@@ -160,7 +160,7 @@ console.log("\n--- Test 3: two claim-mode requests within TTL share one YAOS_CON
 			}) as unknown as DurableObjectStub,
 			newUniqueId: () => { throw new Error("unexpected"); },
 			jurisdiction: (_j: string) => { throw new Error("unexpected"); },
-		} as unknown as Env["YAOS_CONFIG"],
+		} as unknown as Env["KAOS_CONFIG"],
 		SYNC_TOKEN: undefined,
 	};
 
@@ -169,7 +169,7 @@ console.log("\n--- Test 3: two claim-mode requests within TTL share one YAOS_CON
 		countingEnv,
 	);
 	assert(resp.status === 200, "/api/capabilities in claim mode returns 200");
-	assert(fetchCount === 1, `/api/capabilities in claim mode called YAOS_CONFIG exactly once (got ${fetchCount})`);
+	assert(fetchCount === 1, `/api/capabilities in claim mode called KAOS_CONFIG exactly once (got ${fetchCount})`);
 
 	// Second request uses the TTL cache — zero additional DO calls.
 	fetchCount = 0;
@@ -178,28 +178,28 @@ console.log("\n--- Test 3: two claim-mode requests within TTL share one YAOS_CON
 		countingEnv,
 	);
 	assert(resp2.status === 200, "/api/capabilities second request returns 200");
-	assert(fetchCount === 0, `second /api/capabilities within TTL uses cache (YAOS_CONFIG called ${fetchCount} times, expected 0)`);
+	assert(fetchCount === 0, `second /api/capabilities within TTL uses cache (KAOS_CONFIG called ${fetchCount} times, expected 0)`);
 
 	invalidateStoredServerConfigCache();
 }
 
 // ── Test 4: claimed routes in unclaimed mode return expected error ─────────────
 //
-// In unclaimed mode, getAuthStateCached must NOT call YAOS_SYNC.  Auth
-// decisions happen entirely on YAOS_CONFIG config, before any vault routing.
-console.log("\n--- Test 4: unclaimed mode — vault routes rejected without YAOS_SYNC access ---");
+// In unclaimed mode, getAuthStateCached must NOT call KAOS_SYNC.  Auth
+// decisions happen entirely on KAOS_CONFIG config, before any vault routing.
+console.log("\n--- Test 4: unclaimed mode — vault routes rejected without KAOS_SYNC access ---");
 {
 	invalidateStoredServerConfigCache();
 
 	let syncTouched = false;
 	const trapSyncEnv: Env = {
-		YAOS_SYNC: {
+		KAOS_SYNC: {
 			idFromName: (_name: string) => {
 				syncTouched = true;
-				throw new Error("YAOS_SYNC accessed before auth succeeded");
+				throw new Error("KAOS_SYNC accessed before auth succeeded");
 			},
-		} as unknown as Env["YAOS_SYNC"],
-		YAOS_CONFIG: {
+		} as unknown as Env["KAOS_SYNC"],
+		KAOS_CONFIG: {
 			idFromName: () => "global-config" as unknown as DurableObjectId,
 			idFromString: (_id: string) => _id as unknown as DurableObjectId,
 			get: (_id: unknown) => ({
@@ -216,7 +216,7 @@ console.log("\n--- Test 4: unclaimed mode — vault routes rejected without YAOS
 			}) as unknown as DurableObjectStub,
 			newUniqueId: () => { throw new Error("unexpected"); },
 			jurisdiction: (_j: string) => { throw new Error("unexpected"); },
-		} as unknown as Env["YAOS_CONFIG"],
+		} as unknown as Env["KAOS_CONFIG"],
 		SYNC_TOKEN: undefined,
 	};
 
@@ -225,7 +225,7 @@ console.log("\n--- Test 4: unclaimed mode — vault routes rejected without YAOS
 		trapSyncEnv,
 	);
 	assert(resp.status === 503, "unclaimed mode: vault route returns 503");
-	assert(!syncTouched, "unclaimed mode: YAOS_SYNC was not touched");
+	assert(!syncTouched, "unclaimed mode: KAOS_SYNC was not touched");
 
 	invalidateStoredServerConfigCache();
 }
@@ -236,7 +236,7 @@ console.log("\n--- Test 4: unclaimed mode — vault routes rejected without YAOS
 // resource-only whitelisting.  These have a valid resource segment but an
 // invalid method or subpath combination that the server never handles.
 // They must be rejected by isKnownVaultRouteShape() before auth.
-console.log("\n--- Test 5: valid resource + invalid shape returns 404 without YAOS_CONFIG ---");
+console.log("\n--- Test 5: valid resource + invalid shape returns 404 without KAOS_CONFIG ---");
 {
 	const invalidShapePaths: Array<[string, string]> = [
 		// method, path
@@ -276,17 +276,17 @@ console.log("\n--- Test 5: valid resource + invalid shape returns 404 without YA
 console.log("\n--- Test 6: /vault/sync/:vaultId is classified as sync-socket, not vault ---");
 {
 	// The trap env throws on DO access.  A sync-socket route calls
-	// getServerByName(env.YAOS_SYNC) so it WOULD throw.  But the classifier
+	// getServerByName(env.KAOS_SYNC) so it WOULD throw.  But the classifier
 	// result itself (before dispatch) is what we want to verify.
 	// We test the side-effect: a WS-upgrade request to the sync path must not
 	// return 404 (which would happen if parseSyncPath were skipped).
 	//
-	// Use an env with a working YAOS_SYNC stub that rejects the non-WS request
+	// Use an env with a working KAOS_SYNC stub that rejects the non-WS request
 	// with a 426 so we can distinguish "classified as sync" from "classified as
-	// not-found (404)".  Auth is via SYNC_TOKEN so YAOS_CONFIG is not needed.
+	// not-found (404)".  Auth is via SYNC_TOKEN so KAOS_CONFIG is not needed.
 	const syncTestEnv: Env = {
 		SYNC_TOKEN: "test-token-for-sync-ordering-check",
-		YAOS_SYNC: {
+		KAOS_SYNC: {
 			idFromName: (_name: string) => _name as unknown as DurableObjectId,
 			get: (_id: unknown) => ({
 				fetch: async (_url: string, _init?: RequestInit) => {
@@ -299,8 +299,8 @@ console.log("\n--- Test 6: /vault/sync/:vaultId is classified as sync-socket, no
 			}) as unknown as DurableObjectStub,
 			newUniqueId: () => { throw new Error("unexpected"); },
 			jurisdiction: (_j: string) => { throw new Error("unexpected"); },
-		} as unknown as Env["YAOS_SYNC"],
-		YAOS_CONFIG: makeTrapNamespace() as unknown as Env["YAOS_CONFIG"],
+		} as unknown as Env["KAOS_SYNC"],
+		KAOS_CONFIG: makeTrapNamespace() as unknown as Env["KAOS_CONFIG"],
 	};
 
 	// Non-WS request to sync path — classified as sync-socket, routed to the

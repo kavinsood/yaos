@@ -93,7 +93,7 @@ export class PersistentTraceLogger implements TraceLoggerPort {
 			vaultId: options.vaultId,
 		};
 		this.rootDir = normalizePath(
-			`${this.app.vault.configDir}/plugins/yaos/logs`,
+			`${this.app.vault.configDir}/plugins/kaos/logs`,
 		);
 	}
 

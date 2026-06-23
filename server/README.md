@@ -1,10 +1,10 @@
-# YAOS server
+# KAOS server
 
-Cloudflare Worker / Durable Object backend for the YAOS Obsidian plugin. It relays
+Cloudflare Worker / Durable Object backend for the KAOS Obsidian plugin. It relays
 Yjs CRDT updates, optionally stores attachments in R2, and stores snapshots when R2
 is configured.
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/kavinsood/yaos/tree/main/server)
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/adtstack/kaos/tree/main/server)
 
 ## What this server does
 
@@ -32,22 +32,22 @@ The default deploy is text-only:
 - no R2 binding is required up front
 - the first browser visit shows the claim page
 
-That claim page generates a token in the browser and returns an `obsidian://yaos?...` setup link you can use to configure the plugin.
+That claim page generates a token in the browser and returns an `obsidian://kaos?...` setup link you can use to configure the plugin.
 
 ## Updating an existing deploy
 
 The Deploy to Cloudflare button creates a new repository in your own Git account and connects this Worker to that new repo.
 
-That means future pushes to your generated repo will redeploy automatically, but future pushes to the original `kavinsood/yaos` template repo will not update your existing Worker on their own.
+That means future pushes to your generated repo will redeploy automatically, but future pushes to the original `adtstack/kaos` template repo will not update your existing Worker on their own.
 
-To pick up new YAOS changes later:
+To pick up new KAOS changes later:
 
 1. Add your generated repo URL in the plugin settings (`Deployment repo URL`).
 2. Use **Initialize updater** once (GitHub) if workflows are missing.
 3. Use **Open update action** from plugin settings and run the update workflow.
 4. Cloudflare redeploys automatically after the workflow push.
 
-Server updates are published through the main YAOS GitHub release stream. See
+Server updates are published through the main KAOS GitHub release stream. See
 [`engineering/version-release-management.md`](../engineering/version-release-management.md)
 for how plugin, server, and schema versions are bumped together.
 
@@ -57,7 +57,7 @@ If you want attachments and snapshots later:
 
 1. Create an R2 bucket in the Cloudflare dashboard.
 2. Open your Worker in **Workers & Pages**.
-3. Add an R2 binding named `YAOS_BUCKET`.
+3. Add an R2 binding named `KAOS_BUCKET`.
 
 The same Worker will then begin reporting attachments and snapshots as available.
 
@@ -68,13 +68,13 @@ If the Cloudflare dashboard UI is transiently failing when attaching the bucket,
 
 ```toml
 [[r2_buckets]]
-binding = "YAOS_BUCKET"
+binding = "KAOS_BUCKET"
 bucket_name = "your-bucket-name"
 ```
 
 3. Commit and push. Cloudflare redeploys from that commit.
 
-After deploy, refresh your Worker URL. YAOS should report attachments/snapshots as available.
+After deploy, refresh your Worker URL. KAOS should report attachments/snapshots as available.
 
 ## Local development
 

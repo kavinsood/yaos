@@ -50,7 +50,7 @@ console.log("\n--- Test 1: v2 concurrent offline rename converges to one active 
 	base.transact(() => {
 		sys.set("schemaVersion", 2);
 		const text = new Y.Text();
-		text.insert(0, "Hello from YAOS");
+		text.insert(0, "Hello from KAOS");
 		idToText.set(fileId, text);
 		meta.set(fileId, { path: initialPath, mtime: 1, device: "seed" });
 		// Keep legacy map populated to ensure v2 behavior does not depend on it.

@@ -50,7 +50,7 @@ async function main() {
 
 	const oversizedDebug = await getJson(`/vault/${encodeURIComponent(traceRoomId)}/debug/recent`);
 	assert(oversizedDebug.res.ok, "debug endpoint returns successfully after oversized trace payload");
-	// Note: ws-rejected events are no longer persisted to YAOS_SYNC (issue #40
+	// Note: ws-rejected events are no longer persisted to KAOS_SYNC (issue #40
 	// amplification fix — a schema-mismatch loop must not hammer the DO).
 	// They are logged via console.warn only.  The trace list may be empty or
 	// contain unrelated room events; we only verify the endpoint is healthy.

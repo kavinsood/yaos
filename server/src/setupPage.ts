@@ -24,7 +24,7 @@ function escapeHtml(value: string): string {
 }
 
 const IS_MARKETPLACE_APPROVED = true;
-const DEFAULT_DEPLOY_REPO = "kavinsood/yaos";
+const DEFAULT_DEPLOY_REPO = "adtstack/kaos";
 
 function normalizeDeployRepo(value: string | undefined): string {
 	const raw = value?.trim();
@@ -41,7 +41,7 @@ export function renderSetupPage(options: SetupPageOptions): string {
 
 	// Cleaned up the installation copy slightly for better reading
 	const installationStep = `<div class="step-text">
-              In Obsidian, open <em>Settings → Community plugins</em>, search for <strong>YAOS</strong>, install it, and make sure it is <strong>enabled</strong>.
+              In Obsidian, open <em>Settings → Community plugins</em>, search for <strong>KAOS</strong>, install it, and make sure it is <strong>enabled</strong>.
            </div>`;
 
 	return `<!DOCTYPE html>
@@ -49,7 +49,7 @@ export function renderSetupPage(options: SetupPageOptions): string {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Claim YAOS Server</title>
+  <title>Claim KAOS Server</title>
   <style>
     :root { color-scheme: dark; }
     body {
@@ -325,12 +325,12 @@ export function renderSetupPage(options: SetupPageOptions): string {
       <div class="flow-step">
         <div class="step-header">
           <div class="step-number">1</div>
-          <h2>Get the YAOS plugin</h2>
+          <h2>Get the KAOS plugin</h2>
         </div>
         ${installationStep}
         <label class="checkbox-wrapper">
           <input id="installed" type="checkbox" />
-          <span>I have installed and <strong>enabled</strong> YAOS.</span>
+          <span>I have installed and <strong>enabled</strong> KAOS.</span>
         </label>
       </div>
 
@@ -347,7 +347,7 @@ export function renderSetupPage(options: SetupPageOptions): string {
           </div>
           <div class="action-box">
             <p>On a mobile device</p>
-            <div id="qr" aria-label="YAOS mobile setup QR"></div>
+            <div id="qr" aria-label="KAOS mobile setup QR"></div>
           </div>
         </div>
 
@@ -500,7 +500,7 @@ export function renderSetupPage(options: SetupPageOptions): string {
 	        vaultInput.value = vaultId;
 
 	        // Deep link for local button
-	        const deepLink = "obsidian://yaos?" + new URLSearchParams({ action: "setup", host: window.location.origin, token: token, vaultId: vaultId }).toString();
+	        const deepLink = "obsidian://kaos?" + new URLSearchParams({ action: "setup", host: window.location.origin, token: token, vaultId: vaultId }).toString();
 	        openBtn.href = deepLink;
 
 	        // QR Code pointing to the trampoline page
@@ -527,7 +527,7 @@ export function renderMobileSetupPage(options: MobileSetupPageOptions): string {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Connect YAOS</title>
+  <title>Connect KAOS</title>
   <style>
     :root { color-scheme: dark; }
     body {
@@ -606,15 +606,15 @@ export function renderMobileSetupPage(options: MobileSetupPageOptions): string {
 </head>
 <body>
   <main class="card">
-    <h1>Connect YAOS</h1>
+    <h1>Connect KAOS</h1>
     <p>Link this phone to <strong>${safeHost}</strong> in two steps.</p>
 
     <a id="connect-button" class="cta" href="#" aria-disabled="true">Connect Obsidian</a>
     <div id="status" class="status">Loading setup data...</div>
     <div class="recovery">
-      <p>Don't have YAOS installed on this phone yet?</p>
+      <p>Don't have KAOS installed on this phone yet?</p>
       <p style="margin-top: 6px;">1. In Obsidian, open <strong>Community plugins</strong>.</p>
-      <p style="margin-top: 4px;">2. Search for <strong>YAOS</strong>, install it, and enable it.</p>
+      <p style="margin-top: 4px;">2. Search for <strong>KAOS</strong>, install it, and enable it.</p>
       <p style="margin-top: 4px; margin-bottom: 0;">3. Come back here and tap <strong>Connect Obsidian</strong>.</p>
     </div>
 
@@ -627,7 +627,7 @@ export function renderMobileSetupPage(options: MobileSetupPageOptions): string {
 	        <input id="token-input" readonly />
 	        <label>Vault ID</label>
 	        <input id="vault-input" readonly />
-	        <p style="font-size: 11px; margin: 0; color: #6984a3;">Copy these to YAOS settings if the button fails.</p>
+	        <p style="font-size: 11px; margin: 0; color: #6984a3;">Copy these to KAOS settings if the button fails.</p>
 	      </div>
 	    </details>
   </main>
@@ -659,14 +659,14 @@ export function renderMobileSetupPage(options: MobileSetupPageOptions): string {
 	      tokenInput.value = token;
 	      vaultInput.value = vaultId;
 
-	      const deepLink = "obsidian://yaos?" + new URLSearchParams({ action: "setup", host, token, vaultId }).toString();
+	      const deepLink = "obsidian://kaos?" + new URLSearchParams({ action: "setup", host, token, vaultId }).toString();
 	      connectBtn.href = deepLink;
 	      connectBtn.removeAttribute("aria-disabled");
 
       // Scrub the URL history to hide the token fragment immediately
       window.history.replaceState(null, "", window.location.pathname);
 
-      statusEl.textContent = "Ready. Install YAOS from Community plugins if needed, then tap Connect Obsidian.";
+      statusEl.textContent = "Ready. Install KAOS from Community plugins if needed, then tap Connect Obsidian.";
     }
   </script>
 </body>
@@ -684,7 +684,7 @@ export function renderRunningPage(options: RunningPageOptions): string {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>YAOS Server Running</title>
+  <title>KAOS Server Running</title>
   <style>
     body {
       margin: 0; font-family: ui-sans-serif, system-ui, sans-serif;
@@ -711,7 +711,7 @@ export function renderRunningPage(options: RunningPageOptions): string {
 </head>
 <body>
   <main class="card">
-    <h1><span class="pulse-dot"></span>YAOS Server is Online</h1>
+    <h1><span class="pulse-dot"></span>KAOS Server is Online</h1>
     <p>${authLabel}</p>
     <div class="features">
       <div class="badge active">Text Sync</div>

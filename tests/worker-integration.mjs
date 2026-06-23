@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 const HOST = "http://127.0.0.1:8787";
-const VAULT_ID = `yaos-integration-${Date.now().toString(36)}`;
+const VAULT_ID = `kaos-integration-${Date.now().toString(36)}`;
 const WRANGLER_BIN = resolve("server/node_modules/.bin/wrangler");
 
 function wait(ms) {
@@ -74,7 +74,7 @@ async function claimServer() {
 	}
 
 	const payload = await res.json();
-	if (typeof payload?.obsidianUrl !== "string" || !payload.obsidianUrl.startsWith("obsidian://yaos?")) {
+	if (typeof payload?.obsidianUrl !== "string" || !payload.obsidianUrl.startsWith("obsidian://kaos?")) {
 		throw new Error("claim response missing Obsidian setup URL");
 	}
 
@@ -99,7 +99,7 @@ async function resolveAuthToken(defaultEnvToken) {
 }
 
 async function main() {
-	const persistDir = mkdtempSync(join(tmpdir(), "yaos-wrangler-"));
+	const persistDir = mkdtempSync(join(tmpdir(), "kaos-wrangler-"));
 	const envToken = randomBytes(32).toString("hex");
 	const wrangler = spawn(
 		WRANGLER_BIN,
@@ -118,7 +118,7 @@ async function main() {
 			// Short ticket TTL for the ws-ticket-reconnect smoke test — allows
 			// post-expiry reconnect to be exercised in seconds, not 5 minutes.
 			"--var",
-			"YAOS_TICKET_TTL_MS:8000",
+			"KAOS_TICKET_TTL_MS:8000",
 		],
 		{
 			cwd: resolve("server"),
