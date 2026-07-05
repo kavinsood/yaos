@@ -1,3 +1,4 @@
+import type { VaultBlobStore } from "../blobStore";
 import type { VaultSyncServer } from "../server";
 import type { StoredServerConfig } from "../config";
 
@@ -7,7 +8,7 @@ export interface Env {
 	YAOS_SYNC: DurableObjectNamespace<VaultSyncServer>;
 	YAOS_CONFIG: DurableObjectNamespace;
 	YAOS_BUCKET?: R2Bucket;
-	YAOS_BLOBS?: DurableObjectNamespace;
+	YAOS_BLOBS: DurableObjectNamespace<VaultBlobStore>;
 	/**
 	 * Set to any non-empty string to reject WebSocket connections that use
 	 * the legacy ?token= query parameter instead of a short-lived ticket.

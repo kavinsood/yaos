@@ -1,4 +1,5 @@
 import { ServerConfig, type StoredServerConfig } from "./config";
+import { VaultBlobStore } from "./blobStore";
 import { VaultSyncServer } from "./server";
 import { renderMobileSetupPage, renderRunningPage, renderSetupPage } from "./setupPage";
 import {
@@ -432,4 +433,4 @@ const worker = {
 };
 
 export default worker;
-export { ServerConfig, VaultSyncServer };
+export { ServerConfig, VaultSyncServer, VaultBlobStore };

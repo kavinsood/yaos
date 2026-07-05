@@ -1,4 +1,3 @@
-import { getServerByName } from "partyserver";
 import { mapWithConcurrency } from "./concurrency";
 import { blobKey } from "./snapshot";
 import type { Env } from "./routes/types";
@@ -83,7 +82,8 @@ class DoBlobBackend implements BlobBackend {
 	constructor(private env: Env) {}
 
 	private stub(vaultId: string) {
-		return getServerByName(this.env.YAOS_BLOBS!, vaultId);
+		const id = this.env.YAOS_BLOBS!.idFromName(vaultId);
+		return this.env.YAOS_BLOBS!.get(id);
 	}
 
 	async upload(
@@ -92,7 +92,7 @@ class DoBlobBackend implements BlobBackend {
 		mime: string,
 		body: ArrayBuffer,
 	): Promise<{ ok: true } | { error: "full" }> {
-		const stub = await this.stub(vaultId);
+		const stub = this.stub(vaultId);
 		const res = await stub.fetch("https://internal/put", {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
@@ -108,7 +108,7 @@ class DoBlobBackend implements BlobBackend {
 	}
 
 	async download(vaultId: string, hash: string): Promise<{ mime: string; body: ArrayBuffer } | null> {
-		const stub = await this.stub(vaultId);
+		const stub = this.stub(vaultId);
 		const res = await stub.fetch("https://internal/get", {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
@@ -121,7 +121,7 @@ class DoBlobBackend implements BlobBackend {
 	}
 
 	async exists(vaultId: string, hashes: string[]): Promise<string[]> {
-		const stub = await this.stub(vaultId);
+		const stub = this.stub(vaultId);
 		const res = await stub.fetch("https://internal/exists", {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
@@ -132,7 +132,7 @@ class DoBlobBackend implements BlobBackend {
 	}
 
 	async storageStatus(vaultId: string): Promise<{ usedBytes: number; blobCount: number }> {
-		const stub = await this.stub(vaultId);
+		const stub = this.stub(vaultId);
 		const res = await stub.fetch("https://internal/status", { method: "GET" });
 		return (await res.json()) as { usedBytes: number; blobCount: number };
 	}

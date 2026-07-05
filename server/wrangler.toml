@@ -10,9 +10,17 @@ class_name = "VaultSyncServer"
 name = "YAOS_CONFIG"
 class_name = "ServerConfig"
 
+[[durable_objects.bindings]]
+name = "YAOS_BLOBS"
+class_name = "VaultBlobStore"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["VaultSyncServer", "ServerConfig"]
+
+[[migrations]]
+tag = "v2-blob-store"
+new_sqlite_classes = ["VaultBlobStore"]
 
 [observability.logs]
 enabled = true
