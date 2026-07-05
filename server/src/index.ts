@@ -117,10 +117,10 @@ function isKnownSnapshotRouteShape(method: string, rest: string[]): boolean {
  * Valid shapes are derived directly from the route handlers in routes/:
  *   auth:      POST /auth/ticket
  *   debug:     GET  /debug/recent
- *   blobs:     GET|PUT /blobs/:hash,  POST /blobs/exists
- *              (GET|PUT /blobs/exists are structurally valid — the blob handler
- *               treats "exists" as a hash and rejects/misses it after auth,
- *               without touching YAOS_SYNC or hydrating the room)
+ *   blobs:     GET|PUT /blobs/:hash (64 hex),  GET /blobs/status,
+ *              POST /blobs/exists
+ *              (GET|PUT /blobs/exists are structurally invalid — "exists" is not
+ *               a valid hash and is rejected by the classifier before auth)
  *   snapshots: see isKnownSnapshotRouteShape above
  *
  * See the SECURITY/BILLING INVARIANT comment above before adding new shapes.
@@ -136,7 +136,8 @@ function isKnownVaultRouteShape(method: string, resource: string, rest: string[]
 		case "blobs": {
 			if (rest.length !== 1) return false;
 			if (method === "POST") return rest[0] === "exists";
-			return method === "GET" || method === "PUT";
+			if (method === "GET") return rest[0] === "status" || /^[0-9a-f]{64}$/.test(rest[0]!);
+			return method === "PUT" && /^[0-9a-f]{64}$/.test(rest[0]!);
 		}
 
 		case "snapshots":

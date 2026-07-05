@@ -47,6 +47,7 @@ function makeTrapNamespace() {
 const trapEnv: Env = {
 	YAOS_SYNC: makeTrapNamespace() as unknown as Env["YAOS_SYNC"],
 	YAOS_CONFIG: makeTrapNamespace() as unknown as Env["YAOS_CONFIG"],
+	YAOS_BLOBS: makeTrapNamespace() as unknown as Env["YAOS_BLOBS"],
 	SYNC_TOKEN: undefined,
 };
 
@@ -244,6 +245,7 @@ console.log("\n--- Test 5: valid resource + invalid shape returns 404 without YA
 		["GET",  "/vault/foo/debug/evil"],          // debug only handles /recent
 		["GET",  "/vault/foo/auth/random"],         // auth only handles POST /ticket
 		["POST", "/vault/foo/blobs/not-real"],      // blobs POST only handles /exists
+		["GET",  "/vault/foo/blobs/not-real"],      // blobs GET requires status or 64-hex hash
 		["DELETE", "/vault/foo/blobs/somehash"],    // blobs doesn't handle DELETE
 		["POST", "/vault/foo/auth/ticket/extra"],   // extra path segments
 		["GET",  "/api/not-real"],                  // API-shaped but unknown endpoint
@@ -320,6 +322,29 @@ console.log("\n--- Test 6: /vault/sync/:vaultId is classified as sync-socket, no
 		resp.status === 426 || resp.status === 401 || resp.status === 503,
 		`/vault/sync/:vaultId reaches the sync handler (status ${resp.status}, not 404)`,
 	);
+}
+
+// ── Test 7: invalid /blobs/status shapes 404 without DO access ────────────────
+console.log("\n--- Test 7: invalid /blobs/status shapes return 404 without DO access ---");
+{
+	const invalid = [
+		["POST", "/vault/v/blobs/status"],
+		["GET", "/vault/v/blobs/status/extra"],
+		["PUT", "/vault/v/blobs/status"],
+	] as const;
+
+	for (const [method, path] of invalid) {
+		let threw = false;
+		let status = 0;
+		try {
+			const resp = await worker.fetch(new Request(`https://example.com${path}`, { method }), trapEnv);
+			status = resp.status;
+		} catch {
+			threw = true;
+		}
+		assert(!threw, `${method} ${path}: no DO throw`);
+		assert(status === 404, `${method} ${path}: 404 pre-auth`);
+	}
 }
 
 console.log(`\n${"─".repeat(55)}`);
