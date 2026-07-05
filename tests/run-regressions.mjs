@@ -90,6 +90,7 @@ const suites = [
 	[JITI, "tests/blob-store.ts"],
 	[JITI, "tests/blob-store-sqlite-full.ts"],
 	[JITI, "tests/blob-route-do-backend.ts"],
+	[JITI, "tests/blob-gc.ts"],
 	[JITI, "tests/trace-store.ts"],
 	[JITI, "tests/server-hardening.ts"],
 	[JITI, "tests/server-capabilities-attachment-backend.ts"],

@@ -29,6 +29,8 @@ import {
 	PersistenceCoordinator,
 	type PersistenceHealth,
 } from "./persistenceCoordinator";
+import { collectLiveBlobHashes } from "./blobGc";
+import { BLOB_GRACE_MS } from "./blobStoreSql";
 
 const MAX_DEBUG_TRACE_EVENTS = 200;
 const JOURNAL_COMPACT_MAX_ENTRIES = 50;
@@ -50,6 +52,8 @@ const CHECKPOINT_FALLBACK_AFTER_FAILURES = 2;
  */
 const CHECKPOINT_FALLBACK_DELTA_BYTES = 2 * 1024 * 1024;
 
+const ATTACHMENT_SWEEP_MIN_INTERVAL_MS = 60 * 60 * 1000;
+
 /** Legacy storage key used before ChunkedDocStore was introduced. */
 const LEGACY_DOCUMENT_KEY = "document";
 
@@ -57,6 +61,7 @@ type ServerTraceEntry = StoredTraceEntry;
 
 interface ServerEnv {
 	YAOS_BUCKET?: R2Bucket;
+	YAOS_BLOBS?: DurableObjectNamespace;
 }
 
 type SvEchoCounters = {
@@ -105,6 +110,8 @@ export class VaultSyncServer extends YServer {
 	private chunkedDocStore: ChunkedDocStore | null = null;
 	private persistence: PersistenceCoordinator | null = null;
 	private snapshotMaybeChain: Promise<void> = Promise.resolve();
+	private attachmentSweepChain: Promise<void> = Promise.resolve();
+	private lastAttachmentSweepAt = 0;
 	private roomMeta: RoomMeta | null = null;
 	private readonly traceRateLimiter = new TraceRateLimiter();
 	private readonly svEchoCounters: SvEchoCounters = {
@@ -236,6 +243,15 @@ export class VaultSyncServer extends YServer {
 				body = {};
 			}
 			return json(await this.createDailySnapshotMaybe(body.device));
+		}
+
+		if (request.method === "POST" && url.pathname === "/__yaos/attachment-sweep-maybe") {
+			await this.ensureDocumentLoaded();
+			const serialized = { chain: this.attachmentSweepChain };
+			const run = runSerialized(serialized, async () => this.maybeSweepAttachments(true));
+			this.attachmentSweepChain = serialized.chain;
+			const result = await run;
+			return json({ swept: result });
 		}
 
 		// PartyServer internal management routes (e.g. /cdn-cgi/partyserver/set-name/)
@@ -707,6 +723,31 @@ export class VaultSyncServer extends YServer {
 		);
 		this.snapshotMaybeChain = serialized.chain;
 		return await run;
+	}
+
+	private async maybeSweepAttachments(force = false): Promise<{ deleted: number; freedBytes: number } | null> {
+		const env = this.env as ServerEnv;
+		if (!env.YAOS_BLOBS || env.YAOS_BUCKET) return null;
+
+		const now = Date.now();
+		if (!force && now - this.lastAttachmentSweepAt < ATTACHMENT_SWEEP_MIN_INTERVAL_MS) {
+			return null;
+		}
+
+		await this.ensureDocumentLoaded();
+		const liveHashes = collectLiveBlobHashes(this.document);
+		const vaultId = this.getRoomId();
+
+		const id = env.YAOS_BLOBS.idFromName(vaultId);
+		const blobStub = env.YAOS_BLOBS.get(id);
+		const res = await blobStub.fetch("https://internal/sweep", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ liveHashes, graceMs: BLOB_GRACE_MS }),
+		});
+		const result = await res.json() as { deleted: number; freedBytes: number };
+		this.lastAttachmentSweepAt = now;
+		return result;
 	}
 
 	private async recordTrace(

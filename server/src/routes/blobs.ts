@@ -1,3 +1,4 @@
+import { getServerByName } from "partyserver";
 import { selectBlobBackend } from "../blobBackends";
 import { MAX_BLOB_UPLOAD_BYTES } from "../contracts";
 import type { Env, JsonResponse } from "./types";
@@ -96,6 +97,10 @@ async function handleBlobStatus(
 	}
 
 	const status = await backend.storageStatus(vaultId);
+	void (async () => {
+		const syncStub = await getServerByName(env.YAOS_SYNC, vaultId);
+		await syncStub.fetch("https://internal/__yaos/attachment-sweep-maybe", { method: "POST" });
+	})().catch(() => {});
 	return json(status);
 }
 
