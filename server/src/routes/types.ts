@@ -7,6 +7,7 @@ export interface Env {
 	YAOS_SYNC: DurableObjectNamespace<VaultSyncServer>;
 	YAOS_CONFIG: DurableObjectNamespace;
 	YAOS_BUCKET?: R2Bucket;
+	YAOS_BLOBS?: DurableObjectNamespace;
 	/**
 	 * Set to any non-empty string to reject WebSocket connections that use
 	 * the legacy ?token= query parameter instead of a short-lived ticket.

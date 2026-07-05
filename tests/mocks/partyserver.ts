@@ -13,11 +13,27 @@
  * Use via JITI_ALIAS: { "partyserver": "<path-to-this-file>" }
  */
 
-/** Throws if called — DO namespace should never be accessed pre-auth. */
-export function getServerByName(_ns: unknown, _name: string): never {
+/** Resolve a named DO stub, or throw if the namespace is not a real binding. */
+export async function getServerByName(ns: unknown, name: string) {
+	if (
+		ns &&
+		typeof ns === "object" &&
+		"idFromName" in ns &&
+		typeof (ns as { idFromName: unknown }).idFromName === "function" &&
+		"get" in ns &&
+		typeof (ns as { get: unknown }).get === "function"
+	) {
+		const binding = ns as DurableObjectNamespace;
+		const id = binding.idFromName(name);
+		const stub = binding.get(id);
+		const req = new Request("http://dummy-example.cloudflare.com/cdn-cgi/partyserver/set-name/");
+		req.headers.set("x-partykit-room", name);
+		await stub.fetch(req);
+		return stub;
+	}
 	throw new Error(
 		`Durable Object namespace accessed before authentication. ` +
-		`getServerByName("${_name}") was called — INV-SEC-01 violation.`,
+		`getServerByName("${name}") was called — INV-SEC-01 violation.`,
 	);
 }
 

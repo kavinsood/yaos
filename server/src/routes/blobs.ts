@@ -1,10 +1,8 @@
-import { mapWithConcurrency } from "../concurrency";
+import { selectBlobBackend } from "../blobBackends";
 import { MAX_BLOB_UPLOAD_BYTES } from "../contracts";
-import { blobKey } from "../snapshot";
 import type { Env, JsonResponse } from "./types";
 
 const EXISTS_BATCH_LIMIT = 50;
-const R2_HEAD_CONCURRENCY = 4;
 
 function isValidHash(hash: string): boolean {
 	return /^[0-9a-f]{64}$/.test(hash);
@@ -36,6 +34,10 @@ export async function handleBlobRoute(
 		return await handleBlobExists(env, vaultId, req, json);
 	}
 
+	if (req.method === "GET" && rest.length === 1 && rest[0] === "status") {
+		return await handleBlobStatus(env, vaultId, json);
+	}
+
 	const hash = rest[0];
 	if (!hash) {
 		return json({ error: "not found" }, 404);
@@ -58,8 +60,8 @@ async function handleBlobExists(
 	req: Request,
 	json: JsonResponse,
 ): Promise<Response> {
-	const bucket = env.YAOS_BUCKET;
-	if (!bucket) {
+	const backend = selectBlobBackend(env);
+	if (!backend) {
 		return json({ error: "attachments_unavailable" }, 503);
 	}
 
@@ -78,18 +80,23 @@ async function handleBlobExists(
 		.slice(0, EXISTS_BATCH_LIMIT)
 		.filter((hash): hash is string => typeof hash === "string" && isValidHash(hash));
 
-	const present = await mapWithConcurrency(
-		hashes,
-		R2_HEAD_CONCURRENCY,
-		async (hash) => {
-			const object = await bucket.head(blobKey(vaultId, hash));
-			return object ? hash : null;
-		},
-	);
+	const present = await backend.exists(vaultId, hashes);
 
-	return json({
-		present: present.filter((hash): hash is string => hash !== null),
-	});
+	return json({ present });
+}
+
+async function handleBlobStatus(
+	env: Env,
+	vaultId: string,
+	json: JsonResponse,
+): Promise<Response> {
+	const backend = selectBlobBackend(env);
+	if (!backend) {
+		return json({ error: "attachments_unavailable" }, 503);
+	}
+
+	const status = await backend.storageStatus(vaultId);
+	return json(status);
 }
 
 async function handleBlobUpload(
@@ -99,7 +106,8 @@ async function handleBlobUpload(
 	req: Request,
 	json: JsonResponse,
 ): Promise<Response> {
-	if (!env.YAOS_BUCKET) {
+	const backend = selectBlobBackend(env);
+	if (!backend) {
 		return json({ error: "attachments_unavailable" }, 503);
 	}
 
@@ -122,7 +130,7 @@ async function handleBlobUpload(
 	// Cloudflare Workers provide no application-level streaming hook to abort
 	// an in-flight body read, so the Worker pays the memory cost of any
 	// oversized request whose sender omitted the Content-Length header.
-	// The check below still rejects the request and prevents an R2 write, but
+	// The check below still rejects the request and prevents a write, but
 	// the protection is weaker than the header pre-check for the missing-header
 	// case.  Clients should always send Content-Length; the plugin does.
 	const body = await req.arrayBuffer();
@@ -139,15 +147,11 @@ async function handleBlobUpload(
 		return json({ error: "hash mismatch" }, 400);
 	}
 
-	await env.YAOS_BUCKET.put(
-		blobKey(vaultId, hash),
-		body,
-		{
-			httpMetadata: {
-				contentType: req.headers.get("Content-Type") ?? "application/octet-stream",
-			},
-		},
-	);
+	const mime = req.headers.get("Content-Type") ?? "application/octet-stream";
+	const result = await backend.upload(vaultId, hash, mime, body);
+	if ("error" in result) {
+		return json({ error: "storage full" }, 507);
+	}
 
 	return new Response(null, { status: 204 });
 }
@@ -158,7 +162,8 @@ async function handleBlobDownload(
 	hash: string,
 	json: JsonResponse,
 ): Promise<Response> {
-	if (!env.YAOS_BUCKET) {
+	const backend = selectBlobBackend(env);
+	if (!backend) {
 		return json({ error: "attachments_unavailable" }, 503);
 	}
 
@@ -166,19 +171,15 @@ async function handleBlobDownload(
 		return json({ error: "invalid hash: must be 64 hex chars (SHA-256)" }, 400);
 	}
 
-	const object = await env.YAOS_BUCKET.get(blobKey(vaultId, hash));
-	if (!object) {
+	const record = await backend.download(vaultId, hash);
+	if (!record) {
 		return json({ error: "not found" }, 404);
 	}
 
 	const headers = new Headers({
 		"Cache-Control": "no-store",
+		"Content-Type": record.mime,
 	});
-	if (object.httpMetadata?.contentType) {
-		headers.set("Content-Type", object.httpMetadata.contentType);
-	} else {
-		headers.set("Content-Type", "application/octet-stream");
-	}
 
-	return new Response(object.body, { headers });
+	return new Response(record.body, { headers });
 }
