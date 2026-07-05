@@ -352,6 +352,25 @@ console.log("\n--- Test 9: /api/capabilities route splits public and authenticat
 	assert(privateCaps.maxBlobUploadBytes === MAX_BLOB_UPLOAD_BYTES, "capabilities route exposes max blob upload bytes");
 }
 
+console.log("\n--- Test 10: claimed server without R2 advertises DO attachments ---");
+{
+	const auth = { mode: "claim", claimed: true, tokenHash: "hash" } as const;
+	const env = { YAOS_BLOBS: {} } as any; // no YAOS_BUCKET
+	const caps = getCapabilities(auth, env, null);
+	assert(caps.attachments === true, "attachments true when claimed even without R2");
+	assert(caps.attachmentBackend === "do", "attachmentBackend is do without bucket");
+	assert(caps.snapshots === false, "snapshots still false without R2");
+}
+
+console.log("\n--- Test 11: R2 deployment keeps r2 backend ---");
+{
+	const auth = { mode: "claim", claimed: true, tokenHash: "hash" } as const;
+	const env = { YAOS_BUCKET: {}, YAOS_BLOBS: {} } as any;
+	const caps = getCapabilities(auth, env, null);
+	assert(caps.attachmentBackend === "r2", "attachmentBackend is r2 when bucket bound");
+	assert(caps.snapshots === true, "snapshots true with R2");
+}
+
 console.log("\n──────────────────────────────────────────────────");
 console.log(`Results: ${passed} passed, ${failed} failed`);
 console.log("──────────────────────────────────────────────────");

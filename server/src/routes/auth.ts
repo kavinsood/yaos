@@ -34,6 +34,12 @@ export function supportsBuckets(env: Env): boolean {
 	return env.YAOS_BUCKET !== undefined;
 }
 
+export function attachmentBackend(env: Env): "r2" | "do" | null {
+	if (env.YAOS_BUCKET) return "r2";
+	if (env.YAOS_BLOBS) return "do";
+	return null;
+}
+
 export function canonicalRepoForSetup(env: Env): string | undefined {
 	const raw = env.YAOS_CANONICAL_REPO?.trim();
 	if (!raw) return undefined;
@@ -237,6 +243,7 @@ export function getCapabilities(
 	authMode: "env" | "claim" | "unclaimed";
 	attachments: boolean;
 	snapshots: boolean;
+	attachmentBackend: "r2" | "do" | null;
 	maxBlobUploadBytes: number;
 	socketTicketAuth: boolean;
 	serverVersion: string;
@@ -250,10 +257,12 @@ export function getCapabilities(
 	updateRepoBranch: string | null;
 } {
 	const bucketEnabled = supportsBuckets(env);
+	const backend = attachmentBackend(env);
 	return {
 		claimed: auth.claimed,
 		authMode: auth.mode,
-		attachments: bucketEnabled,
+		attachments: auth.claimed && backend !== null,
+		attachmentBackend: backend,
 		snapshots: bucketEnabled,
 		maxBlobUploadBytes: MAX_BLOB_UPLOAD_BYTES,
 		socketTicketAuth: true,

@@ -5,6 +5,7 @@ export interface ServerCapabilities {
 	authMode: "env" | "claim" | "unclaimed";
 	attachments: boolean;
 	snapshots: boolean;
+	attachmentBackend?: "r2" | "do";
 	maxBlobUploadBytes?: number;
 	/** Server supports short-lived WebSocket connection tickets (Release N+). */
 	socketTicketAuth?: boolean;

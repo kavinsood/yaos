@@ -77,6 +77,9 @@ export function isServerCapabilities(value: unknown): value is ServerCapabilitie
 		(candidate.authMode === "env" || candidate.authMode === "claim" || candidate.authMode === "unclaimed") &&
 		typeof candidate.attachments === "boolean" &&
 		typeof candidate.snapshots === "boolean" &&
+		(candidate.attachmentBackend === undefined ||
+			candidate.attachmentBackend === "r2" ||
+			candidate.attachmentBackend === "do") &&
 		(candidate.maxBlobUploadBytes === undefined ||
 			(typeof candidate.maxBlobUploadBytes === "number" &&
 				Number.isSafeInteger(candidate.maxBlobUploadBytes) &&
@@ -95,6 +98,11 @@ export function isServerCapabilities(value: unknown): value is ServerCapabilitie
 		(candidate.updateRepoBranch === undefined ||
 			candidate.updateRepoBranch === null ||
 			typeof candidate.updateRepoBranch === "string");
+}
+
+export function parseServerCapabilities(value: unknown): ServerCapabilities | null {
+	if (!isServerCapabilities(value)) return null;
+	return value;
 }
 
 export function readPersistedServerCapabilitiesCache(value: unknown): PersistedServerCapabilitiesCache | null {
@@ -176,6 +184,10 @@ export class CapabilityUpdateService {
 	get supportsSnapshots(): boolean {
 		if (!this.deps.getSettings().host) return true;
 		return this.serverCapabilities?.snapshots ?? false;
+	}
+
+	get attachmentBackend(): ServerCapabilities["attachmentBackend"] | null {
+		return this.serverCapabilities?.attachmentBackend ?? null;
 	}
 
 	get hasCachedCapabilities(): boolean {

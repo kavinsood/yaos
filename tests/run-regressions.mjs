@@ -42,9 +42,17 @@ const OBSIDIAN_MOCK = fileURLToPath(new URL("./mocks/obsidian.ts", import.meta.u
 // that calls it causes the test to fail loudly (FU-4 invariant).
 const PARTYSERVER_MOCK = fileURLToPath(new URL("./mocks/partyserver.ts", import.meta.url));
 
+// Redirect "cloudflare:workers" for VaultBlobStore imports in server tests.
+const CLOUDFLARE_WORKERS_MOCK = fileURLToPath(new URL("./mocks/cloudflare-workers.ts", import.meta.url));
+
 const JITI_ENV = {
 	...process.env,
-	JITI_ALIAS: JSON.stringify({ yjs: ROOT_YJS, obsidian: OBSIDIAN_MOCK, partyserver: PARTYSERVER_MOCK }),
+	JITI_ALIAS: JSON.stringify({
+		yjs: ROOT_YJS,
+		obsidian: OBSIDIAN_MOCK,
+		partyserver: PARTYSERVER_MOCK,
+		"cloudflare:workers": CLOUDFLARE_WORKERS_MOCK,
+	}),
 };
 
 const JITI = "node --import jiti/register";
@@ -84,6 +92,7 @@ const suites = [
 	[JITI, "tests/blob-route-do-backend.ts"],
 	[JITI, "tests/trace-store.ts"],
 	[JITI, "tests/server-hardening.ts"],
+	[JITI, "tests/server-capabilities-attachment-backend.ts"],
 	[JITI, "tests/settings-hardening.ts"],
 	[JITI, "tests/snapshot-lookup.ts"],
 	[JITI, "tests/ws-ticket-auth.ts"],
