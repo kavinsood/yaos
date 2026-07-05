@@ -40,11 +40,11 @@ export function putBlobRecord(
 	bytes: Uint8Array,
 	createdAt: number,
 ): { ok: true } | { error: "full" } {
-	const existing = sqlRows(sql.exec(`SELECT 1 FROM blob_meta WHERE hash = ?`, hash));
-	if (existing.length > 0) return { ok: true };
-
-	const chunks = splitBytes(bytes);
 	try {
+		const existing = sqlRows(sql.exec(`SELECT 1 FROM blob_meta WHERE hash = ?`, hash));
+		if (existing.length > 0) return { ok: true };
+
+		const chunks = splitBytes(bytes);
 		sql.exec(`BEGIN`);
 		sql.exec(
 			`INSERT INTO blob_meta (hash, size, mime, chunk_count, created_at) VALUES (?, ?, ?, ?, ?)`,
