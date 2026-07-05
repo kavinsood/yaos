@@ -79,6 +79,7 @@ const suites = [
 	[JITI, "tests/controller-recovery-orchestration.ts"],
 	[JITI, "tests/controller-recovery-orchestration-amplifier.ts"],
 	[JITI, "tests/blob-download-conflicts.ts"],
+	[JITI, "tests/blob-storage-full.ts"],
 	[JITI, "tests/markdown-remote-delete-trash-preference.ts"],
 	[JITI, "tests/closed-file-conflict.ts"],
 	[JITI, "tests/preserved-unresolved-registry.ts"],

@@ -152,6 +152,9 @@ class BlobHttpClient {
 			timeoutMs,
 			`blob upload ${hash.slice(0, 12)}…`,
 		);
+		if (res.status === 507) {
+			throw new Error(`blob upload failed: 507 storage full`);
+		}
 		if (res.status !== 204) {
 			throw new Error(`blob upload failed: ${res.status} ${res.text}`);
 		}
@@ -977,6 +980,28 @@ export class BlobSyncManager {
 			}
 		} catch (err) {
 			const reason = err instanceof Error ? err.message : String(err);
+			const isStorageFull =
+				err instanceof Error &&
+				(/blob upload failed: 507/.test(err.message) ||
+					/storage full/i.test(err.message));
+			if (isStorageFull) {
+				this.uploadQueue.delete(item.path);
+				this._permanentUploadFailures++;
+				this.trace?.("blob", "upload-storage-full", { path: item.path });
+				try {
+					new Notice(
+						"YAOS: Attachment storage full (1 GB free limit). Enable R2 in server settings for more storage.",
+						10000,
+					);
+				} catch {
+					// Notice may fail in testing or headless environments.
+				}
+				console.error(
+					`[yaos:blob] Upload failed permanently for "${item.path}" (storage full):`,
+					err,
+				);
+				return;
+			}
 			if (item.retries < MAX_RETRIES) {
 				const delay = RETRY_BASE_MS * Math.pow(4, item.retries);
 				this.log(
