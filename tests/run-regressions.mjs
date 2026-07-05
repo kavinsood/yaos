@@ -78,6 +78,7 @@ const suites = [
 	[JITI, "tests/closed-file-mirror.ts"],
 	[JITI, "tests/folder-rename.ts"],
 	[JITI, "tests/chunked-doc-store.ts"],
+	[JITI, "tests/blob-chunk.ts"],
 	[JITI, "tests/trace-store.ts"],
 	[JITI, "tests/server-hardening.ts"],
 	[JITI, "tests/settings-hardening.ts"],
