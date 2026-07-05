@@ -89,6 +89,8 @@ export function parseAttachmentStorageStatus(value: unknown): AttachmentStorageS
 		blobCount: candidate.blobCount,
 	};
 }
+
+export function isServerCapabilities(value: unknown): value is ServerCapabilities {
 	if (typeof value !== "object" || value === null) return false;
 	const candidate = value as Partial<ServerCapabilities>;
 	return typeof candidate.claimed === "boolean" &&

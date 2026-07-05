@@ -1,8 +1,8 @@
 # YAOS server
 
 Cloudflare Worker / Durable Object backend for the YAOS Obsidian plugin. It relays
-Yjs CRDT updates, optionally stores attachments in R2, and stores snapshots when R2
-is configured.
+Yjs CRDT updates, stores attachments in a Durable Object blob store by default, and
+stores snapshots in R2 when configured.
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/kavinsood/yaos/tree/main/server)
 
@@ -11,8 +11,8 @@ is configured.
 - One vault maps to one Durable Object-backed sync room.
 - Yjs sync runs through `y-partyserver`.
 - Durable Object storage persists the live CRDT snapshot.
-- Attachments are uploaded through the Worker and stored in R2.
-- Snapshots are gzipped CRDT archives stored in R2.
+- Attachments are uploaded through the Worker and stored in the vault blob Durable Object (~1 GB/vault on the free plan).
+- Snapshots are gzipped CRDT archives stored in R2 when `YAOS_BUCKET` is bound.
 - Auth uses the claimed setup token by default, with `SYNC_TOKEN` as an optional hard override.
 
 ## Standard deploy
@@ -26,7 +26,7 @@ The local `wrangler.toml` in this directory defines:
 - the `VaultSyncServer` Durable Object binding
 - the `ServerConfig` Durable Object binding
 
-The default deploy is text-only:
+The default deploy includes text sync and attachment sync:
 
 - no `SYNC_TOKEN` secret is required up front
 - no R2 binding is required up front
@@ -49,13 +49,13 @@ To pick up new YAOS changes later:
 
 ## Optional R2 setup
 
-If you want attachments and snapshots later:
+If you want snapshots or more attachment storage later:
 
 1. Create an R2 bucket in the Cloudflare dashboard.
 2. Open your Worker in **Workers & Pages**.
 3. Add an R2 binding named `YAOS_BUCKET`.
 
-The same Worker will then begin reporting attachments and snapshots as available.
+The same Worker will then use R2 for attachments and report snapshots as available.
 
 If the Cloudflare dashboard UI is transiently failing when attaching the bucket, use this fallback in your generated deploy repo:
 

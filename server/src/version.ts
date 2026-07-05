@@ -1,4 +1,4 @@
-export const SERVER_VERSION = "0.3.0";
+export const SERVER_VERSION = "0.4.0";
 
 // Compatibility metadata is intentionally explicit so the plugin can reason
 // about safe upgrade paths before we add richer release-manifest logic.

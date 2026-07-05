@@ -52,13 +52,15 @@ That's it. Your vault is syncing.
 
 ## Attachments and snapshots
 
-Text sync works out of the box. To sync images, PDFs, and other attachments, add a Cloudflare R2 bucket — it takes about a minute.
+Text sync works out of the box. Attachments (images, PDFs, and other non-markdown files) sync automatically on deploy using built-in server storage — about 1 GB free per vault on the default Cloudflare plan.
+
+R2 is optional. Add a Cloudflare R2 bucket if you want daily automatic snapshots, on-demand point-in-time backups, or more than ~1 GB of attachment storage per vault.
 
 <a href="https://youtu.be/Z7xCMEYfdFM">
   <img src="https://img.youtube.com/vi/Z7xCMEYfdFM/maxresdefault.jpg" width="480" alt="Watch the R2 setup video" />
 </a>
 
-R2 also enables daily automatic snapshots and on-demand point-in-time backups. You can browse snapshots, diff against current state, and selectively restore individual files. If you skip R2, text sync still works — you just won't have attachment sync or snapshots.
+With R2 configured, you can browse snapshots, diff against current state, and selectively restore individual files. Without R2, text sync and attachment sync still work — you just won't have snapshots or unlimited attachment storage.
 
 ## Updating your server
 
@@ -87,7 +89,7 @@ YAOS keeps your vault as normal local files, while also maintaining a shared rea
 3. Live editor edits flow through a Yjs + CodeMirror binding.
 4. Each vault maps to one Durable Object sync room. The shared state survives server restarts and hibernation.
 5. Offline edits are stored in IndexedDB and merge on reconnect.
-6. Attachments sync separately via content-addressed R2 storage instead of being forced through the text CRDT.
+6. Attachments sync separately via content-addressed blob storage (built-in on deploy, or R2 when configured) instead of being forced through the text CRDT.
 7. Daily and on-demand snapshots exist as a safety net.
 
 In practice, that means your vault still exists locally as normal files, Obsidian keeps behaving like Obsidian, and YAOS keeps the disk mirror and the shared CRDT state aligned instead of asking devices to take polite turns uploading files later.
@@ -128,7 +130,7 @@ After enabling, go to **Settings → YAOS**.
 | **Device name** | Shown to other devices in live cursors and presence |
 | **Exclude paths** | Comma-separated prefixes to skip (e.g. `templates/, .trash/`) |
 | **Max text file size** | Skip text files larger than this for live document sync |
-| **Sync attachments** | Enable R2 sync for images, PDFs, and other non-markdown files |
+| **Sync attachments** | Sync images, PDFs, and other non-markdown files (enabled by default; ~1 GB free per vault, R2 optional for more) |
 | **Max attachment size** | Skip attachments larger than this (default and current server cap: 10 MB) |
 | **Parallel transfers** | Number of simultaneous attachment upload/download slots |
 | **Show remote cursors** | Display cursor positions and selections from other devices |
@@ -156,7 +158,7 @@ Access via command palette (Ctrl/Cmd+P):
 
 **"Unauthorized" errors**: Token mismatch between plugin and server. Check both match exactly.
 
-**"R2 not configured"**: The server doesn't have a `YAOS_BUCKET` binding yet. See the [R2 setup video](https://youtu.be/Z7xCMEYfdFM).
+**"R2 not configured"**: Snapshots require R2. Attachments still sync via built-in storage; add a `YAOS_BUCKET` binding for snapshots and larger attachment storage. See the [R2 setup video](https://youtu.be/Z7xCMEYfdFM).
 
 **Cloudflare deploy/dashboard issues**: If build queue or dashboard behavior is flaky, see [server troubleshooting notes](./server/README.md#transient-cloudflare-deployment-issues), including the `wrangler.toml` R2-binding fallback.
 
@@ -173,7 +175,7 @@ Access via command palette (Ctrl/Cmd+P):
 ## Current limits
 
 YAOS currently treats Markdown text as the first-class live sync surface and syncs
-attachments separately through R2 when configured. It does not try to act as a
+attachments separately through built-in blob storage (or R2 when configured). It does not try to act as a
 general `.obsidian` settings/plugin-state sync engine. Empty folders are not synced
 in v0 because the CRDT tracks files and blob references, not folder-only objects.
 Avoid running another live file-sync engine such as iCloud, Dropbox, Syncthing, or
