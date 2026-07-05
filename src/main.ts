@@ -55,6 +55,7 @@ import {
 	type PersistedUpdateManifestCache,
 	type UpdateState,
 } from "./runtime/capabilityUpdateService";
+import type { AttachmentStorageStatus } from "./runtime/capabilityUpdateService";
 import {
 	ConnectionController,
 	type ConnectionState,
@@ -943,6 +944,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			// Fire-and-forget — don't block startup on snapshot creation.
 			if (providerSynced && this.serverSupportsSnapshots) {
 				void this.snapshotService?.triggerDailySnapshot();
+			}
+			if (providerSynced && this.attachmentBackend === "do") {
+				this.triggerAttachmentSweep();
 			}
 		} catch (err) {
 			console.error("[yaos] Failed to initialize sync:", err);
@@ -1855,6 +1859,18 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	get serverMaxBlobUploadBytes(): number | null {
 		return this.capabilityUpdateService?.capabilities?.maxBlobUploadBytes ?? null;
+	}
+
+	get attachmentBackend(): "r2" | "do" | null {
+		return this.capabilityUpdateService?.attachmentBackend ?? null;
+	}
+
+	async fetchAttachmentStorageStatus(reason = "settings-tab"): Promise<AttachmentStorageStatus | null> {
+		return await this.capabilityUpdateService?.fetchAttachmentStorageStatus(reason) ?? null;
+	}
+
+	private triggerAttachmentSweep(): void {
+		void this.capabilityUpdateService?.fetchAttachmentStorageStatus("startup-sweep");
 	}
 
 	buildSetupDeepLink(): string | null {

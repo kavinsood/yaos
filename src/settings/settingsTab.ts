@@ -6,6 +6,7 @@ import {
 	type ExternalEditPolicy,
 	type VaultSyncSettings,
 } from "./settingsStore";
+import { formatAttachmentStorageStatus } from "./attachmentStorageStatus";
 import { randomBase64Url } from "../utils/base64url";
 
 type SettingsAuthMode = "env" | "claim" | "unclaimed" | "unknown";
@@ -31,10 +32,12 @@ export interface VaultSyncSettingsHost {
 	serverAuthMode: SettingsAuthMode;
 	serverSupportsAttachments: boolean;
 	serverMaxBlobUploadBytes: number | null;
+	attachmentBackend: "r2" | "do" | null;
 	updateSettings(mutator: (settings: VaultSyncSettings) => void, reason?: string): Promise<void>;
 	refreshServerCapabilities(reason?: string): Promise<void>;
 	refreshUpdateManifest(reason?: string, force?: boolean): Promise<void>;
 	refreshAttachmentSyncRuntime(reason?: string): Promise<void>;
+	fetchAttachmentStorageStatus(reason?: string): Promise<{ usedBytes: number; blobCount: number } | null>;
 	getSettingsStatusSummary(): { state: SettingsStatusState; label: string };
 	getUpdateState(): SettingsUpdateState;
 	buildSetupDeepLink(): string | null;
@@ -117,6 +120,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 		containerEl.addClass("yaos-settings-tab");
 		const authMode = this.host.serverAuthMode;
 		const attachmentsAvailable = this.host.serverSupportsAttachments;
+		const attachmentBackend = this.host.attachmentBackend;
 		const attachmentCapKB = attachmentSizeCapKB(this.host.serverMaxBlobUploadBytes);
 		const setupIncomplete = !this.host.settings.host || !this.host.settings.token;
 		const syncStatus = this.host.getSettingsStatusSummary();
@@ -316,9 +320,11 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 				new Setting(containerEl)
 					.setName("Attachment storage")
 					.setDesc(
-						attachmentsAvailable
-							? "Available on this server. The plugin can sync attachments and snapshots."
-							: "Not available on this server. Add object storage in Cloudflare, then redeploy.",
+						attachmentBackend === "do"
+							? "Attachments sync automatically (~1 GB free per vault). Add R2 for snapshots and >1 GB storage."
+							: attachmentsAvailable
+								? "Available on this server. The plugin can sync attachments and snapshots."
+								: "Not available on this server. Add object storage in Cloudflare, then redeploy.",
 					)
 					.addButton((button) =>
 						button
@@ -330,6 +336,25 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 							this.display();
 						}),
 				);
+
+				if (attachmentBackend === "do") {
+					const storageRow = containerEl.createDiv({ cls: "yaos-settings-card-row" });
+					storageRow.createSpan({
+						text: "DO storage usage",
+						cls: "yaos-settings-card-label",
+					});
+					const storageValue = storageRow.createSpan({
+						text: "Loading…",
+						cls: "yaos-settings-card-value",
+					});
+					void this.host.fetchAttachmentStorageStatus("settings-tab").then((status) => {
+						if (!storageValue.isConnected) return;
+						const formatted = status
+							? formatAttachmentStorageStatus(status, attachmentBackend)
+							: null;
+						storageValue.setText(formatted ?? "Unavailable");
+					});
+				}
 		}
 
 				if (this.host.settings.host && !attachmentsAvailable) {
@@ -351,7 +376,9 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 				new Setting(containerEl)
 					.setName("Sync attachments")
 					.setDesc(
-						"Sync images, PDF files, and other attachments through object storage. This is enabled by default when the server supports it.",
+						attachmentBackend === "do"
+							? "Sync images, PDF files, and other attachments automatically through the server. R2 is optional for larger storage."
+							: "Sync images, PDF files, and other attachments through object storage. This is enabled by default when the server supports it.",
 					)
 				.addToggle((toggle) =>
 					toggle

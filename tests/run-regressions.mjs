@@ -96,6 +96,7 @@ const suites = [
 	[JITI, "tests/server-hardening.ts"],
 	[JITI, "tests/server-capabilities-attachment-backend.ts"],
 	[JITI, "tests/settings-hardening.ts"],
+	[JITI, "tests/settings-attachment-storage-status.ts"],
 	[JITI, "tests/snapshot-lookup.ts"],
 	[JITI, "tests/ws-ticket-auth.ts"],
 	[JITI, "tests/v2-offline-rename-regressions.mjs"],

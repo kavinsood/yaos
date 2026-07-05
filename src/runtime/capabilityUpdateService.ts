@@ -70,7 +70,25 @@ function buildGithubOpsBootstrapWorkflowYaml(): string {
 	].join("\n");
 }
 
-export function isServerCapabilities(value: unknown): value is ServerCapabilities {
+export type AttachmentStorageStatus = {
+	usedBytes: number;
+	blobCount: number;
+};
+
+export function parseAttachmentStorageStatus(value: unknown): AttachmentStorageStatus | null {
+	if (typeof value !== "object" || value === null) return null;
+	const candidate = value as { usedBytes?: unknown; blobCount?: unknown };
+	if (typeof candidate.usedBytes !== "number" || !Number.isFinite(candidate.usedBytes)) {
+		return null;
+	}
+	if (typeof candidate.blobCount !== "number" || !Number.isSafeInteger(candidate.blobCount)) {
+		return null;
+	}
+	return {
+		usedBytes: candidate.usedBytes,
+		blobCount: candidate.blobCount,
+	};
+}
 	if (typeof value !== "object" || value === null) return false;
 	const candidate = value as Partial<ServerCapabilities>;
 	return typeof candidate.claimed === "boolean" &&
@@ -188,6 +206,32 @@ export class CapabilityUpdateService {
 
 	get attachmentBackend(): ServerCapabilities["attachmentBackend"] | null {
 		return this.serverCapabilities?.attachmentBackend ?? null;
+	}
+
+	async fetchAttachmentStorageStatus(reason = "manual"): Promise<AttachmentStorageStatus | null> {
+		const settings = this.deps.getSettings();
+		const host = settings.host.trim().replace(/\/$/, "");
+		const token = settings.token.trim();
+		const vaultId = settings.vaultId.trim();
+		if (!host || !token || !vaultId) return null;
+
+		try {
+			const res = await obsidianRequest({
+				url: `${host}/vault/${encodeURIComponent(vaultId)}/blobs/status`,
+				method: "GET",
+				headers: {
+					Authorization: `Bearer ${token}`,
+				},
+			});
+			if (res.status !== 200) {
+				this.deps.log(`Attachment storage status fetch (${reason}) failed (${res.status})`);
+				return null;
+			}
+			return parseAttachmentStorageStatus(res.json);
+		} catch (err) {
+			this.deps.log(`Attachment storage status fetch (${reason}) failed: ${formatUnknown(err)}`);
+			return null;
+		}
 	}
 
 	get hasCachedCapabilities(): boolean {
