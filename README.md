@@ -64,7 +64,7 @@ With R2 configured, you can browse snapshots, diff against current state, and se
 
 **Deploy / update / verify on your Cloudflare account:** see the [Durable Object attachment sync operator guide](./docs/do-attachment-sync-guide.md).
 
-**Running your own fork (plugin + Worker) and how to revert:** see [Migrate from kavinsood/yaos to your own fork](./docs/migrate-to-self-fork.md).
+**Running your own fork (plugin + Worker) and how to revert:** use **Settings → YAOS → Advanced → Migrate to your fork…** in Obsidian, or see the [Migrate from kavinsood/yaos to your own fork](./docs/migrate-to-self-fork.md) guide for the wizard walkthrough and manual fallback steps.
 
 ## Updating your server
 

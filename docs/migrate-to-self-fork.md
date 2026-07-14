@@ -2,7 +2,31 @@
 
 Use this when you want **both** the Obsidian plugin and the Cloudflare Worker to follow **your** repo (example: `pixmuffin/yaos`) instead of upstream `kavinsood/yaos`.
 
-It covers:
+---
+
+## Use the in-app wizard (recommended)
+
+The fastest path is the **Migrate to your fork** wizard in Obsidian:
+
+1. Open **Settings → YAOS → Advanced**.
+2. Click **Migrate to your fork…** (use **Revert to upstream…** to roll back later).
+
+The wizard walks you through six steps:
+
+1. **Prerequisites** — enter your fork URL (e.g. `pixmuffin/yaos`) and confirm your deployment repo is set.
+2. **Save release source** — persist the fork as the release source in YAOS settings (Worker URL and vault stay the same).
+3. **Retarget Ops workflow** — copy the generated `yaos-ops.yml` YAML and open GitHub to commit it in your detached deploy repo.
+4. **Run server update** — open the Ops workflow and run with `action=update`.
+5. **Switch plugin (client)** — BRAT / Marketplace cutover checklist, with a link back to this guide.
+6. **Verify** — refresh server capabilities and confirm sync is healthy.
+
+You still need a GitHub Release on your fork (with `yaos-server.zip` and plugin assets) before running the server update. The wizard automates the YAML and keeps the steps in order; use the sections below when you want the full manual reference or need to troubleshoot.
+
+---
+
+## Manual steps (fallback)
+
+The rest of this guide is the detailed manual walkthrough. It covers:
 
 1. Why migration is not “change one URL”
 2. Server (Worker) cutover
