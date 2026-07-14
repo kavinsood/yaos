@@ -12,7 +12,9 @@
  *      (not re-inlined as a literal)
  *   3. No "export const SCHEMA_VERSION = " literal in vaultSync.ts
  *   4. SCHEMA_VERSION in schema.ts is the expected value
- *   5. server/src/version.ts SERVER_MIN/MAX_SCHEMA_VERSION matches plugin
+ *   5. server/src/version.ts SERVER_MAX_SCHEMA_VERSION matches plugin
+ *   6. server/src/version.ts SERVER_MIN_SCHEMA_VERSION is <= plugin schema
+ *   7. server/src/version.ts SERVER_MIN_SCHEMA_VERSION <= SERVER_MAX_SCHEMA_VERSION
  */
 
 import { readFileSync, existsSync } from "node:fs";
@@ -71,7 +73,7 @@ if (!existsSync("src/sync/vaultSync.ts")) {
 	}
 }
 
-// 5. Server schema version must match plugin
+// 5-7. Server schema version range must include plugin schema
 if (!existsSync("server/src/version.ts")) {
 	console.warn("WARN: server/src/version.ts not found — skipping server schema check");
 } else {
@@ -84,8 +86,8 @@ if (!existsSync("server/src/version.ts")) {
 	} else {
 		const min = Number(minMatch[1]);
 		const max = Number(maxMatch[1]);
-		if (min !== EXPECTED_SCHEMA_VERSION) {
-			fail(`server/src/version.ts SERVER_MIN_SCHEMA_VERSION = ${min}, expected ${EXPECTED_SCHEMA_VERSION}`);
+		if (min > EXPECTED_SCHEMA_VERSION) {
+			fail(`server/src/version.ts SERVER_MIN_SCHEMA_VERSION = ${min}, expected <= ${EXPECTED_SCHEMA_VERSION}`);
 		} else {
 			pass(`server/src/version.ts: SERVER_MIN_SCHEMA_VERSION = ${min}`);
 		}
@@ -94,8 +96,13 @@ if (!existsSync("server/src/version.ts")) {
 		} else {
 			pass(`server/src/version.ts: SERVER_MAX_SCHEMA_VERSION = ${max}`);
 		}
-		if (min === EXPECTED_SCHEMA_VERSION && max === EXPECTED_SCHEMA_VERSION) {
-			pass(`server and plugin schema versions agree: v${EXPECTED_SCHEMA_VERSION}`);
+		if (min > max) {
+			fail(`server/src/version.ts has invalid schema range: min ${min} > max ${max}`);
+		} else {
+			pass(`server supports schema range v${min}..v${max}`);
+		}
+		if (min <= EXPECTED_SCHEMA_VERSION && max === EXPECTED_SCHEMA_VERSION) {
+			pass(`server and plugin schema versions agree on max: v${EXPECTED_SCHEMA_VERSION}`);
 		}
 	}
 }
@@ -103,7 +110,7 @@ if (!existsSync("server/src/version.ts")) {
 if (failures > 0) {
 	console.error(`\nFAIL: ${failures} schema-version guard violation(s).`);
 	console.error("  SCHEMA_VERSION must be in src/sync/schema.ts, imported into vaultSync.ts,");
-	console.error("  and server/src/version.ts min/max must match.");
+	console.error("  and server/src/version.ts schema range must include the plugin schema.");
 	process.exit(1);
 } else {
 	console.log("\nPASS: schema version guard — all checks passed.");
