@@ -25,6 +25,7 @@ The local `wrangler.toml` in this directory defines:
 - the Worker entrypoint (`server/src/index.ts`)
 - the `VaultSyncServer` Durable Object binding
 - the `ServerConfig` Durable Object binding
+- the `VaultBlobStore` Durable Object binding (`YAOS_BLOBS`, migration tag `v2-blob-store`)
 
 The default deploy includes text sync and attachment sync:
 
@@ -33,6 +34,9 @@ The default deploy includes text sync and attachment sync:
 - the first browser visit shows the claim page
 
 That claim page generates a token in the browser and returns an `obsidian://yaos?...` setup link you can use to configure the plugin.
+
+For step-by-step deploy, update, `curl` smoke tests, and free-plan limits, see the
+[Durable Object attachment sync operator guide](../docs/do-attachment-sync-guide.md).
 
 ## Updating an existing deploy
 
@@ -118,6 +122,7 @@ The commit SHA lets us verify the exact server snapshot Cloudflare built, which 
 - `POST /vault/<vaultId>/blobs/exists`
 - `PUT /vault/<vaultId>/blobs/<sha256>`
 - `GET /vault/<vaultId>/blobs/<sha256>`
+- `GET /vault/<vaultId>/blobs/status` (usage for DO backend; triggers throttled GC)
 
 ### Snapshot APIs
 

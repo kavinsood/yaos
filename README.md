@@ -62,6 +62,8 @@ R2 is optional. Add a Cloudflare R2 bucket if you want daily automatic snapshots
 
 With R2 configured, you can browse snapshots, diff against current state, and selectively restore individual files. Without R2, text sync and attachment sync still work — you just won't have snapshots or unlimited attachment storage.
 
+**Deploy / update / verify on your Cloudflare account:** see the [Durable Object attachment sync operator guide](./docs/do-attachment-sync-guide.md).
+
 ## Updating your server
 
 YAOS is designed to be zero-terminal, but because you own your infrastructure, you control when updates apply.
