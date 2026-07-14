@@ -1960,6 +1960,14 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		return this.capabilityUpdateService?.buildGithubUpdaterBootstrapUrl() ?? null;
 	}
 
+	buildForkMigrationBootstrapUrl(releaseRepo: string): string | null {
+		return this.capabilityUpdateService?.buildForkMigrationBootstrapUrl(releaseRepo) ?? null;
+	}
+
+	buildForkMigrationEditUrl(): string | null {
+		return this.capabilityUpdateService?.buildForkMigrationEditUrl() ?? null;
+	}
+
 	private async syncUpdateMetadataToServer(reason: string): Promise<void> {
 		await this.capabilityUpdateService?.syncUpdateMetadataToServer(reason);
 	}

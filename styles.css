@@ -75,6 +75,101 @@
 	box-sizing: border-box;
 }
 
+.yaos-fork-migration-step {
+	margin-bottom: 16px;
+	padding: 12px 14px;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 10px;
+	background: var(--background-secondary);
+}
+
+.yaos-fork-migration-step-header {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	margin-bottom: 8px;
+}
+
+.yaos-fork-migration-step-number {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 22px;
+	height: 22px;
+	border-radius: 999px;
+	background: var(--interactive-accent);
+	color: var(--text-on-accent);
+	font-size: 12px;
+	font-weight: 700;
+}
+
+.yaos-fork-migration-step-title {
+	font-weight: 700;
+}
+
+.yaos-fork-migration-step-copy,
+.yaos-fork-migration-step-hint {
+	margin: 0 0 8px;
+}
+
+.yaos-fork-migration-step-hint {
+	color: var(--text-muted);
+	font-size: 12px;
+}
+
+.yaos-fork-migration-input-label {
+	display: block;
+	margin-bottom: 6px;
+	font-weight: 600;
+}
+
+.yaos-fork-migration-input {
+	width: 100%;
+	box-sizing: border-box;
+	margin-bottom: 8px;
+}
+
+.yaos-fork-migration-checklist {
+	margin: 0 0 8px 18px;
+}
+
+.yaos-fork-migration-status-line {
+	display: flex;
+	justify-content: space-between;
+	gap: 12px;
+	margin-bottom: 8px;
+}
+
+.yaos-fork-migration-status-label {
+	color: var(--text-muted);
+}
+
+.yaos-fork-migration-status-value {
+	font-weight: 600;
+	text-align: right;
+	word-break: break-word;
+}
+
+.yaos-fork-migration-status-warning {
+	color: var(--text-error);
+	font-weight: 600;
+	text-align: right;
+}
+
+.yaos-fork-migration-verify-status {
+	white-space: pre-wrap;
+	font-family: var(--font-monospace);
+	font-size: 12px;
+	padding: 8px 10px;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 8px;
+	background: var(--background-primary);
+}
+
+.yaos-settings-fork-migration-actions {
+	margin: 0 0 16px;
+}
+
 .yaos-settings-callout {
 	margin-bottom: 12px;
 }

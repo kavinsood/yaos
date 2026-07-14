@@ -1,4 +1,5 @@
 import { App, Notice, Plugin, PluginSettingTab, Setting } from "obsidian";
+import { ForkMigrationModal } from "../ui/ForkMigrationModal";
 import { PairDeviceModal } from "./PairDeviceModal";
 import { RecoveryKitModal } from "./RecoveryKitModal";
 import {
@@ -43,6 +44,8 @@ export interface VaultSyncSettingsHost {
 	buildSetupDeepLink(): string | null;
 	buildMobileSetupUrl(): string | null;
 	buildRecoveryKitText(): string | null;
+	buildForkMigrationBootstrapUrl(releaseRepo: string): string | null;
+	buildForkMigrationEditUrl(): string | null;
 }
 
 const CLOUDFLARE_DEPLOY_URL = "https://deploy.workers.cloudflare.com/?url=https://github.com/kavinsood/yaos/tree/main/server";
@@ -535,6 +538,16 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 						.setValue(this.host.settings.releaseSourceRepo || "kavinsood/yaos (upstream default)")
 						.setDisabled(true)
 				);
+
+			const forkMigrationActions = advancedBody.createDiv({
+				cls: "modal-button-container yaos-settings-fork-migration-actions",
+			});
+			forkMigrationActions.createEl("button", { text: "Migrate to your fork…" }).addEventListener("click", () => {
+				new ForkMigrationModal(this.app, "migrate", this.host, () => this.display()).open();
+			});
+			forkMigrationActions.createEl("button", { text: "Revert to upstream…" }).addEventListener("click", () => {
+				new ForkMigrationModal(this.app, "revert", this.host, () => this.display()).open();
+			});
 
 			new Setting(advancedBody)
 				.setName("Deployment default branch")
