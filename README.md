@@ -64,6 +64,8 @@ With R2 configured, you can browse snapshots, diff against current state, and se
 
 **Deploy / update / verify on your Cloudflare account:** see the [Durable Object attachment sync operator guide](./docs/do-attachment-sync-guide.md).
 
+**Running your own fork (plugin + Worker) and how to revert:** see [Migrate from kavinsood/yaos to your own fork](./docs/migrate-to-self-fork.md).
+
 ## Updating your server
 
 YAOS is designed to be zero-terminal, but because you own your infrastructure, you control when updates apply.

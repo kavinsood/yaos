@@ -229,4 +229,5 @@ Attachment bytes are integrity-checked with **SHA-256** (client hash + server re
 - Design: `docs/superpowers/specs/2026-06-29-durable-object-attachment-sync-design.md`
 - Plan: `docs/superpowers/plans/2026-06-29-durable-object-attachment-sync.md`
 - Server ops: `server/README.md`
+- Fork / self-host cutover + revert: `docs/migrate-to-self-fork.md`
 - Attachment engineering history (R2 path): `engineering/attachment-sync.md`
