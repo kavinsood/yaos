@@ -528,6 +528,15 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 				);
 
 			new Setting(advancedBody)
+				.setName("Release source repo")
+				.setDesc("The GitHub repository that provides server updates and plugin builds. Managed via the migration wizard.")
+				.addText((text) =>
+					text
+						.setValue(this.host.settings.releaseSourceRepo || "kavinsood/yaos (upstream default)")
+						.setDisabled(true)
+				);
+
+			new Setting(advancedBody)
 				.setName("Deployment default branch")
 				.setDesc("Used for GitLab pipeline links and future provider-native update helpers.")
 				.addText((text) =>

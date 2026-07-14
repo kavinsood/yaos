@@ -57,6 +57,8 @@ export interface VaultSyncSettings {
 	qaTraceSecret?: string;
 	/** Optional repo URL used to deep-link provider-native update pages. */
 	updateRepoUrl: string;
+	/** GitHub repository that provides server updates and plugin builds. */
+	releaseSourceRepo: string;
 	/** Optional default branch for provider-native update links. */
 	updateRepoBranch: string;
 	/** Expose window.__YAOS_DEBUG__ programmatic control surface for QA. Never ship enabled. */
@@ -83,6 +85,7 @@ export const DEFAULT_SETTINGS: VaultSyncSettings = {
 	qaTraceMode: "safe",
 	qaTraceSecret: "",
 	updateRepoUrl: "",
+	releaseSourceRepo: "",
 	updateRepoBranch: "main",
 	qaDebugMode: false,
 };
