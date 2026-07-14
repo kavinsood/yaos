@@ -47,8 +47,20 @@ const UPDATE_MANIFEST_URLS = [
 const UPDATE_MANIFEST_CACHE_MS = 24 * 60 * 60 * 1000;
 export const CAPABILITY_REFRESH_INTERVAL_MS = 30_000;
 const GITHUB_OPS_WORKFLOW_PATH = ".github/workflows/yaos-ops.yml";
+const DEFAULT_RELEASE_REPO = "kavinsood/yaos";
+const RELEASE_REPO_PATTERN = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 
-function buildGithubOpsBootstrapWorkflowYaml(): string {
+export function normalizeReleaseRepo(releaseRepo: string): string {
+	let normalized = releaseRepo.trim().replace(/^https:\/\/github\.com\//, "");
+	normalized = normalized.replace(/\/+$/, "").replace(/\.git$/, "");
+	if (!RELEASE_REPO_PATTERN.test(normalized)) {
+		return DEFAULT_RELEASE_REPO;
+	}
+	return normalized;
+}
+
+export function buildGithubOpsBootstrapWorkflowYaml(releaseRepo = DEFAULT_RELEASE_REPO): string {
+	const repo = normalizeReleaseRepo(releaseRepo);
 	return [
 		"name: YAOS Server Ops",
 		"on:",
@@ -56,12 +68,12 @@ function buildGithubOpsBootstrapWorkflowYaml(): string {
 		"    inputs:",
 		"      action: { type: choice, required: true, default: update, options: [update, revert] }",
 		"      version: { type: string, required: false }",
-		"      release_repo: { type: string, required: false, default: kavinsood/yaos }",
+		`      release_repo: { type: string, required: false, default: ${repo} }`,
 		"permissions:",
 		"  contents: write",
 		"jobs:",
 		"  run:",
-		"    uses: kavinsood/yaos/.github/workflows/yaos-ops-reusable.yml@main",
+		`    uses: ${repo}/.github/workflows/yaos-ops-reusable.yml@main`,
 		"    with:",
 		"      action: ${{ github.event.inputs.action }}",
 		"      version: ${{ github.event.inputs.version }}",
@@ -404,6 +416,10 @@ export class CapabilityUpdateService {
 	}
 
 	buildGithubUpdaterBootstrapUrl(): string | null {
+		return this.buildForkMigrationBootstrapUrl(DEFAULT_RELEASE_REPO);
+	}
+
+	buildForkMigrationBootstrapUrl(releaseRepo: string): string | null {
 		const settings = this.deps.getSettings();
 		const repoUrl = settings.updateRepoUrl.trim() || this.serverCapabilities?.updateRepoUrl;
 		const provider = this.inferUpdateProvider(repoUrl) || this.serverCapabilities?.updateProvider;
@@ -413,8 +429,21 @@ export class CapabilityUpdateService {
 			settings.updateRepoBranch.trim() || this.serverCapabilities?.updateRepoBranch || "main",
 		);
 		const filename = encodeURIComponent(GITHUB_OPS_WORKFLOW_PATH);
-		const workflowValue = encodeURIComponent(buildGithubOpsBootstrapWorkflowYaml());
+		const workflowValue = encodeURIComponent(buildGithubOpsBootstrapWorkflowYaml(releaseRepo));
 		return `${normalizedRepoUrl}/new/${branch}?filename=${filename}&value=${workflowValue}`;
+	}
+
+	buildForkMigrationEditUrl(): string | null {
+		const settings = this.deps.getSettings();
+		const repoUrl = settings.updateRepoUrl.trim() || this.serverCapabilities?.updateRepoUrl;
+		const provider = this.inferUpdateProvider(repoUrl) || this.serverCapabilities?.updateProvider;
+		if (!repoUrl || provider !== "github") return null;
+		const normalizedRepoUrl = repoUrl.replace(/\/+$/, "").replace(/\.git$/, "");
+		const branch = encodeURIComponent(
+			settings.updateRepoBranch.trim() || this.serverCapabilities?.updateRepoBranch || "main",
+		);
+		const filename = encodeURIComponent(GITHUB_OPS_WORKFLOW_PATH);
+		return `${normalizedRepoUrl}/edit/${branch}/${filename}`;
 	}
 
 	async syncUpdateMetadataToServer(reason: string): Promise<void> {
