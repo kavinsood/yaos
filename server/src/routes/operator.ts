@@ -1,8 +1,9 @@
-import { getServerByName } from "partyserver";
 import { randomBase64Url } from "../base64url";
 import { hashSecret } from "../identity";
+import type { VaultRecord } from "../identity";
 import type { PendingDestroyRecord } from "../config";
-import { deleteVaultPrefix } from "../snapshot";
+import { CloudflareRecoveryJobExecutor, type RecoveryJobStatus } from "../recoveryExecutor";
+import { RECOVERY_RPC_HEADER, vaultGenerationPrefix } from "../recoveryProtocol";
 import { buildMobileSetupUrl, renderSetupQrDataUrl } from "../setupQr";
 import {
 	buildObsidianPairingUrl,
@@ -15,7 +16,9 @@ import {
 	verifyOperatorSession,
 } from "./auth";
 import { json } from "./http";
+import { provisionReservedVault } from "./provisioning";
 import type { Env } from "./types";
+import { closeVaultDeviceSockets, readVault } from "./vault";
 
 async function requireOperator(req: Request, env: Env): Promise<Response | null> {
 	return await verifyOperatorSession(env, req)
@@ -87,6 +90,9 @@ export async function handleOperatorState(req: Request, env: Env): Promise<Respo
 export async function handleOperatorRevokeDevice(req: Request, env: Env, deviceId: string): Promise<Response> {
 	const denied = await requireOperator(req, env);
 	if (denied) return denied;
+	const state = await readConsoleState(env);
+	const target = state?.devices.find((device) => device.deviceId === deviceId);
+	if (!target) return json({ error: "unknown_device" }, 404);
 	const response = await configFetch(env, "/__yaos/revoke-device", {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
@@ -96,7 +102,12 @@ export async function handleOperatorRevokeDevice(req: Request, env: Env, deviceI
 		const payload = await response.json().catch(() => null) as { error?: string } | null;
 		return json({ error: payload?.error ?? "revoke_failed" }, response.status);
 	}
-	return json({ ok: true });
+	try {
+		const closedSockets = await closeVaultDeviceSockets(env, target.vaultId, target.deviceId);
+		return json({ ok: true, membershipRevoked: true, socketsClosed: true, closedSockets });
+	} catch {
+		return json({ ok: false, membershipRevoked: true, socketsClosed: false, closedSockets: 0 }, 202);
+	}
 }
 
 export async function handleOperatorCreateVault(req: Request, env: Env): Promise<Response> {
@@ -114,10 +125,23 @@ export async function handleOperatorCreateVault(req: Request, env: Env): Promise
 		headers: { "Content-Type": "application/json" },
 		body: JSON.stringify({ vaultId: randomBase64Url(16), name }),
 	});
-	const payload = await response.json().catch(() => null) as { error?: string; vault?: unknown } | null;
-	return response.ok
-		? json({ ok: true, vault: payload?.vault ?? null })
-		: json({ error: payload?.error ?? "create_failed" }, response.status);
+	const payload = await response.json().catch(() => null) as { error?: string; vault?: VaultRecord } | null;
+	if (!response.ok || !payload?.vault) {
+		return json({ error: payload?.error ?? "create_failed" }, response.status);
+	}
+	const provisioned = await provisionReservedVault(env, payload.vault);
+	if (!provisioned.ok) return provisioned;
+	const activation = await provisioned.json().catch(() => null) as { vault?: unknown } | null;
+	return json({ ok: true, vault: activation?.vault ?? null });
+}
+
+export async function handleOperatorProvisionVault(req: Request, env: Env, vaultId: string): Promise<Response> {
+	const denied = await requireOperator(req, env);
+	if (denied) return denied;
+	const vault = await readVault(env, vaultId);
+	if (!vault) return json({ error: "unknown_vault" }, 404);
+	if (vault.state === "active") return json({ ok: true, vault });
+	return provisionReservedVault(env, vault);
 }
 
 export async function handleOperatorPairingCode(req: Request, env: Env): Promise<Response> {
@@ -174,7 +198,7 @@ export async function handleOperatorRenameVault(req: Request, env: Env, vaultId:
 		: json({ error: payload?.error ?? "rename_failed" }, response.status);
 }
 
-function cleanupError(scope: "room" | "r2", error: unknown): string {
+function cleanupError(scope: "room" | "purge", error: unknown): string {
 	const message = error instanceof Error ? error.message : String(error);
 	return `${scope}: ${message}`.slice(0, 256);
 }
@@ -187,34 +211,122 @@ export async function attemptVaultCleanup(
 ): Promise<PendingDestroyRecord> {
 	let roomComplete = pending.roomComplete;
 	let r2Complete = pending.r2Complete;
+	let purgeState = pending.purgeState;
+	let capabilityHash = pending.capabilityHash;
+	let capabilityExpiresAt = pending.capabilityExpiresAt;
+	let deletedObjects = pending.deletedObjects;
+	let deletedBytes = pending.deletedBytes;
 	const errors: string[] = [];
 
-	if (!roomComplete) {
+	if (!r2Complete) {
 		try {
-			const response = fetchRoom
-				? await fetchRoom()
-				: await (await getServerByName(env.YAOS_SYNC, vaultId))
-					.fetch("https://internal/__yaos/delete-all", { method: "POST" });
-			if (response.ok) {
-				roomComplete = true;
+			const room = env.YAOS_SYNC.get(env.YAOS_SYNC.idFromName(vaultId));
+			const fenced = await room.fetch("https://internal/__yaos/begin-vault-deletion", {
+				method: "POST",
+				headers: {
+					"content-type": "application/json",
+					"x-yaos-vault-id": vaultId,
+					"x-yaos-vault-generation": pending.vaultGeneration,
+				},
+				body: JSON.stringify({
+					deletionId: pending.deletionId,
+					vaultGeneration: pending.vaultGeneration,
+				}),
+			});
+			if (!fenced.ok && fenced.status !== 410) throw new Error(`deletion fence returned HTTP ${fenced.status}`);
+			if (!env.YAOS_BUCKET) {
+				r2Complete = true;
+				purgeState = "complete";
+			} else if (!env.YAOS_RECOVERY_JOBS) {
+				throw new Error("recovery job binding unavailable");
 			} else {
-				errors.push(`room: delete-all returned HTTP ${response.status}`);
+				const executor = new CloudflareRecoveryJobExecutor(env.YAOS_RECOVERY_JOBS);
+				let status: RecoveryJobStatus | null;
+				try {
+					status = await executor.getStatus(pending.purgeJobId);
+				} catch {
+					status = null;
+				}
+				if (status?.state === "failed" || status?.state === "cancelled") {
+					const jobs = env.YAOS_RECOVERY_JOBS;
+					const job = jobs.get(jobs.idFromName(pending.purgeJobId));
+					const reset = await job.fetch("https://internal/__yaos/recovery-job/delete-state", {
+						method: "POST",
+						headers: {
+							[RECOVERY_RPC_HEADER]: "1",
+							"x-yaos-vault-id": vaultId,
+							"x-yaos-vault-generation": pending.vaultGeneration,
+						},
+					});
+					if (!reset.ok) throw new Error(`purge reset returned HTTP ${reset.status}`);
+					status = null;
+				}
+				if (!status) {
+					const capability = randomBase64Url(32);
+					capabilityHash = await hashSecret(capability);
+					capabilityExpiresAt = Date.now() + 7 * 24 * 60 * 60_000;
+					const admitted = await configFetch(env, "/__yaos/update-destroy-vault", {
+						method: "POST",
+						headers: { "content-type": "application/json" },
+						body: JSON.stringify({
+							vaultId,
+							roomComplete,
+							r2Complete,
+							purgeState: "queued",
+							capabilityHash,
+							capabilityExpiresAt,
+							deletedObjects,
+							deletedBytes,
+							lastError: null,
+						}),
+					});
+					if (!admitted.ok) throw new Error(`purge admission persistence returned HTTP ${admitted.status}`);
+					const prefix = vaultGenerationPrefix(vaultId, pending.vaultGeneration);
+					await executor.startPurge({
+						vaultId,
+						vaultGeneration: pending.vaultGeneration,
+						createdAt: pending.requestedAt,
+						capability,
+						capabilityExpiresAt,
+						allowedPrefixes: [`${prefix}/recovery-v2/`, `${prefix}/blobs/`],
+						deletionId: pending.deletionId,
+					});
+					status = await executor.getStatus(pending.purgeJobId);
+				}
+				purgeState = status.state === "complete" ? "complete"
+					: status.state === "failed" || status.state === "cancelled" ? "failed"
+						: status.state === "retrying" ? "retrying"
+							: status.state === "queued" ? "queued" : "purging";
+				deletedObjects = Math.max(deletedObjects, status.deletedObjects);
+				deletedBytes = Math.max(deletedBytes, status.deletedBytes);
+				r2Complete = status.state === "complete";
+				if (status.state === "failed" || status.state === "cancelled") {
+					errors.push(`purge: ${status.error?.code ?? status.state}`);
+				}
 			}
 		} catch (error) {
-			errors.push(cleanupError("room", error));
+			errors.push(cleanupError("purge", error));
 		}
 	}
 
-	if (!r2Complete) {
-		if (!env.YAOS_BUCKET) {
-			r2Complete = true;
-		} else {
-			try {
-				await deleteVaultPrefix(env.YAOS_BUCKET, vaultId);
-				r2Complete = true;
-			} catch (error) {
-				errors.push(cleanupError("r2", error));
-			}
+	if (r2Complete && !roomComplete) {
+		try {
+			const response = fetchRoom
+				? await fetchRoom()
+				: await env.YAOS_SYNC.get(env.YAOS_SYNC.idFromName(vaultId)).fetch(
+					"https://internal/__yaos/delete-all",
+					{
+						method: "POST",
+						headers: {
+							"x-yaos-vault-id": vaultId,
+							"x-yaos-vault-generation": pending.vaultGeneration,
+						},
+					},
+				);
+			if (response.ok) roomComplete = true;
+			else errors.push(`room: delete-all returned HTTP ${response.status}`);
+		} catch (error) {
+			errors.push(cleanupError("room", error));
 		}
 	}
 
@@ -222,6 +334,11 @@ export async function attemptVaultCleanup(
 		...pending,
 		roomComplete,
 		r2Complete,
+		purgeState,
+		capabilityHash,
+		capabilityExpiresAt,
+		deletedObjects,
+		deletedBytes,
 		lastError: errors.length > 0 ? errors.join("; ").slice(0, 512) : null,
 	};
 }
@@ -229,8 +346,6 @@ export async function attemptVaultCleanup(
 export async function handleOperatorDestroyVault(req: Request, env: Env, vaultId: string): Promise<Response> {
 	const denied = await requireOperator(req, env);
 	if (denied) return denied;
-	// Revoke registry membership and persist the cleanup obligation before
-	// touching either physical store. Repeating this request resumes that record.
 	let registry: Response;
 	try {
 		registry = await configFetch(env, "/__yaos/destroy-vault", {
@@ -248,11 +363,17 @@ export async function handleOperatorDestroyVault(req: Request, env: Env, vaultId
 	const registryPayload = await registry.json().catch(() => null) as {
 		pending?: PendingDestroyRecord;
 	} | null;
-	if (!registryPayload?.pending) {
-		return json({ error: "destroy_state_unavailable" }, 502);
-	}
-
-	const cleanup = await attemptVaultCleanup(env, vaultId, registryPayload.pending);
+	if (!registryPayload?.pending) return json({ error: "destroy_state_unavailable" }, 502);
+	const cleanup = await attemptVaultCleanup(env, vaultId, registryPayload.pending, async () => {
+		const room = env.YAOS_SYNC.get(env.YAOS_SYNC.idFromName(vaultId));
+		return room.fetch("https://internal/__yaos/delete-all", {
+			method: "POST",
+			headers: {
+				"x-yaos-vault-id": vaultId,
+				"x-yaos-vault-generation": registryPayload.pending!.vaultGeneration,
+			},
+		});
+	});
 	let updated: Response;
 	try {
 		updated = await configFetch(env, "/__yaos/update-destroy-vault", {
@@ -262,20 +383,20 @@ export async function handleOperatorDestroyVault(req: Request, env: Env, vaultId
 				vaultId,
 				roomComplete: cleanup.roomComplete,
 				r2Complete: cleanup.r2Complete,
+				purgeState: cleanup.purgeState,
+				capabilityHash: cleanup.capabilityHash,
+				capabilityExpiresAt: cleanup.capabilityExpiresAt,
+				deletedObjects: cleanup.deletedObjects,
+				deletedBytes: cleanup.deletedBytes,
 				lastError: cleanup.lastError,
 			}),
 		});
 	} catch {
-		return json({
-			ok: false,
-			pending: cleanup,
-			error: "cleanup_state_update_failed",
-		}, 202);
+		return json({ ok: false, pending: cleanup, error: "cleanup_state_update_failed" }, 202);
 	}
 	if (cleanup.roomComplete && cleanup.r2Complete && updated.status === 200) {
 		return json({ ok: true, completed: true });
 	}
-
 	const updatePayload = await updated.json().catch(() => null) as {
 		error?: string;
 		pending?: PendingDestroyRecord;
@@ -285,6 +406,16 @@ export async function handleOperatorDestroyVault(req: Request, env: Env, vaultId
 		pending: updatePayload?.pending ?? cleanup,
 		error: updatePayload?.error ?? cleanup.lastError ?? "destroy_pending",
 	}, 202);
+}
+
+export async function handleOperatorVaultDeletionStatus(req: Request, env: Env, vaultId: string): Promise<Response> {
+	const denied = await requireOperator(req, env);
+	if (denied) return denied;
+	const state = await readConsoleState(env);
+	if (!state) return json({ error: "config_unavailable" }, 503);
+	const pending = state.pendingDestroys.find((record) => record.vaultId === vaultId);
+	if (!pending) return json({ error: "deletion_not_found" }, 404);
+	return json({ pending });
 }
 
 export async function handleOperatorRevokePairing(req: Request, env: Env, codeId: string): Promise<Response> {

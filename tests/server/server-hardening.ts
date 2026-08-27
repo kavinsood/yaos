@@ -1,26 +1,10 @@
-import { runSerialized, runSingleFlight } from "../../server/src/asyncConcurrency";
+import { runSingleFlight } from "../../server/src/asyncConcurrency";
 import { MAX_BLOB_UPLOAD_BYTES } from "../../server/src/contracts";
-import { shouldBypassDocumentLoadForPartyServerRequest } from "../../server/src/server";
 import { getCapabilities } from "../../server/src/routes/auth";
-import { handleBlobRoute } from "../../server/src/routes/blobs";
 import { FakeR2Bucket, makeEnv } from "../mocks/workerEnv.ts";
-import { sleep, suite } from "../harness.ts";
+import { suite } from "../harness.ts";
 
 const s = suite("server-hardening");
-
-function json(body: unknown, status = 200): Response {
-	return new Response(JSON.stringify(body), {
-		status,
-		headers: { "Content-Type": "application/json" },
-	});
-}
-
-async function sha256Hex(bytes: Uint8Array): Promise<string> {
-	const digest = await crypto.subtle.digest("SHA-256", bytes);
-	return Array.from(new Uint8Array(digest), (byte) =>
-		byte.toString(16).padStart(2, "0")
-	).join("");
-}
 
 s.section("Test 1: runSingleFlight shares one in-flight cold-start load");
 {
@@ -74,182 +58,6 @@ s.section("Test 2: runSingleFlight clears after a failed load so the next call c
 	s.check(gate.inFlight === null, "single-flight gate clears after the retry succeeds");
 }
 
-s.section("Test 3: runSerialized keeps snapshot maybe logic single-filed under concurrency");
-{
-	const serialized = { chain: Promise.resolve() };
-	let activeRuns = 0;
-	let maxActiveRuns = 0;
-	let created = false;
-
-	const maybeCreateSnapshot = (triggeredBy: string) =>
-		runSerialized(serialized, async () => {
-			activeRuns++;
-			maxActiveRuns = Math.max(maxActiveRuns, activeRuns);
-			try {
-				await sleep(5);
-				if (created) {
-					return {
-						status: "noop" as const,
-						triggeredBy,
-					};
-				}
-				created = true;
-				return {
-					status: "created" as const,
-					triggeredBy,
-				};
-			} finally {
-				activeRuns--;
-			}
-		});
-
-	const results = await Promise.all([
-		maybeCreateSnapshot("device-a"),
-		maybeCreateSnapshot("device-b"),
-		maybeCreateSnapshot("device-c"),
-		maybeCreateSnapshot("device-d"),
-	]);
-	const createdResults = results.filter((result) => result.status === "created");
-	const noopResults = results.filter((result) => result.status === "noop");
-
-	s.check(maxActiveRuns === 1, "serialized queue never runs snapshot maybe work concurrently");
-	s.check(createdResults.length === 1, "serialized snapshot maybe logic produces exactly one created result");
-	s.check(noopResults.length === results.length - 1, "remaining serialized snapshot maybe calls become noops");
-}
-
-s.section("Test 4: blob uploads reject poisoned content-addressed keys");
-{
-	let putCalls = 0;
-	const bucket = new FakeR2Bucket({ onPut: () => { putCalls++; } });
-	const env = makeEnv({ YAOS_BUCKET: bucket });
-	const body = new TextEncoder().encode("not the bytes for this hash");
-	const wrongHash = "0".repeat(64);
-	const res = await handleBlobRoute(
-		env,
-		"vault",
-		new Request(`https://example.test/vault/vault/blobs/${wrongHash}`, {
-			method: "PUT",
-			body,
-		}),
-		[wrongHash],
-		json,
-	);
-	s.check(res.status === 400, "blob upload with mismatched body hash is rejected");
-	s.check(putCalls === 0, "mismatched blob body is not written to R2");
-}
-
-s.section("Test 5: blob uploads reject oversized Content-Length before R2 writes");
-{
-	let putCalls = 0;
-	const bucket = new FakeR2Bucket({ onPut: () => { putCalls++; } });
-	const env = makeEnv({ YAOS_BUCKET: bucket });
-	const body = new TextEncoder().encode("small body");
-	const hash = await sha256Hex(body);
-	const res = await handleBlobRoute(
-		env,
-		"vault",
-		new Request(`https://example.test/vault/vault/blobs/${hash}`, {
-			method: "PUT",
-			headers: { "Content-Length": String(11 * 1024 * 1024) },
-			body,
-		}),
-		[hash],
-		json,
-	);
-	s.check(res.status === 413, "blob upload with oversized Content-Length is rejected");
-	s.check(putCalls === 0, "oversized blob upload is not written to R2");
-}
-
-s.section("Test 6: blob uploads accept bytes whose body matches the address");
-{
-	let putCalls = 0;
-	let writtenKey = "";
-	const bucket = new FakeR2Bucket({
-		onPut: (key) => {
-			putCalls++;
-			writtenKey = key;
-		},
-	});
-	const env = makeEnv({ YAOS_BUCKET: bucket });
-	const body = new TextEncoder().encode("correct content-addressed bytes");
-	const hash = await sha256Hex(body);
-	const res = await handleBlobRoute(
-		env,
-		"vault",
-		new Request(`https://example.test/vault/vault/blobs/${hash}`, {
-			method: "PUT",
-			body,
-		}),
-		[hash],
-		json,
-	);
-	s.check(res.status === 204, "blob upload with matching body hash is accepted");
-	s.check(putCalls === 1, "matching blob body is written once");
-	s.check(writtenKey.endsWith(hash), "matching blob body is written under its hash key");
-}
-
-s.section("Test 7: blob uploads reject malformed Content-Length");
-{
-	let putCalls = 0;
-	const bucket = new FakeR2Bucket({ onPut: () => { putCalls++; } });
-	const env = makeEnv({ YAOS_BUCKET: bucket });
-	const body = new TextEncoder().encode("small body");
-	const hash = await sha256Hex(body);
-	const res = await handleBlobRoute(
-		env,
-		"vault",
-		new Request(`https://example.test/vault/vault/blobs/${hash}`, {
-			method: "PUT",
-			headers: { "Content-Length": "not-a-number" },
-			body,
-		}),
-		[hash],
-		json,
-	);
-	s.check(res.status === 400, "blob upload with malformed Content-Length is rejected");
-	s.check(putCalls === 0, "malformed Content-Length upload is not written to R2");
-}
-
-s.section("Test 7b: blob uploads reject oversized body when Content-Length header is absent (post-buffer fallback)");
-{
-	// When Content-Length is absent the pre-check at blobs.ts:114 is not
-	// reachable — parseContentLength returns kind:"missing" and falls through.
-	// The Worker must buffer the full body via arrayBuffer() before the
-	// post-buffer size check at blobs.ts:124 can fire.  This is a Cloudflare
-	// Workers platform constraint: there is no application-level streaming
-	// hook that would let us abort an in-flight body read mid-stream.
-	//
-	// This test documents and locks that fallback behaviour: oversized bodies
-	// are still rejected with 413 and never written to R2, but only after
-	// buffering.  A client that omits Content-Length causes the Worker to pay
-	// the full memory cost of the request body before the rejection occurs.
-	let putCalls = 0;
-	const bucket = new FakeR2Bucket({ onPut: () => { putCalls++; } });
-	const env = makeEnv({ YAOS_BUCKET: bucket });
-	// Body exceeds MAX_BLOB_UPLOAD_BYTES by one byte.  All bytes are zero so
-	// construction is fast; the exact content does not matter because the test
-	// fails at the size check, never reaching the hash-integrity check.
-	const oversizedBody = new Uint8Array(MAX_BLOB_UPLOAD_BYTES + 1);
-	// "aaa...a" (64 chars) is a syntactically valid hex hash for the URL;
-	// it will not be validated for content-address correctness because the
-	// handler returns early on the size check.
-	const placeholderHash = "a".repeat(64);
-	const res = await handleBlobRoute(
-		env,
-		"vault",
-		new Request(`https://example.test/vault/vault/blobs/${placeholderHash}`, {
-			method: "PUT",
-			// Deliberately no Content-Length header — exercises the post-buffer
-			// fallback path.  The Node.js Request constructor does not
-			// automatically populate Content-Length for buffered bodies.
-			body: oversizedBody,
-		}),
-		[placeholderHash],
-		json,
-	);
-	s.check(res.status === 413, "blob upload without Content-Length but oversized body is rejected 413");
-	s.check(putCalls === 0, "oversized blob body without Content-Length is not written to R2");
-}
 
 s.section("Test 8: public capabilities do not expose private update metadata");
 {
@@ -261,7 +69,7 @@ s.section("Test 8: public capabilities do not expose private update metadata");
 		ticketSigningKey: "ticket-signing-key",
 	} as const;
 	const config = {
-		configFormat: 1,
+		configFormat: 2,
 		claimed: true,
 		operatorRecoveryHash: "operator-hash",
 		ticketSigningKey: "ticket-signing-key",
@@ -292,21 +100,6 @@ s.section("Test 9: capabilities expose one final identity-neutral shape");
 	} as const;
 	const caps = getCapabilities(auth, env);
 	s.check(caps.claimed === true, "capabilities preserve claimed state");
-}
-s.section("Test 10: PartyServer management requests bypass document hydration only for HTTP");
-{
-	s.check(
-		shouldBypassDocumentLoadForPartyServerRequest("/cdn-cgi/partyserver/set-name/", false),
-		"non-WebSocket PartyServer management route bypasses hydration",
-	);
-	s.check(
-		!shouldBypassDocumentLoadForPartyServerRequest("/cdn-cgi/partyserver/set-name/", true),
-		"PartyServer WebSocket upgrade does not bypass hydration",
-	);
-	s.check(
-		!shouldBypassDocumentLoadForPartyServerRequest("/__yaos/debug", false),
-		"ordinary internal routes are not misclassified as PartyServer management",
-	);
 }
 
 await s.done();

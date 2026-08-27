@@ -1,1192 +1,553 @@
 import * as Y from "yjs";
-import { YServer } from "y-partyserver";
-import type { Connection, ConnectionContext, WSMessage } from "partyserver";
-import { runSerialized, runSingleFlight } from "./asyncConcurrency";
-import {
-	buildDocumentSummary,
-	type DocumentSummary,
-} from "./documentSummary";
-import { reapTombstonedBodies, type ReapResult } from "./tombstoneReaper";
-import { SqlDocStore } from "./sqlDocStore";
-import { readRoomMeta, type RoomMeta, writeRoomMeta } from "./roomMeta";
-import {
-	createSnapshot,
-	hasSnapshotForDay,
-	getLatestSnapshotIndex,
-	verifySnapshotExists,
-	applyRetention,
-	type SnapshotResult,
-} from "./snapshot";
-import {
-	TraceRing,
-	listRecentTraceEntries,
-	prepareTraceEntryForStorage,
-	TRACE_RATE_THROTTLE_EVENT,
-	TraceRateLimiter,
-	type TraceEntry as StoredTraceEntry,
-} from "./traceStore";
-import { trySendSvEcho, type SvEchoSendResult } from "./svEcho";
-import { isUpdateBearingSyncMessage } from "./syncMessageClassifier";
-import { bytesToHex, sha256Hex } from "./hex";
-import {
-	PersistenceCoordinator,
-	type PersistenceHealth,
-} from "./persistenceCoordinator";
-import type { LoadedDocState } from "./sqlDocStore";
+import { bytesToBase64Url } from "./base64url";
+import { BootstrapService } from "./bootstrap";
+import { MAX_CATCH_UP_BODIES, MAX_CATCH_UP_BYTES } from "./contracts";
+import { sha256Hex } from "./hex";
+import { BoundedBodyError, readBoundedBytes } from "./readBoundedBytes";
+import { handleVaultRecoveryRpc } from "./recoveryRpcRouter";
 import type { Env } from "./routes/types";
-import { json } from "./routes/http";
+import {
+	SERVER_PROTOCOL_VERSION,
+	SERVER_SCHEMA_VERSION,
+	SERVER_SNAPSHOT_FORMAT_VERSION,
+	SERVER_STORAGE_FORMAT_VERSION,
+} from "./version";
+import { VaultCandidateService } from "./vaultCandidateService";
+import { blobKey } from "./vaultObjectStore";
+import { VaultDocumentCache } from "./vaultDocumentCache";
+import { VaultLifecycleService } from "./vaultLifecycleService";
+import { VaultSocketService, hasSafeRootAttachmentSemantics, rootUpdateChangesProtectedAttachmentMaps, rootUpdateHasSafeAttachmentSemantics } from "./vaultSocketService";
+import { VaultStore, type CatalogMutation } from "./vaultStore";
+import { isCanonicalVaultId } from "./vaultId";
+import { VaultRecoveryService } from "./vaultRecoveryService";
 
-const MAX_DEBUG_TRACE_EVENTS = 200;
-const TRACE_DEBUG_LIMIT = 100;
+const PERSIST_DEBOUNCE_MS = 250;
+const PERSIST_RETRY_MS = 1_000;
+const JOURNAL_COMPACT_ENTRIES = 50;
+const JOURNAL_COMPACT_BYTES = 1024 * 1024;
+const FEED_RETAIN_SEQUENCES = 1000;
+const INTERNAL_DEVICE_HEADER = "x-yaos-device-id";
+const INTERNAL_GENERATION_HEADER = "x-yaos-vault-generation";
 
-const LOG_PREFIX = "[yaos-sync:server]";
+interface PersistenceStatus {
+	status: "healthy" | "degraded";
+	lastError: string | null;
+	lastSuccessAt: number | null;
+	failures: number;
+}
 
-type ServerTraceEntry = StoredTraceEntry;
+function json(value: unknown, status = 200): Response {
+	return Response.json(value, { status, headers: { "cache-control": "no-store" } });
+}
 
-type SvEchoCounters = {
-	baselineSent: number;
-	postApplySent: number;
-	failed: number;
-	bytesTotal: number;
-	bytesMax: number;
-	failureNotOpen: number;
-	failureOversize: number;
-	failureSendFailed: number;
-};
-
-/** Server-level persistence health extends coordinator health with load-time fields. */
-type ServerPersistenceHealth = PersistenceHealth & {
-	loadedStateVectorHash: string | null;
-};
-
-function equalBytes(a: Uint8Array, b: Uint8Array): boolean {
-	if (a.byteLength !== b.byteLength) return false;
-	for (let i = 0; i < a.byteLength; i++) {
-		if (a[i] !== b[i]) return false;
+function pathParts(pathname: string): string[] | null {
+	const result: string[] = [];
+	try {
+		for (const part of pathname.split("/").filter(Boolean)) result.push(decodeURIComponent(part));
+		return result;
+	} catch {
+		return null;
 	}
-	return true;
 }
 
-export function disabledAdminRouteResponse(
-	env: Pick<Env, "YAOS_ENABLE_ADMIN_ROUTES">,
-): Response | null {
-	return env.YAOS_ENABLE_ADMIN_ROUTES
-		? null
-		: json({ error: "not found" }, 404);
+function boundedLimit(url: URL, fallback = 1000): number {
+	const value = Number(url.searchParams.get("limit") ?? fallback);
+	return Number.isInteger(value) ? Math.min(1000, Math.max(1, value)) : fallback;
 }
 
-export function shouldBypassDocumentLoadForPartyServerRequest(
-	pathname: string,
-	isWebSocketUpgrade: boolean,
-): boolean {
-	return pathname.startsWith("/cdn-cgi/partyserver/") && !isWebSocketUpgrade;
+export function shouldCompactJournal(stats: { entries: number; bytes: number }): boolean {
+	return stats.entries >= JOURNAL_COMPACT_ENTRIES || stats.bytes >= JOURNAL_COMPACT_BYTES;
 }
 
-/**
- * The per-room Durable Object.
- *
- * Parameterised with the same `Env` the HTTP routes use, so `this.env` is the
- * real binding set. partyserver defaults that parameter to the empty
- * `Cloudflare.Env`, which is why every binding read used to need a cast: the
- * admin-route flag went through `as any`, and the R2 bucket through a second,
- * partial `ServerEnv` interface declared locally in this file. Both are gone —
- * a binding that is not in routes/types.ts is now a compile error here.
- */
-export class VaultSyncServer extends YServer<Env> {
-	static options = {
-		hibernate: true,
-	};
+export function createVaultDocument(guid?: string): Y.Doc {
+	return new Y.Doc(guid ? { guid } : undefined);
+}
 
-	private documentLoaded = false;
-	private destroyed = false;
-	private loadPromise: Promise<void> | null = null;
-	private roomIdHint: string | null = null;
-	private sqlDocStore: SqlDocStore | null = null;
-	private persistence: PersistenceCoordinator | null = null;
-	private snapshotMaybeChain: Promise<void> = Promise.resolve();
-	private roomMeta: RoomMeta | null = null;
-	private destroyPromise: Promise<void> | null = null;
-	private readonly inFlightWork = new Set<Promise<unknown>>();
-	private readonly traceRateLimiter = new TraceRateLimiter();
-	private readonly svEchoCounters: SvEchoCounters = {
-		baselineSent: 0,
-		postApplySent: 0,
-		failed: 0,
-		bytesTotal: 0,
-		bytesMax: 0,
-		failureNotOpen: 0,
-		failureOversize: 0,
-		failureSendFailed: 0,
-	};
-	/** Load-time health fields not owned by PersistenceCoordinator. */
-	private loadedStateVectorHash: string | null = null;
-	/**
-	 * Why this room refuses to serve, when it does.
-	 *
-	 * SQL is the only copy of the document, so a store that will not read
-	 * leaves this room with no state at all.  Set from the failure that
-	 * `SqlDocStore.loadState()` threw; while it is set `documentLoaded` stays
-	 * false and every entry point refuses.  Surfaced on /__yaos/debug so the
-	 * refusal is diagnosable without reading logs.
-	 */
-	private loadFailure: string | null = null;
+export function applyVaultUpdate(doc: Y.Doc, update: Uint8Array): void {
+	Y.applyUpdate(doc, update);
+}
 
-	/** Tombstone-reap observability fields. */
-	private tombstoneReapAttempted = false;
-	private lastTombstoneReap: ReapResult | null = null;
-	/**
-	 * Cumulative reap history, persisted across instances.
-	 *
-	 * `lastTombstoneReap` alone is actively misleading.  Reaping runs once per
-	 * instance, so every instance AFTER a successful reap reports
-	 * `reaped: 0, alreadyReaped: N` — indistinguishable at a glance from a
-	 * reaper that has never worked.  The durable trace holds the real event but
-	 * is a 200-entry ring that a busy room evicts within minutes.
-	 *
-	 * These totals are the answer to "has reaping ever reclaimed anything, and
-	 * how much".  One storage write per EFFECTIVE reap only — reaps that free
-	 * nothing, which is almost all of them, cost nothing.
-	 */
-	private reapTotals: {
-		effectiveRuns: number;
-		bodiesReaped: number;
-		charsFreed: number;
-		lastEffectiveAt: string | null;
-		lastEffective: ReapResult | null;
-	} | null = null;
-	private coldLoadDurationMs: number | null = null;
-	private oversizedDeltaCount = 0;
+export function encodeVaultState(doc: Y.Doc): Uint8Array {
+	return Y.encodeStateAsUpdate(doc);
+}
 
-	private throwIfDestroyed(): void {
-		if (this.destroyed) {
-			throw new Error(`${LOG_PREFIX} vault destroyed`);
-		}
+export interface RootPathPublication {
+	sourcePath: string | null;
+	resultPath: string;
+	fileId: string;
+	lifecycle: "active" | "tombstoned";
+}
+
+export function encodeRootPathPublicationUpdate(rootState: Uint8Array, operations: RootPathPublication[]): Uint8Array {
+	const doc = new Y.Doc({ guid: "root-publication" });
+	try {
+		Y.applyUpdate(doc, rootState);
+		const paths = doc.getMap<string>("pathToId");
+		for (const operation of operations) if (operation.sourcePath) paths.delete(operation.sourcePath);
+		for (const operation of operations) if (operation.lifecycle === "active") paths.set(operation.resultPath, operation.fileId);
+		return Y.encodeStateAsUpdate(doc);
+	} finally {
+		doc.destroy();
 	}
+}
 
-	private trackInFlight<T>(work: Promise<T>): Promise<T> {
-		this.inFlightWork.add(work);
-		void work.then(
-			() => { this.inFlightWork.delete(work); },
-			() => { this.inFlightWork.delete(work); },
+export { hasSafeRootAttachmentSemantics, rootUpdateChangesProtectedAttachmentMaps, rootUpdateHasSafeAttachmentSemantics };
+
+// Workers namespaces require the exported class type to carry the RPC brand.
+// eslint-disable-next-line @typescript-eslint/no-empty-object-type, @typescript-eslint/no-unsafe-declaration-merging -- declaration merging supplies the Workers RPC brand without importing the runtime-only cloudflare:workers module in Node tests.
+export interface VaultSyncServer extends Rpc.DurableObjectBranded {}
+
+/** Schema-4 root/body Durable Object composition and deletion fence. */
+// eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging -- see the RPC brand declaration above.
+export class VaultSyncServer implements DurableObject {
+	private store: VaultStore;
+	private readonly runtimeEpoch = crypto.randomUUID();
+	private readonly cache: VaultDocumentCache;
+	private readonly sockets: VaultSocketService;
+	private readonly lifecycle: VaultLifecycleService;
+	private readonly candidates: VaultCandidateService;
+	private readonly bootstrap: BootstrapService;
+	private readonly recovery: VaultRecoveryService;
+	private readonly persistence = new Map<string, PersistenceStatus>();
+	private readonly scheduledFlushes = new Map<string, Promise<void>>();
+	private flushChain: Promise<void> = Promise.resolve();
+	private deleted = false;
+
+	constructor(private readonly ctx: DurableObjectState, env: Env) {
+		this.store = new VaultStore(ctx.storage);
+		let socketOwner: VaultSocketService;
+		this.cache = new VaultDocumentCache(
+			this.store,
+			() => socketOwner?.openBodyIds() ?? new Set<string>(),
+			() => new Set(this.store.activePins().flatMap(() => this.store.listActiveCatalogAt(this.store.currentSequence()).map((entry) => entry.bodyId))),
 		);
-		return work;
-	}
-
-	private async drainInFlightWork(): Promise<void> {
-		while (this.inFlightWork.size > 0) {
-			await Promise.allSettled([...this.inFlightWork]);
-		}
-	}
-
-	private beginDestroy(): Promise<void> {
-		if (this.destroyPromise) return this.destroyPromise;
-
-		// This is a terminal fence, set before the first await. Every entry point
-		// observes it before it can start more persistence work.
-		this.destroyed = true;
-		for (const connection of this.getConnections()) {
-			try {
-				connection.close(4000, "vault destroyed");
-			} catch {
-				// Storage deletion remains authoritative.
-			}
-		}
-
-		const load = this.loadPromise;
-		const coordinator = this.persistence;
-		const snapshots = this.snapshotMaybeChain;
-		this.destroyPromise = (async () => {
-			// Explicitly drain each independent writer. The general work set also
-			// catches room-meta and trace writes spawned by an operation already
-			// in flight when the fence was raised.
-			await Promise.allSettled([
-				...(load ? [load] : []),
-				...(coordinator ? [coordinator.drain()] : []),
-				snapshots,
-			]);
-			await this.drainInFlightWork();
-
-			coordinator?.dispose();
-			this.documentLoaded = false;
-			this.loadPromise = null;
-			this.sqlDocStore = null;
-			this.persistence = null;
-			this.roomMeta = null;
-			await this.ctx.storage.deleteAll();
-		})();
-		return this.destroyPromise;
-	}
-
-	async onLoad(): Promise<void> {
-		await this.ensureDocumentLoaded();
-	}
-
-	async onSave(): Promise<void> {
-		if (this.destroyed) return;
-		await this.trackInFlight((async () => {
-			await this.ensureDocumentLoaded();
-			if (this.destroyed) return;
-
-			// Delegate to PersistenceCoordinator — the single source of truth
-			// for save orchestration, fallback, and health tracking.
-			//
-			// onSave() intentionally does NOT throw on persistence failure.
-			// Failure is represented by coordinator health state and surfaced via
-			// /__yaos/debug. The coordinator retries through checkpoint fallback.
-			const coordinator = this.getPersistenceCoordinator();
-			const result = await coordinator.enqueueSave();
-			if (this.destroyed) return;
-			if (!result.success) {
-				console.error(`${LOG_PREFIX} save failed (health: degraded, pendingPersistence: true):`, result.error);
-			}
-			await this.syncRoomMetaFromDocument();
-		})());
-	}
-
-	/**
-	 * There is no re-materialisation here, scheduled or manual, and no swap to
-	 * reinstate one.  The save path already encodes on every debounced save,
-	 * which flattens rope as a side effect; what remains is struct
-	 * fragmentation, which a round trip cannot merge. Rationale and
-	 * measurements: docs/architecture.md § Vault model.
-	 */
-
-	async onConnect(connection: Connection, ctx: ConnectionContext): Promise<void> {
-		if (this.destroyed) {
-			try {
-				connection.close(4000, "vault destroyed");
-			} catch {
-				// The isolate is already shutting down.
-			}
-			return;
-		}
-		await super.onConnect(connection, ctx);
-		this.recordSvEchoResult(trySendSvEcho(connection, this.document, "baseline", this.svEchoDurability()));
-	}
-
-	/**
-	 * Monotonic count of Y.Doc "update" events.
-	 *
-	 * Used to tell whether applying a message actually changed the document.
-	 * A state-vector diff cannot answer that: the SV tracks insert clocks only,
-	 * so a delete-only update leaves it byte-identical and `docChanged` would
-	 * report false for a 2KB deletion.  One long-lived listener avoids
-	 * attaching and detaching per message, which would need a finally block and
-	 * leak a listener whenever the parent handler throws.
-	 */
-	private docUpdateCount = 0;
-	private docUpdateWatcherAttached = false;
-	/**
-	 * Aggregate for update-bearing WebSocket messages.
-	 *
-	 * Replaces a per-message trace: see the note in handleMessage.  Lives
-	 * outside `recent` so it survives trace eviction, which is the entire point.
-	 */
-	private readonly updateStats = {
-		messages: 0,
-		changed: 0,
-		unchanged: 0,
-		bytesTotal: 0,
-		bytesMax: 0,
-	};
-	/**
-	 * One ring per instance so trimming needs no per-trace `list`.  See
-	 * TraceRing: the naive form cost ~201 rows read per trace and was the whole
-	 * of this room's read amplification.
-	 */
-	private readonly traceRing = new TraceRing(MAX_DEBUG_TRACE_EVENTS);
-
-	private ensureDocUpdateWatcher(): void {
-		if (this.docUpdateWatcherAttached) return;
-		this.docUpdateWatcherAttached = true;
-		this.document.on("update", () => { this.docUpdateCount++; });
-	}
-
-	handleMessage(connection: Connection, message: WSMessage): void {
-		const shouldEcho = isUpdateBearingSyncMessage(message);
-		this.ensureDocUpdateWatcher();
-		const svBefore = shouldEcho ? Y.encodeStateVector(this.document) : null;
-		const updatesBefore = this.docUpdateCount;
-		super.handleMessage(connection, message);
-		if (shouldEcho) {
-			const svAfter = Y.encodeStateVector(this.document);
-			// The counter is the signal that sees deletions; the state-vector
-			// comparison is a second opinion for inserts.
-			const docChanged =
-				this.docUpdateCount !== updatesBefore
-				|| (svBefore !== null && !equalBytes(svBefore, svAfter));
-			this.recordSvEchoResult(trySendSvEcho(connection, this.document, "postApply", this.svEchoDurability()));
-			// Counted, not traced.
-			//
-			// This is the only per-message trace site in the server, and it was
-			// drowning everything else.  Each recordTrace costs a put, a
-			// list(cap+1) and a delete inside appendTraceEntry — roughly 2 rows
-			// written and 200 rows read EVERY time — so tracing per message both
-			// evicted every rare event from the 100-entry read window (98 of 100
-			// entries observed on a live vault) and produced ~100:1 read
-			// amplification against a daily row budget shared with sync.
-			//
-			// The aggregate is what anyone actually reads, and it lives in
-			// updateStats below, outside `recent`, where trace eviction cannot
-			// hide it.  Per-message detail remains in the Workers log via
-			// console.debug, matching how syncSocket.ts handles its own hot-path
-			// admission events.
-			const updateBytes = typeof message === "string"
-				? message.length
-				: (message as ArrayBuffer).byteLength;
-			this.updateStats.messages++;
-			if (docChanged) this.updateStats.changed++;
-			else this.updateStats.unchanged++;
-			this.updateStats.bytesTotal += updateBytes;
-			if (updateBytes > this.updateStats.bytesMax) this.updateStats.bytesMax = updateBytes;
-		}
+		const vaultId = () => this.requireMetadata().vaultId;
+		const vaultGeneration = () => this.requireMetadata().vaultGeneration;
+		socketOwner = new VaultSocketService({
+			ctx,
+			cache: this.cache,
+			vaultId,
+			vaultGeneration,
+			runtimeEpoch: this.runtimeEpoch,
+			isActiveBody: (bodyId) => this.lifecycle?.activeBodyHead(bodyId) !== null,
+			isDeviceRevoked: (deviceId) => this.store.isDeviceRevoked(deviceId),
+			scheduleFlush: (documentId) => this.scheduleFlush(documentId),
+		});
+		this.sockets = socketOwner;
+		this.lifecycle = new VaultLifecycleService({
+			store: this.store,
+			cache: this.cache,
+			sockets: () => this.sockets,
+			vaultId,
+			hasBlob: async (hash) => {
+				const bucket = env.YAOS_BUCKET;
+				return bucket
+					? await bucket.head(blobKey(vaultId(), vaultGeneration(), hash)) !== null
+					: false;
+			},
+			vaultGeneration,
+			runtimeEpoch: this.runtimeEpoch,
+			flush: (documentId) => this.flushDocument(documentId),
+		});
+		this.candidates = new VaultCandidateService({
+			store: this.store,
+			cache: this.cache,
+			lifecycle: () => this.lifecycle,
+			sockets: () => this.sockets,
+			vaultId,
+			vaultGeneration,
+			runtimeEpoch: this.runtimeEpoch,
+			flush: (documentId) => this.flushDocument(documentId),
+		});
+		this.bootstrap = new BootstrapService(this.store);
+		this.recovery = new VaultRecoveryService({
+			ctx,
+			env,
+			store: () => this.store,
+			runtimeEpoch: this.runtimeEpoch,
+			flushLoadedDocuments: () => this.flushLoadedDocuments(),
+			hasPendingPersistence: () => Object.keys(this.cache.diagnostics().pending).length > 0
+				|| [...this.persistence.values()].some((entry) => entry.status === "degraded"),
+			fenceRuntime: () => {
+				this.deleted = true;
+				this.sockets.closeAll("vault deleting");
+			},
+		});
 	}
 
 	async fetch(request: Request): Promise<Response> {
-		this.captureRoomIdHint(request);
-
+		const vaultId = request.headers.get("x-yaos-vault-id");
+		if (!isCanonicalVaultId(vaultId)) return json({ error: "invalid_vault_identity" }, 400);
 		const url = new URL(request.url);
-		if (request.method === "GET" && url.pathname === "/__yaos/meta") {
-			return json({
-				roomId: this.getRoomId(),
-				meta: await this.readRoomMetaCheap(),
-			});
-		}
-
-		if (request.method === "GET" && url.pathname === "/__yaos/document") {
-			await this.ensureDocumentLoaded();
-			return new Response(Y.encodeStateAsUpdate(this.document), {
-				headers: {
-					"Content-Type": "application/octet-stream",
-					"Cache-Control": "no-store",
-				},
-			});
-		}
-
-		if (request.method === "GET" && url.pathname === "/__yaos/debug") {
-			// Do NOT call ensureDocumentLoaded() here (issue #40 fix).
-			// Debug polling is periodic and must not trigger a checkpoint load
-			// on every poll.  documentSummary is conditionally included only if
-			// the document is already in memory.
-			//
-			// crdtFootprint is opt-in (?census=1) for the same reason: it walks
-			// every struct and re-encodes the whole document, which is far too
-			// expensive to run on a poll.
-			const wantCensus = url.searchParams.get("census") === "1";
-			const recent = await listRecentTraceEntries(this.ctx.storage, TRACE_DEBUG_LIMIT);
-			const coordinator = this.getPersistenceCoordinator();
-			const serverHealth: ServerPersistenceHealth = {
-				...coordinator.health,
-				loadedStateVectorHash: this.loadedStateVectorHash,
-			};
-			return json({
-				roomId: this.getRoomId(),
-				documentLoaded: this.documentLoaded,
-				recent,
-				svEcho: { ...this.svEchoCounters },
-				persistence: serverHealth,
-				documentSummary: this.documentLoaded ? this.getDocumentSummary() : null,
-				crdtFootprint: wantCensus && this.documentLoaded ? this.getCrdtFootprint() : null,
-				storage: {
-					coldLoadDurationMs: this.coldLoadDurationMs,
-					oversizedDeltaCount: this.oversizedDeltaCount,
-					// Non-null only when the SQL store would not read.  While it
-					// is set the room is refusing to serve.
-					loadFailure: this.loadFailure,
-				},
-				updateStats: { ...this.updateStats },
-				// Cheap enough to poll; see getCheapFootprint.  This is the
-				// series to watch for rope drift in production.
-				footprint: this.documentLoaded ? this.getCheapFootprint() : null,
-				tombstoneReap: this.lastTombstoneReap,
-				// Cumulative, durable, and the only reap figure that is not
-				// misleading after the work has already been done.
-				tombstoneReapTotals: await this.loadReapTotals(),
-			});
-		}
-
-		if (request.method === "POST" && url.pathname === "/__yaos/trace") {
-			let body: { event?: string; data?: Record<string, unknown> } = {};
-			try {
-				body = await request.json();
-			} catch {
-				return json({ error: "invalid json" }, 400);
-			}
-
-			if (!body.event || typeof body.event !== "string") {
-				return json({ error: "missing event" }, 400);
-			}
-
-			await this.recordTrace(body.event, body.data ?? {});
-			return json({ ok: true });
-		}
-
-		if (request.method === "POST" && url.pathname === "/__yaos/compact") {
-			const rejection = disabledAdminRouteResponse(this.env);
-			if (rejection) return rejection;
-			await this.ensureDocumentLoaded();
-			this.throwIfDestroyed();
-			return json(await this.executeEmergencyCompact());
-		}
-
-		if (request.method === "POST" && url.pathname === "/__yaos/delete-all") {
-			await this.beginDestroy();
-			return json({ ok: true });
-		}
-
-		if (request.method === "POST" && url.pathname === "/__yaos/snapshot-maybe") {
-			await this.ensureDocumentLoaded();
-			this.throwIfDestroyed();
-			let body: { device?: string } = {};
-			try {
-				body = await request.json();
-			} catch {
-				body = {};
-			}
-			this.throwIfDestroyed();
-			return json(await this.createDailySnapshotMaybe(body.device));
-		}
-
-		// PartyServer internal management routes do not need the Y.Doc. Keep
-		// WebSocket upgrades on the ordinary hydrated path.
-		const isWebSocketUpgrade = request.headers.get("upgrade")?.toLowerCase() === "websocket";
-		if (shouldBypassDocumentLoadForPartyServerRequest(url.pathname, isWebSocketUpgrade)) {
-			return super.fetch(request);
-		}
-
-		await this.ensureDocumentLoaded();
-		return super.fetch(request);
-	}
-
-	/**
-	 * Durability marker for the sv-echo: how many times this coordinator has
-	 * successfully persisted, and which instance is counting.  Lets a client
-	 * distinguish "applied in memory" from "stored", which the state vector
-	 * cannot express for deletions.
-	 */
-	private svEchoDurability(): { generation: number; epoch: string; degraded?: boolean } {
-		const health = this.getPersistenceCoordinator().health;
-		// "degraded" means echoes still flow while writes are failing.  A room
-		// whose state would not load never reaches this path: it has no
-		// connections to echo to.
-		const degraded = health.status === "degraded";
-		return {
-			generation: health.persistedGeneration,
-			epoch: health.generationEpoch,
-			...(degraded ? { degraded: true } : {}),
-		};
-	}
-
-	private recordSvEchoResult(result: SvEchoSendResult): void {
-		if (result.ok) {
-			if (result.kind === "baseline") this.svEchoCounters.baselineSent++;
-			if (result.kind === "postApply") this.svEchoCounters.postApplySent++;
-			this.svEchoCounters.bytesTotal += result.bytes;
-			this.svEchoCounters.bytesMax = Math.max(this.svEchoCounters.bytesMax, result.bytes);
-			return;
-		}
-		this.svEchoCounters.failed++;
-		if (result.failure === "not_open") this.svEchoCounters.failureNotOpen++;
-		if (result.failure === "oversize") this.svEchoCounters.failureOversize++;
-		if (result.failure === "send_failed") this.svEchoCounters.failureSendFailed++;
-	}
-
-	private async ensureDocumentLoaded(): Promise<void> {
-		this.throwIfDestroyed();
-		if (this.documentLoaded) return;
-		const gate = { inFlight: this.loadPromise };
-		const run = runSingleFlight(gate, async () => {
-			this.throwIfDestroyed();
-			if (this.documentLoaded) return;
-
-			const coldLoadStart = performance.now();
-
-			const sqlStore = this.getSqlDocStore();
-			let sqlState: LoadedDocState;
-			try {
-				sqlState = sqlStore.loadState();
-			} catch (sqlErr) {
-				// Fail closed.  SQL is the only copy of the document: there is
-				// no second store to consult, and an unreadable checkpoint is
-				// indistinguishable from an absent one.  Serving an empty Y.Doc
-				// would be strictly worse than serving nothing — the first
-				// client to sync against it sees the vault as emptied, and the
-				// next save writes that emptiness over the state we could not
-				// read.
-				//
-				// `documentLoaded` is left false and this rejects, so no
-				// WebSocket upgrade, save, or document read can proceed.  The
-				// single-flight gate clears on rejection, so the next entry
-				// point retries the load and a transient failure recovers
-				// without operator action.
-				const message = sqlErr instanceof Error ? sqlErr.message : String(sqlErr);
-				this.loadFailure = message;
-				this.getPersistenceCoordinator().health.status = "degraded";
-				this.coldLoadDurationMs = performance.now() - coldLoadStart;
-				await this.recordTrace("storage-unreadable-refusing-service", {
-					error: message,
-					note: "SQL is the only copy of the document; serving an empty room would propagate data loss",
-				});
-				throw new Error(
-					`${LOG_PREFIX} refusing to serve room: document storage is unreadable: ${message}`,
-				);
-			}
-			this.loadFailure = null;
-
-			const sqlHasData = sqlState.snapshot !== null || sqlState.journalUpdates.length > 0;
-
-			if (sqlHasData) {
-				if (sqlState.snapshot) {
-					Y.applyUpdate(this.document, sqlState.snapshot);
-				}
-				for (const update of sqlState.journalUpdates) {
-					Y.applyUpdate(this.document, update);
-				}
-
-				const loadedSV = Y.encodeStateVector(this.document);
-				this.getPersistenceCoordinator().setInitialStateVector(loadedSV);
-				this.loadedStateVectorHash = bytesToHex(loadedSV.slice(0, 16));
-				this.getPersistenceCoordinator().health.journalEntryCount = sqlState.journalStats.entryCount;
-				this.getPersistenceCoordinator().health.journalBytes = sqlState.journalStats.totalBytes;
-				this.documentLoaded = true;
-				this.coldLoadDurationMs = performance.now() - coldLoadStart;
-				await this.syncRoomMetaFromDocument();
-				this.throwIfDestroyed();
-				await this.recordTrace("checkpoint-load", {
-					storage: "sql",
-					hasSnapshot: sqlState.snapshot !== null,
-					journalEntryCount: sqlState.journalStats.entryCount,
-					journalBytes: sqlState.journalStats.totalBytes,
-				});
-				this.throwIfDestroyed();
-				return;
-			}
-
-			// ── Empty state: fresh DO ────────────────────────────────────────
-			const loadedSV = Y.encodeStateVector(this.document);
-			this.getPersistenceCoordinator().setInitialStateVector(loadedSV);
-			this.loadedStateVectorHash = bytesToHex(loadedSV.slice(0, 16));
-			this.getPersistenceCoordinator().health.journalEntryCount = 0;
-			this.getPersistenceCoordinator().health.journalBytes = 0;
-			this.documentLoaded = true;
-			this.coldLoadDurationMs = performance.now() - coldLoadStart;
-			await this.syncRoomMetaFromDocument();
-			this.throwIfDestroyed();
-			await this.recordTrace("checkpoint-load", {
-				storage: "sql",
-				hasSnapshot: false,
-				journalEntryCount: 0,
-				journalBytes: 0,
-				note: "fresh DO, no existing state",
-			});
-			this.throwIfDestroyed();
-		});
-		this.loadPromise = gate.inFlight;
+		const parts = pathParts(url.pathname);
+		if (!parts) return json({ error: "not_found" }, 404);
 		try {
-			await this.trackInFlight(run);
-		} finally {
-			this.loadPromise = gate.inFlight;
-		}
-		this.throwIfDestroyed();
-
-		// Both load paths funnel through here, so this is the one place the
-		// reaper can run exactly once per instance without duplicating the call
-		// across the loaded and fresh branches.  A room that refused to load
-		// never gets here: ensureDocumentLoaded rejects before this point.
-		await this.maybeReapTombstonedBodies();
-		this.throwIfDestroyed();
-	}
-
-	/**
-	 * Reclaim the Y.Text bodies of long-tombstoned files, once per instance.
-	 *
-	 * Deleting a file leaves its body in `idToText` forever — see
-	 * tombstoneReaper.ts for why that happens and why removing it is safe.  The
-	 * resulting update is an ordinary document change, so the framework's
-	 * debounced save picks it up like any edit; the persistence coordinator's
-	 * dirty flag is what guarantees a deletion-only change is actually written.
-	 *
-	 * Cold load is the trigger rather than an alarm: hibernation makes cold
-	 * loads frequent enough to be effectively periodic, and every setAlarm()
-	 * costs a row written against a daily free-tier budget shared with sync.
-	 */
-	private async maybeReapTombstonedBodies(): Promise<void> {
-		if (this.destroyed) return;
-		if (this.tombstoneReapAttempted) return;
-		this.tombstoneReapAttempted = true;
-		if (!this.documentLoaded) return;
-
-		try {
-			const result = reapTombstonedBodies(this.document);
-			this.lastTombstoneReap = result;
-			if (result.tombstones > 0) {
-				await this.recordTrace("tombstone-reap", { ...result });
-				if (this.destroyed) return;
+			if (request.method === "POST" && url.pathname === "/__yaos/provision") return await this.provision(vaultId, request);
+			const metadata = this.store.vaultMetadata();
+			if (!metadata) return json({ error: "vault_not_provisioned" }, 409);
+			if (metadata.vaultId !== vaultId) return json({ error: "vault_identity_mismatch" }, 409);
+			const forwardedGeneration = request.headers.get(INTERNAL_GENERATION_HEADER);
+			if (forwardedGeneration !== metadata.vaultGeneration) {
+				return json({ error: "vault_generation_mismatch" }, 409);
 			}
-
-			// Persist explicitly rather than relying on the framework's
-			// debounced save.  y-partyserver registers its document "update"
-			// listener AFTER awaiting onLoad(), and this runs inside onLoad, so
-			// the reap's update predates that listener and would otherwise wait
-			// for an unrelated edit to flush it — or be discarded on eviction and
-			// redone on the next load.
-			if (result.reaped > 0) {
-				// A forced checkpoint, not an append.  Appending the removal
-				// leaves the entries that INSERTED the reaped bodies in the
-				// journal, and a journal is replayed verbatim on every cold
-				// load — so each subsequent load would re-materialise exactly
-				// the content the reap just removed.  Measured: ~6.3MiB
-				// resident replaying [insert, reap] versus ~0.4MiB loading the
-				// equivalent checkpoint.  Without this the reaper reclaims
-				// memory only for the instance that ran it.
-				const save = await this.getPersistenceCoordinator()
-					.forceCheckpoint("tombstone-reap");
-				if (this.destroyed) return;
-				if (!save.success) {
-					console.error(
-						`${LOG_PREFIX} tombstone reap could not be persisted; ` +
-						`bodies remain until the next attempt:`, save.error,
-					);
-				}
-
-				// Only an effective reap updates the durable totals, and only
-				// after the bodies are actually gone from storage — recording a
-				// reclaim that failed to persist would overstate what the next
-				// instance will find.
-				if (save.success) await this.recordEffectiveReap(result);
-			}
-		} catch (err) {
-			// Maintenance must never break a room load.
-			console.error(`${LOG_PREFIX} tombstone reap failed:`, err);
-		}
-	}
-
-	/** Storage key for the durable reap totals. */
-	private static readonly REAP_TOTALS_KEY = "tombstone:reap:totals";
-
-	/**
-	 * Load the cumulative reap history, once per instance.
-	 *
-	 * Falls back to zeros on a read failure rather than throwing: these are
-	 * observability counters, and losing them must never fail a debug response
-	 * or, worse, a room load.
-	 */
-	private async loadReapTotals(): Promise<NonNullable<VaultSyncServer["reapTotals"]>> {
-		if (this.reapTotals) return this.reapTotals;
-		const empty = {
-			effectiveRuns: 0,
-			bodiesReaped: 0,
-			charsFreed: 0,
-			lastEffectiveAt: null as string | null,
-			lastEffective: null as ReapResult | null,
-		};
-		try {
-			const stored = await this.ctx.storage.get(VaultSyncServer.REAP_TOTALS_KEY);
-			if (stored && typeof stored === "object") {
-				this.reapTotals = { ...empty, ...(stored as Partial<typeof empty>) };
-				return this.reapTotals;
-			}
-		} catch {
-			// Unreadable — report zeros rather than failing the caller.
-		}
-		this.reapTotals = empty;
-		return this.reapTotals;
-	}
-
-	/** Fold an effective reap into the durable totals. */
-	private async recordEffectiveReap(result: ReapResult): Promise<void> {
-		try {
-			const totals = await this.loadReapTotals();
-			if (this.destroyed) return;
-			totals.effectiveRuns++;
-			totals.bodiesReaped += result.reaped;
-			totals.charsFreed += result.charsFreed;
-			totals.lastEffectiveAt = new Date().toISOString();
-			totals.lastEffective = result;
-			await this.ctx.storage.put(VaultSyncServer.REAP_TOTALS_KEY, totals);
-		} catch (err) {
-			console.error(`${LOG_PREFIX} could not record reap totals:`, err);
-		}
-	}
-
-	private getSqlDocStore(): SqlDocStore {
-		this.throwIfDestroyed();
-		if (!this.sqlDocStore) {
-			this.sqlDocStore = new SqlDocStore(this.ctx.storage);
-		}
-		return this.sqlDocStore;
-	}
-
-	private getPersistenceCoordinator(): PersistenceCoordinator {
-		this.throwIfDestroyed();
-		if (!this.persistence) {
-			this.persistence = new PersistenceCoordinator(
-				this.document,
-				this.getSqlDocStore(),
-				(event, data) => {
-					if (event === "save.append_oversized") {
-						this.oversizedDeltaCount++;
-					}
-					void this.recordTrace(`server.${event}`, data);
-				},
-			);
-		}
-		return this.persistence;
-	}
-
-	/**
-	 * In-memory CRDT footprint census.
-	 *
-	 * Two very different things can make a Y.Doc expensive in RAM, and they
-	 * need opposite remedies:
-	 *
-	 *   - Cons-string accumulation.  Yjs merges adjacent ContentString items
-	 *     with `str += str`.  Under fine-grained editing that runs millions of
-	 *     times and V8 keeps a deep rope it will not flatten.  Struct count
-	 *     stays low, memory climbs.  A re-encode would flatten it — which is
-	 *     exactly what the save path already does on every debounced save.
-	 *   - Item fragmentation.  Non-adjacent or multi-client edits produce
-	 *     structs Yjs cannot merge.  Struct count climbs and stays climbed.
-	 *     Nothing recovers it; this is the regime that actually binds.
-	 *
-	 * `bytesPerStruct` separates them: ~10^4 means few large items (rope
-	 * regime), ~10^1 means many small items (fragmentation regime).  Benchmark
-	 * for the same metrics on synthetic corpora: scripts/bench-memory.mjs.
-	 *
-	 * This walks every struct and fully re-encodes the document, so it is far
-	 * too expensive for the periodic debug poll and is opt-in only.
-	 */
-	private getCrdtFootprint(): {
-		clients: number;
-		structs: number;
-		items: number;
-		gcs: number;
-		deletedItems: number;
-		liveChars: number;
-		encodedBytes: number;
-		bytesPerStruct: number;
-		itemsPerKB: number;
-		databaseSizeBytes: number | null;
-	} {
-		let structs = 0;
-		let items = 0;
-		let gcs = 0;
-		let deletedItems = 0;
-		let liveChars = 0;
-
-		for (const structList of this.document.store.clients.values()) {
-			structs += structList.length;
-			for (const struct of structList) {
-				// instanceof, not constructor.name: class names do not survive
-				// minification in the released bundle.
-				if (!(struct instanceof Y.Item)) {
-					gcs++;
-					continue;
-				}
-				items++;
-				if (struct.deleted) deletedItems++;
-				else liveChars += struct.length;
-			}
-		}
-
-		const encodedBytes = Y.encodeStateAsUpdate(this.document).byteLength;
-
-		let databaseSizeBytes: number | null = null;
-		try {
-			const size = this.ctx.storage.sql?.databaseSize;
-			if (typeof size === "number") databaseSizeBytes = size;
-		} catch {
-			// KV-backed or unavailable — reported as null rather than failing
-			// the whole debug response.
-		}
-
-		return {
-			clients: this.document.store.clients.size,
-			structs,
-			items,
-			gcs,
-			deletedItems,
-			liveChars,
-			encodedBytes,
-			bytesPerStruct: structs > 0 ? encodedBytes / structs : 0,
-			itemsPerKB: liveChars > 0 ? items / (liveChars / 1024) : 0,
-			databaseSizeBytes,
-		};
-	}
-
-	/**
-	 * Footprint numbers cheap enough to return on every debug poll.
-	 *
-	 * getCrdtFootprint() is the honest measurement but it re-encodes the whole
-	 * document, so it can only ever be opt-in — which makes it useless for the
-	 * thing we actually want, which is watching drift over time in production.
-	 *
-	 * Everything here is O(clients) or O(1):
-	 *   - struct count sums the per-client array lengths without touching a
-	 *     single struct, so it does not grow with document size.
-	 *   - databaseSize is a SQLite property read.
-	 *
-	 * `structs` is the number that matters.  Memory scales with struct count at
-	 * roughly 117 bytes each, not with characters: 12.5MB of freshly synced text
-	 * costs ~3,300 structs, while 30,000 scattered edits to the same vault cost
-	 * ~30,000 more.  Against a 128MB isolate that puts the ceiling near 850,000
-	 * structs, and it is reached by fragmentation rather than by size.
-	 *
-	 * Deliberately no derived ratio.  An earlier version divided stored bytes by
-	 * struct count and called it bytesPerStruct, which mixes two denominators --
-	 * stored bytes include the journal, the snapshot and SQLite page overhead --
-	 * and this whole line of work is a monument to what convenient proxies cost.
-	 * Both raw numbers are here; divide them if you want to, knowing what you
-	 * divided.
-	 */
-	private getCheapFootprint(): {
-		clients: number;
-		structs: number;
-		databaseSizeBytes: number | null;
-		updatesApplied: number;
-	} {
-		let structs = 0;
-		for (const structList of this.document.store.clients.values()) {
-			structs += structList.length;
-		}
-
-		let databaseSizeBytes: number | null = null;
-		try {
-			const size = this.ctx.storage.sql?.databaseSize;
-			if (typeof size === "number") databaseSizeBytes = size;
-		} catch {
-			// KV-backed or unavailable — null rather than failing the response.
-		}
-
-		return {
-			clients: this.document.store.clients.size,
-			structs,
-			databaseSizeBytes,
-			updatesApplied: this.docUpdateCount,
-		};
-	}
-
-	/**
-	 * Decoded document summary for deployment validation and diagnostics.
-	 *
-	 * Delegated to documentSummary.ts so the counting rules are testable against
-	 * a constructed document; they were not before, which is how a healthy
-	 * 92-file vault came to report activePathsWithText: 0 unchallenged.
-	 */
-	private getDocumentSummary(): DocumentSummary {
-		return buildDocumentSummary(this.document);
-	}
-
-	private async readRoomMetaCheap(): Promise<RoomMeta | null> {
-		this.throwIfDestroyed();
-		return await this.trackInFlight((async () => {
-			const stored = await readRoomMeta(this.ctx.storage);
-			this.throwIfDestroyed();
-			if (stored) {
-				this.roomMeta = stored;
-			}
-			if (this.documentLoaded) {
-				const liveSchemaVersion = this.currentSchemaVersion();
-				if (!this.roomMeta || this.roomMeta.schemaVersion !== liveSchemaVersion) {
-					const nextMeta: RoomMeta = {
-						schemaVersion: liveSchemaVersion,
-						updatedAt: new Date().toISOString(),
-					};
-					this.roomMeta = nextMeta;
-					void this.syncRoomMetaFromDocument();
-				}
-			}
-			return this.roomMeta;
-		})());
-	}
-
-	private currentSchemaVersion(): number | null {
-		const stored = this.document.getMap("sys").get("schemaVersion");
-		if (typeof stored === "number" && Number.isInteger(stored) && stored >= 0) {
-			return stored;
-		}
-		return null;
-	}
-
-	private async syncRoomMetaFromDocument(): Promise<void> {
-		if (this.destroyed) return;
-		await this.trackInFlight((async () => {
-			const nextSchemaVersion = this.currentSchemaVersion();
-			if (this.roomMeta && this.roomMeta.schemaVersion === nextSchemaVersion) {
-				return;
-			}
-			const nextMeta: RoomMeta = {
-				schemaVersion: nextSchemaVersion,
-				updatedAt: new Date().toISOString(),
-			};
-			try {
-				if (this.destroyed) return;
-				await writeRoomMeta(this.ctx.storage, nextMeta);
-				if (this.destroyed) return;
-				this.roomMeta = nextMeta;
-			} catch (err) {
-				console.error(`${LOG_PREFIX} room meta persist failed:`, err);
-			}
-		})());
-	}
-
-	private async createDailySnapshotMaybe(
-		triggeredBy?: string,
-	): Promise<SnapshotResult> {
-		this.throwIfDestroyed();
-		const serialized = { chain: this.snapshotMaybeChain };
-		const run = runSerialized(
-			serialized,
-			async () => {
-				this.throwIfDestroyed();
-				const bucket = this.env.YAOS_BUCKET;
-				if (!bucket) {
-					return {
-						status: "unavailable",
-						reason: "R2 bucket not configured",
-					} satisfies SnapshotResult;
-				}
-
-				const vaultId = this.getRoomId();
-
-				// Dedup: skip if the full encoded CRDT (including delete set) is unchanged.
-				// We use fullUpdateHash because Yjs state vectors do NOT track deletions.
-				// A state-vector-only check would miss delete-only changes, which is
-				// catastrophic for a recovery system.
-				//
-				// Cost: O(doc size) to encode + hash. Acceptable at daily frequency.
-				const latest = await getLatestSnapshotIndex(vaultId, bucket);
-				this.throwIfDestroyed();
-				if (latest?.fullUpdateHash) {
-					const rawUpdate = Y.encodeStateAsUpdate(this.document);
-					const currentHash = await sha256Hex(rawUpdate);
-					this.throwIfDestroyed();
-					if (latest.fullUpdateHash === currentHash) {
-						// Before skipping: verify the pointed snapshot actually exists.
-						// A poisoned latest pointer (payload never written) would
-						// otherwise cause us to skip forever.
-						const exists = await verifySnapshotExists(vaultId, latest, bucket);
-						this.throwIfDestroyed();
-						if (exists) {
-							return {
-								status: "noop",
-								reason: "No changes since last snapshot (full CRDT state identical)",
-							} satisfies SnapshotResult;
-						}
-						// Pointer is poisoned — fall through to create a new snapshot.
-						// The precomputed update is still valid, pass it along.
-					}
-					// Hash changed — create snapshot. Pass precomputed values to avoid re-encoding.
-					const index = await createSnapshot(
-						this.document,
-						vaultId,
-						bucket,
-						{
-							triggeredBy,
-							reason: "daily",
-							pinned: false,
-							precomputedRawUpdate: rawUpdate,
-							precomputedFullUpdateHash: currentHash,
-						},
-					);
-					this.throwIfDestroyed();
-
-					// Retention: await so failures are observable.
-					try {
-						const retentionResult = await applyRetention(vaultId, bucket);
-						if (retentionResult.failed > 0) {
-							console.error(
-								`${LOG_PREFIX} retention: ${retentionResult.failed} delete(s) failed:`,
-								retentionResult.errors.slice(0, 5),
-							);
-						}
-					} catch (err) {
-						console.error(`${LOG_PREFIX} retention failed:`, err);
-					}
-					this.throwIfDestroyed();
-
-					return {
-						status: "created",
-						snapshotId: index.snapshotId,
-						index,
-					} satisfies SnapshotResult;
-				} else if (latest) {
-					// Ancient legacy path: no hash fields at all. Day-based dedup.
-					const currentDay = new Date().toISOString().slice(0, 10);
-					const existsForDay = await hasSnapshotForDay(vaultId, currentDay, bucket);
-					this.throwIfDestroyed();
-					if (existsForDay) {
-						return {
-							status: "noop",
-							reason: `Snapshot already taken today (${currentDay})`,
-						} satisfies SnapshotResult;
-					}
-				}
-
-				const index = await createSnapshot(
-					this.document,
-					vaultId,
-					bucket,
-					{ triggeredBy, reason: "daily", pinned: false },
-				);
-				this.throwIfDestroyed();
-
-				// Retention: await so failures are observable.
+			const recoveryResponse = await handleVaultRecoveryRpc(request, vaultId, this.store, this.recovery);
+			if (recoveryResponse) return recoveryResponse;
+			if (request.method === "POST" && url.pathname === "/__yaos/revoke-device-sockets") {
+				let body: { deviceId?: unknown };
 				try {
-					const retentionResult = await applyRetention(vaultId, bucket);
-					if (retentionResult.failed > 0) {
-						console.error(
-							`${LOG_PREFIX} retention: ${retentionResult.failed} delete(s) failed:`,
-							retentionResult.errors.slice(0, 5),
-						);
-					}
-				} catch (err) {
-					console.error(`${LOG_PREFIX} retention failed:`, err);
+					body = await request.json();
+				} catch {
+					return json({ error: "invalid_json" }, 400);
 				}
-				this.throwIfDestroyed();
+				if (typeof body.deviceId !== "string" || !body.deviceId || body.deviceId.length > 128) {
+					return json({ error: "invalid_device_identity" }, 400);
+				}
+				this.store.revokeDevice(body.deviceId);
+				return json({ closed: this.sockets.closeDevice(body.deviceId) });
+			}
+			if (request.method === "POST" && url.pathname === "/__yaos/begin-vault-deletion") return this.beginDeletion(request);
+			if (request.method === "POST" && url.pathname === "/__yaos/delete-all") return this.deleteAll();
+			if (this.store.vaultDeletionBegun(metadata.vaultGeneration)) return json({ error: "vault_deleting" }, 410);
+			if (request.method === "POST" && url.pathname === "/compact") return this.compact();
 
-				return {
-					status: "created",
-					snapshotId: index.snapshotId,
-					index,
-				} satisfies SnapshotResult;
-			},
-		);
-		this.snapshotMaybeChain = serialized.chain;
-		return await this.trackInFlight(run);
+			if (request.method === "GET" && request.headers.get("upgrade")?.toLowerCase() === "websocket") {
+				const deviceId = request.headers.get(INTERNAL_DEVICE_HEADER);
+				if (!deviceId) return json({ error: "missing_trusted_device_identity" }, 401);
+				if (url.pathname === "/ws/root") return this.sockets.accept("root", "root", deviceId);
+				if (parts.length === 3 && parts[0] === "ws" && parts[1] === "body") {
+					const bodyId = parts[2]!;
+					if (!this.lifecycle.activeBodyHead(bodyId)) return json({ error: "body_not_active" }, 409);
+					return this.sockets.accept(bodyId, "body", deviceId);
+				}
+			}
+			if (request.method === "POST" && parts.length === 3 && parts[0] === "body" && parts[2] === "candidate") {
+				return this.candidates.handle(parts[1]!, request);
+			}
+			if (request.method === "POST" && url.pathname === "/attachments/publish") {
+				return this.lifecycle.publishAttachment(request);
+			}
+			if (request.method === "POST" && url.pathname === "/lifecycle") return this.lifecycle.handle(request);
+			if (request.method === "POST" && url.pathname === "/lifecycle/batch") return this.lifecycle.handleBatch(request);
+			if (request.method === "POST" && url.pathname === "/lifecycle/publish") return this.lifecycle.publish(request);
+			if (request.method === "POST" && url.pathname === "/catch-up") return this.catchUp(request);
+			const bootstrap = await this.bootstrapRoute(request, url, parts);
+			if (bootstrap) return bootstrap;
+			if (request.method === "GET" && url.pathname === "/changes") {
+				const after = Number(url.searchParams.get("after") ?? "0");
+				if (!Number.isInteger(after) || after < 0) return json({ error: "invalid_cursor" }, 400);
+				return json(this.store.changesPageAfter(after, boundedLimit(url)));
+			}
+			if (request.method === "GET" && url.pathname === "/heads") {
+				const highWater = this.store.currentSequence();
+				const limit = boundedLimit(url);
+				const entries = this.store.listActiveCatalogAt(highWater, url.searchParams.get("cursor") ?? "", limit);
+				return json({ entries, nextCursor: entries.length === limit ? entries.at(-1)!.bodyId : null, highWater });
+			}
+			if (request.method === "GET" && parts.length === 2 && parts[0] === "head") return json(this.lifecycle.activeBodyHead(parts[1]!));
+			if (request.method === "GET" && parts.length === 2 && parts[0] === "body") return this.bodyState(parts[1]!);
+			if (request.method === "GET" && url.pathname === "/root") return this.rootState(url);
+			if (request.method === "GET" && url.pathname === "/status") return this.status();
+			if (request.method === "GET" && url.pathname === "/health") return this.health();
+			if (request.method === "GET" && url.pathname === "/diagnostics") return this.diagnostics();
+			return json({ error: "not_found" }, 404);
+		} catch (error) {
+			console.error("[yaos-vault] request failed", error);
+			return json({ error: error instanceof Error ? error.message : "vault_runtime_failed" }, 500);
+		}
 	}
 
-	private async executeEmergencyCompact(): Promise<{
-		status: string;
-		journalBefore: { entryCount: number; totalBytes: number };
-		journalAfter?: { entryCount: number; totalBytes: number };
-		error?: string;
-	}> {
-		const store = this.getSqlDocStore();
-		const statsBefore = store.getJournalStats();
+	async webSocketMessage(socket: WebSocket, message: string | ArrayBuffer): Promise<void> {
+		if (this.deleted) socket.close(1001, "vault maintenance");
+		else await this.sockets.message(socket, message);
+	}
 
-		if (statsBefore.entryCount === 0) {
-			return {
-				status: "noop",
-				journalBefore: statsBefore,
-				journalAfter: statsBefore,
-			};
+	webSocketClose(): void {}
+
+	webSocketError(socket: WebSocket): void {
+		try { socket.close(1011, "socket error"); } catch { /* already closed */ }
+	}
+
+	async alarm(): Promise<void> {
+		for (const documentId of Object.keys(this.cache.diagnostics().pending)) await this.flushDocument(documentId);
+		this.store.reapExpiredRecoveryCaptures(Date.now(), 25);
+		this.store.reapExpiredRestoreAuthorities(Date.now(), 25);
+		const gc = this.store.latestGcEpoch();
+		if (gc && (gc.state === "marking" || gc.state === "sweeping") && gc.deadlineAt <= Date.now()) {
+			this.store.advanceGcEpoch(gc.epoch, "aborted");
 		}
+		if (this.store.activeRecoveryCapture() || this.store.activeRestoreAuthority()
+			|| gc?.state === "marking" || gc?.state === "sweeping") {
+			await this.ctx.storage.setAlarm(Date.now() + 60_000);
+		}
+	}
 
+	private async provision(vaultId: string, request: Request): Promise<Response> {
+		let body: { vaultGeneration?: unknown };
+		try { body = await request.json(); } catch { return json({ error: "invalid_json" }, 400); }
+		if (!isCanonicalVaultId(body.vaultGeneration)) return json({ error: "invalid_vault_generation" }, 400);
+		const root = new Y.Doc({ guid: "root" });
+		root.getMap("sys").set("schemaVersion", SERVER_SCHEMA_VERSION);
+		root.getMap("sys").set("protocolVersion", SERVER_PROTOCOL_VERSION);
+		const result = this.store.provisionVault(vaultId, body.vaultGeneration, Y.encodeStateAsUpdate(root));
+		root.destroy();
+		this.deleted = false;
 		try {
-			const checkpointUpdate = Y.encodeStateAsUpdate(this.document);
-			store.rewriteCheckpoint(checkpointUpdate);
-
-			// Update coordinator state
-			const coordinator = this.getPersistenceCoordinator();
-			const checkpointStateVector = Y.encodeStateVector(this.document);
-			coordinator.setInitialStateVector(checkpointStateVector);
-			coordinator.resetCompactionCircuitBreaker();
-
-			const statsAfter = store.getJournalStats();
-			coordinator.health.journalEntryCount = statsAfter.entryCount;
-			coordinator.health.journalBytes = statsAfter.totalBytes;
-			coordinator.health.lastCompactionAt = new Date().toISOString();
-			coordinator.health.lastCompactionReason = "emergency_compact";
-			coordinator.health.lastCompactionError = null;
-
-			await this.recordTrace("server.emergency_compact_succeeded", {
-				journalEntriesBefore: statsBefore.entryCount,
-				journalBytesBefore: statsBefore.totalBytes,
-				journalEntriesAfter: statsAfter.entryCount,
-				journalBytesAfter: statsAfter.totalBytes,
-				checkpointBytes: checkpointUpdate.byteLength,
-			});
-
-			return {
-				status: "compacted",
-				journalBefore: statsBefore,
-				journalAfter: statsAfter,
-			};
-		} catch (err) {
-			const errorMessage = err instanceof Error ? err.message : String(err);
-
-			await this.recordTrace("server.emergency_compact_failed", {
-				error: errorMessage,
-				journalEntryCount: statsBefore.entryCount,
-				journalBytes: statsBefore.totalBytes,
-			});
-
-			return {
-				status: "failed",
-				journalBefore: statsBefore,
-				error: errorMessage,
-			};
+			await this.recovery.initializeProjection(vaultId);
+		} catch (error) {
+			console.warn("[yaos-vault] recovery projection unavailable", error);
 		}
+		return json(result, result.created ? 201 : 200);
 	}
 
-	private recordTrace(
-		event: string,
-		data: Record<string, unknown>,
-	): Promise<void> {
-		if (this.destroyed) return Promise.resolve();
-		return this.trackInFlight(this.persistTrace(event, data));
+	private async beginDeletion(request: Request): Promise<Response> {
+		let body: { deletionId?: unknown; vaultGeneration?: unknown };
+		try { body = await request.json(); } catch { return json({ error: "invalid_json" }, 400); }
+		const metadata = this.requireMetadata();
+		if (body.vaultGeneration !== metadata.vaultGeneration || typeof body.deletionId !== "string" || !body.deletionId) {
+			return json({ error: "invalid_vault_deletion_fence" }, 400);
+		}
+		await this.flushLoadedDocuments();
+		await this.recovery.beginVaultDeletion({ vaultId: metadata.vaultId, deletionId: body.deletionId });
+		return json({ deleting: true });
 	}
 
-	private async persistTrace(
-		event: string,
-		data: Record<string, unknown>,
-	): Promise<void> {
-		// INV-OBS-02: per-room budget. Drop over-budget events; surface the
-		// drop count via a single throttled-summary entry the next time an
-		// admit succeeds. Throttle-summary entries themselves bypass the
-		// rate limiter (otherwise drops could become unobservable).
-		const isThrottleSummary = event === TRACE_RATE_THROTTLE_EVENT;
-		if (!isThrottleSummary && !this.traceRateLimiter.admit()) {
-			return;
-		}
+	private async deleteAll(): Promise<Response> {
+		this.deleted = true;
+		this.sockets.closeAll("vault deleted");
+		await this.flushChain;
+		this.cache.clear();
+		this.persistence.clear();
+		await this.ctx.storage.deleteAlarm();
+		await this.ctx.storage.deleteAll();
+		this.store = new VaultStore(this.ctx.storage);
+		return json({ deleted: true });
+	}
 
-		const entry: ServerTraceEntry = prepareTraceEntryForStorage({
-			...data,
-			ts: new Date().toISOString(),
-			event,
-			roomId: this.getRoomId(),
+	private async catchUp(request: Request): Promise<Response> {
+		const deviceId = request.headers.get(INTERNAL_DEVICE_HEADER);
+		if (!deviceId) return json({ error: "missing_trusted_device_identity" }, 401);
+		let bytes: Uint8Array;
+		try { bytes = await readBoundedBytes(request, MAX_CATCH_UP_BYTES); }
+		catch (error) { return json({ error: error instanceof BoundedBodyError ? error.kind : "invalid_body" }, 413); }
+		let input: unknown;
+		try { input = JSON.parse(new TextDecoder().decode(bytes)); } catch { return json({ error: "invalid_json" }, 400); }
+		if (typeof input !== "object" || input === null || Array.isArray(input) || !("bodies" in input)
+			|| !Array.isArray(input.bodies) || input.bodies.length > MAX_CATCH_UP_BODIES) {
+			return json({ error: "invalid_catch_up_batch" }, 400);
+		}
+		const requestedBodies: unknown[] = input.bodies;
+		const bodies: unknown[] = [];
+		for (const item of requestedBodies) {
+			if (typeof item !== "object" || item === null || Array.isArray(item)) {
+				return json({ error: "invalid_catch_up_batch" }, 400);
+			}
+			const bodyId = "bodyId" in item && typeof item.bodyId === "string" ? item.bodyId : "";
+			const head = this.lifecycle.activeBodyHead(bodyId);
+			if (!head) { bodies.push({ bodyId, status: 409, error: "body_not_active" }); continue; }
+			try {
+				const reconstructed = this.store.reconstructDocument(bodyId);
+				const update = Y.encodeStateAsUpdate(reconstructed.doc);
+				reconstructed.doc.destroy();
+				bodies.push({ bodyId, status: 200, generation: reconstructed.generation, contentHash: head.contentHash,
+					size: head.size, update: bytesToBase64Url(update) });
+			} catch { bodies.push({ bodyId, status: 500, error: "body_state_corrupt" }); }
+		}
+		const response = JSON.stringify({ bodies, highWater: this.store.currentSequence() });
+		if (new TextEncoder().encode(response).byteLength > MAX_CATCH_UP_BYTES) return json({ error: "catch_up_response_too_large" }, 413);
+		return new Response(response, { headers: { "content-type": "application/json", "cache-control": "no-store" } });
+	}
+
+	private async bootstrapRoute(request: Request, url: URL, parts: string[]): Promise<Response | null> {
+		if (parts[0] !== "bootstrap") return null;
+		if (request.method === "POST" && url.pathname === "/bootstrap/start") {
+			await this.flushLoadedDocuments();
+			let input: unknown = {};
+			try { input = await request.json(); } catch { /* optional body */ }
+			const attemptId = typeof input === "object" && input !== null && !Array.isArray(input)
+				&& "attemptId" in input && typeof input.attemptId === "string" ? input.attemptId : undefined;
+			return json(await this.bootstrap.start(attemptId));
+		}
+		const bootstrapId = parts[1];
+		if (!bootstrapId) return json({ error: "not_found" }, 404);
+		if (request.method === "GET" && parts.length === 3 && parts[2] === "root") {
+			const state = this.bootstrap.rootState(bootstrapId);
+			return new Response(state.encodedState.slice().buffer, { headers: { "content-type": "application/octet-stream", "x-yaos-sha256": await state.hash } });
+		}
+		if (request.method === "GET" && parts.length === 3 && parts[2] === "catalog") return json(this.bootstrap.catalogPage(bootstrapId, url.searchParams.get("cursor"), boundedLimit(url)));
+		if (request.method === "GET" && parts.length === 4 && parts[2] === "body") {
+			const state = this.bootstrap.bodyState(bootstrapId, parts[3]!);
+			const head = this.store.getCatalogHeadAt(state.throughSequence, state.bodyId);
+			return new Response(state.encodedState.slice().buffer, { headers: { "content-type": "application/octet-stream", "x-yaos-body-id": state.bodyId,
+				"x-yaos-generation": String(state.generation), "x-yaos-through-sequence": String(state.throughSequence),
+				"x-yaos-content-hash": head?.contentHash ?? "", "x-yaos-size": String(head?.size ?? 0) } });
+		}
+		if (request.method === "POST" && parts.length === 3 && parts[2] === "renew") {
+			const input: unknown = await request.json();
+			if (typeof input !== "object" || input === null || Array.isArray(input)
+				|| ("settledBodies" in input && input.settledBodies !== undefined && typeof input.settledBodies !== "number")) {
+				return json({ error: "invalid_json" }, 400);
+			}
+			const settledBodies = "settledBodies" in input && typeof input.settledBodies === "number" ? input.settledBodies : 0;
+			this.bootstrap.renew(bootstrapId, settledBodies);
+			return json({ ok: true });
+		}
+		if (request.method === "POST" && parts.length === 3 && parts[2] === "complete") {
+			const operation = this.store.getOperation(bootstrapId);
+			if (operation?.state === "running") this.bootstrap.complete(bootstrapId);
+			return json({ currentHighWater: this.store.currentSequence() });
+		}
+		return json({ error: "not_found" }, 404);
+	}
+
+	private async bodyState(bodyId: string): Promise<Response> {
+		const head = this.lifecycle.activeBodyHead(bodyId);
+		if (!head) return json({ error: "body_not_active" }, 404);
+		const reconstructed = this.store.reconstructDocument(bodyId);
+		const bytes = Y.encodeStateAsUpdate(reconstructed.doc);
+		const content = new TextEncoder().encode(Y.Text.prototype.toString.call(reconstructed.doc.getText("body")));
+		reconstructed.doc.destroy();
+		return new Response(bytes.slice().buffer, { headers: { "content-type": "application/octet-stream", "cache-control": "no-store",
+			"x-yaos-body-id": bodyId, "x-yaos-generation": String(reconstructed.generation), "x-yaos-content-hash": await sha256Hex(content), "x-yaos-size": String(content.byteLength) } });
+	}
+
+	private rootState(url: URL): Response {
+		const current = this.store.currentSequence();
+		const through = Number(url.searchParams.get("through") ?? current);
+		if (!Number.isInteger(through) || through < 0 || through > current) return json({ error: "invalid_root_sequence" }, 400);
+		const reconstructed = this.store.reconstructDocument("root", through);
+		const bytes = Y.encodeStateAsUpdate(reconstructed.doc);
+		reconstructed.doc.destroy();
+		return new Response(bytes.slice().buffer, { headers: { "content-type": "application/octet-stream", "cache-control": "no-store",
+			"x-yaos-generation": String(reconstructed.generation), "x-yaos-through-sequence": String(through) } });
+	}
+
+	private async compact(): Promise<Response> {
+		await this.flushLoadedDocuments();
+		const documentIds = new Set<string>(["root"]);
+		for (const entry of this.store.listActiveCatalogAt(this.store.currentSequence())) {
+			documentIds.add(entry.bodyId);
+		}
+		let written = 0;
+		let blockedByPin = 0;
+		for (const documentId of documentIds) {
+			const result = this.store.writeCheckpoint(documentId);
+			if (result.status === "written") written++;
+			else blockedByPin++;
+		}
+		if (blockedByPin === 0 && this.store.activePins().length === 0) {
+			const floor = Math.max(0, this.store.currentSequence() - FEED_RETAIN_SEQUENCES);
+			if (floor > this.store.journalFloor()) this.store.advanceFeedFloor(floor);
+		}
+		return json({
+			ok: true,
+			documents: documentIds.size,
+			checkpointsWritten: written,
+			blockedByPin,
+			sequence: this.store.currentSequence(),
+			feedFloor: this.store.journalFloor(),
 		});
+	}
 
-		console.debug(JSON.stringify({
-			source: "yaos-sync/server",
-			...entry,
-		}));
+	private status(): Response {
+		const metadata = this.requireMetadata();
+		return json({ vaultId: metadata.vaultId, vaultGeneration: metadata.vaultGeneration, runtimeEpoch: this.runtimeEpoch,
+			provisionedAt: metadata.provisionedAt, schemaVersion: SERVER_SCHEMA_VERSION,
+			storageFormatVersion: SERVER_STORAGE_FORMAT_VERSION, protocolVersion: SERVER_PROTOCOL_VERSION,
+			snapshotFormatVersion: SERVER_SNAPSHOT_FORMAT_VERSION,
+			sequence: this.store.currentSequence(), feedFloor: this.store.journalFloor(), activePins: this.store.activePins().length });
+	}
 
-		try {
-			await this.traceRing.append(this.ctx.storage, entry);
-		} catch (err) {
-			console.error(`${LOG_PREFIX} trace persist failed:`, err);
-		}
-		if (this.destroyed) return;
+	private health(): Response {
+		const diagnostics = this.cache.diagnostics();
+		const degraded = [...this.persistence.values()].filter((value) => value.status === "degraded").length;
+		const ok = degraded === 0 && Object.keys(diagnostics.loadFailures).length === 0;
+		return json({ ok, persistence: degraded === 0 ? "healthy" : "degraded", degradedDocuments: degraded,
+			corruptDocuments: Object.keys(diagnostics.loadFailures).length, pendingUpdates: Object.values(diagnostics.pending).reduce((sum, value) => sum + value, 0) }, ok ? 200 : 503);
+	}
 
-		// Drain accumulated drops as a single bounded summary.
-		if (!isThrottleSummary) {
-			const dropped = this.traceRateLimiter.drainDropped();
-			if (dropped > 0) {
-				await this.recordTrace(TRACE_RATE_THROTTLE_EVENT, { dropped });
+	private diagnostics(): Response {
+		return json({ ...this.statusObject(), sockets: this.ctx.getWebSockets().length, ...this.cache.diagnostics(), persistence: Object.fromEntries(this.persistence) });
+	}
+
+	private statusObject() {
+		const metadata = this.requireMetadata();
+		return { vaultId: metadata.vaultId, vaultGeneration: metadata.vaultGeneration, runtimeEpoch: this.runtimeEpoch,
+			provisionedAt: metadata.provisionedAt, schemaVersion: SERVER_SCHEMA_VERSION,
+			storageFormatVersion: SERVER_STORAGE_FORMAT_VERSION, protocolVersion: SERVER_PROTOCOL_VERSION,
+			snapshotFormatVersion: SERVER_SNAPSHOT_FORMAT_VERSION,
+			sequence: this.store.currentSequence(), feedFloor: this.store.journalFloor() };
+	}
+
+	private scheduleFlush(documentId: string): void {
+		if (this.scheduledFlushes.has(documentId)) return;
+		const scheduled = new Promise<void>((resolve) => setTimeout(resolve, PERSIST_DEBOUNCE_MS))
+			.then(async () => { await this.flushDocument(documentId); })
+			.finally(() => this.scheduledFlushes.delete(documentId));
+		this.scheduledFlushes.set(documentId, scheduled);
+		this.ctx.waitUntil(scheduled);
+	}
+
+	private async flushDocument(documentId: string): Promise<boolean> {
+		if (this.deleted) return false;
+		let success = true;
+		this.flushChain = this.flushChain.then(async () => {
+			const entries = this.cache.takePending(documentId);
+			if (entries.length === 0) return;
+			let processed = 0;
+			try {
+				for (const entry of entries) {
+					const catalog = documentId === "root" ? undefined : await this.catalogForLoadedBody(documentId);
+					const commit = this.store.commitUpdate({ documentId, update: entry.bytes, kind: documentId === "root" ? "root" : "body", catalog });
+					processed++;
+					const loaded = this.cache.get(documentId);
+					if (loaded) loaded.generation = commit.generation;
+					if (documentId !== "root") this.sockets.notifyBodyCommitted(documentId, commit.generation);
+				}
+				this.persistence.set(documentId, { status: "healthy", lastError: null, lastSuccessAt: Date.now(), failures: this.persistence.get(documentId)?.failures ?? 0 });
+			} catch (error) {
+				success = false;
+				this.cache.restorePending(documentId, entries.slice(processed));
+				const prior = this.persistence.get(documentId);
+				this.persistence.set(documentId, { status: "degraded", lastError: error instanceof Error ? error.message : String(error),
+					lastSuccessAt: prior?.lastSuccessAt ?? null, failures: (prior?.failures ?? 0) + 1 });
+				await this.ctx.storage.setAlarm(Date.now() + PERSIST_RETRY_MS);
 			}
+		});
+		await this.flushChain;
+		if (success) this.maintain(documentId);
+		return success;
+	}
+
+	private async catalogForLoadedBody(bodyId: string): Promise<CatalogMutation | undefined> {
+		const loaded = this.cache.get(bodyId);
+		const current = this.lifecycle.activeBodyHead(bodyId);
+		if (!loaded || !current) return undefined;
+		const content = new TextEncoder().encode(Y.Text.prototype.toString.call(loaded.doc.getText("body")));
+		return { bodyId, fileId: current.fileId, path: current.path, previousPath: null, lifecycle: "active",
+			bodyGeneration: (this.store.documentHead(bodyId)?.generation ?? 0) + 1, contentHash: await sha256Hex(content), size: content.byteLength };
+	}
+
+	private maintain(documentId: string): void {
+		try {
+			if (!shouldCompactJournal(this.store.documentJournalStats(documentId))) return;
+			const checkpoint = this.store.writeCheckpoint(documentId);
+			if (checkpoint.status !== "written" || this.store.activePins().length > 0) return;
+			const floor = Math.max(0, this.store.currentSequence() - FEED_RETAIN_SEQUENCES);
+			if (floor > this.store.journalFloor()) this.store.advanceFeedFloor(floor);
+		} catch (error) {
+			console.warn("[yaos-vault] maintenance failed", error);
 		}
 	}
 
-	private getRoomId(): string {
-		try {
-			const candidate = this.name;
-			if (typeof candidate === "string" && candidate.length > 0) {
-				return candidate;
-			}
-		} catch {
-			// Some workerd runtimes can throw while accessing `.name` before set-name.
+	private async flushLoadedDocuments(): Promise<void> {
+		for (const documentId of Object.keys(this.cache.diagnostics().pending)) {
+			if (!await this.flushDocument(documentId)) throw new Error(`persistence unavailable for ${documentId}`);
 		}
-		return this.roomIdHint ?? "unknown";
 	}
 
-	private captureRoomIdHint(request: Request): void {
-		const headerRoom = request.headers.get("x-partykit-room");
-		if (headerRoom && headerRoom.length > 0) {
-			this.roomIdHint = headerRoom;
-		}
+	private requireMetadata() {
+		const metadata = this.store.vaultMetadata();
+		if (!metadata) throw new Error("vault is not provisioned");
+		return metadata;
 	}
 }
-
-export default VaultSyncServer;

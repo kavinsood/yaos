@@ -10,9 +10,17 @@ class_name = "VaultSyncServer"
 name = "YAOS_CONFIG"
 class_name = "ServerConfig"
 
+[[durable_objects.bindings]]
+name = "YAOS_RECOVERY_JOBS"
+class_name = "RecoveryJob"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["VaultSyncServer", "ServerConfig"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["RecoveryJob"]
 
 [[r2_buckets]]
 binding = "YAOS_BUCKET"

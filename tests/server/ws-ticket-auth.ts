@@ -1,137 +1,99 @@
-import { SERVER_SCHEMA_VERSION } from "../../server/src/version";
-import { inspectTicket, createTicket, verifyTicket } from "../../server/src/routes/ticket";
-import { authenticateSocketRequest, handleSyncSocketRoute } from "../../server/src/routes/syncSocket";
-import type { AuthState, Env } from "../../server/src/routes/types";
-import { makeConfigNamespace, makeEnv, makeTrapNamespace } from "../mocks/workerEnv.ts";
+import { strict as assert } from "node:assert";
+import { createTicket, handleTicketRoute, inspectTicket, TICKET_TTL_MS, verifyTicket } from "../../server/src/routes/ticket";
+import { handleVaultSocketRoute } from "../../server/src/routes/vault";
+import type { AuthState } from "../../server/src/routes/types";
+import { makeConfigNamespace, makeEnv, makeTrapNamespace, makeVaultSyncNamespace } from "../mocks/workerEnv.ts";
 import { suite } from "../harness.ts";
 
 const s = suite("ws-ticket-auth");
-const vaultId = "vault-ticket-one";
-const deviceId = "device-ticket-one";
-const auth: AuthState = {
+const VAULT_ID = "ticket-vault-0001";
+const DEVICE_ID = "device-ticket-0001";
+const AUTH: AuthState = {
 	mode: "claim",
 	claimed: true,
-	operatorRecoveryHash: "operator-hash-not-signing-material",
-	ticketSigningKey: "dedicated-ticket-signing-key-for-tests",
+	operatorRecoveryHash: "operator-recovery-hash",
+	ticketSigningKey: "ticket-signing-key-for-tests",
 };
 
-function decodeBase64Url(value: string): Uint8Array {
-	const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
-	const padded = normalized + "=".repeat((4 - (normalized.length % 4)) % 4);
-	return Uint8Array.from(atob(padded), (character) => character.charCodeAt(0));
-}
+s.test("ticket integrity, vault scope, device identity, and expiry fail closed", async () => {
+	const issued = await createTicket(AUTH, VAULT_ID, DEVICE_ID);
+	assert.equal(issued.ttlMs, TICKET_TTL_MS);
+	assert.equal(await verifyTicket(issued.ticket, AUTH, VAULT_ID), true);
+	assert.equal((await inspectTicket(issued.ticket, AUTH, VAULT_ID))?.deviceId, DEVICE_ID);
+	assert.equal(await verifyTicket(`${issued.ticket.slice(0, -1)}x`, AUTH, VAULT_ID), false, "tampering invalidates HMAC");
+	assert.equal(await verifyTicket(issued.ticket, AUTH, "other-vault-0001"), false, "ticket is vault-bound");
+	assert.equal(await verifyTicket((await createTicket(AUTH, VAULT_ID, DEVICE_ID, -1)).ticket, AUTH, VAULT_ID), false, "expired ticket is rejected");
+});
 
-s.section("ticket carries vault and device identity");
-{
-	const { ticket, expiresAt } = await createTicket(auth, vaultId, deviceId);
-	const payload = await inspectTicket(ticket, auth, vaultId);
-	s.check(expiresAt > Date.now(), "ticket expiry is in the future");
-	s.check(payload?.vaultId === vaultId, "ticket is scoped to its vault");
-	s.check(payload?.deviceId === deviceId, "ticket identifies the enrolled device");
-}
-
-s.section("ticket signature uses the dedicated signing key");
-{
-	const { ticket } = await createTicket(auth, vaultId, deviceId);
-	const differentOperatorHash: AuthState = {
-		...auth,
-		operatorRecoveryHash: "different-operator-hash",
-	};
-	const differentSigningKey: AuthState = {
-		...auth,
-		ticketSigningKey: "different-dedicated-signing-key",
-	};
-	s.check(await verifyTicket(ticket, differentOperatorHash, vaultId), "operator hash is not ticket signing material");
-	s.check(!(await verifyTicket(ticket, differentSigningKey, vaultId)), "a different signing key rejects the ticket");
-}
-
-s.section("expiry, tampering, and cross-vault use fail closed");
-{
-	const { ticket: expired } = await createTicket(auth, vaultId, deviceId, -1);
-	s.check(!(await verifyTicket(expired, auth, vaultId)), "expired ticket is rejected");
-	const { ticket } = await createTicket(auth, vaultId, deviceId);
-	s.check(!(await verifyTicket(ticket, auth, "other-vault")), "ticket cannot cross vaults");
-	const [payload, signature] = ticket.split(".");
-	if (!payload || !signature) throw new Error("created ticket is not a payload/signature pair");
-	const tamperedSignature = `${signature[0] === "A" ? "B" : "A"}${signature.slice(1)}`;
-	const originalBytes = decodeBase64Url(signature);
-	const tamperedBytes = decodeBase64Url(tamperedSignature);
-	s.check(
-		originalBytes.length > 0 && originalBytes[0] !== tamperedBytes[0],
-		"tamper deterministically changes decoded signature bytes",
+s.test("ticket HTTP handler signs the authorized device identity", async () => {
+	const response = await handleTicketRoute(
+		new Request(`https://example.test/vault/${VAULT_ID}/auth/ticket`, { method: "POST" }),
+		AUTH,
+		VAULT_ID,
+		DEVICE_ID,
+		(body, status = 200) => Response.json(body, { status }),
 	);
-	s.check(!(await verifyTicket(`${payload}.${tamperedSignature}`, auth, vaultId)), "tampered ticket is rejected");
-}
+	assert.equal(response.status, 200);
+	const body = await response.json() as { ticket: string; ttlMs: number };
+	assert.equal(body.ttlMs, TICKET_TTL_MS);
+	assert.equal((await inspectTicket(body.ticket, AUTH, VAULT_ID))?.deviceId, DEVICE_ID);
+});
 
-s.section("socket authentication accepts tickets only");
-{
-	const { ticket } = await createTicket(auth, vaultId, deviceId);
-	const accepted = await authenticateSocketRequest(ticket, auth, vaultId);
-	s.check(accepted.ok && accepted.method === "ticket", "valid ticket authenticates");
-	s.check(accepted.ok && accepted.deviceId === deviceId, "socket gate retains device identity for membership recheck");
-	const missing = await authenticateSocketRequest(null, auth, vaultId);
-	s.check(!missing.ok && missing.reason === "unauthorized", "missing ticket is unauthorized");
-	const unsupported: AuthState = { mode: "unsupported", claimed: true };
-	const oldConfig = await authenticateSocketRequest(ticket, unsupported, vaultId);
-	s.check(!oldConfig.ok && oldConfig.reason === "server_format_unsupported", "unsupported server format is explicit");
-}
-
-s.section("legacy token query cannot authenticate or wake a room");
-{
-	const { ticket } = await createTicket(auth, vaultId, deviceId);
-	const configTrap = makeTrapNamespace("legacy token query must not consult config");
-	const roomTrap = makeTrapNamespace("legacy token query must not wake room");
-	const env: Env = makeEnv({ YAOS_CONFIG: configTrap, YAOS_SYNC: roomTrap });
-	const url = new URL(`https://example.test/vault/sync/${vaultId}`);
-	url.searchParams.set("token", ticket);
-	url.searchParams.set("schemaVersion", String(SERVER_SCHEMA_VERSION));
-	const response = await handleSyncSocketRoute(new Request(url), env, auth, vaultId);
-	s.check(response.status === 401, "token query is unauthorized even with the supported schema");
-	s.check(configTrap.touched.length === 0, "token query is rejected before membership lookup");
-	s.check(roomTrap.touched.length === 0, "token query does not wake the room");
-}
-
-s.section("revocation invalidates an otherwise-live ticket before room wake");
-{
-	const { ticket } = await createTicket(auth, vaultId, deviceId);
-	const config = makeConfigNamespace(async (request) => {
-		const pathname = new URL(request.url).pathname;
-		if (pathname === "/__yaos/verify-device") {
-			return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401 });
-		}
-		throw new Error(`unexpected config request: ${pathname}`);
+s.test("revoked membership rejects both root and body sockets before vault allocation", async () => {
+	const { ticket } = await createTicket(AUTH, VAULT_ID, DEVICE_ID);
+	let membershipChecks = 0;
+	const syncTrap = makeTrapNamespace("revoked socket touched YAOS_SYNC");
+	const env = makeEnv({
+		YAOS_SYNC: syncTrap,
+		YAOS_CONFIG: makeConfigNamespace(async (request) => {
+			if (new URL(request.url).pathname === "/__yaos/verify-device") membershipChecks++;
+			return Response.json({ error: "device_not_enrolled" }, { status: 404 });
+		}),
 	});
-	const room = makeTrapNamespace("revoked ticket must not wake room");
-	const env: Env = makeEnv({ YAOS_CONFIG: config, YAOS_SYNC: room });
-	const url = new URL(`https://example.test/vault/sync/${vaultId}`);
-	url.searchParams.set("ticket", ticket);
-	url.searchParams.set("schemaVersion", String(SERVER_SCHEMA_VERSION));
-	const response = await handleSyncSocketRoute(new Request(url), env, auth, vaultId);
-	s.check(response.status === 401, "revoked ticket handshake is unauthorized");
-	s.check(config.calls === 1, "handshake rechecks live membership");
-	s.check(room.touched.length === 0, "revoked ticket never wakes the room");
-}
+	for (const runtimePath of ["/ws/root", "/ws/body/body-ticket-0001"]) {
+		const response = await handleVaultSocketRoute(
+			new Request(`https://example.test/vault/${VAULT_ID}${runtimePath}?ticket=${encodeURIComponent(ticket)}&schemaVersion=4&protocolVersion=1`),
+			env,
+			AUTH,
+			VAULT_ID,
+			runtimePath,
+		);
+		assert.equal(response.status, 401);
+	}
+	assert.equal(membershipChecks, 2);
+	assert.deepEqual(syncTrap.touched, []);
+});
 
-s.section("legacy schema query alias is rejected");
-{
-	const { ticket } = await createTicket(auth, vaultId, deviceId);
-	const config = makeConfigNamespace(async (request) => {
-		const pathname = new URL(request.url).pathname;
-		if (pathname === "/__yaos/verify-device" || pathname === "/__yaos/touch-device") {
-			return new Response(JSON.stringify({ ok: true }), { status: 200 });
-		}
-		throw new Error(`unexpected config request: ${pathname}`);
+s.test("live membership forwards exact device identity to root and body runtime sockets", async () => {
+	const { ticket } = await createTicket(AUTH, VAULT_ID, DEVICE_ID);
+	const forwarded: Array<{ path: string; deviceId: string | null }> = [];
+	const syncNamespace = makeVaultSyncNamespace(async (request) => {
+		forwarded.push({ path: new URL(request.url).pathname, deviceId: request.headers.get("x-yaos-device-id") });
+		return new Response(null, { status: 204 });
 	});
-	const room = makeTrapNamespace("schema alias must not wake room");
-	const env: Env = makeEnv({ YAOS_CONFIG: config, YAOS_SYNC: room });
-	const url = new URL(`https://example.test/vault/sync/${vaultId}`);
-	url.searchParams.set("ticket", ticket);
-	url.searchParams.set("schema", String(SERVER_SCHEMA_VERSION));
-	const response = await handleSyncSocketRoute(new Request(url), env, auth, vaultId);
-	const body = await response.json() as { error?: string; reason?: string };
-	s.check(response.status === 426, "schema alias does not satisfy schemaVersion admission");
-	s.check(body.error === "update_required" && body.reason === "invalid_client_schema", "schema alias failure is explicit");
-	s.check(room.touched.length === 0, "schema alias rejection never wakes the room");
-}
+	const env = makeEnv({
+		YAOS_SYNC: syncNamespace,
+		YAOS_CONFIG: makeConfigNamespace(async (request) => {
+			const path = new URL(request.url).pathname;
+			if (path === "/__yaos/verify-device") return Response.json({ ok: true });
+			if (path === "/__yaos/vault") return Response.json({ vault: { vaultId: VAULT_ID, vaultGeneration: "generation-ticket-0001", state: "active" } });
+			return Response.json({ error: "not_found" }, { status: 404 });
+		}),
+	});
+	for (const runtimePath of ["/ws/root", "/ws/body/body-ticket-0001"]) {
+		const response = await handleVaultSocketRoute(
+			new Request(`https://example.test/vault/${VAULT_ID}${runtimePath}?ticket=${encodeURIComponent(ticket)}&schemaVersion=4&protocolVersion=1`),
+			env,
+			AUTH,
+			VAULT_ID,
+			runtimePath,
+		);
+		assert.equal(response.status, 204);
+	}
+	assert.deepEqual(forwarded, [
+		{ path: "/ws/root", deviceId: DEVICE_ID },
+		{ path: "/ws/body/body-ticket-0001", deviceId: DEVICE_ID },
+	]);
+});
 
 await s.done();

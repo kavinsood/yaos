@@ -1,8 +1,8 @@
 {
 	"name": "yaos-server",
-	"version": "0.3.0",
+	"version": "1.0.0",
 	"private": true,
-	"description": "Cloudflare Worker server for Obsidian vault CRDT sync via y-partyserver",
+	"description": "Cloudflare Worker server for multivault root/body CRDT sync and recovery",
 	"scripts": {
 		"dev": "wrangler dev",
 		"deploy": "wrangler deploy",
@@ -11,9 +11,8 @@
 	"dependencies": {
 		"fflate": "^0.8.2",
 		"lib0": "0.2.117",
-		"partyserver": "0.3.2",
 		"qrcode-generator": "2.0.4",
-		"y-partyserver": "2.1.2",
+		"y-protocols": "1.0.7",
 		"yjs": "^13.6.20"
 	},
 	"devDependencies": {

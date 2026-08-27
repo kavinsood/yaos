@@ -1,19 +1,31 @@
 /**
- * Multivault auth gates: reserved vault ids, device rename, operator-only
- * metadata, and snapshot-maybe room header.
+ * Multivault auth gates: reserved vault ids, device rename, and operator-only
+ * metadata.
  */
-import ServerConfig from "../../server/src/config";
-import { hashSecret, isUsableVaultId, OPERATOR_COOKIE } from "../../server/src/identity";
+import ServerConfig, {
+	MAX_PENDING_DESTROYS,
+	parsePendingDestroyRecords,
+} from "../../server/src/config";
+import {
+	CorruptIdentityStateError,
+	MAX_DEVICE_RECORDS,
+	MAX_OPERATOR_SESSION_RECORDS,
+	MAX_PAIRING_CODE_RECORDS,
+	MAX_VAULT_RECORDS,
+	hashSecret,
+	isUsableVaultId,
+	OPERATOR_COOKIE,
+	parseDeviceRecords,
+	parseOperatorSessionRecords,
+	parsePairingCodeRecords,
+	parseVaultRecords,
+} from "../../server/src/identity";
 import { handleUpdateMetadataRoute, invalidateStoredServerConfigCache } from "../../server/src/routes/auth";
 import { handleEnrollRoute, handleVaultDeviceRoute } from "../../server/src/routes/enroll";
 import type { AuthState } from "../../server/src/routes/types";
 import worker from "../../server/src/index";
-import { makeConfigNamespace, makeEnv, makeTrapNamespace } from "../mocks/workerEnv.ts";
-import {
-	getGetServerByNameCallCount,
-	resetGetServerByNameCallCount,
-} from "../mocks/partyserver.ts";
-import { readSource, suite } from "../harness.ts";
+import { makeConfigNamespace, makeEnv, makeVaultSyncNamespace } from "../mocks/workerEnv.ts";
+import { suite } from "../harness.ts";
 
 const s = suite("identity-control-plane");
 
@@ -31,16 +43,23 @@ function makeMemoryConfig(): ServerConfig {
 		put: async (key: string, value: unknown) => {
 			data.set(key, value);
 		},
+		delete: async (key: string) => {
+			data.delete(key);
+		},
 		transaction: async <T>(
 			fn: (txn: {
 				get: (key: string) => Promise<unknown>;
 				put: (key: string, value: unknown) => Promise<void>;
+				delete: (key: string) => Promise<void>;
 			}) => Promise<T>,
 		): Promise<T> => {
 			return await fn({
 				get: async (key: string) => data.get(key),
 				put: async (key: string, value: unknown) => {
 					data.set(key, value);
+				},
+				delete: async (key: string) => {
+					data.delete(key);
 				},
 			});
 		},
@@ -55,6 +74,29 @@ function jsonRequest(path: string, body: unknown): Request {
 		headers: { "Content-Type": "application/json" },
 		body: JSON.stringify(body),
 	});
+}
+
+async function activateClaim(
+	config: ServerConfig,
+	claim: Response,
+	pairingCodeHash?: string,
+	pairingPurpose: "origin" | "device" | "invite" = "device",
+): Promise<Response> {
+	const claimed = await claim.clone().json() as { vaultId?: string; vaultGeneration?: string };
+	return config.fetch(jsonRequest("/__yaos/activate-vault", {
+		vaultId: claimed.vaultId,
+		vaultGeneration: claimed.vaultGeneration,
+		...(pairingCodeHash ? { pairingCodeHash, pairingPurpose } : {}),
+	}));
+}
+
+function captureCorruptState(read: () => unknown): CorruptIdentityStateError | null {
+	try {
+		read();
+		return null;
+	} catch (error) {
+		return error instanceof CorruptIdentityStateError ? error : null;
+	}
 }
 
 s.section("isUsableVaultId: length, slashes, reserved sync");
@@ -121,6 +163,8 @@ s.section("rename-device updates the authorized device record");
 		pairingPurpose: "device",
 	}));
 	s.check(claim.status === 200, "claim succeeds with usable vaultId");
+	const activated = await activateClaim(config, claim, "pair-hash");
+	s.check(activated.status === 200, "claimed vault activates before enrollment");
 
 	const enrolled = await config.fetch(jsonRequest("/__yaos/enroll", {
 		pairingCodeHash: "pair-hash",
@@ -162,7 +206,7 @@ s.section("verify-device requires a live enrollment on that vault");
 {
 	const config = makeMemoryConfig();
 	const vaultId = "vault-live";
-	await config.fetch(jsonRequest("/__yaos/claim", {
+	const claim = await config.fetch(jsonRequest("/__yaos/claim", {
 		operatorRecoveryHash: "op-hash",
 		ticketSigningKey: "sign-key",
 		vaultId,
@@ -171,6 +215,8 @@ s.section("verify-device requires a live enrollment on that vault");
 		pairingExp: Date.now() + 60_000,
 		pairingPurpose: "device",
 	}));
+	const activated = await activateClaim(config, claim, "pair-hash");
+	s.check(activated.status === 200, "verification vault activates before enrollment");
 	await config.fetch(jsonRequest("/__yaos/enroll", {
 		pairingCodeHash: "pair-hash",
 		deviceId: "dev-live",
@@ -284,7 +330,7 @@ s.section("update-metadata: device bearer 401, operator session 200");
 	let metadataWrites = 0;
 	const stored = {
 		claimed: true,
-		configFormat: 1,
+		configFormat: 2,
 		operatorRecoveryHash: CLAIM_AUTH.operatorRecoveryHash,
 		ticketSigningKey: CLAIM_AUTH.ticketSigningKey,
 		updateProvider: "github" as const,
@@ -377,6 +423,8 @@ s.section("public enrollment response is exact and fails closed");
 			vaultId: "vault-enroll",
 			deviceId: "device-enroll",
 			deviceName: "Mac",
+			vaultGeneration: "generation-enroll",
+			originImport: true,
 		}), { status: 200, headers: { "Content-Type": "application/json" } })),
 	});
 	const request = () => new Request("https://sync.example/enroll", {
@@ -389,7 +437,7 @@ s.section("public enrollment response is exact and fails closed");
 	s.check(valid.status === 200, "valid internal enrollment becomes a public success");
 	s.check(
 		JSON.stringify(Object.keys(validBody).sort()) ===
-			JSON.stringify(["deviceId", "deviceName", "deviceToken", "host", "vaultId"]),
+			JSON.stringify(["deviceId", "deviceName", "deviceToken", "host", "originImport", "vaultGeneration", "vaultId"]),
 		"public enrollment returns the exact credential contract",
 	);
 	s.check(validBody.host === "https://sync.example" && validBody.deviceName === "Mac", "public enrollment returns canonical host and name");
@@ -408,7 +456,7 @@ s.section("compact requires both the admin flag and an operator session");
 	invalidateStoredServerConfigCache();
 	const sessionToken = "operator-session-for-compact";
 	const stored = {
-		configFormat: 1,
+		configFormat: 2,
 		claimed: true,
 		operatorRecoveryHash: CLAIM_AUTH.operatorRecoveryHash,
 		ticketSigningKey: CLAIM_AUTH.ticketSigningKey,
@@ -416,6 +464,7 @@ s.section("compact requires both the admin flag and an operator session");
 		updateRepoUrl: null,
 		updateRepoBranch: null,
 	};
+	let vaultReads = 0;
 	const config = makeConfigNamespace(async (request) => {
 		const pathname = new URL(request.url).pathname;
 		if (pathname === "/__yaos/config") {
@@ -424,34 +473,169 @@ s.section("compact requires both the admin flag and an operator session");
 		if (pathname === "/__yaos/verify-session") {
 			return new Response(JSON.stringify({ ok: true }), { status: 200 });
 		}
+		if (pathname === "/__yaos/vault") {
+			vaultReads++;
+			return Response.json({
+				vault: {
+					vaultId: "vault-compact",
+					name: "Compact",
+					state: "active",
+					vaultGeneration: "generation-compact",
+					createdAt: 1,
+					provisionedAt: 2,
+				},
+			});
+		}
 		throw new Error(`unexpected config request: ${pathname}`);
 	});
-	const sync = makeTrapNamespace("unexpected direct room namespace access");
+	const forwarded: Array<{ path: string; deviceId: string | null }> = [];
+	const sync = makeVaultSyncNamespace(async (request) => {
+		forwarded.push({
+			path: new URL(request.url).pathname,
+			deviceId: request.headers.get("x-yaos-device-id"),
+		});
+		return Response.json({ compacted: true });
+	});
 	const env = makeEnv({
 		YAOS_CONFIG: config,
 		YAOS_SYNC: sync,
 		YAOS_ENABLE_ADMIN_ROUTES: "true",
 	});
 	const path = "https://example.test/vault/vault-compact/debug/compact";
-	resetGetServerByNameCallCount();
 	const device = await worker.fetch(new Request(path, {
 		method: "POST",
 		headers: { Authorization: "Bearer device-token" },
 	}), env);
 	s.check(device.status === 401, "device bearer cannot compact");
-	s.check(getGetServerByNameCallCount() === 0, "device rejection does not reach the room");
-	let operatorReachedRoom = false;
-	try {
-		await worker.fetch(new Request(path, {
-			method: "POST",
-			headers: { Cookie: `${OPERATOR_COOKIE}=${sessionToken}` },
-		}), env);
-	} catch (error) {
-		operatorReachedRoom = error instanceof Error && error.message.includes("getServerByName");
-	}
-	s.check(operatorReachedRoom, "operator session passes both gates and reaches the room");
-	s.check(getGetServerByNameCallCount() === 1, "authorized compact performs one room lookup");
+	s.check(sync.idFromNameCalls === 0 && sync.calls === 0 && forwarded.length === 0, "device rejection does not allocate the vault runtime");
+	const operator = await worker.fetch(new Request(path, {
+		method: "POST",
+		headers: { Cookie: `${OPERATOR_COOKIE}=${sessionToken}` },
+	}), env);
+	s.check(operator.status === 200, "operator session reaches schema-4 compact runtime");
+	s.check(vaultReads === 1, "active vault authority is read once after operator auth");
+	s.check(sync.idFromNameCalls === 1 && sync.calls === 1 && forwarded.length === 1, "authorized compact allocates and fetches one vault runtime");
+	s.check(forwarded[0]?.path === "/compact" && forwarded[0]?.deviceId === null, "operator compact forwards only the canonical internal route");
 	invalidateStoredServerConfigCache();
+}
+
+s.section("persisted identity parsers reject malformed, duplicate, and oversized state");
+{
+	const vault = {
+		vaultId: "vault-parse-aa",
+		name: "Personal",
+		state: "active" as const,
+		vaultGeneration: "generation-parse-aa",
+		createdAt: 1_000,
+		provisionedAt: 1_001,
+	};
+	const device = {
+		deviceId: "device-parse",
+		vaultId: vault.vaultId,
+		tokenHash: "device-hash",
+		name: "Phone",
+		enrolledAt: 1_100,
+	};
+	const code = {
+		codeId: "code-parse",
+		codeHash: "code-hash",
+		vaultId: vault.vaultId,
+		exp: 2_000,
+		maxUses: 1,
+		uses: 0,
+		purpose: "device" as const,
+		createdAt: 1_100,
+	};
+	const session = { sessionHash: "session-hash", exp: 2_000, createdAt: 1_100 };
+	const pending = {
+		vaultId: "vault-pending-aa",
+		vaultGeneration: "generation-pending-aa",
+		deletionId: "deletion-pending-aa",
+		purgeJobId: "purge:vault-pending-aa:generation-pending-aa",
+		requestedAt: 1_200,
+		roomComplete: false,
+		r2Complete: false,
+		purgeState: "pending" as const,
+		capabilityHash: null,
+		capabilityExpiresAt: null,
+		deletedObjects: 0,
+		deletedBytes: 0,
+		lastError: null,
+	};
+	const knownVaultIds = new Set([vault.vaultId]);
+
+	const malformed = [
+		captureCorruptState(() => parseVaultRecords([{ ...vault, unexpected: true }])),
+		captureCorruptState(() => parseDeviceRecords([{ ...device, enrolledAt: -1 }])),
+		captureCorruptState(() => parsePairingCodeRecords([{ ...code, purpose: "recovery" }])),
+		captureCorruptState(() => parseOperatorSessionRecords([{ ...session, exp: Number.NaN }])),
+		captureCorruptState(() => parsePendingDestroyRecords([{ ...pending, roomComplete: "yes" }])),
+	];
+	s.check(
+		malformed.every((error) => error?.code === "corrupt_identity_state" && error.message.length <= 192),
+		"all malformed record shapes and fields fail with the bounded corruption error",
+	);
+
+	const duplicates = [
+		captureCorruptState(() => parseVaultRecords([vault, { ...vault }])),
+		captureCorruptState(() => parseDeviceRecords([device, { ...device }], knownVaultIds)),
+		captureCorruptState(() => parsePairingCodeRecords([code, { ...code }], knownVaultIds)),
+		captureCorruptState(() => parseOperatorSessionRecords([session, { ...session }])),
+		captureCorruptState(() => parsePendingDestroyRecords([pending, { ...pending }])),
+	];
+	s.check(
+		duplicates.every((error) => error?.message.includes("duplicate")),
+		"duplicate identifiers fail closed in every persisted collection",
+	);
+
+	const oversized = [
+		captureCorruptState(() => parseVaultRecords(new Array(MAX_VAULT_RECORDS + 1))),
+		captureCorruptState(() => parseDeviceRecords(new Array(MAX_DEVICE_RECORDS + 1))),
+		captureCorruptState(() => parsePairingCodeRecords(new Array(MAX_PAIRING_CODE_RECORDS + 1))),
+		captureCorruptState(() => parseOperatorSessionRecords(new Array(MAX_OPERATOR_SESSION_RECORDS + 1))),
+		captureCorruptState(() => parsePendingDestroyRecords(new Array(MAX_PENDING_DESTROYS + 1))),
+	];
+	s.check(
+		oversized.every((error) => error?.message.includes("exceeds capacity")),
+		"every persisted collection rejects oversized state before reading records",
+	);
+
+	s.check(parseVaultRecords([vault])[0]?.vaultId === vault.vaultId, "valid vault records are preserved");
+	s.check(parseDeviceRecords([device], knownVaultIds)[0]?.name === device.name, "valid device records are preserved");
+	s.check(parsePairingCodeRecords([code], knownVaultIds)[0]?.codeId === code.codeId, "valid pairing records are preserved");
+	s.check(parseOperatorSessionRecords([session])[0]?.sessionHash === session.sessionHash, "valid sessions are preserved");
+	s.check(parsePendingDestroyRecords([pending])[0]?.vaultId === pending.vaultId, "valid pending destroys are preserved");
+}
+
+s.section("origin pairing grants one enrollment the initial-import authority");
+{
+	const config = makeMemoryConfig();
+	const claim = await config.fetch(jsonRequest("/__yaos/claim", {
+		operatorRecoveryHash: "origin-operator-hash",
+		ticketSigningKey: "origin-ticket-key",
+		vaultId: "vault-origin-aa",
+		vaultName: "Personal",
+		pairingCodeHash: "o".repeat(64),
+		pairingPurpose: "origin",
+	}));
+	s.check(claim.status === 200, "origin vault reservation succeeds");
+	s.check((await activateClaim(config, claim, "o".repeat(64), "origin")).status === 200, "origin pairing activates with the vault");
+	const enrolled = await config.fetch(jsonRequest("/__yaos/enroll", {
+		pairingCodeHash: "o".repeat(64),
+		deviceId: "device-origin-aa",
+		deviceTokenHash: "origin-device-token-hash",
+		deviceName: "Origin device",
+	}));
+	const body = await enrolled.json() as Record<string, unknown>;
+	s.check(enrolled.status === 200 && body.originImport === true, "origin pairing grants initial import once");
+	s.check(body.vaultGeneration === "generation" || typeof body.vaultGeneration === "string", "enrollment returns the vault generation");
+	const replay = await config.fetch(jsonRequest("/__yaos/enroll", {
+		pairingCodeHash: "o".repeat(64),
+		deviceId: "device-origin-replay",
+		deviceTokenHash: "origin-replay-token-hash",
+		deviceName: "Replay",
+	}));
+	s.check(replay.status !== 200, "consumed origin pairing cannot grant another importer");
 }
 
 await s.done();

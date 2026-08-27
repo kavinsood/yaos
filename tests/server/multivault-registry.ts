@@ -5,18 +5,14 @@
 import ServerConfig from "../../server/src/config";
 import { hashSecret, OPERATOR_COOKIE, PAIRING_CODE_TTL_MS, uniqueDeviceName } from "../../server/src/identity";
 import { verifyOperatorSession } from "../../server/src/routes/auth";
-import {
-	attemptVaultCleanup,
-	handleOperatorDestroyVault,
-	handleOperatorLogout,
-} from "../../server/src/routes/operator";
+import { handleOperatorLogout } from "../../server/src/routes/operator";
 import {
 	operatorDestroyStatusMessage,
 	operatorStateLoadFailureMessage,
 	renderOperatorConsole,
 } from "../../server/src/setupPage";
-import { FakeR2Bucket, makeConfigNamespace, makeEnv } from "../mocks/workerEnv.ts";
-import { readSource, suite } from "../harness.ts";
+import { makeConfigNamespace, makeEnv } from "../mocks/workerEnv.ts";
+import { suite } from "../harness.ts";
 
 const s = suite("multivault-registry");
 function makeMemoryConfig(initial: Readonly<Record<string, unknown>> = {}): ServerConfig {
@@ -26,16 +22,23 @@ function makeMemoryConfig(initial: Readonly<Record<string, unknown>> = {}): Serv
 		put: async (key: string, value: unknown) => {
 			data.set(key, value);
 		},
+		delete: async (key: string) => {
+			data.delete(key);
+		},
 		transaction: async <T>(
 			fn: (txn: {
 				get: (key: string) => Promise<unknown>;
 				put: (key: string, value: unknown) => Promise<void>;
+				delete: (key: string) => Promise<void>;
 			}) => Promise<T>,
 		): Promise<T> => {
 			return await fn({
 				get: async (key: string) => data.get(key),
 				put: async (key: string, value: unknown) => {
 					data.set(key, value);
+				},
+				delete: async (key: string) => {
+					data.delete(key);
 				},
 			});
 		},
@@ -52,6 +55,20 @@ function jsonRequest(path: string, body: unknown): Request {
 	});
 }
 
+async function activateClaim(
+	config: ServerConfig,
+	claim: Response,
+	pairingCodeHash?: string,
+	pairingPurpose: "origin" | "device" | "invite" = "device",
+): Promise<Response> {
+	const claimed = await claim.clone().json() as { vaultId?: string; vaultGeneration?: string };
+	return config.fetch(jsonRequest("/__yaos/activate-vault", {
+		vaultId: claimed.vaultId,
+		vaultGeneration: claimed.vaultGeneration,
+		...(pairingCodeHash ? { pairingCodeHash, pairingPurpose } : {}),
+	}));
+}
+
 s.section("claim is one-shot and old claimed formats stay unsupported");
 {
 	const config = makeMemoryConfig();
@@ -64,6 +81,8 @@ s.section("claim is one-shot and old claimed formats stay unsupported");
 		pairingPurpose: "device",
 	};
 	const first = await config.fetch(jsonRequest("/__yaos/claim", claimBody));
+	const activated = await activateClaim(config, first);
+	s.check(activated.status === 200, "first claimed vault activates");
 	const second = await config.fetch(jsonRequest("/__yaos/claim", claimBody));
 	s.check(first.status === 200, "first claim succeeds");
 	s.check(second.status === 403, "second claim is rejected");
@@ -105,7 +124,7 @@ s.section("uniqueDeviceName suffixes on this vault");
 s.section("enroll uniquifies names on one vault");
 {
 	const config = makeMemoryConfig();
-	await config.fetch(jsonRequest("/__yaos/claim", {
+	const claimed = await config.fetch(jsonRequest("/__yaos/claim", {
 		operatorRecoveryHash: "h".repeat(64),
 		ticketSigningKey: "key",
 		vaultId: "vault-one-aa",
@@ -114,6 +133,7 @@ s.section("enroll uniquifies names on one vault");
 		pairingExp: Date.now() + 60_000,
 		pairingPurpose: "device",
 	}));
+	s.check((await activateClaim(config, claimed, "a".repeat(64))).status === 200, "enrollment vault activates");
 	await config.fetch(jsonRequest("/__yaos/create-pairing-code", {
 		vaultId: "vault-one-aa",
 		codeHash: "b".repeat(64),
@@ -144,7 +164,7 @@ s.section("enroll uniquifies names on one vault");
 s.section("destroy revokes first, persists bounded retry state, and completes only after both stores");
 {
 	const config = makeMemoryConfig();
-	await config.fetch(jsonRequest("/__yaos/claim", {
+	const claimed = await config.fetch(jsonRequest("/__yaos/claim", {
 		operatorRecoveryHash: "h".repeat(64),
 		ticketSigningKey: "key",
 		vaultId: "vault-gone-1",
@@ -152,6 +172,7 @@ s.section("destroy revokes first, persists bounded retry state, and completes on
 		pairingCodeHash: "c".repeat(64),
 		pairingPurpose: "device",
 	}));
+	s.check((await activateClaim(config, claimed, "c".repeat(64))).status === 200, "destroy target activates before enrollment");
 	await config.fetch(jsonRequest("/__yaos/enroll", {
 		pairingCodeHash: "c".repeat(64),
 		deviceId: "dev-gone",
@@ -160,21 +181,44 @@ s.section("destroy revokes first, persists bounded retry state, and completes on
 	}));
 	const destroyed = await config.fetch(jsonRequest("/__yaos/destroy-vault", { vaultId: "vault-gone-1" }));
 	const destroyedBody = await destroyed.json() as {
-		pending: { requestedAt: number; roomComplete: boolean; r2Complete: boolean };
+		pending: {
+			requestedAt: number;
+			roomComplete: boolean;
+			r2Complete: boolean;
+			purgeState: string;
+			vaultGeneration: string;
+			purgeJobId: string;
+			deletionId: string;
+		};
 	};
 	s.check(destroyed.status === 200, "registry destroy 200");
-	s.check(!destroyedBody.pending.roomComplete && !destroyedBody.pending.r2Complete, "physical cleanup starts pending");
+	s.check(
+		!destroyedBody.pending.roomComplete
+			&& !destroyedBody.pending.r2Complete
+			&& destroyedBody.pending.purgeState === "pending",
+		"physical cleanup starts pending",
+	);
 	const consoleRes = await config.fetch(new Request("https://internal/__yaos/console"));
 	const consoleBody = await consoleRes.json() as {
-		vaults: unknown[];
+		vaults: Array<{ vaultId: string; state: string }>;
 		devices: unknown[];
 		pairingCodes: unknown[];
 		pendingDestroys: unknown[];
 	};
-	s.check(consoleBody.vaults.length === 0, "vault membership revoked");
-	s.check(consoleBody.devices.length === 0, "devices revoked");
-	s.check(consoleBody.pairingCodes.length === 0, "codes revoked");
+	s.check(
+		consoleBody.vaults.length === 1
+			&& consoleBody.vaults[0]?.vaultId === "vault-gone-1"
+			&& consoleBody.vaults[0]?.state === "deleting",
+		"destroy revokes admission by retaining only generation-fenced deleting state",
+	);
+	s.check(consoleBody.devices.length === 0, "all memberships are revoked before purge admission");
+	s.check(consoleBody.pairingCodes.length === 0, "all pairing capabilities are revoked before purge admission");
 	s.check(consoleBody.pendingDestroys.length === 1, "physical cleanup obligation remains visible");
+	s.check(
+		destroyedBody.pending.purgeJobId
+			=== `purge:vault-gone-1:${destroyedBody.pending.vaultGeneration}`,
+		"purge actor identity is generation-scoped",
+	);
 
 	const retry = await config.fetch(jsonRequest("/__yaos/destroy-vault", { vaultId: "vault-gone-1" }));
 	const retryBody = await retry.json() as { pending: { requestedAt: number } };
@@ -186,23 +230,72 @@ s.section("destroy revokes first, persists bounded retry state, and completes on
 	}));
 	s.check(reused.status === 409, "pending vault id cannot be reused before cleanup completes");
 
-	const partial = await config.fetch(jsonRequest("/__yaos/update-destroy-vault", {
+	const expiredCapability = "expired-purge-capability";
+	await config.fetch(jsonRequest("/__yaos/update-destroy-vault", {
+		vaultId: "vault-gone-1",
+		roomComplete: false,
+		r2Complete: false,
+		purgeState: "queued",
+		capabilityHash: await hashSecret(expiredCapability),
+		capabilityExpiresAt: Date.now() - 1,
+		deletedObjects: 0,
+		deletedBytes: 0,
+		lastError: null,
+	}));
+	const expiredProgress = await config.fetch(jsonRequest("/__yaos/deletion/progress", {
+		deletionId: destroyedBody.pending.deletionId,
+		vaultId: "vault-gone-1",
+		vaultGeneration: destroyedBody.pending.vaultGeneration,
+		jobId: destroyedBody.pending.purgeJobId,
+		capability: expiredCapability,
+		state: "purging",
+		deletedObjects: 1,
+		deletedBytes: 1,
+		error: null,
+	}));
+	s.check(expiredProgress.status === 401, "expired purge capability fails closed");
+	const wrongProgress = await config.fetch(jsonRequest("/__yaos/deletion/progress", {
+		deletionId: destroyedBody.pending.deletionId,
+		vaultId: "vault-gone-1",
+		vaultGeneration: destroyedBody.pending.vaultGeneration,
+		jobId: destroyedBody.pending.purgeJobId,
+		capability: "wrong-purge-capability",
+		state: "retrying",
+		deletedObjects: 1,
+		deletedBytes: 1,
+		error: { code: "transient" },
+	}));
+	s.check(wrongProgress.status === 401, "purge retry with the wrong capability fails closed");
+
+	const outOfOrder = await config.fetch(jsonRequest("/__yaos/update-destroy-vault", {
 		vaultId: "vault-gone-1",
 		roomComplete: true,
 		r2Complete: false,
-		lastError: "r2: " + "sensitive".repeat(1_000),
+		purgeState: "pending",
+		lastError: null,
 	}));
-	const partialBody = await partial.json() as { pending: { lastError: string } };
-	s.check(partial.status === 202, "partial cleanup remains pending");
-	s.check(partialBody.pending.lastError.length === 512, "persisted cleanup error is bounded");
+	s.check(outOfOrder.status === 409, "SQL room deletion cannot complete before object purge");
 
-	const completed = await config.fetch(jsonRequest("/__yaos/update-destroy-vault", {
+	const purgeComplete = await config.fetch(jsonRequest("/__yaos/update-destroy-vault", {
 		vaultId: "vault-gone-1",
 		roomComplete: false,
 		r2Complete: true,
+		purgeState: "complete",
+		deletedObjects: 7,
+		deletedBytes: 99,
 		lastError: null,
 	}));
-	s.check(completed.status === 200, "both physical stores complete cleanup");
+	s.check(purgeComplete.status === 202, "completed purge retains the SQL cleanup obligation");
+	const completed = await config.fetch(jsonRequest("/__yaos/update-destroy-vault", {
+		vaultId: "vault-gone-1",
+		roomComplete: true,
+		r2Complete: true,
+		purgeState: "complete",
+		deletedObjects: 7,
+		deletedBytes: 99,
+		lastError: null,
+	}));
+	s.check(completed.status === 200, "SQL cleanup completes only after generation purge");
 	const finalConsole = await config.fetch(new Request("https://internal/__yaos/console"));
 	const finalBody = await finalConsole.json() as { pendingDestroys: unknown[] };
 	s.check(finalBody.pendingDestroys.length === 0, "completed cleanup record is removed");
@@ -212,7 +305,6 @@ s.section("destroy revokes first, persists bounded retry state, and completes on
 s.section("pairing expiry is authoritative in config despite a skewed caller timestamp");
 {
 	const config = makeMemoryConfig();
-	const claimStarted = Date.now();
 	const claimed = await config.fetch(jsonRequest("/__yaos/claim", {
 		operatorRecoveryHash: "h".repeat(64),
 		ticketSigningKey: "key",
@@ -222,13 +314,16 @@ s.section("pairing expiry is authoritative in config despite a skewed caller tim
 		pairingExp: Number.MAX_SAFE_INTEGER,
 		pairingPurpose: "device",
 	}));
-	const claimFinished = Date.now();
-	const claimBody = await claimed.json() as { pairingExp: number };
 	s.check(claimed.status === 200, "caller clock ahead no longer rejects claim");
+	const activationStarted = Date.now();
+	const activated = await activateClaim(config, claimed, "x".repeat(64));
+	const activationFinished = Date.now();
+	const activationBody = await activated.json() as { pairingExp: number };
+	s.check(activated.status === 200, "claimed vault activates with its initial pairing code");
 	s.check(
-		claimBody.pairingExp >= claimStarted + PAIRING_CODE_TTL_MS
-			&& claimBody.pairingExp <= claimFinished + PAIRING_CODE_TTL_MS,
-		"claim expiry comes from config time and fixed TTL",
+		activationBody.pairingExp >= activationStarted + PAIRING_CODE_TTL_MS
+			&& activationBody.pairingExp <= activationFinished + PAIRING_CODE_TTL_MS,
+		"activation expiry comes from config time and fixed TTL",
 	);
 
 	const mintStarted = Date.now();
@@ -248,65 +343,6 @@ s.section("pairing expiry is authoritative in config despite a skewed caller tim
 	);
 }
 
-s.section("operator destroy reports pending cleanup, checks room status, and skips completed R2");
-{
-	const statusFailure = await attemptVaultCleanup(
-		makeEnv(),
-		"vault-clean-aa",
-		{
-			vaultId: "vault-clean-aa",
-			requestedAt: Date.now(),
-			roomComplete: false,
-			r2Complete: false,
-			lastError: null,
-		},
-		async () => new Response(null, { status: 503 }),
-	);
-	s.check(!statusFailure.roomComplete, "non-2xx room response is not treated as complete");
-	s.check(statusFailure.r2Complete, "missing R2 binding counts as complete");
-
-	const config = makeMemoryConfig();
-	await config.fetch(jsonRequest("/__yaos/claim", {
-		operatorRecoveryHash: "h".repeat(64),
-		ticketSigningKey: "key",
-		vaultId: "vault-clean-aa",
-		vaultName: "Cleanup",
-		pairingCodeHash: "z".repeat(64),
-		pairingPurpose: "device",
-	}));
-	const sessionToken = "operator-session-token-for-destroy";
-	await config.fetch(jsonRequest("/__yaos/create-session", {
-		sessionHash: await hashSecret(sessionToken),
-		exp: Date.now() + 60_000,
-	}));
-	const bucket = new FakeR2Bucket({
-		objects: new Map([["v1/vault-clean-aa/snapshots/one", new Uint8Array([1])]]),
-	});
-	const env = makeEnv({
-		YAOS_CONFIG: makeConfigNamespace(async (request) => await config.fetch(request)),
-		YAOS_BUCKET: bucket,
-	});
-	const destroyRequest = () => new Request("https://example.test/operator/vaults/vault-clean-aa", {
-		method: "DELETE",
-		headers: { Cookie: `${OPERATOR_COOKIE}=${sessionToken}` },
-	});
-	const first = await handleOperatorDestroyVault(destroyRequest(), env, "vault-clean-aa");
-	s.check(first.status === 202, "room failure returns truthful pending status");
-	s.check(bucket.objects.size === 0, "R2 cleanup still completes");
-	const firstListCalls = bucket.listCalls;
-	const firstState = await config.fetch(new Request("https://internal/__yaos/console"));
-	const firstStateBody = await firstState.json() as {
-		pendingDestroys: Array<{ roomComplete: boolean; r2Complete: boolean }>;
-	};
-	s.check(
-		firstStateBody.pendingDestroys[0]?.roomComplete === false
-			&& firstStateBody.pendingDestroys[0]?.r2Complete === true,
-		"pending state records each physical store independently",
-	);
-	const retry = await handleOperatorDestroyVault(destroyRequest(), env, "vault-clean-aa");
-	s.check(retry.status === 202, "pending destroy remains retryable");
-	s.check(bucket.listCalls === firstListCalls, "retry does not repeat completed R2 cleanup");
-}
 
 s.section("operator logout revokes copied cookies and clears cookies on failure");
 {
@@ -398,6 +434,8 @@ s.section("operator console clears stale actions before loading state");
 	s.check(validate >= 0 && validate < commit, "state shape is validated before cards are committed");
 	s.check(commit >= 0 && commit < enable, "create is enabled only after valid cards are committed");
 	s.check(page.includes("data-retry-destroy"), "pending cleanup has a retry action");
+	s.check(page.includes("data-retry-provision"), "provisioning vault has an operator retry action");
+	s.check(page.includes('"/provision"'), "provisioning retry uses the operator-only route");
 	s.check(page.includes("lastError.textContent = pending.lastError"), "pending error is rendered as text");
 	s.check(page.includes("await requestVaultDestroy(retryDestroy)"), "retry uses the shared truthful destroy response handler");
 	s.check(page.includes("await requestVaultDestroy(destroy)"), "initial destroy uses the shared truthful destroy response handler");
@@ -410,7 +448,7 @@ s.section("operator console clears stale actions before loading state");
 s.section("rename-vault and revoke-pairing");
 {
 	const config = makeMemoryConfig();
-	await config.fetch(jsonRequest("/__yaos/claim", {
+	const claimed = await config.fetch(jsonRequest("/__yaos/claim", {
 		operatorRecoveryHash: "h".repeat(64),
 		ticketSigningKey: "key",
 		vaultId: "vault-ren-aa",
@@ -419,6 +457,7 @@ s.section("rename-vault and revoke-pairing");
 		pairingExp: Date.now() + 60_000,
 		pairingPurpose: "device",
 	}));
+	s.check((await activateClaim(config, claimed, "d".repeat(64))).status === 200, "rename target activates");
 	const renamed = await config.fetch(jsonRequest("/__yaos/rename-vault", {
 		vaultId: "vault-ren-aa",
 		name: "Notes",
@@ -446,34 +485,81 @@ s.section("rename-vault and revoke-pairing");
 	s.check(afterBody.pairingCodes.length === 0, "code removed");
 }
 
-s.section("classifier: GET devices and DELETE auth/device");
+s.section("corrupt identity references and destruction state fail closed");
 {
-	const src = readSource("server/src/index.ts");
-	s.check(src.includes("devices"), "devices resource is classified");
-	s.check(src.includes("handleVaultDeviceLeaveRoute"), "leave route is dispatched");
-	s.check(src.includes("operator-vault-destroy"), "destroy route is classified");
+	const vault = {
+		vaultId: "vault-known-aa",
+		name: "Known",
+		state: "active" as const,
+		vaultGeneration: "generation-known-aa",
+		createdAt: 1_000,
+		provisionedAt: 1_001,
+	};
+	const danglingDevice = makeMemoryConfig({
+		vaults: [vault],
+		devices: [{
+			deviceId: "device-dangling",
+			vaultId: "vault-missing-aa",
+			tokenHash: "device-token-hash",
+			name: "Lost phone",
+			enrolledAt: 1_100,
+		}],
+	});
+	const deviceResponse = await danglingDevice.fetch(new Request("https://internal/__yaos/console"));
+	const deviceError = await deviceResponse.json() as { error?: string; collection?: string };
+	s.check(
+		deviceResponse.status === 500
+			&& deviceError.error === "corrupt_identity_state"
+			&& deviceError.collection === "devices",
+		"dangling device membership is an explicit fail-closed error",
+	);
+
+	const danglingCode = makeMemoryConfig({
+		vaults: [vault],
+		pairingCodes: [{
+			codeId: "code-dangling",
+			codeHash: "pairing-code-hash",
+			vaultId: "vault-missing-aa",
+			exp: 2_000,
+			maxUses: 1,
+			uses: 0,
+			purpose: "device",
+			createdAt: 1_100,
+		}],
+	});
+	const codeResponse = await danglingCode.fetch(new Request("https://internal/__yaos/console"));
+	const codeError = await codeResponse.json() as { error?: string; collection?: string };
+	s.check(
+		codeResponse.status === 500
+			&& codeError.error === "corrupt_identity_state"
+			&& codeError.collection === "pairingCodes",
+		"dangling pairing-code vault references fail closed",
+	);
+
+	const corruptPending = makeMemoryConfig({
+		pendingVaultDestroys: [{
+			vaultId: "vault-delete-aa",
+			requestedAt: "yesterday",
+			roomComplete: false,
+			r2Complete: false,
+			lastError: null,
+		}],
+	});
+	const pendingResponse = await corruptPending.fetch(jsonRequest("/__yaos/update-destroy-vault", {
+		vaultId: "vault-delete-aa",
+		roomComplete: true,
+		r2Complete: false,
+		lastError: null,
+	}));
+	const pendingError = await pendingResponse.json() as { error?: string; collection?: string; message?: string };
+	s.check(
+		pendingResponse.status === 500
+			&& pendingError.error === "corrupt_identity_state"
+			&& pendingError.collection === "pendingVaultDestroys",
+		"malformed pending destruction is not skipped or treated as missing",
+	);
+	s.check((pendingError.message?.length ?? 1_000) <= 192, "persisted corruption response is bounded");
 }
 
-s.section("schema admission requires room equality in both directions");
-{
-	const src = readSource("server/src/routes/syncSocket.ts");
-	s.check(src.includes("client_schema_newer_than_room"), "newer client is rejected");
-	s.check(src.includes("client_schema_older_than_room"), "older client is rejected");
-}
-
-s.section("self-leave uses authorized deviceId only");
-{
-	const src = readSource("server/src/routes/enroll.ts");
-	s.check(src.includes("handleVaultDeviceLeaveRoute"), "leave handler exists");
-	s.check(/revoke-device[\s\S]*device\.deviceId/.test(src), "leave revokes authorized deviceId");
-}
-
-s.section("delete-all closes the live room");
-{
-	const src = readSource("server/src/server.ts");
-	s.check(src.includes("this.destroyed = true"), "delete-all marks the isolate destroyed");
-	s.check(src.includes("getConnections()"), "delete-all closes live sockets");
-	s.check(/if \(this\.destroyed\) return/.test(src), "onSave no-ops after destroy");
-}
 
 await s.done();

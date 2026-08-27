@@ -872,6 +872,17 @@ export function renderOperatorConsole(options: OperatorPageOptions): string {
         idLine.appendChild(idCode);
         card.appendChild(idLine);
 
+        if (vault.state === "provisioning") {
+          const provisioning = document.createElement("p");
+          provisioning.className = "err";
+          provisioning.textContent = "Provisioning is incomplete. Retry the same vault generation.";
+          card.appendChild(provisioning);
+          const retryProvision = document.createElement("button");
+          retryProvision.textContent = "Retry provisioning";
+          retryProvision.dataset.retryProvision = vault.vaultId;
+          card.appendChild(retryProvision);
+        }
+
         const renameRow = document.createElement("div");
         renameRow.className = "row";
         const renameInput = document.createElement("input");
@@ -1069,7 +1080,15 @@ export function renderOperatorConsole(options: OperatorPageOptions): string {
       const rename = target.getAttribute("data-rename");
       const destroy = target.getAttribute("data-destroy");
       const retryDestroy = target.getAttribute("data-retry-destroy");
+      const retryProvision = target.getAttribute("data-retry-provision");
       const revoke = target.getAttribute("data-revoke");
+      if (retryProvision) {
+        const res = await fetch("/operator/vaults/" + encodeURIComponent(retryProvision) + "/provision", { method: "POST" });
+        if (!res.ok) { status.textContent = "Could not provision vault."; return; }
+        status.textContent = "";
+        await load();
+        return;
+      }
       if (retryDestroy) {
         await requestVaultDestroy(retryDestroy);
         return;

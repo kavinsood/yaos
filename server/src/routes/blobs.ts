@@ -1,22 +1,16 @@
-import { mapWithConcurrency } from "../shared/concurrency";
 import { MAX_BLOB_UPLOAD_BYTES } from "../contracts";
 import { sha256Hex } from "../hex";
-import { blobKey } from "../snapshot";
+import { BoundedBodyError, readBoundedBytes } from "../readBoundedBytes";
+import { blobKey } from "../vaultObjectStore";
+import { mapWithConcurrency } from "../shared/concurrency";
 import type { Env, JsonResponse } from "./types";
+import { readVault } from "./vault";
 
 const EXISTS_BATCH_LIMIT = 50;
 const R2_HEAD_CONCURRENCY = 4;
 
 function isValidHash(hash: string): boolean {
 	return /^[0-9a-f]{64}$/.test(hash);
-}
-
-function parseContentLength(value: string | null): { kind: "missing" } | { kind: "invalid" } | { kind: "ok"; value: number } {
-	if (value === null) return { kind: "missing" };
-	const trimmed = value.trim();
-	if (!/^\d+$/.test(trimmed)) return { kind: "invalid" };
-	const parsed = Number(trimmed);
-	return Number.isSafeInteger(parsed) ? { kind: "ok", value: parsed } : { kind: "invalid" };
 }
 
 export async function handleBlobRoute(
@@ -26,8 +20,16 @@ export async function handleBlobRoute(
 	rest: string[],
 	json: JsonResponse,
 ): Promise<Response> {
+	let vault;
+	try {
+		vault = await readVault(env, vaultId);
+	} catch {
+		return json({ error: "vault_authority_unavailable" }, 503);
+	}
+	if (!vault || vault.state !== "active") return json({ error: vault ? `vault_${vault.state}` : "unknown_vault" }, vault ? 409 : 404);
+	const vaultGeneration = vault.vaultGeneration;
 	if (req.method === "POST" && rest[0] === "exists") {
-		return await handleBlobExists(env, vaultId, req, json);
+		return await handleBlobExists(env, vaultId, vaultGeneration, req, json);
 	}
 
 	const hash = rest[0];
@@ -36,11 +38,11 @@ export async function handleBlobRoute(
 	}
 
 	if (req.method === "PUT" && rest.length === 1) {
-		return await handleBlobUpload(env, vaultId, hash, req, json);
+		return await handleBlobUpload(env, vaultId, vaultGeneration, hash, req, json);
 	}
 
 	if (req.method === "GET" && rest.length === 1) {
-		return await handleBlobDownload(env, vaultId, hash, json);
+		return await handleBlobDownload(env, vaultId, vaultGeneration, hash, json);
 	}
 
 	return json({ error: "not found" }, 404);
@@ -49,6 +51,7 @@ export async function handleBlobRoute(
 async function handleBlobExists(
 	env: Env,
 	vaultId: string,
+	vaultGeneration: string,
 	req: Request,
 	json: JsonResponse,
 ): Promise<Response> {
@@ -76,7 +79,7 @@ async function handleBlobExists(
 		hashes,
 		R2_HEAD_CONCURRENCY,
 		async (hash) => {
-			const object = await bucket.head(blobKey(vaultId, hash));
+			const object = await bucket.head(blobKey(vaultId, vaultGeneration, hash));
 			return object ? hash : null;
 		},
 	);
@@ -89,11 +92,13 @@ async function handleBlobExists(
 async function handleBlobUpload(
 	env: Env,
 	vaultId: string,
+	vaultGeneration: string,
 	hash: string,
 	req: Request,
 	json: JsonResponse,
 ): Promise<Response> {
-	if (!env.YAOS_BUCKET) {
+	const bucket = env.YAOS_BUCKET;
+	if (!bucket) {
 		return json({ error: "attachments_unavailable" }, 503);
 	}
 
@@ -101,40 +106,33 @@ async function handleBlobUpload(
 		return json({ error: "invalid hash: must be 64 hex chars (SHA-256)" }, 400);
 	}
 
-	const contentLength = parseContentLength(req.headers.get("Content-Length"));
-	if (contentLength.kind === "invalid") {
-		return json({ error: "invalid Content-Length" }, 400);
+	let body: Uint8Array;
+	try {
+		body = await readBoundedBytes(req, MAX_BLOB_UPLOAD_BYTES);
+	} catch (error) {
+		if (error instanceof BoundedBodyError) {
+			if (error.kind === "invalid_content_length") {
+				return json({ error: "invalid Content-Length" }, 400);
+			}
+			if (error.kind === "body_too_large") {
+				return json({
+					error: `contentLength exceeds max upload size (${MAX_BLOB_UPLOAD_BYTES} bytes)`,
+				}, 413);
+			}
+			if (error.kind === "missing_body") {
+				return json({ error: "missing request body" }, 400);
+			}
+			return json({ error: "failed to read request body" }, 400);
+		}
+		throw error;
 	}
-	if (contentLength.kind === "ok" && contentLength.value > MAX_BLOB_UPLOAD_BYTES) {
-		return json({
-			error: `contentLength exceeds max upload size (${MAX_BLOB_UPLOAD_BYTES} bytes)`,
-		}, 413);
-	}
-
-	// Post-buffer fallback: when Content-Length is absent the pre-check above
-	// cannot fire, so we must buffer the full body before we can measure it.
-	// Cloudflare Workers provide no application-level streaming hook to abort
-	// an in-flight body read, so the Worker pays the memory cost of any
-	// oversized request whose sender omitted the Content-Length header.
-	// The check below still rejects the request and prevents an R2 write, but
-	// the protection is weaker than the header pre-check for the missing-header
-	// case.  Clients should always send Content-Length; the plugin does.
-	const body = await req.arrayBuffer();
-	if (!body.byteLength) {
-		return json({ error: "missing request body" }, 400);
-	}
-	if (body.byteLength > MAX_BLOB_UPLOAD_BYTES) {
-		return json({
-			error: `contentLength exceeds max upload size (${MAX_BLOB_UPLOAD_BYTES} bytes)`,
-		}, 413);
-	}
-	const actualHash = await sha256Hex(new Uint8Array(body));
+	const actualHash = await sha256Hex(body);
 	if (actualHash !== hash) {
 		return json({ error: "hash mismatch" }, 400);
 	}
 
-	await env.YAOS_BUCKET.put(
-		blobKey(vaultId, hash),
+	await bucket.put(
+		blobKey(vaultId, vaultGeneration, hash),
 		body,
 		{
 			httpMetadata: {
@@ -149,6 +147,7 @@ async function handleBlobUpload(
 async function handleBlobDownload(
 	env: Env,
 	vaultId: string,
+	vaultGeneration: string,
 	hash: string,
 	json: JsonResponse,
 ): Promise<Response> {
@@ -160,7 +159,7 @@ async function handleBlobDownload(
 		return json({ error: "invalid hash: must be 64 hex chars (SHA-256)" }, 400);
 	}
 
-	const object = await env.YAOS_BUCKET.get(blobKey(vaultId, hash));
+	const object = await env.YAOS_BUCKET.get(blobKey(vaultId, vaultGeneration, hash));
 	if (!object) {
 		return json({ error: "not found" }, 404);
 	}

@@ -1,5 +1,6 @@
 import { randomBase64Url } from "../base64url";
 import type { ConsoleState, StoredServerConfig } from "../config";
+import type { VaultRecord } from "../identity";
 import { MAX_BLOB_UPLOAD_BYTES } from "../contracts";
 import {
 	CONFIG_FORMAT,
@@ -14,12 +15,14 @@ import {
 } from "../identity";
 import { buildMobileSetupUrl, renderSetupQrDataUrl } from "../setupQr";
 import {
-	SERVER_MIN_PLUGIN_VERSION,
-	SERVER_RECOMMENDED_PLUGIN_VERSION,
+	SERVER_PROTOCOL_VERSION,
 	SERVER_SCHEMA_VERSION,
+	SERVER_SNAPSHOT_FORMAT_VERSION,
+	SERVER_STORAGE_FORMAT_VERSION,
 	SERVER_VERSION,
 } from "../version";
 import { json } from "./http";
+import { provisionReservedVault } from "./provisioning";
 import type { AuthState, AuthStateCached, Env, UpdateProvider } from "./types";
 
 export function getHttpAuthToken(req: Request): string | null {
@@ -226,25 +229,30 @@ export function getCapabilities(
 	claimed: boolean;
 	attachments: boolean;
 	snapshots: boolean;
+	recoveryJobs: boolean;
 	maxBlobUploadBytes: number;
 	serverVersion: string;
-	minPluginVersion: string | null;
-	recommendedPluginVersion: string | null;
 	schemaVersion: number;
+	storageFormatVersion: number;
+	protocolVersion: number;
+	snapshotFormatVersion: number;
 	updateProvider: UpdateProvider | null;
 	updateRepoUrl: string | null;
 	updateRepoBranch: string | null;
 } {
 	const bucketEnabled = supportsBuckets(env);
+	const recoveryJobs = bucketEnabled && Boolean(env.YAOS_RECOVERY_JOBS);
 	return {
 		claimed: auth.claimed,
 		attachments: bucketEnabled,
-		snapshots: bucketEnabled,
+		snapshots: recoveryJobs,
+		recoveryJobs,
 		maxBlobUploadBytes: MAX_BLOB_UPLOAD_BYTES,
 		serverVersion: SERVER_VERSION,
-		minPluginVersion: SERVER_MIN_PLUGIN_VERSION,
-		recommendedPluginVersion: SERVER_RECOMMENDED_PLUGIN_VERSION,
 		schemaVersion: SERVER_SCHEMA_VERSION,
+		storageFormatVersion: SERVER_STORAGE_FORMAT_VERSION,
+		protocolVersion: SERVER_PROTOCOL_VERSION,
+		snapshotFormatVersion: SERVER_SNAPSHOT_FORMAT_VERSION,
 		updateProvider: options.includePrivateUpdateMetadata ? (config?.updateProvider ?? null) : null,
 		updateRepoUrl: options.includePrivateUpdateMetadata ? (config?.updateRepoUrl ?? null) : null,
 		updateRepoBranch: options.includePrivateUpdateMetadata ? (config?.updateRepoBranch ?? null) : null,
@@ -254,7 +262,8 @@ export function getCapabilities(
 export async function handleClaimRoute(req: Request, env: Env, authState: AuthState): Promise<Response> {
 	const url = new URL(req.url);
 	if (authState.mode === "unsupported") return json({ error: "server_format_unsupported" }, 409);
-	if (authState.claimed) return json({ error: "already_claimed" }, 403);
+	// A claimed server may still have a retryable reserved vault; config owns
+	// the idempotent decision and rejects the ordinary already-active case.
 	let body: { operatorRecoveryKey?: string };
 	try {
 		body = await req.json();
@@ -278,15 +287,43 @@ export async function handleClaimRoute(req: Request, env: Env, authState: AuthSt
 	const claimed = await configFetch(env, "/__yaos/claim", {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify({ operatorRecoveryHash, ticketSigningKey, vaultId, vaultName: "Personal", pairingCodeHash, pairingPurpose: "device" }),
+		body: JSON.stringify({ operatorRecoveryHash, ticketSigningKey, vaultId, vaultName: "Personal", pairingCodeHash, pairingPurpose: "origin" }),
 	});
 	if (!claimed.ok) {
 		const errorBody = await claimed.json().catch(() => null) as { error?: string } | null;
 		return json({ error: errorBody?.error ?? "already_claimed" }, claimed.status);
 	}
-	const claimPayload = await claimed.json().catch(() => null) as { pairingExp?: number } | null;
-	if (typeof claimPayload?.pairingExp !== "number") {
+	const claimPayload = await claimed.json().catch(() => null) as {
+		vaultId?: string;
+		vaultGeneration?: string;
+		vaultName?: string;
+	} | null;
+	if (
+		typeof claimPayload?.vaultId !== "string"
+		|| typeof claimPayload.vaultGeneration !== "string"
+		|| typeof claimPayload.vaultName !== "string"
+	) {
 		return json({ error: "claim_response_invalid" }, 502);
+	}
+	const reservedVault: VaultRecord = {
+		vaultId: claimPayload.vaultId,
+		vaultGeneration: claimPayload.vaultGeneration,
+		name: claimPayload.vaultName,
+		state: "provisioning",
+		createdAt: 0,
+		provisionedAt: null,
+	};
+	const provisioned = await provisionReservedVault(env, reservedVault, {
+		codeHash: pairingCodeHash,
+		purpose: "origin",
+	});
+	if (!provisioned.ok) return provisioned;
+	const activation = await provisioned.json().catch(() => null) as {
+		pairingExp?: number;
+		vault?: VaultRecord;
+	} | null;
+	if (typeof activation?.pairingExp !== "number" || activation.vault?.state !== "active") {
+		return json({ error: "claim_activation_invalid" }, 502);
 	}
 	invalidateStoredServerConfigCache();
 	let sessionHeader: string | undefined;
@@ -304,14 +341,19 @@ export async function handleClaimRoute(req: Request, env: Env, authState: AuthSt
 	const response = json({
 		ok: true,
 		host: url.origin,
-		vaultId,
-		vaultName: "Personal",
+		vaultId: activation.vault.vaultId,
+		vaultName: activation.vault.name,
 		pairingCode,
-		pairingExpiresAt: claimPayload.pairingExp,
+		pairingExpiresAt: activation.pairingExp,
 		obsidianUrl: buildObsidianPairingUrl(url.origin, pairingCode),
 		mobileSetupQrDataUrl,
 		capabilities: getCapabilities(
-			{ mode: "claim", claimed: true, operatorRecoveryHash, ticketSigningKey },
+			{
+				mode: "claim",
+				claimed: true,
+				operatorRecoveryHash,
+				ticketSigningKey: claimedConfig?.ticketSigningKey ?? ticketSigningKey,
+			},
 			env,
 			claimedConfig,
 			{ includePrivateUpdateMetadata: true },

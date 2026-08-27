@@ -2,7 +2,7 @@ import { handleClaimRoute } from "../../server/src/routes/auth";
 import type { AuthState, Env } from "../../server/src/routes/types";
 import { renderMobileSetupPage, renderSetupPage } from "../../server/src/setupPage";
 import { buildMobileSetupUrl, renderSetupQrDataUrl } from "../../server/src/setupQr";
-import { makeConfigNamespace, makeEnv } from "../mocks/workerEnv.ts";
+import { makeConfigNamespace, makeEnv, makeVaultSyncNamespace } from "../mocks/workerEnv.ts";
 import { suite } from "../harness.ts";
 
 const s = suite("setup-page-qr");
@@ -41,7 +41,7 @@ s.section("claim stores only recovery hash and returns pairing material");
 {
 	let claimBody: Record<string, unknown> = {};
 	const stored = {
-		configFormat: 1,
+		configFormat: 2,
 		claimed: true,
 		operatorRecoveryHash: "placeholder",
 		ticketSigningKey: "signing-key",
@@ -54,12 +54,35 @@ s.section("claim stores only recovery hash and returns pairing material");
 			const pathname = new URL(request.url).pathname;
 			if (pathname === "/__yaos/claim") {
 				claimBody = await request.json() as Record<string, unknown>;
-				return new Response(JSON.stringify({ ok: true, pairingExp: Date.now() + 15 * 60_000 }), { status: 200 });
+				return Response.json({
+					ok: true,
+					vaultId: claimBody.vaultId,
+					vaultGeneration: "generation-setup-qr-aa",
+					vaultName: claimBody.vaultName,
+				});
 			}
-			if (pathname === "/__yaos/create-session") return new Response(JSON.stringify({ ok: true }));
-			if (pathname === "/__yaos/config") return new Response(JSON.stringify(stored));
+			if (pathname === "/__yaos/activate-vault") {
+				return Response.json({
+					ok: true,
+					pairingExp: Date.now() + 15 * 60_000,
+					vault: {
+						vaultId: claimBody.vaultId,
+						vaultGeneration: "generation-setup-qr-aa",
+						name: claimBody.vaultName,
+						state: "active",
+						createdAt: 1,
+						provisionedAt: 2,
+					},
+				});
+			}
+			if (pathname === "/__yaos/create-session") return Response.json({ ok: true });
+			if (pathname === "/__yaos/config") return Response.json(stored);
 			throw new Error(`unexpected config request: ${pathname}`);
 		}),
+		YAOS_SYNC: makeVaultSyncNamespace(async (request) =>
+			new URL(request.url).pathname === "/__yaos/provision"
+				? Response.json({ created: true }, { status: 201 })
+				: Response.json({ error: "not found" }, { status: 404 })),
 	});
 	const unclaimed: AuthState = { mode: "unclaimed", claimed: false };
 	const operatorRecoveryKey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";

@@ -1,6 +1,6 @@
 const CORS_ALLOW_HEADERS = "Authorization, Content-Type";
-const CORS_ALLOW_METHODS = "GET, POST, PUT, OPTIONS";
-const CORS_EXPOSE_HEADERS = "X-YAOS-Snapshot-Day";
+const CORS_ALLOW_METHODS = "GET, POST, PUT, PATCH, DELETE, OPTIONS";
+const CORS_EXPOSE_HEADERS = "X-YAOS-Content-SHA256, X-YAOS-Content-Size";
 export function safeDecodeUriComponent(value: string): string | null {
 	try {
 		return decodeURIComponent(value);
