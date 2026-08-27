@@ -10,6 +10,10 @@ export interface AnalyzerFinding {
 	eventSeqs: number[];
 	description: string;
 }
+export interface AnalyzerCoverage {
+	applicableRules: string[];
+	notApplicableRules: Array<{ rule: string; reason: string }>;
+}
 
 export interface AnalyzerReport {
 	scenarioId?: string;
@@ -30,12 +34,30 @@ export interface AnalyzerReport {
 
 	failures: AnalyzerFinding[];
 	warnings: AnalyzerFinding[];
+	coverage: AnalyzerCoverage;
+}
+
+export function isAnalyzerReport(value: unknown): value is AnalyzerReport {
+	if (!value || typeof value !== "object") return false;
+	const report = value as Partial<AnalyzerReport>;
+	return (
+		typeof report.passed === "boolean"
+		&& !!report.summary
+		&& typeof report.summary.hardFailures === "number"
+		&& typeof report.summary.checkedEvents === "number"
+		&& Array.isArray(report.failures)
+		&& Array.isArray(report.warnings)
+		&& !!report.coverage
+		&& Array.isArray(report.coverage.applicableRules)
+		&& Array.isArray(report.coverage.notApplicableRules)
+	);
 }
 
 export function buildReport(
 	traceFile: string,
 	checkedEvents: number,
 	findings: AnalyzerFinding[],
+	coverage: AnalyzerCoverage,
 	scenarioId?: string,
 ): AnalyzerReport {
 	const failures = findings.filter((f) => f.severity === "hard");
@@ -64,6 +86,7 @@ export function buildReport(
 		},
 		failures,
 		warnings,
+		coverage,
 	};
 }
 
@@ -83,6 +106,11 @@ export function formatReport(report: AnalyzerReport): string {
 	lines.push(`Scenario reqs:  ${report.summary.scenarioFailures}`);
 	lines.push(`Hash mismatches:${report.summary.hashMismatches}`);
 	lines.push(`Stuck receipts: ${report.summary.incompleteOps}`);
+	lines.push(`Rules applicable:${report.coverage.applicableRules.length}`);
+	lines.push(`Rules not applicable:${report.coverage.notApplicableRules.length}`);
+	for (const gap of report.coverage.notApplicableRules) {
+		lines.push(`  ${gap.rule}: ${gap.reason}`);
+	}
 
 	if (report.failures.length > 0) {
 		lines.push("");

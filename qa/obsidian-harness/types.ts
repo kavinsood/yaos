@@ -4,30 +4,10 @@
 
 import type { App } from "obsidian";
 import type { YaosQaDebugApi } from "../harness/qaDebugApi";
+import type { VaultManifest } from "../manifest";
+export type { VaultManifest, VaultManifestEntry } from "../manifest";
 
-// -----------------------------------------------------------------------
-// Manifest
-// -----------------------------------------------------------------------
 
-export interface VaultManifestEntry {
-	path: string;
-	sha256: string;
-	bytes: number;
-	kind: "markdown" | "attachment" | "other";
-}
-
-export interface VaultManifest {
-	generatedAt: string;
-	fileCount: number;
-	files: VaultManifestEntry[];
-}
-
-export interface ManifestDiff {
-	match: boolean;
-	differ: Array<{ path: string; aSha: string; bSha: string }>;
-	missingOnB: string[];
-	extraOnB: string[];
-}
 
 // -----------------------------------------------------------------------
 // Scenario
@@ -35,10 +15,6 @@ export interface ManifestDiff {
 
 export type DeleteMode = "vault-delete" | "trash" | "adapter-remove";
 
-export interface QaRunOptions {
-	timeoutMs?: number;
-	role?: "A" | "B" | "C";
-}
 
 /**
  * Phase marker emitted into the trace so the analyzer can scope events.
@@ -94,7 +70,6 @@ export interface QaContext {
 
 	// Wait helpers
 	waitForIdle(timeoutMs?: number): Promise<void>;
-	waitForMemoryReceipt(timeoutMs?: number): Promise<void>;
 	waitForFile(path: string, timeoutMs?: number): Promise<void>;
 	/** Wait until YAOS has seeded the file into CRDT (getCrdtHash non-null). */
 	waitForCrdtFile(path: string, timeoutMs?: number): Promise<void>;
@@ -146,14 +121,11 @@ export interface QaScenario {
 // Console API
 // -----------------------------------------------------------------------
 
-export interface TypingOptions {
-	intervalMs?: number;
-}
 
 export interface QaConsoleApi {
 	help(): void;
 	scenarios(): string[];
-	run(id: string, opts?: QaRunOptions): Promise<QaResult>;
+	run(id: string): Promise<QaResult>;
 
 	// Vault operations
 	createFile(path: string, content: string): Promise<void>;
@@ -167,13 +139,12 @@ export interface QaConsoleApi {
 	// Editor operations
 	openFile(path: string): Promise<void>;
 	closeFile(path: string): Promise<void>;
-	typeIntoFile(path: string, text: string, opts?: TypingOptions): Promise<void>;
+	typeIntoFile(path: string, text: string): Promise<void>;
 	replaceFileContent(path: string, content: string): Promise<void>;
 	runCommand(commandId: string): Promise<void>;
 
 	// Wait
 	waitForIdle(timeoutMs?: number): Promise<void>;
-	waitForMemoryReceipt(timeoutMs?: number): Promise<void>;
 	waitForFile(path: string, timeoutMs?: number): Promise<void>;
 	/** Wait until YAOS has seeded the file into CRDT. */
 	waitForCrdtFile(path: string, timeoutMs?: number): Promise<void>;
@@ -193,7 +164,6 @@ export interface QaConsoleApi {
 
 	// Manifests
 	manifest(): Promise<VaultManifest>;
-	compareManifest(expected: VaultManifest): Promise<ManifestDiff>;
 
 	// Flight trace. Recording follows the product's settings.debug — the
 	// prepared QA vault turns it on — so there is nothing to start or stop.

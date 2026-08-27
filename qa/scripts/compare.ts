@@ -9,63 +9,12 @@
  */
 
 import { readFileSync } from "fs";
-import type { VaultManifest, VaultManifestEntry } from "./manifest";
+import {
+	compareManifests,
+	type ManifestDiff,
+	type VaultManifest,
+} from "../manifest";
 
-export interface ManifestDiff {
-	match: boolean;
-	differ: Array<{ path: string; aSha: string; bSha: string; aBytes: number; bBytes: number }>;
-	missingOnB: string[];
-	extraOnB: string[];
-}
-
-export function compareManifests(
-	a: VaultManifest,
-	b: VaultManifest,
-	filterPaths?: string[],
-): ManifestDiff {
-	const aMap = new Map<string, VaultManifestEntry>(a.files.map((f) => [f.path, f]));
-	const bMap = new Map<string, VaultManifestEntry>(b.files.map((f) => [f.path, f]));
-
-	let aEntries = [...aMap.keys()];
-	if (filterPaths && filterPaths.length > 0) {
-		aEntries = aEntries.filter((p) => filterPaths.some((fp) => p.startsWith(fp)));
-	}
-
-	const differ: ManifestDiff["differ"] = [];
-	const missingOnB: string[] = [];
-
-	for (const path of aEntries) {
-		const aEntry = aMap.get(path)!;
-		const bEntry = bMap.get(path);
-		if (!bEntry) {
-			missingOnB.push(path);
-			continue;
-		}
-		if (aEntry.sha256 !== bEntry.sha256) {
-			differ.push({
-				path,
-				aSha: aEntry.sha256,
-				bSha: bEntry.sha256,
-				aBytes: aEntry.bytes,
-				bBytes: bEntry.bytes,
-			});
-		}
-	}
-
-	const aPathSet = new Set(aEntries);
-	const extraOnB = [...bMap.keys()].filter(
-		(p) =>
-			!aPathSet.has(p) &&
-			(!filterPaths || filterPaths.length === 0 || filterPaths.some((fp) => p.startsWith(fp))),
-	);
-
-	return {
-		match: differ.length === 0 && missingOnB.length === 0 && extraOnB.length === 0,
-		differ,
-		missingOnB,
-		extraOnB,
-	};
-}
 
 function formatDiff(diff: ManifestDiff): string {
 	if (diff.match) {
