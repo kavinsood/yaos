@@ -30,7 +30,7 @@ If you want the official, fully managed experience, pay for Obsidian Sync and su
 
 ## Get started
 
-YAOS has two parts: an Obsidian plugin and a small Cloudflare server you deploy to your own account. The Worker setup page walks you through the remaining steps, so you don't need to memorize this.
+YAOS has two parts: an Obsidian plugin and a small Cloudflare server you deploy to your own account. One server can host multiple vaults, and each Obsidian folder enrolls as its own device membership.
 
 <a href="https://youtu.be/xeS126_XK9Q">
   <img src="https://img.youtube.com/vi/xeS126_XK9Q/maxresdefault.jpg" width="480" alt="Watch the setup walkthrough" />
@@ -40,15 +40,15 @@ YAOS has two parts: an Obsidian plugin and a small Cloudflare server you deploy 
 Click **Deploy to Cloudflare** above. Cloudflare creates a Worker in your account.
 
 **2. Claim your server**
-Open the Worker URL. Click **Claim** to lock the server to you and generate your setup token.
+Open the Worker URL and click **Claim**. Save the operator recovery key: it is the only credential that opens the server console. Claiming also creates a Personal vault and a one-use pairing code.
 
 **3. Install the plugin**
 Install YAOS from the Obsidian Marketplace.
 
-**4. Connect your vault**
-From the claim page, open the setup link or scan the QR code. YAOS fills in the connection details automatically.
+**4. Enroll this folder**
+Open the setup link or scan the QR code. YAOS exchanges the pairing code for credentials belonging only to this enrolled device. To add another folder or device, mint a fresh code from YAOS settings or the server console.
 
-That's it. Your vault is syncing.
+That's it. Your folder is syncing with its vault.
 
 ## Attachments and snapshots
 
@@ -68,17 +68,17 @@ If you're building agentic workflows on top of Obsidian vaults, YAOS gives you t
 
 ## Troubleshooting
 
-**"Unauthorized" errors**: Token mismatch between plugin and server. Check both match exactly.
+**"Unauthorized" errors**: This device's enrollment is missing, revoked, or belongs to another vault. Re-enroll with a fresh pairing code; do not paste the operator recovery key into plugin settings.
 
 **"R2 not configured"**: The server doesn't have a `YAOS_BUCKET` binding yet. See the [R2 setup video](https://youtu.be/Z7xCMEYfdFM).
 
 **Cloudflare deploy/dashboard issues**: If build queue or dashboard behavior is flaky, see [operations](./docs/operations.md#troubleshooting), including the `wrangler.toml` R2-binding fallback.
 
-**Sync stops on mobile**: Use "Reconnect to sync server" command. Check you have network connectivity.
+**Sync stops on mobile**: Use **Reconnect to sync server**. Check you have network connectivity and that the device still appears in the vault roster.
 
 **Files not syncing**: Check exclude patterns. Files over max size are skipped. Use debug logging to see what's happening, and then raise an issue on GitHub.
 
-**Diagnostics**: Use **Show sync debug info** for local inspection. Safe diagnostics exports redact server URL, vault ID, device name, and vault paths.
+**Diagnostics**: Use **Show sync debug info** for local inspection. Safe diagnostics exports redact server URL, vault ID, device name, device credentials, and vault paths.
 
 ## License
 

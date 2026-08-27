@@ -8,17 +8,21 @@ Generated bundles, reports, and device artifacts belong under ignored `qa-runs/`
 
 `npm run test:regressions` discovers suites under `tests/client`, `tests/server`, and `tests/contracts`, plus the root harness/discovery self-tests. `tests/suites.json` records the one suite owned by a separate release-artifact driver. Discovery guards reject unaccounted inert suites and stale exemptions.
 
-`npm run test:ci` then starts a real local Wrangler Worker through the separately accountable `tests/live/run-live.ts` driver and runs:
+`npm run test:ci` then starts a real local Wrangler Worker through the separately accountable `tests/live/run-live.ts` driver and runs every file in that driver's accountability list. The live setup claims the server with an operator recovery key, gives each simulated client a distinct one-use pairing code, and carries only that enrollment's `{host, deviceToken, vaultId, deviceId}` credentials.
 
-- schema admission;
-- provider connection;
-- two sequential sync clients;
+The live suites cover:
+
+- claim, enrollment, capabilities, and exact schema admission;
+- provider connection and two sequential sync clients;
 - snapshot routes;
 - hardening paths;
-- short-lived ticket reconnect after expiry;
-- WebSocket admission protocol.
+- short-lived device-ticket reconnect after expiry;
+- mandatory `ticket` plus `schemaVersion` WebSocket admission;
+- rejection of missing WebSocket credentials.
 
-This proves the local Worker/runtime paths it executes. It is not real mobile, sleep/wake hardware, production Cloudflare routing, or original-reporter validation.
+Wrong-vault and revoked credential rejection are covered by the regression/server suites, not by the live Wrangler scenarios. The live suites prove only the local Worker/runtime paths they execute; they are not real mobile, sleep/wake hardware, production Cloudflare routing, or original-reporter validation.
+
+The Obsidian controllers under `qa/controllers/` use raw CDP against the actual QA-enabled product bundle and separately built harness. The product remains a passive black box: only the harness mounts QA APIs, and the controller fails if the runtime or expected globals are absent.
 
 ## Current multi-device evidence
 
@@ -54,7 +58,9 @@ npm run build:harness
 npm run qa:prepare --fixture 001-basic-markdown --dest /absolute/path/to/new-qa-vault --preset minimal
 ```
 
-The destination must not exist. Preparation never recursively deletes or merges into a path. Each prepared vault receives a fresh random `vaultId`; set a shared connection and identity explicitly only for an intentional multi-device run.
+The destination must not exist. Preparation never recursively deletes or merges into a path. Checked-in and generated fixtures are deterministic inputs; generated run bundles and reports still belong under ignored `qa-runs/`.
+
+An unenrolled prepared folder must join through the same server URL plus one-use pairing code as the product. Controlled direct credentials are complete only as `{host, deviceToken, vaultId, deviceId}` plus a device name; partial identities are rejected. For a multi-device run, mint and consume a distinct pairing code for every device. Devices share the resulting `vaultId`, never a copied `deviceToken` or `deviceId`.
 
 The checked-in blank workspace is byte-tested but still lacks live Obsidian acceptance (`QA-07`). Manual controllers attached to arbitrary existing vaults are outside these preparation guarantees.
 
@@ -65,12 +71,13 @@ The checked-in blank workspace is byte-tested but still lacks live Obsidian acce
 All devices must use:
 
 - the same plugin version;
-- the same room and Worker;
+- the same server and server-generated `vaultId`;
+- their own enrolled `deviceToken` and `deviceId`;
 - `qaDebugMode: true`;
 - the same `qaTraceSecret`;
 - an explicit shared `scenarioRunId` and scenario ID.
 
-Use `deviceId`, never display name, as identity. Do not compare per-device sequence numbers. Use wall-clock timestamps for display only; same-device durations use monotonic time.
+Use `deviceId`, never display name, as identity. Never copy one device's bearer into another fixture, and do not compare per-device sequence numbers. Use wall-clock timestamps for display only; same-device durations use monotonic time.
 
 ### Start
 
@@ -86,13 +93,13 @@ Advance manual steps with **YAOS QA: Advance scenario step**. Step indices must 
 
 ### Export and analyze
 
-On every device, run **YAOS QA: Export witness bundle** while the trace is active. Copy the safe NDJSON outside the vault. The export omits raw paths, content, tokens, and unreviewed fields.
+On every device, run **YAOS QA: Export witness bundle** while the trace is active. Copy the safe NDJSON outside the vault. The export omits raw paths, content, host, device credentials, and unreviewed fields.
 
 ```sh
 bun run qa:analyze-bundles -- <device-a.ndjson> <device-b.ndjson> <device-c.ndjson> --out qa-runs/<run>/report.json
 ```
 
-The analyzer rejects mismatched secret hashes, run IDs, scenario IDs, or bundle schema. A pass requires positive convergence evidence in addition to absence of stale-hash, recovery-old-hash, and editor-stability failures.
+The analyzer fails closed on mismatched secret hashes, run IDs, scenario IDs, or bundle schema. A pass requires positive convergence evidence in addition to absence of stale-hash, recovery-old-hash, and editor-stability failures.
 
 ## QA-01: strict three-device active edit
 
@@ -129,7 +136,7 @@ The existing desktop result does not close this real-device requirement.
 
 ## Evidence rules
 
-- Preserve raw failing evidence. Do not weaken a hard failing regression to obtain green output. `SYNC-01` already fails closed in two-device QA; the remaining work is the product fix in [BACKLOG](BACKLOG.md#sync-01--offline-local-delete-is-resurrected-on-re-enable).
+- Preserve raw failing evidence. Do not weaken a hard failing regression to obtain green output. `SYNC-01` already fails closed in two-device QA; the remaining work is the product fix in [BACKLOG](BACKLOG.md#sync-01-offline-local-delete-is-resurrected-on-re-enable).
 - Adapter writes do not prove OS watcher behavior.
 - Passive quorum does not prove edit propagation.
 - Unit/model tests do not prove real mobile lifecycle ordering.

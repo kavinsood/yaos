@@ -15,6 +15,21 @@ This is the current contract for `main`. [BACKLOG.md](BACKLOG.md) names known vi
 
 `.canvas`, `.excalidraw`, `.base`, and other non-Markdown formats use the attachment plane rather than Markdown character merging.
 
+## Vault, membership, and transport scope
+
+One server can host multiple vaults, but each vault remains an independent room and Yjs document. Every local Obsidian folder has its own enrollment and folder-scoped IndexedDB cache, even when another local folder joins the same server vault.
+
+A one-use pairing code selects a vault. `POST /enroll` consumes it and returns a new `deviceToken`, `deviceId`, and the selected `vaultId`; copying another folder's credentials is outside the contract. A device is a full peer only in vaults where it has an active membership. The roster records device ID, display name, enrollment time, and best-effort last-seen time.
+
+All vault HTTP requests use the device bearer and the vault ID in the route. WebSocket sync never accepts a long-lived device credential in its URL: the client first exchanges its bearer for a short-lived, device-scoped ticket. The handshake then supplies exactly the required admission values, `ticket` and `schemaVersion`. Ticket validation is followed by a live membership check, so revocation or leave fails closed before room admission.
+
+Pairing, roster, leave, and destroy have distinct effects:
+
+- pairing creates a new device membership without sharing an existing bearer;
+- leave revokes this device, clears this folder's enrollment/cache, and keeps disk files;
+- operator kick revokes one selected device;
+- operator destroy revokes the vault boundary before requesting cleanup of its room and R2 data.
+
 ## Authorities
 
 Authority is chosen for each observed transition, not assigned permanently to a file.
@@ -22,7 +37,7 @@ Authority is chosen for each observed transition, not assigned permanently to a 
 - A live editor is authoritative for active user input.
 - CRDT state is authoritative for remote state already accepted into the Yjs document.
 - Disk changes are candidate local input and pass through reconciliation and safety policy.
-- IndexedDB persists local CRDT state; it is not a separate conflict winner.
+- IndexedDB persists local CRDT state in a database scoped by `vaultId` and local folder key; it is not a separate conflict winner.
 - A snapshot becomes authoritative only through an explicit restore.
 
 No reconciliation cycle may apply two incompatible observed-content authorities to the same `Y.Text`.
@@ -135,7 +150,11 @@ Forbidden claims:
 
 - Persistence corruption: fail the room closed.
 - IndexedDB startup failure: fail local sync closed.
+- Missing or invalid ticket/schema declaration: reject before room admission.
+- Revoked or mismatched device membership: reject HTTP and WebSocket vault access.
 - Missing attachment capability: disable attachments/snapshots; continue Markdown.
 - Trace persistence failure: lose bounded diagnostics; continue sync.
 - Unknown delete baseline: preserve locally without resurrection.
 - Conflict artifact failure: do not converge by discarding the unpreserved side.
+
+Per-vault storage accounting, operator recovery beyond current snapshots, and sharding are next-block work. This contract does not claim schema 4, settings sync, a headless client, or Docker packaging.

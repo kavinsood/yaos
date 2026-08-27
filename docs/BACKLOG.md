@@ -1,14 +1,14 @@
 # Main backlog
 
-Canonical list of unfinished work inherited by `main` before the feature branches. This excludes `.obsidian` sync, headless CLI, Docker, multivault/collaboration, auth rewrite, sharded note bodies, and recovery-v2 feature work.
+Canonical list of unfinished work on current `main`. The multivault control plane, operator recovery key, pairing enrollment, device memberships, mandatory socket tickets, and exact schema admission have landed; completed cutover work is not carried here. Current product defects remain until their own closure evidence exists.
 
-Each item names current evidence, required work, and closure evidence. Historical discussion remains in Git history.
+Each item names current evidence, required work, and closure evidence. Historical discussion remains in Git history. Per-vault storage accounting, operator recovery, and sharding are the named next architecture block; schema 4, settings sync, headless clients, and Docker packaging are not shipped.
 
 ## Priority definitions
 
 - **P0:** known correctness/data-preservation or current user incident.
 - **P1:** required evidence or hardening for a confidence-heavy release.
-- **P2:** bounded engineering debt; carry only if its owning code survives feature integration.
+- **P2:** bounded engineering debt; carry only while its owning code survives integration.
 - **External:** closure depends on a reporter or real device/deployment unavailable to CI.
 
 ## P0 correctness and user incidents
@@ -142,14 +142,6 @@ The existing local `ws-ticket-reconnect` suite proves URL patching and short-TTL
 
 **Closure:** Either reproduce and remove the second import or preserve a clean run proving the current entrypoints load one Yjs copy.
 
-### OPS-02 — strict legacy-token-disable deployment smoke
-
-**State:** Initial ticket and reconnect paths run in local integration; migration-closed deployment behavior remains a manual gate.
-
-**Required work:** Deploy with `YAOS_DISABLE_LEGACY_WS_TOKEN=true`; connect a ticket-aware plugin; attempt an old `?token=` socket; verify 401 before vault-room wake and Worker-level rejection logging.
-
-**Closure:** New client connects, old client fails closed, and no per-room mutation occurs for the rejection.
-
 ### OPS-03 — Cloudflare WebSocket upgrade coverage boundary
 
 **State:** Node/Miniflare and local Wrangler cover most pre-auth and socket behavior; Cloudflare-specific upgrade handling is not completely represented in Node tests.
@@ -218,13 +210,13 @@ The existing local `ws-ticket-reconnect` suite proves URL patching and short-TTL
 
 **Closure:** Status copy and source fact have matching semantics, with origin tests for user edit versus repair/restore.
 
-## P2 debt subject to feature-branch survival
+## P2 debt subject to integration survival
 
 ### ARCH-01 — planner/mutation split around `reconcileVault`
 
 **State:** `mintAdmissionOpId` callback is a controller-shaped seam in `VaultSync.reconcileVault()` so a decision can be emitted before mutation.
 
-**Decision:** Do not refactor `main` independently if the selected sharding/integration branch removes this code. If it survives, return a seed plan without mutation; let the controller mint IDs, emit decisions, and call `ensureFile`; migrate every caller in one cutover.
+**Decision:** If this code survives the next architecture block, return a seed plan without mutation; let the controller mint IDs, emit decisions, and call `ensureFile`; cut over every caller together.
 
 **Closure:** Callback and compatibility comments are removed, every caller uses the selected ownership boundary, and decision-before-mutation tests remain.
 
@@ -244,21 +236,13 @@ The existing local `ws-ticket-reconnect` suite proves URL patching and short-TTL
 
 **Closure:** Telemetry cannot call mutation-capable members through its types; tests cover required reads/exports.
 
-### AUTH-01 — dedicated ticket signing secret
-
-**State:** Ticket HMAC signing derives from existing auth material rather than a dedicated random server secret.
-
-**Decision:** Resolve in the auth/control-plane integration, not as parallel main-only work. If the old model survives, generate/store a dedicated signing secret and define existing-deployment backfill.
-
-**Closure:** Signing authority is independent of the bearer-token verifier; migration and ticket tests pass.
-
 ### AUTH-02 — auth material in diagnostics
 
-**State:** Current safe exports test common sensitive fields; auth hardening remains an explicit requirement.
+**State:** Current safe exports test common sensitive fields; the device-membership cutover adds carriers that still require explicit leak coverage.
 
-**Required work:** Audit URL, headers, fatal frames, ticket-fetch errors, setup links, and server traces for token/ticket persistence. Add exact leak fixtures for any uncovered carrier.
+**Required work:** Audit URLs, headers, fatal frames, ticket-fetch errors, pairing/setup links, operator sessions, and server traces. Cover device bearers, socket tickets, pairing codes, operator recovery keys, and session cookies with exact leak fixtures.
 
-**Closure:** Safe/local diagnostic policies intentionally cover each carrier; no bearer token or ticket is persisted in room traces or safe exports.
+**Closure:** Safe/local diagnostic policies intentionally cover each carrier; no credential is persisted in room traces or safe exports.
 
 ### STORAGE-01 — decide journal previous-hash chaining
 
@@ -266,19 +250,45 @@ The existing local `ws-ticket-reconnect` suite proves URL patching and short-TTL
 
 **Decision:** Either name a failure the chain detects that current sequence/hash validation does not, then implement and test it, or close the idea and remove it from planning. Do not carry an unowned “maybe harden” item indefinitely.
 
-### CLEAN-03 — choose snapshot compatibility cutoff
+### CLEAN-03 — choose snapshot response cutoff
 
-**State:** Client/server still carry `semanticUnchanged`, `stateVectorHash`, and `computeStateVectorHash` compatibility paths. Some are read-only aliases for old clients; state vectors are known to miss deletion-only changes.
+**State:** Snapshot responses still carry deprecated `semanticUnchanged`, `stateVectorHash`, and `computeStateVectorHash` metadata. These read-only fields do not relax exact socket schema admission; state vectors are known to miss deletion-only changes.
 
-**Decision:** Establish the oldest supported plugin/server pair. Remove aliases and tests only when that support window permits, or retain them with one explicit compatibility table. The recovery-v2 branch may supersede the entire surface.
+**Decision:** Establish the oldest supported plugin/server pair. Remove fields and tests when that support boundary permits, or retain them with one explicit response-compatibility table. The next recovery block may supersede this surface.
 
-**Closure:** No ambiguous deprecated field remains without an owned compatibility requirement.
+**Closure:** No deprecated snapshot field remains without an owned compatibility requirement, and writer schema equality stays mandatory.
 
 ### CLEAN-04 — delete historical issue narratives from source comments
 
 **State:** Several production files carry long Issue #40/#22 histories and links to documents being removed.
 
 **Required work:** Keep the invariant, failure consequence, and non-obvious reason adjacent to code. Move no history elsewhere; Git already preserves it. Update the few load-bearing references to this backlog/contract.
+
+## Next architecture block
+
+### STORAGE-02 — authoritative per-vault storage accounting
+
+**State:** Room diagnostics expose useful raw persistence facts and snapshots can estimate listed R2 bytes, but the operator has no authoritative per-vault accounting or enforceable limit.
+
+**Required work:** Define ownership and accounting across Durable Object SQLite, snapshot/blob R2 objects, retries, deletion, and unavailable backends. Surface exact versus estimated values honestly and define policy before enforcing a limit.
+
+**Closure:** Operator-visible totals have a documented denominator, update across create/delete/restore/destroy, and fail safe when one storage plane cannot be counted.
+
+### RECOVERY-01 — operator recovery workflow
+
+**State:** The operator recovery key signs into the console and current snapshots support selective restore. There is no broader shipped workflow for lost operator access, vault-level disaster recovery, or key rotation.
+
+**Required work:** Define threat model, recovery authority, rotation and revocation, backup ownership, and destructive-action confirmation without turning a device credential into operator authority.
+
+**Closure:** Recovery scenarios restore intended access/data, reject unauthorized devices, preserve audit-safe evidence, and have explicit irrecoverable cases.
+
+### SHARD-01 — vault sharding design and cutover
+
+**State:** Each vault remains one Yjs document and one room. Storage accounting and recovery semantics are prerequisites to splitting that authority.
+
+**Required work:** Define shard identity, cross-file transaction behavior, bootstrap, routing, receipts, persistence, snapshot/restore, tombstones, and a safe transition for existing vaults.
+
+**Closure:** Mixed-version admission fails closed, existing vaults transition without data loss, and multi-shard convergence plus recovery have end-to-end evidence.
 
 ## External issue closure
 
