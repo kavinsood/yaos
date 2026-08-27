@@ -15,9 +15,9 @@
 import { createHash } from "node:crypto";
 
 // ---------------------------------------------------------------------------
-// IndexedDB stand-in — required by getOrCreateLocalDeviceId() inside
-// FlightTraceController.start(). The shared fake implements the real lib.dom
-// IDBFactory, so installing it as the global needs no cast.
+// IndexedDB stand-in for local receipt-candidate persistence. The shared fake
+// implements the real lib.dom IDBFactory, so installing it as the global needs
+// no cast.
 // ---------------------------------------------------------------------------
 
 import { FakeIndexedDb } from "../mocks/indexedDb";
@@ -59,7 +59,8 @@ const mockApp = {
 const mockSettings = {
 	vaultId: "test-vault-id",
 	host: "https://test.example.com",
-	token: "test-token",
+	deviceToken: "test-device-token",
+	deviceId: "test-device-id",
 	deviceName: "Test Device",
 	debug: true,
 };

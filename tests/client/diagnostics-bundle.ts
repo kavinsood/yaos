@@ -12,7 +12,7 @@
  * Invariants tested:
  *   Redacted (the default — an export that says nothing gets the safe one):
  *     - serverHost / vaultId / deviceName are "(redacted)"
- *     - tokenConfigured is a bare boolean: no prefix, no length
+ *     - deviceTokenConfigured is a bare boolean: no prefix, no length
  *     - known vault paths do not appear anywhere in the serialised header
  *     - pathDirectory is withheld
  *     - full content hashes are truncated, prefix kept for correlation
@@ -140,7 +140,7 @@ function makeState(overrides: Partial<TraceHeaderStateInput> = {}): TraceHeaderS
 		serverVersion: "2026.05.01",
 		settings: {
 			host: SENSITIVE_HOST,
-			token: "secret-token",
+			deviceToken: "secret-device-token",
 			vaultId: SENSITIVE_VAULT,
 			deviceName: SENSITIVE_DEVICE,
 			debug: true,
@@ -291,10 +291,10 @@ s.section("Test 2: redacted — settings snapshot");
 	s.check(settings.serverHost === "(redacted)", "redacted: serverHost is (redacted)");
 	s.check(settings.vaultId === "(redacted)", "redacted: vaultId is (redacted)");
 	s.check(settings.deviceName === "(redacted)", "redacted: deviceName is (redacted)");
-	s.check(settings.tokenConfigured === true, "redacted: tokenConfigured is a bare boolean");
+	s.check(settings.deviceTokenConfigured === true, "redacted: deviceTokenConfigured is a bare boolean");
 	s.check(
-		!JSON.stringify(settings).includes("secret-token"),
-		"redacted: the token value itself never appears",
+		!JSON.stringify(settings).includes("secret-device-token"),
+		"redacted: the device token value itself never appears",
 	);
 	s.check(settings.debugModeEnabled === true, "settings snapshot records that debug was on");
 	s.check(

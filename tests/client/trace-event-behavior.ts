@@ -116,9 +116,10 @@ const BASE_SCOPE: ScopeKey & ScopeMetadata = {
 	serverHostHash: "host-hash",
 	localDeviceId: "local-device",
 	roomName: "raw-room-name-should-not-leak",
+	roomGeneration: 1,
 	docSchemaVersion: 2,
 	pluginVersion: "0.5.0",
-	ackStoreVersion: 1,
+	ackStoreVersion: 2,
 };
 
 s.section("Test 1: receipt trace events fire from tracker behavior");

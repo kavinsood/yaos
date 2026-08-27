@@ -79,7 +79,7 @@ export interface TraceHeaderStateInput {
 	serverVersion: string | null;
 	settings: {
 		host: string;
-		token: string | null | undefined;
+		deviceToken: string | null | undefined;
 		vaultId: string;
 		deviceName: string;
 		debug: boolean;
@@ -265,7 +265,7 @@ export async function buildTraceHeader(
 		settingsSnapshot: state
 			? {
 				serverHost: redacted ? "(redacted)" : state.settings.host,
-				tokenConfigured: !!state.settings.token,
+				deviceTokenConfigured: !!state.settings.deviceToken,
 				vaultId: redacted ? "(redacted)" : state.settings.vaultId,
 				deviceName: redacted ? "(redacted)" : state.settings.deviceName,
 				debugModeEnabled: state.settings.debug,

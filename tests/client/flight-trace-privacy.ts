@@ -65,9 +65,9 @@ const RAW_PATH = "Projects/secret/finance.md";
 const HOST_URL = "https://my-sync-server.example.com";
 const DEVICE_NAME = "MacBook-Kavins-Private";
 const VAULT_ID = "vault-id-very-unique-12345";
-const SYNC_TOKEN = "Bearer sk_live_abcdef1234567890";
+const DEVICE_TOKEN = "Bearer dv_live_abcdef1234567890";
 
-const SENSITIVE_VALUES = [RAW_PATH, HOST_URL, DEVICE_NAME, VAULT_ID, SYNC_TOKEN];
+const SENSITIVE_VALUES = [RAW_PATH, HOST_URL, DEVICE_NAME, VAULT_ID, DEVICE_TOKEN];
 
 // ---------------------------------------------------------------------------
 // Test 1: Envelope fields are hashed, not raw
@@ -87,7 +87,7 @@ s.section("Test 1: Envelope fields are hashed, not raw");
 	});
 
 	const line = serialize(event);
-	const { found, value } = containsSensitive(line, [HOST_URL, VAULT_ID, DEVICE_NAME, SYNC_TOKEN]);
+	const { found, value } = containsSensitive(line, [HOST_URL, VAULT_ID, DEVICE_NAME, DEVICE_TOKEN]);
 	s.check(!found, `Safe envelope does not contain sensitive values (found: ${value || "none"})`);
 }
 
@@ -152,7 +152,7 @@ s.section("Test 4: Token and host never appear as data values");
 	});
 	const line = serialize(event);
 	s.check(!line.includes(HOST_URL), "Provider event does not leak host URL");
-	s.check(!line.includes(SYNC_TOKEN), "Provider event does not leak sync token");
+	s.check(!line.includes(DEVICE_TOKEN), "Provider event does not leak device token");
 }
 
 // ---------------------------------------------------------------------------

@@ -22,22 +22,37 @@ import {
 } from "./fileMeta";
 import { ORIGIN_SEED, isLocalOrigin } from "./origins";
 import type { VaultSyncSettings } from "../settings";
-import type { TraceHttpContext, TraceRecord } from "../observability/traceContext";
+import type { TraceRecord } from "../observability/traceContext";
 import { randomId } from "../utils/randomId";
 import { formatUnknown } from "../utils/format";
 import { sha256TextHex } from "../utils/sha256";
 import { UpdateTracker } from "./updateTracker";
 import { ServerAckTracker, type ServerAckState } from "./serverAckTracker";
-import { IndexedDbCandidateStore, getOrCreateLocalDeviceId } from "./indexedDbCandidateStore";
+import { IndexedDbCandidateStore } from "./indexedDbCandidateStore";
+import {
+	nextSysGeneration,
+	readSysGeneration,
+	receiptRoomName,
+	vaultIdbName,
+} from "./vaultPersistence";
 import {
 	createSvEchoCounters,
 	handleSvEchoCustomMessage,
 	type SvEchoCounters,
 } from "./svEchoMessage";
-import type { CandidateStore, ScopeKey, ScopeMetadata } from "./candidateStore";
+import {
+	readKnownRoomGeneration,
+	type CandidateStore,
+	type ScopeKey,
+	type ScopeMetadata,
+} from "./candidateStore";
 import { PRODUCT_EVENT_KIND } from "../observability/productEventKinds";
 import type { ProductFlightPathEventInput } from "../observability/traceSink";
 import { TICKET_REFRESH_BUFFER_MS, patchTicketInUrl } from "./socketTicket";
+import {
+	parseFatalAuthMessage,
+	type FatalAuthCode,
+} from "./fatalAuth";
 
 /** Current schema version. Stored in sys.schemaVersion. */
 export { SCHEMA_VERSION } from "./schema";
@@ -61,48 +76,6 @@ const RENAME_BATCH_MS = 50;
 
 /** Reconciliation mode determines what operations are safe. */
 export type ReconcileMode = "conservative" | "authoritative";
-type FatalAuthCode = "unauthorized" | "server_misconfigured" | "unclaimed" | "update_required";
-
-interface FatalAuthMessage {
-	code: FatalAuthCode;
-	clientSchemaVersion: number | null;
-	roomSchemaVersion: number | null;
-	reason: string | null;
-}
-
-const FATAL_AUTH_CODES = new Set<FatalAuthCode>([
-	"unauthorized",
-	"server_misconfigured",
-	"unclaimed",
-	"update_required",
-]);
-
-function parseFatalAuthMessage(payload: string): FatalAuthMessage | null {
-	let parsed: unknown;
-	try {
-		parsed = JSON.parse(payload);
-	} catch {
-		return null;
-	}
-	if (!parsed || typeof parsed !== "object") return null;
-	const record = parsed as Record<string, unknown>;
-	if (record.type !== "error") return null;
-	if (typeof record.code !== "string" || !FATAL_AUTH_CODES.has(record.code as FatalAuthCode)) {
-		return null;
-	}
-	return {
-		code: record.code as FatalAuthCode,
-		clientSchemaVersion:
-			typeof record.clientSchemaVersion === "number" && Number.isInteger(record.clientSchemaVersion)
-				? record.clientSchemaVersion
-				: null,
-		roomSchemaVersion:
-			typeof record.roomSchemaVersion === "number" && Number.isInteger(record.roomSchemaVersion)
-				? record.roomSchemaVersion
-				: null,
-		reason: typeof record.reason === "string" ? record.reason : null,
-	};
-}
 
 type IndexedDbErrorKind =
 	| "quota_exceeded"
@@ -261,7 +234,7 @@ export class VaultSync {
 	 * When set, the plugin should stop reconnecting.
 	 */
 	private _fatalAuthError = false;
-	private _fatalAuthCode: "unauthorized" | "server_misconfigured" | "unclaimed" | "update_required" | null = null;
+	private _fatalAuthCode: FatalAuthCode | null = null;
 	private _fatalAuthDetails: {
 		clientSchemaVersion: number | null;
 		roomSchemaVersion: number | null;
@@ -273,6 +246,13 @@ export class VaultSync {
 	private _idbErrorDetails: IndexedDbErrorDetails | null = null;
 	private _serverAckStore: CandidateStore | null = null;
 	private _serverAckScope: (ScopeKey & ScopeMetadata) | null = null;
+	private _serverAckScopeBase: (
+		Pick<ScopeKey, "vaultIdHash" | "serverHostHash" | "localDeviceId" | "docSchemaVersion">
+		& ScopeMetadata
+		& { vaultId: string }
+	) | null = null;
+	private _serverAckLocalYjsPersistenceLoaded = false;
+	private _serverAckBindingChain: Promise<void> = Promise.resolve();
 	private _serverAckPersistenceUnavailable = false;
 	private _serverReceiptStartupValidation: ServerReceiptStartupValidation = "not_started";
 	private readonly _svEchoCounters = createSvEchoCounters();
@@ -285,23 +265,22 @@ export class VaultSync {
 	private _onRenameBatchFlushed: ((renames: Map<string, string>) => void) | null = null;
 
 	private readonly _device: string | undefined;
+	readonly deviceId: string;
+	private readonly _idbName: string;
+	private readonly receiptGenerationHint: number | undefined;
 	private readonly debug: boolean;
 	private _eventRing: Array<{ ts: string; msg: string }> = [];
 	private readonly trace?: TraceRecord;
 	private readonly onFlightEvent?: (event: Record<string, unknown>) => void;
 	private readonly onFlightPathEvent?: (event: ProductFlightPathEventInput) => void;
 
-	/**
-	 * Stored callback for obtaining (and force-refreshing) short-lived tickets.
-	 * Kept on the instance so the proactive refresh timer can call it after
-	 * the constructor's params() closure is no longer in scope.
-	 */
-	private _getSocketTicket: ((force?: boolean) => Promise<{
+	/** Callback for obtaining and force-refreshing mandatory short-lived tickets. */
+	private readonly _getSocketTicket: (force?: boolean) => Promise<{
 		value: string;
 		expiresAt: number;
 		localExpiresAt: number;
 		ttlMs: number;
-	} | null>) | null = null;
+	}>;
 
 	/** Timer handle for the proactive provider URL ticket refresh. */
 	private _socketTicketRefreshTimer: number | null = null;
@@ -309,28 +288,19 @@ export class VaultSync {
 
 	constructor(
 		settings: VaultSyncSettings,
-		options?: {
-			traceContext?: TraceHttpContext;
+		options: {
+			folderKey: string;
+			/** Used when local sys.generation is missing after a nuclear reset. */
+			receiptGenerationHint?: number;
 			trace?: TraceRecord;
 			onFlightEvent?: (event: Record<string, unknown>) => void;
 			onFlightPathEvent?: (event: ProductFlightPathEventInput) => void;
-			/**
-			 * Optional callback returning a short-lived WebSocket ticket.
-			 * Called once during initial connection via async params().
-			 * After that, VaultSync proactively refreshes provider.url via a
-			 * timer so reconnects always find a live ticket — y-partyserver's
-			 * internal reconnect loop reuses provider.url directly without
-			 * re-calling params().
-			 *
-			 * Pass force=true to bypass the ticket cache and always fetch fresh.
-			 * If the callback returns null the provider falls back to ?token=.
-			 */
-				getSocketTicket?: (force?: boolean) => Promise<{
-					value: string;
-					expiresAt: number;
-					localExpiresAt: number;
-					ttlMs: number;
-				} | null>;
+			getSocketTicket: (force?: boolean) => Promise<{
+				value: string;
+				expiresAt: number;
+				localExpiresAt: number;
+				ttlMs: number;
+			}>;
 			/**
 			 * Invoked after a validated server receipt echo updates receipt facts.
 			 * This is notification-only: ServerAckTracker remains the sole
@@ -341,9 +311,12 @@ export class VaultSync {
 	) {
 		this.debug = settings.debug;
 		this._device = settings.deviceName || undefined;
-		this.trace = options?.trace;
-		this.onFlightEvent = options?.onFlightEvent;
-		this.onFlightPathEvent = options?.onFlightPathEvent;
+		this.deviceId = settings.deviceId;
+		this._idbName = vaultIdbName(settings.vaultId, options.folderKey);
+		this.receiptGenerationHint = options.receiptGenerationHint;
+		this.trace = options.trace;
+		this.onFlightEvent = options.onFlightEvent;
+		this.onFlightPathEvent = options.onFlightPathEvent;
 
 		this.ydoc = new Y.Doc();
 		this.pathToId = this.ydoc.getMap<string>("pathToId");
@@ -362,13 +335,12 @@ export class VaultSync {
 		this.meta.observeDeep(this._metaDeepObserver);
 
 		const roomId = settings.vaultId;
-		const idbName = `yaos:${settings.vaultId}`;
 
 		this.log(`Connecting to ${settings.host} room=${roomId}`);
-		this.log(`IndexedDB database: ${idbName}`);
+		this.log(`IndexedDB database: ${this._idbName}`);
 
 		// Start both persistence and provider in parallel.
-		this.persistence = new IndexeddbPersistence(idbName, this.ydoc);
+		this.persistence = new IndexeddbPersistence(this._idbName, this.ydoc);
 
 		// Catch IndexedDB open/write failures (unavailable, quota, permissions).
 		// y-indexeddb declares its internal `_db` open promise, which rejects
@@ -394,41 +366,18 @@ export class VaultSync {
 				// Open failure is already captured above.
 			});
 
-		this._getSocketTicket = options?.getSocketTicket ?? null;
-		const longLivedToken = settings.token;
+		this._getSocketTicket = options.getSocketTicket;
 		const syncPrefix = `/vault/sync/${encodeURIComponent(roomId)}`;
 
 		this.provider = new YSyncProvider(settings.host, roomId, this.ydoc, {
 			prefix: syncPrefix,
 			params: async () => {
-				// Build base params (schema version + optional trace context).
-				const p: Record<string, string> = {
+				const ticket = await this._getSocketTicket();
+				this.scheduleSocketTicketRefresh(ticket);
+				return {
 					schemaVersion: String(SCHEMA_VERSION),
+					ticket: ticket.value,
 				};
-				if (options?.traceContext) {
-					p.device = options.traceContext.deviceName;
-					p.trace = options.traceContext.traceId;
-					p.boot = options.traceContext.bootId;
-				}
-				// Prefer a short-lived ticket when available; fall back to the
-				// long-lived token for servers that do not yet support tickets.
-				//
-				// NOTE: this callback is invoked once by YProvider.connect() on
-				// initial connection.  y-partyserver's internal reconnect loop
-				// (setupWS) reuses provider.url directly without re-calling
-				// params().  VaultSync keeps provider.url fresh via
-				// scheduleSocketTicketRefresh so reconnects always carry a live
-				// ticket. See docs/architecture.md § Authentication and schema
-				// admission.
-				const ticketResult = this._getSocketTicket ? await this._getSocketTicket() : null;
-				if (ticketResult) {
-					p.ticket = ticketResult.value;
-					// Schedule proactive URL refresh before this ticket expires.
-					this.scheduleSocketTicketRefresh(ticketResult);
-				} else {
-					p.token = longLivedToken;
-				}
-				return p;
 			},
 			connect: false,
 			maxBackoffTime: MAX_BACKOFF_TIME_MS,
@@ -454,11 +403,8 @@ export class VaultSync {
 			if (event.status === "connected") {
 				this._connectionGeneration++;
 				this.log(`Connection generation: ${this._connectionGeneration}`);
-			} else if (event.status === "disconnected" && this._getSocketTicket) {
-				// Best-effort: refresh provider.url before the reconnect timer fires.
-				// The proactive timer (scheduleSocketTicketRefresh) is the primary
-				// mechanism; this handles edge cases like laptop sleep where the
-				// disconnect happens without the timer having had a chance to fire.
+			} else if (event.status === "disconnected" && !this._fatalAuthError) {
+				// Best-effort refresh before the reconnect timer fires.
 				void this.refreshProviderTicketUrl(true);
 			}
 		});
@@ -476,6 +422,7 @@ export class VaultSync {
 				roomSchemaVersion: msg.roomSchemaVersion,
 				reason: msg.reason,
 			};
+			this.clearSocketTicketRefreshTimer();
 			if (firstFatal) {
 				this.log(`Fatal auth error: ${msg.code} — stopping reconnection`);
 			}
@@ -545,7 +492,10 @@ export class VaultSync {
 	}
 
 	waitForProviderSync(): Promise<boolean> {
-		if (this._providerSynced) return Promise.resolve(true);
+		if (this._providerSynced || this.provider.synced) {
+			this._providerSynced = true;
+			return Promise.resolve(true);
+		}
 		if (this._fatalAuthError) return Promise.resolve(false);
 
 		return new Promise((resolve) => {
@@ -584,48 +534,96 @@ export class VaultSync {
 		pluginVersion: string,
 		options: { localYjsPersistenceLoaded: boolean },
 	): Promise<void> {
-		if (this._serverAckScope) return;
+		if (this._serverAckScopeBase) return;
 		try {
-			const [vaultIdHash, serverHostHash, localDeviceId] = await Promise.all([
+			const [vaultIdHash, serverHostHash] = await Promise.all([
 				sha256TextHex(settings.vaultId),
 				sha256TextHex(settings.host),
-				getOrCreateLocalDeviceId(),
 			]);
-			const scope: ScopeKey & ScopeMetadata = {
+			this._serverAckScopeBase = {
+				vaultId: settings.vaultId,
 				vaultIdHash,
 				serverHostHash,
-				localDeviceId,
-				// Phase A uses the current y-partyserver room key. Since this is
-				// derived from vaultId, it does not detect server reset/reclaim by
-				// itself; the manual clear command remains the escape hatch until a
-				// server generation/claim ID exists.
-				roomName: settings.vaultId,
+				localDeviceId: settings.deviceId,
 				docSchemaVersion: SCHEMA_VERSION,
 				pluginVersion,
-				ackStoreVersion: 1,
+				ackStoreVersion: 2,
 			};
-			const store = new IndexedDbCandidateStore(scope);
-			this._serverAckStore = store;
-			this._serverAckScope = scope;
+			this._serverAckLocalYjsPersistenceLoaded = options.localYjsPersistenceLoaded;
+			// Capture local updates immediately, but do not bind persistence to a
+			// guessed generation while a fresh cache is still awaiting the room.
 			this.serverAckTracker.attach(
 				this.ydoc,
 				() => Y.encodeStateVector(this.ydoc),
 				this.provider,
 				this.persistence,
 			);
-			if (options.localYjsPersistenceLoaded) {
-				await this.serverAckTracker.onStartup(store, scope);
-				this._serverReceiptStartupValidation = "validated";
-				this.log("Server receipt tracker initialized");
+
+			const storedGeneration = this.sys.get("generation");
+			const localGeneration = storedGeneration === undefined || storedGeneration === null
+				? readKnownRoomGeneration(this.receiptGenerationHint)
+				: readKnownRoomGeneration(storedGeneration);
+			if (localGeneration !== null) {
+				await this.bindServerAckPersistence(localGeneration);
 			} else {
-				this._serverReceiptStartupValidation = "skipped_local_yjs_timeout";
-				this.log("Server receipt startup validation skipped: local Yjs persistence timed out");
+				this.log("Server receipt tracker awaiting authoritative room generation");
 			}
 		} catch (err) {
 			this._serverAckPersistenceUnavailable = true;
 			this._serverReceiptStartupValidation = "unavailable";
 			this.log(`Server receipt tracker unavailable: ${formatUnknown(err)}`);
 		}
+	}
+
+	/**
+	 * Finalize or rotate receipt persistence after the provider has delivered
+	 * authoritative room state. A missing generation after a complete sync is
+	 * the original generation 0; malformed present state remains unknown.
+	 */
+	async finalizeServerAckTrackingAfterProviderSync(): Promise<void> {
+		const storedGeneration = this.sys.get("generation");
+		const generation = storedGeneration === undefined || storedGeneration === null
+			? 0
+			: readKnownRoomGeneration(storedGeneration);
+		if (generation === null) {
+			this.log("Server receipt tracker refused malformed authoritative generation");
+			return;
+		}
+		try {
+			await this.bindServerAckPersistence(generation);
+		} catch (err) {
+			this._serverAckPersistenceUnavailable = true;
+			this._serverReceiptStartupValidation = "unavailable";
+			this.log(`Server receipt tracker generation finalization failed: ${formatUnknown(err)}`);
+		}
+	}
+
+	private bindServerAckPersistence(generation: number): Promise<void> {
+		this._serverAckBindingChain = this._serverAckBindingChain.then(async () => {
+			const base = this._serverAckScopeBase;
+			if (!base || this._serverAckScope?.roomGeneration === generation) return;
+			const scope: ScopeKey & ScopeMetadata = {
+				vaultIdHash: base.vaultIdHash,
+				serverHostHash: base.serverHostHash,
+				localDeviceId: base.localDeviceId,
+				roomName: receiptRoomName(base.vaultId, generation),
+				roomGeneration: generation,
+				docSchemaVersion: base.docSchemaVersion,
+				pluginVersion: base.pluginVersion,
+				ackStoreVersion: base.ackStoreVersion,
+			};
+			const store = new IndexedDbCandidateStore(scope);
+			await this.serverAckTracker.bindPersistence(store, scope, {
+				loadPersisted: this._serverAckLocalYjsPersistenceLoaded,
+			});
+			this._serverAckStore = store;
+			this._serverAckScope = scope;
+			this._serverReceiptStartupValidation = this._serverAckLocalYjsPersistenceLoaded
+				? "validated"
+				: "skipped_local_yjs_timeout";
+			this.log(`Server receipt tracker bound to room generation ${generation}`);
+		});
+		return this._serverAckBindingChain;
 	}
 
 	/**
@@ -638,7 +636,9 @@ export class VaultSync {
 			if (!synced) return;
 			this._providerSynced = true;
 			this.log(`onProviderSync callback firing (gen=${this._connectionGeneration})`);
-			callback(this._connectionGeneration);
+			void this.finalizeServerAckTrackingAfterProviderSync().then(() => {
+				callback(this._connectionGeneration);
+			});
 		});
 	}
 
@@ -1891,7 +1891,7 @@ export class VaultSync {
 		return this._fatalAuthError;
 	}
 
-	get fatalAuthCode(): "unauthorized" | "server_misconfigured" | "unclaimed" | "update_required" | null {
+	get fatalAuthCode(): FatalAuthCode | null {
 		return this._fatalAuthCode;
 	}
 
@@ -1918,16 +1918,18 @@ export class VaultSync {
 		this.captureIndexedDbError(err, phase);
 	}
 
-	/** The IndexedDB database name for this vault. */
+	/** The IndexedDB database name for this server vault and local folder. */
 	get idbName(): string {
-		const vaultId = this.sys.get("vaultId");
-		return `yaos:${typeof vaultId === "string" ? vaultId : "unknown"}`;
+		return this._idbName;
+	}
+
+	get roomGeneration(): number {
+		return readSysGeneration(this.sys.get("generation"));
 	}
 
 	/**
-	 * Wipe all CRDT maps (pathToId, idToText, meta, sys) in a single
-	 * transaction. Collects keys first to avoid mutating during iteration.
-	 * This propagates to the server via the provider (intentional for nuclear reset).
+	 * Wipe all CRDT maps in a single transaction and move receipt persistence
+	 * into a fresh generation so pre-reset receipts cannot be reused.
 	 */
 	clearAllMaps(): { pathCount: number; idCount: number; metaCount: number; blobCount: number } {
 		const pathKeys = Array.from(this.pathToId.keys());
@@ -1937,6 +1939,7 @@ export class VaultSync {
 		const blobPathKeys = Array.from(this.pathToBlob.keys());
 		const blobMetaKeys = Array.from(this.blobMeta.keys());
 		const blobTombKeys = Array.from(this.blobTombstones.keys());
+		const nextGeneration = nextSysGeneration(this.sys.get("generation"));
 
 		this.ydoc.transact(() => {
 			for (const k of pathKeys) this.pathToId.delete(k);
@@ -1946,13 +1949,14 @@ export class VaultSync {
 			for (const k of blobPathKeys) this.pathToBlob.delete(k);
 			for (const k of blobMetaKeys) this.blobMeta.delete(k);
 			for (const k of blobTombKeys) this.blobTombstones.delete(k);
+			this.sys.set("generation", nextGeneration);
 		}, ORIGIN_SEED);
 		this._pathIndexesDirty = true;
 
 		this.log(
 			`clearAllMaps: removed ${pathKeys.length} paths, ` +
 			`${idKeys.length} texts, ${metaKeys.length} meta entries, ` +
-			`${blobPathKeys.length} blob paths`,
+			`${blobPathKeys.length} blob paths, generation=${nextGeneration}`,
 		);
 
 		return {
@@ -1963,19 +1967,36 @@ export class VaultSync {
 		};
 	}
 
-	/**
-	 * Delete the IndexedDB database for this vault.
-	 * Safe to call after destroy() — uses the raw IDB deleteDatabase API.
-	 */
-	static deleteIdb(vaultId: string): Promise<void> {
-		const name = `yaos:${vaultId}`;
-		return new Promise((resolve, reject) => {
+	/** Delete the receipt candidate scoped to one server-issued device enrollment. */
+	static async clearServerReceiptCandidate(
+		host: string,
+		vaultId: string,
+		deviceId: string,
+	): Promise<void> {
+		const [vaultIdHash, serverHostHash] = await Promise.all([
+			sha256TextHex(vaultId),
+			sha256TextHex(host),
+		]);
+		const store = new IndexedDbCandidateStore({
+			vaultIdHash,
+			serverHostHash,
+			localDeviceId: deviceId,
+			roomName: "",
+			roomGeneration: 0,
+			docSchemaVersion: SCHEMA_VERSION,
+		});
+		await store.clear();
+	}
+
+	/** Delete only this server-vault/local-folder persistence database. */
+	static deleteIdb(vaultId: string, folderKey: string): Promise<void> {
+		const name = vaultIdbName(vaultId, folderKey);
+		return new Promise<void>((resolve, reject) => {
 			const req = indexedDB.deleteDatabase(name);
 			req.onsuccess = () => resolve();
 			req.onerror = () => reject(req.error ?? new Error(`Failed to delete IndexedDB database "${name}"`));
 			req.onblocked = () => {
 				console.warn(`[yaos] IDB delete blocked for "${name}"`);
-				// Resolve anyway — it'll be deleted when connections close
 				resolve();
 			};
 		});
@@ -2001,6 +2022,7 @@ export class VaultSync {
 		ttlMs: number;
 	}): void {
 		this.clearSocketTicketRefreshTimer();
+		if (this._fatalAuthError) return;
 		const ttlRemaining = ticket.localExpiresAt - Date.now();
 		const buffer = Math.min(TICKET_REFRESH_BUFFER_MS, Math.floor(ttlRemaining / 2));
 		const msUntilRefresh = Math.max(250, ttlRemaining - buffer);
@@ -2017,10 +2039,7 @@ export class VaultSync {
 		}
 	}
 
-	/**
-	 * Replace the ticket value in provider.url, removing any legacy ?token=.
-	 * Preserves all other query params (schemaVersion, _pk, device, trace, boot).
-	 */
+	/** Replace the ticket value in provider.url without adding credentials. */
 	private patchProviderTicket(value: string): void {
 		try {
 			this.provider.url = patchTicketInUrl(this.provider.url, value);
@@ -2037,14 +2056,14 @@ export class VaultSync {
 	 * proactive refresh cycle survives intermittent network errors.
 	 */
 	private async refreshProviderTicketUrl(force = false): Promise<void> {
-		if (!this._getSocketTicket) return;
+		if (this._fatalAuthError) return;
 		try {
 			const ticket = await this._getSocketTicket(force);
-			if (ticket) {
-				this.patchProviderTicket(ticket.value);
-				this.scheduleSocketTicketRefresh(ticket);
-			}
+			if (this._fatalAuthError) return;
+			this.patchProviderTicket(ticket.value);
+			this.scheduleSocketTicketRefresh(ticket);
 		} catch (err) {
+			if (this._fatalAuthError) return;
 			this.log(`socket ticket refresh failed: ${formatUnknown(err)}`);
 			// Clear any existing timer before scheduling the retry so we never
 			// lose a handle and fire duplicate refreshes.  This matters when the

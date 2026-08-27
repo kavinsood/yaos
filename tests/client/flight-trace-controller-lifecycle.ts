@@ -122,7 +122,7 @@ s.section("Deferred start, stop, and restart share one lifecycle");
 	const settings = {
 		vaultId: "vault-lifecycle",
 		host: "https://sync.example.com",
-		token: "super-secret-token",
+		deviceToken: "super-secret-device-token",
 		deviceName: "private-device",
 		debug: true,
 		enableAttachmentSync: false,
@@ -174,7 +174,7 @@ s.section("Deferred start, stop, and restart share one lifecycle");
 	s.check(controller.currentRecorder === publishedRecorder, "refresh while enabled does not replace the recorder");
 	s.check(fakeWindow.intervals.size === 1, "refresh while enabled does not duplicate polling");
 
-	const crash = new TypeError(`Could not read /Users/alice/private/secret.md token=${settings.token}`);
+	const crash = new TypeError(`Could not read /Users/alice/private/secret.md token=${settings.deviceToken}`);
 	crash.stack = `TypeError: ${crash.message}\n    at run (/Users/alice/private/plugin.js:12:8)`;
 	fakeWindow.emit("error", {
 		error: crash,
@@ -199,11 +199,11 @@ s.section("Deferred start, stop, and restart share one lifecycle");
 	s.check(typeof windowCrashDetails?.stack === "string", "window crash preserves a sanitized stack");
 	s.check(windowCrashDetails?.line === 12 && windowCrashDetails?.column === 8, "window crash preserves source coordinates");
 	s.check(windowCrashDetails?.file === "[redacted-file]", "window crash records that a source file existed without exposing it");
-	s.check(!durableAfterWindowCrash.includes(settings.token), "durable crash evidence excludes the bearer token");
+	s.check(!durableAfterWindowCrash.includes(settings.deviceToken), "durable crash evidence excludes the bearer token");
 	s.check(!durableAfterWindowCrash.includes("/Users/alice"), "durable crash evidence excludes raw filesystem paths");
 	s.check(!durableAfterWindowCrash.includes("secret.md"), "durable crash evidence excludes raw sensitive filenames");
 
-	const rejection = new Error(`Rejected request for /Users/alice/private/other.md with token=${settings.token}`);
+	const rejection = new Error(`Rejected request for /Users/alice/private/other.md with token=${settings.deviceToken}`);
 	let rejectionPrevented = false;
 	fakeWindow.emit("unhandledrejection", {
 		reason: rejection,
@@ -212,7 +212,7 @@ s.section("Deferred start, stop, and restart share one lifecycle");
 	await settleAsyncWrites();
 	const durableAfterRejection = written.join("");
 	s.check(durableAfterRejection.includes("unhandled-rejection"), "unhandled rejection is immediately made durable");
-	s.check(!durableAfterRejection.includes(settings.token), "rejection evidence excludes the token");
+	s.check(!durableAfterRejection.includes(settings.deviceToken), "rejection evidence excludes the token");
 	s.check(!durableAfterRejection.includes("/Users/alice"), "rejection evidence excludes raw paths");
 	s.check(!rejectionPrevented, "ordinary rejection remains visible to the host error policy");
 

@@ -32,12 +32,13 @@ const SENSITIVE_DATA_KEYS: Record<string, true> = {
 	newPath: true,
 	host: true,
 	token: true,
+	deviceToken: true,
 	vaultId: true,
 	deviceName: true,
 };
 
 /** Keys that must never appear in ANY mode's event data. */
-const ABSOLUTELY_FORBIDDEN_KEYS: Record<string, true> = { token: true };
+const ABSOLUTELY_FORBIDDEN_KEYS: Record<string, true> = { token: true, deviceToken: true };
 
 export type FlightRecorderOptions = {
 	mode: FlightMode;

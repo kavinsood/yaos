@@ -122,7 +122,6 @@ s.section("Runtime compatibility decision matrix");
 	const host = "https://release-matrix.test";
 	const baseCapabilities: ServerCapabilities = {
 		claimed: true,
-		authMode: "env",
 		attachments: true,
 		snapshots: true,
 		serverVersion: SERVER_VERSION,
@@ -153,7 +152,12 @@ s.section("Runtime compatibility decision matrix");
 		let stopped = 0;
 		let statusErrors = 0;
 		const service = new CapabilityUpdateService({
-			getSettings: () => ({ host, token: "" } as never),
+			getSettings: () => ({
+				host,
+				deviceToken: "release-matrix-device-bearer",
+				vaultId: "release-matrix-vault",
+				deviceId: "release-matrix-device",
+			} as never),
 			pluginVersion: args.pluginVersion,
 			schemaVersion: args.schemaVersion,
 			trace: () => {},

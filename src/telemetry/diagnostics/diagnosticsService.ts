@@ -126,7 +126,7 @@ export class DiagnosticsService {
 			serverVersion: this.deps.getServerVersion(),
 			settings: {
 				host: settings.host,
-				token: settings.token,
+				deviceToken: settings.deviceToken,
 				vaultId: settings.vaultId,
 				deviceName: settings.deviceName,
 				debug: settings.debug,

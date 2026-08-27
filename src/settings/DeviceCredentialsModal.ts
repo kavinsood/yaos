@@ -1,38 +1,38 @@
 import { App, Modal, Notice } from "obsidian";
 
-export class RecoveryKitModal extends Modal {
-	constructor(app: App, private readonly recoveryKit: string) {
+export class DeviceCredentialsModal extends Modal {
+	constructor(app: App, private readonly credentials: string) {
 		super(app);
 	}
 
 	onOpen(): void {
 		const { contentEl } = this;
 		contentEl.empty();
-		contentEl.addClass("yaos-recovery-kit-modal");
+		contentEl.addClass("yaos-device-credentials-modal");
 
-		contentEl.createEl("h3", { text: "Backup connection details" });
+		contentEl.createEl("h3", { text: "Device credentials" });
 
 		const warning = contentEl.createDiv({ cls: "callout yaos-settings-callout" });
 		warning.setAttr("data-callout", "warning");
 
 		const warningTitle = warning.createDiv({ cls: "callout-title" });
-		warningTitle.createSpan({ text: "Save this somewhere safe" });
+		warningTitle.createSpan({ text: "Private to this device" });
 
 		const warningBody = warning.createDiv({ cls: "callout-content" });
 		warningBody.createEl("p", {
-			text: "Save this somewhere safe, like a password manager. If you lose all your devices, you will need this exact vault ID and token to recover your notes from your server.",
+			text: "These credentials authorize only this enrolled device. Store them securely. Pair another device instead of sharing them.",
 		});
 
 		const textArea = contentEl.createEl("textarea", { cls: "yaos-settings-modal-textarea" });
-		textArea.value = this.recoveryKit;
+		textArea.value = this.credentials;
 		textArea.readOnly = true;
 		textArea.rows = 10;
 
 		const buttons = contentEl.createDiv({ cls: "modal-button-container" });
-		buttons.createEl("button", { text: "Copy connection details" }).addEventListener("click", () => {
-			void navigator.clipboard.writeText(this.recoveryKit).then(
-				() => new Notice("Connection details copied."),
-				() => new Notice("Failed to copy the connection details.", 6000),
+		buttons.createEl("button", { text: "Copy device credentials" }).addEventListener("click", () => {
+			void navigator.clipboard.writeText(this.credentials).then(
+				() => new Notice("Device credentials copied."),
+				() => new Notice("Failed to copy the device credentials.", 6000),
 			);
 		});
 		buttons.createEl("button", { text: "Close" }).addEventListener("click", () => this.close());

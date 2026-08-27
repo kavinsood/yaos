@@ -13,8 +13,9 @@
 export type ScopeKey = {
 	vaultIdHash: string;       // SHA-256 of vaultId, hex-encoded
 	serverHostHash: string;    // SHA-256 of server host URL, hex-encoded
-	localDeviceId: string;     // stable per-install UUID; NOT deviceName
+	localDeviceId: string;     // server-issued device ID for this enrollment; NOT deviceName
 	roomName: string;          // DO room name; changes on server reset/reclaim
+	roomGeneration: number; // authoritative sys.generation; isolates reset/reclaim epochs
 	docSchemaVersion: number;  // CRDT doc schema version at capture time
 };
 
@@ -27,13 +28,19 @@ export type ScopeMetadata = {
 };
 
 export type PersistedCandidateState = ScopeKey & ScopeMetadata & {
-	schema: 1;
+	schema: 2;
 	candidateSvBase64: string | null;
 	candidateCapturedAt: number | null;
 	// Historical-only: NOT restored as active serverAppliedLocalState=true.
 	// Level 3 is not durable — the DO may crash before enqueueSave().
 	lastKnownServerReceiptEchoAt: number | null;
 };
+
+/** Return a usable generation only when local state really contains one. */
+export function readKnownRoomGeneration(value: unknown): number | null {
+	if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) return null;
+	return value;
+}
 
 export interface CandidateStore {
 	/**

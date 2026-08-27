@@ -10,7 +10,6 @@ import {
 } from "../update/updateManifest";
 import type { VaultSyncSettings } from "../settings";
 import { attachmentSizeCapKB } from "../settings/settingsStore";
-import { obsidianRequest } from "../utils/http";
 import { formatUnknown } from "../utils/format";
 import { compareSemver } from "../utils/semver";
 
@@ -73,7 +72,6 @@ export function isServerCapabilities(value: unknown): value is ServerCapabilitie
 	if (typeof value !== "object" || value === null) return false;
 	const candidate = value as Partial<ServerCapabilities>;
 	return typeof candidate.claimed === "boolean" &&
-		(candidate.authMode === "env" || candidate.authMode === "claim" || candidate.authMode === "unclaimed") &&
 		typeof candidate.attachments === "boolean" &&
 		typeof candidate.snapshots === "boolean" &&
 		(candidate.maxBlobUploadBytes === undefined ||
@@ -151,7 +149,6 @@ export class CapabilityUpdateService {
 	private lastServerUpdateNoticeVersion: string | null = null;
 	private lastPluginUpdateNoticeVersion: string | null = null;
 	private compatibilityBlockReason: string | null = null;
-	private lastPushedUpdateMetadataFingerprint: string | null = null;
 	private legacyServerDetected = false;
 	private legacyServerNoticeShown = false;
 
@@ -161,9 +158,6 @@ export class CapabilityUpdateService {
 		return this.serverCapabilities;
 	}
 
-	get authMode(): ServerCapabilities["authMode"] | "unknown" {
-		return this.serverCapabilities?.authMode ?? "unknown";
-	}
 
 	get supportsAttachments(): boolean {
 		if (!this.deps.getSettings().host) return true;
@@ -354,50 +348,6 @@ export class CapabilityUpdateService {
 		return `${normalizedRepoUrl}/new/${branch}?filename=${filename}&value=${workflowValue}`;
 	}
 
-	async syncUpdateMetadataToServer(reason: string): Promise<void> {
-		const settings = this.deps.getSettings();
-		const host = settings.host.trim().replace(/\/$/, "");
-		const token = settings.token.trim();
-		if (!host || !token) return;
-
-		const payload = this.buildUpdateMetadataPayload();
-		if (!payload) {
-			return;
-		}
-		const fingerprint = JSON.stringify(payload);
-		if (fingerprint === this.lastPushedUpdateMetadataFingerprint) {
-			return;
-		}
-
-		try {
-			const res = await obsidianRequest({
-				url: `${host}/api/update-metadata`,
-				method: "POST",
-				headers: {
-					Authorization: `Bearer ${token}`,
-					"Content-Type": "application/json",
-				},
-				body: JSON.stringify(payload),
-			});
-			if (res.status !== 200) {
-				this.deps.log(`Update metadata push (${reason}) failed (${res.status})`);
-				return;
-			}
-
-			const body = res.json as { capabilities?: unknown };
-			const nextCapabilities = isServerCapabilities(body?.capabilities) ? body.capabilities : null;
-			this.lastPushedUpdateMetadataFingerprint = fingerprint;
-			if (!nextCapabilities) {
-				return;
-			}
-
-			const previous = this.serverCapabilities;
-			this.serverCapabilities = nextCapabilities;
-			await this.handleCapabilityChange(previous, nextCapabilities, `metadata-sync:${reason}`);
-		} catch (err) {
-			this.deps.log(`Update metadata push (${reason}) failed: ${formatUnknown(err)}`);
-		}
-	}
 
 	private getHardCompatibilityBlockReason(): string | null {
 		if (!this.serverCapabilities) return null;
@@ -453,7 +403,7 @@ export class CapabilityUpdateService {
 		}
 
 		try {
-			this.serverCapabilities = await fetchServerCapabilities(settings.host, settings.token);
+			this.serverCapabilities = await fetchServerCapabilities(settings.host, settings.deviceToken);
 			const serverVersion = (this.serverCapabilities as { serverVersion?: unknown } | null)?.serverVersion;
 			if (typeof serverVersion === "string" && serverVersion.trim()) {
 				this.legacyServerDetected = false;
@@ -483,7 +433,6 @@ export class CapabilityUpdateService {
 			durationMs: Date.now() - startedAt,
 			outcome: "ok",
 			claimed: this.serverCapabilities?.claimed ?? null,
-			authMode: this.serverCapabilities?.authMode ?? null,
 			attachments: this.serverCapabilities?.attachments ?? null,
 			snapshots: this.serverCapabilities?.snapshots ?? null,
 			serverVersion: this.serverCapabilities?.serverVersion ?? null,
@@ -503,7 +452,6 @@ export class CapabilityUpdateService {
 		const changed =
 			prevAttachments !== nextAttachments ||
 			prevSnapshots !== nextSnapshots ||
-			previous?.authMode !== next?.authMode ||
 			previous?.claimed !== next?.claimed ||
 			previous?.serverVersion !== next?.serverVersion ||
 			previous?.maxBlobUploadBytes !== next?.maxBlobUploadBytes ||
@@ -525,7 +473,7 @@ export class CapabilityUpdateService {
 
 		this.deps.log(
 			`Server capabilities updated (${reason}): ` +
-			`claimed=${next?.claimed ?? "unknown"} auth=${next?.authMode ?? "unknown"} ` +
+			`claimed=${next?.claimed ?? "unknown"} ` +
 			`attachments=${nextAttachments ?? "unknown"} snapshots=${nextSnapshots ?? "unknown"} ` +
 			`serverVersion=${next?.serverVersion ?? "unknown"} ` +
 			`updateProvider=${next?.updateProvider ?? "unknown"} updateBranch=${next?.updateRepoBranch ?? "unknown"}`,
@@ -718,44 +666,10 @@ export class CapabilityUpdateService {
 	private maybeShowLegacyServerNotice(): void {
 		if (this.legacyServerNoticeShown) return;
 		new Notice(
-			"Legacy server detected. Sync continues, but update metadata and 1-click updater features need a newer server.",
+			"Legacy server detected. Sync continues, but current update information needs a newer server.",
 			12000,
 		);
 		this.legacyServerNoticeShown = true;
 	}
 
-	private buildUpdateMetadataPayload(): {
-		updateProvider: "github" | "gitlab" | "unknown";
-		updateRepoUrl: string;
-		updateRepoBranch: string | null;
-	} | null {
-		const settings = this.deps.getSettings();
-		let updateRepoUrl: string | null = null;
-		const rawRepoUrl = settings.updateRepoUrl.trim();
-		if (rawRepoUrl) {
-			try {
-				const parsed = new URL(rawRepoUrl);
-				if ((parsed.protocol === "https:" || parsed.protocol === "http:")
-					&& parsed.pathname.split("/").filter(Boolean).length >= 2) {
-					parsed.search = "";
-					parsed.hash = "";
-					updateRepoUrl = parsed.toString().replace(/\/+$/, "").replace(/\.git$/i, "");
-				}
-			} catch {
-				updateRepoUrl = null;
-			}
-		}
-		if (!updateRepoUrl) {
-			return null;
-		}
-		const updateProvider = this.inferUpdateProvider(updateRepoUrl) ?? "unknown";
-
-		const branch = settings.updateRepoBranch.trim();
-		const updateRepoBranch = branch.length > 0 ? branch : (this.serverCapabilities?.updateRepoBranch ?? null);
-		return {
-			updateProvider,
-			updateRepoUrl,
-			updateRepoBranch,
-		};
-	}
 }

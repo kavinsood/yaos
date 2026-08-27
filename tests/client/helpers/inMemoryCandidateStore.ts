@@ -34,6 +34,7 @@ function scopeKeyMatches(stored: PersistedCandidateState, scope: ScopeKey): bool
 		stored.serverHostHash === scope.serverHostHash &&
 		stored.localDeviceId === scope.localDeviceId &&
 		stored.roomName === scope.roomName &&
+		stored.roomGeneration === scope.roomGeneration &&
 		stored.docSchemaVersion === scope.docSchemaVersion
 	);
 }

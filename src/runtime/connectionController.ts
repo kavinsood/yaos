@@ -1,6 +1,7 @@
 import type { VaultSync } from "../sync/vaultSync";
 import type { TraceRecord } from "../observability/traceContext";
 import { deriveSyncFacts, type SyncFacts } from "./connectionFacts";
+import type { FatalAuthCode } from "../sync/fatalAuth";
 
 export type OfflineReason =
 	| "provider_disconnected"
@@ -18,7 +19,7 @@ export type ConnectionState =
 	| { kind: "connecting" }
 	| { kind: "online"; generation: number }
 	| { kind: "offline"; reason: OfflineReason; generation: number }
-	| { kind: "auth_failed"; code: "unauthorized" | "server_misconfigured" | "unclaimed" }
+	| { kind: "auth_failed"; code: Exclude<FatalAuthCode, "update_required"> }
 	| { kind: "server_update_required"; details: VaultSync["fatalAuthDetails"] }
 	| { kind: "local_persistence_failed"; details: VaultSync["idbErrorDetails"] }
 	| { kind: "error"; details?: ConnectionStartupFailure };
@@ -167,7 +168,8 @@ export class ConnectionController {
 		}
 
 		if (sync.fatalAuthError) {
-			if (sync.fatalAuthCode === "update_required") {
+			const fatalAuthCode = sync.fatalAuthCode;
+			if (fatalAuthCode === "update_required") {
 				return {
 					kind: "server_update_required",
 					details: sync.fatalAuthDetails,
@@ -175,7 +177,7 @@ export class ConnectionController {
 			}
 			return {
 				kind: "auth_failed",
-				code: sync.fatalAuthCode ?? "unauthorized",
+				code: fatalAuthCode ?? "unauthorized",
 			};
 		}
 

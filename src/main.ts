@@ -2,18 +2,16 @@ import { MarkdownView, Notice, Plugin, TFile } from "obsidian";
 import {
 	DEFAULT_SETTINGS,
 	VaultSyncSettingTab,
-	generateVaultId,
+	type VaultRosterDevice,
 	type VaultSyncSettings,
 } from "./settings";
 import { SettingsStore } from "./settings/settingsStore";
 import { VaultSync, type ReconcileMode } from "./sync/vaultSync";
 import { SCHEMA_VERSION } from "./sync/vaultSync";
+import { computeFolderKey, folderKeySeedFromVault } from "./sync/vaultPersistence";
 import { EditorBindingManager } from "./sync/editorBinding";
 import { DiskMirror } from "./sync/diskMirror";
 import { type BlobQueueSnapshot, type BlobSyncManager } from "./sync/blobSync";
-import {
-	type ServerCapabilities,
-} from "./sync/serverCapabilities";
 import { isMarkdownSyncable, isBlobSyncable } from "./types";
 import { planCategoryRenameAction } from "./sync/policy/renameAdmissionPolicy";
 import { classifySyncPath } from "./paths/pathCategory";
@@ -33,7 +31,7 @@ import {
 import {
 	FrontmatterGuardCoordinator,
 } from "./sync/frontmatterGuardCoordinator";
-import { createSocketTicketCache, isTicketEndpointUnsupported } from "./sync/socketTicket";
+import { createSocketTicketCache } from "./sync/socketTicket";
 import {
 	type DiskIndex,
 	moveIndexEntries,
@@ -71,13 +69,18 @@ import {
 import {
 	ReconciliationController,
 } from "./runtime/reconciliationController";
+import { getFatalSyncNotice } from "./runtime/fatalSyncNotice";
 import { AttachmentOrchestrator } from "./runtime/attachmentOrchestrator";
 import {
 	RuntimeTeardownCoordinator,
 	runTeardownStages,
 } from "./runtime/teardownLifecycle";
 import { EditorWorkspaceOrchestrator } from "./runtime/editorWorkspaceOrchestrator";
-import { SetupLinkController } from "./runtime/setupLinkController";
+import {
+	SetupLinkController,
+	startEnrollmentRuntime,
+	type EnrollmentMembership,
+} from "./runtime/setupLinkController";
 import { registerCommands } from "./commands";
 import {
 	getLabelFromConnectionState,
@@ -87,6 +90,7 @@ import { CoalescedStatusRefresh } from "./status/coalescedStatusRefresh";
 import { formatUnknown, yTextToString } from "./utils/format";
 import { randomId } from "./utils/randomId";
 import { ConfirmModal } from "./ui/ConfirmModal";
+import { obsidianRequest } from "./utils/http";
 import { runSchemaMigrationToV2 } from "./migrations/schemaV2";
 import { installTelemetryRuntime, type TelemetryRuntimeHandle } from "./telemetry/installTelemetryRuntime";
 import { setupFlightTraceBestEffort } from "./telemetry/debug/flightTraceController";
@@ -138,6 +142,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private snapshotService: SnapshotService | null = null;
 	private reconciliationController!: ReconciliationController;
 	private setupLinkController: SetupLinkController | null = null;
+	private folderKey: string | null = null;
+	private pendingReceiptGeneration: number | undefined;
+	private vaultRoster: VaultRosterDevice[] = [];
+	private rosterVaultId = "";
 	/** Debug runtime handle — null unless debug mode installed it at startup. */
 	private lab: TelemetryRuntimeHandle | null = null;
 
@@ -425,30 +433,24 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			app: this.app,
 			getSettings: () => this.settings,
 			isMarkdownPathSyncable: (path) => this.isMarkdownPathSyncable(path),
+			requestEnrollment: (request) => obsidianRequest(request),
 			updateSettings: (mutator, reason) => this.updateSettings(mutator, reason),
 			refreshServerCapabilities: (reason) => this.refreshServerCapabilities(reason),
-			hasSyncRuntime: () => this.vaultSync !== null,
-			initSync: () => {
-				void this.initSync();
+			retireCurrentEnrollment: (membership) => this.retireCurrentEnrollment(membership),
+			startSyncAfterEnrollment: async () => {
+				if (!this.teardownLifecycle.isClosing && this.vaultSync) {
+					await this.teardownSync();
+				}
+				await startEnrollmentRuntime(
+					this.teardownLifecycle,
+					() => this.initSync(),
+				);
 			},
 		});
 		this.registerObsidianProtocolHandler("yaos", (params) => {
 			void this.setupLinkController?.handleSetupLink(params);
 		});
 
-		let generatedVaultId = false;
-		if (!this.settings.vaultId) {
-			await this.updateSettings((settings) => {
-				settings.vaultId = generateVaultId();
-			}, "startup-generate-vault-id");
-			generatedVaultId = true;
-		}
-
-		if (!this.settings.deviceName) {
-			await this.updateSettings((settings) => {
-				settings.deviceName = `device-${Date.now().toString(36)}`;
-			}, "startup-generate-device-name");
-		}
 
 		// Install the debug/Observer runtime when debug or qaDebugMode is enabled.
 		//
@@ -552,9 +554,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		});
 		this.attachmentOrchestrator.hydrateSavedQueue(this.savedBlobQueue);
 		this.savedBlobQueue = null;
-		if (generatedVaultId) {
-			this.log(`Generated vault ID: ${this.settings.vaultId}`);
-		}
 
 		this.addSettingTab(new VaultSyncSettingTab(this.app, this, this));
 
@@ -567,7 +566,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				durationMs,
 				outcome,
 				hostConfigured: !!this.settings.host,
-				tokenConfigured: !!this.settings.token,
+				deviceTokenConfigured: !!this.settings.deviceToken,
 			});
 			this.log(`Startup onload complete (${outcome}) in ${durationMs}ms`);
 		};
@@ -575,25 +574,17 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		if (this.settings.host) {
 			void this.refreshServerCapabilities("startup-background");
 			void this.refreshUpdateManifest("startup-background");
-			void this.syncUpdateMetadataToServer("startup-background");
 		}
 
-		if (!this.settings.host) {
-			this.log("Host not configured — sync disabled");
-			new Notice("Configure the server host in settings to enable sync.");
-			finishOnload("missing-host");
-			return;
-		}
-
-		if (!this.settings.token) {
-			this.log("Token not configured — sync disabled");
-			const message = this.serverAuthMode === "env"
-				? "YAOS: configure the server token in settings to enable sync."
-				: this.serverAuthMode === "claim" || this.serverAuthMode === "unclaimed"
-						? "YAOS: claim the server in a browser, then use the YAOS setup link to fill in the token."
-						: "YAOS: configure a token in settings, or claim the server in a browser first.";
-			new Notice(message, 10000);
-			finishOnload("missing-token");
+		if (
+			!this.settings.host.trim()
+			|| !this.settings.deviceToken.trim()
+			|| !this.settings.vaultId.trim()
+			|| !this.settings.deviceId.trim()
+		) {
+			this.log("This folder is not enrolled — sync disabled");
+			new Notice("Join this folder with a server URL and pairing code.", 10000);
+			finishOnload("not-enrolled");
 			return;
 		}
 
@@ -606,9 +597,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				const url = new URL(this.settings.host);
 				const h = url.hostname;
 				if (url.protocol === "http:" && h !== "localhost" && h !== "127.0.0.1" && h !== "[::1]") {
-						this.log("WARNING: connecting over unencrypted HTTP to a remote host — token sent in plaintext");
+						this.log("WARNING: connecting over unencrypted HTTP to a remote host — device credential sent in plaintext");
 						new Notice(
-							"Connecting over unencrypted HTTP. Your token will be sent in plaintext. Use HTTPS for production.",
+							"Connecting over unencrypted HTTP. Your device credential will be sent in plaintext. Use HTTPS for production.",
 							8000,
 						);
 					}
@@ -648,7 +639,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			if (abortIfStale("attachment teardown")) return;
 			this.trace("trace", "startup-init-sync-start", {
 				hostConfigured: !!this.settings.host,
-				tokenConfigured: !!this.settings.token,
+				deviceTokenConfigured: !!this.settings.deviceToken,
 				hasCachedCapabilities: this.capabilityUpdateService?.hasCachedCapabilities ?? false,
 			});
 
@@ -658,9 +649,13 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				return;
 			}
 
-			// 1. Create VaultSync (Y.Doc + IndexedDB + provider in parallel)
+			// 1. Create VaultSync (Y.Doc + folder-scoped IndexedDB + provider in parallel)
+			const folderKey = await this.ensureFolderKey();
+			const receiptGenerationHint = this.pendingReceiptGeneration;
+			this.pendingReceiptGeneration = undefined;
 			this.vaultSync = new VaultSync(this.settings, {
-				traceContext: this.getTraceHttpContext(),
+				folderKey,
+				receiptGenerationHint,
 				trace: (source, msg, details) => this.trace(source, msg, details),
 				onFlightEvent: (event) => this.recordFlightEvent(event as FlightEventInput),
 				onFlightPathEvent: (event) => this.recordFlightPathEvent(event),
@@ -675,49 +670,15 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					expiresAt: number;
 					localExpiresAt: number;
 					ttlMs: number;
-				} | null> => {
-					const socketTicketAuth =
-						this.capabilityUpdateService?.capabilities?.socketTicketAuth;
-
-					// Known old server that explicitly signals no ticket support.
-					if (socketTicketAuth === false) return null;
-
-					// Already confirmed this server does not have the ticket
-					// endpoint — skip the network probe.
-					if (ticketCache.isUnsupported()) return null;
-
-					// socketTicketAuth === true  → confirmed support.
-					// socketTicketAuth === undefined → capability not yet fetched
-					//   (first run, empty cache, slow background poll).
-					// Both: try the ticket endpoint.
-					//
-					// On a clean "endpoint not found" signal (404/405/501) from an
-					// unknown-capability server, mark the cache unsupported and fall
-					// back to ?token= for this connection.  Any other failure (auth,
-					// network, 5xx) must propagate — never silently downgrade to the
-					// long-lived token.
-					//
-					// force=true is used by VaultSync's proactive refresh timer to
-					// bypass the cache and always obtain a fresh ticket.
+				}> => {
 					if (force) ticketCache.invalidate();
-
 					try {
 						return await ticketCache.get(
 							this.settings.host,
-							this.settings.token,
+							this.settings.deviceToken,
 							this.settings.vaultId,
 						);
 					} catch (err) {
-						if (
-							socketTicketAuth === undefined
-							&& isTicketEndpointUnsupported(err)
-						) {
-							// Old server confirmed: stop probing on future reconnects.
-							ticketCache.markUnsupported();
-							this.log("socket ticket endpoint not found; using legacy ?token= for this connection");
-							return null;
-						}
-						// Real failure — propagate.
 						this.log(`socket ticket fetch failed: ${String(err)}`);
 						throw err;
 					}
@@ -1021,6 +982,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			this.log("Waiting for provider sync...");
 			const providerSynced = await this.vaultSync.waitForProviderSync();
 			if (abortIfStale("provider synchronization")) return;
+			if (providerSynced) {
+				await this.vaultSync.finalizeServerAckTrackingAfterProviderSync();
+				if (abortIfStale("server receipt generation finalization")) return;
+			}
 			this.log(`Provider: ${providerSynced ? "synced" : "timed out (offline)"}`);
 			this.awaitingFirstProviderSyncAfterStartup = !providerSynced;
 			this.log(
@@ -1546,7 +1511,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				}
 
 				try {
-					await VaultSync.deleteIdb(vaultId);
+					await VaultSync.deleteIdb(vaultId, await this.ensureFolderKey());
 					this.log("Reset cache: IDB deleted");
 				} catch (err) {
 					console.error("[yaos] Failed to delete IDB:", err);
@@ -1578,10 +1543,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 				// Clear CRDT maps before teardown so deletions propagate while connected.
 				const counts = this.vaultSync!.clearAllMaps();
+				this.pendingReceiptGeneration = this.vaultSync!.roomGeneration;
 				this.log(
 					`Nuclear reset: cleared ${counts.pathCount} paths, ` +
 					`${counts.idCount} texts, ${counts.metaCount} meta, ` +
-					`${counts.blobCount} blob paths`,
+					`${counts.blobCount} blob paths, generation=${this.pendingReceiptGeneration}`,
 				);
 
 				await new Promise((r) => window.setTimeout(r, 500));
@@ -1596,7 +1562,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				}
 
 				try {
-					await VaultSync.deleteIdb(vaultId);
+					await VaultSync.deleteIdb(vaultId, await this.ensureFolderKey());
 					this.log("Nuclear reset: IDB deleted");
 				} catch (err) {
 					console.error("[yaos] Failed to delete IDB:", err);
@@ -2020,7 +1986,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		await this.persistPluginState();
 		this.applyRuntimeSettings(reason);
 		this.refreshStatusBar();
-		void this.syncUpdateMetadataToServer(reason);
+
 	}
 
 	async updateSettings(
@@ -2048,9 +2014,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		});
 	}
 
-	get serverAuthMode(): ServerCapabilities["authMode"] | "unknown" {
-		return this.capabilityUpdateService?.authMode ?? "unknown";
-	}
 
 	get serverSupportsAttachments(): boolean {
 		return this.capabilityUpdateService?.supportsAttachments ?? true;
@@ -2064,47 +2027,283 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		return this.capabilityUpdateService?.capabilities?.maxBlobUploadBytes ?? null;
 	}
 
-	buildSetupDeepLink(): string | null {
-		const host = this.settings.host?.trim().replace(/\/$/, "");
-		const token = this.settings.token?.trim();
-		const vaultId = this.settings.vaultId?.trim();
-		if (!host || !token || !vaultId) return null;
-		const params = new URLSearchParams({
-			action: "setup",
-			host,
-			token,
-			vaultId,
-		});
-		return `obsidian://yaos?${params.toString()}`;
+	async mintDevicePairing(): Promise<{ deepLink: string; mobileUrl: string } | null> {
+		const host = this.settings.host.trim().replace(/\/$/, "");
+		const deviceToken = this.settings.deviceToken.trim();
+		const vaultId = this.settings.vaultId.trim();
+		if (!host || !deviceToken || !vaultId || !this.settings.deviceId.trim()) return null;
+		try {
+			const res = await obsidianRequest({
+				url: `${host}/vault/${encodeURIComponent(vaultId)}/auth/pairing-code`,
+				method: "POST",
+				headers: {
+					Authorization: `Bearer ${deviceToken}`,
+					"Content-Type": "application/json",
+				},
+				body: JSON.stringify({ purpose: "device" }),
+			});
+			const body: unknown = res.json;
+			const deepLink = body && typeof body === "object" && "obsidianUrl" in body && typeof body.obsidianUrl === "string"
+				? body.obsidianUrl
+				: "";
+			const mobileUrl = body && typeof body === "object" && "mobileSetupUrl" in body && typeof body.mobileSetupUrl === "string"
+				? body.mobileSetupUrl
+				: "";
+			const message = body && typeof body === "object" && "message" in body && typeof body.message === "string"
+				? body.message
+				: "";
+			if (res.status !== 200 || !deepLink || !mobileUrl) {
+				new Notice(message || "Could not mint a pairing code.", 7000);
+				return null;
+			}
+			return { deepLink, mobileUrl };
+		} catch (err) {
+			new Notice(err instanceof Error ? err.message : "Could not mint a pairing code.", 7000);
+			return null;
+		}
 	}
 
-	buildMobileSetupUrl(): string | null {
-		const host = this.settings.host?.trim().replace(/\/$/, "");
-		const token = this.settings.token?.trim();
-		const vaultId = this.settings.vaultId?.trim();
-		if (!host || !token || !vaultId) return null;
-		const hash = new URLSearchParams({
-			host,
-			token,
-			vaultId,
-		});
-		return `${host}/mobile-setup#${hash.toString()}`;
+	async renameThisDevice(name: string): Promise<void> {
+		const host = this.settings.host.trim().replace(/\/$/, "");
+		const deviceToken = this.settings.deviceToken.trim();
+		const vaultId = this.settings.vaultId.trim();
+		if (!host || !deviceToken || !vaultId || !name) return;
+		try {
+			const res = await obsidianRequest({
+				url: `${host}/vault/${encodeURIComponent(vaultId)}/auth/device`,
+				method: "POST",
+				headers: {
+					Authorization: `Bearer ${deviceToken}`,
+					"Content-Type": "application/json",
+				},
+				body: JSON.stringify({ name }),
+			});
+			if (res.status === 200) return;
+			const body: unknown = res.json;
+			const message = body && typeof body === "object" && "message" in body && typeof body.message === "string"
+				? body.message
+				: "Could not rename this device.";
+			new Notice(message, 7000);
+		} catch (err) {
+			new Notice(err instanceof Error ? err.message : "Could not rename this device.", 7000);
+		}
 	}
 
-	buildRecoveryKitText(): string | null {
-		const host = this.settings.host?.trim().replace(/\/$/, "");
-		const token = this.settings.token?.trim();
-		const vaultId = this.settings.vaultId?.trim();
-		if (!host || !token || !vaultId) return null;
+	getFolderName(): string {
+		return this.app.vault.getName();
+	}
+
+	async enrollByPaste(host: string, pairingCode: string): Promise<boolean> {
+		return await this.setupLinkController?.enrollWithCode(host, pairingCode) ?? false;
+	}
+
+	private async retireCurrentEnrollment(membership: EnrollmentMembership): Promise<void> {
+		if (
+			membership.host &&
+			membership.deviceToken &&
+			membership.vaultId &&
+			membership.deviceId
+		) {
+			try {
+				const res = await obsidianRequest({
+					url: `${membership.host}/vault/${encodeURIComponent(membership.vaultId)}/auth/device`,
+					method: "DELETE",
+					headers: { Authorization: `Bearer ${membership.deviceToken}` },
+				});
+				if (res.status !== 200 && res.status !== 401) {
+					new Notice(
+						"Could not remove the old server membership. Remove it from the old server console.",
+						9000,
+					);
+				}
+			} catch {
+				new Notice(
+					"Could not remove the old server membership. Remove it from the old server console.",
+					9000,
+				);
+			}
+		}
+
+		await this.clearServerReceiptCandidate(membership);
+		try {
+			await this.teardownSync();
+		} catch (err) {
+			console.error("[yaos] Re-enrollment teardown completed with errors:", err);
+		}
+		if (membership.vaultId) {
+			try {
+				await VaultSync.deleteIdb(membership.vaultId, await this.ensureFolderKey());
+			} catch (err) {
+				console.error("[yaos] Failed to delete old enrollment IDB:", err);
+			}
+		}
+	}
+
+	private async clearServerReceiptCandidate(membership: EnrollmentMembership): Promise<void> {
+		try {
+			await this.vaultSync?.clearLocalServerReceiptState();
+			if (membership.host && membership.vaultId && membership.deviceId) {
+				await VaultSync.clearServerReceiptCandidate(
+					membership.host,
+					membership.vaultId,
+					membership.deviceId,
+				);
+			}
+		} catch (err) {
+			console.error("[yaos] Failed to clear server receipt candidate:", err);
+		}
+	}
+
+	openServerConsole(): void {
+		const host = this.settings.host.trim().replace(/\/$/, "");
+		if (!host) {
+			new Notice("Configure a server URL first.");
+			return;
+		}
+		window.open(host, "_blank", "noopener");
+	}
+
+	getVaultRoster(): VaultRosterDevice[] {
+		return this.vaultRoster;
+	}
+
+	isDeviceOnline(deviceId: string): boolean {
+		if (!deviceId) return false;
+		const awareness = this.vaultSync?.provider.awareness;
+		if (!awareness) return false;
+		for (const state of awareness.getStates().values() as IterableIterator<unknown>) {
+			if (!state || typeof state !== "object" || !("user" in state)) continue;
+			const user = state.user;
+			if (user && typeof user === "object" && "id" in user && user.id === deviceId) return true;
+		}
+		return false;
+	}
+
+	async refreshVaultRoster(): Promise<void> {
+		const host = this.settings.host.trim().replace(/\/$/, "");
+		const deviceToken = this.settings.deviceToken.trim();
+		const vaultId = this.settings.vaultId.trim();
+		if (this.rosterVaultId !== vaultId) {
+			this.vaultRoster = [];
+			this.rosterVaultId = vaultId;
+		}
+		if (!host || !deviceToken || !vaultId) {
+			this.vaultRoster = [];
+			return;
+		}
+		try {
+			const res = await obsidianRequest({
+				url: `${host}/vault/${encodeURIComponent(vaultId)}/devices`,
+				method: "GET",
+				headers: { Authorization: `Bearer ${deviceToken}` },
+			});
+			if (this.settings.vaultId.trim() !== vaultId) return;
+			if (res.status !== 200) {
+				this.vaultRoster = [];
+				new Notice("Could not load the device roster.", 7000);
+				return;
+			}
+			const raw: unknown = res.json;
+			if (!raw || typeof raw !== "object" || !("devices" in raw) || !Array.isArray(raw.devices)) {
+				this.vaultRoster = [];
+				return;
+			}
+			this.vaultRoster = raw.devices.flatMap((item: unknown): VaultRosterDevice[] => {
+				if (!item || typeof item !== "object") return [];
+				if (!("deviceId" in item) || typeof item.deviceId !== "string") return [];
+				if (!("name" in item) || typeof item.name !== "string") return [];
+				return [{
+					deviceId: item.deviceId,
+					name: item.name,
+					enrolledAt: "enrolledAt" in item && typeof item.enrolledAt === "number" ? item.enrolledAt : undefined,
+					lastSeenAt: "lastSeenAt" in item && typeof item.lastSeenAt === "number" ? item.lastSeenAt : undefined,
+				}];
+			});
+		} catch (err) {
+			if (this.settings.vaultId.trim() === vaultId) this.vaultRoster = [];
+			new Notice(err instanceof Error ? err.message : "Could not load the device roster.", 7000);
+		}
+	}
+
+	async leaveThisVault(): Promise<void> {
+		new ConfirmModal(
+			this.app,
+			"Leave this vault",
+			"This device stops syncing; notes stay on disk.",
+			() => { void this.completeLeaveThisVault(); },
+			"Leave",
+		).open();
+	}
+
+	private async completeLeaveThisVault(): Promise<void> {
+		const host = this.settings.host.trim().replace(/\/$/, "");
+		const deviceToken = this.settings.deviceToken.trim();
+		const vaultId = this.settings.vaultId.trim();
+		const deviceId = this.settings.deviceId.trim();
+		if (host && deviceToken && vaultId) {
+			try {
+				const res = await obsidianRequest({
+					url: `${host}/vault/${encodeURIComponent(vaultId)}/auth/device`,
+					method: "DELETE",
+					headers: { Authorization: `Bearer ${deviceToken}` },
+				});
+				if (res.status !== 200 && res.status !== 401) {
+					new Notice("Could not revoke this device on the server. Leaving locally.", 7000);
+				}
+			} catch (err) {
+				const message = err instanceof Error ? err.message : "Could not revoke this device on the server.";
+				new Notice(`${message} Leaving locally.`, 7000);
+			}
+		}
+
+		await this.clearServerReceiptCandidate({
+			host,
+			deviceToken,
+			vaultId,
+			deviceId,
+		});
+
+		try {
+			await this.teardownSync();
+		} catch (err) {
+			console.error("[yaos] Leave teardown completed with errors:", err);
+		}
+		if (vaultId) {
+			try {
+				await VaultSync.deleteIdb(vaultId, await this.ensureFolderKey());
+			} catch (err) {
+				console.error("[yaos] Failed to delete IDB on leave:", err);
+			}
+		}
+		this.vaultRoster = [];
+		this.rosterVaultId = "";
+		await this.updateSettings((settings) => {
+			settings.host = "";
+			settings.deviceToken = "";
+			settings.vaultId = "";
+			settings.deviceId = "";
+		}, "leave-vault");
+		new Notice("Left this vault. Notes are still on disk.", 7000);
+	}
+
+	private async ensureFolderKey(): Promise<string> {
+		if (this.folderKey) return this.folderKey;
+		this.folderKey = await computeFolderKey(folderKeySeedFromVault(this.app.vault));
+		return this.folderKey;
+	}
+
+	buildDeviceCredentialsText(): string | null {
+		const host = this.settings.host.trim().replace(/\/$/, "");
+		const deviceToken = this.settings.deviceToken.trim();
+		const vaultId = this.settings.vaultId.trim();
+		const deviceId = this.settings.deviceId.trim();
+		if (!host || !deviceToken || !vaultId || !deviceId) return null;
 		return [
-			"YAOS Recovery Kit",
-			`Created: ${new Date().toISOString()}`,
-			"",
+			"YAOS Device Credentials",
 			`Host: ${host}`,
-			`Token: ${token}`,
 			`Vault ID: ${vaultId}`,
-			"",
-			"Keep this in a password manager. You need host + token + vault ID to recover this sync room on a new device.",
+			`Device ID: ${deviceId}`,
+			`Device token: ${deviceToken}`,
 		].join("\n");
 	}
 
@@ -2151,40 +2350,14 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		return this.capabilityUpdateService?.buildGithubUpdaterBootstrapUrl() ?? null;
 	}
 
-	private async syncUpdateMetadataToServer(reason: string): Promise<void> {
-		await this.capabilityUpdateService?.syncUpdateMetadataToServer(reason);
+
+	private showFatalSyncNotice(): void {
+		const notice = getFatalSyncNotice(
+			this.vaultSync?.fatalAuthCode ?? null,
+			this.vaultSync?.fatalAuthDetails ?? null,
+		);
+		new Notice(notice.message, notice.timeout);
 	}
-
-		private showFatalSyncNotice(): void {
-			const code = this.vaultSync?.fatalAuthCode;
-			if (code === "unclaimed") {
-				new Notice(
-					"This server is unclaimed. Open the server URL in a browser, then use the setup link.",
-					10000,
-				);
-				return;
-			}
-
-			if (code === "server_misconfigured") {
-				new Notice("Server misconfigured.");
-				return;
-			}
-		if (code === "update_required") {
-			const details = this.vaultSync?.fatalAuthDetails;
-			const detailText =
-				details && (details.roomSchemaVersion !== null || details.clientSchemaVersion !== null)
-					? ` (client=${details.clientSchemaVersion ?? "unknown"}, room=${details.roomSchemaVersion ?? "unknown"})`
-					: "";
-			new Notice(
-				`YAOS: this vault was upgraded by a newer plugin schema${detailText}. ` +
-				"Update YAOS on this device to continue syncing.",
-				12000,
-			);
-			return;
-		}
-
-			new Notice("Unauthorized. Check your token in settings.");
-		}
 
 	private async saveDiskIndex(): Promise<void> {
 		const persistedAt = Date.now();

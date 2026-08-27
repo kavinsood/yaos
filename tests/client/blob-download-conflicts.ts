@@ -173,7 +173,7 @@ function makeHarness() {
 		makeVaultSyncFixture(),
 		{
 			host: "https://worker.example",
-			token: "token",
+			deviceToken: "device-token",
 			vaultId: "vault",
 			maxAttachmentSizeKB: 1024,
 			attachmentConcurrency: 1,

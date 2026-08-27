@@ -39,6 +39,7 @@ export interface ServerAckState {
 export class ServerAckTracker {
 	private _lastUnconfirmedCandidateSv: Uint8Array | null = null;
 	private _candidateCapturedAt: number | null = null;
+	private _hasLiveCandidateThisSession = false;
 	private _serverAppliedLocalState: boolean | null = null;
 	private _lastServerReceiptEchoAt: number | null = null;
 	private _lastKnownServerReceiptEchoAt: number | null = null;
@@ -111,6 +112,7 @@ export class ServerAckTracker {
 			if (isAckTrackedLocalOrigin(origin, provider, persistence)) {
 				this._lastUnconfirmedCandidateSv = encodeStateVector();
 				this._candidateCapturedAt = Date.now();
+				this._hasLiveCandidateThisSession = true;
 				this._serverAppliedLocalState = false;
 				// Baseline for the durability check.  The candidate is confirmed
 				// only once the server reports a persist counter beyond this.
@@ -142,44 +144,70 @@ export class ServerAckTracker {
 	}
 
 	/**
-	 * Load persisted candidate state. Call after IDB has loaded CRDT state so
-	 * encodeStateVector() reflects the fully-loaded document.
-	 *
-	 * Persisted serverAppliedLocalState=true is NOT restored as active truth —
-	 * Level 3 is not durable. Candidate is validated against the current doc SV
-	 * and active state stays null until a fresh server echo revalidates it.
+	 * Bind persistence after the receipt generation is authoritative.
+	 * Local capture is attached earlier, so a candidate created while the
+	 * generation is unknown is carried into the final scope. Persisted state
+	 * from a different generation is never carried across the rotation.
 	 */
-	async onStartup(store: CandidateStore, scope: ScopeKey & ScopeMetadata): Promise<void> {
+	async bindPersistence(
+		store: CandidateStore,
+		scope: ScopeKey & ScopeMetadata,
+		options: { loadPersisted?: boolean } = {},
+	): Promise<void> {
+		await this._persistChain;
+		const scopeChanged = this._scope !== null && !scopeKeysEqual(this._scope, scope);
+		if (scopeChanged) {
+			this._generationAtCapture = null;
+			this._lastSeenServerGeneration = null;
+			this._lastServerGenerationEpoch = null;
+			this._lastServerReceiptEchoAt = null;
+			this._lastKnownServerReceiptEchoAt = null;
+			if (this._hasLiveCandidateThisSession) {
+				this._serverAppliedLocalState = false;
+			} else {
+				this._lastUnconfirmedCandidateSv = null;
+				this._candidateCapturedAt = null;
+				this._serverAppliedLocalState = null;
+			}
+		}
+
 		this._store = store;
 		this._scope = scope;
 
-		let stored: PersistedCandidateState | null;
-		try {
-			stored = await store.load(scope);
-		} catch {
-			this.trace?.("receipt", "receipt-startup-load-failed", {
-				scopeKnown: Boolean(scope.vaultIdHash && scope.serverHostHash && scope.localDeviceId),
-			});
-			stored = null;
+		let stored: PersistedCandidateState | null = null;
+		if (options.loadPersisted !== false) {
+			try {
+				stored = await store.load(scope);
+			} catch {
+				this.trace?.("receipt", "receipt-startup-load-failed", {
+					scopeKnown: Boolean(scope.vaultIdHash && scope.serverHostHash && scope.localDeviceId),
+				});
+			}
 		}
 
-		if (!stored || !stored.candidateSvBase64) return;
-
-		const sv = decodeBytesBase64(stored.candidateSvBase64);
-		if (!sv) return; // corrupt base64 — fail closed
-
-		// attach() runs before persisted startup validation so early local edits
-		// are not missed. If such a live candidate exists, startup must not
-		// overwrite it with older persisted state.
-		if (this._lastUnconfirmedCandidateSv === null) {
-			this._lastUnconfirmedCandidateSv = sv;
-			this._candidateCapturedAt = stored.candidateCapturedAt;
-			// Active state is always null after startup — never restore true.
-			this._serverAppliedLocalState = null;
+		if (stored) {
+			this._lastKnownServerReceiptEchoAt = stored.lastKnownServerReceiptEchoAt;
+			if (!this._hasLiveCandidateThisSession && stored.candidateSvBase64) {
+				const sv = decodeBytesBase64(stored.candidateSvBase64);
+				if (sv) {
+					this._lastUnconfirmedCandidateSv = sv;
+					this._candidateCapturedAt = stored.candidateCapturedAt;
+					// Active state is always null after loading persisted state.
+					this._serverAppliedLocalState = null;
+					this._validateCandidateAgainstDoc();
+				}
+			}
 		}
-		this._lastKnownServerReceiptEchoAt = stored.lastKnownServerReceiptEchoAt;
 
-		this._validateCandidateAgainstDoc();
+		if (this._hasLiveCandidateThisSession) {
+			this._persistAsync();
+			await this._persistChain;
+		}
+	}
+
+	/** Backwards-compatible startup entry point for an already-known scope. */
+	async onStartup(store: CandidateStore, scope: ScopeKey & ScopeMetadata): Promise<void> {
+		await this.bindPersistence(store, scope);
 	}
 
 	/**
@@ -337,16 +365,18 @@ export class ServerAckTracker {
 		this._generationAtCapture = null;
 		this._lastUnconfirmedCandidateSv = null;
 		this._candidateCapturedAt = null;
+		this._hasLiveCandidateThisSession = false;
 		this._serverAppliedLocalState = null;
 		this._lastServerReceiptEchoAt = null;
 		this._lastKnownServerReceiptEchoAt = null;
 		this._candidatePersistenceFailureCount = 0;
-		if (clearStore && this._store) {
+		const store = this._store;
+		if (clearStore && store) {
 			// Enqueue the clear through the same persistence chain so it
 			// cannot race with in-flight saves. A slow save that lands
 			// after a direct clear would resurrect stale state.
 			await this._enqueuePersistence(async () => {
-				await this._store!.clear();
+				await store.clear();
 			});
 		}
 	}
@@ -434,11 +464,12 @@ export class ServerAckTracker {
 	}
 
 	private _persistAsync(): void {
-		if (!this._store || !this._scope) return;
+		const store = this._store;
+		if (!store || !this._scope) return;
 		// Serialize persistence writes through a promise chain to prevent
 		// out-of-order completions from clobbering newer state with older state.
 		const state: PersistedCandidateState = {
-			schema: 1,
+			schema: 2,
 			...this._scope,
 			candidateSvBase64: this._lastUnconfirmedCandidateSv
 				? encodeBytesBase64(this._lastUnconfirmedCandidateSv)
@@ -447,7 +478,16 @@ export class ServerAckTracker {
 			lastKnownServerReceiptEchoAt: this._lastKnownServerReceiptEchoAt,
 		};
 		void this._enqueuePersistence(async () => {
-			await this._store!.save(state);
+			await store.save(state);
 		});
 	}
+}
+
+function scopeKeysEqual(left: ScopeKey, right: ScopeKey): boolean {
+	return left.vaultIdHash === right.vaultIdHash
+		&& left.serverHostHash === right.serverHostHash
+		&& left.localDeviceId === right.localDeviceId
+		&& left.roomName === right.roomName
+		&& left.roomGeneration === right.roomGeneration
+		&& left.docSchemaVersion === right.docSchemaVersion;
 }

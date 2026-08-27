@@ -70,7 +70,7 @@ export type FlightEventBase = {
 	/**
 	 * data must NEVER contain these keys in safe/qa-safe mode:
 	 * path, requestedPath, resolvedPath, oldPath, newPath,
-	 * host, token, vaultId, deviceName, qaTraceSecret
+	 * host, deviceToken, vaultId, deviceName, qaTraceSecret
 	 */
 	data?: Record<string, unknown>;
 };

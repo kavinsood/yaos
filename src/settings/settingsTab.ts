@@ -7,14 +7,13 @@ import {
 	type SettingDefinitionItem,
 } from "obsidian";
 import { PairDeviceModal } from "./PairDeviceModal";
-import { RecoveryKitModal } from "./RecoveryKitModal";
+import { DeviceCredentialsModal } from "./DeviceCredentialsModal";
 import {
 	attachmentSizeCapKB,
 	type ExternalEditPolicy,
 	type VaultSyncSettings,
 } from "./settingsStore";
 
-type SettingsAuthMode = "env" | "claim" | "unclaimed" | "unknown";
 
 type DeclarativeSettingKey =
 	| "deviceName"
@@ -25,8 +24,7 @@ type DeclarativeSettingKey =
 	| "attachmentConcurrency"
 	| "showRemoteCursors"
 	| "host"
-	| "token"
-	| "vaultId"
+	| "pairingCode"
 	| "updateRepoUrl"
 	| "updateRepoBranch"
 	| "externalEditPolicy"
@@ -47,9 +45,15 @@ interface SettingsUpdateState {
 	pluginCompatibilityWarning: string | null;
 }
 
+export interface VaultRosterDevice {
+	deviceId: string;
+	name: string;
+	enrolledAt?: number;
+	lastSeenAt?: number;
+}
+
 export interface VaultSyncSettingsHost {
 	settings: VaultSyncSettings;
-	serverAuthMode: SettingsAuthMode;
 	serverSupportsAttachments: boolean;
 	serverMaxBlobUploadBytes: number | null;
 	updateSettings(mutator: (settings: VaultSyncSettings) => void, reason?: string): Promise<void>;
@@ -58,9 +62,16 @@ export interface VaultSyncSettingsHost {
 	refreshAttachmentSyncRuntime(reason?: string): Promise<void>;
 	getSettingsStatusSummary(): { label: string };
 	getUpdateState(): SettingsUpdateState;
-	buildSetupDeepLink(): string | null;
-	buildMobileSetupUrl(): string | null;
-	buildRecoveryKitText(): string | null;
+	mintDevicePairing(): Promise<{ deepLink: string; mobileUrl: string } | null>;
+	buildDeviceCredentialsText(): string | null;
+	renameThisDevice(name: string): Promise<void>;
+	enrollByPaste(host: string, pairingCode: string): Promise<boolean>;
+	leaveThisVault(): Promise<void>;
+	openServerConsole(): void;
+	getFolderName(): string;
+	getVaultRoster(): VaultRosterDevice[];
+	refreshVaultRoster(): Promise<void>;
+	isDeviceOnline(deviceId: string): boolean;
 }
 
 const CLOUDFLARE_DEPLOY_URL = "https://deploy.workers.cloudflare.com/?url=https://github.com/kavinsood/yaos/tree/main/server";
@@ -70,18 +81,6 @@ const EXTERNAL_EDIT_OPTIONS: Record<ExternalEditPolicy, string> = {
 	"closed-only": "Only when file is closed",
 	never: "Never import",
 };
-
-function isInsecureRemoteHost(host: string): boolean {
-	if (!host) return false;
-	try {
-		const url = new URL(host);
-		if (url.protocol !== "http:") return false;
-		const hostname = url.hostname;
-		return hostname !== "localhost" && hostname !== "127.0.0.1" && hostname !== "[::1]";
-	} catch {
-		return false;
-	}
-}
 
 function shortenMiddle(value: string, maxLength = 36): string {
 	if (value.length <= maxLength) return value;
@@ -114,7 +113,20 @@ function isExternalEditPolicy(value: string): value is ExternalEditPolicy {
 	return value === "always" || value === "closed-only" || value === "never";
 }
 
+function formatRosterLastSeen(lastSeenAt?: number): string {
+	if (typeof lastSeenAt !== "number" || !Number.isFinite(lastSeenAt) || lastSeenAt <= 0) {
+		return "Last seen unknown";
+	}
+	const deltaMs = Date.now() - lastSeenAt;
+	if (deltaMs < 60_000) return "Last seen just now";
+	if (deltaMs < 3_600_000) return `Last seen ${Math.floor(deltaMs / 60_000)}m ago`;
+	if (deltaMs < 86_400_000) return `Last seen ${Math.floor(deltaMs / 3_600_000)}h ago`;
+	return `Last seen ${new Date(lastSeenAt).toISOString()}`;
+}
+
 export class VaultSyncSettingTab extends PluginSettingTab {
+	private pairingCode = "";
+	private lastRosterVaultId = "";
 	constructor(
 		app: App,
 		plugin: Plugin,
@@ -124,7 +136,10 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 	}
 
 	getSettingDefinitions(): SettingDefinitionItem[] {
-		const setupIncomplete = !this.host.settings.host || !this.host.settings.token;
+		const setupIncomplete = !this.host.settings.host.trim()
+			|| !this.host.settings.deviceToken.trim()
+			|| !this.host.settings.vaultId.trim()
+			|| !this.host.settings.deviceId.trim();
 		const attachmentsAvailable = this.host.serverSupportsAttachments;
 		const attachmentCapKB = attachmentSizeCapKB(this.host.serverMaxBlobUploadBytes);
 		const syncStatus = this.host.getSettingsStatusSummary();
@@ -132,13 +147,29 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 		const definitions: SettingDefinitionItem[] = [];
 
 		if (setupIncomplete) {
+			this.lastRosterVaultId = "";
 			definitions.push({
 				type: "group",
 				heading: "Setup",
 				items: [
 					{
-						name: "Setup required",
-						desc: "Deploy and claim a free sync server, then open its setup link to configure Yaos.",
+						name: "Join this folder",
+						desc: "Enter the server URL and one-shot pairing code for the vault this Obsidian folder should join.",
+					},
+					{
+						name: "Server URL",
+						desc: "The Worker URL from the operator console or pairing page.",
+						control: { type: "text", key: "host", placeholder: "https://sync.example.com" },
+					},
+					{
+						name: "Pairing code",
+						desc: "One-shot code. It works once and expires in 15 minutes.",
+						control: { type: "text", key: "pairingCode", placeholder: "Paste the pairing code" },
+					},
+					{
+						name: "Enroll",
+						desc: "Join this folder as a device on that vault.",
+						action: () => { void this.submitEnrollment(); },
 					},
 					{
 						name: "Deploy your server",
@@ -151,20 +182,32 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 			const statusItems: SettingDefinition[] = [
 				{ name: "Status", desc: syncStatus.label },
 				{ name: "Server", desc: this.host.settings.host },
-				{ name: "Vault", desc: shortenMiddle(this.host.settings.vaultId || "Not set") },
+				{ name: "Folder", desc: this.host.getFolderName() },
+				{ name: "Vault ID", desc: shortenMiddle(this.host.settings.vaultId) },
 				{ name: "This device", desc: this.host.settings.deviceName || "Unnamed" },
 				{
 					name: "Pair another device",
-					desc: "Open a setup code and link for another device.",
-					action: () => this.openPairing(),
+					desc: "Mint a one-shot pairing code and server-provided setup links.",
+					action: () => { void this.openPairing(); },
 				},
 				{
-					name: "Back up connection details",
-					desc: "Open a recovery kit containing this vault's connection details.",
-					action: () => this.openRecoveryKit(),
+					name: "Device credentials",
+					desc: "Export only this device's host, vault ID, device ID, and device token.",
+					action: () => this.openDeviceCredentials(),
+				},
+				{
+					name: "Open server console",
+					desc: "Open this Worker in a browser. The operator key stays in the console.",
+					action: () => this.host.openServerConsole(),
+				},
+				{
+					name: "Leave this vault",
+					desc: "Revoke this device when possible, stop syncing, and keep notes on disk.",
+					action: () => { void this.host.leaveThisVault(); },
 				},
 			];
 			definitions.push({ type: "group", heading: "Sync status", items: statusItems });
+			definitions.push(this.buildRosterGroup());
 
 			const updateSummary = updateState.serverUpdateAvailable
 				? "A server update is available."
@@ -215,8 +258,8 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 				heading: "This device",
 				items: [
 					{
-						name: "Device name",
-						desc: "Shown to other devices in live cursors and presence.",
+						name: "Rename this device",
+						desc: "Shown to other devices in live cursors, presence, and the roster.",
 						control: { type: "text", key: "deviceName", placeholder: "My laptop" },
 					},
 				],
@@ -320,74 +363,38 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 			],
 		});
 
-		definitions.push(
-			{
-				type: "page",
-				name: "Manual connection",
-				desc: "View or change this vault's server connection.",
-				displayValue: () => this.host.settings.host || "Not configured",
-				status: () => (!this.host.settings.host || !this.host.settings.token ? "warning" : null),
-				items: [
-					{
-						name: "Server URL",
-						desc: "Usually filled automatically by the setup flow.",
-						control: { type: "text", key: "host", placeholder: "Paste the server URL" },
-					},
-					{
-						name: "Unencrypted connection",
-						desc: "This remote connection sends the sync token in plaintext. Use HTTPS for production.",
-						visible: () => isInsecureRemoteHost(this.host.settings.host),
-					},
-					{
-						name: "Sync token",
-						desc: this.tokenDescription(),
-						control: { type: "text", key: "token", placeholder: "Paste your sync token" },
-					},
-				],
-			},
-			{
-				type: "page",
-				name: "Advanced",
-				desc: "Vault identity, deployment metadata, external edits, safety, and diagnostics.",
-				items: [
-					{
-						name: "Vault ID",
-						desc: "Devices syncing the same vault must use exactly the same vault ID.",
-						control: { type: "text", key: "vaultId", placeholder: "Generated automatically" },
-					},
-					{
-						name: "Deployment repository URL",
-						desc: "Optional. The provider is inferred from this URL.",
-						control: { type: "text", key: "updateRepoUrl", placeholder: "Paste the GitHub or GitLab repository URL" },
-					},
-					{
-						name: "Deployment default branch",
-						desc: "Used for GitLab pipeline links and provider-native update helpers.",
-						control: { type: "text", key: "updateRepoBranch", placeholder: "main" },
-					},
-					{
-						name: "Edits from other apps",
-						desc: "Choose how file changes from Git, scripts, or other editors enter sync.",
-						control: { type: "dropdown", key: "externalEditPolicy", options: EXTERNAL_EDIT_OPTIONS },
-					},
-					{
-						name: "Frontmatter safety guard",
-						desc: "Pause suspicious YAML property updates before they spread.",
-						control: { type: "toggle", key: "frontmatterGuardEnabled" },
-					},
-					{
-						name: "Debug mode",
-						desc: "Record detailed sync events for an exportable diagnostics trace. Leave off for everyday use.",
-						control: { type: "toggle", key: "debug" },
-					},
-					{
-						name: "Reload required",
-						desc: "Changing the server URL, sync token, or vault ID requires reloading the plugin.",
-						searchable: false,
-					},
-				],
-			},
-		);
+		definitions.push({
+			type: "page",
+			name: "Advanced",
+			desc: "Deployment metadata, external edits, safety, and diagnostics.",
+			items: [
+				{
+					name: "Deployment repository URL",
+					desc: "Optional. The provider is inferred from this URL.",
+					control: { type: "text", key: "updateRepoUrl", placeholder: "Paste the GitHub or GitLab repository URL" },
+				},
+				{
+					name: "Deployment default branch",
+					desc: "Used for GitLab pipeline links and provider-native update helpers.",
+					control: { type: "text", key: "updateRepoBranch", placeholder: "main" },
+				},
+				{
+					name: "Edits from other apps",
+					desc: "Choose how file changes from Git, scripts, or other editors enter sync.",
+					control: { type: "dropdown", key: "externalEditPolicy", options: EXTERNAL_EDIT_OPTIONS },
+				},
+				{
+					name: "Frontmatter safety guard",
+					desc: "Pause suspicious YAML property updates before they spread.",
+					control: { type: "toggle", key: "frontmatterGuardEnabled" },
+				},
+				{
+					name: "Debug mode",
+					desc: "Record detailed sync events for an exportable diagnostics trace. Leave off for everyday use.",
+					control: { type: "toggle", key: "debug" },
+				},
+			],
+		});
 
 		return definitions;
 	}
@@ -402,8 +409,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 			case "attachmentConcurrency": return this.host.settings.attachmentConcurrency;
 			case "showRemoteCursors": return this.host.settings.showRemoteCursors;
 			case "host": return this.host.settings.host;
-			case "token": return this.host.settings.token;
-			case "vaultId": return this.host.settings.vaultId;
+			case "pairingCode": return this.pairingCode;
 			case "updateRepoUrl": return this.host.settings.updateRepoUrl;
 			case "updateRepoBranch": return this.host.settings.updateRepoBranch;
 			case "externalEditPolicy": return this.host.settings.externalEditPolicy;
@@ -415,11 +421,14 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 
 	async setControlValue(key: string, value: unknown): Promise<void> {
 		switch (key as DeclarativeSettingKey) {
-			case "deviceName":
+			case "deviceName": {
+				const nextName = expectStringValue(key, value).trim();
 				await this.host.updateSettings((settings) => {
-					settings.deviceName = expectStringValue(key, value).trim();
+					settings.deviceName = nextName;
 				}, "settings:device-name");
+				await this.host.renameThisDevice(nextName);
 				return;
+			}
 			case "excludePatterns":
 				await this.host.updateSettings((settings) => {
 					settings.excludePatterns = expectStringValue(key, value);
@@ -465,13 +474,8 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 				await this.host.updateSettings((settings) => { settings.host = expectStringValue(key, value).trim(); }, "settings:host");
 				this.update();
 				return;
-			case "token":
-				await this.host.updateSettings((settings) => { settings.token = expectStringValue(key, value).trim(); }, "settings:token");
-				this.update();
-				return;
-			case "vaultId":
-				await this.host.updateSettings((settings) => { settings.vaultId = expectStringValue(key, value).trim(); }, "settings:vault-id");
-				this.update();
+			case "pairingCode":
+				this.pairingCode = expectStringValue(key, value);
 				return;
 			case "updateRepoUrl":
 				await this.host.updateSettings((settings) => { settings.updateRepoUrl = expectStringValue(key, value).trim(); }, "settings:update-repo-url");
@@ -502,34 +506,65 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 		}
 	}
 
-	private tokenDescription(): string {
-		switch (this.host.serverAuthMode) {
-			case "unclaimed":
-				return "Leave blank until you claim the server, then use its setup link.";
-			case "env":
-				return "Must match the SYNC_TOKEN configured on the server.";
-			default:
-				return "Usually filled automatically by the setup link after you claim the server.";
+	private buildRosterGroup(): SettingDefinitionItem {
+		const vaultId = this.host.settings.vaultId.trim();
+		if (this.lastRosterVaultId !== vaultId) {
+			this.lastRosterVaultId = vaultId;
+			if (vaultId) void this.host.refreshVaultRoster().then(() => this.update());
 		}
+		const localDeviceId = this.host.settings.deviceId;
+		const items: SettingDefinition[] = this.host.getVaultRoster().map((device) => {
+			const isThis = device.deviceId === localDeviceId && localDeviceId.length > 0;
+			const online = this.host.isDeviceOnline(device.deviceId);
+			return {
+				name: `${online ? "Online · " : ""}${device.name}${isThis ? " · This device" : ""}`,
+				desc: formatRosterLastSeen(device.lastSeenAt),
+			};
+		});
+		if (items.length === 0) {
+			items.push({ name: "No devices loaded", desc: "Refresh to load the enrolled device roster." });
+		}
+		items.push({
+			name: "Refresh roster",
+			desc: "Reload enrolled devices, online presence, and last-seen times.",
+			action: () => { void this.host.refreshVaultRoster().then(() => this.update()); },
+		});
+		return { type: "group", heading: "On this vault", items };
 	}
 
-	private openPairing(): void {
-		const deepLink = this.host.buildSetupDeepLink();
-		const mobileUrl = this.host.buildMobileSetupUrl();
-		if (!deepLink || !mobileUrl) {
-			new Notice("Configure the server URL, sync token, and vault ID before pairing.", 7000);
-			return;
+	async submitEnrollment(): Promise<boolean> {
+		const host = this.host.settings.host.trim();
+		const pairingCode = this.pairingCode.trim();
+		if (!host || !pairingCode) {
+			new Notice("Enter the server URL and pairing code.");
+			return false;
 		}
-		new PairDeviceModal(this.app, deepLink, mobileUrl).open();
+		const enrolled = await this.host.enrollByPaste(host, pairingCode);
+		const completeEnrollment = enrolled
+			&& this.host.settings.host.trim().length > 0
+			&& this.host.settings.deviceToken.trim().length > 0
+			&& this.host.settings.vaultId.trim().length > 0
+			&& this.host.settings.deviceId.trim().length > 0;
+		if (!completeEnrollment) return false;
+		this.pairingCode = "";
+		this.update();
+		return true;
 	}
 
-	private openRecoveryKit(): void {
-		const recoveryKit = this.host.buildRecoveryKitText();
-		if (!recoveryKit) {
-			new Notice("Configure the server URL, sync token, and vault ID before exporting connection details.", 7000);
+	async openPairing(): Promise<boolean> {
+		const links = await this.host.mintDevicePairing();
+		if (!links) return false;
+		new PairDeviceModal(this.app, links.deepLink, links.mobileUrl).open();
+		return true;
+	}
+
+	private openDeviceCredentials(): void {
+		const credentials = this.host.buildDeviceCredentialsText();
+		if (!credentials) {
+			new Notice("Complete device enrollment before exporting credentials.", 7000);
 			return;
 		}
-		new RecoveryKitModal(this.app, recoveryKit).open();
+		new DeviceCredentialsModal(this.app, credentials).open();
 	}
 
 	private async refreshUpdateInformation(): Promise<void> {

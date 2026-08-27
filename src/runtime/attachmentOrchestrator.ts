@@ -66,14 +66,14 @@ export class AttachmentOrchestrator {
 
 		const vaultSync = this.deps.getVaultSync();
 		if (!vaultSync) return;
-		if (!runtimeConfig.host || !runtimeConfig.token) return;
+		if (!runtimeConfig.host || !runtimeConfig.deviceToken) return;
 
 		const blobSync = new BlobSyncManager(
 			this.deps.app,
 			vaultSync,
 			{
 				host: runtimeConfig.host,
-				token: runtimeConfig.token,
+				deviceToken: runtimeConfig.deviceToken,
 				vaultId: runtimeConfig.vaultId,
 				maxAttachmentSizeKB: runtimeConfig.maxAttachmentSizeKB,
 				attachmentConcurrency: runtimeConfig.attachmentConcurrency,

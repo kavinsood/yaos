@@ -3,7 +3,7 @@ import { parseExcludePatterns } from "../sync/exclude";
 
 export interface RuntimeConfig {
 	host: string;
-	token: string;
+	deviceToken: string;
 	vaultId: string;
 	deviceName: string;
 	debug: boolean;
@@ -28,7 +28,7 @@ export function buildRuntimeConfig(
 ): RuntimeConfig {
 	return {
 		host: settings.host.trim(),
-		token: settings.token.trim(),
+		deviceToken: settings.deviceToken.trim(),
 		vaultId: settings.vaultId.trim(),
 		deviceName: settings.deviceName.trim(),
 		debug: settings.debug,

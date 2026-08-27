@@ -133,17 +133,156 @@ s.test("writes the checked-in blank workspace bytes without file state or vault 
 	assert.equal(containsMarkdownLeafOrFilePath(workspace), false);
 });
 
-s.test("creates fresh random vault IDs while keeping plugin order deterministic", async () => {
+s.test("writes an explicitly unenrolled identity by default without inventing membership", async () => {
 	const { paths, vaultParent } = await makeLayout();
 	const first = await prepareVault({ fixture: "001-known", dest: join(vaultParent, "first") }, paths);
 	const second = await prepareVault({ fixture: "001-known", dest: join(vaultParent, "second") }, paths);
-	assert.notEqual(first.vaultId, second.vaultId);
 
-	const firstSettings = JSON.parse(await readFile(join(first.dest, ".obsidian", "plugins", "yaos", "data.json"), "utf8")) as {
-		vaultId: string;
-	};
+	assert.deepEqual(first.enrollment, { status: "unenrolled" });
+	assert.deepEqual(second.enrollment, { status: "unenrolled" });
+	const firstSettings = JSON.parse(await readFile(join(first.dest, ".obsidian", "plugins", "yaos", "data.json"), "utf8")) as Record<string, unknown>;
 	const enabledPlugins = JSON.parse(await readFile(join(first.dest, ".obsidian", "community-plugins.json"), "utf8")) as string[];
-	assert.equal(firstSettings.vaultId, first.vaultId);
+	assert.equal(firstSettings.host, "");
+	assert.equal(firstSettings.deviceToken, "");
+	assert.equal(firstSettings.vaultId, "");
+	assert.equal(firstSettings.deviceId, "");
+	assert.equal("token" in firstSettings, false);
 	assert.deepEqual(enabledPlugins, ["yaos", "yaos-qa-harness"]);
+});
+
+s.test("enrolls through the real server contract and persists the returned identity", async () => {
+	const { paths, vaultParent } = await makeLayout();
+	let requestUrl = "";
+	let requestInit: RequestInit | undefined;
+	const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+		requestUrl = String(input);
+		requestInit = init;
+		return new Response(JSON.stringify({
+			deviceToken: "issued-device-secret",
+			vaultId: "server-vault",
+			deviceId: "server-device",
+			name: "QA Device",
+		}), {
+			status: 200,
+			headers: { "Content-Type": "application/json" },
+		});
+	}) as typeof fetch;
+
+	const prepared = await prepareVault({
+		fixture: "001-known",
+		dest: join(vaultParent, "paired"),
+		enrollment: {
+			mode: "pairing",
+			host: "https://sync.example/",
+			pairingCode: "one-use-code",
+			deviceName: "QA Device",
+		},
+	}, paths, fetchImpl);
+
+	assert.equal(requestUrl, "https://sync.example/enroll");
+	assert.equal(requestInit?.method, "POST");
+	assert.deepEqual(JSON.parse(String(requestInit?.body)), {
+		pairingCode: "one-use-code",
+		deviceName: "QA Device",
+	});
+	assert.deepEqual(prepared.enrollment, {
+		status: "enrolled",
+		host: "https://sync.example",
+		vaultId: "server-vault",
+		deviceId: "server-device",
+		name: "QA Device",
+	});
+	const settings = JSON.parse(await readFile(join(prepared.dest, ".obsidian", "plugins", "yaos", "data.json"), "utf8")) as Record<string, unknown>;
+	assert.equal(settings.host, "https://sync.example");
+	assert.equal(settings.deviceToken, "issued-device-secret");
+	assert.equal(settings.vaultId, "server-vault");
+	assert.equal(settings.deviceId, "server-device");
+	assert.equal(settings.deviceName, "QA Device");
+	assert.equal("token" in settings, false);
+});
+
+s.test("rejects enrollment responses that do not exactly match the credential schema", async () => {
+	const { paths, vaultParent } = await makeLayout();
+	const destination = join(vaultParent, "bad-enrollment");
+	const fetchImpl = (async () => new Response(JSON.stringify({
+		deviceToken: "issued-device-secret",
+		vaultId: "server-vault",
+		deviceId: "server-device",
+		name: "QA Device",
+		extra: true,
+	}), {
+		status: 200,
+		headers: { "Content-Type": "application/json" },
+	})) as typeof fetch;
+
+	await expectPrepareError(
+		() => prepareVault({
+			fixture: "001-known",
+			dest: destination,
+			enrollment: {
+				mode: "pairing",
+				host: "https://sync.example",
+				pairingCode: "one-use-code",
+				deviceName: "QA Device",
+			},
+		}, paths, fetchImpl),
+		"exactly deviceToken, vaultId, deviceId, and name",
+	);
+	await assert.rejects(async () => readFile(destination), { code: "ENOENT" });
+});
+
+s.test("rejects partial or mixed enrollment arguments", () => {
+	const base = ["--fixture", "001-known", "--dest", "/tmp/new-vault"];
+	assert.throws(
+		() => parsePrepareVaultArgs([...base, "--host", "https://sync.example", "--pairing-code", "code"]),
+		(error: unknown) => error instanceof PrepareVaultError && error.message.includes("--device-name"),
+	);
+	assert.throws(
+		() => parsePrepareVaultArgs([...base, "--host", "https://sync.example", "--device-token", "secret", "--vault-id", "vault"]),
+		(error: unknown) => error instanceof PrepareVaultError && error.message.includes("--device-id"),
+	);
+	assert.throws(
+		() => parsePrepareVaultArgs([
+			...base,
+			"--host", "https://sync.example",
+			"--pairing-code", "code",
+			"--device-token", "secret",
+			"--device-name", "QA Device",
+		]),
+		(error: unknown) => error instanceof PrepareVaultError && error.message.includes("cannot be combined"),
+	);
+});
+
+s.test("accepts only a complete controlled pre-enrolled identity", async () => {
+	const { paths, vaultParent } = await makeLayout();
+	const parsed = parsePrepareVaultArgs([
+		"--fixture", "001-known",
+		"--dest", join(vaultParent, "controlled"),
+		"--host", "https://sync.example",
+		"--device-token", "fixture-device-secret",
+		"--vault-id", "fixture-vault",
+		"--device-id", "fixture-device",
+		"--device-name", "Fixture Device",
+	]);
+	assert.equal(parsed.help, false);
+	if (parsed.help) throw new Error("unexpected help result");
+	const prepared = await prepareVault(parsed, paths);
+	const settings = JSON.parse(await readFile(join(prepared.dest, ".obsidian", "plugins", "yaos", "data.json"), "utf8")) as Record<string, unknown>;
+	assert.deepEqual(
+		{
+			host: settings.host,
+			deviceToken: settings.deviceToken,
+			vaultId: settings.vaultId,
+			deviceId: settings.deviceId,
+			deviceName: settings.deviceName,
+		},
+		{
+			host: "https://sync.example",
+			deviceToken: "fixture-device-secret",
+			vaultId: "fixture-vault",
+			deviceId: "fixture-device",
+			deviceName: "Fixture Device",
+		},
+	);
 });
 await s.done();

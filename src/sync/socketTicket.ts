@@ -1,32 +1,7 @@
-/**
- * Socket ticket fetch and cache for the plugin.
- *
- * Fetches a short-lived WebSocket connection ticket from the server and caches
- * it until it has less than TICKET_REFRESH_BUFFER_MS of life remaining.
- *
- * Usage in VaultSync:
- *
- *   const ticketCache = createSocketTicketCache();
- *   const getSocketTicket = (force?: boolean) => {
- *     if (force) ticketCache.invalidate();
- *     return ticketCache.get(settings.host, settings.token, settings.vaultId);
- *   };
- *
- * The cache is intentionally simple: one ticket per VaultSync instance.
- * VaultSync is recreated on settings changes (host/token/vaultId), so the
- * cache is automatically invalidated in those cases.
- *
- * VaultSync schedules a proactive provider URL refresh timer based on the
- * returned expiresAt so that reconnects always find a live ticket in
- * provider.url — y-partyserver's internal reconnect loop reuses provider.url
- * directly without re-calling params().
- */
+/** Fetches and caches the mandatory short-lived WebSocket ticket. */
 
 import { obsidianRequest } from "../utils/http";
 
-// ---------------------------------------------------------------------------
-// Typed HTTP error
-// ---------------------------------------------------------------------------
 
 /**
  * Thrown by fetchSocketTicket when the server responds with a non-200 status.
@@ -40,22 +15,6 @@ export class SocketTicketHttpError extends Error {
 	}
 }
 
-/**
- * Returns true when the ticket endpoint does not exist on this server —
- * clean "old server" signals only:
- *   404 Not Found          — endpoint was never deployed
- *   405 Method Not Allowed — endpoint exists but rejects POST
- *   501 Not Implemented    — explicit unsupported signal
- *
- * Auth failures (401, 403), server errors (500), and network failures are NOT
- * treated as unsupported.  They indicate real problems and must propagate.
- */
-export function isTicketEndpointUnsupported(err: unknown): boolean {
-	return (
-		err instanceof SocketTicketHttpError &&
-		(err.status === 404 || err.status === 405 || err.status === 501)
-	);
-}
 
 // ---------------------------------------------------------------------------
 // Cache
@@ -78,58 +37,25 @@ export interface CachedSocketTicket {
 }
 
 export interface SocketTicketCache {
-	/**
-	 * Return a usable ticket, fetching a fresh one if the cache is empty or
-	 * close to expiry.  Returns the full CachedSocketTicket so callers can
-	 * schedule a proactive refresh timer based on expiresAt.
-	 *
-	 * Throws `SocketTicketHttpError` for HTTP failures and a plain `Error` for
-	 * network/parse failures.  Callers must NOT fall back to the long-lived
-	 * token on failure — let the connection attempt fail and retry normally.
-	 *
-	 * Throws immediately if the server has already been confirmed unsupported
-	 * (see `markUnsupported`).
-	 */
-	get(host: string, token: string, vaultId: string): Promise<CachedSocketTicket>;
-	/** Discard the cached ticket, forcing a fresh fetch on the next get(). */
+	get(host: string, deviceToken: string, vaultId: string): Promise<CachedSocketTicket>;
 	invalidate(): void;
-	/**
-	 * Mark this server as confirmed-unsupported for ticket auth (i.e. the
-	 * endpoint returned 404/405/501).  Subsequent `get()` calls return
-	 * immediately without network I/O so old servers are not re-probed on
-	 * every reconnect.
-	 */
-	markUnsupported(): void;
-	/** True once `markUnsupported()` has been called. */
-	isUnsupported(): boolean;
 }
 
 export function createSocketTicketCache(): SocketTicketCache {
 	let cached: CachedSocketTicket | null = null;
-	let unsupported = false;
 
 	return {
-		async get(host: string, token: string, vaultId: string): Promise<CachedSocketTicket> {
-			if (unsupported) {
-				throw new SocketTicketHttpError(404); // already confirmed missing
-			}
+		async get(host: string, deviceToken: string, vaultId: string): Promise<CachedSocketTicket> {
 			const now = Date.now();
 			if (cached && cached.localExpiresAt - now > TICKET_REFRESH_BUFFER_MS) {
 				return cached;
 			}
-			const fresh = await fetchSocketTicket(host, token, vaultId);
+			const fresh = await fetchSocketTicket(host, deviceToken, vaultId);
 			cached = fresh;
 			return fresh;
 		},
 		invalidate() {
 			cached = null;
-		},
-		markUnsupported() {
-			unsupported = true;
-			cached = null;
-		},
-		isUnsupported() {
-			return unsupported;
 		},
 	};
 }
@@ -138,15 +64,7 @@ export function createSocketTicketCache(): SocketTicketCache {
 // URL patching
 // ---------------------------------------------------------------------------
 
-/**
- * Return a copy of `url` with `ticket` replaced by `ticketValue` and `token`
- * removed.  Other query parameters (schemaVersion, _pk, device, trace, boot,
- * etc.) are preserved untouched.
- *
- * Used by VaultSync.patchProviderTicket to keep provider.url current between
- * reconnects — y-partyserver's reconnect loop reads provider.url directly
- * without re-calling the async params() callback.
- */
+/** Replace the ticket parameter while stripping any stale credential parameter. */
 export function patchTicketInUrl(url: string, ticketValue: string): string {
 	const u = new URL(url);
 	u.searchParams.delete("token");
@@ -160,14 +78,14 @@ export function patchTicketInUrl(url: string, ticketValue: string): string {
 
 async function fetchSocketTicket(
 	host: string,
-	token: string,
+	deviceToken: string,
 	vaultId: string,
 ): Promise<CachedSocketTicket> {
 	const base = host.replace(/\/$/, "");
 	const res = await obsidianRequest({
 		url: `${base}/vault/${encodeURIComponent(vaultId)}/auth/ticket`,
 		method: "POST",
-		headers: { Authorization: `Bearer ${token}` },
+		headers: { Authorization: `Bearer ${deviceToken}` },
 	});
 
 	if (res.status !== 200) {

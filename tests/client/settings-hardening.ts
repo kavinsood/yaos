@@ -51,4 +51,40 @@ s.section("Test 4: server capability can lower the effective attachment cap");
 		"missing server capability falls back to built-in ceiling",
 	);
 }
+
+s.section("Legacy shared-token state is refused");
+{
+	const { settings, migrated } = readVaultSyncSettings({
+		host: "https://legacy.example",
+		token: "old-shared-secret",
+		vaultId: "old-vault",
+	});
+	s.check(migrated, "legacy credential marks settings for persistence cleanup");
+	s.check(settings.host === "", "legacy host is cleared");
+	s.check(settings.deviceToken === "", "legacy token is never promoted to a device token");
+	s.check(settings.vaultId === "", "legacy vault membership is cleared");
+	s.check(settings.deviceId === "", "legacy state has no invented device id");
+	s.check(!("token" in settings), "legacy token property is absent from runtime settings");
+}
+
+s.section("Enrollment requires all four identity fields");
+{
+	const complete = readVaultSyncSettings({
+		host: "https://sync.example",
+		deviceToken: "device-secret",
+		vaultId: "vault-1",
+		deviceId: "device-1",
+	}).settings;
+	s.check(complete.deviceToken === "device-secret", "complete enrollment is preserved");
+
+	const incomplete = readVaultSyncSettings({
+		host: "https://sync.example",
+		deviceToken: "device-secret",
+		vaultId: "vault-1",
+	}).settings;
+	s.check(incomplete.host === "https://sync.example", "host remains available for re-enrollment");
+	s.check(incomplete.deviceToken === "", "incomplete credential is cleared");
+	s.check(incomplete.vaultId === "", "incomplete vault id is cleared");
+	s.check(incomplete.deviceId === "", "missing device id leaves the folder unenrolled");
+}
 await s.done();

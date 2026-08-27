@@ -13,7 +13,12 @@ import {
 } from "../../src/sync/indexedDbCandidateStore";
 import { sha256BytesHex, sha256TextHex } from "../../src/utils/sha256";
 import { encodeBytesBase64, MAX_SV_ECHO_BASE64_BYTES } from "../../src/sync/svEchoMessage";
-import type { PersistedCandidateState, ScopeKey, ScopeMetadata } from "../../src/sync/candidateStore";
+import {
+	readKnownRoomGeneration,
+	type PersistedCandidateState,
+	type ScopeKey,
+	type ScopeMetadata,
+} from "../../src/sync/candidateStore";
 import { suite } from "../harness.ts";
 import { FakeIndexedDb } from "../mocks/indexedDb";
 
@@ -24,9 +29,10 @@ const BASE_SCOPE: ScopeKey & ScopeMetadata = {
 	serverHostHash: "b".repeat(64),
 	localDeviceId: "local-device",
 	roomName: "room-1",
+	roomGeneration: 1,
 	docSchemaVersion: 2,
 	pluginVersion: "1.6.1",
-	ackStoreVersion: 1,
+	ackStoreVersion: 2,
 };
 
 function makeState(scope = BASE_SCOPE): PersistedCandidateState {
@@ -35,7 +41,7 @@ function makeState(scope = BASE_SCOPE): PersistedCandidateState {
 	const candidateSvBase64 = encodeBytesBase64(Y.encodeStateVector(doc));
 	doc.destroy();
 	return {
-		schema: 1,
+		schema: 2,
 		...scope,
 		candidateSvBase64,
 		candidateCapturedAt: 123,
@@ -50,13 +56,85 @@ function sameState(a: PersistedCandidateState | null, b: PersistedCandidateState
 s.section("Test 1: key shape and hash helper");
 {
 	s.check(
-		buildCandidateStoreKey(BASE_SCOPE) === `yaos-ack-v1:${"b".repeat(64)}:${"a".repeat(64)}:local-device`,
-		"candidate key uses serverHostHash, vaultIdHash, localDeviceId",
+		buildCandidateStoreKey(BASE_SCOPE) === `yaos-ack-v2:${"b".repeat(64)}:${"a".repeat(64)}:local-device:1`,
+		"candidate key uses server, vault, device, and authoritative room generation",
 	);
 	const textHash = await sha256TextHex("YAOS");
 	const byteHash = await sha256BytesHex(new TextEncoder().encode("YAOS"));
 	s.check(/^[0-9a-f]{64}$/.test(textHash), "sha256TextHex returns lowercase 64-char hex");
 	s.check(byteHash === textHash, "byte and text SHA-256 helpers use the same UTF-8 digest");
+}
+
+s.section("Unknown generation is never guessed before provider sync");
+{
+	for (const unknown of [undefined, null, Number.NaN, -1, 1.5, "0"]) {
+		s.check(
+			readKnownRoomGeneration(unknown) === null,
+			`generation ${String(unknown)} remains unknown`,
+		);
+	}
+	s.check(readKnownRoomGeneration(0) === 0, "explicit generation zero is authoritative");
+	s.check(readKnownRoomGeneration(7) === 7, "synced generation is accepted");
+}
+
+s.section("Receipt keys isolate every room generation");
+{
+	const generationZero = { ...BASE_SCOPE, roomName: "vault:0", roomGeneration: 0 };
+	const generationSeven = { ...BASE_SCOPE, roomName: "vault:7", roomGeneration: 7 };
+	s.check(
+		buildCandidateStoreKey(generationZero) !== buildCandidateStoreKey(generationSeven),
+		"reset generation changes the persisted candidate key",
+	);
+
+	const fake = new FakeIndexedDb();
+	const oldStore = new IndexedDbCandidateStore(generationZero, fake, "ack-generation-scope");
+	const currentStore = new IndexedDbCandidateStore(generationSeven, fake, "ack-generation-scope");
+	const oldState = makeState(generationZero);
+	const currentState = makeState(generationSeven);
+	currentState.candidateCapturedAt = 789;
+	await currentStore.save(currentState);
+	await oldStore.save(oldState);
+	s.check(
+		sameState(await currentStore.load(generationSeven), currentState),
+		"late generation-zero save cannot overwrite generation seven",
+	);
+	s.check(
+		sameState(await oldStore.load(generationZero), oldState),
+		"same device can retain independently scoped candidates across generations",
+	);
+}
+
+s.section("Fresh device and deleted-cache startup do not borrow candidate scope");
+{
+	const authoritativeScope = { ...BASE_SCOPE, roomName: "vault:9", roomGeneration: 9 };
+	const firstDeviceDb = new FakeIndexedDb();
+	const firstDeviceStore = new IndexedDbCandidateStore(authoritativeScope, firstDeviceDb, "ack-first-device");
+	await firstDeviceStore.save(makeState(authoritativeScope));
+
+	const freshDeviceDb = new FakeIndexedDb();
+	const freshDeviceStore = new IndexedDbCandidateStore(authoritativeScope, freshDeviceDb, "ack-fresh-device");
+	s.check(
+		await freshDeviceStore.load(authoritativeScope) === null,
+		"fresh IndexedDB on another device starts without a borrowed candidate",
+	);
+	s.check(
+		readKnownRoomGeneration(undefined) === null,
+		"deleted Yjs cache leaves receipt generation unbound until provider sync",
+	);
+	const afterProviderSync = new IndexedDbCandidateStore(
+		authoritativeScope,
+		firstDeviceDb,
+		"ack-first-device",
+	);
+	s.check(
+		await afterProviderSync.load(authoritativeScope) !== null,
+		"deleted Yjs cache reloads the existing candidate only after authoritative generation finalization",
+	);
+	await freshDeviceStore.save(makeState(authoritativeScope));
+	s.check(
+		await firstDeviceStore.load(authoritativeScope) !== null,
+		"another device finalizing the synced generation does not disturb the first device",
+	);
 }
 
 s.section("Test 2: save/load survives store re-instantiation");
@@ -82,6 +160,19 @@ s.section("Test 3: scope mismatch fails closed");
 	s.check(loaded === null, "wrong roomName returns null");
 }
 
+s.section("Device enrollment scopes same-vault receipt candidates");
+{
+	const fake = new FakeIndexedDb();
+	const firstDeviceStore = new IndexedDbCandidateStore(BASE_SCOPE, fake, "ack-device-scope");
+	await firstDeviceStore.save(makeState());
+	const secondDeviceScope = { ...BASE_SCOPE, localDeviceId: "other-server-device" };
+	const secondDeviceStore = new IndexedDbCandidateStore(secondDeviceScope, fake, "ack-device-scope");
+	s.check(
+		await secondDeviceStore.load(secondDeviceScope) === null,
+		"same-server same-vault folders with different server device IDs cannot share candidates",
+	);
+}
+
 s.section("Test 4: clear deletes candidate state");
 {
 	const fake = new FakeIndexedDb();
@@ -97,7 +188,7 @@ s.section("Test 5: corrupt records fail closed");
 	const fake = new FakeIndexedDb();
 	const key = buildCandidateStoreKey(BASE_SCOPE);
 
-	fake.putRaw("ack-test-4", "candidateStates", key, { ...makeState(), schema: 2 });
+	fake.putRaw("ack-test-4", "candidateStates", key, { ...makeState(), schema: 3 });
 	const schemaStore = new IndexedDbCandidateStore(BASE_SCOPE, fake, "ack-test-4");
 	s.check(await schemaStore.load(BASE_SCOPE) === null, "wrong schema returns null");
 
@@ -105,7 +196,7 @@ s.section("Test 5: corrupt records fail closed");
 	const corruptSvStore = new IndexedDbCandidateStore(BASE_SCOPE, fake, "ack-test-5");
 	s.check(await corruptSvStore.load(BASE_SCOPE) === null, "invalid candidate SV returns null");
 
-	fake.putRaw("ack-test-5b", "candidateStates", key, { ...makeState(), ackStoreVersion: 2 });
+	fake.putRaw("ack-test-5b", "candidateStates", key, { ...makeState(), ackStoreVersion: 3 });
 	const versionStore = new IndexedDbCandidateStore(BASE_SCOPE, fake, "ack-test-5b");
 	s.check(await versionStore.load(BASE_SCOPE) === null, "unsupported ackStoreVersion returns null");
 
@@ -144,20 +235,6 @@ s.section("Test 6: open failures fail closed on load and reject save");
 	}
 }
 
-s.section("Test 7: localDeviceId is stable once created");
-{
-	const fake = new FakeIndexedDb();
-	let created = 0;
-	const randomUuid = () => {
-		created++;
-		return `uuid-${created}`;
-	};
-	const first = await getOrCreateLocalDeviceId(fake, randomUuid, "ack-test-7");
-	const second = await getOrCreateLocalDeviceId(fake, randomUuid, "ack-test-7");
-	s.check(first === "uuid-1", "first localDeviceId is generated");
-	s.check(second === first, "second localDeviceId reuses stored value");
-	s.check(created === 1, "random UUID called only once");
-}
 
 s.section("Test 8: save rejects mismatched or invalid scope");
 {

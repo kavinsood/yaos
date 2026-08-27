@@ -105,7 +105,7 @@ function makeFixture(initialPersistedQueue: BlobQueueSnapshot | null): Fixture {
 		getRuntimeConfig: () => partialOf<RuntimeConfig>({
 			enableAttachmentSync: true,
 			host: "https://worker.example",
-			token: "token",
+			deviceToken: "device-token",
 			vaultId: "vault",
 			maxAttachmentSizeKB: 1024,
 			attachmentConcurrency: 1,

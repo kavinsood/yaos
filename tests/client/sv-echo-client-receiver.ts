@@ -23,9 +23,10 @@ const SCOPE: ScopeKey & ScopeMetadata = {
 	serverHostHash: "bb",
 	localDeviceId: "device",
 	roomName: "room",
+	roomGeneration: 1,
 	docSchemaVersion: 2,
 	pluginVersion: "test",
-	ackStoreVersion: 1,
+	ackStoreVersion: 2,
 };
 
 async function flushMicrotasks(): Promise<void> {

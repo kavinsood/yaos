@@ -53,6 +53,10 @@ s.check(
 	label({ kind: "auth_failed", code: "server_misconfigured" }).includes("misconfigured"),
 	"server_misconfigured reason is visible",
 );
+s.check(
+	label({ kind: "auth_failed", code: "server_format_unsupported" }).includes("format unsupported"),
+	"server_format_unsupported reason is visible",
+);
 // All three are distinct
 s.check(
 	label({ kind: "auth_failed", code: "unauthorized" }) !==
@@ -208,6 +212,7 @@ const allStates: ConnectionState[] = [
 	{ kind: "auth_failed", code: "unauthorized" },
 	{ kind: "auth_failed", code: "unclaimed" },
 	{ kind: "auth_failed", code: "server_misconfigured" },
+	{ kind: "auth_failed", code: "server_format_unsupported" },
 	{ kind: "server_update_required", details: { clientSchemaVersion: 1, roomSchemaVersion: 2, reason: null } },
 	{ kind: "local_persistence_failed", details: null },
 	{ kind: "error" },

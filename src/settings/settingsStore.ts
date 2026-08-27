@@ -1,5 +1,3 @@
-import { randomId } from "../utils/randomId";
-
 /** Controls how external disk edits (git, other editors) are imported into CRDT. */
 export type ExternalEditPolicy = "always" | "closed-only" | "never";
 export const MAX_ATTACHMENT_SIZE_KB = 10 * 1024;
@@ -18,10 +16,12 @@ export function attachmentSizeCapKB(serverMaxBlobUploadBytes?: number | null): n
 export interface VaultSyncSettings {
 	/** Cloudflare Worker host, e.g. "https://sync.yourdomain.com" */
 	host: string;
-	/** Shared secret token for auth. */
-	token: string;
-	/** Unique vault identifier. Generated randomly if empty on first load. */
+	/** Device bearer minted at enrollment. Never the operator recovery key. */
+	deviceToken: string;
+	/** Server-minted vault identifier. */
 	vaultId: string;
+	/** Server-minted device identifier for this enrollment. */
+	deviceId: string;
 	/** Human-readable device name shown in awareness/cursors. */
 	deviceName: string;
 	/**
@@ -62,8 +62,9 @@ export interface VaultSyncSettings {
 
 export const DEFAULT_SETTINGS: VaultSyncSettings = {
 	host: "",
-	token: "",
+	deviceToken: "",
 	vaultId: "",
+	deviceId: "",
 	deviceName: "",
 	debug: false,
 	frontmatterGuardEnabled: true,
@@ -92,31 +93,42 @@ export interface SettingsLoadResult<TState extends Partial<VaultSyncSettings>> {
 	migrated: boolean;
 }
 
-/** Generate a random vault ID (22 base64url characters). */
-export function generateVaultId(): string {
-	return randomId(22);
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null;
-}
 
 function readPersistedState<TState extends Partial<VaultSyncSettings>>(value: unknown): TState {
-	return isRecord(value) ? { ...value } as TState : {} as TState;
+	if (typeof value !== "object" || value === null) return {} as TState;
+	const state: Record<string, unknown> = { ...value };
+	Reflect.deleteProperty(state, "token");
+	return state as TState;
 }
 
 export function readVaultSyncSettings(
-	data: Partial<VaultSyncSettings> | null | undefined,
+	data: Partial<VaultSyncSettings> | Record<string, unknown> | null | undefined,
 ): { settings: VaultSyncSettings; migrated: boolean } {
-	const settings = Object.assign(
-		{},
-		DEFAULT_SETTINGS,
-		data as Partial<VaultSyncSettings>,
-	);
-	let migrated = false;
-	if (typeof data?.attachmentSyncExplicitlyConfigured !== "boolean") {
-		settings.attachmentSyncExplicitlyConfigured = data?.enableAttachmentSync === true;
-		if (data?.enableAttachmentSync !== true) {
+	const record = typeof data === "object" && data !== null ? data as Record<string, unknown> : {};
+	const settings = Object.assign({}, DEFAULT_SETTINGS, record);
+	Reflect.deleteProperty(settings, "token");
+	let migrated = "token" in record;
+	const legacyCredential = typeof record.token === "string" && record.token.trim().length > 0;
+	const hasCompleteEnrollment = [
+		settings.host,
+		settings.deviceToken,
+		settings.vaultId,
+		settings.deviceId,
+	].every((value) => typeof value === "string" && value.trim().length > 0);
+	if (legacyCredential && !hasCompleteEnrollment) {
+		settings.host = "";
+		settings.deviceToken = "";
+		settings.vaultId = "";
+		settings.deviceId = "";
+	} else if (!hasCompleteEnrollment) {
+		if (settings.deviceToken || settings.vaultId || settings.deviceId) migrated = true;
+		settings.deviceToken = "";
+		settings.vaultId = "";
+		settings.deviceId = "";
+	}
+	if (typeof record.attachmentSyncExplicitlyConfigured !== "boolean") {
+		settings.attachmentSyncExplicitlyConfigured = record.enableAttachmentSync === true;
+		if (record.enableAttachmentSync !== true) {
 			settings.enableAttachmentSync = true;
 		}
 		migrated = true;
@@ -140,8 +152,11 @@ export class SettingsStore<TState extends Partial<VaultSyncSettings>> {
 	constructor(private readonly persistence: SettingsPersistence) {}
 
 	async load(): Promise<SettingsLoadResult<TState>> {
-		const persistedState = readPersistedState<TState>(await this.persistence.loadData());
-		const { settings, migrated } = readVaultSyncSettings(persistedState);
+		const raw = await this.persistence.loadData();
+		const { settings, migrated } = readVaultSyncSettings(
+			typeof raw === "object" && raw !== null ? raw as Record<string, unknown> : undefined,
+		);
+		const persistedState = readPersistedState<TState>(raw);
 		return {
 			settings,
 			persistedState,
@@ -154,9 +169,11 @@ export class SettingsStore<TState extends Partial<VaultSyncSettings>> {
 	}
 
 	withSettings(state: TState, settings: VaultSyncSettings): TState {
-		return {
+		const next: TState & VaultSyncSettings = {
 			...state,
 			...settings,
 		};
+		Reflect.deleteProperty(next, "token");
+		return next;
 	}
 }

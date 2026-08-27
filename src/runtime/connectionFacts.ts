@@ -14,7 +14,7 @@
  *     WebSocket + auth messages only.
  *
  *   authAccepted — null when unknown. True only when websocketOpen (WebSocket
- *     open implies server accepted the token and vaultId). False only when the
+ *     open implies server accepted the device credential and vaultId). False only when the
  *     server explicitly sent a rejection code.
  *
  *   lastLocalUpdateWhileConnectedAt — a transport observation, not a receipt.
@@ -116,7 +116,8 @@ export function deriveSyncFacts(
 			// Auth passed but schema/version is incompatible. Credentials were accepted.
 			authAccepted = true;
 		} else {
-			// Explicit credential rejection: unauthorized, unclaimed, server_misconfigured.
+			// Explicit credential/configuration rejection: unauthorized, unclaimed,
+			// server_misconfigured, or server_format_unsupported.
 			authAccepted = false;
 		}
 	}

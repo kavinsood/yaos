@@ -67,7 +67,7 @@ function sanitizeTraceText(value: string, settings: VaultSyncSettings): string {
 	let safe = value;
 	for (const secret of [
 		settings.host,
-		settings.token ?? "",
+		settings.deviceToken ?? "",
 		settings.vaultId,
 		settings.deviceName,
 	].filter(Boolean)) {
@@ -761,7 +761,7 @@ export class FlightTraceController {
 		const recorder = this.recorder;
 		if (!this.enabled || !this.desiredEnabled || !recorder || this.serverInFlight) return;
 		const settings = this.deps.getSettings();
-		if (!settings.debug || !settings.host || !settings.token || !settings.vaultId) return;
+		if (!settings.debug || !settings.host || !settings.deviceToken || !settings.vaultId) return;
 		this.serverInFlight = true;
 		try {
 			const host = settings.host.replace(/\/$/, "");
@@ -770,7 +770,7 @@ export class FlightTraceController {
 			const response = await obsidianRequest({
 				url,
 				method: "GET",
-				headers: { Authorization: `Bearer ${settings.token}` },
+				headers: { Authorization: `Bearer ${settings.deviceToken}` },
 			});
 			if (response.status !== 200) throw new Error(`server debug fetch failed (${response.status})`);
 			const payload = response.json as { recent?: unknown[]; roomId?: unknown };

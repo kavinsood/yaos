@@ -306,7 +306,7 @@ s.section("Test 11: known paths are replaced even when unquoted (exact-replaceme
 s.section("Test 12: safe-mode bundle shape — no tokenPrefix, vaultId, deviceName");
 {
 	// Simulate the field shape that DiagnosticsService produces in both modes:
-	//   token: { present: boolean }  — no prefix, no length, in either mode
+	//   deviceToken: { present: boolean }  — no prefix, no length, in either mode
 	//   safe mode: vaultId: "(redacted)", deviceName: "(redacted)"
 	// The redactor must leave these synthetic redactions intact.
 	const salt = generateBundleSalt();
@@ -315,7 +315,7 @@ s.section("Test 12: safe-mode bundle shape — no tokenPrefix, vaultId, deviceNa
 	const safeBundle = {
 		settings: {
 			host: "(redacted)",
-			token: { present: true },
+			deviceToken: { present: true },
 			vaultId: "(redacted)",
 			deviceName: "(redacted)",
 		},
@@ -324,26 +324,26 @@ s.section("Test 12: safe-mode bundle shape — no tokenPrefix, vaultId, deviceNa
 	s.check(out.settings.host === "(redacted)", "host stays redacted through redactDeep");
 	s.check(out.settings.vaultId === "(redacted)", "vaultId stays redacted through redactDeep");
 	s.check(out.settings.deviceName === "(redacted)", "deviceName stays redacted through redactDeep");
-	s.check(out.settings.token.present === true, "token.present is preserved");
-	s.check(!("length" in (out.settings.token ?? {})), "no token.length field (not needed)");
-	s.check(!("prefix" in (out.settings.token ?? {})), "no tokenPrefix field in bundle");
+	s.check(out.settings.deviceToken.present === true, "deviceToken.present is preserved");
+	s.check(!("length" in (out.settings.deviceToken ?? {})), "no deviceToken.length field");
+	s.check(!("prefix" in (out.settings.deviceToken ?? {})), "no deviceToken prefix in bundle");
 
 	// Document the known design boundary: the path redactor handles path-shaped
-	// strings only. Identifier fields like token prefix and deviceName are NOT
+	// strings only. Identifier fields like device token prefix and deviceName are NOT
 	// caught by the regex and must be scrubbed by the service before calling
 	// redactDeep. This is by design — the redactor is not responsible for
 	// identifier-field scrubbing, and the service's safe-mode branch explicitly
 	// sets these fields to "(redacted)" before building rawDiagnostics.
 	const withLeaks = {
 		settings: {
-			token: "tok_abcdef01...",
+			deviceToken: "dev_abcdef01...",
 			deviceName: "Kavin's MacBook Air",
 		},
 	};
 	const outLeaks = redactor.redactDeep(withLeaks);
 	s.check(
-		outLeaks.settings.token === "tok_abcdef01...",
-		"non-path token string is NOT altered by path redactor (service must scrub it explicitly)",
+		outLeaks.settings.deviceToken === "dev_abcdef01...",
+		"non-path device token string is NOT altered by path redactor (service must scrub it explicitly)",
 	);
 	s.check(
 		outLeaks.settings.deviceName === "Kavin's MacBook Air",

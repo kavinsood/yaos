@@ -4,7 +4,7 @@ import { decodeBytesBase64, MAX_SV_ECHO_BASE64_BYTES } from "./svEchoMessage";
 
 const DB_NAME = "yaos-server-receipt";
 const DB_VERSION = 1;
-const CURRENT_ACK_STORE_VERSION = 1;
+const CURRENT_ACK_STORE_VERSION = 2;
 const CANDIDATE_STORE = "candidateStates";
 const METADATA_STORE = "metadata";
 const LOCAL_DEVICE_ID_KEY = "localDeviceId";
@@ -65,9 +65,8 @@ export async function getOrCreateLocalDeviceId(
 	return getOrCreateMetadataValue(db, LOCAL_DEVICE_ID_KEY, randomUuid);
 }
 
-
 export function buildCandidateStoreKey(scope: ScopeKey): string {
-	return `yaos-ack-v1:${scope.serverHostHash}:${scope.vaultIdHash}:${scope.localDeviceId}`;
+	return `yaos-ack-v2:${scope.serverHostHash}:${scope.vaultIdHash}:${scope.localDeviceId}:${scope.roomGeneration}`;
 }
 
 function openAckDatabase(indexedDbFactory: IndexedDbFactoryLike, dbName: string): Promise<IDBDatabase> {
@@ -152,11 +151,12 @@ function requestPromise<T = unknown>(req: IDBRequest<T>): Promise<T> {
 function validatePersistedCandidateState(raw: unknown): PersistedCandidateState | null {
 	if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
 	const r = raw as Record<string, unknown>;
-	if (r.schema !== 1) return null;
+	if (r.schema !== 2) return null;
 	if (typeof r.vaultIdHash !== "string" || !HASH_RE.test(r.vaultIdHash)) return null;
 	if (typeof r.serverHostHash !== "string" || !HASH_RE.test(r.serverHostHash)) return null;
 	if (typeof r.localDeviceId !== "string" || r.localDeviceId.length === 0) return null;
 	if (typeof r.roomName !== "string") return null;
+	if (typeof r.roomGeneration !== "number" || !Number.isSafeInteger(r.roomGeneration) || r.roomGeneration < 0) return null;
 	if (typeof r.docSchemaVersion !== "number" || !Number.isInteger(r.docSchemaVersion) || r.docSchemaVersion < 0) return null;
 	if (typeof r.pluginVersion !== "string") return null;
 	if (r.ackStoreVersion !== CURRENT_ACK_STORE_VERSION) return null;
@@ -190,6 +190,7 @@ function scopeKeyMatches(stored: PersistedCandidateState, scope: ScopeKey): bool
 		stored.serverHostHash === scope.serverHostHash &&
 		stored.localDeviceId === scope.localDeviceId &&
 		stored.roomName === scope.roomName &&
+		stored.roomGeneration === scope.roomGeneration &&
 		stored.docSchemaVersion === scope.docSchemaVersion
 	);
 }

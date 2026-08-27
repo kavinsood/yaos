@@ -114,7 +114,7 @@ interface ExistsResult {
 class BlobHttpClient {
 	constructor(
 		private host: string,
-		private token: string,
+		private deviceToken: string,
 		private vaultId: string,
 		private trace?: TraceHttpContext,
 	) {}
@@ -131,7 +131,7 @@ class BlobHttpClient {
 
 	private authHeaders(): Record<string, string> {
 		return {
-			Authorization: `Bearer ${this.token}`,
+			Authorization: `Bearer ${this.deviceToken}`,
 		};
 	}
 
@@ -392,7 +392,7 @@ export class BlobSyncManager {
 		private vaultSync: VaultSync,
 		settings: {
 			host: string;
-			token: string;
+			deviceToken: string;
 			vaultId: string;
 			maxAttachmentSizeKB: number;
 			attachmentConcurrency: number;
@@ -406,7 +406,7 @@ export class BlobSyncManager {
 	) {
 		this.blobClient = new BlobHttpClient(
 			settings.host,
-			settings.token,
+			settings.deviceToken,
 			settings.vaultId,
 			settings.trace,
 		);

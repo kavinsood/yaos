@@ -29,14 +29,14 @@ export class PairDeviceModal extends Modal {
 
 		contentEl.createEl("h3", { text: "Pair another device" });
 		contentEl.createEl("p", {
-			text: "Scan this setup code on your phone to open the setup page. If the plugin is not installed yet, the page will guide you through the beta install flow first.",
+			text: "Scan this one-shot pairing link on the other device. The link carries only the server address and pairing code.",
 			cls: "yaos-modal-copy",
 		});
 
 		const qrWrap = contentEl.createDiv({ cls: "yaos-pair-device-qr-wrap" });
 
 		const loadingEl = qrWrap.createDiv({
-			text: "Generating setup code...",
+			text: "Generating pairing code...",
 			cls: "yaos-pair-device-loading",
 		});
 
@@ -51,10 +51,10 @@ export class PairDeviceModal extends Modal {
 			loadingEl.remove();
 			if (this.qrCanvas) {
 				this.qrCanvas.hidden = false;
-				this.qrCanvas.setAttr("aria-label", "Mobile setup code");
+				this.qrCanvas.setAttr("aria-label", "Device pairing code");
 			}
 		}).catch(() => {
-			loadingEl.setText("Could not generate a setup code.");
+			loadingEl.setText("Could not generate a pairing code.");
 			if (this.qrCanvas) {
 				this.qrCanvas.remove();
 				this.qrCanvas = null;
@@ -62,33 +62,33 @@ export class PairDeviceModal extends Modal {
 		});
 
 		const primaryButtons = contentEl.createDiv({ cls: "modal-button-container" });
-		primaryButtons.createEl("button", { text: "Copy mobile setup URL" }).addEventListener("click", () => {
+		primaryButtons.createEl("button", { text: "Copy pairing page URL" }).addEventListener("click", () => {
 			void navigator.clipboard.writeText(this.mobileUrl).then(
-				() => new Notice("Mobile setup URL copied."),
-				() => new Notice("Failed to copy the mobile setup URL.", 6000),
+				() => new Notice("Pairing page URL copied."),
+				() => new Notice("Failed to copy the pairing page URL.", 6000),
 			);
 		});
-		primaryButtons.createEl("button", { text: "Open mobile setup page" }).addEventListener("click", () => {
+		primaryButtons.createEl("button", { text: "Open pairing page" }).addEventListener("click", () => {
 			window.open(this.mobileUrl, "_blank", "noopener");
 		});
 
-		const manualDetails = createDetailsSection(contentEl, "Desktop or manual setup", false);
+		const manualDetails = createDetailsSection(contentEl, "Desktop or manual pairing", false);
 		const manualBody = manualDetails.createDiv({ cls: "yaos-settings-details-body" });
 
-		manualBody.createEl("h4", { text: "Mobile setup URL" });
+		manualBody.createEl("h4", { text: "Pairing page URL" });
 		const mobileInput = manualBody.createEl("textarea", { cls: "yaos-settings-modal-textarea" });
 		mobileInput.value = this.mobileUrl;
 		mobileInput.readOnly = true;
 		mobileInput.rows = 3;
 
 		const mobileButtons = manualBody.createDiv({ cls: "modal-button-container" });
-		mobileButtons.createEl("button", { text: "Copy mobile setup URL" }).addEventListener("click", () => {
+		mobileButtons.createEl("button", { text: "Copy pairing page URL" }).addEventListener("click", () => {
 			void navigator.clipboard.writeText(this.mobileUrl).then(
-				() => new Notice("Mobile setup URL copied."),
-				() => new Notice("Failed to copy the mobile setup URL.", 6000),
+				() => new Notice("Pairing page URL copied."),
+				() => new Notice("Failed to copy the pairing page URL.", 6000),
 			);
 		});
-		mobileButtons.createEl("button", { text: "Open mobile setup page" }).addEventListener("click", () => {
+		mobileButtons.createEl("button", { text: "Open pairing page" }).addEventListener("click", () => {
 			window.open(this.mobileUrl, "_blank", "noopener");
 		});
 

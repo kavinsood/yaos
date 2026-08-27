@@ -54,6 +54,9 @@ export function getLabelFromConnectionState(
 				case "server_misconfigured":
 					base = "YAOS: Server misconfigured";
 					break;
+				case "server_format_unsupported":
+					base = "YAOS: Server format unsupported";
+					break;
 				case "unauthorized":
 				default:
 					base = "YAOS: Auth rejected";

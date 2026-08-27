@@ -22,9 +22,10 @@ const BASE_SCOPE: ScopeKey & ScopeMetadata = {
 	serverHostHash: "ddeeff",
 	localDeviceId: "uuid-device-1",
 	roomName: "room-vault-1",
+	roomGeneration: 1,
 	docSchemaVersion: 2,
 	pluginVersion: "0.5.0",
-	ackStoreVersion: 1,
+	ackStoreVersion: 2,
 };
 
 function makeDoc(clientId?: number): Y.Doc {
@@ -65,6 +66,55 @@ async function flushMicrotasks(): Promise<void> {
 	for (let i = 0; i < 10; i++) {
 		await Promise.resolve();
 	}
+}
+
+s.section("Authoritative generation binding");
+{
+	const doc = makeDoc(1001);
+	const tracker = new ServerAckTracker();
+	attachTracker(tracker, doc, {}, null);
+	doc.getText("t").insert(0, "edit captured before provider sync");
+	const generationNine = {
+		...BASE_SCOPE,
+		roomName: "room-vault-9",
+		roomGeneration: 9,
+	};
+	const generationNineStore = new InMemoryCandidateStore();
+	await tracker.bindPersistence(generationNineStore, generationNine);
+	s.check(
+		typeof generationNineStore.rawStored?.candidateSvBase64 === "string",
+		"candidate captured while generation is unknown is finalized into synced generation",
+	);
+	s.check(
+		generationNineStore.rawStored?.roomGeneration === 9,
+		"carried candidate persists only under authoritative generation",
+	);
+}
+
+s.section("Generation rotation rejects stale persisted candidates");
+{
+	const oldScope = { ...BASE_SCOPE, roomName: "room-vault-3", roomGeneration: 3 };
+	const newScope = { ...BASE_SCOPE, roomName: "room-vault-4", roomGeneration: 4 };
+	const oldStore = new InMemoryCandidateStore();
+	const firstDoc = makeDoc(1002);
+	const firstTracker = new ServerAckTracker();
+	attachTracker(firstTracker, firstDoc, {}, null);
+	await firstTracker.bindPersistence(oldStore, oldScope);
+	firstDoc.getText("t").insert(0, "generation three candidate");
+	await firstTracker._flushPersistence();
+
+	const restoredDoc = makeDoc(1002);
+	restoredDoc.getText("t").insert(0, "generation three candidate");
+	const rotatingTracker = new ServerAckTracker();
+	attachTracker(rotatingTracker, restoredDoc, {}, null);
+	await rotatingTracker.bindPersistence(oldStore, oldScope);
+	s.check(rotatingTracker.hasUnconfirmedCandidate, "old generation candidate is restored before provider sync");
+
+	const newStore = new InMemoryCandidateStore();
+	await rotatingTracker.bindPersistence(newStore, newScope);
+	s.check(!rotatingTracker.hasUnconfirmedCandidate, "authoritative generation rotation drops stale restored candidate");
+	s.check(newStore.rawStored === null, "stale generation candidate is not copied into the new generation");
+	s.check(oldStore.rawStored?.roomGeneration === 3, "rotation does not overwrite the old generation record");
 }
 
 // ── Test 1: local update while connected captures candidate, state=false ───────

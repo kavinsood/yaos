@@ -207,6 +207,17 @@ s.section("Test 10: update_required → authAccepted=true (auth passed, schema b
 	s.check(facts.lastAuthRejectCode === "update_required", "reject code is captured");
 }
 
+s.section("Test 10b: server_format_unsupported is an explicit auth/config rejection");
+{
+	const facts = deriveSyncFacts(
+		makeSnapshot({ fatalAuthError: true, fatalAuthCode: "server_format_unsupported" }),
+		"auth_failed",
+	);
+	s.check(facts.authAccepted === false, "unsupported server configuration cannot authenticate");
+	s.check(facts.serverReachable === true, "unsupported server did respond");
+	s.check(facts.lastAuthRejectCode === "server_format_unsupported", "unsupported format code is retained");
+}
+
 s.section("Test 11: update timestamps flow through deriveSyncFacts");
 {
 	const now = Date.now();

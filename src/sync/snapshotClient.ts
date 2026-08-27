@@ -195,7 +195,7 @@ async function serverPost(
 		method: "POST",
 		headers: {
 			"Content-Type": "application/json",
-			Authorization: `Bearer ${settings.token}`,
+			Authorization: `Bearer ${settings.deviceToken}`,
 		},
 		body: body ? JSON.stringify(body) : "{}",
 		contentType: "application/json",
@@ -220,7 +220,7 @@ async function serverGet(
 		url,
 		method: "GET",
 		headers: {
-			Authorization: `Bearer ${settings.token}`,
+			Authorization: `Bearer ${settings.deviceToken}`,
 		},
 	});
 	if (res.status < 200 || res.status >= 300) {
@@ -386,7 +386,7 @@ export async function downloadSnapshot(
 		url,
 		method: "GET",
 		headers: {
-			Authorization: `Bearer ${settings.token}`,
+			Authorization: `Bearer ${settings.deviceToken}`,
 		},
 	});
 	if (res.status !== 200) {
