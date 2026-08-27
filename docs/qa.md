@@ -27,6 +27,8 @@ Current client suites exercise:
 - `recovery-backup.ts`: backup-before-replacement and changed-target review;
 - `multivault-enrollment-contract.ts`: device-scoped memberships and schema-4 cache retirement;
 - existing reconciliation, delete-preservation, editor-binding, diagnostics, attachment-conflict, and lifecycle suites through the full regression discovery.
+- `attachment-publication-replay.ts`: lost responses, root-persistence failure, stable operation-ID replay, and durable upsert/delete/rename intent;
+- `body-manager-load-race.ts`: aggregate client cost admission, safe LRU eviction, and protected-body refusal;
 
 These tests use controlled ports and models. They prove policy and orchestration contracts, not a real Obsidian adapter or mobile filesystem.
 
@@ -43,6 +45,8 @@ Current server suites exercise:
 - `recovery-deletion.ts`: generation purge completes before SQL deletion;
 - `multivault-registry.ts` and `identity-control-plane.ts`: provisioning state, memberships, retryable deletion obligations, and purge identity;
 - `vault-route-authority.ts` and socket admission suites: device, vault, schema, and protocol boundaries.
+- `vault-document-cache.ts`: aggregate resident/transient limits, mixed-size LRU, protected-body refusal, and exactly-once reservation release;
+- identity suites: response-loss-safe enrollment replay and durable retryable device revocation obligations;
 
 The full regression runner discovers suites under `tests/client`, `tests/server`, and `tests/contracts`, plus its harness/discovery self-tests. Discovery guards reject unaccounted inert suites.
 

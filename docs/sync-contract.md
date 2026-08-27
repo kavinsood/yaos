@@ -76,6 +76,8 @@ A local Markdown edit enters its body Yjs document and IndexedDB candidate queue
 
 Watcher changes are coalesced. YAOS-authored disk writes carry an expected content fingerprint. A matching event is suppressed; a mismatch is new external input. Time alone is never proof that YAOS authored an event.
 
+Attachment bytes are uploaded before their structural reference. Upsert, delete, and rename intents are persisted in the generation-scoped local database with a stable operation ID before submission; they are removed only after the server atomically commits the root/catalog mutation and the returned root is saved locally. Lost responses and restarts replay the same operation. Root sockets never accept direct attachment-map writes.
+
 ## Reconciliation authority
 
 Authority is selected for each observed transition:
@@ -170,7 +172,7 @@ Forbidden claims:
 - Corrupt or inconsistent SQL state: fail closed.
 - Wrong vault generation, stale candidate, inactive body, or mismatched digest: reject.
 - Missing or invalid ticket/schema/protocol declaration: reject before room admission.
-- Revoked membership: reject HTTP and WebSocket access.
+- Revoked membership: remove admission immediately, persist a device-fence obligation, terminate active sockets, and retain operator-visible retry state until the vault runtime acknowledges the fence.
 - IndexedDB or bootstrap settlement failure: retain retry state; do not claim readiness.
 - Unknown filesystem deletion baseline: preserve.
 - Missing R2: disable attachments and recovery; continue Markdown root/body sync.

@@ -52,7 +52,7 @@ Missing or mismatched schema or protocol declarations fail admission with `updat
 The vault Durable Object contains separate durable and live owners:
 
 - `VaultStore` composes the SQLite document, catalog, bootstrap, recovery-authority, receipt, pin, and deletion stores. SQLite is the durable source for root/body generations, vault sequence, lifecycle, and recovery authority.
-- `VaultDocumentCache` owns loaded Yjs documents and pending updates. It may evict only clean, unpinned bodies that have no open socket.
+- `VaultDocumentCache` owns loaded Yjs documents and pending updates. It enforces body-count, 48 MiB resident-state, and 16 MiB transient/pending budgets and may evict only clean, unpinned bodies with no open socket. The client `BodyManager` independently enforces a 48 MiB aggregate estimated-cost budget.
 - `VaultSocketService` owns root and body WebSocket sessions. The root socket is structural; a body socket is admitted only for an active body.
 - `VaultLifecycleService` owns durable create, rename, delete, and revive ordering plus root publication checks.
 - `VaultCandidateService` owns device-scoped body candidate admission, idempotency, and durable receipts.
@@ -82,7 +82,7 @@ Writes are serialized per path and carry an expected content fingerprint. A watc
 
 ## Attachments
 
-Non-Markdown files, including Canvas, Excalidraw, Base, images, and PDFs, use whole-file content-addressed R2 objects. After bytes are durable, the client submits a device-authenticated attachment command; the server validates the generation-scoped object and commits the root mutation with its attachment catalog event before broadcasting it. Root sockets never accept direct attachment-map writes.
+Non-Markdown files, including Canvas, Excalidraw, Base, images, and PDFs, use whole-file content-addressed R2 objects. After bytes are durable, the client persists a generation-scoped attachment operation before submitting its stable operation ID. The server validates the object and commits the root mutation with its attachment catalog event before broadcasting it. Lost responses, publication failures, and restarts replay the same upsert/delete/rename intent; root sockets never accept direct attachment-map writes.
 
 Without `YAOS_BUCKET`, attachment sync is unavailable while root/body Markdown sync, SQL persistence, and SQL bootstrap continue normally.
 
@@ -100,9 +100,9 @@ GC marks retained recovery and blob roots, acquires bounded sweep leases, and de
 
 ## Authentication and admission
 
-`POST /claim` initializes the operator control plane and provisions the first vault. `POST /enroll` consumes one pairing code and returns a device bearer, device ID, and selected vault ID. Codes expire after 15 minutes and work once.
+`POST /claim` initializes the operator control plane and provisions the first vault. `POST /enroll` consumes one pairing code and returns a device bearer, device ID, selected vault ID, generation, and origin/joining role. The client persists its generated request ID and credentials before enrollment; a lost response retries the same hashes and receives the same bounded replay record without storing the plaintext bearer server-side.
 
-Vault HTTP routes require the device bearer and vault ID. A short-lived device-scoped ticket is minted for WebSocket use; long-lived credentials never appear in socket URLs. Root and body handshakes require `ticket`, `schemaVersion=4`, and `protocolVersion=1`. Ticket signature, expiry, vault scope, current membership, active vault state, and vault generation are checked before runtime admission. Revocation closes already-active root/body sockets for that device as well as preventing future admission.
+Vault HTTP routes require the device bearer and vault ID. A short-lived device-scoped ticket is minted for WebSocket use; long-lived credentials never appear in socket URLs. Root and body handshakes require `ticket`, `schemaVersion=4`, and `protocolVersion=1`. Ticket signature, expiry, vault scope, current membership, active vault state, and vault generation are checked before runtime admission. Revocation persists an obligation before removing membership, applies a durable vault-runtime device fence, terminates already-active sockets, and remains operator-retryable until acknowledged.
 
 Leaving revokes one membership, clears the folder's enrollment and schema-4 IndexedDB cache, and leaves ordinary files on disk. Operator kick revokes one membership. Operator destroy revokes the complete vault boundary.
 

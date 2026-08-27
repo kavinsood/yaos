@@ -78,7 +78,7 @@ In an unenrolled folder, enter the Worker URL and a fresh pairing code in YAOS s
 
 Each folder/device identity belongs to exactly one vault membership. A physical installation may enroll different folders in different vaults, but every membership has its own device ID and bearer. Never copy one folder's token or IndexedDB cache to another.
 
-The first claim pairing code carries a one-use origin-import role. Its enrollment response includes the exact vault generation and authorizes only that folder to import its captured local inventory. Every later device/invite code is a joining role: joining folders bootstrap the root, catalog, and bodies from SQL and never upload their disk as initial shared authority.
+The first claim pairing code carries a one-use origin-import role. Before enrollment, the client persists a random request ID, device ID, device token, and pairing code locally. The server stores only hashes and a bounded replay record, so a lost response retries the same enrollment and origin grant without creating a second device. Every later device/invite code is a joining role: joining folders bootstrap from SQL and never upload their disk as initial shared authority.
 
 An enrolled device can inspect its vault roster, rename itself, mint another one-use pairing code, export only its own credentials, or leave. Pairing codes expire after 15 minutes and work once.
 
@@ -88,7 +88,7 @@ An enrolled device can inspect its vault roster, rename itself, mint another one
 
 The operator recovery key signs in to the console and is never a plugin credential. The browser receives a short-lived HTTP-only session. Sign-out revokes the presented session before clearing its cookie.
 
-The console creates and renames vaults, lists and revokes devices and unused pairing codes, creates enrollment links, reports provisioning failures, and tracks pending deletion obligations.
+The console creates and renames vaults, lists and revokes devices and unused pairing codes, creates enrollment links, reports provisioning failures, and tracks pending deletion and device-fence obligations. A failed device runtime fence remains visible after membership removal and can be retried without restoring membership.
 
 ## Recovery operations
 
@@ -165,9 +165,9 @@ The vault status surface additionally exposes `vaultGeneration`, `runtimeEpoch`,
 ## Current limits
 
 - Empty folders are not synchronized.
-- Attachment upload size is bounded by the server and client caps.
+- Attachment upload size is bounded by the server and client caps; publication operations survive response loss and restart.
 - Root/body persistence is bounded by Durable Object SQL row, statement, and account limits.
-- Bodies are loaded independently and evicted only when clean and unpinned; this removes the vault-wide content monolith but does not make memory unbounded.
+- Server body admission enforces 32 bodies, 48 MiB aggregate resident state, and a 16 MiB transient/pending reserve. Client body admission enforces a separate 48 MiB aggregate estimated-cost budget. Only clean, unpinned bodies without open sockets may be evicted.
 - Recovery requires R2 and the job binding and may finish with explicit unavailable entries.
 - Large benchmark/soak, deployed Cloudflare recovery/deletion, and real mobile recovery evidence are deferred.
 - Settings sync, headless clients, and Docker packaging remain future work.
