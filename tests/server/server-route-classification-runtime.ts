@@ -28,7 +28,6 @@ const DO_TOUCHED = "Durable Object namespace accessed for unknown route (issue #
 const trapEnv: Env = makeEnv({
 	YAOS_SYNC: makeTrapNamespace(DO_TOUCHED),
 	YAOS_CONFIG: makeTrapNamespace(DO_TOUCHED),
-	SYNC_TOKEN: undefined,
 });
 
 // ── Test 1: junk paths return 404 without touching any DO ─────────────────────
@@ -117,8 +116,10 @@ s.section("Test 3: two claim-mode requests within TTL share one YAOS_CONFIG fetc
 
 	let fetchCount = 0;
 	const claimConfig = {
+		configFormat: 1,
 		claimed: true,
-		tokenHash: "abc123",
+		operatorRecoveryHash: "abc123",
+		ticketSigningKey: "ticket-signing-key",
 		updateProvider: null,
 		updateRepoUrl: null,
 		updateRepoBranch: null,
@@ -133,7 +134,6 @@ s.section("Test 3: two claim-mode requests within TTL share one YAOS_CONFIG fetc
 				headers: { "Content-Type": "application/json" },
 			});
 		}),
-		SYNC_TOKEN: undefined,
 	});
 
 	const resp = await worker.fetch(
@@ -169,13 +169,14 @@ s.section("Test 4: unclaimed mode — vault routes rejected without YAOS_SYNC ac
 	const trapSyncEnv: Env = makeEnv({
 		YAOS_SYNC: syncTrap,
 		YAOS_CONFIG: makeStoredConfigNamespace({
+			configFormat: null,
 			claimed: false,
-			tokenHash: null,
+			operatorRecoveryHash: null,
+			ticketSigningKey: null,
 			updateProvider: null,
 			updateRepoUrl: null,
 			updateRepoBranch: null,
 		}),
-		SYNC_TOKEN: undefined,
 	});
 
 	const warnings: string[] = [];
@@ -269,9 +270,16 @@ s.section("Test 6: /vault/sync/:vaultId is classified as sync-socket, not vault"
 	// below is kept in the accepted set because it is the status a real
 	// deployment returns here.
 	const syncTestEnv: Env = makeEnv({
-		SYNC_TOKEN: "test-token-for-sync-ordering-check",
 		YAOS_SYNC: makeTrapNamespace(DO_TOUCHED),
-		YAOS_CONFIG: makeTrapNamespace(DO_TOUCHED),
+		YAOS_CONFIG: makeStoredConfigNamespace({
+			configFormat: null,
+			claimed: false,
+			operatorRecoveryHash: null,
+			ticketSigningKey: null,
+			updateProvider: null,
+			updateRepoUrl: null,
+			updateRepoBranch: null,
+		}),
 	});
 
 	// Non-WS request to the sync path — classified as sync-socket, then refused
@@ -280,9 +288,8 @@ s.section("Test 6: /vault/sync/:vaultId is classified as sync-socket, not vault"
 		new Request("https://example.com/vault/sync/my-vault"),
 		syncTestEnv,
 	);
-	// 426 means it reached the sync handler, not the 404 not-found path.
-	// 401 would mean it reached auth but was rejected (SYNC_TOKEN mismatch).
-	// 404 would mean parseSyncPath was skipped and it hit the resource whitelist.
+	// Any non-404 auth/schema status proves parseSyncPath ran before the vault
+	// resource whitelist.
 	s.check(
 		resp.status !== 404,
 		"/vault/sync/:vaultId is NOT classified as not-found (parseSyncPath runs first)",
@@ -292,4 +299,32 @@ s.section("Test 6: /vault/sync/:vaultId is classified as sync-socket, not vault"
 		`/vault/sync/:vaultId reaches the sync handler (status ${resp.status}, not 404)`,
 	);
 }
+
+s.section("Test 7: malformed URI components return cheap 404 without Durable Object access");
+{
+	const malformedRoutes: Array<[string, string]> = [
+		["GET", "/vault/%ZZ/debug/recent"],
+		["GET", "/vault/valid-vault/blobs/%ZZ"],
+		["GET", "/vault/valid-vault/snapshots/%E0%A4%A"],
+		["GET", "/vault/sync/%ZZ"],
+		["PATCH", "/operator/vaults/%ZZ"],
+		["DELETE", "/operator/vaults/%E0%A4%A"],
+		["DELETE", "/operator/devices/%ZZ"],
+		["DELETE", "/operator/pairing-codes/%ZZ"],
+	];
+	for (const [method, path] of malformedRoutes) {
+		invalidateStoredServerConfigCache();
+		const configTrap = makeTrapNamespace("malformed route touched config");
+		const roomTrap = makeTrapNamespace("malformed route touched room");
+		const malformedEnv = makeEnv({ YAOS_CONFIG: configTrap, YAOS_SYNC: roomTrap });
+		const response = await worker.fetch(
+			new Request(`https://example.com${path}`, { method }),
+			malformedEnv,
+		);
+		s.check(response.status === 404, `${method} ${path}: malformed component returns 404`);
+		s.check(configTrap.touched.length === 0, `${method} ${path}: config remains untouched`);
+		s.check(roomTrap.touched.length === 0, `${method} ${path}: room remains untouched`);
+	}
+}
+
 await s.done();

@@ -1,65 +1,69 @@
 import { getServerByName } from "partyserver";
-import { getSocketAuthToken, isAuthorized } from "./auth";
-import { json, withCors } from "./http";
-import { fetchVaultSchemaVersion } from "./trace";
-import { verifyTicket } from "./ticket";
 import { SERVER_SCHEMA_VERSION } from "../version";
+import { configFetch } from "./auth";
+import { json, safeDecodeUriComponent, withCors } from "./http";
+import { inspectTicket } from "./ticket";
+import { fetchVaultSchemaVersion } from "./trace";
 import type { AuthState, Env, FatalAuthCode } from "./types";
 
 export function parseSyncPath(pathname: string): { vaultId: string } | null {
-	const directMatch = pathname.match(/^\/vault\/sync\/([^/]+)$/);
-	if (directMatch) {
-		const [, vaultId] = directMatch;
-		if (vaultId) {
-			return { vaultId: decodeURIComponent(vaultId) };
-		}
-	}
-	return null;
+	const match = pathname.match(/^\/vault\/sync\/([^/]+)$/);
+	if (!match?.[1]) return null;
+	const vaultId = safeDecodeUriComponent(match[1]);
+	return vaultId === null ? null : { vaultId };
 }
 
-/**
- * Parse the client's declared schema version. Returns null when the parameter
- * is absent, blank, or not a non-negative integer — all of which are hard
- * admission failures. There is no "assume the oldest version" default: an
- * undeclared schema is an unknown writer, not a legacy one.
- */
 function parseClientSchemaVersion(url: URL): number | null {
-	const raw = url.searchParams.get("schemaVersion") ?? url.searchParams.get("schema");
+	const raw = url.searchParams.get("schemaVersion");
 	if (raw === null || raw.trim() === "") return null;
 	const parsed = Number(raw);
-	if (!Number.isInteger(parsed) || parsed < 0) return null;
-	return parsed;
+	return Number.isInteger(parsed) && parsed >= 0 ? parsed : null;
 }
+function describeInvalidSchema(raw: string | null): {
+	present: boolean;
+	length: number;
+	lengthCapped: boolean;
+	classification: "missing" | "blank" | "unsigned_integer" | "negative_integer" | "other";
+} {
+	const actualLength = raw?.length ?? 0;
+	let classification: "missing" | "blank" | "unsigned_integer" | "negative_integer" | "other";
+	if (raw === null) {
+		classification = "missing";
+	} else if (raw.trim() === "") {
+		classification = "blank";
+	} else if (/^[0-9]+$/.test(raw)) {
+		classification = "unsigned_integer";
+	} else if (/^-[0-9]+$/.test(raw)) {
+		classification = "negative_integer";
+	} else {
+		classification = "other";
+	}
+	return {
+		present: raw !== null,
+		length: Math.min(actualLength, 256),
+		lengthCapped: actualLength > 256,
+		classification,
+	};
+}
+
 
 function isWebSocketRequest(req: Request): boolean {
 	return (req.headers.get("Upgrade") ?? "").toLowerCase() === "websocket";
 }
 
-function rejectSocket(
-	req: Request,
-	code: FatalAuthCode,
-	details: Record<string, unknown> = {},
-): Response {
+function rejectSocket(req: Request, code: FatalAuthCode, details: Record<string, unknown> = {}): Response {
 	if (!isWebSocketRequest(req)) {
 		return json(
 			{ error: code, ...details },
-			code === "unauthorized"
-				? 401
-				: code === "update_required"
-					? 426
-					: 503,
+			code === "unauthorized" ? 401 : code === "update_required" ? 426 : 503,
 		);
 	}
-
 	const pair = new WebSocketPair();
 	const client = pair[0];
 	const server = pair[1];
 	server.accept();
 	const payload = JSON.stringify({ type: "error", code, ...details });
-	// Send a plain JSON frame first for generic websocket clients/tests.
 	server.send(payload);
-	// y-partyserver clients consume string control messages via "__YPS:".
-	// Send fatal auth payload through that channel so plugins can fail loudly.
 	server.send(`__YPS:${payload}`);
 	server.close(
 		1008,
@@ -67,93 +71,44 @@ function rejectSocket(
 			? "unauthorized"
 			: code === "update_required"
 				? "update required"
-			: code === "unclaimed"
-				? "server unclaimed"
-				: "server misconfigured",
+				: code === "unclaimed"
+					? "server unclaimed"
+					: code === "server_format_unsupported"
+						? "server format unsupported"
+						: "server misconfigured",
 	);
-	return new Response(null, {
-		status: 101,
-		webSocket: client,
-	});
+	return new Response(null, { status: 101, webSocket: client });
 }
 
 function returnSocketResponse(req: Request, response: Response): Response {
 	return isWebSocketRequest(req) ? response : withCors(response);
 }
 
-/**
- * Pre-auth rejection telemetry MUST NOT touch Durable Object storage
- * (INV-SEC-01, INV-OBS-02). See server/src/index.ts for the long-form
- * comment and root-cause history (issue #40).
- */
-function logSocketRejection(
-	vaultId: string,
-	reason: "unclaimed" | "server_misconfigured" | "unauthorized",
-): void {
-	// Truncate vaultId so it cannot become a correlation handle in exported
-	// worker logs.
-	const vaultIdHint = vaultId.slice(0, 8);
+function logSocketRejection(vaultId: string, reason: string): void {
 	console.warn(
-		`[yaos-sync:worker] ws rejected pre-auth: ` +
-		JSON.stringify({ vaultIdHint, reason }),
+		"[yaos-sync:worker] ws rejected pre-auth: "
+		+ JSON.stringify({ vaultIdHint: vaultId.slice(0, 8), reason }),
 	);
 }
 
-// ---------------------------------------------------------------------------
-// Pure socket auth decision
-// ---------------------------------------------------------------------------
-
 export type SocketAuthResult =
-	| { ok: true; method: "ticket" | "legacy-token" }
-	| { ok: false; reason: "unclaimed" | "server_misconfigured" | "unauthorized" };
+	| { ok: true; method: "ticket"; deviceId: string }
+	| { ok: false; reason: "unclaimed" | "server_format_unsupported" | "server_misconfigured" | "unauthorized" };
 
-/**
- * Decide whether a WebSocket connection request is authenticated.
- *
- * Pure function: takes no Request object, touches no Durable Objects, emits
- * no telemetry.  The route calls this then acts on the result.
- *
- * Auth rules:
- *   1. Ticket present → verify exclusively.  A bad ticket rejects hard and
- *      does NOT fall back to the token path.
- *   2. No ticket, legacy NOT disabled → verify long-lived token.
- *   3. No ticket, legacy IS disabled → reject unauthorised.  The server
- *      operator has opted out of the migration window.
- */
 export async function authenticateSocketRequest(
 	ticket: string | null,
-	token: string | null,
 	authState: AuthState,
 	vaultId: string,
-	disableLegacyToken: boolean,
 ): Promise<SocketAuthResult> {
-	if (!authState.claimed) {
-		return { ok: false, reason: "unclaimed" };
-	}
-	if (authState.mode === "env" && !authState.envToken) {
-		return { ok: false, reason: "server_misconfigured" };
-	}
-
-	if (ticket !== null) {
-		const ticketValid = await verifyTicket(ticket, authState, vaultId);
-		return ticketValid
-			? { ok: true, method: "ticket" }
-			: { ok: false, reason: "unauthorized" };
-	}
-
-	if (disableLegacyToken) {
-		return { ok: false, reason: "unauthorized" };
-	}
-
-	const tokenValid = await isAuthorized(authState, token);
-	return tokenValid
-		? { ok: true, method: "legacy-token" }
+	if (authState.mode === "unsupported") return { ok: false, reason: "server_format_unsupported" };
+	if (!authState.claimed) return { ok: false, reason: "unclaimed" };
+	if (authState.mode !== "claim") return { ok: false, reason: "server_misconfigured" };
+	if (ticket === null) return { ok: false, reason: "unauthorized" };
+	const payload = await inspectTicket(ticket, authState, vaultId);
+	return payload
+		? { ok: true, method: "ticket", deviceId: payload.deviceId }
 		: { ok: false, reason: "unauthorized" };
 }
-
-// ---------------------------------------------------------------------------
-// Route handler
-// ---------------------------------------------------------------------------
 
 export async function handleSyncSocketRoute(
 	req: Request,
@@ -162,62 +117,48 @@ export async function handleSyncSocketRoute(
 	vaultId: string,
 ): Promise<Response> {
 	const url = new URL(req.url);
-	const token = getSocketAuthToken(req);
-	const ticket = url.searchParams.get("ticket");
-	const clientSchemaVersion = parseClientSchemaVersion(url);
-	const disableLegacyToken = !!env.YAOS_DISABLE_LEGACY_WS_TOKEN;
-
-	const authResult = await authenticateSocketRequest(
-		ticket, token, authState, vaultId, disableLegacyToken,
-	);
-
+	const authResult = await authenticateSocketRequest(url.searchParams.get("ticket"), authState, vaultId);
 	if (!authResult.ok) {
 		logSocketRejection(vaultId, authResult.reason);
 		return returnSocketResponse(req, rejectSocket(req, authResult.reason));
 	}
 
-	// Warn on every legacy-token connection so operators can monitor adoption
-	// before enabling YAOS_DISABLE_LEGACY_WS_TOKEN.
-	if (authResult.method === "legacy-token") {
-		console.warn(
-			`[yaos-sync:worker] legacy ?token= WebSocket auth for vault ${vaultId.slice(0, 8)} — ` +
-			`upgrade client to use short-lived tickets, or set YAOS_DISABLE_LEGACY_WS_TOKEN to enforce`,
-		);
+	// Signature and expiry are insufficient: membership is rechecked on every
+	// handshake so revocation invalidates an otherwise-live ticket immediately.
+	const membership = await configFetch(env, "/__yaos/verify-device", {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ deviceId: authResult.deviceId, vaultId }),
+	});
+	if (!membership.ok) {
+		logSocketRejection(vaultId, "unauthorized");
+		return returnSocketResponse(req, rejectSocket(req, "unauthorized"));
+	}
+	try {
+		await configFetch(env, "/__yaos/touch-device", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ deviceId: authResult.deviceId, vaultId }),
+		});
+	} catch {
+		// lastSeenAt is best-effort.
 	}
 
+	const rawSchema = url.searchParams.get("schemaVersion");
+	const clientSchemaVersion = parseClientSchemaVersion(url);
 	if (clientSchemaVersion === null) {
-		// WebSocket admission events must not write to YAOS_SYNC storage
-		// (issue #40 — a schema-mismatch loop would hammer the DO on every
-		// reconnect attempt).  Log only via console for worker-level visibility.
-		console.warn(
-			`[yaos-sync:worker] ws rejected (update_required): ` +
-			JSON.stringify({
-				vaultIdHint: vaultId.slice(0, 8),
-				reason: "update_required",
-				detail: "invalid_client_schema",
-				rawSchema: url.searchParams.get("schemaVersion") ?? url.searchParams.get("schema") ?? null,
-			}),
-		);
+		console.warn("[yaos-sync:worker] ws rejected (update_required): " + JSON.stringify({
+			vaultIdHint: vaultId.slice(0, 8),
+			reason: "invalid_client_schema",
+			schemaQuery: describeInvalidSchema(rawSchema),
+		}));
 		return returnSocketResponse(req, rejectSocket(req, "update_required", {
 			reason: "invalid_client_schema",
 			clientSchemaVersion: null,
 			roomSchemaVersion: null,
 		}));
 	}
-
 	if (clientSchemaVersion !== SERVER_SCHEMA_VERSION) {
-		// Enforce the server's declared capability envelope before probing the
-		// room Durable Object. Cached plugin preflight is helpful UX, but this is
-		// the authoritative protection against unsupported writers.
-		console.warn(
-			`[yaos-sync:worker] ws rejected (update_required): ` +
-			JSON.stringify({
-				vaultIdHint: vaultId.slice(0, 8),
-				reason: "client_schema_unsupported",
-				clientSchemaVersion,
-				serverSchemaVersion: SERVER_SCHEMA_VERSION,
-			}),
-		);
 		return returnSocketResponse(req, rejectSocket(req, "update_required", {
 			reason: "client_schema_unsupported",
 			clientSchemaVersion,
@@ -225,53 +166,24 @@ export async function handleSyncSocketRoute(
 			serverSchemaVersion: SERVER_SCHEMA_VERSION,
 		}));
 	}
-
 	const roomSchemaVersion = await fetchVaultSchemaVersion(env, vaultId);
 	if (roomSchemaVersion !== null && roomSchemaVersion !== clientSchemaVersion) {
-		// Room skew is symmetric: a client older than the room would read data it
-		// cannot represent, and a client newer than the room would write data the
-		// room's other writers cannot read. Under a single pinned version the only
-		// admissible relation is equality; the two directions get distinct reasons
-		// so logs distinguish "stale plugin" from "stale room".
-		//
-		// Schema-skew rejection — console only, no YAOS_SYNC write (issue #40).
-		// A retry loop here would otherwise fan out one DO subrequest per attempt.
 		const reason = clientSchemaVersion < roomSchemaVersion
 			? "client_schema_older_than_room"
 			: "client_schema_newer_than_room";
-		console.warn(
-			`[yaos-sync:worker] ws rejected (update_required): ` +
-			JSON.stringify({
-				vaultIdHint: vaultId.slice(0, 8),
-				reason: "update_required",
-				detail: reason,
-				clientSchemaVersion,
-				roomSchemaVersion,
-			}),
-		);
 		return returnSocketResponse(req, rejectSocket(req, "update_required", {
 			reason,
 			clientSchemaVersion,
 			roomSchemaVersion,
 		}));
 	}
-
-	// Successful connection — console only, no YAOS_SYNC trace write (issue #40).
-	// A reconnect storm would otherwise produce:
-	//   YAOS_CONFIG auth + YAOS_SYNC schema check + YAOS_SYNC trace write
-	// on every connect, burning ~3 subrequests per socket open.
-	console.debug(
-		`[yaos-sync:worker] ws connected: ` +
-		JSON.stringify({
-			vaultIdHint: vaultId.slice(0, 8),
-			clientSchemaVersion,
-			roomSchemaVersion,
-			authMethod: authResult.method,
-			cfRay: req.headers.get("cf-ray") ?? undefined,
-		}),
-	);
-
+	console.debug("[yaos-sync:worker] ws connected: " + JSON.stringify({
+		vaultIdHint: vaultId.slice(0, 8),
+		clientSchemaVersion,
+		roomSchemaVersion,
+		authMethod: authResult.method,
+		cfRay: req.headers.get("cf-ray") ?? undefined,
+	}));
 	const stub = await getServerByName(env.YAOS_SYNC, vaultId);
-	return await stub.fetch(req);
+	return stub.fetch(req);
 }
-

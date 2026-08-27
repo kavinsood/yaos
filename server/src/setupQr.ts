@@ -1,11 +1,11 @@
 import qrcode from "qrcode-generator";
 
 /**
- * Builds the URL encoded by the setup QR. Setup values remain in the fragment
- * so scanners do not send the token or vault ID in the mobile page request.
+ * Builds the URL encoded by the setup QR. The one-time pairing code remains in
+ * the fragment so scanners never send it in the mobile page request.
  */
-export function buildMobileSetupUrl(host: string, token: string, vaultId: string): string {
-	const hash = new URLSearchParams({ host, token, vaultId }).toString();
+export function buildMobileSetupUrl(host: string, pairingCode: string): string {
+	const hash = new URLSearchParams({ host, pairingCode }).toString();
 	return `${host}/mobile-setup#${hash}`;
 }
 

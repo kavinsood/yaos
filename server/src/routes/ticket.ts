@@ -1,244 +1,152 @@
-/**
- * Short-lived WebSocket connection tickets.
- *
- * # Why
- * The browser WebSocket() constructor does not accept custom headers, so auth
- * tokens cannot be passed via Authorization: Bearer during the WS handshake.
- * Putting the long-lived token in a query parameter exposes it in server logs
- * and browser devtools.
- *
- * A short-lived ticket fixes this: the long-lived token is sent only in a
- * normal HTTP POST (Authorization header, TLS-encrypted, not logged in URL
- * access logs), and the resulting ticket — valid for 5 minutes — is placed in
- * the WebSocket URL.  Even if logged, a stale ticket is useless.
- *
- * # Ticket format
- * Two base64url-encoded segments separated by ".":
- *
- *   base64url(JSON(payload)) "." base64url(HMAC-SHA256(signingKey, base64url(JSON(payload))))
- *
- * The payload is a small JSON object:
- *   { v: 1, aud: "yaos-ws", vaultId: "...", iat: ms, exp: ms, nonce: "..." }
- *
- * # Signing key
- * Derived from the existing auth secret so no new deployment secret is needed:
- *   env-token mode  → raw bytes of SYNC_TOKEN
- *   claim mode      → raw bytes of the stored tokenHash (hex string)
- *
- * The invariant is preserved: no Durable Object is woken before the ticket is
- * verified at the Worker edge (INV-SEC-01).
- */
-
 import { base64UrlToBytes, bytesToBase64Url, randomBase64Url } from "../base64url";
 import type { AuthState, Env } from "./types";
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
 const TICKET_VERSION = 1;
-const TICKET_AUD = "yaos-ws";
-/** Default TTL.  Long enough for slow mobile reconnects; short enough to
- *  limit the damage from a logged value. */
-export const TICKET_TTL_MS = 5 * 60 * 1_000; // 5 minutes
-const MAX_REASONABLE_TICKET_TTL_MS = 24 * 60 * 60 * 1_000; // 24 hours
-
-function readTicketTtlMs(raw: string | undefined): number {
-	if (!raw) return TICKET_TTL_MS;
-	const parsed = Number(raw);
-	if (!Number.isFinite(parsed)) return TICKET_TTL_MS;
-	return Math.min(MAX_REASONABLE_TICKET_TTL_MS, Math.max(1_000, Math.floor(parsed)));
-}
-
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
+const TICKET_AUDIENCE = "yaos-ws";
+export const TICKET_TTL_MS = 5 * 60 * 1_000;
+const MAX_TICKET_TTL_MS = 24 * 60 * 60 * 1_000;
 
 export interface TicketPayload {
 	v: number;
 	aud: string;
 	vaultId: string;
+	deviceId: string;
 	iat: number;
 	exp: number;
 	nonce: string;
 }
 
-// ---------------------------------------------------------------------------
-// Signing key derivation
-// ---------------------------------------------------------------------------
+function readTicketTtlMs(raw: string | undefined): number {
+	if (!raw) return TICKET_TTL_MS;
+	const parsed = Number(raw);
+	return Number.isFinite(parsed)
+		? Math.min(MAX_TICKET_TTL_MS, Math.max(1_000, Math.floor(parsed)))
+		: TICKET_TTL_MS;
+}
 
-/**
- * Import the HMAC-SHA256 signing key from the server's auth secret.
- *
- * env mode  → SYNC_TOKEN (the raw token string)
- * claim mode → tokenHash  (the stored SHA-256 hex of the token)
- *
- * Returns null if the auth state is unclaimed (no key material available).
- */
-async function deriveSigningKey(authState: AuthState): Promise<CryptoKey | null> {
-	let keyMaterial: string;
-	if (authState.mode === "env") {
-		keyMaterial = authState.envToken;
-	} else if (authState.mode === "claim") {
-		keyMaterial = authState.tokenHash;
-	} else {
-		return null;
-	}
+async function importSigningKey(ticketSigningKey: string): Promise<CryptoKey> {
 	return crypto.subtle.importKey(
 		"raw",
-		new TextEncoder().encode(keyMaterial),
+		new TextEncoder().encode(ticketSigningKey),
 		{ name: "HMAC", hash: "SHA-256" },
 		false,
 		["sign", "verify"],
 	);
 }
 
-// ---------------------------------------------------------------------------
-// Ticket creation
-// ---------------------------------------------------------------------------
-
 export async function createTicket(
 	authState: AuthState,
 	vaultId: string,
+	deviceId: string,
 	ttlMs = TICKET_TTL_MS,
 ): Promise<{ ticket: string; expiresAt: number; ttlMs: number }> {
-	const key = await deriveSigningKey(authState);
-	if (!key) throw new Error("cannot sign ticket: server is unclaimed");
-
+	if (authState.mode !== "claim") throw new Error("cannot sign ticket: server is unavailable");
 	const now = Date.now();
 	const exp = now + ttlMs;
-
 	const payload: TicketPayload = {
 		v: TICKET_VERSION,
-		aud: TICKET_AUD,
+		aud: TICKET_AUDIENCE,
 		vaultId,
+		deviceId,
 		iat: now,
 		exp,
 		nonce: randomBase64Url(16),
 	};
-
-	const encodedPayload = bytesToBase64Url(
-		new TextEncoder().encode(JSON.stringify(payload)),
-	);
-	const sigBytes = await crypto.subtle.sign(
+	const encodedPayload = bytesToBase64Url(new TextEncoder().encode(JSON.stringify(payload)));
+	const signature = await crypto.subtle.sign(
 		"HMAC",
-		key,
+		await importSigningKey(authState.ticketSigningKey),
 		new TextEncoder().encode(encodedPayload),
 	);
-	const encodedSig = bytesToBase64Url(new Uint8Array(sigBytes));
-
 	return {
-		ticket: `${encodedPayload}.${encodedSig}`,
+		ticket: `${encodedPayload}.${bytesToBase64Url(new Uint8Array(signature))}`,
 		expiresAt: exp,
 		ttlMs,
 	};
 }
 
-// ---------------------------------------------------------------------------
-// Ticket verification
-// ---------------------------------------------------------------------------
+export async function inspectTicket(
+	ticket: string,
+	authState: AuthState,
+	expectedVaultId: string,
+): Promise<TicketPayload | null> {
+	if (authState.mode !== "claim") return null;
+	const dot = ticket.indexOf(".");
+	if (dot <= 0 || dot !== ticket.lastIndexOf(".") || dot === ticket.length - 1) return null;
+	const encodedPayload = ticket.slice(0, dot);
+	let signature: Uint8Array;
+	let payloadBytes: Uint8Array;
+	try {
+		signature = base64UrlToBytes(ticket.slice(dot + 1));
+		payloadBytes = base64UrlToBytes(encodedPayload);
+	} catch {
+		return null;
+	}
+	const valid = await crypto.subtle.verify(
+		"HMAC",
+		await importSigningKey(authState.ticketSigningKey),
+		signature,
+		new TextEncoder().encode(encodedPayload),
+	);
+	if (!valid) return null;
+	let payload: unknown;
+	try {
+		payload = JSON.parse(new TextDecoder().decode(payloadBytes));
+	} catch {
+		return null;
+	}
+	if (!isTicketPayload(payload)) return null;
+	if (payload.v !== TICKET_VERSION || payload.aud !== TICKET_AUDIENCE) return null;
+	if (payload.vaultId !== expectedVaultId || payload.exp <= Date.now()) return null;
+	return payload;
+}
 
-/**
- * Verify a ticket string.  Returns `true` only when:
- *   - The ticket is structurally valid (two base64url segments separated by ".")
- *   - The HMAC-SHA256 signature is correct for the current auth secret
- *   - The ticket has not expired
- *   - The `aud` and `v` fields match expected constants
- *   - The embedded `vaultId` matches `expectedVaultId`
- *
- * Any failure returns `false` without throwing — invalid tickets are treated
- * as unauthorized, not as errors.
- */
 export async function verifyTicket(
 	ticket: string,
 	authState: AuthState,
 	expectedVaultId: string,
 ): Promise<boolean> {
-	const dot = ticket.indexOf(".");
-	if (dot <= 0 || dot === ticket.length - 1) return false;
-
-	const encodedPayload = ticket.slice(0, dot);
-	const encodedSig = ticket.slice(dot + 1);
-
-	const key = await deriveSigningKey(authState);
-	if (!key) return false;
-
-	let sigBytes: Uint8Array;
-	let payloadBytes: Uint8Array;
-	try {
-		sigBytes = base64UrlToBytes(encodedSig);
-		payloadBytes = base64UrlToBytes(encodedPayload);
-	} catch {
-		return false;
-	}
-
-	// Verify HMAC over the encoded payload string (not the decoded bytes).
-	const valid = await crypto.subtle.verify(
-		"HMAC",
-		key,
-		sigBytes,
-		new TextEncoder().encode(encodedPayload),
-	);
-	if (!valid) return false;
-
-	let payload: unknown;
-	try {
-		payload = JSON.parse(new TextDecoder().decode(payloadBytes));
-	} catch {
-		return false;
-	}
-
-	if (!isTicketPayload(payload)) return false;
-	if (payload.v !== TICKET_VERSION) return false;
-	if (payload.aud !== TICKET_AUD) return false;
-	if (payload.vaultId !== expectedVaultId) return false;
-	if (payload.exp <= Date.now()) return false;
-
-	return true;
+	return (await inspectTicket(ticket, authState, expectedVaultId)) !== null;
 }
 
 function isTicketPayload(value: unknown): value is TicketPayload {
 	if (!value || typeof value !== "object") return false;
-	const p = value as Record<string, unknown>;
-	return (
-		typeof p.v === "number" &&
-		typeof p.aud === "string" &&
-		typeof p.vaultId === "string" &&
-		typeof p.iat === "number" &&
-		typeof p.exp === "number" &&
-		typeof p.nonce === "string"
-	);
+	const payload = value as Record<string, unknown>;
+	return typeof payload.v === "number"
+		&& typeof payload.aud === "string"
+		&& typeof payload.vaultId === "string"
+		&& payload.vaultId.length > 0
+		&& typeof payload.deviceId === "string"
+		&& payload.deviceId.length > 0
+		&& typeof payload.iat === "number"
+		&& typeof payload.exp === "number"
+		&& typeof payload.nonce === "string";
 }
 
-// ---------------------------------------------------------------------------
-// HTTP handler
-// ---------------------------------------------------------------------------
-
-/**
- * POST /vault/:vaultId/auth/ticket
- *
- * Called by the plugin before opening a WebSocket connection.  The caller
- * must already be authenticated (Bearer token validated upstream by the
- * rejectAndLogUnauthorizedVaultRequest gate in index.ts).
- *
- * Returns { ticket: string, expiresAt: number }.
- */
 export async function handleTicketRoute(
 	_req: Request,
 	authState: AuthState,
 	vaultId: string,
+	deviceId: string,
 	json: (body: unknown, status?: number) => Response,
 	env?: Env,
 ): Promise<Response> {
-		try {
-			// Allow a short test TTL override so the integration harness can exercise
-			// the proactive refresh path without waiting 5 minutes.
-			const ttlMs = readTicketTtlMs(env?.YAOS_TICKET_TTL_MS);
-			const result = await createTicket(authState, vaultId, ttlMs);
-			return json(result);
-	} catch (err) {
-		const message = err instanceof Error ? err.message : "ticket creation failed";
-		console.error("[yaos-sync:worker] ticket creation error:", message);
-		return json({ error: message }, 500);
+	try {
+		const result = await createTicket(authState, vaultId, deviceId, readTicketTtlMs(env?.YAOS_TICKET_TTL_MS));
+		if (env) {
+			try {
+				const id = env.YAOS_CONFIG.idFromName("global-config");
+				await env.YAOS_CONFIG.get(id).fetch("https://internal/__yaos/touch-device", {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({ deviceId, vaultId }),
+				});
+			} catch {
+				// lastSeenAt is best-effort and never blocks a valid ticket.
+			}
+		}
+		return json(result);
+	} catch (error) {
+		return json({ error: error instanceof Error ? error.message : "ticket creation failed" }, 500);
 	}
 }

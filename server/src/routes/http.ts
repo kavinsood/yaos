@@ -1,6 +1,14 @@
 const CORS_ALLOW_HEADERS = "Authorization, Content-Type";
 const CORS_ALLOW_METHODS = "GET, POST, PUT, OPTIONS";
 const CORS_EXPOSE_HEADERS = "X-YAOS-Snapshot-Day";
+export function safeDecodeUriComponent(value: string): string | null {
+	try {
+		return decodeURIComponent(value);
+	} catch {
+		return null;
+	}
+}
+
 
 export function json(body: unknown, status = 200): Response {
 	return new Response(JSON.stringify(body), {

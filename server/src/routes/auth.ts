@@ -1,6 +1,18 @@
-import { sha256Hex } from "../hex";
+import { randomBase64Url } from "../base64url";
+import type { ConsoleState, StoredServerConfig } from "../config";
+import { MAX_BLOB_UPLOAD_BYTES } from "../contracts";
+import {
+	CONFIG_FORMAT,
+	OPERATOR_COOKIE,
+	OPERATOR_SESSION_TTL_MS,
+	PAIRING_CODE_BYTES,
+	SESSION_TOKEN_BYTES,
+	SIGNING_KEY_BYTES,
+	type DevicePublic,
+	hashSecret,
+	randomSecret,
+} from "../identity";
 import { buildMobileSetupUrl, renderSetupQrDataUrl } from "../setupQr";
-import type { StoredServerConfig } from "../config";
 import {
 	SERVER_MIN_PLUGIN_VERSION,
 	SERVER_RECOMMENDED_PLUGIN_VERSION,
@@ -9,24 +21,12 @@ import {
 } from "../version";
 import { json } from "./http";
 import type { AuthState, AuthStateCached, Env, UpdateProvider } from "./types";
-import { MAX_BLOB_UPLOAD_BYTES } from "../contracts";
 
 export function getHttpAuthToken(req: Request): string | null {
-	const auth = req.headers.get("Authorization");
-	if (!auth?.startsWith("Bearer ")) return null;
-	const token = auth.slice("Bearer ".length).trim();
+	const authorization = req.headers.get("Authorization");
+	if (!authorization?.startsWith("Bearer ")) return null;
+	const token = authorization.slice("Bearer ".length).trim();
 	return token || null;
-}
-
-export function getSocketAuthToken(req: Request): string | null {
-	const headerToken = getHttpAuthToken(req);
-	if (headerToken) return headerToken;
-	return new URL(req.url).searchParams.get("token");
-}
-
-async function hashToken(token: string): Promise<string> {
-	const bytes = new TextEncoder().encode(token);
-	return sha256Hex(bytes);
 }
 
 export function supportsBuckets(env: Env): boolean {
@@ -35,31 +35,12 @@ export function supportsBuckets(env: Env): boolean {
 
 export async function getStoredServerConfig(env: Env): Promise<StoredServerConfig> {
 	const id = env.YAOS_CONFIG.idFromName("global-config");
-	const stub = env.YAOS_CONFIG.get(id);
-	const res = await stub.fetch("https://internal/__yaos/config");
-	if (!res.ok) {
-		throw new Error(`config fetch failed (${res.status})`);
-	}
-	return await res.json();
+	const response = await env.YAOS_CONFIG.get(id).fetch("https://internal/__yaos/config");
+	if (!response.ok) throw new Error(`config fetch failed (${response.status})`);
+	return response.json();
 }
 
-// ── Config cache (issue #40 — stop per-request DO round-trips) ───────────────
-//
-// getStoredServerConfig() does a live Durable Object fetch every call.  In
-// claim mode that fires on every Worker request.  Cache the config for a short
-// TTL so a reconnect storm or scanner traffic does not each become a separate
-// YAOS_CONFIG subrequest.
-//
-// Security note: we cache the *stored* config (tokenHash, updateProvider etc.),
-// not the auth decision itself.  Token verification still runs on every request
-// against the cached tokenHash — we just avoid re-fetching the hash from the DO
-// on every request.
-//
-// The cache is invalidated after /claim and /api/update-metadata writes so that
-// the operator sees the new state immediately on the next request.
-
 const AUTH_CONFIG_CACHE_TTL_MS = 60_000;
-
 let cachedConfig: { value: StoredServerConfig; expiresAt: number } | null = null;
 let configInflight: Promise<StoredServerConfig> | null = null;
 
@@ -70,12 +51,8 @@ export function invalidateStoredServerConfigCache(): void {
 
 export async function getStoredServerConfigCached(env: Env): Promise<StoredServerConfig> {
 	const now = Date.now();
-	if (cachedConfig && cachedConfig.expiresAt > now) {
-		return cachedConfig.value;
-	}
-	if (configInflight) {
-		return configInflight;
-	}
+	if (cachedConfig && cachedConfig.expiresAt > now) return cachedConfig.value;
+	if (configInflight) return configInflight;
 	configInflight = getStoredServerConfig(env)
 		.then((config) => {
 			cachedConfig = { value: config, expiresAt: Date.now() + AUTH_CONFIG_CACHE_TTL_MS };
@@ -87,123 +64,157 @@ export async function getStoredServerConfigCached(env: Env): Promise<StoredServe
 	return configInflight;
 }
 
-async function claimServerConfig(env: Env, tokenHash: string): Promise<boolean> {
+export async function configFetch(env: Env, path: string, init?: RequestInit): Promise<Response> {
 	const id = env.YAOS_CONFIG.idFromName("global-config");
-	const stub = env.YAOS_CONFIG.get(id);
-	const res = await stub.fetch("https://internal/__yaos/claim", {
-		method: "POST",
-		headers: {
-			"Content-Type": "application/json",
-		},
-		body: JSON.stringify({ tokenHash }),
-	});
-	return res.ok;
+	return env.YAOS_CONFIG.get(id).fetch(`https://internal${path}`, init);
 }
 
-async function setServerUpdateMetadata(env: Env, metadata: {
-	updateProvider?: unknown;
-	updateRepoUrl?: unknown;
-	updateRepoBranch?: unknown;
-}): Promise<StoredServerConfig> {
-	const id = env.YAOS_CONFIG.idFromName("global-config");
-	const stub = env.YAOS_CONFIG.get(id);
-	const res = await stub.fetch("https://internal/__yaos/update-metadata", {
-		method: "POST",
-		headers: {
-			"Content-Type": "application/json",
-		},
-		body: JSON.stringify(metadata),
-	});
-	if (!res.ok) {
-		const body = await res.text().catch(() => "");
-		throw new Error(`update metadata write failed (${res.status})${body ? `: ${body}` : ""}`);
+function authStateFromConfig(config: StoredServerConfig): AuthStateCached {
+	if (config.claimed && config.configFormat !== CONFIG_FORMAT) {
+		return { mode: "unsupported", claimed: true, config };
 	}
-	const payload: { config?: StoredServerConfig } = await res.json();
-	if (!payload?.config) {
-		throw new Error("update metadata write failed (missing config)");
+	if (
+		config.claimed
+		&& config.configFormat === CONFIG_FORMAT
+		&& typeof config.operatorRecoveryHash === "string"
+		&& config.operatorRecoveryHash.length > 0
+		&& typeof config.ticketSigningKey === "string"
+		&& config.ticketSigningKey.length > 0
+	) {
+		return {
+			mode: "claim",
+			claimed: true,
+			operatorRecoveryHash: config.operatorRecoveryHash,
+			ticketSigningKey: config.ticketSigningKey,
+			config,
+		};
 	}
-	return payload.config;
-}
-
-/**
- * Cached auth-state lookup. Uses getStoredServerConfigCached so that
- * repeated requests within AUTH_CONFIG_CACHE_TTL_MS share a single YAOS_CONFIG
- * subrequest instead of each paying a DO round-trip.  The cached AuthState
- * carries the full StoredServerConfig in claim/unclaimed modes so callers can
- * reuse it without a second fetch (e.g. /api/capabilities).
- */
-export async function getAuthStateCached(env: Env): Promise<AuthStateCached> {
-	const envToken = env.SYNC_TOKEN?.trim();
-	if (envToken) {
-		return { mode: "env", claimed: true, envToken };
-	}
-
-	const config = await getStoredServerConfigCached(env);
-	if (config.claimed && typeof config.tokenHash === "string" && config.tokenHash.length > 0) {
-		return { mode: "claim", claimed: true, tokenHash: config.tokenHash, config };
-	}
-
+	if (config.claimed) return { mode: "unsupported", claimed: true, config };
 	return { mode: "unclaimed", claimed: false, config };
 }
 
-export async function isAuthorized(
-	state: AuthState,
-	token: string | null,
-): Promise<boolean> {
-	if (!token) return false;
-	if (state.mode === "env") {
-		return token === state.envToken;
-	}
-	if (state.mode === "claim") {
-		return (await hashToken(token)) === state.tokenHash;
-	}
-	return false;
+export async function getAuthStateCached(env: Env): Promise<AuthStateCached> {
+	return authStateFromConfig(await getStoredServerConfigCached(env));
 }
 
-export type PreAuthRejectionReason = "unclaimed" | "server_misconfigured" | "unauthorized";
+export type PreAuthRejectionReason =
+	| "unclaimed"
+	| "server_format_unsupported"
+	| "server_misconfigured"
+	| "unauthorized";
 
-/** Typed rejection result — carries both the HTTP response and the reason for logging. */
 export interface AuthRejection {
 	response: Response;
 	reason: PreAuthRejectionReason;
 }
 
-/**
- * Returns a typed rejection (response + reason) if the request fails pre-auth,
- * or null if the request is authorized and should proceed to the vault handler.
- * Does NOT touch any Durable Object namespace — exported for runtime testing (FU-4).
- *
- * Callers log `rejection.reason` — no duplicated decision tree.
- */
+export async function authorizeDevice(
+	env: Env,
+	token: string | null,
+	vaultId: string,
+): Promise<DevicePublic | null> {
+	if (!token) return null;
+	const tokenHash = await hashSecret(token);
+	const response = await configFetch(env, "/__yaos/authorize-device", {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ tokenHash, vaultId }),
+	});
+	if (!response.ok) return null;
+	const body: { device?: DevicePublic } = await response.json();
+	return body.device ?? null;
+}
+
+export async function authorizeAnyDevice(env: Env, token: string | null): Promise<boolean> {
+	if (!token) return false;
+	const tokenHash = await hashSecret(token);
+	const response = await configFetch(env, "/__yaos/authorize-device", {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ tokenHash }),
+	});
+	return response.ok;
+}
+
+export async function readConsoleState(env: Env): Promise<ConsoleState | null> {
+	const response = await configFetch(env, "/__yaos/console");
+	return response.ok ? response.json() : null;
+}
+
 export async function rejectUnauthorizedVaultRequest(
 	req: Request,
-	_env: unknown,
+	env: Env,
 	authState: AuthState,
-	_vaultId: string,
+	vaultId: string,
 ): Promise<AuthRejection | null> {
-	const token = getHttpAuthToken(req);
+	if (authState.mode === "unsupported") {
+		return { response: json({ error: "server_format_unsupported" }, 503), reason: "server_format_unsupported" };
+	}
 	if (!authState.claimed) {
 		return { response: json({ error: "unclaimed" }, 503), reason: "unclaimed" };
 	}
-	if (authState.mode === "env" && !authState.envToken) {
+	if (authState.mode !== "claim" || !authState.ticketSigningKey) {
 		return { response: json({ error: "server_misconfigured" }, 503), reason: "server_misconfigured" };
 	}
-	if (!(await isAuthorized(authState, token))) {
+	if (!(await authorizeDevice(env, getHttpAuthToken(req), vaultId))) {
 		return { response: json({ error: "unauthorized" }, 401), reason: "unauthorized" };
 	}
 	return null;
 }
 
-function buildObsidianSetupUrl(host: string, token: string, vaultId?: string): string {
-	const params = new URLSearchParams({
-		action: "setup",
-		host,
-		token,
-	});
-	if (vaultId) {
-		params.set("vaultId", vaultId);
+export function readOperatorSessionToken(req: Request): string | null {
+	const cookie = req.headers.get("Cookie");
+	if (!cookie) return null;
+	for (const part of cookie.split(";")) {
+		const trimmed = part.trim();
+		if (trimmed.startsWith(`${OPERATOR_COOKIE}=`)) {
+			const value = trimmed.slice(OPERATOR_COOKIE.length + 1).trim();
+			return value || null;
+		}
 	}
-	return `obsidian://yaos?${params.toString()}`;
+	return null;
+}
+
+export function operatorCookieHeader(sessionToken: string, reqUrl: string, maxAgeSec: number): string {
+	const secure = new URL(reqUrl).protocol === "https:" ? "; Secure" : "";
+	return `${OPERATOR_COOKIE}=${sessionToken}; HttpOnly; Path=/; Max-Age=${maxAgeSec}; SameSite=Lax${secure}`;
+}
+
+export function clearOperatorCookieHeader(reqUrl: string): string {
+	const secure = new URL(reqUrl).protocol === "https:" ? "; Secure" : "";
+	return `${OPERATOR_COOKIE}=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax${secure}`;
+}
+
+export async function verifyOperatorSession(env: Env, req: Request): Promise<boolean> {
+	const token = readOperatorSessionToken(req);
+	if (!token) return false;
+	const sessionHash = await hashSecret(token);
+	const response = await configFetch(env, "/__yaos/verify-session", {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ sessionHash }),
+	});
+	return response.ok;
+}
+
+export async function createOperatorSession(env: Env, reqUrl: string): Promise<{ token: string; header: string }> {
+	const token = randomSecret(SESSION_TOKEN_BYTES);
+	const sessionHash = await hashSecret(token);
+	const exp = Date.now() + OPERATOR_SESSION_TTL_MS;
+	const response = await configFetch(env, "/__yaos/create-session", {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ sessionHash, exp }),
+	});
+	if (!response.ok) throw new Error("session create failed");
+	return {
+		token,
+		header: operatorCookieHeader(token, reqUrl, Math.floor(OPERATOR_SESSION_TTL_MS / 1_000)),
+	};
+}
+
+export function buildObsidianPairingUrl(host: string, pairingCode: string): string {
+	return `obsidian://yaos?${new URLSearchParams({ action: "setup", host, pairingCode }).toString()}`;
 }
 
 export function getCapabilities(
@@ -213,11 +224,9 @@ export function getCapabilities(
 	options: { includePrivateUpdateMetadata?: boolean } = {},
 ): {
 	claimed: boolean;
-	authMode: "env" | "claim" | "unclaimed";
 	attachments: boolean;
 	snapshots: boolean;
 	maxBlobUploadBytes: number;
-	socketTicketAuth: boolean;
 	serverVersion: string;
 	minPluginVersion: string | null;
 	recommendedPluginVersion: string | null;
@@ -229,11 +238,9 @@ export function getCapabilities(
 	const bucketEnabled = supportsBuckets(env);
 	return {
 		claimed: auth.claimed,
-		authMode: auth.mode,
 		attachments: bucketEnabled,
 		snapshots: bucketEnabled,
 		maxBlobUploadBytes: MAX_BLOB_UPLOAD_BYTES,
-		socketTicketAuth: true,
 		serverVersion: SERVER_VERSION,
 		minPluginVersion: SERVER_MIN_PLUGIN_VERSION,
 		recommendedPluginVersion: SERVER_RECOMMENDED_PLUGIN_VERSION,
@@ -246,107 +253,118 @@ export function getCapabilities(
 
 export async function handleClaimRoute(req: Request, env: Env, authState: AuthState): Promise<Response> {
 	const url = new URL(req.url);
-	if (authState.claimed) {
-		return json({ error: "already_claimed" }, 403);
-	}
-
-	let body: { token?: string; vaultId?: string } = {};
+	if (authState.mode === "unsupported") return json({ error: "server_format_unsupported" }, 409);
+	if (authState.claimed) return json({ error: "already_claimed" }, 403);
+	let body: { operatorRecoveryKey?: string };
 	try {
 		body = await req.json();
 	} catch {
 		return json({ error: "invalid json" }, 400);
 	}
+	const operatorRecoveryKey = typeof body.operatorRecoveryKey === "string" ? body.operatorRecoveryKey.trim() : "";
+	if (operatorRecoveryKey.length < 32) return json({ error: "invalid operatorRecoveryKey" }, 400);
 
-	if (typeof body.token !== "string" || body.token.trim().length < 32) {
-		return json({ error: "invalid token" }, 400);
-	}
-	if (body.vaultId !== undefined && (typeof body.vaultId !== "string" || body.vaultId.trim().length < 8)) {
-		return json({ error: "invalid vaultId" }, 400);
-	}
-
-	const token = body.token.trim();
-	const vaultId = typeof body.vaultId === "string" ? body.vaultId.trim() : "";
+	const operatorRecoveryHash = await hashSecret(operatorRecoveryKey);
+	const ticketSigningKey = randomSecret(SIGNING_KEY_BYTES);
+	const vaultId = randomBase64Url(16);
+	const pairingCode = randomSecret(PAIRING_CODE_BYTES);
+	const pairingCodeHash = await hashSecret(pairingCode);
 	let mobileSetupQrDataUrl: string;
 	try {
-		// Render before the durable claim write. A renderer failure must not leave
-		// an otherwise functional server irreversibly claimed with a failed setup UI.
-		mobileSetupQrDataUrl = await renderSetupQrDataUrl(
-			buildMobileSetupUrl(url.origin, token, vaultId),
-		);
+		mobileSetupQrDataUrl = await renderSetupQrDataUrl(buildMobileSetupUrl(url.origin, pairingCode));
 	} catch {
 		return json({ error: "setup QR generation failed" }, 500);
 	}
-
-	const tokenHash = await hashToken(token);
-	const claimed = await claimServerConfig(env, tokenHash);
-	if (!claimed) {
-		return json({ error: "already_claimed" }, 403);
+	const claimed = await configFetch(env, "/__yaos/claim", {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ operatorRecoveryHash, ticketSigningKey, vaultId, vaultName: "Personal", pairingCodeHash, pairingPurpose: "device" }),
+	});
+	if (!claimed.ok) {
+		const errorBody = await claimed.json().catch(() => null) as { error?: string } | null;
+		return json({ error: errorBody?.error ?? "already_claimed" }, claimed.status);
 	}
-	// Invalidate the cached config so the next request sees the claimed state
-	// immediately rather than serving a stale unclaimed response for up to TTL.
+	const claimPayload = await claimed.json().catch(() => null) as { pairingExp?: number } | null;
+	if (typeof claimPayload?.pairingExp !== "number") {
+		return json({ error: "claim_response_invalid" }, 502);
+	}
 	invalidateStoredServerConfigCache();
-
+	let sessionHeader: string | undefined;
+	try {
+		sessionHeader = (await createOperatorSession(env, req.url)).header;
+	} catch (error) {
+		console.warn("[yaos-sync:worker] operator session create failed after claim:", error);
+	}
 	let claimedConfig: StoredServerConfig | null = null;
 	try {
 		claimedConfig = await getStoredServerConfig(env);
-	} catch (err) {
-		console.warn("[yaos-sync:worker] config fetch failed after claim:", err);
+	} catch (error) {
+		console.warn("[yaos-sync:worker] config fetch failed after claim:", error);
 	}
-
-	return json({
+	const response = json({
 		ok: true,
 		host: url.origin,
-		obsidianUrl: buildObsidianSetupUrl(url.origin, token, vaultId || undefined),
+		vaultId,
+		vaultName: "Personal",
+		pairingCode,
+		pairingExpiresAt: claimPayload.pairingExp,
+		obsidianUrl: buildObsidianPairingUrl(url.origin, pairingCode),
 		mobileSetupQrDataUrl,
 		capabilities: getCapabilities(
-			{ mode: "claim", claimed: true, tokenHash },
+			{ mode: "claim", claimed: true, operatorRecoveryHash, ticketSigningKey },
 			env,
 			claimedConfig,
 			{ includePrivateUpdateMetadata: true },
 		),
 	});
+	if (!sessionHeader) return response;
+	const headers = new Headers(response.headers);
+	headers.append("Set-Cookie", sessionHeader);
+	return new Response(response.body, { status: response.status, headers });
 }
 
 export async function handleUpdateMetadataRoute(req: Request, env: Env, authState: AuthState): Promise<Response> {
-	const token = getHttpAuthToken(req);
-	if (!authState.claimed) {
-		return json({ error: "unclaimed" }, 503);
-	}
-	if (authState.mode === "env" && !authState.envToken) {
-		return json({ error: "server_misconfigured" }, 503);
-	}
-	if (!(await isAuthorized(authState, token))) {
-		return json({ error: "unauthorized" }, 401);
-	}
-
-	let body: {
-		updateProvider?: unknown;
-		updateRepoUrl?: unknown;
-		updateRepoBranch?: unknown;
-	} = {};
+	if (authState.mode === "unsupported") return json({ error: "server_format_unsupported" }, 503);
+	if (!authState.claimed) return json({ error: "unclaimed" }, 503);
+	if (!(await verifyOperatorSession(env, req))) return json({ error: "unauthorized" }, 401);
+	let body: { updateProvider?: unknown; updateRepoUrl?: unknown; updateRepoBranch?: unknown };
 	try {
 		body = await req.json();
 	} catch {
 		return json({ error: "invalid json" }, 400);
 	}
-
-	let updatedConfig: StoredServerConfig;
-	try {
-		updatedConfig = await setServerUpdateMetadata(env, body);
-	} catch (err) {
-		const message = err instanceof Error ? err.message : "metadata write failed";
-		const status = message.includes("(403)")
-			? 403
-			: message.includes("(400)")
-				? 400
-				: 500;
-		return json({ error: message }, status);
-	}
-	// Invalidate cache so the next request sees the updated metadata immediately.
-	invalidateStoredServerConfigCache();
-
-	return json({
-		ok: true,
-		capabilities: getCapabilities(authState, env, updatedConfig, { includePrivateUpdateMetadata: true }),
+	const response = await configFetch(env, "/__yaos/update-metadata", {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify(body),
 	});
+	if (!response.ok) {
+		const errorBody = await response.json().catch(() => null) as { error?: string } | null;
+		return json({ error: errorBody?.error ?? "metadata write failed" }, response.status);
+	}
+	const payload: { config?: StoredServerConfig } = await response.json();
+	invalidateStoredServerConfigCache();
+	return json({ ok: true, capabilities: getCapabilities(authState, env, payload.config ?? null, { includePrivateUpdateMetadata: true }) });
+}
+
+export async function mintPairingCode(
+	env: Env,
+	vaultId: string,
+	purpose: "device" | "invite",
+): Promise<{ pairingCode: string; exp: number } | { error: string; status: number }> {
+	const pairingCode = randomSecret(PAIRING_CODE_BYTES);
+	const codeHash = await hashSecret(pairingCode);
+	const response = await configFetch(env, "/__yaos/create-pairing-code", {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ vaultId, codeHash, purpose }),
+	});
+	if (!response.ok) {
+		const errorBody = await response.json().catch(() => null) as { error?: string } | null;
+		return { error: errorBody?.error ?? "pairing create failed", status: response.status };
+	}
+	const payload = await response.json().catch(() => null) as { exp?: number } | null;
+	return typeof payload?.exp === "number"
+		? { pairingCode, exp: payload.exp }
+		: { error: "pairing create response invalid", status: 502 };
 }

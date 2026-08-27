@@ -22,39 +22,12 @@ bucket_name = "yaos"
 enabled = true
 
 # ---------------------------------------------------------------------------
-# Optional hardening variables
-# ---------------------------------------------------------------------------
-#
-# Uncomment YAOS_DISABLE_LEGACY_WS_TOKEN once all plugin clients in your
-# deployment have upgraded to a version that supports short-lived WebSocket
-# tickets (plugin Release N or later, identified by the capabilities response
-# containing "socketTicketAuth": true).
-#
-# When set to any non-empty string, WebSocket connections that still use the
-# legacy ?token= query parameter are rejected with HTTP 401 before the vault
-# Durable Object is woken.  Connections using short-lived tickets are
-# unaffected.
-#
-# Upgrade path:
-#   1. Deploy this server version (Release N).
-#   2. Wait until Worker logs no longer show:
-#        "legacy ?token= WebSocket auth for vault <id>"
-#   3. Uncomment the line below and redeploy.
-#   4. Keep the emergency fallback: if clients break, comment it out again.
-#
-# [vars]
-# YAOS_DISABLE_LEGACY_WS_TOKEN = "true"
-
-# ---------------------------------------------------------------------------
 # Admin / debug route gating
 # ---------------------------------------------------------------------------
 #
-# Uncomment YAOS_ENABLE_ADMIN_ROUTES to enable the destructive admin route:
-#   POST /__yaos/compact      — force an emergency journal compaction
-#
-# When this variable is absent or empty the route returns HTTP 404, keeping it
-# dark in production.  The read-only GET /__yaos/debug endpoint is always
-# available regardless of this setting.
+# Uncomment YAOS_ENABLE_ADMIN_ROUTES to expose the destructive compact route.
+# The route remains operator-session authenticated when enabled. When absent
+# or empty it returns 404 without waking the vault Durable Object.
 #
 # [vars]
 # YAOS_ENABLE_ADMIN_ROUTES = "true"

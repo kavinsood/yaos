@@ -2,11 +2,10 @@ interface SetupPageOptions {
 	host: string;
 }
 
-interface RunningPageOptions {
+interface OperatorPageOptions {
 	host: string;
-	authMode: "env" | "claim";
-	attachments: boolean;
-	snapshots: boolean;
+	attachments?: boolean;
+	snapshots?: boolean;
 }
 
 interface MobileSetupPageOptions {
@@ -20,6 +19,23 @@ function escapeHtml(value: string): string {
 		.replace(/>/g, "&gt;")
 		.replace(/"/g, "&quot;");
 }
+
+export function operatorDestroyStatusMessage(status: number): string {
+	if (status === 200) return "Vault cleanup is complete.";
+	if (status === 202) return "Vault access is revoked; physical cleanup is still pending.";
+	if (status === 401) return "Session expired. Reload and sign in.";
+	if (status === 400) return "Vault destroy request was rejected.";
+	if (status === 404) return "Vault was not found.";
+	if (status >= 500) return "Server or configuration error prevented vault destruction.";
+	return `Vault destruction failed (HTTP ${status}).`;
+}
+
+export function operatorStateLoadFailureMessage(status: number | null): string {
+	return status === 401
+		? "Session expired. Reload and sign in."
+		: "Could not load server configuration. Try again.";
+}
+
 
 
 export function renderSetupPage(options: SetupPageOptions): string {
@@ -325,7 +341,7 @@ export function renderSetupPage(options: SetupPageOptions): string {
           <div class="step-number">2</div>
           <h2>Connect Obsidian</h2>
         </div>
-
+        <p style="margin-bottom: 12px;">This Obsidian folder is one vault. The pairing code works once for 15 minutes. After enrollment, this device is a peer and can add devices.</p>
         <div class="target-actions">
           <div class="action-box">
             <p>On this device</p>
@@ -336,34 +352,33 @@ export function renderSetupPage(options: SetupPageOptions): string {
             <div id="qr" aria-label="YAOS mobile setup QR"></div>
           </div>
         </div>
-
         <details>
-          <summary>Advanced: Manual Setup Token</summary>
-	          <div class="manual-content">
-	            <div>
-	              <label for="host-input" class="manual-label">Server link</label>
-	              <div class="manual-row">
-	                <input id="host-input" type="text" readonly />
-	                <button id="copy-host" class="ghost-btn" style="padding: 10px 16px;">Copy</button>
-	              </div>
-	            </div>
-	            <div>
-	              <label for="token-input" class="manual-label">Token</label>
-	              <div class="manual-row">
-	                <input id="token-input" type="text" readonly />
-	                <button id="copy-token" class="ghost-btn" style="padding: 10px 16px;">Copy</button>
-	              </div>
-	            </div>
-	            <div>
-	              <label for="vault-input" class="manual-label">Vault ID</label>
-	              <div class="manual-row">
-	                <input id="vault-input" type="text" readonly />
-	                <button id="copy-vault" class="ghost-btn" style="padding: 10px 16px;">Copy</button>
-	              </div>
-	            </div>
-	          </div>
-	        </details>
-	      </div>
+          <summary>Save your operator recovery key, then connect</summary>
+          <div class="manual-content">
+            <div>
+              <label for="host-input" class="manual-label">Server link</label>
+              <div class="manual-row">
+                <input id="host-input" type="text" readonly />
+                <button id="copy-host" class="ghost-btn" style="padding: 10px 16px;">Copy</button>
+              </div>
+            </div>
+            <div>
+              <label for="operator-recovery-key-input" class="manual-label">Operator recovery key — password manager only</label>
+              <div class="manual-row">
+                <input id="operator-recovery-key-input" type="text" readonly />
+                <button id="copy-operator-recovery-key" class="ghost-btn" style="padding: 10px 16px;">Copy</button>
+              </div>
+            </div>
+            <div>
+              <label for="pairing-input" class="manual-label">One-time pairing code</label>
+              <div class="manual-row">
+                <input id="pairing-input" type="text" readonly />
+                <button id="copy-pairing" class="ghost-btn" style="padding: 10px 16px;">Copy</button>
+              </div>
+            </div>
+          </div>
+        </details>
+      </div>
     </div>
 
   </main>
@@ -380,24 +395,16 @@ export function renderSetupPage(options: SetupPageOptions): string {
     const qrEl = document.getElementById("qr");
 
     const hostInput = document.getElementById("host-input");
-    const tokenInput = document.getElementById("token-input");
-    const vaultInput = document.getElementById("vault-input");
+    const operatorRecoveryKeyInput = document.getElementById("operator-recovery-key-input");
+    const pairingInput = document.getElementById("pairing-input");
     const copyHostBtn = document.getElementById("copy-host");
-    const copyTokenBtn = document.getElementById("copy-token");
-    const copyVaultBtn = document.getElementById("copy-vault");
+    const copyOperatorRecoveryKeyBtn = document.getElementById("copy-operator-recovery-key");
+    const copyPairingBtn = document.getElementById("copy-pairing");
 
-    function randomToken() {
+    function randomOperatorRecoveryKey() {
       const bytes = new Uint8Array(32);
       crypto.getRandomValues(bytes);
       return Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
-    }
-
-    function randomVaultId() {
-      const bytes = new Uint8Array(16);
-      crypto.getRandomValues(bytes);
-      let binary = "";
-      for (const b of bytes) binary += String.fromCharCode(b);
-      return btoa(binary).replace(/\\+/g, "-").replace(/\\//g, "_").replace(/=+$/g, "");
     }
 
     function renderQr(dataUrl) {
@@ -409,10 +416,17 @@ export function renderSetupPage(options: SetupPageOptions): string {
       qrEl.appendChild(image);
     }
 
-    // Toggle Step 2 state based on checkbox
-    installedCheckbox.addEventListener("change", (e) => {
-      const isChecked = e.target.checked;
-      if (isChecked) {
+    function copyFrom(input, button) {
+      button.addEventListener("click", async () => {
+        await navigator.clipboard.writeText(input.value);
+        const originalText = button.textContent;
+        button.textContent = "Copied!";
+        setTimeout(() => button.textContent = originalText, 2000);
+      });
+    }
+
+    installedCheckbox.addEventListener("change", (event) => {
+      if (event.target.checked) {
         step2El.classList.remove("disabled-step");
         openBtn.removeAttribute("aria-disabled");
       } else {
@@ -420,73 +434,35 @@ export function renderSetupPage(options: SetupPageOptions): string {
         openBtn.setAttribute("aria-disabled", "true");
       }
     });
-
-    // Prevent click on auto-configure if disabled
-    openBtn.addEventListener("click", (e) => {
-      if (!installedCheckbox.checked) {
-        e.preventDefault();
-      }
+    openBtn.addEventListener("click", (event) => {
+      if (!installedCheckbox.checked) event.preventDefault();
     });
+    copyFrom(hostInput, copyHostBtn);
+    copyFrom(operatorRecoveryKeyInput, copyOperatorRecoveryKeyBtn);
+    copyFrom(pairingInput, copyPairingBtn);
 
-    copyHostBtn.addEventListener("click", async () => {
-      await navigator.clipboard.writeText(hostInput.value);
-      const originalText = copyHostBtn.textContent;
-      copyHostBtn.textContent = "Copied!";
-      setTimeout(() => copyHostBtn.textContent = originalText, 2000);
-    });
-
-    // Copy token logic
-	    copyTokenBtn.addEventListener("click", async () => {
-	      await navigator.clipboard.writeText(tokenInput.value);
-	      const originalText = copyTokenBtn.textContent;
-	      copyTokenBtn.textContent = "Copied!";
-	      setTimeout(() => copyTokenBtn.textContent = originalText, 2000);
-	    });
-
-	    copyVaultBtn.addEventListener("click", async () => {
-	      await navigator.clipboard.writeText(vaultInput.value);
-	      const originalText = copyVaultBtn.textContent;
-	      copyVaultBtn.textContent = "Copied!";
-	      setTimeout(() => copyVaultBtn.textContent = originalText, 2000);
-	    });
-
-	    claimButton.addEventListener("click", async () => {
-	      claimButton.disabled = true;
-	      statusEl.textContent = "Claiming server...";
-	      const token = randomToken();
-	      const vaultId = randomVaultId();
-
-	      try {
-	        const res = await fetch("/claim", {
-	          method: "POST",
-	          headers: { "Content-Type": "application/json" },
-	          body: JSON.stringify({ token, vaultId }),
-	        });
-
+    claimButton.addEventListener("click", async () => {
+      claimButton.disabled = true;
+      statusEl.textContent = "Claiming server...";
+      const operatorRecoveryKey = randomOperatorRecoveryKey();
+      try {
+        const res = await fetch("/claim", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ operatorRecoveryKey }),
+        });
         const data = await res.json().catch(() => null);
-        if (!res.ok) {
-          throw new Error(data?.error || "Claim failed");
-        }
-        if (!data || typeof data.mobileSetupQrDataUrl !== "string") {
+        if (!res.ok) throw new Error((data && data.error) || "Claim failed");
+        if (!data || typeof data.mobileSetupQrDataUrl !== "string" || typeof data.pairingCode !== "string" || typeof data.obsidianUrl !== "string") {
           throw new Error("Setup QR generation failed");
         }
-
-	        // Setup the UI state
-	        hostInput.value = window.location.origin;
-	        tokenInput.value = token;
-	        vaultInput.value = vaultId;
-
-	        // Deep link for local button
-	        const deepLink = "obsidian://yaos?" + new URLSearchParams({ action: "setup", host: window.location.origin, token: token, vaultId: vaultId }).toString();
-	        openBtn.href = deepLink;
-
-	        // QR Code pointing to the trampoline page, generated locally by the Worker.
-	        renderQr(data.mobileSetupQrDataUrl);
-
-        // Switch Views
+        hostInput.value = window.location.origin;
+        operatorRecoveryKeyInput.value = operatorRecoveryKey;
+        pairingInput.value = data.pairingCode;
+        openBtn.href = data.obsidianUrl;
+        renderQr(data.mobileSetupQrDataUrl);
         initialView.style.display = "none";
         successFlow.classList.add("show");
-
       } catch (error) {
         statusEl.textContent = error.message;
         claimButton.disabled = false;
@@ -584,7 +560,7 @@ export function renderMobileSetupPage(options: MobileSetupPageOptions): string {
 <body>
   <main class="card">
     <h1>Connect YAOS</h1>
-    <p>Link this phone to <strong>${safeHost}</strong> in two steps.</p>
+    <p>Link this phone to <strong>${safeHost}</strong>. The pairing code works once for 15 minutes.</p>
 
     <a id="connect-button" class="cta" href="#" aria-disabled="true">Connect Obsidian</a>
     <div id="status" class="status">Loading setup data...</div>
@@ -600,10 +576,8 @@ export function renderMobileSetupPage(options: MobileSetupPageOptions): string {
 	      <div class="manual-box">
 	        <label>Host</label>
 	        <input id="host-input" readonly />
-	        <label>Token</label>
-	        <input id="token-input" readonly />
-	        <label>Vault ID</label>
-	        <input id="vault-input" readonly />
+	        <label>Pairing code</label>
+	        <input id="pairing-code-input" readonly />
 	        <p style="font-size: 11px; margin: 0; color: #6984a3;">Copy these to YAOS settings if the button fails.</p>
 	      </div>
 	    </details>
@@ -611,38 +585,29 @@ export function renderMobileSetupPage(options: MobileSetupPageOptions): string {
 
   <script>
     const connectBtn = document.getElementById("connect-button");
-	    const statusEl = document.getElementById("status");
-	    const hostInput = document.getElementById("host-input");
-	    const tokenInput = document.getElementById("token-input");
-	    const vaultInput = document.getElementById("vault-input");
+    const statusEl = document.getElementById("status");
+    const hostInput = document.getElementById("host-input");
+    const pairingCodeInput = document.getElementById("pairing-code-input");
 
     function parseHash() {
       const hash = window.location.hash.startsWith("#") ? window.location.hash.slice(1) : window.location.hash;
       const params = new URLSearchParams(hash);
-	      return {
-	        host: (params.get("host") || "").trim().replace(/\\/$/, ""),
-	        token: (params.get("token") || "").trim(),
-	        vaultId: (params.get("vaultId") || "").trim(),
-	      };
-	    }
+      return {
+        host: (params.get("host") || "").trim().replace(/\\/$/, ""),
+        pairingCode: (params.get("pairingCode") || "").trim(),
+      };
+    }
 
-	    const { host, token, vaultId } = parseHash();
-
-	    if (!host || !token || !vaultId) {
-	      statusEl.textContent = "Error: Invalid setup link. Please re-scan the QR code.";
-	      statusEl.style.color = "#ff6b6b";
-	    } else {
-	      hostInput.value = host;
-	      tokenInput.value = token;
-	      vaultInput.value = vaultId;
-
-	      const deepLink = "obsidian://yaos?" + new URLSearchParams({ action: "setup", host, token, vaultId }).toString();
-	      connectBtn.href = deepLink;
-	      connectBtn.removeAttribute("aria-disabled");
-
-      // Scrub the URL history to hide the token fragment immediately
+    const { host, pairingCode } = parseHash();
+    if (!host || !pairingCode) {
+      statusEl.textContent = "Error: Invalid setup link. Please re-scan the QR code.";
+      statusEl.style.color = "#ff6b6b";
+    } else {
+      hostInput.value = host;
+      pairingCodeInput.value = pairingCode;
+      connectBtn.href = "obsidian://yaos?" + new URLSearchParams({ action: "setup", host, pairingCode }).toString();
+      connectBtn.removeAttribute("aria-disabled");
       window.history.replaceState(null, "", window.location.pathname);
-
       statusEl.textContent = "Ready. Install YAOS from Community plugins if needed, then tap Connect Obsidian.";
     }
   </script>
@@ -650,52 +615,509 @@ export function renderMobileSetupPage(options: MobileSetupPageOptions): string {
 </html>`;
 }
 
-export function renderRunningPage(options: RunningPageOptions): string {
-	const authLabel =
-		options.authMode === "env"
-			? "Secured by an environment token."
-			: "This server has been claimed and is locked.";
-
+export function renderOperatorLogin(options: OperatorPageOptions): string {
+	const safeHost = escapeHtml(options.host);
 	return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>YAOS Server Running</title>
+  <title>YAOS operator</title>
   <style>
-    body {
-      margin: 0; font-family: ui-sans-serif, system-ui, sans-serif;
-      background: #08111d; color: #f4f7fb;
-      min-height: 100vh; display: grid; place-items: center; padding: 24px;
-    }
-    .card {
-      width: min(480px, 100%); background: rgba(255,255,255,0.03);
-      border: 1px solid rgba(255,255,255,0.1); border-radius: 16px; padding: 32px;
-      text-align: center;
-    }
-    .pulse-dot {
-      width: 12px; height: 12px; background: #88ffb8; border-radius: 50%;
-      display: inline-block; margin-right: 8px;
-      box-shadow: 0 0 12px rgba(136, 255, 184, 0.5);
-    }
-    h1 { margin: 0 0 12px; font-size: 24px; display: flex; align-items: center; justify-content: center;}
-    p { margin: 0 0 24px; color: #a9c0d8; line-height: 1.5; }
-    .features { display: flex; gap: 16px; justify-content: center; }
-    .badge { padding: 6px 12px; background: rgba(255,255,255,0.05); border-radius: 999px; font-size: 12px; border: 1px solid rgba(255,255,255,0.1);}
-    .badge.active { color: #88ffb8; border-color: rgba(136, 255, 184, 0.3); }
-    .badge.inactive { color: #6984a3; }
+    body { margin: 0; font-family: ui-sans-serif, system-ui, sans-serif; background: #08111d; color: #f4f7fb; min-height: 100vh; display: grid; place-items: center; padding: 24px; }
+    .card { width: min(440px, 100%); background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.1); border-radius: 16px; padding: 32px; }
+    h1 { margin: 0 0 8px; font-size: 22px; }
+    p { color: #a9c0d8; line-height: 1.5; }
+    input { width: 100%; box-sizing: border-box; margin: 12px 0; padding: 12px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.15); background: #040a12; color: #7bdff6; font-family: monospace; }
+    button { width: 100%; padding: 12px; border: 0; border-radius: 10px; background: #7bdff6; color: #08111d; font-weight: 600; cursor: pointer; }
+    .status { min-height: 20px; font-size: 13px; color: #ff8a8a; }
+    .host { font-size: 12px; color: #6984a3; }
   </style>
 </head>
 <body>
   <main class="card">
-    <h1><span class="pulse-dot"></span>YAOS Server is Online</h1>
-    <p>${authLabel}</p>
-    <div class="features">
-      <div class="badge active">Text Sync</div>
-      <div class="badge ${options.attachments ? "active" : "inactive"}">Attachments: ${options.attachments ? "ON" : "OFF"}</div>
-      <div class="badge ${options.snapshots ? "active" : "inactive"}">Snapshots: ${options.snapshots ? "ON" : "OFF"}</div>
-    </div>
+    <div class="host">${safeHost}</div>
+    <h1>Operator sign-in</h1>
+    <p>Paste the recovery key you saved when you claimed this server. This is not a device pairing code.</p>
+    <input id="operator-recovery-key" type="password" autocomplete="current-password" placeholder="Operator recovery key" />
+    <button id="login">Open console</button>
+    <p id="status" class="status"></p>
   </main>
+  <script>
+    document.getElementById("login").addEventListener("click", async () => {
+      const operatorRecoveryKey = document.getElementById("operator-recovery-key").value.trim();
+      const status = document.getElementById("status");
+      status.textContent = "";
+      const res = await fetch("/operator/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ operatorRecoveryKey }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => null);
+        status.textContent = (data && data.message) || "That key does not match this server.";
+        return;
+      }
+      window.location.reload();
+    });
+  </script>
+</body>
+</html>`;
+}
+
+export function renderOperatorConsole(options: OperatorPageOptions): string {
+	const attachments = options.attachments ? "ON" : "OFF";
+	const snapshots = options.snapshots ? "ON" : "OFF";
+	const destroyStatusMessages = JSON.stringify({
+		200: operatorDestroyStatusMessage(200),
+		202: operatorDestroyStatusMessage(202),
+		400: operatorDestroyStatusMessage(400),
+		401: operatorDestroyStatusMessage(401),
+		404: operatorDestroyStatusMessage(404),
+		500: operatorDestroyStatusMessage(500),
+	});
+	const stateLoadMessages = JSON.stringify({
+		401: operatorStateLoadFailureMessage(401),
+		failure: operatorStateLoadFailureMessage(null),
+	});
+	return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>YAOS console</title>
+  <style>
+    body { margin: 0; font-family: ui-sans-serif, system-ui, sans-serif; background: #08111d; color: #f4f7fb; padding: 32px 16px; }
+    main { width: min(720px, 100%); margin: 0 auto; }
+    h1 { font-size: 24px; }
+    p, li { color: #a9c0d8; line-height: 1.5; }
+    button, input { border-radius: 8px; border: 1px solid rgba(255,255,255,0.15); background: #040a12; color: #f4f7fb; padding: 8px 12px; }
+    button { cursor: pointer; background: #163044; }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0 16px; }
+    .card { background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08); border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+    code { color: #7bdff6; }
+    .err { color: #ff8a8a; }
+    .pair img { display: block; width: 160px; height: 160px; margin-top: 8px; }
+    .pair a { color: #7bdff6; }
+    .danger { color: #ff8a8a; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>YAOS console</h1>
+    <p>Attachments ${attachments} · Snapshots ${snapshots}. Codes work once for 15 minutes. Anyone who enrolls is a full peer on that vault and can add more devices. Add-device and invite are the same enroll, not different permissions. Kick removes that device only.</p>
+    <div class="row">
+      <input id="vault-name" placeholder="New vault name" />
+      <button id="create-vault" disabled>Create vault</button>
+      <button id="logout">Sign out</button>
+    </div>
+    <div class="row">
+      <input id="update-repo" placeholder="Deployment repository URL" style="min-width: 280px;" />
+      <input id="update-branch" placeholder="Branch" style="width: 120px;" />
+      <button id="save-update">Save updater</button>
+    </div>
+    <p id="status" class="err"></p>
+    <div id="vaults"></div>
+  </main>
+  <script>
+    const status = document.getElementById("status");
+    const root = document.getElementById("vaults");
+    const createVault = document.getElementById("create-vault");
+    const destroyStatusMessages = ${destroyStatusMessages};
+    const stateLoadMessages = ${stateLoadMessages};
+    let stateLoadVersion = 0;
+    function formatWhen(ts) {
+      if (typeof ts !== "number" || !isFinite(ts)) return "";
+      const date = new Date(ts);
+      return isNaN(date.getTime()) ? "" : date.toISOString();
+    }
+    function showPairing(slot, purpose, data, ritual) {
+      slot.replaceChildren();
+      if (!data || !data.pairingCode) {
+        slot.textContent = "Could not mint a pairing code.";
+      } else {
+        const line = document.createElement("p");
+        if (purpose === "invite") {
+          line.textContent = "Invite code (once, 15 min): " + data.pairingCode + ". Same enroll as add-device — not a different permission. Enrollee is a full peer.";
+        } else {
+          line.textContent = "Add-device code (once, 15 min): " + data.pairingCode + ". Same enroll as invite — not a different permission. Enrollee is a full peer.";
+        }
+        slot.appendChild(line);
+        if (typeof data.mobileSetupQrDataUrl === "string" && data.mobileSetupQrDataUrl) {
+          const image = document.createElement("img");
+          image.src = data.mobileSetupQrDataUrl;
+          image.alt = "Pairing QR";
+          slot.appendChild(image);
+        }
+      }
+      if (ritual) {
+        const hint = document.createElement("p");
+        hint.textContent = "Open a new empty Obsidian vault, enable YAOS, then scan or paste.";
+        slot.appendChild(hint);
+        const picker = document.createElement("a");
+        picker.href = "obsidian://choose-vault";
+        picker.textContent = "Open vault picker";
+        slot.appendChild(picker);
+      }
+    }
+    function isOperatorState(data) {
+      return data !== null
+        && typeof data === "object"
+        && !Array.isArray(data)
+        && data.ok === true
+        && Array.isArray(data.vaults)
+        && data.vaults.every((vault) =>
+          vault !== null
+          && typeof vault === "object"
+          && !Array.isArray(vault)
+          && typeof vault.vaultId === "string"
+          && typeof vault.name === "string")
+        && Array.isArray(data.devices)
+        && data.devices.every((device) =>
+          device !== null
+          && typeof device === "object"
+          && !Array.isArray(device)
+          && typeof device.vaultId === "string"
+          && typeof device.deviceId === "string"
+          && typeof device.name === "string")
+        && Array.isArray(data.pairingCodes)
+        && data.pairingCodes.every((code) =>
+          code !== null
+          && typeof code === "object"
+          && !Array.isArray(code)
+          && typeof code.vaultId === "string"
+          && typeof code.codeId === "string"
+          && typeof code.purpose === "string")
+        && Array.isArray(data.pendingDestroys)
+        && data.pendingDestroys.every((pending) =>
+          pending !== null
+          && typeof pending === "object"
+          && !Array.isArray(pending)
+          && typeof pending.vaultId === "string"
+          && typeof pending.roomComplete === "boolean"
+          && typeof pending.r2Complete === "boolean"
+          && (pending.lastError === null || typeof pending.lastError === "string"));
+    }
+    function showDestroyStatus(responseStatus) {
+      if (responseStatus >= 500) {
+        status.textContent = destroyStatusMessages["500"];
+        return;
+      }
+      status.textContent = destroyStatusMessages[String(responseStatus)]
+        || "Vault destruction failed (HTTP " + responseStatus + ").";
+    }
+    async function requestVaultDestroy(vaultId) {
+      try {
+        const res = await fetch("/operator/vaults/" + encodeURIComponent(vaultId), { method: "DELETE" });
+        showDestroyStatus(res.status);
+      } catch {
+        status.textContent = "Could not reach the server to destroy the vault.";
+      }
+      await load(true);
+    }
+    async function load(preserveStatus = false) {
+      const loadVersion = ++stateLoadVersion;
+      createVault.disabled = true;
+      root.replaceChildren();
+      let res;
+      try {
+        res = await fetch("/operator/state");
+      } catch {
+        if (loadVersion === stateLoadVersion) status.textContent = stateLoadMessages.failure;
+        return;
+      }
+      if (loadVersion !== stateLoadVersion) return;
+      if (res.status === 401) {
+        status.textContent = stateLoadMessages["401"];
+        return;
+      }
+      if (!res.ok) {
+        status.textContent = stateLoadMessages.failure;
+        return;
+      }
+      const data = await res.json().catch(() => null);
+      if (loadVersion !== stateLoadVersion) return;
+      if (!isOperatorState(data)) {
+        status.textContent = stateLoadMessages.failure;
+        return;
+      }
+      try {
+        const capsRes = await fetch("/api/capabilities");
+        if (capsRes.ok) {
+          const caps = await capsRes.json().catch(() => null);
+          if (caps) {
+            const repo = document.getElementById("update-repo");
+            const branch = document.getElementById("update-branch");
+            if (repo && typeof caps.updateRepoUrl === "string") repo.value = caps.updateRepoUrl;
+            if (branch && typeof caps.updateRepoBranch === "string") branch.value = caps.updateRepoBranch;
+          }
+        }
+      } catch {}
+      if (loadVersion !== stateLoadVersion) return;
+      const rendered = document.createDocumentFragment();
+      for (const vault of data.vaults || []) {
+        const card = document.createElement("div");
+        card.className = "card";
+        card.dataset.vaultId = vault.vaultId;
+        card.dataset.vaultName = vault.name;
+
+        const heading = document.createElement("h2");
+        heading.textContent = vault.name;
+        card.appendChild(heading);
+
+        const idLine = document.createElement("p");
+        const idCode = document.createElement("code");
+        idCode.textContent = vault.vaultId;
+        idLine.appendChild(idCode);
+        card.appendChild(idLine);
+
+        const renameRow = document.createElement("div");
+        renameRow.className = "row";
+        const renameInput = document.createElement("input");
+        renameInput.className = "rename-input";
+        renameInput.value = vault.name;
+        renameInput.setAttribute("aria-label", "Vault nickname");
+        const renameBtn = document.createElement("button");
+        renameBtn.textContent = "Rename";
+        renameBtn.dataset.rename = vault.vaultId;
+        renameRow.appendChild(renameInput);
+        renameRow.appendChild(renameBtn);
+        card.appendChild(renameRow);
+
+        const list = document.createElement("ul");
+        const devices = (data.devices || []).filter((d) => d.vaultId === vault.vaultId);
+        if (devices.length === 0) {
+          const empty = document.createElement("li");
+          empty.textContent = "No devices enrolled yet.";
+          list.appendChild(empty);
+        } else {
+          for (const d of devices) {
+            const item = document.createElement("li");
+            item.appendChild(document.createTextNode(d.name + " "));
+            const deviceCode = document.createElement("code");
+            deviceCode.textContent = d.deviceId.slice(0, 8);
+            item.appendChild(deviceCode);
+            if (typeof d.lastSeenAt === "number") {
+              item.appendChild(document.createTextNode(" last seen " + formatWhen(d.lastSeenAt)));
+            }
+            item.appendChild(document.createTextNode(" "));
+            const kickBtn = document.createElement("button");
+            kickBtn.textContent = "Kick";
+            kickBtn.dataset.kick = d.deviceId;
+            item.appendChild(kickBtn);
+            list.appendChild(item);
+          }
+        }
+        card.appendChild(list);
+
+        const codesHeading = document.createElement("p");
+        codesHeading.textContent = "Unused pairing codes";
+        card.appendChild(codesHeading);
+        const codeList = document.createElement("ul");
+        const codes = (data.pairingCodes || []).filter((c) => c.vaultId === vault.vaultId);
+        if (codes.length === 0) {
+          const emptyCode = document.createElement("li");
+          emptyCode.textContent = "None.";
+          codeList.appendChild(emptyCode);
+        } else {
+          for (const c of codes) {
+            const item = document.createElement("li");
+            const purposeLabel = c.purpose === "invite" ? "Invite" : "Add-device";
+            const expiry = formatWhen(c.exp) || "unknown";
+            item.appendChild(document.createTextNode(purposeLabel + " · expires " + expiry + " "));
+            if (c.codeId) {
+              const revokeBtn = document.createElement("button");
+              revokeBtn.textContent = "Revoke";
+              revokeBtn.dataset.revoke = c.codeId;
+              item.appendChild(revokeBtn);
+            }
+            codeList.appendChild(item);
+          }
+        }
+        card.appendChild(codeList);
+
+        const row = document.createElement("div");
+        row.className = "row";
+        const addDevice = document.createElement("button");
+        addDevice.textContent = "Add my device";
+        addDevice.dataset.pair = vault.vaultId;
+        addDevice.dataset.purpose = "device";
+        const invite = document.createElement("button");
+        invite.textContent = "Invite to this vault";
+        invite.dataset.pair = vault.vaultId;
+        invite.dataset.purpose = "invite";
+        row.appendChild(addDevice);
+        row.appendChild(invite);
+        card.appendChild(row);
+
+        const pairSlot = document.createElement("p");
+        pairSlot.className = "pair";
+        card.appendChild(pairSlot);
+
+        const destroyHint = document.createElement("p");
+        destroyHint.className = "danger";
+        destroyHint.textContent = "Type the nickname to enable Destroy. This deletes the room, not just the listing.";
+        card.appendChild(destroyHint);
+        const destroyRow = document.createElement("div");
+        destroyRow.className = "row";
+        const destroyInput = document.createElement("input");
+        destroyInput.className = "destroy-confirm";
+        destroyInput.setAttribute("aria-label", "Type vault nickname to destroy");
+        destroyInput.placeholder = "Type " + vault.name + " to destroy";
+        const destroyBtn = document.createElement("button");
+        destroyBtn.textContent = "Destroy";
+        destroyBtn.dataset.destroy = vault.vaultId;
+        destroyBtn.disabled = true;
+        destroyRow.appendChild(destroyInput);
+        destroyRow.appendChild(destroyBtn);
+        card.appendChild(destroyRow);
+
+        rendered.appendChild(card);
+      }
+      for (const pending of data.pendingDestroys || []) {
+        const card = document.createElement("div");
+        card.className = "card";
+
+        const heading = document.createElement("h2");
+        heading.textContent = "Vault cleanup pending";
+        card.appendChild(heading);
+
+        const idLine = document.createElement("p");
+        idLine.appendChild(document.createTextNode("Vault "));
+        const idCode = document.createElement("code");
+        idCode.textContent = pending.vaultId;
+        idLine.appendChild(idCode);
+        card.appendChild(idLine);
+
+        const cleanupState = document.createElement("p");
+        cleanupState.textContent =
+          "Room: " + (pending.roomComplete ? "complete" : "pending") +
+          " · R2: " + (pending.r2Complete ? "complete" : "pending") +
+          " · requested " + (formatWhen(pending.requestedAt) || "unknown");
+        card.appendChild(cleanupState);
+
+        if (pending.lastError) {
+          const lastError = document.createElement("p");
+          lastError.className = "err";
+          lastError.textContent = pending.lastError;
+          card.appendChild(lastError);
+        }
+
+        const retryBtn = document.createElement("button");
+        retryBtn.textContent = "Retry cleanup";
+        retryBtn.dataset.retryDestroy = pending.vaultId;
+        card.appendChild(retryBtn);
+        rendered.appendChild(card);
+      }
+      root.replaceChildren(rendered);
+      createVault.disabled = false;
+      if (!preserveStatus) status.textContent = "";
+    }
+    createVault.addEventListener("click", async () => {
+      const name = document.getElementById("vault-name").value.trim();
+      const res = await fetch("/operator/vaults", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name }) });
+      const created = await res.json().catch(() => null);
+      if (!res.ok) { status.textContent = "Could not create vault."; return; }
+      const vaultId = created && created.vault && created.vault.vaultId;
+      let pairData = null;
+      if (vaultId) {
+        const pairRes = await fetch("/operator/pairing-codes", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ vaultId, purpose: "device" }) });
+        pairData = await pairRes.json().catch(() => null);
+        if (!pairRes.ok) pairData = null;
+      }
+      await load();
+      if (vaultId) {
+        const card = Array.from(document.querySelectorAll("#vaults .card")).find((c) => c.dataset.vaultId === vaultId);
+        const slot = card && card.querySelector(".pair");
+        if (slot) showPairing(slot, "device", pairData, true);
+      }
+    });
+    document.getElementById("save-update").addEventListener("click", async () => {
+      const updateRepoUrl = document.getElementById("update-repo").value.trim();
+      const updateRepoBranch = document.getElementById("update-branch").value.trim();
+      let updateProvider = "unknown";
+      try {
+        const host = new URL(updateRepoUrl).hostname;
+        if (host === "github.com" || host.endsWith(".github.com")) updateProvider = "github";
+        else if (host === "gitlab.com" || host.endsWith(".gitlab.com")) updateProvider = "gitlab";
+      } catch {}
+      const res = await fetch("/api/update-metadata", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ updateRepoUrl, updateRepoBranch, updateProvider }),
+      });
+      if (!res.ok) { status.textContent = "Could not save updater settings."; return; }
+      status.textContent = "";
+    });
+    document.getElementById("logout").addEventListener("click", async () => {
+      await fetch("/operator/logout", { method: "POST" });
+      window.location.reload();
+    });
+    document.getElementById("vaults").addEventListener("input", (event) => {
+      const input = event.target;
+      if (!input || !input.classList || !input.classList.contains("destroy-confirm")) return;
+      const card = input.closest(".card");
+      const btn = card && card.querySelector("[data-destroy]");
+      if (btn) btn.disabled = input.value !== (card.dataset.vaultName || "");
+    });
+    document.getElementById("vaults").addEventListener("click", async (event) => {
+      const target = event.target;
+      if (!target || !target.getAttribute) return;
+      const kick = target.getAttribute("data-kick");
+      const pair = target.getAttribute("data-pair");
+      const rename = target.getAttribute("data-rename");
+      const destroy = target.getAttribute("data-destroy");
+      const retryDestroy = target.getAttribute("data-retry-destroy");
+      const revoke = target.getAttribute("data-revoke");
+      if (retryDestroy) {
+        await requestVaultDestroy(retryDestroy);
+        return;
+      }
+      if (kick) {
+        await fetch("/operator/devices/" + encodeURIComponent(kick), { method: "DELETE" });
+        await load();
+        return;
+      }
+      if (rename) {
+        const card = target.closest(".card");
+        const input = card && card.querySelector(".rename-input");
+        const name = input ? input.value.trim() : "";
+        const res = await fetch("/operator/vaults/" + encodeURIComponent(rename), {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name }),
+        });
+        if (!res.ok) { status.textContent = "Could not rename vault."; return; }
+        status.textContent = "";
+        await load();
+        return;
+      }
+      if (destroy) {
+        const card = target.closest(".card");
+        const input = card && card.querySelector(".destroy-confirm");
+        const expected = card ? (card.dataset.vaultName || "") : "";
+        if (!input || input.value !== expected) return;
+        await requestVaultDestroy(destroy);
+        return;
+      }
+      if (revoke) {
+        const res = await fetch("/operator/pairing-codes/" + encodeURIComponent(revoke), { method: "DELETE" });
+        if (!res.ok) { status.textContent = "Could not revoke pairing code."; return; }
+        status.textContent = "";
+        await load();
+        return;
+      }
+      if (pair) {
+        const purpose = target.getAttribute("data-purpose") || "device";
+        const res = await fetch("/operator/pairing-codes", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ vaultId: pair, purpose }) });
+        const data = await res.json().catch(() => null);
+        const slot = target.closest(".card").querySelector(".pair");
+        showPairing(slot, purpose, res.ok ? data : null);
+      }
+    });
+    load();
+  </script>
 </body>
 </html>`;
 }

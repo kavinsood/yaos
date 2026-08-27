@@ -1,23 +1,42 @@
-import { ServerConfig, type StoredServerConfig } from "./config";
+import { ServerConfig } from "./config";
 import { VaultSyncServer } from "./server";
-import { renderMobileSetupPage, renderRunningPage, renderSetupPage } from "./setupPage";
+import { renderMobileSetupPage, renderOperatorConsole, renderOperatorLogin, renderSetupPage } from "./setupPage";
 import {
+	authorizeAnyDevice,
+	authorizeDevice,
 	getAuthStateCached,
 	getCapabilities,
 	getHttpAuthToken,
-	getStoredServerConfigCached,
 	handleClaimRoute,
 	handleUpdateMetadataRoute,
-	isAuthorized,
 	rejectUnauthorizedVaultRequest,
 	supportsBuckets,
+	verifyOperatorSession,
 } from "./routes/auth";
 import { handleBlobRoute } from "./routes/blobs";
-import { corsPreflight, html, json, withCors } from "./routes/http";
+import {
+	handleEnrollRoute,
+	handleVaultDeviceLeaveRoute,
+	handleVaultDeviceRoute,
+	handleVaultDevicesListRoute,
+	handleVaultPairingCodeRoute,
+} from "./routes/enroll";
+import { corsPreflight, html, json, safeDecodeUriComponent, withCors } from "./routes/http";
+import {
+	handleOperatorCreateVault,
+	handleOperatorDestroyVault,
+	handleOperatorLogin,
+	handleOperatorLogout,
+	handleOperatorPairingCode,
+	handleOperatorRenameVault,
+	handleOperatorRevokeDevice,
+	handleOperatorRevokePairing,
+	handleOperatorState,
+} from "./routes/operator";
 import { handleSnapshotRoute } from "./routes/snapshots";
 import { handleSyncSocketRoute, parseSyncPath } from "./routes/syncSocket";
 import { handleTicketRoute } from "./routes/ticket";
-import { fetchVaultDebug, fetchVaultDocument, recordVaultTrace, compactVault } from "./routes/trace";
+import { compactVault, fetchVaultDebug, fetchVaultDocument, recordVaultTrace } from "./routes/trace";
 import type { AuthState, AuthStateCached, Env } from "./routes/types";
 
 const LOG_PREFIX = "[yaos-sync:worker]";
@@ -42,6 +61,16 @@ type WorkerRoute =
 	| { kind: "mobile-setup" }
 	| { kind: "capabilities" }
 	| { kind: "claim" }
+	| { kind: "enroll" }
+	| { kind: "operator-login" }
+	| { kind: "operator-logout" }
+	| { kind: "operator-state" }
+	| { kind: "operator-pairing" }
+	| { kind: "operator-vaults" }
+	| { kind: "operator-vault-patch"; vaultId: string }
+	| { kind: "operator-vault-destroy"; vaultId: string }
+	| { kind: "operator-pairing-revoke"; codeId: string }
+	| { kind: "operator-revoke"; deviceId: string }
 	| { kind: "update-metadata" }
 	| { kind: "sync-socket"; vaultId: string }
 	| { kind: "vault"; vaultId: string; resource: string; rest: string[] }
@@ -51,7 +80,13 @@ type WorkerRoute =
  * The complete set of vault sub-resources the server actually handles.
  * Anything outside this set returns not-found before auth — zero DO access.
  */
-const VALID_VAULT_RESOURCES = new Set(["auth", "debug", "blobs", "snapshots"]);
+const VALID_VAULT_RESOURCES: Record<string, true> = {
+	auth: true,
+	debug: true,
+	blobs: true,
+	snapshots: true,
+	devices: true,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SECURITY / BILLING INVARIANT — route classifier duplication is intentional
@@ -126,8 +161,14 @@ function isKnownSnapshotRouteShape(method: string, rest: string[]): boolean {
 function isKnownVaultRouteShape(method: string, resource: string, rest: string[]): boolean {
 	switch (resource) {
 		case "auth":
-			return method === "POST" && rest.length === 1 && rest[0] === "ticket";
+			if (rest.length !== 1) return false;
+			if (method === "POST") {
+				return rest[0] === "ticket" || rest[0] === "pairing-code" || rest[0] === "device";
+			}
+			return method === "DELETE" && rest[0] === "device";
 
+		case "devices":
+			return method === "GET" && rest.length === 0;
 		case "debug":
 			if (method === "GET" && rest.length === 1 && rest[0] === "recent") return true;
 			if (method === "POST" && rest.length === 1 && rest[0] === "compact") return true;
@@ -150,19 +191,30 @@ function isKnownVaultRouteShape(method: string, resource: string, rest: string[]
 function parseVaultPath(pathname: string): { vaultId: string; resource: string | null; rest: string[] } | null {
 	const parts = pathname.split("/").filter(Boolean);
 	if (parts.length < 2 || parts[0] !== "vault") return null;
-	const vaultId = parts[1];
+	const vaultId = safeDecodeUriComponent(parts[1]!);
 	if (!vaultId) return null;
+	const rest: string[] = [];
+	for (const part of parts.slice(3)) {
+		const decoded = safeDecodeUriComponent(part);
+		if (decoded === null) return null;
+		rest.push(decoded);
+	}
 	return {
-		vaultId: decodeURIComponent(vaultId),
+		vaultId,
 		resource: parts[2] ?? null,
-		rest: parts.slice(3),
+		rest,
 	};
 }
 
 function classifyWorkerRoute(req: Request, url: URL): WorkerRoute {
 	if (
 		req.method === "OPTIONS"
-		&& (url.pathname.startsWith("/vault/") || url.pathname.startsWith("/api/"))
+		&& (
+			url.pathname.startsWith("/vault/")
+			|| url.pathname.startsWith("/api/")
+			|| url.pathname === "/enroll"
+			|| url.pathname.startsWith("/operator/")
+		)
 	) {
 		return { kind: "cors-preflight" };
 	}
@@ -183,6 +235,33 @@ function classifyWorkerRoute(req: Request, url: URL): WorkerRoute {
 		return { kind: "claim" };
 	}
 
+	if (req.method === "POST" && url.pathname === "/enroll") return { kind: "enroll" };
+	if (req.method === "POST" && url.pathname === "/operator/login") return { kind: "operator-login" };
+	if (req.method === "POST" && url.pathname === "/operator/logout") return { kind: "operator-logout" };
+	if (req.method === "GET" && url.pathname === "/operator/state") return { kind: "operator-state" };
+	if (req.method === "POST" && url.pathname === "/operator/pairing-codes") return { kind: "operator-pairing" };
+	if (req.method === "POST" && url.pathname === "/operator/vaults") return { kind: "operator-vaults" };
+	const operatorVault = url.pathname.match(/^\/operator\/vaults\/([^/]+)$/);
+	if (operatorVault?.[1] && (req.method === "PATCH" || req.method === "DELETE")) {
+		const vaultId = safeDecodeUriComponent(operatorVault[1]);
+		if (vaultId === null) return { kind: "not-found" };
+		return req.method === "PATCH"
+			? { kind: "operator-vault-patch", vaultId }
+			: { kind: "operator-vault-destroy", vaultId };
+	}
+	if (req.method === "DELETE") {
+		const device = url.pathname.match(/^\/operator\/devices\/([^/]+)$/);
+		if (device?.[1]) {
+			const deviceId = safeDecodeUriComponent(device[1]);
+			return deviceId === null ? { kind: "not-found" } : { kind: "operator-revoke", deviceId };
+		}
+		const pairing = url.pathname.match(/^\/operator\/pairing-codes\/([^/]+)$/);
+		if (pairing?.[1]) {
+			const codeId = safeDecodeUriComponent(pairing[1]);
+			return codeId === null ? { kind: "not-found" } : { kind: "operator-pairing-revoke", codeId };
+		}
+	}
+
 	if (req.method === "POST" && url.pathname === "/api/update-metadata") {
 		return { kind: "update-metadata" };
 	}
@@ -198,7 +277,7 @@ function classifyWorkerRoute(req: Request, url: URL): WorkerRoute {
 	const vaultRoute = parseVaultPath(url.pathname);
 	if (vaultRoute && vaultRoute.resource !== null) {
 		// Resource whitelist: unknown resources 404 before auth.
-		if (!VALID_VAULT_RESOURCES.has(vaultRoute.resource)) {
+		if (!VALID_VAULT_RESOURCES[vaultRoute.resource]) {
 			return { kind: "not-found" };
 		}
 		// Full shape validation: wrong method or unknown subpath also 404 before
@@ -229,6 +308,16 @@ function routeBucket(route: WorkerRoute): string {
 		case "mobile-setup": return "mobile_setup";
 		case "capabilities": return "api_capabilities";
 		case "claim": return "claim";
+		case "enroll": return "enroll";
+		case "operator-login": return "operator_login";
+		case "operator-logout": return "operator_logout";
+		case "operator-state": return "operator_state";
+		case "operator-pairing": return "operator_pairing";
+		case "operator-vaults": return "operator_vaults";
+		case "operator-vault-patch": return "operator_vault_patch";
+		case "operator-vault-destroy": return "operator_vault_destroy";
+		case "operator-pairing-revoke": return "operator_pairing_revoke";
+		case "operator-revoke": return "operator_revoke";
 		case "update-metadata": return "api_update_metadata";
 		case "sync-socket": return "vault_sync";
 		case "vault": return `vault_${route.resource}`;
@@ -242,7 +331,7 @@ function logWorkerRequest(args: {
 	method: string;
 	status: number;
 	durationMs: number;
-	auth: "skipped" | "env" | "claim" | "unclaimed";
+	auth: "skipped" | "claim" | "unclaimed" | "unsupported";
 	isWebSocket: boolean;
 	cfRay: string | null;
 }): void {
@@ -278,7 +367,7 @@ function logWorkerRequest(args: {
 function logVaultRejection(
 	req: Request,
 	vaultId: string,
-	reason: "unclaimed" | "server_misconfigured" | "unauthorized",
+	reason: "unclaimed" | "server_format_unsupported" | "server_misconfigured" | "unauthorized",
 ): void {
 	// Truncate vaultId so it cannot become a correlation handle in exported
 	// worker logs, while still being useful for debugging.
@@ -304,35 +393,12 @@ async function rejectAndLogUnauthorizedVaultRequest(
 
 // ── Capabilities ──────────────────────────────────────────────────────────────
 
-/**
- * Extract the StoredServerConfig carried in the AuthState. Claim/unclaimed
- * modes always carry it; env mode has no config.
- */
-function getConfigFromAuthState(authState: AuthStateCached): StoredServerConfig | null {
-	if (authState.mode === "claim" || authState.mode === "unclaimed") {
-		return authState.config;
-	}
-	return null;
-}
-
 async function handleCapabilities(req: Request, env: Env, authState: AuthStateCached): Promise<Response> {
-	// Prefer the config already carried in the AuthState (populated by
-	// getAuthStateCached in claim/unclaimed modes — zero extra DO calls).
-	let config = getConfigFromAuthState(authState);
-
-	if (!config) {
-		// env mode: getAuthStateCached returns early without fetching config,
-		// so we fetch it here with the same cached path.
-		try {
-			config = await getStoredServerConfigCached(env);
-		} catch (err) {
-			console.warn(`${LOG_PREFIX} config fetch failed for capabilities:`, err);
-		}
-	}
-
-	const includePrivateUpdateMetadata = authState.claimed
-		&& await isAuthorized(authState, getHttpAuthToken(req));
-	return json(getCapabilities(authState, env, config, { includePrivateUpdateMetadata }));
+	const includePrivateUpdateMetadata = authState.mode === "claim" && (
+		await verifyOperatorSession(env, req)
+		|| await authorizeAnyDevice(env, getHttpAuthToken(req))
+	);
+	return json(getCapabilities(authState, env, authState.config, { includePrivateUpdateMetadata }));
 }
 
 // ── Worker ────────────────────────────────────────────────────────────────────
@@ -360,59 +426,102 @@ const worker = {
 			return response;
 		}
 
+		// Logout must clear the browser cookie even when config reads or session
+		// revocation fail, so it cannot depend on the shared auth-state fetch.
+		if (route.kind === "operator-logout") {
+			const response = await handleOperatorLogout(req, env);
+			logWorkerRequest({ route, method: req.method, status: response.status, durationMs: Date.now() - start, auth: "skipped", isWebSocket, cfRay });
+			return response;
+		}
+
 		// Only recognised routes reach this point.
 		const authState = await getAuthStateCached(env);
 		let response: Response;
 
 		if (route.kind === "home") {
-			const body = authState.claimed
-				? renderRunningPage({
+			if (authState.mode === "unsupported") {
+				response = html("<!doctype html><title>YAOS server format unsupported</title><h1>Server format unsupported</h1><p>This server uses an unsupported configuration format and cannot authenticate requests.</p>");
+			} else if (!authState.claimed) {
+				response = html(renderSetupPage({ host: url.origin }));
+			} else if (await verifyOperatorSession(env, req)) {
+				response = html(renderOperatorConsole({
 					host: url.origin,
-					authMode: authState.mode,
 					attachments: supportsBuckets(env),
 					snapshots: supportsBuckets(env),
-				})
-				: renderSetupPage({
-					host: url.origin,
-				});
-			response = html(body);
+				}));
+			} else {
+				response = html(renderOperatorLogin({ host: url.origin }));
+			}
 		} else if (route.kind === "mobile-setup") {
-			response = html(
-				renderMobileSetupPage({
-					host: url.origin,
-				}),
-			);
+			response = html(renderMobileSetupPage({ host: url.origin }));
 		} else if (route.kind === "capabilities") {
 			response = withCors(await handleCapabilities(req, env, authState));
 		} else if (route.kind === "claim") {
 			response = await handleClaimRoute(req, env, authState);
+		} else if (authState.mode === "unsupported") {
+			response = withCors(json({ error: "server_format_unsupported" }, 503));
+		} else if (route.kind === "enroll") {
+			response = withCors(await handleEnrollRoute(req, env));
+		} else if (route.kind === "operator-login") {
+			response = await handleOperatorLogin(req, env);
+		} else if (route.kind === "operator-state") {
+			response = await handleOperatorState(req, env);
+		} else if (route.kind === "operator-pairing") {
+			response = await handleOperatorPairingCode(req, env);
+		} else if (route.kind === "operator-vaults") {
+			response = await handleOperatorCreateVault(req, env);
+		} else if (route.kind === "operator-vault-patch") {
+			response = withCors(await handleOperatorRenameVault(req, env, route.vaultId));
+		} else if (route.kind === "operator-vault-destroy") {
+			response = withCors(await handleOperatorDestroyVault(req, env, route.vaultId));
+		} else if (route.kind === "operator-pairing-revoke") {
+			response = withCors(await handleOperatorRevokePairing(req, env, route.codeId));
+		} else if (route.kind === "operator-revoke") {
+			response = await handleOperatorRevokeDevice(req, env, route.deviceId);
 		} else if (route.kind === "update-metadata") {
 			response = withCors(await handleUpdateMetadataRoute(req, env, authState));
 		} else if (route.kind === "sync-socket") {
 			response = await handleSyncSocketRoute(req, env, authState, route.vaultId);
 		} else {
-			// route.kind === "vault"
 			const { vaultId, resource, rest } = route;
-
-			const authFailure = await rejectAndLogUnauthorizedVaultRequest(req, env, authState, vaultId);
-			if (authFailure) {
-				response = withCors(authFailure);
-			} else if (resource === "debug" && req.method === "GET" && rest[0] === "recent") {
-				const census = new URL(req.url).searchParams.get("census") === "1";
-				response = withCors(await fetchVaultDebug(env, vaultId, census));
-			} else if (resource === "debug" && req.method === "POST" && rest[0] === "compact") {
-				response = withCors(await compactVault(env, vaultId));
-			} else if (resource === "auth" && rest[0] === "ticket" && req.method === "POST") {
-				response = withCors(await handleTicketRoute(req, authState, vaultId, json, env));
-			} else if (resource === "blobs") {
-				response = withCors(await handleBlobRoute(env, vaultId, req, rest, json));
-			} else if (resource === "snapshots") {
-				response = withCors(await handleSnapshotRoute(env, vaultId, req, rest, json, {
-					fetchVaultDocument,
-					recordVaultTrace,
-				}));
+			if (resource === "debug" && req.method === "POST" && rest[0] === "compact") {
+				if (!env.YAOS_ENABLE_ADMIN_ROUTES) {
+					response = withCors(json({ error: "not found" }, 404));
+				} else if (!(await verifyOperatorSession(env, req))) {
+					response = withCors(json({ error: "unauthorized" }, 401));
+				} else {
+					response = withCors(await compactVault(env, vaultId));
+				}
 			} else {
-				response = withCors(json({ error: "not found" }, 404));
+				const authFailure = await rejectAndLogUnauthorizedVaultRequest(req, env, authState, vaultId);
+				if (authFailure) {
+					response = withCors(authFailure);
+				} else if (resource === "debug" && req.method === "GET" && rest[0] === "recent") {
+					const census = new URL(req.url).searchParams.get("census") === "1";
+					response = withCors(await fetchVaultDebug(env, vaultId, census));
+				} else if (resource === "auth" && rest[0] === "ticket" && req.method === "POST") {
+					const device = await authorizeDevice(env, getHttpAuthToken(req), vaultId);
+					response = device
+						? withCors(await handleTicketRoute(req, authState, vaultId, device.deviceId, json, env))
+						: withCors(json({ error: "unauthorized" }, 401));
+				} else if (resource === "auth" && rest[0] === "pairing-code" && req.method === "POST") {
+					response = withCors(await handleVaultPairingCodeRoute(req, env, vaultId));
+				} else if (resource === "auth" && rest[0] === "device" && req.method === "POST") {
+					response = withCors(await handleVaultDeviceRoute(req, env, vaultId));
+				} else if (resource === "auth" && rest[0] === "device" && req.method === "DELETE") {
+					response = withCors(await handleVaultDeviceLeaveRoute(req, env, vaultId));
+				} else if (resource === "devices" && req.method === "GET") {
+					response = withCors(await handleVaultDevicesListRoute(req, env, vaultId));
+				} else if (resource === "blobs") {
+					response = withCors(await handleBlobRoute(env, vaultId, req, rest, json));
+				} else if (resource === "snapshots") {
+					response = withCors(await handleSnapshotRoute(env, vaultId, req, rest, json, {
+						fetchVaultDocument,
+						recordVaultTrace,
+					}));
+				} else {
+					response = withCors(json({ error: "not found" }, 404));
+				}
 			}
 		}
 

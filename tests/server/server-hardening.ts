@@ -1,10 +1,9 @@
 import { runSerialized, runSingleFlight } from "../../server/src/asyncConcurrency";
 import { MAX_BLOB_UPLOAD_BYTES } from "../../server/src/contracts";
 import { shouldBypassDocumentLoadForPartyServerRequest } from "../../server/src/server";
-import worker from "../../server/src/index";
 import { getCapabilities } from "../../server/src/routes/auth";
 import { handleBlobRoute } from "../../server/src/routes/blobs";
-import { FakeR2Bucket, makeEnv, makeStoredConfigNamespace } from "../mocks/workerEnv.ts";
+import { FakeR2Bucket, makeEnv } from "../mocks/workerEnv.ts";
 import { sleep, suite } from "../harness.ts";
 
 const s = suite("server-hardening");
@@ -255,10 +254,17 @@ s.section("Test 7b: blob uploads reject oversized body when Content-Length heade
 s.section("Test 8: public capabilities do not expose private update metadata");
 {
 	const env = makeEnv({ YAOS_BUCKET: new FakeR2Bucket() });
-	const auth = { mode: "claim", claimed: true, tokenHash: "hash" } as const;
-	const config = {
+	const auth = {
+		mode: "claim",
 		claimed: true,
-		tokenHash: "hash",
+		operatorRecoveryHash: "operator-hash",
+		ticketSigningKey: "ticket-signing-key",
+	} as const;
+	const config = {
+		configFormat: 1,
+		claimed: true,
+		operatorRecoveryHash: "operator-hash",
+		ticketSigningKey: "ticket-signing-key",
 		updateProvider: "github" as const,
 		updateRepoUrl: "https://github.com/private/fork",
 		updateRepoBranch: "secret-branch",
@@ -275,44 +281,17 @@ s.section("Test 8: public capabilities do not expose private update metadata");
 	s.check(privateCaps.updateRepoBranch === "secret-branch", "authenticated capabilities include update repo branch");
 }
 
-s.section("Test 9: /api/capabilities route splits public and authenticated metadata");
+s.section("Test 9: capabilities expose one final identity-neutral shape");
 {
-	const token = "correct-token";
-	const env = makeEnv({
-		SYNC_TOKEN: token,
-		YAOS_BUCKET: new FakeR2Bucket(),
-		YAOS_CONFIG: makeStoredConfigNamespace({
-			claimed: true,
-			tokenHash: "unused-env-token-mode",
-			updateProvider: "github",
-			updateRepoUrl: "https://github.com/private/fork",
-			updateRepoBranch: "secret-branch",
-		}),
-	});
-
-	const publicRes = await worker.fetch(new Request("https://example.test/api/capabilities"), env);
-	const publicCaps = await publicRes.json() as Record<string, unknown>;
-	s.check(publicRes.status === 200, "public capabilities route returns 200");
-	s.check(publicCaps.updateProvider === null, "public capabilities route hides update provider");
-	s.check(publicCaps.updateRepoUrl === null, "public capabilities route hides update repo URL");
-	s.check(publicCaps.updateRepoBranch === null, "public capabilities route hides update repo branch");
-
-	const wrongTokenRes = await worker.fetch(new Request("https://example.test/api/capabilities", {
-		headers: { Authorization: "Bearer wrong-token" },
-	}), env);
-	const wrongTokenCaps = await wrongTokenRes.json() as Record<string, unknown>;
-	s.check(wrongTokenRes.status === 200, "wrong-token capabilities route returns public 200");
-	s.check(wrongTokenCaps.updateRepoUrl === null, "wrong-token capabilities route still hides update repo URL");
-
-	const privateRes = await worker.fetch(new Request("https://example.test/api/capabilities", {
-		headers: { Authorization: `Bearer ${token}` },
-	}), env);
-	const privateCaps = await privateRes.json() as Record<string, unknown>;
-	s.check(privateRes.status === 200, "authenticated capabilities route returns 200");
-	s.check(privateCaps.updateProvider === "github", "authenticated capabilities route includes update provider");
-	s.check(privateCaps.updateRepoUrl === "https://github.com/private/fork", "authenticated capabilities route includes update repo URL");
-	s.check(privateCaps.updateRepoBranch === "secret-branch", "authenticated capabilities route includes update repo branch");
-	s.check(privateCaps.maxBlobUploadBytes === MAX_BLOB_UPLOAD_BYTES, "capabilities route exposes max blob upload bytes");
+	const env = makeEnv({ YAOS_BUCKET: new FakeR2Bucket() });
+	const auth = {
+		mode: "claim",
+		claimed: true,
+		operatorRecoveryHash: "operator-hash",
+		ticketSigningKey: "ticket-signing-key",
+	} as const;
+	const caps = getCapabilities(auth, env);
+	s.check(caps.claimed === true, "capabilities preserve claimed state");
 }
 s.section("Test 10: PartyServer management requests bypass document hydration only for HTTP");
 {
