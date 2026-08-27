@@ -1,9 +1,7 @@
-// Regression tests for the enriched status bar label derivation (Phase 1.5 / INV-AUTH-01).
+// Regression tests for rich connection-state status labels (INV-AUTH-01).
 //
-// The old path collapses ConnectionState into 7 coarse SyncStatus values and then
-// maps those to display strings. That loses the auth rejection reason code and the
-// schema-mismatch detail. The new getLabelFromConnectionState() maps directly from
-// the rich ConnectionState, giving the user enough context to act without a dashboard.
+// Status text is derived directly from ConnectionState so auth rejection,
+// schema mismatch, and local persistence failures remain actionable.
 //
 // Invariants verified:
 //   - each ConnectionState kind produces a distinct, readable label
@@ -17,6 +15,7 @@ import {
 	SERVER_RECEIPT_STATUS_TITLE,
 	SERVER_RECEIPT_STATUS_TITLE_LEGACY,
 	getServerReceiptStatusTitle,
+	type ServerReceiptStatus,
 } from "../../src/status/statusBarController";
 import type { ConnectionState } from "../../src/runtime/connectionController";
 import { suite } from "../harness.ts";
@@ -38,6 +37,8 @@ s.check(label({ kind: "loading_cache" }).includes("Loading"), "loading_cache lab
 s.check(label({ kind: "connecting" }).includes("Connecting"), "connecting label readable");
 s.check(label({ kind: "online", generation: 1 }).includes("Connected"), "online label readable");
 s.check(label({ kind: "offline", reason: "provider_disconnected", generation: 1 }).includes("Offline"), "offline label readable");
+s.check(label({ kind: "local_persistence_failed", details: null }).includes("Local storage error"), "IndexedDB failure label readable");
+s.check(label({ kind: "error" }).includes("Error"), "generic runtime error label readable");
 
 s.section("Test 2: auth_failed reason codes are exposed");
 s.check(
@@ -81,7 +82,7 @@ const withoutTransfer = label({ kind: "online", generation: 1 }, null);
 s.check(!withoutTransfer.includes("null"), "null transferStatus not rendered");
 
 s.section("Test 4b: server receipt status labels distinguish current and historical facts");
-const receiptBase = {
+const receiptBase: ServerReceiptStatus = {
 	// Untracked by default; every case that cares overrides it in the spread.
 	serverAppliedLocalState: null,
 	lastServerReceiptEchoAt: null,
@@ -208,6 +209,8 @@ const allStates: ConnectionState[] = [
 	{ kind: "auth_failed", code: "unclaimed" },
 	{ kind: "auth_failed", code: "server_misconfigured" },
 	{ kind: "server_update_required", details: { clientSchemaVersion: 1, roomSchemaVersion: 2, reason: null } },
+	{ kind: "local_persistence_failed", details: null },
+	{ kind: "error" },
 ];
 const seen = new Set<string>();
 for (const state of allStates) {

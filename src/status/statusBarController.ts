@@ -1,38 +1,27 @@
 import type { ConnectionState } from "../runtime/connectionController";
+import type { VaultSyncReceiptSnapshot } from "../sync/vaultSync";
 
-export type SyncStatus = "disconnected" | "loading" | "syncing" | "connected" | "offline" | "error" | "unauthorized";
 
-export type ServerReceiptStatus = {
-	serverAppliedLocalState: boolean | null;
-	lastServerReceiptEchoAt: number | null;
-	lastKnownServerReceiptEchoAt: number | null;
-	candidatePersistenceHealthy: boolean | null;
-	serverReceiptStartupValidation: string | null;
-	/** Receipts from this server prove a durable write, not just in-memory apply. */
-	receiptGuaranteeIsDurable?: boolean;
-	/** Server reported it cannot durably store writes. */
-	serverPersistenceDegraded?: boolean;
-};
+export type ServerReceiptStatus = Readonly<
+	Pick<
+		VaultSyncReceiptSnapshot,
+		| "serverAppliedLocalState"
+		| "lastServerReceiptEchoAt"
+		| "lastKnownServerReceiptEchoAt"
+		| "candidatePersistenceHealthy"
+		| "serverReceiptStartupValidation"
+	> & Partial<
+		Pick<
+			VaultSyncReceiptSnapshot,
+			"receiptGuaranteeIsDurable" | "serverPersistenceDegraded"
+		>
+	>
+>;
 
-export function getSyncStatusLabel(state: SyncStatus): string {
-	const labels: Record<SyncStatus, string> = {
-		disconnected: "CRDT: Disconnected",
-		loading: "CRDT: Loading cache...",
-		syncing: "CRDT: Syncing...",
-		connected: "CRDT: Connected",
-		offline: "CRDT: Offline",
-		error: "CRDT: Error",
-		unauthorized: "CRDT: Unauthorized",
-	};
-	return labels[state];
-}
 
 /**
- * Derives a status bar label directly from the rich `ConnectionState`. This
- * replaces the coarse 7-value SyncStatus → label mapping for the visible
- * status bar text, allowing the user to see auth rejection reasons and
- * schema-mismatch details without a full dashboard. Per the stabilization
- * plan (INV-AUTH-01): not a dashboard — just enough truth.
+ * Derives status text directly from the rich `ConnectionState`, preserving
+ * actionable auth, compatibility, and local-persistence failure details.
  */
 export function getLabelFromConnectionState(
 	state: ConnectionState,
@@ -73,6 +62,12 @@ export function getLabelFromConnectionState(
 			break;
 		case "server_update_required":
 			base = "YAOS: Update required";
+			break;
+		case "local_persistence_failed":
+			base = "YAOS: Local storage error";
+			break;
+		case "error":
+			base = "YAOS: Error";
 			break;
 	}
 	if (transferStatus) base = `${base} (${transferStatus})`;
@@ -152,26 +147,8 @@ export function getServerReceiptStatusLabel(
 	return label;
 }
 
-export function renderSyncStatus(
-	statusBarEl: HTMLElement,
-	state: SyncStatus,
-	transferStatus?: string | null,
-	attentionCount = 0,
-): void {
-	let text = getSyncStatusLabel(state);
-	if (transferStatus) {
-		text += ` (${transferStatus})`;
-	}
-	if (attentionCount > 0) {
-		text += ` · ${attentionCount} file${attentionCount === 1 ? "" : "s"} need attention`;
-	}
-	statusBarEl.setText(text);
-}
 
-/**
- * Renders the status bar using the rich ConnectionState label. Prefer this
- * over renderSyncStatus when the ConnectionState is available.
- */
+/** Renders the status bar from the canonical rich connection state. */
 export function renderConnectionState(
 	statusBarEl: HTMLElement,
 	state: ConnectionState,

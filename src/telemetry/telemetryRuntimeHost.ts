@@ -30,32 +30,29 @@
 import type { App } from "obsidian";
 import type { VaultSyncSettings } from "../settings";
 import type { TraceSink } from "../observability/traceSink";
-import type { TraceHttpContext } from "../observability/traceContext";
 import type { FrontmatterQuarantineEntry } from "../sync/frontmatterQuarantine";
+import type { ReconciliationState } from "../runtime/reconciliationController";
+import type { VaultSyncReceiptSnapshot } from "../sync/vaultSync";
+
 
 /**
  * Read-only snapshot of runtime state passed through to DiagnosticsService.
  * All fields are plain scalars — no object handles.
  */
-export interface RuntimeDiagnosticsState {
-	reconciled: boolean;
-	reconcileInFlight: boolean;
-	reconcilePending: boolean;
-	lastReconcileStats: {
-		at: string;
-		mode: import("../sync/vaultSync").ReconcileMode;
-		plannedCreates: number;
-		plannedUpdates: number;
-		flushedCreates: number;
-		flushedUpdates: number;
-		safetyBrakeTriggered: boolean;
-		safetyBrakeReason: string | null;
-	} | null;
-	awaitingFirstProviderSyncAfterStartup: boolean;
-	lastReconciledGeneration: number;
-	untrackedFileCount: number;
-	openFileCount: number;
-}
+export type RuntimeDiagnosticsState = Readonly<
+	Pick<
+		ReconciliationState,
+		| "reconciled"
+		| "reconcileInFlight"
+		| "reconcilePending"
+		| "lastReconcileStats"
+		| "lastReconciledGeneration"
+		| "untrackedFileCount"
+	> & {
+		awaitingFirstProviderSyncAfterStartup: boolean;
+		openFileCount: number;
+	}
+>;
 
 /**
  * SyncReadPort — strictly read-only view of VaultSync state for debug use.
@@ -96,16 +93,7 @@ export interface SyncReadPort {
 	// ------------------------------------------------------------------
 	// Server receipt / ACK state
 	// ------------------------------------------------------------------
-	readonly serverAppliedLocalState: boolean | null;
-	readonly lastServerReceiptEchoAt: number | null;
-	readonly lastKnownServerReceiptEchoAt: number | null;
-	readonly hasUnconfirmedServerReceiptCandidate: boolean;
-	readonly serverReceiptCandidateCapturedAt: number | null;
-	readonly serverReceiptStartupValidation:
-		| "not_started"
-		| "validated"
-		| "skipped_local_yjs_timeout"
-		| "unavailable";
+	readonly serverReceipt: VaultSyncReceiptSnapshot;
 	readonly svEchoCounters: {
 		readonly customMessageSeenCount: number;
 		readonly svEchoSeenCount: number;
@@ -119,8 +107,6 @@ export interface SyncReadPort {
 	// ------------------------------------------------------------------
 	// Persistence health
 	// ------------------------------------------------------------------
-	readonly candidatePersistenceHealthy: boolean | null;
-	readonly candidatePersistenceFailureCount: number;
 	readonly idbError: boolean;
 	readonly idbErrorDetails: {
 		readonly kind: string;
@@ -181,23 +167,18 @@ export interface TelemetryRuntimeHost {
 	getSyncState(): SyncReadPort | null;
 
 	getTraceSink(): TraceSink;
-	getTraceHttpContext(): TraceHttpContext | undefined;
 
 	// Domain diagnostics cross this boundary as scalar snapshots, never manager instances.
 	getDiskMirrorSnapshot(): DiskMirrorSnapshot | null;
 	getBlobSyncSnapshot(): BlobSyncSnapshot | null;
 	getEventRing(): ReadonlyArray<{ ts: string; msg: string }>;
-	getRecentServerTrace(): readonly unknown[];
 	getFrontmatterQuarantineEntries(): readonly FrontmatterQuarantineEntry[];
 	getRuntimeDiagnosticsState(): RuntimeDiagnosticsState;
 	collectOpenFileTraceState(): Promise<Array<Record<string, unknown>>>;
 
-	sha256Hex(text: string): Promise<string>;
 	getPluginVersion(): string;
 	/** Server semver from the last capability fetch, or null if never fetched. */
 	getServerVersion(): string | null;
 	isMarkdownPathSyncable(path: string): boolean;
-	/** Register a cleanup to run on plugin unload. */
-	registerCleanup(cleanup: () => void): void;
 	log(msg: string): void;
 }

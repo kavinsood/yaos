@@ -22,7 +22,7 @@
  * references these constants rather than repeating their strings.
  */
 
-export const FLIGHT_TAXONOMY_VERSION = 12; // bumped: qa.trace.* renamed to debug.trace.*
+export const FLIGHT_TAXONOMY_VERSION = 13; // added unified debug trace event/checkpoint kinds
 
 export type FlightSeverity = "debug" | "info" | "warn" | "error";
 export type FlightScope =
@@ -70,6 +70,8 @@ export const FLIGHT_KIND = {
 	// Debug-trace lifecycle (emitted when settings.debug arms/disarms the recorder)
 	debugTraceStarted: "debug.trace.started",
 	debugTraceStopped: "debug.trace.stopped",
+	debugTraceEvent: "debug.trace.event",
+	debugTraceCheckpoint: "debug.trace.checkpoint",
 	// QA harness only
 	qaCheckpoint: "qa.checkpoint",
 	/**

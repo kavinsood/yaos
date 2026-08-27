@@ -17,20 +17,32 @@
  *     open implies server accepted the token and vaultId). False only when the
  *     server explicitly sent a rejection code.
  *
- *   lastLocalUpdateWhileConnectedAt — the strongest honest claim we can make about
- *     outbound candidates today. A local Y.Doc update that happened while the
- *     WebSocket was open is "eligible" to have been sent — but we have no provider-
- *     level send hook or server receipt to prove it was actually delivered. Do NOT
- *     label this "sent" in UI copy. See docs/sync-contract.md for the permitted
- *     receipt claims.
+ *   lastLocalUpdateWhileConnectedAt — a transport observation, not a receipt.
+ *     A local Y.Doc update happened while the WebSocket was open, but this does
+ *     not identify the update or prove durable application. The latest-state
+ *     server receipt is exposed separately through serverReceipt.
  *
- *   pendingLocalCount — null always until a real server ack/queue mechanism exists.
- *     "Connected" only means transport is open; it does not prove the outbound
- *     buffer was flushed, the server received the update, or the update persisted.
- *     See FU-8. Do NOT set this to 0 merely because websocketOpen is true.
+ *   pendingLocalCount — null because the durable receipt tracks the latest
+ *     candidate state vector, not individually identified queued updates. It
+ *     cannot provide queue cardinality or prove that an outbound buffer is empty.
  */
 
 import type { ConnectionState } from "./connectionController";
+import type { VaultSyncReceiptSnapshot } from "../sync/vaultSync";
+
+export type SyncFactsReceipt = Readonly<
+	Pick<
+		VaultSyncReceiptSnapshot,
+		| "serverAppliedLocalState"
+		| "lastServerReceiptEchoAt"
+		| "lastKnownServerReceiptEchoAt"
+		| "candidatePersistenceHealthy"
+		| "candidatePersistenceFailureCount"
+		| "hasUnconfirmedCandidate"
+		| "candidateCapturedAt"
+	>
+>;
+
 
 export interface SyncFacts {
 	/** True = server responded. False/null = unknown (no connection, no auth message). */
@@ -53,24 +65,17 @@ export interface SyncFacts {
 	lastRemoteUpdateAt: number | null;
 
 	/**
-	 * Always null — not derivable without a server ack/queue mechanism.
-	 * "WebSocket open" does NOT mean pending = 0: the transport being open says
-	 * nothing about whether the outbound buffer was flushed, the server received
-	 * the update, or the server persisted it. See FU-8 (server receipt mechanism).
+	 * Always null: the latest-state durable receipt is not a queue. It tracks a
+	 * candidate state vector, not individually identified pending updates, so it
+	 * cannot provide queue cardinality.
 	 */
 	pendingLocalCount: null;
 
 	/** Count of blob uploads pending. */
 	pendingBlobUploads: number;
 
-	/** FU-8 Level 3 server receipt facts. Not durable. */
-	serverAppliedLocalState: boolean | null;
-	lastServerReceiptEchoAt: number | null;
-	lastKnownServerReceiptEchoAt: number | null;
-	candidatePersistenceHealthy: boolean | null;
-	candidatePersistenceFailureCount: number | null;
-	hasUnconfirmedServerReceiptCandidate: boolean;
-	serverReceiptCandidateCapturedAt: number | null;
+	/** Canonical server-receipt facts, or null before the sync runtime exists. */
+	serverReceipt: SyncFactsReceipt | null;
 
 	/** Derived headline connection state. */
 	headlineState: ConnectionState["kind"];
@@ -84,13 +89,7 @@ export interface SyncFactsSnapshot {
 	lastLocalUpdateWhileConnectedAt: number | null;
 	lastRemoteUpdateAt: number | null;
 	pendingBlobUploads: number;
-	serverAppliedLocalState?: boolean | null;
-	lastServerReceiptEchoAt?: number | null;
-	lastKnownServerReceiptEchoAt?: number | null;
-	candidatePersistenceHealthy?: boolean | null;
-	candidatePersistenceFailureCount?: number | null;
-	hasUnconfirmedServerReceiptCandidate?: boolean;
-	serverReceiptCandidateCapturedAt?: number | null;
+	serverReceipt?: SyncFactsReceipt | null;
 }
 
 export function deriveSyncFacts(
@@ -122,10 +121,9 @@ export function deriveSyncFacts(
 		}
 	}
 
-	// pendingLocalCount: always null. "WebSocket open" proves only that the transport
-	// is up — not that the outbound buffer is empty, not that the server received
-	// anything, not that updates persisted. A real pending count requires a
-	// per-update acknowledgement mechanism; see docs/sync-contract.md.
+	// The latest-state receipt can prove whether one candidate state vector was
+	// durably applied. It does not identify every queued update, so it cannot
+	// yield a pending count.
 	const pendingLocalCount = null;
 
 	return {
@@ -138,13 +136,7 @@ export function deriveSyncFacts(
 		lastRemoteUpdateAt: snapshot.lastRemoteUpdateAt,
 		pendingLocalCount,
 		pendingBlobUploads: snapshot.pendingBlobUploads,
-		serverAppliedLocalState: snapshot.serverAppliedLocalState ?? null,
-		lastServerReceiptEchoAt: snapshot.lastServerReceiptEchoAt ?? null,
-		lastKnownServerReceiptEchoAt: snapshot.lastKnownServerReceiptEchoAt ?? null,
-		candidatePersistenceHealthy: snapshot.candidatePersistenceHealthy ?? null,
-		candidatePersistenceFailureCount: snapshot.candidatePersistenceFailureCount ?? null,
-		hasUnconfirmedServerReceiptCandidate: snapshot.hasUnconfirmedServerReceiptCandidate ?? false,
-		serverReceiptCandidateCapturedAt: snapshot.serverReceiptCandidateCapturedAt ?? null,
+		serverReceipt: snapshot.serverReceipt ?? null,
 		headlineState,
 	};
 }

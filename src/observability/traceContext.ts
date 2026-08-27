@@ -1,12 +1,6 @@
 /**
- * Product-safe trace context types.
- *
- * These types are used by product sync/runtime code for HTTP tracing
- * and structured logging. They do NOT depend on flight recorder or
- * debug infrastructure.
- *
- * The lab layer (debug/trace.ts) imports these and builds the full
- * PersistentTraceLogger on top.
+ * Focused product contract for HTTP trace query parameters and legacy
+ * structured trace callbacks routed into the flight recorder.
  */
 
 /**

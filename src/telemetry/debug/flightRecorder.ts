@@ -1,5 +1,7 @@
-import { normalizePath, type App } from "obsidian";
+import type { App } from "obsidian";
+import { canonicalizeVaultPath } from "../../paths/canonicalPath";
 import { randomId } from "../../utils/randomId";
+import { ensureAdapterDirectory } from "../../utils/adapterDirectory";
 import {
 	FLIGHT_EVENT_SCHEMA_VERSION,
 	type FlightEvent,
@@ -70,7 +72,7 @@ function nowMono(): number | undefined {
 }
 
 function ensurePrefixDir(path: string): string {
-	return normalizePath(path);
+	return canonicalizeVaultPath(path).normalizedPath;
 }
 
 export class FlightRecorder {
@@ -332,7 +334,7 @@ export class FlightRecorder {
 		this.pendingEntries = [];
 		this.pendingChars = 0;
 		await this.enqueueWrite(async () => {
-			await this.ensureDir(this.sessionDir());
+			await ensureAdapterDirectory(this.app.vault.adapter, this.sessionDir());
 			// Check if we need to rotate before writing.
 			if (this.bytesWrittenToCurrentFile + chunk.length > MAX_ACTIVE_FILE_BYTES) {
 				await this.rotateFile();
@@ -343,7 +345,7 @@ export class FlightRecorder {
 	}
 
 	async shutdown(): Promise<void> {
-		if (this.flushTimer) {
+		if (this.flushTimer !== null) {
 			window.clearTimeout(this.flushTimer);
 			this.flushTimer = null;
 		}
@@ -362,7 +364,7 @@ export class FlightRecorder {
 	}
 
 	private scheduleFlush(): void {
-		if (this.flushTimer) return;
+		if (this.flushTimer !== null) return;
 		this.flushTimer = window.setTimeout(() => {
 			this.flushTimer = null;
 			void this.flushNow();
@@ -651,23 +653,6 @@ export class FlightRecorder {
 		this.bytesWrittenToCurrentFile = 0;
 	}
 
-	private async ensureDir(dir: string): Promise<void> {
-		const normalized = normalizePath(dir);
-		if (!normalized) return;
-		const parts = normalized.split("/").filter(Boolean);
-		let current = "";
-		for (const part of parts) {
-			current = current ? `${current}/${part}` : part;
-			try {
-				await this.app.vault.adapter.mkdir(current);
-			} catch (error) {
-				const msg = error instanceof Error ? error.message : String(error);
-				if (msg.toLowerCase().includes("exists")) continue;
-				if (await this.app.vault.adapter.exists(current)) continue;
-				throw error;
-			}
-		}
-	}
 
 	// -----------------------------------------------------------------------
 	// Privacy guard

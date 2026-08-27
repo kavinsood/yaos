@@ -278,7 +278,7 @@ function buildFixture(initial: {
 
 s.section("Test 0: taxonomy bumped to 10, recovery.amplification.quarantined defined");
 {
-	assertEq(FLIGHT_TAXONOMY_VERSION, 12, "FLIGHT_TAXONOMY_VERSION === 12");
+	assertEq(FLIGHT_TAXONOMY_VERSION, 13, "FLIGHT_TAXONOMY_VERSION === 13");
 	assertEq(
 		FLIGHT_KIND.recoveryAmplificationQuarantined,
 		"recovery.amplification.quarantined",

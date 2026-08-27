@@ -1,4 +1,4 @@
-import { MarkdownView, Notice, Plugin, TFile, arrayBufferToHex } from "obsidian";
+import { MarkdownView, Notice, Plugin, TFile } from "obsidian";
 import {
 	DEFAULT_SETTINGS,
 	VaultSyncSettingTab,
@@ -18,6 +18,7 @@ import { isMarkdownSyncable, isBlobSyncable } from "./types";
 import { planCategoryRenameAction } from "./sync/policy/renameAdmissionPolicy";
 import { classifySyncPath } from "./paths/pathCategory";
 import { isCanonicalPathFileIdCollision } from "./paths/pathCollision";
+import { sha256TextHex } from "./utils/sha256";
 import type { TraceSink } from "./observability/traceSink";
 import type { FlightEventInput, FlightPathEventInput } from "./observability/flightEnvelope";
 import { NoopTraceSink } from "./observability/noopTraceSink";
@@ -60,6 +61,7 @@ import {
 } from "./runtime/capabilityUpdateService";
 import {
 	ConnectionController,
+	ConnectionStateLatch,
 	type ConnectionState,
 } from "./runtime/connectionController";
 import {
@@ -76,13 +78,10 @@ import {
 } from "./runtime/teardownLifecycle";
 import { EditorWorkspaceOrchestrator } from "./runtime/editorWorkspaceOrchestrator";
 import { SetupLinkController } from "./runtime/setupLinkController";
-import { TraceRuntimeController } from "./runtime/traceRuntimeController";
 import { registerCommands } from "./commands";
 import {
-	getSyncStatusLabel,
+	getLabelFromConnectionState,
 	renderConnectionState,
-	renderSyncStatus,
-	type SyncStatus,
 } from "./status/statusBarController";
 import { CoalescedStatusRefresh } from "./status/coalescedStatusRefresh";
 import { formatUnknown, yTextToString } from "./utils/format";
@@ -90,6 +89,7 @@ import { randomId } from "./utils/randomId";
 import { ConfirmModal } from "./ui/ConfirmModal";
 import { runSchemaMigrationToV2 } from "./migrations/schemaV2";
 import { installTelemetryRuntime, type TelemetryRuntimeHandle } from "./telemetry/installTelemetryRuntime";
+import { setupFlightTraceBestEffort } from "./telemetry/debug/flightTraceController";
 import type { SyncReadPort, TelemetryRuntimeHost } from "./telemetry/telemetryRuntimeHost";
 import type { EngineControlPort, DiskIngestPort } from "./runtime/engineControlPort";
 import type { BindingPropagationGate } from "./sync/editorBinding";
@@ -138,7 +138,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private snapshotService: SnapshotService | null = null;
 	private reconciliationController!: ReconciliationController;
 	private setupLinkController: SetupLinkController | null = null;
-	private traceRuntime: TraceRuntimeController | null = null;
 	/** Debug runtime handle — null unless debug mode installed it at startup. */
 	private lab: TelemetryRuntimeHandle | null = null;
 
@@ -186,6 +185,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private readonly receiptStatusRefresh = new CoalescedStatusRefresh(() => {
 		if (!this.teardownLifecycle.isClosing) this.refreshStatusBar();
 	});
+	private readonly connectionStateLatch = new ConnectionStateLatch();
 
 	/** Parsed exclude patterns from settings. */
 	private excludePatterns: string[] = [];
@@ -384,7 +384,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					});
 				}
 			},
-			setStatusError: () => this.updateStatusBar("error"),
+			setStatusError: () => this.updateStatusBar({ kind: "error" }),
 			scheduleTraceStateSnapshot: (reason) => this.scheduleTraceStateSnapshot(reason),
 			updateSettings: (mutator, reason) => this.updateSettings(mutator, reason),
 		});
@@ -474,15 +474,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 							get lastLocalUpdateAt() { return vs.lastLocalUpdateAt; },
 							get lastLocalUpdateWhileConnectedAt() { return vs.lastLocalUpdateWhileConnectedAt; },
 							get lastRemoteUpdateAt() { return vs.lastRemoteUpdateAt; },
-							get serverAppliedLocalState() { return vs.serverAppliedLocalState; },
-							get lastServerReceiptEchoAt() { return vs.lastServerReceiptEchoAt; },
-							get lastKnownServerReceiptEchoAt() { return vs.lastKnownServerReceiptEchoAt; },
-							get hasUnconfirmedServerReceiptCandidate() { return vs.hasUnconfirmedServerReceiptCandidate; },
-							get serverReceiptCandidateCapturedAt() { return vs.serverReceiptCandidateCapturedAt; },
-							get serverReceiptStartupValidation() { return vs.serverReceiptStartupValidation; },
+							get serverReceipt() { return vs.getServerReceiptSnapshot(); },
 							get svEchoCounters() { return vs.svEchoCounters; },
-							get candidatePersistenceHealthy() { return vs.candidatePersistenceHealthy; },
-							get candidatePersistenceFailureCount() { return vs.candidatePersistenceFailureCount; },
 							get idbError() { return vs.idbError; },
 							get idbErrorDetails() { return vs.idbErrorDetails; },
 							get supportedSchemaVersion() { return vs.supportedSchemaVersion; },
@@ -503,7 +496,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						};  // satisfies SyncReadPort — narrower union types on VaultSync are compatible
 					},
 					getTraceSink: () => this.traceSink,
-					getTraceHttpContext: () => this.getTraceHttpContext(),
 					getDiskMirrorSnapshot: () => {
 						const diskMirror = this.diskMirror;
 						return diskMirror ? { activeObserverCount: diskMirror.activeObserverCount } : null;
@@ -518,24 +510,16 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 							: null;
 					},
 					getEventRing: () => this.eventRing,
-					getRecentServerTrace: () => this.traceRuntime?.getRecentServerTrace() ?? [],
 					getFrontmatterQuarantineEntries: () => this.frontmatterQuarantineEntries,
 					getRuntimeDiagnosticsState: () => ({
-						reconciled: this.reconciliationController.getState().reconciled,
-						reconcileInFlight: this.reconciliationController.getState().reconcileInFlight,
-						reconcilePending: this.reconciliationController.getState().reconcilePending,
-						lastReconcileStats: this.reconciliationController.getState().lastReconcileStats,
+						...this.reconciliationController.getState(),
 						awaitingFirstProviderSyncAfterStartup: this.awaitingFirstProviderSyncAfterStartup,
-						lastReconciledGeneration: this.reconciliationController.getState().lastReconciledGeneration,
-						untrackedFileCount: this.reconciliationController.untrackedFileCount,
 						openFileCount: this.editorWorkspace?.openFileCount ?? 0,
 					}),
 					collectOpenFileTraceState: () => this.collectOpenFileTraceState(),
-					sha256Hex: (text) => this.sha256Hex(text),
 					getPluginVersion: () => this.manifest.version,
 					getServerVersion: () => this.getUpdateState().serverVersion,
 					isMarkdownPathSyncable: (path) => this.isMarkdownPathSyncable(path),
-					registerCleanup: (cleanup) => this.register(cleanup),
 					log: (msg) => this.log(msg),
 			};
 			try {
@@ -548,10 +532,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			}
 		}
 
-		// setupTraceRuntime after telemetry install so createLogger can reference this.lab
-		this.setupTraceRuntime();
-
-		this.setupFlightTrace();
+		await this.setupFlightTrace();
 		this.attachmentOrchestrator = new AttachmentOrchestrator({
 			app: this.app,
 			getVaultSync: () => this.vaultSync,
@@ -578,7 +559,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.addSettingTab(new VaultSyncSettingTab(this.app, this, this));
 
 		this.statusBarEl = this.addStatusBarItem();
-		this.updateStatusBar("disconnected");
+		this.updateStatusBar({ kind: "disconnected" });
 
 		const finishOnload = (outcome: string): void => {
 			const durationMs = Date.now() - onloadStartedAt;
@@ -652,6 +633,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			this.log("initSync: lifecycle is closing; skipping initialization");
 			return;
 		}
+		this.connectionStateLatch.beginInitialization();
 
 		const initSyncStartedAt = Date.now();
 		const abortIfStale = (boundary: string): boolean => {
@@ -838,7 +820,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				flushOpenWrites: (reason) => {
 					void this.diskMirror?.flushOpenWrites(reason);
 				},
-				updateOfflineStatus: () => this.updateStatusBar("offline"),
+				updateOfflineStatus: () => this.updateStatusBar({
+					kind: "offline",
+					reason: "network_offline",
+					generation: this.vaultSync?.connectionGeneration ?? 0,
+				}),
 				refreshStatusBar: () => this.refreshStatusBar(),
 				scheduleTraceStateSnapshot: (reason) => this.scheduleTraceStateSnapshot(reason),
 				log: (message) => this.log(message),
@@ -986,7 +972,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			// STARTUP SEQUENCE
 			// -----------------------------------------------------------
 
-			this.updateStatusBar("loading");
+			this.updateStatusBar({ kind: "loading_cache" });
 			this.log("Waiting for IndexedDB persistence...");
 			const localLoaded = await this.vaultSync.waitForLocalPersistence();
 			if (abortIfStale("local persistence")) return;
@@ -996,12 +982,18 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			});
 			if (abortIfStale("server acknowledgement initialization")) return;
 
-			// Schema version check — refuse to run if a newer plugin wrote this data
+			// Schema version check — refuse to run if a newer plugin wrote this data.
+			// This is terminal for this attempt, so provider/status refreshes must
+			// not replace it with a transient connected/offline state.
 			const schemaError = this.vaultSync.checkSchemaVersion();
 			if (schemaError) {
 				console.error(`[yaos] ${schemaError}`);
 				new Notice(`YAOS: ${schemaError}`);
-				this.updateStatusBar("error");
+				this.connectionStateLatch.failInitialization({
+					phase: "schema",
+					message: schemaError,
+				});
+				this.refreshStatusBar();
 				return;
 			}
 
@@ -1012,11 +1004,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			if (this.vaultSync.fatalAuthError) {
 				this.log("Fatal auth error during startup");
 				if (this.vaultSync.fatalAuthCode === "update_required") {
-					this.updateStatusBar("error");
+					this.updateStatusBar(this.getCurrentConnectionState());
 					this.showFatalSyncNotice();
 					return;
 				}
-				this.updateStatusBar("unauthorized");
+				this.updateStatusBar(this.getCurrentConnectionState());
 				this.showFatalSyncNotice();
 				// Still reconcile with whatever we have locally
 				const mode = this.vaultSync.getSafeReconcileMode();
@@ -1025,7 +1017,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				return;
 			}
 
-			this.updateStatusBar("syncing");
+			this.updateStatusBar({ kind: "connecting" });
 			this.log("Waiting for provider sync...");
 			const providerSynced = await this.vaultSync.waitForProviderSync();
 			if (abortIfStale("provider synchronization")) return;
@@ -1037,7 +1029,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			);
 
 			if (this.vaultSync.fatalAuthError) {
-				this.updateStatusBar(this.vaultSync.fatalAuthCode === "update_required" ? "error" : "unauthorized");
+				this.updateStatusBar(this.getCurrentConnectionState());
 				this.showFatalSyncNotice();
 				return;
 			}
@@ -1052,6 +1044,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				this.awaitingFirstProviderSyncAfterStartup = false;
 			}
 
+			this.connectionStateLatch.recover();
 			this.refreshStatusBar();
 			this.trace("trace", "startup-init-sync-complete", {
 				durationMs: Date.now() - initSyncStartedAt,
@@ -1059,7 +1052,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			this.log("Startup complete");
 			this.scheduleTraceStateSnapshot("startup-complete");
 			this.attachmentOrchestrator?.markStartupReady("startup-complete");
-			void this.traceRuntime?.refreshServerTrace();
+			void this.lab?.refreshServerTrace();
 
 			// Trigger daily snapshot (noop if already taken today).
 			// Fire-and-forget — don't block startup on snapshot creation.
@@ -1069,7 +1062,15 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		} catch (err) {
 			console.error("[yaos] Failed to initialize sync:", err);
 			new Notice(`YAOS: failed to initialize — ${formatUnknown(err)}`);
-			this.updateStatusBar("error");
+			if (!this.teardownLifecycle.isInitializationCurrent(generation)) {
+				this.log("initSync: stale initialization failed after shutdown; ignoring terminal status");
+				return;
+			}
+			this.connectionStateLatch.failInitialization({
+				phase: "initialization",
+				message: formatUnknown(err),
+			});
+			this.refreshStatusBar();
 		}
 	}
 
@@ -1510,7 +1511,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			},
 			{
 				name: "status-ui",
-				run: () => this.updateStatusBar("disconnected"),
+				run: () => this.updateStatusBar({ kind: "disconnected" }),
 			},
 		], ({ stage, error }) => {
 			const details = formatUnknown(error);
@@ -1713,9 +1714,19 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		);
 	}
 
+	private getCurrentConnectionState(): ConnectionState {
+		const liveState: ConnectionState = this.vaultSync?.idbError
+			? {
+				kind: "local_persistence_failed",
+				details: this.vaultSync.idbErrorDetails,
+			}
+			: this.connectionController?.getState() ?? { kind: "disconnected" };
+		return this.connectionStateLatch.resolve(liveState);
+	}
+
 	private refreshStatusBar(): void {
-		const state = this.computeSyncStatus();
-		if (state === "error" && this.vaultSync?.idbError) {
+		const state = this.getCurrentConnectionState();
+		if (state.kind === "local_persistence_failed") {
 			this.handleIndexedDbDegraded("status-check");
 		}
 		this.updateStatusBar(state);
@@ -1730,66 +1741,24 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.receiptStatusRefresh.request();
 	}
 
-	private computeSyncStatus(): SyncStatus {
-		if (this.vaultSync?.idbError) {
-			return "error";
-		}
-
-		return this.syncStatusFromConnectionState(this.connectionController?.getState() ?? { kind: "disconnected" });
-	}
-
-	private syncStatusFromConnectionState(state: ConnectionState): SyncStatus {
-		switch (state.kind) {
-			case "disconnected":
-				return "disconnected";
-			case "loading_cache":
-				return "loading";
-			case "connecting":
-				return "syncing";
-			case "online":
-				return "connected";
-			case "offline":
-				return "offline";
-			case "auth_failed":
-				return "unauthorized";
-			case "server_update_required":
-				return "error";
-		}
-	}
-
-	getSettingsStatusSummary(): { state: SyncStatus; label: string } {
-		const state = this.computeSyncStatus();
+	getSettingsStatusSummary(): { label: string } {
 		return {
-			state,
-			label: getSyncStatusLabel(state).replace(/^CRDT:\s*/, ""),
+			label: getLabelFromConnectionState(this.getCurrentConnectionState()).replace(/^YAOS:\s*/, ""),
 		};
 	}
 
-	private updateStatusBar(_coarseState: SyncStatus): void {
+	private updateStatusBar(connectionState: ConnectionState = this.getCurrentConnectionState()): void {
 		if (!this.statusBarEl) return;
-		const connectionState = this.connectionController?.getState();
+		const visibleState = this.connectionStateLatch.resolve(connectionState);
 		const transferStatus = this.getBlobSync()?.transferStatus;
 		const diskAttention =
 			(this.diskMirror?.getDebugSnapshot().preservedUnresolved.totalCount ?? 0);
 		const blobAttention =
 			(this.getBlobSync()?.getDebugSnapshot().preservedUnresolved.totalCount ?? 0);
 		const attentionCount = diskAttention + blobAttention;
-		const vaultSync = this.vaultSync;
-		const serverReceipt = vaultSync ? {
-			serverAppliedLocalState: vaultSync.serverAppliedLocalState,
-			lastServerReceiptEchoAt: vaultSync.lastServerReceiptEchoAt,
-			lastKnownServerReceiptEchoAt: vaultSync.lastKnownServerReceiptEchoAt,
-			candidatePersistenceHealthy: vaultSync.candidatePersistenceHealthy,
-			serverReceiptStartupValidation: vaultSync.serverReceiptStartupValidation,
-			receiptGuaranteeIsDurable: vaultSync.receiptGuaranteeIsDurable,
-			serverPersistenceDegraded: vaultSync.serverPersistenceDegraded,
-		} : null;
-		this.noticeServerPersistenceHealth(vaultSync?.serverPersistenceDegraded ?? false);
-		if (connectionState) {
-			renderConnectionState(this.statusBarEl, connectionState, transferStatus, serverReceipt, attentionCount);
-		} else {
-			renderSyncStatus(this.statusBarEl, _coarseState, transferStatus, attentionCount);
-		}
+		const serverReceipt = this.vaultSync?.getServerReceiptSnapshot() ?? null;
+		this.noticeServerPersistenceHealth(serverReceipt?.serverPersistenceDegraded ?? false);
+		renderConnectionState(this.statusBarEl, visibleState, transferStatus, serverReceipt, attentionCount);
 	}
 
 	/**
@@ -1810,33 +1779,27 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		new Notice(notice, degraded ? 15000 : 6000);
 	}
 
-	private setupTraceRuntime(): void {
-		this.traceRuntime = new TraceRuntimeController({
-			app: this.app,
-			getSettings: () => this.settings,
-			buildSnapshot: (reason, recentServerTrace) =>
-				this.buildTraceStateSnapshot(reason, recentServerTrace),
-			isIndexedDbRelatedError: (err) => this.isIndexedDbRelatedError(err),
-			isObsidianFileMetadataRaceError: (err) => this.isObsidianFileMetadataRaceError(err),
-			handleIndexedDbDegraded: (source, err) => this.handleIndexedDbDegraded(source, err),
-			registerCleanup: (cleanup) => this.register(cleanup),
-			createLogger: this.lab
-				? (config) => this.lab!.createTraceLogger(this.app, config)
-				: undefined,
-		});
-		this.traceRuntime.start();
-	}
-
-	private setupFlightTrace(): void {
-		this.lab?.setupFlightTrace({
-			getDocSchemaVersion: () => this.vaultSync?.storedSchemaVersion ?? null,
-			buildCheckpoint: () => this.buildFlightCheckpoint(),
-		});
-		void this.refreshFlightTraceState("startup");
+	private async setupFlightTrace(): Promise<void> {
+		await setupFlightTraceBestEffort(
+			async () => {
+				this.lab?.setupFlightTrace({
+					getDocSchemaVersion: () => this.vaultSync?.storedSchemaVersion ?? null,
+					buildCheckpoint: () => this.buildFlightCheckpoint(),
+					isIndexedDbRelatedError: (error) => this.isIndexedDbRelatedError(error),
+					isObsidianFileMetadataRaceError: (error) => this.isObsidianFileMetadataRaceError(error),
+					handleIndexedDbDegraded: (source, error) => this.handleIndexedDbDegraded(source, error),
+				});
+				await this.refreshFlightTraceState("startup");
+			},
+			(error) => {
+				console.error("[yaos] Debug flight trace failed to start:", error);
+				this.log("Debug flight trace failed to start; product initialization is continuing");
+			},
+		);
 	}
 
 	private getTraceHttpContext(): TraceHttpContext | undefined {
-		return this.traceRuntime?.httpContext;
+		return this.lab?.getTraceHttpContext();
 	}
 
 	private trace(
@@ -1844,7 +1807,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		msg: string,
 		details?: TraceEventDetails,
 	): void {
-		this.traceRuntime?.record(source, msg, details);
+		this.lab?.recordTrace(source, msg, details);
 	}
 
 	private recordFlightEvent(event: FlightEventInput): void {
@@ -1856,44 +1819,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	}
 
 	private scheduleTraceStateSnapshot(reason: string): void {
-		this.traceRuntime?.scheduleSnapshot(reason);
+		this.lab?.scheduleTraceCheckpoint(reason);
 	}
 
-	private async buildTraceStateSnapshot(
-		reason: string,
-		recentServerTrace: unknown[],
-	): Promise<Record<string, unknown>> {
-		return {
-			generatedAt: new Date().toISOString(),
-			reason,
-			trace: this.getTraceHttpContext() ?? null,
-			settings: {
-				host: this.settings.host,
-				vaultId: this.settings.vaultId,
-				deviceName: this.settings.deviceName,
-				debug: this.settings.debug,
-				enableAttachmentSync: this.settings.enableAttachmentSync,
-				externalEditPolicy: this.settings.externalEditPolicy,
-			},
-			state: {
-				reconciled: this.reconciliationController.getState().reconciled,
-				reconcileInFlight: this.reconciliationController.getState().reconcileInFlight,
-				reconcilePending: this.reconciliationController.getState().reconcilePending,
-				awaitingFirstProviderSyncAfterStartup: this.awaitingFirstProviderSyncAfterStartup,
-				lastReconciledGeneration: this.reconciliationController.getState().lastReconciledGeneration,
-				openFileCount: this.editorWorkspace?.openFileCount ?? 0,
-			},
-			sync: this.vaultSync?.getDebugSnapshot() ?? null,
-			diskMirror: this.diskMirror?.getDebugSnapshot() ?? null,
-			blobSync: this.getBlobSync()?.getDebugSnapshot() ?? null,
-			openFiles: await this.collectOpenFileTraceState(),
-			recentEvents: {
-				plugin: this.eventRing.slice(-120),
-				sync: this.vaultSync?.getRecentEvents(120) ?? [],
-			},
-			serverTrace: recentServerTrace,
-		};
-	}
 
 	private async buildFlightCheckpoint(): Promise<Record<string, unknown>> {
 		const vaultSync = this.vaultSync;
@@ -1901,7 +1829,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		return {
 			connected: vaultSync?.connected ?? false,
 			providerSynced: vaultSync?.providerSynced ?? false,
-			serverReceipt: vaultSync?.serverAppliedLocalState ?? null,
+			serverReceipt: vaultSync?.getServerReceiptSnapshot().serverAppliedLocalState ?? null,
 			diskFileCount: this.app.vault.getMarkdownFiles().length,
 			crdtPathCount: vaultSync?.getActiveMarkdownPaths().length ?? 0,
 			missingOnDisk: 0,
@@ -1915,7 +1843,13 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	}
 
 	private async refreshFlightTraceState(reason: string): Promise<void> {
-		await this.lab?.refreshFlightTraceState(reason);
+		await setupFlightTraceBestEffort(
+			() => this.lab?.refreshFlightTraceState(reason) ?? Promise.resolve(),
+			(error) => {
+				console.error(`[yaos] Debug flight trace refresh failed (${reason}):`, error);
+				this.log("Debug flight trace refresh failed; product runtime is continuing");
+			},
+		);
 	}
 
 	private async collectOpenFileTraceState(): Promise<Array<Record<string, unknown>>> {
@@ -1972,7 +1906,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	private async hashIfPresent(text: string | null): Promise<string | null> {
 		if (text == null) return null;
-		return this.sha256Hex(text);
+		return sha256TextHex(text);
 	}
 
 	private describeContentDiff(
@@ -2013,7 +1947,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.teardownLifecycle.requestPermanentShutdown();
 		this.log("Unloading plugin");
 		this.lab?.dispose();   // dispose stops the flight trace and QA API
-		void this.traceRuntime?.shutdown();
 		document.body.removeClass("vault-crdt-show-cursors");
 		// Remove plugin-owned debug global to prevent stale API references
 		// from confusing test harnesses after plugin reload.
@@ -2354,11 +2287,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		await this.persistWriteChain;
 	}
 
-	private async sha256Hex(text: string): Promise<string> {
-		const data = new TextEncoder().encode(text);
-		const digest = await crypto.subtle.digest("SHA-256", data);
-		return arrayBufferToHex(digest);
-	}
 
 	private runSchemaMigrationToV2(): void {
 		if (!this.vaultSync) {
@@ -2392,11 +2320,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		// so developers know what happened instead of silently finding no API.
 		this.log("qaDebugMode enabled, but window.__YAOS_DEBUG__ is not mounted by this build. Install the QA harness plugin (qa/obsidian-harness/main.ts) to get the QA debug API.");
 		new Notice("Yaos: Debug mode active — debug API unavailable in this build.", 8000);
-	}
-
-	private async exportFlightTraceForApi(privacy: "safe" | "full"): Promise<string | null> {
-		void privacy;
-		return null;
 	}
 
 	private log(msg: string): void {

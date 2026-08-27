@@ -19,6 +19,8 @@
  */
 
 import { type SyncFacts } from "../../runtime/connectionFacts";
+import type { ReconciliationStats } from "../../runtime/reconciliationController";
+
 import {
 	buildFrontmatterQuarantineDebugLines,
 	type FrontmatterQuarantineEntry,
@@ -43,16 +45,6 @@ type LogLine = { ts: string; msg: string };
 
 type ContentHash = { hash: string; length: number };
 
-type LastReconcileStats = {
-	at: string;
-	mode: string;
-	plannedCreates: number;
-	plannedUpdates: number;
-	flushedCreates: number;
-	flushedUpdates: number;
-	safetyBrakeTriggered: boolean;
-	safetyBrakeReason: string | null;
-};
 
 function describeServerReceiptStartupValidation(state: string | null): string {
 	switch (state) {
@@ -98,7 +90,7 @@ export interface TraceHeaderStateInput {
 		reconcileCompleted: boolean;
 		reconcileInFlight: boolean;
 		reconcilePending: boolean;
-		lastReconcileStats: LastReconcileStats | null;
+		lastReconcileStats: ReconciliationStats | null;
 		awaitingFirstProviderSyncAfterStartup: boolean;
 		lastReconciledGeneration: number;
 		connectedToServer: boolean;

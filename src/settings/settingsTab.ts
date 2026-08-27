@@ -15,7 +15,6 @@ import {
 } from "./settingsStore";
 
 type SettingsAuthMode = "env" | "claim" | "unclaimed" | "unknown";
-type SettingsStatusState = "disconnected" | "loading" | "syncing" | "connected" | "offline" | "error" | "unauthorized";
 
 type DeclarativeSettingKey =
 	| "deviceName"
@@ -57,7 +56,7 @@ export interface VaultSyncSettingsHost {
 	refreshServerCapabilities(reason?: string): Promise<void>;
 	refreshUpdateManifest(reason?: string, force?: boolean): Promise<void>;
 	refreshAttachmentSyncRuntime(reason?: string): Promise<void>;
-	getSettingsStatusSummary(): { state: SettingsStatusState; label: string };
+	getSettingsStatusSummary(): { label: string };
 	getUpdateState(): SettingsUpdateState;
 	buildSetupDeepLink(): string | null;
 	buildMobileSetupUrl(): string | null;

@@ -11,6 +11,7 @@
 
 import { PathIdentityResolver, deriveVaultPathSalt, deriveSaltFingerprint } from "../../src/telemetry/debug/pathIdentity";
 import { FlightRecorder } from "../../src/telemetry/debug/flightRecorder";
+import { ensureAdapterDirectory } from "../../src/utils/adapterDirectory";
 import { FLIGHT_KIND } from "../../src/observability/flightTaxonomy";
 import { suite } from "../harness.ts";
 
@@ -37,6 +38,25 @@ async function trackingSha256(input: string): Promise<string> {
 	return sha256Hex(input);
 }
 
+s.section("Test 0: adapter directory creation is recursive and idempotent");
+{
+	const created = new Set([".obsidian"]);
+	const mkdirCalls: string[] = [];
+	const adapter = {
+		exists: async (path: string) => created.has(path),
+		mkdir: async (path: string) => {
+			mkdirCalls.push(path);
+			created.add(path);
+		},
+	};
+	await ensureAdapterDirectory(adapter as never, ".obsidian/plugins/yaos/diagnostics");
+	await ensureAdapterDirectory(adapter as never, ".obsidian/plugins/yaos/diagnostics");
+	s.check(
+		mkdirCalls.join(",") === ".obsidian/plugins,.obsidian/plugins/yaos,.obsidian/plugins/yaos/diagnostics",
+		"helper creates missing parents once and tolerates an existing nested path",
+	);
+}
+
 // ---------------------------------------------------------------------------
 // Test 1: PathIdentityResolver — stable pseudonyms, never a raw path
 // ---------------------------------------------------------------------------
@@ -53,6 +73,17 @@ s.section("Test 1: PathIdentityResolver pseudonymizes every path");
 
 	const idOther = await resolver.getPathIdentity("Projects/foo.md");
 	s.check(id1.pathId !== idOther.pathId, "Different paths get different pathIds");
+}
+
+s.section("Test 1b: trace path identity uses canonical vault paths");
+{
+	const resolver = new PathIdentityResolver(sha256Hex, { salt: "canonical-paths" });
+	const nfd = await resolver.getPathIdentity("././cafe\u0301\\note.md");
+	const nfc = await resolver.getPathIdentity("/caf\u00E9//note.md");
+
+	s.check(nfd.pathId === nfc.pathId, "separators, repeated ./, leading slash, and NFC/NFD share one pathId");
+	s.check(resolver.directory().length === 1, "canonical-equivalent trace paths share one directory entry");
+	s.check(resolver.directory()[0]?.path === "caf\u00E9/note.md", "trace directory records the canonical path");
 }
 
 // ---------------------------------------------------------------------------
@@ -520,6 +551,8 @@ s.section("Test 14: FLIGHT_KIND taxonomy constants");
 	s.check(FLIGHT_KIND.serverReceiptConfirmed === "server.receipt.confirmed", "receipt confirmed");
 	s.check(FLIGHT_KIND.serverReceiptCandidateCaptured === "server.receipt.candidate_captured", "receipt candidate");
 	s.check(FLIGHT_KIND.qaCheckpoint === "qa.checkpoint", "qa checkpoint");
+	s.check(FLIGHT_KIND.debugTraceEvent === "debug.trace.event", "unified legacy trace event");
+	s.check(FLIGHT_KIND.debugTraceCheckpoint === "debug.trace.checkpoint", "unified runtime checkpoint");
 	s.check(FLIGHT_KIND.exportManifest === "export.manifest", "export manifest (new)");
 	s.check(FLIGHT_KIND.redactionFailure === "redaction.failure", "redaction failure (new)");
 	s.check(FLIGHT_KIND.pathIdentityDegraded === "path.identity.degraded", "path identity degraded (new)");

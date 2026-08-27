@@ -1,24 +1,20 @@
 import { App, Platform, apiVersion, normalizePath } from "obsidian";
 import { deriveSyncFacts } from "../../runtime/connectionFacts";
-import type { BlobSyncSnapshot, DiskMirrorSnapshot, SyncReadPort } from "../telemetryRuntimeHost";
-import type { TraceHttpContext } from "../debug/trace";
+import type {
+	BlobSyncSnapshot,
+	DiskMirrorSnapshot,
+	RuntimeDiagnosticsState,
+	SyncReadPort,
+} from "../telemetryRuntimeHost";
+import type { TraceHttpContext } from "../../observability/traceContext";
 import type { VaultSyncSettings } from "../../settings";
 import type { FrontmatterQuarantineEntry } from "../../sync/frontmatterQuarantine";
 import type { TraceHeaderPlatform, TraceHeaderStateInput } from "./diagnosticsBundle";
-import type { ReconcileMode } from "../../sync/vaultSync";
+import { ensureAdapterDirectory } from "../../utils/adapterDirectory";
+import { sha256TextHex } from "../../utils/sha256";
 
 type LogLine = { ts: string; msg: string };
 
-type LastReconcileStats = {
-	at: string;
-	mode: ReconcileMode;
-	plannedCreates: number;
-	plannedUpdates: number;
-	flushedCreates: number;
-	flushedUpdates: number;
-	safetyBrakeTriggered: boolean;
-	safetyBrakeReason: string | null;
-};
 
 interface DiagnosticsServiceDeps {
 	app: App;
@@ -31,19 +27,9 @@ interface DiagnosticsServiceDeps {
 	getEventRing(): LogLine[];
 	getRecentServerTrace(): unknown[];
 	getFrontmatterQuarantineEntries(): FrontmatterQuarantineEntry[];
-	getState(): {
-		reconciled: boolean;
-		reconcileInFlight: boolean;
-		reconcilePending: boolean;
-		lastReconcileStats: LastReconcileStats | null;
-		awaitingFirstProviderSyncAfterStartup: boolean;
-		lastReconciledGeneration: number;
-		untrackedFileCount: number;
-		openFileCount: number;
-	};
+	getState(): RuntimeDiagnosticsState;
 	isMarkdownPathSyncable(path: string): boolean;
 	collectOpenFileTraceState(): Promise<Array<Record<string, unknown>>>;
-	sha256Hex(text: string): Promise<string>;
 	log(message: string): void;
 }
 
@@ -96,7 +82,7 @@ export class DiagnosticsService {
 			try {
 				const content = await this.deps.app.vault.read(file);
 				diskHashes.set(file.path, {
-					hash: await this.deps.sha256Hex(content),
+					hash: await sha256TextHex(content),
 					length: content.length,
 				});
 			} catch (err) {
@@ -111,7 +97,7 @@ export class DiagnosticsService {
 			const content = vaultSync.getPathContent(path);
 			if (content === null) continue;
 			crdtHashes.set(path, {
-				hash: await this.deps.sha256Hex(content),
+				hash: await sha256TextHex(content),
 				length: content.length,
 			});
 		}
@@ -126,13 +112,7 @@ export class DiagnosticsService {
 				lastLocalUpdateWhileConnectedAt: vaultSync.lastLocalUpdateWhileConnectedAt,
 				lastRemoteUpdateAt: vaultSync.lastRemoteUpdateAt,
 				pendingBlobUploads: blobSyncSnapshot?.pendingUploads ?? 0,
-				serverAppliedLocalState: vaultSync.serverAppliedLocalState,
-				lastServerReceiptEchoAt: vaultSync.lastServerReceiptEchoAt,
-				lastKnownServerReceiptEchoAt: vaultSync.lastKnownServerReceiptEchoAt,
-				candidatePersistenceHealthy: vaultSync.candidatePersistenceHealthy,
-				candidatePersistenceFailureCount: vaultSync.candidatePersistenceFailureCount,
-				hasUnconfirmedServerReceiptCandidate: vaultSync.hasUnconfirmedServerReceiptCandidate,
-				serverReceiptCandidateCapturedAt: vaultSync.serverReceiptCandidateCapturedAt,
+				serverReceipt: vaultSync.serverReceipt,
 			},
 			vaultSync.connected
 				? (state.reconciled ? "online" : "connecting")
@@ -169,7 +149,7 @@ export class DiagnosticsService {
 				fatalAuthDetails: vaultSync.fatalAuthDetails,
 				indexedDbError: vaultSync.idbError,
 				indexedDbErrorDetails: vaultSync.idbErrorDetails,
-				serverReceiptStartupValidation: vaultSync.serverReceiptStartupValidation,
+				serverReceiptStartupValidation: vaultSync.serverReceipt.serverReceiptStartupValidation,
 				serverReceiptEchoCounters: vaultSync.svEchoCounters,
 				activeCrdtPathCount: activePaths.length,
 				blobPathCount: vaultSync.blobPathCount,
@@ -189,15 +169,13 @@ export class DiagnosticsService {
 			diskMirrorSnapshot: this.deps.getDiskMirrorSnapshot(),
 			blobSyncSnapshot,
 			frontmatterQuarantine: this.deps.getFrontmatterQuarantineEntries(),
-			sha256Hex: this.deps.sha256Hex.bind(this.deps),
+			sha256Hex: sha256TextHex,
 		};
 	}
 
 	async ensureDiagnosticsDir(): Promise<string> {
 		const diagDir = normalizePath(`${this.deps.app.vault.configDir}/plugins/yaos/diagnostics`);
-		if (!(await this.deps.app.vault.adapter.exists(diagDir))) {
-			await this.deps.app.vault.adapter.mkdir(diagDir);
-		}
+		await ensureAdapterDirectory(this.deps.app.vault.adapter, diagDir);
 		return diagDir;
 	}
 }

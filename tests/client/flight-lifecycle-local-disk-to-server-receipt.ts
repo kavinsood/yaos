@@ -59,10 +59,11 @@ const mockApp = {
 const mockSettings = {
 	vaultId: "test-vault-id",
 	host: "https://test.example.com",
+	token: "test-token",
+	deviceName: "Test Device",
 	debug: true,
 };
 
-const cleanupFns: (() => void)[] = [];
 
 const deps: FlightTraceDeps = {
 	app: mockApp as never,
@@ -70,7 +71,9 @@ const deps: FlightTraceDeps = {
 	getPluginVersion: () => "1.0.0-test",
 	getDocSchemaVersion: () => 2,
 	buildCheckpoint: async () => ({}),
-	registerCleanup: (fn) => { cleanupFns.push(fn); },
+	isIndexedDbRelatedError: () => false,
+	isObsidianFileMetadataRaceError: () => false,
+	handleIndexedDbDegraded: () => {},
 	// The test never exports, so the header input is never inspected; the stub
 	// exists only to satisfy FlightTraceDeps.
 	collectTraceHeaderInput: async () => ({}) as never,
@@ -93,6 +96,42 @@ async function runLifecycleTest(): Promise<void> {
 	const recorder = controller.currentRecorder!;
 	s.check(recorder !== null && recorder !== undefined, "Recorder is active after start");
 	s.check(recorder.safeToShare === true, "Recorder is in safe mode");
+
+	const httpContext = controller.httpContext;
+	s.check(httpContext?.traceId === recorder.context.traceId, "HTTP trace context shares the flight trace ID");
+	s.check(httpContext?.bootId === recorder.context.bootId, "HTTP trace context shares the flight boot ID");
+	s.check(httpContext?.deviceName === mockSettings.deviceName, "HTTP trace context carries the configured device name");
+	s.check(httpContext?.vaultId === mockSettings.vaultId, "HTTP trace context carries the configured vault ID");
+
+	controller.recordTrace("legacy-source", "legacy-event", {
+		count: 1,
+		path: TEST_PATH,
+	});
+	controller.scheduleCheckpoint("test-checkpoint");
+	await new Promise((resolve) => setTimeout(resolve, 300));
+	await controller.refreshServerTrace();
+	const runtimeEvents = recorder.recentEvents;
+	const legacyEvent = runtimeEvents.find((event) =>
+		event.kind === FLIGHT_KIND.debugTraceEvent
+		&& event.data?.event === "legacy-event");
+	s.check(legacyEvent !== undefined, "legacy structured trace callback routes into the flight recorder");
+	s.check(
+		legacyEvent?.data?.details !== undefined
+			&& !(legacyEvent.data.details as Record<string, unknown>).path,
+		"legacy trace details drop path-shaped fields before persistence",
+	);
+	s.check(
+		runtimeEvents.some((event) =>
+			event.kind === FLIGHT_KIND.debugTraceCheckpoint
+			&& event.data?.reason === "test-checkpoint"),
+		"debounced runtime checkpoint is recorded by the flight controller",
+	);
+	s.check(
+		runtimeEvents.some((event) =>
+			event.kind === FLIGHT_KIND.debugTraceEvent
+			&& event.data?.event === "server-trace-fetch-failed"),
+		"server trace polling failures remain observable in the unified recorder",
+	);
 
 	// Step 1: Record disk.create.observed (simulates main.ts vault event handler)
 	await controller.recordPath({

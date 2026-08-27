@@ -1,4 +1,4 @@
-import { VaultSync } from "../sync/vaultSync";
+import type { VaultSync } from "../sync/vaultSync";
 import type { TraceRecord } from "../observability/traceContext";
 import { deriveSyncFacts, type SyncFacts } from "./connectionFacts";
 
@@ -7,6 +7,11 @@ export type OfflineReason =
 	| "network_offline"
 	| "local_cache_not_ready";
 
+export interface ConnectionStartupFailure {
+	phase: "schema" | "initialization";
+	message: string;
+}
+
 export type ConnectionState =
 	| { kind: "disconnected" }
 	| { kind: "loading_cache" }
@@ -14,7 +19,34 @@ export type ConnectionState =
 	| { kind: "online"; generation: number }
 	| { kind: "offline"; reason: OfflineReason; generation: number }
 	| { kind: "auth_failed"; code: "unauthorized" | "server_misconfigured" | "unclaimed" }
-	| { kind: "server_update_required"; details: VaultSync["fatalAuthDetails"] };
+	| { kind: "server_update_required"; details: VaultSync["fatalAuthDetails"] }
+	| { kind: "local_persistence_failed"; details: VaultSync["idbErrorDetails"] }
+	| { kind: "error"; details?: ConnectionStartupFailure };
+
+/**
+ * Holds startup failures outside the live provider-derived state. Status ticks
+ * can continue to derive current facts without erasing a terminal startup
+ * result; only a fresh attempt or explicit recovery clears the latch.
+ */
+export class ConnectionStateLatch {
+	private terminalState: Extract<ConnectionState, { kind: "error" }> | null = null;
+
+	beginInitialization(): void {
+		this.terminalState = null;
+	}
+
+	failInitialization(details: ConnectionStartupFailure): void {
+		this.terminalState = { kind: "error", details };
+	}
+
+	recover(): void {
+		this.terminalState = null;
+	}
+
+	resolve(liveState: ConnectionState): ConnectionState {
+		return this.terminalState ?? liveState;
+	}
+}
 
 type FastReconnectReason = "app-foregrounded" | "network-online";
 
@@ -115,13 +147,7 @@ export class ConnectionController {
 				lastLocalUpdateWhileConnectedAt: sync?.lastLocalUpdateWhileConnectedAt ?? null,
 				lastRemoteUpdateAt: sync?.lastRemoteUpdateAt ?? null,
 				pendingBlobUploads: blobPendingUploads,
-				serverAppliedLocalState: sync?.serverAppliedLocalState ?? null,
-				lastServerReceiptEchoAt: sync?.lastServerReceiptEchoAt ?? null,
-				lastKnownServerReceiptEchoAt: sync?.lastKnownServerReceiptEchoAt ?? null,
-				candidatePersistenceHealthy: sync?.candidatePersistenceHealthy ?? null,
-				candidatePersistenceFailureCount: sync?.candidatePersistenceFailureCount ?? null,
-				hasUnconfirmedServerReceiptCandidate: sync?.hasUnconfirmedServerReceiptCandidate ?? false,
-				serverReceiptCandidateCapturedAt: sync?.serverReceiptCandidateCapturedAt ?? null,
+				serverReceipt: sync?.getServerReceiptSnapshot() ?? null,
 			},
 			state.kind,
 		);
@@ -131,6 +157,13 @@ export class ConnectionController {
 		const sync = this.deps.getVaultSync();
 		if (!sync) {
 			return { kind: "disconnected" };
+		}
+
+		if (sync.idbError) {
+			return {
+				kind: "local_persistence_failed",
+				details: sync.idbErrorDetails,
+			};
 		}
 
 		if (sync.fatalAuthError) {

@@ -1,13 +1,6 @@
 import type { PathIdentity } from "./flightEvents";
 import { fnv1a32, toHex8 } from "../../utils/fnv1a";
-
-/**
- * Local path normalizer — replaces backslashes, collapses repeated slashes,
- * removes leading slashes. Equivalent to Obsidian's normalizePath for vault paths.
- */
-function normalizeTracePath(path: string): string {
-	return path.replace(/\\/g, "/").replace(/\/+/g, "/").replace(/^\/+/, "");
-}
+import { canonicalizeVaultPath } from "../../paths/canonicalPath";
 
 export type HashHex = (input: string) => Promise<string>;
 
@@ -75,7 +68,7 @@ export class PathIdentityResolver {
 	 * the directory of an explicitly unredacted export.
 	 */
 	async getPathIdentity(rawPath: string): Promise<PathIdentity> {
-		const normalized = normalizeTracePath(rawPath);
+		const normalized = canonicalizeVaultPath(rawPath).normalizedPath;
 		return { pathId: await this.getOrComputePathId(normalized) };
 	}
 
@@ -87,7 +80,7 @@ export class PathIdentityResolver {
 		const pending: Promise<void>[] = [];
 		for (const rawPath of paths) {
 			if (!rawPath) continue;
-			const normalized = normalizeTracePath(rawPath);
+			const normalized = canonicalizeVaultPath(rawPath).normalizedPath;
 			if (this.cache.has(normalized)) continue;
 			pending.push(this.getOrComputePathId(normalized).then(() => undefined));
 		}
@@ -95,9 +88,9 @@ export class PathIdentityResolver {
 	}
 
 	/**
-	 * Every path resolved so far, paired with its pseudonym. This is the only
-	 * place raw vault paths leave the resolver; the redacted export must not
-	 * include it.
+	 * Every canonical path resolved so far, paired with its pseudonym. This is
+	 * the only place vault paths leave the resolver; the redacted export must
+	 * not include it.
 	 */
 	directory(): Array<{ pathId: string; path: string }> {
 		return [...this.resolved].map(([path, pathId]) => ({ pathId, path }));

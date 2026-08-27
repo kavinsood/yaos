@@ -23,7 +23,7 @@
  * Mutation harness (Puppeteer) lives in qa/ and is never imported from here.
  */
 
-import type { App, Plugin } from "obsidian";
+import type { Plugin } from "obsidian";
 import { Notice } from "obsidian";
 import type { TelemetryRuntimeHost } from "./telemetryRuntimeHost";
 import { FlightTraceController } from "./debug/flightTraceController";
@@ -31,9 +31,11 @@ import { FlightTraceSink } from "./debug/flightTraceSink";
 import { DiagnosticsService } from "./diagnostics/diagnosticsService";
 import type { FlightPathEventInput, FlightEventInput } from "../observability/flightEnvelope";
 import type { TraceSink } from "../observability/traceSink";
-import { PersistentTraceLogger } from "./debug/trace";
-import type { TraceLoggerPort, TraceLoggerConfig } from "../observability/traceLogger";
 import type { FrontmatterQuarantineEntry } from "../sync/frontmatterQuarantine";
+import type {
+	TraceEventDetails,
+	TraceHttpContext,
+} from "../observability/traceContext";
 
 /**
  * Handle returned to main.ts after the debug runtime is installed.
@@ -56,8 +58,16 @@ export interface TelemetryRuntimeHandle {
 	setupFlightTrace(deps: {
 		getDocSchemaVersion(): number | null;
 		buildCheckpoint(): Promise<Record<string, unknown>>;
+		isIndexedDbRelatedError(error: unknown): boolean;
+		isObsidianFileMetadataRaceError(error: unknown): boolean;
+		handleIndexedDbDegraded(source: string, error?: unknown): void;
 	}): void;
 	refreshFlightTraceState(reason: string): Promise<void>;
+	recordTrace(source: string, message: string, details?: TraceEventDetails): void;
+	scheduleTraceCheckpoint(reason: string): void;
+	getTraceHttpContext(): TraceHttpContext | undefined;
+	getRecentServerTrace(): readonly unknown[];
+	refreshServerTrace(): Promise<void>;
 
 	// Passive trace commands (safe, read-only diagnostic operations).
 	// includeFilenames only widens the export header; event lines are identical.
@@ -85,8 +95,6 @@ export interface TelemetryRuntimeHandle {
 	// Called on plugin unload
 	dispose(): void;
 
-	/** Creates a PersistentTraceLogger bound to the debug runtime. */
-	createTraceLogger(app: App, config: TraceLoggerConfig): TraceLoggerPort;
 
 	/**
 	 * Register all debug commands with the plugin.
@@ -121,14 +129,13 @@ export async function installTelemetryRuntime(host: TelemetryRuntimeHost): Promi
 		getSyncState: () => host.getSyncState(),
 		getDiskMirrorSnapshot: () => host.getDiskMirrorSnapshot(),
 		getBlobSyncSnapshot: () => host.getBlobSyncSnapshot(),
-		getTraceHttpContext: () => host.getTraceHttpContext(),
+		getTraceHttpContext: () => flightTrace?.httpContext,
 		getEventRing: () => host.getEventRing() as Array<{ ts: string; msg: string }>,
-		getRecentServerTrace: () => host.getRecentServerTrace() as unknown[],
+		getRecentServerTrace: () => [...(flightTrace?.getRecentServerTrace() ?? [])],
 		getFrontmatterQuarantineEntries: () => host.getFrontmatterQuarantineEntries() as FrontmatterQuarantineEntry[],
 		getState: () => host.getRuntimeDiagnosticsState(),
 		isMarkdownPathSyncable: (path) => host.isMarkdownPathSyncable(path),
 		collectOpenFileTraceState: () => host.collectOpenFileTraceState(),
-		sha256Hex: (text) => host.sha256Hex(text),
 		getServerVersion: () => host.getServerVersion(),
 		log: (message) => host.log(message),
 	});
@@ -197,6 +204,9 @@ export async function installTelemetryRuntime(host: TelemetryRuntimeHost): Promi
 	function setupFlightTrace(deps: {
 		getDocSchemaVersion(): number | null;
 		buildCheckpoint(): Promise<Record<string, unknown>>;
+		isIndexedDbRelatedError(error: unknown): boolean;
+		isObsidianFileMetadataRaceError(error: unknown): boolean;
+		handleIndexedDbDegraded(source: string, error?: unknown): void;
 	}): void {
 		flightTrace = new FlightTraceController({
 			app: host.app,
@@ -205,7 +215,9 @@ export async function installTelemetryRuntime(host: TelemetryRuntimeHost): Promi
 			getDocSchemaVersion: () => deps.getDocSchemaVersion(),
 			buildCheckpoint: () => deps.buildCheckpoint(),
 			collectTraceHeaderInput: () => diagnosticsService.collectTraceHeaderInput(),
-			registerCleanup: (cleanup) => host.registerCleanup(cleanup),
+			isIndexedDbRelatedError: (error) => deps.isIndexedDbRelatedError(error),
+			isObsidianFileMetadataRaceError: (error) => deps.isObsidianFileMetadataRaceError(error),
+			handleIndexedDbDegraded: (source, error) => deps.handleIndexedDbDegraded(source, error),
 			log: (message) => host.log(message),
 		});
 	}
@@ -269,6 +281,15 @@ export async function installTelemetryRuntime(host: TelemetryRuntimeHost): Promi
 		recordFlightEvent(event) {
 			flightTrace?.record(event);
 		},
+		recordTrace(source, message, details) {
+			flightTrace?.recordTrace(source, message, details);
+		},
+		scheduleTraceCheckpoint(reason) {
+			flightTrace?.scheduleCheckpoint(reason);
+		},
+		getTraceHttpContext: () => flightTrace?.httpContext,
+		getRecentServerTrace: () => flightTrace?.getRecentServerTrace() ?? [],
+		refreshServerTrace: () => flightTrace?.refreshServerTrace() ?? Promise.resolve(),
 		setupFlightTrace,
 		refreshFlightTraceState,
 		exportDebugTrace,
@@ -277,9 +298,6 @@ export async function installTelemetryRuntime(host: TelemetryRuntimeHost): Promi
 		getFlightTraceController: () => flightTrace,
 		diagnosticsService,
 		dispose,
-		createTraceLogger(app: App, config: TraceLoggerConfig): TraceLoggerPort {
-			return new PersistentTraceLogger(app, config);
-		},
 		registerCommands: registerTelemetryCommands,
 	};
 
