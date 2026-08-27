@@ -1,13 +1,13 @@
 /**
  * Artifact collection utilities for QA runs.
  *
- * Collects: trace exports, vault manifests, screenshots (if available),
- * and writes them to qa-runs/<timestamp>-<scenario>/.
+ * Collects trace exports and vault manifests into
+ * qa-runs/<timestamp>-<scenario>/.
  */
 
-import { mkdir, cp, writeFile, readFile, copyFile } from "fs/promises";
+import { mkdir, writeFile, copyFile } from "fs/promises";
 import { existsSync } from "fs";
-import { join, basename, resolve } from "path";
+import { join, basename } from "path";
 
 export interface ArtifactMeta {
 	scenario: string;
@@ -77,6 +77,7 @@ export class ArtifactCollector {
 		durationMs: number;
 		errors: string[];
 		warnings: string[];
+		evidence?: Record<string, unknown>;
 	}): Promise<void> {
 		this.meta.passed = result.passed;
 		this.meta.errors = result.errors;
