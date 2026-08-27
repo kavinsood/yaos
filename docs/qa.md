@@ -1,151 +1,102 @@
-# QA status and runbook
+# QA status and evidence
 
-QA is diagnostic infrastructure, not a substitute for targeted evidence. Use the narrowest scenario that answers the observed risk.
+QA claims only the surface that was executed. Unit/model tests do not prove Cloudflare deployment behavior, Obsidian filesystem behavior, or mobile lifecycle ordering.
 
-Generated bundles, reports, and device artifacts belong under ignored `qa-runs/`. Do not commit placeholder pass evidence.
+Generated reports and device artifacts belong under ignored `qa-runs/`. Historical runs are not current schema-4 evidence unless they exercise the current storage, protocol, and recovery formats.
 
-## Automated gates
+## Current integration evidence
 
-`npm run test:regressions` discovers suites under `tests/client`, `tests/server`, and `tests/contracts`, plus the root harness/discovery self-tests. `tests/suites.json` records the one suite owned by a separate release-artifact driver. Discovery guards reject unaccounted inert suites and stale exemptions.
+The integrated schema-4 change has current passing evidence from:
 
-`npm run test:ci` then starts a real local Wrangler Worker through the separately accountable `tests/live/run-live.ts` driver and runs every file in that driver's accountability list. The driver claims once, enrolls a primary device, then exercises a separately enrolled secondary device through its own one-use pairing code, bearer, socket ticket, roster access, and self-leave.
+- focused schema-4 client and server suites;
+- the complete discovered regression suite;
+- the separately accountable local Wrangler Worker driver.
 
-The live suites cover:
+Prior donor-branch Worker benchmarks and soaks established the sharding design. No repeat benchmark, soak, external Cloudflare deployment, or real mobile run is included in this integration result.
 
-- claim, enrollment, capabilities, and exact schema admission;
-- provider connection and two sequential sync clients;
-- snapshot routes;
-- hardening paths;
-- short-lived device-ticket reconnect after expiry;
-- mandatory `ticket` plus `schemaVersion` WebSocket admission;
-- rejection of missing WebSocket credentials.
+## Focused client coverage
 
-Wrong-vault rejection remains regression coverage; the live membership scenario covers a secondary credential through enrollment, ticket mint, roster access, and revocation by self-leave. The live suites prove only the local Worker/runtime paths they execute; they are not real mobile, sleep/wake hardware, production Cloudflare routing, or original-reporter validation.
+Current client suites exercise:
 
-The Obsidian controllers under `qa/controllers/` use raw CDP against the actual QA-enabled product bundle and separately built harness. The product remains a passive black box: only the harness mounts QA APIs, and the controller fails if the runtime or expected globals are absent.
+- `onboarding-import.ts`: origin versus joining provisioning, exact schema-4 provisioning proof, bounded initial inventory, and bulk import;
+- `body-manager-load-race.ts`: one load winner and no stale IndexedDB overwrite;
+- `bootstrap-http-boundaries.ts`: authenticated root/catalog/body SQL bootstrap routes and generation headers;
+- `bootstrap-settlement.ts`: root/body verification, safe paths, hash/size/generation checks, feed catch-up, and outstanding retry state;
+- `bootstrap-rename-race.ts`: 200 creates with 100 concurrent renames settle only current heads;
+- `recovery-snapshot-v2.ts`: strict format-2 root and manifest parsing;
+- `recovery-backup.ts`: backup-before-replacement and changed-target review;
+- `multivault-enrollment-contract.ts`: device-scoped memberships and schema-4 cache retirement;
+- existing reconciliation, delete-preservation, editor-binding, diagnostics, attachment-conflict, and lifecycle suites through the full regression discovery.
 
-## Current multi-device evidence
+These tests use controlled ports and models. They prove policy and orchestration contracts, not a real Obsidian adapter or mobile filesystem.
 
-| Scenario | Devices | Result | Proven |
-|---|---|---|---|
-| s11a | 2 desktop | PASS | Passive lag converges without stale resurrection |
-| s11b | 2 desktop | PASS | Re-enable conflict policy preserves both states |
-| s12a local | 2 desktop | PASS | Bundle/export/analyzer pipeline |
-| s12a | Linux + Android | PASS | Android participates in witness flow |
-| s12a passive | Linux + Android + iPad | WEAK PASS | Three devices agree on pre-existing state; no edit during run |
-| s12a with edit | 2 desktop | PASS | A real edit propagates once without duplication |
-| s12b | Linux + Android | PARTIAL | Foreground convergence; background-unavailable segment not captured |
-| s12c | 2 desktop | PASS | Disk wins original path; CRDT is preserved in a synchronized Markdown artifact |
-| s13 | 2 desktop | PASS | Open-editor remote edit converges without duplication |
-| s13 | Linux + Android | PASS | Real Android editor/disk/CRDT final hashes agree |
+## Focused server coverage
 
-Still missing:
+Current server suites exercise:
 
-- strict Linux+iPad+Android active-edit evidence (`QA-01`);
-- real-device conflict-artifact evidence (`QA-02`);
-- true mobile-background proof;
-- real iPad proof for the missing-baseline and bound-file cases;
-- real Node-filesystem watcher proof;
-- original-reporter confirmation.
+- `vault-store-sqlite-cycle.ts`: schema-4 root/body SQL persistence and reconstruction;
+- `vault-server-runtime.ts` and `vault-document-cache.ts`: root/body runtime ownership, persistence, and clean-only cache behavior;
+- `vault-candidate-runtime.ts`: device-scoped candidate identity, digest validation, idempotent receipts, and stale-candidate rejection;
+- `bootstrap-security.ts`: fixed-boundary SQL bootstrap, pins, bounds, and failure behavior;
+- `recovery.ts`, `recovery-job.ts`, and `recovery-routes-v2.ts`: capture/restore/GC job state, immutable content/manifests, bounded reads, and public route validation;
+- `recovery-generation-fence.ts`: job and object authority cannot cross vault generations;
+- `recovery-deletion.ts`: generation purge completes before SQL deletion;
+- `multivault-registry.ts` and `identity-control-plane.ts`: provisioning state, memberships, retryable deletion obligations, and purge identity;
+- `vault-route-authority.ts` and socket admission suites: device, vault, schema, and protocol boundaries.
 
-## Prepare a fixture vault
+The full regression runner discovers suites under `tests/client`, `tests/server`, and `tests/contracts`, plus its harness/discovery self-tests. Discovery guards reject unaccounted inert suites.
 
-Only prepare a brand-new path:
+## Local Worker coverage
 
-```sh
-npm run build:qa-product
-npm run build:harness
-npm run qa:prepare --fixture 001-basic-markdown --dest /absolute/path/to/new-qa-vault --preset minimal
-```
+`tests/live/run-live.ts` starts one fresh local Wrangler Worker with isolated persistence, claims and provisions schema 4, and enrolls two distinct device identities. It accounts for every TypeScript file under `tests/live`.
 
-For a two-device run, bootstrap two distinct memberships from the initial claim/operator pairing code:
+The current passing local Worker run covers:
 
-```sh
-npm run qa:enroll-two -- --host https://sync.example.com --pairing-code <initial-code> --device-a-name Desktop --device-b-name Mobile
-```
+- claim, provisioning, operator session, pairing, roster, and self-leave;
+- exact document schema `4` and socket protocol `1` admission;
+- root and body socket connections using short-lived device tickets;
+- device A create/candidate/root publication and device B cold SQL bootstrap;
+- device B durable body edit, device A catch-up, rename publication, delete tombstone, and stale candidate rejection;
+- SQL persistence across local Worker restart;
+- asynchronous recovery-v2 capture, format-2 root/catalog/branch/content reads, and selective restore result handshake;
+- ticket refresh, missing/wrong admission values, wrong vault access, and hardening paths;
+- operator destroy, stable generation-scoped purge identity, R2 purge completion before SQL deletion, membership revocation, and stale-ticket rejection.
 
-The command enrolls device A, uses A to mint a second one-use code, enrolls device B into the same vault, and prints both credential records. Pass each record to a separate `qa:prepare` invocation with the direct enrollment flags. Never copy one device token into both vaults.
+This driver uses Node Yjs clients and local Wrangler. It does not launch Obsidian and does not traverse public Cloudflare routing.
 
-The destination must not exist. Preparation never recursively deletes or merges into a path. Checked-in and generated fixtures are deterministic inputs; generated run bundles and reports still belong under ignored `qa-runs/`.
+## What is not yet proven
 
-An unenrolled prepared folder must join through the same server URL plus one-use pairing code as the product. Controlled direct credentials are complete only as `{host, deviceToken, vaultId, deviceId}` plus a device name; partial identities are rejected. For a multi-device run, mint and consume a distinct pairing code for every device. Devices share the resulting `vaultId`, never a copied `deviceToken` or `deviceId`.
+The following remain deferred and must not be represented as passing evidence:
 
-The checked-in blank workspace is byte-tested but still lacks live Obsidian acceptance (`QA-07`). Manual controllers attached to arbitrary existing vaults are outside these preparation guarantees.
+### Large-vault benchmark rerun
 
-## Real-device witness procedure
+Prior sharding/recovery benchmark evidence exists. The integrated identity, provisioning, and generation-fencing changes have not been put through another production-scale bootstrap, memory, recovery, R2-cost, or purge benchmark; that repeat is deliberately deferred.
 
-### Preconditions
+### Soak and fault-duration rerun
 
-All devices must use:
+Prior long-run Worker soak evidence exists. The integrated build has not repeated prolonged eviction, alarm retry, R2 outage, pin-expiry, GC interruption, or deletion-retry scenarios.
 
-- the same plugin version;
-- the same server and server-generated `vaultId`;
-- their own enrolled `deviceToken` and `deviceId`;
-- `qaDebugMode: true`;
-- the same `qaTraceSecret`;
-- an explicit shared `scenarioRunId` and scenario ID.
+### Deployed Cloudflare boundary
 
-Use `deviceId`, never display name, as identity. Never copy one device's bearer into another fixture, and do not compare per-device sequence numbers. Use wall-clock timestamps for display only; same-device durations use monotonic time.
+Local Wrangler does not prove production WebSocket upgrade routing, Durable Object placement/eviction, alarms under platform scheduling, R2 list/delete consistency, deployment migration behavior, or operator retry behavior against an actual Cloudflare account.
 
-### Start
+### Obsidian and mobile restore
 
-On each device:
+No current integration run proves recovery-v2 replacement through a real desktop or mobile Obsidian vault, local backup creation on those adapters, sleep/wake continuation, background suspension, or large attachment restoration.
 
-1. **YAOS QA: Show device identity for QA**.
-2. Confirm plugin version and `qaTraceSecretHash` prefix match.
-3. Confirm required mobile devices report `foreground`.
-4. **YAOS QA: Set scenario run ID**.
-5. Start the QA flight trace in `qa-safe` mode.
+### Fresh cutover rehearsal
 
-Advance manual steps with **YAOS QA: Advance scenario step**. Step indices must increase and are shared script markers, not device-local event sequence numbers.
+The supported boundary is a fresh schema-4 deployment and fresh schema-4 client cache. A complete user-facing rehearsal from a populated schema-3 installation through preserved local files, new claim, origin import, and joining-device bootstrap remains external validation; no in-place schema-3 migration is claimed.
 
-### Export and analyze
+## Required evidence discipline
 
-On every device, run **YAOS QA: Export witness bundle** while the trace is active. Copy the safe NDJSON outside the vault. The export omits raw paths, content, host, device credentials, and unreviewed fields.
+- Preserve raw failures; do not weaken a regression to obtain green output.
+- A passing candidate receipt proves server durability for that candidate, not other-device disk materialization.
+- A successful local bootstrap proves the SQL protocol and controlled disk port, not real filesystem watcher ordering.
+- A successful recovery handshake with `skipped-changed` does not prove client replacement.
+- `complete_with_gaps` must retain explicit unavailable entries and is not full recovery coverage.
+- Local Wrangler is not a deployed Worker.
+- Desktop simulation is not mobile lifecycle evidence.
+- Benchmark samples are not soak evidence.
 
-```sh
-bun run qa:analyze-bundles -- <device-a.ndjson> <device-b.ndjson> <device-c.ndjson> --out qa-runs/<run>/report.json
-```
-
-The analyzer fails closed on mismatched secret hashes, run IDs, scenario IDs, or bundle schema. A pass requires positive convergence evidence in addition to absence of stale-hash, recovery-old-hash, and editor-stability failures.
-
-## QA-01: strict three-device active edit
-
-Devices: Linux producer, real foreground iPad, real foreground Android.
-
-1. Open `QA-scratch/s12a-active-edit-witness.md` on all devices with a non-empty baseline of at least 32 bytes.
-2. Step 1 `baseline-quorum`: force a fresh witness on all devices.
-3. Edit through Obsidian's Markdown editor on Linux only; add at least eight bytes.
-4. Step 2 `edit-applied-on-a`: force the Linux witness. Its distinct local-edit hash is the target.
-5. Step 3 `settled-on-b`: after visible arrival, force iPad witness.
-6. Step 4 `settled-on-c`: after visible arrival, force Android witness.
-7. Step 5 `ready-to-export`: export all bundles while tracing remains active.
-
-A pass requires exactly one desktop, one iOS, and one Android bundle; foreground mobile events; one distinct Linux step-2 local-edit hash; iPad and Android settling that exact hash at steps 3 and 4; and analyzer `summary.ok: true`.
-
-Do not substitute CDP, simulator, shell write, adapter write, or `app.vault.modify` for the real editor action.
-
-## QA-02: real-device conflict artifact
-
-Devices: Linux, iPad, Android.
-
-1. Establish `S12C-BASELINE` on all devices.
-2. Disable YAOS on iPad.
-3. Edit remotely on Linux/Android and allow those devices to sync.
-4. Edit the same note locally on iPad while YAOS remains disabled.
-5. Re-enable YAOS on iPad and wait for reconciliation.
-6. Verify the iPad original path contains the local version and a conflict artifact preserves remote content.
-7. Verify the Markdown conflict artifact synchronizes to Linux and Android with the same preserved content.
-8. Export and analyze all three bundles.
-
-A pass requires all devices to settle the original-path survivor hash, all devices to receive the Markdown artifact containing the preserved remote side, and no stale-hash or old-recovery-hash finding.
-
-The existing desktop result does not close this real-device requirement.
-
-## Evidence rules
-
-- Preserve raw failing evidence. Do not weaken a hard failing regression to obtain green output. `SYNC-01` already fails closed in two-device QA; the remaining work is the product fix in [BACKLOG](BACKLOG.md#sync-01-offline-local-delete-is-resurrected-on-re-enable).
-- Adapter writes do not prove OS watcher behavior.
-- Passive quorum does not prove edit propagation.
-- Unit/model tests do not prove real mobile lifecycle ordering.
-- Do not infer reporter confirmation from internal harness evidence.
+Open evidence gaps and field risks are tracked in [BACKLOG.md](BACKLOG.md); architecture claims remain in [architecture.md](architecture.md).

@@ -1,160 +1,181 @@
 # Sync and conflict contract
 
-This is the current contract for `main`. [BACKLOG.md](BACKLOG.md) names known violations and missing proof.
+This is the current schema-4 contract for `main`. [BACKLOG.md](BACKLOG.md) contains only evidenced unresolved risks and missing external-scale proof.
 
 ## Subjects
 
 | Subject | Current mechanism |
 |---|---|
-| Markdown | One `Y.Text` per file inside the vault `Y.Doc` |
-| File identity | Stable file IDs with CRDT path metadata and tombstones |
-| Folders | Derived from file paths; empty folders are not synchronized |
-| Attachments and special formats | Whole-file content-addressed R2 objects |
-| Snapshots | Full compressed Yjs state plus referenced-blob index |
-| `.obsidian` | Not synchronized on `main` |
+| Vault structure | One root Yjs document plus a durable SQL catalog |
+| Markdown | One independently loaded Yjs body per stable file identity |
+| File lifecycle | Durable create, rename, delete, and revive records followed by root publication |
+| Folders | Derived from paths; empty folders are not synchronized |
+| Attachments and special formats | Generation-scoped, content-addressed R2 objects when configured |
+| Recovery | Optional asynchronous recovery-v2 snapshots when R2 and `RecoveryJob` are configured |
+| `.obsidian` | Not synchronized |
 
-`.canvas`, `.excalidraw`, `.base`, and other non-Markdown formats use the attachment plane rather than Markdown character merging.
+Canvas, Excalidraw, Base, and other non-Markdown formats use the attachment plane rather than Markdown character merging.
 
 ## Vault, membership, and transport scope
 
-One server can host multiple vaults, but each vault remains an independent room and Yjs document. Every local Obsidian folder has its own enrollment and folder-scoped IndexedDB cache, even when another local folder joins the same server vault.
+One server hosts multiple independent vaults. A physical installation may enroll different folders in different vaults, but each device identity and bearer is one vault membership. Each local folder stores that membership and has its own schema-4 IndexedDB database.
 
-A one-use pairing code selects a vault. `POST /enroll` consumes it and returns a new `deviceToken`, `deviceId`, and the selected `vaultId`; copying another folder's credentials is outside the contract. A device is a full peer only in vaults where it has an active membership. The roster records device ID, display name, enrollment time, and best-effort last-seen time.
+A pairing code selects one vault and is consumed once. Pairing creates a new full-peer membership; it never copies another folder's bearer. Leave revokes one membership and keeps disk files. Operator kick revokes one membership. Operator destroy revokes the full vault before generation-scoped physical cleanup.
 
-All vault HTTP requests use the device bearer and the vault ID in the route. WebSocket sync never accepts a long-lived device credential in its URL: the client first exchanges its bearer for a short-lived, device-scoped ticket. The handshake then supplies exactly the required admission values, `ticket` and `schemaVersion`. Ticket validation is followed by a live membership check, so revocation or leave fails closed before room admission.
+All vault HTTP requests use a device bearer and vault ID. WebSocket URLs never carry that long-lived bearer. The client exchanges it for a short-lived device ticket; root and body handshakes require the ticket plus exact `schemaVersion=4` and `protocolVersion=1`. Membership and active vault state are checked before every admission.
 
-Pairing, roster, leave, and destroy have distinct effects:
+The root socket carries structural state. Each active Markdown body has a separate socket opened only while the client needs it. Attachment bytes and recovery artifacts do not travel through body sockets.
 
-- pairing creates a new device membership without sharing an existing bearer;
-- leave revokes this device, clears this folder's enrollment/cache, and keeps disk files;
-- operator kick revokes one selected device;
-- operator destroy revokes the vault boundary before requesting cleanup of its room and R2 data.
+## Durable authority
 
-## Authorities
+Authority is split by domain:
 
-Authority is chosen for each observed transition, not assigned permanently to a file.
+- SQL metadata binds `vaultId` to one `vaultGeneration`.
+- The durable SQL sequence, catalog, lifecycle records, document heads, candidate receipts, and recovery authority are the server source of truth.
+- The root Yjs document is the replicated structural view: path-to-body identity, attachment references, tombstones, and schema metadata.
+- A Markdown body Yjs document owns only one file's text.
+- IndexedDB stores the local root, bodies, pending candidates, lifecycle intents, bootstrap progress, and disk baselines. It is a retry/cache boundary, not the shared conflict winner.
+- Disk and live editors are observed local authorities subject to reconciliation and preservation rules.
+- An R2 recovery point becomes restore input only through an explicit restore; it never becomes the live server authority directly.
 
-- A live editor is authoritative for active user input.
-- CRDT state is authoritative for remote state already accepted into the Yjs document.
-- Disk changes are candidate local input and pass through reconciliation and safety policy.
-- IndexedDB persists local CRDT state in a database scoped by `vaultId` and local folder key; it is not a separate conflict winner.
-- A snapshot becomes authoritative only through an explicit restore.
+`vaultGeneration` fences one vault incarnation. `runtimeEpoch` fences receipts and job capabilities to one server runtime. Neither may be inferred from display names.
 
-No reconciliation cycle may apply two incompatible observed-content authorities to the same `Y.Text`.
+## Body candidates and structural lifecycle
 
-The governing rule is preservation before convergence. Disk, editor, and CRDT can disagree because of legitimate ordering, not corruption. Choosing a winner before the other state is durable turns that ordering into data loss; read/stat failure is therefore uncertainty and preservation, never proof that deletion or overwrite is safe.
+A local Markdown update is persisted as a device-scoped candidate before submission. Candidate identity is the tuple of device ID, body ID, candidate ID, and digest.
+
+The server:
+
+1. rejects candidates for inactive bodies;
+2. verifies the declared SHA-256 digest against bounded bytes;
+3. returns the same receipt for an exact retry;
+4. rejects reuse of a candidate ID with different bytes;
+5. commits body generation and catalog content metadata atomically.
+
+A fresh create has an additional fence: its lifecycle intent names the exact candidate ID and digest. The path cannot become active in the root until that body candidate is durable. Rename, delete, and revive similarly commit durable lifecycle state before root publication. Batched structural operations publish in one root transaction after every receipt is durable.
+
+A delete tombstones the body identity. A stale device cannot submit another candidate to an inactive body. Revival is a new explicit lifecycle transition, not an accidental consequence of an old body update.
+
+## Bootstrap and catch-up
+
+Fresh or reset local state bootstraps from SQLite, not R2:
+
+1. obtain a pinned boundary descriptor;
+2. verify the root checkpoint hash and schema;
+3. page active catalog heads;
+4. fetch and verify each body identity, generation, size, content hash, and safe path;
+5. settle disk conservatively;
+6. replay the ordered SQL feed to the current high-water mark;
+7. recheck current heads before each mutation and release the pin only on completion.
+
+Concurrent rename/delete/create activity is resolved against current heads. If the feed floor has advanced beyond a client's cursor, it returns to a fresh pinned bootstrap. An interrupted bootstrap and unresolved body settlement persist locally for retry; neither is treated as successful convergence.
 
 ## Ordinary edits
 
-A local Markdown edit enters the local Yjs document and IndexedDB, then synchronizes through the provider. A remote update enters Yjs first and is materialized through `DiskMirror`; it is not written directly from the socket to disk or editor.
+A local Markdown edit enters its body Yjs document and IndexedDB candidate queue. A remote update enters the body first and is then materialized by `DiskMirror`; sockets do not write disk directly.
 
-YAOS-authored disk writes carry an expected content fingerprint. A matching watcher event is suppressed. A mismatching event is treated as new external input.
+Watcher changes are coalesced. YAOS-authored disk writes carry an expected content fingerprint. A matching event is suppressed; a mismatch is new external input. Time alone is never proof that YAOS authored an event.
 
-External changes made while Obsidian was closed are compared with the disk index on startup. Missing or ambiguous baselines use conservative conflict policy rather than silently claiming certainty.
+## Reconciliation authority
 
-## Closed-file divergence
+Authority is selected for each observed transition:
 
-With baseline hash `B`, disk hash `D`, and CRDT hash `C`:
+- a live editor is authoritative for active user input;
+- a durable server body is authoritative for accepted remote state;
+- disk content is candidate local input;
+- a recovery item is authoritative only for the explicit selection being restored.
 
-- `D == C`: no conflict.
-- `D != B` and `C == B`: disk changed; import disk.
-- `D == B` and `C != B`: CRDT changed; write CRDT to disk.
-- `D != B`, `C != B`, and `D != C`: preserve both and choose the policy-defined winner for the original path.
+No pass may apply two incompatible observed-content authorities to the same body. Preservation precedes convergence: read/stat failure is uncertainty, never permission to delete or overwrite.
 
-When no per-file baseline exists, disk modification time may show that disk changed after the last persisted disk index. If that evidence is complete, disk wins the original path and CRDT is preserved. Otherwise CRDT remains the conservative distributed default and disk content is preserved separately.
+### Closed-file divergence
 
-The mtime policy is heuristic: the persisted timestamp is global, filesystems may have coarse timestamps, and external tools may preserve mtime. [BACKLOG.md](BACKLOG.md) requires real-device proof and tracks the still-open bound-file variant.
+With baseline hash `B`, disk hash `D`, and body hash `C`:
 
-## Open/editor-bound divergence
+- `D == C`: no conflict;
+- `D != B` and `C == B`: import disk;
+- `D == B` and `C != B`: write body state to disk;
+- both changed and differ: preserve both before applying the policy-selected winner.
 
-When disk, CRDT, and editor all disagree and no single authority can be selected:
+Without a trustworthy per-file baseline, modification time may be used only as documented evidence. Ambiguity follows conservative conflict preservation.
 
-1. Preserve the CRDT version as a Markdown sibling conflict note.
-2. Keep the editor/disk version at the original path.
-3. Converge CRDT to that original-path version only after preservation succeeds.
+### Open/editor-bound divergence
 
-If artifact creation fails, convergence must not discard either version. Repeated identical conflict fingerprints are deduplicated within the session.
+When editor, disk, and body all disagree and no single authority is proven:
 
-A known gap remains when both disk and CRDT changed from baseline but the editor matches one side: the current bound-file branches can choose a winner without running the complete three-way classifier. This is BACKLOG `SYNC-02`.
+1. preserve the losing content in a Markdown sibling conflict note;
+2. keep the selected version at the original path;
+3. converge the body only after preservation succeeds.
 
-## Attachment conflict
+If artifact creation fails, convergence must not discard either side. Repeated identical recovery attempts are quarantined, and monotonic-growth detection separately stops amplification-shaped loops.
 
-If an attachment target changes locally while a remote download is in flight:
+### Attachment conflict
 
-1. Preserve the local file at the original path.
-2. Write remote bytes to a local-only conflict artifact.
-3. Suppress that artifact from immediate upload.
-4. Notify the user.
+If an attachment changes locally during a remote download, YAOS keeps the local file at the original path, writes remote bytes to a local-only conflict artifact, suppresses that artifact from immediate upload, and notifies the user. Markdown conflict artifacts synchronize normally; attachment conflict artifacts do not.
 
-Attachment conflict artifacts are local-only. Markdown conflict artifacts synchronize normally.
+## Remote file deletion
 
-## Remote delete
-
-Remote delete uses evidence, not a Boolean dirty flag.
+Remote deletion uses baseline evidence:
 
 | Baseline | Local state | Decision |
 |---|---|---|
 | Known | Matches baseline | Apply configured trash/delete policy |
-| Known | Differs | Preserve local file and intentionally revive it |
-| Missing or unreadable | File exists | Preserve unresolved; do not revive |
+| Known | Differs | Preserve local work and explicitly revive |
+| Missing or unreadable | Exists | Preserve unresolved; do not revive automatically |
 
-Read/stat failure is uncertainty, not proof that a local file is clean.
+Unresolved paths remain guarded from later scan/import resurrection until explicit local create, modify, or delete establishes new intent. Deleted Markdown content may later be reaped, but its tombstone identity remains.
 
-`preservedUnresolvedPaths` prevents later scan/import/queue passes from reviving a path that was preserved without a trustworthy baseline. Explicit local create, modify, or delete establishes new user intent and clears the session guard.
+## Recovery-v2 contract
 
-A separate known violation exists for a file deleted locally while YAOS is disabled: startup reconciliation can classify the absent known file as materialization missing from disk and recreate it from CRDT. This is BACKLOG `SYNC-01`.
+Ordinary Markdown sync and SQL bootstrap do not depend on recovery storage. If either R2 or `RecoveryJob` is absent, the recovery API reports unavailable and core sync continues.
 
-## Tombstones and revival
+Capture is asynchronous. The vault authority pins one SQL boundary; a generation-scoped job materializes verified content, builds bounded active/deleted/attachment manifest trees, and publishes one immutable format-2 root. `complete_with_gaps` is a successful terminal state only because every unavailable entry and its reason remain explicit.
 
-Markdown and blob tombstones prevent stale devices from silently recreating deleted paths. A locally modified file may intentionally beat a remote delete when a baseline proves the modification. Unknown-baseline content is preserved without clearing the tombstone.
+Restore is asynchronous and selection-scoped. The client must:
 
-Deleted Markdown bodies may be reaped after the grace period, but tombstone identity remains. Revival creates active state explicitly; transient absence or failed reads must not do so.
+1. back up every existing target before replacement;
+2. recheck that the target still matches the reviewed state;
+3. validate snapshot root, manifest entry, content hash, body identity, and generation;
+4. use normal body candidates and lifecycle receipts;
+5. settle disk before reporting an item restored;
+6. report changed, skipped, and failed items individually.
 
-## Safety brake
+GC and purge can delete only keys under the exact `vaultId`/`vaultGeneration` prefixes authorized by the vault authority.
 
-When one reconcile would overwrite more than 20 local files and more than 25% of the vault:
+## Receipts and status language
 
-- remote-to-disk overwrites are blocked for that pass;
-- additive CRDT files may still be materialized;
-- blocked paths do not advance disk-index baselines;
-- diagnostics record the count, timestamp, and bounded sample;
-- the user receives a notice.
+The receipt contract is candidate-based, not state-vector dominance:
 
-A later safe reconcile or explicit user action may resolve the block.
-
-## Recovery-loop controls
-
-Repeated identical recovery attempts are quarantined after three matching fingerprints within ten minutes. Fingerprints are bounded and session-local. A separate monotonic-growth detector catches the typing-cadence amplification shape. These are safety nets, not proof that every possible recovery loop is impossible.
-
-## Receipt and status language
-
-The receipt tracks latest state, not individual deliveries. WebSocket-open and provider-synced signals cannot prove storage, while per-update acknowledgement would require a queue identity and a different protocol. The client captures its latest local state vector; confirmation requires a dominating server vector and persistence-generation progress under the same server epoch. One receipt may cover several updates.
-
-Candidate state persists locally, but a previous `true` is never restored as current truth after restart. A new server epoch re-baselines the client and withholds confirmation until new persistence progress. This is why the UI exposes neither a pending-update count nor other-device delivery.
+- a durable body receipt identifies device, candidate, digest, body generation, vault sequence, `vaultGeneration`, and `runtimeEpoch`;
+- the local candidate remains pending until that exact durable receipt is persisted;
+- lifecycle receipts separately confirm structural operations before root publication;
+- reconnect retries are idempotent.
 
 Permitted claims:
 
-- provider connected;
-- initial provider sync completed;
-- latest tracked local state saved by the server, when the durable receipt contract passes;
-- last known receipt time, explicitly historical.
+- root or body provider connected;
+- initial provider synchronization completed;
+- a named local candidate was durably accepted by the server;
+- a named lifecycle operation was durably committed;
+- historical receipt time, explicitly historical.
 
 Forbidden claims:
 
-- another device received or materialized the change;
-- a precise pending-update count;
-- `lastLocalUpdateWhileConnectedAt` means sent;
-- a historical receipt confirms current state.
+- another device materialized the change;
+- socket-open alone proves persistence;
+- a precise count of edits awaiting other-device delivery;
+- an old runtime epoch confirms current state.
 
 ## Failure posture
 
-- Persistence corruption: fail the room closed.
-- IndexedDB startup failure: fail local sync closed.
-- Missing or invalid ticket/schema declaration: reject before room admission.
-- Revoked or mismatched device membership: reject HTTP and WebSocket vault access.
-- Missing attachment capability: disable attachments/snapshots; continue Markdown.
-- Trace persistence failure: lose bounded diagnostics; continue sync.
-- Unknown delete baseline: preserve locally without resurrection.
-- Conflict artifact failure: do not converge by discarding the unpreserved side.
+- Corrupt or inconsistent SQL state: fail closed.
+- Wrong vault generation, stale candidate, inactive body, or mismatched digest: reject.
+- Missing or invalid ticket/schema/protocol declaration: reject before room admission.
+- Revoked membership: reject HTTP and WebSocket access.
+- IndexedDB or bootstrap settlement failure: retain retry state; do not claim readiness.
+- Unknown filesystem deletion baseline: preserve.
+- Missing R2: disable attachments and recovery; continue Markdown root/body sync.
+- Missing `RecoveryJob`: disable recovery; continue Markdown root/body sync.
+- Recovery job retry/gap/failure: expose the state; do not report false completion.
+- Diagnostics persistence failure: lose bounded diagnostics; continue sync.
 
-Per-vault storage accounting, operator recovery beyond current snapshots, and sharding are next-block work. This contract does not claim schema 4, settings sync, a headless client, or Docker packaging.
+Settings sync, headless clients, and Docker packaging are outside the current contract. Large benchmark/soak, deployed Cloudflare, and real mobile recovery claims are also outside current evidence; see [QA](qa.md).

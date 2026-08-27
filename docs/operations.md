@@ -1,20 +1,58 @@
 # Operations
 
-## Deploy and claim
+## Deployment boundary
 
-Use the repository's **Deploy to Cloudflare** button. It targets `server/`, provisions the Worker and Durable Object bindings, and starts unclaimed. Visit the Worker URL and choose **Claim**.
+Schema 4 is a breaking storage and cache boundary. It does not read or migrate schema-3 room state, snapshot-v1 objects, or schema-3 IndexedDB databases.
 
-Claiming creates three separate things:
+For the schema-4 cutover:
 
-- an operator recovery key, which you must save and which opens the server console;
-- a Personal vault with a server-generated `vaultId`;
-- a one-use pairing code for the first Obsidian folder.
+1. preserve the ordinary vault files on at least one trusted device;
+2. deploy a fresh Worker/storage deployment from the current `server/`;
+3. claim it and provision the first vault;
+4. enroll the trusted origin folder with the first pairing code so its local files can enter schema 4;
+5. enroll every joining folder with a distinct new pairing code and a fresh schema-4 local cache.
 
-The server stores a hash of the operator key, not the key itself. The claim page returns the pairing link and QR code once; the pairing code expires after 15 minutes and cannot be reused. The default deployment is Markdown-only and needs no secret environment variable.
+Do not point a schema-4 plugin at a schema-3 deployment or reuse a schema-3 plugin cache. Exact admission fails closed, but manually reusing storage bypasses the supported boundary.
 
-### Optional R2
+The Deploy button creates a detached deployment repository. Upstream changes do not update it automatically. After this breaking cutover, ordinary releases can use the generated repository's updater workflow so deployment and rollback remain Git-visible.
 
-To enable attachments and snapshots, create an R2 bucket and bind it as `YAOS_BUCKET`. If the dashboard cannot add the binding, add this to the generated deployment repository's `wrangler.toml` and push:
+## Required Durable Object configuration
+
+Every current deployment must bind all three Durable Object classes:
+
+```toml
+[[durable_objects.bindings]]
+name = "YAOS_SYNC"
+class_name = "VaultSyncServer"
+
+[[durable_objects.bindings]]
+name = "YAOS_CONFIG"
+class_name = "ServerConfig"
+
+[[durable_objects.bindings]]
+name = "YAOS_RECOVERY_JOBS"
+class_name = "RecoveryJob"
+```
+
+The migration history must include the SQLite recovery-job class:
+
+```toml
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["VaultSyncServer", "ServerConfig"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["RecoveryJob"]
+```
+
+`YAOS_RECOVERY_JOBS` and migration `v2` are part of the current deployment shape even when no R2 bucket is configured. Omitting either makes recovery unavailable and prevents safe generation purge when a configured bucket contains vault objects.
+
+## Optional R2 capability
+
+Markdown root/body sync, durable receipts, and bootstrap use Durable Object SQLite and require no R2 bucket.
+
+To enable attachments and recovery, bind `YAOS_BUCKET`:
 
 ```toml
 [[r2_buckets]]
@@ -22,131 +60,114 @@ binding = "YAOS_BUCKET"
 bucket_name = "your-bucket-name"
 ```
 
-Capabilities refresh dynamically after deployment.
+Recovery is available only when both `YAOS_BUCKET` and `YAOS_RECOVERY_JOBS` exist. Capabilities report attachment and recovery availability separately from core sync.
+
+All blob and recovery keys are scoped by both `vaultId` and `vaultGeneration`. Do not copy objects between generation prefixes or place unrelated objects under a YAOS generation prefix.
+
+## Claim and vault provisioning
+
+Open the fresh Worker URL and choose **Claim**. Save the operator recovery key; the server stores only its hash. Claim reserves a Personal vault, provisions its schema-4 SQL root, activates the exact generation, and returns one pairing code.
+
+Provisioning is a three-step saga: registry reservation, idempotent vault-runtime provisioning, then matching-generation activation. A partial failure remains in `provisioning` state with a retryable error and cannot admit devices as an active vault.
+
+The operator console can create additional vaults through the same saga. Vault display names are not routing or storage identities.
 
 ## Enroll and operate devices
 
-In an unenrolled Obsidian folder, open **YAOS settings → Setup**, enter the Worker URL and a fresh pairing code, then choose **Enroll**. A setup link performs the same exchange. `POST /enroll` consumes `{pairingCode, deviceName}` and returns the folder's `deviceToken`, `vaultId`, `deviceId`, and display `name`.
+In an unenrolled folder, enter the Worker URL and a fresh pairing code in YAOS setup or open the setup link. Enrollment returns a `deviceToken`, `deviceId`, and selected `vaultId`.
 
-The plugin persists the complete enrollment as `host`, `deviceToken`, `vaultId`, and `deviceId`. Each device has a distinct ID and bearer token; never copy one enrolled folder's credentials into another. To add a device, use **Pair another device** or the server console and consume a new one-use code.
+Each folder/device identity belongs to exactly one vault membership. A physical installation may enroll different folders in different vaults, but every membership has its own device ID and bearer. Never copy one folder's token or IndexedDB cache to another.
 
-Opening a setup link or entering a code while the folder is already enrolled always requires explicit confirmation, even for an empty folder. The confirmation names the destination server because every local note will become eligible to sync there. After successful enrollment, YAOS best-effort revokes the old device membership and clears its folder cache and receipt candidate before storing the new identity; a failed old-server revocation remains visible in that server's console for operator cleanup.
+The first claim pairing code carries a one-use origin-import role. Its enrollment response includes the exact vault generation and authorizes only that folder to import its captured local inventory. Every later device/invite code is a joining role: joining folders bootstrap the root, catalog, and bodies from SQL and never upload their disk as initial shared authority.
 
-An enrolled device can:
+An enrolled device can inspect its vault roster, rename itself, mint another one-use pairing code, export only its own credentials, or leave. Pairing codes expire after 15 minutes and work once.
 
-- show and refresh the vault's device roster;
-- rename itself;
-- create another one-use pairing code;
-- export only its own device credentials;
-- leave the vault.
-
-**Leave this vault** revokes the current device when the server is reachable, clears this folder's enrollment and folder-scoped IndexedDB cache, stops sync, and keeps ordinary files on disk. If server revocation cannot complete, local leave still completes and the operator can kick that membership from the console.
+**Leave this vault** revokes the current membership when reachable, stops sync, clears this folder's enrollment and schema-4 IndexedDB cache, and keeps ordinary files on disk. If revocation fails, local leave still completes and the operator can remove the stale membership.
 
 ## Operator console
 
-Open the Worker URL and sign in with the operator recovery key. The browser receives a short-lived HTTP-only session cookie; the recovery key is not a device credential and does not belong in plugin settings.
+The operator recovery key signs in to the console and is never a plugin credential. The browser receives a short-lived HTTP-only session. Sign-out revokes the presented session before clearing its cookie.
 
-Signing out revokes the presented operator session in server storage before clearing the cookie. A copied session cookie cannot continue authorizing console operations after successful logout.
+The console creates and renames vaults, lists and revokes devices and unused pairing codes, creates enrollment links, reports provisioning failures, and tracks pending deletion obligations.
 
-The console can create, rename, and destroy vaults; list and kick enrolled devices; mint or revoke unused pairing codes; and configure the deployment repository used by the updater. Add-device and invite codes have the same authority: either enrolls a full peer on the selected vault.
+## Recovery operations
 
-Destroying a vault is different from leaving or kicking a device. It first removes the vault and all memberships from admission, then attempts to delete its Durable Object storage and R2 prefix. Partial cleanup is stored as a retryable obligation and returns a pending result rather than false success; the console exposes retry until both stores complete. The console requires typing the vault nickname before enabling the initial action.
+With recovery capability available:
 
-## Authentication and admission
+- **Take snapshot now** queues an asynchronous recovery-v2 capture;
+- daily capture may queue when the client is connected and no capture is active;
+- **Show recovery readiness and job status** reports projection, capture, and restore state;
+- **Browse and restore snapshots** lists immutable recovery roots and looks up bounded manifest branches;
+- restore can select Markdown paths, attachment paths, deleted identities, or the complete recovery point.
 
-Public setup routes are narrowly scoped:
+Capture and restore continue in alarm-driven `RecoveryJob` objects after Obsidian closes. `queued`, active phase, `retrying`, `complete`, `complete_with_gaps`, `failed`, and `cancelled` are meaningful states. Do not report a retry or terminal gap as complete coverage.
 
-- `POST /claim` accepts `{operatorRecoveryKey}` only while unclaimed;
-- `POST /enroll` accepts `{pairingCode, deviceName}` and consumes that code once;
-- `GET /api/capabilities` reports `claimed`, attachment/snapshot availability, size and version metadata, and the exact schema version.
+Before applying a restore item, the client creates a local backup and verifies that the target has not changed since review. Changed targets are skipped rather than overwritten. Body and lifecycle mutation still pass through normal schema-4 durable receipts.
 
-Vault HTTP routes use `Authorization: Bearer <deviceToken>` and the vault ID in the path. `POST /vault/:vaultId/auth/ticket` exchanges that bearer for a short-lived ticket tied to the device and vault.
+Recovery roots and manifest/content objects are immutable. Recovery catalog deletion, retention, GC, and purge are asynchronous; UI completion means the corresponding durable state reached its terminal contract, not that another device has materialized anything.
 
-WebSocket admission at `/vault/sync/:vaultId` requires both `ticket` and `schemaVersion`. Membership is rechecked on every handshake, so leaving or operator revocation invalidates even a ticket that has not expired. Missing credentials, missing schema declaration, or a schema mismatch fail closed before sync room admission.
+## Vault deletion
 
-## Update an existing deployment
+Destroy differs from device leave:
 
-The Deploy button creates a detached repository. Upstream pushes do not update it automatically.
+1. the registry immediately revokes the vault, devices, and pairing codes and records a `deletionId`;
+2. the vault runtime fences sync and recovery work for the exact `vaultGeneration`;
+3. with R2, the deterministic purge job empties only that generation's `recovery-v2/` and `blobs/` prefixes;
+4. vault SQL is deleted only after generation purge succeeds;
+5. the pending record remains visible and retryable until both phases complete.
 
-Git is the update boundary because the generated deployment already owns the Worker configuration. Re-running initial deployment can create a new project path; server self-mutation would require Cloudflare credentials. Applying a release artifact as an ordinary repository commit keeps deployment and rollback visible without either risk.
+Never force SQL deletion ahead of an incomplete R2 purge. SQL contains the authority needed to constrain cleanup to the right generation. Repeating destroy retries the same purge identity; it does not create a new generation.
 
-1. Set the generated deployment repository URL in the operator console or YAOS settings.
-2. Run **Initialize updater** once if the repository lacks the workflow.
-3. Run **Open update action** and choose update or revert.
-4. Cloudflare deploys the resulting repository commit.
+Without R2, the purge phase is already complete and SQL cleanup can proceed. A pending vault ID remains unavailable for reuse.
 
-Update metadata uses patch semantics so one device cannot clear established server configuration with empty values.
+## Authentication and version admission
 
-## Local development
+Public setup routes are limited to claim, enrollment, and capability discovery. Vault HTTP routes require the device bearer in `Authorization` and the selected vault ID in the route.
 
-```sh
-npm install
-cd server && npm install && cd ..
-npm run build
-npm run test:ci
-```
+The socket ticket endpoint exchanges that bearer for a short-lived device- and vault-scoped ticket. Root and body sockets require:
 
-Run the unclaimed Worker directly when needed:
+- a valid ticket;
+- document schema `4`;
+- socket protocol `1`;
+- an active membership and active vault generation.
 
-```sh
-cd server
-npm run dev
-```
+The complete version set is document schema `4`, durable SQL format `1`, socket protocol `1`, and recovery snapshot format `2`. These pins change only through a coordinated client/server/storage cutover.
 
-Open the local Worker URL to claim it, then enroll every live client with a distinct one-use pairing code.
+## Updating after the fresh schema-4 deployment
 
-## Manual deployment
+The schema-4 server artifact is marked `deploymentBoundary: fresh`; the in-place updater rejects it. Establish the fresh deployment described above first.
 
-```sh
-cd server
-npm install
-npm run deploy
-```
+Future releases may use the generated deployment repository's updater only when their schema, storage, protocol, snapshot, and Durable Object class boundaries remain unchanged. A release changing any pin or required class must declare another fresh or guided cutover rather than relying on code-only revert.
 
-## Schema updates
+## Operational checks
 
-Client and server currently admit exactly schema 3. A schema bump requires coordinated updates to:
+The Worker capability response distinguishes:
 
-- `src/sync/schema.ts`;
-- `server/src/version.ts`;
-- `scripts/guard-schema-version.mjs`.
+- claimed versus unclaimed state;
+- attachment and recovery-job availability;
+- server version;
+- document schema, durable storage, socket protocol, and snapshot format pins.
 
-Exact admission is deliberate: a writer using an incompatible CRDT shape can corrupt shared state. Do not deploy a mixed writer fleet. Admission rejects absent or mismatched schema declarations with `update_required`.
-
-Schema 4 and settings sync are not shipped behavior.
-
-## Release gates
-
-```sh
-npm run build
-npm run typecheck:tests
-npm run typecheck:qa
-npm run test:ci
-npm run lint
-npm run guard:production-bundles
-npm run guard:no-tracked-generated-artifacts
-npm run guard:no-any
-```
-
-`test:ci` runs regression suites and the separately accountable local Wrangler integration driver. The driver claims the server, enrolls device-scoped clients, and covers exact schema admission, provider connection, sequential sync, snapshots, hardening, ticket refresh, and socket admission.
-
-Real-device and external-deployment evidence is separate; see [QA](qa.md) and [BACKLOG](BACKLOG.md).
+The vault status surface additionally exposes `vaultGeneration`, `runtimeEpoch`, provisioning time, durable sequence, feed floor, and active pins. Health distinguishes degraded pending persistence from a healthy runtime. Diagnostics are evidence, not a repair mechanism.
 
 ## Troubleshooting
 
-- **Unauthorized/Auth rejected:** confirm this folder is still in the selected vault's roster. Re-enroll with a fresh code or ask the operator to mint one.
-- **Pairing code rejected:** codes work once and expire after 15 minutes. Mint a new code; do not retry one consumed by another enrollment.
-- **R2 not configured:** add `YAOS_BUCKET`; Markdown remains available without it.
-- **Cloudflare build/dashboard instability:** retry once, then commit the binding/configuration through the generated repository. Record the failed deployment commit SHA in any issue.
-- **Files not syncing:** check exclusions, file-size limits, connection status, and diagnostics.
-- **Server receipt waiting:** reconnect and allow the folder-scoped local cache to load. A receipt is latest-state confirmation, not other-device delivery.
+- **Unauthorized or auth rejected:** confirm that this exact device ID still has membership in the selected vault. Re-enroll with a fresh code if revoked.
+- **Update required:** client schema or socket protocol does not exactly match the server. Do not attempt mixed-writer operation.
+- **Vault provisioning failed:** retry the recorded provisioning saga; do not manually mark the registry record active.
+- **Recovery unavailable:** confirm the `RecoveryJob` binding and `v2` migration exist. Recovery additionally needs `YAOS_BUCKET`.
+- **Attachments unavailable:** add `YAOS_BUCKET`; Markdown continues without it.
+- **Recovery job retrying:** inspect its status and bounded error code. Preserve the same job identity so durable progress can resume.
+- **Vault cleanup pending:** retry from the console. Do not delete the vault Durable Object manually while generation purge is incomplete.
+- **Bootstrap does not settle:** preserve the local cache and diagnostics; unresolved bodies are intentional retry state, not successful readiness.
+- **Cloudflare dashboard instability:** make binding and migration changes in the generated deployment repository so the deployed configuration remains auditable.
 
-## Current limits and next block
+## Current limits
 
-- Each vault is one vault-wide Yjs document in its own room.
 - Empty folders are not synchronized.
-- Attachment upload cap is 10 MB by default.
-- Text persistence is bounded by SQLite row/statement limits and the checkpoint/journal policy.
-- Server memory is bounded by the 128 MB isolate and CRDT struct growth.
-- Per-vault storage accounting and limits, broader operator recovery, and sharding are next-block work.
-- Native Windows, headless clients, Docker packaging, `.obsidian` settings sync, and schema 4 are not current behavior.
+- Attachment upload size is bounded by the server and client caps.
+- Root/body persistence is bounded by Durable Object SQL row, statement, and account limits.
+- Bodies are loaded independently and evicted only when clean and unpinned; this removes the vault-wide content monolith but does not make memory unbounded.
+- Recovery requires R2 and the job binding and may finish with explicit unavailable entries.
+- Large benchmark/soak, deployed Cloudflare recovery/deletion, and real mobile recovery evidence are deferred.
+- Settings sync, headless clients, and Docker packaging remain future work.

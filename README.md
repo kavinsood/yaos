@@ -4,17 +4,17 @@
 
 **A zero-terminal, real-time sync engine for Obsidian, powered by your own Cloudflare Worker.**
 
-Your notes sync live across devices, with CRDT merge semantics instead of conflicted-copy workflows, delayed file sync, or database-heavy hosted services.
+YAOS synchronizes Markdown live across devices with CRDT merge semantics. One server can host multiple vaults, and every enrolled folder has its own device identity.
 
 <img src="https://github.com/user-attachments/assets/ee937050-8a05-4d56-9c5f-3ae5003496fc" alt="YAOS syncing a note across desktop and mobile in real time" width="720" />
 
-No terminal, no `.env` files, no database setup required.
+No terminal, `.env` file, database setup, or R2 bucket is required for Markdown sync.
 
 [![License: 0-BSD](https://img.shields.io/badge/license-0--BSD-green)](LICENSE)
 
 ## How it compares
 
-YAOS chooses live Markdown CRDT sync on infrastructure you deploy in your Cloudflare account. That gives fast cross-device editing, with explicit limits around durability receipts, attachments, empty folders, and non-Markdown plugin files.
+YAOS runs on infrastructure in your Cloudflare account. Markdown content is split into independently loaded CRDT bodies rather than one vault-wide content document.
 
 | | Conflicts | Real-time | Deployment | No terminal | Free |
 |---|:---:|:---:|:---:|:---:|:---:|
@@ -24,61 +24,48 @@ YAOS chooses live Markdown CRDT sync on infrastructure you deploy in your Cloudf
 | **Relay / Screengarden** | No | Yes | No | Yes | Freemium |
 | **YAOS** | **CRDT merge** | **Yes** | **Self-deployed Cloudflare** | **Yes** | **$0** |
 
-YAOS uses [Yjs CRDTs](https://yjs.dev) to keep one live vault state moving across devices instead of asking them to take polite turns uploading files and hoping nothing collides.
-
-If you want the official, fully managed experience, pay for Obsidian Sync and support the team. If you want a fast, self-deployed, local-first alternative on your own Cloudflare account, welcome to YAOS!
+If you want the official, fully managed experience, use Obsidian Sync. If you want a self-deployed, local-first alternative on your own Cloudflare account, YAOS is built for that.
 
 ## Get started
-
-YAOS has two parts: an Obsidian plugin and a small Cloudflare server you deploy to your own account. One server can host multiple vaults, and each Obsidian folder enrolls as its own device membership.
 
 <a href="https://youtu.be/xeS126_XK9Q">
   <img src="https://img.youtube.com/vi/xeS126_XK9Q/maxresdefault.jpg" width="480" alt="Watch the setup walkthrough" />
 </a>
 
-**1. Deploy your server**
-Click **Deploy to Cloudflare** above. Cloudflare creates a Worker in your account.
+1. **Deploy the server.** Click **Deploy to Cloudflare** above.
+2. **Claim it.** Open the Worker URL, click **Claim**, and save the operator recovery key. Claiming provisions a Personal vault and returns a one-use pairing code.
+3. **Install YAOS.** Install the plugin from the Obsidian Marketplace.
+4. **Enroll this folder.** Open the setup link or scan the QR code. Each additional folder or device needs a fresh pairing code.
 
-**2. Claim your server**
-Open the Worker URL and click **Claim**. Save the operator recovery key: it is the only credential that opens the server console. Claiming also creates a Personal vault and a one-use pairing code.
+The operator key opens the server console. It is not a device credential and must not be pasted into plugin settings.
 
-**3. Install the plugin**
-Install YAOS from the Obsidian Marketplace.
+## Attachments and recovery
 
-**4. Enroll this folder**
-Open the setup link or scan the QR code. YAOS exchanges the pairing code for credentials belonging only to this enrolled device. To add another folder or device, mint a fresh code from YAOS settings or the server console.
-
-That's it. Your folder is syncing with its vault.
-
-## Attachments and snapshots
-
-Text sync works out of the box. To sync images, PDFs, and other attachments, add a Cloudflare R2 bucket — it takes about a minute.
+Markdown uses Durable Object SQLite and works without R2. Add a `YAOS_BUCKET` R2 binding to synchronize images, PDFs, Canvas files, and other non-Markdown content and to enable asynchronous recovery points.
 
 <a href="https://youtu.be/Z7xCMEYfdFM">
   <img src="https://img.youtube.com/vi/Z7xCMEYfdFM/maxresdefault.jpg" width="480" alt="Watch the R2 setup video" />
 </a>
 
-R2 also enables daily automatic snapshots and on-demand point-in-time backups. You can browse snapshots, diff against current state, and selectively restore individual files. If you skip R2, text sync still works — you just won't have attachment sync or snapshots.
+Recovery points can be captured in the background, browsed by path, and selectively restored. A deployment also needs the included `RecoveryJob` Durable Object binding and migration for this capability. See [operations](./docs/operations.md).
 
-## Works with AI agents
+## Works with local tools
 
-Because Obsidian vaults are just local Markdown files, YAOS plays unusually well with scripts, CLI tools, and AI agents that edit files directly on disk. The CRDT state stays aligned with the filesystem, so changes from any source — git, shell scripts, agents writing to disk — propagate cleanly across devices instead of falling back to conflicted-copy workflows.
-
-If you're building agentic workflows on top of Obsidian vaults, YAOS gives you the sync infrastructure so you don't have to wire up your own.
+Obsidian vaults remain ordinary local files. Changes made by editors, scripts, Git tools, or agents enter the same reconciliation path and can synchronize across enrolled devices.
 
 ## Troubleshooting
 
-**"Unauthorized" errors**: This device's enrollment is missing, revoked, or belongs to another vault. Re-enroll with a fresh pairing code; do not paste the operator recovery key into plugin settings.
+**Unauthorized or auth rejected:** The folder's membership is missing, revoked, or belongs to another vault. Re-enroll with a fresh pairing code.
 
-**"R2 not configured"**: The server doesn't have a `YAOS_BUCKET` binding yet. See the [R2 setup video](https://youtu.be/Z7xCMEYfdFM).
+**Recovery unavailable:** Recovery needs both `YAOS_BUCKET` and the `YAOS_RECOVERY_JOBS` binding. Markdown sync remains available without R2.
 
-**Cloudflare deploy/dashboard issues**: If build queue or dashboard behavior is flaky, see [operations](./docs/operations.md#troubleshooting), including the `wrangler.toml` R2-binding fallback.
+**Cloudflare deployment issues:** See [operations](./docs/operations.md#troubleshooting), including the required Durable Object migration and R2 binding.
 
-**Sync stops on mobile**: Use **Reconnect to sync server**. Check you have network connectivity and that the device still appears in the vault roster.
+**Files not syncing:** Check exclusions and file-size limits, then use **Show sync debug info**. Safe exports redact the server URL, vault and device identity, credentials, and vault paths.
 
-**Files not syncing**: Check exclude patterns. Files over max size are skipped. Use debug logging to see what's happening, and then raise an issue on GitHub.
+## Engineering documentation
 
-**Diagnostics**: Use **Show sync debug info** for local inspection. Safe diagnostics exports redact server URL, vault ID, device name, device credentials, and vault paths.
+The compact current source set is indexed in [docs/README.md](./docs/README.md).
 
 ## License
 

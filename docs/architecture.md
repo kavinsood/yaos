@@ -2,134 +2,124 @@
 
 ## Runtime boundaries
 
-The shipped Obsidian plugin is built from `src/` into `main.js`. It contains the sync engine and the debug/diagnostics runtime. Debug collection is inert unless the user enables it.
+The shipped Obsidian plugin is built from `src/` into `main.js`. It contains the sync engine and diagnostics runtime. Diagnostics collection is inert until enabled.
 
-The QA harness lives under `qa/` and is not shipped. QA scenarios use a separate product build compiled with `__YAOS_QA_HARNESS_ENABLED__=true`. Production code may depend on interfaces in `src/observability/`; it must not import QA implementations. CI guards enforce the source and bundle boundaries.
+The QA harness under `qa/` is not shipped. QA scenarios use a separately built product bundle with `__YAOS_QA_HARNESS_ENABLED__=true`; production code does not import QA implementations. A release contains `main.js`, `manifest.json`, and `styles.css`.
 
-A release contains `main.js`, `manifest.json`, and `styles.css`. Generated bundles and `qa-runs/` evidence are not tracked.
+`FlightTraceController` owns the client diagnostics lifecycle. Product code emits through the published flight envelope and taxonomy; there is no second persistent logger.
 
-The diagnostics runtime used to ship as a second `telemetry.js` bundle loaded through filesystem access and `new Function`. That split did not create isolation—the bundles shared one realm and broad host handles—but it did add mobile and loader failure modes. Isolation now comes from read-only types, source boundaries, and production-bundle guards instead.
+## Identity and provisioning
 
-`FlightTraceController` is the single client observability lifecycle: it owns the recorder session, HTTP trace context, server-trace polling, periodic/debounced checkpoints, runtime error capture, export, retention, and shutdown. Product code emits through the published flight envelope/taxonomy; there is no second persistent logger or parallel trace session.
+A claimed Worker is one operator-owned control plane. The server hashes the operator recovery key and uses short-lived, revocable browser sessions for console operations. The global registry owns vault records, per-vault device memberships, one-use pairing codes, pending deletion obligations, and the socket-ticket signing key.
 
-## Server and vault model
+One operator can create multiple vaults. A physical installation may enroll different folders in different vaults, but each device identity, membership, and bearer belongs to exactly one vault. A pairing code selects that vault and creates a new device identity; credentials are never copied between enrolled folders.
 
-A claimed Worker is an operator-owned control plane. The operator recovery key is hashed and retained only for console sign-in; a short-lived browser session then authorizes console operations. The registry stores vaults, device memberships, one-use pairing codes, and the independent signing key used for socket tickets.
+Vault creation is a recoverable provisioning saga:
 
-One server can host multiple vaults. Each vault maps to its own Durable Object room and vault-wide Yjs `Y.Doc`; vault IDs, not display names, are the storage and routing boundary. The operator console creates, renames, and destroys vaults, lists or revokes their devices and unused pairing codes, and mints enrollment links. Destroy first removes the vault and its memberships from the registry, then requests room and R2 cleanup; admission remains revoked if physical cleanup must be retried.
+1. The registry reserves a unique `vaultId` and `vaultGeneration` in `provisioning` state.
+2. The vault Durable Object idempotently creates schema-4 metadata and an empty root in SQLite.
+3. The registry activates the matching generation and, for claim, publishes the first pairing code.
+4. A failure remains recorded as retryable provisioning state; it is not exposed as an active partial vault.
 
-Each vault document contains:
+`vaultGeneration` identifies one storage incarnation of a vault and scopes every R2 key and asynchronous job. `runtimeEpoch` identifies one live Durable Object runtime and prevents receipts or capabilities from being mistaken for evidence from another runtime.
 
-- stable file identity and path metadata;
-- Markdown `Y.Text` values;
-- blob path/hash references and tombstones;
-- schema metadata.
+## Schema-4 vault authority
 
-A folder has no independent CRDT identity. Folder moves are represented as batches of file-path changes. Empty folders are not synchronized.
+Schema 4 replaces the vault-wide content monolith with one structural root document and independent Markdown body documents:
 
-The per-vault monolith preserves one replication stream and structural transactions such as a multi-file folder rename. Its ceiling is memory, not stored bytes: unmergeable Yjs structs cost roughly 117 bytes each and remain for the life of the resident document. Measurement showed that ordinary state encoding already flattens V8 ropes; rebuilding the document does not remove Yjs structs and temporarily raises memory, so re-materialisation was removed rather than kept as an unsafe escape hatch.
+- the root Yjs document carries `pathToId`, attachment references and metadata, attachment tombstones, and schema metadata;
+- every Markdown file has a stable file/body identity and its own Yjs document whose text key is `body`;
+- SQL catalog events bind body identity, canonical path, lifecycle, durable generation, content hash, and size at a vault sequence;
+- folders are derived from paths; empty folders have no synchronized identity.
 
-Tombstoned Markdown bodies are reaped after their grace period while tombstone metadata remains to prevent stale-device resurrection. Per-vault storage accounting, operator recovery workflows, and sharding are the next architecture block, not shipped behavior. Sharding changes consistency, bootstrap, persistence, and recovery and cannot be presented as a local optimization.
+The root is a server-published structural view: client root sockets may negotiate and receive updates but cannot mutate it. Structural changes become authoritative only after the server durably commits lifecycle records and returns receipts; the corresponding root mutation is then published. Markdown content becomes authoritative only through a device-scoped candidate identified by device ID, candidate ID, and SHA-256 digest. Candidate retries are idempotent, candidate-ID reuse with different bytes is rejected, and a fresh create cannot publish a root path before its exact body candidate is durable.
 
-## Client synchronization
+Renames and folder moves can commit as structural batches before one root transaction is published. Deletes tombstone catalog identity and reject later stale body candidates. This preserves cross-file structural atomicity without keeping all Markdown bodies resident in one Yjs document.
 
-Each Obsidian folder stores one complete enrollment: `host`, `deviceToken`, `vaultId`, and `deviceId`, plus its display name and ordinary sync preferences. The token identifies only that device's membership in that vault. The Yjs cache uses `yaos:<vaultId>:<folderKey>`, so two local folders enrolled in the same vault do not share an IndexedDB database.
+The exact product pins are:
 
-`VaultSync` owns the local Yjs document, folder-scoped IndexedDB provider, remote provider, file identity, and reconciliation inputs. `ReconciliationController` coordinates authority decisions. `DiskMirror` materializes CRDT state and observes ordinary local files. `EditorBindingManager` connects open Markdown editors to their `Y.Text`. `BlobSyncManager` handles non-Markdown files through R2.
+| Boundary | Version |
+|---|---:|
+| Document schema | 4 |
+| Durable SQL storage format | 1 |
+| Socket protocol | 1 |
+| Recovery snapshot format | 2 |
 
-SHA-256, receipt state, reconciliation statistics, and status rendering each have one source shape. `ServerAckState` plus the VaultSync-owned receipt envelope feeds connection facts, status, diagnostics, and QA; status text derives directly from rich `ConnectionState` rather than a second coarse state machine. Path identity is not one pipeline yet: `canonicalizeVaultPath` is the NFC/separator helper at exclusion, snapshot restore, and path-id boundaries, while `VaultSync`, `DiskMirror`, and `BlobSync` still key mutation on Obsidian `normalizePath`. That cutover is [PATH-01](BACKLOG.md#path-01-nfcnfd-normalization-across-the-full-pipeline).
+Missing or mismatched schema or protocol declarations fail admission with `update_required`. Mixed writers are unsupported.
 
-### Disk to CRDT
+## Store and runtime ownership
 
-Obsidian file events are noisy, duplicated, and non-causal. YAOS coalesces dirty paths and drains them at the pace of disk I/O instead of treating each watcher event as an independent operation.
+The vault Durable Object contains separate durable and live owners:
 
-Markdown changes are applied as diffs rather than replace-all updates. This preserves Yjs identity and editor history better than replacing the complete text.
+- `VaultStore` composes the SQLite document, catalog, bootstrap, recovery-authority, receipt, pin, and deletion stores. SQLite is the durable source for root/body generations, vault sequence, lifecycle, and recovery authority.
+- `VaultDocumentCache` owns loaded Yjs documents and pending updates. It may evict only clean, unpinned bodies that have no open socket.
+- `VaultSocketService` owns root and body WebSocket sessions. The root socket is structural; a body socket is admitted only for an active body.
+- `VaultLifecycleService` owns durable create, rename, delete, and revive ordering plus root publication checks.
+- `VaultCandidateService` owns device-scoped body candidate admission, idempotency, and durable receipts.
 
-### CRDT to disk
+On the client, `VaultSync` owns the root, transport, durable candidate queue, and lifecycle submission. `BodyManager` loads and persists bodies independently and evicts only clean, settled, unpinned bodies. `DiskMirror`, `ReconciliationController`, and `EditorBindingManager` retain filesystem/editor preservation responsibilities. `BlobSyncManager` owns the optional non-Markdown plane.
 
-Writes are serialized per path. Before writing, YAOS records the expected content fingerprint. A later filesystem event is suppressed only when observed content matches that expected write. Time windows may bound retained bookkeeping, but elapsed time alone is not proof that YAOS authored an event.
+## SQL bootstrap and steady-state sync
 
-TTL-only suppression previously confused delayed YAOS events with real external edits. Content acknowledgement makes ownership causal: a matching observed state proves the event corresponds to the expected write; a timer does not. Deletes remain weaker because no post-delete content exists to fingerprint.
+A new or reset client bootstraps without R2:
 
-### Startup
+1. The server flushes loaded documents and creates a time-bounded SQL history pin at one vault sequence.
+2. The client verifies the schema-4 root checkpoint.
+3. It pages the SQL catalog and fetches each referenced body at the pinned boundary.
+4. Each body is identity-, generation-, size-, hash-, and path-checked before disk settlement.
+5. The client catches up from the ordered SQL feed, rechecks current heads before mutation, and records unresolved bodies for retry.
+6. The bootstrap is completed and its history pin is released.
 
-Plugin startup does not wait for network capability metadata. Capability probes previously made load completion depend on DNS and HTTP even though the metadata was not required to start local state or the provider. Local state and core sync now start first; capabilities refresh in the background.
+Bootstrap never treats an unreadable local path as permission to overwrite or delete it. Rename races, disappearing heads, feed-floor reset, and changed generations are settled against current SQL heads. IndexedDB is scoped by vault generation and local folder; it is a retry/cache boundary and pending-work journal, not a conflict authority.
 
-Attachment observers may start early, but download materialization waits for both Obsidian layout readiness and YAOS startup/reconciliation readiness. Earlier materialization could see a file on disk before Obsidian's in-memory vault view exposed it, producing false absence and `EEXIST` races.
+After bootstrap, the root socket carries structural changes and body sockets are opened only for active consumers. Body candidates are persisted in IndexedDB before submission. The server returns a durable receipt containing the candidate identity, body generation, vault sequence, `vaultGeneration`, and `runtimeEpoch`; only an exact receipt clears that candidate.
 
-IndexedDB is the local persistence cache for Yjs state and is scoped by both server vault and local folder. Failure to load it fails closed rather than continuing from an empty local document.
+## Filesystem reconciliation
 
-## Server persistence
+Local watcher events are coalesced. Markdown changes use text diffs rather than replace-all updates. Server-origin changes enter a body document before `DiskMirror` materializes them.
 
-The Durable Object keeps the vault `Y.Doc` in memory and persists it to SQLite using a checkpoint plus journal:
-
-This shape is a resource decision. Full-state rewrite amplifies every small edit; one row per event spends the daily write budget and grows replay work. Coalesced deltas keep normal saves small without turning typing into database churn.
-
-- full checkpoints are split into rows below Cloudflare's per-row limit;
-- coalesced Yjs deltas append to a bounded journal;
-- checkpoint state vectors anchor journal replay;
-- checkpoint and journal payloads carry SHA-256 integrity checks;
-- persistence operations are serialized;
-- unreadable or inconsistent storage refuses service rather than constructing an empty vault.
-
-Compaction occurs when the journal exceeds 50 entries or 1 MB. A delta above the normal journal limit, repeated append failure, or content reaping forces a checkpoint rewrite. A Yjs update event—not state-vector change—marks the document dirty because deletion-only changes may leave the state vector unchanged.
-
-Observability is separate and fail-open. Trace failures may lose diagnostics but must not make sync unavailable. Trace entries are individually bounded; pre-authentication and high-frequency admission paths do not write room traces.
-
-A small room metadata sidecar supports schema admission without loading the full document. It is not a second authority for vault content.
-
-## Server receipt
-
-The client tracks its latest local candidate state vector. Server echoes contain the server state vector and persistence-generation metadata. A receipt is granted only when the server state dominates the candidate and the persistence generation has advanced under the same server epoch.
-
-A receipt means the server saved this device's latest tracked local state. It does not mean another device received it, and it is not a per-update pending count.
-
-A new server epoch re-baselines the client and withholds confirmation until new persistence progress is observed. Candidate state is kept in IndexedDB, but a previous `true` receipt is never restored as current truth after plugin restart.
+Writes are serialized per path and carry an expected content fingerprint. A watcher event is suppressed only when observed content matches the expected write; elapsed time alone is not evidence of authorship. Disk/editor/CRDT disagreement follows preservation-before-convergence rules in the [sync contract](sync-contract.md).
 
 ## Attachments
 
-Non-Markdown files, including `.canvas`, `.excalidraw`, and `.base`, use the attachment plane when R2 is configured.
+Non-Markdown files, including Canvas, Excalidraw, Base, images, and PDFs, use whole-file content-addressed R2 objects. After bytes are durable, the client submits a device-authenticated attachment command; the server validates the generation-scoped object and commits the root mutation with its attachment catalog event before broadcasting it. Root sockets never accept direct attachment-map writes.
 
-The client hashes the complete file and uses authenticated Worker routes. R2 objects are content-addressed. The server caps attachment uploads at 10 MB by default and bounds concurrent R2 work. YAOS intentionally uses whole-file blobs: block-level delta sync would require content-defined chunking, manifests, reference ownership, and safe distributed garbage collection, while small blocks multiply Cloudflare operation costs for a predominantly write-once attachment workload.
+Without `YAOS_BUCKET`, attachment sync is unavailable while root/body Markdown sync, SQL persistence, and SQL bootstrap continue normally.
 
-If `YAOS_BUCKET` is absent, attachment and snapshot capabilities are disabled while Markdown sync remains available.
+## Recovery-v2
 
-## Snapshots
+Recovery is optional and requires both R2 and the `RecoveryJob` Durable Object binding. It is not on the request path for ordinary Markdown sync.
 
-Current snapshots store a compressed full-Yjs update plus an index of referenced blobs in R2. Automatic creation is semantically deduplicated and retained according to the current snapshot policy. Restore downloads a snapshot into a temporary Yjs document, backs up affected current files, and applies selected content through normal safety paths.
+The vault object remains the authority for fixed-boundary plans, history pins, recovery leases, catalogs, restore authority, and GC marks. Deterministically named `RecoveryJob` objects own alarm-driven execution and durable job progress for projection, capture, restore, garbage collection, and purge.
 
-The broader operator recovery workflow remains next-block work. Current snapshots must not be described as a shipped disaster-recovery control plane.
+The projection job materializes content-addressed Markdown objects needed by recovery. A capture pins one SQL sequence, pages active bodies, deleted identities, and attachments, verifies materialization coverage, builds bounded content-addressed manifest trees, and publishes an immutable `yaos-recovery-v2` root. Jobs are resumable, capability-scoped, bounded per alarm, and may report `complete_with_gaps` when a manifest explicitly records unavailable content.
 
-## Authentication, membership, and schema admission
+Browsing follows only the requested manifest branch. Restore is asynchronous and selection-scoped. Before replacement, the client backs up affected local paths and rechecks disk state; it then submits body candidates and lifecycle operations through normal durable paths, settles disk, and reports per-item outcomes. Recovery never replaces the live SQL root/body authority with an R2 snapshot.
 
-`POST /claim` accepts `{operatorRecoveryKey}` once, creates the first vault and one-use pairing code, and returns the vault/setup material. `POST /enroll` accepts `{pairingCode, deviceName}` and returns `{deviceToken, vaultId, deviceId, name}`. Codes expire after 15 minutes and work once. Every enrollment mints a new device ID and bearer; add-device and invite codes create the same full-peer membership.
+GC marks retained recovery and blob roots, acquires bounded sweep leases, and deletes only unmarked generation-scoped objects. R2 unavailability can delay recovery work without making Markdown sync unavailable.
 
-Vault HTTP routes are under `/vault/:vaultId/...` and require `Authorization: Bearer <deviceToken>`. A device may list its vault roster, mint another pairing code, rename itself, or leave. Leaving revokes that membership, clears this folder's enrollment and IndexedDB cache, and leaves ordinary files on disk. The operator console separately creates, renames, and destroys vaults and can revoke devices or unused codes.
+## Authentication and admission
 
-WebSocket clients obtain a short-lived, device-scoped ticket from `POST /vault/:vaultId/auth/ticket` with the same device bearer. The sync handshake at `/vault/sync/:vaultId` requires both `ticket` and `schemaVersion`; no long-lived credential is accepted in the URL. Ticket signature, expiry, vault scope, and current device membership are checked before the room is admitted.
+`POST /claim` initializes the operator control plane and provisions the first vault. `POST /enroll` consumes one pairing code and returns a device bearer, device ID, and selected vault ID. Codes expire after 15 minutes and work once.
 
-Plugin and server admit exactly one shared schema version. A missing or mismatched declaration is rejected with `update_required`; mixed-schema writes are not supported. Current behavior is schema 3. Schema 4 and settings sync are not shipped.
+Vault HTTP routes require the device bearer and vault ID. A short-lived device-scoped ticket is minted for WebSocket use; long-lived credentials never appear in socket URLs. Root and body handshakes require `ticket`, `schemaVersion=4`, and `protocolVersion=1`. Ticket signature, expiry, vault scope, current membership, active vault state, and vault generation are checked before runtime admission. Revocation closes already-active root/body sockets for that device as well as preventing future admission.
 
-## Resource and safety boundaries
+Leaving revokes one membership, clears the folder's enrollment and schema-4 IndexedDB cache, and leaves ordinary files on disk. Operator kick revokes one membership. Operator destroy revokes the complete vault boundary.
 
-Cloudflare constraints shaping `main` include:
+## Purge-first vault deletion
 
-- 128 MB isolate memory;
-- 1 GB per Durable Object and 5 GB per account;
-- 100,000 rows written and 5,000,000 rows read per day on the free plan;
-- 2 MB SQLite row/BLOB limit and 100 KB SQL statement limit;
-- bounded concurrent external operations.
+Destroy is a fenced saga, not a best-effort room reset:
 
-Correctness rules:
+1. The registry removes the vault, memberships, and pairing capabilities from admission and records the exact deletion obligation.
+2. The vault runtime flushes, fences new work, closes sockets, and cancels active capture/restore jobs.
+3. If R2 exists, a generation-scoped purge job empties only that generation's `recovery-v2/` and `blobs/` prefixes.
+4. Only after purge completes does the operator path delete the vault object's SQLite state.
+5. Failure or retry remains visible under the original deletion and purge identities; the vault ID is not reused while cleanup is pending.
 
-- uncertain deletion preserves data;
-- corrupt persistence fails closed;
-- observability fails open;
-- filesystem writes serialize per path;
-- conflict preservation precedes convergence;
-- safety-brake paths do not advance baselines;
-- QA mutation controls never ship in the production bundle.
+When R2 is absent, the R2 phase is already complete and SQL deletion can proceed. This ordering prevents lost SQL authority from making generation-owned objects unaccountable.
 
-The next architecture block owns per-vault storage accounting and limits, operator recovery, and any sharding design. Headless clients, Docker packaging, settings sync, and schema 4 are also not current behavior.
+## Safety boundaries and deferred work
 
-Known violations and unfinished proofs are tracked only in [BACKLOG.md](BACKLOG.md).
+Persistence corruption, invalid identity, wrong generation, stale candidate, and incompatible versions fail closed. Diagnostics fail open. Uncertain filesystem deletion preserves data. Recovery jobs expose retries and terminal gaps rather than reporting false completeness.
+
+Large-vault benchmark and soak evidence, deployed-Cloudflare recovery/deletion evidence, and real mobile recovery evidence are deferred; current evidence is described only in [QA](qa.md). Settings sync, headless clients, and Docker packaging remain future work. Evidenced open risks are tracked in [BACKLOG.md](BACKLOG.md).
