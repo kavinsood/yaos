@@ -119,7 +119,6 @@ export default tseslint.config(
 		"manifest.json",
 		"esbuild.config.mjs",
 		"eslint.config.mts",
-		"eslint.config.js",
 		"version-bump.mjs",
 		"versions.json",
 		// esbuild outfiles. These are gitignored build artifacts, but eslint's
@@ -129,7 +128,5 @@ export default tseslint.config(
 		// skipping the file (see the `qa` note above). Keep this in sync with
 		// the outfiles in esbuild.config.mjs.
 		"main.js",
-		"telemetry.js",
-		"lab.js",
 	]),
 );

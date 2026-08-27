@@ -96,7 +96,6 @@ s.section("Emitted release artifact contract");
 	) as {
 		serverVersion: string;
 		pluginVersion: string;
-		protectedFiles: string[];
 		updateOwnedPaths: string[];
 	};
 	const archiveEntries = execFileSync("unzip", ["-Z1", archivePath], { encoding: "utf8" })
@@ -104,10 +103,6 @@ s.section("Emitted release artifact contract");
 		.split("\n");
 	s.check(embeddedManifest.serverVersion === SERVER_VERSION, "server archive manifest has the current server version");
 	s.check(embeddedManifest.pluginVersion === manifest.version, "server archive manifest has the current plugin version");
-	s.check(
-		JSON.stringify(embeddedManifest.protectedFiles) === JSON.stringify(["wrangler.toml"]),
-		"server archive protects only operator-owned wrangler.toml",
-	);
 	const expectedOwnedPaths = [".gitlab-ci.yml", "package.json", "package-lock.json", "scripts", "tsconfig.json", "src"];
 	s.check(
 		JSON.stringify(embeddedManifest.updateOwnedPaths) === JSON.stringify(expectedOwnedPaths),

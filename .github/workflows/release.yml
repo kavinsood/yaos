@@ -26,7 +26,6 @@ jobs:
       - run: npm run build
       - run: npm run guard:production-bundles
       - run: npm run guard:no-tracked-generated-artifacts
-      - run: npm run guard:qa-isolation
       - run: npm run build:server-release
       - run: npm run test:ci
       - run: npm --prefix server run typecheck

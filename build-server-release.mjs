@@ -36,6 +36,15 @@ if (serverPackage.version !== serverVersion) {
 		`server/package.json version (${serverPackage.version}) does not match SERVER_VERSION (${serverVersion})`,
 	);
 }
+const serverReleaseOwnedPaths = [
+	".gitlab-ci.yml",
+	"package.json",
+	"package-lock.json",
+	"scripts",
+	"tsconfig.json",
+	"src",
+];
+const serverReleaseCopyPaths = [...serverReleaseOwnedPaths, "wrangler.toml"];
 
 const updateManifest = {
 	latestServerVersion: serverVersion,
@@ -52,29 +61,13 @@ const updateManifest = {
 const serverZipManifest = {
 	serverVersion,
 	pluginVersion: pluginManifest.version,
-	protectedFiles: ["wrangler.toml"],
-	updateOwnedPaths: [
-		".gitlab-ci.yml",
-		"package.json",
-		"package-lock.json",
-		"scripts",
-		"tsconfig.json",
-		"src",
-	],
+	updateOwnedPaths: serverReleaseOwnedPaths,
 };
 
 mkdirSync(outputDir, { recursive: true });
 mkdirSync(serverTempDir, { recursive: true });
 
-for (const relativePath of [
-	"package.json",
-	"package-lock.json",
-	".gitlab-ci.yml",
-	"scripts",
-	"tsconfig.json",
-	"wrangler.toml",
-	"src",
-]) {
+for (const relativePath of serverReleaseCopyPaths) {
 	cpSync(resolve(rootDir, "server", relativePath), join(serverTempDir, relativePath), {
 		recursive: true,
 	});

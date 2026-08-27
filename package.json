@@ -37,7 +37,6 @@
 		"guard:schema-version": "node scripts/guard-schema-version.mjs",
 		"clean:src-js-artifacts": "find src -name '*.js' -o -name '*.js.map' | xargs rm -f 2>/dev/null; echo 'cleaned'"
 	},
-	"keywords": [],
 	"license": "0-BSD",
 	"engines": {
 		"node": ">=20"
@@ -53,8 +52,6 @@
 		"eslint-plugin-obsidianmd": "0.4.1",
 		"globals": "14.0.0",
 		"jiti": "2.6.1",
-		"playwright": "^1.60.0",
-		"qrcode-generator": "^2.0.4",
 		"tslib": "^2.4.0",
 		"typescript": "^5.8.3",
 		"typescript-eslint": "8.35.1",
