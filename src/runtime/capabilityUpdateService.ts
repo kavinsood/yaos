@@ -35,7 +35,6 @@ export type UpdateState = {
 	updateActionUrl: string | null;
 	updateBootstrapUrl: string | null;
 	updateActionLabel: string;
-	legacyServerDetected: boolean;
 	pluginCompatibilityWarning: string | null;
 };
 
@@ -45,6 +44,22 @@ const UPDATE_MANIFEST_URLS = [
 const UPDATE_MANIFEST_CACHE_MS = 24 * 60 * 60 * 1000;
 export const CAPABILITY_REFRESH_INTERVAL_MS = 30_000;
 const GITHUB_OPS_WORKFLOW_PATH = ".github/workflows/yaos-ops.yml";
+
+const INCOMPATIBLE_SERVER_MESSAGE =
+	"This server is incompatible with mandatory device enrollment. Update the server before syncing.";
+
+export function serverCapabilityProtocolError(
+	capabilities: Pick<ServerCapabilities, "serverVersion"> | null,
+	requestError: string | null = null,
+): string | null {
+	if (requestError?.includes("capabilities request failed (404)")) {
+		return INCOMPATIBLE_SERVER_MESSAGE;
+	}
+	if (capabilities && (!capabilities.serverVersion || !capabilities.serverVersion.trim())) {
+		return INCOMPATIBLE_SERVER_MESSAGE;
+	}
+	return null;
+}
 
 function buildGithubOpsBootstrapWorkflowYaml(): string {
 	return [
@@ -149,8 +164,7 @@ export class CapabilityUpdateService {
 	private lastServerUpdateNoticeVersion: string | null = null;
 	private lastPluginUpdateNoticeVersion: string | null = null;
 	private compatibilityBlockReason: string | null = null;
-	private legacyServerDetected = false;
-	private legacyServerNoticeShown = false;
+	private capabilityProtocolError: string | null = null;
 
 	constructor(private readonly deps: CapabilityUpdateServiceDeps) {}
 
@@ -313,7 +327,6 @@ export class CapabilityUpdateService {
 					? "your GitLab pipeline"
 					: "your GitHub workflow"
 				: "YAOS settings",
-			legacyServerDetected: this.legacyServerDetected,
 			pluginCompatibilityWarning,
 		};
 	}
@@ -350,8 +363,8 @@ export class CapabilityUpdateService {
 
 
 	private getHardCompatibilityBlockReason(): string | null {
+		if (this.capabilityProtocolError) return this.capabilityProtocolError;
 		if (!this.serverCapabilities) return null;
-
 		const minPluginVersion = this.serverCapabilities.minPluginVersion;
 		if (minPluginVersion && compareSemver(this.deps.pluginVersion, minPluginVersion) === -1) {
 			return `This server requires YAOS plugin ${minPluginVersion} or newer. Update this plugin before syncing.`;
@@ -391,7 +404,7 @@ export class CapabilityUpdateService {
 		});
 
 		if (!settings.host) {
-			this.legacyServerDetected = false;
+			this.capabilityProtocolError = null;
 			this.serverCapabilities = null;
 			await this.handleCapabilityChange(previous, null, reason);
 			this.deps.trace("trace", "capability-refresh-end", {
@@ -403,20 +416,25 @@ export class CapabilityUpdateService {
 		}
 
 		try {
-			this.serverCapabilities = await fetchServerCapabilities(settings.host, settings.deviceToken);
-			const serverVersion = (this.serverCapabilities as { serverVersion?: unknown } | null)?.serverVersion;
-			if (typeof serverVersion === "string" && serverVersion.trim()) {
-				this.legacyServerDetected = false;
-			} else {
-				this.legacyServerDetected = true;
-				this.maybeShowLegacyServerNotice();
+			const capabilities = await fetchServerCapabilities(settings.host, settings.deviceToken);
+			const protocolError = serverCapabilityProtocolError(capabilities);
+			if (protocolError) {
+				this.serverCapabilities = null;
+				this.capabilityProtocolError = protocolError;
+				await this.handleCapabilityChange(previous, null, reason);
+				return;
 			}
+			this.capabilityProtocolError = null;
+			this.serverCapabilities = capabilities;
 		} catch (err) {
 			const errorText = formatUnknown(err);
 			this.deps.log(`Server capability probe failed: ${errorText}`);
-			if (errorText.includes("capabilities request failed (404)")) {
-				this.legacyServerDetected = true;
-				this.maybeShowLegacyServerNotice();
+			const protocolError = serverCapabilityProtocolError(null, errorText);
+			if (protocolError) {
+				this.serverCapabilities = null;
+				this.capabilityProtocolError = protocolError;
+				await this.handleCapabilityChange(previous, null, reason);
+				return;
 			}
 			this.deps.trace("trace", "capability-refresh-end", {
 				reason,
@@ -663,13 +681,5 @@ export class CapabilityUpdateService {
 		}
 	}
 
-	private maybeShowLegacyServerNotice(): void {
-		if (this.legacyServerNoticeShown) return;
-		new Notice(
-			"Legacy server detected. Sync continues, but current update information needs a newer server.",
-			12000,
-		);
-		this.legacyServerNoticeShown = true;
-	}
 
 }

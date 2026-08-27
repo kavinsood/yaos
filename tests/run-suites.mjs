@@ -15,12 +15,11 @@
 // that contract: no file may be silently unaccounted for, and no entry may
 // name a path that has since been deleted or renamed.
 //
-// ONE REGRESSION RUNNER. Every regression suite runs under `node --import jiti/register`.
+// ONE REGRESSION RUNNER. Every regression suite runs through the programmatic
+// Jiti bootstrap in tests/run-typescript.mjs. This preserves Node 20 support,
+// source maps, and test-only aliases without the deprecated global loader.
 // ONE DIALECT FOR ALL. Suites are TypeScript, full stop. tests/run-suites.mjs
-// is the single plain-JS file in tests/ because it is the bootstrap that does
-// the spawning. The old .ts/.mjs split was generational rather than
-// principled, and it cost two bridge files whose only job was to let a .mjs
-// suite reach a .ts module.
+// is the plain-JS discovery/process bootstrap.
 //
 // ONE HARNESS FOR ALL. A suite reports through tests/harness.ts:
 //
@@ -36,10 +35,8 @@
 // and a suite that never calls it fails loudly instead of exiting 0 empty.
 //
 // IMPORTANT: Always run regressions via `npm run test:regressions` (or this
-// script directly). Do NOT run individual suites with bare
-// `node --import jiti/register tests/foo.ts` — the JITI_ALIAS env injected
-// below (yjs deduplication, obsidian mock, partyserver mock) will be absent
-// and you may see the "Yjs was already imported" warning or import failures.
+// script directly). The child bootstrap owns yjs/y-protocols deduplication and
+// the obsidian, partyserver and @shared aliases.
 //
 // CLI flags:
 //   --only <substring>   Run only suites whose path contains <substring>.
@@ -64,40 +61,7 @@ const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const TESTS_DIR = fileURLToPath(new URL(".", import.meta.url));
 const REGISTRY_PATH = fileURLToPath(new URL("./suites.json", import.meta.url));
 
-// Force all "yjs" imports to resolve to the single root copy, preventing the
-// "Yjs was already imported" constructor-check warning that fires when
-// server/node_modules/yjs and node_modules/yjs are both loaded in the same
-// process (triggered by tests that import from server/src/).
-const ROOT_YJS = fileURLToPath(new URL("../node_modules/yjs/dist/yjs.mjs", import.meta.url));
-
-// Redirect "obsidian" to a minimal runtime mock. The real obsidian package
-// ships only TypeScript declarations (no JS), so any test that imports code
-// depending on obsidian needs this alias to resolve at runtime.
-const OBSIDIAN_MOCK = fileURLToPath(new URL("./mocks/obsidian.ts", import.meta.url));
-
-// Redirect "partyserver" to a minimal runtime mock. The real partyserver
-// imports from "cloudflare:workers" which is unavailable in Node.js.
-// The mock's getServerByName() intentionally throws — any pre-auth code
-// that calls it causes the test to fail loudly (FU-4 invariant).
-const PARTYSERVER_MOCK = fileURLToPath(new URL("./mocks/partyserver.ts", import.meta.url));
-
-// Redirect "@shared/*" to the canonical cross-tree modules. tsc and esbuild
-// resolve this from the `paths` entry in tsconfig.json, but jiti does its own
-// runtime resolution and does not read tsconfig, so the alias has to be
-// restated here. Prefix mapping, so new @shared modules need no change.
-const SHARED_DIR = fileURLToPath(new URL("../server/src/shared", import.meta.url));
-
-const JITI_ENV = {
-	...process.env,
-	JITI_ALIAS: JSON.stringify({
-		yjs: ROOT_YJS,
-		obsidian: OBSIDIAN_MOCK,
-		partyserver: PARTYSERVER_MOCK,
-		"@shared": SHARED_DIR,
-	}),
-};
-
-const RUNNER = ["node", "--import", "jiti/register"];
+const RUNNER = ["node", "tests/run-typescript.mjs", "--test-aliases"];
 
 // -----------------------------------------------------------------------
 // Discovery. Exported so tests/suite-discovery.ts guards the real code path
@@ -114,7 +78,11 @@ const BUCKETS = ["client", "server", "contracts"];
 // discovery functions and the shared assertion harness every bucket suite
 // depends on. Each sits beside the file it verifies and is discovered
 // explicitly rather than by directory walk.
-const ROOT_SUITES = ["tests/harness-self.ts", "tests/suite-discovery.ts"];
+const ROOT_SUITES = [
+	"tests/harness-self.ts",
+	"tests/runner-runtime-self.ts",
+	"tests/suite-discovery.ts",
+];
 
 /** Every discovery candidate in tests/, repo-root-relative and sorted. */
 export function discoverCandidates() {
@@ -243,7 +211,7 @@ function main() {
 		const result = spawnSync(cmd, [...cmdArgs, suitePath], {
 			cwd: ROOT,
 			stdio: "inherit",
-			env: JITI_ENV,
+			env: process.env,
 		});
 
 		if (result.status === 0) {

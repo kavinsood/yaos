@@ -46,11 +46,20 @@ export async function handleEnrollRoute(req: Request, env: Env): Promise<Respons
 			message: payload?.message ?? "Could not enroll this device.",
 		}, response.status);
 	}
+	if (
+		typeof payload?.vaultId !== "string" || !payload.vaultId.trim()
+		|| typeof payload.deviceId !== "string" || !payload.deviceId.trim()
+		|| typeof payload.deviceName !== "string" || !payload.deviceName.trim()
+	) {
+		return json({ error: "enroll_response_invalid" }, 502);
+	}
+	const host = new URL(req.url).origin;
 	return json({
+		host,
 		deviceToken,
-		vaultId: payload?.vaultId,
-		deviceId: payload?.deviceId ?? deviceId,
-		name: payload?.deviceName,
+		vaultId: payload.vaultId,
+		deviceId: payload.deviceId,
+		deviceName: payload.deviceName,
 	});
 }
 

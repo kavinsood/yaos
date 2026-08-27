@@ -6,8 +6,7 @@
  * Product-side diff and restore behavior is covered through the real exports
  * in tests/client/snapshot-diff-restore.ts.
  *
- * Usage:
- *   node --import jiti/register tests/live/snapshots.ts
+ * Usage: node tests/run-typescript.mjs tests/live/snapshots.ts
  */
 
 import * as Y from "yjs";

@@ -9,17 +9,10 @@ import type { LiveIdentity } from "./liveIdentity.ts";
 const HOST = "http://127.0.0.1:8787";
 const WRANGLER_BIN = resolve("server/node_modules/.bin/wrangler");
 
-// Loader flags every spawned suite needs. tests/live/*.ts are TypeScript, so
-// bare `node` cannot load them; this is the same loader tests/run-suites.mjs
-// uses for the regression buckets, which keeps the two entry points on one
-// dialect.
-//
-// JITI_ALIAS is deliberately NOT mirrored from tests/run-suites.mjs. Live
-// suites may import shared test helpers and product constants, but none loads
-// Obsidian-dependent product modules or `@shared`; `partyserver` must never be
-// replaced by a mock when the suite is talking to a real Worker. "yjs" already
-// resolves to the single root copy here.
-const NODE_TS = ["--import", "jiti/register"];
+// Every TypeScript child runs through the programmatic Jiti bootstrap. Live
+// suites deliberately omit test aliases: they use the real Worker and package
+// graph rather than the Obsidian/PartyServer mocks.
+const NODE_TS = ["tests/run-typescript.mjs"];
 interface LiveCommand {
 	readonly file: string;
 	readonly args?: readonly string[];
@@ -132,10 +125,11 @@ interface ClaimResponse {
 }
 
 interface EnrollmentResponse {
+	readonly host?: unknown;
 	readonly deviceToken?: unknown;
 	readonly vaultId?: unknown;
 	readonly deviceId?: unknown;
-	readonly name?: unknown;
+	readonly deviceName?: unknown;
 }
 
 async function getCapabilities(): Promise<Capabilities> {
@@ -177,10 +171,11 @@ async function claimAndEnroll(): Promise<LiveIdentity> {
 	}
 	const enrolled = (await enrollResponse.json()) as EnrollmentResponse | null;
 	if (
-		typeof enrolled?.deviceToken !== "string" || !enrolled.deviceToken
+		typeof enrolled?.host !== "string" || enrolled.host !== HOST
+		|| typeof enrolled.deviceToken !== "string" || !enrolled.deviceToken
 		|| typeof enrolled.vaultId !== "string" || !enrolled.vaultId
 		|| typeof enrolled.deviceId !== "string" || !enrolled.deviceId
-		|| typeof enrolled.name !== "string" || !enrolled.name
+		|| typeof enrolled.deviceName !== "string" || !enrolled.deviceName
 	) {
 		throw new Error(`initial enrollment response was incomplete: ${JSON.stringify(enrolled)}`);
 	}
@@ -193,7 +188,7 @@ async function claimAndEnroll(): Promise<LiveIdentity> {
 		throw new Error("Worker did not remain claimed after initial enrollment");
 	}
 	return {
-		host: HOST,
+		host: enrolled.host,
 		deviceToken: enrolled.deviceToken,
 		vaultId: enrolled.vaultId,
 		deviceId: enrolled.deviceId,

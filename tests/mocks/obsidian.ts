@@ -31,6 +31,22 @@ export class App {}
 /** Base classes needed by declarative settings tests. */
 export class Plugin {}
 
+export const Platform = {
+	isAndroidApp: false,
+	isIosApp: false,
+	isPhone: false,
+	isTablet: false,
+	isMacOS: false,
+	isWin: false,
+	isLinux: true,
+	isMobile: false,
+	isDesktop: true,
+	isDesktopApp: true,
+	isMobileApp: false,
+	isSafari: false,
+	resourcePathPrefix: "",
+};
+
 export class PluginSettingTab {
 	readonly app: App;
 	readonly plugin: Plugin;

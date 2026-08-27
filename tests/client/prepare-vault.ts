@@ -9,6 +9,7 @@ import {
 	parsePrepareVaultArgs,
 	prepareVault,
 } from "../../qa/scripts/prepare-vault-lib";
+import { enrollTwoQaDevices } from "../../qa/scripts/two-device-enrollment";
 import { suite } from "../harness.ts";
 
 const s = suite("prepare-vault");
@@ -158,10 +159,11 @@ s.test("enrolls through the real server contract and persists the returned ident
 		requestUrl = String(input);
 		requestInit = init;
 		return new Response(JSON.stringify({
+			host: "https://sync.example",
 			deviceToken: "issued-device-secret",
 			vaultId: "server-vault",
 			deviceId: "server-device",
-			name: "QA Device",
+			deviceName: "QA Device",
 		}), {
 			status: 200,
 			headers: { "Content-Type": "application/json" },
@@ -205,10 +207,11 @@ s.test("rejects enrollment responses that do not exactly match the credential sc
 	const { paths, vaultParent } = await makeLayout();
 	const destination = join(vaultParent, "bad-enrollment");
 	const fetchImpl = (async () => new Response(JSON.stringify({
+		host: "https://sync.example",
 		deviceToken: "issued-device-secret",
 		vaultId: "server-vault",
 		deviceId: "server-device",
-		name: "QA Device",
+		deviceName: "QA Device",
 		extra: true,
 	}), {
 		status: 200,
@@ -226,7 +229,7 @@ s.test("rejects enrollment responses that do not exactly match the credential sc
 				deviceName: "QA Device",
 			},
 		}, paths, fetchImpl),
-		"exactly deviceToken, vaultId, deviceId, and name",
+		"exactly host, deviceToken, vaultId, deviceId, and deviceName",
 	);
 	await assert.rejects(async () => readFile(destination), { code: "ENOENT" });
 });
@@ -284,5 +287,45 @@ s.test("accepts only a complete controlled pre-enrolled identity", async () => {
 			deviceName: "Fixture Device",
 		},
 	);
+});
+
+s.test("bootstraps two distinct QA memberships into one vault", async () => {
+	const requests: Array<{ url: string; authorization: string | null; body: unknown }> = [];
+	const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+		const request = input instanceof Request ? input : new Request(String(input), init);
+		const body = request.method === "POST" ? await request.json() : null;
+		requests.push({
+			url: request.url,
+			authorization: request.headers.get("Authorization"),
+			body,
+		});
+		if (request.url.endsWith("/enroll")) {
+			const enrollment = body as { pairingCode?: string; deviceName?: string };
+			const suffix = enrollment.pairingCode === "initial-code" ? "a" : "b";
+			return new Response(JSON.stringify({
+				host: "https://sync.example",
+				deviceToken: `token-${suffix}`,
+				vaultId: "shared-vault",
+				deviceId: `device-${suffix}`,
+				deviceName: enrollment.deviceName,
+			}), { status: 200, headers: { "Content-Type": "application/json" } });
+		}
+		return new Response(JSON.stringify({ pairingCode: "second-code" }), {
+			status: 200,
+			headers: { "Content-Type": "application/json" },
+		});
+	}) as typeof fetch;
+	const result = await enrollTwoQaDevices({
+		host: "https://sync.example/",
+		initialPairingCode: "initial-code",
+		deviceNameA: "Desktop",
+		deviceNameB: "Mobile",
+	}, fetchImpl);
+	assert.equal(result.deviceA.deviceId, "device-a");
+	assert.equal(result.deviceB.deviceId, "device-b");
+	assert.equal(result.deviceA.vaultId, result.deviceB.vaultId);
+	assert.equal(requests.length, 3);
+	assert.equal(requests[1]?.authorization, "Bearer token-a");
+	assert.deepEqual(requests[1]?.body, { purpose: "device" });
 });
 await s.done();

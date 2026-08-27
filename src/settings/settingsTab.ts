@@ -41,7 +41,6 @@ interface SettingsUpdateState {
 	updateRepoUrl: string | null;
 	updateActionUrl: string | null;
 	updateBootstrapUrl: string | null;
-	legacyServerDetected: boolean;
 	pluginCompatibilityWarning: string | null;
 }
 
@@ -225,11 +224,6 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 					name: "Compatibility warning",
 					desc: updateState.pluginCompatibilityWarning ?? "",
 					visible: () => this.host.getUpdateState().pluginCompatibilityWarning !== null,
-				},
-				{
-					name: "Legacy server detected",
-					desc: "Sync continues, but update metadata and one-click updates require a newer server.",
-					visible: () => this.host.getUpdateState().legacyServerDetected,
 				},
 				{
 					name: "Refresh update information",

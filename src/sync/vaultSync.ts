@@ -28,11 +28,12 @@ import { formatUnknown } from "../utils/format";
 import { sha256TextHex } from "../utils/sha256";
 import { UpdateTracker } from "./updateTracker";
 import { ServerAckTracker, type ServerAckState } from "./serverAckTracker";
-import { IndexedDbCandidateStore } from "./indexedDbCandidateStore";
+import { IndexedDbCandidateStore, getOrCreateLocalDeviceId } from "./indexedDbCandidateStore";
 import {
 	nextSysGeneration,
 	readSysGeneration,
 	receiptRoomName,
+	receiptLocalDeviceId,
 	vaultIdbName,
 } from "./vaultPersistence";
 import {
@@ -267,6 +268,7 @@ export class VaultSync {
 	private readonly _device: string | undefined;
 	readonly deviceId: string;
 	private readonly _idbName: string;
+	private readonly folderKey: string;
 	private readonly receiptGenerationHint: number | undefined;
 	private readonly debug: boolean;
 	private _eventRing: Array<{ ts: string; msg: string }> = [];
@@ -312,6 +314,7 @@ export class VaultSync {
 		this.debug = settings.debug;
 		this._device = settings.deviceName || undefined;
 		this.deviceId = settings.deviceId;
+		this.folderKey = options.folderKey;
 		this._idbName = vaultIdbName(settings.vaultId, options.folderKey);
 		this.receiptGenerationHint = options.receiptGenerationHint;
 		this.trace = options.trace;
@@ -536,15 +539,16 @@ export class VaultSync {
 	): Promise<void> {
 		if (this._serverAckScopeBase) return;
 		try {
-			const [vaultIdHash, serverHostHash] = await Promise.all([
+			const [vaultIdHash, serverHostHash, localInstallationId] = await Promise.all([
 				sha256TextHex(settings.vaultId),
 				sha256TextHex(settings.host),
+				getOrCreateLocalDeviceId(),
 			]);
 			this._serverAckScopeBase = {
 				vaultId: settings.vaultId,
 				vaultIdHash,
 				serverHostHash,
-				localDeviceId: settings.deviceId,
+				localDeviceId: receiptLocalDeviceId(localInstallationId, this.folderKey),
 				docSchemaVersion: SCHEMA_VERSION,
 				pluginVersion,
 				ackStoreVersion: 2,
@@ -1967,20 +1971,21 @@ export class VaultSync {
 		};
 	}
 
-	/** Delete the receipt candidate scoped to one server-issued device enrollment. */
+	/** Delete the receipt candidate scoped to one local installation and folder. */
 	static async clearServerReceiptCandidate(
 		host: string,
 		vaultId: string,
-		deviceId: string,
+		folderKey: string,
 	): Promise<void> {
-		const [vaultIdHash, serverHostHash] = await Promise.all([
+		const [vaultIdHash, serverHostHash, localInstallationId] = await Promise.all([
 			sha256TextHex(vaultId),
 			sha256TextHex(host),
+			getOrCreateLocalDeviceId(),
 		]);
 		const store = new IndexedDbCandidateStore({
 			vaultIdHash,
 			serverHostHash,
-			localDeviceId: deviceId,
+			localDeviceId: receiptLocalDeviceId(localInstallationId, folderKey),
 			roomName: "",
 			roomGeneration: 0,
 			docSchemaVersion: SCHEMA_VERSION,

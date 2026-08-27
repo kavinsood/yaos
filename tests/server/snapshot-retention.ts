@@ -1,8 +1,7 @@
 /**
  * Unit tests for snapshot: dedup, retention, hash computation, and safety invariants.
  *
- * Usage:
- *   node --import jiti/register tests/server/snapshot-retention.ts
+ * Usage: node tests/run-suites.mjs --only snapshot-retention
  *
  * Required test cases (from code review):
  *  1. Delete-only Yjs transaction changes fullUpdateHash (catches state-vector bug)

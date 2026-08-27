@@ -48,7 +48,6 @@ function createFixture(overrides: Partial<VaultSyncSettingsHost> = {}): {
 			updateRepoUrl: null,
 			updateActionUrl: null,
 			updateBootstrapUrl: null,
-			legacyServerDetected: false,
 			pluginCompatibilityWarning: null,
 		}),
 		mintDevicePairing: async () => null,

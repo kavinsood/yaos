@@ -50,7 +50,7 @@ const LOG_PREFIX = "[yaos-sync:worker]";
 // recognises as valid YAOS routes.  Junk paths (/wp-login.php, /favicon.ico,
 // /random-garbage) never reach the DO.
 //
-// Vault resource whitelist: only the four known resources can proceed to auth.
+// Vault resource whitelist: only the five known resources can proceed to auth.
 // /vault/:id/<anything-else> is classified as not-found here, before any
 // YAOS_CONFIG or YAOS_SYNC access, so vault-shaped scanner traffic (/vault/foo/
 // probe, /vault/foo/wp-login.php) is as cheap as a plain unknown path.

@@ -5,6 +5,7 @@ import {
 	nextSysGeneration,
 	readSysGeneration,
 	receiptRoomName,
+	receiptLocalDeviceId,
 	vaultIdbName,
 } from "../../src/sync/vaultPersistence";
 import { readSource, suite } from "../harness.ts";
@@ -19,6 +20,24 @@ s.section("Folder-keyed persistence");
 	const folderKey = await computeFolderKey("/Users/me/Work");
 	s.check(folderKey === digest.slice(0, 16), "folder key is the first 16 SHA-256 hex characters");
 	s.check(vaultIdbName("vault-1", folderKey) === `yaos:vault-1:${folderKey}`, "IDB name combines server vault and local folder");
+}
+
+s.section("Receipt identity remains local to installation and folder");
+{
+	const first = receiptLocalDeviceId("local-installation", "folder-a");
+	const second = receiptLocalDeviceId("local-installation", "folder-b");
+	s.check(first !== second, "two local folders never share a receipt candidate identity");
+	s.check(first.startsWith("local-installation:"), "server membership id is not part of local receipt identity");
+	const source = readSource("src/sync/vaultSync.ts");
+	s.check(source.includes("getOrCreateLocalDeviceId()"), "VaultSync obtains the installation-local receipt UUID");
+	s.check(
+		source.includes("receiptLocalDeviceId(localInstallationId, this.folderKey)"),
+		"VaultSync scopes the receipt UUID to the local folder",
+	);
+	s.check(
+		!source.includes("localDeviceId: settings.deviceId"),
+		"server-issued deviceId is not reused as receipt identity",
+	);
 }
 
 s.section("Receipt generation scope");

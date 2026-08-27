@@ -1,6 +1,9 @@
 import { execFileSync } from "node:child_process";
 import { resolve } from "node:path";
-import { CapabilityUpdateService } from "../../src/runtime/capabilityUpdateService";
+import {
+	CapabilityUpdateService,
+	serverCapabilityProtocolError,
+} from "../../src/runtime/capabilityUpdateService";
 import type { ServerCapabilities } from "../../src/sync/serverCapabilities";
 import type { UpdateManifest } from "../../src/update/updateManifest";
 import { SCHEMA_VERSION } from "../../src/sync/schema";
@@ -233,6 +236,26 @@ s.section("Runtime compatibility decision matrix");
 	s.check(
 		!manifestPluginFloorOnly.blocked,
 		"server-side plugin floor comes from live capabilities, not unused update-manifest metadata",
+	);
+}
+
+s.section("Mandatory capability protocol");
+{
+	s.check(
+		serverCapabilityProtocolError({ serverVersion: "" }) !== null,
+		"a 200 response without a server version is a hard incompatibility",
+	);
+	s.check(
+		serverCapabilityProtocolError(null, "capabilities request failed (404)") !== null,
+		"a server without the capabilities endpoint is a hard incompatibility",
+	);
+	s.check(
+		serverCapabilityProtocolError({ serverVersion: SERVER_VERSION }) === null,
+		"the current capability protocol is accepted",
+	);
+	s.check(
+		serverCapabilityProtocolError(null, "network unavailable") === null,
+		"a transient network failure is not mislabeled as protocol incompatibility",
 	);
 }
 await s.done();

@@ -1,6 +1,6 @@
 /**
- * RFC multivault plane: unique names, destroy, rename, pairing revoke,
- * and schema admit (newer client / older room).
+ * Multivault plane: identity, unique names, lifecycle, cleanup, operator
+ * sessions, and exact schema admission.
  */
 import ServerConfig from "../../server/src/config";
 import { hashSecret, OPERATOR_COOKIE, PAIRING_CODE_TTL_MS, uniqueDeviceName } from "../../server/src/identity";
@@ -19,8 +19,8 @@ import { FakeR2Bucket, makeConfigNamespace, makeEnv } from "../mocks/workerEnv.t
 import { readSource, suite } from "../harness.ts";
 
 const s = suite("multivault-registry");
-function makeMemoryConfig(): ServerConfig {
-	const data = new Map<string, unknown>();
+function makeMemoryConfig(initial: Readonly<Record<string, unknown>> = {}): ServerConfig {
+	const data = new Map<string, unknown>(Object.entries(initial));
 	const storage = {
 		get: async (key: string) => data.get(key),
 		put: async (key: string, value: unknown) => {
@@ -50,6 +50,48 @@ function jsonRequest(path: string, body: unknown): Request {
 		headers: { "Content-Type": "application/json" },
 		body: JSON.stringify(body),
 	});
+}
+
+s.section("claim is one-shot and old claimed formats stay unsupported");
+{
+	const config = makeMemoryConfig();
+	const claimBody = {
+		operatorRecoveryHash: "h".repeat(64),
+		ticketSigningKey: "signing-key",
+		vaultId: "vault-claim-aa",
+		vaultName: "Personal",
+		pairingCodeHash: "p".repeat(64),
+		pairingPurpose: "device",
+	};
+	const first = await config.fetch(jsonRequest("/__yaos/claim", claimBody));
+	const second = await config.fetch(jsonRequest("/__yaos/claim", claimBody));
+	s.check(first.status === 200, "first claim succeeds");
+	s.check(second.status === 403, "second claim is rejected");
+	s.check((await second.json() as { error?: string }).error === "already_claimed", "duplicate claim reports already_claimed");
+
+	const oldConfig = makeMemoryConfig({ claimed: true });
+	const oldClaim = await oldConfig.fetch(jsonRequest("/__yaos/claim", claimBody));
+	s.check(oldClaim.status === 409, "old claimed config cannot be reinterpreted");
+	s.check((await oldClaim.json() as { error?: string }).error === "server_format_unsupported", "old format is explicit");
+}
+
+s.section("expired operator sessions fail authorization");
+{
+	const sessionToken = "expired-operator-session";
+	const config = makeMemoryConfig({
+		operatorSessions: [{
+			sessionHash: await hashSecret(sessionToken),
+			exp: Date.now() - 1,
+			createdAt: Date.now() - 10_000,
+		}],
+	});
+	const env = makeEnv({
+		YAOS_CONFIG: makeConfigNamespace(async (request) => await config.fetch(request)),
+	});
+	const request = new Request("https://example.test/operator/state", {
+		headers: { Cookie: `${OPERATOR_COOKIE}=${sessionToken}` },
+	});
+	s.check(!(await verifyOperatorSession(env, request)), "expired operator cookie is rejected");
 }
 
 s.section("uniqueDeviceName suffixes on this vault");

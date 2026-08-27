@@ -15,8 +15,8 @@
 // The interesting properties — exit code, output ORDER, and "did the summary
 // wait for the slow body" — are only observable from outside the process,
 // because done() ends the process. Each case therefore runs as a real child
-// suite under the same `node --import jiti/register` command the runner uses,
-// and this file asserts against its stdout, stderr and exit status.
+// through the same programmatic Jiti bootstrap the runner uses, and this file
+// asserts against its stdout, stderr and exit status.
 
 import { spawnSync } from "node:child_process";
 import { existsSync, writeFileSync } from "node:fs";
@@ -24,8 +24,9 @@ import { join } from "node:path";
 import { readSource, repoRoot, sleep, suite, until, withTempDir } from "./harness.ts";
 
 const s = suite("harness-self");
-// Child fixtures are written as .ts and run under the same
-// `node --import jiti/register` the real runner uses.
+// Child fixtures are written as .ts and run through the production test
+// bootstrap with the same aliases and source-map behavior.
+const TYPESCRIPT_RUNNER = join(repoRoot(), "tests/run-typescript.mjs");
 const HARNESS = join(repoRoot(), "tests/harness.ts");
 
 interface Ran {
@@ -39,7 +40,7 @@ interface Ran {
 function runChildSuite(dir: string, label: string, body: string): Ran {
 	const file = join(dir, `${label}.ts`);
 	writeFileSync(file, `import { suite, sleep } from ${JSON.stringify(HARNESS)};\n${body}`);
-	const result = spawnSync("node", ["--import", "jiti/register", file], {
+	const result = spawnSync("node", [TYPESCRIPT_RUNNER, "--test-aliases", file], {
 		cwd: repoRoot(),
 		encoding: "utf8",
 		maxBuffer: 1024 * 1024 * 64,

@@ -8,8 +8,7 @@
  * Verifies that old plugin + new server and new plugin + old server
  * combinations work without breakage.
  *
- * Usage:
- *   node --import jiti/register tests/client/snapshot-compat.ts
+ * Usage: node tests/run-suites.mjs --only snapshot-compat
  */
 
 import {

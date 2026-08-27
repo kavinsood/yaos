@@ -2,7 +2,7 @@ import { SERVER_SCHEMA_VERSION } from "../../server/src/version";
 import { inspectTicket, createTicket, verifyTicket } from "../../server/src/routes/ticket";
 import { authenticateSocketRequest, handleSyncSocketRoute } from "../../server/src/routes/syncSocket";
 import type { AuthState, Env } from "../../server/src/routes/types";
-import { makeEnv, makeTrapNamespace } from "../mocks/workerEnv.ts";
+import { makeConfigNamespace, makeEnv, makeTrapNamespace } from "../mocks/workerEnv.ts";
 import { suite } from "../harness.ts";
 
 const s = suite("ws-ticket-auth");
@@ -89,6 +89,49 @@ s.section("legacy token query cannot authenticate or wake a room");
 	s.check(response.status === 401, "token query is unauthorized even with the supported schema");
 	s.check(configTrap.touched.length === 0, "token query is rejected before membership lookup");
 	s.check(roomTrap.touched.length === 0, "token query does not wake the room");
+}
+
+s.section("revocation invalidates an otherwise-live ticket before room wake");
+{
+	const { ticket } = await createTicket(auth, vaultId, deviceId);
+	const config = makeConfigNamespace(async (request) => {
+		const pathname = new URL(request.url).pathname;
+		if (pathname === "/__yaos/verify-device") {
+			return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401 });
+		}
+		throw new Error(`unexpected config request: ${pathname}`);
+	});
+	const room = makeTrapNamespace("revoked ticket must not wake room");
+	const env: Env = makeEnv({ YAOS_CONFIG: config, YAOS_SYNC: room });
+	const url = new URL(`https://example.test/vault/sync/${vaultId}`);
+	url.searchParams.set("ticket", ticket);
+	url.searchParams.set("schemaVersion", String(SERVER_SCHEMA_VERSION));
+	const response = await handleSyncSocketRoute(new Request(url), env, auth, vaultId);
+	s.check(response.status === 401, "revoked ticket handshake is unauthorized");
+	s.check(config.calls === 1, "handshake rechecks live membership");
+	s.check(room.touched.length === 0, "revoked ticket never wakes the room");
+}
+
+s.section("legacy schema query alias is rejected");
+{
+	const { ticket } = await createTicket(auth, vaultId, deviceId);
+	const config = makeConfigNamespace(async (request) => {
+		const pathname = new URL(request.url).pathname;
+		if (pathname === "/__yaos/verify-device" || pathname === "/__yaos/touch-device") {
+			return new Response(JSON.stringify({ ok: true }), { status: 200 });
+		}
+		throw new Error(`unexpected config request: ${pathname}`);
+	});
+	const room = makeTrapNamespace("schema alias must not wake room");
+	const env: Env = makeEnv({ YAOS_CONFIG: config, YAOS_SYNC: room });
+	const url = new URL(`https://example.test/vault/sync/${vaultId}`);
+	url.searchParams.set("ticket", ticket);
+	url.searchParams.set("schema", String(SERVER_SCHEMA_VERSION));
+	const response = await handleSyncSocketRoute(new Request(url), env, auth, vaultId);
+	const body = await response.json() as { error?: string; reason?: string };
+	s.check(response.status === 426, "schema alias does not satisfy schemaVersion admission");
+	s.check(body.error === "update_required" && body.reason === "invalid_client_schema", "schema alias failure is explicit");
+	s.check(room.touched.length === 0, "schema alias rejection never wakes the room");
 }
 
 await s.done();

@@ -8,7 +8,7 @@ Generated bundles, reports, and device artifacts belong under ignored `qa-runs/`
 
 `npm run test:regressions` discovers suites under `tests/client`, `tests/server`, and `tests/contracts`, plus the root harness/discovery self-tests. `tests/suites.json` records the one suite owned by a separate release-artifact driver. Discovery guards reject unaccounted inert suites and stale exemptions.
 
-`npm run test:ci` then starts a real local Wrangler Worker through the separately accountable `tests/live/run-live.ts` driver and runs every file in that driver's accountability list. The live setup claims the server with an operator recovery key, gives each simulated client a distinct one-use pairing code, and carries only that enrollment's `{host, deviceToken, vaultId, deviceId}` credentials.
+`npm run test:ci` then starts a real local Wrangler Worker through the separately accountable `tests/live/run-live.ts` driver and runs every file in that driver's accountability list. The driver claims once, enrolls a primary device, then exercises a separately enrolled secondary device through its own one-use pairing code, bearer, socket ticket, roster access, and self-leave.
 
 The live suites cover:
 
@@ -20,7 +20,7 @@ The live suites cover:
 - mandatory `ticket` plus `schemaVersion` WebSocket admission;
 - rejection of missing WebSocket credentials.
 
-Wrong-vault and revoked credential rejection are covered by the regression/server suites, not by the live Wrangler scenarios. The live suites prove only the local Worker/runtime paths they execute; they are not real mobile, sleep/wake hardware, production Cloudflare routing, or original-reporter validation.
+Wrong-vault rejection remains regression coverage; the live membership scenario covers a secondary credential through enrollment, ticket mint, roster access, and revocation by self-leave. The live suites prove only the local Worker/runtime paths they execute; they are not real mobile, sleep/wake hardware, production Cloudflare routing, or original-reporter validation.
 
 The Obsidian controllers under `qa/controllers/` use raw CDP against the actual QA-enabled product bundle and separately built harness. The product remains a passive black box: only the harness mounts QA APIs, and the controller fails if the runtime or expected globals are absent.
 
@@ -57,6 +57,14 @@ npm run build:qa-product
 npm run build:harness
 npm run qa:prepare --fixture 001-basic-markdown --dest /absolute/path/to/new-qa-vault --preset minimal
 ```
+
+For a two-device run, bootstrap two distinct memberships from the initial claim/operator pairing code:
+
+```sh
+npm run qa:enroll-two -- --host https://sync.example.com --pairing-code <initial-code> --device-a-name Desktop --device-b-name Mobile
+```
+
+The command enrolls device A, uses A to mint a second one-use code, enrolls device B into the same vault, and prints both credential records. Pass each record to a separate `qa:prepare` invocation with the direct enrollment flags. Never copy one device token into both vaults.
 
 The destination must not exist. Preparation never recursively deletes or merges into a path. Checked-in and generated fixtures are deterministic inputs; generated run bundles and reports still belong under ignored `qa-runs/`.
 

@@ -28,6 +28,11 @@ export async function computeFolderKey(seed: string): Promise<string> {
 	return hex.slice(0, FOLDER_KEY_HEX_LENGTH);
 }
 
+/** Receipt identity is local to one installation and one Obsidian folder. */
+export function receiptLocalDeviceId(localInstallationId: string, folderKey: string): string {
+	return `${localInstallationId}:${folderKey}`;
+}
+
 export function vaultIdbName(vaultId: string, folderKey: string): string {
 	return `yaos:${vaultId}:${folderKey}`;
 }

@@ -1,4 +1,4 @@
-import { MarkdownView, Notice, Plugin, TFile } from "obsidian";
+import { MarkdownView, Notice, Platform, Plugin, TFile } from "obsidian";
 import {
 	DEFAULT_SETTINGS,
 	VaultSyncSettingTab,
@@ -17,6 +17,7 @@ import { planCategoryRenameAction } from "./sync/policy/renameAdmissionPolicy";
 import { classifySyncPath } from "./paths/pathCategory";
 import { isCanonicalPathFileIdCollision } from "./paths/pathCollision";
 import { sha256TextHex } from "./utils/sha256";
+import { defaultDeviceName } from "./utils/defaultDeviceName";
 import type { TraceSink } from "./observability/traceSink";
 import type { FlightEventInput, FlightPathEventInput } from "./observability/flightEnvelope";
 import { NoopTraceSink } from "./observability/noopTraceSink";
@@ -397,6 +398,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			updateSettings: (mutator, reason) => this.updateSettings(mutator, reason),
 		});
 		await this.loadSettings();
+		if (!this.settings.deviceName.trim()) {
+			this.settings.deviceName = defaultDeviceName(Platform);
+			await this.persistPluginState();
+		}
 		this.applyRuntimeSettings("load-settings");
 		this.frontmatterGuardCoordinator = new FrontmatterGuardCoordinator({
 			isFrontmatterGuardEnabled: () => this.settings.frontmatterGuardEnabled,
@@ -2146,7 +2151,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				await VaultSync.clearServerReceiptCandidate(
 					membership.host,
 					membership.vaultId,
-					membership.deviceId,
+					await this.ensureFolderKey(),
 				);
 			}
 		} catch (err) {
@@ -2331,13 +2336,12 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			serverUpdateAvailable: false,
 			pluginVersion: this.manifest.version,
 			latestPluginVersion: null,
-			pluginUpdateRecommended: false,
 			updateProvider: "unknown",
+			pluginUpdateRecommended: false,
 			updateRepoUrl: null,
 			updateActionUrl: null,
 			updateBootstrapUrl: null,
 			updateActionLabel: "YAOS settings",
-			legacyServerDetected: false,
 			pluginCompatibilityWarning: null,
 		};
 	}

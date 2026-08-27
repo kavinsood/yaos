@@ -28,10 +28,11 @@ export interface SetupLinkControllerDeps {
 }
 
 interface EnrollmentResponse {
+	host?: unknown;
 	vaultId?: unknown;
 	deviceId?: unknown;
 	deviceToken?: unknown;
-	name?: unknown;
+	deviceName?: unknown;
 	error?: unknown;
 	message?: unknown;
 }
@@ -120,17 +121,23 @@ export class SetupLinkController {
 		}
 
 		if (
+			typeof enrolled.host !== "string" || !enrolled.host.trim() ||
 			typeof enrolled.vaultId !== "string" || !enrolled.vaultId.trim() ||
 			typeof enrolled.deviceId !== "string" || !enrolled.deviceId.trim() ||
 			typeof enrolled.deviceToken !== "string" || !enrolled.deviceToken.trim() ||
-			typeof enrolled.name !== "string" || !enrolled.name.trim()
+			typeof enrolled.deviceName !== "string" || !enrolled.deviceName.trim()
 		) {
 			new Notice("Server did not return complete enrollment credentials.", 8000);
 			return false;
 		}
-		const enrolledName = enrolled.name;
+		const enrolledHost = enrolled.host.trim().replace(/\/$/, "");
+		if (enrolledHost !== normalizedHost) {
+			new Notice("Server returned enrollment credentials for a different host.", 8000);
+			return false;
+		}
+		const enrolledName = enrolled.deviceName;
 		const nextEnrollment: EnrollmentMembership = {
-			host: normalizedHost,
+			host: enrolledHost,
 			deviceToken: enrolled.deviceToken,
 			vaultId: enrolled.vaultId,
 			deviceId: enrolled.deviceId,

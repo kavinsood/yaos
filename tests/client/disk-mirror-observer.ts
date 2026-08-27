@@ -27,9 +27,8 @@
  *   - Suppression fingerprint behavior
  *   - Debounce timer drain and write queue flush
  *
- * Obsidian dependency: this test uses JITI_ALIAS to redirect "obsidian" to
- * tests/mocks/obsidian.ts. The mock provides normalizePath (identity) and
- * stub classes for MarkdownView/TFile. Tests run under node --import jiti/register.
+ * Obsidian dependency: the regression runner redirects "obsidian" to
+ * tests/mocks/obsidian.ts through its programmatic Jiti bootstrap.
  */
 
 import * as Y from "yjs";

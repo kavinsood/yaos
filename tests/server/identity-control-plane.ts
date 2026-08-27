@@ -5,10 +5,14 @@
 import ServerConfig from "../../server/src/config";
 import { hashSecret, isUsableVaultId, OPERATOR_COOKIE } from "../../server/src/identity";
 import { handleUpdateMetadataRoute, invalidateStoredServerConfigCache } from "../../server/src/routes/auth";
-import { handleVaultDeviceRoute } from "../../server/src/routes/enroll";
+import { handleEnrollRoute, handleVaultDeviceRoute } from "../../server/src/routes/enroll";
 import type { AuthState } from "../../server/src/routes/types";
 import worker from "../../server/src/index";
-import { makeConfigNamespace, makeEnv } from "../mocks/workerEnv.ts";
+import { makeConfigNamespace, makeEnv, makeTrapNamespace } from "../mocks/workerEnv.ts";
+import {
+	getGetServerByNameCallCount,
+	resetGetServerByNameCallCount,
+} from "../mocks/partyserver.ts";
 import { readSource, suite } from "../harness.ts";
 
 const s = suite("identity-control-plane");
@@ -361,7 +365,92 @@ s.section("update-metadata: device bearer 401, operator session 200");
 		},
 		body: JSON.stringify({ updateProvider: "github" }),
 	}), env);
+
 	s.check(workerDevice.status === 401, "worker device bearer is 401");
+	invalidateStoredServerConfigCache();
+}
+
+s.section("public enrollment response is exact and fails closed");
+{
+	const validEnv = makeEnv({
+		YAOS_CONFIG: makeConfigNamespace(async () => new Response(JSON.stringify({
+			vaultId: "vault-enroll",
+			deviceId: "device-enroll",
+			deviceName: "Mac",
+		}), { status: 200, headers: { "Content-Type": "application/json" } })),
+	});
+	const request = () => new Request("https://sync.example/enroll", {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ pairingCode: "pairing-code", deviceName: "Mac" }),
+	});
+	const valid = await handleEnrollRoute(request(), validEnv);
+	const validBody = await valid.json() as Record<string, unknown>;
+	s.check(valid.status === 200, "valid internal enrollment becomes a public success");
+	s.check(
+		JSON.stringify(Object.keys(validBody).sort()) ===
+			JSON.stringify(["deviceId", "deviceName", "deviceToken", "host", "vaultId"]),
+		"public enrollment returns the exact credential contract",
+	);
+	s.check(validBody.host === "https://sync.example" && validBody.deviceName === "Mac", "public enrollment returns canonical host and name");
+
+	const invalidEnv = makeEnv({
+		YAOS_CONFIG: makeConfigNamespace(async () => new Response(JSON.stringify({ ok: true }), { status: 200 })),
+	});
+	const invalid = await handleEnrollRoute(request(), invalidEnv);
+	const invalidBody = await invalid.json() as Record<string, unknown>;
+	s.check(invalid.status === 502, "malformed internal enrollment fails closed");
+	s.check(!("deviceToken" in invalidBody), "malformed enrollment never releases a device token");
+}
+
+s.section("compact requires both the admin flag and an operator session");
+{
+	invalidateStoredServerConfigCache();
+	const sessionToken = "operator-session-for-compact";
+	const stored = {
+		configFormat: 1,
+		claimed: true,
+		operatorRecoveryHash: CLAIM_AUTH.operatorRecoveryHash,
+		ticketSigningKey: CLAIM_AUTH.ticketSigningKey,
+		updateProvider: null,
+		updateRepoUrl: null,
+		updateRepoBranch: null,
+	};
+	const config = makeConfigNamespace(async (request) => {
+		const pathname = new URL(request.url).pathname;
+		if (pathname === "/__yaos/config") {
+			return new Response(JSON.stringify(stored), { status: 200 });
+		}
+		if (pathname === "/__yaos/verify-session") {
+			return new Response(JSON.stringify({ ok: true }), { status: 200 });
+		}
+		throw new Error(`unexpected config request: ${pathname}`);
+	});
+	const sync = makeTrapNamespace("unexpected direct room namespace access");
+	const env = makeEnv({
+		YAOS_CONFIG: config,
+		YAOS_SYNC: sync,
+		YAOS_ENABLE_ADMIN_ROUTES: "true",
+	});
+	const path = "https://example.test/vault/vault-compact/debug/compact";
+	resetGetServerByNameCallCount();
+	const device = await worker.fetch(new Request(path, {
+		method: "POST",
+		headers: { Authorization: "Bearer device-token" },
+	}), env);
+	s.check(device.status === 401, "device bearer cannot compact");
+	s.check(getGetServerByNameCallCount() === 0, "device rejection does not reach the room");
+	let operatorReachedRoom = false;
+	try {
+		await worker.fetch(new Request(path, {
+			method: "POST",
+			headers: { Cookie: `${OPERATOR_COOKIE}=${sessionToken}` },
+		}), env);
+	} catch (error) {
+		operatorReachedRoom = error instanceof Error && error.message.includes("getServerByName");
+	}
+	s.check(operatorReachedRoom, "operator session passes both gates and reaches the room");
+	s.check(getGetServerByNameCallCount() === 1, "authorized compact performs one room lookup");
 	invalidateStoredServerConfigCache();
 }
 

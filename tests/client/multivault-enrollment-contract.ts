@@ -168,10 +168,11 @@ s.test("fully unenrolled folder can enroll without replacement confirmation", as
 			return {
 				status: 200,
 				json: {
+					host: "https://destination.example",
 					vaultId: "new-vault",
 					deviceId: "new-device",
 					deviceToken: "new-token",
-					name: "Server device name",
+					deviceName: "Server device name",
 				},
 			};
 		},
@@ -263,10 +264,11 @@ s.test("failed retirement preserves the current enrollment", async () => {
 		async () => ({
 			status: 200,
 			json: {
+				host: "https://new.example",
 				vaultId: "new-vault",
 				deviceId: "new-device",
 				deviceToken: "new-token",
-				name: "New device",
+				deviceName: "New device",
 			},
 		}),
 		{ currentEnrollment: true, retirementFails: true },
@@ -307,10 +309,11 @@ s.test("successful replacement retires the captured old membership before persis
 			return {
 				status: 200,
 				json: {
+					host: "https://new.example",
 					vaultId: "new-vault",
 					deviceId: "new-device",
 					deviceToken: "new-token",
-					name: "Replacement device",
+					deviceName: "Replacement device",
 				},
 			};
 		},

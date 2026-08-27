@@ -20,9 +20,8 @@
  * Provider-origin edge case section tests isLocalOrigin() directly with
  * all relevant origin types including provider, persistence, and null.
  *
- * Run with: npx tsx tests/client/meta-diskmirror-integration.ts
- * Requires JITI_ALIAS=obsidian:tests/mocks/obsidian.ts
- * or the node import flag used by other disk-mirror tests.
+ * Run with: node tests/run-suites.mjs --only meta-diskmirror-integration
+ * The runner supplies the Obsidian runtime mock.
  */
 
 import * as Y from "yjs";

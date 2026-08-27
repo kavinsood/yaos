@@ -314,26 +314,32 @@ async function resolveEnrollment(
 		throw new PrepareVaultError(`Enrollment failed with HTTP ${response.status}${reason}`);
 	}
 	if (!isEnrollmentResponse(body)) {
-		throw new PrepareVaultError("Enrollment response must contain exactly deviceToken, vaultId, deviceId, and name.");
+		throw new PrepareVaultError(
+			"Enrollment response must contain exactly host, deviceToken, vaultId, deviceId, and deviceName.",
+		);
+	}
+	if (normalizeServerHost(body.host) !== host) {
+		throw new PrepareVaultError("Enrollment response host does not match the requested server.");
 	}
 	return {
-		host,
+		host: normalizeServerHost(body.host),
 		deviceToken: body.deviceToken,
 		vaultId: body.vaultId,
 		deviceId: body.deviceId,
-		deviceName: body.name,
+		deviceName: body.deviceName,
 	};
 }
 
 function isEnrollmentResponse(value: unknown): value is {
+	host: string;
 	deviceToken: string;
 	vaultId: string;
 	deviceId: string;
-	name: string;
+	deviceName: string;
 } {
 	if (!isRecord(value)) return false;
 	const keys = Object.keys(value).sort();
-	const expected = ["deviceId", "deviceToken", "name", "vaultId"];
+	const expected = ["deviceId", "deviceName", "deviceToken", "host", "vaultId"];
 	return keys.length === expected.length
 		&& keys.every((key, index) => key === expected[index])
 		&& expected.every(key => typeof value[key] === "string" && (value[key] as string).trim().length > 0);
