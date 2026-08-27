@@ -1,9 +1,19 @@
 import type { StoredServerConfig } from "../config";
-import type { VaultSyncServer } from "../server";
+import type { RecoveryJobNamespacePort } from "../recoveryExecutor";
+export interface VaultRuntimeStubPort {
+	fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response>;
+}
+
+export interface VaultSyncNamespacePort {
+	idFromName(name: string): DurableObjectId;
+	get(id: DurableObjectId): VaultRuntimeStubPort;
+}
+
 
 export interface Env {
-	YAOS_SYNC: DurableObjectNamespace<VaultSyncServer>;
+	YAOS_SYNC: VaultSyncNamespacePort;
 	YAOS_CONFIG: DurableObjectNamespace;
+	YAOS_RECOVERY_JOBS?: RecoveryJobNamespacePort;
 	YAOS_BUCKET?: R2Bucket;
 	YAOS_TICKET_TTL_MS?: string;
 	YAOS_ENABLE_ADMIN_ROUTES?: string;

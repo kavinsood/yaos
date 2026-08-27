@@ -81,6 +81,17 @@ export function base64UrlToBytes(str: string): Uint8Array {
 	return out;
 }
 
+/** Strict standard-base64 decoder for HTTP JSON fields. */
+export function base64ToBytes(value: string): Uint8Array {
+	if (value.length === 0 || value.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(value)) {
+		throw new Error("invalid base64");
+	}
+	const padding = value.endsWith("==") ? 2 : value.endsWith("=") ? 1 : 0;
+	const unpadded = value.slice(0, value.length - padding);
+	if (unpadded.includes("=")) throw new Error("invalid base64 padding");
+	return base64UrlToBytes(unpadded.replaceAll("+", "-").replaceAll("/", "_"));
+}
+
 export function randomBase64Url(byteLength: number): string {
 	const bytes = new Uint8Array(byteLength);
 	crypto.getRandomValues(bytes);
