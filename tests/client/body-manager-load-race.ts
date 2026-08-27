@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert";
 import * as Y from "yjs";
-import { BodyManager } from "../../src/sync/bodyManager";
+import { BodyManager, DEFAULT_BODY_ESTIMATED_COST_BUDGET } from "../../src/sync/bodyManager";
 import type { StoredDocument } from "../../src/sync/vaultIndexedDb";
 import { suite } from "../harness.ts";
 
@@ -73,6 +73,7 @@ s.test("pin, dirty, unsettled, clean eviction, and body-local cost hooks remain 
 			pendingLocalUpdates: 1,
 			pinned: 1,
 			estimatedCost: body.estimatedCost,
+			estimatedCostLimit: DEFAULT_BODY_ESTIMATED_COST_BUDGET,
 		},
 	);
 
@@ -105,6 +106,87 @@ s.test("least-recently-used eviction skips dirty and pinned bodies", async () =>
 	assert.deepEqual(await manager.evictLeastRecentlyUsed(0), []);
 	manager.unpin("old-dirty");
 	assert.deepEqual(await manager.evictLeastRecentlyUsed(0), ["old-dirty"]);
+	await manager.destroy();
+});
+
+s.test("aggregate load admission evicts mixed-size bodies in least-recently-used order", async () => {
+	let now = 0;
+	const stored = new Map<string, StoredDocument>();
+	for (const bodyId of ["old-large", "new-small", "incoming"]) {
+		stored.set(bodyId, {
+			documentId: bodyId,
+			generation: 1,
+			encodedState: encoded(bodyId),
+			dirty: false,
+			pendingLocalUpdates: 0,
+			updatedAt: 1,
+		});
+	}
+	const costs: Record<string, number> = { "old-large": 7, "new-small": 3, incoming: 7 };
+	const manager = new BodyManager({
+		getDocument: async (bodyId) => stored.get(bodyId) ?? null,
+		putDocument: async (document) => { stored.set(document.documentId, document); },
+	}, () => ++now, {
+		measure: ({ bodyId }) => costs[bodyId]!,
+	}, { estimatedCost: 10 });
+	await manager.load("old-large");
+	await manager.load("new-small");
+	await manager.load("incoming");
+	assert.equal(manager.get("old-large"), null);
+	assert.ok(manager.get("new-small"));
+	assert.ok(manager.get("incoming"));
+	assert.deepEqual(manager.stats(), {
+		loaded: 2,
+		dirty: 0,
+		unsettled: 0,
+		pendingLocalUpdates: 0,
+		pinned: 0,
+		estimatedCost: 10,
+		estimatedCostLimit: 10,
+	});
+	await manager.destroy();
+});
+
+s.test("dirty and pinned bodies make aggregate replacement admission refuse safely", async () => {
+	const costs: Record<string, number> = { dirty: 3, pinned: 3, incoming: 1 };
+	const manager = new BodyManager({
+		getDocument: async () => null,
+		putDocument: async () => {},
+	}, Date.now, {
+		measure: ({ bodyId }) => costs[bodyId]!,
+	}, { estimatedCost: 6 });
+	await manager.replaceFromServer("dirty", new Uint8Array(encoded("dirty")), 1);
+	await manager.markLocalUpdate("dirty");
+	await manager.replaceFromServer("pinned", new Uint8Array(encoded("pinned")), 1);
+	manager.pin("pinned");
+	await assert.rejects(
+		manager.replaceFromServer("incoming", new Uint8Array(encoded("incoming")), 1),
+		/body_estimated_cost_budget/,
+	);
+	assert.ok(manager.get("dirty"));
+	assert.ok(manager.get("pinned"));
+	assert.equal(manager.get("incoming"), null);
+	assert.equal(manager.stats().estimatedCost, 6);
+	manager.unpin("pinned");
+	await manager.destroy();
+});
+
+s.test("a single over-budget body is rejected before persistence or retention", async () => {
+	const writes: StoredDocument[] = [];
+	const manager = new BodyManager({
+		getDocument: async () => null,
+		putDocument: async (document) => { writes.push(document); },
+	}, Date.now, {
+		measure: () => 11,
+	}, { estimatedCost: 10 });
+	await assert.rejects(
+		manager.replaceFromServer("oversized", new Uint8Array(encoded("oversized")), 1),
+		/body_estimated_cost_budget/,
+	);
+	assert.equal(writes.length, 0);
+	assert.equal(manager.get("oversized"), null);
+	assert.equal(manager.stats().estimatedCost, 0);
+	assert.equal(manager.stats().estimatedCostLimit, 10);
 	await manager.destroy();
 });
 

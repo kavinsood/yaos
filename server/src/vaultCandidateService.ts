@@ -2,7 +2,7 @@ import * as Y from "yjs";
 import { MAX_CANDIDATE_BYTES, type DurableReceipt } from "./contracts";
 import { sha256Hex } from "./hex";
 import { BoundedBodyError, readBoundedBytes } from "./readBoundedBytes";
-import type { CatalogMutation, VaultStore } from "./vaultStore";
+import type { CatalogMutation, ReconstructedDocument, VaultStore } from "./vaultStore";
 import type { VaultDocumentCache } from "./vaultDocumentCache";
 import type { VaultLifecycleService } from "./vaultLifecycleService";
 import type { VaultSocketService } from "./vaultSocketService";
@@ -98,9 +98,14 @@ export class VaultCandidateService {
 		metadata: { contentHash: string; size: number };
 		catalog?: CatalogMutation;
 	}> {
-		const reconstructed = this.options.store.reconstructDocument(bodyId);
-		const release = this.options.cache.recordTransient(bodyId, update.byteLength);
+		const head = this.options.store.documentHead(bodyId);
+		const historyBytes = head
+			? this.options.store.documentEncodedHistoryBytes(bodyId, head.latestSequence)
+			: 0;
+		const release = this.options.cache.recordTransient(bodyId, historyBytes + update.byteLength);
+		let reconstructed: ReconstructedDocument | null = null;
 		try {
+			reconstructed = this.options.store.reconstructDocument(bodyId);
 			Y.applyUpdate(reconstructed.doc, update, "candidate-metadata");
 			const bytes = new TextEncoder().encode(Y.Text.prototype.toString.call(reconstructed.doc.getText("body")));
 			const metadata = { contentHash: await sha256Hex(bytes), size: bytes.byteLength };
@@ -113,7 +118,7 @@ export class VaultCandidateService {
 			};
 		} finally {
 			release();
-			reconstructed.doc.destroy();
+			reconstructed?.doc.destroy();
 		}
 	}
 

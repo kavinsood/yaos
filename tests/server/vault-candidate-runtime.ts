@@ -39,6 +39,7 @@ class CandidateStore {
 		return { doc: new Y.Doc({ guid: BODY_ID }), generation: 1 };
 	}
 	documentHead() { return { generation: 1, latestSequence: 1 }; }
+	documentEncodedHistoryBytes(): number { return 1; }
 	commitCandidate(input: { bodyId: string; clientId: string; candidateId: string; candidateDigest: string; vaultGeneration: string; runtimeEpoch: string }): Receipt {
 		this.commits++;
 		const receipt = { ...input, durableGeneration: 2 };

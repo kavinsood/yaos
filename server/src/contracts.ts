@@ -14,6 +14,8 @@ export const MAX_JSON_BYTES = 1024 * 1024;
 export const MAX_BODY_SOCKETS = 32;
 export const MAX_ROOT_SOCKETS = 32;
 export const MAX_AWARENESS_BYTES = 64 * 1024;
+export const MAX_LOADED_BODY_ESTIMATED_BYTES = 48 * 1024 * 1024;
+export const MAX_TRANSIENT_PENDING_BYTES = 16 * 1024 * 1024;
 
 export interface DurableReceipt {
 	vaultId: string;

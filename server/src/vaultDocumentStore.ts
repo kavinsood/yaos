@@ -809,11 +809,19 @@ export abstract class VaultDocumentStore {
 			throughSequence,
 		).toArray()[0];
 		const checkpointSequence = checkpoint?.checkpoint_sequence ?? 0;
-		let bytes = checkpoint ? decodeSqlChunks(this.storage.sql.exec<{ data: string }>(
-			"SELECT data FROM vault_checkpoints WHERE document_id = ? AND checkpoint_sequence = ? ORDER BY chunk_index",
-			documentId,
-			checkpointSequence,
-		)).byteLength : 0;
+		let bytes = 0;
+		if (checkpoint) {
+			for (const row of this.storage.sql.exec<{ data: string }>(
+				"SELECT data FROM vault_checkpoints WHERE document_id = ? AND checkpoint_sequence = ? ORDER BY chunk_index",
+				documentId,
+				checkpointSequence,
+			)) {
+				const completeQuartets = Math.floor(row.data.length / 4);
+				const remainder = row.data.length % 4;
+				if (remainder === 1) throw new Error("invalid checkpoint chunk length");
+				bytes += completeQuartets * 3 + (remainder === 2 ? 1 : remainder === 3 ? 2 : 0);
+			}
+		}
 		bytes += this.storage.sql.exec<{ bytes: number }>(
 			`SELECT COALESCE(SUM(update_byte_length), 0) AS bytes FROM vault_journal
 			 WHERE document_id = ? AND sequence > ? AND sequence <= ?`,

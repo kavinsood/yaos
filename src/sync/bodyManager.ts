@@ -1,5 +1,7 @@
 import * as Y from "yjs";
 import type { StoredDocument } from "./vaultIndexedDb";
+export const DEFAULT_BODY_ESTIMATED_COST_BUDGET = 48 * 1024 * 1024;
+
 export interface DocumentStore {
 	getDocument(documentId: string): Promise<StoredDocument | null>;
 	putDocument(document: StoredDocument): Promise<void>;
@@ -18,10 +20,17 @@ export interface BodyCostChange {
 }
 
 export interface BodyCostAccountingHooks {
-	/** Returns one body-local cost unit; aggregate policy is owned by the runtime. */
 	measure?: (input: BodyCostInput) => number;
 	onChange?: (change: BodyCostChange) => void;
 }
+
+export interface BodyManagerLimits {
+	estimatedCost: number;
+}
+
+const DEFAULT_BODY_MANAGER_LIMITS: BodyManagerLimits = {
+	estimatedCost: DEFAULT_BODY_ESTIMATED_COST_BUDGET,
+};
 
 export interface LoadedBody {
 	bodyId: string;
@@ -39,12 +48,18 @@ export interface LoadedBody {
 export class BodyManager {
 	private readonly loaded = new Map<string, LoadedBody>();
 	private readonly loading = new Map<string, Promise<LoadedBody>>();
+	private admissionTail: Promise<void> = Promise.resolve();
 
 	constructor(
 		private readonly database: DocumentStore,
 		private readonly now: () => number = Date.now,
 		private readonly costHooks: BodyCostAccountingHooks = {},
-	) {}
+		private readonly limits: BodyManagerLimits = DEFAULT_BODY_MANAGER_LIMITS,
+	) {
+		if (!Number.isSafeInteger(limits.estimatedCost) || limits.estimatedCost < 0) {
+			throw new Error("body estimated-cost limit must be a non-negative safe integer");
+		}
+	}
 
 	async load(bodyId: string): Promise<LoadedBody> {
 		const existing = this.loaded.get(bodyId);
@@ -127,42 +142,79 @@ export class BodyManager {
 		generation: number,
 	): Promise<LoadedBody> {
 		const body = await this.load(bodyId);
-		if (encodedState.byteLength > 0) {
-			Y.applyUpdate(body.doc, encodedState, "server-catch-up");
-		}
-		body.generation = Math.max(body.generation, generation);
-		body.lastUsedAt = this.now();
-		await this.persist(body);
-		return body;
+		return this.withAdmission(async () => {
+			const current = this.loaded.get(bodyId);
+			if (!current || current !== body) throw new Error(`body ${bodyId} changed while merging server state`);
+			const candidate = new Y.Doc({ guid: bodyId });
+			try {
+				Y.applyUpdate(candidate, Y.encodeStateAsUpdate(body.doc), "budget-baseline");
+				if (encodedState.byteLength > 0) Y.applyUpdate(candidate, encodedState, "server-catch-up");
+				const candidateState = Y.encodeStateAsUpdate(candidate);
+				const nextCost = this.measureCost(bodyId, candidate, candidateState.byteLength);
+				if (!await this.ensureEstimatedCostCapacity(bodyId, nextCost)) {
+					throw new Error("body_estimated_cost_budget");
+				}
+				if (encodedState.byteLength > 0) Y.applyUpdate(body.doc, encodedState, "server-catch-up");
+				body.generation = Math.max(body.generation, generation);
+				body.lastUsedAt = this.now();
+				await this.persist(body);
+				return body;
+			} finally {
+				candidate.destroy();
+			}
+		});
 	}
 
 	async replaceFromServer(bodyId: string, encodedState: Uint8Array, generation: number): Promise<LoadedBody> {
-		const prior = this.loaded.get(bodyId);
-		if (
-			prior?.dirty
-			|| (prior?.unsettled ?? 0) > 0
-			|| (prior?.pendingLocalUpdates ?? 0) > 0
-			|| (prior?.pins ?? 0) > 0
-		) {
-			throw new Error(`cannot replace dirty, unsettled, pending, or pinned body ${bodyId}`);
-		}
-		prior?.doc.destroy();
-		const doc = new Y.Doc({ guid: bodyId });
-		if (encodedState.byteLength > 0) Y.applyUpdate(doc, encodedState, "server-bootstrap");
-		const body: LoadedBody = {
-			bodyId,
-			doc,
-			generation,
-			dirty: false,
-			unsettled: 0,
-			pendingLocalUpdates: 0,
-			pins: prior?.pins ?? 0,
-			lastUsedAt: this.now(),
-			estimatedCost: 0,
-		};
-		this.loaded.set(bodyId, body);
-		await this.persist(body);
-		return body;
+		return this.withAdmission(async () => {
+			const prior = this.loaded.get(bodyId);
+			if (
+				prior?.dirty
+				|| (prior?.unsettled ?? 0) > 0
+				|| (prior?.pendingLocalUpdates ?? 0) > 0
+				|| (prior?.pins ?? 0) > 0
+			) {
+				throw new Error(`cannot replace dirty, unsettled, pending, or pinned body ${bodyId}`);
+			}
+			const doc = new Y.Doc({ guid: bodyId });
+			try {
+				if (encodedState.byteLength > 0) Y.applyUpdate(doc, encodedState, "server-bootstrap");
+				const canonicalState = Y.encodeStateAsUpdate(doc);
+				const nextCost = this.measureCost(bodyId, doc, canonicalState.byteLength);
+				if (!await this.ensureEstimatedCostCapacity(bodyId, nextCost)) {
+					throw new Error("body_estimated_cost_budget");
+				}
+				const body: LoadedBody = {
+					bodyId,
+					doc,
+					generation,
+					dirty: false,
+					unsettled: 0,
+					pendingLocalUpdates: 0,
+					pins: 0,
+					lastUsedAt: this.now(),
+					estimatedCost: nextCost,
+				};
+				await this.database.putDocument({
+					documentId: bodyId,
+					generation,
+					encodedState: canonicalState.slice().buffer,
+					dirty: false,
+					pendingLocalUpdates: 0,
+					updatedAt: this.now(),
+				});
+				this.loaded.set(bodyId, body);
+				prior?.doc.destroy();
+				const previousCost = prior?.estimatedCost ?? 0;
+				if (previousCost !== nextCost) {
+					this.costHooks.onChange?.({ bodyId, previousCost, currentCost: nextCost });
+				}
+				return body;
+			} catch (error) {
+				doc.destroy();
+				throw error;
+			}
+		});
 	}
 
 	async evict(bodyId: string): Promise<boolean> {
@@ -217,6 +269,7 @@ export class BodyManager {
 		pendingLocalUpdates: number;
 		pinned: number;
 		estimatedCost: number;
+		estimatedCostLimit: number;
 	} {
 		let dirty = 0;
 		let unsettled = 0;
@@ -237,6 +290,7 @@ export class BodyManager {
 			pendingLocalUpdates,
 			pinned,
 			estimatedCost,
+			estimatedCostLimit: this.limits.estimatedCost,
 		};
 	}
 
@@ -250,32 +304,41 @@ export class BodyManager {
 
 	private async loadFresh(bodyId: string): Promise<LoadedBody> {
 		const stored = await this.database.getDocument(bodyId);
-		const winner = this.loaded.get(bodyId);
-		if (winner) {
-			winner.lastUsedAt = this.now();
-			return winner;
-		}
-		const doc = new Y.Doc({ guid: bodyId });
-		if (stored?.encodedState.byteLength) {
-			Y.applyUpdate(doc, new Uint8Array(stored.encodedState), "indexeddb-bootstrap");
-		}
-		const body: LoadedBody = {
-			bodyId,
-			doc,
-			generation: stored?.generation ?? 0,
-			dirty: stored?.dirty ?? false,
-			unsettled: 0,
-			pendingLocalUpdates: stored?.pendingLocalUpdates ?? 0,
-			pins: 0,
-			lastUsedAt: this.now(),
-			estimatedCost: 0,
-		};
-		this.loaded.set(bodyId, body);
-		this.updateCost(
-			body,
-			this.measureCost(bodyId, doc, stored?.encodedState.byteLength ?? 0),
-		);
-		return body;
+		return this.withAdmission(async () => {
+			const winner = this.loaded.get(bodyId);
+			if (winner) {
+				winner.lastUsedAt = this.now();
+				return winner;
+			}
+			const doc = new Y.Doc({ guid: bodyId });
+			try {
+				if (stored?.encodedState.byteLength) {
+					Y.applyUpdate(doc, new Uint8Array(stored.encodedState), "indexeddb-bootstrap");
+				}
+				const body: LoadedBody = {
+					bodyId,
+					doc,
+					generation: stored?.generation ?? 0,
+					dirty: stored?.dirty ?? false,
+					unsettled: 0,
+					pendingLocalUpdates: stored?.pendingLocalUpdates ?? 0,
+					pins: 0,
+					lastUsedAt: this.now(),
+					estimatedCost: 0,
+				};
+				const encodedBytes = Y.encodeStateAsUpdate(doc).byteLength;
+				const nextCost = this.measureCost(bodyId, doc, encodedBytes);
+				if (!await this.ensureEstimatedCostCapacity(bodyId, nextCost)) {
+					throw new Error("body_estimated_cost_budget");
+				}
+				this.loaded.set(bodyId, body);
+				this.updateCost(body, nextCost);
+				return body;
+			} catch (error) {
+				doc.destroy();
+				throw error;
+			}
+		});
 	}
 
 	private async persist(body: LoadedBody): Promise<void> {
@@ -298,6 +361,43 @@ export class BodyManager {
 			throw new Error(`body ${bodyId} cost must be a non-negative finite number`);
 		}
 		return measured;
+	}
+
+	private async ensureEstimatedCostCapacity(bodyId: string, incomingCost: number): Promise<boolean> {
+		if (incomingCost > this.limits.estimatedCost) return false;
+		const replacingCost = this.loaded.get(bodyId)?.estimatedCost ?? 0;
+		const candidates = [...this.loaded.values()]
+			.filter((body) => body.bodyId !== bodyId
+				&& !body.dirty
+				&& body.unsettled === 0
+				&& body.pendingLocalUpdates === 0
+				&& body.pins === 0)
+			.sort((left, right) => left.lastUsedAt - right.lastUsedAt);
+		while (this.estimatedCostTotal() - replacingCost + incomingCost > this.limits.estimatedCost
+			&& candidates.length > 0) {
+			const candidate = candidates.shift()!;
+			await this.persist(candidate);
+			this.removeLoaded(candidate);
+		}
+		return this.estimatedCostTotal() - replacingCost + incomingCost <= this.limits.estimatedCost;
+	}
+
+	private estimatedCostTotal(): number {
+		let total = 0;
+		for (const body of this.loaded.values()) total += body.estimatedCost;
+		return total;
+	}
+
+	private async withAdmission<T>(operation: () => Promise<T>): Promise<T> {
+		const prior = this.admissionTail;
+		let release!: () => void;
+		this.admissionTail = new Promise<void>((resolve) => { release = resolve; });
+		await prior;
+		try {
+			return await operation();
+		} finally {
+			release();
+		}
 	}
 
 	private updateCost(body: LoadedBody, currentCost: number): void {
