@@ -1013,4 +1013,39 @@ s.section("Test 21: processUpload skips preserved-unresolved paths (queue snapsh
 	);
 	s.check(!!skipTrace, "trace emitted for skipped preserved-unresolved upload");
 }
+
+s.section("Test 22: attachment publication failure remains in the upload queue for retry");
+{
+	const { manager, put } = makeHarness();
+	const data = bytes("publication retry");
+	const path = "attachments/publication-retry.bin";
+	put(path, data);
+	const hash = await sha256Hex(data);
+	manager["blobClient"].exists = async () => [hash];
+	let publicationAttempts = 0;
+	manager["attachmentCatalog"].setAttachmentRef = async () => {
+		publicationAttempts++;
+		if (publicationAttempts === 1) throw new Error("publication unavailable");
+	};
+	const item = {
+		path,
+		sizeBytes: data.byteLength,
+		retries: 0,
+		status: "processing" as const,
+		readyAt: 0,
+		needsRerun: false,
+		rerunResets: 0,
+	};
+	manager["uploadQueue"].set(path, item);
+
+	await manager["processUpload"](item);
+	s.check(manager["uploadQueue"].has(path), "publication failure leaves the upload queued");
+	s.check(item.retries === 1, "publication failure consumes one retry attempt");
+
+	item.readyAt = 0;
+	await manager["processUpload"](item);
+	s.check(publicationAttempts === 2, "queued upload retries attachment publication");
+	s.check(!manager["uploadQueue"].has(path), "successful publication clears the upload queue");
+	manager.destroy();
+}
 await s.done();

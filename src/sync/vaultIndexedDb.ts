@@ -48,6 +48,18 @@ export interface StoredLifecycleOperation {
 	lastAttemptAt: number | null;
 }
 
+export type StoredAttachmentPublicationMutation =
+	| { operationId: string; kind: "upsert"; path: string; hash: string; size: number; mime: string }
+	| { operationId: string; kind: "delete"; path: string }
+	| { operationId: string; kind: "rename"; fromPath: string; toPath: string };
+
+export interface StoredAttachmentPublicationOperation {
+	mutation: StoredAttachmentPublicationMutation;
+	createdAt: number;
+	attempts: number;
+	lastAttemptAt: number | null;
+}
+
 export interface StoredBootstrapProgress {
 	bootstrapId: string;
 	highWater: number;
@@ -77,6 +89,7 @@ export interface PendingWorkSummary {
 	dirtyDocuments: number;
 	pendingCandidates: number;
 	lifecycleOperations: number;
+	attachmentOperations: number;
 	outstandingSettlements: number;
 	activeRecoveryOperations: number;
 }
@@ -88,6 +101,7 @@ export class PendingWorkError extends Error {
 			`${summary.dirtyDocuments} dirty documents, ` +
 			`${summary.pendingCandidates} candidates, ` +
 			`${summary.lifecycleOperations} lifecycle operations, ` +
+			`${summary.attachmentOperations} attachment operations, ` +
 			`${summary.outstandingSettlements} unsettled bodies, ` +
 			`${summary.activeRecoveryOperations} active recovery operations`,
 		);
@@ -104,10 +118,11 @@ export function assertResetAllowed(
 }
 
 
-const DATABASE_VERSION = 2;
+const DATABASE_VERSION = 3;
 const DOCUMENTS = "documents";
 const CANDIDATES = "pendingCandidates";
 const LIFECYCLE = "lifecycleOperations";
+const ATTACHMENT_OPERATIONS = "attachmentOperations";
 const OUTSTANDING = "outstanding";
 const BOOTSTRAP = "bootstrapProgress";
 const FEED_CURSOR = "feedCursor";
@@ -168,6 +183,9 @@ export class VaultIndexedDb {
 				}
 				if (event.oldVersion < 2) {
 					db.createObjectStore(RECOVERY_STATE);
+				}
+				if (event.oldVersion < 3) {
+					db.createObjectStore(ATTACHMENT_OPERATIONS, { keyPath: "mutation.operationId" });
 				}
 			};
 			request.onsuccess = () => resolve(request.result);
@@ -335,6 +353,33 @@ export class VaultIndexedDb {
 		await transactionDone(transaction);
 	}
 
+	async putAttachmentOperation(operation: StoredAttachmentPublicationOperation): Promise<void> {
+		const db = await this.database;
+		const transaction = db.transaction(ATTACHMENT_OPERATIONS, "readwrite");
+		transaction.objectStore(ATTACHMENT_OPERATIONS).put(structuredClone(operation));
+		await transactionDone(transaction);
+	}
+
+	async listAttachmentOperations(): Promise<StoredAttachmentPublicationOperation[]> {
+		const db = await this.database;
+		const transaction = db.transaction(ATTACHMENT_OPERATIONS, "readonly");
+		const values = await requestValue(
+			transaction.objectStore(ATTACHMENT_OPERATIONS).getAll(),
+		) as StoredAttachmentPublicationOperation[];
+		await transactionDone(transaction);
+		return values.sort((left, right) =>
+			left.createdAt - right.createdAt
+			|| left.mutation.operationId.localeCompare(right.mutation.operationId)
+		);
+	}
+
+	async deleteAttachmentOperation(operationId: string): Promise<void> {
+		const db = await this.database;
+		const transaction = db.transaction(ATTACHMENT_OPERATIONS, "readwrite");
+		transaction.objectStore(ATTACHMENT_OPERATIONS).delete(operationId);
+		await transactionDone(transaction);
+	}
+
 	async getFeedCursor(): Promise<StoredFeedCursor | null> {
 		const db = await this.database;
 		const transaction = db.transaction(FEED_CURSOR, "readonly");
@@ -482,7 +527,7 @@ export class VaultIndexedDb {
 	async getPendingWorkSummary(): Promise<PendingWorkSummary> {
 		const db = await this.database;
 		const transaction = db.transaction(
-			[DOCUMENTS, CANDIDATES, LIFECYCLE, OUTSTANDING, RECOVERY_STATE],
+			[DOCUMENTS, CANDIDATES, LIFECYCLE, ATTACHMENT_OPERATIONS, OUTSTANDING, RECOVERY_STATE],
 			"readonly",
 		);
 		const summary = await this.readPendingWorkSummary(transaction);
@@ -506,6 +551,7 @@ export class VaultIndexedDb {
 			DOCUMENTS,
 			CANDIDATES,
 			LIFECYCLE,
+			ATTACHMENT_OPERATIONS,
 			OUTSTANDING,
 			BOOTSTRAP,
 			FEED_CURSOR,
@@ -573,14 +619,21 @@ export class VaultIndexedDb {
 	private async readPendingWorkSummary(
 		transaction: IDBTransaction,
 	): Promise<PendingWorkSummary> {
-		const [documents, pendingCandidates, lifecycleOperations, outstandingSettlements, recoveryState] =
-			await Promise.all([
-				requestValue(transaction.objectStore(DOCUMENTS).getAll()) as Promise<StoredDocument[]>,
-				requestValue(transaction.objectStore(CANDIDATES).count()),
-				requestValue(transaction.objectStore(LIFECYCLE).count()),
-				requestValue(transaction.objectStore(OUTSTANDING).count()),
-				requestValue<unknown>(transaction.objectStore(RECOVERY_STATE).get("state")),
-			]);
+		const [
+			documents,
+			pendingCandidates,
+			lifecycleOperations,
+			attachmentOperations,
+			outstandingSettlements,
+			recoveryState,
+		] = await Promise.all([
+			requestValue(transaction.objectStore(DOCUMENTS).getAll()) as Promise<StoredDocument[]>,
+			requestValue(transaction.objectStore(CANDIDATES).count()),
+			requestValue(transaction.objectStore(LIFECYCLE).count()),
+			requestValue(transaction.objectStore(ATTACHMENT_OPERATIONS).count()),
+			requestValue(transaction.objectStore(OUTSTANDING).count()),
+			requestValue<unknown>(transaction.objectStore(RECOVERY_STATE).get("state")),
+		]);
 		const recovery = typeof recoveryState === "object" && recoveryState !== null
 			? recoveryState as { activeCaptureId?: unknown; activeRestore?: unknown }
 			: null;
@@ -588,6 +641,7 @@ export class VaultIndexedDb {
 			dirtyDocuments: documents.reduce((count, document) => count + (document.dirty ? 1 : 0), 0),
 			pendingCandidates,
 			lifecycleOperations,
+			attachmentOperations,
 			outstandingSettlements,
 			activeRecoveryOperations:
 				(typeof recovery?.activeCaptureId === "string" ? 1 : 0)

@@ -18,6 +18,7 @@ const clean: PendingWorkSummary = {
 	dirtyDocuments: 0,
 	pendingCandidates: 0,
 	lifecycleOperations: 0,
+	attachmentOperations: 0,
 	outstandingSettlements: 0,
 	activeRecoveryOperations: 0,
 };

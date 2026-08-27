@@ -3,6 +3,8 @@ import YSyncProvider from "y-partyserver/provider";
 import type { Awareness } from "y-protocols/awareness";
 import { BodyManager, type LoadedBody } from "./bodyManager";
 import type {
+	StoredAttachmentPublicationMutation,
+	StoredAttachmentPublicationOperation,
 	StoredBodyCandidate,
 	StoredBodyReceipt,
 	StoredLifecycleOperation,
@@ -256,10 +258,12 @@ export interface LifecyclePersistencePort {
 	listLifecycleOperations(): Promise<StoredLifecycleOperation[]>;
 	deleteLifecycleOperation(operationId: string): Promise<void>;
 }
-export type AttachmentPublicationMutation =
-	| { operationId: string; kind: "upsert"; path: string; hash: string; size: number; mime: string }
-	| { operationId: string; kind: "delete"; path: string }
-	| { operationId: string; kind: "rename"; fromPath: string; toPath: string };
+export interface AttachmentPersistencePort {
+	putAttachmentOperation(operation: StoredAttachmentPublicationOperation): Promise<void>;
+	listAttachmentOperations(): Promise<StoredAttachmentPublicationOperation[]>;
+	deleteAttachmentOperation(operationId: string): Promise<void>;
+}
+export type AttachmentPublicationMutation = StoredAttachmentPublicationMutation;
 export interface AttachmentPublicationReceipt {
 	operationId: string;
 	vaultGeneration: string;
@@ -309,7 +313,7 @@ export interface DocumentPersistencePort {
 
 export type VaultDatabasePort =
 	DocumentPersistencePort
-	& Partial<CandidatePersistencePort & LifecyclePersistencePort>;
+	& Partial<CandidatePersistencePort & LifecyclePersistencePort & AttachmentPersistencePort>;
 
 export interface VaultSyncOptions {
 	vaultId: string;
@@ -694,6 +698,10 @@ export class VaultSync implements SyncRuntimePort {
 	private readonly candidateTimers = new Map<string, number>();
 	private readonly candidateMaxWaitTimers = new Map<string, number>();
 	private readonly bodyPersistenceWork = new Map<string, Promise<void>>();
+	private readonly attachmentOperations = new Map<string, StoredAttachmentPublicationOperation>();
+	private readonly attachmentOperationDurability = new Map<string, Promise<void>>();
+	private readonly attachmentSubmissions = new Map<string, Promise<void>>();
+	private attachmentPublicationWork: Promise<void> = Promise.resolve();
 	private readonly providerSyncListeners = new Set<(generation: number) => void>();
 	private readonly renameBatch = new Map<string, string>();
 	private renameTimer: number | null = null;
@@ -751,6 +759,7 @@ export class VaultSync implements SyncRuntimePort {
 			|| this.pendingUpdates.size > 0
 			|| this.pendingCandidates.size > 0
 			|| this.bodyPersistenceWork.size > 0
+			|| this.attachmentOperations.size > 0
 			|| bodyStats.dirty > 0
 			|| bodyStats.unsettled > 0
 			|| bodyStats.pendingLocalUpdates > 0
@@ -822,6 +831,7 @@ export class VaultSync implements SyncRuntimePort {
 		}
 		await this.restoreCandidates();
 		await this.retryLifecycleOperations();
+		await this.retryAttachmentOperations();
 		this._localReady = true;
 		if (this.destroyed) throw new Error("runtime closed during initialization");
 		await this.provider.connect();
@@ -942,7 +952,14 @@ export class VaultSync implements SyncRuntimePort {
 
 	getAttachmentRef(path: string): BlobRef | undefined {
 		const ref = this.pathToBlob.get(path);
-		return ref && safeBlobPath(path, [], "", ref) ? ref : undefined;
+		if (!ref || !safeBlobPath(path, [], "", ref)) return undefined;
+		const publicationPending = Array.from(this.attachmentOperations.values()).some((operation) =>
+			operation.mutation.kind === "upsert"
+			&& operation.mutation.path === path
+			&& operation.mutation.hash === ref.hash
+			&& operation.mutation.size === ref.size
+		);
+		return publicationPending ? undefined : ref;
 	}
 
 	isAttachmentTombstoned(path: string): boolean {
@@ -953,28 +970,24 @@ export class VaultSync implements SyncRuntimePort {
 		const ref = { hash, size };
 		const canonical = safeBlobPath(path, [], "", ref);
 		if (!canonical) throw new Error(`Invalid attachment path or reference: ${path}`);
-		const operationId = crypto.randomUUID();
-		const receipt = await this.server.publishAttachment({
-			operationId,
+		await this.commitAttachmentPublication({
+			operationId: crypto.randomUUID(),
 			kind: "upsert",
 			path: canonical,
 			hash,
 			size,
 			mime,
 		});
-		await this.applyAttachmentPublication(operationId, receipt);
 	}
 
 	async deleteAttachmentRef(path: string, _device?: string): Promise<void> {
 		const canonical = safeBlobPath(path);
 		if (!canonical) throw new Error(`Invalid attachment path: ${path}`);
-		const operationId = crypto.randomUUID();
-		const receipt = await this.server.publishAttachment({
-			operationId,
+		await this.commitAttachmentPublication({
+			operationId: crypto.randomUUID(),
 			kind: "delete",
 			path: canonical,
 		});
-		await this.applyAttachmentPublication(operationId, receipt);
 	}
 
 	async renameAttachmentRef(oldPath: string, newPath: string): Promise<void> {
@@ -983,14 +996,128 @@ export class VaultSync implements SyncRuntimePort {
 		const newCanonical = ref ? safeBlobPath(newPath, [], "", ref) : null;
 		if (!oldCanonical || !newCanonical) throw new Error("Invalid attachment rename");
 		if (oldCanonical === newCanonical || !ref) return;
-		const operationId = crypto.randomUUID();
-		const receipt = await this.server.publishAttachment({
-			operationId,
+		await this.commitAttachmentPublication({
+			operationId: crypto.randomUUID(),
 			kind: "rename",
 			fromPath: oldCanonical,
 			toPath: newCanonical,
 		});
-		await this.applyAttachmentPublication(operationId, receipt);
+	}
+
+	private async commitAttachmentPublication(
+		proposed: AttachmentPublicationMutation,
+	): Promise<void> {
+		const save = this.options.database.putAttachmentOperation;
+		if (!save) throw new Error("attachment publication persistence is unavailable");
+		const existing = Array.from(this.attachmentOperations.values()).find((operation) =>
+			this.sameAttachmentMutation(operation.mutation, proposed)
+		);
+		const operation = existing ?? {
+			mutation: proposed,
+			createdAt: this.now(),
+			attempts: 0,
+			lastAttemptAt: null,
+		};
+		if (!existing) {
+			this.attachmentOperations.set(proposed.operationId, operation);
+			const durability = save.call(this.options.database, operation);
+			this.attachmentOperationDurability.set(proposed.operationId, durability);
+			try {
+				await durability;
+			} catch (error) {
+				if (this.attachmentOperations.get(proposed.operationId) === operation) {
+					this.attachmentOperations.delete(proposed.operationId);
+				}
+				throw error;
+			} finally {
+				if (this.attachmentOperationDurability.get(proposed.operationId) === durability) {
+					this.attachmentOperationDurability.delete(proposed.operationId);
+				}
+			}
+		} else {
+			await this.attachmentOperationDurability.get(existing.mutation.operationId);
+		}
+		await this.enqueueAttachmentPublication(operation.mutation.operationId);
+	}
+
+	private enqueueAttachmentPublication(operationId: string): Promise<void> {
+		const existing = this.attachmentSubmissions.get(operationId);
+		if (existing) return existing;
+		const submission = this.attachmentPublicationWork.then(async () => {
+			const operation = this.attachmentOperations.get(operationId);
+			if (!operation) return;
+			await this.publishStoredAttachmentOperation(operation);
+		});
+		this.attachmentPublicationWork = submission.catch(() => undefined);
+		this.attachmentSubmissions.set(operationId, submission);
+		void submission.finally(() => {
+			if (this.attachmentSubmissions.get(operationId) === submission) {
+				this.attachmentSubmissions.delete(operationId);
+			}
+		}).catch(() => undefined);
+		return submission;
+	}
+
+	private async publishStoredAttachmentOperation(
+		operation: StoredAttachmentPublicationOperation,
+	): Promise<void> {
+		const save = this.options.database.putAttachmentOperation;
+		const remove = this.options.database.deleteAttachmentOperation;
+		if (!save || !remove) throw new Error("attachment publication persistence is unavailable");
+		const attempted = {
+			...operation,
+			attempts: operation.attempts + 1,
+			lastAttemptAt: this.now(),
+		};
+		await save.call(this.options.database, attempted);
+		this.attachmentOperations.set(attempted.mutation.operationId, attempted);
+		const receipt = await this.server.publishAttachment(attempted.mutation);
+		await this.applyAttachmentPublication(attempted.mutation.operationId, receipt);
+		await remove.call(this.options.database, attempted.mutation.operationId);
+		this.attachmentOperations.delete(attempted.mutation.operationId);
+	}
+
+	private async retryAttachmentOperations(): Promise<void> {
+		const load = this.options.database.listAttachmentOperations;
+		if (!load) throw new Error("attachment publication persistence is unavailable");
+		const operations = (await load.call(this.options.database)).sort((left, right) =>
+			left.createdAt - right.createdAt
+			|| left.mutation.operationId.localeCompare(right.mutation.operationId)
+		);
+		for (const operation of operations) {
+			this.attachmentOperations.set(operation.mutation.operationId, operation);
+		}
+		for (const operation of operations) {
+			try {
+				await this.enqueueAttachmentPublication(operation.mutation.operationId);
+			} catch (error) {
+				this.log(
+					`attachment publication remains pending for ${operation.mutation.operationId}: ${String(error)}`,
+				);
+				break;
+			}
+		}
+	}
+
+	private sameAttachmentMutation(
+		left: AttachmentPublicationMutation,
+		right: AttachmentPublicationMutation,
+	): boolean {
+		if (left.kind !== right.kind) return false;
+		switch (left.kind) {
+			case "upsert":
+				return right.kind === "upsert"
+					&& left.path === right.path
+					&& left.hash === right.hash
+					&& left.size === right.size
+					&& left.mime === right.mime;
+			case "delete":
+				return right.kind === "delete" && left.path === right.path;
+			case "rename":
+				return right.kind === "rename"
+					&& left.fromPath === right.fromPath
+					&& left.toPath === right.toPath;
+		}
 	}
 
 	private async applyAttachmentPublication(
@@ -1611,6 +1738,7 @@ export class VaultSync implements SyncRuntimePort {
 			await session.provider.connect();
 		}
 		await this.retryPendingCandidates();
+		await this.retryAttachmentOperations();
 	}
 
 	async destroy(): Promise<void> {
@@ -1629,6 +1757,7 @@ export class VaultSync implements SyncRuntimePort {
 		for (const bodyId of Array.from(this.pendingUpdates.keys())) {
 			await this.flushBodyCandidate(bodyId).catch(() => undefined);
 		}
+		await this.attachmentPublicationWork;
 		for (const session of this.sessions.values()) {
 			session.doc.off("update", session.updateObserver);
 			this.terminateProvider(session.provider);
@@ -1649,6 +1778,9 @@ export class VaultSync implements SyncRuntimePort {
 			if (status === "connected") {
 				this._connectionGeneration++;
 				void this.retryPendingCandidates();
+				void this.retryAttachmentOperations().catch((error) => {
+					this.log(`attachment publication replay failed: ${String(error)}`);
+				});
 			} else if (status === "disconnected" && !this.fatalAuthError) {
 				void this.refreshProviderTickets(true);
 			}
