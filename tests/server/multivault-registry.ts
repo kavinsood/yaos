@@ -141,9 +141,10 @@ s.section("enroll uniquifies names on one vault");
 		purpose: "device",
 	}));
 	const first = await config.fetch(jsonRequest("/__yaos/enroll", {
+		enrollmentRequestId: "request-vault-one-aa",
 		pairingCodeHash: "a".repeat(64),
 		deviceId: "dev-1",
-		deviceTokenHash: "t1".repeat(32),
+		deviceTokenHash: "1".repeat(64),
 		deviceName: "Mac",
 	}));
 	const firstBody = await first.json() as { deviceName?: string };
@@ -151,9 +152,10 @@ s.section("enroll uniquifies names on one vault");
 	s.check(firstBody.deviceName === "Mac", "first enroll keeps Mac");
 
 	const second = await config.fetch(jsonRequest("/__yaos/enroll", {
+		enrollmentRequestId: "request-vault-two-aa",
 		pairingCodeHash: "b".repeat(64),
 		deviceId: "dev-2",
-		deviceTokenHash: "t2".repeat(32),
+		deviceTokenHash: "2".repeat(64),
 		deviceName: "Mac",
 	}));
 	const secondBody = await second.json() as { deviceName?: string };
@@ -174,9 +176,10 @@ s.section("destroy revokes first, persists bounded retry state, and completes on
 	}));
 	s.check((await activateClaim(config, claimed, "c".repeat(64))).status === 200, "destroy target activates before enrollment");
 	await config.fetch(jsonRequest("/__yaos/enroll", {
+		enrollmentRequestId: "request-vault-gone-aa",
 		pairingCodeHash: "c".repeat(64),
 		deviceId: "dev-gone",
-		deviceTokenHash: "tg".repeat(32),
+		deviceTokenHash: "3".repeat(64),
 		deviceName: "Phone",
 	}));
 	const destroyed = await config.fetch(jsonRequest("/__yaos/destroy-vault", { vaultId: "vault-gone-1" }));

@@ -18,7 +18,8 @@ import {
 import { json } from "./http";
 import { provisionReservedVault } from "./provisioning";
 import type { Env } from "./types";
-import { closeVaultDeviceSockets, readVault } from "./vault";
+import { attemptPendingDeviceRevocation, isPendingDeviceRevocation } from "./enroll";
+import { readVault } from "./vault";
 
 async function requireOperator(req: Request, env: Env): Promise<Response | null> {
 	return await verifyOperatorSession(env, req)
@@ -91,23 +92,22 @@ export async function handleOperatorRevokeDevice(req: Request, env: Env, deviceI
 	const denied = await requireOperator(req, env);
 	if (denied) return denied;
 	const state = await readConsoleState(env);
-	const target = state?.devices.find((device) => device.deviceId === deviceId);
+	if (!state) return json({ error: "config_unavailable" }, 500);
+	const pending = state.pendingDeviceRevocations.find((record) => record.deviceId === deviceId);
+	if (pending) return attemptPendingDeviceRevocation(env, pending);
+	const target = state.devices.find((device) => device.deviceId === deviceId);
 	if (!target) return json({ error: "unknown_device" }, 404);
 	const response = await configFetch(env, "/__yaos/revoke-device", {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
 		body: JSON.stringify({ deviceId }),
 	});
-	if (!response.ok) {
-		const payload = await response.json().catch(() => null) as { error?: string } | null;
-		return json({ error: payload?.error ?? "revoke_failed" }, response.status);
+	const payload = await response.json().catch(() => null) as { error?: string; revocation?: unknown } | null;
+	if (!response.ok) return json({ error: payload?.error ?? "revoke_failed" }, response.status);
+	if (!isPendingDeviceRevocation(payload?.revocation)) {
+		return json({ error: "revoke_response_invalid" }, 502);
 	}
-	try {
-		const closedSockets = await closeVaultDeviceSockets(env, target.vaultId, target.deviceId);
-		return json({ ok: true, membershipRevoked: true, socketsClosed: true, closedSockets });
-	} catch {
-		return json({ ok: false, membershipRevoked: true, socketsClosed: false, closedSockets: 0 }, 202);
-	}
+	return attemptPendingDeviceRevocation(env, payload.revocation);
 }
 
 export async function handleOperatorCreateVault(req: Request, env: Env): Promise<Response> {

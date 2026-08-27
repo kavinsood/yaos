@@ -1,8 +1,12 @@
+import { randomBytes } from "node:crypto";
+
 export interface QaDeviceEnrollment {
 	host: string;
 	deviceToken: string;
 	vaultId: string;
 	deviceId: string;
+	vaultGeneration: string;
+	originImport: boolean;
 	deviceName: string;
 }
 
@@ -32,11 +36,13 @@ function normalizeHost(host: string): string {
 function isEnrollment(value: unknown): value is QaDeviceEnrollment {
 	if (!value || typeof value !== "object") return false;
 	const record = value as Record<string, unknown>;
-	const expected = ["deviceId", "deviceName", "deviceToken", "host", "vaultId"];
+	const expected = ["deviceId", "deviceName", "deviceToken", "host", "originImport", "vaultGeneration", "vaultId"];
+	const stringKeys = ["deviceId", "deviceName", "deviceToken", "host", "vaultGeneration", "vaultId"];
 	const keys = Object.keys(record).sort();
 	return keys.length === expected.length
 		&& keys.every((key, index) => key === expected[index])
-		&& expected.every((key) => typeof record[key] === "string" && record[key].trim().length > 0);
+		&& stringKeys.every((key) => typeof record[key] === "string" && record[key].trim().length > 0)
+		&& typeof record.originImport === "boolean";
 }
 
 async function enrollDevice(
@@ -45,10 +51,13 @@ async function enrollDevice(
 	deviceName: string,
 	fetchImpl: typeof fetch,
 ): Promise<QaDeviceEnrollment> {
+	const enrollmentRequestId = randomBytes(16).toString("base64url");
+	const deviceId = randomBytes(16).toString("base64url");
+	const deviceToken = randomBytes(32).toString("base64url");
 	const response = await fetchImpl(`${host}/enroll`, {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify({ pairingCode, deviceName }),
+		body: JSON.stringify({ pairingCode, enrollmentRequestId, deviceId, deviceToken, deviceName }),
 	});
 	const body: unknown = await response.json().catch(() => null);
 	if (!response.ok || !isEnrollment(body)) {

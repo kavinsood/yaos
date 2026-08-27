@@ -797,6 +797,16 @@ export function renderOperatorConsole(options: OperatorPageOptions): string {
           && typeof pending.vaultId === "string"
           && typeof pending.roomComplete === "boolean"
           && typeof pending.r2Complete === "boolean"
+          && (pending.lastError === null || typeof pending.lastError === "string"))
+        && Array.isArray(data.pendingDeviceRevocations)
+        && data.pendingDeviceRevocations.every((pending) =>
+          pending !== null
+          && typeof pending === "object"
+          && !Array.isArray(pending)
+          && typeof pending.vaultId === "string"
+          && typeof pending.vaultGeneration === "string"
+          && typeof pending.deviceId === "string"
+          && typeof pending.requestedAt === "number"
           && (pending.lastError === null || typeof pending.lastError === "string"));
     }
     function showDestroyStatus(responseStatus) {
@@ -986,6 +996,41 @@ export function renderOperatorConsole(options: OperatorPageOptions): string {
 
         rendered.appendChild(card);
       }
+      for (const pending of data.pendingDeviceRevocations || []) {
+        const card = document.createElement("div");
+        card.className = "card";
+
+        const heading = document.createElement("h2");
+        heading.textContent = "Device revocation pending";
+        card.appendChild(heading);
+
+        const identity = document.createElement("p");
+        identity.appendChild(document.createTextNode("Device "));
+        const deviceCode = document.createElement("code");
+        deviceCode.textContent = pending.deviceId;
+        identity.appendChild(deviceCode);
+        identity.appendChild(document.createTextNode(" · vault "));
+        const vaultCode = document.createElement("code");
+        vaultCode.textContent = pending.vaultId;
+        identity.appendChild(vaultCode);
+        card.appendChild(identity);
+
+        const requested = document.createElement("p");
+        requested.textContent = "Membership removed · runtime fence requested " +
+          (formatWhen(pending.requestedAt) || "unknown");
+        card.appendChild(requested);
+        if (pending.lastError) {
+          const lastError = document.createElement("p");
+          lastError.className = "err";
+          lastError.textContent = pending.lastError;
+          card.appendChild(lastError);
+        }
+        const retryBtn = document.createElement("button");
+        retryBtn.textContent = "Retry device fence";
+        retryBtn.dataset.retryRevocation = pending.deviceId;
+        card.appendChild(retryBtn);
+        rendered.appendChild(card);
+      }
       for (const pending of data.pendingDestroys || []) {
         const card = document.createElement("div");
         card.className = "card";
@@ -1082,6 +1127,15 @@ export function renderOperatorConsole(options: OperatorPageOptions): string {
       const retryDestroy = target.getAttribute("data-retry-destroy");
       const retryProvision = target.getAttribute("data-retry-provision");
       const revoke = target.getAttribute("data-revoke");
+      const retryRevocation = target.getAttribute("data-retry-revocation");
+      if (retryRevocation) {
+        const res = await fetch("/operator/devices/" + encodeURIComponent(retryRevocation), { method: "DELETE" });
+        status.textContent = res.status === 202
+          ? "Membership is removed, but the vault runtime fence is still pending."
+          : res.ok ? "" : "Could not retry the device runtime fence.";
+        await load(true);
+        return;
+      }
       if (retryProvision) {
         const res = await fetch("/operator/vaults/" + encodeURIComponent(retryProvision) + "/provision", { method: "POST" });
         if (!res.ok) { status.textContent = "Could not provision vault."; return; }
@@ -1094,8 +1148,11 @@ export function renderOperatorConsole(options: OperatorPageOptions): string {
         return;
       }
       if (kick) {
-        await fetch("/operator/devices/" + encodeURIComponent(kick), { method: "DELETE" });
-        await load();
+        const res = await fetch("/operator/devices/" + encodeURIComponent(kick), { method: "DELETE" });
+        status.textContent = res.status === 202
+          ? "Membership is removed, but the vault runtime fence is pending."
+          : res.ok ? "" : "Could not revoke device membership.";
+        await load(true);
         return;
       }
       if (rename) {

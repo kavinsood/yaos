@@ -158,16 +158,20 @@ s.test("enrolls through the real server contract and persists the returned ident
 	const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
 		requestUrl = String(input);
 		requestInit = init;
+		const submitted = JSON.parse(String(init?.body)) as {
+			deviceId: string;
+			deviceToken: string;
+			deviceName: string;
+		};
 		return new Response(JSON.stringify({
 			host: "https://sync.example",
-			deviceToken: "issued-device-secret",
+			deviceToken: submitted.deviceToken,
 			vaultId: "server-vault",
-			deviceId: "server-device",
-			deviceName: "QA Device",
-		}), {
-			status: 200,
-			headers: { "Content-Type": "application/json" },
-		});
+			vaultGeneration: "server-generation",
+			deviceId: submitted.deviceId,
+			deviceName: submitted.deviceName,
+			originImport: true,
+		}), { status: 200, headers: { "Content-Type": "application/json" } });
 	}) as typeof fetch;
 
 	const prepared = await prepareVault({
@@ -183,22 +187,26 @@ s.test("enrolls through the real server contract and persists the returned ident
 
 	assert.equal(requestUrl, "https://sync.example/enroll");
 	assert.equal(requestInit?.method, "POST");
-	assert.deepEqual(JSON.parse(String(requestInit?.body)), {
-		pairingCode: "one-use-code",
-		deviceName: "QA Device",
-	});
+	const enrollmentRequest = JSON.parse(String(requestInit?.body)) as Record<string, unknown>;
+	assert.equal(enrollmentRequest.pairingCode, "one-use-code");
+	assert.equal(enrollmentRequest.deviceName, "QA Device");
+	assert.equal(typeof enrollmentRequest.enrollmentRequestId, "string");
+	assert.equal(typeof enrollmentRequest.deviceId, "string");
+	assert.equal(typeof enrollmentRequest.deviceToken, "string");
 	assert.deepEqual(prepared.enrollment, {
 		status: "enrolled",
 		host: "https://sync.example",
 		vaultId: "server-vault",
-		deviceId: "server-device",
+		deviceId: enrollmentRequest.deviceId,
 		name: "QA Device",
 	});
 	const settings = JSON.parse(await readFile(join(prepared.dest, ".obsidian", "plugins", "yaos", "data.json"), "utf8")) as Record<string, unknown>;
 	assert.equal(settings.host, "https://sync.example");
-	assert.equal(settings.deviceToken, "issued-device-secret");
+	assert.equal(settings.deviceToken, enrollmentRequest.deviceToken);
 	assert.equal(settings.vaultId, "server-vault");
-	assert.equal(settings.deviceId, "server-device");
+	assert.equal(settings.vaultGeneration, "server-generation");
+	assert.equal(settings.deviceId, enrollmentRequest.deviceId);
+	assert.equal(settings.originImportPending, true);
 	assert.equal(settings.deviceName, "QA Device");
 	assert.equal("token" in settings, false);
 });
@@ -229,7 +237,7 @@ s.test("rejects enrollment responses that do not exactly match the credential sc
 				deviceName: "QA Device",
 			},
 		}, paths, fetchImpl),
-		"exactly host, deviceToken, vaultId, deviceId, and deviceName",
+		"Enrollment response must contain exactly",
 	);
 	await assert.rejects(async () => readFile(destination), { code: "ENOENT" });
 });
@@ -264,6 +272,7 @@ s.test("accepts only a complete controlled pre-enrolled identity", async () => {
 		"--host", "https://sync.example",
 		"--device-token", "fixture-device-secret",
 		"--vault-id", "fixture-vault",
+		"--vault-generation", "fixture-generation",
 		"--device-id", "fixture-device",
 		"--device-name", "Fixture Device",
 	]);
@@ -277,6 +286,7 @@ s.test("accepts only a complete controlled pre-enrolled identity", async () => {
 			deviceToken: settings.deviceToken,
 			vaultId: settings.vaultId,
 			deviceId: settings.deviceId,
+			vaultGeneration: settings.vaultGeneration,
 			deviceName: settings.deviceName,
 		},
 		{
@@ -284,6 +294,7 @@ s.test("accepts only a complete controlled pre-enrolled identity", async () => {
 			deviceToken: "fixture-device-secret",
 			vaultId: "fixture-vault",
 			deviceId: "fixture-device",
+			vaultGeneration: "fixture-generation",
 			deviceName: "Fixture Device",
 		},
 	);
@@ -300,14 +311,20 @@ s.test("bootstraps two distinct QA memberships into one vault", async () => {
 			body,
 		});
 		if (request.url.endsWith("/enroll")) {
-			const enrollment = body as { pairingCode?: string; deviceName?: string };
-			const suffix = enrollment.pairingCode === "initial-code" ? "a" : "b";
+			const enrollment = body as {
+				pairingCode?: string;
+				deviceName?: string;
+				deviceId?: string;
+				deviceToken?: string;
+			};
 			return new Response(JSON.stringify({
 				host: "https://sync.example",
-				deviceToken: `token-${suffix}`,
+				deviceToken: enrollment.deviceToken,
 				vaultId: "shared-vault",
-				deviceId: `device-${suffix}`,
+				vaultGeneration: "shared-generation",
+				deviceId: enrollment.deviceId,
 				deviceName: enrollment.deviceName,
+				originImport: enrollment.pairingCode === "initial-code",
 			}), { status: 200, headers: { "Content-Type": "application/json" } });
 		}
 		return new Response(JSON.stringify({ pairingCode: "second-code" }), {
@@ -321,11 +338,11 @@ s.test("bootstraps two distinct QA memberships into one vault", async () => {
 		deviceNameA: "Desktop",
 		deviceNameB: "Mobile",
 	}, fetchImpl);
-	assert.equal(result.deviceA.deviceId, "device-a");
-	assert.equal(result.deviceB.deviceId, "device-b");
+	assert.notEqual(result.deviceA.deviceId, result.deviceB.deviceId);
+	assert.equal(result.deviceA.vaultGeneration, "shared-generation");
 	assert.equal(result.deviceA.vaultId, result.deviceB.vaultId);
 	assert.equal(requests.length, 3);
-	assert.equal(requests[1]?.authorization, "Bearer token-a");
+	assert.equal(requests[1]?.authorization, `Bearer ${result.deviceA.deviceToken}`);
 	assert.deepEqual(requests[1]?.body, { purpose: "device" });
 });
 await s.done();

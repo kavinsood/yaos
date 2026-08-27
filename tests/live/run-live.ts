@@ -101,17 +101,20 @@ interface EnrollmentResponse {
 }
 
 async function enroll(pairingCode: string, deviceName: string, expectedVaultId: string, expectedOrigin: boolean): Promise<LiveIdentity> {
+	const enrollmentRequestId = randomBytes(16).toString("base64url");
+	const deviceId = randomBytes(16).toString("base64url");
+	const deviceToken = randomBytes(32).toString("base64url");
 	const response = await fetch(`${HOST}/enroll`, {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify({ pairingCode, deviceName }),
+		body: JSON.stringify({ pairingCode, enrollmentRequestId, deviceId, deviceToken, deviceName }),
 	});
 	const enrolled = await response.json().catch(() => null) as EnrollmentResponse | null;
 	if (!response.ok
 		|| enrolled?.host !== HOST
 		|| enrolled.vaultId !== expectedVaultId
-		|| typeof enrolled.deviceToken !== "string" || !enrolled.deviceToken
-		|| typeof enrolled.deviceId !== "string" || !enrolled.deviceId
+		|| enrolled.deviceToken !== deviceToken
+		|| enrolled.deviceId !== deviceId
 		|| typeof enrolled.vaultGeneration !== "string" || !enrolled.vaultGeneration
 		|| enrolled.originImport !== expectedOrigin
 		|| enrolled.deviceName !== deviceName) {

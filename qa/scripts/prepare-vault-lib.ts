@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { copyFile, cp, lstat, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -26,8 +27,9 @@ Options:
   --device-name <name> Requested device name for pairing, or the known name of a
                        directly supplied identity.
   --device-token <value>  Supply a controlled pre-enrolled identity. This requires
-  --vault-id <value>      --host, --device-token, --vault-id, --device-id, and
-  --device-id <value>     --device-name together; partial identities are rejected.
+  --vault-id <value>      --host, --device-token, --vault-id, --vault-generation,
+  --vault-generation <value>
+  --device-id <value>     --device-id, and --device-name together.
   --help, -h           Print this help.
 
 Without enrollment options, qa:prepare writes an explicitly unenrolled vault. It
@@ -69,6 +71,7 @@ export type PrepareVaultEnrollment =
 		host: string;
 		deviceToken: string;
 		vaultId: string;
+		vaultGeneration: string;
 		deviceId: string;
 		deviceName: string;
 	};
@@ -132,6 +135,7 @@ export function parsePrepareVaultArgs(args: string[]): ParsedPrepareVaultArgs | 
 		"--device-name": true,
 		"--device-token": true,
 		"--vault-id": true,
+		"--vault-generation": true,
 		"--device-id": true,
 	};
 
@@ -176,7 +180,7 @@ function parseEnrollmentArgs(args: Record<string, string>): PrepareVaultEnrollme
 	if (present.length === 0) return undefined;
 
 	const pairingCode = args["--pairing-code"];
-	const directFields = ["--device-token", "--vault-id", "--device-id"] as const;
+	const directFields = ["--device-token", "--vault-id", "--vault-generation", "--device-id"] as const;
 	const hasDirectField = directFields.some(field => args[field] !== undefined);
 	if (pairingCode && hasDirectField) {
 		throw new PrepareVaultError("--pairing-code cannot be combined with direct pre-enrolled identity options.");
@@ -184,7 +188,7 @@ function parseEnrollmentArgs(args: Record<string, string>): PrepareVaultEnrollme
 
 	const required = pairingCode
 		? ["--host", "--pairing-code", "--device-name"]
-		: ["--host", "--device-token", "--vault-id", "--device-id", "--device-name"];
+		: ["--host", "--device-token", "--vault-id", "--vault-generation", "--device-id", "--device-name"];
 	const missing = required.filter(field => !args[field]?.trim());
 	if (missing.length > 0) {
 		throw new PrepareVaultError(`Enrollment options are incomplete; missing ${missing.join(", ")}.`);
@@ -200,6 +204,7 @@ function parseEnrollmentArgs(args: Record<string, string>): PrepareVaultEnrollme
 		host,
 		deviceToken: args["--device-token"]!.trim(),
 		vaultId: args["--vault-id"]!.trim(),
+		vaultGeneration: args["--vault-generation"]!.trim(),
 		deviceId: args["--device-id"]!.trim(),
 		deviceName,
 	};
@@ -267,6 +272,8 @@ interface ResolvedCredentials {
 	deviceToken: string;
 	vaultId: string;
 	deviceId: string;
+	vaultGeneration: string;
+	originImport: boolean;
 	deviceName: string;
 }
 
@@ -283,10 +290,12 @@ async function resolveEnrollment(
 			host,
 			deviceToken: enrollment.deviceToken.trim(),
 			vaultId: enrollment.vaultId.trim(),
+			vaultGeneration: enrollment.vaultGeneration.trim(),
+			originImport: false,
 			deviceId: enrollment.deviceId.trim(),
 			deviceName,
 		};
-		const missing = (["deviceToken", "vaultId", "deviceId"] as const)
+		const missing = (["deviceToken", "vaultId", "vaultGeneration", "deviceId"] as const)
 			.filter(field => !credentials[field]);
 		if (missing.length > 0) {
 			throw new PrepareVaultError(`Direct pre-enrolled identity is incomplete; missing ${missing.join(", ")}.`);
@@ -296,13 +305,16 @@ async function resolveEnrollment(
 
 	const pairingCode = enrollment.pairingCode.trim();
 	if (!pairingCode) throw new PrepareVaultError("Pairing code must not be empty.");
+	const enrollmentRequestId = randomBytes(16).toString("base64url");
+	const deviceId = randomBytes(16).toString("base64url");
+	const deviceToken = randomBytes(32).toString("base64url");
 
 	let response: Response;
 	try {
 		response = await fetchImpl(`${host}/enroll`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ pairingCode, deviceName }),
+			body: JSON.stringify({ pairingCode, enrollmentRequestId, deviceId, deviceToken, deviceName }),
 		});
 	} catch (error) {
 		throw new PrepareVaultError(`Enrollment request failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -315,7 +327,7 @@ async function resolveEnrollment(
 	}
 	if (!isEnrollmentResponse(body)) {
 		throw new PrepareVaultError(
-			"Enrollment response must contain exactly host, deviceToken, vaultId, deviceId, and deviceName.",
+			"Enrollment response must contain exactly host, deviceToken, vaultId, vaultGeneration, deviceId, deviceName, and originImport.",
 		);
 	}
 	if (normalizeServerHost(body.host) !== host) {
@@ -326,6 +338,8 @@ async function resolveEnrollment(
 		deviceToken: body.deviceToken,
 		vaultId: body.vaultId,
 		deviceId: body.deviceId,
+		vaultGeneration: body.vaultGeneration,
+		originImport: body.originImport,
 		deviceName: body.deviceName,
 	};
 }
@@ -334,15 +348,19 @@ function isEnrollmentResponse(value: unknown): value is {
 	host: string;
 	deviceToken: string;
 	vaultId: string;
+	vaultGeneration: string;
 	deviceId: string;
 	deviceName: string;
+	originImport: boolean;
 } {
 	if (!isRecord(value)) return false;
 	const keys = Object.keys(value).sort();
-	const expected = ["deviceId", "deviceName", "deviceToken", "host", "vaultId"];
+	const expected = ["deviceId", "deviceName", "deviceToken", "host", "originImport", "vaultGeneration", "vaultId"];
+	const strings = ["deviceId", "deviceName", "deviceToken", "host", "vaultGeneration", "vaultId"];
 	return keys.length === expected.length
 		&& keys.every((key, index) => key === expected[index])
-		&& expected.every(key => typeof value[key] === "string" && (value[key] as string).trim().length > 0);
+		&& strings.every(key => typeof value[key] === "string" && (value[key] as string).trim().length > 0)
+		&& typeof value.originImport === "boolean";
 }
 
 export async function listFixtureIds(fixturesDir: string): Promise<string[]> {
@@ -567,6 +585,8 @@ function createYaosSettings(credentials: ResolvedCredentials | null): Record<str
 		deviceToken: credentials?.deviceToken ?? "",
 		vaultId: credentials?.vaultId ?? "",
 		deviceId: credentials?.deviceId ?? "",
+		vaultGeneration: credentials?.vaultGeneration ?? "",
+		originImportPending: credentials?.originImport ?? false,
 		deviceName: credentials?.deviceName ?? "qa-device-a",
 		// debug:true is what starts the flight recorder. There is no separate
 		// trace switch any more — QA scenarios depend on this being on.

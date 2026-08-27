@@ -3,8 +3,12 @@
  * metadata.
  */
 import ServerConfig, {
+	MAX_ENROLLMENT_REPLAY_RECORDS,
 	MAX_PENDING_DESTROYS,
+	MAX_PENDING_DEVICE_REVOCATIONS,
+	parseEnrollmentReplayRecords,
 	parsePendingDestroyRecords,
+	parsePendingDeviceRevocationRecords,
 } from "../../server/src/config";
 import {
 	CorruptIdentityStateError,
@@ -158,18 +162,19 @@ s.section("rename-device updates the authorized device record");
 		ticketSigningKey: "sign-key",
 		vaultId,
 		vaultName: "Personal",
-		pairingCodeHash: "pair-hash",
+		pairingCodeHash: "a".repeat(64),
 		pairingExp: Date.now() + 60_000,
 		pairingPurpose: "device",
 	}));
 	s.check(claim.status === 200, "claim succeeds with usable vaultId");
-	const activated = await activateClaim(config, claim, "pair-hash");
+	const activated = await activateClaim(config, claim, "a".repeat(64));
 	s.check(activated.status === 200, "claimed vault activates before enrollment");
 
 	const enrolled = await config.fetch(jsonRequest("/__yaos/enroll", {
-		pairingCodeHash: "pair-hash",
+		enrollmentRequestId: "request-rename-aa",
+		pairingCodeHash: "a".repeat(64),
 		deviceId: "dev-1",
-		deviceTokenHash: "tok-hash",
+		deviceTokenHash: "b".repeat(64),
 		deviceName: "phone",
 	}));
 	s.check(enrolled.status === 200, "enroll succeeds");
@@ -211,16 +216,17 @@ s.section("verify-device requires a live enrollment on that vault");
 		ticketSigningKey: "sign-key",
 		vaultId,
 		vaultName: "Personal",
-		pairingCodeHash: "pair-hash",
+		pairingCodeHash: "c".repeat(64),
 		pairingExp: Date.now() + 60_000,
 		pairingPurpose: "device",
 	}));
-	const activated = await activateClaim(config, claim, "pair-hash");
+	const activated = await activateClaim(config, claim, "c".repeat(64));
 	s.check(activated.status === 200, "verification vault activates before enrollment");
 	await config.fetch(jsonRequest("/__yaos/enroll", {
-		pairingCodeHash: "pair-hash",
+		enrollmentRequestId: "request-verify-aa",
+		pairingCodeHash: "c".repeat(64),
 		deviceId: "dev-live",
-		deviceTokenHash: "tok-hash",
+		deviceTokenHash: "d".repeat(64),
 		deviceName: "phone",
 	}));
 
@@ -236,12 +242,38 @@ s.section("verify-device requires a live enrollment on that vault");
 	}));
 	s.check(wrongVault.status === 401, "device on another vault is 401");
 
-	await config.fetch(jsonRequest("/__yaos/revoke-device", { deviceId: "dev-live" }));
+	const revokeResponse = await config.fetch(jsonRequest("/__yaos/revoke-device", { deviceId: "dev-live" }));
 	const revoked = await config.fetch(jsonRequest("/__yaos/verify-device", {
 		deviceId: "dev-live",
 		vaultId,
 	}));
 	s.check(revoked.status === 401, "revoked device is 401");
+	const revokeBody = await revokeResponse.json() as { revocation?: {
+		vaultId: string;
+		vaultGeneration: string;
+		deviceId: string;
+	} };
+	s.check(revokeResponse.status === 200 && revokeBody.revocation?.deviceId === "dev-live", "membership removal creates a revocation obligation");
+	const revocation = revokeBody.revocation;
+	if (!revocation) throw new Error("revocation obligation missing");
+	const pendingConsole = await config.fetch(new Request("https://internal/__yaos/console"));
+	const pendingState = await pendingConsole.json() as { pendingDeviceRevocations: Array<{ deviceId: string; lastError: string | null }> };
+	s.check(pendingState.pendingDeviceRevocations.length === 1, "revocation obligation remains visible after membership removal");
+	const failedFence = await config.fetch(jsonRequest("/__yaos/fail-device-revocation", {
+		...revocation,
+		lastError: "runtime unavailable",
+	}));
+	s.check(failedFence.status === 202, "failed runtime fence remains pending");
+	const failedState = await (await config.fetch(new Request("https://internal/__yaos/console"))).json() as {
+		pendingDeviceRevocations: Array<{ lastError: string | null }>;
+	};
+	s.check(failedState.pendingDeviceRevocations[0]?.lastError === "runtime unavailable", "operator state exposes the durable fence failure");
+	const completedFence = await config.fetch(jsonRequest("/__yaos/complete-device-revocation", revocation));
+	s.check(completedFence.status === 200, "successful runtime fence acknowledges the obligation");
+	const completedState = await (await config.fetch(new Request("https://internal/__yaos/console"))).json() as {
+		pendingDeviceRevocations: unknown[];
+	};
+	s.check(completedState.pendingDeviceRevocations.length === 0, "successful fence removes the revocation obligation");
 }
 
 s.section("device token cannot rename without auth or on another vault");
@@ -418,10 +450,13 @@ s.section("update-metadata: device bearer 401, operator session 200");
 
 s.section("public enrollment response is exact and fails closed");
 {
+	const enrollmentRequestId = "public-enroll-request";
+	const deviceId = "device-enroll-0001";
+	const deviceToken = "A".repeat(43);
 	const validEnv = makeEnv({
 		YAOS_CONFIG: makeConfigNamespace(async () => new Response(JSON.stringify({
 			vaultId: "vault-enroll",
-			deviceId: "device-enroll",
+			deviceId,
 			deviceName: "Mac",
 			vaultGeneration: "generation-enroll",
 			originImport: true,
@@ -430,7 +465,7 @@ s.section("public enrollment response is exact and fails closed");
 	const request = () => new Request("https://sync.example/enroll", {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify({ pairingCode: "pairing-code", deviceName: "Mac" }),
+		body: JSON.stringify({ pairingCode: "pairing-code", enrollmentRequestId, deviceId, deviceToken, deviceName: "Mac" }),
 	});
 	const valid = await handleEnrollRoute(request(), validEnv);
 	const validBody = await valid.json() as Record<string, unknown>;
@@ -441,6 +476,7 @@ s.section("public enrollment response is exact and fails closed");
 		"public enrollment returns the exact credential contract",
 	);
 	s.check(validBody.host === "https://sync.example" && validBody.deviceName === "Mac", "public enrollment returns canonical host and name");
+	s.check(validBody.deviceId === deviceId && validBody.deviceToken === deviceToken, "public enrollment returns the client-generated credentials");
 
 	const invalidEnv = makeEnv({
 		YAOS_CONFIG: makeConfigNamespace(async () => new Response(JSON.stringify({ ok: true }), { status: 200 })),
@@ -562,6 +598,25 @@ s.section("persisted identity parsers reject malformed, duplicate, and oversized
 		deletedBytes: 0,
 		lastError: null,
 	};
+	const revocation = {
+		vaultId: vault.vaultId,
+		vaultGeneration: vault.vaultGeneration,
+		deviceId: device.deviceId,
+		requestedAt: 1_200,
+		lastError: null,
+	};
+	const enrollmentReplay = {
+		enrollmentRequestId: "request-parser-aa",
+		pairingCodeHash: "a".repeat(64),
+		deviceId: device.deviceId,
+		deviceTokenHash: "b".repeat(64),
+		vaultId: vault.vaultId,
+		vaultGeneration: vault.vaultGeneration,
+		deviceName: device.name,
+		originImport: false,
+		createdAt: 1_100,
+		expiresAt: 2_100,
+	};
 	const knownVaultIds = new Set([vault.vaultId]);
 
 	const malformed = [
@@ -570,6 +625,8 @@ s.section("persisted identity parsers reject malformed, duplicate, and oversized
 		captureCorruptState(() => parsePairingCodeRecords([{ ...code, purpose: "recovery" }])),
 		captureCorruptState(() => parseOperatorSessionRecords([{ ...session, exp: Number.NaN }])),
 		captureCorruptState(() => parsePendingDestroyRecords([{ ...pending, roomComplete: "yes" }])),
+		captureCorruptState(() => parsePendingDeviceRevocationRecords([{ ...revocation, lastError: " ".repeat(2) }])),
+		captureCorruptState(() => parseEnrollmentReplayRecords([{ ...enrollmentReplay, deviceTokenHash: "plaintext" }])),
 	];
 	s.check(
 		malformed.every((error) => error?.code === "corrupt_identity_state" && error.message.length <= 192),
@@ -582,6 +639,8 @@ s.section("persisted identity parsers reject malformed, duplicate, and oversized
 		captureCorruptState(() => parsePairingCodeRecords([code, { ...code }], knownVaultIds)),
 		captureCorruptState(() => parseOperatorSessionRecords([session, { ...session }])),
 		captureCorruptState(() => parsePendingDestroyRecords([pending, { ...pending }])),
+		captureCorruptState(() => parsePendingDeviceRevocationRecords([revocation, { ...revocation }])),
+		captureCorruptState(() => parseEnrollmentReplayRecords([enrollmentReplay, { ...enrollmentReplay }])),
 	];
 	s.check(
 		duplicates.every((error) => error?.message.includes("duplicate")),
@@ -594,6 +653,8 @@ s.section("persisted identity parsers reject malformed, duplicate, and oversized
 		captureCorruptState(() => parsePairingCodeRecords(new Array(MAX_PAIRING_CODE_RECORDS + 1))),
 		captureCorruptState(() => parseOperatorSessionRecords(new Array(MAX_OPERATOR_SESSION_RECORDS + 1))),
 		captureCorruptState(() => parsePendingDestroyRecords(new Array(MAX_PENDING_DESTROYS + 1))),
+		captureCorruptState(() => parsePendingDeviceRevocationRecords(new Array(MAX_PENDING_DEVICE_REVOCATIONS + 1))),
+		captureCorruptState(() => parseEnrollmentReplayRecords(new Array(MAX_ENROLLMENT_REPLAY_RECORDS + 1))),
 	];
 	s.check(
 		oversized.every((error) => error?.message.includes("exceeds capacity")),
@@ -605,6 +666,8 @@ s.section("persisted identity parsers reject malformed, duplicate, and oversized
 	s.check(parsePairingCodeRecords([code], knownVaultIds)[0]?.codeId === code.codeId, "valid pairing records are preserved");
 	s.check(parseOperatorSessionRecords([session])[0]?.sessionHash === session.sessionHash, "valid sessions are preserved");
 	s.check(parsePendingDestroyRecords([pending])[0]?.vaultId === pending.vaultId, "valid pending destroys are preserved");
+	s.check(parsePendingDeviceRevocationRecords([revocation])[0]?.deviceId === revocation.deviceId, "valid pending revocations are preserved");
+	s.check(parseEnrollmentReplayRecords([enrollmentReplay])[0]?.enrollmentRequestId === enrollmentReplay.enrollmentRequestId, "valid enrollment replays are preserved");
 }
 
 s.section("origin pairing grants one enrollment the initial-import authority");
@@ -615,24 +678,36 @@ s.section("origin pairing grants one enrollment the initial-import authority");
 		ticketSigningKey: "origin-ticket-key",
 		vaultId: "vault-origin-aa",
 		vaultName: "Personal",
-		pairingCodeHash: "o".repeat(64),
+		pairingCodeHash: "e".repeat(64),
 		pairingPurpose: "origin",
 	}));
 	s.check(claim.status === 200, "origin vault reservation succeeds");
-	s.check((await activateClaim(config, claim, "o".repeat(64), "origin")).status === 200, "origin pairing activates with the vault");
+	s.check((await activateClaim(config, claim, "e".repeat(64), "origin")).status === 200, "origin pairing activates with the vault");
 	const enrolled = await config.fetch(jsonRequest("/__yaos/enroll", {
-		pairingCodeHash: "o".repeat(64),
+		enrollmentRequestId: "request-origin-aa",
+		pairingCodeHash: "e".repeat(64),
 		deviceId: "device-origin-aa",
-		deviceTokenHash: "origin-device-token-hash",
+		deviceTokenHash: "f".repeat(64),
 		deviceName: "Origin device",
 	}));
 	const body = await enrolled.json() as Record<string, unknown>;
 	s.check(enrolled.status === 200 && body.originImport === true, "origin pairing grants initial import once");
 	s.check(body.vaultGeneration === "generation" || typeof body.vaultGeneration === "string", "enrollment returns the vault generation");
+	const recovered = await config.fetch(jsonRequest("/__yaos/enroll", {
+		enrollmentRequestId: "request-origin-aa",
+		pairingCodeHash: "e".repeat(64),
+		deviceId: "device-origin-aa",
+		deviceTokenHash: "f".repeat(64),
+		deviceName: "Changed name is ignored on replay",
+	}));
+	const recoveredBody = await recovered.json() as Record<string, unknown>;
+	s.check(recovered.status === 200 && recoveredBody.originImport === true, "lost origin enrollment response replays its original grant");
+	s.check(recoveredBody.deviceId === body.deviceId, "enrollment replay returns the same device");
 	const replay = await config.fetch(jsonRequest("/__yaos/enroll", {
-		pairingCodeHash: "o".repeat(64),
+		enrollmentRequestId: "different-origin-request",
+		pairingCodeHash: "e".repeat(64),
 		deviceId: "device-origin-replay",
-		deviceTokenHash: "origin-replay-token-hash",
+		deviceTokenHash: "a".repeat(64),
 		deviceName: "Replay",
 	}));
 	s.check(replay.status !== 200, "consumed origin pairing cannot grant another importer");

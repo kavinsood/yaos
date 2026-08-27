@@ -1,5 +1,6 @@
 import { type App, Notice, type RequestUrlParam } from "obsidian";
-import type { VaultSyncSettings } from "../settings";
+import type { PendingEnrollment, VaultSyncSettings } from "../settings/settingsStore";
+import { randomId } from "../utils/randomId";
 import { ConfirmModal } from "../ui/ConfirmModal";
 import type { RuntimeTeardownCoordinator } from "./teardownLifecycle";
 
@@ -41,7 +42,13 @@ interface EnrollmentResponse {
 }
 
 export class SetupLinkController {
-	constructor(private readonly deps: SetupLinkControllerDeps) {}
+	private enrollmentInFlight: { requestId: string; promise: Promise<boolean> } | null = null;
+
+	constructor(private readonly deps: SetupLinkControllerDeps) {
+		this.deps.app.workspace?.onLayoutReady(() => {
+			if (this.deps.getSettings().pendingEnrollment) void this.resumePendingEnrollment();
+		});
+	}
 
 	async handleSetupLink(params: Record<string, string>): Promise<void> {
 		const action = typeof params.action === "string" ? params.action.trim() : "";
@@ -54,6 +61,12 @@ export class SetupLinkController {
 		await this.enrollWithCode(host, pairingCode);
 	}
 
+	async resumePendingEnrollment(): Promise<boolean> {
+		const pending = this.deps.getSettings().pendingEnrollment;
+		if (!pending) return false;
+		return this.runPendingEnrollment(pending);
+	}
+
 	async enrollWithCode(host: string, pairingCode: string): Promise<boolean> {
 		const normalizedHost = host.trim().replace(/\/$/, "");
 		const code = pairingCode.trim();
@@ -62,17 +75,18 @@ export class SetupLinkController {
 			return false;
 		}
 		const currentSettings = this.deps.getSettings();
+		const existingPending = currentSettings.pendingEnrollment;
+		if (existingPending) {
+			if (existingPending.host !== normalizedHost || existingPending.pairingCode !== code) {
+				new Notice("A previous enrollment is still pending. The plugin will resume it before accepting another pairing code.", 8000);
+				return false;
+			}
+			return this.runPendingEnrollment(existingPending);
+		}
 
-		const previousEnrollment: EnrollmentMembership = {
-			host: currentSettings.host.trim().replace(/\/$/, ""),
-			deviceToken: currentSettings.deviceToken.trim(),
-			vaultId: currentSettings.vaultId.trim(),
-			deviceId: currentSettings.deviceId.trim(),
-			vaultGeneration: currentSettings.vaultGeneration.trim(),
-		};
-		const currentVaultId = previousEnrollment.vaultId;
+		const previousEnrollment = this.currentMembership(currentSettings);
 		const hasExistingEnrollment = [
-			currentVaultId,
+			previousEnrollment.vaultId,
 			previousEnrollment.deviceId,
 			previousEnrollment.deviceToken,
 		].some(Boolean);
@@ -88,7 +102,7 @@ export class SetupLinkController {
 				// The request path reports invalid hosts after informed consent.
 			}
 			const confirmed = await this.confirmEnrollOverExisting(
-				currentVaultId,
+				previousEnrollment.vaultId,
 				localMarkdownCount,
 				destinationOrigin,
 			);
@@ -98,16 +112,67 @@ export class SetupLinkController {
 			}
 		}
 
+		const pending: PendingEnrollment = {
+			host: normalizedHost,
+			pairingCode: code,
+			enrollmentRequestId: randomId(22),
+			deviceId: randomId(22),
+			deviceToken: randomId(43),
+			deviceName: currentSettings.deviceName.trim(),
+		};
+		try {
+			await this.deps.updateSettings((settings) => {
+				settings.pendingEnrollment = pending;
+			}, "setup-enroll-pending");
+		} catch (err) {
+			new Notice(err instanceof Error ? err.message : "Could not save pending enrollment.", 8000);
+			return false;
+		}
+		return this.runPendingEnrollment(pending);
+	}
+
+	private runPendingEnrollment(pending: PendingEnrollment): Promise<boolean> {
+		if (this.enrollmentInFlight?.requestId === pending.enrollmentRequestId) {
+			return this.enrollmentInFlight.promise;
+		}
+		const promise = this.completePendingEnrollment(pending).finally(() => {
+			if (this.enrollmentInFlight?.requestId === pending.enrollmentRequestId) {
+				this.enrollmentInFlight = null;
+			}
+		});
+		this.enrollmentInFlight = { requestId: pending.enrollmentRequestId, promise };
+		return promise;
+	}
+
+	private currentMembership(settings: VaultSyncSettings): EnrollmentMembership {
+		return {
+			host: settings.host.trim().replace(/\/$/, ""),
+			deviceToken: settings.deviceToken.trim(),
+			vaultId: settings.vaultId.trim(),
+			deviceId: settings.deviceId.trim(),
+			vaultGeneration: settings.vaultGeneration.trim(),
+		};
+	}
+
+	private async completePendingEnrollment(pending: PendingEnrollment): Promise<boolean> {
+		const previousEnrollment = this.currentMembership(this.deps.getSettings());
+		const hasExistingEnrollment = [
+			previousEnrollment.vaultId,
+			previousEnrollment.deviceId,
+			previousEnrollment.deviceToken,
+		].some(Boolean);
 		let enrolled: EnrollmentResponse;
 		try {
-			const requestedName = currentSettings.deviceName.trim();
 			const res = await this.deps.requestEnrollment({
-				url: `${normalizedHost}/enroll`,
+				url: `${pending.host}/enroll`,
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
 				body: JSON.stringify({
-					pairingCode: code,
-					...(requestedName ? { deviceName: requestedName } : {}),
+					pairingCode: pending.pairingCode,
+					enrollmentRequestId: pending.enrollmentRequestId,
+					deviceId: pending.deviceId,
+					deviceToken: pending.deviceToken,
+					...(pending.deviceName ? { deviceName: pending.deviceName } : {}),
 				}),
 			});
 			const raw: unknown = res.json;
@@ -125,36 +190,35 @@ export class SetupLinkController {
 		}
 
 		if (
-			typeof enrolled.host !== "string" || !enrolled.host.trim() ||
-			typeof enrolled.vaultId !== "string" || !enrolled.vaultId.trim() ||
-			typeof enrolled.deviceId !== "string" || !enrolled.deviceId.trim() ||
-			typeof enrolled.deviceToken !== "string" || !enrolled.deviceToken.trim() ||
-			typeof enrolled.deviceName !== "string" || !enrolled.deviceName.trim() ||
-			typeof enrolled.vaultGeneration !== "string" || !enrolled.vaultGeneration.trim() ||
-			typeof enrolled.originImport !== "boolean"
+			typeof enrolled.host !== "string" || !enrolled.host.trim()
+			|| typeof enrolled.vaultId !== "string" || !enrolled.vaultId.trim()
+			|| enrolled.deviceId !== pending.deviceId
+			|| enrolled.deviceToken !== pending.deviceToken
+			|| typeof enrolled.deviceName !== "string" || !enrolled.deviceName.trim()
+			|| typeof enrolled.vaultGeneration !== "string" || !enrolled.vaultGeneration.trim()
+			|| typeof enrolled.originImport !== "boolean"
 		) {
 			new Notice("Server did not return complete enrollment credentials.", 8000);
 			return false;
 		}
 		const enrolledHost = enrolled.host.trim().replace(/\/$/, "");
-		if (enrolledHost !== normalizedHost) {
+		if (enrolledHost !== pending.host) {
 			new Notice("Server returned enrollment credentials for a different host.", 8000);
 			return false;
 		}
-		const enrolledName = enrolled.deviceName;
 		const nextEnrollment: EnrollmentMembership = {
 			host: enrolledHost,
-			deviceToken: enrolled.deviceToken,
+			deviceToken: pending.deviceToken,
 			vaultId: enrolled.vaultId,
-			deviceId: enrolled.deviceId,
+			deviceId: pending.deviceId,
 			vaultGeneration: enrolled.vaultGeneration,
 		};
 		const enrollmentChanged = hasExistingEnrollment && (
-			previousEnrollment.host !== nextEnrollment.host ||
-			previousEnrollment.deviceToken !== nextEnrollment.deviceToken ||
-			previousEnrollment.vaultId !== nextEnrollment.vaultId ||
-			previousEnrollment.deviceId !== nextEnrollment.deviceId ||
-			previousEnrollment.vaultGeneration !== nextEnrollment.vaultGeneration
+			previousEnrollment.host !== nextEnrollment.host
+			|| previousEnrollment.deviceToken !== nextEnrollment.deviceToken
+			|| previousEnrollment.vaultId !== nextEnrollment.vaultId
+			|| previousEnrollment.deviceId !== nextEnrollment.deviceId
+			|| previousEnrollment.vaultGeneration !== nextEnrollment.vaultGeneration
 		);
 		if (enrollmentChanged) {
 			try {
@@ -165,15 +229,21 @@ export class SetupLinkController {
 			}
 		}
 
-		await this.deps.updateSettings((settings) => {
-			settings.host = nextEnrollment.host;
-			settings.deviceToken = nextEnrollment.deviceToken;
-			settings.vaultId = nextEnrollment.vaultId;
-			settings.deviceId = nextEnrollment.deviceId;
-			settings.vaultGeneration = nextEnrollment.vaultGeneration;
-			settings.originImportPending = enrolled.originImport === true;
-			settings.deviceName = enrolledName;
-		}, "setup-enroll");
+		try {
+			await this.deps.updateSettings((settings) => {
+				settings.host = nextEnrollment.host;
+				settings.deviceToken = nextEnrollment.deviceToken;
+				settings.vaultId = nextEnrollment.vaultId;
+				settings.deviceId = nextEnrollment.deviceId;
+				settings.vaultGeneration = nextEnrollment.vaultGeneration;
+				settings.originImportPending = enrolled.originImport === true;
+				settings.deviceName = enrolled.deviceName as string;
+				settings.pendingEnrollment = null;
+			}, "setup-enroll");
+		} catch (err) {
+			new Notice(err instanceof Error ? err.message : "Could not save enrollment credentials.", 8000);
+			return false;
+		}
 		await this.deps.refreshServerCapabilities("setup-enroll");
 		new Notice("This device is enrolled. Starting sync...", 6000);
 		await this.deps.startSyncAfterEnrollment();

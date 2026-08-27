@@ -13,6 +13,15 @@ export function attachmentSizeCapKB(serverMaxBlobUploadBytes?: number | null): n
 	return Math.max(1, Math.min(MAX_ATTACHMENT_SIZE_KB, Math.floor(serverMaxBlobUploadBytes / 1024)));
 }
 
+export interface PendingEnrollment {
+	host: string;
+	pairingCode: string;
+	enrollmentRequestId: string;
+	deviceId: string;
+	deviceToken: string;
+	deviceName: string;
+}
+
 export interface VaultSyncSettings {
 	/** Cloudflare Worker host, e.g. "https://sync.yourdomain.com" */
 	host: string;
@@ -28,6 +37,8 @@ export interface VaultSyncSettings {
 	originImportPending: boolean;
 	/** Human-readable device name shown in awareness/cursors. */
 	deviceName: string;
+	/** Durable client-generated enrollment request, retained until credentials are saved. */
+	pendingEnrollment?: PendingEnrollment | null;
 	/**
 	 * Debug mode: verbose console logging plus the flight recorder that backs
 	 * the exportable bug-report trace. Single switch; off by default.
@@ -72,6 +83,7 @@ export const DEFAULT_SETTINGS: VaultSyncSettings = {
 	vaultGeneration: "",
 	originImportPending: false,
 	deviceName: "",
+	pendingEnrollment: null,
 	debug: false,
 	frontmatterGuardEnabled: true,
 	excludePatterns: "",
@@ -107,6 +119,37 @@ function readPersistedState<TState extends Partial<VaultSyncSettings>>(value: un
 	return state as TState;
 }
 
+function readPendingEnrollment(value: unknown): PendingEnrollment | null {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+	const record = value as Record<string, unknown>;
+	const keys = ["host", "pairingCode", "enrollmentRequestId", "deviceId", "deviceToken", "deviceName"];
+	if (Object.keys(record).length !== keys.length || Object.keys(record).some((key) => !keys.includes(key))) return null;
+	if (
+		typeof record.host !== "string" || !record.host.trim() || record.host.trim() !== record.host || record.host.length > 2_048
+		|| typeof record.pairingCode !== "string" || record.pairingCode.length < 8 || record.pairingCode.length > 512
+		|| typeof record.enrollmentRequestId !== "string" || !/^[A-Za-z0-9_-]{16,128}$/.test(record.enrollmentRequestId)
+		|| typeof record.deviceId !== "string" || !/^[A-Za-z0-9_-]{16,128}$/.test(record.deviceId)
+		|| typeof record.deviceToken !== "string" || !/^[A-Za-z0-9_-]{32,256}$/.test(record.deviceToken)
+		|| typeof record.deviceName !== "string" || record.deviceName.length > 80 || record.deviceName.trim() !== record.deviceName
+	) {
+		return null;
+	}
+	try {
+		const host = new URL(record.host);
+		if ((host.protocol !== "https:" && host.protocol !== "http:") || host.origin !== record.host) return null;
+	} catch {
+		return null;
+	}
+	return {
+		host: record.host,
+		pairingCode: record.pairingCode,
+		enrollmentRequestId: record.enrollmentRequestId,
+		deviceId: record.deviceId,
+		deviceToken: record.deviceToken,
+		deviceName: record.deviceName,
+	};
+}
+
 export function readVaultSyncSettings(
 	data: Partial<VaultSyncSettings> | Record<string, unknown> | null | undefined,
 ): { settings: VaultSyncSettings; migrated: boolean } {
@@ -133,6 +176,11 @@ export function readVaultSyncSettings(
 		settings.originImportPending = false;
 		migrated = true;
 	}
+	const pendingEnrollment = readPendingEnrollment(record.pendingEnrollment);
+	if (record.pendingEnrollment !== null && record.pendingEnrollment !== undefined && pendingEnrollment === null) {
+		migrated = true;
+	}
+	settings.pendingEnrollment = pendingEnrollment;
 	if (typeof record.attachmentSyncExplicitlyConfigured !== "boolean") {
 		settings.attachmentSyncExplicitlyConfigured = record.enableAttachmentSync === true;
 		if (record.enableAttachmentSync !== true) {

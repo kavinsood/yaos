@@ -31,13 +31,22 @@ const pairingResponse = await fetch(`${deviceA.host}/vault/${encodeURIComponent(
 });
 const pairing = await pairingResponse.json() as { pairingCode?: unknown };
 assert(pairingResponse.status === 200 && typeof pairing.pairingCode === "string", "device A mints a one-use pairing for a revocation probe");
+const enrollmentRequestId = crypto.randomUUID().replaceAll("-", "");
+const enrolledDeviceId = crypto.randomUUID().replaceAll("-", "");
+const enrolledDeviceToken = `${crypto.randomUUID().replaceAll("-", "")}${crypto.randomUUID().replaceAll("-", "")}`;
 const enrollment = await fetch(`${deviceA.host}/enroll`, {
 	method: "POST",
 	headers: { "Content-Type": "application/json" },
-	body: JSON.stringify({ pairingCode: pairing.pairingCode, deviceName: "live-revoked-device" }),
+	body: JSON.stringify({
+		pairingCode: pairing.pairingCode,
+		enrollmentRequestId,
+		deviceId: enrolledDeviceId,
+		deviceToken: enrolledDeviceToken,
+		deviceName: "live-revoked-device",
+	}),
 });
 const enrolled = await enrollment.json() as Partial<LiveIdentity> & { deviceName?: unknown };
-assert(enrollment.status === 200 && typeof enrolled.deviceToken === "string" && typeof enrolled.deviceId === "string", "probe device enrolls once");
+assert(enrollment.status === 200 && enrolled.deviceToken === enrolledDeviceToken && enrolled.deviceId === enrolledDeviceId, "probe device enrolls once");
 const revoked: LiveIdentity = {
 	host: deviceA.host,
 	vaultId: deviceA.vaultId,
@@ -105,10 +114,19 @@ const revokedSocketFrame = await new Promise<FatalFrame | null>((resolve, reject
 });
 assert(revokedSocketFrame?.code === "unauthorized", "a pre-revocation ticket is denied after membership revocation");
 
+const replayRequestId = crypto.randomUUID().replaceAll("-", "");
+const replayDeviceId = crypto.randomUUID().replaceAll("-", "");
+const replayDeviceToken = `${crypto.randomUUID().replaceAll("-", "")}${crypto.randomUUID().replaceAll("-", "")}`;
 const replay = await fetch(`${deviceA.host}/enroll`, {
 	method: "POST",
 	headers: { "Content-Type": "application/json" },
-	body: JSON.stringify({ pairingCode: pairing.pairingCode, deviceName: "live-replay" }),
+	body: JSON.stringify({
+		pairingCode: pairing.pairingCode,
+		enrollmentRequestId: replayRequestId,
+		deviceId: replayDeviceId,
+		deviceToken: replayDeviceToken,
+		deviceName: "live-replay",
+	}),
 });
-assert(replay.status === 404, "consumed pairing capability cannot enroll again");
+assert(replay.status === 409, "consumed pairing capability cannot enroll another device");
 console.log("\n✓ Live membership and stale-ticket revocation passed");

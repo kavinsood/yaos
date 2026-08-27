@@ -33,7 +33,7 @@ s.section("Enrollment owns the durable device name");
 {
 	const controller = readSource("src/runtime/setupLinkController.ts");
 	s.check(controller.includes('typeof enrolled.deviceName !== "string"'), "enrollment requires the server-returned device name");
-	s.check(controller.includes("settings.deviceName = enrolledName"), "server-returned name becomes the persisted device name");
+	s.check(controller.includes("settings.deviceName = enrolled.deviceName"), "server-returned name becomes the persisted device name");
 	const main = readSource("src/main.ts");
 	s.check(main.includes("defaultDeviceName(Platform)"), "startup initializes a platform default before enrollment");
 	s.check(!main.includes("Date.now().toString(36)"), "startup does not create timestamp device names");

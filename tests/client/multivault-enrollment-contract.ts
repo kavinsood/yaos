@@ -9,15 +9,40 @@ import { readSource, suite } from "../harness.ts";
 
 const s = suite("multivault-enrollment-contract");
 
+interface EnrollmentIdentity {
+	enrollmentRequestId: string;
+	deviceId: string;
+	deviceToken: string;
+}
+
+function enrollmentIdentity(
+	request: Parameters<SetupLinkControllerDeps["requestEnrollment"]>[0],
+): EnrollmentIdentity {
+	if (typeof request.body !== "string") throw new Error("enrollment request body is not JSON text");
+	const body = JSON.parse(request.body) as Record<string, unknown>;
+	if (
+		typeof body.enrollmentRequestId !== "string"
+		|| typeof body.deviceId !== "string"
+		|| typeof body.deviceToken !== "string"
+	) {
+		throw new Error("enrollment request omitted its persisted client identity");
+	}
+	return {
+		enrollmentRequestId: body.enrollmentRequestId,
+		deviceId: body.deviceId,
+		deviceToken: body.deviceToken,
+	};
+}
+
 s.section("Setup links enroll with a pairing code");
 {
 	const source = readSource("src/runtime/setupLinkController.ts");
 	s.check(source.includes('action !== "setup"'), "protocol handler requires action=setup");
 	s.check(source.includes("params.pairingCode"), "protocol handler reads pairingCode");
-	s.check(source.includes('url: `${normalizedHost}/enroll`'), "pairing code is exchanged at POST /enroll");
+	s.check(source.includes('url: `${pending.host}/enroll`'), "pairing code is exchanged at POST /enroll");
 	s.check(source.includes("settings.deviceToken = nextEnrollment.deviceToken"), "enrollment persists the returned device token");
 	s.check(source.includes("settings.deviceId = nextEnrollment.deviceId"), "enrollment persists the returned device id");
-	s.check(source.includes("settings.deviceName = enrolledName"), "enrollment persists the server-returned name");
+	s.check(source.includes("settings.deviceName = enrolled.deviceName"), "enrollment persists the server-returned name");
 	s.check(!source.includes("params.token") && !source.includes("params.vaultId"), "old token and vault-id links cannot connect");
 }
 
@@ -139,6 +164,7 @@ s.test("fully unenrolled folder can enroll without replacement confirmation", as
 	let requestCount = 0;
 	let refreshCount = 0;
 	let initCount = 0;
+	let generatedIdentity: EnrollmentIdentity | null = null;
 	const deps: SetupLinkControllerDeps = {
 		app: {
 			// @ts-expect-error focused enrollment test supplies only vault file enumeration.
@@ -163,15 +189,16 @@ s.test("fully unenrolled folder can enroll without replacement confirmation", as
 		retireCurrentEnrollment: async () => {
 			throw new Error("fully unenrolled folder has no current enrollment to retire");
 		},
-		requestEnrollment: async () => {
+		requestEnrollment: async (request) => {
 			requestCount++;
+			generatedIdentity = enrollmentIdentity(request);
 			return {
 				status: 200,
 				json: {
 					host: "https://destination.example",
 					vaultId: "new-vault",
-					deviceId: "new-device",
-					deviceToken: "new-token",
+					deviceId: generatedIdentity.deviceId,
+					deviceToken: generatedIdentity.deviceToken,
 					deviceName: "Server device name",
 					vaultGeneration: "new-generation",
 					originImport: true,
@@ -189,11 +216,13 @@ s.test("fully unenrolled folder can enroll without replacement confirmation", as
 	if (requestCount !== 1 || refreshCount !== 1 || initCount !== 1) {
 		throw new Error("fully unenrolled enrollment did not complete exactly once");
 	}
+	const expectedIdentity = generatedIdentity as EnrollmentIdentity | null;
+	if (!expectedIdentity) throw new Error("enrollment request did not generate client credentials");
 	if (
 		settings.host !== "https://destination.example" ||
 		settings.vaultId !== "new-vault" ||
-		settings.deviceId !== "new-device" ||
-		settings.deviceToken !== "new-token" ||
+		settings.deviceId !== expectedIdentity.deviceId ||
+		settings.deviceToken !== expectedIdentity.deviceToken ||
 		settings.vaultGeneration !== "new-generation" ||
 		settings.originImportPending !== true ||
 		settings.deviceName !== "Server device name"
@@ -211,7 +240,7 @@ s.test("fully unenrolled folder can enroll without replacement confirmation", as
 async function exerciseIncompleteEnrollment(
 	requestEnrollment: SetupLinkControllerDeps["requestEnrollment"],
 	options: { currentEnrollment?: boolean; retirementFails?: boolean } = {},
-): Promise<{ completed: boolean; settingsChanged: boolean; startCount: number }> {
+): Promise<{ completed: boolean; settingsChanged: boolean; activeEnrollmentChanged: boolean; startCount: number }> {
 	const settings: VaultSyncSettings = {
 		...DEFAULT_SETTINGS,
 		deviceName: "Test device",
@@ -226,6 +255,13 @@ async function exerciseIncompleteEnrollment(
 			: {}),
 	};
 	const originalSettings = JSON.stringify(settings);
+	const originalEnrollment = JSON.stringify({
+		host: settings.host,
+		deviceToken: settings.deviceToken,
+		vaultId: settings.vaultId,
+		deviceId: settings.deviceId,
+		vaultGeneration: settings.vaultGeneration,
+	});
 	let startCount = 0;
 	const controller = new SetupLinkController({
 		app: {
@@ -247,6 +283,13 @@ async function exerciseIncompleteEnrollment(
 	return {
 		completed,
 		settingsChanged: JSON.stringify(settings) !== originalSettings,
+		activeEnrollmentChanged: originalEnrollment !== JSON.stringify({
+			host: settings.host,
+			deviceToken: settings.deviceToken,
+			vaultId: settings.vaultId,
+			deviceId: settings.deviceId,
+			vaultGeneration: settings.vaultGeneration,
+		}),
 		startCount,
 	};
 }
@@ -258,28 +301,33 @@ for (const [label, requestEnrollment] of [
 ] satisfies Array<[string, SetupLinkControllerDeps["requestEnrollment"]]>) {
 	s.test(`${label} does not complete enrollment`, async () => {
 		const result = await exerciseIncompleteEnrollment(requestEnrollment);
-		if (result.completed || result.settingsChanged || result.startCount !== 0) {
-			throw new Error(`${label} advanced incomplete enrollment: ${JSON.stringify(result)}`);
+		if (result.completed || !result.settingsChanged || result.activeEnrollmentChanged || result.startCount !== 0) {
+			throw new Error(`${label} did not preserve its retryable pending enrollment: ${JSON.stringify(result)}`);
 		}
 	});
 }
 
 s.test("failed retirement preserves the current enrollment", async () => {
 	const result = await exerciseIncompleteEnrollment(
-		async () => ({
-			status: 200,
-			json: {
-				host: "https://new.example",
-				vaultId: "new-vault",
-				deviceId: "new-device",
-				deviceToken: "new-token",
-				deviceName: "New device",
-			},
-		}),
+		async (request) => {
+			const identity = enrollmentIdentity(request);
+			return {
+				status: 200,
+				json: {
+					host: "https://new.example",
+					vaultId: "new-vault",
+					deviceId: identity.deviceId,
+					deviceToken: identity.deviceToken,
+					deviceName: "New device",
+					vaultGeneration: "new-generation",
+					originImport: false,
+				},
+			};
+		},
 		{ currentEnrollment: true, retirementFails: true },
 	);
-	if (result.completed || result.settingsChanged || result.startCount !== 0) {
-		throw new Error(`failed retirement advanced replacement: ${JSON.stringify(result)}`);
+	if (result.completed || !result.settingsChanged || result.activeEnrollmentChanged || result.startCount !== 0) {
+		throw new Error(`failed retirement did not preserve retryable enrollment state: ${JSON.stringify(result)}`);
 	}
 });
 
@@ -310,15 +358,16 @@ s.test("successful replacement retires the captured old membership before persis
 			events.push("confirm");
 			return true;
 		},
-		requestEnrollment: async () => {
+		requestEnrollment: async (request) => {
 			events.push("enroll-request");
+			const identity = enrollmentIdentity(request);
 			return {
 				status: 200,
 				json: {
 					host: "https://new.example",
 					vaultId: "new-vault",
-					deviceId: "new-device",
-					deviceToken: "new-token",
+					deviceId: identity.deviceId,
+					deviceToken: identity.deviceToken,
 					deviceName: "Replacement device",
 					vaultGeneration: "new-generation",
 					originImport: false,
@@ -334,8 +383,8 @@ s.test("successful replacement retires the captured old membership before persis
 			await lifecycle.beginTeardown(async () => {});
 		},
 		updateSettings: async (mutator) => {
-			events.push("persist-new");
 			mutator(settings);
+			events.push(settings.pendingEnrollment ? "persist-pending" : "persist-new");
 		},
 		refreshServerCapabilities: async () => {
 			events.push("refresh-capabilities");
@@ -361,7 +410,7 @@ s.test("successful replacement retires the captured old membership before persis
 	}
 	if (
 		events.join(",") !==
-		"confirm,enroll-request,retire-old,persist-new,refresh-capabilities,init-sync"
+		"confirm,persist-pending,enroll-request,retire-old,persist-new,refresh-capabilities,init-sync"
 	) {
 		throw new Error(`replacement lifecycle ran out of order: ${events.join(",")}`);
 	}

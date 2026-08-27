@@ -3,7 +3,6 @@ import {
 	CONFIG_FORMAT,
 	MAX_DEVICE_RECORDS,
 	MAX_HASH_LENGTH,
-	MAX_ID_LENGTH,
 	MAX_OPERATOR_SESSION_RECORDS,
 	MAX_PAIRING_CODE_RECORDS,
 	MAX_VAULT_RECORDS,
@@ -39,9 +38,15 @@ const PAIRING_CODES_KEY = "pairingCodes";
 const VAULTS_KEY = "vaults";
 const SESSIONS_KEY = "operatorSessions";
 const PENDING_DESTROYS_KEY = "pendingVaultDestroys";
+const PENDING_DEVICE_REVOCATIONS_KEY = "pendingDeviceRevocations";
+const ENROLLMENT_REPLAYS_KEY = "enrollmentReplays";
 const PROVISIONING_ERROR_KEY_PREFIX = "vaultProvisioningError:";
 export const MAX_PENDING_DESTROYS = 256;
 const MAX_PENDING_DESTROY_ERROR_LENGTH = 512;
+export const MAX_PENDING_DEVICE_REVOCATIONS = MAX_DEVICE_RECORDS;
+export const MAX_ENROLLMENT_REPLAY_RECORDS = MAX_DEVICE_RECORDS;
+export const ENROLLMENT_REPLAY_TTL_MS = 24 * 60 * 60 * 1_000;
+const MAX_PENDING_REVOCATION_ERROR_LENGTH = 512;
 
 export interface PendingDestroyRecord {
 	vaultId: string;
@@ -57,6 +62,27 @@ export interface PendingDestroyRecord {
 	deletedObjects: number;
 	deletedBytes: number;
 	lastError: string | null;
+}
+
+export interface PendingDeviceRevocationRecord {
+	vaultId: string;
+	vaultGeneration: string;
+	deviceId: string;
+	requestedAt: number;
+	lastError: string | null;
+}
+
+export interface EnrollmentReplayRecord {
+	enrollmentRequestId: string;
+	pairingCodeHash: string;
+	deviceId: string;
+	deviceTokenHash: string;
+	vaultId: string;
+	vaultGeneration: string;
+	deviceName: string;
+	originImport: boolean;
+	createdAt: number;
+	expiresAt: number;
 }
 
 type UpdateProvider = "github" | "gitlab" | "unknown";
@@ -76,6 +102,7 @@ export interface ConsoleState {
 	devices: DevicePublic[];
 	pairingCodes: PairingCodePublic[];
 	pendingDestroys: PendingDestroyRecord[];
+	pendingDeviceRevocations: PendingDeviceRevocationRecord[];
 }
 
 function normalizeUpdateProvider(value: unknown): UpdateProvider | null {
@@ -125,6 +152,138 @@ function boundedDestroyError(value: unknown): string | null {
 	if (typeof value !== "string") return null;
 	const trimmed = value.trim();
 	return trimmed ? trimmed.slice(0, MAX_PENDING_DESTROY_ERROR_LENGTH) : null;
+}
+
+function boundedRevocationError(value: unknown): string {
+	const trimmed = typeof value === "string" ? value.trim() : "";
+	return (trimmed || "vault runtime revocation fence failed").slice(0, MAX_PENDING_REVOCATION_ERROR_LENGTH);
+}
+
+export function parsePendingDeviceRevocationRecords(value: unknown): PendingDeviceRevocationRecord[] {
+	const collection = "pendingDeviceRevocations";
+	if (value === undefined) return [];
+	if (!Array.isArray(value)) throw new CorruptIdentityStateError(collection, "expected an array");
+	if (value.length > MAX_PENDING_DEVICE_REVOCATIONS) {
+		throw new CorruptIdentityStateError(collection, "collection exceeds capacity");
+	}
+	const deviceIds = new Set<string>();
+	return value.map((item, index) => {
+		if (!Object.prototype.hasOwnProperty.call(value, index)) {
+			throw new CorruptIdentityStateError(collection, `record ${index} is missing`);
+		}
+		if (typeof item !== "object" || item === null || Array.isArray(item)) {
+			throw new CorruptIdentityStateError(collection, `record ${index} is not an object`);
+		}
+		const record = item as Record<string, unknown>;
+		const expectedKeys = ["vaultId", "vaultGeneration", "deviceId", "requestedAt", "lastError"];
+		const keys = Object.keys(record);
+		if (keys.length !== expectedKeys.length || keys.some((key) => !expectedKeys.includes(key))) {
+			throw new CorruptIdentityStateError(collection, `record ${index} has invalid shape`);
+		}
+		if (
+			typeof record.vaultId !== "string" || record.vaultId.trim() !== record.vaultId
+			|| !isUsableVaultId(record.vaultId)
+			|| typeof record.vaultGeneration !== "string"
+			|| record.vaultGeneration.trim() !== record.vaultGeneration
+			|| !isUsableVaultId(record.vaultGeneration)
+			|| typeof record.deviceId !== "string"
+			|| !/^[A-Za-z0-9_-]{1,128}$/.test(record.deviceId)
+			|| !Number.isSafeInteger(record.requestedAt) || (record.requestedAt as number) < 0
+		) {
+			throw new CorruptIdentityStateError(collection, `record ${index} has invalid identity`);
+		}
+		if (record.lastError !== null && (
+			typeof record.lastError !== "string"
+			|| record.lastError.length < 1
+			|| record.lastError.length > MAX_PENDING_REVOCATION_ERROR_LENGTH
+			|| record.lastError.trim() !== record.lastError
+		)) {
+			throw new CorruptIdentityStateError(collection, `record ${index} has invalid lastError`);
+		}
+		if (deviceIds.has(record.deviceId)) {
+			throw new CorruptIdentityStateError(collection, "duplicate deviceId");
+		}
+		deviceIds.add(record.deviceId);
+		return {
+			vaultId: record.vaultId,
+			vaultGeneration: record.vaultGeneration,
+			deviceId: record.deviceId,
+			requestedAt: record.requestedAt as number,
+			lastError: record.lastError,
+		};
+	});
+}
+
+export function parseEnrollmentReplayRecords(value: unknown): EnrollmentReplayRecord[] {
+	const collection = "enrollmentReplays";
+	if (value === undefined) return [];
+	if (!Array.isArray(value)) throw new CorruptIdentityStateError(collection, "expected an array");
+	if (value.length > MAX_ENROLLMENT_REPLAY_RECORDS) {
+		throw new CorruptIdentityStateError(collection, "collection exceeds capacity");
+	}
+	const requestIds = new Set<string>();
+	const deviceIds = new Set<string>();
+	const tokenHashes = new Set<string>();
+	const codeHashes = new Set<string>();
+	return value.map((item, index) => {
+		if (!Object.prototype.hasOwnProperty.call(value, index)) {
+			throw new CorruptIdentityStateError(collection, `record ${index} is missing`);
+		}
+		if (typeof item !== "object" || item === null || Array.isArray(item)) {
+			throw new CorruptIdentityStateError(collection, `record ${index} is not an object`);
+		}
+		const record = item as Record<string, unknown>;
+		const expectedKeys = [
+			"enrollmentRequestId", "pairingCodeHash", "deviceId", "deviceTokenHash", "vaultId",
+			"vaultGeneration", "deviceName", "originImport", "createdAt", "expiresAt",
+		];
+		const keys = Object.keys(record);
+		if (keys.length !== expectedKeys.length || keys.some((key) => !expectedKeys.includes(key))) {
+			throw new CorruptIdentityStateError(collection, `record ${index} has invalid shape`);
+		}
+		if (
+			typeof record.enrollmentRequestId !== "string"
+			|| !/^[A-Za-z0-9_-]{16,128}$/.test(record.enrollmentRequestId)
+			|| typeof record.deviceId !== "string"
+			|| !/^[A-Za-z0-9_-]{1,128}$/.test(record.deviceId)
+			|| typeof record.pairingCodeHash !== "string" || !/^[a-f0-9]{64}$/.test(record.pairingCodeHash)
+			|| typeof record.deviceTokenHash !== "string" || !/^[a-f0-9]{64}$/.test(record.deviceTokenHash)
+			|| typeof record.vaultId !== "string" || record.vaultId.trim() !== record.vaultId
+			|| !isUsableVaultId(record.vaultId)
+			|| typeof record.vaultGeneration !== "string"
+			|| record.vaultGeneration.trim() !== record.vaultGeneration
+			|| !isUsableVaultId(record.vaultGeneration)
+			|| typeof record.deviceName !== "string" || record.deviceName.length < 1
+			|| record.deviceName.length > 80 || record.deviceName.trim() !== record.deviceName
+			|| typeof record.originImport !== "boolean"
+			|| !Number.isSafeInteger(record.createdAt) || (record.createdAt as number) < 0
+			|| !Number.isSafeInteger(record.expiresAt)
+			|| (record.expiresAt as number) <= (record.createdAt as number)
+		) {
+			throw new CorruptIdentityStateError(collection, `record ${index} has invalid enrollment replay`);
+		}
+		for (const [values, field, candidate] of [
+			[requestIds, "enrollmentRequestId", record.enrollmentRequestId],
+			[deviceIds, "deviceId", record.deviceId],
+			[tokenHashes, "deviceTokenHash", record.deviceTokenHash],
+			[codeHashes, "pairingCodeHash", record.pairingCodeHash],
+		] as Array<[Set<string>, string, string]>) {
+			if (values.has(candidate)) throw new CorruptIdentityStateError(collection, `duplicate ${field}`);
+			values.add(candidate);
+		}
+		return {
+			enrollmentRequestId: record.enrollmentRequestId,
+			pairingCodeHash: record.pairingCodeHash,
+			deviceId: record.deviceId,
+			deviceTokenHash: record.deviceTokenHash,
+			vaultId: record.vaultId,
+			vaultGeneration: record.vaultGeneration,
+			deviceName: record.deviceName,
+			originImport: record.originImport,
+			createdAt: record.createdAt as number,
+			expiresAt: record.expiresAt as number,
+		};
+	});
 }
 
 export function parsePendingDestroyRecords(
@@ -266,6 +425,8 @@ export class ServerConfig {
 			case "/__yaos/revoke-session": return this.handleRevokeSession(request);
 			case "/__yaos/verify-operator": return this.handleVerifyOperator(request);
 			case "/__yaos/revoke-device": return this.handleRevokeDevice(request);
+			case "/__yaos/complete-device-revocation": return this.handleCompleteDeviceRevocation(request);
+			case "/__yaos/fail-device-revocation": return this.handleFailDeviceRevocation(request);
 			case "/__yaos/rename-device": return this.handleRenameDevice(request);
 			case "/__yaos/verify-device": return this.handleVerifyDevice(request);
 			case "/__yaos/create-vault": return this.handleCreateVault(request);
@@ -350,6 +511,8 @@ export class ServerConfig {
 			await txn.put(PAIRING_CODES_KEY, []);
 			await txn.put(SESSIONS_KEY, []);
 			await txn.put(PENDING_DESTROYS_KEY, []);
+			await txn.put(PENDING_DEVICE_REVOCATIONS_KEY, []);
+			await txn.put(ENROLLMENT_REPLAYS_KEY, []);
 			return json({ ok: true, vaultId, vaultGeneration: vault.vaultGeneration, vaultName, created: true });
 		});
 	}
@@ -474,68 +637,118 @@ export class ServerConfig {
 	}
 
 	private async handleEnroll(request: Request): Promise<Response> {
-		let body: { pairingCodeHash?: string; deviceId?: string; deviceTokenHash?: string; deviceName?: string };
+		let body: {
+			enrollmentRequestId?: string;
+			pairingCodeHash?: string;
+			deviceId?: string;
+			deviceTokenHash?: string;
+			deviceName?: string;
+		};
 		try {
 			body = await request.json();
 		} catch {
 			return json({ error: "invalid json" }, 400);
 		}
 		if (
-			typeof body.pairingCodeHash !== "string"
-			|| body.pairingCodeHash.length < 1
-			|| body.pairingCodeHash.length > MAX_HASH_LENGTH
+			typeof body.enrollmentRequestId !== "string"
+			|| !/^[A-Za-z0-9_-]{16,128}$/.test(body.enrollmentRequestId)
+			|| typeof body.pairingCodeHash !== "string"
+			|| !/^[a-f0-9]{64}$/.test(body.pairingCodeHash)
 			|| typeof body.deviceId !== "string"
-			|| body.deviceId.trim() !== body.deviceId
-			|| body.deviceId.length < 1
-			|| body.deviceId.length > MAX_ID_LENGTH
+			|| !/^[A-Za-z0-9_-]{1,128}$/.test(body.deviceId)
 			|| typeof body.deviceTokenHash !== "string"
-			|| body.deviceTokenHash.length < 1
-			|| body.deviceTokenHash.length > MAX_HASH_LENGTH
+			|| !/^[a-f0-9]{64}$/.test(body.deviceTokenHash)
 		) {
 			return json({ error: "invalid enroll" }, 400);
 		}
+		const enrollmentRequestId = body.enrollmentRequestId;
+		const pairingCodeHash = body.pairingCodeHash;
+		const deviceId = body.deviceId;
+		const deviceTokenHash = body.deviceTokenHash;
 		const desiredName = typeof body.deviceName === "string" && body.deviceName.trim()
 			? body.deviceName.trim().slice(0, 50)
 			: "unnamed-device";
 		return this.state.storage.transaction(async (txn) => {
+			const now = Date.now();
+			const storedReplays = parseEnrollmentReplayRecords(await txn.get(ENROLLMENT_REPLAYS_KEY));
+			const replays = storedReplays.filter((record) => record.expiresAt > now);
+			if (replays.length !== storedReplays.length) await txn.put(ENROLLMENT_REPLAYS_KEY, replays);
+			const replay = replays.find((record) => record.enrollmentRequestId === enrollmentRequestId);
+			if (replay) {
+				if (
+					replay.pairingCodeHash !== pairingCodeHash
+					|| replay.deviceId !== deviceId
+					|| replay.deviceTokenHash !== deviceTokenHash
+				) {
+					return json({ error: "enrollment_request_conflict" }, 409);
+				}
+				return json({
+					ok: true,
+					vaultId: replay.vaultId,
+					vaultGeneration: replay.vaultGeneration,
+					deviceId: replay.deviceId,
+					deviceName: replay.deviceName,
+					originImport: replay.originImport,
+					replayed: true,
+				});
+			}
+			if (replays.some((record) => record.pairingCodeHash === pairingCodeHash)) {
+				return json({ error: "used_code", message: "This pairing code was already used." }, 409);
+			}
+
 			const vaults = parseVaultRecords(await txn.get(VAULTS_KEY));
 			const vaultIds = new Set(vaults.map((vault) => vault.vaultId));
 			const codes = parsePairingCodeRecords(await txn.get(PAIRING_CODES_KEY), vaultIds);
 			const devices = parseDeviceRecords(await txn.get(DEVICES_KEY), vaultIds);
-			const match = findHashedRecord(codes, body.pairingCodeHash!, (code) => code.codeHash);
+			const match = findHashedRecord(codes, pairingCodeHash, (code) => code.codeHash);
 			if (!match) return json({ error: "unknown_code", message: "This pairing code is not recognized." }, 404);
 			const vault = vaults.find((record) => record.vaultId === match.vaultId);
 			if (!vault || vault.state !== "active") {
 				return json({ error: "vault_not_active", message: "This vault is not ready for enrollment." }, 409);
 			}
-			const now = Date.now();
 			if (match.exp <= now) return json({ error: "expired_code", message: "This pairing code has expired. Ask for a new one." }, 410);
 			if (match.uses >= 1) return json({ error: "used_code", message: "This pairing code was already used." }, 409);
-			if (devices.some((device) => device.deviceId === body.deviceId || device.tokenHash === body.deviceTokenHash)) {
+			if (devices.some((device) => device.deviceId === deviceId || device.tokenHash === deviceTokenHash)) {
 				return json({ error: "device_exists" }, 409);
 			}
 			if (devices.length >= MAX_DEVICE_RECORDS) return json({ error: "device_capacity" }, 503);
+			if (replays.length >= MAX_ENROLLMENT_REPLAY_RECORDS) return json({ error: "enrollment_replay_capacity" }, 503);
 			const name = uniqueDeviceName(
 				desiredName,
 				devices.filter((device) => device.vaultId === match.vaultId).map((device) => device.name),
 			);
 			const device: DeviceRecord = {
-				deviceId: body.deviceId!,
+				deviceId,
 				vaultId: match.vaultId,
-				tokenHash: body.deviceTokenHash!,
+				tokenHash: deviceTokenHash,
 				name,
 				enrolledAt: now,
 			};
+			const replayRecord: EnrollmentReplayRecord = {
+				enrollmentRequestId,
+				pairingCodeHash,
+				deviceId: device.deviceId,
+				deviceTokenHash,
+				vaultId: device.vaultId,
+				vaultGeneration: vault.vaultGeneration,
+				deviceName: name,
+				originImport: match.purpose === "origin",
+				createdAt: now,
+				expiresAt: now + ENROLLMENT_REPLAY_TTL_MS,
+			};
 			devices.push(device);
+			replays.push(replayRecord);
 			await txn.put(DEVICES_KEY, devices);
+			await txn.put(ENROLLMENT_REPLAYS_KEY, replays);
 			await txn.put(PAIRING_CODES_KEY, codes.filter((code) => code !== match && code.exp > now && code.uses < 1));
 			return json({
 				ok: true,
-				vaultId: device.vaultId,
-				vaultGeneration: vault.vaultGeneration,
-				deviceId: device.deviceId,
-				deviceName: name,
-				originImport: match.purpose === "origin",
+				vaultId: replayRecord.vaultId,
+				vaultGeneration: replayRecord.vaultGeneration,
+				deviceId: replayRecord.deviceId,
+				deviceName: replayRecord.deviceName,
+				originImport: replayRecord.originImport,
+				replayed: false,
 			});
 		});
 	}
@@ -694,17 +907,113 @@ export class ServerConfig {
 		} catch {
 			return json({ error: "invalid json" }, 400);
 		}
-		if (!body.deviceId) return json({ error: "invalid deviceId" }, 400);
+		if (typeof body.deviceId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(body.deviceId)) {
+			return json({ error: "invalid deviceId" }, 400);
+		}
+		const deviceId = body.deviceId;
 		return this.state.storage.transaction(async (txn) => {
 			const vaults = parseVaultRecords(await txn.get(VAULTS_KEY));
 			const devices = parseDeviceRecords(
 				await txn.get(DEVICES_KEY),
 				new Set(vaults.map((vault) => vault.vaultId)),
 			);
-			const device = devices.find((record) => record.deviceId === body.deviceId);
-			if (!device) return json({ error: "unknown_device" }, 404);
+			const pendingRevocations = parsePendingDeviceRevocationRecords(
+				await txn.get(PENDING_DEVICE_REVOCATIONS_KEY),
+			);
+			const existing = pendingRevocations.find((record) => record.deviceId === deviceId);
+			const device = devices.find((record) => record.deviceId === deviceId);
+			if (!device) {
+				return existing
+					? json({ ok: true, membershipRevoked: true, revocation: existing })
+					: json({ error: "unknown_device" }, 404);
+			}
+			const vault = vaults.find((record) => record.vaultId === device.vaultId);
+			if (!vault) return json({ error: "unknown_vault" }, 409);
+			if (pendingRevocations.length >= MAX_PENDING_DEVICE_REVOCATIONS && !existing) {
+				return json({ error: "pending_device_revocation_capacity" }, 503);
+			}
+			const revocation: PendingDeviceRevocationRecord = existing ?? {
+				vaultId: device.vaultId,
+				vaultGeneration: vault.vaultGeneration,
+				deviceId: device.deviceId,
+				requestedAt: Date.now(),
+				lastError: null,
+			};
+			if (!existing) pendingRevocations.push(revocation);
+			await txn.put(PENDING_DEVICE_REVOCATIONS_KEY, pendingRevocations);
 			await txn.put(DEVICES_KEY, devices.filter((record) => record !== device));
-			return json({ ok: true, device: toDevicePublic(device) });
+			return json({
+				ok: true,
+				membershipRevoked: true,
+				device: toDevicePublic(device),
+				revocation,
+			});
+		});
+	}
+
+	private async handleCompleteDeviceRevocation(request: Request): Promise<Response> {
+		let body: { vaultId?: string; vaultGeneration?: string; deviceId?: string };
+		try {
+			body = await request.json();
+		} catch {
+			return json({ error: "invalid json" }, 400);
+		}
+		if (
+			typeof body.vaultId !== "string" || !isUsableVaultId(body.vaultId) || body.vaultId.trim() !== body.vaultId
+			|| typeof body.vaultGeneration !== "string" || !isUsableVaultId(body.vaultGeneration)
+			|| body.vaultGeneration.trim() !== body.vaultGeneration
+			|| typeof body.deviceId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(body.deviceId)
+		) {
+			return json({ error: "invalid device revocation" }, 400);
+		}
+		const identity = {
+			vaultId: body.vaultId,
+			vaultGeneration: body.vaultGeneration,
+			deviceId: body.deviceId,
+		};
+		return this.state.storage.transaction(async (txn) => {
+			const pending = parsePendingDeviceRevocationRecords(await txn.get(PENDING_DEVICE_REVOCATIONS_KEY));
+			const match = pending.find((record) =>
+				record.vaultId === identity.vaultId
+				&& record.vaultGeneration === identity.vaultGeneration
+				&& record.deviceId === identity.deviceId);
+			if (!match) return json({ error: "unknown_device_revocation" }, 404);
+			await txn.put(PENDING_DEVICE_REVOCATIONS_KEY, pending.filter((record) => record !== match));
+			return json({ ok: true, completed: true });
+		});
+	}
+
+	private async handleFailDeviceRevocation(request: Request): Promise<Response> {
+		let body: { vaultId?: string; vaultGeneration?: string; deviceId?: string; lastError?: unknown };
+		try {
+			body = await request.json();
+		} catch {
+			return json({ error: "invalid json" }, 400);
+		}
+		if (
+			typeof body.vaultId !== "string" || !isUsableVaultId(body.vaultId) || body.vaultId.trim() !== body.vaultId
+			|| typeof body.vaultGeneration !== "string" || !isUsableVaultId(body.vaultGeneration)
+			|| body.vaultGeneration.trim() !== body.vaultGeneration
+			|| typeof body.deviceId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(body.deviceId)
+		) {
+			return json({ error: "invalid device revocation" }, 400);
+		}
+		const identity = {
+			vaultId: body.vaultId,
+			vaultGeneration: body.vaultGeneration,
+			deviceId: body.deviceId,
+		};
+		const lastError = boundedRevocationError(body.lastError);
+		return this.state.storage.transaction(async (txn) => {
+			const pending = parsePendingDeviceRevocationRecords(await txn.get(PENDING_DEVICE_REVOCATIONS_KEY));
+			const match = pending.find((record) =>
+				record.vaultId === identity.vaultId
+				&& record.vaultGeneration === identity.vaultGeneration
+				&& record.deviceId === identity.deviceId);
+			if (!match) return json({ error: "unknown_device_revocation" }, 404);
+			match.lastError = lastError;
+			await txn.put(PENDING_DEVICE_REVOCATIONS_KEY, pending);
+			return json({ ok: false, completed: false, revocation: match }, 202);
 		});
 	}
 
@@ -854,6 +1163,10 @@ export class ServerConfig {
 			const pendingDestroys = parsePendingDestroyRecords(await txn.get(PENDING_DESTROYS_KEY), nonDeletingVaultIds);
 			const devices = parseDeviceRecords(await txn.get(DEVICES_KEY), vaultIds);
 			const codes = parsePairingCodeRecords(await txn.get(PAIRING_CODES_KEY), vaultIds);
+			const pendingRevocations = parsePendingDeviceRevocationRecords(
+				await txn.get(PENDING_DEVICE_REVOCATIONS_KEY),
+			);
+			const enrollmentReplays = parseEnrollmentReplayRecords(await txn.get(ENROLLMENT_REPLAYS_KEY));
 			const pending = pendingDestroys.find((record) => record.vaultId === vaultId);
 			if (pending) return json({ ok: true, pending });
 
@@ -886,6 +1199,14 @@ export class ServerConfig {
 			await txn.put(VAULTS_KEY, vaults);
 			await txn.put(DEVICES_KEY, nextDevices);
 			await txn.put(PAIRING_CODES_KEY, nextCodes);
+			await txn.put(
+				PENDING_DEVICE_REVOCATIONS_KEY,
+				pendingRevocations.filter((revocation) => revocation.vaultId !== vaultId),
+			);
+			await txn.put(
+				ENROLLMENT_REPLAYS_KEY,
+				enrollmentReplays.filter((replay) => replay.vaultId !== vaultId),
+			);
 			return json({ ok: true, pending: record });
 		});
 	}
@@ -1051,11 +1372,15 @@ export class ServerConfig {
 			await this.state.storage.get(PENDING_DESTROYS_KEY),
 			new Set(vaults.filter((vault) => vault.state !== "deleting" && vault.state !== "delete_failed").map((vault) => vault.vaultId)),
 		);
+		const pendingDeviceRevocations = parsePendingDeviceRevocationRecords(
+			await this.state.storage.get(PENDING_DEVICE_REVOCATIONS_KEY),
+		);
 		return {
 			vaults,
 			devices: devices.map(toDevicePublic),
 			pairingCodes: codes.filter((code) => code.uses < 1 && code.exp > now).map(toPairingPublic),
 			pendingDestroys,
+			pendingDeviceRevocations,
 		};
 	}
 

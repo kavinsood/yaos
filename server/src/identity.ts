@@ -24,7 +24,14 @@ const MAX_DEVICE_NAME_LENGTH = 80;
 const MAX_RECORD_COUNT = 1_000_000;
 const MAX_CORRUPT_STATE_ERROR_LENGTH = 192;
 
-type IdentityCollection = "vaults" | "devices" | "pairingCodes" | "operatorSessions" | "pendingVaultDestroys";
+type IdentityCollection =
+	| "vaults"
+	| "devices"
+	| "pairingCodes"
+	| "operatorSessions"
+	| "pendingVaultDestroys"
+	| "pendingDeviceRevocations"
+	| "enrollmentReplays";
 
 export class CorruptIdentityStateError extends Error {
 	readonly code = "corrupt_identity_state";
