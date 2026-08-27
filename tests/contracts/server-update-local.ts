@@ -48,38 +48,28 @@ try {
 	run("git", ["add", "-A"]);
 	run("git", ["commit", "-qm", "simulate older deployed server"]);
 
-	run("node", ["scripts/update-from-release.mjs"], {
-		env: {
-			...process.env,
-			YAOS_RELEASE_FILE: artifactPath,
-		},
-	});
-
-	const updatedVersion = read("src/version.ts");
-	if (updatedVersion !== baselineVersion) {
-		throw new Error("Update test failed: src/version.ts was not restored from the artifact");
+	let rejected = false;
+	try {
+		run("node", ["scripts/update-from-release.mjs"], {
+			env: { ...process.env, YAOS_RELEASE_FILE: artifactPath },
+			stdio: "pipe",
+		});
+	} catch (error) {
+		const output = error && typeof error === "object" && "stderr" in error
+			? String(error.stderr)
+			: String(error);
+		rejected = output.includes("requires a fresh deployment");
 	}
-
-	const updatedWrangler = read("wrangler.toml");
-	if (!updatedWrangler.includes("# local-test-preserved")) {
-		throw new Error("Update test failed: protected wrangler.toml changes were overwritten");
+	if (!rejected) {
+		throw new Error("Fresh-deployment artifact was accepted by the in-place updater");
 	}
-
-	run("git", ["add", "-A"]);
-	run("git", ["commit", "-qm", `yaos(server): update to ${currentServerVersion}`]);
-	run("node", ["scripts/revert-last-update.mjs"]);
-
-	const revertedVersion = read("src/version.ts");
-	if (!revertedVersion.includes('SERVER_VERSION = "0.1.9"')) {
-		throw new Error("Revert test failed: update-owned files were not restored");
+	if (!read("src/version.ts").includes('SERVER_VERSION = "0.1.9"')) {
+		throw new Error("Rejected fresh deployment modified update-owned files");
 	}
-
-	const revertedWrangler = read("wrangler.toml");
-	if (!revertedWrangler.includes("# local-test-preserved")) {
-		throw new Error("Revert test failed: protected wrangler.toml changes were lost");
+	if (!read("wrangler.toml").includes("# local-test-preserved")) {
+		throw new Error("Rejected fresh deployment modified wrangler.toml");
 	}
-
-	console.log("Local YAOS server update/revert smoke test passed.");
+	console.log("Fresh schema-4 server artifact is rejected by the in-place updater.");
 } finally {
 	rmSync(tempDir, { recursive: true, force: true });
 }

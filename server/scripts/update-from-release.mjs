@@ -175,6 +175,11 @@ async function main() {
 	if (!Array.isArray(rawManifest.updateOwnedPaths)) {
 		throw new Error("Artifact manifest is missing updateOwnedPaths");
 	}
+	if (rawManifest.deploymentBoundary === "fresh") {
+		throw new Error(
+			"This YAOS server release requires a fresh deployment and cannot be applied by the in-place updater.",
+		);
+	}
 	const wranglerWarnings = collectWranglerDriftWarnings(
 		join(repoRoot, "wrangler.toml"),
 		join(extractDir, "wrangler.toml"),

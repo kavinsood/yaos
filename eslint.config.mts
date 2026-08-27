@@ -49,6 +49,11 @@ export default tseslint.config(
 				tsconfigRootDir: import.meta.dirname,
 			},
 		},
+		rules: {
+			// Server code runs in Cloudflare Workers, not Obsidian renderer windows.
+			"obsidianmd/prefer-window-timers": "off",
+			"obsidianmd/no-global-this": "off",
+		},
 	},
 	{
 		files: ["server/tests/**/*.ts"],

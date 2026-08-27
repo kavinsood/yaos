@@ -12,6 +12,21 @@ const rootPackage = JSON.parse(readFileSync(resolve(rootDir, "package.json"), "u
 const pluginManifest = JSON.parse(readFileSync(resolve(rootDir, "manifest.json"), "utf8"));
 const serverPackage = JSON.parse(readFileSync(resolve(rootDir, "server/package.json"), "utf8"));
 const serverVersionSource = readFileSync(resolve(rootDir, "server/src/version.ts"), "utf8");
+const productVersionsSource = readFileSync(
+	resolve(rootDir, "server/src/shared/productVersions.ts"),
+	"utf8",
+);
+const wranglerSource = readFileSync(resolve(rootDir, "server/wrangler.toml"), "utf8");
+
+function requireRecoveryDeploymentContract(source) {
+	const binding = /\[\[durable_objects\.bindings\]\][\s\S]*?name\s*=\s*"YAOS_RECOVERY_JOBS"[\s\S]*?class_name\s*=\s*"RecoveryJob"/.test(source);
+	const sqliteClass = /\[\[migrations\]\][\s\S]*?new_sqlite_classes\s*=\s*\[[^\]]*"RecoveryJob"[^\]]*\]/.test(source);
+	if (!binding || !sqliteClass) {
+		throw new Error("server/wrangler.toml must bind YAOS_RECOVERY_JOBS to the SQLite RecoveryJob class");
+	}
+}
+
+requireRecoveryDeploymentContract(wranglerSource);
 
 function readStringConst(source, name) {
 	const match = source.match(new RegExp(`export const ${name} = "([^"]*)";`));
@@ -20,16 +35,22 @@ function readStringConst(source, name) {
 	}
 	return match[1];
 }
+function readNumberConst(source, name) {
+	const match = source.match(new RegExp(`export const ${name} = (\\d+);`));
+	if (!match) {
+		throw new Error(`Unable to read numeric constant ${name} from shared product versions`);
+	}
+	return Number(match[1]);
+}
 
 const serverVersion = readStringConst(serverVersionSource, "SERVER_VERSION");
-const minCompatibleServerVersionForPlugin = readStringConst(
-	serverVersionSource,
-	"SERVER_MIN_COMPATIBLE_SERVER_VERSION_FOR_PLUGIN",
-);
-const minCompatiblePluginVersionForServer = readStringConst(
-	serverVersionSource,
-	"SERVER_MIN_COMPATIBLE_PLUGIN_VERSION_FOR_SERVER",
-);
+const schemaVersion = readNumberConst(productVersionsSource, "SCHEMA_VERSION");
+const storageFormatVersion = readNumberConst(productVersionsSource, "STORAGE_FORMAT_VERSION");
+const protocolVersion = readNumberConst(productVersionsSource, "PROTOCOL_VERSION");
+const snapshotFormatVersion = readNumberConst(productVersionsSource, "SNAPSHOT_FORMAT_VERSION");
+if (schemaVersion !== 4 || storageFormatVersion !== 1 || protocolVersion !== 1 || snapshotFormatVersion !== 2) {
+	throw new Error("server product versions must remain schema 4 / storage 1 / protocol 1 / snapshot 2");
+}
 
 if (serverPackage.version !== serverVersion) {
 	throw new Error(
@@ -49,18 +70,21 @@ const serverReleaseCopyPaths = [...serverReleaseOwnedPaths, "wrangler.toml"];
 const updateManifest = {
 	latestServerVersion: serverVersion,
 	latestPluginVersion: pluginManifest.version,
-	releaseType: "compatible",
-	autoUpdateEligible: false,
-	minCompatibleServerVersionForPlugin,
-	minCompatiblePluginVersionForServer,
-	upgradeOrder: "either",
+	schemaVersion,
+	storageFormatVersion,
+	protocolVersion,
+	snapshotFormatVersion,
+	deploymentBoundary: "fresh",
 	releaseNotesUrl: `https://github.com/kavinsood/yaos/releases/tag/${rootPackage.version}`,
-	upgradeGuideUrl: "https://github.com/kavinsood/yaos#updating-your-server",
 };
 
 const serverZipManifest = {
+	deploymentBoundary: "fresh",
 	serverVersion,
-	pluginVersion: pluginManifest.version,
+	schemaVersion,
+	storageFormatVersion,
+	protocolVersion,
+	snapshotFormatVersion,
 	updateOwnedPaths: serverReleaseOwnedPaths,
 };
 
