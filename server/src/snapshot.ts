@@ -156,6 +156,14 @@ async function listAllKeys(bucket: R2Bucket, prefix: string): Promise<string[]> 
 	return keys;
 }
 
+export async function deleteVaultPrefix(bucket: R2Bucket, vaultId: string): Promise<number> {
+	const keys = await listAllKeys(bucket, `v1/${vaultId}/`);
+	for (const key of keys) {
+		await bucket.delete(key);
+	}
+	return keys.length;
+}
+
 export async function hasSnapshotForDay(
 	vaultId: string,
 	day: string,

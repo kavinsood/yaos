@@ -98,12 +98,15 @@ export class VaultSyncServer extends YServer<Env> {
 	};
 
 	private documentLoaded = false;
+	private destroyed = false;
 	private loadPromise: Promise<void> | null = null;
 	private roomIdHint: string | null = null;
 	private sqlDocStore: SqlDocStore | null = null;
 	private persistence: PersistenceCoordinator | null = null;
 	private snapshotMaybeChain: Promise<void> = Promise.resolve();
 	private roomMeta: RoomMeta | null = null;
+	private destroyPromise: Promise<void> | null = null;
+	private readonly inFlightWork = new Set<Promise<unknown>>();
 	private readonly traceRateLimiter = new TraceRateLimiter();
 	private readonly svEchoCounters: SvEchoCounters = {
 		baselineSent: 0,
@@ -154,31 +157,90 @@ export class VaultSyncServer extends YServer<Env> {
 	private coldLoadDurationMs: number | null = null;
 	private oversizedDeltaCount = 0;
 
+	private throwIfDestroyed(): void {
+		if (this.destroyed) {
+			throw new Error(`${LOG_PREFIX} vault destroyed`);
+		}
+	}
+
+	private trackInFlight<T>(work: Promise<T>): Promise<T> {
+		this.inFlightWork.add(work);
+		void work.then(
+			() => { this.inFlightWork.delete(work); },
+			() => { this.inFlightWork.delete(work); },
+		);
+		return work;
+	}
+
+	private async drainInFlightWork(): Promise<void> {
+		while (this.inFlightWork.size > 0) {
+			await Promise.allSettled([...this.inFlightWork]);
+		}
+	}
+
+	private beginDestroy(): Promise<void> {
+		if (this.destroyPromise) return this.destroyPromise;
+
+		// This is a terminal fence, set before the first await. Every entry point
+		// observes it before it can start more persistence work.
+		this.destroyed = true;
+		for (const connection of this.getConnections()) {
+			try {
+				connection.close(4000, "vault destroyed");
+			} catch {
+				// Storage deletion remains authoritative.
+			}
+		}
+
+		const load = this.loadPromise;
+		const coordinator = this.persistence;
+		const snapshots = this.snapshotMaybeChain;
+		this.destroyPromise = (async () => {
+			// Explicitly drain each independent writer. The general work set also
+			// catches room-meta and trace writes spawned by an operation already
+			// in flight when the fence was raised.
+			await Promise.allSettled([
+				...(load ? [load] : []),
+				...(coordinator ? [coordinator.drain()] : []),
+				snapshots,
+			]);
+			await this.drainInFlightWork();
+
+			coordinator?.dispose();
+			this.documentLoaded = false;
+			this.loadPromise = null;
+			this.sqlDocStore = null;
+			this.persistence = null;
+			this.roomMeta = null;
+			await this.ctx.storage.deleteAll();
+		})();
+		return this.destroyPromise;
+	}
+
 	async onLoad(): Promise<void> {
 		await this.ensureDocumentLoaded();
 	}
 
 	async onSave(): Promise<void> {
-		await this.ensureDocumentLoaded();
+		if (this.destroyed) return;
+		await this.trackInFlight((async () => {
+			await this.ensureDocumentLoaded();
+			if (this.destroyed) return;
 
-		// Delegate to PersistenceCoordinator — the single source of truth
-		// for save orchestration, fallback, and health tracking.
-		//
-		// onSave() intentionally does NOT throw on persistence failure.
-		// Failure is represented by coordinator health state:
-		//   status === "degraded"
-		//   pendingPersistence === true
-		//   lastSaveError set
-		// These are surfaced via /__yaos/debug endpoint.
-		// Throwing here would only produce unhandled rejection noise in the
-		// y-partyserver framework without aiding recovery. The coordinator
-		// handles retry via immediate checkpoint fallback on the next save.
-		const coordinator = this.getPersistenceCoordinator();
-		const result = await coordinator.enqueueSave();
-		if (!result.success) {
-			console.error(`${LOG_PREFIX} save failed (health: degraded, pendingPersistence: true):`, result.error);
-		}
-		await this.syncRoomMetaFromDocument();
+			// Delegate to PersistenceCoordinator — the single source of truth
+			// for save orchestration, fallback, and health tracking.
+			//
+			// onSave() intentionally does NOT throw on persistence failure.
+			// Failure is represented by coordinator health state and surfaced via
+			// /__yaos/debug. The coordinator retries through checkpoint fallback.
+			const coordinator = this.getPersistenceCoordinator();
+			const result = await coordinator.enqueueSave();
+			if (this.destroyed) return;
+			if (!result.success) {
+				console.error(`${LOG_PREFIX} save failed (health: degraded, pendingPersistence: true):`, result.error);
+			}
+			await this.syncRoomMetaFromDocument();
+		})());
 	}
 
 	/**
@@ -190,6 +252,14 @@ export class VaultSyncServer extends YServer<Env> {
 	 */
 
 	async onConnect(connection: Connection, ctx: ConnectionContext): Promise<void> {
+		if (this.destroyed) {
+			try {
+				connection.close(4000, "vault destroyed");
+			} catch {
+				// The isolate is already shutting down.
+			}
+			return;
+		}
 		await super.onConnect(connection, ctx);
 		this.recordSvEchoResult(trySendSvEcho(connection, this.document, "baseline", this.svEchoDurability()));
 	}
@@ -355,17 +425,25 @@ export class VaultSyncServer extends YServer<Env> {
 			const rejection = disabledAdminRouteResponse(this.env);
 			if (rejection) return rejection;
 			await this.ensureDocumentLoaded();
+			this.throwIfDestroyed();
 			return json(await this.executeEmergencyCompact());
+		}
+
+		if (request.method === "POST" && url.pathname === "/__yaos/delete-all") {
+			await this.beginDestroy();
+			return json({ ok: true });
 		}
 
 		if (request.method === "POST" && url.pathname === "/__yaos/snapshot-maybe") {
 			await this.ensureDocumentLoaded();
+			this.throwIfDestroyed();
 			let body: { device?: string } = {};
 			try {
 				body = await request.json();
 			} catch {
 				body = {};
 			}
+			this.throwIfDestroyed();
 			return json(await this.createDailySnapshotMaybe(body.device));
 		}
 
@@ -414,9 +492,11 @@ export class VaultSyncServer extends YServer<Env> {
 	}
 
 	private async ensureDocumentLoaded(): Promise<void> {
+		this.throwIfDestroyed();
 		if (this.documentLoaded) return;
 		const gate = { inFlight: this.loadPromise };
 		const run = runSingleFlight(gate, async () => {
+			this.throwIfDestroyed();
 			if (this.documentLoaded) return;
 
 			const coldLoadStart = performance.now();
@@ -471,12 +551,14 @@ export class VaultSyncServer extends YServer<Env> {
 				this.documentLoaded = true;
 				this.coldLoadDurationMs = performance.now() - coldLoadStart;
 				await this.syncRoomMetaFromDocument();
+				this.throwIfDestroyed();
 				await this.recordTrace("checkpoint-load", {
 					storage: "sql",
 					hasSnapshot: sqlState.snapshot !== null,
 					journalEntryCount: sqlState.journalStats.entryCount,
 					journalBytes: sqlState.journalStats.totalBytes,
 				});
+				this.throwIfDestroyed();
 				return;
 			}
 
@@ -489,6 +571,7 @@ export class VaultSyncServer extends YServer<Env> {
 			this.documentLoaded = true;
 			this.coldLoadDurationMs = performance.now() - coldLoadStart;
 			await this.syncRoomMetaFromDocument();
+			this.throwIfDestroyed();
 			await this.recordTrace("checkpoint-load", {
 				storage: "sql",
 				hasSnapshot: false,
@@ -496,19 +579,22 @@ export class VaultSyncServer extends YServer<Env> {
 				journalBytes: 0,
 				note: "fresh DO, no existing state",
 			});
+			this.throwIfDestroyed();
 		});
 		this.loadPromise = gate.inFlight;
 		try {
-			await run;
+			await this.trackInFlight(run);
 		} finally {
 			this.loadPromise = gate.inFlight;
 		}
+		this.throwIfDestroyed();
 
 		// Both load paths funnel through here, so this is the one place the
 		// reaper can run exactly once per instance without duplicating the call
 		// across the loaded and fresh branches.  A room that refused to load
 		// never gets here: ensureDocumentLoaded rejects before this point.
 		await this.maybeReapTombstonedBodies();
+		this.throwIfDestroyed();
 	}
 
 	/**
@@ -525,6 +611,7 @@ export class VaultSyncServer extends YServer<Env> {
 	 * costs a row written against a daily free-tier budget shared with sync.
 	 */
 	private async maybeReapTombstonedBodies(): Promise<void> {
+		if (this.destroyed) return;
 		if (this.tombstoneReapAttempted) return;
 		this.tombstoneReapAttempted = true;
 		if (!this.documentLoaded) return;
@@ -534,6 +621,7 @@ export class VaultSyncServer extends YServer<Env> {
 			this.lastTombstoneReap = result;
 			if (result.tombstones > 0) {
 				await this.recordTrace("tombstone-reap", { ...result });
+				if (this.destroyed) return;
 			}
 
 			// Persist explicitly rather than relying on the framework's
@@ -553,6 +641,7 @@ export class VaultSyncServer extends YServer<Env> {
 				// memory only for the instance that ran it.
 				const save = await this.getPersistenceCoordinator()
 					.forceCheckpoint("tombstone-reap");
+				if (this.destroyed) return;
 				if (!save.success) {
 					console.error(
 						`${LOG_PREFIX} tombstone reap could not be persisted; ` +
@@ -608,6 +697,7 @@ export class VaultSyncServer extends YServer<Env> {
 	private async recordEffectiveReap(result: ReapResult): Promise<void> {
 		try {
 			const totals = await this.loadReapTotals();
+			if (this.destroyed) return;
 			totals.effectiveRuns++;
 			totals.bodiesReaped += result.reaped;
 			totals.charsFreed += result.charsFreed;
@@ -620,6 +710,7 @@ export class VaultSyncServer extends YServer<Env> {
 	}
 
 	private getSqlDocStore(): SqlDocStore {
+		this.throwIfDestroyed();
 		if (!this.sqlDocStore) {
 			this.sqlDocStore = new SqlDocStore(this.ctx.storage);
 		}
@@ -627,6 +718,7 @@ export class VaultSyncServer extends YServer<Env> {
 	}
 
 	private getPersistenceCoordinator(): PersistenceCoordinator {
+		this.throwIfDestroyed();
 		if (!this.persistence) {
 			this.persistence = new PersistenceCoordinator(
 				this.document,
@@ -786,22 +878,26 @@ export class VaultSyncServer extends YServer<Env> {
 	}
 
 	private async readRoomMetaCheap(): Promise<RoomMeta | null> {
-		const stored = await readRoomMeta(this.ctx.storage);
-		if (stored) {
-			this.roomMeta = stored;
-		}
-		if (this.documentLoaded) {
-			const liveSchemaVersion = this.currentSchemaVersion();
-			if (!this.roomMeta || this.roomMeta.schemaVersion !== liveSchemaVersion) {
-				const nextMeta: RoomMeta = {
-					schemaVersion: liveSchemaVersion,
-					updatedAt: new Date().toISOString(),
-				};
-				this.roomMeta = nextMeta;
-				void this.syncRoomMetaFromDocument();
+		this.throwIfDestroyed();
+		return await this.trackInFlight((async () => {
+			const stored = await readRoomMeta(this.ctx.storage);
+			this.throwIfDestroyed();
+			if (stored) {
+				this.roomMeta = stored;
 			}
-		}
-		return this.roomMeta;
+			if (this.documentLoaded) {
+				const liveSchemaVersion = this.currentSchemaVersion();
+				if (!this.roomMeta || this.roomMeta.schemaVersion !== liveSchemaVersion) {
+					const nextMeta: RoomMeta = {
+						schemaVersion: liveSchemaVersion,
+						updatedAt: new Date().toISOString(),
+					};
+					this.roomMeta = nextMeta;
+					void this.syncRoomMetaFromDocument();
+				}
+			}
+			return this.roomMeta;
+		})());
 	}
 
 	private currentSchemaVersion(): number | null {
@@ -813,29 +909,36 @@ export class VaultSyncServer extends YServer<Env> {
 	}
 
 	private async syncRoomMetaFromDocument(): Promise<void> {
-		const nextSchemaVersion = this.currentSchemaVersion();
-		if (this.roomMeta && this.roomMeta.schemaVersion === nextSchemaVersion) {
-			return;
-		}
-		const nextMeta: RoomMeta = {
-			schemaVersion: nextSchemaVersion,
-			updatedAt: new Date().toISOString(),
-		};
-		try {
-			await writeRoomMeta(this.ctx.storage, nextMeta);
-			this.roomMeta = nextMeta;
-		} catch (err) {
-			console.error(`${LOG_PREFIX} room meta persist failed:`, err);
-		}
+		if (this.destroyed) return;
+		await this.trackInFlight((async () => {
+			const nextSchemaVersion = this.currentSchemaVersion();
+			if (this.roomMeta && this.roomMeta.schemaVersion === nextSchemaVersion) {
+				return;
+			}
+			const nextMeta: RoomMeta = {
+				schemaVersion: nextSchemaVersion,
+				updatedAt: new Date().toISOString(),
+			};
+			try {
+				if (this.destroyed) return;
+				await writeRoomMeta(this.ctx.storage, nextMeta);
+				if (this.destroyed) return;
+				this.roomMeta = nextMeta;
+			} catch (err) {
+				console.error(`${LOG_PREFIX} room meta persist failed:`, err);
+			}
+		})());
 	}
 
 	private async createDailySnapshotMaybe(
 		triggeredBy?: string,
 	): Promise<SnapshotResult> {
+		this.throwIfDestroyed();
 		const serialized = { chain: this.snapshotMaybeChain };
 		const run = runSerialized(
 			serialized,
 			async () => {
+				this.throwIfDestroyed();
 				const bucket = this.env.YAOS_BUCKET;
 				if (!bucket) {
 					return {
@@ -853,14 +956,17 @@ export class VaultSyncServer extends YServer<Env> {
 				//
 				// Cost: O(doc size) to encode + hash. Acceptable at daily frequency.
 				const latest = await getLatestSnapshotIndex(vaultId, bucket);
+				this.throwIfDestroyed();
 				if (latest?.fullUpdateHash) {
 					const rawUpdate = Y.encodeStateAsUpdate(this.document);
 					const currentHash = await sha256Hex(rawUpdate);
+					this.throwIfDestroyed();
 					if (latest.fullUpdateHash === currentHash) {
 						// Before skipping: verify the pointed snapshot actually exists.
 						// A poisoned latest pointer (payload never written) would
 						// otherwise cause us to skip forever.
 						const exists = await verifySnapshotExists(vaultId, latest, bucket);
+						this.throwIfDestroyed();
 						if (exists) {
 							return {
 								status: "noop",
@@ -883,6 +989,7 @@ export class VaultSyncServer extends YServer<Env> {
 							precomputedFullUpdateHash: currentHash,
 						},
 					);
+					this.throwIfDestroyed();
 
 					// Retention: await so failures are observable.
 					try {
@@ -896,6 +1003,7 @@ export class VaultSyncServer extends YServer<Env> {
 					} catch (err) {
 						console.error(`${LOG_PREFIX} retention failed:`, err);
 					}
+					this.throwIfDestroyed();
 
 					return {
 						status: "created",
@@ -905,7 +1013,9 @@ export class VaultSyncServer extends YServer<Env> {
 				} else if (latest) {
 					// Ancient legacy path: no hash fields at all. Day-based dedup.
 					const currentDay = new Date().toISOString().slice(0, 10);
-					if (await hasSnapshotForDay(vaultId, currentDay, bucket)) {
+					const existsForDay = await hasSnapshotForDay(vaultId, currentDay, bucket);
+					this.throwIfDestroyed();
+					if (existsForDay) {
 						return {
 							status: "noop",
 							reason: `Snapshot already taken today (${currentDay})`,
@@ -919,6 +1029,7 @@ export class VaultSyncServer extends YServer<Env> {
 					bucket,
 					{ triggeredBy, reason: "daily", pinned: false },
 				);
+				this.throwIfDestroyed();
 
 				// Retention: await so failures are observable.
 				try {
@@ -932,6 +1043,7 @@ export class VaultSyncServer extends YServer<Env> {
 				} catch (err) {
 					console.error(`${LOG_PREFIX} retention failed:`, err);
 				}
+				this.throwIfDestroyed();
 
 				return {
 					status: "created",
@@ -941,7 +1053,7 @@ export class VaultSyncServer extends YServer<Env> {
 			},
 		);
 		this.snapshotMaybeChain = serialized.chain;
-		return await run;
+		return await this.trackInFlight(run);
 	}
 
 	private async executeEmergencyCompact(): Promise<{
@@ -1008,7 +1120,15 @@ export class VaultSyncServer extends YServer<Env> {
 		}
 	}
 
-	private async recordTrace(
+	private recordTrace(
+		event: string,
+		data: Record<string, unknown>,
+	): Promise<void> {
+		if (this.destroyed) return Promise.resolve();
+		return this.trackInFlight(this.persistTrace(event, data));
+	}
+
+	private async persistTrace(
 		event: string,
 		data: Record<string, unknown>,
 	): Promise<void> {
@@ -1038,6 +1158,7 @@ export class VaultSyncServer extends YServer<Env> {
 		} catch (err) {
 			console.error(`${LOG_PREFIX} trace persist failed:`, err);
 		}
+		if (this.destroyed) return;
 
 		// Drain accumulated drops as a single bounded summary.
 		if (!isThrottleSummary) {

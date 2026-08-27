@@ -306,6 +306,11 @@ export class PersistenceCoordinator {
 		this.document.off("update", this.onDocumentUpdate);
 	}
 
+	/** Resolve after every save/checkpoint currently queued has settled. */
+	async drain(): Promise<void> {
+		await this.saveChain;
+	}
+
 	/**
 	 * Record the state vector that storage currently reflects, i.e. the base the
 	 * next delta is computed against.
