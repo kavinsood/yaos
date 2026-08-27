@@ -7,7 +7,6 @@ import type { App } from "obsidian";
 import type { YaosQaDebugApi } from "../harness/qaDebugApi";
 
 const DEFAULT_IDLE_TIMEOUT = 15_000;
-const DEFAULT_RECEIPT_TIMEOUT = 30_000;
 const DEFAULT_FILE_TIMEOUT = 15_000;
 const DEFAULT_BINDING_TIMEOUT = 5_000;
 const POLL_INTERVAL = 250;
@@ -47,12 +46,6 @@ export function waitForIdle(
 	return yaos.waitForIdle(timeoutMs);
 }
 
-export function waitForMemoryReceipt(
-	yaos: YaosQaDebugApi,
-	timeoutMs = DEFAULT_RECEIPT_TIMEOUT,
-): Promise<void> {
-	return yaos.waitForMemoryReceipt(timeoutMs);
-}
 
 export function waitForFile(
 	yaos: YaosQaDebugApi,

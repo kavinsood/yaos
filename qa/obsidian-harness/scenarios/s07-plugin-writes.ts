@@ -514,85 +514,122 @@ export const s07fInvalidIntermediateValidFinal: QaScenario = {
 	},
 };
 
-// -----------------------------------------------------------------------
-// S07h — multi-file burst (create + modify 25 files concurrently)
-//
-// One template command creates 25 files and fills them — all at once.
-// Bug class: watcher batching/coalescing drops events, leaving files
-// unsynced.
-// -----------------------------------------------------------------------
+interface BurstVariant {
+	id: string;
+	title: string;
+	folder: string;
+	filePrefix: string;
+	count: number;
+	waitTimeoutMs: number;
+	idleTimeoutMs: number;
+	cleanupIdleMs: number;
+	tags: string[];
+	content(index: number): string;
+}
 
-const BURST_FILE_COUNT = 25;
-const BURST_CONTENT = (i: number) => [
+function buildBurstScenario(variant: BurstVariant): QaScenario {
+	return {
+		id: variant.id,
+		title: variant.title,
+		tags: variant.tags,
+		traceExportPrivacy: "safe",
+
+		async setup(ctx): Promise<void> {
+			await ctx.waitForIdle(8000);
+		},
+
+		async run(ctx): Promise<void> {
+			const timestamp = Date.now().toString(36);
+			const width = String(variant.count - 1).length;
+			const paths = Array.from(
+				{ length: variant.count },
+				(_, index) =>
+					`${variant.folder}/${variant.filePrefix}-${timestamp}-${String(index).padStart(width, "0")}.md`,
+			);
+			await Promise.all(
+				paths.map((path, index) => ctx.createFile(path, variant.content(index))),
+			);
+			console.log(`[${variant.id}] created ${variant.count} files concurrently`);
+
+			await Promise.all(
+				paths.map((path) => ctx.waitForCrdtFile(path, variant.waitTimeoutMs)),
+			);
+			await ctx.waitForIdle(variant.idleTimeoutMs);
+
+			const results = await Promise.all(
+				paths.map(async (path) => ({
+					path,
+					disk: await ctx.yaos.getDiskHash(path),
+					crdt: await ctx.yaos.getCrdtHash(path),
+				})),
+			);
+			const mismatches = results.filter(
+				(result) => !result.disk || !result.crdt || result.disk !== result.crdt,
+			);
+			if (mismatches.length > 0) {
+				const detail = mismatches
+					.slice(0, 5)
+					.map((result) =>
+						`  ${result.path.split("/").pop()}: disk=${result.disk?.slice(0, 8) ?? "null"} ` +
+						`crdt=${result.crdt?.slice(0, 8) ?? "null"}`,
+					)
+					.join("\n");
+				throw new Error(
+					`${variant.id}: ${mismatches.length}/${variant.count} files did not converge:\n${detail}` +
+					(mismatches.length > 5 ? `\n  ... and ${mismatches.length - 5} more` : ""),
+				);
+			}
+			console.log(`[${variant.id}] all ${variant.count} files converged`);
+			await Promise.all(paths.map((path) => ctx.deleteFile(path)));
+		},
+
+		async assert(ctx): Promise<void> {
+			await ctx.assert.noConflictCopies(variant.folder);
+		},
+
+		async cleanup(ctx): Promise<void> {
+			await ctx.waitForIdle(variant.cleanupIdleMs);
+		},
+	};
+}
+
+const BURST_CONTENT = (index: number): string => [
 	"---",
-	`title: "S07h File ${i}"`,
-	`index: ${i}`,
+	`title: "S07h File ${index}"`,
+	`index: ${index}`,
 	"status: active",
 	"---",
 	"",
-	`## File ${i}`,
+	`## File ${index}`,
 	"",
 	"Created by bulk template run.",
 	"",
-	`Index: ${i}`,
+	`Index: ${index}`,
 ].join("\n");
 
-export const s07hMultiFileBurst: QaScenario = {
+export const s07hMultiFileBurst = buildBurstScenario({
 	id: "s07h-multi-file-burst",
-	title: `S07h: Multi-file burst — ${BURST_FILE_COUNT} concurrent creates + fills (watcher storm)`,
+	title: "S07h: Multi-file burst — 25 concurrent creates + fills (watcher storm)",
+	folder: FOLDER,
+	filePrefix: "s07h-burst",
+	count: 25,
+	waitTimeoutMs: 30_000,
+	idleTimeoutMs: 15_000,
+	cleanupIdleMs: 8_000,
 	tags: ["s07h", "plugin-writes", "templater-class", "burst", "bulk", "regression"],
-	traceExportPrivacy: "safe",
+	content: BURST_CONTENT,
+});
 
-	async setup(ctx): Promise<void> {
-		await ctx.waitForIdle(8000);
-	},
-
-	async run(ctx): Promise<void> {
-		const ts = Date.now().toString(36);
-		const paths = Array.from({ length: BURST_FILE_COUNT }, (_, i) =>
-			`${FOLDER}/s07h-burst-${ts}-${String(i).padStart(2, "0")}.md`,
-		);
-		const contents = paths.map((_, i) => BURST_CONTENT(i));
-
-		// 1. Create all files concurrently (watcher storm).
-		await Promise.all(paths.map((path, i) => ctx.createFile(path, contents[i]!)));
-		console.log(`[S07h] created ${BURST_FILE_COUNT} files concurrently`);
-
-		// 2. Wait for all to appear in CRDT (in parallel).
-		await Promise.all(paths.map((path) => ctx.waitForCrdtFile(path, 30000)));
-		await ctx.waitForIdle(15000);
-		console.log("[S07h] all files in CRDT");
-
-		// 3. POSTCONDITION: every file has disk == CRDT.
-		const results = await Promise.all(
-			paths.map(async (path) => ({
-				path,
-				disk: await ctx.yaos.getDiskHash(path),
-				crdt: await ctx.yaos.getCrdtHash(path),
-			})),
-		);
-
-		const mismatches = results.filter((r) => !r.disk || !r.crdt || r.disk !== r.crdt);
-		if (mismatches.length > 0) {
-			const detail = mismatches
-				.slice(0, 5)
-				.map((r) => `  ${r.path.split("/").pop()}: disk=${r.disk?.slice(0, 8) ?? "null"} crdt=${r.crdt?.slice(0, 8) ?? "null"}`)
-				.join("\n");
-			throw new Error(
-				`S07h: ${mismatches.length}/${BURST_FILE_COUNT} files did not converge:\n${detail}`,
-			);
-		}
-		console.log(`[S07h] all ${BURST_FILE_COUNT} files converged (disk == CRDT)`);
-
-		// 4. Cleanup.
-		await Promise.all(paths.map((path) => ctx.deleteFile(path)));
-	},
-
-	async assert(ctx): Promise<void> {
-		await ctx.assert.noConflictCopies(FOLDER);
-	},
-
-	async cleanup(ctx): Promise<void> {
-		await ctx.waitForIdle(8000);
-	},
-};
+export const s07hLargeBurst = buildBurstScenario({
+	id: "s07h-large-burst",
+	title: "S07h-large: 250-file concurrent burst (watcher/coalescing stress)",
+	folder: "QA-s07-extra",
+	filePrefix: "s07h-large",
+	count: 250,
+	waitTimeoutMs: 30_000,
+	idleTimeoutMs: 15_000,
+	cleanupIdleMs: 10_000,
+	tags: ["s07h", "plugin-writes", "burst", "bulk", "stress", "regression"],
+	content: (index) =>
+		`---\ntitle: "Burst ${index}"\nindex: ${index}\n---\n\nFile ${index} of 250.\n`,
+});

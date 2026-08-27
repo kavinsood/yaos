@@ -29,7 +29,7 @@
  *   S07g-2: create → rename → fill (rename before CRDT registration — race test)
  *   S07g-3: create → fill → rename to a previously-deleted path (tombstone race)
  *   S07g-4: create → fill → rename → rename again (chain: A → B → C)
- *   S07g-5: create → CRDT admission → modify → rename (redirectPendingCreate safety)
+ *   S07g-5: create → CRDT admission → modify → rename (redirectPendingDirtyPath safety)
  *
  * Assertions (all variants):
  *   - Final disk path exists, original path does not
@@ -448,12 +448,12 @@ export const s07gRenameChain: QaScenario = {
 // -----------------------------------------------------------------------
 // S07g-5: Admitted file → dirty modify pending → rename fires
 //
-// This is the regression guard for the redirectPendingCreate safety fix.
+// This is the regression guard for redirectPendingDirtyPath rename handling.
 //
 // Background:
-//   redirectPendingCreate is called for every rename batch entry. It must
-//   be a no-op when oldPath has a pending MODIFY (not create). If it were
-//   to delete the modify entry, the modified content would be silently lost.
+//   redirectPendingDirtyPath is called for every rename batch entry. It must
+//   carry a pending MODIFY from the old path to the destination so the
+//   modified content is not silently lost.
 //
 // Sequence:
 //   1. Create file at tmpPath and wait for CRDT admission (ensureFile).
@@ -466,7 +466,7 @@ export const s07gRenameChain: QaScenario = {
 //   - disk == CRDT at finalPath (the modify was not lost).
 //   - tmpPath is not in CRDT (clean rename, no orphan).
 //
-// If redirectPendingCreate had deleted the modify entry:
+// If redirectPendingDirtyPath had dropped the modify entry:
 //   - finalPath CRDT would reflect the pre-modify content.
 //   - disk != CRDT, or disk shows modified content but CRDT shows old.
 // -----------------------------------------------------------------------
@@ -575,7 +575,7 @@ The modify must survive the subsequent rename.
 
 export const s07gModifyThenRename: QaScenario = {
 	id: "s07g-modify-then-rename",
-	title: "S07g-5: Admitted file → pending modify → rename (redirectPendingCreate must not drop modify)",
+	title: "S07g-5: Admitted file → pending modify → rename (dirty path follows rename)",
 	tags: ["s07g", "rename", "plugin-writes", "regression", "race-safety"],
 	traceExportPrivacy: "safe",
 
@@ -602,8 +602,8 @@ export const s07gModifyThenRename: QaScenario = {
 		await ctx.modifyFile(tmpPath, CONTENT_V2);
 
 		// 3. Rename immediately — dirty modify for tmpPath is still pending.
-		//    redirectPendingCreate must be a no-op here (entry reason is "modify",
-		//    not "create"). The modify must be handled by the rename pipeline instead.
+		//    redirectPendingDirtyPath must move the pending modification to the
+		//    destination so the rename pipeline applies it there.
 		await ctx.renameFile(tmpPath, finalPath);
 
 		await ctx.sleep(2000);
@@ -627,7 +627,7 @@ export const s07gModifyThenRename: QaScenario = {
 		if (diskFinal === crdtV1) {
 			throw new Error(
 				`S07g-5: final content is still v1 — the modify was lost across the rename. ` +
-				`redirectPendingCreate may have incorrectly dropped the modify entry.`,
+				`redirectPendingDirtyPath may have dropped the pending modify entry.`,
 			);
 		}
 

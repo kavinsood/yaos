@@ -30,71 +30,94 @@ const FOLDER = "QA-s08";
 // mask dropped events.
 // -----------------------------------------------------------------------
 
-const S08A_COUNT = 500;
+interface MarkdownImportVariant {
+	id: string;
+	count: number;
+	writeMode: "sequential" | "concurrent";
+}
 
-export const s08aBulk500: QaScenario = {
-	id: "s08a-bulk-500",
-	title: `S08a: ${S08A_COUNT}-file concurrent markdown import (admission + coalescing stress)`,
-	tags: ["s08a", "bulk", "import", "stress", "regression"],
-	traceExportPrivacy: "safe",
+function buildMarkdownImportScenario(variant: MarkdownImportVariant): QaScenario {
+	return {
+		id: variant.id,
+		title:
+			`S08a: ${variant.count}-file ${variant.writeMode} markdown import ` +
+			"(admission + coalescing stress)",
+		tags: ["s08a", "bulk", "import", "stress", "regression"],
+		traceExportPrivacy: "safe",
 
-	async setup(ctx): Promise<void> {
-		await ctx.waitForIdle(8000);
-	},
+		async setup(ctx): Promise<void> {
+			await ctx.waitForIdle(8000);
+		},
 
-	async run(ctx): Promise<void> {
-		const ts = Date.now().toString(36);
-		const paths = Array.from({ length: S08A_COUNT }, (_, i) =>
-			`${FOLDER}/s08a-${ts}-${String(i).padStart(3, "0")}.md`,
-		);
-		const content = (i: number) =>
-			`# Note ${i}\n\nImported from external vault.\nIndex: ${i}\nBatch: ${ts}\n`;
-
-		// 1. Create all files concurrently.
-		await Promise.all(paths.map((path, i) => ctx.createFile(path, content(i))));
-		console.log(`[S08a] created ${S08A_COUNT} files concurrently`);
-
-		// 2. Wait for all CRDT entries (parallel, 45s per file — generous for large vaults).
-		await Promise.all(paths.map((path) => ctx.waitForCrdtFile(path, 45000)));
-		await ctx.waitForIdle(20000);
-		console.log(`[S08a] all ${S08A_COUNT} files in CRDT`);
-
-		// 3. POSTCONDITION: every file must have disk == CRDT.
-		const results = await Promise.all(
-			paths.map(async (path) => ({
-				path,
-				disk: await ctx.yaos.getDiskHash(path),
-				crdt: await ctx.yaos.getCrdtHash(path),
-			})),
-		);
-
-		const mismatches = results.filter((r) => !r.disk || !r.crdt || r.disk !== r.crdt);
-		const converged = results.length - mismatches.length;
-		console.log(`[S08a] ${converged}/${S08A_COUNT} converged`);
-
-		if (mismatches.length > 0) {
-			const detail = mismatches
-				.slice(0, 5)
-				.map((r) => `  ${r.path.split("/").pop()}: disk=${r.disk?.slice(0, 8) ?? "null"} crdt=${r.crdt?.slice(0, 8) ?? "null"}`)
-				.join("\n");
-			throw new Error(
-				`S08a: ${mismatches.length}/${S08A_COUNT} files did not converge:\n${detail}` +
-				(mismatches.length > 5 ? `\n  ... and ${mismatches.length - 5} more` : ""),
+		async run(ctx): Promise<void> {
+			const timestamp = Date.now().toString(36);
+			const paths = Array.from(
+				{ length: variant.count },
+				(_, index) =>
+					`${FOLDER}/s08a-${timestamp}-${String(index).padStart(3, "0")}.md`,
 			);
-		}
+			const content = (index: number): string =>
+				`# Note ${index}\n\nImported from external vault.\n` +
+				`Index: ${index}\nBatch: ${timestamp}\n`;
 
-		// 4. Cleanup.
-		await Promise.all(paths.map((path) => ctx.deleteFile(path)));
-	},
+			if (variant.writeMode === "concurrent") {
+				await Promise.all(
+					paths.map((path, index) => ctx.createFile(path, content(index))),
+				);
+			} else {
+				for (const [index, path] of paths.entries()) {
+					await ctx.createFile(path, content(index));
+				}
+			}
+			console.log(
+				`[S08a] created ${variant.count} files ${variant.writeMode}ly`,
+			);
 
-	async assert(ctx): Promise<void> {
-		await ctx.assert.noConflictCopies(FOLDER);
-	},
+			await Promise.all(paths.map((path) => ctx.waitForCrdtFile(path, 45_000)));
+			await ctx.waitForIdle(20_000);
 
-	async cleanup(ctx): Promise<void> {
-		await ctx.waitForIdle(15000);
-	},
-};
+			const results = await Promise.all(
+				paths.map(async (path) => ({
+					path,
+					disk: await ctx.yaos.getDiskHash(path),
+					crdt: await ctx.yaos.getCrdtHash(path),
+				})),
+			);
+			const mismatches = results.filter(
+				(result) => !result.disk || !result.crdt || result.disk !== result.crdt,
+			);
+			console.log(`[S08a] ${results.length - mismatches.length}/${variant.count} converged`);
+			if (mismatches.length > 0) {
+				const detail = mismatches
+					.slice(0, 5)
+					.map((result) =>
+						`  ${result.path.split("/").pop()}: disk=${result.disk?.slice(0, 8) ?? "null"} ` +
+						`crdt=${result.crdt?.slice(0, 8) ?? "null"}`,
+					)
+					.join("\n");
+				throw new Error(
+					`S08a: ${mismatches.length}/${variant.count} files did not converge:\n${detail}` +
+					(mismatches.length > 5 ? `\n  ... and ${mismatches.length - 5} more` : ""),
+				);
+			}
+			await Promise.all(paths.map((path) => ctx.deleteFile(path)));
+		},
+
+		async assert(ctx): Promise<void> {
+			await ctx.assert.noConflictCopies(FOLDER);
+		},
+
+		async cleanup(ctx): Promise<void> {
+			await ctx.waitForIdle(15_000);
+		},
+	};
+}
+
+export const s08aBulk500 = buildMarkdownImportScenario({
+	id: "s08a-bulk-500",
+	count: 500,
+	writeMode: "concurrent",
+});
 
 // -----------------------------------------------------------------------
 // S08b — Unicode filenames

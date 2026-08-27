@@ -7,8 +7,8 @@
  *   adapter-write   app.vault.adapter.write — bypasses Obsidian metadata but still
  *                   routes through the adapter. NOT the same as a real external write.
  *                   Use for: iOS/Android simulation, adapter-layer tests.
- *   (external-fs)   Real Node fs.writeFile, used from the controller side
- *                   (qa/controllers/obsidian-client.ts). Not callable from harness.
+ *   (external-fs)   Real Node fs.writeFile, used by controller-side repros.
+ *                   Not callable from the harness.
  *
  * THREE delete modes:
  *
@@ -114,22 +114,4 @@ export async function writeAdapterFile(app: App, path: string, content: string):
 export async function deleteAdapterFile(app: App, path: string): Promise<void> {
 	const normalized = normalizePath(path);
 	try { await app.vault.adapter.remove(normalized); } catch { /* already gone */ }
-}
-
-// -----------------------------------------------------------------------
-// Bulk adapter write (for bulk-import scenarios)
-// -----------------------------------------------------------------------
-
-export async function writeAdapterFileBulk(
-	app: App,
-	files: Array<{ path: string; content: string }>,
-	{ concurrent = false }: { concurrent?: boolean } = {},
-): Promise<void> {
-	if (concurrent) {
-		await Promise.all(files.map(({ path, content }) => writeAdapterFile(app, path, content)));
-	} else {
-		for (const { path, content } of files) {
-			await writeAdapterFile(app, path, content);
-		}
-	}
 }

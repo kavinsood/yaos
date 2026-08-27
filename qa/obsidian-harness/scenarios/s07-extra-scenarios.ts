@@ -1,5 +1,5 @@
 /**
- * S07 supplementary scenarios: S07i, S07j, S07k, S07h-large.
+ * S07 supplementary scenarios: S07i, S07j, and S07k.
  *
  * S07i  Folder-then-file-later
  *   Empty folders are not synced by design. This scenario verifies that
@@ -18,11 +18,6 @@
  *   created. The blob should be queued/synced separately. The markdown
  *   CRDT entry must remain unchanged — the blob arriving must NOT
  *   trigger a rewrite, conflict, or divergence on the text side.
- *
- * S07h-large  250-file burst
- *   Extends S07h to stress-test YAOS's watcher/coalescing path at a
- *   more meaningful scale. S07h proved the path works for 25 files. This
- *   variant proves it holds at 250 concurrent creates.
  */
 
 import type { QaScenario } from "../types";
@@ -183,75 +178,6 @@ export const s07jAttachmentRefBeforeBlob: QaScenario = {
 	},
 };
 
-// -----------------------------------------------------------------------
-// S07h-large — 250-file burst
-// -----------------------------------------------------------------------
-
-const LARGE_BURST_COUNT = 250;
-
-export const s07hLargeBurst: QaScenario = {
-	id: "s07h-large-burst",
-	title: `S07h-large: ${LARGE_BURST_COUNT}-file concurrent burst (watcher/coalescing stress)`,
-	tags: ["s07h", "plugin-writes", "burst", "bulk", "stress", "regression"],
-	traceExportPrivacy: "safe",
-
-	async setup(ctx): Promise<void> {
-		await ctx.waitForIdle(8000);
-	},
-
-	async run(ctx): Promise<void> {
-		const ts = Date.now().toString(36);
-		const paths = Array.from({ length: LARGE_BURST_COUNT }, (_, i) =>
-			`${FOLDER}/s07h-large-${ts}-${String(i).padStart(3, "0")}.md`,
-		);
-		const content = (i: number) =>
-			`---\ntitle: "Burst ${i}"\nindex: ${i}\n---\n\nFile ${i} of ${LARGE_BURST_COUNT}.\n`;
-
-		// 1. Create all files concurrently.
-		await Promise.all(paths.map((path, i) => ctx.createFile(path, content(i))));
-		console.log(`[S07h-large] created ${LARGE_BURST_COUNT} files concurrently`);
-
-		// 2. Wait for all CRDT entries (in parallel, 30s timeout per file).
-		await Promise.all(paths.map((path) => ctx.waitForCrdtFile(path, 30000)));
-		await ctx.waitForIdle(15000);
-		console.log(`[S07h-large] all ${LARGE_BURST_COUNT} files in CRDT`);
-
-		// 3. Check convergence in batches to avoid console flood.
-		const results = await Promise.all(
-			paths.map(async (path) => ({
-				path,
-				disk: await ctx.yaos.getDiskHash(path),
-				crdt: await ctx.yaos.getCrdtHash(path),
-			})),
-		);
-
-		const mismatches = results.filter((r) => !r.disk || !r.crdt || r.disk !== r.crdt);
-		const converged = results.length - mismatches.length;
-		console.log(`[S07h-large] ${converged}/${LARGE_BURST_COUNT} files converged`);
-
-		if (mismatches.length > 0) {
-			const detail = mismatches
-				.slice(0, 5)
-				.map((r) => `  ${r.path.split("/").pop()}: disk=${r.disk?.slice(0, 8) ?? "null"} crdt=${r.crdt?.slice(0, 8) ?? "null"}`)
-				.join("\n");
-			throw new Error(
-				`S07h-large: ${mismatches.length}/${LARGE_BURST_COUNT} files did not converge:\n${detail}` +
-				(mismatches.length > 5 ? `\n  ... and ${mismatches.length - 5} more` : ""),
-			);
-		}
-
-		// 4. Cleanup in parallel.
-		await Promise.all(paths.map((path) => ctx.deleteFile(path)));
-	},
-
-	async assert(ctx): Promise<void> {
-		await ctx.assert.noConflictCopies(FOLDER);
-	},
-
-	async cleanup(ctx): Promise<void> {
-		await ctx.waitForIdle(10000);
-	},
-};
 
 // -----------------------------------------------------------------------
 // S07k — Blob arrives after markdown reference (markdown stability)

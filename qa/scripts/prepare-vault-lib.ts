@@ -4,6 +4,11 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
+const GENERATED_FIXTURES: Record<string, true> = {
+	"003-tasks-dataview": true,
+	"004-bulk-import": true,
+	"005-nasty-paths": true,
+};
 
 export const PRODUCT_PLUGIN_ID = "yaos";
 export const HARNESS_PLUGIN_ID = "yaos-qa-harness";
@@ -11,7 +16,7 @@ export const HARNESS_PLUGIN_ID = "yaos-qa-harness";
 export const PREPARE_VAULT_USAGE = `Usage: bun run qa:prepare --fixture <id> --dest <new-path> [--preset <name>]
 
 Options:
-  --fixture <id>     Direct fixture directory below qa/fixtures/vaults.
+  --fixture <id>     Known checked-in or generated fixture ID.
   --dest <new-path>  New vault directory. Its existing parent must be a directory.
                      The final path must not exist; existing directories and symlinks fail.
   --preset <name>    Plugin preset from qa/plugin-lock.json (default: minimal).
@@ -132,7 +137,8 @@ export async function prepareVault(
 	// This non-recursive call establishes that this invocation owns the final
 	// destination. Everything written afterwards is below that new directory.
 	await mkdir(dest);
-	await copyFixtureContents(fixtureDir, dest);
+	if (fixtureDir) await copyFixtureContents(fixtureDir, dest);
+	await generateFixtureContents(options.fixture, dest);
 
 	const obsidianDir = join(dest, ".obsidian");
 	await mkdir(obsidianDir, { recursive: true });
@@ -165,10 +171,13 @@ export async function prepareVault(
 
 export async function listFixtureIds(fixturesDir: string): Promise<string[]> {
 	const entries = await readdir(fixturesDir, { withFileTypes: true });
-	return entries.filter(entry => entry.isDirectory()).map(entry => entry.name).sort();
+	return [...new Set([
+		...entries.filter(entry => entry.isDirectory()).map(entry => entry.name),
+		...Object.keys(GENERATED_FIXTURES),
+	])].sort();
 }
 
-async function resolveFixtureDir(fixture: string, fixturesDir: string): Promise<string> {
+async function resolveFixtureDir(fixture: string, fixturesDir: string): Promise<string | null> {
 	if (
 		fixture.length === 0 ||
 		fixture === "." ||
@@ -185,6 +194,7 @@ async function resolveFixtureDir(fixture: string, fixturesDir: string): Promise<
 			`Unknown fixture ID: ${JSON.stringify(fixture)}. Available fixtures: ${fixtureIds.join(", ") || "(none)"}.`,
 		);
 	}
+	if (GENERATED_FIXTURES[fixture]) return null;
 
 	const fixtureDir = join(fixturesDir, fixture);
 	const stat = await lstat(fixtureDir);
@@ -309,6 +319,49 @@ async function copyFixtureContents(fixtureDir: string, dest: string): Promise<vo
 			errorOnExist: true,
 		});
 	}
+}
+
+async function generateFixtureContents(fixture: string, dest: string): Promise<void> {
+	if (fixture === "003-tasks-dataview") {
+		const tasks = Array.from(
+			{ length: 200 },
+			(_, index) => `- [ ] task ${String(index + 1).padStart(3, "0")}`,
+		);
+		await writeGeneratedFile(
+			dest,
+			"Tasks/task-storm.md",
+			["# Task Storm", "", "A generated task list for CRDT throughput scenarios.", "", ...tasks, ""].join("\n"),
+		);
+		return;
+	}
+
+	if (fixture === "004-bulk-import") {
+		for (let index = 1; index <= 30; index++) {
+			const number = String(index).padStart(3, "0");
+			await writeGeneratedFile(
+				dest,
+				`Imported/note-${number}.md`,
+				`# Bulk Import Note ${number}\n\nContent of note ${number}. Lorem ipsum dolor sit amet.\n\n- [ ] item A\n- [ ] item B\n`,
+			);
+		}
+		return;
+	}
+
+	if (fixture === "005-nasty-paths") {
+		const notes = [
+			["Note with spaces.md", "# Spaces in path\n\nTests paths with spaces.\n"],
+			["über café résumé.md", "# Unicode\n\nTests Unicode filenames.\n"],
+			["🌊 Wave Note.md", "# Emoji\n\nTests emoji in filenames.\n"],
+			["Deep/nested/path/note.md", "# Deep Nested\n\nTests deeply nested path handling.\n"],
+		] as const;
+		for (const [path, content] of notes) await writeGeneratedFile(dest, path, content);
+	}
+}
+
+async function writeGeneratedFile(dest: string, relativePath: string, content: string): Promise<void> {
+	const path = join(dest, relativePath);
+	await mkdir(dirname(path), { recursive: true });
+	await writeFile(path, content, "utf8");
 }
 
 function createYaosSettings(vaultId: string): Record<string, unknown> {

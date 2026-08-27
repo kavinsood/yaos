@@ -10,9 +10,8 @@
  * The storm variant is critical: concurrent writes fire many disk events
  * simultaneously, stressing the reconciler's batching and deduplication.
  *
- * Note: For a TRUE external-write storm (OS watcher path), use the Node
- * controller's writeNodeFiles() from qa:two-device or qa:obsidian scripts.
- * These adapter writes go through Obsidian's adapter layer.
+ * These writes go through Obsidian's adapter layer rather than the external
+ * OS watcher path.
  *
  * Key events expected:
  *   disk.create.observed × N (after adapter writes + watcher fires)
@@ -37,99 +36,89 @@ async function cleanupFiles(ctx: QaContext, files: Array<{ path: string }>): Pro
 	}
 }
 
-// -----------------------------------------------------------------------
-// S04a — smoke: 10 sequential adapter writes
-// -----------------------------------------------------------------------
+interface BulkImportVariant {
+	id: string;
+	title: string;
+	count: number;
+	concurrent: boolean;
+	settleMs: number;
+	idleTimeoutMs: number;
+	verifyContent: boolean;
+	tags: string[];
+}
 
-export const s04aBulkImportSmoke: QaScenario = {
+function buildBulkImportScenario(variant: BulkImportVariant): QaScenario {
+	const files = makeFiles(variant.count);
+	return {
+		id: variant.id,
+		title: variant.title,
+		tags: variant.tags,
+
+		async setup(ctx): Promise<void> {
+			await cleanupFiles(ctx, files);
+			await ctx.waitForIdle(variant.concurrent ? 8000 : 5000);
+		},
+
+		async run(ctx): Promise<void> {
+			const importTs = Date.now();
+			if (variant.concurrent) {
+				await Promise.all(
+					files.map(({ path, content }) => ctx.writeAdapterFile(path, content)),
+				);
+			} else {
+				for (const { path, content } of files) {
+					await ctx.writeAdapterFile(path, content);
+				}
+			}
+			await ctx.sleep(variant.settleMs);
+			await ctx.waitForIdle(variant.idleTimeoutMs);
+			await ctx.yaos.waitForReceiptAfter(importTs, 30_000);
+		},
+
+		async assert(ctx): Promise<void> {
+			const failures: string[] = [];
+			for (const { path, content } of files) {
+				try {
+					await ctx.assert.fileExists(path);
+					if (variant.verifyContent) await ctx.assert.fileContent(path, content);
+					await ctx.assert.diskEqualsCrdt(path);
+				} catch (error) {
+					failures.push(`${path}: ${String(error)}`);
+				}
+			}
+			if (failures.length > 0) {
+				throw new Error(
+					`${variant.concurrent ? "Storm" : "Sequential"} import: ` +
+					`${failures.length} file(s) failed:\n${failures.join("\n")}`,
+				);
+			}
+			await ctx.assert.noConflictCopies(PREFIX);
+		},
+
+		async cleanup(ctx): Promise<void> {
+			await cleanupFiles(ctx, files);
+		},
+	};
+}
+
+export const s04aBulkImportSmoke = buildBulkImportScenario({
 	id: "bulk-import-after-delete-smoke",
 	title: "Bulk import: 10 sequential adapter writes after delete",
+	count: 10,
+	concurrent: false,
+	settleMs: 2000,
+	idleTimeoutMs: 20_000,
+	verifyContent: true,
 	tags: ["bulk-import", "single-device", "layer2"],
+});
 
-	async setup(ctx: QaContext): Promise<void> {
-		await cleanupFiles(ctx, makeFiles(10));
-		await ctx.waitForIdle(5000);
-	},
-
-	async run(ctx: QaContext): Promise<void> {
-		const files = makeFiles(10);
-
-		// Write sequentially (smoke: verify basic correctness)
-		const importTs = Date.now();
-		for (const { path, content } of files) {
-			await ctx.writeAdapterFile(path, content);
-		}
-
-		// Give reconciler time to observe and batch
-		await new Promise((r) => setTimeout(r, 2000));
-		await ctx.waitForIdle(20_000);
-
-		await ctx.yaos.waitForReceiptAfter(importTs, 30_000);
-	},
-
-	async assert(ctx: QaContext): Promise<void> {
-		const files = makeFiles(10);
-		for (const { path, content } of files) {
-			await ctx.assert.fileExists(path);
-			await ctx.assert.fileContent(path, content);
-			await ctx.assert.diskEqualsCrdt(path);
-		}
-		await ctx.assert.noConflictCopies(PREFIX);
-	},
-
-	async cleanup(ctx: QaContext): Promise<void> {
-		await cleanupFiles(ctx, makeFiles(10));
-	},
-};
-
-// -----------------------------------------------------------------------
-// S04b — storm: 50 concurrent adapter writes
-// -----------------------------------------------------------------------
-
-export const s04bBulkImportStorm: QaScenario = {
+export const s04bBulkImportStorm = buildBulkImportScenario({
 	id: "bulk-import-after-delete-storm",
 	title: "Bulk import: 50 concurrent adapter writes (watcher storm)",
+	count: 50,
+	concurrent: true,
+	settleMs: 3000,
+	idleTimeoutMs: 30_000,
+	verifyContent: false,
 	tags: ["bulk-import", "stress", "single-device", "layer2"],
-
-	async setup(ctx: QaContext): Promise<void> {
-		await cleanupFiles(ctx, makeFiles(50));
-		await ctx.waitForIdle(8000);
-	},
-
-	async run(ctx: QaContext): Promise<void> {
-		const files = makeFiles(50);
-
-		// Write CONCURRENTLY — stress-tests the reconciler's batching
-		const importTs = Date.now();
-		await Promise.all(
-			files.map(({ path, content }) => ctx.writeAdapterFile(path, content)),
-		);
-
-		// Give reconciler time to drain the storm
-		await new Promise((r) => setTimeout(r, 3000));
-		await ctx.waitForIdle(30_000);
-
-		await ctx.yaos.waitForReceiptAfter(importTs, 30_000);
-	},
-
-	async assert(ctx: QaContext): Promise<void> {
-		const files = makeFiles(50);
-		const failures: string[] = [];
-		for (const { path } of files) {
-			try {
-				await ctx.assert.fileExists(path);
-				await ctx.assert.diskEqualsCrdt(path);
-			} catch (e) {
-				failures.push(`${path}: ${String(e)}`);
-			}
-		}
-		if (failures.length > 0) {
-			throw new Error(`Storm import: ${failures.length} file(s) failed:\n${failures.join("\n")}`);
-		}
-		await ctx.assert.noConflictCopies(PREFIX);
-	},
-
-	async cleanup(ctx: QaContext): Promise<void> {
-		await cleanupFiles(ctx, makeFiles(50));
-	},
-};
+});

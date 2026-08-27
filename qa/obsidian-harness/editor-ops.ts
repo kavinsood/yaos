@@ -54,7 +54,7 @@ function getViewForPath(app: App, path: string): MarkdownView {
 }
 
 /**
- * Append text to a file's editor via a single atomic document replacement.
+ * Append text to a file's editor in one document transaction.
  *
  * This function exercises the editor→CRDT propagation path: a CodeMirror 6
  * document replacement triggers one y-codemirror reconciliation pass that
@@ -70,21 +70,16 @@ function getViewForPath(app: App, path: string): MarkdownView {
  *   - Debounced write behavior
  *   - Cursor-sensitive or partial-transaction behavior
  *
- * Implementation note: character-by-character replaceRange was replaced with
- * atomic setValue because headless CDP runs have no OS window focus, causing
- * getCursor() to return {line:0,ch:0} on every call and inserting all characters
- * at position 0 (reversing the text). Atomic setValue avoids this and also
- * eliminates intermediate Y.js states from N partial transactions.
- *
- * The intervalMs option is kept for API compatibility but is unused.
+ * Implementation note: character-by-character replaceRange is unsuitable for
+ * headless CDP runs because they have no OS window focus. A whole-document
+ * setValue transaction still exercises the editor-to-CRDT binding without
+ * claiming to model incremental keystrokes.
  */
 export async function typeIntoFile(
 	app: App,
 	path: string,
 	text: string,
-	opts: { intervalMs?: number } = {},
 ): Promise<void> {
-	void opts; // intervalMs unused: atomic mode, no per-character delay
 	const view = getViewForPath(app, path);
 	const current = view.editor.getValue();
 	view.editor.setValue(current + text);
@@ -104,9 +99,4 @@ export async function replaceFileContent(app: App, path: string, content: string
 
 export async function runCommand(app: App, commandId: string): Promise<void> {
 	await getCommandRegistry(app).executeCommandById(commandId);
-}
-
-export function listCommands(app: App, filter?: string): string[] {
-	const all = Object.keys(getCommandRegistry(app).commands);
-	return filter ? all.filter((id) => id.includes(filter)) : all;
 }

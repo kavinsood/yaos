@@ -87,12 +87,12 @@ import {
 	s07eFrontmatterRace,
 	s07fInvalidIntermediateValidFinal,
 	s07hMultiFileBurst,
+	s07hLargeBurst,
 } from "./scenarios/s07-plugin-writes";
 import {
 	s07iFolderThenFile,
 	s07jAttachmentRefBeforeBlob,
 	s07kBlobArrivesAfterReference,
-	s07hLargeBurst,
 } from "./scenarios/s07-extra-scenarios";
 import {
 	s08aBulk500,
@@ -118,6 +118,7 @@ const ALL_SCENARIOS: QaScenario[] = [
 	s06aIssue25ForcedRecoveryCrdtOnly,
 	s06aIssue25ForcedRecoveryLocalOnly,
 	s06bIssue25Natural,
+	s06cClosedOnlyOpenBoundDeferral,
 	// S07g: rename/move after create
 	s07gRenameAfterCreate,
 	s07gRenameBeforeCrdtRegistration,
@@ -168,8 +169,8 @@ export default class YaosQaHarnessPlugin extends Plugin {
 
 		// Mount window.__YAOS_DEBUG__ (product QA debug API).
 		// The product plugin ships as a passive black box — it never mounts
-		// __YAOS_DEBUG__ itself.  The harness is responsible for this mount
-		// because it is the only in-repo Puppeteer consumer.
+		// __YAOS_DEBUG__ itself. The harness owns this mount for the raw CDP
+		// automation controllers.
 		this.mountYaosDebugApi();
 
 		new Notice("YAOS QA Harness loaded. window.__YAOS_QA__ is available.", 5000);
