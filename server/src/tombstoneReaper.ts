@@ -53,6 +53,7 @@
 
 import * as Y from "yjs";
 import { usesLegacyPathModel } from "./schemaModel";
+import { isMetaDeleted, readMetaDeletedAt } from "./documentSummary";
 
 /** Tombstones younger than this keep their bodies.  30 days. */
 export const TOMBSTONE_REAP_GRACE_MS = 30 * 24 * 60 * 60 * 1000;
@@ -126,53 +127,6 @@ const EMPTY_RESULT: ReapResult = {
 	remaining: 0,
 };
 
-/**
- * Narrow a metadata value to something with a Y.Map-style `get`.
- *
- * Deliberately duck-typed rather than `value instanceof Y.Map`.  Yjs warns that
- * loading two copies of the library breaks constructor checks, and when that
- * happens an `instanceof` test silently reports every nested entry as a plain
- * object — which here would mean failing to recognise a tombstone and skipping
- * its body forever.  Structural detection cannot fail that way: plain JSON
- * metadata has no callable `get`.
- */
-function asMapLike(value: unknown): { get: (key: string) => unknown } | null {
-	if (value === null || typeof value !== "object") return null;
-	const candidate = value as { get?: unknown };
-	return typeof candidate.get === "function"
-		? (value as { get: (key: string) => unknown })
-		: null;
-}
-
-/**
- * Read a deletion timestamp from either metadata shape.
- *
- * v2 stores flat JSON objects, v3 stores nested Y.Map.  A legacy `deleted: true`
- * with no timestamp returns null — the caller treats that as unknown age.
- */
-function readDeletedAt(value: unknown): number | null {
-	const nested = asMapLike(value);
-	if (nested) {
-		const deletedAt = nested.get("deletedAt");
-		return typeof deletedAt === "number" && Number.isFinite(deletedAt) ? deletedAt : null;
-	}
-	if (typeof value === "object" && value !== null && "deletedAt" in value) {
-		const deletedAt = value.deletedAt;
-		return typeof deletedAt === "number" && Number.isFinite(deletedAt) ? deletedAt : null;
-	}
-	return null;
-}
-
-/** Whether a metadata value is a tombstone, in either shape. */
-function isTombstone(value: unknown): boolean {
-	if (readDeletedAt(value) !== null) return true;
-	const nested = asMapLike(value);
-	if (nested) return nested.get("deleted") === true;
-	if (typeof value === "object" && value !== null) {
-		return (value as { deleted?: unknown }).deleted === true;
-	}
-	return false;
-}
 
 /**
  * Delete the Y.Text bodies of tombstones older than the grace period.
@@ -217,7 +171,7 @@ export function reapTombstonedBodies(doc: Y.Doc, options: ReapOptions = {}): Rea
 		});
 	}
 	meta.forEach((value, fileId) => {
-		if (!isTombstone(value)) activeIds.add(fileId);
+		if (!isMetaDeleted(value)) activeIds.add(fileId);
 	});
 
 	const result: ReapResult = { ...EMPTY_RESULT };
@@ -225,7 +179,7 @@ export function reapTombstonedBodies(doc: Y.Doc, options: ReapOptions = {}): Rea
 
 	meta.forEach((value, fileId) => {
 		result.metaEntries++;
-		if (!isTombstone(value)) return;
+		if (!isMetaDeleted(value)) return;
 		result.tombstones++;
 
 		// Nothing to reclaim — already reaped, or never had a body.
@@ -247,7 +201,7 @@ export function reapTombstonedBodies(doc: Y.Doc, options: ReapOptions = {}): Rea
 		// say.  Overlapping counters describe the tombstone; a partition only
 		// describes the order the code happened to ask.
 		const blockedByReference = activeIds.has(fileId);
-		const deletedAt = readDeletedAt(value);
+		const deletedAt = readMetaDeletedAt(value);
 		const ageUnknown = deletedAt === null;
 		const insideGrace = !ageUnknown && now - deletedAt < graceMs;
 

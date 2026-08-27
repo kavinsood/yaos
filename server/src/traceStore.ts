@@ -290,10 +290,6 @@ export const LOW_VOLUME_TRACE_READ_RESERVE = 0.5;
  */
 export const TRACE_SEED_AFTER_APPENDS = 200;
 
-export function createTraceKey(ts = Date.now()): string {
-	return `${TRACE_KEY_PREFIX}${paddedTimestamp(ts)}:${randomSuffix()}`;
-}
-
 /**
  * Append-and-trim ring over one key prefix.
  *

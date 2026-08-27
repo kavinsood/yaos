@@ -99,9 +99,3 @@ export async function compactVault(env: Env, vaultId: string): Promise<Response>
 	const stub = await getServerByName(env.YAOS_SYNC, vaultId);
 	return await stub.fetch("https://internal/__yaos/compact", { method: "POST" });
 }
-
-/**
- * Rebuild the room's in-memory document to discard accumulated V8 rope
- * structures.  Admin-gated: it replaces the live document, and while the swap
- * is transparent to clients it is not something to expose casually.
- */

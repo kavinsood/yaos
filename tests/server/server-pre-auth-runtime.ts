@@ -1,13 +1,11 @@
 /**
  * FU-4 — Pre-auth runtime test.
  *
- * The static test (tests/contracts/server-pre-auth-trace.mjs) proves the rejection
- * functions do not contain recordVaultTrace calls by parsing source. This
- * test proves the same property at runtime: a fake Env whose YAOS_SYNC and
- * YAOS_CONFIG namespaces throw on any access is passed into the rejection
- * paths. If any pre-auth code touches the Durable Object namespace, the
- * test throws with a clear "INV-SEC-01 violation" error rather than a
- * silent pass.
+ * A fake Env whose YAOS_SYNC and YAOS_CONFIG namespaces throw on any access
+ * is passed into the rejection paths. If pre-auth code touches either
+ * namespace, the suite fails with an INV-SEC-01 error. Structured Worker
+ * warnings are captured separately so observability does not depend on room
+ * storage.
  *
  * Covered paths:
  *   rejectUnauthorizedVaultRequest (HTTP vault route handler, index.ts):
@@ -143,10 +141,31 @@ s.section("Test 6: handleSyncSocketRoute — server_misconfigured (HTTP)");
 
 s.section("Test 7: handleSyncSocketRoute — unauthorized (HTTP, wrong token)");
 {
-	const resp = await handleSyncSocketRoute(syncHttpReq("wrong-token"), fakeEnv, envAuth, "test-vault");
-	s.check(resp.status === 401, "unauthorized socket route: HTTP 401");
-	const body = await parseJsonBody(resp);
-	s.check((body as { error?: string })?.error === "unauthorized", "unauthorized socket route: body has error=unauthorized");
+	const warnings: string[] = [];
+	const originalWarn = console.warn;
+	console.warn = (...values: unknown[]) => {
+		warnings.push(values.map(String).join(" "));
+	};
+	let resp: Response | null = null;
+	try {
+		resp = await handleSyncSocketRoute(syncHttpReq("wrong-token"), fakeEnv, envAuth, "test-vault");
+	} finally {
+		console.warn = originalWarn;
+	}
+	s.check(resp?.status === 401, "unauthorized socket route: HTTP 401");
+	const body = resp ? await parseJsonBody(resp) : null;
+	const errorCode =
+		body && typeof body === "object" && "error" in body
+			? body.error
+			: undefined;
+	s.check(errorCode === "unauthorized", "unauthorized socket route: body has error=unauthorized");
+	s.check(
+		warnings.some((warning) =>
+			warning.includes("ws rejected pre-auth")
+			&& warning.includes('"reason":"unauthorized"')
+		),
+		"unauthorized socket rejection emits a structured Worker warning",
+	);
 }
 
 // ── Test 8: DO trap never fired in any of the above ───────────────────────────

@@ -21,7 +21,13 @@
 import * as Y from "yjs";
 import { usesLegacyPathModel, ID_FIRST_PATH_MODEL_MIN_SCHEMA } from "../../server/src/schemaModel";
 import { reapTombstonedBodies } from "../../server/src/tombstoneReaper";
-import { buildDocumentSummary } from "../../server/src/documentSummary";
+import {
+	asMapLike,
+	buildDocumentSummary,
+	isMetaDeleted,
+	readMetaDeletedAt,
+	readMetaPath,
+} from "../../server/src/documentSummary";
 import { suite } from "../harness.ts";
 
 const s = suite("schema-path-model");
@@ -245,5 +251,21 @@ s.section("Test 7: unreadable metadata is counted, not silently dropped");
 		"invalid entries are in neither active nor tombstoned");
 	s.check(summary.metaCount === 2, "raw metaCount still reports them");
 	doc.destroy();
+}
+
+s.section("Test 8: metadata readers accept map values from another Yjs copy");
+{
+	const values: Record<string, unknown> = {
+		path: "foreign.md",
+		deletedAt: NOW - 60 * DAY,
+	};
+	const foreignMap = {
+		get: (key: string) => values[key],
+	};
+	s.check(asMapLike(foreignMap) === foreignMap, "duck typing accepts a foreign map-like value");
+	s.check(readMetaPath(foreignMap) === "foreign.md", "foreign map path is readable");
+	s.check(readMetaDeletedAt(foreignMap) === values.deletedAt, "foreign map deletion timestamp is readable");
+	s.check(isMetaDeleted(foreignMap), "foreign map tombstone is recognised");
+	s.check(readMetaDeletedAt({ deletedAt: Number.NaN }) === null, "non-finite deletion age remains unknown");
 }
 await s.done();

@@ -64,7 +64,7 @@ export interface DocumentSummary {
  * Here that would misclassify shapes and mis-read tombstones.  Plain JSON
  * metadata has no callable `get`, so structural detection cannot fail that way.
  */
-function asMapLike(value: unknown): { get: (key: string) => unknown } | null {
+export function asMapLike(value: unknown): { get: (key: string) => unknown } | null {
 	if (value === null || typeof value !== "object") return null;
 	const candidate = value as { get?: unknown };
 	return typeof candidate.get === "function"
@@ -87,22 +87,29 @@ export function readMetaPath(value: unknown): string | null {
 	return null;
 }
 
-/** Whether a metadata value is a tombstone, in either shape. */
-export function isMetaDeleted(value: unknown): boolean {
+/** Read a finite deletion timestamp from metadata in either supported shape. */
+export function readMetaDeletedAt(value: unknown): number | null {
 	const nested = asMapLike(value);
 	if (nested) {
 		const deletedAt = nested.get("deletedAt");
-		if (typeof deletedAt === "number" && Number.isFinite(deletedAt)) return true;
-		return nested.get("deleted") === true;
+		return typeof deletedAt === "number" && Number.isFinite(deletedAt) ? deletedAt : null;
 	}
-	if (typeof value === "object" && value !== null) {
-		if ("deletedAt" in value) {
-			const deletedAt = value.deletedAt;
-			if (typeof deletedAt === "number" && Number.isFinite(deletedAt)) return true;
-		}
-		return "deleted" in value && value.deleted === true;
+	if (typeof value === "object" && value !== null && "deletedAt" in value) {
+		const deletedAt = value.deletedAt;
+		return typeof deletedAt === "number" && Number.isFinite(deletedAt) ? deletedAt : null;
 	}
-	return false;
+	return null;
+}
+
+/** Whether a metadata value is a tombstone, in either shape. */
+export function isMetaDeleted(value: unknown): boolean {
+	if (readMetaDeletedAt(value) !== null) return true;
+	const nested = asMapLike(value);
+	if (nested) return nested.get("deleted") === true;
+	return typeof value === "object"
+		&& value !== null
+		&& "deleted" in value
+		&& value.deleted === true;
 }
 
 export function buildDocumentSummary(doc: Y.Doc): DocumentSummary {

@@ -27,36 +27,19 @@ import {
 } from "./traceStore";
 import { trySendSvEcho, type SvEchoSendResult } from "./svEcho";
 import { isUpdateBearingSyncMessage } from "./syncMessageClassifier";
-import { bytesToHex } from "./hex";
-import { sha256Hex } from "./hex";
+import { bytesToHex, sha256Hex } from "./hex";
 import {
 	PersistenceCoordinator,
 	type PersistenceHealth,
 } from "./persistenceCoordinator";
 import type { LoadedDocState } from "./sqlDocStore";
 import type { Env } from "./routes/types";
+import { json } from "./routes/http";
 
 const MAX_DEBUG_TRACE_EVENTS = 200;
-const JOURNAL_COMPACT_MAX_ENTRIES = 50;
-const JOURNAL_COMPACT_MAX_BYTES = 1 * 1024 * 1024;
 const TRACE_DEBUG_LIMIT = 100;
 
-
 const LOG_PREFIX = "[yaos-sync:server]";
-
-/**
- * If a journal append fails, fall back to full checkpoint rewrite after this
- * many consecutive failures. Breaks the death spiral where the same large
- * delta fails repeatedly from a stale persisted state vector.
- */
-const CHECKPOINT_FALLBACK_AFTER_FAILURES = 2;
-
-/**
- * If the computed delta exceeds this byte threshold, skip the journal append
- * entirely and write a full checkpoint. A delta this large is effectively a
- * checkpoint anyway, and appending it risks hitting storage/memory constraints.
- */
-const CHECKPOINT_FALLBACK_DELTA_BYTES = 2 * 1024 * 1024;
 
 type ServerTraceEntry = StoredTraceEntry;
 
@@ -84,14 +67,19 @@ function equalBytes(a: Uint8Array, b: Uint8Array): boolean {
 	return true;
 }
 
-function json(body: unknown, status = 200): Response {
-	return new Response(JSON.stringify(body), {
-		status,
-		headers: {
-			"Content-Type": "application/json; charset=utf-8",
-			"Cache-Control": "no-store",
-		},
-	});
+export function disabledAdminRouteResponse(
+	env: Pick<Env, "YAOS_ENABLE_ADMIN_ROUTES">,
+): Response | null {
+	return env.YAOS_ENABLE_ADMIN_ROUTES
+		? null
+		: json({ error: "not found" }, 404);
+}
+
+export function shouldBypassDocumentLoadForPartyServerRequest(
+	pathname: string,
+	isWebSocketUpgrade: boolean,
+): boolean {
+	return pathname.startsWith("/cdn-cgi/partyserver/") && !isWebSocketUpgrade;
 }
 
 /**
@@ -364,9 +352,8 @@ export class VaultSyncServer extends YServer<Env> {
 		}
 
 		if (request.method === "POST" && url.pathname === "/__yaos/compact") {
-			if (!this.env.YAOS_ENABLE_ADMIN_ROUTES) {
-				return json({ error: "not found" }, 404);
-			}
+			const rejection = disabledAdminRouteResponse(this.env);
+			if (rejection) return rejection;
 			await this.ensureDocumentLoaded();
 			return json(await this.executeEmergencyCompact());
 		}
@@ -382,15 +369,10 @@ export class VaultSyncServer extends YServer<Env> {
 			return json(await this.createDailySnapshotMaybe(body.device));
 		}
 
-		// PartyServer internal management routes (e.g. /cdn-cgi/partyserver/set-name/)
-		// must not hydrate the document (issue #40 fix).  These are framework
-		// bookkeeping calls that do not need the Y.Doc in memory.  The observed
-		// offender was /cdn-cgi/partyserver/set-name/ pairing with checkpoint-load
-		// on every reconnect.  Non-WebSocket internal routes are safe to delegate
-		// directly to the framework without document hydration.
-		const isPartyServerInternal = url.pathname.startsWith("/cdn-cgi/partyserver/");
+		// PartyServer internal management routes do not need the Y.Doc. Keep
+		// WebSocket upgrades on the ordinary hydrated path.
 		const isWebSocketUpgrade = request.headers.get("upgrade")?.toLowerCase() === "websocket";
-		if (isPartyServerInternal && !isWebSocketUpgrade) {
+		if (shouldBypassDocumentLoadForPartyServerRequest(url.pathname, isWebSocketUpgrade)) {
 			return super.fetch(request);
 		}
 
@@ -654,12 +636,6 @@ export class VaultSyncServer extends YServer<Env> {
 						this.oversizedDeltaCount++;
 					}
 					void this.recordTrace(`server.${event}`, data);
-				},
-				{
-					checkpointFallbackDeltaBytes: CHECKPOINT_FALLBACK_DELTA_BYTES,
-					checkpointFallbackAfterFailures: CHECKPOINT_FALLBACK_AFTER_FAILURES,
-					journalCompactMaxEntries: JOURNAL_COMPACT_MAX_ENTRIES,
-					journalCompactMaxBytes: JOURNAL_COMPACT_MAX_BYTES,
 				},
 			);
 		}

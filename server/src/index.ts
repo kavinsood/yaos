@@ -2,7 +2,6 @@ import { ServerConfig, type StoredServerConfig } from "./config";
 import { VaultSyncServer } from "./server";
 import { renderMobileSetupPage, renderRunningPage, renderSetupPage } from "./setupPage";
 import {
-	canonicalRepoForSetup,
 	getAuthStateCached,
 	getCapabilities,
 	getHttpAuthToken,
@@ -306,12 +305,8 @@ async function rejectAndLogUnauthorizedVaultRequest(
 // ── Capabilities ──────────────────────────────────────────────────────────────
 
 /**
- * Extract the StoredServerConfig carried in the AuthState (claim/unclaimed
- * modes only — env mode has no config).  Returns null for env mode or when
- * the config was not populated (e.g. old uncached getAuthState callers).
- *
- * When called with AuthStateCached (the return of getAuthStateCached), config
- * is always present for claim/unclaimed modes — no ?? null needed.
+ * Extract the StoredServerConfig carried in the AuthState. Claim/unclaimed
+ * modes always carry it; env mode has no config.
  */
 function getConfigFromAuthState(authState: AuthStateCached): StoredServerConfig | null {
 	if (authState.mode === "claim" || authState.mode === "unclaimed") {
@@ -379,14 +374,12 @@ const worker = {
 				})
 				: renderSetupPage({
 					host: url.origin,
-					deployRepo: canonicalRepoForSetup(env),
 				});
 			response = html(body);
 		} else if (route.kind === "mobile-setup") {
 			response = html(
 				renderMobileSetupPage({
 					host: url.origin,
-					deployRepo: canonicalRepoForSetup(env),
 				}),
 			);
 		} else if (route.kind === "capabilities") {

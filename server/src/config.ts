@@ -1,3 +1,5 @@
+import { json } from "./routes/http";
+
 const CLAIMED_KEY = "claimed";
 const TOKEN_HASH_KEY = "tokenHash";
 const UPDATE_PROVIDER_KEY = "updateProvider";
@@ -12,16 +14,6 @@ export interface StoredServerConfig {
 	updateProvider: UpdateProvider | null;
 	updateRepoUrl: string | null;
 	updateRepoBranch: string | null;
-}
-
-function json(body: unknown, status = 200): Response {
-	return new Response(JSON.stringify(body), {
-		status,
-		headers: {
-			"Content-Type": "application/json; charset=utf-8",
-			"Cache-Control": "no-store",
-		},
-	});
 }
 
 function normalizeUpdateProvider(value: unknown): UpdateProvider | null {

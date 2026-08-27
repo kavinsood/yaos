@@ -1,5 +1,6 @@
 import { runSerialized, runSingleFlight } from "../../server/src/asyncConcurrency";
 import { MAX_BLOB_UPLOAD_BYTES } from "../../server/src/contracts";
+import { shouldBypassDocumentLoadForPartyServerRequest } from "../../server/src/server";
 import worker from "../../server/src/index";
 import { getCapabilities } from "../../server/src/routes/auth";
 import { handleBlobRoute } from "../../server/src/routes/blobs";
@@ -313,4 +314,20 @@ s.section("Test 9: /api/capabilities route splits public and authenticated metad
 	s.check(privateCaps.updateRepoBranch === "secret-branch", "authenticated capabilities route includes update repo branch");
 	s.check(privateCaps.maxBlobUploadBytes === MAX_BLOB_UPLOAD_BYTES, "capabilities route exposes max blob upload bytes");
 }
+s.section("Test 10: PartyServer management requests bypass document hydration only for HTTP");
+{
+	s.check(
+		shouldBypassDocumentLoadForPartyServerRequest("/cdn-cgi/partyserver/set-name/", false),
+		"non-WebSocket PartyServer management route bypasses hydration",
+	);
+	s.check(
+		!shouldBypassDocumentLoadForPartyServerRequest("/cdn-cgi/partyserver/set-name/", true),
+		"PartyServer WebSocket upgrade does not bypass hydration",
+	);
+	s.check(
+		!shouldBypassDocumentLoadForPartyServerRequest("/__yaos/debug", false),
+		"ordinary internal routes are not misclassified as PartyServer management",
+	);
+}
+
 await s.done();

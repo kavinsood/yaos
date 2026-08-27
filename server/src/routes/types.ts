@@ -3,7 +3,6 @@ import type { StoredServerConfig } from "../config";
 
 export interface Env {
 	SYNC_TOKEN?: string;
-	YAOS_CANONICAL_REPO?: string;
 	YAOS_SYNC: DurableObjectNamespace<VaultSyncServer>;
 	YAOS_CONFIG: DurableObjectNamespace;
 	YAOS_BUCKET?: R2Bucket;

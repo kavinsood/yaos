@@ -1,5 +1,6 @@
 import { mapWithConcurrency } from "../shared/concurrency";
 import { MAX_BLOB_UPLOAD_BYTES } from "../contracts";
+import { sha256Hex } from "../hex";
 import { blobKey } from "../snapshot";
 import type { Env, JsonResponse } from "./types";
 
@@ -8,13 +9,6 @@ const R2_HEAD_CONCURRENCY = 4;
 
 function isValidHash(hash: string): boolean {
 	return /^[0-9a-f]{64}$/.test(hash);
-}
-
-async function sha256Hex(bytes: ArrayBuffer): Promise<string> {
-	const digest = await crypto.subtle.digest("SHA-256", bytes);
-	return Array.from(new Uint8Array(digest), (byte) =>
-		byte.toString(16).padStart(2, "0")
-	).join("");
 }
 
 function parseContentLength(value: string | null): { kind: "missing" } | { kind: "invalid" } | { kind: "ok"; value: number } {
@@ -134,7 +128,7 @@ async function handleBlobUpload(
 			error: `contentLength exceeds max upload size (${MAX_BLOB_UPLOAD_BYTES} bytes)`,
 		}, 413);
 	}
-	const actualHash = await sha256Hex(body);
+	const actualHash = await sha256Hex(new Uint8Array(body));
 	if (actualHash !== hash) {
 		return json({ error: "hash mismatch" }, 400);
 	}

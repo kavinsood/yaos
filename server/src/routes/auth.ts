@@ -33,12 +33,6 @@ export function supportsBuckets(env: Env): boolean {
 	return env.YAOS_BUCKET !== undefined;
 }
 
-export function canonicalRepoForSetup(env: Env): string | undefined {
-	const raw = env.YAOS_CANONICAL_REPO?.trim();
-	if (!raw) return undefined;
-	return /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(raw) ? raw : undefined;
-}
-
 export async function getStoredServerConfig(env: Env): Promise<StoredServerConfig> {
 	const id = env.YAOS_CONFIG.idFromName("global-config");
 	const stub = env.YAOS_CONFIG.get(id);
@@ -131,22 +125,8 @@ async function setServerUpdateMetadata(env: Env, metadata: {
 	return payload.config;
 }
 
-export async function getAuthState(env: Env): Promise<AuthState> {
-	const envToken = env.SYNC_TOKEN?.trim();
-	if (envToken) {
-		return { mode: "env", claimed: true, envToken };
-	}
-
-	const config = await getStoredServerConfig(env);
-	if (config.claimed && typeof config.tokenHash === "string" && config.tokenHash.length > 0) {
-		return { mode: "claim", claimed: true, tokenHash: config.tokenHash };
-	}
-
-	return { mode: "unclaimed", claimed: false };
-}
-
 /**
- * Cached variant of getAuthState.  Uses getStoredServerConfigCached so that
+ * Cached auth-state lookup. Uses getStoredServerConfigCached so that
  * repeated requests within AUTH_CONFIG_CACHE_TTL_MS share a single YAOS_CONFIG
  * subrequest instead of each paying a DO round-trip.  The cached AuthState
  * carries the full StoredServerConfig in claim/unclaimed modes so callers can

@@ -1,6 +1,5 @@
 interface SetupPageOptions {
 	host: string;
-	deployRepo?: string;
 }
 
 interface RunningPageOptions {
@@ -12,7 +11,6 @@ interface RunningPageOptions {
 
 interface MobileSetupPageOptions {
 	host: string;
-	deployRepo?: string;
 }
 
 function escapeHtml(value: string): string {

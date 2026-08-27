@@ -178,12 +178,29 @@ s.section("Test 4: unclaimed mode — vault routes rejected without YAOS_SYNC ac
 		SYNC_TOKEN: undefined,
 	});
 
-	const resp = await worker.fetch(
-		new Request("https://example.com/vault/some-vault/debug/recent"),
-		trapSyncEnv,
-	);
-	s.check(resp.status === 503, "unclaimed mode: vault route returns 503");
+	const warnings: string[] = [];
+	const originalWarn = console.warn;
+	console.warn = (...values: unknown[]) => {
+		warnings.push(values.map(String).join(" "));
+	};
+	let resp: Response | null = null;
+	try {
+		resp = await worker.fetch(
+			new Request("https://example.com/vault/some-vault/debug/recent"),
+			trapSyncEnv,
+		);
+	} finally {
+		console.warn = originalWarn;
+	}
+	s.check(resp?.status === 503, "unclaimed mode: vault route returns 503");
 	s.check(syncTrap.touched.length === 0, "unclaimed mode: YAOS_SYNC was not touched");
+	s.check(
+		warnings.some((warning) =>
+			warning.includes("vault rejected pre-auth")
+			&& warning.includes('"reason":"unclaimed"')
+		),
+		"unclaimed rejection emits a structured Worker warning",
+	);
 
 	invalidateStoredServerConfigCache();
 }
