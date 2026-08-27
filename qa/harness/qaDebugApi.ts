@@ -1,12 +1,12 @@
 /**
- * YAOS QA Debug API — Puppeteer harness (qa/harness/)
+ * YAOS QA Debug API — desktop automation harness (qa/harness/)
  *
  * Exposes a narrow, deterministic control surface for the QA harness.
  * Only registered when settings.qaDebugMode is true.
  * NEVER enable in production vaults.
  *
  * This file lives in qa/harness/ and is NOT compiled into main.js or
- * telemetry.js. It is used by the Puppeteer harness and dev tooling only.
+ * telemetry.js. It is used by desktop automation and developer tooling only.
  *
  * The API surface is conceptually split into two ports:
  *   - YaosDebugPort: safe, read-only or non-mutating debug capabilities
@@ -115,8 +115,6 @@ export interface YaosQaDebugApi {
 		checkpoint: ReceiptWaitCheckpoint,
 		timeoutMs: number,
 	): Promise<void>;
-	/** @deprecated Use waitForReceiptAfter(timestamp). This checks global state and can give false-passes. */
-	waitForMemoryReceipt(timeoutMs: number): Promise<void>;
 	/** File appears in the vault (disk) */
 	waitForFile(path: string, timeoutMs: number): Promise<void>;
 
@@ -268,7 +266,7 @@ interface PluginHandle {
 	connectProvider(reason?: string): void;
 	/** Fingerprint of the derived path salt, `sha256:<hex>`, or null when idle. */
 	getPathSaltFingerprint(): string | null;
-	/** Engine control port — present when Puppeteer harness is active. */
+	/** Engine control port — present when the QA automation harness is active. */
 	getEngineControlPort(): import("../../src/runtime/engineControlPort").EngineControlPort;
 }
 
@@ -303,12 +301,13 @@ function waitFor(
 
 function readReceiptWaitState(vaultSync: VaultSync | null): ReceiptWaitState | null {
 	if (!vaultSync) return null;
+	const receipt = vaultSync.getServerReceiptSnapshot();
 	return {
-		candidateId: vaultSync.serverReceiptCandidateId,
-		capturedAt: vaultSync.serverReceiptCandidateCapturedAt,
-		lastConfirmedCandidateId: vaultSync.lastConfirmedReceiptCandidateId,
-		lastConfirmedAt: vaultSync.lastKnownServerReceiptEchoAt,
-		hasUnconfirmedCandidate: vaultSync.hasUnconfirmedServerReceiptCandidate,
+		candidateId: receipt.candidateId,
+		capturedAt: receipt.candidateCapturedAt,
+		lastConfirmedCandidateId: receipt.lastConfirmedCandidateId,
+		lastConfirmedAt: receipt.lastKnownServerReceiptEchoAt,
+		hasUnconfirmedCandidate: receipt.hasUnconfirmedCandidate,
 	};
 }
 
@@ -438,13 +437,6 @@ export function buildQaDebugApi(plugin: PluginHandle): YaosQaDebugApi {
 			);
 		},
 
-		waitForMemoryReceipt(timeoutMs): Promise<void> {
-			return waitFor(
-				() => plugin.getVaultSync()?.serverAppliedLocalState === true,
-				POLL_INTERVAL,
-				timeoutMs,
-			);
-		},
 
 		waitForFile(path, timeoutMs): Promise<void> {
 			return waitFor(
@@ -600,7 +592,7 @@ export function buildQaDebugApi(plugin: PluginHandle): YaosQaDebugApi {
 		getServerReceiptState(): "confirmed" | "pending" | "unknown" | "no-candidate" {
 			const vaultSync = plugin.getVaultSync();
 			if (!vaultSync) return "no-candidate";
-			const state = vaultSync.serverAppliedLocalState;
+			const state = vaultSync.getServerReceiptSnapshot().serverAppliedLocalState;
 			if (state === true) return "confirmed";
 			if (state === false) return "pending";
 			return "no-candidate";

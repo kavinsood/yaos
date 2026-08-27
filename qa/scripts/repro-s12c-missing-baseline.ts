@@ -12,7 +12,7 @@
  * Ports: A=9222 (temenos), B=9223 (temenos-b)
  */
 
-import { RawCdpObsidianClient as ObsidianClient } from "../controllers/obsidian-client-raw-cdp";
+import { ObsidianClient } from "../controllers/obsidian-client.mjs";
 
 const SCRATCH = "QA-scratch/s12c-repro.md";
 const INITIAL = "S12C-BASELINE\n";

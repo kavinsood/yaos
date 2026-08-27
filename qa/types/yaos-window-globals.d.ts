@@ -2,8 +2,8 @@
  * Ambient declarations for the two QA globals the harness mounts on `window`.
  *
  * Neither is part of the product's public surface: the harness plugin creates
- * both in onload() and deletes both in onunload(), and the Playwright/CDP
- * controllers in qa/controllers/ are the only other readers. Declaring them
+ * both in onload() and deletes both in onunload(), and the raw CDP controllers
+ * in qa/controllers/ are the only other readers. Declaring them
  * here is what lets every one of those readers be an ordinary property access
  * instead of a cast, and it makes a signature drift between the harness API and
  * a controller's use of it a compile error under tsconfig.qa.json.

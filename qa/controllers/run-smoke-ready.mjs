@@ -30,139 +30,15 @@
  * Exit 0 = PASS. Exit 1 = FAIL.
  */
 
-import WebSocket from "ws";
 import { existsSync } from "fs";
 import { resolve, join } from "path";
+import { ObsidianClient } from "./obsidian-client.mjs";
 
 const PORT = parseInt(process.env.QA_CDP_PORT ?? "9222", 10);
 const HOST = process.env.QA_CDP_HOST ?? "localhost";
 const VAULT_PATH = process.env.QA_VAULT_PATH ? resolve(process.env.QA_VAULT_PATH) : null;
 const QA_TIMEOUT_MS = parseInt(process.env.QA_TIMEOUT_MS ?? "30000", 10);
-const SCENARIO_TIMEOUT_MS = 60_000;
 
-// ---------------------------------------------------------------------------
-// Minimal raw-CDP client (no Playwright dependency)
-// ---------------------------------------------------------------------------
-
-class CdpClient {
-	ws = null;
-	msgId = 0;
-	pending = new Map();
-
-	async connect(port, host) {
-		const listUrl = `http://${host}:${port}/json/list`;
-		let res;
-		try {
-			res = await fetch(listUrl);
-		} catch (e) {
-			throw new Error(
-				`QA Obsidian runtime not available; start Obsidian with remote debugging.\n` +
-				`  Expected CDP at http://${host}:${port}\n` +
-				`  Error: ${e.message}`,
-			);
-		}
-		if (!res.ok) {
-			throw new Error(
-				`QA Obsidian runtime not available; start Obsidian with remote debugging.\n` +
-				`  GET ${listUrl} returned ${res.status} ${res.statusText}`,
-			);
-		}
-
-		const targets = await res.json();
-
-		// Pick main Obsidian renderer page (not DevTools, not blob workers)
-		let target =
-			targets.find(
-				(t) => t.type === "page" && t.title.includes("Obsidian") && !t.title.includes("DevTools"),
-			) ??
-			targets.find((t) => t.url?.includes("obsidian.md/index.html")) ??
-			targets.find(
-				(t) =>
-					t.type === "page" &&
-					!t.url?.startsWith("blob:") &&
-					!t.title?.includes("Worker"),
-			);
-
-		if (!target) {
-			throw new Error(
-				`QA Obsidian runtime not available; start Obsidian with remote debugging.\n` +
-				`  No suitable Obsidian renderer page found on port ${port}.\n` +
-				`  Targets found: ${targets.map((t) => `${t.type}:"${t.title}"`).join(", ") || "(none)"}`,
-			);
-		}
-
-		await this._connectWs(target.webSocketDebuggerUrl);
-	}
-
-	_connectWs(url) {
-		return new Promise((resolve, reject) => {
-			const timeout = setTimeout(() => {
-				reject(new Error(`WebSocket connection timeout (15s) to ${url}`));
-			}, 15_000);
-
-			this.ws = new WebSocket(url);
-
-			this.ws.on("open", () => {
-				clearTimeout(timeout);
-				resolve();
-			});
-
-			this.ws.on("error", (err) => {
-				clearTimeout(timeout);
-				reject(err);
-			});
-
-			this.ws.on("message", (data) => {
-				const msg = JSON.parse(data.toString());
-				if (msg.id !== undefined && this.pending.has(msg.id)) {
-					this.pending.get(msg.id)(msg);
-					this.pending.delete(msg.id);
-				}
-			});
-		});
-	}
-
-	async eval(expression, timeoutMs = 60_000) {
-		if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-			throw new Error("CDP not connected");
-		}
-		const id = ++this.msgId;
-		return new Promise((resolve, reject) => {
-			const timer = setTimeout(() => {
-				this.pending.delete(id);
-				reject(new Error(`CDP eval timeout (${timeoutMs}ms)`));
-			}, timeoutMs);
-
-			this.pending.set(id, (msg) => {
-				clearTimeout(timer);
-				if (msg.result?.exceptionDetails) {
-					const d = msg.result.exceptionDetails;
-					reject(new Error(d.exception?.description || d.text || JSON.stringify(d)));
-				} else {
-					resolve(msg.result?.result?.value);
-				}
-			});
-
-			this.ws.send(
-				JSON.stringify({
-					id,
-					method: "Runtime.evaluate",
-					params: { expression, awaitPromise: true, returnByValue: true },
-				}),
-			);
-		});
-	}
-
-	async close() {
-		if (this.ws) {
-			this.ws.close();
-			this.ws = null;
-		}
-		this.pending.clear();
-	}
-}
-
-// ---------------------------------------------------------------------------
 // Logging helpers
 // ---------------------------------------------------------------------------
 
@@ -189,7 +65,7 @@ async function main() {
 	if (VAULT_PATH) log(INFO, `Vault path: ${VAULT_PATH}`);
 	else log(INFO, "QA_VAULT_PATH not set — disk trace-file check will be skipped");
 
-	const client = new CdpClient();
+	const client = new ObsidianClient({ port: PORT, host: HOST });
 	const failures = [];
 
 	function require(label, passed, detail = "") {
@@ -202,7 +78,7 @@ async function main() {
 		// 0. Connect to Obsidian
 		// ----------------------------------------------------------------
 		log(INFO, `Connecting to CDP at http://${HOST}:${PORT} …`);
-		await client.connect(PORT, HOST);
+		await client.connect();
 		log(INFO, "CDP connected.");
 
 		// ----------------------------------------------------------------
@@ -213,7 +89,7 @@ async function main() {
 		let qaReady = false;
 		while (Date.now() - start < QA_TIMEOUT_MS) {
 			try {
-				qaReady = await client.eval(`!!(window.__YAOS_DEBUG__ && window.__YAOS_QA__)`, 5_000);
+				qaReady = await client.evalRaw(`!!(window.__YAOS_DEBUG__ && window.__YAOS_QA__)`, 5_000);
 				if (qaReady) break;
 			} catch {
 				// transient CDP error — keep polling
@@ -238,16 +114,16 @@ async function main() {
 		// ----------------------------------------------------------------
 		// 2–3. Check both globals explicitly
 		// ----------------------------------------------------------------
-		const debugExists = await client.eval(`typeof window.__YAOS_DEBUG__ !== "undefined" && window.__YAOS_DEBUG__ !== null`);
+		const debugExists = await client.evalRaw(`typeof window.__YAOS_DEBUG__ !== "undefined" && window.__YAOS_DEBUG__ !== null`);
 		require("window.__YAOS_DEBUG__ exists", debugExists);
 
-		const qaExists = await client.eval(`typeof window.__YAOS_QA__ !== "undefined" && window.__YAOS_QA__ !== null`);
+		const qaExists = await client.evalRaw(`typeof window.__YAOS_QA__ !== "undefined" && window.__YAOS_QA__ !== null`);
 		require("window.__YAOS_QA__ exists", qaExists);
 
 		// ----------------------------------------------------------------
 		// 4. QA product build loaded (getEngineControlPort callable)
 		// ----------------------------------------------------------------
-		const hasEngineControlPort = await client.eval(
+		const hasEngineControlPort = await client.evalRaw(
 			`typeof app?.plugins?.plugins?.["yaos"]?.getEngineControlPort === "function"`,
 		);
 		require(
@@ -259,7 +135,7 @@ async function main() {
 		// ----------------------------------------------------------------
 		// 5. Harness plugin loaded
 		// ----------------------------------------------------------------
-		const harnessLoaded = await client.eval(
+		const harnessLoaded = await client.evalRaw(
 			`app?.plugins?.plugins?.["yaos-qa-harness"] != null`,
 		);
 		require("Harness plugin loaded (yaos-qa-harness)", harnessLoaded);
@@ -273,15 +149,8 @@ async function main() {
 		// ----------------------------------------------------------------
 		// 6. Run scenario smoke-trace-export
 		// ----------------------------------------------------------------
-		log(INFO, `Running scenario: smoke-trace-export (timeout ${SCENARIO_TIMEOUT_MS}ms) …`);
-		const result = await client.eval(
-			`(async () => {
-				const qa = window.__YAOS_QA__;
-				if (!qa) throw new Error('__YAOS_QA__ not found');
-				return qa.run("smoke-trace-export", { timeoutMs: ${SCENARIO_TIMEOUT_MS} });
-			})()`,
-			SCENARIO_TIMEOUT_MS + 10_000,
-		);
+		log(INFO, "Running scenario: smoke-trace-export …");
+		const result = await client.runScenario("smoke-trace-export");
 
 		if (!result) {
 			require("scenario smoke-trace-export: returned result", false, "qa.run() returned null/undefined");

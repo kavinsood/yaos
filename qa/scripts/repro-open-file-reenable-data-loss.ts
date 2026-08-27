@@ -42,7 +42,7 @@
  * artifact contains REMOTE_FROM_A.
  */
 
-import { RawCdpObsidianClient } from "../controllers/obsidian-client-raw-cdp";
+import { ObsidianClient } from "../controllers/obsidian-client.mjs";
 import { randomBytes } from "node:crypto";
 
 const RUN_ID = randomBytes(4).toString("hex");
@@ -66,8 +66,8 @@ async function main() {
 	log(`=== open-file-reenable-data-loss repro (run=${RUN_ID}) ===`);
 	log(`Path: ${SCRATCH}`);
 
-	const a = new RawCdpObsidianClient({ port: PORT_A });
-	const b = new RawCdpObsidianClient({ port: PORT_B });
+	const a = new ObsidianClient({ port: PORT_A });
+	const b = new ObsidianClient({ port: PORT_B });
 
 	await a.connect();
 	await b.connect();

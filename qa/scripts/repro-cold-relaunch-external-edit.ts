@@ -24,10 +24,10 @@
  * Disk-index entry for the path is explicitly scrubbed from data.json before the run.
  */
 
-import { RawCdpObsidianClient } from "../controllers/obsidian-client-raw-cdp";
+import { ObsidianClient } from "../controllers/obsidian-client.mjs";
 import { randomBytes } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
-import { writeFile } from "node:fs/promises";
+import { writeNodeFile } from "../controllers/node-vault-fs";
 import { spawn } from "node:child_process";
 
 const RUN_ID = randomBytes(4).toString("hex");
@@ -88,7 +88,7 @@ async function waitMs(ms: number) {
 	await new Promise((r) => setTimeout(r, ms));
 }
 
-async function relaunchB(): Promise<RawCdpObsidianClient> {
+async function relaunchB(): Promise<ObsidianClient> {
 	log("Relaunching B Obsidian process...");
 	const proc = spawn(
 		"obsidian",
@@ -118,7 +118,7 @@ async function relaunchB(): Promise<RawCdpObsidianClient> {
 
 	await waitMs(4000); // let Obsidian renderer fully initialize
 
-	const client = new RawCdpObsidianClient({ port: PORT_B });
+	const client = new ObsidianClient({ port: PORT_B });
 	await client.connect();
 	log("B reconnected via CDP");
 
@@ -133,8 +133,8 @@ async function main() {
 
 	// --- Phase 0: Connect to both, clean state ---
 
-	const a = new RawCdpObsidianClient({ port: PORT_A });
-	let b = new RawCdpObsidianClient({ port: PORT_B });
+	const a = new ObsidianClient({ port: PORT_A });
+	let b = new ObsidianClient({ port: PORT_B });
 
 	log("Connecting to A and B...");
 	await a.connect();
@@ -272,7 +272,7 @@ async function main() {
 
 	log("Phase 4b: Writing LOCAL_ON_B directly to B's vault file (node:fs, B process dead)...");
 	const fullVaultPath = `${VAULT_B}/${SCRATCH}`;
-	await writeFile(fullVaultPath, LOCAL_ON_B, "utf-8");
+	await writeNodeFile(VAULT_B, SCRATCH, LOCAL_ON_B);
 	const writtenContent = readFileSync(fullVaultPath, "utf-8");
 	log(`Wrote to B disk: ${JSON.stringify(writtenContent)}`);
 

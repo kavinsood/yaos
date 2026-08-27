@@ -30,10 +30,10 @@
  * confirmed the bug. Then we fix it.
  */
 
-import { RawCdpObsidianClient } from "../controllers/obsidian-client-raw-cdp";
+import { ObsidianClient } from "../controllers/obsidian-client.mjs";
 import { randomBytes } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
-import { writeFile } from "node:fs/promises";
+import { writeNodeFile } from "../controllers/node-vault-fs";
 import { spawn, execSync } from "node:child_process";
 
 const RUN_ID = randomBytes(4).toString("hex");
@@ -88,7 +88,7 @@ function getBPid(): number | null {
 	} catch { return null; }
 }
 
-async function relaunchB(): Promise<RawCdpObsidianClient> {
+async function relaunchB(): Promise<ObsidianClient> {
 	const proc = spawn("obsidian",
 		[`--remote-debugging-port=${PORT_B}`, `--user-data-dir=${USER_DATA_B}`, VAULT_B],
 		{ detached: true, stdio: "ignore" });
@@ -102,7 +102,7 @@ async function relaunchB(): Promise<RawCdpObsidianClient> {
 		await new Promise(r => setTimeout(r, 500));
 	}
 	await new Promise(r => setTimeout(r, 4000)); // let renderer initialize
-	const client = new RawCdpObsidianClient({ port: PORT_B });
+	const client = new ObsidianClient({ port: PORT_B });
 	await client.connect();
 	await client.waitForQaReady(30_000);
 	log("B reconnected and QA-ready after relaunch");
@@ -116,8 +116,8 @@ async function main() {
 	log(`Path: ${SCRATCH}`);
 
 	// --- Setup ---
-	const a = new RawCdpObsidianClient({ port: PORT_A });
-	let b = new RawCdpObsidianClient({ port: PORT_B });
+	const a = new ObsidianClient({ port: PORT_A });
+	let b = new ObsidianClient({ port: PORT_B });
 	await a.connect();
 	await b.connect();
 	await a.waitForQaReady(30_000);
@@ -210,7 +210,7 @@ async function main() {
 	log("A edit settled.");
 
 	log("Phase 3b: Writing LOCAL_ON_B directly to disk (Node/fs, B dead)...");
-	await writeFile(`${VAULT_B}/${SCRATCH}`, LOCAL_ON_B, "utf-8");
+	await writeNodeFile(VAULT_B, SCRATCH, LOCAL_ON_B);
 	const written = readFileSync(`${VAULT_B}/${SCRATCH}`, "utf-8");
 	log(`Wrote to B disk: ${JSON.stringify(written)}`);
 

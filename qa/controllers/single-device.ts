@@ -14,10 +14,11 @@
 
 import { resolve, join } from "path";
 import { readFileSync } from "fs";
-import { ObsidianClient } from "./obsidian-client";
+import { ObsidianClient } from "./obsidian-client.mjs";
 import { ArtifactCollector } from "./collect-artifacts";
 import { analyzeTrace } from "../analyzers/analyzer";
 import { formatReport } from "../analyzers/report";
+import { resolveTraceExportPath } from "./trace-path";
 
 function parseArgs(args: string[]): Record<string, string> {
 	const result: Record<string, string> = {};
@@ -91,18 +92,13 @@ async function main(): Promise<void> {
 			for (const w of result.warnings) log(`  WARN: ${w}`);
 		}
 
-		// Export trace and collect
+		// Export trace and collect. Analysis is a required part of a passing run.
 		log("Exporting flight trace…");
 		const tracePath = await client.exportTrace("safe");
+		if (!tracePath) throw new Error("trace export returned no path");
 		log(`Trace exported: ${tracePath}`);
-		if (tracePath && vaultPath) {
-			const fullTracePath = tracePath.startsWith("/")
-				? tracePath
-				: join(vaultPath, ".obsidian", tracePath);
-			await collector.collectTrace(fullTracePath).catch((e) =>
-				log(`Warning: could not collect trace: ${e}`),
-			);
-		}
+		const fullTracePath = resolveTraceExportPath(tracePath, vaultPath);
+		await collector.collectTrace(fullTracePath);
 
 		// Post-run manifest
 		const postMani = await client.manifest();
@@ -112,7 +108,8 @@ async function main(): Promise<void> {
 		// Save result
 		await collector.saveResult(result);
 
-		// Analyze trace if collected
+		// Analyze the collected trace. Missing, malformed, or failing analysis
+		// makes the run fail closed.
 		const traceCollected = join(collector.runDirectory, "flight-trace.ndjson");
 		try {
 			const raw = readFileSync(traceCollected, "utf-8");
@@ -123,8 +120,9 @@ async function main(): Promise<void> {
 				log("Analyzer found hard failures — marking run as FAIL.");
 				result.passed = false;
 			}
-		} catch {
-			log("Warning: could not analyze trace (not found or parse error).");
+		} catch (err) {
+			log(`ERROR: trace analysis failed: ${String(err)}`);
+			result.passed = false;
 		}
 
 		// Write log
