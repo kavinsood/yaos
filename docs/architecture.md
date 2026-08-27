@@ -10,6 +10,8 @@ A release contains `main.js`, `manifest.json`, and `styles.css`. Generated bundl
 
 The diagnostics runtime used to ship as a second `telemetry.js` bundle loaded through filesystem access and `new Function`. That split did not create isolation—the bundles shared one realm and broad host handles—but it did add mobile and loader failure modes. Isolation now comes from read-only types, source boundaries, and production-bundle guards instead.
 
+`FlightTraceController` is the single client observability lifecycle: it owns the recorder session, HTTP trace context, server-trace polling, periodic/debounced checkpoints, runtime error capture, export, retention, and shutdown. Product code emits through the published flight envelope/taxonomy; there is no second persistent logger or parallel trace session.
+
 ## Vault model
 
 The user-owned surface remains ordinary local files. Yjs provides causal shared state beside those files; the disk bridge exists so Obsidian, scripts, and external tools do not have to treat a proprietary database as the only usable vault.
@@ -32,6 +34,8 @@ Tombstoned Markdown bodies are reaped after their grace period while tombstone m
 ## Client synchronization
 
 `VaultSync` owns the local Yjs document, IndexedDB provider, remote provider, file identity, and reconciliation inputs. `ReconciliationController` coordinates authority decisions. `DiskMirror` materializes CRDT state and observes ordinary local files. `EditorBindingManager` connects open Markdown editors to their `Y.Text`. `BlobSyncManager` handles non-Markdown files through R2.
+
+SHA-256, receipt state, reconciliation statistics, and status rendering each have one source shape. `ServerAckState` plus the VaultSync-owned receipt envelope feeds connection facts, status, diagnostics, and QA; status text derives directly from rich `ConnectionState` rather than a second coarse state machine. Path identity is not one pipeline yet: `canonicalizeVaultPath` is the NFC/separator helper at exclusion, snapshot restore, and path-id boundaries, while `VaultSync`, `DiskMirror`, and `BlobSync` still key mutation on Obsidian `normalizePath`. That cutover is [PATH-01](BACKLOG.md#path-01--nfcnfd-normalization-across-the-full-pipeline).
 
 ### Disk to CRDT
 

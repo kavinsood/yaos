@@ -15,17 +15,16 @@ Each item names current evidence, required work, and closure evidence. Historica
 
 ### SYNC-01 — offline local delete is resurrected on re-enable
 
-**State:** Known failing behavior hidden as an expected failure.
+**State:** Known product bug with a hard failing two-device regression. The product still resurrects the deleted file.
 
-**Evidence:** `qa/controllers/two-device.ts`, scenario `issue-22-disable-reenable-local-delete-remote-unchanged`, explicitly logs a known issue and does not fail. When the file is absent on disk but still present in CRDT, `VaultSync.reconcileVault()` places it in `createdOnDisk`; `ReconciliationController` writes it back. The implementation cannot distinguish a file missing because this device has never materialized it from a file that this device previously indexed and deleted while YAOS was disabled.
+**Evidence:** `qa/controllers/two-device-scenarios/issue22-reconnect.ts`, scenarios `issue-22-disable-reenable-local-delete-remote-unchanged` and `issue-22-disable-reenable-local-delete-remote-edits`. Both fail closed on resurrection, failed delete propagation, or a delete-vs-edit conflict that drops a side. When the file is absent on disk but still present in CRDT, `VaultSync.reconcileVault()` places it in `createdOnDisk`; `ReconciliationController` writes it back. The implementation cannot distinguish a file missing because this device has never materialized it from a file that this device previously indexed and deleted while YAOS was disabled.
 
 **Required work:**
 
-1. Convert the existing scenario into a hard failing regression; no warning-only acceptance.
-2. Define startup classification using the persisted disk index: known indexed path now absent versus path never materialized locally.
-3. Ensure unreadable/skipped paths cannot be mistaken for confirmed deletion.
-4. Propagate a proven offline delete without allowing a stale device to delete a genuinely new remote file.
-5. Preserve conflicting remote edits according to the delete/conflict contract.
+1. Define startup classification using the persisted disk index: known indexed path now absent versus path never materialized locally.
+2. Ensure unreadable/skipped paths cannot be mistaken for confirmed deletion.
+3. Propagate a proven offline delete without allowing a stale device to delete a genuinely new remote file.
+4. Preserve conflicting remote edits according to the delete/conflict contract. Do not convert the existing scenarios back to warning-only acceptance.
 
 **Closure:** Focused regression fails before the fix and passes after it; re-enable keeps the file absent on the deleting device; the remote device observes the intended delete or an explicitly preserved conflict; unreadable-path and new-device materialization cases remain safe.
 
@@ -91,7 +90,7 @@ The existing local `ws-ticket-reconnect` suite proves URL patching and short-TTL
 
 **State:** Desktop proof exists; mobile/tablet proof absent.
 
-**Required work and closure:** Execute [QA](qa.md#qa-02-real-device-conflict-artifact) on real devices. The local offline edit must survive at the original path, remote content must be preserved, artifact locality must match policy, and all original paths must converge.
+**Required work and closure:** Execute [QA](qa.md#qa-02-real-device-conflict-artifact) on real devices. The local offline edit must survive at the original path, remote content must be preserved in a Markdown conflict artifact, that artifact must synchronize to the other devices, and all original paths must converge.
 
 ### QA-03 — iPad missing-baseline/cold-relaunch proof
 
@@ -117,7 +116,7 @@ The existing local `ws-ticket-reconnect` suite proves URL patching and short-TTL
 
 **State:** Adapter-write and controller tests exist; OS watcher path unproven.
 
-**Required work:** In a real debug-enabled Obsidian instance, modify an open/bound file through `qa/controllers/obsidian-client.ts::writeNodeFileAndWait`, not the vault adapter. Exercise tab-close/reconcile deferral and preserve the trace.
+**Required work:** In a real debug-enabled Obsidian instance, modify an open/bound file through `qa/controllers/node-vault-fs.ts::writeNodeFileAndWait`, not the vault adapter. Exercise tab-close/reconcile deferral and preserve the trace.
 
 **Closure:** The OS event reaches the intended controller path, no wrong-authority overwrite occurs, and disk/editor/CRDT converge.
 
@@ -267,23 +266,9 @@ The existing local `ws-ticket-reconnect` suite proves URL patching and short-TTL
 
 **Decision:** Either name a failure the chain detects that current sequence/hash validation does not, then implement and test it, or close the idea and remove it from planning. Do not carry an unowned “maybe harden” item indefinitely.
 
-### CLEAN-01 — remove `redirectPendingCreate` transition alias
-
-**State:** `ReconciliationController.redirectPendingCreate()` is deprecated in favor of `redirectPendingDirtyPath`; QA scenario names/comments still use the old term.
-
-**Required work:** Migrate callers and QA language, remove the alias, retain the regression proving a pending modify is not lost across rename.
-
-### CLEAN-02 — remove false-pass receipt wait API
-
-**State:** `waitForMemoryReceipt()` is deprecated because it polls global current state and can satisfy a later action with an earlier receipt. It remains exposed through QA ports, API types, help text, and wrappers.
-
-**Required work:** Migrate every scenario to action-bound `waitForReceiptAfter(timestamp)` or a candidate-bound equivalent, then delete the old method through all layers.
-
-**Closure:** No deprecated API or help entry remains; receipt waits cannot pass on pre-action state.
-
 ### CLEAN-03 — choose snapshot compatibility cutoff
 
-**State:** Client/server still carry `structureUnchanged`, `semanticUnchanged`, `stateVectorHash`, and `computeStateVectorHash` compatibility paths. Some are read-only aliases for old clients; state vectors are known to miss deletion-only changes.
+**State:** Client/server still carry `semanticUnchanged`, `stateVectorHash`, and `computeStateVectorHash` compatibility paths. Some are read-only aliases for old clients; state vectors are known to miss deletion-only changes.
 
 **Decision:** Establish the oldest supported plugin/server pair. Remove aliases and tests only when that support window permits, or retain them with one explicit compatibility table. The recovery-v2 branch may supersede the entire surface.
 
@@ -294,12 +279,6 @@ The existing local `ws-ticket-reconnect` suite proves URL patching and short-TTL
 **State:** Several production files carry long Issue #40/#22 histories and links to documents being removed.
 
 **Required work:** Keep the invariant, failure consequence, and non-obvious reason adjacent to code. Move no history elsewhere; Git already preserves it. Update the few load-bearing references to this backlog/contract.
-
-### CLEAN-05 — documentation cutover
-
-**State:** This file is the only backlog after the approved documentation rewrite.
-
-**Closure:** Root README and code comments link only to retained documents; no `docs/archive`, superseded RFC, old status ledger, orphan diagram, or ignored `qa-runs` path is presented as repository-verifiable current truth; total durable docs remain within the approved 2,000–3,000-line budget.
 
 ## External issue closure
 

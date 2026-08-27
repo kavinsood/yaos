@@ -6,9 +6,9 @@ Generated bundles, reports, and device artifacts belong under ignored `qa-runs/`
 
 ## Automated gates
 
-`npm run test:regressions` discovers suites under `tests/client`, `tests/server`, `tests/contracts`, and eligible `tests/live` files. `tests/suites.json` records helpers and suites requiring another driver. Discovery guards reject unaccounted inert suites and stale exemptions.
+`npm run test:regressions` discovers suites under `tests/client`, `tests/server`, and `tests/contracts`, plus the root harness/discovery self-tests. `tests/suites.json` records the one suite owned by a separate release-artifact driver. Discovery guards reject unaccounted inert suites and stale exemptions.
 
-`npm run test:ci` also starts a real local Wrangler Worker and runs:
+`npm run test:ci` then starts a real local Wrangler Worker through the separately accountable `tests/live/run-live.ts` driver and runs:
 
 - schema admission;
 - provider connection;
@@ -31,7 +31,7 @@ This proves the local Worker/runtime paths it executes. It is not real mobile, s
 | s12a passive | Linux + Android + iPad | WEAK PASS | Three devices agree on pre-existing state; no edit during run |
 | s12a with edit | 2 desktop | PASS | A real edit propagates once without duplication |
 | s12b | Linux + Android | PARTIAL | Foreground convergence; background-unavailable segment not captured |
-| s12c | 2 desktop | PASS | Disk wins original path; CRDT preserved locally as artifact |
+| s12c | 2 desktop | PASS | Disk wins original path; CRDT is preserved in a synchronized Markdown artifact |
 | s13 | 2 desktop | PASS | Open-editor remote edit converges without duplication |
 | s13 | Linux + Android | PASS | Real Android editor/disk/CRDT final hashes agree |
 
@@ -120,17 +120,16 @@ Devices: Linux, iPad, Android.
 4. Edit the same note locally on iPad while YAOS remains disabled.
 5. Re-enable YAOS on iPad and wait for reconciliation.
 6. Verify the iPad original path contains the local version and a conflict artifact preserves remote content.
-7. Verify Linux and Android do not receive that local-only conflict artifact.
+7. Verify the Markdown conflict artifact synchronizes to Linux and Android with the same preserved content.
 8. Export and analyze all three bundles.
 
-A pass requires all devices to settle the original-path survivor hash, the artifact to exist only on the affected device, and no stale-hash or old-recovery-hash finding.
+A pass requires all devices to settle the original-path survivor hash, all devices to receive the Markdown artifact containing the preserved remote side, and no stale-hash or old-recovery-hash finding.
 
 The existing desktop result does not close this real-device requirement.
 
 ## Evidence rules
 
-- Preserve raw failing evidence; do not weaken a scenario to obtain green output.
-- A manually ignored expected failure is not a passing regression. `SYNC-01` must become a hard failing test before its fix.
+- Preserve raw failing evidence. Do not weaken a hard failing regression to obtain green output. `SYNC-01` already fails closed in two-device QA; the remaining work is the product fix in [BACKLOG](BACKLOG.md#sync-01--offline-local-delete-is-resurrected-on-re-enable).
 - Adapter writes do not prove OS watcher behavior.
 - Passive quorum does not prove edit propagation.
 - Unit/model tests do not prove real mobile lifecycle ordering.
