@@ -52,6 +52,7 @@ const FATAL_AUTH_CODES: Readonly<Record<FatalAuthCode, true>> = {
 	unauthorized: true,
 	server_misconfigured: true,
 	unclaimed: true,
+	server_format_unsupported: true,
 	update_required: true,
 };
 

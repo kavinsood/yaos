@@ -12,20 +12,18 @@ import WebSocket from "ws";
 import { SCHEMA_VERSION } from "../../src/sync/schema.ts";
 import { readField } from "../mocks/readField.ts";
 import { describeFatalFrame, onFatalFrame } from "./fatalFrame.ts";
+import {
+	deviceBearerHeaders,
+	fetchSocketTicket,
+	requireLiveIdentity,
+} from "./liveIdentity.ts";
 
-const hostEnv = process.env.YAOS_TEST_HOST;
-const tokenEnv = process.env.SYNC_TOKEN;
-const roomEnv = process.env.YAOS_TEST_VAULT_ID;
+const identity = requireLiveIdentity();
+const host = identity.host;
+const room = identity.vaultId;
 const mode = process.env.YAOS_TEST_MODE ?? "seed";
 const fileCount = Number.parseInt(process.env.YAOS_TEST_FILE_COUNT ?? "1", 10);
 const expectExactPathCount = process.env.YAOS_TEST_EXACT_PATH_COUNT !== "false";
-
-if (!hostEnv || !tokenEnv || !roomEnv) {
-	throw new Error("YAOS_TEST_HOST, SYNC_TOKEN, and YAOS_TEST_VAULT_ID are required");
-}
-const host: string = hostEnv;
-const token: string = tokenEnv;
-const room: string = roomEnv;
 if (mode !== "seed" && mode !== "validate") {
 	throw new Error(`YAOS_TEST_MODE must be "seed" or "validate" (got ${JSON.stringify(mode)})`);
 }
@@ -72,7 +70,8 @@ function testContent(index: number): string {
 	return `YAOS redeploy durability test\nindex=${index}\nvault=${room}\nschema=${SCHEMA_VERSION}`;
 }
 
-function connectDevice(label: string): Promise<Device> {
+async function connectDevice(label: string): Promise<Device> {
+	const { ticket } = await fetchSocketTicket(identity);
 	return new Promise<Device>((resolvePromise, rejectPromise) => {
 		const doc = new Y.Doc();
 		const pathToId = doc.getMap<string>("pathToId");
@@ -81,7 +80,7 @@ function connectDevice(label: string): Promise<Device> {
 		const sys = doc.getMap("sys");
 		const provider = new YSyncProvider(host, room, doc, {
 			prefix: `/vault/sync/${encodeURIComponent(room)}`,
-			params: { token, schemaVersion: String(SCHEMA_VERSION) },
+			params: { ticket, schemaVersion: String(SCHEMA_VERSION) },
 			WebSocketPolyfill: globalThis.WebSocket ?? WebSocket,
 			connect: false,
 		});
@@ -143,7 +142,7 @@ function connectDevice(label: string): Promise<Device> {
 async function fetchDebug(): Promise<unknown> {
 	const response = await fetch(
 		`${host}/vault/${encodeURIComponent(room)}/debug/recent`,
-		{ headers: { Authorization: `Bearer ${token}` } },
+		{ headers: deviceBearerHeaders(identity) },
 	);
 	if (!response.ok) {
 		throw new Error(`debug endpoint failed (${response.status}): ${await response.text()}`);

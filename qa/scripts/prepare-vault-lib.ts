@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import { copyFile, cp, lstat, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -13,14 +12,27 @@ const GENERATED_FIXTURES: Record<string, true> = {
 export const PRODUCT_PLUGIN_ID = "yaos";
 export const HARNESS_PLUGIN_ID = "yaos-qa-harness";
 
-export const PREPARE_VAULT_USAGE = `Usage: bun run qa:prepare --fixture <id> --dest <new-path> [--preset <name>]
+export const PREPARE_VAULT_USAGE = `Usage: bun run qa:prepare --fixture <id> --dest <new-path> [--preset <name>] [enrollment options]
 
 Options:
-  --fixture <id>     Known checked-in or generated fixture ID.
-  --dest <new-path>  New vault directory. Its existing parent must be a directory.
-                     The final path must not exist; existing directories and symlinks fail.
-  --preset <name>    Plugin preset from qa/plugin-lock.json (default: minimal).
-  --help, -h         Print this help.
+  --fixture <id>       Known checked-in or generated fixture ID.
+  --dest <new-path>    New vault directory. Its existing parent must be a directory.
+                       The final path must not exist; existing directories and symlinks fail.
+  --preset <name>      Plugin preset from qa/plugin-lock.json (default: minimal).
+  --host <url>         Server base URL. Required with either enrollment mode.
+  --pairing-code <code>
+                       Enroll this device through POST /enroll. Requires --host and
+                       --device-name. A pairing code works for one device only.
+  --device-name <name> Requested device name for pairing, or the known name of a
+                       directly supplied identity.
+  --device-token <value>  Supply a controlled pre-enrolled identity. This requires
+  --vault-id <value>      --host, --device-token, --vault-id, --device-id, and
+  --device-id <value>     --device-name together; partial identities are rejected.
+  --help, -h           Print this help.
+
+Without enrollment options, qa:prepare writes an explicitly unenrolled vault. It
+never invents vault or device membership. Each device in a multi-device run must
+use its own one-use pairing code.
 
 qa:prepare never deletes, merges into, or overwrites a destination. --clean and
 all other deletion options are rejected.`;
@@ -45,17 +57,36 @@ export const DEFAULT_PREPARE_VAULT_PATHS: PrepareVaultPaths = {
 	blankWorkspace: join(REPO_ROOT, "qa", "scripts", "blank-workspace.json"),
 };
 
+export type PrepareVaultEnrollment =
+	| {
+		mode: "pairing";
+		host: string;
+		pairingCode: string;
+		deviceName: string;
+	}
+	| {
+		mode: "credentials";
+		host: string;
+		deviceToken: string;
+		vaultId: string;
+		deviceId: string;
+		deviceName: string;
+	};
+
 export interface PrepareVaultOptions {
 	fixture: string;
 	dest: string;
 	preset?: string;
+	enrollment?: PrepareVaultEnrollment;
 }
 
 export interface PreparedVault {
 	dest: string;
 	fixture: string;
 	preset: string;
-	vaultId: string;
+	enrollment:
+		| { status: "unenrolled" }
+		| { status: "enrolled"; host: string; vaultId: string; deviceId: string; name: string };
 	presetPlugins: PluginEntry[];
 }
 
@@ -91,6 +122,18 @@ export function parsePrepareVaultArgs(args: string[]): ParsedPrepareVaultArgs | 
 	let fixture: string | undefined;
 	let dest: string | undefined;
 	let preset: string | undefined;
+	const enrollmentArgs: Record<string, string> = {};
+	const valueOptions: Record<string, true> = {
+		"--fixture": true,
+		"--dest": true,
+		"--preset": true,
+		"--host": true,
+		"--pairing-code": true,
+		"--device-name": true,
+		"--device-token": true,
+		"--vault-id": true,
+		"--device-id": true,
+	};
 
 	for (let i = 0; i < args.length; i++) {
 		const arg = args[i]!;
@@ -98,7 +141,7 @@ export function parsePrepareVaultArgs(args: string[]): ParsedPrepareVaultArgs | 
 		if (arg === "--clean" || arg.startsWith("--clean=")) {
 			throw new PrepareVaultError("--clean is not supported: qa:prepare never deletes a destination.");
 		}
-		if (arg !== "--fixture" && arg !== "--dest" && arg !== "--preset") {
+		if (!valueOptions[arg]) {
 			throw new PrepareVaultError(`Unknown argument: ${arg}`);
 		}
 
@@ -109,15 +152,57 @@ export function parsePrepareVaultArgs(args: string[]): ParsedPrepareVaultArgs | 
 		i++;
 
 		if (arg === "--fixture") fixture = value;
-		if (arg === "--dest") dest = value;
-		if (arg === "--preset") preset = value;
+		else if (arg === "--dest") dest = value;
+		else if (arg === "--preset") preset = value;
+		else enrollmentArgs[arg] = value;
 	}
 
 	if (!fixture || !dest) {
 		throw new PrepareVaultError("Both --fixture and --dest are required.");
 	}
 
-	return { fixture, dest, preset: preset ?? "minimal", help: false };
+	const enrollment = parseEnrollmentArgs(enrollmentArgs);
+	return {
+		fixture,
+		dest,
+		preset: preset ?? "minimal",
+		...(enrollment ? { enrollment } : {}),
+		help: false,
+	};
+}
+
+function parseEnrollmentArgs(args: Record<string, string>): PrepareVaultEnrollment | undefined {
+	const present = Object.keys(args);
+	if (present.length === 0) return undefined;
+
+	const pairingCode = args["--pairing-code"];
+	const directFields = ["--device-token", "--vault-id", "--device-id"] as const;
+	const hasDirectField = directFields.some(field => args[field] !== undefined);
+	if (pairingCode && hasDirectField) {
+		throw new PrepareVaultError("--pairing-code cannot be combined with direct pre-enrolled identity options.");
+	}
+
+	const required = pairingCode
+		? ["--host", "--pairing-code", "--device-name"]
+		: ["--host", "--device-token", "--vault-id", "--device-id", "--device-name"];
+	const missing = required.filter(field => !args[field]?.trim());
+	if (missing.length > 0) {
+		throw new PrepareVaultError(`Enrollment options are incomplete; missing ${missing.join(", ")}.`);
+	}
+
+	const host = normalizeServerHost(args["--host"]!);
+	const deviceName = args["--device-name"]!.trim();
+	if (pairingCode) {
+		return { mode: "pairing", host, pairingCode: pairingCode.trim(), deviceName };
+	}
+	return {
+		mode: "credentials",
+		host,
+		deviceToken: args["--device-token"]!.trim(),
+		vaultId: args["--vault-id"]!.trim(),
+		deviceId: args["--device-id"]!.trim(),
+		deviceName,
+	};
 }
 
 /**
@@ -128,11 +213,15 @@ export function parsePrepareVaultArgs(args: string[]): ParsedPrepareVaultArgs | 
 export async function prepareVault(
 	options: PrepareVaultOptions,
 	paths: PrepareVaultPaths = DEFAULT_PREPARE_VAULT_PATHS,
+	fetchImpl: typeof fetch = fetch,
 ): Promise<PreparedVault> {
 	const fixtureDir = await resolveFixtureDir(options.fixture, paths.fixturesDir);
 	const dest = await validateNewDestination(options.dest);
 	const preset = options.preset ?? "minimal";
 	const preflight = await preflightInputs(paths, preset);
+	const credentials = options.enrollment
+		? await resolveEnrollment(options.enrollment, fetchImpl)
+		: null;
 
 	// This non-recursive call establishes that this invocation owns the final
 	// destination. Everything written afterwards is below that new directory.
@@ -150,12 +239,7 @@ export async function prepareVault(
 	await mkdir(yaosPluginDir, { recursive: true });
 	await copyFile(paths.yaosManifest, join(yaosPluginDir, "manifest.json"));
 	await copyFile(paths.yaosBuild, join(yaosPluginDir, "main.js"));
-
-	// Every preparation receives a new room identity. This must remain random:
-	// deterministic workspace/configuration bytes must not cause runs to share
-	// a sync room accidentally.
-	const vaultId = randomUUID();
-	await writeJson(join(yaosPluginDir, "data.json"), createYaosSettings(vaultId));
+	await writeJson(join(yaosPluginDir, "data.json"), createYaosSettings(credentials));
 
 	const harnessPluginDir = join(obsidianDir, "plugins", HARNESS_PLUGIN_ID);
 	await mkdir(harnessPluginDir, { recursive: true });
@@ -166,7 +250,93 @@ export async function prepareVault(
 	// fixed order is required by the harness runtime guard.
 	await writeJson(join(obsidianDir, "community-plugins.json"), [PRODUCT_PLUGIN_ID, HARNESS_PLUGIN_ID]);
 
-	return { dest, fixture: options.fixture, preset, vaultId, presetPlugins: preflight.presetPlugins };
+	const enrollment: PreparedVault["enrollment"] = credentials
+		? {
+			status: "enrolled",
+			host: credentials.host,
+			vaultId: credentials.vaultId,
+			deviceId: credentials.deviceId,
+			name: credentials.deviceName,
+		}
+		: { status: "unenrolled" };
+	return { dest, fixture: options.fixture, preset, enrollment, presetPlugins: preflight.presetPlugins };
+}
+
+interface ResolvedCredentials {
+	host: string;
+	deviceToken: string;
+	vaultId: string;
+	deviceId: string;
+	deviceName: string;
+}
+
+async function resolveEnrollment(
+	enrollment: PrepareVaultEnrollment,
+	fetchImpl: typeof fetch,
+): Promise<ResolvedCredentials> {
+	const host = normalizeServerHost(enrollment.host);
+	const deviceName = enrollment.deviceName.trim();
+	if (!deviceName) throw new PrepareVaultError("Enrollment device name must not be empty.");
+
+	if (enrollment.mode === "credentials") {
+		const credentials = {
+			host,
+			deviceToken: enrollment.deviceToken.trim(),
+			vaultId: enrollment.vaultId.trim(),
+			deviceId: enrollment.deviceId.trim(),
+			deviceName,
+		};
+		const missing = (["deviceToken", "vaultId", "deviceId"] as const)
+			.filter(field => !credentials[field]);
+		if (missing.length > 0) {
+			throw new PrepareVaultError(`Direct pre-enrolled identity is incomplete; missing ${missing.join(", ")}.`);
+		}
+		return credentials;
+	}
+
+	const pairingCode = enrollment.pairingCode.trim();
+	if (!pairingCode) throw new PrepareVaultError("Pairing code must not be empty.");
+
+	let response: Response;
+	try {
+		response = await fetchImpl(`${host}/enroll`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ pairingCode, deviceName }),
+		});
+	} catch (error) {
+		throw new PrepareVaultError(`Enrollment request failed: ${error instanceof Error ? error.message : String(error)}`);
+	}
+
+	const body: unknown = await response.json().catch(() => null);
+	if (!response.ok) {
+		const reason = isRecord(body) && typeof body.error === "string" ? `: ${body.error}` : "";
+		throw new PrepareVaultError(`Enrollment failed with HTTP ${response.status}${reason}`);
+	}
+	if (!isEnrollmentResponse(body)) {
+		throw new PrepareVaultError("Enrollment response must contain exactly deviceToken, vaultId, deviceId, and name.");
+	}
+	return {
+		host,
+		deviceToken: body.deviceToken,
+		vaultId: body.vaultId,
+		deviceId: body.deviceId,
+		deviceName: body.name,
+	};
+}
+
+function isEnrollmentResponse(value: unknown): value is {
+	deviceToken: string;
+	vaultId: string;
+	deviceId: string;
+	name: string;
+} {
+	if (!isRecord(value)) return false;
+	const keys = Object.keys(value).sort();
+	const expected = ["deviceId", "deviceToken", "name", "vaultId"];
+	return keys.length === expected.length
+		&& keys.every((key, index) => key === expected[index])
+		&& expected.every(key => typeof value[key] === "string" && (value[key] as string).trim().length > 0);
 }
 
 export async function listFixtureIds(fixturesDir: string): Promise<string[]> {
@@ -306,6 +476,27 @@ function isPluginLock(value: unknown): value is PluginLock {
 	);
 }
 
+function normalizeServerHost(value: string): string {
+	const trimmed = value.trim();
+	if (!trimmed) throw new PrepareVaultError("Server host must not be empty.");
+	let url: URL;
+	try {
+		url = new URL(trimmed);
+	} catch {
+		throw new PrepareVaultError("Server host must be an absolute http:// or https:// URL.");
+	}
+	if (
+		(url.protocol !== "http:" && url.protocol !== "https:")
+		|| url.username
+		|| url.password
+		|| url.search
+		|| url.hash
+	) {
+		throw new PrepareVaultError("Server host must be an absolute http:// or https:// URL without credentials, query, or fragment.");
+	}
+	return url.toString().replace(/\/$/, "");
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -364,12 +555,13 @@ async function writeGeneratedFile(dest: string, relativePath: string, content: s
 	await writeFile(path, content, "utf8");
 }
 
-function createYaosSettings(vaultId: string): Record<string, unknown> {
+function createYaosSettings(credentials: ResolvedCredentials | null): Record<string, unknown> {
 	return {
-		host: "",
-		token: "",
-		vaultId,
-		deviceName: "qa-device-a",
+		host: credentials?.host ?? "",
+		deviceToken: credentials?.deviceToken ?? "",
+		vaultId: credentials?.vaultId ?? "",
+		deviceId: credentials?.deviceId ?? "",
+		deviceName: credentials?.deviceName ?? "qa-device-a",
 		// debug:true is what starts the flight recorder. There is no separate
 		// trace switch any more — QA scenarios depend on this being on.
 		debug: true,

@@ -8,10 +8,11 @@ import * as Y from "yjs";
 import YSyncProvider from "y-partyserver/provider";
 import WebSocket from "ws";
 import { SCHEMA_VERSION } from "../../src/sync/schema";
+import { fetchSocketTicket, requireLiveIdentity } from "./liveIdentity.ts";
 
-const HOST = process.env.YAOS_TEST_HOST || "http://127.0.0.1:8787";
-const TOKEN = process.env.SYNC_TOKEN || "dev-sync-token";
-const VAULT_ID = process.env.YAOS_TEST_VAULT_ID || "yaos-smoke-test";
+const identity = requireLiveIdentity();
+const HOST = identity.host;
+const VAULT_ID = identity.vaultId;
 const ROOM_ID = VAULT_ID;
 
 const targetPath = process.argv[2] || "hi.md";
@@ -26,11 +27,12 @@ const idToText = ydoc.getMap<Y.Text>("idToText");
 const meta = ydoc.getMap("meta");
 const syncPrefix = `/vault/sync/${encodeURIComponent(ROOM_ID)}`;
 let finished = false;
+const { ticket } = await fetchSocketTicket(identity);
 
 const provider = new YSyncProvider(HOST, ROOM_ID, ydoc, {
 	prefix: syncPrefix,
 	params: {
-		token: TOKEN,
+		ticket,
 		schemaVersion: String(SCHEMA_VERSION),
 	},
 	WebSocketPolyfill: globalThis.WebSocket ?? WebSocket,

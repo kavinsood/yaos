@@ -23,8 +23,16 @@ async function main(): Promise<void> {
 		const prepared = await prepareVault(args, DEFAULT_PREPARE_VAULT_PATHS);
 		console.log(`Vault ready: ${prepared.dest}`);
 		console.log(`  fixture: ${prepared.fixture}`);
-		console.log(`  vaultId: ${prepared.vaultId} (fresh random identity)`);
-		console.log(`  plugin order: yaos, yaos-qa-harness`);
+		if (prepared.enrollment.status === "enrolled") {
+			console.log("  enrollment: enrolled with server-issued device credentials");
+			console.log(`  host: ${prepared.enrollment.host}`);
+			console.log(`  vaultId: ${prepared.enrollment.vaultId}`);
+			console.log(`  deviceId: ${prepared.enrollment.deviceId}`);
+			console.log(`  device name: ${prepared.enrollment.name}`);
+		} else {
+			console.log("  enrollment: UNENROLLED (no vault or device membership was generated)");
+		}
+		console.log("  plugin order: yaos, yaos-qa-harness");
 		if (prepared.presetPlugins.length > 0) {
 			console.log(`\nPreset "${prepared.preset}" requires these manually installed community plugins:`);
 			for (const plugin of prepared.presetPlugins) {
@@ -32,10 +40,12 @@ async function main(): Promise<void> {
 			}
 		}
 		console.log("\nNext steps:");
-		console.log("  1. Open the new vault in Obsidian and enable community plugins.");
-		console.log("  2. Set host + token in YAOS settings (qaDebugMode is already enabled).");
-		console.log("  3. Launch with remote debugging: Obsidian --remote-debugging-port=9222");
-		console.log("  4. Open DevTools and run: __YAOS_QA__.help()");
+		if (prepared.enrollment.status === "unenrolled") {
+			console.log("  - Enroll with a fresh one-use pairing code, either in Obsidian or by preparing a new vault with --host, --pairing-code, and --device-name.");
+		}
+		console.log("  - Open the new vault in Obsidian and enable community plugins.");
+		console.log("  - Launch with remote debugging: Obsidian --remote-debugging-port=9222");
+		console.log("  - Open DevTools and run: __YAOS_QA__.help()");
 	} catch (error) {
 		console.error(`qa:prepare failed: ${error instanceof Error ? error.message : String(error)}`);
 		console.error(PREPARE_VAULT_USAGE);

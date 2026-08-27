@@ -215,9 +215,10 @@ s.section("Test 8: exported controller trace passes the analyzer");
 		rmdir: async () => {},
 	};
 	const settings = {
-		vaultId: "analyzer-vault",
 		host: "https://sync.example.com",
-		token: "secret",
+		deviceToken: "secret-device-bearer",
+		vaultId: "analyzer-vault",
+		deviceId: "analyzer-device-id",
 		deviceName: "analyzer-device",
 		debug: true,
 		enableAttachmentSync: false,

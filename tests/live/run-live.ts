@@ -4,9 +4,9 @@ import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { sleep } from "../harness.ts";
+import type { LiveIdentity } from "./liveIdentity.ts";
 
 const HOST = "http://127.0.0.1:8787";
-const VAULT_ID = `yaos-integration-${Date.now().toString(36)}`;
 const WRANGLER_BIN = resolve("server/node_modules/.bin/wrangler");
 
 // Loader flags every spawned suite needs. tests/live/*.ts are TypeScript, so
@@ -27,9 +27,9 @@ interface LiveCommand {
 }
 
 // This is the single accountability list for tests/live. Every suite appears
-// here and is executed below; the only non-suites are this driver and the
-// fatal-frame helper imported by provider-facing suites.
+// here and is executed below; imported helpers and this driver are non-suites.
 const LIVE_COMMANDS: readonly LiveCommand[] = [
+	{ file: "membership.ts" },
 	{ file: "schema-guard.ts" },
 	{ file: "provider-manual-connect.ts" },
 	{ file: "sync-client.ts", args: ["smoke.md", "\n\nhello from worker integration pass 1"] },
@@ -40,7 +40,7 @@ const LIVE_COMMANDS: readonly LiveCommand[] = [
 	{ file: "ws-ticket-reconnect.ts" },
 	{ file: "ws-admission-protocol.ts" },
 ];
-const LIVE_NON_SUITES = ["fatalFrame.ts", "run-live.ts"] as const;
+const LIVE_NON_SUITES = ["fatalFrame.ts", "liveIdentity.ts", "run-live.ts"] as const;
 
 function assertLiveAccountability(): void {
 	const actual = readdirSync(new URL(".", import.meta.url))
@@ -57,6 +57,13 @@ function assertLiveAccountability(): void {
 			`tests/live accountability mismatch; unaccounted=[${unaccounted.join(", ")}], missing=[${missing.join(", ")}]`,
 		);
 	}
+}
+
+function inheritedEnvWithoutSharedCredential(): NodeJS.ProcessEnv {
+	const retiredCredentialName = ["SYNC", "TOKEN"].join("_");
+	return Object.fromEntries(
+		Object.entries(process.env).filter(([name]) => name !== retiredCredentialName),
+	);
 }
 
 async function waitForWorker(): Promise<void> {
@@ -79,7 +86,7 @@ async function waitForWorker(): Promise<void> {
 function runCommand(
 	cmd: string,
 	args: string[],
-	token: string,
+	identity: LiveIdentity,
 	extraEnv: Record<string, string> = {},
 ): Promise<void> {
 	// Executor form, not `Promise.withResolvers`: tsconfig.tests.json pins `lib`
@@ -90,10 +97,11 @@ function runCommand(
 			cwd: resolve("."),
 			stdio: "inherit",
 			env: {
-				...process.env,
-				YAOS_TEST_HOST: HOST,
-				SYNC_TOKEN: token,
-				YAOS_TEST_VAULT_ID: VAULT_ID,
+				...inheritedEnvWithoutSharedCredential(),
+				YAOS_TEST_HOST: identity.host,
+				YAOS_TEST_DEVICE_TOKEN: identity.deviceToken,
+				YAOS_TEST_VAULT_ID: identity.vaultId,
+				YAOS_TEST_DEVICE_ID: identity.deviceId,
 				...extraEnv,
 			},
 		});
@@ -114,60 +122,87 @@ function runCommand(
 	});
 }
 
-/** The subset of `POST /claim`'s body this driver asserts on. */
-interface ClaimResponse {
-	readonly obsidianUrl?: unknown;
-}
-
-/** The subset of `GET /api/capabilities` this driver asserts on. */
 interface Capabilities {
 	readonly claimed?: unknown;
-	readonly authMode?: unknown;
 }
 
-async function claimServer() {
-	const token = randomBytes(32).toString("hex");
-	const res = await fetch(`${HOST}/claim`, {
+interface ClaimResponse {
+	readonly vaultId?: unknown;
+	readonly pairingCode?: unknown;
+}
+
+interface EnrollmentResponse {
+	readonly deviceToken?: unknown;
+	readonly vaultId?: unknown;
+	readonly deviceId?: unknown;
+	readonly name?: unknown;
+}
+
+async function getCapabilities(): Promise<Capabilities> {
+	const response = await fetch(`${HOST}/api/capabilities`);
+	if (!response.ok) throw new Error(`capabilities probe failed (${response.status})`);
+	return (await response.json()) as Capabilities;
+}
+
+async function claimAndEnroll(): Promise<LiveIdentity> {
+	const before = await getCapabilities();
+	if (before.claimed !== false) {
+		throw new Error("fresh live Worker must start unclaimed");
+	}
+
+	const operatorRecoveryKey = randomBytes(32).toString("base64url");
+	const claimResponse = await fetch(`${HOST}/claim`, {
 		method: "POST",
-		headers: {
-			"Content-Type": "application/json",
-		},
-		body: JSON.stringify({ token }),
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ operatorRecoveryKey }),
 	});
-	if (!res.ok) {
-		const text = await res.text();
-		throw new Error(`claim failed (${res.status}): ${text}`);
+	if (!claimResponse.ok) {
+		throw new Error(`claim failed (${claimResponse.status}): ${await claimResponse.text()}`);
+	}
+	const claimed = (await claimResponse.json()) as ClaimResponse | null;
+	if (typeof claimed?.vaultId !== "string" || !claimed.vaultId) {
+		throw new Error("claim response missing vaultId");
+	}
+	if (typeof claimed.pairingCode !== "string" || !claimed.pairingCode) {
+		throw new Error("claim response missing initial pairingCode");
 	}
 
-	const payload = (await res.json()) as ClaimResponse | null;
-	if (typeof payload?.obsidianUrl !== "string" || !payload.obsidianUrl.startsWith("obsidian://yaos?")) {
-		throw new Error("claim response missing Obsidian setup URL");
+	const enrollResponse = await fetch(`${HOST}/enroll`, {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ pairingCode: claimed.pairingCode, deviceName: "live-primary" }),
+	});
+	if (!enrollResponse.ok) {
+		throw new Error(`initial enrollment failed (${enrollResponse.status}): ${await enrollResponse.text()}`);
+	}
+	const enrolled = (await enrollResponse.json()) as EnrollmentResponse | null;
+	if (
+		typeof enrolled?.deviceToken !== "string" || !enrolled.deviceToken
+		|| typeof enrolled.vaultId !== "string" || !enrolled.vaultId
+		|| typeof enrolled.deviceId !== "string" || !enrolled.deviceId
+		|| typeof enrolled.name !== "string" || !enrolled.name
+	) {
+		throw new Error(`initial enrollment response was incomplete: ${JSON.stringify(enrolled)}`);
+	}
+	if (enrolled.vaultId !== claimed.vaultId) {
+		throw new Error("initial enrollment returned a different vaultId than claim");
 	}
 
-	const capabilities = (await fetch(`${HOST}/api/capabilities`).then((result) => result.json())) as Capabilities | null;
-	if (capabilities?.claimed !== true || capabilities?.authMode !== "claim") {
-		throw new Error("server did not enter claimed mode");
+	const after = await getCapabilities();
+	if (after.claimed !== true) {
+		throw new Error("Worker did not remain claimed after initial enrollment");
 	}
-
-	return token;
-}
-
-async function resolveAuthToken(defaultEnvToken: string): Promise<string> {
-	const capabilitiesRes = await fetch(`${HOST}/api/capabilities`);
-	if (!capabilitiesRes.ok) {
-		throw new Error(`capabilities probe failed (${capabilitiesRes.status})`);
-	}
-	const capabilities = (await capabilitiesRes.json()) as Capabilities | null;
-	if (capabilities?.claimed === true && capabilities?.authMode === "env") {
-		return defaultEnvToken;
-	}
-	return await claimServer();
+	return {
+		host: HOST,
+		deviceToken: enrolled.deviceToken,
+		vaultId: enrolled.vaultId,
+		deviceId: enrolled.deviceId,
+	};
 }
 
 async function main() {
 	assertLiveAccountability();
 	const persistDir = mkdtempSync(join(tmpdir(), "yaos-wrangler-"));
-	const envToken = randomBytes(32).toString("hex");
 	const wrangler = spawn(
 		WRANGLER_BIN,
 		[
@@ -182,7 +217,7 @@ async function main() {
 			persistDir,
 			"--log-level",
 			"error",
-			// Short ticket TTL for the ws-ticket-reconnect smoke test — allows
+			// Short ticket TTL for the reconnect smoke test — allows
 			// post-expiry reconnect to be exercised in seconds, not 5 minutes.
 			"--var",
 			"YAOS_TICKET_TTL_MS:8000",
@@ -191,10 +226,8 @@ async function main() {
 			cwd: resolve("server"),
 			stdio: ["ignore", "pipe", "pipe"],
 			env: {
-				...process.env,
-				CLOUDFLARE_INCLUDE_PROCESS_ENV: "true",
+				...inheritedEnvWithoutSharedCredential(),
 				CLOUDFLARE_LOAD_DEV_VARS_FROM_DOT_ENV: "false",
-				SYNC_TOKEN: envToken,
 			},
 		},
 	);
@@ -205,9 +238,7 @@ async function main() {
 	let output = "";
 	const capture = (chunk: Buffer) => {
 		output += chunk.toString();
-		if (output.length > 8_000) {
-			output = output.slice(-8_000);
-		}
+		if (output.length > 8_000) output = output.slice(-8_000);
 	};
 	if (!wrangler.stdout || !wrangler.stderr) {
 		throw new Error("wrangler dev did not expose piped stdout/stderr");
@@ -217,7 +248,7 @@ async function main() {
 
 	try {
 		await waitForWorker();
-		const token = await resolveAuthToken(envToken);
+		const identity = await claimAndEnroll();
 		for (const command of LIVE_COMMANDS) {
 			await runCommand(
 				"node",
@@ -226,7 +257,7 @@ async function main() {
 					`tests/live/${command.file}`,
 					...(command.args ?? []),
 				],
-				token,
+				identity,
 				command.extraEnv ? { ...command.extraEnv } : {},
 			);
 		}
@@ -237,9 +268,7 @@ async function main() {
 		}
 		throw err;
 	} finally {
-		if (wrangler.exitCode === null) {
-			wrangler.kill("SIGTERM");
-		}
+		if (wrangler.exitCode === null) wrangler.kill("SIGTERM");
 		await wranglerExit;
 		rmSync(persistDir, { recursive: true, force: true });
 	}

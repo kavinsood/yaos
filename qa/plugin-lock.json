@@ -1,5 +1,5 @@
 {
-  "_comment": "Pinned community plugin versions for QA fixture vaults. Update when a regression is introduced by a new plugin version.",
+  "_comment": "Pinned community plugin versions for QA fixture vaults. Presets select plugins only and never carry server membership. Update when a regression is introduced by a new plugin version.",
   "presets": {
     "minimal": [],
     "tasks": [

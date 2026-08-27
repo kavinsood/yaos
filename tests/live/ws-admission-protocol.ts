@@ -1,14 +1,10 @@
 import WebSocket from "ws";
 import { SCHEMA_VERSION } from "../../src/sync/schema.ts";
+import { fetchSocketTicket, requireLiveIdentity } from "./liveIdentity.ts";
 
-const HOST = process.env.YAOS_TEST_HOST || "http://127.0.0.1:8787";
-const TOKEN = process.env.SYNC_TOKEN || "";
-const BASE_VAULT_ID = process.env.YAOS_TEST_VAULT_ID || "yaos-ws-admission";
-const ROOM_ID = `${BASE_VAULT_ID}-admission-protocol`;
-
-if (!TOKEN) {
-	throw new Error("SYNC_TOKEN is required for WebSocket admission protocol test");
-}
+const identity = requireLiveIdentity();
+const HOST = identity.host;
+const ROOM_ID = identity.vaultId;
 
 /**
  * The subset of the Worker's fatal rejection frame these assertions read.
@@ -36,20 +32,6 @@ function assert(condition: unknown, message: string): void {
 	console.log(`  PASS  ${message}`);
 }
 
-async function fetchTicket(vaultId: string): Promise<string> {
-	const response = await fetch(`${HOST}/vault/${encodeURIComponent(vaultId)}/auth/ticket`, {
-		method: "POST",
-		headers: { Authorization: `Bearer ${TOKEN}` },
-	});
-	if (!response.ok) {
-		throw new Error(`ticket fetch failed (${response.status}): ${await response.text()}`);
-	}
-	const body = (await response.json()) as { ticket?: unknown } | null;
-	if (typeof body?.ticket !== "string") {
-		throw new Error(`ticket response was malformed: ${JSON.stringify(body)}`);
-	}
-	return body.ticket;
-}
 
 function socketUrl(vaultId: string, params: Record<string, string>): string {
 	const url = new URL(HOST);
@@ -131,7 +113,7 @@ function assertFatalUpdateResponse(
 
 console.log("\n--- WebSocket protocol: authenticated schema above the pin ---");
 {
-	const ticket = await fetchTicket(ROOM_ID);
+	const { ticket } = await fetchSocketTicket(identity);
 	const clientSchemaVersion = SCHEMA_VERSION + 1;
 	const result = await captureSocket(socketUrl(ROOM_ID, {
 		ticket,
@@ -150,7 +132,7 @@ console.log("\n--- WebSocket protocol: authenticated schema below the pin ---");
 {
 	// Previously admitted by the v1..v3 range. Admission is now an equality test,
 	// so an older writer is refused at the edge instead of reaching the room.
-	const ticket = await fetchTicket(ROOM_ID);
+	const { ticket } = await fetchSocketTicket(identity);
 	const clientSchemaVersion = SCHEMA_VERSION - 1;
 	const result = await captureSocket(socketUrl(ROOM_ID, {
 		ticket,
@@ -163,7 +145,7 @@ console.log("\n--- WebSocket protocol: authenticated schema below the pin ---");
 
 console.log("\n--- WebSocket protocol: undeclared schema is rejected, never defaulted ---");
 {
-	const ticket = await fetchTicket(ROOM_ID);
+	const { ticket } = await fetchSocketTicket(identity);
 	const result = await captureSocket(socketUrl(ROOM_ID, { ticket }));
 	const payload = assertFatalUpdateResponse(result, "update_required", "update required");
 	assert(payload.reason === "invalid_client_schema", "a connection with no schemaVersion is rejected as invalid, not assumed legacy");
@@ -180,7 +162,7 @@ console.log("\n--- WebSocket protocol: authentication precedes schema enforcemen
 
 console.log("\n--- WebSocket protocol: pinned ticket-authenticated schema upgrades normally ---");
 {
-	const ticket = await fetchTicket(ROOM_ID);
+	const { ticket } = await fetchSocketTicket(identity);
 	const result = await captureSocket(socketUrl(ROOM_ID, {
 		ticket,
 		schemaVersion: String(SCHEMA_VERSION),

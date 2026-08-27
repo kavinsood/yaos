@@ -22,27 +22,24 @@ import YSyncProvider from "y-partyserver/provider";
 import WebSocket from "ws";
 import { SCHEMA_VERSION } from "../../src/sync/schema.ts";
 import { describeFatalFrame, onFatalFrame, parseFatalFrame, type FatalFrame } from "./fatalFrame.ts";
+import { fetchSocketTicket, requireLiveIdentity } from "./liveIdentity.ts";
 
-const HOST = process.env.YAOS_TEST_HOST || "http://127.0.0.1:8787";
-const TOKEN = process.env.SYNC_TOKEN || "";
-const BASE_VAULT_ID = process.env.YAOS_TEST_VAULT_ID || "yaos-schema-guard";
-const ROOM_PREFIX = `${BASE_VAULT_ID}-schema-guard`;
-
-if (!TOKEN) {
-	throw new Error("SYNC_TOKEN is required for schema-guard test");
-}
+const identity = requireLiveIdentity();
+const HOST = identity.host;
+const ROOM_ID = identity.vaultId;
 
 function wait(ms: number): Promise<void> {
 	return new Promise<void>((resolvePromise) => setTimeout(resolvePromise, ms));
 }
 
-function buildWsUrl(
+async function buildWsUrl(
 	roomId: string,
 	{ includeSchema, schemaVersion }: { includeSchema: boolean; schemaVersion?: number },
-): string {
+): Promise<string> {
+	const { ticket } = await fetchSocketTicket(identity, roomId);
 	const url = new URL(`/vault/sync/${encodeURIComponent(roomId)}`, HOST);
 	url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-	url.searchParams.set("token", TOKEN);
+	url.searchParams.set("ticket", ticket);
 	if (includeSchema && schemaVersion !== undefined) {
 		url.searchParams.set("schemaVersion", String(schemaVersion));
 	}
@@ -110,11 +107,12 @@ async function safeDestroy(provider: YSyncProvider, ydoc: Y.Doc): Promise<void> 
 async function seedRoomSchema(roomId: string, schemaVersion: number): Promise<void> {
 	const ydoc = new Y.Doc();
 	const syncPrefix = `/vault/sync/${encodeURIComponent(roomId)}`;
+	const { ticket } = await fetchSocketTicket(identity, roomId);
 
 	const provider = new YSyncProvider(HOST, roomId, ydoc, {
 		prefix: syncPrefix,
 		params: {
-			token: TOKEN,
+			ticket,
 			schemaVersion: String(schemaVersion),
 		},
 		WebSocketPolyfill: globalThis.WebSocket ?? WebSocket,
@@ -228,10 +226,11 @@ async function expectRejected(label: string, wsUrl: string, expectedReason: stri
 async function expectAllowed(roomId: string, schemaVersion: number): Promise<void> {
 	const ydoc = new Y.Doc();
 	const syncPrefix = `/vault/sync/${encodeURIComponent(roomId)}`;
+	const { ticket } = await fetchSocketTicket(identity, roomId);
 	const provider = new YSyncProvider(HOST, roomId, ydoc, {
 		prefix: syncPrefix,
 		params: {
-			token: TOKEN,
+			ticket,
 			schemaVersion: String(schemaVersion),
 		},
 		WebSocketPolyfill: globalThis.WebSocket ?? WebSocket,
@@ -270,7 +269,7 @@ async function expectAllowed(roomId: string, schemaVersion: number): Promise<voi
 }
 
 async function main() {
-	const roomId = `${ROOM_PREFIX}-room-v${SCHEMA_VERSION}`;
+	const roomId = ROOM_ID;
 
 	await seedRoomSchema(roomId, SCHEMA_VERSION);
 	console.log(`Seeded ${roomId} with sys.schemaVersion=${SCHEMA_VERSION}`);
@@ -281,7 +280,7 @@ async function main() {
 	for (const clientSchemaVersion of [SCHEMA_VERSION - 1, SCHEMA_VERSION + 1]) {
 		const payload = await expectRejected(
 			`client v${clientSchemaVersion} is outside the pinned schema`,
-			buildWsUrl(roomId, { includeSchema: true, schemaVersion: clientSchemaVersion }),
+			await buildWsUrl(roomId, { includeSchema: true, schemaVersion: clientSchemaVersion }),
 			"client_schema_unsupported",
 		);
 		if (payload.clientSchemaVersion !== clientSchemaVersion) {
@@ -296,7 +295,7 @@ async function main() {
 	// No legacy default: an undeclared schema is an unknown writer, not a v1 one.
 	const undeclared = await expectRejected(
 		"client that declares no schema",
-		buildWsUrl(roomId, { includeSchema: false }),
+		await buildWsUrl(roomId, { includeSchema: false }),
 		"invalid_client_schema",
 	);
 	if (undeclared.clientSchemaVersion !== null) {

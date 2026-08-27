@@ -94,6 +94,27 @@ function parseArgs(args: string[]): Record<string, string> {
 	return result;
 }
 
+interface QaEnrollmentIdentity {
+	host: string;
+	vaultId: string;
+	deviceId: string;
+	deviceTokenPresent: boolean;
+}
+
+async function readEnrollmentIdentity(client: ObsidianClient): Promise<QaEnrollmentIdentity> {
+	return client.evalRaw<QaEnrollmentIdentity>(`
+		(() => {
+			const settings = app?.plugins?.plugins?.["yaos"]?.settings;
+			return {
+				host: typeof settings?.host === "string" ? settings.host.trim().replace(/\\/$/, "") : "",
+				vaultId: typeof settings?.vaultId === "string" ? settings.vaultId.trim() : "",
+				deviceId: typeof settings?.deviceId === "string" ? settings.deviceId.trim() : "",
+				deviceTokenPresent: typeof settings?.deviceToken === "string" && settings.deviceToken.trim().length > 0,
+			};
+		})()
+	`);
+}
+
 // -----------------------------------------------------------------------
 // Collect trace from vault and run analyzer
 // -----------------------------------------------------------------------
@@ -149,6 +170,19 @@ async function main(): Promise<void> {
 	const vaultB = args["vault-b"] ? resolve(args["vault-b"]) : null;
 	const outDir = resolve(args["out-dir"] ?? "qa-runs");
 
+	if (
+		!Number.isInteger(portA)
+		|| portA < 1024
+		|| portA > 65535
+		|| !Number.isInteger(portB)
+		|| portB < 1024
+		|| portB > 65535
+		|| portA === portB
+	) {
+		console.error("CDP ports must be distinct integers between 1024 and 65535.");
+		process.exit(1);
+	}
+
 	if (!scenario) {
 		console.error(
 			"Usage: bun run qa:two-device --scenario <id> --port-a 9222 --port-b 9223 " +
@@ -157,7 +191,6 @@ async function main(): Promise<void> {
 		console.error("Available scenarios:", Object.keys(TWO_DEVICE_SCENARIOS).join(", "));
 		process.exit(1);
 	}
-
 
 	const scenarioFn = TWO_DEVICE_SCENARIOS[scenario];
 	if (!scenarioFn) {
@@ -191,6 +224,23 @@ async function main(): Promise<void> {
 		log("Waiting for QA APIs on both devices...");
 		await Promise.all([clientA.waitForQaReady(30_000), clientB.waitForQaReady(30_000)]);
 		log("QA APIs ready on both devices.");
+
+		const [enrollmentA, enrollmentB] = await Promise.all([
+			readEnrollmentIdentity(clientA),
+			readEnrollmentIdentity(clientB),
+		]);
+		for (const [label, enrollment] of [["A", enrollmentA], ["B", enrollmentB]] as const) {
+			if (!enrollment.host || !enrollment.deviceTokenPresent || !enrollment.vaultId || !enrollment.deviceId) {
+				throw new Error(`Device ${label} is not fully enrolled; prepare it with host, deviceToken, vaultId, and deviceId.`);
+			}
+		}
+		if (enrollmentA.host !== enrollmentB.host || enrollmentA.vaultId !== enrollmentB.vaultId) {
+			throw new Error("Two-device QA requires both devices to be enrolled in the same server vault.");
+		}
+		if (enrollmentA.deviceId === enrollmentB.deviceId) {
+			throw new Error("Two-device QA requires distinct server-issued device identities; use a separate one-use pairing code for each device.");
+		}
+		log("Enrollment identities verified: shared vault, distinct devices.");
 
 		// Auto-detect vault paths from live instances if not provided as CLI args.
 		// Required for trace collection -- flight traces are exported relative to vault root.

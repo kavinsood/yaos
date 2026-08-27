@@ -3,15 +3,18 @@ import YSyncProvider from "y-partyserver/provider";
 import WebSocket from "ws";
 import { SCHEMA_VERSION } from "../../src/sync/schema.ts";
 import { describeFatalFrame, onFatalFrame } from "./fatalFrame.ts";
+import {
+	deviceBearerHeaders,
+	fetchSocketTicket,
+	requireLiveIdentity,
+} from "./liveIdentity.ts";
 
-const HOST = process.env.YAOS_TEST_HOST || "http://127.0.0.1:8787";
-const TOKEN = process.env.SYNC_TOKEN || "";
-const BASE_VAULT_ID = process.env.YAOS_TEST_VAULT_ID || "yaos-provider-manual-connect";
-const ROOM_ID = `${BASE_VAULT_ID}-manual-connect`;
+const identity = requireLiveIdentity();
+const HOST = identity.host;
+const ROOM_ID = identity.vaultId;
 
-if (!TOKEN) {
-	throw new Error("SYNC_TOKEN is required for provider manual-connect smoke test");
-}
+const CONNECTION_WAIT_MS = 5_000;
+const TICKET_START_MARGIN_MS = 1_000;
 
 /** sv-echo send counters the Worker publishes on `GET /debug/recent`. */
 interface SvEchoCounters {
@@ -43,16 +46,21 @@ function wait(ms: number): Promise<void> {
 	return new Promise<void>((resolve) => setTimeout(resolve, ms));
 }
 
-function authHeaders(extra: Record<string, string> = {}): Record<string, string> {
-	return {
-		Authorization: `Bearer ${TOKEN}`,
-		...extra,
-	};
+async function freshSocketParams(label: string): Promise<Record<string, string>> {
+	const { ticket, expiresAt } = await fetchSocketTicket(identity);
+	const validityMs = expiresAt - Date.now();
+	const minimumValidityMs = CONNECTION_WAIT_MS + TICKET_START_MARGIN_MS;
+	if (validityMs < minimumValidityMs) {
+		throw new Error(
+			`${label}: fresh ticket has ${validityMs}ms validity; ${minimumValidityMs}ms required before connect`,
+		);
+	}
+	return { ticket, schemaVersion: String(SCHEMA_VERSION) };
 }
 
 async function getDebugPayload(): Promise<DebugPayload | string | null> {
 	const res = await fetch(`${HOST}/vault/${encodeURIComponent(ROOM_ID)}/debug/recent`, {
-		headers: authHeaders(),
+		headers: deviceBearerHeaders(identity),
 	});
 	const text = await res.text();
 	let payload: DebugPayload | string | null = null;
@@ -171,10 +179,9 @@ async function withProvider(
 	const ydoc = new Y.Doc();
 	const provider = new YSyncProvider(HOST, ROOM_ID, ydoc, {
 		prefix: `/vault/sync/${encodeURIComponent(ROOM_ID)}`,
-		params: {
-			token: TOKEN,
-			schemaVersion: String(SCHEMA_VERSION),
-		},
+		// YSyncProvider awaits params before every connect and rebuilds its URL,
+		// so the explicit reconnect below cannot reuse the previous ticket.
+		params: () => freshSocketParams(label),
 		WebSocketPolyfill: globalThis.WebSocket ?? WebSocket,
 		connect: false,
 		maxBackoffTime: 500,
@@ -207,7 +214,7 @@ async function waitForSync(provider: YSyncProvider, label: string): Promise<void
 			if (settled) return;
 			settled = true;
 			reject(new Error(`${label}: timed out waiting for sync`));
-		}, 10_000);
+		}, CONNECTION_WAIT_MS);
 
 		// Fatal rejections arrive as "custom-message", not "message" — the
 		// provider has no "message" event at all (see ./fatalFrame.ts).
@@ -224,7 +231,12 @@ async function waitForSync(provider: YSyncProvider, label: string): Promise<void
 			clearTimeout(timeout);
 			resolve(undefined);
 		});
-		void provider.connect();
+		void provider.connect().catch((error: unknown) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timeout);
+			reject(error instanceof Error ? error : new Error(`${label}: connect failed: ${String(error)}`));
+		});
 	});
 }
 
@@ -239,14 +251,19 @@ async function waitForConnected(provider: YSyncProvider, label: string): Promise
 			if (settled) return;
 			settled = true;
 			reject(new Error(`${label}: timed out waiting for connected status`));
-		}, 10_000);
+		}, CONNECTION_WAIT_MS);
 		provider.on("status", (event: { status: string }) => {
 			if (settled || event.status !== "connected") return;
 			settled = true;
 			clearTimeout(timeout);
 			resolve(undefined);
 		});
-		void provider.connect();
+		void provider.connect().catch((error: unknown) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timeout);
+			reject(error instanceof Error ? error : new Error(`${label}: connect failed: ${String(error)}`));
+		});
 	});
 }
 

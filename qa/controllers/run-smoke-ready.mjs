@@ -34,7 +34,7 @@ import { existsSync } from "fs";
 import { resolve, join } from "path";
 import { ObsidianClient } from "./obsidian-client.mjs";
 
-const PORT = parseInt(process.env.QA_CDP_PORT ?? "9222", 10);
+const PORT = Number(process.env.QA_CDP_PORT ?? "9222");
 const HOST = process.env.QA_CDP_HOST ?? "localhost";
 const VAULT_PATH = process.env.QA_VAULT_PATH ? resolve(process.env.QA_VAULT_PATH) : null;
 const QA_TIMEOUT_MS = parseInt(process.env.QA_TIMEOUT_MS ?? "30000", 10);
@@ -61,6 +61,9 @@ function check(label, passed, detail = "") {
 // ---------------------------------------------------------------------------
 
 async function main() {
+	if (!Number.isInteger(PORT) || PORT < 1024 || PORT > 65535) {
+		throw new Error("QA_CDP_PORT must be an integer between 1024 and 65535.");
+	}
 	log(INFO, `P4C QA liveness smoke  port=${PORT} host=${HOST}`);
 	if (VAULT_PATH) log(INFO, `Vault path: ${VAULT_PATH}`);
 	else log(INFO, "QA_VAULT_PATH not set — disk trace-file check will be skipped");
@@ -119,6 +122,23 @@ async function main() {
 
 		const qaExists = await client.evalRaw(`typeof window.__YAOS_QA__ !== "undefined" && window.__YAOS_QA__ !== null`);
 		require("window.__YAOS_QA__ exists", qaExists);
+
+		const enrollmentReady = await client.evalRaw(`
+			(() => {
+				const settings = app?.plugins?.plugins?.["yaos"]?.settings;
+				return !!(
+					typeof settings?.host === "string" && settings.host.trim()
+					&& typeof settings?.deviceToken === "string" && settings.deviceToken.trim()
+					&& typeof settings?.vaultId === "string" && settings.vaultId.trim()
+					&& typeof settings?.deviceId === "string" && settings.deviceId.trim()
+				);
+			})()
+		`);
+		require(
+			"server-issued enrollment identity present",
+			enrollmentReady,
+			enrollmentReady ? "" : "prepare with host, deviceToken, vaultId, and deviceId before running sync scenarios",
+		);
 
 		// ----------------------------------------------------------------
 		// 4. QA product build loaded (getEngineControlPort callable)

@@ -12,37 +12,16 @@
 
 import * as Y from "yjs";
 import { gunzipSync } from "fflate";
-import { readFileSync } from "fs";
-import { resolve } from "path";
 import { readField as field } from "../mocks/readField.ts";
+import { deviceBearerHeaders, requireLiveIdentity } from "./liveIdentity.ts";
 
 // -------------------------------------------------------------------
 // Config
 // -------------------------------------------------------------------
 
-// Parse server/.env
-const envPath = resolve(new URL(".", import.meta.url).pathname, "../../server/.env");
-let envVars: Record<string, string> = {};
-try {
-	const envContent = readFileSync(envPath, "utf-8");
-	for (const line of envContent.split("\n")) {
-		const trimmed = line.trim();
-		if (!trimmed || trimmed.startsWith("#")) continue;
-		const eq = trimmed.indexOf("=");
-		if (eq > 0) {
-			envVars[trimmed.slice(0, eq)] = trimmed.slice(eq + 1);
-		}
-	}
-} catch {
-	console.warn("Could not read server/.env — falling back to process env for live endpoint tests.");
-}
-
-const HOST = process.env.YAOS_TEST_HOST ?? envVars.YAOS_TEST_HOST ?? "http://127.0.0.1:8787";
-const TOKEN = process.env.SYNC_TOKEN ?? envVars.SYNC_TOKEN ?? "";
-const TEST_VAULT_ID =
-	process.env.YAOS_TEST_VAULT_ID
-	?? envVars.YAOS_TEST_VAULT_ID
-	?? `cli-test-${Date.now().toString(36)}`;
+const identity = requireLiveIdentity();
+const HOST = identity.host;
+const TEST_VAULT_ID = identity.vaultId;
 
 function baseUrl(): string {
 	return `${HOST}/vault/${encodeURIComponent(TEST_VAULT_ID)}`;
@@ -97,10 +76,9 @@ async function serverPost(
 	const url = `${baseUrl()}/${endpoint}`;
 	const res = await fetch(url, {
 		method: "POST",
-		headers: {
+		headers: deviceBearerHeaders(identity, {
 			"Content-Type": "application/json",
-			Authorization: `Bearer ${TOKEN}`,
-		},
+		}),
 		body: body ? JSON.stringify(body) : "{}",
 	});
 	const data = await res.json().catch(() => null);
@@ -115,10 +93,9 @@ async function serverPutBytes(
 	const url = `${baseUrl()}/${endpoint}`;
 	const res = await fetch(url, {
 		method: "PUT",
-		headers: {
+		headers: deviceBearerHeaders(identity, {
 			"Content-Type": contentType,
-			Authorization: `Bearer ${TOKEN}`,
-		},
+		}),
 		body,
 	});
 	const data = await res.json().catch(() => null);
@@ -129,9 +106,7 @@ async function serverGet(endpoint: string): Promise<JsonBody> {
 	const url = `${baseUrl()}/${endpoint}`;
 	const res = await fetch(url, {
 		method: "GET",
-		headers: {
-			Authorization: `Bearer ${TOKEN}`,
-		},
+		headers: deviceBearerHeaders(identity),
 	});
 	const data = await res.json().catch(() => null);
 	return { status: res.status, data };
@@ -152,9 +127,7 @@ async function serverGetBytes(
 	const url = `${baseUrl()}/${endpoint}`;
 	const res = await fetch(url, {
 		method: "GET",
-		headers: {
-			Authorization: `Bearer ${TOKEN}`,
-		},
+		headers: deviceBearerHeaders(identity),
 	});
 	const bytes = new Uint8Array(await res.arrayBuffer());
 	return { status: res.status, bytes };
@@ -167,10 +140,6 @@ async function testEndpoints(): Promise<void> {
 	console.log(`  Vault: ${TEST_VAULT_ID}`);
 	console.log("═══════════════════════════════════════════════\n");
 
-	if (!TOKEN) {
-		console.log("  SKIPPED: No SYNC_TOKEN found in server/.env");
-		return;
-	}
 
 	const capabilities = await serverGetCapabilities();
 	assertEqual(capabilities.status, 200, "capabilities returns 200");
@@ -185,13 +154,13 @@ async function testEndpoints(): Promise<void> {
 		const badUrl = `${baseUrl()}/snapshots`;
 		const res = await fetch(badUrl, {
 			method: "GET",
-			headers: { Authorization: "Bearer wrong-token" },
+			headers: { Authorization: "Bearer wrong-device-bearer" },
 		});
-		assertEqual(res.status, 401, "Wrong token returns 401");
+		assertEqual(res.status, 401, "Wrong device bearer returns 401");
 
-		const noTokenUrl = `${baseUrl()}/snapshots`;
-		const res2 = await fetch(noTokenUrl, { method: "GET" });
-		assertEqual(res2.status, 401, "Missing token returns 401");
+		const noBearerUrl = `${baseUrl()}/snapshots`;
+		const res2 = await fetch(noBearerUrl, { method: "GET" });
+		assertEqual(res2.status, 401, "Missing device bearer returns 401");
 	}
 	if (!field(capabilities.data, "snapshots") || !field(capabilities.data, "attachments")) {
 		console.log("  SKIPPED: R2 binding is not configured for this server");
