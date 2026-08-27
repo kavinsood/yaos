@@ -65,13 +65,6 @@ export async function getOrCreateLocalDeviceId(
 	return getOrCreateMetadataValue(db, LOCAL_DEVICE_ID_KEY, randomUuid);
 }
 
-export async function sha256Hex(input: string): Promise<string> {
-	const cryptoApi = defaultCrypto();
-	if (!cryptoApi.subtle) throw new Error("crypto.subtle is not available");
-	const bytes = new TextEncoder().encode(input);
-	const digest = await cryptoApi.subtle.digest("SHA-256", bytes);
-	return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
-}
 
 export function buildCandidateStoreKey(scope: ScopeKey): string {
 	return `yaos-ack-v1:${scope.serverHostHash}:${scope.vaultIdHash}:${scope.localDeviceId}`;

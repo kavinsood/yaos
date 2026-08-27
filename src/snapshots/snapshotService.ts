@@ -16,6 +16,7 @@ import { VaultSync } from "../sync/vaultSync";
 import type { VaultSyncSettings } from "../settings";
 import type { TraceHttpContext } from "../observability/traceContext";
 import { formatUnknown } from "../utils/format";
+import { ensureAdapterDirectory } from "../utils/adapterDirectory";
 import { SnapshotDiffModal, SnapshotListModal } from "./snapshotModals";
 
 interface SnapshotServiceDeps {
@@ -226,8 +227,8 @@ export class SnapshotService {
 								const content = await this.deps.app.vault.read(file);
 								const backupPath = `${backupDir}/${path}`;
 								const parentDir = backupPath.substring(0, backupPath.lastIndexOf("/"));
-								if (parentDir && !this.deps.app.vault.getAbstractFileByPath(parentDir)) {
-									await this.deps.app.vault.createFolder(parentDir);
+								if (parentDir) {
+									await ensureAdapterDirectory(this.deps.app.vault.adapter, parentDir);
 								}
 								await this.deps.app.vault.create(backupPath, content);
 								backedUp++;

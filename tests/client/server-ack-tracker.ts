@@ -10,7 +10,8 @@
 
 import * as Y from "yjs";
 import { ServerAckTracker } from "../../src/sync/serverAckTracker";
-import { InMemoryCandidateStore, type ScopeKey, type ScopeMetadata } from "../../src/sync/candidateStore";
+import type { ScopeKey, ScopeMetadata } from "../../src/sync/candidateStore";
+import { InMemoryCandidateStore } from "./helpers/inMemoryCandidateStore";
 import { isStateVectorGe } from "../../src/sync/stateVectorAck";
 import { suite } from "../harness.ts";
 

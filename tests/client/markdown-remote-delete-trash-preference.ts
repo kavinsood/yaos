@@ -36,7 +36,7 @@
 import { TFile } from "obsidian";
 import * as Y from "yjs";
 import { DiskMirror } from "../../src/sync/diskMirror";
-import { readSource, suite } from "../harness.ts";
+import { suite } from "../harness.ts";
 
 const s = suite("markdown-remote-delete-trash-preference");
 
@@ -404,22 +404,4 @@ s.section("Scenario E: preserve-unresolved does not invoke trash, delete, or ens
 	s.check(fix.fileExists(path), "file remains in vault after preserve-unresolved");
 }
 
-// -------------------------------------------------------------------
-// Source-grep backup signal (optional per Requirement 7.6, labeled as backup).
-// -------------------------------------------------------------------
-//
-// The runtime flight-event assertions above are the primary semantic proof.
-// The single grep below exists only to catch a regression where the deleteMode
-// field is silently dropped from the production emission while leaving the
-// field name still nominally present elsewhere. Per project policy, this is a
-// backup signal, NOT a primary semantic proof.
-
-s.section("Backup: deleteMode field still passed in delete.disk.applied production emission");
-{
-	const src = readSource("src/sync/diskMirror.ts");
-	const appliedIdx = src.indexOf('kind: "delete.disk.applied"');
-	s.check(appliedIdx > 0, "delete.disk.applied flight emission present");
-	const tail = src.slice(appliedIdx, appliedIdx + 400);
-	s.check(tail.includes("deleteMode"), "delete.disk.applied emission still passes deleteMode in data");
-}
 await s.done();

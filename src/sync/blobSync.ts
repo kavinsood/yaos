@@ -18,7 +18,6 @@ import {
 	TFile,
 	normalizePath,
 	requestUrl,
-	arrayBufferToHex,
 	Notice,
 } from "obsidian";
 import type { VaultSync } from "./vaultSync";
@@ -36,6 +35,7 @@ import {
 	removeCachedHash,
 } from "./blobHashCache";
 import { PreservedUnresolvedRegistry, type PreservedUnresolvedEntry, type PreservedUnresolvedReason } from "./preservedUnresolved";
+import { sha256BytesHex } from "../utils/sha256";
 
 // -------------------------------------------------------------------
 // Config
@@ -192,14 +192,6 @@ class BlobHttpClient {
 	}
 }
 
-// -------------------------------------------------------------------
-// Hashing
-// -------------------------------------------------------------------
-
-async function hashArrayBuffer(data: ArrayBuffer): Promise<string> {
-	const hashBuffer = await crypto.subtle.digest("SHA-256", data);
-	return arrayBufferToHex(hashBuffer);
-}
 
 /**
  * Guess MIME type from file extension.
@@ -909,7 +901,7 @@ export class BlobSyncManager {
 			if (!hash) {
 				// Cache miss — read and hash the file
 				data = await this.app.vault.readBinary(file);
-				hash = await hashArrayBuffer(data);
+				hash = await sha256BytesHex(data);
 				setCachedHash(this.hashCache, item.path, fileStat, hash);
 			}
 
@@ -1152,7 +1144,7 @@ export class BlobSyncManager {
 				if (!diskHash) {
 					try {
 						const data = await this.app.vault.readBinary(existing);
-						diskHash = await hashArrayBuffer(data);
+						diskHash = await sha256BytesHex(data);
 						setCachedHash(
 							this.hashCache,
 							item.path,
@@ -1189,7 +1181,7 @@ export class BlobSyncManager {
 			let targetHasRemoteBytes = false;
 
 			// Verify hash of downloaded data
-			const downloadHash = await hashArrayBuffer(data);
+			const downloadHash = await sha256BytesHex(data);
 			if (downloadHash !== item.hash) {
 				throw new Error(
 					`Hash mismatch: expected ${item.hash.slice(0, 12)}… got ${downloadHash.slice(0, 12)}…`,
@@ -1293,7 +1285,7 @@ export class BlobSyncManager {
 					if (!diskHash) {
 						const existingData =
 							await this.app.vault.readBinary(resolved);
-						diskHash = await hashArrayBuffer(existingData);
+						diskHash = await sha256BytesHex(existingData);
 						setCachedHash(
 							this.hashCache,
 							item.path,
@@ -1420,7 +1412,7 @@ export class BlobSyncManager {
 		if (cachedHash) return cachedHash;
 		try {
 			const data = await this.app.vault.readBinary(file);
-			const hash = await hashArrayBuffer(data);
+			const hash = await sha256BytesHex(data);
 			setCachedHash(this.hashCache, path, fileStat, hash);
 			return hash;
 		} catch {
@@ -1464,7 +1456,7 @@ export class BlobSyncManager {
 				const freshStat =
 					await this.app.vault.adapter.stat(conflictPath);
 				if (freshStat) {
-					const hash = await hashArrayBuffer(data);
+					const hash = await sha256BytesHex(data);
 					setCachedHash(
 						this.hashCache,
 						conflictPath,
@@ -1554,7 +1546,7 @@ export class BlobSyncManager {
 							if (!localHash) {
 								try {
 									const data = await this.app.vault.readBinary(file);
-									localHash = await hashArrayBuffer(data);
+									localHash = await sha256BytesHex(data);
 									setCachedHash(
 										this.hashCache,
 										normalized,

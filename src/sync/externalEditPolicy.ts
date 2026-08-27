@@ -26,7 +26,3 @@ export function decideExternalEditImport(
 		reason: "allowed",
 	};
 }
-
-export default {
-	decideExternalEditImport,
-};

@@ -2,17 +2,12 @@
  * Tests for baseline advancement policy.
  *
  * Proves:
- * - All 12 action kinds return correct advance/defer/clear decisions
- * - Hash selection matches the decision matrix
+ * - Every reconciliation action selects the correct settled hash
  * - Null hash throws for actions that require it
- * - Reason strings are descriptive
+ * - Reason strings remain descriptive
  */
 
-import {
-	planBaselineAdvancement,
-	type BaselineAdvancementInput,
-	type BaselineAdvanceAction,
-} from "../../src/runtime/reconcile/baselineAdvancementPolicy";
+import { planBaselineAdvancement } from "../../src/runtime/reconcile/baselineAdvancementPolicy";
 import { suite } from "../harness.ts";
 
 const s = suite("baseline-advancement-policy");
@@ -29,7 +24,6 @@ function assertThrows(fn: () => void, expectedMessage: string, msg: string) {
 
 const DISK_HASH = "sha256-disk-content-abc123";
 const CRDT_HASH = "sha256-crdt-content-def456";
-const BASELINE_HASH = "sha256-baseline-xyz789";
 
 s.section("Test 1: crdt-created-on-disk advances with crdtHash");
 {
@@ -37,7 +31,6 @@ s.section("Test 1: crdt-created-on-disk advances with crdtHash");
 		actionKind: "crdt-created-on-disk",
 		diskHash: null,
 		crdtHash: CRDT_HASH,
-		previousBaselineHash: null,
 	});
 	s.check(result.kind === "advance", "kind is advance");
 	s.check(result.kind === "advance" && result.hash === CRDT_HASH, "hash is crdtHash");
@@ -50,7 +43,6 @@ s.section("Test 2: disk-seeded-to-crdt advances with diskHash");
 		actionKind: "disk-seeded-to-crdt",
 		diskHash: DISK_HASH,
 		crdtHash: null,
-		previousBaselineHash: null,
 	});
 	s.check(result.kind === "advance", "kind is advance");
 	s.check(result.kind === "advance" && result.hash === DISK_HASH, "hash is diskHash");
@@ -63,7 +55,6 @@ s.section("Test 3: import-disk-to-crdt advances with diskHash");
 		actionKind: "import-disk-to-crdt",
 		diskHash: DISK_HASH,
 		crdtHash: CRDT_HASH,
-		previousBaselineHash: BASELINE_HASH,
 	});
 	s.check(result.kind === "advance", "kind is advance");
 	s.check(result.kind === "advance" && result.hash === DISK_HASH, "hash is diskHash (disk wins)");
@@ -76,7 +67,6 @@ s.section("Test 4: conflict-disk-wins advances with diskHash");
 		actionKind: "conflict-disk-wins",
 		diskHash: DISK_HASH,
 		crdtHash: CRDT_HASH,
-		previousBaselineHash: BASELINE_HASH,
 	});
 	s.check(result.kind === "advance", "kind is advance");
 	s.check(result.kind === "advance" && result.hash === DISK_HASH, "hash is diskHash");
@@ -89,7 +79,6 @@ s.section("Test 5: conflict-crdt-wins advances with crdtHash");
 		actionKind: "conflict-crdt-wins",
 		diskHash: DISK_HASH,
 		crdtHash: CRDT_HASH,
-		previousBaselineHash: BASELINE_HASH,
 	});
 	s.check(result.kind === "advance", "kind is advance");
 	s.check(result.kind === "advance" && result.hash === CRDT_HASH, "hash is crdtHash");
@@ -102,7 +91,6 @@ s.section("Test 6: apply-remote-to-disk advances with crdtHash");
 		actionKind: "apply-remote-to-disk",
 		diskHash: DISK_HASH,
 		crdtHash: CRDT_HASH,
-		previousBaselineHash: BASELINE_HASH,
 	});
 	s.check(result.kind === "advance", "kind is advance");
 	s.check(result.kind === "advance" && result.hash === CRDT_HASH, "hash is crdtHash (remote wins)");
@@ -116,7 +104,6 @@ s.section("Test 7: no-op advances with crdtHash (same as diskHash)");
 		actionKind: "no-op",
 		diskHash: SAME_HASH,
 		crdtHash: SAME_HASH,
-		previousBaselineHash: BASELINE_HASH,
 	});
 	s.check(result.kind === "advance", "kind is advance");
 	s.check(result.kind === "advance" && result.hash === SAME_HASH, "hash is the common content hash");
@@ -129,70 +116,19 @@ s.section("Test 8: defer-to-crdt-flush advances with crdtHash");
 		actionKind: "defer-to-crdt-flush",
 		diskHash: DISK_HASH,
 		crdtHash: CRDT_HASH,
-		previousBaselineHash: null,
 	});
 	s.check(result.kind === "advance", "kind is advance");
 	s.check(result.kind === "advance" && result.hash === CRDT_HASH, "hash is crdtHash");
 	s.check(result.kind === "advance" && result.reason === "flush-completed", "reason is flush-completed");
 }
 
-s.section("Test 9: live-disk-to-crdt advances with diskHash");
-{
-	const result = planBaselineAdvancement({
-		actionKind: "live-disk-to-crdt",
-		diskHash: DISK_HASH,
-		crdtHash: CRDT_HASH,
-		previousBaselineHash: BASELINE_HASH,
-	});
-	s.check(result.kind === "advance", "kind is advance");
-	s.check(result.kind === "advance" && result.hash === DISK_HASH, "hash is diskHash");
-	s.check(result.kind === "advance" && result.reason === "external-edit-imported", "reason correct");
-}
-
-s.section("Test 10: live-stat-only defers");
-{
-	const result = planBaselineAdvancement({
-		actionKind: "live-stat-only",
-		diskHash: null,
-		crdtHash: null,
-		previousBaselineHash: BASELINE_HASH,
-	});
-	s.check(result.kind === "defer", "kind is defer");
-	s.check(result.reason === "stat-only-no-content", "reason correct");
-}
-
-s.section("Test 11: conflict-artifact-failed defers");
-{
-	const result = planBaselineAdvancement({
-		actionKind: "conflict-artifact-failed",
-		diskHash: DISK_HASH,
-		crdtHash: CRDT_HASH,
-		previousBaselineHash: BASELINE_HASH,
-	});
-	s.check(result.kind === "defer", "kind is defer");
-	s.check(result.reason === "artifact-creation-failed", "reason correct");
-}
-
-s.section("Test 12: safety-brake defers");
-{
-	const result = planBaselineAdvancement({
-		actionKind: "safety-brake",
-		diskHash: null,
-		crdtHash: null,
-		previousBaselineHash: null,
-	});
-	s.check(result.kind === "defer", "kind is defer");
-	s.check(result.reason === "safety-brake-blocked", "reason correct");
-}
-
-s.section("Test 13: null crdtHash throws for crdt-authority actions");
+s.section("Test 9: null crdtHash throws for crdt-authority actions");
 {
 	assertThrows(
 		() => planBaselineAdvancement({
 			actionKind: "crdt-created-on-disk",
 			diskHash: DISK_HASH,
 			crdtHash: null,
-			previousBaselineHash: null,
 		}),
 		"requires crdtHash",
 		"crdt-created-on-disk throws on null crdtHash",
@@ -203,7 +139,6 @@ s.section("Test 13: null crdtHash throws for crdt-authority actions");
 			actionKind: "apply-remote-to-disk",
 			diskHash: DISK_HASH,
 			crdtHash: null,
-			previousBaselineHash: BASELINE_HASH,
 		}),
 		"requires crdtHash",
 		"apply-remote-to-disk throws on null crdtHash",
@@ -214,21 +149,19 @@ s.section("Test 13: null crdtHash throws for crdt-authority actions");
 			actionKind: "no-op",
 			diskHash: DISK_HASH,
 			crdtHash: null,
-			previousBaselineHash: BASELINE_HASH,
 		}),
 		"requires crdtHash",
 		"no-op throws on null crdtHash",
 	);
 }
 
-s.section("Test 14: null diskHash throws for disk-authority actions");
+s.section("Test 10: null diskHash throws for disk-authority actions");
 {
 	assertThrows(
 		() => planBaselineAdvancement({
 			actionKind: "disk-seeded-to-crdt",
 			diskHash: null,
 			crdtHash: CRDT_HASH,
-			previousBaselineHash: null,
 		}),
 		"requires diskHash",
 		"disk-seeded-to-crdt throws on null diskHash",
@@ -239,7 +172,6 @@ s.section("Test 14: null diskHash throws for disk-authority actions");
 			actionKind: "import-disk-to-crdt",
 			diskHash: null,
 			crdtHash: CRDT_HASH,
-			previousBaselineHash: BASELINE_HASH,
 		}),
 		"requires diskHash",
 		"import-disk-to-crdt throws on null diskHash",
@@ -250,30 +182,10 @@ s.section("Test 14: null diskHash throws for disk-authority actions");
 			actionKind: "conflict-disk-wins",
 			diskHash: null,
 			crdtHash: CRDT_HASH,
-			previousBaselineHash: BASELINE_HASH,
 		}),
 		"requires diskHash",
 		"conflict-disk-wins throws on null diskHash",
 	);
 }
 
-s.section("Test 15: previousBaselineHash is not required");
-{
-	// All actions should work with null previousBaselineHash
-	const result1 = planBaselineAdvancement({
-		actionKind: "crdt-created-on-disk",
-		diskHash: null,
-		crdtHash: CRDT_HASH,
-		previousBaselineHash: null,
-	});
-	s.check(result1.kind === "advance", "works with null baseline (crdt-created-on-disk)");
-
-	const result2 = planBaselineAdvancement({
-		actionKind: "conflict-artifact-failed",
-		diskHash: null,
-		crdtHash: null,
-		previousBaselineHash: null,
-	});
-	s.check(result2.kind === "defer", "works with null baseline (conflict-artifact-failed)");
-}
 await s.done();

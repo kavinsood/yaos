@@ -6,7 +6,7 @@
  * Sync or third-party sync tools). Candidate state is per-device runtime state
  * and must never cross-contaminate across devices.
  *
- * This module defines the interface and an in-memory implementation for tests.
+ * This module defines the persisted data shape and storage interface.
  */
 
 /** Scope fields used both for invalidation and as the persisted payload key. */
@@ -53,39 +53,4 @@ export interface CandidateStore {
 
 	/** Discard any stored candidate state. */
 	clear(): Promise<void>;
-}
-
-/** In-memory CandidateStore for tests. Not durable across restarts. */
-export class InMemoryCandidateStore implements CandidateStore {
-	private _stored: PersistedCandidateState | null = null;
-	/** Set to true to simulate write failures. */
-	simulateWriteFailure = false;
-
-	async load(scope: ScopeKey): Promise<PersistedCandidateState | null> {
-		if (!this._stored) return null;
-		if (!scopeKeyMatches(this._stored, scope)) return null;
-		return this._stored;
-	}
-
-	async save(state: PersistedCandidateState): Promise<void> {
-		if (this.simulateWriteFailure) throw new Error("simulated write failure");
-		this._stored = state;
-	}
-
-	async clear(): Promise<void> {
-		this._stored = null;
-	}
-
-	/** Test helper: read raw stored state without scope check. */
-	get rawStored(): PersistedCandidateState | null { return this._stored; }
-}
-
-function scopeKeyMatches(stored: PersistedCandidateState, scope: ScopeKey): boolean {
-	return (
-		stored.vaultIdHash === scope.vaultIdHash &&
-		stored.serverHostHash === scope.serverHostHash &&
-		stored.localDeviceId === scope.localDeviceId &&
-		stored.roomName === scope.roomName &&
-		stored.docSchemaVersion === scope.docSchemaVersion
-	);
 }

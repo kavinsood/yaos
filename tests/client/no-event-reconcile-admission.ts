@@ -401,12 +401,11 @@ function buildFixture(opts: {
 
 s.section("Taxonomy: FLIGHT_TAXONOMY_VERSION");
 {
-	// Bumped to 12 by the qa.trace.* -> debug.trace.* rename (recorder
-	// lifecycle vocabulary). This spec does not bump.
+	// Bumped to 13 by the unified debug trace event/checkpoint vocabulary.
 	assertEq(
 		FLIGHT_TAXONOMY_VERSION,
-		12,
-		"FLIGHT_TAXONOMY_VERSION === 12 (no bump for this spec)",
+		13,
+		"FLIGHT_TAXONOMY_VERSION === 13",
 	);
 }
 

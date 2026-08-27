@@ -682,8 +682,7 @@ s.section("Scenario D: clear-and-readmit cycle");
 // The unbound syncFileFromDisk sites do NOT call scheduleTraceStateSnapshot
 // today. This test does NOT assert that they do; the primary
 // recovery.skipped flight-event assertion remains the proof for those two
-// sites (covered by Requirement 2.3 / 2.4 invariants and the helper-
-// invocation check in tests/contracts/typed-trace-schema.ts).
+// sites. The flight assertions above exercise the emitted behavior directly.
 //
 // If the secondary trace assertion fails but the primary flight assertion
 // passed (all earlier asserts in Scenarios A and C produced PASS), the

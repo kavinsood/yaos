@@ -5,7 +5,7 @@
  * All call sites must use these helpers instead of accessing metadata entries directly.
  *
  * Schema v3 uses nested Y.Map entries for field-level CRDT resolution.
- * Schema v2 used opaque JSON objects (FileMeta interface).
+ * Schema v2 used opaque JSON objects.
  * Readers must handle both shapes. Writers always produce nested Y.Maps.
  */
 

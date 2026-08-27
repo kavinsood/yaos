@@ -6,6 +6,7 @@
  */
 
 import { classifySyncPath } from "../../src/paths/pathCategory";
+import { isExcluded } from "../../src/sync/exclude";
 import { planCategoryRenameAction } from "../../src/sync/policy/renameAdmissionPolicy";
 import type { RenameAction } from "../../src/sync/policy/renameAdmissionPolicy";
 import { suite } from "../harness.ts";
@@ -85,6 +86,22 @@ s.section("Test 8: non-.md non-excluded = blob");
 	s.check(classify("data/file.json").kind === "blob", ".json is blob");
 	s.check(classify("images/photo.jpg").kind === "blob", ".jpg is blob");
 }
+s.section("Test 8b: exclusions use canonical separator and Unicode identity");
+{
+	s.check(
+		isExcluded("././templates\\daily.md", EXCLUDE, CONFIG),
+		"repeated ./ and backslashes still match a configured exclusion",
+	);
+	s.check(
+		isExcluded("/.obsidian//workspace.md", EXCLUDE, CONFIG),
+		"leading and repeated slashes still match the config directory",
+	);
+	s.check(
+		isExcluded("archive/cafe\u0301/note.md", ["archive/caf\u00E9/"], CONFIG),
+		"NFD path matches an NFC exclusion prefix",
+	);
+}
+
 
 // -----------------------------------------------------------------------
 // Rename category matrix — full 9-case matrix + same-identity

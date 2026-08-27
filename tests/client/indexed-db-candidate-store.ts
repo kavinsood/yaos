@@ -10,8 +10,8 @@ import {
 	IndexedDbCandidateStore,
 	buildCandidateStoreKey,
 	getOrCreateLocalDeviceId,
-	sha256Hex,
 } from "../../src/sync/indexedDbCandidateStore";
+import { sha256BytesHex, sha256TextHex } from "../../src/utils/sha256";
 import { encodeBytesBase64, MAX_SV_ECHO_BASE64_BYTES } from "../../src/sync/svEchoMessage";
 import type { PersistedCandidateState, ScopeKey, ScopeMetadata } from "../../src/sync/candidateStore";
 import { suite } from "../harness.ts";
@@ -53,8 +53,10 @@ s.section("Test 1: key shape and hash helper");
 		buildCandidateStoreKey(BASE_SCOPE) === `yaos-ack-v1:${"b".repeat(64)}:${"a".repeat(64)}:local-device`,
 		"candidate key uses serverHostHash, vaultIdHash, localDeviceId",
 	);
-	const hash = await sha256Hex("YAOS");
-	s.check(/^[0-9a-f]{64}$/.test(hash), "sha256Hex returns lowercase 64-char hex");
+	const textHash = await sha256TextHex("YAOS");
+	const byteHash = await sha256BytesHex(new TextEncoder().encode("YAOS"));
+	s.check(/^[0-9a-f]{64}$/.test(textHash), "sha256TextHex returns lowercase 64-char hex");
+	s.check(byteHash === textHash, "byte and text SHA-256 helpers use the same UTF-8 digest");
 }
 
 s.section("Test 2: save/load survives store re-instantiation");

@@ -707,11 +707,8 @@ export class ReconciliationController {
 							actionKind: "crdt-created-on-disk",
 							diskHash: null,
 							crdtHash,
-							previousBaselineHash: null,
 						});
-						if (baselineAction.kind === "advance") {
-							settledHashes.set(path, baselineAction.hash);
-						}
+						settledHashes.set(path, baselineAction.hash);
 					}
 				}
 				for (const path of result.seededToCrdt) {
@@ -730,11 +727,8 @@ export class ReconciliationController {
 							actionKind: "disk-seeded-to-crdt",
 							diskHash,
 							crdtHash: null,
-							previousBaselineHash: null,
 						});
-						if (baselineAction.kind === "advance") {
-							settledHashes.set(path, baselineAction.hash);
-						}
+						settledHashes.set(path, baselineAction.hash);
 					}
 				}
 			for (const path of result.updatedOnDisk) {
@@ -844,11 +838,8 @@ export class ReconciliationController {
 										actionKind: "conflict-disk-wins",
 										diskHash,
 										crdtHash,
-										previousBaselineHash: baselineHash,
 									});
-									if (baselineAction.kind === "advance") {
-										settledHashes.set(path, baselineAction.hash);
-									}
+									settledHashes.set(path, baselineAction.hash);
 								} else {
 									updatesToFlush.push({ path, baselineActionKind: "conflict-crdt-wins" });
 								}
@@ -875,9 +866,6 @@ export class ReconciliationController {
 									reason: action.reason,
 									error: err instanceof Error ? err.message : String(err),
 								});
-								// Baseline advancement: defer on artifact creation failure
-								// (planBaselineAdvancement would return defer, but we skip calling it
-								// since we're not setting any hash anyway - the path is dropped)
 								continue;
 							}
 						}
@@ -887,11 +875,8 @@ export class ReconciliationController {
 								actionKind: "import-disk-to-crdt",
 								diskHash,
 								crdtHash,
-								previousBaselineHash: baselineHash,
 							});
-							if (baselineAction.kind === "advance") {
-								settledHashes.set(path, baselineAction.hash);
-							}
+							settledHashes.set(path, baselineAction.hash);
 							this.deps.trace("reconcile", "closed-file-disk-wins-clean", {
 								path,
 								reason: action.reason,
@@ -941,11 +926,8 @@ export class ReconciliationController {
 							actionKind: baselineActionKind,
 							diskHash: null,
 							crdtHash,
-							previousBaselineHash: null,
 						});
-						if (baselineAction.kind === "advance") {
-							settledHashes.set(path, baselineAction.hash);
-						}
+						settledHashes.set(path, baselineAction.hash);
 					}
 				}
 
@@ -1218,10 +1200,6 @@ export class ReconciliationController {
 		this.scheduleMarkdownDrain();
 	}
 
-	/** @deprecated Use redirectPendingDirtyPath. Kept for compatibility during transition. */
-	redirectPendingCreate(oldPath: string, newPath: string): void {
-		this.redirectPendingDirtyPath(oldPath, newPath);
-	}
 
 	/**
 	 * Drop a pending dirty entry for path without redirecting.

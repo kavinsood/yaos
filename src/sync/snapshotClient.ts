@@ -16,6 +16,7 @@ import type { BlobRef } from "../types";
 import { appendTraceParams, type TraceHttpContext } from "../observability/traceContext";
 import { obsidianRequest } from "../utils/http";
 import { yTextToString } from "../utils/format";
+import { canonicalizeVaultPath } from "../paths/canonicalPath";
 import { ORIGIN_RESTORE } from "./origins";
 import {
 	getMetaPath,
@@ -58,8 +59,6 @@ export interface SnapshotResult {
 	/** True if the snapshot is byte-for-byte identical to the latest snapshot. */
 	snapshotIdenticalToLatest?: boolean;
 	/** @deprecated Use snapshotIdenticalToLatest */
-	structureUnchanged?: boolean;
-	/** @deprecated Use snapshotIdenticalToLatest */
 	semanticUnchanged?: boolean;
 }
 
@@ -83,13 +82,6 @@ export interface SnapshotDiff {
 	blobsChanged: Array<{ path: string; snapshotHash: string; currentHash: string }>;
 }
 
-function normalizeVaultPath(path: string): string {
-	return path
-		.replace(/\\/g, "/")
-		.replace(/\/{2,}/g, "/")
-		.replace(/^\.\//, "")
-		.replace(/^\/+/, "");
-}
 
 function getStoredSchemaVersion(doc: Y.Doc): number | null {
 	const stored = doc.getMap("sys").get("schemaVersion");
@@ -130,7 +122,7 @@ function collectActiveMarkdownPaths(doc: Y.Doc): Map<string, string> {
 			if (isFileMetaDeletedValue(value)) return;
 			const rawPath = getMetaPath(value);
 			if (!rawPath) return;
-			const path = normalizeVaultPath(rawPath);
+			const path = canonicalizeVaultPath(rawPath).normalizedPath;
 			if (!path) return;
 			const existingId = resolved.get(path);
 			if (!existingId) {
@@ -147,7 +139,7 @@ function collectActiveMarkdownPaths(doc: Y.Doc): Map<string, string> {
 
 	// v1 compatibility: pathToId remains authoritative.
 	pathToId.forEach((fileId, rawPath) => {
-		const path = normalizeVaultPath(rawPath);
+		const path = canonicalizeVaultPath(rawPath).normalizedPath;
 		if (!path) return;
 		const entry = meta.get(fileId);
 		if (isFileMetaDeletedValue(entry)) return;
@@ -159,12 +151,21 @@ function collectActiveMarkdownPaths(doc: Y.Doc): Map<string, string> {
 		if (isFileMetaDeletedValue(value)) return;
 		const rawPath = getMetaPath(value);
 		if (!rawPath) return;
-		const path = normalizeVaultPath(rawPath);
+		const path = canonicalizeVaultPath(rawPath).normalizedPath;
 		if (!path || resolved.has(path)) return;
 		resolved.set(path, fileId);
 	});
 
 	return resolved;
+}
+
+function collectBlobRefsByCanonicalPath(pathToBlob: Y.Map<BlobRef>): Map<string, BlobRef> {
+	const refs = new Map<string, BlobRef>();
+	pathToBlob.forEach((ref, rawPath) => {
+		const path = canonicalizeVaultPath(rawPath).normalizedPath;
+		if (path) refs.set(path, ref);
+	});
+	return refs;
 }
 
 // -------------------------------------------------------------------
@@ -469,22 +470,15 @@ export function diffSnapshot(
 	}
 
 	// Blob diff
-	const snapshotBlobs = new Map<string, string>(); // path -> hash
-	snapPathToBlob.forEach((ref, path) => {
-		snapshotBlobs.set(path, ref.hash);
-	});
+	const snapshotBlobs = collectBlobRefsByCanonicalPath(snapPathToBlob);
+	const liveBlobs = collectBlobRefsByCanonicalPath(livePathToBlob);
 
-	const liveBlobs = new Map<string, string>();
-	livePathToBlob.forEach((ref, path) => {
-		liveBlobs.set(path, ref.hash);
-	});
-
-	for (const [path, snapHash] of snapshotBlobs) {
-		const liveHash = liveBlobs.get(path);
-		if (!liveHash) {
-			diff.blobsDeletedSinceSnapshot.push({ path, hash: snapHash });
-		} else if (liveHash !== snapHash) {
-			diff.blobsChanged.push({ path, snapshotHash: snapHash, currentHash: liveHash });
+	for (const [path, snapRef] of snapshotBlobs) {
+		const liveRef = liveBlobs.get(path);
+		if (!liveRef) {
+			diff.blobsDeletedSinceSnapshot.push({ path, hash: snapRef.hash });
+		} else if (liveRef.hash !== snapRef.hash) {
+			diff.blobsChanged.push({ path, snapshotHash: snapRef.hash, currentHash: liveRef.hash });
 		}
 	}
 
@@ -546,7 +540,9 @@ export function restoreFromSnapshot(
 	const liveBlobTombstones = liveDoc.getMap("blobTombstones");
 	const liveUsesV2 = usesV2MetaPathModel(liveDoc);
 	const snapshotPaths = collectActiveMarkdownPaths(snapshotDoc);
+	const snapshotBlobRefs = collectBlobRefsByCanonicalPath(snapPathToBlob);
 	const livePaths = collectActiveMarkdownPaths(liveDoc);
+	const restoredBlobPaths = new Set<string>();
 
 	const result: RestoreResult = {
 		markdownRestored: 0,
@@ -557,7 +553,7 @@ export function restoreFromSnapshot(
 	liveDoc.transact(() => {
 		// Restore markdown files
 		for (const requestedPath of options.markdownPaths ?? []) {
-			const path = normalizeVaultPath(requestedPath);
+			const path = canonicalizeVaultPath(requestedPath).normalizedPath;
 			const snapFileId = snapshotPaths.get(path);
 			if (!snapFileId) continue;
 
@@ -613,7 +609,7 @@ export function restoreFromSnapshot(
 				liveMeta.forEach((value: unknown, fileId: string) => {
 					if (
 						fileId !== snapFileId
-						&& getMetaPath(value) === path
+						&& canonicalizeVaultPath(getMetaPath(value) ?? "").normalizedPath === path
 						&& isFileMetaDeletedValue(value)
 					) {
 						staleTombstones.push(fileId);
@@ -633,17 +629,34 @@ export function restoreFromSnapshot(
 		}
 
 		// Restore blob references
-		for (const path of options.blobPaths ?? []) {
-			const snapRef = snapPathToBlob.get(path);
-			if (!snapRef) continue;
+		for (const requestedPath of options.blobPaths ?? []) {
+			const path = canonicalizeVaultPath(requestedPath).normalizedPath;
+			const snapRef = snapshotBlobRefs.get(path);
+			if (!path || !snapRef || restoredBlobPaths.has(path)) continue;
 
-			livePathToBlob.set(path, snapRef);
-
-			// Clear any tombstone at this path
-			if (liveBlobTombstones.has(path)) {
-				liveBlobTombstones.delete(path);
+			const liveAliases: string[] = [];
+			livePathToBlob.forEach((_ref, rawPath) => {
+				if (canonicalizeVaultPath(rawPath).normalizedPath === path) {
+					liveAliases.push(rawPath);
+				}
+			});
+			for (const alias of liveAliases) {
+				livePathToBlob.delete(alias);
 			}
 
+			const tombstoneAliases: string[] = [];
+			liveBlobTombstones.forEach((_tombstone, rawPath) => {
+				if (canonicalizeVaultPath(rawPath).normalizedPath === path) {
+					tombstoneAliases.push(rawPath);
+				}
+			});
+			for (const alias of tombstoneAliases) {
+				liveBlobTombstones.delete(alias);
+			}
+
+			// The explicit restore is authoritative over every live alias.
+			livePathToBlob.set(path, snapRef);
+			restoredBlobPaths.add(path);
 			result.blobsRestored++;
 		}
 	}, ORIGIN_RESTORE);

@@ -19,22 +19,22 @@ import { fnv1a32Bytes, toHex8 } from "../utils/fnv1a";
 
 export type { ScopeKey, ScopeMetadata, PersistedCandidateState } from "./candidateStore";
 
-export type ServerAckState = {
-	serverAppliedLocalState: boolean | null;
+export interface ServerAckState {
+	readonly serverAppliedLocalState: boolean | null;
 	// Timestamp of the last valid server SV echo this session. When
 	// serverAppliedLocalState is false, this is historical and does not confirm
 	// the current candidate.
-	lastServerReceiptEchoAt: number | null;
-	lastKnownServerReceiptEchoAt: number | null;
-	candidatePersistenceHealthy: boolean;
-	candidatePersistenceFailureCount: number;
-	hasUnconfirmedCandidate: boolean;
-	candidateCapturedAt: number | null;
+	readonly lastServerReceiptEchoAt: number | null;
+	readonly lastKnownServerReceiptEchoAt: number | null;
+	readonly candidatePersistenceHealthy: boolean;
+	readonly candidatePersistenceFailureCount: number;
+	readonly hasUnconfirmedCandidate: boolean;
+	readonly candidateCapturedAt: number | null;
 	/** Receipts from this server prove a durable write, not just in-memory apply. */
-	receiptGuaranteeIsDurable: boolean;
+	readonly receiptGuaranteeIsDurable: boolean;
 	/** Server reported it cannot durably store writes. */
-	serverPersistenceDegraded: boolean;
-};
+	readonly serverPersistenceDegraded: boolean;
+}
 
 export class ServerAckTracker {
 	private _lastUnconfirmedCandidateSv: Uint8Array | null = null;

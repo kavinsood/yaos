@@ -25,9 +25,10 @@ import type { VaultSyncSettings } from "../settings";
 import type { TraceHttpContext, TraceRecord } from "../observability/traceContext";
 import { randomId } from "../utils/randomId";
 import { formatUnknown } from "../utils/format";
+import { sha256TextHex } from "../utils/sha256";
 import { UpdateTracker } from "./updateTracker";
-import { ServerAckTracker } from "./serverAckTracker";
-import { IndexedDbCandidateStore, getOrCreateLocalDeviceId, sha256Hex } from "./indexedDbCandidateStore";
+import { ServerAckTracker, type ServerAckState } from "./serverAckTracker";
+import { IndexedDbCandidateStore, getOrCreateLocalDeviceId } from "./indexedDbCandidateStore";
 import {
 	createSvEchoCounters,
 	handleSvEchoCustomMessage,
@@ -117,11 +118,24 @@ interface IndexedDbErrorDetails {
 	at: string;
 }
 
-type ServerReceiptStartupValidation =
+export type ServerReceiptStartupValidation =
 	| "not_started"
 	| "validated"
 	| "skipped_local_yjs_timeout"
 	| "unavailable";
+
+export type VaultSyncReceiptSnapshot = Readonly<
+	Omit<ServerAckState, "candidatePersistenceHealthy"> & {
+		/** Null until receipt persistence initialization has been attempted. */
+		candidatePersistenceHealthy: boolean | null;
+		/** VaultSync could not create or open the local receipt store. */
+		persistenceUnavailable: boolean;
+		serverReceiptStartupValidation: ServerReceiptStartupValidation;
+		/** Renderer-local correlation IDs used by the read-only QA receipt API. */
+		candidateId: string | null;
+		lastConfirmedCandidateId: string | null;
+	}
+>;
 
 /**
  * Manages the vault-wide Y.Doc, the Worker sync provider, IndexedDB
@@ -573,8 +587,8 @@ export class VaultSync {
 		if (this._serverAckScope) return;
 		try {
 			const [vaultIdHash, serverHostHash, localDeviceId] = await Promise.all([
-				sha256Hex(settings.vaultId),
-				sha256Hex(settings.host),
+				sha256TextHex(settings.vaultId),
+				sha256TextHex(settings.host),
 				getOrCreateLocalDeviceId(),
 			]);
 			const scope: ScopeKey & ScopeMetadata = {
@@ -1836,28 +1850,30 @@ export class VaultSync {
 	get lastLocalUpdateAt(): number | null { return this.updateTracker.lastLocalUpdateAt; }
 	get lastLocalUpdateWhileConnectedAt(): number | null { return this.updateTracker.lastLocalUpdateWhileConnectedAt; }
 	get lastRemoteUpdateAt(): number | null { return this.updateTracker.lastRemoteUpdateAt; }
-	get serverAppliedLocalState(): boolean | null { return this.serverAckTracker.serverAppliedLocalState; }
-	get lastServerReceiptEchoAt(): number | null { return this.serverAckTracker.lastServerReceiptEchoAt; }
-	get lastKnownServerReceiptEchoAt(): number | null { return this.serverAckTracker.lastKnownServerReceiptEchoAt; }
-	get serverReceiptCandidateId(): string | null { return this.serverAckTracker.lastCandidateId; }
-	get lastConfirmedReceiptCandidateId(): string | null { return this.serverAckTracker.lastConfirmedCandidateId; }
-	get candidatePersistenceHealthy(): boolean | null {
-		if (!this._serverAckScope && !this._serverAckPersistenceUnavailable) return null;
-		if (this._serverAckPersistenceUnavailable) return false;
-		return this.serverAckTracker.candidatePersistenceHealthy;
+	getServerReceiptSnapshot(): VaultSyncReceiptSnapshot {
+		const trackerState = this.serverAckTracker.getState();
+		const persistenceUnavailable = this._serverAckPersistenceUnavailable;
+		return {
+			...trackerState,
+			candidatePersistenceHealthy:
+				!this._serverAckScope && !persistenceUnavailable
+					? null
+					: persistenceUnavailable
+						? false
+						: trackerState.candidatePersistenceHealthy,
+			candidatePersistenceFailureCount:
+				trackerState.candidatePersistenceFailureCount + (persistenceUnavailable ? 1 : 0),
+			persistenceUnavailable,
+			serverReceiptStartupValidation: this._serverReceiptStartupValidation,
+			candidateId: this.serverAckTracker.lastCandidateId,
+			lastConfirmedCandidateId: this.serverAckTracker.lastConfirmedCandidateId,
+		};
 	}
-	get candidatePersistenceFailureCount(): number {
-		return this.serverAckTracker.candidatePersistenceFailureCount + (this._serverAckPersistenceUnavailable ? 1 : 0);
-	}
-	get hasUnconfirmedServerReceiptCandidate(): boolean { return this.serverAckTracker.hasUnconfirmedCandidate; }
-	get serverReceiptCandidateCapturedAt(): number | null { return this.serverAckTracker.candidateCapturedAt; }
-	get serverPersistenceDegraded(): boolean { return this.serverAckTracker.serverPersistenceDegraded; }
-	get receiptGuaranteeIsDurable(): boolean { return this.serverAckTracker.receiptGuaranteeIsDurable; }
 
 	async flushReceiptPersistence(): Promise<void> {
 		await this.serverAckTracker.flushReceiptPersistence();
 	}
-	get serverReceiptStartupValidation(): ServerReceiptStartupValidation { return this._serverReceiptStartupValidation; }
+
 	get svEchoCounters(): SvEchoCounters { return { ...this._svEchoCounters }; }
 
 	async clearLocalServerReceiptState(): Promise<"cleared_persistent" | "cleared_memory_only" | "failed"> {

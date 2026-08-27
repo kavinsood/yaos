@@ -1,36 +1,18 @@
 /**
- * Baseline Advancement Policy — decides when to advance, defer, or clear
- * the disk-index contentHash baseline.
- *
- * This is a pure function with no I/O, no async, no side effects.
- * The controller computes hashes, calls this policy, then executes the result.
- *
- * Design:
- *   - "advance" means write a specific hash as the new settled baseline
- *   - "defer" means do not change the hash (stat-only update acceptable)
- *   - "clear" means explicitly delete the hash (reserved for future use)
+ * Pure policy for selecting the disk-index contentHash after a completed
+ * reconciliation action.
  */
 
-/**
- * Action kinds that lead to baseline decisions.
- * These map to specific reconciliation or live-sync outcomes.
- */
+/** Reconciliation outcomes that establish a settled content baseline. */
 export type BaselineActionKind =
-	// Reconcile phase actions
-	| "crdt-created-on-disk"       // CRDT file written to new disk location
-	| "disk-seeded-to-crdt"        // Disk file seeded into CRDT for first time
-	| "import-disk-to-crdt"        // Disk wins clean (crdt was at baseline)
-	| "conflict-disk-wins"         // Conflict artifact created, disk winner
-	| "conflict-crdt-wins"         // Conflict artifact created, crdt winner
-	| "apply-remote-to-disk"       // CRDT changed, disk unchanged, flushed
-	| "no-op"                      // Disk == CRDT, settle the common content
-	| "defer-to-crdt-flush"        // Open/bound/non-authoritative, flushed
-	// Live-sync actions (future use)
-	| "live-disk-to-crdt"          // External edit imported
-	| "live-stat-only"             // Policy-never/quarantine/frontmatter block
-	// Error/safety actions
-	| "conflict-artifact-failed"   // Artifact creation threw
-	| "safety-brake";              // Safety brake blocked writes
+	| "crdt-created-on-disk"
+	| "disk-seeded-to-crdt"
+	| "import-disk-to-crdt"
+	| "conflict-disk-wins"
+	| "conflict-crdt-wins"
+	| "apply-remote-to-disk"
+	| "no-op"
+	| "defer-to-crdt-flush";
 
 /**
  * Input to the baseline advancement decision.
@@ -43,25 +25,19 @@ export interface BaselineAdvancementInput {
 	readonly diskHash: string | null;
 	/** SHA-256 of CRDT content at decision time. Null if CRDT not available. */
 	readonly crdtHash: string | null;
-	/** Previously persisted baseline. Null if first run or cleared. */
-	readonly previousBaselineHash: string | null;
 }
 
-/**
- * What the controller should do to the disk-index contentHash.
- */
-export type BaselineAdvanceAction =
-	| { readonly kind: "advance"; readonly hash: string; readonly reason: string }
-	| { readonly kind: "defer"; readonly reason: string }
-	| { readonly kind: "clear"; readonly reason: string };
+/** The hash the controller should persist as the settled baseline. */
+export type BaselineAdvanceAction = {
+	readonly kind: "advance";
+	readonly hash: string;
+	readonly reason: string;
+};
 
 /**
- * Decide whether to advance, defer, or clear the baseline hash.
+ * Select the settled baseline hash for a completed reconciliation action.
  *
- * Pure function: no I/O, no async, no side effects.
- *
- * Invariant: never returns "advance" with a missing hash. If the required
- * hash is null, throws an error (caller bug — should have computed hash).
+ * Throws if the caller omitted the hash required by that action.
  */
 export function planBaselineAdvancement(
 	input: BaselineAdvancementInput,
@@ -120,23 +96,6 @@ export function planBaselineAdvancement(
 				throw new Error("planBaselineAdvancement: conflict-disk-wins requires diskHash");
 			}
 			return { kind: "advance", hash: diskHash, reason: "conflict-resolved-disk-wins" };
-
-		// --- Live-sync ---
-		case "live-disk-to-crdt":
-			if (diskHash === null) {
-				throw new Error("planBaselineAdvancement: live-disk-to-crdt requires diskHash");
-			}
-			return { kind: "advance", hash: diskHash, reason: "external-edit-imported" };
-
-		case "live-stat-only":
-			return { kind: "defer", reason: "stat-only-no-content" };
-
-		// --- Error/safety ---
-		case "conflict-artifact-failed":
-			return { kind: "defer", reason: "artifact-creation-failed" };
-
-		case "safety-brake":
-			return { kind: "defer", reason: "safety-brake-blocked" };
 
 		default: {
 			// Exhaustiveness check

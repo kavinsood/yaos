@@ -40,8 +40,8 @@ export function canonicalizeVaultPath(input: string): CanonicalPath {
 	const cleaned = input
 		.replace(/\\/g, "/")
 		.replace(/\/{2,}/g, "/")
-		.replace(/^(\.\/)+/, "")
-		.replace(/^\/+/, "");
+		.replace(/^\/+/, "")
+		.replace(/^(\.\/)+/, "");
 
 	const normalizedPath = cleaned.normalize("NFC");
 

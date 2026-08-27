@@ -9,6 +9,7 @@
 import { type App, TFile, normalizePath } from "obsidian";
 import { mapWithConcurrency } from "@shared/concurrency";
 import { fnv1a32, toHex8 } from "../utils/fnv1a";
+import { sha256TextHex } from "../utils/sha256";
 
 const DEFAULT_STAT_CONCURRENCY = 16;
 
@@ -44,15 +45,11 @@ export function contentFingerprint(text: string): string {
  * YAOS to decide "disk unchanged" and overwrite a local edit without conflict
  * preservation, resulting in silent data loss.
  *
- * Implementation: Web Crypto API (`window.crypto.subtle`).
- * This is the same path used by blobSync, diskMirror.fingerprintContent, and
- * indexedDbCandidateStore.sha256Hex — proven to work on iOS, Android, and desktop.
- * Does NOT use Node's `crypto` module, which is unavailable in mobile WebViews.
+ * Implementation: shared Web Crypto utility, which works on iOS, Android, and
+ * desktop without Node's unavailable `crypto` module.
  */
-export async function contentBaselineHash(content: string): Promise<string> {
-	const bytes = new TextEncoder().encode(content);
-	const digest = await window.crypto.subtle.digest("SHA-256", bytes);
-	return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+export function contentBaselineHash(content: string): Promise<string> {
+	return sha256TextHex(content);
 }
 
 export interface DiskIndexEntry {

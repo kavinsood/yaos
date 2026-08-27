@@ -1,14 +1,7 @@
-/** Paths that are always excluded, regardless of user settings. */
-function normalizePrefix(path: string): string {
-	return path
-		.replace(/\\/g, "/")
-		.replace(/\/{2,}/g, "/")
-		.replace(/^\.\//, "")
-		.replace(/^\/+/, "");
-}
+import { canonicalizeVaultPath } from "../paths/canonicalPath";
 
 function alwaysExcludedPrefixes(configDir: string): string[] {
-	const normalizedConfigDir = normalizePrefix(configDir).replace(/\/$/, "");
+	const normalizedConfigDir = canonicalizeVaultPath(configDir).normalizedPath.replace(/\/$/, "");
 	return [
 		`${normalizedConfigDir}/`,
 		".trash/",
@@ -26,12 +19,12 @@ function alwaysExcludedPrefixes(configDir: string): string[] {
  * @returns true if the path matches any exclude pattern
  */
 export function isExcluded(path: string, patterns: string[], configDir: string): boolean {
-	const normalizedPath = normalizePrefix(path);
+	const normalizedPath = canonicalizeVaultPath(path).normalizedPath;
 	for (const prefix of alwaysExcludedPrefixes(configDir)) {
 		if (normalizedPath.startsWith(prefix)) return true;
 	}
 	for (const prefix of patterns) {
-		if (normalizedPath.startsWith(normalizePrefix(prefix))) return true;
+		if (normalizedPath.startsWith(canonicalizeVaultPath(prefix).normalizedPath)) return true;
 	}
 	return false;
 }

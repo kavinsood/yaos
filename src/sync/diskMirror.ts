@@ -1,4 +1,4 @@
-import { type App, arrayBufferToHex, MarkdownView, TFile, normalizePath } from "obsidian";
+import { type App, MarkdownView, TFile, normalizePath } from "obsidian";
 import * as Y from "yjs";
 import type { VaultSync } from "./vaultSync";
 import type { EditorBindingManager } from "./editorBinding";
@@ -13,6 +13,7 @@ import {
 import { isLocalOrigin } from "./origins";
 import { contentBaselineHash } from "./diskIndex";
 import { PreservedUnresolvedRegistry, type PreservedUnresolvedEntry, type PreservedUnresolvedReason } from "./preservedUnresolved";
+import { sha256BytesHex } from "../utils/sha256";
 export { isLocalOrigin };
 
 /**
@@ -1399,10 +1400,10 @@ export class DiskMirror {
 
 	private async fingerprintContent(content: string): Promise<{ bytes: number; hash: string }> {
 		const bytes = new TextEncoder().encode(content);
-		const digest = await crypto.subtle.digest("SHA-256", bytes);
+		const hash = await sha256BytesHex(bytes);
 		return {
 			bytes: bytes.length,
-			hash: arrayBufferToHex(digest),
+			hash,
 		};
 	}
 

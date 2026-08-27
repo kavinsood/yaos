@@ -18,8 +18,6 @@
 // state, but the masking is incidental. The contract is that local repair
 // origins are classified as local at the predicate level.
 
-import { readFileSync, readdirSync, statSync } from "node:fs";
-import { resolve, join } from "node:path";
 import {
 	isLocalOrigin,
 	isLocalStringOrigin,
@@ -31,9 +29,7 @@ import {
 	ORIGIN_SEED,
 	ORIGIN_RESTORE,
 } from "../../src/sync/origins";
-import { repoRoot, suite } from "../harness.ts";
-
-const ROOT = repoRoot();
+import { suite } from "../harness.ts";
 
 const s = suite("disk-mirror-origin-classification");
 
@@ -114,50 +110,4 @@ for (const origin of callSiteOrigins) {
 	);
 }
 
-s.section("Test 6: no raw string literals as applyDiffToYText origin in src/ (FU-3)");
-// Every applyDiffToYText call site in production code must use a named constant
-// from src/sync/origins.ts, never a raw string literal. A raw string would
-// bypass the registration requirement and silently create an unregistered
-// local-repair origin that the diskMirror observer might classify incorrectly.
-//
-// Pattern matched: applyDiffToYText(…, …, …, "some-string")
-// Constants are identifiers, not string literals — this regex only fires on raw strings.
-{
-	function collectTsFiles(dir: string): string[] {
-		const result: string[] = [];
-		for (const entry of readdirSync(dir)) {
-			const full = join(dir, entry);
-			if (statSync(full).isDirectory()) {
-				if (entry === "node_modules") continue;
-				result.push(...collectTsFiles(full));
-			} else if (entry.endsWith(".ts") && !entry.endsWith(".d.ts")) {
-				result.push(full);
-			}
-		}
-		return result;
-	}
-
-	// This regex catches direct string literals as the final argument before ')'.
-	// It will NOT catch: const origin = "raw"; applyDiffToYText(..., origin)
-	// or aliased function calls. It is a belt, not suspenders. Type-level
-	// enforcement (YaosLocalOrigin union type on the origin parameter) would be
-	// the suspenders — tracked separately.
-	const RAW_ORIGIN_RE = /applyDiffToYText\s*\([^)]*?,\s*"([^"\\]+)"\s*\)/g;
-	const srcDir = resolve(ROOT, "src");
-	const violations: Array<{ file: string; origin: string }> = [];
-
-	for (const file of collectTsFiles(srcDir)) {
-		const source = readFileSync(file, "utf8");
-		let m: RegExpExecArray | null;
-		while ((m = RAW_ORIGIN_RE.exec(source)) !== null) {
-			// Group 1 is mandatory in RAW_ORIGIN_RE, so a match always carries it.
-			violations.push({ file: file.replace(ROOT + "/", ""), origin: m[1]! });
-		}
-	}
-
-	s.check(
-		violations.length === 0,
-		`no raw string literals as applyDiffToYText origin in src/ (${violations.length === 0 ? "clean" : violations.map((v) => `"${v.origin}" in ${v.file}`).join(", ")})`,
-	);
-}
 await s.done();

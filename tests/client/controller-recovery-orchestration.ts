@@ -13,10 +13,8 @@
  *   - ORIGIN_DISK_SYNC_RECOVER_BOUND is in LOCAL_STRING_ORIGIN_SET (the
  *     guard that makes round-trip suppression work)
  *
- * Plus targeted source-grep regressions on src/sync/editorBinding.ts
- * verifying that the real EditorBindingManager emits editor.repair.applied
- * from applyBinding() (action==="repair") and editor.heal.applied from
- * heal() after applyDiffToYText.
+ * Runtime assertions exercise the production controller and binding behavior;
+ * this suite deliberately does not inspect production source text.
  */
 
 import { MarkdownView, TFile } from "obsidian";
@@ -34,7 +32,7 @@ import {
 	isLocalStringOrigin,
 	LOCAL_REPAIR_ORIGINS,
 } from "../../src/sync/origins";
-import { readSource, suite } from "../harness.ts";
+import { suite } from "../harness.ts";
 
 const s = suite("controller-recovery-orchestration");
 
@@ -290,7 +288,7 @@ function buildFixture(initial: {
 
 s.section("Test 0: flight taxonomy bumped and new kinds present");
 {
-	assertEq(FLIGHT_TAXONOMY_VERSION, 12, "FLIGHT_TAXONOMY_VERSION === 12");
+	assertEq(FLIGHT_TAXONOMY_VERSION, 13, "FLIGHT_TAXONOMY_VERSION === 13");
 	assertEq(FLIGHT_KIND.recoverySkipped, "recovery.skipped", "FLIGHT_KIND.recoverySkipped");
 	assertEq(FLIGHT_KIND.editorRepairApplied, "editor.repair.applied", "FLIGHT_KIND.editorRepairApplied");
 	assertEq(FLIGHT_KIND.editorHealApplied, "editor.heal.applied", "FLIGHT_KIND.editorHealApplied");
@@ -637,129 +635,4 @@ s.section("Test 7: bound recovery does not round-trip as disk.write");
 	assertEq(writeFailed, undefined, "no disk.write.failed for recovery write");
 }
 
-// -------------------------------------------------------------------
-// Test 8 — source-grep regressions on src/sync/editorBinding.ts
-// -------------------------------------------------------------------
-
-s.section("Test 8: source-grep regressions on EditorBindingManager emit sites");
-{
-	const src = readSource("src/sync/editorBinding.ts");
-
-	// Constructor accepts the optional flight callback.
-	s.check(
-		src.includes("private recordFlightPathEvent?: (event: ProductFlightPathEventInput) => void"),
-		"constructor accepts optional recordFlightPathEvent callback",
-	);
-	s.check(
-		src.includes('import type { ProductFlightPathEventInput } from "../observability/traceSink"'),
-		"ProductFlightPathEventInput imported from observability",
-	);
-
-	// applyBinding emits editor.repair.applied for action==="repair" only.
-	const applyBindingIdx = src.indexOf(
-		"private applyBinding(",
-	);
-	s.check(applyBindingIdx > 0, "applyBinding method present");
-	const applyBindingTail = src.slice(applyBindingIdx, applyBindingIdx + 4500);
-	s.check(
-		applyBindingTail.includes("PRODUCT_EVENT_KIND.editorRepairApplied"),
-		"applyBinding emits PRODUCT_EVENT_KIND.editorRepairApplied",
-	);
-	s.check(
-		applyBindingTail.includes('if (action === "repair")'),
-		"applyBinding gates emission on action===\"repair\"",
-	);
-
-	// heal() emits editor.heal.applied on every successful entry that
-	// resolves a binding target (not gated on the diff branch). Carries
-	// diffApplied: boolean so absence of the event proves heal() was not
-	// invoked.
-	const healIdx = src.indexOf(
-		"heal(view: MarkdownView, deviceName: string, reason: string): boolean {",
-	);
-	s.check(healIdx > 0, "heal method present");
-	const healBody = src.slice(healIdx, healIdx + 2500);
-	const applyDiffIdx = healBody.indexOf("applyDiffToYText(target.ytext, crdtContent, currentContent, ORIGIN_EDITOR_HEALTH_HEAL)");
-	const healEmitIdx = healBody.indexOf("PRODUCT_EVENT_KIND.editorHealApplied");
-	s.check(applyDiffIdx > 0, "heal() calls applyDiffToYText with ORIGIN_EDITOR_HEALTH_HEAL");
-	s.check(healEmitIdx > 0, "heal() emits PRODUCT_EVENT_KIND.editorHealApplied");
-	s.check(
-		healEmitIdx > applyDiffIdx,
-		"PRODUCT_EVENT_KIND.editorHealApplied emit follows applyDiffToYText",
-	);
-	// editor.heal.applied is NOT gated on the diff branch — the emit must
-	// be after the if (diffApplied) block, not inside it. We assert this by
-	// checking that the emit index is past the closing brace of the diff
-	// branch. The diff branch is short (just the log + applyDiffToYText) so
-	// we can detect it textually.
-	s.check(
-		healBody.includes("const diffApplied = crdtContent !== currentContent"),
-		"heal() computes diffApplied flag",
-	);
-	s.check(
-		healBody.includes("diffApplied,"),
-		"heal() emit data carries diffApplied flag",
-	);
-	const ifBranchIdx = healBody.indexOf("if (diffApplied) {");
-	s.check(ifBranchIdx > 0, "heal() has if(diffApplied) block");
-	// The emit must NOT be inside the if(diffApplied) block. Find the
-	// closing brace of that block by walking braces.
-	let depth = 0;
-	let closeIdx = -1;
-	for (let i = ifBranchIdx + "if (diffApplied) {".length - 1; i < healBody.length; i++) {
-		const ch = healBody[i];
-		if (ch === "{") depth++;
-		else if (ch === "}") {
-			depth--;
-			if (depth === 0) { closeIdx = i; break; }
-		}
-	}
-	s.check(closeIdx > 0, "heal() if(diffApplied) block closing brace found");
-	s.check(
-		healEmitIdx > closeIdx,
-		"PRODUCT_EVENT_KIND.editorHealApplied emit is OUTSIDE if(diffApplied) block (fires on every successful entry)",
-	);
-}
-
-// -------------------------------------------------------------------
-// Test 9 — production code has no new heal() callers
-// -------------------------------------------------------------------
-
-s.section("Test 9: heal() retains zero production callers");
-{
-	const bindingSrc = readSource("src/sync/editorBinding.ts");
-
-	// Grep production sources outside editorBinding.ts itself for `.heal(`.
-	const productionFiles = [
-		"src/main.ts",
-		"src/runtime/reconciliationController.ts",
-		"src/runtime/editorWorkspaceOrchestrator.ts",
-		"src/sync/diskMirror.ts",
-	];
-
-	for (const rel of productionFiles) {
-		try {
-			const text = readSource(rel);
-			// editorBindings.heal( or .heal( on something resembling a manager.
-			// Allow editorBindings?.heal? in trace strings, but not as a call.
-			const callMatches = text.match(/editorBindings(?:\??\s*\.\s*|\s*\.\s*)heal\s*\(/g);
-			assertEq(
-				callMatches,
-				null,
-				`no editorBindings.heal( call in ${rel}`,
-			);
-		} catch (err) {
-			// File missing is fine for editorWorkspaceOrchestrator.ts in
-			// older revisions.
-			void err;
-		}
-	}
-
-	// And inside editorBinding.ts itself, heal() should still call repair()
-	// and not be invoked by validateOpenBindings, bind, or maybeHealBinding.
-	s.check(
-		!bindingSrc.match(/this\.heal\s*\(/),
-		"no this.heal( call inside editorBinding.ts (repair flows do not invoke heal)",
-	);
-}
 await s.done();

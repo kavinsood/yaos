@@ -6,8 +6,8 @@
  * origin MUST import constants from here — raw string literals at call sites
  * are a regression risk.
  *
- * ORIGIN_SEED: src/types.ts re-exports this from here (legacy import path).
- * ORIGIN_RESTORE: src/sync/snapshotClient.ts imports from here (duplicate removed).
+ * Snapshot restore and all local-repair call sites import their origins from
+ * this module.
  */
 
 export const ORIGIN_SEED = "vault-crdt-seed" as const;

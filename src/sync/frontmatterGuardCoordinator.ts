@@ -14,7 +14,7 @@
  * and load/unload can continue to manage it centrally.
  */
 
-import { Notice, arrayBufferToHex } from "obsidian";
+import { Notice } from "obsidian";
 import {
 	isFrontmatterBlocked,
 	validateFrontmatterTransition,
@@ -26,6 +26,7 @@ import {
 	clearFrontmatterQuarantinePath,
 	type FrontmatterQuarantineEntry,
 } from "./frontmatterQuarantine";
+import { sha256TextHex } from "../utils/sha256";
 
 // ---------------------------------------------------------------------------
 // Host interface
@@ -240,8 +241,6 @@ export class FrontmatterGuardCoordinator {
 		if (content == null) return undefined;
 		const block = extractFrontmatter(content);
 		if (block.kind !== "present") return undefined;
-		const data = new TextEncoder().encode(block.frontmatterText);
-		const digest = await crypto.subtle.digest("SHA-256", data);
-		return arrayBufferToHex(digest);
+		return sha256TextHex(block.frontmatterText);
 	}
 }

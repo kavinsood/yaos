@@ -12,7 +12,8 @@ import {
 	makeSvEchoMessage,
 } from "../../src/sync/svEchoMessage";
 import { ServerAckTracker } from "../../src/sync/serverAckTracker";
-import { InMemoryCandidateStore, type ScopeKey, type ScopeMetadata } from "../../src/sync/candidateStore";
+import type { ScopeKey, ScopeMetadata } from "../../src/sync/candidateStore";
+import { InMemoryCandidateStore } from "./helpers/inMemoryCandidateStore";
 import { suite } from "../harness.ts";
 
 const s = suite("sv-echo-client-receiver");

@@ -12,12 +12,13 @@ import {
 } from "obsidian";
 import { DiskMirror } from "../../src/sync/diskMirror";
 import { ServerAckTracker } from "../../src/sync/serverAckTracker";
-import { InMemoryCandidateStore, type ScopeKey, type ScopeMetadata } from "../../src/sync/candidateStore";
+import type { ScopeKey, ScopeMetadata } from "../../src/sync/candidateStore";
+import { InMemoryCandidateStore } from "./helpers/inMemoryCandidateStore";
 import type { VaultSync } from "../../src/sync/vaultSync";
 import type { EditorBindingManager } from "../../src/sync/editorBinding";
 import type { VaultSyncSettings } from "../../src/settings/settingsStore";
 import type { RuntimeConfig } from "../../src/runtime/runtimeConfig";
-import type { TraceEventDetails, TraceRecord } from "../../src/telemetry/debug/trace";
+import type { TraceEventDetails, TraceRecord } from "../../src/observability/traceContext";
 import { suite } from "../harness.ts";
 
 const s = suite("trace-event-behavior");

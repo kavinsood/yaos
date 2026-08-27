@@ -4,25 +4,6 @@
 
 import { isExcluded } from "./sync/exclude";
 
-// -------------------------------------------------------------------
-// Markdown CRDT types
-// -------------------------------------------------------------------
-
-/** Metadata stored per file ID in the CRDT meta map. */
-export interface FileMeta {
-	/** Vault-relative path (normalized). */
-	path: string;
-	/** v2 tombstone timestamp (ms since epoch). */
-	deletedAt?: number;
-	/** Legacy v1 soft-delete flag (kept for migration compatibility). */
-	deleted?: boolean;
-	/** Last-modified timestamp (ms since epoch). Informational only. */
-	mtime?: number;
-	/** Device that last modified this entry. */
-	device?: string;
-}
-
-// -------------------------------------------------------------------
 // Blob / attachment types
 // -------------------------------------------------------------------
 
@@ -65,17 +46,6 @@ export interface BlobTombstone {
 	device?: string;
 }
 
-// -------------------------------------------------------------------
-// Origins
-// -------------------------------------------------------------------
-
-/** Origin string used for Yjs transactions initiated by this plugin. */
-export const ORIGIN_LOCAL = "vault-crdt-local";
-// Canonical declaration lives in src/sync/origins.ts — re-exported here for
-// legacy importers. New code should import directly from origins.ts.
-export { ORIGIN_SEED } from "./sync/origins";
-
-// -------------------------------------------------------------------
 // File classification
 // -------------------------------------------------------------------
 
