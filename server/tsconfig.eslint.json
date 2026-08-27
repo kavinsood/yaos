@@ -4,5 +4,5 @@
 		"rootDir": ".",
 		"types": ["@cloudflare/workers-types", "node"]
 	},
-	"include": ["src/**/*.ts", "tests/**/*.ts", "bench-*.ts"]
+	"include": ["src/**/*.ts", "bench-*.ts"]
 }

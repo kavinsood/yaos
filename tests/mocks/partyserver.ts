@@ -33,7 +33,17 @@ export function getServerByName(_ns: unknown, _name: string): never {
 	);
 }
 
-/** Stub base class. Not instantiated in any tested path. */
+/** Runtime-sized base class for server tests; routing tests still trap namespace access above. */
 export class Server {
-	constructor() {}
+	readonly ctx: unknown;
+	readonly env: unknown;
+
+	constructor(ctx?: unknown, env?: unknown) {
+		this.ctx = ctx;
+		this.env = env;
+	}
+
+	getConnections(): Iterable<never> {
+		return [];
+	}
 }

@@ -1,9 +1,9 @@
 // Guard for the test-discovery contract.
 //
-// The regression runner discovers suites by convention — every `*.{ts,mjs}`
-// file in tests/client/, tests/server/, tests/contracts/ or tests/live/ —
-// instead of reading a hand-maintained array. That only stays trustworthy if
-// two invariants hold, and both are checked here:
+// The regression runner discovers suites by convention — every `*.ts` file in
+// tests/client/, tests/server/ or tests/contracts/ — instead of reading a
+// hand-maintained array. Live-worker discovery belongs to tests/live/run-live.ts.
+// That only stays trustworthy if two invariants hold, and both are checked here:
 //
 //   1. ACCOUNTABILITY — every discovery candidate is either a real suite (one
 //      that can actually fail) or named in tests/suites.json with a non-empty
@@ -60,10 +60,9 @@ s.section("Test 2: every candidate is accounted for");
 // coverage hole the hand-maintained array used to produce, just louder.
 //
 // All idioms in this repo are covered: the shared harness (`s.check(…)`,
-// `s.test(…)` from tests/harness.ts), raw `node:assert` calls, `throw new
-// Error`, and the delegating wrapper in snapshot-r2-runner.mjs
-// (`process.exit(result.status ?? 1)`). `process.exit(0)` and bare
-// `process.exit()` deliberately do NOT count — they cannot express failure.
+// `s.test(…)` from tests/harness.ts), raw `node:assert` calls, and `throw new
+// Error`. `process.exit(0)` and bare `process.exit()` deliberately do NOT count
+// — they cannot express failure.
 // A file that only calls `s.done()` does not count either: draining an empty
 // queue is exactly the green-and-empty suite this guard exists to catch.
 const CAN_FAIL = /\bs\.(?:check|test)\s*\(|\bassert\b[\w.]*\s*\(|\bthrow\s+new\s+\w*Error\b|process\.exit\(\s*(?!0\s*\)|\))/;

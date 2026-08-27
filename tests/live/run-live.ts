@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { sleep } from "../harness.ts";
@@ -14,14 +14,50 @@ const WRANGLER_BIN = resolve("server/node_modules/.bin/wrangler");
 // uses for the regression buckets, which keeps the two entry points on one
 // dialect.
 //
-// JITI_ALIAS is deliberately NOT mirrored from tests/run-suites.mjs. None of
-// its four entries applies to a live suite: they import only yjs,
-// y-partyserver/provider, ws and src/sync/schema.ts (which is Obsidian-free),
-// so the `obsidian` and `@shared` aliases would be dead; the `partyserver`
-// mock must never be substituted into a suite whose whole point is talking to
-// a real Worker; and "yjs" already resolves to the single root copy here
-// (verified — no "Yjs was already imported" warning from a child).
+// JITI_ALIAS is deliberately NOT mirrored from tests/run-suites.mjs. Live
+// suites may import shared test helpers and product constants, but none loads
+// Obsidian-dependent product modules or `@shared`; `partyserver` must never be
+// replaced by a mock when the suite is talking to a real Worker. "yjs" already
+// resolves to the single root copy here.
 const NODE_TS = ["--import", "jiti/register"];
+interface LiveCommand {
+	readonly file: string;
+	readonly args?: readonly string[];
+	readonly extraEnv?: Readonly<Record<string, string>>;
+}
+
+// This is the single accountability list for tests/live. Every suite appears
+// here and is executed below; the only non-suites are this driver and the
+// fatal-frame helper imported by provider-facing suites.
+const LIVE_COMMANDS: readonly LiveCommand[] = [
+	{ file: "schema-guard.ts" },
+	{ file: "provider-manual-connect.ts" },
+	{ file: "sync-client.ts", args: ["smoke.md", "\n\nhello from worker integration pass 1"] },
+	{ file: "sync-client.ts", args: ["smoke.md", "\n\nhello from worker integration pass 2"] },
+	{ file: "live-seed-check.ts", extraEnv: { YAOS_TEST_MODE: "seed", YAOS_TEST_EXACT_PATH_COUNT: "false" } },
+	{ file: "snapshots.ts" },
+	{ file: "hardening-worker.ts" },
+	{ file: "ws-ticket-reconnect.ts" },
+	{ file: "ws-admission-protocol.ts" },
+];
+const LIVE_NON_SUITES = ["fatalFrame.ts", "run-live.ts"] as const;
+
+function assertLiveAccountability(): void {
+	const actual = readdirSync(new URL(".", import.meta.url))
+		.filter((name) => name.endsWith(".ts"))
+		.sort();
+	const accounted = [
+		...LIVE_COMMANDS.map(({ file }) => file),
+		...LIVE_NON_SUITES,
+	].filter((name, index, names) => names.indexOf(name) === index).sort();
+	if (actual.length !== accounted.length || actual.some((name, index) => name !== accounted[index])) {
+		const unaccounted = actual.filter((name) => !accounted.includes(name));
+		const missing = accounted.filter((name) => !actual.includes(name));
+		throw new Error(
+			`tests/live accountability mismatch; unaccounted=[${unaccounted.join(", ")}], missing=[${missing.join(", ")}]`,
+		);
+	}
+}
 
 async function waitForWorker(): Promise<void> {
 	const deadline = Date.now() + 15_000;
@@ -129,6 +165,7 @@ async function resolveAuthToken(defaultEnvToken: string): Promise<string> {
 }
 
 async function main() {
+	assertLiveAccountability();
 	const persistDir = mkdtempSync(join(tmpdir(), "yaos-wrangler-"));
 	const envToken = randomBytes(32).toString("hex");
 	const wrangler = spawn(
@@ -155,9 +192,9 @@ async function main() {
 			stdio: ["ignore", "pipe", "pipe"],
 			env: {
 				...process.env,
-			CLOUDFLARE_INCLUDE_PROCESS_ENV: "true",
-			CLOUDFLARE_LOAD_DEV_VARS_FROM_DOT_ENV: "false",
-			SYNC_TOKEN: envToken,
+				CLOUDFLARE_INCLUDE_PROCESS_ENV: "true",
+				CLOUDFLARE_LOAD_DEV_VARS_FROM_DOT_ENV: "false",
+				SYNC_TOKEN: envToken,
 			},
 		},
 	);
@@ -181,42 +218,18 @@ async function main() {
 	try {
 		await waitForWorker();
 		const token = await resolveAuthToken(envToken);
-		await runCommand("node", [
-			...NODE_TS,
-			"tests/live/schema-guard.ts",
-		], token);
-		await runCommand("node", [
-			...NODE_TS,
-			"tests/live/provider-manual-connect.ts",
-		], token);
-		await runCommand("node", [
-			...NODE_TS,
-			"tests/live/sync-client.ts",
-			"smoke.md",
-			"\n\nhello from worker integration pass 1",
-		], token);
-		await runCommand("node", [
-			...NODE_TS,
-			"tests/live/sync-client.ts",
-			"smoke.md",
-			"\n\nhello from worker integration pass 2",
-		], token);
-		await runCommand("node", [
-			...NODE_TS,
-			"tests/live/snapshots.ts",
-		], token);
-		await runCommand("node", [
-			...NODE_TS,
-			"tests/live/hardening-worker.ts",
-		], token);
-		await runCommand("node", [
-			...NODE_TS,
-			"tests/live/ws-ticket-reconnect.ts",
-		], token);
-		await runCommand("node", [
-			...NODE_TS,
-			"tests/live/ws-admission-protocol.ts",
-		], token);
+		for (const command of LIVE_COMMANDS) {
+			await runCommand(
+				"node",
+				[
+					...NODE_TS,
+					`tests/live/${command.file}`,
+					...(command.args ?? []),
+				],
+				token,
+				command.extraEnv ? { ...command.extraEnv } : {},
+			);
+		}
 	} catch (err) {
 		if (output.trim()) {
 			console.error("\n[wrangler output]");

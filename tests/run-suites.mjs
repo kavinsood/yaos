@@ -3,19 +3,19 @@
 // executes them in sequence, reports pass/fail per suite, and exits non-zero
 // if any suite fails.
 //
-// DISCOVERY, NOT REGISTRATION. A suite is any `*.{ts,mjs}` file inside one of
-// the four suite buckets — tests/client/, tests/server/, tests/contracts/,
-// tests/live/ — that is not named in tests/suites.json. There is no list to
-// append to, because a list that developers must remember to append to loses
-// coverage — this runner replaced one that had silently orphaned two real unit
-// suites (458 + 364 LOC, 146 assertions) for however long nobody noticed.
+// DISCOVERY, NOT REGISTRATION. A regression suite is any `*.ts` file inside
+// tests/client/, tests/server/ or tests/contracts/ that is not named in
+// tests/suites.json. Live-worker suites are owned separately by
+// tests/live/run-live.ts because they require a running Worker.
+// There is no list to append to: this runner replaced one that had silently
+// orphaned two real unit suites (458 + 364 LOC, 146 assertions).
 //
 // The only hand-maintained data is tests/suites.json, and every entry in it
 // carries a reason string. tests/suite-discovery.ts enforces both halves of
 // that contract: no file may be silently unaccounted for, and no entry may
 // name a path that has since been deleted or renamed.
 //
-// ONE RUNNER FOR ALL. Every suite runs under `node --import jiti/register`.
+// ONE REGRESSION RUNNER. Every regression suite runs under `node --import jiti/register`.
 // ONE DIALECT FOR ALL. Suites are TypeScript, full stop. tests/run-suites.mjs
 // is the single plain-JS file in tests/ because it is the bootstrap that does
 // the spawning. The old .ts/.mjs split was generational rather than
@@ -104,10 +104,11 @@ const RUNNER = ["node", "--import", "jiti/register"];
 // rather than a copy of it that could drift.
 // -----------------------------------------------------------------------
 
-// The four suite buckets. Everything else under tests/ is infrastructure —
-// this runner, suites.json, harness.ts, mocks/, fixtures/ and manual/ — and is
-// not a discovery candidate at all, so it needs no excuse in suites.json.
-const BUCKETS = ["client", "server", "contracts", "live"];
+// The three regression buckets. Live-worker suites have their own accountable
+// driver in tests/live/run-live.ts. Everything else under tests/ is
+// infrastructure — this runner, suites.json, harness.ts, mocks/, fixtures/ and
+// manual/ — and is not a discovery candidate, so it needs no registry excuse.
+const BUCKETS = ["client", "server", "contracts"];
 
 // The suites that cannot live in a bucket: they guard this runner's own
 // discovery functions and the shared assertion harness every bucket suite

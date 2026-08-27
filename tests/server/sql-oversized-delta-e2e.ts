@@ -9,128 +9,8 @@ import { SqlDocStore } from "../../server/src/sqlDocStore";
 import { PersistenceCoordinator } from "../../server/src/persistenceCoordinator";
 import * as Y from "yjs";
 import { suite } from "../harness.ts";
+import { FakeDurableObjectStorage } from "../mocks/sqlStorage";
 
-// ── Fake SQLite storage (copied from tests/server/sql-doc-store.ts pattern) ─────────
-
-class FakeSqlCursor<T> {
-	constructor(private readonly rows: T[]) {}
-	toArray(): T[] { return this.rows; }
-	[Symbol.iterator](): Iterator<T> { return this.rows[Symbol.iterator](); }
-}
-
-class FakeSqlStorage {
-	private tables: Map<string, Array<Record<string, unknown>>> = new Map();
-	private autoIncrements: Map<string, number> = new Map();
-
-	exec<T = Record<string, unknown>>(query: string, ...bindings: unknown[]): FakeSqlCursor<T> {
-		const trimmed = query.trim().replace(/\s+/g, " ");
-
-		// CREATE TABLE IF NOT EXISTS
-		if (trimmed.startsWith("CREATE TABLE IF NOT EXISTS")) {
-			const table = trimmed.match(/CREATE TABLE IF NOT EXISTS (\w+)/)?.[1];
-			if (table !== undefined && !this.tables.has(table)) {
-				this.tables.set(table, []);
-				this.autoIncrements.set(table, 1);
-			}
-			return new FakeSqlCursor<T>([]);
-		}
-
-		// INSERT INTO snapshot_chunks
-		if (trimmed.startsWith("INSERT INTO snapshot_chunks")) {
-			const table = this.tables.get("snapshot_chunks")!;
-			const [chunkIndex, data] = bindings;
-			table.push({ chunk_index: chunkIndex, data });
-			return new FakeSqlCursor<T>([]);
-		}
-
-		// INSERT INTO journal
-		if (trimmed.startsWith("INSERT INTO journal")) {
-			const table = this.tables.get("journal")!;
-			const [data, byteLength] = bindings;
-			const id = this.autoIncrements.get("journal")!;
-			this.autoIncrements.set("journal", id + 1);
-
-			// Simulate SQLITE_TOOBIG for values >2MB
-			if (data instanceof ArrayBuffer && data.byteLength > 2 * 1024 * 1024) {
-				throw new Error("string or blob too big: SQLITE_TOOBIG");
-			}
-
-			table.push({ id, data, byte_length: byteLength, created_at: new Date().toISOString() });
-			return new FakeSqlCursor<T>([]);
-		}
-
-		// SELECT from snapshot_chunks
-		if (trimmed.startsWith("SELECT data FROM snapshot_chunks")) {
-			const table = this.tables.get("snapshot_chunks") ?? [];
-			const sorted = [...table].sort((a, b) => (a.chunk_index as number) - (b.chunk_index as number));
-			return new FakeSqlCursor<T>(sorted as T[]);
-		}
-
-		// COUNT/SUM from snapshot_chunks — loadState pre-sizes the contiguous
-		// snapshot buffer with this before streaming the rows.
-		if (trimmed.includes("COUNT(*)") && trimmed.includes("snapshot_chunks")) {
-			const table = this.tables.get("snapshot_chunks") ?? [];
-			const cnt = table.length;
-			const total = table.reduce(
-				(sum, row) => sum + (row.data instanceof ArrayBuffer ? row.data.byteLength : 0),
-				0,
-			);
-			return new FakeSqlCursor<T>([{ cnt, total } as T]);
-		}
-
-		// SELECT from journal
-		// coalesceJournal reads payloads only.
-		if (trimmed.startsWith("SELECT data FROM journal")) {
-			const table = this.tables.get("journal") ?? [];
-			const sorted = [...table].sort((a, b) => (a.id as number) - (b.id as number));
-			return new FakeSqlCursor<T>(sorted as T[]);
-		}
-
-		if (trimmed.startsWith("SELECT data, byte_length FROM journal")) {
-			const table = this.tables.get("journal") ?? [];
-			const sorted = [...table].sort((a, b) => (a.id as number) - (b.id as number));
-			return new FakeSqlCursor<T>(sorted as T[]);
-		}
-
-		// COUNT/SUM from journal
-		if (trimmed.includes("COUNT(*)") && trimmed.includes("journal")) {
-			const table = this.tables.get("journal") ?? [];
-			const cnt = table.length;
-			const total = table.reduce((sum, row) => sum + (row.byte_length as number), 0);
-			return new FakeSqlCursor<T>([{ cnt, total } as T]);
-		}
-
-		// DELETE FROM
-		if (trimmed.startsWith("DELETE FROM snapshot_chunks")) {
-			this.tables.set("snapshot_chunks", []);
-			return new FakeSqlCursor<T>([]);
-		}
-		if (trimmed.startsWith("DELETE FROM journal")) {
-			this.tables.set("journal", []);
-			this.autoIncrements.set("journal", 1);
-			return new FakeSqlCursor<T>([]);
-		}
-
-		throw new Error(`FakeSqlStorage: unhandled query: ${trimmed}`);
-	}
-
-	/** Expose raw journal table for assertions. */
-	getJournalRows(): Array<Record<string, unknown>> {
-		return this.tables.get("journal") ?? [];
-	}
-
-	/** Expose raw snapshot_chunks table for assertions. */
-	getSnapshotRows(): Array<Record<string, unknown>> {
-		return this.tables.get("snapshot_chunks") ?? [];
-	}
-}
-
-class FakeDurableObjectStorage {
-	sql = new FakeSqlStorage();
-	transactionSync<T>(closure: () => T): T {
-		return closure();
-	}
-}
 
 // ── Test helpers ─────────────────────────────────────────────────────────────
 
@@ -338,5 +218,46 @@ s.section("Test 5: small delta after oversized checkpoint → journal append");
 	);
 
 	doc.destroy();
+}
+// ── Test 6: failed multi-chunk checkpoint rolls back atomically ──────────────
+
+s.section("Test 6: checkpoint write-threshold failure preserves prior SQL state");
+{
+	const storage = new FakeDurableObjectStorage();
+	const store = new SqlDocStore(storage);
+	const oldDoc = new Y.Doc();
+	const oldText = oldDoc.getText("content");
+	oldText.insert(0, "checkpoint before failure");
+	store.rewriteCheckpoint(Y.encodeStateAsUpdate(oldDoc));
+	const oldStateVector = Y.encodeStateVector(oldDoc);
+	oldText.insert(oldText.length, " plus durable journal");
+	store.appendUpdate(Y.encodeStateAsUpdate(oldDoc, oldStateVector));
+
+	storage.sql.resetBytesWritten();
+	storage.sql.failWritesAfterBytes = 1024 * 1024;
+	const replacement = new Y.Doc();
+	replacement.getText("content").insert(0, "N".repeat(1_200_000));
+	let failure: unknown = null;
+	try {
+		store.rewriteCheckpoint(Y.encodeStateAsUpdate(replacement));
+	} catch (error) {
+		failure = error;
+	}
+
+	s.check(failure instanceof Error && failure.message.includes("SIMULATED_STORAGE_FAILURE"), "second snapshot chunk crosses the write threshold");
+	s.check(storage.sql.writeFailures === 1, "fake SQL observed exactly one threshold write failure");
+	const persisted = new SqlDocStore(storage).loadState();
+	const reloaded = new Y.Doc();
+	if (persisted.snapshot) Y.applyUpdate(reloaded, persisted.snapshot);
+	for (const update of persisted.journalUpdates) Y.applyUpdate(reloaded, update);
+	s.check(
+		reloaded.getText("content").toString() === "checkpoint before failure plus durable journal",
+		"transaction rollback preserves the old checkpoint and journal",
+	);
+	s.check(persisted.journalStats.entryCount === 1, "rolled-back checkpoint delete did not erase the prior journal");
+
+	oldDoc.destroy();
+	replacement.destroy();
+	reloaded.destroy();
 }
 await s.done();

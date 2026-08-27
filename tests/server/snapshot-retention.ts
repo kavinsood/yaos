@@ -18,20 +18,29 @@
  * 11. Retention around month boundary
  * 12. R2 delete failure is surfaced in diagnostics (errors array)
  * 13. Snapshot restore still works for snapshots created before new fields existed
- * 14. Snapshot listing excludes latest-index.json and sorts correctly
+ * 14. roughWeekKey remains valid at calendar boundaries
+ * 15. Snapshot listing excludes latest-index.json, counts immutable indexes, sorts, and limits honestly
  */
 
+import { createRequire } from "node:module";
+import type { Miniflare as MiniflareClass } from "../../server/node_modules/miniflare";
 import * as Y from "yjs";
 import {
+	createSnapshot,
 	selectRetention,
 	computeFullUpdateHash,
 	computeStructureHash,
 	computeStateVectorHash,
 	DEFAULT_RETENTION,
+	getLatestSnapshotIndex,
+	listSnapshots,
 	roughWeekKey,
+	snapshotPrefix,
+	verifySnapshotExists,
 	type SnapshotIndex,
 	type RetentionPolicy,
 } from "../../server/src/snapshot";
+import { FakeR2Bucket } from "../mocks/workerEnv.ts";
 import { suite } from "../harness.ts";
 
 // -------------------------------------------------------------------
@@ -39,6 +48,32 @@ import { suite } from "../harness.ts";
 // -------------------------------------------------------------------
 
 const s = suite("snapshot-retention");
+const requireFromServer = createRequire(new URL("../../server/package.json", import.meta.url));
+const { Miniflare } = requireFromServer("miniflare") as { Miniflare: typeof MiniflareClass };
+const miniflareInstances: Array<{ dispose(): Promise<void> }> = [];
+
+async function makeR2Bucket(): Promise<R2Bucket> {
+	const miniflare = new Miniflare({
+		modules: true,
+		script: "export default { fetch() { return new Response('ok'); } }",
+		r2Buckets: ["BUCKET"],
+	});
+	miniflareInstances.push(miniflare);
+	// @ts-expect-error Miniflare and @cloudflare/workers-types publish equivalent
+	// R2 runtime objects from separate declaration versions.
+	return await miniflare.getR2Bucket("BUCKET");
+}
+
+function makeR2Doc(content: string): Y.Doc {
+	const doc = new Y.Doc();
+	doc.transact(() => {
+		const text = new Y.Text();
+		text.insert(0, content);
+		doc.getMap("idToText").set("file1", text);
+		doc.getMap<string>("pathToId").set("notes/test.md", "file1");
+	});
+	return doc;
+}
 
 function assertEqual(actual: unknown, expected: unknown, msg: string): void {
 	const equal = actual === expected;
@@ -142,11 +177,11 @@ async function test2_contentEditChangesFullUpdateHash(): Promise<void> {
 }
 
 // -------------------------------------------------------------------
-// TEST 3: Manual snapshot after content edit — structureHash unchanged is NOT misleading
+// TEST 3: structureHash remains scoped to structure after a content edit
 // -------------------------------------------------------------------
 
-async function test3_manualSnapshotStructureUnchangedHonest(): Promise<void> {
-	console.log("\n--- Test 3: structureUnchanged is honest about what it means ---");
+async function test3_structureHashScope(): Promise<void> {
+	console.log("\n--- Test 3: structureHash does not claim to represent content ---");
 
 	const doc = new Y.Doc();
 	doc.transact(() => {
@@ -227,10 +262,107 @@ async function test5_legacySnapshotNotPruned(): Promise<void> {
 }
 
 // -------------------------------------------------------------------
-// TEST 6 & 7: Write ordering + Poisoned pointer
-// These are tested with real R2 in server/tests/snapshot-r2.ts.
-// See: test1_writeOrdering, test2_poisonedPointer
+// TEST 6: Real-Miniflare write ordering
 // -------------------------------------------------------------------
+
+async function test6_realR2WriteOrdering(): Promise<void> {
+	console.log("\n--- Test 6: payload and index exist before the latest pointer is published ---");
+	const bucket = await makeR2Bucket();
+	const completedWrites: string[] = [];
+	const observedBucket = new Proxy(bucket, {
+		get(target, property) {
+			const value = Reflect.get(target, property);
+			if (property === "put") {
+				return async (...args: unknown[]) => {
+					const result = await Reflect.apply(target.put, target, args);
+					completedWrites.push(String(args[0]));
+					return result;
+				};
+			}
+			return typeof value === "function" ? value.bind(target) : value;
+		},
+	});
+	const doc = makeR2Doc("Write ordering test");
+	const vaultId = "test-vault-ordering";
+
+	const index = await createSnapshot(doc, vaultId, observedBucket, {
+		reason: "daily",
+		pinned: false,
+	});
+	const prefix = snapshotPrefix(vaultId, index.day, index.snapshotId);
+	const payload = await bucket.head(`${prefix}/crdt.bin.gz`);
+	const indexObject = await bucket.head(`${prefix}/index.json`);
+	const pointerObject = await bucket.get(`v1/${vaultId}/snapshots/latest-index.json`);
+	const payloadKey = `${prefix}/crdt.bin.gz`;
+	const indexKey = `${prefix}/index.json`;
+	const pointerKey = `v1/${vaultId}/snapshots/latest-index.json`;
+
+	s.check(payload !== null, "real R2 contains the payload when createSnapshot returns");
+	s.check(indexObject !== null, "real R2 contains the immutable index when createSnapshot returns");
+	s.check(pointerObject !== null, "real R2 contains the latest pointer only after the snapshot is complete");
+	const pointerWrite = completedWrites.indexOf(pointerKey);
+	s.check(
+		pointerWrite > completedWrites.indexOf(payloadKey)
+			&& pointerWrite > completedWrites.indexOf(indexKey),
+		`latest pointer completed after payload and index (${completedWrites.join(" -> ")})`,
+	);
+	if (pointerObject) {
+		const pointer = JSON.parse(await pointerObject.text()) as SnapshotIndex;
+		assertEqual(pointer.snapshotId, index.snapshotId, "latest pointer references the completed snapshot");
+	}
+	doc.destroy();
+}
+
+// -------------------------------------------------------------------
+// TEST 7: Real-Miniflare poisoned pointer recovery
+// -------------------------------------------------------------------
+
+async function test7_realR2PoisonedPointer(): Promise<void> {
+	console.log("\n--- Test 7: poisoned latest pointer never suppresses a replacement snapshot ---");
+	const bucket = await makeR2Bucket();
+	const vaultId = "test-vault-poisoned";
+	const doc = makeR2Doc("Poisoned pointer test");
+	const rawUpdate = Y.encodeStateAsUpdate(doc);
+	const currentHash = await computeFullUpdateHash(doc);
+	const poisoned: SnapshotIndex = {
+		snapshotId: "missing-snapshot",
+		vaultId,
+		createdAt: "2026-05-27T00:00:00Z",
+		day: "2026-05-27",
+		schemaVersion: 1,
+		markdownFileCount: 1,
+		blobFileCount: 0,
+		crdtSizeBytes: 500,
+		crdtRawSizeBytes: 1000,
+		referencedBlobHashes: [],
+		fullUpdateHash: currentHash,
+		reason: "daily",
+		pinned: false,
+	};
+	await bucket.put(
+		`v1/${vaultId}/snapshots/latest-index.json`,
+		JSON.stringify(poisoned),
+		{ httpMetadata: { contentType: "application/json" } },
+	);
+
+	const latest = await getLatestSnapshotIndex(vaultId, bucket);
+	s.check(latest?.fullUpdateHash === currentHash, "poisoned pointer has the same hash as the live document");
+	s.check(
+		latest !== null && await verifySnapshotExists(vaultId, latest, bucket) === false,
+		"real R2 verification detects the pointer's missing payload",
+	);
+
+	const replacement = await createSnapshot(doc, vaultId, bucket, {
+		reason: "daily",
+		pinned: false,
+		precomputedRawUpdate: rawUpdate,
+		precomputedFullUpdateHash: currentHash,
+	});
+	s.check(await verifySnapshotExists(vaultId, replacement, bucket), "replacement snapshot has a real payload and index");
+	const repairedLatest = await getLatestSnapshotIndex(vaultId, bucket);
+	assertEqual(repairedLatest?.snapshotId, replacement.snapshotId, "latest pointer is repaired to the replacement snapshot");
+	doc.destroy();
+}
 
 // -------------------------------------------------------------------
 // TEST 10: Retention around year boundary
@@ -352,8 +484,8 @@ async function test13_legacySnapshotBackwardCompat(): Promise<void> {
 // TEST 14: roughWeekKey correctness
 // -------------------------------------------------------------------
 
-async function test14_roughWeekKeyAndListingExclusion(): Promise<void> {
-	console.log("\n--- Test 14: roughWeekKey and listing behavior ---");
+async function test14_roughWeekKey(): Promise<void> {
+	console.log("\n--- Test 14: roughWeekKey behavior ---");
 
 	// roughWeekKey should return consistent values and not crash at boundaries
 	const dec31 = roughWeekKey(new Date("2025-12-31T00:00:00Z"));
@@ -367,6 +499,67 @@ async function test14_roughWeekKeyAndListingExclusion(): Promise<void> {
 	// Verify the key format is year-Wxx
 	s.check(/^\d{4}-W\d{2}$/.test(dec31), "Week key format is YYYY-Wnn");
 	s.check(/^\d{4}-W\d{2}$/.test(jan1), "Week key format is YYYY-Wnn");
+}
+
+// -------------------------------------------------------------------
+// TEST 15: Real/Fake R2 snapshot listing contracts
+// -------------------------------------------------------------------
+
+async function test15_r2SnapshotListingContracts(): Promise<void> {
+	console.log("\n--- Test 15: listSnapshots excludes pointer, counts indexes, orders, and limits honestly ---");
+	const vaultId = "test-vault-listing";
+	const oldest = makeSnapshot("snap-oldest", "2026-05-01T08:00:00Z", { vaultId });
+	const middle = makeSnapshot("snap-middle", "2026-05-02T09:00:00Z", { vaultId });
+	const newest = makeSnapshot("snap-newest", "2026-05-03T10:00:00Z", { vaultId });
+	const indexes = [oldest, middle, newest];
+	const encoder = new TextEncoder();
+
+	const realBucket = await makeR2Bucket();
+	for (const index of indexes) {
+		await realBucket.put(
+			`${snapshotPrefix(vaultId, index.day, index.snapshotId)}/index.json`,
+			JSON.stringify(index),
+		);
+	}
+	await realBucket.put(
+		`v1/${vaultId}/snapshots/latest-index.json`,
+		JSON.stringify(newest),
+	);
+
+	const realResult = await listSnapshots(vaultId, realBucket);
+	s.check(realResult.totalIndexKeys === 3, `real R2 counts only three immutable indexes (got ${realResult.totalIndexKeys})`);
+	s.check(realResult.snapshots.length === 3, "real R2 latest pointer is excluded from returned snapshots");
+	s.check(
+		realResult.snapshots.map((snapshot) => snapshot.snapshotId).join(",") === "snap-newest,snap-middle,snap-oldest",
+		"real R2 snapshots are newest-first by createdAt",
+	);
+	s.check(realResult.limited === false, "unbounded real R2 listing is not marked limited");
+
+	const fakeObjects = new Map<string, Uint8Array>();
+	for (const index of [middle, oldest, newest]) {
+		fakeObjects.set(
+			`${snapshotPrefix(vaultId, index.day, index.snapshotId)}/index.json`,
+			encoder.encode(JSON.stringify(index)),
+		);
+	}
+	fakeObjects.set(
+		`v1/${vaultId}/snapshots/latest-index.json`,
+		encoder.encode(JSON.stringify(newest)),
+	);
+	const fakeBucket = new FakeR2Bucket({ objects: fakeObjects });
+	const limited = await listSnapshots(vaultId, fakeBucket, 2);
+
+	s.check(limited.totalIndexKeys === 3, `limited Fake R2 reports all immutable index keys (got ${limited.totalIndexKeys})`);
+	s.check(limited.snapshots.length === 2, `low limit fetches exactly two immutable indexes (got ${limited.snapshots.length})`);
+	s.check(limited.limited === true, "low limit honestly reports omitted immutable indexes");
+	s.check(
+		limited.snapshots.map((snapshot) => snapshot.snapshotId).join(",") === "snap-newest,snap-middle",
+		"limited Fake R2 keeps the newest two snapshots in newest-first order",
+	);
+	s.check(
+		!fakeBucket.gets.some((key) => key.endsWith("latest-index.json")),
+		"Fake R2 listing never fetches the mutable latest pointer as an immutable index",
+	);
 }
 
 // -------------------------------------------------------------------
@@ -430,17 +623,22 @@ async function main(): Promise<void> {
 
 	await test1_deleteOnlyChangesFullUpdateHash();
 	await test2_contentEditChangesFullUpdateHash();
-	await test3_manualSnapshotStructureUnchangedHonest();
+	await test3_structureHashScope();
 	await test4_manualSnapshotPinnedSurvivesRetention();
 	await test5_legacySnapshotNotPruned();
-	// Tests 6 & 7 (write ordering, poisoned pointer) are in server/tests/snapshot-r2.ts
+	await test6_realR2WriteOrdering();
+	await test7_realR2PoisonedPointer();
 	await test10_retentionYearBoundary();
 	await test11_retentionMonthBoundary();
 	await test12_pruneErrorSurfacing();
 	await test13_legacySnapshotBackwardCompat();
-	await test14_roughWeekKeyAndListingExclusion();
+	await test14_roughWeekKey();
+	await test15_r2SnapshotListingContracts();
 	await testMapDelete();
 	await testRetentionOnlyDaily();
+	for (const miniflare of miniflareInstances) {
+		await miniflare.dispose();
+	}
 }
 
 // A rejection from main() propagates as a top-level failure: node prints the

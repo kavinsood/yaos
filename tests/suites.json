@@ -1,20 +1,7 @@
 {
-	"notSuites": {
-		"tests/live/fatalFrame.ts": "Shared helper, not a suite. Typed reader for the Worker's fatal socket-rejection frame (parseFatalFrame + onFatalFrame); imported by the live suites, runs no assertions of its own.",
-		"tests/live/run-live.ts": "Integration driver, not a suite. Boots `wrangler dev` and spawns the live-worker suites against it. Owned by `npm run test:integration:worker`."
-	},
+	"notSuites": {},
 	"skip": {
-		"tests/contracts/server-update-local.ts": "Owned by `npm run test:server-update-local`, which runs `build:server-release` first. Needs dist/release-assets/yaos-server.zip on disk and shells out to git in a temp clone.",
-		"tests/live/schema-guard.ts": "Live-worker suite. Spawned by tests/live/run-live.ts; needs a running server on 127.0.0.1:8787 and SYNC_TOKEN.",
-		"tests/live/provider-manual-connect.ts": "Live-worker suite. Spawned by tests/live/run-live.ts; exits non-zero without SYNC_TOKEN.",
-		"tests/live/sync-client.ts": "Live-worker suite. Spawned by tests/live/run-live.ts with positional args (file path, text); needs a running server and SYNC_TOKEN.",
-		"tests/live/snapshots.ts": "Live-worker suite. Spawned by tests/live/run-live.ts; needs a running server, SYNC_TOKEN, and an R2 binding for snapshot routes.",
-		"tests/live/hardening-worker.ts": "Live-worker suite. Spawned by tests/live/run-live.ts; needs a running server and SYNC_TOKEN.",
-		"tests/live/ws-ticket-reconnect.ts": "Live-worker suite. Spawned by tests/live/run-live.ts, which starts the server with YAOS_TICKET_TTL_MS:8000 so post-expiry reconnect is reachable in seconds.",
-		"tests/live/ws-admission-protocol.ts": "Live-worker suite. Spawned by tests/live/run-live.ts; needs a running server and SYNC_TOKEN.",
-		"tests/live/live-seed-check.ts": "Manual probe against a deployed server. Throws unless YAOS_TEST_HOST, SYNC_TOKEN, and YAOS_TEST_VAULT_ID are all set.",
-		"tests/live/persistence-handoff-proof.ts": "Issue #24 RCA experiment against a live server. Throws without SYNC_TOKEN; two-device handoff over real WebSockets.",
-		"tests/live/persistence-eviction-proof.ts": "Issue #24 RCA experiment. Defaults YAOS_TEST_HOST to a real deployment URL and sleeps 160s waiting for Durable Object eviction — far too slow and too external for the regression gate."
+		"tests/contracts/server-update-local.ts": "Owned by `npm run test:server-update-local`, which runs `build:server-release` first. Needs dist/release-assets/yaos-server.zip on disk and shells out to git in a temp clone."
 	},
 	"serialReason": "These suites write into the repo tree, so they must never run concurrently with each other or with a build. The runner is sequential today, which satisfies this for free; the list exists so that adding parallelism cannot silently break it.",
 	"serial": [

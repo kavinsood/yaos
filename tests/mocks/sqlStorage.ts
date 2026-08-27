@@ -35,6 +35,7 @@ class FakeSqlCursor<T> {
 interface TableSnapshot {
 	tables: Array<[string, Array<Record<string, unknown>>]>;
 	journalAutoInc: number;
+	bytesWritten: number;
 }
 
 export class FakeSqlStorage {
@@ -51,6 +52,9 @@ export class FakeSqlStorage {
 	/** Writes rejected by the threshold above. */
 	writeFailures = 0;
 
+	snapshotTotalBias = 0;
+	rowsRead = 0;
+	journalRowsScanned = 0;
 	private bytesWritten = 0;
 
 	/** Re-arm the threshold from zero, e.g. after re-enabling writes. */
@@ -66,17 +70,36 @@ export class FakeSqlStorage {
 			totalBytes: rows.reduce((sum, row) => sum + (row.byte_length as number), 0),
 		};
 	}
+	seedJournalRows(byteLengths: readonly number[]): void {
+		for (const byteLength of byteLengths) {
+			this.rowsOf("journal").push({
+				id: this.journalAutoInc++,
+				data: new Uint8Array(byteLength).buffer,
+				byte_length: byteLength,
+			});
+		}
+	}
+
+	getJournalRows(): Array<Record<string, unknown>> {
+		return this.tables.get("journal") ?? [];
+	}
+
+	getSnapshotRows(): Array<Record<string, unknown>> {
+		return this.tables.get("snapshot_chunks") ?? [];
+	}
 
 	snapshotTables(): TableSnapshot {
 		return {
 			tables: [...this.tables].map(([name, rows]) => [name, [...rows]]),
 			journalAutoInc: this.journalAutoInc,
+			bytesWritten: this.bytesWritten,
 		};
 	}
 
 	restoreTables(snapshot: TableSnapshot): void {
 		this.tables = new Map(snapshot.tables.map(([name, rows]) => [name, [...rows]]));
 		this.journalAutoInc = snapshot.journalAutoInc;
+		this.bytesWritten = snapshot.bytesWritten;
 	}
 
 	private chargeWrite(bytes: number): void {
@@ -126,18 +149,22 @@ export class FakeSqlStorage {
 			const total = rows.reduce(
 				(sum, row) => sum + (row.data as ArrayBuffer).byteLength,
 				0,
-			);
+			) + this.snapshotTotalBias;
+			this.rowsRead++;
 			return new FakeSqlCursor<T>([{ cnt: rows.length, total } as T]);
 		}
 
 		if (trimmed.includes("COUNT(*)") && trimmed.includes("journal")) {
 			const truth = this.journalTruth();
+			this.rowsRead++;
+			this.journalRowsScanned += truth.entryCount;
 			return new FakeSqlCursor<T>([{ cnt: truth.entryCount, total: truth.totalBytes } as T]);
 		}
 
 		if (trimmed.startsWith("SELECT data FROM snapshot_chunks")) {
 			const rows = [...(this.tables.get("snapshot_chunks") ?? [])];
 			rows.sort((a, b) => (a.chunk_index as number) - (b.chunk_index as number));
+			this.rowsRead += rows.length;
 			return new FakeSqlCursor<T>(rows as T[]);
 		}
 
@@ -145,6 +172,10 @@ export class FakeSqlStorage {
 		if (trimmed.startsWith("SELECT data FROM journal") || trimmed.startsWith("SELECT data, byte_length FROM journal")) {
 			const rows = [...(this.tables.get("journal") ?? [])];
 			rows.sort((a, b) => (a.id as number) - (b.id as number));
+			if (trimmed.startsWith("SELECT data, byte_length")) {
+				this.rowsRead += rows.length;
+				this.journalRowsScanned += rows.length;
+			}
 			return new FakeSqlCursor<T>(rows as T[]);
 		}
 
