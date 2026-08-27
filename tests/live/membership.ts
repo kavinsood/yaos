@@ -1,120 +1,114 @@
+import WebSocket from "ws";
+import { PROTOCOL_VERSION, SCHEMA_VERSION } from "../../src/sync/schema.ts";
+import { parseFatalFrame, type FatalFrame } from "./fatalFrame.ts";
 import {
 	deviceBearerHeaders,
 	fetchSocketTicket,
 	type LiveIdentity,
-	requireLiveIdentity,
+	requireLiveIdentityContext,
 } from "./liveIdentity.ts";
+import { socketPrefix } from "./schema4Live.ts";
 
-const identity = requireLiveIdentity();
+const { deviceA, deviceB } = requireLiveIdentityContext();
 
 function assert(condition: unknown, message: string): asserts condition {
 	if (!condition) throw new Error(message);
 	console.log(`  PASS  ${message}`);
 }
 
-interface PairingResponse {
-	readonly pairingCode?: unknown;
-	readonly expiresAt?: unknown;
-	readonly purpose?: unknown;
-}
+const rosterResponse = await fetch(`${deviceA.host}/vault/${encodeURIComponent(deviceA.vaultId)}/devices`, {
+	headers: deviceBearerHeaders(deviceA),
+});
+const roster = await rosterResponse.json() as { devices?: Array<{ deviceId?: unknown }> };
+assert(rosterResponse.status === 200, "device A can read the provisioned vault roster");
+assert(roster.devices?.some((device) => device.deviceId === deviceA.deviceId), "roster contains device A");
+assert(roster.devices?.some((device) => device.deviceId === deviceB.deviceId), "roster contains distinct device B");
 
-interface EnrollmentResponse {
-	readonly host?: unknown;
-	readonly deviceToken?: unknown;
-	readonly vaultId?: unknown;
-	readonly deviceId?: unknown;
-	readonly deviceName?: unknown;
-}
-
-console.log("\n--- Live membership: one-use pairing code ---");
-
-const pairingResponse = await fetch(
-	`${identity.host}/vault/${encodeURIComponent(identity.vaultId)}/auth/pairing-code`,
-	{
-		method: "POST",
-		headers: deviceBearerHeaders(identity, { "Content-Type": "application/json" }),
-		body: JSON.stringify({ purpose: "device" }),
-	},
-);
-assert(pairingResponse.status === 200, `enrolled device can mint a pairing code (got ${pairingResponse.status})`);
-const pairing = (await pairingResponse.json()) as PairingResponse | null;
-assert(typeof pairing?.pairingCode === "string" && pairing.pairingCode.length > 0, "pairing response contains a code");
-assert(typeof pairing.expiresAt === "number" && pairing.expiresAt > Date.now(), "pairing response contains a future expiry");
-assert(pairing.purpose === "device", "pairing response preserves the device purpose");
-
-const enrollBody = JSON.stringify({ pairingCode: pairing.pairingCode, deviceName: "live-secondary" });
-const firstEnrollment = await fetch(`${identity.host}/enroll`, {
+const pairingResponse = await fetch(`${deviceA.host}/vault/${encodeURIComponent(deviceA.vaultId)}/auth/pairing-code`, {
+	method: "POST",
+	headers: deviceBearerHeaders(deviceA, { "Content-Type": "application/json" }),
+	body: JSON.stringify({ purpose: "device" }),
+});
+const pairing = await pairingResponse.json() as { pairingCode?: unknown };
+assert(pairingResponse.status === 200 && typeof pairing.pairingCode === "string", "device A mints a one-use pairing for a revocation probe");
+const enrollment = await fetch(`${deviceA.host}/enroll`, {
 	method: "POST",
 	headers: { "Content-Type": "application/json" },
-	body: enrollBody,
+	body: JSON.stringify({ pairingCode: pairing.pairingCode, deviceName: "live-revoked-device" }),
 });
-assert(firstEnrollment.status === 200, `fresh pairing code enrolls one device (got ${firstEnrollment.status})`);
-const enrolled = (await firstEnrollment.json()) as EnrollmentResponse | null;
-const enrolledDeviceId = enrolled?.deviceId;
-assert(enrolled?.host === identity.host, "enrollment returns the canonical server host");
-assert(typeof enrolled.deviceToken === "string" && enrolled.deviceToken.length > 0, "enrollment returns a device bearer");
-assert(enrolled.vaultId === identity.vaultId, "enrollment joins the pairing code's vault");
-assert(typeof enrolledDeviceId === "string" && enrolledDeviceId.length > 0, "enrollment returns a deviceId");
-assert(enrolledDeviceId !== identity.deviceId, "each enrollment receives a distinct deviceId");
-assert(enrolled.deviceName === "live-secondary", "enrollment returns the requested unique name");
-const secondary: LiveIdentity = {
-	host: enrolled.host,
+const enrolled = await enrollment.json() as Partial<LiveIdentity> & { deviceName?: unknown };
+assert(enrollment.status === 200 && typeof enrolled.deviceToken === "string" && typeof enrolled.deviceId === "string", "probe device enrolls once");
+const revoked: LiveIdentity = {
+	host: deviceA.host,
+	vaultId: deviceA.vaultId,
 	deviceToken: enrolled.deviceToken,
-	vaultId: enrolled.vaultId,
-	deviceId: enrolledDeviceId,
+	deviceId: enrolled.deviceId,
 };
-const secondaryTicket = await fetchSocketTicket(secondary);
-assert(secondaryTicket.expiresAt > Date.now(), "secondary device credential mints its own socket ticket");
+const staleTicket = (await fetchSocketTicket(revoked)).ticket;
+const activeUrl = new URL(revoked.host);
+activeUrl.protocol = activeUrl.protocol === "https:" ? "wss:" : "ws:";
+activeUrl.pathname = socketPrefix(revoked, "root", "root");
+activeUrl.searchParams.set("ticket", staleTicket);
+activeUrl.searchParams.set("schemaVersion", String(SCHEMA_VERSION));
+activeUrl.searchParams.set("protocolVersion", String(PROTOCOL_VERSION));
+const activeSocket = new WebSocket(activeUrl);
+await new Promise<void>((resolve, reject) => {
+	const timeout = setTimeout(() => reject(new Error("active revocation probe did not become ready")), 5_000);
+	activeSocket.on("message", (data) => {
+		if (!data.toString().includes("VAULT_READY")) return;
+		clearTimeout(timeout);
+		resolve();
+	});
+	activeSocket.once("error", reject);
+});
+const activeSocketClosed = new Promise<boolean>((resolve, reject) => {
+	const timeout = setTimeout(() => reject(new Error("revoked active socket received no terminal signal")), 5_000);
+	const finish = (): void => {
+		clearTimeout(timeout);
+		resolve(true);
+	};
+	activeSocket.once("close", finish);
+	activeSocket.on("message", (data) => {
+		if (data.toString().includes("unauthorized")) finish();
+	});
+});
+const leave = await fetch(`${revoked.host}/vault/${encodeURIComponent(revoked.vaultId)}/auth/device`, {
+	method: "DELETE",
+	headers: deviceBearerHeaders(revoked),
+});
+const leaveBody = await leave.json() as { closedSockets?: unknown };
+assert(leave.status === 200, "probe device revokes its membership");
+assert(typeof leaveBody.closedSockets === "number" && leaveBody.closedSockets >= 1, "revocation command found the active socket");
+assert(await activeSocketClosed, "membership revocation terminates the already-active root socket");
+const ticketAfterLeave = await fetch(`${revoked.host}/vault/${encodeURIComponent(revoked.vaultId)}/auth/ticket`, {
+	method: "POST",
+	headers: deviceBearerHeaders(revoked),
+});
+assert(ticketAfterLeave.status === 401, "revoked bearer cannot mint another socket ticket");
 
-const replay = await fetch(`${identity.host}/enroll`, {
+const revokedSocketFrame = await new Promise<FatalFrame | null>((resolve, reject) => {
+	const url = new URL(revoked.host);
+	url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+	url.pathname = socketPrefix(revoked, "root", "root");
+	url.searchParams.set("ticket", staleTicket);
+	url.searchParams.set("schemaVersion", String(SCHEMA_VERSION));
+	url.searchParams.set("protocolVersion", String(PROTOCOL_VERSION));
+	const socket = new WebSocket(url);
+	let frame: FatalFrame | null = null;
+	const timeout = setTimeout(() => { socket.terminate(); reject(new Error("revoked socket probe timed out")); }, 5_000);
+	socket.on("message", (data) => {
+		const text = data.toString();
+		frame = parseFatalFrame(text.startsWith("__YPS:") ? text.slice(6) : text) ?? frame;
+	});
+	socket.on("close", () => { clearTimeout(timeout); resolve(frame); });
+	socket.on("error", (error) => { clearTimeout(timeout); reject(error); });
+});
+assert(revokedSocketFrame?.code === "unauthorized", "a pre-revocation ticket is denied after membership revocation");
+
+const replay = await fetch(`${deviceA.host}/enroll`, {
 	method: "POST",
 	headers: { "Content-Type": "application/json" },
-	body: enrollBody,
+	body: JSON.stringify({ pairingCode: pairing.pairingCode, deviceName: "live-replay" }),
 });
-assert(replay.status === 404, `consumed pairing code cannot enroll again (got ${replay.status})`);
-const replayBody = (await replay.json()) as { error?: unknown } | null;
-assert(replayBody?.error === "unknown_code", "pairing replay reports an unknown consumed code");
-
-function hasDeviceId(value: unknown, deviceId: string): boolean {
-	return value !== null
-		&& typeof value === "object"
-		&& "deviceId" in value
-		&& value.deviceId === deviceId;
-}
-
-const rosterResponse = await fetch(
-	`${identity.host}/vault/${encodeURIComponent(identity.vaultId)}/devices`,
-	{ headers: deviceBearerHeaders(secondary) },
-);
-assert(rosterResponse.status === 200, `secondary device can read its vault roster (got ${rosterResponse.status})`);
-const rosterBody = (await rosterResponse.json()) as { devices?: unknown } | null;
-const devices = Array.isArray(rosterBody?.devices) ? rosterBody.devices : [];
-assert(
-	devices.some((device) => hasDeviceId(device, identity.deviceId)),
-	"roster contains the primary device",
-);
-assert(
-	devices.some((device) => hasDeviceId(device, enrolledDeviceId)),
-	"roster contains the newly enrolled device",
-);
-
-const leaveResponse = await fetch(
-	`${secondary.host}/vault/${encodeURIComponent(secondary.vaultId)}/auth/device`,
-	{ method: "DELETE", headers: deviceBearerHeaders(secondary) },
-);
-assert(leaveResponse.status === 200, `secondary device can leave itself (got ${leaveResponse.status})`);
-const ticketAfterLeave = await fetch(
-	`${secondary.host}/vault/${encodeURIComponent(secondary.vaultId)}/auth/ticket`,
-	{ method: "POST", headers: deviceBearerHeaders(secondary) },
-);
-assert(ticketAfterLeave.status === 401, "secondary credential is revoked after self-leave");
-const rosterAfterLeaveResponse = await fetch(
-	`${identity.host}/vault/${encodeURIComponent(identity.vaultId)}/devices`,
-	{ headers: deviceBearerHeaders(identity) },
-);
-assert(rosterAfterLeaveResponse.status === 200, "primary device can read roster after secondary leave");
-const rosterAfterLeaveBody = await rosterAfterLeaveResponse.json() as { devices?: unknown };
-const devicesAfterLeave = Array.isArray(rosterAfterLeaveBody.devices) ? rosterAfterLeaveBody.devices : [];
-assert(!devicesAfterLeave.some((device) => hasDeviceId(device, secondary.deviceId)), "secondary membership disappears after leave");
-
-console.log("\n✓ Live one-use membership path passed");
+assert(replay.status === 404, "consumed pairing capability cannot enroll again");
+console.log("\n✓ Live membership and stale-ticket revocation passed");

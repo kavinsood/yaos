@@ -302,10 +302,18 @@ function waitFor(
 function readReceiptWaitState(vaultSync: VaultSync | null): ReceiptWaitState | null {
 	if (!vaultSync) return null;
 	const receipt = vaultSync.getServerReceiptSnapshot();
+	const candidateId = receipt.candidateCapturedAt === null
+		? null
+		: `schema4:${receipt.candidateCapturedAt}`;
 	return {
-		candidateId: receipt.candidateId,
+		candidateId,
 		capturedAt: receipt.candidateCapturedAt,
-		lastConfirmedCandidateId: receipt.lastConfirmedCandidateId,
+		lastConfirmedCandidateId:
+			candidateId !== null
+			&& receipt.serverAppliedLocalState === true
+			&& receipt.hasUnconfirmedCandidate === false
+				? candidateId
+				: null,
 		lastConfirmedAt: receipt.lastKnownServerReceiptEchoAt,
 		hasUnconfirmedCandidate: receipt.hasUnconfirmedCandidate,
 	};
@@ -497,7 +505,18 @@ export function buildQaDebugApi(plugin: PluginHandle): YaosQaDebugApi {
 				return { beforeHash: null, afterHash: null, fileExisted: false };
 			}
 
-			const ytext = existingText ?? vaultSync.ensureFile(path, content, "qa");
+			let ytext = existingText;
+			if (!ytext) {
+				const identity = crypto.randomUUID();
+				await vaultSync.commitFreshBody({
+					bodyId: `qa-${identity}`,
+					path,
+					content: "",
+					candidateId: `qa-${identity}`,
+					reason: "qa-unsafe-create",
+				});
+				ytext = vaultSync.getTextForPath(path);
+			}
 			if (!ytext) return { beforeHash: null, afterHash: null, fileExisted };
 
 			// Compute before hash from current Y.Text content.

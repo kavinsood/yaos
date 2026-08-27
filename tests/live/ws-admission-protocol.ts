@@ -1,184 +1,86 @@
 import WebSocket from "ws";
-import { SCHEMA_VERSION } from "../../src/sync/schema.ts";
+import { PROTOCOL_VERSION, SCHEMA_VERSION } from "../../src/sync/schema.ts";
+import { parseFatalFrame, type FatalFrame } from "./fatalFrame.ts";
 import { fetchSocketTicket, requireLiveIdentity } from "./liveIdentity.ts";
+import { createBody, socketPrefix } from "./schema4Live.ts";
 
 const identity = requireLiveIdentity();
-const HOST = identity.host;
-const ROOM_ID = identity.vaultId;
+const bodyId = `body_admission_${crypto.randomUUID().replaceAll("-", "_")}`;
+await createBody(identity, bodyId, "live/socket-admission.md", "socket admission");
 
-/**
- * The subset of the Worker's fatal rejection frame these assertions read.
- * Built by rejectSocket() in server/src/routes/syncSocket.ts.
- */
-interface FatalFrame {
-	readonly type?: string;
-	readonly code?: string;
-	readonly reason?: string;
-	readonly clientSchemaVersion?: number | null;
-	readonly serverSchemaVersion?: number;
+interface Outcome {
+	opened: boolean;
+	control: Array<Record<string, unknown>>;
+	fatal: FatalFrame | null;
 }
 
-/** Everything captureSocket() observes about one connection attempt. */
-interface SocketOutcome {
-	readonly opened: boolean;
-	readonly upgradeStatus: number | null;
-	readonly messages: string[];
-	readonly closeCode: number | null;
-	readonly closeReason: string | null;
+function capture(kind: "root" | "body", documentId: string, params: Record<string, string>): Promise<Outcome> {
+	return new Promise<Outcome>((resolve, reject) => {
+		const url = new URL(identity.host);
+		url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+		url.pathname = socketPrefix(identity, kind, documentId);
+		for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+		const socket = new WebSocket(url);
+		let opened = false;
+		let fatal: FatalFrame | null = null;
+		const control: Array<Record<string, unknown>> = [];
+		let settled = false;
+		const timeout = setTimeout(() => finish(new Error(`${kind} socket admission timed out`)), 5_000);
+		const finish = (error?: Error) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timeout);
+			socket.terminate();
+			error ? reject(error) : resolve({ opened, control, fatal });
+		};
+		socket.on("open", () => {
+			opened = true;
+			setTimeout(() => finish(), 150);
+		});
+		socket.on("message", (data, binary) => {
+			if (binary) return;
+			const text = data.toString();
+			const payload = text.startsWith("__YPS:") ? text.slice(6) : text;
+			fatal = parseFatalFrame(payload) ?? fatal;
+			try { control.push(JSON.parse(payload) as Record<string, unknown>); } catch { /* not a JSON control frame */ }
+		});
+		socket.on("close", () => finish());
+		socket.on("error", (error) => finish(error));
+	});
 }
 
-function assert(condition: unknown, message: string): void {
+function assert(condition: unknown, message: string): asserts condition {
 	if (!condition) throw new Error(message);
 	console.log(`  PASS  ${message}`);
 }
 
-
-function socketUrl(vaultId: string, params: Record<string, string>): string {
-	const url = new URL(HOST);
-	url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-	url.pathname = `/vault/sync/${encodeURIComponent(vaultId)}`;
-	for (const [key, value] of Object.entries(params)) {
-		url.searchParams.set(key, value);
-	}
-	return url.toString();
-}
-
-function captureSocket(
-	url: string,
-	{ settleAfterOpenMs = null }: { settleAfterOpenMs?: number | null } = {},
-): Promise<SocketOutcome> {
-	return new Promise<SocketOutcome>((resolvePromise, rejectPromise) => {
-		const socket = new WebSocket(url);
-		const messages: string[] = [];
-		let opened = false;
-		let upgradeStatus: number | null = null;
-		let settled = false;
-		const timeout = setTimeout(() => {
-			finish(new Error(`timed out waiting for socket outcome: ${url}`));
-			socket.terminate();
-		}, 10_000);
-
-		function finish(value: SocketOutcome | Error): void {
-			if (settled) return;
-			settled = true;
-			clearTimeout(timeout);
-			if (value instanceof Error) rejectPromise(value);
-			else resolvePromise(value);
-		}
-
-		socket.once("upgrade", (response) => {
-			upgradeStatus = response.statusCode ?? null;
-		});
-		socket.once("open", () => {
-			opened = true;
-			if (settleAfterOpenMs !== null) {
-				setTimeout(() => {
-					// A healthy PartyServer socket is intentionally long-lived. Verify
-					// it stayed open without a fatal worker frame, then terminate only
-					// the test client instead of waiting for a server close that should
-					// never occur during normal sync.
-					finish({ opened, upgradeStatus, messages, closeCode: null, closeReason: null });
-					socket.terminate();
-				}, settleAfterOpenMs);
-			}
-		});
-		socket.on("message", (message) => messages.push(message.toString()));
-		socket.once("unexpected-response", (_request, response) => {
-			finish(new Error(`unexpected HTTP response ${response.statusCode} for ${url}`));
-		});
-		socket.once("error", (error) => finish(error));
-		socket.once("close", (code, reason) => {
-			finish({ opened, upgradeStatus, messages, closeCode: code, closeReason: reason.toString() });
-		});
-	});
-}
-
-function assertFatalUpdateResponse(
-	result: SocketOutcome,
-	expectedCode: string,
-	expectedReason: string,
-): FatalFrame {
-	assert(result.upgradeStatus === 101, `rejection upgrades with HTTP 101 (got ${result.upgradeStatus})`);
-	assert(result.opened, "rejection opens the WebSocket before sending fatal frames");
-	assert(result.closeCode === 1008, `rejection closes with policy-violation 1008 (got ${result.closeCode})`);
-	assert(result.closeReason === expectedReason, `rejection close reason is ${expectedReason}`);
-	assert(result.messages.length === 2, `rejection sends exactly two fatal frames (got ${result.messages.length})`);
-	// Non-null: the assertion directly above proves there are exactly two frames.
-	const payload = JSON.parse(result.messages[0]!) as FatalFrame;
-	assert(payload.type === "error", "first fatal frame is a generic error payload");
-	assert(payload.code === expectedCode, `first fatal frame code is ${expectedCode}`);
-	assert(result.messages[1] === `__YPS:${result.messages[0]}`, "second fatal frame is the y-partyserver control form");
-	return payload;
-}
-
-console.log("\n--- WebSocket protocol: authenticated schema above the pin ---");
-{
-	const { ticket } = await fetchSocketTicket(identity);
-	const clientSchemaVersion = SCHEMA_VERSION + 1;
-	const result = await captureSocket(socketUrl(ROOM_ID, {
-		ticket,
-		schemaVersion: String(clientSchemaVersion),
-	}));
-	const payload = assertFatalUpdateResponse(result, "update_required", "update required");
-	assert(payload.reason === "client_schema_unsupported", "schema rejection reports the explicit unsupported-client reason");
-	assert(payload.clientSchemaVersion === clientSchemaVersion, "schema rejection echoes the client schema");
-	assert(
-		payload.serverSchemaVersion === SCHEMA_VERSION,
-		`schema rejection publishes the pinned v${SCHEMA_VERSION} server schema`,
-	);
-}
-
-console.log("\n--- WebSocket protocol: authenticated schema below the pin ---");
-{
-	// Previously admitted by the v1..v3 range. Admission is now an equality test,
-	// so an older writer is refused at the edge instead of reaching the room.
-	const { ticket } = await fetchSocketTicket(identity);
-	const clientSchemaVersion = SCHEMA_VERSION - 1;
-	const result = await captureSocket(socketUrl(ROOM_ID, {
-		ticket,
-		schemaVersion: String(clientSchemaVersion),
-	}));
-	const payload = assertFatalUpdateResponse(result, "update_required", "update required");
-	assert(payload.reason === "client_schema_unsupported", "below-pin schema rejection reports the unsupported-client reason");
-	assert(payload.clientSchemaVersion === clientSchemaVersion, "below-pin rejection echoes the client schema");
-}
-
-console.log("\n--- WebSocket protocol: undeclared schema is rejected, never defaulted ---");
-{
-	const { ticket } = await fetchSocketTicket(identity);
-	const result = await captureSocket(socketUrl(ROOM_ID, { ticket }));
-	const payload = assertFatalUpdateResponse(result, "update_required", "update required");
-	assert(payload.reason === "invalid_client_schema", "a connection with no schemaVersion is rejected as invalid, not assumed legacy");
-	assert(payload.clientSchemaVersion === null, "undeclared-schema rejection reports a null client schema");
-}
-
-console.log("\n--- WebSocket protocol: authentication precedes schema enforcement ---");
-{
-	const result = await captureSocket(socketUrl(ROOM_ID, { schemaVersion: String(SCHEMA_VERSION + 1) }));
-	const payload = assertFatalUpdateResponse(result, "unauthorized", "unauthorized");
-	assert(payload.reason === undefined, "auth rejection does not disclose schema details");
-	assert(payload.serverSchemaVersion === undefined, "auth rejection omits the server schema version");
-}
-
-console.log("\n--- WebSocket protocol: pinned ticket-authenticated schema upgrades normally ---");
-{
-	const { ticket } = await fetchSocketTicket(identity);
-	const result = await captureSocket(socketUrl(ROOM_ID, {
+for (const [kind, documentId] of [["root", "root"], ["body", bodyId]] as const) {
+	const ticket = (await fetchSocketTicket(identity)).ticket;
+	const allowed = await capture(kind, documentId, {
 		ticket,
 		schemaVersion: String(SCHEMA_VERSION),
-	}), { settleAfterOpenMs: 250 });
-	assert(result.upgradeStatus === 101, `supported connection upgrades with HTTP 101 (got ${result.upgradeStatus})`);
-	assert(result.opened, "supported connection opens");
-	assert(
-		!result.messages.some((message) => {
-			try {
-				return JSON.parse(message)?.type === "error";
-			} catch {
-				return false;
-			}
-		}),
-		"supported connection receives no worker fatal error payload",
-	);
+		protocolVersion: String(PROTOCOL_VERSION),
+	});
+	assert(allowed.opened && !allowed.fatal, `${kind} socket accepts a device/vault-scoped ticket`);
+	assert(allowed.control.some((frame) => frame.type === "VAULT_READY" && frame.documentId === documentId), `${kind} socket publishes VAULT_READY for the exact document`);
+
+	const unauthenticated = await capture(kind, documentId, {
+		schemaVersion: String(SCHEMA_VERSION),
+		protocolVersion: String(PROTOCOL_VERSION),
+	});
+	assert(unauthenticated.fatal?.code === "unauthorized", `${kind} socket rejects a missing ticket`);
 }
 
-console.log("\n✓ WebSocket admission protocol tests passed");
+const wrongSchema = await capture("body", bodyId, {
+	ticket: (await fetchSocketTicket(identity)).ticket,
+	schemaVersion: String(SCHEMA_VERSION + 1),
+	protocolVersion: String(PROTOCOL_VERSION),
+});
+assert(wrongSchema.fatal?.reason === "schema_mismatch", "body socket rejects the wrong schema pin");
+const wrongProtocol = await capture("body", bodyId, {
+	ticket: (await fetchSocketTicket(identity)).ticket,
+	schemaVersion: String(SCHEMA_VERSION),
+	protocolVersion: String(PROTOCOL_VERSION + 1),
+});
+assert(wrongProtocol.fatal?.reason === "protocol_mismatch", "body socket rejects the wrong wire protocol pin");
+console.log("\n✓ Schema-4 root/body admission passed");

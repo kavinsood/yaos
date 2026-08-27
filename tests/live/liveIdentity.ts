@@ -5,6 +5,13 @@ export interface LiveIdentity {
 	readonly deviceId: string;
 }
 
+export interface LiveIdentityContext {
+	readonly deviceA: LiveIdentity;
+	readonly deviceB: LiveIdentity;
+	readonly operatorRecoveryKey: string;
+	readonly operatorCookie: string;
+}
+
 export interface SocketTicket {
 	readonly ticket: string;
 	readonly expiresAt: number;
@@ -17,12 +24,26 @@ function requireEnv(name: string): string {
 	return value;
 }
 
-export function requireLiveIdentity(): LiveIdentity {
+function identityFromEnv(suffix: "A" | "B"): LiveIdentity {
 	return {
 		host: requireEnv("YAOS_TEST_HOST").replace(/\/$/, ""),
-		deviceToken: requireEnv("YAOS_TEST_DEVICE_TOKEN"),
+		deviceToken: requireEnv(`YAOS_TEST_DEVICE_${suffix}_TOKEN`),
 		vaultId: requireEnv("YAOS_TEST_VAULT_ID"),
-		deviceId: requireEnv("YAOS_TEST_DEVICE_ID"),
+		deviceId: requireEnv(`YAOS_TEST_DEVICE_${suffix}_ID`),
+	};
+}
+
+/** Device A is the default identity for one-device route checks. */
+export function requireLiveIdentity(): LiveIdentity {
+	return identityFromEnv("A");
+}
+
+export function requireLiveIdentityContext(): LiveIdentityContext {
+	return {
+		deviceA: identityFromEnv("A"),
+		deviceB: identityFromEnv("B"),
+		operatorRecoveryKey: requireEnv("YAOS_TEST_OPERATOR_RECOVERY_KEY"),
+		operatorCookie: requireEnv("YAOS_TEST_OPERATOR_COOKIE"),
 	};
 }
 

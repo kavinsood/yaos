@@ -1,57 +1,35 @@
-import {
-	deviceBearerHeaders,
-	fetchSocketTicket,
-	requireLiveIdentity,
-} from "./liveIdentity.ts";
+import WebSocket from "ws";
+import { PROTOCOL_VERSION } from "../../src/sync/schema.ts";
+import { parseFatalFrame, type FatalFrame } from "./fatalFrame.ts";
+import { deviceBearerHeaders, fetchSocketTicket, requireLiveIdentity } from "./liveIdentity.ts";
+import { socketPrefix } from "./schema4Live.ts";
 
 const identity = requireLiveIdentity();
-const HOST = identity.host;
-const VAULT_ID = identity.vaultId;
-
-function assert(condition: unknown, msg: string): void {
-	if (!condition) {
-		throw new Error(msg);
-	}
-	console.log(`  PASS  ${msg}`);
-}
-
-
-async function getJson(path: string): Promise<{ res: Response; payload: unknown }> {
-	const res = await fetch(`${HOST}${path}`, {
-		headers: deviceBearerHeaders(identity),
+const { ticket } = await fetchSocketTicket(identity);
+const url = new URL(identity.host);
+url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+url.pathname = socketPrefix(identity, "root", "root");
+url.searchParams.set("ticket", ticket);
+url.searchParams.set("schemaVersion", "x".repeat(20_000));
+url.searchParams.set("protocolVersion", String(PROTOCOL_VERSION));
+const frame = await new Promise<FatalFrame | null>((resolve, reject) => {
+	const socket = new WebSocket(url);
+	let fatal: FatalFrame | null = null;
+	const timeout = setTimeout(() => { socket.terminate(); reject(new Error("oversized schema socket timed out")); }, 5_000);
+	socket.on("message", (data) => {
+		const text = data.toString();
+		fatal = parseFatalFrame(text.startsWith("__YPS:") ? text.slice(6) : text) ?? fatal;
 	});
-	const text = await res.text();
-	let payload: unknown = null;
-	try {
-		payload = text ? JSON.parse(text) : null;
-	} catch {
-		payload = text;
-	}
-	return { res, payload };
-}
-
-async function main() {
-	const traceRoomId = VAULT_ID;
-	console.log(`Hardening trace room: ${traceRoomId}`);
-
-	console.log("\n--- Test: oversized trace payloads are truncated and do not fail the request ---");
-	const hugeSchema = "x".repeat(20_000);
-	const { ticket } = await fetchSocketTicket(identity);
-	const oversizedUrl = new URL(`${HOST}/vault/sync/${encodeURIComponent(traceRoomId)}`);
-	oversizedUrl.searchParams.set("ticket", ticket);
-	oversizedUrl.searchParams.set("schemaVersion", hugeSchema);
-	const oversizedTraceRes = await fetch(oversizedUrl);
-	assert(oversizedTraceRes.status === 426, "invalid giant schema request is rejected normally");
-
-	const oversizedDebug = await getJson(`/vault/${encodeURIComponent(traceRoomId)}/debug/recent`);
-	assert(oversizedDebug.res.ok, "debug endpoint returns successfully after oversized trace payload");
-	// Note: ws-rejected events are no longer persisted to YAOS_SYNC (issue #40
-	// amplification fix — a schema-mismatch loop must not hammer the DO).
-	// They are logged via console.warn only.  The trace list may be empty or
-	// contain unrelated room events; we only verify the endpoint is healthy.
-}
-
-main().catch((err) => {
-	console.error(err);
-	process.exit(1);
+	socket.on("close", () => { clearTimeout(timeout); resolve(fatal); });
+	socket.on("error", (error) => { clearTimeout(timeout); reject(error); });
 });
+if (frame?.code !== "update_required" || frame.reason !== "schema_mismatch") {
+	throw new Error(`oversized schema pin was not rejected normally: ${JSON.stringify(frame)}`);
+}
+const diagnostics = await fetch(`${identity.host}/vault/${encodeURIComponent(identity.vaultId)}/diagnostics`, {
+	headers: deviceBearerHeaders(identity),
+});
+if (!diagnostics.ok) throw new Error(`diagnostics failed after oversized schema rejection (${diagnostics.status})`);
+const body = await diagnostics.json() as { schemaVersion?: unknown; protocolVersion?: unknown };
+if (body.schemaVersion !== 4 || body.protocolVersion !== 1) throw new Error(`diagnostics lost schema-4 pins: ${JSON.stringify(body)}`);
+console.log("Oversized /ws/root schema input is bounded and leaves schema-4 diagnostics healthy.");

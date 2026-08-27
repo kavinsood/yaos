@@ -347,8 +347,9 @@ export class FakeDatabase extends EventTarget implements IDBDatabase {
 		return tx;
 	}
 
-	close(): never {
-		return unreachable("IDBDatabase.close");
+	close(): void {
+		// Closing a real handle does not delete the database; later opens must
+		// observe the same persisted stores.
 	}
 
 	deleteObjectStore(): never {

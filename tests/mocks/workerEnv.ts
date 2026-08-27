@@ -1,30 +1,27 @@
 /**
  * Typed fakes for the Cloudflare Worker `Env` and the bindings hanging off it.
  *
- * Server suites need an `Env` to call route handlers, but `Env` demands two
- * `DurableObjectNamespace`s and an `R2Bucket` — platform types whose interesting
- * members return values (`DurableObjectStub`, `R2Object`) that a test has no way
- * to build.  Historically every suite answered that with `{ YAOS_BUCKET: bucket }
- * as any` or `as unknown as R2Bucket`, which silences the compiler on the exact
- * surface the test is exercising: a route that started reading `env.YAOS_SYNC`
- * would still typecheck against a fake that does not have it.
+ * Server suites need an `Env` to call route handlers, but its bindings include
+ * platform values such as `DurableObjectNamespace` and `R2Bucket`. Historically
+ * suites built partial objects behind casts, which silenced the compiler on the
+ * exact surface under test.
  *
- * Nothing here casts.  Two observations make that possible:
- *
- *   1. `DurableObjectNamespace` and `R2Bucket` are declared as abstract classes
- *      with no private or protected members, so a plain object or a class
- *      `implements` clause satisfies them structurally.
- *   2. The members whose return types are unconstructible are exactly the ones
- *      no test reaches.  Declaring those `: never` and throwing satisfies the
- *      signature for free, because `never` is assignable to every type — and it
- *      fails loudly the moment a test does reach them, which is strictly better
- *      than a cast quietly handing back `undefined`.
- *
- * The members tests DO reach (`R2Bucket.put`, `R2Bucket.get`,
- * `DurableObjectStub.fetch`) are implemented for real.
+ * The fakes below implement the narrow fetch-only ports used by vault and
+ * recovery-job routes. Full platform interfaces are implemented only where the
+ * product genuinely consumes them, such as config namespaces and R2 buckets.
+ * Unused operations return `never` and throw so newly reached behavior fails
+ * loudly instead of quietly producing `undefined`.
  */
 
-import type { Env } from "../../server/src/routes/types.ts";
+import type {
+	RecoveryJobNamespacePort,
+	RecoveryJobStubPort,
+} from "../../server/src/recoveryExecutor.ts";
+import type {
+	Env,
+	VaultRuntimeStubPort,
+	VaultSyncNamespacePort,
+} from "../../server/src/routes/types.ts";
 
 /** Independent ArrayBuffer over exactly `bytes`, never the parent allocation. */
 function ownedBuffer(bytes: Uint8Array): ArrayBuffer {
@@ -47,15 +44,10 @@ export function makeDurableObjectId(name: string): DurableObjectId {
 }
 
 /**
- * A trap namespace that records which members were reached before throwing.
+ * A trap namespace that records every platform or narrow-port member reached.
  *
- * Deliberately NOT declared as `extends DurableObjectNamespace<never>`.  `T`
- * appears in both variance positions of `Rpc.Provider<T>`, so
- * `DurableObjectNamespace` is invariant in it, and `jurisdiction()` returning
- * `DurableObjectNamespace<never>` would make the whole thing unassignable to
- * `DurableObjectNamespace<VaultSyncServer>`.  Spelling the members out with
- * `never` returns sidesteps variance entirely: `never` is assignable to every
- * return type, for every `T`, so one trap serves both bindings.
+ * Its `never` returns satisfy both the full config namespace and the fetch-only
+ * vault runtime namespace while guaranteeing any access fails loudly.
  */
 export interface FakeTrapNamespace {
 	/**
@@ -77,15 +69,7 @@ export interface FakeTrapNamespace {
 
 /**
  * A namespace whose every member records itself in `touched`, then throws
- * `message`.
- *
- * Used to prove a code path never woke the Durable Object: if it did, the test
- * fails with the supplied message rather than passing on a fake that returned
- * `undefined`.  Typed as `DurableObjectNamespace<never>` so it is assignable to
- * both `Env["YAOS_SYNC"]` (parameterised over the VaultSyncServer RPC surface)
- * and `Env["YAOS_CONFIG"]` (unparameterised): every member's return type
- * collapses to `never`, which is assignable to whatever the real member
- * promises.
+ * `message`. It proves rejected paths do not allocate any Durable Object.
  */
 export function makeTrapNamespace(message: string): FakeTrapNamespace {
 	const touched: string[] = [];
@@ -166,6 +150,158 @@ export function makeStoredConfigNamespace(config: unknown): FakeConfigNamespace 
 			headers: { "Content-Type": "application/json" },
 		}));
 }
+/** A typed `YAOS_SYNC` namespace whose fetch-only stub is supplied by the test. */
+export interface FakeVaultSyncNamespace extends VaultSyncNamespacePort {
+	/** How many times the stub was looked up via `get`. */
+	readonly calls: number;
+	/** How many named Durable Object identities were derived. */
+	readonly idFromNameCalls: number;
+}
+
+export function makeVaultSyncNamespace(
+	fetchImpl: (req: Request) => Promise<Response>,
+): FakeVaultSyncNamespace {
+	let idFromNameCalls = 0;
+	let calls = 0;
+	const stub = (): VaultRuntimeStubPort => ({
+		fetch: async (input: RequestInfo | URL, init?: RequestInit) =>
+			await fetchImpl(input instanceof Request ? input : new Request(String(input), init)),
+	});
+	const namespace: FakeVaultSyncNamespace = {
+		get calls() {
+			return calls;
+		},
+		get idFromNameCalls() {
+			return idFromNameCalls;
+		},
+		idFromName: (name: string) => {
+			idFromNameCalls++;
+			return makeDurableObjectId(name);
+		},
+		get: () => {
+			calls++;
+			return stub();
+		},
+	};
+	return namespace;
+}
+/** The fetch-only recovery-job stub surface exercised by server tests. */
+export type FakeRecoveryJobStub = RecoveryJobStubPort;
+
+/** The named-actor recovery namespace surface exercised by server tests. */
+export interface FakeRecoveryJobNamespace extends RecoveryJobNamespacePort {
+	get(id: DurableObjectId): FakeRecoveryJobStub;
+}
+
+export function makeRecoveryJobNamespace(
+	fetchImpl: (req: Request) => Promise<Response>,
+): FakeRecoveryJobNamespace {
+	return {
+		idFromName: (name: string) => makeDurableObjectId(name),
+		get: () => ({
+			fetch: async (input: RequestInfo | URL, init?: RequestInit) =>
+				await fetchImpl(input instanceof Request ? input : new Request(String(input), init)),
+		}),
+	};
+}
+
+
+export interface FakeDurableObjectStateOptions {
+	onDeleteAll?: () => void | Promise<void>;
+	onDeleteAlarm?: () => void | Promise<void>;
+	getWebSockets?: (tag?: string) => WebSocket[];
+}
+
+class FakeDurableObjectStorage implements DurableObjectStorage {
+	constructor(private readonly options: FakeDurableObjectStateOptions) {}
+
+	get sql(): never {
+		throw new Error("FakeDurableObjectStorage: sql is not implemented");
+	}
+
+	get kv(): never {
+		throw new Error("FakeDurableObjectStorage: kv is not implemented");
+	}
+
+	get(): never {
+		throw new Error("FakeDurableObjectStorage: get() is not implemented");
+	}
+
+	list(): never {
+		throw new Error("FakeDurableObjectStorage: list() is not implemented");
+	}
+
+	put(): never {
+		throw new Error("FakeDurableObjectStorage: put() is not implemented");
+	}
+
+	delete(): never {
+		throw new Error("FakeDurableObjectStorage: delete() is not implemented");
+	}
+
+	async deleteAll(): Promise<void> {
+		await this.options.onDeleteAll?.();
+	}
+
+	transaction(): never {
+		throw new Error("FakeDurableObjectStorage: transaction() is not implemented");
+	}
+
+	getAlarm(): never {
+		throw new Error("FakeDurableObjectStorage: getAlarm() is not implemented");
+	}
+
+	setAlarm(): never {
+		throw new Error("FakeDurableObjectStorage: setAlarm() is not implemented");
+	}
+
+	async deleteAlarm(): Promise<void> {
+		await this.options.onDeleteAlarm?.();
+	}
+
+	sync(): never {
+		throw new Error("FakeDurableObjectStorage: sync() is not implemented");
+	}
+
+	transactionSync<T>(closure: () => T): T {
+		return closure();
+	}
+
+	getCurrentBookmark(): never {
+		throw new Error("FakeDurableObjectStorage: getCurrentBookmark() is not implemented");
+	}
+
+	getBookmarkForTime(): never {
+		throw new Error("FakeDurableObjectStorage: getBookmarkForTime() is not implemented");
+	}
+
+	onNextSessionRestoreBookmark(): never {
+		throw new Error("FakeDurableObjectStorage: onNextSessionRestoreBookmark() is not implemented");
+	}
+}
+
+/** A complete Durable Object state with explicit hooks for the operations a suite uses. */
+export function makeDurableObjectState(options: FakeDurableObjectStateOptions = {}): DurableObjectState {
+	return {
+		props: {},
+		id: makeDurableObjectId("fake-durable-object"),
+		storage: new FakeDurableObjectStorage(options),
+		waitUntil: () => {},
+		blockConcurrencyWhile: async <T>(callback: () => Promise<T>) => await callback(),
+		acceptWebSocket: () => {},
+		getWebSockets: (tag?: string) => options.getWebSockets?.(tag) ?? [],
+		setWebSocketAutoResponse: () => {},
+		getWebSocketAutoResponse: () => null,
+		getWebSocketAutoResponseTimestamp: () => null,
+		setHibernatableWebSocketEventTimeout: () => {},
+		getHibernatableWebSocketEventTimeout: () => null,
+		getTags: () => [],
+		abort: (reason?: string): never => {
+			throw new Error(reason ?? "FakeDurableObjectState: abort()");
+		},
+	};
+}
+
 
 // ---------------------------------------------------------------------------
 // R2
