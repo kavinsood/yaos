@@ -164,18 +164,22 @@ function makeState(overrides: Partial<TraceHeaderStateInput> = {}): TraceHeaderS
 			indexedDbError: false,
 			indexedDbErrorDetails: null,
 			serverReceiptStartupValidation: "validated",
-			serverReceiptEchoCounters: {
-				customMessageSeenCount: 0,
-				svEchoSeenCount: 0,
-				acceptedCount: 0,
-				rejectedCount: 0,
-			},
 			activeCrdtPathCount: 2,
 			blobPathCount: 0,
 			syncableMarkdownFileCountOnDisk: 2,
 			openFileCount: 1,
 			documentSchemaVersionSupportedByClient: 2,
 			documentSchemaVersionStoredInDocument: 2,
+		},
+		recoveryState: {
+			readiness: "retrying",
+			storageAvailable: true,
+			projectionState: "retrying",
+			projectionLag: 2,
+			activeCaptureId: "capture-1",
+			captureState: "retrying",
+			activeRestoreId: null,
+			restoreState: null,
 		},
 		syncFacts: {
 			headlineState: "online",
@@ -263,6 +267,15 @@ s.section("Test 0: server receipt startup validation detail");
 		syncState.serverReceiptStartupValidationExplanation ===
 			"skipped: local Yjs cache did not finish loading; persisted receipt candidate was not trusted this session",
 		"header explains that skipped startup validation means the persisted candidate was not trusted",
+	);
+}
+
+{
+	const { header } = await buildTraceHeader(makeInput());
+	const recoveryState = header.recoveryState as Record<string, unknown>;
+	s.check(
+		recoveryState.readiness === "retrying" && recoveryState.projectionLag === 2,
+		"diagnostics expose recovery retry and lag independently from connected sync state",
 	);
 }
 

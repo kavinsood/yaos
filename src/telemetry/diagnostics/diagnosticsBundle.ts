@@ -103,13 +103,22 @@ export interface TraceHeaderStateInput {
 		indexedDbError: boolean;
 		indexedDbErrorDetails: unknown;
 		serverReceiptStartupValidation: string | null;
-		serverReceiptEchoCounters: unknown;
 		activeCrdtPathCount: number;
 		blobPathCount: number;
 		syncableMarkdownFileCountOnDisk: number;
 		openFileCount: number;
 		documentSchemaVersionSupportedByClient: number | null;
 		documentSchemaVersionStoredInDocument: number | null | undefined;
+	};
+	recoveryState: {
+		readiness: "unavailable" | "preparing" | "ready" | "retrying" | "gaps" | "failure";
+		storageAvailable: boolean | null;
+		projectionState: string | null;
+		projectionLag: number | null;
+		activeCaptureId: string | null;
+		captureState: string | null;
+		activeRestoreId: string | null;
+		restoreState: string | null;
 	};
 	syncFacts: SyncFacts;
 	/** Raw HTTP trace context — passed through opaquely. */
@@ -282,6 +291,7 @@ export async function buildTraceHeader(
 				),
 			}
 			: null,
+		recoveryState: state?.recoveryState ?? null,
 		vaultVersusCrdtComparison: state
 			? {
 				filesMissingOnDisk,

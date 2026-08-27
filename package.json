@@ -63,10 +63,8 @@
 		"fflate": "^0.8.2",
 		"js-yaml": "4.3.1",
 		"obsidian": "1.13.1",
-		"partyserver": "0.3.2",
 		"qrcode": "^1.5.4",
 		"y-codemirror.next": "^0.3.5",
-		"y-indexeddb": "^9.0.12",
 		"y-partyserver": "2.1.2",
 		"yjs": "^13.6.20"
 	}

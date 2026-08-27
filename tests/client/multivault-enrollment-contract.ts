@@ -173,6 +173,8 @@ s.test("fully unenrolled folder can enroll without replacement confirmation", as
 					deviceId: "new-device",
 					deviceToken: "new-token",
 					deviceName: "Server device name",
+					vaultGeneration: "new-generation",
+					originImport: true,
 				},
 			};
 		},
@@ -192,6 +194,8 @@ s.test("fully unenrolled folder can enroll without replacement confirmation", as
 		settings.vaultId !== "new-vault" ||
 		settings.deviceId !== "new-device" ||
 		settings.deviceToken !== "new-token" ||
+		settings.vaultGeneration !== "new-generation" ||
+		settings.originImportPending !== true ||
 		settings.deviceName !== "Server device name"
 	) {
 		throw new Error(`server enrollment was not persisted: ${JSON.stringify(settings)}`);
@@ -217,6 +221,7 @@ async function exerciseIncompleteEnrollment(
 				vaultId: "old-vault",
 				deviceId: "old-device",
 				deviceToken: "old-token",
+				vaultGeneration: "old-generation",
 			}
 			: {}),
 	};
@@ -285,6 +290,7 @@ s.test("successful replacement retires the captured old membership before persis
 		vaultId: "old-vault",
 		deviceId: "old-device",
 		deviceToken: "old-token",
+		vaultGeneration: "old-generation",
 		deviceName: "Existing device",
 	};
 	const events: string[] = [];
@@ -314,6 +320,8 @@ s.test("successful replacement retires the captured old membership before persis
 					deviceId: "new-device",
 					deviceToken: "new-token",
 					deviceName: "Replacement device",
+					vaultGeneration: "new-generation",
+					originImport: false,
 				},
 			};
 		},
@@ -346,6 +354,7 @@ s.test("successful replacement retires the captured old membership before persis
 		deviceToken: "old-token",
 		vaultId: "old-vault",
 		deviceId: "old-device",
+		vaultGeneration: "old-generation",
 	};
 	if (JSON.stringify(retiredMembership) !== JSON.stringify(expectedMembership)) {
 		throw new Error(`old enrollment was not captured exactly: ${JSON.stringify(retiredMembership)}`);
@@ -380,8 +389,14 @@ s.section("Roster and leave stay device-scoped");
 	s.check(main.includes('method: "DELETE"'), "leave attempts to revoke this device");
 	s.check(main.includes("await this.teardownSync()"), "leave tears down locally even after revoke failure");
 	s.check(main.includes("settings.deviceToken = \"\"") && main.includes("settings.deviceId = \"\""), "leave clears local membership");
-	s.check(main.includes("await VaultSync.deleteIdb(vaultId, await this.ensureFolderKey())"), "leave deletes only this folder's vault database");
-	s.check(main.includes("clearServerReceiptCandidate"), "leave clears this enrollment's server-receipt candidate");
+	s.check(
+		main.includes("database.deleteDatabaseAfterClose(preflight, { discardPendingWork: true })"),
+		"leave deletes only the active folder-scoped schema-4 database",
+	);
+	s.check(
+		main.includes("const preflight = await database?.getPendingWorkSummary()"),
+		"leave accounts for body candidates in the same folder database before deletion",
+	);
 }
 
 s.section("Device credentials are device-scoped");

@@ -13,7 +13,6 @@ import {
 	getLabelFromConnectionState,
 	getServerReceiptStatusLabel,
 	SERVER_RECEIPT_STATUS_TITLE,
-	SERVER_RECEIPT_STATUS_TITLE_LEGACY,
 	getServerReceiptStatusTitle,
 	type ServerReceiptStatus,
 } from "../../src/status/statusBarController";
@@ -85,43 +84,36 @@ s.check(withTransfer.includes("Connected"), "base label present with transfer");
 const withoutTransfer = label({ kind: "online", generation: 1 }, null);
 s.check(!withoutTransfer.includes("null"), "null transferStatus not rendered");
 
-s.section("Test 4b: server receipt status labels distinguish current and historical facts");
+s.section("Test 4b: schema-4 server receipt status is always durable");
 const receiptBase: ServerReceiptStatus = {
-	// Untracked by default; every case that cares overrides it in the spread.
 	serverAppliedLocalState: null,
 	lastServerReceiptEchoAt: null,
 	lastKnownServerReceiptEchoAt: null,
 	candidatePersistenceHealthy: true,
 	serverReceiptStartupValidation: "validated",
+	serverPersistenceDegraded: false,
 };
 const observedAt = Date.UTC(2026, 4, 10, 12, 34);
 const observedTime = new Date(observedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 s.check(
-	getServerReceiptStatusLabel({ ...receiptBase, serverAppliedLocalState: true }, true) ===
-		"Receipt: server received latest local state",
-	"connected + true identifies the latest local state as received by the server",
+	getServerReceiptStatusLabel({ ...receiptBase, serverAppliedLocalState: true }, true)
+		=== "Receipt: server saved latest local state",
+	"connected receipt states the durable storage guarantee",
 );
 s.check(
-	getServerReceiptStatusLabel({ ...receiptBase, serverAppliedLocalState: false }, true) ===
-		"Receipt: local state not yet received by server",
-	"connected + false identifies the local state as not yet received",
+	getServerReceiptStatusLabel({ ...receiptBase, serverAppliedLocalState: false }, true)
+		=== "Receipt: local state not yet received by server",
+	"connected false identifies the local state as not yet received",
 );
 s.check(
-	getServerReceiptStatusLabel({ ...receiptBase, serverAppliedLocalState: false }, false) ===
-		"Receipt: offline — local state not yet received by server",
-	"offline + false retains the current local-state warning",
+	getServerReceiptStatusLabel({ ...receiptBase, serverAppliedLocalState: false }, false)
+		=== "Receipt: offline — local state not yet received by server",
+	"offline false retains the current local-state warning",
 );
 s.check(
-	getServerReceiptStatusLabel({ ...receiptBase, serverAppliedLocalState: true, lastServerReceiptEchoAt: observedAt }, false) ===
-		`Receipt: offline — server receipt at ${observedTime}`,
-	"offline + current-session echo identifies when the server receipt was observed",
-);
-s.check(
-	getServerReceiptStatusLabel(
-		{ ...receiptBase, serverAppliedLocalState: true, lastServerReceiptEchoAt: observedAt, receiptGuaranteeIsDurable: true },
-		false,
-	) === `Receipt: offline — server saved at ${observedTime}`,
-	"offline + durable marker reports when the write landed, not merely an echo",
+	getServerReceiptStatusLabel({ ...receiptBase, serverAppliedLocalState: true, lastServerReceiptEchoAt: observedAt }, false)
+		=== `Receipt: offline — server saved at ${observedTime}`,
+	"offline durable receipt reports when the write landed",
 );
 s.check(
 	getServerReceiptStatusLabel({
@@ -129,71 +121,23 @@ s.check(
 		serverAppliedLocalState: null,
 		lastKnownServerReceiptEchoAt: observedAt,
 	}, true) === `Receipt: last known server receipt at ${observedTime} — checking…`,
-	"historical receipt is explicitly marked as last known while current state is checked",
+	"historical receipt is explicitly marked while current state is checked",
 );
 s.check(
-	getServerReceiptStatusLabel({
-		...receiptBase,
-		serverAppliedLocalState: null,
-		serverReceiptStartupValidation: "skipped_local_yjs_timeout",
-	}, true) === "Receipt: unchecked — local cache still loading",
-	"startup validation skip is stated without claiming a server result",
-);
-s.check(
-	getServerReceiptStatusLabel({ ...receiptBase, serverAppliedLocalState: null }, true) === "Receipt: not tracked yet",
-	"unknown receipt without history is not tracked yet",
-);
-s.check(
-	getServerReceiptStatusLabel({ ...receiptBase, serverAppliedLocalState: true, candidatePersistenceHealthy: false }, true) ===
-		"Receipt: server received latest local state — receipt history not saved locally",
-	"receipt-history persistence degradation is stated precisely",
+	getServerReceiptStatusLabel({ ...receiptBase, serverAppliedLocalState: true, candidatePersistenceHealthy: false }, true)
+		=== "Receipt: server saved latest local state — receipt history not saved locally",
+	"local receipt-history degradation is stated precisely",
 );
 const receiptStatus = getLabelFromConnectionState(
 	{ kind: "online", generation: 1 },
 	null,
 	{ ...receiptBase, serverAppliedLocalState: true },
 );
-s.check(receiptStatus.includes("Receipt:"), "connection label includes receipt label when facts are provided");
-// The receipt never implies DELIVERY, in either guarantee level.  "Saved" is no
-// longer banned outright: against a server that reports storage confirmation it
-// is simply true, and the old blanket ban would force the UI to understate a
-// guarantee it actually has.
+s.check(/saved/i.test(receiptStatus), "connection label exposes durable receipt state");
+s.check(!/Synced|all devices|other devices/i.test(receiptStatus), "receipt never claims other-device delivery");
 s.check(
-	!/Synced|Confirmed|Acked|all devices|other devices/i.test(receiptStatus),
-	"receipt label never claims delivery to other devices",
-);
-s.check(
-	!/Saved|Durable/i.test(receiptStatus),
-	"without a durability marker the label does not claim a durable write",
-);
-
-const durableReceipt = getLabelFromConnectionState(
-	{ kind: "online", generation: 1 },
-	null,
-	{ ...receiptBase, serverAppliedLocalState: true, receiptGuaranteeIsDurable: true },
-);
-s.check(
-	/saved/i.test(durableReceipt),
-	"with a durability marker the label reports the write, not merely receipt",
-);
-s.check(
-	!/Synced|all devices|other devices/i.test(durableReceipt),
-	"the durable label still does not claim delivery",
-);
-
-s.check(
-	getServerReceiptStatusTitle({ ...receiptBase, receiptGuaranteeIsDurable: true }) ===
-		"Server receipt means this device’s latest local CRDT state was written to the server’s storage. It does not prove that another device received the change.",
-	"durable tooltip claims the write and still disclaims delivery",
-);
-s.check(
-	getServerReceiptStatusTitle(receiptBase) === SERVER_RECEIPT_STATUS_TITLE_LEGACY,
-	"a server without the marker falls back to the in-memory wording",
-);
-s.check(
-	/does not prove durable storage/.test(SERVER_RECEIPT_STATUS_TITLE_LEGACY)
-	&& !/does not prove durable storage/.test(SERVER_RECEIPT_STATUS_TITLE),
-	"the non-durable disclaimer survives only on the legacy wording",
+	getServerReceiptStatusTitle() === SERVER_RECEIPT_STATUS_TITLE,
+	"schema-4 tooltip states the one durable receipt contract",
 );
 const errorWithReceipt = getLabelFromConnectionState(
 	{ kind: "auth_failed", code: "unauthorized" },
@@ -226,4 +170,17 @@ for (const state of allStates) {
 	s.check(!seen.has(l), `label for ${state.kind} is distinct from previous labels`);
 	seen.add(l);
 }
+
+s.section("Test 6: recovery readiness is independent from sync connectivity");
+const recoveryRetrying = getLabelFromConnectionState(
+	{ kind: "online", generation: 1 },
+	null,
+	null,
+	0,
+	"retrying",
+);
+s.check(
+	recoveryRetrying.includes("YAOS: Connected") && recoveryRetrying.includes("Recovery retrying"),
+	"connected sync can report recovery retrying without becoming a sync error",
+);
 await s.done();

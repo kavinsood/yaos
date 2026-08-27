@@ -9,11 +9,11 @@ export interface CommandsRuntimeHost {
 	getSnapshotService(): SnapshotService | null;
 	getUntrackedFileCount(): number;
 	runReconciliation(mode: ReconcileMode): Promise<void>;
-	runSchemaMigrationToV2(): void;
 	importUntrackedFiles(): Promise<void>;
-	clearLocalServerReceiptState(): Promise<"cleared_persistent" | "cleared_memory_only" | "failed" | undefined>;
 	resetLocalCache(): void;
 	nuclearReset(): void;
+	exportVault(): Promise<void>;
+	restartPendingRestore(): Promise<void>;
 }
 
 export function registerCommands(
@@ -42,13 +42,6 @@ export function registerCommands(
 		},
 	});
 
-	registrar.addCommand({
-		id: "migrate-schema-v2",
-		name: "Migrate sync schema to v2",
-		callback: () => {
-			host.runSchemaMigrationToV2();
-		},
-	});
 
 	registrar.addCommand({
 		id: "import-untracked",
@@ -69,28 +62,6 @@ export function registerCommands(
 		},
 	});
 
-	registrar.addCommand({
-		id: "clear-local-server-receipt-state",
-		name: "Clear local server-receipt state",
-		callback: () => {
-			const vaultSync = host.getVaultSync();
-			if (!vaultSync) {
-				new Notice("Sync not initialized");
-				return;
-			}
-			void host.clearLocalServerReceiptState().then(
-				(result) => new Notice(
-					result === "cleared_persistent"
-						? "Local server-receipt state cleared."
-						: result === "cleared_memory_only"
-							? "Local server-receipt state cleared for this session. Persistent receipt store is unavailable."
-							: "Failed to clear local server-receipt state. Check console.",
-					result === "cleared_persistent" ? 4000 : 7000,
-				),
-				() => new Notice("Failed to clear local server-receipt state. Check console.", 5000),
-			);
-		},
-	});
 
 	registrar.addCommand({
 		id: "reset-cache",
@@ -110,6 +81,14 @@ export function registerCommands(
 	});
 
 	registrar.addCommand({
+		id: "recovery-status",
+		name: "Show recovery readiness and job status",
+		callback: async () => {
+			await host.getSnapshotService()?.showRecoveryStatus();
+		},
+	});
+
+	registrar.addCommand({
 		id: "snapshot-list",
 		name: "Browse and restore snapshots",
 		callback: async () => {
@@ -124,6 +103,22 @@ export function registerCommands(
 			await host.getSnapshotService()?.pruneSnapshots();
 		},
 	});
+	registrar.addCommand({
+		id: "restart-interrupted-restore",
+		name: "Resume interrupted restore",
+		callback: async () => {
+			await host.restartPendingRestore();
+		},
+	});
+
+	registrar.addCommand({
+		id: "export-portable-vault",
+		name: "Export portable vault backup",
+		callback: async () => {
+			await host.exportVault();
+		},
+	});
+
 
 	registrar.addCommand({
 		id: "nuclear-reset",

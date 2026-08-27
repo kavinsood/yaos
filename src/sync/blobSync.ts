@@ -18,16 +18,17 @@ import {
 	TFile,
 	normalizePath,
 	requestUrl,
+	arrayBufferToHex,
 	Notice,
 } from "obsidian";
-import type { VaultSync } from "./vaultSync";
-import { isBlobSyncable, type BlobRef } from "../types";
-import { ORIGIN_SEED } from "./origins";
+import { type BlobRef } from "../types";
 import {
 	appendTraceParams,
 	type TraceHttpContext,
 	type TraceRecord,
 } from "../observability/traceContext";
+import { PRODUCT_EVENT_KIND, type ProductEventKind } from "../observability/productEventKinds";
+import type { ProductFlightPathEventInput } from "../observability/traceSink";
 import {
 	type BlobHashCache,
 	getCachedHash,
@@ -35,7 +36,25 @@ import {
 	removeCachedHash,
 } from "./blobHashCache";
 import { PreservedUnresolvedRegistry, type PreservedUnresolvedEntry, type PreservedUnresolvedReason } from "./preservedUnresolved";
-import { sha256BytesHex } from "../utils/sha256";
+import { safeBlobPath } from "./pathPolicy";
+
+export type AttachmentCatalogChange =
+	| { kind: "upsert"; path: string; ref: BlobRef; local: boolean }
+	| { kind: "tombstone"; path: string; previousHash: string | null; local: boolean };
+
+/**
+ * Durable attachment metadata surface implemented by the canonical VaultSync
+ * root document. Blob bytes remain content-addressed and live behind /blobs.
+ */
+export interface AttachmentCatalogPort {
+	listAttachmentRefs(): Iterable<[string, BlobRef]>;
+	getAttachmentRef(path: string): BlobRef | undefined;
+	isAttachmentTombstoned(path: string): boolean;
+	setAttachmentRef(path: string, hash: string, size: number, mime: string): void | Promise<void>;
+	deleteAttachmentRef(path: string, device?: string): void | Promise<void>;
+	renameAttachmentRef(oldPath: string, newPath: string): void | Promise<void>;
+	observeAttachmentChanges(callback: (change: AttachmentCatalogChange) => void): () => void;
+}
 
 // -------------------------------------------------------------------
 // Config
@@ -114,7 +133,7 @@ interface ExistsResult {
 class BlobHttpClient {
 	constructor(
 		private host: string,
-		private deviceToken: string,
+		private token: string,
 		private vaultId: string,
 		private trace?: TraceHttpContext,
 	) {}
@@ -131,7 +150,7 @@ class BlobHttpClient {
 
 	private authHeaders(): Record<string, string> {
 		return {
-			Authorization: `Bearer ${this.deviceToken}`,
+			Authorization: `Bearer ${this.token}`,
 		};
 	}
 
@@ -192,6 +211,14 @@ class BlobHttpClient {
 	}
 }
 
+// -------------------------------------------------------------------
+// Hashing
+// -------------------------------------------------------------------
+
+async function hashArrayBuffer(data: ArrayBuffer): Promise<string> {
+	const hashBuffer = await crypto.subtle.digest("SHA-256", data);
+	return arrayBufferToHex(hashBuffer);
+}
 
 /**
  * Guess MIME type from file extension.
@@ -326,6 +353,11 @@ export class BlobSyncManager {
 	private uploadQueue = new Map<string, UploadItem>();
 	/** Pending downloads keyed by path (deduped). */
 	private downloadQueue = new Map<string, DownloadItem>();
+	private readonly forcedDownloadWaiters = new Map<string, Array<{
+		hash: string;
+		resolve: () => void;
+		reject: (error: Error) => void;
+	}>>();
 
 	/** Debounce timers for upload scheduling (keyed by path). */
 	private uploadDebounce = new Map<string, number>();
@@ -359,10 +391,7 @@ export class BlobSyncManager {
 	private _blobConflictArtifacts = 0;
 	private localOnlyBlobConflictPaths = new Set<string>();
 	private remoteDeleteInFlight = new Set<string>();
-	private remoteDeleteHashesByTransaction = new WeakMap<
-		import("yjs").Transaction,
-		Map<string, string>
-	>();
+	private readonly quarantinedInvalidPaths = new Map<string, string>();
 
 	/** CRDT map observer cleanup functions. */
 	private observerCleanups: (() => void)[] = [];
@@ -383,13 +412,14 @@ export class BlobSyncManager {
 	private readonly maxConcurrency: number;
 	private readonly maxSize: number;
 	private readonly debug: boolean;
+	private readonly excludePatterns: readonly string[];
 
 	/** External blob hash cache (owned by main.ts, persisted to data.json). */
 	private hashCache: BlobHashCache;
 
 	constructor(
 		private app: App,
-		private vaultSync: VaultSync,
+		private attachmentCatalog: AttachmentCatalogPort,
 		settings: {
 			host: string;
 			deviceToken: string;
@@ -397,12 +427,14 @@ export class BlobSyncManager {
 			maxAttachmentSizeKB: number;
 			attachmentConcurrency: number;
 			debug: boolean;
+			excludePatterns?: readonly string[];
 			trace?: TraceHttpContext;
 		},
 		hashCache: BlobHashCache,
 		private trace?: TraceRecord,
 		initialPreservedUnresolved: PreservedUnresolvedEntry[] = [],
 		private onPreservedUnresolvedChanged?: () => void,
+		private recordFlightPathEvent?: (event: ProductFlightPathEventInput) => void,
 	) {
 		this.blobClient = new BlobHttpClient(
 			settings.host,
@@ -413,6 +445,7 @@ export class BlobSyncManager {
 		this.maxConcurrency = settings.attachmentConcurrency;
 		this.maxSize = settings.maxAttachmentSizeKB * 1024;
 		this.debug = settings.debug;
+		this.excludePatterns = settings.excludePatterns ?? [];
 		this.hashCache = hashCache;
 		this.preservedUnresolved = new PreservedUnresolvedRegistry(
 			initialPreservedUnresolved.filter((entry) => entry.kind === "blob"),
@@ -421,76 +454,94 @@ export class BlobSyncManager {
 	}
 
 	// -------------------------------------------------------------------
-	// CRDT observers (remote changes → download queue)
+	// Durable catalog observer (remote changes → disk work)
 	// -------------------------------------------------------------------
 
-	/**
-	 * Start observing pathToBlob and blobTombstones for remote changes.
-	 * Remote blob additions → schedule download.
-	 * Remote tombstones → delete from disk.
-	 */
 	startObservers(): void {
-		// pathToBlob observer: remote add/update → download if missing
-		const blobObserver = (event: import("yjs").YMapEvent<BlobRef>) => {
-			event.changes.keys.forEach((change, path) => {
-				if (change.action === "add" || change.action === "update") {
-					if (event.transaction.origin === ORIGIN_SEED) return;
-					const ref = this.vaultSync.pathToBlob.get(path);
-					if (!ref) return;
-					this.log(
-						`observer: remote blob ref for "${path}" hash=${ref.hash.slice(0, 12)}…`,
-					);
-					this.scheduleDownload(path, ref.hash, ref.size);
-				}
-				if (change.action === "delete") {
-					if (event.transaction.origin === ORIGIN_SEED) return;
-					const oldRef = change.oldValue as BlobRef | undefined;
-					if (oldRef?.hash) {
-						let transactionHashes =
-							this.remoteDeleteHashesByTransaction.get(event.transaction);
-						if (!transactionHashes) {
-							transactionHashes = new Map();
-							this.remoteDeleteHashesByTransaction.set(
-								event.transaction,
-								transactionHashes,
-							);
-						}
-						transactionHashes.set(path, oldRef.hash);
-					}
-					void this.handleRemoteDelete(path, oldRef?.hash ?? null);
-				}
-			});
-		};
-		this.vaultSync.pathToBlob.observe(blobObserver);
-		this.observerCleanups.push(() =>
-			this.vaultSync.pathToBlob.unobserve(blobObserver),
-		);
-
-		// blobTombstones observer: remote tombstone → delete from disk
-		const tombObserver = (
-			event: import("yjs").YMapEvent<import("../types").BlobTombstone>,
-		) => {
-			event.changes.keys.forEach((change, path) => {
-				if (change.action === "add" || change.action === "update") {
-					if (event.transaction.origin === ORIGIN_SEED) return;
-					const transactionHashes =
-						this.remoteDeleteHashesByTransaction.get(event.transaction);
-					if (transactionHashes?.has(path)) return;
-					// Try to find known hash from pathToBlob (may already be deleted)
-					const ref = this.vaultSync.pathToBlob.get(path);
-					void this.handleRemoteDelete(path, ref?.hash ?? null);
-				}
-			});
-		};
-		this.vaultSync.blobTombstones.observe(tombObserver);
-		this.observerCleanups.push(() =>
-			this.vaultSync.blobTombstones.unobserve(tombObserver),
-		);
-
+		const cleanup = this.attachmentCatalog.observeAttachmentChanges((change) => {
+			if (change.local) return;
+			if (change.kind === "upsert") {
+				const path = this.validateBlobPath(change.path, "remote-catalog-upsert", change.ref);
+				if (!path) return;
+				this.log(
+					`observer: remote blob ref for "${path}" hash=${change.ref.hash.slice(0, 12)}…`,
+				);
+				this.recordAttachmentEvent(
+					PRODUCT_EVENT_KIND.attachmentDownloadDecision,
+					path,
+					"info",
+					"important",
+					{ decision: "queue-remote-upsert", hashPrefix: hashPrefix(change.ref.hash), sizeBytes: change.ref.size },
+				);
+				this.scheduleDownload(path, change.ref.hash, change.ref.size);
+				return;
+			}
+			const path = this.validateBlobPath(change.path, "remote-catalog-tombstone");
+			if (!path || (change.previousHash !== null && !/^[a-f0-9]{64}$/.test(change.previousHash))) {
+				if (path) this.validateBlobPath(change.path, "remote-tombstone-hash", { hash: change.previousHash ?? "", size: 0 });
+				return;
+			}
+			void this.handleRemoteDelete(path, change.previousHash);
+			this.recordAttachmentEvent(
+				PRODUCT_EVENT_KIND.deleteRemoteObserved,
+				path,
+				"info",
+				"critical",
+				{ subject: "attachment", previousHashPrefix: hashPrefix(change.previousHash) },
+			);
+		});
+		this.observerCleanups.push(cleanup);
 		this.log("Blob observers started");
 	}
 
+	private recordAttachmentEvent(
+		kind: ProductEventKind,
+		path: string,
+		severity: ProductFlightPathEventInput["severity"],
+		priority: ProductFlightPathEventInput["priority"],
+		data: Record<string, unknown>,
+	): void {
+		this.recordFlightPathEvent?.({
+			kind,
+			path,
+			severity,
+			priority,
+			scope: "file",
+			source: "blobSync",
+			layer: "blob",
+			data,
+		});
+	}
+
+	private validateBlobPath(
+		path: string,
+		context: string,
+		ref?: BlobRef,
+	): string | null {
+		const canonical = safeBlobPath(path, this.excludePatterns, this.app.vault.configDir, ref);
+		if (
+			canonical &&
+			(!ref || this.maxSize <= 0 || ref.size <= this.maxSize)
+		) return canonical;
+		if (this.quarantinedInvalidPaths.size >= 1_000 && !this.quarantinedInvalidPaths.has(path)) {
+			const oldest = this.quarantinedInvalidPaths.keys().next().value as string | undefined;
+			if (oldest !== undefined) this.quarantinedInvalidPaths.delete(oldest);
+		}
+		this.quarantinedInvalidPaths.set(path, context);
+		this.trace?.("blob", "invalid-path-quarantined", {
+			context,
+			pathLength: path.length,
+			hashPrefix: ref?.hash.slice(0, 12) ?? null,
+			sizeBytes: ref?.size ?? null,
+		});
+		this.log(`Attachment catalog entry quarantined (${context})`);
+		return null;
+	}
+
 	private enqueueUpload(path: string, retries = 0, sizeBytes?: number): void {
+		const canonical = this.validateBlobPath(path, "upload-queue");
+		if (!canonical) return;
+		path = canonical;
 		const existing = this.uploadQueue.get(path);
 		if (existing) {
 			if (sizeBytes && sizeBytes > 0) existing.sizeBytes = sizeBytes;
@@ -520,6 +571,9 @@ export class BlobSyncManager {
 		sizeBytes?: number,
 		retries = 0,
 	): void {
+		const canonical = this.validateBlobPath(path, "download-queue", { hash, size: sizeBytes ?? 0 });
+		if (!canonical) return;
+		path = canonical;
 		const existing = this.downloadQueue.get(path);
 		if (existing) {
 			existing.hash = hash;
@@ -554,6 +608,7 @@ export class BlobSyncManager {
 	 * Debounces and queues upload.
 	 */
 	handleFileChange(file: TFile): void {
+		if (!this.validateBlobPath(file.path, "local-file-change")) return;
 		if (
 			this.localOnlyBlobConflictPaths.has(file.path) ||
 			isBlobConflictArtifactPath(file.path)
@@ -599,7 +654,10 @@ export class BlobSyncManager {
 	/**
 	 * Handle a local file delete for a blob-syncable file.
 	 */
-	handleFileDelete(path: string, device?: string): void {
+	async handleFileDelete(path: string, device?: string): Promise<void> {
+		const canonical = this.validateBlobPath(path, "local-file-delete");
+		if (!canonical) return;
+		path = canonical;
 		// Cancel any pending upload
 		const pendingUpload = this.uploadDebounce.get(path);
 		if (pendingUpload) {
@@ -616,9 +674,29 @@ export class BlobSyncManager {
 		// Remove from hash cache
 		removeCachedHash(this.hashCache, path);
 
-		this.vaultSync.deleteBlobRef(path, device);
+		await this.attachmentCatalog.deleteAttachmentRef(path, device);
+		this.recordAttachmentEvent(
+			PRODUCT_EVENT_KIND.attachmentTombstoned,
+			path,
+			"info",
+			"critical",
+			{ device: device ?? null },
+		);
 	}
 
+	async handleFileRename(oldPath: string, newPath: string): Promise<void> {
+		const safeOldPath = this.validateBlobPath(oldPath, "local-file-rename-source");
+		const safeNewPath = this.validateBlobPath(newPath, "local-file-rename-target");
+		if (!safeOldPath || !safeNewPath) return;
+		await this.attachmentCatalog.renameAttachmentRef(safeOldPath, safeNewPath);
+		this.recordAttachmentEvent(
+			PRODUCT_EVENT_KIND.attachmentRenamed,
+			safeNewPath,
+			"info",
+			"important",
+			{ fromPath: safeOldPath },
+		);
+	}
 	/**
 	 * Returns true if this path was preserved during a remote-delete because
 	 * no hash baseline was available to verify local state.
@@ -662,18 +740,9 @@ export class BlobSyncManager {
 		// Collect non-md, non-excluded disk files
 		const diskBlobs = new Map<string, TFile>();
 		for (const file of this.app.vault.getFiles()) {
-			if (
-				!isBlobSyncable(
-					file.path,
-					excludePatterns,
-					this.app.vault.configDir,
-				)
-			)
-				continue;
-
-			// Size check
+			const canonical = safeBlobPath(file.path, excludePatterns, this.app.vault.configDir);
+			if (!canonical || canonical !== file.path) continue;
 			if (this.maxSize > 0 && file.stat.size > this.maxSize) continue;
-
 			if (
 				this.localOnlyBlobConflictPaths.has(file.path) ||
 				isBlobConflictArtifactPath(file.path)
@@ -681,34 +750,37 @@ export class BlobSyncManager {
 				skipped++;
 				continue;
 			}
-
-			diskBlobs.set(file.path, file);
+			diskBlobs.set(canonical, file);
 		}
 
-		// Collect CRDT blob paths (non-tombstoned)
+		// Collect validated catalog blob paths (non-tombstoned).
 		const crdtBlobPaths = new Set<string>();
-		this.vaultSync.pathToBlob.forEach((_ref, path) => {
-			if (!this.vaultSync.isBlobTombstoned(path)) {
-				crdtBlobPaths.add(path);
+		for (const [rawPath, ref] of this.attachmentCatalog.listAttachmentRefs()) {
+			const path = this.validateBlobPath(rawPath, "reconcile-catalog", ref);
+			if (!path) {
+				skipped++;
+				continue;
 			}
-		});
+			if (!this.attachmentCatalog.isAttachmentTombstoned(path)) crdtBlobPaths.add(path);
+		}
 
 		// CRDT blobs not on disk → schedule download
 		for (const path of crdtBlobPaths) {
-			if (!diskBlobs.has(path)) {
-				const ref = this.vaultSync.pathToBlob.get(path);
-				if (ref) {
-					this.scheduleDownload(path, ref.hash, ref.size);
-					downloadQueued++;
-				}
+			if (diskBlobs.has(path)) continue;
+			const ref = this.attachmentCatalog.getAttachmentRef(path);
+			if (!ref || !this.validateBlobPath(path, "reconcile-download", ref)) {
+				skipped++;
+				continue;
 			}
+			this.scheduleDownload(path, ref.hash, ref.size);
+			downloadQueued++;
 		}
 
 		// Disk blobs not in CRDT → schedule upload (authoritative only)
 		// Disk blobs IN CRDT but with different hash → schedule upload (content changed offline)
 		for (const [path, file] of diskBlobs) {
 			// Check tombstone
-			if (this.vaultSync.isBlobTombstoned(path)) {
+			if (this.attachmentCatalog.isAttachmentTombstoned(path)) {
 				skipped++;
 				continue;
 			}
@@ -725,7 +797,7 @@ export class BlobSyncManager {
 				// Both sides have this path — check for hash mismatch
 				// (file was modified while offline, e.g. image edited externally)
 				if (mode === "authoritative") {
-					const ref = this.vaultSync.pathToBlob.get(path);
+					const ref = this.attachmentCatalog.getAttachmentRef(path);
 					if (ref) {
 						const fileStat = {
 							mtime: file.stat.mtime,
@@ -833,12 +905,15 @@ export class BlobSyncManager {
 
 	private async processUpload(item: UploadItem): Promise<void> {
 		const start = Date.now();
+		const normalized = this.validateBlobPath(item.path, "upload-before-disk-read");
+		if (!normalized) {
+			this.uploadQueue.delete(item.path);
+			return;
+		}
 		this.log(
-			`upload: started "${item.path}" (attempt ${item.retries + 1})`,
+			`upload: started "${normalized}" (attempt ${item.retries + 1})`,
 		);
 		try {
-			const normalized = normalizePath(item.path);
-
 			// Guard: do not upload preserved-unresolved paths or local-only
 			// blob conflict artifacts. This can happen
 			// if a queue snapshot was restored with a stale entry for a path
@@ -901,12 +976,12 @@ export class BlobSyncManager {
 			if (!hash) {
 				// Cache miss — read and hash the file
 				data = await this.app.vault.readBinary(file);
-				hash = await sha256BytesHex(data);
+				hash = await hashArrayBuffer(data);
 				setCachedHash(this.hashCache, item.path, fileStat, hash);
 			}
 
 			// Check if CRDT already has this exact hash for this path
-			const existingRef = this.vaultSync.getBlobRef(item.path);
+			const existingRef = this.attachmentCatalog.getAttachmentRef(item.path);
 			if (existingRef && existingRef.hash === hash) {
 				if (item.needsRerun) {
 					item.needsRerun = false;
@@ -946,11 +1021,25 @@ export class BlobSyncManager {
 				this.log(
 					`upload: "${item.path}" already in R2 (dedup), updating CRDT only`,
 				);
+				this.recordAttachmentEvent(
+					PRODUCT_EVENT_KIND.attachmentUploadDecision,
+					item.path,
+					"info",
+					"important",
+					{ decision: "deduplicated", hashPrefix: hashPrefix(hash), sizeBytes: file.stat.size },
+				);
 			}
 
 			// Two-phase commit: update CRDT only after successful upload
 			const mime = guessMime(item.path);
-			this.vaultSync.setBlobRef(item.path, hash, file.stat.size, mime);
+			await this.attachmentCatalog.setAttachmentRef(item.path, hash, file.stat.size, mime);
+			this.recordAttachmentEvent(
+				PRODUCT_EVENT_KIND.attachmentUploadComplete,
+				item.path,
+				"info",
+				"important",
+				{ hashPrefix: hashPrefix(hash), sizeBytes: file.stat.size, deduplicated: present.includes(hash) },
+			);
 			this._completedUploads++;
 			if (item.needsRerun) {
 				item.needsRerun = false;
@@ -1044,21 +1133,13 @@ export class BlobSyncManager {
 	 */
 	prioritizeDownloads(paths: string[]): number {
 		let queued = 0;
-		for (const path of paths) {
-			// Already queued
-			if (this.downloadQueue.has(path)) continue;
-
-			// Check if file exists on disk already
-			const existing = this.app.vault.getAbstractFileByPath(
-				normalizePath(path),
-			);
+		for (const rawPath of paths) {
+			const ref = this.attachmentCatalog.getAttachmentRef(rawPath);
+			const path = ref ? this.validateBlobPath(rawPath, "prioritized-download", ref) : null;
+			if (!ref || !path || this.downloadQueue.has(path)) continue;
+			const existing = this.app.vault.getAbstractFileByPath(path);
 			if (existing instanceof TFile) continue;
-
-			// Look up the blob ref in the CRDT
-			const ref = this.vaultSync.pathToBlob.get(path);
-			if (!ref) continue;
-			if (this.vaultSync.isBlobTombstoned(path)) continue;
-
+			if (this.attachmentCatalog.isAttachmentTombstoned(path)) continue;
 			this.enqueueDownload(path, ref.hash, ref.size);
 			queued++;
 		}
@@ -1070,6 +1151,47 @@ export class BlobSyncManager {
 			this.kickDownloadDrain();
 		}
 		return queued;
+	}
+
+	/**
+	 * Recovery-only download: ignores an existing disk replica, waits until the
+	 * selected snapshot bytes are durably written, and fails on any conflict.
+	 */
+	async forceDownloads(paths: string[]): Promise<number> {
+		const pending: Promise<void>[] = [];
+		this.openDownloadGate("recovery-restore");
+		let queued = 0;
+		for (const rawPath of new Set(paths)) {
+			const ref = this.attachmentCatalog.getAttachmentRef(rawPath);
+			const path = ref ? this.validateBlobPath(rawPath, "forced-recovery-download", ref) : null;
+			if (!path || !ref || this.attachmentCatalog.isAttachmentTombstoned(path)) {
+				throw new Error(`attachment recovery target is unavailable: ${rawPath}`);
+			}
+			pending.push(new Promise<void>((resolve, reject) => {
+				const waiters = this.forcedDownloadWaiters.get(path) ?? [];
+				waiters.push({ hash: ref.hash, resolve, reject });
+				this.forcedDownloadWaiters.set(path, waiters);
+			}));
+			this.enqueueDownload(path, ref.hash, ref.size);
+			queued++;
+		}
+		if (queued === 0) return 0;
+		this.kickDownloadDrain();
+		await Promise.all(pending);
+		return queued;
+	}
+
+	private settleForcedDownload(path: string, hash: string, error?: Error): void {
+		const waiters = this.forcedDownloadWaiters.get(path);
+		if (!waiters) return;
+		const remaining = waiters.filter((waiter) => waiter.hash !== hash);
+		for (const waiter of waiters) {
+			if (waiter.hash !== hash) continue;
+			if (error) waiter.reject(error);
+			else waiter.resolve();
+		}
+		if (remaining.length > 0) this.forcedDownloadWaiters.set(path, remaining);
+		else this.forcedDownloadWaiters.delete(path);
 	}
 
 	private kickDownloadDrain(): void {
@@ -1120,12 +1242,26 @@ export class BlobSyncManager {
 
 	private async processDownload(item: DownloadItem): Promise<void> {
 		const start = Date.now();
+		const catalogRef = this.attachmentCatalog.getAttachmentRef(item.path);
+		const normalized = catalogRef
+			? this.validateBlobPath(item.path, "download-before-read", catalogRef)
+			: null;
+		if (
+			!catalogRef ||
+			!normalized ||
+			this.attachmentCatalog.isAttachmentTombstoned(normalized) ||
+			catalogRef.hash !== item.hash
+		) {
+			this.downloadQueue.delete(item.path);
+			this.settleForcedDownload(item.path, item.hash, new Error("attachment recovery target changed before download"));
+			return;
+		}
+		item.sizeBytes = catalogRef.size;
+		const forced = this.forcedDownloadWaiters.get(item.path)?.some((waiter) => waiter.hash === item.hash) === true;
 		this.log(
-			`download: started "${item.path}" (attempt ${item.retries + 1})`,
+			`download: started "${normalized}" (attempt ${item.retries + 1})`,
 		);
 		try {
-			const normalized = normalizePath(item.path);
-
 			// Check if file already exists with matching hash
 			const existing = this.app.vault.getAbstractFileByPath(normalized);
 			let diskHashBefore: string | null = null;
@@ -1135,16 +1271,14 @@ export class BlobSyncManager {
 					mtime: existing.stat.mtime,
 					size: existing.stat.size,
 				};
-				let diskHash = getCachedHash(
-					this.hashCache,
-					item.path,
-					fileStat,
-				);
+				let diskHash = forced
+					? null
+					: getCachedHash(this.hashCache, item.path, fileStat);
 
 				if (!diskHash) {
 					try {
 						const data = await this.app.vault.readBinary(existing);
-						diskHash = await sha256BytesHex(data);
+						diskHash = await hashArrayBuffer(data);
 						setCachedHash(
 							this.hashCache,
 							item.path,
@@ -1159,6 +1293,7 @@ export class BlobSyncManager {
 
 				if (diskHash === item.hash) {
 					this.downloadQueue.delete(item.path);
+					this.settleForcedDownload(item.path, item.hash);
 					this.log(
 						`download: "${item.path}" already matches, skipping`,
 					);
@@ -1181,11 +1316,35 @@ export class BlobSyncManager {
 			let targetHasRemoteBytes = false;
 
 			// Verify hash of downloaded data
-			const downloadHash = await sha256BytesHex(data);
+			const downloadHash = await hashArrayBuffer(data);
 			if (downloadHash !== item.hash) {
+				this.recordAttachmentEvent(
+					PRODUCT_EVENT_KIND.attachmentIntegrityFailed,
+					item.path,
+					"error",
+					"critical",
+					{ expectedHashPrefix: hashPrefix(item.hash), actualHashPrefix: hashPrefix(downloadHash) },
+				);
 				throw new Error(
 					`Hash mismatch: expected ${item.hash.slice(0, 12)}… got ${downloadHash.slice(0, 12)}…`,
 				);
+			}
+
+			const currentRef = this.attachmentCatalog.getAttachmentRef(normalized);
+			if (
+				!currentRef ||
+				!this.validateBlobPath(normalized, "download-before-disk-write", currentRef) ||
+				this.attachmentCatalog.isAttachmentTombstoned(normalized) ||
+				currentRef.hash !== item.hash ||
+				currentRef.size !== data.byteLength
+			) {
+				this.downloadQueue.delete(item.path);
+				this.settleForcedDownload(item.path, item.hash, new Error("attachment recovery target changed during download"));
+				this.trace?.("blob", "download-target-changed-quarantined", {
+					hashPrefix: hashPrefix(item.hash),
+					sizeBytes: data.byteLength,
+				});
+				return;
 			}
 
 			// Suppress path to prevent re-upload from vault event
@@ -1230,6 +1389,9 @@ export class BlobSyncManager {
 						action: "overwrite-existing",
 						sizeBytes: data.byteLength,
 					});
+					if (!this.validateBlobPath(existing.path, "download-immediate-before-modify", currentRef)) {
+						throw new Error("unsafe attachment modify path");
+					}
 					await this.app.vault.modifyBinary(existing, data);
 					targetHasRemoteBytes = true;
 					this.log(
@@ -1262,6 +1424,9 @@ export class BlobSyncManager {
 					}
 				}
 				try {
+					if (!this.validateBlobPath(normalized, "download-immediate-before-create", currentRef)) {
+						throw new Error("unsafe attachment create path");
+					}
 					await this.app.vault.createBinary(normalized, data);
 					targetHasRemoteBytes = true;
 					this.log(
@@ -1285,7 +1450,7 @@ export class BlobSyncManager {
 					if (!diskHash) {
 						const existingData =
 							await this.app.vault.readBinary(resolved);
-						diskHash = await sha256BytesHex(existingData);
+						diskHash = await hashArrayBuffer(existingData);
 						setCachedHash(
 							this.hashCache,
 							item.path,
@@ -1349,7 +1514,21 @@ export class BlobSyncManager {
 				}
 			}
 
+			const forcedAtCompletion = this.forcedDownloadWaiters.get(item.path)?.some((waiter) => waiter.hash === item.hash) === true;
+			if (forcedAtCompletion && !targetHasRemoteBytes) {
+				this.downloadQueue.delete(item.path);
+				this.settleForcedDownload(item.path, item.hash, new Error("attachment recovery conflicted with a local disk change"));
+				return;
+			}
+			if (forcedAtCompletion) this.settleForcedDownload(item.path, item.hash);
 			this._completedDownloads++;
+			this.recordAttachmentEvent(
+				PRODUCT_EVENT_KIND.attachmentDownloadComplete,
+				item.path,
+				"info",
+				"important",
+				{ hashPrefix: hashPrefix(item.hash), sizeBytes: data.byteLength, wroteTarget: targetHasRemoteBytes },
+			);
 			if (item.needsRerun) {
 				item.needsRerun = false;
 				item.status = "pending";
@@ -1389,6 +1568,7 @@ export class BlobSyncManager {
 				}
 				this.downloadQueue.delete(item.path);
 				this._permanentDownloadFailures++;
+				this.settleForcedDownload(item.path, item.hash, new Error(`attachment recovery download failed: ${reason}`));
 				this.trace?.("blob", "download-permanently-failed", {
 					path: item.path,
 					retries: item.retries,
@@ -1412,7 +1592,7 @@ export class BlobSyncManager {
 		if (cachedHash) return cachedHash;
 		try {
 			const data = await this.app.vault.readBinary(file);
-			const hash = await sha256BytesHex(data);
+			const hash = await hashArrayBuffer(data);
 			setCachedHash(this.hashCache, path, fileStat, hash);
 			return hash;
 		} catch {
@@ -1431,11 +1611,8 @@ export class BlobSyncManager {
 	 * rename, or delete the artifact. If they want the remote version to sync,
 	 * they should replace the original file manually.
 	 *
-	 * Markdown conflict artifacts (from ReconciliationController) are created via
-	 * vault.create() WITHOUT suppression, so they DO sync. This difference is
-	 * deliberate: Markdown conflicts involve CRDT state that is already part of
-	 * the sync model, while blob conflicts involve raw binary data racing against
-	 * a local file change.
+	 * Markdown conflicts are handled by the canonical document pipeline, while
+	 * blob conflicts preserve raw binary bytes racing with a local file change.
 	 */
 	private async writeDownloadConflictArtifact(
 		targetPath: string,
@@ -1451,12 +1628,15 @@ export class BlobSyncManager {
 			if (this.app.vault.getAbstractFileByPath(conflictPath)) continue;
 			try {
 				this.suppress(conflictPath);
+				if (!this.validateBlobPath(conflictPath, "conflict-immediate-before-create")) {
+					throw new Error("unsafe attachment conflict path");
+				}
 				await this.app.vault.createBinary(conflictPath, data);
 				this.localOnlyBlobConflictPaths.add(conflictPath);
 				const freshStat =
 					await this.app.vault.adapter.stat(conflictPath);
 				if (freshStat) {
-					const hash = await sha256BytesHex(data);
+					const hash = await hashArrayBuffer(data);
 					setCachedHash(
 						this.hashCache,
 						conflictPath,
@@ -1510,7 +1690,8 @@ export class BlobSyncManager {
 		path: string,
 		knownHash: string | null,
 	): Promise<void> {
-		const normalized = normalizePath(path);
+		const normalized = this.validateBlobPath(path, "remote-delete-before-lookup");
+		if (!normalized || (knownHash !== null && !/^[a-f0-9]{64}$/.test(knownHash))) return;
 		if (this.remoteDeleteInFlight.has(normalized) && !knownHash) {
 			this.trace?.("blob", "remote-delete-duplicate-ignored", {
 				path: normalized,
@@ -1546,7 +1727,7 @@ export class BlobSyncManager {
 							if (!localHash) {
 								try {
 									const data = await this.app.vault.readBinary(file);
-									localHash = await sha256BytesHex(data);
+									localHash = await hashArrayBuffer(data);
 									setCachedHash(
 										this.hashCache,
 										normalized,
@@ -1621,6 +1802,13 @@ export class BlobSyncManager {
 					this.log(
 						`handleRemoteDelete: deleted "${normalized}" from disk`,
 					);
+					this.recordAttachmentEvent(
+						PRODUCT_EVENT_KIND.deleteDiskApplied,
+						normalized,
+						"info",
+						"critical",
+						{ subject: "attachment" },
+					);
 				} else if (decision.kind === "preserve-revive") {
 					// Clear any prior unresolved marker — we now have a baseline.
 					if (this.preservedUnresolved.resolve(normalized)) {
@@ -1636,8 +1824,9 @@ export class BlobSyncManager {
 					this.log(
 						`handleRemoteDelete: preserved locally modified "${normalized}" (hash mismatch with known ${knownHash!.slice(0, 12)}…)`,
 					);
-					if (this.vaultSync.isBlobTombstoned?.(normalized)) {
-						this.vaultSync.blobTombstones.delete(normalized);
+					if (this.attachmentCatalog.isAttachmentTombstoned(normalized)) {
+						this.enqueueUpload(normalized, 0, file.stat.size);
+						this.kickUploadDrain();
 						this.trace?.(
 							"blob",
 							"remote-delete-preserved-tombstone-cleared",
@@ -1680,6 +1869,9 @@ export class BlobSyncManager {
 	}
 
 	private async deleteLocalReplica(file: TFile): Promise<"trash"> {
+		if (!this.validateBlobPath(file.path, "remote-delete-before-disk-delete")) {
+			throw new Error("unsafe attachment delete path");
+		}
 		await this.app.fileManager.trashFile(file);
 		return "trash";
 	}
@@ -1834,39 +2026,39 @@ export class BlobSyncManager {
 
 		if (snapshot.uploads) {
 			for (const item of snapshot.uploads) {
-				if (
-					!this.uploadQueue.has(item.path) &&
-					!this.uploadDebounce.has(item.path)
-				) {
-					this.uploadQueue.set(item.path, {
-						path: item.path,
-						sizeBytes: item.sizeBytes,
-						retries: item.retries ?? 0,
-						status: "pending",
-						readyAt: 0,
-						needsRerun: item.needsRerun ?? false,
-						rerunResets: item.rerunResets ?? 0,
-					});
-					restored++;
-				}
+				const path = this.validateBlobPath(item.path, "restored-upload-queue");
+				if (!path || this.uploadQueue.has(path) || this.uploadDebounce.has(path)) continue;
+				this.uploadQueue.set(path, {
+					path,
+					sizeBytes: item.sizeBytes,
+					retries: item.retries ?? 0,
+					status: "pending",
+					readyAt: 0,
+					needsRerun: item.needsRerun ?? false,
+					rerunResets: item.rerunResets ?? 0,
+				});
+				restored++;
 			}
 		}
 
 		if (snapshot.downloads) {
 			for (const item of snapshot.downloads) {
-				if (!this.downloadQueue.has(item.path)) {
-					this.downloadQueue.set(item.path, {
-						path: item.path,
-						hash: item.hash,
-						sizeBytes: item.sizeBytes,
-						retries: item.retries ?? 0,
-						status: "pending",
-						readyAt: 0,
-						needsRerun: item.needsRerun ?? false,
-						rerunResets: item.rerunResets ?? 0,
-					});
-					restored++;
-				}
+				const path = this.validateBlobPath(item.path, "restored-download-queue", {
+					hash: item.hash,
+					size: item.sizeBytes ?? 0,
+				});
+				if (!path || this.downloadQueue.has(path)) continue;
+				this.downloadQueue.set(path, {
+					path,
+					hash: item.hash,
+					sizeBytes: item.sizeBytes,
+					retries: item.retries ?? 0,
+					status: "pending",
+					readyAt: 0,
+					needsRerun: item.needsRerun ?? false,
+					rerunResets: item.rerunResets ?? 0,
+				});
+				restored++;
 			}
 		}
 
@@ -1899,9 +2091,14 @@ export class BlobSyncManager {
 		let dropped = 0;
 		for (const [path, item] of this.downloadQueue) {
 			if (item.status !== "pending") continue;
-			const existing = this.app.vault.getAbstractFileByPath(
-				normalizePath(path),
-			);
+			const ref = this.attachmentCatalog.getAttachmentRef(path);
+			const canonical = ref ? this.validateBlobPath(path, "download-gate-prune", ref) : null;
+			if (!ref || !canonical || ref.hash !== item.hash) {
+				this.downloadQueue.delete(path);
+				dropped++;
+				continue;
+			}
+			const existing = this.app.vault.getAbstractFileByPath(canonical);
 			if (!(existing instanceof TFile)) continue;
 
 			const fileStat = {
@@ -1943,8 +2140,13 @@ export class BlobSyncManager {
 		this.suppressedPaths.clear();
 		this.localOnlyBlobConflictPaths.clear();
 		this.remoteDeleteInFlight.clear();
+		this.quarantinedInvalidPaths.clear();
 		this.preservedUnresolved.clear();
 		this.log("BlobSyncManager destroyed");
+		for (const waiters of this.forcedDownloadWaiters.values()) {
+			for (const waiter of waiters) waiter.reject(new Error("attachment sync stopped during recovery download"));
+		}
+		this.forcedDownloadWaiters.clear();
 	}
 
 	getDebugSnapshot(): {
@@ -1960,6 +2162,7 @@ export class BlobSyncManager {
 		permanentDownloadFailures: number;
 		blobConflictArtifacts: number;
 		localOnlyBlobConflictPaths: number;
+		quarantinedInvalidPaths: number;
 		preservedUnresolved: ReturnType<PreservedUnresolvedRegistry["getSummary"]>;
 		uploadQueue: string[];
 		downloadQueue: string[];
@@ -1979,6 +2182,7 @@ export class BlobSyncManager {
 			permanentDownloadFailures: this._permanentDownloadFailures,
 			blobConflictArtifacts: this._blobConflictArtifacts,
 			localOnlyBlobConflictPaths: this.localOnlyBlobConflictPaths.size,
+			quarantinedInvalidPaths: this.quarantinedInvalidPaths.size,
 			preservedUnresolved: this.preservedUnresolved.getSummary(),
 			uploadQueue: Array.from(this.uploadQueue.values())
 				.filter((item) => item.status === "pending")

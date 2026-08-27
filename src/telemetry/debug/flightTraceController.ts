@@ -16,8 +16,6 @@ import { FLIGHT_KIND, FLIGHT_TAXONOMY_VERSION } from "../../observability/flight
 import type { FlightExportResult, TraceContext } from "./flightEvents";
 import { PathIdentityResolver, deriveSaltFingerprint, deriveVaultPathSalt } from "./pathIdentity";
 import { buildTraceHeader, type TraceHeaderStateInput } from "../diagnostics/diagnosticsBundle";
-import { getOrCreateLocalDeviceId } from "../../sync/indexedDbCandidateStore";
-import { randomId } from "../../utils/randomId";
 import { sha256TextHex } from "../../utils/sha256";
 import { formatUnknown } from "../../utils/format";
 
@@ -289,8 +287,7 @@ export class FlightTraceController {
 		const [vaultIdHash, serverHostHash, deviceId, pathSalt] = await Promise.all([
 			sha256TextHex(vaultId),
 			sha256TextHex(canonicalizeHost(host)),
-			(this.deps.getLocalDeviceId?.() ?? getOrCreateLocalDeviceId())
-				.catch(() => `ephemeral-${randomId(14)}`),
+			this.deps.getLocalDeviceId?.() ?? Promise.resolve(settings.deviceId.trim()),
 			deriveVaultPathSalt(sha256TextHex, vaultId),
 		]);
 		const saltFingerprint = await deriveSaltFingerprint(sha256TextHex, pathSalt);

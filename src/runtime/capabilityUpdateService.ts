@@ -12,6 +12,7 @@ import type { VaultSyncSettings } from "../settings";
 import { attachmentSizeCapKB } from "../settings/settingsStore";
 import { formatUnknown } from "../utils/format";
 import { compareSemver } from "../utils/semver";
+import { PROTOCOL_VERSION, SNAPSHOT_FORMAT_VERSION, STORAGE_FORMAT_VERSION } from "../sync/schema";
 
 export type PersistedServerCapabilitiesCache = {
 	host: string;
@@ -94,9 +95,14 @@ export function isServerCapabilities(value: unknown): value is ServerCapabilitie
 				Number.isSafeInteger(candidate.maxBlobUploadBytes) &&
 				candidate.maxBlobUploadBytes > 0)) &&
 		typeof candidate.serverVersion === "string" &&
-		(candidate.minPluginVersion === null || typeof candidate.minPluginVersion === "string") &&
-		(candidate.recommendedPluginVersion === null || typeof candidate.recommendedPluginVersion === "string") &&
 		(candidate.schemaVersion === null || typeof candidate.schemaVersion === "number") &&
+		Number.isSafeInteger(candidate.storageFormatVersion) &&
+		candidate.storageFormatVersion === 1 &&
+		Number.isSafeInteger(candidate.protocolVersion) &&
+		candidate.protocolVersion === 1 &&
+		Number.isSafeInteger(candidate.snapshotFormatVersion) &&
+		candidate.snapshotFormatVersion === 2 &&
+		typeof candidate.recoveryJobs === "boolean" &&
 		(candidate.updateProvider === null ||
 			candidate.updateProvider === "github" ||
 			candidate.updateProvider === "gitlab" ||
@@ -295,21 +301,16 @@ export class CapabilityUpdateService {
 			this.serverCapabilities?.updateProvider ||
 			"unknown";
 
-		let pluginCompatibilityWarning: string | null = null;
-		const minPluginVersion = this.serverCapabilities?.minPluginVersion ?? null;
-		if (minPluginVersion && compareSemver(this.deps.pluginVersion, minPluginVersion) === -1) {
-			pluginCompatibilityWarning =
-				`This server requires YAOS plugin ${minPluginVersion} or newer.`;
-		} else {
-			const serverSchemaVersion = this.serverCapabilities?.schemaVersion ?? null;
-			if (serverSchemaVersion !== null && this.deps.schemaVersion < serverSchemaVersion) {
-				pluginCompatibilityWarning =
-					`This server requires schema version ${serverSchemaVersion}.`;
-			} else if (serverSchemaVersion !== null && this.deps.schemaVersion > serverSchemaVersion) {
-				pluginCompatibilityWarning =
-					`This plugin uses schema version ${this.deps.schemaVersion}, but the server supports ${serverSchemaVersion}.`;
-			}
-		}
+		const serverSchemaVersion = this.serverCapabilities?.schemaVersion ?? null;
+		const pluginCompatibilityWarning = serverSchemaVersion !== null
+			&& (
+				serverSchemaVersion !== this.deps.schemaVersion
+				|| this.serverCapabilities?.storageFormatVersion !== STORAGE_FORMAT_VERSION
+				|| this.serverCapabilities?.protocolVersion !== PROTOCOL_VERSION
+				|| this.serverCapabilities?.snapshotFormatVersion !== SNAPSHOT_FORMAT_VERSION
+			)
+			? "This plugin and server use different schema, storage, protocol, or snapshot formats. Use a fresh compatible deployment."
+			: null;
 
 		return {
 			serverVersion,
@@ -365,30 +366,17 @@ export class CapabilityUpdateService {
 	private getHardCompatibilityBlockReason(): string | null {
 		if (this.capabilityProtocolError) return this.capabilityProtocolError;
 		if (!this.serverCapabilities) return null;
-		const minPluginVersion = this.serverCapabilities.minPluginVersion;
-		if (minPluginVersion && compareSemver(this.deps.pluginVersion, minPluginVersion) === -1) {
-			return `This server requires YAOS plugin ${minPluginVersion} or newer. Update this plugin before syncing.`;
-		}
-
 		const serverSchemaVersion = this.serverCapabilities.schemaVersion;
-		if (serverSchemaVersion !== null && this.deps.schemaVersion < serverSchemaVersion) {
-			return `This server requires schema version ${serverSchemaVersion}. Update this plugin before syncing.`;
-		}
-		if (serverSchemaVersion !== null && this.deps.schemaVersion > serverSchemaVersion) {
-			return `This plugin uses schema version ${this.deps.schemaVersion}, but this server supports ${serverSchemaVersion}. Update server first.`;
-		}
-
-		const minCompatibleServer = this.updateManifest?.minCompatibleServerVersionForPlugin ?? null;
-		const latestPluginVersion = this.updateManifest?.latestPluginVersion ?? null;
-		const serverVersion = this.serverCapabilities.serverVersion;
-		if (!minCompatibleServer || !latestPluginVersion || !serverVersion) {
-			return null;
-		}
-
-		const pluginVsLatest = compareSemver(this.deps.pluginVersion, latestPluginVersion);
-		const serverVsRequired = compareSemver(serverVersion, minCompatibleServer);
-		if (pluginVsLatest !== null && serverVsRequired !== null && pluginVsLatest >= 0 && serverVsRequired === -1) {
-			return `This plugin requires YAOS server ${minCompatibleServer} or newer. Update server first.`;
+		if (
+			serverSchemaVersion !== null
+			&& (
+				serverSchemaVersion !== this.deps.schemaVersion
+				|| this.serverCapabilities.storageFormatVersion !== STORAGE_FORMAT_VERSION
+				|| this.serverCapabilities.protocolVersion !== PROTOCOL_VERSION
+				|| this.serverCapabilities.snapshotFormatVersion !== SNAPSHOT_FORMAT_VERSION
+			)
+		) {
+			return "This plugin and server use different product formats. Use a fresh compatible deployment.";
 		}
 		return null;
 	}

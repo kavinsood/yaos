@@ -6,9 +6,9 @@ const s = suite("mandatory-socket-ticket");
 s.section("Provider credentials");
 {
 	const vaultSync = readSource("src/sync/vaultSync.ts");
-	s.check(vaultSync.includes("const ticket = await this._getSocketTicket()"), "provider fetches a ticket before connecting");
+	s.check(vaultSync.includes("const ticket = await this.options.getSocketTicket()"), "provider fetches a ticket before connecting");
 	s.check(vaultSync.includes("schemaVersion: String(SCHEMA_VERSION)") && vaultSync.includes("ticket: ticket.value"), "provider params contain schema version and ticket");
-	s.check(!vaultSync.includes("p.token") && !vaultSync.includes("longLivedToken"), "provider has no device-token fallback query path");
+	s.check(!vaultSync.includes("token: this.options.token"), "provider has no device-token fallback query path");
 	const ticketClient = readSource("src/sync/socketTicket.ts");
 	s.check(ticketClient.includes("get(host: string, deviceToken: string, vaultId: string)"), "ticket cache requires device credentials and vault scope");
 }

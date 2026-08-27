@@ -87,16 +87,25 @@ function makeFixture(initialPersistedQueue: BlobQueueSnapshot | null): Fixture {
 		},
 	});
 
-	const observedMap = {
-		observe: () => {},
-		unobserve: () => {},
-		get: () => undefined,
-		forEach: () => {},
-	};
+	const attachmentRefs = new Map<string, { hash: string; size: number }>(
+		(initialPersistedQueue?.downloads ?? []).flatMap((download) =>
+			download.sizeBytes === undefined
+				? []
+				: [[download.path, { hash: download.hash, size: download.sizeBytes }]],
+		),
+	);
 	const vaultSync = partialOf<VaultSync>({
-		pathToBlob: observedMap,
-		blobTombstones: observedMap,
-		isBlobTombstoned: () => false,
+		listAttachmentRefs: () => attachmentRefs,
+		getAttachmentRef: (path) => attachmentRefs.get(path),
+		isAttachmentTombstoned: () => false,
+		setAttachmentRef: async (path, hash, size) => { attachmentRefs.set(path, { hash, size }); },
+		deleteAttachmentRef: async (path) => { attachmentRefs.delete(path); },
+		renameAttachmentRef: async (oldPath, newPath) => {
+			const ref = attachmentRefs.get(oldPath);
+			if (ref) attachmentRefs.set(newPath, ref);
+			attachmentRefs.delete(oldPath);
+		},
+		observeAttachmentChanges: () => () => {},
 	});
 
 	const orchestrator = new AttachmentOrchestrator({
@@ -253,9 +262,9 @@ s.section("Attachment orchestrator queue lifecycle");
 {
 	const queued: BlobQueueSnapshot = {
 		uploads: [],
-		downloads: [{ path: "pending.bin", hash: "pending-hash", sizeBytes: 1 }],
+		downloads: [{ path: "pending.bin", hash: "a".repeat(64), sizeBytes: 1 }],
 	};
-	const fixture = makeFixture(null);
+	const fixture = makeFixture(queued);
 	fixture.orchestrator.hydrateSavedQueue(queued);
 	fixture.orchestrator.start("nonempty-control", false);
 	const expectedPersistedQueue = fixture.orchestrator.manager?.exportQueue() ?? null;

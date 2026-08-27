@@ -1,138 +1,16 @@
-// Regression tests for Phase 1.4 — connection fact derivation and update tracking.
-//
-// These modules are Obsidian-free, so both can be imported directly under jiti.
-//
-// UpdateTracker tests:
-//   Exercise the Y.Doc "update" event hook with a real Y.Doc and fake provider.
-//   Verify that local updates set lastLocalUpdateAt, remote updates set
-//   lastRemoteUpdateAt, and lastLocalUpdateWhileConnectedAt only updates when
-//   the tracker believes the WebSocket is open.
-//
-// deriveSyncFacts tests:
+// Connection-fact derivation stays independent of the schema-4 root/body
+// transport. Candidate durability is represented by explicit receipt facts.
 //   Drive the pure fact-derivation function with synthetic snapshots.
 //   Verify the three key honesty invariants:
 //     1. serverReachable is null when neither connected nor auth error received.
 //     2. authAccepted is false for explicit server rejections.
 //     3. pendingLocalCount stays null even when connected; socket-open is not server receipt.
 
-import * as Y from "yjs";
-import { UpdateTracker } from "../../src/sync/updateTracker";
 import { deriveSyncFacts, type SyncFactsSnapshot, type SyncFacts } from "../../src/runtime/connectionFacts";
 import { suite } from "../harness.ts";
 
 const s = suite("sync-facts");
 
-// ── UpdateTracker ─────────────────────────────────────────────────────────────
-
-s.section("Test 1: local update while connected sets lastLocalUpdateAt and lastLocalUpdateWhileConnectedAt");
-{
-	const doc = new Y.Doc();
-	const fakeProvider = { __sentinel: "provider" };
-	const tracker = new UpdateTracker();
-	let connected = true;
-
-	tracker.attach(doc, () => connected, fakeProvider as object);
-
-	const text = doc.getText("content");
-	doc.transact(() => {
-		text.insert(0, "hello");
-	}, "local-origin");
-
-	s.check(tracker.lastLocalUpdateAt !== null, "lastLocalUpdateAt set after local update");
-	s.check(tracker.lastLocalUpdateWhileConnectedAt !== null, "lastLocalUpdateWhileConnectedAt set when connected");
-	s.check(tracker.lastRemoteUpdateAt === null, "lastRemoteUpdateAt not set");
-	s.check(
-		tracker.lastLocalUpdateAt === tracker.lastLocalUpdateWhileConnectedAt,
-		"lastLocalUpdateWhileConnectedAt equals lastLocalUpdateAt when connected",
-	);
-}
-
-s.section("Test 2: local update while offline sets lastLocalUpdateAt but NOT lastLocalUpdateWhileConnectedAt");
-{
-	const doc = new Y.Doc();
-	const fakeProvider = { __sentinel: "provider" };
-	const tracker = new UpdateTracker();
-	let connected = false;
-
-	tracker.attach(doc, () => connected, fakeProvider as object);
-
-	const text = doc.getText("content");
-	doc.transact(() => {
-		text.insert(0, "offline edit");
-	}, "local-origin");
-
-	s.check(tracker.lastLocalUpdateAt !== null, "lastLocalUpdateAt set after offline edit");
-	s.check(tracker.lastLocalUpdateWhileConnectedAt === null, "lastLocalUpdateWhileConnectedAt null when offline");
-}
-
-s.section("Test 3: remote update (provider origin) sets lastRemoteUpdateAt only");
-{
-	const doc = new Y.Doc();
-	const fakeProvider = { __sentinel: "provider" };
-	const tracker = new UpdateTracker();
-
-	tracker.attach(doc, () => false, fakeProvider as object);
-
-	// Simulate a remote update: create a delta from another doc, apply with provider as origin
-	const remoteDoc = new Y.Doc();
-	const remoteText = remoteDoc.getText("content");
-	remoteDoc.transact(() => {
-		remoteText.insert(0, "remote content");
-	});
-	const update = Y.encodeStateAsUpdate(remoteDoc);
-
-	Y.applyUpdate(doc, update, fakeProvider);
-
-	s.check(tracker.lastRemoteUpdateAt !== null, "lastRemoteUpdateAt set after remote update");
-	s.check(tracker.lastLocalUpdateAt === null, "lastLocalUpdateAt not set for remote update");
-	s.check(tracker.lastLocalUpdateWhileConnectedAt === null, "lastLocalUpdateWhileConnectedAt not set for remote update");
-}
-
-s.section("Test 4: persistence-origin updates are ignored");
-{
-	const doc = new Y.Doc();
-	const fakeProvider = { __sentinel: "provider" };
-	const fakePersistence = { __sentinel: "persistence" };
-	const tracker = new UpdateTracker();
-
-	tracker.attach(doc, () => true, fakeProvider as object, fakePersistence as object);
-
-	// Simulate IDB cache load: apply update with persistence as origin
-	const cacheDoc = new Y.Doc();
-	const cacheText = cacheDoc.getText("content");
-	cacheDoc.transact(() => {
-		cacheText.insert(0, "cached content");
-	});
-	const update = Y.encodeStateAsUpdate(cacheDoc);
-
-	Y.applyUpdate(doc, update, fakePersistence);
-
-	s.check(tracker.lastLocalUpdateAt === null, "IDB cache load does not set lastLocalUpdateAt");
-	s.check(tracker.lastLocalUpdateWhileConnectedAt === null, "IDB cache load does not set lastLocalUpdateWhileConnectedAt");
-	s.check(tracker.lastRemoteUpdateAt === null, "IDB cache load does not set lastRemoteUpdateAt");
-}
-
-s.section("Test 5: lastLocalUpdateWhileConnectedAt only updates when connected at update time");
-{
-	const doc = new Y.Doc();
-	const fakeProvider = { __sentinel: "provider" };
-	const tracker = new UpdateTracker();
-	let connected = false;
-
-	tracker.attach(doc, () => connected, fakeProvider as object);
-
-	const text = doc.getText("content");
-
-	// Offline edit
-	doc.transact(() => { text.insert(0, "offline"); }, "edit-1");
-	s.check(tracker.lastLocalUpdateWhileConnectedAt === null, "no lastLocalUpdateWhileConnectedAt after offline edit");
-
-	// Go online, make another edit
-	connected = true;
-	doc.transact(() => { text.insert(7, " online"); }, "edit-2");
-	s.check(tracker.lastLocalUpdateWhileConnectedAt !== null, "lastLocalUpdateWhileConnectedAt set after online edit");
-	s.check(tracker.lastLocalUpdateAt! >= tracker.lastLocalUpdateWhileConnectedAt!, "lastLocalUpdateAt >= lastLocalUpdateWhileConnectedAt");
-}
 
 // ── deriveSyncFacts ────────────────────────────────────────────────────────────
 

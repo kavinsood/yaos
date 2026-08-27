@@ -206,9 +206,6 @@ function buildFixture(initial: {
 
 	const vaultSync = {
 		getTextForPath: (p: string) => (p === path ? ytext : null),
-		serverAckTracker: {
-			withActiveOpId: (_opId: string | undefined, fn: () => void) => fn(),
-		},
 		getFileIdForText: () => "stub-file-id",
 	};
 

@@ -95,7 +95,6 @@ export type ProductFlightSource = Extract<
 	| "reconciliationController"
 	| "connectionController"
 	| "blobSync"
-	| "serverAckTracker"
 >;
 
 /**

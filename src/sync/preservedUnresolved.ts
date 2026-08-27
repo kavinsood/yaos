@@ -11,6 +11,9 @@ export type PreservedUnresolvedReason =
 	| "three-way-preserve-failed"
 	| "multiple-editor-authorities"
 	| "path-collision"
+	| "body-open-deferred"
+	| "body-settlement-failed"
+	| "structural-batch-failed"
 	| "unknown";
 
 export interface PreservedUnresolvedEntry {

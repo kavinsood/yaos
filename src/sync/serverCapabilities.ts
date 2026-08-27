@@ -6,9 +6,11 @@ export interface ServerCapabilities {
 	snapshots: boolean;
 	maxBlobUploadBytes?: number;
 	serverVersion: string;
-	minPluginVersion: string | null;
-	recommendedPluginVersion: string | null;
 	schemaVersion: number | null;
+	storageFormatVersion: number;
+	protocolVersion: number;
+	snapshotFormatVersion: number;
+	recoveryJobs: boolean;
 	updateProvider: "github" | "gitlab" | "unknown" | null;
 	updateRepoUrl: string | null;
 	updateRepoBranch?: string | null;

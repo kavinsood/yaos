@@ -33,6 +33,7 @@ import type { TraceSink } from "../observability/traceSink";
 import type { FrontmatterQuarantineEntry } from "../sync/frontmatterQuarantine";
 import type { ReconciliationState } from "../runtime/reconciliationController";
 import type { VaultSyncReceiptSnapshot } from "../sync/vaultSync";
+import type { RecoveryReadiness } from "../snapshots/recoveryState";
 
 
 /**
@@ -51,6 +52,16 @@ export type RuntimeDiagnosticsState = Readonly<
 	> & {
 		awaitingFirstProviderSyncAfterStartup: boolean;
 		openFileCount: number;
+		recovery: {
+			readiness: RecoveryReadiness;
+			storageAvailable: boolean | null;
+			projectionState: string | null;
+			projectionLag: number | null;
+			activeCaptureId: string | null;
+			captureState: string | null;
+			activeRestoreId: string | null;
+			restoreState: string | null;
+		};
 	}
 >;
 
@@ -94,15 +105,6 @@ export interface SyncReadPort {
 	// Server receipt / ACK state
 	// ------------------------------------------------------------------
 	readonly serverReceipt: VaultSyncReceiptSnapshot;
-	readonly svEchoCounters: {
-		readonly customMessageSeenCount: number;
-		readonly svEchoSeenCount: number;
-		readonly acceptedCount: number;
-		readonly rejectedCount: number;
-		readonly rejectedOversizeCount: number;
-		readonly rejectedInvalidCount: number;
-		readonly bytesMax: number;
-	};
 
 	// ------------------------------------------------------------------
 	// Persistence health

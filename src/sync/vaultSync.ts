@@ -1,2338 +1,2637 @@
 import * as Y from "yjs";
 import YSyncProvider from "y-partyserver/provider";
-import { IndexeddbPersistence } from "y-indexeddb";
-import { normalizePath } from "obsidian";
-import { type BlobRef, type BlobMeta, type BlobTombstone } from "../types";
-import {
-	decodeFileMeta,
-	getMetaPath,
-	getMetaMtime,
-	isFileMetaDeletedValue,
-	ensureNestedMetaEntry,
-	createNestedActiveMeta,
-	buildMetaSnapshot,
-	computeMetaSemanticChanges,
-	computeMetaShapeStats,
-	extractAffectedFileIds,
-	computeIncrementalMetaChanges,
-	type DecodedFileMeta,
-	type MetaSemanticChange,
-	type MetaChangeBatch,
-	type MetaShapeStats,
-} from "./fileMeta";
-import { ORIGIN_SEED, isLocalOrigin } from "./origins";
-import type { VaultSyncSettings } from "../settings";
-import type { TraceRecord } from "../observability/traceContext";
-import { randomId } from "../utils/randomId";
-import { formatUnknown } from "../utils/format";
-import { sha256TextHex } from "../utils/sha256";
-import { UpdateTracker } from "./updateTracker";
-import { ServerAckTracker, type ServerAckState } from "./serverAckTracker";
-import { IndexedDbCandidateStore, getOrCreateLocalDeviceId } from "./indexedDbCandidateStore";
-import {
-	nextSysGeneration,
-	readSysGeneration,
-	receiptRoomName,
-	receiptLocalDeviceId,
-	vaultIdbName,
-} from "./vaultPersistence";
-import {
-	createSvEchoCounters,
-	handleSvEchoCustomMessage,
-	type SvEchoCounters,
-} from "./svEchoMessage";
-import {
-	readKnownRoomGeneration,
-	type CandidateStore,
-	type ScopeKey,
-	type ScopeMetadata,
-} from "./candidateStore";
+import type { Awareness } from "y-protocols/awareness";
+import { BodyManager, type LoadedBody } from "./bodyManager";
+import type {
+	StoredBodyCandidate,
+	StoredBodyReceipt,
+	StoredLifecycleOperation,
+	StoredDocument,
+} from "./vaultIndexedDb";
+import { obsidianRequest } from "../utils/http";
+import { patchTicketInUrl, TICKET_REFRESH_BUFFER_MS } from "./socketTicket";
+import { PROTOCOL_VERSION, SCHEMA_VERSION } from "./schema";
+import type { BlobMeta, BlobRef, BlobTombstone } from "../types";
+import { applyDiffToYText } from "./diff";
+import { safeBlobPath, safeMarkdownPath } from "./pathPolicy";
+import { ORIGIN_DISK_COMMIT } from "./origins";
+
 import { PRODUCT_EVENT_KIND } from "../observability/productEventKinds";
 import type { ProductFlightPathEventInput } from "../observability/traceSink";
-import { TICKET_REFRESH_BUFFER_MS, patchTicketInUrl } from "./socketTicket";
-import {
-	parseFatalAuthMessage,
-	type FatalAuthCode,
-} from "./fatalAuth";
+export const ROOT_DOCUMENT_ID = "root";
 
-/** Current schema version. Stored in sys.schemaVersion. */
-export { SCHEMA_VERSION } from "./schema";
-import { SCHEMA_VERSION } from "./schema";
-
-/** Timeouts for the startup sequence. */
-const LOCAL_PERSISTENCE_TIMEOUT_MS = 3_000;
-const PROVIDER_SYNC_TIMEOUT_MS = 10_000;
-
-/**
- * Reconnection config.
- * y-partyserver uses `2^n * 100ms` capped at `maxBackoffTime`.
- * Default is 2500ms which is aggressive for mobile. We raise it to 30s
- * and the natural jitter from network latency + varying reconnect
- * timing provides sufficient de-correlation.
- */
-const MAX_BACKOFF_TIME_MS = 30_000;
-
-/** Debounce window for batching rename events (folder renames). */
-const RENAME_BATCH_MS = 50;
-
-/** Reconciliation mode determines what operations are safe. */
-export type ReconcileMode = "conservative" | "authoritative";
-
-type IndexedDbErrorKind =
-	| "quota_exceeded"
-	| "blocked"
-	| "permission"
-	| "unknown";
-
-interface IndexedDbErrorDetails {
-	kind: IndexedDbErrorKind;
-	name: string | null;
-	message: string | null;
-	phase: "open" | "wait" | "runtime";
-	at: string;
+export interface SyncAwarenessPort {
+	setLocalStateField(field: string, value: unknown): void;
+	destroy(): void;
+	getStates(): Map<number, unknown>;
 }
+
+export interface SyncProviderPort {
+	readonly awareness: SyncAwarenessPort;
+	/** Object used as the Y.Doc transaction origin for remote provider updates. */
+	readonly documentOrigin?: unknown;
+	readonly ws: {
+		readonly readyState?: number;
+		terminate?: () => void;
+		close?: () => void;
+	} | null;
+	readonly wsconnected: boolean;
+	readonly wsconnecting: boolean;
+	readonly synced: boolean;
+	url: string;
+	connect(): void | Promise<void>;
+	disconnect(): void;
+	destroy(): void;
+	on(event: "status", callback: (event: { status: string }) => void): void;
+	on(event: "sync", callback: (synced: boolean) => void): void;
+	on(event: "custom-message", callback: (payload: string) => void): void;
+	on(event: "message", callback: (event: MessageEvent) => void): void;
+}
+
+export type FatalSyncCode =
+	| "unauthorized"
+	| "server_misconfigured"
+	| "server_format_unsupported"
+	| "unclaimed"
+	| "update_required";
+export interface FatalSyncDetails {
+	clientSchemaVersion: number | null;
+	roomSchemaVersion: number | null;
+	reason: string | null;
+}
+export type AttachmentCatalogChange =
+	| { kind: "upsert"; path: string; ref: BlobRef; local: boolean }
+	| { kind: "tombstone"; path: string; previousHash: string | null; local: boolean };
 
 export type ServerReceiptStartupValidation =
 	| "not_started"
 	| "validated"
-	| "skipped_local_yjs_timeout"
 	| "unavailable";
 
-export type VaultSyncReceiptSnapshot = Readonly<
-	Omit<ServerAckState, "candidatePersistenceHealthy"> & {
-		/** Null until receipt persistence initialization has been attempted. */
-		candidatePersistenceHealthy: boolean | null;
-		/** VaultSync could not create or open the local receipt store. */
-		persistenceUnavailable: boolean;
-		serverReceiptStartupValidation: ServerReceiptStartupValidation;
-		/** Renderer-local correlation IDs used by the read-only QA receipt API. */
-		candidateId: string | null;
-		lastConfirmedCandidateId: string | null;
+export interface VaultSyncReceiptSnapshot {
+	serverAppliedLocalState: boolean | null;
+	lastServerReceiptEchoAt: number | null;
+	lastKnownServerReceiptEchoAt: number | null;
+	candidatePersistenceHealthy: boolean | null;
+	candidatePersistenceFailureCount: number;
+	hasUnconfirmedCandidate: boolean;
+	candidateCapturedAt: number | null;
+	serverReceiptStartupValidation: ServerReceiptStartupValidation;
+	serverPersistenceDegraded: boolean;
+}
+
+export type ReconcileMode = "conservative" | "authoritative";
+
+
+/** Narrow port consumed by connection, editor, disk, telemetry, and command surfaces. */
+export interface SyncRuntimePort {
+	readonly provider: SyncProviderPort;
+	readonly localReady: boolean;
+	readonly connected: boolean;
+	readonly connectionGeneration: number;
+	readonly deviceId: string;
+	readonly fatalAuthError: boolean;
+	readonly fatalAuthCode: FatalSyncCode | null;
+	readonly fatalAuthDetails: FatalSyncDetails | null;
+	readonly lastLocalUpdateAt: number | null;
+	readonly hasPendingLocalWork?: boolean;
+	readonly lastLocalUpdateWhileConnectedAt: number | null;
+	readonly lastRemoteUpdateAt: number | null;
+	readonly serverAppliedLocalState: boolean | null;
+	readonly lastServerReceiptEchoAt: number | null;
+	readonly lastKnownServerReceiptEchoAt: number | null;
+	readonly candidatePersistenceHealthy: boolean | null;
+	readonly candidatePersistenceFailureCount: number;
+	readonly hasUnconfirmedServerReceiptCandidate: boolean;
+	readonly serverReceiptCandidateCapturedAt: number | null;
+	onProviderSync(callback: (generation: number) => void): void;
+	getTextForPath(path: string): Y.Text | null;
+	getBodyOrigin(path: string): unknown;
+	getBodyAwareness(path: string): SyncAwarenessPort;
+	getFileId(path: string): string | undefined;
+	getRecoveryLive(path: string): Promise<{
+		fileId: string;
+		bodyId: string;
+		generation: number;
+		contentHash: string;
+	} | null>;
+	getFileIdForText(text: Y.Text): string | undefined;
+	ensureFile(path: string, content: string, device?: string): Y.Text | null;
+	isPendingRenameTarget(path: string): boolean;
+	markPendingRenameTarget(path: string, bodyId: string): void;
+	clearPendingRenameTarget(path: string, bodyId?: string): void;
+	isMarkdownTombstoned(path: string): boolean;
+	acquireEditorBody?(path: string, consumerId: string): Promise<void>;
+	isEditorBodyReady?(path: string, consumerId: string): boolean;
+	releaseEditorBody?(path: string, consumerId: string): void;
+	reconnect?(): void | Promise<void>;
+	listAttachmentRefs(): Iterable<[string, BlobRef]>;
+	getAttachmentRef(path: string): BlobRef | undefined;
+	isAttachmentTombstoned(path: string): boolean;
+	setAttachmentRef(path: string, hash: string, size: number, mime: string): void | Promise<void>;
+	deleteAttachmentRef(path: string, device?: string): void | Promise<void>;
+	renameAttachmentRef(oldPath: string, newPath: string): void | Promise<void>;
+	observeAttachmentChanges(callback: (change: AttachmentCatalogChange) => void): () => void;
+	destroy(): Promise<void>;
+}
+
+export interface BodyHead {
+	bodyId: string;
+	generation: number;
+	contentHash?: string | null;
+	size?: number | null;
+	lifecycle?: "active" | "tombstoned" | "reaped";
+}
+export interface BodyState extends BodyHead {
+	encodedState: Uint8Array;
+}
+export type BodyReceipt = StoredBodyReceipt;
+export type CandidateRecord = StoredBodyCandidate;
+export type LifecycleKind = "create" | "delete" | "revive" | "rename";
+export interface LifecycleRequest {
+	operationId: string;
+	kind: LifecycleKind;
+	fileId: string;
+	bodyId: string;
+	path?: string;
+	fromPath?: string;
+	toPath?: string;
+	candidateId?: string;
+	candidateDigest?: string;
+}
+export interface LifecycleReceipt {
+	vaultId: string;
+	vaultGeneration: string;
+	bodyId: string;
+	operationId: string;
+	kind: LifecycleKind;
+	durableGeneration: number;
+	vaultSequence: number;
+	runtimeEpoch: string;
+}
+export type LifecyclePublicationOperation =
+	LifecycleRequest & { vaultSequence: number };
+export interface RootPublicationReceipt {
+	vaultGeneration: string;
+	operationIds: string[];
+	vaultSequence: number;
+	rootGeneration: number;
+	runtimeEpoch: string;
+}
+export interface LifecycleBatchReceipt {
+	receipts: LifecycleReceipt[];
+	vaultSequence: number;
+	runtimeEpoch: string;
+}
+
+export interface CandidateBatchReceipt {
+	receipts: BodyReceipt[];
+	highWater: number;
+}
+export interface BodyCommittedNotification {
+	type: "BODY_COMMITTED";
+	bodyId: string;
+	vaultGeneration: string;
+	durableGeneration: number;
+	runtimeEpoch: string;
+}
+export type VaultControlFrame =
+	| {
+		type: "VAULT_READY";
+		documentId: string;
+		vaultGeneration: string;
+		durableGeneration: number;
+		runtimeEpoch: string;
 	}
->;
+	| { type: "VAULT_BACKPRESSURE"; reason: string }
+	| { type: "VAULT_ERROR"; message: string };
+export interface DiskBodyCommitInput {
+	bodyId: string;
+	path: string;
+	content: string;
+	reason: string;
+	/** Required when the root path is absent; creation and revival are not inferred. */
+	lifecycle?: "create" | "revive";
+	candidateId?: string;
+	admissionStillCurrent?: () => boolean;
+}
+export interface DiskBodyCommitResult {
+	lifecycle: "create" | "revive" | null;
+	revived: boolean;
+	receipt: BodyReceipt | null;
+}
+export interface FreshBodyCommitInput {
+	bodyId: string;
+	path: string;
+	content: string;
+	reason: string;
+	candidateId: string;
+	admissionStillCurrent?: () => boolean;
+}
+export interface FreshBodyCommitResult {
+	fileId: string;
+	bodyId: string;
+	lifecycleOperationId: string;
+	receipt: BodyReceipt;
+}
+
+export interface FreshBodyBatchCommitResult {
+	results: FreshBodyCommitResult[];
+}
+export interface BodyCandidateCommitInput {
+	bodyId: string;
+	content: string;
+	candidateId: string;
+	reason: string;
+}
+export interface CandidatePersistencePort {
+	putCandidate(record: CandidateRecord): Promise<void>;
+	deleteCandidate(bodyId: string, candidateId: string): Promise<void>;
+	listCandidates(): Promise<CandidateRecord[]>;
+	confirmPendingCandidate?(receipt: BodyReceipt): Promise<void>;
+}
+export interface LifecyclePersistencePort {
+	deleteLifecycleOperations?(operationIds: readonly string[]): Promise<void>;
+	putLifecycleOperation(operation: StoredLifecycleOperation): Promise<void>;
+	listLifecycleOperations(): Promise<StoredLifecycleOperation[]>;
+	deleteLifecycleOperation(operationId: string): Promise<void>;
+}
+export type AttachmentPublicationMutation =
+	| { operationId: string; kind: "upsert"; path: string; hash: string; size: number; mime: string }
+	| { operationId: string; kind: "delete"; path: string }
+	| { operationId: string; kind: "rename"; fromPath: string; toPath: string };
+export interface AttachmentPublicationReceipt {
+	operationId: string;
+	vaultGeneration: string;
+	runtimeEpoch: string;
+	vaultSequence: number;
+	rootGeneration: number;
+	rootUpdateBase64Url: string;
+}
+export interface VaultServerPort {
+	currentHead(bodyId: string): Promise<BodyHead | null>;
+	currentBody(bodyId: string): Promise<BodyState>;
+	submitCandidate(record: CandidateRecord): Promise<BodyReceipt>;
+	submitCandidates?(records: readonly CandidateRecord[]): Promise<CandidateBatchReceipt>;
+	commitLifecycle(request: LifecycleRequest): Promise<LifecycleReceipt>;
+	commitCreateAdmissionsBatch?(
+		requests: readonly LifecycleRequest[],
+	): Promise<LifecycleBatchReceipt>;
+	publishLifecycleRoot(
+		operations: readonly LifecyclePublicationOperation[],
+		rootUpdate: Uint8Array,
+	): Promise<RootPublicationReceipt>;
+	commitLifecycleBatch(
+		requests: readonly LifecycleRequest[],
+	): Promise<LifecycleBatchReceipt>;
+	publishAttachment(mutation: AttachmentPublicationMutation): Promise<AttachmentPublicationReceipt>;
+}
+
+export interface ProviderFactoryInput {
+	kind: "root" | "body";
+	documentId: string;
+	doc: Y.Doc;
+}
+export type ProviderFactory = (input: ProviderFactoryInput) => SyncProviderPort;
+export interface SocketTicketResult {
+	value: string;
+	expiresAt: number;
+	localExpiresAt: number;
+	ttlMs: number;
+}
+
+export interface DocumentPersistencePort {
+	getDocument(documentId: string): Promise<StoredDocument | null>;
+	putDocument(document: StoredDocument): Promise<void>;
+	deleteDocument?(documentId: string): Promise<void>;
+	close(): Promise<void>;
+}
+
+export type VaultDatabasePort =
+	DocumentPersistencePort
+	& Partial<CandidatePersistencePort & LifecyclePersistencePort>;
+
+export interface VaultSyncOptions {
+	vaultId: string;
+	deviceId: string;
+	host: string;
+	token: string;
+	database: VaultDatabasePort;
+	server?: VaultServerPort;
+	providerFactory?: ProviderFactory;
+	getSocketTicket?: (force?: boolean) => Promise<SocketTicketResult | null>;
+	maxLoadedBodies?: number;
+	candidateDebounceMs?: number;
+	bodySyncTimeoutMs?: number;
+	candidateMaxWaitMs?: number;
+	now?: () => number;
+	log?: (message: string) => void;
+	onRemoteRootStructuralUpdate?: () => void | Promise<void>;
+	onDurableBodyCommitted?: (
+		notification: BodyCommittedNotification,
+	) => void | Promise<void>;
+	onProductEvent?: (event: ProductFlightPathEventInput) => void;
+	onControlFrame?: (frame: VaultControlFrame) => void;
+}
+
+interface BodySession {
+	bodyId: string;
+	doc: Y.Doc;
+	provider: SyncProviderPort;
+	consumers: Set<string>;
+	updateObserver: (update: Uint8Array, origin: unknown) => void;
+	ready: Promise<void>;
+}
+interface PendingCandidate {
+	record: CandidateRecord;
+	submission: Promise<BodyReceipt> | null;
+	path: string | null;
+}
+
+const BODY_TEXT_NAME = "body";
+
+const DEFAULT_MAX_LOADED_BODIES = 24;
+const DEFAULT_CANDIDATE_DEBOUNCE_MS = 250;
+export class FreshAdmissionCancelledError extends Error {
+	constructor(readonly path: string) {
+		super(`fresh admission cancelled for ${path}`);
+		this.name = "FreshAdmissionCancelledError";
+	}
+}
+
+const DEFAULT_CANDIDATE_MAX_WAIT_MS = 2_000;
+const DEFAULT_BODY_SYNC_TIMEOUT_MS = 10_000;
+const MAX_BACKOFF_TIME_MS = 30_000;
+const FATAL_CODES = new Set<FatalSyncCode>([
+	"unauthorized",
+	"server_misconfigured",
+	"server_format_unsupported",
+	"unclaimed",
+	"update_required",
+]);
+const ORIGIN_DURABLE_ROOT_PUBLICATION = "durable-root-publication";
+
+export function parseActiveBodyHead(bodyId: string, value: unknown): BodyHead | null {
+	if (value === null) return null;
+	if (!value || typeof value !== "object") throw new Error("invalid body head response");
+	const candidate = value as Partial<BodyHead>;
+	if (
+		candidate.bodyId !== bodyId
+		|| typeof candidate.generation !== "number"
+		|| (candidate.lifecycle !== undefined
+			&& candidate.lifecycle !== "active"
+			&& candidate.lifecycle !== "tombstoned"
+			&& candidate.lifecycle !== "reaped")
+		|| (candidate.contentHash !== undefined
+			&& candidate.contentHash !== null
+			&& (typeof candidate.contentHash !== "string" || !/^[a-f0-9]{64}$/.test(candidate.contentHash)))
+		|| (candidate.size !== undefined
+			&& candidate.size !== null
+			&& (typeof candidate.size !== "number" || !Number.isSafeInteger(candidate.size) || candidate.size < 0))
+	) throw new Error("invalid body head response");
+	if (candidate.lifecycle !== undefined && candidate.lifecycle !== "active") return null;
+	return {
+		bodyId,
+		generation: candidate.generation,
+		contentHash: candidate.contentHash,
+		size: candidate.size,
+		lifecycle: candidate.lifecycle,
+	};
+}
+
+function asFatalSyncMessage(payload: string): { code: FatalSyncCode; details: FatalSyncDetails } | null {
+	let value: unknown;
+	try {
+		value = JSON.parse(payload);
+	} catch {
+		return null;
+	}
+	if (!value || typeof value !== "object") return null;
+	const record = value as Record<string, unknown>;
+	if (record.type !== "error" || typeof record.code !== "string" || !FATAL_CODES.has(record.code as FatalSyncCode)) {
+		return null;
+	}
+	return {
+		code: record.code as FatalSyncCode,
+		details: {
+			clientSchemaVersion: typeof record.clientSchemaVersion === "number" ? record.clientSchemaVersion : null,
+			roomSchemaVersion: typeof record.roomSchemaVersion === "number" ? record.roomSchemaVersion : null,
+			reason: typeof record.reason === "string" ? record.reason : null,
+		},
+	};
+}
+export function parseVaultControlFrame(payload: string): VaultControlFrame | null {
+	let value: unknown;
+	try {
+		value = JSON.parse(payload);
+	} catch {
+		return null;
+	}
+	if (!value || typeof value !== "object") return null;
+	const record = value as Record<string, unknown>;
+	switch (record.type) {
+		case "VAULT_READY":
+			if (
+				typeof record.documentId !== "string"
+				|| typeof record.vaultGeneration !== "string"
+				|| !record.vaultGeneration
+				|| !Number.isSafeInteger(record.durableGeneration)
+				|| (record.durableGeneration as number) < 0
+				|| typeof record.runtimeEpoch !== "string"
+				|| !record.runtimeEpoch
+			) return null;
+			return {
+				type: "VAULT_READY",
+				documentId: record.documentId,
+				vaultGeneration: record.vaultGeneration,
+				durableGeneration: record.durableGeneration as number,
+				runtimeEpoch: record.runtimeEpoch,
+			};
+		case "VAULT_BACKPRESSURE":
+			return typeof record.reason === "string" && record.reason
+				? { type: "VAULT_BACKPRESSURE", reason: record.reason }
+				: null;
+		case "VAULT_ERROR":
+			return typeof record.message === "string" && record.message
+				? { type: "VAULT_ERROR", message: record.message }
+				: null;
+		default:
+			return null;
+	}
+}
+
+function asBodyCommittedNotification(payload: string): BodyCommittedNotification | null {
+	let value: unknown;
+	try {
+		value = JSON.parse(payload);
+	} catch {
+		return null;
+	}
+	if (!value || typeof value !== "object") return null;
+	const record = value as Record<string, unknown>;
+	if (
+		record.type !== "BODY_COMMITTED"
+		|| typeof record.bodyId !== "string"
+		|| typeof record.vaultGeneration !== "string"
+		|| !record.vaultGeneration
+		|| typeof record.durableGeneration !== "number"
+		|| !Number.isSafeInteger(record.durableGeneration)
+		|| record.durableGeneration < 0
+		|| typeof record.runtimeEpoch !== "string"
+		|| !record.runtimeEpoch
+	) {
+		return null;
+	}
+	return {
+		type: "BODY_COMMITTED",
+		bodyId: record.bodyId,
+		vaultGeneration: record.vaultGeneration,
+		durableGeneration: record.durableGeneration,
+		runtimeEpoch: record.runtimeEpoch,
+	};
+}
+async function sha256Hex(bytes: Uint8Array): Promise<string> {
+	const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes.slice().buffer));
+	return Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+function bytesToBase64(bytes: Uint8Array): string {
+	let binary = "";
+	for (const byte of bytes) binary += String.fromCharCode(byte);
+	return btoa(binary);
+}
+
+function base64UrlToBytes(value: string): Uint8Array {
+	const base64 = value.replace(/-/g, "+").replace(/_/g, "/")
+		.padEnd(Math.ceil(value.length / 4) * 4, "=");
+	const binary = atob(base64);
+	const bytes = new Uint8Array(binary.length);
+	for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
+	return bytes;
+}
+
+function adaptProvider(provider: YSyncProvider): SyncProviderPort {
+	return {
+		get awareness() { return provider.awareness; },
+		get documentOrigin() { return provider; },
+		get wsconnected() { return provider.wsconnected; },
+		get wsconnecting() { return provider.wsconnecting; },
+		get synced() { return provider.synced; },
+		get ws() { return provider.ws; },
+		get url() { return provider.url; },
+		set url(value: string) { provider.url = value; },
+		connect: () => provider.connect(),
+		disconnect: () => provider.disconnect(),
+		destroy: () => provider.destroy(),
+		on: ((event: string, callback: (...values: never[]) => void) => provider.on(event, callback)) as SyncProviderPort["on"],
+	};
+}
+
+/** Authenticated production HTTP adapter for currentness checks and durable candidates. */
+export class VaultSyncHttpPort implements VaultServerPort {
+	private readonly base: string;
+
+	constructor(host: string, private readonly vaultId: string, private readonly token: string) {
+		this.base = host.replace(/\/$/, "");
+	}
+
+	async currentHead(bodyId: string): Promise<BodyHead | null> {
+		const response = await obsidianRequest({
+			url: `${this.route("head")}/${encodeURIComponent(bodyId)}`,
+			method: "GET",
+			headers: this.headers(),
+		});
+		if (response.status === 404) return null;
+		if (response.status !== 200) throw new Error(`body head request failed (${response.status})`);
+		return parseActiveBodyHead(bodyId, response.json);
+	}
+
+	async currentBody(bodyId: string): Promise<BodyState> {
+		const response = await obsidianRequest({
+			url: `${this.route("body")}/${encodeURIComponent(bodyId)}`,
+			method: "GET",
+			headers: this.headers(),
+		});
+		if (response.status !== 200) throw new Error(`body state request failed (${response.status})`);
+		const returnedBodyId =
+			response.headers["x-yaos-body-id"]
+			?? response.headers["X-Yaos-Body-Id"];
+		if (returnedBodyId !== bodyId) throw new Error("body state identity mismatch");
+		const generation = Number(response.headers["x-yaos-generation"] ?? response.headers["X-Yaos-Generation"]);
+		if (!Number.isSafeInteger(generation) || generation < 0) throw new Error("body state omitted generation");
+		const contentHash =
+			response.headers["x-yaos-content-hash"]
+			?? response.headers["X-Yaos-Content-Hash"];
+		const sizeHeader =
+			response.headers["x-yaos-size"]
+			?? response.headers["X-Yaos-Size"];
+		if (!contentHash || !/^[a-f0-9]{64}$/.test(contentHash)) {
+			throw new Error("body state content hash is missing or invalid");
+		}
+		if (sizeHeader === undefined) throw new Error("body state size is missing");
+		const size = Number(sizeHeader);
+		if (!Number.isSafeInteger(size) || size < 0) {
+			throw new Error("body state size is invalid");
+		}
+		return {
+			bodyId,
+			generation,
+			contentHash,
+			size,
+			encodedState: new Uint8Array(response.arrayBuffer),
+		};
+	}
+
+	async submitCandidate(record: CandidateRecord): Promise<BodyReceipt> {
+		const response = await obsidianRequest({
+			url: `${this.route("body")}/${encodeURIComponent(record.bodyId)}/candidate`,
+			method: "POST",
+			contentType: "application/octet-stream",
+			body: record.encodedUpdate.slice(0),
+			headers: {
+				...this.headers(),
+				"x-yaos-candidate-id": record.candidateId,
+				"x-yaos-candidate-digest": record.candidateDigest,
+			},
+		});
+		if (response.status !== 200) throw new Error(`body candidate request failed (${response.status})`);
+		return response.json as BodyReceipt;
+	}
+
+	async commitLifecycle(request: LifecycleRequest): Promise<LifecycleReceipt> {
+		const response = await obsidianRequest({
+			url: this.route("lifecycle"),
+			method: "POST",
+			contentType: "application/json",
+			body: JSON.stringify(request),
+			headers: this.headers(),
+		});
+		if (response.status !== 200) {
+			throw new Error(`lifecycle commit failed (${response.status})`);
+		}
+		return response.json as LifecycleReceipt;
+	}
+
+	async commitLifecycleBatch(
+		requests: readonly LifecycleRequest[],
+	): Promise<LifecycleBatchReceipt> {
+		const response = await obsidianRequest({
+			url: this.route("lifecycle/batch"),
+			method: "POST",
+			contentType: "application/json",
+			body: JSON.stringify({ operations: requests }),
+			headers: this.headers(),
+		});
+		if (response.status !== 200) {
+			throw new Error(`lifecycle batch commit failed (${response.status})`);
+		}
+		return response.json as LifecycleBatchReceipt;
+	}
+	async publishLifecycleRoot(
+		operations: readonly LifecyclePublicationOperation[],
+		rootUpdate: Uint8Array,
+	): Promise<RootPublicationReceipt> {
+		const response = await obsidianRequest({
+			url: this.route("lifecycle/publish"),
+			method: "POST",
+			contentType: "application/json",
+			body: JSON.stringify({
+				operations,
+				rootUpdateBase64: bytesToBase64(rootUpdate),
+			}),
+			headers: this.headers(),
+		});
+		if (response.status !== 200) {
+			throw new Error(`lifecycle root publication failed (${response.status})`);
+		}
+		return response.json as RootPublicationReceipt;
+	}
+
+	async publishAttachment(mutation: AttachmentPublicationMutation): Promise<AttachmentPublicationReceipt> {
+		const response = await obsidianRequest({
+			url: this.route("attachments/publish"),
+			method: "POST",
+			contentType: "application/json",
+			body: JSON.stringify(mutation),
+			headers: this.headers(),
+		});
+		if (response.status !== 200) throw new Error(`attachment publication failed (${response.status})`);
+		return response.json as AttachmentPublicationReceipt;
+	}
+
+	private route(resource: string): string {
+		return `${this.base}/vault/${encodeURIComponent(this.vaultId)}/${resource}`;
+	}
+
+	private headers(): Record<string, string> {
+		return { Authorization: `Bearer ${this.token}` };
+	}
+}
 
 /**
- * Manages the vault-wide Y.Doc, the Worker sync provider, IndexedDB
- * persistence, and the shared Yjs maps.
- *
- * Schema:
- *   pathToId:        Y.Map<string>         — vault-relative path -> stable fileId (markdown)
- *   idToText:        Y.Map<Y.Text>         — fileId -> Y.Text (markdown content)
- *   meta:            Y.Map<Y.Map<unknown>>  — fileId -> nested metadata fields
- *   sys:             Y.Map<unknown>        — sentinel/bookkeeping { initialized, lastSync }
- *   pathToBlob:      Y.Map<BlobRef>        — vault-relative path -> { hash, size }
- *   blobMeta:        Y.Map<BlobMeta>       — sha256 hex -> { size, mime, createdAt }
- *   blobTombstones:  Y.Map<BlobTombstone>  — vault-relative path -> { deletedAt, device? }
+ * Canonical client runtime. Root synchronization and awareness remain on one
+ * provider; open Markdown bodies own ordinary reference-counted providers.
  */
-export class VaultSync {
-	readonly ydoc: Y.Doc;
-	readonly provider: YSyncProvider;
-	readonly persistence: IndexeddbPersistence;
-	readonly updateTracker: UpdateTracker;
-	readonly serverAckTracker: ServerAckTracker;
-
-	readonly pathToId: Y.Map<string>;
-	readonly idToText: Y.Map<Y.Text>;
-	readonly meta: Y.Map<unknown>;
-	readonly sys: Y.Map<unknown>;
-
-	// Blob / attachment maps (additive — schema version stays at 1)
-	readonly pathToBlob: Y.Map<BlobRef>;
-	readonly blobMeta: Y.Map<BlobMeta>;
-	readonly blobTombstones: Y.Map<BlobTombstone>;
-
-	/**
-	 * In-memory reverse map: Y.Text instance -> fileId.
-	 * Populated when texts are created/resolved. WeakMap so GC'd
-	 * Y.Text instances don't leak. Used by DiskMirror for O(1)
-	 * reverse lookups instead of scanning idToText.
-	 */
-	private _textToFileId = new WeakMap<Y.Text, string>();
-	private _pathIndex = new Map<string, string>(); // path -> fileId (active only)
-	private _deletedPathIndex = new Set<string>(); // tombstoned paths
-	private _pathIndexesDirty = true;
-
-	/**
-	 * Snapshot of decoded metadata used by the semantic observer.
-	 * Maintained by `_metaDeepObserver` and used to compute semantic diffs.
-	 */
-	private _metaSnapshot = new Map<string, DecodedFileMeta>();
-
-	/**
-	 * Counts how many times the `_metaDeepObserver` fell back to a full snapshot diff
-	 * because event paths were ambiguous. Should be zero in normal operation.
-	 * Exposed in debug stats so operators can confirm the incremental path is taken.
-	 */
-	private _metaObserverFallbackCount = 0;
-	private _metaSemanticListeners = new Set<(batch: MetaChangeBatch) => void>();
-
-	/**
-	 * The single shared `observeDeep` handler on the meta map.
-	 *
-	 * Uses incremental diffing: reads event paths to determine which fileIds
-	 * changed, then decodes only those entries. Falls back to a full snapshot
-	 * diff only if event paths are ambiguous.
-	 *
-	 * Preserves transaction origin so consumers can distinguish local from remote.
-	 */
-	private _metaDeepObserver = (events: Y.YEvent<Y.AbstractType<unknown>>[]) => {
-		const origin: unknown = events[0]?.transaction.origin;
-		const isLocal = isLocalOrigin(origin, this.provider);
-
-		let changes: MetaSemanticChange[];
-
-		// Try incremental diff first (O(k) where k = affected entries).
-		const affected = extractAffectedFileIds(events, this.meta);
-		if (affected !== null) {
-			changes = computeIncrementalMetaChanges(this._metaSnapshot, this.meta, affected);
-		} else {
-			// Fallback: full snapshot diff (O(N)). Increment counter for observability.
-			this._metaObserverFallbackCount++;
-			const nextSnapshot = buildMetaSnapshot(this.meta);
-			changes = computeMetaSemanticChanges(this._metaSnapshot, nextSnapshot);
-			this._metaSnapshot = nextSnapshot;
-		}
-
-		if (changes.length === 0) return;
-
-		this.invalidatePathIndexesForMetaChanges(changes);
-
-		// Dispatch to all registered listeners.
-		if (this._metaSemanticListeners.size > 0) {
-			const batch: MetaChangeBatch = { origin, isLocal, changes };
-			for (const listener of this._metaSemanticListeners) {
-				listener(batch);
-			}
-		}
-	};
-
-	/**
-	 * Invalidate lazily derived path indexes only for metadata that can change
-	 * path identity or the deterministic collision winner. Device metadata is
-	 * intentionally excluded; mtime is included because it ranks collisions.
-	 */
-	private invalidatePathIndexesForMetaChanges(changes: readonly MetaSemanticChange[]): void {
-		for (const change of changes) {
-			if (change.kind !== "device-changed") {
-				this._pathIndexesDirty = true;
-				return;
-			}
-		}
-	}
-
-	private _localReady = false;
-	private _providerSynced = false;
-
-	/**
-	 * Increments each time the provider connects. Used to distinguish
-	 * first connect (gen 0) from reconnects (gen > 0).
-	 */
-	private _connectionGeneration = 0;
-	private _providerSyncWaiters = new Set<(value: boolean) => void>();
-
-	/**
-	 * True if the server sent an explicit auth error message.
-	 * When set, the plugin should stop reconnecting.
-	 */
-	private _fatalAuthError = false;
-	private _fatalAuthCode: FatalAuthCode | null = null;
-	private _fatalAuthDetails: {
-		clientSchemaVersion: number | null;
-		roomSchemaVersion: number | null;
-		reason: string | null;
-	} | null = null;
-
-	/** True if IndexedDB encountered an error (unavailable, quota, etc). */
-	private _idbError = false;
-	private _idbErrorDetails: IndexedDbErrorDetails | null = null;
-	private _serverAckStore: CandidateStore | null = null;
-	private _serverAckScope: (ScopeKey & ScopeMetadata) | null = null;
-	private _serverAckScopeBase: (
-		Pick<ScopeKey, "vaultIdHash" | "serverHostHash" | "localDeviceId" | "docSchemaVersion">
-		& ScopeMetadata
-		& { vaultId: string }
-	) | null = null;
-	private _serverAckLocalYjsPersistenceLoaded = false;
-	private _serverAckBindingChain: Promise<void> = Promise.resolve();
-	private _serverAckPersistenceUnavailable = false;
-	private _serverReceiptStartupValidation: ServerReceiptStartupValidation = "not_started";
-	private readonly _svEchoCounters = createSvEchoCounters();
-
-	/** Buffered renames for batch flush. */
-	private _renameBatch: Map<string, string> = new Map(); // oldPath -> newPath
-	private _renameBatchNewToOld: Map<string, string> = new Map(); // newPath -> oldPath
-	private _renameTimer: number | null = null;
-	/** Callback invoked after a rename batch is flushed. */
-	private _onRenameBatchFlushed: ((renames: Map<string, string>) => void) | null = null;
-
-	private readonly _device: string | undefined;
+export class VaultSync implements SyncRuntimePort {
+	readonly ydoc = new Y.Doc({ guid: ROOT_DOCUMENT_ID });
+	readonly pathToId = this.ydoc.getMap<string>("pathToId");
+	readonly pathToBlob = this.ydoc.getMap<BlobRef>("pathToBlob");
+	readonly blobMeta = this.ydoc.getMap<BlobMeta>("blobMeta");
+	readonly blobTombstones = this.ydoc.getMap<BlobTombstone & { previousHash?: string | null }>("blobTombstones");
+	readonly meta = this.ydoc.getMap<unknown>("meta");
+	readonly bodies: BodyManager;
+	readonly provider: SyncProviderPort;
 	readonly deviceId: string;
-	private readonly _idbName: string;
-	private readonly folderKey: string;
-	private readonly receiptGenerationHint: number | undefined;
-	private readonly debug: boolean;
-	private _eventRing: Array<{ ts: string; msg: string }> = [];
-	private readonly trace?: TraceRecord;
-	private readonly onFlightEvent?: (event: Record<string, unknown>) => void;
-	private readonly onFlightPathEvent?: (event: ProductFlightPathEventInput) => void;
 
-	/** Callback for obtaining and force-refreshing mandatory short-lived tickets. */
-	private readonly _getSocketTicket: (force?: boolean) => Promise<{
-		value: string;
-		expiresAt: number;
-		localExpiresAt: number;
-		ttlMs: number;
-	}>;
+	private readonly options: Required<Pick<VaultSyncOptions,
+		"maxLoadedBodies" | "candidateDebounceMs" | "candidateMaxWaitMs" | "bodySyncTimeoutMs">> & VaultSyncOptions;
+	private readonly server: VaultServerPort;
+	private readonly sessions = new Map<string, BodySession>();
+	private readonly currentnessChecks = new Map<string, Promise<LoadedBody>>();
+	private readonly consumerGenerations = new Map<string, number>();
+	private readonly textToBodyId = new WeakMap<Y.Text, string>();
+	private readonly pendingCandidates = new Map<string, PendingCandidate>();
+	private readonly pendingUpdates = new Map<string, Uint8Array[]>();
+	private readonly candidateTimers = new Map<string, number>();
+	private readonly candidateMaxWaitTimers = new Map<string, number>();
+	private readonly bodyPersistenceWork = new Map<string, Promise<void>>();
+	private readonly providerSyncListeners = new Set<(generation: number) => void>();
+	private readonly renameBatch = new Map<string, string>();
+	private renameTimer: number | null = null;
+	private renameBatchListener: ((renames: Map<string, string>) => void) | null = null;
+	private readonly pendingRenameTargets = new Map<string, string>();
+	private ticketRefreshTimer: number | null = null;
+	private destroyed = false;
+	private _localReady = false;
+	private _connectionGeneration = 0;
+	private _fatalAuthCode: FatalSyncCode | null = null;
+	private _fatalAuthDetails: FatalSyncDetails | null = null;
+	private _lastLocalUpdateAt: number | null = null;
+	private _lastLocalUpdateWhileConnectedAt: number | null = null;
+	private _lastRemoteUpdateAt: number | null = null;
+	private _lastReceiptAt: number | null = null;
+	private _lastCandidateCapturedAt: number | null = null;
+	private _candidatePersistenceHealthy: boolean | null = null;
+	private readonly recentEvents: Array<{ ts: string; msg: string }> = [];
+	private _candidatePersistenceFailureCount = 0;
+	private _rootGeneration = 0;
+	private submissionPausedUntil = 0;
+	private backpressureLevel = 0;
 
-	/** Timer handle for the proactive provider URL ticket refresh. */
-	private _socketTicketRefreshTimer: number | null = null;
-
-
-	constructor(
-		settings: VaultSyncSettings,
-		options: {
-			folderKey: string;
-			/** Used when local sys.generation is missing after a nuclear reset. */
-			receiptGenerationHint?: number;
-			trace?: TraceRecord;
-			onFlightEvent?: (event: Record<string, unknown>) => void;
-			onFlightPathEvent?: (event: ProductFlightPathEventInput) => void;
-			getSocketTicket: (force?: boolean) => Promise<{
-				value: string;
-				expiresAt: number;
-				localExpiresAt: number;
-				ttlMs: number;
-			}>;
-			/**
-			 * Invoked after a validated server receipt echo updates receipt facts.
-			 * This is notification-only: ServerAckTracker remains the sole
-			 * state-vector truth and persistence authority.
-			 */
-			onServerReceiptStatusChanged?: () => void;
-		},
-	) {
-		this.debug = settings.debug;
-		this._device = settings.deviceName || undefined;
-		this.deviceId = settings.deviceId;
-		this.folderKey = options.folderKey;
-		this._idbName = vaultIdbName(settings.vaultId, options.folderKey);
-		this.receiptGenerationHint = options.receiptGenerationHint;
-		this.trace = options.trace;
-		this.onFlightEvent = options.onFlightEvent;
-		this.onFlightPathEvent = options.onFlightPathEvent;
-
-		this.ydoc = new Y.Doc();
-		this.pathToId = this.ydoc.getMap<string>("pathToId");
-		this.idToText = this.ydoc.getMap<Y.Text>("idToText");
-		this.meta = this.ydoc.getMap("meta");
-		this.sys = this.ydoc.getMap("sys");
-
-		this.pathToBlob = this.ydoc.getMap<BlobRef>("pathToBlob");
-		this.blobMeta = this.ydoc.getMap<BlobMeta>("blobMeta");
-		this.blobTombstones = this.ydoc.getMap<BlobTombstone>("blobTombstones");
-
-		// Single shared observeDeep handler. Computes semantic diffs and dispatches
-		// to listeners. Also drives path index invalidation so we only dirty it
-		// for structurally relevant changes (not mtime/device churn).
-		this._metaSnapshot = buildMetaSnapshot(this.meta);
-		this.meta.observeDeep(this._metaDeepObserver);
-
-		const roomId = settings.vaultId;
-
-		this.log(`Connecting to ${settings.host} room=${roomId}`);
-		this.log(`IndexedDB database: ${this._idbName}`);
-
-		// Start both persistence and provider in parallel.
-		this.persistence = new IndexeddbPersistence(this._idbName, this.ydoc);
-
-		// Catch IndexedDB open/write failures (unavailable, quota, permissions).
-		// y-indexeddb declares its internal `_db` open promise, which rejects
-		// if IDB can't open.
-		// We also listen for unhandled IDB transaction errors.
-		this.persistence._db
-			.catch((err: unknown) => {
-				this.captureIndexedDbError(err, "open");
-				console.error("[yaos] IndexedDB failed to open:", err);
-			});
-
-		this.persistence._db
-			.then((db: IDBDatabase) => {
-				db.addEventListener("error", (event) => {
-					const target = event.target as { error?: unknown } | null;
-					this.captureIndexedDbError(
-						target?.error ?? new Error("IndexedDB runtime error"),
-						"runtime",
-					);
-				});
-			})
-			.catch(() => {
-				// Open failure is already captured above.
-			});
-
-		this._getSocketTicket = options.getSocketTicket;
-		const syncPrefix = `/vault/sync/${encodeURIComponent(roomId)}`;
-
-		this.provider = new YSyncProvider(settings.host, roomId, this.ydoc, {
-			prefix: syncPrefix,
-			params: async () => {
-				const ticket = await this._getSocketTicket();
-				this.scheduleSocketTicketRefresh(ticket);
-				return {
-					schemaVersion: String(SCHEMA_VERSION),
-					ticket: ticket.value,
-				};
-			},
-			connect: false,
-			maxBackoffTime: MAX_BACKOFF_TIME_MS,
-		});
-
-		// Wire update tracker before any Y.Doc events so timestamps are captured.
-		this.updateTracker = new UpdateTracker();
-		this.updateTracker.attach(
-			this.ydoc,
-			() => this.connected,
-			this.provider,
-			this.persistence,
-		);
-
-		this.serverAckTracker = new ServerAckTracker(this.trace, this.onFlightEvent);
-
-		// Track connection generations for reconnect detection
-		this.provider.on("status", (event: { status: string }) => {
-			this.log(
-				`Provider status=${event.status} ` +
-				`(wsconnected=${this.provider.wsconnected}, synced=${this.provider.synced})`,
-			);
-			if (event.status === "connected") {
-				this._connectionGeneration++;
-				this.log(`Connection generation: ${this._connectionGeneration}`);
-			} else if (event.status === "disconnected" && !this._fatalAuthError) {
-				// Best-effort refresh before the reconnect timer fires.
-				void this.refreshProviderTicketUrl(true);
-			}
-		});
-
-		const handleFatalAuthPayload = (payload: string) => {
-			const msg = parseFatalAuthMessage(payload);
-			if (!msg) {
-				return;
-			}
-			const firstFatal = !this._fatalAuthError;
-			this._fatalAuthError = true;
-			this._fatalAuthCode = msg.code;
-			this._fatalAuthDetails = {
-				clientSchemaVersion: msg.clientSchemaVersion,
-				roomSchemaVersion: msg.roomSchemaVersion,
-				reason: msg.reason,
-			};
-			this.clearSocketTicketRefreshTimer();
-			if (firstFatal) {
-				this.log(`Fatal auth error: ${msg.code} — stopping reconnection`);
-			}
-			this.provider.disconnect();
-			this.resolvePendingProviderSyncWaiters(false);
-		};
-
-		// y-partyserver emits "__YPS:" control payloads via "custom-message".
-		this.provider.on("custom-message", handleFatalAuthPayload);
-		this.provider.on("custom-message", (payload: string) => {
-			// SV echoes are Level 3 receipt signals only. They are not durable.
-			// When the server supplies a durability marker, ServerAckTracker
-			// gates on its persist counter advancing; the state-vector
-			// dominance check is the fallback for servers without one, and
-			// cannot see deletion-only changes at all.
-			handleSvEchoCustomMessage(payload, this._svEchoCounters, (sv, durability) => {
-				this.serverAckTracker.recordServerSvEcho(sv, durability);
-				options?.onServerReceiptStatusChanged?.();
-			});
-		});
-		// Fallback for servers that still send plain text JSON frames.
-		this.provider.on("message", (event: MessageEvent) => {
-			if (typeof event.data === "string") {
-				handleFatalAuthPayload(event.data);
-			}
-		});
-		void this.provider.connect().catch((err: unknown) => {
-			this.log(`Provider connect failed: ${formatUnknown(err)}`);
-		});
+	static async create(options: VaultSyncOptions): Promise<VaultSync> {
+		const runtime = new VaultSync(options);
+		await runtime.initialize();
+		return runtime;
 	}
 
-	// -------------------------------------------------------------------
-	// Startup gates
-	// -------------------------------------------------------------------
+	constructor(options: VaultSyncOptions) {
+		this.options = {
+			...options,
+			maxLoadedBodies: options.maxLoadedBodies ?? DEFAULT_MAX_LOADED_BODIES,
+			candidateDebounceMs: options.candidateDebounceMs ?? DEFAULT_CANDIDATE_DEBOUNCE_MS,
+			candidateMaxWaitMs: options.candidateMaxWaitMs ?? DEFAULT_CANDIDATE_MAX_WAIT_MS,
+			bodySyncTimeoutMs: options.bodySyncTimeoutMs ?? DEFAULT_BODY_SYNC_TIMEOUT_MS,
+		};
+		this.deviceId = options.deviceId;
+		this.server = options.server ?? new VaultSyncHttpPort(options.host, options.vaultId, options.token);
+		this.bodies = new BodyManager(options.database, options.now);
+		const factory = options.providerFactory ?? ((input) => this.createDefaultProvider(input));
+		this.provider = factory({ kind: "root", documentId: ROOT_DOCUMENT_ID, doc: this.ydoc });
+		this.wireRootProvider();
+	}
+
+	get localReady(): boolean { return this._localReady; }
+	get connected(): boolean {
+		return this.provider.wsconnected && this.provider.ws?.readyState === 1;
+	}
+	get hasPendingLocalWork(): boolean {
+		const bodyStats = this.bodies.stats();
+		return (
+			this.candidateTimers.size > 0
+			|| this.candidateMaxWaitTimers.size > 0
+			|| this.pendingUpdates.size > 0
+			|| this.pendingCandidates.size > 0
+			|| this.bodyPersistenceWork.size > 0
+			|| bodyStats.dirty > 0
+			|| bodyStats.unsettled > 0
+			|| bodyStats.pendingLocalUpdates > 0
+		);
+	}
+	get connectionGeneration(): number { return this._connectionGeneration; }
+	get fatalAuthError(): boolean { return this._fatalAuthCode !== null; }
+	get fatalAuthCode(): FatalSyncCode | null { return this._fatalAuthCode; }
+	get fatalAuthDetails(): FatalSyncDetails | null { return this._fatalAuthDetails; }
+	get lastLocalUpdateAt(): number | null { return this._lastLocalUpdateAt; }
+	get lastLocalUpdateWhileConnectedAt(): number | null { return this._lastLocalUpdateWhileConnectedAt; }
+	get lastRemoteUpdateAt(): number | null { return this._lastRemoteUpdateAt; }
+	get serverAppliedLocalState(): boolean | null {
+		return this.pendingCandidates.size > 0 ? false : (this._lastReceiptAt === null ? null : true);
+	}
+	get lastServerReceiptEchoAt(): number | null { return this._lastReceiptAt; }
+	get lastKnownServerReceiptEchoAt(): number | null { return this._lastReceiptAt; }
+	get candidatePersistenceHealthy(): boolean | null { return this._candidatePersistenceHealthy; }
+	get candidatePersistenceFailureCount(): number { return this._candidatePersistenceFailureCount; }
+	get hasUnconfirmedServerReceiptCandidate(): boolean { return this.pendingCandidates.size > 0; }
+	get serverReceiptCandidateCapturedAt(): number | null { return this._lastCandidateCapturedAt; }
+
+	get providerSynced(): boolean { return this.provider.synced; }
+	get isInitialized(): boolean { return this._localReady; }
+	get idbError(): boolean { return false; }
+	get idbErrorDetails(): null { return null; }
+	get supportedSchemaVersion(): number { return SCHEMA_VERSION; }
+	get storedSchemaVersion(): number { return SCHEMA_VERSION; }
+	get blobPathCount(): number { return this.pathToBlob.size; }
+	get roomGeneration(): number { return this._rootGeneration; }
+	get serverReceipt(): VaultSyncReceiptSnapshot { return this.getServerReceiptSnapshot(); }
+
+	getServerReceiptSnapshot(): VaultSyncReceiptSnapshot {
+		return {
+			serverAppliedLocalState: this.serverAppliedLocalState,
+			lastServerReceiptEchoAt: this.lastServerReceiptEchoAt,
+			lastKnownServerReceiptEchoAt: this.lastKnownServerReceiptEchoAt,
+			candidatePersistenceHealthy: this.candidatePersistenceHealthy,
+			candidatePersistenceFailureCount: this.candidatePersistenceFailureCount,
+			hasUnconfirmedCandidate: this.hasUnconfirmedServerReceiptCandidate,
+			candidateCapturedAt: this.serverReceiptCandidateCapturedAt,
+			serverReceiptStartupValidation: this._localReady ? "validated" : "not_started",
+			serverPersistenceDegraded: false,
+		};
+	}
+
+	getActiveMarkdownPaths(): string[] {
+		return [...this.pathToId.keys()];
+	}
+
+	getPathContent(path: string): string | null {
+		return this.getTextForPath(path)?.toJSON() ?? null;
+	}
+
+	getSafeReconcileMode(): ReconcileMode {
+		return this._localReady ? "authoritative" : "conservative";
+	}
+
+	async initialize(): Promise<void> {
+		if (this.destroyed) throw new Error("runtime is destroyed");
+		const root = await this.options.database.getDocument(ROOT_DOCUMENT_ID);
+		if (this.destroyed) throw new Error("runtime closed during initialization");
+		this._rootGeneration = root?.generation ?? 0;
+		if (root?.encodedState.byteLength) {
+			Y.applyUpdate(this.ydoc, new Uint8Array(root.encodedState), "indexeddb-bootstrap");
+		}
+		if (root && this.ydoc.getMap("sys").get("schemaVersion") !== SCHEMA_VERSION) {
+			throw new Error("local root cache is not schema 4");
+		}
+		await this.restoreCandidates();
+		await this.retryLifecycleOperations();
+		this._localReady = true;
+		if (this.destroyed) throw new Error("runtime closed during initialization");
+		await this.provider.connect();
+	}
 
 	waitForLocalPersistence(): Promise<boolean> {
-		if (this._localReady) return Promise.resolve(true);
-		if (this._idbError) return Promise.resolve(false);
-
-		return new Promise((resolve) => {
-			const timeout = window.setTimeout(() => {
-				this.log("IndexedDB persistence timed out — proceeding without cache");
-				resolve(false);
-			}, LOCAL_PERSISTENCE_TIMEOUT_MS);
-
-			// Resolve on successful sync
-			this.persistence.once("synced", () => {
-				window.clearTimeout(timeout);
-				this._localReady = true;
-				this._pathIndexesDirty = true;
-				this.log(
-					`IndexedDB loaded (pathToId: ${this.pathToId.size}, ` +
-					`initialized: ${this.isInitialized})`,
-				);
-				resolve(true);
-			});
-
-			// Also resolve (false) if IDB errors out after we started waiting
-			this.persistence._db
-				.catch(() => {
-					window.clearTimeout(timeout);
-					this.captureIndexedDbError(new Error("IndexedDB failed during waitForLocalPersistence"), "wait");
-					this.log("IndexedDB errored during wait — proceeding without cache");
-					resolve(false);
-				});
-		});
+		return Promise.resolve(this._localReady);
 	}
 
-	waitForProviderSync(): Promise<boolean> {
-		if (this._providerSynced || this.provider.synced) {
-			this._providerSynced = true;
-			return Promise.resolve(true);
-		}
-		if (this._fatalAuthError) return Promise.resolve(false);
-
-		return new Promise((resolve) => {
+	waitForProviderSync(timeoutMs = 10_000): Promise<boolean> {
+		if (this.provider.synced) return Promise.resolve(true);
+		if (this.fatalAuthError) return Promise.resolve(false);
+		return new Promise<boolean>((resolve) => {
 			let settled = false;
 			const finish = (value: boolean) => {
 				if (settled) return;
 				settled = true;
 				window.clearTimeout(timeout);
-				this.provider.off("sync", check);
-				this._providerSyncWaiters.delete(finish);
 				resolve(value);
 			};
-
-			const timeout = window.setTimeout(() => {
-				this.log("Provider sync timed out — entering offline mode");
-				finish(false);
-			}, PROVIDER_SYNC_TIMEOUT_MS);
-
-			const check = (synced: boolean) => {
-				this.log(`Provider sync event: synced=${synced} (gen=${this._connectionGeneration})`);
-				if (!synced) return;
-				this._providerSynced = true;
-				this.log("Provider synced — room state received");
-				finish(true);
-			};
-			this.provider.on("sync", check);
-			this._providerSyncWaiters.add(finish);
-			if (this._fatalAuthError) {
-				finish(false);
-			}
-		});
-	}
-
-	async initializeServerAckTracking(
-		settings: VaultSyncSettings,
-		pluginVersion: string,
-		options: { localYjsPersistenceLoaded: boolean },
-	): Promise<void> {
-		if (this._serverAckScopeBase) return;
-		try {
-			const [vaultIdHash, serverHostHash, localInstallationId] = await Promise.all([
-				sha256TextHex(settings.vaultId),
-				sha256TextHex(settings.host),
-				getOrCreateLocalDeviceId(),
-			]);
-			this._serverAckScopeBase = {
-				vaultId: settings.vaultId,
-				vaultIdHash,
-				serverHostHash,
-				localDeviceId: receiptLocalDeviceId(localInstallationId, this.folderKey),
-				docSchemaVersion: SCHEMA_VERSION,
-				pluginVersion,
-				ackStoreVersion: 2,
-			};
-			this._serverAckLocalYjsPersistenceLoaded = options.localYjsPersistenceLoaded;
-			// Capture local updates immediately, but do not bind persistence to a
-			// guessed generation while a fresh cache is still awaiting the room.
-			this.serverAckTracker.attach(
-				this.ydoc,
-				() => Y.encodeStateVector(this.ydoc),
-				this.provider,
-				this.persistence,
-			);
-
-			const storedGeneration = this.sys.get("generation");
-			const localGeneration = storedGeneration === undefined || storedGeneration === null
-				? readKnownRoomGeneration(this.receiptGenerationHint)
-				: readKnownRoomGeneration(storedGeneration);
-			if (localGeneration !== null) {
-				await this.bindServerAckPersistence(localGeneration);
-			} else {
-				this.log("Server receipt tracker awaiting authoritative room generation");
-			}
-		} catch (err) {
-			this._serverAckPersistenceUnavailable = true;
-			this._serverReceiptStartupValidation = "unavailable";
-			this.log(`Server receipt tracker unavailable: ${formatUnknown(err)}`);
-		}
-	}
-
-	/**
-	 * Finalize or rotate receipt persistence after the provider has delivered
-	 * authoritative room state. A missing generation after a complete sync is
-	 * the original generation 0; malformed present state remains unknown.
-	 */
-	async finalizeServerAckTrackingAfterProviderSync(): Promise<void> {
-		const storedGeneration = this.sys.get("generation");
-		const generation = storedGeneration === undefined || storedGeneration === null
-			? 0
-			: readKnownRoomGeneration(storedGeneration);
-		if (generation === null) {
-			this.log("Server receipt tracker refused malformed authoritative generation");
-			return;
-		}
-		try {
-			await this.bindServerAckPersistence(generation);
-		} catch (err) {
-			this._serverAckPersistenceUnavailable = true;
-			this._serverReceiptStartupValidation = "unavailable";
-			this.log(`Server receipt tracker generation finalization failed: ${formatUnknown(err)}`);
-		}
-	}
-
-	private bindServerAckPersistence(generation: number): Promise<void> {
-		this._serverAckBindingChain = this._serverAckBindingChain.then(async () => {
-			const base = this._serverAckScopeBase;
-			if (!base || this._serverAckScope?.roomGeneration === generation) return;
-			const scope: ScopeKey & ScopeMetadata = {
-				vaultIdHash: base.vaultIdHash,
-				serverHostHash: base.serverHostHash,
-				localDeviceId: base.localDeviceId,
-				roomName: receiptRoomName(base.vaultId, generation),
-				roomGeneration: generation,
-				docSchemaVersion: base.docSchemaVersion,
-				pluginVersion: base.pluginVersion,
-				ackStoreVersion: base.ackStoreVersion,
-			};
-			const store = new IndexedDbCandidateStore(scope);
-			await this.serverAckTracker.bindPersistence(store, scope, {
-				loadPersisted: this._serverAckLocalYjsPersistenceLoaded,
-			});
-			this._serverAckStore = store;
-			this._serverAckScope = scope;
-			this._serverReceiptStartupValidation = this._serverAckLocalYjsPersistenceLoaded
-				? "validated"
-				: "skipped_local_yjs_timeout";
-			this.log(`Server receipt tracker bound to room generation ${generation}`);
-		});
-		return this._serverAckBindingChain;
-	}
-
-	/**
-	 * Register a callback for when the provider syncs AFTER the initial
-	 * startup sequence. Fires on both late first-sync and reconnections.
-	 * The callback receives the connection generation number.
-	 */
-	onProviderSync(callback: (generation: number) => void): void {
-		this.provider.on("sync", (synced: boolean) => {
-			if (!synced) return;
-			this._providerSynced = true;
-			this.log(`onProviderSync callback firing (gen=${this._connectionGeneration})`);
-			void this.finalizeServerAckTrackingAfterProviderSync().then(() => {
-				callback(this._connectionGeneration);
+			const timeout = window.setTimeout(() => finish(false), timeoutMs);
+			this.provider.on("sync", (synced) => {
+				if (synced) finish(true);
 			});
 		});
-	}
-
-	// -------------------------------------------------------------------
-	// Sentinel
-	// -------------------------------------------------------------------
-
-	get isInitialized(): boolean {
-		return this.sys.get("initialized") === true;
-	}
-
-	markInitialized(): void {
-		const alreadyInitialized = this.isInitialized;
-		this.sys.set("initialized", true);
-		if (this.storedSchemaVersion === null) {
-			this.sys.set("schemaVersion", SCHEMA_VERSION);
-		}
-		if (!alreadyInitialized) {
-			this.sys.set("lastSync", Date.now());
-			this.log("Marked Y.Doc as initialized (sentinel set)");
-		}
-	}
-
-	/**
-	 * Check if the persisted schema version is compatible with this code.
-	 * Returns null if OK, or an error string if incompatible.
-	 *
-	 * Rules:
-	 *   - No version stored (first run or pre-versioning): OK, we'll set it
-	 *   - Version <= SCHEMA_VERSION: OK (same or older, we can read it)
-	 *   - Version > SCHEMA_VERSION: INCOMPATIBLE (newer plugin wrote this)
-	 */
-	checkSchemaVersion(): string | null {
-		const stored = this.sys.get("schemaVersion");
-		if (stored === undefined || stored === null) return null; // first run
-		if (typeof stored !== "number") return null; // corrupt, treat as first run
-		if (stored > SCHEMA_VERSION) {
-			return (
-				`CRDT schema version ${stored} is newer than this plugin supports (v${SCHEMA_VERSION}). ` +
-				`Update the plugin or risk data corruption.`
-			);
-		}
-		return null; // same or older version, OK
-	}
-
-	get supportedSchemaVersion(): number {
-		return SCHEMA_VERSION;
-	}
-
-	get storedSchemaVersion(): number | null {
-		const stored = this.sys.get("schemaVersion");
-		if (typeof stored !== "number" || !Number.isInteger(stored) || stored < 0) {
-			return null;
-		}
-		return stored;
-	}
-
-	/**
-	 * Write the schema v3 marker if not already at v3+.
-	 * This does NOT convert metadata — it only signals that this room
-	 * may contain nested metadata and must only be accessed by v3-aware clients.
-	 * Safe to call concurrently from multiple v3 clients (idempotent small write).
-	 */
-	markSchemaV3(device?: string): void {
-		const current = this.currentSchemaVersion();
-		if (current >= 3) return;
-
-		this.ydoc.transact(() => {
-			this.sys.set("schemaVersion", 3);
-			this.sys.set("schemaUpdatedAt", Date.now());
-			if (device) this.sys.set("schemaUpdatedBy", device);
-		}, ORIGIN_SEED);
-
-		this.log(`schema: marked v3 (was ${current})`);
-	}
-
-	/**
-	 * Compute metadata shape statistics for debug/diagnostics.
-	 * Returns counts of flat vs nested entries, active vs tombstones, etc.
-	 */
-	getMetaShapeStats(): MetaShapeStats & { metaObserverFallbackCount: number } {
-		return {
-			...computeMetaShapeStats(this.meta, this.storedSchemaVersion),
-			metaObserverFallbackCount: this._metaObserverFallbackCount,
-		};
-	}
-
-	/**
-	 * Subscribe to semantic metadata change events.
-	 *
-	 * The callback receives a `MetaChangeBatch` for each Yjs transaction
-	 * that changes metadata. The batch includes:
-	 *   - `origin`: the Yjs transaction origin
-	 *   - `isLocal`: true for locally-originated changes (DiskMirror must skip these)
-	 *   - `changes`: pre-classified MetaSemanticChange[] for this transaction
-	 *
-	 * Works correctly for both flat (v2) and nested (v3) metadata entries.
-	 * Powered by `observeDeep` with incremental diffing internally.
-	 *
-	 * Returns an unsubscribe function.
-	 */
-	observeMetaChanges(callback: (batch: MetaChangeBatch) => void): () => void {
-		this._metaSemanticListeners.add(callback);
-		return () => { this._metaSemanticListeners.delete(callback); };
-	}
-
-	// -------------------------------------------------------------------
-	// Path normalization
-	// -------------------------------------------------------------------
-
-	/** Normalize a vault-relative path for consistent CRDT keys. */
-	private normPath(path: string): string {
-		return normalizePath(path);
-	}
-
-	isFileMetaDeleted(meta: unknown): boolean {
-		if (!meta) return false;
-		return isFileMetaDeletedValue(meta);
-	}
-
-	private currentSchemaVersion(): number {
-		return this.storedSchemaVersion ?? 1;
-	}
-
-	private usesV2PathModel(): boolean {
-		return this.currentSchemaVersion() >= 2;
-	}
-
-	private shouldWriteLegacyPathMap(): boolean {
-		return !this.usesV2PathModel();
-	}
-
-	private ensurePathIndexes(): void {
-		if (!this._pathIndexesDirty) return;
-
-		this._pathIndex.clear();
-		this._deletedPathIndex.clear();
-
-		this.meta.forEach((value: unknown, fileId: string) => {
-			const path = getMetaPath(value);
-			if (!path) return;
-			const normalizedPath = this.normPath(path);
-
-			if (isFileMetaDeletedValue(value)) {
-				if (!this._pathIndex.has(normalizedPath)) {
-					this._deletedPathIndex.add(normalizedPath);
-				}
-				return;
-			}
-
-			const existingId = this._pathIndex.get(normalizedPath);
-			if (!existingId) {
-				this._pathIndex.set(normalizedPath, fileId);
-				this._deletedPathIndex.delete(normalizedPath);
-				return;
-			}
-
-			const existingValue = this.meta.get(existingId);
-			const existingMtime = getMetaMtime(existingValue) ?? 0;
-			const candidateMtime = getMetaMtime(value) ?? 0;
-
-			// If we see active path collisions, deterministically choose one winner.
-			if (candidateMtime > existingMtime || (candidateMtime === existingMtime && fileId > existingId)) {
-				this._pathIndex.set(normalizedPath, fileId);
-			}
-			this._deletedPathIndex.delete(normalizedPath);
-		});
-
-		this._pathIndexesDirty = false;
-	}
-
-	private setMetaActive(fileId: string, path: string, device?: string): void {
-		const normalizedPath = this.normPath(path);
-		const now = Date.now();
-
-		const entry = ensureNestedMetaEntry(this.meta, fileId, {
-			shape: "flat",
-			path: normalizedPath,
-			mtime: now,
-			...(device ? { device } : {}),
-		});
-
-		if (!entry) {
-			// Should not happen since we always provide a fallback
-			this.log(`setMetaActive: failed to ensure nested entry for ${fileId}`);
-			return;
-		}
-
-		entry.set("path", normalizedPath);
-		entry.delete("deleted");
-		entry.delete("deletedAt");
-		entry.set("mtime", now);
-
-		if (device) {
-			entry.set("device", device);
-		} else {
-			entry.delete("device");
-		}
-	}
-
-	private setMetaDeleted(fileId: string, path: string, device?: string): void {
-		const normalizedPath = this.normPath(path);
-		const deletedAt = Date.now();
-
-		const entry = ensureNestedMetaEntry(this.meta, fileId, {
-			shape: "flat",
-			path: normalizedPath,
-			deletedAt,
-		});
-
-		if (!entry) {
-			this.log(`setMetaDeleted: failed to ensure nested entry for ${fileId}`);
-			return;
-		}
-
-		entry.set("path", normalizedPath);
-		entry.set("deletedAt", deletedAt);
-		entry.delete("deleted");
-		entry.delete("mtime");
-		entry.delete("device");
-	}
-
-	migrateSchemaToV2(device?: string): {
-		from: number | null;
-		to: number;
-		metaUpdated: number;
-		metaCreated: number;
-		tombstonesConverted: number;
-		loserPaths: string[];
-	} {
-		const from = this.storedSchemaVersion;
-		let metaUpdated = 0;
-		let metaCreated = 0;
-		let tombstonesConverted = 0;
-		const loserPaths: string[] = [];
-
-		this.ydoc.transact(() => {
-			const now = Date.now();
-			const canonicalPathById = new Map<string, string>();
-			const pathsById = new Map<string, string[]>();
-
-			this.pathToId.forEach((fileId, rawPath) => {
-				const path = this.normPath(rawPath);
-				const list = pathsById.get(fileId);
-				if (list) {
-					list.push(path);
-				} else {
-					pathsById.set(fileId, [path]);
-				}
-			});
-
-			for (const [fileId, paths] of pathsById) {
-				const metaValue = this.meta.get(fileId);
-				const preferred = getMetaPath(metaValue) ? this.normPath(getMetaPath(metaValue)!) : "";
-				const canonical = preferred && paths.includes(preferred)
-					? preferred
-					: paths.slice().sort()[0]!;
-				canonicalPathById.set(fileId, canonical);
-				for (const path of paths) {
-					if (path !== canonical) {
-						loserPaths.push(path);
-					}
-				}
-			}
-
-			for (const [fileId, normalizedPath] of canonicalPathById) {
-				const currentMeta = decodeFileMeta(this.meta.get(fileId));
-				if (!currentMeta) {
-					// Write flat v2 object — this is a v1→v2 migration, not a v3 upgrade.
-					// The lazy v3 conversion will upgrade this entry when it is next touched.
-					this.meta.set(fileId, {
-						path: normalizedPath,
-						deletedAt: undefined,
-						deleted: undefined,
-						mtime: now,
-						device,
-					});
-					metaCreated++;
-					return;
-				}
-
-				const isDeleted = currentMeta.deleted === true || typeof currentMeta.deletedAt === "number";
-				if (!isDeleted && currentMeta.path !== normalizedPath) {
-					// Update path in-place on nested map; write flat if still flat.
-					const existing = this.meta.get(fileId);
-					if (existing instanceof Y.Map) {
-						existing.set("path", normalizedPath);
-					} else {
-						this.meta.set(fileId, {
-							...(currentMeta as object),
-							path: normalizedPath,
-							deleted: undefined,
-							deletedAt: undefined,
-							mtime: currentMeta.mtime ?? now,
-							device: currentMeta.device ?? device,
-						});
-					}
-					metaUpdated++;
-				}
-			}
-
-			this.meta.forEach((value: unknown, fileId: string) => {
-				const decoded = decodeFileMeta(value);
-				if (!decoded) return;
-				if (decoded.deleted && decoded.deletedAt === undefined) {
-					// Convert legacy deleted:true to v2 flat tombstone.
-					this.meta.set(fileId, {
-						path: this.normPath(decoded.path),
-						deletedAt: typeof decoded.mtime === "number" ? decoded.mtime : now,
-					});
-					tombstonesConverted++;
-					return;
-				}
-				const isDel = decoded.deleted === true || typeof decoded.deletedAt === "number";
-				if (isDel && (decoded.deleted !== undefined || decoded.mtime !== undefined || decoded.device !== undefined)) {
-					// Strip extra fields from tombstone, keep as flat v2.
-					this.meta.set(fileId, {
-						path: this.normPath(decoded.path),
-						deletedAt: typeof decoded.deletedAt === "number" ? decoded.deletedAt : now,
-					});
-					metaUpdated++;
-				}
-			});
-
-			// Explicit tombstones for dropped alias paths — write flat v2.
-			const existingActivePaths = new Set<string>();
-			this.meta.forEach((value: unknown) => {
-				if (isFileMetaDeletedValue(value)) return;
-				const path = getMetaPath(value);
-				if (path) existingActivePaths.add(this.normPath(path));
-			});
-			for (const loserPath of loserPaths) {
-				if (existingActivePaths.has(loserPath)) continue;
-				const tombstoneId = this.generateFileId();
-				this.meta.set(tombstoneId, { path: loserPath, deletedAt: now });
-			}
-
-			this.sys.set("schemaVersion", 2);
-			this.sys.set("migratedAt", now);
-			this.sys.set("migratedBy", device ?? this._device ?? "unknown");
-		}, ORIGIN_SEED);
-
-		this._pathIndexesDirty = true;
-		this.log(
-			`schema migration: ${from ?? "none"} -> 2 ` +
-			`(metaUpdated=${metaUpdated}, metaCreated=${metaCreated}, tombstonesConverted=${tombstonesConverted})`,
-		);
-		return {
-			from,
-			to: 2,
-			metaUpdated,
-			metaCreated,
-			tombstonesConverted,
-			loserPaths,
-		};
-	}
-
-	// -------------------------------------------------------------------
-	// Integrity checks
-	// -------------------------------------------------------------------
-
-	/**
-	 * Run integrity checks on the CRDT maps. Call after reconciliation.
-	 *
-	 * Checks:
-	 *   1. Two paths pointing to the same fileId → keep first, remap second
-	 *   2. idToText/meta entries with no pathToId reference → orphan garbage
-	 *
-	 * Returns counts for logging.
-	 */
-	runIntegrityChecks(): { duplicateIds: number; orphansCleaned: number } {
-		let duplicateIds = 0;
-		let orphansCleaned = 0;
-
-		// 1. Legacy duplicate-id repair for schema v1 only.
-		// In schema v2, id->meta.path is authoritative and this clone behavior
-		// is intentionally disabled.
-		if (!this.usesV2PathModel()) {
-			const idToPaths = new Map<string, string[]>();
-			this.pathToId.forEach((fileId, path) => {
-				const paths = idToPaths.get(fileId);
-				if (paths) {
-					paths.push(path);
-				} else {
-					idToPaths.set(fileId, [path]);
-				}
-			});
-
-			for (const [fileId, paths] of idToPaths) {
-				if (paths.length <= 1) continue;
-
-				duplicateIds++;
-				this.log(
-					`integrity: fileId ${fileId} shared by ${paths.length} paths: ${paths.join(", ")}`,
-				);
-
-				const keepPath = paths[0]!;
-				const sourceText = this.idToText.get(fileId);
-
-				for (let i = 1; i < paths.length; i++) {
-					const dupPath = paths[i]!;
-					const newId = this.generateFileId();
-					const newText = new Y.Text();
-
-				this.ydoc.transact(() => {
-					if (sourceText) {
-						newText.insert(0, sourceText.toJSON());
-					}
-					this.pathToId.set(dupPath, newId);
-					this.idToText.set(newId, newText);
-					const dupMeta = createNestedActiveMeta(dupPath, Date.now(), this._device);
-					this.meta.set(newId, dupMeta);
-				}, ORIGIN_SEED);
-
-					this.log(
-						`integrity: gave "${dupPath}" new id=${newId} (was sharing ${fileId} with "${keepPath}")`,
-					);
-				}
-			}
-		}
-
-		// 2. Orphan GC: find idToText/meta entries with no pathToId reference
-		const referencedIds = new Set<string>();
-		this.ensurePathIndexes();
-		for (const fileId of this._pathIndex.values()) {
-			referencedIds.add(fileId);
-		}
-
-		// Also keep tombstoned IDs (they're intentionally orphaned from pathToId)
-		const tombstonedIds = new Set<string>();
-		this.meta.forEach((value: unknown, fileId: string) => {
-			if (isFileMetaDeletedValue(value)) {
-				tombstonedIds.add(fileId);
-			}
-		});
-
-		// Clean orphans from idToText
-		const orphanTextIds: string[] = [];
-		this.idToText.forEach((_text, fileId) => {
-			if (!referencedIds.has(fileId) && !tombstonedIds.has(fileId)) {
-				orphanTextIds.push(fileId);
-			}
-		});
-
-		// Clean orphans from meta (non-tombstoned only)
-		const orphanMetaIds: string[] = [];
-		this.meta.forEach((meta, fileId) => {
-			if (!referencedIds.has(fileId) && !tombstonedIds.has(fileId)) {
-				orphanMetaIds.push(fileId);
-			}
-		});
-
-		const allOrphanIds = new Set([...orphanTextIds, ...orphanMetaIds]);
-		if (allOrphanIds.size > 0) {
-			this.ydoc.transact(() => {
-				for (const fileId of allOrphanIds) {
-					this.idToText.delete(fileId);
-					this.meta.delete(fileId);
-				}
-			}, ORIGIN_SEED);
-
-			orphansCleaned = allOrphanIds.size;
-			this.log(
-				`integrity: cleaned ${orphansCleaned} orphaned entries ` +
-				`(${orphanTextIds.length} from idToText, ${orphanMetaIds.length} from meta)`,
-			);
-		}
-
-		return { duplicateIds, orphansCleaned };
-	}
-
-	// -------------------------------------------------------------------
-	// Reconciliation
-	// -------------------------------------------------------------------
-
-	/**
-	 * Determine which reconciliation mode is safe given current state.
-	 *
-	 * Authoritative when:
-	 *   - Provider synced (we have the full server state), OR
-	 *   - Local cache loaded AND sentinel says initialized AND
-	 *     pathToId is non-empty (protects against partial IndexedDB persistence)
-	 *
-	 * Conservative otherwise.
-	 */
-	getSafeReconcileMode(): ReconcileMode {
-		if (this._providerSynced) return "authoritative";
-		// Use schemaVersion presence (set atomically with initialized) as
-		// proof that IDB loaded real data. Unlike pathToId.size > 0 this
-		// correctly handles legitimately-empty-but-initialized vaults.
-		if (this._localReady && this.isInitialized && this.sys.get("schemaVersion") !== undefined) {
-			return "authoritative";
-		}
-		return "conservative";
-	}
-
-	reconcileVault(
-		diskFiles: Map<string, string>,
-		diskPresentPaths: Set<string>,
-		mode: ReconcileMode,
-		device?: string,
-		/**
-		 * Optional admission-opId factory invoked at each authoritative-lane
-		 * `seed-to-crdt` decision point BEFORE the CRDT mutation runs.
-		 *
-		 * ## Contract
-		 *
-		 * 1. **Optionality.** When the parameter is omitted, `reconcileVault`
-		 *    behaves EXACTLY as it did before this hook existed: no opId,
-		 *    no decision emission from inside the seed loop, and the seed
-		 *    mutation runs unchanged. Callers that do not care about
-		 *    decision-before-mutation ordering MUST NOT pass it.
-		 *
-		 * 2. **Frequency.** When supplied, the callback is invoked EXACTLY
-		 *    ONCE per `seed-to-crdt` admission decision per call to
-		 *    `reconcileVault`. It is NOT invoked for `skip-in-crdt`,
-		 *    `tombstone-conflict`, or `untracked` classifications. It is
-		 *    NOT invoked for `createdOnDisk` or `updatedOnDisk` paths
-		 *    (those are post-result loops in the controller).
-		 *
-		 * 3. **Ordering.** Within a single seed-to-crdt branch, the seed
-		 *    loop calls `mintAdmissionOpId(path)` first, then invokes the
-		 *    returned `emitDecision()` thunk, then calls `ensureFile`
-		 *    with `{ opId }`. The decision emission therefore precedes the
-		 *    `crdt.file.created` envelope, and both events carry the same
-		 *    `opId` value — the load-bearing causality property the spec
-		 *    asserts in Scenario A.
-		 *
-		 * 4. **Side-effect surface.** The factory and `emitDecision()` are
-		 *    free to read state and emit flight events. They MUST NOT
-		 *    mutate any field on this `VaultSync` instance, MUST NOT call
-		 *    back into `ensureFile`, and MUST NOT call back into
-		 *    `reconcileVault` (recursion is undefined).
-		 *
-		 * 5. **Failure semantics.** If `mintAdmissionOpId(path)` throws OR
-		 *    if `emitDecision()` throws, the exception propagates UP out
-		 *    of `reconcileVault` synchronously. The current path's
-		 *    `ensureFile` SHALL NOT run, the path SHALL NOT be appended
-		 *    to `seededToCrdt`, AND any subsequent paths in `diskPresentPaths`
-		 *    are NOT classified or seeded. Recovery is the caller's
-		 *    responsibility — `runReconciliation` runs inside a single
-		 *    `try { ... } finally { reconcileInFlight = false; ... }`
-		 *    block, so a throw here will mark the reconcile as failed
-		 *    rather than half-applied.
-		 *
-		 *    Rationale: the seed mutation and the decision emission are
-		 *    paired. If the controller cannot record the decision, we
-		 *    refuse to perform the mutation. Letting the mutation through
-		 *    would create a `crdt.file.created` event with no preceding
-		 *    `reconcile.file.decision` — exactly the silent admission the
-		 *    spec was written to prevent.
-		 *
-		 * 6. **No new origins / suppression / UI.** The callback is a
-		 *    causality-tracking hook only. It MUST NOT introduce a new
-		 *    Yjs transaction origin, a new disk-event suppression rule,
-		 *    or any user-visible surface.
-		 */
-		mintAdmissionOpId?: (path: string) => { opId: string; emitDecision: () => void },
-	): ReconcileResult {
-		const createdOnDisk: string[] = [];
-		const updatedOnDisk: string[] = [];
-		const seededToCrdt: string[] = [];
-		const untracked: string[] = [];
-		let skipped = 0;
-
-		this.ensurePathIndexes();
-		const crdtPaths = new Set<string>(this._pathIndex.keys());
-
-		// CRDT files not on disk → create on disk
-		// IMPORTANT: use diskPresentPaths (all known disk paths), not
-		// diskFiles (only the subset whose content was read this run).
-		for (const path of crdtPaths) {
-			if (!diskPresentPaths.has(path)) {
-				createdOnDisk.push(path);
-			}
-		}
-
-		// Files present in both disk and CRDT whose content differs.
-		// In authoritative mode, CRDT is source of truth and should be
-		// flushed to disk so reopened clients converge reliably.
-		if (mode === "authoritative") {
-			for (const [path, diskContent] of diskFiles) {
-				if (!crdtPaths.has(path)) continue;
-				const ytext = this.getTextForPath(path);
-				if (!ytext) continue;
-				const crdtContent = ytext.toJSON();
-				if (crdtContent !== diskContent) {
-					updatedOnDisk.push(path);
-				}
-			}
-		}
-
-		const tombstonedDiskConflicts: TombstonedDiskConflict[] = [];
-
-		// Disk files not in CRDT
-		for (const path of diskPresentPaths) {
-			const classification = classifyDiskPathForReconcile(
-				path,
-				crdtPaths.has(path),
-				this._deletedPathIndex.has(path),
-				mode,
-			);
-
-			switch (classification.action) {
-				case "skip-in-crdt":
-					// Already in CRDT, handled above
-					continue;
-
-				case "tombstone-conflict":
-					// Disk file exists at a tombstoned path — zombie prevention
-					this.log(`reconcile: "${path}" exists on disk but is tombstoned in CRDT — conflict preserved`);
-					tombstonedDiskConflicts.push(classification.conflict!);
-					skipped++;
-					continue;
-
-				case "seed-to-crdt": {
-					const content = diskFiles.get(path);
-					if (content === undefined) {
-						// Presence is known, but content wasn't read this pass. Skip seeding
-						// to avoid accidentally creating empty/incorrect files.
-						this.log(`reconcile: "${path}" present on disk but content not loaded, skipping seed`);
-						continue;
-					}
-					// Spec R2 / Option (b): when an admission-opId factory is
-					// supplied, emit `reconcile.file.decision` BEFORE the CRDT
-					// mutation and thread the shared opId into ensureFile so
-					// the resulting `crdt.file.created` carries it.
-					//
-					// Failure semantics (see callback contract on this method):
-					// if `mintAdmissionOpId` or `emitDecision` throws, the
-					// exception propagates and the path's `ensureFile` is
-					// NOT called, so we never emit a `crdt.file.created`
-					// without a preceding `reconcile.file.decision`. The
-					// path is also NOT appended to `seededToCrdt`.
-					const minted = mintAdmissionOpId?.(path);
-					if (minted) {
-						minted.emitDecision();
-						this.ensureFile(path, content, device, { opId: minted.opId });
-					} else {
-						this.ensureFile(path, content, device);
-					}
-					seededToCrdt.push(path);
-					continue;
-				}
-
-				case "untracked":
-					untracked.push(path);
-					continue;
-			}
-		}
-
-		if (mode === "authoritative") {
-			this.markInitialized();
-		}
-
-		this.log(
-			`reconcile [${mode}]: ` +
-			`${seededToCrdt.length} seeded, ` +
-			`${createdOnDisk.length} need disk creation, ` +
-			`${updatedOnDisk.length} need disk update, ` +
-			`${untracked.length} untracked, ` +
-			`${tombstonedDiskConflicts.length} tombstoned-disk conflicts`,
-		);
-
-		return { mode, createdOnDisk, updatedOnDisk, seededToCrdt, untracked, tombstonedDiskConflicts, skipped };
-	}
-
-	// -------------------------------------------------------------------
-	// File operations
-	// -------------------------------------------------------------------
-
-	private generateFileId(): string {
-		return randomId(16);
-	}
-
-	ensureFile(
-		path: string,
-		currentContent: string,
-		device?: string,
-		options?: { reviveTombstone?: boolean; reviveReason?: string; opId?: string },
-	): Y.Text | null {
-		path = this.normPath(path);
-		const reviveTombstone = options?.reviveTombstone === true;
-		const reviveReason = options?.reviveReason ?? "unknown";
-		const opId = options?.opId;
-
-		const existingId = this.getFileId(path);
-		if (!existingId) {
-			this.promotePendingRenameTarget(path, device);
-		}
-		const resolvedId = this.getFileId(path);
-		if (resolvedId) {
-			const existingText = this.idToText.get(resolvedId);
-			if (existingText) {
-				const cleared = this.clearMarkdownTombstonesForPath(path, resolvedId);
-				if (cleared > 0) {
-					this.log(`ensureFile: cleared ${cleared} stale tombstone(s) for "${path}"`);
-				}
-				this.log(`ensureFile: "${path}" already exists (id=${resolvedId})`);
-				this._textToFileId.set(existingText, resolvedId);
-				return existingText;
-			}
-			// Orphaned mapping — clean up old entries before recreating
-			this.log(
-				`ensureFile: "${path}" has id=${resolvedId} but no Y.Text — cleaning up orphan`,
-			);
-			this.ydoc.transact(() => {
-				if (this.shouldWriteLegacyPathMap()) {
-					this.pathToId.delete(path);
-				}
-				this.idToText.delete(resolvedId);
-				this.meta.delete(resolvedId);
-			}, ORIGIN_SEED);
-		}
-
-		// Check tombstones — never resurrect a deleted path unless it is already
-		// backed by a live pathToId entry handled above.
-		const tombstoneIds = this.getMarkdownTombstoneIds(path);
-		if (tombstoneIds.length > 0) {
-			if (reviveTombstone) {
-				this.ydoc.transact(() => {
-					for (const tombstoneId of tombstoneIds) {
-						this.meta.delete(tombstoneId);
-					}
-				}, ORIGIN_SEED);
-			this._pathIndexesDirty = true;
-			this.trace?.("sync", "ensureFile-tombstone-revived", {
-				path,
-				tombstoneIds,
-				device: device ?? null,
-				reason: reviveReason,
-			});
-			this.onFlightPathEvent?.({
-				priority: "critical",
-				kind: PRODUCT_EVENT_KIND.crdtFileRevived,
-				severity: "info",
-				scope: "file",
-				source: "vaultSync",
-				layer: "crdt",
-				path,
-				opId,
-				data: { reason: reviveReason },
-			});
-			this.log(
-				`ensureFile: "${path}" revived from tombstone (${tombstoneIds.length}) due to ${reviveReason}`,
-			);
-			} else {
-				this.trace?.("sync", "ensureFile-tombstone-blocked", {
-					path,
-					tombstoneIds,
-					device: device ?? null,
-				});
-				this.log(`ensureFile: "${path}" is tombstoned, refusing to create`);
-				return null;
-			}
-		}
-
-		const fileId = this.generateFileId();
-		const ytext = new Y.Text();
-
-		this.ydoc.transact(() => {
-			ytext.insert(0, currentContent);
-			if (this.shouldWriteLegacyPathMap()) {
-				this.pathToId.set(path, fileId);
-			}
-			this.idToText.set(fileId, ytext);
-			this.setMetaActive(fileId, path, device);
-		}, ORIGIN_SEED);
-
-		this._pathIndexesDirty = true;
-		this.log(`ensureFile: created "${path}" (id=${fileId})`);
-		this._textToFileId.set(ytext, fileId);
-	this.onFlightPathEvent?.({
-		priority: "important",
-		kind: PRODUCT_EVENT_KIND.crdtFileCreated,
-		severity: "info",
-		scope: "file",
-		source: "vaultSync",
-		layer: "crdt",
-		path,
-		opId,
-		data: { fileId },
-	});
-		return ytext;
-	}
-
-	isMarkdownTombstoned(path: string): boolean {
-		return this.isPathTombstoned(path) || this.getMarkdownTombstoneIds(path).length > 0;
-	}
-
-	getTextForPath(path: string): Y.Text | null {
-		path = this.normPath(path);
-		const fileId = this.getFileId(path);
-		if (!fileId) return null;
-		const text = this.idToText.get(fileId) ?? null;
-		if (text) this._textToFileId.set(text, fileId);
-		return text;
-	}
-
-	getFileId(path: string): string | undefined {
-		path = this.normPath(path);
-		if (this.usesV2PathModel()) {
-			this.ensurePathIndexes();
-			return this._pathIndex.get(path);
-		}
-		const legacy = this.pathToId.get(path);
-		if (legacy) return legacy;
-		this.ensurePathIndexes();
-		return this._pathIndex.get(path);
-	}
-
-	/**
-	 * O(1) reverse lookup: given a Y.Text, get its fileId.
-	 * Returns undefined if the text isn't tracked (shouldn't happen
-	 * for texts created via ensureFile/getTextForPath).
-	 */
-	getFileIdForText(ytext: Y.Text): string | undefined {
-		return this._textToFileId.get(ytext);
-	}
-
-	getActiveMarkdownPaths(): string[] {
-		this.ensurePathIndexes();
-		return Array.from(this._pathIndex.keys());
-	}
-
-	isPathTombstoned(path: string): boolean {
-		this.ensurePathIndexes();
-		return this._deletedPathIndex.has(this.normPath(path));
-	}
-
-	// -------------------------------------------------------------------
-	// Blob operations
-	// -------------------------------------------------------------------
-
-	/**
-	 * Record a blob reference for a vault path. Called after a successful
-	 * R2 upload. Sets pathToBlob + blobMeta in a single transaction.
-	 * Only sets blobMeta if the hash isn't already tracked (dedup).
-	 */
-	setBlobRef(
-		path: string,
-		hash: string,
-		size: number,
-		mime: string,
-		device?: string,
-	): void {
-		path = this.normPath(path);
-
-		this.ydoc.transact(() => {
-			this.pathToBlob.set(path, { hash, size });
-			// Only set blobMeta if this content hash is new
-			if (!this.blobMeta.has(hash)) {
-				this.blobMeta.set(hash, {
-					size,
-					mime,
-					createdAt: Date.now(),
-					device,
-				});
-			}
-			// Clear any existing tombstone for this path
-			if (this.blobTombstones.has(path)) {
-				this.blobTombstones.delete(path);
-			}
-		}, ORIGIN_SEED);
-
-		this.log(`setBlobRef: "${path}" hash=${hash.slice(0, 12)}… (${size} bytes)`);
-	}
-
-	/**
-	 * Get the blob reference for a vault path, if any.
-	 */
-	getBlobRef(path: string): BlobRef | undefined {
-		return this.pathToBlob.get(this.normPath(path));
-	}
-
-	/**
-	 * Get blob metadata for a content hash.
-	 */
-	getBlobMeta(hash: string): BlobMeta | undefined {
-		return this.blobMeta.get(hash);
-	}
-
-	/**
-	 * Tombstone-delete a blob path. Removes from pathToBlob and records
-	 * a tombstone to prevent resurrection from stale disk scans.
-	 * Does NOT delete the R2 blob (content-addressed = may be shared).
-	 */
-	deleteBlobRef(path: string, device?: string): void {
-		path = this.normPath(path);
-
-		if (!this.pathToBlob.has(path)) {
-			this.log(`deleteBlobRef: "${path}" not in CRDT, ignoring`);
-			return;
-		}
-
-		this.ydoc.transact(() => {
-			this.pathToBlob.delete(path);
-			this.blobTombstones.set(path, {
-				deletedAt: Date.now(),
-				device,
-			});
-		}, ORIGIN_SEED);
-
-		this.log(`deleteBlobRef: "${path}" tombstoned`);
-	}
-
-	/**
-	 * Check if a path is blob-tombstoned (deleted).
-	 */
-	isBlobTombstoned(path: string): boolean {
-		return this.blobTombstones.has(this.normPath(path));
-	}
-
-	/**
-	 * Rename a blob path. Moves the entry in pathToBlob.
-	 * Called from the rename batch flush for non-markdown files.
-	 */
-	renameBlobRef(oldPath: string, newPath: string): void {
-		oldPath = this.normPath(oldPath);
-		newPath = this.normPath(newPath);
-
-		const ref = this.pathToBlob.get(oldPath);
-		if (!ref) return;
-
-		this.ydoc.transact(() => {
-			this.pathToBlob.delete(oldPath);
-			this.pathToBlob.set(newPath, ref);
-			// Clear any tombstone at the new path
-			if (this.blobTombstones.has(newPath)) {
-				this.blobTombstones.delete(newPath);
-			}
-		}, ORIGIN_SEED);
-
-		this.log(`renameBlobRef: "${oldPath}" -> "${newPath}"`);
-	}
-
-	// -------------------------------------------------------------------
-	// Rename batching
-	// -------------------------------------------------------------------
-
-	/**
-	 * Queue a rename for batched application. Multiple renames arriving
-	 * within RENAME_BATCH_MS (e.g. folder rename) are collected and
-	 * applied in a single ydoc.transact().
-	 *
-	 * Transitive chains are resolved: if A→B and B→C arrive in the same
-	 * batch, they collapse to A→C.
-	 */
-	queueRename(oldPath: string, newPath: string): void {
-		oldPath = this.normPath(oldPath);
-		newPath = this.normPath(newPath);
-
-		const rootOldPath = this._renameBatchNewToOld.get(oldPath) ?? oldPath;
-		if (rootOldPath === newPath) {
-			this.deletePendingRenameByOldPath(rootOldPath);
-		} else {
-			this.setPendingRename(rootOldPath, newPath);
-		}
-		if (rootOldPath !== oldPath) {
-			this.deletePendingRenameByOldPath(oldPath);
-		}
-
-		// Reset the debounce timer
-		if (this._renameTimer) window.clearTimeout(this._renameTimer);
-		this._renameTimer = window.setTimeout(() => this.flushRenameBatch(), RENAME_BATCH_MS);
-	}
-
-	isPendingRenameTarget(path: string): boolean {
-		path = this.normPath(path);
-		return this._renameBatchNewToOld.has(path);
-	}
-
-	/**
-	 * Register a callback invoked after each rename batch flush.
-	 * Receives the map of old→new paths that were applied.
-	 */
-	onRenameBatchFlushed(callback: (renames: Map<string, string>) => void): void {
-		this._onRenameBatchFlushed = callback;
-	}
-
-	private flushRenameBatch(): void {
-		this._renameTimer = null;
-		if (this._renameBatch.size === 0) return;
-
-		const batch = new Map(this._renameBatch);
-		this.clearPendingRenames();
-
-		this.log(`Flushing rename batch: ${batch.size} renames`);
-		this.applyRenameBatch(batch, this._device);
-	}
-
-	/** Direct single rename (kept for programmatic use). */
-	handleRename(oldPath: string, newPath: string, device?: string): void {
-		oldPath = this.normPath(oldPath);
-		newPath = this.normPath(newPath);
-
-		const fileId = this.getFileId(oldPath);
-		if (!fileId) {
-			this.log(`handleRename: "${oldPath}" not in CRDT, ignoring`);
-			return;
-		}
-
-		this.ydoc.transact(() => {
-			if (this.shouldWriteLegacyPathMap()) {
-				this.pathToId.delete(oldPath);
-				this.pathToId.set(newPath, fileId);
-			}
-			this.clearMarkdownTombstonesForPath(newPath, fileId);
-			this.setMetaActive(fileId, newPath, device);
-		}, ORIGIN_SEED);
-
-		this._pathIndexesDirty = true;
-		this.log(`handleRename: "${oldPath}" -> "${newPath}" (id=${fileId})`);
-	}
-
-	private promotePendingRenameTarget(path: string, device?: string): void {
-		const normalizedPath = this.normPath(path);
-		const pendingOldPath = this._renameBatchNewToOld.get(normalizedPath);
-		if (!pendingOldPath) return;
-
-		this.deletePendingRenameByOldPath(pendingOldPath);
-		if (this._renameBatch.size === 0 && this._renameTimer) {
-			window.clearTimeout(this._renameTimer);
-			this._renameTimer = null;
-		}
-
-		const batch = new Map([[pendingOldPath, normalizedPath]]);
-		this.log(`Promoting pending rename target: "${pendingOldPath}" -> "${normalizedPath}"`);
-		this.applyRenameBatch(batch, device ?? this._device);
-	}
-
-	private applyRenameBatch(batch: Map<string, string>, device?: string): void {
-		if (batch.size === 0) return;
-
-		// Collect file IDs before the transaction for flight events.
-		const renamedIds: Array<{ oldPath: string; newPath: string; fileId: string }> = [];
-
-		this.ydoc.transact(() => {
-			for (const [oldPath, newPath] of batch) {
-				const fileId = this.getFileId(oldPath);
-				if (fileId) {
-					if (this.shouldWriteLegacyPathMap()) {
-						this.pathToId.delete(oldPath);
-						this.pathToId.set(newPath, fileId);
-					}
-					this.clearMarkdownTombstonesForPath(newPath, fileId);
-					this.setMetaActive(fileId, newPath, device);
-					this.log(`renameBatch: "${oldPath}" -> "${newPath}" (id=${fileId})`);
-					renamedIds.push({ oldPath, newPath, fileId });
-				}
-
-				const blobRef = this.pathToBlob.get(oldPath);
-				if (blobRef) {
-					this.pathToBlob.delete(oldPath);
-					this.pathToBlob.set(newPath, blobRef);
-					if (this.blobTombstones.has(newPath)) {
-						this.blobTombstones.delete(newPath);
-					}
-					this.log(`renameBatch: blob "${oldPath}" -> "${newPath}"`);
-				}
-			}
-		}, ORIGIN_SEED);
-
-		this._pathIndexesDirty = true;
-
-		// Emit crdt.file.renamed for each markdown file that was renamed.
-		for (const { newPath, fileId } of renamedIds) {
-			this.onFlightPathEvent?.({
-				priority: "important",
-				kind: PRODUCT_EVENT_KIND.crdtFileRenamed,
-				severity: "info",
-				scope: "file",
-				source: "vaultSync",
-				layer: "crdt",
-				path: newPath,
-				data: { fileId, batchSize: batch.size },
-			});
-		}
-
-		this._onRenameBatchFlushed?.(batch);
-	}
-
-	private clearMarkdownTombstonesForPath(path: string, keepFileId?: string): number {
-		const tombstonedIds: string[] = [];
-		this.meta.forEach((value: unknown, fileId: string) => {
-			if (
-				fileId !== keepFileId
-				&& getMetaPath(value) === path
-				&& isFileMetaDeletedValue(value)
-			) {
-				tombstonedIds.push(fileId);
-			}
-		});
-
-		for (const tombstonedId of tombstonedIds) {
-			this.meta.delete(tombstonedId);
-		}
-
-		return tombstonedIds.length;
-	}
-
-	private getMarkdownTombstoneIds(path: string): string[] {
-		const normalizedPath = this.normPath(path);
-		const tombstonedIds: string[] = [];
-		this.meta.forEach((value: unknown, fileId: string) => {
-			if (getMetaPath(value) === normalizedPath && isFileMetaDeletedValue(value)) {
-				tombstonedIds.push(fileId);
-			}
-		});
-		return tombstonedIds;
-	}
-
-	handleDelete(path: string, device?: string, opId?: string): void {
-		path = this.normPath(path);
-
-		// Check pending rename batch for races:
-		// 1. If a pending rename maps X → path (our delete target is the
-		//    NEW name), cancel the rename and delete from the old path.
-		// 2. If a pending rename maps path → Y (our delete target is the
-		//    OLD name, rename hasn't flushed), cancel the rename and
-		//    delete from path (it's still in pathToId).
-		let resolvedPath = path;
-		const pendingOldPath = this._renameBatchNewToOld.get(path);
-		if (pendingOldPath) {
-			const pendingNewPath = this._renameBatch.get(pendingOldPath) ?? path;
-			this.trace?.("sync", "delete-cancelled-pending-rename", {
-				requestedPath: path,
-				pendingOldPath,
-				pendingNewPath,
-				case: "rename-target",
-			});
-			this.log(`handleDelete: "${path}" is a pending rename target from "${pendingOldPath}" — cancelling rename`);
-			this.deletePendingRenameByOldPath(pendingOldPath);
-			resolvedPath = pendingOldPath;
-		} else if (this._renameBatch.has(path)) {
-			const pendingNewPath = this._renameBatch.get(path)!;
-			this.trace?.("sync", "delete-cancelled-pending-rename", {
-				requestedPath: path,
-				pendingOldPath: path,
-				pendingNewPath,
-				case: "rename-source",
-			});
-			this.log(`handleDelete: "${path}" has pending rename to "${pendingNewPath}" — cancelling rename`);
-			this.deletePendingRenameByOldPath(path);
-			resolvedPath = path;
-		}
-
-		const fileId = this.getFileId(resolvedPath);
-		if (!fileId) {
-			// Not a markdown file — might be a blob
-			if (this.pathToBlob.has(resolvedPath)) {
-				this.deleteBlobRef(resolvedPath, device);
-			} else {
-				this.log(`handleDelete: "${resolvedPath}" not in CRDT, ignoring`);
-			}
-			return;
-		}
-
-		this.ydoc.transact(() => {
-			if (this.shouldWriteLegacyPathMap()) {
-				this.pathToId.delete(resolvedPath);
-			}
-			this.setMetaDeleted(fileId, resolvedPath, device);
-		}, ORIGIN_SEED);
-
-		this._pathIndexesDirty = true;
-		this.trace?.("sync", "markdown-tombstoned", {
-			requestedPath: path,
-			resolvedPath,
-			fileId,
-			device: device ?? null,
-		});
-	this.onFlightPathEvent?.({
-		priority: "critical",
-		kind: PRODUCT_EVENT_KIND.crdtFileTombstoned,
-		severity: "info",
-		scope: "file",
-		source: "vaultSync",
-		layer: "crdt",
-		path: resolvedPath,
-		opId,
-		data: { fileId },
-	});
-
-		this.log(`handleDelete: "${resolvedPath}" marked deleted (id=${fileId})`);
-	}
-
-	// -------------------------------------------------------------------
-	// State
-	// -------------------------------------------------------------------
-
-	get localReady(): boolean {
-		return this._localReady;
-	}
-
-	get providerSynced(): boolean {
-		return this._providerSynced;
-	}
-
-	get connected(): boolean {
-		return this.provider.wsconnected;
-	}
-
-	get connectionGeneration(): number {
-		return this._connectionGeneration;
-	}
-
-	// Update-tracking getters (delegated to UpdateTracker — INV-ACK-01)
-	get lastLocalUpdateAt(): number | null { return this.updateTracker.lastLocalUpdateAt; }
-	get lastLocalUpdateWhileConnectedAt(): number | null { return this.updateTracker.lastLocalUpdateWhileConnectedAt; }
-	get lastRemoteUpdateAt(): number | null { return this.updateTracker.lastRemoteUpdateAt; }
-	getServerReceiptSnapshot(): VaultSyncReceiptSnapshot {
-		const trackerState = this.serverAckTracker.getState();
-		const persistenceUnavailable = this._serverAckPersistenceUnavailable;
-		return {
-			...trackerState,
-			candidatePersistenceHealthy:
-				!this._serverAckScope && !persistenceUnavailable
-					? null
-					: persistenceUnavailable
-						? false
-						: trackerState.candidatePersistenceHealthy,
-			candidatePersistenceFailureCount:
-				trackerState.candidatePersistenceFailureCount + (persistenceUnavailable ? 1 : 0),
-			persistenceUnavailable,
-			serverReceiptStartupValidation: this._serverReceiptStartupValidation,
-			candidateId: this.serverAckTracker.lastCandidateId,
-			lastConfirmedCandidateId: this.serverAckTracker.lastConfirmedCandidateId,
-		};
 	}
 
 	async flushReceiptPersistence(): Promise<void> {
-		await this.serverAckTracker.flushReceiptPersistence();
-	}
-
-	get svEchoCounters(): SvEchoCounters { return { ...this._svEchoCounters }; }
-
-	async clearLocalServerReceiptState(): Promise<"cleared_persistent" | "cleared_memory_only" | "failed"> {
-		if (!this._serverAckStore) {
-			await this.serverAckTracker.clearLocalReceiptState(false);
-			return "cleared_memory_only";
-		}
-		const beforeFailures = this.serverAckTracker.candidatePersistenceFailureCount;
-		await this.serverAckTracker.clearLocalReceiptState(true);
-		if (this.serverAckTracker.candidatePersistenceFailureCount > beforeFailures) return "failed";
-		return "cleared_persistent";
-	}
-
-	get fatalAuthError(): boolean {
-		return this._fatalAuthError;
-	}
-
-	get fatalAuthCode(): FatalAuthCode | null {
-		return this._fatalAuthCode;
-	}
-
-	get fatalAuthDetails(): {
-		clientSchemaVersion: number | null;
-		roomSchemaVersion: number | null;
-		reason: string | null;
-	} | null {
-		return this._fatalAuthDetails;
-	}
-
-	get idbError(): boolean {
-		return this._idbError;
-	}
-
-	get idbErrorDetails(): IndexedDbErrorDetails | null {
-		return this._idbErrorDetails;
-	}
-
-	reportIndexedDbError(
-		err: unknown,
-		phase: IndexedDbErrorDetails["phase"] = "runtime",
-	): void {
-		this.captureIndexedDbError(err, phase);
-	}
-
-	/** The IndexedDB database name for this server vault and local folder. */
-	get idbName(): string {
-		return this._idbName;
-	}
-
-	get roomGeneration(): number {
-		return readSysGeneration(this.sys.get("generation"));
+		for (const work of this.bodyPersistenceWork.values()) await work;
 	}
 
 	/**
-	 * Wipe all CRDT maps in a single transaction and move receipt persistence
-	 * into a fresh generation so pre-reset receipts cannot be reused.
+	 * Persists one lifecycle intent, obtains its durable receipt, and only then
+	 * publishes the corresponding root mutation.
 	 */
-	clearAllMaps(): { pathCount: number; idCount: number; metaCount: number; blobCount: number } {
-		const pathKeys = Array.from(this.pathToId.keys());
-		const idKeys = Array.from(this.idToText.keys());
-		const metaKeys = Array.from(this.meta.keys());
-		const sysKeys = Array.from(this.sys.keys());
-		const blobPathKeys = Array.from(this.pathToBlob.keys());
-		const blobMetaKeys = Array.from(this.blobMeta.keys());
-		const blobTombKeys = Array.from(this.blobTombstones.keys());
-		const nextGeneration = nextSysGeneration(this.sys.get("generation"));
+	async commitLifecycle(request: LifecycleRequest): Promise<LifecycleReceipt> {
+		const receipts = await this.commitStructuralBatch([request]);
+		return receipts[0]!;
+	}
 
-		this.ydoc.transact(() => {
-			for (const k of pathKeys) this.pathToId.delete(k);
-			for (const k of idKeys) this.idToText.delete(k);
-			for (const k of metaKeys) this.meta.delete(k);
-			for (const k of sysKeys) this.sys.delete(k);
-			for (const k of blobPathKeys) this.pathToBlob.delete(k);
-			for (const k of blobMetaKeys) this.blobMeta.delete(k);
-			for (const k of blobTombKeys) this.blobTombstones.delete(k);
-			this.sys.set("generation", nextGeneration);
-		}, ORIGIN_SEED);
-		this._pathIndexesDirty = true;
+	/**
+	 * Commits every structural operation durably before publishing their root
+	 * mutations in one Yjs transaction. This preserves path swaps and folder
+	 * rename batches without exposing an intermediate root layout.
+	 */
+	async commitStructuralBatch(
+		requests: readonly LifecycleRequest[],
+	): Promise<LifecycleReceipt[]> {
+		if (this.destroyed) throw new Error("runtime is destroyed");
+		if (requests.length === 0) return [];
+		const save = this.options.database.putLifecycleOperation;
+		const remove = this.options.database.deleteLifecycleOperation;
+		const removeBatch = this.options.database.deleteLifecycleOperations;
+		if (!save || !remove) throw new Error("lifecycle persistence is unavailable");
+		if (requests.length > 1 && !removeBatch) {
+			throw new Error("atomic lifecycle batch cleanup is unavailable");
+		}
+		const batchId = requests.length > 1 ? crypto.randomUUID() : null;
+		for (let index = 0; index < requests.length; index++) {
+			const request = requests[index]!;
+			this.assertLifecyclePaths(request);
+			if (
+				request.kind === "create"
+				&& (!request.candidateId || !request.candidateDigest)
+			) {
+				throw new Error("fresh create requires an exact candidate fence");
+			}
+			await save.call(this.options.database, {
+				...this.toStoredLifecycleOperation(request),
+				batchId,
+				batchIndex: batchId ? index : null,
+			});
+		}
+		const receipts = await this.commitLifecycleRequests(requests);
+		await this.publishLifecycleRoot(requests, receipts);
+		if (requests.length > 1) {
+			await removeBatch!.call(
+				this.options.database,
+				requests.map((request) => request.operationId),
+			);
+		} else {
+			await remove.call(this.options.database, requests[0]!.operationId);
+		}
+		return receipts;
+	}
 
-		this.log(
-			`clearAllMaps: removed ${pathKeys.length} paths, ` +
-			`${idKeys.length} texts, ${metaKeys.length} meta entries, ` +
-			`${blobPathKeys.length} blob paths, generation=${nextGeneration}`,
-		);
+	onProviderSync(callback: (generation: number) => void): void {
+		this.providerSyncListeners.add(callback);
+	}
 
+	getFileId(path: string): string | undefined {
+		return this.pathToId.get(path);
+	}
+
+	async getRecoveryLive(path: string): Promise<{
+		fileId: string;
+		bodyId: string;
+		generation: number;
+		contentHash: string;
+	} | null> {
+		const bodyId = this.getFileId(path);
+		if (!bodyId) return null;
+		const head = await this.server.currentHead(bodyId);
+		if (!head || head.bodyId !== bodyId || typeof head.contentHash !== "string") return null;
 		return {
-			pathCount: pathKeys.length,
-			idCount: idKeys.length,
-			metaCount: metaKeys.length,
-			blobCount: blobPathKeys.length,
+			fileId: bodyId,
+			bodyId,
+			generation: head.generation,
+			contentHash: head.contentHash,
 		};
 	}
 
-	/** Delete the receipt candidate scoped to one local installation and folder. */
-	static async clearServerReceiptCandidate(
-		host: string,
-		vaultId: string,
-		folderKey: string,
+	listAttachmentRefs(): Iterable<[string, BlobRef]> {
+		return [...this.pathToBlob.entries()].filter(([path, ref]) =>
+			safeBlobPath(path, [], "", ref) !== null
+		);
+	}
+
+	getAttachmentRef(path: string): BlobRef | undefined {
+		const ref = this.pathToBlob.get(path);
+		return ref && safeBlobPath(path, [], "", ref) ? ref : undefined;
+	}
+
+	isAttachmentTombstoned(path: string): boolean {
+		return safeBlobPath(path) !== null && this.blobTombstones.has(path);
+	}
+
+	async setAttachmentRef(path: string, hash: string, size: number, mime: string): Promise<void> {
+		const ref = { hash, size };
+		const canonical = safeBlobPath(path, [], "", ref);
+		if (!canonical) throw new Error(`Invalid attachment path or reference: ${path}`);
+		const operationId = crypto.randomUUID();
+		const receipt = await this.server.publishAttachment({
+			operationId,
+			kind: "upsert",
+			path: canonical,
+			hash,
+			size,
+			mime,
+		});
+		await this.applyAttachmentPublication(operationId, receipt);
+	}
+
+	async deleteAttachmentRef(path: string, _device?: string): Promise<void> {
+		const canonical = safeBlobPath(path);
+		if (!canonical) throw new Error(`Invalid attachment path: ${path}`);
+		const operationId = crypto.randomUUID();
+		const receipt = await this.server.publishAttachment({
+			operationId,
+			kind: "delete",
+			path: canonical,
+		});
+		await this.applyAttachmentPublication(operationId, receipt);
+	}
+
+	async renameAttachmentRef(oldPath: string, newPath: string): Promise<void> {
+		const oldCanonical = safeBlobPath(oldPath);
+		const ref = oldCanonical ? this.pathToBlob.get(oldCanonical) : undefined;
+		const newCanonical = ref ? safeBlobPath(newPath, [], "", ref) : null;
+		if (!oldCanonical || !newCanonical) throw new Error("Invalid attachment rename");
+		if (oldCanonical === newCanonical || !ref) return;
+		const operationId = crypto.randomUUID();
+		const receipt = await this.server.publishAttachment({
+			operationId,
+			kind: "rename",
+			fromPath: oldCanonical,
+			toPath: newCanonical,
+		});
+		await this.applyAttachmentPublication(operationId, receipt);
+	}
+
+	private async applyAttachmentPublication(
+		operationId: string,
+		receipt: AttachmentPublicationReceipt,
 	): Promise<void> {
-		const [vaultIdHash, serverHostHash, localInstallationId] = await Promise.all([
-			sha256TextHex(vaultId),
-			sha256TextHex(host),
-			getOrCreateLocalDeviceId(),
-		]);
-		const store = new IndexedDbCandidateStore({
-			vaultIdHash,
-			serverHostHash,
-			localDeviceId: receiptLocalDeviceId(localInstallationId, folderKey),
-			roomName: "",
-			roomGeneration: 0,
-			docSchemaVersion: SCHEMA_VERSION,
-		});
-		await store.clear();
+		if (receipt.operationId !== operationId || !receipt.vaultGeneration || !receipt.runtimeEpoch
+			|| !Number.isSafeInteger(receipt.vaultSequence) || receipt.vaultSequence < 0
+			|| !Number.isSafeInteger(receipt.rootGeneration) || receipt.rootGeneration < 0
+			|| typeof receipt.rootUpdateBase64Url !== "string" || !receipt.rootUpdateBase64Url) {
+			throw new Error("attachment publication proof mismatch");
+		}
+		const update = base64UrlToBytes(receipt.rootUpdateBase64Url);
+		Y.applyUpdate(this.ydoc, update, ORIGIN_DURABLE_ROOT_PUBLICATION);
+		this._rootGeneration = Math.max(this._rootGeneration, receipt.rootGeneration);
+		await this.persistRoot();
 	}
 
-	/** Delete only this server-vault/local-folder persistence database. */
-	static deleteIdb(vaultId: string, folderKey: string): Promise<void> {
-		const name = vaultIdbName(vaultId, folderKey);
-		return new Promise<void>((resolve, reject) => {
-			const req = indexedDB.deleteDatabase(name);
-			req.onsuccess = () => resolve();
-			req.onerror = () => reject(req.error ?? new Error(`Failed to delete IndexedDB database "${name}"`));
-			req.onblocked = () => {
-				console.warn(`[yaos] IDB delete blocked for "${name}"`);
-				resolve();
+	observeAttachmentChanges(callback: (change: AttachmentCatalogChange) => void): () => void {
+		const onRefs = (event: Y.YMapEvent<BlobRef>, transaction: Y.Transaction) => {
+			const local = transaction.origin !== this.provider.documentOrigin;
+			for (const [path, change] of event.changes.keys) {
+				if (change.action === "delete") continue;
+				const ref = this.pathToBlob.get(path);
+				const canonical = ref ? safeBlobPath(path, [], "", ref) : null;
+				if (ref && canonical) callback({ kind: "upsert", path: canonical, ref, local });
+				else this.log(`quarantined invalid remote attachment path: ${path}`);
+			}
+		};
+		const onTombstones = (
+			event: Y.YMapEvent<BlobTombstone & { previousHash?: string | null }>,
+			transaction: Y.Transaction,
+		) => {
+			const local = transaction.origin !== this.provider.documentOrigin;
+			for (const [path, change] of event.changes.keys) {
+				if (change.action === "delete") continue;
+				const canonical = safeBlobPath(path);
+				if (!canonical) {
+					this.log(`quarantined invalid remote attachment tombstone: ${path}`);
+					continue;
+				}
+				const tombstone = this.blobTombstones.get(path);
+				callback({
+					kind: "tombstone",
+					path: canonical,
+					previousHash: tombstone?.previousHash ?? null,
+					local,
+				});
+			}
+		};
+		this.pathToBlob.observe(onRefs);
+		this.blobTombstones.observe(onTombstones);
+		return () => {
+			this.pathToBlob.unobserve(onRefs);
+			this.blobTombstones.unobserve(onTombstones);
+		};
+	}
+	/**
+	 * Creates a fresh identity without publishing it empty: local lifecycle and
+	 * candidate records first, durable server admission second, durable body
+	 * receipt third, and root publication last.
+	 */
+	async commitFreshBody(
+		input: FreshBodyCommitInput,
+	): Promise<FreshBodyCommitResult> {
+		if (this.destroyed) throw new Error("runtime is destroyed");
+		if (input.admissionStillCurrent?.() === false) {
+			throw new FreshAdmissionCancelledError(input.path);
+		}
+		if (this.getFileId(input.path)) throw new Error(`path ${input.path} is already active`);
+		const save = this.options.database.putLifecycleOperation;
+		const remove = this.options.database.deleteLifecycleOperation;
+		if (!save || !remove) throw new Error("lifecycle persistence is unavailable");
+		const operationId = crypto.randomUUID();
+		const request: LifecycleRequest = {
+			operationId,
+			kind: "create",
+			fileId: input.bodyId,
+			bodyId: input.bodyId,
+			path: input.path,
+		};
+		const storedOperation: StoredLifecycleOperation = {
+			...this.toStoredLifecycleOperation(request),
+			content: input.content,
+		};
+		await save.call(this.options.database, storedOperation);
+		if (input.admissionStillCurrent?.() === false) {
+			await remove.call(this.options.database, operationId);
+			throw new FreshAdmissionCancelledError(input.path);
+		}
+		let pending = this.pendingCandidates.get(input.candidateId);
+		if (pending && pending.record.bodyId !== input.bodyId) {
+			throw new Error("candidate ID belongs to a different body");
+		}
+		if (!pending) {
+			const body = await this.bodies.load(input.bodyId);
+			if (input.admissionStillCurrent?.() === false) {
+				await remove.call(this.options.database, operationId);
+				this.bodies.discardTransient(input.bodyId);
+				await this.options.database.deleteDocument?.(input.bodyId);
+				throw new FreshAdmissionCancelledError(input.path);
+			}
+			const text = body.doc.getText(BODY_TEXT_NAME);
+			const before = Y.encodeStateVector(body.doc);
+			applyDiffToYText(
+				text,
+				text.toJSON(),
+				input.content,
+				ORIGIN_DISK_COMMIT,
+			);
+			pending = await this.captureCandidate(
+				input.bodyId,
+				Y.encodeStateAsUpdate(body.doc, before),
+				input.candidateId,
+				0,
+				input.path,
+			);
+		}
+		if (input.admissionStillCurrent?.() === false) {
+			await this.cancelFreshAdmission(pending, operationId);
+			throw new FreshAdmissionCancelledError(input.path);
+		}
+		request.candidateId = pending.record.candidateId;
+		request.candidateDigest = pending.record.candidateDigest;
+		const admissionReceipt = await this.server.commitLifecycle(request);
+		this.validateLifecycleReceipt(request, admissionReceipt);
+		if (input.admissionStillCurrent?.() === false) {
+			await this.cancelFreshAdmission(pending, operationId);
+			throw new FreshAdmissionCancelledError(input.path);
+		}
+		const receipt = await this.submitCandidate(pending);
+		await save.call(this.options.database, {
+			...storedOperation,
+			content: null,
+		});
+		const lifecycleReceipt = await this.server.commitLifecycle(request);
+		this.validateLifecycleReceipt(request, lifecycleReceipt);
+		if (lifecycleReceipt.vaultSequence < admissionReceipt.vaultSequence) {
+			throw new Error("fresh lifecycle final sequence regressed");
+		}
+		await this.publishLifecycleRoot([request], [lifecycleReceipt]);
+		await remove.call(this.options.database, operationId);
+		this.log(`fresh body committed for ${input.path} (${input.reason})`);
+		return {
+			fileId: input.bodyId,
+			bodyId: input.bodyId,
+			lifecycleOperationId: operationId,
+			receipt,
+		};
+	}
+
+	/**
+	 * Initial import path: one bounded admission request, one candidate request,
+	 * one lifecycle readback, and one root publication for the whole batch.
+	 * Durable local operations remain resumable if any network step fails.
+	 */
+	async commitFreshBodies(
+		inputs: readonly FreshBodyCommitInput[],
+	): Promise<FreshBodyBatchCommitResult> {
+		if (this.destroyed) throw new Error("runtime is destroyed");
+		if (inputs.length === 0) return { results: [] };
+		if (inputs.length > 100) throw new Error("fresh body batch exceeds 100 items");
+		const save = this.options.database.putLifecycleOperation;
+		const removeBatch = this.options.database.deleteLifecycleOperations;
+		if (!save || !removeBatch) throw new Error("batch lifecycle persistence is unavailable");
+		const paths = new Set<string>();
+		const bodyIds = new Set<string>();
+		const candidateIds = new Set<string>();
+		const prepared: Array<{
+			input: FreshBodyCommitInput;
+			request: LifecycleRequest;
+			pending: PendingCandidate;
+		}> = [];
+		const batchId = crypto.randomUUID();
+		for (let index = 0; index < inputs.length; index++) {
+			const input = inputs[index]!;
+			if (input.admissionStillCurrent?.() === false) {
+				throw new FreshAdmissionCancelledError(input.path);
+			}
+			if (
+				this.getFileId(input.path)
+				|| paths.has(input.path)
+				|| bodyIds.has(input.bodyId)
+				|| candidateIds.has(input.candidateId)
+			) {
+				throw new Error(`duplicate or active fresh body batch item: ${input.path}`);
+			}
+			paths.add(input.path);
+			bodyIds.add(input.bodyId);
+			candidateIds.add(input.candidateId);
+			const operationId = crypto.randomUUID();
+			const request: LifecycleRequest = {
+				operationId,
+				kind: "create",
+				fileId: input.bodyId,
+				bodyId: input.bodyId,
+				path: input.path,
 			};
+			await save.call(this.options.database, {
+				...this.toStoredLifecycleOperation(request),
+				content: input.content,
+				batchId,
+				batchIndex: index,
+			});
+			const body = await this.bodies.load(input.bodyId);
+			const text = body.doc.getText(BODY_TEXT_NAME);
+			const before = Y.encodeStateVector(body.doc);
+			applyDiffToYText(text, text.toJSON(), input.content, ORIGIN_DISK_COMMIT);
+			const pending = await this.captureCandidate(
+				input.bodyId,
+				Y.encodeStateAsUpdate(body.doc, before),
+				input.candidateId,
+				0,
+				input.path,
+			);
+			request.candidateId = pending.record.candidateId;
+			request.candidateDigest = pending.record.candidateDigest;
+			prepared.push({ input, request, pending });
+		}
+
+		const requests = prepared.map((item) => item.request);
+		if (this.server.commitCreateAdmissionsBatch) {
+			const admissions = await this.server.commitCreateAdmissionsBatch(requests);
+			if (admissions.receipts.length !== requests.length) {
+				throw new Error("create admission batch response count mismatch");
+			}
+			for (let index = 0; index < requests.length; index++) {
+				this.validateLifecycleReceipt(requests[index]!, admissions.receipts[index]!);
+			}
+		} else {
+			for (const request of requests) {
+				this.validateLifecycleReceipt(request, await this.server.commitLifecycle(request));
+			}
+		}
+
+		let bodyReceipts: BodyReceipt[];
+		if (this.server.submitCandidates) {
+			const batch = await this.server.submitCandidates(prepared.map((item) => item.pending.record));
+			bodyReceipts = batch.receipts;
+			if (bodyReceipts.length !== prepared.length) {
+				throw new Error("candidate batch receipt count mismatch");
+			}
+			const byBody = new Map(bodyReceipts.map((receipt) => [receipt.bodyId, receipt]));
+			for (const item of prepared) {
+				const receipt = byBody.get(item.pending.record.bodyId);
+				if (!receipt) throw new Error("candidate batch omitted body receipt");
+				await this.completeCandidateSubmission(item.pending, receipt);
+			}
+		} else {
+			bodyReceipts = [];
+			for (const item of prepared) bodyReceipts.push(await this.submitCandidate(item.pending));
+		}
+
+		const lifecycleReceipts = await this.commitLifecycleRequests(requests);
+		await this.publishLifecycleRoot(requests, lifecycleReceipts);
+		await removeBatch.call(
+			this.options.database,
+			requests.map((request) => request.operationId),
+		);
+		const receiptByBody = new Map(bodyReceipts.map((receipt) => [receipt.bodyId, receipt]));
+		return {
+			results: prepared.map(({ input, request }) => ({
+				fileId: input.bodyId,
+				bodyId: input.bodyId,
+				lifecycleOperationId: request.operationId,
+				receipt: receiptByBody.get(input.bodyId)!,
+			})),
+		};
+	}
+
+	/** Durable exact-candidate write for an already admitted body. */
+	async commitBodyCandidate(
+		input: BodyCandidateCommitInput,
+	): Promise<BodyReceipt> {
+		if (this.destroyed) throw new Error("runtime is destroyed");
+		const existing = this.pendingCandidates.get(input.candidateId);
+		if (existing) {
+			if (existing.record.bodyId !== input.bodyId) {
+				throw new Error("candidate ID belongs to a different body");
+			}
+			return this.submitCandidate(existing);
+		}
+		const body = await this.loadCurrentBody(input.bodyId);
+		const text = body.doc.getText(BODY_TEXT_NAME);
+		const before = Y.encodeStateVector(body.doc);
+		applyDiffToYText(
+			text,
+			text.toJSON(),
+			input.content,
+			ORIGIN_DISK_COMMIT,
+		);
+		await this.bodies.markDirty(input.bodyId);
+		const pending = await this.captureCandidate(
+			input.bodyId,
+			Y.encodeStateAsUpdate(body.doc, before),
+			input.candidateId,
+		);
+		const receipt = await this.submitCandidate(pending);
+		this.log(`body candidate committed for ${input.bodyId} (${input.reason})`);
+		return receipt;
+	}
+
+	/**
+	 * Imports an ordinary-file winner through the same durable body candidate
+	 * path as editor changes. A missing root identity is revived durably before
+	 * the root path is republished.
+	 */
+	async commitDiskBody(
+		input: DiskBodyCommitInput,
+	): Promise<DiskBodyCommitResult> {
+		if (this.destroyed) throw new Error("runtime is destroyed");
+		const activeBodyId = this.getFileId(input.path);
+		if (activeBodyId && activeBodyId !== input.bodyId) {
+			throw new Error(`path ${input.path} belongs to a different body`);
+		}
+		const lifecycle: "create" | "revive" | null =
+			activeBodyId === input.bodyId ? null : (input.lifecycle ?? null);
+		if (!activeBodyId && !lifecycle) {
+			throw new Error(`disk body ${input.path} requires explicit create or revive lifecycle`);
+		}
+		if (lifecycle === "create") {
+			const fresh = await this.commitFreshBody({
+				...input,
+				candidateId: input.candidateId ?? crypto.randomUUID(),
+			});
+			return {
+				lifecycle: "create",
+				revived: false,
+				receipt: fresh.receipt,
+			};
+		}
+		if (lifecycle === "revive") {
+			await this.commitLifecycle({
+				operationId: crypto.randomUUID(),
+				kind: "revive",
+				fileId: input.bodyId,
+				bodyId: input.bodyId,
+				path: input.path,
+			});
+		}
+		const revived = lifecycle === "revive";
+		const body = await this.loadCurrentBody(input.bodyId);
+		if (body.doc.getText(BODY_TEXT_NAME).toJSON() === input.content) {
+			await this.bodies.evictLeastRecentlyUsed(this.options.maxLoadedBodies);
+			return { lifecycle, revived, receipt: null };
+		}
+		try {
+			const receipt = await this.commitBodyCandidate({
+				bodyId: input.bodyId,
+				content: input.content,
+				candidateId: input.candidateId ?? crypto.randomUUID(),
+				reason: input.reason,
+			});
+			return { lifecycle, revived, receipt };
+		} catch (error) {
+			this.log(`disk body candidate remains pending for ${input.path} (${input.reason}): ${String(error)}`);
+			throw error;
+		}
+	}
+
+
+	isBodyLoaded(bodyId: string): boolean {
+		return this.bodies.get(bodyId) !== null;
+	}
+
+	isBodyOpen(bodyId: string): boolean {
+		return (this.sessions.get(bodyId)?.consumers.size ?? 0) > 0;
+	}
+	getBodyOrigin(path: string): unknown {
+		const bodyId = this.getFileId(path);
+		return bodyId ? this.sessions.get(bodyId)?.provider.documentOrigin : undefined;
+	}
+
+
+	async settleBodyOnClose(bodyId: string): Promise<void> {
+		if (this.isBodyOpen(bodyId)) return;
+		await this.flushBodyCandidate(bodyId);
+		const hasPendingCandidate = Array.from(this.pendingCandidates.values()).some(
+			(candidate) => candidate.record.bodyId === bodyId,
+		);
+		if (hasPendingCandidate || (this.pendingUpdates.get(bodyId)?.length ?? 0) > 0) {
+			throw new Error(`body ${bodyId} still has pending local work`);
+		}
+		await this.loadCurrentBody(bodyId);
+		await this.bodies.evictLeastRecentlyUsed(this.options.maxLoadedBodies);
+	}
+
+	getTextForPath(path: string): Y.Text | null {
+		const bodyId = this.getFileId(path);
+		if (!bodyId) return null;
+		const body = this.bodies.get(bodyId);
+		if (!body) return null;
+		const text = body.doc.getText(BODY_TEXT_NAME);
+		this.textToBodyId.set(text, bodyId);
+		return text;
+	}
+
+	getFileIdForText(text: Y.Text): string | undefined {
+		return this.textToBodyId.get(text);
+	}
+
+	/** V4 file creation is a durable lifecycle operation and cannot occur from a synchronous editor bind. */
+	ensureFile(path: string): Y.Text | null {
+		return this.getTextForPath(path);
+	}
+
+	isPendingRenameTarget(path: string): boolean {
+		const bodyId = this.pendingRenameTargets.get(path);
+		if (!bodyId) return false;
+		const current = this.pathToId.get(path);
+		if (current) {
+			this.pendingRenameTargets.delete(path);
+			return false;
+		}
+		return true;
+	}
+
+	markPendingRenameTarget(path: string, bodyId: string): void {
+		this.pendingRenameTargets.set(path, bodyId);
+	}
+
+	clearPendingRenameTarget(path: string, bodyId?: string): void {
+		if (bodyId !== undefined && this.pathToId.get(path) !== bodyId) return;
+		this.pendingRenameTargets.delete(path);
+	}
+
+	isMarkdownTombstoned(path: string): boolean {
+		for (const [fileId, raw] of this.meta) {
+			if (!raw || typeof raw !== "object") continue;
+
+			const value = raw as Record<string, unknown>;
+			if (value.path === path && (typeof value.deletedAt === "number" || value.lifecycle === "tombstoned")) {
+				return this.pathToId.get(path) !== fileId;
+			}
+		}
+		return false;
+	}
+	getBodyAwareness(path: string): SyncAwarenessPort {
+		const bodyId = this.getFileId(path);
+		return bodyId
+			? (this.sessions.get(bodyId)?.provider.awareness ?? this.provider.awareness)
+			: this.provider.awareness;
+	}
+
+	queueRename(oldPath: string, newPath: string): void {
+		const bodyId = this.getFileId(oldPath);
+		if (!bodyId) {
+			if (this.getAttachmentRef(oldPath)) {
+				void this.renameAttachmentRef(oldPath, newPath)
+					.catch((error) => this.log(`attachment rename remains pending for ${oldPath}: ${String(error)}`));
+			}
+			return;
+		}
+		this.renameBatch.set(oldPath, newPath);
+		this.markPendingRenameTarget(newPath, bodyId);
+		if (this.renameTimer !== null) window.clearTimeout(this.renameTimer);
+		this.renameTimer = window.setTimeout(() => {
+			this.renameTimer = null;
+			void this.flushRenameBatch();
+		}, 50);
+	}
+
+	onRenameBatchFlushed(callback: (renames: Map<string, string>) => void): void {
+		this.renameBatchListener = callback;
+	}
+
+	handleDelete(path: string, _device?: string, opId: string = crypto.randomUUID()): void {
+		const bodyId = this.getFileId(path);
+		if (!bodyId) {
+			if (this.getAttachmentRef(path)) {
+				void this.deleteAttachmentRef(path, _device)
+					.catch((error) => this.log(`attachment delete remains pending for ${path}: ${String(error)}`));
+			}
+			return;
+		}
+		void this.commitStructuralBatch([{
+			operationId: opId,
+			kind: "delete",
+			fileId: bodyId,
+			bodyId,
+			path,
+		}]).catch((error) => this.log(`delete lifecycle remains pending for ${path}: ${String(error)}`));
+	}
+
+	private async flushRenameBatch(): Promise<void> {
+		if (this.renameBatch.size === 0) return;
+		const batch = new Map(this.renameBatch);
+		this.renameBatch.clear();
+		const requests = [...batch].flatMap(([fromPath, toPath]) => {
+			const bodyId = this.getFileId(fromPath);
+			return bodyId ? [{
+				operationId: crypto.randomUUID(),
+				kind: "rename" as const,
+				fileId: bodyId,
+				bodyId,
+				fromPath,
+				toPath,
+			}] : [];
+		});
+		try {
+			if (requests.length > 0) await this.commitStructuralBatch(requests);
+			this.renameBatchListener?.(batch);
+		} catch (error) {
+			for (const [fromPath, toPath] of batch) {
+				const bodyId = this.getFileId(fromPath);
+				if (bodyId) this.markPendingRenameTarget(toPath, bodyId);
+			}
+			this.log(`rename batch remains pending: ${String(error)}`);
+		} finally {
+			for (const toPath of batch.values()) this.clearPendingRenameTarget(toPath);
+		}
+	}
+
+	async acquireEditorBody(path: string, consumerId: string): Promise<void> {
+		if (this.destroyed) throw new Error("runtime is destroyed");
+		const bodyId = this.getFileId(path);
+		if (!bodyId) throw new Error(`root catalog has no active body for ${path}`);
+		const already = this.sessions.get(bodyId);
+		if (already?.consumers.has(consumerId)) return;
+		const generation = (this.consumerGenerations.get(consumerId) ?? 0) + 1;
+		this.consumerGenerations.set(consumerId, generation);
+
+		const body = await this.loadCurrentBody(bodyId);
+		if (this.destroyed) throw new Error("runtime closed during body acquisition");
+		let session = this.sessions.get(bodyId);
+		if (!session || session.doc !== body.doc) {
+			session?.provider.destroy();
+			if (session) session.doc.off("update", session.updateObserver);
+			session = this.createBodySession(body);
+			this.sessions.set(bodyId, session);
+			session.ready = this.waitForBodySync(session, body);
+		}
+		try {
+			await session.ready;
+		} catch (error) {
+			if (this.sessions.get(bodyId) === session && session.consumers.size === 0) {
+				session.doc.off("update", session.updateObserver);
+				session.provider.destroy();
+				this.sessions.delete(bodyId);
+			}
+			throw error;
+		}
+		if (this.destroyed) throw new Error("runtime closed during body synchronization");
+		if (this.consumerGenerations.get(consumerId) !== generation) {
+			if (this.sessions.get(bodyId) === session && session.consumers.size === 0) {
+				session.doc.off("update", session.updateObserver);
+				session.provider.destroy();
+				this.sessions.delete(bodyId);
+			}
+			throw new Error(`stale body acquisition for ${path}`);
+		}
+		if (!session.consumers.has(consumerId)) {
+			session.consumers.add(consumerId);
+			this.bodies.pin(bodyId);
+		}
+		const text = body.doc.getText(BODY_TEXT_NAME);
+		this.textToBodyId.set(text, bodyId);
+	}
+
+	isEditorBodyReady(path: string, consumerId: string): boolean {
+		const bodyId = this.getFileId(path);
+		if (!bodyId) return false;
+		const session = this.sessions.get(bodyId);
+		return !!session?.consumers.has(consumerId) && this.bodies.get(bodyId)?.doc === session.doc;
+	}
+
+	releaseEditorBody(path: string, consumerId: string): void {
+		this.consumerGenerations.set(consumerId, (this.consumerGenerations.get(consumerId) ?? 0) + 1);
+		const bodyId = this.findSessionBodyForConsumer(consumerId) ?? this.getFileId(path);
+		if (!bodyId) return;
+		const session = this.sessions.get(bodyId);
+		if (!session || !session.consumers.delete(consumerId)) return;
+		this.bodies.unpin(bodyId);
+		if (session.consumers.size === 0) {
+			session.doc.off("update", session.updateObserver);
+			session.provider.destroy();
+			this.sessions.delete(bodyId);
+		}
+	}
+
+	async flushBodyCandidate(bodyId: string): Promise<void> {
+		this.clearCandidateTimers(bodyId);
+		const updates = this.pendingUpdates.get(bodyId);
+		if (updates && updates.length > 0) {
+			this.pendingUpdates.delete(bodyId);
+			const encodedUpdate = updates.length === 1 ? updates[0]! : Y.mergeUpdates(updates);
+			try {
+				await this.bodies.markDirty(bodyId);
+				await this.captureCandidate(
+					bodyId,
+					encodedUpdate,
+					undefined,
+					updates.length,
+				);
+			} catch (error) {
+				const newer = this.pendingUpdates.get(bodyId) ?? [];
+				this.pendingUpdates.set(bodyId, [...updates, ...newer]);
+				if (!this.destroyed) this.scheduleCandidate(bodyId);
+				throw error;
+			}
+		}
+		await this.submitPendingForBody(bodyId);
+	}
+
+	async retryPendingCandidates(): Promise<void> {
+		const bodyIds = new Set(Array.from(this.pendingCandidates.values(), (candidate) => candidate.record.bodyId));
+		for (const bodyId of bodyIds) await this.submitPendingForBody(bodyId);
+	}
+
+	async reconnect(): Promise<void> {
+		if (this.fatalAuthError || this.destroyed) return;
+		await this.refreshProviderTickets(true);
+		if (this.fatalAuthError || this.destroyed) return;
+		this.provider.disconnect();
+		await this.provider.connect();
+		for (const session of this.sessions.values()) {
+			session.provider.disconnect();
+			await session.provider.connect();
+		}
+		await this.retryPendingCandidates();
+	}
+
+	async destroy(): Promise<void> {
+		if (this.destroyed) return;
+		if (this.renameTimer !== null) {
+			window.clearTimeout(this.renameTimer);
+			this.renameTimer = null;
+			await this.flushRenameBatch();
+		}
+		this.destroyed = true;
+		if (this.ticketRefreshTimer) window.clearTimeout(this.ticketRefreshTimer);
+		for (const timer of this.candidateTimers.values()) window.clearTimeout(timer);
+		for (const timer of this.candidateMaxWaitTimers.values()) window.clearTimeout(timer);
+		this.candidateTimers.clear();
+		this.candidateMaxWaitTimers.clear();
+		for (const bodyId of Array.from(this.pendingUpdates.keys())) {
+			await this.flushBodyCandidate(bodyId).catch(() => undefined);
+		}
+		for (const session of this.sessions.values()) {
+			session.doc.off("update", session.updateObserver);
+			this.terminateProvider(session.provider);
+			session.provider.destroy();
+		}
+		this.sessions.clear();
+		this.pendingRenameTargets.clear();
+		this.terminateProvider(this.provider);
+		this.provider.awareness.destroy();
+		this.provider.destroy();
+		await this.persistRoot();
+		await this.bodies.destroy();
+		await this.options.database.close();
+	}
+
+	private wireRootProvider(): void {
+		this.provider.on("status", ({ status }) => {
+			if (status === "connected") {
+				this._connectionGeneration++;
+				void this.retryPendingCandidates();
+			} else if (status === "disconnected" && !this.fatalAuthError) {
+				void this.refreshProviderTickets(true);
+			}
+		});
+		this.provider.on("sync", (synced) => {
+			if (!synced) return;
+			for (const callback of this.providerSyncListeners) callback(this._connectionGeneration);
+		});
+		const handleFatal = (payload: string) => {
+			const fatal = asFatalSyncMessage(payload);
+			if (!fatal) return;
+			this._fatalAuthCode = fatal.code;
+			this._fatalAuthDetails = fatal.details;
+			if (this.ticketRefreshTimer !== null) {
+				window.clearTimeout(this.ticketRefreshTimer);
+				this.ticketRefreshTimer = null;
+			}
+			this.provider.disconnect();
+			for (const session of this.sessions.values()) session.provider.disconnect();
+		};
+		const handleRootControl = (payload: string) => {
+			handleFatal(payload);
+			this.handleVaultControl(payload, ROOT_DOCUMENT_ID);
+			const committed = asBodyCommittedNotification(payload);
+			if (committed) void this.handleDurableBodyCommitted(committed);
+		};
+		this.provider.on("custom-message", handleRootControl);
+		this.provider.on("message", (event) => {
+			if (typeof event.data === "string") handleRootControl(event.data);
+		});
+		this.ydoc.on("update", (_update, origin) => {
+			if (origin === this.provider.documentOrigin) {
+				this._lastRemoteUpdateAt = this.now();
+				const invalidPath = this.invalidRootPath();
+				if (invalidPath) {
+					this._fatalAuthCode = "server_misconfigured";
+					this._fatalAuthDetails = {
+						clientSchemaVersion: SCHEMA_VERSION,
+						roomSchemaVersion: SCHEMA_VERSION,
+						reason: `invalid root path: ${invalidPath}`,
+					};
+					this.provider.disconnect();
+					this.log(`quarantined invalid remote root path: ${invalidPath}`);
+					return;
+				}
+				void this.persistRoot().catch((error) => {
+					this.log(`remote root persistence failed: ${String(error)}`);
+				});
+				const callback = this.options.onRemoteRootStructuralUpdate;
+				if (callback) {
+					void Promise.resolve()
+						.then(() => callback())
+						.catch((error) => {
+							this.log(`remote root catch-up scheduling failed: ${String(error)}`);
+						});
+				}
+				return;
+			}
+			if (
+				origin === "indexeddb-bootstrap"
+				|| origin === ORIGIN_DURABLE_ROOT_PUBLICATION
+			) return;
+			const now = this.now();
+			this._lastLocalUpdateAt = now;
+			if (this.connected) this._lastLocalUpdateWhileConnectedAt = now;
+			void this.persistRoot().catch((error) => {
+				this.log(`root persistence failed: ${String(error)}`);
+			});
 		});
 	}
 
-	// -------------------------------------------------------------------
-	// Socket ticket proactive refresh
-	// -------------------------------------------------------------------
-
-	/**
-	 * Schedule a timer to refresh provider.url with a fresh ticket before the
-	 * current one expires.  Fires at expiresAt - TICKET_REFRESH_BUFFER_MS,
-	 * which is the same threshold the cache uses to decide a ticket is stale.
-	 *
-	 * This is the primary mechanism ensuring reconnects use a live ticket.
-	 * y-partyserver's setupWS loop reads provider.url directly without
-	 * re-calling the async params() callback.
-	 */
-	private scheduleSocketTicketRefresh(ticket: {
-		value: string;
-		expiresAt: number;
-		localExpiresAt: number;
-		ttlMs: number;
-	}): void {
-		this.clearSocketTicketRefreshTimer();
-		if (this._fatalAuthError) return;
-		const ttlRemaining = ticket.localExpiresAt - Date.now();
-		const buffer = Math.min(TICKET_REFRESH_BUFFER_MS, Math.floor(ttlRemaining / 2));
-		const msUntilRefresh = Math.max(250, ttlRemaining - buffer);
-		this._socketTicketRefreshTimer = window.setTimeout(() => {
-			this._socketTicketRefreshTimer = null;
-			void this.refreshProviderTicketUrl(true);
-		}, msUntilRefresh);
+	private createBodySession(body: LoadedBody): BodySession {
+		const factory = this.options.providerFactory ?? ((input) => this.createDefaultProvider(input));
+		const provider = factory({ kind: "body", documentId: body.bodyId, doc: body.doc });
+		const handleControl = (payload: string) => this.handleVaultControl(payload, body.bodyId);
+		provider.on("custom-message", handleControl);
+		provider.on("message", (event) => {
+			if (typeof event.data === "string") handleControl(event.data);
+		});
+		const updateObserver = (update: Uint8Array, origin: unknown) => {
+			if (origin === provider.documentOrigin) {
+				this._lastRemoteUpdateAt = this.now();
+				void this.bodies.mergeFromServer(
+					body.bodyId,
+					new Uint8Array(),
+					body.generation,
+				).catch((error) => {
+					this.log(`remote body persistence failed for ${body.bodyId}: ${String(error)}`);
+				});
+				return;
+			}
+			if (
+				origin === ORIGIN_DISK_COMMIT
+				|| origin === "server-catch-up"
+				|| origin === "server-bootstrap"
+				|| origin === "indexeddb-bootstrap"
+			) return;
+			const now = this.now();
+			this._lastLocalUpdateAt = now;
+			if (this.connected) this._lastLocalUpdateWhileConnectedAt = now;
+			const updates = this.pendingUpdates.get(body.bodyId) ?? [];
+			updates.push(update.slice());
+			this.pendingUpdates.set(body.bodyId, updates);
+			this.queueBodyPersistence(body.bodyId);
+			this.scheduleCandidate(body.bodyId);
+		};
+		body.doc.on("update", updateObserver);
+		return {
+			bodyId: body.bodyId,
+			doc: body.doc,
+			provider,
+			consumers: new Set(),
+			updateObserver,
+			ready: Promise.resolve(),
+		};
 	}
 
-	private clearSocketTicketRefreshTimer(): void {
-		if (this._socketTicketRefreshTimer !== null) {
-			window.clearTimeout(this._socketTicketRefreshTimer);
-			this._socketTicketRefreshTimer = null;
+	private async loadCurrentBody(bodyId: string): Promise<LoadedBody> {
+		const inFlight = this.currentnessChecks.get(bodyId);
+		if (inFlight) return inFlight;
+		const run = this.bodies.load(bodyId).then((body) => this.catchUpBody(body));
+		this.currentnessChecks.set(bodyId, run);
+		try {
+			return await run;
+		} finally {
+			if (this.currentnessChecks.get(bodyId) === run) {
+				this.currentnessChecks.delete(bodyId);
+			}
 		}
 	}
 
-	/** Replace the ticket value in provider.url without adding credentials. */
-	private patchProviderTicket(value: string): void {
+	private async catchUpBody(body: LoadedBody): Promise<LoadedBody> {
+		let head: BodyHead | null;
 		try {
-			this.provider.url = patchTicketInUrl(this.provider.url, value);
-			this.log("socket ticket refreshed in provider URL");
-		} catch (err) {
-			this.log(`patchProviderTicket: failed to update provider URL: ${formatUnknown(err)}`);
+			head = await this.server.currentHead(body.bodyId);
+		} catch (error) {
+			if (body.generation > 0 || body.dirty) return body;
+			throw error;
+		}
+		if (!head) throw new Error(`body ${body.bodyId} is not active`);
+		if (
+			head.generation <= body.generation
+			&& await this.bodyMatchesHead(body.doc, head)
+		) return body;
+		const state = await this.server.currentBody(body.bodyId);
+		if (state.bodyId !== body.bodyId || state.generation < head.generation) {
+			throw new Error("stale body catch-up response");
+		}
+		await this.validateBodyStateIntegrity(head, state);
+		return body.dirty || body.unsettled > 0 || body.pendingLocalUpdates > 0 || body.pins > 0
+			? this.bodies.mergeFromServer(body.bodyId, state.encodedState, state.generation)
+			: this.bodies.replaceFromServer(body.bodyId, state.encodedState, state.generation);
+	}
+	private async bodyMatchesHead(doc: Y.Doc, head: BodyHead): Promise<boolean> {
+		if (
+			(head.contentHash === undefined || head.contentHash === null)
+			&& (head.size === undefined || head.size === null)
+		) return true;
+		const metadata = await this.bodyContentMetadata(doc);
+		return (
+			(head.contentHash === undefined
+				|| head.contentHash === null
+				|| head.contentHash === metadata.contentHash)
+			&& (head.size === undefined || head.size === null || head.size === metadata.size)
+		);
+	}
+
+	private async bodyContentMetadata(
+		doc: Y.Doc,
+	): Promise<{ contentHash: string; size: number }> {
+		const bytes = new TextEncoder().encode(doc.getText(BODY_TEXT_NAME).toJSON());
+		return {
+			contentHash: await sha256Hex(bytes),
+			size: bytes.byteLength,
+		};
+	}
+
+	private async validateBodyStateIntegrity(
+		head: BodyHead,
+		state: BodyState,
+	): Promise<void> {
+		const doc = new Y.Doc();
+		try {
+			Y.applyUpdate(doc, state.encodedState);
+			const bytes = new TextEncoder().encode(doc.getText(BODY_TEXT_NAME).toJSON());
+			const contentHash = await sha256Hex(bytes);
+			if (head.contentHash !== undefined && head.contentHash !== null && head.contentHash !== contentHash) {
+				throw new Error("body content hash mismatch");
+			}
+			if (head.size !== undefined && head.size !== null && head.size !== bytes.byteLength) {
+				throw new Error("body content size mismatch");
+			}
+			if (state.contentHash !== undefined && state.contentHash !== null && state.contentHash !== contentHash) {
+				throw new Error("body response content hash mismatch");
+			}
+			if (state.size !== undefined && state.size !== null && state.size !== bytes.byteLength) {
+				throw new Error("body response content size mismatch");
+			}
+		} finally {
+			doc.destroy();
 		}
 	}
 
-	/**
-	 * Fetch a fresh ticket (optionally bypassing the cache) and patch
-	 * provider.url.  Reschedules the refresh timer on success.
-	 * On transient failure, retries after TICKET_REFRESH_BUFFER_MS so the
-	 * proactive refresh cycle survives intermittent network errors.
-	 */
-	private async refreshProviderTicketUrl(force = false): Promise<void> {
-		if (this._fatalAuthError) return;
+
+	private async waitForBodySync(session: BodySession, body: LoadedBody): Promise<void> {
+		if (session.provider.synced) return;
+		let timer: number | null = null;
+		const synced = new Promise<boolean>((resolve) => {
+			session.provider.on("sync", (value) => { if (value) resolve(true); });
+			timer = window.setTimeout(() => resolve(false), this.options.bodySyncTimeoutMs);
+		});
+		await session.provider.connect();
+		const completed = await synced;
+		if (timer) window.clearTimeout(timer);
+		if (!completed && body.generation === 0 && !body.dirty) {
+			session.provider.destroy();
+			throw new Error(`body ${body.bodyId} did not establish current state`);
+		}
+	}
+
+	private queueBodyPersistence(bodyId: string): void {
+		const prior = this.bodyPersistenceWork.get(bodyId);
+		const run = (prior ? prior.catch(() => undefined) : Promise.resolve())
+			.then(() => this.bodies.markLocalUpdate(bodyId));
+		this.bodyPersistenceWork.set(bodyId, run);
+		void run.catch((error) => {
+			this.log(`body persistence failed for ${bodyId}: ${String(error)}`);
+		});
+	}
+
+	private async awaitBodyPersistence(bodyId: string): Promise<void> {
+		const work = this.bodyPersistenceWork.get(bodyId);
+		if (!work) return;
 		try {
-			const ticket = await this._getSocketTicket(force);
-			if (this._fatalAuthError) return;
-			this.patchProviderTicket(ticket.value);
-			this.scheduleSocketTicketRefresh(ticket);
-		} catch (err) {
-			if (this._fatalAuthError) return;
-			this.log(`socket ticket refresh failed: ${formatUnknown(err)}`);
-			// Clear any existing timer before scheduling the retry so we never
-			// lose a handle and fire duplicate refreshes.  This matters when the
-			// disconnected best-effort path calls here while the proactive timer
-			// is already scheduled: without the clear, the proactive timer
-			// handle is overwritten but the timer still fires.
-			this.clearSocketTicketRefreshTimer();
-			this._socketTicketRefreshTimer = window.setTimeout(() => {
-				this._socketTicketRefreshTimer = null;
-				void this.refreshProviderTicketUrl(true);
+			await work;
+		} finally {
+			if (this.bodyPersistenceWork.get(bodyId) === work) {
+				this.bodyPersistenceWork.delete(bodyId);
+			}
+		}
+	}
+
+	private scheduleCandidate(bodyId: string): void {
+		const existing = this.candidateTimers.get(bodyId);
+		if (existing) window.clearTimeout(existing);
+		this.candidateTimers.set(bodyId, window.setTimeout(() => {
+			void this.flushBodyCandidate(bodyId).catch((error) => {
+				this.log(`candidate flush failed for ${bodyId}: ${String(error)}`);
+			});
+		}, this.options.candidateDebounceMs));
+		if (!this.candidateMaxWaitTimers.has(bodyId)) {
+			this.candidateMaxWaitTimers.set(bodyId, window.setTimeout(() => {
+				void this.flushBodyCandidate(bodyId).catch((error) => {
+					this.log(`candidate max-wait flush failed for ${bodyId}: ${String(error)}`);
+				});
+			}, this.options.candidateMaxWaitMs));
+		}
+	}
+
+	private clearCandidateTimers(bodyId: string): void {
+		const debounce = this.candidateTimers.get(bodyId);
+		if (debounce) window.clearTimeout(debounce);
+		this.candidateTimers.delete(bodyId);
+		const maxWait = this.candidateMaxWaitTimers.get(bodyId);
+		if (maxWait) window.clearTimeout(maxWait);
+		this.candidateMaxWaitTimers.delete(bodyId);
+	}
+
+	private async handleDurableBodyCommitted(
+		notification: BodyCommittedNotification,
+	): Promise<void> {
+		await this.catchUpCommittedBody(notification);
+		const callback = this.options.onDurableBodyCommitted;
+		if (!callback) return;
+		try {
+			await callback(notification);
+		} catch (error) {
+			this.log(`durable body settlement scheduling failed: ${String(error)}`);
+		}
+	}
+
+	private async catchUpCommittedBody(notification: BodyCommittedNotification): Promise<void> {
+		const body = this.bodies.get(notification.bodyId);
+		if (!body || body.generation >= notification.durableGeneration) return;
+		try {
+			const state = await this.server.currentBody(notification.bodyId);
+			if (state.generation < notification.durableGeneration) return;
+			await this.bodies.mergeFromServer(
+				notification.bodyId,
+				state.encodedState,
+				state.generation,
+			);
+		} catch (error) {
+			this.log(`BODY_COMMITTED catch-up failed for ${notification.bodyId}: ${String(error)}`);
+		}
+	}
+
+	private handleVaultControl(payload: string, expectedDocumentId: string): void {
+		let frame: VaultControlFrame | null;
+		try {
+			frame = parseVaultControlFrame(payload);
+		} catch (error) {
+			frame = { type: "VAULT_ERROR", message: String(error) };
+		}
+		if (!frame) return;
+		if (frame.type === "VAULT_READY") {
+			if (frame.documentId !== expectedDocumentId) {
+				frame = { type: "VAULT_ERROR", message: "ready document identity mismatch" };
+			} else {
+				this.backpressureLevel = 0;
+				this.submissionPausedUntil = 0;
+				if (frame.documentId === ROOT_DOCUMENT_ID) {
+					this._rootGeneration = Math.max(this._rootGeneration, frame.durableGeneration);
+				} else {
+					const body = this.bodies.get(frame.documentId);
+					if (body) body.generation = Math.max(body.generation, frame.durableGeneration);
+				}
+			}
+		} else if (frame.type === "VAULT_BACKPRESSURE") {
+			this.backpressureLevel = Math.min(this.backpressureLevel + 1, 5);
+			const delay = Math.min(
+				MAX_BACKOFF_TIME_MS,
+				1_000 * (2 ** (this.backpressureLevel - 1)),
+			);
+			this.submissionPausedUntil = Math.max(this.submissionPausedUntil, this.now() + delay);
+			this.log(`server backpressure: ${frame.reason}; submissions paused ${delay}ms`);
+		} else {
+			this.submissionPausedUntil = Math.max(this.submissionPausedUntil, this.now() + 1_000);
+			this.log(`server vault error: ${frame.message}`);
+		}
+		this.options.onControlFrame?.(frame);
+	}
+
+	private async waitForSubmissionWindow(): Promise<void> {
+		const remaining = this.submissionPausedUntil - this.now();
+		if (remaining <= 0) return;
+		await new Promise<void>((resolve) => window.setTimeout(resolve, remaining));
+		if (this.destroyed) throw new Error("runtime destroyed during submission backoff");
+	}
+
+	private async captureCandidate(
+		bodyId: string,
+		encodedUpdate: Uint8Array,
+		candidateId: string | undefined = crypto.randomUUID(),
+		capturedLocalUpdates = 0,
+		path?: string,
+	): Promise<PendingCandidate> {
+		if (!candidateId) throw new Error("candidateId is required");
+		const candidateDigest = await sha256Hex(encodedUpdate);
+		const existing = this.pendingCandidates.get(candidateId);
+		if (existing) {
+			const prior = new Uint8Array(existing.record.encodedUpdate);
+			const sameBytes = prior.byteLength === encodedUpdate.byteLength
+				&& prior.every((byte, index) => byte === encodedUpdate[index]);
+			if (
+				existing.record.bodyId !== bodyId
+				|| existing.record.candidateDigest !== candidateDigest
+				|| !sameBytes
+			) {
+				throw new Error("candidate ID reused with different bytes");
+			}
+			return existing;
+		}
+		const capturedAt = this.now();
+		const record: CandidateRecord = {
+			vaultId: this.options.vaultId,
+			bodyId,
+			candidateId,
+			candidateDigest,
+			encodedUpdate: encodedUpdate.slice().buffer,
+			capturedAt,
+			capturedLocalUpdates,
+		};
+		await this.bodies.markDirty(bodyId);
+		await this.persistCandidate(record);
+		const candidatePath = path ?? this.pathForBodyId(bodyId);
+		const pending: PendingCandidate = { record, submission: null, path: candidatePath };
+		this.pendingCandidates.set(record.candidateId, pending);
+		this.bodies.markUnsettled(bodyId);
+		this._lastCandidateCapturedAt = capturedAt;
+		if (candidatePath) {
+			this.options.onProductEvent?.({
+				kind: PRODUCT_EVENT_KIND.serverReceiptCandidateCaptured,
+				severity: "info",
+				scope: "file",
+				source: "vaultSync",
+				layer: "server",
+				priority: "important",
+				path: candidatePath,
+				data: { bodyId, candidateId, candidateDigest },
+			});
+		}
+		return pending;
+	}
+
+	private submitCandidate(candidate: PendingCandidate): Promise<BodyReceipt> {
+		if (candidate.submission) return candidate.submission;
+		const run = this.performCandidateSubmission(candidate);
+		candidate.submission = run;
+		void run.then(
+			() => {
+				if (candidate.submission === run) candidate.submission = null;
+			},
+			() => {
+				if (candidate.submission === run) candidate.submission = null;
+			},
+		);
+		return run;
+	}
+
+	private async performCandidateSubmission(
+		candidate: PendingCandidate,
+	): Promise<BodyReceipt> {
+		await this.waitForSubmissionWindow();
+		const receipt = await this.server.submitCandidate(candidate.record);
+		return this.completeCandidateSubmission(candidate, receipt);
+	}
+
+	private async completeCandidateSubmission(
+		candidate: PendingCandidate,
+		receipt: BodyReceipt,
+	): Promise<BodyReceipt> {
+		await this.awaitBodyPersistence(candidate.record.bodyId);
+		this.validateReceipt(candidate.record, receipt);
+		await this.confirmPersistedCandidate(candidate.record, receipt);
+		this.pendingCandidates.delete(candidate.record.candidateId);
+		await this.bodies.markCandidateSettled(
+			candidate.record.bodyId,
+			receipt.durableGeneration,
+			candidate.record.capturedLocalUpdates ?? 0,
+		);
+		this._lastReceiptAt = this.now();
+		const path = candidate.path ?? this.pathForBodyId(candidate.record.bodyId);
+		if (path) {
+			this.options.onProductEvent?.({
+				kind: PRODUCT_EVENT_KIND.serverReceiptConfirmed,
+				severity: "info",
+				scope: "file",
+				source: "vaultSync",
+				layer: "server",
+				priority: "important",
+				path,
+				data: {
+					bodyId: candidate.record.bodyId,
+					candidateId: candidate.record.candidateId,
+					durableGeneration: receipt.durableGeneration,
+				},
+			});
+		}
+		await this.bodies.evictLeastRecentlyUsed(this.options.maxLoadedBodies);
+		return receipt;
+	}
+
+	private async submitPendingForBody(bodyId: string): Promise<void> {
+		const candidates = Array.from(this.pendingCandidates.values())
+			.filter((candidate) => candidate.record.bodyId === bodyId)
+			.sort((left, right) => left.record.capturedAt - right.record.capturedAt);
+		for (const candidate of candidates) {
+			try {
+				await this.submitCandidate(candidate);
+			} catch (error) {
+				this.log(`candidate ${candidate.record.candidateId} remains pending: ${String(error)}`);
+				break;
+			}
+		}
+	}
+
+	private validateReceipt(candidate: CandidateRecord, receipt: BodyReceipt): void {
+		if (
+			receipt.vaultId !== candidate.vaultId
+			|| receipt.bodyId !== candidate.bodyId
+			|| receipt.clientId !== this.options.deviceId
+			|| receipt.candidateId !== candidate.candidateId
+			|| receipt.candidateDigest !== candidate.candidateDigest
+			|| !Number.isSafeInteger(receipt.durableGeneration)
+			|| receipt.durableGeneration < 0
+			|| typeof receipt.vaultGeneration !== "string"
+			|| receipt.vaultGeneration.length === 0
+			|| typeof receipt.runtimeEpoch !== "string"
+			|| receipt.runtimeEpoch.length === 0
+		) {
+			throw new Error("candidate receipt identity mismatch");
+		}
+	}
+
+	private async restoreCandidates(): Promise<void> {
+		const list = this.options.database.listCandidates;
+		if (!list) return;
+		try {
+			for (const record of await list.call(this.options.database)) {
+				this.pendingCandidates.set(record.candidateId, {
+					record,
+					submission: null,
+					path: this.pathForBodyId(record.bodyId),
+				});
+				const body = await this.bodies.load(record.bodyId);
+				this.bodies.markUnsettled(record.bodyId);
+				body.dirty = true;
+			}
+			this._candidatePersistenceHealthy = true;
+		} catch (error) {
+			this.noteCandidatePersistenceFailure(error);
+		}
+	}
+	private async persistCandidate(record: CandidateRecord): Promise<void> {
+		const save = this.options.database.putCandidate;
+		if (!save) {
+			this._candidatePersistenceHealthy = false;
+			this._candidatePersistenceFailureCount++;
+			throw new Error("candidate persistence is unavailable");
+		}
+		try {
+			await save.call(this.options.database, record);
+			this._candidatePersistenceHealthy = true;
+		} catch (error) {
+			this.noteCandidatePersistenceFailure(error);
+			throw error;
+		}
+	}
+
+	private async retryLifecycleOperations(): Promise<void> {
+		const list = this.options.database.listLifecycleOperations;
+		if (!list) return;
+		const operations = await list.call(this.options.database);
+		const groups = new Map<string, StoredLifecycleOperation[]>();
+		for (const operation of operations) {
+			const key = operation.batchId
+				? `batch:${operation.batchId}`
+				: `single:${operation.operationId}`;
+			const group = groups.get(key) ?? [];
+			group.push(operation);
+			groups.set(key, group);
+		}
+		for (const group of groups.values()) {
+			group.sort((left, right) => (left.batchIndex ?? 0) - (right.batchIndex ?? 0));
+			await this.retryLifecycleGroup(group);
+		}
+	}
+
+	private async retryLifecycleGroup(
+		operations: readonly StoredLifecycleOperation[],
+	): Promise<void> {
+		const save = this.options.database.putLifecycleOperation;
+		const remove = this.options.database.deleteLifecycleOperation;
+		const removeBatch = this.options.database.deleteLifecycleOperations;
+		if (!save || !remove || operations.length === 0) return;
+		if (operations.length > 1 && !removeBatch) {
+			this.log("lifecycle replay remains pending: atomic batch cleanup is unavailable");
+			return;
+		}
+		const attempted = operations.map((operation): StoredLifecycleOperation => ({
+			...operation,
+			attempts: operation.attempts + 1,
+			lastAttemptAt: this.now(),
+		}));
+		for (const operation of attempted) {
+			await save.call(this.options.database, operation);
+		}
+		const requests = attempted.map((operation) => this.fromStoredLifecycleOperation(operation));
+		try {
+			for (let index = 0; index < attempted.length; index++) {
+				const operation = attempted[index]!;
+				if (operation.kind !== "create" || operation.content === null) continue;
+				const request = requests[index]!;
+				let pending = Array.from(this.pendingCandidates.values()).find(
+					(candidate) => candidate.record.bodyId === operation.bodyId,
+				);
+				if (!pending) {
+					const body = await this.bodies.load(operation.bodyId);
+					const text = body.doc.getText(BODY_TEXT_NAME);
+					if (text.toJSON() !== operation.content) {
+						applyDiffToYText(
+							text,
+							text.toJSON(),
+							operation.content,
+							ORIGIN_DISK_COMMIT,
+						);
+						await this.bodies.markDirty(operation.bodyId);
+					}
+					pending = await this.captureCandidate(
+						operation.bodyId,
+						Y.encodeStateAsUpdate(body.doc),
+					);
+				}
+				request.candidateId = pending.record.candidateId;
+				request.candidateDigest = pending.record.candidateDigest;
+			}
+			const receipts = await this.commitLifecycleRequests(requests);
+			for (const operation of attempted) {
+				if (operation.kind !== "create" || operation.content === null) continue;
+				await this.submitPendingForBody(operation.bodyId);
+				const stillPending = Array.from(this.pendingCandidates.values()).some(
+					(candidate) => candidate.record.bodyId === operation.bodyId,
+				);
+				if (stillPending) throw new Error(`fresh body ${operation.bodyId} is not durable`);
+				await save.call(this.options.database, {
+					...operation,
+					content: null,
+				});
+			}
+			for (let index = 0; index < attempted.length; index++) {
+				const operation = attempted[index]!;
+				if (operation.kind !== "create" || operation.content === null) continue;
+				const finalReceipt = await this.server.commitLifecycle(requests[index]!);
+				this.validateLifecycleReceipt(requests[index]!, finalReceipt);
+				if (finalReceipt.vaultSequence < receipts[index]!.vaultSequence) {
+					throw new Error("fresh lifecycle final sequence regressed");
+
+				}
+				receipts[index] = finalReceipt;
+			}
+			await this.publishLifecycleRoot(requests, receipts);
+			if (attempted.length > 1) {
+				await removeBatch!.call(
+					this.options.database,
+					attempted.map((operation) => operation.operationId),
+				);
+			} else {
+				await remove.call(this.options.database, attempted[0]!.operationId);
+			}
+		} catch (error) {
+			this.log(`lifecycle replay remains pending: ${String(error)}`);
+		}
+	}
+
+	private async cancelFreshAdmission(
+		pending: PendingCandidate,
+		operationId: string,
+	): Promise<void> {
+		await this.options.database.deleteCandidate?.(
+			pending.record.bodyId,
+			pending.record.candidateId,
+		);
+		this.pendingCandidates.delete(pending.record.candidateId);
+		await this.bodies.markCandidateSettled(
+			pending.record.bodyId,
+			this.bodies.get(pending.record.bodyId)?.generation ?? 0,
+			pending.record.capturedLocalUpdates ?? 0,
+		);
+		this.bodies.discardTransient(pending.record.bodyId);
+		await this.options.database.deleteDocument?.(pending.record.bodyId);
+		await this.options.database.deleteLifecycleOperation?.(operationId);
+	}
+
+	private toStoredLifecycleOperation(request: LifecycleRequest): StoredLifecycleOperation {
+		const path = request.toPath ?? request.path;
+		if (!path) throw new Error(`lifecycle ${request.kind} requires a path`);
+		if (request.fileId !== request.bodyId) throw new Error("vault requires bodyId=fileId");
+		return {
+			operationId: request.operationId,
+			kind: request.kind,
+			bodyId: request.bodyId,
+			path,
+			previousPath: request.fromPath ?? null,
+			content: null,
+			createdAt: this.now(),
+			attempts: 0,
+			lastAttemptAt: null,
+		};
+	}
+
+	private fromStoredLifecycleOperation(operation: StoredLifecycleOperation): LifecycleRequest {
+		return {
+			operationId: operation.operationId,
+			kind: operation.kind,
+			fileId: operation.bodyId,
+			bodyId: operation.bodyId,
+			path: operation.kind === "rename" ? undefined : operation.path,
+			fromPath: operation.previousPath ?? undefined,
+			toPath: operation.kind === "rename" ? operation.path : undefined,
+		};
+	}
+
+	private async commitLifecycleRequests(
+		requests: readonly LifecycleRequest[],
+	): Promise<LifecycleReceipt[]> {
+		await this.waitForSubmissionWindow();
+		if (requests.length === 1) {
+			const receipt = await this.server.commitLifecycle(requests[0]!);
+			this.validateLifecycleReceipt(requests[0]!, receipt);
+			return [receipt];
+		}
+		const batch = await this.server.commitLifecycleBatch(requests);
+		if (
+			batch.receipts.length !== requests.length
+			|| !Number.isSafeInteger(batch.vaultSequence)
+			|| batch.vaultSequence < 0
+			|| !batch.runtimeEpoch
+		) {
+			throw new Error("lifecycle batch receipt mismatch");
+		}
+		for (let index = 0; index < requests.length; index++) {
+			this.validateLifecycleReceipt(requests[index]!, batch.receipts[index]!);
+		}
+		const maxReceiptSequence = Math.max(
+			...batch.receipts.map((receipt) => receipt.vaultSequence),
+		);
+		if (batch.vaultSequence < maxReceiptSequence) {
+			throw new Error("lifecycle batch sequence mismatch");
+		}
+		return batch.receipts;
+	}
+
+	private async publishLifecycleRoot(
+		requests: readonly LifecycleRequest[],
+		receipts: readonly LifecycleReceipt[],
+	): Promise<void> {
+		if (requests.length !== receipts.length || requests.length === 0) {
+			throw new Error("lifecycle root publication input mismatch");
+		}
+		const operations = requests.map((request, index): LifecyclePublicationOperation => ({
+			...request,
+			vaultSequence: receipts[index]!.vaultSequence,
+		}));
+		const rootUpdate = this.buildLifecycleRootUpdate(requests);
+		const proof = await this.server.publishLifecycleRoot(operations, rootUpdate);
+		const expectedIds = requests.map((request) => request.operationId);
+		const actualIds = proof.operationIds;
+		const minimumSequence = Math.max(...receipts.map((receipt) => receipt.vaultSequence));
+		if (
+			actualIds.length !== expectedIds.length
+			|| actualIds.some((operationId, index) => operationId !== expectedIds[index])
+			|| !Number.isSafeInteger(proof.vaultSequence)
+			|| proof.vaultSequence < minimumSequence
+			|| !Number.isSafeInteger(proof.rootGeneration)
+			|| proof.rootGeneration < 0
+			|| typeof proof.vaultGeneration !== "string"
+			|| !proof.vaultGeneration
+			|| !proof.runtimeEpoch
+		) {
+			throw new Error("lifecycle root publication proof mismatch");
+		}
+		Y.applyUpdate(this.ydoc, rootUpdate, ORIGIN_DURABLE_ROOT_PUBLICATION);
+		this._rootGeneration = Math.max(this._rootGeneration, proof.rootGeneration);
+		await this.persistRoot();
+		for (const request of requests) {
+			const path = request.kind === "rename" ? request.toPath : request.path;
+			if (!path) continue;
+			const kind = request.kind === "create"
+				? PRODUCT_EVENT_KIND.crdtFileCreated
+				: request.kind === "rename"
+					? PRODUCT_EVENT_KIND.crdtFileRenamed
+					: request.kind === "delete"
+						? PRODUCT_EVENT_KIND.crdtFileTombstoned
+						: PRODUCT_EVENT_KIND.crdtFileRevived;
+			this.options.onProductEvent?.({
+				kind,
+				severity: "info",
+				scope: "file",
+				source: "vaultSync",
+				layer: "crdt",
+				priority: request.kind === "delete" ? "critical" : "important",
+				path,
+				opId: request.operationId,
+				data: {
+					bodyId: request.bodyId,
+					fromPath: request.fromPath ?? null,
+					toPath: request.toPath ?? null,
+				},
+			});
+		}
+	}
+
+	private assertLifecyclePaths(request: LifecycleRequest): void {
+		const paths = request.kind === "rename"
+			? [request.fromPath, request.toPath]
+			: [request.path];
+		if (paths.some((path) => !path || safeMarkdownPath(path) !== path)) {
+			throw new Error(`Invalid lifecycle path for ${request.kind}`);
+		}
+	}
+
+	private invalidRootPath(): string | null {
+		for (const [path, bodyId] of this.pathToId) {
+			if (safeMarkdownPath(path) !== path || !bodyId) return path;
+		}
+		for (const [path, ref] of this.pathToBlob) {
+			if (safeBlobPath(path, [], "", ref) !== path) return path;
+		}
+		for (const path of this.blobTombstones.keys()) {
+			if (safeBlobPath(path) !== path) return path;
+		}
+		return null;
+	}
+
+
+	private pathForBodyId(bodyId: string): string | null {
+		for (const [path, activeBodyId] of this.pathToId) {
+			if (activeBodyId === bodyId) return path;
+		}
+		return null;
+	}
+
+
+	private buildLifecycleRootUpdate(
+		requests: readonly LifecycleRequest[],
+	): Uint8Array {
+		const next = new Y.Doc();
+		Y.applyUpdate(next, Y.encodeStateAsUpdate(this.ydoc));
+		const before = Y.encodeStateVector(next);
+		next.transact(() => {
+			this.mutateLifecycleRoot(next.getMap<string>("pathToId"), requests);
+		}, ORIGIN_DURABLE_ROOT_PUBLICATION);
+		const update = Y.encodeStateAsUpdate(next, before);
+		next.destroy();
+		return update;
+	}
+
+	private mutateLifecycleRoot(
+		pathToId: Y.Map<string>,
+		requests: readonly LifecycleRequest[],
+	): void {
+		for (const request of requests) {
+			if (request.kind === "rename" && request.fromPath) {
+				pathToId.delete(request.fromPath);
+			} else if (request.kind === "delete" && request.path) {
+				pathToId.delete(request.path);
+			}
+		}
+		for (const request of requests) {
+			if (request.kind === "rename" && request.toPath) {
+				pathToId.set(request.toPath, request.fileId);
+			} else if (
+				(request.kind === "create" || request.kind === "revive")
+				&& request.path
+			) {
+				pathToId.set(request.path, request.fileId);
+			}
+		}
+	}
+
+	private validateLifecycleReceipt(
+		request: LifecycleRequest,
+		receipt: LifecycleReceipt,
+	): void {
+		if (
+			receipt.vaultId !== this.options.vaultId
+			|| receipt.bodyId !== request.bodyId
+			|| receipt.operationId !== request.operationId
+			|| receipt.kind !== request.kind
+			|| !Number.isSafeInteger(receipt.durableGeneration)
+			|| receipt.durableGeneration < 0
+			|| !Number.isSafeInteger(receipt.vaultSequence)
+			|| receipt.vaultSequence < 0
+			|| typeof receipt.vaultGeneration !== "string"
+			|| receipt.vaultGeneration.length === 0
+			|| typeof receipt.runtimeEpoch !== "string"
+			|| receipt.runtimeEpoch.length === 0
+		) {
+			throw new Error("lifecycle receipt identity mismatch");
+		}
+	}
+
+	private async confirmPersistedCandidate(
+		record: CandidateRecord,
+		receipt: BodyReceipt,
+	): Promise<void> {
+		const confirm = this.options.database.confirmPendingCandidate;
+		if (confirm) {
+			try {
+				await confirm.call(this.options.database, receipt);
+				this._candidatePersistenceHealthy = true;
+				return;
+			} catch (error) {
+				this.noteCandidatePersistenceFailure(error);
+				throw error;
+			}
+		}
+		await this.deletePersistedCandidate(record);
+	}
+
+	private async deletePersistedCandidate(record: CandidateRecord): Promise<void> {
+		const remove = this.options.database.deleteCandidate;
+		if (!remove) throw new Error("candidate persistence is unavailable");
+		try {
+			await remove.call(this.options.database, record.bodyId, record.candidateId);
+			this._candidatePersistenceHealthy = true;
+		} catch (error) {
+			this.noteCandidatePersistenceFailure(error);
+			throw error;
+		}
+	}
+
+	private noteCandidatePersistenceFailure(error: unknown): void {
+		this._candidatePersistenceHealthy = false;
+		this._candidatePersistenceFailureCount++;
+		this.log(`candidate persistence failed: ${String(error)}`);
+	}
+
+	private async persistRoot(): Promise<void> {
+		await this.options.database.putDocument({
+			documentId: ROOT_DOCUMENT_ID,
+			generation: this._rootGeneration,
+			encodedState: Y.encodeStateAsUpdate(this.ydoc).slice().buffer,
+			dirty: false,
+			updatedAt: this.now(),
+		});
+	}
+
+	private createDefaultProvider(input: ProviderFactoryInput): SyncProviderPort {
+		const prefix = input.kind === "root"
+			? `/vault/${encodeURIComponent(this.options.vaultId)}/ws/root`
+			: `/vault/${encodeURIComponent(this.options.vaultId)}/ws/body/${encodeURIComponent(input.documentId)}`;
+		const provider = new YSyncProvider(this.options.host, input.documentId, input.doc, {
+			prefix,
+			connect: false,
+			maxBackoffTime: MAX_BACKOFF_TIME_MS,
+			params: async () => {
+				if (!this.options.getSocketTicket) {
+					throw new Error("a short-lived socket ticket is required");
+				}
+				const ticket = await this.options.getSocketTicket();
+				if (!ticket) throw new Error("socket ticket request returned no ticket");
+				this.scheduleTicketRefresh(ticket);
+				return {
+					ticket: ticket.value,
+					schemaVersion: String(SCHEMA_VERSION),
+					protocolVersion: String(PROTOCOL_VERSION),
+				};
+			},
+			awareness: input.kind === "root" ? undefined : new (this.providerAwarenessConstructor())(input.doc),
+		});
+		if (input.kind === "body") provider.awareness.setLocalState(null);
+		return adaptProvider(provider);
+	}
+
+	private providerAwarenessConstructor(): new (doc: Y.Doc) => Awareness {
+		return this.provider.awareness.constructor as new (doc: Y.Doc) => Awareness;
+	}
+
+	private scheduleTicketRefresh(ticket: SocketTicketResult): void {
+		if (this.destroyed || this.fatalAuthError) return;
+		if (this.ticketRefreshTimer) window.clearTimeout(this.ticketRefreshTimer);
+		const remaining = ticket.localExpiresAt - this.now();
+		const buffer = Math.min(TICKET_REFRESH_BUFFER_MS, Math.floor(remaining / 2));
+		this.ticketRefreshTimer = window.setTimeout(() => {
+			this.ticketRefreshTimer = null;
+			void this.refreshProviderTickets(true);
+		}, Math.max(250, remaining - buffer));
+	}
+
+	private async refreshProviderTickets(force: boolean): Promise<void> {
+		if (!this.options.getSocketTicket || this.destroyed || this.fatalAuthError) return;
+		try {
+			const ticket = await this.options.getSocketTicket(force);
+			if (this.destroyed || this.fatalAuthError || !ticket) return;
+			this.provider.url = patchTicketInUrl(this.provider.url, ticket.value);
+			for (const session of this.sessions.values()) {
+				session.provider.url = patchTicketInUrl(session.provider.url, ticket.value);
+			}
+			this.scheduleTicketRefresh(ticket);
+		} catch (error) {
+			if (this.destroyed || this.fatalAuthError) return;
+			this.log(`socket ticket refresh failed: ${String(error)}`);
+			this.ticketRefreshTimer = window.setTimeout(() => {
+				this.ticketRefreshTimer = null;
+				void this.refreshProviderTickets(true);
 			}, TICKET_REFRESH_BUFFER_MS);
 		}
 	}
 
-	async destroy(): Promise<void> {
-		this.log("Destroying VaultSync");
-		if (this._renameTimer) window.clearTimeout(this._renameTimer);
-		this.clearSocketTicketRefreshTimer();
-		this.clearPendingRenames();
-		await this.flushReceiptPersistence();
-
-		const ws = this.provider.ws;
-
-		// Force terminate the WebSocket to skip the 30s close handshake timeout in "ws" library (Node/Electron).
-		// Safe because it's a targeted call on our own instance.
-		if (isTerminableWebSocket(ws)) {
-			ws.terminate();
+	private findSessionBodyForConsumer(consumerId: string): string | undefined {
+		for (const [bodyId, session] of this.sessions) {
+			if (session.consumers.has(consumerId)) return bodyId;
 		}
-
-		// Ensure Awareness interval is cleared (using public API).
-		// This is defensive; awareness-protocol already binds to doc destroy.
-		if (this.provider.awareness) {
-			this.provider.awareness.destroy();
-		}
-
-		this.provider.destroy();
-		await this.persistence.destroy();
-		this.ydoc.destroy();
+		return undefined;
 	}
 
-	private setPendingRename(oldPath: string, newPath: string): void {
-		if (oldPath === newPath) {
-			this.deletePendingRenameByOldPath(oldPath);
-			return;
-		}
-
-		const existingOldForTarget = this._renameBatchNewToOld.get(newPath);
-		if (existingOldForTarget && existingOldForTarget !== oldPath) {
-			this.deletePendingRenameByOldPath(existingOldForTarget);
-		}
-
-		const previousTarget = this._renameBatch.get(oldPath);
-		if (previousTarget) {
-			this._renameBatchNewToOld.delete(previousTarget);
-		}
-
-		this._renameBatch.set(oldPath, newPath);
-		this._renameBatchNewToOld.set(newPath, oldPath);
-	}
-
-	private deletePendingRenameByOldPath(oldPath: string): void {
-		const existingTarget = this._renameBatch.get(oldPath);
-		if (!existingTarget) return;
-		this._renameBatch.delete(oldPath);
-		this._renameBatchNewToOld.delete(existingTarget);
-	}
-
-	private clearPendingRenames(): void {
-		this._renameBatch.clear();
-		this._renameBatchNewToOld.clear();
+	private terminateProvider(provider: SyncProviderPort): void {
+		if (typeof provider.ws?.terminate === "function") provider.ws.terminate();
+		else if (typeof provider.ws?.close === "function") provider.ws.close();
 	}
 
 	getRecentEvents(limit = 120): Array<{ ts: string; msg: string }> {
-		if (limit <= 0) return [];
-		return this._eventRing.slice(-limit);
+		return limit > 0 ? this.recentEvents.slice(-limit) : [];
 	}
 
-	getDebugSnapshot(): {
-		connected: boolean;
-		providerSynced: boolean;
-		localReady: boolean;
-		connectionGeneration: number;
-		fatalAuthError: boolean;
-		idbError: boolean;
-		idbErrorDetails: IndexedDbErrorDetails | null;
-		pathToIdCount: number;
-		activePathCount: number;
-		tombstonedPathCount: number;
-		storedSchemaVersion: number | null;
-		blobPathCount: number;
-		serverReceipt: ReturnType<ServerAckTracker["getState"]> & { persistenceUnavailable: boolean };
-		serverReceiptStartupValidation: ServerReceiptStartupValidation;
-		svEcho: SvEchoCounters;
-	} {
-		this.ensurePathIndexes();
-		return {
-			connected: this.connected,
-			providerSynced: this.providerSynced,
-			localReady: this.localReady,
-			connectionGeneration: this.connectionGeneration,
-			fatalAuthError: this.fatalAuthError,
-			idbError: this.idbError,
-			idbErrorDetails: this.idbErrorDetails,
-			pathToIdCount: this.pathToId.size,
-			activePathCount: this._pathIndex.size,
-			tombstonedPathCount: this._deletedPathIndex.size,
-			storedSchemaVersion: this.storedSchemaVersion,
-			blobPathCount: this.pathToBlob.size,
-			serverReceipt: {
-				...this.serverAckTracker.getState(),
-				persistenceUnavailable: this._serverAckPersistenceUnavailable,
-			},
-			serverReceiptStartupValidation: this._serverReceiptStartupValidation,
-			svEcho: this.svEchoCounters,
-		};
-	}
-
-	private resolvePendingProviderSyncWaiters(value: boolean): void {
-		if (this._providerSyncWaiters.size === 0) return;
-		const waiters = Array.from(this._providerSyncWaiters);
-		this._providerSyncWaiters.clear();
-		for (const waiter of waiters) {
-			try {
-				waiter(value);
-			} catch {
-				// Ignore waiter errors; each promise handles its own lifecycle.
-			}
+	private now(): number { return this.options.now?.() ?? Date.now(); }
+	private log(message: string): void {
+		this.recentEvents.push({ ts: new Date(this.now()).toISOString(), msg: message });
+		if (this.recentEvents.length > 600) {
+			this.recentEvents.splice(0, this.recentEvents.length - 600);
 		}
+		this.options.log?.(message);
 	}
-
-	private classifyIndexedDbError(err: unknown): {
-		kind: IndexedDbErrorKind;
-		name: string | null;
-		message: string | null;
-	} {
-		const name =
-			typeof (err as { name?: unknown })?.name === "string"
-				? (err as { name: string }).name
-				: null;
-		const message =
-			typeof (err as { message?: unknown })?.message === "string"
-				? (err as { message: string }).message
-				: err
-					? formatUnknown(err)
-					: null;
-
-		const haystack = `${name ?? ""} ${message ?? ""}`.toLowerCase();
-		if (haystack.includes("quotaexceeded") || haystack.includes("quota exceeded")) {
-			return { kind: "quota_exceeded", name, message };
-		}
-		if (haystack.includes("blocked")) {
-			return { kind: "blocked", name, message };
-		}
-		if (haystack.includes("security") || haystack.includes("permission") || haystack.includes("denied")) {
-			return { kind: "permission", name, message };
-		}
-		return { kind: "unknown", name, message };
-	}
-
-	private captureIndexedDbError(err: unknown, phase: IndexedDbErrorDetails["phase"]): void {
-		const classified = this.classifyIndexedDbError(err);
-		this._idbError = true;
-		if (
-			!this._idbErrorDetails
-			|| (
-				this._idbErrorDetails.kind !== "quota_exceeded"
-				&& classified.kind === "quota_exceeded"
-			)
-		) {
-			this._idbErrorDetails = {
-				...classified,
-				phase,
-				at: new Date().toISOString(),
-			};
-		}
-		this.log(
-			`IndexedDB error (${phase}): kind=${classified.kind}` +
-			`${classified.name ? ` name=${classified.name}` : ""}` +
-			`${classified.message ? ` msg=${classified.message}` : ""}`,
-		);
-	}
-
-	private log(msg: string): void {
-		this._eventRing.push({ ts: new Date().toISOString(), msg });
-		if (this._eventRing.length > 600) {
-			this._eventRing.splice(0, this._eventRing.length - 600);
-		}
-		this.trace?.("sync", msg);
-		if (this.debug) {
-			console.debug(`[yaos] ${msg}`);
-		}
-	}
-}
-
-export interface TombstonedDiskConflict {
-	path: string;
-	action: "preserved-local-only";
-	reason: "disk-present-at-tombstoned-path";
-}
-
-export interface ReconcileResult {
-	mode: ReconcileMode;
-	createdOnDisk: string[];
-	updatedOnDisk: string[];
-	seededToCrdt: string[];
-	untracked: string[];
-	/**
-	 * Disk files that exist at tombstoned paths.
-	 * These are preserved locally but not synced.
-	 * User should resolve manually or via explicit create action.
-	 */
-	tombstonedDiskConflicts: TombstonedDiskConflict[];
-	skipped: number;
-}
-
-/**
- * Pure function to classify a disk path during reconciliation.
- * Exported for testing.
- *
- * @param path - The disk file path to classify
- * @param crdtHasPath - Whether the CRDT has an active (non-deleted) entry for this path
- * @param isTombstoned - Whether the path is tombstoned in the CRDT
- * @param mode - The reconciliation mode
- * @returns The classification decision
- */
-export function classifyDiskPathForReconcile(
-	path: string,
-	crdtHasPath: boolean,
-	isTombstoned: boolean,
-	mode: ReconcileMode,
-): {
-	action: "skip-in-crdt" | "tombstone-conflict" | "seed-to-crdt" | "untracked";
-	conflict?: TombstonedDiskConflict;
-} {
-	// Already in CRDT — skip
-	if (crdtHasPath) {
-		return { action: "skip-in-crdt" };
-	}
-
-	// Tombstoned in CRDT — do NOT revive (zombie prevention)
-	if (isTombstoned) {
-		return {
-			action: "tombstone-conflict",
-			conflict: {
-				path,
-				action: "preserved-local-only",
-				reason: "disk-present-at-tombstoned-path",
-			},
-		};
-	}
-
-	// Not in CRDT — seed if authoritative, otherwise untracked
-	if (mode === "authoritative") {
-		return { action: "seed-to-crdt" };
-	}
-
-	return { action: "untracked" };
-}
-
-function isTerminableWebSocket(value: unknown): value is { terminate: () => void } {
-	return (
-		typeof value === "object" &&
-		value !== null &&
-		"terminate" in value &&
-		typeof value.terminate === "function"
-	);
 }

@@ -83,14 +83,14 @@ s.section("Unsupported format is terminal and visible");
 s.section("Fatal auth stops ticket refresh lifecycle");
 {
 	const source = readSource("src/sync/vaultSync.ts");
-	s.check(source.includes("this._fatalAuthCode = msg.code"), "parsed fatal code is stored on VaultSync");
+	s.check(source.includes("this._fatalAuthCode = fatal.code"), "parsed fatal code is stored on VaultSync");
 	s.check(
-		source.includes("this.clearSocketTicketRefreshTimer();") &&
-		source.includes("if (this._fatalAuthError) return;"),
+		source.includes("window.clearTimeout(this.ticketRefreshTimer)") &&
+		source.includes("this.destroyed || this.fatalAuthError"),
 		"fatal auth clears and gates proactive ticket refresh",
 	);
 	s.check(
-		source.includes('event.status === "disconnected" && !this._fatalAuthError'),
+		source.includes('status === "disconnected" && !this.fatalAuthError'),
 		"fatal disconnect cannot trigger a best-effort ticket refresh",
 	);
 }

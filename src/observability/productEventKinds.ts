@@ -35,6 +35,18 @@ export const PRODUCT_EVENT_KIND = {
 	diskWriteOk: FLIGHT_KIND.diskWriteOk,
 	diskWriteFailed: FLIGHT_KIND.diskWriteFailed,
 	diskEventNotSuppressed: FLIGHT_KIND.diskEventNotSuppressed,
+	deleteRemoteObserved: FLIGHT_KIND.deleteRemoteObserved,
+	deleteDiskApplied: FLIGHT_KIND.deleteDiskApplied,
+	serverReceiptCandidateCaptured: FLIGHT_KIND.serverReceiptCandidateCaptured,
+	serverReceiptConfirmed: FLIGHT_KIND.serverReceiptConfirmed,
+	attachmentRevived: FLIGHT_KIND.attachmentRevived,
+	attachmentTombstoned: FLIGHT_KIND.attachmentTombstoned,
+	attachmentRenamed: FLIGHT_KIND.attachmentRenamed,
+	attachmentUploadDecision: FLIGHT_KIND.attachmentUploadDecision,
+	attachmentUploadComplete: FLIGHT_KIND.attachmentUploadComplete,
+	attachmentDownloadDecision: FLIGHT_KIND.attachmentDownloadDecision,
+	attachmentDownloadComplete: FLIGHT_KIND.attachmentDownloadComplete,
+	attachmentIntegrityFailed: FLIGHT_KIND.attachmentIntegrityFailed,
 
 	// Reconcile
 	reconcileStart: FLIGHT_KIND.reconcileStart,
@@ -44,6 +56,9 @@ export const PRODUCT_EVENT_KIND = {
 	reconcileSafetyBrakeTriggered: FLIGHT_KIND.reconcileSafetyBrakeTriggered,
 
 	// Recovery
+	recoveryCaptureStart: FLIGHT_KIND.recoveryCaptureStart,
+	recoveryCaptureComplete: FLIGHT_KIND.recoveryCaptureComplete,
+	recoveryRestoreRestarted: FLIGHT_KIND.recoveryRestoreRestarted,
 	recoveryDecision: FLIGHT_KIND.recoveryDecision,
 	recoveryApplyStart: FLIGHT_KIND.recoveryApplyStart,
 	recoveryApplyDone: FLIGHT_KIND.recoveryApplyDone,

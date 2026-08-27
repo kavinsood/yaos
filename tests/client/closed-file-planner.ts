@@ -249,10 +249,8 @@ s.section("Test 12 (characterization): open file in authoritative mode defers");
 
 s.section("Test 13 (characterization): conservative mode always defers");
 {
-	// In conservative mode the planner defers all updatedOnDisk paths.
-	// Note: vaultSync.reconcileVault only populates updatedOnDisk in
-	// authoritative mode, so this path is currently unreachable from
-	// runReconciliation. The planner handles it correctly if called.
+	// Conservative admission remains a planner-level safety contract for
+	// bootstrap settlement when authority is unavailable.
 	const actionDiffers = planClosedFileReconcile(makeInput({
 		mode: "conservative",
 		diskHash: HASH_A,

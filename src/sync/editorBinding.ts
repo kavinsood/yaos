@@ -3,7 +3,7 @@ import { EditorView, ViewPlugin, type ViewUpdate } from "@codemirror/view";
 import { yCollab, ySyncFacet } from "y-codemirror.next";
 import * as Y from "yjs";
 import { editorInfoField, MarkdownView, Notice, type MarkdownFileInfo, type Workspace } from "obsidian";
-import type { VaultSync } from "./vaultSync";
+import type { SyncRuntimePort } from "./vaultSync";
 import { applyDiffToYText } from "./diff";
 import type { TraceRecord } from "../observability/traceContext";
 import type { ProductFlightPathEventInput } from "../observability/traceSink";
@@ -138,6 +138,9 @@ export class EditorBindingManager {
 	private cmDegradedWarned = false;
 	private cmResolveAttempts = new Map<string, number>();
 	private pendingCmResolveRetries = new Map<string, number>();
+	private pendingBodyLoads = new Map<string, { path: string; generation: number }>();
+	private bodyLeases = new Map<string, string>();
+	private bodyLoadGeneration = 0;
 	/**
 	 * Why the last getCmView() call returned null. Attached to the degraded
 	 * trace so field reports separate "no editor ever registered" (our CM6
@@ -149,7 +152,7 @@ export class EditorBindingManager {
 	private readonly debug: boolean;
 
 	constructor(
-		private vaultSync: VaultSync,
+		private vaultSync: SyncRuntimePort,
 		private readonly workspace: Workspace,
 		debug: boolean,
 		private trace?: TraceRecord,
@@ -218,6 +221,15 @@ export class EditorBindingManager {
 		if (!file.path.endsWith(".md")) return;
 
 		const leafId = view.leaf.id ?? file.path;
+		const tracked = this.bindings.get(leafId);
+		if (tracked && tracked.path !== file.path) {
+			// Never leave the previous body's extension attached while the next
+			// body is loading and proving currentness.
+			this.unbind(view);
+		}
+		if (!this.ensureEditorBodyReady(view, deviceName, leafId, file.path)) {
+			return;
+		}
 		const cm = this.getCmView(view);
 		if (!cm) {
 			this.log(`bind: no CM EditorView for "${file.path}"`);
@@ -415,6 +427,11 @@ export class EditorBindingManager {
 
 		const leafId =
 			view.leaf.id ?? file.path;
+		const pending = this.pendingBodyLoads.get(leafId);
+		if (pending?.path === file.path) {
+			this.log(`rebind: waiting for v4 body "${file.path}" (leaf=${leafId}, reason=${reason})`);
+			return;
+		}
 		this.log(`rebind: forcing "${file.path}" (leaf=${leafId}, reason=${reason})`);
 		this.unbind(view);
 		this.bind(view, deviceName);
@@ -427,6 +444,8 @@ export class EditorBindingManager {
 		const file = view.file;
 		const leafId =
 			view.leaf.id ?? file?.path ?? "unknown";
+		this.cancelPendingBodyLoad(leafId);
+		this.releaseBodyLease(leafId);
 
 		const binding = this.bindings.get(leafId);
 		if (!binding) return;
@@ -455,6 +474,12 @@ export class EditorBindingManager {
 	 * Unbind all editors. Called on plugin unload.
 	 */
 	unbindAll(): void {
+		for (const leafId of Array.from(this.pendingBodyLoads.keys())) {
+			this.cancelPendingBodyLoad(leafId);
+		}
+		for (const leafId of Array.from(this.bodyLeases.keys())) {
+			this.releaseBodyLease(leafId);
+		}
 		for (const [leafId, binding] of this.bindings) {
 			this.clearScheduledHealthCheck(leafId);
 			this.clearCmResolveRetry(leafId);
@@ -471,8 +496,15 @@ export class EditorBindingManager {
 	 * Called when a file is deleted (locally or remotely).
 	 */
 	unbindByPath(path: string): void {
+		for (const [leafId, pending] of Array.from(this.pendingBodyLoads)) {
+			if (pending.path === path) this.cancelPendingBodyLoad(leafId);
+		}
+		for (const [leafId, leasedPath] of Array.from(this.bodyLeases)) {
+			if (leasedPath === path) this.releaseBodyLease(leafId, path);
+		}
 		for (const [leafId, binding] of this.bindings) {
 			if (binding.path === path) {
+				this.cancelPendingBodyLoad(leafId);
 				this.clearScheduledHealthCheck(leafId);
 				this.clearCmResolveRetry(leafId);
 				this.healthWorkInFlight.delete(leafId);
@@ -517,6 +549,14 @@ export class EditorBindingManager {
 	pruneOrphanedBindings(liveLeafKeys: ReadonlySet<string>, source: string): number {
 		let pruned = 0;
 		let deferred = 0;
+		for (const leafId of Array.from(this.pendingBodyLoads.keys())) {
+			if (!liveLeafKeys.has(leafId)) this.cancelPendingBodyLoad(leafId);
+		}
+		for (const leafId of Array.from(this.bodyLeases.keys())) {
+			if (!liveLeafKeys.has(leafId) && !this.bindings.has(leafId)) {
+				this.releaseBodyLease(leafId);
+			}
+		}
 
 		for (const [leafId, binding] of Array.from(this.bindings)) {
 			if (liveLeafKeys.has(leafId)) continue;
@@ -533,6 +573,7 @@ export class EditorBindingManager {
 			binding.undoManager.destroy();
 			this.cmToLeafId.delete(binding.cm);
 			this.bindings.delete(leafId);
+			this.releaseBodyLease(leafId, binding.path);
 			pruned += 1;
 			this.log(
 				`pruneOrphanedBindings: released "${binding.path}" (leaf=${leafId}, cm=${binding.cmId})`,
@@ -596,12 +637,16 @@ export class EditorBindingManager {
 	 * on either observer set during `yCollab` belongs to the stray one and is
 	 * safe to drop.
 	 */
-	private buildCollabExtension(ytext: Y.Text, undoManager: Y.UndoManager): Extension {
+	private buildCollabExtension(
+		ytext: Y.Text,
+		undoManager: Y.UndoManager,
+		path: string,
+	): Extension {
 		const doc = ytext.doc;
 		const destroyBefore = this.snapshotDocObservers(doc, "destroy");
 		const transactionBefore = this.snapshotDocObservers(doc, "afterTransaction");
 
-		const extension = yCollab(ytext, this.vaultSync.provider.awareness, {
+		const extension = yCollab(ytext, this.vaultSync.getBodyAwareness(path), {
 			undoManager,
 		});
 
@@ -821,7 +866,7 @@ export class EditorBindingManager {
 			cmId: this.getCmId(cm),
 			hasSyncFacet: !!syncFacet,
 			awarenessMatchesProvider: syncFacet
-				? syncFacet.awareness === this.vaultSync.provider.awareness
+				? syncFacet.awareness === this.vaultSync.getBodyAwareness(file.path)
 				: null,
 			yTextMatchesExpected: syncFacet
 				? (expectedText ? syncFacet.ytext === expectedText : false)
@@ -1291,12 +1336,13 @@ export class EditorBindingManager {
 
 		const undoManager = this.createUndoManager(ytext);
 
-		this.vaultSync.provider.awareness.setLocalStateField(
+		const awareness = this.vaultSync.getBodyAwareness(filePath);
+		awareness.setLocalStateField(
 			"user",
 			awarenessCursorUser(deviceName, this.vaultSync.deviceId),
 		);
 
-		const collabExtension = this.buildCollabExtension(ytext, undoManager);
+		const collabExtension = this.buildCollabExtension(ytext, undoManager, filePath);
 
 		try {
 			this.clearLocalCursor(`${action}-pre-reconfigure`);
@@ -1305,6 +1351,7 @@ export class EditorBindingManager {
 			});
 		} catch (err) {
 			undoManager.destroy();
+			if (!existing) this.releaseBodyLease(leafId, filePath);
 			this.log(
 				`${action}: failed "${filePath}" ` +
 				`(leaf=${leafId}, cm=${cmId}, reason=${reason ?? "n/a"}): ${String(err)}`,
@@ -1406,6 +1453,64 @@ export class EditorBindingManager {
 		return null;
 	}
 
+	private ensureEditorBodyReady(
+		view: MarkdownView,
+		deviceName: string,
+		leafId: string,
+		path: string,
+	): boolean {
+		const runtime = this.vaultSync;
+		if (!runtime.acquireEditorBody) return true;
+		if (runtime.isEditorBodyReady?.(path, leafId)) return true;
+
+		const pending = this.pendingBodyLoads.get(leafId);
+		if (pending?.path === path) return false;
+		if (pending) this.cancelPendingBodyLoad(leafId);
+
+		const generation = ++this.bodyLoadGeneration;
+		this.pendingBodyLoads.set(leafId, { path, generation });
+		void runtime.acquireEditorBody(path, leafId).then(
+			() => {
+				const current = this.pendingBodyLoads.get(leafId);
+				const stillCurrent =
+					current?.generation === generation
+					&& current.path === path
+					&& view.file?.path === path;
+				if (!stillCurrent) {
+					this.vaultSync.releaseEditorBody?.(path, leafId);
+					return;
+				}
+				this.bodyLeases.set(leafId, path);
+				this.pendingBodyLoads.delete(leafId);
+				if (!this.vaultSync.isEditorBodyReady?.(path, leafId)) {
+					this.releaseBodyLease(leafId, path);
+					return;
+				}
+				this.bind(view, deviceName);
+			},
+			(error: unknown) => {
+				const current = this.pendingBodyLoads.get(leafId);
+				if (current?.generation === generation) {
+					this.pendingBodyLoads.delete(leafId);
+				}
+				this.log(`bind: body load failed for "${path}" (leaf=${leafId}): ${String(error)}`);
+			},
+		);
+		return false;
+	}
+
+	private cancelPendingBodyLoad(leafId: string): void {
+		const pending = this.pendingBodyLoads.get(leafId);
+		if (!pending) return;
+		this.pendingBodyLoads.delete(leafId);
+		this.vaultSync.releaseEditorBody?.(pending.path, leafId);
+	}
+	private releaseBodyLease(leafId: string, fallbackPath?: string): void {
+		const path = this.bodyLeases.get(leafId) ?? fallbackPath;
+		this.bodyLeases.delete(leafId);
+		if (path) this.vaultSync.releaseEditorBody?.(path, leafId);
+	}
+
 	private resolveBindingTarget(
 		view: MarkdownView,
 		deviceName: string,
@@ -1426,6 +1531,12 @@ export class EditorBindingManager {
 
 		if (this.isHardTombstonedPath(file.path)) {
 			this.handleTombstonedBinding(view, reason);
+			return null;
+		}
+		if (this.vaultSync.acquireEditorBody) {
+			// V4 bodies are admitted by the durable root/catalog and may only
+			// bind after async load, HTTP catch-up, and provider synchronization.
+			this.log(`resolveBindingTarget: v4 body is not ready for "${file.path}" (reason=${reason})`);
 			return null;
 		}
 

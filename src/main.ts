@@ -7,10 +7,31 @@ import {
 } from "./settings";
 import { SettingsStore } from "./settings/settingsStore";
 import { VaultSync, type ReconcileMode } from "./sync/vaultSync";
-import { SCHEMA_VERSION } from "./sync/vaultSync";
+import { SCHEMA_VERSION } from "./sync/schema";
 import { computeFolderKey, folderKeySeedFromVault } from "./sync/vaultPersistence";
 import { EditorBindingManager } from "./sync/editorBinding";
 import { DiskMirror } from "./sync/diskMirror";
+import { VaultIndexedDb } from "./sync/vaultIndexedDb";
+import {
+	BootstrapClient,
+	BootstrapHttpPort,
+	prepareBootstrapRoot,
+	type BootstrapProgressEvent,
+} from "./sync/bootstrapClient";
+import {
+	LocalVaultImporter,
+	summarizeLocalVaultImport,
+	type LocalVaultImportSummary,
+} from "./onboarding/localVaultImport";
+import { IndexedDbLocalVaultImportStateStore } from "./onboarding/localVaultImportStore";
+import {
+	FreshBodyAdmissionLocalVaultImportSink,
+	ObsidianLocalVaultImportSource,
+} from "./onboarding/obsidianLocalVaultImport";
+import {
+	fetchVaultProvisioningProof,
+	type VaultProvisioningProof,
+} from "./onboarding/provisioningClient";
 import { type BlobQueueSnapshot, type BlobSyncManager } from "./sync/blobSync";
 import { isMarkdownSyncable, isBlobSyncable } from "./types";
 import { planCategoryRenameAction } from "./sync/policy/renameAdmissionPolicy";
@@ -43,9 +64,18 @@ import {
 	moveCachedHashes,
 } from "./sync/blobHashCache";
 import type { PreservedUnresolvedEntry } from "./sync/preservedUnresolved";
+import { SnapshotService } from "./snapshots/snapshotService";
 import {
-	SnapshotService,
-} from "./snapshots/snapshotService";
+	EMPTY_PENDING_RECOVERY_STATE,
+	getRecoveryReadiness,
+	parsePendingRecoveryState,
+	type PendingRecoveryState,
+} from "./snapshots/recoveryState";
+import {
+	createRecoveryRuntimePort,
+	type RecoveryRuntimePort,
+} from "./snapshots/recoveryClient";
+import { VaultExportService } from "./snapshots/vaultExport";
 import type {
 	TraceEventDetails,
 	TraceHttpContext,
@@ -92,7 +122,6 @@ import { formatUnknown, yTextToString } from "./utils/format";
 import { randomId } from "./utils/randomId";
 import { ConfirmModal } from "./ui/ConfirmModal";
 import { obsidianRequest } from "./utils/http";
-import { runSchemaMigrationToV2 } from "./migrations/schemaV2";
 import { installTelemetryRuntime, type TelemetryRuntimeHandle } from "./telemetry/installTelemetryRuntime";
 import { setupFlightTraceBestEffort } from "./telemetry/debug/flightTraceController";
 import type { SyncReadPort, TelemetryRuntimeHost } from "./telemetry/telemetryRuntimeHost";
@@ -124,6 +153,7 @@ type PersistedPluginState = Partial<VaultSyncSettings> & {
 	_updateManifestCache?: PersistedUpdateManifestCache;
 	_frontmatterQuarantine?: FrontmatterQuarantineEntry[];
 	_preservedUnresolved?: PreservedUnresolvedEntry[];
+	_provisioningProof?: VaultProvisioningProof;
 };
 
 export default class VaultCrdtSyncPlugin extends Plugin {
@@ -135,16 +165,23 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private runtimeConfig: RuntimeConfig | null = null;
 
 	private vaultSync: VaultSync | null = null;
+	private vaultDatabase: VaultIndexedDb | null = null;
+	private bootstrapClient: BootstrapClient | null = null;
+	private bootstrapProgress: BootstrapProgressEvent | null = null;
+	private bootstrapCatchUp: Promise<void> | null = null;
+	private initialVaultImporter: LocalVaultImporter | null = null;
+	private initialImportSummary: LocalVaultImportSummary | null = null;
+	private bootstrapCatchUpPending = false;
 	private connectionController: ConnectionController | null = null;
 	private editorBindings: EditorBindingManager | null = null;
 	private diskMirror: DiskMirror | null = null;
 	private attachmentOrchestrator: AttachmentOrchestrator | null = null;
 	private editorWorkspace: EditorWorkspaceOrchestrator | null = null;
 	private snapshotService: SnapshotService | null = null;
+	private pendingRecoveryState: PendingRecoveryState = { ...EMPTY_PENDING_RECOVERY_STATE };
 	private reconciliationController!: ReconciliationController;
 	private setupLinkController: SetupLinkController | null = null;
 	private folderKey: string | null = null;
-	private pendingReceiptGeneration: number | undefined;
 	private vaultRoster: VaultRosterDevice[] = [];
 	private rosterVaultId = "";
 	/** Debug runtime handle — null unless debug mode installed it at startup. */
@@ -308,6 +345,36 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		return this.attachmentOrchestrator?.manager ?? null;
 	}
 
+	private getRecoveryRuntime(): RecoveryRuntimePort | null {
+		const runtime = this.vaultSync;
+		const diskMirror = this.diskMirror;
+		if (!runtime || !diskMirror) return null;
+		return createRecoveryRuntimePort({
+			runtime,
+			getLive: (path) => runtime.getRecoveryLive(path),
+			settleDisk: async (input) => {
+				const outcome = await diskMirror.settleBody({
+					path: input.path,
+					bodyId: input.bodyId,
+					generation: input.generation,
+					content: input.content,
+				});
+				if (outcome !== "settled") {
+					throw new Error(`recovery disk settlement preserved unresolved target: ${input.path}`);
+				}
+				const file = this.app.vault.getAbstractFileByPath(input.path);
+				if (!(file instanceof TFile)) {
+					throw new Error(`recovery disk settlement did not materialize target: ${input.path}`);
+				}
+				const content = await this.app.vault.read(file);
+				return {
+					contentHash: await sha256TextHex(content),
+					size: new TextEncoder().encode(content).byteLength,
+				};
+			},
+		});
+	}
+
 	async onload() {
 		const onloadStartedAt = Date.now();
 
@@ -368,7 +435,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					this.log("QA offline hold activated — provider disconnected, reconnects blocked");
 				} else {
 					this.log("QA offline hold released — reconnects permitted, connecting…");
-					void sync.provider.connect().catch((e: unknown) =>
+					void Promise.resolve(sync.provider.connect()).catch((e: unknown) =>
 						this.log(`QA connectProvider error: ${String(e)}`),
 					);
 				}
@@ -428,11 +495,21 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			getSettings: () => this.settings,
 			getTraceHttpContext: () => this.getTraceHttpContext(),
 			getVaultSync: () => this.vaultSync,
-			getDiskMirror: () => this.diskMirror,
+			getRecoveryRuntime: () => this.getRecoveryRuntime(),
+			getAttachmentCatalog: () => this.vaultSync,
 			getBlobSync: () => this.getBlobSync(),
+			getPendingRecoveryState: () => this.pendingRecoveryState,
+			persistPendingRecoveryState: async (state) => {
+				const database = this.vaultDatabase;
+				if (!database) throw new Error("folder-scoped recovery persistence is unavailable");
+				await database.putRecoveryState(state);
+				this.pendingRecoveryState = state;
+				this.refreshStatusBar();
+			},
 			getServerSupportsSnapshots: () => this.serverSupportsSnapshots,
 			log: (message) => this.log(message),
 			onEditorsNeedReconcile: (reason) => this.editorWorkspace?.onReconciled(reason),
+			recordFlightEvent: (event) => this.recordFlightEvent(event),
 		});
 		this.setupLinkController = new SetupLinkController({
 			app: this.app,
@@ -482,7 +559,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 							get lastLocalUpdateWhileConnectedAt() { return vs.lastLocalUpdateWhileConnectedAt; },
 							get lastRemoteUpdateAt() { return vs.lastRemoteUpdateAt; },
 							get serverReceipt() { return vs.getServerReceiptSnapshot(); },
-							get svEchoCounters() { return vs.svEchoCounters; },
 							get idbError() { return vs.idbError; },
 							get idbErrorDetails() { return vs.idbErrorDetails; },
 							get supportedSchemaVersion() { return vs.supportedSchemaVersion; },
@@ -492,11 +568,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 								const ytext = vs.getTextForPath(path);
 								return ytext ? ytext.toJSON() : null;
 							},
-							getFileIdForPath: (path: string) => {
-								const ytext = vs.getTextForPath(path);
-								return ytext ? vs.getFileIdForText(ytext) : undefined;
-							},
-							isPathTombstoned: (path: string) => vs.isPathTombstoned(path),
+							getFileIdForPath: (path: string) => vs.getFileId(path),
+							isPathTombstoned: (path: string) => vs.isMarkdownTombstoned(path),
 							getActiveMarkdownPaths: () => vs.getActiveMarkdownPaths(),
 							getRecentEvents: (limit?: number) => vs.getRecentEvents(limit),
 							getSafeReconcileMode: () => vs.getSafeReconcileMode(),
@@ -522,6 +595,16 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						...this.reconciliationController.getState(),
 						awaitingFirstProviderSyncAfterStartup: this.awaitingFirstProviderSyncAfterStartup,
 						openFileCount: this.editorWorkspace?.openFileCount ?? 0,
+						recovery: {
+							readiness: getRecoveryReadiness(this.pendingRecoveryState),
+							storageAvailable: this.pendingRecoveryState.lastRecoveryStatus?.storageAvailable ?? null,
+							projectionState: this.pendingRecoveryState.lastRecoveryStatus?.projectionState ?? null,
+							projectionLag: this.pendingRecoveryState.lastRecoveryStatus?.projectionLag ?? null,
+							activeCaptureId: this.pendingRecoveryState.activeCaptureId,
+							captureState: this.pendingRecoveryState.lastCaptureStatus?.state ?? null,
+							activeRestoreId: this.pendingRecoveryState.activeRestore?.restoreId ?? null,
+							restoreState: this.pendingRecoveryState.lastRestoreStatus?.state ?? null,
+						},
 					}),
 					collectOpenFileTraceState: () => this.collectOpenFileTraceState(),
 					getPluginVersion: () => this.manifest.version,
@@ -586,6 +669,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			|| !this.settings.deviceToken.trim()
 			|| !this.settings.vaultId.trim()
 			|| !this.settings.deviceId.trim()
+			|| !this.settings.vaultGeneration.trim()
 		) {
 			this.log("This folder is not enrolled — sync disabled");
 			new Notice("Join this folder with a server URL and pairing code.", 10000);
@@ -654,42 +738,90 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				return;
 			}
 
-			// 1. Create VaultSync (Y.Doc + folder-scoped IndexedDB + provider in parallel)
+			// Schema 4 always starts from a fresh vault+folder database. The
+			// bootstrap root is validated before the live root provider opens.
 			const folderKey = await this.ensureFolderKey();
-			const receiptGenerationHint = this.pendingReceiptGeneration;
-			this.pendingReceiptGeneration = undefined;
-			this.vaultSync = new VaultSync(this.settings, {
-				folderKey,
-				receiptGenerationHint,
-				trace: (source, msg, details) => this.trace(source, msg, details),
-				onFlightEvent: (event) => this.recordFlightEvent(event as FlightEventInput),
-				onFlightPathEvent: (event) => this.recordFlightPathEvent(event),
-				onServerReceiptStatusChanged: () => this.queueReceiptStatusRefresh(),
-				getSocketTicket: (() => {
-				// Each VaultSync instance gets its own ticket cache.  The cache
-				// is discarded when VaultSync is torn down and recreated.
-				const ticketCache = createSocketTicketCache();
-
-				return async (force = false): Promise<{
-					value: string;
-					expiresAt: number;
-					localExpiresAt: number;
-					ttlMs: number;
-				}> => {
-					if (force) ticketCache.invalidate();
-					try {
-						return await ticketCache.get(
-							this.settings.host,
-							this.settings.deviceToken,
-							this.settings.vaultId,
-						);
-					} catch (err) {
-						this.log(`socket ticket fetch failed: ${String(err)}`);
-						throw err;
-					}
-				};
-			})(),
+			const importer = new LocalVaultImporter(
+				new ObsidianLocalVaultImportSource(this.app),
+				new FreshBodyAdmissionLocalVaultImportSink(
+					() => this.vaultSync,
+					(_paths, work) => work(),
+				),
+				new IndexedDbLocalVaultImportStateStore(this.settings.vaultId, folderKey),
+				{
+					vaultId: this.settings.vaultId,
+					maxFileSizeBytes: this.getRuntimeConfig().maxFileSizeBytes,
+					excludePatterns: this.excludePatterns,
+					configDir: this.app.vault.configDir,
+					onProgress: (summary) => {
+						this.initialImportSummary = summary;
+					},
+				},
+			);
+			this.initialVaultImporter = importer;
+			await importer.capture();
+			const provisioning = await fetchVaultProvisioningProof({
+				host: this.settings.host,
+				deviceToken: this.settings.deviceToken,
+				vaultId: this.settings.vaultId,
 			});
+			if (provisioning.vaultGeneration !== this.settings.vaultGeneration) {
+				throw new Error("enrollment vault generation does not match the active server vault");
+			}
+			await this.persistPluginState((state) => {
+				state._provisioningProof = provisioning;
+			});
+			const database = new VaultIndexedDb(
+				this.settings.vaultId,
+				this.settings.vaultGeneration,
+				folderKey,
+			);
+			this.vaultDatabase = database;
+			this.pendingRecoveryState = parsePendingRecoveryState(await database.getRecoveryState());
+			const bootstrapServer = new BootstrapHttpPort(
+				this.settings.host,
+				this.settings.vaultId,
+				this.settings.deviceToken,
+				database,
+				async (request) => {
+					const response = await obsidianRequest({
+						url: request.url,
+						method: request.method,
+						headers: request.headers,
+						...(request.contentType ? { contentType: request.contentType } : {}),
+						...(request.body !== undefined ? { body: request.body } : {}),
+					});
+					return {
+						status: response.status,
+						headers: response.headers,
+						arrayBuffer: response.arrayBuffer,
+						json: response.json,
+					};
+				},
+			);
+			await prepareBootstrapRoot(bootstrapServer, database);
+			const ticketCache = createSocketTicketCache();
+			const runtime = await VaultSync.create({
+				vaultId: this.settings.vaultId,
+				deviceId: this.settings.deviceId,
+				host: this.settings.host,
+				token: this.settings.deviceToken,
+				database,
+				getSocketTicket: async (force = false) => {
+					if (force) ticketCache.invalidate();
+					return ticketCache.get(
+						this.settings.host,
+						this.settings.deviceToken,
+						this.settings.vaultId,
+					);
+				},
+				log: (message) => this.log(`[sync] ${message}`),
+				onRemoteRootStructuralUpdate: () => this.scheduleSchema4CatchUp("remote-root"),
+				onDurableBodyCommitted: () => this.scheduleSchema4CatchUp("body-committed"),
+				onProductEvent: (event) => this.recordFlightPathEvent(event),
+				onControlFrame: () => this.queueReceiptStatusRefresh(),
+			});
+			this.vaultSync = runtime;
 
 			// 2. EditorBindingManager
 			const bindingPropagationGate: BindingPropagationGate = {
@@ -747,8 +879,42 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				this.preservedUnresolvedEntries,
 				() => this.persistPreservedUnresolvedState(),
 			);
-			this.diskMirror.startMapObservers();
-			this.diskMirror.setFlightEventHandler((event) => this.recordFlightPathEvent(event as FlightPathEventInput));
+			this.diskMirror.configureSettlement({
+				getBaseline: (path) => ({
+					contentHash: this.diskIndex[path]?.contentHash ?? null,
+					lastDiskIndexPersistedAt: this.lastDiskIndexPersistedAt,
+				}),
+				commitLocalBody: async (input) => {
+					await runtime.commitDiskBody({
+						...input,
+						...(input.reason === "delete-revive"
+							? { lifecycle: "revive" as const }
+							: {}),
+					});
+				},
+				settleClosedBody: async (path) => {
+					const bodyId = runtime.getFileId(path);
+					if (!bodyId || !this.bootstrapClient) return;
+					await runtime.settleBodyOnClose(bodyId);
+					await this.bootstrapClient.settleBodyNow(bodyId);
+					this.diskMirror?.notifyBodyAvailable(path);
+				},
+				isPathAllowed: (path) => this.isMarkdownPathSyncable(path),
+				isBodyLive: (bodyId) => runtime.isBodyOpen(bodyId),
+			});
+			this.diskMirror.setFlightEventHandler(
+				(event) => this.recordFlightPathEvent(event as FlightPathEventInput),
+			);
+			this.bootstrapClient = new BootstrapClient(
+				bootstrapServer,
+				database,
+				runtime.bodies,
+				this.diskMirror,
+				(progress) => {
+					this.bootstrapProgress = progress;
+					this.refreshStatusBar();
+				},
+			);
 			// Track SHA-256 baseline hash after every successful flushWrite.
 			// Used by decideClosedFileConflict on startup/re-enable to determine
 			// which side actually changed from the last known stable state.
@@ -876,11 +1042,13 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					getSnapshotService: () => this.snapshotService,
 					getUntrackedFileCount: () => this.reconciliationController.untrackedFileCount,
 					runReconciliation: (mode) => this.runReconciliation(mode),
-					runSchemaMigrationToV2: () => this.runSchemaMigrationToV2(),
 					importUntrackedFiles: () => this.importUntrackedFiles(),
-					clearLocalServerReceiptState: () => this.clearLocalServerReceiptState(),
 					resetLocalCache: () => this.resetLocalCache(),
 					nuclearReset: () => this.nuclearReset(),
+					restartPendingRestore: () => this.snapshotService?.restartPendingRestore() ?? Promise.resolve(),
+					exportVault: async () => {
+						await new VaultExportService(this.app).exportToDownload();
+					},
 				});
 				// Debug-runtime commands are registered separately by the debug runtime.
 				this.lab?.registerCommands(this);
@@ -934,84 +1102,43 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				}
 			});
 
-			// -----------------------------------------------------------
-			// STARTUP SEQUENCE
-			// -----------------------------------------------------------
-
+			// Materialize the validated schema-4 root and every active body before
+			// admitting editor/disk events. Bootstrap progress and outstanding
+			// safety settlements are durable in the folder-scoped database.
 			this.updateStatusBar({ kind: "loading_cache" });
-			this.log("Waiting for IndexedDB persistence...");
-			const localLoaded = await this.vaultSync.waitForLocalPersistence();
-			if (abortIfStale("local persistence")) return;
-			this.log(`IndexedDB: ${localLoaded ? "loaded" : "timed out"}`);
-			await this.vaultSync.initializeServerAckTracking(this.settings, this.manifest.version, {
-				localYjsPersistenceLoaded: localLoaded,
-			});
-			if (abortIfStale("server acknowledgement initialization")) return;
-
-			// Schema version check — refuse to run if a newer plugin wrote this data.
-			// This is terminal for this attempt, so provider/status refreshes must
-			// not replace it with a transient connected/offline state.
-			const schemaError = this.vaultSync.checkSchemaVersion();
-			if (schemaError) {
-				console.error(`[yaos] ${schemaError}`);
-				new Notice(`YAOS: ${schemaError}`);
-				this.connectionStateLatch.failInitialization({
-					phase: "schema",
-					message: schemaError,
-				});
-				this.refreshStatusBar();
-				return;
-			}
-
-			// Mark schema v3 if room is still at v2 (lazy, no metadata migration).
-			this.vaultSync.markSchemaV3(this.settings.deviceName);
-
-			// Check for fatal auth error before waiting for provider
-			if (this.vaultSync.fatalAuthError) {
-				this.log("Fatal auth error during startup");
-				if (this.vaultSync.fatalAuthCode === "update_required") {
-					this.updateStatusBar(this.getCurrentConnectionState());
-					this.showFatalSyncNotice();
-					return;
-				}
-				this.updateStatusBar(this.getCurrentConnectionState());
-				this.showFatalSyncNotice();
-				// Still reconcile with whatever we have locally
-				const mode = this.vaultSync.getSafeReconcileMode();
-				await this.runReconciliation(mode);
-				if (abortIfStale("fatal-auth reconciliation")) return;
-				return;
-			}
+			const bootstrap = this.bootstrapClient;
+			if (!bootstrap) throw new Error("schema-4 bootstrap client is unavailable");
+			const bootstrapState = await bootstrap.run();
+			if (abortIfStale("schema-4 bootstrap")) return;
+			const outstanding = await database.listOutstanding();
+			this.bootstrapProgress = {
+				stage: bootstrapState.stage,
+				settledBodies: bootstrapState.settledBodies,
+				totalBodies: bootstrapState.totalBodies,
+				outstandingBodies: outstanding.length,
+			};
 
 			this.updateStatusBar({ kind: "connecting" });
-			this.log("Waiting for provider sync...");
-			const providerSynced = await this.vaultSync.waitForProviderSync();
-			if (abortIfStale("provider synchronization")) return;
-			if (providerSynced) {
-				await this.vaultSync.finalizeServerAckTrackingAfterProviderSync();
-				if (abortIfStale("server receipt generation finalization")) return;
-			}
-			this.log(`Provider: ${providerSynced ? "synced" : "timed out (offline)"}`);
+			const providerSynced = await runtime.waitForProviderSync();
+			if (abortIfStale("root provider synchronization")) return;
 			this.awaitingFirstProviderSyncAfterStartup = !providerSynced;
-			this.log(
-				`Startup sync gate: awaitingFirstProviderSyncAfterStartup=${this.awaitingFirstProviderSyncAfterStartup} ` +
-				`(gen=${this.vaultSync.connectionGeneration})`,
-			);
-
-			if (this.vaultSync.fatalAuthError) {
+			if (runtime.fatalAuthError) {
 				this.updateStatusBar(this.getCurrentConnectionState());
 				this.showFatalSyncNotice();
 				return;
 			}
 
-			const mode = this.vaultSync.getSafeReconcileMode();
-			this.log(`Reconciliation mode: ${mode}`);
-
-			await this.runReconciliation(mode);
-			if (abortIfStale("startup reconciliation")) return;
-			this.reconciliationController.lastGeneration = this.vaultSync.connectionGeneration;
-			if (providerSynced) {
-				this.awaitingFirstProviderSyncAfterStartup = false;
+			await this.runReconciliation("authoritative");
+			if (abortIfStale("schema-4 admission")) return;
+			this.reconciliationController.lastGeneration = runtime.connectionGeneration;
+			if (providerSynced) this.awaitingFirstProviderSyncAfterStartup = false;
+			if (this.settings.originImportPending) {
+				this.initialImportSummary = summarizeLocalVaultImport(await importer.run());
+				if (this.initialImportSummary.stage === "complete") {
+					await this.updateSettings((settings) => {
+						settings.originImportPending = false;
+					}, "origin-import-complete");
+				}
 			}
 
 			this.connectionStateLatch.recover();
@@ -1023,6 +1150,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			this.scheduleTraceStateSnapshot("startup-complete");
 			this.attachmentOrchestrator?.markStartupReady("startup-complete");
 			void this.lab?.refreshServerTrace();
+			this.snapshotService?.resumePersistedOperations();
 
 			// Trigger daily snapshot (noop if already taken today).
 			// Fire-and-forget — don't block startup on snapshot creation.
@@ -1044,6 +1172,44 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		}
 	}
 
+	private scheduleSchema4CatchUp(reason: string): void {
+		if (!this.bootstrapClient || this.teardownLifecycle.isClosing) return;
+		this.bootstrapCatchUpPending = true;
+		if (this.bootstrapCatchUp) return;
+		const bootstrap = this.bootstrapClient;
+		const run = async () => {
+			while (this.bootstrapCatchUpPending && !this.teardownLifecycle.isClosing) {
+				this.bootstrapCatchUpPending = false;
+				try {
+					const progress = await bootstrap.run();
+					const outstanding = await this.vaultDatabase?.listOutstanding() ?? [];
+					this.bootstrapProgress = {
+						stage: progress.stage,
+						settledBodies: progress.settledBodies,
+						totalBodies: progress.totalBodies,
+						outstandingBodies: outstanding.length,
+					};
+					this.reconciliationController.lastGeneration =
+						this.vaultSync?.connectionGeneration
+						?? this.reconciliationController.lastGeneration;
+					this.editorWorkspace?.onReconciled(`schema4-catch-up:${reason}`);
+				} catch (error) {
+					this.log(`Schema-4 catch-up failed (${reason}): ${formatUnknown(error)}`);
+				} finally {
+					this.refreshStatusBar();
+				}
+			}
+		};
+		let tracked: Promise<void>;
+		tracked = run().finally(() => {
+			if (this.bootstrapCatchUp === tracked) {
+				this.bootstrapCatchUp = null;
+				if (this.bootstrapCatchUpPending) this.scheduleSchema4CatchUp(`${reason}:pending`);
+			}
+		});
+		this.bootstrapCatchUp = tracked;
+	}
+
 	private async runReconciliation(mode: ReconcileMode): Promise<void> {
 		await this.reconciliationController.runReconciliation(mode);
 	}
@@ -1052,14 +1218,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		await this.reconciliationController.importUntrackedFiles();
 	}
 
-	private async clearLocalServerReceiptState(): Promise<"cleared_persistent" | "cleared_memory_only" | "failed" | undefined> {
-		if (!this.vaultSync) return;
-		const result = await this.vaultSync.clearLocalServerReceiptState();
-		this.log(`Cleared local server-receipt state: ${result}`);
-		this.scheduleTraceStateSnapshot("clear-local-server-receipt-state");
-		this.refreshStatusBar();
-		return result;
-	}
 
 	// -------------------------------------------------------------------
 	// Vault event handlers
@@ -1348,7 +1506,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					} else {
 						const blobSync = this.getBlobSync();
 						if (blobSync && this.isBlobPathSyncable(file.path) && !blobSync.isSuppressed(file.path)) {
-							blobSync.handleFileDelete(file.path, this.settings.deviceName);
+							void blobSync.handleFileDelete(file.path, this.settings.deviceName)
+								.catch((error) => this.log(`Blob delete publication failed: ${formatUnknown(error)}`));
 							this.log(`Delete (blob): "${file.path}"`);
 						}
 					}
@@ -1396,17 +1555,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	// -------------------------------------------------------------------
 	// Teardown + reinit (for reset commands)
-	//
-	// There is deliberately no scheduled rebuild.  It ran on the status tick,
-	// gated on being disconnected, to shed accumulated V8 rope.  A soak of a
-	// live 12.5MB vault through Obsidian — full save path, real GC — reclaimed
-	// 0.02 MiB of rope after 20,602 updates, because y-indexeddb's periodic
-	// encodeStateAsUpdate trim already flattens the strings.  And on a
-	// fragmented document a rebuild left struct count unchanged while making
-	// heap 15% worse.  The rebuild is gone entirely rather than kept as a manual
-	// command, because the case that would tempt someone into running it -- a
-	// vault near the memory limit -- is the fragmented case, where it spikes
-	// rather than saves.  See scripts/bench-interventions.mjs.
+	// Schema-4 bodies are independently bounded and clean-only eviction replaces
+	// the old whole-document rebuild path.
 
 	// -------------------------------------------------------------------
 
@@ -1437,6 +1587,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			{
 				name: "editor-bindings",
 				run: () => this.editorBindings?.unbindAll(),
+			},
+			{
+				name: "schema4-catch-up",
+				run: () => this.bootstrapCatchUp ?? undefined,
 			},
 			{
 				name: "disk-mirror",
@@ -1474,6 +1628,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					this.connectionController = null;
 					this.editorBindings = null;
 					this.diskMirror = null;
+					this.vaultDatabase = null;
+					this.bootstrapClient = null;
+					this.bootstrapProgress = null;
+					this.bootstrapCatchUp = null;
+					this.bootstrapCatchUpPending = false;
 					this.awaitingFirstProviderSyncAfterStartup = false;
 					this.editorWorkspace?.reset();
 					this.idbDegradedHandled = false;
@@ -1492,93 +1651,68 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	}
 
 	private resetLocalCache(): void {
-		if (!this.vaultSync) {
+		if (!this.vaultSync || !this.vaultDatabase) {
 			new Notice("Sync not initialized");
 			return;
 		}
-
-		const vaultId = this.settings.vaultId;
 		new ConfirmModal(
 			this.app,
 			"Reset local cache",
-			"This will clear the local IndexedDB cache and re-sync from the server. " +
-			"Your disk files and server state are not affected. Continue?",
+			"This clears this folder’s schema-4 cache and downloads the vault again. Pending local work must settle first. Continue?",
 			async () => {
-				this.log("Reset cache: starting");
-				new Notice("Clearing cache and syncing again...");
-
+				const database = this.vaultDatabase;
+				if (!database) return;
 				try {
+					const preflight = await database.getPendingWorkSummary();
 					await this.teardownSync();
-				} catch (err) {
-					console.error("[yaos] Reset teardown completed with errors:", err);
-					new Notice("Sync cleanup completed with errors; local cache was not reset.");
-					return;
+					await database.deleteDatabaseAfterClose(preflight);
+					await this.initSync(true);
+					new Notice("Cache reset complete.");
+				} catch (error) {
+					console.error("[yaos] Failed to reset schema-4 cache:", error);
+					new Notice(`Cache reset refused: ${formatUnknown(error)}`, 8000);
 				}
-
-				try {
-					await VaultSync.deleteIdb(vaultId, await this.ensureFolderKey());
-					this.log("Reset cache: IDB deleted");
-				} catch (err) {
-					console.error("[yaos] Failed to delete IDB:", err);
-				}
-
-				this.log("Reset cache: reinitializing");
-				await this.initSync(true);
-				new Notice("Cache reset complete.");
 			},
 		).open();
 	}
 
 	private nuclearReset(): void {
-		if (!this.vaultSync) {
+		const runtime = this.vaultSync;
+		const database = this.vaultDatabase;
+		if (!runtime || !database) {
 			new Notice("Sync not initialized");
 			return;
 		}
-
-		const pathCount = this.vaultSync.getActiveMarkdownPaths().length;
+		const pathCount = runtime.getActiveMarkdownPaths().length;
 		new ConfirmModal(
 			this.app,
 			"Nuclear reset",
-			`This will wipe all CRDT state (${pathCount} files) on both this device and the server, ` +
-			`clear the local cache, then re-seed everything from your current disk files. ` +
-			`Other connected devices will also see the reset. This cannot be undone. Continue?`,
+			`This durably deletes ${pathCount} synced notes from the server, clears this folder’s schema-4 cache, then imports the current disk files. Continue?`,
 			async () => {
-				this.log("Nuclear reset: starting");
-				new Notice("Nuclear reset in progress...");
-
-				// Clear CRDT maps before teardown so deletions propagate while connected.
-				const counts = this.vaultSync!.clearAllMaps();
-				this.pendingReceiptGeneration = this.vaultSync!.roomGeneration;
-				this.log(
-					`Nuclear reset: cleared ${counts.pathCount} paths, ` +
-					`${counts.idCount} texts, ${counts.metaCount} meta, ` +
-					`${counts.blobCount} blob paths, generation=${this.pendingReceiptGeneration}`,
-				);
-
-				await new Promise((r) => window.setTimeout(r, 500));
-
-				const vaultId = this.settings.vaultId;
 				try {
+					const requests = [...runtime.pathToId].map(([path, bodyId]) => ({
+						operationId: crypto.randomUUID(),
+						kind: "delete" as const,
+						fileId: bodyId,
+						bodyId,
+						path,
+					}));
+					if (requests.length > 0) await runtime.commitStructuralBatch(requests);
+					for (const [path] of runtime.listAttachmentRefs()) {
+						await runtime.deleteAttachmentRef(path, this.settings.deviceName);
+					}
+					const preflight = await database.getPendingWorkSummary();
 					await this.teardownSync();
-				} catch (err) {
-					console.error("[yaos] Reset teardown completed with errors:", err);
-					new Notice("Sync cleanup completed with errors; local cache was not reset.");
-					return;
+					await database.deleteDatabaseAfterClose(preflight, { discardPendingWork: true });
+					await this.initSync(true);
+					await this.importUntrackedFiles();
+					new Notice(
+						`YAOS: nuclear reset complete. Re-imported ${this.vaultSync?.getActiveMarkdownPaths().length ?? 0} files.`,
+					);
+				} catch (error) {
+					console.error("[yaos] Nuclear reset failed:", error);
+					new Notice(`Nuclear reset failed: ${formatUnknown(error)}`, 10000);
 				}
-
-				try {
-					await VaultSync.deleteIdb(vaultId, await this.ensureFolderKey());
-					this.log("Nuclear reset: IDB deleted");
-				} catch (err) {
-					console.error("[yaos] Failed to delete IDB:", err);
-				}
-
-				this.log("Nuclear reset: reinitializing (will re-seed from disk)");
-				await this.initSync(true);
-				new Notice(
-					`YAOS: nuclear reset complete. ` +
-					`Re-seeded ${this.vaultSync?.getActiveMarkdownPaths().length ?? 0} files from disk.`,
-				);
 			},
 		).open();
 	}
@@ -1703,18 +1837,20 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.updateStatusBar(state);
 	}
 
-	/**
-	 * Batch receipt echoes delivered in the same provider turn into one redraw.
-	 * The accepted-echo callback runs after ServerAckTracker updates its facts,
-	 * so this always renders the current receipt state rather than stale data.
-	 */
+	/** Coalesce durable body-candidate receipt updates into one status redraw. */
 	private queueReceiptStatusRefresh(): void {
 		this.receiptStatusRefresh.request();
 	}
 
 	getSettingsStatusSummary(): { label: string } {
 		return {
-			label: getLabelFromConnectionState(this.getCurrentConnectionState()).replace(/^YAOS:\s*/, ""),
+			label: getLabelFromConnectionState(
+				this.getCurrentConnectionState(),
+				null,
+				null,
+				0,
+				getRecoveryReadiness(this.pendingRecoveryState),
+			).replace(/^YAOS:\s*/, ""),
 		};
 	}
 
@@ -1729,7 +1865,14 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		const attentionCount = diskAttention + blobAttention;
 		const serverReceipt = this.vaultSync?.getServerReceiptSnapshot() ?? null;
 		this.noticeServerPersistenceHealth(serverReceipt?.serverPersistenceDegraded ?? false);
-		renderConnectionState(this.statusBarEl, visibleState, transferStatus, serverReceipt, attentionCount);
+		renderConnectionState(
+			this.statusBarEl,
+			visibleState,
+			transferStatus,
+			serverReceipt,
+			attentionCount,
+			getRecoveryReadiness(this.pendingRecoveryState),
+		);
 	}
 
 	/**
@@ -1810,6 +1953,12 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			pendingBlobDownloads: blobSync?.pendingDownloads ?? 0,
 			reconcileInFlight: this.reconciliationController?.isReconcileInFlight ?? false,
 			safetyBrakeActive: this.reconciliationController?.getState().lastReconcileStats?.safetyBrakeTriggered ?? false,
+			recovery: {
+				readiness: getRecoveryReadiness(this.pendingRecoveryState),
+				captureState: this.pendingRecoveryState.lastCaptureStatus?.state ?? null,
+				restoreState: this.pendingRecoveryState.lastRestoreStatus?.state ?? null,
+				projectionState: this.pendingRecoveryState.lastRecoveryStatus?.projectionState ?? null,
+			},
 		};
 	}
 
@@ -1916,6 +2065,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		// Obsidian invokes unload synchronously. Set this gate before any cleanup
 		// so a late init continuation cannot attach a replacement runtime.
 		this.teardownLifecycle.requestPermanentShutdown();
+		this.snapshotService?.destroy();
 		this.log("Unloading plugin");
 		this.lab?.dispose();   // dispose stops the flight trace and QA API
 		document.body.removeClass("vault-crdt-show-cursors");
@@ -2103,6 +2253,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	}
 
 	private async retireCurrentEnrollment(membership: EnrollmentMembership): Promise<void> {
+		const database = this.vaultDatabase;
+		const preflight = await database?.getPendingWorkSummary() ?? null;
 		if (
 			membership.host &&
 			membership.deviceToken &&
@@ -2129,35 +2281,12 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			}
 		}
 
-		await this.clearServerReceiptCandidate(membership);
-		try {
-			await this.teardownSync();
-		} catch (err) {
-			console.error("[yaos] Re-enrollment teardown completed with errors:", err);
-		}
-		if (membership.vaultId) {
-			try {
-				await VaultSync.deleteIdb(membership.vaultId, await this.ensureFolderKey());
-			} catch (err) {
-				console.error("[yaos] Failed to delete old enrollment IDB:", err);
-			}
+		await this.teardownSync();
+		if (database && preflight) {
+			await database.deleteDatabaseAfterClose(preflight);
 		}
 	}
 
-	private async clearServerReceiptCandidate(membership: EnrollmentMembership): Promise<void> {
-		try {
-			await this.vaultSync?.clearLocalServerReceiptState();
-			if (membership.host && membership.vaultId && membership.deviceId) {
-				await VaultSync.clearServerReceiptCandidate(
-					membership.host,
-					membership.vaultId,
-					await this.ensureFolderKey(),
-				);
-			}
-		} catch (err) {
-			console.error("[yaos] Failed to clear server receipt candidate:", err);
-		}
-	}
 
 	openServerConsole(): void {
 		const host = this.settings.host.trim().replace(/\/$/, "");
@@ -2244,7 +2373,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		const host = this.settings.host.trim().replace(/\/$/, "");
 		const deviceToken = this.settings.deviceToken.trim();
 		const vaultId = this.settings.vaultId.trim();
-		const deviceId = this.settings.deviceId.trim();
 		if (host && deviceToken && vaultId) {
 			try {
 				const res = await obsidianRequest({
@@ -2261,24 +2389,16 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			}
 		}
 
-		await this.clearServerReceiptCandidate({
-			host,
-			deviceToken,
-			vaultId,
-			deviceId,
-		});
 
+		const database = this.vaultDatabase;
+		const preflight = await database?.getPendingWorkSummary() ?? null;
 		try {
 			await this.teardownSync();
-		} catch (err) {
-			console.error("[yaos] Leave teardown completed with errors:", err);
-		}
-		if (vaultId) {
-			try {
-				await VaultSync.deleteIdb(vaultId, await this.ensureFolderKey());
-			} catch (err) {
-				console.error("[yaos] Failed to delete IDB on leave:", err);
+			if (database && preflight) {
+				await database.deleteDatabaseAfterClose(preflight, { discardPendingWork: true });
 			}
+		} catch (err) {
+			console.error("[yaos] Leave teardown or cache deletion completed with errors:", err);
 		}
 		this.vaultRoster = [];
 		this.rosterVaultId = "";
@@ -2287,6 +2407,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			settings.deviceToken = "";
 			settings.vaultId = "";
 			settings.deviceId = "";
+			settings.vaultGeneration = "";
+			settings.originImportPending = false;
 		}, "leave-vault");
 		new Notice("Left this vault. Notes are still on disk.", 7000);
 	}
@@ -2465,23 +2587,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	}
 
 
-	private runSchemaMigrationToV2(): void {
-		if (!this.vaultSync) {
-			new Notice("Sync not initialized.");
-			return;
-		}
-		runSchemaMigrationToV2({
-			app: this.app,
-			vaultSync: this.vaultSync,
-			settings: this.settings,
-			log: (msg) => this.log(msg),
-			runReconciliation: async () => {
-				const mode = this.vaultSync?.getSafeReconcileMode();
-				if (!mode) return;
-				await this.runReconciliation(mode);
-			},
-		});
-	}
 
 	// -------------------------------------------------------------------
 	// QA debug API surface
@@ -2539,19 +2644,13 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	}
 
 	private handleIndexedDbDegraded(source: string, err?: unknown): void {
-		if (!this.vaultSync) return;
-		if (err) {
-			this.vaultSync.reportIndexedDbError(err, "runtime");
-		}
-		if (!this.vaultSync.idbError || this.idbDegradedHandled) return;
-
+		if (this.idbDegradedHandled) return;
 		this.idbDegradedHandled = true;
-		const kind = this.vaultSync.idbErrorDetails?.kind ?? "unknown";
+		const details = err ? formatUnknown(err) : "unknown IndexedDB failure";
+		const kind = details.toLowerCase().includes("quota") ? "quota_exceeded" : "unknown";
 		this.log(`IndexedDB degraded (${source}): kind=${kind}`);
 		this.scheduleTraceStateSnapshot("idb-degraded");
-
 		void this.attachmentOrchestrator?.stop("idb-degraded");
-
 		const notice = kind === "quota_exceeded"
 			? "YAOS: Device storage is full. Sync durability is degraded and attachment transfers are paused. Free up storage, then restart Obsidian."
 			: "YAOS: IndexedDB persistence failed. Sync durability is degraded and attachment transfers are paused.";

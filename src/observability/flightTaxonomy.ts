@@ -55,7 +55,6 @@ export type FlightSource =
 	| "reconciliationController"
 	| "connectionController"
 	| "blobSync"
-	| "serverAckTracker"
 	| "traceRuntime"
 	| "diagnostics"
 	| "server";
@@ -94,7 +93,6 @@ export const FLIGHT_KIND = {
 
 	// Server receipt
 	serverReceiptCandidateCaptured: "server.receipt.candidate_captured",
-	serverSvEchoSeen: "server.sv_echo.seen",
 	serverReceiptConfirmed: "server.receipt.confirmed",
 
 	// Disk — local observations (external edits, not YAOS self-writes)
@@ -122,6 +120,16 @@ export const FLIGHT_KIND = {
 	crdtFileTombstoned: "crdt.file.tombstoned",            // priority: critical
 	crdtFileRevived: "crdt.file.revived",                  // priority: critical
 
+	// Attachment root catalog and transfer lifecycle
+	attachmentRevived: "attachment.revived",
+	attachmentTombstoned: "attachment.tombstoned",
+	attachmentRenamed: "attachment.renamed",
+	attachmentUploadDecision: "attachment.upload.decision",
+	attachmentUploadComplete: "attachment.upload.complete",
+	attachmentDownloadDecision: "attachment.download.decision",
+	attachmentDownloadComplete: "attachment.download.complete",
+	attachmentIntegrityFailed: "attachment.integrity.failed",
+
 	// Reconcile
 	reconcileStart: "reconcile.start",
 	reconcileFileDecision: "reconcile.file.decision",      // priority: critical when conflictRisk=ambiguous
@@ -130,6 +138,9 @@ export const FLIGHT_KIND = {
 	reconcileComplete: "reconcile.complete",
 
 	// Recovery — all now emitted from reconciliationController
+	recoveryCaptureStart: "recovery.capture.start",
+	recoveryCaptureComplete: "recovery.capture.complete",
+	recoveryRestoreRestarted: "recovery.restore.restarted",
 	recoveryDecision: "recovery.decision",
 	recoveryApplyStart: "recovery.apply.start",
 	recoveryApplyDone: "recovery.apply.done",

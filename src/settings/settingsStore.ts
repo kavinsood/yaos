@@ -22,6 +22,10 @@ export interface VaultSyncSettings {
 	vaultId: string;
 	/** Server-minted device identifier for this enrollment. */
 	deviceId: string;
+	/** Exact provisioned storage incarnation for this enrollment. */
+	vaultGeneration: string;
+	/** One-use authority for this folder to seed the newly provisioned vault. */
+	originImportPending: boolean;
 	/** Human-readable device name shown in awareness/cursors. */
 	deviceName: string;
 	/**
@@ -65,6 +69,8 @@ export const DEFAULT_SETTINGS: VaultSyncSettings = {
 	deviceToken: "",
 	vaultId: "",
 	deviceId: "",
+	vaultGeneration: "",
+	originImportPending: false,
 	deviceName: "",
 	debug: false,
 	frontmatterGuardEnabled: true,
@@ -108,23 +114,24 @@ export function readVaultSyncSettings(
 	const settings = Object.assign({}, DEFAULT_SETTINGS, record);
 	Reflect.deleteProperty(settings, "token");
 	let migrated = "token" in record;
-	const legacyCredential = typeof record.token === "string" && record.token.trim().length > 0;
 	const hasCompleteEnrollment = [
 		settings.host,
 		settings.deviceToken,
 		settings.vaultId,
 		settings.deviceId,
+		settings.vaultGeneration,
 	].every((value) => typeof value === "string" && value.trim().length > 0);
-	if (legacyCredential && !hasCompleteEnrollment) {
-		settings.host = "";
+	if (!hasCompleteEnrollment) {
+		if (settings.deviceToken || settings.vaultId || settings.deviceId || settings.vaultGeneration) migrated = true;
 		settings.deviceToken = "";
 		settings.vaultId = "";
 		settings.deviceId = "";
-	} else if (!hasCompleteEnrollment) {
-		if (settings.deviceToken || settings.vaultId || settings.deviceId) migrated = true;
-		settings.deviceToken = "";
-		settings.vaultId = "";
-		settings.deviceId = "";
+		settings.vaultGeneration = "";
+		settings.originImportPending = false;
+	}
+	if (typeof settings.originImportPending !== "boolean") {
+		settings.originImportPending = false;
+		migrated = true;
 	}
 	if (typeof record.attachmentSyncExplicitlyConfigured !== "boolean") {
 		settings.attachmentSyncExplicitlyConfigured = record.enableAttachmentSync === true;

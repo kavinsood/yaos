@@ -1,5 +1,6 @@
 import type { ConnectionState } from "../runtime/connectionController";
 import type { VaultSyncReceiptSnapshot } from "../sync/vaultSync";
+import type { RecoveryReadiness } from "../snapshots/recoveryState";
 
 
 export type ServerReceiptStatus = Readonly<
@@ -10,11 +11,7 @@ export type ServerReceiptStatus = Readonly<
 		| "lastKnownServerReceiptEchoAt"
 		| "candidatePersistenceHealthy"
 		| "serverReceiptStartupValidation"
-	> & Partial<
-		Pick<
-			VaultSyncReceiptSnapshot,
-			"receiptGuaranteeIsDurable" | "serverPersistenceDegraded"
-		>
+		| "serverPersistenceDegraded"
 	>
 >;
 
@@ -28,6 +25,7 @@ export function getLabelFromConnectionState(
 	transferStatus?: string | null,
 	serverReceipt?: ServerReceiptStatus | null,
 	attentionCount = 0,
+	recovery?: RecoveryReadiness | null,
 ): string {
 	let base: string;
 	switch (state.kind) {
@@ -87,6 +85,9 @@ export function getLabelFromConnectionState(
 	if (serverReceipt?.serverPersistenceDegraded === true) {
 		base = `${base} · Server not saving`;
 	}
+	if (recovery) {
+		base = `${base} · Recovery ${recovery}`;
+	}
 	return receipt ? `${base} · ${receipt}` : base;
 }
 
@@ -97,20 +98,8 @@ function shouldShowReceiptStatus(state: ConnectionState): boolean {
 export const SERVER_RECEIPT_STATUS_TITLE =
 	"Server receipt means this device’s latest local CRDT state was written to the server’s storage. It does not prove that another device received the change.";
 
-/**
- * Shown against a server that predates the durability marker, where the
- * state-vector fallback proves only an in-memory apply.  Kept as a separate
- * string rather than softening the main one: the common case now genuinely is
- * durable, and describing it as though it were not is the mistake this
- * replaces.
- */
-export const SERVER_RECEIPT_STATUS_TITLE_LEGACY =
-	"Server receipt means this device’s latest local CRDT state was applied to the server Y.Doc in memory. This server does not report storage confirmation, so the receipt does not prove durable storage or that another device received the change.";
-
-export function getServerReceiptStatusTitle(receipt?: ServerReceiptStatus | null): string {
-	return receipt?.receiptGuaranteeIsDurable === true
-		? SERVER_RECEIPT_STATUS_TITLE
-		: SERVER_RECEIPT_STATUS_TITLE_LEGACY;
+export function getServerReceiptStatusTitle(): string {
+	return SERVER_RECEIPT_STATUS_TITLE;
 }
 
 function fmtTime(ms: number): string {
@@ -121,24 +110,15 @@ export function getServerReceiptStatusLabel(
 	receipt: ServerReceiptStatus,
 	connected: boolean,
 ): string {
-	// "saved" is claimed only when the durable marker is in force; otherwise the
-	// weaker "received" wording stands, because that is all the fallback proves.
-	const durable = receipt.receiptGuaranteeIsDurable === true;
 	let label: string;
 	if (receipt.serverAppliedLocalState === true && connected) {
-		label = durable
-			? "Receipt: server saved latest local state"
-			: "Receipt: server received latest local state";
+		label = "Receipt: server saved latest local state";
 	} else if (receipt.serverAppliedLocalState === false && connected) {
 		label = "Receipt: local state not yet received by server";
 	} else if (receipt.serverAppliedLocalState === false && !connected) {
 		label = "Receipt: offline — local state not yet received by server";
 	} else if (receipt.serverAppliedLocalState === true && !connected && receipt.lastServerReceiptEchoAt !== null) {
-		label = durable
-			? `Receipt: offline — server saved at ${fmtTime(receipt.lastServerReceiptEchoAt)}`
-			: `Receipt: offline — server receipt at ${fmtTime(receipt.lastServerReceiptEchoAt)}`;
-	} else if (receipt.serverReceiptStartupValidation === "skipped_local_yjs_timeout") {
-		label = "Receipt: unchecked — local cache still loading";
+		label = `Receipt: offline — server saved at ${fmtTime(receipt.lastServerReceiptEchoAt)}`;
 	} else if (receipt.lastKnownServerReceiptEchoAt !== null && receipt.lastServerReceiptEchoAt === null) {
 		label = `Receipt: last known server receipt at ${fmtTime(receipt.lastKnownServerReceiptEchoAt)} — checking…`;
 	} else {
@@ -158,10 +138,20 @@ export function renderConnectionState(
 	transferStatus?: string | null,
 	serverReceipt?: ServerReceiptStatus | null,
 	attentionCount = 0,
+	recovery?: RecoveryReadiness | null,
 ): void {
-	statusBarEl.setText(getLabelFromConnectionState(state, transferStatus, serverReceipt, attentionCount));
-	const title = serverReceipt && shouldShowReceiptStatus(state)
-		? getServerReceiptStatusTitle(serverReceipt)
+	statusBarEl.setText(getLabelFromConnectionState(
+		state,
+		transferStatus,
+		serverReceipt,
+		attentionCount,
+		recovery,
+	));
+	const receiptTitle = serverReceipt && shouldShowReceiptStatus(state)
+		? getServerReceiptStatusTitle()
 		: "";
-	statusBarEl.setAttr("title", title);
+	const recoveryTitle = recovery
+		? `Recovery is ${recovery}; sync connectivity and recovery preparation are independent.`
+		: "";
+	statusBarEl.setAttr("title", [receiptTitle, recoveryTitle].filter(Boolean).join(" "));
 }

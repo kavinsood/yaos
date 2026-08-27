@@ -1,9 +1,7 @@
-import { type App, MarkdownView, TFile, normalizePath } from "obsidian";
-import * as Y from "yjs";
+import { type App, arrayBufferToHex, MarkdownView, TFile, normalizePath } from "obsidian";
 import type { VaultSync } from "./vaultSync";
 import type { EditorBindingManager } from "./editorBinding";
 import type { TraceRecord } from "../observability/traceContext";
-import { getMetaPath, isFileMetaDeletedValue } from "./fileMeta";
 import { formatUnknown, yTextToString } from "../utils/format";
 import {
 	isFrontmatterBlocked,
@@ -12,18 +10,32 @@ import {
 } from "./frontmatterGuard";
 import { isLocalOrigin } from "./origins";
 import { contentBaselineHash } from "./diskIndex";
+import { decideClosedFileConflict } from "./closedFileConflict";
+import {
+	createMarkdownConflictArtifact,
+} from "../runtime/reconcile/markdownConflictArtifact";
 import { PreservedUnresolvedRegistry, type PreservedUnresolvedEntry, type PreservedUnresolvedReason } from "./preservedUnresolved";
-import { sha256BytesHex } from "../utils/sha256";
+import { safeMarkdownPath } from "./pathPolicy";
 export { isLocalOrigin };
 
-/**
- * Three-way decision for remote-delete handling.
- * Discriminated union — NOT a boolean dirty flag.
- */
-export type RemoteDeleteDecision =
-	| { kind: "apply-delete" }
-	| { kind: "preserve-revive"; diskContent: string }
-	| { kind: "preserve-unresolved" };
+export interface DiskSettlementOptions {
+	getBaseline(path: string): {
+		contentHash: string | null;
+		lastDiskIndexPersistedAt?: number;
+	} | null;
+	commitLocalBody(input: {
+		bodyId: string;
+		path: string;
+		content: string;
+		reason: "external-edit" | "delete-revive";
+	}): Promise<void>;
+	settleClosedBody?(path: string): Promise<void>;
+	isPathAllowed?(path: string): boolean;
+	isBodyLive?(bodyId: string): boolean;
+}
+
+export type DeleteSettlement = "deleted" | "revived" | "preserved-unresolved";
+
 
 /**
  * Handles writeback from Y.Text -> disk with:
@@ -36,8 +48,10 @@ export type RemoteDeleteDecision =
 const DEBOUNCE_MS = 300;
 const DEBOUNCE_BURST_MS = 1000;
 const OPEN_FILE_IDLE_MS = 1500;
+const BODY_OBSERVER_RETRY_MS = 100;
+const BODY_OBSERVER_RETRY_LIMIT = 100;
 const OPEN_FILE_ACTIVE_GRACE_MS = 1200;
-const SUPPRESS_MS = 500;
+const SUPPRESS_MS = 10_000;
 const MAX_CONCURRENT_WRITES = 5;
 const BURST_THRESHOLD = 20;
 
@@ -58,11 +72,13 @@ interface SuppressionEntry {
 	expiresAt: number;
 	expectedBytes?: number;
 	expectedHash?: string;
+	remainingAcks?: number;
 }
 
 function hashPrefix(hash: string | null | undefined): string | null {
 	return typeof hash === "string" ? hash.slice(0, 12) : null;
 }
+
 
 export class DiskMirror {
 	private suppressedPaths = new Map<string, SuppressionEntry>();
@@ -116,6 +132,8 @@ export class DiskMirror {
 	private debounceTimers = new Map<string, number>();
 	private openWriteTimers = new Map<string, number>();
 	private pendingOpenWrites = new Set<string>();
+	private bodyObserverRetryTimers = new Map<string, number>();
+	private bodyObserverRetryAttempts = new Map<string, number>();
 	/** True while the drain loop is running. */
 	private draining = false;
 	private drainPromise: Promise<void> | null = null;
@@ -127,7 +145,6 @@ export class DiskMirror {
 		{ ytext: import("yjs").Text; handler: (event: import("yjs").YTextEvent, txn: import("yjs").Transaction) => void }
 	>();
 
-	private mapObserverCleanups: (() => void)[] = [];
 
 	private _flightEventHandler: ((event: Record<string, unknown>) => void) | null = null;
 
@@ -149,6 +166,8 @@ export class DiskMirror {
 	private lastDiskWriteOkAt = new Map<string, number>();
 
 	private readonly debug: boolean;
+	private settlement: DiskSettlementOptions | null = null;
+
 
 	constructor(
 		private app: App,
@@ -189,121 +208,302 @@ export class DiskMirror {
 	setDiskWriteCallback(callback: (path: string, contentHash: string) => void): void {
 		this._onDiskWriteCallback = callback;
 	}
+	configureSettlement(options: DiskSettlementOptions | null): void {
+		this.settlement = options;
+	}
+	markPendingPath(path: string, bodyId: string): void {
+		this.vaultSync.markPendingRenameTarget(normalizePath(path), bodyId);
+	}
+
+	clearPendingPath(path: string, bodyId: string): void {
+		this.vaultSync.clearPendingRenameTarget(normalizePath(path), bodyId);
+	}
+
+
+	async settleBody(input: {
+		path: string;
+		bodyId: string;
+		generation: number;
+		content: string;
+	}): Promise<"settled" | "preserved-unresolved"> {
+		const path = this.acceptPath(input.path);
+		if (!path) return "preserved-unresolved";
+		return this.runPathWriteLocked(path, () => this.settleBodyUnlocked({ ...input, path }));
+	}
+	async discardStaleBody(input: {
+		path: string;
+		bodyId: string;
+		expectedContent: string;
+	}): Promise<boolean> {
+		const path = this.acceptPath(input.path);
+		if (!path) return false;
+		return this.runPathWriteLocked(path, async () => {
+			if (this.openPaths.has(path) || this.editorBindings.isBound(path)) {
+				this.recordPreservedUnresolved(path, "body-open-deferred");
+				return false;
+			}
+			const file = this.app.vault.getAbstractFileByPath(path);
+			if (!(file instanceof TFile)) return true;
+			let content: string;
+			try {
+				content = await this.app.vault.read(file);
+			} catch {
+				this.recordPreservedUnresolved(path, "body-settlement-failed");
+				return false;
+			}
+			if (content !== input.expectedContent) {
+				this.recordPreservedUnresolved(path, "body-settlement-failed");
+				return false;
+			}
+
+			this.suppressDelete(path, 2);
+			await this.deleteLocalReplica(file);
+			this.clearPreservedUnresolved(path);
+			this.log(`discarded stale settlement for ${input.bodyId} at "${path}"`);
+			return true;
+		});
+	}
+	async settleRename(input: {
+		from: string;
+		to: string;
+		bodyId: string;
+		currentContent: string;
+	}): Promise<"moved" | "source-absent" | "source-deleted" | "preserved-unresolved"> {
+		const from = this.acceptPath(input.from);
+		const to = this.acceptPath(input.to);
+		if (!from || !to) return "preserved-unresolved";
+		const source = this.app.vault.getAbstractFileByPath(from);
+		if (!(source instanceof TFile)) return "source-absent";
+		const target = this.app.vault.getAbstractFileByPath(to);
+		if (target instanceof TFile) {
+			const [sourceContent, targetContent] = await Promise.all([
+				this.app.vault.read(source),
+				this.app.vault.read(target),
+			]);
+			if (
+				sourceContent !== input.currentContent
+				|| targetContent !== input.currentContent
+				|| this.openPaths.has(from)
+				|| this.editorBindings.isBound(from)
+			) {
+				this.recordPreservedUnresolved(from, "path-collision");
+				return "preserved-unresolved";
+			}
+			this.suppressDelete(from, 2);
+			await this.deleteLocalReplica(source);
+			this.clearPreservedUnresolved(from);
+			this.log(`removed exact previous rename source "${from}" for ${input.bodyId}`);
+			return "source-deleted";
+		}
+		if (target) {
+			this.recordPreservedUnresolved(from, "path-collision");
+			return "preserved-unresolved";
+		}
+		await this.moveBodies([{ from, to, bodyId: input.bodyId }]);
+		return "moved";
+	}
+
+
+	async moveBodies(moves: Array<{ from: string; to: string; bodyId: string }>): Promise<void> {
+		const normalized = moves.map((move) => {
+			const from = this.acceptPath(move.from);
+			const to = this.acceptPath(move.to);
+			if (!from || !to) throw new Error("structural batch contains an unsafe path");
+			return { ...move, from, to };
+		}).filter((move) => move.from !== move.to);
+		if (normalized.length === 0) return;
+
+		const fromPaths = new Set<string>();
+		const toPaths = new Set<string>();
+		for (const move of normalized) {
+			if (fromPaths.has(move.from)) throw new Error(`Duplicate move source: ${move.from}`);
+			if (toPaths.has(move.to)) throw new Error(`Duplicate move destination: ${move.to}`);
+			fromPaths.add(move.from);
+			toPaths.add(move.to);
+		}
+		for (const move of normalized) {
+			const target = this.app.vault.getAbstractFileByPath(move.to);
+			if (target && !fromPaths.has(move.to)) {
+				throw new Error(`Move destination already exists: ${move.to}`);
+			}
+		}
+
+		const staged: Array<{
+			move: { from: string; to: string; bodyId: string };
+			temp: string;
+		}> = [];
+		const completed: typeof staged = [];
+		try {
+			for (const move of normalized) {
+				const source = this.app.vault.getAbstractFileByPath(move.from);
+				if (!(source instanceof TFile)) continue;
+				const slash = move.from.lastIndexOf("/");
+				const dir = slash >= 0 ? move.from.slice(0, slash + 1) : "";
+				let temp: string;
+				do {
+					temp = `${dir}.yaos-moving-${move.bodyId}-${Math.random().toString(36).slice(2)}.md`;
+				} while (this.app.vault.getAbstractFileByPath(temp));
+				const content = await this.app.vault.read(source);
+				await this.suppressWrite(temp, content, 2);
+				this.markPendingPath(temp, move.bodyId);
+				this.suppressDelete(move.from, 2);
+				this._pendingRemoteRenameNewPaths.add(temp);
+				await this.app.fileManager.renameFile(source, temp);
+				staged.push({ move, temp });
+			}
+			for (const item of staged) {
+				await this.ensureParentFolder(item.move.to);
+				const temporary = this.app.vault.getAbstractFileByPath(item.temp);
+				if (!(temporary instanceof TFile)) {
+					throw new Error(`Staged move disappeared: ${item.temp}`);
+				}
+				const content = await this.app.vault.read(temporary);
+				await this.suppressWrite(item.move.to, content, 2);
+				this.markPendingPath(item.move.to, item.move.bodyId);
+				this.suppressDelete(item.temp, 2);
+				this._pendingRemoteRenameNewPaths.add(item.move.to);
+				await this.app.fileManager.renameFile(temporary, item.move.to);
+				this.clearPendingPath(item.temp, item.move.bodyId);
+				completed.push(item);
+			}
+			this.editorBindings.updatePathsAfterRename(
+				new Map(normalized.map((move) => [move.from, move.to])),
+			);
+			this.expireRemoteRenameMarkers([
+				...staged.map((item) => item.temp),
+				...normalized.map((move) => move.to),
+			]);
+			for (const move of normalized) this.clearPendingPath(move.to, move.bodyId);
+		} catch (error) {
+			let rollbackFailed = false;
+			for (const item of [...completed].reverse()) {
+				const target = this.app.vault.getAbstractFileByPath(item.move.to);
+				if (!(target instanceof TFile)) continue;
+				try {
+					const content = await this.app.vault.read(target);
+					await this.suppressWrite(item.move.from, content, 2);
+					this.suppressDelete(item.move.to, 2);
+					this._pendingRemoteRenameNewPaths.add(item.move.from);
+					await this.app.fileManager.renameFile(target, item.move.from);
+				} catch {
+					rollbackFailed = true;
+				}
+			}
+			for (const item of staged) {
+				if (completed.includes(item)) continue;
+				const temporary = this.app.vault.getAbstractFileByPath(item.temp);
+				if (!(temporary instanceof TFile)) continue;
+				try {
+					const content = await this.app.vault.read(temporary);
+					await this.suppressWrite(item.move.from, content, 2);
+					this.suppressDelete(item.temp, 2);
+					this._pendingRemoteRenameNewPaths.add(item.move.from);
+					await this.app.fileManager.renameFile(temporary, item.move.from);
+				} catch {
+					rollbackFailed = true;
+				}
+			}
+			if (rollbackFailed) {
+				for (const move of normalized) {
+					this.recordPreservedUnresolved(move.from, "structural-batch-failed");
+					this.recordPreservedUnresolved(move.to, "structural-batch-failed");
+				}
+			}
+			this.expireRemoteRenameMarkers([
+				...staged.map((item) => item.temp),
+				...normalized.flatMap((move) => [move.from, move.to]),
+			]);
+			for (const item of staged) this.clearPendingPath(item.temp, item.move.bodyId);
+			for (const move of normalized) this.clearPendingPath(move.to, move.bodyId);
+			throw error;
+		}
+	}
+	private expireRemoteRenameMarkers(paths: readonly string[]): void {
+		window.setTimeout(() => {
+			for (const path of paths) this._pendingRemoteRenameNewPaths.delete(path);
+		}, SUPPRESS_MS);
+	}
+
+
+	async deleteBody(input: {
+		path: string;
+		bodyId: string;
+		generation: number;
+		baselineContent?: string | null;
+	}): Promise<DeleteSettlement> {
+		const path = this.acceptPath(input.path);
+		if (!path) return "preserved-unresolved";
+		if (
+			this.settlement?.isBodyLive?.(input.bodyId)
+			|| this.openPaths.has(path)
+			|| this.editorBindings.isBound(path)
+		) {
+			this.recordPreservedUnresolved(path, "body-open-deferred");
+			return "preserved-unresolved";
+		}
+		const file = this.app.vault.getAbstractFileByPath(path);
+		if (!(file instanceof TFile)) {
+			this.clearPreservedUnresolved(path);
+			return "deleted";
+		}
+
+		let diskContent: string;
+		try {
+			diskContent = await this.app.vault.read(file);
+		} catch {
+			this.recordPreservedUnresolved(path, "remote-delete-read-failed");
+			return "preserved-unresolved";
+		}
+		if (input.baselineContent == null) {
+			this.recordPreservedUnresolved(path, "remote-delete-missing-baseline");
+			return "preserved-unresolved";
+		}
+		if (diskContent !== input.baselineContent) {
+			if (!this.settlement) {
+				this.recordPreservedUnresolved(path, "body-settlement-failed");
+				return "preserved-unresolved";
+			}
+			try {
+				await this.settlement.commitLocalBody({
+					bodyId: input.bodyId,
+					path,
+					content: diskContent,
+					reason: "delete-revive",
+				});
+				this.clearPreservedUnresolved(path);
+				return "revived";
+			} catch {
+				this.recordPreservedUnresolved(path, "body-settlement-failed");
+				return "preserved-unresolved";
+			}
+		}
+
+		this.editorBindings.unbindByPath(path);
+		this.suppressDelete(path, 2);
+		await this.deleteLocalReplica(file);
+		this.clearPreservedUnresolved(path);
+		return "deleted";
+	}
+
+
+	private acceptPath(path: string): string | null {
+		const canonical = safeMarkdownPath(path);
+		if (!canonical || this.settlement?.isPathAllowed?.(canonical) === false) {
+			this.log(`disk mutation rejected unsafe path "${path}"`);
+			return null;
+		}
+		return normalizePath(canonical);
+	}
 
 	// -------------------------------------------------------------------
 	// Map observers (structural: add/delete)
 	// -------------------------------------------------------------------
 
-	startMapObservers(): void {
-		// ---------------------------------------------------------------
-		// Semantic metadata observer.
-		//
-		// Subscribes to pre-classified MetaSemanticChange events from
-		// VaultSync.observeMetaChanges(), which is powered by observeDeep
-		// internally. This correctly fires for both flat (v2) object
-		// replacements AND nested Y.Map field mutations (v3), where a
-		// shallow meta.observe() would have silently dropped the event.
-		// ---------------------------------------------------------------
-		const unsubscribeMetaChanges = this.vaultSync.observeMetaChanges((batch) => {
-			// Only react to remote changes. Local metadata writes (disk sync,
-			// seed, restore) must not feed back into DiskMirror as remote events.
-			if (batch.isLocal) return;
-
-			for (const change of batch.changes) {
-				switch (change.kind) {
-					case "deleted": {
-						const path = normalizePath(change.path);
-						const baselineText = yTextToString(this.vaultSync.idToText.get(change.fileId));
-						void this.handleRemoteDelete(path, { baselineText });
-						break;
-					}
-					case "revived": {
-						this.scheduleWrite(normalizePath(change.path));
-						break;
-					}
-					case "path-changed": {
-						// Only rename on disk when the entry is active.
-						// Tombstone path changes (e.g. from migrateSchemaToV2) must not
-						// trigger a disk rename — there is no live file to rename.
-						if (!change.isDeleted) {
-							void this.handleRemoteRename(
-								normalizePath(change.previousPath),
-								normalizePath(change.nextPath),
-							);
-						}
-						break;
-					}
-					case "added": {
-						// New file received from remote — schedule write if active.
-						if (!change.next.deletedAt && !change.next.deleted) {
-							this.scheduleWrite(normalizePath(change.next.path));
-						}
-						break;
-					}
-					// mtime-changed, device-changed, removed, invalid:
-					// no disk side effect needed.
-				}
-			}
-		});
-		this.mapObserverCleanups.push(unsubscribeMetaChanges);
-
-		// ---------------------------------------------------------------
-		// afterTransaction: catch remote content edits to CLOSED files.
-		//
-		// Per-file Y.Text observers only cover open files. When a remote
-		// device edits a note that is closed locally, the Y.Text changes
-		// in memory but nothing writes it to disk. This handler inspects
-		// every non-local transaction for changed Y.Text instances,
-		// reverse-maps them to paths, and schedules writes for any path
-		// that doesn't already have a per-file observer (i.e. closed).
-		// ---------------------------------------------------------------
-		const afterTxnHandler = (txn: Y.Transaction) => {
-			if (isLocalOrigin(txn.origin, this.vaultSync.provider)) return;
-
-			for (const [changedType] of txn.changed) {
-				if (!(changedType instanceof Y.Text)) continue;
-
-				// Reverse lookup: find the fileId that owns this Y.Text
-				const fileId = this.findFileIdForText(changedType);
-				if (!fileId) continue;
-
-				// Map fileId → path via meta (pathToId is path→id, not id→path)
-				const metaValue = this.vaultSync.meta.get(fileId);
-				if (!metaValue || isFileMetaDeletedValue(metaValue)) continue;
-
-				const path = getMetaPath(metaValue);
-				if (!path) continue;
-
-				// Skip if this path is already open (handled by per-file observer policy)
-				if (this.openPaths.has(path)) continue;
-
-				this.log(`afterTxn: remote content change to closed file "${path}"`);
-				this.scheduleWrite(path);
-			}
-		};
-		this.vaultSync.ydoc.on("afterTransaction", afterTxnHandler);
-		this.mapObserverCleanups.push(() =>
-			this.vaultSync.ydoc.off("afterTransaction", afterTxnHandler),
-		);
-
-		this.log("Map observers started");
-	}
 
 	/**
 	 * Reverse-lookup: given a Y.Text instance, find the fileId.
 	 * Uses VaultSync's WeakMap for O(1) lookup, with O(n) fallback.
 	 */
-	private findFileIdForText(ytext: Y.Text): string | null {
-		// Fast path: WeakMap lookup
-		const cached = this.vaultSync.getFileIdForText(ytext);
-		if (cached) return cached;
-
-		// Slow fallback: scan idToText (should rarely happen)
-		for (const [fileId, text] of this.vaultSync.idToText.entries()) {
-			if (text === ytext) return fileId;
-		}
-		return null;
-	}
 
 	// -------------------------------------------------------------------
 	// Per-file observers (lazy)
@@ -311,6 +511,12 @@ export class DiskMirror {
 
 	notifyFileOpened(path: string): void {
 		path = normalizePath(path);
+		if (
+			"acquireEditorBody" in this.vaultSync
+			&& typeof this.vaultSync.acquireEditorBody === "function"
+		) {
+			this.scheduleBodyObserverRetry(path);
+		}
 		this.trace?.("disk", "notifyFileOpened", { path });
 		this.openPaths.add(path);
 		if (this.writeQueue.delete(path)) {
@@ -332,6 +538,10 @@ export class DiskMirror {
 		this.trace?.("disk", "notifyFileClosed", { path });
 		this.openPaths.delete(path);
 		// Flush any pending debounce for this path
+		const bodyRetry = this.bodyObserverRetryTimers.get(path);
+		if (bodyRetry !== undefined) window.clearTimeout(bodyRetry);
+		this.bodyObserverRetryTimers.delete(path);
+		this.bodyObserverRetryAttempts.delete(path);
 		const timer = this.debounceTimers.get(path);
 		if (timer) {
 			window.clearTimeout(timer);
@@ -348,25 +558,56 @@ export class DiskMirror {
 			this.queueImmediateWrite(path, "file-closed");
 		}
 		this.unobserveText(path);
+		if (this.settlement?.settleClosedBody) {
+			void this.settlement.settleClosedBody(path).catch(() => {
+				this.recordPreservedUnresolved(path, "body-settlement-failed");
+			});
+		}
 	}
 
 	private observeText(path: string): void {
-		if (this.textObservers.has(path)) return;
-
 		const ytext = this.vaultSync.getTextForPath(path);
-		if (!ytext) return;
+		const existing = this.textObservers.get(path);
+		if (!ytext) {
+			if (existing) this.unobserveText(path);
+			return;
+		}
+		if (existing?.ytext === ytext) return;
+		if (existing) this.unobserveText(path);
 
 		const handler = (_event: import("yjs").YTextEvent, txn: import("yjs").Transaction) => {
-			if (isLocalOrigin(txn.origin, this.vaultSync.provider)) return;
-			const originLabel = describeOrigin(txn.origin, this.vaultSync.provider);
+			const bodyOrigin = this.vaultSync.getBodyOrigin(path);
+			if (isLocalOrigin(txn.origin, bodyOrigin)) return;
+			const originLabel = describeOrigin(txn.origin, bodyOrigin);
 			this.log(`text observer: remote change to "${path}" (origin=${originLabel})`);
 			this.scheduleWrite(path);
 		};
 
 		ytext.observe(handler);
 		this.textObservers.set(path, { ytext, handler });
+		this.bodyObserverRetryAttempts.delete(path);
 		this.log(`observeText: watching "${path}" (remote-only)`);
 	}
+
+	private scheduleBodyObserverRetry(path: string): void {
+		if (this.textObservers.has(path) || this.bodyObserverRetryTimers.has(path)) return;
+		const attempts = this.bodyObserverRetryAttempts.get(path) ?? 0;
+		if (attempts >= BODY_OBSERVER_RETRY_LIMIT) return;
+		this.bodyObserverRetryAttempts.set(path, attempts + 1);
+		const timer = window.setTimeout(() => {
+			this.bodyObserverRetryTimers.delete(path);
+			if (!this.openPaths.has(path)) return;
+			this.observeText(path);
+			if (!this.textObservers.has(path)) this.scheduleBodyObserverRetry(path);
+		}, BODY_OBSERVER_RETRY_MS);
+		this.bodyObserverRetryTimers.set(path, timer);
+	}
+	/** Reattach after a body load or server replacement changes Y.Text identity. */
+	notifyBodyAvailable(path: string): void {
+		path = normalizePath(path);
+		if (this.openPaths.has(path)) this.observeText(path);
+	}
+
 
 	private unobserveText(path: string): void {
 		const obs = this.textObservers.get(path);
@@ -497,6 +738,166 @@ export class DiskMirror {
 		}
 	}
 
+	private async settleBodyUnlocked(input: {
+		path: string;
+		bodyId: string;
+		generation: number;
+		content: string;
+	}): Promise<"settled" | "preserved-unresolved"> {
+		const { path, bodyId, content } = input;
+		if (this.openPaths.has(path) || this.editorBindings.isBound(path)) {
+			this.recordPreservedUnresolved(path, "body-open-deferred");
+			return "preserved-unresolved";
+		}
+
+		const existing = this.app.vault.getAbstractFileByPath(path);
+		if (existing && !(existing instanceof TFile)) {
+			this.recordPreservedUnresolved(path, "path-collision");
+			return "preserved-unresolved";
+		}
+		if (!(existing instanceof TFile)) {
+			const written = await this.writeSettledBody(path, null, content);
+			if (!written) return "preserved-unresolved";
+			this.clearPreservedUnresolved(path);
+			this.trace?.("disk", "body-settled", {
+				path,
+				bodyId,
+				generation: input.generation,
+				action: "create",
+			});
+			return "settled";
+		}
+
+		let diskContent: string;
+		try {
+			diskContent = await this.app.vault.read(existing);
+		} catch {
+			this.recordPreservedUnresolved(path, "body-settlement-failed");
+			return "preserved-unresolved";
+		}
+		const [diskHash, remoteHash] = await Promise.all([
+			contentBaselineHash(diskContent),
+			contentBaselineHash(content),
+		]);
+		if (diskHash === remoteHash) {
+			this._onDiskWriteCallback?.(path, remoteHash);
+			this.clearPreservedUnresolved(path);
+			return "settled";
+		}
+
+		const baseline = this.settlement?.getBaseline(path) ?? null;
+		const decision = decideClosedFileConflict({
+			baselineHash: baseline?.contentHash ?? null,
+			diskHash,
+			crdtHash: remoteHash,
+			diskMtime: existing.stat.mtime,
+			lastDiskIndexPersistedAt: baseline?.lastDiskIndexPersistedAt,
+		});
+
+		if (decision.kind === "apply-remote-to-disk") {
+			const written = await this.writeSettledBody(path, diskContent, content);
+			if (!written) return "preserved-unresolved";
+			this.clearPreservedUnresolved(path);
+			return "settled";
+		}
+		if (decision.kind === "import-disk-to-crdt") {
+			return this.commitDiskWinner(bodyId, path, diskContent, "external-edit", diskHash);
+		}
+		if (decision.kind === "no-op") {
+			this._onDiskWriteCallback?.(path, remoteHash);
+			this.clearPreservedUnresolved(path);
+			return "settled";
+		}
+
+		const preservedContent = decision.preserveDisk ? diskContent : content;
+		const preservedSource = decision.preserveDisk ? "disk" : "crdt";
+		try {
+			await createMarkdownConflictArtifact(this.app, path, preservedContent, {
+				deviceName: this.getDeviceName(),
+				reason: `closed-file-${decision.reason}`,
+				source: preservedSource,
+				trace: (message: string, details: Record<string, unknown>) =>
+					this.trace?.("conflict", message, details),
+			});
+		} catch {
+			this.recordPreservedUnresolved(path, "conflict-artifact-write-failed");
+			return "preserved-unresolved";
+		}
+
+		if (decision.winner === "disk") {
+			return this.commitDiskWinner(bodyId, path, diskContent, "external-edit", diskHash);
+		}
+		const written = await this.writeSettledBody(path, diskContent, content);
+		if (!written) return "preserved-unresolved";
+		this.clearPreservedUnresolved(path);
+		return "settled";
+	}
+
+	private async commitDiskWinner(
+		bodyId: string,
+		path: string,
+		content: string,
+		reason: "external-edit" | "delete-revive",
+		contentHash: string,
+	): Promise<"settled" | "preserved-unresolved"> {
+		if (!this.settlement) {
+			this.recordPreservedUnresolved(path, "body-settlement-failed");
+			return "preserved-unresolved";
+		}
+		try {
+			await this.settlement.commitLocalBody({ bodyId, path, content, reason });
+			this._onDiskWriteCallback?.(path, contentHash);
+			this.clearPreservedUnresolved(path);
+			return "settled";
+		} catch {
+			this.recordPreservedUnresolved(path, "body-settlement-failed");
+			return "preserved-unresolved";
+		}
+	}
+
+	private async writeSettledBody(
+		path: string,
+		previousContent: string | null,
+		content: string,
+	): Promise<boolean> {
+		if (this.shouldBlockFrontmatterWrite(path, previousContent, content)) {
+			this.recordPreservedUnresolved(path, "body-settlement-failed");
+			return false;
+		}
+		try {
+			const existing = this.app.vault.getAbstractFileByPath(path);
+			await this.suppressWrite(path, content, existing instanceof TFile ? 1 : 2);
+			if (existing instanceof TFile) {
+				await this.app.vault.modify(existing, content);
+			} else {
+				await this.ensureParentFolder(path);
+				await this.app.vault.create(path, content);
+			}
+			this.lastDiskWriteOkAt.set(path, Date.now());
+			this._onDiskWriteCallback?.(path, await contentBaselineHash(content));
+			return true;
+		} catch {
+			this.recordPreservedUnresolved(path, "body-settlement-failed");
+			return false;
+		}
+	}
+
+	private async ensureParentFolder(path: string): Promise<void> {
+		const slash = path.lastIndexOf("/");
+		if (slash < 0) return;
+		const parts = path.slice(0, slash).split("/");
+		let current = "";
+		for (const part of parts) {
+			current = current ? `${current}/${part}` : part;
+			const existing = this.app.vault.getAbstractFileByPath(current);
+			if (!existing) {
+				await this.app.vault.createFolder(current);
+			} else if (existing instanceof TFile) {
+				throw new Error(`Cannot create sync folder over file: ${current}`);
+			}
+		}
+	}
+
 	// -------------------------------------------------------------------
 	// Disk write
 	// -------------------------------------------------------------------
@@ -544,7 +945,7 @@ export class DiskMirror {
 					return;
 				}
 
-				await this.suppressWrite(path, content);
+				await this.suppressWrite(path, content, 1);
 				await this.app.vault.modify(existing, content);
 				this.log(`flushWrite: updated "${path}" (${content.length} chars)`);
 				this.lastDiskWriteOkAt.set(normalized, Date.now());
@@ -563,7 +964,7 @@ export class DiskMirror {
 				if (this.shouldBlockFrontmatterWrite(path, null, content)) {
 					return;
 				}
-				await this.suppressWrite(path, content);
+				await this.suppressWrite(path, content, 2);
 				const dir = normalized.substring(0, normalized.lastIndexOf("/"));
 				if (dir) {
 					const dirExists =
@@ -629,309 +1030,7 @@ export class DiskMirror {
 		return true;
 	}
 
-	private async handleRemoteDelete(
-		path: string,
-		options: { baselineText?: string | null } = {},
-	): Promise<void> {
-		const normalized = normalizePath(path);
-		const wasOpen = this.openPaths.has(normalized);
-		const wasObserved = this.textObservers.has(normalized);
-		const wasSuppressed = this.isSuppressed(normalized);
-		this.trace?.("disk", "remote-delete", {
-			path,
-			normalizedPath: normalized,
-			wasOpen,
-			wasObserved,
-			wasSuppressed,
-			hasBaselineText: options.baselineText !== undefined && options.baselineText !== null,
-		});
-		// Flight: remote delete observed — emit before we know the outcome
-		this._flightEventHandler?.({
-			priority: "critical",
-			kind: "delete.remote.observed",
-			severity: "info",
-			scope: "file",
-			source: "diskMirror",
-			layer: "disk",
-			path: normalized,
-			data: { wasOpen, hasBaselineText: options.baselineText !== null && options.baselineText !== undefined },
-		});
-		const file = this.app.vault.getAbstractFileByPath(normalized);
-		if (file instanceof TFile) {
-				try {
-					// Remote delete decision: determine whether to delete, preserve+revive,
-					// or preserve without reviving. Three-way decision avoids conflating
-					// "known dirty" with "unknown baseline".
-					const ytext = this.vaultSync.getTextForPath(normalized);
-					const lastKnownContent =
-						options.baselineText !== undefined
-							? options.baselineText
-							: yTextToString(ytext);
 
-					let decision: RemoteDeleteDecision = { kind: "apply-delete" };
-
-					let unresolvedReason: PreservedUnresolvedReason | null = null;
-
-					if (lastKnownContent !== null) {
-						try {
-							const diskContent = await this.app.vault.read(file);
-							if (diskContent !== lastKnownContent) {
-								// Known baseline exists, local file differs → known dirty.
-								// Preserve and revive: local dirty work wins over remote delete.
-								decision = { kind: "preserve-revive", diskContent };
-								this.trace?.("disk", "remote-delete-conflict-preserved", {
-									path,
-									normalizedPath: normalized,
-									reason: "local-file-modified-since-last-sync",
-									diskLength: diskContent.length,
-									crdtLength: lastKnownContent.length,
-								});
-								this.log(
-									`handleRemoteDelete: preserved locally modified "${path}" ` +
-									`(disk ${diskContent.length} chars !== CRDT ${lastKnownContent.length} chars)`,
-								);
-							}
-							// else: disk matches CRDT → clean → apply-delete stays
-						} catch {
-							// Read failed — file might be locked, busy, or inaccessible.
-							// We have a baseline but cannot verify local state. Treat as
-							// unresolved to avoid deleting potentially modified data.
-							decision = { kind: "preserve-unresolved" };
-							unresolvedReason = "remote-delete-read-failed";
-							this.trace?.("disk", "remote-delete-conflict-preserved", {
-								path,
-								normalizedPath: normalized,
-								reason: "read-failed-cannot-verify",
-							});
-							this.log(
-								`handleRemoteDelete: preserved "${path}" (read failed — cannot verify local state)`,
-							);
-						}
-					} else {
-						// No CRDT baseline available — cannot verify local file is
-						// unmodified. Preserve the file to avoid data loss, but DO NOT
-						// auto-revive the tombstone. This prevents phantom resurrection
-						// of legitimately deleted files when CRDT state is transiently
-						// unavailable (startup, hydration, race).
-						decision = { kind: "preserve-unresolved" };
-						unresolvedReason = "remote-delete-missing-baseline";
-						this.trace?.("disk", "remote-delete-conflict-preserved", {
-							path,
-							normalizedPath: normalized,
-							reason: "no-crdt-baseline-available",
-						});
-						this.log(
-							`handleRemoteDelete: preserved "${path}" (no CRDT baseline to compare — unresolved)`,
-						);
-					}
-
-					if (decision.kind === "apply-delete") {
-						this.unobserveText(normalized);
-						this.openPaths.delete(normalized);
-						this.pendingOpenWrites.delete(normalized);
-						this.writeQueue.delete(normalized);
-						this.forcedWritePaths.delete(normalized);
-						const pending = this.debounceTimers.get(normalized);
-						if (pending) {
-							window.clearTimeout(pending);
-							this.debounceTimers.delete(normalized);
-						}
-						const openPending = this.openWriteTimers.get(normalized);
-						if (openPending) {
-							window.clearTimeout(openPending);
-							this.openWriteTimers.delete(normalized);
-						}
-						// Unbind editor before suppressed delete so the vault `delete` event
-						// (which skips unbind due to suppression) doesn't leave a stale binding.
-						this.editorBindings.unbindByPath(normalized);
-						// If this path was previously preserved-unresolved but now
-						// we have a baseline proving it's clean, clear the marker.
-						if (this.preservedUnresolved.resolve(normalized)) {
-							this.onPreservedUnresolvedChanged?.();
-						}
-						this.suppressDelete(path);
-					const deleteMode = await this.deleteLocalReplica(file);
-					this.trace?.("disk", "remote-delete-applied", {
-						path,
-						deleteMode,
-						reason: "remote-delete",
-					});
-					this.log(`handleRemoteDelete: deleted "${path}" from disk`);
-					this._flightEventHandler?.({
-						priority: "critical",
-						kind: "delete.disk.applied",
-						severity: "info",
-						scope: "file",
-						source: "diskMirror",
-						layer: "disk",
-						path: normalized,
-						data: { deleteMode, reason: "tombstone-applied" },
-					});
-					} else if (decision.kind === "preserve-revive") {
-						// Clear any prior unresolved marker — we now have a baseline.
-						if (this.preservedUnresolved.resolve(normalized)) {
-							this.onPreservedUnresolvedChanged?.();
-						}
-						this._flightEventHandler?.({
-							priority: "critical",
-							kind: "delete.preserved",
-							severity: "warn",
-							scope: "file",
-							source: "diskMirror",
-							layer: "disk",
-							path: normalized,
-							data: { reason: "local-dirty-wins-over-remote-delete", preserveKind: "preserve-revive" },
-						});
-						// Known dirty: local file intentionally differs from baseline.
-						// Revive tombstone so the file re-enters sync. This is the
-						// explicit policy: local dirty work wins over remote delete.
-						try {
-							this.vaultSync.ensureFile(
-								normalized,
-								decision.diskContent,
-								this.getDeviceName(),
-								{
-									reviveTombstone: true,
-									reviveReason: "remote-delete-local-dirty-preserved",
-								},
-							);
-							this.trace?.("disk", "remote-delete-preserved-revived", {
-								path,
-								normalizedPath: normalized,
-								reason: "remote-delete-local-dirty-preserved",
-								contentLength: decision.diskContent.length,
-							});
-							this.log(
-								`handleRemoteDelete: revived tombstone for "${path}" after dirty preservation`,
-							);
-						} catch (reviveErr) {
-							// Best-effort: if revive fails, file is still on disk,
-							// tombstone remains, importUntrackedFiles can pick it up.
-							this.trace?.("disk", "remote-delete-preserved-revive-failed", {
-								path,
-								normalizedPath: normalized,
-								error: reviveErr instanceof Error ? reviveErr.message : String(reviveErr),
-							});
-						}
-					}
-				// kind === "preserve-unresolved": file stays on disk, tombstone
-				// remains in CRDT. The file is NOT auto-revived by later
-				// reconcile/import passes; explicit user action or a future
-				// remote event is required to resolve the limbo state.
-				if (decision.kind === "preserve-unresolved") {
-					this._flightEventHandler?.({
-						priority: "critical",
-						kind: "delete.preserved",
-						severity: "warn",
-						scope: "file",
-						source: "diskMirror",
-						layer: "disk",
-						path: normalized,
-						data: {
-							reason: unresolvedReason ?? "preserve-unresolved",
-							preserveKind: "preserve-unresolved",
-						},
-					});
-						this.unobserveText(normalized);
-						this.openPaths.delete(normalized);
-						this.pendingOpenWrites.delete(normalized);
-						this.writeQueue.delete(normalized);
-						this.forcedWritePaths.delete(normalized);
-						const pending = this.debounceTimers.get(normalized);
-						if (pending) {
-							window.clearTimeout(pending);
-							this.debounceTimers.delete(normalized);
-						}
-						const openPending = this.openWriteTimers.get(normalized);
-						if (openPending) {
-							window.clearTimeout(openPending);
-							this.openWriteTimers.delete(normalized);
-						}
-						this.editorBindings.unbindByPath(normalized);
-						this.preservedUnresolved.record({
-							path: normalized,
-							kind: "markdown",
-							reason: unresolvedReason ?? "unknown",
-						});
-						this.onPreservedUnresolvedChanged?.();
-					}
-			} catch (err) {
-				console.error(
-					`[yaos] handleRemoteDelete failed for "${path}":`,
-					err,
-				);
-			}
-		}
-	}
-
-	private async handleRemoteRename(oldPath: string, newPath: string): Promise<void> {
-		const oldNormalized = normalizePath(oldPath);
-		const newNormalized = normalizePath(newPath);
-		if (oldNormalized === newNormalized) return;
-
-		const wasOpen = this.openPaths.delete(oldNormalized);
-		if (wasOpen) {
-			this.openPaths.add(newNormalized);
-		}
-		this.pendingOpenWrites.delete(oldNormalized);
-
-		const oldDebounce = this.debounceTimers.get(oldNormalized);
-		if (oldDebounce) {
-			window.clearTimeout(oldDebounce);
-			this.debounceTimers.delete(oldNormalized);
-		}
-		const oldOpenDebounce = this.openWriteTimers.get(oldNormalized);
-		if (oldOpenDebounce) {
-			window.clearTimeout(oldOpenDebounce);
-			this.openWriteTimers.delete(oldNormalized);
-		}
-
-		this.writeQueue.delete(oldNormalized);
-		this.forcedWritePaths.delete(oldNormalized);
-		this.unobserveText(oldNormalized);
-
-		this.editorBindings.updatePathsAfterRename(new Map([[oldNormalized, newNormalized]]));
-
-		const oldFile = this.app.vault.getAbstractFileByPath(oldNormalized);
-		if (oldFile instanceof TFile) {
-			try {
-				const target = this.app.vault.getAbstractFileByPath(newNormalized);
-				if (target instanceof TFile) {
-					this.suppressDelete(oldNormalized);
-					await this.deleteLocalReplica(oldFile);
-				} else {
-					const dir = newNormalized.substring(0, newNormalized.lastIndexOf("/"));
-					if (dir) {
-						const dirNode = this.app.vault.getAbstractFileByPath(normalizePath(dir));
-						if (!dirNode) {
-							await this.app.vault.createFolder(dir);
-						}
-					}
-					// Mark this rename as remote-originated before the vault event fires,
-					// so main.ts can consume the marker and skip queueRename.
-					// consumeRemoteRename() in the vault handler removes the marker on use.
-					// On error (rename throws), the vault event won't fire, so clean up here.
-					this._pendingRemoteRenameNewPaths.add(newNormalized);
-					try {
-						await this.app.fileManager.renameFile(oldFile, newNormalized);
-					} catch (renameErr) {
-						this._pendingRemoteRenameNewPaths.delete(newNormalized);
-						throw renameErr;
-					}
-				}
-				this.log(`handleRemoteRename: "${oldNormalized}" -> "${newNormalized}"`);
-			} catch (err) {
-				console.error(`[yaos] handleRemoteRename failed for "${oldNormalized}" -> "${newNormalized}":`, err);
-			}
-		}
-
-		if (wasOpen) {
-			this.observeText(newNormalized);
-			this.scheduleOpenWrite(newNormalized);
-		} else {
-			this.scheduleWrite(newNormalized);
-		}
-	}
 
 	private async deleteLocalReplica(file: TFile): Promise<"trash"> {
 		await this.app.fileManager.trashFile(file);
@@ -968,10 +1067,11 @@ export class DiskMirror {
 	consumeDeleteSuppression(path: string): boolean {
 		path = normalizePath(path);
 		const entry = this.getActiveSuppression(path);
-		if (!entry) return false;
-
-		this.suppressedPaths.delete(path);
-		return entry.kind === "delete";
+		if (!entry || entry.kind !== "delete") return false;
+		const remaining = Math.max(0, (entry.remainingAcks ?? 1) - 1);
+		if (remaining === 0) this.suppressedPaths.delete(path);
+		else entry.remainingAcks = remaining;
+		return true;
 	}
 
 	/**
@@ -1169,10 +1269,6 @@ export class DiskMirror {
 			void this.flushWrite(path, true);
 		}
 
-		for (const cleanup of this.mapObserverCleanups) {
-			cleanup();
-		}
-		this.mapObserverCleanups = [];
 
 		for (const [, obs] of this.textObservers) {
 			obs.ytext.unobserve(obs.handler);
@@ -1187,6 +1283,11 @@ export class DiskMirror {
 			window.clearTimeout(timer);
 		}
 		this.openWriteTimers.clear();
+		for (const timer of this.bodyObserverRetryTimers.values()) {
+			window.clearTimeout(timer);
+		}
+		this.bodyObserverRetryTimers.clear();
+		this.bodyObserverRetryAttempts.clear();
 
 		this.writeQueue.clear();
 		this.pendingOpenWrites.clear();
@@ -1253,22 +1354,24 @@ export class DiskMirror {
 		return null;
 	}
 
-	private async suppressWrite(path: string, content: string): Promise<void> {
-		// Record the exact content we wrote so vault modify/create events can
-		// acknowledge our own write by observed state, not just timing.
+	private async suppressWrite(path: string, content: string, remainingAcks = 1): Promise<void> {
+		// Record the exact content before mutation so create/modify event order is
+		// irrelevant and each matching Obsidian event consumes one acknowledgement.
 		const fingerprint = await this.fingerprintContent(content);
 		this.suppressedPaths.set(normalizePath(path), {
 			kind: "write",
 			expiresAt: Date.now() + SUPPRESS_MS,
 			expectedBytes: fingerprint.bytes,
 			expectedHash: fingerprint.hash,
+			remainingAcks,
 		});
 	}
 
-	private suppressDelete(path: string): void {
+	private suppressDelete(path: string, remainingAcks = 1): void {
 		this.suppressedPaths.set(normalizePath(path), {
 			kind: "delete",
 			expiresAt: Date.now() + SUPPRESS_MS,
+			remainingAcks,
 		});
 	}
 
@@ -1303,41 +1406,6 @@ export class DiskMirror {
 			return false;
 		}
 
-		if (
-			typeof file.stat?.size === "number"
-			&& typeof entry.expectedBytes === "number"
-			&& file.stat.size !== entry.expectedBytes
-		) {
-			this.suppressedPaths.delete(path);
-			this.log(
-				`suppression: "${path}" ${event} size mismatch ` +
-				`(expected=${entry.expectedBytes}, observed=${file.stat.size})`,
-			);
-			this.trace?.("disk", "suppression-mismatch", {
-				path,
-				event,
-				expectedKind: entry.kind,
-				expectedBytes: entry.expectedBytes,
-				observedBytes: file.stat.size,
-				reason: "size-mismatch",
-			});
-			this._flightEventHandler?.({
-				priority: "critical",
-				kind: "disk.event.not_suppressed",
-				severity: "warn",
-				scope: "file",
-				source: "diskMirror",
-				layer: "disk",
-				path,
-				data: {
-					event,
-					reason: "size-mismatch",
-					expectedBytes: entry.expectedBytes,
-					observedBytes: file.stat.size,
-				},
-			});
-			return false;
-		}
 
 		try {
 			// Read back the file only when a suppression candidate exists. This
@@ -1348,14 +1416,17 @@ export class DiskMirror {
 				fingerprint.bytes === entry.expectedBytes
 				&& fingerprint.hash === entry.expectedHash
 			) {
-				this.suppressedPaths.delete(path);
-				this.log(`suppression: acknowledged "${path}" ${event}`);
+				const remaining = Math.max(0, (entry.remainingAcks ?? 1) - 1);
+				if (remaining === 0) this.suppressedPaths.delete(path);
+				else entry.remainingAcks = remaining;
+				this.log(`suppression: acknowledged "${path}" ${event} (${remaining} remaining)`);
 				this.trace?.("disk", "suppression-acknowledged", {
 					path,
 					event,
 					kind: entry.kind,
 					expectedBytes: entry.expectedBytes,
 					expectedHashPrefix: hashPrefix(entry.expectedHash),
+					remainingAcks: remaining,
 				});
 				return true;
 			}
@@ -1400,25 +1471,28 @@ export class DiskMirror {
 
 	private async fingerprintContent(content: string): Promise<{ bytes: number; hash: string }> {
 		const bytes = new TextEncoder().encode(content);
-		const hash = await sha256BytesHex(bytes);
+		const digest = await crypto.subtle.digest("SHA-256", bytes);
 		return {
 			bytes: bytes.length,
-			hash,
+			hash: arrayBufferToHex(digest),
 		};
 	}
 
-	private runPathWriteLocked(path: string, work: () => Promise<void>): Promise<void> {
+	private runPathWriteLocked<T>(path: string, work: () => Promise<T>): Promise<T> {
 		// All flush paths funnel through one per-path promise chain so direct
 		// flushes cannot overlap with queued writes for the same file.
 		const previous = this.pathWriteLocks.get(path) ?? Promise.resolve();
 		const next = previous.catch(() => undefined).then(work);
 		let tracked: Promise<void>;
-		tracked = next.finally(() => {
+		tracked = next.then(
+			() => undefined,
+			() => undefined,
+		).finally(() => {
 			if (this.pathWriteLocks.get(path) === tracked) {
 				this.pathWriteLocks.delete(path);
 			}
 		});
 		this.pathWriteLocks.set(path, tracked);
-		return tracked;
+		return next;
 	}
 }

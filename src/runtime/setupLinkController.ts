@@ -8,6 +8,7 @@ export interface EnrollmentMembership {
 	deviceToken: string;
 	vaultId: string;
 	deviceId: string;
+	vaultGeneration: string;
 }
 
 export interface SetupLinkControllerDeps {
@@ -33,6 +34,8 @@ interface EnrollmentResponse {
 	deviceId?: unknown;
 	deviceToken?: unknown;
 	deviceName?: unknown;
+	vaultGeneration?: unknown;
+	originImport?: unknown;
 	error?: unknown;
 	message?: unknown;
 }
@@ -65,6 +68,7 @@ export class SetupLinkController {
 			deviceToken: currentSettings.deviceToken.trim(),
 			vaultId: currentSettings.vaultId.trim(),
 			deviceId: currentSettings.deviceId.trim(),
+			vaultGeneration: currentSettings.vaultGeneration.trim(),
 		};
 		const currentVaultId = previousEnrollment.vaultId;
 		const hasExistingEnrollment = [
@@ -125,7 +129,9 @@ export class SetupLinkController {
 			typeof enrolled.vaultId !== "string" || !enrolled.vaultId.trim() ||
 			typeof enrolled.deviceId !== "string" || !enrolled.deviceId.trim() ||
 			typeof enrolled.deviceToken !== "string" || !enrolled.deviceToken.trim() ||
-			typeof enrolled.deviceName !== "string" || !enrolled.deviceName.trim()
+			typeof enrolled.deviceName !== "string" || !enrolled.deviceName.trim() ||
+			typeof enrolled.vaultGeneration !== "string" || !enrolled.vaultGeneration.trim() ||
+			typeof enrolled.originImport !== "boolean"
 		) {
 			new Notice("Server did not return complete enrollment credentials.", 8000);
 			return false;
@@ -141,12 +147,14 @@ export class SetupLinkController {
 			deviceToken: enrolled.deviceToken,
 			vaultId: enrolled.vaultId,
 			deviceId: enrolled.deviceId,
+			vaultGeneration: enrolled.vaultGeneration,
 		};
 		const enrollmentChanged = hasExistingEnrollment && (
 			previousEnrollment.host !== nextEnrollment.host ||
 			previousEnrollment.deviceToken !== nextEnrollment.deviceToken ||
 			previousEnrollment.vaultId !== nextEnrollment.vaultId ||
-			previousEnrollment.deviceId !== nextEnrollment.deviceId
+			previousEnrollment.deviceId !== nextEnrollment.deviceId ||
+			previousEnrollment.vaultGeneration !== nextEnrollment.vaultGeneration
 		);
 		if (enrollmentChanged) {
 			try {
@@ -162,6 +170,8 @@ export class SetupLinkController {
 			settings.deviceToken = nextEnrollment.deviceToken;
 			settings.vaultId = nextEnrollment.vaultId;
 			settings.deviceId = nextEnrollment.deviceId;
+			settings.vaultGeneration = nextEnrollment.vaultGeneration;
+			settings.originImportPending = enrolled.originImport === true;
 			settings.deviceName = enrolledName;
 		}, "setup-enroll");
 		await this.deps.refreshServerCapabilities("setup-enroll");

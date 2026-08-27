@@ -1,285 +1,481 @@
-import { App, Notice, TFile, normalizePath } from "obsidian";
-import { BlobSyncManager } from "../sync/blobSync";
-import { DiskMirror } from "../sync/diskMirror";
-import {
-	diffSnapshot,
-	downloadSnapshot,
-	listSnapshots as fetchSnapshotList,
-	requestDailySnapshot,
-	requestSnapshotNow,
-	requestPrune,
-	restoreFromSnapshot,
-	normalizeSnapshotUnchanged,
-	type SnapshotIndex,
-} from "../sync/snapshotClient";
-import { VaultSync } from "../sync/vaultSync";
+import { App, Notice } from "obsidian";
 import type { VaultSyncSettings } from "../settings";
 import type { TraceHttpContext } from "../observability/traceContext";
+import { PRODUCT_EVENT_KIND } from "../observability/productEventKinds";
+import type { ProductFlightEventInput } from "../observability/traceSink";
+import type { AttachmentCatalogPort, BlobSyncManager } from "../sync/blobSync";
+import type { VaultSync } from "../sync/vaultSync";
+import { ConfirmModal } from "../ui/ConfirmModal";
 import { formatUnknown } from "../utils/format";
-import { ensureAdapterDirectory } from "../utils/adapterDirectory";
-import { SnapshotDiffModal, SnapshotListModal } from "./snapshotModals";
+import { RecoveryBackupHook } from "./recoveryBackup";
+import {
+	RecoveryClient,
+	RecoveryTerminalItemError,
+	type RecoveryLiveFile,
+	type RecoveryRuntimePort,
+	type RecoverySnapshotSummary,
+	type RestoreItem,
+	type RestoreItemResult,
+	type RestoreSelection,
+	isRecoveryTerminal,
+} from "./recoveryClient";
+import {
+	RecoveryBrowseModal,
+	RecoveryCaptureStatusModal,
+	RecoverySnapshotListModal,
+} from "./recoveryModals";
+import type { PendingRecoveryState } from "./recoveryState";
 
 interface SnapshotServiceDeps {
 	app: App;
 	getSettings(): VaultSyncSettings;
 	getTraceHttpContext(): TraceHttpContext | undefined;
 	getVaultSync(): VaultSync | null;
-	getDiskMirror(): DiskMirror | null;
+	getRecoveryRuntime(): RecoveryRuntimePort | null;
+	getAttachmentCatalog(): AttachmentCatalogPort | null;
 	getBlobSync(): BlobSyncManager | null;
+	getPendingRecoveryState(): PendingRecoveryState;
+	persistPendingRecoveryState(state: PendingRecoveryState): Promise<void>;
 	getServerSupportsSnapshots(): boolean;
 	log(message: string): void;
 	onEditorsNeedReconcile(reason: string): void;
+	recordFlightEvent?(event: ProductFlightEventInput): void;
 }
 
+const STATUS_POLL_MS = 5_000;
+const RESTORE_PAGE_SIZE = 50;
+
 export class SnapshotService {
+	private monitorTimer: number | null = null;
+	private monitoring = false;
+	private captureStatusModal: RecoveryCaptureStatusModal | null = null;
+	private snapshotListModal: RecoverySnapshotListModal | null = null;
+	private browseModal: RecoveryBrowseModal | null = null;
+
 	constructor(private readonly deps: SnapshotServiceDeps) {}
 
-	/**
-	 * Request the daily snapshot from the server.
-	 * Silent noop if R2 isn't configured or snapshot already taken today.
-	 */
-	async triggerDailySnapshot(): Promise<void> {
-		if (!this.deps.getServerSupportsSnapshots()) {
-			return;
-		}
+	resumePersistedOperations(): void {
+		const pending = this.deps.getPendingRecoveryState();
+		if (pending.activeCaptureId || pending.activeRestore) this.scheduleMonitor(0);
+	}
 
-		const settings = this.deps.getSettings();
+	destroy(): void {
+		if (this.monitorTimer !== null) window.clearTimeout(this.monitorTimer);
+		this.monitorTimer = null;
+		this.captureStatusModal?.close();
+		this.captureStatusModal = null;
+		this.snapshotListModal?.close();
+		this.snapshotListModal = null;
+		this.browseModal?.close();
+		this.browseModal = null;
+	}
+
+	getDiagnostics(): PendingRecoveryState {
+		return this.deps.getPendingRecoveryState();
+	}
+
+	async triggerDailySnapshot(): Promise<void> {
+		if (!this.deps.getServerSupportsSnapshots() || !this.deps.getVaultSync()?.connected) return;
+		const pending = this.deps.getPendingRecoveryState();
+		if (pending.activeCaptureId) return;
 		try {
-			const result = await requestDailySnapshot(
-				settings,
-				settings.deviceName,
-				this.deps.getTraceHttpContext(),
-			);
-			if (result.status === "created") {
-				this.deps.log(`Daily snapshot created: ${result.snapshotId}`);
-			} else if (result.status === "noop") {
-				this.deps.log("Daily snapshot: already taken today");
-			} else {
-				this.deps.log(`Daily snapshot: ${result.reason ?? "unavailable"}`);
-			}
-		} catch (err) {
-			// Don't spam the user; snapshot failure is non-critical.
-			console.warn("[yaos] Daily snapshot failed:", err);
+			const started = await this.client().startCapture("daily", crypto.randomUUID());
+			await this.persist({ activeCaptureId: started.captureId, lastCaptureStatus: null });
+			this.deps.log(`Daily recovery capture queued at sequence ${started.boundarySequence}: ${started.captureId}`);
+			this.scheduleMonitor(0);
+		} catch (error) {
+			this.deps.log(`Daily recovery capture admission failed: ${formatUnknown(error)}`);
 		}
 	}
 
 	async takeSnapshotNow(): Promise<void> {
-		const vaultSync = this.deps.getVaultSync();
-		if (!vaultSync) {
-			new Notice("Sync not initialized");
+		if (!this.canUseRecovery("capture a recovery point")) return;
+		const pending = this.deps.getPendingRecoveryState();
+		if (pending.activeCaptureId) {
+			new Notice("A recovery capture is already active. Opening its status.");
+			await this.showRecoveryStatus();
 			return;
 		}
-		if (!this.deps.getServerSupportsSnapshots()) {
-			new Notice("Snapshots are unavailable until object storage is configured on the server.");
-			return;
-		}
-		if (!vaultSync.connected) {
-			new Notice("Not connected to server — cannot create snapshot.");
-			return;
-		}
-
-		const settings = this.deps.getSettings();
-		new Notice("Creating snapshot...");
+		this.recordRecoveryEvent(PRODUCT_EVENT_KIND.recoveryCaptureStart, "info", { reason: "manual" });
 		try {
-			const result = await requestSnapshotNow(
-				settings,
-				settings.deviceName,
-				this.deps.getTraceHttpContext(),
-			);
-			if (result.status === "created" && result.index) {
-				// Handle both new and old server response field names
-				const identical = normalizeSnapshotUnchanged(result);
-				const unchangedNote = identical
-					? " (note: identical to latest snapshot)"
-					: "";
-				new Notice(
-					`Snapshot created: ${result.index.markdownFileCount} notes, ` +
-					`${result.index.blobFileCount} attachments ` +
-					`(${Math.round(result.index.crdtSizeBytes / 1024)} KB)${unchangedNote}`,
-				);
-			} else if (result.status === "unavailable") {
-				new Notice(`Snapshot unavailable: ${result.reason ?? "R2 not configured"}`);
-			} else {
-				new Notice("Snapshot created.");
-			}
-		} catch (err) {
-			console.error("[yaos] Snapshot failed:", err);
-			new Notice(`Snapshot failed: ${formatUnknown(err)}`);
+			const started = await this.client().startCapture("manual");
+			await this.persist({ activeCaptureId: started.captureId, lastCaptureStatus: null });
+			new Notice("Recovery capture queued. It will continue if Obsidian closes.", 7000);
+			this.scheduleMonitor(0);
+		} catch (error) {
+			this.recordRecoveryEvent(PRODUCT_EVENT_KIND.recoveryCaptureComplete, "error", { reason: "manual", error: formatUnknown(error) });
+			new Notice(`Recovery capture could not start: ${formatUnknown(error)}`, 8000);
 		}
 	}
 
-	/**
-	 * Show a list of available snapshots and let the user pick one to diff/restore.
-	 */
-	async showSnapshotList(): Promise<void> {
-		const vaultSync = this.deps.getVaultSync();
-		if (!vaultSync) {
-			new Notice("Sync not initialized");
-			return;
-		}
-		if (!this.deps.getServerSupportsSnapshots()) {
-			new Notice("Snapshots are unavailable until object storage is configured on the server.");
-			return;
-		}
-		if (!vaultSync.connected) {
-			new Notice("Not connected to server — cannot browse snapshots.");
-			return;
-		}
-
-		new Notice("Loading snapshots...");
-
+	async showRecoveryStatus(): Promise<void> {
 		try {
-			const snapshots = await fetchSnapshotList(
-				this.deps.getSettings(),
-				this.deps.getTraceHttpContext(),
+			const recovery = await this.client().getRecoveryStatus();
+			await this.persist({ lastRecoveryStatus: recovery });
+			this.captureStatusModal?.close();
+			this.captureStatusModal = new RecoveryCaptureStatusModal(
+				this.deps.app,
+				recovery,
+				recovery.activeCapture ?? this.deps.getPendingRecoveryState().lastCaptureStatus,
+				() => this.cancelActiveCapture(),
+				() => this.cancelActiveRestore(),
+				() => this.refreshRecoveryStatusModal(),
 			);
+			this.captureStatusModal.open();
+		} catch (error) {
+			new Notice(`Could not load recovery status: ${formatUnknown(error)}`, 8000);
+		}
+	}
 
+	async showSnapshotList(): Promise<void> {
+		if (!this.hasRecoveryService("browse recovery points")) return;
+		new Notice("Loading recovery points…");
+		try {
+			const snapshots: RecoverySnapshotSummary[] = [];
+			let cursor: string | null = null;
+			do {
+				const page = await this.client().listSnapshots(cursor, 100);
+				snapshots.push(...page.snapshots);
+				cursor = page.nextCursor;
+			} while (cursor && snapshots.length < 1_000);
 			if (snapshots.length === 0) {
-				new Notice("No snapshots found. Take a snapshot first.");
+				new Notice("No recovery points exist yet.");
 				return;
 			}
-
-			new SnapshotListModal(this.deps.app, snapshots, async (selected) => {
-				await this.showSnapshotDiff(selected);
-			}).open();
-		} catch (err) {
-			console.error("[yaos] Failed to list snapshots:", err);
-			new Notice(`Failed to list snapshots: ${formatUnknown(err)}`);
-		}
-	}
-
-	/**
-	 * Run server-side retention pruning. Exposed as a user command.
-	 */
-	async pruneSnapshots(): Promise<void> {
-		if (!this.deps.getServerSupportsSnapshots()) {
-			new Notice("Snapshots are unavailable until object storage is configured on the server.");
-			return;
-		}
-		const vaultSync = this.deps.getVaultSync();
-		if (!vaultSync?.connected) {
-			new Notice("Not connected to server.");
-			return;
-		}
-
-		new Notice("Running snapshot cleanup...");
-		try {
-			const result = await requestPrune(
-				this.deps.getSettings(),
-				this.deps.getTraceHttpContext(),
-			);
-			if (result.pruned === 0) {
-				new Notice("No snapshots to prune — retention policy already satisfied.");
-			} else {
-				new Notice(
-					`Cleanup complete: ${result.pruned} old snapshot(s) removed, ${result.kept} retained.` +
-					(result.failed > 0 ? ` (${result.failed} failed)` : ""),
-				);
-			}
-			this.deps.log(`Snapshot prune: kept=${result.kept} pruned=${result.pruned} failed=${result.failed}`);
-		} catch (err) {
-			console.error("[yaos] Snapshot prune failed:", err);
-			new Notice(`Snapshot cleanup failed: ${formatUnknown(err)}`);
-		}
-	}
-
-	/**
-	 * Download a snapshot, compute diff against current CRDT, and show the restore UI.
-	 */
-	private async showSnapshotDiff(snapshot: SnapshotIndex): Promise<void> {
-		const vaultSync = this.deps.getVaultSync();
-		if (!vaultSync) return;
-
-		new Notice("Downloading snapshot...");
-
-		try {
-			const snapshotDoc = await downloadSnapshot(
-				this.deps.getSettings(),
-				snapshot,
-				this.deps.getTraceHttpContext(),
-			);
-			const diff = diffSnapshot(snapshotDoc, vaultSync.ydoc);
-
-			let destroyed = false;
-			const cleanup = () => {
-				if (!destroyed) {
-					destroyed = true;
-					snapshotDoc.destroy();
-				}
-			};
-
-			new SnapshotDiffModal(
+			this.snapshotListModal?.close();
+			this.snapshotListModal = new RecoverySnapshotListModal(
 				this.deps.app,
-				snapshot,
-				diff,
-				async (markdownPaths, blobPaths) => {
-					const liveVaultSync = this.deps.getVaultSync();
-					if (!liveVaultSync) return;
-
-					const backupDir = normalizePath(
-						`${this.deps.app.vault.configDir}/plugins/yaos/restore-backups/${new Date().toISOString().replace(/[:.]/g, "-")}`,
-					);
-					let backedUp = 0;
-					for (const path of markdownPaths) {
-						try {
-							const file = this.deps.app.vault.getAbstractFileByPath(path);
-							if (file instanceof TFile) {
-								const content = await this.deps.app.vault.read(file);
-								const backupPath = `${backupDir}/${path}`;
-								const parentDir = backupPath.substring(0, backupPath.lastIndexOf("/"));
-								if (parentDir) {
-									await ensureAdapterDirectory(this.deps.app.vault.adapter, parentDir);
-								}
-								await this.deps.app.vault.create(backupPath, content);
-								backedUp++;
-							}
-						} catch (err) {
-							// Non-fatal: file might not exist on disk (undelete case).
-							this.deps.log(`Backup skipped for "${path}": ${formatUnknown(err)}`);
-						}
-					}
-					if (backedUp > 0) {
-						this.deps.log(`Pre-restore backup: ${backedUp} files saved to ${backupDir}`);
-					}
-
-					const result = restoreFromSnapshot(snapshotDoc, liveVaultSync.ydoc, {
-						markdownPaths,
-						blobPaths,
-						device: this.deps.getSettings().deviceName,
-					});
-
-					for (const path of markdownPaths) {
-						await this.deps.getDiskMirror()?.flushWrite(path, true);
-					}
-
-					if (blobPaths.length > 0) {
-						const queued = this.deps.getBlobSync()?.prioritizeDownloads(blobPaths) ?? 0;
-						if (queued > 0) {
-							this.deps.log(`Restore: queued ${queued} blob downloads`);
-						}
-					}
-
-					this.deps.onEditorsNeedReconcile("snapshot-restore");
-
-					const parts: string[] = [];
-					if (result.markdownRestored > 0) parts.push(`${result.markdownRestored} files restored`);
-					if (result.markdownUndeleted > 0) parts.push(`${result.markdownUndeleted} files undeleted`);
-					if (result.blobsRestored > 0) parts.push(`${result.blobsRestored} attachments restored`);
-					if (backedUp > 0) parts.push(`backup in ${backupDir}`);
-
-					const msg = parts.length > 0
-						? `Restore complete: ${parts.join(", ")}.`
-						: "No changes were applied.";
-					new Notice(msg, 8000);
-					this.deps.log(`Restore from snapshot ${snapshot.snapshotId}: ${msg}`);
-
-					cleanup();
-				},
-				cleanup,
-			).open();
-		} catch (err) {
-			console.error("[yaos] Snapshot diff failed:", err);
-			new Notice(`Failed to load snapshot: ${formatUnknown(err)}`);
+				snapshots,
+				(snapshot) => this.browseSnapshot(snapshot),
+				(snapshot) => this.confirmDeleteSnapshot(snapshot),
+			);
+			this.snapshotListModal.open();
+		} catch (error) {
+			new Notice(`Could not list recovery points: ${formatUnknown(error)}`, 8000);
 		}
+	}
+
+	async pruneSnapshots(): Promise<void> {
+		if (!this.hasRecoveryService("clean up recovery points")) return;
+		try {
+			const result = await this.client().applyRetention();
+			new Notice(
+				`Recovery retention updated: ${result.retained} retained, ${result.removed} roots removed` +
+				`${result.deferred ? `, ${result.deferred} deferred by active jobs` : ""}. ` +
+				"Unreferenced objects are reclaimed only by resumable garbage collection.",
+				9000,
+			);
+		} catch (error) {
+			new Notice(`Recovery retention failed: ${formatUnknown(error)}`, 8000);
+		}
+	}
+
+	async restartPendingRestore(): Promise<void> {
+		const active = this.deps.getPendingRecoveryState().activeRestore;
+		if (!active) {
+			new Notice("There is no interrupted restore to restart.");
+			return;
+		}
+		if (!this.deps.getRecoveryRuntime() || !this.canUseRecovery("restart the restore")) return;
+		this.recordRecoveryEvent(PRODUCT_EVENT_KIND.recoveryRestoreRestarted, "info", active);
+		await this.resumeRestore(active.restoreId, active.snapshotId);
+	}
+
+	private async browseSnapshot(snapshot: RecoverySnapshotSummary): Promise<void> {
+		try {
+			const root = await this.client().getSnapshotRoot(snapshot.snapshotId, snapshot.rootHash);
+			this.browseModal?.close();
+			this.browseModal = new RecoveryBrowseModal(
+				this.deps.app,
+				root,
+				(path) => this.client().lookupPathEntry(snapshot.snapshotId, path),
+				(bodyId) => this.client().lookupDeletedEntry(snapshot.snapshotId, bodyId),
+				(selection) => this.startRestore(snapshot.snapshotId, selection),
+			);
+			this.browseModal.open();
+		} catch (error) {
+			new Notice(`Could not inspect recovery point: ${formatUnknown(error)}`, 8000);
+		}
+	}
+
+	private async startRestore(snapshotId: string, selection: RestoreSelection): Promise<void> {
+		if (!this.deps.getRecoveryRuntime() || !this.canUseRecovery("restore files")) return;
+		if (this.deps.getPendingRecoveryState().activeRestore) {
+			new Notice("Another restore is already active. Resume or cancel it first.", 8000);
+			return;
+		}
+		try {
+			const started = await this.client().startRestore(snapshotId, selection);
+			await this.persist({ activeRestore: { restoreId: started.restoreId, snapshotId }, lastRestoreStatus: null });
+			new Notice("Restore job queued. Work is checkpointed and can resume after restart.", 8000);
+			await this.resumeRestore(started.restoreId, snapshotId);
+		} catch (error) {
+			new Notice(`Restore could not start: ${formatUnknown(error)}`, 10000);
+		}
+	}
+
+	private async resumeRestore(restoreId: string, snapshotId: string): Promise<void> {
+		const runtime = this.deps.getRecoveryRuntime();
+		if (!runtime) {
+			this.scheduleMonitor(STATUS_POLL_MS);
+			return;
+		}
+		try {
+			const status = await this.client().getRestoreStatus(restoreId);
+			await this.persist({ lastRestoreStatus: status });
+			if (status.state === "failed" || status.state === "cancelled") {
+				await this.persist({ activeRestore: null });
+				new Notice(`Restore ${status.state}${status.error ? `: ${status.error.code}` : ""}.`, 10000);
+				return;
+			}
+			if (status.state === "complete") {
+				await this.persist({ activeRestore: null });
+				new Notice("Restore complete.", 8000);
+				this.deps.onEditorsNeedReconcile("recovery-restore");
+				return;
+			}
+			if (status.state !== "awaiting-results") {
+				this.scheduleMonitor(this.retryDelay(status.state === "retrying" ? status.nextAttemptAt : null));
+				return;
+			}
+			let cursor: string | null = null;
+			let applied = 0;
+			do {
+				const page = await this.client().listRestoreItems(restoreId, cursor, RESTORE_PAGE_SIZE);
+				if (page.items.length === 0) break;
+				const results = await this.applyRestorePage(restoreId, snapshotId, page.items, runtime);
+				const nextStatus = await this.client().reportRestoreResults(restoreId, results);
+				await this.persist({ lastRestoreStatus: nextStatus });
+				applied += results.length;
+				cursor = page.nextCursor;
+			} while (cursor && applied < 500);
+			this.deps.onEditorsNeedReconcile("recovery-restore");
+			this.scheduleMonitor(0);
+		} catch (error) {
+			this.deps.log(`Restore ${restoreId} paused: ${formatUnknown(error)}`);
+			new Notice(`Restore paused: ${formatUnknown(error)}. It will retry safely.`, 10000);
+			this.scheduleMonitor(STATUS_POLL_MS);
+		}
+	}
+
+	private async applyRestorePage(restoreId: string, snapshotId: string, items: RestoreItem[], runtime: RecoveryRuntimePort): Promise<RestoreItemResult[]> {
+		const catalog = this.deps.getAttachmentCatalog();
+		const markdownReviews = new Map<string, RecoveryLiveFile | null>();
+		const attachmentReviews = new Map<string, { hash: string; size: number } | null>();
+		for (const item of items) {
+			if (item.kind === "markdown") markdownReviews.set(item.itemId, await runtime.getLive(item.path));
+			else attachmentReviews.set(item.itemId, catalog?.getAttachmentRef(item.path) ?? null);
+		}
+		const backupHook = new RecoveryBackupHook(this.deps.app, {
+			log: (message) => this.deps.log(message),
+		});
+		const backup = await backupHook.backupBeforeReplacement(items.map((item) => item.path));
+		if (!backup.complete) throw new Error(`restore backup is incomplete at ${backup.backupRoot}`);
+		const results: RestoreItemResult[] = [];
+		for (const item of items) {
+			const diskReview = backup.reviews.get(item.path);
+			if (!diskReview) throw new Error(`restore backup omitted review for ${item.path}`);
+			if (!await backupHook.targetStillMatches(diskReview, item.path)) {
+				results.push({ itemId: item.itemId, outcome: "skipped-changed" });
+				continue;
+			}
+			try {
+				if (item.kind === "markdown") {
+					results.push(await this.client().applyMarkdownItem(restoreId, snapshotId, item, markdownReviews.get(item.itemId) ?? null, runtime));
+				} else {
+					results.push(await this.applyAttachmentItem(restoreId, item, attachmentReviews.get(item.itemId) ?? null));
+				}
+			} catch (error) {
+				if (!(error instanceof RecoveryTerminalItemError)) throw error;
+				results.push({ itemId: item.itemId, outcome: "failed", errorCode: error.errorCode });
+			}
+		}
+		this.deps.log(`Applied restore page of ${items.length}; backup=${backup.backupRoot}`);
+		return results;
+	}
+
+	private async applyAttachmentItem(restoreId: string, item: Extract<RestoreItem, { kind: "attachment" }>, liveAtReview: { hash: string; size: number } | null): Promise<RestoreItemResult> {
+		const catalog = this.deps.getAttachmentCatalog();
+		const blobSync = this.deps.getBlobSync();
+		if (!catalog || !blobSync) throw new Error("attachment recovery runtime is unavailable");
+		await this.client().downloadRestoreItem(restoreId, item);
+		const current = catalog.getAttachmentRef(item.path) ?? null;
+		const unchanged = current === null
+			? liveAtReview === null
+			: liveAtReview !== null && current.hash === liveAtReview.hash && current.size === liveAtReview.size;
+		if (!unchanged && !(current?.hash === item.contentHash && current.size === item.size)) {
+			return { itemId: item.itemId, outcome: "skipped-changed" };
+		}
+		await catalog.setAttachmentRef(item.path, item.contentHash, item.size, item.mime ?? "application/octet-stream");
+		await blobSync.forceDownloads([item.path]);
+		return { itemId: item.itemId, outcome: "restored" };
+	}
+
+	private async cancelActiveCapture(): Promise<void> {
+		const captureId = this.deps.getPendingRecoveryState().activeCaptureId;
+		if (!captureId) return;
+		try {
+			const status = await this.client().cancelCapture(captureId);
+			await this.persist({ activeCaptureId: isRecoveryTerminal(status.state) ? null : captureId, lastCaptureStatus: status });
+			this.captureStatusModal?.setCaptureStatus(status);
+			new Notice(status.state === "cancelled" ? "Recovery capture cancelled." : `Capture is ${status.state}.`);
+		} catch (error) {
+			new Notice(`Could not cancel capture: ${formatUnknown(error)}`, 8000);
+		}
+	}
+
+	private async cancelActiveRestore(): Promise<void> {
+		const active = this.deps.getPendingRecoveryState().activeRestore;
+		if (!active) return;
+		try {
+			const status = await this.client().cancelRestore(active.restoreId);
+			await this.persist({
+				activeRestore: isRecoveryTerminal(status.state) ? null : active,
+				lastRestoreStatus: status,
+			});
+			await this.refreshRecoveryStatusModal();
+			new Notice(status.state === "cancelled" ? "Recovery restore cancelled." : `Restore is ${status.state}.`);
+		} catch (error) {
+			new Notice(`Could not cancel restore: ${formatUnknown(error)}`, 8000);
+		}
+	}
+
+	private async refreshRecoveryStatusModal(): Promise<void> {
+		const recovery = await this.client().getRecoveryStatus();
+		await this.persist({ lastRecoveryStatus: recovery });
+		this.captureStatusModal?.setRecoveryStatus(recovery);
+		const captureId = this.deps.getPendingRecoveryState().activeCaptureId;
+		if (captureId) {
+			const capture = await this.client().getCaptureStatus(captureId);
+			await this.persist({ lastCaptureStatus: capture, activeCaptureId: isRecoveryTerminal(capture.state) ? null : captureId });
+			this.captureStatusModal?.setCaptureStatus(capture);
+		}
+	}
+
+	private scheduleMonitor(delayMs: number): void {
+		if (this.monitorTimer !== null) window.clearTimeout(this.monitorTimer);
+		this.monitorTimer = window.setTimeout(() => {
+			this.monitorTimer = null;
+			void this.monitorPending();
+		}, delayMs);
+	}
+
+	private async monitorPending(): Promise<void> {
+		if (this.monitoring) return;
+		this.monitoring = true;
+		try {
+			const pending = this.deps.getPendingRecoveryState();
+			let nextDelay: number | null = null;
+			if (pending.activeCaptureId) {
+				try {
+					const status = await this.client().getCaptureStatus(pending.activeCaptureId);
+					await this.persist({
+						lastCaptureStatus: status,
+						activeCaptureId: isRecoveryTerminal(status.state) ? null : pending.activeCaptureId,
+					});
+					this.captureStatusModal?.setCaptureStatus(status);
+					if (status.state === "complete" || status.state === "complete_with_gaps") {
+						this.recordRecoveryEvent(PRODUCT_EVENT_KIND.recoveryCaptureComplete, "info", {
+							captureId: status.captureId,
+							snapshotId: status.snapshotId,
+							state: status.state,
+						});
+						new Notice(
+							status.state === "complete_with_gaps"
+								? "Recovery point captured with unavailable items. Open recovery status for details."
+								: status.snapshotId ? "Recovery point captured." : "Recovery capture completed.",
+							10000,
+						);
+					} else if (status.state === "failed" || status.state === "cancelled") {
+						this.recordRecoveryEvent(
+							PRODUCT_EVENT_KIND.recoveryCaptureComplete,
+							status.state === "failed" ? "error" : "info",
+							{ captureId: status.captureId, state: status.state, error: status.error },
+						);
+						new Notice(`Recovery capture ${status.state}${status.error ? `: ${status.error.code}` : ""}.`, 10000);
+					} else {
+						nextDelay = this.retryDelay(status.nextAttemptAt);
+					}
+				} catch (error) {
+					this.deps.log(`Capture status resume failed: ${formatUnknown(error)}`);
+					nextDelay = STATUS_POLL_MS;
+				}
+			}
+			const activeRestore = this.deps.getPendingRecoveryState().activeRestore;
+			if (activeRestore) {
+				await this.resumeRestore(activeRestore.restoreId, activeRestore.snapshotId);
+				nextDelay = STATUS_POLL_MS;
+			}
+			try {
+				const recovery = await this.client().getRecoveryStatus();
+				await this.persist({ lastRecoveryStatus: recovery });
+				this.captureStatusModal?.setRecoveryStatus(recovery);
+			} catch (error) {
+				this.deps.log(`Recovery readiness refresh failed: ${formatUnknown(error)}`);
+			}
+			if (
+				nextDelay !== null
+				&& (this.deps.getPendingRecoveryState().activeCaptureId || this.deps.getPendingRecoveryState().activeRestore)
+			) {
+				this.scheduleMonitor(nextDelay);
+			}
+		} finally {
+			this.monitoring = false;
+		}
+	}
+
+	private retryDelay(nextAttemptAt: number | null): number {
+		return nextAttemptAt === null ? STATUS_POLL_MS : Math.max(250, Math.min(60_000, nextAttemptAt - Date.now()));
+	}
+
+	private async persist(update: Partial<PendingRecoveryState>): Promise<void> {
+		await this.deps.persistPendingRecoveryState({ ...this.deps.getPendingRecoveryState(), ...update });
+	}
+
+	private confirmDeleteSnapshot(snapshot: RecoverySnapshotSummary): void {
+		new ConfirmModal(
+			this.deps.app,
+			"Delete recovery point?",
+			"This removes the retained v2 root. Current files and other roots remain. Unreferenced content is reclaimed later by recovery garbage collection.",
+			async () => {
+				try {
+					await this.client().deleteSnapshot(snapshot.snapshotId);
+					new Notice("Recovery point deleted. Content cleanup remains resumable in the background.", 8000);
+				} catch (error) {
+					new Notice(`Recovery point deletion failed: ${formatUnknown(error)}`, 8000);
+				}
+			},
+		).open();
+	}
+
+	private client(): RecoveryClient {
+		return new RecoveryClient(this.deps.getSettings(), this.deps.getTraceHttpContext());
+	}
+
+	private hasRecoveryService(action: string): boolean {
+		if (this.deps.getServerSupportsSnapshots()) return true;
+		new Notice(`Cannot ${action}: recovery storage or the recovery job service is unavailable.`);
+		return false;
+	}
+
+	private canUseRecovery(action: string): boolean {
+		if (!this.hasRecoveryService(action)) return false;
+		if (!this.deps.getVaultSync()?.connected) {
+			new Notice(`Cannot ${action}: sync is not connected.`);
+			return false;
+		}
+		return true;
+	}
+
+	private recordRecoveryEvent(kind: ProductFlightEventInput["kind"], severity: ProductFlightEventInput["severity"], data: Record<string, unknown>): void {
+		this.deps.recordFlightEvent?.({
+			kind,
+			severity,
+			priority: severity === "error" ? "critical" : "important",
+			scope: "vault",
+			source: "vaultSync",
+			layer: "recovery",
+			data,
+		});
 	}
 }

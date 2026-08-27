@@ -160,13 +160,13 @@ async function runLifecycleTest(): Promise<void> {
 		data: { fileId: "file-abc123" },
 	});
 
-	// Step 3: Record server.receipt.candidate_captured (simulates serverAckTracker)
+	// Step 3: Record the durable schema-4 body candidate capture.
 	controller.record({
 		priority: "critical",
 		kind: FLIGHT_KIND.serverReceiptCandidateCaptured,
 		severity: "info",
 		scope: "connection",
-		source: "serverAckTracker",
+		source: "vaultSync",
 		layer: "server",
 		candidateId: "cand-test-001",
 		svHash: "abcd1234",

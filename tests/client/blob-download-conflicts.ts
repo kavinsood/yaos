@@ -1,7 +1,8 @@
 import { App, TFile, type FileStats } from "obsidian";
-import * as Y from "yjs";
-import { BlobSyncManager } from "../../src/sync/blobSync";
-import { VaultSync } from "../../src/sync/vaultSync";
+import {
+	BlobSyncManager,
+	type AttachmentCatalogPort,
+} from "../../src/sync/blobSync";
 import type { BlobRef } from "../../src/types";
 import { suite } from "../harness.ts";
 
@@ -133,21 +134,29 @@ function makeApp(vault: FakeVault, fileManager: FakeFileManager): App {
 	});
 }
 
-/**
- * BlobSyncManager only reaches into VaultSync's two blob CRDT maps.
- * `Object.create(VaultSync.prototype)` gives the real prototype methods
- * (`isBlobTombstoned`, `getBlobRef`, …) without the constructor's provider and
- * IndexedDB wiring, and the maps go in through `Object.assign` because they are
- * `readonly` on the class.
- */
-function makeVaultSyncFixture(): VaultSync {
-	const ydoc = new Y.Doc();
-	return Object.assign(Object.create(VaultSync.prototype) as VaultSync, {
-		ydoc,
-		pathToBlob: ydoc.getMap<BlobRef>("pathToBlob"),
-		blobTombstones: ydoc.getMap<{ deletedAt: number }>("blobTombstones"),
-		debug: false,
-	});
+function makeAttachmentCatalogFixture(): AttachmentCatalogPort {
+	const refs = new Map<string, BlobRef>();
+	const tombstones = new Set<string>();
+	return {
+		listAttachmentRefs: () => refs,
+		getAttachmentRef: (path) => refs.get(path),
+		isAttachmentTombstoned: (path) => tombstones.has(path),
+		setAttachmentRef: (path, hash, size) => {
+			refs.set(path, { hash, size });
+			tombstones.delete(path);
+		},
+		deleteAttachmentRef: (path) => {
+			refs.delete(path);
+			tombstones.add(path);
+		},
+		renameAttachmentRef: (oldPath, newPath) => {
+			const ref = refs.get(oldPath);
+			if (!ref) return;
+			refs.delete(oldPath);
+			refs.set(newPath, ref);
+		},
+		observeAttachmentChanges: () => () => {},
+	};
 }
 
 /**
@@ -170,7 +179,7 @@ function makeHarness() {
 
 	const manager = new BlobSyncManager(
 		makeApp(vault, fileManager),
-		makeVaultSyncFixture(),
+		makeAttachmentCatalogFixture(),
 		{
 			host: "https://worker.example",
 			deviceToken: "device-token",
@@ -193,6 +202,7 @@ async function runDownload(
 	onDownload?: () => void,
 ): Promise<string> {
 	const hash = await sha256Hex(data);
+	manager["attachmentCatalog"].setAttachmentRef(path, hash, data.byteLength, "application/octet-stream");
 	stubDownload(manager, async () => {
 		onDownload?.();
 		return data;
@@ -324,7 +334,7 @@ s.section("Test 5: blob remote delete prefers trashFile");
 	const deletedPaths: string[] = [];
 
 	// Seed hash cache so knownHash matches — file is clean, delete should proceed
-	const knownHash = "deadbeef1234";
+	const knownHash = "1".repeat(64);
 	manager["hashCache"]["attachment.png"] = {
 		mtime: existing.file.stat.mtime,
 		size: existing.file.stat.size,
@@ -363,7 +373,7 @@ s.section("Test 6: blob remote delete never hard-deletes when trash is unavailab
 	const existing = put("attachment2.png", bytes("local data 2"));
 	const deletedPaths: string[] = [];
 
-	const knownHash = "deadbeef5678";
+	const knownHash = "2".repeat(64);
 	manager["hashCache"]["attachment2.png"] = {
 		mtime: existing.file.stat.mtime,
 		size: existing.file.stat.size,
@@ -394,7 +404,7 @@ s.section("Test 7: blob remote delete never hard-deletes when trashFile throws")
 	const existing = put("attachment3.png", bytes("local data 3"));
 	const deletedPaths: string[] = [];
 
-	const knownHash = "deadbeef9abc";
+	const knownHash = "3".repeat(64);
 	manager["hashCache"]["attachment3.png"] = {
 		mtime: existing.file.stat.mtime,
 		size: existing.file.stat.size,
@@ -427,7 +437,7 @@ s.section("Test 8: blob remote delete suppresses path before deletion");
 	const existing = put("suppressed.png", bytes("suppress me"));
 
 	// Seed hash cache so knownHash matches — file is clean, delete should proceed
-	const knownHash = "deadbeefdef0";
+	const knownHash = "4".repeat(64);
 	manager["hashCache"]["suppressed.png"] = {
 		mtime: existing.file.stat.mtime,
 		size: existing.file.stat.size,
@@ -482,7 +492,7 @@ s.section("Test 10: blob remote delete proceeds when hash matches known");
 	const existing = put("unchanged.png", bytes("same content"));
 
 	// Seed the hash cache so getCachedHash returns the known hash
-	const knownHash = "known-hash-matching";
+	const knownHash = "5".repeat(64);
 	const stat = existing.file.stat;
 	manager["hashCache"]["unchanged.png"] = {
 		mtime: stat.mtime,
@@ -515,11 +525,9 @@ s.section("Test 11: blob remote delete preserves when no known hash baseline");
 
 	// Track whether tombstone was cleared (it should NOT be for unknown baseline)
 	let tombstoneCleared = false;
-	manager["vaultSync"] = Object.assign(Object.create(VaultSync.prototype) as VaultSync, {
-		isBlobTombstoned: () => true,
-		blobTombstones: {
-			delete: () => { tombstoneCleared = true; },
-		},
+	Reflect.set(manager, "attachmentCatalog", {
+		isAttachmentTombstoned: () => true,
+		setAttachmentRef: () => { tombstoneCleared = true; },
 	});
 
 	vault.delete = async () => { throw new Error("should not delete when knownHash is null"); };
@@ -547,7 +555,7 @@ s.section("Test 12: rerunResets cap triggers permanent failure");
 	// Craft a download item that has exhausted retries AND rerunResets
 	const item = {
 		path: "capped.png",
-		hash: "abc123",
+		hash: "a".repeat(64),
 		sizeBytes: 100,
 		status: "processing" as const,
 		retries: 4, // > MAX_RETRIES (3)
@@ -555,6 +563,12 @@ s.section("Test 12: rerunResets cap triggers permanent failure");
 		needsRerun: true,
 		rerunResets: 5, // = MAX_RERUN_RESETS (5)
 	};
+	manager["attachmentCatalog"].setAttachmentRef(
+		item.path,
+		item.hash,
+		item.sizeBytes,
+		"image/png",
+	);
 
 	// Mock blobClient to throw
 	stubDownload(manager, async () => { throw new Error("always fails"); });
@@ -587,7 +601,7 @@ s.section("Test 13: rerunResets below cap allows fresh restart");
 
 	const item = {
 		path: "restartable.png",
-		hash: "def456",
+		hash: "b".repeat(64),
 		sizeBytes: 200,
 		status: "processing" as "pending" | "processing",
 		retries: 4, // > MAX_RETRIES
@@ -595,6 +609,12 @@ s.section("Test 13: rerunResets below cap allows fresh restart");
 		needsRerun: true,
 		rerunResets: 3, // < MAX_RERUN_RESETS (5)
 	};
+	manager["attachmentCatalog"].setAttachmentRef(
+		item.path,
+		item.hash,
+		item.sizeBytes,
+		"image/png",
+	);
 
 	stubDownload(manager, async () => { throw new Error("temporary"); });
 
@@ -749,9 +769,15 @@ s.section("Test 17: importQueue preserves rerunResets near cap");
 			{ path: "near-cap.png", sizeBytes: 100, retries: 2, status: "pending" as const, readyAt: 0, needsRerun: true, rerunResets: 4 },
 		],
 		downloads: [
-			{ path: "at-cap.png", hash: "xyz", sizeBytes: 200, retries: 3, status: "processing" as const, readyAt: 999, needsRerun: true, rerunResets: 5 },
+			{ path: "at-cap.png", hash: "c".repeat(64), sizeBytes: 200, retries: 3, status: "processing" as const, readyAt: 999, needsRerun: true, rerunResets: 5 },
 		],
 	};
+	manager["attachmentCatalog"].setAttachmentRef(
+		"at-cap.png",
+		"c".repeat(64),
+		200,
+		"image/png",
+	);
 
 	manager.importQueue(snapshot);
 
@@ -851,16 +877,19 @@ s.section("Test 19: Multi-pass: unknown-baseline preserved blob is NOT re-upload
 	put("attachments/preserved.png", bytes("local image data"));
 
 	// Simulate: the vaultSync has this path tombstoned
-	const blobTombstones = new Map([["attachments/preserved.png", true]]);
-	const vaultSync = Object.assign(Object.create(VaultSync.prototype) as VaultSync, {
-		pathToBlob: new Map<string, BlobRef>([["attachments/preserved.png", { hash: "remote-hash-old", size: 100 }]]),
-		isBlobTombstoned: (path: string) => path === "attachments/preserved.png",
-		blobTombstones,
-		getBlobRef: () => null,
-		setBlobRef: () => { throw new Error("setBlobRef should not be called"); },
-		deleteBlobRef: () => {},
+	const attachmentRefs = new Map<string, BlobRef>([
+		["attachments/preserved.png", { hash: "d".repeat(64), size: 100 }],
+	]);
+	const blobTombstones = new Set(["attachments/preserved.png"]);
+	Reflect.set(manager, "attachmentCatalog", {
+		listAttachmentRefs: () => attachmentRefs,
+		getAttachmentRef: (path: string) => attachmentRefs.get(path),
+		isAttachmentTombstoned: (path: string) => blobTombstones.has(path),
+		setAttachmentRef: () => { throw new Error("setAttachmentRef should not be called"); },
+		deleteAttachmentRef: (path: string) => { blobTombstones.delete(path); },
+		renameAttachmentRef: () => {},
+		observeAttachmentChanges: () => () => {},
 	});
-	manager["vaultSync"] = vaultSync;
 
 	// Step 2–3: Remote tombstone with unknown baseline
 	// Call handleRemoteDelete with knownHash = null
@@ -933,7 +962,7 @@ s.section("Test 20: Multi-pass: stat-failure during blob remote-delete becomes p
 	vault.adapter.stat = async () => { throw new Error("EBUSY"); };
 
 	// Call handleRemoteDelete with a known hash (so it enters the stat path)
-	await manager["handleRemoteDelete"]("attachments/stat-fails.png", "known-hash-abc123");
+	await manager["handleRemoteDelete"]("attachments/stat-fails.png", "6".repeat(64));
 
 	// File should NOT be deleted (check that delete was not called)
 	const deleteTrace = traces.find((t) => t.msg === "remote-delete-applied");
