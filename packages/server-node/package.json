@@ -1,0 +1,31 @@
+{
+	"name": "@yaos/server-node",
+	"version": "2.1.0",
+	"private": true,
+	"description": "Production Node.js host for the YAOS schema-4 server",
+	"type": "module",
+	"engines": {
+		"node": ">=24"
+	},
+	"scripts": {
+		"build": "node esbuild.config.mjs",
+		"typecheck": "tsc --noEmit -p tsconfig.json",
+		"dev": "node --import jiti/register src/index.ts",
+		"start": "node dist/server.mjs",
+		"retry-alarm": "node dist/server.mjs --retry-alarm"
+	},
+	"files": [
+		"dist/server.mjs"
+	],
+	"dependencies": {
+		"ws": "8.21.3"
+	},
+	"devDependencies": {
+		"@cloudflare/workers-types": "4.20260305.0",
+		"@types/node": "^24.0.0",
+		"@types/ws": "8.18.1",
+		"esbuild": "0.25.5",
+		"jiti": "2.6.1",
+		"typescript": "^5.8.3"
+	}
+}
