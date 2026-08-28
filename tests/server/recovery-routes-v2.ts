@@ -1,8 +1,8 @@
-import worker, { classifyWorkerRoute } from "../../server/src/index";
+import { classifyWorkerRoute, handleWorkerRequest } from "../../server/src/index";
 import { invalidateStoredServerConfigCache } from "../../server/src/routes/auth";
 import type { Env } from "../../server/src/routes/types";
 import { handleRecoveryRoute, type RecoveryRouteAuthority } from "../../server/src/recoveryRoutes";
-import { FakeR2Bucket, makeConfigNamespace, makeEnv, makeTrapNamespace } from "../mocks/workerEnv.ts";
+import { FakeObjectStore, makeConfigNamespace, makeEnv, makeTrapNamespace } from "../mocks/workerEnv.ts";
 import { suite } from "../harness.ts";
 
 const s = suite("recovery-routes-v2");
@@ -89,7 +89,7 @@ s.test("unknown recovery paths stay dark before Config, Sync, and Job allocation
 		["POST", "recovery/finalize"],
 		["GET", "recovery/snapshots/id/arbitrary/hash"],
 	] as Array<[string, string]>) {
-		const response = await worker.fetch(new Request(`https://example.test/vault/${vaultId}/${path}`, { method }), env);
+		const response = await handleWorkerRequest(new Request(`https://example.test/vault/${vaultId}/${path}`, { method }), env);
 		if (response.status !== 404) throw new Error(`${method} ${path} returned ${response.status}`);
 	}
 	if (trap.touched.length !== 0) throw new Error(`unknown route touched ${trap.touched.join(",")}`);
@@ -254,20 +254,11 @@ s.test("device bearer auth runs before vault allocation and missing bucket/jobs 
 		if (path === "/__yaos/authorize-device") return Response.json({ device: { deviceId: "device-1", vaultId } });
 		throw new Error(`unexpected config path ${path}`);
 	});
-	const unauthorized = await worker.fetch(
-		new Request(`https://example.test/vault/${vaultId}/recovery/status`),
-		makeEnv({ YAOS_CONFIG: config, YAOS_SYNC: sync }),
-	);
+	const unauthorized = await handleWorkerRequest(new Request(`https://example.test/vault/${vaultId}/recovery/status`), makeEnv({ YAOS_CONFIG: config, YAOS_SYNC: sync }));
 	if (unauthorized.status !== 401 || sync.touched.length !== 0) throw new Error("unauthorized request allocated vault state");
 	const token = { authorization: "Bearer device-token" };
-	const missingBoth = await worker.fetch(
-		new Request(`https://example.test/vault/${vaultId}/recovery/status`, { headers: token }),
-		makeEnv({ YAOS_CONFIG: config, YAOS_SYNC: sync }),
-	);
-	const missingJobs = await worker.fetch(
-		new Request(`https://example.test/vault/${vaultId}/recovery/status`, { headers: token }),
-		makeEnv({ YAOS_CONFIG: config, YAOS_SYNC: sync, YAOS_BUCKET: new FakeR2Bucket() }),
-	);
+	const missingBoth = await handleWorkerRequest(new Request(`https://example.test/vault/${vaultId}/recovery/status`, { headers: token }), makeEnv({ YAOS_CONFIG: config, YAOS_SYNC: sync }));
+	const missingJobs = await handleWorkerRequest(new Request(`https://example.test/vault/${vaultId}/recovery/status`, { headers: token }), makeEnv({ YAOS_CONFIG: config, YAOS_SYNC: sync, YAOS_BUCKET: new FakeObjectStore() }));
 	const bothBody = await missingBoth.json() as Record<string, unknown>;
 	const jobsBody = await missingJobs.json() as Record<string, unknown>;
 	if (missingBoth.status !== 503 || bothBody.storageAvailable !== false || bothBody.jobsAvailable !== false) {

@@ -1129,16 +1129,33 @@ export class RecoveryAuthorityStore extends VaultBootstrapStore {
 		this.storage.transactionSync(() => {
 			this.storage.sql.exec("DELETE FROM recovery_key_leases WHERE expires_at <= ?", now).toArray();
 			for (const key of input.objectKeys) {
-				const conflict = this.storage.sql.exec<{ lease_kind: string; lease_id: string }>(
-					"SELECT lease_kind, lease_id FROM recovery_key_leases WHERE object_key = ?",
+				const conflict = this.storage.sql.exec<{
+					lease_kind: string;
+					lease_id: string;
+					owner_kind: string;
+					owner_id: string;
+				}>(
+					"SELECT lease_kind, lease_id, owner_kind, owner_id FROM recovery_key_leases WHERE object_key = ?",
 					key,
 				).toArray()[0];
-				if (conflict && conflict.lease_id !== input.leaseId) throw new Error("object key is temporarily leased");
+				if (conflict && (
+					conflict.lease_kind !== "materialize"
+					|| conflict.owner_kind !== input.ownerKind
+					|| conflict.owner_id !== input.ownerId
+				)) {
+					throw new Error("object key is temporarily leased");
+				}
 				this.storage.sql.exec(
 					`INSERT INTO recovery_key_leases(
 					 object_key, lease_id, lease_kind, owner_kind, owner_id, expires_at
 					 ) VALUES (?, ?, 'materialize', ?, ?, ?)
-					 ON CONFLICT(object_key) DO UPDATE SET expires_at = excluded.expires_at`,
+					 ON CONFLICT(object_key) DO UPDATE SET
+					 lease_id = excluded.lease_id,
+					 lease_kind = excluded.lease_kind,
+					 owner_kind = excluded.owner_kind,
+					 owner_id = excluded.owner_id,
+					 domain = NULL,
+					 expires_at = excluded.expires_at`,
 					key,
 					input.leaseId,
 					input.ownerKind,

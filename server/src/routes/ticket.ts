@@ -135,12 +135,11 @@ export async function handleTicketRoute(
 		const result = await createTicket(authState, vaultId, deviceId, readTicketTtlMs(env?.YAOS_TICKET_TTL_MS));
 		if (env) {
 			try {
-				const id = env.YAOS_CONFIG.idFromName("global-config");
-				await env.YAOS_CONFIG.get(id).fetch("https://internal/__yaos/touch-device", {
+				await env.YAOS_CONFIG.call("global-config", new Request("https://internal/__yaos/touch-device", {
 					method: "POST",
 					headers: { "Content-Type": "application/json" },
 					body: JSON.stringify({ deviceId, vaultId }),
-				});
+				}));
 			} catch {
 				// lastSeenAt is best-effort and never blocks a valid ticket.
 			}

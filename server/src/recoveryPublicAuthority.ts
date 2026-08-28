@@ -10,13 +10,14 @@ import {
 } from "./recoveryProtocol";
 import type { RetainedSnapshotRoot } from "./recoveryReadService";
 import type { RecoveryRouteAuthority, RestoreItemResult, StartRestoreRequest } from "./recoveryRoutes";
-import type { VaultRuntimeStubPort } from "./routes/types";
+import type { ActorCallPort } from "./platformPorts";
 
 const encoder = new TextEncoder();
 
-export class DurableRecoveryRouteAuthority implements RecoveryRouteAuthority {
+export class ActorRecoveryRouteAuthority implements RecoveryRouteAuthority {
 	constructor(
-		private readonly stub: VaultRuntimeStubPort,
+		private readonly actors: ActorCallPort,
+		private readonly actorName: string,
 		private readonly vaultId: string,
 		private readonly vaultGeneration: string,
 	) {}
@@ -24,7 +25,7 @@ export class DurableRecoveryRouteAuthority implements RecoveryRouteAuthority {
 	private async call<T>(method: string, params: unknown): Promise<T> {
 		const body = JSON.stringify({ method, params: encodeRecoveryRpcPayload(params) });
 		if (encoder.encode(body).byteLength > RECOVERY_RPC_MAX_JSON_BYTES) throw new Error("recovery request too large");
-		const response = await this.stub.fetch(new Request(`https://internal${RECOVERY_PUBLIC_RPC_PATH}`, {
+		const response = await this.actors.call(this.actorName, new Request(`https://internal${RECOVERY_PUBLIC_RPC_PATH}`, {
 			method: "POST",
 			headers: {
 				"content-type": "application/json",
@@ -79,7 +80,7 @@ export class DurableRecoveryRouteAuthority implements RecoveryRouteAuthority {
 	}
 	async getRecoveryRestoreItemContent(input: { vaultId: string; restoreId: string; itemId: string }): Promise<Response> {
 		const body = JSON.stringify({ method: "getRecoveryRestoreItemContent", params: input });
-		return this.stub.fetch(new Request(`https://internal${RECOVERY_PUBLIC_RPC_PATH}`, {
+		return this.actors.call(this.actorName, new Request(`https://internal${RECOVERY_PUBLIC_RPC_PATH}`, {
 			method: "POST",
 			headers: {
 				"content-type": "application/json",

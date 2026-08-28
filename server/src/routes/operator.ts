@@ -2,7 +2,7 @@ import { randomBase64Url } from "../base64url";
 import { hashSecret } from "../identity";
 import type { VaultRecord } from "../identity";
 import type { PendingDestroyRecord } from "../config";
-import { CloudflareRecoveryJobExecutor, type RecoveryJobStatus } from "../recoveryExecutor";
+import { ActorRecoveryJobExecutor, type RecoveryJobStatus } from "../recoveryExecutor";
 import { RECOVERY_RPC_HEADER, vaultGenerationPrefix } from "../recoveryProtocol";
 import { buildMobileSetupUrl, renderSetupQrDataUrl } from "../setupQr";
 import {
@@ -220,8 +220,7 @@ export async function attemptVaultCleanup(
 
 	if (!r2Complete) {
 		try {
-			const room = env.YAOS_SYNC.get(env.YAOS_SYNC.idFromName(vaultId));
-			const fenced = await room.fetch("https://internal/__yaos/begin-vault-deletion", {
+			const fenced = await env.YAOS_SYNC.call(vaultId, new Request("https://internal/__yaos/begin-vault-deletion", {
 				method: "POST",
 				headers: {
 					"content-type": "application/json",
@@ -232,7 +231,7 @@ export async function attemptVaultCleanup(
 					deletionId: pending.deletionId,
 					vaultGeneration: pending.vaultGeneration,
 				}),
-			});
+			}));
 			if (!fenced.ok && fenced.status !== 410) throw new Error(`deletion fence returned HTTP ${fenced.status}`);
 			if (!env.YAOS_BUCKET) {
 				r2Complete = true;
@@ -240,7 +239,8 @@ export async function attemptVaultCleanup(
 			} else if (!env.YAOS_RECOVERY_JOBS) {
 				throw new Error("recovery job binding unavailable");
 			} else {
-				const executor = new CloudflareRecoveryJobExecutor(env.YAOS_RECOVERY_JOBS);
+				const recoveryJobs = env.YAOS_RECOVERY_JOBS;
+				const executor = new ActorRecoveryJobExecutor(recoveryJobs);
 				let status: RecoveryJobStatus | null;
 				try {
 					status = await executor.getStatus(pending.purgeJobId);
@@ -248,16 +248,14 @@ export async function attemptVaultCleanup(
 					status = null;
 				}
 				if (status?.state === "failed" || status?.state === "cancelled") {
-					const jobs = env.YAOS_RECOVERY_JOBS;
-					const job = jobs.get(jobs.idFromName(pending.purgeJobId));
-					const reset = await job.fetch("https://internal/__yaos/recovery-job/delete-state", {
+					const reset = await recoveryJobs.call(pending.purgeJobId, new Request("https://internal/__yaos/recovery-job/delete-state", {
 						method: "POST",
 						headers: {
 							[RECOVERY_RPC_HEADER]: "1",
 							"x-yaos-vault-id": vaultId,
 							"x-yaos-vault-generation": pending.vaultGeneration,
 						},
-					});
+					}));
 					if (!reset.ok) throw new Error(`purge reset returned HTTP ${reset.status}`);
 					status = null;
 				}
@@ -313,7 +311,7 @@ export async function attemptVaultCleanup(
 		try {
 			const response = fetchRoom
 				? await fetchRoom()
-				: await env.YAOS_SYNC.get(env.YAOS_SYNC.idFromName(vaultId)).fetch(
+				: await env.YAOS_SYNC.call(vaultId, new Request(
 					"https://internal/__yaos/delete-all",
 					{
 						method: "POST",
@@ -322,7 +320,7 @@ export async function attemptVaultCleanup(
 							"x-yaos-vault-generation": pending.vaultGeneration,
 						},
 					},
-				);
+				));
 			if (response.ok) roomComplete = true;
 			else errors.push(`room: delete-all returned HTTP ${response.status}`);
 		} catch (error) {
@@ -365,14 +363,13 @@ export async function handleOperatorDestroyVault(req: Request, env: Env, vaultId
 	} | null;
 	if (!registryPayload?.pending) return json({ error: "destroy_state_unavailable" }, 502);
 	const cleanup = await attemptVaultCleanup(env, vaultId, registryPayload.pending, async () => {
-		const room = env.YAOS_SYNC.get(env.YAOS_SYNC.idFromName(vaultId));
-		return room.fetch("https://internal/__yaos/delete-all", {
+		return env.YAOS_SYNC.call(vaultId, new Request("https://internal/__yaos/delete-all", {
 			method: "POST",
 			headers: {
 				"x-yaos-vault-id": vaultId,
 				"x-yaos-vault-generation": registryPayload.pending!.vaultGeneration,
 			},
-		});
+		}));
 	});
 	let updated: Response;
 	try {

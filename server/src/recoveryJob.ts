@@ -85,10 +85,13 @@ import {
 	type RestoreItemOutcome,
 	type StoredRestoreItem,
 } from "./recoveryJobState.js";
+import type { ActorCallPort, AlarmPort, ObjectStorePort, RecoveryRuntimeStoragePort } from "./platformPorts.js";
+import { CloudflareActorCalls, CloudflareAlarmPort, CloudflareObjectStore } from "./cloudflarePorts.js";
 
 const MAX_BODIES_PER_ALARM = 25;
 const ALARM_SLICE_WALL_MS = 4_000;
-const MAX_R2_IN_FLIGHT = 4;
+const DISPATCH_WATCHDOG_MS = 15_000;
+const MAX_OBJECT_STORE_IN_FLIGHT = 4;
 const RETRY_BASE_MS = 1_000;
 const RETRY_CAP_MS = 15 * 60_000;
 const MAX_BODY_DEFECT_ATTEMPTS = 3;
@@ -100,10 +103,12 @@ const MAX_SINGLE_TURN_REBUILD_ENTRIES = 10_000;
 const MANIFEST_INVENTORY_PAGE = 32;
 const encoder = new TextEncoder();
 
-export interface RecoveryJobEnvironment {
-	YAOS_SYNC: DurableObjectNamespace;
-	YAOS_CONFIG: DurableObjectNamespace;
-	YAOS_BUCKET?: R2Bucket;
+export interface RecoveryJobRuntimeOptions {
+	storage: RecoveryRuntimeStoragePort;
+	alarms: AlarmPort;
+	objectStore?: ObjectStorePort;
+	recoveryAuthority: ActorCallPort;
+	controlPlane: ActorCallPort;
 }
 interface LeaseStatus {
 	valid: true;
@@ -520,13 +525,10 @@ function isRetryableFailure(error: unknown): boolean {
 	return /(?:10001|timeout|timed out|temporar|overload|\b5\d\d\b|network|fetch failed|internal error;\s*reference)/i.test(message);
 }
 
-async function objectBytes(object: R2ObjectBody): Promise<Uint8Array> {
-	return new Uint8Array(await object.arrayBuffer());
-}
 
 async function mapFour<T>(items: readonly T[], worker: (item: T) => Promise<void>): Promise<void> {
 	let next = 0;
-	const workers = Array.from({ length: Math.min(MAX_R2_IN_FLIGHT, items.length) }, async () => {
+	const workers = Array.from({ length: Math.min(MAX_OBJECT_STORE_IN_FLIGHT, items.length) }, async () => {
 		for (;;) {
 			const index = next++;
 			if (index >= items.length) return;
@@ -559,24 +561,21 @@ export function isRecoveryGcSweepCandidate(
 }
 
 export async function putCreateOnlyRecoveryRoot(
-	bucket: R2Bucket,
+	bucket: ObjectStorePort,
 	objectKey: string,
 	canonicalBytes: Uint8Array,
 	expectedHash: string,
 ): Promise<void> {
 	const existing = await bucket.get(objectKey);
 	if (existing) {
-		await parseAndVerifySnapshotRoot(await objectBytes(existing), expectedHash);
+		await parseAndVerifySnapshotRoot(existing.bytes, expectedHash);
 		return;
 	}
-	const written = await bucket.put(objectKey, canonicalBytes, {
-		onlyIf: { etagDoesNotMatch: "*" },
-		httpMetadata: { contentType: "application/json" },
-	});
-	if (written !== null) return;
+	const outcome = await bucket.createOnly(objectKey, canonicalBytes, { contentType: "application/json" });
+	if (outcome === "created") return;
 	const raced = await bucket.get(objectKey);
 	if (!raced) throw new RetryableRecoveryError("root_put_lost", "snapshot root create response lost");
-	await parseAndVerifySnapshotRoot(await objectBytes(raced), expectedHash);
+	await parseAndVerifySnapshotRoot(raced.bytes, expectedHash);
 }
 
 export function canCancelRecoveryJob(state: RecoveryJobRecord["state"]): boolean {
@@ -1003,7 +1002,7 @@ const RECOVERY_AUTHORITY_METHODS: Record<keyof RecoveryAuthorityRpc, true> = {
 };
 
 async function callRecoveryAuthority(
-	stub: DurableObjectStub,
+	actors: ActorCallPort,
 	vaultId: string,
 	vaultGeneration: string,
 	method: keyof RecoveryAuthorityRpc,
@@ -1014,8 +1013,7 @@ async function callRecoveryAuthority(
 		method,
 		params: encodeRecoveryRpcPayload(params),
 	}));
-	if (requestBytes.byteLength > RECOVERY_RPC_MAX_JSON_BYTES) throw new Error("recovery RPC request exceeds byte bound");
-	const response = await stub.fetch(new Request(`https://internal${RECOVERY_RPC_PATH}`, {
+	const response = await actors.call(vaultId, new Request(`https://internal${RECOVERY_RPC_PATH}`, {
 		method: "POST",
 		headers: {
 			"content-type": "application/json",
@@ -1043,20 +1041,19 @@ async function callRecoveryAuthority(
 	return decodeRecoveryRpcPayload(record.result);
 }
 
-class DirectR2Artifacts implements ImmutableArtifactStore {
-	constructor(private readonly bucket: R2Bucket) {}
+class DirectObjectArtifacts implements ImmutableArtifactStore {
+	constructor(private readonly bucket: ObjectStorePort) {}
 
 	async exists(key: string): Promise<boolean> {
 		return await this.bucket.head(key) !== null;
 	}
 
 	async get(key: string): Promise<Uint8Array | null> {
-		const object = await this.bucket.get(key);
-		return object ? objectBytes(object) : null;
+		return (await this.bucket.get(key))?.bytes ?? null;
 	}
 
 	async put(key: string, bytes: Uint8Array, contentType: string): Promise<void> {
-		await this.bucket.put(key, bytes, { httpMetadata: { contentType } });
+		await this.bucket.put(key, bytes, { contentType });
 	}
 
 	async delete(key: string): Promise<void> {
@@ -1120,17 +1117,14 @@ class CaptureManifestStore implements ManifestNodeStore {
 	}
 }
 
-// eslint-disable-next-line @typescript-eslint/no-empty-object-type, @typescript-eslint/no-unsafe-declaration-merging -- Workers RPC requires an exported branded class type.
-export interface RecoveryJob extends Rpc.DurableObjectBranded {}
 
-/** Alarm-driven, SQLite-backed recovery worker. Public Worker routes never reach fetch(). */
-// eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging -- Merge the Workers RPC brand into the runtime class.
-export class RecoveryJob implements DurableObject {
+/** Alarm-driven, SQLite-backed recovery state machine, independent of the alarm host. */
+export class RecoveryJobRuntime {
 	private readonly store: RecoveryJobStateStore;
 
 	private deferredAlarmAt: number | null = null;
-	constructor(private readonly ctx: DurableObjectState, private readonly env: RecoveryJobEnvironment) {
-		this.store = new RecoveryJobStateStore(ctx.storage);
+	constructor(private readonly options: RecoveryJobRuntimeOptions) {
+		this.store = new RecoveryJobStateStore(options.storage);
 	}
 
 	async fetch(request: Request): Promise<Response> {
@@ -1170,7 +1164,7 @@ export class RecoveryJob implements DurableObject {
 			if (route === "/__yaos/recovery-job/projection/wake" && request.method === "POST") {
 				const record = this.store.load();
 				if (!record || record.kind !== "projection") throw new Error("projection job is not initialized");
-				await this.ctx.storage.setAlarm(Date.now());
+				await this.options.alarms.setAlarm(Date.now());
 				return Response.json(null);
 			}
 			if (route === "/__yaos/recovery-job/purge/rotate-capability" && request.method === "POST") {
@@ -1220,15 +1214,14 @@ export class RecoveryJob implements DurableObject {
 		return JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes)) as T;
 	}
 
-	private bucket(): R2Bucket {
-		if (!this.env.YAOS_BUCKET) throw new RetryableRecoveryError("recovery_storage_unavailable", "recovery bucket unavailable");
-		return this.env.YAOS_BUCKET;
+	private bucket(): ObjectStorePort {
+		if (!this.options.objectStore) throw new RetryableRecoveryError("recovery_storage_unavailable", "recovery bucket unavailable");
+		return this.options.objectStore;
 	}
 
 	private authority(vaultId: string, vaultGeneration: string): RecoveryAuthorityRpc {
-		const stub = this.env.YAOS_SYNC.get(this.env.YAOS_SYNC.idFromName(vaultId));
 		const call = (method: keyof RecoveryAuthorityRpc, params: unknown): Promise<unknown> =>
-			callRecoveryAuthority(stub, vaultId, vaultGeneration, method, params);
+			callRecoveryAuthority(this.options.recoveryAuthority, vaultId, vaultGeneration, method, params);
 		return {
 			checkRecoveryJobLease: async (input) => parseLeaseStatus(await call("checkRecoveryJobLease", input)),
 			getCapturePlanPage: async (input) => parseCapturePlanResponse(await call("getCapturePlanPage", input)),
@@ -1320,7 +1313,7 @@ export class RecoveryJob implements DurableObject {
 			createdAt: descriptor.createdAt,
 			metadata,
 		});
-		await this.ctx.storage.setAlarm(Date.now());
+		await this.options.alarms.setAlarm(Date.now());
 		return { jobId: expectedId, kind, capabilityHash: await sha256Hex(encoder.encode(capability)), created: initialized.created };
 	}
 
@@ -1350,7 +1343,7 @@ export class RecoveryJob implements DurableObject {
 			completedAt: null,
 			updatedAt: Date.now(),
 		});
-		await this.ctx.storage.setAlarm(Date.now());
+		await this.options.alarms.setAlarm(Date.now());
 		return {
 			jobId: expectedId,
 			kind: "projection",
@@ -1385,7 +1378,7 @@ export class RecoveryJob implements DurableObject {
 			completedAt: state === "complete" ? record.completedAt : null,
 			updatedAt: Date.now(),
 		});
-		if (!isTerminalRecoveryState(state)) await this.ctx.storage.setAlarm(Date.now());
+		if (!isTerminalRecoveryState(state)) await this.options.alarms.setAlarm(Date.now());
 		return {
 			capabilityHash: await sha256Hex(encoder.encode(input.capability)),
 			state,
@@ -1398,7 +1391,7 @@ export class RecoveryJob implements DurableObject {
 			|| (record.state !== "queued" && record.state !== "purging")) {
 			throw new Error("purge job is not wakeable");
 		}
-		await this.ctx.storage.setAlarm(Date.now());
+		await this.options.alarms.setAlarm(Date.now());
 	}
 
 	async republishPurge(): Promise<void> {
@@ -1477,7 +1470,7 @@ export class RecoveryJob implements DurableObject {
 		if (record.state === "complete" || record.state === "complete_with_gaps") throw new Error("completed recovery job cannot be cancelled");
 		if (!canCancelRecoveryJob(record.state)) return;
 		this.store.requestCancellation(Date.now());
-		await this.ctx.storage.setAlarm(Date.now());
+		await this.options.alarms.setAlarm(Date.now());
 	}
 
 	requestCancellation(): Promise<void> {
@@ -1487,20 +1480,26 @@ export class RecoveryJob implements DurableObject {
 	async deleteState(): Promise<void> {
 		const record = this.store.load();
 		if (record && !isTerminalRecoveryState(record.state)) throw new Error("active recovery job state cannot be deleted");
-		await this.ctx.storage.deleteAll();
+		await this.options.alarms.deleteAlarm();
+		await this.options.storage.deleteAll();
 		this.store.resetAfterDeleteAll();
 	}
 
-	async alarm(): Promise<void> {
+	async dispatch(dispatchId: string): Promise<void> {
+		if (!/^[A-Za-z0-9:_-]{1,256}$/.test(dispatchId)) throw new Error("invalid recovery dispatch identity");
 		const startedAt = Date.now();
+		this.store.setMetadata("dispatch-identity", { dispatchId, startedAt, completedAt: null });
 		this.deferredAlarmAt = null;
 		try {
 			for (let unit = 0; unit < MAX_BODIES_PER_ALARM; unit++) {
 				let record = this.store.load();
-				if (!record || isTerminalRecoveryState(record.state)) return;
+				if (!record || isTerminalRecoveryState(record.state)) {
+					await this.options.alarms.deleteAlarm();
+					return;
+				}
 				const now = Date.now();
 				if (record.nextAttemptAt !== null && record.nextAttemptAt > now) {
-					await this.ctx.storage.setAlarm(record.nextAttemptAt);
+					await this.options.alarms.setAlarm(record.nextAttemptAt);
 					return;
 				}
 				if (record.cancelRequested) {
@@ -1510,6 +1509,9 @@ export class RecoveryJob implements DurableObject {
 				if (record.capabilityExpiresAt !== null && now >= record.capabilityExpiresAt) {
 					throw new TerminalRecoveryError("capability_expired", "recovery capability expired");
 				}
+				// Persist the successor before any authority call or state transition. If the
+				// process dies inside the slice, the host will durably redispatch this actor.
+				await this.options.alarms.setAlarm(now + DISPATCH_WATCHDOG_MS);
 				const authority = this.authority(record.vaultId, record.vaultGeneration);
 				if (record.kind === "capture") {
 					const capture = this.descriptor("capture");
@@ -1526,12 +1528,17 @@ export class RecoveryJob implements DurableObject {
 				else if (record.kind === "gc") await this.runGcSlice(record, authority);
 				else await this.runPurgeSlice(record);
 				record = this.store.load();
-				if (!record || isTerminalRecoveryState(record.state)) return;
+				if (!record || isTerminalRecoveryState(record.state)) {
+					await this.options.alarms.deleteAlarm();
+					return;
+				}
 				if (this.deferredAlarmAt !== null || Date.now() - startedAt >= ALARM_SLICE_WALL_MS) break;
 			}
-			await this.ctx.storage.setAlarm(this.deferredAlarmAt ?? Date.now());
+			await this.options.alarms.setAlarm(this.deferredAlarmAt ?? Date.now());
 		} catch (error) {
 			await this.handleFailure(error);
+		} finally {
+			this.store.setMetadata("dispatch-identity", { dispatchId, startedAt, completedAt: Date.now() });
 		}
 	}
 
@@ -1553,11 +1560,15 @@ export class RecoveryJob implements DurableObject {
 			errorRef: null,
 			updatedAt: Date.now(),
 		});
+		await this.options.alarms.deleteAlarm();
 	}
 
 	private async handleFailure(error: unknown): Promise<void> {
 		const record = this.store.load();
-		if (!record || isTerminalRecoveryState(record.state)) return;
+		if (!record || isTerminalRecoveryState(record.state)) {
+			await this.options.alarms.deleteAlarm();
+			return;
+		}
 		if (record.cancelRequested) {
 			await this.finishCancellation(record);
 			return;
@@ -1581,7 +1592,7 @@ export class RecoveryJob implements DurableObject {
 				internalError: RecoveryJobStateStore.safeInternalError(error),
 				updatedAt: now,
 			});
-			await this.ctx.storage.setAlarm(nextAttemptAt);
+			await this.options.alarms.setAlarm(nextAttemptAt);
 			return;
 		}
 		const code = error instanceof TerminalRecoveryError ? error.code : "recovery_failed";
@@ -1599,6 +1610,7 @@ export class RecoveryJob implements DurableObject {
 			internalError: RecoveryJobStateStore.safeInternalError(error),
 			updatedAt: now,
 		});
+		await this.options.alarms.deleteAlarm();
 	}
 
 	private initialCaptureProgress(): CaptureProgress {
@@ -1651,7 +1663,7 @@ export class RecoveryJob implements DurableObject {
 			const object = await this.bucket().get(base.rootKey);
 			if (!object) return { ...progress, mode: "plan", fullRebuild: true };
 			try {
-				const root = await parseAndVerifySnapshotRoot(await objectBytes(object), base.rootHash);
+				const root = await parseAndVerifySnapshotRoot(object.bytes, base.rootHash);
 				this.store.setMetadata("base-root", root);
 				progress = { ...progress, baseSnapshotId: base.snapshotId, baseRootKey: base.rootKey, baseRootHash: base.rootHash };
 			} catch {
@@ -1801,8 +1813,8 @@ export class RecoveryJob implements DurableObject {
 		if (!record) throw new Error("recovery job not initialized");
 		const key = `${recoveryStagingPrefix(recoveryV2Prefix(vaultPrefix(record.vaultId, record.vaultGeneration)), record.jobId)}/${kind}/${encoded.hash}.json.gz`;
 		const existing = await this.bucket().get(key);
-		if (existing) await decodeHashedRecoveryObject(await objectBytes(existing), encoded.hash);
-		else await this.bucket().put(key, encoded.compressedBytes, { httpMetadata: { contentType: "application/gzip" } });
+		if (existing) await decodeHashedRecoveryObject(existing.bytes, encoded.hash);
+		else await this.bucket().put(key, encoded.compressedBytes, { contentType: "application/gzip" });
 		return this.store.putArtifact({
 			artifactKind: kind,
 			logicalKey: String(sequence).padStart(12, "0"),
@@ -1817,7 +1829,7 @@ export class RecoveryJob implements DurableObject {
 	private async readStagedArray<T>(key: string, hash: string, parser: (value: unknown) => T): Promise<T[]> {
 		const object = await this.bucket().get(key);
 		if (!object) throw new RetryableRecoveryError("staging_missing", "recovery staging page missing");
-		const value = await decodeHashedRecoveryObject(await objectBytes(object), hash);
+		const value = await decodeHashedRecoveryObject(object.bytes, hash);
 		if (!Array.isArray(value)) throw new TerminalRecoveryError("staging_corrupt", "staging page is not an array");
 		return value.map(parser);
 	}
@@ -1883,7 +1895,7 @@ export class RecoveryJob implements DurableObject {
 			if (reconstruction.stagingKey) {
 				const staged = await this.bucket().get(reconstruction.stagingKey);
 				if (!staged || !reconstruction.stagingHash) throw new BodyDefectError("missing_history", entry, "staged reconstruction missing");
-				const encoded = await objectBytes(staged);
+				const encoded = staged.bytes;
 				if (await sha256Hex(encoded) !== reconstruction.stagingHash) throw new BodyDefectError("corrupt_history", entry, "staged reconstruction corrupt");
 				Y.applyUpdate(doc, encoded);
 				oldStagingKey = reconstruction.stagingKey;
@@ -1901,7 +1913,7 @@ export class RecoveryJob implements DurableObject {
 				const encoded = Y.encodeStateAsUpdate(doc);
 				const hash = await sha256Hex(encoded);
 				const key = `${recoveryStagingPrefix(recoveryV2Prefix(vaultPrefix(descriptor.vaultId, descriptor.vaultGeneration)), recoveryJobId("capture", descriptor.vaultId, descriptor.vaultGeneration, descriptor.captureId))}/body/${entry.bodyId}/${hash}.yjs`;
-				await this.bucket().put(key, encoded, { httpMetadata: { contentType: "application/octet-stream" } });
+				await this.bucket().put(key, encoded, { contentType: "application/octet-stream" });
 				this.store.setReconstruction({ ...reconstruction, cursor: chunk.nextCursor, stagingKey: key, stagingHash: hash, encodedBytes: encoded.byteLength });
 				if (oldStagingKey && oldStagingKey !== key) await this.bucket().delete(oldStagingKey);
 				return;
@@ -1918,7 +1930,7 @@ export class RecoveryJob implements DurableObject {
 				const existing = await this.bucket().get(key);
 				if (existing) {
 					try {
-						const current = gunzipRecoveryBytes(await objectBytes(existing), 4 * 1024 * 1024, 1_500_000);
+						const current = gunzipRecoveryBytes(existing.bytes, 4 * 1024 * 1024, 1_500_000);
 						if (await sha256Hex(current) !== reconstruction.expectedContentHash) {
 							throw new TerminalRecoveryError("content_collision", "content-addressed object collision");
 						}
@@ -1927,7 +1939,7 @@ export class RecoveryJob implements DurableObject {
 						throw new TerminalRecoveryError("content_collision", "content-addressed object is corrupt");
 					}
 				} else {
-					await this.bucket().put(key, compressed, { httpMetadata: { contentType: "application/gzip" } });
+					await this.bucket().put(key, compressed, { contentType: "application/gzip" });
 				}
 				this.store.putArtifact({ artifactKind: "content-object", logicalKey: `${entry.bodyId}:${entry.generation}`, objectKey: key, objectHash: reconstruction.expectedContentHash, entries: 1, bytes: plain.byteLength, metadata: null });
 				await authority.acknowledgeContentMaterialized({ captureId: descriptor.captureId, boundarySequence: descriptor.boundarySequence, capability: descriptor.capability, bodyId: entry.bodyId, generation: entry.generation, contentHash: reconstruction.expectedContentHash, plainBytes: plain.byteLength, objectKey: key });
@@ -1977,7 +1989,7 @@ export class RecoveryJob implements DurableObject {
 		}
 		const tree = trees[progress.buildTreeIndex]!;
 		const prefix = recoveryV2Prefix(vaultPrefix(descriptor.vaultId, descriptor.vaultGeneration));
-		const artifacts = new DirectR2Artifacts(this.bucket());
+		const artifacts = new DirectObjectArtifacts(this.bucket());
 		const manifestStore: CaptureManifestStore = new CaptureManifestStore(artifacts, authority, this.store, descriptor, prefix);
 		let checkpoint = this.store.getParsedMetadata(`tree-${tree}`, parseTreeCheckpoint);
 		if (!checkpoint) {
@@ -2060,7 +2072,7 @@ export class RecoveryJob implements DurableObject {
 			return;
 		}
 		const prefix = recoveryV2Prefix(vaultPrefix(descriptor.vaultId, descriptor.vaultGeneration));
-		const source = new R2ManifestNodeStore(new DirectR2Artifacts(this.bucket()), prefix);
+		const source = new R2ManifestNodeStore(new DirectObjectArtifacts(this.bucket()), prefix);
 		const verified = await Promise.all(frontiers.map(async (frontier) => {
 			const node = await readAndVerifyManifestNode(source, frontier.tree, frontier.nodeHash);
 			return { frontier, node, artifact: this.store.getArtifact("manifest-object", frontier.nodeHash), objectKey: manifestNodeObjectKey(prefix, frontier.nodeHash) };
@@ -2277,7 +2289,7 @@ export class RecoveryJob implements DurableObject {
 			if (reconstruction.stagingKey) {
 				const staged = await this.bucket().get(reconstruction.stagingKey);
 				if (!staged || !reconstruction.stagingHash) throw new RetryableRecoveryError("projection_staging_missing", "projection staging state missing");
-				const encoded = await objectBytes(staged);
+				const encoded = staged.bytes;
 				if (await sha256Hex(encoded) !== reconstruction.stagingHash) throw new TerminalRecoveryError("projection_staging_corrupt", "projection staging state corrupt");
 				Y.applyUpdate(doc, encoded);
 				oldStagingKey = reconstruction.stagingKey;
@@ -2298,7 +2310,7 @@ export class RecoveryJob implements DurableObject {
 				const encoded = Y.encodeStateAsUpdate(doc);
 				const hash = await sha256Hex(encoded);
 				const key = `${recoveryStagingPrefix(recoveryV2Prefix(vaultPrefix(descriptor.vaultId, descriptor.vaultGeneration)), recoveryJobId("projection", descriptor.vaultId, descriptor.vaultGeneration))}/body/${entry.bodyId}/${hash}.yjs`;
-				await this.bucket().put(key, encoded, { httpMetadata: { contentType: "application/octet-stream" } });
+				await this.bucket().put(key, encoded, { contentType: "application/octet-stream" });
 				this.store.setReconstruction({ ...reconstruction, cursor: chunk.nextCursor, stagingKey: key, stagingHash: hash, encodedBytes: encoded.byteLength });
 				if (oldStagingKey && oldStagingKey !== key) await this.bucket().delete(oldStagingKey);
 				return;
@@ -2317,7 +2329,7 @@ export class RecoveryJob implements DurableObject {
 			});
 			try {
 				if (!await this.bucket().head(key)) {
-					await this.bucket().put(key, gzipSync(plain, { level: 6 }), { httpMetadata: { contentType: "application/gzip" } });
+					await this.bucket().put(key, gzipSync(plain, { level: 6 }), { contentType: "application/gzip" });
 				}
 				await authority.acknowledgeProjectionContentMaterialized({
 					vaultId: descriptor.vaultId,
@@ -2345,7 +2357,7 @@ export class RecoveryJob implements DurableObject {
 	private async runRestoreSlice(record: RecoveryJobRecord, authority: RecoveryAuthorityRpc): Promise<void> {
 		const descriptor = this.descriptor("restore");
 		const prefix = recoveryV2Prefix(vaultPrefix(descriptor.vaultId, descriptor.vaultGeneration));
-		const source = new R2ManifestNodeStore(new DirectR2Artifacts(this.bucket()), prefix);
+		const source = new R2ManifestNodeStore(new DirectObjectArtifacts(this.bucket()), prefix);
 		let root = this.store.getParsedMetadata("restore-root", validateSnapshotRoot);
 		if (!root) {
 			const proof = await authority.validateRestoreAuthority({
@@ -2361,7 +2373,7 @@ export class RecoveryJob implements DurableObject {
 			}
 			const object = await this.bucket().get(proof.rootKey);
 			if (!object) throw new TerminalRecoveryError("restore_root_missing", "retained snapshot root is missing");
-			root = await parseAndVerifySnapshotRoot(await objectBytes(object), proof.rootHash);
+			root = await parseAndVerifySnapshotRoot(object.bytes, proof.rootHash);
 			if (root.snapshotId !== descriptor.snapshotId) throw new TerminalRecoveryError("restore_root_mismatch", "restore snapshot identity mismatch");
 			this.store.setMetadata("restore-root", root);
 			if (descriptor.selection.kind === "all") {
@@ -2541,7 +2553,7 @@ export class RecoveryJob implements DurableObject {
 			: blobObjectKey(record.vaultId, record.vaultGeneration, item.contentHash);
 		const object = await this.bucket().get(key);
 		if (!object || object.size > MAX_RESTORE_CONTENT_BYTES) return new Response("restore content missing", { status: 409 });
-		let bytes = await objectBytes(object);
+		let bytes = object.bytes;
 		if (item.kind === "markdown") bytes = gunzipRecoveryBytes(bytes, MAX_RESTORE_CONTENT_BYTES, MAX_RESTORE_CONTENT_BYTES);
 		if (bytes.byteLength !== item.size || await sha256Hex(bytes) !== item.contentHash) return new Response("restore content corrupt", { status: 409 });
 		return new Response(bytes, { headers: { "content-type": item.kind === "markdown" ? "text/markdown; charset=utf-8" : "application/octet-stream", "x-yaos-content-sha256": item.contentHash, "x-yaos-content-size": String(item.size) } });
@@ -2562,7 +2574,7 @@ export class RecoveryJob implements DurableObject {
 		const record = this.store.load();
 		if (record) {
 			this.commit(record, { processedEntries: progress.processedEntries, totalEntries: progress.totalEntries, updatedAt: Date.now() });
-			await this.ctx.storage.setAlarm(Date.now());
+			await this.options.alarms.setAlarm(Date.now());
 		}
 		return { accepted, complete: progress.complete, terminal: progress.complete };
 	}
@@ -2604,7 +2616,7 @@ export class RecoveryJob implements DurableObject {
 			if (frontier.objectKey.includes("/roots/sha256/")) {
 				const expected = frontier.objectKey.match(/\/([a-f0-9]{64})\.json$/)?.[1];
 				if (!expected) throw new TerminalRecoveryError("gc_root_corrupt", "invalid GC root key");
-				const root = await parseAndVerifySnapshotRoot(await objectBytes(object), expected);
+				const root = await parseAndVerifySnapshotRoot(object.bytes, expected);
 				const prefix = recoveryV2Prefix(vaultPrefix(descriptor.vaultId, descriptor.vaultGeneration));
 				this.store.enqueueGcFrontier([
 					{ objectKey: manifestNodeObjectKey(prefix, root.activeFilesTreeHash), domain: "recovery", tree: "active" },
@@ -2614,7 +2626,7 @@ export class RecoveryJob implements DurableObject {
 			} else if (frontier.tree) {
 				const expected = frontier.objectKey.match(/\/([a-f0-9]{64})\.json\.gz$/)?.[1];
 				if (!expected) throw new TerminalRecoveryError("gc_manifest_corrupt", "invalid manifest key");
-				const source: ManifestNodeSource = { readNode: async () => objectBytes(object) };
+				const source: ManifestNodeSource = { readNode: async () => object.bytes };
 				const verified = await readAndVerifyManifestNode(source, frontier.tree, expected);
 				if (verified.node.format === MANIFEST_BRANCH_FORMAT) {
 					this.store.enqueueGcFrontier(Object.values(verified.node.children).map((child) => ({
@@ -2652,7 +2664,7 @@ export class RecoveryJob implements DurableObject {
 		const page = await this.bucket().list({ prefix, cursor: typeof metadata.cursor === "string" ? metadata.cursor : undefined, limit: MAX_MARK_PAGE });
 		const candidates: string[] = [];
 		for (const object of page.objects) {
-			if (!isRecoveryGcSweepCandidate(object.uploaded.getTime(), descriptor.markStartedAt, Date.now(), descriptor.gracePeriodMs)) continue;
+			if (!isRecoveryGcSweepCandidate(object.uploadedAt, descriptor.markStartedAt, Date.now(), descriptor.gracePeriodMs)) continue;
 			const keyHash = await sha256Hex(encoder.encode(object.key));
 			if (!this.store.isGcMarked(descriptor.epoch, domain, keyHash)) candidates.push(object.key);
 		}
@@ -2705,13 +2717,46 @@ export class RecoveryJob implements DurableObject {
 	}
 
 	private async publishPurgeProgress(record: RecoveryJobRecord, descriptor: PurgeDescriptor): Promise<void> {
-		const stub = this.env.YAOS_CONFIG.get(this.env.YAOS_CONFIG.idFromName("global-config"));
-		const response = await stub.fetch(new Request("https://internal/__yaos/deletion/progress", {
+		const response = await this.options.controlPlane.call("global-config", new Request("https://internal/__yaos/deletion/progress", {
 			method: "POST",
 			headers: { "content-type": "application/json" },
 			body: JSON.stringify({ deletionId: descriptor.deletionId, vaultId: descriptor.vaultId, vaultGeneration: descriptor.vaultGeneration, jobId: record.jobId, capability: descriptor.capability, state: record.state, cursor: record.cursor, deletedObjects: record.deletedObjects, deletedBytes: record.deletedBytes, retryCount: record.retryCount, nextAttemptAt: record.nextAttemptAt, error: record.errorCode ? { code: record.errorCode, reference: record.errorRef } : null }),
 		}));
 		if (!response.ok) throw new RetryableRecoveryError("purge_progress_rejected", `purge progress rejected: ${response.status}`);
+	}
+}
+
+// Workers namespaces require the exported class type to carry the RPC brand.
+// eslint-disable-next-line @typescript-eslint/no-empty-object-type, @typescript-eslint/no-unsafe-declaration-merging -- Workers RPC requires the exported class type to carry its brand.
+export interface RecoveryJob extends Rpc.DurableObjectBranded {}
+
+export interface CloudflareRecoveryJobEnvironment {
+	YAOS_SYNC: DurableObjectNamespace;
+	YAOS_CONFIG: DurableObjectNamespace;
+	YAOS_BUCKET?: R2Bucket;
+}
+
+/** Cloudflare Durable Object wrapper for the portable recovery state machine. */
+// eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging -- Declaration merging preserves the Workers RPC brand on the Cloudflare wrapper.
+export class RecoveryJob implements DurableObject {
+	private readonly runtime: RecoveryJobRuntime;
+
+	constructor(state: DurableObjectState, env: CloudflareRecoveryJobEnvironment) {
+		this.runtime = new RecoveryJobRuntime({
+			storage: state.storage as RecoveryRuntimeStoragePort,
+			alarms: new CloudflareAlarmPort(state.storage),
+			objectStore: env.YAOS_BUCKET ? new CloudflareObjectStore(env.YAOS_BUCKET) : undefined,
+			recoveryAuthority: new CloudflareActorCalls(env.YAOS_SYNC),
+			controlPlane: new CloudflareActorCalls(env.YAOS_CONFIG),
+		});
+	}
+
+	fetch(request: Request): Promise<Response> {
+		return this.runtime.fetch(request);
+	}
+
+	alarm(): Promise<void> {
+		return this.runtime.dispatch(`cloudflare:${crypto.randomUUID()}`);
 	}
 }
 

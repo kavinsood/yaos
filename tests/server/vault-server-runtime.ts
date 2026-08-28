@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert";
-import { VaultSyncServer } from "../../server/src/server";
-import { makeDurableObjectState, makeEnv } from "../mocks/workerEnv.ts";
+import { VaultRuntime } from "../../server/src/server";
+import { makeDurableObjectState } from "../mocks/workerEnv.ts";
 import { suite } from "../harness.ts";
 
 const s = suite("vault-server-runtime");
@@ -39,7 +39,20 @@ function makeServer() {
 			deleteAllCalls++;
 		},
 	});
-	const server = new VaultSyncServer(context, makeEnv());
+	const server = new VaultRuntime({
+		storage: context.storage as never,
+		sockets: {
+			sockets: () => [],
+			createPair: () => { throw new Error("socket pair is replaced by test runtime"); },
+			accept: () => {},
+			upgradeResponse: () => { throw new Error("socket response is replaced by test runtime"); },
+		},
+		alarms: {
+			setAlarm: async (scheduledTime) => { await context.storage.setAlarm(scheduledTime); },
+			deleteAlarm: async () => { await context.storage.deleteAlarm(); },
+		},
+		execution: { waitUntil: (task) => { context.waitUntil(task); } },
+	});
 	const store = new RuntimeStore();
 	const accepted: Array<{ documentId: string; kind: "root" | "body"; deviceId: string }> = [];
 	const closed: string[] = [];

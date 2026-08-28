@@ -1,7 +1,7 @@
 import { runSingleFlight } from "../../server/src/asyncConcurrency";
 import { MAX_BLOB_UPLOAD_BYTES } from "../../server/src/contracts";
 import { getCapabilities } from "../../server/src/routes/auth";
-import { FakeR2Bucket, makeEnv } from "../mocks/workerEnv.ts";
+import { FakeObjectStore, makeEnv } from "../mocks/workerEnv.ts";
 import { suite } from "../harness.ts";
 
 const s = suite("server-hardening");
@@ -61,7 +61,7 @@ s.section("Test 2: runSingleFlight clears after a failed load so the next call c
 
 s.section("Test 8: public capabilities do not expose private update metadata");
 {
-	const env = makeEnv({ YAOS_BUCKET: new FakeR2Bucket() });
+	const env = makeEnv({ YAOS_BUCKET: new FakeObjectStore() });
 	const auth = {
 		mode: "claim",
 		claimed: true,
@@ -91,7 +91,7 @@ s.section("Test 8: public capabilities do not expose private update metadata");
 
 s.section("Test 9: capabilities expose one final identity-neutral shape");
 {
-	const env = makeEnv({ YAOS_BUCKET: new FakeR2Bucket() });
+	const env = makeEnv({ YAOS_BUCKET: new FakeObjectStore() });
 	const auth = {
 		mode: "claim",
 		claimed: true,

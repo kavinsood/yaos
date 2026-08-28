@@ -24,7 +24,15 @@ export interface VaultSocketAttachment {
 export interface VaultSocketPort {
 	close(code?: number, reason?: string): void;
 	deserializeAttachment(): unknown;
+	serializeAttachment(value: unknown): void;
 	send(message: ArrayBuffer | ArrayBufferView | string): void;
+}
+
+export interface VaultSocketRegistryPort {
+	sockets(): readonly VaultSocketPort[];
+	createPair(): { client: unknown; server: VaultSocketPort };
+	accept(socket: VaultSocketPort): void;
+	upgradeResponse(client: unknown): Response;
 }
 
 function validIdentity(value: string): boolean {
@@ -131,8 +139,8 @@ export function rootUpdateChangesDocument(current: Y.Doc, update: Uint8Array): b
 	}
 }
 
-interface SocketServiceOptions {
-	ctx: DurableObjectState;
+export interface SocketServiceOptions {
+	sockets: VaultSocketRegistryPort;
 	cache: VaultDocumentCache;
 	vaultId: () => string;
 	vaultGeneration: () => string;
@@ -148,7 +156,7 @@ export class VaultSocketService {
 
 	openBodyIds(): ReadonlySet<string> {
 		const result = new Set<string>();
-		for (const socket of this.options.ctx.getWebSockets()) {
+		for (const socket of this.options.sockets.sockets()) {
 			const attachment = parseVaultSocketAttachment(socket.deserializeAttachment());
 			if (attachment?.kind === "body") result.add(attachment.documentId);
 		}
@@ -162,7 +170,7 @@ export class VaultSocketService {
 		}
 		let rootCount = 0;
 		let bodyCount = 0;
-		for (const socket of this.options.ctx.getWebSockets()) {
+		for (const socket of this.options.sockets.sockets()) {
 			const attachment = parseVaultSocketAttachment(socket.deserializeAttachment());
 			if (attachment?.kind === "root") rootCount++;
 			if (attachment?.kind === "body") bodyCount++;
@@ -171,9 +179,9 @@ export class VaultSocketService {
 		if (kind === "body" && bodyCount >= MAX_BODY_SOCKETS) return Response.json({ error: "body_socket_limit" }, { status: 429 });
 		if (kind === "body" && !this.options.cache.admitBody(documentId)) return Response.json({ error: "body_cache_count" }, { status: 429 });
 		const loaded = this.options.cache.load(documentId, kind === "body", () => this.options.isActiveBody(documentId));
-		const pair = new WebSocketPair();
-		const client = pair[0];
-		const server = pair[1];
+		const pair = this.options.sockets.createPair();
+		const client = pair.client;
+		const server = pair.server;
 		const attachment: VaultSocketAttachment = {
 			vaultId: this.options.vaultId(),
 			vaultGeneration: this.options.vaultGeneration(),
@@ -184,7 +192,7 @@ export class VaultSocketService {
 			socketId: crypto.randomUUID(),
 		};
 		server.serializeAttachment(attachment);
-		this.options.ctx.acceptWebSocket(server);
+		this.options.sockets.accept(server);
 		const encoder = encoding.createEncoder();
 		encoding.writeVarUint(encoder, MESSAGE_SYNC);
 		syncProtocol.writeSyncStep1(encoder, loaded.doc);
@@ -196,7 +204,7 @@ export class VaultSocketService {
 			durableGeneration: loaded.generation,
 			runtimeEpoch: attachment.runtimeEpoch,
 		});
-		return new Response(null, { status: 101, webSocket: client });
+		return this.options.sockets.upgradeResponse(client);
 	}
 
 	async message(socket: VaultSocketPort, message: string | ArrayBuffer): Promise<void> {
@@ -242,7 +250,7 @@ export class VaultSocketService {
 	}
 
 	closeBody(bodyId: string): void {
-		for (const socket of this.options.ctx.getWebSockets()) {
+		for (const socket of this.options.sockets.sockets()) {
 			const attachment = parseVaultSocketAttachment(socket.deserializeAttachment());
 			if (attachment?.kind === "body" && attachment.documentId === bodyId) socket.close(1008, "body deleted");
 		}
@@ -250,7 +258,7 @@ export class VaultSocketService {
 	}
 	closeDevice(deviceId: string): number {
 		let closed = 0;
-		for (const socket of this.options.ctx.getWebSockets()) {
+		for (const socket of this.options.sockets.sockets()) {
 			const attachment = parseVaultSocketAttachment(socket.deserializeAttachment());
 			if (attachment?.deviceId !== deviceId) continue;
 			this.sendControl(socket, { type: "error", code: "unauthorized", reason: "device membership revoked" });
@@ -265,7 +273,7 @@ export class VaultSocketService {
 	}
 
 	closeAll(reason: string): void {
-		for (const socket of this.options.ctx.getWebSockets()) {
+		for (const socket of this.options.sockets.sockets()) {
 			try { socket.close(1001, reason); } catch { /* already closed */ }
 		}
 	}
@@ -278,7 +286,7 @@ export class VaultSocketService {
 			durableGeneration,
 			runtimeEpoch: this.options.runtimeEpoch,
 		};
-		for (const socket of this.options.ctx.getWebSockets()) {
+		for (const socket of this.options.sockets.sockets()) {
 			const attachment = parseVaultSocketAttachment(socket.deserializeAttachment());
 			if (attachment?.kind === "root" || attachment?.documentId === bodyId) this.sendControl(socket, value);
 		}
@@ -289,7 +297,7 @@ export class VaultSocketService {
 		encoding.writeVarUint(encoder, MESSAGE_SYNC);
 		syncProtocol.writeUpdate(encoder, update);
 		const frame = encoding.toUint8Array(encoder);
-		for (const socket of this.options.ctx.getWebSockets()) {
+		for (const socket of this.options.sockets.sockets()) {
 			if (socket === origin) continue;
 			const attachment = parseVaultSocketAttachment(socket.deserializeAttachment());
 			if (attachment?.documentId === documentId) {
@@ -350,7 +358,7 @@ export class VaultSocketService {
 	}
 
 	private relayRootAwareness(origin: VaultSocketPort, source: VaultSocketAttachment, frame: Uint8Array): void {
-		for (const socket of this.options.ctx.getWebSockets()) {
+		for (const socket of this.options.sockets.sockets()) {
 			if (socket === origin) continue;
 			const attachment = parseVaultSocketAttachment(socket.deserializeAttachment());
 			if (attachment?.kind === "root" && attachment.vaultId === source.vaultId) {

@@ -7,7 +7,7 @@ import type { Env, JsonResponse } from "./types";
 import { readVault } from "./vault";
 
 const EXISTS_BATCH_LIMIT = 50;
-const R2_HEAD_CONCURRENCY = 4;
+const OBJECT_HEAD_CONCURRENCY = 4;
 
 function isValidHash(hash: string): boolean {
 	return /^[0-9a-f]{64}$/.test(hash);
@@ -77,7 +77,7 @@ async function handleBlobExists(
 
 	const present = await mapWithConcurrency(
 		hashes,
-		R2_HEAD_CONCURRENCY,
+		OBJECT_HEAD_CONCURRENCY,
 		async (hash) => {
 			const object = await bucket.head(blobKey(vaultId, vaultGeneration, hash));
 			return object ? hash : null;
@@ -134,11 +134,7 @@ async function handleBlobUpload(
 	await bucket.put(
 		blobKey(vaultId, vaultGeneration, hash),
 		body,
-		{
-			httpMetadata: {
-				contentType: req.headers.get("Content-Type") ?? "application/octet-stream",
-			},
-		},
+		{ contentType: req.headers.get("Content-Type") ?? "application/octet-stream" },
 	);
 
 	return new Response(null, { status: 204 });
@@ -167,11 +163,11 @@ async function handleBlobDownload(
 	const headers = new Headers({
 		"Cache-Control": "no-store",
 	});
-	if (object.httpMetadata?.contentType) {
-		headers.set("Content-Type", object.httpMetadata.contentType);
+	if (object.contentType) {
+		headers.set("Content-Type", object.contentType);
 	} else {
 		headers.set("Content-Type", "application/octet-stream");
 	}
 
-	return new Response(object.body, { headers });
+	return new Response(object.bytes, { headers });
 }

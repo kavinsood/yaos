@@ -4,7 +4,6 @@ import {
 	VaultStore,
 	type VaultStoragePort,
 } from "../../server/src/vaultStore";
-import { makeDurableObjectState, makeEnv } from "../mocks/workerEnv.ts";
 import { suite } from "../harness.ts";
 
 const s = suite("snapshot-v2-retention");
@@ -84,13 +83,16 @@ function retentionService(initial: Snapshot[], dependentIds: string[] = []) {
 	const pins: Array<{ snapshotId: string; pinned: boolean }> = [];
 	const store = new RetentionStore(catalog, dependencies, deletes, pins);
 	const service = new VaultRecoveryService({
-		ctx: makeDurableObjectState(),
-		env: makeEnv(),
+		alarms: {
+			setAlarm: async () => {},
+			deleteAlarm: async () => {},
+		},
 		store: () => store,
 		runtimeEpoch: "runtime-retention-aa",
 		flushLoadedDocuments: async () => {},
 		hasPendingPersistence: () => false,
 		fenceRuntime: () => {},
+		closeSockets: () => {},
 	});
 	return { service, catalog, deletes, pins };
 }

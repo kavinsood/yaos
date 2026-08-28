@@ -38,8 +38,7 @@ export function supportsBuckets(env: Env): boolean {
 }
 
 export async function getStoredServerConfig(env: Env): Promise<StoredServerConfig> {
-	const id = env.YAOS_CONFIG.idFromName("global-config");
-	const response = await env.YAOS_CONFIG.get(id).fetch("https://internal/__yaos/config");
+	const response = await env.YAOS_CONFIG.call("global-config", new Request("https://internal/__yaos/config"));
 	if (!response.ok) throw new Error(`config fetch failed (${response.status})`);
 	return response.json();
 }
@@ -69,8 +68,7 @@ export async function getStoredServerConfigCached(env: Env): Promise<StoredServe
 }
 
 export async function configFetch(env: Env, path: string, init?: RequestInit): Promise<Response> {
-	const id = env.YAOS_CONFIG.idFromName("global-config");
-	return env.YAOS_CONFIG.get(id).fetch(`https://internal${path}`, init);
+	return env.YAOS_CONFIG.call("global-config", new Request(`https://internal${path}`, init));
 }
 
 function authStateFromConfig(config: StoredServerConfig): AuthStateCached {

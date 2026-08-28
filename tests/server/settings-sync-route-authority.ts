@@ -1,7 +1,8 @@
 import { strict as assert } from "node:assert";
-import worker from "../../server/src/index";
+import { handleWorkerRequest } from "../../server/src/index";
 import { hashSecret } from "../../server/src/identity";
 import { invalidateStoredServerConfigCache } from "../../server/src/routes/auth";
+import { handleOperatorVaultRuntimeRoute } from "../../server/src/routes/vault";
 import { makeConfigNamespace, makeEnv, makeVaultSyncNamespace } from "../mocks/workerEnv.ts";
 import { suite } from "../harness.ts";
 
@@ -63,11 +64,11 @@ s.test("settings route requires current vault membership and forwards only trust
 	const env = makeEnv({ YAOS_CONFIG: config, YAOS_SYNC: sync });
 	const endpoint = `https://example.test/vault/${VAULT_ID}/settings-sync/.obsidian?settingsFormatVersion=1`;
 
-	const missing = await worker.fetch(new Request(endpoint), env);
+	const missing = await handleWorkerRequest(new Request(endpoint), env);
 	assert.equal(missing.status, 401);
 	assert.equal(sync.calls, 0, "missing bearer does not allocate the vault runtime");
 
-	const foreign = await worker.fetch(new Request(
+	const foreign = await handleWorkerRequest(new Request(
 		`https://example.test/vault/${OTHER_VAULT_ID}/settings-sync/.obsidian?settingsFormatVersion=1`,
 		{ headers: { authorization: `Bearer ${DEVICE_TOKEN}` } },
 	), env);
@@ -75,20 +76,20 @@ s.test("settings route requires current vault membership and forwards only trust
 	assert.equal(sync.calls, 0, "wrong-vault bearer does not allocate the vault runtime");
 
 	revoked = true;
-	const denied = await worker.fetch(new Request(endpoint, {
+	const denied = await handleWorkerRequest(new Request(endpoint, {
 		headers: { authorization: `Bearer ${DEVICE_TOKEN}` },
 	}), env);
 	assert.equal(denied.status, 401);
 	assert.equal(sync.calls, 0, "revoked device does not allocate the vault runtime");
 
 	revoked = false;
-	const admitted = await worker.fetch(new Request(endpoint, {
+	const admitted = await handleWorkerRequest(new Request(endpoint, {
 		headers: { authorization: `Bearer ${DEVICE_TOKEN}` },
 	}), env);
 	assert.equal(admitted.status, 200);
 	assert.deepEqual(await admitted.json(), { seeded: false });
 	assert.equal(authorizationCalls, 4, "pre-auth and runtime authority both verify the admitted bearer");
-	assert.equal(sync.idFromNameCalls, 1);
+	assert.equal(sync.actorSelections, 1);
 	assert.equal(sync.calls, 1);
 	assert.equal(forwarded.length, 1);
 	assert.equal(new URL(forwarded[0]!.url).pathname, "/settings-sync/.obsidian");
@@ -98,6 +99,55 @@ s.test("settings route requires current vault membership and forwards only trust
 	assert.equal(forwarded[0]!.headers.get("x-yaos-device-id"), DEVICE_ID);
 	assert.equal(forwarded[0]!.headers.get("authorization"), null, "bearer secret is not forwarded to the runtime");
 	invalidateStoredServerConfigCache();
+});
+
+s.test("actor forwarding owns request bytes before the public response lifetime ends", async () => {
+	let sourceClosed = false;
+	let publicResponseSent = false;
+	let pullCount = 0;
+	const expected = new TextEncoder().encode("{\"kind\":\"delete\"}");
+	const source = new ReadableStream<Uint8Array>({
+		pull(controller) {
+			if (pullCount++ === 0) {
+				controller.enqueue(expected);
+				return;
+			}
+			if (publicResponseSent) {
+				controller.error(new Error("request stream outlived public response"));
+				return;
+			}
+			sourceClosed = true;
+			controller.close();
+		},
+	});
+	const forwarded: Request[] = [];
+	const env = makeEnv({
+		YAOS_CONFIG: makeConfigNamespace(async () => Response.json({
+			vault: {
+				vaultId: VAULT_ID,
+				vaultGeneration: VAULT_GENERATION,
+				name: "Settings",
+				state: "active",
+				createdAt: 1,
+				provisionedAt: 2,
+			},
+		})),
+		YAOS_SYNC: makeVaultSyncNamespace(async (request) => {
+			forwarded.push(request);
+			assert.equal(sourceClosed, true, "source stream must close before the actor is called");
+			return new Response(null, { status: 204 });
+		}),
+	});
+	const request = new Request(`https://example.test/vault/${VAULT_ID}/lifecycle`, {
+		method: "POST",
+		body: source,
+		duplex: "half",
+	} as RequestInit & { duplex: "half" });
+	const response = await handleOperatorVaultRuntimeRoute(request, env, VAULT_ID, "/lifecycle");
+	publicResponseSent = true;
+	assert.equal(response.status, 204);
+	assert.equal(forwarded.length, 1);
+	assert.deepEqual(new Uint8Array(await forwarded[0]!.arrayBuffer()), expected);
 });
 
 await s.done();

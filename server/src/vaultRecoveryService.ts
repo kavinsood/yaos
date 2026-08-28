@@ -1,6 +1,5 @@
 import { bytesToBase64Url } from "./base64url";
 import { sha256Hex } from "./hex";
-import type { Env } from "./routes/types";
 import type { VaultStore } from "./vaultStore";
 import {
 	CAPTURE_HARD_TTL_MS,
@@ -61,7 +60,8 @@ import {
 } from "./recoveryProtocol";
 import { canonicalJsonBytes as recoveryCanonicalJsonBytes, canonicalJsonText as recoveryCanonicalJsonText } from "./recoveryCanonicalJson";
 import { parseAndVerifySnapshotRoot, readAndVerifyManifestNode } from "./recoveryManifestTree";
-import { recoveryJobId, type RecoveryJobNamespacePort, type RecoveryJobStubPort } from "./recoveryExecutor";
+import type { ActorCallPort, AlarmPort, ObjectStorePort } from "./platformPorts";
+import { recoveryJobId } from "./recoveryExecutor";
 
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
@@ -79,19 +79,20 @@ async function digestChain(previousHex: string, label: string, pageHash: string)
 }
 
 export interface VaultRecoveryServiceOptions {
-	ctx: DurableObjectState;
-	env: Env;
+	alarms: AlarmPort;
+	objectStore?: ObjectStorePort;
+	recoveryJobs?: ActorCallPort;
 	store(): VaultStore;
 	runtimeEpoch: string;
 	flushLoadedDocuments(): Promise<void>;
 	hasPendingPersistence(): boolean;
 	fenceRuntime(): void;
+	closeSockets(reason: string): void;
 }
 
 export class VaultRecoveryService {
 	constructor(private readonly options: VaultRecoveryServiceOptions) {}
-	private get ctx(): DurableObjectState { return this.options.ctx; }
-	private get env(): Env { return this.options.env; }
+	private get objectStore(): ObjectStorePort | undefined { return this.options.objectStore; }
 	private get store(): VaultStore { return this.options.store(); }
 	private get runtimeEpoch(): string { return this.options.runtimeEpoch; }
 	private flushLoadedDocuments(): Promise<void> { return this.options.flushLoadedDocuments(); }
@@ -107,7 +108,7 @@ export class VaultRecoveryService {
 		} catch (error) {
 			console.warn("[yaos-vault] recovery projection refresh failed", errorMessage(error));
 		}
-		if (!this.env.YAOS_BUCKET) throw new Error("recovery storage unavailable");
+		if (!this.objectStore) throw new Error("recovery storage unavailable");
 		this.store.reapExpiredRecoveryCaptures();
 		const gc = this.store.latestGcEpoch();
 		if (gc?.state === "marking") throw new Error("capture admission paused for GC mark");
@@ -201,16 +202,14 @@ export class VaultRecoveryService {
 			}
 		}
 		descriptor = this.store.setRecoveryCaptureState(descriptor.captureId, "queued");
-		await this.ctx.storage.setAlarm(Date.now() + 60_000);
+		await this.options.alarms.setAlarm(Date.now() + 60_000);
 		return this.captureStarted(descriptor);
 	}
 	async beginVaultDeletion(input: { vaultId: string; deletionId: string }): Promise<void> {
 		if (this.store.vaultMetadata()?.vaultId !== input.vaultId) throw new Error("vault identity mismatch");
 		const jobsToCancel = this.store.beginVaultDeletion(input.deletionId, this.requireVaultGeneration(input.vaultId));
 		this.options.fenceRuntime();
-		for (const socket of this.ctx.getWebSockets()) {
-			try { socket.close(1001, "vault deletion in progress"); } catch { /* already closed */ }
-		}
+		this.options.closeSockets("vault deleting");
 		for (const jobId of jobsToCancel.captureJobIds) {
 			await this.recoveryJobJson(input.vaultId, jobId, "/__yaos/recovery-job/cancel", "POST");
 		}
@@ -473,7 +472,7 @@ export class VaultRecoveryService {
 		};
 	}
 	private async ensureRecoveryProjection(vaultId: string): Promise<void> {
-		if (!this.env.YAOS_BUCKET) return;
+		if (!this.objectStore) return;
 		const jobId = recoveryJobId("projection", vaultId, this.requireVaultGeneration(vaultId));
 		const initialized = await this.recoveryJobJson<
 			{ initialized: false } | {
@@ -690,11 +689,11 @@ export class VaultRecoveryService {
 
 	async finalizeCapture(request: FinalizeCaptureRequest): Promise<FinalizedCapture> {
 		const capture = await this.assertCaptureAuthority(request);
-		if (!this.env.YAOS_BUCKET) throw new Error("recovery storage unavailable");
+		if (!this.objectStore) throw new Error("recovery storage unavailable");
 		if (request.snapshotRootKey !== snapshotRootObjectKey(capture.vaultId, capture.vaultGeneration, request.snapshotRootHash)) throw new Error("invalid snapshot root key");
-		const rootObject = await this.env.YAOS_BUCKET.get(request.snapshotRootKey);
+		const rootObject = await this.objectStore.get(request.snapshotRootKey);
 		if (!rootObject || rootObject.size > MAX_CAPTURE_PLAN_BYTES) throw new Error("snapshot root missing or oversized");
-		const rootBytes = new Uint8Array(await rootObject.arrayBuffer());
+		const rootBytes = rootObject.bytes;
 		const root = await parseAndVerifySnapshotRoot(rootBytes, request.snapshotRootHash);
 		const vaultIdHash = await sha256Hex(new TextEncoder().encode(capture.vaultId));
 		const vaultGenerationHash = await sha256Hex(new TextEncoder().encode(capture.vaultGeneration));
@@ -710,8 +709,8 @@ export class VaultRecoveryService {
 		}
 		const nodeSource = {
 			readNode: async (hash: string): Promise<Uint8Array | null> => {
-				const object = await this.env.YAOS_BUCKET!.get(manifestObjectKey(capture.vaultId, capture.vaultGeneration, hash));
-				return object ? new Uint8Array(await object.arrayBuffer()) : null;
+				const object = await this.objectStore!.get(manifestObjectKey(capture.vaultId, capture.vaultGeneration, hash));
+				return object?.bytes ?? null;
 			},
 		};
 		const activeRoot = await readAndVerifyManifestNode(nodeSource, "active", root.activeFilesTreeHash);
@@ -827,7 +826,7 @@ export class VaultRecoveryService {
 			this.store.setRestoreAuthorityState(authority.restoreId, "failed");
 			throw error;
 		}
-		await this.ctx.storage.setAlarm(Date.now() + 60_000);
+		await this.options.alarms.setAlarm(Date.now() + 60_000);
 		return this.recoveryJobJson(input.vaultId, authority.jobId, "/__yaos/recovery-job/status", "GET");
 	}
 
@@ -947,7 +946,7 @@ export class VaultRecoveryService {
 
 	async startRecoveryGc(input: { vaultId: string; requestId: string }): Promise<unknown> {
 		if (this.store.vaultMetadata()?.vaultId !== input.vaultId) throw new Error("vault identity mismatch");
-		if (!this.env.YAOS_BUCKET) throw new Error("recovery storage unavailable");
+		if (!this.objectStore) throw new Error("recovery storage unavailable");
 		const current = this.store.latestGcEpoch();
 		const jobId = recoveryJobId("gc", input.vaultId, this.requireVaultGeneration(input.vaultId));
 		let activeEpoch = current && (current.state === "marking" || current.state === "sweeping") ? current : null;
@@ -1057,7 +1056,7 @@ export class VaultRecoveryService {
 				lastProgressAt: rawStatus?.updatedAt ?? null,
 			};
 		}
-		const storageAvailable = Boolean(this.env.YAOS_BUCKET);
+		const storageAvailable = this.objectStore !== undefined;
 		const activeRestoreDependency = this.store.activeRestoreDependency();
 		type ActiveRestoreStatus = {
 			restoreId: string; snapshotId: string; state: string; processedEntries: number; totalEntries: number | null;
@@ -1200,15 +1199,10 @@ export class VaultRecoveryService {
 			throw new Error("GC capability mismatch");
 		}
 	}
-	private recoveryJobs(): RecoveryJobNamespacePort {
-		const jobs = this.env.YAOS_RECOVERY_JOBS;
+	private recoveryJobs(): ActorCallPort {
+		const jobs = this.options.recoveryJobs;
 		if (!jobs) throw new Error("recovery job binding unavailable");
 		return jobs;
-	}
-
-	private recoveryJobStub(jobId: string): RecoveryJobStubPort {
-		const jobs = this.recoveryJobs();
-		return jobs.get(jobs.idFromName(jobId));
 	}
 
 	private async recoveryJobJson<T>(
@@ -1218,7 +1212,7 @@ export class VaultRecoveryService {
 		method: "GET" | "POST",
 		payload?: unknown,
 	): Promise<T> {
-		const response = await this.recoveryJobStub(jobId).fetch(`https://internal${path}`, {
+		const response = await this.recoveryJobs().call(jobId, new Request(`https://internal${path}`, {
 			method,
 			headers: {
 				[RECOVERY_RPC_HEADER]: "1",
@@ -1227,7 +1221,7 @@ export class VaultRecoveryService {
 				...(payload === undefined ? {} : { "content-type": "application/json" }),
 			},
 			...(payload === undefined ? {} : { body: JSON.stringify(payload) }),
-		});
+		}));
 		const value: unknown = await response.json();
 		if (!response.ok) {
 			const message = value && typeof value === "object" && "error" in value && typeof value.error === "string"
@@ -1243,7 +1237,7 @@ export class VaultRecoveryService {
 		path: string,
 		payload: unknown,
 	): Promise<Response> {
-		const response = await this.recoveryJobStub(jobId).fetch(`https://internal${path}`, {
+		const response = await this.recoveryJobs().call(jobId, new Request(`https://internal${path}`, {
 			method: "POST",
 			headers: {
 				[RECOVERY_RPC_HEADER]: "1",
@@ -1252,7 +1246,7 @@ export class VaultRecoveryService {
 				"content-type": "application/json",
 			},
 			body: JSON.stringify(payload),
-		});
+		}));
 		if (!response.ok) throw new Error(`recovery job content request failed (${response.status})`);
 		return response;
 	}

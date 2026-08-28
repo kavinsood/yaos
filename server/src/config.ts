@@ -25,6 +25,7 @@ import {
 	uniqueDeviceName,
 } from "./identity";
 import { json } from "./routes/http";
+import type { ControlPlaneStoragePort } from "./platformPorts";
 
 const CONFIG_FORMAT_KEY = "configFormat";
 const CLAIMED_KEY = "claimed";
@@ -389,8 +390,9 @@ export function parsePendingDestroyRecords(
 	});
 }
 
-export class ServerConfig {
-	constructor(private readonly state: DurableObjectState) {}
+/** Runtime-independent owner of server claim, enrollment, identity, and vault control-plane policy. */
+export class ControlPlaneRuntime {
+	constructor(private readonly storage: ControlPlaneStoragePort) {}
 
 	async fetch(request: Request): Promise<Response> {
 		try {
@@ -478,7 +480,7 @@ export class ServerConfig {
 			? body.vaultName.trim().slice(0, 80)
 			: "Personal";
 
-		return this.state.storage.transaction(async (txn) => {
+		return this.storage.transaction(async (txn) => {
 			const claimed = await txn.get<boolean>(CLAIMED_KEY);
 			const format = await txn.get<number>(CONFIG_FORMAT_KEY);
 			if (claimed === true && format !== CONFIG_FORMAT) {
@@ -520,10 +522,10 @@ export class ServerConfig {
 	private async handleReadVault(request: Request): Promise<Response> {
 		const vaultId = new URL(request.url).searchParams.get("vaultId");
 		if (!vaultId) return json({ error: "invalid vaultId" }, 400);
-		const vaults = parseVaultRecords(await this.state.storage.get(VAULTS_KEY));
+		const vaults = parseVaultRecords(await this.storage.get(VAULTS_KEY));
 		const vault = vaults.find((record) => record.vaultId === vaultId);
 		if (!vault) return json({ error: "unknown_vault" }, 404);
-		const lastError = await this.state.storage.get<string>(`${PROVISIONING_ERROR_KEY_PREFIX}${vaultId}`);
+		const lastError = await this.storage.get<string>(`${PROVISIONING_ERROR_KEY_PREFIX}${vaultId}`);
 		return json({ vault, provisioningError: typeof lastError === "string" ? lastError : null });
 	}
 
@@ -545,7 +547,7 @@ export class ServerConfig {
 		)) {
 			return json({ error: "invalid pairingCodeHash" }, 400);
 		}
-		return this.state.storage.transaction(async (txn) => {
+		return this.storage.transaction(async (txn) => {
 			const vaults = parseVaultRecords(await txn.get(VAULTS_KEY));
 			const vault = vaults.find((record) => record.vaultId === body.vaultId);
 			if (!vault) return json({ error: "unknown_vault" }, 404);
@@ -599,7 +601,7 @@ export class ServerConfig {
 			return json({ error: "invalid json" }, 400);
 		}
 		if (!body.vaultId || !body.vaultGeneration) return json({ error: "invalid provisioning failure" }, 400);
-		const vaults = parseVaultRecords(await this.state.storage.get(VAULTS_KEY));
+		const vaults = parseVaultRecords(await this.storage.get(VAULTS_KEY));
 		const vault = vaults.find((record) => record.vaultId === body.vaultId);
 		if (!vault || vault.vaultGeneration !== body.vaultGeneration) {
 			return json({ error: "unknown_vault_generation" }, 404);
@@ -607,7 +609,7 @@ export class ServerConfig {
 		const error = typeof body.error === "string" && body.error.trim()
 			? body.error.trim().slice(0, 512)
 			: "vault provisioning failed";
-		await this.state.storage.put(`${PROVISIONING_ERROR_KEY_PREFIX}${vault.vaultId}`, error);
+		await this.storage.put(`${PROVISIONING_ERROR_KEY_PREFIX}${vault.vaultId}`, error);
 		return json({ ok: false, retryable: true, vault, error }, 202);
 	}
 
@@ -628,7 +630,7 @@ export class ServerConfig {
 		} catch (error) {
 			return json({ error: error instanceof Error ? error.message : "invalid metadata" }, 400);
 		}
-		await this.state.storage.transaction(async (txn) => {
+		await this.storage.transaction(async (txn) => {
 			if (updateProvider !== null) await txn.put(UPDATE_PROVIDER_KEY, updateProvider);
 			if (updateRepoUrl !== null) await txn.put(UPDATE_REPO_URL_KEY, updateRepoUrl);
 			if (updateRepoBranch !== null) await txn.put(UPDATE_REPO_BRANCH_KEY, updateRepoBranch);
@@ -668,7 +670,7 @@ export class ServerConfig {
 		const desiredName = typeof body.deviceName === "string" && body.deviceName.trim()
 			? body.deviceName.trim().slice(0, 50)
 			: "unnamed-device";
-		return this.state.storage.transaction(async (txn) => {
+		return this.storage.transaction(async (txn) => {
 			const now = Date.now();
 			const storedReplays = parseEnrollmentReplayRecords(await txn.get(ENROLLMENT_REPLAYS_KEY));
 			const replays = storedReplays.filter((record) => record.expiresAt > now);
@@ -770,7 +772,7 @@ export class ServerConfig {
 		}
 		const now = Date.now();
 		const exp = now + PAIRING_CODE_TTL_MS;
-		return this.state.storage.transaction(async (txn) => {
+		return this.storage.transaction(async (txn) => {
 			const vaults = parseVaultRecords(await txn.get(VAULTS_KEY));
 			const vaultIds = new Set(vaults.map((vault) => vault.vaultId));
 			const vault = vaults.find((record) => record.vaultId === body.vaultId);
@@ -809,9 +811,9 @@ export class ServerConfig {
 			return json({ error: "unauthorized" }, 401);
 		}
 		if (!body.tokenHash) return json({ error: "unauthorized" }, 401);
-		const vaults = parseVaultRecords(await this.state.storage.get(VAULTS_KEY));
+		const vaults = parseVaultRecords(await this.storage.get(VAULTS_KEY));
 		const devices = parseDeviceRecords(
-			await this.state.storage.get(DEVICES_KEY),
+			await this.storage.get(DEVICES_KEY),
 			new Set(vaults.map((vault) => vault.vaultId)),
 		);
 		const device = findHashedRecord(devices, body.tokenHash, (record) => record.tokenHash);
@@ -839,7 +841,7 @@ export class ServerConfig {
 		) {
 			return json({ error: "invalid session" }, 400);
 		}
-		return this.state.storage.transaction(async (txn) => {
+		return this.storage.transaction(async (txn) => {
 			const sessions = parseOperatorSessionRecords(await txn.get(SESSIONS_KEY))
 				.filter((session) => session.exp > now);
 			if (sessions.some((session) => session.sessionHash === body.sessionHash)) {
@@ -860,7 +862,7 @@ export class ServerConfig {
 			return json({ ok: false }, 401);
 		}
 		if (!body.sessionHash) return json({ ok: false }, 401);
-		const sessions = parseOperatorSessionRecords(await this.state.storage.get(SESSIONS_KEY));
+		const sessions = parseOperatorSessionRecords(await this.storage.get(SESSIONS_KEY));
 		const match = findHashedRecord(sessions, body.sessionHash, (session) => session.sessionHash);
 		return match && match.exp > Date.now() ? json({ ok: true }) : json({ ok: false }, 401);
 	}
@@ -873,7 +875,7 @@ export class ServerConfig {
 		}
 		if (!body.sessionHash) return json({ error: "invalid session" }, 400);
 		const now = Date.now();
-		return this.state.storage.transaction(async (txn) => {
+		return this.storage.transaction(async (txn) => {
 			const sessions = parseOperatorSessionRecords(await txn.get(SESSIONS_KEY));
 			const match = findHashedRecord(sessions, body.sessionHash!, (session) => session.sessionHash);
 			const next = sessions.filter((session) => session.exp > now && session !== match);
@@ -890,7 +892,7 @@ export class ServerConfig {
 		} catch {
 			return json({ ok: false }, 401);
 		}
-		const stored = await this.state.storage.get<string>(OPERATOR_RECOVERY_HASH_KEY);
+		const stored = await this.storage.get<string>(OPERATOR_RECOVERY_HASH_KEY);
 		if (
 			typeof body.operatorRecoveryHash !== "string" || typeof stored !== "string"
 			|| !findHashedRecord([{ hash: stored }], body.operatorRecoveryHash, (record) => record.hash)
@@ -911,7 +913,7 @@ export class ServerConfig {
 			return json({ error: "invalid deviceId" }, 400);
 		}
 		const deviceId = body.deviceId;
-		return this.state.storage.transaction(async (txn) => {
+		return this.storage.transaction(async (txn) => {
 			const vaults = parseVaultRecords(await txn.get(VAULTS_KEY));
 			const devices = parseDeviceRecords(
 				await txn.get(DEVICES_KEY),
@@ -971,7 +973,7 @@ export class ServerConfig {
 			vaultGeneration: body.vaultGeneration,
 			deviceId: body.deviceId,
 		};
-		return this.state.storage.transaction(async (txn) => {
+		return this.storage.transaction(async (txn) => {
 			const pending = parsePendingDeviceRevocationRecords(await txn.get(PENDING_DEVICE_REVOCATIONS_KEY));
 			const match = pending.find((record) =>
 				record.vaultId === identity.vaultId
@@ -1004,7 +1006,7 @@ export class ServerConfig {
 			deviceId: body.deviceId,
 		};
 		const lastError = boundedRevocationError(body.lastError);
-		return this.state.storage.transaction(async (txn) => {
+		return this.storage.transaction(async (txn) => {
 			const pending = parsePendingDeviceRevocationRecords(await txn.get(PENDING_DEVICE_REVOCATIONS_KEY));
 			const match = pending.find((record) =>
 				record.vaultId === identity.vaultId
@@ -1027,7 +1029,7 @@ export class ServerConfig {
 		const name = typeof body.name === "string" ? body.name.trim() : "";
 		if (!body.deviceId) return json({ error: "invalid deviceId" }, 400);
 		if (name.length < 1 || name.length > 50) return json({ error: "invalid name" }, 400);
-		return this.state.storage.transaction(async (txn) => {
+		return this.storage.transaction(async (txn) => {
 			const vaults = parseVaultRecords(await txn.get(VAULTS_KEY));
 			const devices = parseDeviceRecords(
 				await txn.get(DEVICES_KEY),
@@ -1052,9 +1054,9 @@ export class ServerConfig {
 			return json({ error: "unauthorized" }, 401);
 		}
 		if (!body.deviceId || !body.vaultId) return json({ error: "unauthorized" }, 401);
-		const vaults = parseVaultRecords(await this.state.storage.get(VAULTS_KEY));
+		const vaults = parseVaultRecords(await this.storage.get(VAULTS_KEY));
 		const devices = parseDeviceRecords(
-			await this.state.storage.get(DEVICES_KEY),
+			await this.storage.get(DEVICES_KEY),
 			new Set(vaults.map((vault) => vault.vaultId)),
 		);
 		const vault = vaults.find((record) => record.vaultId === body.vaultId);
@@ -1076,7 +1078,7 @@ export class ServerConfig {
 		}
 		const vaultId = body.vaultId.trim();
 		const name = typeof body.name === "string" && body.name.trim() ? body.name.trim().slice(0, 80) : "Vault";
-		return this.state.storage.transaction(async (txn) => {
+		return this.storage.transaction(async (txn) => {
 			const vaults = parseVaultRecords(await txn.get(VAULTS_KEY));
 			const pendingDestroys = parsePendingDestroyRecords(
 				await txn.get(PENDING_DESTROYS_KEY),
@@ -1109,7 +1111,7 @@ export class ServerConfig {
 			return json({ error: "invalid json" }, 400);
 		}
 		if (!body.deviceId || !body.vaultId) return json({ error: "invalid device" }, 400);
-		return this.state.storage.transaction(async (txn) => {
+		return this.storage.transaction(async (txn) => {
 			const vaults = parseVaultRecords(await txn.get(VAULTS_KEY));
 			const devices = parseDeviceRecords(
 				await txn.get(DEVICES_KEY),
@@ -1133,7 +1135,7 @@ export class ServerConfig {
 		const name = typeof body.name === "string" ? body.name.trim() : "";
 		if (!body.vaultId) return json({ error: "invalid vaultId" }, 400);
 		if (name.length < 1 || name.length > 80) return json({ error: "invalid name" }, 400);
-		return this.state.storage.transaction(async (txn) => {
+		return this.storage.transaction(async (txn) => {
 			const vaults = parseVaultRecords(await txn.get(VAULTS_KEY));
 			const vault = vaults.find((record) => record.vaultId === body.vaultId);
 			if (!vault) return json({ error: "unknown_vault" }, 404);
@@ -1154,7 +1156,7 @@ export class ServerConfig {
 			return json({ error: "invalid vaultId" }, 400);
 		}
 		const vaultId = body.vaultId.trim();
-		return this.state.storage.transaction(async (txn) => {
+		return this.storage.transaction(async (txn) => {
 			const vaults = parseVaultRecords(await txn.get(VAULTS_KEY));
 			const vaultIds = new Set(vaults.map((vault) => vault.vaultId));
 			const nonDeletingVaultIds = new Set(
@@ -1246,7 +1248,7 @@ export class ServerConfig {
 		) {
 			return json({ error: "invalid pending destroy update" }, 400);
 		}
-		return this.state.storage.transaction(async (txn) => {
+		return this.storage.transaction(async (txn) => {
 			const vaults = parseVaultRecords(await txn.get(VAULTS_KEY));
 			const pendingDestroys = parsePendingDestroyRecords(
 				await txn.get(PENDING_DESTROYS_KEY),
@@ -1314,7 +1316,7 @@ export class ServerConfig {
 			return json({ error: "invalid deletion progress" }, 400);
 		}
 		const purgeState = body.state as PendingDestroyRecord["purgeState"];
-		return this.state.storage.transaction(async (txn) => {
+		return this.storage.transaction(async (txn) => {
 			const vaults = parseVaultRecords(await txn.get(VAULTS_KEY));
 			const pendingDestroys = parsePendingDestroyRecords(
 				await txn.get(PENDING_DESTROYS_KEY),
@@ -1349,7 +1351,7 @@ export class ServerConfig {
 			return json({ error: "invalid json" }, 400);
 		}
 		if (!body.codeId) return json({ error: "invalid codeId" }, 400);
-		return this.state.storage.transaction(async (txn) => {
+		return this.storage.transaction(async (txn) => {
 			const vaults = parseVaultRecords(await txn.get(VAULTS_KEY));
 			const codes = parsePairingCodeRecords(
 				await txn.get(PAIRING_CODES_KEY),
@@ -1364,16 +1366,16 @@ export class ServerConfig {
 
 	private async readConsole(): Promise<ConsoleState> {
 		const now = Date.now();
-		const vaults = parseVaultRecords(await this.state.storage.get(VAULTS_KEY));
+		const vaults = parseVaultRecords(await this.storage.get(VAULTS_KEY));
 		const vaultIds = new Set(vaults.map((vault) => vault.vaultId));
-		const devices = parseDeviceRecords(await this.state.storage.get(DEVICES_KEY), vaultIds);
-		const codes = parsePairingCodeRecords(await this.state.storage.get(PAIRING_CODES_KEY), vaultIds);
+		const devices = parseDeviceRecords(await this.storage.get(DEVICES_KEY), vaultIds);
+		const codes = parsePairingCodeRecords(await this.storage.get(PAIRING_CODES_KEY), vaultIds);
 		const pendingDestroys = parsePendingDestroyRecords(
-			await this.state.storage.get(PENDING_DESTROYS_KEY),
+			await this.storage.get(PENDING_DESTROYS_KEY),
 			new Set(vaults.filter((vault) => vault.state !== "deleting" && vault.state !== "delete_failed").map((vault) => vault.vaultId)),
 		);
 		const pendingDeviceRevocations = parsePendingDeviceRevocationRecords(
-			await this.state.storage.get(PENDING_DEVICE_REVOCATIONS_KEY),
+			await this.storage.get(PENDING_DEVICE_REVOCATIONS_KEY),
 		);
 		return {
 			vaults,
@@ -1385,13 +1387,13 @@ export class ServerConfig {
 	}
 
 	private async readConfig(): Promise<StoredServerConfig> {
-		const configFormat = await this.state.storage.get<number>(CONFIG_FORMAT_KEY);
-		const claimed = await this.state.storage.get<boolean>(CLAIMED_KEY);
-		const operatorRecoveryHash = await this.state.storage.get<string>(OPERATOR_RECOVERY_HASH_KEY);
-		const ticketSigningKey = await this.state.storage.get<string>(TICKET_SIGNING_KEY);
-		const updateProvider = await this.state.storage.get<UpdateProvider>(UPDATE_PROVIDER_KEY);
-		const updateRepoUrl = await this.state.storage.get<string>(UPDATE_REPO_URL_KEY);
-		const updateRepoBranch = await this.state.storage.get<string>(UPDATE_REPO_BRANCH_KEY);
+		const configFormat = await this.storage.get<number>(CONFIG_FORMAT_KEY);
+		const claimed = await this.storage.get<boolean>(CLAIMED_KEY);
+		const operatorRecoveryHash = await this.storage.get<string>(OPERATOR_RECOVERY_HASH_KEY);
+		const ticketSigningKey = await this.storage.get<string>(TICKET_SIGNING_KEY);
+		const updateProvider = await this.storage.get<UpdateProvider>(UPDATE_PROVIDER_KEY);
+		const updateRepoUrl = await this.storage.get<string>(UPDATE_REPO_URL_KEY);
+		const updateRepoBranch = await this.storage.get<string>(UPDATE_REPO_BRANCH_KEY);
 		const isCurrent = configFormat === CONFIG_FORMAT;
 		return {
 			configFormat: typeof configFormat === "number" ? configFormat : null,
@@ -1402,6 +1404,19 @@ export class ServerConfig {
 			updateRepoUrl: typeof updateRepoUrl === "string" && updateRepoUrl.length > 0 ? updateRepoUrl : null,
 			updateRepoBranch: typeof updateRepoBranch === "string" && updateRepoBranch.length > 0 ? updateRepoBranch : null,
 		};
+	}
+}
+
+/** Cloudflare transport/storage wrapper for the shared control-plane runtime. */
+export class ServerConfig {
+	private readonly runtime: ControlPlaneRuntime;
+
+	constructor(state: DurableObjectState) {
+		this.runtime = new ControlPlaneRuntime(state.storage as ControlPlaneStoragePort);
+	}
+
+	fetch(request: Request): Promise<Response> {
+		return this.runtime.fetch(request);
 	}
 }
 

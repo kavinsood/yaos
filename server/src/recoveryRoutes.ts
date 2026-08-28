@@ -6,6 +6,7 @@ import {
 	type RetainedSnapshotRoot,
 } from "./recoveryReadService";
 import { safeBlobPath, safeMarkdownPath } from "./shared/vaultPath";
+import type { ObjectStorePort } from "./platformPorts";
 
 const MAX_REQUEST_BYTES = 1024 * 1024;
 const MAX_CATALOG_PAGE = 100;
@@ -52,7 +53,7 @@ export interface RecoveryRouteAuthority {
 export interface RecoveryRouteOptions {
 	vaultId: string;
 	authority: RecoveryRouteAuthority;
-	bucket?: R2Bucket;
+	bucket?: ObjectStorePort;
 }
 
 function json(body: unknown, status = 200): Response {

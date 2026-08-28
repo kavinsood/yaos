@@ -1,5 +1,5 @@
 import { strict as assert } from "node:assert";
-import worker, { classifyWorkerRoute } from "../../server/src/index";
+import { classifyWorkerRoute, handleWorkerRequest } from "../../server/src/index";
 import type { Env } from "../../server/src/routes/types";
 import { makeEnv, makeTrapNamespace } from "../mocks/workerEnv.ts";
 import { suite } from "../harness.ts";
@@ -27,7 +27,7 @@ s.test("junk, legacy sync, and malformed vault routes return 404 before any DO",
 		["GET", "/vault/vault-route-0001/settings-sync/.obsidian/seed"],
 	];
 	for (const [method, path] of routes) {
-		const response = await worker.fetch(new Request(`https://example.test${path}`, { method }), trapEnv);
+		const response = await handleWorkerRequest(new Request(`https://example.test${path}`, { method }), trapEnv);
 		assert.equal(response.status, 404, `${method} ${path}`);
 	}
 	assert.deepEqual(configTrap.touched, []);

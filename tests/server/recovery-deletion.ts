@@ -3,7 +3,7 @@ import { hashSecret, OPERATOR_COOKIE } from "../../server/src/identity";
 import { recoveryJobId } from "../../server/src/recoveryExecutor";
 import { attemptVaultCleanup, handleOperatorVaultDeletionStatus } from "../../server/src/routes/operator";
 import {
-	FakeR2Bucket,
+	FakeObjectStore,
 	makeConfigNamespace,
 	makeEnv,
 	makeRecoveryJobNamespace,
@@ -73,7 +73,7 @@ s.test("room SQL deletion is never called before successful generation purge", a
 	});
 	let sqlDeletes = 0;
 	const result = await attemptVaultCleanup(
-		makeEnv({ YAOS_SYNC: sync, YAOS_RECOVERY_JOBS: jobs, YAOS_BUCKET: new FakeR2Bucket() }),
+		makeEnv({ YAOS_SYNC: sync, YAOS_RECOVERY_JOBS: jobs, YAOS_BUCKET: new FakeObjectStore() }),
 		vaultId,
 		pending(),
 		async () => {
@@ -100,7 +100,7 @@ s.test("successful generation purge permits exactly one SQL delete afterwards", 
 		return Response.json(jobStatus("complete"));
 	});
 	const result = await attemptVaultCleanup(
-		makeEnv({ YAOS_SYNC: sync, YAOS_RECOVERY_JOBS: jobs, YAOS_BUCKET: new FakeR2Bucket() }),
+		makeEnv({ YAOS_SYNC: sync, YAOS_RECOVERY_JOBS: jobs, YAOS_BUCKET: new FakeObjectStore() }),
 		vaultId,
 		pending(),
 		async () => {
@@ -121,7 +121,7 @@ s.test("retrying purge remains visible and never falls through to SQL deletion",
 	const jobs = makeRecoveryJobNamespace(async () => Response.json(jobStatus("retrying")));
 	let sqlDeletes = 0;
 	const result = await attemptVaultCleanup(
-		makeEnv({ YAOS_SYNC: sync, YAOS_RECOVERY_JOBS: jobs, YAOS_BUCKET: new FakeR2Bucket() }),
+		makeEnv({ YAOS_SYNC: sync, YAOS_RECOVERY_JOBS: jobs, YAOS_BUCKET: new FakeObjectStore() }),
 		vaultId,
 		pending(),
 		async () => {
@@ -176,7 +176,7 @@ s.test("failed purge reset is fail-closed and cannot trigger SQL deletion", asyn
 		throw new Error(`unexpected job path ${path}`);
 	});
 	const result = await attemptVaultCleanup(
-		makeEnv({ YAOS_SYNC: sync, YAOS_RECOVERY_JOBS: jobs, YAOS_BUCKET: new FakeR2Bucket() }),
+		makeEnv({ YAOS_SYNC: sync, YAOS_RECOVERY_JOBS: jobs, YAOS_BUCKET: new FakeObjectStore() }),
 		vaultId,
 		pending({ purgeState: "failed" }),
 		async () => {

@@ -7,6 +7,7 @@ import {
 	rootUpdateHasSafeAttachmentSemantics,
 	rootUpdateChangesDocument,
 	type VaultSocketPort,
+	type VaultSocketRegistryPort,
 	VaultSocketService,
 } from "../../server/src/vaultSocketService";
 import { suite } from "../harness.ts";
@@ -22,6 +23,15 @@ const attachment = {
 	deviceId: "device-authority-0001",
 	socketId: "socket-authority-0001",
 };
+
+function registry(sockets: readonly VaultSocketPort[]): VaultSocketRegistryPort {
+	return {
+		sockets: () => sockets,
+		createPair: () => { throw new Error("socket creation is outside this test"); },
+		accept: () => { throw new Error("socket acceptance is outside this test"); },
+		upgradeResponse: () => { throw new Error("socket upgrade is outside this test"); },
+	};
+}
 class StaleGenerationSocket implements VaultSocketPort {
 	constructor(private readonly onClose: (code: number, reason: string) => void) {}
 
@@ -33,6 +43,9 @@ class StaleGenerationSocket implements VaultSocketPort {
 	}
 	deserializeAttachment() {
 		return attachment;
+	}
+	serializeAttachment(): never {
+		throw new Error("stale socket must not change attachment");
 	}
 }
 
@@ -51,7 +64,7 @@ s.test("stale-generation sockets are fenced before decoding or document access",
 	let close: { code: number; reason: string } | null = null;
 	let cacheLoads = 0;
 	const service = new VaultSocketService({
-		ctx: { getWebSockets: () => [] },
+		sockets: registry([]),
 		cache: { load: () => { cacheLoads++; throw new Error("must not load"); } },
 		vaultId: () => attachment.vaultId,
 		vaultGeneration: () => "generation-authority-current",
@@ -84,7 +97,7 @@ s.test("root socket validation rejects structural changes and accepts duplicate 
 s.test("hibernated sockets from an old runtime epoch are fenced", async () => {
 	let close: { code: number; reason: string } | null = null;
 	const service = new VaultSocketService({
-		ctx: { getWebSockets: () => [] },
+		sockets: registry([]),
 		cache: { load: () => { throw new Error("must not load"); } },
 		vaultId: () => attachment.vaultId,
 		vaultGeneration: () => attachment.vaultGeneration,
@@ -136,13 +149,15 @@ s.test("direct protected attachment-map mutations are detected and validated", (
 
 s.test("device revocation closes every active root and body socket for that device", () => {
 	const closed: string[] = [];
-	const socket = (deviceId: string, documentId: string) => ({
+	const socket = (deviceId: string, documentId: string): VaultSocketPort => ({
 		deserializeAttachment: () => ({
 			...attachment,
 			deviceId,
 			documentId,
 			kind: documentId === "root" ? "root" as const : "body" as const,
 		}),
+		serializeAttachment: () => {},
+		send: () => {},
 		close: (_code: number, reason: string) => { closed.push(`${deviceId}:${documentId}:${reason}`); },
 	});
 	const sockets = [
@@ -151,7 +166,7 @@ s.test("device revocation closes every active root and body socket for that devi
 		socket("device-active", "root"),
 	];
 	const service = new VaultSocketService({
-		ctx: { getWebSockets: () => sockets },
+		sockets: registry(sockets),
 		cache: {},
 		vaultId: () => attachment.vaultId,
 		vaultGeneration: () => attachment.vaultGeneration,

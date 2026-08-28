@@ -15,7 +15,11 @@ export class BoundedBodyError extends Error {
  * Read a request body without retaining more than `maxBytes` of accepted chunks.
  * A chunk that crosses the limit is cancelled and rejected before it is retained.
  */
-export async function readBoundedBytes(request: Request, maxBytes: number): Promise<Uint8Array> {
+export async function readBoundedBytes(
+	request: Request,
+	maxBytes: number,
+	options: { allowEmpty?: boolean } = {},
+): Promise<Uint8Array> {
 	if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
 		throw new RangeError("maxBytes must be a non-negative safe integer");
 	}
@@ -37,6 +41,7 @@ export async function readBoundedBytes(request: Request, maxBytes: number): Prom
 
 	const body = request.body;
 	if (!body) {
+		if (options.allowEmpty) return new Uint8Array();
 		throw new BoundedBodyError("missing_body");
 	}
 
@@ -89,6 +94,7 @@ export async function readBoundedBytes(request: Request, maxBytes: number): Prom
 	}
 
 	if (total === 0) {
+		if (options.allowEmpty) return new Uint8Array();
 		throw new BoundedBodyError("missing_body");
 	}
 	if (chunks.length === 1) {

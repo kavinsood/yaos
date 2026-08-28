@@ -8,17 +8,18 @@ import {
 	recoveryProjectionPageAction,
 	recoveryRestoreProgress,
 	recoveryRetryDelay,
+	RecoveryJobRuntime,
 	shouldTraverseRecoveryGcObject,
 } from "../../server/src/recoveryJob";
 import {
-	CloudflareRecoveryJobExecutor,
+	ActorRecoveryJobExecutor,
 	parseRecoveryJobId,
 	recoveryJobId,
 	type CaptureStartDescriptor,
 } from "../../server/src/recoveryExecutor";
 import { encodeSnapshotRoot } from "../../server/src/recoveryManifestTree";
 import { recoveryPrefix, RECOVERY_RPC_HEADER, vaultGenerationPrefix } from "../../server/src/recoveryProtocol";
-import { FakeR2Bucket, makeRecoveryJobNamespace } from "../mocks/workerEnv.ts";
+import { FakeObjectStore, makeRecoveryJobNamespace } from "../mocks/workerEnv.ts";
 import { suite } from "../harness.ts";
 
 const s = suite("recovery-job");
@@ -141,7 +142,7 @@ s.test("executor initialization is idempotent and every operation carries genera
 		}
 		return Response.json(null);
 	});
-	const executor = new CloudflareRecoveryJobExecutor(namespace);
+	const executor = new ActorRecoveryJobExecutor(namespace);
 	const descriptor = captureDescriptor();
 	const first = await executor.startCapture(descriptor);
 	const replay = await executor.startCapture(descriptor);
@@ -166,7 +167,7 @@ s.test("descriptor generation and caller-supplied actor identity fail closed", a
 		invoked = true;
 		return Response.json({ jobId: "unexpected" });
 	});
-	const executor = new CloudflareRecoveryJobExecutor(namespace);
+	const executor = new ActorRecoveryJobExecutor(namespace);
 	let rejected = false;
 	try {
 		await executor.startCapture({ ...captureDescriptor(), jobId: recoveryJobId("capture", vaultId, "generation-job-bb", "capture_1") });
@@ -183,7 +184,7 @@ s.test("purge admission is restricted to the exact generation recovery and blob 
 		const body = await request.json() as { jobId: string };
 		return Response.json({ jobId: body.jobId });
 	});
-	const executor = new CloudflareRecoveryJobExecutor(namespace);
+	const executor = new ActorRecoveryJobExecutor(namespace);
 	const generationPrefix = vaultGenerationPrefix(vaultId, vaultGeneration);
 	await executor.startPurge({
 		vaultId,
@@ -212,7 +213,7 @@ s.test("purge admission is restricted to the exact generation recovery and blob 
 });
 
 s.test("create-only root publication reuses exact bytes and rejects poisoned objects", async () => {
-	const bucket = new FakeR2Bucket();
+	const bucket = new FakeObjectStore();
 	const prefix = recoveryPrefix(vaultId, vaultGeneration);
 	const encoded = await encodeSnapshotRoot(prefix, {
 		format: "yaos-recovery-v2",
@@ -247,6 +248,65 @@ s.test("create-only root publication reuses exact bytes and rejects poisoned obj
 		rejected = true;
 	}
 	if (!rejected) throw new Error("poisoned root collision was accepted");
+});
+
+s.test("dispatch arms a durable successor before a slice can be lost with transitioned state", async () => {
+	const alarmEvents: Array<{ kind: "set"; at: number } | { kind: "delete" }> = [];
+	let state: "queued" | "planning" | "complete" = "queued";
+	let enterSlice!: () => void;
+	let releaseSlice!: () => void;
+	const sliceEntered = new Promise<void>((resolve) => { enterSlice = resolve; });
+	const sliceRelease = new Promise<void>((resolve) => { releaseSlice = resolve; });
+	const runtime = new RecoveryJobRuntime({
+		storage: {} as never,
+		alarms: {
+			setAlarm: async (at) => { alarmEvents.push({ kind: "set", at }); },
+			deleteAlarm: async () => { alarmEvents.push({ kind: "delete" }); },
+		},
+		recoveryAuthority: {
+			call: async () => { throw new Error("authority must not run in watchdog ordering test"); },
+		},
+		controlPlane: {
+			call: async () => { throw new Error("control plane must not run in watchdog ordering test"); },
+		},
+	});
+	const record = () => ({
+		kind: "purge",
+		state,
+		nextAttemptAt: null,
+		cancelRequested: false,
+		capabilityExpiresAt: null,
+		vaultId,
+		vaultGeneration,
+	});
+	Object.defineProperties(runtime, {
+		store: {
+			value: {
+				load: record,
+				setMetadata: () => {},
+			},
+		},
+		runPurgeSlice: {
+			value: async () => {
+				state = "planning";
+				enterSlice();
+				await sliceRelease;
+				state = "complete";
+			},
+		},
+	});
+	const beforeDispatch = Date.now();
+	const dispatch = runtime.dispatch("dispatch:process-loss");
+	await sliceEntered;
+	const watchdog = alarmEvents[0];
+	if (!watchdog || watchdog.kind !== "set" || watchdog.at <= beforeDispatch) {
+		throw new Error("slice transitioned before its durable successor alarm was armed");
+	}
+	releaseSlice();
+	await dispatch;
+	if (alarmEvents.at(-1)?.kind !== "delete") {
+		throw new Error("terminal dispatch left its watchdog alarm armed");
+	}
 });
 
 await s.done();

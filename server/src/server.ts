@@ -5,7 +5,8 @@ import { MAX_BODY_ID_LENGTH, MAX_CATCH_UP_BODIES, MAX_CATCH_UP_BYTES, MAX_JSON_B
 import { sha256Hex } from "./hex";
 import { BoundedBodyError, readBoundedBytes } from "./readBoundedBytes";
 import { handleVaultRecoveryRpc } from "./recoveryRpcRouter";
-import type { Env } from "./routes/types";
+import type { ActorCallPort, AlarmPort, DrainPort, ExecutionPort, ObjectStorePort, VaultRuntimeStoragePort } from "./platformPorts";
+import { CloudflareActorCalls, CloudflareAlarmPort, CloudflareExecutionPort, CloudflareObjectStore, CloudflareSocketRegistry } from "./cloudflarePorts";
 import { handleSettingsSyncRequest, SettingsSyncStore } from "./settingsSyncStore";
 import {
 	SERVER_PROTOCOL_VERSION,
@@ -18,7 +19,7 @@ import { VaultCandidateService } from "./vaultCandidateService";
 import { blobKey } from "./vaultObjectStore";
 import { VaultDocumentCache } from "./vaultDocumentCache";
 import { VaultLifecycleService } from "./vaultLifecycleService";
-import { VaultSocketService, hasSafeRootAttachmentSemantics, rootUpdateChangesProtectedAttachmentMaps, rootUpdateHasSafeAttachmentSemantics } from "./vaultSocketService";
+import { VaultSocketService, type VaultSocketPort, type VaultSocketRegistryPort, hasSafeRootAttachmentSemantics, rootUpdateChangesProtectedAttachmentMaps, rootUpdateHasSafeAttachmentSemantics } from "./vaultSocketService";
 import { VaultStore, type CatalogMutation } from "./vaultStore";
 import { isCanonicalVaultId } from "./vaultId";
 import { VaultRecoveryService } from "./vaultRecoveryService";
@@ -95,13 +96,17 @@ export function encodeRootPathPublicationUpdate(rootState: Uint8Array, operation
 
 export { hasSafeRootAttachmentSemantics, rootUpdateChangesProtectedAttachmentMaps, rootUpdateHasSafeAttachmentSemantics };
 
-// Workers namespaces require the exported class type to carry the RPC brand.
-// eslint-disable-next-line @typescript-eslint/no-empty-object-type, @typescript-eslint/no-unsafe-declaration-merging -- declaration merging supplies the Workers RPC brand without importing the runtime-only cloudflare:workers module in Node tests.
-export interface VaultSyncServer extends Rpc.DurableObjectBranded {}
+export interface VaultRuntimeOptions {
+	storage: VaultRuntimeStoragePort;
+	sockets: VaultSocketRegistryPort;
+	alarms: AlarmPort;
+	execution: ExecutionPort;
+	objectStore?: ObjectStorePort;
+	recoveryJobs?: ActorCallPort;
+}
 
-/** Schema-4 root/body Durable Object composition and deletion fence. */
-// eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging -- see the RPC brand declaration above.
-export class VaultSyncServer implements DurableObject {
+/** Schema-4 root/body composition, independent of a worker or process host. */
+export class VaultRuntime implements DrainPort {
 	private store: VaultStore;
 	private settings: SettingsSyncStore;
 	private readonly runtimeEpoch = crypto.randomUUID();
@@ -115,10 +120,11 @@ export class VaultSyncServer implements DurableObject {
 	private readonly scheduledFlushes = new Map<string, Promise<void>>();
 	private flushChain: Promise<void> = Promise.resolve();
 	private deleted = false;
+	private drainPromise: Promise<void> | null = null;
 
-	constructor(private readonly ctx: DurableObjectState, env: Env) {
-		this.store = new VaultStore(ctx.storage);
-		this.settings = new SettingsSyncStore(ctx.storage);
+	constructor(private readonly options: VaultRuntimeOptions) {
+		this.store = new VaultStore(options.storage);
+		this.settings = new SettingsSyncStore(options.storage);
 		let socketOwner: VaultSocketService;
 		this.cache = new VaultDocumentCache(
 			this.store,
@@ -128,7 +134,7 @@ export class VaultSyncServer implements DurableObject {
 		const vaultId = () => this.requireMetadata().vaultId;
 		const vaultGeneration = () => this.requireMetadata().vaultGeneration;
 		socketOwner = new VaultSocketService({
-			ctx,
+			sockets: options.sockets,
 			cache: this.cache,
 			vaultId,
 			vaultGeneration,
@@ -143,12 +149,9 @@ export class VaultSyncServer implements DurableObject {
 			cache: this.cache,
 			sockets: () => this.sockets,
 			vaultId,
-			hasBlob: async (hash) => {
-				const bucket = env.YAOS_BUCKET;
-				return bucket
-					? await bucket.head(blobKey(vaultId(), vaultGeneration(), hash)) !== null
-					: false;
-			},
+			hasBlob: async (hash) => options.objectStore
+				? await options.objectStore.head(blobKey(vaultId(), vaultGeneration(), hash)) !== null
+				: false,
 			vaultGeneration,
 			runtimeEpoch: this.runtimeEpoch,
 			flush: (documentId) => this.flushDocument(documentId),
@@ -165,8 +168,9 @@ export class VaultSyncServer implements DurableObject {
 		});
 		this.bootstrap = new BootstrapService(this.store);
 		this.recovery = new VaultRecoveryService({
-			ctx,
-			env,
+			alarms: options.alarms,
+			objectStore: options.objectStore,
+			recoveryJobs: options.recoveryJobs,
 			store: () => this.store,
 			runtimeEpoch: this.runtimeEpoch,
 			flushLoadedDocuments: () => this.flushLoadedDocuments(),
@@ -174,12 +178,13 @@ export class VaultSyncServer implements DurableObject {
 				|| [...this.persistence.values()].some((entry) => entry.status === "degraded"),
 			fenceRuntime: () => {
 				this.deleted = true;
-				this.sockets.closeAll("vault deleting");
 			},
+			closeSockets: (reason) => this.sockets.closeAll(reason),
 		});
 	}
 
 	async fetch(request: Request): Promise<Response> {
+		if (this.drainPromise) return json({ error: "vault_draining" }, 503);
 		const vaultId = request.headers.get("x-yaos-vault-id");
 		if (!isCanonicalVaultId(vaultId)) return json({ error: "invalid_vault_identity" }, 400);
 		const url = new URL(request.url);
@@ -267,15 +272,27 @@ export class VaultSyncServer implements DurableObject {
 		}
 	}
 
-	async webSocketMessage(socket: WebSocket, message: string | ArrayBuffer): Promise<void> {
-		if (this.deleted) socket.close(1001, "vault maintenance");
+	async webSocketMessage(socket: VaultSocketPort, message: string | ArrayBuffer): Promise<void> {
+		if (this.deleted || this.drainPromise) socket.close(1001, "vault maintenance");
 		else await this.sockets.message(socket, message);
 	}
 
 	webSocketClose(): void {}
 
-	webSocketError(socket: WebSocket): void {
+	webSocketError(socket: VaultSocketPort): void {
 		try { socket.close(1011, "socket error"); } catch { /* already closed */ }
+	}
+
+	drain(): Promise<void> {
+		if (!this.drainPromise) {
+			this.drainPromise = (async () => {
+				this.sockets.closeAll("server draining");
+				await Promise.all([...this.scheduledFlushes.values()]);
+				await this.flushLoadedDocuments();
+				await this.flushChain;
+			})();
+		}
+		return this.drainPromise;
 	}
 
 	async alarm(): Promise<void> {
@@ -288,7 +305,7 @@ export class VaultSyncServer implements DurableObject {
 		}
 		if (this.store.activeRecoveryCapture() || this.store.activeRestoreAuthority()
 			|| gc?.state === "marking" || gc?.state === "sweeping") {
-			await this.ctx.storage.setAlarm(Date.now() + 60_000);
+			await this.options.alarms.setAlarm(Date.now() + 60_000);
 		}
 	}
 
@@ -328,10 +345,10 @@ export class VaultSyncServer implements DurableObject {
 		await this.flushChain;
 		this.cache.clear();
 		this.persistence.clear();
-		await this.ctx.storage.deleteAlarm();
-		await this.ctx.storage.deleteAll();
-		this.store = new VaultStore(this.ctx.storage);
-		this.settings = new SettingsSyncStore(this.ctx.storage);
+		await this.options.alarms.deleteAlarm();
+		await this.options.storage.deleteAll();
+		this.store = new VaultStore(this.options.storage);
+		this.settings = new SettingsSyncStore(this.options.storage);
 		return json({ deleted: true });
 	}
 
@@ -530,7 +547,7 @@ export class VaultSyncServer implements DurableObject {
 	}
 
 	private diagnostics(): Response {
-		return json({ ...this.statusObject(), sockets: this.ctx.getWebSockets().length, ...this.cache.diagnostics(), persistence: Object.fromEntries(this.persistence) });
+		return json({ ...this.statusObject(), sockets: this.options.sockets.sockets().length, ...this.cache.diagnostics(), persistence: Object.fromEntries(this.persistence) });
 	}
 
 	private statusObject() {
@@ -549,7 +566,7 @@ export class VaultSyncServer implements DurableObject {
 			.then(async () => { await this.flushDocument(documentId); })
 			.finally(() => this.scheduledFlushes.delete(documentId));
 		this.scheduledFlushes.set(documentId, scheduled);
-		this.ctx.waitUntil(scheduled);
+		this.options.execution.waitUntil(scheduled);
 	}
 
 	private async flushDocument(documentId: string): Promise<boolean> {
@@ -575,7 +592,7 @@ export class VaultSyncServer implements DurableObject {
 				const prior = this.persistence.get(documentId);
 				this.persistence.set(documentId, { status: "degraded", lastError: error instanceof Error ? error.message : String(error),
 					lastSuccessAt: prior?.lastSuccessAt ?? null, failures: (prior?.failures ?? 0) + 1 });
-				await this.ctx.storage.setAlarm(Date.now() + PERSIST_RETRY_MS);
+				await this.options.alarms.setAlarm(Date.now() + PERSIST_RETRY_MS);
 			}
 		});
 		await this.flushChain;
@@ -614,5 +631,53 @@ export class VaultSyncServer implements DurableObject {
 		const metadata = this.store.vaultMetadata();
 		if (!metadata) throw new Error("vault is not provisioned");
 		return metadata;
+	}
+}
+
+export interface CloudflareVaultEnvironment {
+	YAOS_BUCKET?: R2Bucket;
+	YAOS_RECOVERY_JOBS?: DurableObjectNamespace;
+}
+
+// Workers namespaces require the exported class type to carry the RPC brand.
+// eslint-disable-next-line @typescript-eslint/no-empty-object-type, @typescript-eslint/no-unsafe-declaration-merging -- Workers RPC requires the exported class type to carry its brand.
+export interface VaultSyncServer extends Rpc.DurableObjectBranded {}
+
+/** Cloudflare Durable Object wrapper for the portable schema-4 vault runtime. */
+// eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging -- Declaration merging preserves the Workers RPC brand on the Cloudflare wrapper.
+export class VaultSyncServer implements DurableObject {
+	private readonly runtime: VaultRuntime;
+
+	constructor(state: DurableObjectState, env: CloudflareVaultEnvironment) {
+		this.runtime = new VaultRuntime({
+			storage: state.storage as VaultRuntimeStoragePort,
+			sockets: new CloudflareSocketRegistry(state),
+			alarms: new CloudflareAlarmPort(state.storage),
+			execution: new CloudflareExecutionPort(state),
+			objectStore: env.YAOS_BUCKET ? new CloudflareObjectStore(env.YAOS_BUCKET) : undefined,
+			recoveryJobs: env.YAOS_RECOVERY_JOBS
+				? new CloudflareActorCalls(env.YAOS_RECOVERY_JOBS)
+				: undefined,
+		});
+	}
+
+	fetch(request: Request): Promise<Response> {
+		return this.runtime.fetch(request);
+	}
+
+	webSocketMessage(socket: WebSocket, message: string | ArrayBuffer): Promise<void> {
+		return this.runtime.webSocketMessage(socket, message);
+	}
+
+	webSocketClose(): void {
+		this.runtime.webSocketClose();
+	}
+
+	webSocketError(socket: WebSocket): void {
+		this.runtime.webSocketError(socket);
+	}
+
+	alarm(): Promise<void> {
+		return this.runtime.alarm();
 	}
 }

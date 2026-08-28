@@ -11,7 +11,7 @@ import { gzipRecoveryBytes } from "../../server/src/recoveryCanonicalJson";
 import { sha256Hex } from "../../server/src/hex";
 import { blobObjectKey, recoveryPrefix } from "../../server/src/recoveryProtocol";
 import { RecoveryReadError, RecoveryReadService } from "../../server/src/recoveryReadService";
-import { FakeR2Bucket } from "../mocks/workerEnv.ts";
+import { FakeObjectStore } from "../mocks/workerEnv.ts";
 import { suite } from "../harness.ts";
 
 const s = suite("snapshot-v2-lookup");
@@ -22,7 +22,7 @@ const vaultGeneration = "generation-lookup-aa";
 const prefix = recoveryPrefix(vaultId, vaultGeneration);
 
 async function seededSnapshot() {
-	const bucket = new FakeR2Bucket();
+	const bucket = new FakeObjectStore();
 	const markdown = encoder.encode("verified snapshot body");
 	const deletedMarkdown = encoder.encode("deleted historical body");
 	const attachment = new Uint8Array([0, 1, 127, 255]);

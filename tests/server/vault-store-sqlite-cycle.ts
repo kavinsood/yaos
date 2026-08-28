@@ -177,6 +177,31 @@ export class StoreCycle {
       expiresAt: 2_500,
       now: 2_002,
     });
+    const reacquiredWriter = store.acquireMaterializationLease({
+      leaseId: "capture-writer-lease-after-crash",
+      ownerKind: "capture",
+      ownerId: "capture-in-flight",
+      objectKeys: [garbageKey],
+      expiresAt: 2_600,
+      now: 2_003,
+    });
+    const staleLeaseRelease = store.releaseKeyLease("capture-writer-lease");
+    const crashReacquiredMaterializationLease = reacquiredWriter.leaseId === "capture-writer-lease-after-crash"
+      && staleLeaseRelease === 0
+      && store.hasMaterializationLease("capture-in-flight", garbageKey, 2_004);
+    let differentOwnerRejected = false;
+    try {
+      store.acquireMaterializationLease({
+        leaseId: "different-writer-lease",
+        ownerKind: "capture",
+        ownerId: "capture-other",
+        objectKeys: [garbageKey],
+        expiresAt: 2_700,
+        now: 2_004,
+      });
+    } catch {
+      differentOwnerRejected = true;
+    }
     const blockedSweep = store.acquireSweepLease({
       leaseId: "sweep-blocked-by-writer",
       epoch: gcTwo.epoch,
@@ -184,9 +209,9 @@ export class StoreCycle {
       domain: "recovery",
       objectKeys: [garbageKey],
       expiresAt: 3_000,
-      now: 2_003,
+      now: 2_005,
     });
-    store.releaseKeyLease("capture-writer-lease");
+    store.releaseKeyLease("capture-writer-lease-after-crash");
     const sweep = store.acquireSweepLease({
       leaseId: "sweep-indexed-garbage",
       epoch: gcTwo.epoch,
@@ -194,7 +219,7 @@ export class StoreCycle {
       domain: "recovery",
       objectKeys: [garbageKey],
       expiresAt: 3_000,
-      now: 2_004,
+      now: 2_006,
     });
     store.invalidateDeletedObjects(sweep.leaseId, sweep.approvedKeys);
     const indexedGarbageInvalidated = store.missingIndexedContent([garbageHash]).includes(garbageHash);
@@ -271,6 +296,8 @@ export class StoreCycle {
         gcEpochAdvanced: gcTwo.epoch === gcOne.epoch + 1,
         indexedGarbageApproved: sweep.approvedKeys.includes(garbageKey),
         activeWriterBlockedSweep: blockedSweep.approvedKeys.length === 0,
+        crashReacquiredMaterializationLease,
+        differentOwnerRejected,
         indexedGarbageInvalidated,
         deltaReset,
         deletionAuthority,
@@ -358,6 +385,8 @@ s.test("VaultStore completes journal/checkpoint/pin/feed-floor cycle on real SQL
 				indexedGarbageApproved: boolean;
 				activeWriterBlockedSweep: boolean;
 				indexedGarbageInvalidated: boolean;
+				crashReacquiredMaterializationLease: boolean;
+				differentOwnerRejected: boolean;
 				deltaReset: boolean;
 				deletionAuthority: boolean;
 			};
@@ -383,10 +412,12 @@ s.test("VaultStore completes journal/checkpoint/pin/feed-floor cycle on real SQL
 		s.check(result.textLength === 1_200_060, "chunked checkpoint reconstruction preserves exact body state");
 		s.check(result.authority.deletionAuthority, "vault deletion authority remains generation-fenced");
 		s.check(
-			result.authority.activeWriterBlockedSweep
+			result.authority.crashReacquiredMaterializationLease
+				&& result.authority.differentOwnerRejected
+				&& result.authority.activeWriterBlockedSweep
 				&& result.authority.indexedGarbageApproved
 				&& result.authority.indexedGarbageInvalidated,
-			"active writer lease fences sweep; released unreachable garbage is approved and invalidated",
+			"same logical writer replaces a crash-stale lease, other writers and GC remain fenced until release",
 		);
 		s.check(result.authority.deltaReset, "delta fallback atomically clears committed page chain and digest");
 		s.check(

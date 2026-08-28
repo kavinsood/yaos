@@ -2,7 +2,8 @@
  * Multivault plane: identity, unique names, lifecycle, cleanup, operator
  * sessions, and exact schema admission.
  */
-import ServerConfig from "../../server/src/config";
+import { ControlPlaneRuntime } from "../../server/src/config";
+import type { ControlPlaneStoragePort, ControlPlaneTransactionPort } from "../../server/src/platformPorts";
 import { hashSecret, OPERATOR_COOKIE, PAIRING_CODE_TTL_MS, uniqueDeviceName } from "../../server/src/identity";
 import { verifyOperatorSession } from "../../server/src/routes/auth";
 import { handleOperatorLogout } from "../../server/src/routes/operator";
@@ -15,36 +16,21 @@ import { makeConfigNamespace, makeEnv } from "../mocks/workerEnv.ts";
 import { suite } from "../harness.ts";
 
 const s = suite("multivault-registry");
-function makeMemoryConfig(initial: Readonly<Record<string, unknown>> = {}): ServerConfig {
+function makeMemoryConfig(initial: Readonly<Record<string, unknown>> = {}): ControlPlaneRuntime {
 	const data = new Map<string, unknown>(Object.entries(initial));
-	const storage = {
-		get: async (key: string) => data.get(key),
+	const transaction: ControlPlaneTransactionPort = {
+		get: async <T = unknown>(key: string) => data.get(key) as T | undefined,
 		put: async (key: string, value: unknown) => {
 			data.set(key, value);
 		},
-		delete: async (key: string) => {
-			data.delete(key);
-		},
-		transaction: async <T>(
-			fn: (txn: {
-				get: (key: string) => Promise<unknown>;
-				put: (key: string, value: unknown) => Promise<void>;
-				delete: (key: string) => Promise<void>;
-			}) => Promise<T>,
-		): Promise<T> => {
-			return await fn({
-				get: async (key: string) => data.get(key),
-				put: async (key: string, value: unknown) => {
-					data.set(key, value);
-				},
-				delete: async (key: string) => {
-					data.delete(key);
-				},
-			});
-		},
+		delete: async (key: string) => data.delete(key),
 	};
-	// @ts-expect-error focused fake supplies only the storage surface ServerConfig uses.
-	return new ServerConfig({ storage });
+	const storage: ControlPlaneStoragePort = {
+		...transaction,
+		transaction: async <T>(fn: (txn: ControlPlaneTransactionPort) => Promise<T>): Promise<T> =>
+			await fn(transaction),
+	};
+	return new ControlPlaneRuntime(storage);
 }
 
 function jsonRequest(path: string, body: unknown): Request {
@@ -56,7 +42,7 @@ function jsonRequest(path: string, body: unknown): Request {
 }
 
 async function activateClaim(
-	config: ServerConfig,
+	config: ControlPlaneRuntime,
 	claim: Response,
 	pairingCodeHash?: string,
 	pairingPurpose: "origin" | "device" | "invite" = "device",

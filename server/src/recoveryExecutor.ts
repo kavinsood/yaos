@@ -1,20 +1,12 @@
 import type { RecoveryJobKind, RecoveryJobPhase } from "./recoveryJobState";
 import { isCanonicalVaultId } from "./vaultId";
 import { RECOVERY_RPC_HEADER, vaultGenerationPrefix } from "./recoveryProtocol";
+import type { ActorCallPort } from "./platformPorts";
 
 export interface JobHandle {
 	jobId: string;
 }
 
-
-export interface RecoveryJobStubPort {
-	fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response>;
-}
-
-export interface RecoveryJobNamespacePort {
-	idFromName(name: string): DurableObjectId;
-	get(id: DurableObjectId): RecoveryJobStubPort;
-}
 interface DescriptorBase {
 	jobId?: string;
 	vaultId: string;
@@ -218,7 +210,8 @@ function validateDescriptor(descriptor: RecoveryJobDescriptor): string {
 }
 
 async function callRecoveryJob<T>(
-	stub: RecoveryJobStubPort,
+	actors: ActorCallPort,
+	actorName: string,
 	vaultId: string,
 	vaultGeneration: string,
 	operation: "initialize" | "status" | "cancel",
@@ -230,7 +223,7 @@ async function callRecoveryJob<T>(
 		"x-yaos-vault-generation": vaultGeneration,
 	};
 	if (payload !== undefined) headers["content-type"] = "application/json";
-	const response = await stub.fetch(new Request(`https://internal/__yaos/recovery-job/${operation}`, {
+	const response = await actors.call(actorName, new Request(`https://internal/__yaos/recovery-job/${operation}`, {
 		method: operation === "status" ? "GET" : "POST",
 		headers,
 		body: payload === undefined ? undefined : JSON.stringify(payload),
@@ -242,15 +235,15 @@ async function callRecoveryJob<T>(
 	return await response.json() as T;
 }
 
-/** Cloudflare adapter for the runtime-independent executor port. */
-export class CloudflareRecoveryJobExecutor implements RecoveryJobExecutor {
-	constructor(private readonly namespace: RecoveryJobNamespacePort) {}
+/** Runtime-independent client for stable named recovery-job actors. */
+export class ActorRecoveryJobExecutor implements RecoveryJobExecutor {
+	constructor(private readonly actors: ActorCallPort) {}
 
 	private async start(descriptor: RecoveryJobDescriptor): Promise<JobHandle> {
 		const jobId = validateDescriptor(descriptor);
-		const stub = this.namespace.get(this.namespace.idFromName(jobId));
 		const initialized = await callRecoveryJob<{ jobId: string }>(
-			stub,
+			this.actors,
+			jobId,
 			descriptor.vaultId,
 			descriptor.vaultGeneration,
 			"initialize",
@@ -282,14 +275,12 @@ export class CloudflareRecoveryJobExecutor implements RecoveryJobExecutor {
 
 	async getStatus(jobId: string): Promise<RecoveryJobStatus> {
 		const parsed = parseRecoveryJobId(jobId);
-		const stub = this.namespace.get(this.namespace.idFromName(parsed.jobId));
-		return await callRecoveryJob<RecoveryJobStatus>(stub, parsed.vaultId, parsed.vaultGeneration, "status");
+		return await callRecoveryJob<RecoveryJobStatus>(this.actors, parsed.jobId, parsed.vaultId, parsed.vaultGeneration, "status");
 	}
 
 	async cancel(jobId: string): Promise<void> {
 		const parsed = parseRecoveryJobId(jobId);
-		const stub = this.namespace.get(this.namespace.idFromName(parsed.jobId));
-		await callRecoveryJob<null>(stub, parsed.vaultId, parsed.vaultGeneration, "cancel");
+		await callRecoveryJob<null>(this.actors, parsed.jobId, parsed.vaultId, parsed.vaultGeneration, "cancel");
 	}
 }
 

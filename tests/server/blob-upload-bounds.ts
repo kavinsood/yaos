@@ -1,6 +1,7 @@
 import { MAX_BLOB_UPLOAD_BYTES } from "../../server/src/contracts";
 import { handleBlobRoute } from "../../server/src/routes/blobs";
-import { FakeR2Bucket, makeConfigNamespace, makeEnv } from "../mocks/workerEnv.ts";
+import type { ObjectStorePort, ObjectWriteOptions } from "../../server/src/platformPorts";
+import { FakeObjectStore, makeConfigNamespace, makeEnv } from "../mocks/workerEnv.ts";
 import { suite } from "../harness.ts";
 
 const s = suite("blob-upload-bounds");
@@ -14,7 +15,7 @@ function json(body: unknown, status = 200): Response {
 	});
 }
 
-function blobEnv(bucket: R2Bucket) {
+function blobEnv(bucket: ObjectStorePort) {
 	return makeEnv({
 		YAOS_BUCKET: bucket,
 		YAOS_CONFIG: makeConfigNamespace(async (request) => {
@@ -61,23 +62,13 @@ async function errorMessage(response: Response): Promise<string | undefined> {
 	return (await response.json() as { error?: string }).error;
 }
 
-type R2PutValue = Parameters<R2Bucket["put"]>[1];
 
-class MetadataRecordingBucket extends FakeR2Bucket {
+class MetadataRecordingBucket extends FakeObjectStore {
 	contentType: string | null = null;
 
-	override put(
-		key: string,
-		value: R2PutValue,
-		options: R2PutOptions & { onlyIf: R2Conditional | Headers },
-	): Promise<R2Object | null>;
-	override put(key: string, value: R2PutValue, options?: R2PutOptions): Promise<R2Object>;
-	override async put(key: string, value: R2PutValue, options?: R2PutOptions): Promise<R2Object> {
-		const metadata = options?.httpMetadata;
-		this.contentType = metadata instanceof Headers
-			? metadata.get("Content-Type")
-			: metadata?.contentType ?? null;
-		return await super.put(key, value, options);
+	override async put(key: string, value: Uint8Array, options?: ObjectWriteOptions): Promise<void> {
+		this.contentType = options?.contentType ?? null;
+		await super.put(key, value, options);
 	}
 }
 
@@ -124,7 +115,7 @@ s.section("Crossing the undeclared size limit");
 			cancelled = true;
 		},
 	});
-	const bucket = new FakeR2Bucket();
+	const bucket = new FakeObjectStore();
 	const hash = "a".repeat(64);
 	const response = await handleBlobRoute(
 		blobEnv(bucket),
@@ -160,7 +151,7 @@ s.section("Declared length validation happens before body access");
 				throw new Error("body must not be accessed");
 			},
 		};
-		const bucket = new FakeR2Bucket();
+		const bucket = new FakeObjectStore();
 		const response = await handleBlobRoute(
 			blobEnv(bucket),
 			VAULT_ID,
@@ -178,7 +169,7 @@ s.section("Declared length validation happens before body access");
 s.section("Empty and failed streams");
 {
 	const hash = "c".repeat(64);
-	const emptyBucket = new FakeR2Bucket();
+	const emptyBucket = new FakeObjectStore();
 	const emptyResponse = await handleBlobRoute(
 		blobEnv(emptyBucket),
 		VAULT_ID,
@@ -205,7 +196,7 @@ s.section("Empty and failed streams");
 			controller.error(new Error("client disconnected"));
 		},
 	});
-	const failedBucket = new FakeR2Bucket();
+	const failedBucket = new FakeObjectStore();
 	const failedResponse = await handleBlobRoute(
 		blobEnv(failedBucket),
 		VAULT_ID,
@@ -222,7 +213,7 @@ s.section("Hash verification precedes publication");
 {
 	const body = encoder.encode("not the addressed content");
 	const wrongHash = "0".repeat(64);
-	const bucket = new FakeR2Bucket();
+	const bucket = new FakeObjectStore();
 	const stream = new ReadableStream<Uint8Array>({
 		start(controller) {
 			controller.enqueue(body);

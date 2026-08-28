@@ -1,34 +1,22 @@
 /**
- * Typed fakes for the Cloudflare Worker `Env` and the bindings hanging off it.
+ * Typed fakes for the portable worker environment and its narrow actor,
+ * object-store, socket-upgrade, and Durable Object wrapper seams.
  *
- * Server suites need an `Env` to call route handlers, but its bindings include
- * platform values such as `DurableObjectNamespace` and `R2Bucket`. Historically
- * suites built partial objects behind casts, which silenced the compiler on the
- * exact surface under test.
- *
- * The fakes below implement the narrow fetch-only ports used by vault and
- * recovery-job routes. Full platform interfaces are implemented only where the
- * product genuinely consumes them, such as config namespaces and R2 buckets.
- * Unused operations return `never` and throw so newly reached behavior fails
- * loudly instead of quietly producing `undefined`.
+ * Defaults are hostile: an unexpected actor call throws and records the
+ * access so route-classification tests prove rejected requests stayed blind.
  */
 
 import type {
-	RecoveryJobNamespacePort,
-	RecoveryJobStubPort,
-} from "../../server/src/recoveryExecutor.ts";
-import type {
-	Env,
-	VaultRuntimeStubPort,
-	VaultSyncNamespacePort,
-} from "../../server/src/routes/types.ts";
+	ActorCallPort,
+	ObjectBody,
+	ObjectListPage,
+	ObjectMetadata,
+	ObjectStorePort,
+	ObjectWriteOptions,
+	SocketUpgradePort,
+} from "../../server/src/platformPorts.ts";
+import type { Env } from "../../server/src/routes/types.ts";
 
-/** Independent ArrayBuffer over exactly `bytes`, never the parent allocation. */
-function ownedBuffer(bytes: Uint8Array): ArrayBuffer {
-	const copy = new ArrayBuffer(bytes.byteLength);
-	new Uint8Array(copy).set(bytes);
-	return copy;
-}
 
 // ---------------------------------------------------------------------------
 // Durable Object namespaces
@@ -43,106 +31,41 @@ export function makeDurableObjectId(name: string): DurableObjectId {
 	};
 }
 
-/**
- * A trap namespace that records every platform or narrow-port member reached.
- *
- * Its `never` returns satisfy both the full config namespace and the fetch-only
- * vault runtime namespace while guaranteeing any access fails loudly.
- */
-export interface FakeTrapNamespace {
-	/**
-	 * Names of every member accessed, in order.
-	 *
-	 * A suite asserting "this path never woke the Durable Object" needs a
-	 * positive observable, not just the absence of a thrown error: the throw
-	 * only surfaces if the caller does not swallow it.  Reading `touched` proves
-	 * the negative directly.
-	 */
+/** Named actor trap used to prove rejected routes do not reach storage-backed actors. */
+export interface FakeTrapNamespace extends ActorCallPort {
 	readonly touched: string[];
-	newUniqueId(options?: DurableObjectNamespaceNewUniqueIdOptions): never;
-	idFromName(name: string): never;
-	idFromString(id: string): never;
-	get(id: DurableObjectId, options?: DurableObjectNamespaceGetDurableObjectOptions): never;
-	getByName(name: string, options?: DurableObjectNamespaceGetDurableObjectOptions): never;
-	jurisdiction(jurisdiction: DurableObjectJurisdiction): never;
 }
 
-/**
- * A namespace whose every member records itself in `touched`, then throws
- * `message`. It proves rejected paths do not allocate any Durable Object.
- */
 export function makeTrapNamespace(message: string): FakeTrapNamespace {
 	const touched: string[] = [];
-	const trap = (member: string) => (): never => {
-		touched.push(member);
-		throw new Error(`${message} (via ${member})`);
-	};
 	return {
 		touched,
-		newUniqueId: trap("newUniqueId"),
-		idFromName: trap("idFromName"),
-		idFromString: trap("idFromString"),
-		get: trap("get"),
-		getByName: trap("getByName"),
-		jurisdiction: trap("jurisdiction"),
+		call(actorName: string): Promise<Response> {
+			touched.push(`call:${actorName}`);
+			throw new Error(`${message} (via call)`);
+		},
 	};
 }
 
-/** A config namespace whose stub `fetch` is supplied by the test. */
-export interface FakeConfigNamespace extends DurableObjectNamespace {
-	/** How many times a stub was looked up via `get`/`getByName`. */
+export interface FakeConfigNamespace extends ActorCallPort {
 	readonly calls: number;
 }
 
-/**
- * A `YAOS_CONFIG` namespace that hands every lookup the same stub, whose
- * `fetch` is `fetchImpl`.
- *
- * `DurableObjectStub<undefined>` is `{ fetch, connect, id, name? }` — the RPC
- * provider half collapses away when the namespace is unparameterised — so the
- * whole stub is buildable.  `connect` opens a raw TCP socket and no config
- * lookup does that, so it throws.
- */
 export function makeConfigNamespace(
 	fetchImpl: (req: Request) => Promise<Response>,
 ): FakeConfigNamespace {
 	let calls = 0;
-	const stub = (id: DurableObjectId): DurableObjectStub => ({
-		id,
-		name: id.name,
-		fetch: async (input: RequestInfo | URL, init?: RequestInit) =>
-			await fetchImpl(input instanceof Request ? input : new Request(String(input), init)),
-		connect: (): never => {
-			throw new Error("FakeConfigNamespace: stub.connect() is not implemented");
-		},
-	});
 	return {
 		get calls() {
 			return calls;
 		},
-		newUniqueId: () => makeDurableObjectId("global-config"),
-		idFromName: (name: string) => makeDurableObjectId(name),
-		idFromString: (id: string) => makeDurableObjectId(id),
-		get: (id: DurableObjectId) => {
+		async call(_actorName: string, request: Request): Promise<Response> {
 			calls++;
-			return stub(id);
-		},
-		getByName: (name: string) => {
-			calls++;
-			return stub(makeDurableObjectId(name));
-		},
-		jurisdiction: (): never => {
-			throw new Error("FakeConfigNamespace: jurisdiction() is not implemented");
+			return await fetchImpl(request);
 		},
 	};
 }
 
-/**
- * A config namespace that answers every lookup with `config` as JSON.
- *
- * Convenience over `makeConfigNamespace` for the common case: suites that only
- * need the stored server config to come back.
- */
 export function makeStoredConfigNamespace(config: unknown): FakeConfigNamespace {
 	return makeConfigNamespace(async () =>
 		new Response(JSON.stringify(config), {
@@ -150,58 +73,38 @@ export function makeStoredConfigNamespace(config: unknown): FakeConfigNamespace 
 			headers: { "Content-Type": "application/json" },
 		}));
 }
-/** A typed `YAOS_SYNC` namespace whose fetch-only stub is supplied by the test. */
-export interface FakeVaultSyncNamespace extends VaultSyncNamespacePort {
-	/** How many times the stub was looked up via `get`. */
+
+export interface FakeVaultSyncNamespace extends ActorCallPort {
 	readonly calls: number;
-	/** How many named Durable Object identities were derived. */
-	readonly idFromNameCalls: number;
+	readonly actorSelections: number;
 }
 
 export function makeVaultSyncNamespace(
 	fetchImpl: (req: Request) => Promise<Response>,
 ): FakeVaultSyncNamespace {
-	let idFromNameCalls = 0;
+	let actorSelections = 0;
 	let calls = 0;
-	const stub = (): VaultRuntimeStubPort => ({
-		fetch: async (input: RequestInfo | URL, init?: RequestInit) =>
-			await fetchImpl(input instanceof Request ? input : new Request(String(input), init)),
-	});
-	const namespace: FakeVaultSyncNamespace = {
+	return {
 		get calls() {
 			return calls;
 		},
-		get idFromNameCalls() {
-			return idFromNameCalls;
+		get actorSelections() {
+			return actorSelections;
 		},
-		idFromName: (name: string) => {
-			idFromNameCalls++;
-			return makeDurableObjectId(name);
-		},
-		get: () => {
+		async call(_actorName: string, request: Request): Promise<Response> {
+			actorSelections++;
 			calls++;
-			return stub();
+			return await fetchImpl(request);
 		},
 	};
-	return namespace;
-}
-/** The fetch-only recovery-job stub surface exercised by server tests. */
-export type FakeRecoveryJobStub = RecoveryJobStubPort;
-
-/** The named-actor recovery namespace surface exercised by server tests. */
-export interface FakeRecoveryJobNamespace extends RecoveryJobNamespacePort {
-	get(id: DurableObjectId): FakeRecoveryJobStub;
 }
 
+export type FakeRecoveryJobNamespace = ActorCallPort;
 export function makeRecoveryJobNamespace(
 	fetchImpl: (req: Request) => Promise<Response>,
 ): FakeRecoveryJobNamespace {
 	return {
-		idFromName: (name: string) => makeDurableObjectId(name),
-		get: () => ({
-			fetch: async (input: RequestInfo | URL, init?: RequestInit) =>
-				await fetchImpl(input instanceof Request ? input : new Request(String(input), init)),
-		}),
+		call: async (_actorName: string, request: Request) => await fetchImpl(request),
 	};
 }
 
@@ -304,190 +207,86 @@ export function makeDurableObjectState(options: FakeDurableObjectStateOptions = 
 
 
 // ---------------------------------------------------------------------------
-// R2
+// Object storage
 // ---------------------------------------------------------------------------
 
-/** Every value `R2Bucket.put` accepts. */
-type R2PutValue = ReadableStream | ArrayBuffer | ArrayBufferView | string | null | Blob;
-
-async function putValueToBytes(value: R2PutValue): Promise<Uint8Array> {
-	if (value === null) return new Uint8Array(0);
-	if (typeof value === "string") return new TextEncoder().encode(value);
-	if (value instanceof ArrayBuffer) return new Uint8Array(value.slice(0));
-	if (ArrayBuffer.isView(value)) {
-		return new Uint8Array(
-			value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength),
-		);
-	}
-	// Blob and ReadableStream both reach bytes through Response.
-	return new Uint8Array(await new Response(value).arrayBuffer());
-}
-
-/**
- * The R2 object metadata fields, as plain properties.
- *
- * Spelled as its own interface rather than reusing `R2Object` because
- * `R2Object` declares `writeHttpMetadata` as a *method*, which lives on the
- * prototype and is therefore dropped by an object spread — building the body
- * variant with `{ ...makeR2Object(...) }` silently loses it.  As a property
- * signature it survives the spread.
- */
-interface R2Meta {
-	key: string;
-	version: string;
-	size: number;
-	etag: string;
-	httpEtag: string;
-	checksums: R2Checksums;
-	uploaded: Date;
-	storageClass: string;
-	writeHttpMetadata: (headers: Headers) => void;
-}
-
-/**
- * R2 metadata for `bytes` stored at `key`.
- *
- * `version`/`etag` are derived from key and length rather than a real content
- * hash: no assertion in any suite depends on their value, and inventing a hash
- * here would make them look authoritative when they are not.
- */
-function makeR2Meta(key: string, bytes: Uint8Array): R2Meta {
-	const etag = `${key.length.toString(16)}-${bytes.byteLength.toString(16)}`;
+function makeObjectMetadata(key: string, bytes: Uint8Array): ObjectMetadata {
 	return {
 		key,
-		version: etag,
 		size: bytes.byteLength,
-		etag,
-		httpEtag: `"${etag}"`,
-		checksums: { toJSON: () => ({}) },
-		uploaded: new Date(0),
-		storageClass: "Standard",
-		writeHttpMetadata: (_headers: Headers) => {},
+		uploadedAt: 0,
+		contentType: null,
+		customMetadata: {},
 	};
 }
 
-function makeR2Object(key: string, bytes: Uint8Array): R2Object {
-	return makeR2Meta(key, bytes);
+function makeObjectBody(key: string, bytes: Uint8Array): ObjectBody {
+	return { ...makeObjectMetadata(key, bytes), bytes: bytes.slice() };
 }
 
-function makeR2ObjectBody(key: string, bytes: Uint8Array): R2ObjectBody {
-	let bodyUsed = false;
-	return {
-		...makeR2Meta(key, bytes),
-		get bodyUsed() {
-			return bodyUsed;
-		},
-		get body() {
-			bodyUsed = true;
-			// Response.body is typed nullable, but a Response constructed over a
-			// non-null body always has one.
-			return new Response(ownedBuffer(bytes)).body!;
-		},
-		arrayBuffer: async () => ownedBuffer(bytes),
-		bytes: async () => new Uint8Array(ownedBuffer(bytes)),
-		text: async () => new TextDecoder().decode(bytes),
-		json: async <T>(): Promise<T> => JSON.parse(new TextDecoder().decode(bytes)),
-		blob: async () => new Blob([ownedBuffer(bytes)]),
-	};
-}
-
-export interface FakeR2BucketInit {
-	/**
-	 * Objects already in the bucket, keyed by R2 key.  `get`/`head` serve from
-	 * here and return `null` for anything absent, which is how a test scripts
-	 * "this key exists, that one does not".
-	 */
+export interface FakeObjectStoreInit {
 	objects?: Map<string, Uint8Array>;
-	/**
-	 * Called on every `put` before the object is recorded.  Throw from here to
-	 * simulate a write failure.
-	 */
 	onPut?: (key: string, bytes: Uint8Array) => void;
 }
 
-/**
- * An in-memory `R2Bucket`.
- *
- * `put`/`get`/`head`/`delete`/`list` are real and operate on `objects`; every
- * call is recorded so tests can assert both the effect and the access pattern.
- * Multipart upload is not implemented because no suite uses it — it throws
- * rather than pretending.
- */
-export class FakeR2Bucket implements R2Bucket {
-	/** Live contents, keyed by R2 key.  Mutable: tests may seed or clear it. */
+/** In-memory implementation of the portable object-store contract. */
+export class FakeObjectStore implements ObjectStorePort {
 	readonly objects: Map<string, Uint8Array>;
-
-	/** Every accepted `put`, in order. */
 	readonly puts: Array<{ key: string; bytes: Uint8Array }> = [];
-	/** Every key passed to `get`, in order, including misses. */
 	readonly gets: string[] = [];
-	/** Every key passed to `head`, in order, including misses. */
 	readonly heads: string[] = [];
-	/** Every key passed to `delete`, in order, flattened. */
 	readonly deletes: string[] = [];
-	/** How many times `list` was called. */
 	listCalls = 0;
 
 	private readonly onPut: ((key: string, bytes: Uint8Array) => void) | undefined;
 
-	constructor(init: FakeR2BucketInit = {}) {
+	constructor(init: FakeObjectStoreInit = {}) {
 		this.objects = init.objects ?? new Map();
 		this.onPut = init.onPut;
 	}
 
-	async head(key: string): Promise<R2Object | null> {
+	async head(key: string): Promise<ObjectMetadata | null> {
 		this.heads.push(key);
 		const bytes = this.objects.get(key);
-		return bytes === undefined ? null : makeR2Object(key, bytes);
+		return bytes === undefined ? null : makeObjectMetadata(key, bytes);
 	}
 
-	get(
-		key: string,
-		options: R2GetOptions & { onlyIf: R2Conditional | Headers },
-	): Promise<R2ObjectBody | R2Object | null>;
-	get(key: string, options?: R2GetOptions): Promise<R2ObjectBody | null>;
-	async get(key: string): Promise<R2ObjectBody | null> {
+	async get(key: string): Promise<ObjectBody | null> {
 		this.gets.push(key);
 		const bytes = this.objects.get(key);
-		return bytes === undefined ? null : makeR2ObjectBody(key, bytes);
+		return bytes === undefined ? null : makeObjectBody(key, bytes);
 	}
 
-	put(
-		key: string,
-		value: R2PutValue,
-		options?: R2PutOptions & { onlyIf: R2Conditional | Headers },
-	): Promise<R2Object | null>;
-	put(key: string, value: R2PutValue, options?: R2PutOptions): Promise<R2Object>;
-	async put(key: string, value: R2PutValue): Promise<R2Object> {
-		const bytes = await putValueToBytes(value);
+	async put(key: string, value: Uint8Array, _options?: ObjectWriteOptions): Promise<void> {
+		const bytes = value.slice();
 		this.onPut?.(key, bytes);
 		this.objects.set(key, bytes);
 		this.puts.push({ key, bytes });
-		return makeR2Object(key, bytes);
 	}
 
-	async delete(keys: string | string[]): Promise<void> {
-		for (const key of typeof keys === "string" ? [keys] : keys) {
-			this.deletes.push(key);
-			this.objects.delete(key);
-		}
+	async createOnly(key: string, value: Uint8Array, options?: ObjectWriteOptions): Promise<"created" | "exists"> {
+		if (this.objects.has(key)) return "exists";
+		await this.put(key, value, options);
+		return "created";
 	}
 
-	async list(options?: R2ListOptions): Promise<R2Objects> {
+	async delete(key: string): Promise<void> {
+		this.deletes.push(key);
+		this.objects.delete(key);
+	}
+
+	async list(input: { prefix: string; cursor?: string; limit?: number }): Promise<ObjectListPage> {
 		this.listCalls++;
-		const prefix = options?.prefix ?? "";
-		const objects = [...this.objects]
-			.filter(([key]) => key.startsWith(prefix))
-			.map(([key, bytes]) => makeR2Object(key, bytes));
-		return { objects, delimitedPrefixes: [], truncated: false };
-	}
-
-	createMultipartUpload(): never {
-		throw new Error("FakeR2Bucket: createMultipartUpload() is not implemented");
-	}
-
-	resumeMultipartUpload(): never {
-		throw new Error("FakeR2Bucket: resumeMultipartUpload() is not implemented");
+		const keys = [...this.objects.keys()].filter((key) => key.startsWith(input.prefix)).sort();
+		const start = input.cursor ? Math.max(0, Number(input.cursor)) : 0;
+		const limit = input.limit ?? keys.length;
+		const selected = keys.slice(start, start + limit);
+		const next = start + selected.length;
+		return {
+			objects: selected.map((key) => makeObjectMetadata(key, this.objects.get(key)!)),
+			cursor: next < keys.length ? String(next) : null,
+			truncated: next < keys.length,
+		};
 	}
 }
 
@@ -513,10 +312,15 @@ function unexpectedNamespace(binding: "YAOS_SYNC" | "YAOS_CONFIG"): string {
  * reaches for a binding the test did not set up throws, instead of silently
  * seeing `undefined` the way an `as any` env would let it.
  */
+const rejectedSocketUpgrade: SocketUpgradePort = {
+	reject: () => new Response(null, { status: 400 }),
+};
+
 export function makeEnv(overrides: Partial<Env> = {}): Env {
 	return {
 		YAOS_SYNC: makeTrapNamespace(unexpectedNamespace("YAOS_SYNC")),
 		YAOS_CONFIG: makeTrapNamespace(unexpectedNamespace("YAOS_CONFIG")),
+		socketUpgrades: rejectedSocketUpgrade,
 		...overrides,
 	};
 }

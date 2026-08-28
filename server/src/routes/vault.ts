@@ -1,8 +1,18 @@
+import {
+	MAX_CANDIDATE_BYTES,
+	MAX_CATCH_UP_BYTES,
+	MAX_JSON_BYTES,
+} from "../contracts";
+import {
+	MAX_SETTINGS_ITEM_REQUEST_BYTES,
+	MAX_SETTINGS_SNAPSHOT_REQUEST_BYTES,
+} from "../settingsSyncStore";
+import { BoundedBodyError, readBoundedBytes } from "../readBoundedBytes";
 import { SERVER_PROTOCOL_VERSION, SERVER_SCHEMA_VERSION } from "../version";
 import type { VaultRecord } from "../identity";
 import { inspectTicket } from "./ticket";
 import { authorizeDevice, configFetch, getHttpAuthToken } from "./auth";
-import type { AuthState, Env, VaultRuntimeStubPort } from "./types";
+import type { AuthState, Env } from "./types";
 
 export const TRUSTED_DEVICE_HEADER = "x-yaos-device-id";
 
@@ -16,11 +26,21 @@ export async function readVault(env: Env, vaultId: string): Promise<VaultRecord 
 	return body.vault ?? null;
 }
 
-function stub(env: Env, vaultId: string): VaultRuntimeStubPort {
-	return env.YAOS_SYNC.get(env.YAOS_SYNC.idFromName(vaultId));
+
+function forwardedBodyLimit(request: Request, runtimePath: string): number | null {
+	if (!request.body || request.method === "GET" || request.method === "HEAD") return null;
+	if (/^\/body\/[^/]+\/candidate$/.test(runtimePath)) return MAX_CANDIDATE_BYTES;
+	if (runtimePath === "/catch-up") return MAX_CATCH_UP_BYTES;
+	if (runtimePath.startsWith("/settings-sync/") && request.method === "PUT") {
+		const action = runtimePath.split("/")[3];
+		return action === "seed" || action === "replace"
+			? MAX_SETTINGS_SNAPSHOT_REQUEST_BYTES
+			: MAX_SETTINGS_ITEM_REQUEST_BYTES;
+	}
+	return MAX_JSON_BYTES;
 }
 
-function forward(env: Env, vault: VaultRecord, request: Request, runtimePath: string, deviceId?: string): Promise<Response> {
+async function forward(env: Env, vault: VaultRecord, request: Request, runtimePath: string, deviceId?: string): Promise<Response> {
 	const url = new URL(request.url);
 	url.pathname = runtimePath;
 	const headers = new Headers(request.headers);
@@ -30,8 +50,24 @@ function forward(env: Env, vault: VaultRecord, request: Request, runtimePath: st
 	headers.delete("x-yaos-device-id");
 	if (deviceId) headers.set(TRUSTED_DEVICE_HEADER, deviceId);
 	const init: RequestInit = { method: request.method, headers };
-	if (request.method !== "GET" && request.method !== "HEAD") init.body = request.body;
-	return stub(env, vault.vaultId).fetch(new Request(url, init));
+	const maximumBodyBytes = forwardedBodyLimit(request, runtimePath);
+	if (maximumBodyBytes !== null) {
+		try {
+			const bytes = await readBoundedBytes(request, maximumBodyBytes, { allowEmpty: true });
+			if (bytes.byteLength > 0) {
+				const owned = new Uint8Array(bytes.byteLength);
+				owned.set(bytes);
+				init.body = owned.buffer;
+			}
+		} catch (error) {
+			const kind = error instanceof BoundedBodyError ? error.kind : "body_read_failed";
+			return Response.json(
+				{ error: kind },
+				{ status: kind === "body_too_large" ? 413 : 400, headers: { "cache-control": "no-store" } },
+			);
+		}
+	}
+	return env.YAOS_SYNC.call(vault.vaultId, new Request(url, init));
 }
 
 export async function closeVaultDeviceSockets(
@@ -41,7 +77,7 @@ export async function closeVaultDeviceSockets(
 ): Promise<number> {
 	const vault = await readVault(env, vaultId);
 	if (!vault) return 0;
-	const response = await stub(env, vaultId).fetch("https://internal/__yaos/revoke-device-sockets", {
+	const response = await env.YAOS_SYNC.call(vaultId, new Request("https://internal/__yaos/revoke-device-sockets", {
 		method: "POST",
 		headers: {
 			"content-type": "application/json",
@@ -49,7 +85,7 @@ export async function closeVaultDeviceSockets(
 			"x-yaos-vault-generation": vault.vaultGeneration,
 		},
 		body: JSON.stringify({ deviceId }),
-	});
+	}));
 	if (!response.ok) throw new Error(`device socket revocation failed (${response.status})`);
 	const body = await response.json<{ closed?: unknown }>();
 	return typeof body.closed === "number" && Number.isSafeInteger(body.closed) && body.closed >= 0
@@ -58,17 +94,12 @@ export async function closeVaultDeviceSockets(
 }
 
 
-function rejectSocket(request: Request, code: "unclaimed" | "unauthorized" | "update_required", details: Record<string, unknown> = {}): Response {
+function rejectSocket(request: Request, env: Env, code: "unclaimed" | "unauthorized" | "update_required", details: Record<string, unknown> = {}): Response {
 	if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
 		return Response.json({ error: code, ...details }, { status: code === "unauthorized" ? 401 : code === "update_required" ? 426 : 503 });
 	}
-	const pair = new WebSocketPair();
-	const client = pair[0];
-	const server = pair[1];
-	server.accept();
-	server.send(`__YPS:${JSON.stringify({ type: "error", code, ...details })}`);
-	server.close(1008, code === "update_required" ? "update required" : code);
-	return new Response(null, { status: 101, webSocket: client });
+	const frame = `__YPS:${JSON.stringify({ type: "error", code, ...details })}`;
+	return env.socketUpgrades.reject(frame, 1008, code === "update_required" ? "update required" : code);
 }
 
 function declaredVersion(url: URL, name: string): number | null {
@@ -85,28 +116,28 @@ export async function handleVaultSocketRoute(
 	vaultId: string,
 	runtimePath: string,
 ): Promise<Response> {
-	if (!authState.claimed) return rejectSocket(request, "unclaimed");
+	if (!authState.claimed) return rejectSocket(request, env, "unclaimed");
 	const url = new URL(request.url);
 	const ticket = url.searchParams.get("ticket");
 	const payload = ticket ? await inspectTicket(ticket, authState, vaultId) : null;
-	if (!payload) return rejectSocket(request, "unauthorized");
+	if (!payload) return rejectSocket(request, env, "unauthorized");
 	const membership = await configFetch(env, "/__yaos/verify-device", {
 		method: "POST",
 		headers: { "content-type": "application/json" },
 		body: JSON.stringify({ vaultId, deviceId: payload.deviceId }),
 	});
-	if (!membership.ok) return rejectSocket(request, "unauthorized");
+	if (!membership.ok) return rejectSocket(request, env, "unauthorized");
 	const schemaVersion = declaredVersion(url, "schemaVersion");
-	if (schemaVersion !== SERVER_SCHEMA_VERSION) return rejectSocket(request, "update_required", {
+	if (schemaVersion !== SERVER_SCHEMA_VERSION) return rejectSocket(request, env, "update_required", {
 		reason: "schema_mismatch", clientSchemaVersion: schemaVersion, serverSchemaVersion: SERVER_SCHEMA_VERSION,
 	});
 	const protocolVersion = declaredVersion(url, "protocolVersion");
-	if (protocolVersion !== SERVER_PROTOCOL_VERSION) return rejectSocket(request, "update_required", {
+	if (protocolVersion !== SERVER_PROTOCOL_VERSION) return rejectSocket(request, env, "update_required", {
 		reason: "protocol_mismatch", clientProtocolVersion: protocolVersion, serverProtocolVersion: SERVER_PROTOCOL_VERSION,
 	});
 	let vault: VaultRecord | null;
-	try { vault = await readVault(env, vaultId); } catch { return rejectSocket(request, "unauthorized"); }
-	if (!vault || vault.state !== "active") return rejectSocket(request, "unauthorized");
+	try { vault = await readVault(env, vaultId); } catch { return rejectSocket(request, env, "unauthorized"); }
+	if (!vault || vault.state !== "active") return rejectSocket(request, env, "unauthorized");
 	return forward(env, vault, request, runtimePath, payload.deviceId);
 }
 

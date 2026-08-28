@@ -2,7 +2,8 @@
  * Multivault auth gates: reserved vault ids, device rename, and operator-only
  * metadata.
  */
-import ServerConfig, {
+import {
+	ControlPlaneRuntime,
 	MAX_ENROLLMENT_REPLAY_RECORDS,
 	MAX_PENDING_DESTROYS,
 	MAX_PENDING_DEVICE_REVOCATIONS,
@@ -10,6 +11,7 @@ import ServerConfig, {
 	parsePendingDestroyRecords,
 	parsePendingDeviceRevocationRecords,
 } from "../../server/src/config";
+import type { ControlPlaneStoragePort, ControlPlaneTransactionPort } from "../../server/src/platformPorts";
 import {
 	CorruptIdentityStateError,
 	MAX_DEVICE_RECORDS,
@@ -27,7 +29,7 @@ import {
 import { handleUpdateMetadataRoute, invalidateStoredServerConfigCache } from "../../server/src/routes/auth";
 import { handleEnrollRoute, handleVaultDeviceRoute } from "../../server/src/routes/enroll";
 import type { AuthState } from "../../server/src/routes/types";
-import worker from "../../server/src/index";
+import { handleWorkerRequest } from "../../server/src/index";
 import { makeConfigNamespace, makeEnv, makeVaultSyncNamespace } from "../mocks/workerEnv.ts";
 import { suite } from "../harness.ts";
 
@@ -40,36 +42,21 @@ const CLAIM_AUTH: AuthState = {
 	ticketSigningKey: "ticket-signing-key-for-tests",
 };
 
-function makeMemoryConfig(): ServerConfig {
+function makeMemoryConfig(): ControlPlaneRuntime {
 	const data = new Map<string, unknown>();
-	const storage = {
-		get: async (key: string) => data.get(key),
+	const transaction: ControlPlaneTransactionPort = {
+		get: async <T = unknown>(key: string) => data.get(key) as T | undefined,
 		put: async (key: string, value: unknown) => {
 			data.set(key, value);
 		},
-		delete: async (key: string) => {
-			data.delete(key);
-		},
-		transaction: async <T>(
-			fn: (txn: {
-				get: (key: string) => Promise<unknown>;
-				put: (key: string, value: unknown) => Promise<void>;
-				delete: (key: string) => Promise<void>;
-			}) => Promise<T>,
-		): Promise<T> => {
-			return await fn({
-				get: async (key: string) => data.get(key),
-				put: async (key: string, value: unknown) => {
-					data.set(key, value);
-				},
-				delete: async (key: string) => {
-					data.delete(key);
-				},
-			});
-		},
+		delete: async (key: string) => data.delete(key),
 	};
-	// @ts-expect-error focused fake supplies only the storage surface ServerConfig uses.
-	return new ServerConfig({ storage });
+	const storage: ControlPlaneStoragePort = {
+		...transaction,
+		transaction: async <T>(fn: (txn: ControlPlaneTransactionPort) => Promise<T>): Promise<T> =>
+			await fn(transaction),
+	};
+	return new ControlPlaneRuntime(storage);
 }
 
 function jsonRequest(path: string, body: unknown): Request {
@@ -81,7 +68,7 @@ function jsonRequest(path: string, body: unknown): Request {
 }
 
 async function activateClaim(
-	config: ServerConfig,
+	config: ControlPlaneRuntime,
 	claim: Response,
 	pairingCodeHash?: string,
 	pairingPurpose: "origin" | "device" | "invite" = "device",
@@ -435,7 +422,7 @@ s.section("update-metadata: device bearer 401, operator session 200");
 	s.check(operatorRes.status === 200, "operator session can POST update-metadata");
 	s.check(metadataWrites === 1, "operator session writes metadata once");
 
-	const workerDevice = await worker.fetch(new Request("https://example.test/api/update-metadata", {
+	const workerDevice = await handleWorkerRequest(new Request("https://example.test/api/update-metadata", {
 		method: "POST",
 		headers: {
 			Authorization: `Bearer ${deviceToken}`,
@@ -538,19 +525,19 @@ s.section("compact requires both the admin flag and an operator session");
 		YAOS_ENABLE_ADMIN_ROUTES: "true",
 	});
 	const path = "https://example.test/vault/vault-compact/debug/compact";
-	const device = await worker.fetch(new Request(path, {
+	const device = await handleWorkerRequest(new Request(path, {
 		method: "POST",
 		headers: { Authorization: "Bearer device-token" },
 	}), env);
 	s.check(device.status === 401, "device bearer cannot compact");
-	s.check(sync.idFromNameCalls === 0 && sync.calls === 0 && forwarded.length === 0, "device rejection does not allocate the vault runtime");
-	const operator = await worker.fetch(new Request(path, {
+	s.check(sync.actorSelections === 0 && sync.calls === 0 && forwarded.length === 0, "device rejection does not allocate the vault runtime");
+	const operator = await handleWorkerRequest(new Request(path, {
 		method: "POST",
 		headers: { Cookie: `${OPERATOR_COOKIE}=${sessionToken}` },
 	}), env);
 	s.check(operator.status === 200, "operator session reaches schema-4 compact runtime");
 	s.check(vaultReads === 1, "active vault authority is read once after operator auth");
-	s.check(sync.idFromNameCalls === 1 && sync.calls === 1 && forwarded.length === 1, "authorized compact allocates and fetches one vault runtime");
+	s.check(sync.actorSelections === 1 && sync.calls === 1 && forwarded.length === 1, "authorized compact allocates and fetches one vault runtime");
 	s.check(forwarded[0]?.path === "/compact" && forwarded[0]?.deviceId === null, "operator compact forwards only the canonical internal route");
 	invalidateStoredServerConfigCache();
 }

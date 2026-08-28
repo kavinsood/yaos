@@ -21,6 +21,7 @@ import {
 import { sha256Hex } from "./hex";
 import { safeBlobPath, safeMarkdownPath } from "./shared/vaultPath";
 import { blobObjectKey, recoveryPrefix } from "./recoveryProtocol";
+import type { ObjectStorePort } from "./platformPorts";
 
 const MAX_ROOT_BYTES = 1024 * 1024;
 const MAX_MARKDOWN_BYTES = 1_500_000;
@@ -52,12 +53,12 @@ function safeIdentity(value: string): boolean {
 	return true;
 }
 
-/** Authenticated, state-free graph reader. Every R2 key is derived from a retained root or verified entry. */
+/** Authenticated, state-free graph reader. Every object key is derived from a retained root or verified entry. */
 export class RecoveryReadService {
 	private readonly prefix: string;
 
 	constructor(
-		private readonly bucket: R2Bucket,
+		private readonly bucket: ObjectStorePort,
 		private readonly vaultId: string,
 		private readonly vaultGeneration: string,
 	) {
@@ -133,7 +134,7 @@ export class RecoveryReadService {
 			|| retained.rootKey !== snapshotRootObjectKey(this.prefix, retained.rootHash)) {
 			throw new RecoveryReadError("invalid_snapshot_authority", 503);
 		}
-		const bytes = await this.readR2(retained.rootKey, MAX_ROOT_BYTES);
+		const bytes = await this.readObject(retained.rootKey, MAX_ROOT_BYTES);
 		if (await sha256Hex(bytes) !== retained.rootHash) throw new RecoveryReadError("corrupt_snapshot_root", 503);
 		let unverified: unknown;
 		try { unverified = parseCanonicalJson(bytes); }
@@ -157,7 +158,7 @@ export class RecoveryReadService {
 	private nodeSource(): ManifestNodeSource {
 		return {
 			readNode: async (hash) => {
-				try { return await this.readR2(manifestNodeObjectKey(this.prefix, hash), MANIFEST_MAX_COMPRESSED_BYTES); }
+				try { return await this.readObject(manifestNodeObjectKey(this.prefix, hash), MANIFEST_MAX_COMPRESSED_BYTES); }
 				catch (error) {
 					if (error instanceof RecoveryReadError && error.code === "recovery_object_missing") return null;
 					throw error;
@@ -182,7 +183,7 @@ export class RecoveryReadService {
 
 	private async readMarkdown(hash: string, expectedSize: number): Promise<Uint8Array> {
 		if (!Number.isSafeInteger(expectedSize) || expectedSize < 0 || expectedSize > MAX_MARKDOWN_BYTES) throw new RecoveryReadError("snapshot_content_too_large", 413);
-		const compressed = await this.readR2(recoveryContentObjectKey(this.prefix, hash), MAX_CONTENT_COMPRESSED_BYTES);
+		const compressed = await this.readObject(recoveryContentObjectKey(this.prefix, hash), MAX_CONTENT_COMPRESSED_BYTES);
 		let bytes: Uint8Array;
 		try { bytes = gunzipRecoveryBytes(compressed, MAX_CONTENT_COMPRESSED_BYTES, Math.max(1, expectedSize)); }
 		catch { throw new RecoveryReadError("snapshot_content_corrupt", 503); }
@@ -194,7 +195,7 @@ export class RecoveryReadService {
 		if (!Number.isSafeInteger(expectedSize) || expectedSize < 0 || expectedSize > MAX_BLOB_UPLOAD_BYTES) {
 			throw new RecoveryReadError("snapshot_content_too_large", 413);
 		}
-		const bytes = await this.readR2(
+		const bytes = await this.readObject(
 			blobObjectKey(this.vaultId, this.vaultGeneration, hash),
 			MAX_BLOB_UPLOAD_BYTES,
 		);
@@ -203,11 +204,11 @@ export class RecoveryReadService {
 	}
 
 
-	private async readR2(key: string, maximumBytes: number): Promise<Uint8Array> {
+	private async readObject(key: string, maximumBytes: number): Promise<Uint8Array> {
 		const object = await this.bucket.get(key);
 		if (!object) throw new RecoveryReadError("recovery_object_missing", 503);
 		if (object.size > maximumBytes) throw new RecoveryReadError("recovery_object_too_large", 503);
-		const bytes = new Uint8Array(await object.arrayBuffer());
+		const bytes = object.bytes;
 		if (bytes.byteLength > maximumBytes) throw new RecoveryReadError("recovery_object_too_large", 503);
 		return bytes;
 	}

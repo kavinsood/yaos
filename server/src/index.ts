@@ -1,9 +1,9 @@
-import { ServerConfig } from "./config";
-import { VaultSyncServer } from "./server";
-import { DurableRecoveryRouteAuthority } from "./recoveryPublicAuthority";
+import { ControlPlaneRuntime, ServerConfig } from "./config";
+import { VaultRuntime, VaultSyncServer } from "./server";
+import { ActorRecoveryRouteAuthority } from "./recoveryPublicAuthority";
 import { handleRecoveryRoute, isPublicRecoveryRouteShape } from "./recoveryRoutes";
 import type { VaultRecord } from "./identity";
-import { RecoveryJob } from "./recoveryJob";
+import { RecoveryJob, RecoveryJobRuntime } from "./recoveryJob";
 import { renderMobileSetupPage, renderOperatorConsole, renderOperatorLogin, renderSetupPage } from "./setupPage";
 import {
 	authorizeAnyDevice,
@@ -43,6 +43,16 @@ import { handleTicketRoute } from "./routes/ticket";
 import { handleOperatorVaultRuntimeRoute, handleVaultRuntimeRoute, handleVaultSocketRoute, readVault } from "./routes/vault";
 import type { AuthState, AuthStateCached, Env } from "./routes/types";
 import { decodeCanonicalVaultIdSegment } from "./vaultId";
+import { CloudflareActorCalls, CloudflareObjectStore, CloudflareSocketUpgrades } from "./cloudflarePorts";
+
+interface CloudflareWorkerEnvironment {
+	YAOS_SYNC: DurableObjectNamespace;
+	YAOS_CONFIG: DurableObjectNamespace;
+	YAOS_RECOVERY_JOBS?: DurableObjectNamespace;
+	YAOS_BUCKET?: R2Bucket;
+	YAOS_TICKET_TTL_MS?: string;
+	YAOS_ENABLE_ADMIN_ROUTES?: string;
+}
 
 const LOG_PREFIX = "[yaos-sync:worker]";
 
@@ -176,8 +186,7 @@ async function authorizedVaultControl(request: Request, env: Env, authState: Aut
 	return rejection.response;
 }
 
-const worker = {
-	async fetch(request: Request, env: Env): Promise<Response> {
+export async function handleWorkerRequest(request: Request, env: Env): Promise<Response> {
 		const start = Date.now();
 		const url = new URL(request.url);
 		const route = classifyWorkerRoute(request, url);
@@ -255,8 +264,7 @@ const worker = {
 						if (!vault || vault.state !== "active") {
 							response = withCors(json({ error: vault ? `vault_${vault.state}` : "vault_authority_unavailable" }, 503));
 						} else {
-							const stub = env.YAOS_SYNC.get(env.YAOS_SYNC.idFromName(vault.vaultId));
-							const authority = new DurableRecoveryRouteAuthority(stub, vault.vaultId, vault.vaultGeneration);
+							const authority = new ActorRecoveryRouteAuthority(env.YAOS_SYNC, vault.vaultId, vault.vaultId, vault.vaultGeneration);
 							response = withCors(await handleRecoveryRoute(request, route.rest, {
 								vaultId: vault.vaultId,
 								authority,
@@ -273,7 +281,34 @@ const worker = {
 		else response = withCors(json({ error: "not found" }, 404));
 		logRequest(route, request, response, start, authState.mode);
 		return response;
+}
+
+const worker = {
+	fetch(request: Request, env: CloudflareWorkerEnvironment): Promise<Response> {
+		return handleWorkerRequest(request, {
+			...env,
+			YAOS_SYNC: new CloudflareActorCalls(env.YAOS_SYNC),
+			YAOS_CONFIG: new CloudflareActorCalls(env.YAOS_CONFIG),
+			YAOS_RECOVERY_JOBS: env.YAOS_RECOVERY_JOBS ? new CloudflareActorCalls(env.YAOS_RECOVERY_JOBS) : undefined,
+			YAOS_BUCKET: env.YAOS_BUCKET ? new CloudflareObjectStore(env.YAOS_BUCKET) : undefined,
+			socketUpgrades: new CloudflareSocketUpgrades(),
+		});
 	},
 };
-export { RecoveryJob, ServerConfig, VaultSyncServer };
+export { ControlPlaneRuntime, RecoveryJob, RecoveryJobRuntime, ServerConfig, VaultRuntime, VaultSyncServer };
+export type {
+	ActorCallPort,
+	AlarmPort,
+	ControlPlaneStoragePort,
+	DrainPort,
+	ExecutionPort,
+	ObjectStorePort,
+	RecoveryRuntimeStoragePort,
+	SocketUpgradePort,
+	VaultRuntimeStoragePort,
+} from "./platformPorts";
+export type { VaultRuntimeOptions } from "./server";
+export type { RecoveryJobRuntimeOptions } from "./recoveryJob";
+export type { SocketServiceOptions, VaultSocketPort, VaultSocketRegistryPort } from "./vaultSocketService";
+export type { Env as WorkerRuntimeEnvironment } from "./routes/types";
 export default worker;
