@@ -40,14 +40,15 @@
 	},
 	"license": "0-BSD",
 	"engines": {
-		"node": ">=20"
+		"node": ">=24"
 	},
 	"devDependencies": {
 		"@cloudflare/workers-types": "4.20260305.0",
 		"@codemirror/state": "^6.0.0",
 		"@codemirror/view": "^6.0.0",
-		"@types/node": "^20.19.0",
+		"@types/node": "^24.13.3",
 		"@types/ws": "^8.18.1",
+		"chokidar": "^5.0.0",
 		"esbuild": "0.25.5",
 		"eslint": "^9.39.1",
 		"eslint-plugin-obsidianmd": "0.4.1",

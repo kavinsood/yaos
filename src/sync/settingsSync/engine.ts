@@ -1526,7 +1526,7 @@ function bytesToBase64(bytes: Uint8Array): string {
 	return btoa(chunks.join(""));
 }
 
-function base64ToBytes(value: string): Uint8Array {
+function base64ToBytes(value: string): Uint8Array<ArrayBuffer> {
 	const binary = atob(value);
 	const bytes = new Uint8Array(binary.length);
 	for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
@@ -1548,13 +1548,12 @@ async function writeConfigFile(
 	adapter: SettingsDirAdapter,
 	configDir: string,
 	rel: string,
-	bytes: Uint8Array,
+	bytes: Uint8Array<ArrayBuffer>,
 ): Promise<void> {
 	const abs = joinConfig(configDir, rel);
 	await ensureParent(adapter, abs);
 	if (adapter.writeBinary) {
-		const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
-		await adapter.writeBinary(abs, buffer);
+		await adapter.writeBinary(abs, bytes.buffer);
 		return;
 	}
 	await adapter.write(abs, new TextDecoder("utf-8").decode(bytes));

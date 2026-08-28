@@ -64,13 +64,16 @@ export class RecoveryBackupHook {
 				}
 				const target = normalizePath(`${backupRoot}/${path}`);
 				await this.ensureParent(target);
-				const bytes = file.extension.toLowerCase() === "md"
-					? new TextEncoder().encode(await this.app.vault.read(file))
-					: new Uint8Array(await this.app.vault.readBinary(file));
-				if (file.extension.toLowerCase() === "md") {
+				const markdown = file.extension.toLowerCase() === "md";
+				let bytes: Uint8Array;
+				if (markdown) {
+					const content = await this.app.vault.read(file);
+					bytes = new TextEncoder().encode(content);
 					await this.app.vault.adapter.write(target, new TextDecoder().decode(bytes));
 				} else {
-					await this.app.vault.adapter.writeBinary(target, bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+					const buffer = await this.app.vault.readBinary(file);
+					bytes = new Uint8Array(buffer);
+					await this.app.vault.adapter.writeBinary(target, buffer);
 				}
 				report.reviews.set(path, {
 					exists: true,

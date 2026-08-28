@@ -18,7 +18,12 @@ const OTHER_HASH = "b".repeat(64);
 const CAPTURE_REQUEST_ID = "11111111-1111-4111-8111-111111111111";
 const RESTORE_ID = "22222222-2222-4222-8222-222222222222";
 
-function response(status: number, json: unknown, bytes = new Uint8Array(), headers: Record<string, string> = {}): RecoveryTransportResponse {
+function response(
+	status: number,
+	json: unknown,
+	bytes: Uint8Array<ArrayBufferLike> = new Uint8Array(),
+	headers: Record<string, string> = {},
+): RecoveryTransportResponse {
 	const arrayBuffer = new ArrayBuffer(bytes.byteLength);
 	new Uint8Array(arrayBuffer).set(bytes);
 	return { status, json, text: JSON.stringify(json), arrayBuffer, headers };

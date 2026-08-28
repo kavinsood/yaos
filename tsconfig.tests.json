@@ -8,17 +8,9 @@
 	//
 	//   npx tsc -noEmit -p tsconfig.tests.json
 	//
-	// `lib` is deliberately pinned to ES2023, NOT ESNext. The rule is that it
-	// tracks the FLOOR of runtimes this repo supports (package.json engines.node
-	// = ">=20"), not whatever CI happens to run — CI is on Node 24, and pinning
-	// lib to CI's version would let an API land that breaks a contributor on the
-	// oldest supported Node. ES2023 is Node 20's ceiling, so ES2024 additions
-	// like Promise.withResolvers are a compile error here. If engines.node ever
-	// rises, raise this with it and not before.
-	//
-	// Note this only constrains contributors and CI: the plugin ships into
-	// Obsidian's bundled Electron runtime and the server runs on Cloudflare
-	// Workers, so there is no production Node to stay compatible with.
+	// `lib` tracks the Node runtime floor declared in package.json. The repository
+	// now ships Node-24 CLI and server runtimes, so ES2024 APIs are part of the
+	// supported surface. Raise this only with the declared runtime floor.
 	//
 	// The target/module bump to ES2022 is unavoidable — suites legitimately use
 	// top-level await, which the plugin's ES6 target forbids — but that affects
@@ -27,7 +19,7 @@
 	"compilerOptions": {
 		"target": "ES2022",
 		"module": "ESNext",
-		"lib": ["ES2023", "DOM"],
+		"lib": ["ES2024", "DOM"],
 		"types": ["node", "@cloudflare/workers-types"],
 		"allowImportingTsExtensions": true,
 		// tests/ is the one program that must hold BOTH type universes at once:

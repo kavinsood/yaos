@@ -19,7 +19,15 @@ function assertSnapshot(
 
 function bytes(text: string): ArrayBuffer {
 	const encoded = new TextEncoder().encode(text);
-	return encoded.buffer.slice(encoded.byteOffset, encoded.byteOffset + encoded.byteLength);
+	const buffer = encoded.buffer;
+	if (
+		buffer instanceof ArrayBuffer
+		&& encoded.byteOffset === 0
+		&& encoded.byteLength === buffer.byteLength
+	) return buffer;
+	const owned = new Uint8Array(encoded.byteLength);
+	owned.set(encoded);
+	return owned.buffer;
 }
 
 async function sha256Hex(data: ArrayBuffer): Promise<string> {
