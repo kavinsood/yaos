@@ -8,6 +8,7 @@ import type { LiveIdentity, LiveIdentityContext } from "./liveIdentity.ts";
 
 const HOST = "http://127.0.0.1:8787";
 const WRANGLER_BIN = resolve("server/node_modules/.bin/wrangler");
+const SETTINGS_CONFIG_KEY = ".obsidian-live";
 const NODE_TS = ["tests/run-typescript.mjs"];
 
 interface LiveCommand {
@@ -25,6 +26,7 @@ const LIVE_COMMANDS: readonly LiveCommand[] = [
 	{ file: "hardening-worker.ts" },
 	{ file: "ws-ticket-reconnect.ts" },
 	{ file: "ws-admission-protocol.ts" },
+	{ file: "settings-sync.ts" },
 	{ file: "operator-destroy.ts" },
 ];
 const LIVE_NON_SUITES = ["fatalFrame.ts", "liveIdentity.ts", "run-live.ts", "schema4Live.ts"] as const;
@@ -74,6 +76,7 @@ function runCommand(command: LiveCommand, context: LiveIdentityContext): Promise
 				YAOS_TEST_DEVICE_B_ID: context.deviceB.deviceId,
 				YAOS_TEST_OPERATOR_RECOVERY_KEY: context.operatorRecoveryKey,
 				YAOS_TEST_OPERATOR_COOKIE: context.operatorCookie,
+				YAOS_TEST_SETTINGS_CONFIG_KEY: context.settingsConfigKey,
 				...command.extraEnv,
 			},
 		});
@@ -167,7 +170,7 @@ async function claimEnrollAndProvision(): Promise<LiveIdentityContext> {
 	if (!login.ok || !setCookie) throw new Error(`operator login failed (${login.status})`);
 	const operatorCookie = setCookie.split(";", 1)[0]!;
 	console.log("Live driver claimed and provisioned schema 4, then enrolled distinct A/B devices.");
-	return { deviceA, deviceB, operatorRecoveryKey, operatorCookie };
+	return { deviceA, deviceB, operatorRecoveryKey, operatorCookie, settingsConfigKey: SETTINGS_CONFIG_KEY };
 }
 
 async function main(): Promise<void> {

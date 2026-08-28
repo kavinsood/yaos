@@ -10,6 +10,7 @@ export interface LiveIdentityContext {
 	readonly deviceB: LiveIdentity;
 	readonly operatorRecoveryKey: string;
 	readonly operatorCookie: string;
+	readonly settingsConfigKey: string;
 }
 
 export interface SocketTicket {
@@ -44,6 +45,7 @@ export function requireLiveIdentityContext(): LiveIdentityContext {
 		deviceB: identityFromEnv("B"),
 		operatorRecoveryKey: requireEnv("YAOS_TEST_OPERATOR_RECOVERY_KEY"),
 		operatorCookie: requireEnv("YAOS_TEST_OPERATOR_COOKIE"),
+		settingsConfigKey: requireEnv("YAOS_TEST_SETTINGS_CONFIG_KEY"),
 	};
 }
 
