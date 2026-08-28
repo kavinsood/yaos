@@ -99,6 +99,28 @@ s.section("Test 9: capabilities expose one final identity-neutral shape");
 		ticketSigningKey: "ticket-signing-key",
 	} as const;
 	const caps = getCapabilities(auth, env);
+	s.check(caps.settingsSync === true, "capabilities advertise the settings SQL sidecar");
+	s.check(caps.settingsFormatVersion === 1, "capabilities pin settings format version 1");
+	s.check(
+		JSON.stringify(Object.keys(caps).sort()) === JSON.stringify([
+			"attachments",
+			"claimed",
+			"maxBlobUploadBytes",
+			"protocolVersion",
+			"recoveryJobs",
+			"schemaVersion",
+			"serverVersion",
+			"settingsFormatVersion",
+			"settingsSync",
+			"snapshotFormatVersion",
+			"snapshots",
+			"storageFormatVersion",
+			"updateProvider",
+			"updateRepoBranch",
+			"updateRepoUrl",
+		]),
+		"capabilities expose the exact current contract",
+	);
 	s.check(caps.claimed === true, "capabilities preserve claimed state");
 }
 

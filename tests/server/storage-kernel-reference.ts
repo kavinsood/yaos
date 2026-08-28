@@ -4,6 +4,7 @@ import {
 	SCHEMA_VERSION,
 	SNAPSHOT_FORMAT_VERSION,
 	STORAGE_FORMAT_VERSION,
+	SETTINGS_FORMAT_VERSION,
 	negotiateSnapshotVersion,
 	negotiateStorageVersion,
 	negotiateSyncVersions,
@@ -32,8 +33,9 @@ s.check(
 	SCHEMA_VERSION === 4
 		&& STORAGE_FORMAT_VERSION === 1
 		&& PROTOCOL_VERSION === 1
-		&& SNAPSHOT_FORMAT_VERSION === 2,
-	"schema/storage/protocol/snapshot formats remain independently pinned to 4/1/1/2",
+		&& SNAPSHOT_FORMAT_VERSION === 2
+		&& SETTINGS_FORMAT_VERSION === 1,
+	"schema/storage/protocol/snapshot/settings formats remain independently pinned to 4/1/1/2/1",
 );
 
 function withVersion(component: keyof ProductVersions, version: number): ProductVersions {

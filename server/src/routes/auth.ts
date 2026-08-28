@@ -17,6 +17,7 @@ import { buildMobileSetupUrl, renderSetupQrDataUrl } from "../setupQr";
 import {
 	SERVER_PROTOCOL_VERSION,
 	SERVER_SCHEMA_VERSION,
+	SERVER_SETTINGS_FORMAT_VERSION,
 	SERVER_SNAPSHOT_FORMAT_VERSION,
 	SERVER_STORAGE_FORMAT_VERSION,
 	SERVER_VERSION,
@@ -230,12 +231,14 @@ export function getCapabilities(
 	attachments: boolean;
 	snapshots: boolean;
 	recoveryJobs: boolean;
+	settingsSync: boolean;
 	maxBlobUploadBytes: number;
 	serverVersion: string;
 	schemaVersion: number;
 	storageFormatVersion: number;
 	protocolVersion: number;
 	snapshotFormatVersion: number;
+	settingsFormatVersion: number;
 	updateProvider: UpdateProvider | null;
 	updateRepoUrl: string | null;
 	updateRepoBranch: string | null;
@@ -247,12 +250,14 @@ export function getCapabilities(
 		attachments: bucketEnabled,
 		snapshots: recoveryJobs,
 		recoveryJobs,
+		settingsSync: true,
 		maxBlobUploadBytes: MAX_BLOB_UPLOAD_BYTES,
 		serverVersion: SERVER_VERSION,
 		schemaVersion: SERVER_SCHEMA_VERSION,
 		storageFormatVersion: SERVER_STORAGE_FORMAT_VERSION,
 		protocolVersion: SERVER_PROTOCOL_VERSION,
 		snapshotFormatVersion: SERVER_SNAPSHOT_FORMAT_VERSION,
+		settingsFormatVersion: SERVER_SETTINGS_FORMAT_VERSION,
 		updateProvider: options.includePrivateUpdateMetadata ? (config?.updateProvider ?? null) : null,
 		updateRepoUrl: options.includePrivateUpdateMetadata ? (config?.updateRepoUrl ?? null) : null,
 		updateRepoBranch: options.includePrivateUpdateMetadata ? (config?.updateRepoBranch ?? null) : null,

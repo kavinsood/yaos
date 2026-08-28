@@ -38,6 +38,13 @@ export function bytesToBase64Url(bytes: Uint8Array): string {
 	return out;
 }
 
+/** Standard padded base64 for JSON wire fields. */
+export function bytesToBase64(bytes: Uint8Array): string {
+	const unpadded = bytesToBase64Url(bytes).replaceAll("-", "+").replaceAll("_", "/");
+	const padding = (3 - bytes.byteLength % 3) % 3;
+	return padding === 0 ? unpadded : `${unpadded}${"=".repeat(padding)}`;
+}
+
 export function base64UrlToBytes(str: string): Uint8Array {
 	const len = str.length;
 	if (len === 0) return new Uint8Array(0);

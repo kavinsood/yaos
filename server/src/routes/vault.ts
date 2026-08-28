@@ -26,6 +26,7 @@ function forward(env: Env, vault: VaultRecord, request: Request, runtimePath: st
 	const headers = new Headers(request.headers);
 	headers.set("x-yaos-vault-id", vault.vaultId);
 	headers.set("x-yaos-vault-generation", vault.vaultGeneration);
+	headers.delete("authorization");
 	headers.delete("x-yaos-device-id");
 	if (deviceId) headers.set(TRUSTED_DEVICE_HEADER, deviceId);
 	const init: RequestInit = { method: request.method, headers };

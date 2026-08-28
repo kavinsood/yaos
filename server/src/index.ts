@@ -62,6 +62,13 @@ type WorkerRoute =
 
 function validVaultRest(method: string, rest: string[]): boolean {
 	if (isPublicRecoveryRouteShape(method, rest)) return true;
+	if (rest[0] === "settings-sync") {
+		if (method === "GET") return rest.length === 2 && rest[1]!.length > 0;
+		if (method === "PUT" && rest.length === 3 && rest[1]!.length > 0) {
+			return ["seed", "replace", "file", "intent", "tombstone", "plugin-data"].includes(rest[2]!);
+		}
+		return method === "DELETE" && rest.length === 3 && rest[1]!.length > 0 && rest[2] === "file";
+	}
 	if (method === "POST" && rest.length === 2 && rest[0] === "auth") {
 		return rest[1] === "ticket" || rest[1] === "pairing-code" || rest[1] === "device";
 	}

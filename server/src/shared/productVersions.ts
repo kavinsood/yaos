@@ -8,12 +8,14 @@ export const SCHEMA_VERSION = 4;
 export const STORAGE_FORMAT_VERSION = 1;
 export const PROTOCOL_VERSION = 1;
 export const SNAPSHOT_FORMAT_VERSION = 2;
+export const SETTINGS_FORMAT_VERSION = 1;
 
 export interface ProductVersions {
 	schemaVersion: number;
 	storageFormatVersion: number;
 	protocolVersion: number;
 	snapshotFormatVersion: number;
+	settingsFormatVersion: number;
 }
 
 export const CURRENT_PRODUCT_VERSIONS: Readonly<ProductVersions> = Object.freeze({
@@ -21,6 +23,7 @@ export const CURRENT_PRODUCT_VERSIONS: Readonly<ProductVersions> = Object.freeze
 	storageFormatVersion: STORAGE_FORMAT_VERSION,
 	protocolVersion: PROTOCOL_VERSION,
 	snapshotFormatVersion: SNAPSHOT_FORMAT_VERSION,
+	settingsFormatVersion: SETTINGS_FORMAT_VERSION,
 });
 
 export type VersionCompatibility =

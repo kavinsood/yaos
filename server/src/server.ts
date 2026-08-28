@@ -6,9 +6,11 @@ import { sha256Hex } from "./hex";
 import { BoundedBodyError, readBoundedBytes } from "./readBoundedBytes";
 import { handleVaultRecoveryRpc } from "./recoveryRpcRouter";
 import type { Env } from "./routes/types";
+import { handleSettingsSyncRequest, SettingsSyncStore } from "./settingsSyncStore";
 import {
 	SERVER_PROTOCOL_VERSION,
 	SERVER_SCHEMA_VERSION,
+	SERVER_SETTINGS_FORMAT_VERSION,
 	SERVER_SNAPSHOT_FORMAT_VERSION,
 	SERVER_STORAGE_FORMAT_VERSION,
 } from "./version";
@@ -101,6 +103,7 @@ export interface VaultSyncServer extends Rpc.DurableObjectBranded {}
 // eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging -- see the RPC brand declaration above.
 export class VaultSyncServer implements DurableObject {
 	private store: VaultStore;
+	private settings: SettingsSyncStore;
 	private readonly runtimeEpoch = crypto.randomUUID();
 	private readonly cache: VaultDocumentCache;
 	private readonly sockets: VaultSocketService;
@@ -115,6 +118,7 @@ export class VaultSyncServer implements DurableObject {
 
 	constructor(private readonly ctx: DurableObjectState, env: Env) {
 		this.store = new VaultStore(ctx.storage);
+		this.settings = new SettingsSyncStore(ctx.storage);
 		let socketOwner: VaultSocketService;
 		this.cache = new VaultDocumentCache(
 			this.store,
@@ -208,6 +212,13 @@ export class VaultSyncServer implements DurableObject {
 			if (request.method === "POST" && url.pathname === "/__yaos/begin-vault-deletion") return this.beginDeletion(request);
 			if (request.method === "POST" && url.pathname === "/__yaos/delete-all") return this.deleteAll();
 			if (this.store.vaultDeletionBegun(metadata.vaultGeneration)) return json({ error: "vault_deleting" }, 410);
+			if (parts[0] === "settings-sync") {
+				if (parts.length < 2 || parts.length > 3) return json({ error: "not_found" }, 404);
+				const deviceId = request.headers.get(INTERNAL_DEVICE_HEADER);
+				if (!deviceId || deviceId.length > 128) return json({ error: "missing_trusted_device_identity" }, 401);
+				if (this.store.isDeviceRevoked(deviceId)) return json({ error: "unauthorized" }, 401);
+				return handleSettingsSyncRequest(this.settings, request, parts[1]!, parts[2]);
+			}
 			if (request.method === "POST" && url.pathname === "/compact") return this.compact();
 
 			if (request.method === "GET" && request.headers.get("upgrade")?.toLowerCase() === "websocket") {
@@ -320,6 +331,7 @@ export class VaultSyncServer implements DurableObject {
 		await this.ctx.storage.deleteAlarm();
 		await this.ctx.storage.deleteAll();
 		this.store = new VaultStore(this.ctx.storage);
+		this.settings = new SettingsSyncStore(this.ctx.storage);
 		return json({ deleted: true });
 	}
 
@@ -505,6 +517,7 @@ export class VaultSyncServer implements DurableObject {
 			provisionedAt: metadata.provisionedAt, schemaVersion: SERVER_SCHEMA_VERSION,
 			storageFormatVersion: SERVER_STORAGE_FORMAT_VERSION, protocolVersion: SERVER_PROTOCOL_VERSION,
 			snapshotFormatVersion: SERVER_SNAPSHOT_FORMAT_VERSION,
+			settingsFormatVersion: SERVER_SETTINGS_FORMAT_VERSION,
 			sequence: this.store.currentSequence(), feedFloor: this.store.journalFloor(), activePins: this.store.activePins().length });
 	}
 
@@ -526,6 +539,7 @@ export class VaultSyncServer implements DurableObject {
 			provisionedAt: metadata.provisionedAt, schemaVersion: SERVER_SCHEMA_VERSION,
 			storageFormatVersion: SERVER_STORAGE_FORMAT_VERSION, protocolVersion: SERVER_PROTOCOL_VERSION,
 			snapshotFormatVersion: SERVER_SNAPSHOT_FORMAT_VERSION,
+			settingsFormatVersion: SERVER_SETTINGS_FORMAT_VERSION,
 			sequence: this.store.currentSequence(), feedFloor: this.store.journalFloor() };
 	}
 

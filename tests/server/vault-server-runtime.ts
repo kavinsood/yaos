@@ -10,6 +10,7 @@ const GENERATION = "generation-runtime-0001";
 class RuntimeStore {
 	metadata: { vaultId: string; vaultGeneration: string; schemaVersion: number; storageFormatVersion: number; provisionedAt: number } | null = null;
 	deletion: { deletionId: string; vaultGeneration: string } | null = null;
+	readonly revokedDevices = new Set<string>();
 	provisionVault(vaultId: string, vaultGeneration: string): object {
 		if (this.metadata) {
 			if (this.metadata.vaultId !== vaultId || this.metadata.vaultGeneration !== vaultGeneration) throw new Error("vault generation mismatch");
@@ -25,6 +26,7 @@ class RuntimeStore {
 		this.deletion = { deletionId, vaultGeneration };
 		return { captureJobIds: [], restoreIds: [] };
 	}
+	isDeviceRevoked(deviceId: string): boolean { return this.revokedDevices.has(deviceId); }
 	currentSequence(): number { return 1; }
 	journalFloor(): number { return 0; }
 	activePins(): unknown[] { return []; }
@@ -41,6 +43,7 @@ function makeServer() {
 	const store = new RuntimeStore();
 	const accepted: Array<{ documentId: string; kind: "root" | "body"; deviceId: string }> = [];
 	const closed: string[] = [];
+	const settingsReads: string[] = [];
 	Object.defineProperties(server, {
 		bootstrap: {
 			value: {
@@ -51,7 +54,16 @@ function makeServer() {
 				}),
 			},
 		},
-		store: { value: store },
+		settings: {
+			value: {
+				getEnvironment: (configKey: string) => {
+					settingsReads.push(configKey);
+					return { ok: true, value: { seeded: false } };
+				},
+			},
+			writable: true,
+		},
+		store: { value: store, writable: true },
 		lifecycle: { value: { activeBodyHead: (bodyId: string) => bodyId === "body-runtime-0001" ? {} : null } },
 		sockets: {
 			value: {
@@ -65,7 +77,7 @@ function makeServer() {
 			},
 		},
 	});
-	return { server, store, accepted, closed, deleteAllCalls: () => deleteAllCalls };
+	return { server, store, accepted, closed, settingsReads, deleteAllCalls: () => deleteAllCalls };
 }
 
 function request(path: string, init: RequestInit = {}): Request {
@@ -155,6 +167,8 @@ s.test("vault deletion is fenced by generation before destructive storage access
 	assert.equal(deleteAllCalls(), 1);
 });
 
+
+
 s.test("bootstrap body batch is bounded and returns every requested body", async () => {
 	const { server } = makeServer();
 	await server.fetch(request("/__yaos/provision", {
@@ -185,5 +199,60 @@ s.test("bootstrap body batch is bounded and returns every requested body", async
 	assert.equal(duplicate.status, 400);
 	assert.deepEqual(await duplicate.json(), { error: "duplicate_body_id" });
 });
-
+s.test("settings sidecar requires generation and trusted device authority without hydrating documents", async () => {
+	const { server, store, settingsReads } = makeServer();
+	await server.fetch(request("/__yaos/provision", { method: "POST", body: JSON.stringify({ vaultGeneration: GENERATION }) }));
+	Object.defineProperty(server, "cache", {
+		value: new Proxy({}, {
+			get: () => {
+				throw new Error("settings route hydrated a root/body document");
+			},
+		}),
+	});
+	const stale = await server.fetch(request("/settings-sync/.obsidian", {
+		headers: {
+			"x-yaos-device-id": "device-runtime-0001",
+			"x-yaos-vault-generation": "generation-runtime-stale",
+		},
+	}));
+	assert.equal(stale.status, 409);
+	assert.deepEqual(settingsReads, []);
+	const missing = await server.fetch(request("/settings-sync/.obsidian"));
+	assert.equal(missing.status, 401);
+	assert.deepEqual(await missing.json(), { error: "missing_trusted_device_identity" });
+	assert.deepEqual(settingsReads, []);
+	store.revokedDevices.add("device-runtime-revoked");
+	const revoked = await server.fetch(request("/settings-sync/.obsidian", {
+		headers: { "x-yaos-device-id": "device-runtime-revoked" },
+	}));
+	assert.equal(revoked.status, 401);
+	assert.deepEqual(settingsReads, []);
+	const undeclaredFormat = await server.fetch(request("/settings-sync/.obsidian", {
+		headers: { "x-yaos-device-id": "device-runtime-0001" },
+	}));
+	assert.equal(undeclaredFormat.status, 426);
+	assert.deepEqual(await undeclaredFormat.json(), {
+		error: "update_required",
+		reason: "settings_format_mismatch",
+		clientSettingsFormatVersion: null,
+		serverSettingsFormatVersion: 1,
+	});
+	assert.deepEqual(settingsReads, []);
+	const staleFormat = await server.fetch(request("/settings-sync/.obsidian?settingsFormatVersion=2", {
+		headers: { "x-yaos-device-id": "device-runtime-0001" },
+	}));
+	assert.equal(staleFormat.status, 426);
+	assert.deepEqual(settingsReads, []);
+	const duplicateFormat = await server.fetch(request("/settings-sync/.obsidian?settingsFormatVersion=1&settingsFormatVersion=1", {
+		headers: { "x-yaos-device-id": "device-runtime-0001" },
+	}));
+	assert.equal(duplicateFormat.status, 426);
+	assert.deepEqual(settingsReads, []);
+	const admitted = await server.fetch(request("/settings-sync/.obsidian?settingsFormatVersion=1", {
+		headers: { "x-yaos-device-id": "device-runtime-0001" },
+	}));
+	assert.equal(admitted.status, 200);
+	assert.deepEqual(await admitted.json(), { seeded: false });
+	assert.deepEqual(settingsReads, [".obsidian"]);
+});
 await s.done();

@@ -20,6 +20,11 @@ s.test("junk, legacy sync, and malformed vault routes return 404 before any DO",
 		["POST", "/vault/vault-route-0001/bootstrap/attempt/unknown"],
 		["GET", "/vault/%20vault-route-0001%20/status"],
 		["GET", "/vault/%76ault-route-0001/status"],
+		["GET", "/vault/vault-route-0001/settings-sync"],
+		["PUT", "/vault/vault-route-0001/settings-sync/.obsidian"],
+		["POST", "/vault/vault-route-0001/settings-sync/.obsidian/seed"],
+		["PUT", "/vault/vault-route-0001/settings-sync/.obsidian/unknown"],
+		["GET", "/vault/vault-route-0001/settings-sync/.obsidian/seed"],
 	];
 	for (const [method, path] of routes) {
 		const response = await worker.fetch(new Request(`https://example.test${path}`, { method }), trapEnv);
@@ -42,6 +47,14 @@ s.test("schema-4 root/body, candidate, lifecycle, and bootstrap shapes classify 
 		["GET", "/vault/vault-route-0001/bootstrap/bootstrap-route-0001/root"],
 		["POST", "/vault/vault-route-0001/bootstrap/bootstrap-route-0001/bodies"],
 		["GET", "/vault/vault-route-0001/bootstrap/bootstrap-route-0001/body/body-route-0001"],
+		["GET", "/vault/vault-route-0001/settings-sync/.obsidian"],
+		["PUT", "/vault/vault-route-0001/settings-sync/.obsidian/seed"],
+		["PUT", "/vault/vault-route-0001/settings-sync/.obsidian/replace"],
+		["PUT", "/vault/vault-route-0001/settings-sync/.obsidian/file"],
+		["PUT", "/vault/vault-route-0001/settings-sync/.obsidian/intent"],
+		["PUT", "/vault/vault-route-0001/settings-sync/.obsidian/tombstone"],
+		["PUT", "/vault/vault-route-0001/settings-sync/.obsidian/plugin-data"],
+		["DELETE", "/vault/vault-route-0001/settings-sync/.obsidian/file"],
 	];
 	for (const [method, path] of accepted) {
 		assert.equal(classifyWorkerRoute(new Request(`https://example.test${path}`, { method })).kind, "vault", `${method} ${path}`);

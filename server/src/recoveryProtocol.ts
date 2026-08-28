@@ -5,6 +5,7 @@ import {
 	recoveryContentObjectKey,
 	snapshotRootObjectKey as recoverySnapshotRootObjectKey,
 } from "./recoveryManifestTree.js";
+import { isSha256Hex } from "./hex.js";
 import { isCanonicalVaultId } from "./vaultId.js";
 export const RECOVERY_FORMAT = "yaos-recovery-v2" as const;
 export const RECOVERY_PLAN_DIGEST_SEED = "YAOS_CAPTURE_PLAN_V1";
@@ -227,7 +228,6 @@ export interface SweepLease { leaseId: string; epoch: number; ownerId: string; d
 
 export const canonicalJson = canonicalJsonText;
 
-export function isSha256(value: string): boolean { return /^[a-f0-9]{64}$/.test(value); }
 export function isSafeRecoveryIdentity(value: string): boolean { return value.length > 0 && value.length <= 256 && /^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(value); }
 export function vaultGenerationPrefix(vaultId: string, vaultGeneration: string): string {
 	if (!isCanonicalVaultId(vaultId) || !isCanonicalVaultId(vaultGeneration)) throw new Error("invalid vault identity");
@@ -237,7 +237,7 @@ export function recoveryPrefix(vaultId: string, vaultGeneration: string): string
 	return `${vaultGenerationPrefix(vaultId, vaultGeneration)}/recovery-v2`;
 }
 export function blobObjectKey(vaultId: string, vaultGeneration: string, hash: string): string {
-	if (!isSha256(hash)) throw new Error("invalid blob hash");
+	if (!isSha256Hex(hash)) throw new Error("invalid blob hash");
 	return `${vaultGenerationPrefix(vaultId, vaultGeneration)}/blobs/${hash}`;
 }
 export function contentObjectKey(vaultId: string, vaultGeneration: string, hash: string): string {
