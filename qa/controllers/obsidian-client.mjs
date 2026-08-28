@@ -1,5 +1,22 @@
 import WebSocket from "ws";
 
+export function selectObsidianTarget(targets) {
+	if (!Array.isArray(targets)) return null;
+	return targets.find((candidate) =>
+		candidate?.type === "page" && candidate.url?.includes("obsidian.md/index.html"))
+		?? targets.find((candidate) =>
+			candidate?.type === "page"
+			&& candidate.title?.includes("Obsidian")
+			&& !candidate.title.includes("DevTools")
+			&& candidate.url !== "about:blank")
+		?? targets.find((candidate) =>
+			candidate?.type === "page"
+			&& !candidate.url?.startsWith("blob:")
+			&& candidate.url !== "about:blank"
+			&& !candidate.title?.includes("Worker"))
+		?? null;
+}
+
 /** Raw Chrome DevTools Protocol client for live Obsidian renderer automation. */
 export class ObsidianClient {
 	#ws = null;
@@ -31,12 +48,7 @@ export class ObsidianClient {
 		}
 
 		const targets = await response.json();
-		const target = targets.find(
-			(candidate) => candidate.type === "page" && candidate.title.includes("Obsidian") && !candidate.title.includes("DevTools"),
-		) ?? targets.find((candidate) => candidate.url?.includes("obsidian.md/index.html"))
-			?? targets.find(
-				(candidate) => candidate.type === "page" && !candidate.url?.startsWith("blob:") && !candidate.title?.includes("Worker"),
-			);
+		const target = selectObsidianTarget(targets);
 		if (!target?.webSocketDebuggerUrl) {
 			throw new Error(
 				`No suitable Obsidian renderer found on port ${this.#port}. Targets: ` +

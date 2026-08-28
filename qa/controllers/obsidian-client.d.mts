@@ -1,3 +1,12 @@
+export interface ObsidianCdpTarget {
+	type?: string;
+	title?: string;
+	url?: string;
+	webSocketDebuggerUrl?: string;
+}
+
+export function selectObsidianTarget(targets: unknown): ObsidianCdpTarget | null;
+
 export interface ObsidianClientOptions {
 	port?: number;
 	host?: string;
