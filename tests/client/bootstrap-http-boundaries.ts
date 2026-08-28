@@ -5,6 +5,12 @@ import {
 	type BootstrapHttpResponse,
 } from "../../src/sync/bootstrapClient";
 import type { StoredDocument } from "../../src/sync/vaultIndexedDb";
+import { VaultSyncHttpPort } from "../../src/sync/vaultSync";
+import {
+	createFetchRequester,
+	type HttpRequest,
+	type HttpResponse,
+} from "../../src/utils/http";
 import { suite } from "../harness.ts";
 
 const s = suite("bootstrap-http-boundaries");
@@ -68,6 +74,82 @@ s.test("HTTP adapter consumes authenticated root, catalog, and body boundaries d
 	assert.equal(documents[0]?.documentId, "root");
 	assert.equal(documents[0]?.generation, 7);
 	assert.equal(documents[0]?.updatedAt, 99);
+});
+
+s.test("fetch adaptation preserves request bytes and decodes one response body", async () => {
+	const requestBody = new Uint8Array([4, 5, 6]).buffer;
+	let receivedBody: BodyInit | null | undefined;
+	const request = createFetchRequester(async (_input, init) => {
+		receivedBody = init?.body;
+		return new Response('{"accepted":true}', {
+			status: 200,
+			headers: {
+				"content-type": "application/json",
+				"x-yaos-generation": "9",
+			},
+		});
+	});
+
+	const result = await request({
+		url: "https://sync.test/vault",
+		method: "POST",
+		contentType: "application/octet-stream",
+		headers: { Authorization: "Bearer token" },
+		body: requestBody,
+	});
+
+	assert.strictEqual(receivedBody, requestBody);
+	assert.deepEqual(result.json, { accepted: true });
+	assert.equal(result.headers["x-yaos-generation"], "9");
+	assert.deepEqual(
+		new Uint8Array(result.arrayBuffer),
+		new TextEncoder().encode('{"accepted":true}'),
+	);
+});
+
+s.test("VaultSync HTTP injection sends candidate bytes without copying", async () => {
+	const requests: HttpRequest[] = [];
+	const response: HttpResponse = {
+		status: 200,
+		headers: {},
+		arrayBuffer: new ArrayBuffer(0),
+		json: {
+			vaultId: "vault/id",
+			vaultGeneration: "generation",
+			bodyId: "body/id",
+			clientId: "client",
+			candidateId: "candidate",
+			candidateDigest: "digest",
+			durableGeneration: 2,
+			runtimeEpoch: "epoch",
+		},
+		text: "",
+	};
+	const port = new VaultSyncHttpPort(
+		"https://sync.test/",
+		"vault/id",
+		"token",
+		async (request) => {
+			requests.push(request);
+			return response;
+		},
+	);
+	const encodedUpdate = new Uint8Array([7, 8, 9]).buffer;
+	await port.submitCandidate({
+		vaultId: "vault/id",
+		bodyId: "body/id",
+		candidateId: "candidate",
+		candidateDigest: "digest",
+		encodedUpdate,
+		capturedAt: 1,
+	});
+
+	assert.strictEqual(requests[0]?.body, encodedUpdate);
+	assert.equal(
+		requests[0]?.url,
+		"https://sync.test/vault/vault%2Fid/body/body%2Fid/candidate",
+	);
+	assert.equal(requests[0]?.headers?.Authorization, "Bearer token");
 });
 
 await s.done();

@@ -10,7 +10,7 @@ import type {
 	StoredLifecycleOperation,
 	StoredDocument,
 } from "./vaultIndexedDb";
-import { obsidianRequest } from "../utils/http";
+import { obsidianRequest, type HttpRequester } from "../utils/http";
 import { patchTicketInUrl, TICKET_REFRESH_BUFFER_MS } from "./socketTicket";
 import { PROTOCOL_VERSION, SCHEMA_VERSION } from "./schema";
 import type { BlobMeta, BlobRef, BlobTombstone } from "../types";
@@ -297,6 +297,10 @@ export interface ProviderFactoryInput {
 	doc: Y.Doc;
 }
 export type ProviderFactory = (input: ProviderFactoryInput) => SyncProviderPort;
+export type WebSocketImplementation = new (
+	url: string | URL,
+	protocols?: string | string[],
+) => unknown;
 export interface SocketTicketResult {
 	value: string;
 	expiresAt: number;
@@ -324,6 +328,8 @@ export interface VaultSyncOptions {
 	server?: VaultServerPort;
 	providerFactory?: ProviderFactory;
 	getSocketTicket?: (force?: boolean) => Promise<SocketTicketResult | null>;
+	request?: HttpRequester;
+	webSocket?: WebSocketImplementation;
 	maxLoadedBodies?: number;
 	candidateDebounceMs?: number;
 	bodySyncTimeoutMs?: number;
@@ -534,12 +540,17 @@ function adaptProvider(provider: YSyncProvider): SyncProviderPort {
 export class VaultSyncHttpPort implements VaultServerPort {
 	private readonly base: string;
 
-	constructor(host: string, private readonly vaultId: string, private readonly token: string) {
+	constructor(
+		host: string,
+		private readonly vaultId: string,
+		private readonly token: string,
+		private readonly request: HttpRequester = obsidianRequest,
+	) {
 		this.base = host.replace(/\/$/, "");
 	}
 
 	async currentHead(bodyId: string): Promise<BodyHead | null> {
-		const response = await obsidianRequest({
+		const response = await this.request({
 			url: `${this.route("head")}/${encodeURIComponent(bodyId)}`,
 			method: "GET",
 			headers: this.headers(),
@@ -550,7 +561,7 @@ export class VaultSyncHttpPort implements VaultServerPort {
 	}
 
 	async currentBody(bodyId: string): Promise<BodyState> {
-		const response = await obsidianRequest({
+		const response = await this.request({
 			url: `${this.route("body")}/${encodeURIComponent(bodyId)}`,
 			method: "GET",
 			headers: this.headers(),
@@ -586,11 +597,11 @@ export class VaultSyncHttpPort implements VaultServerPort {
 	}
 
 	async submitCandidate(record: CandidateRecord): Promise<BodyReceipt> {
-		const response = await obsidianRequest({
+		const response = await this.request({
 			url: `${this.route("body")}/${encodeURIComponent(record.bodyId)}/candidate`,
 			method: "POST",
 			contentType: "application/octet-stream",
-			body: record.encodedUpdate.slice(0),
+			body: record.encodedUpdate,
 			headers: {
 				...this.headers(),
 				"x-yaos-candidate-id": record.candidateId,
@@ -602,7 +613,7 @@ export class VaultSyncHttpPort implements VaultServerPort {
 	}
 
 	async commitLifecycle(request: LifecycleRequest): Promise<LifecycleReceipt> {
-		const response = await obsidianRequest({
+		const response = await this.request({
 			url: this.route("lifecycle"),
 			method: "POST",
 			contentType: "application/json",
@@ -618,7 +629,7 @@ export class VaultSyncHttpPort implements VaultServerPort {
 	async commitLifecycleBatch(
 		requests: readonly LifecycleRequest[],
 	): Promise<LifecycleBatchReceipt> {
-		const response = await obsidianRequest({
+		const response = await this.request({
 			url: this.route("lifecycle/batch"),
 			method: "POST",
 			contentType: "application/json",
@@ -634,7 +645,7 @@ export class VaultSyncHttpPort implements VaultServerPort {
 		operations: readonly LifecyclePublicationOperation[],
 		rootUpdate: Uint8Array,
 	): Promise<RootPublicationReceipt> {
-		const response = await obsidianRequest({
+		const response = await this.request({
 			url: this.route("lifecycle/publish"),
 			method: "POST",
 			contentType: "application/json",
@@ -651,7 +662,7 @@ export class VaultSyncHttpPort implements VaultServerPort {
 	}
 
 	async publishAttachment(mutation: AttachmentPublicationMutation): Promise<AttachmentPublicationReceipt> {
-		const response = await obsidianRequest({
+		const response = await this.request({
 			url: this.route("attachments/publish"),
 			method: "POST",
 			contentType: "application/json",
@@ -740,7 +751,12 @@ export class VaultSync implements SyncRuntimePort {
 			bodySyncTimeoutMs: options.bodySyncTimeoutMs ?? DEFAULT_BODY_SYNC_TIMEOUT_MS,
 		};
 		this.deviceId = options.deviceId;
-		this.server = options.server ?? new VaultSyncHttpPort(options.host, options.vaultId, options.token);
+		this.server = options.server ?? new VaultSyncHttpPort(
+			options.host,
+			options.vaultId,
+			options.token,
+			options.request,
+		);
 		this.bodies = new BodyManager(options.database, options.now);
 		const factory = options.providerFactory ?? ((input) => this.createDefaultProvider(input));
 		this.provider = factory({ kind: "root", documentId: ROOT_DOCUMENT_ID, doc: this.ydoc });
@@ -2688,6 +2704,7 @@ export class VaultSync implements SyncRuntimePort {
 			prefix,
 			connect: false,
 			maxBackoffTime: MAX_BACKOFF_TIME_MS,
+			WebSocketPolyfill: this.options.webSocket as typeof WebSocket | undefined,
 			params: async () => {
 				if (!this.options.getSocketTicket) {
 					throw new Error("a short-lived socket ticket is required");

@@ -1,6 +1,6 @@
 /** Fetches and caches the mandatory short-lived WebSocket ticket. */
 
-import { obsidianRequest } from "../utils/http";
+import { obsidianRequest, type HttpRequester } from "../utils/http";
 
 
 /**
@@ -41,7 +41,7 @@ export interface SocketTicketCache {
 	invalidate(): void;
 }
 
-export function createSocketTicketCache(): SocketTicketCache {
+export function createSocketTicketCache(request: HttpRequester = obsidianRequest): SocketTicketCache {
 	let cached: CachedSocketTicket | null = null;
 
 	return {
@@ -50,7 +50,7 @@ export function createSocketTicketCache(): SocketTicketCache {
 			if (cached && cached.localExpiresAt - now > TICKET_REFRESH_BUFFER_MS) {
 				return cached;
 			}
-			const fresh = await fetchSocketTicket(host, deviceToken, vaultId);
+			const fresh = await fetchSocketTicket(host, deviceToken, vaultId, request);
 			cached = fresh;
 			return fresh;
 		},
@@ -80,9 +80,10 @@ async function fetchSocketTicket(
 	host: string,
 	deviceToken: string,
 	vaultId: string,
+	request: HttpRequester,
 ): Promise<CachedSocketTicket> {
 	const base = host.replace(/\/$/, "");
-	const res = await obsidianRequest({
+	const res = await request({
 		url: `${base}/vault/${encodeURIComponent(vaultId)}/auth/ticket`,
 		method: "POST",
 		headers: { Authorization: `Bearer ${deviceToken}` },

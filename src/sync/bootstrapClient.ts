@@ -1,8 +1,10 @@
 import * as Y from "yjs";
 import { BodyManager } from "./bodyManager";
-import {
-	VaultIndexedDb,
-	type StoredBootstrapProgress,
+import type {
+	StoredBootstrapProgress,
+	StoredDocument,
+	StoredFeedCursor,
+	StoredOutstandingBody,
 } from "./vaultIndexedDb";
 import { safeMarkdownPath } from "./pathPolicy";
 import { sha256BytesHex } from "../utils/sha256";
@@ -90,6 +92,23 @@ export interface BootstrapServerPort {
 	currentHead(bodyId: string): Promise<ClientCatalogEntry | null>;
 	currentBody(bodyId: string): Promise<ClientBodyState>;
 	settleRootThrough(sequence: number): Promise<void>;
+}
+export interface BootstrapDatabasePort {
+	getDocument(documentId: string): Promise<StoredDocument | null>;
+	putDocument(document: StoredDocument): Promise<void>;
+	deleteDocument(documentId: string): Promise<void>;
+	getBootstrapProgress(): Promise<StoredBootstrapProgress | null>;
+	putBootstrapProgress(progress: StoredBootstrapProgress): Promise<void>;
+	putFeedCursor(cursor: StoredFeedCursor): Promise<void>;
+	getOutstanding(bodyId: string): Promise<StoredOutstandingBody | null>;
+	putOutstanding(entry: StoredOutstandingBody): Promise<void>;
+	deleteOutstanding(bodyId: string): Promise<void>;
+	listOutstanding(): Promise<StoredOutstandingBody[]>;
+	getMaterializedPath(bodyId: string): Promise<string | null>;
+	setMaterializedPath(bodyId: string, path: string): Promise<void>;
+	setMaterializedPaths(moves: readonly { bodyId: string; path: string }[]): Promise<void>;
+	deleteMaterializedPath(bodyId: string): Promise<void>;
+	listMaterializedPaths(): Promise<Array<{ bodyId: string; path: string }>>;
 }
 export interface BootstrapDiskPort {
 	settleBody(input: {
@@ -237,6 +256,20 @@ function decodeBytesBase64(value: string): Uint8Array | null {
 	}
 }
 
+function exactArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+	const buffer = bytes.buffer;
+	if (
+		buffer instanceof ArrayBuffer
+		&& bytes.byteOffset === 0
+		&& bytes.byteLength === buffer.byteLength
+	) {
+		return buffer;
+	}
+	const copy = new Uint8Array(bytes.byteLength);
+	copy.set(bytes);
+	return copy.buffer;
+}
+
 function decodeBase64UrlBytes(value: string): Uint8Array {
 	const base64 = value.replace(/-/g, "+").replace(/_/g, "/")
 		.padEnd(Math.ceil(value.length / 4) * 4, "=");
@@ -253,7 +286,7 @@ export class BootstrapHttpPort implements BootstrapServerPort {
 		host: string,
 		private readonly vaultId: string,
 		private readonly token: string,
-		private readonly database: VaultIndexedDb,
+		private readonly database: BootstrapDatabasePort,
 		private readonly request: BootstrapHttpRequester,
 		private readonly now: () => number = Date.now,
 	) {
@@ -375,7 +408,7 @@ export class BootstrapHttpPort implements BootstrapServerPort {
 		await this.database.putDocument({
 			documentId: "root",
 			generation: this.generationHeader(response.headers),
-			encodedState: response.arrayBuffer.slice(0),
+			encodedState: response.arrayBuffer,
 			dirty: false,
 			updatedAt: this.now(),
 		});
@@ -430,7 +463,7 @@ export class BootstrapHttpPort implements BootstrapServerPort {
 
 export async function prepareBootstrapRoot(
 	server: BootstrapServerPort,
-	database: VaultIndexedDb,
+	database: BootstrapDatabasePort,
 	attemptId?: string,
 	now: () => number = Date.now,
 ): Promise<{
@@ -450,7 +483,7 @@ export async function prepareBootstrapRoot(
 	await database.putDocument({
 		documentId: "root",
 		generation: descriptor.capture.rootGeneration,
-		encodedState: rootBytes.slice().buffer,
+		encodedState: exactArrayBuffer(rootBytes),
 		dirty: false,
 		updatedAt: now(),
 	});
@@ -472,7 +505,7 @@ export class BootstrapClient {
 	private readonly bodySettlementWork = new Map<string, Promise<void>>();
 	constructor(
 		private readonly server: BootstrapServerPort,
-		private readonly database: VaultIndexedDb,
+		private readonly database: BootstrapDatabasePort,
 		private readonly bodies: BodyManager,
 		private readonly disk: BootstrapDiskPort,
 		private readonly onProgress?: (event: BootstrapProgressEvent) => void,
