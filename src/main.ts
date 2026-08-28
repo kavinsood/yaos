@@ -791,11 +791,14 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						...(request.contentType ? { contentType: request.contentType } : {}),
 						...(request.body !== undefined ? { body: request.body } : {}),
 					});
+					const responseContentType = response.headers["content-type"]
+						?? response.headers["Content-Type"]
+						?? "";
 					return {
 						status: response.status,
 						headers: response.headers,
 						arrayBuffer: response.arrayBuffer,
-						json: response.json,
+						...(responseContentType.includes("application/json") ? { json: response.json } : {}),
 					};
 				},
 			);

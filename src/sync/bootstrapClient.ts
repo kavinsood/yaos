@@ -19,7 +19,7 @@ export interface BootstrapHttpResponse {
 	status: number;
 	headers: Record<string, string>;
 	arrayBuffer: ArrayBuffer;
-	json: unknown;
+	json?: unknown;
 }
 
 export type BootstrapHttpRequester = (
@@ -296,6 +296,7 @@ export class BootstrapHttpPort implements BootstrapServerPort {
 	}
 
 	async bodies(bootstrapId: string, bodyIds: string[]): Promise<Map<string, ClientBodyState>> {
+		if (bodyIds.length === 0) return new Map();
 		const value = await this.json<{
 			bodies: Array<{ bodyId: string; generation: number; encodedState: string }>;
 		}>(

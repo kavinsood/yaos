@@ -40,6 +40,7 @@ s.test("schema-4 root/body, candidate, lifecycle, and bootstrap shapes classify 
 		["POST", "/vault/vault-route-0001/attachments/publish"],
 		["POST", "/vault/vault-route-0001/bootstrap/start"],
 		["GET", "/vault/vault-route-0001/bootstrap/bootstrap-route-0001/root"],
+		["POST", "/vault/vault-route-0001/bootstrap/bootstrap-route-0001/bodies"],
 		["GET", "/vault/vault-route-0001/bootstrap/bootstrap-route-0001/body/body-route-0001"],
 	];
 	for (const [method, path] of accepted) {

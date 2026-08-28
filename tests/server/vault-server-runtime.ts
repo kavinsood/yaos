@@ -42,6 +42,15 @@ function makeServer() {
 	const accepted: Array<{ documentId: string; kind: "root" | "body"; deviceId: string }> = [];
 	const closed: string[] = [];
 	Object.defineProperties(server, {
+		bootstrap: {
+			value: {
+				bodyState: (_bootstrapId: string, bodyId: string) => ({
+					bodyId,
+					generation: bodyId.endsWith("1") ? 7 : 8,
+					encodedState: new Uint8Array(bodyId.endsWith("1") ? [1, 2] : [3, 4]),
+				}),
+			},
+		},
 		store: { value: store },
 		lifecycle: { value: { activeBodyHead: (bodyId: string) => bodyId === "body-runtime-0001" ? {} : null } },
 		sockets: {
@@ -144,6 +153,37 @@ s.test("vault deletion is fenced by generation before destructive storage access
 	assert.equal((await server.fetch(request("/status"))).status, 410);
 	assert.equal((await server.fetch(request("/__yaos/delete-all", { method: "POST" }))).status, 200);
 	assert.equal(deleteAllCalls(), 1);
+});
+
+s.test("bootstrap body batch is bounded and returns every requested body", async () => {
+	const { server } = makeServer();
+	await server.fetch(request("/__yaos/provision", {
+		method: "POST",
+		body: JSON.stringify({ vaultGeneration: GENERATION }),
+	}));
+	const headers = {
+		"x-yaos-device-id": "device-runtime-0001",
+		"content-type": "application/json",
+	};
+	const response = await server.fetch(request("/bootstrap/bootstrap-runtime-0001/bodies", {
+		method: "POST",
+		headers,
+		body: JSON.stringify({ bodyIds: ["body-runtime-0001", "body-runtime-0002"] }),
+	}));
+	assert.equal(response.status, 200);
+	assert.deepEqual(await response.json(), {
+		bodies: [
+			{ bodyId: "body-runtime-0001", generation: 7, encodedState: "AQI" },
+			{ bodyId: "body-runtime-0002", generation: 8, encodedState: "AwQ" },
+		],
+	});
+	const duplicate = await server.fetch(request("/bootstrap/bootstrap-runtime-0001/bodies", {
+		method: "POST",
+		headers,
+		body: JSON.stringify({ bodyIds: ["body-runtime-0001", "body-runtime-0001"] }),
+	}));
+	assert.equal(duplicate.status, 400);
+	assert.deepEqual(await duplicate.json(), { error: "duplicate_body_id" });
 });
 
 await s.done();

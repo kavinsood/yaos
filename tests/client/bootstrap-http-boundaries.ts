@@ -50,6 +50,7 @@ s.test("HTTP adapter consumes authenticated root, catalog, and body boundaries d
 	assert.equal((await port.body("boot/id", "body/id")).generation, 7);
 	assert.equal((await port.currentBody("body/id")).generation, 7);
 	await port.settleRootThrough(41);
+	assert.equal((await port.bodies("boot/id", [])).size, 0);
 
 	assert.deepEqual(
 		requests.map(({ url, method }) => ({ url, method })),

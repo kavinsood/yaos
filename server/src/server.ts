@@ -1,7 +1,7 @@
 import * as Y from "yjs";
 import { bytesToBase64Url } from "./base64url";
 import { BootstrapService } from "./bootstrap";
-import { MAX_CATCH_UP_BODIES, MAX_CATCH_UP_BYTES } from "./contracts";
+import { MAX_BODY_ID_LENGTH, MAX_CATCH_UP_BODIES, MAX_CATCH_UP_BYTES, MAX_JSON_BYTES } from "./contracts";
 import { sha256Hex } from "./hex";
 import { BoundedBodyError, readBoundedBytes } from "./readBoundedBytes";
 import { handleVaultRecoveryRpc } from "./recoveryRpcRouter";
@@ -374,6 +374,57 @@ export class VaultSyncServer implements DurableObject {
 			return new Response(state.encodedState.slice().buffer, { headers: { "content-type": "application/octet-stream", "x-yaos-sha256": await state.hash } });
 		}
 		if (request.method === "GET" && parts.length === 3 && parts[2] === "catalog") return json(this.bootstrap.catalogPage(bootstrapId, url.searchParams.get("cursor"), boundedLimit(url)));
+		if (request.method === "POST" && parts.length === 3 && parts[2] === "bodies") {
+			let bytes: Uint8Array;
+			try {
+				bytes = await readBoundedBytes(request, MAX_JSON_BYTES);
+			} catch (error) {
+				return json({
+					error: error instanceof BoundedBodyError ? error.kind : "invalid_body_batch",
+				}, error instanceof BoundedBodyError && error.kind === "body_too_large" ? 413 : 400);
+			}
+			let input: unknown;
+			try {
+				input = JSON.parse(new TextDecoder().decode(bytes));
+			} catch {
+				return json({ error: "invalid_body_batch" }, 400);
+			}
+			if (
+				typeof input !== "object"
+				|| input === null
+				|| Array.isArray(input)
+				|| Object.keys(input).length !== 1
+				|| !("bodyIds" in input)
+				|| !Array.isArray(input.bodyIds)
+				|| input.bodyIds.length < 1
+				|| input.bodyIds.length > MAX_CATCH_UP_BODIES
+			) {
+				return json({ error: "invalid_body_batch" }, 400);
+			}
+			const bodyIds: string[] = [];
+			for (const value of input.bodyIds) {
+				if (typeof value !== "string" || value.length > MAX_BODY_ID_LENGTH || !/^[A-Za-z0-9_-]+$/.test(value)) {
+					return json({ error: "invalid_body_id" }, 400);
+				}
+				bodyIds.push(value);
+			}
+			if (new Set(bodyIds).size !== bodyIds.length) return json({ error: "duplicate_body_id" }, 400);
+			const bodies = bodyIds.map((bodyId) => {
+				const state = this.bootstrap.bodyState(bootstrapId, bodyId);
+				return {
+					bodyId,
+					generation: state.generation,
+					encodedState: bytesToBase64Url(state.encodedState),
+				};
+			});
+			const response = JSON.stringify({ bodies });
+			if (new TextEncoder().encode(response).byteLength > MAX_CATCH_UP_BYTES) {
+				return json({ error: "bootstrap_response_too_large" }, 413);
+			}
+			return new Response(response, {
+				headers: { "content-type": "application/json", "cache-control": "no-store" },
+			});
+		}
 		if (request.method === "GET" && parts.length === 4 && parts[2] === "body") {
 			const state = this.bootstrap.bodyState(bootstrapId, parts[3]!);
 			const head = this.store.getCatalogHeadAt(state.throughSequence, state.bodyId);

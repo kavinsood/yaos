@@ -81,7 +81,7 @@ function validVaultRest(method: string, rest: string[]): boolean {
 	if (method === "POST" && rest.length === 2 && rest[0] === "bootstrap" && rest[1] === "start") return true;
 	if (rest.length === 3 && rest[0] === "bootstrap" && !!rest[1]) {
 		return (method === "GET" && (rest[2] === "root" || rest[2] === "catalog"))
-			|| (method === "POST" && (rest[2] === "renew" || rest[2] === "complete"));
+			|| (method === "POST" && (rest[2] === "bodies" || rest[2] === "renew" || rest[2] === "complete"));
 	}
 	if (method === "GET" && rest.length === 4 && rest[0] === "bootstrap" && !!rest[1] && rest[2] === "body" && !!rest[3]) return true;
 	return method === "GET" && rest.length === 1
