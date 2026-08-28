@@ -32,6 +32,16 @@ import {
 	fetchVaultProvisioningProof,
 	type VaultProvisioningProof,
 } from "./onboarding/provisioningClient";
+import { SettingsSyncEngine } from "./sync/settingsSync/engine";
+import {
+	emptySettingsSyncStatus,
+	SETTINGS_SYNC_FORMAT_VERSION,
+	type SettingsSyncStatus,
+} from "./sync/settingsSync/types";
+import {
+	confirmAndSmokeInstallCalendar,
+	noticeForInstallResult,
+} from "./sync/settingsSync/obsidianPluginInstall";
 import { type BlobQueueSnapshot, type BlobSyncManager } from "./sync/blobSync";
 import { isMarkdownSyncable, isBlobSyncable } from "./types";
 import { planCategoryRenameAction } from "./sync/policy/renameAdmissionPolicy";
@@ -178,6 +188,12 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private attachmentOrchestrator: AttachmentOrchestrator | null = null;
 	private editorWorkspace: EditorWorkspaceOrchestrator | null = null;
 	private snapshotService: SnapshotService | null = null;
+	private settingsSyncEngine: SettingsSyncEngine | null = null;
+	private settingsSyncStatus: SettingsSyncStatus = emptySettingsSyncStatus();
+	private settingsSyncTab: VaultSyncSettingTab | null = null;
+	private settingsSyncLifecycleTail: Promise<void> = Promise.resolve();
+	private settingsSyncSeedNoticeIdentity: string | null = null;
+	private settingsSyncCapabilityActive = false;
 	private pendingRecoveryState: PendingRecoveryState = { ...EMPTY_PENDING_RECOVERY_STATE };
 	private reconciliationController!: ReconciliationController;
 	private setupLinkController: SetupLinkController | null = null;
@@ -643,7 +659,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.attachmentOrchestrator.hydrateSavedQueue(this.savedBlobQueue);
 		this.savedBlobQueue = null;
 
-		this.addSettingTab(new VaultSyncSettingTab(this.app, this, this));
+		this.settingsSyncTab = new VaultSyncSettingTab(this.app, this, this);
+		this.addSettingTab(this.settingsSyncTab);
 
 		this.statusBarEl = this.addStatusBarItem();
 		this.updateStatusBar({ kind: "disconnected" });
@@ -768,9 +785,12 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			if (provisioning.vaultGeneration !== this.settings.vaultGeneration) {
 				throw new Error("enrollment vault generation does not match the active server vault");
 			}
+			if (abortIfStale("vault provisioning proof")) return;
 			await this.persistPluginState((state) => {
 				state._provisioningProof = provisioning;
 			});
+			await this.installSettingsSyncEngine(folderKey, provisioning);
+			if (abortIfStale("settings sync initialization")) return;
 			const database = new VaultIndexedDb(
 				this.settings.vaultId,
 				this.settings.vaultGeneration,
@@ -1052,6 +1072,16 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					exportVault: async () => {
 						await new VaultExportService(this.app).exportToDownload();
 					},
+					applySettingsSync: () => this.applySettingsSync(),
+					replaceSettingsSyncEnvironment: () => this.replaceSettingsSyncEnvironment(),
+					seedSettingsSyncFromThisDevice: () => this.seedSettingsSyncFromThisDevice(),
+					takeSettingsSyncSeed: () => this.takeSettingsSyncSeed(),
+					deferSettingsSyncSeed: () => this.deferSettingsSyncSeed(),
+					isSettingsSyncDebugEnabled: () => this.settings.debug || this.settings.qaDebugMode,
+					runSettingsSyncInstallSmoke: async () => {
+						noticeForInstallResult(await confirmAndSmokeInstallCalendar(this.app));
+					},
+					runSettingsSyncCommand: (action) => this.runSettingsSyncCommand(action),
 				});
 				// Debug-runtime commands are registered separately by the debug runtime.
 				this.lab?.registerCommands(this);
@@ -1577,6 +1607,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.log("teardownSync: tearing down all sync state");
 
 		await runTeardownStages([
+			{
+				name: "settings-sync",
+				run: () => this.stopSettingsSyncEngine(),
+			},
 			// Safe baseline order: flush callbacks update memory, then persist the
 			// resulting disk index before DiskMirror clears its write state.
 			{
@@ -1627,6 +1661,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			{
 				name: "runtime-references",
 				run: () => {
+					this.settingsSyncEngine = null;
 					this.vaultSync = null;
 					this.connectionController = null;
 					this.editorBindings = null;
@@ -1843,6 +1878,246 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	/** Coalesce durable body-candidate receipt updates into one status redraw. */
 	private queueReceiptStatusRefresh(): void {
 		this.receiptStatusRefresh.request();
+	}
+
+	private serializeSettingsSyncLifecycle(operation: () => Promise<void>): Promise<void> {
+		const run = this.settingsSyncLifecycleTail.then(operation, operation);
+		this.settingsSyncLifecycleTail = run.catch(() => undefined);
+		return run;
+	}
+
+	private publishSettingsSyncStatus(status: SettingsSyncStatus): void {
+		this.settingsSyncStatus = status;
+		this.settingsSyncTab?.update();
+	}
+
+	private hasExactSettingsSyncCapability(): boolean {
+		const capabilities = this.capabilityUpdateService?.capabilities;
+		return capabilities?.settingsSync === true
+			&& capabilities.settingsFormatVersion === SETTINGS_SYNC_FORMAT_VERSION;
+	}
+
+	private async installSettingsSyncEngine(
+		folderKey: string,
+		provisioning: VaultProvisioningProof,
+	): Promise<void> {
+		if (
+			provisioning.vaultId !== this.settings.vaultId
+			|| provisioning.vaultGeneration !== this.settings.vaultGeneration
+		) {
+			throw new Error("settings sync provisioning identity mismatch");
+		}
+		await this.serializeSettingsSyncLifecycle(async () => {
+			if (this.teardownLifecycle.isClosing) return;
+			await this.settingsSyncEngine?.stop();
+			this.settingsSyncCapabilityActive = false;
+			let engine!: SettingsSyncEngine;
+			const noticeIdentity = [
+				this.settings.host.trim().replace(/\/$/, ""),
+				this.settings.vaultId,
+				this.settings.vaultGeneration,
+				folderKey,
+				this.settings.deviceId,
+				this.app.vault.configDir,
+			].join("\n");
+			engine = new SettingsSyncEngine({
+				app: this.app,
+				getSettings: () => this.settings,
+				getCapabilities: () => this.capabilityUpdateService?.capabilities ?? null,
+				folderKey,
+				onStatus: (status) => {
+					if (this.settingsSyncEngine === engine) this.publishSettingsSyncStatus(status);
+				},
+				onNeedsSeed: ({ blank }) => {
+					if (this.settingsSyncEngine !== engine || this.settingsSyncSeedNoticeIdentity === noticeIdentity) {
+						return;
+					}
+					this.settingsSyncSeedNoticeIdentity = noticeIdentity;
+					new Notice(
+						blank
+							? "YAOS settings sync is ready, but this settings environment has not been seeded. Open Yaos settings to take the remote environment or seed this device."
+							: "YAOS settings sync found local configuration, but this settings environment has not been seeded. Open Yaos settings to choose which environment wins.",
+						10000,
+					);
+				},
+				setDeferred: (deferred) => {
+					if (this.settings.settingsSyncDeferred === deferred) return;
+					void this.updateSettings((settings) => {
+						settings.settingsSyncDeferred = deferred;
+					}, "settings-sync-deferred").catch((error: unknown) => {
+						new Notice(`Could not save settings sync choice: ${formatUnknown(error)}`, 8000);
+					});
+				},
+			});
+			this.settingsSyncEngine = engine;
+			await this.reconcileSettingsSyncEngineInner();
+		});
+	}
+
+	private async reconcileSettingsSyncEngineInner(force = false): Promise<void> {
+		const engine = this.settingsSyncEngine;
+		if (!engine) return;
+		try {
+			if (this.teardownLifecycle.isClosing) {
+				this.settingsSyncCapabilityActive = false;
+				await engine.stop();
+				return;
+			}
+			if (this.hasExactSettingsSyncCapability()) {
+				if (this.settingsSyncCapabilityActive && !force) return;
+				await engine.start();
+				this.settingsSyncCapabilityActive = true;
+				return;
+			}
+			this.settingsSyncCapabilityActive = false;
+			await engine.stop();
+			const capabilities = this.capabilityUpdateService?.capabilities;
+			this.publishSettingsSyncStatus({
+				...engine.getStatus(),
+				running: false,
+				reason: "unsupported",
+				headline: capabilities?.settingsSync
+					? "settings_format_unsupported"
+					: "settings_sync_unsupported",
+				error: null,
+			});
+		} catch (error) {
+			this.settingsSyncCapabilityActive = false;
+			await engine.stop().catch(() => undefined);
+			const details = formatUnknown(error);
+			this.publishSettingsSyncStatus({
+				...engine.getStatus(),
+				running: false,
+				reason: "error",
+				error: details,
+			});
+			this.log(`Settings sync unavailable; note sync is continuing: ${details}`);
+			this.trace("settings", "settings-sync-start-failed", { error: details });
+		}
+	}
+
+	async refreshSettingsSyncRuntime(): Promise<void> {
+		await this.serializeSettingsSyncLifecycle(() => this.reconcileSettingsSyncEngineInner(true));
+	}
+
+	private async stopSettingsSyncEngine(): Promise<void> {
+		await this.serializeSettingsSyncLifecycle(async () => {
+			await this.settingsSyncEngine?.stop();
+			this.settingsSyncCapabilityActive = false;
+		});
+	}
+
+	getSettingsSyncStatus(): SettingsSyncStatus {
+		return this.settingsSyncStatus;
+	}
+
+	private async runSettingsSyncAction(
+		action: (engine: SettingsSyncEngine) => Promise<void>,
+	): Promise<void> {
+		const engine = this.settingsSyncEngine;
+		if (!engine) {
+			new Notice("Settings sync is not available until enrollment and provisioning complete.", 7000);
+			return;
+		}
+		try {
+			await action(engine);
+			this.publishSettingsSyncStatus(engine.getStatus());
+		} catch (error) {
+			new Notice(`Settings sync action failed: ${formatUnknown(error)}`, 9000);
+		}
+	}
+
+	async applySettingsSync(): Promise<void> {
+		await this.runSettingsSyncAction((engine) => engine.applySettings());
+	}
+
+	async replaceSettingsSyncEnvironment(): Promise<void> {
+		await this.runSettingsSyncAction((engine) => engine.replaceEnvironment());
+	}
+
+	async seedSettingsSyncFromThisDevice(): Promise<void> {
+		await this.runSettingsSyncAction((engine) => engine.seedThisDevice());
+	}
+
+	async takeSettingsSyncSeed(): Promise<void> {
+		await this.runSettingsSyncAction((engine) => engine.takeSeed());
+	}
+
+	async deferSettingsSyncSeed(): Promise<void> {
+		await this.updateSettings((settings) => {
+			settings.settingsSyncDeferred = true;
+		}, "settings-sync-defer");
+		await this.refreshSettingsSyncRuntime();
+	}
+
+	async updateSettingsSyncPlugin(pluginId: string): Promise<void> {
+		await this.runSettingsSyncAction((engine) => engine.updatePlugin(pluginId));
+	}
+
+	async promoteSettingsSyncPlugin(pluginId: string): Promise<void> {
+		await this.runSettingsSyncAction((engine) => engine.promotePin(pluginId));
+	}
+
+	async removeSettingsSyncEnvironmentItem(kind: "plugin" | "theme", id: string): Promise<void> {
+		await this.runSettingsSyncAction((engine) => engine.removeFromEnvironment(kind, id));
+	}
+
+	private async confirmSettingsSyncCommand(
+		title: string,
+		message: string,
+		confirmText: string,
+	): Promise<boolean> {
+		return await new Promise<boolean>((resolve) => {
+			new ConfirmModal(
+				this.app,
+				title,
+				message,
+				() => resolve(true),
+				confirmText,
+				"Cancel",
+				() => resolve(false),
+			).open();
+		});
+	}
+
+	async runSettingsSyncCommand(
+		action: "apply" | "replace" | "seed" | "take" | "defer",
+	): Promise<void> {
+		const status = this.getSettingsSyncStatus();
+		const decisionRequired = status.reason === "decision-required";
+		if (action === "defer") {
+			await this.deferSettingsSyncSeed();
+			return;
+		}
+		if (action === "replace" || (action === "seed" && decisionRequired)) {
+			const confirmed = await this.confirmSettingsSyncCommand(
+				"Replace the remote settings environment?",
+				"This overwrites the shared remote settings environment with this device's current managed configuration.",
+				"Replace remote",
+			);
+			if (confirmed) await this.replaceSettingsSyncEnvironment();
+			return;
+		}
+		if ((action === "take" || action === "apply") && decisionRequired) {
+			const confirmed = await this.confirmSettingsSyncCommand(
+				"Take the remote settings environment?",
+				status.seedKind === "occupied"
+					? "This applies the remote plugin, theme, and settings environment over this device's existing managed configuration."
+					: "This applies the remote plugin, theme, and settings environment to this device.",
+				"Take remote",
+			);
+			if (confirmed) await this.takeSettingsSyncSeed();
+			return;
+		}
+		if (action === "apply") {
+			await this.applySettingsSync();
+			return;
+		}
+		if (action === "seed") {
+			await this.seedSettingsSyncFromThisDevice();
+			return;
+		}
+		await this.takeSettingsSyncSeed();
 	}
 
 	getSettingsStatusSummary(): { label: string } {
@@ -2255,7 +2530,38 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		return await this.setupLinkController?.enrollWithCode(host, pairingCode) ?? false;
 	}
 
+	private async retireSettingsSyncLocalState(membership: EnrollmentMembership): Promise<void> {
+		const folderKey = await this.ensureFolderKey();
+		await this.serializeSettingsSyncLifecycle(async () => {
+			const activeEngine = this.settingsSyncEngine;
+			const engine = activeEngine ?? new SettingsSyncEngine({
+				app: this.app,
+				getSettings: () => ({
+					host: membership.host,
+					deviceToken: membership.deviceToken,
+					vaultId: membership.vaultId,
+					vaultGeneration: membership.vaultGeneration,
+					deviceId: membership.deviceId,
+					settingsSyncEnabled: this.settings.settingsSyncEnabled,
+					settingsSyncAutoInstall: this.settings.settingsSyncAutoInstall,
+					settingsSyncDeferred: this.settings.settingsSyncDeferred,
+				}),
+				getCapabilities: () => null,
+				folderKey,
+			});
+			await engine.retire();
+			if (this.settingsSyncEngine === activeEngine) this.settingsSyncEngine = null;
+			this.settingsSyncCapabilityActive = false;
+		});
+		this.settings.settingsSyncDeferred = false;
+		await this.persistPluginState((state) => {
+			delete state._provisioningProof;
+		});
+		this.publishSettingsSyncStatus(emptySettingsSyncStatus());
+	}
+
 	private async retireCurrentEnrollment(membership: EnrollmentMembership): Promise<void> {
+		await this.retireSettingsSyncLocalState(membership);
 		const database = this.vaultDatabase;
 		const preflight = await database?.getPendingWorkSummary() ?? null;
 		if (
@@ -2376,6 +2682,19 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		const host = this.settings.host.trim().replace(/\/$/, "");
 		const deviceToken = this.settings.deviceToken.trim();
 		const vaultId = this.settings.vaultId.trim();
+		const membership: EnrollmentMembership = {
+			host,
+			deviceToken,
+			vaultId,
+			deviceId: this.settings.deviceId.trim(),
+			vaultGeneration: this.settings.vaultGeneration.trim(),
+		};
+		try {
+			await this.retireSettingsSyncLocalState(membership);
+		} catch (error) {
+			new Notice(`Could not retire local settings sync state: ${formatUnknown(error)}`, 9000);
+			return;
+		}
 		if (host && deviceToken && vaultId) {
 			try {
 				const res = await obsidianRequest({
@@ -2412,6 +2731,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			settings.deviceId = "";
 			settings.vaultGeneration = "";
 			settings.originImportPending = false;
+			settings.settingsSyncDeferred = false;
 		}, "leave-vault");
 		new Notice("Left this vault. Notes are still on disk.", 7000);
 	}
@@ -2448,6 +2768,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	async refreshServerCapabilities(reason = "manual"): Promise<void> {
 		await this.capabilityUpdateService?.refreshServerCapabilities(reason);
+		await this.serializeSettingsSyncLifecycle(() => this.reconcileSettingsSyncEngineInner());
 	}
 
 	async refreshUpdateManifest(reason = "manual", force = false): Promise<void> {

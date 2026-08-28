@@ -8,11 +8,13 @@ import {
 } from "obsidian";
 import { PairDeviceModal } from "./PairDeviceModal";
 import { DeviceCredentialsModal } from "./DeviceCredentialsModal";
+import { ConfirmModal } from "../ui/ConfirmModal";
 import {
 	attachmentSizeCapKB,
 	type ExternalEditPolicy,
 	type VaultSyncSettings,
 } from "./settingsStore";
+import type { SettingsSyncStatus } from "../sync/settingsSync/types";
 
 
 type DeclarativeSettingKey =
@@ -29,6 +31,8 @@ type DeclarativeSettingKey =
 	| "updateRepoBranch"
 	| "externalEditPolicy"
 	| "frontmatterGuardEnabled"
+	| "settingsSyncEnabled"
+	| "settingsSyncAutoInstall"
 	| "debug";
 
 interface SettingsUpdateState {
@@ -60,6 +64,16 @@ export interface VaultSyncSettingsHost {
 	refreshUpdateManifest(reason?: string, force?: boolean): Promise<void>;
 	refreshAttachmentSyncRuntime(reason?: string): Promise<void>;
 	getSettingsStatusSummary(): { label: string };
+	getSettingsSyncStatus(): SettingsSyncStatus;
+	refreshSettingsSyncRuntime(): Promise<void>;
+	applySettingsSync(): Promise<void>;
+	replaceSettingsSyncEnvironment(): Promise<void>;
+	seedSettingsSyncFromThisDevice(): Promise<void>;
+	takeSettingsSyncSeed(): Promise<void>;
+	deferSettingsSyncSeed(): Promise<void>;
+	updateSettingsSyncPlugin(pluginId: string): Promise<void>;
+	promoteSettingsSyncPlugin(pluginId: string): Promise<void>;
+	removeSettingsSyncEnvironmentItem(kind: "plugin" | "theme", id: string): Promise<void>;
 	getUpdateState(): SettingsUpdateState;
 	mintDevicePairing(): Promise<{ deepLink: string; mobileUrl: string } | null>;
 	buildDeviceCredentialsText(): string | null;
@@ -244,6 +258,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 				},
 			];
 			definitions.push({ type: "group", heading: "Updates", items: updateItems });
+			definitions.push(this.buildSettingsSyncGroup());
 		}
 
 		definitions.push(
@@ -393,6 +408,218 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 		return definitions;
 	}
 
+	private buildSettingsSyncGroup(): SettingDefinitionItem {
+		const status = this.host.getSettingsSyncStatus();
+		const decisionRequired = String(status.reason) === "decision-required";
+		const reason = decisionRequired
+			? "A remote settings environment exists. Explicitly choose whether this device takes it or replaces it; note sync continues."
+			: (() => {
+				switch (status.reason) {
+					case "ok": return "Running";
+					case "unsupported": return status.headline === "settings_format_unsupported"
+						? "Server settings format is incompatible; note sync continues."
+						: "Server does not support settings sync; note sync continues.";
+					case "master-off": return "Off on this device; note sync continues.";
+					case "invalid-key": return "The Obsidian configuration folder name is not a valid settings key.";
+					case "clash": return "Paused because another settings-sync plugin is enabled.";
+					case "deferred": return "Initial seed decision deferred; note sync continues.";
+					case "unseeded": return "Waiting for an initial settings environment choice.";
+					case "stopped": return "Stopped";
+					case "error": return status.error ? `Error: ${status.error}` : "Settings sync error";
+					default: return "Stopped";
+				}
+			})();
+		const seedState = decisionRequired
+			? `Remote seed available; explicit consent required${status.seedKind ? ` (${status.seedKind} local configuration)` : ""}`
+			: status.seeded === true
+				? "Seeded and accepted"
+				: status.seeded === false
+					? `${status.deferred ? "Unseeded; decision deferred" : "Unseeded"}${status.seedKind ? ` (${status.seedKind} local configuration)` : ""}`
+					: "Not checked";
+		const items: SettingDefinition[] = [
+			{
+				name: "Sync Obsidian settings",
+				desc: "Synchronize this vault's current Obsidian configuration folder. Note sync is independent of this switch.",
+				control: { type: "toggle", key: "settingsSyncEnabled" },
+			},
+			{
+				name: "Configuration-folder key",
+				desc: status.configKey ?? "Pending enrollment provisioning and capability check",
+			},
+			{ name: "Settings sync state", desc: reason },
+			{ name: "Settings environment", desc: seedState },
+			{
+				name: "Pending settings apply queue",
+				desc: status.pendingApplySteps > 0
+					? `${status.pendingApplySteps} of ${status.pendingApplyTotal} steps remain for this exact device and configuration folder.`
+					: "No pending apply steps for this device and configuration folder.",
+			},
+			{
+				name: "Apply remote environment",
+				desc: "Apply the known remote plugin, theme, and settings environment now.",
+				visible: () => {
+					const current = this.host.getSettingsSyncStatus();
+					return current.seeded === true && String(current.reason) !== "decision-required";
+				},
+				action: () => this.finishSettingsSyncAction(() => this.host.applySettingsSync()),
+			},
+			{
+				name: decisionRequired ? "Use this device (replace remote)" : "Seed from this device",
+				desc: decisionRequired
+					? "Replace the existing remote environment with this device's managed configuration."
+					: "Create the initial remote settings environment from this device.",
+				visible: () => {
+					const current = this.host.getSettingsSyncStatus();
+					return current.seeded === false || String(current.reason) === "decision-required";
+				},
+				action: () => {
+					const current = this.host.getSettingsSyncStatus();
+					if (String(current.reason) === "decision-required") {
+						this.confirmSettingsSyncAction(
+							"Replace the remote settings environment?",
+							"This replaces the shared remote settings environment with this device's current configuration. Other devices will receive these plugin, theme, and settings choices.",
+							"Replace remote",
+							() => this.host.replaceSettingsSyncEnvironment(),
+						);
+						return;
+					}
+					this.finishSettingsSyncAction(() => this.host.seedSettingsSyncFromThisDevice());
+				},
+			},
+			{
+				name: "Take the remote seed",
+				desc: "Apply a remote seed if another device created it since the last check.",
+				visible: () => {
+					const current = this.host.getSettingsSyncStatus();
+					return current.seeded === false || String(current.reason) === "decision-required";
+				},
+				action: () => {
+					const current = this.host.getSettingsSyncStatus();
+					if (String(current.reason) === "decision-required") {
+						this.confirmSettingsSyncAction(
+							"Take the remote settings environment?",
+							current.seedKind === "occupied"
+								? "This applies the remote plugin, theme, and settings environment over this device's existing managed configuration."
+								: "This applies the remote plugin, theme, and settings environment to this device.",
+							"Take remote",
+							() => this.host.takeSettingsSyncSeed(),
+						);
+						return;
+					}
+					this.finishSettingsSyncAction(() => this.host.takeSettingsSyncSeed());
+				},
+			},
+			{
+				name: "Decide initial seed later",
+				desc: "Defer the seed choice without pausing note sync.",
+				visible: () => {
+					const current = this.host.getSettingsSyncStatus();
+					return current.seeded === false && !current.deferred;
+				},
+				action: () => this.finishSettingsSyncAction(() => this.host.deferSettingsSyncSeed()),
+			},
+			{
+				name: "Replace remote settings environment",
+				desc: "Replace the seeded remote settings environment with this device's current configuration.",
+				visible: () => this.host.getSettingsSyncStatus().seeded === true,
+				action: () => this.confirmSettingsSyncAction(
+					"Replace the remote settings environment?",
+					"This overwrites the shared remote settings environment with this device's current managed configuration.",
+					"Replace remote",
+					() => this.host.replaceSettingsSyncEnvironment(),
+				),
+			},
+			{
+				name: "Automatically install remote plugins and themes",
+				desc: "Consent to foreground installation and removal needed by the remote environment. Off by default.",
+				control: { type: "toggle", key: "settingsSyncAutoInstall" },
+			},
+			{
+				name: "Settings-sync clash",
+				desc: status.clashId ? `Conflicting plugin: ${status.clashId}` : "",
+				visible: () => this.host.getSettingsSyncStatus().clashId !== null,
+			},
+			{
+				name: "Ignored unknown configuration files",
+				desc: status.unknownFiles.join(", "),
+				visible: () => this.host.getSettingsSyncStatus().unknownFiles.length > 0,
+			},
+			{
+				name: "Restart required",
+				desc: "Restart Obsidian to finish applying settings changes.",
+				visible: () => this.host.getSettingsSyncStatus().needsRestart,
+			},
+		];
+		for (const mismatch of status.versionMismatches) {
+			items.push(
+				{
+					name: `Update ${mismatch.pluginId} to ${mismatch.pin}`,
+					desc: `Installed ${mismatch.localVersion || "missing"}; remote pin ${mismatch.pin}.`,
+					visible: () => !mismatch.localAhead,
+					action: () => this.finishSettingsSyncAction(() => this.host.updateSettingsSyncPlugin(mismatch.pluginId)),
+				},
+				{
+					name: `Promote ${mismatch.pluginId} pin`,
+					desc: `Use this device's ${mismatch.localVersion} version as the remote pin.`,
+					visible: () => mismatch.localAhead,
+					action: () => this.finishSettingsSyncAction(() => this.host.promoteSettingsSyncPlugin(mismatch.pluginId)),
+				},
+				{
+					name: `Remove ${mismatch.pluginId} from settings environment`,
+					desc: "Remove the mismatched plugin from the shared settings environment and this device.",
+					action: () => this.confirmSettingsSyncRemoval("plugin", mismatch.pluginId),
+				},
+			);
+		}
+		for (const plugin of status.environmentPlugins) {
+			items.push({
+				name: `Environment plugin: ${plugin.id}`,
+				desc: `${plugin.version}${plugin.enabled ? " (enabled)" : " (disabled)"}`,
+				action: () => this.confirmSettingsSyncRemoval("plugin", plugin.id),
+			});
+		}
+		for (const theme of status.environmentThemes) {
+			items.push({
+				name: `Environment theme: ${theme.name}`,
+				desc: theme.version,
+				action: () => this.confirmSettingsSyncRemoval("theme", theme.name),
+			});
+		}
+		return { type: "group", heading: "Obsidian settings sync", items };
+	}
+
+	private confirmSettingsSyncAction(
+		title: string,
+		message: string,
+		confirmText: string,
+		action: () => Promise<void>,
+	): void {
+		new ConfirmModal(
+			this.app,
+			title,
+			message,
+			() => this.finishSettingsSyncAction(action),
+			confirmText,
+		).open();
+	}
+
+	private confirmSettingsSyncRemoval(kind: "plugin" | "theme", id: string): void {
+		this.confirmSettingsSyncAction(
+			`Remove ${kind} from the settings environment?`,
+			`This removes ${id} from the shared settings environment and from this device. Other devices will observe the removal.`,
+			`Remove ${kind}`,
+			() => this.host.removeSettingsSyncEnvironmentItem(kind, id),
+		);
+	}
+
+	private finishSettingsSyncAction(action: () => Promise<void>): void {
+		void action()
+			.catch((error: unknown) => {
+				new Notice(`Settings sync action failed: ${error instanceof Error ? error.message : String(error)}`, 8000);
+			})
+			.finally(() => this.update());
+	}
+
 	getControlValue(key: string): unknown {
 		switch (key as DeclarativeSettingKey) {
 			case "deviceName": return this.host.settings.deviceName;
@@ -408,6 +635,8 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 			case "updateRepoBranch": return this.host.settings.updateRepoBranch;
 			case "externalEditPolicy": return this.host.settings.externalEditPolicy;
 			case "frontmatterGuardEnabled": return this.host.settings.frontmatterGuardEnabled;
+			case "settingsSyncEnabled": return this.host.settings.settingsSyncEnabled;
+			case "settingsSyncAutoInstall": return this.host.settings.settingsSyncAutoInstall;
 			case "debug": return this.host.settings.debug;
 			default: throw new Error(`Unknown Yaos setting: ${key}`);
 		}
@@ -489,6 +718,20 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 				await this.host.updateSettings((settings) => {
 					settings.frontmatterGuardEnabled = expectBooleanValue(key, value);
 				}, "settings:frontmatter-guard");
+				return;
+			case "settingsSyncEnabled":
+				await this.host.updateSettings((settings) => {
+					settings.settingsSyncEnabled = expectBooleanValue(key, value);
+				}, "settings:settings-sync-toggle");
+				await this.host.refreshSettingsSyncRuntime();
+				this.update();
+				return;
+			case "settingsSyncAutoInstall":
+				await this.host.updateSettings((settings) => {
+					settings.settingsSyncAutoInstall = expectBooleanValue(key, value);
+				}, "settings:settings-sync-auto-install");
+				await this.host.refreshSettingsSyncRuntime();
+				this.update();
 				return;
 			case "debug":
 				await this.host.updateSettings((settings) => {

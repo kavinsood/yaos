@@ -3,7 +3,7 @@ import {
 	runTeardownStages,
 	TeardownStagesError,
 } from "../../src/runtime/teardownLifecycle";
-import { suite } from "../harness.ts";
+import { readSource, suite } from "../harness.ts";
 
 const s = suite("teardown-lifecycle");
 
@@ -118,4 +118,43 @@ s.section("Teardown lifecycle");
 		"aggregate failure identifies the failed stage",
 	);
 }
+{
+	const main = readSource("src/main.ts");
+	const settingsStage = main.indexOf('name: "settings-sync"');
+	const diskStage = main.indexOf('name: "disk-pending-writes"');
+	s.check(settingsStage >= 0 && settingsStage < diskStage, "settings engine is the first runtime teardown stage");
+	s.check(
+		main.includes("await this.settingsSyncEngine?.stop()"),
+		"runtime teardown awaits the settings engine and its current operation",
+	);
+	const retirementStart = main.indexOf("private async retireSettingsSyncLocalState");
+	const enrollmentRetirement = main.indexOf("private async retireCurrentEnrollment");
+	const retirement = main.slice(retirementStart, enrollmentRetirement);
+	s.check(
+		retirementStart >= 0 && retirement.includes("await engine.retire()"),
+		"membership retirement clears the exact settings queue",
+	);
+	const proof = main.indexOf("const provisioning = await fetchVaultProvisioningProof");
+	const settingsStart = main.indexOf("await this.installSettingsSyncEngine(folderKey, provisioning)");
+	s.check(proof >= 0 && proof < settingsStart, "settings engine starts only after current provisioning proof");
+	const capabilityRefresh = main.slice(
+		main.indexOf("async refreshServerCapabilities"),
+		main.indexOf("async refreshUpdateManifest"),
+	);
+	s.check(
+		capabilityRefresh.includes("reconcileSettingsSyncEngineInner")
+			&& !capabilityRefresh.includes("teardownSync"),
+		"capability refresh reconciles settings availability without tearing down note sync",
+	);
+	const settingsReconcile = main.slice(
+		main.indexOf("private async reconcileSettingsSyncEngineInner"),
+		main.indexOf("async refreshSettingsSyncRuntime"),
+	);
+	s.check(
+		settingsReconcile.includes("catch (error)")
+			&& settingsReconcile.includes("Settings sync unavailable; note sync is continuing"),
+		"settings startup failure is isolated from note runtime initialization",
+	);
+}
+
 await s.done();

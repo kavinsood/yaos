@@ -14,6 +14,14 @@ export interface CommandsRuntimeHost {
 	nuclearReset(): void;
 	exportVault(): Promise<void>;
 	restartPendingRestore(): Promise<void>;
+	applySettingsSync(): Promise<void>;
+	replaceSettingsSyncEnvironment(): Promise<void>;
+	seedSettingsSyncFromThisDevice(): Promise<void>;
+	takeSettingsSyncSeed(): Promise<void>;
+	deferSettingsSyncSeed(): Promise<void>;
+	isSettingsSyncDebugEnabled(): boolean;
+	runSettingsSyncInstallSmoke(): Promise<void>;
+	runSettingsSyncCommand(action: "apply" | "replace" | "seed" | "take" | "defer"): Promise<void>;
 }
 
 export function registerCommands(
@@ -119,6 +127,56 @@ export function registerCommands(
 		},
 	});
 
+
+	registrar.addCommand({
+		id: "settings-sync-apply",
+		name: "Settings sync: apply remote environment",
+		callback: async () => {
+			await host.runSettingsSyncCommand("apply");
+		},
+	});
+
+	registrar.addCommand({
+		id: "settings-sync-replace",
+		name: "Settings sync: replace remote environment with this device",
+		callback: async () => {
+			await host.runSettingsSyncCommand("replace");
+		},
+	});
+
+	registrar.addCommand({
+		id: "settings-sync-seed-this-device",
+		name: "Settings sync: seed from this device",
+		callback: async () => {
+			await host.runSettingsSyncCommand("seed");
+		},
+	});
+
+	registrar.addCommand({
+		id: "settings-sync-take-seed",
+		name: "Settings sync: take the remote seed",
+		callback: async () => {
+			await host.runSettingsSyncCommand("take");
+		},
+	});
+
+	registrar.addCommand({
+		id: "settings-sync-decide-later",
+		name: "Settings sync: decide initial seed later",
+		callback: async () => {
+			await host.runSettingsSyncCommand("defer");
+		},
+	});
+
+	registrar.addCommand({
+		id: "settings-sync-debug-install-calendar",
+		name: "Settings sync debug: install calendar via Obsidian",
+		checkCallback: (checking) => {
+			if (!host.isSettingsSyncDebugEnabled()) return false;
+			if (!checking) void host.runSettingsSyncInstallSmoke();
+			return true;
+		},
+	});
 
 	registrar.addCommand({
 		id: "nuclear-reset",
