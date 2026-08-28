@@ -12,7 +12,7 @@ This is the current schema-4 contract for `main`. [BACKLOG.md](BACKLOG.md) conta
 | Folders | Derived from paths; empty folders are not synchronized |
 | Attachments and special formats | Generation-scoped, content-addressed R2 objects when configured |
 | Recovery | Optional asynchronous recovery-v2 snapshots when R2 and `RecoveryJob` are configured |
-| `.obsidian` | Not synchronized |
+| Obsidian settings | Allowlisted paths and package intents in a named, bounded SQL environment |
 
 Canvas, Excalidraw, Base, and other non-Markdown formats use the attachment plane rather than Markdown character merging.
 
@@ -37,6 +37,7 @@ Authority is split by domain:
 - IndexedDB stores the local root, bodies, pending candidates, lifecycle intents, bootstrap progress, and disk baselines. It is a retry/cache boundary, not the shared conflict winner.
 - Disk and live editors are observed local authorities subject to reconciliation and preservation rules.
 - An R2 recovery point becomes restore input only through an explicit restore; it never becomes the live server authority directly.
+- Named settings environments live in a SQL sidecar inside the vault Durable Object. They are not part of the root/body Yjs documents, attachment objects, or recovery R2 objects.
 
 `vaultGeneration` fences one vault incarnation. `runtimeEpoch` fences receipts and job capabilities to one server runtime. Neither may be inferred from display names.
 
@@ -77,6 +78,55 @@ A local Markdown edit enters its body Yjs document and IndexedDB candidate queue
 Watcher changes are coalesced. YAOS-authored disk writes carry an expected content fingerprint. A matching event is suppressed; a mismatch is new external input. Time alone is never proof that YAOS authored an event.
 
 Attachment bytes are uploaded before their structural reference. Upsert, delete, and rename intents are persisted in the generation-scoped local database with a stable operation ID before submission; they are removed only after the server atomically commits the root/catalog mutation and the returned root is saved locally. Lost responses and restarts replay the same operation. Root sockets never accept direct attachment-map writes.
+
+## Settings environments
+
+### Scope, storage, and allowlist
+
+Settings scope is the vault plus `configDirKey`, the sanitized basename of `app.vault.configDir`; there is no user principal. The key must be 1–64 characters and cannot be `.`, `..`, contain NUL, `/`, or `\`. Folder names such as `.obsidian` and `.obsidian-mobile` therefore select distinct named environments in the same vault.
+
+The exact file allowlist is:
+
+- root JSON: `app.json`, `appearance.json`, `hotkeys.json`, `graph.json`, `daily-notes.json`, `templates.json`, `backlink.json`, `page-preview.json`, `note-composer.json`, `switcher.json`, `bookmarks.json`, `workspaces.json`, `core-plugins.json`, and `core-plugins-migration.json`;
+- one-level `snippets/*.css`;
+- community-plugin `plugins/<id>/data.json`, represented in the plugin-data table rather than the ordinary-file table.
+
+`workspace.json`, `workspace-mobile.json`, `community-plugins.json`, `file-recovery.json`, `publish.json`, `types.json`, unknown root JSON, YAOS/QA-harness plugin data, manifests, JavaScript, CSS theme packages, and all other paths remain local. Unknown root JSON is surfaced but never silently admitted. Plugin and theme binaries are never uploaded to YAOS, Yjs, SQL, or R2.
+
+Settings format `1` uses environment, file, plugin-intent, theme-intent, tombstone, and plugin-data tables inside the vault Durable Object. A named environment has one monotonic safe-integer `envRev`; every accepted item mutation advances it once and assigns the same revision to the changed row. Corrupt rows, exhausted revision space, duplicate snapshot identities, invalid UTF-8/JSON, bad hashes, traversal, and exceeded bounds fail closed.
+
+### Initialization and LWW
+
+Settings sync defaults on after enrollment, but a pre-existing remote environment cannot apply to a new local identity without an explicit user decision. A take/replace action authorizes work for the exact host, vault, generation, folder, device, and configuration key; its full apply queue is durable before the first mutation, and acceptance commits only after the operation succeeds. An unseeded or decision-required environment offers:
+
+- **Seed from this device** atomically creates revision 1 from this folder and records acceptance only after the seed succeeds; it fails if another device seeded first;
+- **Take the remote seed** persists the exact-identity apply queue, applies the existing remote environment, then records acceptance;
+- **Decide initial seed later** records deferral without authorizing or applying the environment and leaves note sync running;
+- **Replace remote settings environment** explicitly authorizes and atomically replaces the live snapshot with this device, advances the revision, creates plugin/theme tombstones for previously live entries omitted by the replacement, and records acceptance after success.
+
+For ordinary allowlisted files, the client remembers each acknowledged hash and server revision. Equal hashes are a no-op. A newer server revision beats local divergence; otherwise unacknowledged/dirty local content uploads. First-seen remote-only content downloads, first-seen local-only content uploads, acknowledged local absence deletes the remote row, and acknowledged remote absence deletes the local file. Deleting a file advances `envRev` and removes that row; plugin/theme deletion uses tombstones instead.
+
+Inbound bodies must match SHA-256 and every JSON body must parse before disk mutation. Invalid inbound JSON is quarantined: the local file is retained and later queue steps continue. Invalid local JSON is not uploaded. `app.json` or `hotkeys.json` apply marks restart required; `workspaces.json` refreshes workspace names but never changes the active layout.
+
+### Plugins, themes, and consent
+
+A plugin intent contains catalog ID, GitHub repository, pinned version, and enabled state. A theme intent contains catalog name, GitHub repository, and pinned version. A plugin or theme tombstone removes the corresponding live server intent; a plugin tombstone also removes its server plugin-data row. A later matching live intent clears its tombstone. Applying a plugin tombstone disables/unloads/uninstalls it and removes its local plugin directory when the host permits; host failures are reported and folder removal that leaves a loaded plugin requires restart. Applying a theme tombstone removes the local theme directory and reports restart guidance in case it was active.
+
+Plugin `data.json` may upload or apply only when three versions are present and identical: the local installed manifest, the shared plugin intent pin, and the plugin-data row version. A tombstone closes the gate. Mismatch holds the data, exposes update/promote/remove actions, and never rewrites it under a different plugin version.
+
+YAOS resolves package repositories from Obsidian's published plugin/theme catalogs and obtains package manifests/binaries from Obsidian/GitHub at the pinned version; the YAOS server stores only intent metadata. **Automatically install remote plugins and themes** is separate explicit consent and is off by default. Without it, file LWW continues only after environment acceptance, while remote package changes wait for manual **Apply remote environment** or a per-plugin action. Install steps run only in the foreground; background suspension checkpoints before the install. Restricted mode, desktop-only plugins on mobile, missing Obsidian installer APIs, or installation failure skip that step, report the reason, and continue safe later steps.
+
+### Durable apply and lifecycle
+
+An explicit take/replace decision and its complete apply plan precede the first disk or package mutation. Queue and later acceptance identities are exactly `hostHash + vaultId + vaultGeneration + folderKey + deviceId + configDirKey`; records with any other identity never authorize or resume work. The acceptance marker commits only after successful seed/take/replace, while a crash during take resumes the already-consented queue before that marker exists. The runner checkpoints the first unexecuted step after every attempt, resumes the same ordered plan at startup, pauses when its runtime generation is inactive, and clears only after all steps complete. A malformed record is not executed. Individual quarantined or failed steps are reported and skipped so later steps can proceed; a crash before checkpoint replays the current idempotent step.
+
+A full take/manual apply orders: ordinary root JSON except `appearance.json`/`workspaces.json`; CSS snippets; `appearance.json`; theme installs; `appearance.json` again when themes were installed; plugin installs; version-gated plugin data; plugin enabled/disabled state; plugin/theme tombstones; then `workspaces.json`. This keeps workspace activation out of the apply path; a missing or newly changed local manifest still holds plugin data until a later gate sees all three versions equal.
+
+Stopping the runtime waits for the serialized settings operation, removes watchers/timers, and restores the exact Obsidian installer hooks. Re-enrollment and **Leave this vault** retire only the old membership's exact apply queue and acceptance and clear deferral; configuration files remain on disk. Device revocation blocks subsequent bearer requests. Vault destruction makes the environment inaccessible immediately and removes the settings sidecar when that generation's vault SQL is deleted.
+
+Settings sync starts only after enrollment, exact `settingsSync=true` capability, and `settingsFormatVersion=1`. Its HTTP route requires the current device bearer and selected vault; the public router supplies trusted device/vault/generation authority to the vault runtime and does not forward the bearer. Exactly one format declaration is required. If capability is absent, format is incompatible, the local switch is off, initialization is deferred, or a decision is still required with no durable consented queue, settings mutation/watch loops do not run and note sync remains unaffected.
+
+The clash set is official Obsidian Sync (`sync`), Remotely Save (`remotely-save`), LiveSync (`obsidian-livesync`), and System3 Relay (`system3-relay`), with official Sync taking precedence in the reported reason.
 
 ## Reconciliation authority
 
@@ -179,5 +229,8 @@ Forbidden claims:
 - Missing `RecoveryJob`: disable recovery; continue Markdown root/body sync.
 - Recovery job retry/gap/failure: expose the state; do not report false completion.
 - Diagnostics persistence failure: lose bounded diagnostics; continue sync.
+- Settings capability absent, settings format mismatch, local switch off, deferred choice, decision-required state without a durable consented queue, or detected clash: pause settings sync only; continue note sync. A crash during an already-consented take resumes its exact queue before acceptance commits.
+- Invalid settings JSON/hash/path, stale queue identity, or plugin-data version mismatch: quarantine or reject the settings item; never widen the allowlist or overwrite the held local value.
+- Restricted/backgrounded/missing package installer: skip or durably pause the package step as specified; continue file LWW where safe.
 
-Settings sync, headless clients, and Docker packaging are outside the current contract. Large benchmark/soak, deployed Cloudflare, and real mobile recovery claims are also outside current evidence; see [QA](qa.md).
+Headless clients and Docker packaging are outside the current contract. Large benchmark/soak, deployed Cloudflare behavior, broader real desktop settings/recovery, and all mobile settings/recovery claims are outside current evidence; see [QA](qa.md).

@@ -44,6 +44,7 @@ The exact product pins are:
 | Durable SQL storage format | 1 |
 | Socket protocol | 1 |
 | Recovery snapshot format | 2 |
+| Settings sync format | 1 |
 
 Missing or mismatched schema or protocol declarations fail admission with `update_required`. Mixed writers are unsupported.
 
@@ -56,8 +57,11 @@ The vault Durable Object contains separate durable and live owners:
 - `VaultSocketService` owns root and body WebSocket sessions. The root socket is structural; a body socket is admitted only for an active body.
 - `VaultLifecycleService` owns durable create, rename, delete, and revive ordering plus root publication checks.
 - `VaultCandidateService` owns device-scoped body candidate admission, idempotency, and durable receipts.
+- `SettingsSyncStore` owns bounded named settings environments in tables inside the same vault Durable Object. Its monotonic environment revision orders file rows, plugin/theme intents, tombstones, and version-gated plugin data; settings never enter the root/body Yjs documents or R2.
 
 On the client, `VaultSync` owns the root, transport, durable candidate queue, and lifecycle submission. `BodyManager` loads and persists bodies independently and evicts only clean, settled, unpinned bodies. `DiskMirror`, `ReconciliationController`, and `EditorBindingManager` retain filesystem/editor preservation responsibilities. `BlobSyncManager` owns the optional non-Markdown plane.
+
+The client `SettingsSyncEngine` is a separate serialized lifecycle. It gates on exact server capability and settings format, scopes one environment by the vault plus the sanitized basename of the active Obsidian configuration directory, watches only the allowlist, and owns LWW reconciliation. A pre-existing remote environment requires an explicit user decision. Before the first mutation, the client persists the complete ordered plan in IndexedDB under the exact host hash, vault ID, vault generation, folder key, device ID, and configuration key; only successful seed/take/replace commits the acceptance marker. The runner checkpoints every step, resumes only that exact identity, and retires its queue and acceptance when the membership is replaced or left.
 
 ## SQL bootstrap and steady-state sync
 
@@ -79,6 +83,16 @@ After bootstrap, the root socket carries structural changes and body sockets are
 Local watcher events are coalesced. Markdown changes use text diffs rather than replace-all updates. Server-origin changes enter a body document before `DiskMirror` materializes them.
 
 Writes are serialized per path and carry an expected content fingerprint. A watcher event is suppressed only when observed content matches the expected write; elapsed time alone is not evidence of authorship. Disk/editor/CRDT disagreement follows preservation-before-convergence rules in the [sync contract](sync-contract.md).
+
+## Settings sync
+
+Settings sync is enabled by default after enrollment and has no user principal: the shared scope is `vaultId` plus the named, sanitized configuration-folder key. Different names such as `.obsidian` and `.obsidian-mobile` are independent environments. An existing remote environment is not applied without this device's explicit seed/take/replace decision; a take first persists its exact-identity queue, then commits acceptance only after the apply succeeds, while defer withholds the decision. The synchronized file set is closed to selected root JSON, `snippets/*.css`, and community-plugin `data.json`; workspace session state, `community-plugins.json`, YAOS state, unknown root JSON, plugin/theme binaries, and every other path remain local.
+
+The vault SQL sidecar stores settings format 1. Every accepted mutation advances one safe integer environment revision, and each changed row receives that revision. Clients use the last acknowledged hash and revision to distinguish newer server state, dirty local state, first-seen files, and acknowledged deletion. Seed is create-once; replace atomically publishes a complete local snapshot and tombstones omitted live plugins and themes.
+
+Plugins and themes synchronize as repository/version intents, enabled state, and explicit tombstones. A plugin tombstone removes its live intent and plugin data. Plugin `data.json` can move in either direction only when the local manifest version, shared intent pin, and data-row version are identical and the plugin is not tombstoned. Binaries are never stored by YAOS: installation resolves Obsidian's published catalogs and GitHub repositories, requires explicit auto-install consent, and pauses at install steps while the app is backgrounded.
+
+Inbound JSON must decode, hash correctly, and parse before replacement; invalid JSON is quarantined while the local file and remaining apply steps are preserved. Official Obsidian Sync, Remotely Save, LiveSync, or System3 Relay pauses this subsystem as a clash. Missing capability, a format mismatch, the local off switch, deferral, or a clash does not stop note sync.
 
 ## Attachments
 
@@ -102,9 +116,11 @@ GC marks retained recovery and blob roots, acquires bounded sweep leases, and de
 
 `POST /claim` initializes the operator control plane and provisions the first vault. `POST /enroll` consumes one pairing code and returns a device bearer, device ID, selected vault ID, generation, and origin/joining role. The client persists its generated request ID and credentials before enrollment; a lost response retries the same hashes and receives the same bounded replay record without storing the plaintext bearer server-side.
 
-Vault HTTP routes require the device bearer and vault ID. A short-lived device-scoped ticket is minted for WebSocket use; long-lived credentials never appear in socket URLs. Root and body handshakes require `ticket`, `schemaVersion=4`, and `protocolVersion=1`. Ticket signature, expiry, vault scope, current membership, active vault state, and vault generation are checked before runtime admission. Revocation persists an obligation before removing membership, applies a durable vault-runtime device fence, terminates already-active sockets, and remains operator-retryable until acknowledged.
+Vault HTTP routes, including `/vault/:vaultId/settings-sync/:configDirKey`, require the device bearer and selected vault ID. The public route resolves current membership and active `vaultGeneration`, forwards only trusted vault/generation/device headers, and strips the bearer before the vault runtime handles the request. Settings routes require exactly one `settingsFormatVersion=1`; a mismatch fails before mutation.
 
-Leaving revokes one membership, clears the folder's enrollment and schema-4 IndexedDB cache, and leaves ordinary files on disk. Operator kick revokes one membership. Operator destroy revokes the complete vault boundary.
+A short-lived device-scoped ticket is minted for WebSocket use; long-lived credentials never appear in socket URLs. Root and body handshakes require `ticket`, `schemaVersion=4`, and `protocolVersion=1`. Ticket signature, expiry, vault scope, current membership, active vault state, and vault generation are checked before runtime admission. Revocation persists an obligation before removing membership, applies a durable vault-runtime device fence, terminates already-active sockets, and remains operator-retryable until acknowledged.
+
+Leaving revokes one membership, retires only its exact settings apply queue, clears the folder's enrollment and schema-4 IndexedDB cache, and leaves ordinary files and its configuration directory on disk. Operator kick revokes one membership. Operator destroy revokes the complete vault boundary; purge-first deletion ultimately removes the settings SQL tables with the rest of that vault generation's SQL.
 
 ## Purge-first vault deletion
 
@@ -118,8 +134,8 @@ Destroy is a fenced saga, not a best-effort room reset:
 
 When R2 is absent, the R2 phase is already complete and SQL deletion can proceed. This ordering prevents lost SQL authority from making generation-owned objects unaccountable.
 
-## Safety boundaries and deferred work
+## Safety boundaries and deferred evidence
 
-Persistence corruption, invalid identity, wrong generation, stale candidate, and incompatible versions fail closed. Diagnostics fail open. Uncertain filesystem deletion preserves data. Recovery jobs expose retries and terminal gaps rather than reporting false completeness.
+Persistence corruption, invalid identity, wrong generation, stale candidate, and incompatible versions fail closed. Diagnostics fail open. Uncertain filesystem deletion preserves data. Settings JSON and hashes are quarantined before apply, and incompatible settings capability or clashes isolate the settings subsystem. Recovery jobs expose retries and terminal gaps rather than reporting false completeness.
 
-Large-vault benchmark and soak evidence, deployed-Cloudflare recovery/deletion evidence, and real mobile recovery evidence are deferred; current evidence is described only in [QA](qa.md). Settings sync, headless clients, and Docker packaging remain future work. Evidenced open risks are tracked in [BACKLOG.md](BACKLOG.md).
+Large-vault benchmark and soak evidence, deployed-Cloudflare recovery/deletion/settings evidence, broader real desktop settings/recovery flows, and all real mobile settings/recovery evidence are deferred; current evidence is described only in [QA](qa.md). Headless clients and Docker packaging remain future work. Evidenced open risks are tracked in [BACKLOG.md](BACKLOG.md).

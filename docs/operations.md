@@ -84,6 +84,33 @@ An enrolled device can inspect its vault roster, rename itself, mint another one
 
 **Leave this vault** revokes the current membership when reachable, stops sync, clears this folder's enrollment and schema-4 IndexedDB cache, and keeps ordinary files on disk. If revocation fails, local leave still completes and the operator can remove the stale membership.
 
+## Settings sync setup and operation
+
+Settings sync is enabled by default for a newly enrolled device when the server advertises `settingsSync: true` with `settingsFormatVersion: 1`. Note sync remains independent. Open **Settings → YAOS → Obsidian settings sync** and verify the displayed configuration-folder key; it is the sanitized basename of the active Obsidian configuration directory and names this vault's environment. `.obsidian` and `.obsidian-mobile` do not share settings.
+
+On first contact, resolve the named environment before any pre-existing remote settings can apply:
+
+1. If the environment is unseeded, choose **Seed from this device** to make this folder its initial authority. The create is atomic and fails if another device seeded first.
+2. If an environment already exists, choose **Take the remote seed** to authorize it for this exact host/vault/generation/folder/device/configuration identity. YAOS persists the complete queue before applying it and commits acceptance only after the take completes.
+3. Choose **Replace remote settings environment** instead when this device must replace an existing environment; replacement tombstones omitted shared plugins/themes and commits acceptance only after success.
+4. Choose **Decide initial seed later** to withhold acceptance and leave settings unchanged while notes continue syncing.
+
+After initialization:
+
+- **Apply remote environment** explicitly applies the current remote files and package intents;
+- **Replace remote settings environment** atomically makes this device's allowlisted snapshot current and tombstones shared plugins/themes omitted by this device;
+- **Automatically install remote plugins and themes** separately consents to foreground package installation/removal and is off by default;
+- per-plugin **Update**, **Promote pin**, and **Remove from settings environment** actions resolve the displayed three-version mismatch;
+- selecting an environment plugin/theme removes it from shared state through a tombstone. Plugin removal attempts local disable/unload/uninstall and directory removal; theme removal deletes its local theme directory. Either may require restart when loaded state outlives removed files.
+
+Do not enable another settings-sync product at the same time. YAOS pauses settings sync when official Obsidian Sync, Remotely Save, LiveSync, or System3 Relay is enabled; disable the clash and refresh YAOS. Turning **Sync Obsidian settings** off, deferring, a capability/version mismatch, or a clash affects settings only.
+
+An explicit take/replace decision authorizes an apply plan, which is persisted before its first mutation and resumes from its checkpoint after restart for that exact identity. The acceptance marker is written only after successful seed/take/replace, so a crash during take resumes the already-consented queue first. Package installation pauses while Obsidian is backgrounded. Keep Obsidian in the foreground for install steps. Invalid inbound JSON, oversize entries, restricted community-plugin mode, desktop-only plugins on mobile, missing installer APIs, and individual install failures are reported without widening the allowlist; safe later steps continue.
+
+The synchronized files are exactly the root JSON and CSS/plugin-data paths listed in the [settings contract](sync-contract.md#scope-storage-and-allowlist). `app.json` and `hotkeys.json` may require an Obsidian restart. Applying `workspaces.json` refreshes names but does not switch the current layout. Plugin and theme binaries are fetched from Obsidian/GitHub at their pinned versions and are never stored in the Worker, Yjs, or R2.
+
+Leaving or replacing enrollment retires only that exact device/folder/configuration acceptance and apply queue. It does not delete local configuration files. Device revocation makes later settings HTTP requests unauthorized. Destroying a vault makes settings inaccessible with the vault and removes its SQL sidecar only when the generation's vault deletion completes.
+
 ## Operator console
 
 The operator recovery key signs in to the console and is never a plugin credential. The browser receives a short-lived HTTP-only session. Sign-out revokes the presented session before clearing its cookie.
@@ -131,7 +158,7 @@ The socket ticket endpoint exchanges that bearer for a short-lived device- and v
 - socket protocol `1`;
 - an active membership and active vault generation.
 
-The complete version set is document schema `4`, durable SQL format `1`, socket protocol `1`, and recovery snapshot format `2`. These pins change only through a coordinated client/server/storage cutover.
+The complete version set is document schema `4`, durable SQL format `1`, socket protocol `1`, recovery snapshot format `2`, and settings sync format `1`. These pins change only through a coordinated client/server/storage cutover.
 
 ## Updating after the fresh schema-4 deployment
 
@@ -146,7 +173,8 @@ The Worker capability response distinguishes:
 - claimed versus unclaimed state;
 - attachment and recovery-job availability;
 - server version;
-- document schema, durable storage, socket protocol, and snapshot format pins.
+- document schema, durable storage, socket protocol, snapshot format, and settings-format pins;
+- settings-sync, attachment, and recovery capabilities.
 
 The vault status surface additionally exposes `vaultGeneration`, `runtimeEpoch`, provisioning time, durable sequence, feed floor, and active pins. Health distinguishes degraded pending persistence from a healthy runtime. Diagnostics are evidence, not a repair mechanism.
 
@@ -156,6 +184,12 @@ The vault status surface additionally exposes `vaultGeneration`, `runtimeEpoch`,
 - **Update required:** client schema or socket protocol does not exactly match the server. Do not attempt mixed-writer operation.
 - **Vault provisioning failed:** retry the recorded provisioning saga; do not manually mark the registry record active.
 - **Recovery unavailable:** confirm the `RecoveryJob` binding and `v2` migration exist. Recovery additionally needs `YAOS_BUCKET`.
+- **Settings environment waits for a decision:** open the Obsidian settings-sync group and choose Seed, Take, or Decide later. A pre-existing remote environment never grants its own acceptance.
+- **Settings sync paused for clash:** disable the named official/community settings-sync plugin, then refresh YAOS. Note sync is unaffected.
+- **Settings format unsupported:** update the client/server pair; every settings route requires exactly one `settingsFormatVersion=1`.
+- **Plugin data held:** make the installed manifest version, shared intent pin, and plugin-data version identical; use Update, Promote pin, or Remove. Do not copy `data.json` across versions.
+- **Package install pending:** enable automatic package installation only if you consent, keep Obsidian foregrounded, and confirm community plugins are unrestricted. Install manually when the host API is unavailable.
+- **Invalid settings JSON:** repair the named local/remote JSON and retry; quarantine intentionally keeps the local value rather than overwriting it.
 - **Attachments unavailable:** add `YAOS_BUCKET`; Markdown continues without it.
 - **Recovery job retrying:** inspect its status and bounded error code. Preserve the same job identity so durable progress can resume.
 - **Vault cleanup pending:** retry from the console. Do not delete the vault Durable Object manually while generation purge is incomplete.
@@ -169,5 +203,8 @@ The vault status surface additionally exposes `vaultGeneration`, `runtimeEpoch`,
 - Root/body persistence is bounded by Durable Object SQL row, statement, and account limits.
 - Server body admission enforces 32 bodies, 48 MiB aggregate resident state, and a 16 MiB transient/pending reserve. Client body admission enforces a separate 48 MiB aggregate estimated-cost budget. Only clean, unpinned bodies without open sockets may be evicted.
 - Recovery requires R2 and the job binding and may finish with explicit unavailable entries.
-- Large benchmark/soak, deployed Cloudflare recovery/deletion, and real mobile recovery evidence are deferred.
-- Settings sync, headless clients, and Docker packaging remain future work.
+- Settings environment key: 1–64 characters; no `.`, `..`, NUL, slash, or backslash. Settings paths: at most 256 characters and must match the closed allowlist without traversal.
+- Settings bodies: at most 1,000,000 bytes each and 4,000,000 bytes total per environment. Snapshot requests are at most 6,000,000 bytes; item requests 1,500,000 bytes; GET responses 6,000,000 bytes.
+- Settings counts per environment: 256 ordinary files, 256 plugin intents, 64 theme intents, 256 plugin-data rows, and 512 tombstones. IDs are at most 128 characters, repository strings 256, and version strings 64.
+- Large benchmark/soak, deployed Cloudflare settings/recovery/deletion, broader desktop settings/recovery, and all real mobile settings/recovery evidence remain deferred.
+- Headless clients and Docker packaging remain future work.

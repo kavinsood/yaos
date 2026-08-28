@@ -39,6 +39,12 @@ If you want the official, fully managed experience, use Obsidian Sync. If you wa
 
 The operator key opens the server console. It is not a device credential and must not be pasted into plugin settings.
 
+## Obsidian settings sync
+
+Settings sync is enabled by default after enrollment and is independent of note sync. Before a pre-existing remote environment can change this folder, open **Settings → YAOS → Obsidian settings sync** and choose **Take the remote seed**, **Seed from this device**, or **Decide initial seed later**. The choice is stored for this exact enrollment, folder, device, and configuration-folder name. Use **Replace remote settings environment** only when this device should replace an existing seed.
+
+YAOS synchronizes a closed allowlist of Obsidian JSON files, CSS snippets, community-plugin intents, theme intents, and version-matched plugin `data.json`. It does not store plugin or theme binaries; automatic package installation/removal requires separate explicit consent and is off by default. Settings state is stored in the vault Durable Object's SQLite sidecar, not Yjs or R2. Unsupported servers, an off switch, or a detected settings-sync clash pause settings only; notes continue syncing. See [operations](./docs/operations.md#settings-sync-setup-and-operation) for setup, limits, and recovery behavior.
+
 ## Attachments and recovery
 
 Markdown uses Durable Object SQLite and works without R2. Add a `YAOS_BUCKET` R2 binding to synchronize images, PDFs, Canvas files, and other non-Markdown content and to enable asynchronous recovery points.

@@ -64,6 +64,16 @@ Current passing evidence is limited to focused suites, the complete regression d
 
 **Closure:** Desktop replacement passes end to end without bypassing the actual adapter/runtime; changed targets skip; backups are readable; restored server and disk state agree. Mobile evidence remains separately labeled until run.
 
+### SETTINGS-01 — real desktop settings apply evidence
+
+**State:** Focused and local Worker settings coverage passes. One disposable Obsidian 1.13.7 run also proves note sync remains online beside settings sync, exact identity/capability, explicit seed, command-driven remote CSS apply, and consented Calendar 1.5.10 installation.
+
+**Evidence:** `tests/live/settings-sync.ts` proves two-device HTTP/SQLite revisions, auth, generation fencing, non-hydration, and post-settings root/body health. `qa/controllers/settings-sync-smoke.mjs` passed against a real desktop configuration directory; its generated artifact is retained under ignored `qa-runs/settings-sync-desktop/obsidian-1.13.7.json`. A second runtime observation also held `envRev` and the Calendar plugin-data revision exactly stable for 12 seconds after restart, closing an observed repeated plugin-data upload loop with `shouldPutMissingRemotePluginData`.
+
+**Required work:** Extend desktop evidence across two freshly enrolled Obsidian folders with the same configuration-folder key. Exercise LWW create/update/delete, invalid JSON quarantine, crash/restart queue resume, explicit auto-install consent, plugin/theme intents and tombstones, exact plugin-data version holding, and a named clash while confirming note sync continues.
+
+**Closure:** Retained desktop artifacts show no remote apply before an explicit user decision and durable exact-identity queue, queue checkpoints survive restart, successful seed/take/replace commits acceptance, allowlisted files converge without widening scope, packages come from Obsidian/GitHub rather than YAOS storage, and held/quarantined state remains intact. Mobile coverage closes only under `MOBILE-01`.
+
 ## P1 deployment and scale evidence
 
 ### DEPLOY-01 — fresh schema-4 Cloudflare cutover rehearsal
@@ -72,9 +82,9 @@ Current passing evidence is limited to focused suites, the complete regression d
 
 **Evidence:** The implementation deliberately admits only schema `4` and protocol `1`, provisions new SQL format `1`, and stores clients in a schema-4 IndexedDB namespace. [Operations](operations.md#deployment-boundary) explicitly rejects in-place schema-3 room/cache reuse.
 
-**Required work:** Preserve a populated schema-3 vault on a trusted device, deploy a fresh current Worker with the `RecoveryJob` migration, claim, import through the origin path, enroll a joining device with a fresh cache, and verify the complete inventory and device isolation.
+**Required work:** Preserve a populated schema-3 vault on a trusted device, deploy a fresh current Worker with the `RecoveryJob` migration, claim, import through the origin path, enroll a joining device with a fresh cache, and verify the complete inventory and device isolation. Also verify advertised settings format 1, generation-fenced device-auth settings routes, and that a new vault generation starts with an unseeded settings environment.
 
-**Closure:** A recorded external rehearsal matches the documented boundary, including failure behavior when the job binding/migration is absent. It does not claim an in-place migration.
+**Closure:** A recorded external rehearsal matches the documented boundary, including failure behavior when the job binding/migration is absent and when settings capability/version is incompatible. It does not claim an in-place migration.
 
 ### DEPLOY-02 — production Cloudflare recovery and purge
 
@@ -88,7 +98,7 @@ Current passing evidence is limited to focused suites, the complete regression d
 
 ### SCALE-01 — integrated large-vault benchmark and soak rerun
 
-**State:** Prior donor-branch Worker benchmarks and long-run soaks established sharding, snapshot, and performance ceilings. Repeating those campaigns after identity/provisioning integration is deliberately deferred.
+**State:** Earlier Worker benchmarks and long-run soaks established sharding, snapshot, and performance ceilings. Repeating those campaigns after identity/provisioning integration is deliberately deferred.
 
 **Evidence:** Current focused and local Worker tests prove the integrated bounds and race behavior, including a 1,505-file import inventory and a 200-body/100-rename bootstrap race. They do not replace the earlier scale evidence or claim a fresh integrated performance measurement.
 
@@ -96,21 +106,22 @@ Current passing evidence is limited to focused suites, the complete regression d
 
 **Closure:** Integrated results state platform, dataset shape, limits, duration, and failure criteria; benchmark samples and soak evidence remain distinct.
 
-### MOBILE-01 — schema-4 mobile lifecycle evidence
+### MOBILE-01 — schema-4 mobile lifecycle and settings evidence
 
-**State:** No current integration result covers real iOS or Android schema-4 bootstrap, reconnect, attachment, or recovery behavior.
+**State:** No current integration result covers real iOS or Android schema-4 bootstrap, reconnect, attachment, recovery, or settings apply behavior.
 
-**Evidence:** Current schema-4 evidence uses unit ports, desktop/controller history from the earlier architecture, and Node clients under local Wrangler.
+**Evidence:** Current schema-4 evidence uses unit ports, desktop/controller history from the earlier architecture, and Node clients under local Wrangler. Settings policy/queue tests do not invoke mobile Obsidian or its package installer.
 
-**Required work:** Run fresh joining bootstrap, foreground edit, suspend/resume reconnect, attachment conflict, and supported recovery flows on real iOS and Android without copying credentials or caches.
+**Required work:** Run fresh joining bootstrap, foreground edit, suspend/resume reconnect, attachment conflict, and supported recovery flows on real iOS and Android without copying credentials or caches. For settings, take an already-seeded named environment, verify no apply before an explicit decision and durable exact-identity queue, apply allowlisted files, exercise foreground auto-install consent and a desktop-only plugin skip, resume a checkpointed consented install after backgrounding, verify acceptance commits after successful take, verify the three-version plugin-data hold, and apply plugin/theme tombstones without interrupting note sync.
 
-**Closure:** Device-scoped bundles show root/body convergence, no stale candidate or generation crossing, and correct recovery outcomes. Passive agreement alone is insufficient.
+**Closure:** Device-scoped bundles show root/body convergence, no stale candidate or generation crossing, correct recovery outcomes, and exact settings queue/acceptance identity. Mobile install/apply results distinguish iOS from Android, preserve held data, and never claim a package installed from passive server agreement.
 
 ## External dependencies
 
 | Item | External requirement |
 |---|---|
 | ATTACH-01 | Reporter-shaped plugin environment and preferably reporter validation |
+| SETTINGS-01 | Real desktop Obsidian configuration directory and installer APIs |
 | SYNC-01 | Reporter-shaped iOS Web Clipper environment |
 | RECOVERY-01 | Real Obsidian desktop and mobile adapters |
 | DEPLOY-01/02 | Disposable Cloudflare account and deployment |
@@ -119,8 +130,8 @@ Current passing evidence is limited to focused suites, the complete regression d
 
 External dependency does not excuse reachable work: build the focused reproduction or runbook first and record exactly which final observation remains external.
 
-## Future, not current behavior
+## Unscheduled features
 
-Settings sync, headless clients, and Docker packaging remain future work. They are not backlog commitments without a separately evidenced product requirement.
+Headless clients and Docker packaging are not current behavior or backlog commitments without a separately evidenced product requirement.
 
 Generic feature expansion, awareness relays, configurable cursor colors, and native Windows support are not backlog items unless an observed problem establishes an owner and closure contract.

@@ -12,7 +12,7 @@ The integrated schema-4 change has current passing evidence from:
 - the complete discovered regression suite;
 - the separately accountable local Wrangler Worker driver.
 
-Prior donor-branch Worker benchmarks and soaks established the sharding design. No repeat benchmark, soak, external Cloudflare deployment, or real mobile run is included in this integration result.
+Earlier Worker benchmarks and soaks established the sharding design. No repeat benchmark, soak, external Cloudflare deployment, real Obsidian settings run, or real mobile run is included in this integration result.
 
 ## Focused client coverage
 
@@ -29,6 +29,13 @@ Current client suites exercise:
 - existing reconciliation, delete-preservation, editor-binding, diagnostics, attachment-conflict, and lifecycle suites through the full regression discovery.
 - `attachment-publication-replay.ts`: lost responses, root-persistence failure, stable operation-ID replay, and durable upsert/delete/rename intent;
 - `body-manager-load-race.ts`: aggregate client cost admission, safe LRU eviction, and protected-body refusal;
+
+Settings-focused client coverage is grouped by contract rather than repeated elsewhere:
+
+- pure policy: `settings-sync-allowlist.ts`, `settings-sync-config-dir.ts`, `settings-sync-blank.ts`, `settings-sync-clash.ts`, `settings-sync-lww-reconcile.ts`, `settings-sync-data-json-gate.ts`, `settings-sync-watch.ts`, and `plugin-intent.ts` cover the closed path set, named keys, first-choice classification, clashes, revision decisions, the plugin-data three-version gate, watcher scans, catalog pins, and platform/installer gates;
+- durable queue: `settings-sync-apply-queue.ts` and `settings-sync-queue-identity.ts` cover persist-before-mutate, checkpoint/resume, JSON quarantine, partial-step continuation, background install pause, exact host/vault/generation/folder/device/configuration identity, durable environment acceptance, and exact retirement;
+- engine: `settings-sync-engine.ts` covers capability/master/acceptance gating, serialized lifecycle, and installer-hook restoration;
+- protocol: `settings-sync-protocol.ts` covers device-bearer vault routes, exactly one settings-format declaration, bounded strict response parsing, and duplicate rejection.
 
 These tests use controlled ports and models. They prove policy and orchestration contracts, not a real Obsidian adapter or mobile filesystem.
 
@@ -47,6 +54,8 @@ Current server suites exercise:
 - `vault-route-authority.ts` and socket admission suites: device, vault, schema, and protocol boundaries.
 - `vault-document-cache.ts`: aggregate resident/transient limits, mixed-size LRU, protected-body refusal, and exactly-once reservation release;
 - identity suites: response-loss-safe enrollment replay and durable retryable device revocation obligations;
+- `settings-sync-store.ts`: SQL seed/replace, monotonic LWW revisions, intents/tombstones, plugin-data gates, atomic failure, JSON/hash/path/count/body bounds, and bounded HTTP reads;
+- `settings-sync-route-authority.ts`: current membership, wrong-vault/revoked denial before runtime allocation, and trusted vault/generation/device forwarding without the bearer.
 
 The full regression runner discovers suites under `tests/client`, `tests/server`, and `tests/contracts`, plus its harness/discovery self-tests. Discovery guards reject unaccounted inert suites.
 
@@ -64,9 +73,13 @@ The current passing local Worker run covers:
 - SQL persistence across local Worker restart;
 - asynchronous recovery-v2 capture, format-2 root/catalog/branch/content reads, and selective restore result handshake;
 - ticket refresh, missing/wrong admission values, wrong vault access, and hardening paths;
-- operator destroy, stable generation-scoped purge identity, R2 purge completion before SQL deletion, membership revocation, and stale-ticket rejection.
+- operator destroy, stable generation-scoped purge identity, R2 purge completion before SQL deletion, membership revocation, and stale-ticket rejection;
+- `tests/live/settings-sync.ts`: two-device settings-format/device-auth coverage for seed, exact read, mutation/revision/readback, format rejection without mutation, wrong-vault/revoked denial, no root/body cache hydration, and root/body socket health after settings traffic;
+- `tests/live/operator-destroy.ts`: seeded settings become inaccessible on destroy and a fresh vault generation begins unseeded.
 
 This driver uses Node Yjs clients and local Wrangler. It does not launch Obsidian and does not traverse public Cloudflare routing.
+
+These settings live cases exercise HTTP/SQLite behavior through local Wrangler. They do not run the shipped Obsidian settings engine, filesystem watcher, apply queue, package installers, or a public deployed Worker.
 
 ## What is not yet proven
 
@@ -87,6 +100,12 @@ Local Wrangler does not prove production WebSocket upgrade routing, Durable Obje
 ### Obsidian and mobile restore
 
 No current integration run proves recovery-v2 replacement through a real desktop or mobile Obsidian vault, local backup creation on those adapters, sleep/wake continuation, background suspension, or large attachment restoration.
+
+### Obsidian settings sync
+
+A disposable local run on Obsidian 1.13.7 passed `qa/controllers/settings-sync-smoke.mjs`: note sync remained online and provider-synced while exact capability/generation identity, explicit seed, remote allowlisted CSS mutation and command-driven disk apply, and consented Calendar 1.5.10 installation all succeeded. The emitted artifact is retained under ignored `qa-runs/settings-sync-desktop/obsidian-1.13.7.json`.
+
+This proves one desktop seed/apply/install path against a local current Worker. It does not prove two real Obsidian folders, LWW deletion, invalid-JSON quarantine, crash/restart queue resume, plugin/theme tombstones, version-held plugin data, clash pause, mobile behavior, or deployed Cloudflare placement/eviction.
 
 ### Fresh cutover rehearsal
 
