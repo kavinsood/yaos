@@ -59,6 +59,28 @@ Recovery points can be captured in the background, browsed by path, and selectiv
 
 Obsidian vaults remain ordinary local files. Changes made by editors, scripts, Git tools, or agents enter the same reconciliation path and can synchronize across enrolled devices.
 
+## Headless Linux client
+
+The Node 24 CLI synchronizes Markdown in a local directory without Obsidian. It enrolls as its own vault-scoped device; credentials are generated and stored outside the vault rather than copied from another installation.
+
+```sh
+npm run build:cli
+
+YAOS_HOST=https://sync.example.workers.dev \
+YAOS_PAIRING_CODE=... \
+node packages/cli/dist/yaos.mjs enroll /srv/vault
+
+node packages/cli/dist/yaos.mjs daemon /srv/vault
+```
+
+The daemon is Linux/local-filesystem only, Markdown only, and single-process per vault. `.obsidian`, attachments, network filesystems, and rename-identity inference are intentionally outside its contract. See [operations](./docs/operations.md#headless-linux-client).
+
+## Node server runtime
+
+`packages/server-node` runs the same schema-4 control-plane, vault, settings, attachment, and recovery domain owners as the Cloudflare Worker over Node 24, SQLite, WebSockets, and filesystem object storage. It is verified against the Worker by the runtime-blind conformance suite. This is a Node process, not a Docker image or Docker-readiness claim.
+
+See [operations](./docs/operations.md#node-server-runtime).
+
 ## Troubleshooting
 
 **Unauthorized or auth rejected:** The folder's membership is missing, revoked, or belongs to another vault. Re-enroll with a fresh pairing code.

@@ -8,6 +8,10 @@ The QA harness under `qa/` is not shipped. QA scenarios use a separately built p
 
 `FlightTraceController` owns the client diagnostics lifecycle. Product code emits through the published flight envelope and taxonomy; there is no second persistent logger.
 
+The headless client under `packages/cli` hosts the same `VaultSync`, `BodyManager`, `DiskMirror`, and reconciliation policy on a local Linux filesystem. It is Markdown-only, stores its device identity and schema-4 retry/cache state in machine-local SQLite, and never copies another enrollment's bearer.
+
+The Cloudflare Worker classes are thin platform wrappers around portable `ControlPlaneRuntime`, `VaultRuntime`, and `RecoveryJobRuntime` compositions. `packages/server-node` supplies Node-specific SQLite/KV, actor, WebSocket, alarm, and filesystem-object mechanisms to those same domain owners; it does not implement a second sync policy.
+
 ## Identity and provisioning
 
 A claimed Worker is one operator-owned control plane. The server hashes the operator recovery key and uses short-lived, revocable browser sessions for console operations. The global registry owns vault records, per-vault device memberships, one-use pairing codes, pending deletion obligations, and the socket-ticket signing key.
@@ -138,4 +142,4 @@ When R2 is absent, the R2 phase is already complete and SQL deletion can proceed
 
 Persistence corruption, invalid identity, wrong generation, stale candidate, and incompatible versions fail closed. Diagnostics fail open. Uncertain filesystem deletion preserves data. Settings JSON and hashes are quarantined before apply, and incompatible settings capability or clashes isolate the settings subsystem. Recovery jobs expose retries and terminal gaps rather than reporting false completeness.
 
-Large-vault benchmark and soak evidence, deployed-Cloudflare recovery/deletion/settings evidence, broader real desktop settings/recovery flows, and all real mobile settings/recovery evidence are deferred; current evidence is described only in [QA](qa.md). Headless clients and Docker packaging remain future work. Evidenced open risks are tracked in [BACKLOG.md](BACKLOG.md).
+Large-vault benchmark and soak evidence, deployed-Cloudflare recovery/deletion/settings evidence, broader real desktop settings/recovery flows, and all real mobile settings/recovery evidence are deferred; current evidence is described only in [QA](qa.md). Docker packaging remains future work. Evidenced open risks are tracked in [BACKLOG.md](BACKLOG.md).

@@ -10,7 +10,12 @@ The integrated schema-4 change has current passing evidence from:
 
 - focused schema-4 client and server suites;
 - the complete discovered regression suite;
-- the separately accountable local Wrangler Worker driver.
+- the separately accountable local Wrangler Worker driver;
+- the runtime-blind Wrangler/Node conformance matrix;
+- the real-process headless daemon suite, isolated CLI bundle smoke, and packed-install/bin smoke;
+- focused Node SQLite, object-store, alarm, migration, lock, and health suites.
+
+The canonical `npm run test:ci` gate runs both CLI checks through `npm --prefix packages/cli run smoke` and `npm --prefix packages/cli run pack-smoke`.
 
 Earlier Worker benchmarks and soaks established the sharding design. No repeat benchmark, soak, external Cloudflare deployment, real Obsidian settings run, or real mobile run is included in this integration result.
 
@@ -80,6 +85,14 @@ The current passing local Worker run covers:
 This driver uses Node Yjs clients and local Wrangler. It does not launch Obsidian and does not traverse public Cloudflare routing.
 
 These settings live cases exercise HTTP/SQLite behavior through local Wrangler. They do not run the shipped Obsidian settings engine, filesystem watcher, apply queue, package installers, or a public deployed Worker.
+
+## Headless and Node runtime coverage
+
+`tests/headless/run-headless.ts` launches a real local Worker, enrolls distinct CLI and peer devices, and drives the CLI only through argv, environment, filesystem, stdout, signals, HTTP, and WebSockets. Its passing cases cover replay-safe enrollment, origin import, joining bootstrap, exact two-way Markdown sync, burst admission, non-cold restart, offline changes, process locking, last-instant shutdown durability, conservative remote-delete handling, persisted unresolved state, dropped watcher hints, two-phase delete evidence, atomic saves, unreadable and symlinked subtrees, and the documented delete-plus-create rename limitation. It does not claim attachment, `.obsidian`, network-filesystem, or mobile support.
+
+`tests/conformance/run-conformance.ts` runs the same public fixtures against local Wrangler and `packages/server-node`: capabilities, routing, identity, ticket/version admission, root/body candidate and lifecycle ordering, SQL bootstrap/feed, crash durability, settings, attachments, recovery, purge-first deletion, and root awareness. The Node target additionally proves recovery dispatch resumption across process death. Local Wrangler does not claim that process-level alarm property because stopping the emulator is not Durable Object eviction.
+
+`tests/node-runtime/` separately proves Node-only mechanics: zero-copy BLOB bindings and exact offset ownership, lazy cursors and rollback, create-only object publication, durable alarm leases/quarantine, forward migration refusal, one-owner locking, and liveness/readiness. These tests do not constitute Docker or deployed-production evidence.
 
 ## What is not yet proven
 

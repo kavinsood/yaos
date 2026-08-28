@@ -64,6 +64,34 @@ Recovery is available only when both `YAOS_BUCKET` and `YAOS_RECOVERY_JOBS` exis
 
 All blob and recovery keys are scoped by both `vaultId` and `vaultGeneration`. Do not copy objects between generation prefixes or place unrelated objects under a YAOS generation prefix.
 
+## Node server runtime
+
+The Node 24 server uses the same schema-4 domain runtimes as the Worker. Build with `npm run build:server-node`, then run:
+
+```sh
+YAOS_NODE_HOST=127.0.0.1 \
+YAOS_NODE_PORT=8787 \
+YAOS_NODE_DATA_DIR=/srv/yaos \
+node packages/server-node/dist/server.mjs
+```
+
+The data directory contains the process lock, control-plane SQLite, generation-scoped vault and recovery-job databases, and immutable object storage. One process owns a data directory. Startup applies forward-only SQLite migrations and refuses databases written by a newer binary. `/health` reports process liveness; `/health/ready` reports storage, lock, migration, and drain readiness without exposing vault identity or paths.
+
+Recovery alarms persist deadlines and dispatch leases. A process death resumes overdue work; three consecutive abandoned dispatch leases quarantine that job until the explicit retry command. Quarantined recovery work does not block note sync or server startup. Immutable object publication writes and flushes a sibling temporary file, atomically links it into place, and validates rather than overwrites an existing winner.
+
+Retry only a quarantined alarm, with the server stopped so the command can take exclusive ownership of the same data directory. The exact syntax is `--retry-alarm <vault|recovery-job> <actor-name>`; use the actor kind and name printed by the quarantine log:
+
+```sh
+npm run build:server-node
+YAOS_NODE_DATA_DIR=/srv/yaos \
+node packages/server-node/dist/server.mjs \
+  --retry-alarm recovery-job 'ACTOR_NAME_FROM_QUARANTINE_LOG'
+```
+
+The command clears quarantine and schedules another durable attempt; it does not run the server. Restart the server normally after it succeeds.
+
+The public claim, enrollment, ticket, root/body, bootstrap, settings, attachment, recovery, and deletion contracts match the Worker. Docker packaging, TLS termination, and reverse-proxy policy are not part of this runtime.
+
 ## Claim and vault provisioning
 
 Open the fresh Worker URL and choose **Claim**. Save the operator recovery key; the server stores only its hash. Claim reserves a Personal vault, provisions its schema-4 SQL root, activates the exact generation, and returns one pairing code.
@@ -83,6 +111,24 @@ The first claim pairing code carries a one-use origin-import role. Before enroll
 An enrolled device can inspect its vault roster, rename itself, mint another one-use pairing code, export only its own credentials, or leave. Pairing codes expire after 15 minutes and work once.
 
 **Leave this vault** revokes the current membership when reachable, stops sync, clears this folder's enrollment and schema-4 IndexedDB cache, and keeps ordinary files on disk. If revocation fails, local leave still completes and the operator can remove the stale membership.
+
+## Headless Linux client
+
+The headless client requires Node 24 and a local Linux filesystem. Build it with `npm run build:cli`. Enroll each directory as a distinct device:
+
+```sh
+YAOS_HOST=https://sync.example.workers.dev \
+YAOS_PAIRING_CODE=... \
+node packages/cli/dist/yaos.mjs enroll /srv/vault
+
+node packages/cli/dist/yaos.mjs daemon /srv/vault
+```
+
+The pairing code is read from the environment, never argv. Enrollment persists a replay-stable request ID, generated device ID and bearer, vault generation, server-minted name, and origin/import role before the daemon starts. Default state lives under `XDG_STATE_HOME` or `~/.local/state/yaos/headless/`; `YAOS_STATE_DIR` is an explicit state-directory leaf override, not a parent directory. State directories are mode `0700`, credential/database files `0600`, and nothing is written inside the vault except user Markdown.
+
+The daemon prints `YAOS_DAEMON_READY <vaultId>` only after bootstrap, origin import when applicable, provider sync, authoritative disk admission, and durable candidate/lifecycle settlement. Exit `2` is terminal identity/admission failure; exit `17` means another process owns that vault state. `SIGINT` and `SIGTERM` stop input, drain disk work and receipts, close SQLite, and release the lock.
+
+Supported: Markdown, one daemon per local vault, external editor/Git changes, conservative conflict preservation. Unsupported: `.obsidian`, attachments, recovery UI, NFS/SMB/FUSE, and inferred rename identity. A filesystem rename deliberately synchronizes as delete plus create.
 
 ## Settings sync setup and operation
 
@@ -207,4 +253,4 @@ The vault status surface additionally exposes `vaultGeneration`, `runtimeEpoch`,
 - Settings bodies: at most 1,000,000 bytes each and 4,000,000 bytes total per environment. Snapshot requests are at most 6,000,000 bytes; item requests 1,500,000 bytes; GET responses 6,000,000 bytes.
 - Settings counts per environment: 256 ordinary files, 256 plugin intents, 64 theme intents, 256 plugin-data rows, and 512 tombstones. IDs are at most 128 characters, repository strings 256, and version strings 64.
 - Large benchmark/soak, deployed Cloudflare settings/recovery/deletion, broader desktop settings/recovery, and all real mobile settings/recovery evidence remain deferred.
-- Headless clients and Docker packaging remain future work.
+- Network-filesystem support for headless clients remains future work.

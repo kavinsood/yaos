@@ -132,6 +132,6 @@ External dependency does not excuse reachable work: build the focused reproducti
 
 ## Unscheduled features
 
-Headless clients and Docker packaging are not current behavior or backlog commitments without a separately evidenced product requirement.
+Docker packaging is not current behavior or a backlog commitment without a separately evidenced product requirement.
 
 Generic feature expansion, awareness relays, configurable cursor colors, and native Windows support are not backlog items unless an observed problem establishes an owner and closure contract.
