@@ -56,14 +56,34 @@ export interface ObsidianCommandRegistry {
 	executeCommandById(id: string): boolean | Promise<boolean>;
 }
 
-/**
- * The internal members of App this port knows about, all optional: that is the
- * honest description of an undeclared runtime surface, and it makes the reads
- * below checks rather than assertions.
- */
-interface AppInternals {
-	readonly plugins?: ObsidianPluginRegistry;
-	readonly commands?: ObsidianCommandRegistry;
+function isPluginRegistry(value: unknown): value is ObsidianPluginRegistry {
+	if (
+		typeof value !== "object"
+		|| value === null
+		|| !("plugins" in value)
+		|| typeof value.plugins !== "object"
+		|| value.plugins === null
+		|| Array.isArray(value.plugins)
+	) {
+		return false;
+	}
+	return Object.values(value.plugins).every((plugin) =>
+		typeof plugin === "object"
+		&& plugin !== null
+		&& "manifest" in plugin
+		&& typeof plugin.manifest === "object"
+		&& plugin.manifest !== null);
+}
+
+function isCommandRegistry(value: unknown): value is ObsidianCommandRegistry {
+	return typeof value === "object"
+		&& value !== null
+		&& "commands" in value
+		&& typeof value.commands === "object"
+		&& value.commands !== null
+		&& !Array.isArray(value.commands)
+		&& "executeCommandById" in value
+		&& typeof value.executeCommandById === "function";
 }
 
 /**
@@ -74,10 +94,8 @@ interface AppInternals {
  * useful to whoever is running QA than a stack trace out of onload().
  */
 export function getPluginRegistry(app: App): ObsidianPluginRegistry | null {
-	const internals: App & AppInternals = app;
-	const registry = internals.plugins;
-	if (!registry || !registry.plugins || typeof registry.plugins !== "object") return null;
-	return registry;
+	const registry: unknown = app.plugins;
+	return isPluginRegistry(registry) ? registry : null;
 }
 
 /**
@@ -87,9 +105,8 @@ export function getPluginRegistry(app: App): ObsidianPluginRegistry | null {
  * to fall back to, so an unrunnable command has to fail the scenario.
  */
 export function getCommandRegistry(app: App): ObsidianCommandRegistry {
-	const internals: App & AppInternals = app;
-	const registry = internals.commands;
-	if (!registry || typeof registry.executeCommandById !== "function") {
+	const registry: unknown = Reflect.get(app, "commands");
+	if (!isCommandRegistry(registry)) {
 		throw new Error(
 			"[YAOS QA] app.commands is not available — Obsidian's command registry " +
 			"moved, or this is not an Obsidian renderer.",

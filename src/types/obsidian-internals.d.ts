@@ -1,13 +1,12 @@
-export {};
+import type { Plugin, PluginManifest } from "obsidian";
 
 /**
  * Obsidian runtime members that the shipped API surface (obsidian.d.ts) does
  * not declare.
  *
- * WHY THIS FILE EXISTS: the product legitimately depends on a leaf identity
- * member that the public typings omit. Declaring it once here states the
- * assumption in one place, keeps the property optional where the runtime does
- * not guarantee it, and lets tsc check every read.
+ * This file states each undocumented runtime assumption once. Optional members
+ * force every caller to retain a safe fallback or capability-check before use,
+ * while still allowing TypeScript to check the boundary.
  */
 declare module "obsidian" {
 	interface WorkspaceLeaf {
@@ -18,5 +17,28 @@ declare module "obsidian" {
 		 * (they all fall back to the file path).
 		 */
 		readonly id?: string;
+	}
+
+	/**
+	 * Optional host adapter for Obsidian's undocumented community-plugin
+	 * manager. Callers capability-check every method before use.
+	 */
+	interface App {
+		readonly plugins?: CommunityPluginsManager;
+	}
+
+	interface CommunityPluginsManager {
+		readonly manifests?: Record<string, PluginManifest & { dir?: string }>;
+		readonly plugins?: Record<string, Plugin>;
+		readonly enabledPlugins?: Set<string>;
+		installPlugin?(repo: string, version: string, manifest: PluginManifest): Promise<void>;
+		enablePluginAndSave?(id: string): Promise<boolean>;
+		enablePlugin?(id: string): Promise<boolean>;
+		disablePluginAndSave?(id: string): Promise<boolean>;
+		disablePlugin?(id: string): Promise<void>;
+		unloadPlugin?(id: string): Promise<void>;
+		setEnable?(enabled: boolean): Promise<void>;
+		isEnabled?(): boolean;
+		uninstallPlugin?(id: string): Promise<void>;
 	}
 }

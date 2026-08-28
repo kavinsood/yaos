@@ -47,6 +47,17 @@ export const Platform = {
 	resourcePathPrefix: "",
 };
 
+export let apiVersion = "1.12.7";
+
+export async function requestUrl(_request: unknown): Promise<{
+	status: number;
+	json: unknown;
+	text: string;
+	arrayBuffer: ArrayBuffer;
+}> {
+	throw new Error("requestUrl is not stubbed for this test");
+}
+
 export class PluginSettingTab {
 	readonly app: App;
 	readonly plugin: Plugin;
