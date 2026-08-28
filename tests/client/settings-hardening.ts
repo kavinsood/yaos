@@ -1,3 +1,4 @@
+import { isServerCapabilities } from "../../src/runtime/capabilityUpdateService";
 import {
 	attachmentSizeCapKB,
 	MAX_ATTACHMENT_SIZE_KB,
@@ -88,5 +89,42 @@ s.section("Enrollment requires the complete generation-scoped identity");
 	s.check(incomplete.deviceToken === "", "incomplete credential is cleared");
 	s.check(incomplete.vaultId === "", "incomplete vault id is cleared");
 	s.check(incomplete.deviceId === "", "missing device id leaves the folder unenrolled");
+}
+s.section("Settings sync preferences default safely and reject invalid persisted values");
+{
+	s.check(readVaultSyncSettings({}).settings.settingsSyncEnabled, "settings sync is enabled for seed resolution by default");
+	s.check(!readVaultSyncSettings({}).settings.settingsSyncAutoInstall, "automatic environment installs require consent");
+	const repaired = readVaultSyncSettings({
+		settingsSyncEnabled: "yes",
+		settingsSyncAutoInstall: 1,
+		settingsSyncDeferred: null,
+	} as never);
+	s.check(repaired.settings.settingsSyncEnabled, "invalid master switch resets to the enabled default");
+	s.check(!repaired.settings.settingsSyncAutoInstall, "invalid install consent resets off");
+	s.check(!repaired.settings.settingsSyncDeferred, "invalid deferral state resets");
+	s.check(repaired.migrated, "invalid settings sync preferences are persisted after repair");
+}
+
+
+s.section("Settings capability is optional for note sync");
+{
+	const notesOnly = {
+		claimed: true,
+		attachments: false,
+		snapshots: false,
+		serverVersion: "1.0.0",
+		schemaVersion: 4,
+		storageFormatVersion: 1,
+		protocolVersion: 1,
+		snapshotFormatVersion: 2,
+		recoveryJobs: false,
+		updateProvider: null,
+		updateRepoUrl: null,
+	};
+	s.check(isServerCapabilities(notesOnly), "missing settings capability does not invalidate note capabilities");
+	s.check(
+		isServerCapabilities({ ...notesOnly, settingsSync: true, settingsFormatVersion: 2 }),
+		"unknown settings format remains a valid note capability envelope",
+	);
 }
 await s.done();

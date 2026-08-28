@@ -25,6 +25,8 @@ const baseCapabilities: ServerCapabilities = {
 	claimed: true,
 	attachments: true,
 	snapshots: true,
+	settingsSync: true,
+	settingsFormatVersion: 1,
 	recoveryJobs: true,
 	serverVersion: SERVER_VERSION,
 	schemaVersion: SCHEMA_VERSION,

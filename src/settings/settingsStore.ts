@@ -44,6 +44,12 @@ export interface VaultSyncSettings {
 	 * the exportable bug-report trace. Single switch; off by default.
 	 */
 	debug: boolean;
+	/** Synchronize this vault's Obsidian configuration directory. */
+	settingsSyncEnabled: boolean;
+	/** Allow foreground installation of remotely pinned plugins and themes. */
+	settingsSyncAutoInstall: boolean;
+	/** Defer the initial settings seed decision without affecting note sync. */
+	settingsSyncDeferred: boolean;
 	/** Pause propagation of suspicious YAML frontmatter transitions. */
 	frontmatterGuardEnabled: boolean;
 	/** Comma-separated path prefixes to exclude from sync. */
@@ -85,6 +91,9 @@ export const DEFAULT_SETTINGS: VaultSyncSettings = {
 	deviceName: "",
 	pendingEnrollment: null,
 	debug: false,
+	settingsSyncEnabled: true,
+	settingsSyncAutoInstall: false,
+	settingsSyncDeferred: false,
 	frontmatterGuardEnabled: true,
 	excludePatterns: "",
 	maxFileSizeKB: 2048,
@@ -181,6 +190,12 @@ export function readVaultSyncSettings(
 		migrated = true;
 	}
 	settings.pendingEnrollment = pendingEnrollment;
+	for (const key of ["settingsSyncEnabled", "settingsSyncAutoInstall", "settingsSyncDeferred"] as const) {
+		if (typeof record[key] !== "boolean") {
+			settings[key] = DEFAULT_SETTINGS[key];
+			if (record[key] !== undefined) migrated = true;
+		}
+	}
 	if (typeof record.attachmentSyncExplicitlyConfigured !== "boolean") {
 		settings.attachmentSyncExplicitlyConfigured = record.enableAttachmentSync === true;
 		if (record.enableAttachmentSync !== true) {

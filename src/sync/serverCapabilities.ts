@@ -4,6 +4,8 @@ export interface ServerCapabilities {
 	claimed: boolean;
 	attachments: boolean;
 	snapshots: boolean;
+	settingsSync?: boolean;
+	settingsFormatVersion?: number;
 	maxBlobUploadBytes?: number;
 	serverVersion: string;
 	schemaVersion: number | null;
