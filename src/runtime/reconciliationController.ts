@@ -783,7 +783,7 @@ export class ReconciliationController {
 			}
 
 			const bodyId = vaultSync.getFileId(file.path);
-			if (existingText && bodyId) {
+			if (existingText && bodyId && vaultSync.isBodyOpen(bodyId)) {
 				applyDiffToYText(existingText, previousContent ?? "", content, ORIGIN_DISK_SYNC);
 			} else {
 				const admittedBodyId = bodyId ?? crypto.randomUUID();
