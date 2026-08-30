@@ -233,4 +233,4 @@ Forbidden claims:
 - Invalid settings JSON/hash/path, stale queue identity, or plugin-data version mismatch: quarantine or reject the settings item; never widen the allowlist or overwrite the held local value.
 - Restricted/backgrounded/missing package installer: skip or durably pause the package step as specified; continue file LWW where safe.
 
-Headless clients and Docker packaging are outside the current contract. Large benchmark/soak, deployed Cloudflare behavior, broader real desktop settings/recovery, and all mobile settings/recovery claims are outside current evidence; see [QA](qa.md).
+The Docker server preserves this contract through the shared Node host; its volume, lifecycle, health, backup, and upgrade boundaries are defined in [operations](operations.md#docker-deployment). The headless client implements the Markdown subset described there. Large benchmark/soak, deployed Cloudflare behavior, broader real desktop settings/recovery, and all mobile settings/recovery claims are outside current evidence; see [QA](qa.md).

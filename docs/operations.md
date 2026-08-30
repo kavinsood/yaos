@@ -90,11 +90,81 @@ node packages/server-node/dist/server.mjs \
 
 The command clears quarantine and schedules another durable attempt; it does not run the server. Restart the server normally after it succeeds.
 
-The public claim, enrollment, ticket, root/body, bootstrap, settings, attachment, recovery, and deletion contracts match the Worker. Docker packaging, TLS termination, and reverse-proxy policy are not part of this runtime.
+The public claim, enrollment, ticket, root/body, bootstrap, settings, attachment, recovery, and deletion contracts match the Worker.
+
+## Docker deployment
+
+`Dockerfile` packages the production Node host as a non-root, read-only-root-filesystem container. `compose.yaml` exposes port 8787, gives the process one persistent `yaos-data` volume at `/data`, drops Linux capabilities, and uses `/health/ready` for health checks.
+
+For a local build:
+
+```sh
+YAOS_PUBLIC_ORIGIN=https://sync.example.com \
+YAOS_BIND=127.0.0.1:8787 \
+docker compose up --build -d
+```
+
+`YAOS_PUBLIC_ORIGIN` is the exact external `http(s)` origin placed into setup and enrollment responses. Set it when TLS terminates at a reverse proxy. It accepts no credentials, path, query, or fragment. The proxy must preserve `Host`, pass WebSocket `Upgrade`/`Connection` headers, disable response buffering for WebSockets, and forward traffic to container port 8787. YAOS does not trust forwarded-protocol headers.
+
+Released images are published only under an exact repository release tag:
+
+```sh
+YAOS_IMAGE=ghcr.io/kavinsood/yaos-server:<version> \
+YAOS_PUBLIC_ORIGIN=https://sync.example.com \
+docker compose pull
+
+YAOS_IMAGE=ghcr.io/kavinsood/yaos-server:<version> \
+YAOS_PUBLIC_ORIGIN=https://sync.example.com \
+docker compose up -d
+```
+
+Do not run two server containers against one volume. The second process fails with exit 17 rather than sharing SQLite and object ownership.
+
+### Backup and restore
+
+The named volume is the complete backup boundary. Stop the server before copying it so the SQLite databases, alarm leases, and immutable objects share one point in time:
+
+```sh
+docker compose stop server
+docker run --rm \
+  --mount type=volume,source=yaos-data,target=/data,readonly \
+  --mount type=bind,source=\"$PWD\",target=/backup \
+  node:24-bookworm-slim \
+  tar -C /data -czf /backup/yaos-data.tgz .
+docker compose start server
+```
+
+Restore only into an empty volume while the server is stopped:
+
+```sh
+docker compose down
+docker volume rm yaos-data
+docker volume create yaos-data
+docker run --rm \
+  --mount type=volume,source=yaos-data,target=/data \
+  --mount type=bind,source=\"$PWD\",target=/backup,readonly \
+  node:24-bookworm-slim \
+  tar -C /data -xzf /backup/yaos-data.tgz
+docker compose up -d
+```
+
+If `YAOS_DATA_VOLUME` overrides the volume name, use that exact name in backup and restore commands.
+
+### Upgrade and rollback
+
+Before changing an image tag, take a stopped-volume backup. Pull an exact new tag, start it, and wait for `/health/ready`. Storage migrations are forward-only. Rollback means stopping the new image and restoring the pre-upgrade volume backup before starting the old image; never point an old image at a volume already opened by a newer storage format.
+
+Retry a quarantined alarm only with the service stopped:
+
+```sh
+docker compose stop server
+docker compose run --rm server --retry-alarm recovery-job 'ACTOR_NAME_FROM_QUARANTINE_LOG'
+docker compose start server
+```
 
 ## Claim and vault provisioning
 
-Open the fresh Worker URL and choose **Claim**. Save the operator recovery key; the server stores only its hash. Claim reserves a Personal vault, provisions its schema-4 SQL root, activates the exact generation, and returns one pairing code.
+Open the fresh server URL and choose **Claim**. Save the operator recovery key; the server stores only its hash. Claim reserves a Personal vault, provisions its schema-4 SQL root, activates the exact generation, and returns one pairing code.
 
 Provisioning is a three-step saga: registry reservation, idempotent vault-runtime provisioning, then matching-generation activation. A partial failure remains in `provisioning` state with a retryable error and cannot admit devices as an active vault.
 

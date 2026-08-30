@@ -132,6 +132,4 @@ External dependency does not excuse reachable work: build the focused reproducti
 
 ## Unscheduled features
 
-Docker packaging is not current behavior or a backlog commitment without a separately evidenced product requirement.
-
 Generic feature expansion, awareness relays, configurable cursor colors, and native Windows support are not backlog items unless an observed problem establishes an owner and closure contract.

@@ -75,11 +75,15 @@ node packages/cli/dist/yaos.mjs daemon /srv/vault
 
 The daemon is Linux/local-filesystem only, Markdown only, and single-process per vault. `.obsidian`, attachments, network filesystems, and rename-identity inference are intentionally outside its contract. See [operations](./docs/operations.md#headless-linux-client).
 
-## Node server runtime
+## Self-hosted Docker server
 
-`packages/server-node` runs the same schema-4 control-plane, vault, settings, attachment, and recovery domain owners as the Cloudflare Worker over Node 24, SQLite, WebSockets, and filesystem object storage. It is verified against the Worker by the runtime-blind conformance suite. This is a Node process, not a Docker image or Docker-readiness claim.
+The production image packages `packages/server-node`, which runs the same schema-4 control-plane, vault, settings, attachment, recovery, and deletion owners as the Cloudflare Worker over Node 24, SQLite, WebSockets, and filesystem object storage.
 
-See [operations](./docs/operations.md#node-server-runtime).
+```sh
+YAOS_PUBLIC_ORIGIN=https://sync.example.com docker compose up --build -d
+```
+
+The `yaos-data` volume is the complete durable server state. Put TLS in front of the container, preserve that volume, and pin released deployments to an exact `ghcr.io/kavinsood/yaos-server:<version>` image. See [operations](./docs/operations.md#docker-deployment).
 
 ## Troubleshooting
 

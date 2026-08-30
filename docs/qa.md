@@ -92,7 +92,7 @@ These settings live cases exercise HTTP/SQLite behavior through local Wrangler. 
 
 `tests/conformance/run-conformance.ts` runs the same public fixtures against local Wrangler and `packages/server-node`: capabilities, routing, identity, ticket/version admission, root/body candidate and lifecycle ordering, SQL bootstrap/feed, crash durability, settings, attachments, recovery, purge-first deletion, and root awareness. The Node target additionally proves recovery dispatch resumption across process death. Local Wrangler does not claim that process-level alarm property because stopping the emulator is not Durable Object eviction.
 
-`tests/node-runtime/` separately proves Node-only mechanics: zero-copy BLOB bindings and exact offset ownership, lazy cursors and rollback, create-only object publication, durable alarm leases/quarantine, forward migration refusal, one-owner locking, and liveness/readiness. These tests do not constitute Docker or deployed-production evidence.
+`tests/node-runtime/` separately proves Node-only mechanics: zero-copy BLOB bindings and exact offset ownership, lazy cursors and rollback, create-only object publication, durable alarm leases/quarantine, forward migration refusal, one-owner locking, and liveness/readiness. `tests/docker/smoke.mjs` then builds and drives the production image through its published port and persistent volume. It requires the image to run non-root with a read-only root filesystem, expose exact liveness/readiness, persist a real claim across restart, reject a second volume owner with exit 17, and stop cleanly under Docker's `SIGTERM`. This is local-container evidence, not a claim about an external registry, reverse proxy, or deployed host.
 
 ## What is not yet proven
 
