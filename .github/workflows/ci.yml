@@ -29,4 +29,5 @@ jobs:
       - run: npm run guard:production-bundles
       - run: npm run guard:no-tracked-generated-artifacts
       - run: npm run test:ci
+      - run: npm run test:docker
       - run: npm --prefix server run typecheck
