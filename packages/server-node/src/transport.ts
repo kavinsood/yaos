@@ -38,6 +38,7 @@ export type NodeReadinessFailure = "lock" | "migration" | "storage";
 export interface NodeTransportOptions {
 	readonly host: string;
 	readonly port: number;
+	readonly publicOrigin?: string;
 	readonly drainTimeoutMs?: number;
 	readonly readiness: () => NodeReadinessFailure | null | Promise<NodeReadinessFailure | null>;
 	readonly onError?: (error: unknown) => void;
@@ -103,12 +104,13 @@ class WsServerSocket implements NodeServerSocket {
 	}
 }
 
-function requestUrl(request: IncomingMessage, host: string, port: number): URL {
+function requestUrl(request: IncomingMessage, host: string, port: number, publicOrigin?: string): URL {
 	const authority = request.headers.host ?? `${host}:${port}`;
-	return new URL(request.url ?? "/", `http://${authority}`);
+	const incoming = new URL(request.url ?? "/", `http://${authority}`);
+	return publicOrigin ? new URL(`${incoming.pathname}${incoming.search}`, publicOrigin) : incoming;
 }
 
-function toWebRequest(request: IncomingMessage, host: string, port: number): Request {
+function toWebRequest(request: IncomingMessage, host: string, port: number, publicOrigin?: string): Request {
 	const method = request.method ?? "GET";
 	const controller = new AbortController();
 	request.once("aborted", () => controller.abort());
@@ -125,7 +127,7 @@ function toWebRequest(request: IncomingMessage, host: string, port: number): Req
 		init.body = Readable.toWeb(request) as ReadableStream<Uint8Array>;
 		init.duplex = "half";
 	}
-	return new Request(requestUrl(request, host, port), init);
+	return new Request(requestUrl(request, host, port, publicOrigin), init);
 }
 
 async function sendResponse(response: Response, outgoing: ServerResponse, method: string): Promise<void> {
@@ -235,7 +237,7 @@ export class NodeTransport {
 
 	private async handleHttp(request: IncomingMessage, response: ServerResponse): Promise<void> {
 		try {
-			const url = requestUrl(request, this.options.host, this.options.port);
+			const url = requestUrl(request, this.options.host, this.options.port, this.options.publicOrigin);
 			if (request.method === "GET" && url.pathname === "/health") {
 				await sendResponse(Response.json({ status: "ok" }), response, "GET");
 				return;
@@ -248,7 +250,7 @@ export class NodeTransport {
 				await sendResponse(Response.json({ error: "server_draining" }, { status: 503 }), response, request.method ?? "GET");
 				return;
 			}
-			const webRequest = toWebRequest(request, this.options.host, this.options.port);
+			const webRequest = toWebRequest(request, this.options.host, this.options.port, this.options.publicOrigin);
 			await sendResponse(await this.application.fetch(webRequest), response, webRequest.method);
 		} catch (error) {
 			this.options.onError?.(error);
@@ -286,7 +288,7 @@ export class NodeTransport {
 				await rejectUpgrade(socket, Response.json({ error: "server_draining" }, { status: 503 }));
 				return;
 			}
-			const webRequest = toWebRequest(request, this.options.host, this.options.port);
+			const webRequest = toWebRequest(request, this.options.host, this.options.port, this.options.publicOrigin);
 			const result = await this.application.upgrade(webRequest);
 			if (result instanceof Response) {
 				await rejectUpgrade(socket, result);

@@ -162,6 +162,31 @@ s.test("health endpoints are exact unauthenticated GET routes", async () => {
 	}
 });
 
+s.test("public origin rewrites application URLs behind a TLS proxy", async () => {
+	const port = await reservePort();
+	let observedUrl = "";
+	const transport = new NodeTransport({
+		fetch: async (request) => {
+			observedUrl = request.url;
+			return new Response("ok");
+		},
+		upgrade: async () => new Response("not found", { status: 404 }),
+	}, {
+		host: "127.0.0.1",
+		port,
+		publicOrigin: "https://sync.example.com",
+		readiness: () => null,
+	});
+	try {
+		await transport.listen();
+		const response = await fetch(`http://127.0.0.1:${port}/vault/example/status?detail=1`);
+		assert.equal(response.status, 200);
+		assert.equal(observedUrl, "https://sync.example.com/vault/example/status?detail=1");
+	} finally {
+		await transport.drain();
+	}
+});
+
 s.test("readiness fails closed without leaking lock identity or paths", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "yaos-node-health-lock-"));
 	const lock = ProcessDataLock.acquire(directory);

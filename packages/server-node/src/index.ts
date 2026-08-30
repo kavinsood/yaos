@@ -25,6 +25,7 @@ export interface NodeServerOptions {
 	readonly host: string;
 	readonly port: number;
 	readonly dataDirectory: string;
+	readonly publicOrigin?: string;
 	readonly ticketTtlMs?: string;
 	readonly enableAdminRoutes?: string;
 	readonly drainTimeoutMs?: number;
@@ -183,10 +184,21 @@ function parseEnvironment(environment: NodeJS.ProcessEnv): NodeServerOptions {
 	}
 	const configuredDirectory = environment.YAOS_NODE_DATA_DIR?.trim();
 	if (!configuredDirectory) throw new Error("YAOS_NODE_DATA_DIR is required");
+	const configuredPublicOrigin = environment.YAOS_NODE_PUBLIC_ORIGIN?.trim();
+	let publicOrigin: string | undefined;
+	if (configuredPublicOrigin) {
+		const parsed = new URL(configuredPublicOrigin);
+		if ((parsed.protocol !== "http:" && parsed.protocol !== "https:")
+			|| parsed.username || parsed.password || parsed.pathname !== "/" || parsed.search || parsed.hash) {
+			throw new Error("YAOS_NODE_PUBLIC_ORIGIN must be an http(s) origin without credentials, path, query, or fragment");
+		}
+		publicOrigin = parsed.origin;
+	}
 	return {
 		host,
 		port,
 		dataDirectory: resolve(configuredDirectory),
+		...(publicOrigin ? { publicOrigin } : {}),
 		...(environment.YAOS_TICKET_TTL_MS ? { ticketTtlMs: environment.YAOS_TICKET_TTL_MS } : {}),
 		...(environment.YAOS_ENABLE_ADMIN_ROUTES ? { enableAdminRoutes: environment.YAOS_ENABLE_ADMIN_ROUTES } : {}),
 	};
@@ -302,6 +314,7 @@ export async function runNodeServer(options: NodeServerOptions): Promise<void> {
 		const transport = new NodeTransport(application, {
 			host: options.host,
 			port: options.port,
+			publicOrigin: options.publicOrigin,
 			drainTimeoutMs: options.drainTimeoutMs,
 			readiness: () => lock.ownsLock() ? databases.readinessFailure() : "lock",
 			onError: (error) => console.error("[yaos-node] transport error", error),
