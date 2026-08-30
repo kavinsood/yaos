@@ -1,0 +1,28 @@
+services:
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ${YAOS_IMAGE:-yaos-server:local}
+    environment:
+      YAOS_NODE_HOST: 0.0.0.0
+      YAOS_NODE_PORT: 8787
+      YAOS_NODE_DATA_DIR: /data
+      YAOS_NODE_PUBLIC_ORIGIN: ${YAOS_PUBLIC_ORIGIN:-}
+    ports:
+      - "${YAOS_BIND:-8787}:8787"
+    volumes:
+      - yaos-data:/data
+    restart: unless-stopped
+    stop_grace_period: 30s
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  yaos-data:
+    name: ${YAOS_DATA_VOLUME:-yaos-data}
