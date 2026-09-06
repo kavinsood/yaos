@@ -5,6 +5,7 @@ import { PRODUCT_EVENT_KIND } from "../observability/productEventKinds";
 import type { ProductFlightEventInput } from "../observability/traceSink";
 import type { AttachmentCatalogPort, BlobSyncManager } from "../sync/blobSync";
 import type { VaultSync } from "../sync/vaultSync";
+import type { AttachmentHead } from "../types";
 import { ConfirmModal } from "../ui/ConfirmModal";
 import { formatUnknown } from "../utils/format";
 import { RecoveryBackupHook } from "./recoveryBackup";
@@ -261,10 +262,10 @@ export class SnapshotService {
 	private async applyRestorePage(restoreId: string, snapshotId: string, items: RestoreItem[], runtime: RecoveryRuntimePort): Promise<RestoreItemResult[]> {
 		const catalog = this.deps.getAttachmentCatalog();
 		const markdownReviews = new Map<string, RecoveryLiveFile | null>();
-		const attachmentReviews = new Map<string, { hash: string; size: number } | null>();
+		const attachmentReviews = new Map<string, AttachmentHead>();
 		for (const item of items) {
 			if (item.kind === "markdown") markdownReviews.set(item.itemId, await runtime.getLive(item.path));
-			else attachmentReviews.set(item.itemId, catalog?.getAttachmentRef(item.path) ?? null);
+			else attachmentReviews.set(item.itemId, catalog?.getObservedAttachmentHead(item.path) ?? { kind: "missing", revision: null });
 		}
 		const backupHook = new RecoveryBackupHook(this.deps.app, {
 			log: (message) => this.deps.log(message),
@@ -283,7 +284,7 @@ export class SnapshotService {
 				if (item.kind === "markdown") {
 					results.push(await this.client().applyMarkdownItem(restoreId, snapshotId, item, markdownReviews.get(item.itemId) ?? null, runtime));
 				} else {
-					results.push(await this.applyAttachmentItem(restoreId, item, attachmentReviews.get(item.itemId) ?? null));
+					results.push(await this.applyAttachmentItem(restoreId, item, attachmentReviews.get(item.itemId) ?? { kind: "missing", revision: null }));
 				}
 			} catch (error) {
 				if (!(error instanceof RecoveryTerminalItemError)) throw error;
@@ -294,19 +295,30 @@ export class SnapshotService {
 		return results;
 	}
 
-	private async applyAttachmentItem(restoreId: string, item: Extract<RestoreItem, { kind: "attachment" }>, liveAtReview: { hash: string; size: number } | null): Promise<RestoreItemResult> {
+	private async applyAttachmentItem(restoreId: string, item: Extract<RestoreItem, { kind: "attachment" }>, liveAtReview: AttachmentHead): Promise<RestoreItemResult> {
 		const catalog = this.deps.getAttachmentCatalog();
 		const blobSync = this.deps.getBlobSync();
 		if (!catalog || !blobSync) throw new Error("attachment recovery runtime is unavailable");
 		await this.client().downloadRestoreItem(restoreId, item);
-		const current = catalog.getAttachmentRef(item.path) ?? null;
-		const unchanged = current === null
-			? liveAtReview === null
-			: liveAtReview !== null && current.hash === liveAtReview.hash && current.size === liveAtReview.size;
-		if (!unchanged && !(current?.hash === item.contentHash && current.size === item.size)) {
+		const current = catalog.getObservedAttachmentHead(item.path);
+		if (current.revision !== liveAtReview.revision || current.kind !== liveAtReview.kind) {
+			if (current.kind === "active" && current.hash === item.contentHash && current.size === item.size) {
+				await blobSync.forceDownloads([item.path]);
+				return { itemId: item.itemId, outcome: "restored" };
+			}
 			return { itemId: item.itemId, outcome: "skipped-changed" };
 		}
-		await catalog.setAttachmentRef(item.path, item.contentHash, item.size, item.mime ?? "application/octet-stream");
+		const outcome = await catalog.setAttachmentRef(
+			item.path,
+			item.contentHash,
+			item.size,
+			item.mime ?? "application/octet-stream",
+			{ operationId: `restore:${item.itemId}`, expectedRevision: liveAtReview.revision },
+		);
+		if (outcome.kind === "superseded") return { itemId: item.itemId, outcome: "skipped-changed" };
+		if (outcome.kind === "durably-pending") {
+			throw new Error(`attachment restore publication remains pending: ${outcome.operationId}`);
+		}
 		await blobSync.forceDownloads([item.path]);
 		return { itemId: item.itemId, outcome: "restored" };
 	}
