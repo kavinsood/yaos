@@ -42,7 +42,7 @@ export class StoreCycle {
   async fetch() {
     const store = new VaultStore(this.state.storage);
     const root = new Y.Doc({ guid: "root" });
-    root.getMap("sys").set("schemaVersion", 4);
+    root.getMap("sys").set("schemaVersion", 5);
     const rootUpdate = Y.encodeStateAsUpdate(root);
     const vaultGeneration = "generation-sqlite-cycle-0001";
     const provisioned = store.provisionVault("sqlite-cycle-vault", vaultGeneration, rootUpdate, 500);
@@ -147,6 +147,48 @@ export class StoreCycle {
     const directHead = store.getCatalogHeadAt(renameCatalogCommit.vaultSequence, "catalog-body");
     const listedHead = store.listCatalogAt(renameCatalogCommit.vaultSequence).find((entry) => entry.bodyId === "catalog-body");
     const renameFeed = store.changesPageAfter(createCatalogCommit.vaultSequence).entries.find((entry) => entry.sequence === renameCatalogCommit.vaultSequence);
+	const attachmentOperationId = "attachment-sqlite-cycle";
+	const attachmentHash = "a".repeat(64);
+	const attachmentUpdate = incremental(catalogRoot, () => {
+	  catalogRoot.getMap("pathToBlob").set("assets/atomic.bin", { hash: attachmentHash, size: 1, revision: attachmentOperationId });
+	  catalogRoot.getMap("blobMeta").set(attachmentHash, { size: 1, mime: "application/octet-stream", createdAt: 700 });
+	});
+	const attachmentCommit = store.commitRootAttachments(attachmentUpdate, [{
+	  operationId: attachmentOperationId,
+	  path: "assets/atomic.bin",
+	  contentHash: attachmentHash,
+	  size: 1,
+	  mime: "application/octet-stream",
+	  lifecycle: "active",
+	}], { operationId: attachmentOperationId, requestDigest: "b".repeat(64) }, 700);
+	const attachmentHead = store.attachmentHead("assets/atomic.bin");
+	const attachmentOperation = store.attachmentOperation(attachmentOperationId);
+	const beforeFailedAttachmentSequence = store.currentSequence();
+	const failedAttachmentUpdate = incremental(catalogRoot, () => {
+	  catalogRoot.getMap("pathToBlob").set("assets/must-rollback.bin", { hash: attachmentHash, size: 1, revision: attachmentOperationId });
+	});
+	let attachmentCommitRejected = false;
+	try {
+	  store.commitRootAttachments(failedAttachmentUpdate, [{
+	    operationId: attachmentOperationId,
+	    path: "assets/must-rollback.bin",
+	    contentHash: attachmentHash,
+	    size: 1,
+	    mime: "application/octet-stream",
+	    lifecycle: "active",
+	  }], { operationId: attachmentOperationId, requestDigest: "c".repeat(64) }, 701);
+	} catch {
+	  attachmentCommitRejected = true;
+	}
+	const attachmentRootAfterRollback = store.reconstructDocument("root");
+	const attachmentAtomicity = attachmentCommit.vaultSequence === attachmentHead?.sequence
+	  && attachmentCommit.vaultSequence === attachmentOperation?.rootSequence
+	  && attachmentCommit.generation === attachmentOperation?.rootGeneration
+	  && attachmentCommitRejected
+	  && store.currentSequence() === beforeFailedAttachmentSequence
+	  && store.attachmentHead("assets/must-rollback.bin") === null
+	  && !attachmentRootAfterRollback.doc.getMap("pathToBlob").has("assets/must-rollback.bin");
+	attachmentRootAfterRollback.doc.destroy();
     catalogRoot.destroy();
     const gcOne = store.createGcEpoch({
       requestId: "gc-request-one",
@@ -292,6 +334,7 @@ export class StoreCycle {
         listed: listedHead?.previousPath ?? null,
         feed: renameFeed?.catalogs[0]?.previousPath ?? null,
       },
+	  attachmentAtomicity,
       authority: {
         gcEpochAdvanced: gcTwo.epoch === gcOne.epoch + 1,
         indexedGarbageApproved: sweep.approvedKeys.includes(garbageKey),
@@ -395,12 +438,13 @@ s.test("VaultStore completes journal/checkpoint/pin/feed-floor cycle on real SQL
 			highWater: number;
 			textLength: number;
 			previousPath: { direct: string | null; listed: string | null; feed: string | null };
+			attachmentAtomicity: boolean;
 		};
 		s.check(
 			result.metadata.created && result.metadata.replayed && result.metadata.generationFenceRejected
 				&& result.metadata.persisted && result.metadata.bootstrapCycle
-				&& result.metadata.schemaVersion === 4 && result.metadata.storageFormatVersion === 1,
-			"schema-4 metadata persists vaultGeneration and rejects a different provisioning incarnation",
+				&& result.metadata.schemaVersion === 5 && result.metadata.storageFormatVersion === 2,
+			"schema-5 metadata persists vaultGeneration and rejects a different provisioning incarnation",
 		);
 		s.check(result.before.entries === 61 && result.before.bytes > 1_200_000, "real SQLite journal contains the large update plus all semantic body edits");
 		s.check(result.blocked === "blocked-by-pin" && result.pinnedFloorRejected, "active capture pin blocks checkpoint compaction and feed-floor advancement");
@@ -426,6 +470,7 @@ s.test("VaultStore completes journal/checkpoint/pin/feed-floor cycle on real SQL
 				&& result.previousPath.feed === "old.md",
 			"real SQLite get/list/feed APIs preserve atomic rename previousPath",
 		);
+		s.check(result.attachmentAtomicity, "real SQLite atomically commits and rolls back root, attachment catalog, and exact replay ledger");
 	} finally {
 		if (child && child.exitCode === null) {
 			child.kill("SIGTERM");

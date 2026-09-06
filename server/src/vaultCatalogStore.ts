@@ -88,6 +88,14 @@ export interface AttachmentCatalogEvent {
 	size: number | null;
 	mime: string | null;
 	lifecycle: "active" | "deleted";
+	operationId: string;
+}
+
+export interface DurableAttachmentOperation {
+	operationId: string;
+	requestDigest: string;
+	rootSequence: number;
+	rootGeneration: number;
 }
 
 export interface CatalogDeltaEntry {
@@ -498,9 +506,9 @@ export abstract class VaultCatalogStore extends VaultDocumentStore {
 		const bounded = Math.min(1000, Math.max(1, limit));
 		return this.storage.sql.exec<{
 			sequence: number; path: string; content_hash: string | null; size: number | null;
-			mime: string | null; lifecycle: AttachmentCatalogEvent["lifecycle"];
+			mime: string | null; lifecycle: AttachmentCatalogEvent["lifecycle"]; operation_id: string;
 		}>(
-			`SELECT e.sequence, e.path, e.content_hash, e.size, e.mime, e.lifecycle
+			`SELECT e.sequence, e.path, e.content_hash, e.size, e.mime, e.lifecycle, e.operation_id
 			 FROM vault_attachment_catalog_events e
 			 JOIN (
 			   SELECT path, MAX(sequence) AS sequence
@@ -517,15 +525,16 @@ export abstract class VaultCatalogStore extends VaultDocumentStore {
 			size: row.size,
 			mime: row.mime,
 			lifecycle: row.lifecycle,
+			operationId: row.operation_id,
 		}));
 	}
 
 	activeAttachmentCatalogAt(boundarySequence: number, afterPath = "", limit = 1000): AttachmentCatalogEvent[] {
 		this.initialize();
 		return this.storage.sql.exec<{
-			sequence: number; path: string; content_hash: string | null; size: number | null; mime: string | null;
+			sequence: number; path: string; content_hash: string | null; size: number | null; mime: string | null; operation_id: string;
 		}>(
-			`SELECT e.sequence, e.path, e.content_hash, e.size, e.mime
+			`SELECT e.sequence, e.path, e.content_hash, e.size, e.mime, e.operation_id
 			 FROM vault_attachment_catalog_events e
 			 JOIN (
 			   SELECT path, MAX(sequence) AS sequence
@@ -542,6 +551,7 @@ export abstract class VaultCatalogStore extends VaultDocumentStore {
 			size: row.size,
 			mime: row.mime,
 			lifecycle: "active",
+			operationId: row.operation_id,
 		}));
 	}
 
@@ -549,9 +559,9 @@ export abstract class VaultCatalogStore extends VaultDocumentStore {
 		this.initialize();
 		return this.storage.sql.exec<{
 			sequence: number; path: string; content_hash: string | null; size: number | null;
-			mime: string | null; lifecycle: AttachmentCatalogEvent["lifecycle"];
+			mime: string | null; lifecycle: AttachmentCatalogEvent["lifecycle"]; operation_id: string;
 		}>(
-			`SELECT sequence, path, content_hash, size, mime, lifecycle
+			`SELECT sequence, path, content_hash, size, mime, lifecycle, operation_id
 			 FROM vault_attachment_catalog_events WHERE operation_id = ? ORDER BY path`,
 			operationId,
 		).toArray().map((row) => ({
@@ -561,7 +571,46 @@ export abstract class VaultCatalogStore extends VaultDocumentStore {
 			size: row.size,
 			mime: row.mime,
 			lifecycle: row.lifecycle,
+			operationId: row.operation_id,
 		}));
+	}
+
+	attachmentHead(path: string): AttachmentCatalogEvent | null {
+		this.initialize();
+		const row = this.storage.sql.exec<{
+			sequence: number; path: string; content_hash: string | null; size: number | null;
+			mime: string | null; lifecycle: AttachmentCatalogEvent["lifecycle"]; operation_id: string;
+		}>(
+			`SELECT sequence, path, content_hash, size, mime, lifecycle, operation_id
+			 FROM vault_attachment_catalog_events WHERE path = ? ORDER BY sequence DESC LIMIT 1`,
+			path,
+		).toArray()[0];
+		return row ? {
+			sequence: row.sequence,
+			path: row.path,
+			contentHash: row.content_hash,
+			size: row.size,
+			mime: row.mime,
+			lifecycle: row.lifecycle,
+			operationId: row.operation_id,
+		} : null;
+	}
+
+	attachmentOperation(operationId: string): DurableAttachmentOperation | null {
+		this.initialize();
+		const row = this.storage.sql.exec<{
+			operation_id: string; request_digest: string; root_sequence: number; root_generation: number;
+		}>(
+			`SELECT operation_id, request_digest, root_sequence, root_generation
+			 FROM vault_attachment_operations WHERE operation_id = ?`,
+			operationId,
+		).toArray()[0];
+		return row ? {
+			operationId: row.operation_id,
+			requestDigest: row.request_digest,
+			rootSequence: row.root_sequence,
+			rootGeneration: row.root_generation,
+		} : null;
 	}
 
 	catalogDeltaAt(afterSequence: number, throughSequence: number, cursor: string | null, limit: number): Array<{

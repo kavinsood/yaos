@@ -89,12 +89,16 @@ export function hasSafeRootAttachmentSemantics(doc: Y.Doc): boolean {
 		if (typeof value !== "object" || value === null || Array.isArray(value)
 			|| !("hash" in value) || typeof value.hash !== "string"
 			|| !("size" in value) || typeof value.size !== "number"
+			|| !("revision" in value) || typeof value.revision !== "string" || !validIdentity(value.revision)
 			|| safeBlobPath(path, "", { hash: value.hash, size: value.size }) !== path
 			|| tombstones.has(path)) return false;
 	}
 	for (const [path, value] of tombstones.entries()) {
 		if (safeBlobPath(path) !== path || typeof value !== "object" || value === null || Array.isArray(value)
-			|| !("deletedAt" in value) || !Number.isSafeInteger(value.deletedAt) || (value.deletedAt as number) < 0) return false;
+			|| !("deletedAt" in value) || !Number.isSafeInteger(value.deletedAt) || (value.deletedAt as number) < 0
+			|| !("revision" in value) || typeof value.revision !== "string" || !validIdentity(value.revision)
+			|| !("previousHash" in value) || (value.previousHash !== null
+				&& (typeof value.previousHash !== "string" || !/^[a-f0-9]{64}$/.test(value.previousHash)))) return false;
 	}
 	for (const [hash, value] of doc.getMap<unknown>("blobMeta").entries()) {
 		if (!/^[a-f0-9]{64}$/.test(hash) || typeof value !== "object" || value === null || Array.isArray(value)

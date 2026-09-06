@@ -194,8 +194,8 @@ export abstract class VaultDocumentStore {
 				id INTEGER PRIMARY KEY CHECK(id = 1),
 				vault_id TEXT NOT NULL,
 				vault_generation TEXT NOT NULL,
-				schema_version INTEGER NOT NULL CHECK(schema_version = 4),
-				storage_format_version INTEGER NOT NULL CHECK(storage_format_version = 1),
+				schema_version INTEGER NOT NULL CHECK(schema_version = 5),
+				storage_format_version INTEGER NOT NULL CHECK(storage_format_version = 2),
 				provisioned_at INTEGER NOT NULL
 			);
 			CREATE TABLE IF NOT EXISTS vault_revoked_devices (
@@ -288,6 +288,13 @@ export abstract class VaultDocumentStore {
 			);
 			CREATE INDEX IF NOT EXISTS vault_attachment_path_sequence
 				ON vault_attachment_catalog_events(path, sequence DESC);
+			CREATE TABLE IF NOT EXISTS vault_attachment_operations (
+				operation_id TEXT PRIMARY KEY,
+				request_digest TEXT NOT NULL,
+				root_sequence INTEGER NOT NULL,
+				root_generation INTEGER NOT NULL,
+				created_at INTEGER NOT NULL
+			);
 			CREATE TABLE IF NOT EXISTS recovery_captures (
 				capture_id TEXT PRIMARY KEY,
 				request_id TEXT NOT NULL UNIQUE,

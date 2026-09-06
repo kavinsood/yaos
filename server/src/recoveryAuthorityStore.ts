@@ -83,6 +83,14 @@ function parseRestoreSelection(value: string): RestoreSelection {
 
 /** Recovery capture, restore, projection, GC, lease, and deletion authority storage. */
 export class RecoveryAuthorityStore extends VaultBootstrapStore {
+	acquireVaultMutationLease(owner: string, now = Date.now(), ttlMs = 5 * 60_000): boolean {
+		return this.acquireRecoveryMutex(owner, now, ttlMs);
+	}
+
+	releaseVaultMutationLease(owner: string): boolean {
+		return this.releaseRecoveryMutex(owner);
+	}
+
 	acquireRecoveryMutex(owner: string, now = Date.now(), ttlMs = 5 * 60_000): boolean {
 		this.initialize();
 		if (!owner || ttlMs <= 0) throw new Error("invalid recovery mutex");

@@ -18,6 +18,23 @@ import type { VaultSocketService } from "./vaultSocketService";
 
 const MAX_IDENTITY_LENGTH = 256;
 
+type AttachmentMutation =
+	| { operationId: string; kind: "upsert"; path: string; expectedRevision: string | null; hash: string; size: number; mime: string }
+	| { operationId: string; kind: "delete"; path: string; expectedRevision: string | null }
+	| { operationId: string; kind: "rename"; fromPath: string; toPath: string; expectedFromRevision: string; expectedToRevision: string | null };
+
+type AttachmentHeadSummary =
+	| { kind: "missing"; revision: null }
+	| { kind: "active"; revision: string; hash: string; size: number }
+	| { kind: "deleted"; revision: string; previousHash: string | null };
+
+type AttachmentTombstone = {
+	deletedAt: number;
+	device?: string;
+	previousHash: string | null;
+	revision: string;
+};
+
 function json(value: unknown, status = 200): Response {
 	return Response.json(value, { status, headers: { "cache-control": "no-store" } });
 }
@@ -246,88 +263,97 @@ export class VaultLifecycleService {
 		} catch {
 			return json({ error: "invalid_json" }, 400);
 		}
-		if (typeof decoded !== "object" || decoded === null || Array.isArray(decoded)) {
-			return json({ error: "invalid_attachment_publication" }, 400);
+		const mutation = this.parseAttachmentMutation(decoded);
+		if (!mutation) return json({ error: "invalid_attachment_publication" }, 400);
+		const requestDigest = await this.attachmentRequestDigest(mutation);
+		const replay = this.options.store.attachmentOperation(mutation.operationId);
+		const replayEvents = this.options.store.attachmentEventsForOperation(mutation.operationId);
+		if (replay || replayEvents.length > 0) return this.attachmentReplayResult(mutation, requestDigest, replay, replayEvents);
+		if (mutation.kind === "upsert" && !await this.options.hasBlob(mutation.hash)) {
+			return json({ error: "attachment_blob_missing" }, 409);
 		}
-		const value = decoded as Record<string, unknown>;
-		const operationId = value.operationId;
-		const kind = value.kind;
-		if (typeof operationId !== "string" || !validIdentity(operationId)
-			|| (kind !== "upsert" && kind !== "delete" && kind !== "rename")) {
-			return json({ error: "invalid_attachment_publication" }, 400);
-		}
-		const replay = this.options.store.attachmentEventsForOperation(operationId);
-		if (replay.length > 0) return this.attachmentReplay(operationId);
 		if (!await this.options.flush("root")) return json({ error: "root_persistence_unavailable" }, 503);
-		const current = this.options.store.reconstructDocument("root");
-		const vector = Y.encodeStateVector(current.doc);
-		const refs = current.doc.getMap<{ hash: string; size: number }>("pathToBlob");
-		const metadata = current.doc.getMap<{ size: number; mime: string; createdAt: number }>("blobMeta");
-		const tombstones = current.doc.getMap<{ deletedAt: number; device?: string; previousHash: string | null }>("blobTombstones");
-		const events: Array<Omit<AttachmentCatalogEvent, "sequence"> & { operationId: string }> = [];
+		const mutexOwner = `attachment:${mutation.operationId}:${crypto.randomUUID()}`;
+		if (!this.options.store.acquireVaultMutationLease(mutexOwner)) {
+			return json({ error: "attachment_mutation_busy" }, 503);
+		}
 		try {
-			if (kind === "upsert") {
-				const path = typeof value.path === "string" ? value.path : "";
-				const hash = typeof value.hash === "string" ? value.hash.toLowerCase() : "";
-				const size = value.size;
-				const mime = typeof value.mime === "string" ? value.mime : "";
-				const ref = { hash, size: typeof size === "number" ? size : -1 };
-				if (safeBlobPath(path, "", ref) !== path || !/^[a-f0-9]{64}$/.test(hash)
-					|| !Number.isSafeInteger(size) || (size as number) < 0 || (size as number) > MAX_BLOB_UPLOAD_BYTES
-					|| !mime || mime.length > 256) {
-					return json({ error: "invalid_attachment_upsert" }, 400);
-				}
-				if (!await this.options.hasBlob(hash)) {
-					return json({ error: "attachment_blob_missing" }, 409);
-				}
-				refs.set(path, { hash, size: size as number });
-				if (!metadata.has(hash)) metadata.set(hash, { size: size as number, mime, createdAt: Date.now() });
-				tombstones.delete(path);
-				events.push({ operationId, path, contentHash: hash, size: size as number, mime, lifecycle: "active" });
-			} else if (kind === "delete") {
-				const path = typeof value.path === "string" ? value.path : "";
-				if (safeBlobPath(path) !== path) return json({ error: "invalid_attachment_delete" }, 400);
-				const prior = refs.get(path);
-				refs.delete(path);
-				tombstones.set(path, {
-					deletedAt: Date.now(),
-					device: request.headers.get("x-yaos-device-id") ?? undefined,
-					previousHash: prior?.hash ?? null,
-				});
-				events.push({ operationId, path, contentHash: prior?.hash ?? null, size: prior?.size ?? null, mime: null, lifecycle: "deleted" });
-			} else {
-				const fromPath = typeof value.fromPath === "string" ? value.fromPath : "";
-				const toPath = typeof value.toPath === "string" ? value.toPath : "";
-				const prior = refs.get(fromPath);
-				if (!prior || safeBlobPath(fromPath) !== fromPath || safeBlobPath(toPath, "", prior) !== toPath) {
-					return json({ error: "invalid_attachment_rename" }, 400);
-				}
-				const meta = metadata.get(prior.hash);
-				refs.delete(fromPath);
-				refs.set(toPath, prior);
-				tombstones.set(fromPath, { deletedAt: Date.now(), previousHash: prior.hash });
-				tombstones.delete(toPath);
-				events.push(
-					{ operationId, path: fromPath, contentHash: prior.hash, size: prior.size, mime: meta?.mime ?? null, lifecycle: "deleted" },
-					{ operationId, path: toPath, contentHash: prior.hash, size: prior.size, mime: meta?.mime ?? null, lifecycle: "active" },
-				);
+			const insideReplay = this.options.store.attachmentOperation(mutation.operationId);
+			const insideReplayEvents = this.options.store.attachmentEventsForOperation(mutation.operationId);
+			if (insideReplay || insideReplayEvents.length > 0) {
+				return this.attachmentReplayResult(mutation, requestDigest, insideReplay, insideReplayEvents);
 			}
-			const update = Y.encodeStateAsUpdate(current.doc, vector);
-			if (update.byteLength === 0 || update.byteLength > MAX_JSON_BYTES) {
-				return json({ error: "invalid_attachment_root_update" }, 400);
+			const current = this.options.store.reconstructDocument("root");
+			try {
+				const vector = Y.encodeStateVector(current.doc);
+				const refs = current.doc.getMap<{ hash: string; size: number; revision: string }>("pathToBlob");
+				const metadata = current.doc.getMap<{ size: number; mime: string; createdAt: number }>("blobMeta");
+				const tombstones = current.doc.getMap<AttachmentTombstone>("blobTombstones");
+				const affected = mutation.kind === "rename" ? [mutation.fromPath, mutation.toPath] : [mutation.path];
+				for (const path of affected) {
+					const sql = this.options.store.attachmentHead(path);
+					if (!this.attachmentHeadIsConsistent(path, sql, refs, metadata, tombstones)) {
+						return json({ error: "attachment_catalog_root_mismatch" }, 500);
+					}
+				}
+				if (mutation.kind === "upsert") {
+					const meta = metadata.get(mutation.hash);
+					if (meta && (meta.size !== mutation.size
+						|| typeof meta.mime !== "string" || meta.mime.length === 0 || meta.mime.length > 256
+						|| !Number.isSafeInteger(meta.createdAt) || meta.createdAt < 0)) {
+						return json({ error: "attachment_catalog_root_mismatch" }, 500);
+					}
+				}
+				const checks = mutation.kind === "rename"
+					? [[mutation.fromPath, mutation.expectedFromRevision], [mutation.toPath, mutation.expectedToRevision]] as const
+					: [[mutation.path, mutation.expectedRevision]] as const;
+				for (const [path, expectedRevision] of checks) {
+					const currentHead = this.attachmentHeadSummary(path, refs, tombstones);
+					if (currentHead.revision !== expectedRevision) {
+						return this.attachmentRevisionMismatch(path, currentHead, affected, refs, tombstones);
+					}
+				}
+				if (mutation.kind === "rename") {
+					const sourceHead = this.attachmentHeadSummary(mutation.fromPath, refs, tombstones);
+					if (sourceHead.kind !== "active") {
+						return this.attachmentRevisionMismatch(mutation.fromPath, sourceHead, affected, refs, tombstones);
+					}
+				}
+				const events: Array<Omit<AttachmentCatalogEvent, "sequence"> & { operationId: string }> = [];
+				if (mutation.kind === "upsert") {
+					refs.set(mutation.path, { hash: mutation.hash, size: mutation.size, revision: mutation.operationId });
+					if (!metadata.has(mutation.hash)) metadata.set(mutation.hash, { size: mutation.size, mime: mutation.mime, createdAt: Date.now() });
+					tombstones.delete(mutation.path);
+					events.push({ operationId: mutation.operationId, path: mutation.path, contentHash: mutation.hash, size: mutation.size, mime: mutation.mime, lifecycle: "active" });
+				} else if (mutation.kind === "delete") {
+					const prior = refs.get(mutation.path);
+					const previousHash = prior?.hash ?? tombstones.get(mutation.path)?.previousHash ?? null;
+					refs.delete(mutation.path);
+					tombstones.set(mutation.path, { deletedAt: Date.now(), device: request.headers.get("x-yaos-device-id") ?? undefined,
+						previousHash, revision: mutation.operationId });
+					events.push({ operationId: mutation.operationId, path: mutation.path, contentHash: previousHash, size: prior?.size ?? null, mime: null, lifecycle: "deleted" });
+				} else {
+					const prior = refs.get(mutation.fromPath)!;
+					const meta = metadata.get(prior.hash);
+					refs.delete(mutation.fromPath);
+					refs.set(mutation.toPath, { ...prior, revision: mutation.operationId });
+					tombstones.set(mutation.fromPath, { deletedAt: Date.now(), previousHash: prior.hash, revision: mutation.operationId });
+					tombstones.delete(mutation.toPath);
+					events.push(
+						{ operationId: mutation.operationId, path: mutation.fromPath, contentHash: prior.hash, size: prior.size, mime: meta?.mime ?? null, lifecycle: "deleted" },
+						{ operationId: mutation.operationId, path: mutation.toPath, contentHash: prior.hash, size: prior.size, mime: meta?.mime ?? null, lifecycle: "active" },
+					);
+				}
+				const update = Y.encodeStateAsUpdate(current.doc, vector);
+				if (update.byteLength === 0 || update.byteLength > MAX_JSON_BYTES) return json({ error: "invalid_attachment_root_update" }, 400);
+				const commit = this.options.store.commitRootAttachments(update, events, { operationId: mutation.operationId, requestDigest });
+				this.applyRoot(update, commit.generation, request);
+				return this.attachmentReceipt(mutation.operationId, events, update, commit.vaultSequence, commit.generation);
+			} finally {
+				current.doc.destroy();
 			}
-			const commit = this.options.store.commitRootAttachments(update, events);
-			this.applyRoot(update, commit.generation, request);
-			return json({
-				operationId,
-				vaultGeneration: this.options.vaultGeneration(),
-				runtimeEpoch: this.options.runtimeEpoch,
-				vaultSequence: commit.vaultSequence,
-				rootGeneration: commit.generation,
-				rootUpdateBase64Url: bytesToBase64Url(update),
-			});
 		} finally {
-			current.doc.destroy();
+			this.options.store.releaseVaultMutationLease(mutexOwner);
 		}
 	}
 
@@ -439,23 +465,192 @@ export class VaultLifecycleService {
 		const root = this.options.store.reconstructDocument("root");
 		try {
 			const events = this.options.store.attachmentEventsForOperation(operationId);
-			return json({
+			const operation = this.options.store.attachmentOperation(operationId);
+			if (!operation || events.length === 0) return json({ error: "attachment_replay_corrupt" }, 500);
+			return this.attachmentReceipt(
 				operationId,
-				vaultGeneration: this.options.vaultGeneration(),
-				runtimeEpoch: this.options.runtimeEpoch,
-				vaultSequence: Math.max(...events.map((event) => event.sequence)),
-				rootGeneration: root.generation,
-				rootUpdateBase64Url: bytesToBase64Url(Y.encodeStateAsUpdate(root.doc)),
-			});
+				events,
+				Y.encodeStateAsUpdate(root.doc),
+				operation.rootSequence,
+				root.generation,
+			);
 		} finally {
 			root.doc.destroy();
 		}
 	}
 
-	private applyRoot(update: Uint8Array, generation: number, origin: unknown): void {
-		if (this.options.cache.applyDurableUpdate("root", update, generation, origin)) {
-			this.options.sockets().broadcastDocumentUpdate("root", update, origin);
+	private attachmentReplayResult(
+		mutation: AttachmentMutation,
+		requestDigest: string,
+		operation: ReturnType<VaultStore["attachmentOperation"]>,
+		events: AttachmentCatalogEvent[],
+	): Response {
+		if (!operation || events.length === 0
+			|| !Number.isSafeInteger(operation.rootSequence) || operation.rootSequence <= 0
+			|| !Number.isSafeInteger(operation.rootGeneration) || operation.rootGeneration <= 0
+			|| !/^[a-f0-9]{64}$/.test(operation.requestDigest)
+			|| events.some((event) => event.operationId !== mutation.operationId || event.sequence !== operation.rootSequence)) {
+			return json({ error: "attachment_replay_corrupt" }, 500);
 		}
+		if (operation.requestDigest !== requestDigest) return json({ error: "attachment_operation_identity_mismatch" }, 409);
+		if (!this.attachmentReplayEventsMatchMutation(mutation, events)) return json({ error: "attachment_replay_corrupt" }, 500);
+		return this.attachmentReplay(mutation.operationId);
+	}
+
+	private attachmentReplayEventsMatchMutation(mutation: AttachmentMutation, events: AttachmentCatalogEvent[]): boolean {
+		if (new Set(events.map((event) => event.path)).size !== events.length) return false;
+		if (mutation.kind === "upsert") {
+			const event = events[0];
+			return events.length === 1 && event?.path === mutation.path && event.lifecycle === "active"
+				&& event.contentHash === mutation.hash && event.size === mutation.size && event.mime === mutation.mime;
+		}
+		if (mutation.kind === "delete") {
+			return events.length === 1 && events[0]?.path === mutation.path && events[0].lifecycle === "deleted";
+		}
+		if (events.length !== 2) return false;
+		const source = events.find((event) => event.path === mutation.fromPath);
+		const target = events.find((event) => event.path === mutation.toPath);
+		return source?.lifecycle === "deleted" && target?.lifecycle === "active"
+			&& source.contentHash !== null && source.contentHash === target.contentHash
+			&& source.size === target.size;
+	}
+
+	private attachmentRevisionMismatch(
+		path: string,
+		current: AttachmentHeadSummary,
+		affected: string[],
+		refs: Y.Map<{ hash: string; size: number; revision: string }>,
+		tombstones: Y.Map<AttachmentTombstone>,
+	): Response {
+		return json({
+			error: "attachment_revision_mismatch",
+			path,
+			current,
+			currentHeads: affected.map((affectedPath) => ({
+				path: affectedPath,
+				head: this.attachmentHeadSummary(affectedPath, refs, tombstones),
+			})),
+			vaultGeneration: this.options.vaultGeneration(),
+			vaultSequence: this.options.store.currentSequence(),
+		}, 409);
+	}
+
+	private attachmentHeadIsConsistent(
+		path: string,
+		sql: AttachmentCatalogEvent | null,
+		refs: Y.Map<{ hash: string; size: number; revision: string }>,
+		metadata: Y.Map<{ size: number; mime: string; createdAt: number }>,
+		tombstones: Y.Map<AttachmentTombstone>,
+	): boolean {
+		const ref = refs.get(path);
+		const tombstone = tombstones.get(path);
+		if (ref && tombstone) return false;
+		if (!ref && !tombstone) return sql === null;
+		if (ref) {
+			const meta = metadata.get(ref.hash);
+			return validIdentity(ref.revision)
+				&& /^[a-f0-9]{64}$/.test(ref.hash)
+				&& Number.isSafeInteger(ref.size) && ref.size >= 0 && ref.size <= MAX_BLOB_UPLOAD_BYTES
+				&& !!meta && meta.size === ref.size
+				&& typeof meta.mime === "string" && meta.mime.length > 0 && meta.mime.length <= 256
+				&& Number.isSafeInteger(meta.createdAt) && meta.createdAt >= 0
+				&& sql?.lifecycle === "active"
+				&& sql.operationId === ref.revision
+				&& sql.contentHash === ref.hash
+				&& sql.size === ref.size;
+		}
+		return !!tombstone
+			&& validIdentity(tombstone.revision)
+			&& Number.isSafeInteger(tombstone.deletedAt) && tombstone.deletedAt >= 0
+			&& (tombstone.device === undefined || validIdentity(tombstone.device))
+			&& (tombstone.previousHash === null || /^[a-f0-9]{64}$/.test(tombstone.previousHash))
+			&& sql?.lifecycle === "deleted"
+			&& sql.operationId === tombstone.revision
+			&& sql.contentHash === tombstone.previousHash;
+	}
+
+	private attachmentReceipt(
+		operationId: string,
+		events: Array<Pick<AttachmentCatalogEvent, "path" | "lifecycle">>,
+		update: Uint8Array,
+		vaultSequence: number,
+		rootGeneration: number,
+	): Response {
+		return json({
+			operationId,
+			outcome: "committed",
+			revisions: events.map((event) => ({
+				path: event.path,
+				revision: operationId,
+				state: event.lifecycle,
+			})),
+			vaultGeneration: this.options.vaultGeneration(),
+			runtimeEpoch: this.options.runtimeEpoch,
+			vaultSequence,
+			rootGeneration,
+			rootUpdateBase64Url: bytesToBase64Url(update),
+		});
+	}
+
+	private parseAttachmentMutation(decoded: unknown): AttachmentMutation | null {
+		if (typeof decoded !== "object" || decoded === null || Array.isArray(decoded)) return null;
+		const value = decoded as Record<string, unknown>;
+		if (!validIdentity(value.operationId)) return null;
+		const validRevision = (revision: unknown): revision is string | null => revision === null || validIdentity(revision);
+		const exactKeys = (keys: string[]): boolean => {
+			const actual = Object.keys(value).sort();
+			return actual.length === keys.length && actual.every((key, index) => key === [...keys].sort()[index]);
+		};
+		if (value.kind === "upsert") {
+			const hash = typeof value.hash === "string" ? value.hash.toLowerCase() : "";
+			const ref = { hash, size: typeof value.size === "number" ? value.size : -1 };
+			if (!exactKeys(["operationId", "kind", "path", "expectedRevision", "hash", "size", "mime"])
+				|| typeof value.path !== "string" || safeBlobPath(value.path, "", ref) !== value.path
+				|| !validRevision(value.expectedRevision) || !/^[a-f0-9]{64}$/.test(hash)
+				|| !Number.isSafeInteger(value.size) || (value.size as number) < 0 || (value.size as number) > MAX_BLOB_UPLOAD_BYTES
+				|| typeof value.mime !== "string" || !value.mime || value.mime.length > 256) return null;
+			return { operationId: value.operationId, kind: "upsert", path: value.path, expectedRevision: value.expectedRevision,
+				hash, size: value.size as number, mime: value.mime };
+		}
+		if (value.kind === "delete") {
+			if (!exactKeys(["operationId", "kind", "path", "expectedRevision"])
+				|| typeof value.path !== "string" || safeBlobPath(value.path) !== value.path
+				|| !validRevision(value.expectedRevision)) return null;
+			return { operationId: value.operationId, kind: "delete", path: value.path, expectedRevision: value.expectedRevision };
+		}
+		if (value.kind === "rename") {
+			if (!exactKeys(["operationId", "kind", "fromPath", "toPath", "expectedFromRevision", "expectedToRevision"])
+				|| typeof value.fromPath !== "string" || safeBlobPath(value.fromPath) !== value.fromPath
+				|| typeof value.toPath !== "string" || safeBlobPath(value.toPath) !== value.toPath
+				|| value.fromPath === value.toPath || !validIdentity(value.expectedFromRevision)
+				|| !validRevision(value.expectedToRevision)) return null;
+			return { operationId: value.operationId, kind: "rename", fromPath: value.fromPath, toPath: value.toPath,
+				expectedFromRevision: value.expectedFromRevision, expectedToRevision: value.expectedToRevision };
+		}
+		return null;
+	}
+
+	private async attachmentRequestDigest(mutation: AttachmentMutation): Promise<string> {
+		const bytes = new TextEncoder().encode(canonicalJsonText(mutation));
+		const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+		return [...digest].map((value) => value.toString(16).padStart(2, "0")).join("");
+	}
+
+	private attachmentHeadSummary(
+		path: string,
+		refs: Y.Map<{ hash: string; size: number; revision: string }>,
+		tombstones: Y.Map<AttachmentTombstone>,
+	): AttachmentHeadSummary {
+		const ref = refs.get(path);
+		if (ref) return { kind: "active", revision: ref.revision, hash: ref.hash, size: ref.size };
+		const tombstone = tombstones.get(path);
+		if (tombstone) return { kind: "deleted", revision: tombstone.revision, previousHash: tombstone.previousHash };
+		return { kind: "missing", revision: null };
+	}
+
+	private applyRoot(update: Uint8Array, generation: number, origin: unknown): void {
+		this.options.cache.applyDurableUpdate("root", update, generation, origin);
+		this.options.sockets().broadcastDocumentUpdate("root", update, origin);
 	}
 	private publicationMatches(update: Uint8Array, records: DurableLifecycleRecord[]): boolean {
 		const reconstructed = this.options.store.reconstructDocument("root");

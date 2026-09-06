@@ -126,6 +126,7 @@ export class VaultStore extends RecoveryAuthorityStore {
 				"vault_lifecycle_receipts",
 				"vault_creation_candidates",
 				"vault_candidate_receipts",
+				"vault_attachment_operations",
 				"vault_attachment_catalog_events",
 				"vault_catalog_events",
 				"vault_checkpoints",
@@ -250,6 +251,7 @@ export class VaultStore extends RecoveryAuthorityStore {
 		completeCreations?: Array<{ bodyId: string; candidateId: string; candidateDigest: string }>;
 		rootPublications?: Array<{ operationId: string; lifecycleSequence: number; vaultGeneration: string; runtimeEpoch: string }>;
 		attachmentCatalog?: Array<Omit<AttachmentCatalogEvent, "sequence"> & { operationId: string }>;
+		attachmentOperation?: { operationId: string; requestDigest: string };
 		provisioning?: { vaultId: string; vaultGeneration: string; provisionedAt: number };
 		now?: number;
 	}): DurableCommitResult {
@@ -265,7 +267,7 @@ export class VaultStore extends RecoveryAuthorityStore {
 		}
 		for (const publication of input.rootPublications ?? []) this.assertVaultGeneration(publication.vaultGeneration);
 		if ((input.lifecycleReceipt || input.lifecycleReceipts || input.completeCreation
-			|| input.completeCreations || input.rootPublications || input.attachmentCatalog) && input.documentId !== "root") {
+			|| input.completeCreations || input.rootPublications || input.attachmentCatalog || input.attachmentOperation) && input.documentId !== "root") {
 			throw new Error("root publication metadata must commit through root");
 		}
 		if (input.completeCreation && !input.lifecycleReceipt) {
@@ -415,6 +417,20 @@ export class VaultStore extends RecoveryAuthorityStore {
 				inserted.toArray();
 				rowsWritten += inserted.rowsWritten;
 			}
+			if (input.attachmentOperation) {
+				const inserted = this.storage.sql.exec(
+					`INSERT INTO vault_attachment_operations(
+					 operation_id, request_digest, root_sequence, root_generation, created_at
+					 ) VALUES (?, ?, ?, ?, ?)`,
+					input.attachmentOperation.operationId,
+					input.attachmentOperation.requestDigest,
+					sequence,
+					generation,
+					now,
+				);
+				inserted.toArray();
+				rowsWritten += inserted.rowsWritten;
+			}
 			if (input.provisioning) {
 				const inserted = this.storage.sql.exec(
 					`INSERT INTO vault_meta(
@@ -459,8 +475,20 @@ export class VaultStore extends RecoveryAuthorityStore {
 		});
 	}
 
-	commitRootAttachments(rootUpdate: Uint8Array, events: Array<Omit<AttachmentCatalogEvent, "sequence"> & { operationId: string }>, now = Date.now()): DurableCommitResult {
+	commitRootAttachments(
+		rootUpdate: Uint8Array,
+		events: Array<Omit<AttachmentCatalogEvent, "sequence"> & { operationId: string }>,
+		operation: { operationId: string; requestDigest: string },
+		now = Date.now(),
+	): DurableCommitResult {
 		if (events.length === 0) throw new Error("attachment publication requires an event");
-		return this.commitUpdate({ documentId: "root", update: rootUpdate, kind: "blob", attachmentCatalog: events, now });
+		if (!operation.operationId || operation.operationId.length > 256
+			|| !/^[a-f0-9]{64}$/.test(operation.requestDigest)
+			|| events.length > 2
+			|| new Set(events.map((event) => event.path)).size !== events.length
+			|| events.some((event) => event.operationId !== operation.operationId)) {
+			throw new Error("invalid attachment publication commit");
+		}
+		return this.commitUpdate({ documentId: "root", update: rootUpdate, kind: "blob", attachmentCatalog: events, attachmentOperation: operation, now });
 	}
 }
