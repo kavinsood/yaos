@@ -24,7 +24,16 @@ export async function enableYaosAndWait(
 	client: ObsidianClient,
 	timeoutMs = 30_000,
 ): Promise<boolean> {
-	await client.evalRaw(`app.plugins.enablePlugin("yaos")`);
+	await client.evalRaw(`
+		(async () => {
+			await app.plugins.enablePlugin("yaos");
+			await new Promise(resolve => setTimeout(resolve, 250));
+			if (app.plugins?.plugins?.["yaos-qa-harness"]) {
+				await app.plugins.disablePlugin("yaos-qa-harness");
+			}
+			await app.plugins.enablePlugin("yaos-qa-harness");
+		})()
+	`);
 	return client.evalRaw<boolean>(`
 		(async () => {
 			const deadline = Date.now() + ${timeoutMs};

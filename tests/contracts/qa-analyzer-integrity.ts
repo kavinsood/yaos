@@ -9,7 +9,7 @@ const s = suite("qa-analyzer-integrity");
 
 const validEvent = JSON.stringify({
 	eventSchemaVersion: 1,
-	taxonomyVersion: 13,
+	taxonomyVersion: 14,
 	ts: 1,
 	seq: 1,
 	kind: "provider.connected",
@@ -37,10 +37,10 @@ const validHeader = JSON.stringify({
 	versions: {
 		pluginVersion: "1.2.3",
 		serverVersion: null,
-		documentSchemaVersionSupportedByClient: 3,
-		documentSchemaVersionStoredInDocument: 3,
+		documentSchemaVersionSupportedByClient: 5,
+		documentSchemaVersionStoredInDocument: 5,
 		flightEventSchemaVersion: 1,
-		flightEventTaxonomyVersion: 13,
+		flightEventTaxonomyVersion: 14,
 	},
 	platform: {
 		obsidianApiVersion: "1.8.10",
@@ -228,7 +228,7 @@ s.section("Test 8: exported controller trace passes the analyzer");
 		app: { vault: { configDir: ".obsidian", adapter } } as never,
 		getSettings: () => settings as never,
 		getPluginVersion: () => "2.1.0",
-		getDocSchemaVersion: () => 3,
+		getDocSchemaVersion: () => 5,
 		buildCheckpoint: async () => ({}),
 		collectTraceHeaderInput: async () => null,
 		isIndexedDbRelatedError: () => false,
@@ -251,7 +251,7 @@ s.section("Test 8: exported controller trace passes the analyzer");
 		const event = lines[1];
 		s.check(
 			event?.eventSchemaVersion === 1
-				&& event.taxonomyVersion === 13
+				&& event.taxonomyVersion === 14
 				&& typeof event.traceId === "string"
 				&& typeof event.bootId === "string",
 			"actual exported event carries the current envelope",

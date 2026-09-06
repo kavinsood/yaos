@@ -5,6 +5,7 @@ type Expectation = {
 	name: string;
 	scenarioIds: string[];
 	requiredKinds: string[];
+	requiredAnyKinds?: string[][];
 	forbiddenKinds?: string[];
 	allowedReasons?: string[];
 	pathFilter?: (event: FlightEvent) => boolean;
@@ -22,6 +23,18 @@ const S07G_IDS = [
 ];
 
 const EXPECTATIONS: Expectation[] = [
+	{
+		name: "attachment-intent-field-shapes",
+		scenarioIds: ["attachment-intent-field-shapes"],
+		requiredKinds: [
+			"attachment.intent.created",
+			"attachment.publication.committed",
+		],
+		requiredAnyKinds: [[
+			"attachment.transfer.uploaded",
+			"attachment.transfer.object_present",
+		]],
+	},
 	{
 		name: "issue-25-forced-recovery-local-only",
 		scenarioIds: ["issue-25-editor-bound-loop-forced-recovery-local-only"],
@@ -93,6 +106,17 @@ export function checkScenarioExpectations(
 						`Scenario ${scenarioId} expected ${kind} for reasons ` +
 						`${expectation.allowedReasons?.join(", ") ?? "(any)"} ` +
 						"but none were observed in the trace.",
+				});
+			}
+		}
+
+		for (const kinds of expectation.requiredAnyKinds ?? []) {
+			if (!events.some((event) => kinds.includes(event.kind))) {
+				findings.push({
+					rule: "scenario-expectation-missing",
+					severity: "hard",
+					eventSeqs: [],
+					description: `Scenario ${scenarioId} expected one of ${kinds.join(", ")} but none were observed in the trace.`,
 				});
 			}
 		}

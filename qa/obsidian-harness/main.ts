@@ -25,6 +25,7 @@ import type { ReconciliationController } from "../../src/runtime/reconciliationC
 import type { ConnectionController } from "../../src/runtime/connectionController";
 import type { EditorBindingManager } from "../../src/sync/editorBinding";
 import type { EngineControlPort } from "../../src/runtime/engineControlPort";
+import { sha256TextHex } from "../../src/utils/sha256";
 
 /**
  * The private surface of the product plugin that this harness reaches for.
@@ -49,7 +50,6 @@ interface ProductInternals {
 	readonly connectionController: ConnectionController | null;
 	readonly editorBindings: EditorBindingManager | null;
 	readonly lab: TelemetryRuntimeHandle | null | undefined;
-	sha256Hex(text: string): Promise<string>;
 	getEngineControlPort(): EngineControlPort;
 	setQaNetworkHold(mode: "offline" | "online"): void;
 }
@@ -309,7 +309,6 @@ export default class YaosQaHarnessPlugin extends Plugin {
 		const probes: ReadonlyArray<readonly [string, "method" | "field", string]> = [
 			["getEngineControlPort", "method", "The vault is loading the production main.js instead of the QA product build. Run: npm run build:qa-product, then re-run qa:prepare."],
 			["setQaNetworkHold", "method", "Same cause as getEngineControlPort — this is the other QA-only accessor attached under __YAOS_QA_HARNESS_ENABLED__."],
-			["sha256Hex", "method", "Renamed or removed from the product plugin class."],
 			["vaultSync", "field", "Renamed or removed from the product plugin class."],
 			["connectionController", "field", "Renamed or removed from the product plugin class."],
 			["editorBindings", "field", "Renamed or removed from the product plugin class."],
@@ -376,7 +375,7 @@ export default class YaosQaHarnessPlugin extends Plugin {
 			getFlightTraceController: () => lab.getFlightTraceController?.() ?? null,
 			getEditorBindings: () => product.editorBindings ?? null,
 			getDiagnosticsDir: () => undefined,
-			sha256Hex: (text: string) => product.sha256Hex(text),
+			sha256Hex: sha256TextHex,
 			// No start/stop bridge: the recorder follows the product's
 			// settings.debug, which qa/scripts/prepare-vault-lib.ts sets to true.
 			//
