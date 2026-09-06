@@ -23,6 +23,10 @@ function makeSnapshot(overrides: Partial<SyncFactsSnapshot> = {}): SyncFactsSnap
 		lastLocalUpdateWhileConnectedAt: null,
 		lastRemoteUpdateAt: null,
 		pendingBlobUploads: 0,
+		pendingAttachmentPublications: 0,
+		attachmentReconciliationPending: false,
+		permanentAttachmentTransferFailures: 0,
+		fatalAttachmentPublications: 0,
 		...overrides,
 	};
 }
@@ -118,5 +122,21 @@ s.section("Test 12: pendingBlobUploads flows through deriveSyncFacts");
 {
 	const facts = deriveSyncFacts(makeSnapshot({ pendingBlobUploads: 3 }), "offline");
 	s.check(facts.pendingBlobUploads === 3, "pendingBlobUploads passed through");
+}
+
+s.section("Test 13: attachment work classes remain separate status facts");
+{
+	const facts = deriveSyncFacts(makeSnapshot({
+		pendingBlobUploads: 2,
+		pendingAttachmentPublications: 3,
+		attachmentReconciliationPending: true,
+		permanentAttachmentTransferFailures: 4,
+		fatalAttachmentPublications: 1,
+	}), "offline");
+	s.check(facts.pendingBlobUploads === 2, "byte transfers remain distinct from publication operations");
+	s.check(facts.pendingAttachmentPublications === 3, "durable attachment publications are reported separately");
+	s.check(facts.attachmentReconciliationPending, "superseded attachment reconciliation is visible");
+	s.check(facts.permanentAttachmentTransferFailures === 4, "permanent transfer failures are visible");
+	s.check(facts.fatalAttachmentPublications === 1, "fatal publication failures are visible");
 }
 await s.done();

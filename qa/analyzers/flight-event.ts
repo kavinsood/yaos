@@ -44,7 +44,7 @@ export interface NdjsonParseResult {
 }
 const TRACE_HEADER_FORMAT_VERSION = 1;
 const CURRENT_EVENT_SCHEMA_VERSION = 1;
-const CURRENT_TAXONOMY_VERSION = 13;
+const CURRENT_TAXONOMY_VERSION = 14;
 
 function isTraceHeader(value: unknown): boolean {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return false;

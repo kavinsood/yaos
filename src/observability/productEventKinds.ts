@@ -47,6 +47,17 @@ export const PRODUCT_EVENT_KIND = {
 	attachmentDownloadDecision: FLIGHT_KIND.attachmentDownloadDecision,
 	attachmentDownloadComplete: FLIGHT_KIND.attachmentDownloadComplete,
 	attachmentIntegrityFailed: FLIGHT_KIND.attachmentIntegrityFailed,
+	attachmentIntentCreated: FLIGHT_KIND.attachmentIntentCreated,
+	attachmentIntentSupersededLocal: FLIGHT_KIND.attachmentIntentSupersededLocal,
+	attachmentIntentQuiesced: FLIGHT_KIND.attachmentIntentQuiesced,
+	attachmentTransferObjectPresent: FLIGHT_KIND.attachmentTransferObjectPresent,
+	attachmentTransferUploaded: FLIGHT_KIND.attachmentTransferUploaded,
+	attachmentPublicationDurablePending: FLIGHT_KIND.attachmentPublicationDurablePending,
+	attachmentPublicationCommitted: FLIGHT_KIND.attachmentPublicationCommitted,
+	attachmentPublicationSupersededRemote: FLIGHT_KIND.attachmentPublicationSupersededRemote,
+	attachmentPublicationReplayed: FLIGHT_KIND.attachmentPublicationReplayed,
+	attachmentPublicationIdentityMismatch: FLIGHT_KIND.attachmentPublicationIdentityMismatch,
+	attachmentPublicationMutationBusy: FLIGHT_KIND.attachmentPublicationMutationBusy,
 
 	// Reconcile
 	reconcileStart: FLIGHT_KIND.reconcileStart,

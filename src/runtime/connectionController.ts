@@ -57,6 +57,12 @@ const FAST_RECONNECT_MIN_INTERVAL_MS = 2_000;
 
 interface ConnectionControllerDeps {
 	getVaultSync(): VaultSync | null;
+	getAttachmentStatus?(): {
+		pendingPublications: number;
+		reconciliationPending: boolean;
+		permanentTransferFailures: number;
+		fatalPublications: number;
+	};
 	isReconciled(): boolean;
 	getAwaitingFirstProviderSyncAfterStartup(): boolean;
 	setAwaitingFirstProviderSyncAfterStartup(value: boolean): void;
@@ -139,6 +145,15 @@ export class ConnectionController {
 	getSyncFacts(blobPendingUploads = 0): SyncFacts {
 		const sync = this.deps.getVaultSync();
 		const state = this.getState();
+		const attachmentStatus = this.deps.getAttachmentStatus?.() ?? {
+			pendingPublications: Math.max(
+				0,
+				(sync?.pendingAttachmentOperations ?? 0) - (sync?.fatalAttachmentPublications ?? 0),
+			),
+			reconciliationPending: false,
+			permanentTransferFailures: 0,
+			fatalPublications: sync?.fatalAttachmentPublications ?? 0,
+		};
 		return deriveSyncFacts(
 			{
 				connected: sync?.connected ?? false,
@@ -148,6 +163,10 @@ export class ConnectionController {
 				lastLocalUpdateWhileConnectedAt: sync?.lastLocalUpdateWhileConnectedAt ?? null,
 				lastRemoteUpdateAt: sync?.lastRemoteUpdateAt ?? null,
 				pendingBlobUploads: blobPendingUploads,
+				pendingAttachmentPublications: attachmentStatus.pendingPublications,
+				attachmentReconciliationPending: attachmentStatus.reconciliationPending,
+				permanentAttachmentTransferFailures: attachmentStatus.permanentTransferFailures,
+				fatalAttachmentPublications: attachmentStatus.fatalPublications,
 				serverReceipt: sync?.getServerReceiptSnapshot() ?? null,
 			},
 			state.kind,

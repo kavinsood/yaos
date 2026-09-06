@@ -22,7 +22,7 @@
  * references these constants rather than repeating their strings.
  */
 
-export const FLIGHT_TAXONOMY_VERSION = 13; // added unified debug trace event/checkpoint kinds
+export const FLIGHT_TAXONOMY_VERSION = 14; // added revisioned attachment intent/publication lifecycle kinds
 
 export type FlightSeverity = "debug" | "info" | "warn" | "error";
 export type FlightScope =
@@ -129,6 +129,17 @@ export const FLIGHT_KIND = {
 	attachmentDownloadDecision: "attachment.download.decision",
 	attachmentDownloadComplete: "attachment.download.complete",
 	attachmentIntegrityFailed: "attachment.integrity.failed",
+	attachmentIntentCreated: "attachment.intent.created",
+	attachmentIntentSupersededLocal: "attachment.intent.superseded_local",
+	attachmentIntentQuiesced: "attachment.intent.quiesced",
+	attachmentTransferObjectPresent: "attachment.transfer.object_present",
+	attachmentTransferUploaded: "attachment.transfer.uploaded",
+	attachmentPublicationDurablePending: "attachment.publication.durable_pending",
+	attachmentPublicationCommitted: "attachment.publication.committed",
+	attachmentPublicationSupersededRemote: "attachment.publication.superseded_remote",
+	attachmentPublicationReplayed: "attachment.publication.replayed",
+	attachmentPublicationIdentityMismatch: "attachment.publication.identity_mismatch",
+	attachmentPublicationMutationBusy: "attachment.publication.mutation_busy",
 
 	// Reconcile
 	reconcileStart: "reconcile.start",

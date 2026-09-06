@@ -73,6 +73,14 @@ export interface SyncFacts {
 
 	/** Count of blob uploads pending. */
 	pendingBlobUploads: number;
+	/** Catalog publications already durable locally and awaiting terminal server outcome. */
+	pendingAttachmentPublications: number;
+	/** A superseded attachment publication is waiting for conservative reconciliation. */
+	attachmentReconciliationPending: boolean;
+	/** Transfer failures which exhausted their retry budget. */
+	permanentAttachmentTransferFailures: number;
+	/** Durable publications stopped on fatal proof or protocol failures. */
+	fatalAttachmentPublications: number;
 
 	/** Canonical server-receipt facts, or null before the sync runtime exists. */
 	serverReceipt: SyncFactsReceipt | null;
@@ -89,6 +97,10 @@ export interface SyncFactsSnapshot {
 	lastLocalUpdateWhileConnectedAt: number | null;
 	lastRemoteUpdateAt: number | null;
 	pendingBlobUploads: number;
+	pendingAttachmentPublications: number;
+	attachmentReconciliationPending: boolean;
+	permanentAttachmentTransferFailures: number;
+	fatalAttachmentPublications: number;
 	serverReceipt?: SyncFactsReceipt | null;
 }
 
@@ -137,6 +149,10 @@ export function deriveSyncFacts(
 		lastRemoteUpdateAt: snapshot.lastRemoteUpdateAt,
 		pendingLocalCount,
 		pendingBlobUploads: snapshot.pendingBlobUploads,
+		pendingAttachmentPublications: snapshot.pendingAttachmentPublications,
+		attachmentReconciliationPending: snapshot.attachmentReconciliationPending,
+		permanentAttachmentTransferFailures: snapshot.permanentAttachmentTransferFailures,
+		fatalAttachmentPublications: snapshot.fatalAttachmentPublications,
 		serverReceipt: snapshot.serverReceipt ?? null,
 		headlineState,
 	};

@@ -192,6 +192,10 @@ function makeState(overrides: Partial<TraceHeaderStateInput> = {}): TraceHeaderS
 			lastRemoteUpdateAt: null,
 			pendingLocalCount: null,
 			pendingBlobUploads: 0,
+			pendingAttachmentPublications: 0,
+			attachmentReconciliationPending: false,
+			permanentAttachmentTransferFailures: 0,
+			fatalAttachmentPublications: 0,
 			// FU-8 receipt facts: connected fixture with nothing in flight.
 			serverReceipt: {
 				serverAppliedLocalState: true,

@@ -51,6 +51,7 @@ export type RuntimeDiagnosticsState = Readonly<
 		| "untrackedFileCount"
 	> & {
 		awaitingFirstProviderSyncAfterStartup: boolean;
+		attachmentReconciliationPending: boolean;
 		openFileCount: number;
 		recovery: {
 			readiness: RecoveryReadiness;
@@ -93,6 +94,8 @@ export interface SyncReadPort {
 	readonly providerSynced: boolean;
 	readonly isInitialized: boolean;
 	readonly connectionGeneration: number;
+	readonly pendingAttachmentOperations: number;
+	readonly fatalAttachmentPublications: number;
 
 	// ------------------------------------------------------------------
 	// Timestamp state
@@ -151,6 +154,8 @@ export interface DiskMirrorSnapshot {
 export interface BlobSyncSnapshot {
 	readonly pendingUploads: number;
 	readonly pendingDownloads: number;
+	readonly permanentUploadFailures: number;
+	readonly permanentDownloadFailures: number;
 }
 
 export interface TelemetryRuntimeHost {

@@ -112,6 +112,15 @@ export class DiagnosticsService {
 				lastLocalUpdateWhileConnectedAt: vaultSync.lastLocalUpdateWhileConnectedAt,
 				lastRemoteUpdateAt: vaultSync.lastRemoteUpdateAt,
 				pendingBlobUploads: blobSyncSnapshot?.pendingUploads ?? 0,
+				pendingAttachmentPublications: Math.max(
+					0,
+					vaultSync.pendingAttachmentOperations - vaultSync.fatalAttachmentPublications,
+				),
+				attachmentReconciliationPending: state.attachmentReconciliationPending,
+				permanentAttachmentTransferFailures:
+					(blobSyncSnapshot?.permanentUploadFailures ?? 0)
+					+ (blobSyncSnapshot?.permanentDownloadFailures ?? 0),
+				fatalAttachmentPublications: vaultSync.fatalAttachmentPublications,
 				serverReceipt: vaultSync.serverReceipt,
 			},
 			vaultSync.connected
