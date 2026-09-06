@@ -17,6 +17,8 @@ export interface BlobRef {
 	hash: string;
 	/** File size in bytes (denormalized for quick checks without HEAD). */
 	size: number;
+	/** Successful attachment operation which created this path head. */
+	revision: string;
 }
 
 /**
@@ -44,7 +46,14 @@ export interface BlobTombstone {
 	deletedAt: number;
 	/** Device that performed the delete. */
 	device?: string;
+	previousHash: string | null;
+	revision: string;
 }
+
+export type AttachmentHead =
+	| { kind: "missing"; revision: null }
+	| { kind: "active"; revision: string; hash: string; size: number }
+	| { kind: "deleted"; revision: string; previousHash: string | null };
 
 // File classification
 // -------------------------------------------------------------------

@@ -8,6 +8,13 @@ import { partialOf } from "../mocks/productFixture.ts";
 import { suite, until } from "../harness.ts";
 
 const s = suite("attachment-orchestrator-queue-lifecycle");
+const TEST_QUEUE_SCOPE = {
+	host: "https://worker.example",
+	vaultId: "vault",
+	vaultGeneration: "generation",
+	deviceId: "device",
+	folderKey: "folder",
+};
 
 function assertSnapshot(
 	actual: BlobQueueSnapshot | null,
@@ -95,23 +102,36 @@ function makeFixture(initialPersistedQueue: BlobQueueSnapshot | null): Fixture {
 		},
 	});
 
-	const attachmentRefs = new Map<string, { hash: string; size: number }>(
+	const attachmentRefs = new Map<string, { hash: string; size: number; revision: string }>(
 		(initialPersistedQueue?.downloads ?? []).flatMap((download) =>
 			download.sizeBytes === undefined
 				? []
-				: [[download.path, { hash: download.hash, size: download.sizeBytes }]],
+				: [[download.path, { hash: download.hash, size: download.sizeBytes, revision: "seed" }]],
 		),
 	);
 	const vaultSync = partialOf<VaultSync>({
 		listAttachmentRefs: () => attachmentRefs,
 		getAttachmentRef: (path) => attachmentRefs.get(path),
+		getObservedAttachmentHead: (path) => {
+			const ref = attachmentRefs.get(path);
+			return ref
+				? { kind: "active", revision: ref.revision, hash: ref.hash, size: ref.size }
+				: { kind: "missing", revision: null };
+		},
+		getProjectedAttachmentHead: (path) => {
+			const ref = attachmentRefs.get(path);
+			return ref
+				? { kind: "active", revision: ref.revision, hash: ref.hash, size: ref.size }
+				: { kind: "missing", revision: null };
+		},
 		isAttachmentTombstoned: () => false,
-		setAttachmentRef: async (path, hash, size) => { attachmentRefs.set(path, { hash, size }); },
-		deleteAttachmentRef: async (path) => { attachmentRefs.delete(path); },
+		setAttachmentRef: async (path, hash, size) => { const revision = crypto.randomUUID(); attachmentRefs.set(path, { hash, size, revision }); return { kind: "committed", revision }; },
+		deleteAttachmentRef: async (path) => { attachmentRefs.delete(path); return { kind: "committed", revision: crypto.randomUUID() }; },
 		renameAttachmentRef: async (oldPath, newPath) => {
 			const ref = attachmentRefs.get(oldPath);
 			if (ref) attachmentRefs.set(newPath, ref);
 			attachmentRefs.delete(oldPath);
+			return { kind: "committed", revision: crypto.randomUUID() };
 		},
 		observeAttachmentChanges: () => () => {},
 	});
@@ -131,6 +151,7 @@ function makeFixture(initialPersistedQueue: BlobQueueSnapshot | null): Fixture {
 		getServerSupportsAttachments: () => true,
 		getTraceHttpContext: () => undefined,
 		getBlobHashCache: () => ({}),
+		getBlobQueueScope: () => TEST_QUEUE_SCOPE,
 		getExcludePatterns: () => [],
 		persistBlobQueue: async (snapshot) => {
 			persistCount++;
@@ -145,6 +166,7 @@ function makeFixture(initialPersistedQueue: BlobQueueSnapshot | null): Fixture {
 		getPreservedUnresolvedEntries: () => [],
 		onPreservedUnresolvedChanged: () => {},
 		trace: () => {},
+		recordFlightPathEvent: () => {},
 		scheduleTraceStateSnapshot: () => {},
 		refreshStatusBar: () => {},
 		log: () => {},
@@ -188,6 +210,7 @@ s.section("Attachment orchestrator queue lifecycle");
 {
 	const remoteData = bytes("restored-download");
 	const savedQueue: BlobQueueSnapshot = {
+		scope: TEST_QUEUE_SCOPE,
 		uploads: [],
 		downloads: [{
 			path: "attachments/restored.bin",
@@ -227,7 +250,7 @@ s.section("Attachment orchestrator queue lifecycle");
 	recreated.orchestrator.start("reload", false);
 	assertSnapshot(
 		recreated.orchestrator.manager?.exportQueue() ?? null,
-		{ uploads: [], downloads: [] },
+		{ scope: TEST_QUEUE_SCOPE, uploads: [], downloads: [] },
 		"recreated orchestrator has no stale queue to import",
 	);
 	await recreated.orchestrator.destroy();
@@ -236,6 +259,7 @@ s.section("Attachment orchestrator queue lifecycle");
 {
 	const remoteData = bytes("status-tick-before-stop");
 	const savedQueue: BlobQueueSnapshot = {
+		scope: TEST_QUEUE_SCOPE,
 		uploads: [],
 		downloads: [{
 			path: "attachments/status-tick.bin",
@@ -269,6 +293,7 @@ s.section("Attachment orchestrator queue lifecycle");
 
 {
 	const queued: BlobQueueSnapshot = {
+		scope: TEST_QUEUE_SCOPE,
 		uploads: [],
 		downloads: [{ path: "pending.bin", hash: "a".repeat(64), sizeBytes: 1 }],
 	};
@@ -284,7 +309,16 @@ s.section("Attachment orchestrator queue lifecycle");
 
 {
 	const savedQueue: BlobQueueSnapshot = {
-		uploads: [{ path: "never-started.bin", sizeBytes: 1 }],
+		scope: TEST_QUEUE_SCOPE,
+		uploads: [{
+			intentId: "never-started-intent",
+			path: "never-started.bin",
+			expectedRevision: null,
+			observedMtime: 1,
+			observedSize: 1,
+			createdAt: 1,
+			sizeBytes: 1,
+		}],
 		downloads: [],
 	};
 	const fixture = makeFixture(savedQueue);
@@ -293,5 +327,21 @@ s.section("Attachment orchestrator queue lifecycle");
 	s.check(fixture.persistCalls() === 0, "unstarted queue is not re-persisted");
 	s.check(fixture.clearCalls() === 0, "unstarted queue is not cleared");
 	assertSnapshot(fixture.getPersistedQueue(), savedQueue, "saved queue survives when attachment sync never starts");
+}
+
+{
+	const mismatchedQueue: BlobQueueSnapshot = {
+		scope: { ...TEST_QUEUE_SCOPE, vaultGeneration: "different-generation" },
+		uploads: [],
+		downloads: [{ path: "wrong-generation.bin", hash: "b".repeat(64), sizeBytes: 1 }],
+	};
+	const fixture = makeFixture(mismatchedQueue);
+	fixture.orchestrator.hydrateSavedQueue(mismatchedQueue);
+	fixture.orchestrator.start("scope-mismatch", false);
+	s.check(
+		fixture.orchestrator.manager?.exportQueue().downloads.length === 0,
+		"queue snapshot from another vault generation is rejected",
+	);
+	await fixture.orchestrator.destroy();
 }
 await s.done();

@@ -1,10 +1,11 @@
 import { type App, Notice } from "obsidian";
-import { BlobSyncManager, type BlobQueueSnapshot } from "../sync/blobSync";
+import { BlobSyncManager, type BlobQueueScope, type BlobQueueSnapshot } from "../sync/blobSync";
 import type { BlobHashCache } from "../sync/blobHashCache";
 import type { VaultSync } from "../sync/vaultSync";
 import type { RuntimeConfig } from "./runtimeConfig";
 import { formatUnknown } from "../utils/format";
 import type { TraceHttpContext, TraceRecord } from "../observability/traceContext";
+import type { ProductFlightPathEventInput } from "../observability/traceSink";
 import type { PreservedUnresolvedEntry } from "../sync/preservedUnresolved";
 
 interface AttachmentOrchestratorDeps {
@@ -14,12 +15,14 @@ interface AttachmentOrchestratorDeps {
 	getServerSupportsAttachments(): boolean;
 	getTraceHttpContext(): TraceHttpContext | undefined;
 	getBlobHashCache(): BlobHashCache;
+	getBlobQueueScope(): BlobQueueScope;
 	getExcludePatterns(): string[];
 	persistBlobQueue(snapshot: BlobQueueSnapshot): Promise<void>;
 	clearPersistedBlobQueue(): Promise<void>;
 	getPreservedUnresolvedEntries(): PreservedUnresolvedEntry[];
 	onPreservedUnresolvedChanged(): void;
 	trace: TraceRecord;
+	recordFlightPathEvent(event: ProductFlightPathEventInput): void;
 	scheduleTraceStateSnapshot(reason: string): void;
 	refreshStatusBar(): void;
 	log(message: string): void;
@@ -75,6 +78,7 @@ export class AttachmentOrchestrator {
 				host: runtimeConfig.host,
 				deviceToken: runtimeConfig.deviceToken,
 				vaultId: runtimeConfig.vaultId,
+				queueScope: this.deps.getBlobQueueScope(),
 				maxAttachmentSizeKB: runtimeConfig.maxAttachmentSizeKB,
 				attachmentConcurrency: runtimeConfig.attachmentConcurrency,
 				debug: runtimeConfig.debug,
@@ -84,6 +88,7 @@ export class AttachmentOrchestrator {
 			this.deps.trace,
 			this.deps.getPreservedUnresolvedEntries(),
 			() => this.deps.onPreservedUnresolvedChanged(),
+			(event) => this.deps.recordFlightPathEvent(event),
 		);
 
 		this.blobSync = blobSync;
@@ -128,13 +133,14 @@ export class AttachmentOrchestrator {
 	private async stopActiveManager(): Promise<void> {
 		const blobSync = this.blobSync;
 		if (!blobSync) return;
+		const snapshot = blobSync.quiesce();
 
 		// Clear the public handle before the first await. This prevents a status
 		// tick from appending a stale checkpoint after terminal persistence has
 		// been queued for this manager.
 		this.blobSync = null;
 		try {
-			await this.persistQueueSnapshot(blobSync.exportQueue());
+			await this.persistQueueSnapshot(snapshot);
 		} finally {
 			blobSync.destroy();
 		}

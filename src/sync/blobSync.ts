@@ -21,7 +21,8 @@ import {
 	arrayBufferToHex,
 	Notice,
 } from "obsidian";
-import { type BlobRef } from "../types";
+import { type AttachmentHead, type BlobRef } from "../types";
+import type { AttachmentIntentOutcome } from "./vaultSync";
 import {
 	appendTraceParams,
 	type TraceHttpContext,
@@ -34,6 +35,7 @@ import {
 	getCachedHash,
 	setCachedHash,
 	removeCachedHash,
+	moveCachedHashes,
 } from "./blobHashCache";
 import { PreservedUnresolvedRegistry, type PreservedUnresolvedEntry, type PreservedUnresolvedReason } from "./preservedUnresolved";
 import { safeBlobPath } from "./pathPolicy";
@@ -49,10 +51,15 @@ export type AttachmentCatalogChange =
 export interface AttachmentCatalogPort {
 	listAttachmentRefs(): Iterable<[string, BlobRef]>;
 	getAttachmentRef(path: string): BlobRef | undefined;
+	getObservedAttachmentHead(path: string): AttachmentHead;
+	getProjectedAttachmentHead(path: string): AttachmentHead;
 	isAttachmentTombstoned(path: string): boolean;
-	setAttachmentRef(path: string, hash: string, size: number, mime: string): void | Promise<void>;
-	deleteAttachmentRef(path: string, device?: string): void | Promise<void>;
-	renameAttachmentRef(oldPath: string, newPath: string): void | Promise<void>;
+	setAttachmentRef(path: string, hash: string, size: number, mime: string, intent: {
+		operationId: string;
+		expectedRevision: string | null;
+	}): Promise<AttachmentIntentOutcome>;
+	deleteAttachmentRef(path: string, device?: string): Promise<AttachmentIntentOutcome>;
+	renameAttachmentRef(oldPath: string, newPath: string): Promise<AttachmentIntentOutcome>;
 	observeAttachmentChanges(callback: (change: AttachmentCatalogChange) => void): () => void;
 }
 
@@ -294,14 +301,17 @@ function isBlobConflictArtifactPath(path: string): boolean {
 // -------------------------------------------------------------------
 
 interface UploadItem {
-	path: string;
-	sizeBytes?: number;
+	readonly intentId: string;
+	readonly runtimeId: string;
+	readonly path: string;
+	readonly expectedRevision: string | null;
+	readonly observedMtime: number | null;
+	readonly observedSize: number | null;
+	readonly sizeBytes?: number;
+	readonly createdAt: number;
 	retries: number;
 	status: "pending" | "processing";
 	readyAt: number;
-	needsRerun?: boolean;
-	/** How many times this item has been reset via needsRerun. Capped at MAX_RERUN_RESETS. */
-	rerunResets: number;
 }
 
 interface DownloadItem {
@@ -321,14 +331,18 @@ interface DownloadItem {
  * Persisted to plugin data.json so in-flight transfers survive reloads.
  */
 export interface BlobQueueSnapshot {
+	scope: BlobQueueScope;
 	uploads: {
+		intentId: string;
 		path: string;
+		expectedRevision: string | null;
+		observedMtime: number | null;
+		observedSize: number | null;
+		createdAt: number;
 		sizeBytes?: number;
 		retries?: number;
 		status?: "pending" | "processing";
 		readyAt?: number;
-		needsRerun?: boolean;
-		rerunResets?: number;
 	}[];
 	downloads: {
 		path: string;
@@ -342,6 +356,23 @@ export interface BlobQueueSnapshot {
 	}[];
 }
 
+export interface BlobQueueScope {
+	host: string;
+	vaultId: string;
+	vaultGeneration: string;
+	deviceId: string;
+	folderKey: string;
+}
+
+function sameBlobQueueScope(left: BlobQueueScope | undefined, right: BlobQueueScope): boolean {
+	return left !== undefined
+		&& left.host === right.host
+		&& left.vaultId === right.vaultId
+		&& left.vaultGeneration === right.vaultGeneration
+		&& left.deviceId === right.deviceId
+		&& left.folderKey === right.folderKey;
+}
+
 // -------------------------------------------------------------------
 // BlobSyncManager
 // -------------------------------------------------------------------
@@ -351,6 +382,10 @@ export class BlobSyncManager {
 
 	/** Pending uploads keyed by path (deduped). */
 	private uploadQueue = new Map<string, UploadItem>();
+	private acceptingWork = true;
+	private runtimeId = crypto.randomUUID();
+	private quiescedSnapshot: BlobQueueSnapshot | null = null;
+	private readonly queueScope: BlobQueueScope;
 	/** Pending downloads keyed by path (deduped). */
 	private downloadQueue = new Map<string, DownloadItem>();
 	private readonly forcedDownloadWaiters = new Map<string, Array<{
@@ -424,6 +459,7 @@ export class BlobSyncManager {
 			host: string;
 			deviceToken: string;
 			vaultId: string;
+			queueScope: BlobQueueScope;
 			maxAttachmentSizeKB: number;
 			attachmentConcurrency: number;
 			debug: boolean;
@@ -446,6 +482,7 @@ export class BlobSyncManager {
 		this.maxSize = settings.maxAttachmentSizeKB * 1024;
 		this.debug = settings.debug;
 		this.excludePatterns = settings.excludePatterns ?? [];
+		this.queueScope = { ...settings.queueScope };
 		this.hashCache = hashCache;
 		this.preservedUnresolved = new PreservedUnresolvedRegistry(
 			initialPreservedUnresolved.filter((entry) => entry.kind === "blob"),
@@ -516,7 +553,7 @@ export class BlobSyncManager {
 	private validateBlobPath(
 		path: string,
 		context: string,
-		ref?: BlobRef,
+		ref?: Pick<BlobRef, "hash" | "size">,
 	): string | null {
 		const canonical = safeBlobPath(path, this.excludePatterns, this.app.vault.configDir, ref);
 		if (
@@ -538,31 +575,60 @@ export class BlobSyncManager {
 		return null;
 	}
 
-	private enqueueUpload(path: string, retries = 0, sizeBytes?: number): void {
+	private enqueueUpload(
+		path: string,
+		retries = 0,
+		sizeBytes?: number,
+		readyAt = 0,
+	): UploadItem | null {
+		if (!this.acceptingWork) return null;
 		const canonical = this.validateBlobPath(path, "upload-queue");
-		if (!canonical) return;
+		if (!canonical) return null;
 		path = canonical;
-		const existing = this.uploadQueue.get(path);
-		if (existing) {
-			if (sizeBytes && sizeBytes > 0) existing.sizeBytes = sizeBytes;
-			existing.retries = Math.min(existing.retries, retries);
-			existing.readyAt = 0;
-			if (existing.status === "processing") {
-				existing.needsRerun = true;
-			} else {
-				existing.status = "pending";
-			}
-			return;
-		}
-
-		this.uploadQueue.set(path, {
+		const file = this.app.vault.getAbstractFileByPath(path);
+		const previous = this.uploadQueue.get(path);
+		const createdAt = Date.now();
+		const item: UploadItem = {
+			intentId: crypto.randomUUID(),
+			runtimeId: this.runtimeId,
 			path,
-			sizeBytes,
+			expectedRevision: this.attachmentCatalog.getProjectedAttachmentHead(path).revision,
+			observedMtime: file instanceof TFile ? file.stat.mtime : null,
+			observedSize: file instanceof TFile ? file.stat.size : (sizeBytes ?? null),
+			sizeBytes: file instanceof TFile ? file.stat.size : sizeBytes,
+			createdAt,
 			retries,
 			status: "pending",
-			readyAt: 0,
-			rerunResets: 0,
-		});
+			readyAt,
+		};
+		this.uploadQueue.set(path, item);
+		if (previous) {
+			this.recordAttachmentEvent(
+				PRODUCT_EVENT_KIND.attachmentIntentSupersededLocal,
+				path,
+				"info",
+				"important",
+				{
+					intentIdPrefix: previous.intentId.slice(0, 12),
+					successorIntentIdPrefix: item.intentId.slice(0, 12),
+					intentAgeMs: Math.max(0, createdAt - previous.createdAt),
+					reason: "replacement",
+				},
+			);
+		}
+		this.recordAttachmentEvent(
+			PRODUCT_EVENT_KIND.attachmentIntentCreated,
+			path,
+			"info",
+			"important",
+			{
+				intentIdPrefix: item.intentId.slice(0, 12),
+				expectedRevisionPrefix: hashPrefix(item.expectedRevision),
+				sizeBytes: item.observedSize,
+				debounced: readyAt > createdAt,
+			},
+		);
+		return item;
 	}
 
 	private enqueueDownload(
@@ -608,6 +674,7 @@ export class BlobSyncManager {
 	 * Debounces and queues upload.
 	 */
 	handleFileChange(file: TFile): void {
+		if (!this.acceptingWork) return;
 		if (!this.validateBlobPath(file.path, "local-file-change")) return;
 		if (
 			this.localOnlyBlobConflictPaths.has(file.path) ||
@@ -637,15 +704,18 @@ export class BlobSyncManager {
 			);
 		}
 
-		// Clear existing debounce
+		// Replace the path intent synchronously. The debounce controls transfer
+		// start only; it must never delay invalidation of older work.
 		const existing = this.uploadDebounce.get(file.path);
 		if (existing) window.clearTimeout(existing);
+		const readyAt = Date.now() + DEBOUNCE_MS;
+		const intent = this.enqueueUpload(file.path, 0, file.stat.size, readyAt);
+		if (!intent) return;
 
 		this.uploadDebounce.set(
 			file.path,
 			window.setTimeout(() => {
 				this.uploadDebounce.delete(file.path);
-				this.enqueueUpload(file.path, 0, file.stat.size);
 				this.kickUploadDrain();
 			}, DEBOUNCE_MS),
 		);
@@ -655,6 +725,7 @@ export class BlobSyncManager {
 	 * Handle a local file delete for a blob-syncable file.
 	 */
 	async handleFileDelete(path: string, device?: string): Promise<void> {
+		if (!this.acceptingWork) return;
 		const canonical = this.validateBlobPath(path, "local-file-delete");
 		if (!canonical) return;
 		path = canonical;
@@ -664,7 +735,7 @@ export class BlobSyncManager {
 			window.clearTimeout(pendingUpload);
 		}
 		this.uploadDebounce.delete(path);
-		this.uploadQueue.delete(path);
+		this.invalidateUploadPath(path, "delete");
 
 		// If user deletes a preserved-unresolved file, that resolves the conflict.
 		if (this.preservedUnresolved.resolve(path)) {
@@ -685,10 +756,54 @@ export class BlobSyncManager {
 	}
 
 	async handleFileRename(oldPath: string, newPath: string): Promise<void> {
+		if (!this.acceptingWork) return;
 		const safeOldPath = this.validateBlobPath(oldPath, "local-file-rename-source");
 		const safeNewPath = this.validateBlobPath(newPath, "local-file-rename-target");
 		if (!safeOldPath || !safeNewPath) return;
-		await this.attachmentCatalog.renameAttachmentRef(safeOldPath, safeNewPath);
+		if (safeOldPath === safeNewPath) return;
+		const sourceTransfer = this.uploadQueue.get(safeOldPath);
+		const oldTimer = this.uploadDebounce.get(safeOldPath);
+		if (oldTimer !== undefined) window.clearTimeout(oldTimer);
+		const newTimer = this.uploadDebounce.get(safeNewPath);
+		if (newTimer !== undefined) window.clearTimeout(newTimer);
+		this.uploadDebounce.delete(safeOldPath);
+		this.uploadDebounce.delete(safeNewPath);
+		this.invalidateUploadPath(safeOldPath, "rename-source");
+		this.invalidateUploadPath(safeNewPath, "rename-target");
+		const projectedSource = this.attachmentCatalog.getProjectedAttachmentHead(safeOldPath);
+		const projectedTarget = this.attachmentCatalog.getProjectedAttachmentHead(safeNewPath);
+		if (projectedTarget?.kind === "active") {
+			this.preservedUnresolved.record({
+				path: safeNewPath,
+				kind: "blob",
+				reason: "path-collision",
+				knownRemoteHash: projectedTarget.hash,
+			});
+			this.onPreservedUnresolvedChanged?.();
+			this.recordAttachmentEvent(
+				PRODUCT_EVENT_KIND.attachmentIntentSupersededLocal,
+				safeNewPath,
+				"warn",
+				"critical",
+				{
+					reason: "rename-target-collision",
+					currentRevisionPrefix: hashPrefix(projectedTarget.revision),
+					currentHashPrefix: hashPrefix(projectedTarget.hash),
+				},
+			);
+			this.log(`attachment rename collision preserved at "${safeNewPath}"`);
+			return;
+		}
+		moveCachedHashes(this.hashCache, new Map([[safeOldPath, safeNewPath]]));
+		if (projectedSource?.kind === "active" || this.attachmentCatalog.getAttachmentRef(safeOldPath)) {
+			await this.attachmentCatalog.renameAttachmentRef(safeOldPath, safeNewPath);
+		} else {
+			const target = this.app.vault.getAbstractFileByPath(safeNewPath);
+			if (target instanceof TFile) {
+				this.enqueueUpload(safeNewPath, sourceTransfer?.retries ?? 0, target.stat.size);
+				this.kickUploadDrain();
+			}
+		}
 		this.recordAttachmentEvent(
 			PRODUCT_EVENT_KIND.attachmentRenamed,
 			safeNewPath,
@@ -859,6 +974,7 @@ export class BlobSyncManager {
 	// -------------------------------------------------------------------
 
 	private kickUploadDrain(): void {
+		if (!this.acceptingWork) return;
 		if (this.uploadDraining) return;
 		void this.drainUploads();
 	}
@@ -906,8 +1022,8 @@ export class BlobSyncManager {
 	private async processUpload(item: UploadItem): Promise<void> {
 		const start = Date.now();
 		const normalized = this.validateBlobPath(item.path, "upload-before-disk-read");
-		if (!normalized) {
-			this.uploadQueue.delete(item.path);
+		if (!normalized || !this.isCurrentUploadIntent(item)) {
+			this.deleteUploadIntent(item);
 			return;
 		}
 		this.log(
@@ -926,7 +1042,7 @@ export class BlobSyncManager {
 				this.preservedUnresolvedPaths.has(normalized) ||
 				this.preservedUnresolvedPaths.has(item.path)
 			) {
-				this.uploadQueue.delete(item.path);
+				this.deleteUploadIntent(item);
 				const isLocalOnlyConflict =
 					this.localOnlyBlobConflictPaths.has(normalized) ||
 					this.localOnlyBlobConflictPaths.has(item.path) ||
@@ -952,7 +1068,7 @@ export class BlobSyncManager {
 
 			const file = this.app.vault.getAbstractFileByPath(normalized);
 			if (!(file instanceof TFile)) {
-				this.uploadQueue.delete(item.path);
+				this.deleteUploadIntent(item);
 				this.log(`upload: "${item.path}" no longer exists, skipping`);
 				removeCachedHash(this.hashCache, item.path);
 				return;
@@ -960,64 +1076,92 @@ export class BlobSyncManager {
 
 			// Size guard
 			if (this.maxSize > 0 && file.stat.size > this.maxSize) {
-				this.uploadQueue.delete(item.path);
+				this.deleteUploadIntent(item);
 				this.log(
 					`upload: "${item.path}" too large (${file.stat.size} bytes), skipping`,
 				);
 				return;
 			}
-			item.sizeBytes = file.stat.size;
-
-			// Try hash cache first: if mtime+size match, skip read+hash
-			const fileStat = { mtime: file.stat.mtime, size: file.stat.size };
-			let hash = getCachedHash(this.hashCache, item.path, fileStat);
-			let data: ArrayBuffer | null = null;
-
-			if (!hash) {
-				// Cache miss — read and hash the file
-				data = await this.app.vault.readBinary(file);
-				hash = await hashArrayBuffer(data);
-				setCachedHash(this.hashCache, item.path, fileStat, hash);
+			if (
+				item.observedMtime === null
+				|| item.observedSize === null
+				|| file.stat.mtime !== item.observedMtime
+				|| file.stat.size !== item.observedSize
+			) {
+				this.enqueueUpload(item.path, 0, file.stat.size);
+				return;
 			}
+
+			// Select one exact byte snapshot for this immutable intent. The cache is
+			// only populated from these bytes; it is never trusted as publication
+			// proof because the object-present branch must be just as strict as PUT.
+			const fileStat = { mtime: file.stat.mtime, size: file.stat.size };
+			const data = await this.app.vault.readBinary(file);
+			if (!this.isCurrentUploadIntent(item)) return;
+			const hash = await hashArrayBuffer(data);
+			if (!this.isCurrentUploadIntent(item)) return;
+			const selectedSize = data.byteLength;
+			const selectedFile = this.app.vault.getAbstractFileByPath(normalized);
+			if (
+				!(selectedFile instanceof TFile)
+				|| selectedFile.stat.mtime !== item.observedMtime
+				|| selectedFile.stat.size !== item.observedSize
+				|| selectedSize !== item.observedSize
+			) {
+				if (selectedFile instanceof TFile) {
+					this.enqueueUpload(item.path, 0, selectedFile.stat.size);
+				}
+				return;
+			}
+			setCachedHash(this.hashCache, item.path, fileStat, hash);
 
 			// Check if CRDT already has this exact hash for this path
 			const existingRef = this.attachmentCatalog.getAttachmentRef(item.path);
-			if (existingRef && existingRef.hash === hash) {
-				if (item.needsRerun) {
-					item.needsRerun = false;
-					item.status = "pending";
-					item.retries = 0;
-					item.readyAt = 0;
-					this.log(
-						`upload: "${item.path}" unchanged on this pass; running queued rerun`,
-					);
-					this.kickUploadDrain();
-				} else {
-					this.uploadQueue.delete(item.path);
-					this.log(
-						`upload: "${item.path}" unchanged (hash match), skipping`,
-					);
-				}
+			if (existingRef && existingRef.hash === hash && existingRef.size === selectedSize) {
+				this.deleteUploadIntent(item);
+				this.log(
+					`upload: "${item.path}" unchanged (hash match), skipping`,
+				);
 				return;
 			}
 
 			// Check if R2 already has this blob (content-addressed dedup)
 			const present = await this.blobClient.exists([hash]);
+			if (!this.isCurrentUploadIntent(item)) return;
 			if (!present.includes(hash)) {
-				// Need actual bytes for upload — read if we used cache
-				if (!data) {
-					data = await this.app.vault.readBinary(file);
-				}
-
 				// Upload through the Worker
 				const mime = guessMime(item.path);
-				const uploadTimeoutMs = transferTimeoutMs(item.sizeBytes);
+				const uploadTimeoutMs = transferTimeoutMs(selectedSize);
 				await this.blobClient.upload(hash, mime, data, uploadTimeoutMs);
+				if (!this.isCurrentUploadIntent(item)) return;
+				this.recordAttachmentEvent(
+					PRODUCT_EVENT_KIND.attachmentTransferUploaded,
+					item.path,
+					"info",
+					"important",
+					{
+						intentIdPrefix: item.intentId.slice(0, 12),
+						hashPrefix: hashPrefix(hash),
+						sizeBytes: selectedSize,
+						transferDurationMs: Math.max(0, Date.now() - start),
+					},
+				);
 
 				this.log(
 					`upload: "${item.path}" uploaded (${data.byteLength} bytes)`,
 				);
 			} else {
+				this.recordAttachmentEvent(
+					PRODUCT_EVENT_KIND.attachmentTransferObjectPresent,
+					item.path,
+					"info",
+					"important",
+					{
+						intentIdPrefix: item.intentId.slice(0, 12),
+						hashPrefix: hashPrefix(hash),
+						sizeBytes: selectedSize,
+					},
+				);
 				this.log(
 					`upload: "${item.path}" already in R2 (dedup), updating CRDT only`,
 				);
@@ -1026,37 +1170,52 @@ export class BlobSyncManager {
 					item.path,
 					"info",
 					"important",
-					{ decision: "deduplicated", hashPrefix: hashPrefix(hash), sizeBytes: file.stat.size },
+					{ decision: "deduplicated", hashPrefix: hashPrefix(hash), sizeBytes: selectedSize },
 				);
 			}
 
+			// Publication is the commit boundary. Re-prove the immutable local
+			// intent after every await which can overlap delete/rename/stop.
+			const currentFile = this.app.vault.getAbstractFileByPath(normalized);
+			if (!this.isCurrentUploadIntent(item)
+				|| !(currentFile instanceof TFile)
+				|| currentFile.stat.mtime !== item.observedMtime
+				|| currentFile.stat.size !== item.observedSize) {
+				return;
+			}
 			// Two-phase commit: update CRDT only after successful upload
 			const mime = guessMime(item.path);
-			await this.attachmentCatalog.setAttachmentRef(item.path, hash, file.stat.size, mime);
+			const publication = await this.attachmentCatalog.setAttachmentRef(
+				item.path,
+				hash,
+				selectedSize,
+				mime,
+				{ operationId: item.intentId, expectedRevision: item.expectedRevision },
+			);
+			if (publication.kind === "superseded") {
+				this.deleteUploadIntent(item);
+				this.recordAttachmentEvent(
+					PRODUCT_EVENT_KIND.attachmentUploadDecision,
+					item.path,
+					"warn",
+					"critical",
+					{ decision: "superseded-remote", currentKind: publication.current.kind },
+				);
+				return;
+			}
 			this.recordAttachmentEvent(
 				PRODUCT_EVENT_KIND.attachmentUploadComplete,
 				item.path,
 				"info",
 				"important",
-				{ hashPrefix: hashPrefix(hash), sizeBytes: file.stat.size, deduplicated: present.includes(hash) },
+				{ hashPrefix: hashPrefix(hash), sizeBytes: selectedSize, deduplicated: present.includes(hash),
+					publication: publication.kind },
 			);
 			this._completedUploads++;
-			if (item.needsRerun) {
-				item.needsRerun = false;
-				item.status = "pending";
-				item.retries = 0;
-				item.readyAt = 0;
-				this.log(
-					`upload: success "${item.path}" in ${Date.now() - start}ms (queued rerun)`,
-				);
-				this.kickUploadDrain();
-			} else {
-				this.uploadQueue.delete(item.path);
-				this.log(
-					`upload: success "${item.path}" in ${Date.now() - start}ms`,
-				);
-			}
+			this.deleteUploadIntent(item);
+			this.log(`upload: success "${item.path}" in ${Date.now() - start}ms`);
 		} catch (err) {
+			if (!this.isCurrentUploadIntent(item)) return;
 			const reason = err instanceof Error ? err.message : String(err);
 			if (item.retries < MAX_RETRIES) {
 				const delay = RETRY_BASE_MS * Math.pow(4, item.retries);
@@ -1069,19 +1228,7 @@ export class BlobSyncManager {
 				item.readyAt = Date.now() + delay;
 				this.scheduleRetryKick(delay, "upload");
 			} else {
-				if (item.needsRerun && item.rerunResets < MAX_RERUN_RESETS) {
-					item.needsRerun = false;
-					item.status = "pending";
-					item.retries = 0;
-					item.readyAt = 0;
-					item.rerunResets++;
-					this.log(
-						`upload: "${item.path}" had pending rerun (reset ${item.rerunResets}/${MAX_RERUN_RESETS}); restarting fresh`,
-					);
-					this.kickUploadDrain();
-					return;
-				}
-				this.uploadQueue.delete(item.path);
+				this.deleteUploadIntent(item);
 				this._permanentUploadFailures++;
 				this.trace?.("blob", "upload-permanently-failed", {
 					path: item.path,
@@ -1095,6 +1242,35 @@ export class BlobSyncManager {
 				);
 			}
 		}
+	}
+
+	private isCurrentUploadIntent(item: UploadItem): boolean {
+		return this.acceptingWork
+			&& item.runtimeId === this.runtimeId
+			&& this.uploadQueue.get(item.path)?.intentId === item.intentId;
+	}
+
+	private deleteUploadIntent(item: UploadItem): void {
+		if (this.uploadQueue.get(item.path)?.intentId === item.intentId) {
+			this.uploadQueue.delete(item.path);
+		}
+	}
+
+	private invalidateUploadPath(path: string, reason: string): void {
+		const item = this.uploadQueue.get(path);
+		if (!item) return;
+		this.uploadQueue.delete(path);
+		this.recordAttachmentEvent(
+			PRODUCT_EVENT_KIND.attachmentIntentSupersededLocal,
+			path,
+			"info",
+			"important",
+			{
+				intentIdPrefix: item.intentId.slice(0, 12),
+				intentAgeMs: Math.max(0, Date.now() - item.createdAt),
+				reason,
+			},
+		);
 	}
 
 	private nextPendingUpload(): UploadItem | null {
@@ -1978,43 +2154,33 @@ export class BlobSyncManager {
 		const uploads: BlobQueueSnapshot["uploads"] = [];
 		for (const [, item] of this.uploadQueue) {
 			uploads.push({
+				intentId: item.intentId,
 				path: item.path,
+				expectedRevision: item.expectedRevision,
+				observedMtime: item.observedMtime,
+				observedSize: item.observedSize,
+				createdAt: item.createdAt,
 				sizeBytes: item.sizeBytes,
 				retries: item.retries,
-				status: item.status,
-				readyAt: item.readyAt,
-				needsRerun: item.needsRerun,
-				rerunResets: item.rerunResets,
+				status: "pending",
+				readyAt: 0,
 			});
 		}
-		// Also include items in debounce (not yet in queue but pending)
-		for (const [path] of this.uploadDebounce) {
-			if (!this.uploadQueue.has(path)) {
-				uploads.push({
-					path,
-					retries: 0,
-					status: "pending",
-					readyAt: 0,
-					rerunResets: 0,
-				});
-			}
-		}
-
 		const downloads: BlobQueueSnapshot["downloads"] = [];
 		for (const [, item] of this.downloadQueue) {
-			downloads.push({
+				downloads.push({
 				path: item.path,
 				hash: item.hash,
 				sizeBytes: item.sizeBytes,
 				retries: item.retries,
-				status: item.status,
-				readyAt: item.readyAt,
+				status: "pending",
+				readyAt: 0,
 				needsRerun: item.needsRerun,
 				rerunResets: item.rerunResets,
 			});
 		}
 
-		return { uploads, downloads };
+		return { scope: { ...this.queueScope }, uploads, downloads };
 	}
 
 	/**
@@ -2022,20 +2188,43 @@ export class BlobSyncManager {
 	 * Processing items are normalized to pending.
 	 */
 	importQueue(snapshot: BlobQueueSnapshot): void {
+		if (!this.acceptingWork) return;
+		if (!sameBlobQueueScope(snapshot.scope, this.queueScope)) {
+			this.trace?.("blob", "queue-snapshot-scope-mismatch", {
+				hasScope: snapshot.scope !== undefined,
+				vaultMatches: snapshot.scope?.vaultId === this.queueScope.vaultId,
+				generationMatches: snapshot.scope?.vaultGeneration === this.queueScope.vaultGeneration,
+				deviceMatches: snapshot.scope?.deviceId === this.queueScope.deviceId,
+				folderMatches: snapshot.scope?.folderKey === this.queueScope.folderKey,
+			});
+			return;
+		}
 		let restored = 0;
 
 		if (snapshot.uploads) {
 			for (const item of snapshot.uploads) {
 				const path = this.validateBlobPath(item.path, "restored-upload-queue");
 				if (!path || this.uploadQueue.has(path) || this.uploadDebounce.has(path)) continue;
+				if (
+					typeof item.intentId !== "string"
+					|| item.intentId.length === 0
+					|| (item.expectedRevision !== null && typeof item.expectedRevision !== "string")
+					|| (item.observedMtime !== null && !Number.isFinite(item.observedMtime))
+					|| (item.observedSize !== null && !Number.isFinite(item.observedSize))
+					|| !Number.isFinite(item.createdAt)
+				) continue;
 				this.uploadQueue.set(path, {
+					intentId: item.intentId,
+					runtimeId: this.runtimeId,
 					path,
+					expectedRevision: item.expectedRevision,
+					observedMtime: item.observedMtime,
+					observedSize: item.observedSize,
 					sizeBytes: item.sizeBytes,
+					createdAt: item.createdAt,
 					retries: item.retries ?? 0,
 					status: "pending",
 					readyAt: 0,
-					needsRerun: item.needsRerun ?? false,
-					rerunResets: item.rerunResets ?? 0,
 				});
 				restored++;
 			}
@@ -2118,7 +2307,24 @@ export class BlobSyncManager {
 	// Cleanup
 	// -------------------------------------------------------------------
 
-	destroy(): void {
+	quiesce(): BlobQueueSnapshot {
+		if (this.quiescedSnapshot) return this.quiescedSnapshot;
+		this.acceptingWork = false;
+		this.runtimeId = crypto.randomUUID();
+		const snapshot = this.exportQueue();
+		for (const item of this.uploadQueue.values()) {
+			this.recordAttachmentEvent(
+				PRODUCT_EVENT_KIND.attachmentIntentQuiesced,
+				item.path,
+				"info",
+				"important",
+				{
+					intentIdPrefix: item.intentId.slice(0, 12),
+					intentAgeMs: Math.max(0, Date.now() - item.createdAt),
+					wasProcessing: item.status === "processing",
+				},
+			);
+		}
 		for (const cleanup of this.observerCleanups) {
 			cleanup();
 		}
@@ -2132,6 +2338,12 @@ export class BlobSyncManager {
 			window.clearTimeout(timer);
 		}
 		this.retryTimers.clear();
+		this.quiescedSnapshot = snapshot;
+		return snapshot;
+	}
+
+	destroy(): void {
+		this.quiesce();
 
 		this.uploadQueue.clear();
 		this.downloadQueue.clear();

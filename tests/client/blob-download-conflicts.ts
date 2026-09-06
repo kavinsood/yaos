@@ -4,6 +4,7 @@ import {
 	type AttachmentCatalogPort,
 } from "../../src/sync/blobSync";
 import type { BlobRef } from "../../src/types";
+import type { ProductFlightPathEventInput } from "../../src/observability/traceSink";
 import { suite } from "../harness.ts";
 
 const s = suite("blob-download-conflicts");
@@ -145,23 +146,38 @@ function makeApp(vault: FakeVault, fileManager: FakeFileManager): App {
 function makeAttachmentCatalogFixture(): AttachmentCatalogPort {
 	const refs = new Map<string, BlobRef>();
 	const tombstones = new Set<string>();
+	const head = (path: string) => {
+		const ref = refs.get(path);
+		if (ref) return { kind: "active" as const, revision: ref.revision, hash: ref.hash, size: ref.size };
+		if (tombstones.has(path)) return { kind: "deleted" as const, revision: `deleted:${path}`, previousHash: null };
+		return { kind: "missing" as const, revision: null };
+	};
 	return {
 		listAttachmentRefs: () => refs,
 		getAttachmentRef: (path) => refs.get(path),
+		getObservedAttachmentHead: head,
+		getProjectedAttachmentHead: head,
 		isAttachmentTombstoned: (path) => tombstones.has(path),
-		setAttachmentRef: (path, hash, size) => {
-			refs.set(path, { hash, size });
+		setAttachmentRef: async (path, hash, size) => {
+			const revision = crypto.randomUUID();
+			refs.set(path, { hash, size, revision });
 			tombstones.delete(path);
+			return { kind: "committed", revision };
 		},
-		deleteAttachmentRef: (path) => {
+		deleteAttachmentRef: async (path) => {
+			const revision = crypto.randomUUID();
 			refs.delete(path);
 			tombstones.add(path);
+			return { kind: "committed", revision };
 		},
-		renameAttachmentRef: (oldPath, newPath) => {
+		renameAttachmentRef: async (oldPath, newPath) => {
+			const revision = crypto.randomUUID();
 			const ref = refs.get(oldPath);
-			if (!ref) return;
-			refs.delete(oldPath);
-			refs.set(newPath, ref);
+			if (ref) {
+				refs.delete(oldPath);
+				refs.set(newPath, { ...ref, revision });
+			}
+			return { kind: "committed", revision };
 		},
 		observeAttachmentChanges: () => () => {},
 	};
@@ -184,6 +200,7 @@ function makeHarness() {
 	const { vault, files, put } = makeVaultFixture();
 	const fileManager: FakeFileManager = {};
 	const traces: Array<{ source: string; msg: string; details?: Record<string, unknown> }> = [];
+	const productEvents: ProductFlightPathEventInput[] = [];
 
 	const manager = new BlobSyncManager(
 		makeApp(vault, fileManager),
@@ -192,15 +209,25 @@ function makeHarness() {
 			host: "https://worker.example",
 			deviceToken: "device-token",
 			vaultId: "vault",
+			queueScope: {
+				host: "https://worker.example",
+				vaultId: "vault",
+				vaultGeneration: "generation",
+				deviceId: "device",
+				folderKey: "folder",
+			},
 			maxAttachmentSizeKB: 1024,
 			attachmentConcurrency: 1,
 			debug: false,
 		},
 		{},
 		(source, msg, details) => traces.push({ source, msg, details }),
+		[],
+		undefined,
+		(event) => productEvents.push(event),
 	);
 
-	return { vault, fileManager, manager, files, put, traces };
+	return { vault, fileManager, manager, files, put, traces, productEvents };
 }
 
 async function runDownload(
@@ -210,7 +237,10 @@ async function runDownload(
 	onDownload?: () => void,
 ): Promise<string> {
 	const hash = await sha256Hex(data);
-	manager["attachmentCatalog"].setAttachmentRef(path, hash, data.byteLength, "application/octet-stream");
+	manager["attachmentCatalog"].setAttachmentRef(path, hash, data.byteLength, "application/octet-stream", {
+		operationId: `seed:${path}`,
+		expectedRevision: null,
+	});
 	stubDownload(manager, async () => {
 		onDownload?.();
 		return data;
@@ -576,6 +606,7 @@ s.section("Test 12: rerunResets cap triggers permanent failure");
 		item.hash,
 		item.sizeBytes,
 		"image/png",
+		{ operationId: `seed:${item.path}`, expectedRevision: null },
 	);
 
 	// Mock blobClient to throw
@@ -622,6 +653,7 @@ s.section("Test 13: rerunResets below cap allows fresh restart");
 		item.hash,
 		item.sizeBytes,
 		"image/png",
+		{ operationId: `seed:${item.path}`, expectedRevision: null },
 	);
 
 	stubDownload(manager, async () => { throw new Error("temporary"); });
@@ -773,8 +805,28 @@ s.section("Test 17: importQueue preserves rerunResets near cap");
 	manager["downloadDraining"] = true;
 
 	const snapshot = {
+		scope: {
+			host: "https://worker.example",
+			vaultId: "vault",
+			vaultGeneration: "generation",
+			deviceId: "device",
+			folderKey: "folder",
+		},
 		uploads: [
-			{ path: "near-cap.png", sizeBytes: 100, retries: 2, status: "pending" as const, readyAt: 0, needsRerun: true, rerunResets: 4 },
+			{
+				intentId: "near-cap-intent",
+				path: "near-cap.png",
+				expectedRevision: "near-cap-revision",
+				observedMtime: 10,
+				observedSize: 100,
+				createdAt: 10,
+				sizeBytes: 100,
+				retries: 2,
+				status: "pending" as const,
+				readyAt: 0,
+				needsRerun: true,
+				rerunResets: 4,
+			},
 		],
 		downloads: [
 			{ path: "at-cap.png", hash: "c".repeat(64), sizeBytes: 200, retries: 3, status: "processing" as const, readyAt: 999, needsRerun: true, rerunResets: 5 },
@@ -785,15 +837,20 @@ s.section("Test 17: importQueue preserves rerunResets near cap");
 		"c".repeat(64),
 		200,
 		"image/png",
+		{ operationId: "seed:at-cap.png", expectedRevision: null },
 	);
 
 	manager.importQueue(snapshot);
 
 	const uploadItem = manager["uploadQueue"].get("near-cap.png");
 	s.check(uploadItem !== undefined, "near-cap upload item imported");
-	// The check above proves the entry is present; `!` keeps the field reads terse.
-	s.check(uploadItem!.rerunResets === 4, "rerunResets preserved at 4 (near cap)");
-	s.check(uploadItem!.needsRerun === true, "needsRerun preserved");
+	// Restored uploads become fresh immutable intents; legacy rerun state is discarded.
+	s.check(uploadItem!.status === "pending", "restored upload is normalized to pending");
+	s.check(uploadItem!.retries === 2, "restored upload preserves its retry count");
+	s.check(uploadItem!.intentId === "near-cap-intent", "restored upload preserves its stable intent ID");
+	s.check(uploadItem!.expectedRevision === "near-cap-revision", "restored upload does not rebase its expected revision");
+	s.check(uploadItem!.observedMtime === 10 && uploadItem!.createdAt === 10, "restored upload preserves its observed stat and age");
+	s.check(uploadItem!.runtimeId === manager["runtimeId"], "restored upload is fenced to the new attachment runtime");
 	s.check(uploadItem!.status === "pending", "status normalized to pending on import");
 	s.check(uploadItem!.readyAt === 0, "readyAt reset to 0 on import");
 
@@ -886,12 +943,24 @@ s.section("Test 19: Multi-pass: unknown-baseline preserved blob is NOT re-upload
 
 	// Simulate: the vaultSync has this path tombstoned
 	const attachmentRefs = new Map<string, BlobRef>([
-		["attachments/preserved.png", { hash: "d".repeat(64), size: 100 }],
+		["attachments/preserved.png", { hash: "d".repeat(64), size: 100, revision: "seed" }],
 	]);
 	const blobTombstones = new Set(["attachments/preserved.png"]);
 	Reflect.set(manager, "attachmentCatalog", {
 		listAttachmentRefs: () => attachmentRefs,
 		getAttachmentRef: (path: string) => attachmentRefs.get(path),
+		getObservedAttachmentHead: (path: string) => {
+			const ref = attachmentRefs.get(path);
+			return ref
+				? { kind: "active", revision: ref.revision, hash: ref.hash, size: ref.size }
+				: { kind: "missing", revision: null };
+		},
+		getProjectedAttachmentHead: (path: string) => {
+			const ref = attachmentRefs.get(path);
+			return ref
+				? { kind: "active", revision: ref.revision, hash: ref.hash, size: ref.size }
+				: { kind: "missing", revision: null };
+		},
 		isAttachmentTombstoned: (path: string) => blobTombstones.has(path),
 		setAttachmentRef: () => { throw new Error("setAttachmentRef should not be called"); },
 		deleteAttachmentRef: (path: string) => { blobTombstones.delete(path); },
@@ -998,8 +1067,14 @@ s.section("Test 21: processUpload skips preserved-unresolved paths (queue snapsh
 
 	// Simulate a stale queue entry that slipped through (e.g., from importQueue)
 	const item = {
+		intentId: "zombie-intent",
+		expectedRevision: null,
+		runtimeId: manager["runtimeId"],
 		path: "attachments/zombie.png",
+		observedMtime: 1,
+		observedSize: 11,
 		sizeBytes: 11,
+		createdAt: 1,
 		retries: 0,
 		status: "processing" as const,
 		readyAt: 0,
@@ -1034,10 +1109,17 @@ s.section("Test 22: attachment publication failure remains in the upload queue f
 	manager["attachmentCatalog"].setAttachmentRef = async () => {
 		publicationAttempts++;
 		if (publicationAttempts === 1) throw new Error("publication unavailable");
+		return { kind: "committed", revision: "retry-committed" };
 	};
 	const item = {
+		intentId: "retry-intent",
+		expectedRevision: null,
+		runtimeId: manager["runtimeId"],
 		path,
+		observedMtime: 1,
+		observedSize: data.byteLength,
 		sizeBytes: data.byteLength,
+		createdAt: 1,
 		retries: 0,
 		status: "processing" as const,
 		readyAt: 0,
@@ -1054,6 +1136,364 @@ s.section("Test 22: attachment publication failure remains in the upload queue f
 	await manager["processUpload"](item);
 	s.check(publicationAttempts === 2, "queued upload retries attachment publication");
 	s.check(!manager["uploadQueue"].has(path), "successful publication clears the upload queue");
+	manager.destroy();
+}
+
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+	let resolve!: () => void;
+	const promise = new Promise<void>((done) => { resolve = done; });
+	return { promise, resolve };
+}
+
+s.section("Test 23: delete while object PUT is paused fences the obsolete upload intent");
+{
+	const { manager, put } = makeHarness();
+	const path = "attachments/delete-race.bin";
+	const stored = put(path, bytes("delete race"));
+	const enteredPut = deferred();
+	const releasePut = deferred();
+	manager["blobClient"].exists = async () => [];
+	manager["blobClient"].upload = async () => { enteredPut.resolve(); await releasePut.promise; };
+	let publications = 0;
+	manager["attachmentCatalog"].setAttachmentRef = async () => {
+		publications++;
+		return { kind: "committed", revision: "delete-race-committed" };
+	};
+	manager.handleFileChange(stored.file);
+	const item = manager["uploadQueue"].get(path)!;
+	item.status = "processing";
+	const processing = manager["processUpload"](item);
+	await enteredPut.promise;
+	await manager.handleFileDelete(path, "test-device");
+	releasePut.resolve();
+	await processing;
+	s.check(publications === 0, "delete invalidates an upload already inside PUT");
+	manager.destroy();
+}
+
+s.section("Test 24: modify while object PUT is paused installs a distinct immutable intent");
+{
+	const { manager, put } = makeHarness();
+	const path = "attachments/modify-race.bin";
+	const stored = put(path, bytes("first bytes"));
+	const enteredPut = deferred();
+	const releasePut = deferred();
+	manager["blobClient"].exists = async () => [];
+	manager["blobClient"].upload = async () => { enteredPut.resolve(); await releasePut.promise; };
+	let publications = 0;
+	manager["attachmentCatalog"].setAttachmentRef = async () => {
+		publications++;
+		return { kind: "committed", revision: "modify-race-committed" };
+	};
+	manager.handleFileChange(stored.file);
+	const item = manager["uploadQueue"].get(path)!;
+	item.status = "processing";
+	const processing = manager["processUpload"](item);
+	await enteredPut.promise;
+	const successorFile = put(path, bytes("newer bytes")).file;
+	manager.handleFileChange(successorFile);
+	const successor = manager["uploadQueue"].get(path)!;
+	releasePut.resolve();
+	await processing;
+	s.check(successor.intentId !== item.intentId, "modify replaces rather than mutates the processing intent");
+	s.check(manager["uploadQueue"].get(path)?.intentId === successor.intentId, "old completion cannot remove its successor");
+	s.check(publications === 0, "old bytes are not published after modify");
+	manager.destroy();
+}
+
+s.section("Test 25: quiesce while object PUT is paused synchronously blocks publication");
+{
+	const { manager, put } = makeHarness();
+	const path = "attachments/stop-race.bin";
+	const stored = put(path, bytes("stop race"));
+	const enteredPut = deferred();
+	const releasePut = deferred();
+	manager["blobClient"].exists = async () => [];
+	manager["blobClient"].upload = async () => { enteredPut.resolve(); await releasePut.promise; };
+	let publications = 0;
+	manager["attachmentCatalog"].setAttachmentRef = async () => {
+		publications++;
+		return { kind: "committed", revision: "stop-race-committed" };
+	};
+	manager.handleFileChange(stored.file);
+	const item = manager["uploadQueue"].get(path)!;
+	item.status = "processing";
+	const processing = manager["processUpload"](item);
+	await enteredPut.promise;
+	const snapshot = manager.quiesce();
+	const snapshottedUpload = snapshot.uploads.find((upload) => upload.path === path);
+	releasePut.resolve();
+	await processing;
+	s.check(snapshottedUpload?.status === "pending" && snapshottedUpload.readyAt === 0, "quiesce normalizes the in-flight intent for restart");
+	s.check(manager.quiesce() === snapshot, "repeated quiesce returns the frozen terminal snapshot");
+	s.check(publications === 0, "quiesce fences publication before teardown awaits");
+	manager.destroy();
+}
+
+s.section("Test 26: upload publishes the revision captured before transfer began");
+{
+	const { manager, put } = makeHarness();
+	const path = "attachments/remote-delete-race.bin";
+	const stored = put(path, bytes("remote race"));
+	let projected = { kind: "active" as const, revision: "revision-before-put", hash: "f".repeat(64), size: 1 };
+	manager["attachmentCatalog"].getProjectedAttachmentHead = () => projected;
+	const enteredPut = deferred();
+	const releasePut = deferred();
+	manager["blobClient"].exists = async () => [];
+	manager["blobClient"].upload = async () => { enteredPut.resolve(); await releasePut.promise; };
+	let publishedIntent: { operationId: string; expectedRevision: string | null } | undefined;
+	manager["attachmentCatalog"].setAttachmentRef = async (_path, _hash, _size, _mime, intent) => {
+		publishedIntent = intent;
+		return { kind: "committed", revision: intent?.operationId ?? "missing-intent" };
+	};
+	manager.handleFileChange(stored.file);
+	const item = manager["uploadQueue"].get(path)!;
+	item.status = "processing";
+	const processing = manager["processUpload"](item);
+	await enteredPut.promise;
+	projected = { kind: "active", revision: "revision-after-remote-delete", hash: "e".repeat(64), size: 2 };
+	releasePut.resolve();
+	await processing;
+	s.check(publishedIntent?.operationId === item.intentId, "intent ID becomes the stable publication operation ID");
+	s.check(publishedIntent?.expectedRevision === "revision-before-put", "remote change during PUT cannot silently rebase publication");
+	manager.destroy();
+}
+
+s.section("Test 27: modify during disk read fences the old public-handler intent");
+{
+	const { manager, vault, put } = makeHarness();
+	const path = "attachments/modify-during-read.bin";
+	const firstData = bytes("first read snapshot");
+	const stored = put(path, firstData);
+	const enteredRead = deferred();
+	const releaseRead = deferred();
+	vault.readBinary = async () => {
+		enteredRead.resolve();
+		await releaseRead.promise;
+		return firstData;
+	};
+	let existsCalls = 0;
+	manager["blobClient"].exists = async () => { existsCalls++; return []; };
+	let publications = 0;
+	manager["attachmentCatalog"].setAttachmentRef = async () => {
+		publications++;
+		return { kind: "committed", revision: "read-race-committed" };
+	};
+	manager.handleFileChange(stored.file);
+	const firstIntent = manager["uploadQueue"].get(path)!;
+	firstIntent.status = "processing";
+	const processing = manager["processUpload"](firstIntent);
+	await enteredRead.promise;
+	const changed = put(path, bytes("new bytes after read started"));
+	manager.handleFileChange(changed.file);
+	const successor = manager["uploadQueue"].get(path)!;
+	releaseRead.resolve();
+	await processing;
+	s.check(successor.intentId !== firstIntent.intentId, "modify installs its successor before debounce elapses");
+	s.check(existsCalls === 0, "superseded read does not reach object existence check");
+	s.check(publications === 0, "superseded read cannot publish");
+	manager.destroy();
+}
+
+s.section("Test 28: delete during object existence check fences publication");
+{
+	const { manager, put } = makeHarness();
+	const path = "attachments/delete-during-exists.bin";
+	const data = bytes("delete during exists");
+	const stored = put(path, data);
+	const enteredExists = deferred();
+	const releaseExists = deferred();
+	const hash = await sha256Hex(data);
+	manager["blobClient"].exists = async () => {
+		enteredExists.resolve();
+		await releaseExists.promise;
+		return [hash];
+	};
+	let publications = 0;
+	manager["attachmentCatalog"].setAttachmentRef = async () => {
+		publications++;
+		return { kind: "committed", revision: "exists-race-committed" };
+	};
+	manager.handleFileChange(stored.file);
+	const item = manager["uploadQueue"].get(path)!;
+	item.status = "processing";
+	const processing = manager["processUpload"](item);
+	await enteredExists.promise;
+	await manager.handleFileDelete(path, "test-device");
+	releaseExists.resolve();
+	await processing;
+	s.check(publications === 0, "delete during exists prevents stale publication");
+	s.check(!manager["uploadQueue"].has(path), "delete synchronously removes the transfer intent");
+	manager.destroy();
+}
+
+s.section("Test 29: rename during PUT moves the cancellable intent and hash cache");
+{
+	const { manager, files, put } = makeHarness();
+	const oldPath = "attachments/rename-source.bin";
+	const newPath = "attachments/rename-target.bin";
+	const data = bytes("rename during put");
+	const stored = put(oldPath, data);
+	const enteredPut = deferred();
+	const releasePut = deferred();
+	manager["blobClient"].exists = async () => [];
+	manager["blobClient"].upload = async () => { enteredPut.resolve(); await releasePut.promise; };
+	let oldPathPublications = 0;
+	manager["attachmentCatalog"].setAttachmentRef = async (path, _hash, _size, _mime, intent) => {
+		if (path === oldPath) oldPathPublications++;
+		return { kind: "committed", revision: intent?.operationId ?? "rename-upload" };
+	};
+	manager["hashCache"][oldPath] = {
+		mtime: stored.file.stat.mtime,
+		size: stored.file.stat.size,
+		hash: await sha256Hex(data),
+	};
+	manager.handleFileChange(stored.file);
+	const sourceIntent = manager["uploadQueue"].get(oldPath)!;
+	sourceIntent.status = "processing";
+	const processing = manager["processUpload"](sourceIntent);
+	await enteredPut.promise;
+	files.delete(oldPath);
+	const target = put(newPath, data);
+	manager["uploadDraining"] = true;
+	await manager.handleFileRename(oldPath, newPath);
+	const targetIntent = manager["uploadQueue"].get(newPath);
+	releasePut.resolve();
+	await processing;
+	s.check(oldPathPublications === 0, "rename fences the source upload already inside PUT");
+	s.check(targetIntent !== undefined && targetIntent.intentId !== sourceIntent.intentId, "rename creates a target-path intent");
+	s.check(manager["hashCache"][oldPath] === undefined, "rename removes the source hash-cache entry");
+	s.check(manager["hashCache"][newPath]?.size === target.file.stat.size, "rename moves the hash-cache entry to the target");
+	manager.destroy();
+}
+
+s.section("Test 30: rename to an active target is preserved and reported");
+{
+	const { manager, files, put, traces } = makeHarness();
+	const oldPath = "attachments/collision-source.bin";
+	const newPath = "attachments/collision-target.bin";
+	const source = put(oldPath, bytes("local collision bytes"));
+	await manager["attachmentCatalog"].setAttachmentRef(
+		newPath,
+		await sha256Hex(bytes("remote target")),
+		13,
+		"application/octet-stream",
+		{ operationId: "target-revision", expectedRevision: null },
+	);
+	manager.handleFileChange(source.file);
+	files.delete(oldPath);
+	put(newPath, bytes("local collision bytes"));
+	await manager.handleFileRename(oldPath, newPath);
+	s.check(manager.preservedUnresolvedPaths.has(newPath), "rename collision preserves the local target as unresolved");
+	s.check(!manager["uploadQueue"].has(oldPath) && !manager["uploadQueue"].has(newPath), "collision invalidates both path intents");
+	s.check(traces.some((event) => event.msg.includes("attachment rename collision preserved")), "rename collision is reported");
+	manager.destroy();
+}
+
+s.section("Test 31: quiesce during durable publication preserves restart ownership");
+{
+	const { manager, put } = makeHarness();
+	const path = "attachments/stop-during-publication.bin";
+	const data = bytes("durable handoff");
+	const stored = put(path, data);
+	const hash = await sha256Hex(data);
+	manager["blobClient"].exists = async () => [hash];
+	const enteredPublication = deferred();
+	const releasePublication = deferred();
+	let publications = 0;
+	manager["attachmentCatalog"].setAttachmentRef = async (_path, _hash, _size, _mime, intent) => {
+		publications++;
+		enteredPublication.resolve();
+		await releasePublication.promise;
+		return { kind: "committed", revision: intent?.operationId ?? "publication-race" };
+	};
+	manager.handleFileChange(stored.file);
+	const item = manager["uploadQueue"].get(path)!;
+	item.status = "processing";
+	const processing = manager["processUpload"](item);
+	await enteredPublication.promise;
+	const snapshot = manager.quiesce();
+	releasePublication.resolve();
+	await processing;
+	s.check(publications === 1, "publication already durably handed off is not duplicated");
+	s.check(snapshot.uploads.some((upload) => upload.path === path), "stop snapshot retains restart ownership during publication");
+	manager.destroy();
+}
+
+s.section("Test 32: object-present publication uses exact selected bytes, not cached metadata");
+{
+	const { manager, put } = makeHarness();
+	const path = "attachments/exact-dedup-bytes.bin";
+	const data = bytes("exact deduplicated bytes");
+	const stored = put(path, data);
+	manager["hashCache"][path] = {
+		mtime: stored.file.stat.mtime,
+		size: stored.file.stat.size,
+		hash: "f".repeat(64),
+	};
+	const selectedHash = await sha256Hex(data);
+	let existsHash: string | null = null;
+	manager["blobClient"].exists = async (hashes) => {
+		existsHash = hashes[0] ?? null;
+		return [selectedHash];
+	};
+	const publications: Array<{ hash: string; size: number }> = [];
+	manager["attachmentCatalog"].setAttachmentRef = async (_path, hash, size, _mime, intent) => {
+		publications.push({ hash, size });
+		return { kind: "committed", revision: intent?.operationId ?? "exact-dedup" };
+	};
+	manager.handleFileChange(stored.file);
+	const item = manager["uploadQueue"].get(path)!;
+	item.status = "processing";
+	await manager["processUpload"](item);
+	s.check(existsHash === selectedHash, "exists query uses the hash of bytes read for this intent");
+	const published = publications[0];
+	s.check(published?.hash === selectedHash && published.size === data.byteLength, "dedup publication names the exact selected hash and size");
+	manager.destroy();
+}
+
+s.section("Test 33: a short disk read never reaches exists or publication");
+{
+	const { manager, vault, put } = makeHarness();
+	const path = "attachments/short-read.bin";
+	const stored = put(path, bytes("declared longer bytes"));
+	vault.readBinary = async () => bytes("short");
+	let existsCalls = 0;
+	let publications = 0;
+	manager["blobClient"].exists = async () => { existsCalls++; return []; };
+	manager["attachmentCatalog"].setAttachmentRef = async () => {
+		publications++;
+		return { kind: "committed", revision: "short-read" };
+	};
+	manager.handleFileChange(stored.file);
+	const item = manager["uploadQueue"].get(path)!;
+	item.status = "processing";
+	await manager["processUpload"](item);
+	s.check(existsCalls === 0 && publications === 0, "short read cannot transfer or publish inconsistent metadata");
+	s.check(manager["uploadQueue"].get(path)?.intentId !== item.intentId, "short read is replaced by a fresh observation intent");
+	manager.destroy();
+}
+
+s.section("Test 34: durable publication handoff retires the transfer snapshot owner");
+{
+	const { manager, put, productEvents } = makeHarness();
+	const path = "attachments/durable-handoff.bin";
+	const data = bytes("durably queued publication");
+	const stored = put(path, data);
+	const hash = await sha256Hex(data);
+	manager["blobClient"].exists = async () => [hash];
+	manager["attachmentCatalog"].setAttachmentRef = async (_path, _hash, _size, _mime, intent) => ({
+		kind: "durably-pending",
+		operationId: intent?.operationId ?? "missing-operation",
+	});
+	manager.handleFileChange(stored.file);
+	const item = manager["uploadQueue"].get(path)!;
+	item.status = "processing";
+	await manager["processUpload"](item);
+	s.check(!manager["uploadQueue"].has(path), "durable publication queue becomes the sole retry owner");
+	s.check(manager.exportQueue().uploads.length === 0, "completed handoff is absent from later transfer snapshots");
+	s.check(productEvents.some((event) => event.kind === "attachment.upload.complete"
+		&& event.data?.publication === "durably-pending"), "transfer completion records durable publication handoff without duplicating the publication-owner event");
 	manager.destroy();
 }
 await s.done();
