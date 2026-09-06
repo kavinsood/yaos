@@ -75,7 +75,7 @@ export class NodeVaultDatabaseIdentityError extends Error {
 
 
 /**
- * Durable schema-4 client persistence for Node 24.
+ * Durable schema-5 client persistence for Node 24.
  *
  * The database owns no sync policy. It is the SQLite implementation of the
  * client database ports, plus the two small daemon-only ledgers that replace
@@ -132,6 +132,10 @@ export class NodeVaultDatabase implements VaultDatabasePort, BootstrapDatabasePo
 				operation_id TEXT PRIMARY KEY,
 				created_at INTEGER NOT NULL,
 				value_json TEXT NOT NULL
+			) STRICT;
+			CREATE TABLE IF NOT EXISTS client_counters (
+				name TEXT PRIMARY KEY,
+				value INTEGER NOT NULL
 			) STRICT;
 			CREATE TABLE IF NOT EXISTS bootstrap_progress (
 				singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -367,14 +371,23 @@ export class NodeVaultDatabase implements VaultDatabasePort, BootstrapDatabasePo
 		});
 	}
 
-	async putAttachmentOperation(operation: StoredAttachmentPublicationOperation): Promise<void> {
-		this.statement(`INSERT INTO attachment_operations(operation_id, created_at, value_json) VALUES (?, ?, ?)
-			ON CONFLICT(operation_id) DO UPDATE SET created_at=excluded.created_at, value_json=excluded.value_json`)
-			.run(operation.mutation.operationId, operation.createdAt, JSON.stringify(operation));
+	async putAttachmentOperation(operation: StoredAttachmentPublicationOperation): Promise<StoredAttachmentPublicationOperation> {
+		return this.transaction(() => {
+			let stored = operation;
+			if (!Number.isSafeInteger(stored.localSequence) || stored.localSequence <= 0) {
+				const row = this.statement(`INSERT INTO client_counters(name, value) VALUES ('attachment_sequence', 1)
+					ON CONFLICT(name) DO UPDATE SET value = value + 1 RETURNING value`).get() as SqlRow;
+				stored = { ...stored, localSequence: Number(row.value) };
+			}
+			this.statement(`INSERT INTO attachment_operations(operation_id, created_at, value_json) VALUES (?, ?, ?)
+				ON CONFLICT(operation_id) DO UPDATE SET created_at=excluded.created_at, value_json=excluded.value_json`)
+				.run(stored.mutation.operationId, stored.createdAt, JSON.stringify(stored));
+			return stored;
+		});
 	}
 
 	async listAttachmentOperations(): Promise<StoredAttachmentPublicationOperation[]> {
-		return (this.statement("SELECT value_json FROM attachment_operations ORDER BY created_at, operation_id").all() as SqlRow[])
+		return (this.statement("SELECT value_json FROM attachment_operations").all() as SqlRow[])
 			.map((row) => jsonValue<StoredAttachmentPublicationOperation>(row.value_json, "attachment_operations.value_json"));
 	}
 

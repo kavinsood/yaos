@@ -55,6 +55,9 @@ s.test("a loaded but closed body submits a durable candidate before advancing it
 		putCandidate: async (candidate) => { candidates.set(candidate.candidateId, candidate); },
 		deleteCandidate: async (_candidateBodyId, candidateId) => { candidates.delete(candidateId); },
 		listCandidates: async () => [...candidates.values()],
+		putAttachmentOperation: async (operation) => ({ ...operation, localSequence: operation.localSequence || 1 }),
+		listAttachmentOperations: async () => [],
+		deleteAttachmentOperation: async () => {},
 		close: async () => {},
 	};
 
@@ -90,6 +93,7 @@ s.test("a loaded but closed body submits a durable candidate before advancing it
 	});
 	const runtime = new VaultSync({
 		vaultId: "vault-1",
+		vaultGeneration: "generation-1",
 		deviceId: "device-1",
 		host: "https://sync.test",
 		token: "token",

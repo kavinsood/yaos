@@ -4,7 +4,7 @@ import {
 	folderKeySeed,
 	vaultIdbName,
 } from "../../src/sync/vaultPersistence";
-import { schema4VaultIdbName } from "../../src/sync/vaultIndexedDb";
+import { schema5VaultIdbName } from "../../src/sync/vaultIndexedDb";
 import { readSource, suite } from "../harness.ts";
 
 const s = suite("vault-persistence");
@@ -18,13 +18,13 @@ s.section("Folder-keyed schema-4 persistence");
 	s.check(folderKey === digest.slice(0, 16), "folder key is the first 16 SHA-256 hex characters");
 	s.check(vaultIdbName("vault-1", folderKey) === `yaos:vault-1:${folderKey}`, "base identity combines vault and local folder");
 	s.check(
-		schema4VaultIdbName("vault-1", "generation-1", folderKey)
-			=== `yaos:vault-1:generation-1:${folderKey}:schema-4`,
+		schema5VaultIdbName("vault-1", "generation-1", folderKey)
+			=== `yaos:vault-1:generation-1:${folderKey}:schema-5`,
 		"schema-4 cache uses a generation-fenced namespace",
 	);
 	s.check(
-		schema4VaultIdbName("vault-1", "generation-1", "folder-a")
-			!== schema4VaultIdbName("vault-1", "generation-1", "folder-b"),
+		schema5VaultIdbName("vault-1", "generation-1", "folder-a")
+			!== schema5VaultIdbName("vault-1", "generation-1", "folder-b"),
 		"two local folders never share body candidates or documents",
 	);
 }

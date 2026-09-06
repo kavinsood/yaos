@@ -392,6 +392,7 @@ export class DaemonEngine {
 		const tickets = createSocketTicketCache(requester);
 		const vaultSync = new VaultSync({
 			vaultId: this.membership.vaultId,
+			vaultGeneration: this.membership.vaultGeneration,
 			deviceId: this.membership.deviceId,
 			host: this.membership.host,
 			token: this.membership.deviceToken,
@@ -408,6 +409,7 @@ export class DaemonEngine {
 			},
 			log: (message) => this.log(`[sync] ${message}`),
 			onRemoteRootStructuralUpdate: () => this.scheduleBootstrapCatchUp("remote-root"),
+			onAttachmentReconciliationRequired: () => this.scheduleBootstrapCatchUp("attachment-revision-mismatch"),
 			onDurableBodyCommitted: () => this.scheduleBootstrapCatchUp("body-committed"),
 		});
 		this.vaultSync = vaultSync;
@@ -514,7 +516,7 @@ export class DaemonEngine {
 		const providerSynced = await vaultSync.waitForProviderSync();
 		if (vaultSync.fatalAuthError) throw this.recordFatalAuth();
 		if (!providerSynced) {
-			throw new StartupError(`Timed out waiting for ${this.membership.host} to synchronize the schema-4 root`);
+			throw new StartupError(`Timed out waiting for ${this.membership.host} to synchronize the schema-5 root`);
 		}
 		await this.admitAuthoritativeDiskChanges(await host.scanMarkdown());
 		const mode = vaultSync.getSafeReconcileMode();
@@ -1225,4 +1227,3 @@ export class DaemonEngine {
 		return error;
 	}
 }
-

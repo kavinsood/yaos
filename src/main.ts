@@ -182,6 +182,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private initialVaultImporter: LocalVaultImporter | null = null;
 	private initialImportSummary: LocalVaultImportSummary | null = null;
 	private bootstrapCatchUpPending = false;
+	private attachmentReconciliationPending = false;
 	private connectionController: ConnectionController | null = null;
 	private editorBindings: EditorBindingManager | null = null;
 	private diskMirror: DiskMirror | null = null;
@@ -571,6 +572,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 							get providerSynced() { return vs.providerSynced; },
 							get isInitialized() { return vs.isInitialized; },
 							get connectionGeneration() { return vs.connectionGeneration; },
+							get pendingAttachmentOperations() { return vs.pendingAttachmentOperations; },
+							get fatalAttachmentPublications() { return vs.fatalAttachmentPublications; },
 							get lastLocalUpdateAt() { return vs.lastLocalUpdateAt; },
 							get lastLocalUpdateWhileConnectedAt() { return vs.lastLocalUpdateWhileConnectedAt; },
 							get lastRemoteUpdateAt() { return vs.lastRemoteUpdateAt; },
@@ -602,6 +605,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 							? {
 								pendingUploads: blobSync.pendingUploads,
 								pendingDownloads: blobSync.pendingDownloads,
+								permanentUploadFailures: blobSync.getDebugSnapshot().permanentUploadFailures,
+								permanentDownloadFailures: blobSync.getDebugSnapshot().permanentDownloadFailures,
 							}
 							: null;
 					},
@@ -609,6 +614,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					getFrontmatterQuarantineEntries: () => this.frontmatterQuarantineEntries,
 					getRuntimeDiagnosticsState: () => ({
 						...this.reconciliationController.getState(),
+						attachmentReconciliationPending: this.attachmentReconciliationPending,
 						awaitingFirstProviderSyncAfterStartup: this.awaitingFirstProviderSyncAfterStartup,
 						openFileCount: this.editorWorkspace?.openFileCount ?? 0,
 						recovery: {
@@ -646,12 +652,20 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			getServerSupportsAttachments: () => this.serverSupportsAttachments,
 			getTraceHttpContext: () => this.getTraceHttpContext(),
 			getBlobHashCache: () => this.blobHashCache,
+			getBlobQueueScope: () => ({
+				host: this.settings.host.trim().replace(/\/$/, ""),
+				vaultId: this.settings.vaultId.trim(),
+				vaultGeneration: this.settings.vaultGeneration.trim(),
+				deviceId: this.settings.deviceId.trim(),
+				folderKey: this.folderKey ?? "",
+			}),
 			getExcludePatterns: () => this.excludePatterns,
 			persistBlobQueue: (snapshot) => this.persistBlobQueueSnapshot(snapshot),
 			clearPersistedBlobQueue: () => this.clearSavedBlobQueue(),
 			getPreservedUnresolvedEntries: () => this.preservedUnresolvedEntries,
 			onPreservedUnresolvedChanged: () => this.persistPreservedUnresolvedState(),
 			trace: (source, msg, details) => this.trace(source, msg, details),
+			recordFlightPathEvent: (event) => this.recordFlightPathEvent(event as FlightPathEventInput),
 			scheduleTraceStateSnapshot: (reason) => this.scheduleTraceStateSnapshot(reason),
 			refreshStatusBar: () => this.refreshStatusBar(),
 			log: (message) => this.log(message),
@@ -755,7 +769,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				return;
 			}
 
-			// Schema 4 always starts from a fresh vault+folder database. The
+			// Schema 5 always starts from a fresh vault+folder database. The
 			// bootstrap root is validated before the live root provider opens.
 			const folderKey = await this.ensureFolderKey();
 			const importer = new LocalVaultImporter(
@@ -826,6 +840,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			const ticketCache = createSocketTicketCache();
 			const runtime = await VaultSync.create({
 				vaultId: this.settings.vaultId,
+				vaultGeneration: this.settings.vaultGeneration,
 				deviceId: this.settings.deviceId,
 				host: this.settings.host,
 				token: this.settings.deviceToken,
@@ -840,6 +855,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				},
 				log: (message) => this.log(`[sync] ${message}`),
 				onRemoteRootStructuralUpdate: () => this.scheduleSchema4CatchUp("remote-root"),
+				onAttachmentReconciliationRequired: () => {
+					this.attachmentReconciliationPending = true;
+					this.reconciliationController.markPending();
+					this.scheduleSchema4CatchUp("attachment-revision-mismatch");
+				},
 				onDurableBodyCommitted: () => this.scheduleSchema4CatchUp("body-committed"),
 				onProductEvent: (event) => this.recordFlightPathEvent(event),
 				onControlFrame: () => this.queueReceiptStatusRefresh(),
@@ -956,6 +976,21 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			// 5. Status tracking
 			this.connectionController = new ConnectionController({
 				getVaultSync: () => this.vaultSync,
+				getAttachmentStatus: () => {
+					const blobSnapshot = this.getBlobSync()?.getDebugSnapshot();
+					return {
+						pendingPublications: Math.max(
+							0,
+							(this.vaultSync?.pendingAttachmentOperations ?? 0)
+								- (this.vaultSync?.fatalAttachmentPublications ?? 0),
+						),
+						reconciliationPending: this.attachmentReconciliationPending,
+						permanentTransferFailures:
+							(blobSnapshot?.permanentUploadFailures ?? 0)
+							+ (blobSnapshot?.permanentDownloadFailures ?? 0),
+						fatalPublications: this.vaultSync?.fatalAttachmentPublications ?? 0,
+					};
+				},
 				isReconciled: () => this.reconciliationController.isReconciled,
 				getAwaitingFirstProviderSyncAfterStartup: () => this.awaitingFirstProviderSyncAfterStartup,
 				setAwaitingFirstProviderSyncAfterStartup: (value) => {
@@ -967,7 +1002,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				},
 				isReconcileInFlight: () => this.reconciliationController.isReconcileInFlight,
 				runReconnectReconciliation: (generation) => {
-					void this.reconciliationController.runReconnectReconciliation(generation);
+					void this.reconciliationController.runReconnectReconciliation(generation).then(() => {
+						if (!this.reconciliationController.isReconcileInFlight && !this.reconciliationController.pending) {
+							this.attachmentReconciliationPending = false;
+						}
+					});
 				},
 				refreshServerCapabilities: (reason) => {
 					void this.refreshServerCapabilities(reason);
@@ -1135,14 +1174,14 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				}
 			});
 
-			// Materialize the validated schema-4 root and every active body before
+			// Materialize the validated schema-5 root and every active body before
 			// admitting editor/disk events. Bootstrap progress and outstanding
 			// safety settlements are durable in the folder-scoped database.
 			this.updateStatusBar({ kind: "loading_cache" });
 			const bootstrap = this.bootstrapClient;
-			if (!bootstrap) throw new Error("schema-4 bootstrap client is unavailable");
+			if (!bootstrap) throw new Error("schema-5 bootstrap client is unavailable");
 			const bootstrapState = await bootstrap.run();
-			if (abortIfStale("schema-4 bootstrap")) return;
+			if (abortIfStale("schema-5 bootstrap")) return;
 			const outstanding = await database.listOutstanding();
 			this.bootstrapProgress = {
 				stage: bootstrapState.stage,
@@ -1162,7 +1201,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			}
 
 			await this.runReconciliation("authoritative");
-			if (abortIfStale("schema-4 admission")) return;
+			if (abortIfStale("schema-5 admission")) return;
 			this.reconciliationController.lastGeneration = runtime.connectionGeneration;
 			if (providerSynced) this.awaitingFirstProviderSyncAfterStartup = false;
 			if (this.settings.originImportPending) {
@@ -1227,7 +1266,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						?? this.reconciliationController.lastGeneration;
 					this.editorWorkspace?.onReconciled(`schema4-catch-up:${reason}`);
 				} catch (error) {
-					this.log(`Schema-4 catch-up failed (${reason}): ${formatUnknown(error)}`);
+					this.log(`Schema-5 catch-up failed (${reason}): ${formatUnknown(error)}`);
 				} finally {
 					this.refreshStatusBar();
 				}
@@ -1245,6 +1284,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	private async runReconciliation(mode: ReconcileMode): Promise<void> {
 		await this.reconciliationController.runReconciliation(mode);
+		if (!this.reconciliationController.isReconcileInFlight && !this.reconciliationController.pending) {
+			this.attachmentReconciliationPending = false;
+		}
 	}
 
 	private async importUntrackedFiles(): Promise<void> {
@@ -1413,7 +1455,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						break;
 
 					case "queue-blob-rename":
-						this.vaultSync?.queueRename(action.oldPath, action.newPath);
+						void this.attachmentOrchestrator?.manager
+							?.handleFileRename(action.oldPath, action.newPath)
+							.catch((error) => this.log(`Blob rename failed: ${formatUnknown(error)}`));
 						this.log(`Rename queued (blob): "${oldPath}" -> "${file.path}"`);
 						break;
 
@@ -1588,7 +1632,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	// -------------------------------------------------------------------
 	// Teardown + reinit (for reset commands)
-	// Schema-4 bodies are independently bounded and clean-only eviction replaces
+	// Schema-5 bodies are independently bounded and clean-only eviction replaces
 	// the old whole-document rebuild path.
 
 	// -------------------------------------------------------------------
@@ -1671,6 +1715,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					this.bootstrapProgress = null;
 					this.bootstrapCatchUp = null;
 					this.bootstrapCatchUpPending = false;
+					this.attachmentReconciliationPending = false;
 					this.awaitingFirstProviderSyncAfterStartup = false;
 					this.editorWorkspace?.reset();
 					this.idbDegradedHandled = false;
@@ -1696,7 +1741,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		new ConfirmModal(
 			this.app,
 			"Reset local cache",
-			"This clears this folder’s schema-4 cache and downloads the vault again. Pending local work must settle first. Continue?",
+			"This clears this folder’s schema-5 cache and downloads the vault again. Pending local work must settle first. Continue?",
 			async () => {
 				const database = this.vaultDatabase;
 				if (!database) return;
@@ -1707,7 +1752,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					await this.initSync(true);
 					new Notice("Cache reset complete.");
 				} catch (error) {
-					console.error("[yaos] Failed to reset schema-4 cache:", error);
+					console.error("[yaos] Failed to reset schema-5 cache:", error);
 					new Notice(`Cache reset refused: ${formatUnknown(error)}`, 8000);
 				}
 			},
@@ -1725,7 +1770,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		new ConfirmModal(
 			this.app,
 			"Nuclear reset",
-			`This durably deletes ${pathCount} synced notes from the server, clears this folder’s schema-4 cache, then imports the current disk files. Continue?`,
+			`This durably deletes ${pathCount} synced notes from the server, clears this folder’s schema-5 cache, then imports the current disk files. Continue?`,
 			async () => {
 				try {
 					const requests = [...runtime.pathToId].map(([path, bodyId]) => ({
@@ -2229,6 +2274,17 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			hashMismatches: 0,
 			pendingBlobUploads: blobSync?.pendingUploads ?? 0,
 			pendingBlobDownloads: blobSync?.pendingDownloads ?? 0,
+			pendingAttachmentPublications: Math.max(
+				0,
+				(vaultSync?.pendingAttachmentOperations ?? 0)
+					- (vaultSync?.fatalAttachmentPublications ?? 0),
+			),
+			attachmentReconciliationPending: this.attachmentReconciliationPending,
+			permanentAttachmentTransferFailures: blobSync
+				? blobSync.getDebugSnapshot().permanentUploadFailures
+					+ blobSync.getDebugSnapshot().permanentDownloadFailures
+				: 0,
+			fatalAttachmentPublications: vaultSync?.fatalAttachmentPublications ?? 0,
 			reconcileInFlight: this.reconciliationController?.isReconcileInFlight ?? false,
 			safetyBrakeActive: this.reconciliationController?.getState().lastReconcileStats?.safetyBrakeTriggered ?? false,
 			recovery: {

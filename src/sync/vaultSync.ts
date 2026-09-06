@@ -13,7 +13,7 @@ import type {
 import { obsidianRequest, type HttpRequester } from "../utils/http";
 import { patchTicketInUrl, TICKET_REFRESH_BUFFER_MS } from "./socketTicket";
 import { PROTOCOL_VERSION, SCHEMA_VERSION } from "./schema";
-import type { BlobMeta, BlobRef, BlobTombstone } from "../types";
+import type { AttachmentHead, BlobMeta, BlobRef, BlobTombstone } from "../types";
 import { applyDiffToYText } from "./diff";
 import { safeBlobPath, safeMarkdownPath } from "./pathPolicy";
 import { ORIGIN_DISK_COMMIT } from "./origins";
@@ -97,6 +97,8 @@ export interface SyncRuntimePort {
 	readonly fatalAuthDetails: FatalSyncDetails | null;
 	readonly lastLocalUpdateAt: number | null;
 	readonly hasPendingLocalWork?: boolean;
+	readonly pendingAttachmentOperations: number;
+	readonly fatalAttachmentPublications: number;
 	readonly lastLocalUpdateWhileConnectedAt: number | null;
 	readonly lastRemoteUpdateAt: number | null;
 	readonly serverAppliedLocalState: boolean | null;
@@ -129,10 +131,15 @@ export interface SyncRuntimePort {
 	reconnect?(): void | Promise<void>;
 	listAttachmentRefs(): Iterable<[string, BlobRef]>;
 	getAttachmentRef(path: string): BlobRef | undefined;
+	getObservedAttachmentHead(path: string): AttachmentHead;
+	getProjectedAttachmentHead(path: string): AttachmentHead;
 	isAttachmentTombstoned(path: string): boolean;
-	setAttachmentRef(path: string, hash: string, size: number, mime: string): void | Promise<void>;
-	deleteAttachmentRef(path: string, device?: string): void | Promise<void>;
-	renameAttachmentRef(oldPath: string, newPath: string): void | Promise<void>;
+	setAttachmentRef(path: string, hash: string, size: number, mime: string, intent: {
+		operationId: string;
+		expectedRevision: string | null;
+	}): Promise<AttachmentIntentOutcome>;
+	deleteAttachmentRef(path: string, device?: string): Promise<AttachmentIntentOutcome>;
+	renameAttachmentRef(oldPath: string, newPath: string): Promise<AttachmentIntentOutcome>;
 	observeAttachmentChanges(callback: (change: AttachmentCatalogChange) => void): () => void;
 	destroy(): Promise<void>;
 }
@@ -259,18 +266,50 @@ export interface LifecyclePersistencePort {
 	deleteLifecycleOperation(operationId: string): Promise<void>;
 }
 export interface AttachmentPersistencePort {
-	putAttachmentOperation(operation: StoredAttachmentPublicationOperation): Promise<void>;
+	putAttachmentOperation(operation: StoredAttachmentPublicationOperation): Promise<StoredAttachmentPublicationOperation>;
 	listAttachmentOperations(): Promise<StoredAttachmentPublicationOperation[]>;
 	deleteAttachmentOperation(operationId: string): Promise<void>;
 }
 export type AttachmentPublicationMutation = StoredAttachmentPublicationMutation;
 export interface AttachmentPublicationReceipt {
 	operationId: string;
+	outcome: "committed";
+	revisions: Array<{ path: string; revision: string; state: "active" | "deleted" }>;
 	vaultGeneration: string;
 	runtimeEpoch: string;
 	vaultSequence: number;
 	rootGeneration: number;
 	rootUpdateBase64Url: string;
+}
+export type AttachmentIntentOutcome =
+	| { kind: "committed"; revision: string }
+	| { kind: "durably-pending"; operationId: string }
+	| { kind: "superseded"; current: AttachmentHead };
+
+export interface AttachmentRevisionMismatchDetails {
+	path: string;
+	current: AttachmentHead;
+	currentHeads: Array<{ path: string; head: AttachmentHead }>;
+	vaultGeneration: string;
+	vaultSequence: number;
+}
+
+export class AttachmentPublicationError extends Error {
+	constructor(
+		readonly status: number,
+		readonly code: string,
+		readonly mismatch: AttachmentRevisionMismatchDetails | null = null,
+	) {
+		super(`attachment publication failed (${status}: ${code})`);
+		this.name = "AttachmentPublicationError";
+	}
+}
+
+export class AttachmentPublicationProofError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "AttachmentPublicationProofError";
+	}
 }
 export interface VaultServerPort {
 	currentHead(bodyId: string): Promise<BodyHead | null>;
@@ -317,10 +356,12 @@ export interface DocumentPersistencePort {
 
 export type VaultDatabasePort =
 	DocumentPersistencePort
-	& Partial<CandidatePersistencePort & LifecyclePersistencePort & AttachmentPersistencePort>;
+	& AttachmentPersistencePort
+	& Partial<CandidatePersistencePort & LifecyclePersistencePort>;
 
 export interface VaultSyncOptions {
 	vaultId: string;
+	vaultGeneration: string;
 	deviceId: string;
 	host: string;
 	token: string;
@@ -337,6 +378,10 @@ export interface VaultSyncOptions {
 	now?: () => number;
 	log?: (message: string) => void;
 	onRemoteRootStructuralUpdate?: () => void | Promise<void>;
+	onAttachmentReconciliationRequired?: (
+		paths: readonly string[],
+		reason: "revision-mismatch",
+	) => void | Promise<void>;
 	onDurableBodyCommitted?: (
 		notification: BodyCommittedNotification,
 	) => void | Promise<void>;
@@ -519,6 +564,61 @@ function base64UrlToBytes(value: string): Uint8Array {
 	return bytes;
 }
 
+function parseAttachmentHead(value: unknown): AttachmentHead | null {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+	const record = value as Record<string, unknown>;
+	if (record.kind === "missing" && record.revision === null) {
+		return { kind: "missing", revision: null };
+	}
+	if (record.kind === "active"
+		&& typeof record.revision === "string" && record.revision.length > 0 && record.revision.length <= 128
+		&& typeof record.hash === "string" && /^[a-f0-9]{64}$/.test(record.hash)
+		&& Number.isSafeInteger(record.size) && (record.size as number) >= 0) {
+		return {
+			kind: "active",
+			revision: record.revision,
+			hash: record.hash,
+			size: record.size as number,
+		};
+	}
+	if (record.kind === "deleted"
+		&& typeof record.revision === "string" && record.revision.length > 0 && record.revision.length <= 128
+		&& (record.previousHash === null
+			|| (typeof record.previousHash === "string" && /^[a-f0-9]{64}$/.test(record.previousHash)))) {
+		return {
+			kind: "deleted",
+			revision: record.revision,
+			previousHash: record.previousHash,
+		};
+	}
+	return null;
+}
+
+function parseAttachmentRevisionMismatch(value: unknown): AttachmentRevisionMismatchDetails | null {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+	const record = value as Record<string, unknown>;
+	const current = parseAttachmentHead(record.current);
+	if (typeof record.path !== "string" || !current
+		|| typeof record.vaultGeneration !== "string" || !record.vaultGeneration
+		|| !Number.isSafeInteger(record.vaultSequence) || (record.vaultSequence as number) < 0
+		|| !Array.isArray(record.currentHeads)) return null;
+	const currentHeads: Array<{ path: string; head: AttachmentHead }> = [];
+	for (const candidate of record.currentHeads) {
+		if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return null;
+		const entry = candidate as Record<string, unknown>;
+		const head = parseAttachmentHead(entry.head);
+		if (typeof entry.path !== "string" || !head) return null;
+		currentHeads.push({ path: entry.path, head });
+	}
+	return {
+		path: record.path,
+		current,
+		currentHeads,
+		vaultGeneration: record.vaultGeneration,
+		vaultSequence: record.vaultSequence as number,
+	};
+}
+
 function adaptProvider(provider: YSyncProvider): SyncProviderPort {
 	return {
 		get awareness() { return provider.awareness; },
@@ -669,7 +769,18 @@ export class VaultSyncHttpPort implements VaultServerPort {
 			body: JSON.stringify(mutation),
 			headers: this.headers(),
 		});
-		if (response.status !== 200) throw new Error(`attachment publication failed (${response.status})`);
+		if (response.status !== 200) {
+			const body = response.json as { error?: unknown } | null;
+			const code = typeof body?.error === "string" ? body.error : "unknown";
+			const mismatch = code === "attachment_revision_mismatch"
+				? parseAttachmentRevisionMismatch(response.json)
+				: null;
+			throw new AttachmentPublicationError(
+				response.status,
+				code,
+				mismatch,
+			);
+		}
 		return response.json as AttachmentPublicationReceipt;
 	}
 
@@ -710,8 +821,11 @@ export class VaultSync implements SyncRuntimePort {
 	private readonly candidateMaxWaitTimers = new Map<string, number>();
 	private readonly bodyPersistenceWork = new Map<string, Promise<void>>();
 	private readonly attachmentOperations = new Map<string, StoredAttachmentPublicationOperation>();
-	private readonly attachmentOperationDurability = new Map<string, Promise<void>>();
-	private readonly attachmentSubmissions = new Map<string, Promise<void>>();
+	private readonly attachmentOperationDurability = new Map<string, Promise<StoredAttachmentPublicationOperation>>();
+	private readonly attachmentTerminalOutcomes = new Map<string, AttachmentIntentOutcome>();
+	private readonly attachmentOutcomeWaiters = new Set<string>();
+	private readonly fatalAttachmentPublicationIds = new Set<string>();
+	private attachmentPublicationDrain: Promise<void> | null = null;
 	private attachmentPublicationWork: Promise<void> = Promise.resolve();
 	private readonly providerSyncListeners = new Set<(generation: number) => void>();
 	private readonly renameBatch = new Map<string, string>();
@@ -743,6 +857,7 @@ export class VaultSync implements SyncRuntimePort {
 	}
 
 	constructor(options: VaultSyncOptions) {
+		if (!options.vaultGeneration.trim()) throw new Error("vault generation is required");
 		this.options = {
 			...options,
 			maxLoadedBodies: options.maxLoadedBodies ?? DEFAULT_MAX_LOADED_BODIES,
@@ -781,6 +896,8 @@ export class VaultSync implements SyncRuntimePort {
 			|| bodyStats.pendingLocalUpdates > 0
 		);
 	}
+	get pendingAttachmentOperations(): number { return this.attachmentOperations.size; }
+	get fatalAttachmentPublications(): number { return this.fatalAttachmentPublicationIds.size; }
 	get connectionGeneration(): number { return this._connectionGeneration; }
 	get fatalAuthError(): boolean { return this._fatalAuthCode !== null; }
 	get fatalAuthCode(): FatalSyncCode | null { return this._fatalAuthCode; }
@@ -843,7 +960,7 @@ export class VaultSync implements SyncRuntimePort {
 			Y.applyUpdate(this.ydoc, new Uint8Array(root.encodedState), "indexeddb-bootstrap");
 		}
 		if (root && this.ydoc.getMap("sys").get("schemaVersion") !== SCHEMA_VERSION) {
-			throw new Error("local root cache is not schema 4");
+			throw new Error(`local root cache is not schema ${SCHEMA_VERSION}`);
 		}
 		await this.restoreCandidates();
 		await this.retryLifecycleOperations();
@@ -969,77 +1086,153 @@ export class VaultSync implements SyncRuntimePort {
 	getAttachmentRef(path: string): BlobRef | undefined {
 		const ref = this.pathToBlob.get(path);
 		if (!ref || !safeBlobPath(path, [], "", ref)) return undefined;
-		const publicationPending = Array.from(this.attachmentOperations.values()).some((operation) =>
-			operation.mutation.kind === "upsert"
-			&& operation.mutation.path === path
-			&& operation.mutation.hash === ref.hash
-			&& operation.mutation.size === ref.size
-		);
-		return publicationPending ? undefined : ref;
+		return ref;
+	}
+
+	getObservedAttachmentHead(path: string): AttachmentHead {
+		const ref = this.pathToBlob.get(path);
+		if (ref && safeBlobPath(path, [], "", ref)) {
+			return { kind: "active", revision: ref.revision, hash: ref.hash, size: ref.size };
+		}
+		const tombstone = this.blobTombstones.get(path);
+		if (tombstone && safeBlobPath(path)) {
+			return { kind: "deleted", revision: tombstone.revision, previousHash: tombstone.previousHash ?? null };
+		}
+		return { kind: "missing", revision: null };
+	}
+
+	getProjectedAttachmentHead(path: string): AttachmentHead {
+		const heads = new Map<string, AttachmentHead>();
+		const getHead = (candidatePath: string): AttachmentHead => {
+			const existing = heads.get(candidatePath);
+			if (existing) return existing;
+			const observed = this.getObservedAttachmentHead(candidatePath);
+			heads.set(candidatePath, observed);
+			return observed;
+		};
+		for (const { mutation } of this.sortedAttachmentOperations()) {
+			if (mutation.kind === "upsert") {
+				heads.set(mutation.path, {
+					kind: "active",
+					revision: mutation.operationId,
+					hash: mutation.hash,
+					size: mutation.size,
+				});
+			} else if (mutation.kind === "delete") {
+				const prior = getHead(mutation.path);
+				heads.set(mutation.path, {
+					kind: "deleted",
+					revision: mutation.operationId,
+					previousHash: prior.kind === "active" ? prior.hash : prior.kind === "deleted" ? prior.previousHash : null,
+				});
+			} else {
+				const source = getHead(mutation.fromPath);
+				heads.set(mutation.fromPath, {
+					kind: "deleted",
+					revision: mutation.operationId,
+					previousHash: source.kind === "active" ? source.hash : source.kind === "deleted" ? source.previousHash : null,
+				});
+				if (source.kind === "active") {
+					heads.set(mutation.toPath, { ...source, revision: mutation.operationId });
+				}
+			}
+		}
+		return getHead(path);
+	}
+
+	private sortedAttachmentOperations(): StoredAttachmentPublicationOperation[] {
+		return [...this.attachmentOperations.values()].sort((left, right) => {
+			const leftSequence = left.localSequence > 0 ? left.localSequence : Number.MAX_SAFE_INTEGER;
+			const rightSequence = right.localSequence > 0 ? right.localSequence : Number.MAX_SAFE_INTEGER;
+			return leftSequence - rightSequence;
+		});
 	}
 
 	isAttachmentTombstoned(path: string): boolean {
 		return safeBlobPath(path) !== null && this.blobTombstones.has(path);
 	}
 
-	async setAttachmentRef(path: string, hash: string, size: number, mime: string): Promise<void> {
-		const ref = { hash, size };
+	async setAttachmentRef(path: string, hash: string, size: number, mime: string, intent: {
+		operationId: string;
+		expectedRevision: string | null;
+	}): Promise<AttachmentIntentOutcome> {
+		const ref = { hash, size, revision: "validation" };
 		const canonical = safeBlobPath(path, [], "", ref);
 		if (!canonical) throw new Error(`Invalid attachment path or reference: ${path}`);
-		await this.commitAttachmentPublication({
-			operationId: crypto.randomUUID(),
+		return this.commitAttachmentPublication({
+			operationId: intent.operationId,
 			kind: "upsert",
 			path: canonical,
+			expectedRevision: intent.expectedRevision,
 			hash,
 			size,
 			mime,
 		});
 	}
 
-	async deleteAttachmentRef(path: string, _device?: string): Promise<void> {
+	async deleteAttachmentRef(path: string, _device?: string): Promise<AttachmentIntentOutcome> {
 		const canonical = safeBlobPath(path);
 		if (!canonical) throw new Error(`Invalid attachment path: ${path}`);
-		await this.commitAttachmentPublication({
+		return this.commitAttachmentPublication({
 			operationId: crypto.randomUUID(),
 			kind: "delete",
 			path: canonical,
+			expectedRevision: this.getProjectedAttachmentHead(canonical).revision,
 		});
 	}
 
-	async renameAttachmentRef(oldPath: string, newPath: string): Promise<void> {
+	async renameAttachmentRef(oldPath: string, newPath: string): Promise<AttachmentIntentOutcome> {
 		const oldCanonical = safeBlobPath(oldPath);
-		const ref = oldCanonical ? this.pathToBlob.get(oldCanonical) : undefined;
+		const source = oldCanonical ? this.getProjectedAttachmentHead(oldCanonical) : null;
+		const ref = source?.kind === "active" ? { hash: source.hash, size: source.size, revision: source.revision } : undefined;
 		const newCanonical = ref ? safeBlobPath(newPath, [], "", ref) : null;
 		if (!oldCanonical || !newCanonical) throw new Error("Invalid attachment rename");
-		if (oldCanonical === newCanonical || !ref) return;
-		await this.commitAttachmentPublication({
+		if (oldCanonical === newCanonical || !ref || !source || source.kind !== "active") {
+			return { kind: "committed", revision: source?.revision ?? "" };
+		}
+		return this.commitAttachmentPublication({
 			operationId: crypto.randomUUID(),
 			kind: "rename",
 			fromPath: oldCanonical,
 			toPath: newCanonical,
+			expectedFromRevision: source.revision,
+			expectedToRevision: this.getProjectedAttachmentHead(newCanonical).revision,
 		});
 	}
 
 	private async commitAttachmentPublication(
 		proposed: AttachmentPublicationMutation,
-	): Promise<void> {
-		const save = this.options.database.putAttachmentOperation;
-		if (!save) throw new Error("attachment publication persistence is unavailable");
-		const existing = Array.from(this.attachmentOperations.values()).find((operation) =>
-			this.sameAttachmentMutation(operation.mutation, proposed)
-		);
+	): Promise<AttachmentIntentOutcome> {
+		this.assertAttachmentMutation(proposed);
+		const existing = this.attachmentOperations.get(proposed.operationId);
+		if (existing && !this.sameAttachmentMutation(existing.mutation, proposed)) {
+			this.emitAttachmentPublicationEvent(
+				PRODUCT_EVENT_KIND.attachmentPublicationIdentityMismatch,
+				existing,
+				"error",
+			);
+			throw new AttachmentPublicationError(409, "attachment_operation_identity_mismatch");
+		}
 		const operation = existing ?? {
+			vaultId: this.options.vaultId,
+			vaultGeneration: this.options.vaultGeneration,
 			mutation: proposed,
+			localSequence: 0,
 			createdAt: this.now(),
 			attempts: 0,
 			lastAttemptAt: null,
 		};
 		if (!existing) {
+			// Reserve the projected head before awaiting IndexedDB. A delete or
+			// rename arriving during this durability boundary must chain after this
+			// operation if it commits, rather than independently planning at R0.
 			this.attachmentOperations.set(proposed.operationId, operation);
-			const durability = save.call(this.options.database, operation);
+			const durability = this.options.database.putAttachmentOperation(operation);
 			this.attachmentOperationDurability.set(proposed.operationId, durability);
 			try {
-				await durability;
+				const stored = await durability;
+				this.assertStoredAttachmentOperation(operation, stored);
+				this.attachmentOperations.set(proposed.operationId, stored);
 			} catch (error) {
 				if (this.attachmentOperations.get(proposed.operationId) === operation) {
 					this.attachmentOperations.delete(proposed.operationId);
@@ -1053,66 +1246,296 @@ export class VaultSync implements SyncRuntimePort {
 		} else {
 			await this.attachmentOperationDurability.get(existing.mutation.operationId);
 		}
-		await this.enqueueAttachmentPublication(operation.mutation.operationId);
+		this.attachmentOutcomeWaiters.add(operation.mutation.operationId);
+		try {
+			while (this.attachmentOperations.has(operation.mutation.operationId)) {
+				await this.requestAttachmentPublicationDrain();
+			}
+			const terminal = this.attachmentTerminalOutcomes.get(operation.mutation.operationId);
+			this.attachmentTerminalOutcomes.delete(operation.mutation.operationId);
+			this.attachmentOutcomeWaiters.delete(operation.mutation.operationId);
+			return terminal ?? { kind: "committed", revision: operation.mutation.operationId };
+		} catch (error) {
+			this.attachmentOutcomeWaiters.delete(operation.mutation.operationId);
+			if (error instanceof AttachmentPublicationProofError) throw error;
+			if (error instanceof AttachmentPublicationError && error.status < 500) throw error;
+			this.emitAttachmentPublicationEvent(
+				PRODUCT_EVENT_KIND.attachmentPublicationDurablePending,
+				operation,
+				"warn",
+			);
+			return { kind: "durably-pending", operationId: operation.mutation.operationId };
+		}
 	}
 
-	private enqueueAttachmentPublication(operationId: string): Promise<void> {
-		const existing = this.attachmentSubmissions.get(operationId);
-		if (existing) return existing;
-		const submission = this.attachmentPublicationWork.then(async () => {
-			const operation = this.attachmentOperations.get(operationId);
-			if (!operation) return;
-			await this.publishStoredAttachmentOperation(operation);
-		});
-		this.attachmentPublicationWork = submission.catch(() => undefined);
-		this.attachmentSubmissions.set(operationId, submission);
-		void submission.finally(() => {
-			if (this.attachmentSubmissions.get(operationId) === submission) {
-				this.attachmentSubmissions.delete(operationId);
-			}
+	private requestAttachmentPublicationDrain(): Promise<void> {
+		if (this.attachmentPublicationDrain) return this.attachmentPublicationDrain;
+		const drain = this.drainAttachmentPublications();
+		this.attachmentPublicationDrain = drain;
+		this.attachmentPublicationWork = drain.catch(() => undefined);
+		void drain.finally(() => {
+			if (this.attachmentPublicationDrain === drain) this.attachmentPublicationDrain = null;
 		}).catch(() => undefined);
-		return submission;
+		return drain;
+	}
+
+	private async drainAttachmentPublications(): Promise<void> {
+		while (true) {
+			const operation = this.sortedAttachmentOperations().find((candidate) => candidate.localSequence > 0);
+			if (!operation) return;
+			try {
+				await this.publishStoredAttachmentOperation(operation);
+			} catch (error) {
+				if (error instanceof AttachmentPublicationError
+					&& error.status === 409
+					&& error.code === "attachment_revision_mismatch") {
+					await this.retireSupersededAttachmentChain(operation, error);
+					continue;
+				}
+				if (error instanceof AttachmentPublicationError
+					&& error.code === "attachment_operation_identity_mismatch") {
+					this.emitAttachmentPublicationEvent(
+						PRODUCT_EVENT_KIND.attachmentPublicationIdentityMismatch,
+						operation,
+						"error",
+					);
+				} else if (error instanceof AttachmentPublicationError
+					&& error.code === "attachment_mutation_busy") {
+					this.emitAttachmentPublicationEvent(
+						PRODUCT_EVENT_KIND.attachmentPublicationMutationBusy,
+						operation,
+						"warn",
+					);
+				}
+				if (error instanceof AttachmentPublicationProofError
+					|| (error instanceof AttachmentPublicationError && error.status < 500)) {
+					this.fatalAttachmentPublicationIds.add(operation.mutation.operationId);
+				}
+				throw error;
+			}
+		}
 	}
 
 	private async publishStoredAttachmentOperation(
 		operation: StoredAttachmentPublicationOperation,
 	): Promise<void> {
-		const save = this.options.database.putAttachmentOperation;
-		const remove = this.options.database.deleteAttachmentOperation;
-		if (!save || !remove) throw new Error("attachment publication persistence is unavailable");
 		const attempted = {
 			...operation,
 			attempts: operation.attempts + 1,
 			lastAttemptAt: this.now(),
 		};
-		await save.call(this.options.database, attempted);
-		this.attachmentOperations.set(attempted.mutation.operationId, attempted);
+		const storedAttempt = await this.options.database.putAttachmentOperation(attempted);
+		this.assertStoredAttachmentOperation(attempted, storedAttempt);
+		this.attachmentOperations.set(storedAttempt.mutation.operationId, storedAttempt);
 		const receipt = await this.server.publishAttachment(attempted.mutation);
-		await this.applyAttachmentPublication(attempted.mutation.operationId, receipt);
-		await remove.call(this.options.database, attempted.mutation.operationId);
+		await this.applyAttachmentPublication(attempted.mutation, receipt);
+		await this.options.database.deleteAttachmentOperation(attempted.mutation.operationId);
 		this.attachmentOperations.delete(attempted.mutation.operationId);
+		this.fatalAttachmentPublicationIds.delete(attempted.mutation.operationId);
+		this.emitAttachmentPublicationEvent(
+			storedAttempt.attempts > 1
+				? PRODUCT_EVENT_KIND.attachmentPublicationReplayed
+				: PRODUCT_EVENT_KIND.attachmentPublicationCommitted,
+			storedAttempt,
+			"info",
+		);
 	}
 
 	private async retryAttachmentOperations(): Promise<void> {
-		const load = this.options.database.listAttachmentOperations;
-		if (!load) throw new Error("attachment publication persistence is unavailable");
-		const operations = (await load.call(this.options.database)).sort((left, right) =>
-			left.createdAt - right.createdAt
-			|| left.mutation.operationId.localeCompare(right.mutation.operationId)
-		);
+		const operations = (await this.options.database.listAttachmentOperations())
+			.sort((left, right) => left.localSequence - right.localSequence);
+		const sequences = new Set<number>();
 		for (const operation of operations) {
+			this.assertAttachmentOperationScope(operation);
+			this.assertAttachmentMutation(operation.mutation);
+			if (!Number.isSafeInteger(operation.localSequence) || operation.localSequence <= 0
+				|| sequences.has(operation.localSequence)) {
+				throw new AttachmentPublicationProofError("attachment publication sequence is invalid");
+			}
+			sequences.add(operation.localSequence);
+			const existing = this.attachmentOperations.get(operation.mutation.operationId);
+			if (existing && !this.sameAttachmentMutation(existing.mutation, operation.mutation)) {
+				throw new AttachmentPublicationProofError("attachment operation identity is inconsistent in local storage");
+			}
 			this.attachmentOperations.set(operation.mutation.operationId, operation);
 		}
 		for (const operation of operations) {
+			if (!this.attachmentOperations.has(operation.mutation.operationId)) continue;
 			try {
-				await this.enqueueAttachmentPublication(operation.mutation.operationId);
+				await this.requestAttachmentPublicationDrain();
 			} catch (error) {
-				this.log(
-					`attachment publication remains pending for ${operation.mutation.operationId}: ${String(error)}`,
-				);
+				if (error instanceof AttachmentPublicationProofError
+					|| (error instanceof AttachmentPublicationError && error.status < 500)) throw error;
+				this.log(`attachment publication remains pending for ${operation.mutation.operationId}: ${String(error)}`);
 				break;
 			}
 		}
+	}
+
+	private assertStoredAttachmentOperation(
+		expected: StoredAttachmentPublicationOperation,
+		stored: StoredAttachmentPublicationOperation,
+	): void {
+		this.assertAttachmentOperationScope(stored);
+		this.assertAttachmentMutation(stored.mutation);
+		if (expected.vaultId !== stored.vaultId
+			|| expected.vaultGeneration !== stored.vaultGeneration
+			|| !this.sameAttachmentMutation(expected.mutation, stored.mutation)
+			|| !Number.isSafeInteger(stored.localSequence) || stored.localSequence <= 0
+			|| (expected.localSequence > 0 && stored.localSequence !== expected.localSequence)) {
+			throw new AttachmentPublicationProofError("attachment publication persistence changed operation identity");
+		}
+	}
+
+	private assertAttachmentOperationScope(operation: StoredAttachmentPublicationOperation): void {
+		if (operation.vaultId !== this.options.vaultId
+			|| operation.vaultGeneration !== this.options.vaultGeneration) {
+			throw new AttachmentPublicationProofError(
+				"attachment publication scope does not match the active vault generation",
+			);
+		}
+	}
+
+	private assertAttachmentMutation(mutation: AttachmentPublicationMutation): void {
+		const validIdentity = (value: string): boolean => value.length > 0 && value.length <= 128;
+		const validRevision = (value: string | null): boolean => value === null || validIdentity(value);
+		if (!validIdentity(mutation.operationId)) {
+			throw new AttachmentPublicationProofError("attachment operation ID is invalid");
+		}
+		if (mutation.kind === "upsert") {
+			if (safeBlobPath(mutation.path, [], "", mutation) !== mutation.path
+				|| !validRevision(mutation.expectedRevision)
+				|| typeof mutation.mime !== "string" || !mutation.mime || mutation.mime.length > 256) {
+				throw new AttachmentPublicationProofError("attachment upsert mutation is invalid");
+			}
+		} else if (mutation.kind === "delete") {
+			if (safeBlobPath(mutation.path) !== mutation.path || !validRevision(mutation.expectedRevision)) {
+				throw new AttachmentPublicationProofError("attachment delete mutation is invalid");
+			}
+		} else if (safeBlobPath(mutation.fromPath) !== mutation.fromPath
+			|| safeBlobPath(mutation.toPath) !== mutation.toPath
+			|| mutation.fromPath === mutation.toPath
+			|| !validIdentity(mutation.expectedFromRevision)
+			|| !validRevision(mutation.expectedToRevision)) {
+			throw new AttachmentPublicationProofError("attachment rename mutation is invalid");
+		}
+	}
+
+	private async retireSupersededAttachmentChain(
+		failed: StoredAttachmentPublicationOperation,
+		error: AttachmentPublicationError,
+	): Promise<void> {
+		const mismatch = error.mismatch;
+		if (!mismatch || mismatch.vaultGeneration !== this.options.vaultGeneration) {
+			throw new AttachmentPublicationProofError(
+				"attachment revision mismatch proof is invalid for this vault generation",
+			);
+		}
+		const failedPaths = new Set(this.attachmentMutationPaths(failed.mutation));
+		const mismatchPaths = new Set(mismatch.currentHeads.map((entry) => entry.path));
+		if (!failedPaths.has(mismatch.path) || mismatchPaths.size !== failedPaths.size
+			|| [...failedPaths].some((path) => !mismatchPaths.has(path))) {
+			throw new AttachmentPublicationProofError("attachment revision mismatch paths are invalid");
+		}
+		const currentByPath = new Map(mismatch.currentHeads.map((entry) => [entry.path, entry.head]));
+		if (!currentByPath.has(mismatch.path)) currentByPath.set(mismatch.path, mismatch.current);
+		const retiredIds = new Set([failed.mutation.operationId]);
+		const retired: StoredAttachmentPublicationOperation[] = [];
+		for (const operation of this.sortedAttachmentOperations()) {
+			if (operation.mutation.operationId === failed.mutation.operationId
+				|| this.attachmentMutationDependsOn(operation.mutation, retiredIds)) {
+				retiredIds.add(operation.mutation.operationId);
+				retired.push(operation);
+			}
+		}
+		for (const operation of retired) {
+			await this.options.database.deleteAttachmentOperation(operation.mutation.operationId);
+		}
+		const affectedPaths = new Set<string>();
+		for (const operation of retired) {
+			this.attachmentOperations.delete(operation.mutation.operationId);
+			this.fatalAttachmentPublicationIds.delete(operation.mutation.operationId);
+			const paths = this.attachmentMutationPaths(operation.mutation);
+			for (const path of paths) affectedPaths.add(path);
+			const primaryPath = operation.mutation.kind === "rename"
+				? operation.mutation.toPath
+				: operation.mutation.path;
+			const current = currentByPath.get(primaryPath)
+				?? currentByPath.get(paths[0]!)
+				?? this.getObservedAttachmentHead(primaryPath);
+			if (this.attachmentOutcomeWaiters.has(operation.mutation.operationId)) {
+				this.attachmentTerminalOutcomes.set(operation.mutation.operationId, {
+					kind: "superseded",
+					current,
+				});
+			}
+			this.emitAttachmentPublicationEvent(
+				PRODUCT_EVENT_KIND.attachmentPublicationSupersededRemote,
+				operation,
+				"warn",
+				current,
+			);
+		}
+		const callback = this.options.onAttachmentReconciliationRequired;
+		if (callback && affectedPaths.size > 0) {
+			void Promise.resolve()
+				.then(() => callback([...affectedPaths], "revision-mismatch"))
+				.catch((callbackError) => {
+					this.log(`attachment reconciliation scheduling failed: ${String(callbackError)}`);
+				});
+		}
+	}
+
+	private attachmentMutationDependsOn(
+		mutation: AttachmentPublicationMutation,
+		operationIds: ReadonlySet<string>,
+	): boolean {
+		if (mutation.kind === "rename") {
+			return operationIds.has(mutation.expectedFromRevision)
+				|| (mutation.expectedToRevision !== null && operationIds.has(mutation.expectedToRevision));
+		}
+		return mutation.expectedRevision !== null && operationIds.has(mutation.expectedRevision);
+	}
+
+	private attachmentMutationPaths(mutation: AttachmentPublicationMutation): string[] {
+		return mutation.kind === "rename"
+			? [mutation.fromPath, mutation.toPath]
+			: [mutation.path];
+	}
+
+	private emitAttachmentPublicationEvent(
+		kind: typeof PRODUCT_EVENT_KIND.attachmentPublicationDurablePending
+			| typeof PRODUCT_EVENT_KIND.attachmentPublicationCommitted
+			| typeof PRODUCT_EVENT_KIND.attachmentPublicationSupersededRemote
+			| typeof PRODUCT_EVENT_KIND.attachmentPublicationReplayed
+			| typeof PRODUCT_EVENT_KIND.attachmentPublicationIdentityMismatch
+			| typeof PRODUCT_EVENT_KIND.attachmentPublicationMutationBusy,
+		operation: StoredAttachmentPublicationOperation,
+		severity: "info" | "warn" | "error",
+		current?: AttachmentHead,
+	): void {
+		const mutation = operation.mutation;
+		const path = mutation.kind === "rename" ? mutation.toPath : mutation.path;
+		const expected = mutation.kind === "rename"
+			? `${mutation.expectedFromRevision}:${mutation.expectedToRevision ?? "missing"}`
+			: mutation.expectedRevision ?? "missing";
+		this.options.onProductEvent?.({
+			kind,
+			severity,
+			scope: "file",
+			source: "vaultSync",
+			layer: "server",
+			priority: severity === "error" ? "critical" : "important",
+			path,
+			data: {
+				operationPrefix: mutation.operationId.slice(0, 12),
+				localSequence: operation.localSequence,
+				expectedRevisionPrefix: expected.slice(0, 25),
+				currentRevisionPrefix: current?.revision?.slice(0, 12) ?? null,
+				queueAgeMs: Math.max(0, this.now() - operation.createdAt),
+				attempts: operation.attempts,
+			},
+		});
 	}
 
 	private sameAttachmentMutation(
@@ -1126,30 +1549,154 @@ export class VaultSync implements SyncRuntimePort {
 					&& left.path === right.path
 					&& left.hash === right.hash
 					&& left.size === right.size
-					&& left.mime === right.mime;
+					&& left.mime === right.mime
+					&& left.expectedRevision === right.expectedRevision;
 			case "delete":
-				return right.kind === "delete" && left.path === right.path;
+				return right.kind === "delete" && left.path === right.path
+					&& left.expectedRevision === right.expectedRevision;
 			case "rename":
 				return right.kind === "rename"
 					&& left.fromPath === right.fromPath
-					&& left.toPath === right.toPath;
+					&& left.toPath === right.toPath
+					&& left.expectedFromRevision === right.expectedFromRevision
+					&& left.expectedToRevision === right.expectedToRevision;
 		}
 	}
 
 	private async applyAttachmentPublication(
-		operationId: string,
+		mutation: AttachmentPublicationMutation,
 		receipt: AttachmentPublicationReceipt,
 	): Promise<void> {
-		if (receipt.operationId !== operationId || !receipt.vaultGeneration || !receipt.runtimeEpoch
+		const expectedResults = mutation.kind === "rename"
+			? new Map([[mutation.fromPath, "deleted"], [mutation.toPath, "active"]] as const)
+			: new Map([[mutation.path, mutation.kind === "delete" ? "deleted" : "active"]] as const);
+		const resultPaths = new Set(receipt.revisions.map((result) => result.path));
+		if (receipt.operationId !== mutation.operationId || receipt.outcome !== "committed"
+			|| receipt.revisions.length !== expectedResults.size
+			|| resultPaths.size !== receipt.revisions.length
+			|| !receipt.revisions.every((result) => result.revision === mutation.operationId
+				&& expectedResults.get(result.path) === result.state)
+			|| receipt.vaultGeneration !== this.options.vaultGeneration || !receipt.runtimeEpoch
 			|| !Number.isSafeInteger(receipt.vaultSequence) || receipt.vaultSequence < 0
 			|| !Number.isSafeInteger(receipt.rootGeneration) || receipt.rootGeneration < 0
 			|| typeof receipt.rootUpdateBase64Url !== "string" || !receipt.rootUpdateBase64Url) {
-			throw new Error("attachment publication proof mismatch");
+			throw new AttachmentPublicationProofError("attachment publication proof mismatch");
 		}
-		const update = base64UrlToBytes(receipt.rootUpdateBase64Url);
+		let update: Uint8Array;
+		try {
+			update = base64UrlToBytes(receipt.rootUpdateBase64Url);
+			this.validateAttachmentPublicationUpdate(mutation, update);
+		} catch (error) {
+			if (error instanceof AttachmentPublicationProofError) throw error;
+			throw new AttachmentPublicationProofError(String(error));
+		}
 		Y.applyUpdate(this.ydoc, update, ORIGIN_DURABLE_ROOT_PUBLICATION);
 		this._rootGeneration = Math.max(this._rootGeneration, receipt.rootGeneration);
 		await this.persistRoot();
+	}
+
+	private validateAttachmentPublicationUpdate(
+		mutation: AttachmentPublicationMutation,
+		update: Uint8Array,
+	): void {
+		const beforeSource = mutation.kind === "rename"
+			? this.getObservedAttachmentHead(mutation.fromPath)
+			: null;
+		const beforePath = mutation.kind === "delete"
+			? this.getObservedAttachmentHead(mutation.path)
+			: null;
+		const candidate = new Y.Doc({ guid: "attachment-publication-validation" });
+		try {
+			Y.applyUpdate(candidate, Y.encodeStateAsUpdate(this.ydoc));
+			Y.applyUpdate(candidate, update);
+			if (!this.hasSafeAttachmentRoot(candidate)) {
+				throw new AttachmentPublicationProofError("attachment publication root semantics are invalid");
+			}
+			const head = (path: string): AttachmentHead => {
+				const ref = candidate.getMap<BlobRef>("pathToBlob").get(path);
+				if (ref) return { kind: "active", revision: ref.revision, hash: ref.hash, size: ref.size };
+				const tombstone = candidate.getMap<BlobTombstone>("blobTombstones").get(path);
+				if (tombstone) return {
+					kind: "deleted",
+					revision: tombstone.revision,
+					previousHash: tombstone.previousHash,
+				};
+				return { kind: "missing", revision: null };
+			};
+			if (mutation.kind === "upsert") {
+				const result = head(mutation.path);
+				if (result.revision === mutation.expectedRevision
+					|| (result.revision === mutation.operationId
+						&& (result.kind !== "active" || result.hash !== mutation.hash || result.size !== mutation.size))) {
+					throw new AttachmentPublicationProofError("attachment upsert result does not match its mutation");
+				}
+			} else if (mutation.kind === "delete") {
+				const result = head(mutation.path);
+				if (result.revision === mutation.expectedRevision
+					|| (result.revision === mutation.operationId && result.kind !== "deleted")
+					|| (result.revision === mutation.operationId
+						&& result.kind === "deleted"
+						&& beforePath?.revision === mutation.expectedRevision
+						&& result.previousHash !== (beforePath.kind === "active"
+							? beforePath.hash
+							: beforePath.kind === "deleted" ? beforePath.previousHash : null))) {
+					throw new AttachmentPublicationProofError("attachment delete result does not match its mutation");
+				}
+			} else {
+				const source = head(mutation.fromPath);
+				const target = head(mutation.toPath);
+				if (source.revision === mutation.expectedFromRevision
+					|| target.revision === mutation.expectedToRevision
+					|| (source.revision === mutation.operationId && source.kind !== "deleted")
+					|| (target.revision === mutation.operationId && target.kind !== "active")) {
+					throw new AttachmentPublicationProofError("attachment rename result does not match its mutation");
+				}
+				if (target.revision === mutation.operationId
+					&& beforeSource?.kind === "active"
+					&& (target.kind !== "active"
+						|| target.hash !== beforeSource.hash
+						|| target.size !== beforeSource.size)) {
+					throw new AttachmentPublicationProofError("attachment rename changed the source object identity");
+				}
+				if (source.revision === mutation.operationId
+					&& target.revision === mutation.operationId
+					&& (source.kind !== "deleted" || target.kind !== "active"
+						|| source.previousHash !== target.hash)) {
+					throw new AttachmentPublicationProofError("attachment rename result paths disagree");
+				}
+			}
+		} finally {
+			candidate.destroy();
+		}
+	}
+
+	private hasSafeAttachmentRoot(doc: Y.Doc): boolean {
+		if (doc.getMap("sys").get("schemaVersion") !== SCHEMA_VERSION
+			|| doc.getMap("sys").get("protocolVersion") !== PROTOCOL_VERSION) return false;
+		const refs = doc.getMap<BlobRef>("pathToBlob");
+		const tombstones = doc.getMap<BlobTombstone>("blobTombstones");
+		const metadata = doc.getMap<BlobMeta>("blobMeta");
+		for (const [path, ref] of refs) {
+			if (!ref || safeBlobPath(path, [], "", ref) !== path
+				|| typeof ref.revision !== "string" || !ref.revision || ref.revision.length > 128
+				|| tombstones.has(path)) return false;
+			const meta = metadata.get(ref.hash);
+			if (!meta || meta.size !== ref.size) return false;
+		}
+		for (const [path, tombstone] of tombstones) {
+			if (safeBlobPath(path) !== path || !tombstone
+				|| !Number.isSafeInteger(tombstone.deletedAt) || tombstone.deletedAt < 0
+				|| typeof tombstone.revision !== "string" || !tombstone.revision || tombstone.revision.length > 128
+				|| (tombstone.previousHash !== null && !/^[a-f0-9]{64}$/.test(tombstone.previousHash))
+				|| refs.has(path)) return false;
+		}
+		for (const [hash, meta] of metadata) {
+			if (!/^[a-f0-9]{64}$/.test(hash) || !meta
+				|| !Number.isSafeInteger(meta.size) || meta.size < 0
+				|| typeof meta.mime !== "string" || !meta.mime || meta.mime.length > 256
+				|| !Number.isSafeInteger(meta.createdAt) || meta.createdAt < 0) return false;
+		}
+		return true;
 	}
 
 	observeAttachmentChanges(callback: (change: AttachmentCatalogChange) => void): () => void {

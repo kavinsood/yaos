@@ -2,7 +2,7 @@ import { strict as assert } from "node:assert";
 import {
 	assertResetAllowed,
 	PendingWorkError,
-	schema4VaultIdbName,
+	schema5VaultIdbName,
 	VaultIndexedDb,
 	type PendingWorkSummary,
 } from "../../src/sync/vaultIndexedDb";
@@ -26,23 +26,23 @@ const clean: PendingWorkSummary = {
 s.test("schema-4 databases fence vault generation and local folder identity", () => {
 	const legacyCache = vaultIdbName("vault-a", "folder-a");
 	assert.equal(
-		schema4VaultIdbName("vault-a", "generation-a", "folder-a"),
-		"yaos:vault-a:generation-a:folder-a:schema-4",
+		schema5VaultIdbName("vault-a", "generation-a", "folder-a"),
+		"yaos:vault-a:generation-a:folder-a:schema-5",
 	);
-	assert.notEqual(schema4VaultIdbName("vault-a", "generation-a", "folder-a"), legacyCache);
+	assert.notEqual(schema5VaultIdbName("vault-a", "generation-a", "folder-a"), legacyCache);
 	assert.notEqual(
-		schema4VaultIdbName("vault-a", "generation-a", "folder-a"),
-		schema4VaultIdbName("vault-a", "generation-b", "folder-a"),
+		schema5VaultIdbName("vault-a", "generation-a", "folder-a"),
+		schema5VaultIdbName("vault-a", "generation-b", "folder-a"),
 		"destructive reprovisioning never opens the prior generation cache",
 	);
 	assert.notEqual(
-		schema4VaultIdbName("vault-a", "generation-a", "folder-a"),
-		schema4VaultIdbName("vault-a", "generation-a", "folder-b"),
+		schema5VaultIdbName("vault-a", "generation-a", "folder-a"),
+		schema5VaultIdbName("vault-a", "generation-a", "folder-b"),
 		"two local folders enrolled in the same vault never share schema-4 state",
 	);
-	assert.equal(localVaultImportIdbName("vault-a", "folder-a"), `${legacyCache}:schema-4:local-import`);
-	assert.throws(() => schema4VaultIdbName("vault-a", "", "folder-a"), /generation/);
-	assert.throws(() => schema4VaultIdbName("vault-a", "generation-a", ""), /folder key/);
+	assert.equal(localVaultImportIdbName("vault-a", "folder-a"), `${legacyCache}:schema-5:local-import`);
+	assert.throws(() => schema5VaultIdbName("vault-a", "", "folder-a"), /generation/);
+	assert.throws(() => schema5VaultIdbName("vault-a", "generation-a", ""), /folder key/);
 	assert.throws(() => localVaultImportIdbName("", "folder-a"), /vault ID/);
 });
 
@@ -77,5 +77,33 @@ s.test("recovery operation identities hydrate from the vault-and-folder database
 	assert.equal(hydrated.activeCaptureId, "capture-1");
 	assert.equal(hydrated.activeRestore?.restoreId, "restore-1");
 	await restarted.close();
+});
+
+s.test("attachment operations allocate a durable causal sequence transactionally", async () => {
+	const indexedDb = new FakeIndexedDb();
+	const database = new VaultIndexedDb("vault-attachments", "generation-attachments", "folder-attachments", indexedDb);
+	const first = await database.putAttachmentOperation({
+		vaultId: "vault-attachments",
+		vaultGeneration: "generation-attachments",
+		mutation: { operationId: "operation-z", kind: "upsert", path: "assets/order.bin", expectedRevision: null,
+			hash: "a".repeat(64), size: 1, mime: "application/octet-stream" },
+		localSequence: 0,
+		createdAt: 1,
+		attempts: 0,
+		lastAttemptAt: null,
+	});
+	const second = await database.putAttachmentOperation({
+		vaultId: "vault-attachments",
+		vaultGeneration: "generation-attachments",
+		mutation: { operationId: "operation-a", kind: "delete", path: "assets/order.bin", expectedRevision: first.mutation.operationId },
+		localSequence: 0,
+		createdAt: 1,
+		attempts: 0,
+		lastAttemptAt: null,
+	});
+	assert.equal(first.localSequence, 1);
+	assert.equal(second.localSequence, 2);
+	assert.deepEqual((await database.listAttachmentOperations()).map((operation) => operation.mutation.operationId), ["operation-z", "operation-a"]);
+	await database.close();
 });
 await s.done();

@@ -123,6 +123,7 @@ export class FakeOpenDbRequest extends FakeRequest<IDBDatabase> implements IDBOp
 
 type FakeDatabaseData = {
 	stores: Map<string, Map<string, unknown>>;
+	keyPaths: Map<string, string | null>;
 	/** Per-store tail of committed `readwrite` transactions, so writes cannot interleave. */
 	writeQueues: Map<string, Promise<void>>;
 };
@@ -139,8 +140,7 @@ export class FakeTransaction extends EventTarget implements IDBTransaction {
 
 	constructor(
 		readonly db: IDBDatabase,
-		private readonly storeName: string,
-		private readonly store: Map<string, unknown>,
+		private readonly stores: Map<string, { data: Map<string, unknown>; keyPath: string | null }>,
 		readonly mode: IDBTransactionMode,
 		private readonly abortAfterRequestSuccess: boolean,
 		private readonly waitFor: Promise<void>,
@@ -152,7 +152,7 @@ export class FakeTransaction extends EventTarget implements IDBTransaction {
 	}
 
 	get objectStoreNames(): DOMStringList {
-		return new FakeStringList(() => [this.storeName]);
+		return new FakeStringList(() => [...this.stores.keys()]);
 	}
 
 	get durability(): never {
@@ -168,8 +168,9 @@ export class FakeTransaction extends EventTarget implements IDBTransaction {
 	}
 
 	objectStore(name: string): FakeObjectStore {
-		if (name !== this.storeName) throw new Error(`Missing object store ${name}`);
-		return new FakeObjectStore(name, this.store, this);
+		const store = this.stores.get(name);
+		if (!store) throw new Error(`Missing object store ${name}`);
+		return new FakeObjectStore(name, store.data, this, store.keyPath);
 	}
 
 	enqueue<T>(work: () => T): FakeRequest<T> {
@@ -212,6 +213,7 @@ export class FakeObjectStore implements IDBObjectStore {
 		readonly name: string,
 		private readonly store: Map<string, unknown>,
 		readonly transaction: FakeTransaction,
+		private readonly storedKeyPath: string | null = null,
 	) {}
 
 	get autoIncrement(): boolean {
@@ -220,8 +222,8 @@ export class FakeObjectStore implements IDBObjectStore {
 
 	// lib.dom types keyPath as `string | string[]`, but a store created without
 	// one really has null, so there is no honest value to return here.
-	get keyPath(): never {
-		return unreachable("IDBObjectStore.keyPath");
+	get keyPath(): string | string[] {
+		return this.storedKeyPath ?? "";
 	}
 
 	get indexNames(): DOMStringList {
@@ -234,7 +236,17 @@ export class FakeObjectStore implements IDBObjectStore {
 	}
 
 	put(value: unknown, key?: IDBValidKey): FakeRequest<IDBValidKey> {
-		const stringKey = requireStringKey(key);
+		let candidate = key;
+		if (candidate === undefined && this.storedKeyPath && typeof value === "object" && value !== null) {
+			let current: unknown = value;
+			for (const segment of this.storedKeyPath.split(".")) {
+				current = typeof current === "object" && current !== null
+					? (current as Record<string, unknown>)[segment]
+					: undefined;
+			}
+			candidate = current as IDBValidKey | undefined;
+		}
+		const stringKey = requireStringKey(candidate);
 		return this.transaction.enqueue(() => {
 			this.store.set(stringKey, value);
 			return stringKey;
@@ -269,8 +281,8 @@ export class FakeObjectStore implements IDBObjectStore {
 		return unreachable("IDBObjectStore.deleteIndex");
 	}
 
-	getAll(): never {
-		return unreachable("IDBObjectStore.getAll");
+	getAll(): FakeRequest<unknown[]> {
+		return this.transaction.enqueue(() => [...this.store.values()]);
 	}
 
 	getAllKeys(): never {
@@ -313,37 +325,40 @@ export class FakeDatabase extends EventTarget implements IDBDatabase {
 		return new FakeStringList(() => [...this.data.stores.keys()]);
 	}
 
-	createObjectStore(name: string): FakeObjectStore {
+	createObjectStore(name: string, options?: IDBObjectStoreParameters): FakeObjectStore {
 		let store = this.data.stores.get(name);
 		if (!store) {
 			store = new Map();
 			this.data.stores.set(name, store);
 		}
+		const keyPath = typeof options?.keyPath === "string" ? options.keyPath : null;
+		this.data.keyPaths.set(name, keyPath);
 		// Real createObjectStore returns the store bound to the versionchange
 		// transaction. Built directly rather than through transaction() so it
 		// never enters writeQueues: no caller uses it, and an unused queue entry
 		// would never complete and would stall every later write to this store.
-		const upgradeTx = new FakeTransaction(this, name, store, "versionchange", false, Promise.resolve());
-		return upgradeTx.objectStore(name);
+		const upgradeTx = new FakeTransaction(this, new Map([[name, { data: store, keyPath }]]), "versionchange", false, Promise.resolve());
+		return new FakeObjectStore(name, store, upgradeTx, keyPath);
 	}
 
 	transaction(storeNames: string | string[], mode: IDBTransactionMode = "readonly"): FakeTransaction {
-		// The fake opens one object store per transaction; a multi-store request is a test bug.
-		const storeName = typeof storeNames === "string"
-			? storeNames
-			: storeNames.length === 1 ? storeNames[0] : undefined;
-		if (storeName === undefined) {
-			throw new TypeError(`FakeIndexedDb supports single-store transactions only, received ${JSON.stringify(storeNames)}`);
+		const names = typeof storeNames === "string" ? [storeNames] : [...storeNames];
+		if (names.length === 0) throw new TypeError("FakeIndexedDb transaction requires an object store");
+		const stores = new Map<string, { data: Map<string, unknown>; keyPath: string | null }>();
+		for (const name of names) {
+			const store = this.data.stores.get(name);
+			if (!store) throw new Error(`Missing object store ${name}`);
+			stores.set(name, { data: store, keyPath: this.data.keyPaths.get(name) ?? null });
 		}
-		const store = this.data.stores.get(storeName);
-		if (!store) throw new Error(`Missing object store ${storeName}`);
 		const abortAfterRequestSuccess = mode === "readwrite" && this.factory.abortNextWriteTransaction;
 		this.factory.abortNextWriteTransaction = false;
 		const waitFor = mode === "readwrite"
-			? (this.data.writeQueues.get(storeName) ?? Promise.resolve())
+			? Promise.all(names.map((name) => this.data.writeQueues.get(name) ?? Promise.resolve())).then(() => undefined)
 			: Promise.resolve();
-		const tx = new FakeTransaction(this, storeName, store, mode, abortAfterRequestSuccess, waitFor);
-		if (mode === "readwrite") this.data.writeQueues.set(storeName, tx.done.catch(() => undefined));
+		const tx = new FakeTransaction(this, stores, mode, abortAfterRequestSuccess, waitFor);
+		if (mode === "readwrite") {
+			for (const name of names) this.data.writeQueues.set(name, tx.done.catch(() => undefined));
+		}
 		return tx;
 	}
 
@@ -374,7 +389,7 @@ export class FakeIndexedDb implements IDBFactory {
 				return;
 			}
 			const existing = this.stored.get(name);
-			const data = existing ?? { stores: new Map(), writeQueues: new Map() };
+			const data = existing ?? { stores: new Map(), keyPaths: new Map(), writeQueues: new Map() };
 			if (!existing) this.stored.set(name, data);
 			const db = new FakeDatabase(name, version, data, this);
 			req.result = db;
@@ -388,7 +403,7 @@ export class FakeIndexedDb implements IDBFactory {
 	putRaw(dbName: string, storeName: string, key: string, value: unknown): void {
 		let data = this.stored.get(dbName);
 		if (!data) {
-			data = { stores: new Map(), writeQueues: new Map() };
+			data = { stores: new Map(), keyPaths: new Map(), writeQueues: new Map() };
 			this.stored.set(dbName, data);
 		}
 		let store = data.stores.get(storeName);
