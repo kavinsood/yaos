@@ -2,7 +2,7 @@
 	"name": "@yaos/cli",
 	"version": "2.1.0",
 	"private": true,
-	"description": "Schema-4 headless YAOS Markdown sync daemon.",
+	"description": "Schema-5 headless YAOS Markdown sync daemon.",
 	"type": "module",
 	"license": "0-BSD",
 	"bin": {

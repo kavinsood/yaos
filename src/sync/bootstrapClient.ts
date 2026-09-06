@@ -8,6 +8,7 @@ import type {
 } from "./vaultIndexedDb";
 import { safeMarkdownPath } from "./pathPolicy";
 import { sha256BytesHex } from "../utils/sha256";
+import { SCHEMA_VERSION } from "./schema";
 
 export interface BootstrapHttpRequest {
 	url: string;
@@ -1080,8 +1081,8 @@ export function decodeBootstrapRoot(encoded: Uint8Array): Y.Doc {
 	const doc = new Y.Doc({ guid: "root" });
 	try {
 		Y.applyUpdate(doc, encoded, "bootstrap-root");
-		if (doc.getMap("sys").get("schemaVersion") !== 4) {
-			throw new Error("bootstrap root is not schema 4");
+		if (doc.getMap("sys").get("schemaVersion") !== SCHEMA_VERSION) {
+			throw new Error(`bootstrap root is not schema ${SCHEMA_VERSION}`);
 		}
 		return doc;
 	} catch (error) {

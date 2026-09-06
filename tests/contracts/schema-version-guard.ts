@@ -22,7 +22,7 @@ const guardPath = resolve(repoRoot(), "scripts/guard-schema-version.mjs");
 
 function makePluginFixture(dir: string) {
 	mkdirSync(join(dir, "src/sync"), { recursive: true });
-	writeFileSync(join(dir, "src/sync/schema.ts"), "export const SCHEMA_VERSION = 4;\n");
+	writeFileSync(join(dir, "src/sync/schema.ts"), "export const SCHEMA_VERSION = 5;\n");
 }
 
 function writeServerVersionModule(dir: string) {
@@ -74,7 +74,7 @@ await withTempDir("yaos-schema-version-guard-", (fixtureDir) => {
 s.section("Test 2: a mismatched canonical server pin fails closed");
 await withTempDir("yaos-schema-version-guard-", (fixtureDir) => {
 	makePluginFixture(fixtureDir);
-	makeServerFixture(fixtureDir, 5);
+	makeServerFixture(fixtureDir, 6);
 
 	const result = runGuard(fixtureDir);
 
@@ -89,14 +89,14 @@ await withTempDir("yaos-schema-version-guard-", (fixtureDir) => {
 	);
 });
 
-s.section("Test 3: exact schema-4 pins pass");
+s.section("Test 3: exact schema-5 pins pass");
 await withTempDir("yaos-schema-version-guard-", (fixtureDir) => {
 	makePluginFixture(fixtureDir);
-	makeServerFixture(fixtureDir, 4);
+	makeServerFixture(fixtureDir, 5);
 
 	const result = runGuard(fixtureDir);
 
-	s.check(result.status === 0, "guard accepts matching schema-4 source pins");
+	s.check(result.status === 0, "guard accepts matching schema-5 source pins");
 	s.check(
 		result.stdout.includes("PASS: schema version guard — all checks passed."),
 		"guard reports overall success for the exact schema-4 contract",

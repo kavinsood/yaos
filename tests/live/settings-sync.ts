@@ -200,7 +200,7 @@ const root = await connectDocument(deviceA, "root", "root");
 const body = await connectDocument(deviceB, "body", DURABLE_BODY_ID);
 try {
 	assert(root.doc.getMap<string>("pathToId").get(DURABLE_BODY_PATH) === DURABLE_BODY_ID, "root socket remains healthy after settings traffic");
-	assert(body.doc.getText("body").toString().startsWith("YAOS schema-4 SQL redeploy durability"), "body socket remains healthy after settings traffic");
+	assert(body.doc.getText("body").toString().startsWith("YAOS schema-5 SQL redeploy durability"), "body socket remains healthy after settings traffic");
 } finally {
 	body.destroy();
 	root.destroy();

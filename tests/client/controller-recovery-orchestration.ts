@@ -285,7 +285,7 @@ function buildFixture(initial: {
 
 s.section("Test 0: flight taxonomy bumped and new kinds present");
 {
-	assertEq(FLIGHT_TAXONOMY_VERSION, 13, "FLIGHT_TAXONOMY_VERSION === 13");
+	assertEq(FLIGHT_TAXONOMY_VERSION, 14, "FLIGHT_TAXONOMY_VERSION === 14");
 	assertEq(FLIGHT_KIND.recoverySkipped, "recovery.skipped", "FLIGHT_KIND.recoverySkipped");
 	assertEq(FLIGHT_KIND.editorRepairApplied, "editor.repair.applied", "FLIGHT_KIND.editorRepairApplied");
 	assertEq(FLIGHT_KIND.editorHealApplied, "editor.heal.applied", "FLIGHT_KIND.editorHealApplied");

@@ -100,7 +100,7 @@ export function isServerCapabilities(value: unknown): value is ServerCapabilitie
 		typeof candidate.serverVersion === "string" &&
 		(candidate.schemaVersion === null || typeof candidate.schemaVersion === "number") &&
 		Number.isSafeInteger(candidate.storageFormatVersion) &&
-		candidate.storageFormatVersion === 1 &&
+		candidate.storageFormatVersion === 2 &&
 		Number.isSafeInteger(candidate.protocolVersion) &&
 		candidate.protocolVersion === 1 &&
 		Number.isSafeInteger(candidate.snapshotFormatVersion) &&

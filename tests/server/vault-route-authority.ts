@@ -82,7 +82,7 @@ s.test("stale-generation sockets are fenced before decoding or document access",
 
 s.test("root socket validation rejects structural changes and accepts duplicate state", () => {
 	const current = new Y.Doc({ guid: "root" });
-	current.getMap("sys").set("schemaVersion", 4);
+	current.getMap("sys").set("schemaVersion", 5);
 	const duplicate = Y.encodeStateAsUpdate(current);
 	assert.equal(rootUpdateChangesDocument(current, duplicate), false);
 	const changed = new Y.Doc({ guid: "root" });
@@ -132,7 +132,7 @@ s.test("lifecycle publication is the exact root path authority", () => {
 s.test("direct protected attachment-map mutations are detected and validated", () => {
 	const root = new Y.Doc({ guid: "root" });
 	const vector = Y.encodeStateVector(root);
-	root.getMap("pathToBlob").set("assets/image.png", { hash: "a".repeat(64), size: 1 });
+	root.getMap("pathToBlob").set("assets/image.png", { hash: "a".repeat(64), size: 1, revision: "operation-valid" });
 	const safeUpdate = Y.encodeStateAsUpdate(root, vector);
 	const empty = new Y.Doc({ guid: "empty-root" });
 	assert.equal(rootUpdateChangesProtectedAttachmentMaps(empty, safeUpdate), true);

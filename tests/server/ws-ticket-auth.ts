@@ -52,7 +52,7 @@ s.test("revoked membership rejects both root and body sockets before vault alloc
 	});
 	for (const runtimePath of ["/ws/root", "/ws/body/body-ticket-0001"]) {
 		const response = await handleVaultSocketRoute(
-			new Request(`https://example.test/vault/${VAULT_ID}${runtimePath}?ticket=${encodeURIComponent(ticket)}&schemaVersion=4&protocolVersion=1`),
+			new Request(`https://example.test/vault/${VAULT_ID}${runtimePath}?ticket=${encodeURIComponent(ticket)}&schemaVersion=5&protocolVersion=1`),
 			env,
 			AUTH,
 			VAULT_ID,
@@ -82,7 +82,7 @@ s.test("live membership forwards exact device identity to root and body runtime 
 	});
 	for (const runtimePath of ["/ws/root", "/ws/body/body-ticket-0001"]) {
 		const response = await handleVaultSocketRoute(
-			new Request(`https://example.test/vault/${VAULT_ID}${runtimePath}?ticket=${encodeURIComponent(ticket)}&schemaVersion=4&protocolVersion=1`),
+			new Request(`https://example.test/vault/${VAULT_ID}${runtimePath}?ticket=${encodeURIComponent(ticket)}&schemaVersion=5&protocolVersion=1`),
 			env,
 			AUTH,
 			VAULT_ID,

@@ -8,7 +8,7 @@ import type {
 const DATABASE_VERSION = 1;
 const STATE = "state";
 const STATE_KEY = "initial-import";
-const DATABASE_SUFFIX = ":schema-4:local-import";
+const DATABASE_SUFFIX = ":schema-5:local-import";
 
 export function localVaultImportIdbName(vaultId: string, folderKey: string): string {
 	if (!vaultId.trim() || !folderKey.trim()) {

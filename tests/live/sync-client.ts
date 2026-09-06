@@ -97,13 +97,15 @@ try {
 		body: attachmentBytes,
 	});
 	assert(upload.status === 204, "device A uploads generation-scoped attachment bytes");
+	const attachmentOperationId = `attachment-${crypto.randomUUID()}`;
 	const attachmentPublication = await requestJson(deviceA, "attachments/publish", {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
 		body: JSON.stringify({
-			operationId: `attachment-${crypto.randomUUID()}`,
+			operationId: attachmentOperationId,
 			kind: "upsert",
 			path: attachmentPath,
+			expectedRevision: null,
 			hash: attachmentHash,
 			size: attachmentBytes.byteLength,
 			mime: "application/octet-stream",
@@ -119,6 +121,7 @@ try {
 			operationId: `attachment-delete-${crypto.randomUUID()}`,
 			kind: "delete",
 			path: attachmentPath,
+			expectedRevision: attachmentOperationId,
 		}),
 	});
 	assert(attachmentDelete.response.status === 200, "attachment deletion publishes through the durable root command");

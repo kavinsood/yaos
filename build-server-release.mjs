@@ -48,8 +48,8 @@ const schemaVersion = readNumberConst(productVersionsSource, "SCHEMA_VERSION");
 const storageFormatVersion = readNumberConst(productVersionsSource, "STORAGE_FORMAT_VERSION");
 const protocolVersion = readNumberConst(productVersionsSource, "PROTOCOL_VERSION");
 const snapshotFormatVersion = readNumberConst(productVersionsSource, "SNAPSHOT_FORMAT_VERSION");
-if (schemaVersion !== 4 || storageFormatVersion !== 1 || protocolVersion !== 1 || snapshotFormatVersion !== 2) {
-	throw new Error("server product versions must remain schema 4 / storage 1 / protocol 1 / snapshot 2");
+if (schemaVersion !== 5 || storageFormatVersion !== 2 || protocolVersion !== 1 || snapshotFormatVersion !== 2) {
+	throw new Error("server product versions must remain schema 5 / storage 2 / protocol 1 / snapshot 2");
 }
 
 if (serverPackage.version !== serverVersion) {

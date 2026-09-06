@@ -4,8 +4,8 @@ export interface VaultProvisioningProof {
 	vaultId: string;
 	vaultGeneration: string;
 	provisionedAt: number;
-	schemaVersion: 4;
-	storageFormatVersion: 1;
+	schemaVersion: 5;
+	storageFormatVersion: 2;
 	protocolVersion: 1;
 	runtimeEpoch: string;
 }
@@ -33,15 +33,15 @@ export function readVaultProvisioningProof(value: unknown): VaultProvisioningPro
 		throw new Error("vault status is not an object");
 	}
 	const record = value as Record<string, unknown>;
-	if (record.schemaVersion !== 4 || record.storageFormatVersion !== 1 || record.protocolVersion !== 1) {
+	if (record.schemaVersion !== 5 || record.storageFormatVersion !== 2 || record.protocolVersion !== 1) {
 		throw new Error("vault status has incompatible product versions");
 	}
 	return {
 		vaultId: requiredString(record.vaultId, "vaultId"),
 		vaultGeneration: requiredString(record.vaultGeneration, "vaultGeneration"),
 		provisionedAt: requiredNonNegativeInteger(record.provisionedAt, "provisionedAt"),
-		schemaVersion: 4,
-		storageFormatVersion: 1,
+		schemaVersion: 5,
+		storageFormatVersion: 2,
 		protocolVersion: 1,
 		runtimeEpoch: requiredString(record.runtimeEpoch, "runtimeEpoch"),
 	};
