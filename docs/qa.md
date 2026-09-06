@@ -2,13 +2,13 @@
 
 QA claims only the surface that was executed. Unit/model tests do not prove Cloudflare deployment behavior, Obsidian filesystem behavior, or mobile lifecycle ordering.
 
-Generated reports and device artifacts belong under ignored `qa-runs/`. Historical runs are not current schema-4 evidence unless they exercise the current storage, protocol, and recovery formats.
+Generated reports and device artifacts belong under ignored `qa-runs/`. Historical runs are not current schema-5 evidence unless they exercise the current storage, protocol, attachment revision, and recovery formats.
 
 ## Current integration evidence
 
-The integrated schema-4 change has current passing evidence from:
+The integrated schema-5 change has current passing evidence from:
 
-- focused schema-4 client and server suites;
+- focused schema-5 client and server suites;
 - the complete discovered regression suite;
 - the separately accountable local Wrangler Worker driver;
 - the runtime-blind Wrangler/Node conformance matrix;
@@ -17,20 +17,26 @@ The integrated schema-4 change has current passing evidence from:
 
 The canonical `npm run test:ci` gate runs both CLI checks through `npm --prefix packages/cli run smoke` and `npm --prefix packages/cli run pack-smoke`.
 
-Earlier Worker benchmarks and soaks established the sharding design. No repeat benchmark, soak, external Cloudflare deployment, real Obsidian settings run, or real mobile run is included in this integration result.
+Earlier Worker benchmarks and soaks established the sharding design. No repeat benchmark, soak, external Cloudflare deployment, or real mobile run is included in this integration result.
+
+### Desktop attachment intent fencing
+
+A disposable two-device Obsidian 1.13.7 run passed `attachment-intent-field-shapes` against a fresh local Worker and two independently enrolled profiles. It exercised equal-size rapid Canvas and Base rewrites, Base rename before first publication, delete before first publication, plugin stop during debounce followed by restart, two-device disk materialization, and required intent/transfer/publication telemetry. Both device analyzers reported zero hard failures, warnings, critical drops, redaction failures, hash mismatches, or stuck receipts. The retained local artifacts are under `qa-runs/attachment-intent-phase5/2026-09-05T23-06-33-attachment-intent-field-shapes-A` and the corresponding `-B` directory.
+
+The first attempt exposed a real hibernation boundary: a committed attachment update was not broadcast when root sockets existed but the server root cache was unloaded. The server now broadcasts every newly committed durable root update independently of cache residency, with focused regression coverage. A post-fix desktop probe and the complete scenario both materialized the attachment on the peer. Excalidraw was intentionally omitted, as allowed for this phase.
 
 ## Focused client coverage
 
 Current client suites exercise:
 
-- `onboarding-import.ts`: origin versus joining provisioning, exact schema-4 provisioning proof, bounded initial inventory, and bulk import;
+- `onboarding-import.ts`: origin versus joining provisioning, exact schema-5 provisioning proof, bounded initial inventory, and bulk import;
 - `body-manager-load-race.ts`: one load winner and no stale IndexedDB overwrite;
 - `bootstrap-http-boundaries.ts`: authenticated root/catalog/body SQL bootstrap routes and generation headers;
 - `bootstrap-settlement.ts`: root/body verification, safe paths, hash/size/generation checks, feed catch-up, and outstanding retry state;
 - `bootstrap-rename-race.ts`: 200 creates with 100 concurrent renames settle only current heads;
 - `recovery-snapshot-v2.ts`: strict format-2 root and manifest parsing;
 - `recovery-backup.ts`: backup-before-replacement and changed-target review;
-- `multivault-enrollment-contract.ts`: device-scoped memberships and schema-4 cache retirement;
+- `multivault-enrollment-contract.ts`: device-scoped memberships and schema-5 cache retirement;
 - existing reconciliation, delete-preservation, editor-binding, diagnostics, attachment-conflict, and lifecycle suites through the full regression discovery.
 - `attachment-publication-replay.ts`: lost responses, root-persistence failure, stable operation-ID replay, and durable upsert/delete/rename intent;
 - `body-manager-load-race.ts`: aggregate client cost admission, safe LRU eviction, and protected-body refusal;
@@ -48,7 +54,7 @@ These tests use controlled ports and models. They prove policy and orchestration
 
 Current server suites exercise:
 
-- `vault-store-sqlite-cycle.ts`: schema-4 root/body SQL persistence and reconstruction;
+- `vault-store-sqlite-cycle.ts`: schema-5 root/body SQL persistence and reconstruction;
 - `vault-server-runtime.ts` and `vault-document-cache.ts`: root/body runtime ownership, persistence, and clean-only cache behavior;
 - `vault-candidate-runtime.ts`: device-scoped candidate identity, digest validation, idempotent receipts, and stale-candidate rejection;
 - `bootstrap-security.ts`: fixed-boundary SQL bootstrap, pins, bounds, and failure behavior;
@@ -66,12 +72,12 @@ The full regression runner discovers suites under `tests/client`, `tests/server`
 
 ## Local Worker coverage
 
-`tests/live/run-live.ts` starts one fresh local Wrangler Worker with isolated persistence, claims and provisions schema 4, and enrolls two distinct device identities. It accounts for every TypeScript file under `tests/live`.
+`tests/live/run-live.ts` starts one fresh local Wrangler Worker with isolated persistence, claims and provisions schema 5, and enrolls two distinct device identities. It accounts for every TypeScript file under `tests/live`.
 
 The current passing local Worker run covers:
 
 - claim, provisioning, operator session, pairing, roster, and self-leave;
-- exact document schema `4` and socket protocol `1` admission;
+- exact document schema `5` and socket protocol `1` admission;
 - root and body socket connections using short-lived device tickets;
 - device A create/candidate/root publication and device B cold SQL bootstrap;
 - device B durable body edit, device A catch-up, rename publication, delete tombstone, and stale candidate rejection;
@@ -122,7 +128,7 @@ This proves one desktop seed/apply/install path against a local current Worker. 
 
 ### Fresh cutover rehearsal
 
-The supported boundary is a fresh schema-4 deployment and fresh schema-4 client cache. A complete user-facing rehearsal from a populated schema-3 installation through preserved local files, new claim, origin import, and joining-device bootstrap remains external validation; no in-place schema-3 migration is claimed.
+The supported boundary is a fresh schema-5 deployment and fresh schema-5 client cache. A complete user-facing rehearsal from a populated earlier installation through preserved local files, new claim, origin import, and joining-device bootstrap remains external validation; no in-place migration is claimed.
 
 ## Required evidence discipline
 

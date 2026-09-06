@@ -1,6 +1,6 @@
 # Main backlog
 
-This file contains only unresolved risks that remain after the schema-4 multivault, root/body, SQL-bootstrap, and recovery-v2 integration. Completed schema-3 cutover, monolith replacement, snapshot-v1 replacement, candidate/receipt, provisioning, and purge-order work is removed rather than marked complete.
+This file contains only unresolved risks that remain after the schema-5 multivault, root/body, SQL-bootstrap, attachment-CAS, and recovery-v2 integration. Completed earlier cutovers, monolith replacement, snapshot-v1 replacement, candidate/receipt, provisioning, and purge-order work is removed rather than marked complete.
 
 Current passing evidence is limited to focused suites, the complete regression discovery, and the local Wrangler Worker driver. See [QA](qa.md).
 
@@ -14,17 +14,17 @@ Current passing evidence is limited to focused suites, the complete regression d
 
 ### ATTACH-01 — Base/Canvas rollback and Excalidraw save freeze
 
-**State:** Unresolved field reports against the attachment plane. Schema 4 generation-scopes blob objects but does not itself prove these client-side behaviors fixed.
+**State:** Partially validated. A fresh two-device Obsidian 1.13.7 run now passes equal-size rapid Canvas and Base rewrites, pre-publication rename/delete, stop/restart fencing, peer materialization, and attachment telemetry. The run exposed and verified a fix for missed attachment broadcasts while the server root cache was hibernated. Mobile Canvas lifecycle and Excalidraw save-freeze reports remain unresolved.
 
-**Evidence:** Existing issue reports describe `.base` layout rollback, Canvas versions alternating after mobile restart, and sporadic Excalidraw save freezes while YAOS is enabled. Base, Canvas, and Excalidraw still use whole-file attachment sync.
+**Evidence:** Existing issue reports describe `.base` layout rollback, Canvas versions alternating after mobile restart, and sporadic Excalidraw save freezes while YAOS is enabled. Desktop artifacts for the passing Canvas/Base intent run are retained under `qa-runs/attachment-intent-phase5/2026-09-05T23-06-33-attachment-intent-field-shapes-{A,B}`. Base, Canvas, and Excalidraw still use whole-file attachment sync.
 
-**Required work:** Reproduce each shape independently against the current schema-4 deployment. Record root attachment metadata, object generation prefix, upload/download queue state, local hash, conflict decision, and lifecycle ordering. Profile Excalidraw save for synchronous hashing and watcher/queue churn. Do not convert structured formats to Markdown merging as a symptom fix.
+**Required work:** Repeat the Canvas lifecycle case on the affected mobile restart/suspension shape and profile Excalidraw save for synchronous hashing and watcher/queue churn. Record root attachment revisions, publication outcomes, object generation prefix, transfer queue state, local hash, conflict decision, and lifecycle ordering. Do not convert structured formats to Markdown merging as a symptom fix.
 
 **Closure:** Each reported shape has a focused reproduction and root-cause result; rollback/oscillation and freeze behavior no longer occur under that reproduction; the relevant reporter or equivalent real-device environment validates the result.
 
 ### SYNC-01 — burst-created Markdown can miss admission
 
-**State:** An unresolved field report says one of several iOS Web Clipper-created Markdown files did not reach desktop until renamed. The schema-4 candidate path changes server durability but does not prove the client watcher/admission miss fixed.
+**State:** An unresolved field report says one of several iOS Web Clipper-created Markdown files did not reach desktop until renamed. The schema-5 candidate path changes server durability but does not prove the client watcher/admission miss fixed.
 
 **Evidence:** The report names burst creation and rename as the action that recovered synchronization. Current local Worker clients submit candidates directly and therefore do not exercise Obsidian watcher admission.
 
@@ -46,7 +46,7 @@ Current passing evidence is limited to focused suites, the complete regression d
 
 ### AUTH-01 — explicit credential-carrier coverage in diagnostics
 
-**State:** Safe exports redact common identity and credential fields, but schema 4 adds provisioning, recovery capability, purge, and multi-socket error surfaces.
+**State:** Safe exports redact common identity and credential fields, but schema 5 adds attachment revision, provisioning, recovery capability, purge, and multi-socket error surfaces.
 
 **Evidence:** Current diagnostics tests cover the established safe shape. Production now carries device bearers, pairing/setup links, socket tickets, operator sessions, recovery job capabilities, and purge capabilities across additional routes and error paths.
 
@@ -76,11 +76,11 @@ Current passing evidence is limited to focused suites, the complete regression d
 
 ## P1 deployment and scale evidence
 
-### DEPLOY-01 — fresh schema-4 Cloudflare cutover rehearsal
+### DEPLOY-01 — fresh schema-5 Cloudflare cutover rehearsal
 
-**State:** Local Wrangler proves fresh claim/provision/enrollment. No external run currently proves the documented schema-3-to-fresh-schema-4 user boundary.
+**State:** Local Wrangler proves fresh claim/provision/enrollment. No external run currently proves the documented earlier-to-fresh-schema-5 user boundary.
 
-**Evidence:** The implementation deliberately admits only schema `4` and protocol `1`, provisions new SQL format `1`, and stores clients in a schema-4 IndexedDB namespace. [Operations](operations.md#deployment-boundary) explicitly rejects in-place schema-3 room/cache reuse.
+**Evidence:** The implementation deliberately admits only schema `5` and protocol `1`, provisions SQL format `2`, and stores clients in a schema-5 IndexedDB namespace. [Operations](operations.md#deployment-boundary) explicitly rejects in-place earlier room/cache reuse.
 
 **Required work:** Preserve a populated schema-3 vault on a trusted device, deploy a fresh current Worker with the `RecoveryJob` migration, claim, import through the origin path, enroll a joining device with a fresh cache, and verify the complete inventory and device isolation. Also verify advertised settings format 1, generation-fenced device-auth settings routes, and that a new vault generation starts with an unseeded settings environment.
 
@@ -106,11 +106,11 @@ Current passing evidence is limited to focused suites, the complete regression d
 
 **Closure:** Integrated results state platform, dataset shape, limits, duration, and failure criteria; benchmark samples and soak evidence remain distinct.
 
-### MOBILE-01 — schema-4 mobile lifecycle and settings evidence
+### MOBILE-01 — schema-5 mobile lifecycle and settings evidence
 
-**State:** No current integration result covers real iOS or Android schema-4 bootstrap, reconnect, attachment, recovery, or settings apply behavior.
+**State:** No current integration result covers real iOS or Android schema-5 bootstrap, reconnect, attachment, recovery, or settings apply behavior.
 
-**Evidence:** Current schema-4 evidence uses unit ports, desktop/controller history from the earlier architecture, and Node clients under local Wrangler. Settings policy/queue tests do not invoke mobile Obsidian or its package installer.
+**Evidence:** Current schema-5 evidence uses unit ports, desktop controllers, and Node clients under local Wrangler. Settings policy/queue tests do not invoke mobile Obsidian or its package installer.
 
 **Required work:** Run fresh joining bootstrap, foreground edit, suspend/resume reconnect, attachment conflict, and supported recovery flows on real iOS and Android without copying credentials or caches. For settings, take an already-seeded named environment, verify no apply before an explicit decision and durable exact-identity queue, apply allowlisted files, exercise foreground auto-install consent and a desktop-only plugin skip, resume a checkpointed consented install after backgrounding, verify acceptance commits after successful take, verify the three-version plugin-data hold, and apply plugin/theme tombstones without interrupting note sync.
 

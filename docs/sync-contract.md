@@ -1,6 +1,6 @@
 # Sync and conflict contract
 
-This is the current schema-4 contract for `main`. [BACKLOG.md](BACKLOG.md) contains only evidenced unresolved risks and missing external-scale proof.
+This is the current schema-5 contract for `main`. [BACKLOG.md](BACKLOG.md) contains only evidenced unresolved risks and missing external-scale proof.
 
 ## Subjects
 
@@ -18,11 +18,28 @@ Canvas, Excalidraw, Base, and other non-Markdown formats use the attachment plan
 
 ## Vault, membership, and transport scope
 
-One server hosts multiple independent vaults. A physical installation may enroll different folders in different vaults, but each device identity and bearer is one vault membership. Each local folder stores that membership and has its own schema-4 IndexedDB database.
+One server hosts multiple independent vaults. A physical installation may enroll different folders in different vaults, but each device identity and bearer is one vault membership. Each local folder stores that membership and has its own schema-5 IndexedDB database.
 
 A pairing code selects one vault and is consumed once. Pairing creates a new full-peer membership; it never copies another folder's bearer. Leave revokes one membership and keeps disk files. Operator kick revokes one membership. Operator destroy revokes the full vault before generation-scoped physical cleanup.
 
-All vault HTTP requests use a device bearer and vault ID. WebSocket URLs never carry that long-lived bearer. The client exchanges it for a short-lived device ticket; root and body handshakes require the ticket plus exact `schemaVersion=4` and `protocolVersion=1`. Membership and active vault state are checked before every admission.
+All vault HTTP requests use a device bearer and vault ID. WebSocket URLs never carry that long-lived bearer. The client exchanges it for a short-lived device ticket; root and body handshakes require the ticket plus exact `schemaVersion=5` and `protocolVersion=1`. Membership and active vault state are checked before every admission.
+
+Attachment heads are revisioned. Every active reference and tombstone carries the operation ID which created it. Upsert, delete, and rename publications name the exact revisions they expect; revision comparison, root mutation, catalog events, and the replay ledger commit atomically under the vault mutation lease. Reusing an operation ID succeeds only for the same canonical request digest. Clients persist publications in a transactionally allocated local sequence, distinguish committed, durably pending, and superseded outcomes, and never silently rebase a superseded operation.
+
+Attachment publication preserves these invariants:
+
+1. only the current local path and runtime intent may hand work to the durable publication queue;
+2. every mutation names the exact observed or projected revisions it replaces;
+3. revision comparison, root mutation, catalog events, and replay identity commit atomically;
+4. every active and deleted attachment head has one opaque revision;
+5. an operation ID replays only with the same canonical mutation identity;
+6. retry never rebases a mutation onto a newer head;
+7. later local intent becomes an ordered successor after durable handoff;
+8. revision mismatch retires the operation and dependent successors into reconciliation;
+9. published hash and size describe the immutable bytes selected by that intent;
+10. rename fences both source and target and never silently overwrites a collision;
+11. runtime stop invalidates publication synchronously before teardown awaits;
+12. no transfer, intent, or publication crosses vault generation, enrollment, folder, or runtime scope.
 
 The root socket carries structural state. Each active Markdown body has a separate socket opened only while the client needs it. Attachment bytes and recovery artifacts do not travel through body sockets.
 

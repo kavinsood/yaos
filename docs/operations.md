@@ -2,17 +2,17 @@
 
 ## Deployment boundary
 
-Schema 4 is a breaking storage and cache boundary. It does not read or migrate schema-3 room state, snapshot-v1 objects, or schema-3 IndexedDB databases.
+Schema 5 is a breaking storage and cache boundary. It does not read or migrate earlier room state or IndexedDB attachment queues.
 
-For the schema-4 cutover:
+For the schema-5 cutover:
 
 1. preserve the ordinary vault files on at least one trusted device;
 2. deploy a fresh Worker/storage deployment from the current `server/`;
 3. claim it and provision the first vault;
-4. enroll the trusted origin folder with the first pairing code so its local files can enter schema 4;
-5. enroll every joining folder with a distinct new pairing code and a fresh schema-4 local cache.
+4. enroll the trusted origin folder with the first pairing code so its local files can enter schema 5;
+5. enroll every joining folder with a distinct new pairing code and a fresh schema-5 local cache.
 
-Do not point a schema-4 plugin at a schema-3 deployment or reuse a schema-3 plugin cache. Exact admission fails closed, but manually reusing storage bypasses the supported boundary.
+Do not point a schema-5 plugin at an earlier deployment or reuse an earlier plugin cache. Exact admission fails closed, but manually reusing storage bypasses the supported boundary.
 
 The Deploy button creates a detached deployment repository. Upstream changes do not update it automatically. After this breaking cutover, ordinary releases can use the generated repository's updater workflow so deployment and rollback remain Git-visible.
 
@@ -66,7 +66,7 @@ All blob and recovery keys are scoped by both `vaultId` and `vaultGeneration`. D
 
 ## Node server runtime
 
-The Node 24 server uses the same schema-4 domain runtimes as the Worker. Build with `npm run build:server-node`, then run:
+The Node 24 server uses the same schema-5 domain runtimes as the Worker. Build with `npm run build:server-node`, then run:
 
 ```sh
 YAOS_NODE_HOST=127.0.0.1 \
@@ -164,7 +164,7 @@ docker compose start server
 
 ## Claim and vault provisioning
 
-Open the fresh server URL and choose **Claim**. Save the operator recovery key; the server stores only its hash. Claim reserves a Personal vault, provisions its schema-4 SQL root, activates the exact generation, and returns one pairing code.
+Open the fresh server URL and choose **Claim**. Save the operator recovery key; the server stores only its hash. Claim reserves a Personal vault, provisions its schema-5 SQL root, activates the exact generation, and returns one pairing code.
 
 Provisioning is a three-step saga: registry reservation, idempotent vault-runtime provisioning, then matching-generation activation. A partial failure remains in `provisioning` state with a retryable error and cannot admit devices as an active vault.
 
@@ -180,7 +180,7 @@ The first claim pairing code carries a one-use origin-import role. Before enroll
 
 An enrolled device can inspect its vault roster, rename itself, mint another one-use pairing code, export only its own credentials, or leave. Pairing codes expire after 15 minutes and work once.
 
-**Leave this vault** revokes the current membership when reachable, stops sync, clears this folder's enrollment and schema-4 IndexedDB cache, and keeps ordinary files on disk. If revocation fails, local leave still completes and the operator can remove the stale membership.
+**Leave this vault** revokes the current membership when reachable, stops sync, clears this folder's enrollment and schema-5 IndexedDB cache, and keeps ordinary files on disk. If revocation fails, local leave still completes and the operator can remove the stale membership.
 
 ## Headless Linux client
 
@@ -245,7 +245,7 @@ With recovery capability available:
 
 Capture and restore continue in alarm-driven `RecoveryJob` objects after Obsidian closes. `queued`, active phase, `retrying`, `complete`, `complete_with_gaps`, `failed`, and `cancelled` are meaningful states. Do not report a retry or terminal gap as complete coverage.
 
-Before applying a restore item, the client creates a local backup and verifies that the target has not changed since review. Changed targets are skipped rather than overwritten. Body and lifecycle mutation still pass through normal schema-4 durable receipts.
+Before applying a restore item, the client creates a local backup and verifies that the target has not changed since review. Changed targets are skipped rather than overwritten. Body, lifecycle, and attachment mutations still pass through normal schema-5 durable receipts and attachment revision checks.
 
 Recovery roots and manifest/content objects are immutable. Recovery catalog deletion, retention, GC, and purge are asynchronous; UI completion means the corresponding durable state reached its terminal contract, not that another device has materialized anything.
 
@@ -270,15 +270,15 @@ Public setup routes are limited to claim, enrollment, and capability discovery. 
 The socket ticket endpoint exchanges that bearer for a short-lived device- and vault-scoped ticket. Root and body sockets require:
 
 - a valid ticket;
-- document schema `4`;
+- document schema `5`;
 - socket protocol `1`;
 - an active membership and active vault generation.
 
-The complete version set is document schema `4`, durable SQL format `1`, socket protocol `1`, recovery snapshot format `2`, and settings sync format `1`. These pins change only through a coordinated client/server/storage cutover.
+The complete version set is document schema `5`, durable SQL format `2`, socket protocol `1`, recovery snapshot format `2`, and settings sync format `1`. These pins change only through a coordinated client/server/storage cutover.
 
-## Updating after the fresh schema-4 deployment
+## Updating after the fresh schema-5 deployment
 
-The schema-4 server artifact is marked `deploymentBoundary: fresh`; the in-place updater rejects it. Establish the fresh deployment described above first.
+The schema-5 server artifact is marked `deploymentBoundary: fresh`; the in-place updater rejects it. Establish the fresh deployment described above first.
 
 Future releases may use the generated deployment repository's updater only when their schema, storage, protocol, snapshot, and Durable Object class boundaries remain unchanged. A release changing any pin or required class must declare another fresh or guided cutover rather than relying on code-only revert.
 

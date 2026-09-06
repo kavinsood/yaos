@@ -77,7 +77,7 @@ The daemon is Linux/local-filesystem only, Markdown only, and single-process per
 
 ## Self-hosted Docker server
 
-The production image packages `packages/server-node`, which runs the same schema-4 control-plane, vault, settings, attachment, recovery, and deletion owners as the Cloudflare Worker over Node 24, SQLite, WebSockets, and filesystem object storage.
+The production image packages `packages/server-node`, which runs the same schema-5 control-plane, vault, settings, attachment, recovery, and deletion owners as the Cloudflare Worker over Node 24, SQLite, WebSockets, and filesystem object storage.
 
 ```sh
 YAOS_PUBLIC_ORIGIN=https://sync.example.com docker compose up --build -d

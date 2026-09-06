@@ -2,9 +2,9 @@
 
 Current `main` has five durable engineering documents. Git history preserves replaced RFCs, audits, incident reports, and implementation notes; they are not parallel current specifications.
 
-- [Architecture](architecture.md) — schema-4 root/body authority, provisioning, settings SQL authority, recovery, and deletion.
+- [Architecture](architecture.md) — schema-5 root/body and revisioned attachment authority, provisioning, settings SQL authority, recovery, and deletion.
 - [Sync and conflict contract](sync-contract.md) — current note, attachment, and named settings-environment contracts, including lifecycle and preservation rules.
-- [Operations](operations.md) — claim, device enrollment, settings setup, required bindings, recovery capability, and the breaking schema-4 deployment boundary.
+- [Operations](operations.md) — claim, device enrollment, settings setup, required bindings, recovery capability, and the breaking schema-5 deployment boundary.
 - [QA](qa.md) — focused, regression, and local Worker coverage, with real-runtime and external evidence gaps stated separately.
 - [Backlog](BACKLOG.md) — only evidenced unresolved product risks and concrete external validation gaps.
 

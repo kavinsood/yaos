@@ -8,7 +8,7 @@ The QA harness under `qa/` is not shipped. QA scenarios use a separately built p
 
 `FlightTraceController` owns the client diagnostics lifecycle. Product code emits through the published flight envelope and taxonomy; there is no second persistent logger.
 
-The headless client under `packages/cli` hosts the same `VaultSync`, `BodyManager`, `DiskMirror`, and reconciliation policy on a local Linux filesystem. It is Markdown-only, stores its device identity and schema-4 retry/cache state in machine-local SQLite, and never copies another enrollment's bearer.
+The headless client under `packages/cli` hosts the same `VaultSync`, `BodyManager`, `DiskMirror`, and reconciliation policy on a local Linux filesystem. It is Markdown-only, stores its device identity and schema-5 retry/cache state in machine-local SQLite, and never copies another enrollment's bearer.
 
 The Cloudflare Worker classes are thin platform wrappers around portable `ControlPlaneRuntime`, `VaultRuntime`, and `RecoveryJobRuntime` compositions. `packages/server-node` supplies Node-specific SQLite/KV, actor, WebSocket, alarm, and filesystem-object mechanisms to those same domain owners; it does not implement a second sync policy.
 
@@ -21,15 +21,15 @@ One operator can create multiple vaults. A physical installation may enroll diff
 Vault creation is a recoverable provisioning saga:
 
 1. The registry reserves a unique `vaultId` and `vaultGeneration` in `provisioning` state.
-2. The vault Durable Object idempotently creates schema-4 metadata and an empty root in SQLite.
+2. The vault Durable Object idempotently creates schema-5 metadata and an empty root in SQLite.
 3. The registry activates the matching generation and, for claim, publishes the first pairing code.
 4. A failure remains recorded as retryable provisioning state; it is not exposed as an active partial vault.
 
 `vaultGeneration` identifies one storage incarnation of a vault and scopes every R2 key and asynchronous job. `runtimeEpoch` identifies one live Durable Object runtime and prevents receipts or capabilities from being mistaken for evidence from another runtime.
 
-## Schema-4 vault authority
+## Schema-5 vault authority
 
-Schema 4 replaces the vault-wide content monolith with one structural root document and independent Markdown body documents:
+Schema 5 retains the root/body architecture and adds revisioned attachment heads and compare-and-set publication:
 
 - the root Yjs document carries `pathToId`, attachment references and metadata, attachment tombstones, and schema metadata;
 - every Markdown file has a stable file/body identity and its own Yjs document whose text key is `body`;
@@ -44,8 +44,8 @@ The exact product pins are:
 
 | Boundary | Version |
 |---|---:|
-| Document schema | 4 |
-| Durable SQL storage format | 1 |
+| Document schema | 5 |
+| Durable SQL storage format | 2 |
 | Socket protocol | 1 |
 | Recovery snapshot format | 2 |
 | Settings sync format | 1 |
@@ -72,7 +72,7 @@ The client `SettingsSyncEngine` is a separate serialized lifecycle. It gates on 
 A new or reset client bootstraps without R2:
 
 1. The server flushes loaded documents and creates a time-bounded SQL history pin at one vault sequence.
-2. The client verifies the schema-4 root checkpoint.
+2. The client verifies the schema-5 root checkpoint.
 3. It pages the SQL catalog and fetches each referenced body at the pinned boundary.
 4. Each body is identity-, generation-, size-, hash-, and path-checked before disk settlement.
 5. The client catches up from the ordered SQL feed, rechecks current heads before mutation, and records unresolved bodies for retry.
@@ -122,9 +122,9 @@ GC marks retained recovery and blob roots, acquires bounded sweep leases, and de
 
 Vault HTTP routes, including `/vault/:vaultId/settings-sync/:configDirKey`, require the device bearer and selected vault ID. The public route resolves current membership and active `vaultGeneration`, forwards only trusted vault/generation/device headers, and strips the bearer before the vault runtime handles the request. Settings routes require exactly one `settingsFormatVersion=1`; a mismatch fails before mutation.
 
-A short-lived device-scoped ticket is minted for WebSocket use; long-lived credentials never appear in socket URLs. Root and body handshakes require `ticket`, `schemaVersion=4`, and `protocolVersion=1`. Ticket signature, expiry, vault scope, current membership, active vault state, and vault generation are checked before runtime admission. Revocation persists an obligation before removing membership, applies a durable vault-runtime device fence, terminates already-active sockets, and remains operator-retryable until acknowledged.
+A short-lived device-scoped ticket is minted for WebSocket use; long-lived credentials never appear in socket URLs. Root and body handshakes require `ticket`, `schemaVersion=5`, and `protocolVersion=1`. Ticket signature, expiry, vault scope, current membership, active vault state, and vault generation are checked before runtime admission. Revocation persists an obligation before removing membership, applies a durable vault-runtime device fence, terminates already-active sockets, and remains operator-retryable until acknowledged.
 
-Leaving revokes one membership, retires only its exact settings apply queue, clears the folder's enrollment and schema-4 IndexedDB cache, and leaves ordinary files and its configuration directory on disk. Operator kick revokes one membership. Operator destroy revokes the complete vault boundary; purge-first deletion ultimately removes the settings SQL tables with the rest of that vault generation's SQL.
+Leaving revokes one membership, retires only its exact settings apply queue, clears the folder's enrollment and schema-5 IndexedDB cache, and leaves ordinary files and its configuration directory on disk. Operator kick revokes one membership. Operator destroy revokes the complete vault boundary; purge-first deletion ultimately removes the settings SQL tables with the rest of that vault generation's SQL.
 
 ## Purge-first vault deletion
 
