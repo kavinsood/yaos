@@ -42,7 +42,8 @@ export class StoreCycle {
   async fetch() {
     const store = new VaultStore(this.state.storage);
     const root = new Y.Doc({ guid: "root" });
-    root.getMap("sys").set("schemaVersion", 6);
+    root.getMap("sys").set("schemaVersion", 7);
+    root.getMap("sys").set("protocolVersion", 4);
     const rootUpdate = Y.encodeStateAsUpdate(root);
     const vaultGeneration = "generation-sqlite-cycle-0001";
     const provisioned = store.provisionVault("sqlite-cycle-vault", vaultGeneration, rootUpdate, 500);
@@ -86,7 +87,11 @@ export class StoreCycle {
 
     const body = new Y.Doc({ guid: "sqlite-cycle-body" });
     const largeUpdate = incremental(body, () => body.getText("payload").insert(0, "x".repeat(1_200_000)));
-    store.commitUpdate({ documentId: "sqlite-cycle-body", update: largeUpdate, kind: "body" });
+    const largeCommit = store.commitUpdate({ documentId: "sqlite-cycle-body", update: largeUpdate, kind: "body" });
+    const largeUpdateStorage = this.state.storage.sql.exec(
+      "SELECT COUNT(*) AS chunks, MIN(typeof(data)) AS storage_type, COALESCE(SUM(length(data)), 0) AS stored_bytes FROM vault_journal_chunks WHERE sequence = ?",
+      largeCommit.vaultSequence,
+    ).one();
     for (let index = 0; index < 60; index++) {
       const update = incremental(body, () => body.getText("body").insert(body.getText("body").length, String(index % 10)));
       store.commitUpdate({ documentId: "sqlite-cycle-body", update, kind: "body" });
@@ -94,7 +99,7 @@ export class StoreCycle {
     const sequence = store.currentSequence();
     const before = store.documentJournalStats("sqlite-cycle-body");
     const pin = store.createPin({ kind: "capture", boundarySequence: sequence, pinId: "cycle-pin" });
-    const blocked = store.writeCheckpoint("sqlite-cycle-body", sequence);
+    const checkpoint = store.writeCheckpoint("sqlite-cycle-body", sequence);
     const pinnedFloorRejected = (() => {
       try {
         store.advanceFeedFloor(sequence);
@@ -104,7 +109,6 @@ export class StoreCycle {
       }
     })();
     store.releasePin(pin.pinId);
-    const checkpoint = store.writeCheckpoint("sqlite-cycle-body", sequence);
     const floor = store.advanceFeedFloor(sequence);
     const after = store.documentJournalStats("sqlite-cycle-body");
     const feed = store.changesPageAfter(0, 100);
@@ -321,7 +325,57 @@ export class StoreCycle {
     const authorityMirror = store.validateActor(ownerActor) === "allowed"
       && store.authorityFenceReceipt(authorityReceipt.changeId)?.subjectDigest === authorityReceipt.subjectDigest
       && store.validateActor({ ...ownerActor, membershipRevision: 2 }) === "authority_superseded";
-	const redundantCandidateDocument = store.reconstructDocument("sqlite-cycle-body").doc;
+	const originalReconstructDocument = store.reconstructDocument.bind(store);
+	const changedCandidateDocument = originalReconstructDocument("sqlite-cycle-body").doc;
+	const changedCandidateVector = Y.encodeStateVector(changedCandidateDocument);
+	changedCandidateDocument.getText("body").insert(changedCandidateDocument.getText("body").length, "changed");
+	const changedCandidateUpdate = Y.encodeStateAsUpdate(changedCandidateDocument, changedCandidateVector);
+	changedCandidateDocument.destroy();
+	let commitReconstructionCalls = 0;
+	store.reconstructDocument = (...args) => {
+	  commitReconstructionCalls++;
+	  return originalReconstructDocument(...args);
+	};
+	const beforeChangedCandidate = store.documentHead("sqlite-cycle-body");
+	const changedCandidate = store.commitCandidate({
+	  bodyId: "sqlite-cycle-body",
+	  clientId: ownerActor.deviceId,
+	  candidateId: "candidate-changed-sqlite-cycle",
+	  candidateDigest: "c".repeat(64),
+	  update: changedCandidateUpdate,
+	  expectedHead: beforeChangedCandidate,
+	  changesState: true,
+	  vaultGeneration,
+	  runtimeEpoch: "sqlite-cycle-runtime-epoch",
+	  actor: ownerActor,
+	});
+	const afterChangedCandidate = store.documentHead("sqlite-cycle-body");
+	const changedCandidateReusedValidation = commitReconstructionCalls === 0
+	  && changedCandidate.durableGeneration === (beforeChangedCandidate?.generation ?? 0) + 1
+	  && afterChangedCandidate?.generation === changedCandidate.durableGeneration;
+
+	let staleCandidateRejected = false;
+	try {
+	  store.commitCandidate({
+		bodyId: "sqlite-cycle-body",
+		clientId: ownerActor.deviceId,
+		candidateId: "candidate-stale-sqlite-cycle",
+		candidateDigest: "b".repeat(64),
+		update: changedCandidateUpdate,
+		expectedHead: beforeChangedCandidate,
+		changesState: true,
+		vaultGeneration,
+		runtimeEpoch: "sqlite-cycle-runtime-epoch",
+		actor: ownerActor,
+	  });
+	} catch (error) {
+	  staleCandidateRejected = error instanceof Error && error.message === "candidate_generation_fence_changed";
+	}
+	const staleCandidateFailedClosed = staleCandidateRejected
+	  && store.documentHead("sqlite-cycle-body")?.generation === afterChangedCandidate?.generation
+	  && store.candidateReceipt("sqlite-cycle-body", ownerActor.deviceId, "candidate-stale-sqlite-cycle") === null;
+
+	const redundantCandidateDocument = originalReconstructDocument("sqlite-cycle-body").doc;
 	const redundantCandidateUpdate = Y.encodeStateAsUpdate(redundantCandidateDocument);
 	redundantCandidateDocument.destroy();
 	const beforeRedundantCandidate = store.documentHead("sqlite-cycle-body");
@@ -331,14 +385,21 @@ export class StoreCycle {
 	  candidateId: "candidate-redundant-sqlite-cycle",
 	  candidateDigest: "d".repeat(64),
 	  update: redundantCandidateUpdate,
+	  expectedHead: beforeRedundantCandidate,
+	  changesState: false,
 	  vaultGeneration,
 	  runtimeEpoch: "sqlite-cycle-runtime-epoch",
 	  actor: ownerActor,
 	});
+	const storedRedundantCandidate = store.candidateReceipt(redundantCandidate.bodyId,
+	  redundantCandidate.clientId, redundantCandidate.candidateId);
 	const redundantCandidateOutcome = store.committedOperationOutcome(ownerActor,
 	  redundantCandidate.candidateId, redundantCandidate.candidateDigest);
 	const redundantCandidateRecovery = redundantCandidateOutcome?.vaultSequence === redundantCandidate.vaultSequence
-	  && store.documentHead("sqlite-cycle-body")?.generation === beforeRedundantCandidate?.generation;
+	  && redundantCandidate.vaultSequence === beforeRedundantCandidate?.latestSequence
+	  && redundantCandidate.durableGeneration === beforeRedundantCandidate?.generation
+	  && store.documentHead("sqlite-cycle-body")?.generation === beforeRedundantCandidate?.generation
+	  && JSON.stringify(storedRedundantCandidate) === JSON.stringify(redundantCandidate);
 
     return Response.json({
       metadata: {
@@ -349,10 +410,11 @@ export class StoreCycle {
         schemaVersion: metadata?.schemaVersion ?? null,
         storageFormatVersion: metadata?.storageFormatVersion ?? null,
         bootstrapCycle,
-      },
-      before,
-      blocked: blocked.status,
-      pinnedFloorRejected,
+	      },
+	      before,
+	      largeUpdateBytes: largeUpdate.byteLength,
+	      largeUpdateStorage,
+	      pinnedFloorRejected,
       checkpoint: checkpoint.status,
       checkpointChunks: checkpoint.chunks,
       floor: floor.floor,
@@ -366,7 +428,11 @@ export class StoreCycle {
         feed: renameFeed?.catalogs[0]?.previousPath ?? null,
       },
       attachmentAtomicity,
-	  redundantCandidateRecovery,
+	  candidateGenerationFence: {
+		changedCandidateReusedValidation,
+		staleCandidateFailedClosed,
+		redundantCandidateRecovery,
+	  },
       authority: {
 		authorityMirror,
         gcEpochAdvanced: gcTwo.epoch === gcOne.epoch + 1,
@@ -451,7 +517,8 @@ s.test("VaultStore completes journal/checkpoint/pin/feed-floor cycle on real SQL
 				bootstrapCycle: boolean;
 			};
 			before: { entries: number; bytes: number };
-			blocked: string;
+			largeUpdateBytes: number;
+			largeUpdateStorage: { chunks: number; storage_type: string; stored_bytes: number };
 			pinnedFloorRejected: boolean;
 			checkpoint: string;
 			checkpointChunks: number;
@@ -473,18 +540,29 @@ s.test("VaultStore completes journal/checkpoint/pin/feed-floor cycle on real SQL
 			textLength: number;
 			previousPath: { direct: string | null; listed: string | null; feed: string | null };
 			attachmentAtomicity: boolean;
-			redundantCandidateRecovery: boolean;
+			candidateGenerationFence: {
+				changedCandidateReusedValidation: boolean;
+				staleCandidateFailedClosed: boolean;
+				redundantCandidateRecovery: boolean;
+			};
 		};
 		s.check(
 			result.metadata.created && result.metadata.replayed && result.metadata.generationFenceRejected
 				&& result.metadata.persisted && result.metadata.bootstrapCycle
-				&& result.metadata.schemaVersion === 7 && result.metadata.storageFormatVersion === 2,
+				&& result.metadata.schemaVersion === 7 && result.metadata.storageFormatVersion === 3,
 			"schema-7 metadata persists vaultGeneration and rejects a different provisioning incarnation",
 		);
 		s.check(result.before.entries === 61 && result.before.bytes > 1_200_000, "real SQLite journal contains the large update plus all semantic body edits");
-		s.check(result.blocked === "blocked-by-pin" && result.pinnedFloorRejected, "active capture pin blocks checkpoint compaction and feed-floor advancement");
-		s.check(result.checkpoint === "written", "checkpoint writes after pin release");
-		s.check(result.checkpointChunks > 1, "large checkpoint is split across multiple SQLite chunks");
+		s.check(
+			result.largeUpdateStorage.chunks === 1
+				&& result.largeUpdateStorage.storage_type === "blob"
+				&& result.largeUpdateStorage.stored_bytes === result.largeUpdateBytes
+				&& result.largeUpdateBytes > 1_200_000,
+			"ordinary near-limit update is one exact binary SQLite row without base64 inflation",
+		);
+		s.check(result.checkpoint === "written" && result.pinnedFloorRejected,
+			"active capture pin permits checkpoint creation but still fences feed-floor advancement");
+		s.check(result.checkpointChunks === 1, "sub-limit checkpoint remains one bounded SQLite BLOB");
 		s.check(result.floor === result.highWater && result.floor > 0, "feed floor advances to durable high-water after checkpoint");
 		s.check(result.after.entries === 0 && result.after.bytes === 0, "checkpointed journal rows are compacted on real SQLite");
 		s.check(result.resetRequired, "cursor below retained floor receives reset-required response");
@@ -507,7 +585,12 @@ s.test("VaultStore completes journal/checkpoint/pin/feed-floor cycle on real SQL
 			"real SQLite get/list/feed APIs preserve atomic rename previousPath",
 		);
 		s.check(result.attachmentAtomicity, "real SQLite atomically commits and rolls back root, attachment catalog, and exact replay ledger");
-		s.check(result.redundantCandidateRecovery, "redundant candidates preserve an exact committed outcome without inventing a semantic generation");
+		s.check(result.candidateGenerationFence.changedCandidateReusedValidation,
+			"validated changed candidate commits without a second reconstruction/application pass");
+		s.check(result.candidateGenerationFence.staleCandidateFailedClosed,
+			"candidate whose expected durable head went stale fails closed without a receipt or generation");
+		s.check(result.candidateGenerationFence.redundantCandidateRecovery,
+			"redundant candidate preserves its exact durable receipt without inventing a semantic generation");
 	} finally {
 		if (child && child.exitCode === null) {
 			child.kill("SIGTERM");

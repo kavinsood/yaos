@@ -1,7 +1,7 @@
 import * as Y from "yjs";
-import { bytesToBase64Url } from "./base64url";
+import { encodeBinaryEnvelope, YAOS_BINARY_CONTENT_TYPE } from "./shared/binaryEnvelope";
 import { BootstrapService } from "./bootstrap";
-import { MAX_BODY_ID_LENGTH, MAX_CATCH_UP_BODIES, MAX_CATCH_UP_BYTES, MAX_JSON_BYTES } from "./contracts";
+import { MAX_BODY_ID_LENGTH, MAX_CATCH_UP_BODIES, MAX_CATCH_UP_BYTES, MAX_DURABLE_UPDATE_BYTES, MAX_JSON_BYTES } from "./contracts";
 import { sha256Hex } from "./hex";
 import { BoundedBodyError, readBoundedBytes } from "./readBoundedBytes";
 import { handleVaultRecoveryRpc } from "./recoveryRpcRouter";
@@ -67,6 +67,27 @@ function boundedLimit(url: URL, fallback = 1000): number {
 
 export function shouldCompactJournal(stats: { entries: number; bytes: number }): boolean {
 	return stats.entries >= JOURNAL_COMPACT_ENTRIES || stats.bytes >= JOURNAL_COMPACT_BYTES;
+}
+
+/** Split one debounced queue into batches that can each occupy one durable BLOB row. */
+export function partitionDurableUpdateBatches<T extends { bytes: Uint8Array }>(entries: readonly T[]): T[][] {
+	const batches: T[][] = [];
+	let batch: T[] = [];
+	let bytes = 0;
+	for (const entry of entries) {
+		if (entry.bytes.byteLength === 0 || entry.bytes.byteLength > MAX_DURABLE_UPDATE_BYTES) {
+			throw new Error("pending update exceeds durable value limit");
+		}
+		if (batch.length > 0 && bytes + entry.bytes.byteLength > MAX_DURABLE_UPDATE_BYTES) {
+			batches.push(batch);
+			batch = [];
+			bytes = 0;
+		}
+		batch.push(entry);
+		bytes += entry.bytes.byteLength;
+	}
+	if (batch.length > 0) batches.push(batch);
+	return batches;
 }
 
 export function createVaultDocument(guid?: string): Y.Doc {
@@ -643,8 +664,7 @@ export class VaultRuntime implements DrainPort {
 				const reconstructed = this.store.reconstructDocument(bodyId);
 				const update = Y.encodeStateAsUpdate(reconstructed.doc);
 				reconstructed.doc.destroy();
-				bodies.push({ ...metadata, status: 200, generation: reconstructed.generation,
-					update: bytesToBase64Url(update) });
+				bodies.push({ ...metadata, status: 200, generation: reconstructed.generation, update });
 				reconstructedBodies++;
 				reconstructedThisBody = true;
 			} catch { bodies.push({ bodyId, status: 500, error: "body_state_corrupt" }); }
@@ -652,9 +672,10 @@ export class VaultRuntime implements DrainPort {
 				await new Promise<void>((resolve) => setTimeout(resolve, 0));
 			}
 		}
-		const response = JSON.stringify({ bodies, highWater: this.store.currentSequence() });
-		if (new TextEncoder().encode(response).byteLength > MAX_CATCH_UP_BYTES) return json({ error: "catch_up_response_too_large" }, 413);
-		return new Response(response, { headers: { "content-type": "application/json", "cache-control": "no-store" } });
+		let response: Uint8Array;
+		try { response = encodeBinaryEnvelope({ bodies, highWater: this.store.currentSequence() }, MAX_CATCH_UP_BYTES); }
+		catch { return json({ error: "catch_up_response_too_large" }, 413); }
+		return new Response(response.slice().buffer, { headers: { "content-type": YAOS_BINARY_CONTENT_TYPE, "cache-control": "no-store" } });
 	}
 
 	private async bootstrapRoute(request: Request, url: URL, parts: string[]): Promise<Response | null> {
@@ -714,15 +735,14 @@ export class VaultRuntime implements DrainPort {
 				return {
 					bodyId,
 					generation: state.generation,
-					encodedState: bytesToBase64Url(state.encodedState),
+					encodedState: state.encodedState,
 				};
 			});
-			const response = JSON.stringify({ bodies });
-			if (new TextEncoder().encode(response).byteLength > MAX_CATCH_UP_BYTES) {
-				return json({ error: "bootstrap_response_too_large" }, 413);
-			}
-			return new Response(response, {
-				headers: { "content-type": "application/json", "cache-control": "no-store" },
+			let response: Uint8Array;
+			try { response = encodeBinaryEnvelope({ bodies }, MAX_CATCH_UP_BYTES); }
+			catch { return json({ error: "bootstrap_response_too_large" }, 413); }
+			return new Response(response.slice().buffer, {
+				headers: { "content-type": YAOS_BINARY_CONTENT_TYPE, "cache-control": "no-store" },
 			});
 		}
 		if (request.method === "GET" && parts.length === 4 && parts[2] === "body") {
@@ -779,13 +799,11 @@ export class VaultRuntime implements DrainPort {
 			documentIds.add(entry.bodyId);
 		}
 		let written = 0;
-		let blockedByPin = 0;
 		for (const documentId of documentIds) {
-			const result = this.store.writeCheckpoint(documentId);
-			if (result.status === "written") written++;
-			else blockedByPin++;
+			this.store.writeCheckpoint(documentId);
+			written++;
 		}
-		if (blockedByPin === 0 && this.store.activePins().length === 0) {
+		if (this.store.activePins().length === 0) {
 			const floor = Math.max(0, this.store.currentSequence() - FEED_RETAIN_SEQUENCES);
 			if (floor > this.store.journalFloor()) this.store.advanceFeedFloor(floor);
 		}
@@ -793,7 +811,7 @@ export class VaultRuntime implements DrainPort {
 			ok: true,
 			documents: documentIds.size,
 			checkpointsWritten: written,
-			blockedByPin,
+			blockedByPin: 0,
 			sequence: this.store.currentSequence(),
 			feedFloor: this.store.journalFloor(),
 		});
@@ -854,17 +872,22 @@ export class VaultRuntime implements DrainPort {
 				if (entries.some((entry) => !entry.actor || this.store.validateActor(entry.actor) !== "allowed")) {
 					throw new Error("authority_superseded");
 				}
-				const update = entries.length === 1
-					? entries[0]!.bytes
-					: Y.mergeUpdates(entries.map((entry) => entry.bytes));
-				const catalog = documentId === "root" ? undefined : await this.catalogForUpdate(documentId, update);
-				const commit = this.store.commitUpdate({ documentId, update, kind: documentId === "root" ? "root" : "body", catalog,
-					actorAttributions: entries.map((entry) => ({ actor: entry.actor!, requestDigest: entry.digest })) });
-				processed = entries.length;
-				const loaded = this.cache.get(documentId);
-				if (loaded) loaded.generation = commit.generation;
-				if (documentId !== "root") {
-					this.sockets.notifyBodyCommitted(documentId, commit.generation, commit.vaultSequence);
+				for (const batch of partitionDurableUpdateBatches(entries)) {
+					const update = batch.length === 1
+						? batch[0]!.bytes
+						: Y.mergeUpdates(batch.map((entry) => entry.bytes));
+					if (update.byteLength > MAX_DURABLE_UPDATE_BYTES) {
+						throw new Error("merged pending update exceeds durable value limit");
+					}
+					const catalog = documentId === "root" ? undefined : await this.catalogForUpdate(documentId, update);
+					const commit = this.store.commitUpdate({ documentId, update, kind: documentId === "root" ? "root" : "body", catalog,
+						actorAttributions: batch.map((entry) => ({ actor: entry.actor!, requestDigest: entry.digest })) });
+					processed += batch.length;
+					const loaded = this.cache.get(documentId);
+					if (loaded) loaded.generation = commit.generation;
+					if (documentId !== "root") {
+						this.sockets.notifyBodyCommitted(documentId, commit.generation, commit.vaultSequence);
+					}
 				}
 				this.persistence.set(documentId, { status: "healthy", lastError: null, lastSuccessAt: Date.now(), failures: this.persistence.get(documentId)?.failures ?? 0 });
 			} catch (error) {
@@ -904,8 +927,8 @@ export class VaultRuntime implements DrainPort {
 	private maintain(documentId: string): void {
 		try {
 			if (!shouldCompactJournal(this.store.documentJournalStats(documentId))) return;
-			const checkpoint = this.store.writeCheckpoint(documentId);
-			if (checkpoint.status !== "written" || this.store.activePins().length > 0) return;
+			this.store.writeCheckpoint(documentId);
+			if (this.store.activePins().length > 0) return;
 			const floor = Math.max(0, this.store.currentSequence() - FEED_RETAIN_SEQUENCES);
 			if (floor > this.store.journalFloor()) this.store.advanceFeedFloor(floor);
 		} catch (error) {

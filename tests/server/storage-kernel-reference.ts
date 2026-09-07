@@ -31,11 +31,11 @@ const s = suite("storage-kernel-reference");
 s.section("Independent format pins");
 s.check(
 	SCHEMA_VERSION === 7
-		&& STORAGE_FORMAT_VERSION === 2
-		&& PROTOCOL_VERSION === 3
+		&& STORAGE_FORMAT_VERSION === 3
+		&& PROTOCOL_VERSION === 4
 		&& SNAPSHOT_FORMAT_VERSION === 2
-		&& SETTINGS_FORMAT_VERSION === 1,
-	"schema/storage/protocol/snapshot/settings formats remain independently pinned to 7/2/3/2/1",
+		&& SETTINGS_FORMAT_VERSION === 2,
+	"schema/storage/protocol/snapshot/settings formats remain independently pinned to 7/3/4/2/2",
 );
 
 function withVersion(component: keyof ProductVersions, version: number): ProductVersions {
@@ -73,7 +73,7 @@ s.section("Durable hard limits");
 s.check(MAX_DURABLE_UPDATE_BYTES === 1_750_000, "durable update values retain the SQLite-safe bound");
 s.check(MAX_CLIENT_MARKDOWN_BYTES === 1_500_000, "client markdown retains deterministic wire headroom");
 s.check(
-	MAX_CLIENT_MARKDOWN_KB === Math.floor(MAX_CLIENT_MARKDOWN_BYTES / 1024),
+	MAX_CLIENT_MARKDOWN_KB === Math.ceil(MAX_CLIENT_MARKDOWN_BYTES / 1024),
 	"displayed markdown KB limit derives from the byte limit",
 );
 
@@ -107,7 +107,7 @@ const metadata: VaultMetadata = {
 	vaultId: "vault-reference-01",
 	vaultGeneration: "generation-reference-01",
 	schemaVersion: 7,
-	storageFormatVersion: 2,
+	storageFormatVersion: 3,
 	provisionedAt: 1,
 };
 const provisioning: VaultProvisioningResult = { ...metadata, created: true };

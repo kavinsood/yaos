@@ -12,13 +12,14 @@ import { SCHEMA_VERSION } from "./schema";
 import { canonicalMarkdownBytes, canonicalizeMarkdown } from "@shared/markdownCodec";
 import type { BodySettlementRepository, DiskSettlementFingerprint } from "./bodySettlement";
 import { splitMarkdownComponents } from "./frontmatterBoundary";
+import { decodeBinaryEnvelope, YAOS_BINARY_CONTENT_TYPE } from "@shared/binaryEnvelope";
 
 export interface BootstrapHttpRequest {
 	url: string;
 	method: "GET" | "POST";
 	headers: Record<string, string>;
-	contentType?: "application/json";
-	body?: string;
+	contentType?: "application/json" | typeof YAOS_BINARY_CONTENT_TYPE;
+	body?: string | ArrayBuffer;
 }
 
 export interface BootstrapHttpResponse {
@@ -264,19 +265,6 @@ export async function decodeVerifiedBodyContent(
 	return canonicalContent;
 }
 
-function decodeBytesBase64(value: string): Uint8Array | null {
-	try {
-		const binary = atob(value);
-		const bytes = new Uint8Array(binary.length);
-		for (let index = 0; index < binary.length; index++) {
-			bytes[index] = binary.charCodeAt(index);
-		}
-		return bytes;
-	} catch {
-		return null;
-	}
-}
-
 function exactArrayBuffer(bytes: Uint8Array): ArrayBuffer {
 	const buffer = bytes.buffer;
 	if (
@@ -289,14 +277,6 @@ function exactArrayBuffer(bytes: Uint8Array): ArrayBuffer {
 	const copy = new Uint8Array(bytes.byteLength);
 	copy.set(bytes);
 	return copy.buffer;
-}
-
-function decodeBase64UrlBytes(value: string): Uint8Array {
-	const base64 = value.replace(/-/g, "+").replace(/_/g, "/")
-		.padEnd(Math.ceil(value.length / 4) * 4, "=");
-	const decoded = decodeBytesBase64(base64);
-	if (!decoded) throw new Error("invalid base64url body state");
-	return decoded;
 }
 
 /** Authenticated bounded HTTP adapter for bootstrap and closed-body catch-up. */
@@ -351,13 +331,29 @@ export class BootstrapHttpPort implements BootstrapServerPort {
 
 	async bodies(bootstrapId: string, bodyIds: string[]): Promise<Map<string, ClientBodyState>> {
 		if (bodyIds.length === 0) return new Map();
-		const value = await this.json<{
-			bodies: Array<{ bodyId: string; generation: number; encodedState: string }>;
-		}>(
-			`bootstrap/${encodeURIComponent(bootstrapId)}/bodies`,
-			"POST",
-			{ bodyIds },
-		);
+		const response = await this.request({
+			url: this.route(`bootstrap/${encodeURIComponent(bootstrapId)}/bodies`),
+			method: "POST",
+			headers: this.headers(),
+			contentType: "application/json",
+			body: JSON.stringify({ bodyIds }),
+		});
+		if (response.status === 413) {
+			if (bodyIds.length === 1) {
+				const state = await this.body(bootstrapId, bodyIds[0]!);
+				return new Map([[state.bodyId, state]]);
+			}
+			const midpoint = Math.ceil(bodyIds.length / 2);
+			const [left, right] = await Promise.all([
+				this.bodies(bootstrapId, bodyIds.slice(0, midpoint)),
+				this.bodies(bootstrapId, bodyIds.slice(midpoint)),
+			]);
+			return new Map([...left, ...right]);
+		}
+		if (response.status !== 200) throw new Error(`vault request failed (${response.status})`);
+		const value = decodeBinaryEnvelope(new Uint8Array(response.arrayBuffer)) as {
+			bodies: Array<{ bodyId: string; generation: number; encodedState: Uint8Array }>;
+		};
 		if (!Array.isArray(value.bodies) || value.bodies.length !== bodyIds.length) {
 			throw new Error("body batch response count mismatch");
 		}
@@ -369,14 +365,14 @@ export class BootstrapHttpPort implements BootstrapServerPort {
 				|| states.has(body.bodyId)
 				|| !Number.isSafeInteger(body.generation)
 				|| body.generation < 0
-				|| typeof body.encodedState !== "string"
+				|| !(body.encodedState instanceof Uint8Array)
 			) {
 				throw new Error("body batch response identity mismatch");
 			}
 			states.set(body.bodyId, {
 				bodyId: body.bodyId,
 				generation: body.generation,
-				encodedState: decodeBase64UrlBytes(body.encodedState),
+				encodedState: body.encodedState,
 			});
 		}
 		return states;
@@ -435,18 +431,30 @@ export class BootstrapHttpPort implements BootstrapServerPort {
 			contentType: "application/json",
 			body: JSON.stringify({ bodies: requests }),
 		});
-		if (response.status === 413 && requests.length > 1) {
-			const midpoint = Math.ceil(requests.length / 2);
-			const [left, right] = await Promise.all([
-				this.catchUpBodies(requests.slice(0, midpoint)),
-				this.catchUpBodies(requests.slice(midpoint)),
-			]);
-			return new Map([...left, ...right]);
+		if (response.status === 413) {
+			if (requests.length > 1) {
+				const midpoint = Math.ceil(requests.length / 2);
+				const [left, right] = await Promise.all([
+					this.catchUpBodies(requests.slice(0, midpoint)),
+					this.catchUpBodies(requests.slice(midpoint)),
+				]);
+				return new Map([...left, ...right]);
+			}
+			const bodyId = requests[0]!.bodyId;
+			for (let attempt = 0; attempt < 3; attempt++) {
+				const head = await this.currentHead(bodyId);
+				if (!head) return new Map();
+				const state = await this.currentBody(bodyId);
+				if (state.generation === head.generation) {
+					return new Map([[bodyId, { head: { ...head, lifecycle: "active" }, state }]]);
+				}
+			}
+			throw new Error("body changed during binary catch-up fallback");
 		}
-		if (response.status !== 200 || !response.json || typeof response.json !== "object") {
+		if (response.status !== 200) {
 			throw new Error(`body catch-up request failed (${response.status})`);
 		}
-		const raw = response.json as { bodies?: unknown };
+		const raw = decodeBinaryEnvelope(new Uint8Array(response.arrayBuffer)) as { bodies?: unknown };
 		if (!Array.isArray(raw.bodies) || raw.bodies.length !== requests.length) {
 			throw new Error("body catch-up response count mismatch");
 		}
@@ -480,7 +488,7 @@ export class BootstrapHttpPort implements BootstrapServerPort {
 				? {
 					bodyId: entry.bodyId,
 					generation: entry.generation as number,
-					encodedState: decodeBase64UrlBytes(typeof entry.update === "string" ? entry.update : ""),
+					encodedState: entry.update instanceof Uint8Array ? entry.update : (() => { throw new Error("invalid body catch-up update"); })(),
 				}
 				: null;
 			results.set(entry.bodyId, { head, state });

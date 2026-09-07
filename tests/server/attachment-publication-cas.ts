@@ -3,6 +3,7 @@ import * as Y from "yjs";
 import { VaultLifecycleService } from "../../server/src/vaultLifecycleService.ts";
 import type { AttachmentCatalogEvent, DurableAttachmentOperation } from "../../server/src/vaultCatalogStore.ts";
 import { suite } from "../harness.ts";
+import { decodeBinaryEnvelope, YAOS_BINARY_CONTENT_TYPE } from "../../server/src/shared/binaryEnvelope.ts";
 
 const s = suite("attachment-publication-cas");
 const HASH_A = "a".repeat(64);
@@ -130,7 +131,11 @@ function request(mutation: unknown): Request {
 
 async function publish(service: VaultLifecycleService, mutation: unknown): Promise<{ response: Response; body: Record<string, unknown> }> {
 	const response = await service.publishAttachment(request(mutation));
-	return { response, body: await response.json() as Record<string, unknown> };
+	const contentType = response.headers.get("content-type") ?? "";
+	const body = contentType.startsWith(YAOS_BINARY_CONTENT_TYPE)
+		? decodeBinaryEnvelope(new Uint8Array(await response.arrayBuffer())) as Record<string, unknown>
+		: await response.json() as Record<string, unknown>;
+	return { response, body };
 }
 
 function upsert(operationId: string, path: string, expectedRevision: string | null, hash = HASH_A): UpsertMutation {
@@ -165,6 +170,8 @@ s.test("a committed attachment broadcasts while the hibernated root cache is unl
 	const { service, broadcasts } = fixture();
 	const result = await publish(service, upsert("hibernated-root", "hibernated.bin", null));
 	assert.equal(result.response.status, 200);
+	assert.equal(result.response.headers.get("content-type"), YAOS_BINARY_CONTENT_TYPE);
+	assert.ok(result.body.rootUpdate instanceof Uint8Array);
 	assert.equal(broadcasts(), 1, "durable publication must wake hibernated root peers even without a loaded cache entry");
 });
 

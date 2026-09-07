@@ -2,11 +2,14 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import * as Y from "yjs";
 import {
 	NodeDatabaseSet,
 	NodeSqliteStorage,
 	readSqliteBlob,
 } from "../../packages/server-node/src/storage";
+import { decodeSqlChunks, SQLITE_BLOB_CHUNK_BYTES } from "../../server/src/vaultDocumentStore";
+import { VaultStore } from "../../server/src/vaultStore";
 import { suite } from "../harness.ts";
 
 const s = suite("node-runtime-storage");
@@ -27,6 +30,59 @@ s.test("ArrayBuffer and offset views bind as exact BLOBs rather than NULL", asyn
 		assert.deepEqual([...new Uint8Array(rows[0]!.value)], [1, 2, 3, 4]);
 		assert.deepEqual([...new Uint8Array(rows[1]!.value)], [5, 6, 7]);
 	} finally {
+		storage.close();
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+s.test("vault journals and multi-row checkpoints persist exact bounded BLOB bytes", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "yaos-node-vault-blobs-"));
+	const storage = NodeSqliteStorage.open(join(directory, "state.sqlite"));
+	const doc = new Y.Doc({ guid: "root" });
+	try {
+		doc.getText("bulk").insert(0, "a".repeat(900_000));
+		const first = Y.encodeStateAsUpdate(doc);
+		const pooled = new Uint8Array(first.byteLength + 2);
+		pooled[0] = 90;
+		pooled.set(first, 1);
+		pooled[pooled.byteLength - 1] = 91;
+		const firstView = pooled.subarray(1, pooled.byteLength - 1);
+
+		const store = new VaultStore(storage);
+		store.provisionVault("vault-blob-test", "generation-blob-test", firstView, 1);
+		const beforeSecond = Y.encodeStateVector(doc);
+		doc.getText("bulk").insert(900_000, "b".repeat(900_000));
+		const second = Y.encodeStateAsUpdate(doc, beforeSecond);
+		store.commitUpdate({ documentId: "root", update: second, kind: "root", now: 2 });
+
+		const journal = storage.sql.exec<{
+			sequence: number;
+			storage_type: string;
+			stored_bytes: number;
+			data: ArrayBuffer;
+		}>(`SELECT sequence, typeof(data) AS storage_type, length(data) AS stored_bytes, data
+		   FROM vault_journal_chunks ORDER BY sequence, chunk_index`).toArray();
+		assert.deepEqual(journal.map((row) => row.storage_type), ["blob", "blob"]);
+		assert.deepEqual(journal.map((row) => row.stored_bytes), [first.byteLength, second.byteLength]);
+		assert.deepEqual(new Uint8Array(journal[0]!.data), first, "offset-backed input leaked padding or changed bytes");
+		assert.deepEqual(new Uint8Array(journal[1]!.data), second);
+
+		const expectedCheckpoint = Y.encodeStateAsUpdate(doc);
+		const written = store.writeCheckpoint("root", store.currentSequence());
+		const checkpoint = storage.sql.exec<{
+			chunk_index: number;
+			storage_type: string;
+			stored_bytes: number;
+			data: ArrayBuffer;
+		}>(`SELECT chunk_index, typeof(data) AS storage_type, length(data) AS stored_bytes, data
+		   FROM vault_checkpoints WHERE document_id = 'root' ORDER BY chunk_index`).toArray();
+		assert.equal(written.chunks, checkpoint.length);
+		assert.ok(checkpoint.length >= 2, "checkpoint fixture did not cross the SQLite row boundary");
+		assert.ok(checkpoint.every((row) => row.storage_type === "blob" && row.stored_bytes <= SQLITE_BLOB_CHUNK_BYTES));
+		assert.equal(checkpoint.reduce((total, row) => total + row.stored_bytes, 0), expectedCheckpoint.byteLength);
+		assert.deepEqual(decodeSqlChunks(checkpoint), expectedCheckpoint);
+	} finally {
+		doc.destroy();
 		storage.close();
 		await rm(directory, { recursive: true, force: true });
 	}

@@ -31,5 +31,5 @@ const diagnostics = await fetch(`${identity.host}/vault/${encodeURIComponent(ide
 });
 if (!diagnostics.ok) throw new Error(`diagnostics failed after oversized schema rejection (${diagnostics.status})`);
 const body = await diagnostics.json() as { schemaVersion?: unknown; protocolVersion?: unknown };
-if (body.schemaVersion !== 7 || body.protocolVersion !== 3) throw new Error(`diagnostics lost schema-7 pins: ${JSON.stringify(body)}`);
+if (body.schemaVersion !== 7 || body.protocolVersion !== 4) throw new Error(`diagnostics lost schema-7 pins: ${JSON.stringify(body)}`);
 console.log("Oversized /ws/root schema input is bounded and leaves schema-4 diagnostics healthy.");

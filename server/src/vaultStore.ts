@@ -217,7 +217,7 @@ export class VaultStore extends RecoveryAuthorityStore {
 				vault_id TEXT NOT NULL,
 				vault_generation TEXT NOT NULL,
 				schema_version INTEGER NOT NULL CHECK(schema_version = 7),
-				storage_format_version INTEGER NOT NULL CHECK(storage_format_version = 2),
+				storage_format_version INTEGER NOT NULL CHECK(storage_format_version = 3),
 				provisioned_at INTEGER NOT NULL
 			)`).toArray();
 			this.storage.sql.exec(
@@ -339,6 +339,8 @@ export class VaultStore extends RecoveryAuthorityStore {
 		candidateId: string;
 		candidateDigest: string;
 		update: Uint8Array;
+		expectedHead: { generation: number; latestSequence: number } | null;
+		changesState: boolean;
 		vaultGeneration: string;
 		runtimeEpoch: string;
 		actor: { principalId: string; membershipRevision: number; deviceId: string; deviceCredentialRevision: number };
@@ -373,22 +375,17 @@ export class VaultStore extends RecoveryAuthorityStore {
 			}
 			return existing;
 		}
-		const reconstructed = this.reconstructDocument(input.bodyId);
-		let changed = false;
-		const observe = () => { changed = true; };
-		reconstructed.doc.on("update", observe);
-		try {
-			Y.applyUpdate(reconstructed.doc, input.update, "candidate-coverage-check");
-		} finally {
-			reconstructed.doc.off("update", observe);
-			reconstructed.doc.destroy();
+		const currentHead = this.documentHead(input.bodyId);
+		if (currentHead?.generation !== input.expectedHead?.generation
+			|| currentHead?.latestSequence !== input.expectedHead?.latestSequence) {
+			throw new Error("candidate_generation_fence_changed");
 		}
-		const commit = changed
+		const commit = input.changesState
 			? this.commitUpdate({ documentId: input.bodyId, update: input.update, kind: "body", catalog: input.catalog, now: input.now,
 				actorAttributions: [{ actor: input.actor, operationId: input.candidateId, requestDigest: input.candidateDigest }] })
 			: {
-				vaultSequence: this.documentHead(input.bodyId)?.latestSequence ?? 0,
-				generation: this.documentHead(input.bodyId)?.generation ?? 0,
+				vaultSequence: currentHead?.latestSequence ?? 0,
+				generation: currentHead?.generation ?? 0,
 			};
 		if (commit.generation <= 0) throw new Error("body state is missing");
 		const receipt: DurableCandidateReceipt = {

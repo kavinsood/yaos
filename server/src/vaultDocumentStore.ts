@@ -1,11 +1,17 @@
 import * as Y from "yjs";
 import { SCHEMA_VERSION, STORAGE_FORMAT_VERSION } from "./shared/productVersions";
-import { base64UrlToBytes, bytesToBase64Url } from "./base64url";
 import type { BodyLifecycle, CatalogHeadAtBoundary } from "./vaultCatalogStore";
 import type { HistoryPin } from "./vaultBootstrapStore";
 import type { VaultActorContext, VaultRole } from "./collaboration";
+import { SQLITE_ROW_SAFE_BYTES } from "./shared/durableLimits";
 
-const CHECKPOINT_CHUNK_BYTES = 1024 * 1024;
+/**
+ * Durable Object SQLite rows are limited to 2 MB. Durable updates are capped
+ * below this value and therefore fit in one binary row. Checkpoints may be
+ * larger and are split into independently bounded binary rows.
+ */
+export const SQLITE_BLOB_CHUNK_BYTES = SQLITE_ROW_SAFE_BYTES;
+export type DurableChunkValue = ArrayBuffer;
 
 interface SqlCursor<T> extends Iterable<T> {
 	toArray(): T[];
@@ -116,11 +122,17 @@ export interface VaultCollaborationMigrationReceipt {
 	installedAt: number;
 }
 
-export function decodeSqlChunks(rows: Iterable<{ data: string }>): Uint8Array {
+function ownedBuffer(bytes: Uint8Array): ArrayBuffer {
+	const buffer = new ArrayBuffer(bytes.byteLength);
+	new Uint8Array(buffer).set(bytes);
+	return buffer;
+}
+
+export function decodeSqlChunks(rows: Iterable<{ data: DurableChunkValue }>): Uint8Array {
 	const chunks: Uint8Array[] = [];
 	let total = 0;
 	for (const row of rows) {
-		const chunk = base64UrlToBytes(row.data);
+		const chunk = new Uint8Array(row.data);
 		chunks.push(chunk);
 		total += chunk.byteLength;
 	}
@@ -172,7 +184,7 @@ export abstract class VaultDocumentStore {
 			CREATE TABLE IF NOT EXISTS vault_journal_chunks (
 				sequence INTEGER NOT NULL,
 				chunk_index INTEGER NOT NULL,
-				data TEXT NOT NULL,
+				data BLOB NOT NULL,
 				PRIMARY KEY(sequence, chunk_index)
 			);
 			CREATE TABLE IF NOT EXISTS vault_checkpoints (
@@ -180,7 +192,7 @@ export abstract class VaultDocumentStore {
 				checkpoint_sequence INTEGER NOT NULL,
 				generation INTEGER NOT NULL,
 				chunk_index INTEGER NOT NULL,
-				data TEXT NOT NULL,
+				data BLOB NOT NULL,
 				PRIMARY KEY(document_id, checkpoint_sequence, chunk_index)
 			);
 			CREATE INDEX IF NOT EXISTS vault_checkpoint_lookup
@@ -241,7 +253,7 @@ export abstract class VaultDocumentStore {
 				vault_id TEXT NOT NULL,
 				vault_generation TEXT NOT NULL,
 				schema_version INTEGER NOT NULL CHECK(schema_version = 7),
-				storage_format_version INTEGER NOT NULL CHECK(storage_format_version = 2),
+				storage_format_version INTEGER NOT NULL CHECK(storage_format_version = 3),
 				provisioned_at INTEGER NOT NULL
 			);
 			CREATE TABLE IF NOT EXISTS vault_revoked_devices (
@@ -592,13 +604,13 @@ export abstract class VaultDocumentStore {
 	protected insertJournalChunks(sequence: number, update: Uint8Array): number {
 		let chunkIndex = 0;
 		let rowsWritten = 0;
-		for (let offset = 0; offset < update.byteLength; offset += CHECKPOINT_CHUNK_BYTES) {
-			const chunk = update.subarray(offset, Math.min(offset + CHECKPOINT_CHUNK_BYTES, update.byteLength));
+		for (let offset = 0; offset < update.byteLength; offset += SQLITE_BLOB_CHUNK_BYTES) {
+			const chunk = update.subarray(offset, Math.min(offset + SQLITE_BLOB_CHUNK_BYTES, update.byteLength));
 			const write = this.storage.sql.exec(
 				"INSERT INTO vault_journal_chunks(sequence, chunk_index, data) VALUES (?, ?, ?)",
 				sequence,
 				chunkIndex++,
-				bytesToBase64Url(chunk),
+				ownedBuffer(chunk),
 			);
 			write.toArray();
 			rowsWritten += write.rowsWritten;
@@ -919,78 +931,91 @@ export abstract class VaultDocumentStore {
 		this.initialize();
 		if (throughSequence < 0) throw new Error("throughSequence must be non-negative");
 		let rowsRead = 0;
-		const checkpointHead = this.storage.sql.exec<{ checkpoint_sequence: number; generation: number }>(
-			`SELECT checkpoint_sequence, generation
+		const checkpointRows = this.storage.sql.exec<{
+			checkpoint_sequence: number; generation: number; chunk_index: number; data: DurableChunkValue;
+		}>(
+			`SELECT checkpoint_sequence, generation, chunk_index, data
 			 FROM vault_checkpoints
-			 WHERE document_id = ? AND checkpoint_sequence <= ?
-			 ORDER BY checkpoint_sequence DESC LIMIT 1`,
+			 WHERE document_id = ?
+			   AND checkpoint_sequence = (
+			     SELECT MAX(checkpoint_sequence) FROM vault_checkpoints
+			     WHERE document_id = ? AND checkpoint_sequence <= ?
+			   )
+			 ORDER BY chunk_index`,
+			documentId,
 			documentId,
 			throughSequence,
 		);
-		const checkpoint = checkpointHead.toArray()[0];
-		rowsRead += checkpointHead.rowsRead;
+		const checkpointChunks = checkpointRows.toArray();
+		rowsRead += checkpointRows.rowsRead;
+		const checkpoint = checkpointChunks[0];
 		const checkpointSequence = checkpoint?.checkpoint_sequence ?? 0;
 		let generation = checkpoint?.generation ?? 0;
 		const doc = new Y.Doc({ guid: documentId });
 		if (checkpoint) {
-			const chunks = this.storage.sql.exec<{ data: string }>(
-				`SELECT data FROM vault_checkpoints
-				 WHERE document_id = ? AND checkpoint_sequence = ?
-				 ORDER BY chunk_index`,
-				documentId,
-				checkpointSequence,
-			);
-			const checkpointBytes = decodeSqlChunks(chunks);
+			const checkpointBytes = decodeSqlChunks(checkpointChunks);
 			if (checkpointBytes.byteLength === 0) throw new Error("checkpoint chunks are missing");
 			Y.applyUpdate(doc, checkpointBytes, "checkpoint-load");
-			rowsRead += chunks.rowsRead;
 		}
-		const journal = this.storage.sql.exec<{ sequence: number; generation: number; update_byte_length: number }>(
-			`SELECT sequence, generation, update_byte_length FROM vault_journal
-			 WHERE document_id = ? AND sequence > ? AND sequence <= ?
-			 ORDER BY sequence`,
+		const journal = this.storage.sql.exec<{
+			sequence: number; generation: number; update_byte_length: number;
+			chunk_index: number | null; data: DurableChunkValue | null;
+		}>(
+			`SELECT j.sequence, j.generation, j.update_byte_length, c.chunk_index, c.data
+			 FROM vault_journal j
+			 LEFT JOIN vault_journal_chunks c ON c.sequence = j.sequence
+			 WHERE j.document_id = ? AND j.sequence > ? AND j.sequence <= ?
+			 ORDER BY j.sequence, c.chunk_index`,
 			documentId,
 			checkpointSequence,
 			throughSequence,
 		);
 		let journalUpdates = 0;
-		for (const row of journal) {
-			const chunks = this.storage.sql.exec<{ data: string }>(
-				"SELECT data FROM vault_journal_chunks WHERE sequence = ? ORDER BY chunk_index",
-				row.sequence,
-			);
+		let journalSequence: number | null = null;
+		let journalGeneration = 0;
+		let expectedBytes = 0;
+		let chunks: Array<{ data: DurableChunkValue }> = [];
+		const applyJournal = (): void => {
+			if (journalSequence === null) return;
 			const update = decodeSqlChunks(chunks);
-			if (update.byteLength !== row.update_byte_length) throw new Error("journal chunk length mismatch");
+			if (update.byteLength !== expectedBytes) throw new Error("journal chunk length mismatch");
 			if (update.byteLength === 0) throw new Error("journal chunks are missing");
 			Y.applyUpdate(doc, update, "journal-load");
-			rowsRead += chunks.rowsRead;
-			generation = row.generation;
+			generation = journalGeneration;
 			journalUpdates++;
+		};
+		for (const row of journal) {
+			if (journalSequence !== row.sequence) {
+				applyJournal();
+				journalSequence = row.sequence;
+				journalGeneration = row.generation;
+				expectedBytes = row.update_byte_length;
+				chunks = [];
+			}
+			if (row.data !== null) chunks.push({ data: row.data });
 		}
+		applyJournal();
 		rowsRead += journal.rowsRead;
 		return { documentId, throughSequence, generation, checkpointSequence, journalUpdates, doc, rowsRead };
 	}
 
 	writeCheckpoint(documentId: string, throughSequence = this.currentSequence()): {
-		status: "written" | "blocked-by-pin";
+		status: "written";
 		checkpointSequence: number;
 		generation: number;
 		chunks: number;
 		rowsWritten: number;
 	} {
 		this.initialize();
-		const activePins = this.activePins(Date.now());
-		if (activePins.length > 0) {
-			return { status: "blocked-by-pin", checkpointSequence: throughSequence, generation: 0, chunks: 0, rowsWritten: 0 };
-		}
+		const now = Date.now();
 		const reconstructed = this.reconstructDocument(documentId, throughSequence);
 		const encoded = Y.encodeStateAsUpdate(reconstructed.doc);
 		reconstructed.doc.destroy();
 		let rowsWritten = 0;
 		let chunks = 0;
 		this.storage.transactionSync(() => {
-			for (let offset = 0; offset < encoded.byteLength || (offset === 0 && encoded.byteLength === 0); offset += CHECKPOINT_CHUNK_BYTES) {
-				const chunk = encoded.subarray(offset, Math.min(encoded.byteLength, offset + CHECKPOINT_CHUNK_BYTES));
+			for (let offset = 0; offset < encoded.byteLength || (offset === 0 && encoded.byteLength === 0); offset += SQLITE_BLOB_CHUNK_BYTES) {
+				const chunk = encoded.subarray(offset, Math.min(encoded.byteLength, offset + SQLITE_BLOB_CHUNK_BYTES));
 				const write = this.storage.sql.exec(
 					`INSERT INTO vault_checkpoints(document_id, checkpoint_sequence, generation, chunk_index, data)
 					 VALUES (?, ?, ?, ?, ?)`,
@@ -998,7 +1023,7 @@ export abstract class VaultDocumentStore {
 					throughSequence,
 					reconstructed.generation,
 					chunks,
-					bytesToBase64Url(chunk),
+					ownedBuffer(chunk),
 				);
 				write.toArray();
 				rowsWritten += write.rowsWritten;
@@ -1026,11 +1051,22 @@ export abstract class VaultDocumentStore {
 			const oldCheckpoints = this.storage.sql.exec(
 				`DELETE FROM vault_checkpoints
 				 WHERE document_id = ? AND checkpoint_sequence NOT IN (
-				   SELECT checkpoint_sequence FROM vault_checkpoints
+				   SELECT DISTINCT checkpoint_sequence FROM vault_checkpoints
 				   WHERE document_id = ? ORDER BY checkpoint_sequence DESC LIMIT 3
+				 )
+				 AND NOT EXISTS (
+				   SELECT 1 FROM vault_history_pins p
+				   WHERE p.hard_expires_at > ?
+				     AND vault_checkpoints.checkpoint_sequence = (
+				       SELECT MAX(protected.checkpoint_sequence)
+				       FROM vault_checkpoints protected
+				       WHERE protected.document_id = vault_checkpoints.document_id
+				         AND protected.checkpoint_sequence <= p.boundary_sequence
+				     )
 				 )`,
 				documentId,
 				documentId,
+				now,
 			);
 			oldCheckpoints.toArray();
 			rowsWritten += oldCheckpoints.rowsWritten;
@@ -1039,27 +1075,34 @@ export abstract class VaultDocumentStore {
 	}
 
 	listChangesAfter(sequence: number, limit = 1000): JournalFeedEntry[] {
+		this.initialize();
+		const boundedLimit = Math.min(1000, Math.max(1, limit));
 		const rows = this.storage.sql.exec<{
 			sequence: number; document_id: string; generation: number; kind: VaultCommitKind;
 		}>(
 			`SELECT sequence, document_id, generation, kind FROM vault_journal
 			 WHERE sequence > ? ORDER BY sequence LIMIT ?`,
 			sequence,
-			Math.min(1000, Math.max(1, limit)),
+			boundedLimit,
 		).toArray();
-		return rows.map((row) => ({
-			sequence: row.sequence,
-			documentId: row.document_id,
-			generation: row.generation,
-			kind: row.kind,
-			catalogs: this.storage.sql.exec<{
-				sequence: number; body_id: string; file_id: string; path: string; previous_path: string | null;
-				lifecycle: BodyLifecycle; generation: number; content_hash: string | null; size: number | null;
-			}>(
-				`SELECT sequence, body_id, file_id, path, previous_path, lifecycle, generation, content_hash, size
-				 FROM vault_catalog_events WHERE sequence = ? ORDER BY mutation_index`,
-				row.sequence,
-			).toArray().map((catalog) => ({
+		const catalogs = this.storage.sql.exec<{
+			sequence: number; body_id: string; file_id: string; path: string; previous_path: string | null;
+			lifecycle: BodyLifecycle; generation: number; content_hash: string | null; size: number | null;
+		}>(
+			`SELECT c.sequence, c.body_id, c.file_id, c.path, c.previous_path, c.lifecycle,
+			        c.generation, c.content_hash, c.size
+			 FROM vault_catalog_events c
+			 JOIN (
+			   SELECT sequence FROM vault_journal
+			   WHERE sequence > ? ORDER BY sequence LIMIT ?
+			 ) page ON page.sequence = c.sequence
+			 ORDER BY c.sequence, c.mutation_index`,
+			sequence,
+			boundedLimit,
+		).toArray();
+		const catalogsBySequence = new Map<number, CatalogHeadAtBoundary[]>();
+		for (const catalog of catalogs) {
+			const mapped: CatalogHeadAtBoundary = {
 				sequence: catalog.sequence,
 				bodyId: catalog.body_id,
 				fileId: catalog.file_id,
@@ -1069,7 +1112,17 @@ export abstract class VaultDocumentStore {
 				generation: catalog.generation,
 				contentHash: catalog.content_hash,
 				size: catalog.size,
-			})),
+			};
+			const entries = catalogsBySequence.get(catalog.sequence);
+			if (entries) entries.push(mapped);
+			else catalogsBySequence.set(catalog.sequence, [mapped]);
+		}
+		return rows.map((row) => ({
+			sequence: row.sequence,
+			documentId: row.document_id,
+			generation: row.generation,
+			kind: row.kind,
+			catalogs: catalogsBySequence.get(row.sequence) ?? [],
 		}));
 	}
 
@@ -1145,19 +1198,12 @@ export abstract class VaultDocumentStore {
 			throughSequence,
 		).toArray()[0];
 		const checkpointSequence = checkpoint?.checkpoint_sequence ?? 0;
-		let bytes = 0;
-		if (checkpoint) {
-			for (const row of this.storage.sql.exec<{ data: string }>(
-				"SELECT data FROM vault_checkpoints WHERE document_id = ? AND checkpoint_sequence = ? ORDER BY chunk_index",
-				documentId,
-				checkpointSequence,
-			)) {
-				const completeQuartets = Math.floor(row.data.length / 4);
-				const remainder = row.data.length % 4;
-				if (remainder === 1) throw new Error("invalid checkpoint chunk length");
-				bytes += completeQuartets * 3 + (remainder === 2 ? 1 : remainder === 3 ? 2 : 0);
-			}
-		}
+		let bytes = checkpoint ? this.storage.sql.exec<{ bytes: number }>(
+			`SELECT COALESCE(SUM(length(data)), 0) AS bytes FROM vault_checkpoints
+			 WHERE document_id = ? AND checkpoint_sequence = ?`,
+			documentId,
+			checkpointSequence,
+		).one().bytes : 0;
 		bytes += this.storage.sql.exec<{ bytes: number }>(
 			`SELECT COALESCE(SUM(update_byte_length), 0) AS bytes FROM vault_journal
 			 WHERE document_id = ? AND sequence > ? AND sequence <= ?`,
@@ -1169,60 +1215,119 @@ export abstract class VaultDocumentStore {
 	}
 
 	rawDocumentRecipeChunk(documentId: string, throughSequence: number, cursor: string, maxBytes: number): {
-		parts: Array<{ kind: "checkpoint" | "journal"; sequence: number; update: Uint8Array }>;
+		parts: Array<{ kind: "checkpoint" | "journal"; sequence: number; fragmentIndex: number; fragmentCount: number; bytes: Uint8Array }>;
 		nextCursor: string | null;
 		encodedBytes: number;
 	} {
 		this.initialize();
 		const offset = Number(cursor);
 		if (!Number.isSafeInteger(offset) || offset < 0 || maxBytes <= 0) throw new Error("invalid recipe cursor or byte budget");
-		const checkpoint = this.storage.sql.exec<{ checkpoint_sequence: number }>(
-			`SELECT checkpoint_sequence FROM vault_checkpoints
-			 WHERE document_id = ? AND checkpoint_sequence <= ? ORDER BY checkpoint_sequence DESC LIMIT 1`,
+		const checkpoint = this.storage.sql.exec<{ checkpoint_sequence: number; chunk_count: number }>(
+			`SELECT checkpoint_sequence, COUNT(*) AS chunk_count FROM vault_checkpoints
+			 WHERE document_id = ?
+			   AND checkpoint_sequence = (
+			     SELECT MAX(checkpoint_sequence) FROM vault_checkpoints
+			     WHERE document_id = ? AND checkpoint_sequence <= ?
+			   )
+			 GROUP BY checkpoint_sequence`,
+			documentId,
 			documentId,
 			throughSequence,
 		).toArray()[0];
 		const checkpointSequence = checkpoint?.checkpoint_sequence ?? 0;
-		const checkpointBytes = checkpoint ? decodeSqlChunks(this.storage.sql.exec<{ data: string }>(
-			"SELECT data FROM vault_checkpoints WHERE document_id = ? AND checkpoint_sequence = ? ORDER BY chunk_index",
-			documentId,
-			checkpointSequence,
-		)).byteLength : 0;
-		const journalOffset = Math.max(0, offset - (checkpoint ? 1 : 0));
-		const metadata: Array<{ kind: "checkpoint" | "journal"; sequence: number; bytes: number }> = [];
-		if (checkpoint && offset === 0) metadata.push({ kind: "checkpoint", sequence: checkpointSequence, bytes: checkpointBytes });
-		metadata.push(...this.storage.sql.exec<{ sequence: number; update_byte_length: number }>(
-			`SELECT sequence, update_byte_length FROM vault_journal
-			 WHERE document_id = ? AND sequence > ? AND sequence <= ?
-			 ORDER BY sequence LIMIT 257 OFFSET ?`,
+		const checkpointCount = checkpoint?.chunk_count ?? 0;
+		const checkpointRows = checkpoint && offset < checkpointCount ? this.storage.sql.exec<{
+			chunk_index: number; expected_bytes: number; data: DurableChunkValue;
+		}>(
+			`WITH candidates AS (
+			   SELECT chunk_index, length(data) AS expected_bytes
+			   FROM vault_checkpoints
+			   WHERE document_id = ? AND checkpoint_sequence = ? AND chunk_index >= ?
+			   ORDER BY chunk_index LIMIT 256
+			 ), sized AS (
+			   SELECT chunk_index, expected_bytes,
+			          ROW_NUMBER() OVER (ORDER BY chunk_index) AS ordinal,
+			          SUM(expected_bytes) OVER (ORDER BY chunk_index ROWS UNBOUNDED PRECEDING) AS running_bytes
+			   FROM candidates
+			 )
+			 SELECT sized.chunk_index, sized.expected_bytes, checkpoint.data
+			 FROM sized
+			 JOIN vault_checkpoints checkpoint
+			   ON checkpoint.document_id = ? AND checkpoint.checkpoint_sequence = ?
+			  AND checkpoint.chunk_index = sized.chunk_index
+			 WHERE sized.ordinal = 1 OR sized.running_bytes <= ?
+			 ORDER BY sized.chunk_index`,
+			documentId, checkpointSequence, offset,
+			documentId, checkpointSequence, maxBytes,
+		).toArray() : [];
+		const journalOffset = Math.max(0, offset - checkpointCount);
+		const candidates: Array<{
+			kind: "checkpoint" | "journal"; sequence: number; fragmentIndex: number;
+			fragmentCount: number; expectedBytes: number; bytes: Uint8Array;
+		}> = checkpointRows.map((row) => ({
+			kind: "checkpoint", sequence: checkpointSequence, fragmentIndex: row.chunk_index,
+			fragmentCount: checkpointCount, expectedBytes: row.expected_bytes, bytes: new Uint8Array(row.data),
+		}));
+		const checkpointBytes = candidates.reduce((total, candidate) => total + candidate.expectedBytes, 0);
+		const checkpointExhausted = offset >= checkpointCount
+			|| offset + checkpointRows.length >= checkpointCount;
+		const journalLimit = checkpointExhausted ? 256 - checkpointRows.length : 0;
+		const remainingBytes = maxBytes - checkpointBytes;
+		const forceFirstJournal = checkpointRows.length === 0;
+		const journalRows = journalLimit > 0 && (remainingBytes > 0 || forceFirstJournal) ? this.storage.sql.exec<{
+			sequence: number; update_byte_length: number; chunk_index: number | null; data: DurableChunkValue | null;
+		}>(
+			`WITH candidates AS (
+			   SELECT sequence, update_byte_length FROM vault_journal
+			   WHERE document_id = ? AND sequence > ? AND sequence <= ?
+			   ORDER BY sequence LIMIT ? OFFSET ?
+			 ), sized AS (
+			   SELECT sequence, update_byte_length,
+			          ROW_NUMBER() OVER (ORDER BY sequence) AS ordinal,
+			          SUM(update_byte_length) OVER (ORDER BY sequence ROWS UNBOUNDED PRECEDING) AS running_bytes
+			   FROM candidates
+			 ), selected AS (
+			   SELECT sequence, update_byte_length FROM sized
+			   WHERE running_bytes <= ? OR (? = 1 AND ordinal = 1)
+			 )
+			 SELECT selected.sequence, selected.update_byte_length, chunks.chunk_index, chunks.data
+			 FROM selected
+			 LEFT JOIN vault_journal_chunks chunks ON chunks.sequence = selected.sequence
+			 ORDER BY selected.sequence, chunks.chunk_index`,
 			documentId,
 			checkpointSequence,
 			throughSequence,
+			journalLimit,
 			journalOffset,
-		).toArray().map((row) => ({ kind: "journal" as const, sequence: row.sequence, bytes: row.update_byte_length })));
-		const selected: typeof metadata = [];
+			Math.max(0, remainingBytes),
+			forceFirstJournal ? 1 : 0,
+		).toArray() : [];
+		for (let start = 0; start < journalRows.length;) {
+			const first = journalRows[start]!;
+			let end = start + 1;
+			while (end < journalRows.length && journalRows[end]!.sequence === first.sequence) end++;
+			const bytes = decodeSqlChunks(journalRows.slice(start, end)
+				.filter((row): row is typeof row & { data: DurableChunkValue } => row.data !== null)
+				.map((row) => ({ data: row.data })));
+			candidates.push({
+				kind: "journal", sequence: first.sequence, fragmentIndex: 0, fragmentCount: 1,
+				expectedBytes: first.update_byte_length, bytes,
+			});
+			start = end;
+		}
+		const selected: typeof candidates = [];
 		let encodedBytes = 0;
-		for (const item of metadata) {
-			if (selected.length > 0 && encodedBytes + item.bytes > maxBytes) break;
+		for (const item of candidates) {
+			if (item.bytes.byteLength !== item.expectedBytes) throw new Error("recipe history chunk length mismatch");
+			if (selected.length > 0 && encodedBytes + item.expectedBytes > maxBytes) break;
 			selected.push(item);
-			encodedBytes += item.bytes;
+			encodedBytes += item.expectedBytes;
 			if (selected.length === 256) break;
 		}
-		const parts = selected.map((item) => {
-			const rows = item.kind === "checkpoint" ? this.storage.sql.exec<{ data: string }>(
-				"SELECT data FROM vault_checkpoints WHERE document_id = ? AND checkpoint_sequence = ? ORDER BY chunk_index",
-				documentId,
-				item.sequence,
-			) : this.storage.sql.exec<{ data: string }>(
-				"SELECT data FROM vault_journal_chunks WHERE sequence = ? ORDER BY chunk_index",
-				item.sequence,
-			);
-			const update = decodeSqlChunks(rows);
-			if (update.byteLength !== item.bytes) throw new Error("recipe history chunk length mismatch");
-			return { kind: item.kind, sequence: item.sequence, update };
-		});
+		const parts = selected.map(({ kind, sequence, fragmentIndex, fragmentCount, bytes }) =>
+			({ kind, sequence, fragmentIndex, fragmentCount, bytes }));
 		const consumed = offset + selected.length;
-		const total = (checkpoint ? 1 : 0) + this.storage.sql.exec<{ count: number }>(
+		const total = checkpointCount + this.storage.sql.exec<{ count: number }>(
 			`SELECT COUNT(*) AS count FROM vault_journal
 			 WHERE document_id = ? AND sequence > ? AND sequence <= ?`,
 			documentId,

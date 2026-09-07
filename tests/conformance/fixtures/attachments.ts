@@ -64,7 +64,7 @@ async function attachmentState(path: string): Promise<{ ref: AttachmentRef | und
 	}
 }
 
-const bytes = new TextEncoder().encode("schema-6 attachment bytes");
+const bytes = new TextEncoder().encode("schema-7 attachment bytes");
 const hash = await sha256Hex(bytes);
 const upload = await fetch(vaultUrl(target.deviceA, `blobs/${hash}`), {
 	method: "PUT", headers: bearer(target.deviceA, { "content-type": "text/plain" }), body: bytes,
@@ -75,7 +75,7 @@ const exists = await vaultJson(target.deviceB, "blobs/exists", {
 });
 assert.deepEqual(exists.body, { present: [hash] });
 const downloaded = await fetch(vaultUrl(target.deviceB, `blobs/${hash}`), { headers: bearer(target.deviceB) });
-assert.equal(await downloaded.text(), "schema-6 attachment bytes");
+assert.equal(await downloaded.text(), "schema-7 attachment bytes");
 pass("attachment bytes are content-addressed and visible to vault peers");
 
 const path = "assets/conformance.txt";

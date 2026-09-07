@@ -18,7 +18,7 @@ export interface BootstrapDescriptor {
 	format: "yaos-bootstrap-v1";
 	bootstrapId: string;
 	schemaVersion: 7;
-	storageFormatVersion: 2;
+	storageFormatVersion: 3;
 	createdAt: string;
 	serverCompleted: boolean;
 	expiresAt: string;
@@ -162,7 +162,7 @@ export class BootstrapService {
 			format: "yaos-bootstrap-v1",
 			bootstrapId: operation.operationId,
 			schemaVersion: SERVER_SCHEMA_VERSION as 7,
-			storageFormatVersion: SERVER_STORAGE_FORMAT_VERSION as 2,
+			storageFormatVersion: SERVER_STORAGE_FORMAT_VERSION as 3,
 			serverCompleted: operation.state === "complete",
 			createdAt: new Date(operation.createdAt).toISOString(),
 			expiresAt: new Date(pin?.softExpiresAt ?? operation.updatedAt).toISOString(),

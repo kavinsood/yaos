@@ -12,6 +12,7 @@ import {
 	type HttpResponse,
 } from "../../src/utils/http";
 import { suite } from "../harness.ts";
+import { encodeBinaryEnvelope } from "../../server/src/shared/binaryEnvelope";
 
 const s = suite("bootstrap-http-boundaries");
 
@@ -37,7 +38,7 @@ s.test("HTTP adapter consumes authenticated root, catalog, and body boundaries d
 			return response({ json: { entries: [], nextCursor: null } });
 		}
 		if (input.url.endsWith("/catch-up")) {
-			return response({ json: { bodies: [{
+			return response({ arrayBuffer: encodeBinaryEnvelope({ bodies: [{
 				bodyId: "body-current",
 				fileId: "body-current",
 				path: "Current.md",
@@ -47,8 +48,8 @@ s.test("HTTP adapter consumes authenticated root, catalog, and body boundaries d
 				contentHash: "a".repeat(64),
 				size: 3,
 				status: 200,
-				update: "AQID",
-			}] } });
+				update: new Uint8Array([1, 2, 3]),
+			}] }).slice().buffer });
 		}
 		return response();
 	};
@@ -87,7 +88,7 @@ s.test("HTTP adapter consumes authenticated root, catalog, and body boundaries d
 		],
 	);
 	assert.ok(requests.every((entry) => entry.headers.Authorization === "Bearer token"));
-	assert.deepEqual(JSON.parse(requests[0]!.body ?? "null"), { attemptId: "attempt" });
+	assert.deepEqual(JSON.parse(typeof requests[0]!.body === "string" ? requests[0]!.body : "null"), { attemptId: "attempt" });
 	assert.equal(documents[0]?.documentId, "root");
 	assert.equal(documents[0]?.generation, 7);
 	assert.equal(documents[0]?.updatedAt, 99);
@@ -122,6 +123,44 @@ s.test("fetch adaptation preserves request bytes and decodes one response body",
 		new Uint8Array(result.arrayBuffer),
 		new TextEncoder().encode('{"accepted":true}'),
 	);
+});
+
+s.test("oversized bootstrap batches split and a single oversized body falls back to raw bytes", async () => {
+	const requests: BootstrapHttpRequest[] = [];
+	const request = async (input: BootstrapHttpRequest): Promise<BootstrapHttpResponse> => {
+		requests.push(input);
+		if (input.method === "POST") return response({ status: 413, json: { error: "bootstrap_response_too_large" } });
+		return response({ headers: { "x-yaos-generation": "11" }, arrayBuffer: new Uint8Array([4, 5, 6]).buffer });
+	};
+	const port = new BootstrapHttpPort("https://sync.test", "vault", "token", {} as never, request);
+	const states = await port.bodies("boot", ["large-a", "large-b"]);
+	assert.equal(states.size, 2);
+	assert.equal(states.get("large-a")?.generation, 11);
+	assert.deepEqual(states.get("large-b")?.encodedState, new Uint8Array([4, 5, 6]));
+	assert.equal(requests.filter((entry) => entry.method === "POST").length, 3);
+	assert.equal(requests.filter((entry) => entry.method === "GET").length, 2);
+});
+
+s.test("a single oversized catch-up body falls back to generation-matched raw state", async () => {
+	const requests: BootstrapHttpRequest[] = [];
+	const request = async (input: BootstrapHttpRequest): Promise<BootstrapHttpResponse> => {
+		requests.push(input);
+		if (input.url.endsWith("/catch-up")) {
+			return response({ status: 413, json: { error: "catch_up_response_too_large" } });
+		}
+		if (input.url.endsWith("/head/large")) {
+			return response({ json: {
+				bodyId: "large", fileId: "large", path: "large.md", generation: 17,
+				contentHash: "a".repeat(64), size: 1_700_000,
+			} });
+		}
+		return response({ headers: { "x-yaos-generation": "17" }, arrayBuffer: new Uint8Array([7, 8, 9]).buffer });
+	};
+	const port = new BootstrapHttpPort("https://sync.test", "vault", "token", {} as never, request);
+	const caught = await port.catchUpBodies([{ bodyId: "large", generation: 16 }]);
+	assert.equal(caught.get("large")?.head.path, "large.md");
+	assert.deepEqual(caught.get("large")?.state?.encodedState, new Uint8Array([7, 8, 9]));
+	assert.deepEqual(requests.map((entry) => entry.method), ["POST", "GET", "GET"]);
 });
 
 s.test("VaultSync HTTP injection sends candidate bytes without copying", async () => {

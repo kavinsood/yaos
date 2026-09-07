@@ -1,5 +1,6 @@
 import type { ExternalEditPolicy, VaultSyncSettings } from "../settings";
 import { parseExcludePatterns } from "../sync/exclude";
+import { MAX_CLIENT_MARKDOWN_BYTES, MAX_CLIENT_MARKDOWN_KB } from "@shared/durableLimits";
 
 export interface RuntimeConfig {
 	host: string;
@@ -26,6 +27,13 @@ export function buildRuntimeConfig(
 	settings: VaultSyncSettings,
 	vaultConfigDir: string,
 ): RuntimeConfig {
+	const configuredMaxFileSizeKB = Number.isSafeInteger(settings.maxFileSizeKB)
+		? Math.max(1, settings.maxFileSizeKB)
+		: MAX_CLIENT_MARKDOWN_KB;
+	const maxFileSizeBytes = Math.min(
+		MAX_CLIENT_MARKDOWN_BYTES,
+		configuredMaxFileSizeKB * 1024,
+	);
 	return {
 		host: settings.host.trim(),
 		deviceToken: settings.deviceToken.trim(),
@@ -34,8 +42,8 @@ export function buildRuntimeConfig(
 		debug: settings.debug,
 		frontmatterGuardEnabled: settings.frontmatterGuardEnabled,
 		excludePatterns: parseExcludePatterns(settings.excludePatterns),
-		maxFileSizeBytes: settings.maxFileSizeKB * 1024,
-		maxFileSizeKB: settings.maxFileSizeKB,
+		maxFileSizeBytes,
+		maxFileSizeKB: Math.ceil(maxFileSizeBytes / 1024),
 		externalEditPolicy: settings.externalEditPolicy,
 		enableAttachmentSync: settings.enableAttachmentSync,
 		attachmentSyncExplicitlyConfigured: settings.attachmentSyncExplicitlyConfigured,

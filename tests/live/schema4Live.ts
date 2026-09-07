@@ -12,6 +12,7 @@ import {
 	fetchSocketTicket,
 	type LiveIdentity,
 } from "./liveIdentity.ts";
+import { decodeBinaryEnvelope, encodeBinaryEnvelope, YAOS_BINARY_CONTENT_TYPE } from "../../server/src/shared/binaryEnvelope.ts";
 
 const WAIT_MS = 10_000;
 
@@ -130,7 +131,9 @@ export async function requestJson(
 	});
 	const headers = deviceBearerHeaders(identity, forwardedHeaders);
 	const response = await fetch(vaultRoute(identity, suffix), { ...init, headers });
-	const parsed: unknown = await response.clone().json().catch(() => null);
+	const parsed: unknown = response.headers.get("content-type")?.toLowerCase().startsWith(YAOS_BINARY_CONTENT_TYPE)
+		? await response.clone().arrayBuffer().then((value) => decodeBinaryEnvelope(new Uint8Array(value))).catch(() => null)
+		: await response.clone().json().catch(() => null);
 	return { response, body: isUnknownRecord(parsed) ? parsed : null };
 }
 
@@ -214,10 +217,10 @@ async function publishRoot(
 	root.destroy();
 	const { response, body } = await requestJson(identity, "lifecycle/publish", {
 		method: "POST",
-		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify({
+		headers: { "Content-Type": YAOS_BINARY_CONTENT_TYPE },
+		body: encodeBinaryEnvelope({
 			operations: [{ ...request, vaultSequence: receipt.vaultSequence }],
-			rootUpdateBase64: Buffer.from(update).toString("base64"),
+			rootUpdate: update,
 		}),
 	});
 	if (response.status !== 200) throw new Error(`root publication failed (${response.status}): ${JSON.stringify(body)}`);

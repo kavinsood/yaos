@@ -157,7 +157,7 @@ async function claimEnrollAndProvision(): Promise<LiveIdentityContext> {
 		headers: { Authorization: `Bearer ${deviceA.deviceToken}` },
 	});
 	const status = await statusResponse.json().catch(() => null) as Record<string, unknown> | null;
-	if (!statusResponse.ok || status?.vaultId !== claim.vaultId || status.schemaVersion !== 7 || status.protocolVersion !== 3
+	if (!statusResponse.ok || status?.vaultId !== claim.vaultId || status.schemaVersion !== 7 || status.protocolVersion !== 4
 		|| typeof status.vaultGeneration !== "string" || typeof status.runtimeEpoch !== "string") {
 		throw new Error(`claimed vault was not active and provisioned: ${JSON.stringify(status)}`);
 	}

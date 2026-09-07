@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import * as Y from "yjs";
 import YSyncProvider from "y-partyserver/provider";
 import WebSocket from "ws";
+import { decodeBinaryEnvelope, encodeBinaryEnvelope, YAOS_BINARY_CONTENT_TYPE } from "../../server/src/shared/binaryEnvelope.ts";
 
 const browserWindow = globalThis.window;
 for (const method of ["addEventListener", "removeEventListener"] as const) {
@@ -11,7 +12,7 @@ for (const method of ["addEventListener", "removeEventListener"] as const) {
 }
 
 const SCHEMA_VERSION = 7;
-const PROTOCOL_VERSION = 3;
+const PROTOCOL_VERSION = 4;
 const NETWORK_WAIT_MS = 15_000;
 function fetchBounded(input: string | URL | Request, init: RequestInit = {}): Promise<Response> {
 	return globalThis.fetch(input, {
@@ -95,7 +96,9 @@ function integerField(value: unknown, label: string): number {
 }
 
 async function json(response: Response, label: string): Promise<Record<string, unknown>> {
-	const body: unknown = await response.json().catch(() => null);
+	const body: unknown = response.headers.get("content-type")?.toLowerCase().startsWith(YAOS_BINARY_CONTENT_TYPE)
+		? await response.arrayBuffer().then((value) => decodeBinaryEnvelope(new Uint8Array(value))).catch(() => null)
+		: await response.json().catch(() => null);
 	if (!response.ok) throw new Error(`${label} failed (${response.status}): ${JSON.stringify(body)}`);
 	return record(body, `${label} response`);
 }
@@ -133,7 +136,7 @@ export async function claimServer(host: string): Promise<ClaimedServer> {
 		operatorCookie,
 	};
 	const capabilities = await fetchBounded(`${host}/api/capabilities`).then((result) => json(result, "capabilities"));
-	if (capabilities.claimed !== true || capabilities.schemaVersion !== 7 || capabilities.protocolVersion !== 3) {
+	if (capabilities.claimed !== true || capabilities.schemaVersion !== 7 || capabilities.protocolVersion !== 4) {
 		throw new Error(`claimed Worker has the wrong public contract: ${JSON.stringify(capabilities)}`);
 	}
 	return claimed;
@@ -300,10 +303,10 @@ async function publishRoot(identity: Identity, request: LifecycleRequest, receip
 	root.destroy();
 	const publication = await json(await fetchBounded(route(identity, "lifecycle/publish"), {
 		method: "POST",
-		headers: headers(identity, { "Content-Type": "application/json" }),
-		body: JSON.stringify({
+		headers: headers(identity, { "Content-Type": YAOS_BINARY_CONTENT_TYPE }),
+		body: encodeBinaryEnvelope({
 			operations: [{ ...request, vaultSequence: receipt.vaultSequence }],
-			rootUpdateBase64: Buffer.from(update).toString("base64"),
+			rootUpdate: update,
 		}),
 	}), "root publication");
 	if (publication.vaultGeneration !== identity.vaultGeneration

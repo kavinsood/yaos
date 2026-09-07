@@ -2,6 +2,7 @@ import { strict as assert } from "node:assert";
 import * as Y from "yjs";
 import { bearer, createBody, pass, vaultJson, vaultUrl } from "../client.ts";
 import { SCHEMA_VERSION, STORAGE_FORMAT_VERSION, targetFromEnv } from "../target.ts";
+import { decodeBinaryEnvelope, YAOS_BINARY_CONTENT_TYPE } from "../../../server/src/shared/binaryEnvelope.ts";
 
 const target = targetFromEnv();
 const before = await createBody(target.deviceA, "before.md", "fixed-boundary-before");
@@ -35,25 +36,31 @@ assert.equal(root.getMap<string>("pathToId").has("after.md"), false);
 root.destroy();
 pass("bootstrap root is pinned to the same boundary as the catalog");
 
-const bodies = await vaultJson(target.deviceA, `bootstrap/${bootstrapId}/bodies`, {
-	method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ bodyIds: [before.bodyId] }),
+const bodiesResponse = await fetch(vaultUrl(target.deviceA, `bootstrap/${bootstrapId}/bodies`), {
+	method: "POST", headers: bearer(target.deviceA, { "content-type": "application/json" }), body: JSON.stringify({ bodyIds: [before.bodyId] }),
 });
-assert.equal(bodies.response.status, 200);
-assert.equal((bodies.body?.bodies as Array<{ bodyId?: unknown }>)[0]?.bodyId, before.bodyId);
+assert.equal(bodiesResponse.status, 200);
+assert.ok(bodiesResponse.headers.get("content-type")?.startsWith(YAOS_BINARY_CONTENT_TYPE));
+const bodies = decodeBinaryEnvelope(new Uint8Array(await bodiesResponse.arrayBuffer())) as { bodies: Array<{ bodyId?: unknown }> };
+assert.equal(bodies.bodies[0]?.bodyId, before.bodyId);
 const complete = await vaultJson(target.deviceA, `bootstrap/${bootstrapId}/complete`, { method: "POST" });
 assert.equal(complete.response.status, 200);
 assert.ok(typeof complete.body?.currentHighWater === "number" && complete.body.currentHighWater > descriptorCatalog.highWater);
 
-const catchUp = await vaultJson(target.deviceA, "catch-up", {
-	method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ bodies: [{ bodyId: after.bodyId }] }),
+const catchUpResponse = await fetch(vaultUrl(target.deviceA, "catch-up"), {
+	method: "POST", headers: bearer(target.deviceA, { "content-type": "application/json" }), body: JSON.stringify({ bodies: [{ bodyId: after.bodyId }] }),
 });
-assert.equal(catchUp.response.status, 200);
-const caught = (catchUp.body?.bodies as Array<{ bodyId?: unknown; status?: unknown; update?: unknown }>)[0];
+assert.equal(catchUpResponse.status, 200);
+assert.ok(catchUpResponse.headers.get("content-type")?.startsWith(YAOS_BINARY_CONTENT_TYPE));
+const catchUp = decodeBinaryEnvelope(new Uint8Array(await catchUpResponse.arrayBuffer())) as {
+	bodies: Array<{ bodyId?: unknown; status?: unknown; update?: unknown }>;
+};
+const caught = catchUp.bodies[0];
 assert.equal(caught?.bodyId, after.bodyId);
 assert.equal(caught?.status, 200);
-assert.equal(typeof caught?.update, "string");
+assert.ok(caught?.update instanceof Uint8Array);
 const caughtDoc = new Y.Doc();
-Y.applyUpdate(caughtDoc, Buffer.from(caught.update as string, "base64url"));
+Y.applyUpdate(caughtDoc, caught.update as Uint8Array);
 assert.equal(caughtDoc.getText("body").toString(), "feed-catch-up-after");
 caughtDoc.destroy();
 pass("feed catch-up supplies writes after the bootstrap boundary");

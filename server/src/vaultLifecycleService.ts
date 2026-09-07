@@ -1,5 +1,4 @@
 import * as Y from "yjs";
-import { base64ToBytes, bytesToBase64Url } from "./base64url";
 import { MAX_BLOB_UPLOAD_BYTES, MAX_CATCH_UP_BODIES, MAX_JSON_BYTES, type LifecycleRequest, type LifecycleReceipt, type RootPublicationReceipt } from "./contracts";
 import { canonicalJsonText } from "./recoveryCanonicalJson";
 import { readBoundedBytes } from "./readBoundedBytes";
@@ -16,6 +15,7 @@ import type {
 import type { VaultDocumentCache } from "./vaultDocumentCache";
 import type { VaultSocketService } from "./vaultSocketService";
 import type { VaultActorContext } from "./collaboration";
+import { decodeBinaryEnvelope, encodeBinaryEnvelope, YAOS_BINARY_CONTENT_TYPE } from "./shared/binaryEnvelope";
 
 const MAX_IDENTITY_LENGTH = 256;
 
@@ -211,12 +211,12 @@ export class VaultLifecycleService {
 
 	async publish(request: Request, actor: VaultActorContext): Promise<Response> {
 		let decoded: unknown;
-		try { decoded = await boundedJson(request); }
-		catch { return json({ error: "invalid_json" }, 400); }
+		try { decoded = decodeBinaryEnvelope(await readBoundedBytes(request, MAX_JSON_BYTES), MAX_JSON_BYTES); }
+		catch { return json({ error: "invalid_binary_envelope" }, 400); }
 		if (typeof decoded !== "object" || decoded === null || Array.isArray(decoded)
 			|| !("operations" in decoded) || !Array.isArray(decoded.operations) || decoded.operations.length === 0
 			|| decoded.operations.length > MAX_CATCH_UP_BODIES
-			|| !("rootUpdateBase64" in decoded) || typeof decoded.rootUpdateBase64 !== "string") {
+			|| !("rootUpdate" in decoded) || !(decoded.rootUpdate instanceof Uint8Array)) {
 			return json({ error: "invalid_lifecycle_publication" }, 400);
 		}
 		const candidates: unknown[] = decoded.operations;
@@ -245,9 +245,7 @@ export class VaultLifecycleService {
 				vaultGeneration: first.vaultGeneration, runtimeEpoch: first.runtimeEpoch } satisfies RootPublicationReceipt);
 		}
 		if (prior.some((value) => value !== null)) return json({ error: "lifecycle_publication_partial_retry" }, 409);
-		let rootUpdate: Uint8Array;
-		try { rootUpdate = base64ToBytes(decoded.rootUpdateBase64); }
-		catch { return json({ error: "invalid_root_update" }, 400); }
+		const rootUpdate = decoded.rootUpdate;
 		if (rootUpdate.byteLength === 0 || rootUpdate.byteLength > MAX_JSON_BYTES) return json({ error: "invalid_root_update_size" }, 400);
 		if (!await this.options.flush("root")) return json({ error: "root_persistence_unavailable" }, 503);
 		this.options.cache.load("root", false, () => true);
@@ -598,7 +596,7 @@ export class VaultLifecycleService {
 		vaultSequence: number,
 		rootGeneration: number,
 	): Response {
-		return json({
+		const body = encodeBinaryEnvelope({
 			operationId,
 			outcome: "committed",
 			revisions: events.map((event) => ({
@@ -610,8 +608,9 @@ export class VaultLifecycleService {
 			runtimeEpoch: this.options.runtimeEpoch,
 			vaultSequence,
 			rootGeneration,
-			rootUpdateBase64Url: bytesToBase64Url(update),
-		});
+			rootUpdate: update,
+		}, MAX_JSON_BYTES);
+		return new Response(body.slice().buffer, { headers: { "content-type": YAOS_BINARY_CONTENT_TYPE, "cache-control": "no-store" } });
 	}
 
 	private parseAttachmentMutation(decoded: unknown): AttachmentMutation | null {

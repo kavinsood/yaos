@@ -100,11 +100,11 @@ export function isServerCapabilities(value: unknown): value is ServerCapabilitie
 		typeof candidate.serverVersion === "string" &&
 		(candidate.schemaVersion === null || typeof candidate.schemaVersion === "number") &&
 		Number.isSafeInteger(candidate.storageFormatVersion) &&
-		candidate.storageFormatVersion === 2 &&
+		candidate.storageFormatVersion === STORAGE_FORMAT_VERSION &&
 		Number.isSafeInteger(candidate.protocolVersion) &&
 		candidate.protocolVersion === PROTOCOL_VERSION &&
 		Number.isSafeInteger(candidate.snapshotFormatVersion) &&
-		candidate.snapshotFormatVersion === 2 &&
+		candidate.snapshotFormatVersion === SNAPSHOT_FORMAT_VERSION &&
 		typeof candidate.recoveryJobs === "boolean" &&
 		(candidate.updateProvider === null ||
 			candidate.updateProvider === "github" ||
