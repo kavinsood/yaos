@@ -10,6 +10,9 @@ Current `main` has durable engineering documents for the schema-6 product and th
 - [Backlog](BACKLOG.md) — only evidenced unresolved product risks and concrete external validation gaps.
 - [Runtime lifecycle and socket admission](runtime-lifecycle-and-admission.md) — publication epochs, bounded drain, and refresh-first socket ownership.
 - [Application-level socket liveness](socket-liveness.md) — protocol-2 heartbeat evidence, background suspension, and force-abort recovery.
+- [Multiplexed body transport evaluation](multiplexed-body-transport-evaluation.md) — deployed Cloudflare measurements, formal protocol-2 rejection, and evidence thresholds for reconsideration.
+- [Currentness plane and editor admission investigation](currentness-plane-investigation.md) — measured admission and catch-up amplification, exact socket watermarks, batched head queries, lifetime prerequisites, and staged implementation plan.
+- [Currentness plane implementation report](currentness-plane-implementation-report.md) — six-phase delivery, public Cloudflare profiling, flush compaction, contention remediation, and final outcome.
 - [Body coordination and safe apply](body-coordination-and-safe-apply.md) — effect-specific proofs, catalog identity, editor/disk leases, and stale-safe text commit.
 - [Common bases and three-way merge](common-base-and-three-way-merge.md) — CAS ancestry, bootstrap backfill, bounded diff3, preservation, and revision-fenced review.
 - [RFC 01–07 implementation report](relay-rfcs-01-07-implementation-report.md) — delivered work, observations, pitfalls, validation, and next recommendations.
