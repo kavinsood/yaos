@@ -10,6 +10,7 @@ import {
 import { MemoryLocalVaultImportStateStore } from "../../src/onboarding/localVaultImportStore";
 import { fetchVaultProvisioningProof, readVaultProvisioningProof } from "../../src/onboarding/provisioningClient";
 import { suite } from "../harness.ts";
+import { MAX_CLIENT_MARKDOWN_BYTES } from "../../server/src/shared/durableLimits";
 
 const s = suite("onboarding-import");
 
@@ -194,7 +195,7 @@ s.test("an edit during upload is retried with the latest content and a fresh can
 	assert.notEqual(sink.commits[0]?.candidateId, sink.commits[1]?.candidateId);
 });
 s.test("configured Markdown byte boundary accepts exact limit and rejects one byte over without sink writes", async () => {
-	const limit = 1_500_000;
+	const limit = MAX_CLIENT_MARKDOWN_BYTES;
 	const source = new FakeSource();
 	source.set("near.md", "a".repeat(1_490_000), 1);
 	source.set("exact.md", "b".repeat(limit), 1);
@@ -220,6 +221,17 @@ s.test("configured Markdown byte boundary accepts exact limit and rejects one by
 		["exact.md", "near.md", "unicode-exact.md"],
 		"rejected bodies never reach candidate or catalog creation",
 	);
+});
+
+s.test("initial import never permits a configured limit above the shared hard ceiling", async () => {
+	const source = new FakeSource();
+	source.set("over-contract.md", "x".repeat(MAX_CLIENT_MARKDOWN_BYTES + 1), 1);
+	const sink = new FakeSink();
+	const state = await importer(source, sink, undefined, {
+		maxFileSizeBytes: Number.MAX_SAFE_INTEGER,
+	}).run();
+	assert.equal(state.items[0]?.status, "oversized");
+	assert.equal(sink.commits.length, 0);
 });
 
 s.test("large captured inventory is paged with bounded concurrency and excludes later arrivals", async () => {
@@ -264,16 +276,16 @@ s.test("provisioning proof parser rejects incomplete or wrong-format responses",
 		vaultGeneration: "generation",
 		provisionedAt: 1,
 		schemaVersion: 7,
-		storageFormatVersion: 2,
-		protocolVersion: 3,
+		storageFormatVersion: 3,
+		protocolVersion: 4,
 		runtimeEpoch: "epoch",
 	}), {
 		vaultId: "vault",
 		vaultGeneration: "generation",
 		provisionedAt: 1,
 		schemaVersion: 7,
-		storageFormatVersion: 2,
-		protocolVersion: 3,
+		storageFormatVersion: 3,
+		protocolVersion: 4,
 		runtimeEpoch: "epoch",
 	});
 	assert.throws(() => readVaultProvisioningProof({
@@ -281,8 +293,8 @@ s.test("provisioning proof parser rejects incomplete or wrong-format responses",
 		vaultGeneration: "generation",
 		provisionedAt: 1,
 		schemaVersion: 3,
-		storageFormatVersion: 2,
-		protocolVersion: 3,
+		storageFormatVersion: 3,
+		protocolVersion: 4,
 		runtimeEpoch: "epoch",
 	}));
 });
@@ -308,8 +320,8 @@ s.test("devices read provisioned status and never call a public provision route"
 				vaultGeneration: "generation",
 				provisionedAt: 1,
 				schemaVersion: 7,
-				storageFormatVersion: 2,
-				protocolVersion: 3,
+				storageFormatVersion: 3,
+				protocolVersion: 4,
 				runtimeEpoch: "epoch",
 			},
 			text: "",

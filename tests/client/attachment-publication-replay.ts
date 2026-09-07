@@ -80,19 +80,6 @@ function memoryDatabase(state: MemoryState): VaultDatabasePort {
 	};
 }
 
-function bytesToBase64Url(bytes: Uint8Array): string {
-	let binary = "";
-	for (const byte of bytes) binary += String.fromCharCode(byte);
-	return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-
-function base64UrlToBytes(value: string): Uint8Array {
-	const base64 = value.replace(/-/g, "+").replace(/_/g, "/")
-		.padEnd(Math.ceil(value.length / 4) * 4, "=");
-	const binary = atob(base64);
-	return Uint8Array.from(binary, (character) => character.charCodeAt(0));
-}
-
 class AttachmentServer {
 	readonly calls: AttachmentPublicationMutation[] = [];
 	readonly readinessDuringPublish: boolean[] = [];
@@ -107,7 +94,7 @@ class AttachmentServer {
 
 	constructor() {
 		this.root.getMap("sys").set("schemaVersion", 7);
-		this.root.getMap("sys").set("protocolVersion", 3);
+		this.root.getMap("sys").set("protocolVersion", 4);
 	}
 
 	loseNextResponse(): void {
@@ -240,7 +227,7 @@ class AttachmentServer {
 			runtimeEpoch: "runtime-1",
 			vaultSequence: this.vaultSequence,
 			rootGeneration: this.rootGeneration,
-			rootUpdateBase64Url: bytesToBase64Url(Y.encodeStateAsUpdate(this.root)),
+			rootUpdate: Y.encodeStateAsUpdate(this.root),
 		};
 		this.receipts.set(mutation.operationId, receipt);
 		if (this.loseResponse) {
@@ -267,7 +254,7 @@ async function startRuntime(
 	if (!state.documents.has("root")) {
 		const root = new Y.Doc({ guid: "root" });
 		root.getMap("sys").set("schemaVersion", 7);
-		root.getMap("sys").set("protocolVersion", 3);
+		root.getMap("sys").set("protocolVersion", 4);
 		state.documents.set("root", {
 			documentId: "root",
 			generation: 1,
@@ -619,13 +606,13 @@ s.test("receipt generation and exact resulting object identity fail closed befor
 	const identityFixture = await startRuntime(identityState, identityServer);
 	identityServer.transformNextReceipt((receipt) => {
 		const doc = new Y.Doc();
-		Y.applyUpdate(doc, base64UrlToBytes(receipt.rootUpdateBase64Url));
+		Y.applyUpdate(doc, receipt.rootUpdate);
 		const wrongHash = "9".repeat(64);
 		doc.getMap<{ hash: string; size: number; revision: string }>("pathToBlob")
 			.set("attachments/result.bin", { hash: wrongHash, size: 15, revision: receipt.operationId });
 		doc.getMap<{ size: number; mime: string; createdAt: number }>("blobMeta")
 			.set(wrongHash, { size: 15, mime: "application/octet-stream", createdAt: 1 });
-		return { ...receipt, rootUpdateBase64Url: bytesToBase64Url(Y.encodeStateAsUpdate(doc)) };
+		return { ...receipt, rootUpdate: Y.encodeStateAsUpdate(doc) };
 	});
 	await assert.rejects(
 		identityFixture.runtime.setAttachmentRef(

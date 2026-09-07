@@ -4,10 +4,10 @@ import { safeMarkdownPath } from "../sync/pathPolicy";
 import { isExcluded } from "../sync/exclude";
 import { sha256TextHex } from "../utils/sha256";
 import {
-	canonicalMarkdownBytes,
-	canonicalMarkdownHash,
-	canonicalizeMarkdown,
+	canonicalMarkdownBytesHash,
+	prepareCanonicalMarkdown,
 } from "@shared/markdownCodec";
+import { MAX_CLIENT_MARKDOWN_BYTES } from "@shared/durableLimits";
 
 export const LOCAL_VAULT_IMPORT_FORMAT = 1 as const;
 
@@ -135,6 +135,7 @@ interface PreparedLocalImport {
 	content: string;
 	revision: LocalFileRevision;
 	contentHash: string;
+	canonicalBytes: Uint8Array;
 }
 
 /**
@@ -418,7 +419,8 @@ export class LocalVaultImporter {
 				item.lastError = "file-removed-during-import";
 				return null;
 			}
-			const content = canonicalizeMarkdown(await this.source.read(item.path));
+			const preparedMarkdown = prepareCanonicalMarkdown(await this.source.read(item.path));
+			const content = preparedMarkdown.content;
 			const afterRead = await this.source.stat(item.path);
 			if (!afterRead) {
 				item.status = "missing";
@@ -431,22 +433,27 @@ export class LocalVaultImporter {
 				return null;
 			}
 
-			const bytes = canonicalMarkdownBytes(content).byteLength;
+			const canonicalBytes = preparedMarkdown.bytes;
+			const bytes = canonicalBytes.byteLength;
 			const frontmatterReasons = validateBoundedImportFrontmatter(content);
 			if (frontmatterReasons.length > 0) {
 				item.status = "invalid-frontmatter";
 				item.lastError = frontmatterReasons.join(",");
 				return null;
 			}
-			if (this.options.maxFileSizeBytes > 0 && bytes > this.options.maxFileSizeBytes) {
+			const configuredLimit = this.options.maxFileSizeBytes > 0
+				? this.options.maxFileSizeBytes
+				: MAX_CLIENT_MARKDOWN_BYTES;
+			const effectiveLimit = Math.min(MAX_CLIENT_MARKDOWN_BYTES, configuredLimit);
+			if (bytes > effectiveLimit) {
 				item.status = "oversized";
-				item.lastError = `file-size-${bytes}-exceeds-${this.options.maxFileSizeBytes}`;
+				item.lastError = `file-size-${bytes}-exceeds-${effectiveLimit}`;
 				return null;
 			}
-			const contentHash = await canonicalMarkdownHash(content);
+			const contentHash = await canonicalMarkdownBytesHash(canonicalBytes);
 			item.lastContentHash = contentHash;
 			item.candidateId = await candidateIdFor(item.bodyId, contentHash);
-			return { item, content, revision: afterRead, contentHash };
+			return { item, content, revision: afterRead, contentHash, canonicalBytes };
 		} catch (error) {
 			item.status = "failed";
 			item.lastError = errorMessage(error);
@@ -463,7 +470,7 @@ export class LocalVaultImporter {
 		let current: PreparedLocalImport[] = [];
 		let bytes = 0;
 		for (const item of prepared) {
-			const itemBytes = new TextEncoder().encode(item.content).byteLength;
+			const itemBytes = item.canonicalBytes.byteLength;
 			if (current.length > 0 && (current.length >= 32 || bytes + itemBytes > 4 * 1024 * 1024)) {
 				batches.push(current);
 				current = [];

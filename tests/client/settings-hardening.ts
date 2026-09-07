@@ -2,9 +2,15 @@ import { isServerCapabilities } from "../../src/runtime/capabilityUpdateService"
 import { capabilitiesForRole } from "../../src/collaboration/authority";
 import {
 	attachmentSizeCapKB,
+	DEFAULT_SETTINGS,
 	MAX_ATTACHMENT_SIZE_KB,
 	readVaultSyncSettings,
 } from "../../src/settings/settingsStore";
+import {
+	MAX_CLIENT_MARKDOWN_BYTES,
+	MAX_CLIENT_MARKDOWN_KB,
+} from "../../server/src/shared/durableLimits";
+import { buildRuntimeConfig } from "../../src/runtime/runtimeConfig";
 import { suite } from "../harness.ts";
 
 const s = suite("settings-hardening");
@@ -52,6 +58,33 @@ s.section("Test 4: server capability can lower the effective attachment cap");
 		attachmentSizeCapKB(null) === MAX_ATTACHMENT_SIZE_KB,
 		"missing server capability falls back to built-in ceiling",
 	);
+}
+
+s.section("Markdown settings cannot exceed the end-to-end storage and recovery contract");
+{
+	s.check(
+		DEFAULT_SETTINGS.maxFileSizeKB === MAX_CLIENT_MARKDOWN_KB,
+		"the default text limit comes from the shared durable limit",
+	);
+	for (const [persisted, expected, label] of [
+		[MAX_CLIENT_MARKDOWN_KB, MAX_CLIENT_MARKDOWN_KB, "exact cap"],
+		[MAX_CLIENT_MARKDOWN_KB + 1, MAX_CLIENT_MARKDOWN_KB, "oversized"],
+		[10.75, 10, "fractional"],
+		[-4, 1, "negative"],
+	] as const) {
+		const result = readVaultSyncSettings({ ...DEFAULT_SETTINGS, maxFileSizeKB: persisted });
+		s.check(result.settings.maxFileSizeKB === expected, `${label} Markdown setting is normalized`);
+		s.check(result.migrated === (persisted !== expected), `${label} normalization is marked for persistence`);
+	}
+	const malformed = readVaultSyncSettings({ ...DEFAULT_SETTINGS, maxFileSizeKB: "enormous" } as never);
+	s.check(malformed.settings.maxFileSizeKB === MAX_CLIENT_MARKDOWN_KB, "non-numeric Markdown setting resets to the default");
+	s.check(malformed.migrated, "non-numeric Markdown setting is marked for persistence");
+
+	const runtime = buildRuntimeConfig(
+		{ ...DEFAULT_SETTINGS, maxFileSizeKB: Number.MAX_SAFE_INTEGER },
+		".obsidian",
+	);
+	s.check(runtime.maxFileSizeBytes === MAX_CLIENT_MARKDOWN_BYTES, "runtime defensively enforces the exact byte ceiling");
 }
 
 s.section("Unsupported shared-token state is erased without inventing enrollment");
@@ -124,8 +157,8 @@ s.section("Settings capability is optional for note sync");
 		snapshots: false,
 		serverVersion: "1.0.0",
 		schemaVersion: 7,
-		storageFormatVersion: 2,
-		protocolVersion: 3,
+		storageFormatVersion: 3,
+		protocolVersion: 4,
 		snapshotFormatVersion: 2,
 		recoveryJobs: false,
 		updateProvider: null,
@@ -133,7 +166,7 @@ s.section("Settings capability is optional for note sync");
 	};
 	s.check(isServerCapabilities(notesOnly), "missing settings capability does not invalidate note capabilities");
 	s.check(
-		isServerCapabilities({ ...notesOnly, settingsSync: true, settingsFormatVersion: 2 }),
+		isServerCapabilities({ ...notesOnly, settingsSync: true, settingsFormatVersion: 3 }),
 		"unknown settings format remains a valid note capability envelope",
 	);
 }

@@ -1,8 +1,10 @@
 import { runSingleFlight } from "../../server/src/asyncConcurrency";
-import { MAX_BLOB_UPLOAD_BYTES } from "../../server/src/contracts";
+import { MAX_BLOB_UPLOAD_BYTES, MAX_DURABLE_UPDATE_BYTES } from "../../server/src/contracts";
 import { getCapabilities } from "../../server/src/routes/auth";
+import { partitionDurableUpdateBatches } from "../../server/src/server";
 import { FakeObjectStore, makeEnv } from "../mocks/workerEnv.ts";
 import { suite } from "../harness.ts";
+import * as Y from "yjs";
 
 const s = suite("server-hardening");
 
@@ -100,7 +102,7 @@ s.section("Test 9: capabilities expose one final identity-neutral shape");
 	} as const;
 	const caps = getCapabilities(auth, env);
 	s.check(caps.settingsSync === true, "capabilities advertise the settings SQL sidecar");
-	s.check(caps.settingsFormatVersion === 1, "capabilities pin settings format version 1");
+	s.check(caps.settingsFormatVersion === 2, "capabilities pin settings format version 2");
 	s.check(
 		JSON.stringify(Object.keys(caps).sort()) === JSON.stringify([
 			"attachments",
@@ -122,6 +124,29 @@ s.section("Test 9: capabilities expose one final identity-neutral shape");
 		"capabilities expose the exact current contract",
 	);
 	s.check(caps.claimed === true, "capabilities preserve claimed state");
+}
+
+s.section("Debounced persistence never merges a batch beyond one durable row");
+{
+	const document = new Y.Doc();
+	const text = document.getText("body");
+	const updates: Array<{ bytes: Uint8Array }> = [];
+	for (const character of ["a", "b"]) {
+		const before = Y.encodeStateVector(document);
+		text.insert(text.length, character.repeat(900_000));
+		updates.push({ bytes: Y.encodeStateAsUpdate(document, before) });
+	}
+	const unbounded = Y.mergeUpdates(updates.map((entry) => entry.bytes));
+	s.check(updates.every((entry) => entry.bytes.byteLength < MAX_DURABLE_UPDATE_BYTES),
+		"fixture updates are individually durable");
+	s.check(unbounded.byteLength > MAX_DURABLE_UPDATE_BYTES,
+		"fixture reproduces the oversized merged-update failure");
+	const batches = partitionDurableUpdateBatches(updates);
+	s.check(batches.length === 2 && batches.flat().length === updates.length,
+		"oversized pending work is split without loss");
+	s.check(batches.every((batch) => Y.mergeUpdates(batch.map((entry) => entry.bytes)).byteLength <= MAX_DURABLE_UPDATE_BYTES),
+		"every persistence batch fits one SQLite-safe row");
+	document.destroy();
 }
 
 await s.done();

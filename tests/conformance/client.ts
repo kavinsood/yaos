@@ -9,6 +9,7 @@ import {
 	type ConformanceTarget,
 	type DeviceIdentity,
 } from "./target.ts";
+import { decodeBinaryEnvelope, encodeBinaryEnvelope, YAOS_BINARY_CONTENT_TYPE } from "../../server/src/shared/binaryEnvelope.ts";
 
 const WAIT_MS = 20_000;
 // @ts-expect-error -- DOM and Workers ambient WebSocket declarations disagree on Cloudflare-only attachment methods; ws supplies the provider's runtime constructor.
@@ -78,7 +79,9 @@ export function vaultUrl(identity: DeviceIdentity, suffix: string): string {
 
 export async function jsonRequest(url: string, init: RequestInit = {}): Promise<JsonResult> {
 	const response = await fetch(url, init);
-	const parsed: unknown = await response.clone().json().catch(() => null);
+	const parsed: unknown = response.headers.get("content-type")?.toLowerCase().startsWith(YAOS_BINARY_CONTENT_TYPE)
+		? await response.clone().arrayBuffer().then((body) => decodeBinaryEnvelope(new Uint8Array(body))).catch(() => null)
+		: await response.clone().json().catch(() => null);
 	return {
 		response,
 		body: parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null,
@@ -257,8 +260,8 @@ export async function publishLifecycle(identity: DeviceIdentity, request: Lifecy
 	const update = Y.encodeStateAsUpdate(root, before);
 	root.destroy();
 	return vaultJson(identity, "lifecycle/publish", {
-		method: "POST", headers: { "content-type": "application/json" },
-		body: JSON.stringify({ operations: [{ ...request, vaultSequence: receipt.vaultSequence }], rootUpdateBase64: Buffer.from(update).toString("base64") }),
+		method: "POST", headers: { "content-type": YAOS_BINARY_CONTENT_TYPE },
+		body: encodeBinaryEnvelope({ operations: [{ ...request, vaultSequence: receipt.vaultSequence }], rootUpdate: update }),
 	});
 }
 

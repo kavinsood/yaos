@@ -34,6 +34,7 @@ import {
 import nodePath from "node:path";
 import { TFile, TFolder, type TAbstractFile } from "obsidian";
 import { canonicalizeMarkdown } from "@shared/markdownCodec";
+import { MAX_CLIENT_MARKDOWN_BYTES } from "@shared/durableLimits";
 /**
  * Stat shape this host tracks. Declared locally: the daemon no longer depends
  * on the client `VaultFs` port, which is unfinished and stays out of this
@@ -63,11 +64,13 @@ import {
  * A Markdown file bigger than this is not a note, it is an accident. The daemon
  * refuses to index it at all rather than reading it into memory to find out.
  *
- * This is a MECHANISM guard and not the user's size limit: the configured
- * `maxFileSizeBytes` is applied by `ReconciliationController` to canonical UTF-8 bytes
- * after a successful read, and stays there.
+ * This early raw-byte guard is derived from the protocol's absolute canonical
+ * Markdown ceiling. CRLF can make a valid on-disk file twice as large as its
+ * canonical LF form, and a leading UTF-8 BOM contributes three more bytes.
+ * Reconciliation applies the exact configured (possibly lower) canonical-byte
+ * limit after reading.
  */
-export const MAX_MARKDOWN_FILE_BYTES = 64 * 1024 * 1024;
+export const MAX_MARKDOWN_FILE_BYTES = MAX_CLIENT_MARKDOWN_BYTES * 2 + 3;
 
 /** What the index knows about one path. */
 interface IndexEntry {

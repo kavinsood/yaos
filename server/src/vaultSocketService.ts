@@ -20,6 +20,9 @@ import {
 	type BodyCurrentnessHead,
 } from "./shared/socketLiveness";
 import { validateFrontmatterSemanticRoots } from "./shared/frontmatterSemanticValidation";
+import { canonicalMarkdownBytes } from "./shared/markdownCodec";
+import { MAX_CLIENT_MARKDOWN_BYTES } from "./shared/durableLimits";
+import { AUTHORITY_SUPERSEDED_SOCKET_CLOSE_CODE } from "./shared/socketCloseCodes";
 import type { VaultActorContext } from "./collaboration";
 
 const MESSAGE_SYNC = 0;
@@ -184,18 +187,23 @@ export function rootUpdateChangesDocument(current: Y.Doc, update: Uint8Array): b
 	}
 }
 
-export function bodyUpdateFrontmatterSemanticError(current: Y.Doc, update: Uint8Array): string | null {
+export function bodyUpdateAdmissionError(current: Y.Doc, update: Uint8Array): string | null {
 	const candidate = new Y.Doc({ guid: "body-frontmatter-semantic-validation" });
 	try {
 		Y.applyUpdate(candidate, Y.encodeStateAsUpdate(current));
 		Y.applyUpdate(candidate, update, "body-frontmatter-semantic-validation");
-		return validateFrontmatterSemanticRoots(candidate);
+		const semanticError = validateFrontmatterSemanticRoots(candidate);
+		if (semanticError) return semanticError;
+		return canonicalMarkdownBytes(Y.Text.prototype.toString.call(candidate.getText("body"))).byteLength
+			> MAX_CLIENT_MARKDOWN_BYTES ? "markdown_size_limit" : null;
 	} catch {
 		return "frontmatter_semantic_root_invalid";
 	} finally {
 		candidate.destroy();
 	}
 }
+
+export const bodyUpdateFrontmatterSemanticError = bodyUpdateAdmissionError;
 
 export interface SocketServiceOptions {
 	sockets: VaultSocketRegistryPort;
@@ -410,7 +418,7 @@ export class VaultSocketService {
 			if (attachment?.deviceId !== deviceId) continue;
 			this.sendControl(socket, { type: "error", code: "authority_superseded", reason: "device authority changed" });
 			try {
-				socket.close(1008, "device authority changed");
+				socket.close(AUTHORITY_SUPERSEDED_SOCKET_CLOSE_CODE, "device authority changed");
 			} catch {
 				// The durable revocation fence rejects any later frame.
 			}
@@ -424,7 +432,7 @@ export class VaultSocketService {
 			const attachment = parseVaultSocketAttachment(socket.deserializeAttachment());
 			if (attachment?.principalId !== principalId) continue;
 			this.sendControl(socket, { type: "error", code: "authority_superseded", reason: "membership revoked" });
-			try { socket.close(1008, "membership revoked"); } catch { /* fenced durably */ }
+			try { socket.close(AUTHORITY_SUPERSEDED_SOCKET_CLOSE_CODE, "membership revoked"); } catch { /* fenced durably */ }
 			closed++;
 		}
 		return closed;
@@ -495,7 +503,7 @@ export class VaultSocketService {
 			}
 			return;
 		}
-		const semanticError = bodyUpdateFrontmatterSemanticError(loaded.doc, update);
+		const semanticError = bodyUpdateAdmissionError(loaded.doc, update);
 		if (semanticError) {
 			this.sendControl(socket, { type: "VAULT_ERROR", code: semanticError, message: "invalid semantic frontmatter" });
 			socket.close(1008, "invalid semantic frontmatter");

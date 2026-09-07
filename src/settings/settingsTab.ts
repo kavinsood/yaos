@@ -15,6 +15,7 @@ import {
 	type ExternalEditPolicy,
 	type VaultSyncSettings,
 } from "./settingsStore";
+import { MAX_CLIENT_MARKDOWN_KB } from "@shared/durableLimits";
 import type { SettingsSyncStatus } from "../sync/settingsSync/types";
 import type {
 	OperationalResourcePressure,
@@ -380,8 +381,13 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 							type: "number",
 							key: "maxFileSizeKB",
 							min: 1,
+							max: MAX_CLIENT_MARKDOWN_KB,
 							step: 1,
-							validate: validatePositiveInteger,
+							validate: (value) => validatePositiveInteger(value) ?? (
+								value > MAX_CLIENT_MARKDOWN_KB
+									? `Must be at most ${MAX_CLIENT_MARKDOWN_KB} KB`
+									: undefined
+							),
 						},
 					},
 				],
@@ -795,7 +801,9 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 				return;
 			case "maxFileSizeKB": {
 				const nextValue = expectFiniteNumber(key, value);
-				if (validatePositiveInteger(nextValue)) throw new RangeError("maxFileSizeKB must be a positive integer");
+				if (validatePositiveInteger(nextValue) || nextValue > MAX_CLIENT_MARKDOWN_KB) {
+					throw new RangeError(`maxFileSizeKB must be an integer between 1 and ${MAX_CLIENT_MARKDOWN_KB}`);
+				}
 				await this.host.updateSettings((settings) => { settings.maxFileSizeKB = nextValue; }, "settings:max-file-size");
 				return;
 			}

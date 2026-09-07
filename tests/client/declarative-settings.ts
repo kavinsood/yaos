@@ -4,6 +4,7 @@ import { VaultSyncSettingTab, type VaultSyncSettingsHost } from "../../src/setti
 import { emptySettingsSyncStatus, type SettingsSyncStatus } from "../../src/sync/settingsSync/types";
 import { readSource, suite } from "../harness.ts";
 import type { OperationalResourceSnapshot } from "../../src/runtime/operationalResourceSnapshot";
+import { MAX_CLIENT_MARKDOWN_KB } from "../../server/src/shared/durableLimits";
 
 const s = suite("declarative-settings");
 
@@ -121,6 +122,27 @@ s.section("Device rename and attachment side effects");
 	await tab.setControlValue("enableAttachmentSync", false);
 	s.check(!settings.enableAttachmentSync && settings.attachmentSyncExplicitlyConfigured, "attachment toggle remains normalized");
 	s.check(attachmentRefreshReasons.includes("attachment-toggle"), "attachment toggle refreshes runtime");
+}
+
+s.section("Markdown size control exposes and enforces the shared upper bound");
+{
+	const { tab, settings } = createFixture();
+	const definition = collectDefinitions(tab.getSettingDefinitions())
+		.find((candidate) => candidate.control?.key === "maxFileSizeKB");
+	s.check(
+		definition?.control?.type === "number" && definition.control.max === MAX_CLIENT_MARKDOWN_KB,
+		"numeric control advertises the protocol-safe maximum",
+	);
+	await tab.setControlValue("maxFileSizeKB", MAX_CLIENT_MARKDOWN_KB);
+	s.check(settings.maxFileSizeKB === MAX_CLIENT_MARKDOWN_KB, "exact maximum is accepted");
+	let rejected = false;
+	try {
+		await tab.setControlValue("maxFileSizeKB", MAX_CLIENT_MARKDOWN_KB + 1);
+	} catch (error) {
+		rejected = error instanceof RangeError;
+	}
+	s.check(rejected, "values above the shared maximum are rejected");
+	s.check(settings.maxFileSizeKB === MAX_CLIENT_MARKDOWN_KB, "rejected input does not mutate settings");
 }
 
 s.section("Pairing code lifecycle follows completed enrollment");

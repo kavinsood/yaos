@@ -5,9 +5,9 @@
  * This preserves CRDT history and cursor positions when an external tool
  * (git, another editor) modifies a file that's currently open.
  */
-import diff from "fast-diff";
 import * as Y from "yjs";
 import { yTextToString } from "../utils/format";
+import { boundedTextDiff } from "./boundedTextDiff";
 
 /**
  * Diff operation: retain N chars, delete N chars, or insert a string.
@@ -31,9 +31,10 @@ export function applyDiffToYText(
 ): void {
 	if (oldText === newText) return;
 
-	// `fast-diff` gives us a synchronous Myers-style patch without building
-	// the old quadratic DP matrix that used to freeze on large notes.
-	const charOps = diffToCharOps(diff(oldText, newText));
+	// Keep exact Myers edits while the changed middle is bounded. Wholesale
+	// large rewrites use an exact prefix/middle/suffix replacement so a valid
+	// note cannot monopolise the event loop through worst-case diff distance.
+	const charOps = diffToCharOps(boundedTextDiff(oldText, newText));
 	if (charOps.length === 0) return;
 
 	// Apply to Y.Text in a single transaction so collaborators see one patch.

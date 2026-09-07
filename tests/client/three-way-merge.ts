@@ -71,4 +71,16 @@ s.test("refuses pathological inputs outside declared bounds", () => {
 	);
 });
 
+s.test("bounds pathological large divergent edits conservatively", () => {
+	const base = `head\n${"a".repeat(1_300_000)}\ntail`;
+	const startedAt = performance.now();
+	const result = mergeThreeWayText(
+		base,
+		`head\n${"b".repeat(1_300_000)}\ntail`,
+		`head\n${"c".repeat(1_300_000)}\ntail`,
+	);
+	assert.equal(result.kind, "conflict");
+	assert.ok(performance.now() - startedAt < 2_000);
+});
+
 await s.done();

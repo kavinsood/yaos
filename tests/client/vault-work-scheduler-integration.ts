@@ -1,6 +1,7 @@
 import { strict as assert } from "node:assert";
 import * as Y from "yjs";
 import { SOCKET_LIVENESS_DESCRIPTOR } from "../../server/src/shared/socketLiveness";
+import { AUTHORITY_SUPERSEDED_SOCKET_CLOSE_CODE } from "../../server/src/shared/socketCloseCodes";
 import type { OverdueWorkClock } from "../../src/runtime/overdueWorkKernel";
 import {
 	VaultSync,
@@ -82,15 +83,18 @@ class TestProvider implements SyncProviderPort {
 	private readonly syncHandlers: Array<(synced: boolean) => void> = [];
 	private readonly customHandlers: Array<(payload: string) => void> = [];
 	private readonly messageHandlers: Array<(event: MessageEvent) => void> = [];
+	private readonly socket = { readyState: 0 };
+	private nativeClose: (event: { code: number; reason: string }) => void = () => undefined;
 
-	get ws(): { readonly readyState: number } | null {
-		return this.wsconnected ? { readyState: 1 } : null;
+	get ws(): SyncProviderPort["ws"] {
+		return this.wsconnected ? this.socket : null;
 	}
 
 	connect(): void {
 		this.wsconnecting = false;
 		this.wsconnected = true;
 		this.synced = true;
+		this.socket.readyState = 1;
 		for (const handler of this.statusHandlers) handler({ status: "connected" });
 		for (const handler of this.syncHandlers) handler(true);
 	}
@@ -98,6 +102,7 @@ class TestProvider implements SyncProviderPort {
 	disconnect(): void {
 		this.wsconnected = false;
 		this.synced = false;
+		this.socket.readyState = 3;
 	}
 
 	destroy(): void {
@@ -122,6 +127,17 @@ class TestProvider implements SyncProviderPort {
 	emitCustom(payload: string): void {
 		for (const handler of this.customHandlers) handler(payload);
 	}
+	setNativeClose(handler: (event: { code: number; reason: string }) => void): void { this.nativeClose = handler; }
+
+	emitClose(code: number, reason: string): void {
+		this.wsconnected = false;
+		this.synced = false;
+		this.socket.readyState = 3;
+		// The provider's own close handler can publish disconnection before the
+		// raw socket listener. The application close code must still win.
+		for (const handler of this.statusHandlers) handler({ status: "disconnected" });
+		this.nativeClose({ code, reason });
+	}
 }
 
 function encodedBody(bodyId: string, content: string): Uint8Array {
@@ -137,7 +153,7 @@ s.test("VaultSync reconstructs and drains candidate, body-wake, and ticket work"
 	const documents = new Map<string, StoredDocument>();
 	const root = new Y.Doc({ guid: "root" });
 	root.getMap("sys").set("schemaVersion", 7);
-	root.getMap("sys").set("protocolVersion", 3);
+	root.getMap("sys").set("protocolVersion", 4);
 	documents.set("root", {
 		documentId: "root",
 		generation: 1,
@@ -214,7 +230,10 @@ s.test("VaultSync reconstructs and drains candidate, body-wake, and ticket work"
 		token: "token",
 		database,
 		server,
-		providerFactory: () => provider,
+		providerFactory: (input) => {
+			provider.setNativeClose(input.onClose);
+			return provider;
+		},
 		getSocketTicket: async () => {
 			ticketRequests++;
 			return {
@@ -300,6 +319,12 @@ s.test("VaultSync reconstructs and drains candidate, body-wake, and ticket work"
 	assert.equal(candidateAttempts, 2);
 	assert.equal(candidates.size, 0);
 	assert.equal(runtime.getOverdueWorkDiagnostics().queue.some((item) => item.key === "candidate:body-1"), false);
+	let fatalNotifications = 0;
+	runtime.onFatalAuth(() => { fatalNotifications++; });
+	provider.emitClose(AUTHORITY_SUPERSEDED_SOCKET_CLOSE_CODE, "device authority changed");
+	assert.equal(runtime.fatalAuthCode, "authority_superseded", "application close code is fatal even when the control frame is lost");
+	assert.equal(runtime.fatalAuthDetails?.reason, "device authority changed");
+	assert.equal(fatalNotifications, 1);
 	await runtime.destroy();
 });
 

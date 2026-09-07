@@ -7,12 +7,14 @@ import type { VaultDocumentCache } from "./vaultDocumentCache";
 import type { VaultLifecycleService } from "./vaultLifecycleService";
 import type { VaultSocketService } from "./vaultSocketService";
 import { canonicalMarkdownBytes, canonicalizeMarkdown } from "./shared/markdownCodec";
+import { MAX_CLIENT_MARKDOWN_BYTES } from "./shared/durableLimits";
 import { validateFrontmatterSemanticRoots } from "./shared/frontmatterSemanticValidation";
 import type { VaultActorContext } from "./collaboration";
 
 const MAX_IDENTITY_LENGTH = 256;
 
 class NonCanonicalMarkdownCandidateError extends Error {}
+class OversizedMarkdownCandidateError extends Error {}
 class InvalidFrontmatterSemanticCandidateError extends Error {
 	constructor(readonly reason: string) { super(reason); }
 }
@@ -82,6 +84,9 @@ export class VaultCandidateService {
 			if (error instanceof NonCanonicalMarkdownCandidateError) {
 				return json({ error: "candidate_markdown_not_canonical" }, 409);
 			}
+			if (error instanceof OversizedMarkdownCandidateError) {
+				return json({ error: "candidate_markdown_too_large" }, 413);
+			}
 			if (error instanceof InvalidFrontmatterSemanticCandidateError) {
 				return json({ error: error.reason }, 409);
 			}
@@ -90,13 +95,15 @@ export class VaultCandidateService {
 		let durable;
 		try {
 			if (!(this.options.validateActor?.(actor) ?? true)) return json({ error: "authority_superseded" }, 409);
-			durable = this.options.store.commitCandidate({
+				durable = this.options.store.commitCandidate({
 				bodyId,
 				clientId: deviceId,
 				candidateId,
 				candidateDigest,
 				update,
 				catalog: state.catalog,
+				expectedHead: state.expectedHead,
+				changesState: state.changesState,
 				vaultGeneration: this.options.vaultGeneration(),
 				runtimeEpoch: this.options.runtimeEpoch,
 				actor,
@@ -127,6 +134,8 @@ export class VaultCandidateService {
 	private async candidateCatalog(bodyId: string, update: Uint8Array): Promise<{
 		metadata: { contentHash: string; size: number };
 		catalog?: CatalogMutation;
+		expectedHead: { generation: number; latestSequence: number } | null;
+		changesState: boolean;
 	}> {
 		const head = this.options.store.documentHead(bodyId);
 		const historyBytes = head
@@ -136,7 +145,11 @@ export class VaultCandidateService {
 		let reconstructed: ReconstructedDocument | null = null;
 		try {
 			reconstructed = this.options.store.reconstructDocument(bodyId);
-			Y.applyUpdate(reconstructed.doc, update, "candidate-metadata");
+			let changesState = false;
+			const observe = (): void => { changesState = true; };
+			reconstructed.doc.on("update", observe);
+			try { Y.applyUpdate(reconstructed.doc, update, "candidate-metadata"); }
+			finally { reconstructed.doc.off("update", observe); }
 			const content = Y.Text.prototype.toString.call(reconstructed.doc.getText("body"));
 			if (content !== canonicalizeMarkdown(content)) {
 				throw new NonCanonicalMarkdownCandidateError();
@@ -144,11 +157,16 @@ export class VaultCandidateService {
 			const semanticError = validateFrontmatterSemanticRoots(reconstructed.doc);
 			if (semanticError) throw new InvalidFrontmatterSemanticCandidateError(semanticError);
 			const bytes = canonicalMarkdownBytes(content);
+			if (bytes.byteLength > MAX_CLIENT_MARKDOWN_BYTES) {
+				throw new OversizedMarkdownCandidateError();
+			}
 			const metadata = { contentHash: await sha256Hex(bytes), size: bytes.byteLength };
 			const current = this.options.store.getCatalogHeadAt(this.options.store.currentSequence(), bodyId);
 			const generation = (this.options.store.documentHead(bodyId)?.generation ?? 0) + 1;
 			return {
 				metadata,
+				expectedHead: head,
+				changesState,
 				catalog: current?.lifecycle === "active" ? { bodyId, fileId: current.fileId, path: current.path, previousPath: null,
 					lifecycle: "active", bodyGeneration: generation, contentHash: metadata.contentHash, size: metadata.size } : undefined,
 			};

@@ -16,8 +16,14 @@ export function canonicalizeMarkdown(content: string): string {
 	return withoutBom.replace(/\r\n?/g, "\n");
 }
 
+/** Canonical text and its exact UTF-8 bytes, prepared with one normalization pass. */
+export function prepareCanonicalMarkdown(content: string): { content: string; bytes: Uint8Array } {
+	const canonical = canonicalizeMarkdown(content);
+	return { content: canonical, bytes: encoder.encode(canonical) };
+}
+
 export function canonicalMarkdownBytes(content: string): Uint8Array {
-	return encoder.encode(canonicalizeMarkdown(content));
+	return prepareCanonicalMarkdown(content).bytes;
 }
 
 export function exactMarkdownDiskBytes(content: string): Uint8Array {
@@ -31,9 +37,14 @@ async function sha256Hex(bytes: Uint8Array): Promise<string> {
 	return output;
 }
 
+/** SHA-256 identity of bytes already produced by canonicalMarkdownBytes. */
+export function canonicalMarkdownBytesHash(bytes: Uint8Array): Promise<string> {
+	return sha256Hex(bytes);
+}
+
 /** SHA-256 identity of canonical Markdown UTF-8 bytes. */
 export function canonicalMarkdownHash(content: string): Promise<string> {
-	return sha256Hex(canonicalMarkdownBytes(content));
+	return canonicalMarkdownBytesHash(canonicalMarkdownBytes(content));
 }
 
 /**

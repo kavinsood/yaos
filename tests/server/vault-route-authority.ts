@@ -5,6 +5,7 @@ import * as syncProtocol from "y-protocols/sync";
 import { applyAwarenessUpdate, Awareness, encodeAwarenessUpdate } from "y-protocols/awareness";
 import * as Y from "yjs";
 import { encodeRootPathPublicationUpdate } from "../../server/src/server";
+import { AUTHORITY_SUPERSEDED_SOCKET_CLOSE_CODE } from "../../server/src/shared/socketCloseCodes";
 import { VaultDocumentCachePressureError } from "../../server/src/vaultDocumentCache";
 import {
 	parseVaultSocketAttachment,
@@ -15,6 +16,7 @@ import {
 	type VaultSocketPort,
 	type VaultSocketRegistryPort,
 	VaultSocketService,
+	bodyUpdateAdmissionError,
 } from "../../server/src/vaultSocketService";
 import { suite } from "../harness.ts";
 
@@ -105,6 +107,18 @@ s.test("root socket validation rejects structural changes and accepts duplicate 
 	assert.equal(rootUpdateChangesDocument(current, Y.encodeStateAsUpdate(changed, vector)), true);
 	current.destroy();
 	changed.destroy();
+});
+
+s.test("body socket admission rejects a bounded update that grows Markdown beyond recovery limits", () => {
+	const current = new Y.Doc({ guid: "body-size-admission" });
+	const candidate = new Y.Doc({ guid: "body-size-admission" });
+	const vector = Y.encodeStateVector(candidate);
+	candidate.getText("body").insert(0, "x".repeat(1_500_001));
+	const update = Y.encodeStateAsUpdate(candidate, vector);
+	assert.ok(update.byteLength < 1_750_000, "fixture must pass the per-frame durable update gate");
+	assert.equal(bodyUpdateAdmissionError(current, update), "markdown_size_limit");
+	current.destroy();
+	candidate.destroy();
 });
 
 s.test("hibernated sockets from an old runtime epoch are fenced", async () => {
@@ -374,7 +388,7 @@ s.test("device revocation closes every active root and body socket for that devi
 		}),
 		serializeAttachment: () => {},
 		send: () => {},
-		close: (_code: number, reason: string) => { closed.push(`${deviceId}:${documentId}:${reason}`); },
+		close: (code: number, reason: string) => { closed.push(`${code}:${deviceId}:${documentId}:${reason}`); },
 	});
 	const sockets = [
 		socket("device-revoked", "root"),
@@ -392,9 +406,13 @@ s.test("device revocation closes every active root and body socket for that devi
 	} as never);
 	assert.equal(service.closeDevice("device-revoked"), 2);
 	assert.deepEqual(closed, [
-		"device-revoked:root:device authority changed",
-		"device-revoked:body-revoked:device authority changed",
+		`${AUTHORITY_SUPERSEDED_SOCKET_CLOSE_CODE}:device-revoked:root:device authority changed`,
+		`${AUTHORITY_SUPERSEDED_SOCKET_CLOSE_CODE}:device-revoked:body-revoked:device authority changed`,
 	]);
+	closed.length = 0;
+	assert.equal(service.closePrincipal(attachment.principalId), 3);
+	assert.ok(closed.every((entry) => entry.startsWith(`${AUTHORITY_SUPERSEDED_SOCKET_CLOSE_CODE}:`)
+		&& entry.endsWith(":membership revoked")), "membership revocation uses the same durable terminal close code");
 });
 
 s.test("body awareness is principal-rewritten and confined to the exact body room", async () => {

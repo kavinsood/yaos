@@ -130,7 +130,7 @@ s.test("manual reconnect delegates to the unified runtime admission owner", asyn
 s.section("Fatal auth stops ticket refresh lifecycle");
 {
 	const source = readSource("src/sync/vaultSync.ts");
-	s.check(source.includes("this._fatalAuthCode = fatal.code"), "parsed fatal code is stored on VaultSync");
+	s.check(source.includes("this.setFatalAuth(fatal.code, fatal.details)"), "parsed fatal code is stored on VaultSync");
 	s.check(
 		source.includes('this.workScheduler.queueReconnect("ticket-refresh-due"') &&
 		source.includes("this.destroyed || this.fatalAuthError") &&

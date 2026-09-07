@@ -19,6 +19,7 @@ interface Receipt {
 	candidateId: string;
 	candidateDigest: string;
 	durableGeneration: number;
+	vaultSequence: number;
 	vaultGeneration: string;
 	runtimeEpoch: string;
 }
@@ -26,7 +27,11 @@ interface Receipt {
 class CandidateStore {
 	readonly receipts = new Map<string, Receipt>();
 	commits = 0;
+	reconstructions = 0;
+	appliedUpdates = 0;
+	lastCommit: { expectedHead: { generation: number; latestSequence: number } | null; changesState: boolean } | null = null;
 	throwAfterCommit = false;
+	private head = { generation: 1, latestSequence: 1 };
 	currentSequence(): number { return 1; }
 	creationCandidate(): null { return null; }
 	getCatalogHeadAt() {
@@ -36,13 +41,20 @@ class CandidateStore {
 		return this.receipts.get(`${bodyId}\u0000${clientId}\u0000${candidateId}`) ?? null;
 	}
 	reconstructDocument() {
-		return { doc: new Y.Doc({ guid: BODY_ID }), generation: 1 };
+		this.reconstructions++;
+		const doc = new Y.Doc({ guid: BODY_ID });
+		doc.on("update", () => { this.appliedUpdates++; });
+		return { doc, generation: this.head.generation };
 	}
-	documentHead() { return { generation: 1, latestSequence: 1 }; }
+	documentHead() { return { ...this.head }; }
 	documentEncodedHistoryBytes(): number { return 1; }
-	commitCandidate(input: { bodyId: string; clientId: string; candidateId: string; candidateDigest: string; vaultGeneration: string; runtimeEpoch: string }): Receipt {
+	commitCandidate(input: { bodyId: string; clientId: string; candidateId: string; candidateDigest: string;
+		expectedHead: { generation: number; latestSequence: number } | null; changesState: boolean;
+		vaultGeneration: string; runtimeEpoch: string }): Receipt {
 		this.commits++;
-		const receipt = { ...input, durableGeneration: 2 };
+		this.lastCommit = { expectedHead: input.expectedHead, changesState: input.changesState };
+		if (input.changesState) this.head = { generation: this.head.generation + 1, latestSequence: this.head.latestSequence + 1 };
+		const receipt = { ...input, durableGeneration: this.head.generation, vaultSequence: this.head.latestSequence };
 		this.receipts.set(`${input.bodyId}\u0000${input.clientId}\u0000${input.candidateId}`, receipt);
 		if (this.throwAfterCommit) {
 			this.throwAfterCommit = false;
@@ -121,6 +133,33 @@ s.test("durable candidate receipt is device-scoped and exact", async () => {
 	});
 	assert.equal(flushes(), 1);
 	assert.equal(notifications(), 1);
+	assert.equal(store.reconstructions, 1, "candidate metadata validation reconstructs exactly once");
+	assert.equal(store.appliedUpdates, 1, "the changed update is applied exactly once during validation");
+	assert.deepEqual(store.lastCommit, {
+		expectedHead: { generation: 1, latestSequence: 1 },
+		changesState: true,
+	}, "the validated state decision and exact head are reused by commit");
+});
+
+s.test("semantic no-op preserves the current generation while writing an exact receipt", async () => {
+	const doc = new Y.Doc({ guid: BODY_ID });
+	const update = Y.encodeStateAsUpdate(doc);
+	doc.destroy();
+	const candidateDigest = await digest(update);
+	const store = new CandidateStore();
+	const { service, notifications } = makeService(store);
+	const response = await service.handle(BODY_ID, candidateRequest(candidateDigest, update));
+	assert.equal(response.status, 200);
+	const receipt = await response.json() as { durableGeneration: number; candidateDigest: string };
+	assert.equal(receipt.durableGeneration, 1);
+	assert.equal(receipt.candidateDigest, candidateDigest);
+	assert.deepEqual(store.lastCommit, {
+		expectedHead: { generation: 1, latestSequence: 1 },
+		changesState: false,
+	});
+	assert.equal(store.reconstructions, 1);
+	assert.equal(store.appliedUpdates, 0, "applying a redundant update emits no Yjs state change");
+	assert.equal(notifications(), 1, "the durable no-op receipt still settles waiting clients");
 });
 
 s.test("replay returns the original receipt and digest collision fails before another write", async () => {
@@ -130,10 +169,12 @@ s.test("replay returns the original receipt and digest collision fails before an
 	const candidateDigest = await digest(update);
 	const store = new CandidateStore();
 	const { service, flushes } = makeService(store);
-	assert.equal((await service.handle(BODY_ID, candidateRequest(candidateDigest, update))).status, 200);
+	const initial = await service.handle(BODY_ID, candidateRequest(candidateDigest, update));
+	assert.equal(initial.status, 200);
+	const initialReceipt = await initial.json();
 	const replay = await service.handle(BODY_ID, candidateRequest(candidateDigest));
 	assert.equal(replay.status, 200);
-	assert.equal((await replay.json() as { durableGeneration: number }).durableGeneration, 2);
+	assert.deepEqual(await replay.json(), initialReceipt);
 	const collision = await service.handle(BODY_ID, candidateRequest("f".repeat(64)));
 	assert.equal(collision.status, 409);
 	assert.equal((await collision.json() as { error: string }).error, "candidate_id_reused_with_different_digest");
@@ -169,6 +210,22 @@ s.test("server rejects a candidate whose resulting Markdown is not canonical", a
 	assert.equal((await response.json() as { error: string }).error, "candidate_markdown_not_canonical");
 	assert.equal(store.commits, 0, "non-canonical text never reaches durable history");
 	assert.equal(notifications(), 0, "rejected candidate is not broadcast as committed");
+});
+
+s.test("server rejects Markdown beyond the shared recovery-safe byte ceiling", async () => {
+	const doc = new Y.Doc({ guid: BODY_ID });
+	doc.getText("body").insert(0, "x".repeat(1_500_001));
+	const update = Y.encodeStateAsUpdate(doc);
+	doc.destroy();
+	assert.ok(update.byteLength < 1_750_000, "fixture must pass the durable update-size gate");
+	const candidateDigest = await digest(update);
+	const store = new CandidateStore();
+	const { service, notifications } = makeService(store);
+	const response = await service.handle(BODY_ID, candidateRequest(candidateDigest, update));
+	assert.equal(response.status, 413);
+	assert.equal((await response.json() as { error: string }).error, "candidate_markdown_too_large");
+	assert.equal(store.commits, 0);
+	assert.equal(notifications(), 0);
 });
 
 s.test("server admits bounded semantic frontmatter roots", async () => {

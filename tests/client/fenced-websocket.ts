@@ -27,6 +27,11 @@ class FakeWebSocket {
 		if (type === "error" && [...listeners].length === 0) throw new Error("unhandled websocket error");
 		for (const listener of listeners) listener(new Event(type));
 	}
+	emitClose(code: number, reason: string): void {
+		for (const listener of this.listeners.get("close") ?? []) {
+			listener({ type: "close", code, reason } as unknown as Event);
+		}
+	}
 }
 
 const s = suite("fenced-websocket");
@@ -50,6 +55,15 @@ s.test("force termination closes provider state synchronously and fences late na
 	FakeWebSocket.last!.emit("close");
 	assert.deepEqual(events, ["close"]);
 	assert.equal(FakeWebSocket.last!.terminated, 1);
+});
+
+s.test("native application close survives a lost provider control frame", () => {
+	let close: { code: number; reason: string } | null = null;
+	// @ts-expect-error FakeWebSocket intentionally implements only the provider-used WebSocket surface.
+	const Constructor = fencedWebSocketConstructor(FakeWebSocket, (event) => { close = event; });
+	new Constructor("ws://example.test");
+	FakeWebSocket.last!.emitClose(4403, "device authority changed");
+	assert.deepEqual(close, { code: 4403, reason: "device authority changed" });
 });
 
 s.test("the provider owns exactly one custom-message prefix", async () => {

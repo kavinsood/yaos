@@ -4,6 +4,7 @@ import {
 	canonicalMarkdownBytes,
 	canonicalMarkdownHash,
 	canonicalizeMarkdown,
+	prepareCanonicalMarkdown,
 	exactMarkdownDiskFingerprint,
 } from "../../server/src/shared/markdownCodec";
 import {
@@ -29,6 +30,8 @@ s.section("canonical representation");
 	s.check(canonicalizeMarkdown("line  \r\n\t\r\n") === "line  \n\t\n", "trailing whitespace is preserved");
 	s.check(canonicalizeMarkdown("e\u0301") === "e\u0301", "Unicode normalization is not performed");
 	s.check(canonicalMarkdownBytes("\uFEFFa\r\n").byteLength === 2, "canonical bytes encode canonical text only");
+	const prepared = prepareCanonicalMarkdown("\uFEFFa\r\n");
+	s.check(prepared.content === "a\n" && prepared.bytes.byteLength === 2, "canonical text and bytes are prepared together");
 }
 
 s.test("logical hashes ignore representation-only differences", async () => {

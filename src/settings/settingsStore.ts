@@ -1,3 +1,12 @@
+import {
+	MAX_CLIENT_MARKDOWN_KB,
+} from "@shared/durableLimits";
+import {
+	readVaultAuthoritySnapshot,
+	type VaultCapability,
+	type VaultRole,
+} from "../collaboration/authority";
+
 /** Controls how external disk edits (git, other editors) are imported into CRDT. */
 export type ExternalEditPolicy = "always" | "closed-only" | "never";
 export const MAX_ATTACHMENT_SIZE_KB = 10 * 1024;
@@ -123,7 +132,7 @@ export const DEFAULT_SETTINGS: VaultSyncSettings = {
 	settingsSyncDeferred: false,
 	frontmatterGuardEnabled: true,
 	excludePatterns: "",
-	maxFileSizeKB: 2048,
+	maxFileSizeKB: MAX_CLIENT_MARKDOWN_KB,
 	externalEditPolicy: "always",
 	enableAttachmentSync: true,
 	attachmentSyncExplicitlyConfigured: false,
@@ -192,7 +201,7 @@ export function readVaultSyncSettings(
 	const record = typeof data === "object" && data !== null ? data as Record<string, unknown> : {};
 	const settings = Object.assign({}, DEFAULT_SETTINGS, record);
 	settings.authorityCapabilities = Array.isArray(record.authorityCapabilities)
-		? [...record.authorityCapabilities] as VaultCapability[]
+		? [...(record.authorityCapabilities as unknown[])] as VaultCapability[]
 		: [];
 	Reflect.deleteProperty(settings, "token");
 	let migrated = "token" in record;
@@ -262,6 +271,18 @@ export function readVaultSyncSettings(
 			if (record[key] !== undefined) migrated = true;
 		}
 	}
+	if (
+		typeof settings.maxFileSizeKB !== "number"
+		|| !Number.isSafeInteger(settings.maxFileSizeKB)
+		|| settings.maxFileSizeKB < 1
+		|| settings.maxFileSizeKB > MAX_CLIENT_MARKDOWN_KB
+	) {
+		const numeric = typeof settings.maxFileSizeKB === "number" && Number.isFinite(settings.maxFileSizeKB)
+			? Math.floor(settings.maxFileSizeKB)
+			: DEFAULT_SETTINGS.maxFileSizeKB;
+		settings.maxFileSizeKB = Math.max(1, Math.min(MAX_CLIENT_MARKDOWN_KB, numeric));
+		migrated = true;
+	}
 	if (typeof record.attachmentSyncExplicitlyConfigured !== "boolean") {
 		settings.attachmentSyncExplicitlyConfigured = record.enableAttachmentSync === true;
 		if (record.enableAttachmentSync !== true) {
@@ -313,8 +334,3 @@ export class SettingsStore<TState extends Partial<VaultSyncSettings>> {
 		return next;
 	}
 }
-import {
-	readVaultAuthoritySnapshot,
-	type VaultCapability,
-	type VaultRole,
-} from "../collaboration/authority";

@@ -9,6 +9,10 @@ export interface TerminableWebSocket {
 }
 
 type WebSocketConstructor = new (url: string | URL, protocols?: string | string[]) => WebSocket;
+export interface NativeSocketClose {
+	readonly code: number;
+	readonly reason: string;
+}
 type ExtendedWebSocket = WebSocket & {
 	terminate?: () => void;
 	accept?: () => void;
@@ -22,7 +26,10 @@ function callListener(listener: EventListenerOrEventListenerObject, event: Event
 }
 
 /** Fences late events and gives browser WebSockets a synchronous abandonment path. */
-export function fencedWebSocketConstructor(Base: WebSocketConstructor): typeof WebSocket {
+export function fencedWebSocketConstructor(
+	Base: WebSocketConstructor,
+	onNativeClose?: (event: NativeSocketClose) => void,
+): typeof WebSocket {
 	class FencedWebSocket {
 		static readonly CONNECTING = 0;
 		static readonly OPEN = 1;
@@ -47,6 +54,10 @@ export function fencedWebSocketConstructor(Base: WebSocketConstructor): typeof W
 		constructor(url: string | URL, protocols?: string | string[]) {
 			this.url = String(url);
 			this.socket = new Base(url, protocols);
+			this.socket.addEventListener("close", (event) => {
+				const close = event as CloseEvent;
+				onNativeClose?.({ code: close.code, reason: close.reason });
+			});
 		}
 
 		get readyState(): number { return this.fenced ? FencedWebSocket.CLOSED : this.socket.readyState; }

@@ -1,4 +1,4 @@
-import diff from "fast-diff";
+import { boundedTextDiff } from "./boundedTextDiff";
 
 export interface ThreeWayEdit {
 	start: number;
@@ -39,7 +39,7 @@ interface SideEdit {
 }
 
 function editsFromBase(base: string, changed: string): SideEdit[] {
-	const operations = diff(base, changed);
+	const operations = boundedTextDiff(base, changed);
 	const edits: SideEdit[] = [];
 	let baseOffset = 0;
 	let pending: SideEdit | null = null;

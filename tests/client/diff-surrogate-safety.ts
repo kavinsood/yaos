@@ -38,6 +38,7 @@
 
 import * as Y from "yjs";
 import diff from "fast-diff";
+import { boundedTextDiff, MAX_EXACT_DIFF_TOTAL_CHARACTERS } from "../../src/sync/boundedTextDiff";
 import { applyDiffToYText } from "../../src/sync/diff";
 import { suite } from "../harness.ts";
 
@@ -212,5 +213,54 @@ s.section("Test 5: canary — the detector fires on a deliberately split pair");
 	);
 	doc.destroy();
 	reloaded.destroy();
+}
+
+s.section("Test 6: pathological large rewrites are bounded and remain exact");
+{
+	const edge = `${POO}${GRIN}`;
+	const oldText = `${edge}${"a".repeat(1_300_000)}${edge}`;
+	const newText = `${edge}${"b".repeat(1_300_000)}${edge}`;
+	const startedAt = performance.now();
+	const segments = boundedTextDiff(oldText, newText);
+	const elapsedMs = performance.now() - startedAt;
+	const { live, persisted } = applyAndRoundTrip(oldText, newText);
+
+	s.check(
+		segments.some(([kind, text]) => kind === -1 && text.length > MAX_EXACT_DIFF_TOTAL_CHARACTERS),
+		"large irreducible middle uses the bounded replacement path",
+	);
+	s.check(elapsedMs < 2_000, `large rewrite diff completes promptly (${elapsedMs.toFixed(1)}ms)`);
+	s.check(live === newText && persisted === newText, "large rewrite is exact live and after persistence");
+	s.check(loneSurrogates(live) === 0, "bounded edge retention never splits a surrogate pair");
+}
+
+s.section("Test 7: asymmetric large rewrites cannot sneak into Myers");
+{
+	const oldText = "a".repeat(64 * 1024);
+	const newText = "b".repeat(1_499_000);
+	const startedAt = performance.now();
+	const segments = boundedTextDiff(oldText, newText);
+	const elapsedMs = performance.now() - startedAt;
+	const { live, persisted } = applyAndRoundTrip(oldText, newText);
+
+	s.check(segments.length === 2 && segments[0]?.[0] === -1 && segments[1]?.[0] === 1,
+		"unrelated asymmetric inputs use one bounded replacement");
+	s.check(elapsedMs < 2_000, `asymmetric rewrite diff completes promptly (${elapsedMs.toFixed(1)}ms)`);
+	s.check(live === newText && persisted === newText, "asymmetric rewrite is exact live and after persistence");
+}
+
+s.section("Test 8: moderate unrelated middles cannot enter Myers worst case");
+{
+	const oldText = "a".repeat(16_384);
+	const newText = "b".repeat(16_384);
+	const startedAt = performance.now();
+	const segments = boundedTextDiff(oldText, newText);
+	const elapsedMs = performance.now() - startedAt;
+
+	s.check(segments.length === 2 && segments[0]?.[0] === -1 && segments[1]?.[0] === 1,
+		"wide unrelated middle uses one bounded replacement");
+	s.check(segments[0]?.[1] === oldText && segments[1]?.[1] === newText,
+		"bounded replacement remains exact");
+	s.check(elapsedMs < 250, `moderate rewrite diff completes promptly (${elapsedMs.toFixed(1)}ms)`);
 }
 await s.done();

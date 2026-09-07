@@ -1,5 +1,7 @@
 import * as Y from "yjs";
 import { canonicalizeMarkdown } from "@shared/markdownCodec";
+import { decodeBinaryEnvelope, encodeBinaryEnvelope, YAOS_BINARY_CONTENT_TYPE } from "@shared/binaryEnvelope";
+import { AUTHORITY_SUPERSEDED_SOCKET_CLOSE_CODE } from "@shared/socketCloseCodes";
 import {
 	SOCKET_LIVENESS_IDLE_MS,
 	SOCKET_LIVENESS_TIMEOUT_MS,
@@ -63,7 +65,7 @@ import {
 	SocketLivenessCoordinator,
 	type SocketLivenessSnapshot,
 } from "../runtime/socketLivenessCoordinator";
-import { fencedWebSocketConstructor } from "./fencedWebSocket";
+import { fencedWebSocketConstructor, type NativeSocketClose } from "./fencedWebSocket";
 import { sameAuthorityIdentity, type VaultAuthorityIdentity } from "../collaboration/authority";
 export const ROOT_DOCUMENT_ID = "root";
 
@@ -386,7 +388,7 @@ export interface AttachmentPublicationReceipt {
 	runtimeEpoch: string;
 	vaultSequence: number;
 	rootGeneration: number;
-	rootUpdateBase64Url: string;
+	rootUpdate: Uint8Array;
 }
 export interface CommittedOperationOutcome {
 	operationId: string;
@@ -459,6 +461,7 @@ export interface ProviderFactoryInput {
 	kind: "root" | "body";
 	documentId: string;
 	doc: Y.Doc;
+	onClose: (event: NativeSocketClose) => void;
 }
 export type ProviderFactory = (input: ProviderFactoryInput) => SyncProviderPort;
 export type WebSocketImplementation = typeof WebSocket;
@@ -728,7 +731,7 @@ function asBodyCommittedNotification(payload: string): BodyCommittedNotification
 	};
 }
 async function sha256Hex(bytes: Uint8Array): Promise<string> {
-	const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes.slice().buffer));
+	const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
 	return Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
@@ -752,21 +755,6 @@ function mutationRequestError(response: { status: number; json?: unknown }, oper
 		: "request_failed";
 	return new VaultMutationRequestError(response.status, code, operation);
 }
-function bytesToBase64(bytes: Uint8Array): string {
-	let binary = "";
-	for (const byte of bytes) binary += String.fromCharCode(byte);
-	return btoa(binary);
-}
-
-function base64UrlToBytes(value: string): Uint8Array {
-	const base64 = value.replace(/-/g, "+").replace(/_/g, "/")
-		.padEnd(Math.ceil(value.length / 4) * 4, "=");
-	const binary = atob(base64);
-	const bytes = new Uint8Array(binary.length);
-	for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
-	return bytes;
-}
-
 function parseAttachmentHead(value: unknown): AttachmentHead | null {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
 	const record = value as Record<string, unknown>;
@@ -956,11 +944,8 @@ export class VaultSyncHttpPort implements VaultServerPort {
 		const response = await this.request({
 			url: this.route("lifecycle/publish"),
 			method: "POST",
-			contentType: "application/json",
-			body: JSON.stringify({
-				operations,
-				rootUpdateBase64: bytesToBase64(rootUpdate),
-			}),
+			contentType: YAOS_BINARY_CONTENT_TYPE,
+			body: encodeBinaryEnvelope({ operations, rootUpdate }).slice().buffer,
 			headers: this.headers(),
 		});
 		if (response.status !== 200) {
@@ -989,7 +974,7 @@ export class VaultSyncHttpPort implements VaultServerPort {
 				mismatch,
 			);
 		}
-		return response.json as AttachmentPublicationReceipt;
+		return decodeBinaryEnvelope(new Uint8Array(response.arrayBuffer)) as AttachmentPublicationReceipt;
 	}
 
 	async committedOperationOutcome(input: {
@@ -1061,6 +1046,7 @@ export class VaultSync implements SyncRuntimePort {
 	private attachmentPublicationDrain: Promise<void> | null = null;
 	private attachmentPublicationWork: Promise<void> = Promise.resolve();
 	private readonly providerSyncListeners = new Set<(generation: number) => void>();
+	private readonly fatalAuthListeners = new Set<() => void>();
 	private readonly runtimeScope = new RuntimeScope();
 	private readonly socketAdmission: SocketAdmissionCoordinator;
 	private readonly socketLiveness: SocketLivenessCoordinator;
@@ -1148,7 +1134,8 @@ export class VaultSync implements SyncRuntimePort {
 			onBackpressure: (bodyId, reason) => this.log(`body admission backpressured for ${bodyId}: ${reason}`),
 		});
 		const factory = options.providerFactory ?? ((input) => this.createDefaultProvider(input));
-		this.provider = factory({ kind: "root", documentId: ROOT_DOCUMENT_ID, doc: this.ydoc });
+		this.provider = factory({ kind: "root", documentId: ROOT_DOCUMENT_ID, doc: this.ydoc,
+			onClose: (event) => this.handleNativeSocketClose(event) });
 		this.socketAdmission = new SocketAdmissionCoordinator({
 			scope: this.runtimeScope,
 			refreshCredential: async (epoch, force) => {
@@ -1446,6 +1433,12 @@ export class VaultSync implements SyncRuntimePort {
 
 	onProviderSync(callback: (generation: number) => void): void {
 		this.providerSyncListeners.add(callback);
+	}
+
+	onFatalAuth(callback: () => void): () => void {
+		this.fatalAuthListeners.add(callback);
+		if (this.fatalAuthError) callback();
+		return () => this.fatalAuthListeners.delete(callback);
 	}
 
 	getFileId(path: string): string | undefined {
@@ -2014,12 +2007,12 @@ export class VaultSync implements SyncRuntimePort {
 			|| receipt.vaultGeneration !== this.options.vaultGeneration || !receipt.runtimeEpoch
 			|| !Number.isSafeInteger(receipt.vaultSequence) || receipt.vaultSequence < 0
 			|| !Number.isSafeInteger(receipt.rootGeneration) || receipt.rootGeneration < 0
-			|| typeof receipt.rootUpdateBase64Url !== "string" || !receipt.rootUpdateBase64Url) {
+			|| !(receipt.rootUpdate instanceof Uint8Array) || receipt.rootUpdate.byteLength === 0) {
 			throw new AttachmentPublicationProofError("attachment publication proof mismatch");
 		}
 		let update: Uint8Array;
 		try {
-			update = base64UrlToBytes(receipt.rootUpdateBase64Url);
+			update = receipt.rootUpdate;
 			this.validateAttachmentPublicationUpdate(mutation, update);
 		} catch (error) {
 			if (error instanceof AttachmentPublicationProofError) throw error;
@@ -3091,6 +3084,24 @@ export class VaultSync implements SyncRuntimePort {
 		await this.options.database.close();
 	}
 
+	private setFatalAuth(code: FatalSyncCode, details: FatalSyncDetails): void {
+		if (this.fatalAuthError) return;
+		this._fatalAuthCode = code;
+		this._fatalAuthDetails = details;
+		this.provider.disconnect();
+		for (const session of this.sessions.values()) session.provider.disconnect();
+		for (const callback of this.fatalAuthListeners) callback();
+	}
+
+	private handleNativeSocketClose(event: NativeSocketClose): void {
+		if (event.code !== AUTHORITY_SUPERSEDED_SOCKET_CLOSE_CODE) return;
+		this.setFatalAuth("authority_superseded", {
+			clientSchemaVersion: SCHEMA_VERSION,
+			roomSchemaVersion: SCHEMA_VERSION,
+			reason: event.reason || "socket authority superseded",
+		});
+	}
+
 	private wireRootProvider(): void {
 		this.bodies.coordinator.replacePathBindings(this.pathToId.entries());
 		this.ydoc.on("afterTransaction", () => {
@@ -3123,10 +3134,7 @@ export class VaultSync implements SyncRuntimePort {
 		const handleFatal = (payload: string) => {
 			const fatal = asFatalSyncMessage(payload);
 			if (!fatal) return;
-			this._fatalAuthCode = fatal.code;
-			this._fatalAuthDetails = fatal.details;
-			this.provider.disconnect();
-			for (const session of this.sessions.values()) session.provider.disconnect();
+			this.setFatalAuth(fatal.code, fatal.details);
 		};
 		const handleRootControl = (payload: string) => {
 			handleFatal(payload);
@@ -3146,13 +3154,11 @@ export class VaultSync implements SyncRuntimePort {
 				this._lastRemoteUpdateAt = this.now();
 				const invalidPath = this.invalidRootPath();
 				if (invalidPath) {
-					this._fatalAuthCode = "server_misconfigured";
-					this._fatalAuthDetails = {
+					this.setFatalAuth("server_misconfigured", {
 						clientSchemaVersion: SCHEMA_VERSION,
 						roomSchemaVersion: SCHEMA_VERSION,
 						reason: `invalid root path: ${invalidPath}`,
-					};
-					this.provider.disconnect();
+					});
 					this.log(`quarantined invalid remote root path: ${invalidPath}`);
 					return;
 				}
@@ -3185,7 +3191,8 @@ export class VaultSync implements SyncRuntimePort {
 	private createBodySession(body: LoadedBody): BodySession {
 		this.ensureSemanticMirror(body);
 		const factory = this.options.providerFactory ?? ((input) => this.createDefaultProvider(input));
-		const provider = factory({ kind: "body", documentId: body.bodyId, doc: body.doc });
+		const provider = factory({ kind: "body", documentId: body.bodyId, doc: body.doc,
+			onClose: (event) => this.handleNativeSocketClose(event) });
 		this.registerSocketLiveness(body.bodyId, provider);
 		const lifetimeLease = this.bodies.acquireLease(body.bodyId);
 		let session!: BodySession;
@@ -4708,7 +4715,7 @@ export class VaultSync implements SyncRuntimePort {
 			prefix,
 			connect: false,
 			maxBackoffTime: MAX_BACKOFF_TIME_MS,
-			WebSocketPolyfill: fencedWebSocketConstructor(baseWebSocket),
+			WebSocketPolyfill: fencedWebSocketConstructor(baseWebSocket, input.onClose),
 			params: async () => {
 				if (!this.options.getSocketTicket) {
 					throw new Error("a short-lived socket ticket is required");
@@ -4789,20 +4796,19 @@ export class VaultSync implements SyncRuntimePort {
 
 	private applyTerminalAdmissionOutcome(outcome: OperationOutcome): void {
 		if (outcome.kind !== "permanently_blocked" || this.fatalAuthError) return;
+		let code: FatalSyncCode;
 		if (outcome.failure === "unauthorized" || outcome.failure === "revoked") {
-			this._fatalAuthCode = "unauthorized";
+			code = "unauthorized";
 		} else if (outcome.failure === "incompatible_protocol") {
-			this._fatalAuthCode = "update_required";
+			code = "update_required";
 		} else {
-			this._fatalAuthCode = "server_misconfigured";
+			code = "server_misconfigured";
 		}
-		this._fatalAuthDetails = {
+		this.setFatalAuth(code, {
 			clientSchemaVersion: SCHEMA_VERSION,
 			roomSchemaVersion: null,
 			reason: `socket_admission_${outcome.failure}`,
-		};
-		this.provider.disconnect();
-		for (const session of this.sessions.values()) session.provider.disconnect();
+		});
 	}
 
 	private findSessionBodyForConsumer(consumerId: string): string | undefined {
