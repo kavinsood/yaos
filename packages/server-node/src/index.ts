@@ -80,7 +80,7 @@ class ConfigActor implements RuntimeActor {
 	private readonly runtime;
 
 	constructor(databases: NodeDatabaseSet, name: string) {
-		this.runtime = new ControlPlaneRuntime(databases.controlKv(`config:${name}`));
+		this.runtime = new ControlPlaneRuntime(databases.controlPlane(`config:${name}`));
 	}
 
 	fetch(request: Request): Promise<Response> {

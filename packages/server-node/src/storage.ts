@@ -4,8 +4,9 @@ import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { deserialize, serialize } from "node:v8";
 import type { ControlPlaneStoragePort, ControlPlaneTransactionPort } from "../../../server/src/platformPorts";
+import { SqlControlPlaneStorage, type ControlPlaneSqlHost } from "../../../server/src/controlPlaneSql";
 
-export const NODE_STORAGE_VERSION = 1;
+export const NODE_STORAGE_VERSION = 2;
 
 export class NewerStorageVersionError extends Error {
 	readonly exitCode = 18;
@@ -623,6 +624,10 @@ export class NodeDatabaseSet {
 
 	controlKv(actorName: string): SqliteKvStore {
 		return new SqliteKvStore(this.control, actorName);
+	}
+
+	controlPlane(actorName: string): SqlControlPlaneStorage {
+		return new SqlControlPlaneStorage(this.control as unknown as ControlPlaneSqlHost, actorName);
 	}
 
 	vault(actorName: string): NodeSqliteStorage {

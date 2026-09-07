@@ -26,7 +26,6 @@ const s = suite("collaboration-migration-sqlite");
 
 const workerSource = String.raw`
 import * as Y from "yjs";
-import { bytesToBase64Url } from "./server/src/base64url.ts";
 import { VaultStore } from "./server/src/vaultStore.ts";
 
 export class MigrationCycle {
@@ -48,16 +47,16 @@ export class MigrationCycle {
       "CREATE TABLE vault_document_heads (document_id TEXT PRIMARY KEY, generation INTEGER NOT NULL, latest_sequence INTEGER NOT NULL);" +
       "INSERT INTO vault_document_heads(document_id, generation, latest_sequence) VALUES ('root', 1, 1);" +
       "CREATE TABLE vault_journal (sequence INTEGER PRIMARY KEY, document_id TEXT NOT NULL, generation INTEGER NOT NULL, kind TEXT NOT NULL, update_byte_length INTEGER NOT NULL, created_at INTEGER NOT NULL);" +
-      "CREATE TABLE vault_journal_chunks (sequence INTEGER NOT NULL, chunk_index INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY(sequence, chunk_index));" +
-      "CREATE TABLE vault_meta (id INTEGER PRIMARY KEY CHECK(id = 1), vault_id TEXT NOT NULL, vault_generation TEXT NOT NULL, schema_version INTEGER NOT NULL CHECK(schema_version = 6), storage_format_version INTEGER NOT NULL CHECK(storage_format_version = 2), provisioned_at INTEGER NOT NULL);" +
-      "INSERT INTO vault_meta(id, vault_id, vault_generation, schema_version, storage_format_version, provisioned_at) VALUES (1, 'legacy-vault', 'legacy-generation', 6, 2, 50);" +
+      "CREATE TABLE vault_journal_chunks (sequence INTEGER NOT NULL, chunk_index INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY(sequence, chunk_index));" +
+      "CREATE TABLE vault_meta (id INTEGER PRIMARY KEY CHECK(id = 1), vault_id TEXT NOT NULL, vault_generation TEXT NOT NULL, schema_version INTEGER NOT NULL CHECK(schema_version = 6), storage_format_version INTEGER NOT NULL CHECK(storage_format_version = 3), provisioned_at INTEGER NOT NULL);" +
+      "INSERT INTO vault_meta(id, vault_id, vault_generation, schema_version, storage_format_version, provisioned_at) VALUES (1, 'legacy-vault', 'legacy-generation', 6, 3, 50);" +
       "CREATE TABLE settings_env (config_key TEXT PRIMARY KEY, env_rev INTEGER NOT NULL);" +
       "INSERT INTO settings_env(config_key, env_rev) VALUES ('obsidian', 3);" +
       "CREATE TABLE settings_files (config_key TEXT NOT NULL, path TEXT NOT NULL, sha256 TEXT NOT NULL, size INTEGER NOT NULL, rev INTEGER NOT NULL, body BLOB NOT NULL, PRIMARY KEY(config_key, path));" +
       "INSERT INTO settings_files(config_key, path, sha256, size, rev, body) VALUES ('obsidian', 'app.json', '${"a".repeat(64)}', 2, 3, '{}');"
     );
     sql.exec("INSERT INTO vault_journal(sequence, document_id, generation, kind, update_byte_length, created_at) VALUES (1, 'root', 1, 'root', ?, 100)", rootUpdate.byteLength);
-    sql.exec("INSERT INTO vault_journal_chunks(sequence, chunk_index, data) VALUES (1, 0, ?)", bytesToBase64Url(rootUpdate));
+    sql.exec("INSERT INTO vault_journal_chunks(sequence, chunk_index, data) VALUES (1, 0, ?)", rootUpdate.slice().buffer);
 
     const store = new VaultStore(this.state.storage);
     const input = {
@@ -158,11 +157,11 @@ s.test("schema-6 vault migration preserves history and atomically installs schem
 			authority: string;
 		};
 		s.check(result.replayExact && result.receipt.rootSequence === 2, "migration replays its exact durable receipt");
-		s.check(result.metadata.schemaVersion === 7 && result.metadata.storageFormatVersion === 2,
+		s.check(result.metadata.schemaVersion === 7 && result.metadata.storageFormatVersion === 3,
 			"vault_meta CHECK constraint is rebuilt for schema 7");
 		s.check(result.journal.join(",") === "1,2" && result.root.path === "kept-body",
 			"legacy journal and root content survive the schema transition");
-		s.check(result.root.schemaVersion === 7 && result.root.protocolVersion === 3
+		s.check(result.root.schemaVersion === 7 && result.root.protocolVersion === 4
 			&& result.root.historyAttribution === "legacy_unattributed",
 			"root advertises schema 7 while historical work remains explicitly unattributed");
 		s.check(result.settingsKey === "\u0001owner-principal\0obsidian"

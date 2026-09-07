@@ -19,6 +19,43 @@ export interface ControlPlaneTransactionPort {
 	get<T = unknown>(key: string): Promise<T | undefined>;
 	put(key: string, value: unknown): Promise<void>;
 	delete(key: string): Promise<boolean>;
+	readonly records?: ControlPlaneRecordTransactionPort;
+}
+
+export interface ControlPlaneRecordTransactionPort {
+	get<T = unknown>(collection: string, filter: ControlPlaneRecordFilter): Promise<T | undefined>;
+	upsert(collection: string, record: unknown): Promise<void>;
+	delete(collection: string, recordKey: string): Promise<boolean>;
+	deleteWhere(collection: string, filter: ControlPlaneRecordFilter): Promise<number>;
+	count(collection: string, filter?: ControlPlaneRecordFilter): Promise<number>;
+	append(collection: string, record: unknown, maximumRecords: number): Promise<void>;
+	list<T = unknown>(collection: string, options?: ControlPlaneRecordListOptions): Promise<T[]>;
+}
+
+export interface ControlPlaneRecordFilter {
+	recordKey?: string;
+	vaultId?: string;
+	vaultGeneration?: string;
+	principalId?: string;
+	deviceId?: string;
+	tokenHash?: string;
+	codeHash?: string;
+	pairingCodeHash?: string;
+	requestId?: string;
+	authorizationChangeId?: string;
+	state?: string;
+	role?: string;
+	purpose?: string;
+	consumed?: boolean;
+	expiresAfter?: number;
+	expiresAtOrBefore?: number;
+	createdBefore?: number;
+	completedAtOrBefore?: number;
+}
+
+export interface ControlPlaneRecordListOptions extends ControlPlaneRecordFilter {
+	limit?: number;
+	reverse?: boolean;
 }
 
 export interface ControlPlaneStoragePort {
