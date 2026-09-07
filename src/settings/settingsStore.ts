@@ -31,6 +31,24 @@ export interface VaultSyncSettings {
 	vaultId: string;
 	/** Server-minted device identifier for this enrollment. */
 	deviceId: string;
+	/** Stable vault-scoped person identity which owns this device. */
+	principalId: string;
+	/** Current server-owned person display name. */
+	principalDisplayName: string;
+	/** Stable server-owned seed shared by this person's cursor instances. */
+	principalColorSeed: string;
+	/** Fixed collaboration role; YAOS intentionally has no custom roles. */
+	vaultRole: VaultRole | "";
+	/** Exact membership revision which admitted this enrollment. */
+	membershipRevision: number;
+	/** Exact device credential revision which admitted this enrollment. */
+	deviceCredentialRevision: number;
+	/** Canonical fixed role-policy version. */
+	policyVersion: number;
+	/** Consistency evidence for the server-issued capability snapshot. */
+	capabilityDigest: string;
+	/** Server-issued UX planning facts; never an authorization source. */
+	authorityCapabilities: VaultCapability[];
 	/** Exact provisioned storage incarnation for this enrollment. */
 	vaultGeneration: string;
 	/** One-use authority for this folder to seed the newly provisioned vault. */
@@ -86,6 +104,15 @@ export const DEFAULT_SETTINGS: VaultSyncSettings = {
 	deviceToken: "",
 	vaultId: "",
 	deviceId: "",
+	principalId: "",
+	principalDisplayName: "",
+	principalColorSeed: "",
+	vaultRole: "",
+	membershipRevision: 0,
+	deviceCredentialRevision: 0,
+	policyVersion: 0,
+	capabilityDigest: "",
+	authorityCapabilities: [],
 	vaultGeneration: "",
 	originImportPending: false,
 	deviceName: "",
@@ -164,6 +191,9 @@ export function readVaultSyncSettings(
 ): { settings: VaultSyncSettings; migrated: boolean } {
 	const record = typeof data === "object" && data !== null ? data as Record<string, unknown> : {};
 	const settings = Object.assign({}, DEFAULT_SETTINGS, record);
+	settings.authorityCapabilities = Array.isArray(record.authorityCapabilities)
+		? [...record.authorityCapabilities] as VaultCapability[]
+		: [];
 	Reflect.deleteProperty(settings, "token");
 	let migrated = "token" in record;
 	const hasCompleteEnrollment = [
@@ -172,13 +202,49 @@ export function readVaultSyncSettings(
 		settings.vaultId,
 		settings.deviceId,
 		settings.vaultGeneration,
+		settings.principalId,
+		settings.principalDisplayName,
+		settings.principalColorSeed,
+		settings.vaultRole,
+		settings.capabilityDigest,
 	].every((value) => typeof value === "string" && value.trim().length > 0);
-	if (!hasCompleteEnrollment) {
+	let hasValidAuthority = false;
+	if (hasCompleteEnrollment) {
+		try {
+			const authority = readVaultAuthoritySnapshot({
+				vaultId: settings.vaultId,
+				vaultGeneration: settings.vaultGeneration,
+				principalId: settings.principalId,
+				membershipRevision: settings.membershipRevision,
+				deviceId: settings.deviceId,
+				deviceCredentialRevision: settings.deviceCredentialRevision,
+				role: settings.vaultRole,
+				policyVersion: settings.policyVersion,
+				capabilityDigest: settings.capabilityDigest,
+				capabilities: settings.authorityCapabilities,
+			});
+			settings.vaultRole = authority.role;
+			settings.authorityCapabilities = [...authority.capabilities];
+			hasValidAuthority = true;
+		} catch {
+			hasValidAuthority = false;
+		}
+	}
+	if (!hasCompleteEnrollment || !hasValidAuthority) {
 		if (settings.deviceToken || settings.vaultId || settings.deviceId || settings.vaultGeneration) migrated = true;
 		settings.deviceToken = "";
 		settings.vaultId = "";
 		settings.deviceId = "";
 		settings.vaultGeneration = "";
+		settings.principalId = "";
+		settings.principalDisplayName = "";
+		settings.principalColorSeed = "";
+		settings.vaultRole = "";
+		settings.membershipRevision = 0;
+		settings.deviceCredentialRevision = 0;
+		settings.policyVersion = 0;
+		settings.capabilityDigest = "";
+		settings.authorityCapabilities = [];
 		settings.originImportPending = false;
 	}
 	if (typeof settings.originImportPending !== "boolean") {
@@ -247,3 +313,8 @@ export class SettingsStore<TState extends Partial<VaultSyncSettings>> {
 		return next;
 	}
 }
+import {
+	readVaultAuthoritySnapshot,
+	type VaultCapability,
+	type VaultRole,
+} from "../collaboration/authority";

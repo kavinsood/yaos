@@ -30,7 +30,7 @@ import type {
 	StoredDocument,
 } from "./vaultIndexedDb";
 import { obsidianRequest, type HttpRequester } from "../utils/http";
-import { patchTicketInUrl, SocketTicketHttpError, TICKET_REFRESH_BUFFER_MS } from "./socketTicket";
+import { patchTicketInUrl, SocketTicketHttpError, TICKET_REFRESH_BUFFER_MS, type SocketTicketScope } from "./socketTicket";
 import { PROTOCOL_VERSION, SCHEMA_VERSION } from "./schema";
 import type { AttachmentHead, BlobMeta, BlobRef, BlobTombstone } from "../types";
 import { applyDiffToYText, tryApplyDiffToYText } from "./diff";
@@ -64,6 +64,7 @@ import {
 	type SocketLivenessSnapshot,
 } from "../runtime/socketLivenessCoordinator";
 import { fencedWebSocketConstructor } from "./fencedWebSocket";
+import { sameAuthorityIdentity, type VaultAuthorityIdentity } from "../collaboration/authority";
 export const ROOT_DOCUMENT_ID = "root";
 
 export interface SyncAwarenessPort {
@@ -100,7 +101,10 @@ export type FatalSyncCode =
 	| "server_misconfigured"
 	| "server_format_unsupported"
 	| "unclaimed"
-	| "update_required";
+	| "update_required"
+	| "authority_superseded"
+	| "membership_revoked"
+	| "device_revoked";
 export interface FatalSyncDetails {
 	clientSchemaVersion: number | null;
 	roomSchemaVersion: number | null;
@@ -384,6 +388,12 @@ export interface AttachmentPublicationReceipt {
 	rootGeneration: number;
 	rootUpdateBase64Url: string;
 }
+export interface CommittedOperationOutcome {
+	operationId: string;
+	requestDigest: string;
+	vaultSequence: number;
+	committed: true;
+}
 export type AttachmentIntentOutcome =
 	| { kind: "committed"; revision: string }
 	| { kind: "durably-pending"; operationId: string }
@@ -405,6 +415,13 @@ export class AttachmentPublicationError extends Error {
 	) {
 		super(`attachment publication failed (${status}: ${code})`);
 		this.name = "AttachmentPublicationError";
+	}
+}
+
+export class VaultMutationRequestError extends Error {
+	constructor(readonly status: number, readonly code: string, operation: string) {
+		super(`${operation} failed (${status}: ${code})`);
+		this.name = "VaultMutationRequestError";
 	}
 }
 
@@ -431,6 +448,11 @@ export interface VaultServerPort {
 		requests: readonly LifecycleRequest[],
 	): Promise<LifecycleBatchReceipt>;
 	publishAttachment(mutation: AttachmentPublicationMutation): Promise<AttachmentPublicationReceipt>;
+	committedOperationOutcome?(input: {
+		operationId: string;
+		requestDigest: string;
+		authority: VaultAuthorityIdentity;
+	}): Promise<CommittedOperationOutcome | null>;
 }
 
 export interface ProviderFactoryInput {
@@ -468,7 +490,7 @@ export interface VaultSyncOptions {
 	database: VaultDatabasePort;
 	server?: VaultServerPort;
 	providerFactory?: ProviderFactory;
-	getSocketTicket?: (force?: boolean) => Promise<SocketTicketResult | null>;
+	getSocketTicket?: (scope: SocketTicketScope, force?: boolean) => Promise<SocketTicketResult | null>;
 	request?: HttpRequester;
 	webSocket?: WebSocketImplementation;
 	maxLoadedBodies?: number;
@@ -490,6 +512,12 @@ export interface VaultSyncOptions {
 	) => void | Promise<void>;
 	onProductEvent?: (event: ProductFlightPathEventInput) => void;
 	onControlFrame?: (frame: VaultControlFrame) => void;
+	getAuthority?: () => VaultAuthorityIdentity;
+	onAuthoritySuperseded?: (
+		kind: "candidate" | "lifecycle" | "attachment",
+		identity: string,
+		authority: VaultAuthorityIdentity | null,
+	) => void;
 }
 
 interface BodySession {
@@ -549,6 +577,9 @@ const FATAL_CODES = new Set<FatalSyncCode>([
 	"server_format_unsupported",
 	"unclaimed",
 	"update_required",
+	"authority_superseded",
+	"membership_revoked",
+	"device_revoked",
 ]);
 const ORIGIN_DURABLE_ROOT_PUBLICATION = "durable-root-publication";
 
@@ -699,6 +730,27 @@ function asBodyCommittedNotification(payload: string): BodyCommittedNotification
 async function sha256Hex(bytes: Uint8Array): Promise<string> {
 	const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes.slice().buffer));
 	return Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function canonicalOperationJson(value: unknown): string {
+	if (value === null || typeof value === "boolean" || typeof value === "string") return JSON.stringify(value);
+	if (typeof value === "number" && Number.isSafeInteger(value)) return Object.is(value, -0) ? "0" : String(value);
+	if (Array.isArray(value)) return `[${value.map(canonicalOperationJson).join(",")}]`;
+	if (!value || typeof value !== "object") throw new Error("operation digest contains an unsupported value");
+	const record = value as Record<string, unknown>;
+	return `{${Object.keys(record).filter((key) => record[key] !== undefined).sort().map((key) => `${JSON.stringify(key)}:${canonicalOperationJson(record[key])}`).join(",")}}`;
+}
+
+async function operationRequestDigest(value: unknown): Promise<string> {
+	return sha256Hex(new TextEncoder().encode(canonicalOperationJson(value)));
+}
+
+function mutationRequestError(response: { status: number; json?: unknown }, operation: string): VaultMutationRequestError {
+	const value = response.json;
+	const code = value && typeof value === "object" && "error" in value && typeof value.error === "string"
+		? value.error
+		: "request_failed";
+	return new VaultMutationRequestError(response.status, code, operation);
 }
 function bytesToBase64(bytes: Uint8Array): string {
 	let binary = "";
@@ -866,7 +918,7 @@ export class VaultSyncHttpPort implements VaultServerPort {
 				"x-yaos-candidate-digest": record.candidateDigest,
 			},
 		});
-		if (response.status !== 200) throw new Error(`body candidate request failed (${response.status})`);
+		if (response.status !== 200) throw mutationRequestError(response, "body candidate request");
 		return response.json as BodyReceipt;
 	}
 
@@ -878,9 +930,7 @@ export class VaultSyncHttpPort implements VaultServerPort {
 			body: JSON.stringify(request),
 			headers: this.headers(),
 		});
-		if (response.status !== 200) {
-			throw new Error(`lifecycle commit failed (${response.status})`);
-		}
+		if (response.status !== 200) throw mutationRequestError(response, "lifecycle commit");
 		return response.json as LifecycleReceipt;
 	}
 
@@ -895,7 +945,7 @@ export class VaultSyncHttpPort implements VaultServerPort {
 			headers: this.headers(),
 		});
 		if (response.status !== 200) {
-			throw new Error(`lifecycle batch commit failed (${response.status})`);
+			throw mutationRequestError(response, "lifecycle batch commit");
 		}
 		return response.json as LifecycleBatchReceipt;
 	}
@@ -940,6 +990,32 @@ export class VaultSyncHttpPort implements VaultServerPort {
 			);
 		}
 		return response.json as AttachmentPublicationReceipt;
+	}
+
+	async committedOperationOutcome(input: {
+		operationId: string;
+		requestDigest: string;
+		authority: VaultAuthorityIdentity;
+	}): Promise<CommittedOperationOutcome | null> {
+		const query = new URLSearchParams({
+			requestDigest: input.requestDigest,
+			membershipRevision: String(input.authority.membershipRevision),
+			deviceCredentialRevision: String(input.authority.deviceCredentialRevision),
+			deviceId: input.authority.deviceId,
+		});
+		const response = await this.request({
+			url: `${this.route(`operations/${encodeURIComponent(input.operationId)}/outcome`)}?${query}`,
+			method: "GET",
+			headers: this.headers(),
+		});
+		if (response.status === 404 && (response.json as { error?: unknown } | undefined)?.error === "operation_outcome_not_found") return null;
+		if (response.status !== 200) throw new Error(`operation outcome request failed (${response.status})`);
+		const value = response.json as Partial<CommittedOperationOutcome> | null;
+		if (!value || value.operationId !== input.operationId || value.requestDigest !== input.requestDigest
+			|| value.committed !== true || !Number.isSafeInteger(value.vaultSequence) || value.vaultSequence! < 0) {
+			throw new Error("operation outcome proof mismatch");
+		}
+		return value as CommittedOperationOutcome;
 	}
 
 	private route(resource: string): string {
@@ -1318,6 +1394,7 @@ export class VaultSync implements SyncRuntimePort {
 			throw new Error("atomic lifecycle batch cleanup is unavailable");
 		}
 		const batchId = requests.length > 1 ? crypto.randomUUID() : null;
+		const capturedAuthority = this.captureAuthority();
 		for (let index = 0; index < requests.length; index++) {
 			const request = requests[index]!;
 			this.assertLifecyclePaths(request);
@@ -1329,11 +1406,32 @@ export class VaultSync implements SyncRuntimePort {
 			}
 			await save.call(this.options.database, {
 				...this.toStoredLifecycleOperation(request),
+				authority: capturedAuthority,
 				batchId,
 				batchIndex: batchId ? index : null,
 			});
 		}
-		const receipts = await this.commitLifecycleRequests(requests);
+		if (!this.isCapturedAuthorityCurrent(capturedAuthority)) {
+			const recovered = await this.recoverLifecycleReceipts(requests, requests.map(() => capturedAuthority));
+			if (recovered) {
+				await this.publishLifecycleRoot(requests, recovered);
+				if (requests.length > 1) await removeBatch!.call(this.options.database, requests.map((request) => request.operationId));
+				else await remove.call(this.options.database, requests[0]!.operationId);
+				return recovered;
+			}
+			for (const request of requests) this.noteAuthoritySuperseded("lifecycle", request.operationId, capturedAuthority);
+			throw new Error("authority_superseded");
+		}
+		let receipts: LifecycleReceipt[];
+		try {
+			receipts = await this.commitLifecycleRequests(requests);
+		} catch (error) {
+			const recovered = this.shouldQueryOperationOutcome(error)
+				? await this.recoverLifecycleReceipts(requests, requests.map(() => capturedAuthority))
+				: null;
+			if (!recovered) throw error;
+			receipts = recovered;
+		}
 		await this.publishLifecycleRoot(requests, receipts);
 		if (requests.length > 1) {
 			await removeBatch!.call(
@@ -1516,6 +1614,7 @@ export class VaultSync implements SyncRuntimePort {
 			createdAt: this.now(),
 			attempts: 0,
 			lastAttemptAt: null,
+			authority: this.captureAuthority(),
 		};
 		if (!existing) {
 			// Reserve the projected head before awaiting IndexedDB. A delete or
@@ -1615,6 +1714,12 @@ export class VaultSync implements SyncRuntimePort {
 	private async publishStoredAttachmentOperation(
 		operation: StoredAttachmentPublicationOperation,
 	): Promise<void> {
+		if (!this.isCapturedAuthorityCurrent(operation.authority)) {
+			if (await this.recoverAttachmentOutcome(operation)) return;
+			this.noteAuthoritySuperseded("attachment", operation.mutation.operationId, operation.authority);
+			this.attachmentOperations.delete(operation.mutation.operationId);
+			return;
+		}
 		const attempted = {
 			...operation,
 			attempts: operation.attempts + 1,
@@ -1623,7 +1728,13 @@ export class VaultSync implements SyncRuntimePort {
 		const storedAttempt = await this.options.database.putAttachmentOperation(attempted);
 		this.assertStoredAttachmentOperation(attempted, storedAttempt);
 		this.attachmentOperations.set(storedAttempt.mutation.operationId, storedAttempt);
-		const receipt = await this.server.publishAttachment(attempted.mutation);
+		let receipt: AttachmentPublicationReceipt;
+		try {
+			receipt = await this.server.publishAttachment(attempted.mutation);
+		} catch (error) {
+			if (this.shouldQueryAttachmentOutcome(error) && await this.recoverAttachmentOutcome(attempted)) return;
+			throw error;
+		}
 		await this.applyAttachmentPublication(attempted.mutation, receipt);
 		await this.options.database.deleteAttachmentOperation(attempted.mutation.operationId);
 		this.attachmentOperations.delete(attempted.mutation.operationId);
@@ -1648,6 +1759,11 @@ export class VaultSync implements SyncRuntimePort {
 		const sequences = new Set<number>();
 		for (const operation of operations) {
 			this.assertAttachmentOperationScope(operation);
+			if (!this.isCapturedAuthorityCurrent(operation.authority)) {
+				if (await this.recoverAttachmentOutcome(operation)) continue;
+				this.noteAuthoritySuperseded("attachment", operation.mutation.operationId, operation.authority);
+				continue;
+			}
 			this.assertAttachmentMutation(operation.mutation);
 			if (!Number.isSafeInteger(operation.localSequence) || operation.localSequence <= 0
 				|| sequences.has(operation.localSequence)) {
@@ -1660,6 +1776,35 @@ export class VaultSync implements SyncRuntimePort {
 			}
 			this.attachmentOperations.set(operation.mutation.operationId, operation);
 		}
+	}
+
+	private shouldQueryAttachmentOutcome(error: unknown): boolean {
+		return this.shouldQueryOperationOutcome(error);
+	}
+
+	private async recoverAttachmentOutcome(operation: StoredAttachmentPublicationOperation): Promise<boolean> {
+		const outcome = await this.exactCommittedOutcome(
+			operation.mutation.operationId,
+			await operationRequestDigest(operation.mutation),
+			operation.authority,
+		);
+		if (!outcome) return false;
+		await this.options.database.deleteAttachmentOperation(operation.mutation.operationId);
+		this.attachmentOperations.delete(operation.mutation.operationId);
+		this.fatalAttachmentPublicationIds.delete(operation.mutation.operationId);
+		if (this.attachmentOutcomeWaiters.has(operation.mutation.operationId)) {
+			this.attachmentTerminalOutcomes.set(operation.mutation.operationId, {
+				kind: "committed",
+				revision: operation.mutation.operationId,
+			});
+		}
+		await this.options.onAttachmentReconciliationRequired?.(
+			this.attachmentMutationPaths(operation.mutation),
+			"revision-mismatch",
+		);
+		this.emitAttachmentPublicationEvent(PRODUCT_EVENT_KIND.attachmentPublicationReplayed, operation, "info");
+		this.log(`attachment ${operation.mutation.operationId} settled from exact committed outcome at sequence ${outcome.vaultSequence}`);
+		return true;
 	}
 
 	private assertStoredAttachmentOperation(
@@ -3847,6 +3992,7 @@ export class VaultSync implements SyncRuntimePort {
 			encodedUpdate: encodedUpdate.slice().buffer,
 			capturedAt,
 			capturedLocalUpdates,
+			authority: this.captureAuthority(),
 		};
 		await this.bodies.markDirty(bodyId);
 		await this.persistCandidate(record);
@@ -3888,9 +4034,29 @@ export class VaultSync implements SyncRuntimePort {
 	private async performCandidateSubmission(
 		candidate: PendingCandidate,
 	): Promise<BodyReceipt> {
+		if (!this.isCapturedAuthorityCurrent(candidate.record.authority)) {
+			const recovered = await this.recoverCandidateOutcome(candidate);
+			if (recovered) return recovered;
+			this.noteAuthoritySuperseded("candidate", candidate.record.candidateId, candidate.record.authority);
+			this.pendingCandidates.delete(candidate.record.candidateId);
+			throw new Error("authority_superseded");
+		}
 		await this.waitForSubmissionWindow();
-		const receipt = await this.server.submitCandidate(candidate.record);
-		return this.completeCandidateSubmission(candidate, receipt);
+		if (!this.isCapturedAuthorityCurrent(candidate.record.authority)) {
+			const recovered = await this.recoverCandidateOutcome(candidate);
+			if (recovered) return recovered;
+			this.noteAuthoritySuperseded("candidate", candidate.record.candidateId, candidate.record.authority);
+			this.pendingCandidates.delete(candidate.record.candidateId);
+			throw new Error("authority_superseded");
+		}
+		try {
+			const receipt = await this.server.submitCandidate(candidate.record);
+			return this.completeCandidateSubmission(candidate, receipt);
+		} catch (error) {
+			const recovered = this.shouldQueryOperationOutcome(error) ? await this.recoverCandidateOutcome(candidate) : null;
+			if (recovered) return recovered;
+			throw error;
+		}
 	}
 
 	private async completeCandidateSubmission(
@@ -3964,6 +4130,12 @@ export class VaultSync implements SyncRuntimePort {
 		if (!list) return;
 		try {
 			for (const record of await list.call(this.options.database)) {
+				if (!this.isCapturedAuthorityCurrent(record.authority)) {
+					const candidate: PendingCandidate = { record, submission: null, path: this.pathForBodyId(record.bodyId) };
+					if (await this.recoverCandidateOutcome(candidate)) continue;
+					this.noteAuthoritySuperseded("candidate", record.candidateId, record.authority);
+					continue;
+				}
 				this.pendingCandidates.set(record.candidateId, {
 					record,
 					submission: null,
@@ -3977,6 +4149,77 @@ export class VaultSync implements SyncRuntimePort {
 		} catch (error) {
 			this.noteCandidatePersistenceFailure(error);
 		}
+	}
+
+	private captureAuthority(): VaultAuthorityIdentity | undefined {
+		return this.options.getAuthority?.();
+	}
+
+	private isCapturedAuthorityCurrent(captured: VaultAuthorityIdentity | undefined): boolean {
+		const getAuthority = this.options.getAuthority;
+		if (!getAuthority) return true;
+		if (!captured) return false;
+		try {
+			return sameAuthorityIdentity(captured, getAuthority());
+		} catch {
+			return false;
+		}
+	}
+
+	private noteAuthoritySuperseded(
+		kind: "candidate" | "lifecycle" | "attachment",
+		identity: string,
+		authority: VaultAuthorityIdentity | undefined,
+	): void {
+		this.options.onAuthoritySuperseded?.(kind, identity, authority ?? null);
+		this.log(`${kind} ${identity} preserved under superseded authority`);
+	}
+
+	private async exactCommittedOutcome(
+		operationId: string,
+		requestDigest: string,
+		authority: VaultAuthorityIdentity | undefined,
+	): Promise<CommittedOperationOutcome | null> {
+		if (!authority || !this.server.committedOperationOutcome) return null;
+		try {
+			return await this.server.committedOperationOutcome({ operationId, requestDigest, authority });
+		} catch (error) {
+			this.log(`exact operation outcome remains unknown for ${operationId}: ${String(error)}`);
+			return null;
+		}
+	}
+
+	private shouldQueryOperationOutcome(error: unknown): boolean {
+		if (!(error instanceof VaultMutationRequestError) && !(error instanceof AttachmentPublicationError)) return true;
+		return error.status >= 500 || error.status === 401 || error.status === 403
+			|| error.code === "authority_superseded" || error.code === "membership_revoked" || error.code === "device_revoked";
+	}
+
+	private async recoverCandidateOutcome(candidate: PendingCandidate): Promise<BodyReceipt | null> {
+		const outcome = await this.exactCommittedOutcome(
+			candidate.record.candidateId,
+			candidate.record.candidateDigest,
+			candidate.record.authority,
+		);
+		if (!outcome) return null;
+		const body = await this.loadBodyWithPriority(candidate.record.bodyId, "background", true);
+		if (!this.pendingCandidates.has(candidate.record.candidateId)) {
+			this.pendingCandidates.set(candidate.record.candidateId, candidate);
+			this.bodies.markUnsettled(candidate.record.bodyId);
+		}
+		const receipt: BodyReceipt = {
+			vaultId: candidate.record.vaultId,
+			vaultGeneration: this.options.vaultGeneration,
+			bodyId: candidate.record.bodyId,
+			clientId: candidate.record.authority?.deviceId ?? this.options.deviceId,
+			candidateId: candidate.record.candidateId,
+			candidateDigest: candidate.record.candidateDigest,
+			durableGeneration: body.generation,
+			runtimeEpoch: `outcome:${outcome.vaultSequence}`,
+		};
+		await this.completeCandidateSubmission(candidate, receipt);
+		this.log(`candidate ${candidate.record.candidateId} settled from exact committed outcome`);
+		return receipt;
 	}
 	private async persistCandidate(record: CandidateRecord): Promise<void> {
 		const save = this.options.database.putCandidate;
@@ -4009,6 +4252,21 @@ export class VaultSync implements SyncRuntimePort {
 		}
 		for (const group of groups.values()) {
 			group.sort((left, right) => (left.batchIndex ?? 0) - (right.batchIndex ?? 0));
+			if (group.some((operation) => !this.isCapturedAuthorityCurrent(operation.authority))) {
+				const requests = group.map((operation) => this.fromStoredLifecycleOperation(operation));
+				const recovered = await this.recoverLifecycleReceipts(requests, group.map((operation) => operation.authority));
+				if (recovered) {
+					try {
+						await this.publishLifecycleRoot(requests, recovered);
+						await this.deleteLifecycleGroup(group);
+						continue;
+					} catch (error) {
+						this.log(`recovered lifecycle root publication remains pending: ${String(error)}`);
+					}
+				}
+				for (const operation of group) this.noteAuthoritySuperseded("lifecycle", operation.operationId, operation.authority);
+				continue;
+			}
 			await this.retryLifecycleGroup(group);
 		}
 	}
@@ -4032,6 +4290,21 @@ export class VaultSync implements SyncRuntimePort {
 		for (const operation of attempted) {
 			await save.call(this.options.database, operation);
 		}
+		if (attempted.some((operation) => !this.isCapturedAuthorityCurrent(operation.authority))) {
+			const requests = attempted.map((operation) => this.fromStoredLifecycleOperation(operation));
+			const recovered = await this.recoverLifecycleReceipts(requests, attempted.map((operation) => operation.authority));
+			if (recovered) {
+				try {
+					await this.publishLifecycleRoot(requests, recovered);
+					await this.deleteLifecycleGroup(attempted);
+					return;
+				} catch (error) {
+					this.log(`recovered lifecycle root publication remains pending: ${String(error)}`);
+				}
+			}
+			for (const operation of attempted) this.noteAuthoritySuperseded("lifecycle", operation.operationId, operation.authority);
+			return;
+		}
 		const requests = attempted.map((operation) => this.fromStoredLifecycleOperation(operation));
 		try {
 			for (let index = 0; index < attempted.length; index++) {
@@ -4039,7 +4312,8 @@ export class VaultSync implements SyncRuntimePort {
 				if (operation.kind !== "create" || operation.content === null) continue;
 				const request = requests[index]!;
 				let pending = Array.from(this.pendingCandidates.values()).find(
-					(candidate) => candidate.record.bodyId === operation.bodyId,
+					(candidate) => candidate.record.bodyId === operation.bodyId
+						&& (!operation.candidateId || candidate.record.candidateId === operation.candidateId),
 				);
 				if (!pending) {
 					const body = await this.loadBodyWithPriority(operation.bodyId, "background", true);
@@ -4060,6 +4334,9 @@ export class VaultSync implements SyncRuntimePort {
 				}
 				request.candidateId = pending.record.candidateId;
 				request.candidateDigest = pending.record.candidateDigest;
+				operation.candidateId = pending.record.candidateId;
+				operation.candidateDigest = pending.record.candidateDigest;
+				await save.call(this.options.database, operation);
 			}
 			const receipts = await this.commitLifecycleRequests(requests);
 			for (const operation of attempted) {
@@ -4095,8 +4372,52 @@ export class VaultSync implements SyncRuntimePort {
 				await remove.call(this.options.database, attempted[0]!.operationId);
 			}
 		} catch (error) {
+			const recovered = this.shouldQueryOperationOutcome(error)
+				? await this.recoverLifecycleReceipts(requests, attempted.map((operation) => operation.authority))
+				: null;
+			if (recovered) {
+				try {
+					await this.publishLifecycleRoot(requests, recovered);
+					await this.deleteLifecycleGroup(attempted);
+					this.log(`lifecycle group settled from exact committed outcomes`);
+					return;
+				} catch (publicationError) {
+					this.log(`recovered lifecycle root publication remains pending: ${String(publicationError)}`);
+				}
+			}
 			this.log(`lifecycle replay remains pending: ${String(error)}`);
 		}
+	}
+
+	private async recoverLifecycleReceipts(
+		requests: readonly LifecycleRequest[],
+		authorities: readonly (VaultAuthorityIdentity | undefined)[],
+	): Promise<LifecycleReceipt[] | null> {
+		if (requests.length !== authorities.length) return null;
+		const outcomes = await Promise.all(requests.map(async (request, index) => this.exactCommittedOutcome(
+			request.operationId,
+			await operationRequestDigest(request),
+			authorities[index],
+		)));
+		if (outcomes.some((outcome) => outcome === null)) return null;
+		return outcomes.map((outcome, index) => ({
+			vaultId: this.options.vaultId,
+			vaultGeneration: this.options.vaultGeneration,
+			bodyId: requests[index]!.bodyId,
+			operationId: requests[index]!.operationId,
+			kind: requests[index]!.kind,
+			durableGeneration: this.bodies.get(requests[index]!.bodyId)?.generation ?? 0,
+			vaultSequence: outcome!.vaultSequence,
+			runtimeEpoch: `outcome:${outcome!.vaultSequence}`,
+		}));
+	}
+
+	private async deleteLifecycleGroup(operations: readonly StoredLifecycleOperation[]): Promise<void> {
+		if (operations.length > 1 && this.options.database.deleteLifecycleOperations) {
+			await this.options.database.deleteLifecycleOperations(operations.map((operation) => operation.operationId));
+			return;
+		}
+		for (const operation of operations) await this.options.database.deleteLifecycleOperation?.(operation.operationId);
 	}
 
 	private async cancelFreshAdmission(
@@ -4129,9 +4450,12 @@ export class VaultSync implements SyncRuntimePort {
 			path,
 			previousPath: request.fromPath ?? null,
 			content: null,
+			...(request.candidateId ? { candidateId: request.candidateId } : {}),
+			...(request.candidateDigest ? { candidateDigest: request.candidateDigest } : {}),
 			createdAt: this.now(),
 			attempts: 0,
 			lastAttemptAt: null,
+			authority: this.captureAuthority(),
 		};
 	}
 
@@ -4144,6 +4468,8 @@ export class VaultSync implements SyncRuntimePort {
 			path: operation.kind === "rename" ? undefined : operation.path,
 			fromPath: operation.previousPath ?? undefined,
 			toPath: operation.kind === "rename" ? operation.path : undefined,
+			candidateId: operation.candidateId,
+			candidateDigest: operation.candidateDigest,
 		};
 	}
 
@@ -4387,7 +4713,7 @@ export class VaultSync implements SyncRuntimePort {
 				if (!this.options.getSocketTicket) {
 					throw new Error("a short-lived socket ticket is required");
 				}
-				const ticket = await this.options.getSocketTicket();
+				const ticket = await this.options.getSocketTicket({ purpose: input.kind, documentId: input.documentId });
 				if (!ticket) throw new Error("socket ticket request returned no ticket");
 				this.scheduleTicketRefresh(ticket);
 				return {
@@ -4422,13 +4748,10 @@ export class VaultSync implements SyncRuntimePort {
 			return { value: "provider-factory", expiresAt: Number.MAX_SAFE_INTEGER, localExpiresAt: Number.MAX_SAFE_INTEGER, ttlMs: Number.MAX_SAFE_INTEGER };
 		}
 		if (this.destroyed || this.fatalAuthError || !epoch.isCurrent()) throw new Error("socket admission superseded");
-		const ticket = await this.options.getSocketTicket(force);
+		const ticket = await this.options.getSocketTicket({ purpose: "root", documentId: ROOT_DOCUMENT_ID }, force);
 		if (this.destroyed || this.fatalAuthError || !epoch.isCurrent()) throw new Error("socket admission superseded");
 		if (!ticket) throw new Error("socket ticket request returned no ticket");
 		this.provider.url = patchTicketInUrl(this.provider.url, ticket.value);
-		for (const session of this.sessions.values()) {
-			session.provider.url = patchTicketInUrl(session.provider.url, ticket.value);
-		}
 		this.scheduleTicketRefresh(ticket);
 		return ticket;
 	}

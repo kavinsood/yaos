@@ -75,6 +75,9 @@ function makeCtx(opts: {
 		vaultGeneration: "generation",
 		folderKey: "folder",
 		deviceId: "device",
+		principalId: "principal",
+		membershipRevision: 1,
+		deviceCredentialRevision: 1,
 		configDirKey: ".obsidian",
 		indexedDb: opts.indexedDb,
 		beforeStep: opts.beforeStep,
@@ -134,7 +137,7 @@ s.test("persist then resume after simulated crash mid-batch", async () => {
 	s.check(!files.has(".obsidian/daily-notes.json"), "tail of the batch is unapplied after crash");
 
 	const leftover = await loadApplyQueue(
-		{ hostHash: "host", vaultId: "vault", vaultGeneration: "generation", folderKey: "folder", deviceId: "device", configDirKey: ".obsidian", indexedDb },
+		{ hostHash: "host", vaultId: "vault", vaultGeneration: "generation", folderKey: "folder", deviceId: "device", principalId: "principal", membershipRevision: 1, deviceCredentialRevision: 1, configDirKey: ".obsidian", indexedDb },
 	);
 	s.check(leftover !== null, "queue record survives the crash in IndexedDB");
 	s.check(leftover !== null && leftover.nextIndex === 1, "checkpoint is the first unrun step");
@@ -147,7 +150,7 @@ s.test("persist then resume after simulated crash mid-batch", async () => {
 	s.check(files.get(".obsidian/graph.json") === '{"a":1}', "already-landed file is kept");
 
 	const after = await loadApplyQueue(
-		{ hostHash: "host", vaultId: "vault", vaultGeneration: "generation", folderKey: "folder", deviceId: "device", configDirKey: ".obsidian", indexedDb },
+		{ hostHash: "host", vaultId: "vault", vaultGeneration: "generation", folderKey: "folder", deviceId: "device", principalId: "principal", membershipRevision: 1, deviceCredentialRevision: 1, configDirKey: ".obsidian", indexedDb },
 	);
 	s.check(after === null, "finished queue is cleared from IndexedDB");
 });
@@ -292,7 +295,7 @@ s.test("backgrounded device pauses at installPlugin and resumes later", async ()
 	s.check(files.get(".obsidian/graph.json") === "{}", "file LWW runs while backgrounded");
 	s.check(installs.length === 0, "installPlugin is not called while hidden");
 	const leftover = await loadApplyQueue(
-		{ hostHash: "host", vaultId: "vault", vaultGeneration: "generation", folderKey: "folder", deviceId: "device", configDirKey: ".obsidian", indexedDb },
+		{ hostHash: "host", vaultId: "vault", vaultGeneration: "generation", folderKey: "folder", deviceId: "device", principalId: "principal", membershipRevision: 1, deviceCredentialRevision: 1, configDirKey: ".obsidian", indexedDb },
 	);
 	s.check(leftover !== null && leftover.nextIndex === 1, "install step stays queued while hidden");
 

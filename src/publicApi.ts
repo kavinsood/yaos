@@ -12,6 +12,49 @@ export type YaosPublicProjectionOwner = "editor" | "disk" | "recovery";
 export type YaosPublicSynchronization = "clean" | "locally-pending" | "durably-pending" | "catching-up";
 export type YaosPublicDivergence = "none" | "evaluating" | "preserved" | "decision-required";
 export type YaosPublicLifetime = "accepting" | "quiescing" | "disposed";
+export type YaosPublicVaultRole = "owner" | "member";
+export type YaosPublicAuthorityState = "active" | "refreshing" | "changing" | "revoked" | "incompatible";
+
+export interface YaosPublicPrincipal {
+	readonly principalId: string;
+	readonly displayName: string;
+	readonly role: YaosPublicVaultRole;
+	readonly state: "active" | "changing" | "revoking" | "revoked";
+	readonly deviceCount: number;
+	readonly lastSeenAt: number | null;
+}
+
+export interface YaosPublicPresence {
+	readonly principalId: string;
+	readonly deviceId: string;
+	readonly displayName: string;
+	readonly deviceName: string;
+}
+
+export interface YaosPublicOwnershipTransfer {
+	readonly transferId: string;
+	readonly fromPrincipalId: string;
+	readonly toPrincipalId: string;
+	readonly createdAt: number;
+	readonly expiresAt: number;
+}
+
+export interface YaosPublicCollaboration {
+	readonly authorityState: YaosPublicAuthorityState;
+	readonly principalId: string | null;
+	readonly displayName: string | null;
+	readonly deviceId: string | null;
+	readonly deviceName: string | null;
+	readonly role: YaosPublicVaultRole | null;
+	readonly membershipRevision: number | null;
+	readonly deviceCredentialRevision: number | null;
+	readonly policyVersion: number | null;
+	readonly capabilities: readonly string[];
+	readonly members: readonly YaosPublicPrincipal[];
+	readonly presence: readonly YaosPublicPresence[];
+	readonly ownershipTransfers: readonly YaosPublicOwnershipTransfer[];
+	readonly preservedUnpublishedWork: number;
+}
 
 export interface YaosPublicBodyState {
 	readonly contentRevision: number;
@@ -57,13 +100,15 @@ export interface YaosPublicCounts {
 /** The snapshot supplied by YAOS's runtime projection, before API metadata. */
 export interface YaosPublicSnapshotInput {
 	readonly availability: YaosPublicAvailability;
+	readonly collaboration?: YaosPublicCollaboration;
 	readonly files: readonly YaosPublicFileState[];
 	readonly counts: YaosPublicCounts;
 }
 
-export interface YaosPublicSnapshot extends YaosPublicSnapshotInput {
+export interface YaosPublicSnapshot extends Omit<YaosPublicSnapshotInput, "collaboration"> {
 	readonly apiVersion: 0;
 	readonly revision: number;
+	readonly collaboration: YaosPublicCollaboration;
 }
 
 export interface YaosPublicSnapshotEvent {
@@ -155,11 +200,46 @@ function copyCounts(counts: YaosPublicCounts): YaosPublicCounts {
 	});
 }
 
+function copyCollaboration(collaboration: YaosPublicCollaboration): YaosPublicCollaboration {
+	return Object.freeze({
+		authorityState: collaboration.authorityState,
+		principalId: collaboration.principalId,
+		displayName: collaboration.displayName,
+		deviceId: collaboration.deviceId,
+		deviceName: collaboration.deviceName,
+		role: collaboration.role,
+		membershipRevision: collaboration.membershipRevision,
+		deviceCredentialRevision: collaboration.deviceCredentialRevision,
+		policyVersion: collaboration.policyVersion,
+		capabilities: Object.freeze([...collaboration.capabilities]),
+		members: Object.freeze(collaboration.members.map((member) => Object.freeze({ ...member }))),
+		presence: Object.freeze(collaboration.presence.map((instance) => Object.freeze({ ...instance }))),
+		ownershipTransfers: Object.freeze(collaboration.ownershipTransfers.map((transfer) => Object.freeze({ ...transfer }))),
+		preservedUnpublishedWork: collaboration.preservedUnpublishedWork,
+	});
+}
+
 function snapshotCopy(input: YaosPublicSnapshotInput, revision: number): YaosPublicSnapshot {
 	return Object.freeze({
 		apiVersion: 0 as const,
 		revision,
 		availability: input.availability,
+		collaboration: copyCollaboration(input.collaboration ?? {
+			authorityState: "refreshing",
+			principalId: null,
+			displayName: null,
+			deviceId: null,
+			deviceName: null,
+			role: null,
+			membershipRevision: null,
+			deviceCredentialRevision: null,
+			policyVersion: null,
+			capabilities: [],
+			members: [],
+			presence: [],
+			ownershipTransfers: [],
+			preservedUnpublishedWork: 0,
+		}),
 		files: Object.freeze(input.files.map(copyFile)),
 		counts: copyCounts(input.counts),
 	});

@@ -11,6 +11,34 @@ const s = suite("public-api");
 function state(path = "Notes/alpha.md", bodyId = "body-alpha"): YaosPublicSnapshotInput {
 	return {
 		availability: "ready",
+		collaboration: {
+			authorityState: "active",
+			principalId: "principal-alice",
+			displayName: "Alice",
+			deviceId: "device-laptop",
+			deviceName: "Laptop",
+			role: "member",
+			membershipRevision: 3,
+			deviceCredentialRevision: 2,
+			policyVersion: 1,
+			capabilities: ["vault.content.read", "vault.content.write"],
+			members: [{
+				principalId: "principal-alice",
+				displayName: "Alice",
+				role: "member",
+				state: "active",
+				deviceCount: 1,
+				lastSeenAt: 100,
+			}],
+			presence: [{
+				principalId: "principal-alice",
+				deviceId: "device-laptop",
+				displayName: "Alice",
+				deviceName: "Laptop",
+			}],
+			ownershipTransfers: [],
+			preservedUnpublishedWork: 0,
+		},
 		files: [{
 			path,
 			bodyId,
@@ -55,6 +83,8 @@ s.test("snapshots are whitelisted, deeply frozen, and independent of source muta
 	assert.equal(Object.isFrozen(snapshot), true);
 	assert.equal(Object.isFrozen(snapshot.files), true);
 	assert.equal(Object.isFrozen(snapshot.files[0]!.body), true);
+	assert.equal(Object.isFrozen(snapshot.collaboration), true);
+	assert.equal(Object.isFrozen(snapshot.collaboration.members), true);
 	assert.throws(() => {
 		(snapshot.files[0]!.body as { contentRevision: number }).contentRevision = 100;
 	}, TypeError);
@@ -101,7 +131,7 @@ s.test("file lookups expose only safe projected values", () => {
 	assert.equal(api.getFile("missing.md"), null);
 	assert.equal(api.getFileByBodyId("missing"), null);
 	const keys = Object.keys(api.getSnapshot()).sort();
-	assert.deepEqual(keys, ["apiVersion", "availability", "counts", "files", "revision"]);
+	assert.deepEqual(keys, ["apiVersion", "availability", "collaboration", "counts", "files", "revision"]);
 });
 
 s.test("a disposed plugin instance fences retained handles and stops callbacks", () => {

@@ -22,6 +22,7 @@ export interface CommandsRuntimeHost {
 	isSettingsSyncDebugEnabled(): boolean;
 	runSettingsSyncInstallSmoke(): Promise<void>;
 	runSettingsSyncCommand(action: "apply" | "replace" | "seed" | "take" | "defer"): Promise<void>;
+	canManageRecovery?(): boolean;
 }
 
 export function registerCommands(
@@ -83,39 +84,49 @@ export function registerCommands(
 	registrar.addCommand({
 		id: "snapshot-now",
 		name: "Take snapshot now",
-		callback: async () => {
-			await host.getSnapshotService()?.takeSnapshotNow();
+		checkCallback: (checking) => {
+			if (host.canManageRecovery?.() === false) return false;
+			if (!checking) void host.getSnapshotService()?.takeSnapshotNow();
+			return true;
 		},
 	});
 
 	registrar.addCommand({
 		id: "recovery-status",
 		name: "Show recovery readiness and job status",
-		callback: async () => {
-			await host.getSnapshotService()?.showRecoveryStatus();
+		checkCallback: (checking) => {
+			if (host.canManageRecovery?.() === false) return false;
+			if (!checking) void host.getSnapshotService()?.showRecoveryStatus();
+			return true;
 		},
 	});
 
 	registrar.addCommand({
 		id: "snapshot-list",
 		name: "Browse and restore snapshots",
-		callback: async () => {
-			await host.getSnapshotService()?.showSnapshotList();
+		checkCallback: (checking) => {
+			if (host.canManageRecovery?.() === false) return false;
+			if (!checking) void host.getSnapshotService()?.showSnapshotList();
+			return true;
 		},
 	});
 
 	registrar.addCommand({
 		id: "snapshot-prune",
 		name: "Cleanup old snapshots (apply retention policy)",
-		callback: async () => {
-			await host.getSnapshotService()?.pruneSnapshots();
+		checkCallback: (checking) => {
+			if (host.canManageRecovery?.() === false) return false;
+			if (!checking) void host.getSnapshotService()?.pruneSnapshots();
+			return true;
 		},
 	});
 	registrar.addCommand({
 		id: "restart-interrupted-restore",
 		name: "Resume interrupted restore",
-		callback: async () => {
-			await host.restartPendingRestore();
+		checkCallback: (checking) => {
+			if (host.canManageRecovery?.() === false) return false;
+			if (!checking) void host.restartPendingRestore();
+			return true;
 		},
 	});
 

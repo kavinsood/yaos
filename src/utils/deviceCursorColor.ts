@@ -10,9 +10,9 @@ const CURSOR_LIGHTNESS_PCT = 52;
 const SELECTION_ALPHA = 0.2;
 const HUE_COUNT = 360;
 
-/** Stable awareness colour derived from the server-minted device id. */
-export function deviceCursorColor(deviceId: string): DeviceCursorColor {
-	const hue = fnv1a32(deviceId) % HUE_COUNT;
+/** Stable awareness colour derived from a server-owned identity seed. */
+export function deviceCursorColor(identitySeed: string): DeviceCursorColor {
+	const hue = fnv1a32(identitySeed) % HUE_COUNT;
 	const base = `${hue}, ${CURSOR_SATURATION_PCT}%, ${CURSOR_LIGHTNESS_PCT}%`;
 	return {
 		color: `hsl(${base})`,
@@ -21,14 +21,41 @@ export function deviceCursorColor(deviceId: string): DeviceCursorColor {
 }
 
 export function awarenessCursorUser(deviceName: string, deviceId: string): {
+	name: string; id: string; principalId: string; deviceId: string; deviceName: string; color: string; colorLight: string;
+};
+export function awarenessCursorUser(
+	displayName: string,
+	principalId: string,
+	principalColorSeed: string,
+	deviceName: string,
+	deviceId: string,
+): {
+	name: string; id: string; principalId: string; deviceId: string; deviceName: string; color: string; colorLight: string;
+};
+export function awarenessCursorUser(
+	displayName: string,
+	principalId: string,
+	principalColorSeed?: string,
+	deviceName?: string,
+	deviceId?: string,
+): {
 	name: string;
 	id: string;
+	principalId: string;
+	deviceId: string;
+	deviceName: string;
 	color: string;
 	colorLight: string;
 } {
+	const resolvedDeviceId = deviceId ?? principalId;
+	const resolvedDeviceName = deviceName ?? displayName;
+	const resolvedPrincipalId = deviceId ? principalId : resolvedDeviceId;
 	return {
-		name: deviceName,
-		id: deviceId,
-		...deviceCursorColor(deviceId),
+		name: displayName,
+		id: resolvedDeviceId,
+		principalId: resolvedPrincipalId,
+		deviceId: resolvedDeviceId,
+		deviceName: resolvedDeviceName,
+		...deviceCursorColor(principalColorSeed ?? resolvedDeviceId),
 	};
 }

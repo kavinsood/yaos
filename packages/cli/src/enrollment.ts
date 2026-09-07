@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import os from "node:os";
 
 import type { EnrollmentConfig } from "./config";
+import { readVaultAuthoritySnapshot } from "../../../src/collaboration/authority";
 import {
 	ENROLLMENT_FORMAT,
 	type EnrollmentMembership,
@@ -17,11 +18,18 @@ import {
 
 const MAX_ENROLLMENT_RESPONSE_BYTES = 64 * 1024;
 const RESPONSE_KEYS = [
+	"actor",
+	"capabilities",
+	"deviceCredentialRevision",
 	"deviceId",
 	"deviceName",
 	"deviceToken",
 	"host",
+	"membershipRevision",
 	"originImport",
+	"principal",
+	"principalId",
+	"role",
 	"vaultGeneration",
 	"vaultId",
 ] as const;
@@ -114,7 +122,7 @@ async function readBoundedJson(response: Response): Promise<Record<string, unkno
 function exactMembership(payload: Record<string, unknown>, pending: PendingEnrollment): EnrollmentMembership {
 	const keys = Object.keys(payload).sort();
 	if (keys.length !== RESPONSE_KEYS.length || keys.some((key, index) => key !== RESPONSE_KEYS[index])) {
-		throw new EnrollmentError("Enrollment response fields did not match the schema-6 contract");
+		throw new EnrollmentError("Enrollment response fields did not match the schema-7 contract");
 	}
 	const host = requiredBoundedString(payload.host, "host");
 	if (host !== pending.host) throw new EnrollmentError("Enrollment response host does not match YAOS_HOST");
@@ -124,6 +132,26 @@ function exactMembership(payload: Record<string, unknown>, pending: PendingEnrol
 	if (typeof payload.originImport !== "boolean") {
 		throw new EnrollmentError("Enrollment response has invalid originImport authority");
 	}
+	if (!payload.actor || typeof payload.actor !== "object" || Array.isArray(payload.actor) || !Array.isArray(payload.capabilities)) {
+		throw new EnrollmentError("Enrollment response has invalid collaboration authority");
+	}
+	let authority;
+	try {
+		authority = readVaultAuthoritySnapshot({ ...(payload.actor as Record<string, unknown>), capabilities: payload.capabilities });
+	} catch (error) {
+		throw new EnrollmentError(`Enrollment response has invalid collaboration authority: ${String(error)}`);
+	}
+	if (authority.deviceId !== pending.deviceId
+		|| authority.principalId !== payload.principalId || authority.role !== payload.role
+		|| authority.membershipRevision !== payload.membershipRevision
+		|| authority.deviceCredentialRevision !== payload.deviceCredentialRevision) {
+		throw new EnrollmentError("Enrollment response collaboration identity is inconsistent");
+	}
+	const principal = payload.principal;
+	if (!principal || typeof principal !== "object" || Array.isArray(principal)
+		|| (principal as Record<string, unknown>).principalId !== authority.principalId) {
+		throw new EnrollmentError("Enrollment response principal is inconsistent");
+	}
 	return {
 		host,
 		vaultId: requiredBoundedString(payload.vaultId, "vaultId", 128),
@@ -131,6 +159,12 @@ function exactMembership(payload: Record<string, unknown>, pending: PendingEnrol
 		deviceId: pending.deviceId,
 		deviceToken: pending.deviceToken,
 		deviceName: requiredBoundedString(payload.deviceName, "deviceName", 80),
+		principalId: authority.principalId,
+		role: authority.role,
+		membershipRevision: authority.membershipRevision,
+		deviceCredentialRevision: authority.deviceCredentialRevision,
+		capabilityDigest: authority.capabilityDigest,
+		capabilities: authority.capabilities,
 		originImport: payload.originImport,
 		originImportPending: payload.originImport,
 	};

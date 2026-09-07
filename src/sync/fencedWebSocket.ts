@@ -65,6 +65,12 @@ export function fencedWebSocketConstructor(Base: WebSocketConstructor): typeof W
 		terminate(): void {
 			if (this.fenced) return;
 			this.fenced = true;
+			const abandonmentErrorSink = (): void => undefined;
+			const releaseAbandonmentSink = (): void => {
+				this.socket.removeEventListener("error", abandonmentErrorSink);
+			};
+			this.socket.addEventListener("error", abandonmentErrorSink);
+			this.socket.addEventListener("close", releaseAbandonmentSink, { once: true });
 			const closeEvent = typeof CloseEvent === "function"
 				? new CloseEvent("close", { code: 4000, reason: "transport superseded", wasClean: false })
 				: new Event("close");

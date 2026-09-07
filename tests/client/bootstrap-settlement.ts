@@ -26,7 +26,7 @@ async function sha256(bytes: Uint8Array): Promise<string> {
 
 s.test("missing body state never creates a placeholder and remains durably outstanding", async () => {
 	const root = new Y.Doc({ guid: "root" });
-	root.getMap("sys").set("schemaVersion", 6);
+	root.getMap("sys").set("schemaVersion", 7);
 	const rootBytes = Y.encodeStateAsUpdate(root);
 	root.destroy();
 
@@ -182,7 +182,7 @@ s.test("bootstrap root rejects schema-3 state instead of migrating it", () => {
 	legacy.getMap("sys").set("schemaVersion", 3);
 	const encodedState = Y.encodeStateAsUpdate(legacy);
 	legacy.destroy();
-	assert.throws(() => decodeBootstrapRoot(encodedState), /not schema 6/);
+	assert.throws(() => decodeBootstrapRoot(encodedState), /not schema 7/);
 });
 
 s.test("feed pages collapse repeated body and catalog work to latest durable state", () => {

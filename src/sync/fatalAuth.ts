@@ -3,7 +3,10 @@ export type FatalAuthCode =
 	| "server_misconfigured"
 	| "server_format_unsupported"
 	| "unclaimed"
-	| "update_required";
+	| "update_required"
+	| "authority_superseded"
+	| "membership_revoked"
+	| "device_revoked";
 
 export interface FatalAuthMessage {
 	code: FatalAuthCode;
@@ -18,6 +21,9 @@ const FATAL_AUTH_CODES: Readonly<Record<FatalAuthCode, true>> = {
 	server_format_unsupported: true,
 	unclaimed: true,
 	update_required: true,
+	authority_superseded: true,
+	membership_revoked: true,
+	device_revoked: true,
 };
 
 export function parseFatalAuthMessage(payload: string): FatalAuthMessage | null {

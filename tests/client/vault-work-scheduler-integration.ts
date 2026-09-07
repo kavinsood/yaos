@@ -136,8 +136,8 @@ s.test("VaultSync reconstructs and drains candidate, body-wake, and ticket work"
 	const clock = new FakeClock();
 	const documents = new Map<string, StoredDocument>();
 	const root = new Y.Doc({ guid: "root" });
-	root.getMap("sys").set("schemaVersion", 6);
-	root.getMap("sys").set("protocolVersion", 2);
+	root.getMap("sys").set("schemaVersion", 7);
+	root.getMap("sys").set("protocolVersion", 3);
 	documents.set("root", {
 		documentId: "root",
 		generation: 1,

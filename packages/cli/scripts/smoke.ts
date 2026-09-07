@@ -163,6 +163,12 @@ try {
 		deviceId: pendingRecord.deviceId,
 		deviceToken: pendingRecord.deviceToken,
 		deviceName: "headless-device",
+		principalId: "principal-headless-device",
+		role: "member",
+		membershipRevision: 1,
+		deviceCredentialRevision: 1,
+		capabilityDigest: "member-capabilities",
+		capabilities: ["vault.catalog.read", "vault.content.read", "vault.content.write"],
 		originImport: false,
 		originImportPending: false,
 	};

@@ -505,7 +505,7 @@ export class ReconciliationController {
 			}
 		}
 		this.deps.refreshStatusBar();
-		this.deps.log(`Imported ${imported} previously untracked files through schema-6 bodies`);
+		this.deps.log(`Imported ${imported} previously untracked files through schema-7 bodies`);
 		if (imported > 0) new Notice(`YAOS: imported ${imported} files after server sync.`);
 	}
 

@@ -6,6 +6,7 @@ import {
 } from "../../src/runtime/setupLinkController";
 import { RuntimeTeardownCoordinator } from "../../src/runtime/teardownLifecycle";
 import { readSource, suite } from "../harness.ts";
+import { MEMBER_CAPABILITIES } from "../../src/collaboration/authority";
 
 const s = suite("multivault-enrollment-contract");
 
@@ -31,6 +32,28 @@ function enrollmentIdentity(
 		enrollmentRequestId: body.enrollmentRequestId,
 		deviceId: body.deviceId,
 		deviceToken: body.deviceToken,
+	};
+}
+
+function collaborationEnrollment(
+	identity: EnrollmentIdentity,
+	vaultId: string,
+	vaultGeneration: string,
+) {
+	return {
+		principal: { displayName: "Member", colorSeed: "member-colour" },
+		actor: {
+			vaultId,
+			vaultGeneration,
+			principalId: "principal-member",
+			membershipRevision: 1,
+			deviceId: identity.deviceId,
+			deviceCredentialRevision: 1,
+			role: "member",
+			policyVersion: 1,
+			capabilityDigest: "member-capability-digest",
+		},
+		capabilities: MEMBER_CAPABILITIES,
 	};
 }
 
@@ -195,6 +218,7 @@ s.test("fully unenrolled folder can enroll without replacement confirmation", as
 			return {
 				status: 200,
 				json: {
+					...collaborationEnrollment(generatedIdentity, "new-vault", "new-generation"),
 					host: "https://destination.example",
 					vaultId: "new-vault",
 					deviceId: generatedIdentity.deviceId,
@@ -314,6 +338,7 @@ s.test("failed retirement preserves the current enrollment", async () => {
 			return {
 				status: 200,
 				json: {
+					...collaborationEnrollment(identity, "new-vault", "new-generation"),
 					host: "https://new.example",
 					vaultId: "new-vault",
 					deviceId: identity.deviceId,
@@ -364,6 +389,7 @@ s.test("successful replacement retires the captured old membership before persis
 			return {
 				status: 200,
 				json: {
+					...collaborationEnrollment(identity, "new-vault", "new-generation"),
 					host: "https://new.example",
 					vaultId: "new-vault",
 					deviceId: identity.deviceId,
@@ -425,8 +451,8 @@ s.test("successful replacement retires the captured old membership before persis
 s.section("Pairing links come from the server");
 {
 	const main = readSource("src/main.ts");
-	s.check(main.includes("/auth/pairing-code"), "pair another device mints a server pairing code");
-	s.check(main.includes("body.obsidianUrl") && main.includes("body.mobileSetupUrl"), "client displays only server-returned URLs");
+	s.check(main.includes("createDeviceLink()"), "pair another device mints a server device-link code");
+	s.check(main.includes("code.obsidianUrl") && main.includes("code.mobileSetupUrl"), "client displays only server-returned URLs");
 	s.check(main.includes("async mintDevicePairing()"), "pairing links are minted instead of assembled from stored credentials");
 }
 

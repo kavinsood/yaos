@@ -22,7 +22,11 @@ class FakeWebSocket {
 		this.listeners.set(type, values);
 	}
 	removeEventListener(type: string, listener: EventListener): void { this.listeners.get(type)?.delete(listener); }
-	emit(type: string): void { for (const listener of this.listeners.get(type) ?? []) listener(new Event(type)); }
+	emit(type: string): void {
+		const listeners = this.listeners.get(type) ?? [];
+		if (type === "error" && [...listeners].length === 0) throw new Error("unhandled websocket error");
+		for (const listener of listeners) listener(new Event(type));
+	}
 }
 
 const s = suite("fenced-websocket");
@@ -42,6 +46,7 @@ s.test("force termination closes provider state synchronously and fences late na
 	assert.deepEqual(events, ["close"]);
 	assert.equal(socket.readyState, 3);
 	FakeWebSocket.last!.emit("message");
+	assert.doesNotThrow(() => FakeWebSocket.last!.emit("error"), "native teardown errors remain handled after provider listeners are fenced");
 	FakeWebSocket.last!.emit("close");
 	assert.deepEqual(events, ["close"]);
 	assert.equal(FakeWebSocket.last!.terminated, 1);

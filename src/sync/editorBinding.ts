@@ -159,6 +159,11 @@ export class EditorBindingManager {
 		private trace?: TraceRecord,
 		private recordFlightPathEvent?: (event: ProductFlightPathEventInput) => void,
 		private readonly bindingPropagationGate?: BindingPropagationGate,
+		private readonly getAwarenessIdentity?: () => {
+			displayName: string;
+			principalId: string;
+			colorSeed: string;
+		},
 	) {
 		this.debug = debug;
 		// Register the reconfigure hook so the harness can trigger CM extension
@@ -1332,9 +1337,16 @@ export class EditorBindingManager {
 		const undoManager = this.createUndoManager(ytext);
 
 		const awareness = this.vaultSync.getBodyAwareness(filePath);
+		const identity = this.getAwarenessIdentity?.();
 		awareness.setLocalStateField(
 			"user",
-			awarenessCursorUser(deviceName, this.vaultSync.deviceId),
+			awarenessCursorUser(
+				identity?.displayName || deviceName,
+				identity?.principalId || this.vaultSync.deviceId,
+				identity?.colorSeed || this.vaultSync.deviceId,
+				deviceName,
+				this.vaultSync.deviceId,
+			),
 		);
 
 		const collabExtension = this.buildCollabExtension(ytext, undoManager, filePath);

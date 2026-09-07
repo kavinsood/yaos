@@ -25,4 +25,12 @@ s.test("renaming a device preserves its colour", () => {
 	if (before.color !== after.color || before.colorLight !== after.colorLight) throw new Error("rename changed the identity colour");
 });
 
+s.test("one principal keeps one colour while device instances remain distinct", () => {
+	const laptop = awarenessCursorUser("Alice", "principal-alice", "alice-seed", "Laptop", "device-laptop");
+	const phone = awarenessCursorUser("Alice", "principal-alice", "alice-seed", "Phone", "device-phone");
+	if (laptop.id === phone.id || laptop.deviceId === phone.deviceId) throw new Error("device presence instances collapsed");
+	if (laptop.principalId !== phone.principalId) throw new Error("one person split across principal identities");
+	if (laptop.color !== phone.color || laptop.colorLight !== phone.colorLight) throw new Error("principal colour changed by device");
+});
+
 await s.done();

@@ -3,6 +3,7 @@ import {
 	DEFAULT_SETTINGS,
 	VaultSyncSettingTab,
 	type VaultRosterDevice,
+	type VaultSecurityAuditEvent,
 	type VaultSyncSettings,
 } from "./settings";
 import { SettingsStore } from "./settings/settingsStore";
@@ -159,6 +160,12 @@ import {
 	OperationalResourceSnapshotTracker,
 	type OperationalResourceSnapshot,
 } from "./runtime/operationalResourceSnapshot";
+import { AuthorityCoordinator, readVaultAuthoritySnapshot } from "./collaboration/authority";
+import {
+	CollaborationClient,
+	type CollaborationOwnershipTransfer,
+	type SecurityAuditEvent,
+} from "./collaboration/client";
 
 // Build-time constant injected by esbuild.
 //   production build (main.js):          define __YAOS_QA_HARNESS_ENABLED__ = false
@@ -186,7 +193,18 @@ type PersistedPluginState = Partial<VaultSyncSettings> & {
 	_frontmatterQuarantine?: FrontmatterQuarantineEntry[];
 	_preservedUnresolved?: PreservedUnresolvedEntry[];
 	_provisioningProof?: VaultProvisioningProof;
+	_authoritySupersededWork?: AuthoritySupersededWork[];
 };
+
+interface AuthoritySupersededWork {
+	kind: "candidate" | "lifecycle" | "attachment";
+	identity: string;
+	principalId: string | null;
+	membershipRevision: number | null;
+	deviceId: string | null;
+	deviceCredentialRevision: number | null;
+	preservedAt: number;
+}
 
 export default class VaultCrdtSyncPlugin extends Plugin {
 	/** Data-only API for other plugins; consumers reacquire it after `yaos:api-ready`. */
@@ -224,7 +242,12 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private setupLinkController: SetupLinkController | null = null;
 	private folderKey: string | null = null;
 	private vaultRoster: VaultRosterDevice[] = [];
+	private readonly vaultDevicesByPrincipal = new Map<string, readonly VaultRosterDevice[]>();
+	private securityAudit: readonly SecurityAuditEvent[] = [];
 	private rosterVaultId = "";
+	private readonly authorityCoordinator = new AuthorityCoordinator();
+	private authoritySupersededWork: AuthoritySupersededWork[] = [];
+	private ownershipTransfers: readonly CollaborationOwnershipTransfer[] = [];
 	/** Debug runtime handle — null unless debug mode installed it at startup. */
 	private lab: TelemetryRuntimeHandle | null = null;
 
@@ -806,8 +829,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			if (this.enforceCompatibilityGuard("init-sync-preflight")) {
 				return;
 			}
+			await this.refreshCollaborationAuthority("init-sync");
+			if (abortIfStale("collaboration authority")) return;
 
-			// Schema 6 always starts from a fresh vault+folder database. The
+			// Schema 7 always starts from a fresh vault-generation+folder database. The
 			// bootstrap root is validated before the live root provider opens.
 			const folderKey = await this.ensureFolderKey();
 			const importer = new LocalVaultImporter(
@@ -880,15 +905,31 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				vaultId: this.settings.vaultId,
 				vaultGeneration: this.settings.vaultGeneration,
 				deviceId: this.settings.deviceId,
+				getAuthority: () => this.authorityCoordinator.capture(),
+				onAuthoritySuperseded: (kind, identity, authority) => {
+					if (this.authoritySupersededWork.some((item) => item.kind === kind && item.identity === identity)) return;
+					this.authoritySupersededWork.push({
+						kind,
+						identity,
+						principalId: authority?.principalId ?? null,
+						membershipRevision: authority?.membershipRevision ?? null,
+						deviceId: authority?.deviceId ?? null,
+						deviceCredentialRevision: authority?.deviceCredentialRevision ?? null,
+						preservedAt: Date.now(),
+					});
+					void this.persistPluginState();
+					this.refreshStatusBar();
+				},
 				host: this.settings.host,
 				token: this.settings.deviceToken,
 				database,
-				getSocketTicket: async (force = false) => {
+				getSocketTicket: async (scope, force = false) => {
 					if (force) ticketCache.invalidate();
 					return ticketCache.get(
 						this.settings.host,
 						this.settings.deviceToken,
 						this.settings.vaultId,
+						scope,
 					);
 				},
 				log: (message) => this.log(`[sync] ${message}`),
@@ -925,6 +966,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				(source, msg, details) => this.trace(source, msg, details),
 				(event) => this.recordFlightPathEvent(event),
 				bindingPropagationGate,
+				() => ({
+					displayName: this.settings.principalDisplayName,
+					principalId: this.settings.principalId,
+					colorSeed: this.settings.principalColorSeed,
+				}),
 			);
 
 			// 3. Global CM6 extension.
@@ -1247,14 +1293,14 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				}
 			});
 
-			// Materialize the validated schema-6 root and every active body before
+			// Materialize the validated schema-7 root and every active body before
 			// admitting editor/disk events. Bootstrap progress and outstanding
 			// safety settlements are durable in the folder-scoped database.
 			this.updateStatusBar({ kind: "loading_cache" });
 			const bootstrap = this.bootstrapClient;
-			if (!bootstrap) throw new Error("schema-6 bootstrap client is unavailable");
+			if (!bootstrap) throw new Error("schema-7 bootstrap client is unavailable");
 			const bootstrapState = await bootstrap.run();
-			if (abortIfStale("schema-6 bootstrap")) return;
+			if (abortIfStale("schema-7 bootstrap")) return;
 			const outstanding = await database.listOutstanding();
 			this.bootstrapProgress = {
 				stage: bootstrapState.stage,
@@ -1274,7 +1320,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			}
 
 			await this.runReconciliation("authoritative");
-			if (abortIfStale("schema-6 admission")) return;
+			if (abortIfStale("schema-7 admission")) return;
 			this.reconciliationController.lastGeneration = runtime.connectionGeneration;
 			if (providerSynced) this.awaitingFirstProviderSyncAfterStartup = false;
 			if (this.settings.originImportPending) {
@@ -1816,7 +1862,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		new ConfirmModal(
 			this.app,
 			"Reset local cache",
-			"This clears this folder’s schema-6 cache and downloads the vault again. Pending local work must settle first. Continue?",
+			"This clears this folder’s schema-7 cache and downloads the vault again. Pending local work must settle first. Continue?",
 			async () => {
 				const database = this.vaultDatabase;
 				if (!database) return;
@@ -1827,7 +1873,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					await this.initSync(true);
 					new Notice("Cache reset complete.");
 				} catch (error) {
-					console.error("[yaos] Failed to reset schema-6 cache:", error);
+					console.error("[yaos] Failed to reset schema-7 cache:", error);
 					new Notice(`Cache reset refused: ${formatUnknown(error)}`, 8000);
 				}
 			},
@@ -1845,7 +1891,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		new ConfirmModal(
 			this.app,
 			"Nuclear reset",
-			`This durably deletes ${pathCount} synced notes from the server, clears this folder’s schema-6 cache, then imports the current disk files. Continue?`,
+			`This durably deletes ${pathCount} synced notes from the server, clears this folder’s schema-7 cache, then imports the current disk files. Continue?`,
 			async () => {
 				try {
 					const requests = [...runtime.pathToId].map(([path, bodyId]) => ({
@@ -2011,6 +2057,14 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	}
 
 	private refreshStatusBar(): void {
+		const fatalAuthority = this.vaultSync?.fatalAuthCode;
+		if ((fatalAuthority === "membership_revoked" || fatalAuthority === "device_revoked")
+			&& this.authorityCoordinator.current.state !== "revoked") {
+			this.authorityCoordinator.revoked(fatalAuthority);
+		} else if (fatalAuthority === "authority_superseded"
+			&& this.authorityCoordinator.current.state !== "changing") {
+			this.authorityCoordinator.changing(fatalAuthority);
+		}
 		const state = this.getCurrentConnectionState();
 		if (state.kind === "local_persistence_failed") {
 			this.handleIndexedDbDegraded("status-check");
@@ -2038,6 +2092,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		if (!runtime) {
 			return {
 				availability: "starting",
+				collaboration: this.publicCollaborationSnapshot(),
 				files: [],
 				counts: {
 					files: 0,
@@ -2082,6 +2137,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		});
 		return {
 			availability: "ready",
+			collaboration: this.publicCollaborationSnapshot(),
 			files,
 			counts: {
 				files: files.length,
@@ -2090,6 +2146,49 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				preservedUnresolved: preserved.length,
 				frontmatterQuarantined: frontmatter.length,
 			},
+		};
+	}
+
+	private publicCollaborationSnapshot(): NonNullable<YaosPublicSnapshotInput["collaboration"]> {
+		const authoritySnapshot = this.authorityCoordinator.current;
+		const authority = authoritySnapshot.authority;
+		const presence: NonNullable<YaosPublicSnapshotInput["collaboration"]>["presence"][number][] = [];
+		const states = this.vaultSync?.provider.awareness.getStates().values() ?? [];
+		for (const state of states as Iterable<unknown>) {
+			if (!state || typeof state !== "object" || !("user" in state)) continue;
+			const user = state.user;
+			if (!user || typeof user !== "object") continue;
+			const value = user as Record<string, unknown>;
+			if (typeof value.principalId !== "string" || typeof value.deviceId !== "string") continue;
+			presence.push({
+				principalId: value.principalId,
+				deviceId: value.deviceId,
+				displayName: typeof value.name === "string" ? value.name : "Vault member",
+				deviceName: typeof value.deviceName === "string" ? value.deviceName : "Device",
+			});
+		}
+		return {
+			authorityState: authoritySnapshot.state,
+			principalId: authority?.principalId ?? null,
+			displayName: this.settings.principalDisplayName || null,
+			deviceId: authority?.deviceId ?? null,
+			deviceName: this.settings.deviceName || null,
+			role: authority?.role ?? null,
+			membershipRevision: authority?.membershipRevision ?? null,
+			deviceCredentialRevision: authority?.deviceCredentialRevision ?? null,
+			policyVersion: authority?.policyVersion ?? null,
+			capabilities: authority?.capabilities ?? [],
+			members: this.vaultRoster.map((member) => ({
+				principalId: member.principalId ?? member.deviceId,
+				displayName: member.displayName ?? member.name,
+				role: member.role ?? "member",
+				state: member.state ?? "active",
+				deviceCount: member.deviceCount ?? 1,
+				lastSeenAt: member.lastSeenAt ?? null,
+			})),
+			presence,
+			ownershipTransfers: this.ownershipTransfers,
+			preservedUnpublishedWork: this.authoritySupersededWork.length,
 		};
 	}
 
@@ -2148,7 +2247,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	private hasExactSettingsSyncCapability(): boolean {
 		const capabilities = this.capabilityUpdateService?.capabilities;
-		return capabilities?.settingsSync === true
+		return this.authorityCoordinator.has("vault.settings.personal.sync")
+			&& capabilities?.settingsSync === true
 			&& capabilities.settingsFormatVersion === SETTINGS_SYNC_FORMAT_VERSION;
 	}
 
@@ -2266,6 +2366,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		return this.settingsSyncStatus;
 	}
 
+	canManageRecovery(): boolean {
+		return this.authorityCoordinator.has("vault.recovery.manage");
+	}
+
 	private async runSettingsSyncAction(
 		action: (engine: SettingsSyncEngine) => Promise<void>,
 	): Promise<void> {
@@ -2347,7 +2451,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		if (action === "replace" || (action === "seed" && decisionRequired)) {
 			const confirmed = await this.confirmSettingsSyncCommand(
 				"Replace the remote settings environment?",
-				"This overwrites the shared remote settings environment with this device's current managed configuration.",
+				"This overwrites your personal remote settings environment with this device's current managed configuration.",
 				"Replace remote",
 			);
 			if (confirmed) await this.replaceSettingsSyncEnvironment();
@@ -2662,6 +2766,20 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		const data = persistedState;
 		this.persistedState = persistedState;
 		this.settings = settings;
+		if (settings.principalId) {
+			this.authorityCoordinator.install(readVaultAuthoritySnapshot({
+				vaultId: settings.vaultId,
+				vaultGeneration: settings.vaultGeneration,
+				principalId: settings.principalId,
+				membershipRevision: settings.membershipRevision,
+				deviceId: settings.deviceId,
+				deviceCredentialRevision: settings.deviceCredentialRevision,
+				role: settings.vaultRole,
+				policyVersion: settings.policyVersion,
+				capabilityDigest: settings.capabilityDigest,
+				capabilities: settings.authorityCapabilities,
+			}));
+		}
 		// Load disk index from plugin data (stored under _diskIndex key)
 		if (data && typeof data._diskIndex === "object" && data._diskIndex !== null) {
 			this.diskIndex = readDiskIndex(data._diskIndex);
@@ -2690,6 +2808,13 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					typeof (entry).firstSeenAt === "number" &&
 					typeof (entry).lastSeenAt === "number",
 			);
+		}
+		if (Array.isArray(data?._authoritySupersededWork)) {
+			this.authoritySupersededWork = data._authoritySupersededWork.filter((item): item is AuthoritySupersededWork =>
+				!!item && typeof item === "object"
+				&& (item.kind === "candidate" || item.kind === "lifecycle" || item.kind === "attachment")
+				&& typeof item.identity === "string"
+				&& typeof item.preservedAt === "number");
 		}
 		const cachedCapabilities = readPersistedServerCapabilitiesCache(data?._serverCapabilitiesCache);
 		const cachedUpdateManifest = readPersistedUpdateManifestCache(data?._updateManifestCache);
@@ -2752,33 +2877,131 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		const vaultId = this.settings.vaultId.trim();
 		if (!host || !deviceToken || !vaultId || !this.settings.deviceId.trim()) return null;
 		try {
-			const res = await obsidianRequest({
-				url: `${host}/vault/${encodeURIComponent(vaultId)}/auth/pairing-code`,
-				method: "POST",
-				headers: {
-					Authorization: `Bearer ${deviceToken}`,
-					"Content-Type": "application/json",
-				},
-				body: JSON.stringify({ purpose: "device" }),
-			});
-			const body: unknown = res.json;
-			const deepLink = body && typeof body === "object" && "obsidianUrl" in body && typeof body.obsidianUrl === "string"
-				? body.obsidianUrl
-				: "";
-			const mobileUrl = body && typeof body === "object" && "mobileSetupUrl" in body && typeof body.mobileSetupUrl === "string"
-				? body.mobileSetupUrl
-				: "";
-			const message = body && typeof body === "object" && "message" in body && typeof body.message === "string"
-				? body.message
-				: "";
-			if (res.status !== 200 || !deepLink || !mobileUrl) {
-				new Notice(message || "Could not mint a pairing code.", 7000);
-				return null;
-			}
-			return { deepLink, mobileUrl };
+			const code = await new CollaborationClient(host, vaultId, deviceToken).createDeviceLink();
+			return { deepLink: code.obsidianUrl, mobileUrl: code.mobileSetupUrl };
 		} catch (err) {
 			new Notice(err instanceof Error ? err.message : "Could not mint a pairing code.", 7000);
 			return null;
+		}
+	}
+
+	async mintPersonInvitation(): Promise<{ deepLink: string; mobileUrl: string } | null> {
+		if (!this.authorityCoordinator.has("vault.members.invite")) {
+			new Notice("Only the vault owner can invite another person.", 7000);
+			return null;
+		}
+		try {
+			const code = await this.collaborationClient().createInvitation("New member");
+			return { deepLink: code.obsidianUrl, mobileUrl: code.mobileSetupUrl };
+		} catch (error) {
+			new Notice(error instanceof Error ? error.message : "Could not create an invitation.", 7000);
+			return null;
+		}
+	}
+
+	getOwnershipTransfers(): readonly CollaborationOwnershipTransfer[] {
+		return this.ownershipTransfers;
+	}
+
+	async offerOwnershipTransfer(principalId: string): Promise<void> {
+		if (!this.authorityCoordinator.has("vault.ownership.transfer")) {
+			new Notice("Only the vault owner can transfer ownership.", 7000);
+			return;
+		}
+		const transfer = await this.collaborationClient().createOwnershipTransfer(principalId);
+		this.ownershipTransfers = Object.freeze([...this.ownershipTransfers, transfer]);
+		this.settingsSyncTab?.update();
+		this.publishPublicApiSnapshot();
+		new Notice("Ownership transfer offer created. The member must explicitly accept it.", 8000);
+	}
+
+	async renameSharedVault(name: string): Promise<void> {
+		if (!this.authorityCoordinator.has("vault.metadata.rename")) throw new Error("Only the vault owner can rename shared vault metadata.");
+		await this.collaborationClient().renameVault(name, randomId(22));
+		await this.refreshSecurityAudit().catch(() => undefined);
+		new Notice(`Shared vault renamed to ${name}.`, 7000);
+	}
+
+	async requestVaultDestruction(): Promise<void> {
+		if (!this.authorityCoordinator.has("vault.destroy.request")) throw new Error("Only the vault owner can request vault destruction.");
+		const request = await this.collaborationClient().requestVaultDestruction(randomId(22));
+		await this.refreshSecurityAudit().catch(() => undefined);
+		new Notice(`Destruction request created (${request.governanceRequestId}). The deployment operator must confirm it.`, 10000);
+	}
+
+	async acceptOwnershipTransfer(transferId: string): Promise<void> {
+		this.authorityCoordinator.changing("ownership_transfer");
+		try {
+			const outcome = await this.collaborationClient().acceptOwnershipTransfer(transferId, randomId(22));
+			await this.teardownSync();
+			if (outcome.pending) {
+				new Notice("Ownership transfer is waiting for the durable vault fence. Sync remains stopped until retry.", 9000);
+				return;
+			}
+			this.ownershipTransfers = [];
+			await startEnrollmentRuntime(this.teardownLifecycle, () => this.initSync());
+			new Notice("Ownership transfer completed.", 7000);
+		} catch (error) {
+			await this.refreshCollaborationAuthority("ownership-transfer-failed").catch(() => undefined);
+			throw error;
+		}
+	}
+
+	async cancelOwnershipTransfer(transferId: string): Promise<void> {
+		await this.collaborationClient().cancelOwnershipTransfer(transferId);
+		this.ownershipTransfers = this.ownershipTransfers.filter((transfer) => transfer.transferId !== transferId);
+		this.settingsSyncTab?.update();
+		this.publishPublicApiSnapshot();
+		new Notice("Ownership transfer offer cancelled.", 6000);
+	}
+
+	getVaultDevices(principalId: string): readonly VaultRosterDevice[] {
+		return this.vaultDevicesByPrincipal.get(principalId) ?? [];
+	}
+
+	getSecurityAudit(): readonly VaultSecurityAuditEvent[] {
+		return this.securityAudit;
+	}
+
+	async revokeVaultDevice(deviceId: string): Promise<void> {
+		if (deviceId === this.settings.deviceId) throw new Error("Use Leave this vault instead of revoking the active device.");
+		await this.collaborationClient().revokeDevice(deviceId, randomId(22));
+		await this.refreshVaultRoster();
+		this.settingsSyncTab?.update();
+		this.publishPublicApiSnapshot();
+		new Notice("Device revocation started. The device is fenced before removal completes.", 7000);
+	}
+
+	async removeVaultMember(principalId: string): Promise<void> {
+		if (!this.authorityCoordinator.has("vault.members.manage")) throw new Error("Only the vault owner can remove a person.");
+		if (principalId === this.settings.principalId) throw new Error("The vault owner cannot remove themselves.");
+		await this.collaborationClient().removeMember(principalId, randomId(22));
+		await this.refreshVaultRoster();
+		this.settingsSyncTab?.update();
+		this.publishPublicApiSnapshot();
+		new Notice("Member removal started. Their devices are fenced before removal completes.", 7000);
+	}
+
+	async renameThisPerson(displayName: string): Promise<void> {
+		if (!this.authorityCoordinator.has("vault.profile.manage_self")) throw new Error("This membership cannot rename its profile.");
+		const principalId = this.settings.principalId.trim();
+		if (!principalId) throw new Error("Person identity is unavailable.");
+		this.authorityCoordinator.changing("profile_update");
+		await this.teardownSync();
+		try {
+			const outcome = await this.collaborationClient().renamePrincipal(principalId, displayName.trim(), randomId(22));
+			await this.refreshCollaborationAuthority("profile-update");
+			await startEnrollmentRuntime(this.teardownLifecycle, () => this.initSync());
+			await this.refreshVaultRoster();
+			this.settingsSyncTab?.update();
+			this.publishPublicApiSnapshot();
+			new Notice(outcome.pending ? "Name changed. The authority fence is settling across the vault." : "Name changed.", 7000);
+		} catch (error) {
+			await this.refreshCollaborationAuthority("profile-update-failed").catch(() => undefined);
+			if (this.authorityCoordinator.current.state === "active") {
+				await startEnrollmentRuntime(this.teardownLifecycle, () => this.initSync()).catch(() => undefined);
+			}
+			throw error;
 		}
 	}
 
@@ -2828,6 +3051,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					vaultId: membership.vaultId,
 					vaultGeneration: membership.vaultGeneration,
 					deviceId: membership.deviceId,
+					principalId: this.settings.principalId,
+					membershipRevision: this.settings.membershipRevision,
+					deviceCredentialRevision: this.settings.deviceCredentialRevision,
 					settingsSyncEnabled: this.settings.settingsSyncEnabled,
 					settingsSyncAutoInstall: this.settings.settingsSyncAutoInstall,
 					settingsSyncDeferred: this.settings.settingsSyncDeferred,
@@ -2896,6 +3122,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		return this.vaultRoster;
 	}
 
+	getPreservedUnpublishedWorkCount(): number {
+		return this.authoritySupersededWork.length;
+	}
+
 	isDeviceOnline(deviceId: string): boolean {
 		if (!deviceId) return false;
 		const awareness = this.vaultSync?.provider.awareness;
@@ -2903,7 +3133,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		for (const state of awareness.getStates().values() as IterableIterator<unknown>) {
 			if (!state || typeof state !== "object" || !("user" in state)) continue;
 			const user = state.user;
-			if (user && typeof user === "object" && "id" in user && user.id === deviceId) return true;
+			if (user && typeof user === "object" && (
+				("id" in user && user.id === deviceId)
+				|| ("deviceId" in user && user.deviceId === deviceId)
+				|| ("principalId" in user && user.principalId === deviceId)
+			)) return true;
 		}
 		return false;
 	}
@@ -2914,44 +3148,73 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		const vaultId = this.settings.vaultId.trim();
 		if (this.rosterVaultId !== vaultId) {
 			this.vaultRoster = [];
+			this.vaultDevicesByPrincipal.clear();
+			this.securityAudit = [];
 			this.rosterVaultId = vaultId;
 		}
 		if (!host || !deviceToken || !vaultId) {
 			this.vaultRoster = [];
+			this.vaultDevicesByPrincipal.clear();
+			this.securityAudit = [];
 			return;
 		}
 		try {
-			const res = await obsidianRequest({
-				url: `${host}/vault/${encodeURIComponent(vaultId)}/devices`,
-				method: "GET",
-				headers: { Authorization: `Bearer ${deviceToken}` },
-			});
+			const client = new CollaborationClient(host, vaultId, deviceToken);
+			const members = await client.listMembers();
+			const visibleDevicePrincipals = members.filter((member) => member.state !== "revoked" && (
+				this.settings.vaultRole === "owner" || member.principalId === this.settings.principalId
+			));
+			const devices = await Promise.all(visibleDevicePrincipals.map(async (member) => ({
+				principalId: member.principalId,
+				devices: await client.listDevices(member.principalId),
+			})));
 			if (this.settings.vaultId.trim() !== vaultId) return;
-			if (res.status !== 200) {
-				this.vaultRoster = [];
-				new Notice("Could not load the device roster.", 7000);
-				return;
+			this.vaultRoster = members.map((member) => ({
+				deviceId: member.principalId,
+				principalId: member.principalId,
+				name: member.displayName,
+				displayName: member.displayName,
+				role: member.role,
+				state: member.state,
+				deviceCount: member.deviceCount,
+				enrolledAt: member.joinedAt,
+				lastSeenAt: member.lastSeenAt ?? undefined,
+			}));
+			this.vaultDevicesByPrincipal.clear();
+			for (const entry of devices) {
+				this.vaultDevicesByPrincipal.set(entry.principalId, Object.freeze(entry.devices.map((device) => ({
+					deviceId: device.deviceId,
+					principalId: device.principalId,
+					name: device.name,
+					state: device.state,
+					enrolledAt: device.enrolledAt,
+					lastSeenAt: device.lastSeenAt ?? undefined,
+				}))));
 			}
-			const raw: unknown = res.json;
-			if (!raw || typeof raw !== "object" || !("devices" in raw) || !Array.isArray(raw.devices)) {
-				this.vaultRoster = [];
-				return;
+			if (this.settings.vaultRole === "owner") {
+				try {
+					this.securityAudit = await client.listSecurityAudit();
+				} catch (error) {
+					this.securityAudit = [];
+					console.warn("[yaos] Could not refresh the collaboration security audit:", error);
+				}
+			} else {
+				this.securityAudit = [];
 			}
-			this.vaultRoster = raw.devices.flatMap((item: unknown): VaultRosterDevice[] => {
-				if (!item || typeof item !== "object") return [];
-				if (!("deviceId" in item) || typeof item.deviceId !== "string") return [];
-				if (!("name" in item) || typeof item.name !== "string") return [];
-				return [{
-					deviceId: item.deviceId,
-					name: item.name,
-					enrolledAt: "enrolledAt" in item && typeof item.enrolledAt === "number" ? item.enrolledAt : undefined,
-					lastSeenAt: "lastSeenAt" in item && typeof item.lastSeenAt === "number" ? item.lastSeenAt : undefined,
-				}];
-			});
+			this.publishPublicApiSnapshot();
 		} catch (err) {
 			if (this.settings.vaultId.trim() === vaultId) this.vaultRoster = [];
 			new Notice(err instanceof Error ? err.message : "Could not load the device roster.", 7000);
 		}
+	}
+
+	async refreshSecurityAudit(): Promise<void> {
+		if (!this.authorityCoordinator.has("vault.audit.read")) {
+			this.securityAudit = [];
+			return;
+		}
+		this.securityAudit = await this.collaborationClient().listSecurityAudit();
+		this.settingsSyncTab?.update();
 	}
 
 	async leaveThisVault(): Promise<void> {
@@ -2975,26 +3238,38 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			deviceId: this.settings.deviceId.trim(),
 			vaultGeneration: this.settings.vaultGeneration.trim(),
 		};
+		if (host && deviceToken && vaultId) {
+			try {
+				this.authorityCoordinator.changing("leave");
+				const outcome = await this.collaborationClient().leave(randomId(22));
+				if (outcome.pending) {
+					await this.teardownSync();
+					new Notice("Leaving is waiting for the server's durable authority fence. Credentials are retained for retry.", 9000);
+					return;
+				}
+				this.authorityCoordinator.revoked("left_vault");
+			} catch (err) {
+				const message = err instanceof Error ? err.message : "Could not revoke this device on the server.";
+				this.authorityCoordinator.install(readVaultAuthoritySnapshot({
+					vaultId: this.settings.vaultId,
+					vaultGeneration: this.settings.vaultGeneration,
+					principalId: this.settings.principalId,
+					membershipRevision: this.settings.membershipRevision,
+					deviceId: this.settings.deviceId,
+					deviceCredentialRevision: this.settings.deviceCredentialRevision,
+					role: this.settings.vaultRole,
+					policyVersion: this.settings.policyVersion,
+					capabilityDigest: this.settings.capabilityDigest,
+					capabilities: this.settings.authorityCapabilities,
+				}));
+				new Notice(`${message} Nothing was removed locally.`, 7000);
+				return;
+			}
+		}
 		try {
 			await this.retireSettingsSyncLocalState(membership);
 		} catch (error) {
-			new Notice(`Could not retire local settings sync state: ${formatUnknown(error)}`, 9000);
-			return;
-		}
-		if (host && deviceToken && vaultId) {
-			try {
-				const res = await obsidianRequest({
-					url: `${host}/vault/${encodeURIComponent(vaultId)}/auth/device`,
-					method: "DELETE",
-					headers: { Authorization: `Bearer ${deviceToken}` },
-				});
-				if (res.status !== 200 && res.status !== 401) {
-					new Notice("Could not revoke this device on the server. Leaving locally.", 7000);
-				}
-			} catch (err) {
-				const message = err instanceof Error ? err.message : "Could not revoke this device on the server.";
-				new Notice(`${message} Leaving locally.`, 7000);
-			}
+			new Notice(`Vault membership ended, but local settings queue cleanup failed: ${formatUnknown(error)}`, 9000);
 		}
 
 
@@ -3003,12 +3278,16 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		try {
 			await this.teardownSync();
 			if (database && preflight) {
-				await database.deleteDatabaseAfterClose(preflight, { discardPendingWork: true });
+				const hasPendingWork = Object.values(preflight).some((count) => count > 0);
+				if (!hasPendingWork) await database.deleteDatabaseAfterClose(preflight);
+				else new Notice("Pending unpublished work was preserved in this folder's local YAOS cache.", 9000);
 			}
 		} catch (err) {
 			console.error("[yaos] Leave teardown or cache deletion completed with errors:", err);
 		}
 		this.vaultRoster = [];
+		this.vaultDevicesByPrincipal.clear();
+		this.securityAudit = [];
 		this.rosterVaultId = "";
 		await this.updateSettings((settings) => {
 			settings.host = "";
@@ -3016,10 +3295,51 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			settings.vaultId = "";
 			settings.deviceId = "";
 			settings.vaultGeneration = "";
+			settings.principalId = "";
+			settings.principalDisplayName = "";
+			settings.principalColorSeed = "";
+			settings.vaultRole = "";
+			settings.membershipRevision = 0;
+			settings.deviceCredentialRevision = 0;
+			settings.policyVersion = 0;
+			settings.capabilityDigest = "";
+			settings.authorityCapabilities = [];
 			settings.originImportPending = false;
 			settings.settingsSyncDeferred = false;
 		}, "leave-vault");
 		new Notice("Left this vault. Notes are still on disk.", 7000);
+	}
+
+	private collaborationClient(): CollaborationClient {
+		return new CollaborationClient(
+			this.settings.host,
+			this.settings.vaultId,
+			this.settings.deviceToken,
+		);
+	}
+
+	private async refreshCollaborationAuthority(reason: string): Promise<void> {
+		this.authorityCoordinator.refreshing(reason);
+		try {
+			const me = await this.collaborationClient().getMe();
+			this.authorityCoordinator.install(me.authority);
+			this.ownershipTransfers = me.ownershipTransfers;
+			await this.updateSettings((settings) => {
+				settings.principalId = me.authority.principalId;
+				settings.principalDisplayName = me.displayName;
+				settings.principalColorSeed = me.colorSeed;
+				settings.vaultRole = me.authority.role;
+				settings.membershipRevision = me.authority.membershipRevision;
+				settings.deviceCredentialRevision = me.authority.deviceCredentialRevision;
+				settings.policyVersion = me.authority.policyVersion;
+				settings.capabilityDigest = me.authority.capabilityDigest;
+				settings.authorityCapabilities = [...me.authority.capabilities];
+				settings.deviceName = me.deviceName;
+			}, `authority:${reason}`);
+		} catch (error) {
+			this.authorityCoordinator.revoked(error instanceof Error ? error.message : "authority_refresh_failed");
+			throw error;
+		}
 	}
 
 	private async ensureFolderKey(): Promise<string> {
@@ -3151,6 +3471,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			nextState._preservedUnresolved = preserved;
 		} else {
 			delete nextState._preservedUnresolved;
+		}
+		if (this.authoritySupersededWork.length > 0) {
+			nextState._authoritySupersededWork = this.authoritySupersededWork.map((item) => ({ ...item }));
+		} else {
+			delete nextState._authoritySupersededWork;
 		}
 		this.persistedState = nextState;
 	}

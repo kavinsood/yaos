@@ -65,6 +65,9 @@ export type SettingsSyncSettingsSlice = {
 	vaultId?: string;
 	vaultGeneration?: string;
 	deviceId?: string;
+	principalId?: string;
+	membershipRevision?: number;
+	deviceCredentialRevision?: number;
 	debug?: boolean;
 	settingsSyncEnabled?: boolean;
 	settingsSyncAutoInstall?: boolean;
@@ -1298,6 +1301,9 @@ export class SettingsSyncEngine {
 			vaultGeneration: conn.vaultGeneration,
 			folderKey: this.opts.folderKey,
 			deviceId: conn.deviceId,
+			principalId: conn.principalId,
+			membershipRevision: conn.membershipRevision,
+			deviceCredentialRevision: conn.deviceCredentialRevision,
 			configDirKey: key,
 			indexedDb: this.opts.indexedDb,
 			isHidden: () => this.isSettingsHidden(),
@@ -1356,6 +1362,9 @@ export class SettingsSyncEngine {
 		vaultId: string;
 		vaultGeneration: string;
 		deviceId: string;
+		principalId: string;
+		membershipRevision: number;
+		deviceCredentialRevision: number;
 	} {
 		const settings = this.opts.getSettings();
 		return {
@@ -1364,6 +1373,9 @@ export class SettingsSyncEngine {
 			vaultId: settings.vaultId ?? "",
 			vaultGeneration: settings.vaultGeneration ?? "",
 			deviceId: settings.deviceId ?? "",
+			principalId: settings.principalId ?? "",
+			membershipRevision: settings.membershipRevision ?? 0,
+			deviceCredentialRevision: settings.deviceCredentialRevision ?? 0,
 		};
 	}
 
@@ -1415,6 +1427,9 @@ export class SettingsSyncEngine {
 			&& conn.vaultId
 			&& conn.vaultGeneration
 			&& conn.deviceId
+			&& conn.principalId
+			&& conn.membershipRevision > 0
+			&& conn.deviceCredentialRevision > 0
 			&& this.opts.folderKey.trim(),
 		);
 	}
@@ -1429,6 +1444,9 @@ export class SettingsSyncEngine {
 			vaultGeneration: conn.vaultGeneration,
 			folderKey: this.opts.folderKey,
 			deviceId: conn.deviceId,
+			principalId: conn.principalId,
+			membershipRevision: conn.membershipRevision,
+			deviceCredentialRevision: conn.deviceCredentialRevision,
 			configDirKey,
 			indexedDb: this.opts.indexedDb,
 		};

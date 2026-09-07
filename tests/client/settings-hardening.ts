@@ -1,4 +1,5 @@
 import { isServerCapabilities } from "../../src/runtime/capabilityUpdateService";
+import { capabilitiesForRole } from "../../src/collaboration/authority";
 import {
 	attachmentSizeCapKB,
 	MAX_ATTACHMENT_SIZE_KB,
@@ -77,6 +78,15 @@ s.section("Enrollment requires the complete generation-scoped identity");
 		vaultId: "vault-1",
 		deviceId: "device-1",
 		vaultGeneration: "generation-1",
+		principalId: "principal-1",
+		principalDisplayName: "Alice",
+		principalColorSeed: "color-1",
+		vaultRole: "member",
+		membershipRevision: 1,
+		deviceCredentialRevision: 1,
+		policyVersion: 1,
+		capabilityDigest: "digest-1",
+		authorityCapabilities: [...capabilitiesForRole("member")],
 	}).settings;
 	s.check(complete.deviceToken === "device-secret", "complete enrollment is preserved");
 
@@ -113,9 +123,9 @@ s.section("Settings capability is optional for note sync");
 		attachments: false,
 		snapshots: false,
 		serverVersion: "1.0.0",
-		schemaVersion: 6,
+		schemaVersion: 7,
 		storageFormatVersion: 2,
-		protocolVersion: 2,
+		protocolVersion: 3,
 		snapshotFormatVersion: 2,
 		recoveryJobs: false,
 		updateProvider: null,

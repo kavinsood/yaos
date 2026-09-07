@@ -3,6 +3,7 @@ import type { PendingEnrollment, VaultSyncSettings } from "../settings/settingsS
 import { randomId } from "../utils/randomId";
 import { ConfirmModal } from "../ui/ConfirmModal";
 import type { RuntimeTeardownCoordinator } from "./teardownLifecycle";
+import { readVaultAuthoritySnapshot, type VaultCapability, type VaultRole } from "../collaboration/authority";
 
 export interface EnrollmentMembership {
 	host: string;
@@ -37,6 +38,17 @@ interface EnrollmentResponse {
 	deviceName?: unknown;
 	vaultGeneration?: unknown;
 	originImport?: unknown;
+	principalId?: unknown;
+	displayName?: unknown;
+	colorSeed?: unknown;
+	role?: unknown;
+	membershipRevision?: unknown;
+	deviceCredentialRevision?: unknown;
+	policyVersion?: unknown;
+	capabilityDigest?: unknown;
+	capabilities?: unknown;
+	actor?: unknown;
+	principal?: unknown;
 	error?: unknown;
 	message?: unknown;
 }
@@ -189,6 +201,19 @@ export class SetupLinkController {
 			return false;
 		}
 
+		const actor = enrolled.actor && typeof enrolled.actor === "object"
+			? enrolled.actor as Record<string, unknown>
+			: enrolled as Record<string, unknown>;
+		const principal = enrolled.principal && typeof enrolled.principal === "object"
+			? enrolled.principal as Record<string, unknown>
+			: enrolled as Record<string, unknown>;
+		let authority;
+		try {
+			authority = readVaultAuthoritySnapshot({ ...actor, capabilities: enrolled.capabilities ?? actor.capabilities });
+		} catch {
+			new Notice("Server did not return complete collaboration authority.", 8000);
+			return false;
+		}
 		if (
 			typeof enrolled.host !== "string" || !enrolled.host.trim()
 			|| typeof enrolled.vaultId !== "string" || !enrolled.vaultId.trim()
@@ -197,6 +222,8 @@ export class SetupLinkController {
 			|| typeof enrolled.deviceName !== "string" || !enrolled.deviceName.trim()
 			|| typeof enrolled.vaultGeneration !== "string" || !enrolled.vaultGeneration.trim()
 			|| typeof enrolled.originImport !== "boolean"
+			|| typeof principal.displayName !== "string" || !principal.displayName.trim()
+			|| typeof principal.colorSeed !== "string" || !principal.colorSeed.trim()
 		) {
 			new Notice("Server did not return complete enrollment credentials.", 8000);
 			return false;
@@ -236,6 +263,15 @@ export class SetupLinkController {
 				settings.vaultId = nextEnrollment.vaultId;
 				settings.deviceId = nextEnrollment.deviceId;
 				settings.vaultGeneration = nextEnrollment.vaultGeneration;
+				settings.principalId = authority.principalId;
+				settings.principalDisplayName = principal.displayName as string;
+				settings.principalColorSeed = principal.colorSeed as string;
+				settings.vaultRole = authority.role as VaultRole;
+				settings.membershipRevision = authority.membershipRevision;
+				settings.deviceCredentialRevision = authority.deviceCredentialRevision;
+				settings.policyVersion = authority.policyVersion;
+				settings.capabilityDigest = authority.capabilityDigest;
+				settings.authorityCapabilities = [...authority.capabilities] as VaultCapability[];
 				settings.originImportPending = enrolled.originImport === true;
 				settings.deviceName = enrolled.deviceName as string;
 				settings.pendingEnrollment = null;

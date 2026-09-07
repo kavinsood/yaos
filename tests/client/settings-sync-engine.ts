@@ -50,6 +50,9 @@ function settings() {
 		vaultId: "vault-a",
 		vaultGeneration: "generation-a",
 		deviceId: "device-a",
+		principalId: "principal-a",
+		membershipRevision: 1,
+		deviceCredentialRevision: 1,
 		settingsSyncEnabled: true,
 		settingsSyncAutoInstall: false,
 		settingsSyncDeferred: false,
@@ -65,6 +68,9 @@ async function acceptedScope(
 		vaultGeneration: "generation-a",
 		folderKey: "folder-a",
 		deviceId: "device-a",
+		principalId: "principal-a",
+		membershipRevision: 1,
+		deviceCredentialRevision: 1,
 		configDirKey: ".obsidian",
 		indexedDb,
 		...overrides,
@@ -287,7 +293,7 @@ s.test("foreground visibility resumes a paused consented package queue", async (
 	const scope = await acceptedScope(indexedDb);
 	const { indexedDb: _factory, ...identity } = scope;
 	await persistApplyQueue(scope, {
-		version: 1,
+		version: 2,
 		identity,
 		steps: [{
 			kind: "install-plugin",

@@ -9,6 +9,7 @@ import {
 import { PairDeviceModal } from "./PairDeviceModal";
 import { DeviceCredentialsModal } from "./DeviceCredentialsModal";
 import { ConfirmModal } from "../ui/ConfirmModal";
+import { VaultNameModal } from "./VaultNameModal";
 import {
 	attachmentSizeCapKB,
 	type ExternalEditPolicy,
@@ -23,6 +24,7 @@ import type {
 
 type DeclarativeSettingKey =
 	| "deviceName"
+	| "principalDisplayName"
 	| "excludePatterns"
 	| "maxFileSizeKB"
 	| "enableAttachmentSync"
@@ -55,8 +57,32 @@ interface SettingsUpdateState {
 export interface VaultRosterDevice {
 	deviceId: string;
 	name: string;
+	principalId?: string;
+	displayName?: string;
+	role?: "owner" | "member";
+	state?: "active" | "changing" | "revoking" | "revoked";
+	deviceCount?: number;
 	enrolledAt?: number;
 	lastSeenAt?: number;
+}
+
+export interface VaultOwnershipTransfer {
+	transferId: string;
+	fromPrincipalId: string;
+	toPrincipalId: string;
+	createdAt: number;
+	expiresAt: number;
+}
+
+export interface VaultSecurityAuditEvent {
+	eventId: string;
+	kind: string;
+	actorPrincipalId: string | null;
+	actorDeviceId: string | null;
+	targetPrincipalId: string | null;
+	targetDeviceId: string | null;
+	createdAt: number;
+	detail: string | null;
 }
 
 export interface VaultSyncSettingsHost {
@@ -81,6 +107,7 @@ export interface VaultSyncSettingsHost {
 	removeSettingsSyncEnvironmentItem(kind: "plugin" | "theme", id: string): Promise<void>;
 	getUpdateState(): SettingsUpdateState;
 	mintDevicePairing(): Promise<{ deepLink: string; mobileUrl: string } | null>;
+	mintPersonInvitation?(): Promise<{ deepLink: string; mobileUrl: string } | null>;
 	buildDeviceCredentialsText(): string | null;
 	renameThisDevice(name: string): Promise<void>;
 	enrollByPaste(host: string, pairingCode: string): Promise<boolean>;
@@ -89,7 +116,20 @@ export interface VaultSyncSettingsHost {
 	getFolderName(): string;
 	getVaultRoster(): VaultRosterDevice[];
 	refreshVaultRoster(): Promise<void>;
+	getVaultDevices?(principalId: string): readonly VaultRosterDevice[];
+	revokeVaultDevice?(deviceId: string): Promise<void>;
+	removeVaultMember?(principalId: string): Promise<void>;
+	renameThisPerson?(displayName: string): Promise<void>;
+	getSecurityAudit?(): readonly VaultSecurityAuditEvent[];
+	refreshSecurityAudit?(): Promise<void>;
 	isDeviceOnline(deviceId: string): boolean;
+	getPreservedUnpublishedWorkCount?(): number;
+	getOwnershipTransfers?(): readonly VaultOwnershipTransfer[];
+	offerOwnershipTransfer?(principalId: string): Promise<void>;
+	acceptOwnershipTransfer?(transferId: string): Promise<void>;
+	cancelOwnershipTransfer?(transferId: string): Promise<void>;
+	renameSharedVault?(name: string): Promise<void>;
+	requestVaultDestruction?(): Promise<void>;
 }
 
 const CLOUDFLARE_DEPLOY_URL = "https://deploy.workers.cloudflare.com/?url=https://github.com/kavinsood/yaos/tree/main/server";
@@ -140,6 +180,10 @@ function formatRosterLastSeen(lastSeenAt?: number): string {
 	if (deltaMs < 3_600_000) return `Last seen ${Math.floor(deltaMs / 60_000)}m ago`;
 	if (deltaMs < 86_400_000) return `Last seen ${Math.floor(deltaMs / 3_600_000)}h ago`;
 	return `Last seen ${new Date(lastSeenAt).toISOString()}`;
+}
+
+function formatAuditKind(kind: string): string {
+	return kind.split("_").filter(Boolean).map((part) => part[0]!.toUpperCase() + part.slice(1)).join(" ") || "Security event";
 }
 
 function formatEstimatedBytes(bytes: number): string {
@@ -223,9 +267,15 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 				{ name: "Vault ID", desc: shortenMiddle(this.host.settings.vaultId) },
 				{ name: "This device", desc: this.host.settings.deviceName || "Unnamed" },
 				{
-					name: "Pair another device",
-					desc: "Mint a one-shot pairing code and server-provided setup links.",
+					name: "Add my device",
+					desc: "Link another device to the same person. This never creates another vault member.",
 					action: () => { void this.openPairing(); },
+				},
+				{
+					name: "Invite person",
+					desc: "Invite a full collaborator who can download and change the complete vault.",
+					visible: () => this.host.settings.vaultRole === "owner",
+					action: () => { void this.openInvitation(); },
 				},
 				{
 					name: "Device credentials",
@@ -239,12 +289,17 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 				},
 				{
 					name: "Leave this vault",
-					desc: "Revoke this device when possible, stop syncing, and keep notes on disk.",
+					desc: "Remove your membership and devices, stop syncing, and keep notes on disk.",
+					visible: () => this.host.settings.vaultRole === "member",
 					action: () => { void this.host.leaveThisVault(); },
 				},
 			];
 			definitions.push({ type: "group", heading: "Sync status", items: statusItems });
 			definitions.push(this.buildRosterGroup());
+			if (this.host.settings.vaultRole === "owner") {
+				definitions.push(this.buildVaultGovernanceGroup());
+				definitions.push(this.buildSecurityAuditGroup());
+			}
 
 			const updateSummary = updateState.serverUpdateAvailable
 				? "A server update is available."
@@ -286,6 +341,18 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 		}
 
 		definitions.push(
+			{
+				type: "group",
+				heading: "This person",
+				visible: () => Boolean(this.host.settings.vaultId && this.host.settings.principalId),
+				items: [
+					{
+						name: "Your name",
+						desc: "Identifies you across every linked device, live cursor, and collaboration record.",
+						control: { type: "text", key: "principalDisplayName", placeholder: "Your name" },
+					},
+				],
+			},
 			{
 				type: "group",
 				heading: "This device",
@@ -500,7 +567,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 		const items: SettingDefinition[] = [
 			{
 				name: "Sync Obsidian settings",
-				desc: "Synchronize this vault's current Obsidian configuration folder. Note sync is independent of this switch.",
+				desc: "Synchronize your personal Obsidian configuration across your devices. Other vault members cannot read it.",
 				control: { type: "toggle", key: "settingsSyncEnabled" },
 			},
 			{
@@ -538,7 +605,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 					if (String(current.reason) === "decision-required") {
 						this.confirmSettingsSyncAction(
 							"Replace the remote settings environment?",
-							"This replaces the shared remote settings environment with this device's current configuration. Other devices will receive these plugin, theme, and settings choices.",
+							"This replaces your remote settings environment with this device's current configuration. Only your devices receive these choices.",
 							"Replace remote",
 							() => this.host.replaceSettingsSyncEnvironment(),
 						);
@@ -581,11 +648,11 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 			},
 			{
 				name: "Replace remote settings environment",
-				desc: "Replace the seeded remote settings environment with this device's current configuration.",
+				desc: "Replace your seeded remote settings environment with this device's current configuration.",
 				visible: () => this.host.getSettingsSyncStatus().seeded === true,
 				action: () => this.confirmSettingsSyncAction(
 					"Replace the remote settings environment?",
-					"This overwrites the shared remote settings environment with this device's current managed configuration.",
+					"This overwrites your personal remote settings environment with this device's current managed configuration.",
 					"Replace remote",
 					() => this.host.replaceSettingsSyncEnvironment(),
 				),
@@ -667,7 +734,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 	private confirmSettingsSyncRemoval(kind: "plugin" | "theme", id: string): void {
 		this.confirmSettingsSyncAction(
 			`Remove ${kind} from the settings environment?`,
-			`This removes ${id} from the shared settings environment and from this device. Other devices will observe the removal.`,
+			`This removes ${id} from your settings environment and from this device. Your other devices will observe the removal.`,
 			`Remove ${kind}`,
 			() => this.host.removeSettingsSyncEnvironmentItem(kind, id),
 		);
@@ -684,6 +751,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 	getControlValue(key: string): unknown {
 		switch (key as DeclarativeSettingKey) {
 			case "deviceName": return this.host.settings.deviceName;
+			case "principalDisplayName": return this.host.settings.principalDisplayName;
 			case "excludePatterns": return this.host.settings.excludePatterns;
 			case "maxFileSizeKB": return this.host.settings.maxFileSizeKB;
 			case "enableAttachmentSync": return this.host.settings.enableAttachmentSync;
@@ -705,6 +773,13 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 
 	async setControlValue(key: string, value: unknown): Promise<void> {
 		switch (key as DeclarativeSettingKey) {
+			case "principalDisplayName": {
+				const displayName = expectStringValue(key, value).trim();
+				if (!displayName) throw new RangeError("principalDisplayName must not be empty");
+				if (!this.host.renameThisPerson) throw new Error("Person rename is unavailable");
+				await this.host.renameThisPerson(displayName);
+				return;
+			}
 			case "deviceName": {
 				const nextName = expectStringValue(key, value).trim();
 				await this.host.updateSettings((settings) => {
@@ -811,23 +886,196 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 			if (vaultId) void this.host.refreshVaultRoster().then(() => this.update());
 		}
 		const localDeviceId = this.host.settings.deviceId;
-		const items: SettingDefinition[] = this.host.getVaultRoster().map((device) => {
-			const isThis = device.deviceId === localDeviceId && localDeviceId.length > 0;
-			const online = this.host.isDeviceOnline(device.deviceId);
-			return {
-				name: `${online ? "Online · " : ""}${device.name}${isThis ? " · This device" : ""}`,
-				desc: formatRosterLastSeen(device.lastSeenAt),
-			};
-		});
+		const localPrincipalId = this.host.settings.principalId;
+		const items: SettingDefinition[] = [];
+		for (const member of this.host.getVaultRoster()) {
+			const displayName = member.displayName || member.name;
+			const isCurrentPerson = member.principalId === localPrincipalId && localPrincipalId.length > 0;
+			const role = member.role === "owner" ? "Owner" : "Member";
+			const deviceSummary = typeof member.deviceCount === "number"
+				? `${member.deviceCount} ${member.deviceCount === 1 ? "device" : "devices"}`
+				: "Devices not loaded";
+			items.push({
+				name: `${displayName}${isCurrentPerson ? " · You" : ""}`,
+				desc: `${role} · ${deviceSummary} · ${formatRosterLastSeen(member.lastSeenAt)}`,
+			});
+			for (const device of this.host.getVaultDevices?.(member.principalId ?? "") ?? []) {
+				const isThis = device.deviceId === localDeviceId && localDeviceId.length > 0;
+				const online = this.host.isDeviceOnline(device.deviceId);
+				const mayRevoke = device.state === "active" && !isThis
+					&& (this.host.settings.vaultRole === "owner" || isCurrentPerson);
+				const name = `${online ? "Online · " : ""}${device.name}${isThis ? " · This device" : ""}`;
+				const desc = `${device.state === "active" ? "Active" : device.state ?? "Unknown"} · ${formatRosterLastSeen(device.lastSeenAt)}`;
+				if (mayRevoke) items.push({
+					name,
+					desc,
+					action: () => this.confirmDeviceRevocation(device.deviceId, device.name),
+				});
+				else items.push({ name, desc });
+			}
+			const mayGovernMember = this.host.settings.vaultRole === "owner"
+				&& member.role === "member" && member.state === "active"
+				&& !!member.principalId && member.principalId !== localPrincipalId;
+			if (mayGovernMember) {
+				items.push({
+					name: `Transfer ownership to ${displayName}`,
+					desc: "Creates an offer this member must explicitly accept.",
+					action: () => this.confirmOwnershipTransfer(member.principalId!, displayName),
+				});
+				items.push({
+					name: `Remove ${displayName}`,
+					desc: "Revokes this person's membership and every linked device after the durable authority fence.",
+					action: () => this.confirmMemberRemoval(member.principalId!, displayName),
+				});
+			}
+		}
 		if (items.length === 0) {
 			items.push({ name: "No devices loaded", desc: "Refresh to load the enrolled device roster." });
+		}
+		const preserved = this.host.getPreservedUnpublishedWorkCount?.() ?? 0;
+		if (preserved > 0) {
+			items.push({
+				name: "Preserved unpublished work",
+				desc: `${preserved} durable ${preserved === 1 ? "operation belongs" : "operations belong"} to older authority and will not be replayed automatically. Local vault files remain untouched.`,
+			});
+		}
+		for (const transfer of this.host.getOwnershipTransfers?.() ?? []) {
+			const target = this.host.getVaultRoster().find((member) => member.principalId === transfer.toPrincipalId);
+			const source = this.host.getVaultRoster().find((member) => member.principalId === transfer.fromPrincipalId);
+			if (transfer.fromPrincipalId === localPrincipalId) {
+				items.push({
+					name: `Cancel ownership transfer to ${target?.displayName ?? "member"}`,
+					desc: `Offer expires ${new Date(transfer.expiresAt).toISOString()}.`,
+					action: () => this.confirmCancelOwnershipTransfer(transfer.transferId),
+				});
+			} else if (transfer.toPrincipalId === localPrincipalId) {
+				items.push({
+					name: `Accept ownership from ${source?.displayName ?? "current owner"}`,
+					desc: "Accepting atomically makes you owner and the current owner a member. Visible queued work should settle first.",
+					action: () => this.confirmAcceptOwnershipTransfer(transfer.transferId),
+				});
+			}
 		}
 		items.push({
 			name: "Refresh roster",
 			desc: "Reload enrolled devices, online presence, and last-seen times.",
 			action: () => { void this.host.refreshVaultRoster().then(() => this.update()); },
 		});
-		return { type: "group", heading: "On this vault", items };
+		return { type: "group", heading: "People and devices", items };
+	}
+
+	private buildSecurityAuditGroup(): SettingDefinitionItem {
+		const roster = this.host.getVaultRoster();
+		const nameOf = (principalId: string | null): string => {
+			if (!principalId) return "System";
+			return roster.find((member) => member.principalId === principalId)?.displayName ?? shortenMiddle(principalId);
+		};
+		const items: SettingDefinition[] = (this.host.getSecurityAudit?.() ?? []).map((event) => ({
+			name: formatAuditKind(event.kind),
+			desc: `${new Date(event.createdAt).toISOString()} · ${nameOf(event.actorPrincipalId)}${event.targetPrincipalId ? ` → ${nameOf(event.targetPrincipalId)}` : ""}${event.detail ? ` · ${event.detail}` : ""}`,
+		}));
+		if (items.length === 0) items.push({ name: "No security events loaded", desc: "Refresh to load owner-visible governance history." });
+		items.push({
+			name: "Refresh security audit",
+			desc: "Reload the latest membership, device, ownership, and recovery events.",
+			action: () => this.finishCollaborationAction(() => this.host.refreshSecurityAudit?.() ?? Promise.resolve()),
+		});
+		return { type: "group", heading: "Security audit", items };
+	}
+
+	private buildVaultGovernanceGroup(): SettingDefinitionItem {
+		const localName = this.host.getFolderName().trim() || "Vault";
+		return {
+			type: "group",
+			heading: "Vault governance",
+			items: [
+				{
+					name: "Rename shared vault",
+					desc: "Change the server metadata shown to all members and the operator. Local folder names are unaffected.",
+					action: () => this.openVaultRename(localName),
+				},
+				{
+					name: "Request vault destruction",
+					desc: "Create a durable destruction request. Nothing is deleted until the deployment operator separately confirms it.",
+					action: () => this.confirmVaultDestruction(),
+				},
+			],
+		};
+	}
+
+	private openVaultRename(initialName: string): void {
+		new VaultNameModal(
+			this.app,
+			initialName,
+			(name) => this.finishCollaborationAction(() => this.host.renameSharedVault?.(name) ?? Promise.resolve()),
+		).open();
+	}
+
+	private confirmVaultDestruction(): void {
+		new ConfirmModal(
+			this.app,
+			"Request permanent vault destruction?",
+			"The operator must confirm this durable request. Confirmation permanently purges synchronized vault data; members may still retain local copies.",
+			() => this.finishCollaborationAction(() => this.host.requestVaultDestruction?.() ?? Promise.resolve()),
+			"Request destruction",
+		).open();
+	}
+
+	private confirmDeviceRevocation(deviceId: string, deviceName: string): void {
+		new ConfirmModal(
+			this.app,
+			`Revoke ${deviceName}?`,
+			"That device stops syncing after the durable authority fence. Its local notes and unpublished cache are not remotely deleted.",
+			() => this.finishCollaborationAction(() => this.host.revokeVaultDevice?.(deviceId) ?? Promise.resolve()),
+			"Revoke device",
+		).open();
+	}
+
+	private confirmMemberRemoval(principalId: string, displayName: string): void {
+		new ConfirmModal(
+			this.app,
+			`Remove ${displayName}?`,
+			"This revokes the person's membership and all linked devices. Vault content already present on their devices cannot be remotely erased.",
+			() => this.finishCollaborationAction(() => this.host.removeVaultMember?.(principalId) ?? Promise.resolve()),
+			"Remove person",
+		).open();
+	}
+
+	private confirmOwnershipTransfer(principalId: string, displayName: string): void {
+		if (!this.host.offerOwnershipTransfer) return;
+		new ConfirmModal(
+			this.app,
+			`Transfer vault ownership to ${displayName}?`,
+			"They must accept before ownership changes. After acceptance, you become a full member and lose governance, recovery, and membership controls.",
+			() => this.finishCollaborationAction(() => this.host.offerOwnershipTransfer?.(principalId) ?? Promise.resolve()),
+			"Create transfer offer",
+		).open();
+	}
+
+	private confirmAcceptOwnershipTransfer(transferId: string): void {
+		new ConfirmModal(
+			this.app,
+			"Accept vault ownership?",
+			"Your authority revision changes atomically. YAOS preserves any work that cannot settle before the transfer fence.",
+			() => this.finishCollaborationAction(() => this.host.acceptOwnershipTransfer?.(transferId) ?? Promise.resolve()),
+			"Accept ownership",
+		).open();
+	}
+
+	private confirmCancelOwnershipTransfer(transferId: string): void {
+		new ConfirmModal(
+			this.app,
+			"Cancel ownership transfer?",
+			"The invited member will no longer be able to accept this offer.",
+			() => this.finishCollaborationAction(() => this.host.cancelOwnershipTransfer?.(transferId) ?? Promise.resolve()),
+			"Cancel offer",
+		).open();
+	}
+
+	private finishCollaborationAction(action: () => Promise<void>): void {
+		void action()
+			.catch((error: unknown) => new Notice(`Collaboration action failed: ${error instanceof Error ? error.message : String(error)}`, 8000))
+			.finally(() => this.update());
 	}
 
 	async submitEnrollment(): Promise<boolean> {
@@ -853,6 +1101,13 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 		const links = await this.host.mintDevicePairing();
 		if (!links) return false;
 		new PairDeviceModal(this.app, links.deepLink, links.mobileUrl).open();
+		return true;
+	}
+
+	async openInvitation(): Promise<boolean> {
+		const links = await this.host.mintPersonInvitation?.() ?? null;
+		if (!links) return false;
+		new PairDeviceModal(this.app, links.deepLink, links.mobileUrl, "person").open();
 		return true;
 	}
 

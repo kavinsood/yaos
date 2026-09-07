@@ -39,8 +39,13 @@ export interface CachedSocketTicket {
 	ttlMs: number;
 }
 
+export interface SocketTicketScope {
+	purpose: "root" | "body";
+	documentId: string;
+}
+
 export interface SocketTicketCache {
-	get(host: string, deviceToken: string, vaultId: string): Promise<CachedSocketTicket>;
+	get(host: string, deviceToken: string, vaultId: string, scope: SocketTicketScope): Promise<CachedSocketTicket>;
 	invalidate(): void;
 }
 
@@ -51,15 +56,15 @@ export function createSocketTicketCache(request: HttpRequester = obsidianRequest
 	let revision = 0;
 
 	return {
-		async get(host: string, deviceToken: string, vaultId: string): Promise<CachedSocketTicket> {
-			const key = `${host.replace(/\/$/, "")}\0${deviceToken}\0${vaultId}`;
+		async get(host: string, deviceToken: string, vaultId: string, scope: SocketTicketScope): Promise<CachedSocketTicket> {
+			const key = `${host.replace(/\/$/, "")}\0${deviceToken}\0${vaultId}\0${scope.purpose}\0${scope.documentId}`;
 			const now = Date.now();
 			if (cached && cachedKey === key && cached.localExpiresAt - now > TICKET_REFRESH_BUFFER_MS) {
 				return cached;
 			}
 			if (inFlight?.key === key && inFlight.revision === revision) return inFlight.promise;
 			const requestRevision = revision;
-			const promise = fetchSocketTicket(host, deviceToken, vaultId, request).then((fresh) => {
+			const promise = fetchSocketTicket(host, deviceToken, vaultId, scope, request).then((fresh) => {
 				if (revision === requestRevision) {
 					cached = fresh;
 					cachedKey = key;
@@ -101,6 +106,7 @@ async function fetchSocketTicket(
 	host: string,
 	deviceToken: string,
 	vaultId: string,
+	scope: SocketTicketScope,
 	request: HttpRequester,
 ): Promise<CachedSocketTicket> {
 	const base = host.replace(/\/$/, "");
@@ -108,6 +114,8 @@ async function fetchSocketTicket(
 		url: `${base}/vault/${encodeURIComponent(vaultId)}/auth/ticket`,
 		method: "POST",
 		headers: { Authorization: `Bearer ${deviceToken}` },
+		contentType: "application/json",
+		body: JSON.stringify(scope),
 	});
 
 	if (res.status !== 200) {

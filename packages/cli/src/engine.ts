@@ -302,6 +302,12 @@ export class DaemonEngine {
 			vaultGeneration: membership.vaultGeneration,
 			originImportPending: membership.originImportPending,
 			deviceName: membership.deviceName,
+			principalId: membership.principalId,
+			vaultRole: membership.role,
+			membershipRevision: membership.membershipRevision,
+			deviceCredentialRevision: membership.deviceCredentialRevision,
+			capabilityDigest: membership.capabilityDigest,
+			authorityCapabilities: [...membership.capabilities],
 			debug: config.debug,
 			settingsSyncEnabled: false,
 			enableAttachmentSync: false,
@@ -410,12 +416,13 @@ export class DaemonEngine {
 			database,
 			request: requester,
 			webSocket: WebSocket as unknown as WebSocketImplementation,
-			getSocketTicket: async (force = false) => {
+			getSocketTicket: async (scope, force = false) => {
 				if (force) tickets.invalidate();
 				return tickets.get(
 					this.membership.host,
 					this.membership.deviceToken,
 					this.membership.vaultId,
+					scope,
 				);
 			},
 			log: (message) => this.log(`[sync] ${message}`),
@@ -551,7 +558,7 @@ export class DaemonEngine {
 		const providerSynced = await vaultSync.waitForProviderSync();
 		if (vaultSync.fatalAuthError) throw this.recordFatalAuth();
 		if (!providerSynced) {
-			throw new StartupError(`Timed out waiting for ${this.membership.host} to synchronize the schema-6 root`);
+			throw new StartupError(`Timed out waiting for ${this.membership.host} to synchronize the schema-7 root`);
 		}
 		await this.admitAuthoritativeDiskChanges(await host.scanMarkdown());
 		const mode = vaultSync.getSafeReconcileMode();

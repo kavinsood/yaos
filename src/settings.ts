@@ -6,5 +6,6 @@ export {
 export {
 	VaultSyncSettingTab,
 	type VaultRosterDevice,
+	type VaultSecurityAuditEvent,
 	type VaultSyncSettingsHost,
 } from "./settings/settingsTab";

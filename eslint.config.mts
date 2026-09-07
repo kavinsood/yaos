@@ -5,7 +5,7 @@ import { globalIgnores } from "eslint/config";
 
 export default tseslint.config(
 	{
-		files: ["src/**/*.ts"],
+		files: ["src/**/*.ts", "yaos-plugin-api.d.ts"],
 		languageOptions: {
 			globals: {
 				...globals.browser,

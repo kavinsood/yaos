@@ -3,8 +3,8 @@ const DB_NAME = "yaos-settings-sync";
 const DB_VERSION = 2;
 const STORE = "applyQueue";
 const ACCEPTANCE_STORE = "environmentAcceptance";
-const RECORD_VERSION = 1;
-const ACCEPTANCE_RECORD_VERSION = 1;
+const RECORD_VERSION = 2;
+const ACCEPTANCE_RECORD_VERSION = 2;
 
 export const SETTINGS_SYNC_DB_NAME = DB_NAME;
 export const APPLY_QUEUE_STORE = STORE;
@@ -16,6 +16,9 @@ export type ApplyQueueIdentity = {
 	vaultGeneration: string;
 	folderKey: string;
 	deviceId: string;
+	principalId?: string;
+	membershipRevision?: number;
+	deviceCredentialRevision?: number;
 	configDirKey: string;
 };
 
@@ -24,13 +27,13 @@ export type ApplyQueueScope = ApplyQueueIdentity & {
 };
 
 export type PersistedApplyQueue = {
-	version: 1;
+	version: 1 | 2;
 	identity: ApplyQueueIdentity;
 	steps: unknown[];
 	nextIndex: number;
 };
 type PersistedEnvironmentAcceptance = {
-	version: 1;
+	version: 1 | 2;
 	accepted: true;
 	identity: ApplyQueueIdentity;
 };
@@ -43,6 +46,9 @@ export function buildApplyQueueKey(identity: ApplyQueueIdentity): string {
 		identity.vaultGeneration,
 		identity.folderKey,
 		identity.deviceId,
+		identity.principalId ?? "",
+		String(identity.membershipRevision ?? 0),
+		String(identity.deviceCredentialRevision ?? 0),
 		identity.configDirKey,
 	].map((part) => `${part.length}:${part}`).join("|");
 }
@@ -100,7 +106,7 @@ export async function loadEnvironmentAcceptance(scope: ApplyQueueScope): Promise
 export async function markEnvironmentAccepted(scope: ApplyQueueScope): Promise<void> {
 	assertIdentity(scope);
 	const record: PersistedEnvironmentAcceptance = {
-		version: ACCEPTANCE_RECORD_VERSION,
+		version: identityVersion(scope),
 		accepted: true,
 		identity: copyIdentity(scope),
 	};
@@ -127,13 +133,14 @@ function parsePersisted(raw: unknown, expected: ApplyQueueIdentity): PersistedAp
 		keys.length !== 4
 		|| keys.some((key) => !["version", "identity", "steps", "nextIndex"].includes(key))
 	) return null;
-	if (raw.version !== RECORD_VERSION || !isIdentity(raw.identity)) return null;
+	if ((raw.version !== 1 && raw.version !== RECORD_VERSION) || !isIdentity(raw.identity)) return null;
+	if (raw.version !== identityVersion(raw.identity)) return null;
 	if (!sameIdentity(raw.identity, expected)) return null;
 	if (!Array.isArray(raw.steps)) return null;
 	if (!Number.isSafeInteger(raw.nextIndex) || (raw.nextIndex as number) < 0) return null;
 	if ((raw.nextIndex as number) > raw.steps.length) return null;
 	return {
-		version: RECORD_VERSION,
+		version: raw.version,
 		identity: copyIdentity(raw.identity),
 		steps: raw.steps,
 		nextIndex: raw.nextIndex as number,
@@ -151,7 +158,7 @@ function parseAcceptance(
 		|| keys.some((key) => !["version", "accepted", "identity"].includes(key))
 	) return null;
 	if (
-		raw.version !== ACCEPTANCE_RECORD_VERSION
+		(raw.version !== 1 && raw.version !== ACCEPTANCE_RECORD_VERSION)
 		|| raw.accepted !== true
 		|| !isIdentity(raw.identity)
 		|| !sameIdentity(raw.identity, expected)
@@ -159,7 +166,7 @@ function parseAcceptance(
 		return null;
 	}
 	return {
-		version: ACCEPTANCE_RECORD_VERSION,
+		version: raw.version,
 		accepted: true,
 		identity: copyIdentity(raw.identity),
 	};
@@ -167,11 +174,25 @@ function parseAcceptance(
 
 function isIdentity(value: unknown): value is ApplyQueueIdentity {
 	if (!isRecord(value)) return false;
-	const keys = ["hostHash", "vaultId", "vaultGeneration", "folderKey", "deviceId", "configDirKey"];
-	if (Object.keys(value).length !== keys.length || Object.keys(value).some((key) => !keys.includes(key))) {
+	const baseKeys = ["hostHash", "vaultId", "vaultGeneration", "folderKey", "deviceId", "configDirKey"];
+	const authorityKeys = ["principalId", "membershipRevision", "deviceCredentialRevision"];
+	const keys = [...baseKeys, ...authorityKeys];
+	if (Object.keys(value).some((key) => !keys.includes(key))) {
 		return false;
 	}
-	return keys.every((key) => typeof value[key] === "string" && value[key].length > 0);
+	const baseValid = baseKeys
+		.every((key) => typeof value[key] === "string" && (value[key] as string).length > 0)
+	if (!baseValid) return false;
+	const authorityPresent = authorityKeys.some((key) => value[key] !== undefined);
+	if (!authorityPresent) return Object.keys(value).length === baseKeys.length;
+	return Object.keys(value).length === keys.length
+		&& typeof value.principalId === "string" && value.principalId.length > 0
+		&& Number.isSafeInteger(value.membershipRevision) && (value.membershipRevision as number) > 0
+		&& Number.isSafeInteger(value.deviceCredentialRevision) && (value.deviceCredentialRevision as number) > 0;
+}
+
+function identityVersion(identity: ApplyQueueIdentity): 1 | 2 {
+	return identity.principalId && identity.membershipRevision && identity.deviceCredentialRevision ? 2 : 1;
 }
 
 function assertIdentity(value: ApplyQueueIdentity): void {
@@ -184,6 +205,9 @@ function sameIdentity(left: ApplyQueueIdentity, right: ApplyQueueIdentity): bool
 		&& left.vaultGeneration === right.vaultGeneration
 		&& left.folderKey === right.folderKey
 		&& left.deviceId === right.deviceId
+		&& left.principalId === right.principalId
+		&& left.membershipRevision === right.membershipRevision
+		&& left.deviceCredentialRevision === right.deviceCredentialRevision
 		&& left.configDirKey === right.configDirKey;
 }
 
@@ -194,6 +218,11 @@ function copyIdentity(value: ApplyQueueIdentity): ApplyQueueIdentity {
 		vaultGeneration: value.vaultGeneration,
 		folderKey: value.folderKey,
 		deviceId: value.deviceId,
+		...(value.principalId && value.membershipRevision && value.deviceCredentialRevision ? {
+			principalId: value.principalId,
+			membershipRevision: value.membershipRevision,
+			deviceCredentialRevision: value.deviceCredentialRevision,
+		} : {}),
 		configDirKey: value.configDirKey,
 	};
 }

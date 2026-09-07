@@ -18,6 +18,7 @@ import type {
 import { suite } from "../harness.ts";
 import { installDomCrypto } from "./helpers/installDomCrypto";
 import { partialOf } from "../mocks/productFixture.ts";
+import type { VaultAuthorityIdentity } from "../../src/collaboration/authority";
 
 installDomCrypto();
 const s = suite("attachment-publication-replay");
@@ -105,8 +106,8 @@ class AttachmentServer {
 	isClientReady: (() => boolean) | null = null;
 
 	constructor() {
-		this.root.getMap("sys").set("schemaVersion", 6);
-		this.root.getMap("sys").set("protocolVersion", 2);
+		this.root.getMap("sys").set("schemaVersion", 7);
+		this.root.getMap("sys").set("protocolVersion", 3);
 	}
 
 	loseNextResponse(): void {
@@ -141,6 +142,10 @@ class AttachmentServer {
 	port(): VaultServerPort {
 		return partialOf<VaultServerPort>({
 			publishAttachment: async (mutation) => this.publish(mutation),
+			committedOperationOutcome: async ({ operationId, requestDigest }) => {
+				const receipt = this.receipts.get(operationId);
+				return receipt ? { operationId, requestDigest, vaultSequence: receipt.vaultSequence, committed: true } : null;
+			},
 		});
 	}
 
@@ -254,11 +259,15 @@ interface RuntimeFixture {
 	reconciliations: string[][];
 }
 
-async function startRuntime(state: MemoryState, server: AttachmentServer): Promise<RuntimeFixture> {
+async function startRuntime(
+	state: MemoryState,
+	server: AttachmentServer,
+	authority?: VaultAuthorityIdentity,
+): Promise<RuntimeFixture> {
 	if (!state.documents.has("root")) {
 		const root = new Y.Doc({ guid: "root" });
-		root.getMap("sys").set("schemaVersion", 6);
-		root.getMap("sys").set("protocolVersion", 2);
+		root.getMap("sys").set("schemaVersion", 7);
+		root.getMap("sys").set("protocolVersion", 3);
 		state.documents.set("root", {
 			documentId: "root",
 			generation: 1,
@@ -297,6 +306,7 @@ async function startRuntime(state: MemoryState, server: AttachmentServer): Promi
 		database: memoryDatabase(state),
 		server: server.port(),
 		providerFactory: () => provider,
+		...(authority ? { getAuthority: () => authority } : {}),
 		onAttachmentReconciliationRequired: (paths) => { reconciliations.push([...paths]); },
 		now: (() => {
 			let value = 100;
@@ -339,6 +349,32 @@ s.test("lost response survives restart with the same operation ID and cleans up 
 	assert.equal(state.attachmentOperations.size, 0, "validated receipt and persisted root remove intent");
 	assert.equal(replayed.runtime.hasPendingLocalWork, false);
 	await replayed.runtime.destroy();
+});
+
+s.test("a stale attachment queue clears only when exact prior authority proves it committed", async () => {
+	const state = createMemoryState();
+	const server = new AttachmentServer();
+	const oldAuthority: VaultAuthorityIdentity = {
+		vaultId: "vault-1", vaultGeneration: "generation-1", principalId: "principal-1",
+		membershipRevision: 1, deviceId: "device-1", deviceCredentialRevision: 1,
+	};
+	const currentAuthority = { ...oldAuthority, membershipRevision: 2 };
+	const mutation: AttachmentPublicationMutation = {
+		operationId: "attachment-fenced", kind: "upsert", path: "attachments/fenced.png",
+		expectedRevision: null, hash: "f".repeat(64), size: 42, mime: "image/png",
+	};
+	await server.port().publishAttachment(mutation);
+	state.attachmentOperations.set(mutation.operationId, {
+		vaultId: "vault-1", vaultGeneration: "generation-1", mutation, localSequence: 1,
+		createdAt: 1, attempts: 1, lastAttemptAt: 1, authority: oldAuthority,
+	});
+	assert.equal(state.attachmentOperations.size, 1);
+	const callsBeforeRecovery = server.calls.length;
+	const second = await startRuntime(state, server, currentAuthority);
+	assert.equal(state.attachmentOperations.size, 0);
+	assert.equal(server.calls.length, callsBeforeRecovery, "stale work is not republished under newer authority");
+	assert.deepEqual(second.reconciliations, [["attachments/fenced.png"]]);
+	await second.runtime.destroy();
 });
 
 s.test("root persistence failure retains the exact upsert for an in-process upload retry", async () => {

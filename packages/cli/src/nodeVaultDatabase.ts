@@ -76,7 +76,7 @@ export class NodeVaultDatabaseIdentityError extends Error {
 
 
 /**
- * Durable schema-6 client persistence for Node 24.
+ * Durable schema-7 client persistence for Node 24.
  *
  * The database owns no sync policy. It is the SQLite implementation of the
  * client database ports, plus the two small daemon-only ledgers that replace

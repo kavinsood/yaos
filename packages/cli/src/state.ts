@@ -4,6 +4,7 @@ import os from "node:os";
 import nodePath from "node:path";
 
 import type { VaultProvisioningProof } from "../../../src/onboarding/provisioningClient";
+import type { VaultCapability, VaultRole } from "../../../src/collaboration/authority";
 import { ConfigError, resolveStateDirectoryOverride } from "./config";
 import { ensureDirectoryDurable, writeFileAtomic } from "./fs";
 
@@ -26,6 +27,12 @@ export interface EnrollmentMembership {
 	readonly deviceId: string;
 	readonly deviceToken: string;
 	readonly deviceName: string;
+	readonly principalId: string;
+	readonly role: VaultRole;
+	readonly membershipRevision: number;
+	readonly deviceCredentialRevision: number;
+	readonly capabilityDigest: string;
+	readonly capabilities: readonly VaultCapability[];
 	readonly originImport: boolean;
 	readonly originImportPending: boolean;
 }
@@ -143,6 +150,12 @@ function readMembership(value: unknown): EnrollmentMembership | null {
 	if (typeof membership.originImport !== "boolean" || typeof membership.originImportPending !== "boolean") {
 		throw new StateIdentityError("Enrollment state has invalid origin import authority");
 	}
+	if ((membership.role !== "owner" && membership.role !== "member")
+		|| !Number.isSafeInteger(membership.membershipRevision) || (membership.membershipRevision as number) < 1
+		|| !Number.isSafeInteger(membership.deviceCredentialRevision) || (membership.deviceCredentialRevision as number) < 1
+		|| !Array.isArray(membership.capabilities) || membership.capabilities.some((capability) => typeof capability !== "string")) {
+		throw new StateIdentityError("Enrollment state has invalid collaboration authority");
+	}
 	return {
 		host: requiredString(membership.host, "membership.host"),
 		vaultId: requiredString(membership.vaultId, "membership.vaultId"),
@@ -150,6 +163,12 @@ function readMembership(value: unknown): EnrollmentMembership | null {
 		deviceId: requiredString(membership.deviceId, "membership.deviceId"),
 		deviceToken: requiredString(membership.deviceToken, "membership.deviceToken"),
 		deviceName: requiredString(membership.deviceName, "membership.deviceName"),
+		principalId: requiredString(membership.principalId, "membership.principalId"),
+		role: membership.role,
+		membershipRevision: membership.membershipRevision as number,
+		deviceCredentialRevision: membership.deviceCredentialRevision as number,
+		capabilityDigest: requiredString(membership.capabilityDigest, "membership.capabilityDigest"),
+		capabilities: membership.capabilities as VaultCapability[],
 		originImport: membership.originImport,
 		originImportPending: membership.originImportPending,
 	};
@@ -158,7 +177,7 @@ function readMembership(value: unknown): EnrollmentMembership | null {
 function readProof(value: unknown): VaultProvisioningProof | null {
 	if (value === null) return null;
 	const proof = record(value, "provisioningProof");
-	if (proof.schemaVersion !== 6 || proof.storageFormatVersion !== 2 || proof.protocolVersion !== 2) {
+	if (proof.schemaVersion !== 7 || proof.storageFormatVersion !== 2 || proof.protocolVersion !== 3) {
 		throw new StateProvisioningMismatchError("Enrollment state has incompatible provisioning proof");
 	}
 	const provisionedAt = proof.provisionedAt;
@@ -169,9 +188,9 @@ function readProof(value: unknown): VaultProvisioningProof | null {
 		vaultId: requiredString(proof.vaultId, "provisioningProof.vaultId"),
 		vaultGeneration: requiredString(proof.vaultGeneration, "provisioningProof.vaultGeneration"),
 		provisionedAt: provisionedAt as number,
-		schemaVersion: 6,
+		schemaVersion: 7,
 		storageFormatVersion: 2,
-	protocolVersion: 2,
+	protocolVersion: 3,
 		runtimeEpoch: requiredString(proof.runtimeEpoch, "provisioningProof.runtimeEpoch"),
 	};
 }

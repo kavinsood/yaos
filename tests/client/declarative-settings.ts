@@ -105,7 +105,7 @@ s.section("Enrollment requires the complete identity tuple");
 	settings.deviceId = "device-id";
 	settings.deviceName = "Mac";
 	names = new Set(collectDefinitions(tab.getSettingDefinitions()).map((definition) => definition.name));
-	for (const name of ["Status", "Folder", "Vault ID", "This device", "Pair another device", "Device credentials", "Open server console", "Leave this vault", "Refresh roster"]) {
+	for (const name of ["Status", "Folder", "Vault ID", "This device", "Add my device", "Device credentials", "Open server console", "Leave this vault", "Refresh roster"]) {
 		s.check(names.has(name), `${name} is exposed while enrolled`);
 	}
 	const vaultId = collectDefinitions(tab.getSettingDefinitions()).find((definition) => definition.name === "Vault ID");
@@ -183,6 +183,37 @@ s.section("Pairing mint failure has one owner");
 	});
 	s.check(!await tab.openPairing(), "mint failure does not open a pairing modal");
 	s.check(mintCalls === 1, "settings delegates mint failure reporting exactly once");
+}
+
+s.section("Ownership transfer offers require explicit owner/member actions");
+{
+	const owner = createFixture({
+		getVaultRoster: () => [
+			{ deviceId: "principal-owner", principalId: "principal-owner", name: "Owner", displayName: "Owner", role: "owner", state: "active", deviceCount: 1 },
+			{ deviceId: "principal-member", principalId: "principal-member", name: "Alice", displayName: "Alice", role: "member", state: "active", deviceCount: 2 },
+		],
+	});
+	Object.assign(owner.settings, {
+		host: "https://sync.example", deviceToken: "token", vaultId: "vault", deviceId: "device-owner",
+		principalId: "principal-owner", vaultRole: "owner",
+	});
+	const alice = collectDefinitions(owner.tab.getSettingDefinitions()).find((definition) => definition.name === "Transfer ownership to Alice");
+	s.check(typeof alice?.action === "function", "owner can explicitly offer ownership to an active member");
+	const removeAlice = collectDefinitions(owner.tab.getSettingDefinitions()).find((definition) => definition.name === "Remove Alice");
+	s.check(typeof removeAlice?.action === "function", "owner can explicitly remove an active member");
+
+	const member = createFixture({
+		getVaultRoster: () => [
+			{ deviceId: "principal-owner", principalId: "principal-owner", name: "Owner", displayName: "Owner", role: "owner", state: "active", deviceCount: 1 },
+		],
+		getOwnershipTransfers: () => [{ transferId: "transfer", fromPrincipalId: "principal-owner", toPrincipalId: "principal-member", createdAt: 1, expiresAt: 2 }],
+	});
+	Object.assign(member.settings, {
+		host: "https://sync.example", deviceToken: "token", vaultId: "vault", deviceId: "device-member",
+		principalId: "principal-member", vaultRole: "member",
+	});
+	const accept = collectDefinitions(member.tab.getSettingDefinitions()).find((definition) => definition.name.startsWith("Accept ownership"));
+	s.check(typeof accept?.action === "function", "target member sees an explicit accept action for a server-listed offer");
 }
 
 s.section("Settings sync controls preserve the current settings surface");

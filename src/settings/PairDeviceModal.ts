@@ -18,6 +18,7 @@ export class PairDeviceModal extends Modal {
 		app: App,
 		private readonly deepLink: string,
 		private readonly mobileUrl: string,
+		private readonly kind: "device" | "person" = "device",
 	) {
 		super(app);
 	}
@@ -27,9 +28,12 @@ export class PairDeviceModal extends Modal {
 		contentEl.empty();
 		contentEl.addClass("yaos-pair-device-modal");
 
-		contentEl.createEl("h3", { text: "Pair another device" });
+		const person = this.kind === "person";
+		contentEl.createEl("h3", { text: person ? "Invite person" : "Add my device" });
 		contentEl.createEl("p", {
-			text: "Scan this one-shot pairing link on the other device. The link carries only the server address and pairing code.",
+			text: person
+				? "Anyone with this one-shot link can download and change the complete vault. Send it only to the person you intend to invite."
+				: "Scan this one-shot device link on your other device. It joins the same person and never creates another member.",
 			cls: "yaos-modal-copy",
 		});
 
@@ -51,7 +55,7 @@ export class PairDeviceModal extends Modal {
 			loadingEl.remove();
 			if (this.qrCanvas) {
 				this.qrCanvas.hidden = false;
-				this.qrCanvas.setAttr("aria-label", "Device pairing code");
+				this.qrCanvas.setAttr("aria-label", person ? "Person invitation code" : "Device linking code");
 			}
 		}).catch(() => {
 			loadingEl.setText("Could not generate a pairing code.");

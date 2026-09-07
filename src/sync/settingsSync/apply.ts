@@ -88,6 +88,9 @@ export type ApplyContext = {
 	vaultGeneration: string;
 	folderKey: string;
 	deviceId: string;
+	principalId?: string;
+	membershipRevision?: number;
+	deviceCredentialRevision?: number;
 	configDirKey: string;
 	indexedDb?: Pick<IDBFactory, "open">;
 	isHidden?: () => boolean;
@@ -111,13 +114,16 @@ export async function persistAndRunApplyBatch(
 	if (batch.key !== ctx.configDirKey) throw new Error("settings apply batch identity mismatch");
 	const identity = scopeOf(ctx);
 	const record: PersistedApplyQueue = {
-		version: 1,
+		version: ctx.principalId && ctx.membershipRevision && ctx.deviceCredentialRevision ? 2 : 1,
 		identity: {
 			hostHash: identity.hostHash,
 			vaultId: identity.vaultId,
 			vaultGeneration: identity.vaultGeneration,
 			folderKey: identity.folderKey,
 			deviceId: identity.deviceId,
+			principalId: identity.principalId,
+			membershipRevision: identity.membershipRevision,
+			deviceCredentialRevision: identity.deviceCredentialRevision,
 			configDirKey: identity.configDirKey,
 		},
 		steps: batch.steps,
@@ -142,6 +148,9 @@ function scopeOf(ctx: ApplyContext): ApplyQueueScope {
 		vaultGeneration: ctx.vaultGeneration,
 		folderKey: ctx.folderKey,
 		deviceId: ctx.deviceId,
+		principalId: ctx.principalId ?? "",
+		membershipRevision: ctx.membershipRevision ?? 0,
+		deviceCredentialRevision: ctx.deviceCredentialRevision ?? 0,
 		configDirKey: ctx.configDirKey,
 		indexedDb: ctx.indexedDb,
 	};

@@ -44,6 +44,12 @@ export function getFatalSyncNotice(
 				timeout: 12_000,
 			};
 		}
+		case "authority_superseded":
+			return { message: "YAOS: your vault authority changed. Pending work was preserved; refresh membership before reconnecting.", timeout: 12_000 };
+		case "membership_revoked":
+			return { message: "YAOS: your vault membership ended. Local notes and unpublished work remain on this device.", timeout: 12_000 };
+		case "device_revoked":
+			return { message: "YAOS: this device was revoked. Local notes and unpublished work remain on this device.", timeout: 12_000 };
 		case "unauthorized":
 		default:
 			return { message: "Unauthorized. Re-enroll this device with a fresh pairing code." };
