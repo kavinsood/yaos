@@ -1,6 +1,6 @@
 # Sync and conflict contract
 
-This is the current schema-6 contract for `main`. [BACKLOG.md](BACKLOG.md) contains only evidenced unresolved risks and missing external-scale proof.
+This is the current schema-7 contract for `main`. [BACKLOG.md](BACKLOG.md) contains only evidenced unresolved risks and missing external-scale proof.
 
 ## Subjects
 
@@ -12,17 +12,19 @@ This is the current schema-6 contract for `main`. [BACKLOG.md](BACKLOG.md) conta
 | Folders | Derived from paths; empty folders are not synchronized |
 | Attachments and special formats | Generation-scoped, content-addressed R2 objects when configured |
 | Recovery | Optional asynchronous recovery-v2 snapshots when R2 and `RecoveryJob` are configured |
-| Obsidian settings | Allowlisted paths and package intents in a named, bounded SQL environment |
+| Obsidian settings | Allowlisted paths and package intents in a principal-owned, named SQL environment |
 
 Canvas, Excalidraw, Base, and other non-Markdown formats use the attachment plane rather than Markdown character merging.
 
 ## Vault, membership, and transport scope
 
-One server hosts multiple independent vaults. A physical installation may enroll different folders in different vaults, but each device identity and bearer is one vault membership. Each local folder stores that membership and has its own schema-6 IndexedDB database.
+One server hosts multiple independent vaults. Each active vault has exactly one owner and any number of members. Both roles are full content peers for the complete vault; only the owner governs membership, other people's devices, recovery, audit, vault policy and metadata, ownership transfer, and destruction. YAOS has no viewer role, delegated administrator, folder ACL, or per-person capability toggle.
 
-A pairing code selects one vault and is consumed once. Pairing creates a new full-peer membership; it never copies another folder's bearer. Leave revokes one membership and keeps disk files. Operator kick revokes one membership. Operator destroy revokes the full vault before generation-scoped physical cleanup.
+A principal is a stable vault-scoped person identity; a device is one separately revocable credential-bearing installation for that principal. **Invite person** creates a member principal and first device. **Add my device** adds a device to the current principal. Both codes are one-use, expire, and are purpose-bound. Each local folder stores its complete principal/membership/device authority tuple and has its own schema-7 IndexedDB database.
 
-All vault HTTP requests use a device bearer and vault ID. WebSocket URLs never carry that long-lived bearer. The client exchanges it for a short-lived device ticket; root and body handshakes require the ticket plus exact `schemaVersion=6` and `protocolVersion=2`. Membership and active vault state are checked before every admission, and protocol-level liveness must acknowledge the exact current socket before it is treated as responsive.
+All vault HTTP requests use a device bearer and vault ID. The control plane resolves a trusted actor containing vault generation, principal ID, membership revision, device ID, credential revision, owner/member role, policy version, and capability digest; the vault runtime accepts no caller-asserted identity. WebSocket URLs never carry the long-lived bearer. The client exchanges it for a short-lived protocol-3 ticket bound to the deployment, exact actor, purpose, and document. Root and body handshakes require exact `schemaVersion=7` and `protocolVersion=3`, current control-plane authority, current vault-mirror authority, and exact application liveness.
+
+Leave revokes a member principal and all of their devices while keeping ordinary files. Revoking a member's final device has the same membership effect. The owner cannot self-leave or revoke the last owner device. Owner loss is repaired by an audited, operator-issued one-use recovery code. Operator destroy revokes the full vault before generation-scoped physical cleanup.
 
 Attachment heads are revisioned. Every active reference and tombstone carries the operation ID which created it. Upsert, delete, and rename publications name the exact revisions they expect; revision comparison, root mutation, catalog events, and the replay ledger commit atomically under the vault mutation lease. Reusing an operation ID succeeds only for the same canonical request digest. Clients persist publications in a transactionally allocated local sequence, distinguish committed, durably pending, and superseded outcomes, and never silently rebase a superseded operation.
 
@@ -48,19 +50,25 @@ The root socket carries structural state. Each active Markdown body has a separa
 Authority is split by domain:
 
 - SQL metadata binds `vaultId` to one `vaultGeneration`.
+- The control plane owns principal profiles, owner/member memberships, device credentials, invitation/device-link purpose, and security audit.
+- The vault SQL mirror owns current principal and device revisions at the durable mutation boundary.
 - The durable SQL sequence, catalog, lifecycle records, document heads, candidate receipts, and recovery authority are the server source of truth.
 - The root Yjs document is the replicated structural view: path-to-body identity, attachment references, tombstones, and schema metadata.
 - A Markdown body Yjs document owns only one file's text.
 - IndexedDB stores the local root, bodies, pending candidates, lifecycle intents, bootstrap progress, and disk baselines. It is a retry/cache boundary, not the shared conflict winner.
 - Disk and live editors are observed local authorities subject to reconciliation and preservation rules.
 - An R2 recovery point becomes restore input only through an explicit restore; it never becomes the live server authority directly.
-- Named settings environments live in a SQL sidecar inside the vault Durable Object. They are not part of the root/body Yjs documents, attachment objects, or recovery R2 objects.
+- Principal-owned named settings environments live in a SQL sidecar inside the vault Durable Object. They are not part of root/body Yjs, attachment objects, or recovery R2 objects.
 
 `vaultGeneration` fences one vault incarnation. `runtimeEpoch` fences receipts and job capabilities to one server runtime. Neither may be inferred from display names.
 
+Every durable mutation revalidates its trusted actor inside the same serialized vault boundary that installs authority changes. If the mutation orders first it commits under the old authority; if the fence orders first the mutation fails with `authority_superseded`. The client must not relabel or replay queued work under a different membership or credential revision. It preserves that work locally, while an exact operation-ID and request-digest lookup may recover only an outcome already committed by the same actor.
+
+Root awareness preserves one live instance per device/socket. The server rewrites identity-bearing awareness fields from the vault authority mirror, so peers see the principal display name/color and the actual device ID rather than caller-selected identity. UI may group devices under a person, but transport state remains per device.
+
 ## Body candidates and structural lifecycle
 
-A local Markdown update is persisted as a device-scoped candidate before submission. Candidate identity is the tuple of device ID, body ID, candidate ID, and digest.
+A local Markdown update is persisted as an authority-scoped candidate before submission. Candidate identity retains device ID, body ID, candidate ID, and digest, while admission and durable attribution additionally bind the current principal, membership revision, and device credential revision.
 
 The candidate digest names the encoded Yjs update bytes, not the note's logical
 text. Catalog content hashes and disk baselines name canonical Markdown bytes
@@ -105,7 +113,7 @@ Attachment bytes are uploaded before their structural reference. Upsert, delete,
 
 ### Scope, storage, and allowlist
 
-Settings scope is the vault plus `configDirKey`, the sanitized basename of `app.vault.configDir`; there is no user principal. The key must be 1–64 characters and cannot be `.`, `..`, contain NUL, `/`, or `\`. Folder names such as `.obsidian` and `.obsidian-mobile` therefore select distinct named environments in the same vault.
+Settings scope is `vaultId + principalId + configDirKey`, where `configDirKey` is the sanitized basename of `app.vault.configDir`. The key must be 1–64 characters and cannot be `.`, `..`, contain NUL, `/`, or `\`. Folder names such as `.obsidian` and `.obsidian-mobile` select distinct environments for the same principal. Different principals cannot read or mutate one another's environments, and ownership transfer does not move settings between people.
 
 The exact file allowlist is:
 
@@ -140,13 +148,13 @@ YAOS resolves package repositories from Obsidian's published plugin/theme catalo
 
 ### Durable apply and lifecycle
 
-An explicit take/replace decision and its complete apply plan precede the first disk or package mutation. Queue and later acceptance identities are exactly `hostHash + vaultId + vaultGeneration + folderKey + deviceId + configDirKey`; records with any other identity never authorize or resume work. The acceptance marker commits only after successful seed/take/replace, while a crash during take resumes the already-consented queue before that marker exists. The runner checkpoints the first unexecuted step after every attempt, resumes the same ordered plan at startup, pauses when its runtime generation is inactive, and clears only after all steps complete. A malformed record is not executed. Individual quarantined or failed steps are reported and skipped so later steps can proceed; a crash before checkpoint replays the current idempotent step.
+An explicit take/replace decision and its complete apply plan precede the first disk or package mutation. Queue and later acceptance identities are exactly `hostHash + vaultId + vaultGeneration + folderKey + principalId + membershipRevision + deviceId + deviceCredentialRevision + configDirKey`; records with any other identity never authorize or resume work. The acceptance marker commits only after successful seed/take/replace, while a crash during take resumes the already-consented queue before that marker exists. The runner checkpoints the first unexecuted step after every attempt, resumes only under the same active authority, and clears only after all steps complete. A malformed or superseded record is not executed.
 
 A full take/manual apply orders: ordinary root JSON except `appearance.json`/`workspaces.json`; CSS snippets; `appearance.json`; theme installs; `appearance.json` again when themes were installed; plugin installs; version-gated plugin data; plugin enabled/disabled state; plugin/theme tombstones; then `workspaces.json`. This keeps workspace activation out of the apply path; a missing or newly changed local manifest still holds plugin data until a later gate sees all three versions equal.
 
-Stopping the runtime waits for the serialized settings operation, removes watchers/timers, and restores the exact Obsidian installer hooks. Re-enrollment and **Leave this vault** retire only the old membership's exact apply queue and acceptance and clear deferral; configuration files remain on disk. Device revocation blocks subsequent bearer requests. Vault destruction makes the environment inaccessible immediately and removes the settings sidecar when that generation's vault SQL is deleted.
+Stopping the runtime waits for the serialized settings operation, removes watchers/timers, and restores the exact Obsidian installer hooks. Re-enrollment and **Leave this vault** retire only the old authority's exact apply queue and acceptance and clear deferral; configuration files remain on disk. Device or membership revocation blocks subsequent bearer requests. Ownership transfer preserves both principals' separate settings. Vault destruction makes every environment inaccessible immediately and removes the settings sidecar when that generation's vault SQL is deleted.
 
-Settings sync starts only after enrollment, exact `settingsSync=true` capability, and `settingsFormatVersion=1`. Its HTTP route requires the current device bearer and selected vault; the public router supplies trusted device/vault/generation authority to the vault runtime and does not forward the bearer. Exactly one format declaration is required. If capability is absent, format is incompatible, the local switch is off, initialization is deferred, or a decision is still required with no durable consented queue, settings mutation/watch loops do not run and note sync remains unaffected.
+Settings sync starts only after enrollment, active authority with `vault.settings.personal.sync`, exact `settingsSync=true`, and `settingsFormatVersion=1`. Its HTTP route requires the current device bearer and selected vault; the public router supplies the full trusted actor and the vault runtime derives the principal namespace rather than trusting a path parameter. Exactly one format declaration is required. If authority or capability is absent, format is incompatible, the local switch is off, initialization is deferred, or a decision is still required with no durable consented queue, settings loops do not run and note sync remains unaffected.
 
 The clash set is official Obsidian Sync (`sync`), Remotely Save (`remotely-save`), LiveSync (`obsidian-livesync`), and System3 Relay (`system3-relay`), with official Sync taking precedence in the reported reason.
 
@@ -202,7 +210,7 @@ Unresolved paths remain guarded from later scan/import resurrection until explic
 
 Ordinary Markdown sync and SQL bootstrap do not depend on recovery storage. If either R2 or `RecoveryJob` is absent, the recovery API reports unavailable and core sync continues.
 
-Capture is asynchronous. The vault authority pins one SQL boundary; a generation-scoped job materializes verified content, builds bounded active/deleted/attachment manifest trees, and publishes one immutable format-2 root. `complete_with_gaps` is a successful terminal state only because every unavailable entry and its reason remain explicit.
+Capture is asynchronous. The vault authority pins one SQL boundary; a generation-scoped job materializes verified content, builds bounded active/deleted/attachment manifest trees, and publishes one immutable format-2 root. `complete_with_gaps` is a successful terminal state only because every unavailable entry and its reason remain explicit. Recovery points contain content, never principals, memberships, devices, invitations, revocations, authority changes, settings environments, or security audit.
 
 Restore is asynchronous and selection-scoped. The client must:
 
@@ -220,6 +228,7 @@ GC and purge can delete only keys under the exact `vaultId`/`vaultGeneration` pr
 The receipt contract is candidate-based, not state-vector dominance:
 
 - a durable body receipt identifies device, candidate, digest, body generation, vault sequence, `vaultGeneration`, and `runtimeEpoch`;
+- durable mutation attribution records the admitted principal and device at commit boundaries, without claiming character-level authorship;
 - the local candidate remains pending until that exact durable receipt is persisted;
 - lifecycle receipts separately confirm structural operations before root publication;
 - reconnect retries are idempotent.
@@ -244,14 +253,16 @@ Forbidden claims:
 - Corrupt or inconsistent SQL state: fail closed.
 - Wrong vault generation, stale candidate, inactive body, or mismatched digest: reject.
 - Missing or invalid ticket/schema/protocol declaration: reject before room admission.
-- Revoked membership: remove admission immediately, persist a device-fence obligation, terminate active sockets, and retain operator-visible retry state until the vault runtime acknowledges the fence.
+- Revoked device or membership: remove new admission immediately, persist an idempotent authorization change, install it in the serialized vault mutation order, close affected sockets, and retain retry state until the vault runtime acknowledges the fence.
+- Ownership transfer: require target acceptance, atomically swap the two membership roles through one multi-subject fence, and never expose zero or two owners.
+- Lost mutation response followed by authority change: permit only exact committed-outcome lookup; never replay new work under stale or newly acquired authority.
 - IndexedDB or bootstrap settlement failure: retain retry state; do not claim readiness.
 - Unknown filesystem deletion baseline: preserve.
 - Missing R2: disable attachments and recovery; continue Markdown root/body sync.
 - Missing `RecoveryJob`: disable recovery; continue Markdown root/body sync.
 - Recovery job retry/gap/failure: expose the state; do not report false completion.
 - Diagnostics persistence failure: lose bounded diagnostics; continue sync.
-- Settings capability absent, settings format mismatch, local switch off, deferred choice, decision-required state without a durable consented queue, or detected clash: pause settings sync only; continue note sync. A crash during an already-consented take resumes its exact queue before acceptance commits.
+- Settings authority/capability absent, settings format mismatch, local switch off, deferred choice, decision-required state without a durable consented queue, or detected clash: pause settings sync only; continue note sync. A crash during an already-consented take resumes only its exact principal/device authority queue before acceptance commits.
 - Invalid settings JSON/hash/path, stale queue identity, or plugin-data version mismatch: quarantine or reject the settings item; never widen the allowlist or overwrite the held local value.
 - Restricted/backgrounded/missing package installer: skip or durably pause the package step as specified; continue file LWW where safe.
 

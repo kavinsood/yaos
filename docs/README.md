@@ -1,11 +1,17 @@
 # YAOS documentation
 
-Current `main` has durable engineering documents for the schema-6 product and the Relay-derived text/lifetime program. Git history preserves replaced RFCs, audits, incident reports, and implementation notes; they are not parallel current specifications.
+Current `main` has durable engineering documents for the schema-7 collaboration
+product and the Relay-derived text/lifetime program. Git history preserves
+replaced RFCs, audits, incident reports, and implementation notes; they are not
+parallel current specifications.
 
-- [Architecture](architecture.md) — schema-6 root/body, semantic frontmatter, and revisioned attachment authority, provisioning, settings SQL authority, recovery, and deletion.
+- [Vault collaboration](collaboration.md) — owner/member product contract,
+  people and devices, fixed authority, principal-scoped settings, transfer,
+  revocation, presence, and compatibility.
+- [Architecture](architecture.md) — schema-7 root/body and collaboration authority, principal/device identity, semantic frontmatter, settings, recovery, and deletion.
 - [Sync and conflict contract](sync-contract.md) — current note, attachment, and named settings-environment contracts, including lifecycle and preservation rules.
 - [Canonical Markdown](canonical-markdown.md) — the shared logical text representation, hash domains, and baseline cutover.
-- [Operations](operations.md) — claim, device enrollment, settings setup, required bindings, recovery capability, and the breaking schema-6 deployment boundary.
+- [Operations](operations.md) — claim, invitations/device links, owner recovery and transfer, settings setup, required bindings, recovery, and the schema-7 cutover.
 - [QA](qa.md) — focused, regression, and local Worker coverage, with real-runtime and external evidence gaps stated separately.
 - [Backlog](BACKLOG.md) — only evidenced unresolved product risks and concrete external validation gaps.
 - [Runtime lifecycle and socket admission](runtime-lifecycle-and-admission.md) — publication epochs, bounded drain, and refresh-first socket ownership.

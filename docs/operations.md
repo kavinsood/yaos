@@ -2,17 +2,19 @@
 
 ## Deployment boundary
 
-Schema 6 is a breaking storage and cache boundary. It does not read or migrate earlier room state or IndexedDB attachment queues.
+Schema 7, protocol 3, and control-plane identity format 3 form one breaking collaboration boundary. Older clients are rejected before partial synchronization, and schema-7 clients never open an older local cache.
 
-For the schema-6 cutover:
+For a fresh deployment:
 
 1. preserve the ordinary vault files on at least one trusted device;
-2. deploy a fresh Worker/storage deployment from the current `server/`;
-3. claim it and provision the first vault;
-4. enroll the trusted origin folder with the first pairing code so its local files can enter schema 6;
-5. enroll every joining folder with a distinct new pairing code and a fresh schema-6 local cache.
+2. deploy and claim the current server;
+3. save the operator recovery key and the one-use owner-bootstrap code;
+4. enroll the trusted origin folder as the owner so its local files can enter schema 7;
+5. use **Add my device** for another owner installation or **Invite person** for a collaborator.
 
-Do not point a schema-6 plugin at an earlier deployment or reuse an earlier plugin cache. Exact admission fails closed, but manually reusing storage bypasses the supported boundary.
+An existing schema-6 deployment requires an operator-reviewed identity migration because old device records cannot reveal which devices belong to one person. Select the owner devices explicitly; they become one owner principal, while every ungrouped device becomes a separate full member principal. Settle or preserve old queued work, install the complete vault authority mirror, invalidate old tickets/sockets, and only then activate schema 7/protocol 3. Historical operations remain `legacy_unattributed`; migration never invents a person identity for them.
+
+Do not manually reuse old plugin caches. Exact admission fails closed, but bypassing the guided migration can strand authority or settings state.
 
 The Deploy button creates a detached deployment repository. Upstream changes do not update it automatically. After this breaking cutover, ordinary releases can use the generated repository's updater workflow so deployment and rollback remain Git-visible.
 
@@ -66,7 +68,7 @@ All blob and recovery keys are scoped by both `vaultId` and `vaultGeneration`. D
 
 ## Node server runtime
 
-The Node 24 server uses the same schema-6 domain runtimes as the Worker. Build with `npm run build:server-node`, then run:
+The Node 24 server uses the same schema-7 collaboration and sync domain runtimes as the Worker. Build with `npm run build:server-node`, then run:
 
 ```sh
 YAOS_NODE_HOST=127.0.0.1 \
@@ -164,7 +166,7 @@ docker compose start server
 
 ## Claim and vault provisioning
 
-Open the fresh server URL and choose **Claim**. Save the operator recovery key; the server stores only its hash. Claim reserves a Personal vault, provisions its schema-6 SQL root, activates the exact generation, and returns one pairing code.
+Open the fresh server URL and choose **Claim**. Save the operator recovery key; the server stores only its hash. Claim reserves a Personal vault, provisions its schema-7 SQL root in `awaiting_owner`, and returns a one-use owner-bootstrap code. The first successful owner enrollment and authority fence activate the vault. The operator identity controls deployment recovery and provisioning; it is not automatically a content principal.
 
 Provisioning is a three-step saga: registry reservation, idempotent vault-runtime provisioning, then matching-generation activation. A partial failure remains in `provisioning` state with a retryable error and cannot admit devices as an active vault.
 
@@ -172,15 +174,21 @@ The operator console can create additional vaults through the same saga. Vault d
 
 ## Enroll and operate devices
 
-In an unenrolled folder, enter the Worker URL and a fresh pairing code in YAOS setup or open the setup link. Enrollment returns a `deviceToken`, `deviceId`, and selected `vaultId`.
+In an unenrolled folder, enter the server URL and a fresh setup code in YAOS or open its setup link. Enrollment returns a bearer plus the selected vault generation, principal ID, owner/member role, membership revision, device ID, credential revision, and fixed capability snapshot.
 
-Each folder/device identity belongs to exactly one vault membership. A physical installation may enroll different folders in different vaults, but every membership has its own device ID and bearer. Never copy one folder's token or IndexedDB cache to another.
+Every active vault has exactly one owner. Every other principal is a full member with the same read/write authority over the complete vault. Only the owner manages invitations, other people and devices, recovery, audit, vault policy/metadata, ownership transfer, and destruction. Permissions are fixed; there are no viewers, delegated administrators, folder ACLs, or custom toggles.
 
-The first claim pairing code carries a one-use origin-import role. Before enrollment, the client persists a random request ID, device ID, device token, and pairing code locally. The server stores only hashes and a bounded replay record, so a lost response retries the same enrollment and origin grant without creating a second device. Every later device/invite code is a joining role: joining folders bootstrap from SQL and never upload their disk as initial shared authority.
+A principal represents one vault-scoped person; devices are separately revocable installations. **Add my device** issues a device-link code for the current principal. **Invite person** issues a member-invitation code that creates a new principal and first device. Codes expire after 15 minutes, work once, and cannot be substituted across purposes. Never copy one folder's bearer or IndexedDB cache to another.
 
-An enrolled device can inspect its vault roster, rename itself, mint another one-use pairing code, export only its own credentials, or leave. Pairing codes expire after 15 minutes and work once.
+Before enrollment, the client persists a random request ID, device ID, bearer, and code locally. The server stores only hashes and a bounded replay record, so a lost response retries the exact enrollment without creating a second device or principal. The owner-bootstrap enrollment carries origin-import authority; later invited/device-link folders join from SQL and never upload their disk as initial shared authority.
 
-**Leave this vault** revokes the current membership when reachable, stops sync, clears this folder's enrollment and schema-6 IndexedDB cache, and keeps ordinary files on disk. If revocation fails, local leave still completes and the operator can remove the stale membership.
+An enrolled person can inspect the member roster, rename their own profile and devices, revoke their own non-final device, add another device, or leave if they are a member. The owner can invite/remove members and manage every device. Revoking a member's final active device revokes that membership.
+
+**Leave this vault** revokes the current member and all of their devices when reachable, stops sync, clears this folder's enrollment and schema-7 IndexedDB cache, and keeps ordinary files and configuration on disk. The owner cannot leave or revoke the final owner device. If the owner loses every device, the operator issues an audited one-use owner-recovery code; the operator does not become a vault participant.
+
+Ownership transfer is offered by the current owner to one active member. The target must explicitly accept before one atomic authority fence changes the target to owner and the former owner to member. An unaccepted offer can be cancelled or expires; the vault never exposes zero or two owners.
+
+Membership, device, and ownership changes stop new admission before the vault installs their durable fence. Active sockets for affected principals/devices close after installation. If a local operation belongs to an older membership or credential revision, YAOS preserves it as unpublished work and does not silently replay it under new authority. Exact committed-outcome lookup is only for recovering a lost response to work that already committed.
 
 ## Headless Linux client
 
@@ -194,7 +202,7 @@ node packages/cli/dist/yaos.mjs enroll /srv/vault
 node packages/cli/dist/yaos.mjs daemon /srv/vault
 ```
 
-The pairing code is read from the environment, never argv. Enrollment persists a replay-stable request ID, generated device ID and bearer, vault generation, server-minted name, and origin/import role before the daemon starts. Default state lives under `XDG_STATE_HOME` or `~/.local/state/yaos/headless/`; `YAOS_STATE_DIR` is an explicit state-directory leaf override, not a parent directory. State directories are mode `0700`, credential/database files `0600`, and nothing is written inside the vault except user Markdown.
+The setup code is read from the environment, never argv. Enrollment persists a replay-stable request ID, generated device ID and bearer, vault generation, principal and membership revisions, device credential revision, role, fixed capabilities, server-minted names, and origin/import authority before the daemon starts. Default state lives under `XDG_STATE_HOME` or `~/.local/state/yaos/headless/`; `YAOS_STATE_DIR` is an explicit state-directory leaf override, not a parent directory. State directories are mode `0700`, credential/database files `0600`, and nothing is written inside the vault except user Markdown.
 
 The daemon prints `YAOS_DAEMON_READY <vaultId>` only after bootstrap, origin import when applicable, provider sync, authoritative disk admission, and durable candidate/lifecycle settlement. Exit `2` is terminal identity/admission failure; exit `17` means another process owns that vault state. `SIGINT` and `SIGTERM` stop input, drain disk work and receipts, close SQLite, and release the lock.
 
@@ -202,22 +210,22 @@ Supported: Markdown, one daemon per local vault, external editor/Git changes, co
 
 ## Settings sync setup and operation
 
-Settings sync is enabled by default for a newly enrolled device when the server advertises `settingsSync: true` with `settingsFormatVersion: 1`. Note sync remains independent. Open **Settings → YAOS → Obsidian settings sync** and verify the displayed configuration-folder key; it is the sanitized basename of the active Obsidian configuration directory and names this vault's environment. `.obsidian` and `.obsidian-mobile` do not share settings.
+Settings sync is enabled by default for a newly enrolled device when the active authority includes `vault.settings.personal.sync` and the server advertises `settingsSync: true` with `settingsFormatVersion: 1`. Note sync remains independent. Open **Settings → YAOS → Obsidian settings sync** and verify the displayed configuration-folder key; it is the sanitized basename of the active Obsidian configuration directory and names an environment for the current principal. `.obsidian` and `.obsidian-mobile` do not share settings, and different vault members cannot read or mutate one another's environments.
 
 On first contact, resolve the named environment before any pre-existing remote settings can apply:
 
 1. If the environment is unseeded, choose **Seed from this device** to make this folder its initial authority. The create is atomic and fails if another device seeded first.
 2. If an environment already exists, choose **Take the remote seed** to authorize it for this exact host/vault/generation/folder/device/configuration identity. YAOS persists the complete queue before applying it and commits acceptance only after the take completes.
-3. Choose **Replace remote settings environment** instead when this device must replace an existing environment; replacement tombstones omitted shared plugins/themes and commits acceptance only after success.
+3. Choose **Replace remote settings environment** instead when this device must replace the current principal's existing environment; replacement tombstones omitted synchronized plugins/themes and commits acceptance only after success.
 4. Choose **Decide initial seed later** to withhold acceptance and leave settings unchanged while notes continue syncing.
 
 After initialization:
 
 - **Apply remote environment** explicitly applies the current remote files and package intents;
-- **Replace remote settings environment** atomically makes this device's allowlisted snapshot current and tombstones shared plugins/themes omitted by this device;
+- **Replace remote settings environment** atomically makes this device's allowlisted snapshot current for this principal and tombstones synchronized plugins/themes omitted by this device;
 - **Automatically install remote plugins and themes** separately consents to foreground package installation/removal and is off by default;
 - per-plugin **Update**, **Promote pin**, and **Remove from settings environment** actions resolve the displayed three-version mismatch;
-- selecting an environment plugin/theme removes it from shared state through a tombstone. Plugin removal attempts local disable/unload/uninstall and directory removal; theme removal deletes its local theme directory. Either may require restart when loaded state outlives removed files.
+- selecting an environment plugin/theme removes it from that principal's synchronized state through a tombstone. Plugin removal attempts local disable/unload/uninstall and directory removal; theme removal deletes its local theme directory. Either may require restart when loaded state outlives removed files.
 
 Do not enable another settings-sync product at the same time. YAOS pauses settings sync when official Obsidian Sync, Remotely Save, LiveSync, or System3 Relay is enabled; disable the clash and refresh YAOS. Turning **Sync Obsidian settings** off, deferring, a capability/version mismatch, or a clash affects settings only.
 
@@ -225,13 +233,15 @@ An explicit take/replace decision authorizes an apply plan, which is persisted b
 
 The synchronized files are exactly the root JSON and CSS/plugin-data paths listed in the [settings contract](sync-contract.md#scope-storage-and-allowlist). `app.json` and `hotkeys.json` may require an Obsidian restart. Applying `workspaces.json` refreshes names but does not switch the current layout. Plugin and theme binaries are fetched from Obsidian/GitHub at their pinned versions and are never stored in the Worker, Yjs, or R2.
 
-Leaving or replacing enrollment retires only that exact device/folder/configuration acceptance and apply queue. It does not delete local configuration files. Device revocation makes later settings HTTP requests unauthorized. Destroying a vault makes settings inaccessible with the vault and removes its SQL sidecar only when the generation's vault deletion completes.
+Leaving or replacing enrollment retires only that exact principal/membership/device/folder/configuration acceptance and apply queue. It does not delete local configuration files. Device or membership revocation makes later settings HTTP requests unauthorized. Ownership transfer leaves both principals' environments where they are. Destroying a vault makes settings inaccessible with the vault and removes its SQL sidecar only when the generation's vault deletion completes.
 
 ## Operator console
 
 The operator recovery key signs in to the console and is never a plugin credential. The browser receives a short-lived HTTP-only session. Sign-out revokes the presented session before clearing its cookie.
 
-The console creates and renames vaults, lists and revokes devices and unused pairing codes, creates enrollment links, reports provisioning failures, and tracks pending deletion and device-fence obligations. A failed device runtime fence remains visible after membership removal and can be retried without restoring membership.
+The console creates/provisions vaults, performs the explicit schema-6 identity migration, issues owner-bootstrap or owner-recovery codes, reports provisioning failures, and tracks pending deletion and authorization-change obligations. The operator remains outside ordinary content presence and attribution. Failed vault authority fences stay retryable without restoring the revoked credential or membership.
+
+Vault rename and ordinary destruction originate with the enrolled owner. A rename is replay-safe shared metadata and never renames local folders. Destruction is a durable owner request which does nothing until the operator confirms that exact request; confirmation then runs the existing R2-first, room-second purge workflow. The separately named emergency-destruction repair path requires a recorded reason and must not be used as a silent substitute for owner authorization. Final deletion removes vault-scoped identities, invitations, transfers, authorization changes, and security events while retaining the bounded governance outcome needed to make retries unambiguous.
 
 ## Recovery operations
 
@@ -245,7 +255,7 @@ With recovery capability available:
 
 Capture and restore continue in alarm-driven `RecoveryJob` objects after Obsidian closes. `queued`, active phase, `retrying`, `complete`, `complete_with_gaps`, `failed`, and `cancelled` are meaningful states. Do not report a retry or terminal gap as complete coverage.
 
-Before applying a restore item, the client creates a local backup and verifies that the target has not changed since review. Changed targets are skipped rather than overwritten. Body, lifecycle, and attachment mutations still pass through normal schema-6 durable receipts and attachment revision checks.
+Before applying a restore item, the client creates a local backup and verifies that the target has not changed since review. Changed targets are skipped rather than overwritten. Body, lifecycle, and attachment mutations still pass through normal schema-7 actor authority, durable receipts, and attachment revision checks. Recovery contains content only; it cannot restore or roll back principals, memberships, devices, codes, transfers, revocations, audit, or settings.
 
 Recovery roots and manifest/content objects are immutable. Recovery catalog deletion, retention, GC, and purge are asynchronous; UI completion means the corresponding durable state reached its terminal contract, not that another device has materialized anything.
 
@@ -253,7 +263,7 @@ Recovery roots and manifest/content objects are immutable. Recovery catalog dele
 
 Destroy differs from device leave:
 
-1. the registry immediately revokes the vault, devices, and pairing codes and records a `deletionId`;
+1. the registry immediately revokes the vault, principals, memberships, devices, collaboration codes, and socket admission and records a `deletionId`;
 2. the vault runtime fences sync and recovery work for the exact `vaultGeneration`;
 3. with R2, the deterministic purge job empties only that generation's `recovery-v2/` and `blobs/` prefixes;
 4. vault SQL is deleted only after generation purge succeeds;
@@ -267,18 +277,18 @@ Without R2, the purge phase is already complete and SQL cleanup can proceed. A p
 
 Public setup routes are limited to claim, enrollment, and capability discovery. Vault HTTP routes require the device bearer in `Authorization` and the selected vault ID in the route.
 
-The socket ticket endpoint exchanges that bearer for a short-lived device- and vault-scoped ticket. Root and body sockets require:
+The socket ticket endpoint exchanges that bearer for a short-lived protocol-3 ticket bound to the deployment, vault generation, principal/membership revision, device/credential revision, purpose, and exact document. Root and body sockets require:
 
 - a valid ticket;
-- document schema `5`;
-- socket protocol `1`;
-- an active membership and active vault generation.
+- document schema `7`;
+- socket protocol `3`;
+- active matching authority in both the control plane and vault mirror.
 
-The complete version set is document schema `5`, durable SQL format `2`, socket protocol `1`, recovery snapshot format `2`, and settings sync format `1`. These pins change only through a coordinated client/server/storage cutover.
+The complete version set is document schema `7`, durable SQL format `2`, socket protocol `3`, recovery snapshot format `2`, settings sync format `1`, and control-plane identity format `3`. These pins change only through a coordinated client/server/storage cutover.
 
-## Updating after the fresh schema-6 deployment
+## Updating after the schema-7 cutover
 
-The schema-6 server artifact is marked `deploymentBoundary: fresh`; the in-place updater rejects it. Establish the fresh deployment described above first.
+Establish the fresh deployment or complete the guided identity migration described above first. Do not activate schema 7 until every active vault has exactly one owner and its complete principal/device authority mirror is installed.
 
 Future releases may use the generated deployment repository's updater only when their schema, storage, protocol, snapshot, and Durable Object class boundaries remain unchanged. A release changing any pin or required class must declare another fresh or guided cutover rather than relying on code-only revert.
 
@@ -292,11 +302,14 @@ The Worker capability response distinguishes:
 - document schema, durable storage, socket protocol, snapshot format, and settings-format pins;
 - settings-sync, attachment, and recovery capabilities.
 
-The vault status surface additionally exposes `vaultGeneration`, `runtimeEpoch`, provisioning time, durable sequence, feed floor, and active pins. Health distinguishes degraded pending persistence from a healthy runtime. Diagnostics are evidence, not a repair mechanism.
+The vault status surface additionally exposes `vaultGeneration`, `runtimeEpoch`, provisioning time, durable sequence, feed floor, active pins, current authority state, and preserved unpublished-work count. The public plugin API exposes immutable principal/role/capability, member-summary, per-device presence, and authority-revision facts without credentials or mutation controls. Health distinguishes degraded pending persistence from a healthy runtime. Diagnostics are evidence, not a repair mechanism.
 
 ## Troubleshooting
 
-- **Unauthorized or auth rejected:** confirm that this exact device ID still has membership in the selected vault. Re-enroll with a fresh code if revoked.
+- **Unauthorized or auth rejected:** confirm that this principal membership and exact device credential are still active in the selected vault. Use a fresh purpose-correct code if revoked.
+- **Authority changed:** queued work tied to the older membership/device revision is preserved locally. Refresh membership; do not relabel it as current work.
+- **Owner lost every device:** sign in with the operator recovery key and issue an owner-recovery code. Do not create a replacement member or manually edit identity storage.
+- **Invitation rejected:** confirm it is unexpired, unused, issued by the current owner revision, and used for **Invite person**, not **Add my device**.
 - **Update required:** client schema or socket protocol does not exactly match the server. Do not attempt mixed-writer operation.
 - **Vault provisioning failed:** retry the recorded provisioning saga; do not manually mark the registry record active.
 - **Recovery unavailable:** confirm the `RecoveryJob` binding and `v2` migration exist. Recovery additionally needs `YAOS_BUCKET`.

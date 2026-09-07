@@ -29,14 +29,34 @@ not reuse it after a reload.
 
 `api.v0` supplies `getSnapshot`, `subscribe`, `getFile(path)`, and
 `getFileByBodyId(bodyId)`. Snapshots carry a monotonic `revision`, readiness,
-file/body identity, coordinator lifecycle facts, settlement evidence, per-file
-preservation/frontmatter-quarantine counts, and aggregate counts. Subscription
-registration and its returned snapshot are synchronous, so a consumer cannot
-miss the next published revision between those operations.
+collaboration authority, file/body identity, coordinator lifecycle facts,
+settlement evidence, per-file preservation/frontmatter-quarantine counts, and
+aggregate counts. Subscription registration and its returned snapshot are
+synchronous, so a consumer cannot miss the next published revision between
+those operations.
+
+The immutable `collaboration` projection includes:
+
+- authority state (`active`, `refreshing`, `changing`, `revoked`, or
+  `incompatible`), current principal/device identities and names, owner/member
+  role, membership and device-credential revisions, fixed policy version, and
+  capabilities;
+- current member summaries with role, lifecycle state, device count, and
+  aggregate last-seen time;
+- live presence as distinct principal/device instances, even when UI groups
+  several devices under one person;
+- current ownership-transfer offers with source, target, creation, and expiry
+  facts, but no accept/cancel method;
+- the count of durable local operations preserved because their captured
+  authority was superseded.
+
+These are observations for presentation and integration. Capability strings
+are useful for planning UI, but never authorize an action; the server remains
+the permission source.
 
 Every value is a frozen plain-data copy. The API never returns Markdown text,
-Yjs values, providers, sockets, credentials, raw hashes, diagnostics handles,
-or QA controls. It accepts no mutation operations. Settlement evidence is
-refreshed asynchronously after startup; `unknown` remains explicit until a
-validated durable record is available.
-
+Yjs values, providers, sockets, device bearers, invitation/device-link secrets,
+raw hashes, diagnostics handles, mutable membership objects, or QA controls. It
+accepts no content, membership, device, settings, or ownership mutations.
+Settlement evidence is refreshed asynchronously after startup; `unknown`
+remains explicit until a validated durable record is available.

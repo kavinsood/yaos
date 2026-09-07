@@ -15,38 +15,44 @@ stands down safely when the host behavior is unavailable or replaced. The
 supported behavior matrix is in [Obsidian host compatibility](obsidian-host-compatibility.md).
 
 `plugin.api` is a separate, versioned data-only projection for other plugins.
-It exposes immutable coordinator, settlement, and preservation facts without
-Yjs documents, credentials, providers, diagnostics, or mutation controls.
+It exposes immutable collaboration authority, member/presence summaries,
+coordinator, settlement, and preservation facts without Yjs documents,
+credentials, invitation secrets, providers, diagnostics, or mutation controls.
 Consumers reacquire after `yaos:api-ready`; unload fences retained handles.
 The contract is in [Public plugin API](public-api.md).
 
-The headless client under `packages/cli` hosts the same `VaultSync`, `BodyManager`, `DiskMirror`, and reconciliation policy on a local Linux filesystem. It is Markdown-only, stores its device identity and schema-6 retry/cache state in machine-local SQLite, and never copies another enrollment's bearer.
+The headless client under `packages/cli` hosts the same `VaultSync`, `BodyManager`, `DiskMirror`, and reconciliation policy on a local Linux filesystem. It is Markdown-only, stores its complete principal/device authority tuple and schema-7 retry/cache state in machine-local SQLite, and never copies another enrollment's bearer.
 
 The Cloudflare Worker classes are thin platform wrappers around portable `ControlPlaneRuntime`, `VaultRuntime`, and `RecoveryJobRuntime` compositions. `packages/server-node` supplies Node-specific SQLite/KV, actor, WebSocket, alarm, and filesystem-object mechanisms to those same domain owners; it does not implement a second sync policy.
 
 ## Identity and provisioning
 
-A claimed Worker is one operator-owned control plane. The server hashes the operator recovery key and uses short-lived, revocable browser sessions for console operations. The global registry owns vault records, per-vault device memberships, one-use pairing codes, pending deletion obligations, and the socket-ticket signing key.
+A claimed Worker is one operator-owned control plane. The server hashes the operator recovery key and uses short-lived, revocable browser sessions for console operations. The global registry owns vault records, stable vault-scoped principals, owner/member memberships, separately revocable device credentials, purpose-bound one-use codes, ownership transfers, authorization-change obligations, security audit events, pending deletion obligations, and the socket-ticket signing key. The operator provisions and repairs infrastructure but is not implicitly a vault content actor.
 
-One operator can create multiple vaults. A physical installation may enroll different folders in different vaults, but each device identity, membership, and bearer belongs to exactly one vault. A pairing code selects that vault and creates a new device identity; credentials are never copied between enrolled folders.
+One operator can create multiple vaults. Every active vault has exactly one owner; every other active principal is a full member. Owner and member have the same complete-vault content authority, while only the owner governs people, recovery, audit, policy, metadata, ownership transfer, and destruction. There are no viewer, delegated-admin, folder-ACL, or permission-toggle modes.
+
+A physical installation may enroll different folders in different vaults, but each device identity and bearer belongs to one principal in exactly one vault. **Invite person** creates a member principal and its first device. **Add my device** creates another independently revocable credential for the current principal. These code purposes are not interchangeable, and credentials are never copied between enrolled folders.
 
 Vault creation is a recoverable provisioning saga:
 
 1. The registry reserves a unique `vaultId` and `vaultGeneration` in `provisioning` state.
-2. The vault Durable Object idempotently creates schema-6 metadata and an empty root in SQLite.
-3. The registry activates the matching generation and, for claim, publishes the first pairing code.
-4. A failure remains recorded as retryable provisioning state; it is not exposed as an active partial vault.
+2. The vault Durable Object idempotently creates schema-7 metadata and an empty root in SQLite.
+3. The registry moves the matching generation to `awaiting_owner` and, for claim, publishes the one-use owner-bootstrap code.
+4. Owner enrollment installs the first complete principal/device authority fence and then activates the vault.
+5. A failure remains recorded as retryable provisioning or authorization-change state; it is not exposed as an active partial vault.
 
 `vaultGeneration` identifies one storage incarnation of a vault and scopes every R2 key and asynchronous job. `runtimeEpoch` identifies one live Durable Object runtime and prevents receipts or capabilities from being mistaken for evidence from another runtime.
 
-## Schema-6 vault authority
+## Schema-7 vault authority
 
-Schema 6 retains the root/body and revisioned-attachment architecture and adds semantic frontmatter with component settlement:
+Schema 7 retains the schema-6 root/body, semantic-frontmatter, component-settlement, and revisioned-attachment architecture while adding human collaboration authority:
 
 - the root Yjs document carries `pathToId`, attachment references and metadata, attachment tombstones, and schema metadata;
 - every Markdown file has a stable file/body identity and its own Yjs document whose text key is `body`;
 - SQL catalog events bind body identity, canonical path, lifecycle, durable generation, content hash, and size at a vault sequence;
 - folders are derived from paths; empty folders have no synchronized identity.
+- a generation-scoped SQL mirror carries current principal membership and device credential revisions;
+- durable content mutations record the admitted principal and device without claiming character-level authorship.
 
 The root is a server-published structural view: client root sockets may negotiate and receive updates but cannot mutate it. Structural changes become authoritative only after the server durably commits lifecycle records and returns receipts; the corresponding root mutation is then published. Markdown content becomes authoritative only through a device-scoped candidate identified by device ID, candidate ID, and SHA-256 digest. Candidate retries are idempotent, candidate-ID reuse with different bytes is rejected, and a fresh create cannot publish a root path before its exact body candidate is durable.
 
@@ -56,11 +62,12 @@ The exact product pins are:
 
 | Boundary | Version |
 |---|---:|
-| Document schema | 6 |
+| Document schema | 7 |
 | Durable SQL storage format | 2 |
-| Socket protocol | 2 |
+| Socket protocol | 3 |
 | Recovery snapshot format | 2 |
 | Settings sync format | 1 |
+| Control-plane identity format | 3 |
 
 Missing or mismatched schema or protocol declarations fail admission with `update_required`. Mixed writers are unsupported.
 
@@ -73,18 +80,19 @@ The vault Durable Object contains separate durable and live owners:
 - `VaultSocketService` owns root and body WebSocket sessions. The root socket is structural; a body socket is admitted only for an active body.
 - `VaultLifecycleService` owns durable create, rename, delete, and revive ordering plus root publication checks.
 - `VaultCandidateService` owns device-scoped body candidate admission, idempotency, and durable receipts.
-- `SettingsSyncStore` owns bounded named settings environments in tables inside the same vault Durable Object. Its monotonic environment revision orders file rows, plugin/theme intents, tombstones, and version-gated plugin data; settings never enter the root/body Yjs documents or R2.
+- The collaboration control plane owns principal profiles, memberships, devices, invitations, device links, transfer offers, authorization-change sagas, and audit. The vault-side authority mirror validates every forwarded actor tuple and installs revocation/transfer fences in the same serialized mutation domain as content work.
+- `SettingsSyncStore` owns bounded principal-scoped settings environments in tables inside the same vault Durable Object. The storage key is `principalId + configDirKey`; its monotonic environment revision orders file rows, plugin/theme intents, tombstones, and version-gated plugin data. Settings never enter root/body Yjs documents or R2 and one principal cannot read another principal's environment.
 
 On the client, `VaultSync` owns the root, transport, durable candidate queue, and lifecycle submission. `BodyManager` loads and persists bodies independently and evicts only clean, settled, unpinned bodies. `DiskMirror`, `ReconciliationController`, and `EditorBindingManager` retain filesystem/editor preservation responsibilities. `BlobSyncManager` owns the optional non-Markdown plane.
 
-The client `SettingsSyncEngine` is a separate serialized lifecycle. It gates on exact server capability and settings format, scopes one environment by the vault plus the sanitized basename of the active Obsidian configuration directory, watches only the allowlist, and owns LWW reconciliation. A pre-existing remote environment requires an explicit user decision. Before the first mutation, the client persists the complete ordered plan in IndexedDB under the exact host hash, vault ID, vault generation, folder key, device ID, and configuration key; only successful seed/take/replace commits the acceptance marker. The runner checkpoints every step, resumes only that exact identity, and retires its queue and acceptance when the membership is replaced or left.
+The client `SettingsSyncEngine` is a separate serialized lifecycle. It gates on active authority, `vault.settings.personal.sync`, exact server capability, and settings format; scopes one environment by the current principal plus the sanitized basename of the active Obsidian configuration directory; watches only the allowlist; and owns LWW reconciliation. A pre-existing remote environment requires an explicit user decision. Before the first mutation, the client persists the complete ordered plan in IndexedDB under the exact host, vault generation, folder, principal, membership revision, device credential revision, and configuration key. Only successful seed/take/replace commits acceptance. A stale authority tuple can neither resume nor authorize the queue.
 
 ## SQL bootstrap and steady-state sync
 
 A new or reset client bootstraps without R2:
 
 1. The server flushes loaded documents and creates a time-bounded SQL history pin at one vault sequence.
-2. The client verifies the schema-6 root checkpoint.
+2. The client verifies the schema-7 root checkpoint.
 3. It pages the SQL catalog and fetches each referenced body at the pinned boundary.
 4. Each body is identity-, generation-, size-, hash-, and path-checked before disk settlement.
 5. The client catches up from the ordered SQL feed, rechecks current heads before mutation, and records unresolved bodies for retry.
@@ -102,7 +110,7 @@ Writes are serialized per path and carry an expected content fingerprint. A watc
 
 ## Settings sync
 
-Settings sync is enabled by default after enrollment and has no user principal: the shared scope is `vaultId` plus the named, sanitized configuration-folder key. Different names such as `.obsidian` and `.obsidian-mobile` are independent environments. An existing remote environment is not applied without this device's explicit seed/take/replace decision; a take first persists its exact-identity queue, then commits acceptance only after the apply succeeds, while defer withholds the decision. The synchronized file set is closed to selected root JSON, `snippets/*.css`, and community-plugin `data.json`; workspace session state, `community-plugins.json`, YAOS state, unknown root JSON, plugin/theme binaries, and every other path remain local.
+Settings sync is enabled by default after enrollment and belongs to the current principal. The shared scope is `vaultId + principalId + configDirKey`, where the last component is the named, sanitized configuration-folder key. Different principals never share settings, and ownership transfer does not reveal or confiscate either person's environment. Different keys such as `.obsidian` and `.obsidian-mobile` remain independent within one principal. An existing remote environment is not applied without this device's explicit seed/take/replace decision; a take first persists its exact-authority queue, then commits acceptance only after apply succeeds, while defer withholds the decision. The synchronized file set remains closed to selected root JSON, `snippets/*.css`, and community-plugin `data.json`; device-local and excluded state remains local.
 
 The vault SQL sidecar stores settings format 1. Every accepted mutation advances one safe integer environment revision, and each changed row receives that revision. Clients use the last acknowledged hash and revision to distinguish newer server state, dirty local state, first-seen files, and acknowledged deletion. Seed is create-once; replace atomically publishes a complete local snapshot and tombstones omitted live plugins and themes.
 
@@ -128,15 +136,17 @@ Browsing follows only the requested manifest branch. Restore is asynchronous and
 
 GC marks retained recovery and blob roots, acquires bounded sweep leases, and deletes only unmarked generation-scoped objects. R2 unavailability can delay recovery work without making Markdown sync unavailable.
 
-## Authentication and admission
+## Authentication, authority, and admission
 
-`POST /claim` initializes the operator control plane and provisions the first vault. `POST /enroll` consumes one pairing code and returns a device bearer, device ID, selected vault ID, generation, and origin/joining role. The client persists its generated request ID and credentials before enrollment; a lost response retries the same hashes and receives the same bounded replay record without storing the plaintext bearer server-side.
+`POST /claim` initializes the operator control plane and provisions the first vault. `POST /enroll` consumes one purpose-bound code and returns the principal ID, owner/member role, membership revision, device ID, device credential revision, fixed capabilities, bearer, selected vault generation, and origin/joining authority. The client persists its generated request ID and credentials before enrollment; a lost response retries the same hashes and receives the same bounded replay record without storing the plaintext bearer server-side.
 
-Vault HTTP routes, including `/vault/:vaultId/settings-sync/:configDirKey`, require the device bearer and selected vault ID. The public route resolves current membership and active `vaultGeneration`, forwards only trusted vault/generation/device headers, and strips the bearer before the vault runtime handles the request. Settings routes require exactly one `settingsFormatVersion=1`; a mismatch fails before mutation.
+Vault HTTP routes require the device bearer and selected vault ID. The public route resolves the current principal, membership, device credential, role, policy version, capability digest, and active generation, then replaces any caller-supplied actor headers with this trusted context before forwarding. The vault runtime verifies the context against its durable authority mirror and checks the fixed capability for the route. Settings routes additionally bind the environment to the admitted principal and require exactly one `settingsFormatVersion=1`.
 
-A short-lived device-scoped ticket is minted for WebSocket use; long-lived credentials never appear in socket URLs. Root and body handshakes require `ticket`, `schemaVersion=6`, and `protocolVersion=2`. Ticket signature, expiry, vault scope, current membership, active vault state, and vault generation are checked before runtime admission. Protocol 2 also requires exact per-socket application liveness acknowledgements; browser `OPEN` alone is not reported as responsive. Revocation persists an obligation before removing membership, applies a durable vault-runtime device fence, terminates already-active sockets, and remains operator-retryable until acknowledged.
+A short-lived protocol-3 ticket is deployment-, vault-generation-, principal-, membership-, device-, credential-, purpose-, and document-bound; long-lived credentials never appear in socket URLs. Root and body handshakes require exact `schemaVersion=7` and `protocolVersion=3`. Current control-plane authority is checked before runtime admission and the vault mirror checks it again. Protocol liveness still requires exact per-socket acknowledgements; browser `OPEN` alone is not responsive evidence.
 
-Leaving revokes one membership, retires only its exact settings apply queue, clears the folder's enrollment and schema-6 IndexedDB cache, and leaves ordinary files and its configuration directory on disk. Operator kick revokes one membership. Operator destroy revokes the complete vault boundary; purge-first deletion ultimately removes the settings SQL tables with the rest of that vault generation's SQL.
+Revocation or ownership transfer first prevents new admission, then installs one idempotent authority change in the vault mutation order and closes affected sockets. A mutation ordered before the fence remains committed; one ordered after it fails as `authority_superseded`. Exact operation-outcome lookup can recover a bounded receipt for work that committed before a response was lost, but cannot create new work. The client preserves stale-authority work as unpublished rather than replaying it under new authority.
+
+Leaving revokes a member principal and all of their devices, retires only its exact settings queue and acceptance, clears the folder's schema-7 enrollment cache, and leaves ordinary files and configuration on disk. Revoking a last member device has the same membership result. An owner cannot leave or lose the last device through ordinary self-service; owner loss uses an audited operator-issued recovery code. Recovery restores content only and never rewinds principals, devices, invitations, authority changes, or audit.
 
 ## Purge-first vault deletion
 
