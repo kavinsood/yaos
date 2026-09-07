@@ -144,4 +144,19 @@ s.test("lost response after durable commit is recovered from the receipt ledger"
 	assert.equal(store.commits, 1);
 });
 
+s.test("server rejects a candidate whose resulting Markdown is not canonical", async () => {
+	const doc = new Y.Doc({ guid: BODY_ID });
+	doc.getText("body").insert(0, "line one\r\nline two\r\n");
+	const update = Y.encodeStateAsUpdate(doc);
+	doc.destroy();
+	const candidateDigest = await digest(update);
+	const store = new CandidateStore();
+	const { service, notifications } = makeService(store);
+	const response = await service.handle(BODY_ID, candidateRequest(candidateDigest, update));
+	assert.equal(response.status, 409);
+	assert.equal((await response.json() as { error: string }).error, "candidate_markdown_not_canonical");
+	assert.equal(store.commits, 0, "non-canonical text never reaches durable history");
+	assert.equal(notifications(), 0, "rejected candidate is not broadcast as committed");
+});
+
 await s.done();

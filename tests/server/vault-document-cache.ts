@@ -2,11 +2,14 @@ import { strict as assert } from "node:assert";
 import * as Y from "yjs";
 import {
 	MAX_BODY_SOCKETS,
-	MAX_LOADED_BODY_ESTIMATED_BYTES,
+	MAX_LOADED_BODY_ENCODED_STATE_BYTES,
 	MAX_PENDING_BYTES_PER_DOCUMENT,
 	MAX_TRANSIENT_PENDING_BYTES,
 } from "../../server/src/contracts";
-import { VaultDocumentCache } from "../../server/src/vaultDocumentCache";
+import {
+	VaultDocumentCache,
+	VaultDocumentCachePressureError,
+} from "../../server/src/vaultDocumentCache";
 import { suite } from "../harness.ts";
 
 const s = suite("vault-document-cache");
@@ -109,7 +112,7 @@ s.test("mixed-size byte admission evicts the clean least-recently-used body", ()
 		makeStore(contents) as never,
 		() => new Set(),
 		() => new Set(),
-		{ loadedBodies: 10, residentBytes: Math.max(oldBytes, incomingBytes) + smallBytes, transientBytes: 100 },
+		{ loadedBodies: 10, encodedStateBytes: Math.max(oldBytes, incomingBytes) + smallBytes, transientBytes: 100 },
 	);
 	cache.load("old-large", true, () => true).lastUsedAt = 1;
 	cache.load("new-small", true, () => true).lastUsedAt = 2;
@@ -117,7 +120,7 @@ s.test("mixed-size byte admission evicts the clean least-recently-used body", ()
 	assert.equal(cache.get("old-large"), undefined);
 	assert.ok(cache.get("new-small"));
 	assert.ok(cache.get("incoming"));
-	assert.ok(cache.diagnostics().costs.residentBytes <= cache.diagnostics().limits.residentBytes);
+	assert.ok(cache.diagnostics().costs.encodedStateBytes <= cache.diagnostics().limits.encodedStateBytes);
 });
 
 s.test("durable updates evict safe LRU state or reject before mutating protected state", () => {
@@ -133,21 +136,21 @@ s.test("durable updates evict safe LRU state or reject before mutating protected
 	const probeTarget = probeCache.load("target", true, () => true);
 	const probeVictim = probeCache.load("victim", true, () => true);
 	const updatedBytes = measuredAfterUpdate(probeTarget.doc, update);
-	const initialBytes = probeTarget.residentBytes + probeVictim.residentBytes;
+	const initialBytes = probeTarget.encodedStateBytes + probeVictim.encodedStateBytes;
 	probeCache.clear();
 	assert.ok(initialBytes <= updatedBytes, "fixture starts within the post-update budget");
 	const cache = new VaultDocumentCache(
 		makeStore(contents) as never,
 		() => open,
 		() => new Set(),
-		{ loadedBodies: 10, residentBytes: updatedBytes, transientBytes: 100 },
+		{ loadedBodies: 10, encodedStateBytes: updatedBytes, transientBytes: 100 },
 	);
 	const target = cache.load("target", true, () => true);
 	cache.load("victim", true, () => true).lastUsedAt = 1;
 	open.add("target");
 	assert.equal(cache.applyDurableUpdate("target", update, 2, "test"), true);
 	assert.equal(cache.get("victim"), undefined);
-	assert.equal(target.residentBytes, updatedBytes);
+	assert.equal(target.encodedStateBytes, updatedBytes);
 
 	const rejecting = new VaultDocumentCache(
 		makeStore({ protected: "before" }) as never,
@@ -155,14 +158,14 @@ s.test("durable updates evict safe LRU state or reject before mutating protected
 		() => new Set(),
 		{
 			loadedBodies: 10,
-			residentBytes: encodedBytes("protected", "before"),
+			encodedStateBytes: encodedBytes("protected", "before"),
 			transientBytes: 100,
 		},
 	);
 	const protectedBody = rejecting.load("protected", true, () => true);
 	assert.throws(
 		() => rejecting.applyDurableUpdate("protected", update, 2, "test"),
-		/body_cache_resident_bytes/,
+		/body_cache_encoded_state_bytes/,
 	);
 	assert.equal(protectedBody.doc.getText("body").toString(), "before");
 	assert.equal(protectedBody.generation, 1);
@@ -183,13 +186,13 @@ s.test("dirty, open, and pinned bodies refuse byte-pressure eviction", () => {
 		() => new Set(),
 	);
 	for (const id of ["dirty", "open", "pinned"]) probe.load(id, true, () => true);
-	const residentBytes = probe.diagnostics().costs.residentBytes;
+	const encodedStateBytes = probe.diagnostics().costs.encodedStateBytes;
 	probe.clear();
 	const cache = new VaultDocumentCache(
 		makeStore(contents) as never,
 		() => open,
 		() => pinned,
-		{ loadedBodies: 10, residentBytes, transientBytes: 100 },
+		{ loadedBodies: 10, encodedStateBytes, transientBytes: 100 },
 	);
 	cache.load("dirty", true, () => true);
 	assert.deepEqual(cache.queue("dirty", {
@@ -201,7 +204,7 @@ s.test("dirty, open, and pinned bodies refuse byte-pressure eviction", () => {
 	open.add("open");
 	cache.load("pinned", true, () => true);
 	pinned.add("pinned");
-	assert.throws(() => cache.load("incoming", true, () => true), /body_cache_resident_bytes/);
+	assert.throws(() => cache.load("incoming", true, () => true), /body_cache_encoded_state_bytes/);
 	assert.ok(cache.get("dirty"));
 	assert.ok(cache.get("open"));
 	assert.ok(cache.get("pinned"));
@@ -214,11 +217,15 @@ s.test("a single body over budget is rejected from durable cost before reconstru
 		store as never,
 		() => new Set(),
 		() => new Set(),
-		{ loadedBodies: 10, residentBytes: 10, transientBytes: 10 },
+		{ loadedBodies: 10, encodedStateBytes: 10, transientBytes: 10 },
 	);
-	assert.throws(() => cache.load("oversized", true, () => true), /body_cache_resident_bytes/);
+	assert.throws(
+		() => cache.load("oversized", true, () => true),
+		(error: unknown) => error instanceof VaultDocumentCachePressureError
+			&& error.reason === "body_cache_encoded_state_bytes",
+	);
 	assert.equal(store.reconstructions.get("oversized"), undefined);
-	assert.equal(cache.diagnostics().costs.residentBytes, 0);
+	assert.equal(cache.diagnostics().costs.encodedStateBytes, 0);
 });
 
 s.test("transient reservations enforce their aggregate limit and release exactly once", () => {
@@ -226,11 +233,15 @@ s.test("transient reservations enforce their aggregate limit and release exactly
 		makeStore() as never,
 		() => new Set(),
 		() => new Set(),
-		{ loadedBodies: 10, residentBytes: 100, transientBytes: 10 },
+		{ loadedBodies: 10, encodedStateBytes: 100, transientBytes: 10 },
 	);
 	const release = cache.recordTransient("unloaded", 6);
 	assert.equal(cache.diagnostics().costs.transientBytes, 6);
-	assert.throws(() => cache.recordTransient("other", 5), /vault_transient_bytes/);
+	assert.throws(
+		() => cache.recordTransient("other", 5),
+		(error: unknown) => error instanceof VaultDocumentCachePressureError
+			&& error.reason === "vault_transient_bytes",
+	);
 	release();
 	release();
 	assert.equal(cache.diagnostics().costs.transientBytes, 0);
@@ -256,7 +267,7 @@ s.test("count and byte fences interact without stopping after one eviction", () 
 		makeStore(contents) as never,
 		() => new Set(),
 		() => new Set(),
-		{ loadedBodies: 2, residentBytes: mediumBytes, transientBytes: 100 },
+		{ loadedBodies: 2, encodedStateBytes: mediumBytes, transientBytes: 100 },
 	);
 	cache.load("small-old", true, () => true).lastUsedAt = 1;
 	cache.load("small-new", true, () => true).lastUsedAt = 2;
@@ -294,9 +305,13 @@ s.test("pending byte cost is exact, observable, and released after durability", 
 
 s.test("default aggregate limits are explicit in diagnostics", () => {
 	const cache = new VaultDocumentCache(makeStore() as never, () => new Set(), () => new Set());
+	assert.deepEqual(cache.diagnostics().accounting, {
+		formatVersion: 1,
+		claim: "encoded-yjs-state-proxy-not-heap-measurement",
+	});
 	assert.deepEqual(cache.diagnostics().limits, {
 		loadedBodies: MAX_BODY_SOCKETS,
-		residentBytes: MAX_LOADED_BODY_ESTIMATED_BYTES,
+		encodedStateBytes: MAX_LOADED_BODY_ENCODED_STATE_BYTES,
 		transientBytes: MAX_TRANSIENT_PENDING_BYTES,
 	});
 });

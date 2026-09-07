@@ -1,7 +1,7 @@
 import * as Y from "yjs";
 import {
 	MAX_BODY_SOCKETS,
-	MAX_LOADED_BODY_ESTIMATED_BYTES,
+	MAX_LOADED_BODY_ENCODED_STATE_BYTES,
 	MAX_PENDING_BYTES_PER_DOCUMENT,
 	MAX_PENDING_BYTES_PER_SOCKET,
 	MAX_PENDING_BYTES_PER_VAULT,
@@ -15,8 +15,7 @@ export interface LoadedVaultDocument {
 	generation: number;
 	lastUsedAt: number;
 	dirty: boolean;
-	estimatedBytes: number;
-	residentBytes: number;
+	encodedStateBytes: number;
 	transientBytes: number;
 }
 
@@ -32,17 +31,24 @@ export type CachePressureReason =
 	| "vault_pending_bytes"
 	| "vault_transient_bytes"
 	| "body_cache_count"
-	| "body_cache_resident_bytes";
+	| "body_cache_encoded_state_bytes";
+
+export class VaultDocumentCachePressureError extends Error {
+	constructor(readonly reason: CachePressureReason) {
+		super(reason);
+		this.name = "VaultDocumentCachePressureError";
+	}
+}
 
 export interface VaultDocumentCacheLimits {
 	loadedBodies: number;
-	residentBytes: number;
+	encodedStateBytes: number;
 	transientBytes: number;
 }
 
 const DEFAULT_CACHE_LIMITS: VaultDocumentCacheLimits = {
 	loadedBodies: MAX_BODY_SOCKETS,
-	residentBytes: MAX_LOADED_BODY_ESTIMATED_BYTES,
+	encodedStateBytes: MAX_LOADED_BODY_ENCODED_STATE_BYTES,
 	transientBytes: MAX_TRANSIENT_PENDING_BYTES,
 };
 
@@ -52,11 +58,14 @@ export interface VaultDocumentCacheDiagnostics {
 		generation: number;
 		dirty: boolean;
 		lastUsedAt: number;
-		estimatedBytes: number;
-		residentBytes: number;
+		encodedStateBytes: number;
 		transientBytes: number;
 	}>;
-	costs: { estimatedBytes: number; residentBytes: number; transientBytes: number };
+	accounting: {
+		formatVersion: 1;
+		claim: "encoded-yjs-state-proxy-not-heap-measurement";
+	};
+	costs: { encodedStateBytes: number; transientBytes: number };
 	limits: VaultDocumentCacheLimits;
 	pending: Record<string, number>;
 	pendingBytes: {
@@ -91,7 +100,7 @@ export class VaultDocumentCache {
 		private readonly limits: VaultDocumentCacheLimits = DEFAULT_CACHE_LIMITS,
 	) {
 		if (!Number.isSafeInteger(limits.loadedBodies) || limits.loadedBodies < 0
-			|| !Number.isSafeInteger(limits.residentBytes) || limits.residentBytes < 0
+			|| !Number.isSafeInteger(limits.encodedStateBytes) || limits.encodedStateBytes < 0
 			|| !Number.isSafeInteger(limits.transientBytes) || limits.transientBytes < 0) {
 			throw new Error("cache limits must be non-negative safe integers");
 		}
@@ -110,7 +119,7 @@ export class VaultDocumentCache {
 		if (body && !admitted()) throw new Error("body is not admitted");
 		if (body) {
 			const reason = this.ensureBodyCapacity(documentId, this.durableBodyCost(documentId));
-			if (reason) throw new Error(reason);
+			if (reason) throw new VaultDocumentCachePressureError(reason);
 		}
 		let reconstructed: ReconstructedDocument;
 		try {
@@ -123,12 +132,12 @@ export class VaultDocumentCache {
 			this.loadFailures.set(documentId, message(error));
 			throw error;
 		}
-		const estimatedBytes = Y.encodeStateAsUpdate(reconstructed.doc).byteLength;
+		const encodedStateBytes = Y.encodeStateAsUpdate(reconstructed.doc).byteLength;
 		if (body) {
-			const reason = this.ensureBodyCapacity(documentId, estimatedBytes);
+			const reason = this.ensureBodyCapacity(documentId, encodedStateBytes);
 			if (reason) {
 				reconstructed.doc.destroy();
-				throw new Error(reason);
+				throw new VaultDocumentCachePressureError(reason);
 			}
 		}
 		const loaded: LoadedVaultDocument = {
@@ -136,8 +145,7 @@ export class VaultDocumentCache {
 			generation: reconstructed.generation,
 			lastUsedAt: Date.now(),
 			dirty: false,
-			estimatedBytes,
-			residentBytes: estimatedBytes,
+			encodedStateBytes,
 			transientBytes: this.documentTransientBytes(documentId),
 		};
 		this.loaded.set(documentId, loaded);
@@ -226,7 +234,7 @@ export class VaultDocumentCache {
 	applyDurableUpdate(documentId: string, update: Uint8Array, generation: number, origin: unknown): boolean {
 		const loaded = this.loaded.get(documentId);
 		if (!loaded) return false;
-		let measuredBytes = loaded.residentBytes;
+		let measuredBytes = loaded.encodedStateBytes;
 		if (documentId !== "root") {
 			const candidate = new Y.Doc({ guid: documentId });
 			try {
@@ -237,7 +245,7 @@ export class VaultDocumentCache {
 				candidate.destroy();
 			}
 			const reason = this.ensureBodyCapacity(documentId, measuredBytes);
-			if (reason) throw new Error(reason);
+			if (reason) throw new VaultDocumentCachePressureError(reason);
 		}
 		let changed = false;
 		const observer = () => { changed = true; };
@@ -249,16 +257,17 @@ export class VaultDocumentCache {
 		}
 		loaded.generation = Math.max(loaded.generation, generation);
 		loaded.lastUsedAt = Date.now();
-		loaded.estimatedBytes = documentId === "root"
+		loaded.encodedStateBytes = documentId === "root"
 			? Y.encodeStateAsUpdate(loaded.doc).byteLength
 			: measuredBytes;
-		loaded.residentBytes = loaded.estimatedBytes;
 		return changed;
 	}
 
 	recordTransient(documentId: string, bytes: number): () => void {
 		if (!Number.isSafeInteger(bytes) || bytes < 0) throw new Error("transient reservation must be a non-negative safe integer");
-		if (this.transientBytesTotal() + bytes > this.limits.transientBytes) throw new Error("vault_transient_bytes");
+		if (this.transientBytesTotal() + bytes > this.limits.transientBytes) {
+			throw new VaultDocumentCachePressureError("vault_transient_bytes");
+		}
 		this.transientReservationsTotal += bytes;
 		this.transientReservationsByDocument.set(
 			documentId,
@@ -303,12 +312,10 @@ export class VaultDocumentCache {
 	}
 
 	diagnostics(): VaultDocumentCacheDiagnostics {
-		let estimatedBytes = 0;
-		let residentBytes = 0;
+		let encodedStateBytes = 0;
 		const loaded = [...this.loaded].map(([documentId, value]) => {
 			if (documentId !== "root") {
-				estimatedBytes += value.estimatedBytes;
-				residentBytes += value.residentBytes;
+				encodedStateBytes += value.encodedStateBytes;
 			}
 			const transientBytes = this.documentTransientBytes(documentId);
 			return {
@@ -316,14 +323,17 @@ export class VaultDocumentCache {
 				generation: value.generation,
 				dirty: value.dirty,
 				lastUsedAt: value.lastUsedAt,
-				estimatedBytes: value.estimatedBytes,
-				residentBytes: value.residentBytes,
+				encodedStateBytes: value.encodedStateBytes,
 				transientBytes,
 			};
 		});
 		return {
 			loaded,
-			costs: { estimatedBytes, residentBytes, transientBytes: this.transientBytesTotal() },
+			accounting: {
+				formatVersion: 1,
+				claim: "encoded-yjs-state-proxy-not-heap-measurement",
+			},
+			costs: { encodedStateBytes, transientBytes: this.transientBytesTotal() },
 			limits: { ...this.limits },
 			pending: Object.fromEntries([...this.pending].map(([id, values]) => [id, values.length])),
 			pendingBytes: {
@@ -347,26 +357,26 @@ export class VaultDocumentCache {
 	}
 
 	private ensureBodyCapacity(documentId: string, incomingBytes: number): CachePressureReason | null {
-		if (!Number.isSafeInteger(incomingBytes) || incomingBytes < 0) throw new Error("body estimated bytes must be a non-negative safe integer");
+		if (!Number.isSafeInteger(incomingBytes) || incomingBytes < 0) throw new Error("body encoded-state bytes must be a non-negative safe integer");
 		const existing = this.loaded.get(documentId);
-		const replacingBytes = existing?.residentBytes ?? 0;
+		const replacingBytes = existing?.encodedStateBytes ?? 0;
 		const additionalCount = existing ? 0 : 1;
 		const candidates = this.cleanBodyCandidates(documentId);
 		let count = this.loadedBodyCount();
-		let residentBytes = this.loadedBodyResidentBytes() - replacingBytes;
+		let encodedStateBytes = this.loadedBodyEncodedStateBytes() - replacingBytes;
 		while (
 			(count + additionalCount > this.limits.loadedBodies
-				|| residentBytes + incomingBytes > this.limits.residentBytes)
+				|| encodedStateBytes + incomingBytes > this.limits.encodedStateBytes)
 			&& candidates.length > 0
 		) {
 			const [id, value] = candidates.shift()!;
 			this.loaded.delete(id);
-			residentBytes -= value.residentBytes;
+			encodedStateBytes -= value.encodedStateBytes;
 			count--;
 			value.doc.destroy();
 		}
 		if (count + additionalCount > this.limits.loadedBodies) return "body_cache_count";
-		if (residentBytes + incomingBytes > this.limits.residentBytes) return "body_cache_resident_bytes";
+		if (encodedStateBytes + incomingBytes > this.limits.encodedStateBytes) return "body_cache_encoded_state_bytes";
 		return null;
 	}
 
@@ -384,9 +394,9 @@ export class VaultDocumentCache {
 		return head ? this.store.documentEncodedHistoryBytes(documentId, head.latestSequence) : 0;
 	}
 
-	private loadedBodyResidentBytes(): number {
+	private loadedBodyEncodedStateBytes(): number {
 		let bytes = 0;
-		for (const [id, loaded] of this.loaded) if (id !== "root") bytes += loaded.residentBytes;
+		for (const [id, loaded] of this.loaded) if (id !== "root") bytes += loaded.encodedStateBytes;
 		return bytes;
 	}
 

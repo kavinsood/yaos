@@ -4,7 +4,11 @@ import * as syncProtocol from "y-protocols/sync";
 import * as Y from "yjs";
 import { MAX_AWARENESS_BYTES, MAX_BODY_SOCKETS, MAX_CANDIDATE_BYTES, MAX_ROOT_SOCKETS } from "./contracts";
 import { sha256Hex } from "./hex";
-import type { VaultDocumentCache } from "./vaultDocumentCache";
+import {
+	VaultDocumentCachePressureError,
+	type LoadedVaultDocument,
+	type VaultDocumentCache,
+} from "./vaultDocumentCache";
 import { safeBlobPath } from "./shared/vaultPath";
 import { isCanonicalVaultId } from "./vaultId";
 
@@ -154,6 +158,13 @@ export interface SocketServiceOptions {
 	scheduleFlush: (documentId: string) => void;
 }
 
+function cachePressureResponse(reason: "body_cache_count" | "body_cache_encoded_state_bytes" | "vault_transient_bytes"): Response {
+	return Response.json(
+		{ error: reason },
+		{ status: 429, headers: { "Retry-After": "1" } },
+	);
+}
+
 /** Owns hibernated root/body sockets, attachments, framing, and fan-out. */
 export class VaultSocketService {
 	constructor(private readonly options: SocketServiceOptions) {}
@@ -181,8 +192,22 @@ export class VaultSocketService {
 		}
 		if (kind === "root" && rootCount >= MAX_ROOT_SOCKETS) return Response.json({ error: "root_socket_limit" }, { status: 429 });
 		if (kind === "body" && bodyCount >= MAX_BODY_SOCKETS) return Response.json({ error: "body_socket_limit" }, { status: 429 });
-		if (kind === "body" && !this.options.cache.admitBody(documentId)) return Response.json({ error: "body_cache_count" }, { status: 429 });
-		const loaded = this.options.cache.load(documentId, kind === "body", () => this.options.isActiveBody(documentId));
+		if (kind === "body" && !this.options.cache.admitBody(documentId)) {
+			return cachePressureResponse("body_cache_count");
+		}
+		let loaded: LoadedVaultDocument;
+		try {
+			loaded = this.options.cache.load(documentId, kind === "body", () => this.options.isActiveBody(documentId));
+		} catch (error) {
+			if (kind === "body" && error instanceof VaultDocumentCachePressureError) {
+				if (error.reason === "body_cache_count"
+					|| error.reason === "body_cache_encoded_state_bytes"
+					|| error.reason === "vault_transient_bytes") {
+					return cachePressureResponse(error.reason);
+				}
+			}
+			throw error;
+		}
 		const pair = this.options.sockets.createPair();
 		const client = pair.client;
 		const server = pair.server;

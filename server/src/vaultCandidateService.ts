@@ -6,8 +6,11 @@ import type { CatalogMutation, ReconstructedDocument, VaultStore } from "./vault
 import type { VaultDocumentCache } from "./vaultDocumentCache";
 import type { VaultLifecycleService } from "./vaultLifecycleService";
 import type { VaultSocketService } from "./vaultSocketService";
+import { canonicalMarkdownBytes, canonicalizeMarkdown } from "./shared/markdownCodec";
 
 const MAX_IDENTITY_LENGTH = 256;
+
+class NonCanonicalMarkdownCandidateError extends Error {}
 
 function json(value: unknown, status = 200): Response {
 	return Response.json(value, { status, headers: { "cache-control": "no-store" } });
@@ -65,7 +68,15 @@ export class VaultCandidateService {
 		const actualDigest = await sha256Hex(update);
 		if (actualDigest !== candidateDigest) return json({ error: "candidate_digest_mismatch" }, 400);
 		if (!await this.options.flush(bodyId)) return json({ error: "body_persistence_unavailable" }, 503);
-		const state = await this.candidateCatalog(bodyId, update);
+		let state: Awaited<ReturnType<VaultCandidateService["candidateCatalog"]>>;
+		try {
+			state = await this.candidateCatalog(bodyId, update);
+		} catch (error) {
+			if (error instanceof NonCanonicalMarkdownCandidateError) {
+				return json({ error: "candidate_markdown_not_canonical" }, 409);
+			}
+			throw error;
+		}
 		let durable;
 		try {
 			durable = this.options.store.commitCandidate({
@@ -107,7 +118,11 @@ export class VaultCandidateService {
 		try {
 			reconstructed = this.options.store.reconstructDocument(bodyId);
 			Y.applyUpdate(reconstructed.doc, update, "candidate-metadata");
-			const bytes = new TextEncoder().encode(Y.Text.prototype.toString.call(reconstructed.doc.getText("body")));
+			const content = Y.Text.prototype.toString.call(reconstructed.doc.getText("body"));
+			if (content !== canonicalizeMarkdown(content)) {
+				throw new NonCanonicalMarkdownCandidateError();
+			}
+			const bytes = canonicalMarkdownBytes(content);
 			const metadata = { contentHash: await sha256Hex(bytes), size: bytes.byteLength };
 			const current = this.options.store.getCatalogHeadAt(this.options.store.currentSequence(), bodyId);
 			const generation = (this.options.store.documentHead(bodyId)?.generation ?? 0) + 1;

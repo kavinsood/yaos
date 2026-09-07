@@ -1,6 +1,7 @@
 import { strict as assert } from "node:assert";
 import * as Y from "yjs";
 import { encodeRootPathPublicationUpdate } from "../../server/src/server";
+import { VaultDocumentCachePressureError } from "../../server/src/vaultDocumentCache";
 import {
 	parseVaultSocketAttachment,
 	rootUpdateChangesProtectedAttachmentMaps,
@@ -109,6 +110,64 @@ s.test("hibernated sockets from an old runtime epoch are fenced", async () => {
 		close = { code, reason };
 	}), new Uint8Array([0]).buffer);
 	assert.deepEqual(close, { code: 1008, reason: "socket authority mismatch" });
+});
+
+s.test("body socket cache pressure is bounded to explicit 429 responses", async () => {
+	for (const reason of ["body_cache_encoded_state_bytes", "vault_transient_bytes"] as const) {
+		const service = new VaultSocketService({
+			sockets: registry([]),
+			cache: {
+				admitBody: () => true,
+				load: () => { throw new VaultDocumentCachePressureError(reason); },
+			},
+			vaultId: () => attachment.vaultId,
+			vaultGeneration: () => attachment.vaultGeneration,
+			runtimeEpoch: attachment.runtimeEpoch,
+			isActiveBody: () => true,
+			isDeviceRevoked: () => false,
+			scheduleFlush: () => {},
+		} as never);
+		const response = service.accept("body-pressure", "body", "device-pressure");
+		assert.equal(response.status, 429);
+		assert.equal(response.headers.get("retry-after"), "1");
+		assert.deepEqual(await response.json(), { error: reason });
+	}
+
+	const countService = new VaultSocketService({
+		sockets: registry([]),
+		cache: { admitBody: () => false },
+		vaultId: () => attachment.vaultId,
+		vaultGeneration: () => attachment.vaultGeneration,
+		runtimeEpoch: attachment.runtimeEpoch,
+		isActiveBody: () => true,
+		isDeviceRevoked: () => false,
+		scheduleFlush: () => {},
+	} as never);
+	const countResponse = countService.accept("body-count", "body", "device-pressure");
+	assert.equal(countResponse.status, 429);
+	assert.equal(countResponse.headers.get("retry-after"), "1");
+	assert.deepEqual(await countResponse.json(), { error: "body_cache_count" });
+});
+
+s.test("body socket admission preserves unknown cache failures", () => {
+	const failure = new Error("storage reconstruction failed");
+	const service = new VaultSocketService({
+		sockets: registry([]),
+		cache: {
+			admitBody: () => true,
+			load: () => { throw failure; },
+		},
+		vaultId: () => attachment.vaultId,
+		vaultGeneration: () => attachment.vaultGeneration,
+		runtimeEpoch: attachment.runtimeEpoch,
+		isActiveBody: () => true,
+		isDeviceRevoked: () => false,
+		scheduleFlush: () => {},
+	} as never);
+	assert.throws(
+		() => service.accept("body-unknown", "body", "device-pressure"),
+		(error: unknown) => error === failure,
+	);
 });
 
 s.test("lifecycle publication is the exact root path authority", () => {

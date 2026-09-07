@@ -16,6 +16,7 @@ import {
 	SERVER_STORAGE_FORMAT_VERSION,
 } from "./version";
 import { VaultCandidateService } from "./vaultCandidateService";
+import { canonicalMarkdownBytes } from "./shared/markdownCodec";
 import { blobKey } from "./vaultObjectStore";
 import { VaultDocumentCache } from "./vaultDocumentCache";
 import { VaultLifecycleService } from "./vaultLifecycleService";
@@ -484,7 +485,7 @@ export class VaultRuntime implements DrainPort {
 		if (!head) return json({ error: "body_not_active" }, 404);
 		const reconstructed = this.store.reconstructDocument(bodyId);
 		const bytes = Y.encodeStateAsUpdate(reconstructed.doc);
-		const content = new TextEncoder().encode(Y.Text.prototype.toString.call(reconstructed.doc.getText("body")));
+		const content = canonicalMarkdownBytes(Y.Text.prototype.toString.call(reconstructed.doc.getText("body")));
 		reconstructed.doc.destroy();
 		return new Response(bytes.slice().buffer, { headers: { "content-type": "application/octet-stream", "cache-control": "no-store",
 			"x-yaos-body-id": bodyId, "x-yaos-generation": String(reconstructed.generation), "x-yaos-content-hash": await sha256Hex(content), "x-yaos-size": String(content.byteLength) } });
@@ -604,7 +605,7 @@ export class VaultRuntime implements DrainPort {
 		const loaded = this.cache.get(bodyId);
 		const current = this.lifecycle.activeBodyHead(bodyId);
 		if (!loaded || !current) return undefined;
-		const content = new TextEncoder().encode(Y.Text.prototype.toString.call(loaded.doc.getText("body")));
+		const content = canonicalMarkdownBytes(Y.Text.prototype.toString.call(loaded.doc.getText("body")));
 		return { bodyId, fileId: current.fileId, path: current.path, previousPath: null, lifecycle: "active",
 			bodyGeneration: (this.store.documentHead(bodyId)?.generation ?? 0) + 1, contentHash: await sha256Hex(content), size: content.byteLength };
 	}
