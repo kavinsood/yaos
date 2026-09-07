@@ -6,7 +6,8 @@ import { join, resolve } from "node:path";
 import { sleep } from "../harness.ts";
 import type { LiveIdentity, LiveIdentityContext } from "./liveIdentity.ts";
 
-const HOST = "http://127.0.0.1:8787";
+const DEPLOYED_HOST = process.env.YAOS_TEST_DEPLOYED_HOST?.trim().replace(/\/+$/, "") || null;
+const HOST = DEPLOYED_HOST ?? "http://127.0.0.1:8787";
 const WRANGLER_BIN = resolve("server/node_modules/.bin/wrangler");
 const SETTINGS_CONFIG_KEY = ".obsidian-live";
 const NODE_TS = ["tests/run-typescript.mjs"];
@@ -58,7 +59,7 @@ async function waitForWorker(): Promise<void> {
 		}
 		await sleep(250);
 	}
-	throw new Error("Timed out waiting for wrangler dev to accept requests");
+	throw new Error(`Timed out waiting for ${HOST} to accept requests`);
 }
 
 function runCommand(command: LiveCommand, context: LiveIdentityContext): Promise<void> {
@@ -175,6 +176,19 @@ async function claimEnrollAndProvision(): Promise<LiveIdentityContext> {
 
 async function main(): Promise<void> {
 	assertLiveAccountability();
+	if (DEPLOYED_HOST) {
+		const url = new URL(DEPLOYED_HOST);
+		if (url.protocol !== "https:" || url.origin !== DEPLOYED_HOST) {
+			throw new Error("YAOS_TEST_DEPLOYED_HOST must be an exact HTTPS origin");
+		}
+		if (process.env.YAOS_TEST_DEPLOYED_DISPOSABLE !== "true") {
+			throw new Error("deployed integration is destructive; set YAOS_TEST_DEPLOYED_DISPOSABLE=true for a fresh disposable Worker");
+		}
+		await waitForWorker();
+		const context = await claimEnrollAndProvision();
+		for (const command of LIVE_COMMANDS) await runCommand(command, context);
+		return;
+	}
 	const persistDir = mkdtempSync(join(tmpdir(), "yaos-wrangler-"));
 	const wrangler = spawn(WRANGLER_BIN, [
 		"dev", "--ip", "127.0.0.1", "--port", "8787", "--local-protocol", "http",

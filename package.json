@@ -20,6 +20,7 @@
 		"test:regressions": "npm run guard:no-src-js-artifacts && npm run guard:qa-isolation && npm run guard:schema-version && node tests/run-suites.mjs",
 		"test:ci": "npm run test:regressions && npm run test:integration:worker && npm run test:node-runtime && npm run test:conformance && npm run test:headless && npm run test:cli",
 		"test:integration:worker": "node tests/run-typescript.mjs tests/live/run-live.ts",
+		"test:integration:deployed": "node tests/run-typescript.mjs tests/live/run-live.ts",
 		"test:conformance": "node --import jiti/register tests/conformance/run-conformance.ts",
 		"test:headless": "node tests/run-typescript.mjs tests/headless/run-headless.ts",
 		"test:node-runtime": "node tests/run-typescript.mjs tests/node-runtime/storage.ts && node tests/run-typescript.mjs tests/node-runtime/object-store.ts && node tests/run-typescript.mjs tests/node-runtime/alarms.ts && node tests/run-typescript.mjs tests/node-runtime/runtime.ts",
