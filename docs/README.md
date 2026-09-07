@@ -19,5 +19,7 @@ Current `main` has durable engineering documents for the schema-6 product and th
 - [Operational resource UX](operational-resource-ux.md) — read-only heuristic budgets, queues, blockers, socket counts, and actionable pressure guidance.
 - [RFC 08–10 implementation report](relay-rfcs-08-10-implementation-report.md) — integrated resource and scheduling work, server reuse, pitfalls, validation, and calibration recommendations.
 - [Relay follow-up implementation and deferral report](relay-followups-implementation-report.md) — explicit rename/audit migration prerequisites, field-evidence gaps, exit criteria, and recommended execution order.
+- [Obsidian host compatibility](obsidian-host-compatibility.md) — supported private-host seams, capability fallbacks, and reversible patching rules.
+- [Public plugin API](public-api.md) — versioned immutable state projection, subscriptions, and reload fencing.
 
 The repository-root [README](../README.md) is the public product guide. Generated evidence belongs under ignored `qa-runs/`; workstation notes belong under ignored `notes/`.

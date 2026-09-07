@@ -8,6 +8,18 @@ The QA harness under `qa/` is not shipped. QA scenarios use a separately built p
 
 `FlightTraceController` owns the client diagnostics lifecycle. Product code emits through the published flight envelope and taxonomy; there is no second persistent logger.
 
+`ObsidianHostAdapter` is the sole boundary for capability-checked undocumented
+Obsidian behavior, including leaf identities and the community-plugin manager.
+Its scoped patch registry observes only demonstrated product needs and always
+stands down safely when the host behavior is unavailable or replaced. The
+supported behavior matrix is in [Obsidian host compatibility](obsidian-host-compatibility.md).
+
+`plugin.api` is a separate, versioned data-only projection for other plugins.
+It exposes immutable coordinator, settlement, and preservation facts without
+Yjs documents, credentials, providers, diagnostics, or mutation controls.
+Consumers reacquire after `yaos:api-ready`; unload fences retained handles.
+The contract is in [Public plugin API](public-api.md).
+
 The headless client under `packages/cli` hosts the same `VaultSync`, `BodyManager`, `DiskMirror`, and reconciliation policy on a local Linux filesystem. It is Markdown-only, stores its device identity and schema-6 retry/cache state in machine-local SQLite, and never copies another enrollment's bearer.
 
 The Cloudflare Worker classes are thin platform wrappers around portable `ControlPlaneRuntime`, `VaultRuntime`, and `RecoveryJobRuntime` compositions. `packages/server-node` supplies Node-specific SQLite/KV, actor, WebSocket, alarm, and filesystem-object mechanisms to those same domain owners; it does not implement a second sync policy.
