@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, open, readdir, rm, unlink } from "node:fs/promises";
+import { mkdtemp, open, opendir, readdir, rm, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import {
@@ -142,6 +142,130 @@ s.test("prefix listing and deletion expose only durably published objects", asyn
 		assert.equal(second.objects.length, 1);
 		await store.delete(first.objects[0]!.key);
 		assert.equal(await store.head(first.objects[0]!.key), null);
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+s.test("cursor pages use the startup index instead of rescanning the object tree", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "yaos-node-object-index-"));
+	const root = join(directory, "objects");
+	const writer = new FilesystemObjectStore(root);
+	await writer.initialize();
+	try {
+		const objectCount = 64;
+		for (let index = 0; index < objectCount; index++) {
+			const bucket = String(index % 8).padStart(2, "0");
+			const name = String(index).padStart(4, "0");
+			await writer.put(`bench/${bucket}/${name}`, new Uint8Array([index]));
+		}
+
+		let directoryOpens = 0;
+		let fileOpens = 0;
+		const reader = new FilesystemObjectStore(root, {
+			open: async (path, flags, mode) => {
+				fileOpens++;
+				return await open(path, flags, mode);
+			},
+			openDirectory: async (path) => {
+				directoryOpens++;
+				return await opendir(path);
+			},
+		});
+		await reader.initialize();
+		assert.ok(directoryOpens >= 10, "the startup index probe did not encounter the seeded directory tree");
+		directoryOpens = 0;
+		fileOpens = 0;
+
+		const listedKeys: string[] = [];
+		let cursor: string | undefined;
+		let pageCount = 0;
+		do {
+			const page = await reader.list({ prefix: "bench/", cursor, limit: 7 });
+			listedKeys.push(...page.objects.map((object) => object.key));
+			pageCount++;
+			assert.equal(directoryOpens, 0, `page ${pageCount} rescanned the filesystem tree`);
+			cursor = page.cursor ?? undefined;
+			if (!page.truncated) break;
+		} while (true);
+
+		assert.ok(pageCount > 2, "the fixture did not exercise subsequent cursor pages");
+		assert.equal(listedKeys.length, objectCount);
+		assert.equal(new Set(listedKeys).size, objectCount);
+		assert.equal(fileOpens, objectCount, "listing work must be one header read per returned object");
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+s.test("heavy create/delete churn compacts index tombstones without rescanning", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "yaos-node-object-index-churn-"));
+	const root = join(directory, "objects");
+	let directoryOpens = 0;
+	const store = new FilesystemObjectStore(root, {
+		openDirectory: async (path) => {
+			directoryOpens++;
+			return await opendir(path);
+		},
+	});
+	await store.initialize();
+	directoryOpens = 0;
+	try {
+		const retainedKeys = Array.from({ length: 16 }, (_, index) =>
+			`churn/retained/${String(index).padStart(3, "0")}`);
+		for (const key of retainedKeys) await store.put(key, new Uint8Array([1]));
+
+		for (let round = 0; round < 6; round++) {
+			const churnKeys = Array.from({ length: 300 }, (_, index) =>
+				`churn/transient-${round}/${String(index).padStart(3, "0")}`);
+			for (const key of churnKeys) await store.put(key, new Uint8Array([round]));
+
+			const beforeDelete = await store.list({ prefix: "churn/", limit: 1_000 });
+			assert.equal(beforeDelete.truncated, false);
+			assert.equal(beforeDelete.objects.length, retainedKeys.length + churnKeys.length);
+			for (const key of churnKeys) await store.delete(key);
+
+			const afterDelete = await store.list({ prefix: "churn/", limit: 1_000 });
+			assert.equal(afterDelete.truncated, false);
+			assert.deepEqual(afterDelete.objects.map((object) => object.key), retainedKeys);
+			assert.equal(directoryOpens, 0, `round ${round} rescanned the filesystem tree`);
+		}
+
+		const internal = store as unknown as { sortedKeys: unknown };
+		assert.ok(Array.isArray(internal.sortedKeys));
+		assert.ok(internal.sortedKeys.length <= retainedKeys.length + 255,
+			`index retained ${internal.sortedKeys.length} entries for ${retainedKeys.length} live keys`);
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+s.test("listing tolerates an indexed object being concurrently deleted", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "yaos-node-object-list-delete-"));
+	const root = join(directory, "objects");
+	const writer = new FilesystemObjectStore(root);
+	await writer.initialize();
+	try {
+		await writer.put("capture/a", new Uint8Array([1]));
+		await writer.put("capture/b", new Uint8Array([2]));
+		await writer.put("capture/c", new Uint8Array([3]));
+		const deletedLocation = join(root, "capture/b");
+		let deleted = false;
+		const reader = new FilesystemObjectStore(root, {
+			open: async (path, flags, mode) => {
+				if (!deleted && path === deletedLocation && flags === "r") {
+					deleted = true;
+					await unlink(deletedLocation);
+				}
+				return await open(path, flags, mode);
+			},
+		});
+		await reader.initialize();
+
+		const page = await reader.list({ prefix: "capture/", limit: 3 });
+		assert.equal(deleted, true);
+		assert.deepEqual(page.objects.map((object) => object.key), ["capture/a", "capture/c"]);
+		assert.equal(page.truncated, false);
 	} finally {
 		await rm(directory, { recursive: true, force: true });
 	}

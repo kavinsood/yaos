@@ -1,4 +1,5 @@
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
+import type { Dir } from "node:fs";
 import {
 	type FileHandle,
 	link,
@@ -40,6 +41,7 @@ interface StoredHeader {
 
 export interface FilesystemObjectStoreOperations {
 	open(path: string, flags: string, mode?: number): Promise<FileHandle>;
+	openDirectory(path: string): Promise<Dir>;
 	link(existingPath: string, newPath: string): Promise<void>;
 	unlink(path: string): Promise<void>;
 	remove(path: string): Promise<void>;
@@ -47,10 +49,15 @@ export interface FilesystemObjectStoreOperations {
 
 const DEFAULT_OPERATIONS: FilesystemObjectStoreOperations = {
 	open,
+	openDirectory: opendir,
 	link,
 	unlink,
 	remove: async (path) => await rm(path, { force: true }),
 };
+
+// Keep deletions O(1) in the common case, but do not let the startup index
+// retain every object name ever created for the lifetime of the process.
+const INDEX_COMPACTION_MIN_TOMBSTONES = 256;
 
 function hasControlCharacter(value: string): boolean {
 	for (const character of value) {
@@ -120,10 +127,39 @@ function objectMetadata(header: StoredHeader): ObjectMetadata {
 	};
 }
 
+function lowerBound(values: readonly string[], target: string): number {
+	let low = 0;
+	let high = values.length;
+	while (low < high) {
+		const middle = low + ((high - low) >> 1);
+		if (values[middle]! < target) low = middle + 1;
+		else high = middle;
+	}
+	return low;
+}
+
+function upperBound(values: readonly string[], target: string): number {
+	let low = 0;
+	let high = values.length;
+	while (low < high) {
+		const middle = low + ((high - low) >> 1);
+		if (values[middle]! <= target) low = middle + 1;
+		else high = middle;
+	}
+	return low;
+}
+
 /** Immutable filesystem objects published with fsync + atomic hard-link. */
 export class FilesystemObjectStore implements ObjectStorePort {
 	readonly root: string;
 	private readonly operations: FilesystemObjectStoreOperations;
+	// Build the filesystem index once at startup. New keys are merged in batches;
+	// deleted keys become cheap tombstones so paged GC does not rebuild the index.
+	private indexInitialization: Promise<void> | null = null;
+	private sortedKeys: string[] = [];
+	private readonly liveKeys = new Set<string>();
+	private readonly pendingKeys = new Set<string>();
+	private indexedTombstones = 0;
 
 	constructor(root: string, operations: Partial<FilesystemObjectStoreOperations> = {}) {
 		this.root = resolve(root);
@@ -132,6 +168,7 @@ export class FilesystemObjectStore implements ObjectStorePort {
 
 	async initialize(): Promise<void> {
 		await mkdir(this.root, { recursive: true, mode: 0o700 });
+		await this.ensureIndex();
 	}
 
 	async head(key: string): Promise<ObjectMetadata | null> {
@@ -166,6 +203,7 @@ export class FilesystemObjectStore implements ObjectStorePort {
 	}
 
 	async put(key: string, bytes: Uint8Array, options: ObjectWriteOptions = {}): Promise<void> {
+		await this.ensureIndex();
 		await this.publish(key, bytes, options);
 	}
 
@@ -174,16 +212,20 @@ export class FilesystemObjectStore implements ObjectStorePort {
 		bytes: Uint8Array,
 		options: ObjectWriteOptions = {},
 	): Promise<"created" | "exists"> {
+		await this.ensureIndex();
 		return await this.publish(key, bytes, options);
 	}
 
 	async delete(key: string): Promise<void> {
+		await this.ensureIndex();
 		const location = this.location(key);
 		try {
 			await this.operations.unlink(location);
+			this.removeIndexedKey(key);
 			await fsyncDirectory(dirname(location));
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			this.removeIndexedKey(key);
 		}
 	}
 
@@ -192,17 +234,21 @@ export class FilesystemObjectStore implements ObjectStorePort {
 		if (!Number.isSafeInteger(limit) || limit < 1 || limit > 10_000) {
 			throw new RangeError("object list limit must be between 1 and 10000");
 		}
-		const keys: string[] = [];
-		await this.collectKeys(this.root, keys);
-		keys.sort();
-		const selected = keys.filter((key) => key.startsWith(input.prefix) && (input.cursor === undefined || key > input.cursor));
-		const pageKeys = selected.slice(0, limit);
-		const objects: ObjectMetadata[] = [];
-		for (const key of pageKeys) {
-			const object = await this.head(key);
-			if (object) objects.push(object);
+		await this.ensureIndex();
+		this.mergePendingKeys();
+		const start = input.cursor === undefined || input.cursor < input.prefix
+			? lowerBound(this.sortedKeys, input.prefix)
+			: upperBound(this.sortedKeys, input.cursor);
+		const selected: string[] = [];
+		for (let index = start; index < this.sortedKeys.length && selected.length <= limit; index++) {
+			const key = this.sortedKeys[index]!;
+			if (!key.startsWith(input.prefix)) break;
+			if (this.liveKeys.has(key)) selected.push(key);
 		}
-		const truncated = selected.length > pageKeys.length;
+		const truncated = selected.length > limit;
+		const pageKeys = truncated ? selected.slice(0, limit) : selected;
+		const listed = await Promise.all(pageKeys.map(async (key) => await this.head(key)));
+		const objects = listed.filter((object): object is ObjectMetadata => object !== null);
 		return {
 			objects,
 			truncated,
@@ -248,9 +294,11 @@ export class FilesystemObjectStore implements ObjectStorePort {
 			} catch (error) {
 				if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
 				await this.validateWinner(location, header, bytes);
+				this.addIndexedKey(key);
 				return "exists";
 			}
 			await fsyncDirectory(directory);
+			this.addIndexedKey(key);
 			return "created";
 		} finally {
 			await this.operations.remove(temporary);
@@ -315,10 +363,73 @@ export class FilesystemObjectStore implements ObjectStorePort {
 		return location;
 	}
 
+	private async ensureIndex(): Promise<void> {
+		if (this.indexInitialization === null) {
+			this.indexInitialization = this.initializeIndex();
+		}
+		await this.indexInitialization;
+	}
+
+	private async initializeIndex(): Promise<void> {
+		await mkdir(this.root, { recursive: true, mode: 0o700 });
+		const keys: string[] = [];
+		await this.collectKeys(this.root, keys);
+		keys.sort();
+		this.sortedKeys = keys;
+		this.liveKeys.clear();
+		for (const key of keys) this.liveKeys.add(key);
+		this.indexedTombstones = 0;
+	}
+
+	private addIndexedKey(key: string): void {
+		if (this.liveKeys.has(key)) return;
+		this.liveKeys.add(key);
+		const location = lowerBound(this.sortedKeys, key);
+		if (this.sortedKeys[location] !== key) this.pendingKeys.add(key);
+	}
+
+	private removeIndexedKey(key: string): void {
+		if (!this.liveKeys.delete(key)) return;
+		if (!this.pendingKeys.delete(key)) this.indexedTombstones++;
+		this.compactIndexIfNeeded();
+	}
+
+	private compactIndexIfNeeded(): void {
+		const threshold = Math.max(INDEX_COMPACTION_MIN_TOMBSTONES, this.liveKeys.size);
+		if (this.indexedTombstones < threshold) return;
+		this.sortedKeys = this.sortedKeys.filter((key) => this.liveKeys.has(key));
+		this.indexedTombstones = 0;
+	}
+
+	private mergePendingKeys(): void {
+		if (this.pendingKeys.size === 0) return;
+		const additions = [...this.pendingKeys].sort();
+		const merged: string[] = [];
+		let existingIndex = 0;
+		let additionIndex = 0;
+		while (existingIndex < this.sortedKeys.length || additionIndex < additions.length) {
+			const existing = this.sortedKeys[existingIndex];
+			const addition = additions[additionIndex];
+			if (addition === undefined || (existing !== undefined && existing < addition)) {
+				merged.push(existing!);
+				existingIndex++;
+			} else if (existing === addition) {
+				merged.push(existing);
+				existingIndex++;
+				additionIndex++;
+			} else {
+				merged.push(addition);
+				additionIndex++;
+			}
+		}
+		this.sortedKeys = merged;
+		this.pendingKeys.clear();
+	}
+
 	private async collectKeys(directory: string, keys: string[]): Promise<void> {
 		let handle;
 		try {
-			handle = await opendir(directory);
+			handle = await this.operations.openDirectory(directory);
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
 			throw error;
