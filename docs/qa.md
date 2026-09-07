@@ -63,7 +63,7 @@ Current server suites exercise:
 - `recovery-deletion.ts`: generation purge completes before SQL deletion;
 - `multivault-registry.ts` and `identity-control-plane.ts`: provisioning state, memberships, retryable deletion obligations, and purge identity;
 - `vault-route-authority.ts` and socket admission suites: device, vault, schema, and protocol boundaries.
-- `vault-document-cache.ts`: aggregate resident/transient limits, mixed-size LRU, protected-body refusal, and exactly-once reservation release;
+- `vault-document-cache.ts`: aggregate encoded-state/transient limits, mixed-size LRU, protected-body refusal, and exactly-once reservation release;
 - identity suites: response-loss-safe enrollment replay and durable retryable device revocation obligations;
 - `settings-sync-store.ts`: SQL seed/replace, monotonic LWW revisions, intents/tombstones, plugin-data gates, atomic failure, JSON/hash/path/count/body bounds, and bounded HTTP reads;
 - `settings-sync-route-authority.ts`: current membership, wrong-vault/revoked denial before runtime allocation, and trusted vault/generation/device forwarding without the bearer.
@@ -115,6 +115,8 @@ Prior long-run Worker soak evidence exists. The integrated build has not repeate
 ### Deployed Cloudflare boundary
 
 Local Wrangler does not prove production WebSocket upgrade routing, Durable Object placement/eviction, alarms under platform scheduling, R2 list/delete consistency, deployment migration behavior, or operator retry behavior against an actual Cloudflare account.
+
+The same live suite can target a fresh disposable deployed Worker without starting local Wrangler. Set `YAOS_TEST_DEPLOYED_HOST` to its exact HTTPS origin and explicitly acknowledge teardown with `YAOS_TEST_DEPLOYED_DISPOSABLE=true`, then run `npm run test:integration:deployed`. The suite claims the fresh deployment, mutates it, exercises HTTP and WebSocket behavior, and destroys its test vault; it must never target a retained or production deployment.
 
 ### Obsidian and mobile restore
 

@@ -317,7 +317,7 @@ The vault status surface additionally exposes `vaultGeneration`, `runtimeEpoch`,
 - Empty folders are not synchronized.
 - Attachment upload size is bounded by the server and client caps; publication operations survive response loss and restart.
 - Root/body persistence is bounded by Durable Object SQL row, statement, and account limits.
-- Server body admission enforces 32 bodies, 48 MiB aggregate resident state, and a 16 MiB transient/pending reserve. Client body admission enforces a separate 48 MiB aggregate estimated-cost budget. Only clean, unpinned bodies without open sockets may be evicted.
+- Server body admission enforces 32 bodies, a 48 MiB aggregate encoded-Yjs-state proxy budget, and a 16 MiB transient/pending reserve. Known cache pressure rejects the body WebSocket handshake with `429`, an exact count/encoded/transient reason, and `Retry-After: 1`; operators should treat it as backpressure rather than an internal failure. The proxy is not a server heap measurement. Client body admission enforces a separate 48 MiB aggregate estimated-cost budget. Only clean, unpinned bodies without open sockets may be evicted.
 - Recovery requires R2 and the job binding and may finish with explicit unavailable entries.
 - Settings environment key: 1–64 characters; no `.`, `..`, NUL, slash, or backslash. Settings paths: at most 256 characters and must match the closed allowlist without traversal.
 - Settings bodies: at most 1,000,000 bytes each and 4,000,000 bytes total per environment. Snapshot requests are at most 6,000,000 bytes; item requests 1,500,000 bytes; GET responses 6,000,000 bytes.

@@ -62,6 +62,11 @@ Authority is split by domain:
 
 A local Markdown update is persisted as a device-scoped candidate before submission. Candidate identity is the tuple of device ID, body ID, candidate ID, and digest.
 
+The candidate digest names the encoded Yjs update bytes, not the note's logical
+text. Catalog content hashes and disk baselines name canonical Markdown bytes
+under [`markdown-lf-v1`](canonical-markdown.md); exact disk fingerprints remain
+separate self-write evidence.
+
 The server:
 
 1. rejects candidates for inactive bodies;
