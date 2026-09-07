@@ -63,10 +63,10 @@ The exact product pins are:
 | Boundary | Version |
 |---|---:|
 | Document schema | 7 |
-| Durable SQL storage format | 2 |
-| Socket protocol | 3 |
+| Durable SQL storage format | 3 |
+| Socket protocol | 4 |
 | Recovery snapshot format | 2 |
-| Settings sync format | 1 |
+| Settings sync format | 2 |
 | Control-plane identity format | 3 |
 
 Missing or mismatched schema or protocol declarations fail admission with `update_required`. Mixed writers are unsupported.
@@ -112,7 +112,7 @@ Writes are serialized per path and carry an expected content fingerprint. A watc
 
 Settings sync is enabled by default after enrollment and belongs to the current principal. The shared scope is `vaultId + principalId + configDirKey`, where the last component is the named, sanitized configuration-folder key. Different principals never share settings, and ownership transfer does not reveal or confiscate either person's environment. Different keys such as `.obsidian` and `.obsidian-mobile` remain independent within one principal. An existing remote environment is not applied without this device's explicit seed/take/replace decision; a take first persists its exact-authority queue, then commits acceptance only after apply succeeds, while defer withholds the decision. The synchronized file set remains closed to selected root JSON, `snippets/*.css`, and community-plugin `data.json`; device-local and excluded state remains local.
 
-The vault SQL sidecar stores settings format 1. Every accepted mutation advances one safe integer environment revision, and each changed row receives that revision. Clients use the last acknowledged hash and revision to distinguish newer server state, dirty local state, first-seen files, and acknowledged deletion. Seed is create-once; replace atomically publishes a complete local snapshot and tombstones omitted live plugins and themes.
+The vault SQL sidecar stores settings format 2. Every accepted mutation advances one safe integer environment revision, and each changed row receives that revision. Clients use the last acknowledged hash and revision to distinguish newer server state, dirty local state, first-seen files, and acknowledged deletion. Seed is create-once; replace atomically publishes a complete local snapshot and tombstones omitted live plugins and themes.
 
 Plugins and themes synchronize as repository/version intents, enabled state, and explicit tombstones. A plugin tombstone removes its live intent and plugin data. Plugin `data.json` can move in either direction only when the local manifest version, shared intent pin, and data-row version are identical and the plugin is not tombstoned. Binaries are never stored by YAOS: installation resolves Obsidian's published catalogs and GitHub repositories, requires explicit auto-install consent, and pauses at install steps while the app is backgrounded.
 
@@ -140,9 +140,9 @@ GC marks retained recovery and blob roots, acquires bounded sweep leases, and de
 
 `POST /claim` initializes the operator control plane and provisions the first vault. `POST /enroll` consumes one purpose-bound code and returns the principal ID, owner/member role, membership revision, device ID, device credential revision, fixed capabilities, bearer, selected vault generation, and origin/joining authority. The client persists its generated request ID and credentials before enrollment; a lost response retries the same hashes and receives the same bounded replay record without storing the plaintext bearer server-side.
 
-Vault HTTP routes require the device bearer and selected vault ID. The public route resolves the current principal, membership, device credential, role, policy version, capability digest, and active generation, then replaces any caller-supplied actor headers with this trusted context before forwarding. The vault runtime verifies the context against its durable authority mirror and checks the fixed capability for the route. Settings routes additionally bind the environment to the admitted principal and require exactly one `settingsFormatVersion=1`.
+Vault HTTP routes require the device bearer and selected vault ID. The public route resolves the current principal, membership, device credential, role, policy version, capability digest, and active generation, then replaces any caller-supplied actor headers with this trusted context before forwarding. The vault runtime verifies the context against its durable authority mirror and checks the fixed capability for the route. Settings routes additionally bind the environment to the admitted principal and require exactly one `settingsFormatVersion=2`.
 
-A short-lived protocol-3 ticket is deployment-, vault-generation-, principal-, membership-, device-, credential-, purpose-, and document-bound; long-lived credentials never appear in socket URLs. Root and body handshakes require exact `schemaVersion=7` and `protocolVersion=3`. Current control-plane authority is checked before runtime admission and the vault mirror checks it again. Protocol liveness still requires exact per-socket acknowledgements; browser `OPEN` alone is not responsive evidence.
+A short-lived protocol-4 ticket is deployment-, vault-generation-, principal-, membership-, device-, credential-, purpose-, and document-bound; long-lived credentials never appear in socket URLs. Root and body handshakes require exact `schemaVersion=7` and `protocolVersion=4`. Current control-plane authority is checked before runtime admission and the vault mirror checks it again. Protocol liveness still requires exact per-socket acknowledgements; browser `OPEN` alone is not responsive evidence.
 
 Revocation or ownership transfer first prevents new admission, then installs one idempotent authority change in the vault mutation order and closes affected sockets. A mutation ordered before the fence remains committed; one ordered after it fails as `authority_superseded`. Exact operation-outcome lookup can recover a bounded receipt for work that committed before a response was lost, but cannot create new work. The client preserves stale-authority work as unpublished rather than replaying it under new authority.
 

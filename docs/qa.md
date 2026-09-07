@@ -66,7 +66,7 @@ Current server suites exercise:
 - `multivault-registry.ts` and `identity-control-plane.ts`: provisioning state, identity-format admission, retryable deletion obligations, and purge identity;
 - `collaboration-control-plane.ts`: principals versus devices, owner/member invariants, invitation/device-link separation, owner governance, accepted ownership transfer, last-owner-device rejection, and exact actor revisions;
 - `vault-collaboration-authority.ts`: trusted actor parsing, forged-header stripping, fixed capability policy, and non-colliding principal settings namespaces;
-- `vault-route-authority.ts` and socket admission suites: principal/device revisions, vault generation, schema 7, protocol 3, purpose/document ticket binding, and stale-authority rejection.
+- `vault-route-authority.ts` and socket admission suites: principal/device revisions, vault generation, schema 7, protocol 4, purpose/document ticket binding, and stale-authority rejection.
 - `vault-document-cache.ts`: aggregate encoded-state/transient limits, mixed-size LRU, protected-body refusal, and exactly-once reservation release;
 - identity suites: response-loss-safe enrollment replay and durable retryable device revocation obligations;
 - `settings-sync-store.ts`: SQL seed/replace, monotonic LWW revisions, intents/tombstones, plugin-data gates, atomic failure, JSON/hash/path/count/body bounds, and bounded HTTP reads;
@@ -81,7 +81,7 @@ The full regression runner discovers suites under `tests/client`, `tests/server`
 The current passing local Worker run covers:
 
 - claim, owner bootstrap, same-principal device link, device roster, device revocation, and consumed-code rejection;
-- exact document schema `7`, socket protocol `3`, and identity format `3` admission;
+- exact document schema `7`, socket protocol `4`, and identity format `3` admission;
 - root and body socket connections using deployment-, actor-, purpose-, and document-bound tickets;
 - device A create/candidate/root publication and device B cold SQL bootstrap;
 - device B durable body edit, device A catch-up, rename publication, delete tombstone, and stale candidate rejection;

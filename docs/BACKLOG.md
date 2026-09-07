@@ -82,7 +82,7 @@ Current passing evidence is limited to focused suites, the complete regression d
 
 **Evidence:** The implementation deliberately admits only schema `6` and protocol `2`, provisions SQL format `2`, and stores clients in a schema-6 IndexedDB namespace. [Operations](operations.md#deployment-boundary) explicitly rejects in-place earlier room/cache reuse.
 
-**Required work:** Preserve a populated schema-3 vault on a trusted device, deploy a fresh current Worker with the `RecoveryJob` migration, claim, import through the origin path, enroll a joining device with a fresh cache, and verify the complete inventory and device isolation. Also verify advertised settings format 1, generation-fenced device-auth settings routes, and that a new vault generation starts with an unseeded settings environment.
+**Required work:** Preserve a populated schema-3 vault on a trusted device, deploy a fresh current Worker with the `RecoveryJob` migration, claim, import through the origin path, enroll a joining device with a fresh cache, and verify the complete inventory and device isolation. Also verify advertised settings format 2, generation-fenced device-auth settings routes, and that a new vault generation starts with an unseeded settings environment.
 
 **Closure:** A recorded external rehearsal matches the documented boundary, including failure behavior when the job binding/migration is absent and when settings capability/version is incompatible. It does not claim an in-place migration.
 

@@ -104,7 +104,7 @@ Collaboration is an exact breaking boundary:
 | Boundary | Version |
 |---|---:|
 | Document schema | 7 |
-| Socket protocol | 3 |
+| Socket protocol | 4 |
 | Control-plane identity format | 3 |
 
 Older clients fail before partial synchronization. Historical schema-6 work is

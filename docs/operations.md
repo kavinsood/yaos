@@ -2,7 +2,7 @@
 
 ## Deployment boundary
 
-Schema 7, protocol 3, and control-plane identity format 3 form one breaking collaboration boundary. Older clients are rejected before partial synchronization, and schema-7 clients never open an older local cache.
+Schema 7, protocol 4, and control-plane identity format 3 form one breaking collaboration boundary. Older clients are rejected before partial synchronization, and schema-7 clients never open an older local cache.
 
 For a fresh deployment:
 
@@ -12,11 +12,42 @@ For a fresh deployment:
 4. enroll the trusted origin folder as the owner so its local files can enter schema 7;
 5. use **Add my device** for another owner installation or **Invite person** for a collaborator.
 
-An existing schema-6 deployment requires an operator-reviewed identity migration because old device records cannot reveal which devices belong to one person. Select the owner devices explicitly; they become one owner principal, while every ungrouped device becomes a separate full member principal. Settle or preserve old queued work, install the complete vault authority mirror, invalidate old tickets/sockets, and only then activate schema 7/protocol 3. Historical operations remain `legacy_unattributed`; migration never invents a person identity for them.
+An existing schema-6 deployment requires an operator-reviewed identity migration because old device records cannot reveal which devices belong to one person. Select the owner devices explicitly; they become one owner principal, while every ungrouped device becomes a separate full member principal. Settle or preserve old queued work, install the complete vault authority mirror, invalidate old tickets/sockets, and only then activate schema 7/protocol 4. Historical operations remain `legacy_unattributed`; migration never invents a person identity for them.
 
 Do not manually reuse old plugin caches. Exact admission fails closed, but bypassing the guided migration can strand authority or settings state.
 
 The Deploy button creates a detached deployment repository. Upstream changes do not update it automatically. After this breaking cutover, ordinary releases can use the generated repository's updater workflow so deployment and rollback remain Git-visible.
+
+## Cloudflare Access edge policy
+
+Protect the server with an Access application for its exact hostname. Do not use
+`Bypass`, `Everyone`, country, or broad-IP rules: they are not authentication and
+Cloudflare security enforcement may delete them automatically.
+
+Use separate strong policies for separate actors:
+
+- interactive users: an `Allow` policy restricted to exact identities (for
+  example, selected email addresses through the configured identity provider);
+- headless clients and automated probes: a `Service Auth` policy whose include
+  rule names one or more Access service tokens.
+
+Access applications do not inherit policy requirements from a broader
+wildcard application. If an exact-host application overlaps one, repeat the
+intended WARP, authentication-method, and device-posture requirements on its
+interactive policy; otherwise the more specific app can silently weaken the
+browser path.
+
+The headless client sends `CF-Access-Client-Id` and
+`CF-Access-Client-Secret` on HTTP requests and WebSocket upgrades when
+`YAOS_CF_ACCESS_CLIENT_ID` and `YAOS_CF_ACCESS_CLIENT_SECRET` are present. Set
+both variables for enrollment and every daemon run. Keep the secret in the
+host's secret manager or protected environment file, never in the vault, YAOS
+state directory, command line, repository, or Worker variables. Prefer one
+token per deployment or automation principal so it can be revoked independently.
+
+Access is an outer gate, not a replacement for YAOS authentication. A service
+token permits a request to reach the Worker; the request still needs its normal
+YAOS setup code, device bearer, ticket, and revision checks.
 
 ## Required Durable Object configuration
 
@@ -210,7 +241,7 @@ Supported: Markdown, one daemon per local vault, external editor/Git changes, co
 
 ## Settings sync setup and operation
 
-Settings sync is enabled by default for a newly enrolled device when the active authority includes `vault.settings.personal.sync` and the server advertises `settingsSync: true` with `settingsFormatVersion: 1`. Note sync remains independent. Open **Settings → YAOS → Obsidian settings sync** and verify the displayed configuration-folder key; it is the sanitized basename of the active Obsidian configuration directory and names an environment for the current principal. `.obsidian` and `.obsidian-mobile` do not share settings, and different vault members cannot read or mutate one another's environments.
+Settings sync is enabled by default for a newly enrolled device when the active authority includes `vault.settings.personal.sync` and the server advertises `settingsSync: true` with `settingsFormatVersion: 2`. Note sync remains independent. Open **Settings → YAOS → Obsidian settings sync** and verify the displayed configuration-folder key; it is the sanitized basename of the active Obsidian configuration directory and names an environment for the current principal. `.obsidian` and `.obsidian-mobile` do not share settings, and different vault members cannot read or mutate one another's environments.
 
 On first contact, resolve the named environment before any pre-existing remote settings can apply:
 
@@ -277,14 +308,14 @@ Without R2, the purge phase is already complete and SQL cleanup can proceed. A p
 
 Public setup routes are limited to claim, enrollment, and capability discovery. Vault HTTP routes require the device bearer in `Authorization` and the selected vault ID in the route.
 
-The socket ticket endpoint exchanges that bearer for a short-lived protocol-3 ticket bound to the deployment, vault generation, principal/membership revision, device/credential revision, purpose, and exact document. Root and body sockets require:
+The socket ticket endpoint exchanges that bearer for a short-lived protocol-4 ticket bound to the deployment, vault generation, principal/membership revision, device/credential revision, purpose, and exact document. Root and body sockets require:
 
 - a valid ticket;
 - document schema `7`;
-- socket protocol `3`;
+- socket protocol `4`;
 - active matching authority in both the control plane and vault mirror.
 
-The complete version set is document schema `7`, durable SQL format `2`, socket protocol `3`, recovery snapshot format `2`, settings sync format `1`, and control-plane identity format `3`. These pins change only through a coordinated client/server/storage cutover.
+The complete version set is document schema `7`, durable SQL format `3`, socket protocol `4`, recovery snapshot format `2`, settings sync format `2`, and control-plane identity format `3`. These pins change only through a coordinated client/server/storage cutover.
 
 ## Updating after the schema-7 cutover
 
@@ -315,7 +346,7 @@ The vault status surface additionally exposes `vaultGeneration`, `runtimeEpoch`,
 - **Recovery unavailable:** confirm the `RecoveryJob` binding and `v2` migration exist. Recovery additionally needs `YAOS_BUCKET`.
 - **Settings environment waits for a decision:** open the Obsidian settings-sync group and choose Seed, Take, or Decide later. A pre-existing remote environment never grants its own acceptance.
 - **Settings sync paused for clash:** disable the named official/community settings-sync plugin, then refresh YAOS. Note sync is unaffected.
-- **Settings format unsupported:** update the client/server pair; every settings route requires exactly one `settingsFormatVersion=1`.
+- **Settings format unsupported:** update the client/server pair; every settings route requires exactly one `settingsFormatVersion=2`.
 - **Plugin data held:** make the installed manifest version, shared intent pin, and plugin-data version identical; use Update, Promote pin, or Remove. Do not copy `data.json` across versions.
 - **Package install pending:** enable automatic package installation only if you consent, keep Obsidian foregrounded, and confirm community plugins are unrestricted. Install manually when the host API is unavailable.
 - **Invalid settings JSON:** repair the named local/remote JSON and retry; quarantine intentionally keeps the local value rather than overwriting it.

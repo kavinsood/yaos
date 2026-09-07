@@ -30,5 +30,6 @@ parallel current specifications.
 - [Relay follow-up implementation and deferral report](relay-followups-implementation-report.md) — explicit rename/audit migration prerequisites, field-evidence gaps, exit criteria, and recommended execution order.
 - [Obsidian host compatibility](obsidian-host-compatibility.md) — supported private-host seams, capability fallbacks, and reversible patching rules.
 - [Public plugin API](public-api.md) — versioned immutable state projection, subscriptions, and reload fencing.
+- [Canvas semantic synchronization](canvas-semantic-sync-plan.md) — proposed semantic model, authority, projection, migration, recovery, validation, and staged build plan for JSON Canvas.
 
 The repository-root [README](../README.md) is the public product guide. Generated evidence belongs under ignored `qa-runs/`; workstation notes belong under ignored `notes/`.
