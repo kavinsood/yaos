@@ -80,7 +80,9 @@ try {
 	assert(rename.path === renamedPath, "rename commits against the durable catalog");
 	await waitFor(
 		() => rootA.doc.getMap<string>("pathToId").get(renamedPath) === bodyId
-			&& !rootA.doc.getMap<string>("pathToId").has(originalPath),
+			&& !rootA.doc.getMap<string>("pathToId").has(originalPath)
+			&& rootB!.doc.getMap<string>("pathToId").get(renamedPath) === bodyId
+			&& !rootB!.doc.getMap<string>("pathToId").has(originalPath),
 		"renamed root publication",
 	);
 	assert(rootB.doc.getMap<string>("pathToId").get(renamedPath) === bodyId, "both root sockets observe the rename");

@@ -1,4 +1,5 @@
 import { strict as nodeAssert } from "node:assert";
+import { SCHEMA_VERSION } from "../../src/sync/schema.ts";
 import { deviceBearerHeaders, type LiveIdentity, requireLiveIdentityContext } from "./liveIdentity.ts";
 import { connectDocument, sha256Hex } from "./schema4Live.ts";
 
@@ -200,7 +201,7 @@ const root = await connectDocument(deviceA, "root", "root");
 const body = await connectDocument(deviceB, "body", DURABLE_BODY_ID);
 try {
 	assert(root.doc.getMap<string>("pathToId").get(DURABLE_BODY_PATH) === DURABLE_BODY_ID, "root socket remains healthy after settings traffic");
-	assert(body.doc.getText("body").toString().startsWith("YAOS schema-6 SQL redeploy durability"), "body socket remains healthy after settings traffic");
+	assert(body.doc.getText("body").toString().startsWith(`YAOS schema-${SCHEMA_VERSION} SQL redeploy durability`), "body socket remains healthy after settings traffic");
 } finally {
 	body.destroy();
 	root.destroy();

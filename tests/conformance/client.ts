@@ -105,8 +105,16 @@ export async function waitFor(predicate: () => boolean | Promise<boolean>, label
 	throw new Error(`timed out waiting for ${label}`);
 }
 
-export async function socketTicket(identity: DeviceIdentity): Promise<{ ticket: string; expiresAt: number; ttlMs: number }> {
-	const { response, body } = await vaultJson(identity, "auth/ticket", { method: "POST" });
+export async function socketTicket(
+	identity: DeviceIdentity,
+	purpose: "root" | "body" = "root",
+	documentId = purpose === "root" ? "root" : "",
+): Promise<{ ticket: string; expiresAt: number; ttlMs: number }> {
+	const { response, body } = await vaultJson(identity, "auth/ticket", {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ purpose, documentId }),
+	});
 	if (response.status !== 200 || typeof body?.ticket !== "string"
 		|| typeof body.expiresAt !== "number" || typeof body.ttlMs !== "number") {
 		throw new Error("device bearer did not mint a bounded socket ticket");
@@ -130,7 +138,7 @@ export async function connectDocument(
 	const provider = new YSyncProvider(identity.host, documentId, doc, {
 		prefix: socketPrefix(identity, kind, documentId),
 		params: async () => ({
-			ticket: (await socketTicket(identity)).ticket,
+			ticket: (await socketTicket(identity, kind, documentId)).ticket,
 			schemaVersion: String(SCHEMA_VERSION),
 			protocolVersion: String(PROTOCOL_VERSION),
 		}),
@@ -263,7 +271,7 @@ export async function createBody(identity: DeviceIdentity, path: string, content
 	const candidateDigest = await sha256Hex(update);
 	const request: LifecycleRequest = { operationId: `create_${randomBytes(12).toString("hex")}`, kind: "create", fileId: bodyId, bodyId, path, candidateId, candidateDigest };
 	const admission = await postLifecycle(identity, request);
-	assert.equal(admission.result.response.status, 200, "create lifecycle admits its named candidate fence");
+	assert.equal(admission.result.response.status, 200, `create lifecycle admits its named candidate fence: ${JSON.stringify(admission.result.body)}`);
 	assert.ok(admission.receipt);
 	const candidate = await fetch(vaultUrl(identity, `body/${encodeURIComponent(bodyId)}/candidate`), {
 		method: "POST", headers: bearer(identity, { "content-type": "application/octet-stream", "x-yaos-candidate-id": candidateId, "x-yaos-candidate-digest": candidateDigest }), body: update,
@@ -338,8 +346,12 @@ export async function enroll(host: string, pairingCode: string, name: string, va
 	const deviceToken = values?.deviceToken ?? randomBytes(32).toString("base64url");
 	const result = await jsonRequest(`${host}/enroll`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ pairingCode, enrollmentRequestId, deviceId, deviceToken, deviceName: name }) });
 	const body = result.body;
-	const identity = result.response.ok && body && typeof body.vaultId === "string" && typeof body.vaultGeneration === "string"
-		? { host, vaultId: body.vaultId, vaultGeneration: body.vaultGeneration, deviceId, deviceToken }
+	const identity: DeviceIdentity | null = result.response.ok && body && typeof body.vaultId === "string" && typeof body.vaultGeneration === "string"
+		&& typeof body.principalId === "string" && (body.role === "owner" || body.role === "member")
+		&& Number.isSafeInteger(body.membershipRevision) && Number.isSafeInteger(body.deviceCredentialRevision)
+		? { host, vaultId: body.vaultId, vaultGeneration: body.vaultGeneration,
+			principalId: body.principalId, role: body.role as "owner" | "member", membershipRevision: body.membershipRevision as number,
+			deviceId, deviceCredentialRevision: body.deviceCredentialRevision as number, deviceToken }
 		: null;
 	return { result, identity };
 }
@@ -351,8 +363,8 @@ export async function createVaultAndEnroll(target: ConformanceTarget, name: stri
 	assert.equal(created.response.status, 200, JSON.stringify(created.body));
 	const vault = created.body?.vault as Record<string, unknown> | undefined;
 	assert.ok(vault && typeof vault.vaultId === "string");
-	const paired = await jsonRequest(`${target.baseUrl}/operator/pairing-codes`, {
-		method: "POST", headers: { cookie: target.operatorCookie, "content-type": "application/json" }, body: JSON.stringify({ vaultId: vault.vaultId, purpose: "device" }),
+	const paired = await jsonRequest(`${target.baseUrl}/operator/vaults/${encodeURIComponent(vault.vaultId)}/owner-code`, {
+		method: "POST", headers: { cookie: target.operatorCookie, "content-type": "application/json" }, body: JSON.stringify({ purpose: "owner-bootstrap" }),
 	});
 	assert.equal(paired.response.status, 200);
 	assert.ok(paired.body && typeof paired.body.pairingCode === "string");

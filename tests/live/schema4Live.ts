@@ -143,7 +143,7 @@ export async function connectDocument(
 	const provider = new YSyncProvider(identity.host, documentId, doc, {
 		prefix: socketPrefix(identity, kind, documentId),
 		params: async () => {
-			const { ticket } = await fetchSocketTicket(identity);
+			const { ticket } = await fetchSocketTicket(identity, identity.vaultId, kind, documentId);
 			return {
 				ticket,
 				schemaVersion: String(SCHEMA_VERSION),

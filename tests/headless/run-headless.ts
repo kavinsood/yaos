@@ -44,7 +44,7 @@ const NEGATIVE_HOLD_MS = 7_000;
 const SLOW_INTERVAL_MS = 12_000;
 const SLOW_HOLD_MS = 8_000;
 const SLOW_WAIT_MS = 60_000;
-const s = suite("schema-4 headless daemon");
+const s = suite("schema-7 headless daemon");
 
 function describe(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
@@ -150,6 +150,17 @@ function deepBoolean(value: unknown, key: string): boolean | null {
 	return null;
 }
 
+function deepInteger(value: unknown, key: string): number | null {
+	if (typeof value !== "object" || value === null) return null;
+	const object = value as Record<string, unknown>;
+	if (Number.isSafeInteger(object[key])) return object[key] as number;
+	for (const candidate of Object.values(object)) {
+		const nested = deepInteger(candidate, key);
+		if (nested !== null) return nested;
+	}
+	return null;
+}
+
 function replaceDeepString(value: unknown, keys: readonly string[], replacement: string): boolean {
 	if (typeof value !== "object" || value === null) return false;
 	const object = value as Record<string, unknown>;
@@ -170,11 +181,16 @@ async function enrollmentIdentity(path: string): Promise<Identity> {
 	const deviceId = deepString(value, ["deviceId"]);
 	const deviceToken = deepString(value, ["deviceToken", "deviceBearer", "token"]);
 	const deviceName = deepString(value, ["deviceName"]);
+	const principalId = deepString(value, ["principalId"]);
+	const role = deepString(value, ["role"]);
+	const membershipRevision = deepInteger(value, "membershipRevision");
+	const deviceCredentialRevision = deepInteger(value, "deviceCredentialRevision");
 	const originImport = deepBoolean(value, "originImport");
-	if (!host || !vaultId || !vaultGeneration || !deviceId || !deviceToken || !deviceName || originImport === null) {
+	if (!host || !vaultId || !vaultGeneration || !deviceId || !deviceToken || !deviceName || !principalId
+		|| (role !== "owner" && role !== "member") || membershipRevision === null || deviceCredentialRevision === null || originImport === null) {
 		throw new Error(`enrollment.json has incomplete identity shape: ${JSON.stringify(value)}`);
 	}
-	return { host, vaultId, vaultGeneration, deviceId, deviceToken, deviceName, originImport };
+	return { host, vaultId, vaultGeneration, deviceId, deviceToken, deviceName, principalId, role, membershipRevision, deviceCredentialRevision, originImport };
 }
 
 async function remoteEquals(peer: PublicPeer, path: string, expected: string | null): Promise<boolean> {
@@ -320,7 +336,7 @@ try {
 		"the pairing secret is supplied only through environment, never argv",
 	);
 	originIdentity = await enrollmentIdentity(enrollmentPath);
-	s.check(originIdentity.vaultId === server.vaultId && originIdentity.vaultGeneration === server.vaultGeneration, "durable enrollment is fenced to the claimed schema-4 vault generation");
+	s.check(originIdentity.vaultId === server.vaultId && originIdentity.vaultGeneration === server.vaultGeneration, "durable enrollment is fenced to the claimed schema-7 vault generation");
 	s.check(originIdentity.originImport, "the first enrolled CLI persistently owns originImport authority");
 	s.check(
 		originIdentity.deviceId === pendingDeviceId && originIdentity.deviceToken === pendingDeviceToken,
@@ -331,7 +347,7 @@ try {
 	const matchingDevices = devices.filter((device) => device.deviceId === originIdentity?.deviceId);
 	s.check(matchingDevices.length === 1, "lost-response retry enrolled one device, not a second identity");
 
-	const peerPairingCode = await mintPairingCode(server);
+	const peerPairingCode = await mintPairingCode(originIdentity, "invite");
 	const peerIdentity = await enrollPublic(worker.host, peerPairingCode, "headless-public-peer");
 	s.check(
 		!`${firstAttempt.stdout()}${firstAttempt.stderr()}${retry.stdout()}${retry.stderr()}`.includes(originIdentity.deviceToken),
@@ -358,7 +374,7 @@ try {
 		RECONCILE_MS,
 	));
 
-	const joinPairingCode = await mintPairingCode(server);
+	const joinPairingCode = await mintPairingCode(originIdentity, "device");
 	const joinEnrollment = await enroll(joiningVault, { xdgStateHome: xdgState, host: worker.host, pairingCode: joinPairingCode });
 	await expectExit(joinEnrollment, 0, "joining enrollment");
 	const allEnrollmentFiles = await findNamed(xdgState, "enrollment.json");
@@ -400,7 +416,7 @@ try {
 	));
 
 	const remotePath = "remote-exact.md";
-	const remoteV1 = "# remote\n\ncreated through schema-4 lifecycle and candidate receipts\n";
+	const remoteV1 = "# remote\n\ncreated through schema-7 lifecycle and candidate receipts\n";
 	await requirePeer().create(remotePath, remoteV1);
 	await checked("remote create materializes exact content on disk", () => waitFor(
 		async () => await readIfExists(join(originVault, remotePath)) === remoteV1,
@@ -480,7 +496,7 @@ try {
 	const originStateDir = dirname(enrollmentPath);
 	const originSqlite = join(originStateDir, "client.sqlite");
 	const sqliteBefore = await stat(originSqlite);
-	s.check(sqliteBefore.size > 0, "the stopped origin daemon left a non-empty schema-4 SQLite cache");
+	s.check(sqliteBefore.size > 0, "the stopped origin daemon left a non-empty schema-7 SQLite cache");
 	const offlineLocalPath = "offline-local.md";
 	const offlineLocalText = "written while daemon was stopped\n";
 	await writeFile(join(originVault, offlineLocalPath), offlineLocalText, "utf8");
@@ -573,8 +589,10 @@ try {
 	));
 	await rename(join(originVault, unresolvedSource), join(originVault, unresolvedTarget));
 	await checked("the external rename observably retires the preserved-unresolved source", () => waitFor(
-		() => diagnosticFor(unresolvedDaemon.preservedRetired(), unresolvedSource),
-		() => `preserved-retired diagnostic for ${unresolvedSource}\n${unresolvedDaemon.dump()}`,
+		async () => diagnosticFor(unresolvedDaemon.preservedRetired(), unresolvedSource)
+			|| (await remoteEquals(requirePeer(), unresolvedSource, null)
+				&& await remoteEquals(requirePeer(), unresolvedTarget, preservedLocal)),
+		() => `preserved retirement diagnostic or durable state for ${unresolvedSource}\n${unresolvedDaemon.dump()}`,
 		RECONCILE_MS,
 	));
 	await checked("external rename retires the unresolved source and imports its preserved content at the new path", () => waitFor(
@@ -1000,7 +1018,7 @@ try {
 	await writeFile(enrollmentPath, originalEnrollment, { mode: 0o600 });
 	const revoked = await bootOrigin("revocation daemon");
 	if (originIdentity === null) throw new Error("origin identity missing before revocation");
-	await revokeDevice(server, originIdentity.deviceId);
+	await revokeDevice(originIdentity, originIdentity.deviceId);
 	const revokedExited = await checked(
 		"server-side device revocation terminates the daemon with exit 2",
 		() => expectExit(revoked, 2, "revoked daemon"),

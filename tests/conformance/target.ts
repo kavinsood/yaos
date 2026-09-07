@@ -1,6 +1,6 @@
-export const SCHEMA_VERSION = 6 as const;
+export const SCHEMA_VERSION = 7 as const;
 export const STORAGE_FORMAT_VERSION = 2 as const;
-export const PROTOCOL_VERSION = 2 as const;
+export const PROTOCOL_VERSION = 3 as const;
 export const SNAPSHOT_FORMAT_VERSION = 2 as const;
 export const SETTINGS_FORMAT_VERSION = 1 as const;
 
@@ -17,7 +17,11 @@ export interface DeviceIdentity {
 	readonly host: string;
 	readonly vaultId: string;
 	readonly vaultGeneration: string;
+	readonly principalId: string;
+	readonly role: "owner" | "member";
+	readonly membershipRevision: number;
 	readonly deviceId: string;
+	readonly deviceCredentialRevision: number;
 	readonly deviceToken: string;
 }
 

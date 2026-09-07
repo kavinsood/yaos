@@ -10,8 +10,8 @@ for (const method of ["addEventListener", "removeEventListener"] as const) {
 	}
 }
 
-const SCHEMA_VERSION = 6;
-const PROTOCOL_VERSION = 2;
+const SCHEMA_VERSION = 7;
+const PROTOCOL_VERSION = 3;
 const NETWORK_WAIT_MS = 15_000;
 function fetchBounded(input: string | URL | Request, init: RequestInit = {}): Promise<Response> {
 	return globalThis.fetch(input, {
@@ -28,6 +28,10 @@ export interface Identity {
 	readonly deviceId: string;
 	readonly deviceToken: string;
 	readonly deviceName: string;
+	readonly principalId: string;
+	readonly role: "owner" | "member";
+	readonly membershipRevision: number;
+	readonly deviceCredentialRevision: number;
 	readonly originImport: boolean;
 }
 
@@ -129,7 +133,7 @@ export async function claimServer(host: string): Promise<ClaimedServer> {
 		operatorCookie,
 	};
 	const capabilities = await fetchBounded(`${host}/api/capabilities`).then((result) => json(result, "capabilities"));
-	if (capabilities.claimed !== true || capabilities.schemaVersion !== 6 || capabilities.protocolVersion !== 2) {
+	if (capabilities.claimed !== true || capabilities.schemaVersion !== 7 || capabilities.protocolVersion !== 3) {
 		throw new Error(`claimed Worker has the wrong public contract: ${JSON.stringify(capabilities)}`);
 	}
 	return claimed;
@@ -140,11 +144,12 @@ export async function operatorState(server: ClaimedServer): Promise<Record<strin
 	return json(await fetchBounded(`${server.host}/operator/state`, { headers: { Cookie: server.operatorCookie } }), "operator state");
 }
 
-export async function mintPairingCode(server: ClaimedServer): Promise<string> {
-	const body = await json(await fetchBounded(`${server.host}/operator/pairing-codes`, {
+export async function mintPairingCode(actor: Identity, purpose: "device" | "invite"): Promise<string> {
+	const resource = purpose === "invite" ? "invitations" : "device-links";
+	const body = await json(await fetchBounded(`${actor.host}/vault/${encodeURIComponent(actor.vaultId)}/${resource}`, {
 		method: "POST",
-		headers: { Cookie: server.operatorCookie, "Content-Type": "application/json" },
-		body: JSON.stringify({ vaultId: server.vaultId, purpose: "device" }),
+		headers: { Authorization: `Bearer ${actor.deviceToken}`, "Content-Type": "application/json" },
+		body: JSON.stringify({}),
 	}), "pairing code");
 	return stringField(body.pairingCode, "pairingCode");
 }
@@ -169,14 +174,19 @@ export async function enrollPublic(host: string, pairingCode: string, deviceName
 		deviceId,
 		deviceToken,
 		deviceName,
+		principalId: stringField(body.principalId, "enrollment principalId"),
+		role: body.role === "owner" ? "owner" : body.role === "member" ? "member" : (() => { throw new Error("enrollment role is invalid"); })(),
+		membershipRevision: integerField(body.membershipRevision, "enrollment membershipRevision"),
+		deviceCredentialRevision: integerField(body.deviceCredentialRevision, "enrollment deviceCredentialRevision"),
 		originImport: body.originImport === true,
 	};
 }
 
-export async function revokeDevice(server: ClaimedServer, deviceId: string): Promise<void> {
-	await json(await fetchBounded(`${server.host}/operator/devices/${encodeURIComponent(deviceId)}`, {
+export async function revokeDevice(actor: Identity, deviceId: string): Promise<void> {
+	await json(await fetchBounded(`${actor.host}/vault/${encodeURIComponent(actor.vaultId)}/devices/${encodeURIComponent(deviceId)}`, {
 		method: "DELETE",
-		headers: { Cookie: server.operatorCookie },
+		headers: { Authorization: `Bearer ${actor.deviceToken}`, "Content-Type": "application/json" },
+		body: JSON.stringify({ requestId: randomBytes(18).toString("base64url") }),
 	}), "device revocation");
 }
 
@@ -188,8 +198,12 @@ function route(identity: Identity, suffix: string): string {
 	return `${identity.host}/vault/${encodeURIComponent(identity.vaultId)}/${suffix.replace(/^\//, "")}`;
 }
 
-async function socketTicket(identity: Identity): Promise<string> {
-	const body = await json(await fetchBounded(route(identity, "auth/ticket"), { method: "POST", headers: headers(identity) }), "socket ticket");
+async function socketTicket(identity: Identity, purpose: "root" | "body", documentId: string): Promise<string> {
+	const body = await json(await fetchBounded(route(identity, "auth/ticket"), {
+		method: "POST",
+		headers: headers(identity, { "Content-Type": "application/json" }),
+		body: JSON.stringify({ purpose, documentId }),
+	}), "socket ticket");
 	const ticket = stringField(body.ticket, "socket ticket");
 	const expiresAt = integerField(body.expiresAt, "socket ticket expiresAt");
 	const ttlMs = integerField(body.ttlMs, "socket ticket ttlMs");
@@ -205,7 +219,7 @@ async function connectDocument(identity: Identity, kind: "root" | "body", docume
 	const provider = new YSyncProvider(identity.host, documentId, doc, {
 		prefix,
 		params: async () => ({
-			ticket: await socketTicket(identity),
+			ticket: await socketTicket(identity, kind, documentId),
 			schemaVersion: String(SCHEMA_VERSION),
 			protocolVersion: String(PROTOCOL_VERSION),
 		}),
@@ -338,7 +352,7 @@ export async function bootstrapCatalog(identity: Identity): Promise<Map<string, 
 		headers: headers(identity, { "Content-Type": "application/json" }),
 		body: JSON.stringify({ attemptId: `headless-bootstrap-${crypto.randomUUID()}` }),
 	}), "bootstrap start");
-	if (started.format !== "yaos-bootstrap-v1" || started.schemaVersion !== 6) throw new Error(`wrong bootstrap format: ${JSON.stringify(started)}`);
+	if (started.format !== "yaos-bootstrap-v1" || started.schemaVersion !== 7) throw new Error(`wrong bootstrap format: ${JSON.stringify(started)}`);
 	const bootstrapId = stringField(started.bootstrapId, "bootstrapId");
 	const catalogBody = await json(await fetchBounded(route(identity, `bootstrap/${encodeURIComponent(bootstrapId)}/catalog?limit=100`), {
 		headers: headers(identity),

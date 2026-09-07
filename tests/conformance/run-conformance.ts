@@ -112,11 +112,15 @@ async function enroll(baseUrl: string, pairingCode: string, deviceName: string, 
 	});
 	const body = await responseJson(response);
 	if (!response.ok || body?.deviceId !== request.deviceId || body.deviceToken !== request.deviceToken
-		|| typeof body.vaultId !== "string" || typeof body.vaultGeneration !== "string") {
+		|| typeof body.vaultId !== "string" || typeof body.vaultGeneration !== "string"
+		|| typeof body.principalId !== "string" || (body.role !== "owner" && body.role !== "member")
+		|| !Number.isSafeInteger(body.membershipRevision) || !Number.isSafeInteger(body.deviceCredentialRevision)) {
 		throw new Error(`enrollment failed (${response.status}): ${JSON.stringify(body)}`);
 	}
 	return {
-		identity: { host: baseUrl, vaultId: body.vaultId, vaultGeneration: body.vaultGeneration, deviceId: request.deviceId, deviceToken: request.deviceToken },
+		identity: { host: baseUrl, vaultId: body.vaultId, vaultGeneration: body.vaultGeneration,
+			principalId: body.principalId, role: body.role as "owner" | "member", membershipRevision: body.membershipRevision as number,
+			deviceId: request.deviceId, deviceCredentialRevision: body.deviceCredentialRevision as number, deviceToken: request.deviceToken },
 		replay: request,
 	};
 }
@@ -140,14 +144,18 @@ async function provision(runtime: LaunchedRuntime, controlUrl: string): Promise<
 	}
 	const origin = await enroll(runtime.baseUrl, claim.pairingCode, "conformance-origin");
 	if (origin.identity.vaultId !== claim.vaultId) throw new Error("origin enrollment returned the wrong vault");
-	const pairingResponse = await fetch(`${runtime.baseUrl}/vault/${encodeURIComponent(origin.identity.vaultId)}/auth/pairing-code`, {
-		method: "POST", headers: { authorization: `Bearer ${origin.identity.deviceToken}`, "content-type": "application/json" }, body: JSON.stringify({ purpose: "device" }),
+	if (origin.identity.role !== "owner") throw new Error("claim enrollment did not establish the vault owner");
+	const pairingResponse = await fetch(`${runtime.baseUrl}/vault/${encodeURIComponent(origin.identity.vaultId)}/device-links`, {
+		method: "POST", headers: { authorization: `Bearer ${origin.identity.deviceToken}` },
 	});
 	const pairing = await responseJson(pairingResponse);
 	if (!pairingResponse.ok || typeof pairing?.pairingCode !== "string") throw new Error(`second-device pairing failed (${pairingResponse.status})`);
 	const second = await enroll(runtime.baseUrl, pairing.pairingCode, "conformance-peer");
 	if (second.identity.vaultId !== origin.identity.vaultId || second.identity.deviceId === origin.identity.deviceId) {
 		throw new Error("second enrollment did not produce an isolated device on the fixture vault");
+	}
+	if (second.identity.principalId !== origin.identity.principalId || second.identity.role !== "owner") {
+		throw new Error("device link did not retain the owner principal");
 	}
 	return {
 		runtime: runtime.runtime,

@@ -157,7 +157,7 @@ async function claimEnrollAndProvision(): Promise<LiveIdentityContext> {
 		headers: { Authorization: `Bearer ${deviceA.deviceToken}` },
 	});
 	const status = await statusResponse.json().catch(() => null) as Record<string, unknown> | null;
-	if (!statusResponse.ok || status?.vaultId !== claim.vaultId || status.schemaVersion !== 6 || status.protocolVersion !== 2
+	if (!statusResponse.ok || status?.vaultId !== claim.vaultId || status.schemaVersion !== 7 || status.protocolVersion !== 3
 		|| typeof status.vaultGeneration !== "string" || typeof status.runtimeEpoch !== "string") {
 		throw new Error(`claimed vault was not active and provisioned: ${JSON.stringify(status)}`);
 	}
@@ -170,7 +170,7 @@ async function claimEnrollAndProvision(): Promise<LiveIdentityContext> {
 	const setCookie = login.headers.get("set-cookie");
 	if (!login.ok || !setCookie) throw new Error(`operator login failed (${login.status})`);
 	const operatorCookie = setCookie.split(";", 1)[0]!;
-	console.log("Live driver claimed and provisioned schema 6, then enrolled distinct A/B devices.");
+	console.log("Live driver claimed and provisioned schema 7, then enrolled distinct A/B devices.");
 	return { deviceA, deviceB, operatorRecoveryKey, operatorCookie, settingsConfigKey: SETTINGS_CONFIG_KEY };
 }
 

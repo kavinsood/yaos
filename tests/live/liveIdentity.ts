@@ -62,10 +62,16 @@ export function deviceBearerHeaders(
 export async function fetchSocketTicket(
 	identity: LiveIdentity,
 	vaultId = identity.vaultId,
+	purpose: "root" | "body" = "root",
+	documentId = "root",
 ): Promise<SocketTicket> {
 	const response = await fetch(
 		`${identity.host}/vault/${encodeURIComponent(vaultId)}/auth/ticket`,
-		{ method: "POST", headers: deviceBearerHeaders(identity) },
+		{
+			method: "POST",
+			headers: deviceBearerHeaders(identity, { "Content-Type": "application/json" }),
+			body: JSON.stringify({ purpose, documentId }),
+		},
 	);
 	if (!response.ok) {
 		const body = await response.text().catch(() => "");

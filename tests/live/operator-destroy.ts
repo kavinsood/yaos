@@ -20,8 +20,12 @@ function assert(condition: unknown, message: string): asserts condition {
 	console.log(`  PASS  ${message}`);
 }
 
-async function destroy(): Promise<{ response: Response; body: Record<string, unknown> | null }> {
-	const response = await fetch(`${deviceA.host}${vaultPath}`, { method: "DELETE", headers: operatorHeaders });
+async function destroy(governanceRequestId: string): Promise<{ response: Response; body: Record<string, unknown> | null }> {
+	const response = await fetch(`${deviceA.host}${vaultPath}`, {
+		method: "DELETE",
+		headers: { ...operatorHeaders, "Content-Type": "application/json" },
+		body: JSON.stringify({ governanceRequestId }),
+	});
 	const body = await response.clone().json().catch(() => null) as Record<string, unknown> | null;
 	return { response, body };
 }
@@ -36,9 +40,19 @@ assert(
 		&& settingsBeforeBody.envRev === 2,
 	"operator destroy starts with the exact seeded settings generation from the two-device suite",
 );
-console.log("\n--- Operator generation-scoped destroy smoke ---");
-let result = await destroy();
-assert(result.response.status === 202, `operator destroy enters bounded purge (${result.response.status})`);
+console.log("\n--- Owner-requested, operator-confirmed generation-scoped destroy smoke ---");
+const ownerRequest = await fetch(`${deviceA.host}/vault/${encodeURIComponent(deviceA.vaultId)}/governance`, {
+	method: "DELETE",
+	headers: deviceBearerHeaders(deviceA, { "Content-Type": "application/json" }),
+	body: JSON.stringify({ requestId: crypto.randomUUID().replaceAll("-", "") }),
+});
+const ownerRequestBody = await jsonBody(ownerRequest);
+const governanceRequest = ownerRequestBody?.governanceRequest as Record<string, unknown> | undefined;
+assert(ownerRequest.status === 202 && typeof governanceRequest?.governanceRequestId === "string",
+	"owner creates a durable destruction request");
+const governanceRequestId = String(governanceRequest.governanceRequestId);
+let result = await destroy(governanceRequestId);
+assert(result.response.status === 202, `operator confirms the owner request and enters bounded purge (${result.response.status})`);
 let pending = result.body?.pending as Record<string, unknown> | undefined;
 assert(typeof pending?.vaultGeneration === "string", "pending destroy exposes its vault generation fence");
 assert(pending.purgeJobId === `purge:${deviceA.vaultId}:${pending.vaultGeneration}`, "purge job identity is scoped to the exact vault generation");
@@ -46,7 +60,7 @@ assert(["pending", "queued", "purging", "retrying", "complete"].includes(String(
 const status = await fetch(`${deviceA.host}${vaultPath}/deletion`, { headers: operatorHeaders });
 const statusBody = await status.json().catch(() => null) as { pending?: Record<string, unknown> } | null;
 assert(status.status === 200 && statusBody?.pending?.purgeJobId === pending.purgeJobId, "operator deletion status preserves the generation-scoped retry obligation");
-result = await destroy();
+result = await destroy(governanceRequestId);
 assert(result.response.status === 202 || result.response.status === 200, "repeating destroy retries idempotently instead of creating another purge generation");
 if (result.response.status === 202) {
 	pending = result.body?.pending as Record<string, unknown> | undefined;
@@ -56,7 +70,7 @@ if (result.response.status === 202) {
 const deadline = Date.now() + 15_000;
 while (result.response.status !== 200 && Date.now() < deadline) {
 	await new Promise((resolve) => setTimeout(resolve, 100));
-	result = await destroy();
+	result = await destroy(governanceRequestId);
 }
 assert(result.response.status === 200 && result.body?.completed === true, `generation purge and SQL deletion complete (${result.response.status})`);
 
@@ -121,13 +135,19 @@ assert(
 	"operator provisions a fresh vault generation after destroy",
 );
 assert(freshVault.vaultGeneration !== pending?.vaultGeneration, "fresh vault uses a generation distinct from the destroyed settings state");
-const freshPairingResponse = await fetch(`${deviceA.host}/operator/pairing-codes`, {
+const legacyPairingResponse = await fetch(`${deviceA.host}/operator/pairing-codes`, {
 	method: "POST",
 	headers: { ...operatorHeaders, "Content-Type": "application/json" },
 	body: JSON.stringify({ vaultId: freshVault.vaultId, purpose: "device" }),
 });
+assert(legacyPairingResponse.status === 409, "operator cannot mint an ordinary collaboration enrollment");
+const freshPairingResponse = await fetch(`${deviceA.host}/operator/vaults/${encodeURIComponent(String(freshVault.vaultId))}/owner-code`, {
+	method: "POST",
+	headers: { ...operatorHeaders, "Content-Type": "application/json" },
+	body: JSON.stringify({ purpose: "owner-bootstrap" }),
+});
 const freshPairing = await jsonBody(freshPairingResponse);
-assert(freshPairingResponse.status === 200 && typeof freshPairing?.pairingCode === "string", "operator mints enrollment for the fresh generation");
+assert(freshPairingResponse.status === 200 && typeof freshPairing?.pairingCode === "string", "operator issues explicit owner bootstrap for the fresh generation");
 const freshDeviceId = crypto.randomUUID().replaceAll("-", "");
 const freshDeviceToken = `${crypto.randomUUID().replaceAll("-", "")}${crypto.randomUUID().replaceAll("-", "")}`;
 const freshEnrollment = await fetch(`${deviceA.host}/enroll`, {
@@ -145,9 +165,38 @@ const freshEnrollmentBody = await jsonBody(freshEnrollment);
 assert(
 	freshEnrollment.status === 200
 		&& freshEnrollmentBody?.vaultId === freshVault.vaultId
-		&& freshEnrollmentBody.vaultGeneration === freshVault.vaultGeneration,
+		&& freshEnrollmentBody.vaultGeneration === freshVault.vaultGeneration
+		&& freshEnrollmentBody.role === "owner"
+		&& typeof freshEnrollmentBody.principalId === "string",
 	"fresh device enrollment is fenced to the new vault generation",
 );
+const recoveryCodeResponse = await fetch(`${deviceA.host}/operator/vaults/${encodeURIComponent(String(freshVault.vaultId))}/owner-code`, {
+	method: "POST",
+	headers: { ...operatorHeaders, "Content-Type": "application/json" },
+	body: JSON.stringify({ purpose: "owner-recovery" }),
+});
+const recoveryCode = await jsonBody(recoveryCodeResponse);
+assert(recoveryCodeResponse.status === 200 && typeof recoveryCode?.pairingCode === "string",
+	"operator issues an explicit owner recovery code");
+const recoveryDeviceId = crypto.randomUUID().replaceAll("-", "");
+const recoveryDeviceToken = `${crypto.randomUUID().replaceAll("-", "")}${crypto.randomUUID().replaceAll("-", "")}`;
+const recoveryEnrollment = await fetch(`${deviceA.host}/enroll`, {
+	method: "POST",
+	headers: { "Content-Type": "application/json" },
+	body: JSON.stringify({
+		pairingCode: recoveryCode.pairingCode,
+		enrollmentRequestId: crypto.randomUUID().replaceAll("-", ""),
+		deviceId: recoveryDeviceId,
+		deviceToken: recoveryDeviceToken,
+		deviceName: "live-owner-recovery-device",
+	}),
+});
+const recoveryEnrollmentBody = await jsonBody(recoveryEnrollment);
+assert(recoveryEnrollment.status === 200
+	&& recoveryEnrollmentBody?.principalId === freshEnrollmentBody?.principalId
+	&& recoveryEnrollmentBody.role === "owner"
+	&& recoveryEnrollmentBody.deviceId === recoveryDeviceId,
+	"owner recovery enrolls a new device into the exact existing owner principal");
 const freshSettings = await fetch(
 	`${deviceA.host}/vault/${encodeURIComponent(String(freshVault.vaultId))}/settings-sync/${encodeURIComponent(settingsConfigKey)}?settingsFormatVersion=1`,
 	{ headers: { Authorization: `Bearer ${freshDeviceToken}` } },

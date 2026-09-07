@@ -62,7 +62,7 @@ function assert(condition: unknown, message: string): asserts condition {
 }
 
 for (const [kind, documentId] of [["root", "root"], ["body", bodyId]] as const) {
-	const ticket = (await fetchSocketTicket(identity)).ticket;
+	const ticket = (await fetchSocketTicket(identity, identity.vaultId, kind, documentId)).ticket;
 	const allowed = await capture(kind, documentId, {
 		ticket,
 		schemaVersion: String(SCHEMA_VERSION),
@@ -81,13 +81,13 @@ for (const [kind, documentId] of [["root", "root"], ["body", bodyId]] as const) 
 }
 
 const wrongSchema = await capture("body", bodyId, {
-	ticket: (await fetchSocketTicket(identity)).ticket,
+	ticket: (await fetchSocketTicket(identity, identity.vaultId, "body", bodyId)).ticket,
 	schemaVersion: String(SCHEMA_VERSION + 1),
 	protocolVersion: String(PROTOCOL_VERSION),
 });
 assert(wrongSchema.fatal?.reason === "schema_mismatch", "body socket rejects the wrong schema pin");
 const wrongProtocol = await capture("body", bodyId, {
-	ticket: (await fetchSocketTicket(identity)).ticket,
+	ticket: (await fetchSocketTicket(identity, identity.vaultId, "body", bodyId)).ticket,
 	schemaVersion: String(SCHEMA_VERSION),
 	protocolVersion: String(PROTOCOL_VERSION + 1),
 });

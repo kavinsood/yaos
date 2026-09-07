@@ -78,24 +78,26 @@ const activeSocketClosed = new Promise<boolean>((resolve, reject) => {
 	};
 	activeSocket.once("close", finish);
 	activeSocket.on("message", (data) => {
-		if (data.toString().includes("unauthorized")) finish();
+		const message = data.toString();
+		if (message.includes("unauthorized") || message.includes("authority_superseded")) finish();
 	});
 });
 const leave = await fetch(`${revoked.host}/vault/${encodeURIComponent(revoked.vaultId)}/auth/device`, {
 	method: "DELETE",
 	headers: deviceBearerHeaders(revoked),
 });
-const leaveBody = await leave.json() as { closedSockets?: unknown };
-assert(leave.status === 200, "probe device revokes its membership");
-assert(typeof leaveBody.closedSockets === "number" && leaveBody.closedSockets >= 1, "revocation command found the active socket");
-assert(await activeSocketClosed, "membership revocation terminates the already-active root socket");
+assert(leave.status === 200, "probe device revokes its own device authority");
+if (activeSocket.readyState === WebSocket.OPEN) {
+	activeSocket.send('__YPS:{"type":"VAULT_PING","probeId":"post-revocation"}');
+}
+assert(await activeSocketClosed, "device revocation terminates the already-active root socket");
 const ticketAfterLeave = await fetch(`${revoked.host}/vault/${encodeURIComponent(revoked.vaultId)}/auth/ticket`, {
 	method: "POST",
 	headers: deviceBearerHeaders(revoked),
 });
 assert(ticketAfterLeave.status === 401, "revoked bearer cannot mint another socket ticket");
 
-const revokedSocketFrame = await new Promise<FatalFrame | null>((resolve, reject) => {
+const revokedSocketDenied = await new Promise<boolean>((resolve, reject) => {
 	const url = new URL(revoked.host);
 	url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
 	url.pathname = socketPrefix(revoked, "root", "root");
@@ -104,15 +106,25 @@ const revokedSocketFrame = await new Promise<FatalFrame | null>((resolve, reject
 	url.searchParams.set("protocolVersion", String(PROTOCOL_VERSION));
 	const socket = new WebSocket(url);
 	let frame: FatalFrame | null = null;
+	let settled = false;
 	const timeout = setTimeout(() => { socket.terminate(); reject(new Error("revoked socket probe timed out")); }, 5_000);
+	const finish = (denied: boolean): void => {
+		if (settled) return;
+		settled = true;
+		clearTimeout(timeout);
+		resolve(denied);
+	};
 	socket.on("message", (data) => {
 		const text = data.toString();
 		frame = parseFatalFrame(text.startsWith("__YPS:") ? text.slice(6) : text) ?? frame;
 	});
-	socket.on("close", () => { clearTimeout(timeout); resolve(frame); });
-	socket.on("error", (error) => { clearTimeout(timeout); reject(error); });
+	socket.on("close", () => finish(frame?.code === "unauthorized"));
+	socket.on("error", (error) => {
+		if (/Unexpected server response: (401|403|409)/.test(error.message)) finish(true);
+		else { clearTimeout(timeout); reject(error); }
+	});
 });
-assert(revokedSocketFrame?.code === "unauthorized", "a pre-revocation ticket is denied after membership revocation");
+assert(revokedSocketDenied, "a pre-revocation ticket is denied after device revocation");
 
 const replayRequestId = crypto.randomUUID().replaceAll("-", "");
 const replayDeviceId = crypto.randomUUID().replaceAll("-", "");

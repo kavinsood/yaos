@@ -215,8 +215,8 @@ async function main() {
 	requireCheck(statusResult.response.status === 200 && isRecord(statusResult.body), "device-authenticated vault status", `HTTP ${statusResult.response.status}`);
 	requireCheck(
 		statusResult.body.vaultId === vaultId
-			&& statusResult.body.schemaVersion === 6
-			&& statusResult.body.protocolVersion === 2
+			&& statusResult.body.schemaVersion === 7
+			&& statusResult.body.protocolVersion === 3
 			&& typeof statusResult.body.vaultGeneration === "string"
 			&& statusResult.body.vaultGeneration.length > 0,
 		"schema-4 generation identity",

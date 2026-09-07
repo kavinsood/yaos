@@ -23,11 +23,12 @@ const mismatch = await enroll(target.baseUrl, target.originEnrollment.pairingCod
 assert.equal(mismatch.result.response.status, 409);
 pass("an enrollment request identity cannot be replayed with changed credentials");
 
-const devices = await vaultJson(target.deviceA, "devices");
+const devices = await vaultJson(target.deviceA, `principals/${encodeURIComponent(target.deviceA.principalId)}/devices`);
 assert.equal(devices.response.status, 200);
 assert.ok(devices.body && Array.isArray(devices.body.devices));
 assert.ok((devices.body.devices as Array<{ deviceId?: unknown }>).some((entry) => entry.deviceId === target.deviceB.deviceId));
-pass("pairing enrolled a distinct peer into the provisioned vault");
+assert.equal(target.deviceB.principalId, target.deviceA.principalId);
+pass("device linking enrolled a distinct device under the owner principal");
 
 const other = await createVaultAndEnroll(target, "conformance-isolation");
 const denied = await fetch(`${target.baseUrl}/vault/${encodeURIComponent(other.vaultId)}/status`, {

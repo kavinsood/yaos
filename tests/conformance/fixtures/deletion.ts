@@ -1,5 +1,5 @@
 import { strict as assert } from "node:assert";
-import { bearer, connectDocument, jsonRequest, pass, sha256Hex, vaultUrl, waitFor } from "../client.ts";
+import { bearer, connectDocument, jsonRequest, pass, sha256Hex, vaultJson, vaultUrl, waitFor } from "../client.ts";
 import { targetFromEnv } from "../target.ts";
 
 const target = targetFromEnv();
@@ -11,9 +11,20 @@ const hash = await sha256Hex(bytes);
 const upload = await fetch(vaultUrl(target.deviceA, `blobs/${hash}`), { method: "PUT", headers: bearer(target.deviceA), body: bytes });
 assert.equal(upload.status, 204);
 
+const requested = await vaultJson(target.deviceA, "governance", {
+	method: "DELETE",
+	headers: { "content-type": "application/json" },
+	body: JSON.stringify({ requestId: `conformance-destroy-${crypto.randomUUID()}` }),
+});
+assert.equal(requested.response.status, 202, JSON.stringify(requested.body));
+const governanceRequest = requested.body?.governanceRequest as Record<string, unknown> | undefined;
+assert.ok(governanceRequest && typeof governanceRequest.governanceRequestId === "string");
+const governanceRequestId = governanceRequest.governanceRequestId;
+
 async function destroy(): Promise<{ status: number; body: Record<string, unknown> | null }> {
 	const result = await jsonRequest(`${target.baseUrl}/operator/vaults/${encodeURIComponent(target.deviceA.vaultId)}`, {
-		method: "DELETE", headers: { cookie: target.operatorCookie },
+		method: "DELETE", headers: { cookie: target.operatorCookie, "content-type": "application/json" },
+		body: JSON.stringify({ governanceRequestId }),
 	});
 	return { status: result.response.status, body: result.body };
 }
