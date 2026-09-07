@@ -1,6 +1,6 @@
-import { base64ToBytes, bytesToBase64 } from "./base64url";
 import { BoundedBodyError, readBoundedBytes } from "./readBoundedBytes";
 import { isSha256Hex, sha256Hex } from "./hex";
+import { decodeBinaryEnvelope, encodeBinaryEnvelope, YAOS_BINARY_CONTENT_TYPE } from "./shared/binaryEnvelope";
 import { SETTINGS_FORMAT_VERSION } from "./shared/productVersions";
 
 export { SETTINGS_FORMAT_VERSION };
@@ -59,7 +59,7 @@ export type SettingsFileRow = {
 	sha256: string;
 	size: number;
 	rev: number;
-	bodyBase64: string;
+	body: Uint8Array;
 };
 export type SettingsIntentRow = { id: string; repo: string; version: string; enabled: boolean; rev: number };
 export type SettingsThemeRow = { name: string; repo: string; version: string; rev: number };
@@ -70,7 +70,7 @@ export type SettingsPluginDataRow = {
 	sha256: string;
 	size: number;
 	rev: number;
-	bodyBase64: string;
+	body: Uint8Array;
 };
 export type SettingsEnvironment = {
 	seeded: true;
@@ -139,15 +139,9 @@ function requireSha(value: unknown): string {
 }
 
 function decodeBody(value: unknown): Uint8Array {
-	if (typeof value !== "string") throw new StoreAbort(400, "invalid_json");
-	let bytes: Uint8Array;
-	try {
-		bytes = value === "" ? new Uint8Array(0) : base64ToBytes(value);
-	} catch {
-		throw new StoreAbort(400, "invalid_json");
-	}
-	if (bytes.byteLength > MAX_SETTINGS_FILE_BYTES) throw new StoreAbort(413, "oversized");
-	return bytes;
+	if (!(value instanceof Uint8Array)) throw new StoreAbort(400, "invalid_json");
+	if (value.byteLength > MAX_SETTINGS_FILE_BYTES) throw new StoreAbort(413, "oversized");
+	return value.slice();
 }
 
 function quarantineJson(body: Uint8Array): void {
@@ -248,19 +242,19 @@ function parseTheme(value: unknown): ParsedTheme {
 
 function parseFile(value: unknown): ParsedFile {
 	const input = record(value);
-	exactKeys(input, ["path", "sha256", "bodyBase64"]);
+	exactKeys(input, ["path", "sha256", "body"]);
 	if (typeof input.path !== "string" || !isAllowlistedSettingsFile(input.path)) {
 		throw new StoreAbort(400, "path_not_allowed");
 	}
-	const body = decodeBody(input.bodyBase64);
+	const body = decodeBody(input.body);
 	if (input.path.endsWith(".json")) quarantineJson(body);
 	return { path: input.path, sha256: requireSha(input.sha256), body };
 }
 
 function parsePluginData(value: unknown): ParsedPluginData {
 	const input = record(value);
-	exactKeys(input, ["pluginId", "pluginVersion", "sha256", "bodyBase64"]);
-	const body = decodeBody(input.bodyBase64);
+	exactKeys(input, ["pluginId", "pluginVersion", "sha256", "body"]);
+	const body = decodeBody(input.body);
 	quarantineJson(body);
 	return {
 		pluginId: requirePluginId(input.pluginId),
@@ -483,7 +477,7 @@ export class SettingsSyncStore {
 				if (!isAllowlistedSettingsFile(row.path) || !isSha256Hex(row.sha256) || !safeRevision(row.rev)) {
 					throw new StoreAbort(500, "settings_corrupt");
 				}
-				return { path: row.path, sha256: row.sha256, size: row.size, rev: row.rev, bodyBase64: bytesToBase64(body) };
+				return { path: row.path, sha256: row.sha256, size: row.size, rev: row.rev, body: body.slice() };
 			}).sort((a, b) => a.path.localeCompare(b.path));
 			const pluginData = pluginRows.map((row): SettingsPluginDataRow => {
 				const body = storedBody(row.body, row.size);
@@ -491,7 +485,7 @@ export class SettingsSyncStore {
 				if (!isAllowlistedPluginDataId(row.plugin_id) || row.plugin_version.length > MAX_SETTINGS_VERSION_LENGTH
 					|| !isSha256Hex(row.sha256) || !safeRevision(row.rev)) throw new StoreAbort(500, "settings_corrupt");
 				return { pluginId: row.plugin_id, pluginVersion: row.plugin_version, sha256: row.sha256,
-					size: row.size, rev: row.rev, bodyBase64: bytesToBase64(body) };
+					size: row.size, rev: row.rev, body: body.slice() };
 			}).sort((a, b) => a.pluginId.localeCompare(b.pluginId));
 			if (bodyBytes > MAX_SETTINGS_ENVIRONMENT_BODY_BYTES) throw new StoreAbort(500, "settings_corrupt");
 
@@ -571,10 +565,10 @@ export class SettingsSyncStore {
 		});
 	}
 
-	putFile(key: string, path: unknown, sha256: unknown, bodyBase64: unknown, actor?: SettingsMutationActor): SettingsSyncResult<MutationOk> {
+	putFile(key: string, path: unknown, sha256: unknown, body: unknown, actor?: SettingsMutationActor): SettingsSyncResult<MutationOk> {
 		return this.result(() => {
 			const configKey = requireStorageConfigKey(key);
-			const file = parseFile({ path, sha256, bodyBase64 });
+			const file = parseFile({ path, sha256, body });
 			this.ensureSchema();
 			return this.storage.transactionSync(() => {
 				this.assertUniqueCapacity("settings_files", "path", configKey, file.path, MAX_SETTINGS_FILES);
@@ -759,15 +753,32 @@ export class SettingsSyncStore {
 
 function mutationResponse(result: SettingsSyncResult<MutationOk>): Response {
 	return result.ok
-		? Response.json({ ok: true, envRev: result.value.envRev, rev: result.value.rev }, { headers: { "cache-control": "no-store" } })
-		: Response.json({ error: result.error }, { status: result.status, headers: { "cache-control": "no-store" } });
+		? envelopeResponse({ ok: true, envRev: result.value.envRev, rev: result.value.rev })
+		: errorResponse(result.error, result.status);
 }
 
 function errorResponse(error: string, status: number): Response {
-	return Response.json({ error }, { status, headers: { "cache-control": "no-store" } });
+	return envelopeResponse({ error }, status);
 }
 
-async function readJsonObject(request: Request, maxBytes: number): Promise<SettingsSyncResult<Record<string, unknown>>> {
+function envelopeResponse(value: unknown, status = 200): Response {
+	let body: Uint8Array;
+	try {
+		body = encodeBinaryEnvelope(value, MAX_SETTINGS_GET_RESPONSE_BYTES);
+	} catch {
+		body = encodeBinaryEnvelope({ error: "environment_too_large" });
+		status = 413;
+	}
+	return new Response(body.slice().buffer, {
+		status,
+		headers: { "content-type": YAOS_BINARY_CONTENT_TYPE, "cache-control": "no-store" },
+	});
+}
+
+async function readEnvelopeObject(request: Request, maxBytes: number): Promise<SettingsSyncResult<Record<string, unknown>>> {
+	if (!request.headers.get("content-type")?.toLowerCase().startsWith(YAOS_BINARY_CONTENT_TYPE)) {
+		return { ok: false, status: 400, error: "invalid_json" };
+	}
 	let bytes: Uint8Array;
 	try {
 		bytes = await readBoundedBytes(request, maxBytes);
@@ -781,7 +792,7 @@ async function readJsonObject(request: Request, maxBytes: number): Promise<Setti
 		return { ok: false, status: 400, error: "invalid_json" };
 	}
 	try {
-		return { ok: true, value: record(JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes))) };
+		return { ok: true, value: record(decodeBinaryEnvelope(bytes, maxBytes)) };
 	} catch {
 		return { ok: false, status: 400, error: "invalid_json" };
 	}
@@ -789,24 +800,16 @@ async function readJsonObject(request: Request, maxBytes: number): Promise<Setti
 
 function boundedGetResponse(result: SettingsSyncResult<SettingsGetBody>): Response {
 	if (!result.ok) return errorResponse(result.error, result.status);
-	const body = JSON.stringify(result.value);
-	if (new TextEncoder().encode(body).byteLength > MAX_SETTINGS_GET_RESPONSE_BYTES) {
-		return errorResponse("environment_too_large", 413);
-	}
-	return new Response(body, {
-		status: 200,
-		headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" },
-	});
+	return envelopeResponse(result.value);
 }
 
 
 async function declaredBodyHashMatches(value: unknown): Promise<boolean> {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) return true;
-	if (!("sha256" in value) || !("bodyBase64" in value)) return true;
-	if (typeof value.sha256 !== "string" || typeof value.bodyBase64 !== "string") return true;
+	if (!("sha256" in value) || !("body" in value)) return true;
+	if (typeof value.sha256 !== "string" || !(value.body instanceof Uint8Array)) return true;
 	try {
-		const bytes = value.bodyBase64 === "" ? new Uint8Array(0) : base64ToBytes(value.bodyBase64);
-		return await sha256Hex(bytes) === value.sha256;
+		return await sha256Hex(value.body) === value.sha256;
 	} catch {
 		return true;
 	}
@@ -844,12 +847,12 @@ export async function handleSettingsSyncRequest(
 	const storageKey = principalId === undefined ? configKey : principalSettingsKey(principalId, configKey);
 	const formatDeclarations = new URL(request.url).searchParams.getAll("settingsFormatVersion");
 	if (formatDeclarations.length !== 1 || formatDeclarations[0] !== String(SETTINGS_FORMAT_VERSION)) {
-		return Response.json({
+		return envelopeResponse({
 			error: "update_required",
 			reason: "settings_format_mismatch",
 			clientSettingsFormatVersion: formatDeclarations.length === 1 ? formatDeclarations[0] : null,
 			serverSettingsFormatVersion: SETTINGS_FORMAT_VERSION,
-		}, { status: 426, headers: { "cache-control": "no-store" } });
+		}, 426);
 	}
 	if (request.method === "GET" && action === undefined) return boundedGetResponse(store.getEnvironment(storageKey));
 	if (request.method === "DELETE" && action === "file") {
@@ -861,7 +864,7 @@ export async function handleSettingsSyncRequest(
 	const itemMutation = request.method === "PUT" && (action === "file" || action === "intent"
 		|| action === "tombstone" || action === "plugin-data");
 	if (!snapshotMutation && !itemMutation) return errorResponse("not_found", 404);
-	const body = await readJsonObject(
+	const body = await readEnvelopeObject(
 		request,
 		snapshotMutation ? MAX_SETTINGS_SNAPSHOT_REQUEST_BYTES : MAX_SETTINGS_ITEM_REQUEST_BYTES,
 	);
@@ -870,7 +873,7 @@ export async function handleSettingsSyncRequest(
 	if (validateMutationAuthority && !validateMutationAuthority()) return errorResponse("authority_superseded", 409);
 	if (action === "seed") return mutationResponse(store.seed(storageKey, body.value, actor));
 	if (action === "replace") return mutationResponse(store.replace(storageKey, body.value, actor));
-	if (action === "file") return mutationResponse(store.putFile(storageKey, body.value.path, body.value.sha256, body.value.bodyBase64, actor));
+	if (action === "file") return mutationResponse(store.putFile(storageKey, body.value.path, body.value.sha256, body.value.body, actor));
 	if (action === "intent") return mutationResponse(store.putIntent(storageKey, body.value, actor));
 	if (action === "tombstone") return mutationResponse(store.putTombstone(storageKey, body.value, actor));
 	return mutationResponse(store.putPluginData(storageKey, body.value, actor));

@@ -652,7 +652,7 @@ export class SettingsSyncEngine {
 			const put = await this.client().putFile(key, {
 				path: loc.path,
 				sha256: loc.sha256,
-				bodyBase64: bytesToBase64(loc.body),
+				body: loc.body,
 			});
 			if (this.stopped) return;
 			this.acked.set(loc.path, {
@@ -699,7 +699,7 @@ export class SettingsSyncEngine {
 					sha256: entry.sha256,
 					size: entry.size,
 					rev: entry.rev,
-					bodyBase64: entry.bodyBase64,
+					body: entry.body,
 				});
 				continue;
 			}
@@ -717,13 +717,13 @@ export class SettingsSyncEngine {
 				sha256: entry.sha256,
 				size: entry.size,
 				rev: entry.rev,
-				bodyBase64: entry.bodyBase64,
+				body: entry.body,
 			});
 		}
 	}
 
 	private async applyRemoteFile(file: SettingsSyncFile): Promise<void> {
-		const bytes = base64ToBytes(file.bodyBase64);
+		const bytes = new Uint8Array(file.body);
 		if (await sha256BytesHex(bytes) !== file.sha256) {
 			if (!this.stopped) this.patch({ error: `invalid_hash:${file.path}` });
 			return;
@@ -764,7 +764,7 @@ export class SettingsSyncEngine {
 			pluginId,
 			pluginVersion: localVersion,
 			sha256: file.sha256,
-			bodyBase64: bytesToBase64(file.body),
+			body: file.body,
 		});
 		this.acked.set(file.path, {
 			sha256: file.sha256,
@@ -774,11 +774,10 @@ export class SettingsSyncEngine {
 
 	private async verifiedRemoteText(
 		label: string,
-		bodyBase64: string,
+		bytes: Uint8Array,
 		expectedSha256: string,
 	): Promise<string | null> {
 		try {
-			const bytes = base64ToBytes(bodyBase64);
 			if (await sha256BytesHex(bytes) !== expectedSha256) {
 				this.patch({ error: `invalid_hash:${label}` });
 				return null;
@@ -796,7 +795,7 @@ export class SettingsSyncEngine {
 		const isSnippet = (path: string) => path.startsWith("snippets/") && path.endsWith(".css");
 		const verifiedFiles = new Map<string, string>();
 		for (const file of remote.files) {
-			const body = await this.verifiedRemoteText(file.path, file.bodyBase64, file.sha256);
+			const body = await this.verifiedRemoteText(file.path, file.body, file.sha256);
 			if (body !== null) verifiedFiles.set(file.path, body);
 		}
 
@@ -901,7 +900,7 @@ export class SettingsSyncEngine {
 			const local = manifests.get(entry.pluginId);
 			const body = await this.verifiedRemoteText(
 				`plugins/${entry.pluginId}/data.json`,
-				entry.bodyBase64,
+				entry.body,
 				entry.sha256,
 			);
 			if (body === null) continue;
@@ -953,7 +952,7 @@ export class SettingsSyncEngine {
 					pluginId,
 					pluginVersion: manifest.version,
 					sha256: file.sha256,
-					bodyBase64: bytesToBase64(file.body),
+					body: file.body,
 				});
 				continue;
 			}
@@ -962,7 +961,7 @@ export class SettingsSyncEngine {
 			files.push({
 				path: file.path,
 				sha256: file.sha256,
-				bodyBase64: bytesToBase64(file.body),
+				body: file.body,
 			});
 		}
 
@@ -1487,22 +1486,6 @@ export class SettingsSyncEngine {
 		this.snapshot = withStatusPatch(this.snapshot, patch);
 		this.opts.onStatus?.(this.snapshot);
 	}
-}
-
-function bytesToBase64(bytes: Uint8Array): string {
-	const chunks: string[] = [];
-	const chunkSize = 0x8000;
-	for (let offset = 0; offset < bytes.length; offset += chunkSize) {
-		chunks.push(String.fromCharCode(...bytes.subarray(offset, offset + chunkSize)));
-	}
-	return btoa(chunks.join(""));
-}
-
-function base64ToBytes(value: string): Uint8Array<ArrayBuffer> {
-	const binary = atob(value);
-	const bytes = new Uint8Array(binary.length);
-	for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
-	return bytes;
 }
 
 function jsonQuarantineOk(rel: string, bytes: Uint8Array): boolean {

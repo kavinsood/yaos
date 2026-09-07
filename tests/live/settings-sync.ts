@@ -2,9 +2,10 @@ import { strict as nodeAssert } from "node:assert";
 import { SCHEMA_VERSION } from "../../src/sync/schema.ts";
 import { deviceBearerHeaders, type LiveIdentity, requireLiveIdentityContext } from "./liveIdentity.ts";
 import { connectDocument, sha256Hex } from "./schema4Live.ts";
+import { decodeBinaryEnvelope, encodeBinaryEnvelope, YAOS_BINARY_CONTENT_TYPE } from "../../server/src/shared/binaryEnvelope.ts";
 
 const { deviceA, deviceB, settingsConfigKey } = requireLiveIdentityContext();
-const SETTINGS_FORMAT_VERSION = "1";
+const SETTINGS_FORMAT_VERSION = "2";
 const DURABLE_BODY_ID = "body_redeploy_durability_0001";
 const DURABLE_BODY_PATH = "redeploy-test.md";
 
@@ -37,9 +38,18 @@ async function responseJson(response: Response): Promise<Record<string, unknown>
 		: null;
 }
 
+async function responseEnvelope(response: Response): Promise<Record<string, unknown> | null> {
+	const value: unknown = await response.clone().arrayBuffer()
+		.then((body) => decodeBinaryEnvelope(new Uint8Array(body)))
+		.catch(() => null);
+	return typeof value === "object" && value !== null && !Array.isArray(value)
+		? value as Record<string, unknown>
+		: null;
+}
+
 async function getEnvironment(identity: LiveIdentity, configKey = settingsConfigKey): Promise<Record<string, unknown>> {
 	const response = await fetch(settingsUrl(identity, configKey), { headers: deviceBearerHeaders(identity) });
-	const body = await responseJson(response);
+	const body = await responseEnvelope(response);
 	assert(response.status === 200 && body !== null, `settings environment read succeeds for device ${identity.deviceId}`);
 	return body;
 }
@@ -52,10 +62,10 @@ async function put(
 ): Promise<{ response: Response; body: Record<string, unknown> | null }> {
 	const response = await fetch(settingsUrl(identity, configKey, action), {
 		method: "PUT",
-		headers: deviceBearerHeaders(identity, { "Content-Type": "application/json" }),
-		body: JSON.stringify(body),
+		headers: deviceBearerHeaders(identity, { "Content-Type": YAOS_BINARY_CONTENT_TYPE }),
+		body: encodeBinaryEnvelope(body),
 	});
-	return { response, body: await responseJson(response) };
+	return { response, body: await responseEnvelope(response) };
 }
 
 async function loadedDocuments(identity: LiveIdentity): Promise<string[]> {
@@ -79,15 +89,15 @@ for (const probe of [
 ]) {
 	const response = await fetch(settingsUrl(deviceA, gateKey, "seed", probe.declarations), {
 		method: "PUT",
-		headers: deviceBearerHeaders(deviceA, { "Content-Type": "application/json" }),
-		body: "{malformed-json-that-must-not-be-read",
+		headers: deviceBearerHeaders(deviceA, { "Content-Type": YAOS_BINARY_CONTENT_TYPE }),
+		body: "malformed-envelope-that-must-not-be-read",
 	});
 	assert(response.status === 426, `${probe.label} settings format is rejected before malformed body/store access`);
-	assertDeepEqual(await responseJson(response), {
+	assertDeepEqual(await responseEnvelope(response), {
 		error: "update_required",
 		reason: "settings_format_mismatch",
 		clientSettingsFormatVersion: probe.client,
-		serverSettingsFormatVersion: 1,
+		serverSettingsFormatVersion: 2,
 	}, `${probe.label} settings format returns the exact upgrade contract`);
 }
 assertDeepEqual(await getEnvironment(deviceB, gateKey), { seeded: false }, "format failures leave their settings environment unseeded");
@@ -98,9 +108,6 @@ const snippetV2 = "/* YAOS live settings mutation from device B */\n.yaos-live-s
 const appBytes = new TextEncoder().encode(appText);
 const snippetV1Bytes = new TextEncoder().encode(snippetV1);
 const snippetV2Bytes = new TextEncoder().encode(snippetV2);
-const appBodyBase64 = Buffer.from(appBytes).toString("base64");
-const snippetV1BodyBase64 = Buffer.from(snippetV1Bytes).toString("base64");
-const snippetV2BodyBase64 = Buffer.from(snippetV2Bytes).toString("base64");
 const appHash = await sha256Hex(appBytes);
 const snippetV1Hash = await sha256Hex(snippetV1Bytes);
 const snippetV2Hash = await sha256Hex(snippetV2Bytes);
@@ -113,8 +120,8 @@ const calendarIntent = {
 
 const seeded = await put(deviceA, settingsConfigKey, "seed", {
 	files: [
-		{ path: "app.json", sha256: appHash, bodyBase64: appBodyBase64 },
-		{ path: "snippets/yaos-live-settings.css", sha256: snippetV1Hash, bodyBase64: snippetV1BodyBase64 },
+		{ path: "app.json", sha256: appHash, body: appBytes },
+		{ path: "snippets/yaos-live-settings.css", sha256: snippetV1Hash, body: snippetV1Bytes },
 	],
 	intents: [calendarIntent],
 	themes: [],
@@ -127,8 +134,8 @@ const expectedSeed = {
 	seeded: true,
 	envRev: 1,
 	files: [
-		{ path: "app.json", sha256: appHash, size: appBytes.byteLength, rev: 1, bodyBase64: appBodyBase64 },
-		{ path: "snippets/yaos-live-settings.css", sha256: snippetV1Hash, size: snippetV1Bytes.byteLength, rev: 1, bodyBase64: snippetV1BodyBase64 },
+		{ path: "app.json", sha256: appHash, size: appBytes.byteLength, rev: 1, body: appBytes },
+		{ path: "snippets/yaos-live-settings.css", sha256: snippetV1Hash, size: snippetV1Bytes.byteLength, rev: 1, body: snippetV1Bytes },
 	],
 	intents: [{ ...calendarIntent, rev: 1 }],
 	themes: [],
@@ -140,7 +147,7 @@ assertDeepEqual(await getEnvironment(deviceB), expectedSeed, "device B reads A's
 const mutation = await put(deviceB, settingsConfigKey, "file", {
 	path: "snippets/yaos-live-settings.css",
 	sha256: snippetV2Hash,
-	bodyBase64: snippetV2BodyBase64,
+	body: snippetV2Bytes,
 });
 assert(mutation.response.status === 200, `device B mutates an allowlisted settings file (${mutation.response.status})`);
 assertDeepEqual(mutation.body, { ok: true, envRev: 2, rev: 2 }, "device B mutation advances the exact environment and row revision");
@@ -149,7 +156,7 @@ const expectedMutation = {
 	envRev: 2,
 	files: [
 		expectedSeed.files[0],
-		{ path: "snippets/yaos-live-settings.css", sha256: snippetV2Hash, size: snippetV2Bytes.byteLength, rev: 2, bodyBase64: snippetV2BodyBase64 },
+		{ path: "snippets/yaos-live-settings.css", sha256: snippetV2Hash, size: snippetV2Bytes.byteLength, rev: 2, body: snippetV2Bytes },
 	],
 };
 assertDeepEqual(await getEnvironment(deviceA), expectedMutation, "device A observes device B's exact revision and body");

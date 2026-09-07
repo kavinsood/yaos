@@ -1,4 +1,9 @@
 import type { RequestUrlParam, RequestUrlResponse } from "obsidian";
+import {
+	decodeBinaryEnvelope,
+	encodeBinaryEnvelope,
+	YAOS_BINARY_CONTENT_TYPE,
+} from "../../../server/src/shared/binaryEnvelope";
 import { obsidianRequest } from "../../utils/http";
 import {
 	SETTINGS_SYNC_FORMAT_VERSION,
@@ -85,25 +90,34 @@ export class SettingsSyncClient {
 
 	private async request(method: "GET" | "PUT" | "DELETE", configDirKey: string, action?: string, body?: unknown, query?: Record<string, string>): Promise<unknown> {
 		const headers: Record<string, string> = { Authorization: `Bearer ${this.opts.deviceToken}` };
-		let encodedBody: string | undefined;
+		let encodedBody: ArrayBuffer | undefined;
 		if (method !== "GET") {
-			headers["Content-Type"] = "application/json";
-			encodedBody = JSON.stringify(body ?? {});
 			const limit = action === "seed" || action === "replace" ? SETTINGS_SYNC_MAX_SNAPSHOT_REQUEST_BYTES : SETTINGS_SYNC_MAX_ITEM_REQUEST_BYTES;
-			if (utf8ByteLength(encodedBody) > limit) {
+			let envelope: Uint8Array;
+			try {
+				envelope = encodeBinaryEnvelope(body ?? {}, limit);
+			} catch {
 				throw new SettingsSyncHttpError(0, "request_too_large", "settings-sync request exceeds client bound");
 			}
+			headers["Content-Type"] = YAOS_BINARY_CONTENT_TYPE;
+			encodedBody = envelope.slice().buffer;
 		}
 		const response = await (this.opts.request ?? obsidianRequest)({
 			url: this.url(configDirKey, action, query), method, headers,
-			contentType: method === "GET" ? undefined : "application/json", body: encodedBody,
+			contentType: method === "GET" ? undefined : YAOS_BINARY_CONTENT_TYPE, body: encodedBody,
 		});
-		if (utf8ByteLength(response.text ?? "") > SETTINGS_SYNC_MAX_RESPONSE_BYTES) {
+		if (response.arrayBuffer.byteLength > SETTINGS_SYNC_MAX_RESPONSE_BYTES) {
 			throw new SettingsSyncHttpError(response.status, "response_too_large", "settings-sync response exceeds client bound");
 		}
-		if (response.status < 200 || response.status >= 300) throw readHttpError(response.status, response.json, response.text);
 		if (response.status === 204) return undefined;
-		return response.json ?? undefined;
+		let decoded: unknown;
+		try {
+			decoded = decodeBinaryEnvelope(new Uint8Array(response.arrayBuffer), SETTINGS_SYNC_MAX_RESPONSE_BYTES);
+		} catch {
+			throw new SettingsSyncHttpError(response.status, "invalid_response", "settings-sync response is not a valid binary envelope");
+		}
+		if (response.status < 200 || response.status >= 300) throw readHttpError(response.status, decoded);
+		return decoded;
 	}
 }
 
@@ -136,9 +150,9 @@ function parseFile(value: unknown): SettingsSyncFile {
 	const sha256 = hashString(row.sha256, "file sha256");
 	const size = nonNegativeInteger(row.size, "file size");
 	const rev = nonNegativeInteger(row.rev, "file rev");
-	const bodyBase64 = boundedString(row.bodyBase64, 0, base64MaxLength(SETTINGS_SYNC_MAX_FILE_BYTES), "file body");
-	if (size !== decodedBase64Size(bodyBase64, "file body") || size > SETTINGS_SYNC_MAX_FILE_BYTES) invalid("file size does not match bounded body");
-	return { path, sha256, size, rev, bodyBase64 };
+	const body = boundedBody(row.body, "file body");
+	if (size !== body.byteLength) invalid("file size does not match bounded body");
+	return { path, sha256, size, rev, body };
 }
 
 function parseIntent(value: unknown): SettingsSyncIntent {
@@ -161,9 +175,14 @@ function parseTombstone(value: unknown): SettingsSyncTombstone {
 function parsePluginData(value: unknown): SettingsSyncPluginData {
 	const row = objectRow(value, "plugin data");
 	const size = nonNegativeInteger(row.size, "plugin data size");
-	const bodyBase64 = boundedString(row.bodyBase64, 0, base64MaxLength(SETTINGS_SYNC_MAX_FILE_BYTES), "plugin data body");
-	if (size !== decodedBase64Size(bodyBase64, "plugin data body") || size > SETTINGS_SYNC_MAX_FILE_BYTES) invalid("plugin data size does not match bounded body");
-	return { pluginId: boundedString(row.pluginId, 1, SETTINGS_SYNC_MAX_ID_LENGTH, "plugin data id"), pluginVersion: boundedString(row.pluginVersion, 1, SETTINGS_SYNC_MAX_VERSION_LENGTH, "plugin data version"), sha256: hashString(row.sha256, "plugin data sha256"), size, rev: nonNegativeInteger(row.rev, "plugin data rev"), bodyBase64 };
+	const body = boundedBody(row.body, "plugin data body");
+	if (size !== body.byteLength) invalid("plugin data size does not match bounded body");
+	return { pluginId: boundedString(row.pluginId, 1, SETTINGS_SYNC_MAX_ID_LENGTH, "plugin data id"), pluginVersion: boundedString(row.pluginVersion, 1, SETTINGS_SYNC_MAX_VERSION_LENGTH, "plugin data version"), sha256: hashString(row.sha256, "plugin data sha256"), size, rev: nonNegativeInteger(row.rev, "plugin data rev"), body };
+}
+
+function boundedBody(value: unknown, label: string): Uint8Array {
+	if (!(value instanceof Uint8Array) || value.byteLength > SETTINGS_SYNC_MAX_FILE_BYTES) invalid(`${label} is invalid`);
+	return value.slice();
 }
 
 function objectRow(value: unknown, label: string): Record<string, unknown> {
@@ -195,37 +214,10 @@ function assertUnique<T>(rows: readonly T[], identity: (row: T) => string, label
 		seen.add(key);
 	}
 }
-function decodedBase64Size(value: string, label: string): number {
-	if (value.length % 4 !== 0) invalid(`${label} is invalid base64`);
-	let padding = 0;
-	if (value.endsWith("==")) padding = 2;
-	else if (value.endsWith("=")) padding = 1;
-	const dataEnd = value.length - padding;
-	for (let index = 0; index < value.length; index++) {
-		const code = value.charCodeAt(index);
-		const data = (code >= 65 && code <= 90) || (code >= 97 && code <= 122) || (code >= 48 && code <= 57) || code === 43 || code === 47;
-		if (index < dataEnd ? !data : code !== 61) invalid(`${label} is invalid base64`);
-	}
-	return (value.length / 4) * 3 - padding;
-}
-function base64MaxLength(bytes: number): number {
-	return Math.ceil(bytes / 3) * 4;
-}
-function utf8ByteLength(value: string): number {
-	let bytes = 0;
-	for (let index = 0; index < value.length; index++) {
-		const code = value.charCodeAt(index);
-		if (code < 0x80) bytes++;
-		else if (code < 0x800) bytes += 2;
-		else if (code >= 0xd800 && code <= 0xdbff && index + 1 < value.length && value.charCodeAt(index + 1) >= 0xdc00 && value.charCodeAt(index + 1) <= 0xdfff) { bytes += 4; index++; }
-		else bytes += 3;
-	}
-	return bytes;
-}
-function readHttpError(status: number, json: unknown, text: string): SettingsSyncHttpError {
+function readHttpError(status: number, json: unknown): SettingsSyncHttpError {
 	const response = typeof json === "object" && json !== null && !Array.isArray(json) ? json as Record<string, unknown> : null;
 	const code = response && typeof response.error === "string" && response.error ? response.error : response && typeof response.code === "string" && response.code ? response.code : `http_${status}`;
-	return new SettingsSyncHttpError(status, code, text || code);
+	return new SettingsSyncHttpError(status, code, code);
 }
 function invalid(detail: string): never {
 	throw new SettingsSyncHttpError(200, "invalid_response", `settings-sync ${detail}`);

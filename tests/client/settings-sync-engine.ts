@@ -12,13 +12,15 @@ import { suite } from "../harness.ts";
 import { installDomCrypto } from "./helpers/installDomCrypto";
 import { FakeIndexedDb } from "../mocks/indexedDb";
 import type { SettingsDirAdapter } from "../../src/sync/settingsSync/watch";
+import { encodeBinaryEnvelope, YAOS_BINARY_CONTENT_TYPE } from "../../server/src/shared/binaryEnvelope";
 
 installDomCrypto();
 const s = suite("settings-sync-engine");
 const emptyRemote = { seeded: true, envRev: 1, files: [], intents: [], themes: [], tombstones: [], pluginData: [] };
 
 function response(json: unknown): RequestUrlResponse {
-	return { status: 200, headers: {}, arrayBuffer: new ArrayBuffer(0), json, text: JSON.stringify(json) };
+	const body = encodeBinaryEnvelope(json);
+	return { status: 200, headers: { "content-type": YAOS_BINARY_CONTENT_TYPE }, arrayBuffer: body.slice().buffer, json: undefined, text: "" };
 }
 
 function makeAdapter() {
@@ -84,7 +86,7 @@ s.test("unsupported capability exits before queue, adapter, or network", async (
 	const engine = new SettingsSyncEngine({
 		app,
 		getSettings: settings,
-		getCapabilities: () => ({ settingsSync: false, settingsFormatVersion: 1 }),
+		getCapabilities: () => ({ settingsSync: false, settingsFormatVersion: 2 }),
 		folderKey: "folder-a",
 		adapter: { ...makeAdapter(), list: async () => { touched++; return { files: [], folders: [] }; } },
 		createClient: (options) => new SettingsSyncClient({ ...options, request: async () => { touched++; return response(emptyRemote); } }),
@@ -118,7 +120,7 @@ s.test("stop restores exact installer functions", async () => {
 	const app = appFixture(adapter, pluginHost);
 	const engine = new SettingsSyncEngine({
 		app, adapter, getSettings: settings,
-		getCapabilities: () => ({ settingsSync: true, settingsFormatVersion: 1 }),
+		getCapabilities: () => ({ settingsSync: true, settingsFormatVersion: 2 }),
 		folderKey: "folder-a",
 		indexedDb,
 		createClient: (options) => new SettingsSyncClient({ ...options, request: async (_input: RequestUrlParam) => response(emptyRemote) }),
@@ -140,7 +142,7 @@ s.test("awaitable stop waits for an active serialized mutation", async () => {
 	const app = appFixture(adapter);
 	const engine = new SettingsSyncEngine({
 		app, adapter, getSettings: settings,
-		getCapabilities: () => ({ settingsSync: true, settingsFormatVersion: 1 }),
+		getCapabilities: () => ({ settingsSync: true, settingsFormatVersion: 2 }),
 		folderKey: "folder-a",
 		indexedDb,
 		createClient: (options) => new SettingsSyncClient({
@@ -188,7 +190,7 @@ s.test("blank and occupied joiners require consent before any mutation", async (
 			adapter,
 			indexedDb,
 			getSettings: settings,
-			getCapabilities: () => ({ settingsSync: true, settingsFormatVersion: 1 }),
+			getCapabilities: () => ({ settingsSync: true, settingsFormatVersion: 2 }),
 			folderKey: "folder-a",
 			createClient: (options) => new SettingsSyncClient({
 				...options,
@@ -218,7 +220,7 @@ s.test("acceptance resumes only its exact identity", async () => {
 		adapter,
 		indexedDb,
 		getSettings: settings,
-		getCapabilities: () => ({ settingsSync: true, settingsFormatVersion: 1 }),
+		getCapabilities: () => ({ settingsSync: true, settingsFormatVersion: 2 }),
 		folderKey: "folder-a",
 		createClient: (options) => new SettingsSyncClient({
 			...options,
@@ -255,7 +257,7 @@ s.test("take quarantines remote bodies whose hashes do not match", async () => {
 			sha256: "0".repeat(64),
 			size: 2,
 			rev: 2,
-			bodyBase64: btoa("{}"),
+			body: new TextEncoder().encode("{}"),
 		}],
 		intents: [],
 		themes: [],
@@ -266,7 +268,7 @@ s.test("take quarantines remote bodies whose hashes do not match", async () => {
 			sha256: "1".repeat(64),
 			size: 2,
 			rev: 2,
-			bodyBase64: btoa("{}"),
+			body: new TextEncoder().encode("{}"),
 		}],
 	};
 	const engine = new SettingsSyncEngine({
@@ -274,7 +276,7 @@ s.test("take quarantines remote bodies whose hashes do not match", async () => {
 		adapter,
 		indexedDb,
 		getSettings: settings,
-		getCapabilities: () => ({ settingsSync: true, settingsFormatVersion: 1 }),
+		getCapabilities: () => ({ settingsSync: true, settingsFormatVersion: 2 }),
 		folderKey: "folder-a",
 		createClient: (options) => new SettingsSyncClient({
 			...options,
@@ -320,7 +322,7 @@ s.test("foreground visibility resumes a paused consented package queue", async (
 		adapter,
 		indexedDb,
 		getSettings: settings,
-		getCapabilities: () => ({ settingsSync: true, settingsFormatVersion: 1 }),
+		getCapabilities: () => ({ settingsSync: true, settingsFormatVersion: 2 }),
 		folderKey: "folder-a",
 		visibility: {
 			isHidden: () => hidden,

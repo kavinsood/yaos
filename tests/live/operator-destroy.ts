@@ -1,4 +1,5 @@
 import WebSocket from "ws";
+import { decodeBinaryEnvelope } from "../../server/src/shared/binaryEnvelope.ts";
 import { parseFatalFrame, type FatalFrame } from "./fatalFrame.ts";
 import { deviceBearerHeaders, fetchSocketTicket, requireLiveIdentityContext } from "./liveIdentity.ts";
 
@@ -6,10 +7,19 @@ const { deviceA, deviceB, operatorCookie, settingsConfigKey } = requireLiveIdent
 const vaultPath = `/operator/vaults/${encodeURIComponent(deviceA.vaultId)}`;
 const operatorHeaders = { Cookie: operatorCookie };
 const staleTicket = (await fetchSocketTicket(deviceA)).ticket;
-const settingsPath = `/vault/${encodeURIComponent(deviceA.vaultId)}/settings-sync/${encodeURIComponent(settingsConfigKey)}?settingsFormatVersion=1`;
+const settingsPath = `/vault/${encodeURIComponent(deviceA.vaultId)}/settings-sync/${encodeURIComponent(settingsConfigKey)}?settingsFormatVersion=2`;
 
 async function jsonBody(response: Response): Promise<Record<string, unknown> | null> {
 	const value: unknown = await response.clone().json().catch(() => null);
+	return typeof value === "object" && value !== null && !Array.isArray(value)
+		? value as Record<string, unknown>
+		: null;
+}
+
+async function envelopeBody(response: Response): Promise<Record<string, unknown> | null> {
+	const value: unknown = await response.clone().arrayBuffer()
+		.then((body) => decodeBinaryEnvelope(new Uint8Array(body)))
+		.catch(() => null);
 	return typeof value === "object" && value !== null && !Array.isArray(value)
 		? value as Record<string, unknown>
 		: null;
@@ -33,7 +43,7 @@ async function destroy(governanceRequestId: string): Promise<{ response: Respons
 const settingsBeforeDestroy = await fetch(`${deviceA.host}${settingsPath}`, {
 	headers: deviceBearerHeaders(deviceA),
 });
-const settingsBeforeBody = await jsonBody(settingsBeforeDestroy);
+const settingsBeforeBody = await envelopeBody(settingsBeforeDestroy);
 assert(
 	settingsBeforeDestroy.status === 200
 		&& settingsBeforeBody?.seeded === true
@@ -198,10 +208,10 @@ assert(recoveryEnrollment.status === 200
 	&& recoveryEnrollmentBody.deviceId === recoveryDeviceId,
 	"owner recovery enrolls a new device into the exact existing owner principal");
 const freshSettings = await fetch(
-	`${deviceA.host}/vault/${encodeURIComponent(String(freshVault.vaultId))}/settings-sync/${encodeURIComponent(settingsConfigKey)}?settingsFormatVersion=1`,
+	`${deviceA.host}/vault/${encodeURIComponent(String(freshVault.vaultId))}/settings-sync/${encodeURIComponent(settingsConfigKey)}?settingsFormatVersion=2`,
 	{ headers: { Authorization: `Bearer ${freshDeviceToken}` } },
 );
-const freshSettingsBody = await jsonBody(freshSettings);
+const freshSettingsBody = await envelopeBody(freshSettings);
 assert(
 	freshSettings.status === 200
 		&& JSON.stringify(freshSettingsBody) === JSON.stringify({ seeded: false }),

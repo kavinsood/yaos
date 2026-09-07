@@ -1,4 +1,4 @@
-export const SETTINGS_SYNC_FORMAT_VERSION = 1;
+export const SETTINGS_SYNC_FORMAT_VERSION = 2;
 export const SETTINGS_SYNC_MAX_FILE_BYTES = 1_000_000;
 export const SETTINGS_SYNC_MAX_AGGREGATE_BODY_BYTES = 4_000_000;
 export const SETTINGS_SYNC_MAX_SNAPSHOT_REQUEST_BYTES = 6_000_000;
@@ -21,7 +21,7 @@ export type SettingsSyncFile = {
 	sha256: string;
 	size: number;
 	rev: number;
-	bodyBase64: string;
+	body: Uint8Array;
 };
 
 export type SettingsSyncIntent = {
@@ -52,7 +52,7 @@ export type SettingsSyncPluginData = {
 	sha256: string;
 	size: number;
 	rev: number;
-	bodyBase64: string;
+	body: Uint8Array;
 };
 
 export type SettingsSyncUnseeded = { seeded: false };
@@ -70,25 +70,25 @@ export type SettingsSyncSeeded = {
 export type SettingsSyncState = SettingsSyncUnseeded | SettingsSyncSeeded;
 
 export type SettingsSyncSnapshot = {
-	files: Array<{ path: string; sha256: string; bodyBase64: string }>;
+	files: Array<{ path: string; sha256: string; body: Uint8Array }>;
 	intents: Array<{ id: string; repo: string; version: string; enabled: boolean }>;
 	themes: Array<{ name: string; repo: string; version: string }>;
 	pluginData: Array<{
 		pluginId: string;
 		pluginVersion: string;
 		sha256: string;
-		bodyBase64: string;
+		body: Uint8Array;
 	}>;
 };
 
-export type SettingsSyncFilePut = { path: string; sha256: string; bodyBase64: string };
+export type SettingsSyncFilePut = { path: string; sha256: string; body: Uint8Array };
 export type SettingsSyncIntentPut = { id: string; repo: string; version: string; enabled: boolean };
 export type SettingsSyncTombstonePut = { kind: "plugin" | "theme"; id: string };
 export type SettingsSyncPluginDataPut = {
 	pluginId: string;
 	pluginVersion: string;
 	sha256: string;
-	bodyBase64: string;
+	body: Uint8Array;
 };
 
 export type SettingsVersionMismatch = {

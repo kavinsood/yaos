@@ -76,14 +76,14 @@ s.test("settings route requires current vault membership and forwards only trust
 		return Response.json({ seeded: false });
 	});
 	const env = makeEnv({ YAOS_CONFIG: config, YAOS_SYNC: sync });
-	const endpoint = `https://example.test/vault/${VAULT_ID}/settings-sync/.obsidian?settingsFormatVersion=1`;
+	const endpoint = `https://example.test/vault/${VAULT_ID}/settings-sync/.obsidian?settingsFormatVersion=2`;
 
 	const missing = await handleWorkerRequest(new Request(endpoint), env);
 	assert.equal(missing.status, 401);
 	assert.equal(sync.calls, 0, "missing bearer does not allocate the vault runtime");
 
 	const foreign = await handleWorkerRequest(new Request(
-		`https://example.test/vault/${OTHER_VAULT_ID}/settings-sync/.obsidian?settingsFormatVersion=1`,
+		`https://example.test/vault/${OTHER_VAULT_ID}/settings-sync/.obsidian?settingsFormatVersion=2`,
 		{ headers: { authorization: `Bearer ${DEVICE_TOKEN}` } },
 	), env);
 	assert.equal(foreign.status, 401);
@@ -107,7 +107,7 @@ s.test("settings route requires current vault membership and forwards only trust
 	assert.equal(sync.calls, 1);
 	assert.equal(forwarded.length, 1);
 	assert.equal(new URL(forwarded[0]!.url).pathname, "/settings-sync/.obsidian");
-	assert.equal(new URL(forwarded[0]!.url).searchParams.get("settingsFormatVersion"), "1");
+	assert.equal(new URL(forwarded[0]!.url).searchParams.get("settingsFormatVersion"), "2");
 	assert.equal(forwarded[0]!.headers.get("x-yaos-vault-id"), VAULT_ID);
 	assert.equal(forwarded[0]!.headers.get("x-yaos-vault-generation"), VAULT_GENERATION);
 	assert.equal(forwarded[0]!.headers.get("x-yaos-device-id"), DEVICE_ID);

@@ -76,7 +76,7 @@ function vaultFile(vaultRoot, ...segments) {
 function settingsUrl(host, vaultId, configKey, action) {
 	const base = host.replace(/\/$/, "");
 	const suffix = action ? `/${action}` : "";
-	return `${base}/vault/${encodeURIComponent(vaultId)}/settings-sync/${encodeURIComponent(configKey)}${suffix}?settingsFormatVersion=1`;
+	return `${base}/vault/${encodeURIComponent(vaultId)}/settings-sync/${encodeURIComponent(configKey)}${suffix}?settingsFormatVersion=2`;
 }
 
 async function fetchJson(url, init = {}) {
@@ -207,7 +207,7 @@ async function main() {
 	const capabilitiesResult = await fetchJson(`${serverHost}/api/capabilities`, { headers: authorization });
 	requireCheck(capabilitiesResult.response.status === 200 && isRecord(capabilitiesResult.body), "server capabilities reachable", `HTTP ${capabilitiesResult.response.status}`);
 	requireCheck(
-		capabilitiesResult.body.settingsSync === true && capabilitiesResult.body.settingsFormatVersion === 1,
+		capabilitiesResult.body.settingsSync === true && capabilitiesResult.body.settingsFormatVersion === 2,
 		"exact settings capability",
 		`settingsSync=${String(capabilitiesResult.body.settingsSync)} settingsFormatVersion=${String(capabilitiesResult.body.settingsFormatVersion)}`,
 	);

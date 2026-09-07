@@ -5,6 +5,7 @@ import { suite } from "../harness.ts";
 import { actorHeaders } from "../../server/src/vaultAuthority";
 import type { VaultActorContext } from "../../server/src/collaboration";
 import { principalSettingsKey } from "../../server/src/settingsSyncStore";
+import { decodeBinaryEnvelope } from "../../server/src/shared/binaryEnvelope";
 
 const s = suite("vault-server-runtime");
 const VAULT_ID = "vault-runtime-0001";
@@ -30,7 +31,7 @@ class RuntimeStore {
 			if (this.metadata.vaultId !== vaultId || this.metadata.vaultGeneration !== vaultGeneration) throw new Error("vault generation mismatch");
 			return { ...this.metadata, created: false };
 		}
-		this.metadata = { vaultId, vaultGeneration, schemaVersion: 7, storageFormatVersion: 2, provisionedAt: 1 };
+		this.metadata = { vaultId, vaultGeneration, schemaVersion: 7, storageFormatVersion: 3, provisionedAt: 1 };
 		return { ...this.metadata, created: true };
 	}
 	vaultMetadata() { return this.metadata; }
@@ -217,10 +218,11 @@ s.test("bootstrap body batch is bounded and returns every requested body", async
 		body: JSON.stringify({ bodyIds: ["body-runtime-0001", "body-runtime-0002"] }),
 	}));
 	assert.equal(response.status, 200);
-	assert.deepEqual(await response.json(), {
+	assert.equal(response.headers.get("content-type"), "application/vnd.yaos.binary-envelope");
+	assert.deepEqual(decodeBinaryEnvelope(new Uint8Array(await response.arrayBuffer())), {
 		bodies: [
-			{ bodyId: "body-runtime-0001", generation: 7, encodedState: "AQI" },
-			{ bodyId: "body-runtime-0002", generation: 8, encodedState: "AwQ" },
+			{ bodyId: "body-runtime-0001", generation: 7, encodedState: new Uint8Array([1, 2]) },
+			{ bodyId: "body-runtime-0002", generation: 8, encodedState: new Uint8Array([3, 4]) },
 		],
 	});
 	const duplicate = await server.fetch(request("/bootstrap/bootstrap-runtime-0001/bodies", {
@@ -264,28 +266,28 @@ s.test("settings sidecar requires generation and trusted device authority withou
 		headers: { "x-yaos-device-id": "device-runtime-0001" },
 	}));
 	assert.equal(undeclaredFormat.status, 426);
-	assert.deepEqual(await undeclaredFormat.json(), {
+	assert.deepEqual(decodeBinaryEnvelope(new Uint8Array(await undeclaredFormat.arrayBuffer())), {
 		error: "update_required",
 		reason: "settings_format_mismatch",
 		clientSettingsFormatVersion: null,
-		serverSettingsFormatVersion: 1,
+		serverSettingsFormatVersion: 2,
 	});
 	assert.deepEqual(settingsReads, []);
-	const staleFormat = await server.fetch(request("/settings-sync/.obsidian?settingsFormatVersion=2", {
+	const staleFormat = await server.fetch(request("/settings-sync/.obsidian?settingsFormatVersion=1", {
 		headers: { "x-yaos-device-id": "device-runtime-0001" },
 	}));
 	assert.equal(staleFormat.status, 426);
 	assert.deepEqual(settingsReads, []);
-	const duplicateFormat = await server.fetch(request("/settings-sync/.obsidian?settingsFormatVersion=1&settingsFormatVersion=1", {
+	const duplicateFormat = await server.fetch(request("/settings-sync/.obsidian?settingsFormatVersion=2&settingsFormatVersion=2", {
 		headers: { "x-yaos-device-id": "device-runtime-0001" },
 	}));
 	assert.equal(duplicateFormat.status, 426);
 	assert.deepEqual(settingsReads, []);
-	const admitted = await server.fetch(request("/settings-sync/.obsidian?settingsFormatVersion=1", {
+	const admitted = await server.fetch(request("/settings-sync/.obsidian?settingsFormatVersion=2", {
 		headers: { "x-yaos-device-id": "device-runtime-0001" },
 	}));
 	assert.equal(admitted.status, 200);
-	assert.deepEqual(await admitted.json(), { seeded: false });
+	assert.deepEqual(decodeBinaryEnvelope(new Uint8Array(await admitted.arrayBuffer())), { seeded: false });
 	assert.deepEqual(settingsReads, [principalSettingsKey(ACTOR.principalId, ".obsidian")]);
 });
 await s.done();
