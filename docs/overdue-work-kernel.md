@@ -2,7 +2,8 @@
 
 `OverdueWorkKernel` centralizes the scheduling mechanics shared by reconnect,
 body wake/catch-up, candidate submission, transfer retry, recovery, settings,
-and periodic reconciliation. It does not centralize their domain policy.
+and their continuations. It does not centralize their domain policy. Periodic
+repair audit and rename batching remain explicit migration candidates.
 
 The kernel's governing rule is:
 
@@ -260,20 +261,81 @@ loaded-body durable-generation wake, and attachment publication retry through
 this adapter. Their old candidate, ticket/retry, and controller debounce timers
 were removed in the same slices. Manual reconnect and first attachment publish
 remain direct foreground attempts; only their continuation/retry ownership is
-kernel-owned. Schema-5 candidate records and attachment operations remain the
+kernel-owned. Schema-6 candidate records and attachment operations remain the
 durable truth and reconstruct scheduler intent during startup.
 
 The adapter's retry attempt/due time is reconstructible rather than durable.
 A restart immediately reconstructs still-pending candidate and attachment
 work, but does not retain the exact prior backoff deadline. Use a database-backed
-store when exact throttling state must survive restart. Recovery, settings,
-periodic reconciliation, and rename batching have not been migrated.
+store when exact throttling state must survive restart. Periodic repair audit
+and rename batching have not been migrated.
 
 Focused integration coverage uses a single fake clock to prove candidate
 startup reconstruction and retry, loaded-body wake through residency admission,
 and proactive ticket-driven reconnect. The attachment publication replay suite
 proves scheduler-owned startup reconstruction/retry while retaining exact
 operation identity, causal ordering, CAS, and root-persistence settlement.
+
+## Recovery work adapter
+
+`RecoveryWorkScheduler` in `src/snapshots/recoveryWorkScheduler.ts` owns the
+continuation timing for recovery capture and restore jobs:
+
+| Domain work | Key | Default priority | Durable truth |
+| --- | --- | --- | --- |
+| capture continuation | `recovery-capture:<captureId>` | normal | `PendingRecoveryState.activeCaptureId` |
+| restore continuation | `recovery-restore:<restoreId>` | interactive | `PendingRecoveryState.activeRestore` |
+
+The scheduler store is reconstructible. Folder-scoped `VaultIndexedDb` remains
+the durable authority for the exact active operation identity and last observed
+status. Startup scans `PendingRecoveryState` and queues each active identity
+again. Losing an in-memory attempt or due time can make the next check earlier,
+but cannot lose or duplicate the server-owned recovery job.
+
+Each worker fences publication against the currently persisted identity before
+and after remote I/O. Terminal state settles the keyed intent and clears the
+durable active identity. Ordinary server progress requeues the same key at the
+server-derived or bounded local delay. I/O failure returns
+`retryable_failure`; no separate monitor timer remains in `SnapshotService`.
+Restore application is bounded to 500 reported items per pass before yielding
+back through the scheduler. A terminal user cancellation clears durable truth
+and revises the exact scheduler key to due-now so the fenced worker promptly
+settles the stale reconstructible intent as superseded.
+
+## Settings work adapter
+
+`SettingsWorkScheduler` in `src/sync/settingsSync/workScheduler.ts` uses two
+separate collision domains per hashed apply-queue scope:
+
+| Domain work | Key | Default priority | Durable truth |
+| --- | --- | --- | --- |
+| environment reconciliation | `settings-reconcile:<hashed-scope>` | background | local config plus the server environment |
+| exact apply continuation | `settings-apply:<hashed-scope>` | interactive | the IndexedDB apply queue |
+
+The hash is a redacted stable derivative of `buildApplyQueueKey(scope)`; it is
+not durable state. Startup derives the scope again. Foreground visibility
+queues exact apply continuation and pokes the kernel. Successful apply queues
+immediate reconciliation. Reconciliation scans recur every five seconds, so
+local changes and remote drift remain reconstructible even if browser timers
+are suspended.
+
+Scheduled workers enter the engine's existing serialization boundary. The
+one-time startup apply-queue resume deliberately remains inside the initial
+serialized startup operation: awaiting a scheduled worker there would deadlock
+on the same serialization tail. After startup, the scheduler owns recurrence
+and foreground continuation. `SettingsSyncEngine` no longer owns a production
+interval or constructs `SettingsSyncWatcher`; the standalone watcher remains
+available only for its isolated behavior tests.
+
+## Remaining migration
+
+Periodic repair audit remains deferred until it has a bounded, useful repair
+unit and can be integrated without sharing retry ownership with vault
+connection or status code. The current reconciliation entry point primarily
+refreshes attachment/state bookkeeping, so wrapping it in a recurring kernel
+intent would add scheduling machinery without yet guaranteeing substantive
+repair coverage. Rename batching is also still intentionally outside the
+kernel migration.
 
 ## Migration recipe
 

@@ -107,7 +107,7 @@ Coverage includes typed invalid/missing states, content corruption, hash disagre
 ## Non-goals
 
 - YAML/frontmatter semantic merge is RFC 11;
-- binary and attachment merge semantics remain schema-5 attachment concerns;
+- binary and attachment merge semantics remain schema-6 attachment concerns;
 - conflict-session persistence is unnecessary because the durable artifact and preserved registry are the restart contract;
 - diff3 does not infer ancestry when the base is missing or invalid.
 

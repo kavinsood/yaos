@@ -1,6 +1,6 @@
 # Main backlog
 
-This file contains only unresolved risks that remain after the schema-5 multivault, root/body, SQL-bootstrap, attachment-CAS, and recovery-v2 integration. Completed earlier cutovers, monolith replacement, snapshot-v1 replacement, candidate/receipt, provisioning, and purge-order work is removed rather than marked complete.
+This file contains only unresolved risks that remain after the schema-6 multivault, root/body, semantic-frontmatter, SQL-bootstrap, attachment-CAS, and recovery-v2 integration. Completed earlier cutovers, monolith replacement, snapshot-v1 replacement, candidate/receipt, provisioning, and purge-order work is removed rather than marked complete.
 
 Current passing evidence is limited to focused suites, the complete regression discovery, and the local Wrangler Worker driver. See [QA](qa.md).
 
@@ -24,7 +24,7 @@ Current passing evidence is limited to focused suites, the complete regression d
 
 ### SYNC-01 — burst-created Markdown can miss admission
 
-**State:** An unresolved field report says one of several iOS Web Clipper-created Markdown files did not reach desktop until renamed. The schema-5 candidate path changes server durability but does not prove the client watcher/admission miss fixed.
+**State:** An unresolved field report says one of several iOS Web Clipper-created Markdown files did not reach desktop until renamed. The schema-6 candidate path changes server durability but does not prove the client watcher/admission miss fixed.
 
 **Evidence:** The report names burst creation and rename as the action that recovered synchronization. Current local Worker clients submit candidates directly and therefore do not exercise Obsidian watcher admission.
 
@@ -46,7 +46,7 @@ Current passing evidence is limited to focused suites, the complete regression d
 
 ### AUTH-01 — explicit credential-carrier coverage in diagnostics
 
-**State:** Safe exports redact common identity and credential fields, but schema 5 adds attachment revision, provisioning, recovery capability, purge, and multi-socket error surfaces.
+**State:** Safe exports redact common identity and credential fields, but schema 6 includes semantic settlement, attachment revision, provisioning, recovery capability, purge, and multi-socket error surfaces.
 
 **Evidence:** Current diagnostics tests cover the established safe shape. Production now carries device bearers, pairing/setup links, socket tickets, operator sessions, recovery job capabilities, and purge capabilities across additional routes and error paths.
 
@@ -76,11 +76,11 @@ Current passing evidence is limited to focused suites, the complete regression d
 
 ## P1 deployment and scale evidence
 
-### DEPLOY-01 — fresh schema-5 Cloudflare cutover rehearsal
+### DEPLOY-01 — fresh schema-6 Cloudflare cutover rehearsal
 
-**State:** Local Wrangler proves fresh claim/provision/enrollment. No external run currently proves the documented earlier-to-fresh-schema-5 user boundary.
+**State:** Local Wrangler proves fresh claim/provision/enrollment. No external run currently proves the documented earlier-to-fresh-schema-6 user boundary.
 
-**Evidence:** The implementation deliberately admits only schema `5` and protocol `1`, provisions SQL format `2`, and stores clients in a schema-5 IndexedDB namespace. [Operations](operations.md#deployment-boundary) explicitly rejects in-place earlier room/cache reuse.
+**Evidence:** The implementation deliberately admits only schema `6` and protocol `2`, provisions SQL format `2`, and stores clients in a schema-6 IndexedDB namespace. [Operations](operations.md#deployment-boundary) explicitly rejects in-place earlier room/cache reuse.
 
 **Required work:** Preserve a populated schema-3 vault on a trusted device, deploy a fresh current Worker with the `RecoveryJob` migration, claim, import through the origin path, enroll a joining device with a fresh cache, and verify the complete inventory and device isolation. Also verify advertised settings format 1, generation-fenced device-auth settings routes, and that a new vault generation starts with an unseeded settings environment.
 
@@ -106,11 +106,11 @@ Current passing evidence is limited to focused suites, the complete regression d
 
 **Closure:** Integrated results state platform, dataset shape, limits, duration, and failure criteria; benchmark samples and soak evidence remain distinct.
 
-### MOBILE-01 — schema-5 mobile lifecycle and settings evidence
+### MOBILE-01 — schema-6 mobile lifecycle and settings evidence
 
-**State:** No current integration result covers real iOS or Android schema-5 bootstrap, reconnect, attachment, recovery, or settings apply behavior.
+**State:** No current integration result covers real iOS or Android schema-6 bootstrap, reconnect, attachment, recovery, or settings apply behavior.
 
-**Evidence:** Current schema-5 evidence uses unit ports, desktop controllers, and Node clients under local Wrangler. Settings policy/queue tests do not invoke mobile Obsidian or its package installer.
+**Evidence:** Current schema-6 evidence uses unit ports, desktop controllers, and Node clients under local Wrangler. Settings policy/queue tests do not invoke mobile Obsidian or its package installer.
 
 **Required work:** Run fresh joining bootstrap, foreground edit, suspend/resume reconnect, attachment conflict, and supported recovery flows on real iOS and Android without copying credentials or caches. For settings, take an already-seeded named environment, verify no apply before an explicit decision and durable exact-identity queue, apply allowlisted files, exercise foreground auto-install consent and a desktop-only plugin skip, resume a checkpointed consented install after backgrounding, verify acceptance commits after successful take, verify the three-version plugin-data hold, and apply plugin/theme tombstones without interrupting note sync.
 

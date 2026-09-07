@@ -1,6 +1,6 @@
 # Sync and conflict contract
 
-This is the current schema-5 contract for `main`. [BACKLOG.md](BACKLOG.md) contains only evidenced unresolved risks and missing external-scale proof.
+This is the current schema-6 contract for `main`. [BACKLOG.md](BACKLOG.md) contains only evidenced unresolved risks and missing external-scale proof.
 
 ## Subjects
 
@@ -18,11 +18,11 @@ Canvas, Excalidraw, Base, and other non-Markdown formats use the attachment plan
 
 ## Vault, membership, and transport scope
 
-One server hosts multiple independent vaults. A physical installation may enroll different folders in different vaults, but each device identity and bearer is one vault membership. Each local folder stores that membership and has its own schema-5 IndexedDB database.
+One server hosts multiple independent vaults. A physical installation may enroll different folders in different vaults, but each device identity and bearer is one vault membership. Each local folder stores that membership and has its own schema-6 IndexedDB database.
 
 A pairing code selects one vault and is consumed once. Pairing creates a new full-peer membership; it never copies another folder's bearer. Leave revokes one membership and keeps disk files. Operator kick revokes one membership. Operator destroy revokes the full vault before generation-scoped physical cleanup.
 
-All vault HTTP requests use a device bearer and vault ID. WebSocket URLs never carry that long-lived bearer. The client exchanges it for a short-lived device ticket; root and body handshakes require the ticket plus exact `schemaVersion=5` and `protocolVersion=1`. Membership and active vault state are checked before every admission.
+All vault HTTP requests use a device bearer and vault ID. WebSocket URLs never carry that long-lived bearer. The client exchanges it for a short-lived device ticket; root and body handshakes require the ticket plus exact `schemaVersion=6` and `protocolVersion=2`. Membership and active vault state are checked before every admission, and protocol-level liveness must acknowledge the exact current socket before it is treated as responsive.
 
 Attachment heads are revisioned. Every active reference and tombstone carries the operation ID which created it. Upsert, delete, and rename publications name the exact revisions they expect; revision comparison, root mutation, catalog events, and the replay ledger commit atomically under the vault mutation lease. Reusing an operation ID succeeds only for the same canonical request digest. Clients persist publications in a transactionally allocated local sequence, distinguish committed, durably pending, and superseded outcomes, and never silently rebase a superseded operation.
 

@@ -73,8 +73,11 @@ response, simultaneous reconnect signals, root/body ordering, retryable versus
 terminal outcomes, and teardown during credential refresh. Production and test
 typechecks plus the production plugin build exercise the integrated boundary.
 
-Browser WebSocket APIs do not expose protocol ping/pong frames. YAOS can detect
-a closed or non-open socket and can force a fresh admission on foreground, but
-an open TCP connection which silently black-holes traffic still requires a
-future application-level liveness acknowledgement. Treating elapsed time since
-a Yjs update as proof of death would disconnect healthy quiet vaults.
+Browser WebSocket APIs do not expose protocol ping/pong frames. Socket protocol
+2 therefore supplies an application-level `VAULT_PING`/`VAULT_PONG` contract.
+The current socket attachment, device fence, vault generation, runtime epoch,
+document identity, and exact probe ID are checked before a pong renews
+liveness. Background suspension cancels deadlines; foregrounding requests
+fresh proof. A timeout fences late browser events, abandons the old transport,
+and enters the existing refresh-first admission path. See
+[application-level socket liveness](socket-liveness.md).

@@ -112,9 +112,18 @@ retry timers are removed; `ConnectionController` no longer owns a fast-reconnect
 debounce timer; loaded-body durable-generation catch-up enters residency
 admission through a scheduled body wake; and attachment startup/retry is
 scheduler-owned while its first foreground publication attempt remains direct.
-Pending schema-5 candidates and attachment operations reconstruct scheduler
+Pending schema-6 candidates and attachment operations reconstruct scheduler
 intent before normal startup admission. Manual reconnect likewise remains an
 immediate user action, but any continuation is scheduler-owned.
+
+Recovery and settings continuation now use dedicated reconstructible adapters.
+Recovery capture and restore are keyed by immutable server operation identity
+and reconstruct from folder-scoped pending recovery state. Settings uses
+separate reconcile and exact-apply keys derived from the durable apply-queue
+scope; startup and foreground reconstruct from the IndexedDB queue, local
+config, and server environment. The old recovery monitor and production
+settings interval/watcher ownership are removed. Periodic repair audit and
+rename batching remain unmigrated.
 
 ## Existing server machinery to reuse
 
@@ -191,7 +200,7 @@ outcome/diagnostic vocabulary only where that reduces operational ambiguity.
 | --- | --- | --- |
 | Cold editor opens have bounded priority under catch-up | **Delivered** | Editor-first selection and bounded background promotion are deterministic, and editor/background loads share the live runtime. |
 | Background work progresses during sustained interaction | **Delivered** | Preferred-burst fairness is covered without timers and background load callers carry background priority. |
-| Dirty/pinned saturation preserves work and reports backpressure | **Delivered; UX refinement deferred** | Protected state is never planned for eviction, typed reasons are logged and exported, and no unsafe fallback exists. |
+| Dirty/pinned saturation preserves work and reports backpressure | **Delivered** | Protected state is never planned for eviction, typed reasons are logged and exported, no unsafe fallback exists, and actionable current pressure reaches the status bar while full blocker/current/last detail remains in Advanced settings. |
 | Rapid switching leaks no consumers, providers, or leases | **Delivered** | Cancellation is deterministic and a live 100-transition `VaultSync` test proves bounded providers, sockets, reservations, warm bodies, and exact teardown. |
 | Loaded-body and socket limits differ safely | **Delivered** | Independent arithmetic, provider observations, socket-only idle-session closure, and live pressure integration are covered. |
 
@@ -199,10 +208,10 @@ outcome/diagnostic vocabulary only where that reduces operational ambiguity.
 
 | Acceptance criterion | Status | Evidence or remaining work |
 | --- | --- | --- |
-| Suspended timers cannot strand durable work | **Delivered for migrated consumers** | Timer callbacks only poke and reread intent. Pending candidates and attachment operations reconstruct at startup; reconnect and body wake are reconstructible from live controller/domain events. |
+| Suspended timers cannot strand durable work | **Delivered for migrated consumers** | Timer callbacks only poke and reread intent. Pending candidates, attachment operations, recovery jobs, and exact settings apply reconstruct at startup; reconnect, body wake, and settings reconcile are reconstructible from live domain state. |
 | Retry vocabulary is shared without sharing domain policy | **Delivered** | Workers return `OperationOutcome`; the kernel never infers protocol semantics from exceptions or HTTP status. |
 | Diagnostics expose age, priority, blocker, attempt, and owner | **Delivered** | Scalar diagnostics omit metadata and are exported through the telemetry runtime host and diagnostics bundle. |
-| Migrated producers retain no independent critical retry timer | **Delivered** | Reconnect, body wake, candidate submission, and attachment publication continuation are scheduler-owned; the replaced debounce/retry timers were removed. |
+| Migrated producers retain no independent critical retry timer | **Delivered** | Reconnect, body wake, candidate submission, attachment publication continuation, recovery continuation, and settings reconciliation/apply continuation are scheduler-owned; the replaced debounce/retry, recovery monitor, and settings production interval/watcher paths were removed. |
 
 ## Observations
 
@@ -285,7 +294,7 @@ was needed, and server drain/alarm ownership remains separate.
   for future debounce/backoff timers.
 - Attachment startup replay is part of local-readiness ordering, not ordinary
   background convenience. Reconstructed publication intent is installed and
-  drained before `_localReady`, preserving schema-5 causal settlement.
+  drained before `_localReady`, preserving schema-6 causal settlement.
 - Carrying reconnect maximum-wait across separately triggered ticket-refresh
   cycles can make a newer cycle inherit an obsolete deadline. Reconnect keeps
   debounce/due ownership without preserving that stale maximum-wait boundary.
@@ -364,9 +373,12 @@ fenced.
 > admission. Instrument the remaining server validation scratch documents before
 > changing Worker/Node limits; do not import client coefficients.
 
-> **Operational UX:** elevate named backpressure and
-> calibration caveats beyond logs into safe status/diagnostic guidance without
-> displaying a fake percentage of device memory.
+> **Operational UX delivered:** Advanced settings and diagnostics now expose a
+> read-only aggregate of residency, admission, and overdue work: configured and
+> current heuristic body estimates, queue counts and oldest age, blockers,
+> sockets, and current/last pressure. The status bar shows only actionable
+> unresolved pressure. Every estimate explicitly denies RAM measurement; no
+> fake device-memory percentage is displayed.
 
 ## Recommendations
 
@@ -401,16 +413,18 @@ timer ownership after settlement and teardown.
 
 Keep each migrated producer's key collision domain, durable truth, startup scan,
 removed timer, outcome mapping, and diagnostic surface documented and tested.
-Apply that same checklist before considering recovery, settings, periodic
-reconciliation, or rename batching; none is migrated merely because the shared
-kernel exists.
+Recovery and settings now satisfy that ownership checklist. Apply it before
+considering periodic repair audit or rename batching; neither is migrated
+merely because the shared kernel exists.
 
-### 6. Keep application-level socket liveness separate
+### 6. Application-level socket liveness follow-up
 
-Connection budgets can count opening/open providers but cannot prove that an
-apparently open browser socket still carries traffic. Add a protocol-level
-liveness acknowledgement before reclaiming black-holed connections
-automatically; do not infer death from a quiet Yjs document.
+This follow-up is delivered by socket protocol 2. Exact per-socket
+`VAULT_PING`/`VAULT_PONG` acknowledgements now distinguish an application-live
+connection from a browser socket which merely reports `OPEN`. Hidden Obsidian
+runtimes suspend deadlines, foreground runtimes revalidate, and a fenced
+transport adapter permits immediate replacement without accepting late events
+from an abandoned native socket. Quiet Yjs documents remain healthy.
 
 ## Remaining Relay horizon
 
