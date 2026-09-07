@@ -147,6 +147,52 @@ s.test("application liveness is acknowledged on the exact socket without loading
 	assert.equal(sent.length, 1, "the custom-message prefix is consumed exactly once");
 });
 
+s.test("root currentness queries return bounded exact heads without loading documents", async () => {
+	const sent: string[] = [];
+	let cacheLoads = 0;
+	const liveSocket: VaultSocketPort = {
+		deserializeAttachment: () => attachment,
+		serializeAttachment: () => {},
+		send: (message) => { if (typeof message === "string") sent.push(message); },
+		close: () => {},
+	};
+	const service = new VaultSocketService({
+		sockets: registry([liveSocket]),
+		cache: { load: () => { cacheLoads++; throw new Error("query must not load"); } },
+		vaultId: () => attachment.vaultId,
+		vaultGeneration: () => attachment.vaultGeneration,
+		runtimeEpoch: attachment.runtimeEpoch,
+		isActiveBody: () => true,
+		currentBodyHead: (bodyId: string) => bodyId === "body-current"
+			? { bodyId, lifecycle: "active", generation: 7, contentHash: "a".repeat(64), size: 12, sequence: 19 }
+			: null,
+		currentSequence: () => 21,
+		isDeviceRevoked: () => false,
+		scheduleFlush: () => {},
+	} as never);
+	await service.message(liveSocket, `__YPS:${JSON.stringify({
+		type: "BODY_CURRENTNESS_QUERY",
+		queryId: "query-1",
+		bodyIds: ["body-current", "body-missing"],
+	})}`);
+	assert.equal(cacheLoads, 0);
+	assert.equal(sent.length, 1);
+	assert.deepEqual(JSON.parse(sent[0]!.slice(6)), {
+		type: "BODY_CURRENTNESS_RESULT",
+		queryId: "query-1",
+		socketSessionId: attachment.socketId,
+		vaultSequence: 21,
+		heads: [{
+			bodyId: "body-current",
+			lifecycle: "active",
+			generation: 7,
+			contentHash: "a".repeat(64),
+			size: 12,
+		}],
+		missingBodyIds: ["body-missing"],
+	});
+});
+
 s.test("an inactive body cannot renew liveness", async () => {
 	let close: { code: number; reason: string } | null = null;
 	const bodySocket: VaultSocketPort = {

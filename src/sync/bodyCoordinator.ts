@@ -256,6 +256,7 @@ export class BodyCoordinator {
 	acquireProjection(path: string, bodyId: string, owner: BodyProjectionOwner, holderId: string): BodyLease {
 		const record = this.record(bodyId);
 		this.assertAccepting(record);
+		if (record.residency === "evicting") throw new Error(`body ${bodyId} is being replaced or evicted`);
 		if (!this.isPathCurrent(path, bodyId)) throw new Error(`path ${path} is not currently bound to body ${bodyId}`);
 		const currentClaim = this.pathClaims.get(path);
 		if (currentClaim && (currentClaim.bodyId !== bodyId || currentClaim.owner !== owner || owner !== "editor")) {

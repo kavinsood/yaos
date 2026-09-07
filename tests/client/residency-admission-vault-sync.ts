@@ -76,6 +76,139 @@ function providerFactory(
 	};
 }
 
+type CurrentnessFailure = "session-replaced" | "invalid-ready" | "malformed-result" | "identity-set-mismatch";
+
+async function createFailFastCurrentnessRuntime(failure: CurrentnessFailure): Promise<{
+	runtime: VaultSync;
+	bodyId: string;
+	headReads: () => number;
+	queryCount: () => number;
+}> {
+	const bodyId = `body-${failure}`;
+	const content = "current body";
+	const bytes = new TextEncoder().encode(content);
+	const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+	const contentHash = Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("");
+	const documents = new Map<string, StoredDocument>([[bodyId, storedBody(bodyId, content)]]);
+	const database = partialOf<VaultDatabasePort>({
+		getDocument: async (documentId) => documents.get(documentId) ?? null,
+		putDocument: async (document) => { documents.set(document.documentId, document); },
+		putAttachmentOperation: async (operation) => operation,
+		listAttachmentOperations: async () => [],
+		deleteAttachmentOperation: async () => {},
+		close: async () => {},
+	});
+	let headReads = 0;
+	let queryCount = 0;
+	const server = partialOf<VaultServerPort>({
+		currentHead: async (requestedBodyId) => {
+			headReads++;
+			return { bodyId: requestedBodyId, generation: 1, contentHash, size: bytes.byteLength };
+		},
+	});
+	const factory: ProviderFactory = ({ kind, documentId }) => {
+		const statusHandlers: Array<(event: { status: string }) => void> = [];
+		const syncHandlers: Array<(synced: boolean) => void> = [];
+		const customHandlers: Array<(payload: string) => void> = [];
+		let connected = false;
+		let socketSessionId = `socket-${documentId}-1`;
+		const emitCustom = (value: unknown) => {
+			const payload = JSON.stringify(value);
+			for (const handler of customHandlers) handler(payload);
+		};
+		const readyFrame = (overrides: Record<string, unknown> = {}) => ({
+			type: "VAULT_READY",
+			documentId,
+			socketSessionId,
+			vaultGeneration: "generation-fail-fast",
+			durableGeneration: 1,
+			runtimeEpoch: "runtime-fail-fast",
+			liveness: { version: 1, idleMs: 60_000, timeoutMs: 15_000 },
+			capabilities: kind === "body" ? { currentnessQuery: 2, committedHead: 2 } : null,
+			...overrides,
+		});
+		return partialOf<SyncProviderPort>({
+			awareness: partialOf<SyncAwarenessPort>({
+				setLocalStateField: () => {}, destroy: () => {}, getStates: () => new Map(),
+			}),
+			documentOrigin: {},
+			get ws() { return connected ? { readyState: 1 } : null; },
+			get wsconnected() { return connected; },
+			get wsconnecting() { return false; },
+			get synced() { return connected; },
+			url: "ws://test/currentness-fail-fast",
+			connect: () => {
+				connected = true;
+				for (const handler of statusHandlers) handler({ status: "connected" });
+				emitCustom(readyFrame());
+				for (const handler of syncHandlers) handler(true);
+			},
+			disconnect: () => { connected = false; },
+			destroy: () => { connected = false; },
+			sendMessage: (message) => {
+				const query = JSON.parse(message) as { type: string; queryId: string; bodyIds: string[] };
+				if (kind !== "body" || query.type !== "BODY_CURRENTNESS_QUERY") return;
+				queryCount++;
+				queueMicrotask(() => {
+					const queriedSessionId = socketSessionId;
+					if (failure === "session-replaced") {
+						socketSessionId = `socket-${documentId}-2`;
+						emitCustom(readyFrame());
+						emitCustom({
+							type: "BODY_CURRENTNESS_RESULT",
+							queryId: query.queryId,
+							socketSessionId: queriedSessionId,
+							vaultSequence: 2,
+							heads: [],
+							missingBodyIds: query.bodyIds,
+						});
+						return;
+					}
+					if (failure === "invalid-ready") {
+						emitCustom(readyFrame({ vaultGeneration: "wrong-generation" }));
+						return;
+					}
+					if (failure === "malformed-result") {
+						emitCustom({
+							type: "BODY_CURRENTNESS_RESULT",
+							queryId: query.queryId,
+							vaultSequence: 2,
+							heads: [],
+							missingBodyIds: query.bodyIds,
+						});
+						return;
+					}
+					emitCustom({
+						type: "BODY_CURRENTNESS_RESULT",
+						queryId: query.queryId,
+						socketSessionId,
+						vaultSequence: 2,
+						heads: [],
+						missingBodyIds: ["different-body"],
+					});
+				});
+			},
+			on: ((event: string, callback: unknown) => {
+				if (event === "status") statusHandlers.push(callback as (event: { status: string }) => void);
+				if (event === "sync") syncHandlers.push(callback as (synced: boolean) => void);
+				if (event === "custom-message") customHandlers.push(callback as (payload: string) => void);
+			}) as SyncProviderPort["on"],
+		});
+	};
+	const runtime = new VaultSync({
+		vaultId: "vault-fail-fast",
+		vaultGeneration: "generation-fail-fast",
+		deviceId: "device-fail-fast",
+		host: "https://sync.test",
+		token: "token",
+		database,
+		server,
+		providerFactory: factory,
+	});
+	runtime.ydoc.transact(() => runtime.pathToId.set("Current.md", bodyId), "test");
+	return { runtime, bodyId, headReads: () => headReads, queryCount: () => queryCount };
+}
+
 s.test("editor admission reserves decode and socket, then socket pressure closes only warm transport", async () => {
 	const documents = new Map<string, StoredDocument>([
 		["one", storedBody("one", "first")],
@@ -89,8 +222,12 @@ s.test("editor admission reserves decode and socket, then socket pressure closes
 		deleteAttachmentOperation: async () => {},
 		close: async () => {},
 	});
+	let headReads = 0;
 	const server = partialOf<VaultServerPort>({
-		currentHead: async (bodyId) => ({ bodyId, generation: 1 }),
+		currentHead: async (bodyId) => {
+			headReads++;
+			return { bodyId, generation: 1 };
+		},
 	});
 	let releaseFirstBody!: () => void;
 	const firstBodyGate = new Promise<void>((resolve) => { releaseFirstBody = resolve; });
@@ -122,6 +259,21 @@ s.test("editor admission reserves decode and socket, then socket pressure closes
 	releaseFirstBody();
 	await firstAcquire;
 	assert.equal(runtime.getResidencyAdmissionSnapshot().populations.active, 1);
+	const readsAfterFirstAcquire = headReads;
+	await runtime.acquireEditorBody("One.md", "editor-split");
+	assert.equal(headReads, readsAfterFirstAcquire, "a second active consumer performs no currentness request");
+	const sharedAdmission = runtime.getEditorAdmissionDiagnostics().at(-1);
+	assert.equal(sharedAdmission?.tier, "shared-active");
+	assert.equal(sharedAdmission?.currentnessSource, "none");
+	assert.equal(sharedAdmission?.httpFallback, false);
+	assert.equal(sharedAdmission?.failureClass, null);
+	assert.ok((sharedAdmission?.projectionMs ?? -1) >= 0);
+	runtime.completeEditorBodyBinding("editor-split");
+	const boundAdmission = runtime.getEditorAdmissionDiagnostics().at(-1);
+	assert.equal(boundAdmission?.outcome, "bound");
+	assert.ok((boundAdmission?.visibleToBoundMs ?? -1) >= (boundAdmission?.acquisitionMs ?? 0));
+	assert.ok((boundAdmission?.cmBindMs ?? -1) >= 0);
+	runtime.releaseEditorBody("One.md", "editor-split");
 
 	runtime.releaseEditorBody("One.md", "editor-one");
 	assert.equal(runtime.getResidencyAdmissionSnapshot().populations.warm, 1);
@@ -201,5 +353,136 @@ s.test("rapid editor switching leaves bounded warm bodies, sockets, and provider
 	await runtime.destroy();
 	assert.equal(providerStats.destroyed, providerStats.created, "teardown destroys every created provider exactly once");
 });
+
+s.test("warm synced reacquisition uses the exact body-socket currentness query", async () => {
+	const bodyId = "body-currentness";
+	const content = "current body";
+	const bytes = new TextEncoder().encode(content);
+	const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+	const contentHash = Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("");
+	const documents = new Map<string, StoredDocument>([[bodyId, storedBody(bodyId, content)]]);
+	const database = partialOf<VaultDatabasePort>({
+		getDocument: async (documentId) => documents.get(documentId) ?? null,
+		putDocument: async (document) => { documents.set(document.documentId, document); },
+		putAttachmentOperation: async (operation) => operation,
+		listAttachmentOperations: async () => [],
+		deleteAttachmentOperation: async () => {},
+		close: async () => {},
+	});
+	let headReads = 0;
+	const server = partialOf<VaultServerPort>({
+		currentHead: async (requestedBodyId) => {
+			headReads++;
+			return { bodyId: requestedBodyId, generation: 1, contentHash, size: bytes.byteLength };
+		},
+	});
+	const factory: ProviderFactory = ({ kind, documentId }) => {
+		const statusHandlers: Array<(event: { status: string }) => void> = [];
+		const syncHandlers: Array<(synced: boolean) => void> = [];
+		const customHandlers: Array<(payload: string) => void> = [];
+		let connected = false;
+		return partialOf<SyncProviderPort>({
+			awareness: partialOf<SyncAwarenessPort>({
+				setLocalStateField: () => {}, destroy: () => {}, getStates: () => new Map(),
+			}),
+			documentOrigin: {},
+			get ws() { return connected ? { readyState: 1 } : null; },
+			get wsconnected() { return connected; },
+			get wsconnecting() { return false; },
+			get synced() { return connected; },
+			url: "ws://test/currentness",
+			connect: () => {
+				connected = true;
+				for (const handler of statusHandlers) handler({ status: "connected" });
+				for (const handler of customHandlers) handler(JSON.stringify({
+					type: "VAULT_READY",
+					documentId,
+					socketSessionId: `socket-${documentId}`,
+					vaultGeneration: "generation-currentness",
+					durableGeneration: 1,
+					runtimeEpoch: "runtime-currentness",
+					liveness: { version: 1, idleMs: 60_000, timeoutMs: 15_000 },
+					capabilities: { currentnessQuery: 2, committedHead: 2 },
+				}));
+				for (const handler of syncHandlers) handler(true);
+			},
+			disconnect: () => { connected = false; },
+			destroy: () => { connected = false; },
+			sendMessage: (message) => {
+				const query = JSON.parse(message) as { type: string; queryId: string; bodyIds: string[] };
+				if (query.type !== "BODY_CURRENTNESS_QUERY") return;
+				queueMicrotask(() => {
+					for (const handler of customHandlers) handler(JSON.stringify({
+						type: "BODY_CURRENTNESS_RESULT",
+						queryId: query.queryId,
+						socketSessionId: `socket-${documentId}`,
+						vaultSequence: 4,
+						heads: query.bodyIds.map((requestedBodyId) => ({
+							bodyId: requestedBodyId,
+							lifecycle: "active",
+							generation: 1,
+							contentHash,
+							size: bytes.byteLength,
+						})),
+						missingBodyIds: [],
+					}));
+				});
+			},
+			on: ((event: string, callback: unknown) => {
+				if (event === "status") statusHandlers.push(callback as (event: { status: string }) => void);
+				if (event === "sync") syncHandlers.push(callback as (synced: boolean) => void);
+				if (event === "custom-message") customHandlers.push(callback as (payload: string) => void);
+			}) as SyncProviderPort["on"],
+		});
+	};
+	const runtime = new VaultSync({
+		vaultId: "vault-currentness",
+		vaultGeneration: "generation-currentness",
+		deviceId: "device-currentness",
+		host: "https://sync.test",
+		token: "token",
+		database,
+		server,
+		providerFactory: factory,
+	});
+	runtime.ydoc.transact(() => runtime.pathToId.set("Current.md", bodyId), "test");
+	await runtime.acquireEditorBody("Current.md", "editor-first");
+	runtime.releaseEditorBody("Current.md", "editor-first");
+	assert.equal(headReads, 1);
+	await runtime.acquireEditorBody("Current.md", "editor-second");
+	assert.equal(headReads, 1, "warm reacquisition replaces HEAD with the socket query");
+	const warmAdmission = runtime.getEditorAdmissionDiagnostics().at(-1);
+	assert.equal(warmAdmission?.tier, "warm-live");
+	assert.equal(warmAdmission?.currentnessSource, "body-query");
+	assert.equal(warmAdmission?.httpFallback, false);
+	assert.equal(warmAdmission?.bodySizeBucket, "lt-16-kib");
+	assert.ok((warmAdmission?.currentnessProofMs ?? -1) >= 0);
+	runtime.releaseEditorBody("Current.md", "editor-second");
+	await runtime.destroy();
+});
+
+for (const failure of [
+	"session-replaced",
+	"invalid-ready",
+	"malformed-result",
+	"identity-set-mismatch",
+] as const) {
+	s.test(`currentness ${failure} settles once and falls back immediately`, async () => {
+		const harness = await createFailFastCurrentnessRuntime(failure);
+		await harness.runtime.acquireEditorBody("Current.md", "editor-first");
+		harness.runtime.releaseEditorBody("Current.md", "editor-first");
+		assert.equal(harness.headReads(), 1);
+		const startedAt = performance.now();
+		await harness.runtime.acquireEditorBody("Current.md", "editor-second");
+		const elapsedMs = performance.now() - startedAt;
+		assert.ok(elapsedMs < 500, `${failure} waited ${elapsedMs}ms instead of failing fast`);
+		assert.equal(harness.queryCount(), 1);
+		assert.equal(harness.headReads(), 2, "fallback currentness executes exactly once");
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		assert.equal(harness.headReads(), 2, "late frames cannot resettle a completed waiter");
+		harness.runtime.releaseEditorBody("Current.md", "editor-second");
+		await harness.runtime.destroy();
+	});
+}
 
 await s.done();

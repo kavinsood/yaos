@@ -36,6 +36,20 @@ s.test("HTTP adapter consumes authenticated root, catalog, and body boundaries d
 		if (input.url.includes("/catalog?")) {
 			return response({ json: { entries: [], nextCursor: null } });
 		}
+		if (input.url.endsWith("/catch-up")) {
+			return response({ json: { bodies: [{
+				bodyId: "body-current",
+				fileId: "body-current",
+				path: "Current.md",
+				previousPath: null,
+				lifecycle: "active",
+				generation: 8,
+				contentHash: "a".repeat(64),
+				size: 3,
+				status: 200,
+				update: "AQID",
+			}] } });
+		}
 		return response();
 	};
 	const database = {
@@ -57,6 +71,8 @@ s.test("HTTP adapter consumes authenticated root, catalog, and body boundaries d
 	assert.equal((await port.currentBody("body/id")).generation, 7);
 	await port.settleRootThrough(41);
 	assert.equal((await port.bodies("boot/id", [])).size, 0);
+	const caught = await port.catchUpBodies([{ bodyId: "body-current", generation: 7 }]);
+	assert.deepEqual(caught.get("body-current")?.state?.encodedState, new Uint8Array([1, 2, 3]));
 
 	assert.deepEqual(
 		requests.map(({ url, method }) => ({ url, method })),
@@ -67,6 +83,7 @@ s.test("HTTP adapter consumes authenticated root, catalog, and body boundaries d
 			{ url: "https://sync.test/vault/vault%2Fid/bootstrap/boot%2Fid/body/body%2Fid", method: "GET" },
 			{ url: "https://sync.test/vault/vault%2Fid/body/body%2Fid", method: "GET" },
 			{ url: "https://sync.test/vault/vault%2Fid/root?through=41", method: "GET" },
+			{ url: "https://sync.test/vault/vault%2Fid/catch-up", method: "POST" },
 		],
 	);
 	assert.ok(requests.every((entry) => entry.headers.Authorization === "Bearer token"));

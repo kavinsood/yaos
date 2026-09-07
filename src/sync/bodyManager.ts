@@ -248,14 +248,17 @@ export class BodyManager {
 	async replaceFromServer(bodyId: string, encodedState: Uint8Array, generation: number): Promise<LoadedBody> {
 		return this.withAdmission(async () => {
 			const prior = this.loaded.get(bodyId);
+			const coordination = this.coordinator.snapshot(bodyId);
 			if (
 				prior?.dirty
-				|| (prior?.unsettled ?? 0) > 0
-				|| (prior?.pendingLocalUpdates ?? 0) > 0
-				|| (prior?.pins ?? 0) > 0
+					|| (prior?.unsettled ?? 0) > 0
+					|| (prior?.pendingLocalUpdates ?? 0) > 0
+					|| (prior?.pins ?? 0) > 0
+					|| (coordination?.leaseCount ?? 0) > 0
 			) {
 				throw new Error(`cannot replace dirty, unsettled, pending, or pinned body ${bodyId}`);
 			}
+			const priorRevision = prior ? this.coordinator.setResidency(bodyId, "evicting") : null;
 			const scratch = this.reserveTemporary(
 				"server-replacement",
 				bodyId,
@@ -269,6 +272,18 @@ export class BodyManager {
 				if (!await this.ensureEstimatedCostCapacity(bodyId, next.cost)) {
 					throw new Error("body_estimated_cost_budget");
 				}
+				const current = this.loaded.get(bodyId);
+				const currentCoordination = this.coordinator.snapshot(bodyId);
+				if (prior && (
+					current !== prior
+					|| !priorRevision
+					|| !this.coordinator.isContentCurrent(priorRevision)
+					|| prior.dirty
+					|| prior.unsettled > 0
+					|| prior.pendingLocalUpdates > 0
+					|| prior.pins > 0
+					|| (currentCoordination?.leaseCount ?? 0) > 0
+				)) throw new Error(`body ${bodyId} changed while preparing replacement`);
 				const body: LoadedBody = {
 					bodyId,
 					doc,
@@ -302,11 +317,33 @@ export class BodyManager {
 				this.updateHighWater();
 				return body;
 			} catch (error) {
+				if (prior && this.loaded.get(bodyId) === prior
+					&& this.coordinator.snapshot(bodyId)?.lifetime === "accepting") {
+					this.coordinator.setResidency(bodyId, "warm");
+				}
 				doc.destroy();
 				throw error;
 			} finally {
 				scratch.release();
 			}
+		});
+	}
+
+	async promoteExactGeneration(
+		bodyId: string,
+		expectedDoc: Y.Doc,
+		expectedRevision: BodyRevisionToken,
+		generation: number,
+	): Promise<boolean> {
+		return this.withAdmission(async () => {
+			const body = this.loaded.get(bodyId);
+			if (!body || body.doc !== expectedDoc || !this.coordinator.isContentCurrent(expectedRevision)) return false;
+			body.generation = Math.max(body.generation, generation);
+			body.lastUsedAt = this.now();
+			await this.persist(body);
+			return this.loaded.get(bodyId) === body
+				&& body.doc === expectedDoc
+				&& this.coordinator.isContentCurrent(expectedRevision);
 		});
 	}
 

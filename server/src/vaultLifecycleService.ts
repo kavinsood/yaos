@@ -425,7 +425,7 @@ export class VaultLifecycleService {
 		const record = this.options.store.lifecycleRecord(input.operationId)!;
 		this.applyRoot(rootUpdate, commit.generation, input);
 		if (input.kind === "delete") this.options.sockets().closeBody(input.bodyId);
-		this.options.sockets().notifyBodyCommitted(input.bodyId, prepared.receipt.durableGeneration);
+		this.options.sockets().notifyBodyCommitted(input.bodyId, prepared.receipt.durableGeneration, commit.vaultSequence);
 		return json(this.receipt(record));
 	}
 

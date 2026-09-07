@@ -3,8 +3,14 @@ import { canonicalizeMarkdown } from "@shared/markdownCodec";
 import {
 	SOCKET_LIVENESS_IDLE_MS,
 	SOCKET_LIVENESS_TIMEOUT_MS,
+	parseBodyCurrentnessResultFrame,
+	parseSocketControlCapabilities,
 	parseSocketLivenessDescriptor,
+	parseSocketSessionId,
 	parseVaultPongFrame,
+	type BodyCurrentnessHead,
+	type BodyCurrentnessResultFrame,
+	type SocketControlCapabilities,
 	type SocketLivenessDescriptor,
 } from "@shared/socketLiveness";
 import YSyncProvider from "y-partyserver/provider";
@@ -167,6 +173,7 @@ export interface SyncRuntimePort {
 	acquireEditorBody?(path: string, consumerId: string): Promise<void>;
 	isEditorBodyReady?(path: string, consumerId: string): boolean;
 	releaseEditorBody?(path: string, consumerId: string): void;
+	completeEditorBodyBinding?(consumerId: string): void;
 	reconnect?(reason?: string): Promise<OperationOutcome>;
 	queueReconnect?(reason: string, delayMs?: number, maxWaitMs?: number): Promise<void>;
 	pokeOverdueWork?(reason: string): void;
@@ -185,6 +192,42 @@ export interface SyncRuntimePort {
 	renameAttachmentRef(oldPath: string, newPath: string): Promise<AttachmentIntentOutcome>;
 	observeAttachmentChanges(callback: (change: AttachmentCatalogChange) => void): () => void;
 	destroy(): Promise<void>;
+}
+
+export type EditorAdmissionTier = "same-consumer" | "shared-active" | "warm-live" | "warm-loaded" | "cold";
+export type EditorAdmissionCurrentnessSource = "none" | "body-query" | "root-query" | "http-head";
+export type EditorAdmissionFailureClass = "cancelled" | "identity" | "network" | "capacity" | "unknown";
+export type EditorAdmissionBodySizeBucket = "unknown" | "lt-16-kib" | "16-256-kib" | "256-kib-1-mib" | "gte-1-mib";
+export interface EditorAdmissionSample {
+	tier: EditorAdmissionTier;
+	outcome: "bound" | "acquired" | "failed";
+	acquisitionMs: number;
+	visibleToBoundMs: number | null;
+	cmBindMs: number | null;
+	queueDelayMs: number;
+	localLoadMs: number;
+	currentnessProofMs: number;
+	stateFetchMs: number;
+	providerAdmissionMs: number;
+	providerSyncMs: number;
+	projectionMs: number;
+	currentnessSource: EditorAdmissionCurrentnessSource;
+	httpFallback: boolean;
+	socketCount: number;
+	bodySizeBucket: EditorAdmissionBodySizeBucket;
+	failureClass: EditorAdmissionFailureClass | null;
+}
+
+interface EditorAdmissionTrace {
+	queueDelayMs: number;
+	localLoadMs: number;
+	currentnessProofMs: number;
+	stateFetchMs: number;
+	providerAdmissionMs: number;
+	providerSyncMs: number;
+	projectionMs: number;
+	currentnessSource: EditorAdmissionCurrentnessSource;
+	httpFallback: boolean;
 }
 
 export interface BodyHead {
@@ -246,15 +289,21 @@ export interface BodyCommittedNotification {
 	vaultGeneration: string;
 	durableGeneration: number;
 	runtimeEpoch: string;
+	vaultSequence?: number;
+	lifecycle?: "active" | "tombstoned" | "reaped";
+	contentHash?: string | null;
+	size?: number | null;
 }
 export type VaultControlFrame =
 	| {
 		type: "VAULT_READY";
 		documentId: string;
+		socketSessionId: string | null;
 		vaultGeneration: string;
 		durableGeneration: number;
 		runtimeEpoch: string;
 		liveness: SocketLivenessDescriptor;
+		capabilities: SocketControlCapabilities | null;
 	}
 	| {
 		type: "VAULT_PONG";
@@ -449,8 +498,24 @@ interface BodySession {
 	provider: SyncProviderPort;
 	consumers: Set<string>;
 	projectionLeases: Map<string, BodyLease>;
+	lifetimeLease: BodyLease;
 	updateObserver: (update: Uint8Array, origin: unknown) => void;
 	ready: Promise<void>;
+	pendingCommitted: BodyCommittedNotification | null;
+	watermarkWork: Promise<void>;
+}
+
+interface SocketSession {
+	readonly id: string | null;
+	readonly runtimeEpoch: string;
+	readonly capabilities: SocketControlCapabilities | null;
+}
+
+interface CurrentnessWaiter {
+	readonly session: SocketSession;
+	readonly bodyIds: ReadonlySet<string>;
+	readonly resolve: (result: BodyCurrentnessResultFrame | null) => void;
+	readonly timer: number;
 }
 interface PendingCandidate {
 	record: CandidateRecord;
@@ -471,6 +536,7 @@ export class FreshAdmissionCancelledError extends Error {
 
 const DEFAULT_CANDIDATE_MAX_WAIT_MS = 2_000;
 const DEFAULT_BODY_SYNC_TIMEOUT_MS = 10_000;
+const DEFAULT_CURRENTNESS_QUERY_TIMEOUT_MS = 2_000;
 const DEFAULT_TRANSIENT_COST_BUDGET = 24 * 1024 * 1024;
 const DEFAULT_BODY_SOCKET_BUDGET = 8;
 const DEFAULT_WARM_RETENTION_MS = 5 * 60_000;
@@ -547,6 +613,8 @@ export function parseVaultControlFrame(payload: string): VaultControlFrame | nul
 	switch (record.type) {
 		case "VAULT_READY": {
 			const liveness = parseSocketLivenessDescriptor(record.liveness);
+			const capabilities = parseSocketControlCapabilities(record.capabilities);
+			const socketSessionId = parseSocketSessionId(record.socketSessionId);
 			if (
 				typeof record.documentId !== "string"
 				|| typeof record.vaultGeneration !== "string"
@@ -555,15 +623,18 @@ export function parseVaultControlFrame(payload: string): VaultControlFrame | nul
 				|| (record.durableGeneration as number) < 0
 				|| typeof record.runtimeEpoch !== "string"
 				|| !record.runtimeEpoch
+				|| (capabilities !== null && socketSessionId === null)
 				|| !liveness
 			) return null;
 			return {
 				type: "VAULT_READY",
 				documentId: record.documentId,
+				socketSessionId,
 				vaultGeneration: record.vaultGeneration,
 				durableGeneration: record.durableGeneration as number,
 				runtimeEpoch: record.runtimeEpoch,
 				liveness,
+				capabilities,
 			};
 		}
 		case "VAULT_PONG": {
@@ -602,6 +673,14 @@ function asBodyCommittedNotification(payload: string): BodyCommittedNotification
 		|| record.durableGeneration < 0
 		|| typeof record.runtimeEpoch !== "string"
 		|| !record.runtimeEpoch
+		|| (record.vaultSequence !== undefined
+			&& (!Number.isSafeInteger(record.vaultSequence) || (record.vaultSequence as number) < 0))
+		|| (record.lifecycle !== undefined
+			&& record.lifecycle !== "active" && record.lifecycle !== "tombstoned" && record.lifecycle !== "reaped")
+		|| (record.contentHash !== undefined && record.contentHash !== null
+			&& (typeof record.contentHash !== "string" || !/^[a-f0-9]{64}$/.test(record.contentHash)))
+		|| (record.size !== undefined && record.size !== null
+			&& (!Number.isSafeInteger(record.size) || (record.size as number) < 0))
 	) {
 		return null;
 	}
@@ -611,6 +690,10 @@ function asBodyCommittedNotification(payload: string): BodyCommittedNotification
 		vaultGeneration: record.vaultGeneration,
 		durableGeneration: record.durableGeneration,
 		runtimeEpoch: record.runtimeEpoch,
+		...(record.vaultSequence === undefined ? {} : { vaultSequence: record.vaultSequence as number }),
+		...(record.lifecycle === undefined ? {} : { lifecycle: record.lifecycle }),
+		...(record.contentHash === undefined ? {} : { contentHash: record.contentHash }),
+		...(record.size === undefined ? {} : { size: record.size as number | null }),
 	};
 }
 async function sha256Hex(bytes: Uint8Array): Promise<string> {
@@ -905,6 +988,10 @@ export class VaultSync implements SyncRuntimePort {
 	private readonly runtimeScope = new RuntimeScope();
 	private readonly socketAdmission: SocketAdmissionCoordinator;
 	private readonly socketLiveness: SocketLivenessCoordinator;
+	private readonly socketSessions = new WeakMap<SyncProviderPort, SocketSession>();
+	private readonly currentnessWaiters = new Map<string, CurrentnessWaiter>();
+	private readonly pendingRootCurrentness = new Map<string, Array<(value: { queried: boolean; head: BodyCurrentnessHead | null }) => void>>();
+	private rootCurrentnessScheduled = false;
 	private readonly expectedLivenessDisconnects = new WeakSet<SyncProviderPort>();
 	private readonly residencyAdmission: ResidencyAdmissionCoordinator;
 	private readonly residencyRuntime: ResidencyAdmissionRuntime;
@@ -932,6 +1019,8 @@ export class VaultSync implements SyncRuntimePort {
 	private _rootGeneration = 0;
 	private submissionPausedUntil = 0;
 	private backpressureLevel = 0;
+	private readonly editorAdmissionSamples: EditorAdmissionSample[] = [];
+	private readonly editorAdmissionPending = new Map<string, { sample: EditorAdmissionSample; startedAt: number }>();
 
 	static async create(options: VaultSyncOptions): Promise<VaultSync> {
 		const runtime = new VaultSync(options);
@@ -1043,7 +1132,7 @@ export class VaultSync implements SyncRuntimePort {
 	get hasPendingLocalWork(): boolean {
 		const bodyStats = this.bodies.stats();
 		return (
-			this.workScheduler.diagnostics().queue.length > 0
+			this.workScheduler.diagnostics().queue.some((item) => item.key !== "reconnect")
 			|| this.pendingUpdates.size > 0
 			|| this.pendingCandidates.size > 0
 			|| this.bodyPersistenceWork.size > 0
@@ -2449,6 +2538,65 @@ export class VaultSync implements SyncRuntimePort {
 	}
 
 	async acquireEditorBody(path: string, consumerId: string): Promise<void> {
+		const startedAt = this.monotonicNow();
+		const bodyId = this.getFileId(path);
+		const session = bodyId ? this.sessions.get(bodyId) : undefined;
+		const tier: EditorAdmissionTier = session?.consumers.has(consumerId)
+			? "same-consumer"
+			: (session?.consumers.size ?? 0) > 0
+				? "shared-active"
+				: session
+					? "warm-live"
+					: bodyId && this.bodies.get(bodyId)
+					? "warm-loaded"
+						: "cold";
+		const trace: EditorAdmissionTrace = {
+			queueDelayMs: 0,
+			localLoadMs: 0,
+			currentnessProofMs: 0,
+			stateFetchMs: 0,
+			providerAdmissionMs: 0,
+			providerSyncMs: 0,
+			projectionMs: 0,
+			currentnessSource: "none",
+			httpFallback: false,
+		};
+		try {
+			await this.acquireEditorBodyInternal(path, consumerId, trace);
+			const sample: EditorAdmissionSample = {
+				tier,
+				outcome: "acquired",
+				acquisitionMs: Math.max(0, this.monotonicNow() - startedAt),
+				visibleToBoundMs: null,
+				cmBindMs: null,
+				...trace,
+				socketCount: this.sessions.size + 1,
+				bodySizeBucket: this.editorAdmissionBodySizeBucket(bodyId),
+				failureClass: null,
+			};
+			this.recordEditorAdmission(sample);
+			this.editorAdmissionPending.set(consumerId, { sample, startedAt });
+		} catch (error) {
+			this.recordEditorAdmission({
+				tier,
+				outcome: "failed",
+				acquisitionMs: Math.max(0, this.monotonicNow() - startedAt),
+				visibleToBoundMs: null,
+				cmBindMs: null,
+				...trace,
+				socketCount: this.sessions.size + 1,
+				bodySizeBucket: this.editorAdmissionBodySizeBucket(bodyId),
+				failureClass: this.editorAdmissionFailureClass(error),
+			});
+			throw error;
+		}
+	}
+
+	private async acquireEditorBodyInternal(
+		path: string,
+		consumerId: string,
+		trace: EditorAdmissionTrace,
+	): Promise<void> {
 		if (this.destroyed) throw new Error("runtime is destroyed");
 		const bodyId = this.getFileId(path);
 		if (!bodyId) throw new Error(`root catalog has no active body for ${path}`);
@@ -2456,18 +2604,33 @@ export class VaultSync implements SyncRuntimePort {
 		if (already?.consumers.has(consumerId)) return;
 		const generation = (this.consumerGenerations.get(consumerId) ?? 0) + 1;
 		this.consumerGenerations.set(consumerId, generation);
+		const loaded = this.bodies.get(bodyId);
+		if (already && already.consumers.size > 0 && loaded?.doc === already.doc) {
+			const projectionStartedAt = this.monotonicNow();
+			this.attachEditorConsumer(path, bodyId, consumerId, generation, already, loaded);
+			trace.projectionMs += Math.max(0, this.monotonicNow() - projectionStartedAt);
+			this.refreshResidencyObservations();
+			return;
+		}
+		const queuedAt = this.monotonicNow();
 		await this.withBodyAdmission(bodyId, "editor", true, "active", async () => {
-			const body = await this.loadCurrentBodyUnadmitted(bodyId);
+			trace.queueDelayMs += Math.max(0, this.monotonicNow() - queuedAt);
+			const existing = this.sessions.get(bodyId);
+			const body = await this.loadCurrentBodyForEditor(bodyId, existing, trace);
 			if (this.destroyed) throw new Error("runtime closed during body acquisition");
 			let session = this.sessions.get(bodyId);
 			if (!session || session.doc !== body.doc) {
 				if (session) this.destroyBodySession(session);
+				const providerAdmissionStartedAt = this.monotonicNow();
 				session = this.createBodySession(body);
 				this.sessions.set(bodyId, session);
 				session.ready = this.waitForBodySync(session, body);
+				trace.providerAdmissionMs += Math.max(0, this.monotonicNow() - providerAdmissionStartedAt);
 			}
 			try {
+				const providerSyncStartedAt = this.monotonicNow();
 				await session.ready;
+				trace.providerSyncMs += Math.max(0, this.monotonicNow() - providerSyncStartedAt);
 			} catch (error) {
 				if (this.sessions.get(bodyId) === session && session.consumers.size === 0) {
 					this.destroyBodySession(session);
@@ -2481,22 +2644,73 @@ export class VaultSync implements SyncRuntimePort {
 				}
 				throw new Error(`stale body acquisition for ${path}`);
 			}
-			if (!session.consumers.has(consumerId)) {
-				const projectionLease = this.bodies.coordinator.acquireProjection(
-					path,
-					bodyId,
-					"editor",
-					consumerId,
-				);
-				session.consumers.add(consumerId);
-				session.projectionLeases.set(consumerId, projectionLease);
-				this.bodies.pin(bodyId);
-			}
-			this.bodies.coordinator.setResidency(bodyId, "active");
-			const text = body.doc.getText(BODY_TEXT_NAME);
-			this.textToBodyId.set(text, bodyId);
+			const projectionStartedAt = this.monotonicNow();
+			this.attachEditorConsumer(path, bodyId, consumerId, generation, session, body);
+			trace.projectionMs += Math.max(0, this.monotonicNow() - projectionStartedAt);
 		}, false, true);
 		this.refreshResidencyObservations();
+	}
+
+	completeEditorBodyBinding(consumerId: string): void {
+		const pending = this.editorAdmissionPending.get(consumerId);
+		if (!pending) return;
+		this.editorAdmissionPending.delete(consumerId);
+		pending.sample.outcome = "bound";
+		pending.sample.visibleToBoundMs = Math.max(0, this.monotonicNow() - pending.startedAt);
+		pending.sample.cmBindMs = Math.max(0, pending.sample.visibleToBoundMs - pending.sample.acquisitionMs);
+	}
+
+	getEditorAdmissionDiagnostics(): readonly EditorAdmissionSample[] {
+		return this.editorAdmissionSamples.map((sample) => ({ ...sample }));
+	}
+
+	private recordEditorAdmission(sample: EditorAdmissionSample): void {
+		this.editorAdmissionSamples.push(sample);
+		if (this.editorAdmissionSamples.length > 256) this.editorAdmissionSamples.shift();
+	}
+
+	private monotonicNow(): number {
+		return typeof performance === "undefined" ? this.now() : performance.now();
+	}
+
+	private editorAdmissionBodySizeBucket(bodyId: string | undefined): EditorAdmissionBodySizeBucket {
+		const bytes = bodyId ? this.bodies.get(bodyId)?.residencyMeasurement.materializedTextUtf8Bytes : undefined;
+		if (bytes === undefined) return "unknown";
+		if (bytes < 16 * 1024) return "lt-16-kib";
+		if (bytes < 256 * 1024) return "16-256-kib";
+		if (bytes < 1024 * 1024) return "256-kib-1-mib";
+		return "gte-1-mib";
+	}
+
+	private editorAdmissionFailureClass(error: unknown): EditorAdmissionFailureClass {
+		const message = error instanceof Error ? error.message : String(error);
+		if (/stale|cancel|closed|destroyed|superseded/i.test(message)) return "cancelled";
+		if (/catalog|identity|active|authority|generation|revision/i.test(message)) return "identity";
+		if (/budget|capacity|429|admission/i.test(message)) return "capacity";
+		if (/network|socket|provider|timeout|fetch|http/i.test(message)) return "network";
+		return "unknown";
+	}
+
+	private attachEditorConsumer(
+		path: string,
+		bodyId: string,
+		consumerId: string,
+		generation: number,
+		session: BodySession,
+		body: LoadedBody,
+	): void {
+		if (this.destroyed || this.consumerGenerations.get(consumerId) !== generation
+			|| this.sessions.get(bodyId) !== session || session.doc !== body.doc) {
+			throw new Error(`stale body acquisition for ${path}`);
+		}
+		if (!session.consumers.has(consumerId)) {
+			const projectionLease = this.bodies.coordinator.acquireProjection(path, bodyId, "editor", consumerId);
+			session.consumers.add(consumerId);
+			session.projectionLeases.set(consumerId, projectionLease);
+			this.bodies.pin(bodyId);
+		}
+		this.bodies.coordinator.setResidency(bodyId, "active");
+		this.textToBodyId.set(body.doc.getText(BODY_TEXT_NAME), bodyId);
 	}
 
 	isEditorBodyReady(path: string, consumerId: string): boolean {
@@ -2507,6 +2721,7 @@ export class VaultSync implements SyncRuntimePort {
 	}
 
 	releaseEditorBody(path: string, consumerId: string): void {
+		this.editorAdmissionPending.delete(consumerId);
 		this.consumerGenerations.set(consumerId, (this.consumerGenerations.get(consumerId) ?? 0) + 1);
 		const bodyId = this.findSessionBodyForConsumer(consumerId) ?? this.getFileId(path);
 		if (!bodyId) return;
@@ -2686,6 +2901,15 @@ export class VaultSync implements SyncRuntimePort {
 		this.runtimeScope.stopAdmission();
 		this.socketAdmission.stop();
 		this.socketLiveness.stop();
+		for (const waiter of this.currentnessWaiters.values()) {
+			window.clearTimeout(waiter.timer);
+			waiter.resolve(null);
+		}
+		this.currentnessWaiters.clear();
+		for (const waiters of this.pendingRootCurrentness.values()) {
+			for (const resolve of waiters) resolve({ queried: false, head: null });
+		}
+		this.pendingRootCurrentness.clear();
 		this.reconnectRequester = null;
 		this.reconnectBlocked = null;
 		if (this.renameTimer !== null) {
@@ -2701,6 +2925,7 @@ export class VaultSync implements SyncRuntimePort {
 		for (const session of this.sessions.values()) {
 			for (const lease of session.projectionLeases.values()) lease.release();
 			session.projectionLeases.clear();
+			session.lifetimeLease.release();
 			session.doc.off("update", session.updateObserver);
 			this.terminateProvider(session.provider);
 			session.provider.destroy();
@@ -2729,16 +2954,20 @@ export class VaultSync implements SyncRuntimePort {
 		this.provider.on("status", ({ status }) => {
 			if (status === "connected") {
 				this.expectedLivenessDisconnects.delete(this.provider);
+				this.invalidateSocketSession(this.provider);
 				this.socketLiveness.connected(ROOT_DOCUMENT_ID);
 				this._connectionGeneration++;
 				this.workScheduler.poke("root-connected");
 			} else if (status === "disconnected" && this.expectedLivenessDisconnects.delete(this.provider)) {
+				this.invalidateSocketSession(this.provider);
 				this.socketLiveness.disconnected(ROOT_DOCUMENT_ID);
 			} else if (status === "disconnected" && !this.fatalAuthError && !this.socketAdmission.isAttempting) {
+				this.invalidateSocketSession(this.provider);
 				this.socketLiveness.disconnected(ROOT_DOCUMENT_ID);
 				this.provider.disconnect();
 				this.requestReconnect("root-disconnected");
 			} else if (status === "disconnected") {
+				this.invalidateSocketSession(this.provider);
 				this.socketLiveness.disconnected(ROOT_DOCUMENT_ID);
 			}
 		});
@@ -2756,9 +2985,15 @@ export class VaultSync implements SyncRuntimePort {
 		};
 		const handleRootControl = (payload: string) => {
 			handleFatal(payload);
-			this.handleVaultControl(payload, ROOT_DOCUMENT_ID);
+			this.handleVaultControl(payload, ROOT_DOCUMENT_ID, this.provider);
+			this.handleCurrentnessResult(payload, this.provider);
 			const committed = asBodyCommittedNotification(payload);
-			if (committed) void this.handleDurableBodyCommitted(committed);
+			const session = this.socketSessions.get(this.provider);
+			if (committed && session
+				&& committed.vaultGeneration === this.options.vaultGeneration
+				&& committed.runtimeEpoch === session.runtimeEpoch) {
+				void this.handleDurableBodyCommitted(committed);
+			}
 		};
 		this.provider.on("custom-message", handleRootControl);
 		this.ydoc.on("update", (_update, origin) => {
@@ -2807,21 +3042,32 @@ export class VaultSync implements SyncRuntimePort {
 		const factory = this.options.providerFactory ?? ((input) => this.createDefaultProvider(input));
 		const provider = factory({ kind: "body", documentId: body.bodyId, doc: body.doc });
 		this.registerSocketLiveness(body.bodyId, provider);
-		const handleControl = (payload: string) => this.handleVaultControl(payload, body.bodyId);
+		const lifetimeLease = this.bodies.acquireLease(body.bodyId);
+		let session!: BodySession;
+		const handleControl = (payload: string) => {
+			this.handleVaultControl(payload, body.bodyId, provider);
+			this.handleCurrentnessResult(payload, provider);
+			const committed = asBodyCommittedNotification(payload);
+			if (committed) this.handleBodySessionCommitted(session, committed);
+		};
 		provider.on("custom-message", handleControl);
 		provider.on("status", ({ status }) => {
 			if (status === "connected") {
 				this.expectedLivenessDisconnects.delete(provider);
+				this.invalidateSocketSession(provider);
 				this.socketLiveness.connected(body.bodyId);
 			} else if (status === "disconnected" && this.expectedLivenessDisconnects.delete(provider)) {
+				this.invalidateSocketSession(provider);
 				this.socketLiveness.disconnected(body.bodyId);
 			} else if (status === "disconnected" && !this.fatalAuthError && !this.socketAdmission.isAttempting) {
+				this.invalidateSocketSession(provider);
 				this.socketLiveness.disconnected(body.bodyId);
 				provider.disconnect();
 				if ((this.sessions.get(body.bodyId)?.consumers.size ?? 0) > 0) {
 					this.requestReconnect(`body-disconnected:${body.bodyId}`);
 				}
 			} else if (status === "disconnected") {
+				this.invalidateSocketSession(provider);
 				this.socketLiveness.disconnected(body.bodyId);
 			}
 		});
@@ -2853,15 +3099,22 @@ export class VaultSync implements SyncRuntimePort {
 			this.scheduleCandidate(body.bodyId);
 		};
 		body.doc.on("update", updateObserver);
-		return {
+		session = {
 			bodyId: body.bodyId,
 			doc: body.doc,
 			provider,
 			consumers: new Set(),
 			projectionLeases: new Map(),
+			lifetimeLease,
 			updateObserver,
 			ready: Promise.resolve(),
+			pendingCommitted: null,
+			watermarkWork: Promise.resolve(),
 		};
+		provider.on("sync", (synced) => {
+			if (synced && session.pendingCommitted) this.handleBodySessionCommitted(session, session.pendingCommitted);
+		});
+		return session;
 	}
 
 	private async loadBodyWithPriority(
@@ -2956,7 +3209,7 @@ export class VaultSync implements SyncRuntimePort {
 				transientCost: 0,
 				dirty: body.dirty,
 				durablyPending: body.unsettled > 0,
-				leaseCount: coordination?.leaseCount ?? 0,
+				leaseCount: Math.max(0, (coordination?.leaseCount ?? 0) - (session ? 1 : 0)),
 				socket,
 				lastUsedAt: body.lastUsedAt,
 			});
@@ -2996,7 +3249,7 @@ export class VaultSync implements SyncRuntimePort {
 			|| body.unsettled > 0
 			|| body.pendingLocalUpdates > 0
 			|| body.pins > 0
-			|| (coordination?.leaseCount ?? 0) > 0
+			|| (coordination?.leaseCount ?? 0) > 1
 			|| coordination?.residency === "active") return false;
 		this.destroyBodySession(session);
 		return true;
@@ -3017,6 +3270,7 @@ export class VaultSync implements SyncRuntimePort {
 		if (this.sessions.get(session.bodyId) === session) this.sessions.delete(session.bodyId);
 		this.socketLiveness.unregister(session.bodyId);
 		session.doc.off("update", session.updateObserver);
+		session.lifetimeLease.release();
 		this.terminateProvider(session.provider);
 		session.provider.destroy();
 	}
@@ -3055,10 +3309,162 @@ export class VaultSync implements SyncRuntimePort {
 		);
 	}
 
-	private async loadCurrentBodyUnadmitted(bodyId: string): Promise<LoadedBody> {
+	private async loadCurrentBodyForEditor(
+		bodyId: string,
+		session: BodySession | undefined,
+		trace: EditorAdmissionTrace,
+	): Promise<LoadedBody> {
+		const localLoadStartedAt = this.monotonicNow();
+		const body = await this.bodies.load(bodyId);
+		trace.localLoadMs += Math.max(0, this.monotonicNow() - localLoadStartedAt);
+		if (session && session.doc === body.doc && session.provider.synced
+			&& session.provider.wsconnected && session.provider.ws?.readyState === 1) {
+			const proofStartedAt = this.monotonicNow();
+			const result = await this.queryCurrentness(session.provider, [bodyId]);
+			if (result) {
+				trace.currentnessSource = "body-query";
+				const head = result.heads.find((candidate) => candidate.bodyId === bodyId) ?? null;
+				if (!head || head.lifecycle !== "active") throw new Error(`body ${bodyId} is not active`);
+				const promoted = await this.promoteBodyFromCurrentness(body, head);
+				trace.currentnessProofMs += Math.max(0, this.monotonicNow() - proofStartedAt);
+				if (promoted) return body;
+				return this.catchUpBody(body, head, trace);
+			}
+			trace.currentnessProofMs += Math.max(0, this.monotonicNow() - proofStartedAt);
+		}
+		const rootProofStartedAt = this.monotonicNow();
+		const queried = await this.queryRootBodyHead(bodyId);
+		if (queried.queried) {
+			trace.currentnessSource = "root-query";
+			trace.currentnessProofMs += Math.max(0, this.monotonicNow() - rootProofStartedAt);
+			if (!queried.head || queried.head.lifecycle !== "active") throw new Error(`body ${bodyId} is not active`);
+			return this.catchUpBody(body, queried.head, trace);
+		}
+		trace.currentnessProofMs += Math.max(0, this.monotonicNow() - rootProofStartedAt);
+		trace.currentnessSource = "http-head";
+		trace.httpFallback = true;
+		return this.catchUpBody(body, undefined, trace);
+	}
+
+	private async promoteBodyFromCurrentness(body: LoadedBody, head: BodyCurrentnessHead): Promise<boolean> {
+		if (head.lifecycle !== "active") return false;
+		const revision = this.bodies.captureRevision(body.bodyId);
+		if (!await this.bodyMatchesHead(body.doc, head)
+			|| !this.bodies.coordinator.isContentCurrent(revision)) return false;
+		if (body.generation >= head.generation) return true;
+		return this.bodies.promoteExactGeneration(body.bodyId, body.doc, revision, head.generation);
+	}
+
+	private queryRootBodyHead(bodyId: string): Promise<{ queried: boolean; head: BodyCurrentnessHead | null }> {
+		return new Promise((resolve) => {
+			const waiters = this.pendingRootCurrentness.get(bodyId) ?? [];
+			waiters.push(resolve);
+			this.pendingRootCurrentness.set(bodyId, waiters);
+			if (this.rootCurrentnessScheduled) return;
+			this.rootCurrentnessScheduled = true;
+			queueMicrotask(() => { void this.flushRootCurrentnessQueries(); });
+		});
+	}
+
+	private async flushRootCurrentnessQueries(): Promise<void> {
+		this.rootCurrentnessScheduled = false;
+		const pending = [...this.pendingRootCurrentness.entries()];
+		this.pendingRootCurrentness.clear();
+		for (let offset = 0; offset < pending.length; offset += 100) {
+			const batch = pending.slice(offset, offset + 100);
+			const result = await this.queryCurrentness(this.provider, batch.map(([bodyId]) => bodyId));
+			const heads = new Map(result?.heads.map((head) => [head.bodyId, head]));
+			for (const [bodyId, waiters] of batch) {
+				const value = { queried: result !== null, head: heads.get(bodyId) ?? null };
+				for (const resolve of waiters) resolve(value);
+			}
+		}
+	}
+
+	private queryCurrentness(
+		provider: SyncProviderPort,
+		bodyIds: readonly string[],
+	): Promise<BodyCurrentnessResultFrame | null> {
+		const session = this.socketSessions.get(provider);
+		if (!session?.id || !session.capabilities || !provider.sendMessage || !provider.wsconnected
+			|| provider.ws?.readyState !== 1) return Promise.resolve(null);
+		const queryId = crypto.randomUUID();
+		return new Promise((resolve) => {
+			const timer = window.setTimeout(() => {
+				this.settleCurrentnessWaiter(queryId, null);
+			}, DEFAULT_CURRENTNESS_QUERY_TIMEOUT_MS);
+			this.currentnessWaiters.set(queryId, {
+				session,
+				bodyIds: new Set(bodyIds),
+				resolve,
+				timer,
+			});
+			try {
+				provider.sendMessage!(JSON.stringify({ type: "BODY_CURRENTNESS_QUERY", queryId, bodyIds }));
+			} catch {
+				this.invalidateSocketSession(provider);
+			}
+		});
+	}
+
+	private handleCurrentnessResult(payload: string, provider: SyncProviderPort): void {
+		let value: unknown;
+		try { value = JSON.parse(payload); } catch {
+			this.invalidateSocketSession(provider);
+			return;
+		}
+		const record = value && typeof value === "object" && !Array.isArray(value)
+			? value as Record<string, unknown>
+			: null;
+		if (record?.type !== "BODY_CURRENTNESS_RESULT") return;
+		const queryId = typeof record.queryId === "string"
+			? record.queryId
+			: null;
+		const waiter = queryId ? this.currentnessWaiters.get(queryId) : undefined;
+		const result = parseBodyCurrentnessResultFrame(value);
+		if (!result) {
+			if (queryId && waiter) this.settleCurrentnessWaiter(queryId, null);
+			this.invalidateSocketSession(provider);
+			return;
+		}
+		if (!waiter) return;
+		const session = this.socketSessions.get(provider);
+		if (session !== waiter.session || result.socketSessionId !== waiter.session.id) {
+			this.settleCurrentnessWaiter(result.queryId, null);
+			if (session === waiter.session) this.invalidateSocketSession(provider);
+			return;
+		}
+		const returned = new Set([...result.heads.map((head) => head.bodyId), ...result.missingBodyIds]);
+		if (returned.size !== waiter.bodyIds.size
+			|| [...waiter.bodyIds].some((bodyId) => !returned.has(bodyId))) {
+			this.invalidateSocketSession(provider);
+			return;
+		}
+		this.settleCurrentnessWaiter(result.queryId, result);
+	}
+
+	private settleCurrentnessWaiter(queryId: string, result: BodyCurrentnessResultFrame | null): void {
+		const waiter = this.currentnessWaiters.get(queryId);
+		if (!waiter) return;
+		window.clearTimeout(waiter.timer);
+		this.currentnessWaiters.delete(queryId);
+		waiter.resolve(result);
+	}
+
+	private invalidateSocketSession(provider: SyncProviderPort): void {
+		const session = this.socketSessions.get(provider);
+		this.socketSessions.delete(provider);
+		if (!session) return;
+		for (const [queryId, waiter] of this.currentnessWaiters) {
+			if (waiter.session !== session) continue;
+			this.settleCurrentnessWaiter(queryId, null);
+		}
+	}
+
+	private async loadCurrentBodyUnadmitted(bodyId: string, suppliedHead?: BodyHead | null): Promise<LoadedBody> {
 		const inFlight = this.currentnessChecks.get(bodyId);
 		if (inFlight) return inFlight;
-		const run = this.bodies.load(bodyId).then((body) => this.catchUpBody(body)).then((body) => {
+		const run = this.bodies.load(bodyId).then((body) => this.catchUpBody(body, suppliedHead)).then((body) => {
 			this.ensureSemanticMirror(body);
 			return body;
 		});
@@ -3072,25 +3478,38 @@ export class VaultSync implements SyncRuntimePort {
 		}
 	}
 
-	private async catchUpBody(body: LoadedBody): Promise<LoadedBody> {
+	private async catchUpBody(
+		body: LoadedBody,
+		suppliedHead?: BodyHead | null,
+		trace?: EditorAdmissionTrace,
+	): Promise<LoadedBody> {
 		let head: BodyHead | null;
-		try {
-			head = await this.server.currentHead(body.bodyId);
-		} catch (error) {
-			if (body.generation > 0 || body.dirty) return body;
-			throw error;
+		if (suppliedHead !== undefined) {
+			head = suppliedHead;
+		} else {
+			try {
+				const proofStartedAt = trace ? this.monotonicNow() : 0;
+				head = await this.server.currentHead(body.bodyId);
+				if (trace) trace.currentnessProofMs += Math.max(0, this.monotonicNow() - proofStartedAt);
+			} catch (error) {
+				if (body.generation > 0 || body.dirty) return body;
+				throw error;
+			}
 		}
 		if (!head) throw new Error(`body ${body.bodyId} is not active`);
 		if (
 			head.generation <= body.generation
 			&& await this.bodyMatchesHead(body.doc, head)
 		) return body;
+		const stateFetchStartedAt = trace ? this.monotonicNow() : 0;
 		const state = await this.server.currentBody(body.bodyId);
 		if (state.bodyId !== body.bodyId || state.generation < head.generation) {
 			throw new Error("stale body catch-up response");
 		}
 		await this.validateBodyStateIntegrity(head, state);
+		if (trace) trace.stateFetchMs += Math.max(0, this.monotonicNow() - stateFetchStartedAt);
 		return body.dirty || body.unsettled > 0 || body.pendingLocalUpdates > 0 || body.pins > 0
+			|| (this.bodies.coordinator.snapshot(body.bodyId)?.leaseCount ?? 0) > 0
 			? this.bodies.mergeFromServer(body.bodyId, state.encodedState, state.generation)
 			: this.bodies.replaceFromServer(body.bodyId, state.encodedState, state.generation);
 	}
@@ -3223,22 +3642,68 @@ export class VaultSync implements SyncRuntimePort {
 	private async handleDurableBodyCommitted(
 		notification: BodyCommittedNotification,
 	): Promise<void> {
-		await this.workScheduler.queueBodyWake(
-			notification.bodyId,
-			notification.durableGeneration,
-			"background",
-		);
-		await this.workScheduler.whenIdle();
 		const callback = this.options.onDurableBodyCommitted;
-		if (!callback) return;
-		try {
-			await callback(notification);
-		} catch (error) {
-			this.log(`durable body settlement scheduling failed: ${String(error)}`);
+		if (callback) {
+			try {
+				await callback(notification);
+			} catch (error) {
+				this.log(`durable body settlement scheduling failed: ${String(error)}`);
+			}
+			return;
+		}
+		const session = this.sessions.get(notification.bodyId);
+		if (!session || !session.provider.synced || !session.provider.wsconnected
+			|| session.provider.ws?.readyState !== 1) {
+			await this.workScheduler.queueBodyWake(
+				notification.bodyId,
+				notification.durableGeneration,
+				"background",
+			);
+			await this.workScheduler.whenIdle();
 		}
 	}
 
-	private handleVaultControl(payload: string, expectedDocumentId: string): void {
+	private handleBodySessionCommitted(session: BodySession, notification: BodyCommittedNotification): void {
+		const socketSession = this.socketSessions.get(session.provider);
+		if (this.sessions.get(session.bodyId) !== session
+			|| notification.bodyId !== session.bodyId
+			|| notification.vaultGeneration !== this.options.vaultGeneration
+			|| !socketSession || notification.runtimeEpoch !== socketSession.runtimeEpoch
+			|| notification.lifecycle !== "active"
+			|| notification.contentHash === undefined || notification.contentHash === null
+			|| notification.size === undefined || notification.size === null) return;
+		if (!session.pendingCommitted
+			|| notification.durableGeneration >= session.pendingCommitted.durableGeneration) {
+			session.pendingCommitted = notification;
+		}
+		if (!session.provider.synced) return;
+		const target = session.pendingCommitted;
+		if (!target) return;
+		session.watermarkWork = session.watermarkWork.catch(() => undefined).then(async () => {
+			if (this.sessions.get(session.bodyId) !== session || !session.provider.synced) return;
+			const current = session.pendingCommitted;
+			if (!current) return;
+			const body = this.bodies.get(session.bodyId);
+			if (!body || body.doc !== session.doc) return;
+			const head: BodyCurrentnessHead = {
+				bodyId: current.bodyId,
+				lifecycle: "active",
+				generation: current.durableGeneration,
+				contentHash: current.contentHash ?? null,
+				size: current.size ?? null,
+			};
+			if (await this.promoteBodyFromCurrentness(body, head)
+				&& session.pendingCommitted === current) session.pendingCommitted = null;
+		}).catch((error) => {
+			this.log(`body watermark persistence failed for ${session.bodyId}: ${String(error)}`);
+		});
+	}
+
+	private handleVaultControl(
+		payload: string,
+		expectedDocumentId: string,
+		provider: SyncProviderPort,
+	): void {
 		let frame: VaultControlFrame | null;
 		try {
 			frame = parseVaultControlFrame(payload);
@@ -3249,16 +3714,24 @@ export class VaultSync implements SyncRuntimePort {
 		if (frame.type === "VAULT_READY") {
 			if (frame.documentId !== expectedDocumentId
 				|| frame.vaultGeneration !== this.options.vaultGeneration) {
+				this.invalidateSocketSession(provider);
 				frame = { type: "VAULT_ERROR", message: "ready socket authority mismatch" };
 			} else {
+				const current = this.socketSessions.get(provider);
+				if (current?.id !== frame.socketSessionId) this.invalidateSocketSession(provider);
+				const session = current?.id === frame.socketSessionId
+					? current
+					: Object.freeze({
+						id: frame.socketSessionId,
+						runtimeEpoch: frame.runtimeEpoch,
+						capabilities: frame.capabilities,
+					});
+				this.socketSessions.set(provider, session);
 				this.socketLiveness.ready(expectedDocumentId, frame.liveness, frame.runtimeEpoch);
 				this.backpressureLevel = 0;
 				this.submissionPausedUntil = 0;
 				if (frame.documentId === ROOT_DOCUMENT_ID) {
 					this._rootGeneration = Math.max(this._rootGeneration, frame.durableGeneration);
-				} else {
-					const body = this.bodies.get(frame.documentId);
-					if (body) body.generation = Math.max(body.generation, frame.durableGeneration);
 				}
 			}
 		} else if (frame.type === "VAULT_PONG") {

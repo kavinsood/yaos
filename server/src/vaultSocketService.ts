@@ -12,8 +12,11 @@ import {
 import { safeBlobPath } from "./shared/vaultPath";
 import { isCanonicalVaultId } from "./vaultId";
 import {
+	SOCKET_CONTROL_CAPABILITIES,
 	SOCKET_LIVENESS_DESCRIPTOR,
+	parseBodyCurrentnessQueryFrame,
 	parseVaultPingFrame,
+	type BodyCurrentnessHead,
 } from "./shared/socketLiveness";
 import { validateFrontmatterSemanticRoots } from "./shared/frontmatterSemanticValidation";
 
@@ -172,6 +175,8 @@ export interface SocketServiceOptions {
 	vaultGeneration: () => string;
 	runtimeEpoch: string;
 	isActiveBody: (bodyId: string) => boolean;
+	currentBodyHead: (bodyId: string) => (BodyCurrentnessHead & { sequence: number }) | null;
+	currentSequence: () => number;
 	isDeviceRevoked(deviceId: string): boolean;
 	scheduleFlush: (documentId: string) => void;
 }
@@ -247,10 +252,12 @@ export class VaultSocketService {
 		this.sendControl(server, {
 			type: "VAULT_READY",
 			documentId,
+			socketSessionId: attachment.socketId,
 			vaultGeneration: attachment.vaultGeneration,
 			durableGeneration: loaded.generation,
 			runtimeEpoch: attachment.runtimeEpoch,
 			liveness: SOCKET_LIVENESS_DESCRIPTOR,
+			capabilities: SOCKET_CONTROL_CAPABILITIES,
 		});
 		return this.options.sockets.upgradeResponse(client);
 	}
@@ -283,13 +290,43 @@ export class VaultSocketService {
 			try { value = JSON.parse(message.slice(6)); }
 			catch { return; }
 			const ping = parseVaultPingFrame(value);
-			if (!ping) return;
+			if (ping) {
+				this.sendControl(socket, {
+					type: "VAULT_PONG",
+					probeId: ping.probeId,
+					documentId: attachment.documentId,
+					vaultGeneration: attachment.vaultGeneration,
+					runtimeEpoch: attachment.runtimeEpoch,
+				});
+				return;
+			}
+			const query = parseBodyCurrentnessQueryFrame(value);
+			if (!query) return;
+			if (attachment.kind === "body"
+				&& (query.bodyIds.length !== 1 || query.bodyIds[0] !== attachment.documentId)) {
+				socket.close(1008, "body currentness query authority mismatch");
+				return;
+			}
+			const heads: BodyCurrentnessHead[] = [];
+			const missingBodyIds: string[] = [];
+			for (const bodyId of query.bodyIds) {
+				const head = this.options.currentBodyHead(bodyId);
+				if (head) heads.push({
+					bodyId: head.bodyId,
+					lifecycle: head.lifecycle,
+					generation: head.generation,
+					contentHash: head.contentHash,
+					size: head.size,
+				});
+				else missingBodyIds.push(bodyId);
+			}
 			this.sendControl(socket, {
-				type: "VAULT_PONG",
-				probeId: ping.probeId,
-				documentId: attachment.documentId,
-				vaultGeneration: attachment.vaultGeneration,
-				runtimeEpoch: attachment.runtimeEpoch,
+				type: "BODY_CURRENTNESS_RESULT",
+				queryId: query.queryId,
+				socketSessionId: attachment.socketId,
+				vaultSequence: this.options.currentSequence(),
+				heads,
+				missingBodyIds,
 			});
 			return;
 		}
@@ -342,12 +379,17 @@ export class VaultSocketService {
 		}
 	}
 
-	notifyBodyCommitted(bodyId: string, durableGeneration: number): void {
+	notifyBodyCommitted(bodyId: string, durableGeneration: number, vaultSequence: number): void {
+		const head = this.options.currentBodyHead(bodyId);
 		const value = {
 			type: "BODY_COMMITTED",
 			bodyId,
 			vaultGeneration: this.options.vaultGeneration(),
 			durableGeneration,
+			vaultSequence,
+			lifecycle: head?.lifecycle ?? "reaped",
+			contentHash: head?.contentHash ?? null,
+			size: head?.size ?? null,
 			runtimeEpoch: this.options.runtimeEpoch,
 		};
 		for (const socket of this.options.sockets.sockets()) {

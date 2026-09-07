@@ -210,6 +210,81 @@ s.test("feed pages collapse repeated body and catalog work to latest durable sta
 	assert.deepEqual(page.bodyGenerations.get("body-b"), { generation: 4, kind: "body" });
 });
 
+s.test("body-only feed catch-up batches state and skips root settlement", async () => {
+	const makeBody = async (bodyId: string, path: string, content: string, generation: number) => {
+		const doc = new Y.Doc({ guid: bodyId });
+		doc.getText("body").insert(0, content);
+		const encodedState = Y.encodeStateAsUpdate(doc);
+		doc.destroy();
+		return {
+			head: {
+				bodyId, fileId: bodyId, path, generation,
+				contentHash: await canonicalMarkdownHash(content),
+				size: new TextEncoder().encode(content).byteLength,
+				lifecycle: "active" as const,
+			},
+			state: { bodyId, generation, encodedState },
+		};
+	};
+	const first = await makeBody("batch-a", "Batch A.md", "first", 2);
+	const second = await makeBody("batch-b", "Batch B.md", "second", 3);
+	const documents = new Map<string, StoredDocument>();
+	let progress: StoredBootstrapProgress = {
+		bootstrapId: "batch-bootstrap", highWater: 0, nextCatalogCursor: null,
+		stage: "complete", settledBodies: 0, totalBodies: 2, feedCursor: 0,
+	};
+	const materialized = new Map<string, string>();
+	const database = {
+		getBootstrapProgress: async () => progress,
+		putBootstrapProgress: async (next: StoredBootstrapProgress) => { progress = { ...next }; },
+		putFeedCursor: async () => {},
+		getDocument: async (bodyId: string) => documents.get(bodyId) ?? null,
+		putDocument: async (document: StoredDocument) => { documents.set(document.documentId, document); },
+		deleteDocument: async (bodyId: string) => { documents.delete(bodyId); },
+		getOutstanding: async () => null,
+		putOutstanding: async () => {}, deleteOutstanding: async () => {}, listOutstanding: async () => [],
+		getMaterializedPath: async (bodyId: string) => materialized.get(bodyId) ?? null,
+		setMaterializedPath: async (bodyId: string, path: string) => { materialized.set(bodyId, path); },
+		setMaterializedPaths: async () => {}, deleteMaterializedPath: async () => {}, listMaterializedPaths: async () => [],
+	};
+	let page = 0;
+	let rootSettlements = 0;
+	let batches = 0;
+	const heads = new Map([[first.head.bodyId, first.head], [second.head.bodyId, second.head]]);
+	const server = {
+		changesAfter: async () => page++ === 0
+			? {
+				entries: [
+					{ sequence: 1, documentId: first.head.bodyId, generation: 2, kind: "body" },
+					{ sequence: 2, documentId: second.head.bodyId, generation: 3, kind: "body" },
+				],
+				currentHighWater: 2,
+				resetRequired: false,
+			}
+			: { entries: [], currentHighWater: 2, resetRequired: false },
+		settleRootThrough: async () => { rootSettlements++; },
+		catchUpBodies: async (requests: Array<{ bodyId: string }>) => {
+			batches++;
+			assert.deepEqual(requests.map((request) => request.bodyId).sort(), ["batch-a", "batch-b"]);
+			return new Map([[first.head.bodyId, first], [second.head.bodyId, second]]);
+		},
+		currentHead: async (bodyId: string) => heads.get(bodyId) ?? null,
+	};
+	const writes: string[] = [];
+	const disk = {
+		settleBody: async ({ path }: { path: string }) => { writes.push(path); return "settled" as const; },
+		moveBodies: async () => {}, deleteBody: async () => "deleted" as const,
+	};
+	const bodies = new BodyManager(database);
+	const client = new BootstrapClient(server as never, database as never, bodies, disk);
+	await client.run();
+	assert.equal(batches, 1);
+	assert.equal(rootSettlements, 0);
+	assert.deepEqual(writes.sort(), ["Batch A.md", "Batch B.md"]);
+	assert.equal(progress.feedCursor, 2);
+	await bodies.destroy();
+});
+
 s.test("verified body-only agreement creates a restart-safe component base", async () => {
 	const bodyId = "body-common-base";
 	const path = "notes/common.md";

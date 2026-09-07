@@ -72,6 +72,11 @@ export interface ClientBodyState {
 	encodedState: Uint8Array;
 }
 
+export interface ClientCatchUpBody {
+	head: ClientCatalogEntry & { lifecycle: "active" | "tombstoned" | "reaped" };
+	state: ClientBodyState | null;
+}
+
 export interface ClientFeedEntry {
 	sequence: number;
 	documentId: string;
@@ -95,6 +100,7 @@ export interface BootstrapServerPort {
 	currentHeads(cursor: string | null, limit: number): Promise<ClientCatalogPage>;
 	currentHead(bodyId: string): Promise<ClientCatalogEntry | null>;
 	currentBody(bodyId: string): Promise<ClientBodyState>;
+	catchUpBodies?(requests: Array<{ bodyId: string; generation: number; contentHash?: string | null }>): Promise<Map<string, ClientCatchUpBody>>;
 	settleRootThrough(sequence: number): Promise<void>;
 }
 export interface BootstrapDatabasePort {
@@ -418,6 +424,70 @@ export class BootstrapHttpPort implements BootstrapServerPort {
 		};
 	}
 
+	async catchUpBodies(
+		requests: Array<{ bodyId: string; generation: number; contentHash?: string | null }>,
+	): Promise<Map<string, ClientCatchUpBody>> {
+		if (requests.length === 0) return new Map();
+		const response = await this.request({
+			url: this.route("catch-up"),
+			method: "POST",
+			headers: this.headers(),
+			contentType: "application/json",
+			body: JSON.stringify({ bodies: requests }),
+		});
+		if (response.status === 413 && requests.length > 1) {
+			const midpoint = Math.ceil(requests.length / 2);
+			const [left, right] = await Promise.all([
+				this.catchUpBodies(requests.slice(0, midpoint)),
+				this.catchUpBodies(requests.slice(midpoint)),
+			]);
+			return new Map([...left, ...right]);
+		}
+		if (response.status !== 200 || !response.json || typeof response.json !== "object") {
+			throw new Error(`body catch-up request failed (${response.status})`);
+		}
+		const raw = response.json as { bodies?: unknown };
+		if (!Array.isArray(raw.bodies) || raw.bodies.length !== requests.length) {
+			throw new Error("body catch-up response count mismatch");
+		}
+		const expected = new Set(requests.map((request) => request.bodyId));
+		const results = new Map<string, ClientCatchUpBody>();
+		for (const value of raw.bodies) {
+			if (!value || typeof value !== "object" || Array.isArray(value)) {
+				throw new Error("invalid body catch-up result");
+			}
+			const entry = value as Record<string, unknown>;
+			if (typeof entry.bodyId !== "string" || !expected.has(entry.bodyId) || results.has(entry.bodyId)) {
+				throw new Error("body catch-up response identity mismatch");
+			}
+			if (entry.status === 409) continue;
+			if ((entry.status !== 200 && entry.status !== 304)
+				|| entry.fileId !== entry.bodyId || typeof entry.path !== "string"
+				|| entry.lifecycle !== "active" || !Number.isSafeInteger(entry.generation)
+				|| typeof entry.contentHash !== "string" || !/^[a-f0-9]{64}$/.test(entry.contentHash)
+				|| !Number.isSafeInteger(entry.size)) throw new Error("invalid body catch-up metadata");
+			const head: ClientCatchUpBody["head"] = {
+				bodyId: entry.bodyId,
+				fileId: entry.fileId,
+				path: entry.path,
+				generation: entry.generation as number,
+				contentHash: entry.contentHash,
+				size: entry.size as number,
+				previousPath: typeof entry.previousPath === "string" ? entry.previousPath : null,
+				lifecycle: "active",
+			};
+			const state = entry.status === 200
+				? {
+					bodyId: entry.bodyId,
+					generation: entry.generation as number,
+					encodedState: decodeBase64UrlBytes(typeof entry.update === "string" ? entry.update : ""),
+				}
+				: null;
+			results.set(entry.bodyId, { head, state });
+		}
+		return results;
+	}
+
 	async settleRootThrough(sequence: number): Promise<void> {
 		const response = await this.raw(`root?through=${sequence}`);
 		await this.database.putDocument({
@@ -637,7 +707,9 @@ export class BootstrapClient {
 			if (page.entries.length === 0) break;
 
 			const coalesced = coalesceFeedPage(page.entries);
-			await this.server.settleRootThrough(coalesced.throughSequence);
+			if (page.entries.some((entry) => entry.documentId === "root")) {
+				await this.server.settleRootThrough(coalesced.throughSequence);
+			}
 			try {
 				await this.applyCatalogEvents(progress, coalesced.catalogs);
 			} catch (error) {
@@ -652,12 +724,7 @@ export class BootstrapClient {
 				}
 			}
 
-			await runBounded(
-				[...coalesced.bodyGenerations],
-				this.materializeConcurrency,
-				async ([bodyId, change]) =>
-					this.settleFeedBody(progress, bodyId, change.generation, change.kind),
-			);
+			await this.settleFeedBodies(progress, coalesced.bodyGenerations);
 			progress.feedCursor = coalesced.throughSequence;
 			await this.persistFeedProgress(progress);
 			if (progress.feedCursor >= page.currentHighWater && page.entries.length < PAGE_SIZE) break;
@@ -666,6 +733,45 @@ export class BootstrapClient {
 		await this.database.putBootstrapProgress(progress);
 		this.emitProgress(progress);
 		return progress;
+	}
+
+	private async settleFeedBodies(
+		progress: StoredBootstrapProgress,
+		changes: ReadonlyMap<string, { generation: number; kind: string }>,
+	): Promise<void> {
+		const pending: Array<{ bodyId: string; generation: number; contentHash?: string | null }> = [];
+		for (const [bodyId, change] of changes) {
+			const [local, outstanding] = await Promise.all([
+				this.database.getDocument(bodyId),
+				this.database.getOutstanding(bodyId),
+			]);
+			if (change.kind === "body" && !outstanding && local && !local.dirty
+				&& local.generation >= change.generation) continue;
+			pending.push({
+				bodyId,
+				generation: outstanding
+					? Math.max(0, (local?.generation ?? 0) - 1)
+					: (local?.generation ?? 0),
+			});
+		}
+		if (pending.length === 0) return;
+		if (!this.server.catchUpBodies) {
+			await runBounded(pending, this.materializeConcurrency, async (request) => {
+				const change = changes.get(request.bodyId)!;
+				await this.settleFeedBody(progress, request.bodyId, change.generation, change.kind);
+			});
+			return;
+		}
+		const caught = await this.server.catchUpBodies(pending);
+		await runBounded(pending, this.materializeConcurrency, async (request) => {
+			const result = caught.get(request.bodyId);
+			if (!result) {
+				await this.settleMissingHead(request.bodyId, changes.get(request.bodyId)!.generation);
+				return;
+			}
+			if (!result.state) return;
+			await this.materializeCurrentEntry(progress, result.head, result.state);
+		});
 	}
 
 	private async settleFeedBody(
@@ -744,8 +850,7 @@ export class BootstrapClient {
 			);
 		}
 		await runBounded(active, this.materializeConcurrency, async (catalog) => {
-			const head = await this.server.currentHead(catalog.bodyId);
-			if (head) await this.materializeEntry(progress, head);
+			await this.materializeEntry(progress, catalog);
 		});
 	}
 
@@ -816,6 +921,17 @@ export class BootstrapClient {
 		);
 	}
 
+	private materializeCurrentEntry(
+		progress: StoredBootstrapProgress,
+		entry: ClientCatalogEntry,
+		provided?: ClientBodyState,
+	): Promise<boolean> {
+		return this.runBodyWork(
+			[entry.bodyId],
+			() => this.materializeEntryFenced(progress, entry, provided, true),
+		);
+	}
+
 	private async runBodyWork<T>(
 		bodyIds: readonly string[],
 		work: () => Promise<T>,
@@ -842,11 +958,14 @@ export class BootstrapClient {
 		progress: StoredBootstrapProgress,
 		initial: ClientCatalogEntry,
 		provided?: ClientBodyState,
+		initialIsCurrent = false,
 	): Promise<boolean> {
 		let expected = initial;
 		let supplied = provided;
 		for (let attempt = 0; attempt < 12; attempt++) {
-			const head = await this.server.currentHead(expected.bodyId);
+			const head = attempt === 0 && initialIsCurrent
+				? expected
+				: await this.server.currentHead(expected.bodyId);
 			if (!head) {
 				await this.settleMissingHead(expected.bodyId, expected.generation);
 				return true;

@@ -30,6 +30,7 @@ const PERSIST_RETRY_MS = 1_000;
 const JOURNAL_COMPACT_ENTRIES = 50;
 const JOURNAL_COMPACT_BYTES = 1024 * 1024;
 const FEED_RETAIN_SEQUENCES = 1000;
+const CATCH_UP_YIELD_INTERVAL = 4;
 const INTERNAL_DEVICE_HEADER = "x-yaos-device-id";
 const INTERNAL_GENERATION_HEADER = "x-yaos-vault-generation";
 
@@ -141,6 +142,18 @@ export class VaultRuntime implements DrainPort {
 			vaultGeneration,
 			runtimeEpoch: this.runtimeEpoch,
 			isActiveBody: (bodyId) => this.lifecycle?.activeBodyHead(bodyId) !== null,
+			currentBodyHead: (bodyId) => {
+				const head = this.store.getCatalogHeadAt(this.store.currentSequence(), bodyId);
+				return head ? {
+					bodyId: head.bodyId,
+					lifecycle: head.lifecycle,
+					generation: head.generation,
+					contentHash: head.contentHash,
+					size: head.size,
+					sequence: head.sequence,
+				} : null;
+			},
+			currentSequence: () => this.store.currentSequence(),
 			isDeviceRevoked: (deviceId) => this.store.isDeviceRevoked(deviceId),
 			scheduleFlush: (documentId) => this.scheduleFlush(documentId),
 		});
@@ -367,20 +380,58 @@ export class VaultRuntime implements DrainPort {
 		}
 		const requestedBodies: unknown[] = input.bodies;
 		const bodies: unknown[] = [];
+		const requestedBodyIds = new Set<string>();
+		let reconstructedBodies = 0;
 		for (const item of requestedBodies) {
 			if (typeof item !== "object" || item === null || Array.isArray(item)) {
 				return json({ error: "invalid_catch_up_batch" }, 400);
 			}
 			const bodyId = "bodyId" in item && typeof item.bodyId === "string" ? item.bodyId : "";
+			if (!bodyId || bodyId.length > MAX_BODY_ID_LENGTH || !/^[A-Za-z0-9_-]+$/.test(bodyId)
+				|| requestedBodyIds.has(bodyId)
+				|| ("generation" in item && item.generation !== undefined
+					&& (!Number.isSafeInteger(item.generation) || (item.generation as number) < 0))
+				|| ("contentHash" in item && item.contentHash !== undefined && item.contentHash !== null
+					&& (typeof item.contentHash !== "string" || !/^[a-f0-9]{64}$/.test(item.contentHash)))) {
+				return json({ error: "invalid_catch_up_batch" }, 400);
+			}
+			requestedBodyIds.add(bodyId);
 			const head = this.lifecycle.activeBodyHead(bodyId);
 			if (!head) { bodies.push({ bodyId, status: 409, error: "body_not_active" }); continue; }
+			const knownGeneration = "generation" in item && Number.isSafeInteger(item.generation)
+				? item.generation as number
+				: null;
+			const knownContentHash = "contentHash" in item && typeof item.contentHash === "string"
+				? item.contentHash
+				: null;
+			const metadata = {
+				bodyId,
+				fileId: head.fileId,
+				path: head.path,
+				previousPath: head.previousPath,
+				lifecycle: head.lifecycle,
+				generation: head.generation,
+				contentHash: head.contentHash,
+				size: head.size,
+			};
+			if (knownGeneration === head.generation
+				&& (knownContentHash === null || knownContentHash === head.contentHash)) {
+				bodies.push({ ...metadata, status: 304 });
+				continue;
+			}
+			let reconstructedThisBody = false;
 			try {
 				const reconstructed = this.store.reconstructDocument(bodyId);
 				const update = Y.encodeStateAsUpdate(reconstructed.doc);
 				reconstructed.doc.destroy();
-				bodies.push({ bodyId, status: 200, generation: reconstructed.generation, contentHash: head.contentHash,
-					size: head.size, update: bytesToBase64Url(update) });
+				bodies.push({ ...metadata, status: 200, generation: reconstructed.generation,
+					update: bytesToBase64Url(update) });
+				reconstructedBodies++;
+				reconstructedThisBody = true;
 			} catch { bodies.push({ bodyId, status: 500, error: "body_state_corrupt" }); }
+			if (reconstructedThisBody && reconstructedBodies % CATCH_UP_YIELD_INTERVAL === 0) {
+				await new Promise<void>((resolve) => setTimeout(resolve, 0));
+			}
 		}
 		const response = JSON.stringify({ bodies, highWater: this.store.currentSequence() });
 		if (new TextEncoder().encode(response).byteLength > MAX_CATCH_UP_BYTES) return json({ error: "catch_up_response_too_large" }, 413);
@@ -565,7 +616,10 @@ export class VaultRuntime implements DrainPort {
 		if (this.scheduledFlushes.has(documentId)) return;
 		const scheduled = new Promise<void>((resolve) => setTimeout(resolve, PERSIST_DEBOUNCE_MS))
 			.then(async () => { await this.flushDocument(documentId); })
-			.finally(() => this.scheduledFlushes.delete(documentId));
+			.finally(() => {
+				this.scheduledFlushes.delete(documentId);
+				if (this.cache.pendingFor(documentId).length > 0) this.scheduleFlush(documentId);
+			});
 		this.scheduledFlushes.set(documentId, scheduled);
 		this.options.execution.waitUntil(scheduled);
 	}
@@ -578,13 +632,16 @@ export class VaultRuntime implements DrainPort {
 			if (entries.length === 0) return;
 			let processed = 0;
 			try {
-				for (const entry of entries) {
-					const catalog = documentId === "root" ? undefined : await this.catalogForLoadedBody(documentId);
-					const commit = this.store.commitUpdate({ documentId, update: entry.bytes, kind: documentId === "root" ? "root" : "body", catalog });
-					processed++;
-					const loaded = this.cache.get(documentId);
-					if (loaded) loaded.generation = commit.generation;
-					if (documentId !== "root") this.sockets.notifyBodyCommitted(documentId, commit.generation);
+				const update = entries.length === 1
+					? entries[0]!.bytes
+					: Y.mergeUpdates(entries.map((entry) => entry.bytes));
+				const catalog = documentId === "root" ? undefined : await this.catalogForUpdate(documentId, update);
+				const commit = this.store.commitUpdate({ documentId, update, kind: documentId === "root" ? "root" : "body", catalog });
+				processed = entries.length;
+				const loaded = this.cache.get(documentId);
+				if (loaded) loaded.generation = commit.generation;
+				if (documentId !== "root") {
+					this.sockets.notifyBodyCommitted(documentId, commit.generation, commit.vaultSequence);
 				}
 				this.persistence.set(documentId, { status: "healthy", lastError: null, lastSuccessAt: Date.now(), failures: this.persistence.get(documentId)?.failures ?? 0 });
 			} catch (error) {
@@ -601,13 +658,18 @@ export class VaultRuntime implements DrainPort {
 		return success;
 	}
 
-	private async catalogForLoadedBody(bodyId: string): Promise<CatalogMutation | undefined> {
-		const loaded = this.cache.get(bodyId);
+	private async catalogForUpdate(bodyId: string, update: Uint8Array): Promise<CatalogMutation | undefined> {
 		const current = this.lifecycle.activeBodyHead(bodyId);
-		if (!loaded || !current) return undefined;
-		const content = canonicalMarkdownBytes(Y.Text.prototype.toString.call(loaded.doc.getText("body")));
-		return { bodyId, fileId: current.fileId, path: current.path, previousPath: null, lifecycle: "active",
-			bodyGeneration: (this.store.documentHead(bodyId)?.generation ?? 0) + 1, contentHash: await sha256Hex(content), size: content.byteLength };
+		if (!current) return undefined;
+		const reconstructed = this.store.reconstructDocument(bodyId);
+		try {
+			Y.applyUpdate(reconstructed.doc, update, "flush-metadata");
+			const content = canonicalMarkdownBytes(Y.Text.prototype.toString.call(reconstructed.doc.getText("body")));
+			return { bodyId, fileId: current.fileId, path: current.path, previousPath: null, lifecycle: "active",
+				bodyGeneration: reconstructed.generation + 1, contentHash: await sha256Hex(content), size: content.byteLength };
+		} finally {
+			reconstructed.doc.destroy();
+		}
 	}
 
 	private maintain(documentId: string): void {

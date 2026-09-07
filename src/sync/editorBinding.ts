@@ -1482,6 +1482,7 @@ export class EditorBindingManager {
 					return;
 				}
 				this.bind(view, deviceName);
+				this.vaultSync.completeEditorBodyBinding?.(leafId);
 			},
 			(error: unknown) => {
 				const current = this.pendingBodyLoads.get(leafId);

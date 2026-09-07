@@ -34,6 +34,10 @@ export interface BodyCommittedNotification {
 	vaultGeneration: string;
 	durableGeneration: number;
 	runtimeEpoch: string;
+	vaultSequence: number;
+	lifecycle: "active" | "tombstoned" | "reaped";
+	contentHash: string | null;
+	size: number | null;
 }
 
 export type LifecycleKind = "create" | "delete" | "revive" | "rename";

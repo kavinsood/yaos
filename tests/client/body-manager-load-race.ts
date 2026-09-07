@@ -190,4 +190,40 @@ s.test("a single over-budget body is rejected before persistence or retention", 
 	await manager.destroy();
 });
 
+s.test("replacement blocks a projection from claiming the prior document across awaits", async () => {
+	let releaseEviction!: () => void;
+	const evictionGate = new Promise<void>((resolve) => { releaseEviction = resolve; });
+	let evictionStarted!: () => void;
+	const started = new Promise<void>((resolve) => { evictionStarted = resolve; });
+	let gateEviction = false;
+	const costs: Record<string, number> = { target: 5, other: 5 };
+	const manager = new BodyManager({
+		getDocument: async () => null,
+		putDocument: async (document) => {
+			if (gateEviction && document.documentId === "other") {
+				evictionStarted();
+				await evictionGate;
+			}
+		},
+	}, Date.now, {
+		measure: ({ bodyId }) => costs[bodyId]!,
+	}, { estimatedCost: 10 });
+	await manager.replaceFromServer("target", new Uint8Array(encoded("old")), 1);
+	await manager.replaceFromServer("other", new Uint8Array(encoded("other")), 1);
+	gateEviction = true;
+	manager.coordinator.bindPath("Target.md", "target");
+	costs.target = 7;
+	const replacing = manager.replaceFromServer("target", new Uint8Array(encoded("new")), 2);
+	await started;
+	assert.throws(
+		() => manager.coordinator.acquireProjection("Target.md", "target", "editor", "editor-race"),
+		/being replaced or evicted/,
+	);
+	releaseEviction();
+	const result = await replacing;
+	assert.equal(result.doc.getText("body").toString(), "new");
+	assert.equal(result.generation, 2);
+	await manager.destroy();
+});
+
 await s.done();

@@ -108,7 +108,7 @@ export class VaultCandidateService {
 			this.options.sockets().broadcastDocumentUpdate(bodyId, update, request);
 		}
 		this.options.cache.removePendingDigest(bodyId, candidateDigest);
-		this.options.sockets().notifyBodyCommitted(bodyId, durable.durableGeneration);
+		this.options.sockets().notifyBodyCommitted(bodyId, durable.durableGeneration, durable.vaultSequence);
 		return json(this.receipt(durable));
 	}
 
