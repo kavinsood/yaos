@@ -148,6 +148,13 @@ import { setupFlightTraceBestEffort } from "./telemetry/debug/flightTraceControl
 import type { SyncReadPort, TelemetryRuntimeHost } from "./telemetry/telemetryRuntimeHost";
 import type { EngineControlPort, DiskIngestPort } from "./runtime/engineControlPort";
 import type { BindingPropagationGate } from "./sync/editorBinding";
+import { leafIdentity } from "./host/obsidianHostAdapter";
+import {
+	YaosPublicApiService,
+	type YaosPublicApi,
+	type YaosPublicSettlementSummary,
+	type YaosPublicSnapshotInput,
+} from "./publicApi";
 import {
 	OperationalResourceSnapshotTracker,
 	type OperationalResourceSnapshot,
@@ -182,6 +189,8 @@ type PersistedPluginState = Partial<VaultSyncSettings> & {
 };
 
 export default class VaultCrdtSyncPlugin extends Plugin {
+	/** Data-only API for other plugins; consumers reacquire it after `yaos:api-ready`. */
+	api: YaosPublicApi | null = null;
 	settings: VaultSyncSettings = DEFAULT_SETTINGS;
 	private readonly settingsStore = new SettingsStore<PersistedPluginState>({
 		loadData: () => this.loadData(),
@@ -305,6 +314,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private frontmatterGuardCoordinator!: FrontmatterGuardCoordinator;
 	private frontmatterQuarantineEntries: FrontmatterQuarantineEntry[] = [];
 	private bodySettlementRepository: BodySettlementRepository | null = null;
+	private publicApiService: YaosPublicApiService | null = null;
+	private readonly publicSettlementSummaries = new Map<string, YaosPublicSettlementSummary>();
 	private readonly teardownLifecycle = new RuntimeTeardownCoordinator();
 
 	/**
@@ -411,6 +422,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	async onload() {
 		const onloadStartedAt = Date.now();
+		this.installPublicApi();
 
 		// Initialize QA harness state before any component construction so that
 		// registerDiskIngestPort (called from createReconciliationController) and
@@ -1276,6 +1288,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 			this.connectionStateLatch.recover();
 			this.refreshStatusBar();
+			void this.refreshPublicSettlementEvidence();
 			this.trace("trace", "startup-init-sync-complete", {
 				durationMs: Date.now() - initSyncStartedAt,
 			});
@@ -2003,6 +2016,118 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			this.handleIndexedDbDegraded("status-check");
 		}
 		this.updateStatusBar(state);
+		this.publishPublicApiSnapshot();
+	}
+
+	private installPublicApi(): void {
+		const service = new YaosPublicApiService(this.publicApiSnapshotInput());
+		this.publicApiService = service;
+		this.api = service.api;
+		this.app.workspace.trigger("yaos:api-ready");
+	}
+
+	private publishPublicApiSnapshot(): void {
+		if (!this.publicApiService || this.teardownLifecycle.isClosing) return;
+		this.publicApiService.publish(this.publicApiSnapshotInput());
+	}
+
+	private publicApiSnapshotInput(): YaosPublicSnapshotInput {
+		const runtime = this.vaultSync;
+		const preserved = this.collectPreservedUnresolvedEntries();
+		const frontmatter = this.frontmatterQuarantineEntries;
+		if (!runtime) {
+			return {
+				availability: "starting",
+				files: [],
+				counts: {
+					files: 0,
+					residentBodies: 0,
+					pendingSettlements: 0,
+					preservedUnresolved: preserved.length,
+					frontmatterQuarantined: frontmatter.length,
+				},
+			};
+		}
+		let residentBodies = 0;
+		let pendingSettlements = 0;
+		const files = runtime.getActiveMarkdownPaths().sort().flatMap((path) => {
+			const bodyId = runtime.getFileId(path);
+			if (!bodyId) return [];
+			const body = runtime.bodies.coordinator.snapshot(bodyId);
+			if (!body) return [];
+			if (body.residency !== "absent") residentBodies++;
+			const settlement = this.publicSettlementSummaries.get(bodyId)
+				?? this.unknownPublicSettlement(body.synchronization);
+			if (settlement.state === "pending") pendingSettlements++;
+			return [{
+				path,
+				bodyId,
+				body: {
+					contentRevision: body.contentRevision,
+					lifecycleRevision: body.lifecycleRevision,
+					ownershipRevision: body.ownershipRevision,
+					residency: body.residency,
+					projectionOwner: body.projectionOwner,
+					synchronization: body.synchronization,
+					divergence: body.divergence,
+					lifetime: body.lifetime,
+					leaseCount: body.leaseCount,
+				},
+				settlement,
+				conflicts: {
+					preservedUnresolved: preserved.filter((entry) => entry.path === path).length,
+					frontmatterQuarantined: frontmatter.filter((entry) => entry.path === path).length,
+				},
+			}];
+		});
+		return {
+			availability: "ready",
+			files,
+			counts: {
+				files: files.length,
+				residentBodies,
+				pendingSettlements,
+				preservedUnresolved: preserved.length,
+				frontmatterQuarantined: frontmatter.length,
+			},
+		};
+	}
+
+	private unknownPublicSettlement(synchronization: YaosPublicSnapshotInput["files"][number]["body"]["synchronization"]): YaosPublicSettlementSummary {
+		return {
+			state: synchronization === "locally-pending" || synchronization === "durably-pending" ? "pending" : "unknown",
+			durableGeneration: null,
+			localSettlementRevision: null,
+			agreement: "unknown",
+			settledAt: null,
+		};
+	}
+
+	private async refreshPublicSettlementEvidence(): Promise<void> {
+		const runtime = this.vaultSync;
+		const repository = this.bodySettlementRepository;
+		if (!runtime || !repository || this.teardownLifecycle.isClosing) return;
+		const records = await Promise.all(runtime.getActiveMarkdownPaths().map(async (path) => {
+			const bodyId = runtime.getFileId(path);
+			if (!bodyId) return null;
+			const result = await repository.read(bodyId);
+			if (result.kind !== "available") return [bodyId, null] as const;
+			return [bodyId, {
+				state: "settled" as const,
+				durableGeneration: result.settlement.durableGeneration,
+				localSettlementRevision: result.settlement.localSettlementRevision,
+				agreement: result.settlement.format === 1 || result.settlement.agreement === "whole" ? "agreed" as const : "disagreed" as const,
+				settledAt: result.settlement.settledAt,
+			}] as const;
+		}));
+		if (runtime !== this.vaultSync || this.teardownLifecycle.isClosing) return;
+		for (const record of records) {
+			if (!record) continue;
+			const [bodyId, settlement] = record;
+			if (settlement) this.publicSettlementSummaries.set(bodyId, settlement);
+			else this.publicSettlementSummaries.delete(bodyId);
+		}
+		this.publishPublicApiSnapshot();
 	}
 
 	/** Coalesce durable body-candidate receipt updates into one status redraw. */
@@ -2438,7 +2563,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 			probes.push({
 				path,
-				leafId: binding?.leafId ?? view.leaf.id ?? path,
+				leafId: binding?.leafId ?? leafIdentity(view.leaf, path),
 				binding,
 				collab,
 				hashes: {
@@ -2501,6 +2626,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		// Obsidian invokes unload synchronously. Set this gate before any cleanup
 		// so a late init continuation cannot attach a replacement runtime.
 		this.teardownLifecycle.requestPermanentShutdown();
+		this.publicApiService?.dispose();
+		this.publicApiService = null;
+		this.api = null;
 		this.snapshotService?.destroy();
 		this.log("Unloading plugin");
 		this.lab?.dispose();   // dispose stops the flight trace and QA API
