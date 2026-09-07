@@ -1,4 +1,5 @@
 import { BoundedBodyError, readBoundedBytes } from "./readBoundedBytes";
+import { decodeBinaryEnvelope, encodeBinaryEnvelope, YAOS_BINARY_CONTENT_TYPE } from "./shared/binaryEnvelope";
 import {
 	RECOVERY_PUBLIC_RPC_HEADER,
 	RECOVERY_PUBLIC_RPC_PATH,
@@ -61,25 +62,25 @@ const PUBLIC_METHODS: Record<PublicRecoveryRpcMethod, true> = {
 };
 
 function response(envelope: RecoveryRpcResponse, status = 200): Response {
-	const body = JSON.stringify(envelope);
-	if (new TextEncoder().encode(body).byteLength > RECOVERY_RPC_MAX_JSON_BYTES) {
-		return Response.json(
-			{ ok: false, error: { code: "recovery_rpc_failed", message: "recovery RPC response too large" } },
-			{ status: 413, headers: { "cache-control": "no-store" } },
-		);
+	let body: Uint8Array;
+	try {
+		body = encodeBinaryEnvelope(envelope, RECOVERY_RPC_MAX_JSON_BYTES);
+	} catch {
+		body = encodeBinaryEnvelope({ ok: false, error: { code: "recovery_rpc_failed", message: "recovery RPC response too large" } });
+		status = 413;
 	}
-	return new Response(body, {
+	return new Response(body.slice().buffer, {
 		status,
-		headers: { "content-type": "application/json", "cache-control": "no-store" },
+		headers: { "content-type": YAOS_BINARY_CONTENT_TYPE, "cache-control": "no-store" },
 	});
 }
 
 async function readEnvelope(request: Request): Promise<RecoveryRpcRequest> {
-	if (!request.headers.get("content-type")?.toLowerCase().startsWith("application/json")) {
-		throw new Error("JSON required");
+	if (!request.headers.get("content-type")?.toLowerCase().startsWith(YAOS_BINARY_CONTENT_TYPE)) {
+		throw new Error("YAOS binary envelope required");
 	}
 	const bytes = await readBoundedBytes(request, RECOVERY_RPC_MAX_JSON_BYTES);
-	const decoded: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes));
+	const decoded = decodeBinaryEnvelope(bytes, RECOVERY_RPC_MAX_JSON_BYTES);
 	if (!decoded || typeof decoded !== "object" || Array.isArray(decoded)
 		|| Object.keys(decoded).length !== 2 || !("method" in decoded) || !("params" in decoded)
 		|| typeof decoded.method !== "string" || decoded.method.length === 0 || decoded.method.length > 128) {

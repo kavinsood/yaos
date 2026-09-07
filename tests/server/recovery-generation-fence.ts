@@ -21,6 +21,11 @@ import {
 	ACTOR_ROLE_HEADER,
 } from "../../server/src/vaultAuthority";
 import { suite } from "../harness.ts";
+import {
+	decodeBinaryEnvelope,
+	encodeBinaryEnvelope,
+	YAOS_BINARY_CONTENT_TYPE,
+} from "../../server/src/shared/binaryEnvelope";
 
 const s = suite("recovery-generation-fence");
 const vaultId = "vault-fence-aa";
@@ -54,12 +59,20 @@ function rpcRequest(
 	return new Request(`https://internal${path}`, {
 		method: "POST",
 		headers: {
-			"content-type": "application/json",
+			"content-type": YAOS_BINARY_CONTENT_TYPE,
 			[header]: "1",
 			"x-yaos-vault-generation": generation,
 		},
-		body: JSON.stringify({ method, params }),
+		body: encodeBinaryEnvelope({ method, params }).slice().buffer,
 	});
+}
+
+async function decodedResponse(response: Response | null | undefined): Promise<Record<string, unknown> | undefined> {
+	if (!response) return undefined;
+	if (!response.headers.get("content-type")?.startsWith(YAOS_BINARY_CONTENT_TYPE)) {
+		throw new Error("recovery RPC response was not a binary envelope");
+	}
+	return decodeBinaryEnvelope(new Uint8Array(await response.arrayBuffer())) as Record<string, unknown>;
 }
 
 function recoveryStore(metadata: { vaultId: string; vaultGeneration: string }): RecoveryRpcStorePort {
@@ -130,7 +143,7 @@ s.test("projection work dispatches only with exact generation and private header
 		store,
 		service,
 	);
-	const envelope = await accepted?.json() as { ok?: boolean; result?: { terminal?: boolean } } | undefined;
+	const envelope = await decodedResponse(accepted) as { ok?: boolean; result?: { terminal?: boolean } } | undefined;
 	if (wrongHeader?.status !== 404 || accepted?.status !== 200 || envelope?.ok !== true
 		|| envelope.result?.terminal !== true || dispatchedGeneration !== vaultGeneration || calls !== 1) {
 		throw new Error("projection generation/header fence changed");
@@ -152,7 +165,7 @@ s.test("vault identity mismatch is indistinguishable from a stale generation", a
 		store,
 		service,
 	);
-	const body = await response?.json() as { error?: { message?: string } } | undefined;
+	const body = await decodedResponse(response) as { error?: { message?: string } } | undefined;
 	if (response?.status !== 404 || body?.error?.message !== "not found" || calls !== 0) {
 		throw new Error("vault identity mismatch leaked or dispatched");
 	}
@@ -163,7 +176,9 @@ s.test("public recovery authority forwards the exact authenticated actor", async
 	const authority = new ActorRecoveryRouteAuthority({
 		async call(name, request) {
 			calls.push({ actorName: name, request });
-			return Response.json({ ok: true, result: null });
+			return new Response(encodeBinaryEnvelope({ ok: true, result: null }).slice().buffer, {
+				headers: { "content-type": YAOS_BINARY_CONTENT_TYPE },
+			});
 		},
 	}, vaultId, vaultId, vaultGeneration, {
 		vaultId,
@@ -197,7 +212,10 @@ s.test("public recovery authority forwards the exact authenticated actor", async
 	for (const [name, value] of expected) {
 		if (headers.get(name) !== value) throw new Error(`public recovery actor header ${name} was not exact`);
 	}
-	const body = await forwarded.request.json() as { method?: string };
+	if (!forwarded.request.headers.get("content-type")?.startsWith(YAOS_BINARY_CONTENT_TYPE)) {
+		throw new Error("public recovery request did not use the binary envelope content type");
+	}
+	const body = decodeBinaryEnvelope(new Uint8Array(await forwarded.request.arrayBuffer())) as { method?: string };
 	if (body.method !== "getRecoveryStatus") throw new Error("public recovery method changed in forwarding");
 });
 

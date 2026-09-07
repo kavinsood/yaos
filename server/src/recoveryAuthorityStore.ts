@@ -1,5 +1,5 @@
 import { canonicalJsonText } from "./recoveryCanonicalJson";
-import { decodeSqlChunks } from "./vaultDocumentStore";
+import { decodeSqlChunks, type DurableChunkValue } from "./vaultDocumentStore";
 import { DEFAULT_SOFT_TTL_MS, VaultBootstrapStore } from "./vaultBootstrapStore";
 import type { BodyLifecycle } from "./vaultCatalogStore";
 
@@ -646,7 +646,7 @@ export class RecoveryAuthorityStore extends VaultBootstrapStore {
 		const checkpointSequence = checkpoint?.checkpoint_sequence ?? 0;
 		let encodedHistoryBytes = 0;
 		if (checkpoint) {
-			const chunks = this.storage.sql.exec<{ data: string }>(
+			const chunks = this.storage.sql.exec<{ data: DurableChunkValue }>(
 				"SELECT data FROM vault_checkpoints WHERE document_id = ? AND checkpoint_sequence = ? ORDER BY chunk_index",
 				bodyId,
 				checkpointSequence,
@@ -694,7 +694,7 @@ export class RecoveryAuthorityStore extends VaultBootstrapStore {
 	}
 
 	rawRecipeChunk(recipeId: string, cursor: string, maxBytes: number): {
-		parts: Array<{ kind: "checkpoint" | "journal"; sequence: number; update: Uint8Array }>;
+		parts: Array<{ kind: "checkpoint" | "journal"; sequence: number; fragmentIndex: number; fragmentCount: number; bytes: Uint8Array }>;
 		nextCursor: string | null;
 		encodedBytes: number;
 	} {
@@ -708,64 +708,7 @@ export class RecoveryAuthorityStore extends VaultBootstrapStore {
 		if (!recipe) throw new Error("recipe not found");
 		const capture = this.recoveryCapture(recipe.capture_id);
 		if (!capture) throw new Error("capture not found");
-		const checkpoint = this.storage.sql.exec<{ checkpoint_sequence: number }>(
-			`SELECT checkpoint_sequence FROM vault_checkpoints
-			 WHERE document_id = ? AND checkpoint_sequence <= ? ORDER BY checkpoint_sequence DESC LIMIT 1`,
-			recipe.body_id,
-			capture.boundarySequence,
-		).toArray()[0];
-		const checkpointSequence = checkpoint?.checkpoint_sequence ?? 0;
-		const metadata: Array<{ kind: "checkpoint" | "journal"; sequence: number; bytes: number }> = [];
-		if (checkpoint) {
-			const bytes = decodeSqlChunks(this.storage.sql.exec<{ data: string }>(
-				"SELECT data FROM vault_checkpoints WHERE document_id = ? AND checkpoint_sequence = ? ORDER BY chunk_index",
-				recipe.body_id,
-				checkpointSequence,
-			)).byteLength;
-			metadata.push({ kind: "checkpoint", sequence: checkpointSequence, bytes });
-		}
-		const journal = this.storage.sql.exec<{ sequence: number; update_byte_length: number }>(
-			`SELECT sequence, update_byte_length FROM vault_journal
-			 WHERE document_id = ? AND sequence > ? AND sequence <= ?
-			 ORDER BY sequence LIMIT 257 OFFSET ?`,
-			recipe.body_id,
-			checkpointSequence,
-			capture.boundarySequence,
-			Math.max(0, offset - metadata.length),
-		).toArray();
-		metadata.push(...journal.map((row) => ({ kind: "journal" as const, sequence: row.sequence, bytes: row.update_byte_length })));
-		const selected: typeof metadata = [];
-		let encodedBytes = 0;
-		for (const item of metadata.slice(offset === 0 ? 0 : metadata.length > journal.length ? 1 : 0)) {
-			if (selected.length > 0 && encodedBytes + item.bytes > maxBytes) break;
-			selected.push(item);
-			encodedBytes += item.bytes;
-			if (selected.length >= 256) break;
-		}
-		const parts = selected.map((item) => {
-			const rows = item.kind === "checkpoint"
-				? this.storage.sql.exec<{ data: string }>(
-					"SELECT data FROM vault_checkpoints WHERE document_id = ? AND checkpoint_sequence = ? ORDER BY chunk_index",
-					recipe.body_id,
-					item.sequence,
-				)
-				: this.storage.sql.exec<{ data: string }>(
-					"SELECT data FROM vault_journal_chunks WHERE sequence = ? ORDER BY chunk_index",
-					item.sequence,
-				);
-			const update = decodeSqlChunks(rows);
-			if (update.byteLength !== item.bytes) throw new Error("recipe history chunk length mismatch");
-			return { kind: item.kind, sequence: item.sequence, update };
-		});
-		const consumed = offset + selected.length;
-		const total = (checkpoint ? 1 : 0) + this.storage.sql.exec<{ count: number }>(
-			`SELECT COUNT(*) AS count FROM vault_journal
-			 WHERE document_id = ? AND sequence > ? AND sequence <= ?`,
-			recipe.body_id,
-			checkpointSequence,
-			capture.boundarySequence,
-		).one().count;
-		return { parts, nextCursor: consumed < total ? String(consumed) : null, encodedBytes };
+		return super.rawDocumentRecipeChunk(recipe.body_id, capture.boundarySequence, String(offset), maxBytes);
 	}
 
 	addSnapshotDependency(dependency: RecoverySnapshotDependency): void {

@@ -82,6 +82,7 @@ export interface VaultRecoveryServiceOptions {
 	alarms: AlarmPort;
 	objectStore?: ObjectStorePort;
 	recoveryJobs?: ActorCallPort;
+	canonicalPageEntryBytes?(entry: CapturePlanEntry | CatalogDeltaEntry): Uint8Array;
 	store(): VaultStore;
 	runtimeEpoch: string;
 	flushLoadedDocuments(): Promise<void>;
@@ -92,6 +93,9 @@ export interface VaultRecoveryServiceOptions {
 
 export class VaultRecoveryService {
 	constructor(private readonly options: VaultRecoveryServiceOptions) {}
+	private canonicalPageEntryBytes(entry: CapturePlanEntry | CatalogDeltaEntry): Uint8Array {
+		return this.options.canonicalPageEntryBytes?.(entry) ?? recoveryCanonicalJsonBytes(entry);
+	}
 	private get objectStore(): ObjectStorePort | undefined { return this.options.objectStore; }
 	private get store(): VaultStore { return this.options.store(); }
 	private get runtimeEpoch(): string { return this.options.runtimeEpoch; }
@@ -309,13 +313,15 @@ export class VaultRecoveryService {
 			|| request.maxResponseBytes > MAX_CAPTURE_PLAN_BYTES) throw new Error("invalid capture plan bounds");
 		const candidates = this.store.listCapturePlanAt(capture.captureId, request.stream, request.cursor, request.maxEntries + 1);
 		const entries: CapturePlanEntry[] = [];
+		let entriesBytes = 2; // []
 		for (const entry of candidates.slice(0, request.maxEntries)) {
-			const candidate = [...entries, entry];
-			if (recoveryCanonicalJsonBytes(candidate).byteLength > request.maxResponseBytes) {
+			const nextBytes = entriesBytes + (entries.length === 0 ? 0 : 1) + this.canonicalPageEntryBytes(entry).byteLength;
+			if (nextBytes > request.maxResponseBytes) {
 				if (entries.length === 0) throw new Error("capture plan entry exceeds response bound");
 				break;
 			}
 			entries.push(entry);
+			entriesBytes = nextBytes;
 		}
 		const key = (entry: CapturePlanEntry): string => entry.kind === "active" ? entry.canonicalPath
 			: entry.kind === "deleted" ? entry.bodyId : entry.canonicalPath;
@@ -641,12 +647,15 @@ export class VaultRecoveryService {
 		}
 		const candidates = this.store.catalogDeltaAt(request.afterSequence, capture.boundarySequence, request.cursor, request.maxEntries + 1);
 		const entries: CatalogDeltaEntry[] = [];
+		let entriesBytes = 2; // []
 		for (const entry of candidates.slice(0, request.maxEntries)) {
-			if (recoveryCanonicalJsonBytes([...entries, entry]).byteLength > request.maxResponseBytes) {
+			const nextBytes = entriesBytes + (entries.length === 0 ? 0 : 1) + this.canonicalPageEntryBytes(entry).byteLength;
+			if (nextBytes > request.maxResponseBytes) {
 				if (entries.length === 0) throw new Error("delta entry exceeds response bound");
 				break;
 			}
 			entries.push(entry);
+			entriesBytes = nextBytes;
 		}
 		const terminal = entries.length === candidates.length;
 		const last = entries.at(-1);

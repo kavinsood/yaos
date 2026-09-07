@@ -82,11 +82,15 @@ import {
 	RecoveryJobStateStore,
 	isTerminalRecoveryState,
 	type RecoveryJobRecord,
+	type ReconstructionPart,
 	type RestoreItemOutcome,
 	type StoredRestoreItem,
 } from "./recoveryJobState.js";
 import type { ActorCallPort, AlarmPort, ObjectStorePort, RecoveryRuntimeStoragePort } from "./platformPorts.js";
 import { CloudflareActorCalls, CloudflareAlarmPort, CloudflareObjectStore } from "./cloudflarePorts.js";
+import { decodeBinaryEnvelope, encodeBinaryEnvelope, YAOS_BINARY_CONTENT_TYPE } from "./shared/binaryEnvelope.js";
+import { MAX_BLOB_UPLOAD_BYTES } from "./contracts.js";
+import { MAX_CLIENT_MARKDOWN_BYTES } from "./shared/durableLimits.js";
 
 const MAX_BODIES_PER_ALARM = 25;
 const ALARM_SLICE_WALL_MS = 4_000;
@@ -98,10 +102,46 @@ const MAX_BODY_DEFECT_ATTEMPTS = 3;
 const MAX_MARK_PAGE = 128;
 const GC_GRACE_MS = 48 * 60 * 60_000;
 const MAX_RESTORE_PAGE = 100;
-const MAX_RESTORE_CONTENT_BYTES = 64 * 1024 * 1024;
 const MAX_SINGLE_TURN_REBUILD_ENTRIES = 10_000;
 const MANIFEST_INVENTORY_PAGE = 32;
 const encoder = new TextEncoder();
+
+function concatenateBytes(parts: readonly Uint8Array[]): Uint8Array {
+	const total = parts.reduce((sum, part) => sum + part.byteLength, 0);
+	const bytes = new Uint8Array(total);
+	let offset = 0;
+	for (const part of parts) {
+		bytes.set(part, offset);
+		offset += part.byteLength;
+	}
+	return bytes;
+}
+
+/** Applies only complete logical Yjs updates; an incomplete checkpoint stays durable for the next slice. */
+export function applyCompleteRecoveryRecipeParts(doc: Y.Doc, parts: readonly ReconstructionPart[]): boolean {
+	for (let index = 0; index < parts.length;) {
+		const first = parts[index]!;
+		if (first.kind === "journal") {
+			if (first.fragmentIndex !== 0 || first.fragmentCount !== 1) throw new Error("journal recipe part is fragmented");
+			Y.applyUpdate(doc, first.bytes, "journal-load");
+			index++;
+			continue;
+		}
+		if (first.fragmentIndex !== 0) throw new Error("checkpoint recipe starts mid-fragment");
+		const fragments = parts.slice(index, index + first.fragmentCount);
+		if (fragments.length !== first.fragmentCount) return false;
+		for (let fragmentIndex = 0; fragmentIndex < fragments.length; fragmentIndex++) {
+			const fragment = fragments[fragmentIndex]!;
+			if (fragment.kind !== "checkpoint" || fragment.sequence !== first.sequence
+				|| fragment.fragmentCount !== first.fragmentCount || fragment.fragmentIndex !== fragmentIndex) {
+				throw new Error("checkpoint recipe fragments are inconsistent");
+			}
+		}
+		Y.applyUpdate(doc, concatenateBytes(fragments.map((fragment) => fragment.bytes)), "checkpoint-load");
+		index += fragments.length;
+	}
+	return true;
+}
 
 export interface RecoveryJobRuntimeOptions {
 	storage: RecoveryRuntimeStoragePort;
@@ -763,13 +803,18 @@ function parseRecipeChunk(value: unknown): RecipeChunk {
 	if (!Array.isArray(chunk.parts)) throw new TerminalRecoveryError("invalid_authority_response", "invalid recipe chunk parts");
 	const parts = chunk.parts.map((candidate) => {
 		const part = metadataRecord(candidate, "recipe chunk part");
-		assertMetadataKeys(part, ["kind", "sequence", "update"], "recipe chunk part");
+		assertMetadataKeys(part, ["kind", "sequence", "fragmentIndex", "fragmentCount", "bytes"], "recipe chunk part");
 		let kind: "checkpoint" | "journal";
 		if (part.kind === "checkpoint") kind = "checkpoint";
 		else if (part.kind === "journal") kind = "journal";
 		else throw new TerminalRecoveryError("invalid_authority_response", "invalid recipe chunk part kind");
-		if (!(part.update instanceof Uint8Array)) throw new TerminalRecoveryError("invalid_authority_response", "invalid recipe chunk update");
-		return { kind, sequence: metadataInteger(part.sequence, "recipe chunk sequence"), update: part.update };
+		if (!(part.bytes instanceof Uint8Array)) throw new TerminalRecoveryError("invalid_authority_response", "invalid recipe chunk bytes");
+		const fragmentIndex = metadataInteger(part.fragmentIndex, "recipe chunk fragment index");
+		const fragmentCount = metadataInteger(part.fragmentCount, "recipe chunk fragment count");
+		if (fragmentCount < 1 || fragmentIndex < 0 || fragmentIndex >= fragmentCount) {
+			throw new TerminalRecoveryError("invalid_authority_response", "invalid recipe chunk fragment bounds");
+		}
+		return { kind, sequence: metadataInteger(part.sequence, "recipe chunk sequence"), fragmentIndex, fragmentCount, bytes: part.bytes };
 	});
 	return {
 		recipeId: metadataString(chunk.recipeId, "recipe chunk ID"),
@@ -1009,27 +1054,27 @@ async function callRecoveryAuthority(
 	params: unknown,
 ): Promise<unknown> {
 	if (RECOVERY_AUTHORITY_METHODS[method] !== true) throw new Error("unsupported recovery authority method");
-	const requestBytes = encoder.encode(JSON.stringify({
+	const requestBytes = encodeBinaryEnvelope({
 		method,
 		params: encodeRecoveryRpcPayload(params),
-	}));
+	}, RECOVERY_RPC_MAX_JSON_BYTES);
 	const response = await actors.call(vaultId, new Request(`https://internal${RECOVERY_RPC_PATH}`, {
 		method: "POST",
 		headers: {
-			"content-type": "application/json",
+			"content-type": YAOS_BINARY_CONTENT_TYPE,
 			[RECOVERY_RPC_HEADER]: "1",
 			"x-yaos-vault-id": vaultId,
 			"x-yaos-vault-generation": vaultGeneration,
 		},
-		body: requestBytes,
+		body: requestBytes.slice().buffer,
 	}));
 	const responseBytes = new Uint8Array(await response.arrayBuffer());
 	if (responseBytes.byteLength > RECOVERY_RPC_MAX_JSON_BYTES) throw new Error("recovery RPC response exceeds byte bound");
 	let envelope: unknown;
 	try {
-		envelope = JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(responseBytes));
+		envelope = decodeBinaryEnvelope(responseBytes, RECOVERY_RPC_MAX_JSON_BYTES);
 	} catch {
-		throw new Error(`recovery RPC returned invalid JSON (${response.status})`);
+		throw new Error(`recovery RPC returned invalid binary envelope (${response.status})`);
 	}
 	const record = metadataRecord(envelope, "recovery RPC envelope");
 	if (record.ok !== true) {
@@ -1770,8 +1815,9 @@ export class RecoveryJobRuntime {
 		}
 		if (progress.entryIndex < entries.length) {
 			const entry = entries[progress.entryIndex]!;
+			let materializationComplete = true;
 			try {
-				await this.materializePlanEntry(descriptor, authority, entry);
+				materializationComplete = await this.materializePlanEntry(descriptor, authority, entry);
 			} catch (error) {
 				if (!(error instanceof BodyDefectError)) throw error;
 				const reconstruction = this.store.getReconstruction();
@@ -1792,6 +1838,7 @@ export class RecoveryJobRuntime {
 				});
 				await this.recordBodyDefect(descriptor, authority, error);
 			}
+			if (!materializationComplete) return;
 			this.store.deleteMetadata("body-defect-retry");
 			this.store.clearReconstruction();
 			const latest = this.store.load();
@@ -1834,7 +1881,7 @@ export class RecoveryJobRuntime {
 		return value.map(parser);
 	}
 
-	private async materializePlanEntry(descriptor: CaptureStartDescriptor, authority: RecoveryAuthorityRpc, entry: CapturePlanEntry): Promise<void> {
+	private async materializePlanEntry(descriptor: CaptureStartDescriptor, authority: RecoveryAuthorityRpc, entry: CapturePlanEntry): Promise<boolean> {
 		if (entry.kind === "attachment") {
 			const object = await this.bucket().head(blobObjectKey(descriptor.vaultId, descriptor.vaultGeneration, entry.contentHash));
 			if (!object || object.size !== entry.size) {
@@ -1852,7 +1899,7 @@ export class RecoveryJobRuntime {
 				bytes: entry.size,
 				metadata: null,
 			});
-			return;
+			return true;
 		}
 		const hash = entry.kind === "active" ? entry.contentHash : entry.baselineContentHash;
 		const size = entry.kind === "active" ? entry.size : entry.baselineSize;
@@ -1860,16 +1907,16 @@ export class RecoveryJobRuntime {
 		const written = this.store.getArtifact("content-object", identity);
 		if (written) {
 			await authority.acknowledgeContentMaterialized({ captureId: descriptor.captureId, boundarySequence: descriptor.boundarySequence, capability: descriptor.capability, bodyId: entry.bodyId, generation: entry.generation, contentHash: hash, plainBytes: size, objectKey: written.objectKey });
-			return;
+			return true;
 		}
 		const reused = this.store.getArtifact("content-reused", identity);
-		if (reused) return;
+		if (reused) return true;
 		const coverage = await authority.checkRecoveryCoverage({ captureId: descriptor.captureId, boundarySequence: descriptor.boundarySequence, capability: descriptor.capability, contentHashes: [hash] });
 		if (coverage.missingContentHashes.length === 0) {
 			this.store.putArtifact({ artifactKind: "content-reused", logicalKey: identity, objectKey: recoveryContentObjectKey(recoveryV2Prefix(vaultPrefix(descriptor.vaultId, descriptor.vaultGeneration)), hash), objectHash: hash, entries: 1, bytes: size, metadata: null });
 			const record = this.store.load();
 			if (record) this.commit(record, { contentObjectsReused: record.contentObjectsReused + 1, updatedAt: Date.now() });
-			return;
+			return true;
 		}
 		let reconstruction = this.store.getReconstruction();
 		if (!reconstruction) {
@@ -1885,10 +1932,10 @@ export class RecoveryJobRuntime {
 			reconstruction = { bodyId: entry.bodyId, generation: entry.generation, recipeId: recipe.recipeId, expectedContentHash: hash, expectedSize: size, cursor: recipe.firstCursor, stagingKey: null, stagingHash: null, encodedBytes: 0, attempts: 0 };
 			this.store.setReconstruction(reconstruction);
 		}
-		await this.advanceCaptureReconstruction(descriptor, authority, entry, reconstruction);
+		return this.advanceCaptureReconstruction(descriptor, authority, entry, reconstruction);
 	}
 
-	private async advanceCaptureReconstruction(descriptor: CaptureStartDescriptor, authority: RecoveryAuthorityRpc, entry: Extract<CapturePlanEntry, { kind: "active" | "deleted" }>, reconstruction: NonNullable<ReturnType<RecoveryJobStateStore["getReconstruction"]>>): Promise<void> {
+	private async advanceCaptureReconstruction(descriptor: CaptureStartDescriptor, authority: RecoveryAuthorityRpc, entry: Extract<CapturePlanEntry, { kind: "active" | "deleted" }>, reconstruction: NonNullable<ReturnType<RecoveryJobStateStore["getReconstruction"]>>): Promise<boolean> {
 		const doc = new Y.Doc({ guid: entry.bodyId });
 		let oldStagingKey: string | null = null;
 		try {
@@ -1907,16 +1954,25 @@ export class RecoveryJobRuntime {
 				if (isRetryableFailure(error)) throw new RetryableRecoveryError("recipe_chunk_transient", RecoveryJobStateStore.safeInternalError(error));
 				throw new BodyDefectError("missing_history", entry, RecoveryJobStateStore.safeInternalError(error));
 			}
-			if (chunk.encodedBytes > MAX_RECIPE_BYTES && chunk.parts.length !== 1) throw new BodyDefectError("corrupt_history", entry, "recipe chunk exceeds bound");
-			for (const part of chunk.parts) Y.applyUpdate(doc, part.update);
+			if (chunk.encodedBytes > MAX_RECIPE_BYTES) throw new BodyDefectError("corrupt_history", entry, "recipe chunk exceeds bound");
+			const ordinal = Number(chunk.cursor);
+			if (!Number.isSafeInteger(ordinal) || chunk.parts.length === 0) throw new BodyDefectError("corrupt_history", entry, "recipe chunk made no progress");
+			this.store.putReconstructionParts(chunk.parts.map((part, index) => ({ ordinal: ordinal + index, ...part })));
+			const completeParts = applyCompleteRecoveryRecipeParts(doc, this.store.reconstructionParts());
+			if (!completeParts) {
+				if (chunk.nextCursor === null) throw new BodyDefectError("corrupt_history", entry, "checkpoint recipe ended mid-fragment");
+				this.store.setReconstruction({ ...reconstruction, cursor: chunk.nextCursor, encodedBytes: reconstruction.encodedBytes + chunk.encodedBytes });
+				return false;
+			}
+			this.store.clearReconstructionParts();
 			if (chunk.nextCursor !== null) {
 				const encoded = Y.encodeStateAsUpdate(doc);
 				const hash = await sha256Hex(encoded);
 				const key = `${recoveryStagingPrefix(recoveryV2Prefix(vaultPrefix(descriptor.vaultId, descriptor.vaultGeneration)), recoveryJobId("capture", descriptor.vaultId, descriptor.vaultGeneration, descriptor.captureId))}/body/${entry.bodyId}/${hash}.yjs`;
 				await this.bucket().put(key, encoded, { contentType: "application/octet-stream" });
-				this.store.setReconstruction({ ...reconstruction, cursor: chunk.nextCursor, stagingKey: key, stagingHash: hash, encodedBytes: encoded.byteLength });
+				this.store.setReconstruction({ ...reconstruction, cursor: chunk.nextCursor, stagingKey: key, stagingHash: hash, encodedBytes: reconstruction.encodedBytes + chunk.encodedBytes });
 				if (oldStagingKey && oldStagingKey !== key) await this.bucket().delete(oldStagingKey);
-				return;
+				return false;
 			}
 			const bodyText: string = doc.getText("body").toJSON();
 			const plain = encoder.encode(bodyText);
@@ -1930,7 +1986,7 @@ export class RecoveryJobRuntime {
 				const existing = await this.bucket().get(key);
 				if (existing) {
 					try {
-						const current = gunzipRecoveryBytes(existing.bytes, 4 * 1024 * 1024, 1_500_000);
+						const current = gunzipRecoveryBytes(existing.bytes, 4 * 1024 * 1024, MAX_CLIENT_MARKDOWN_BYTES);
 						if (await sha256Hex(current) !== reconstruction.expectedContentHash) {
 							throw new TerminalRecoveryError("content_collision", "content-addressed object collision");
 						}
@@ -1944,11 +2000,12 @@ export class RecoveryJobRuntime {
 				this.store.putArtifact({ artifactKind: "content-object", logicalKey: `${entry.bodyId}:${entry.generation}`, objectKey: key, objectHash: reconstruction.expectedContentHash, entries: 1, bytes: plain.byteLength, metadata: null });
 				await authority.acknowledgeContentMaterialized({ captureId: descriptor.captureId, boundarySequence: descriptor.boundarySequence, capability: descriptor.capability, bodyId: entry.bodyId, generation: entry.generation, contentHash: reconstruction.expectedContentHash, plainBytes: plain.byteLength, objectKey: key });
 				const record = this.store.load();
-				if (record) this.commit(record, { contentObjectsWritten: record.contentObjectsWritten + 1, bytesRead: record.bytesRead + chunk.encodedBytes, bytesWritten: record.bytesWritten + compressed.byteLength, updatedAt: Date.now() });
+				if (record) this.commit(record, { contentObjectsWritten: record.contentObjectsWritten + 1, bytesRead: record.bytesRead + reconstruction.encodedBytes + chunk.encodedBytes, bytesWritten: record.bytesWritten + compressed.byteLength, updatedAt: Date.now() });
 			} finally {
 				await authority.releaseMaterializationLease(lease.leaseId);
 			}
 			if (oldStagingKey) await this.bucket().delete(oldStagingKey);
+			return true;
 		} catch (error) {
 			if (error instanceof BodyDefectError || error instanceof TerminalRecoveryError || error instanceof RetryableRecoveryError) throw error;
 			if (isRetryableFailure(error)) throw new RetryableRecoveryError("reconstruction_transient", RecoveryJobStateStore.safeInternalError(error));
@@ -2305,13 +2362,23 @@ export class RecoveryJobRuntime {
 				cursor: reconstruction.cursor,
 				maxResponseBytes: MAX_RECIPE_BYTES,
 			});
-			for (const part of chunk.parts) Y.applyUpdate(doc, part.update);
+			if (chunk.encodedBytes > MAX_RECIPE_BYTES) throw new TerminalRecoveryError("projection_recipe_oversized", "projection recipe chunk exceeds bound");
+			const ordinal = Number(chunk.cursor);
+			if (!Number.isSafeInteger(ordinal) || chunk.parts.length === 0) throw new TerminalRecoveryError("projection_recipe_empty", "projection recipe chunk made no progress");
+			this.store.putReconstructionParts(chunk.parts.map((part, index) => ({ ordinal: ordinal + index, ...part })));
+			const completeParts = applyCompleteRecoveryRecipeParts(doc, this.store.reconstructionParts());
+			if (!completeParts) {
+				if (chunk.nextCursor === null) throw new TerminalRecoveryError("projection_recipe_corrupt", "checkpoint recipe ended mid-fragment");
+				this.store.setReconstruction({ ...reconstruction, cursor: chunk.nextCursor, encodedBytes: reconstruction.encodedBytes + chunk.encodedBytes });
+				return;
+			}
+			this.store.clearReconstructionParts();
 			if (chunk.nextCursor !== null) {
 				const encoded = Y.encodeStateAsUpdate(doc);
 				const hash = await sha256Hex(encoded);
 				const key = `${recoveryStagingPrefix(recoveryV2Prefix(vaultPrefix(descriptor.vaultId, descriptor.vaultGeneration)), recoveryJobId("projection", descriptor.vaultId, descriptor.vaultGeneration))}/body/${entry.bodyId}/${hash}.yjs`;
 				await this.bucket().put(key, encoded, { contentType: "application/octet-stream" });
-				this.store.setReconstruction({ ...reconstruction, cursor: chunk.nextCursor, stagingKey: key, stagingHash: hash, encodedBytes: encoded.byteLength });
+				this.store.setReconstruction({ ...reconstruction, cursor: chunk.nextCursor, stagingKey: key, stagingHash: hash, encodedBytes: reconstruction.encodedBytes + chunk.encodedBytes });
 				if (oldStagingKey && oldStagingKey !== key) await this.bucket().delete(oldStagingKey);
 				return;
 			}
@@ -2552,9 +2619,11 @@ export class RecoveryJobRuntime {
 			? recoveryContentObjectKey(recoveryV2Prefix(vaultPrefix(record.vaultId, record.vaultGeneration)), item.contentHash)
 			: blobObjectKey(record.vaultId, record.vaultGeneration, item.contentHash);
 		const object = await this.bucket().get(key);
-		if (!object || object.size > MAX_RESTORE_CONTENT_BYTES) return new Response("restore content missing", { status: 409 });
+		const maximum = item.kind === "markdown" ? MAX_CLIENT_MARKDOWN_BYTES : MAX_BLOB_UPLOAD_BYTES;
+		const storedMaximum = item.kind === "markdown" ? MAX_CLIENT_MARKDOWN_BYTES + 64 * 1024 : maximum;
+		if (!object || object.size > storedMaximum) return new Response("restore content missing", { status: 409 });
 		let bytes = object.bytes;
-		if (item.kind === "markdown") bytes = gunzipRecoveryBytes(bytes, MAX_RESTORE_CONTENT_BYTES, MAX_RESTORE_CONTENT_BYTES);
+		if (item.kind === "markdown") bytes = gunzipRecoveryBytes(bytes, storedMaximum, maximum);
 		if (bytes.byteLength !== item.size || await sha256Hex(bytes) !== item.contentHash) return new Response("restore content corrupt", { status: 409 });
 		return new Response(bytes, { headers: { "content-type": item.kind === "markdown" ? "text/markdown; charset=utf-8" : "application/octet-stream", "x-yaos-content-sha256": item.contentHash, "x-yaos-content-size": String(item.size) } });
 	}
@@ -2586,12 +2655,16 @@ export class RecoveryJobRuntime {
 			throw new TerminalRecoveryError("gc_deadline_exceeded", "GC epoch exceeded its deadline");
 		}
 		if (record.state === "queued" || record.state === "marking" || record.state === "retrying") {
-			const page = await authority.getGcRootPage({ vaultId: descriptor.vaultId, vaultGeneration: descriptor.vaultGeneration, epoch: descriptor.epoch, capability: descriptor.capability, cursor: record.cursor, maxEntries: MAX_MARK_PAGE });
-			this.store.addGcMarks(page.marks.map((mark) => ({ epoch: descriptor.epoch, domain: mark.domain, objectKeyHash: mark.objectKeyHash })));
-			this.store.enqueueGcFrontier(page.roots.map((root) => ({ ...root })));
-			if (!page.terminal) {
-				this.commit(record, { state: "marking", cursor: page.nextCursor, updatedAt: Date.now() });
-				return;
+			const rootsLoaded = this.store.getMetadata("gc-roots-loaded")?.complete === true;
+			if (!rootsLoaded) {
+				const page = await authority.getGcRootPage({ vaultId: descriptor.vaultId, vaultGeneration: descriptor.vaultGeneration, epoch: descriptor.epoch, capability: descriptor.capability, cursor: record.cursor, maxEntries: MAX_MARK_PAGE });
+				this.store.addGcMarks(page.marks.map((mark) => ({ epoch: descriptor.epoch, domain: mark.domain, objectKeyHash: mark.objectKeyHash })));
+				this.store.enqueueGcFrontier(page.roots.map((root) => ({ ...root })));
+				if (!page.terminal) {
+					this.commit(record, { state: "marking", cursor: page.nextCursor, updatedAt: Date.now() });
+					return;
+				}
+				this.store.setMetadata("gc-roots-loaded", { complete: true });
 			}
 			const frontier = this.store.nextGcFrontier();
 			if (frontier) {

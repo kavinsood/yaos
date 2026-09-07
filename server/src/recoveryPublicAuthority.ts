@@ -13,8 +13,7 @@ import type { RecoveryRouteAuthority, RestoreItemResult, StartRestoreRequest } f
 import type { ActorCallPort } from "./platformPorts";
 import type { VaultActorContext } from "./collaboration";
 import { actorHeaders } from "./vaultAuthority";
-
-const encoder = new TextEncoder();
+import { decodeBinaryEnvelope, encodeBinaryEnvelope, YAOS_BINARY_CONTENT_TYPE } from "./shared/binaryEnvelope";
 
 export class ActorRecoveryRouteAuthority implements RecoveryRouteAuthority {
 	constructor(
@@ -27,7 +26,7 @@ export class ActorRecoveryRouteAuthority implements RecoveryRouteAuthority {
 
 	private headers(): Headers {
 		const headers = actorHeaders(this.actor);
-		headers.set("content-type", "application/json");
+		headers.set("content-type", YAOS_BINARY_CONTENT_TYPE);
 		headers.set(RECOVERY_PUBLIC_RPC_HEADER, "1");
 		headers.set("x-yaos-vault-id", this.vaultId);
 		headers.set("x-yaos-vault-generation", this.vaultGeneration);
@@ -35,20 +34,19 @@ export class ActorRecoveryRouteAuthority implements RecoveryRouteAuthority {
 	}
 
 	private async call<T>(method: string, params: unknown): Promise<T> {
-		const body = JSON.stringify({ method, params: encodeRecoveryRpcPayload(params) });
-		if (encoder.encode(body).byteLength > RECOVERY_RPC_MAX_JSON_BYTES) throw new Error("recovery request too large");
+		const body = encodeBinaryEnvelope({ method, params: encodeRecoveryRpcPayload(params) }, RECOVERY_RPC_MAX_JSON_BYTES);
 		const response = await this.actors.call(this.actorName, new Request(`https://internal${RECOVERY_PUBLIC_RPC_PATH}`, {
 			method: "POST",
 				headers: this.headers(),
-			body,
+			body: body.slice().buffer,
 		}));
 		const bytes = new Uint8Array(await response.arrayBuffer());
 		if (bytes.byteLength > RECOVERY_RPC_MAX_JSON_BYTES) throw new Error("recovery response too large");
 		let envelope: unknown;
 		try {
-			envelope = JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes));
+			envelope = decodeBinaryEnvelope(bytes, RECOVERY_RPC_MAX_JSON_BYTES);
 		} catch {
-			throw new Error(`recovery authority returned invalid JSON (${response.status})`);
+			throw new Error(`recovery authority returned invalid binary envelope (${response.status})`);
 		}
 		if (!envelope || typeof envelope !== "object" || Array.isArray(envelope)) {
 			throw new Error("recovery authority returned invalid response");
@@ -86,11 +84,11 @@ export class ActorRecoveryRouteAuthority implements RecoveryRouteAuthority {
 		return this.call<unknown>("listRecoveryRestoreItems", input);
 	}
 	async getRecoveryRestoreItemContent(input: { vaultId: string; restoreId: string; itemId: string }): Promise<Response> {
-		const body = JSON.stringify({ method: "getRecoveryRestoreItemContent", params: input });
+		const body = encodeBinaryEnvelope({ method: "getRecoveryRestoreItemContent", params: input }, RECOVERY_RPC_MAX_JSON_BYTES);
 		return this.actors.call(this.actorName, new Request(`https://internal${RECOVERY_PUBLIC_RPC_PATH}`, {
 			method: "POST",
 				headers: this.headers(),
-			body,
+			body: body.slice().buffer,
 		}));
 	}
 	recordRecoveryRestoreResults(input: { vaultId: string; restoreId: string; results: RestoreItemResult[] }) {

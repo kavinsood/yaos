@@ -1,4 +1,3 @@
-import { base64UrlToBytes, bytesToBase64Url } from "./base64url.js";
 import { canonicalJsonText } from "./recoveryCanonicalJson.js";
 import {
 	manifestNodeObjectKey,
@@ -35,7 +34,7 @@ export type RecoveryRpcResponse =
 	| { ok: false; error: { code: "recovery_rpc_failed"; message: string } };
 
 export function encodeRecoveryRpcPayload(value: unknown, ancestors = new Set<object>()): unknown {
-	if (value instanceof Uint8Array) return { $bytes: bytesToBase64Url(value) };
+	if (value instanceof Uint8Array) return value.slice();
 	if (value === null || typeof value === "string" || typeof value === "boolean"
 		|| (typeof value === "number" && Number.isSafeInteger(value))) return value;
 	if (Array.isArray(value)) {
@@ -59,14 +58,12 @@ export function encodeRecoveryRpcPayload(value: unknown, ancestors = new Set<obj
 }
 
 export function decodeRecoveryRpcPayload(value: unknown): unknown {
+	if (value instanceof Uint8Array) return value.slice();
 	if (value === null || typeof value === "string" || typeof value === "boolean"
 		|| (typeof value === "number" && Number.isSafeInteger(value))) return value;
 	if (Array.isArray(value)) return value.map(decodeRecoveryRpcPayload);
 	if (value && typeof value === "object") {
 		const entries = Object.entries(value);
-		if (entries.length === 1 && entries[0]![0] === "$bytes" && typeof entries[0]![1] === "string") {
-			return base64UrlToBytes(entries[0]![1]);
-		}
 		const result = Object.create(null) as Record<string, unknown>;
 		for (const [key, item] of entries) result[key] = decodeRecoveryRpcPayload(item);
 		return result;
@@ -165,7 +162,14 @@ export interface BodyRecipeDescriptor {
 	encodedHistoryBytes: number; firstCursor: string;
 }
 export interface RecipeChunkRequest { captureId: string; boundarySequence: number; capability: string; recipeId: string; cursor: string; maxResponseBytes: number }
-export interface RecipeChunkPart { kind: "checkpoint" | "journal"; sequence: number; update: Uint8Array }
+export interface RecipeChunkPart {
+	kind: "checkpoint" | "journal";
+	sequence: number;
+	/** Checkpoints are one logical Yjs update split across bounded physical rows. */
+	fragmentIndex: number;
+	fragmentCount: number;
+	bytes: Uint8Array;
+}
 export interface RecipeChunk { recipeId: string; cursor: string; nextCursor: string | null; parts: RecipeChunkPart[]; encodedBytes: number }
 
 export interface MaterializationLeaseRequest { ownerKind: "capture" | "projection"; ownerId: string; capability: string; objectKeys: string[]; ttlMs?: number }

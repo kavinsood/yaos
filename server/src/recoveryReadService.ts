@@ -22,9 +22,10 @@ import { sha256Hex } from "./hex";
 import { safeBlobPath, safeMarkdownPath } from "./shared/vaultPath";
 import { blobObjectKey, recoveryPrefix } from "./recoveryProtocol";
 import type { ObjectStorePort } from "./platformPorts";
+import { MAX_CLIENT_MARKDOWN_BYTES } from "./shared/durableLimits.js";
 
 const MAX_ROOT_BYTES = 1024 * 1024;
-const MAX_MARKDOWN_BYTES = 1_500_000;
+const MAX_MARKDOWN_BYTES = MAX_CLIENT_MARKDOWN_BYTES;
 const MAX_CONTENT_COMPRESSED_BYTES = 4 * 1024 * 1024;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false });

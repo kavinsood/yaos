@@ -1,3 +1,10 @@
+import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import * as Y from "yjs";
+import { NodeSqliteStorage } from "../../packages/server-node/src/storage";
 import {
 	advanceRecoveryPurgeProgress,
 	canCancelRecoveryJob,
@@ -17,6 +24,8 @@ import {
 	recoveryJobId,
 	type CaptureStartDescriptor,
 } from "../../server/src/recoveryExecutor";
+import { sha256Hex } from "../../server/src/hex";
+import { RecoveryJobStateStore, type RecoveryJobRecord } from "../../server/src/recoveryJobState";
 import { encodeSnapshotRoot } from "../../server/src/recoveryManifestTree";
 import { recoveryPrefix, RECOVERY_RPC_HEADER, vaultGenerationPrefix } from "../../server/src/recoveryProtocol";
 import { FakeObjectStore, makeRecoveryJobNamespace } from "../mocks/workerEnv.ts";
@@ -306,6 +315,198 @@ s.test("dispatch arms a durable successor before a slice can be lost with transi
 	await dispatch;
 	if (alarmEvents.at(-1)?.kind !== "delete") {
 		throw new Error("terminal dispatch left its watchdog alarm armed");
+	}
+});
+
+s.test("capture pause and restart do not advance a fragmented recipe before its terminal cursor", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "yaos-capture-pause-"));
+	const storage = NodeSqliteStorage.open(join(directory, "state.sqlite"));
+	const bucket = new FakeObjectStore();
+	const bodyId = "fragmented-body";
+	const generation = 3;
+	const markdown = "fragmented checkpoint recovery";
+	const plain = new TextEncoder().encode(markdown);
+	const contentHash = await sha256Hex(plain);
+	const source = new Y.Doc({ guid: bodyId });
+	source.getText("body").insert(0, markdown);
+	const checkpoint = Y.encodeStateAsUpdate(source);
+	const midpoint = Math.max(1, Math.floor(checkpoint.byteLength / 2));
+	const fragments = [checkpoint.slice(0, midpoint), checkpoint.slice(midpoint)];
+	let recipeCalls = 0;
+	let acknowledgements = 0;
+
+	const options = {
+		storage,
+		alarms: {
+			setAlarm: async () => {},
+			deleteAlarm: async () => {},
+		},
+		objectStore: bucket,
+		recoveryAuthority: {
+			call: async () => { throw new Error("encoded recovery authority transport must not run in slice regression"); },
+		},
+		controlPlane: {
+			call: async () => { throw new Error("control plane must not run in slice regression"); },
+		},
+	};
+	const authority = {
+		getCapturePlanPage: async () => ({
+			entries: [{
+				kind: "active" as const,
+				bodyId,
+				fileId: "fragmented-file",
+				canonicalPath: "Fragmented.md",
+				generation,
+				contentHash,
+				size: plain.byteLength,
+			}],
+			casHints: { [contentHash]: false },
+			nextCursor: null,
+			terminal: true,
+			pageHash: hashA,
+			planDigest: hashB,
+		}),
+		checkRecoveryCoverage: async () => ({ missingContentHashes: [contentHash], missingNodeHashes: [] }),
+		getRecipeDescriptors: async () => [{
+			recipeId: "fragmented-recipe",
+			bodyId,
+			generation,
+			expectedContentHash: contentHash,
+			expectedSize: plain.byteLength,
+			encodedHistoryBytes: checkpoint.byteLength,
+			firstCursor: "0",
+		}],
+		getRecipeChunk: async () => {
+			const index = recipeCalls++;
+			assert.ok(index < fragments.length, "capture fetched beyond the terminal recipe cursor");
+			return {
+				recipeId: "fragmented-recipe",
+				cursor: String(index),
+				nextCursor: index === fragments.length - 1 ? null : String(index + 1),
+				parts: [{
+					kind: "checkpoint" as const,
+					sequence: 17,
+					fragmentIndex: index,
+					fragmentCount: fragments.length,
+					bytes: fragments[index]!,
+				}],
+				encodedBytes: fragments[index]!.byteLength,
+			};
+		},
+		acquireMaterializationLease: async () => ({
+			leaseId: "capture-materialization-lease",
+			ownerKind: "capture" as const,
+			ownerId: "capture_1",
+			objectKeys: [],
+			expiresAt: Date.now() + 60_000,
+		}),
+		releaseMaterializationLease: async () => {},
+		acknowledgeContentMaterialized: async () => { acknowledgements++; },
+	};
+	type CaptureSliceHarness = {
+		store: RecoveryJobStateStore;
+		runCaptureSlice(record: RecoveryJobRecord, authority: unknown): Promise<void>;
+	};
+
+	try {
+		let runtime = new RecoveryJobRuntime(options) as unknown as CaptureSliceHarness;
+		const descriptor = {
+			...captureDescriptor(),
+			createdAt: Date.now(),
+			capabilityExpiresAt: Date.now() + 60_000,
+			pinSoftExpiresAt: Date.now() + 30_000,
+			pinHardExpiresAt: Date.now() + 60_000,
+		};
+		await (runtime as unknown as RecoveryJobRuntime).initializeCapture(descriptor);
+		runtime.store.setMetadata("capture-progress", {
+			mode: "plan", streamIndex: 0, cursor: null, pageSequence: 0, currentPage: null,
+			entryIndex: 0, planDigest: null, deltaDigest: null, baseSnapshotId: null,
+			baseRootKey: null, baseRootHash: null, fullRebuild: true,
+			buildTreeIndex: 0, buildPageIndex: 0, buildDeltaIndex: 0,
+		});
+
+		await runtime.runCaptureSlice(runtime.store.load()!, authority);
+		assert.equal(runtime.store.getMetadata("capture-progress")?.entryIndex, 0, "staging a plan page advanced its entry");
+
+		await runtime.runCaptureSlice(runtime.store.load()!, authority);
+		assert.equal(runtime.store.getMetadata("capture-progress")?.entryIndex, 0, "partial checkpoint advanced the plan entry");
+		assert.equal(runtime.store.load()?.processedEntries, 0, "partial checkpoint advanced durable progress");
+		assert.equal(runtime.store.getReconstruction()?.cursor, "1", "partial checkpoint did not persist its continuation cursor");
+		assert.equal(runtime.store.reconstructionParts().length, 1, "partial checkpoint fragment was not retained");
+		assert.equal(acknowledgements, 0, "partial checkpoint was acknowledged as materialized");
+
+		// Recreate the runtime over the same SQLite state to exercise the alarm/process-loss boundary.
+		runtime = new RecoveryJobRuntime(options) as unknown as CaptureSliceHarness;
+		await runtime.runCaptureSlice(runtime.store.load()!, authority);
+		assert.equal(runtime.store.getMetadata("capture-progress")?.entryIndex, 1, "terminal checkpoint did not advance the plan entry");
+		assert.equal(runtime.store.load()?.processedEntries, 1, "terminal checkpoint did not advance durable progress");
+		assert.equal(runtime.store.getReconstruction(), null, "completed reconstruction progress was not cleared");
+		assert.deepEqual(runtime.store.reconstructionParts(), [], "completed reconstruction fragments were not cleared");
+		assert.equal(acknowledgements, 1, "completed body was not acknowledged exactly once");
+		assert.equal(recipeCalls, 2, "capture did not resume at the persisted recipe cursor");
+	} finally {
+		source.destroy();
+		storage.close();
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+s.test("GC loads a terminal root page once while draining its durable frontier", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "yaos-gc-roots-once-"));
+	const storage = NodeSqliteStorage.open(join(directory, "state.sqlite"));
+	const runtime = new RecoveryJobRuntime({
+		storage,
+		alarms: { setAlarm: async () => {}, deleteAlarm: async () => {} },
+		objectStore: new FakeObjectStore(),
+		recoveryAuthority: { call: async () => { throw new Error("encoded authority transport must not run in GC slice regression"); } },
+		controlPlane: { call: async () => { throw new Error("control plane must not run in GC slice regression"); } },
+	});
+	type GcSliceHarness = {
+		store: RecoveryJobStateStore;
+		runGcSlice(record: RecoveryJobRecord, authority: unknown): Promise<void>;
+	};
+	const harness = runtime as unknown as GcSliceHarness;
+	let rootPageCalls = 0;
+	let markCompletions = 0;
+	const authority = {
+		getGcRootPage: async () => {
+			rootPageCalls++;
+			return {
+				roots: [
+					{ objectKey: "blob/root-a", domain: "blob" as const },
+					{ objectKey: "blob/root-b", domain: "blob" as const },
+				],
+				marks: [],
+				nextCursor: null,
+				terminal: true,
+			};
+		},
+		completeGcMark: async () => { markCompletions++; },
+		abortRecoveryGc: async () => { throw new Error("live GC regression unexpectedly aborted"); },
+	};
+	try {
+		const now = Date.now();
+		await runtime.initializeGc({
+			vaultId,
+			vaultGeneration,
+			createdAt: now,
+			capability: "gc-capability",
+			capabilityExpiresAt: now + 60_000,
+			epoch: 9,
+			markStartedAt: now,
+			deadlineAt: now + 60_000,
+			gracePeriodMs: 1_000,
+			domains: ["recovery", "blob"],
+		});
+		await harness.runGcSlice(harness.store.load()!, authority);
+		await harness.runGcSlice(harness.store.load()!, authority);
+		await harness.runGcSlice(harness.store.load()!, authority);
+		assert.equal(rootPageCalls, 1, "terminal root page was replayed while frontier items drained");
+		assert.equal(markCompletions, 1, "GC did not complete marking after draining the frontier");
+		assert.equal(harness.store.load()?.state, "sweeping");
+	} finally {
+		storage.close();
+		await rm(directory, { recursive: true, force: true });
 	}
 });
 

@@ -27,7 +27,7 @@ function encodedDocument(documentId: string, configure?: (doc: Y.Doc) => void): 
 	const doc = new Y.Doc({ guid: documentId });
 	if (documentId === "root") {
 		doc.getMap("sys").set("schemaVersion", 7);
-		doc.getMap("sys").set("protocolVersion", 3);
+		doc.getMap("sys").set("protocolVersion", 4);
 	}
 	configure?.(doc);
 	const encodedState = Y.encodeStateAsUpdate(doc).slice().buffer;

@@ -1,4 +1,6 @@
-export const RECOVERY_JOB_SCHEMA_VERSION = 1;
+import { SQLITE_ROW_SAFE_BYTES } from "./shared/durableLimits";
+
+export const RECOVERY_JOB_SCHEMA_VERSION = 2;
 
 export type RecoveryJobKind = "capture" | "projection" | "restore" | "gc" | "purge";
 
@@ -90,6 +92,18 @@ export interface ReconstructionProgress {
 	encodedBytes: number;
 	attempts: number;
 }
+
+export interface ReconstructionPart {
+	ordinal: number;
+	kind: "checkpoint" | "journal";
+	sequence: number;
+	fragmentIndex: number;
+	fragmentCount: number;
+	bytes: Uint8Array;
+}
+
+const MAX_RECONSTRUCTION_PARTS_PER_SLICE = 256;
+const RECONSTRUCTION_PART_SQL_BATCH = 16;
 
 export interface RecoveryDefect {
 	logicalKey: string;
@@ -306,6 +320,14 @@ export class RecoveryJobStateStore {
 				staging_hash TEXT,
 				encoded_bytes INTEGER NOT NULL,
 				attempts INTEGER NOT NULL
+			);
+			CREATE TABLE IF NOT EXISTS reconstruction_parts (
+				ordinal INTEGER PRIMARY KEY,
+				kind TEXT NOT NULL,
+				sequence INTEGER NOT NULL,
+				fragment_index INTEGER NOT NULL,
+				fragment_count INTEGER NOT NULL,
+				data BLOB NOT NULL
 			);
 			CREATE TABLE IF NOT EXISTS job_defects (
 				logical_key TEXT PRIMARY KEY,
@@ -541,9 +563,85 @@ export class RecoveryJobStateStore {
 		);
 	}
 
+	putReconstructionParts(parts: readonly ReconstructionPart[]): void {
+		this.initializeSchema();
+		if (parts.length > MAX_RECONSTRUCTION_PARTS_PER_SLICE) {
+			throw new Error("too many reconstruction parts");
+		}
+		const ordinals = new Set<number>();
+		for (const part of parts) {
+			if (part.bytes.byteLength > SQLITE_ROW_SAFE_BYTES) {
+				throw new Error("reconstruction part exceeds the SQLite row safety limit");
+			}
+			if (ordinals.has(part.ordinal)) throw new Error("duplicate reconstruction part ordinal");
+			ordinals.add(part.ordinal);
+		}
+		this.storage.transactionSync(() => {
+			for (let offset = 0; offset < parts.length; offset += RECONSTRUCTION_PART_SQL_BATCH) {
+				const batch = parts.slice(offset, offset + RECONSTRUCTION_PART_SQL_BATCH);
+				const values = batch.map(() => "(?, ?, ?, ?, ?, ?)").join(", ");
+				const bindings: unknown[] = [];
+				for (const part of batch) {
+					const data = new ArrayBuffer(part.bytes.byteLength);
+					new Uint8Array(data).set(part.bytes);
+					bindings.push(part.ordinal, part.kind, part.sequence, part.fragmentIndex, part.fragmentCount, data);
+				}
+				this.storage.sql.exec(
+					`INSERT OR IGNORE INTO reconstruction_parts(
+					 ordinal, kind, sequence, fragment_index, fragment_count, data
+					) VALUES ${values}`,
+					...bindings,
+				);
+				const stored = this.storage.sql.exec<{
+					ordinal: number; kind: string; sequence: number; fragment_index: number;
+					fragment_count: number; data: ArrayBuffer;
+				}>(
+					`SELECT ordinal, kind, sequence, fragment_index, fragment_count, data
+					 FROM reconstruction_parts WHERE ordinal IN (${batch.map(() => "?").join(", ")})`,
+					...batch.map((part) => part.ordinal),
+				).toArray();
+				const storedByOrdinal = new Map(stored.map((row) => [row.ordinal, row]));
+				for (const part of batch) {
+					const existing = storedByOrdinal.get(part.ordinal);
+					if (!existing) throw new Error("reconstruction part insert missing");
+					const bytes = new Uint8Array(existing.data);
+					if (existing.kind !== part.kind || existing.sequence !== part.sequence
+						|| existing.fragment_index !== part.fragmentIndex || existing.fragment_count !== part.fragmentCount
+						|| bytes.byteLength !== part.bytes.byteLength || bytes.some((byte, index) => byte !== part.bytes[index])) {
+						throw new Error("reconstruction part replay changed");
+					}
+				}
+			}
+		});
+	}
+
+	reconstructionParts(): ReconstructionPart[] {
+		this.initializeSchema();
+		return this.storage.sql.exec<{
+			ordinal: number; kind: "checkpoint" | "journal"; sequence: number;
+			fragment_index: number; fragment_count: number; data: ArrayBuffer;
+		}>("SELECT ordinal, kind, sequence, fragment_index, fragment_count, data FROM reconstruction_parts ORDER BY ordinal")
+			.toArray().map((row) => ({
+				ordinal: row.ordinal,
+				kind: row.kind,
+				sequence: row.sequence,
+				fragmentIndex: row.fragment_index,
+				fragmentCount: row.fragment_count,
+				bytes: new Uint8Array(row.data),
+			}));
+	}
+
+	clearReconstructionParts(): void {
+		this.initializeSchema();
+		this.storage.sql.exec("DELETE FROM reconstruction_parts");
+	}
+
 	clearReconstruction(): void {
 		this.initializeSchema();
-		this.storage.sql.exec("DELETE FROM reconstruction_progress WHERE id = 1");
+		this.storage.transactionSync(() => {
+			this.storage.sql.exec("DELETE FROM reconstruction_progress WHERE id = 1");
+			this.storage.sql.exec("DELETE FROM reconstruction_parts");
+		});
 	}
 
 	putDefect(defect: RecoveryDefect): void {
@@ -770,7 +868,7 @@ export class RecoveryJobStateStore {
 	deleteOperationalState(): void {
 		this.initializeSchema();
 		this.storage.transactionSync(() => {
-			for (const table of ["reconstruction_progress", "job_defects", "job_artifacts", "gc_marks", "gc_frontier", "manifest_frontier", "restore_items", "job_metadata"]) {
+			for (const table of ["reconstruction_progress", "reconstruction_parts", "job_defects", "job_artifacts", "gc_marks", "gc_frontier", "manifest_frontier", "restore_items", "job_metadata"]) {
 				this.storage.sql.exec(`DELETE FROM ${table}`);
 			}
 		});
