@@ -7,10 +7,14 @@ import type { VaultDocumentCache } from "./vaultDocumentCache";
 import type { VaultLifecycleService } from "./vaultLifecycleService";
 import type { VaultSocketService } from "./vaultSocketService";
 import { canonicalMarkdownBytes, canonicalizeMarkdown } from "./shared/markdownCodec";
+import { validateFrontmatterSemanticRoots } from "./shared/frontmatterSemanticValidation";
 
 const MAX_IDENTITY_LENGTH = 256;
 
 class NonCanonicalMarkdownCandidateError extends Error {}
+class InvalidFrontmatterSemanticCandidateError extends Error {
+	constructor(readonly reason: string) { super(reason); }
+}
 
 function json(value: unknown, status = 200): Response {
 	return Response.json(value, { status, headers: { "cache-control": "no-store" } });
@@ -75,6 +79,9 @@ export class VaultCandidateService {
 			if (error instanceof NonCanonicalMarkdownCandidateError) {
 				return json({ error: "candidate_markdown_not_canonical" }, 409);
 			}
+			if (error instanceof InvalidFrontmatterSemanticCandidateError) {
+				return json({ error: error.reason }, 409);
+			}
 			throw error;
 		}
 		let durable;
@@ -122,6 +129,8 @@ export class VaultCandidateService {
 			if (content !== canonicalizeMarkdown(content)) {
 				throw new NonCanonicalMarkdownCandidateError();
 			}
+			const semanticError = validateFrontmatterSemanticRoots(reconstructed.doc);
+			if (semanticError) throw new InvalidFrontmatterSemanticCandidateError(semanticError);
 			const bytes = canonicalMarkdownBytes(content);
 			const metadata = { contentHash: await sha256Hex(bytes), size: bytes.byteLength };
 			const current = this.options.store.getCatalogHeadAt(this.options.store.currentSequence(), bodyId);

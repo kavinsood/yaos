@@ -7,7 +7,11 @@ import { DiskMirror } from "../../../src/sync/diskMirror";
 import { createSocketTicketCache } from "../../../src/sync/socketTicket";
 import { BodySettlementRepository } from "../../../src/sync/bodySettlement";
 import { canonicalMarkdownHash } from "../../../server/src/shared/markdownCodec";
-import { VaultSync, type ReconcileMode } from "../../../src/sync/vaultSync";
+import {
+	VaultSync,
+	type ReconcileMode,
+	type WebSocketImplementation,
+} from "../../../src/sync/vaultSync";
 import { ReconciliationController } from "../../../src/runtime/reconciliationController";
 import { buildRuntimeConfig, type RuntimeConfig } from "../../../src/runtime/runtimeConfig";
 import { DEFAULT_SETTINGS, type VaultSyncSettings } from "../../../src/settings/settingsStore";
@@ -405,7 +409,7 @@ export class DaemonEngine {
 			token: this.membership.deviceToken,
 			database,
 			request: requester,
-			webSocket: WebSocket,
+			webSocket: WebSocket as unknown as WebSocketImplementation,
 			getSocketTicket: async (force = false) => {
 				if (force) tickets.invalidate();
 				return tickets.get(
@@ -547,7 +551,7 @@ export class DaemonEngine {
 		const providerSynced = await vaultSync.waitForProviderSync();
 		if (vaultSync.fatalAuthError) throw this.recordFatalAuth();
 		if (!providerSynced) {
-			throw new StartupError(`Timed out waiting for ${this.membership.host} to synchronize the schema-5 root`);
+			throw new StartupError(`Timed out waiting for ${this.membership.host} to synchronize the schema-6 root`);
 		}
 		await this.admitAuthoritativeDiskChanges(await host.scanMarkdown());
 		const mode = vaultSync.getSafeReconcileMode();

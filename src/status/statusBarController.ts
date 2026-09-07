@@ -1,6 +1,7 @@
 import type { ConnectionState } from "../runtime/connectionController";
 import type { VaultSyncReceiptSnapshot } from "../sync/vaultSync";
 import type { RecoveryReadiness } from "../snapshots/recoveryState";
+import type { OperationalResourcePressure } from "../runtime/operationalResourceSnapshot";
 
 
 export type ServerReceiptStatus = Readonly<
@@ -26,6 +27,7 @@ export function getLabelFromConnectionState(
 	serverReceipt?: ServerReceiptStatus | null,
 	attentionCount = 0,
 	recovery?: RecoveryReadiness | null,
+	resourcePressure?: OperationalResourcePressure | null,
 ): string {
 	let base: string;
 	switch (state.kind) {
@@ -88,6 +90,9 @@ export function getLabelFromConnectionState(
 	if (recovery) {
 		base = `${base} · Recovery ${recovery}`;
 	}
+	if (resourcePressure?.actionable) {
+		base = `${base} · ${resourcePressure.label}`;
+	}
 	return receipt ? `${base} · ${receipt}` : base;
 }
 
@@ -139,6 +144,7 @@ export function renderConnectionState(
 	serverReceipt?: ServerReceiptStatus | null,
 	attentionCount = 0,
 	recovery?: RecoveryReadiness | null,
+	resourcePressure?: OperationalResourcePressure | null,
 ): void {
 	statusBarEl.setText(getLabelFromConnectionState(
 		state,
@@ -146,6 +152,7 @@ export function renderConnectionState(
 		serverReceipt,
 		attentionCount,
 		recovery,
+		resourcePressure,
 	));
 	const receiptTitle = serverReceipt && shouldShowReceiptStatus(state)
 		? getServerReceiptStatusTitle()
@@ -153,5 +160,8 @@ export function renderConnectionState(
 	const recoveryTitle = recovery
 		? `Recovery is ${recovery}; sync connectivity and recovery preparation are independent.`
 		: "";
-	statusBarEl.setAttr("title", [receiptTitle, recoveryTitle].filter(Boolean).join(" "));
+	const resourceTitle = resourcePressure?.actionable
+		? `${resourcePressure.label}. ${resourcePressure.guidance}`
+		: "";
+	statusBarEl.setAttr("title", [receiptTitle, recoveryTitle, resourceTitle].filter(Boolean).join(" "));
 }

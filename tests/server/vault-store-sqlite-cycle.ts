@@ -42,7 +42,7 @@ export class StoreCycle {
   async fetch() {
     const store = new VaultStore(this.state.storage);
     const root = new Y.Doc({ guid: "root" });
-    root.getMap("sys").set("schemaVersion", 5);
+    root.getMap("sys").set("schemaVersion", 6);
     const rootUpdate = Y.encodeStateAsUpdate(root);
     const vaultGeneration = "generation-sqlite-cycle-0001";
     const provisioned = store.provisionVault("sqlite-cycle-vault", vaultGeneration, rootUpdate, 500);
@@ -443,8 +443,8 @@ s.test("VaultStore completes journal/checkpoint/pin/feed-floor cycle on real SQL
 		s.check(
 			result.metadata.created && result.metadata.replayed && result.metadata.generationFenceRejected
 				&& result.metadata.persisted && result.metadata.bootstrapCycle
-				&& result.metadata.schemaVersion === 5 && result.metadata.storageFormatVersion === 2,
-			"schema-5 metadata persists vaultGeneration and rejects a different provisioning incarnation",
+				&& result.metadata.schemaVersion === 6 && result.metadata.storageFormatVersion === 2,
+			"schema-6 metadata persists vaultGeneration and rejects a different provisioning incarnation",
 		);
 		s.check(result.before.entries === 61 && result.before.bytes > 1_200_000, "real SQLite journal contains the large update plus all semantic body edits");
 		s.check(result.blocked === "blocked-by-pin" && result.pinnedFloorRejected, "active capture pin blocks checkpoint compaction and feed-floor advancement");

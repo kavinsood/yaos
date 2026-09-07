@@ -26,7 +26,7 @@ async function sha256(bytes: Uint8Array): Promise<string> {
 
 s.test("missing body state never creates a placeholder and remains durably outstanding", async () => {
 	const root = new Y.Doc({ guid: "root" });
-	root.getMap("sys").set("schemaVersion", 5);
+	root.getMap("sys").set("schemaVersion", 6);
 	const rootBytes = Y.encodeStateAsUpdate(root);
 	root.destroy();
 
@@ -182,7 +182,7 @@ s.test("bootstrap root rejects schema-3 state instead of migrating it", () => {
 	legacy.getMap("sys").set("schemaVersion", 3);
 	const encodedState = Y.encodeStateAsUpdate(legacy);
 	legacy.destroy();
-	assert.throws(() => decodeBootstrapRoot(encodedState), /not schema 5/);
+	assert.throws(() => decodeBootstrapRoot(encodedState), /not schema 6/);
 });
 
 s.test("feed pages collapse repeated body and catalog work to latest durable state", () => {
@@ -210,10 +210,11 @@ s.test("feed pages collapse repeated body and catalog work to latest durable sta
 	assert.deepEqual(page.bodyGenerations.get("body-b"), { generation: 4, kind: "body" });
 });
 
-s.test("verified server-body-disk agreement creates a restart-safe common base", async () => {
+s.test("verified body-only agreement creates a restart-safe component base", async () => {
 	const bodyId = "body-common-base";
 	const path = "notes/common.md";
-	const content = "shared base\n";
+	const content = "---\ntitle: server\n---\nshared base\n";
+	const heldDiskContent = "---\ntitle: disk\n---\nshared base\n";
 	const contentHash = await canonicalMarkdownHash(content);
 	const bodyDoc = new Y.Doc({ guid: bodyId });
 	bodyDoc.getText("body").insert(0, content);
@@ -230,7 +231,8 @@ s.test("verified server-body-disk agreement creates a restart-safe common base",
 	const documents = new Map<string, StoredDocument>();
 	let materializedPath: string | null = null;
 	let settlement: StoredBodySettlement | null = null;
-	let diskContent = content;
+	let outstanding: StoredOutstandingBody | null = null;
+	let diskContent = heldDiskContent;
 	let bodyFetches = 0;
 	let diskWrites = 0;
 	const database = {
@@ -239,8 +241,10 @@ s.test("verified server-body-disk agreement creates a restart-safe common base",
 		deleteDocument: async () => {},
 		getBootstrapProgress: async () => progress,
 		putBootstrapProgress: async () => {}, putFeedCursor: async () => {},
-		getOutstanding: async () => null, putOutstanding: async () => {},
-		deleteOutstanding: async () => {}, listOutstanding: async () => [],
+		getOutstanding: async () => outstanding,
+		putOutstanding: async (value: StoredOutstandingBody) => { outstanding = structuredClone(value); },
+		deleteOutstanding: async () => { outstanding = null; },
+		listOutstanding: async () => outstanding ? [outstanding] : [],
 		getMaterializedPath: async () => materializedPath,
 		setMaterializedPath: async (_id: string, value: string) => { materializedPath = value; },
 		setMaterializedPaths: async () => {}, deleteMaterializedPath: async () => {}, listMaterializedPaths: async () => [],
@@ -256,7 +260,7 @@ s.test("verified server-body-disk agreement creates a restart-safe common base",
 		currentBody: async () => { bodyFetches++; return { bodyId, generation: 7, encodedState }; },
 	};
 	const disk = {
-		settleBody: async (input: { content: string }) => { diskWrites++; diskContent = input.content; return "settled" as const; },
+		settleBody: async () => { diskWrites++; return "settled" as const; },
 		moveBodies: async () => {}, deleteBody: async () => "deleted" as const,
 		markPendingPath: () => {}, clearPendingPath: () => {},
 		readCanonicalDiskEvidence: async () => ({
@@ -278,11 +282,37 @@ s.test("verified server-body-disk agreement creates a restart-safe common base",
 	assert.equal(storedSettlement?.content, content);
 	assert.equal(storedSettlement?.durableGeneration, 7);
 	assert.equal(storedSettlement?.pathAtSettlement, path);
+	assert.equal(storedSettlement?.format, 2);
+	if (storedSettlement?.format === 2) assert.equal(storedSettlement.agreement, "body-only");
+	assert.equal(diskContent, heldDiskContent, "bootstrap holds divergent disk properties");
 	assert.equal(diskWrites, 1);
-	await client.settleBodyNow(bodyId);
+	assert.equal(
+		(outstanding as StoredOutstandingBody | null)?.operation,
+		"properties",
+		"held properties remain explicit durable work",
+	);
+	outstanding = null;
+	await bodies.destroy();
+	const restartedBodies = new BodyManager(database);
+	restartedBodies.coordinator.bindPath(path, bodyId);
+	const restartedClient = new BootstrapClient(server as never, database as never, restartedBodies, disk as never);
+	restartedClient.configureSettlements(new BodySettlementRepository(
+		database,
+		BodySettlementRepository.markdownScope("vault-generation"),
+		canonicalMarkdownHash,
+	));
+	await restartedClient.settleBodyNow(bodyId);
 	assert.equal(bodyFetches, 1, "valid persisted base enables the fenced fast path");
 	assert.equal(diskWrites, 1, "valid exact disk evidence skips rematerialization");
-	await bodies.destroy();
+	assert.equal(
+		(outstanding as StoredOutstandingBody | null)?.operation,
+		"properties",
+		"restart self-heals missing dormant properties-held work",
+	);
+	diskContent = content;
+	await restartedClient.settleBodyNow(bodyId);
+	assert.equal(outstanding, null, "whole agreement clears properties-held work");
+	await restartedBodies.destroy();
 });
 
 s.test("null feed head records delete settlement before advancing the cursor", async () => {

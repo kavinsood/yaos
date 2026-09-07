@@ -1,5 +1,6 @@
 import { App, MarkdownView, Notice, TFile } from "obsidian";
 import { canonicalMarkdownBytes, canonicalizeMarkdown } from "@shared/markdownCodec";
+import { composeBodyOnlyProgress } from "../sync/frontmatterBoundary";
 import type { BlobSyncManager } from "../sync/blobSync";
 import type { DiskMirror } from "../sync/diskMirror";
 import {
@@ -476,15 +477,19 @@ export class ReconciliationController {
 				continue;
 			}
 			try {
-				const content = canonicalizeMarkdown(await this.deps.app.vault.read(file));
+				let content = canonicalizeMarkdown(await this.deps.app.vault.read(file));
 				if (this.deps.shouldBlockFrontmatterIngest(
 					path,
 					null,
 					content,
 					"disk-to-crdt-seed",
 				)) {
-					this.recordFrontmatterIngestBlocked(path, false, "disk-to-crdt-seed");
-					continue;
+					const partial = this.frontmatterBodyOnlyProgress(path, "", content, "disk-to-crdt-seed");
+					if (partial === null) {
+						this.recordFrontmatterIngestBlocked(path, false, "disk-to-crdt-seed");
+						continue;
+					}
+					content = partial;
 				}
 				await vaultSync.commitDiskBody({
 					bodyId: crypto.randomUUID(),
@@ -500,7 +505,7 @@ export class ReconciliationController {
 			}
 		}
 		this.deps.refreshStatusBar();
-		this.deps.log(`Imported ${imported} previously untracked files through schema-5 bodies`);
+		this.deps.log(`Imported ${imported} previously untracked files through schema-6 bodies`);
 		if (imported > 0) new Notice(`YAOS: imported ${imported} files after server sync.`);
 	}
 
@@ -746,7 +751,7 @@ export class ReconciliationController {
 		}
 
 		try {
-			const content = canonicalizeMarkdown(await this.deps.app.vault.read(file));
+			let content = canonicalizeMarkdown(await this.deps.app.vault.read(file));
 
 			const contentBytes = canonicalMarkdownBytes(content).byteLength;
 			if (runtimeConfig.maxFileSizeBytes > 0 && contentBytes > runtimeConfig.maxFileSizeBytes) {
@@ -777,13 +782,14 @@ export class ReconciliationController {
 				content,
 				previousContent === null ? "disk-to-crdt-seed" : "disk-to-crdt",
 			)) {
-				this.recordFrontmatterIngestBlocked(
-					file.path,
-					false,
-					previousContent === null ? "disk-to-crdt-seed" : "disk-to-crdt-existing",
-				);
-				await this.updateDiskIndexForPath(file.path);
-				return;
+				const branch = previousContent === null ? "disk-to-crdt-seed" : "disk-to-crdt-existing";
+				const partial = this.frontmatterBodyOnlyProgress(file.path, previousContent ?? "", content, branch);
+				if (partial === null) {
+					this.recordFrontmatterIngestBlocked(file.path, false, branch);
+					await this.updateDiskIndexForPath(file.path);
+					return;
+				}
+				content = partial;
 			}
 
 			const bodyId = vaultSync.getFileId(file.path);
@@ -997,9 +1003,15 @@ export class ReconciliationController {
 					content,
 					"bound-file-local-only-divergence",
 				)) {
-					this.recordFrontmatterIngestBlocked(file.path, true, "bound-file-local-only-divergence");
-					this.deps.scheduleTraceStateSnapshot("frontmatter-ingest-blocked");
-					return true;
+					const partial = this.frontmatterBodyOnlyProgress(
+						file.path, crdtContent ?? "", content, "bound-file-local-only-divergence",
+					);
+					if (partial === null) {
+						this.recordFrontmatterIngestBlocked(file.path, true, "bound-file-local-only-divergence");
+						this.deps.scheduleTraceStateSnapshot("frontmatter-ingest-blocked");
+						return true;
+					}
+					content = partial;
 				}
 				this.deps.log(
 					`syncFileFromDisk: recovering "${file.path}" ` +
@@ -1126,9 +1138,15 @@ export class ReconciliationController {
 					content,
 					"bound-file-local-only-seed",
 				)) {
-					this.recordFrontmatterIngestBlocked(file.path, true, "bound-file-local-only-seed");
-					this.deps.scheduleTraceStateSnapshot("frontmatter-ingest-blocked");
-					return true;
+					const partial = this.frontmatterBodyOnlyProgress(
+						file.path, "", content, "bound-file-local-only-seed",
+					);
+					if (partial === null) {
+						this.recordFrontmatterIngestBlocked(file.path, true, "bound-file-local-only-seed");
+						this.deps.scheduleTraceStateSnapshot("frontmatter-ingest-blocked");
+						return true;
+					}
+					content = partial;
 				}
 				this.deps.log(
 					`syncFileFromDisk: recovering "${file.path}" ` +
@@ -1278,9 +1296,15 @@ export class ReconciliationController {
 					content,
 					"bound-file-open-idle-disk-recovery",
 				)) {
-					this.recordFrontmatterIngestBlocked(file.path, true, "bound-file-open-idle-disk-recovery");
-					this.deps.scheduleTraceStateSnapshot("frontmatter-ingest-blocked");
-					return true;
+					const partial = this.frontmatterBodyOnlyProgress(
+						file.path, crdtContent ?? "", content, "bound-file-open-idle-disk-recovery",
+					);
+					if (partial === null) {
+						this.recordFrontmatterIngestBlocked(file.path, true, "bound-file-open-idle-disk-recovery");
+						this.deps.scheduleTraceStateSnapshot("frontmatter-ingest-blocked");
+						return true;
+					}
+					content = partial;
 				}
 				this.deps.log(
 					`syncFileFromDisk: recovering "${file.path}" ` +
@@ -1371,9 +1395,15 @@ export class ReconciliationController {
 					content,
 					"bound-file-open-idle-seed",
 				)) {
-					this.recordFrontmatterIngestBlocked(file.path, true, "bound-file-open-idle-seed");
-					this.deps.scheduleTraceStateSnapshot("frontmatter-ingest-blocked");
-					return true;
+					const partial = this.frontmatterBodyOnlyProgress(
+						file.path, "", content, "bound-file-open-idle-seed",
+					);
+					if (partial === null) {
+						this.recordFrontmatterIngestBlocked(file.path, true, "bound-file-open-idle-seed");
+						this.deps.scheduleTraceStateSnapshot("frontmatter-ingest-blocked");
+						return true;
+					}
+					content = partial;
 				}
 				this.deps.log(
 					`syncFileFromDisk: recovering "${file.path}" ` +
@@ -1560,6 +1590,26 @@ export class ReconciliationController {
 		this.deps.log(`syncFileFromDisk: skipping "${file.path}" (editor-bound, ambiguous divergence)`);
 		this.deps.scheduleTraceStateSnapshot("bound-file-ambiguous");
 		return true;
+	}
+
+	private frontmatterBodyOnlyProgress(
+		path: string,
+		currentContent: string,
+		incomingContent: string,
+		reason: string,
+	): string | null {
+		const partial = composeBodyOnlyProgress(currentContent, incomingContent);
+		if (partial.kind === "ambiguous") return null;
+		if (partial.heldPropertiesRegion === "" && partial.incomingPropertiesRegion === "") return null;
+		this.deps.trace("quarantine", "frontmatter-body-only-progress", {
+			path,
+			reason,
+			heldPropertiesLength: partial.heldPropertiesRegion.length,
+			incomingPropertiesLength: partial.incomingPropertiesRegion.length,
+			bodyLength: partial.body.length,
+		});
+		this.deps.scheduleTraceStateSnapshot("frontmatter-body-only-progress");
+		return partial.content;
 	}
 
 	/**

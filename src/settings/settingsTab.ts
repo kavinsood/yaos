@@ -15,6 +15,10 @@ import {
 	type VaultSyncSettings,
 } from "./settingsStore";
 import type { SettingsSyncStatus } from "../sync/settingsSync/types";
+import type {
+	OperationalResourcePressure,
+	OperationalResourceSnapshot,
+} from "../runtime/operationalResourceSnapshot";
 
 
 type DeclarativeSettingKey =
@@ -64,6 +68,7 @@ export interface VaultSyncSettingsHost {
 	refreshUpdateManifest(reason?: string, force?: boolean): Promise<void>;
 	refreshAttachmentSyncRuntime(reason?: string): Promise<void>;
 	getSettingsStatusSummary(): { label: string };
+	getOperationalResourceSnapshot(): OperationalResourceSnapshot | null;
 	getSettingsSyncStatus(): SettingsSyncStatus;
 	refreshSettingsSyncRuntime(): Promise<void>;
 	applySettingsSync(): Promise<void>;
@@ -137,6 +142,24 @@ function formatRosterLastSeen(lastSeenAt?: number): string {
 	return `Last seen ${new Date(lastSeenAt).toISOString()}`;
 }
 
+function formatEstimatedBytes(bytes: number): string {
+	if (bytes < 1024) return `${bytes} B`;
+	if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+	return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+}
+
+function formatAge(ageMs: number | null): string {
+	if (ageMs === null) return "none";
+	if (ageMs < 60_000) return `${Math.max(0, Math.floor(ageMs / 1000))}s`;
+	if (ageMs < 3_600_000) return `${Math.floor(ageMs / 60_000)}m`;
+	return `${Math.floor(ageMs / 3_600_000)}h`;
+}
+
+function describePressure(pressure: OperationalResourcePressure | null, now: number): string {
+	if (!pressure) return "None";
+	return `${pressure.label} (${formatAge(Math.max(0, now - pressure.observedAt))} ago). ${pressure.guidance}`;
+}
+
 export class VaultSyncSettingTab extends PluginSettingTab {
 	private pairingCode = "";
 	private lastRosterVaultId = "";
@@ -156,6 +179,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 		const attachmentsAvailable = this.host.serverSupportsAttachments;
 		const attachmentCapKB = attachmentSizeCapKB(this.host.serverMaxBlobUploadBytes);
 		const syncStatus = this.host.getSettingsStatusSummary();
+		const operationalResources = this.host.getOperationalResourceSnapshot();
 		const updateState = this.host.getUpdateState();
 		const definitions: SettingDefinitionItem[] = [];
 
@@ -361,10 +385,10 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 		definitions.push({ type: "group", heading: "Attachments", items: attachmentItems });
 
 		definitions.push({
-			type: "group",
-			heading: "Collaboration",
-			items: [
-				{
+				type: "group",
+				heading: "Collaboration",
+				items: [
+					{
 					name: "Show remote cursors",
 					desc: "Show other devices' cursors and selections while editing.",
 					control: { type: "toggle", key: "showRemoteCursors" },
@@ -374,10 +398,11 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 
 		definitions.push({
 			type: "page",
-			name: "Advanced",
-			desc: "Deployment metadata, external edits, safety, and diagnostics.",
-			items: [
-				{
+				name: "Advanced",
+				desc: "Deployment metadata, external edits, safety, and diagnostics.",
+				items: [
+					...this.buildOperationalResourceItems(operationalResources),
+					{
 					name: "Deployment repository URL",
 					desc: "Optional. The provider is inferred from this URL.",
 					control: { type: "text", key: "updateRepoUrl", placeholder: "Paste the GitHub or GitLab repository URL" },
@@ -406,6 +431,42 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 		});
 
 		return definitions;
+	}
+
+	private buildOperationalResourceItems(snapshot: OperationalResourceSnapshot | null): SettingDefinition[] {
+		if (!snapshot) {
+			return [{
+				name: "Operational resources",
+				desc: "Unavailable until the vault sync runtime is initialized.",
+			}];
+		}
+		const bodyBlockers = snapshot.blockers.bodyObservations;
+		return [
+			{
+				name: "Body residency estimate",
+				desc: `Heuristic estimate, not RAM usage: ${formatEstimatedBytes(snapshot.residency.currentEstimatedBytes)} current, ${formatEstimatedBytes(snapshot.residency.highWaterEstimatedBytes)} high-water, ${formatEstimatedBytes(snapshot.residency.configuredBudgetBytes)} configured body-estimate budget. Temporary work (${formatEstimatedBytes(snapshot.residency.temporaryReservedBytes)}) is reported separately.`,
+			},
+			{
+				name: "Queued resource work",
+				desc: `${snapshot.queued.admission.total} admission request(s) (editor ${snapshot.queued.admission.editor}, foreground ${snapshot.queued.admission.foreground}, background ${snapshot.queued.admission.background}); ${snapshot.queued.overdue.total} overdue job(s) (interactive ${snapshot.queued.overdue.interactive}, normal ${snapshot.queued.overdue.normal}, background ${snapshot.queued.overdue.background}). Oldest queued age: ${formatAge(snapshot.queued.oldestAgeMs)}.`,
+			},
+			{
+				name: "Resource blockers",
+				desc: `Body observations — active ${bodyBlockers.active}, dirty ${bodyBlockers.dirty}, durably pending ${bodyBlockers.durablyPending}, leased ${bodyBlockers.leased}. Overdue blockers — decision ${snapshot.blockers.overdueDecisionRequired}, permanent ${snapshot.blockers.overduePermanentlyBlocked}.`,
+			},
+			{
+				name: "Body sockets",
+				desc: `${snapshot.sockets.used} used + ${snapshot.sockets.reserved} reserved + ${snapshot.sockets.fixed} fixed of ${snapshot.sockets.limit} configured; ${snapshot.sockets.plannedRelease} planned release(s).`,
+			},
+			{
+				name: "Current resource pressure",
+				desc: describePressure(snapshot.currentPressure, snapshot.capturedAt),
+			},
+			{
+				name: "Last resource pressure",
+				desc: describePressure(snapshot.lastPressure, snapshot.capturedAt),
+			},
+		];
 	}
 
 	private buildSettingsSyncGroup(): SettingDefinitionItem {

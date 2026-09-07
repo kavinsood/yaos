@@ -2,13 +2,13 @@
 /**
  * Regression coverage for scripts/guard-schema-version.mjs.
  *
- * Schema 4 is pinned in the plugin's sync schema and the server's shared
+ * Schema 6 is pinned in the plugin's sync schema and the server's shared
  * product-version source. The public server version module must derive its
  * schema export from that canonical server pin rather than duplicate a number.
  *
  * These fixtures prove that the real guard fails closed when the canonical
  * server source is missing or mismatched, while accepting the exact schema-4
- * contract.
+ * schema contract and its durable SQLite constraint.
  */
 
 import { spawnSync } from "node:child_process";
@@ -22,7 +22,7 @@ const guardPath = resolve(repoRoot(), "scripts/guard-schema-version.mjs");
 
 function makePluginFixture(dir: string) {
 	mkdirSync(join(dir, "src/sync"), { recursive: true });
-	writeFileSync(join(dir, "src/sync/schema.ts"), "export const SCHEMA_VERSION = 5;\n");
+	writeFileSync(join(dir, "src/sync/schema.ts"), "export const SCHEMA_VERSION = 6;\n");
 }
 
 function writeServerVersionModule(dir: string) {
@@ -39,6 +39,10 @@ function makeServerFixture(dir: string, schemaVersion: number) {
 	writeFileSync(
 		join(dir, "server/src/shared/productVersions.ts"),
 		`export const SCHEMA_VERSION = ${schemaVersion};\n`,
+	);
+	writeFileSync(
+		join(dir, "server/src/vaultDocumentStore.ts"),
+		`const sql = \`schema_version INTEGER NOT NULL CHECK(schema_version = ${schemaVersion})\`;\n`,
 	);
 	writeServerVersionModule(dir);
 }
@@ -74,7 +78,7 @@ await withTempDir("yaos-schema-version-guard-", (fixtureDir) => {
 s.section("Test 2: a mismatched canonical server pin fails closed");
 await withTempDir("yaos-schema-version-guard-", (fixtureDir) => {
 	makePluginFixture(fixtureDir);
-	makeServerFixture(fixtureDir, 6);
+	makeServerFixture(fixtureDir, 5);
 
 	const result = runGuard(fixtureDir);
 
@@ -89,17 +93,34 @@ await withTempDir("yaos-schema-version-guard-", (fixtureDir) => {
 	);
 });
 
-s.section("Test 3: exact schema-5 pins pass");
+s.section("Test 3: exact schema-6 pins pass");
 await withTempDir("yaos-schema-version-guard-", (fixtureDir) => {
 	makePluginFixture(fixtureDir);
-	makeServerFixture(fixtureDir, 5);
+	makeServerFixture(fixtureDir, 6);
 
 	const result = runGuard(fixtureDir);
 
-	s.check(result.status === 0, "guard accepts matching schema-5 source pins");
+	s.check(result.status === 0, "guard accepts matching schema-6 source pins");
 	s.check(
 		result.stdout.includes("PASS: schema version guard — all checks passed."),
-		"guard reports overall success for the exact schema-4 contract",
+		"guard reports overall success for the exact schema-6 contract",
+	);
+});
+
+s.section("Test 4: a stale durable SQL schema constraint fails closed");
+await withTempDir("yaos-schema-version-guard-", (fixtureDir) => {
+	makePluginFixture(fixtureDir);
+	makeServerFixture(fixtureDir, 6);
+	writeFileSync(
+		join(fixtureDir, "server/src/vaultDocumentStore.ts"),
+		"const sql = `schema_version INTEGER NOT NULL CHECK(schema_version = 5)`;\n",
+	);
+	const result = runGuard(fixtureDir);
+
+	s.check(result.status === 1, "guard exits non-zero for a stale SQLite schema constraint");
+	s.check(
+		result.stderr.includes("schema_version CHECK pins 5, expected canonical server schema 6"),
+		"guard reports the stale durable constraint",
 	);
 });
 await s.done();

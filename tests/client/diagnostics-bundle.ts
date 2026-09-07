@@ -64,6 +64,7 @@ import {
 } from "../../src/telemetry/diagnostics/diagnosticsBundle";
 import { BodyManager } from "../../src/sync/bodyManager";
 import { ResidencyAdmissionCoordinator } from "../../src/runtime/residencyAdmissionCoordinator";
+import { OperationalResourceSnapshotTracker } from "../../src/runtime/operationalResourceSnapshot";
 import { suite } from "../harness.ts";
 
 const s = suite("diagnostics-bundle");
@@ -157,6 +158,17 @@ function makeState(overrides: Partial<TraceHeaderStateInput> = {}): TraceHeaderS
 			awaitingFirstProviderSyncAfterStartup: false,
 			lastReconciledGeneration: 1,
 			connectedToServer: true,
+			websocketOpen: true,
+			applicationResponsive: true,
+			lastLivenessAckAt: 1,
+			socketLiveness: {
+				rootPhase: "healthy",
+				healthy: 1,
+				probing: 0,
+				suspended: 0,
+				failed: 0,
+				timeoutCount: 0,
+			},
 			providerSynced: true,
 			localCacheReady: true,
 			connectionGeneration: 1,
@@ -188,6 +200,8 @@ function makeState(overrides: Partial<TraceHeaderStateInput> = {}): TraceHeaderS
 			serverReachable: true,
 			authAccepted: true,
 			websocketOpen: true,
+			applicationResponsive: true,
+			lastLivenessAckAt: 1,
 			lastAuthRejectCode: null,
 			lastLocalUpdateAt: null,
 			lastLocalUpdateWhileConnectedAt: null,
@@ -272,23 +286,31 @@ s.test("body residency accounting is included with its estimate caveat", async (
 		backgroundPromotionMs: 100,
 		maxPreferredBurst: 2,
 	}).snapshot();
+	const overdueWorkDiagnostics = {
+		stopped: false,
+		draining: false,
+		pokePending: false,
+		lastPokeReason: "network-online",
+		nextWakeAt: 123,
+		queue: [],
+	} as const;
+	const operationalResourceSnapshot = new OperationalResourceSnapshotTracker().capture({
+		residency: snapshot,
+		admission,
+		overdue: [overdueWorkDiagnostics],
+	}, 456);
 	const { header } = await buildTraceHeader(makeInput({
 		state: makeState({
 			bodyResidencySnapshot: snapshot,
 			residencyAdmissionSnapshot: admission,
-			overdueWorkDiagnostics: {
-				stopped: false,
-				draining: false,
-				pokePending: false,
-				lastPokeReason: "network-online",
-				nextWakeAt: 123,
-				queue: [],
-			},
+			overdueWorkDiagnostics,
+			operationalResourceSnapshot,
 		}),
 	}));
 	const residency = header.bodyResidency as Record<string, unknown>;
 	const admissionHeader = header.residencyAdmission as Record<string, unknown>;
 	const overdueWork = header.overdueWork as Record<string, unknown>;
+	const operationalResources = header.operationalResources as Record<string, unknown>;
 	s.check(residency.estimatorVersion === "yaos-body-residency-v1", "header carries estimator version");
 	s.check(
 		residency.claim === "heuristic-resident-estimate-not-heap-measurement",
@@ -299,6 +321,10 @@ s.test("body residency accounting is included with its estimate caveat", async (
 		"header includes scalar residency admission budgets without runtime handles",
 	);
 	s.check(overdueWork.lastPokeReason === "network-online", "header includes overdue-work diagnostics");
+	s.check(
+		operationalResources.estimateClaim === "heuristic-resident-estimate-not-heap-measurement",
+		"header includes the same bounded operational resource view used by product UX",
+	);
 	await manager.destroy();
 });
 

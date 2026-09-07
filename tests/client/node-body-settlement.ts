@@ -10,18 +10,39 @@ const s = suite("node-body-settlement");
 
 function settlement(revision: number, generation: number): StoredBodySettlement {
 	return {
-		format: 1,
+		format: 2,
 		bodyId: "body",
 		vaultGeneration: "generation",
 		canonicalVersion: "markdown-lf-v1",
+		boundaryVersion: "frontmatter-boundary-v1",
+		agreement: "whole",
 		content: "base",
 		contentHash: "a".repeat(64),
+		diskContentHash: "a".repeat(64),
 		durableGeneration: generation,
 		serverContentHash: "a".repeat(64),
 		diskFingerprint: { bytes: 4, hash: "b".repeat(64) },
 		pathAtSettlement: "note.md",
 		localSettlementRevision: revision,
 		settledAt: revision,
+		bodyBase: {
+			kind: "available",
+			content: "base",
+			contentHash: "a".repeat(64),
+			advancedAtGeneration: generation,
+		},
+		propertiesBase: {
+			kind: "available",
+			content: "",
+			contentHash: "a".repeat(64),
+			advancedAtGeneration: generation,
+		},
+		observation: {
+			serverBodyHash: "a".repeat(64),
+			serverPropertiesHash: "a".repeat(64),
+			diskBodyHash: "a".repeat(64),
+			diskPropertiesHash: "a".repeat(64),
+		},
 	};
 }
 

@@ -17,7 +17,7 @@ export interface ImmutableArtifactStore {
 export interface BootstrapDescriptor {
 	format: "yaos-bootstrap-v1";
 	bootstrapId: string;
-	schemaVersion: 5;
+	schemaVersion: 6;
 	storageFormatVersion: 2;
 	createdAt: string;
 	serverCompleted: boolean;
@@ -161,7 +161,7 @@ export class BootstrapService {
 		return {
 			format: "yaos-bootstrap-v1",
 			bootstrapId: operation.operationId,
-			schemaVersion: SERVER_SCHEMA_VERSION as 5,
+			schemaVersion: SERVER_SCHEMA_VERSION as 6,
 			storageFormatVersion: SERVER_STORAGE_FORMAT_VERSION as 2,
 			serverCompleted: operation.state === "complete",
 			createdAt: new Date(operation.createdAt).toISOString(),

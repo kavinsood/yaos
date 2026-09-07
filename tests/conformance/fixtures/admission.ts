@@ -24,7 +24,7 @@ const protocol = await rejectedSocket(target.deviceA, { ticket: ticket.ticket, s
 assert.equal(protocol.code, "update_required");
 assert.equal(protocol.reason, "protocol_mismatch");
 assert.equal(protocol.serverProtocolVersion, PROTOCOL_VERSION);
-pass("authenticated sockets enforce protocol 1");
+pass("authenticated sockets enforce protocol 2");
 
 const wrongVault = await jsonRequest(`${target.baseUrl}/vault/${encodeURIComponent(`${target.deviceA.vaultId}x`)}/auth/ticket`, {
 	method: "POST", headers: { authorization: `Bearer ${target.deviceA.deviceToken}` },

@@ -53,6 +53,18 @@ export type AdmissionBackpressureReason =
 	| "protected_residency_saturation"
 	| "socket_budget";
 
+export interface AdmissionPressureDiagnostic {
+	readonly reason: AdmissionBackpressureReason;
+	readonly observedAt: number;
+	readonly priority: AdmissionPriority;
+	readonly demand: {
+		readonly residentCost: number;
+		readonly transientCost: number;
+		readonly loadSlots: number;
+		readonly socketSlots: number;
+	};
+}
+
 export interface AdmissionReservation {
 	readonly reservationId: string;
 	readonly request: AdmissionRequest;
@@ -93,6 +105,11 @@ export interface ResidencyAdmissionSnapshot {
 		durablyPending: number;
 		leased: number;
 		active: number;
+	};
+	readonly oldestQueuedAt?: number | null;
+	readonly pressure?: {
+		readonly current: AdmissionPressureDiagnostic | null;
+		readonly last: AdmissionPressureDiagnostic | null;
 	};
 }
 
@@ -135,6 +152,9 @@ export class ResidencyAdmissionCoordinator {
 	private preferredBurst = 0;
 	private platform: RuntimePlatform = "desktop";
 	private visibility: RuntimeVisibility = "foreground";
+	private currentPressure: AdmissionPressureDiagnostic | null = null;
+	private currentPressureRequestId: string | null = null;
+	private lastPressure: AdmissionPressureDiagnostic | null = null;
 
 	constructor(
 		readonly limits: ResidencyAdmissionLimits,
@@ -186,6 +206,7 @@ export class ResidencyAdmissionCoordinator {
 			};
 			this.validateRequest(coalesced);
 			this.queue.set(coalesced.requestId, coalesced);
+			if (this.currentPressureRequestId === coalesced.requestId) this.clearCurrentPressure();
 			return coalesced;
 		}
 		const request: AdmissionRequest = {
@@ -198,7 +219,9 @@ export class ResidencyAdmissionCoordinator {
 	}
 
 	cancelRequest(requestId: string): boolean {
-		return this.queue.delete(requestId);
+		const cancelled = this.queue.delete(requestId);
+		if (cancelled && this.currentPressureRequestId === requestId) this.clearCurrentPressure();
+		return cancelled;
 	}
 
 	cancelBodyRequests(bodyId: string): number {
@@ -206,6 +229,7 @@ export class ResidencyAdmissionCoordinator {
 		for (const [requestId, request] of this.queue) {
 			if (request.bodyId !== bodyId) continue;
 			this.queue.delete(requestId);
+			if (this.currentPressureRequestId === requestId) this.clearCurrentPressure();
 			cancelled++;
 		}
 		return cancelled;
@@ -216,16 +240,16 @@ export class ResidencyAdmissionCoordinator {
 		const request = this.pickNext(now);
 		if (!request) return { kind: "idle" };
 		if (this.isOptionalAdmissionPaused(request)) {
-			return { kind: "backpressure", request, reason: "mobile_background" };
+			return this.backpressure(request, "mobile_background", now);
 		}
 		const resourceFailure = this.checkFixedResources(request);
-		if (resourceFailure) return { kind: "backpressure", request, reason: resourceFailure };
+		if (resourceFailure) return this.backpressure(request, resourceFailure, now);
 		const residency = this.planResidency(request);
 		if (!residency) {
-			return { kind: "backpressure", request, reason: "protected_residency_saturation" };
+			return this.backpressure(request, "protected_residency_saturation", now);
 		}
 		const sockets = this.planSockets(request, residency.evictBodyIds);
-		if (!sockets) return { kind: "backpressure", request, reason: "socket_budget" };
+		if (!sockets) return this.backpressure(request, "socket_budget", now);
 		const reservation: AdmissionReservation = {
 			reservationId: `residency-${++this.reservationSequence}-${this.createId()}`,
 			request,
@@ -238,6 +262,7 @@ export class ResidencyAdmissionCoordinator {
 		};
 		this.queue.delete(request.requestId);
 		this.reservations.set(reservation.reservationId, reservation);
+		this.clearCurrentPressure();
 		if (request.priority === "background") this.preferredBurst = 0;
 		else this.preferredBurst++;
 		return { kind: "granted", reservation };
@@ -331,7 +356,41 @@ export class ResidencyAdmissionCoordinator {
 			loads: { used: loadsUsed, reserved: loadsReserved, limit: this.limits.concurrentLoads },
 			sockets: { used: socketsUsed, reserved: socketsReserved, plannedRelease: plannedSocketRelease, fixed: this.limits.reservedSockets, limit: this.limits.sockets },
 			blockers,
+			oldestQueuedAt: this.queue.size > 0
+				? Math.min(...[...this.queue.values()].map((request) => request.requestedAt))
+				: null,
+			pressure: {
+				current: this.currentPressure,
+				last: this.lastPressure,
+			},
 		};
+	}
+
+	private backpressure(
+		request: AdmissionRequest,
+		reason: AdmissionBackpressureReason,
+		observedAt: number,
+	): AdmissionDecision {
+		const pressure: AdmissionPressureDiagnostic = {
+			reason,
+			observedAt,
+			priority: request.priority,
+			demand: {
+				residentCost: request.needsLoad ? request.residentCost : 0,
+				transientCost: request.transientCost,
+				loadSlots: request.needsLoad ? 1 : 0,
+				socketSlots: request.needsSocket ? 1 : 0,
+			},
+		};
+		this.currentPressure = pressure;
+		this.currentPressureRequestId = request.requestId;
+		this.lastPressure = pressure;
+		return { kind: "backpressure", request, reason };
+	}
+
+	private clearCurrentPressure(): void {
+		this.currentPressure = null;
+		this.currentPressureRequestId = null;
 	}
 
 	private pickNext(now: number): AdmissionRequest | null {

@@ -75,12 +75,17 @@ export interface DiskIndexEntry {
 	contentHash?: string;
 	/** Representation contract under which contentHash was computed. */
 	contentHashVersion?: MarkdownCanonicalVersion;
+	/** Whole-file authority is absent while only the Markdown body is settled. */
+	settlementKind?: "whole" | "body-only";
+	bodyContentHash?: string;
+	propertiesContentHash?: string;
 }
 
 export type DiskIndex = Record<string, DiskIndexEntry>;
 
 export function currentContentHash(entry: DiskIndexEntry | undefined): string | undefined {
-	return entry?.contentHashVersion === MARKDOWN_CANONICAL_VERSION
+	return entry?.settlementKind !== "body-only"
+		&& entry?.contentHashVersion === MARKDOWN_CANONICAL_VERSION
 		? entry.contentHash
 		: undefined;
 }
@@ -88,6 +93,21 @@ export function currentContentHash(entry: DiskIndexEntry | undefined): string | 
 export function setCurrentContentHash(entry: DiskIndexEntry, contentHash: string): void {
 	entry.contentHash = contentHash;
 	entry.contentHashVersion = MARKDOWN_CANONICAL_VERSION;
+	entry.settlementKind = "whole";
+	delete entry.bodyContentHash;
+	delete entry.propertiesContentHash;
+}
+
+export function setPartialContentHashes(
+	entry: DiskIndexEntry,
+	bodyContentHash: string,
+	propertiesContentHash: string,
+): void {
+	delete entry.contentHash;
+	delete entry.contentHashVersion;
+	entry.settlementKind = "body-only";
+	entry.bodyContentHash = bodyContentHash;
+	entry.propertiesContentHash = propertiesContentHash;
 }
 
 /**
@@ -112,6 +132,13 @@ export function readDiskIndex(value: unknown): DiskIndex {
 			&& /^[a-f0-9]{64}$/.test(entry.contentHash)
 		) {
 			setCurrentContentHash(parsed, entry.contentHash);
+		}
+		if (
+			entry.settlementKind === "body-only"
+			&& typeof entry.bodyContentHash === "string" && /^[a-f0-9]{64}$/.test(entry.bodyContentHash)
+			&& typeof entry.propertiesContentHash === "string" && /^[a-f0-9]{64}$/.test(entry.propertiesContentHash)
+		) {
+			setPartialContentHashes(parsed, entry.bodyContentHash, entry.propertiesContentHash);
 		}
 		result[path] = parsed;
 	}
@@ -271,6 +298,11 @@ export function updateIndex(
 			...(contentHash !== undefined && {
 				contentHash,
 				contentHashVersion: MARKDOWN_CANONICAL_VERSION,
+			}),
+			...(settledHash === undefined && oldEntry?.settlementKind === "body-only" && {
+				settlementKind: "body-only" as const,
+				bodyContentHash: oldEntry.bodyContentHash,
+				propertiesContentHash: oldEntry.propertiesContentHash,
 			}),
 		};
 	}

@@ -115,6 +115,31 @@ s.test("forced reconnect waits for an admitted body and then refreshes again", a
 	]);
 });
 
+s.test("a completed global admission does not capture later reconnects", async () => {
+	const scope = new RuntimeScope();
+	const events: string[] = [];
+	let refreshes = 0;
+	const coordinator = new SocketAdmissionCoordinator({
+		scope,
+		refreshCredential: async () => {
+			refreshes++;
+			return { expiresAt: Date.now() + 60_000 };
+		},
+		providers: () => [fakeProvider("root", events)],
+		afterAdmission: async () => {},
+		classifyFailure: () => ({ failure: "internal", terminal: false }),
+		isBlocked: () => false,
+		log: () => {},
+	});
+	assert.equal((await coordinator.request("first")).kind, "completed");
+	assert.equal((await coordinator.request("liveness-recovery")).kind, "completed");
+	assert.equal(refreshes, 2);
+	assert.deepEqual(events, [
+		"root:disconnect", "root:connect",
+		"root:disconnect", "root:connect",
+	]);
+});
+
 s.test("terminal and retryable credential failures remain distinct", async () => {
 	for (const expected of ["permanently_blocked", "retryable_failure"] as const) {
 		const scope = new RuntimeScope();

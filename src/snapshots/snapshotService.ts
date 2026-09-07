@@ -26,6 +26,9 @@ import {
 	RecoverySnapshotListModal,
 } from "./recoveryModals";
 import type { PendingRecoveryState } from "./recoveryState";
+import type { OperationOutcome } from "../runtime/operationLifecycle";
+import { RecoveryWorkScheduler } from "./recoveryWorkScheduler";
+import type { OverdueWorkDiagnostics } from "../runtime/overdueWorkKernel";
 
 interface SnapshotServiceDeps {
 	app: App;
@@ -47,22 +50,39 @@ const STATUS_POLL_MS = 5_000;
 const RESTORE_PAGE_SIZE = 50;
 
 export class SnapshotService {
-	private monitorTimer: number | null = null;
-	private monitoring = false;
+	private readonly workScheduler: RecoveryWorkScheduler;
 	private captureStatusModal: RecoveryCaptureStatusModal | null = null;
 	private snapshotListModal: RecoverySnapshotListModal | null = null;
 	private browseModal: RecoveryBrowseModal | null = null;
 
-	constructor(private readonly deps: SnapshotServiceDeps) {}
+	constructor(private readonly deps: SnapshotServiceDeps) {
+		this.workScheduler = new RecoveryWorkScheduler({
+			runCapture: (captureId) => this.runCaptureWork(captureId),
+			runRestore: (restoreId, snapshotId) => this.runRestoreWork(restoreId, snapshotId),
+			onError: (error) => this.deps.log(`Recovery work scheduler failed: ${formatUnknown(error)}`),
+		});
+	}
 
 	resumePersistedOperations(): void {
 		const pending = this.deps.getPendingRecoveryState();
-		if (pending.activeCaptureId || pending.activeRestore) this.scheduleMonitor(0);
+		if (pending.activeCaptureId) {
+			void this.workScheduler.queueCapture(pending.activeCaptureId)
+				.catch((error) => this.deps.log(`Capture resume scheduling failed: ${formatUnknown(error)}`));
+		}
+		if (pending.activeRestore) {
+			void this.workScheduler.queueRestore(
+				pending.activeRestore.restoreId,
+				pending.activeRestore.snapshotId,
+			).catch((error) => this.deps.log(`Restore resume scheduling failed: ${formatUnknown(error)}`));
+		}
+	}
+
+	getOverdueWorkDiagnostics(): OverdueWorkDiagnostics {
+		return this.workScheduler.diagnostics();
 	}
 
 	destroy(): void {
-		if (this.monitorTimer !== null) window.clearTimeout(this.monitorTimer);
-		this.monitorTimer = null;
+		this.workScheduler.stop();
 		this.captureStatusModal?.close();
 		this.captureStatusModal = null;
 		this.snapshotListModal?.close();
@@ -83,7 +103,7 @@ export class SnapshotService {
 			const started = await this.client().startCapture("daily", crypto.randomUUID());
 			await this.persist({ activeCaptureId: started.captureId, lastCaptureStatus: null });
 			this.deps.log(`Daily recovery capture queued at sequence ${started.boundarySequence}: ${started.captureId}`);
-			this.scheduleMonitor(0);
+			await this.workScheduler.queueCapture(started.captureId);
 		} catch (error) {
 			this.deps.log(`Daily recovery capture admission failed: ${formatUnknown(error)}`);
 		}
@@ -102,7 +122,7 @@ export class SnapshotService {
 			const started = await this.client().startCapture("manual");
 			await this.persist({ activeCaptureId: started.captureId, lastCaptureStatus: null });
 			new Notice("Recovery capture queued. It will continue if Obsidian closes.", 7000);
-			this.scheduleMonitor(0);
+			await this.workScheduler.queueCapture(started.captureId);
 		} catch (error) {
 			this.recordRecoveryEvent(PRODUCT_EVENT_KIND.recoveryCaptureComplete, "error", { reason: "manual", error: formatUnknown(error) });
 			new Notice(`Recovery capture could not start: ${formatUnknown(error)}`, 8000);
@@ -179,7 +199,7 @@ export class SnapshotService {
 		}
 		if (!this.deps.getRecoveryRuntime() || !this.canUseRecovery("restart the restore")) return;
 		this.recordRecoveryEvent(PRODUCT_EVENT_KIND.recoveryRestoreRestarted, "info", active);
-		await this.resumeRestore(active.restoreId, active.snapshotId);
+		await this.workScheduler.queueRestore(active.restoreId, active.snapshotId);
 	}
 
 	private async browseSnapshot(snapshot: RecoverySnapshotSummary): Promise<void> {
@@ -209,35 +229,44 @@ export class SnapshotService {
 			const started = await this.client().startRestore(snapshotId, selection);
 			await this.persist({ activeRestore: { restoreId: started.restoreId, snapshotId }, lastRestoreStatus: null });
 			new Notice("Restore job queued. Work is checkpointed and can resume after restart.", 8000);
-			await this.resumeRestore(started.restoreId, snapshotId);
+			await this.workScheduler.queueRestore(started.restoreId, snapshotId);
 		} catch (error) {
 			new Notice(`Restore could not start: ${formatUnknown(error)}`, 10000);
 		}
 	}
 
-	private async resumeRestore(restoreId: string, snapshotId: string): Promise<void> {
+	private async runRestoreWork(restoreId: string, snapshotId: string): Promise<OperationOutcome> {
+		if (!this.isActiveRestore(restoreId, snapshotId)) {
+			return { kind: "superseded" };
+		}
 		const runtime = this.deps.getRecoveryRuntime();
 		if (!runtime) {
-			this.scheduleMonitor(STATUS_POLL_MS);
-			return;
+			return { kind: "retryable_failure", failure: "internal", retryAfterMs: STATUS_POLL_MS };
 		}
 		try {
 			const status = await this.client().getRestoreStatus(restoreId);
+			if (!this.isActiveRestore(restoreId, snapshotId)) {
+				return { kind: "superseded" };
+			}
 			await this.persist({ lastRestoreStatus: status });
 			if (status.state === "failed" || status.state === "cancelled") {
 				await this.persist({ activeRestore: null });
 				new Notice(`Restore ${status.state}${status.error ? `: ${status.error.code}` : ""}.`, 10000);
-				return;
+				return { kind: "completed", value: undefined };
 			}
 			if (status.state === "complete") {
 				await this.persist({ activeRestore: null });
 				new Notice("Restore complete.", 8000);
 				this.deps.onEditorsNeedReconcile("recovery-restore");
-				return;
+				return { kind: "completed", value: undefined };
 			}
 			if (status.state !== "awaiting-results") {
-				this.scheduleMonitor(this.retryDelay(status.state === "retrying" ? status.nextAttemptAt : null));
-				return;
+				await this.workScheduler.queueRestore(
+					restoreId,
+					snapshotId,
+					this.retryDelay(status.state === "retrying" ? status.nextAttemptAt : null),
+				);
+				return { kind: "completed", value: undefined };
 			}
 			let cursor: string | null = null;
 			let applied = 0;
@@ -245,17 +274,21 @@ export class SnapshotService {
 				const page = await this.client().listRestoreItems(restoreId, cursor, RESTORE_PAGE_SIZE);
 				if (page.items.length === 0) break;
 				const results = await this.applyRestorePage(restoreId, snapshotId, page.items, runtime);
+				if (!this.isActiveRestore(restoreId, snapshotId)) {
+					return { kind: "superseded" };
+				}
 				const nextStatus = await this.client().reportRestoreResults(restoreId, results);
 				await this.persist({ lastRestoreStatus: nextStatus });
 				applied += results.length;
 				cursor = page.nextCursor;
 			} while (cursor && applied < 500);
 			this.deps.onEditorsNeedReconcile("recovery-restore");
-			this.scheduleMonitor(0);
+			await this.workScheduler.queueRestore(restoreId, snapshotId, 250);
+			return { kind: "completed", value: undefined };
 		} catch (error) {
 			this.deps.log(`Restore ${restoreId} paused: ${formatUnknown(error)}`);
 			new Notice(`Restore paused: ${formatUnknown(error)}. It will retry safely.`, 10000);
-			this.scheduleMonitor(STATUS_POLL_MS);
+			return { kind: "retryable_failure", failure: "network", retryAfterMs: STATUS_POLL_MS };
 		}
 	}
 
@@ -328,7 +361,9 @@ export class SnapshotService {
 		if (!captureId) return;
 		try {
 			const status = await this.client().cancelCapture(captureId);
-			await this.persist({ activeCaptureId: isRecoveryTerminal(status.state) ? null : captureId, lastCaptureStatus: status });
+			const terminal = isRecoveryTerminal(status.state);
+			await this.persist({ activeCaptureId: terminal ? null : captureId, lastCaptureStatus: status });
+			if (terminal) await this.workScheduler.queueCapture(captureId);
 			this.captureStatusModal?.setCaptureStatus(status);
 			new Notice(status.state === "cancelled" ? "Recovery capture cancelled." : `Capture is ${status.state}.`);
 		} catch (error) {
@@ -341,10 +376,12 @@ export class SnapshotService {
 		if (!active) return;
 		try {
 			const status = await this.client().cancelRestore(active.restoreId);
+			const terminal = isRecoveryTerminal(status.state);
 			await this.persist({
-				activeRestore: isRecoveryTerminal(status.state) ? null : active,
+				activeRestore: terminal ? null : active,
 				lastRestoreStatus: status,
 			});
+			if (terminal) await this.workScheduler.queueRestore(active.restoreId, active.snapshotId);
 			await this.refreshRecoveryStatusModal();
 			new Notice(status.state === "cancelled" ? "Recovery restore cancelled." : `Restore is ${status.state}.`);
 		} catch (error) {
@@ -364,76 +401,65 @@ export class SnapshotService {
 		}
 	}
 
-	private scheduleMonitor(delayMs: number): void {
-		if (this.monitorTimer !== null) window.clearTimeout(this.monitorTimer);
-		this.monitorTimer = window.setTimeout(() => {
-			this.monitorTimer = null;
-			void this.monitorPending();
-		}, delayMs);
+	private async runCaptureWork(captureId: string): Promise<OperationOutcome> {
+		if (this.deps.getPendingRecoveryState().activeCaptureId !== captureId) {
+			return { kind: "superseded" };
+		}
+		try {
+			const status = await this.client().getCaptureStatus(captureId);
+			if (this.deps.getPendingRecoveryState().activeCaptureId !== captureId) {
+				return { kind: "superseded" };
+			}
+			await this.persist({
+				lastCaptureStatus: status,
+				activeCaptureId: isRecoveryTerminal(status.state) ? null : captureId,
+			});
+			this.captureStatusModal?.setCaptureStatus(status);
+			if (status.state === "complete" || status.state === "complete_with_gaps") {
+				this.recordRecoveryEvent(PRODUCT_EVENT_KIND.recoveryCaptureComplete, "info", {
+					captureId: status.captureId,
+					snapshotId: status.snapshotId,
+					state: status.state,
+				});
+				new Notice(
+					status.state === "complete_with_gaps"
+						? "Recovery point captured with unavailable items. Open recovery status for details."
+						: status.snapshotId ? "Recovery point captured." : "Recovery capture completed.",
+					10000,
+				);
+			} else if (status.state === "failed" || status.state === "cancelled") {
+				this.recordRecoveryEvent(
+					PRODUCT_EVENT_KIND.recoveryCaptureComplete,
+					status.state === "failed" ? "error" : "info",
+					{ captureId: status.captureId, state: status.state, error: status.error },
+				);
+				new Notice(`Recovery capture ${status.state}${status.error ? `: ${status.error.code}` : ""}.`, 10000);
+			}
+			await this.refreshRecoveryReadinessBestEffort();
+			if (isRecoveryTerminal(status.state)) {
+				return { kind: "completed", value: undefined };
+			}
+			await this.workScheduler.queueCapture(captureId, this.retryDelay(status.nextAttemptAt));
+			return { kind: "completed", value: undefined };
+		} catch (error) {
+			this.deps.log(`Capture status resume failed: ${formatUnknown(error)}`);
+			return { kind: "retryable_failure", failure: "network", retryAfterMs: STATUS_POLL_MS };
+		}
 	}
 
-	private async monitorPending(): Promise<void> {
-		if (this.monitoring) return;
-		this.monitoring = true;
+	private async refreshRecoveryReadinessBestEffort(): Promise<void> {
 		try {
-			const pending = this.deps.getPendingRecoveryState();
-			let nextDelay: number | null = null;
-			if (pending.activeCaptureId) {
-				try {
-					const status = await this.client().getCaptureStatus(pending.activeCaptureId);
-					await this.persist({
-						lastCaptureStatus: status,
-						activeCaptureId: isRecoveryTerminal(status.state) ? null : pending.activeCaptureId,
-					});
-					this.captureStatusModal?.setCaptureStatus(status);
-					if (status.state === "complete" || status.state === "complete_with_gaps") {
-						this.recordRecoveryEvent(PRODUCT_EVENT_KIND.recoveryCaptureComplete, "info", {
-							captureId: status.captureId,
-							snapshotId: status.snapshotId,
-							state: status.state,
-						});
-						new Notice(
-							status.state === "complete_with_gaps"
-								? "Recovery point captured with unavailable items. Open recovery status for details."
-								: status.snapshotId ? "Recovery point captured." : "Recovery capture completed.",
-							10000,
-						);
-					} else if (status.state === "failed" || status.state === "cancelled") {
-						this.recordRecoveryEvent(
-							PRODUCT_EVENT_KIND.recoveryCaptureComplete,
-							status.state === "failed" ? "error" : "info",
-							{ captureId: status.captureId, state: status.state, error: status.error },
-						);
-						new Notice(`Recovery capture ${status.state}${status.error ? `: ${status.error.code}` : ""}.`, 10000);
-					} else {
-						nextDelay = this.retryDelay(status.nextAttemptAt);
-					}
-				} catch (error) {
-					this.deps.log(`Capture status resume failed: ${formatUnknown(error)}`);
-					nextDelay = STATUS_POLL_MS;
-				}
-			}
-			const activeRestore = this.deps.getPendingRecoveryState().activeRestore;
-			if (activeRestore) {
-				await this.resumeRestore(activeRestore.restoreId, activeRestore.snapshotId);
-				nextDelay = STATUS_POLL_MS;
-			}
-			try {
-				const recovery = await this.client().getRecoveryStatus();
-				await this.persist({ lastRecoveryStatus: recovery });
-				this.captureStatusModal?.setRecoveryStatus(recovery);
-			} catch (error) {
-				this.deps.log(`Recovery readiness refresh failed: ${formatUnknown(error)}`);
-			}
-			if (
-				nextDelay !== null
-				&& (this.deps.getPendingRecoveryState().activeCaptureId || this.deps.getPendingRecoveryState().activeRestore)
-			) {
-				this.scheduleMonitor(nextDelay);
-			}
-		} finally {
-			this.monitoring = false;
+			const recovery = await this.client().getRecoveryStatus();
+			await this.persist({ lastRecoveryStatus: recovery });
+			this.captureStatusModal?.setRecoveryStatus(recovery);
+		} catch (error) {
+			this.deps.log(`Recovery readiness refresh failed: ${formatUnknown(error)}`);
 		}
+	}
+
+	private isActiveRestore(restoreId: string, snapshotId: string): boolean {
+		const active = this.deps.getPendingRecoveryState().activeRestore;
+		return active?.restoreId === restoreId && active.snapshotId === snapshotId;
 	}
 
 	private retryDelay(nextAttemptAt: number | null): number {

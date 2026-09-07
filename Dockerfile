@@ -17,7 +17,7 @@ RUN npm run build:server-node
 FROM node:24-bookworm-slim AS runtime
 ARG VERSION
 LABEL org.opencontainers.image.title="YAOS Server" \
-      org.opencontainers.image.description="Self-hosted schema-5 YAOS synchronization server" \
+      org.opencontainers.image.description="Self-hosted schema-6 YAOS synchronization server" \
       org.opencontainers.image.source="https://github.com/kavinsood/yaos" \
       org.opencontainers.image.version="${VERSION}"
 ENV NODE_ENV=production \

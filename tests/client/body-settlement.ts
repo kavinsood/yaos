@@ -1,8 +1,10 @@
 import { strict as assert } from "node:assert";
 import {
 	BodySettlementRepository,
+	validateBodySettlement,
 	type StoredBodySettlement,
 } from "../../src/sync/bodySettlement";
+import { canonicalMarkdownHash } from "../../server/src/shared/markdownCodec";
 import { suite } from "../harness.ts";
 
 const s = suite("body-settlement");
@@ -23,7 +25,10 @@ function memoryStore(initial: StoredBodySettlement | null = null) {
 	};
 }
 
-function repository(store = memoryStore(), hash = async () => HASH_A) {
+function repository(
+	store = memoryStore(),
+	hash: (content: string) => Promise<string> = async () => HASH_A,
+) {
 	return new BodySettlementRepository(
 		store,
 		BodySettlementRepository.markdownScope("vault-generation"),
@@ -46,7 +51,7 @@ function validStored(overrides: Partial<StoredBodySettlement> = {}): StoredBodyS
 		localSettlementRevision: 1,
 		settledAt: 10,
 		...overrides,
-	};
+	} as StoredBodySettlement;
 }
 
 s.test("records reconstructible common content using a durable local CAS revision", async () => {
@@ -102,6 +107,111 @@ s.test("refuses ancestry unless body, server, and canonical bytes agree", async 
 		serverContentHash: HASH_B, diskFingerprint: { bytes: 4, hash: HASH_B },
 		pathAtSettlement: "note.md", expectedLocalSettlementRevision: null, settledAt: 1,
 	}), /server head/);
+});
+
+s.test("advances the body base while retaining the last agreed properties base", async () => {
+	const store = memoryStore();
+	const repo = repository(store, canonicalMarkdownHash);
+	const original = "---\ntitle: agreed\n---\nold body";
+	const originalHash = await canonicalMarkdownHash(original);
+	const whole = await repo.settle({
+		bodyId: "body",
+		content: original,
+		contentHash: originalHash,
+		durableGeneration: 1,
+		serverContentHash: originalHash,
+		diskFingerprint: { bytes: original.length, hash: HASH_B },
+		pathAtSettlement: "note.md",
+		expectedLocalSettlementRevision: null,
+		settledAt: 1,
+	});
+	assert.equal(whole.kind, "stored");
+	const server = "---\ntitle: server\n---\nnew body";
+	const disk = "---\ntitle: disk\n---\nnew body";
+	const partial = await repo.settleComponents({
+		bodyId: "body",
+		serverContent: server,
+		diskContent: disk,
+		serverContentHash: await canonicalMarkdownHash(server),
+		durableGeneration: 2,
+		diskFingerprint: { bytes: disk.length, hash: HASH_B },
+		pathAtSettlement: "note.md",
+		expectedLocalSettlementRevision: 1,
+		settledAt: 2,
+	});
+	assert.equal(partial.kind, "stored");
+	if (partial.kind !== "stored") return;
+	assert.equal(partial.settlement.agreement, "body-only");
+	assert.equal(partial.settlement.bodyBase.content, "new body");
+	assert.equal(partial.settlement.propertiesBase.kind, "available");
+	if (partial.settlement.propertiesBase.kind === "available") {
+		assert.equal(partial.settlement.propertiesBase.content, "---\ntitle: agreed\n---\n");
+		assert.equal(partial.settlement.propertiesBase.advancedAtGeneration, 1);
+	}
+});
+
+s.test("keeps a missing properties base typed and rejects partial body disagreement", async () => {
+	const store = memoryStore();
+	const repo = repository(store, canonicalMarkdownHash);
+	const server = "---\ntitle: server\n---\nsame body";
+	const partial = await repo.settleComponents({
+		bodyId: "body",
+		serverContent: server,
+		diskContent: "---\ntitle: disk\n---\nsame body",
+		serverContentHash: await canonicalMarkdownHash(server),
+		durableGeneration: 1,
+		diskFingerprint: { bytes: 10, hash: HASH_B },
+		pathAtSettlement: "note.md",
+		expectedLocalSettlementRevision: null,
+		settledAt: 1,
+	});
+	assert.equal(partial.kind, "stored");
+	if (partial.kind === "stored") assert.deepEqual(partial.settlement.propertiesBase, { kind: "missing" });
+	await assert.rejects(repo.settleComponents({
+		bodyId: "body",
+		serverContent: server,
+		diskContent: "---\ntitle: disk\n---\ndifferent body",
+		serverContentHash: await canonicalMarkdownHash(server),
+		durableGeneration: 2,
+		diskFingerprint: { bytes: 10, hash: HASH_B },
+		pathAtSettlement: "note.md",
+		expectedLocalSettlementRevision: 1,
+		settledAt: 2,
+	}), /identical body content/);
+});
+
+s.test("rejects v2 records whose component ancestry is unrelated to the recorded content", async () => {
+	const store = memoryStore();
+	const repo = repository(store, canonicalMarkdownHash);
+	const content = "---\ntitle: agreed\n---\nbody";
+	const result = await repo.settle({
+		bodyId: "body",
+		content,
+		contentHash: await canonicalMarkdownHash(content),
+		durableGeneration: 1,
+		serverContentHash: await canonicalMarkdownHash(content),
+		diskFingerprint: { bytes: content.length, hash: HASH_B },
+		pathAtSettlement: "note.md",
+		expectedLocalSettlementRevision: null,
+		settledAt: 1,
+	});
+	assert.equal(result.kind, "stored");
+	if (result.kind !== "stored") return;
+	const scope = BodySettlementRepository.markdownScope("vault-generation");
+	const invalidAgreement = structuredClone(result.settlement);
+	// @ts-expect-error Deliberately corrupt the persisted discriminant to exercise validation.
+	invalidAgreement.agreement = "future";
+	assert.equal(validateBodySettlement(invalidAgreement, "body", scope), "component-observation");
+	assert.equal(validateBodySettlement({
+		...result.settlement,
+		bodyBase: { ...result.settlement.bodyBase, content: "unrelated body" },
+	}, "body", scope), "component-observation");
+	assert.equal(validateBodySettlement({
+		...result.settlement,
+		propertiesBase: result.settlement.propertiesBase.kind === "available"
+			? { ...result.settlement.propertiesBase, content: "---\ntitle: unrelated\n---\n" }
+			: result.settlement.propertiesBase,
+	}, "body", scope), "component-observation");
 });
 
 await s.done();

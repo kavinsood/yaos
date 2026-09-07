@@ -1,6 +1,6 @@
-export const SCHEMA_VERSION = 5 as const;
+export const SCHEMA_VERSION = 6 as const;
 export const STORAGE_FORMAT_VERSION = 2 as const;
-export const PROTOCOL_VERSION = 1 as const;
+export const PROTOCOL_VERSION = 2 as const;
 export const SNAPSHOT_FORMAT_VERSION = 2 as const;
 export const SETTINGS_FORMAT_VERSION = 1 as const;
 

@@ -146,6 +146,9 @@ export class ConnectionController {
 		return deriveSyncFacts(
 			{
 				connected: sync?.connected ?? false,
+				websocketOpen: sync?.websocketOpen ?? false,
+				applicationResponsive: sync?.applicationResponsive ?? null,
+				lastLivenessAckAt: sync?.lastLivenessAckAt ?? null,
 				fatalAuthError: sync?.fatalAuthError ?? false,
 				fatalAuthCode: sync?.fatalAuthCode ?? null,
 				lastLocalUpdateAt: sync?.lastLocalUpdateAt ?? null,
@@ -193,8 +196,11 @@ export class ConnectionController {
 			return { kind: "loading_cache" };
 		}
 
+		const transportConnecting = sync.provider.wsconnecting
+			|| (sync.websocketOpen && sync.applicationResponsive === null);
+
 		if (!this.deps.isReconciled()) {
-			return sync.connected
+			return sync.connected || transportConnecting
 				? { kind: "connecting" }
 				: {
 					kind: "offline",
@@ -208,6 +214,10 @@ export class ConnectionController {
 				kind: "online",
 				generation: sync.connectionGeneration,
 			};
+		}
+
+		if (transportConnecting) {
+			return { kind: "connecting" };
 		}
 
 		return {
@@ -277,6 +287,7 @@ export class ConnectionController {
 		this.visibilityHandler = () => {
 			if (document.visibilityState === "hidden") {
 				this.deps.setResidencyVisibility?.("background");
+				this.deps.getVaultSync()?.setSocketLivenessForeground(false);
 				this.deps.flushOpenWrites("app-backgrounded");
 				return;
 			}
@@ -285,6 +296,8 @@ export class ConnectionController {
 			const sync = this.deps.getVaultSync();
 			if (!sync) return;
 			if (sync.fatalAuthError) return;
+			sync.setSocketLivenessForeground(true);
+			sync.probeSocketLiveness("app-foregrounded");
 
 			this.deps.refreshServerCapabilities("app-foregrounded");
 			this.requestFastReconnect("app-foregrounded");
@@ -294,6 +307,7 @@ export class ConnectionController {
 		this.deps.setResidencyVisibility?.(
 			document.visibilityState === "hidden" ? "background" : "foreground",
 		);
+		this.deps.getVaultSync()?.setSocketLivenessForeground(document.visibilityState !== "hidden");
 		this.deps.registerCleanup(() => {
 			if (this.visibilityHandler) {
 				document.removeEventListener("visibilitychange", this.visibilityHandler);
@@ -313,6 +327,7 @@ export class ConnectionController {
 			this.deps.log("Network online event — requesting fast reconnect");
 			this.deps.scheduleTraceStateSnapshot("network-online");
 			this.deps.refreshServerCapabilities("network-online");
+			this.deps.getVaultSync()?.probeSocketLiveness("network-online");
 			this.requestFastReconnect("network-online");
 		};
 

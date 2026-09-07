@@ -3,6 +3,7 @@ import { DEFAULT_SETTINGS, type VaultSyncSettings } from "../../src/settings/set
 import { VaultSyncSettingTab, type VaultSyncSettingsHost } from "../../src/settings/settingsTab";
 import { emptySettingsSyncStatus, type SettingsSyncStatus } from "../../src/sync/settingsSync/types";
 import { readSource, suite } from "../harness.ts";
+import type { OperationalResourceSnapshot } from "../../src/runtime/operationalResourceSnapshot";
 
 const s = suite("declarative-settings");
 
@@ -40,6 +41,7 @@ function createFixture(overrides: Partial<VaultSyncSettingsHost> = {}): {
 		refreshUpdateManifest: async () => {},
 		refreshAttachmentSyncRuntime: async (reason) => { attachmentRefreshReasons.push(reason ?? ""); },
 		getSettingsStatusSummary: () => ({ label: "Connected" }),
+		getOperationalResourceSnapshot: () => null,
 		getSettingsSyncStatus: () => settingsSyncStatus,
 		refreshSettingsSyncRuntime: async () => {},
 		applySettingsSync: async () => {},
@@ -299,6 +301,54 @@ s.section("Settings sync commands delegate useful environment decisions");
 			&& main.includes("noticeForInstallResult"),
 		"debug Calendar smoke confirms before install and reports the result",
 	);
+}
+
+s.section("Operational resource details label estimates honestly");
+{
+	const resources: OperationalResourceSnapshot = {
+		capturedAt: 10_000,
+		estimateClaim: "heuristic-resident-estimate-not-heap-measurement",
+		residency: {
+			estimatorVersion: "yaos-body-residency-v1",
+			currentEstimatedBytes: 12 * 1024 * 1024,
+			highWaterEstimatedBytes: 20 * 1024 * 1024,
+			configuredBudgetBytes: 48 * 1024 * 1024,
+			temporaryReservedBytes: 2 * 1024 * 1024,
+			loadedBodies: 3,
+			loadingBodies: 1,
+		},
+		queued: {
+			admission: { editor: 1, foreground: 0, background: 1, total: 2 },
+			overdue: { interactive: 1, normal: 2, background: 0, total: 3 },
+			oldestAgeMs: 8_000,
+		},
+		blockers: {
+			bodyObservations: { active: 2, dirty: 1, durablyPending: 1, leased: 0 },
+			overdueDecisionRequired: 1,
+			overduePermanentlyBlocked: 0,
+		},
+		sockets: { used: 3, reserved: 1, fixed: 1, plannedRelease: 0, limit: 8 },
+		currentPressure: null,
+		lastPressure: {
+			source: "admission",
+			reason: "socket_budget",
+			observedAt: 8_000,
+			actionable: true,
+			label: "Body connection limit reached",
+			guidance: "Close inactive notes to release body connections, then retry.",
+		},
+	};
+	const { tab } = createFixture({ getOperationalResourceSnapshot: () => resources });
+	const definitions = collectDefinitions(tab.getSettingDefinitions());
+	const residency = definitions.find((definition) => definition.name === "Body residency estimate");
+	const queue = definitions.find((definition) => definition.name === "Queued resource work");
+	const sockets = definitions.find((definition) => definition.name === "Body sockets");
+	const lastPressure = definitions.find((definition) => definition.name === "Last resource pressure");
+	s.check(typeof residency?.desc === "string" && residency.desc.includes("not RAM usage"), "residency explicitly denies RAM measurement");
+	s.check(typeof residency?.desc === "string" && residency.desc.includes("configured body-estimate budget"), "configured estimate budget is visible");
+	s.check(typeof queue?.desc === "string" && queue.desc.includes("Oldest queued age: 8s"), "queue counts and oldest age are visible");
+	s.check(typeof sockets?.desc === "string" && sockets.desc.includes("3 used + 1 reserved + 1 fixed of 8"), "socket usage and configured limit are visible");
+	s.check(typeof lastPressure?.desc === "string" && lastPressure.desc.includes("Body connection limit reached"), "last pressure remains visible in details");
 }
 
 await s.done();

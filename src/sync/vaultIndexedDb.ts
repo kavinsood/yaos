@@ -85,7 +85,7 @@ export interface StoredOutstandingBody {
 	generation: number;
 	reason: string;
 	updatedAt: number;
-	operation?: "settle" | "delete" | "move";
+	operation?: "settle" | "delete" | "move" | "properties";
 	attempts?: number;
 }
 
@@ -134,7 +134,7 @@ const PATHS = "paths";
 const RECOVERY_STATE = "recoveryState";
 const ATTACHMENT_SEQUENCE = "attachmentSequence";
 const BODY_SETTLEMENTS = "bodySettlements";
-const SCHEMA_5_DATABASE_SUFFIX = ":schema-5";
+const SCHEMA_6_DATABASE_SUFFIX = ":schema-6";
 
 function transactionDone(transaction: IDBTransaction): Promise<void> {
 	return new Promise((resolve, reject) => {
@@ -151,18 +151,18 @@ function requestValue<T>(request: IDBRequest<T>): Promise<T> {
 	});
 }
 /**
- * Schema-5 state is scoped to one server vault incarnation and local folder.
+ * Schema-6 state is scoped to one server vault incarnation and local folder.
  * A destructive reprovision can never open the prior generation's cache.
  */
-export function schema5VaultIdbName(vaultId: string, vaultGeneration: string, folderKey: string): string {
+export function schema6VaultIdbName(vaultId: string, vaultGeneration: string, folderKey: string): string {
 	if (!vaultId.trim() || !vaultGeneration.trim() || !folderKey.trim()) {
-		throw new Error("vault ID, generation, and folder key are required for schema-5 storage");
+		throw new Error("vault ID, generation, and folder key are required for schema-6 storage");
 	}
-	return `${vaultIdbName(`${vaultId}:${vaultGeneration}`, folderKey)}${SCHEMA_5_DATABASE_SUFFIX}`;
+	return `${vaultIdbName(`${vaultId}:${vaultGeneration}`, folderKey)}${SCHEMA_6_DATABASE_SUFFIX}`;
 }
 
 
-/** One fresh schema-5 database per enrolled vault and local Obsidian folder. */
+/** One fresh schema-6 database per enrolled vault and local Obsidian folder. */
 export class VaultIndexedDb {
 	private readonly database: Promise<IDBDatabase>;
 	private readonly databaseName: string;
@@ -173,7 +173,7 @@ export class VaultIndexedDb {
 		folderKey: string,
 		private readonly indexedDb: IDBFactory = window.indexedDB,
 	) {
-		this.databaseName = schema5VaultIdbName(vaultId, vaultGeneration, folderKey);
+		this.databaseName = schema6VaultIdbName(vaultId, vaultGeneration, folderKey);
 		this.database = new Promise((resolve, reject) => {
 			const request = this.indexedDb.open(this.databaseName, DATABASE_VERSION);
 			request.onupgradeneeded = (event) => {

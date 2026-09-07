@@ -194,7 +194,7 @@ export abstract class VaultDocumentStore {
 				id INTEGER PRIMARY KEY CHECK(id = 1),
 				vault_id TEXT NOT NULL,
 				vault_generation TEXT NOT NULL,
-				schema_version INTEGER NOT NULL CHECK(schema_version = 5),
+				schema_version INTEGER NOT NULL CHECK(schema_version = 6),
 				storage_format_version INTEGER NOT NULL CHECK(storage_format_version = 2),
 				provisioned_at INTEGER NOT NULL
 			);

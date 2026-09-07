@@ -10,8 +10,8 @@ for (const method of ["addEventListener", "removeEventListener"] as const) {
 	}
 }
 
-const SCHEMA_VERSION = 5;
-const PROTOCOL_VERSION = 1;
+const SCHEMA_VERSION = 6;
+const PROTOCOL_VERSION = 2;
 const NETWORK_WAIT_MS = 15_000;
 function fetchBounded(input: string | URL | Request, init: RequestInit = {}): Promise<Response> {
 	return globalThis.fetch(input, {
@@ -129,7 +129,7 @@ export async function claimServer(host: string): Promise<ClaimedServer> {
 		operatorCookie,
 	};
 	const capabilities = await fetchBounded(`${host}/api/capabilities`).then((result) => json(result, "capabilities"));
-	if (capabilities.claimed !== true || capabilities.schemaVersion !== 5 || capabilities.protocolVersion !== 1) {
+	if (capabilities.claimed !== true || capabilities.schemaVersion !== 6 || capabilities.protocolVersion !== 2) {
 		throw new Error(`claimed Worker has the wrong public contract: ${JSON.stringify(capabilities)}`);
 	}
 	return claimed;
@@ -338,7 +338,7 @@ export async function bootstrapCatalog(identity: Identity): Promise<Map<string, 
 		headers: headers(identity, { "Content-Type": "application/json" }),
 		body: JSON.stringify({ attemptId: `headless-bootstrap-${crypto.randomUUID()}` }),
 	}), "bootstrap start");
-	if (started.format !== "yaos-bootstrap-v1" || started.schemaVersion !== 5) throw new Error(`wrong bootstrap format: ${JSON.stringify(started)}`);
+	if (started.format !== "yaos-bootstrap-v1" || started.schemaVersion !== 6) throw new Error(`wrong bootstrap format: ${JSON.stringify(started)}`);
 	const bootstrapId = stringField(started.bootstrapId, "bootstrapId");
 	const catalogBody = await json(await fetchBounded(route(identity, `bootstrap/${encodeURIComponent(bootstrapId)}/catalog?limit=100`), {
 		headers: headers(identity),

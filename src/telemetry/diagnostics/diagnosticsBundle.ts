@@ -23,6 +23,7 @@ import type { ReconciliationStats } from "../../runtime/reconciliationController
 import type { BodyResidencySnapshot } from "../../sync/bodyResidencyAccounting";
 import type { ResidencyAdmissionSnapshot } from "../../runtime/residencyAdmissionCoordinator";
 import type { OverdueWorkDiagnostics } from "../../runtime/overdueWorkKernel";
+import type { OperationalResourceSnapshot } from "../../runtime/operationalResourceSnapshot";
 
 import {
 	buildFrontmatterQuarantineDebugLines,
@@ -97,6 +98,17 @@ export interface TraceHeaderStateInput {
 		awaitingFirstProviderSyncAfterStartup: boolean;
 		lastReconciledGeneration: number;
 		connectedToServer: boolean;
+		websocketOpen: boolean;
+		applicationResponsive: boolean | null;
+		lastLivenessAckAt: number | null;
+		socketLiveness: {
+			rootPhase: string;
+			healthy: number;
+			probing: number;
+			suspended: number;
+			failed: number;
+			timeoutCount: number;
+		};
 		providerSynced: boolean;
 		localCacheReady: boolean;
 		connectionGeneration: number;
@@ -137,6 +149,7 @@ export interface TraceHeaderStateInput {
 	bodyResidencySnapshot?: BodyResidencySnapshot | null;
 	residencyAdmissionSnapshot?: ResidencyAdmissionSnapshot | null;
 	overdueWorkDiagnostics?: OverdueWorkDiagnostics | null;
+	operationalResourceSnapshot?: OperationalResourceSnapshot | null;
 	frontmatterQuarantine: FrontmatterQuarantineEntry[];
 	sha256Hex: Sha256Hex;
 }
@@ -322,6 +335,7 @@ export async function buildTraceHeader(
 		bodyResidency: state?.bodyResidencySnapshot ?? null,
 		residencyAdmission: state?.residencyAdmissionSnapshot ?? null,
 		overdueWork: state?.overdueWorkDiagnostics ?? null,
+		operationalResources: state?.operationalResourceSnapshot ?? null,
 		serverTraceEvents: state?.serverTraceEvents ?? [],
 		frontmatterQuarantineNotes: state
 			? buildFrontmatterQuarantineDebugLines(state.frontmatterQuarantine)

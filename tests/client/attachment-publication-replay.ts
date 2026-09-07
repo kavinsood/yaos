@@ -105,8 +105,8 @@ class AttachmentServer {
 	isClientReady: (() => boolean) | null = null;
 
 	constructor() {
-		this.root.getMap("sys").set("schemaVersion", 5);
-		this.root.getMap("sys").set("protocolVersion", 1);
+		this.root.getMap("sys").set("schemaVersion", 6);
+		this.root.getMap("sys").set("protocolVersion", 2);
 	}
 
 	loseNextResponse(): void {
@@ -257,8 +257,8 @@ interface RuntimeFixture {
 async function startRuntime(state: MemoryState, server: AttachmentServer): Promise<RuntimeFixture> {
 	if (!state.documents.has("root")) {
 		const root = new Y.Doc({ guid: "root" });
-		root.getMap("sys").set("schemaVersion", 5);
-		root.getMap("sys").set("protocolVersion", 1);
+		root.getMap("sys").set("schemaVersion", 6);
+		root.getMap("sys").set("protocolVersion", 2);
 		state.documents.set("root", {
 			documentId: "root",
 			generation: 1,

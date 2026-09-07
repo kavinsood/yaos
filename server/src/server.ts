@@ -106,7 +106,7 @@ export interface VaultRuntimeOptions {
 	recoveryJobs?: ActorCallPort;
 }
 
-/** Schema-5 root/body composition, independent of a worker or process host. */
+/** Schema-6 root/body composition, independent of a worker or process host. */
 export class VaultRuntime implements DrainPort {
 	private store: VaultStore;
 	private settings: SettingsSyncStore;
@@ -644,7 +644,7 @@ export interface CloudflareVaultEnvironment {
 // eslint-disable-next-line @typescript-eslint/no-empty-object-type, @typescript-eslint/no-unsafe-declaration-merging -- Workers RPC requires the exported class type to carry its brand.
 export interface VaultSyncServer extends Rpc.DurableObjectBranded {}
 
-/** Cloudflare Durable Object wrapper for the portable schema-5 vault runtime. */
+/** Cloudflare Durable Object wrapper for the portable schema-6 vault runtime. */
 // eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging -- Declaration merging preserves the Workers RPC brand on the Cloudflare wrapper.
 export class VaultSyncServer implements DurableObject {
 	private readonly runtime: VaultRuntime;

@@ -1,5 +1,12 @@
 import * as Y from "yjs";
 import { canonicalizeMarkdown } from "@shared/markdownCodec";
+import {
+	SOCKET_LIVENESS_IDLE_MS,
+	SOCKET_LIVENESS_TIMEOUT_MS,
+	parseSocketLivenessDescriptor,
+	parseVaultPongFrame,
+	type SocketLivenessDescriptor,
+} from "@shared/socketLiveness";
 import YSyncProvider from "y-partyserver/provider";
 import type { Awareness } from "y-protocols/awareness";
 import {
@@ -45,6 +52,12 @@ import {
 import { ResidencyAdmissionRuntime } from "../runtime/residencyAdmissionRuntime";
 import type { OverdueWorkClock, OverdueWorkDiagnostics, OverdueWorkRandom } from "../runtime/overdueWorkKernel";
 import { VaultWorkScheduler } from "./vaultWorkScheduler";
+import { FrontmatterSemanticMirror } from "./frontmatterSemanticMirror";
+import {
+	SocketLivenessCoordinator,
+	type SocketLivenessSnapshot,
+} from "../runtime/socketLivenessCoordinator";
+import { fencedWebSocketConstructor } from "./fencedWebSocket";
 export const ROOT_DOCUMENT_ID = "root";
 
 export interface SyncAwarenessPort {
@@ -69,10 +82,11 @@ export interface SyncProviderPort {
 	connect(): void | Promise<void>;
 	disconnect(): void;
 	destroy(): void;
+	sendMessage?(message: string): void;
+	forceAbort?(): void;
 	on(event: "status", callback: (event: { status: string }) => void): void;
 	on(event: "sync", callback: (synced: boolean) => void): void;
 	on(event: "custom-message", callback: (payload: string) => void): void;
-	on(event: "message", callback: (event: MessageEvent) => void): void;
 }
 
 export type FatalSyncCode =
@@ -240,6 +254,14 @@ export type VaultControlFrame =
 		vaultGeneration: string;
 		durableGeneration: number;
 		runtimeEpoch: string;
+		liveness: SocketLivenessDescriptor;
+	}
+	| {
+		type: "VAULT_PONG";
+		probeId: string;
+		documentId: string;
+		vaultGeneration: string;
+		runtimeEpoch: string;
 	}
 	| { type: "VAULT_BACKPRESSURE"; reason: string }
 	| { type: "VAULT_ERROR"; message: string };
@@ -368,10 +390,7 @@ export interface ProviderFactoryInput {
 	doc: Y.Doc;
 }
 export type ProviderFactory = (input: ProviderFactoryInput) => SyncProviderPort;
-export type WebSocketImplementation = new (
-	url: string | URL,
-	protocols?: string | string[],
-) => unknown;
+export type WebSocketImplementation = typeof WebSocket;
 export interface SocketTicketResult {
 	value: string;
 	expiresAt: number;
@@ -526,7 +545,8 @@ export function parseVaultControlFrame(payload: string): VaultControlFrame | nul
 	if (!value || typeof value !== "object") return null;
 	const record = value as Record<string, unknown>;
 	switch (record.type) {
-		case "VAULT_READY":
+		case "VAULT_READY": {
+			const liveness = parseSocketLivenessDescriptor(record.liveness);
 			if (
 				typeof record.documentId !== "string"
 				|| typeof record.vaultGeneration !== "string"
@@ -535,6 +555,7 @@ export function parseVaultControlFrame(payload: string): VaultControlFrame | nul
 				|| (record.durableGeneration as number) < 0
 				|| typeof record.runtimeEpoch !== "string"
 				|| !record.runtimeEpoch
+				|| !liveness
 			) return null;
 			return {
 				type: "VAULT_READY",
@@ -542,7 +563,13 @@ export function parseVaultControlFrame(payload: string): VaultControlFrame | nul
 				vaultGeneration: record.vaultGeneration,
 				durableGeneration: record.durableGeneration as number,
 				runtimeEpoch: record.runtimeEpoch,
+				liveness,
 			};
+		}
+		case "VAULT_PONG": {
+			const pong = parseVaultPongFrame(record);
+			return pong;
+		}
 		case "VAULT_BACKPRESSURE":
 			return typeof record.reason === "string" && record.reason
 				? { type: "VAULT_BACKPRESSURE", reason: record.reason }
@@ -673,6 +700,13 @@ function adaptProvider(provider: YSyncProvider): SyncProviderPort {
 		connect: () => provider.connect(),
 		disconnect: () => provider.disconnect(),
 		destroy: () => provider.destroy(),
+		sendMessage: (message) => provider.sendMessage(message),
+		forceAbort: () => {
+			const socket = provider.ws as (WebSocket & { terminate?: () => void }) | null;
+			provider.disconnect();
+			if (typeof socket?.terminate === "function") socket.terminate();
+			else socket?.close();
+		},
 		on: ((event: string, callback: (...values: never[]) => void) => provider.on(event, callback)) as SyncProviderPort["on"],
 	};
 }
@@ -853,6 +887,7 @@ export class VaultSync implements SyncRuntimePort {
 		"maxLoadedBodies" | "candidateDebounceMs" | "candidateMaxWaitMs" | "bodySyncTimeoutMs">> & VaultSyncOptions;
 	private readonly server: VaultServerPort;
 	private readonly sessions = new Map<string, BodySession>();
+	private readonly semanticMirrors = new Map<string, { doc: Y.Doc; mirror: FrontmatterSemanticMirror }>();
 	private readonly currentnessChecks = new Map<string, Promise<LoadedBody>>();
 	private readonly consumerGenerations = new Map<string, number>();
 	private readonly textToBodyId = new WeakMap<Y.Text, string>();
@@ -869,6 +904,8 @@ export class VaultSync implements SyncRuntimePort {
 	private readonly providerSyncListeners = new Set<(generation: number) => void>();
 	private readonly runtimeScope = new RuntimeScope();
 	private readonly socketAdmission: SocketAdmissionCoordinator;
+	private readonly socketLiveness: SocketLivenessCoordinator;
+	private readonly expectedLivenessDisconnects = new WeakSet<SyncProviderPort>();
 	private readonly residencyAdmission: ResidencyAdmissionCoordinator;
 	private readonly residencyRuntime: ResidencyAdmissionRuntime;
 	private readonly workScheduler: VaultWorkScheduler;
@@ -967,6 +1004,8 @@ export class VaultSync implements SyncRuntimePort {
 			setTimer: (callback: () => void, delayMs: number) => window.setTimeout(callback, delayMs),
 			clearTimer: (handle: unknown) => window.clearTimeout(handle as number),
 		};
+		this.socketLiveness = new SocketLivenessCoordinator(workClock);
+		this.registerSocketLiveness(ROOT_DOCUMENT_ID, this.provider);
 		this.workScheduler = new VaultWorkScheduler({
 			clock: workClock,
 			...(options.workRandom === undefined ? {} : { random: options.workRandom }),
@@ -981,8 +1020,26 @@ export class VaultSync implements SyncRuntimePort {
 
 	get localReady(): boolean { return this._localReady; }
 	get connected(): boolean {
-		return this.provider.wsconnected && this.provider.ws?.readyState === 1;
+		const root = this.socketLiveness.snapshot().find((entry) => entry.id === ROOT_DOCUMENT_ID);
+		return this.provider.wsconnected && this.provider.ws?.readyState === 1
+			&& (root?.phase === "healthy" || (root?.phase === "probing"
+				&& root.lastAcknowledgedAt !== null
+				&& this.now() - root.lastAcknowledgedAt <= SOCKET_LIVENESS_IDLE_MS + SOCKET_LIVENESS_TIMEOUT_MS));
 	}
+	get websocketOpen(): boolean { return this.provider.wsconnected && this.provider.ws?.readyState === 1; }
+	get applicationResponsive(): boolean | null {
+		const root = this.socketLiveness.snapshot().find((entry) => entry.id === ROOT_DOCUMENT_ID);
+		if (!this.websocketOpen || !root || root.phase === "disconnected" || root.phase === "awaiting_ready") return null;
+		if (root.phase === "failed") return false;
+		if (root.phase === "healthy") return true;
+		if (root.phase === "probing" && root.lastAcknowledgedAt !== null
+			&& this.now() - root.lastAcknowledgedAt <= SOCKET_LIVENESS_IDLE_MS + SOCKET_LIVENESS_TIMEOUT_MS) return true;
+		return null;
+	}
+	get lastLivenessAckAt(): number | null {
+		return this.socketLiveness.snapshot().find((entry) => entry.id === ROOT_DOCUMENT_ID)?.lastAcknowledgedAt ?? null;
+	}
+	getSocketLivenessSnapshot(): readonly SocketLivenessSnapshot[] { return this.socketLiveness.snapshot(); }
 	get hasPendingLocalWork(): boolean {
 		const bodyStats = this.bodies.stats();
 		return (
@@ -1936,6 +1993,7 @@ export class VaultSync implements SyncRuntimePort {
 				input.content,
 				ORIGIN_DISK_COMMIT,
 			);
+			this.ensureSemanticMirror(body).seedCurrent();
 			pending = await this.captureCandidate(
 				input.bodyId,
 				Y.encodeStateAsUpdate(body.doc, before),
@@ -2038,6 +2096,7 @@ export class VaultSync implements SyncRuntimePort {
 			const text = body.doc.getText(BODY_TEXT_NAME);
 			const before = Y.encodeStateVector(body.doc);
 			applyDiffToYText(text, text.toJSON(), input.content, ORIGIN_DISK_COMMIT);
+			this.ensureSemanticMirror(body).seedCurrent();
 			const pending = await this.captureCandidate(
 				input.bodyId,
 				Y.encodeStateAsUpdate(body.doc, before),
@@ -2626,6 +2685,7 @@ export class VaultSync implements SyncRuntimePort {
 		this.workScheduler.stop();
 		this.runtimeScope.stopAdmission();
 		this.socketAdmission.stop();
+		this.socketLiveness.stop();
 		this.reconnectRequester = null;
 		this.reconnectBlocked = null;
 		if (this.renameTimer !== null) {
@@ -2646,6 +2706,8 @@ export class VaultSync implements SyncRuntimePort {
 			session.provider.destroy();
 		}
 		this.sessions.clear();
+		for (const semantic of this.semanticMirrors.values()) semantic.mirror.destroy();
+		this.semanticMirrors.clear();
 		this.pendingRenameTargets.clear();
 		this.terminateProvider(this.provider);
 		this.provider.awareness.destroy();
@@ -2666,11 +2728,18 @@ export class VaultSync implements SyncRuntimePort {
 		});
 		this.provider.on("status", ({ status }) => {
 			if (status === "connected") {
+				this.expectedLivenessDisconnects.delete(this.provider);
+				this.socketLiveness.connected(ROOT_DOCUMENT_ID);
 				this._connectionGeneration++;
 				this.workScheduler.poke("root-connected");
+			} else if (status === "disconnected" && this.expectedLivenessDisconnects.delete(this.provider)) {
+				this.socketLiveness.disconnected(ROOT_DOCUMENT_ID);
 			} else if (status === "disconnected" && !this.fatalAuthError && !this.socketAdmission.isAttempting) {
+				this.socketLiveness.disconnected(ROOT_DOCUMENT_ID);
 				this.provider.disconnect();
 				this.requestReconnect("root-disconnected");
+			} else if (status === "disconnected") {
+				this.socketLiveness.disconnected(ROOT_DOCUMENT_ID);
 			}
 		});
 		this.provider.on("sync", (synced) => {
@@ -2692,9 +2761,6 @@ export class VaultSync implements SyncRuntimePort {
 			if (committed) void this.handleDurableBodyCommitted(committed);
 		};
 		this.provider.on("custom-message", handleRootControl);
-		this.provider.on("message", (event) => {
-			if (typeof event.data === "string") handleRootControl(event.data);
-		});
 		this.ydoc.on("update", (_update, origin) => {
 			if (origin === this.provider.documentOrigin) {
 				this._lastRemoteUpdateAt = this.now();
@@ -2737,19 +2803,26 @@ export class VaultSync implements SyncRuntimePort {
 	}
 
 	private createBodySession(body: LoadedBody): BodySession {
+		this.ensureSemanticMirror(body);
 		const factory = this.options.providerFactory ?? ((input) => this.createDefaultProvider(input));
 		const provider = factory({ kind: "body", documentId: body.bodyId, doc: body.doc });
+		this.registerSocketLiveness(body.bodyId, provider);
 		const handleControl = (payload: string) => this.handleVaultControl(payload, body.bodyId);
 		provider.on("custom-message", handleControl);
-		provider.on("message", (event) => {
-			if (typeof event.data === "string") handleControl(event.data);
-		});
 		provider.on("status", ({ status }) => {
-			if (status === "disconnected" && !this.fatalAuthError && !this.socketAdmission.isAttempting) {
+			if (status === "connected") {
+				this.expectedLivenessDisconnects.delete(provider);
+				this.socketLiveness.connected(body.bodyId);
+			} else if (status === "disconnected" && this.expectedLivenessDisconnects.delete(provider)) {
+				this.socketLiveness.disconnected(body.bodyId);
+			} else if (status === "disconnected" && !this.fatalAuthError && !this.socketAdmission.isAttempting) {
+				this.socketLiveness.disconnected(body.bodyId);
 				provider.disconnect();
 				if ((this.sessions.get(body.bodyId)?.consumers.size ?? 0) > 0) {
 					this.requestReconnect(`body-disconnected:${body.bodyId}`);
 				}
+			} else if (status === "disconnected") {
+				this.socketLiveness.disconnected(body.bodyId);
 			}
 		});
 		const updateObserver = (update: Uint8Array, origin: unknown) => {
@@ -2796,7 +2869,7 @@ export class VaultSync implements SyncRuntimePort {
 		priority: AdmissionPriority,
 		essentialInBackground = false,
 	): Promise<LoadedBody> {
-		return this.withBodyAdmission(
+		const body = await this.withBodyAdmission(
 			bodyId,
 			priority,
 			false,
@@ -2804,6 +2877,8 @@ export class VaultSync implements SyncRuntimePort {
 			() => this.bodies.load(bodyId),
 			essentialInBackground,
 		);
+		this.ensureSemanticMirror(body);
+		return body;
 	}
 
 	private async withBodyAdmission<T>(
@@ -2932,15 +3007,40 @@ export class VaultSync implements SyncRuntimePort {
 		const revision = this.bodies.captureRevision(bodyId);
 		const session = this.sessions.get(bodyId);
 		if (session && !this.closeIdleBodySession(bodyId)) return false;
-		return this.bodies.isRevisionCurrent(revision)
+		const evicted = this.bodies.isRevisionCurrent(revision)
 			&& this.bodies.evict(bodyId, revision);
+		if (evicted) this.destroySemanticMirror(bodyId);
+		return evicted;
 	}
 
 	private destroyBodySession(session: BodySession): void {
 		if (this.sessions.get(session.bodyId) === session) this.sessions.delete(session.bodyId);
+		this.socketLiveness.unregister(session.bodyId);
 		session.doc.off("update", session.updateObserver);
 		this.terminateProvider(session.provider);
 		session.provider.destroy();
+	}
+
+	private ensureSemanticMirror(body: LoadedBody): FrontmatterSemanticMirror {
+		const current = this.semanticMirrors.get(body.bodyId);
+		if (current?.doc === body.doc) return current.mirror;
+		current?.mirror.destroy();
+		const mirror = new FrontmatterSemanticMirror(body.doc, {
+			textName: BODY_TEXT_NAME,
+			onOpaque: (reason) => this.log(`frontmatter semantic fallback for ${body.bodyId}: ${reason}`),
+			onProjected: (fields) => this.log(
+				`frontmatter semantic projection for ${body.bodyId}: ${fields.join(",")}`,
+			),
+		});
+		this.semanticMirrors.set(body.bodyId, { doc: body.doc, mirror });
+		return mirror;
+	}
+
+	private destroySemanticMirror(bodyId: string): void {
+		const current = this.semanticMirrors.get(bodyId);
+		if (!current) return;
+		current.mirror.destroy();
+		this.semanticMirrors.delete(bodyId);
 	}
 
 	private async loadCurrentBody(bodyId: string): Promise<LoadedBody> {
@@ -2958,7 +3058,10 @@ export class VaultSync implements SyncRuntimePort {
 	private async loadCurrentBodyUnadmitted(bodyId: string): Promise<LoadedBody> {
 		const inFlight = this.currentnessChecks.get(bodyId);
 		if (inFlight) return inFlight;
-		const run = this.bodies.load(bodyId).then((body) => this.catchUpBody(body));
+		const run = this.bodies.load(bodyId).then((body) => this.catchUpBody(body)).then((body) => {
+			this.ensureSemanticMirror(body);
+			return body;
+		});
 		this.currentnessChecks.set(bodyId, run);
 		try {
 			return await run;
@@ -3144,9 +3247,11 @@ export class VaultSync implements SyncRuntimePort {
 		}
 		if (!frame) return;
 		if (frame.type === "VAULT_READY") {
-			if (frame.documentId !== expectedDocumentId) {
-				frame = { type: "VAULT_ERROR", message: "ready document identity mismatch" };
+			if (frame.documentId !== expectedDocumentId
+				|| frame.vaultGeneration !== this.options.vaultGeneration) {
+				frame = { type: "VAULT_ERROR", message: "ready socket authority mismatch" };
 			} else {
+				this.socketLiveness.ready(expectedDocumentId, frame.liveness, frame.runtimeEpoch);
 				this.backpressureLevel = 0;
 				this.submissionPausedUntil = 0;
 				if (frame.documentId === ROOT_DOCUMENT_ID) {
@@ -3156,6 +3261,12 @@ export class VaultSync implements SyncRuntimePort {
 					if (body) body.generation = Math.max(body.generation, frame.durableGeneration);
 				}
 			}
+		} else if (frame.type === "VAULT_PONG") {
+			if (frame.documentId !== expectedDocumentId
+				|| frame.vaultGeneration !== this.options.vaultGeneration) return;
+			this.socketLiveness.acknowledge(expectedDocumentId, frame.probeId, frame.runtimeEpoch);
+			this.options.onControlFrame?.(frame);
+			return;
 		} else if (frame.type === "VAULT_BACKPRESSURE") {
 			this.backpressureLevel = Math.min(this.backpressureLevel + 1, 5);
 			const delay = Math.min(
@@ -3169,6 +3280,59 @@ export class VaultSync implements SyncRuntimePort {
 			this.log(`server vault error: ${frame.message}`);
 		}
 		this.options.onControlFrame?.(frame);
+	}
+
+	setSocketLivenessForeground(foreground: boolean): void {
+		this.socketLiveness.setForeground(foreground);
+	}
+
+	probeSocketLiveness(reason: string): void {
+		this.socketLiveness.probeNow(reason);
+	}
+
+	private registerSocketLiveness(documentId: string, provider: SyncProviderPort): void {
+		this.socketLiveness.register({
+			id: documentId,
+			documentId,
+			isOpen: () => provider.wsconnected && provider.ws?.readyState === 1,
+			sendProbe: (probeId) => {
+				if (!provider.sendMessage) throw new Error("provider does not support protocol control messages");
+				// YSyncProvider owns the single `__YPS:` transport prefix.
+				provider.sendMessage(JSON.stringify({ type: "VAULT_PING", probeId }));
+			},
+			onFailure: (reason) => {
+				this.log(`socket liveness failed for ${documentId}: ${reason}`);
+				if (documentId === ROOT_DOCUMENT_ID) {
+					this.forceAbortProvider(ROOT_DOCUMENT_ID, this.provider);
+					for (const session of this.sessions.values()) {
+						this.forceAbortProvider(session.bodyId, session.provider);
+					}
+					this.refreshResidencyObservations();
+					this.requestReconnect(`socket-liveness:${documentId}:${reason}`);
+					return;
+				}
+				this.forceAbortProvider(documentId, provider);
+				this.refreshResidencyObservations();
+				const session = this.sessions.get(documentId);
+				if (!session || session.provider !== provider || session.consumers.size === 0) return;
+				void this.reconnectBodySession(session).catch((error) => {
+					this.log(`body liveness recovery failed for ${documentId}: ${String(error)}`);
+					if (!this.destroyed && !this.fatalAuthError) {
+						this.requestReconnect(`socket-liveness-fallback:${documentId}:${reason}`);
+					}
+				});
+			},
+		});
+	}
+
+	private forceAbortProvider(documentId: string, provider: SyncProviderPort): void {
+		this.socketLiveness.disconnected(documentId);
+		this.expectedLivenessDisconnects.add(provider);
+		if (provider.forceAbort) provider.forceAbort();
+		else {
+			provider.disconnect();
+			this.terminateProvider(provider);
+		}
 	}
 
 	private async waitForSubmissionWindow(): Promise<void> {
@@ -3740,11 +3904,12 @@ export class VaultSync implements SyncRuntimePort {
 		const prefix = input.kind === "root"
 			? `/vault/${encodeURIComponent(this.options.vaultId)}/ws/root`
 			: `/vault/${encodeURIComponent(this.options.vaultId)}/ws/body/${encodeURIComponent(input.documentId)}`;
+		const baseWebSocket = this.options.webSocket ?? WebSocket;
 		const provider = new YSyncProvider(this.options.host, input.documentId, input.doc, {
 			prefix,
 			connect: false,
 			maxBackoffTime: MAX_BACKOFF_TIME_MS,
-			WebSocketPolyfill: this.options.webSocket as typeof WebSocket | undefined,
+			WebSocketPolyfill: fencedWebSocketConstructor(baseWebSocket),
 			params: async () => {
 				if (!this.options.getSocketTicket) {
 					throw new Error("a short-lived socket ticket is required");
@@ -3852,6 +4017,11 @@ export class VaultSync implements SyncRuntimePort {
 	}
 
 	private terminateProvider(provider: SyncProviderPort): void {
+		if (provider.forceAbort) {
+			provider.forceAbort();
+			return;
+		}
+		provider.disconnect();
 		if (typeof provider.ws?.terminate === "function") provider.ws.terminate();
 		else if (typeof provider.ws?.close === "function") provider.ws.close();
 	}

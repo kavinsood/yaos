@@ -1,4 +1,5 @@
 import yaml from "js-yaml";
+import { splitMarkdownComponents } from "./frontmatterBoundary";
 
 export type FrontmatterRisk = "ok" | "warn" | "block" | "unknown";
 export type FieldPolicy = "register" | "ordered-list" | "set-like" | "opaque";
@@ -10,7 +11,7 @@ export interface FrontmatterValidationResult {
 	previousFrontmatterLength?: number | null;
 }
 
-type FrontmatterBlock =
+export type FrontmatterBlock =
 	| { kind: "none" }
 	| { kind: "malformed"; reason: string }
 	| {
@@ -30,7 +31,6 @@ type ParsedFrontmatter = {
 type ValueKind = "null" | "scalar" | "array" | "object";
 
 const FRONTMATTER_OPEN = "---";
-const FRONTMATTER_CLOSE = new Set(["---", "..."]);
 
 const FIELD_POLICIES: Record<string, FieldPolicy> = {
 	aliases: "ordered-list",
@@ -113,31 +113,17 @@ export function isFrontmatterBlocked(result: FrontmatterValidationResult): boole
 }
 
 export function extractFrontmatter(content: string): FrontmatterBlock {
-	const firstLineEnd = findLineEnd(content, 0);
-	const firstLine = content.slice(0, firstLineEnd).trim();
-	if (firstLine !== FRONTMATTER_OPEN) {
-		return { kind: "none" };
-	}
-
-	let cursor = advancePastLineBreak(content, firstLineEnd);
-	const frontmatterStart = cursor;
-	while (cursor < content.length) {
-		const lineEnd = findLineEnd(content, cursor);
-		const line = content.slice(cursor, lineEnd).trim();
-		if (FRONTMATTER_CLOSE.has(line)) {
-			const bodyStart = advancePastLineBreak(content, lineEnd);
-			return {
-				kind: "present",
-				frontmatterText: content.slice(frontmatterStart, cursor),
-				bodyText: content.slice(bodyStart),
-				start: frontmatterStart,
-				end: cursor,
-			};
-		}
-		cursor = advancePastLineBreak(content, lineEnd);
-	}
-
-	return { kind: "malformed", reason: "missing-closing-fence" };
+	const split = splitMarkdownComponents(content);
+	if (split.kind === "none") return { kind: "none" };
+	if (split.kind === "ambiguous") return { kind: "malformed", reason: split.reason };
+	const frontmatterStart = FRONTMATTER_OPEN.length + 1;
+	return {
+		kind: "present",
+		frontmatterText: split.yamlText,
+		bodyText: split.body,
+		start: frontmatterStart,
+		end: frontmatterStart + split.yamlText.length,
+	};
 }
 
 export function getFieldPolicy(fieldName: string): FieldPolicy {
@@ -300,24 +286,4 @@ function addReasons(target: Set<string>, reasons: string[]): void {
 	for (const reason of reasons) {
 		target.add(reason);
 	}
-}
-
-function findLineEnd(content: string, start: number): number {
-	const newline = content.indexOf("\n", start);
-	if (newline === -1) return content.length;
-	return content.charCodeAt(newline - 1) === 13 ? newline - 1 : newline;
-}
-
-function advancePastLineBreak(content: string, lineEnd: number): number {
-	if (lineEnd >= content.length) return content.length;
-	if (content.charCodeAt(lineEnd) === 13 && content.charCodeAt(lineEnd + 1) === 10) {
-		return lineEnd + 2;
-	}
-	if (content.charCodeAt(lineEnd) === 10) {
-		return lineEnd + 1;
-	}
-	if (content.charCodeAt(lineEnd) === 13) {
-		return lineEnd + 1;
-	}
-	return lineEnd;
 }

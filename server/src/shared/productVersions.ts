@@ -4,9 +4,9 @@
  * A change to one pin does not imply a change to any other pin. Compatibility
  * is exact until a future release deliberately defines a wider contract.
  */
-export const SCHEMA_VERSION = 5;
+export const SCHEMA_VERSION = 6;
 export const STORAGE_FORMAT_VERSION = 2;
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 export const SNAPSHOT_FORMAT_VERSION = 2;
 export const SETTINGS_FORMAT_VERSION = 1;
 

@@ -13,6 +13,11 @@ import {
 	type FrontmatterValidationResult,
 } from "./frontmatterGuard";
 import { isLocalOrigin } from "./origins";
+import {
+	composeBodyOnlyProgress,
+	composeMarkdownComponents,
+	splitMarkdownComponents,
+} from "./frontmatterBoundary";
 import { contentBaselineHash } from "./diskIndex";
 import { decideClosedFileConflict } from "./closedFileConflict";
 import {
@@ -175,6 +180,7 @@ export class DiskMirror {
 	 * the caller free of crypto concerns. Use to update disk index baselines.
 	 */
 	private _onDiskWriteCallback: ((path: string, contentHash: string) => void) | null = null;
+	private _onPartialDiskWriteCallback: ((path: string, bodyHash: string, propertiesHash: string) => void) | null = null;
 
 	/**
 	 * Per-path timestamp of the most recent successful `flushWrite`. Updated
@@ -226,6 +232,9 @@ export class DiskMirror {
 	 */
 	setDiskWriteCallback(callback: (path: string, contentHash: string) => void): void {
 		this._onDiskWriteCallback = callback;
+	}
+	setPartialDiskWriteCallback(callback: (path: string, bodyHash: string, propertiesHash: string) => void): void {
+		this._onPartialDiskWriteCallback = callback;
 	}
 	configureSettlement(options: DiskSettlementOptions | null): void {
 		this.settlement = options;
@@ -839,7 +848,25 @@ export class DiskMirror {
 				this.recordPreservedUnresolved(path, "body-settlement-failed");
 				return "preserved-unresolved";
 			}
-			const merge = mergeThreeWayText(base.settlement.content, diskContent, content);
+			let merge: ThreeWayMergeResult;
+			let composeMerged = (merged: string): string => merged;
+			if (base.settlement.format === 2 && base.settlement.agreement === "body-only") {
+				const diskComponents = splitMarkdownComponents(diskContent);
+				const remoteComponents = splitMarkdownComponents(content);
+				if (diskComponents.kind === "ambiguous" || remoteComponents.kind === "ambiguous") {
+					this.settlement.markDivergence?.(bodyId, "preserved");
+					this.recordPreservedUnresolved(path, "body-settlement-failed");
+					return "preserved-unresolved";
+				}
+				merge = mergeThreeWayText(
+					base.settlement.bodyBase.content,
+					diskComponents.body,
+					remoteComponents.body,
+				);
+				composeMerged = (merged) => composeMarkdownComponents(remoteComponents.propertiesRegion, merged);
+			} else {
+				merge = mergeThreeWayText(base.settlement.content, diskContent, content);
+			}
 			if (merge.kind === "too-large") {
 				this.settlement.markDivergence?.(bodyId, "preserved");
 				this.recordPreservedUnresolved(path, "body-settlement-failed");
@@ -863,7 +890,8 @@ export class DiskMirror {
 					? await this.settlement.reviewConflict({ path, conflict: merge, stillCurrent: isCurrent })
 					: null;
 				if (reviewed === null || !isCurrent()) return "preserved-unresolved";
-				if (reviewed === content) {
+				const reviewedContent = composeMerged(reviewed);
+				if (reviewedContent === content) {
 					const written = await this.writeSettledBody(path, diskContent, content, isCurrent);
 					if (!written) return "preserved-unresolved";
 					this.settlement.markDivergence?.(bodyId, "none");
@@ -874,11 +902,12 @@ export class DiskMirror {
 					bodyId,
 					path,
 					expectedBodyContent: content,
-					mergedContent: reviewed,
+					mergedContent: reviewedContent,
 				});
 				return "replan";
 			}
-			if (merge.content === content) {
+			const mergedContent = composeMerged(merge.content);
+			if (mergedContent === content) {
 				const written = await this.writeSettledBody(path, diskContent, content, isCurrent);
 				if (!written) return "preserved-unresolved";
 				this.settlement.markDivergence?.(bodyId, "none");
@@ -889,7 +918,7 @@ export class DiskMirror {
 				bodyId,
 				path,
 				expectedBodyContent: content,
-				mergedContent: merge.content,
+				mergedContent,
 			});
 			if (committed === "superseded") return "replan";
 			this.settlement.markDivergence?.(bodyId, "none");
@@ -989,9 +1018,15 @@ export class DiskMirror {
 	): Promise<boolean> {
 		content = canonicalizeMarkdown(content);
 		previousContent = previousContent === null ? null : canonicalizeMarkdown(previousContent);
+		let partial = false;
 		if (this.shouldBlockFrontmatterWrite(path, previousContent, content)) {
-			this.recordPreservedUnresolved(path, "body-settlement-failed");
-			return false;
+			const bodyOnly = this.frontmatterBodyOnlyWrite(previousContent ?? "", content);
+			if (bodyOnly === null) {
+				this.recordPreservedUnresolved(path, "body-settlement-failed");
+				return false;
+			}
+			content = bodyOnly;
+			partial = true;
 		}
 		try {
 			if (!isCurrent()) return false;
@@ -1005,7 +1040,8 @@ export class DiskMirror {
 				await this.app.vault.create(path, content);
 			}
 			this.lastDiskWriteOkAt.set(path, Date.now());
-			this._onDiskWriteCallback?.(path, await contentBaselineHash(content));
+			if (partial) await this.recordPartialDiskWrite(path, content);
+			else this._onDiskWriteCallback?.(path, await contentBaselineHash(content));
 			return true;
 		} catch {
 			this.recordPreservedUnresolved(path, "body-settlement-failed");
@@ -1076,6 +1112,8 @@ export class DiskMirror {
 			const existing = this.app.vault.getAbstractFileByPath(normalized);
 			if (existing instanceof TFile) {
 				const currentContent = canonicalizeMarkdown(await this.app.vault.read(existing));
+				let writeContent = content;
+				let partial = false;
 				if (!isCurrent()) {
 					this.queueImmediateWrite(path, "superseded-disk-proof", force);
 					return;
@@ -1085,18 +1123,22 @@ export class DiskMirror {
 					return;
 				}
 				if (this.shouldBlockFrontmatterWrite(path, currentContent, content)) {
-					return;
+					const bodyOnly = this.frontmatterBodyOnlyWrite(currentContent, content);
+					if (bodyOnly === null) return;
+					writeContent = bodyOnly;
+					partial = true;
 				}
 
-				await this.suppressWrite(path, content, 1);
+				await this.suppressWrite(path, writeContent, 1);
 				if (!isCurrent()) {
 					this.queueImmediateWrite(path, "superseded-before-modify", force);
 					return;
 				}
-				await this.app.vault.modify(existing, content);
-				this.log(`flushWrite: updated "${path}" (${content.length} chars)`);
+				await this.app.vault.modify(existing, writeContent);
+				this.log(`flushWrite: updated "${path}" (${writeContent.length} chars)`);
 				this.lastDiskWriteOkAt.set(normalized, Date.now());
-				this._onDiskWriteCallback?.(normalized, await contentBaselineHash(content));
+				if (partial) await this.recordPartialDiskWrite(normalized, writeContent);
+				else this._onDiskWriteCallback?.(normalized, await contentBaselineHash(writeContent));
 				this._flightEventHandler?.({
 					priority: "important",
 					kind: "disk.write.ok",
@@ -1105,13 +1147,18 @@ export class DiskMirror {
 					source: "diskMirror",
 					layer: "disk",
 					path: normalized,
-					data: { contentLength: content.length, isCreate: false },
+					data: { contentLength: writeContent.length, isCreate: false, partialFrontmatter: partial },
 				});
 			} else {
+				let writeContent = content;
+				let partial = false;
 				if (this.shouldBlockFrontmatterWrite(path, null, content)) {
-					return;
+					const bodyOnly = this.frontmatterBodyOnlyWrite("", content);
+					if (bodyOnly === null) return;
+					writeContent = bodyOnly;
+					partial = true;
 				}
-				await this.suppressWrite(path, content, 2);
+				await this.suppressWrite(path, writeContent, 2);
 				if (!isCurrent()) {
 					this.queueImmediateWrite(path, "superseded-before-create", force);
 					return;
@@ -1124,12 +1171,13 @@ export class DiskMirror {
 						await this.app.vault.createFolder(dir);
 					}
 				}
-				await this.app.vault.create(normalized, content);
+				await this.app.vault.create(normalized, writeContent);
 				this.log(
-					`flushWrite: created "${path}" on disk (${content.length} chars)`,
+					`flushWrite: created "${path}" on disk (${writeContent.length} chars)`,
 				);
 				this.lastDiskWriteOkAt.set(normalized, Date.now());
-				this._onDiskWriteCallback?.(normalized, await contentBaselineHash(content));
+				if (partial) await this.recordPartialDiskWrite(normalized, writeContent);
+				else this._onDiskWriteCallback?.(normalized, await contentBaselineHash(writeContent));
 				this._flightEventHandler?.({
 					priority: "important",
 					kind: "disk.write.ok",
@@ -1179,6 +1227,27 @@ export class DiskMirror {
 			`(${validation.reasons.join(", ") || validation.risk})`,
 		);
 		return true;
+	}
+
+	private frontmatterBodyOnlyWrite(currentContent: string, incomingContent: string): string | null {
+		const partial = composeBodyOnlyProgress(currentContent, incomingContent);
+		if (partial.kind === "ambiguous") return null;
+		if (partial.heldPropertiesRegion === "" && partial.incomingPropertiesRegion === "") return null;
+		this.log(
+			`frontmatter properties held while body advanced ` +
+			`(${partial.heldPropertiesRegion.length}->${partial.incomingPropertiesRegion.length} property bytes)`,
+		);
+		return partial.content;
+	}
+
+	private async recordPartialDiskWrite(path: string, content: string): Promise<void> {
+		const split = splitMarkdownComponents(content);
+		if (split.kind === "ambiguous") return;
+		const [bodyHash, propertiesHash] = await Promise.all([
+			contentBaselineHash(split.body),
+			contentBaselineHash(split.propertiesRegion),
+		]);
+		this._onPartialDiskWriteCallback?.(path, bodyHash, propertiesHash);
 	}
 
 

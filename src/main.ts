@@ -63,6 +63,7 @@ import {
 import {
 	readPersistedFrontmatterQuarantine,
 	type FrontmatterQuarantineEntry,
+	type FrontmatterQuarantineEvidence,
 } from "./sync/frontmatterQuarantine";
 import {
 	FrontmatterGuardCoordinator,
@@ -76,6 +77,7 @@ import {
 	moveIndexEntries,
 	readDiskIndex,
 	setCurrentContentHash,
+	setPartialContentHashes,
 	waitForDiskQuiet,
 } from "./sync/diskIndex";
 import {
@@ -146,6 +148,10 @@ import { setupFlightTraceBestEffort } from "./telemetry/debug/flightTraceControl
 import type { SyncReadPort, TelemetryRuntimeHost } from "./telemetry/telemetryRuntimeHost";
 import type { EngineControlPort, DiskIngestPort } from "./runtime/engineControlPort";
 import type { BindingPropagationGate } from "./sync/editorBinding";
+import {
+	OperationalResourceSnapshotTracker,
+	type OperationalResourceSnapshot,
+} from "./runtime/operationalResourceSnapshot";
 
 // Build-time constant injected by esbuild.
 //   production build (main.js):          define __YAOS_QA_HARNESS_ENABLED__ = false
@@ -258,6 +264,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		if (!this.teardownLifecycle.isClosing) this.refreshStatusBar();
 	});
 	private readonly connectionStateLatch = new ConnectionStateLatch();
+	private readonly operationalResources = new OperationalResourceSnapshotTracker();
 
 	/** Parsed exclude patterns from settings. */
 	private excludePatterns: string[] = [];
@@ -297,6 +304,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private idbDegradedHandled = false;
 	private frontmatterGuardCoordinator!: FrontmatterGuardCoordinator;
 	private frontmatterQuarantineEntries: FrontmatterQuarantineEntry[] = [];
+	private bodySettlementRepository: BodySettlementRepository | null = null;
 	private readonly teardownLifecycle = new RuntimeTeardownCoordinator();
 
 	/**
@@ -504,6 +512,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			setFrontmatterQuarantineEntries: (entries) => {
 				this.frontmatterQuarantineEntries = entries;
 			},
+			getFrontmatterQuarantineEvidence: (path) => this.getFrontmatterQuarantineEvidence(path),
 		});
 		this.createReconciliationController();
 		this.editorWorkspace = new EditorWorkspaceOrchestrator({
@@ -574,6 +583,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						if (!vs) return null;
 						return {
 							get connected() { return vs.connected; },
+							get websocketOpen() { return vs.websocketOpen; },
+							get applicationResponsive() { return vs.applicationResponsive; },
+							get lastLivenessAckAt() { return vs.lastLivenessAckAt; },
 							get fatalAuthError() { return vs.fatalAuthError; },
 							get fatalAuthCode() { return vs.fatalAuthCode; },
 							get fatalAuthDetails() { return vs.fatalAuthDetails; },
@@ -583,6 +595,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 							get connectionGeneration() { return vs.connectionGeneration; },
 							get pendingAttachmentOperations() { return vs.pendingAttachmentOperations; },
 							get fatalAttachmentPublications() { return vs.fatalAttachmentPublications; },
+							getSocketLivenessSnapshot: () => vs.getSocketLivenessSnapshot(),
 							get lastLocalUpdateAt() { return vs.lastLocalUpdateAt; },
 							get lastLocalUpdateWhileConnectedAt() { return vs.lastLocalUpdateWhileConnectedAt; },
 							get lastRemoteUpdateAt() { return vs.lastRemoteUpdateAt; },
@@ -604,6 +617,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 							getBodyResidencySnapshot: () => vs.getBodyResidencySnapshot(),
 							getResidencyAdmissionSnapshot: () => vs.getResidencyAdmissionSnapshot(),
 							getOverdueWorkDiagnostics: () => vs.getOverdueWorkDiagnostics(),
+							getOperationalResourceSnapshot: () => this.getOperationalResourceSnapshot(),
 						};  // satisfies SyncReadPort — narrower union types on VaultSync are compatible
 					},
 					getTraceSink: () => this.traceSink,
@@ -781,7 +795,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				return;
 			}
 
-			// Schema 5 always starts from a fresh vault+folder database. The
+			// Schema 6 always starts from a fresh vault+folder database. The
 			// bootstrap root is validated before the live root provider opens.
 			const folderKey = await this.ensureFolderKey();
 			const importer = new LocalVaultImporter(
@@ -939,6 +953,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				BodySettlementRepository.markdownScope(this.settings.vaultGeneration),
 				canonicalMarkdownHash,
 			);
+			this.bodySettlementRepository = bodySettlements;
 			this.diskMirror.configureSettlement({
 				getBaseline: (path) => ({
 					contentHash: currentContentHash(this.diskIndex[path]) ?? null,
@@ -1003,6 +1018,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					setCurrentContentHash(entry, contentHash);
 					this.diskIndex[path] = entry;
 				}
+			});
+			this.diskMirror.setPartialDiskWriteCallback((path, bodyHash, propertiesHash) => {
+				const entry = this.diskIndex[path] ?? { mtime: 0, size: 0 };
+				setPartialContentHashes(entry, bodyHash, propertiesHash);
+				this.diskIndex[path] = entry;
 			});
 
 			// 4b. BlobSyncManager (if attachment sync is enabled)
@@ -1215,14 +1235,14 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				}
 			});
 
-			// Materialize the validated schema-5 root and every active body before
+			// Materialize the validated schema-6 root and every active body before
 			// admitting editor/disk events. Bootstrap progress and outstanding
 			// safety settlements are durable in the folder-scoped database.
 			this.updateStatusBar({ kind: "loading_cache" });
 			const bootstrap = this.bootstrapClient;
-			if (!bootstrap) throw new Error("schema-5 bootstrap client is unavailable");
+			if (!bootstrap) throw new Error("schema-6 bootstrap client is unavailable");
 			const bootstrapState = await bootstrap.run();
-			if (abortIfStale("schema-5 bootstrap")) return;
+			if (abortIfStale("schema-6 bootstrap")) return;
 			const outstanding = await database.listOutstanding();
 			this.bootstrapProgress = {
 				stage: bootstrapState.stage,
@@ -1242,7 +1262,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			}
 
 			await this.runReconciliation("authoritative");
-			if (abortIfStale("schema-5 admission")) return;
+			if (abortIfStale("schema-6 admission")) return;
 			this.reconciliationController.lastGeneration = runtime.connectionGeneration;
 			if (providerSynced) this.awaitingFirstProviderSyncAfterStartup = false;
 			if (this.settings.originImportPending) {
@@ -1307,7 +1327,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						?? this.reconciliationController.lastGeneration;
 					this.editorWorkspace?.onReconciled(`schema4-catch-up:${reason}`);
 				} catch (error) {
-					this.log(`Schema-5 catch-up failed (${reason}): ${formatUnknown(error)}`);
+					this.log(`Schema-6 catch-up failed (${reason}): ${formatUnknown(error)}`);
 				} finally {
 					this.refreshStatusBar();
 				}
@@ -1673,7 +1693,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	// -------------------------------------------------------------------
 	// Teardown + reinit (for reset commands)
-	// Schema-5 bodies are independently bounded and clean-only eviction replaces
+	// Schema-6 bodies are independently bounded and clean-only eviction replaces
 	// the old whole-document rebuild path.
 
 	// -------------------------------------------------------------------
@@ -1753,6 +1773,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					this.diskMirror = null;
 					this.vaultDatabase = null;
 					this.bootstrapClient = null;
+					this.bodySettlementRepository = null;
 					this.bootstrapProgress = null;
 					this.bootstrapCatchUp = null;
 					this.bootstrapCatchUpPending = false;
@@ -1782,7 +1803,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		new ConfirmModal(
 			this.app,
 			"Reset local cache",
-			"This clears this folder’s schema-5 cache and downloads the vault again. Pending local work must settle first. Continue?",
+			"This clears this folder’s schema-6 cache and downloads the vault again. Pending local work must settle first. Continue?",
 			async () => {
 				const database = this.vaultDatabase;
 				if (!database) return;
@@ -1793,7 +1814,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					await this.initSync(true);
 					new Notice("Cache reset complete.");
 				} catch (error) {
-					console.error("[yaos] Failed to reset schema-5 cache:", error);
+					console.error("[yaos] Failed to reset schema-6 cache:", error);
 					new Notice(`Cache reset refused: ${formatUnknown(error)}`, 8000);
 				}
 			},
@@ -1811,7 +1832,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		new ConfirmModal(
 			this.app,
 			"Nuclear reset",
-			`This durably deletes ${pathCount} synced notes from the server, clears this folder’s schema-5 cache, then imports the current disk files. Continue?`,
+			`This durably deletes ${pathCount} synced notes from the server, clears this folder’s schema-6 cache, then imports the current disk files. Continue?`,
 			async () => {
 				try {
 					const requests = [...runtime.pathToId].map(([path, bodyId]) => ({
@@ -1929,6 +1950,29 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.frontmatterGuardCoordinator.handleFrontmatterValidation(
 			path, direction, reason, validation, previousContent, nextContent,
 		);
+	}
+
+	private async getFrontmatterQuarantineEvidence(path: string): Promise<FrontmatterQuarantineEvidence> {
+		const bodyId = this.vaultSync?.getFileId(path) ?? null;
+		if (!bodyId) return {};
+		const result = await this.bodySettlementRepository?.read(bodyId);
+		if (!result || result.kind !== "available") return { bodyId };
+		const settlement = result.settlement;
+		if (settlement.format === 1) {
+			return {
+				bodyId,
+				settlementRevision: settlement.localSettlementRevision,
+				settlementAgreement: "whole",
+			};
+		}
+		return {
+			bodyId,
+			settlementRevision: settlement.localSettlementRevision,
+			settlementAgreement: settlement.agreement,
+			settlementBodyHashPrefix: settlement.observation.serverBodyHash.slice(0, 12),
+			settlementServerPropertiesHashPrefix: settlement.observation.serverPropertiesHash.slice(0, 12),
+			settlementDiskPropertiesHashPrefix: settlement.observation.diskPropertiesHash.slice(0, 12),
+		};
 	}
 
 	/**
@@ -2218,6 +2262,21 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		};
 	}
 
+	getOperationalResourceSnapshot(): OperationalResourceSnapshot | null {
+		const vaultSync = this.vaultSync;
+		if (!vaultSync) return null;
+		const overdue = [vaultSync.getOverdueWorkDiagnostics()];
+		const recovery = this.snapshotService?.getOverdueWorkDiagnostics();
+		if (recovery) overdue.push(recovery);
+		const settings = this.settingsSyncEngine?.getOverdueWorkDiagnostics();
+		if (settings) overdue.push(settings);
+		return this.operationalResources.capture({
+			residency: vaultSync.getBodyResidencySnapshot(),
+			admission: vaultSync.getResidencyAdmissionSnapshot(),
+			overdue,
+		}, Date.now(), `${this.settings.vaultGeneration}\0${this.folderKey ?? ""}`);
+	}
+
 	private updateStatusBar(connectionState: ConnectionState = this.getCurrentConnectionState()): void {
 		if (!this.statusBarEl) return;
 		const visibleState = this.connectionStateLatch.resolve(connectionState);
@@ -2228,6 +2287,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			(this.getBlobSync()?.getDebugSnapshot().preservedUnresolved.totalCount ?? 0);
 		const attentionCount = diskAttention + blobAttention;
 		const serverReceipt = this.vaultSync?.getServerReceiptSnapshot() ?? null;
+		const resourcePressure = this.getOperationalResourceSnapshot()?.currentPressure ?? null;
 		this.noticeServerPersistenceHealth(serverReceipt?.serverPersistenceDegraded ?? false);
 		renderConnectionState(
 			this.statusBarEl,
@@ -2236,6 +2296,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			serverReceipt,
 			attentionCount,
 			getRecoveryReadiness(this.pendingRecoveryState),
+			resourcePressure,
 		);
 	}
 

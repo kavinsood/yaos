@@ -8,6 +8,7 @@ import {
 	loadEnvironmentAcceptance,
 	markEnvironmentAccepted,
 	retireApplyQueue,
+	buildApplyQueueKey,
 	type ApplyQueueScope,
 } from "./applyQueue";
 import { isPluginDataRelPath, pluginIdFromDataPath } from "./allowlist";
@@ -44,13 +45,15 @@ import {
 } from "./types";
 import {
 	SETTINGS_SYNC_POLL_MS,
-	SettingsSyncWatcher,
+	SETTINGS_SYNC_DATA_JSON_DEBOUNCE_MS,
 	joinConfig,
 	scanConfigDir,
 	type LocalConfigFile,
 	type SettingsDirAdapter,
-	type WatchFileEvent,
 } from "./watch";
+import type { OperationOutcome } from "../../runtime/operationLifecycle";
+import type { OverdueWorkClock, OverdueWorkDiagnostics, OverdueWorkRandom } from "../../runtime/overdueWorkKernel";
+import { SettingsWorkScheduler } from "./workScheduler";
 
 const THEME_CATALOG_URL =
 	"https://raw.githubusercontent.com/obsidianmd/obsidian-releases/master/community-css-themes.json";
@@ -87,6 +90,8 @@ export type SettingsSyncEngineOptions = {
 	indexedDb?: Pick<IDBFactory, "open">;
 	createClient?: (options: SettingsSyncClientOptions) => SettingsSyncClient;
 	visibility?: SettingsSyncVisibilityPort;
+	workClock?: OverdueWorkClock;
+	workRandom?: OverdueWorkRandom;
 	onStatus?: (status: SettingsSyncStatus) => void;
 	onNeedsSeed?: (info: { key: string; blank: boolean }) => void;
 	setDeferred?: (deferred: boolean) => void;
@@ -105,8 +110,7 @@ export class SettingsSyncEngine {
 	private stopped = true;
 	private loopStarted = false;
 	private operationTail: Promise<void> = Promise.resolve();
-	private timer: number | null = null;
-	private watcher: SettingsSyncWatcher | null = null;
+	private workScheduler: SettingsWorkScheduler | null = null;
 	private seedUiShown = false;
 	private lastAppliedEnvRev: number | null = null;
 	private environmentAccepted = false;
@@ -132,10 +136,21 @@ export class SettingsSyncEngine {
 		return this.snapshot;
 	}
 
+	getOverdueWorkDiagnostics(): OverdueWorkDiagnostics | null {
+		return this.workScheduler?.diagnostics() ?? null;
+	}
+
 	async start(): Promise<void> {
 		await this.stop();
 		this.seedUiShown = false;
 		this.stopped = false;
+		this.workScheduler = new SettingsWorkScheduler({
+			...(this.opts.workClock === undefined ? {} : { clock: this.opts.workClock }),
+			...(this.opts.workRandom === undefined ? {} : { random: this.opts.workRandom }),
+			runReconcile: () => this.serialize(() => this.runScheduledReconcile()),
+			runApply: () => this.serialize(() => this.runScheduledApply()),
+			onError: (error) => this.patch({ error: formatUnknown(error) }),
+		});
 		const gen = this.generation;
 		await this.serialize(async () => {
 			if (!this.isCurrent(gen)) return;
@@ -211,12 +226,8 @@ export class SettingsSyncEngine {
 		this.generation += 1;
 		this.stopped = true;
 		this.loopStarted = false;
-		if (this.timer !== null) {
-			window.clearInterval(this.timer);
-			this.timer = null;
-		}
-		this.watcher?.stop();
-		this.watcher = null;
+		this.workScheduler?.stop();
+		this.workScheduler = null;
 		this.removeVisibilityHandler();
 
 		await this.operationTail;
@@ -403,27 +414,19 @@ export class SettingsSyncEngine {
 		}
 
 		this.hookInstallPlugin();
-		const adapter = this.adapter();
-		const configDir = this.configDir();
-		this.watcher = new SettingsSyncWatcher(adapter, configDir, {
-			onFile: (event) => {
-				void this.serialize(async () => this.handleLocalEvent(event));
-			},
-			onUnknownRootJson: (names) => {
-				if (this.isCurrent(gen)) this.noteUnknown(names);
-			},
-		});
-		this.watcher.start();
-		this.timer = window.setInterval(() => {
-			void this.serialize(async () => this.tick());
-		}, SETTINGS_SYNC_POLL_MS);
+		await this.queueScheduledReconcile(Math.max(
+			SETTINGS_SYNC_POLL_MS,
+			SETTINGS_SYNC_DATA_JSON_DEBOUNCE_MS,
+		));
 	}
 
 	private installVisibilityHandler(generation: number): void {
 		this.removeVisibilityHandler();
 		const listener = () => {
 			if (this.isSettingsHidden() || !this.isCurrent(generation)) return;
-			void this.serialize(async () => this.resumeForegroundQueue(generation));
+			void this.queueScheduledApply("foreground")
+				.catch((error) => this.patch({ error: formatUnknown(error) }));
+			this.workScheduler?.poke("settings-foreground");
 		};
 		if (this.opts.visibility) {
 			this.removeVisibilitySubscription = this.opts.visibility.subscribe(listener);
@@ -444,35 +447,27 @@ export class SettingsSyncEngine {
 		return typeof document !== "undefined" && document.visibilityState === "hidden";
 	}
 
-	private async resumeForegroundQueue(generation: number): Promise<void> {
-		if (!this.isCurrent(generation)) return;
+	private async runScheduledApply(): Promise<OperationOutcome> {
+		if (this.stopped) return { kind: "cancelled" };
+		const generation = this.generation;
 		const key = this.configKey();
 		const scope = await this.queueScope();
-		if (!key || !scope) return;
+		if (!key || !scope || !this.isCurrent(generation)) return { kind: "cancelled" };
 		const result = await resumeApplyQueue(await this.applyCtx(key));
 		await this.refreshApplyQueueStatus(scope);
-		if (!this.isCurrent(generation) || result === "none") return;
+		if (!this.isCurrent(generation)) return { kind: "superseded" };
+		if (result === "none") return { kind: "completed", value: undefined };
 		if (result === "invalid") {
 			this.patch({ running: false, reason: "error", error: "invalid_settings_apply_queue" });
-			return;
+			return { kind: "completed", value: undefined };
 		}
-		if (result === "paused") return;
+		if (result === "paused") return { kind: "completed", value: undefined };
 		if (!this.environmentAccepted) {
 			await this.acceptEnvironment();
 			this.opts.setDeferred?.(false);
 		}
-		const remote = await this.client().getEnvironment(key);
-		if (!this.isCurrent(generation) || !remote.seeded) return;
-		this.rememberAcked(remote);
-		this.patch({
-			running: true,
-			reason: "ok",
-			seeded: true,
-			needsSeed: false,
-			deferred: false,
-		});
-		if (this.loopStarted) await this.tick(remote);
-		else await this.beginLoop(generation, remote);
+		await this.queueScheduledReconcile(0);
+		return { kind: "completed", value: undefined };
 	}
 
 	private async tick(initialRemote?: SettingsSyncSeeded): Promise<void> {
@@ -482,6 +477,39 @@ export class SettingsSyncEngine {
 		} catch (error) {
 			if (!this.stopped) this.patch({ reason: "error", error: formatUnknown(error), running: false });
 		}
+	}
+
+	private async runScheduledReconcile(): Promise<OperationOutcome> {
+		if (this.stopped) return { kind: "cancelled" };
+		try {
+			await this.tickInner();
+			if (this.stopped) return { kind: "cancelled" };
+			await this.queueScheduledReconcile(Math.max(
+				SETTINGS_SYNC_POLL_MS,
+				SETTINGS_SYNC_DATA_JSON_DEBOUNCE_MS,
+			));
+			return { kind: "completed", value: undefined };
+		} catch (error) {
+			if (!this.stopped) this.patch({ reason: "error", error: formatUnknown(error), running: false });
+			return { kind: "retryable_failure", failure: "network" };
+		}
+	}
+
+	private async queueScheduledReconcile(delayMs: number): Promise<void> {
+		const scope = await this.queueScope();
+		if (!scope || this.stopped) return;
+		await this.workScheduler?.queueReconcile(await this.workScopeKey(scope), delayMs);
+	}
+
+	private async queueScheduledApply(reason: string): Promise<void> {
+		const scope = await this.queueScope();
+		if (!scope || this.stopped) return;
+		await this.workScheduler?.queueApply(await this.workScopeKey(scope));
+		this.workScheduler?.poke(`settings-apply:${reason}`);
+	}
+
+	private async workScopeKey(scope: ApplyQueueScope): Promise<string> {
+		return (await sha256TextHex(buildApplyQueueKey(scope))).slice(0, 24);
 	}
 
 	private async tickInner(initialRemote?: SettingsSyncSeeded): Promise<void> {
@@ -553,41 +581,6 @@ export class SettingsSyncEngine {
 		await this.lwwPluginData(key, scan.files, remote);
 		if (this.stopped) return;
 		this.refreshMismatches(scan.files, remote);
-	}
-
-	private async handleLocalEvent(event: WatchFileEvent): Promise<void> {
-		if (this.stopped || this.snapshot.seeded !== true) return;
-		const key = this.configKey();
-		if (!key || !this.canMutate()) return;
-		try {
-			if (event.type === "delete") {
-				const ack = this.acked.get(event.path);
-				if (!ack) return;
-				if (isPluginDataRelPath(event.path)) return;
-				await this.client().deleteFile(key, event.path);
-				this.acked.delete(event.path);
-				return;
-			}
-			const { file } = event;
-			if (this.acked.get(file.path)?.sha256 === file.sha256) return;
-			if (isPluginDataRelPath(file.path)) {
-				await this.pushPluginData(key, file);
-				return;
-			}
-			if (!jsonQuarantineOk(file.path, file.body)) return;
-			const put = await this.client().putFile(key, {
-				path: file.path,
-				sha256: file.sha256,
-				bodyBase64: bytesToBase64(file.body),
-			});
-			if (this.stopped) return;
-			this.acked.set(file.path, {
-				sha256: file.sha256,
-				rev: mutationRev(put, this.acked.get(file.path)?.rev ?? 0),
-			});
-		} catch (error) {
-			if (!this.stopped) this.patch({ error: formatUnknown(error) });
-		}
 	}
 
 	private async lwwFiles(

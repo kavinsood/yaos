@@ -24,6 +24,7 @@ function capture(kind: "root" | "body", documentId: string, params: Record<strin
 		let opened = false;
 		let fatal: FatalFrame | null = null;
 		const control: Array<Record<string, unknown>> = [];
+		const probeId = `probe-${kind}`;
 		let settled = false;
 		const timeout = setTimeout(() => finish(new Error(`${kind} socket admission timed out`)), 5_000);
 		const finish = (error?: Error) => {
@@ -42,7 +43,13 @@ function capture(kind: "root" | "body", documentId: string, params: Record<strin
 			const text = data.toString();
 			const payload = text.startsWith("__YPS:") ? text.slice(6) : text;
 			fatal = parseFatalFrame(payload) ?? fatal;
-			try { control.push(JSON.parse(payload) as Record<string, unknown>); } catch { /* not a JSON control frame */ }
+			try {
+				const frame = JSON.parse(payload) as Record<string, unknown>;
+				control.push(frame);
+				if (frame.type === "VAULT_READY") {
+					socket.send(`__YPS:${JSON.stringify({ type: "VAULT_PING", probeId })}`);
+				}
+			} catch { /* not a JSON control frame */ }
 		});
 		socket.on("close", () => finish());
 		socket.on("error", (error) => finish(error));
@@ -63,6 +70,8 @@ for (const [kind, documentId] of [["root", "root"], ["body", bodyId]] as const) 
 	});
 	assert(allowed.opened && !allowed.fatal, `${kind} socket accepts a device/vault-scoped ticket`);
 	assert(allowed.control.some((frame) => frame.type === "VAULT_READY" && frame.documentId === documentId), `${kind} socket publishes VAULT_READY for the exact document`);
+	assert(allowed.control.some((frame) => frame.type === "VAULT_PONG"
+		&& frame.documentId === documentId && frame.probeId === `probe-${kind}`), `${kind} socket acknowledges exact application liveness`);
 
 	const unauthenticated = await capture(kind, documentId, {
 		schemaVersion: String(SCHEMA_VERSION),

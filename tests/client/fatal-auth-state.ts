@@ -101,8 +101,9 @@ s.test("manual reconnect delegates to the unified runtime admission owner", asyn
 			disconnect: () => { directDisconnects++; },
 			connect: () => { directConnects++; },
 		},
-	} as unknown as VaultSync;
+	};
 	const controller = new ConnectionController({
+		// @ts-expect-error This focused fixture supplies only the fields used by reconnect.
 		getVaultSync: () => sync,
 		isReconciled: () => false,
 		getAwaitingFirstProviderSyncAfterStartup: () => false,

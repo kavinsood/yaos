@@ -1,16 +1,16 @@
 #!/usr/bin/env node
 /**
- * Enforce the schema-5 ownership contract.
+ * Enforce the schema-6 ownership contract.
  *
  * The plugin owns its pin in src/sync/schema.ts. The server owns its pin in
  * server/src/shared/productVersions.ts and exposes that same symbol through
  * server/src/version.ts. Both canonical sources must exist, the plugin source
- * must remain on schema 5, and the server source must match it exactly.
+ * must remain on schema 6, and the server source must match it exactly.
  */
 
 import { readFileSync, existsSync } from "node:fs";
 
-const EXPECTED_PLUGIN_SCHEMA_VERSION = 5;
+const EXPECTED_PLUGIN_SCHEMA_VERSION = 6;
 let failures = 0;
 
 function fail(msg) {
@@ -25,6 +25,7 @@ function pass(msg) {
 const PLUGIN_SCHEMA_SOURCE = "src/sync/schema.ts";
 const SERVER_SCHEMA_SOURCE = "server/src/shared/productVersions.ts";
 const SERVER_VERSION_MODULE = "server/src/version.ts";
+const SERVER_DOCUMENT_STORE = "server/src/vaultDocumentStore.ts";
 
 function readSchemaVersion(path, owner) {
 	if (!existsSync(path)) {
@@ -76,6 +77,27 @@ function validateServerVersionModule() {
 	pass(`${SERVER_VERSION_MODULE} exposes the canonical server schema pin`);
 }
 
+function validateServerSqlConstraint(schemaVersion) {
+	if (!existsSync(SERVER_DOCUMENT_STORE)) {
+		fail(`${SERVER_DOCUMENT_STORE} is missing — the durable schema constraint cannot be validated.`);
+		return;
+	}
+	const content = readFileSync(SERVER_DOCUMENT_STORE, "utf8");
+	const matches = [...content.matchAll(
+		/schema_version\s+INTEGER\s+NOT\s+NULL\s+CHECK\s*\(\s*schema_version\s*=\s*(\d+)\s*\)/g,
+	)];
+	if (matches.length !== 1) {
+		fail(`${SERVER_DOCUMENT_STORE} must contain exactly one literal vault_meta schema_version CHECK constraint.`);
+		return;
+	}
+	const constrainedVersion = Number(matches[0][1]);
+	if (constrainedVersion !== schemaVersion) {
+		fail(`${SERVER_DOCUMENT_STORE} schema_version CHECK pins ${constrainedVersion}, expected canonical server schema ${schemaVersion}.`);
+		return;
+	}
+	pass(`${SERVER_DOCUMENT_STORE}: schema_version CHECK = ${constrainedVersion}`);
+}
+
 const pluginSchemaVersion = readSchemaVersion(PLUGIN_SCHEMA_SOURCE, "plugin");
 const serverSchemaVersion = readSchemaVersion(SERVER_SCHEMA_SOURCE, "server");
 
@@ -99,6 +121,7 @@ if (
 }
 
 validateServerVersionModule();
+if (serverSchemaVersion !== null) validateServerSqlConstraint(serverSchemaVersion);
 
 if (failures > 0) {
 	console.error(`\nFAIL: ${failures} schema-version guard violation(s).`);

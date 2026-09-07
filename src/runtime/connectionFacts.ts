@@ -51,6 +51,10 @@ export interface SyncFacts {
 	authAccepted: boolean | null;
 	/** Whether the WebSocket is currently open. */
 	websocketOpen: boolean;
+	/** Exact application-level acknowledgement for the current root transport. */
+	applicationResponsive: boolean | null;
+	/** Most recent exact root liveness acknowledgement in this runtime. */
+	lastLivenessAckAt: number | null;
 	/** The most recent fatal auth code from the server, or null. */
 	lastAuthRejectCode: string | null;
 
@@ -91,6 +95,9 @@ export interface SyncFacts {
 
 export interface SyncFactsSnapshot {
 	connected: boolean;
+	websocketOpen?: boolean;
+	applicationResponsive?: boolean | null;
+	lastLivenessAckAt?: number | null;
 	fatalAuthError: boolean;
 	fatalAuthCode: string | null;
 	lastLocalUpdateAt: number | null;
@@ -110,18 +117,19 @@ export function deriveSyncFacts(
 ): SyncFacts {
 	const { connected, fatalAuthError, fatalAuthCode } = snapshot;
 
-	const websocketOpen = connected;
+	const websocketOpen = snapshot.websocketOpen ?? connected;
+	const applicationResponsive = snapshot.applicationResponsive ?? (connected ? true : null);
 
 	// serverReachable: we can only claim "true" if we've successfully communicated
 	// (ws connected) or the server sent an auth response. Unknown otherwise.
-	const serverReachable: boolean | null = connected || fatalAuthError ? true : null;
+	const serverReachable: boolean | null = applicationResponsive === true || fatalAuthError ? true : null;
 
 	// authAccepted: definitely true if ws is open (auth must have passed to open the
 	// WebSocket). Also true for update_required: the server checked credentials first,
 	// then rejected the protocol version — auth itself succeeded. Definitively false
 	// only for explicit credential rejections.
 	let authAccepted: boolean | null = null;
-	if (connected) {
+	if (websocketOpen) {
 		authAccepted = true;
 	} else if (fatalAuthError && fatalAuthCode) {
 		if (fatalAuthCode === "update_required") {
@@ -143,6 +151,8 @@ export function deriveSyncFacts(
 		serverReachable,
 		authAccepted,
 		websocketOpen,
+		applicationResponsive,
+		lastLivenessAckAt: snapshot.lastLivenessAckAt ?? null,
 		lastAuthRejectCode: fatalAuthCode,
 		lastLocalUpdateAt: snapshot.lastLocalUpdateAt,
 		lastLocalUpdateWhileConnectedAt: snapshot.lastLocalUpdateWhileConnectedAt,

@@ -1,5 +1,6 @@
 import { strict as assert } from "node:assert";
 import * as Y from "yjs";
+import { SOCKET_LIVENESS_DESCRIPTOR } from "../../server/src/shared/socketLiveness";
 import type { OverdueWorkClock } from "../../src/runtime/overdueWorkKernel";
 import {
 	VaultSync,
@@ -76,6 +77,7 @@ class TestProvider implements SyncProviderPort {
 	wsconnected = false;
 	wsconnecting = false;
 	synced = false;
+	readonly sentMessages: string[] = [];
 	private readonly statusHandlers: Array<(event: { status: string }) => void> = [];
 	private readonly syncHandlers: Array<(synced: boolean) => void> = [];
 	private readonly customHandlers: Array<(payload: string) => void> = [];
@@ -100,6 +102,10 @@ class TestProvider implements SyncProviderPort {
 
 	destroy(): void {
 		this.disconnect();
+	}
+
+	sendMessage(message: string): void {
+		this.sentMessages.push(message);
 	}
 
 	on(event: "status", callback: (event: { status: string }) => void): void;
@@ -130,8 +136,8 @@ s.test("VaultSync reconstructs and drains candidate, body-wake, and ticket work"
 	const clock = new FakeClock();
 	const documents = new Map<string, StoredDocument>();
 	const root = new Y.Doc({ guid: "root" });
-	root.getMap("sys").set("schemaVersion", 5);
-	root.getMap("sys").set("protocolVersion", 1);
+	root.getMap("sys").set("schemaVersion", 6);
+	root.getMap("sys").set("protocolVersion", 2);
 	documents.set("root", {
 		documentId: "root",
 		generation: 1,
@@ -221,6 +227,45 @@ s.test("VaultSync reconstructs and drains candidate, body-wake, and ticket work"
 		workClock: clock,
 		workRandom: { next: () => 0.5 },
 	});
+	provider.emitCustom(JSON.stringify({
+		type: "VAULT_READY",
+		documentId: "root",
+		vaultGeneration: "wrong-generation",
+		durableGeneration: 1,
+		runtimeEpoch: "runtime-wrong",
+		liveness: SOCKET_LIVENESS_DESCRIPTOR,
+	}));
+	assert.equal(runtime.applicationResponsive, null);
+	provider.emitCustom(JSON.stringify({
+		type: "VAULT_READY",
+		documentId: "root",
+		vaultGeneration: "generation-1",
+		durableGeneration: 1,
+		runtimeEpoch: "runtime-1",
+		liveness: SOCKET_LIVENESS_DESCRIPTOR,
+	}));
+	assert.equal(runtime.applicationResponsive, true);
+	runtime.probeSocketLiveness("authority-test");
+	const probe = JSON.parse(provider.sentMessages.at(-1) ?? "null") as { probeId?: unknown };
+	assert.equal(typeof probe.probeId, "string");
+	assert.equal(runtime.getSocketLivenessSnapshot()[0]?.phase, "probing");
+	for (const frame of [
+		{ documentId: "other", vaultGeneration: "generation-1", runtimeEpoch: "runtime-1", probeId: probe.probeId },
+		{ documentId: "root", vaultGeneration: "wrong-generation", runtimeEpoch: "runtime-1", probeId: probe.probeId },
+		{ documentId: "root", vaultGeneration: "generation-1", runtimeEpoch: "runtime-wrong", probeId: probe.probeId },
+		{ documentId: "root", vaultGeneration: "generation-1", runtimeEpoch: "runtime-1", probeId: "wrong-probe" },
+	]) {
+		provider.emitCustom(JSON.stringify({ type: "VAULT_PONG", ...frame }));
+		assert.equal(runtime.getSocketLivenessSnapshot()[0]?.phase, "probing");
+	}
+	provider.emitCustom(JSON.stringify({
+		type: "VAULT_PONG",
+		documentId: "root",
+		vaultGeneration: "generation-1",
+		runtimeEpoch: "runtime-1",
+		probeId: probe.probeId,
+	}));
+	assert.equal(runtime.getSocketLivenessSnapshot()[0]?.phase, "healthy");
 
 	assert.equal(candidateAttempts, 1);
 	const candidateRetry = runtime.getOverdueWorkDiagnostics().queue.find((item) => item.key === "candidate:body-1");

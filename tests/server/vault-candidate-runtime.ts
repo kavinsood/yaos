@@ -87,6 +87,18 @@ function candidateRequest(candidateDigest: string, body?: Uint8Array): Request {
 	});
 }
 
+async function submitSemanticCandidate(doc: Y.Doc): Promise<{
+	response: Response;
+	store: CandidateStore;
+}> {
+	const update = Y.encodeStateAsUpdate(doc);
+	doc.destroy();
+	const candidateDigest = await digest(update);
+	const store = new CandidateStore();
+	const { service } = makeService(store);
+	return { response: await service.handle(BODY_ID, candidateRequest(candidateDigest, update)), store };
+}
+
 s.test("durable candidate receipt is device-scoped and exact", async () => {
 	const doc = new Y.Doc({ guid: BODY_ID });
 	doc.getText("body").insert(0, "durable candidate");
@@ -157,6 +169,76 @@ s.test("server rejects a candidate whose resulting Markdown is not canonical", a
 	assert.equal((await response.json() as { error: string }).error, "candidate_markdown_not_canonical");
 	assert.equal(store.commits, 0, "non-canonical text never reaches durable history");
 	assert.equal(notifications(), 0, "rejected candidate is not broadcast as committed");
+});
+
+s.test("server admits bounded semantic frontmatter roots", async () => {
+	const doc = new Y.Doc({ guid: BODY_ID });
+	doc.getMap<number>("frontmatter:meta").set("format", 1);
+	doc.getMap("frontmatter:registers").set("title", { kind: "value", key: "title", value: "" });
+	doc.getMap("frontmatter:presence").set("aliases", { present: true, key: "aliases" });
+	doc.getArray("frontmatter:ordered:aliases").push(["", "two"]);
+	const { response, store } = await submitSemanticCandidate(doc);
+	assert.equal(response.status, 200);
+	assert.equal(store.commits, 1);
+});
+
+s.test("server rejects unexpected or incorrectly typed semantic roots without throwing", async () => {
+	for (const configure of [
+		(doc: Y.Doc) => doc.getArray("frontmatter:meta").push([1]),
+		(doc: Y.Doc) => {
+			doc.getMap<number>("frontmatter:meta").set("format", 1);
+			doc.getMap("frontmatter:ordered:aliases").set("not", "an-array");
+		},
+		(doc: Y.Doc) => {
+			doc.getMap<number>("frontmatter:meta").set("format", 1);
+			doc.getMap("frontmatter:future-root").set("value", true);
+		},
+	]) {
+		const doc = new Y.Doc({ guid: BODY_ID });
+		configure(doc);
+		const { response, store } = await submitSemanticCandidate(doc);
+		assert.equal(response.status, 409);
+		assert.equal((await response.json() as { error: string }).error, "frontmatter_semantic_root_invalid");
+		assert.equal(store.commits, 0);
+	}
+});
+
+s.test("server bounds semantic scalar and aggregate ordered bytes before admission", async () => {
+	const oversizedScalar = new Y.Doc({ guid: BODY_ID });
+	oversizedScalar.getMap<number>("frontmatter:meta").set("format", 1);
+	oversizedScalar.getMap("frontmatter:registers").set("title", {
+		kind: "value",
+		key: "title",
+		value: "x".repeat(16 * 1024 + 1),
+	});
+	const scalarResult = await submitSemanticCandidate(oversizedScalar);
+	assert.equal(scalarResult.response.status, 409);
+	assert.equal((await scalarResult.response.json() as { error: string }).error, "frontmatter_semantic_register_invalid");
+	assert.equal(scalarResult.store.commits, 0);
+
+	const oversizedAggregate = new Y.Doc({ guid: BODY_ID });
+	oversizedAggregate.getMap<number>("frontmatter:meta").set("format", 1);
+	oversizedAggregate.getArray("frontmatter:ordered:aliases").push(
+		Array.from({ length: 17 }, (_, index) => `${index}:${"x".repeat(16 * 1024 - 4)}`),
+	);
+	const aggregateResult = await submitSemanticCandidate(oversizedAggregate);
+	assert.equal(aggregateResult.response.status, 409);
+	assert.equal((await aggregateResult.response.json() as { error: string }).error, "frontmatter_semantic_limit_exceeded");
+	assert.equal(aggregateResult.store.commits, 0);
+});
+
+s.test("server binds semantic display keys to their normalized field", async () => {
+	const doc = new Y.Doc({ guid: BODY_ID });
+	doc.getMap<number>("frontmatter:meta").set("format", 1);
+	doc.getMap("frontmatter:registers").set("title", {
+		kind: "value",
+		key: "unrelated",
+		value: "unsafe projection target",
+	});
+	const { response, store } = await submitSemanticCandidate(doc);
+	assert.equal(response.status, 409);
+	assert.equal((await response.json() as { error: string }).error, "frontmatter_semantic_register_invalid");
+	assert.equal(store.commits, 0);
 });
 
 await s.done();

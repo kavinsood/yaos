@@ -108,6 +108,9 @@ export class DiagnosticsService {
 		const syncFacts = deriveSyncFacts(
 			{
 				connected: vaultSync.connected,
+				websocketOpen: vaultSync.websocketOpen,
+				applicationResponsive: vaultSync.applicationResponsive,
+				lastLivenessAckAt: vaultSync.lastLivenessAckAt,
 				fatalAuthError: vaultSync.fatalAuthError,
 				fatalAuthCode: vaultSync.fatalAuthCode,
 				lastLocalUpdateAt: vaultSync.lastLocalUpdateAt,
@@ -130,6 +133,8 @@ export class DiagnosticsService {
 				: (vaultSync.fatalAuthError ? "auth_failed" : "offline"),
 		);
 
+		const liveness = vaultSync.getSocketLivenessSnapshot();
+		const countPhase = (phase: string): number => liveness.filter((entry) => entry.phase === phase).length;
 		return {
 			generatedAt: new Date().toISOString(),
 			generationDurationMs: Date.now() - startedAt,
@@ -152,6 +157,17 @@ export class DiagnosticsService {
 				awaitingFirstProviderSyncAfterStartup: state.awaitingFirstProviderSyncAfterStartup,
 				lastReconciledGeneration: state.lastReconciledGeneration,
 				connectedToServer: vaultSync.connected,
+				websocketOpen: vaultSync.websocketOpen,
+				applicationResponsive: vaultSync.applicationResponsive,
+				lastLivenessAckAt: vaultSync.lastLivenessAckAt,
+				socketLiveness: {
+					rootPhase: liveness.find((entry) => entry.id === "root")?.phase ?? "disconnected",
+					healthy: countPhase("healthy"),
+					probing: countPhase("probing"),
+					suspended: countPhase("suspended"),
+					failed: countPhase("failed"),
+					timeoutCount: liveness.reduce((total, entry) => total + entry.timeoutCount, 0),
+				},
 				providerSynced: vaultSync.providerSynced,
 				localCacheReady: vaultSync.localReady,
 				connectionGeneration: vaultSync.connectionGeneration,
@@ -182,6 +198,7 @@ export class DiagnosticsService {
 			bodyResidencySnapshot: vaultSync.getBodyResidencySnapshot?.() ?? null,
 			residencyAdmissionSnapshot: vaultSync.getResidencyAdmissionSnapshot?.() ?? null,
 			overdueWorkDiagnostics: vaultSync.getOverdueWorkDiagnostics?.() ?? null,
+			operationalResourceSnapshot: vaultSync.getOperationalResourceSnapshot?.() ?? null,
 			frontmatterQuarantine: this.deps.getFrontmatterQuarantineEntries(),
 			sha256Hex: sha256TextHex,
 		};

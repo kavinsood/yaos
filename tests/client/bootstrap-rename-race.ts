@@ -64,7 +64,7 @@ s.test("200 creates with 100 mid-bootstrap renames leave only authoritative targ
 		listMaterializedPaths: async () => [...materializedPaths].map(([bodyId, path]) => ({ bodyId, path })),
 	};
 	const root = new Y.Doc();
-	root.getMap("sys").set("schemaVersion", 5);
+	root.getMap("sys").set("schemaVersion", 6);
 	const rootBytes = Y.encodeStateAsUpdate(root);
 	root.destroy();
 	const server = {

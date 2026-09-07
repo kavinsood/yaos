@@ -11,7 +11,9 @@ s.section("Provider credentials");
 	s.check(vaultSync.includes("schemaVersion: String(SCHEMA_VERSION)") && vaultSync.includes("ticket: ticket.value"), "provider params contain schema version and ticket");
 	s.check(!vaultSync.includes("token: this.options.token"), "provider has no device-token fallback query path");
 	s.check(
-		vaultSync.includes("WebSocketPolyfill: this.options.webSocket"),
+		vaultSync.includes("const baseWebSocket =")
+			&& vaultSync.includes("this.options.webSocket ?? WebSocket")
+			&& vaultSync.includes("WebSocketPolyfill: fencedWebSocketConstructor(baseWebSocket)"),
 		"default provider accepts a caller-supplied WebSocket implementation",
 	);
 	const ticketClient = readSource("src/sync/socketTicket.ts");

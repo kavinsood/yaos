@@ -1,4 +1,6 @@
 import { strict as assert } from "node:assert";
+import * as encoding from "lib0/encoding";
+import * as syncProtocol from "y-protocols/sync";
 import * as Y from "yjs";
 import { encodeRootPathPublicationUpdate } from "../../server/src/server";
 import { VaultDocumentCachePressureError } from "../../server/src/vaultDocumentCache";
@@ -83,7 +85,7 @@ s.test("stale-generation sockets are fenced before decoding or document access",
 
 s.test("root socket validation rejects structural changes and accepts duplicate state", () => {
 	const current = new Y.Doc({ guid: "root" });
-	current.getMap("sys").set("schemaVersion", 5);
+	current.getMap("sys").set("schemaVersion", 6);
 	const duplicate = Y.encodeStateAsUpdate(current);
 	assert.equal(rootUpdateChangesDocument(current, duplicate), false);
 	const changed = new Y.Doc({ guid: "root" });
@@ -110,6 +112,61 @@ s.test("hibernated sockets from an old runtime epoch are fenced", async () => {
 		close = { code, reason };
 	}), new Uint8Array([0]).buffer);
 	assert.deepEqual(close, { code: 1008, reason: "socket authority mismatch" });
+});
+
+s.test("application liveness is acknowledged on the exact socket without loading a document", async () => {
+	const sent: Array<string | ArrayBuffer | ArrayBufferView> = [];
+	let cacheLoads = 0;
+	const liveSocket: VaultSocketPort = {
+		deserializeAttachment: () => attachment,
+		serializeAttachment: () => {},
+		send: (message) => { sent.push(message); },
+		close: () => {},
+	};
+	const service = new VaultSocketService({
+		sockets: registry([liveSocket]),
+		cache: { load: () => { cacheLoads++; throw new Error("liveness must not load"); } },
+		vaultId: () => attachment.vaultId,
+		vaultGeneration: () => attachment.vaultGeneration,
+		runtimeEpoch: attachment.runtimeEpoch,
+		isActiveBody: () => true,
+		isDeviceRevoked: () => false,
+		scheduleFlush: () => {},
+	} as never);
+	await service.message(liveSocket, '__YPS:{"type":"VAULT_PING","probeId":"probe-1"}');
+	assert.equal(cacheLoads, 0);
+	assert.equal(sent.length, 1);
+	assert.deepEqual(JSON.parse((sent[0] as string).slice(6)), {
+		type: "VAULT_PONG",
+		probeId: "probe-1",
+		documentId: "root",
+		vaultGeneration: attachment.vaultGeneration,
+		runtimeEpoch: attachment.runtimeEpoch,
+	});
+	await service.message(liveSocket, '__YPS:__YPS:{"type":"VAULT_PING","probeId":"probe-2"}');
+	assert.equal(sent.length, 1, "the custom-message prefix is consumed exactly once");
+});
+
+s.test("an inactive body cannot renew liveness", async () => {
+	let close: { code: number; reason: string } | null = null;
+	const bodySocket: VaultSocketPort = {
+		deserializeAttachment: () => ({ ...attachment, kind: "body", documentId: "inactive-body" }),
+		serializeAttachment: () => {},
+		send: () => { throw new Error("inactive body must not receive a pong"); },
+		close: (code = 1000, reason = "") => { close = { code, reason }; },
+	};
+	const service = new VaultSocketService({
+		sockets: registry([bodySocket]),
+		cache: { load: () => { throw new Error("inactive body must not load"); } },
+		vaultId: () => attachment.vaultId,
+		vaultGeneration: () => attachment.vaultGeneration,
+		runtimeEpoch: attachment.runtimeEpoch,
+		isActiveBody: () => false,
+		isDeviceRevoked: () => false,
+		scheduleFlush: () => {},
+	} as never);
+	await service.message(bodySocket, '__YPS:{"type":"VAULT_PING","probeId":"probe-inactive"}');
+	assert.deepEqual(close, { code: 1008, reason: "body is not active" });
 });
 
 s.test("body socket cache pressure is bounded to explicit 429 responses", async () => {
@@ -204,6 +261,50 @@ s.test("direct protected attachment-map mutations are detected and validated", (
 	root.destroy();
 	empty.destroy();
 	unsafe.destroy();
+});
+
+s.test("body sockets reject invalid semantic roots before queue, apply, broadcast, or flush", async () => {
+	const bodyId = "body-semantic-authority-0001";
+	const loaded = new Y.Doc({ guid: bodyId });
+	const malicious = new Y.Doc({ guid: bodyId });
+	malicious.getMap<number>("frontmatter:meta").set("format", 1);
+	malicious.getMap("frontmatter:future-root").set("payload", "not admitted");
+	const encoder = encoding.createEncoder();
+	encoding.writeVarUint(encoder, 0);
+	syncProtocol.writeUpdate(encoder, Y.encodeStateAsUpdate(malicious));
+	const frame = encoding.toUint8Array(encoder);
+	let queued = 0;
+	let flushes = 0;
+	let close: { code: number; reason: string } | null = null;
+	const sent: Array<string | ArrayBuffer | ArrayBufferView> = [];
+	const bodySocket: VaultSocketPort = {
+		deserializeAttachment: () => ({ ...attachment, kind: "body", documentId: bodyId }),
+		serializeAttachment: () => {},
+		send: (message) => { sent.push(message); },
+		close: (code = 1000, reason = "") => { close = { code, reason }; },
+	};
+	const service = new VaultSocketService({
+		sockets: registry([bodySocket]),
+		cache: {
+			load: () => ({ doc: loaded, generation: 1 }),
+			queue: () => { queued++; return { ok: true }; },
+		},
+		vaultId: () => attachment.vaultId,
+		vaultGeneration: () => attachment.vaultGeneration,
+		runtimeEpoch: attachment.runtimeEpoch,
+		isActiveBody: () => true,
+		isDeviceRevoked: () => false,
+		scheduleFlush: () => { flushes++; },
+	} as never);
+	await service.message(bodySocket, frame.slice().buffer);
+	assert.deepEqual(close, { code: 1008, reason: "invalid semantic frontmatter" });
+	assert.equal(queued, 0);
+	assert.equal(flushes, 0);
+	assert.equal(loaded.share.has("frontmatter:future-root"), false);
+	assert.equal(sent.length, 1, "only the typed rejection is sent; no document update is broadcast");
+	assert.equal(JSON.parse((sent[0] as string).slice(6)).code, "frontmatter_semantic_root_invalid");
+	loaded.destroy();
+	malicious.destroy();
 });
 
 s.test("device revocation closes every active root and body socket for that device", () => {

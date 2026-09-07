@@ -1,7 +1,9 @@
 import {
+	ConnectionController,
 	ConnectionStateLatch,
 	type ConnectionState,
 } from "../../src/runtime/connectionController";
+import type { VaultSync } from "../../src/sync/vaultSync";
 import { getLabelFromConnectionState } from "../../src/status/statusBarController";
 import { suite } from "../harness.ts";
 
@@ -63,6 +65,59 @@ s.section("New initialization and successful recovery clear terminal failure");
 		recoveredState.kind === "online" && recoveredState.generation === 8,
 		"successful recovery exposes the current rich connection state",
 	);
+}
+
+type ConnectionStateSyncFixture = Pick<VaultSync,
+	| "fatalAuthError"
+	| "fatalAuthCode"
+	| "idbError"
+	| "localReady"
+	| "connected"
+	| "websocketOpen"
+	| "applicationResponsive"
+	| "connectionGeneration"
+> & { provider: Pick<VaultSync["provider"], "wsconnecting"> };
+
+function controllerState(sync: ConnectionStateSyncFixture, reconciled: boolean): ConnectionState {
+	return new ConnectionController({
+		// @ts-expect-error This focused fixture supplies only the fields getState reads.
+		getVaultSync: () => sync,
+		isReconciled: () => reconciled,
+		getAwaitingFirstProviderSyncAfterStartup: () => false,
+		setAwaitingFirstProviderSyncAfterStartup: () => {},
+		getLastReconciledGeneration: () => 0,
+		setReconnectPending: () => {},
+		isReconcileInFlight: () => false,
+		runReconnectReconciliation: () => {},
+		refreshServerCapabilities: () => {},
+		flushOpenWrites: () => {},
+		updateOfflineStatus: () => {},
+		refreshStatusBar: () => {},
+		scheduleTraceStateSnapshot: () => {},
+		log: () => {},
+		trace: (() => {}) as never,
+		registerCleanup: () => {},
+	}).getState();
+}
+
+s.section("Application handshake is visible as connecting");
+{
+	const base = {
+		fatalAuthError: false,
+		fatalAuthCode: null,
+		idbError: false,
+		localReady: true,
+		connected: false,
+		websocketOpen: true,
+		applicationResponsive: null,
+		connectionGeneration: 3,
+		provider: { wsconnecting: false },
+	} satisfies ConnectionStateSyncFixture;
+
+	s.check(controllerState(base, true).kind === "connecting", "open transport awaiting VAULT_READY is connecting");
+	s.check(controllerState(base, false).kind === "connecting", "handshake stays connecting before reconciliation");
+	const failed = { ...base, applicationResponsive: false } satisfies ConnectionStateSyncFixture;
+	s.check(controllerState(failed, true).kind === "offline", "failed application liveness is offline");
 }
 
 await s.done();

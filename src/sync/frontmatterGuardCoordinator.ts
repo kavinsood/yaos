@@ -24,9 +24,12 @@ import {
 import {
 	upsertFrontmatterQuarantineEntry,
 	clearFrontmatterQuarantinePath,
+	clearResolvedFrontmatterQuarantinePath,
 	type FrontmatterQuarantineEntry,
+	type FrontmatterQuarantineEvidence,
 } from "./frontmatterQuarantine";
 import { sha256TextHex } from "../utils/sha256";
+import { FRONTMATTER_BOUNDARY_VERSION } from "./frontmatterBoundary";
 
 // ---------------------------------------------------------------------------
 // Host interface
@@ -44,6 +47,7 @@ export interface FrontmatterGuardHost {
 	persistPluginState(): Promise<void>;
 	getFrontmatterQuarantineEntries(): FrontmatterQuarantineEntry[];
 	setFrontmatterQuarantineEntries(entries: FrontmatterQuarantineEntry[]): void;
+	getFrontmatterQuarantineEvidence?(path: string): Promise<FrontmatterQuarantineEvidence>;
 }
 
 // ---------------------------------------------------------------------------
@@ -94,7 +98,7 @@ export class FrontmatterGuardCoordinator {
 	): void {
 		if (validation.risk === "ok") {
 			this.clearFrontmatterNoticeFingerprint(path, direction);
-			void this.clearFrontmatterQuarantine(path, `${direction}:${reason}`);
+			void this.resolveFrontmatterQuarantine(path, `${direction}:${reason}`, nextContent);
 			return;
 		}
 
@@ -197,12 +201,18 @@ export class FrontmatterGuardCoordinator {
 		lastNoticeAt: number | null,
 	): Promise<void> {
 		const now = Date.now();
-		const prevHash = await this.hashFrontmatterContent(previousContent);
-		const nextHash = await this.hashFrontmatterContent(nextContent);
+		const [prevHash, nextHash, evidence] = await Promise.all([
+			this.hashFrontmatterContent(previousContent),
+			this.hashFrontmatterContent(nextContent),
+			this.readQuarantineEvidence(path),
+		]);
 		const updated = upsertFrontmatterQuarantineEntry(
 			this.host.getFrontmatterQuarantineEntries(),
 			{
 				path,
+				...evidence,
+				state: this.quarantineState(previousContent, nextContent),
+				boundaryVersion: FRONTMATTER_BOUNDARY_VERSION,
 				firstSeenAt: now,
 				lastSeenAt: now,
 				direction,
@@ -218,6 +228,25 @@ export class FrontmatterGuardCoordinator {
 		await this.host.persistPluginState();
 	}
 
+	private async readQuarantineEvidence(path: string): Promise<FrontmatterQuarantineEvidence> {
+		try {
+			return await this.host.getFrontmatterQuarantineEvidence?.(path) ?? {};
+		} catch {
+			return {};
+		}
+	}
+
+	private quarantineState(
+		previousContent: string | null,
+		nextContent: string,
+	): "whole-blocked" | "properties-held" {
+		const previous = extractFrontmatter(previousContent ?? "");
+		const next = extractFrontmatter(nextContent);
+		return previous.kind !== "malformed" && next.kind !== "malformed"
+			? "properties-held"
+			: "whole-blocked";
+	}
+
 	async clearFrontmatterQuarantine(path: string, reason: string): Promise<void> {
 		const current = this.host.getFrontmatterQuarantineEntries();
 		if (current.length === 0) return;
@@ -228,6 +257,32 @@ export class FrontmatterGuardCoordinator {
 			path,
 			reason,
 		});
+		await this.host.persistPluginState();
+	}
+
+	private async resolveFrontmatterQuarantine(
+		path: string,
+		reason: string,
+		currentContent: string,
+	): Promise<void> {
+		const current = this.host.getFrontmatterQuarantineEntries();
+		if (!current.some((entry) => entry.path === path)) return;
+		const [currentPropertiesHash, evidence] = await Promise.all([
+			this.hashFrontmatterContent(currentContent),
+			this.readQuarantineEvidence(path),
+		]);
+		const next = clearResolvedFrontmatterQuarantinePath(
+			current,
+			path,
+			currentPropertiesHash,
+			evidence.settlementAgreement,
+		);
+		if (next.length === current.length) {
+			this.host.trace("quarantine", "frontmatter-properties-still-held", { path, reason });
+			return;
+		}
+		this.host.setFrontmatterQuarantineEntries(next);
+		this.host.trace("quarantine", "frontmatter-quarantine-cleared", { path, reason });
 		await this.host.persistPluginState();
 	}
 

@@ -228,7 +228,7 @@ s.section("Test 8: exported controller trace passes the analyzer");
 		app: { vault: { configDir: ".obsidian", adapter } } as never,
 		getSettings: () => settings as never,
 		getPluginVersion: () => "2.1.0",
-		getDocSchemaVersion: () => 5,
+		getDocSchemaVersion: () => 6,
 		buildCheckpoint: async () => ({}),
 		collectTraceHeaderInput: async () => null,
 		isIndexedDbRelatedError: () => false,

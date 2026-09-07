@@ -11,6 +11,11 @@ import {
 } from "./vaultDocumentCache";
 import { safeBlobPath } from "./shared/vaultPath";
 import { isCanonicalVaultId } from "./vaultId";
+import {
+	SOCKET_LIVENESS_DESCRIPTOR,
+	parseVaultPingFrame,
+} from "./shared/socketLiveness";
+import { validateFrontmatterSemanticRoots } from "./shared/frontmatterSemanticValidation";
 
 const MESSAGE_SYNC = 0;
 const MESSAGE_AWARENESS = 1;
@@ -147,6 +152,19 @@ export function rootUpdateChangesDocument(current: Y.Doc, update: Uint8Array): b
 	}
 }
 
+export function bodyUpdateFrontmatterSemanticError(current: Y.Doc, update: Uint8Array): string | null {
+	const candidate = new Y.Doc({ guid: "body-frontmatter-semantic-validation" });
+	try {
+		Y.applyUpdate(candidate, Y.encodeStateAsUpdate(current));
+		Y.applyUpdate(candidate, update, "body-frontmatter-semantic-validation");
+		return validateFrontmatterSemanticRoots(candidate);
+	} catch {
+		return "frontmatter_semantic_root_invalid";
+	} finally {
+		candidate.destroy();
+	}
+}
+
 export interface SocketServiceOptions {
 	sockets: VaultSocketRegistryPort;
 	cache: VaultDocumentCache;
@@ -232,15 +250,12 @@ export class VaultSocketService {
 			vaultGeneration: attachment.vaultGeneration,
 			durableGeneration: loaded.generation,
 			runtimeEpoch: attachment.runtimeEpoch,
+			liveness: SOCKET_LIVENESS_DESCRIPTOR,
 		});
 		return this.options.sockets.upgradeResponse(client);
 	}
 
 	async message(socket: VaultSocketPort, message: string | ArrayBuffer): Promise<void> {
-		if (typeof message === "string") {
-			if (message.length > 64 * 1024) socket.close(1009, "text frame too large");
-			return;
-		}
 		const attachment = parseVaultSocketAttachment(socket.deserializeAttachment());
 		if (!attachment
 			|| attachment.vaultId !== this.options.vaultId()
@@ -252,6 +267,30 @@ export class VaultSocketService {
 		if (this.options.isDeviceRevoked(attachment.deviceId)) {
 			this.sendControl(socket, { type: "error", code: "unauthorized", reason: "device membership revoked" });
 			socket.close(1008, "device membership revoked");
+			return;
+		}
+		if (attachment.kind === "body" && !this.options.isActiveBody(attachment.documentId)) {
+			socket.close(1008, "body is not active");
+			return;
+		}
+		if (typeof message === "string") {
+			if (message.length > 64 * 1024) {
+				socket.close(1009, "text frame too large");
+				return;
+			}
+			if (!message.startsWith("__YPS:")) return;
+			let value: unknown;
+			try { value = JSON.parse(message.slice(6)); }
+			catch { return; }
+			const ping = parseVaultPingFrame(value);
+			if (!ping) return;
+			this.sendControl(socket, {
+				type: "VAULT_PONG",
+				probeId: ping.probeId,
+				documentId: attachment.documentId,
+				vaultGeneration: attachment.vaultGeneration,
+				runtimeEpoch: attachment.runtimeEpoch,
+			});
 			return;
 		}
 		try {
@@ -268,10 +307,6 @@ export class VaultSocketService {
 				return;
 			}
 			if (type !== MESSAGE_SYNC) return;
-			if (attachment.kind === "body" && !this.options.isActiveBody(attachment.documentId)) {
-				socket.close(1008, "body is not active");
-				return;
-			}
 			await this.handleSyncFrame(socket, attachment, decoder);
 		} catch (error) {
 			this.sendControl(socket, { type: "VAULT_ERROR", message: error instanceof Error ? error.message : String(error) });
@@ -359,6 +394,12 @@ export class VaultSocketService {
 			if (rootUpdateChangesDocument(loaded.doc, update)) {
 				socket.close(1008, "root updates require durable publication");
 			}
+			return;
+		}
+		const semanticError = bodyUpdateFrontmatterSemanticError(loaded.doc, update);
+		if (semanticError) {
+			this.sendControl(socket, { type: "VAULT_ERROR", code: semanticError, message: "invalid semantic frontmatter" });
+			socket.close(1008, "invalid semantic frontmatter");
 			return;
 		}
 		const owned = update.slice();

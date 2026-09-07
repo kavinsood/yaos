@@ -1,6 +1,7 @@
 import {
 	buildFrontmatterQuarantineDebugLines,
 	clearFrontmatterQuarantinePath,
+	clearResolvedFrontmatterQuarantinePath,
 	readPersistedFrontmatterQuarantine,
 	upsertFrontmatterQuarantineEntry,
 } from "../../src/sync/frontmatterQuarantine";
@@ -92,6 +93,14 @@ s.section("Test 4: persisted quarantine state is sanitized");
 	const entries = readPersistedFrontmatterQuarantine([
 		{
 			path: "Bathroom floor clean.md",
+			bodyId: "body-1",
+			state: "properties-held",
+			boundaryVersion: "frontmatter-boundary-v1",
+			settlementRevision: 4,
+			settlementAgreement: "body-only",
+			settlementBodyHashPrefix: "a".repeat(12),
+			settlementServerPropertiesHashPrefix: "b".repeat(12),
+			settlementDiskPropertiesHashPrefix: "c".repeat(12),
 			firstSeenAt: 10,
 			lastSeenAt: 20,
 			direction: "disk-to-crdt",
@@ -105,6 +114,9 @@ s.section("Test 4: persisted quarantine state is sanitized");
 
 	s.check(entries.length === 1, "invalid persisted entries are dropped");
 	s.check(entries[0]?.reasons.join(",") === "a,z", "persisted reasons are normalized");
+	s.check(entries[0]?.bodyId === "body-1", "persisted body identity is retained");
+	s.check(entries[0]?.settlementRevision === 4, "persisted settlement revision is retained");
+	s.check(entries[0]?.settlementBodyHashPrefix === "a".repeat(12), "bounded settlement evidence is retained");
 }
 
 s.section("Test 5: debug lines summarize quarantined paths without content");
@@ -121,9 +133,35 @@ s.section("Test 5: debug lines summarize quarantined paths without content");
 	]);
 
 	s.check(lines[0] === "Frontmatter quarantines: 1", "debug header includes entry count");
-	s.check(lines[1]?.includes("Bathroom floor clean.md") === true, "debug summary includes path");
-	s.check(lines[1]?.includes("lastNotice") === true, "debug summary includes notice timing metadata");
-	s.check(lines[1]?.includes("noticeFingerprint") === true, "debug summary includes notice fingerprint metadata");
-	s.check(!lines[1]?.includes("prevHash"), "debug summary does not expose hashes or content by default");
+	s.check(lines[1] === "Frontmatter quarantine states: wholeBlocked=1, propertiesHeld=0", "debug summary splits whole and partial blocks");
+	s.check(lines[2]?.includes("Bathroom floor clean.md") === true, "debug summary includes path");
+	s.check(lines[2]?.includes("lastNotice") === true, "debug summary includes notice timing metadata");
+	s.check(lines[2]?.includes("noticeFingerprint") === true, "debug summary includes notice fingerprint metadata");
+	s.check(!lines[2]?.includes("prevHash"), "debug summary does not expose hashes or content by default");
+}
+
+s.section("Test 6: body-only convergence retains held properties until they change");
+{
+	const held: FrontmatterQuarantineEntry = {
+		path: "held.md",
+		bodyId: "body-held",
+		state: "properties-held",
+		boundaryVersion: "frontmatter-boundary-v1",
+		firstSeenAt: 1,
+		lastSeenAt: 2,
+		direction: "crdt-to-disk",
+		reasons: ["duplicate-key:title"],
+		prevHash: "held-properties-hash",
+		nextHash: "incoming-properties-hash",
+		count: 1,
+	};
+	const retained = clearResolvedFrontmatterQuarantinePath([held], held.path, "held-properties-hash");
+	s.check(retained.length === 1, "body-only progress does not clear unresolved properties");
+	const resolved = clearResolvedFrontmatterQuarantinePath([held], held.path, "resolved-properties-hash");
+	s.check(resolved.length === 0, "a changed properties component clears the held state");
+	const intentionallyDiscarded = clearResolvedFrontmatterQuarantinePath(
+		[held], held.path, "held-properties-hash", "whole",
+	);
+	s.check(intentionallyDiscarded.length === 0, "whole settlement proves resolution after discarding unsafe properties");
 }
 await s.done();

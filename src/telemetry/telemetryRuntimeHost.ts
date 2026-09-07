@@ -33,10 +33,12 @@ import type { TraceSink } from "../observability/traceSink";
 import type { FrontmatterQuarantineEntry } from "../sync/frontmatterQuarantine";
 import type { ReconciliationState } from "../runtime/reconciliationController";
 import type { VaultSyncReceiptSnapshot } from "../sync/vaultSync";
+import type { SocketLivenessSnapshot } from "../runtime/socketLivenessCoordinator";
 import type { RecoveryReadiness } from "../snapshots/recoveryState";
 import type { BodyResidencySnapshot } from "../sync/bodyResidencyAccounting";
 import type { OverdueWorkDiagnostics } from "../runtime/overdueWorkKernel";
 import type { ResidencyAdmissionSnapshot } from "../runtime/residencyAdmissionCoordinator";
+import type { OperationalResourceSnapshot } from "../runtime/operationalResourceSnapshot";
 
 
 /**
@@ -86,6 +88,9 @@ export interface SyncReadPort {
 	// Connection / auth state — all readonly scalars
 	// ------------------------------------------------------------------
 	readonly connected: boolean;
+	readonly websocketOpen: boolean;
+	readonly applicationResponsive: boolean | null;
+	readonly lastLivenessAckAt: number | null;
 	readonly fatalAuthError: boolean;
 	readonly fatalAuthCode: string | null;
 	readonly fatalAuthDetails: {
@@ -99,6 +104,7 @@ export interface SyncReadPort {
 	readonly connectionGeneration: number;
 	readonly pendingAttachmentOperations: number;
 	readonly fatalAttachmentPublications: number;
+	getSocketLivenessSnapshot(): readonly SocketLivenessSnapshot[];
 
 	// ------------------------------------------------------------------
 	// Timestamp state
@@ -152,6 +158,7 @@ export interface SyncReadPort {
 	getBodyResidencySnapshot?(): BodyResidencySnapshot;
 	getResidencyAdmissionSnapshot?(): ResidencyAdmissionSnapshot;
 	getOverdueWorkDiagnostics?(): OverdueWorkDiagnostics;
+	getOperationalResourceSnapshot?(): OperationalResourceSnapshot | null;
 }
 
 export interface DiskMirrorSnapshot {

@@ -102,7 +102,7 @@ export function isServerCapabilities(value: unknown): value is ServerCapabilitie
 		Number.isSafeInteger(candidate.storageFormatVersion) &&
 		candidate.storageFormatVersion === 2 &&
 		Number.isSafeInteger(candidate.protocolVersion) &&
-		candidate.protocolVersion === 1 &&
+		candidate.protocolVersion === PROTOCOL_VERSION &&
 		Number.isSafeInteger(candidate.snapshotFormatVersion) &&
 		candidate.snapshotFormatVersion === 2 &&
 		typeof candidate.recoveryJobs === "boolean" &&

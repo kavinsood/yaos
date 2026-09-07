@@ -11,6 +11,7 @@ import { sha256BytesHex } from "../utils/sha256";
 import { SCHEMA_VERSION } from "./schema";
 import { canonicalMarkdownBytes, canonicalizeMarkdown } from "@shared/markdownCodec";
 import type { BodySettlementRepository, DiskSettlementFingerprint } from "./bodySettlement";
+import { splitMarkdownComponents } from "./frontmatterBoundary";
 
 export interface BootstrapHttpRequest {
 	url: string;
@@ -860,14 +861,27 @@ export class BootstrapClient {
 				const local = await this.database.getDocument(expected.bodyId);
 				const outstanding = await this.database.getOutstanding(expected.bodyId);
 				const materializedPath = await this.database.getMaterializedPath(expected.bodyId);
-				if (
-					!outstanding
-					&& expected.previousPath == null
+				const currentAgreement = expected.previousPath == null
 					&& materializedPath === expected.path
 					&& (local?.generation ?? -1) >= expected.generation
 					&& local?.dirty === false
-					&& await this.hasCurrentSettlement(expected)
-				) return true;
+					? await this.currentSettlementAgreement(expected)
+					: null;
+				if (
+					currentAgreement
+					&& (!outstanding || outstanding.operation === "properties")
+				) {
+					if (outstanding?.operation === "properties" && currentAgreement === "whole") {
+						await this.database.deleteOutstanding(expected.bodyId);
+					} else if (!outstanding && currentAgreement === "body-only") {
+						await this.recordOutstanding(
+							expected,
+							"Markdown body settled while properties remain held",
+							"properties",
+						);
+					}
+					return true;
+				}
 				const state = suppliedForHead ?? await this.server.currentBody(expected.bodyId);
 				const content = await decodeVerifiedBodyContent(expected, state);
 				const beforeApply = await this.server.currentHead(expected.bodyId);
@@ -953,11 +967,20 @@ export class BootstrapClient {
 					continue;
 				}
 				await this.database.setMaterializedPath(expected.bodyId, expected.path);
-				if (!await this.establishSettlement(expected, content)) {
+				const agreement = await this.establishSettlement(expected, content);
+				if (!agreement) {
 					await this.recordOutstanding(expected, "body and disk agreement could not be durably recorded");
 					return false;
 				}
-				await this.database.deleteOutstanding(expected.bodyId);
+				if (agreement === "body-only") {
+					await this.recordOutstanding(
+						expected,
+						"Markdown body settled while properties remain held",
+						"properties",
+					);
+				} else {
+					await this.database.deleteOutstanding(expected.bodyId);
+				}
 				await this.bodies.evict(expected.bodyId);
 				return true;
 			} catch (error) {
@@ -972,43 +995,58 @@ export class BootstrapClient {
 		return false;
 	}
 
-	private async hasCurrentSettlement(head: ClientCatalogEntry): Promise<boolean> {
-		if (!this.settlements || !this.disk.readCanonicalDiskEvidence || head.contentHash === null) return false;
+	private async currentSettlementAgreement(
+		head: ClientCatalogEntry,
+	): Promise<"whole" | "body-only" | null> {
+		if (!this.settlements || !this.disk.readCanonicalDiskEvidence || head.contentHash === null) return null;
 		const current = await this.settlements.read(head.bodyId);
-		if (current.kind !== "available") return false;
+		if (current.kind !== "available") return null;
 		const settlement = current.settlement;
 		if (settlement.durableGeneration < head.generation
 			|| settlement.serverContentHash !== head.contentHash
-			|| settlement.pathAtSettlement !== head.path) return false;
+			|| settlement.pathAtSettlement !== head.path) return null;
 		const disk = await this.disk.readCanonicalDiskEvidence(head.path);
-		return !!disk
-			&& disk.content === settlement.content
-			&& disk.fingerprint.bytes === settlement.diskFingerprint.bytes
-			&& disk.fingerprint.hash === settlement.diskFingerprint.hash;
+		if (!disk
+			|| disk.fingerprint.bytes !== settlement.diskFingerprint.bytes
+			|| disk.fingerprint.hash !== settlement.diskFingerprint.hash) return null;
+		if (settlement.format === 1 || settlement.agreement === "whole") {
+			return disk.content === settlement.content ? "whole" : null;
+		}
+		const split = splitMarkdownComponents(disk.content);
+		return split.kind !== "ambiguous" && split.body === settlement.bodyBase.content
+			? "body-only"
+			: null;
 	}
 
-	private async establishSettlement(head: ClientCatalogEntry, content: string): Promise<boolean> {
-		if (!this.settlements) return true;
-		if (!this.disk.readCanonicalDiskEvidence || head.contentHash === null) return false;
+	private async establishSettlement(
+		head: ClientCatalogEntry,
+		content: string,
+	): Promise<"whole" | "body-only" | null> {
+		if (!this.settlements) return "whole";
+		if (!this.disk.readCanonicalDiskEvidence || head.contentHash === null) return null;
 		const body = this.bodies.get(head.bodyId);
-		if (!body || body.dirty || body.unsettled > 0 || body.pendingLocalUpdates > 0) return false;
+		if (!body || body.dirty || body.unsettled > 0 || body.pendingLocalUpdates > 0) return null;
 		const lease = this.bodies.acquireLease(head.bodyId);
 		try {
 			const proof = this.bodies.captureRevision(head.bodyId);
 			const disk = await this.disk.readCanonicalDiskEvidence(head.path);
-			if (!disk || disk.content !== content || !this.bodies.coordinator.isProjectionCurrent(proof, head.path)) return false;
+			if (!disk || !this.bodies.coordinator.isProjectionCurrent(proof, head.path)) return null;
+			const serverSplit = splitMarkdownComponents(content);
+			const diskSplit = splitMarkdownComponents(disk.content);
+			if (serverSplit.kind === "ambiguous" || diskSplit.kind === "ambiguous"
+				|| serverSplit.body !== diskSplit.body) return null;
 			const currentHead = await this.server.currentHead(head.bodyId);
 			if (!currentHead || !this.sameCatalogHead(head, currentHead)
 				|| currentHead.contentHash !== head.contentHash
-				|| !this.bodies.coordinator.isProjectionCurrent(proof, head.path)) return false;
+				|| !this.bodies.coordinator.isProjectionCurrent(proof, head.path)) return null;
 			const current = await this.settlements.read(head.bodyId);
 			const expectedRevision = current.kind === "available"
 				? current.settlement.localSettlementRevision
 				: null;
-			const result = await this.settlements.settle({
+			const result = await this.settlements.settleComponents({
 				bodyId: head.bodyId,
-				content,
-				contentHash: head.contentHash,
+				serverContent: content,
+				diskContent: disk.content,
 				durableGeneration: head.generation,
 				serverContentHash: head.contentHash,
 				diskFingerprint: disk.fingerprint,
@@ -1016,7 +1054,7 @@ export class BootstrapClient {
 				expectedLocalSettlementRevision: expectedRevision,
 				settledAt: this.now(),
 			});
-			return result.kind === "stored";
+			return result.kind === "stored" ? result.settlement.agreement : null;
 		} finally {
 			lease.release();
 		}
@@ -1034,6 +1072,14 @@ export class BootstrapClient {
 			if (!head) {
 				await this.settleMissingHead(outstanding.bodyId, outstanding.generation);
 				continue;
+			}
+			if (outstanding.operation === "properties") {
+				const agreement = await this.currentSettlementAgreement(head);
+				if (agreement === "whole") {
+					await this.database.deleteOutstanding(outstanding.bodyId);
+					continue;
+				}
+				if (agreement === "body-only") continue;
 			}
 			try {
 				await this.applyCatalogEvents(progress, [{ ...head, lifecycle: "active" }]);
@@ -1130,7 +1176,7 @@ export class BootstrapClient {
 	private async recordOutstanding(
 		entry: Pick<ClientCatalogEntry, "bodyId" | "path" | "generation">,
 		reason: string,
-		operation: "settle" | "delete" | "move" = "settle",
+		operation: "settle" | "delete" | "move" | "properties" = "settle",
 	): Promise<void> {
 		const previous = await this.database.getOutstanding(entry.bodyId);
 		await this.database.putOutstanding({

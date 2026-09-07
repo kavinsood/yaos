@@ -183,4 +183,32 @@ s.check(
 	recoveryRetrying.includes("YAOS: Connected") && recoveryRetrying.includes("Recovery retrying"),
 	"connected sync can report recovery retrying without becoming a sync error",
 );
+
+s.section("Test 7: status exposes only actionable resource pressure");
+const actionablePressure = {
+	source: "admission" as const,
+	reason: "socket_budget" as const,
+	observedAt: Date.now(),
+	actionable: true,
+	label: "Body connection limit reached",
+	guidance: "Close inactive notes to release body connections, then retry.",
+};
+const actionableStatus = getLabelFromConnectionState(
+	{ kind: "online", generation: 1 },
+	null,
+	null,
+	0,
+	null,
+	actionablePressure,
+);
+s.check(actionableStatus.includes(actionablePressure.label), "actionable pressure is visible");
+const transientStatus = getLabelFromConnectionState(
+	{ kind: "online", generation: 1 },
+	null,
+	null,
+	0,
+	null,
+	{ ...actionablePressure, reason: "concurrent_load_limit", actionable: false },
+);
+s.check(!transientStatus.includes(actionablePressure.label), "self-clearing pressure stays out of the status bar");
 await s.done();
