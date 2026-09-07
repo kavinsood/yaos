@@ -1,7 +1,7 @@
 import { Notice, Platform, apiVersion, requestUrl, type App, type PluginManifest } from "obsidian";
+import { createObsidianHostAdapter } from "../../host/obsidianHostAdapter";
 import { ConfirmModal } from "../../ui/ConfirmModal";
 import {
-	detectPluginInstallCapability,
 	planPluginApply,
 	type PluginIntent,
 } from "./pluginIntent";
@@ -47,15 +47,10 @@ export async function runSmokeInstallCalendar(
 	app: App,
 	deps: { lookupCatalog?: CatalogLookup; lookupManifest?: ManifestLookup } = {},
 ): Promise<InstallSmokeResult> {
-	const plugins = app.plugins;
-	const capability = detectPluginInstallCapability({
-		installPlugin: plugins?.installPlugin?.bind(plugins),
-		enablePluginAndSave: plugins?.enablePluginAndSave?.bind(plugins),
-		setEnable: plugins?.setEnable?.bind(plugins),
-		isEnabled: plugins?.isEnabled?.bind(plugins),
-	});
+	const host = createObsidianHostAdapter(app);
+	const capability = host.communityPluginInstallCapability();
 
-	if (typeof plugins?.installPlugin !== "function" || typeof plugins.enablePluginAndSave !== "function") {
+	if (!capability.installPlugin || !capability.enablePluginAndSave) {
 		return { kind: "failed", reason: "This Obsidian build does not expose installPlugin/enablePluginAndSave." };
 	}
 	if (!capability.communityEnabled) {
@@ -77,11 +72,11 @@ export async function runSmokeInstallCalendar(
 		version: manifest.version,
 		enabled: true,
 	};
-	const alreadyEnabled = plugins.enabledPlugins?.has(intent.id) === true;
+	const alreadyEnabled = host.isCommunityPluginEnabled(intent.id);
 	const plan = planPluginApply({
 		intent,
 		capability,
-		installedVersion: plugins.manifests?.[intent.id]?.version ?? null,
+		installedVersion: host.communityPluginVersion(intent.id) ?? null,
 		alreadyEnabled,
 		manifest,
 		isMobile: Platform.isMobile,
@@ -111,11 +106,11 @@ export async function runSmokeInstallCalendar(
 
 	try {
 		if (plan.kind === "install-then-enable" || plan.kind === "install-only") {
-			await plugins.installPlugin(intent.repo, intent.version, manifest);
+			await host.installCommunityPlugin(intent.repo, intent.version, manifest);
 		}
 		let enabled = alreadyEnabled;
 		if (plan.kind === "install-then-enable" || plan.kind === "enable-only") {
-			enabled = (await plugins.enablePluginAndSave(intent.id)) === true;
+			enabled = await host.enableCommunityPlugin(intent.id);
 		}
 		return { kind: "installed", id: intent.id, version: intent.version, enabled };
 	} catch (error) {

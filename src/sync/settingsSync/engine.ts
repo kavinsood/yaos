@@ -1,4 +1,5 @@
-import type { App, PluginManifest } from "obsidian";
+import type { App } from "obsidian";
+import { createObsidianHostAdapter, type HostPatchRelease, type ObsidianHostAdapter } from "../../host/obsidianHostAdapter";
 import { formatUnknown } from "../../utils/format";
 import { obsidianRequest } from "../../utils/http";
 import { persistAndRunApplyBatch, resumeApplyQueue } from "./apply";
@@ -118,15 +119,13 @@ export class SettingsSyncEngine {
 	private lastPluginBatch: ApplyBatch | null = null;
 	private readonly acked = new Map<string, Ack>();
 	private readonly unknown = new UnknownRootJsonLog();
-	private originalInstallPlugin: ((
-		repo: string,
-		version: string,
-		manifest: PluginManifest,
-	) => Promise<void>) | null = null;
-	private originalEnablePluginAndSave: ((id: string) => Promise<boolean>) | null = null;
+	private readonly host: ObsidianHostAdapter;
+	private removeInstallObserver: HostPatchRelease | null = null;
 	private removeVisibilitySubscription: (() => void) | null = null;
 
-	constructor(private readonly opts: SettingsSyncEngineOptions) {}
+	constructor(private readonly opts: SettingsSyncEngineOptions) {
+		this.host = createObsidianHostAdapter(opts.app);
+	}
 
 	get status(): SettingsSyncStatus {
 		return this.snapshot;
@@ -1122,14 +1121,8 @@ export class SettingsSyncEngine {
 	}
 
 	private async communityEnabledIds(): Promise<Set<string>> {
-		const fromApp = this.opts.app.plugins?.enabledPlugins;
-		if (fromApp instanceof Set) {
-			const ids = new Set<string>();
-			for (const id of fromApp) {
-				if (typeof id === "string") ids.add(id);
-			}
-			if (ids.size > 0) return ids;
-		}
+		const fromApp = this.host.communityEnabledIds();
+		if (fromApp.size > 0) return fromApp;
 		const ids = new Set<string>();
 		try {
 			const raw = await this.adapter().read(joinConfig(this.configDir(), "community-plugins.json"));
@@ -1146,9 +1139,7 @@ export class SettingsSyncEngine {
 	}
 
 	private isCommunityEnabled(id: string): boolean {
-		const fromApp = this.opts.app.plugins?.enabledPlugins;
-		if (fromApp instanceof Set) return fromApp.has(id);
-		return false;
+		return this.host.isCommunityPluginEnabled(id);
 	}
 
 	private async localManifestMap(): Promise<Map<string, ApplyPluginManifest>> {
@@ -1267,55 +1258,24 @@ export class SettingsSyncEngine {
 	}
 
 	private hookInstallPlugin(): void {
-		const plugins = this.opts.app.plugins;
-		if (!plugins) return;
-		// eslint-disable-next-line @typescript-eslint/unbound-method -- retain the exact host function for restoration; invocation below uses call(plugins).
-		const originalInstall = plugins.installPlugin;
-		if (typeof originalInstall === "function" && !this.originalInstallPlugin) {
-			this.originalInstallPlugin = originalInstall;
-			plugins.installPlugin = async (repo, version, manifest) => {
-				const hooked = this.originalInstallPlugin;
-				if (!hooked) return;
-				await hooked.call(plugins, repo, version, manifest);
-				const id = manifest?.id;
-				if (typeof id !== "string") return;
-				if ((SETTINGS_SYNC_SKIP_PLUGIN_IDS as readonly string[]).includes(id)) return;
-				void this.notifyCatalogInstall({
-					id,
-					repo,
-					version,
-					enabled: this.isCommunityEnabled(id),
-				});
-			};
-		}
-		// eslint-disable-next-line @typescript-eslint/unbound-method -- retain the exact host function for restoration; invocation below uses call(plugins).
-		const originalEnable = plugins.enablePluginAndSave;
-		if (typeof originalEnable === "function" && !this.originalEnablePluginAndSave) {
-			this.originalEnablePluginAndSave = originalEnable;
-			plugins.enablePluginAndSave = async (id: string) => {
-				const hooked = this.originalEnablePluginAndSave;
-				const ok = hooked ? await hooked.call(plugins, id) : false;
-				if (ok && !(SETTINGS_SYNC_SKIP_PLUGIN_IDS as readonly string[]).includes(id)) {
-					const repo = this.lastRemote?.intents.find((row) => row.id === id)?.repo
-						?? (await this.loadCatalogs()).plugins.get(id);
-					const version = this.opts.app.plugins?.manifests?.[id]?.version;
-					if (repo && version) void this.notifyCatalogInstall({ id, repo, version, enabled: true });
-				}
-				return ok;
-			};
-		}
+		if (this.removeInstallObserver) return;
+		this.removeInstallObserver = this.host.observeCommunityPluginInstalls((event) => {
+			if ((SETTINGS_SYNC_SKIP_PLUGIN_IDS as readonly string[]).includes(event.id)) return;
+			if (event.kind === "installed" && event.repo && event.version) {
+				return this.notifyCatalogInstall({ id: event.id, repo: event.repo, version: event.version, enabled: event.enabled });
+			}
+			return (async () => {
+				const repo = this.lastRemote?.intents.find((row) => row.id === event.id)?.repo
+					?? (await this.loadCatalogs()).plugins.get(event.id);
+				const version = event.version ?? this.host.communityPluginVersion(event.id);
+				if (repo && version) await this.notifyCatalogInstall({ id: event.id, repo, version, enabled: true });
+			})();
+		});
 	}
 
 	private unhookInstallPlugin(): void {
-		const plugins = this.opts.app.plugins;
-		if (plugins && this.originalInstallPlugin) {
-			plugins.installPlugin = this.originalInstallPlugin;
-		}
-		if (plugins && this.originalEnablePluginAndSave) {
-			plugins.enablePluginAndSave = this.originalEnablePluginAndSave;
-		}
-		this.originalInstallPlugin = null;
-		this.originalEnablePluginAndSave = null;
+		this.removeInstallObserver?.();
+		this.removeInstallObserver = null;
 	}
 
 	private async applyCtx(key: string): Promise<ApplyContext> {
@@ -1324,6 +1284,7 @@ export class SettingsSyncEngine {
 		const generation = this.generation;
 		return {
 			app: this.opts.app,
+			host: this.host,
 			adapter: {
 				write: (path, data) => adapter.write(path, data),
 				remove: (path) => adapter.remove(path),

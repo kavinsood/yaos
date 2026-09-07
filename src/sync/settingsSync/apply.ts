@@ -10,6 +10,10 @@
 
 import { Notice, Platform, normalizePath, type App, type PluginManifest } from "obsidian";
 import {
+	createObsidianHostAdapter,
+	type ObsidianHostAdapter,
+} from "../../host/obsidianHostAdapter";
+import {
 	canApplyPluginData,
 	type PluginDataGateInput,
 } from "./dataJsonGate";
@@ -76,6 +80,7 @@ export type ApplyQueueRunResult = "none" | "invalid" | "paused" | "complete";
 
 export type ApplyContext = {
 	app: App;
+	host?: ObsidianHostAdapter;
 	adapter: ApplyAdapter;
 	configDir: string;
 	hostHash: string;
@@ -93,25 +98,6 @@ export type ApplyContext = {
 	refreshWorkspaceNames?: () => void;
 	/** Test seam: throw to abort the run without checkpointing the current step. */
 	beforeStep?: (index: number, step: ApplyStep) => void | Promise<void>;
-};
-
-type CommunityPlugins = NonNullable<App["plugins"]>;
-
-type CustomCss = {
-	installTheme?: (theme: { name: string; repo: string }, version?: string) => Promise<void>;
-};
-
-type WorkspacesInstance = {
-	loadData?: () => unknown;
-	changeLayout?: (layout: unknown) => void;
-};
-
-type AppExtras = App & {
-	customCss?: CustomCss;
-	internalPlugins?: {
-		getPluginById?: (id: string) => { instance?: WorkspacesInstance } | null;
-		plugins?: Record<string, { instance?: WorkspacesInstance }>;
-	};
 };
 
 /**
@@ -288,15 +274,14 @@ async function applyInstallTheme(
 	ctx: ApplyContext,
 	step: Extract<ApplyStep, { kind: "install-theme" }>,
 ): Promise<void> {
-	const extras: AppExtras = ctx.app;
-	const css = extras.customCss;
-	if (!css || typeof css.installTheme !== "function") {
+	const host = hostAdapter(ctx);
+	if (!host.canInstallTheme()) {
 		emitReason(ctx, "settings.missing_api", "installTheme");
 		emitNotice(ctx, `YAOS: cannot install theme ${step.name} on this Obsidian build.`, 8000);
 		return;
 	}
 	try {
-		await css.installTheme({ name: step.name, repo: step.repo }, step.version);
+		await host.installTheme(step.name, step.repo, step.version);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		emitReason(ctx, "settings.install_failed", `${step.name}: ${message}`);
@@ -316,13 +301,13 @@ async function applyInstallPlugin(
 		emitReason(ctx, "settings.desktop_only", step.id);
 		return;
 	}
-	const plugins: CommunityPlugins | undefined = ctx.app.plugins;
-	if (!plugins || plugins.isEnabled?.() !== true) {
+	const host = hostAdapter(ctx);
+	if (host.communityPluginsRestricted()) {
 		emitReason(ctx, "settings.restricted", step.id);
 		emitNotice(ctx, "YAOS: community plugins are restricted. Plugin install skipped.", 8000);
 		return;
 	}
-	if (typeof plugins.installPlugin !== "function") {
+	if (!host.canInstallCommunityPlugins()) {
 		emitReason(ctx, "settings.missing_api", "installPlugin");
 		emitNotice(
 			ctx,
@@ -331,8 +316,7 @@ async function applyInstallPlugin(
 		);
 		return;
 	}
-	const installed = plugins.manifests?.[step.id];
-	if (installed?.version === step.version) return;
+	if (host.communityPluginVersion(step.id) === step.version) return;
 	try {
 		const manifest: PluginManifest = {
 			id: step.manifest.id,
@@ -343,7 +327,7 @@ async function applyInstallPlugin(
 			description: step.manifest.description ?? "",
 			isDesktopOnly: step.manifest.isDesktopOnly,
 		};
-		await plugins.installPlugin(step.repo, step.version, manifest);
+		await host.installCommunityPlugin(step.repo, step.version, manifest);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		emitReason(ctx, "settings.install_failed", `${step.id}: ${message}`);
@@ -390,41 +374,37 @@ async function applyEnablePlugin(
 		emitReason(ctx, "settings.desktop_only", step.id);
 		return;
 	}
-	const plugins: CommunityPlugins | undefined = ctx.app.plugins;
-	if (!plugins || plugins.isEnabled?.() !== true) {
+	const host = hostAdapter(ctx);
+	if (host.communityPluginsRestricted()) {
 		emitReason(ctx, "settings.restricted", step.id);
 		return;
 	}
 	if (step.enabled) {
-		if (plugins.enabledPlugins?.has(step.id)) return;
-		if (!plugins.manifests?.[step.id]) {
+		if (host.isCommunityPluginEnabled(step.id)) return;
+		if (!host.communityPluginVersion(step.id)) {
 			emitReason(ctx, "settings.enable_missing", step.id);
 			return;
 		}
-		if (typeof plugins.enablePluginAndSave !== "function") {
-			emitReason(ctx, "settings.missing_api", "enablePluginAndSave");
-			emitNotice(
-				ctx,
-				`YAOS: enable ${step.id} manually: obsidian://show-plugin?id=${step.id}`,
-				8000,
-			);
-			return;
-		}
 		try {
-			await plugins.enablePluginAndSave(step.id);
+			if (!await host.enableCommunityPlugin(step.id)) {
+				emitReason(ctx, "settings.missing_api", "enablePluginAndSave");
+				emitNotice(
+					ctx,
+					`YAOS: enable ${step.id} manually: obsidian://show-plugin?id=${step.id}`,
+					8000,
+				);
+			}
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			emitReason(ctx, "settings.enable_failed", `${step.id}: ${message}`);
 		}
 		return;
 	}
-	if (plugins.enabledPlugins && !plugins.enabledPlugins.has(step.id)) return;
-	if (typeof plugins.disablePluginAndSave !== "function") {
-		emitReason(ctx, "settings.missing_api", "disablePluginAndSave");
-		return;
-	}
+	if (!host.isCommunityPluginEnabled(step.id)) return;
 	try {
-		await plugins.disablePluginAndSave(step.id);
+		if (!await host.disableCommunityPlugin(step.id)) {
+			emitReason(ctx, "settings.missing_api", "disablePluginAndSave");
+		}
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		emitReason(ctx, "settings.disable_failed", `${step.id}: ${message}`);
@@ -436,35 +416,30 @@ async function applyUninstallPlugin(ctx: ApplyContext, id: string): Promise<void
 		emitReason(ctx, "settings.forbidden_plugin", id);
 		return;
 	}
-	const plugins = ctx.app.plugins;
+	const host = hostAdapter(ctx);
 	let hostFailed = false;
 	try {
-		if (plugins?.enabledPlugins?.has(id)) {
-			if (typeof plugins.disablePluginAndSave === "function") await plugins.disablePluginAndSave(id);
-			else if (typeof plugins.disablePlugin === "function") await plugins.disablePlugin(id);
-		}
+		if (host.isCommunityPluginEnabled(id)) await host.disableCommunityPlugin(id);
 	} catch (error) {
 		hostFailed = true;
 		const message = error instanceof Error ? error.message : String(error);
 		emitReason(ctx, "settings.disable_failed", `${id}: ${message}`);
 	}
 	try {
-		if (typeof plugins?.unloadPlugin === "function") await plugins.unloadPlugin(id);
+		await host.unloadCommunityPlugin(id);
 	} catch (error) {
 		hostFailed = true;
 		const message = error instanceof Error ? error.message : String(error);
 		emitReason(ctx, "settings.unload_failed", `${id}: ${message}`);
 	}
 	try {
-		if (typeof plugins?.uninstallPlugin === "function") await plugins.uninstallPlugin(id);
+		await host.uninstallCommunityPlugin(id);
 	} catch (error) {
 		hostFailed = true;
 		const message = error instanceof Error ? error.message : String(error);
 		emitReason(ctx, "settings.uninstall_failed", `${id}: ${message}`);
 	}
-	plugins?.enabledPlugins?.delete(id);
-	if (plugins?.plugins && id in plugins.plugins) delete plugins.plugins[id];
-	if (plugins?.manifests && id in plugins.manifests) delete plugins.manifests[id];
+	host.removeCommunityPluginState(id);
 	const folder = normalizePath(`${ctx.configDir}/plugins/${id}`);
 	let removed = false;
 	try {
@@ -517,13 +492,11 @@ function refreshWorkspaceNames(ctx: ApplyContext): void {
 		ctx.refreshWorkspaceNames();
 		return;
 	}
-	const extras: AppExtras = ctx.app;
-	const instance =
-		extras.internalPlugins?.getPluginById?.("workspaces")?.instance
-		?? extras.internalPlugins?.plugins?.workspaces?.instance;
-	if (instance && typeof instance.loadData === "function") {
-		void instance.loadData();
-	}
+	hostAdapter(ctx).refreshWorkspaceNames();
+}
+
+function hostAdapter(ctx: ApplyContext): ObsidianHostAdapter {
+	return ctx.host ?? createObsidianHostAdapter(ctx.app);
 }
 
 function parseApplyStep(raw: unknown): ApplyStep | null {

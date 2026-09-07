@@ -10,6 +10,7 @@ import type { ProductFlightPathEventInput } from "../observability/traceSink";
 import { PRODUCT_EVENT_KIND } from "../observability/productEventKinds";
 import { ORIGIN_EDITOR_HEALTH_HEAL } from "./origins";
 import { awarenessCursorUser } from "../utils/deviceCursorColor";
+import { leafIdentity } from "../host/obsidianHostAdapter";
 
 /**
  * Manages per-editor CM6 bindings via yCollab.
@@ -220,7 +221,7 @@ export class EditorBindingManager {
 		// Only bind .md files
 		if (!file.path.endsWith(".md")) return;
 
-		const leafId = view.leaf.id ?? file.path;
+		const leafId = leafIdentity(view.leaf, file.path);
 		const tracked = this.bindings.get(leafId);
 		if (tracked && tracked.path !== file.path) {
 			// Never leave the previous body's extension attached while the next
@@ -312,7 +313,7 @@ export class EditorBindingManager {
 		if (!file) return false;
 		if (!file.path.endsWith(".md")) return false;
 
-		const leafId = view.leaf.id ?? file.path;
+		const leafId = leafIdentity(view.leaf, file.path);
 		const cm = this.getCmView(view);
 		if (!cm) {
 			this.log(`repair: no CM EditorView for "${file.path}"`);
@@ -425,8 +426,7 @@ export class EditorBindingManager {
 			return;
 		}
 
-		const leafId =
-			view.leaf.id ?? file.path;
+		const leafId = leafIdentity(view.leaf, file.path);
 		const pending = this.pendingBodyLoads.get(leafId);
 		if (pending?.path === file.path) {
 			this.log(`rebind: waiting for v4 body "${file.path}" (leaf=${leafId}, reason=${reason})`);
@@ -442,8 +442,7 @@ export class EditorBindingManager {
 	 */
 	unbind(view: MarkdownView): void {
 		const file = view.file;
-		const leafId =
-			view.leaf.id ?? file?.path ?? "unknown";
+		const leafId = leafIdentity(view.leaf, file?.path ?? "unknown");
 		this.cancelPendingBodyLoad(leafId);
 		this.releaseBodyLease(leafId);
 
@@ -722,8 +721,7 @@ export class EditorBindingManager {
 
 	getBindingDebugInfoForView(view: MarkdownView): BindingDebugInfo | null {
 		const file = view.file;
-		const leafId =
-			view.leaf.id ?? file?.path ?? "unknown";
+		const leafId = leafIdentity(view.leaf, file?.path ?? "unknown");
 		const binding = this.bindings.get(leafId);
 		if (!binding) return null;
 
@@ -758,8 +756,7 @@ export class EditorBindingManager {
 
 	getBindingHealthForView(view: MarkdownView): BindingHealthStatus {
 		const file = view.file;
-		const leafId =
-			view.leaf.id ?? file?.path ?? "unknown";
+		const leafId = leafIdentity(view.leaf, file?.path ?? "unknown");
 		const binding = this.bindings.get(leafId);
 		if (!binding) {
 			return {
@@ -811,8 +808,7 @@ export class EditorBindingManager {
 		const file = view.file;
 		if (!file) return null;
 
-		const leafId =
-			view.leaf.id ?? file.path;
+		const leafId = leafIdentity(view.leaf, file.path);
 		const cm = this.getCmView(view);
 		if (!cm) {
 			return {
@@ -913,8 +909,7 @@ export class EditorBindingManager {
 		const container = view.containerEl;
 		if (!container) return null;
 
-		const leafId =
-			view.leaf.id ?? view.file?.path ?? null;
+		const leafId = leafIdentity(view.leaf, view.file?.path ?? "");
 		if (leafId) {
 			const existing = this.bindings.get(leafId);
 			if (
@@ -1550,8 +1545,7 @@ export class EditorBindingManager {
 				this.trace?.("editor", "binding-target-missing", {
 					path: file.path,
 					reason,
-					leafId:
-						view.leaf.id ?? file.path,
+					leafId: leafIdentity(view.leaf, file.path),
 				});
 			}
 			return null;
@@ -1577,8 +1571,7 @@ export class EditorBindingManager {
 		const file = view.file;
 		if (!file) return;
 
-		const leafId =
-			view.leaf.id ?? file.path;
+		const leafId = leafIdentity(view.leaf, file.path);
 		const existing = this.bindings.get(leafId);
 		this.trace?.("editor", "binding-blocked-tombstone", {
 			path: file.path,
