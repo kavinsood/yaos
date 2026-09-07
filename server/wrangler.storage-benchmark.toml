@@ -1,0 +1,66 @@
+# Temporary benchmark build of the existing storage-v3 validation Worker.
+# The three YAOS namespaces and their complete migration lineage are preserved;
+# benchmark bytes go only to the additional STORAGE_BENCHMARK_RUNS namespace.
+name = "yaos-rfc08-10-validation-open"
+main = "../tests/deployed/storage-benchmark-entry.ts"
+compatibility_date = "2026-03-02"
+workers_dev = true
+preview_urls = false
+
+[vars]
+YAOS_ENABLE_STORAGE_BENCHMARK = "true"
+
+[[durable_objects.bindings]]
+name = "YAOS_SYNC"
+class_name = "VaultSyncServerStorage3Stress5"
+
+[[durable_objects.bindings]]
+name = "YAOS_CONFIG"
+class_name = "ServerConfigStorage3Stress5"
+
+[[durable_objects.bindings]]
+name = "YAOS_RECOVERY_JOBS"
+class_name = "RecoveryJobStorage3Stress5"
+
+[[durable_objects.bindings]]
+name = "STORAGE_BENCHMARK_RUNS"
+class_name = "StorageBenchmarkRun"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["VaultSyncServer", "ServerConfig"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["RecoveryJob"]
+
+[[migrations]]
+tag = "storage-v3-validation-20260908"
+new_sqlite_classes = ["VaultSyncServerStorage3Validation", "ServerConfigStorage3Validation", "RecoveryJobStorage3Validation"]
+
+[[migrations]]
+tag = "storage-v3-stress2-20260908"
+new_sqlite_classes = ["VaultSyncServerStorage3Stress2", "ServerConfigStorage3Stress2", "RecoveryJobStorage3Stress2"]
+
+[[migrations]]
+tag = "storage-v3-stress3-20260908"
+new_sqlite_classes = ["VaultSyncServerStorage3Stress3", "ServerConfigStorage3Stress3", "RecoveryJobStorage3Stress3"]
+
+[[migrations]]
+tag = "storage-v3-stress4-20260908"
+new_sqlite_classes = ["VaultSyncServerStorage3Stress4", "ServerConfigStorage3Stress4", "RecoveryJobStorage3Stress4"]
+
+[[migrations]]
+tag = "storage-v3-stress5-20260908"
+new_sqlite_classes = ["VaultSyncServerStorage3Stress5", "ServerConfigStorage3Stress5", "RecoveryJobStorage3Stress5"]
+
+[[migrations]]
+tag = "storage-benchmark-20260908"
+new_sqlite_classes = ["StorageBenchmarkRun"]
+
+[[r2_buckets]]
+binding = "YAOS_BUCKET"
+bucket_name = "yaos"
+
+[observability.logs]
+enabled = true
