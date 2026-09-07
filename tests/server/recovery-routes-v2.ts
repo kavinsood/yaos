@@ -4,6 +4,7 @@ import type { Env } from "../../server/src/routes/types";
 import { handleRecoveryRoute, type RecoveryRouteAuthority } from "../../server/src/recoveryRoutes";
 import { FakeObjectStore, makeConfigNamespace, makeEnv, makeTrapNamespace } from "../mocks/workerEnv.ts";
 import { suite } from "../harness.ts";
+import { COLLABORATION_POLICY_VERSION, capabilityDigestForRole } from "../../server/src/collaboration";
 
 const s = suite("recovery-routes-v2");
 const vaultId = "vault-routes-aa";
@@ -238,11 +239,12 @@ s.test("snapshot deletion keeps dependency failures explicit and safe IDs canoni
 s.test("device bearer auth runs before vault allocation and missing bucket/jobs are explicit", async () => {
 	invalidateStoredServerConfigCache();
 	const sync = makeTrapNamespace("vault allocated unexpectedly");
+	const capabilityDigest = await capabilityDigestForRole("owner");
 	const config = makeConfigNamespace(async (request) => {
 		const path = new URL(request.url).pathname;
 		if (path === "/__yaos/config") {
 			return Response.json({
-				configFormat: 2,
+				configFormat: 3,
 				claimed: true,
 				operatorRecoveryHash: "a".repeat(64),
 				ticketSigningKey: "ticket-key",
@@ -251,6 +253,14 @@ s.test("device bearer auth runs before vault allocation and missing bucket/jobs 
 				updateRepoBranch: null,
 			});
 		}
+		if (path === "/__yaos/collaboration/authorize") return Response.json({
+			device: { deviceId: "device-1", vaultId, name: "Owner device" },
+			principal: { principalId: "principal-1", vaultId },
+			membership: { principalId: "principal-1", vaultId, role: "owner", state: "active", revision: 1 },
+			actor: { vaultId, vaultGeneration: "generation-routes-aa", principalId: "principal-1", membershipRevision: 1,
+				deviceId: "device-1", deviceCredentialRevision: 1, role: "owner",
+				policyVersion: COLLABORATION_POLICY_VERSION, capabilityDigest },
+		});
 		if (path === "/__yaos/authorize-device") return Response.json({ device: { deviceId: "device-1", vaultId } });
 		throw new Error(`unexpected config path ${path}`);
 	});

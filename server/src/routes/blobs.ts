@@ -5,6 +5,8 @@ import { blobKey } from "../vaultObjectStore";
 import { mapWithConcurrency } from "../shared/concurrency";
 import type { Env, JsonResponse } from "./types";
 import { readVault } from "./vault";
+import { authorizeVaultActor, getHttpAuthToken } from "./auth";
+import { authorizeVaultAction } from "../collaboration";
 
 const EXISTS_BATCH_LIMIT = 50;
 const OBJECT_HEAD_CONCURRENCY = 4;
@@ -20,6 +22,14 @@ export async function handleBlobRoute(
 	rest: string[],
 	json: JsonResponse,
 ): Promise<Response> {
+	const authorized = await authorizeVaultActor(env, getHttpAuthToken(req), vaultId);
+	if (!authorized) return json({ error: "unauthorized" }, 401);
+	const actor = authorized.actor;
+	const required = req.method === "GET" || (req.method === "POST" && rest[0] === "exists")
+		? "vault.attachments.read" as const
+		: "vault.attachments.write" as const;
+	const decision = authorizeVaultAction(actor, required);
+	if (!decision.allowed) return json({ error: decision.reason }, 403);
 	let vault;
 	try {
 		vault = await readVault(env, vaultId);
@@ -28,6 +38,7 @@ export async function handleBlobRoute(
 	}
 	if (!vault || vault.state !== "active") return json({ error: vault ? `vault_${vault.state}` : "unknown_vault" }, vault ? 409 : 404);
 	const vaultGeneration = vault.vaultGeneration;
+	if (actor.vaultGeneration !== vaultGeneration) return json({ error: "authority_superseded" }, 409);
 	if (req.method === "POST" && rest[0] === "exists") {
 		return await handleBlobExists(env, vaultId, vaultGeneration, req, json);
 	}

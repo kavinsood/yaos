@@ -26,6 +26,14 @@ import {
 } from "./identity";
 import { json } from "./routes/http";
 import type { ControlPlaneStoragePort } from "./platformPorts";
+import {
+	CollaborationControlPlane,
+	buildActorContext,
+	initializeCollaborationStorage,
+	installEnrollmentIdentity,
+} from "./collaborationControlPlane";
+import { capabilitiesForRole } from "./collaboration";
+import { parseAuthorizationChangeRecords, parseCollaborationCodeRecords, parseMembershipRecords, parseOwnershipTransferRecords, parsePrincipalRecords, parseSecurityAuditEvents, parseVaultGovernanceRequestRecords, type AuthorizationChangeRecord, type VaultGovernanceRequestRecord } from "./collaborationIdentity";
 
 const CONFIG_FORMAT_KEY = "configFormat";
 const CLAIMED_KEY = "claimed";
@@ -104,6 +112,10 @@ export interface ConsoleState {
 	pairingCodes: PairingCodePublic[];
 	pendingDestroys: PendingDestroyRecord[];
 	pendingDeviceRevocations: PendingDeviceRevocationRecord[];
+	principals: ReturnType<typeof parsePrincipalRecords>;
+	memberships: ReturnType<typeof parseMembershipRecords>;
+	authorizationChanges: AuthorizationChangeRecord[];
+	vaultGovernanceRequests: VaultGovernanceRequestRecord[];
 }
 
 function normalizeUpdateProvider(value: unknown): UpdateProvider | null {
@@ -392,7 +404,11 @@ export function parsePendingDestroyRecords(
 
 /** Runtime-independent owner of server claim, enrollment, identity, and vault control-plane policy. */
 export class ControlPlaneRuntime {
-	constructor(private readonly storage: ControlPlaneStoragePort) {}
+	private readonly collaboration: CollaborationControlPlane;
+
+	constructor(private readonly storage: ControlPlaneStoragePort) {
+		this.collaboration = new CollaborationControlPlane(storage);
+	}
 
 	async fetch(request: Request): Promise<Response> {
 		try {
@@ -411,6 +427,11 @@ export class ControlPlaneRuntime {
 
 	private async dispatch(request: Request): Promise<Response> {
 		const { pathname } = new URL(request.url);
+		if (request.method === "POST" && pathname === "/__yaos/verify-actor") {
+			return (await this.collaboration.fetch(new Request("https://internal/__yaos/collaboration/verify-actor", request)))!;
+		}
+		const collaborationResponse = await this.collaboration.fetch(request);
+		if (collaborationResponse) return collaborationResponse;
 		if (request.method === "GET" && pathname === "/__yaos/config") return json(await this.readConfig());
 		if (request.method === "GET" && pathname === "/__yaos/console") return json(await this.readConsole());
 		if (request.method === "GET" && pathname === "/__yaos/vault") return this.handleReadVault(request);
@@ -503,6 +524,7 @@ export class ControlPlaneRuntime {
 				vaultGeneration: randomBase64Url(16),
 				createdAt: now,
 				provisionedAt: null,
+				ownerPrincipalId: null,
 			};
 			await txn.put(CONFIG_FORMAT_KEY, CONFIG_FORMAT);
 			await txn.put(CLAIMED_KEY, true);
@@ -515,6 +537,7 @@ export class ControlPlaneRuntime {
 			await txn.put(PENDING_DESTROYS_KEY, []);
 			await txn.put(PENDING_DEVICE_REVOCATIONS_KEY, []);
 			await txn.put(ENROLLMENT_REPLAYS_KEY, []);
+			await initializeCollaborationStorage(txn);
 			return json({ ok: true, vaultId, vaultGeneration: vault.vaultGeneration, vaultName, created: true });
 		});
 	}
@@ -559,7 +582,7 @@ export class ControlPlaneRuntime {
 			}
 			const now = Date.now();
 			if (vault.state === "provisioning") {
-				vault.state = "active";
+				vault.state = vault.ownerPrincipalId ? "active" : "awaiting_owner";
 				vault.provisionedAt = now;
 				await txn.put(VAULTS_KEY, vaults);
 			}
@@ -684,6 +707,17 @@ export class ControlPlaneRuntime {
 				) {
 					return json({ error: "enrollment_request_conflict" }, 409);
 				}
+				const replayVaults = parseVaultRecords(await txn.get(VAULTS_KEY));
+				const replayDevices = parseDeviceRecords(await txn.get(DEVICES_KEY), new Set(replayVaults.map((record) => record.vaultId)));
+				const replayDevice = replayDevices.find((record) => record.deviceId === replay.deviceId);
+				const replayPrincipal = replayDevice?.principalId
+					? parsePrincipalRecords(await txn.get("principals")).find((record) => record.principalId === replayDevice.principalId)
+					: undefined;
+				const replayMembership = replayPrincipal
+					? parseMembershipRecords(await txn.get("vaultMemberships")).find((record) => record.principalId === replayPrincipal.principalId && record.vaultId === replay.vaultId)
+					: undefined;
+				const replayChange = parseAuthorizationChangeRecords(await txn.get("authorizationChanges"))
+					.find((record) => record.vaultId === replay.vaultId && record.requestId === enrollmentRequestId);
 				return json({
 					ok: true,
 					vaultId: replay.vaultId,
@@ -691,6 +725,16 @@ export class ControlPlaneRuntime {
 					deviceId: replay.deviceId,
 					deviceName: replay.deviceName,
 					originImport: replay.originImport,
+					...(replayPrincipal && replayMembership && replayDevice ? {
+						principalId: replayPrincipal.principalId,
+						role: replayMembership.role,
+						membershipRevision: replayMembership.revision,
+						deviceCredentialRevision: replayDevice.credentialRevision,
+					capabilities: capabilitiesForRole(replayMembership.role),
+						change: replayChange,
+						principal: replayPrincipal,
+						actor: await buildActorContext(replay.vaultGeneration, replayPrincipal, replayMembership, replayDevice),
+					} : {}),
 					replayed: true,
 				});
 			}
@@ -702,10 +746,26 @@ export class ControlPlaneRuntime {
 			const vaultIds = new Set(vaults.map((vault) => vault.vaultId));
 			const codes = parsePairingCodeRecords(await txn.get(PAIRING_CODES_KEY), vaultIds);
 			const devices = parseDeviceRecords(await txn.get(DEVICES_KEY), vaultIds);
-			const match = findHashedRecord(codes, pairingCodeHash, (code) => code.codeHash);
+			const legacyMatch = findHashedRecord(codes, pairingCodeHash, (code) => code.codeHash);
+			const collaborationMatch = findHashedRecord(
+				parseCollaborationCodeRecords(await txn.get("collaborationCodes")),
+				pairingCodeHash,
+				(code) => code.codeHash,
+			);
+			const match = legacyMatch ?? (collaborationMatch ? {
+				codeId: collaborationMatch.codeId,
+				codeHash: collaborationMatch.codeHash,
+				vaultId: collaborationMatch.vaultId,
+				exp: collaborationMatch.expiresAt,
+				maxUses: 1,
+				uses: collaborationMatch.consumedAt === null ? 0 : 1,
+				purpose: collaborationMatch.purpose === "member-invitation" ? "invite" as const
+					: collaborationMatch.purpose === "owner-bootstrap" ? "origin" as const : "device" as const,
+				createdAt: collaborationMatch.createdAt,
+			} : null);
 			if (!match) return json({ error: "unknown_code", message: "This pairing code is not recognized." }, 404);
 			const vault = vaults.find((record) => record.vaultId === match.vaultId);
-			if (!vault || vault.state !== "active") {
+			if (!vault || (vault.state !== "active" && vault.state !== "awaiting_owner")) {
 				return json({ error: "vault_not_active", message: "This vault is not ready for enrollment." }, 409);
 			}
 			if (match.exp <= now) return json({ error: "expired_code", message: "This pairing code has expired. Ask for a new one." }, 410);
@@ -722,10 +782,24 @@ export class ControlPlaneRuntime {
 			const device: DeviceRecord = {
 				deviceId,
 				vaultId: match.vaultId,
+				principalId: "pending",
 				tokenHash: deviceTokenHash,
+				credentialRevision: 1,
 				name,
+				state: "active",
 				enrolledAt: now,
+				revokedAt: null,
 			};
+			const identity = await installEnrollmentIdentity(txn, {
+				vaultId: match.vaultId,
+				device,
+				pairingPurpose: match.purpose,
+				pairingCodeHash,
+				displayName: desiredName,
+				enrollmentRequestId,
+				requestDigest: await hashSecret(JSON.stringify({ pairingCodeHash, deviceId, deviceTokenHash })),
+			});
+			if (identity instanceof Response) return identity;
 			const replayRecord: EnrollmentReplayRecord = {
 				enrollmentRequestId,
 				pairingCodeHash,
@@ -734,7 +808,7 @@ export class ControlPlaneRuntime {
 				vaultId: device.vaultId,
 				vaultGeneration: vault.vaultGeneration,
 				deviceName: name,
-				originImport: match.purpose === "origin",
+				originImport: legacyMatch?.purpose === "origin",
 				createdAt: now,
 				expiresAt: now + ENROLLMENT_REPLAY_TTL_MS,
 			};
@@ -750,6 +824,14 @@ export class ControlPlaneRuntime {
 				deviceId: replayRecord.deviceId,
 				deviceName: replayRecord.deviceName,
 				originImport: replayRecord.originImport,
+				principalId: identity.principal.principalId,
+				role: identity.membership.role,
+				membershipRevision: identity.membership.revision,
+				deviceCredentialRevision: identity.device.credentialRevision,
+				capabilities: capabilitiesForRole(identity.membership.role),
+				change: identity.change,
+				principal: identity.principal,
+				actor: await buildActorContext(vault.vaultGeneration, identity.principal, identity.membership, identity.device),
 				replayed: false,
 			});
 		});
@@ -811,6 +893,12 @@ export class ControlPlaneRuntime {
 			return json({ error: "unauthorized" }, 401);
 		}
 		if (!body.tokenHash) return json({ error: "unauthorized" }, 401);
+		const collaboration = await this.collaboration.fetch(new Request("https://internal/__yaos/collaboration/authorize", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify(body),
+		}));
+		if (collaboration?.ok) return collaboration;
 		const vaults = parseVaultRecords(await this.storage.get(VAULTS_KEY));
 		const devices = parseDeviceRecords(
 			await this.storage.get(DEVICES_KEY),
@@ -818,7 +906,7 @@ export class ControlPlaneRuntime {
 		);
 		const device = findHashedRecord(devices, body.tokenHash, (record) => record.tokenHash);
 		const vault = device ? vaults.find((record) => record.vaultId === device.vaultId) : null;
-		if (!device || vault?.state !== "active" || (body.vaultId !== undefined && device.vaultId !== body.vaultId)) {
+		if (!device || device.principalId || vault?.state !== "active" || (body.vaultId !== undefined && device.vaultId !== body.vaultId)) {
 			return json({ error: "unauthorized" }, 401);
 		}
 		return json({ ok: true, device: toDevicePublic(device) });
@@ -929,6 +1017,7 @@ export class ControlPlaneRuntime {
 					? json({ ok: true, membershipRevoked: true, revocation: existing })
 					: json({ error: "unknown_device" }, 404);
 			}
+			if (device.principalId) return json({ error: "collaboration_authority_required" }, 409);
 			const vault = vaults.find((record) => record.vaultId === device.vaultId);
 			if (!vault) return json({ error: "unknown_vault" }, 409);
 			if (pendingRevocations.length >= MAX_PENDING_DEVICE_REVOCATIONS && !existing) {
@@ -1096,6 +1185,7 @@ export class ControlPlaneRuntime {
 				vaultGeneration: randomBase64Url(16),
 				createdAt: Date.now(),
 				provisionedAt: null,
+				ownerPrincipalId: null,
 			};
 			vaults.push(vault);
 			await txn.put(VAULTS_KEY, vaults);
@@ -1146,7 +1236,7 @@ export class ControlPlaneRuntime {
 	}
 
 	private async handleDestroyVault(request: Request): Promise<Response> {
-		let body: { vaultId?: string };
+		let body: { vaultId?: string; governanceRequestId?: string };
 		try {
 			body = await request.json();
 		} catch {
@@ -1154,6 +1244,9 @@ export class ControlPlaneRuntime {
 		}
 		if (typeof body.vaultId !== "string" || !isUsableVaultId(body.vaultId)) {
 			return json({ error: "invalid vaultId" }, 400);
+		}
+		if (typeof body.governanceRequestId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(body.governanceRequestId)) {
+			return json({ error: "destroy_confirmation_required" }, 409);
 		}
 		const vaultId = body.vaultId.trim();
 		return this.storage.transaction(async (txn) => {
@@ -1170,6 +1263,12 @@ export class ControlPlaneRuntime {
 			);
 			const enrollmentReplays = parseEnrollmentReplayRecords(await txn.get(ENROLLMENT_REPLAYS_KEY));
 			const pending = pendingDestroys.find((record) => record.vaultId === vaultId);
+			const governanceRequests = parseVaultGovernanceRequestRecords(await txn.get("vaultGovernanceRequests"));
+			const governance = governanceRequests.find((record) => record.vaultId === vaultId
+				&& record.governanceRequestId === body.governanceRequestId && record.kind !== "vault-rename");
+			if (!governance || (governance.state !== "confirmed" && governance.state !== "executing")) {
+				return json({ error: "destroy_confirmation_required" }, 409);
+			}
 			if (pending) return json({ ok: true, pending });
 
 			const vault = vaults.find((record) => record.vaultId === vaultId);
@@ -1195,6 +1294,8 @@ export class ControlPlaneRuntime {
 				lastError: null,
 			};
 			vault.state = "deleting";
+			governance.state = "executing";
+			governance.lastError = null;
 			const nextDevices = devices.filter((device) => device.vaultId !== vaultId);
 			const nextCodes = codes.filter((code) => code.vaultId !== vaultId);
 			await txn.put(PENDING_DESTROYS_KEY, [...pendingDestroys, record]);
@@ -1209,6 +1310,7 @@ export class ControlPlaneRuntime {
 				ENROLLMENT_REPLAYS_KEY,
 				enrollmentReplays.filter((replay) => replay.vaultId !== vaultId),
 			);
+			await txn.put("vaultGovernanceRequests", governanceRequests);
 			return json({ ok: true, pending: record });
 		});
 	}
@@ -1273,16 +1375,38 @@ export class ControlPlaneRuntime {
 			pending.lastError = boundedDestroyError(body.lastError);
 			const vault = vaults.find((record) => record.vaultId === body.vaultId);
 			if (pending.roomComplete && pending.r2Complete) {
+				const governanceRequests = parseVaultGovernanceRequestRecords(await txn.get("vaultGovernanceRequests"));
+				const governance = governanceRequests.find((record) => record.vaultId === body.vaultId
+					&& record.vaultGeneration === pending.vaultGeneration && record.state === "executing");
+				if (governance) {
+					governance.state = "complete";
+					governance.completedAt = Date.now();
+					governance.lastError = null;
+				}
 				await txn.put(
 					PENDING_DESTROYS_KEY,
 					pendingDestroys.filter((record) => record !== pending),
 				);
 				await txn.put(VAULTS_KEY, vaults.filter((record) => record !== vault));
+				await txn.put("principals", parsePrincipalRecords(await txn.get("principals")).filter((record) => record.vaultId !== body.vaultId));
+				await txn.put("vaultMemberships", parseMembershipRecords(await txn.get("vaultMemberships")).filter((record) => record.vaultId !== body.vaultId));
+				await txn.put("collaborationCodes", parseCollaborationCodeRecords(await txn.get("collaborationCodes")).filter((record) => record.vaultId !== body.vaultId));
+				await txn.put("ownershipTransfers", parseOwnershipTransferRecords(await txn.get("ownershipTransfers")).filter((record) => record.vaultId !== body.vaultId));
+				await txn.put("authorizationChanges", parseAuthorizationChangeRecords(await txn.get("authorizationChanges")).filter((record) => record.vaultId !== body.vaultId));
+				await txn.put("securityAuditEvents", parseSecurityAuditEvents(await txn.get("securityAuditEvents")).filter((record) => record.vaultId !== body.vaultId));
+				await txn.put("vaultGovernanceRequests", governanceRequests);
 				return json({ ok: true, completed: true });
 			}
 			if (vault) {
 				vault.state = pending.lastError ? "delete_failed" : "deleting";
 				await txn.put(VAULTS_KEY, vaults);
+			}
+			if (pending.lastError) {
+				const governanceRequests = parseVaultGovernanceRequestRecords(await txn.get("vaultGovernanceRequests"));
+				const governance = governanceRequests.find((record) => record.vaultId === body.vaultId
+					&& record.vaultGeneration === pending.vaultGeneration && record.state === "executing");
+				if (governance) governance.lastError = pending.lastError;
+				await txn.put("vaultGovernanceRequests", governanceRequests);
 			}
 			await txn.put(PENDING_DESTROYS_KEY, pendingDestroys);
 			return json({ ok: false, completed: false, pending }, 202);
@@ -1383,6 +1507,10 @@ export class ControlPlaneRuntime {
 			pairingCodes: codes.filter((code) => code.uses < 1 && code.exp > now).map(toPairingPublic),
 			pendingDestroys,
 			pendingDeviceRevocations,
+			principals: parsePrincipalRecords(await this.storage.get("principals")),
+			memberships: parseMembershipRecords(await this.storage.get("vaultMemberships")),
+			authorizationChanges: parseAuthorizationChangeRecords(await this.storage.get("authorizationChanges")),
+			vaultGovernanceRequests: parseVaultGovernanceRequestRecords(await this.storage.get("vaultGovernanceRequests")),
 		};
 	}
 

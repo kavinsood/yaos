@@ -8,6 +8,7 @@ import { renderMobileSetupPage, renderOperatorConsole, renderOperatorLogin, rend
 import {
 	authorizeAnyDevice,
 	authorizeDevice,
+	authorizeVaultActor,
 	getAuthStateCached,
 	getCapabilities,
 	getHttpAuthToken,
@@ -20,21 +21,37 @@ import {
 import { handleBlobRoute } from "./routes/blobs";
 import {
 	handleEnrollRoute,
+	handleOwnershipTransferRoute,
+	handleRevokeCollaborationCodeRoute,
+	handleVaultAuditRoute,
+	handleVaultCollaborationCodeRoute,
+	handleVaultCollaborationCodesListRoute,
+	handleVaultCollaborationDeviceRoute,
 	handleVaultDeviceLeaveRoute,
 	handleVaultDeviceRoute,
 	handleVaultDevicesListRoute,
+	handleVaultGovernanceRoute,
+	handleVaultLeaveRoute,
+	handleVaultMeRoute,
+	handleVaultMembersRoute,
 	handleVaultPairingCodeRoute,
+	handleVaultPrincipalDevicesRoute,
+	handleVaultPrincipalRoute,
 } from "./routes/enroll";
 import { corsPreflight, html, json, safeDecodeUriComponent, withCors } from "./routes/http";
 import {
 	handleOperatorCreateVault,
+	handleOperatorCollaborationMigration,
 	handleOperatorDestroyVault,
+	handleOperatorEmergencyDestroyVault,
 	handleOperatorLogin,
 	handleOperatorLogout,
+	handleOperatorOwnerCode,
 	handleOperatorPairingCode,
 	handleOperatorVaultDeletionStatus,
 	handleOperatorProvisionVault,
 	handleOperatorRenameVault,
+	handleOperatorRetryAuthorizationChange,
 	handleOperatorRevokeDevice,
 	handleOperatorRevokePairing,
 	handleOperatorState,
@@ -44,6 +61,7 @@ import { handleOperatorVaultRuntimeRoute, handleVaultRuntimeRoute, handleVaultSo
 import type { AuthState, AuthStateCached, Env } from "./routes/types";
 import { decodeCanonicalVaultIdSegment } from "./vaultId";
 import { CloudflareActorCalls, CloudflareObjectStore, CloudflareSocketUpgrades } from "./cloudflarePorts";
+import { authorizeVaultAction } from "./collaboration";
 
 interface CloudflareWorkerEnvironment {
 	YAOS_SYNC: DurableObjectNamespace;
@@ -64,13 +82,23 @@ type WorkerRoute =
 	| { kind: "claim" }
 	| { kind: "enroll" }
 	| { kind: "operator-login" | "operator-logout" | "operator-state" | "operator-pairing" | "operator-vaults" }
-	| { kind: "operator-vault-patch" | "operator-vault-destroy" | "operator-vault-deletion" | "operator-vault-provision"; id: string }
+	| { kind: "operator-vault-patch" | "operator-vault-destroy" | "operator-vault-emergency-destroy" | "operator-vault-deletion" | "operator-vault-provision" | "operator-owner-code" | "operator-collaboration-migrate"; id: string }
+	| { kind: "operator-authorization-retry"; id: string; changeId: string }
 	| { kind: "operator-pairing-revoke" | "operator-revoke"; id: string }
 	| { kind: "update-metadata" }
 	| { kind: "vault"; vaultId: string; rest: string[] }
 	| { kind: "not-found" };
 
 function validVaultRest(method: string, rest: string[]): boolean {
+	if (method === "GET" && rest.length === 1 && ["me", "members", "audit"].includes(rest[0]!)) return true;
+	if ((method === "PATCH" || method === "DELETE") && rest.length === 1 && rest[0] === "governance") return true;
+	if ((method === "POST" || method === "GET") && rest.length === 1 && rest[0] === "invitations") return true;
+	if (method === "POST" && rest.length === 1 && ["device-links", "leave"].includes(rest[0]!)) return true;
+	if (method === "DELETE" && rest.length === 2 && rest[0] === "invitations" && !!rest[1]) return true;
+	if (method === "GET" && rest.length === 3 && rest[0] === "principals" && !!rest[1] && rest[2] === "devices") return true;
+	if ((method === "PATCH" || method === "DELETE") && rest.length === 2 && ["principals", "devices"].includes(rest[0]!) && !!rest[1]) return true;
+	if (method === "POST" && rest.length === 2 && rest[0] === "ownership" && rest[1] === "transfers") return true;
+	if ((method === "POST" || method === "DELETE") && rest.length === 3 && rest[0] === "ownership" && rest[1] === "transfers" && !!rest[2]) return true;
 	if (isPublicRecoveryRouteShape(method, rest)) return true;
 	if (rest[0] === "settings-sync") {
 		if (method === "GET") return rest.length === 2 && rest[1]!.length > 0;
@@ -91,6 +119,7 @@ function validVaultRest(method: string, rest: string[]): boolean {
 	if (method === "GET" && rest.length === 2 && rest[0] === "ws" && rest[1] === "root") return true;
 	if (method === "GET" && rest.length === 3 && rest[0] === "ws" && rest[1] === "body" && !!rest[2]) return true;
 	if (method === "POST" && rest.length === 3 && rest[0] === "body" && !!rest[1] && rest[2] === "candidate") return true;
+	if (method === "GET" && rest.length === 3 && rest[0] === "operations" && !!rest[1] && rest[2] === "outcome") return true;
 	if (method === "GET" && rest.length === 2 && (rest[0] === "body" || rest[0] === "head") && !!rest[1]) return true;
 	if (method === "POST" && rest.length === 1 && (rest[0] === "lifecycle" || rest[0] === "catch-up")) return true;
 	if (method === "POST" && rest.length === 2 && rest[0] === "lifecycle") return rest[1] === "batch" || rest[1] === "publish";
@@ -141,10 +170,31 @@ export function classifyWorkerRoute(request: Request, url = new URL(request.url)
 		const id = safeDecodeUriComponent(operatorVaultProvision[1]);
 		return id ? { kind: "operator-vault-provision", id } : { kind: "not-found" };
 	}
+	const operatorOwnerCode = url.pathname.match(/^\/operator\/vaults\/([^/]+)\/owner-code$/);
+	if (operatorOwnerCode?.[1] && request.method === "POST") {
+		const id = safeDecodeUriComponent(operatorOwnerCode[1]);
+		return id ? { kind: "operator-owner-code", id } : { kind: "not-found" };
+	}
+	const operatorCollaborationMigrate = url.pathname.match(/^\/operator\/vaults\/([^/]+)\/collaboration-migrate$/);
+	if (operatorCollaborationMigrate?.[1] && request.method === "POST") {
+		const id = safeDecodeUriComponent(operatorCollaborationMigrate[1]);
+		return id ? { kind: "operator-collaboration-migrate", id } : { kind: "not-found" };
+	}
 	const operatorVaultDeletion = url.pathname.match(/^\/operator\/vaults\/([^/]+)\/deletion$/);
 	if (operatorVaultDeletion?.[1] && request.method === "GET") {
 		const id = safeDecodeUriComponent(operatorVaultDeletion[1]);
 		return id ? { kind: "operator-vault-deletion", id } : { kind: "not-found" };
+	}
+	const operatorEmergencyDestroy = url.pathname.match(/^\/operator\/vaults\/([^/]+)\/emergency-destroy$/);
+	if (operatorEmergencyDestroy?.[1] && request.method === "POST") {
+		const id = safeDecodeUriComponent(operatorEmergencyDestroy[1]);
+		return id ? { kind: "operator-vault-emergency-destroy", id } : { kind: "not-found" };
+	}
+	const operatorAuthorizationRetry = url.pathname.match(/^\/operator\/vaults\/([^/]+)\/authorization-changes\/([^/]+)\/retry$/);
+	if (operatorAuthorizationRetry?.[1] && operatorAuthorizationRetry[2] && request.method === "POST") {
+		const id = safeDecodeUriComponent(operatorAuthorizationRetry[1]);
+		const changeId = safeDecodeUriComponent(operatorAuthorizationRetry[2]);
+		return id && changeId ? { kind: "operator-authorization-retry", id, changeId } : { kind: "not-found" };
 	}
 	const operatorVault = url.pathname.match(/^\/operator\/vaults\/([^/]+)$/);
 	if (operatorVault?.[1] && (request.method === "PATCH" || request.method === "DELETE")) {
@@ -214,16 +264,20 @@ export async function handleWorkerRequest(request: Request, env: Env): Promise<R
 		} else if (route.kind === "mobile-setup") response = html(renderMobileSetupPage({ host: url.origin }));
 		else if (route.kind === "capabilities") response = withCors(await capabilities(request, env, authState));
 		else if (route.kind === "claim") response = await handleClaimRoute(request, env, authState);
+		else if (route.kind === "operator-login") response = await handleOperatorLogin(request, env);
+		else if (route.kind === "operator-collaboration-migrate") response = withCors(await handleOperatorCollaborationMigration(request, env, route.id));
 		else if (authState.mode === "unsupported") response = withCors(json({ error: "server_format_unsupported" }, 503));
 		else if (route.kind === "enroll") response = withCors(await handleEnrollRoute(request, env));
-		else if (route.kind === "operator-login") response = await handleOperatorLogin(request, env);
 		else if (route.kind === "operator-state") response = await handleOperatorState(request, env);
 		else if (route.kind === "operator-pairing") response = await handleOperatorPairingCode(request, env);
 		else if (route.kind === "operator-vaults") response = await handleOperatorCreateVault(request, env);
 		else if (route.kind === "operator-vault-patch") response = withCors(await handleOperatorRenameVault(request, env, route.id));
 		else if (route.kind === "operator-vault-destroy") response = withCors(await handleOperatorDestroyVault(request, env, route.id));
+		else if (route.kind === "operator-vault-emergency-destroy") response = withCors(await handleOperatorEmergencyDestroyVault(request, env, route.id));
+		else if (route.kind === "operator-authorization-retry") response = withCors(await handleOperatorRetryAuthorizationChange(request, env, route.id, route.changeId));
 		else if (route.kind === "operator-vault-deletion") response = withCors(await handleOperatorVaultDeletionStatus(request, env, route.id));
 		else if (route.kind === "operator-vault-provision") response = withCors(await handleOperatorProvisionVault(request, env, route.id));
+		else if (route.kind === "operator-owner-code") response = withCors(await handleOperatorOwnerCode(request, env, route.id));
 		else if (route.kind === "operator-pairing-revoke") response = withCors(await handleOperatorRevokePairing(request, env, route.id));
 		else if (route.kind === "operator-revoke") response = withCors(await handleOperatorRevokeDevice(request, env, route.id));
 		else if (route.kind === "update-metadata") response = withCors(await handleUpdateMetadataRoute(request, env, authState));
@@ -232,15 +286,29 @@ export async function handleWorkerRequest(request: Request, env: Env): Promise<R
 			const socket = request.headers.get("upgrade")?.toLowerCase() === "websocket" && route.rest[0] === "ws";
 			if (socket) response = await handleVaultSocketRoute(request, env, authState, route.vaultId, runtimePath);
 			else if (route.rest[0] === "auth" && route.rest[1] === "ticket") {
-				const device = await authorizeDevice(env, getHttpAuthToken(request), route.vaultId);
-				response = device
-					? withCors(await handleTicketRoute(request, authState, route.vaultId, device.deviceId, json, env))
+				const actor = await authorizeVaultActor(env, getHttpAuthToken(request), route.vaultId);
+				response = actor
+					? withCors(await handleTicketRoute(request, authState, { ...actor.actor, deviceName: actor.device.name }, json, env))
 					: withCors(json({ error: "unauthorized" }, 401));
 			} else if (route.rest[0] === "debug" && route.rest[1] === "compact") {
 				if (!env.YAOS_ENABLE_ADMIN_ROUTES) response = withCors(json({ error: "not found" }, 404));
 				else if (!await verifyOperatorSession(env, request)) response = withCors(json({ error: "unauthorized" }, 401));
 				else response = withCors(await handleOperatorVaultRuntimeRoute(request, env, route.vaultId, "/compact"));
 			} else {
+				if (route.rest[0] === "me") response = withCors(await handleVaultMeRoute(request, env, route.vaultId));
+				else if (route.rest[0] === "members") response = withCors(await handleVaultMembersRoute(request, env, route.vaultId));
+				else if (route.rest[0] === "audit") response = withCors(await handleVaultAuditRoute(request, env, route.vaultId));
+				else if (route.rest[0] === "governance") response = withCors(await handleVaultGovernanceRoute(request, env, route.vaultId));
+				else if (route.rest[0] === "invitations" && request.method === "POST") response = withCors(await handleVaultCollaborationCodeRoute(request, env, route.vaultId, "member-invitation"));
+				else if (route.rest[0] === "invitations" && request.method === "GET") response = withCors(await handleVaultCollaborationCodesListRoute(request, env, route.vaultId));
+				else if (route.rest[0] === "invitations" && route.rest[1]) response = withCors(await handleRevokeCollaborationCodeRoute(request, env, route.vaultId, route.rest[1]));
+				else if (route.rest[0] === "device-links") response = withCors(await handleVaultCollaborationCodeRoute(request, env, route.vaultId, "device-link"));
+				else if (route.rest[0] === "principals" && route.rest[1] && route.rest[2] === "devices") response = withCors(await handleVaultPrincipalDevicesRoute(request, env, route.vaultId, route.rest[1]));
+				else if (route.rest[0] === "principals" && route.rest[1]) response = withCors(await handleVaultPrincipalRoute(request, env, route.vaultId, route.rest[1]));
+				else if (route.rest[0] === "devices" && route.rest[1]) response = withCors(await handleVaultCollaborationDeviceRoute(request, env, route.vaultId, route.rest[1]));
+				else if (route.rest[0] === "leave") response = withCors(await handleVaultLeaveRoute(request, env, route.vaultId));
+				else if (route.rest[0] === "ownership" && route.rest[1] === "transfers") response = withCors(await handleOwnershipTransferRoute(request, env, route.vaultId, route.rest[2]));
+				else {
 				const authFailure = await authorizedVaultControl(request, env, authState, route.vaultId);
 				if (authFailure) response = withCors(authFailure);
 				else if (route.rest[0] === "auth" && route.rest[1] === "pairing-code") response = withCors(await handleVaultPairingCodeRoute(request, env, route.vaultId));
@@ -248,7 +316,15 @@ export async function handleWorkerRequest(request: Request, env: Env): Promise<R
 				else if (route.rest[0] === "auth" && route.rest[1] === "device") response = withCors(await handleVaultDeviceLeaveRoute(request, env, route.vaultId));
 				else if (route.rest[0] === "devices") response = withCors(await handleVaultDevicesListRoute(request, env, route.vaultId));
 				else if (route.rest[0] === "recovery") {
-					if (!env.YAOS_BUCKET || !env.YAOS_RECOVERY_JOBS) {
+					const authorized = await authorizeVaultActor(env, getHttpAuthToken(request), route.vaultId);
+					const recoveryDecision = authorized
+						? authorizeVaultAction(authorized.actor, "vault.recovery.manage")
+						: null;
+					if (!authorized) {
+						response = withCors(json({ error: "unauthorized" }, 401));
+					} else if (!recoveryDecision?.allowed) {
+						response = withCors(json({ error: recoveryDecision?.reason ?? "capability_missing" }, 403));
+					} else if (!env.YAOS_BUCKET || !env.YAOS_RECOVERY_JOBS) {
 						response = withCors(json({
 							error: "recovery_unavailable",
 							storageAvailable: Boolean(env.YAOS_BUCKET),
@@ -264,7 +340,13 @@ export async function handleWorkerRequest(request: Request, env: Env): Promise<R
 						if (!vault || vault.state !== "active") {
 							response = withCors(json({ error: vault ? `vault_${vault.state}` : "vault_authority_unavailable" }, 503));
 						} else {
-							const authority = new ActorRecoveryRouteAuthority(env.YAOS_SYNC, vault.vaultId, vault.vaultId, vault.vaultGeneration);
+							const authority = new ActorRecoveryRouteAuthority(
+								env.YAOS_SYNC,
+								vault.vaultId,
+								vault.vaultId,
+								vault.vaultGeneration,
+								authorized.actor,
+							);
 							response = withCors(await handleRecoveryRoute(request, route.rest, {
 								vaultId: vault.vaultId,
 								authority,
@@ -276,6 +358,7 @@ export async function handleWorkerRequest(request: Request, env: Env): Promise<R
 				else if (route.rest[0] === "blobs") response = withCors(await handleBlobRoute(env, route.vaultId, request, route.rest.slice(1), json));
 				else if (route.rest[0] === "debug" && route.rest[1] === "recent") response = withCors(await handleVaultRuntimeRoute(request, env, route.vaultId, "/diagnostics"));
 				else response = withCors(await handleVaultRuntimeRoute(request, env, route.vaultId, runtimePath));
+				}
 			}
 		}
 		else response = withCors(json({ error: "not found" }, 404));

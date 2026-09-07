@@ -53,7 +53,7 @@ function makeBootstrapStore() {
 		},
 		reconstructDocument: () => {
 			const doc = new Y.Doc({ guid: "root" });
-			doc.getMap("sys").set("schemaVersion", 6);
+			doc.getMap("sys").set("schemaVersion", 7);
 			return { doc, generation: 3 };
 		},
 		getPin: () => pin(),
@@ -73,7 +73,7 @@ s.test("bootstrap root is captured in SQLite without an R2 dependency", async ()
 	const fixture = makeBootstrapStore();
 	const service = new BootstrapService(fixture.store as never, () => NOW);
 	const descriptor = await service.start("bootstrap-device-0001");
-	assert.equal(descriptor.schemaVersion, 6);
+	assert.equal(descriptor.schemaVersion, 7);
 	assert.equal(descriptor.capture.vaultSequence, 7);
 	assert.equal(descriptor.capture.rootGeneration, 3);
 	assert.equal(descriptor.capture.rootCheckpointKey, "sql:root:7");

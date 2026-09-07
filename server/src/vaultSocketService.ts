@@ -1,6 +1,7 @@
 import * as decoding from "lib0/decoding";
 import * as encoding from "lib0/encoding";
 import * as syncProtocol from "y-protocols/sync";
+import { modifyAwarenessUpdate } from "y-protocols/awareness";
 import * as Y from "yjs";
 import { MAX_AWARENESS_BYTES, MAX_BODY_SOCKETS, MAX_CANDIDATE_BYTES, MAX_ROOT_SOCKETS } from "./contracts";
 import { sha256Hex } from "./hex";
@@ -19,6 +20,7 @@ import {
 	type BodyCurrentnessHead,
 } from "./shared/socketLiveness";
 import { validateFrontmatterSemanticRoots } from "./shared/frontmatterSemanticValidation";
+import type { VaultActorContext } from "./collaboration";
 
 const MESSAGE_SYNC = 0;
 const MESSAGE_AWARENESS = 1;
@@ -31,6 +33,14 @@ export interface VaultSocketAttachment {
 	documentId: string;
 	kind: "root" | "body";
 	deviceId: string;
+	deviceName?: string;
+	principalId: string;
+	membershipRevision: number;
+	deviceCredentialRevision: number;
+	role: "owner" | "member";
+	policyVersion: number;
+	capabilityDigest: string;
+	awarenessClientId?: number;
 	socketId: string;
 }
 export interface VaultSocketPort {
@@ -56,12 +66,31 @@ function validIdentity(value: string): boolean {
 	return true;
 }
 
+function presenceColors(seed: string): { color: string; colorLight: string } {
+	let hash = 0x811c9dc5;
+	for (let index = 0; index < seed.length; index++) {
+		hash ^= seed.charCodeAt(index);
+		hash = Math.imul(hash, 0x01000193) >>> 0;
+	}
+	const hue = hash % 360;
+	return { color: `hsl(${hue}, 72%, 52%)`, colorLight: `hsla(${hue}, 72%, 52%, 0.2)` };
+}
+
 export function parseVaultSocketAttachment(value: unknown): VaultSocketAttachment | null {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
 	const attachment = value as Partial<VaultSocketAttachment>;
 	if (!isCanonicalVaultId(attachment.vaultId) || !isCanonicalVaultId(attachment.vaultGeneration)
 		|| typeof attachment.runtimeEpoch !== "string" || !validIdentity(attachment.runtimeEpoch)
 		|| typeof attachment.deviceId !== "string" || !validIdentity(attachment.deviceId)
+		|| (attachment.deviceName !== undefined && (typeof attachment.deviceName !== "string" || !validIdentity(attachment.deviceName)))
+		|| typeof attachment.principalId !== "string" || !validIdentity(attachment.principalId)
+		|| typeof attachment.membershipRevision !== "number" || !Number.isSafeInteger(attachment.membershipRevision) || attachment.membershipRevision < 1
+		|| typeof attachment.deviceCredentialRevision !== "number" || !Number.isSafeInteger(attachment.deviceCredentialRevision) || attachment.deviceCredentialRevision < 1
+		|| (attachment.role !== "owner" && attachment.role !== "member")
+		|| typeof attachment.policyVersion !== "number" || !Number.isSafeInteger(attachment.policyVersion) || attachment.policyVersion < 1
+		|| typeof attachment.capabilityDigest !== "string" || !validIdentity(attachment.capabilityDigest)
+		|| (attachment.awarenessClientId !== undefined && (!Number.isSafeInteger(attachment.awarenessClientId)
+			|| attachment.awarenessClientId < 0))
 		|| typeof attachment.socketId !== "string" || !validIdentity(attachment.socketId)
 		|| (attachment.kind !== "root" && attachment.kind !== "body")
 		|| typeof attachment.documentId !== "string") return null;
@@ -177,7 +206,8 @@ export interface SocketServiceOptions {
 	isActiveBody: (bodyId: string) => boolean;
 	currentBodyHead: (bodyId: string) => (BodyCurrentnessHead & { sequence: number }) | null;
 	currentSequence: () => number;
-	isDeviceRevoked(deviceId: string): boolean;
+	validateActor(actor: VaultActorContext): boolean;
+	principalPresence(principalId: string): { displayName: string; colorSeed: string } | null;
 	scheduleFlush: (documentId: string) => void;
 }
 
@@ -201,11 +231,13 @@ export class VaultSocketService {
 		return result;
 	}
 
-	accept(documentId: string, kind: VaultSocketAttachment["kind"], deviceId: string): Response {
-		if (!validIdentity(deviceId)) return Response.json({ error: "invalid_device_identity" }, { status: 400 });
-		if (this.options.isDeviceRevoked(deviceId)) {
-			return Response.json({ error: "device_membership_revoked" }, { status: 401 });
-		}
+	accept(documentId: string, kind: VaultSocketAttachment["kind"], actorOrDevice: VaultActorContext | string): Response {
+		const actor: VaultActorContext = typeof actorOrDevice === "string"
+			? { vaultId: this.options.vaultId(), vaultGeneration: this.options.vaultGeneration(), principalId: actorOrDevice,
+				membershipRevision: 1, deviceId: actorOrDevice, deviceCredentialRevision: 1, role: "member",
+				policyVersion: 1, capabilityDigest: "legacy" }
+			: actorOrDevice;
+		if (!(this.options.validateActor?.(actor) ?? true)) return Response.json({ error: "authority_superseded" }, { status: 409 });
 		let rootCount = 0;
 		let bodyCount = 0;
 		for (const socket of this.options.sockets.sockets()) {
@@ -240,7 +272,14 @@ export class VaultSocketService {
 			runtimeEpoch: this.options.runtimeEpoch,
 			documentId,
 			kind,
-			deviceId,
+			deviceId: actor.deviceId,
+			...(actor.deviceName ? { deviceName: actor.deviceName } : {}),
+			principalId: actor.principalId,
+			membershipRevision: actor.membershipRevision,
+			deviceCredentialRevision: actor.deviceCredentialRevision,
+			role: actor.role,
+			policyVersion: actor.policyVersion,
+			capabilityDigest: actor.capabilityDigest,
 			socketId: crypto.randomUUID(),
 		};
 		server.serializeAttachment(attachment);
@@ -258,6 +297,13 @@ export class VaultSocketService {
 			runtimeEpoch: attachment.runtimeEpoch,
 			liveness: SOCKET_LIVENESS_DESCRIPTOR,
 			capabilities: SOCKET_CONTROL_CAPABILITIES,
+			principalId: actor.principalId,
+			deviceId: actor.deviceId,
+			role: actor.role,
+			membershipRevision: actor.membershipRevision,
+			deviceCredentialRevision: actor.deviceCredentialRevision,
+			policyVersion: actor.policyVersion,
+			capabilityDigest: actor.capabilityDigest,
 		});
 		return this.options.sockets.upgradeResponse(client);
 	}
@@ -271,9 +317,9 @@ export class VaultSocketService {
 			socket.close(1008, "socket authority mismatch");
 			return;
 		}
-		if (this.options.isDeviceRevoked(attachment.deviceId)) {
-			this.sendControl(socket, { type: "error", code: "unauthorized", reason: "device membership revoked" });
-			socket.close(1008, "device membership revoked");
+		if (!(this.options.validateActor?.(this.actorFromAttachment(attachment)) ?? true)) {
+			this.sendControl(socket, { type: "error", code: "authority_superseded", reason: "socket authority superseded" });
+			socket.close(1008, "socket authority superseded");
 			return;
 		}
 		if (attachment.kind === "body" && !this.options.isActiveBody(attachment.documentId)) {
@@ -340,7 +386,7 @@ export class VaultSocketService {
 			const type = decoding.readVarUint(decoder);
 			if (type === MESSAGE_AWARENESS) {
 				if (frame.byteLength > MAX_AWARENESS_BYTES) socket.close(1009, "awareness frame too large");
-				else if (attachment.kind === "root") this.relayRootAwareness(socket, attachment, frame);
+				else this.relayAwareness(socket, attachment, frame);
 				return;
 			}
 			if (type !== MESSAGE_SYNC) return;
@@ -362,12 +408,23 @@ export class VaultSocketService {
 		for (const socket of this.options.sockets.sockets()) {
 			const attachment = parseVaultSocketAttachment(socket.deserializeAttachment());
 			if (attachment?.deviceId !== deviceId) continue;
-			this.sendControl(socket, { type: "error", code: "unauthorized", reason: "device membership revoked" });
+			this.sendControl(socket, { type: "error", code: "authority_superseded", reason: "device authority changed" });
 			try {
-				socket.close(1008, "device membership revoked");
+				socket.close(1008, "device authority changed");
 			} catch {
 				// The durable revocation fence rejects any later frame.
 			}
+			closed++;
+		}
+		return closed;
+	}
+	closePrincipal(principalId: string): number {
+		let closed = 0;
+		for (const socket of this.options.sockets.sockets()) {
+			const attachment = parseVaultSocketAttachment(socket.deserializeAttachment());
+			if (attachment?.principalId !== principalId) continue;
+			this.sendControl(socket, { type: "error", code: "authority_superseded", reason: "membership revoked" });
+			try { socket.close(1008, "membership revoked"); } catch { /* fenced durably */ }
 			closed++;
 		}
 		return closed;
@@ -450,6 +507,7 @@ export class VaultSocketService {
 			bytes: owned,
 			digest,
 			socketId: attachment.socketId,
+			actor: this.actorFromAttachment(attachment),
 		});
 		if (!queued.ok) {
 			this.sendControl(socket, { type: "VAULT_BACKPRESSURE", reason: queued.reason });
@@ -469,14 +527,76 @@ export class VaultSocketService {
 		this.options.scheduleFlush(attachment.documentId);
 	}
 
-	private relayRootAwareness(origin: VaultSocketPort, source: VaultSocketAttachment, frame: Uint8Array): void {
+	private relayAwareness(origin: VaultSocketPort, source: VaultSocketAttachment, frame: Uint8Array): void {
+		const decoder = decoding.createDecoder(frame);
+		decoding.readVarUint(decoder);
+		const presence = this.options.principalPresence(source.principalId);
+		if (!presence) return;
+		let payload: Uint8Array;
+		let awarenessClientId: number;
+		try {
+			payload = decoding.readVarUint8Array(decoder);
+			const identity = decoding.createDecoder(payload);
+			if (decoding.readVarUint(identity) !== 1) throw new Error("one awareness identity required");
+			awarenessClientId = decoding.readVarUint(identity);
+			if (!Number.isSafeInteger(awarenessClientId) || awarenessClientId < 0) throw new Error("invalid awareness identity");
+		} catch {
+			origin.close(1008, "invalid awareness identity");
+			return;
+		}
+		if (source.awarenessClientId !== undefined && source.awarenessClientId !== awarenessClientId) {
+			origin.close(1008, "awareness identity changed");
+			return;
+		}
+		if (source.awarenessClientId === undefined) {
+			for (const socket of this.options.sockets.sockets()) {
+				if (socket === origin) continue;
+				const attachment = parseVaultSocketAttachment(socket.deserializeAttachment());
+				if (attachment?.awarenessClientId === awarenessClientId
+					&& attachment.documentId === source.documentId && attachment.kind === source.kind) {
+					origin.close(1008, "awareness identity already in use");
+					return;
+				}
+			}
+			source.awarenessClientId = awarenessClientId;
+			origin.serializeAttachment(source);
+		}
+		let update: Uint8Array;
+		try {
+			update = modifyAwarenessUpdate(payload, (state: unknown) => {
+				if (!state || typeof state !== "object" || Array.isArray(state)) return state;
+				return { ...state, user: {
+					name: presence.displayName, id: source.deviceId, principalId: source.principalId,
+					deviceId: source.deviceId,
+					...(source.deviceName ? { deviceName: source.deviceName } : {}),
+					colorSeed: presence.colorSeed,
+					...presenceColors(presence.colorSeed),
+				} };
+			});
+		} catch { return; }
+		const encoder = encoding.createEncoder();
+		encoding.writeVarUint(encoder, MESSAGE_AWARENESS);
+		encoding.writeVarUint8Array(encoder, update);
+		const trustedFrame = encoding.toUint8Array(encoder);
 		for (const socket of this.options.sockets.sockets()) {
 			if (socket === origin) continue;
 			const attachment = parseVaultSocketAttachment(socket.deserializeAttachment());
-			if (attachment?.kind === "root" && attachment.vaultId === source.vaultId) {
-				try { socket.send(frame); } catch { /* peer closed */ }
+			if (attachment?.kind === source.kind && attachment.documentId === source.documentId
+				&& attachment.vaultId === source.vaultId && attachment.vaultGeneration === source.vaultGeneration) {
+				try { socket.send(trustedFrame); } catch { /* peer closed */ }
 			}
 		}
+	}
+
+	private actorFromAttachment(attachment: VaultSocketAttachment): VaultActorContext {
+		return {
+			vaultId: attachment.vaultId, vaultGeneration: attachment.vaultGeneration,
+			principalId: attachment.principalId, membershipRevision: attachment.membershipRevision,
+			deviceId: attachment.deviceId, deviceCredentialRevision: attachment.deviceCredentialRevision,
+			...(attachment.deviceName ? { deviceName: attachment.deviceName } : {}),
+			role: attachment.role, policyVersion: attachment.policyVersion,
+			capabilityDigest: attachment.capabilityDigest,
+		};
 	}
 
 	private sendControl(socket: VaultSocketPort, value: unknown): void {

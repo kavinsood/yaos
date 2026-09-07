@@ -12,6 +12,9 @@ import { SERVER_PROTOCOL_VERSION, SERVER_SCHEMA_VERSION } from "../version";
 import type { VaultRecord } from "../identity";
 import { inspectTicket } from "./ticket";
 import { authorizeDevice, configFetch, getHttpAuthToken } from "./auth";
+import { authorizeVaultActor, authorizeVaultOutcomeActor } from "./auth";
+import type { VaultActorContext } from "../collaboration";
+import { actorHeaders, OUTCOME_CLAIM_HEADER, stripActorHeaders } from "../vaultAuthority";
 import type { AuthState, Env } from "./types";
 
 export const TRUSTED_DEVICE_HEADER = "x-yaos-device-id";
@@ -40,15 +43,16 @@ function forwardedBodyLimit(request: Request, runtimePath: string): number | nul
 	return MAX_JSON_BYTES;
 }
 
-async function forward(env: Env, vault: VaultRecord, request: Request, runtimePath: string, deviceId?: string): Promise<Response> {
+async function forward(env: Env, vault: VaultRecord, request: Request, runtimePath: string, actor?: VaultActorContext, outcomeClaim = false): Promise<Response> {
 	const url = new URL(request.url);
 	url.pathname = runtimePath;
 	const headers = new Headers(request.headers);
 	headers.set("x-yaos-vault-id", vault.vaultId);
 	headers.set("x-yaos-vault-generation", vault.vaultGeneration);
 	headers.delete("authorization");
-	headers.delete("x-yaos-device-id");
-	if (deviceId) headers.set(TRUSTED_DEVICE_HEADER, deviceId);
+	stripActorHeaders(headers);
+	if (actor) actorHeaders(actor).forEach((value, name) => headers.set(name, value));
+	if (outcomeClaim) headers.set(OUTCOME_CLAIM_HEADER, "1");
 	const init: RequestInit = { method: request.method, headers };
 	const maximumBodyBytes = forwardedBodyLimit(request, runtimePath);
 	if (maximumBodyBytes !== null) {
@@ -119,7 +123,9 @@ export async function handleVaultSocketRoute(
 	if (!authState.claimed) return rejectSocket(request, env, "unclaimed");
 	const url = new URL(request.url);
 	const ticket = url.searchParams.get("ticket");
-	const payload = ticket ? await inspectTicket(ticket, authState, vaultId) : null;
+	const purpose = runtimePath === "/ws/root" ? "root" : "body";
+	const documentId = purpose === "root" ? "root" : runtimePath.split("/").at(-1) ?? "";
+	const payload = ticket ? await inspectTicket(ticket, authState, { vaultId, purpose, documentId }) : null;
 	if (!payload) return rejectSocket(request, env, "unauthorized");
 	const membership = await configFetch(env, "/__yaos/verify-device", {
 		method: "POST",
@@ -138,7 +144,15 @@ export async function handleVaultSocketRoute(
 	let vault: VaultRecord | null;
 	try { vault = await readVault(env, vaultId); } catch { return rejectSocket(request, env, "unauthorized"); }
 	if (!vault || vault.state !== "active") return rejectSocket(request, env, "unauthorized");
-	return forward(env, vault, request, runtimePath, payload.deviceId);
+	if (payload.vaultGeneration !== vault.vaultGeneration) return rejectSocket(request, env, "unauthorized");
+	const actor: VaultActorContext = {
+		vaultId: payload.vaultId, vaultGeneration: payload.vaultGeneration,
+		principalId: payload.principalId, membershipRevision: payload.membershipRevision,
+		deviceId: payload.deviceId, deviceCredentialRevision: payload.deviceCredentialRevision,
+		...(payload.deviceName ? { deviceName: payload.deviceName } : {}),
+		role: payload.role, policyVersion: payload.policyVersion, capabilityDigest: payload.capabilityDigest,
+	};
+	return forward(env, vault, request, runtimePath, actor);
 }
 
 export async function handleVaultRuntimeRoute(
@@ -152,9 +166,12 @@ export async function handleVaultRuntimeRoute(
 	catch { return Response.json({ error: "vault_authority_unavailable" }, { status: 503 }); }
 	if (!vault) return Response.json({ error: "unknown_vault" }, { status: 404 });
 	if (vault.state !== "active") return Response.json({ error: `vault_${vault.state}` }, { status: 409 });
-	const device = await authorizeDevice(env, getHttpAuthToken(request), vaultId);
-	if (!device) return Response.json({ error: "unauthorized" }, { status: 401 });
-	return forward(env, vault, request, runtimePath, device.deviceId);
+	const outcomeRoute = request.method === "GET" && /^\/operations\/[^/]+\/outcome$/.test(runtimePath);
+	const authorized = outcomeRoute
+		? await authorizeVaultOutcomeActor(env, getHttpAuthToken(request), vaultId)
+		: await authorizeVaultActor(env, getHttpAuthToken(request), vaultId);
+	if (!authorized) return Response.json({ error: "unauthorized" }, { status: 401 });
+	return forward(env, vault, request, runtimePath, authorized.actor, outcomeRoute);
 }
 
 export async function handleOperatorVaultRuntimeRoute(

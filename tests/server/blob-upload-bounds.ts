@@ -3,6 +3,7 @@ import { handleBlobRoute } from "../../server/src/routes/blobs";
 import type { ObjectStorePort, ObjectWriteOptions } from "../../server/src/platformPorts";
 import { FakeObjectStore, makeConfigNamespace, makeEnv } from "../mocks/workerEnv.ts";
 import { suite } from "../harness.ts";
+import { COLLABORATION_POLICY_VERSION, capabilityDigestForRole } from "../../server/src/collaboration";
 
 const s = suite("blob-upload-bounds");
 const encoder = new TextEncoder();
@@ -15,11 +16,22 @@ function json(body: unknown, status = 200): Response {
 	});
 }
 
-function blobEnv(bucket: ObjectStorePort) {
+async function blobEnv(bucket: ObjectStorePort) {
+	const capabilityDigest = await capabilityDigestForRole("member");
 	return makeEnv({
 		YAOS_BUCKET: bucket,
 		YAOS_CONFIG: makeConfigNamespace(async (request) => {
 			const url = new URL(request.url);
+			if (url.pathname === "/__yaos/collaboration/authorize") {
+				return json({
+					device: { deviceId: "device-blob-upload-aa", vaultId: VAULT_ID, name: "Uploader" },
+					principal: { principalId: "principal-blob-upload-aa", vaultId: VAULT_ID },
+					membership: { principalId: "principal-blob-upload-aa", vaultId: VAULT_ID, role: "member", state: "active", revision: 1 },
+					actor: { vaultId: VAULT_ID, vaultGeneration: "generation-blob-upload-aa", principalId: "principal-blob-upload-aa",
+						membershipRevision: 1, deviceId: "device-blob-upload-aa", deviceCredentialRevision: 1,
+						role: "member", policyVersion: COLLABORATION_POLICY_VERSION, capabilityDigest },
+				});
+			}
 			if (url.pathname !== "/__yaos/vault" || url.searchParams.get("vaultId") !== VAULT_ID) {
 				return json({ error: "unknown_vault" }, 404);
 			}
@@ -50,9 +62,11 @@ function uploadRequest(
 	body: ReadableStream<Uint8Array>,
 	headers?: HeadersInit,
 ): Request {
+	const requestHeaders = new Headers(headers);
+	requestHeaders.set("Authorization", "Bearer blob-upload-token");
 	return new Request(`https://example.test/vault/${VAULT_ID}/blobs/${hash}`, {
 		method: "PUT",
-		headers,
+		headers: requestHeaders,
 		body,
 		duplex: "half",
 	} as RequestInit & { duplex: "half" });
@@ -85,7 +99,7 @@ s.section("Missing Content-Length");
 	});
 	const bucket = new MetadataRecordingBucket();
 	const response = await handleBlobRoute(
-		blobEnv(bucket),
+		await blobEnv(bucket),
 		VAULT_ID,
 		uploadRequest(hash, stream, { "Content-Type": "image/png" }),
 		[hash],
@@ -118,7 +132,7 @@ s.section("Crossing the undeclared size limit");
 	const bucket = new FakeObjectStore();
 	const hash = "a".repeat(64);
 	const response = await handleBlobRoute(
-		blobEnv(bucket),
+		await blobEnv(bucket),
 		VAULT_ID,
 		uploadRequest(hash, stream),
 		[hash],
@@ -145,7 +159,7 @@ s.section("Declared length validation happens before body access");
 		// @ts-expect-error Intentionally incomplete Request proves invalid lengths are rejected before any body access.
 		const request: Request = {
 			method: "PUT",
-			headers: new Headers({ "Content-Length": declared }),
+			headers: new Headers({ "Content-Length": declared, Authorization: "Bearer blob-upload-token" }),
 			get body(): ReadableStream<Uint8Array> {
 				bodyAccesses++;
 				throw new Error("body must not be accessed");
@@ -153,7 +167,7 @@ s.section("Declared length validation happens before body access");
 		};
 		const bucket = new FakeObjectStore();
 		const response = await handleBlobRoute(
-			blobEnv(bucket),
+			await blobEnv(bucket),
 			VAULT_ID,
 			request,
 			[hash],
@@ -171,7 +185,7 @@ s.section("Empty and failed streams");
 	const hash = "c".repeat(64);
 	const emptyBucket = new FakeObjectStore();
 	const emptyResponse = await handleBlobRoute(
-		blobEnv(emptyBucket),
+		await blobEnv(emptyBucket),
 		VAULT_ID,
 		uploadRequest(hash, new ReadableStream<Uint8Array>({
 			start(controller) {
@@ -198,7 +212,7 @@ s.section("Empty and failed streams");
 	});
 	const failedBucket = new FakeObjectStore();
 	const failedResponse = await handleBlobRoute(
-		blobEnv(failedBucket),
+		await blobEnv(failedBucket),
 		VAULT_ID,
 		uploadRequest(hash, failedStream),
 		[hash],
@@ -221,7 +235,7 @@ s.section("Hash verification precedes publication");
 		},
 	});
 	const response = await handleBlobRoute(
-		blobEnv(bucket),
+		await blobEnv(bucket),
 		VAULT_ID,
 		uploadRequest(wrongHash, stream, { "Content-Length": String(body.byteLength) }),
 		[wrongHash],

@@ -3,12 +3,23 @@ import {
 	type RecoveryRpcServicePort,
 	type RecoveryRpcStorePort,
 } from "../../server/src/recoveryRpcRouter";
+import { ActorRecoveryRouteAuthority } from "../../server/src/recoveryPublicAuthority";
 import {
 	RECOVERY_PUBLIC_RPC_HEADER,
 	RECOVERY_PUBLIC_RPC_PATH,
 	RECOVERY_RPC_HEADER,
 	RECOVERY_RPC_PATH,
 } from "../../server/src/recoveryProtocol";
+import {
+	ACTOR_CAPABILITY_DIGEST_HEADER,
+	ACTOR_DEVICE_HEADER,
+	ACTOR_DEVICE_NAME_HEADER,
+	ACTOR_DEVICE_REVISION_HEADER,
+	ACTOR_MEMBERSHIP_REVISION_HEADER,
+	ACTOR_POLICY_VERSION_HEADER,
+	ACTOR_PRINCIPAL_HEADER,
+	ACTOR_ROLE_HEADER,
+} from "../../server/src/vaultAuthority";
 import { suite } from "../harness.ts";
 
 const s = suite("recovery-generation-fence");
@@ -145,6 +156,49 @@ s.test("vault identity mismatch is indistinguishable from a stale generation", a
 	if (response?.status !== 404 || body?.error?.message !== "not found" || calls !== 0) {
 		throw new Error("vault identity mismatch leaked or dispatched");
 	}
+});
+
+s.test("public recovery authority forwards the exact authenticated actor", async () => {
+	const calls: Array<{ actorName: string; request: Request }> = [];
+	const authority = new ActorRecoveryRouteAuthority({
+		async call(name, request) {
+			calls.push({ actorName: name, request });
+			return Response.json({ ok: true, result: null });
+		},
+	}, vaultId, vaultId, vaultGeneration, {
+		vaultId,
+		vaultGeneration,
+		principalId: "owner-principal-aa",
+		membershipRevision: 7,
+		deviceId: "owner-device-aa",
+		deviceName: "Owner laptop",
+		deviceCredentialRevision: 11,
+		role: "owner",
+		policyVersion: 1,
+		capabilityDigest: "owner-capability-digest-aa",
+	});
+	await authority.getRecoveryStatus({ vaultId });
+	const forwarded = calls[0];
+	if (!forwarded || forwarded.actorName !== vaultId) throw new Error("public recovery request was not forwarded to the exact vault actor");
+	const headers = forwarded.request.headers;
+	const expected = new Map([
+		[ACTOR_PRINCIPAL_HEADER, "owner-principal-aa"],
+		[ACTOR_MEMBERSHIP_REVISION_HEADER, "7"],
+		[ACTOR_DEVICE_HEADER, "owner-device-aa"],
+		[ACTOR_DEVICE_NAME_HEADER, "Owner laptop"],
+		[ACTOR_DEVICE_REVISION_HEADER, "11"],
+		[ACTOR_ROLE_HEADER, "owner"],
+		[ACTOR_POLICY_VERSION_HEADER, "1"],
+		[ACTOR_CAPABILITY_DIGEST_HEADER, "owner-capability-digest-aa"],
+		["x-yaos-vault-id", vaultId],
+		["x-yaos-vault-generation", vaultGeneration],
+		[RECOVERY_PUBLIC_RPC_HEADER, "1"],
+	]);
+	for (const [name, value] of expected) {
+		if (headers.get(name) !== value) throw new Error(`public recovery actor header ${name} was not exact`);
+	}
+	const body = await forwarded.request.json() as { method?: string };
+	if (body.method !== "getRecoveryStatus") throw new Error("public recovery method changed in forwarding");
 });
 
 await s.done();

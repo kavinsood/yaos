@@ -115,6 +115,7 @@ function fixture(input: { store?: AttachmentStore; hasBlob?: (hash: string) => P
 		runtimeEpoch: "runtime-attachment-cas-0001",
 		hasBlob: input.hasBlob ?? (async () => true),
 		flush: input.flush ?? (async () => true),
+		validateActor: () => true,
 	} as never);
 	return { store, service, broadcasts: () => broadcasts };
 }

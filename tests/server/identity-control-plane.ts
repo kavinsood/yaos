@@ -205,17 +205,23 @@ s.section("verify-device requires a live enrollment on that vault");
 		vaultName: "Personal",
 		pairingCodeHash: "c".repeat(64),
 		pairingExp: Date.now() + 60_000,
-		pairingPurpose: "device",
+		pairingPurpose: "origin",
 	}));
-	const activated = await activateClaim(config, claim, "c".repeat(64));
+	const activated = await activateClaim(config, claim, "c".repeat(64), "origin");
 	s.check(activated.status === 200, "verification vault activates before enrollment");
-	await config.fetch(jsonRequest("/__yaos/enroll", {
+	const ownerEnrollment = await config.fetch(jsonRequest("/__yaos/enroll", {
 		enrollmentRequestId: "request-verify-aa",
 		pairingCodeHash: "c".repeat(64),
 		deviceId: "dev-live",
 		deviceTokenHash: "d".repeat(64),
 		deviceName: "phone",
 	}));
+	const owner = await ownerEnrollment.json() as {
+		principalId: string;
+		deviceId: string;
+		change: { changeId: string; vaultId: string; vaultGeneration: string };
+	};
+	await config.fetch(jsonRequest("/__yaos/collaboration/complete-change", owner.change));
 
 	const live = await config.fetch(jsonRequest("/__yaos/verify-device", {
 		deviceId: "dev-live",
@@ -229,38 +235,55 @@ s.section("verify-device requires a live enrollment on that vault");
 	}));
 	s.check(wrongVault.status === 401, "device on another vault is 401");
 
-	const revokeResponse = await config.fetch(jsonRequest("/__yaos/revoke-device", { deviceId: "dev-live" }));
-	const revoked = await config.fetch(jsonRequest("/__yaos/verify-device", {
-		deviceId: "dev-live",
+	const linkHash = "e".repeat(64);
+	const link = await config.fetch(jsonRequest("/__yaos/collaboration/create-code", {
 		vaultId,
+		principalId: owner.principalId,
+		deviceId: owner.deviceId,
+		purpose: "device-link",
+		codeHash: linkHash,
 	}));
-	s.check(revoked.status === 401, "revoked device is 401");
-	const revokeBody = await revokeResponse.json() as { revocation?: {
-		vaultId: string;
-		vaultGeneration: string;
-		deviceId: string;
-	} };
-	s.check(revokeResponse.status === 200 && revokeBody.revocation?.deviceId === "dev-live", "membership removal creates a revocation obligation");
-	const revocation = revokeBody.revocation;
-	if (!revocation) throw new Error("revocation obligation missing");
-	const pendingConsole = await config.fetch(new Request("https://internal/__yaos/console"));
-	const pendingState = await pendingConsole.json() as { pendingDeviceRevocations: Array<{ deviceId: string; lastError: string | null }> };
-	s.check(pendingState.pendingDeviceRevocations.length === 1, "revocation obligation remains visible after membership removal");
-	const failedFence = await config.fetch(jsonRequest("/__yaos/fail-device-revocation", {
-		...revocation,
+	s.check(link.status === 200, "owner can create a same-principal device link");
+	const linkedEnrollment = await config.fetch(jsonRequest("/__yaos/enroll", {
+		enrollmentRequestId: "request-verify-linked",
+		pairingCodeHash: linkHash,
+		deviceId: "dev-linked",
+		deviceTokenHash: "f".repeat(64),
+		deviceName: "tablet",
+	}));
+	const linked = await linkedEnrollment.json() as {
+		change: { changeId: string; vaultId: string; vaultGeneration: string };
+	};
+	await config.fetch(jsonRequest("/__yaos/collaboration/complete-change", linked.change));
+	const revokeResponse = await config.fetch(jsonRequest("/__yaos/collaboration/revoke-device", {
+		vaultId,
+		principalId: owner.principalId,
+		deviceId: owner.deviceId,
+		targetDeviceId: "dev-linked",
+		requestId: "request-revoke-linked",
+	}));
+	const revokeBody = await revokeResponse.json() as { change?: { changeId: string; vaultId: string; vaultGeneration: string } };
+	s.check(revokeResponse.status === 202 && typeof revokeBody.change?.changeId === "string", "device removal creates an authorization fence obligation");
+	const revocation = revokeBody.change;
+	if (!revocation) throw new Error("authorization fence obligation missing");
+	const pendingResponse = await config.fetch(jsonRequest("/__yaos/collaboration/pending-changes", { vaultId }));
+	const pendingState = await pendingResponse.json() as { changes: Array<{ changeId: string; lastError: string | null }> };
+	s.check(pendingState.changes.some((change) => change.changeId === revocation.changeId), "authorization fence remains durably visible");
+	const failedFence = await config.fetch(jsonRequest("/__yaos/collaboration/fail-change", {
+		changeId: revocation.changeId,
 		lastError: "runtime unavailable",
 	}));
 	s.check(failedFence.status === 202, "failed runtime fence remains pending");
-	const failedState = await (await config.fetch(new Request("https://internal/__yaos/console"))).json() as {
-		pendingDeviceRevocations: Array<{ lastError: string | null }>;
+	const failedState = await (await config.fetch(jsonRequest("/__yaos/collaboration/pending-changes", { vaultId }))).json() as {
+		changes: Array<{ changeId: string; lastError: string | null }>;
 	};
-	s.check(failedState.pendingDeviceRevocations[0]?.lastError === "runtime unavailable", "operator state exposes the durable fence failure");
-	const completedFence = await config.fetch(jsonRequest("/__yaos/complete-device-revocation", revocation));
+	s.check(failedState.changes.find((change) => change.changeId === revocation.changeId)?.lastError === "runtime unavailable", "control plane exposes the durable fence failure");
+	const completedFence = await config.fetch(jsonRequest("/__yaos/collaboration/complete-change", revocation));
 	s.check(completedFence.status === 200, "successful runtime fence acknowledges the obligation");
-	const completedState = await (await config.fetch(new Request("https://internal/__yaos/console"))).json() as {
-		pendingDeviceRevocations: unknown[];
+	const completedState = await (await config.fetch(jsonRequest("/__yaos/collaboration/pending-changes", { vaultId }))).json() as {
+		changes: Array<{ changeId: string }>;
 	};
-	s.check(completedState.pendingDeviceRevocations.length === 0, "successful fence removes the revocation obligation");
+	s.check(!completedState.changes.some((change) => change.changeId === revocation.changeId), "successful fence removes the revocation obligation");
 }
 
 s.section("device token cannot rename without auth or on another vault");
@@ -349,7 +372,7 @@ s.section("update-metadata: device bearer 401, operator session 200");
 	let metadataWrites = 0;
 	const stored = {
 		claimed: true,
-		configFormat: 2,
+		configFormat: 3,
 		operatorRecoveryHash: CLAIM_AUTH.operatorRecoveryHash,
 		ticketSigningKey: CLAIM_AUTH.ticketSigningKey,
 		updateProvider: "github" as const,
@@ -440,14 +463,50 @@ s.section("public enrollment response is exact and fails closed");
 	const enrollmentRequestId = "public-enroll-request";
 	const deviceId = "device-enroll-0001";
 	const deviceToken = "A".repeat(43);
+	const change = {
+		changeId: "change-public-enroll",
+		vaultId: "vault-enroll",
+		vaultGeneration: "generation-enroll",
+		subjectDigest: "a".repeat(64),
+		subjects: [],
+	};
+	const actor = {
+		vaultId: "vault-enroll",
+		vaultGeneration: "generation-enroll",
+		principalId: "principal-enroll-0001",
+		membershipRevision: 1,
+		deviceId,
+		deviceCredentialRevision: 1,
+		role: "member",
+		policyVersion: 1,
+		capabilityDigest: "member-capabilities",
+	};
 	const validEnv = makeEnv({
-		YAOS_CONFIG: makeConfigNamespace(async () => new Response(JSON.stringify({
-			vaultId: "vault-enroll",
-			deviceId,
-			deviceName: "Mac",
-			vaultGeneration: "generation-enroll",
-			originImport: true,
-		}), { status: 200, headers: { "Content-Type": "application/json" } })),
+		YAOS_CONFIG: makeConfigNamespace(async (request) => {
+			const path = new URL(request.url).pathname;
+			if (path === "/__yaos/enroll") return Response.json({
+				vaultId: "vault-enroll",
+				deviceId,
+				deviceName: "Mac",
+				vaultGeneration: "generation-enroll",
+				originImport: true,
+				principalId: actor.principalId,
+				role: actor.role,
+				membershipRevision: actor.membershipRevision,
+				deviceCredentialRevision: actor.deviceCredentialRevision,
+				capabilities: ["vault.content.read"],
+				principal: { principalId: actor.principalId, vaultId: actor.vaultId, displayName: "Member", colorSeed: "member-colour", createdAt: 1, updatedAt: 1 },
+				actor,
+				change,
+			});
+			if (path === "/__yaos/collaboration/complete-change") return Response.json({ change });
+			throw new Error(`unexpected config request: ${path}`);
+		}),
+		YAOS_SYNC: makeVaultSyncNamespace(async () => Response.json({
+			changeId: change.changeId,
+			vaultGeneration: change.vaultGeneration,
+			subjectDigest: change.subjectDigest,
+		})),
 	});
 	const request = () => new Request("https://sync.example/enroll", {
 		method: "POST",
@@ -459,7 +518,7 @@ s.section("public enrollment response is exact and fails closed");
 	s.check(valid.status === 200, "valid internal enrollment becomes a public success");
 	s.check(
 		JSON.stringify(Object.keys(validBody).sort()) ===
-			JSON.stringify(["deviceId", "deviceName", "deviceToken", "host", "originImport", "vaultGeneration", "vaultId"]),
+			JSON.stringify(["actor", "capabilities", "deviceCredentialRevision", "deviceId", "deviceName", "deviceToken", "host", "membershipRevision", "originImport", "principal", "principalId", "role", "vaultGeneration", "vaultId"]),
 		"public enrollment returns the exact credential contract",
 	);
 	s.check(validBody.host === "https://sync.example" && validBody.deviceName === "Mac", "public enrollment returns canonical host and name");
@@ -479,7 +538,7 @@ s.section("compact requires both the admin flag and an operator session");
 	invalidateStoredServerConfigCache();
 	const sessionToken = "operator-session-for-compact";
 	const stored = {
-		configFormat: 2,
+		configFormat: 3,
 		claimed: true,
 		operatorRecoveryHash: CLAIM_AUTH.operatorRecoveryHash,
 		ticketSigningKey: CLAIM_AUTH.ticketSigningKey,

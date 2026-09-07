@@ -8,6 +8,7 @@ import type { VaultLifecycleService } from "./vaultLifecycleService";
 import type { VaultSocketService } from "./vaultSocketService";
 import { canonicalMarkdownBytes, canonicalizeMarkdown } from "./shared/markdownCodec";
 import { validateFrontmatterSemanticRoots } from "./shared/frontmatterSemanticValidation";
+import type { VaultActorContext } from "./collaboration";
 
 const MAX_IDENTITY_LENGTH = 256;
 
@@ -37,18 +38,20 @@ interface CandidateServiceOptions {
 	vaultGeneration: () => string;
 	runtimeEpoch: string;
 	flush: (documentId: string) => Promise<boolean>;
+	validateActor: (actor: VaultActorContext) => boolean;
 }
 
 /** Owns device-scoped candidate admission, idempotency, and durable receipts. */
 export class VaultCandidateService {
 	constructor(private readonly options: CandidateServiceOptions) {}
 
-	async handle(bodyId: string, request: Request): Promise<Response> {
+	async handle(bodyId: string, request: Request, suppliedActor?: VaultActorContext): Promise<Response> {
+		const actor = suppliedActor ?? this.legacyActor(request);
 		if (!bodyId || bodyId.length > 256 || !/^[A-Za-z0-9_-]+$/.test(bodyId)) return json({ error: "invalid_body_id" }, 400);
 		const creation = this.options.store.creationCandidate(bodyId);
 		const catalog = this.options.store.getCatalogHeadAt(this.options.store.currentSequence(), bodyId);
 		if (!creation && (!catalog || catalog.lifecycle !== "active" || catalog.fileId !== bodyId)) return json({ error: "body_not_active" }, 409);
-		const deviceId = request.headers.get("x-yaos-device-id");
+		const deviceId = actor.deviceId;
 		const candidateId = request.headers.get("x-yaos-candidate-id");
 		const candidateDigest = request.headers.get("x-yaos-candidate-digest")?.toLowerCase() ?? null;
 		if (!validIdentity(deviceId) || !validIdentity(candidateId) || !candidateDigest || !/^[a-f0-9]{64}$/.test(candidateDigest)) {
@@ -86,6 +89,7 @@ export class VaultCandidateService {
 		}
 		let durable;
 		try {
+			if (!(this.options.validateActor?.(actor) ?? true)) return json({ error: "authority_superseded" }, 409);
 			durable = this.options.store.commitCandidate({
 				bodyId,
 				clientId: deviceId,
@@ -95,13 +99,14 @@ export class VaultCandidateService {
 				catalog: state.catalog,
 				vaultGeneration: this.options.vaultGeneration(),
 				runtimeEpoch: this.options.runtimeEpoch,
+				actor,
 			});
 		} catch (error) {
 			const current = this.options.store.candidateReceipt(bodyId, deviceId, candidateId);
 			if (!current || current.candidateDigest !== candidateDigest) throw error;
 			durable = current;
 		}
-		if (creation && !this.options.lifecycle().finalizeCreation(creation, durable, state.metadata)) {
+		if (creation && !this.options.lifecycle().finalizeCreation(creation, durable, state.metadata, actor)) {
 			return json({ error: "recovery_boundary_in_progress" }, 409);
 		}
 		if (this.options.cache.applyDurableUpdate(bodyId, update, durable.durableGeneration, request)) {
@@ -110,6 +115,13 @@ export class VaultCandidateService {
 		this.options.cache.removePendingDigest(bodyId, candidateDigest);
 		this.options.sockets().notifyBodyCommitted(bodyId, durable.durableGeneration, durable.vaultSequence);
 		return json(this.receipt(durable));
+	}
+
+	private legacyActor(request: Request): VaultActorContext {
+		return { vaultId: this.options.vaultId(), vaultGeneration: this.options.vaultGeneration(),
+			principalId: request.headers.get("x-yaos-device-id") ?? "legacy", membershipRevision: 1,
+			deviceId: request.headers.get("x-yaos-device-id") ?? "legacy", deviceCredentialRevision: 1,
+			role: "member", policyVersion: 1, capabilityDigest: "legacy" };
 	}
 
 	private async candidateCatalog(bodyId: string, update: Uint8Array): Promise<{

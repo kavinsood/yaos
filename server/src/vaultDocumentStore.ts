@@ -3,6 +3,7 @@ import { SCHEMA_VERSION, STORAGE_FORMAT_VERSION } from "./shared/productVersions
 import { base64UrlToBytes, bytesToBase64Url } from "./base64url";
 import type { BodyLifecycle, CatalogHeadAtBoundary } from "./vaultCatalogStore";
 import type { HistoryPin } from "./vaultBootstrapStore";
+import type { VaultActorContext, VaultRole } from "./collaboration";
 
 const CHECKPOINT_CHUNK_BYTES = 1024 * 1024;
 
@@ -68,6 +69,51 @@ export interface JournalFeedPage {
 	floor: number;
 	highWater: number;
 	resetRequired: boolean;
+}
+
+export interface VaultPrincipalAuthority {
+	principalId: string;
+	role: VaultRole;
+	state: "active" | "revoked";
+	membershipRevision: number;
+	policyVersion: number;
+	capabilityDigest: string;
+	displayName: string;
+	colorSeed: string;
+	changeId: string;
+}
+
+export interface VaultDeviceAuthority {
+	deviceId: string;
+	principalId: string;
+	state: "active" | "revoked";
+	credentialRevision: number;
+	changeId: string;
+}
+
+export type VaultAuthoritySubjectChange =
+	| Omit<VaultPrincipalAuthority, "changeId">
+	| Omit<VaultDeviceAuthority, "changeId">;
+
+export interface VaultAuthorityFenceReceipt {
+	changeId: string;
+	vaultId: string;
+	vaultGeneration: string;
+	subjectDigest: string;
+	installedAt: number;
+}
+
+export interface VaultCollaborationMigrationReceipt {
+	migrationId: string;
+	vaultId: string;
+	vaultGeneration: string;
+	requestDigest: string;
+	subjectDigest: string;
+	rootSequence: number;
+	settingsAssignment: "owner_principal_scoped";
+	settingsEnvironmentCount: number;
+	historyAttribution: "legacy_unattributed";
+	installedAt: number;
 }
 
 export function decodeSqlChunks(rows: Iterable<{ data: string }>): Uint8Array {
@@ -194,13 +240,78 @@ export abstract class VaultDocumentStore {
 				id INTEGER PRIMARY KEY CHECK(id = 1),
 				vault_id TEXT NOT NULL,
 				vault_generation TEXT NOT NULL,
-				schema_version INTEGER NOT NULL CHECK(schema_version = 6),
+				schema_version INTEGER NOT NULL CHECK(schema_version = 7),
 				storage_format_version INTEGER NOT NULL CHECK(storage_format_version = 2),
 				provisioned_at INTEGER NOT NULL
 			);
 			CREATE TABLE IF NOT EXISTS vault_revoked_devices (
 				device_id TEXT PRIMARY KEY,
 				revoked_at INTEGER NOT NULL
+			);
+			CREATE TABLE IF NOT EXISTS vault_principal_authority (
+				principal_id TEXT PRIMARY KEY,
+				role TEXT NOT NULL,
+				state TEXT NOT NULL,
+				membership_revision INTEGER NOT NULL,
+				policy_version INTEGER NOT NULL,
+				capability_digest TEXT NOT NULL,
+				display_name TEXT NOT NULL,
+				color_seed TEXT NOT NULL,
+				change_id TEXT NOT NULL
+			);
+			CREATE TABLE IF NOT EXISTS vault_device_authority (
+				device_id TEXT PRIMARY KEY,
+				principal_id TEXT NOT NULL,
+				state TEXT NOT NULL,
+				credential_revision INTEGER NOT NULL,
+				change_id TEXT NOT NULL
+			);
+			CREATE INDEX IF NOT EXISTS vault_device_authority_principal
+				ON vault_device_authority(principal_id);
+			CREATE TABLE IF NOT EXISTS vault_authorization_change_receipts (
+				change_id TEXT PRIMARY KEY,
+				vault_id TEXT NOT NULL,
+				vault_generation TEXT NOT NULL,
+				subject_digest TEXT NOT NULL,
+				installed_at INTEGER NOT NULL
+			);
+			CREATE TABLE IF NOT EXISTS vault_collaboration_migration_receipts (
+				migration_id TEXT PRIMARY KEY,
+				vault_id TEXT NOT NULL,
+				vault_generation TEXT NOT NULL,
+				request_digest TEXT NOT NULL,
+				subject_digest TEXT NOT NULL,
+				root_sequence INTEGER NOT NULL,
+				settings_assignment TEXT NOT NULL,
+				settings_environment_count INTEGER NOT NULL,
+				history_attribution TEXT NOT NULL,
+				installed_at INTEGER NOT NULL
+			);
+			CREATE TABLE IF NOT EXISTS vault_mutation_attribution (
+				sequence INTEGER NOT NULL,
+				mutation_index INTEGER NOT NULL,
+				principal_id TEXT NOT NULL,
+				membership_revision INTEGER NOT NULL,
+				device_id TEXT NOT NULL,
+				device_credential_revision INTEGER NOT NULL,
+				operation_id TEXT,
+				request_digest TEXT,
+				PRIMARY KEY(sequence, mutation_index)
+			);
+			CREATE TABLE IF NOT EXISTS vault_operation_outcomes (
+				principal_id TEXT NOT NULL,
+				membership_revision INTEGER NOT NULL,
+				device_id TEXT NOT NULL,
+				device_credential_revision INTEGER NOT NULL,
+				operation_id TEXT NOT NULL,
+				request_digest TEXT NOT NULL,
+				vault_sequence INTEGER NOT NULL,
+				committed_at INTEGER NOT NULL,
+				expires_at INTEGER NOT NULL,
+				PRIMARY KEY(
+					principal_id, membership_revision, device_id, device_credential_revision,
+					operation_id, request_digest
+				)
 			);
 			CREATE TABLE IF NOT EXISTS vault_candidate_receipts (
 				body_id TEXT NOT NULL,
@@ -526,6 +637,70 @@ export abstract class VaultDocumentStore {
 		} : null;
 	}
 
+	storedVaultSchemaVersion(): number | null {
+		this.initialize();
+		return this.storage.sql.exec<{ schema_version: number }>(
+			"SELECT schema_version FROM vault_meta WHERE id = 1",
+		).toArray()[0]?.schema_version ?? null;
+	}
+
+	storedVaultMetadata(): {
+		vaultId: string;
+		vaultGeneration: string;
+		schemaVersion: number;
+		storageFormatVersion: number;
+		provisionedAt: number;
+	} | null {
+		this.initialize();
+		const row = this.storage.sql.exec<{
+			vault_id: string;
+			vault_generation: string;
+			schema_version: number;
+			storage_format_version: number;
+			provisioned_at: number;
+		}>(`SELECT vault_id, vault_generation, schema_version,
+		          storage_format_version, provisioned_at
+		   FROM vault_meta WHERE id = 1`).toArray()[0];
+		return row ? {
+			vaultId: row.vault_id,
+			vaultGeneration: row.vault_generation,
+			schemaVersion: row.schema_version,
+			storageFormatVersion: row.storage_format_version,
+			provisionedAt: row.provisioned_at,
+		} : null;
+	}
+
+	collaborationMigrationReceipt(migrationId: string): VaultCollaborationMigrationReceipt | null {
+		this.initialize();
+		const row = this.storage.sql.exec<{
+			migration_id: string;
+			vault_id: string;
+			vault_generation: string;
+			request_digest: string;
+			subject_digest: string;
+			root_sequence: number;
+			settings_assignment: "owner_principal_scoped";
+			settings_environment_count: number;
+			history_attribution: "legacy_unattributed";
+			installed_at: number;
+		}>(`SELECT migration_id, vault_id, vault_generation, request_digest,
+		          subject_digest, root_sequence, settings_assignment,
+		          settings_environment_count, history_attribution, installed_at
+		   FROM vault_collaboration_migration_receipts WHERE migration_id = ?`, migrationId).toArray()[0];
+		return row ? {
+			migrationId: row.migration_id,
+			vaultId: row.vault_id,
+			vaultGeneration: row.vault_generation,
+			requestDigest: row.request_digest,
+			subjectDigest: row.subject_digest,
+			rootSequence: row.root_sequence,
+			settingsAssignment: row.settings_assignment,
+			settingsEnvironmentCount: row.settings_environment_count,
+			historyAttribution: row.history_attribution,
+			installedAt: row.installed_at,
+		} : null;
+	}
+
 	protected assertVaultGeneration(vaultGeneration: string): VaultMetadata {
 		const metadata = this.vaultMetadata();
 		if (!metadata || metadata.vaultGeneration !== vaultGeneration) {
@@ -556,6 +731,160 @@ export abstract class VaultDocumentStore {
 			"SELECT COUNT(*) AS count FROM vault_revoked_devices WHERE device_id = ?",
 			deviceId,
 		).one().count > 0;
+	}
+
+	principalAuthority(principalId: string): VaultPrincipalAuthority | null {
+		this.initialize();
+		const row = this.storage.sql.exec<{
+			principal_id: string; role: VaultRole; state: "active" | "revoked";
+			membership_revision: number; policy_version: number; capability_digest: string;
+			display_name: string; color_seed: string; change_id: string;
+		}>(`SELECT principal_id, role, state, membership_revision, policy_version,
+		          capability_digest, display_name, color_seed, change_id
+		   FROM vault_principal_authority WHERE principal_id = ?`, principalId).toArray()[0];
+		return row ? {
+			principalId: row.principal_id, role: row.role, state: row.state,
+			membershipRevision: row.membership_revision, policyVersion: row.policy_version,
+			capabilityDigest: row.capability_digest, displayName: row.display_name,
+			colorSeed: row.color_seed, changeId: row.change_id,
+		} : null;
+	}
+
+	deviceAuthority(deviceId: string): VaultDeviceAuthority | null {
+		this.initialize();
+		const row = this.storage.sql.exec<{
+			device_id: string; principal_id: string; state: "active" | "revoked";
+			credential_revision: number; change_id: string;
+		}>(`SELECT device_id, principal_id, state, credential_revision, change_id
+		   FROM vault_device_authority WHERE device_id = ?`, deviceId).toArray()[0];
+		return row ? {
+			deviceId: row.device_id, principalId: row.principal_id, state: row.state,
+			credentialRevision: row.credential_revision, changeId: row.change_id,
+		} : null;
+	}
+
+	validateActor(actor: VaultActorContext): "allowed" | "authority_superseded" {
+		const metadata = this.vaultMetadata();
+		if (!metadata || actor.vaultId !== metadata.vaultId || actor.vaultGeneration !== metadata.vaultGeneration) {
+			return "authority_superseded";
+		}
+		const principal = this.principalAuthority(actor.principalId);
+		const device = this.deviceAuthority(actor.deviceId);
+		if (!principal || !device || principal.state !== "active" || device.state !== "active"
+			|| device.principalId !== actor.principalId || principal.role !== actor.role
+			|| principal.membershipRevision !== actor.membershipRevision
+			|| device.credentialRevision !== actor.deviceCredentialRevision
+			|| principal.policyVersion !== actor.policyVersion
+			|| principal.capabilityDigest !== actor.capabilityDigest) return "authority_superseded";
+		return "allowed";
+	}
+
+	authorityFenceReceipt(changeId: string): VaultAuthorityFenceReceipt | null {
+		this.initialize();
+		const row = this.storage.sql.exec<{
+			change_id: string; vault_id: string; vault_generation: string;
+			subject_digest: string; installed_at: number;
+		}>(`SELECT change_id, vault_id, vault_generation, subject_digest, installed_at
+		   FROM vault_authorization_change_receipts WHERE change_id = ?`, changeId).toArray()[0];
+		return row ? { changeId: row.change_id, vaultId: row.vault_id,
+			vaultGeneration: row.vault_generation, subjectDigest: row.subject_digest,
+			installedAt: row.installed_at } : null;
+	}
+
+	installAuthorityFence(input: {
+		changeId: string;
+		vaultId: string;
+		vaultGeneration: string;
+		subjectDigest: string;
+		subjects: VaultAuthoritySubjectChange[];
+		now?: number;
+	}): VaultAuthorityFenceReceipt {
+		this.initialize();
+		const metadata = this.assertVaultGeneration(input.vaultGeneration);
+		if (metadata.vaultId !== input.vaultId) throw new Error("vault identity mismatch");
+		const existing = this.authorityFenceReceipt(input.changeId);
+		if (existing) {
+			if (existing.vaultId !== input.vaultId || existing.vaultGeneration !== input.vaultGeneration
+				|| existing.subjectDigest !== input.subjectDigest) throw new Error("authorization_change_identity_mismatch");
+			return existing;
+		}
+		const installedAt = input.now ?? Date.now();
+		this.storage.transactionSync(() => {
+			for (const subject of input.subjects) {
+				if ("deviceId" in subject) {
+					const current = this.deviceAuthority(subject.deviceId);
+					if (current && subject.credentialRevision < current.credentialRevision) throw new Error("authority_revision_regressed");
+					if (current && subject.credentialRevision === current.credentialRevision) throw new Error("authority_revision_reused");
+					if (current && current.principalId !== subject.principalId) throw new Error("device_principal_mismatch");
+					this.storage.sql.exec(`INSERT INTO vault_device_authority(
+					 device_id, principal_id, state, credential_revision, change_id
+					) VALUES (?, ?, ?, ?, ?)
+					ON CONFLICT(device_id) DO UPDATE SET principal_id=excluded.principal_id,
+					 state=excluded.state, credential_revision=excluded.credential_revision,
+					 change_id=excluded.change_id`, subject.deviceId, subject.principalId,
+					subject.state, subject.credentialRevision, input.changeId).toArray();
+					if (subject.state === "revoked") this.revokeDevice(subject.deviceId, installedAt);
+				} else {
+					const current = this.principalAuthority(subject.principalId);
+					if (current && subject.membershipRevision < current.membershipRevision) throw new Error("authority_revision_regressed");
+					if (current && subject.membershipRevision === current.membershipRevision) throw new Error("authority_revision_reused");
+					this.storage.sql.exec(`INSERT INTO vault_principal_authority(
+					 principal_id, role, state, membership_revision, policy_version,
+					 capability_digest, display_name, color_seed, change_id
+					) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+					ON CONFLICT(principal_id) DO UPDATE SET role=excluded.role, state=excluded.state,
+					 membership_revision=excluded.membership_revision, policy_version=excluded.policy_version,
+					 capability_digest=excluded.capability_digest, display_name=excluded.display_name,
+					 color_seed=excluded.color_seed, change_id=excluded.change_id`, subject.principalId,
+					subject.role, subject.state, subject.membershipRevision, subject.policyVersion,
+					subject.capabilityDigest, subject.displayName, subject.colorSeed, input.changeId).toArray();
+				}
+			}
+			const activeOwners = this.storage.sql.exec<{ count: number }>(
+				"SELECT COUNT(*) AS count FROM vault_principal_authority WHERE state = 'active' AND role = 'owner'",
+			).one().count;
+			if (activeOwners !== 1) throw new Error("owner_invariant");
+			const orphaned = this.storage.sql.exec<{ count: number }>(`SELECT COUNT(*) AS count
+			 FROM vault_principal_authority p
+			 WHERE p.state = 'active' AND NOT EXISTS (
+			  SELECT 1 FROM vault_device_authority d
+			  WHERE d.principal_id = p.principal_id AND d.state = 'active'
+			 )`).one().count;
+			if (orphaned !== 0) throw new Error("active_membership_without_device");
+			const unknownDevices = this.storage.sql.exec<{ count: number }>(`SELECT COUNT(*) AS count
+			 FROM vault_device_authority d LEFT JOIN vault_principal_authority p
+			 ON p.principal_id = d.principal_id WHERE p.principal_id IS NULL`).one().count;
+			if (unknownDevices !== 0) throw new Error("device_principal_missing");
+			this.storage.sql.exec(`INSERT INTO vault_authorization_change_receipts(
+			 change_id, vault_id, vault_generation, subject_digest, installed_at
+			) VALUES (?, ?, ?, ?, ?)`, input.changeId, input.vaultId, input.vaultGeneration,
+				input.subjectDigest, installedAt).toArray();
+		});
+		return { changeId: input.changeId, vaultId: input.vaultId,
+			vaultGeneration: input.vaultGeneration, subjectDigest: input.subjectDigest, installedAt };
+	}
+
+	committedOperationOutcome(
+		actor: Pick<VaultActorContext, "principalId" | "membershipRevision" | "deviceId" | "deviceCredentialRevision">,
+		operationId: string,
+		requestDigest: string,
+	): { operationId: string; requestDigest: string; vaultSequence: number; committed: true } | null {
+		this.initialize();
+		const outcome = this.storage.sql.exec<{ vault_sequence: number }>(`SELECT vault_sequence
+		 FROM vault_operation_outcomes
+		 WHERE principal_id = ? AND membership_revision = ? AND device_id = ?
+		   AND device_credential_revision = ? AND operation_id = ? AND request_digest = ?
+		   AND expires_at > ?
+		 LIMIT 1`, actor.principalId, actor.membershipRevision, actor.deviceId,
+			actor.deviceCredentialRevision, operationId, requestDigest, Date.now()).toArray()[0];
+		if (outcome) return { operationId, requestDigest, vaultSequence: outcome.vault_sequence, committed: true };
+		const row = this.storage.sql.exec<{ sequence: number }>(`SELECT sequence
+		 FROM vault_mutation_attribution
+		 WHERE principal_id = ? AND membership_revision = ? AND device_id = ?
+		   AND device_credential_revision = ? AND operation_id = ? AND request_digest = ?
+		 ORDER BY sequence DESC LIMIT 1`, actor.principalId, actor.membershipRevision, actor.deviceId,
+			actor.deviceCredentialRevision, operationId, requestDigest).toArray()[0];
+		return row ? { operationId, requestDigest, vaultSequence: row.sequence, committed: true } : null;
 	}
 
 	documentGenerationAtSequence(documentId: string, sequence: number): number | null {

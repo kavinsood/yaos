@@ -1,9 +1,10 @@
 import * as Y from "yjs";
-import { SCHEMA_VERSION, STORAGE_FORMAT_VERSION } from "./shared/productVersions";
+import { PROTOCOL_VERSION, SCHEMA_VERSION, STORAGE_FORMAT_VERSION } from "./shared/productVersions";
 import { isCanonicalVaultId } from "./vaultId";
 import { MAX_DURABLE_UPDATE_BYTES } from "./contracts";
 import { RecoveryAuthorityStore } from "./recoveryAuthorityStore";
 import {
+	CANDIDATE_RECEIPT_TTL_MS,
 	MAX_CANDIDATE_RECEIPTS_PER_BODY,
 	type AttachmentCatalogEvent,
 	type CatalogMutation,
@@ -12,6 +13,8 @@ import {
 } from "./vaultCatalogStore";
 import type {
 	DurableCommitResult,
+	VaultAuthoritySubjectChange,
+	VaultCollaborationMigrationReceipt,
 	VaultCommitKind,
 	VaultProvisioningResult,
 } from "./vaultDocumentStore";
@@ -78,6 +81,177 @@ export type {
 
 /** Compatibility facade for cross-domain atomic vault mutations. */
 export class VaultStore extends RecoveryAuthorityStore {
+	migrateCollaboration(input: {
+		migrationId: string;
+		vaultId: string;
+		vaultGeneration: string;
+		requestDigest: string;
+		subjectDigest: string;
+		ownerPrincipalId: string;
+		subjects: VaultAuthoritySubjectChange[];
+		now?: number;
+	}): VaultCollaborationMigrationReceipt {
+		this.initialize();
+		const existing = this.collaborationMigrationReceipt(input.migrationId);
+		if (existing) {
+			if (existing.vaultId !== input.vaultId
+				|| existing.vaultGeneration !== input.vaultGeneration
+				|| existing.requestDigest !== input.requestDigest
+				|| existing.subjectDigest !== input.subjectDigest) {
+				throw new Error("collaboration_migration_identity_mismatch");
+			}
+			return existing;
+		}
+		const metadata = this.storedVaultMetadata();
+		if (!metadata || metadata.vaultId !== input.vaultId
+			|| metadata.vaultGeneration !== input.vaultGeneration) {
+			throw new Error("vault generation mismatch");
+		}
+		if (metadata.schemaVersion !== 6 || metadata.storageFormatVersion !== STORAGE_FORMAT_VERSION) {
+			throw new Error("collaboration_migration_source_mismatch");
+		}
+		if (!input.migrationId || !/^[A-Za-z0-9_-]{1,128}$/.test(input.migrationId)
+			|| !/^[a-f0-9]{64}$/.test(input.requestDigest)
+			|| !/^[a-f0-9]{64}$/.test(input.subjectDigest)
+			|| !input.ownerPrincipalId) {
+			throw new Error("invalid_collaboration_migration");
+		}
+		const owner = input.subjects.find((subject) => !("deviceId" in subject)
+			&& subject.principalId === input.ownerPrincipalId && subject.role === "owner" && subject.state === "active");
+		const activeOwners = input.subjects.filter((subject) => !("deviceId" in subject)
+			&& subject.role === "owner" && subject.state === "active");
+		if (!owner || activeOwners.length !== 1) throw new Error("owner_invariant");
+		const principals = new Set(input.subjects.filter((subject) => !("deviceId" in subject))
+			.map((subject) => subject.principalId));
+		const devices = input.subjects.filter((subject) => "deviceId" in subject);
+		if (devices.length === 0 || devices.some((device) => !principals.has(device.principalId))) {
+			throw new Error("device_principal_missing");
+		}
+		for (const principalId of principals) {
+			if (!devices.some((device) => device.principalId === principalId && device.state === "active")) {
+				throw new Error("active_membership_without_device");
+			}
+		}
+
+		const reconstructed = this.reconstructDocument("root");
+		const stateVector = Y.encodeStateVector(reconstructed.doc);
+		const system = reconstructed.doc.getMap("sys");
+		system.set("schemaVersion", SCHEMA_VERSION);
+		system.set("protocolVersion", PROTOCOL_VERSION);
+		system.set("historyAttribution", "legacy_unattributed");
+		const rootUpdate = Y.encodeStateAsUpdate(reconstructed.doc, stateVector);
+		reconstructed.doc.destroy();
+		if (rootUpdate.byteLength === 0) throw new Error("collaboration_migration_root_unchanged");
+
+		const installedAt = input.now ?? Date.now();
+		let rootSequence = 0;
+		let settingsEnvironmentCount = 0;
+		this.storage.transactionSync(() => {
+			if (this.storage.sql.exec<{ count: number }>(
+				"SELECT COUNT(*) AS count FROM vault_principal_authority",
+			).one().count !== 0 || this.storage.sql.exec<{ count: number }>(
+				"SELECT COUNT(*) AS count FROM vault_device_authority",
+			).one().count !== 0) {
+				throw new Error("collaboration_migration_partial_authority");
+			}
+			const rootHead = this.storage.sql.exec<{ generation: number }>(
+				"SELECT generation FROM vault_document_heads WHERE document_id = 'root'",
+			).toArray()[0];
+			if (!rootHead) throw new Error("collaboration_migration_root_missing");
+			rootSequence = this.storage.sql.exec<{ sequence: number }>(
+				"UPDATE vault_clock SET sequence = sequence + 1 WHERE id = 1 RETURNING sequence",
+			).one().sequence;
+			const rootGeneration = rootHead.generation + 1;
+			this.storage.sql.exec(
+				`INSERT INTO vault_journal(sequence, document_id, generation, kind, update_byte_length, created_at)
+				 VALUES (?, 'root', ?, 'root', ?, ?)`,
+				rootSequence, rootGeneration, rootUpdate.byteLength, installedAt,
+			).toArray();
+			this.insertJournalChunks(rootSequence, rootUpdate);
+			this.storage.sql.exec(
+				"UPDATE vault_document_heads SET generation = ?, latest_sequence = ? WHERE document_id = 'root'",
+				rootGeneration, rootSequence,
+			).toArray();
+
+			for (const subject of input.subjects) {
+				if ("deviceId" in subject) {
+					this.storage.sql.exec(`INSERT INTO vault_device_authority(
+					 device_id, principal_id, state, credential_revision, change_id
+					) VALUES (?, ?, ?, ?, ?)`, subject.deviceId, subject.principalId,
+					subject.state, subject.credentialRevision, input.migrationId).toArray();
+				} else {
+					this.storage.sql.exec(`INSERT INTO vault_principal_authority(
+					 principal_id, role, state, membership_revision, policy_version,
+					 capability_digest, display_name, color_seed, change_id
+					) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, subject.principalId, subject.role,
+					subject.state, subject.membershipRevision, subject.policyVersion,
+					subject.capabilityDigest, subject.displayName, subject.colorSeed,
+					input.migrationId).toArray();
+				}
+			}
+
+			const hasSettings = this.storage.sql.exec<{ count: number }>(
+				"SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = 'settings_env'",
+			).one().count > 0;
+			if (hasSettings) {
+				const keys = this.storage.sql.exec<{ config_key: string }>(
+					"SELECT config_key FROM settings_env",
+				).toArray();
+				if (keys.some((row) => row.config_key.startsWith("\u0001"))) {
+					throw new Error("collaboration_migration_settings_already_scoped");
+				}
+				settingsEnvironmentCount = keys.length;
+				const prefix = `\u0001${input.ownerPrincipalId}\0`;
+				for (const table of ["settings_env", "settings_files", "settings_intents", "settings_themes",
+					"settings_tombstones", "settings_plugin_data", "settings_mutation_attribution"]) {
+					const exists = this.storage.sql.exec<{ count: number }>(
+						"SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = ?", table,
+					).one().count > 0;
+					if (exists) this.storage.sql.exec(`UPDATE ${table} SET config_key = ? || config_key`, prefix).toArray();
+				}
+			}
+
+			this.storage.sql.exec("DROP TABLE vault_meta").toArray();
+			this.storage.sql.exec(`CREATE TABLE vault_meta (
+				id INTEGER PRIMARY KEY CHECK(id = 1),
+				vault_id TEXT NOT NULL,
+				vault_generation TEXT NOT NULL,
+				schema_version INTEGER NOT NULL CHECK(schema_version = 7),
+				storage_format_version INTEGER NOT NULL CHECK(storage_format_version = 2),
+				provisioned_at INTEGER NOT NULL
+			)`).toArray();
+			this.storage.sql.exec(
+				`INSERT INTO vault_meta(id, vault_id, vault_generation, schema_version,
+				 storage_format_version, provisioned_at) VALUES (1, ?, ?, ?, ?, ?)`,
+				metadata.vaultId, metadata.vaultGeneration, SCHEMA_VERSION,
+				STORAGE_FORMAT_VERSION, metadata.provisionedAt,
+			).toArray();
+			this.storage.sql.exec(`INSERT INTO vault_authorization_change_receipts(
+				change_id, vault_id, vault_generation, subject_digest, installed_at
+			) VALUES (?, ?, ?, ?, ?)`, input.migrationId, input.vaultId,
+			input.vaultGeneration, input.subjectDigest, installedAt).toArray();
+			this.storage.sql.exec(`INSERT INTO vault_collaboration_migration_receipts(
+				migration_id, vault_id, vault_generation, request_digest, subject_digest,
+				root_sequence, settings_assignment, settings_environment_count,
+				history_attribution, installed_at
+			) VALUES (?, ?, ?, ?, ?, ?, 'owner_principal_scoped', ?, 'legacy_unattributed', ?)`,
+			input.migrationId, input.vaultId, input.vaultGeneration, input.requestDigest,
+			input.subjectDigest, rootSequence, settingsEnvironmentCount, installedAt).toArray();
+		});
+		return {
+			migrationId: input.migrationId,
+			vaultId: input.vaultId,
+			vaultGeneration: input.vaultGeneration,
+			requestDigest: input.requestDigest,
+			subjectDigest: input.subjectDigest,
+			rootSequence,
+			settingsAssignment: "owner_principal_scoped",
+			settingsEnvironmentCount,
+			historyAttribution: "legacy_unattributed",
+			installedAt,
+		};
+	}
+
 	provisionVault(
 		vaultId: string,
 		vaultGeneration: string,
@@ -122,6 +296,8 @@ export class VaultStore extends RecoveryAuthorityStore {
 		this.storage.transactionSync(() => {
 			for (const table of [
 				"vault_restore_entries",
+				"vault_operation_outcomes",
+				"vault_mutation_attribution",
 				"vault_lifecycle_publications",
 				"vault_lifecycle_receipts",
 				"vault_creation_candidates",
@@ -165,6 +341,7 @@ export class VaultStore extends RecoveryAuthorityStore {
 		update: Uint8Array;
 		vaultGeneration: string;
 		runtimeEpoch: string;
+		actor: { principalId: string; membershipRevision: number; deviceId: string; deviceCredentialRevision: number };
 		now?: number;
 	}): DurableCandidateReceipt {
 		if (input.update.byteLength === 0 || input.update.byteLength > MAX_DURABLE_UPDATE_BYTES) {
@@ -207,7 +384,8 @@ export class VaultStore extends RecoveryAuthorityStore {
 			reconstructed.doc.destroy();
 		}
 		const commit = changed
-			? this.commitUpdate({ documentId: input.bodyId, update: input.update, kind: "body", catalog: input.catalog, now: input.now })
+			? this.commitUpdate({ documentId: input.bodyId, update: input.update, kind: "body", catalog: input.catalog, now: input.now,
+				actorAttributions: [{ actor: input.actor, operationId: input.candidateId, requestDigest: input.candidateDigest }] })
 			: {
 				vaultSequence: this.documentHead(input.bodyId)?.latestSequence ?? 0,
 				generation: this.documentHead(input.bodyId)?.generation ?? 0,
@@ -223,20 +401,37 @@ export class VaultStore extends RecoveryAuthorityStore {
 			vaultGeneration: input.vaultGeneration,
 			runtimeEpoch: input.runtimeEpoch,
 		};
-		this.storage.sql.exec(
-			`INSERT INTO vault_candidate_receipts(
-			 body_id, client_id, candidate_id, candidate_digest, durable_generation,
-			 vault_sequence, runtime_epoch, created_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-			receipt.bodyId,
-			receipt.clientId,
-			receipt.candidateId,
-			receipt.candidateDigest,
-			receipt.durableGeneration,
-			receipt.vaultSequence,
-			receipt.runtimeEpoch,
-			now,
-		).toArray();
+		this.storage.transactionSync(() => {
+			this.storage.sql.exec(
+				`INSERT INTO vault_operation_outcomes(
+					 principal_id, membership_revision, device_id, device_credential_revision,
+					 operation_id, request_digest, vault_sequence, committed_at, expires_at
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				input.actor.principalId,
+				input.actor.membershipRevision,
+				input.actor.deviceId,
+				input.actor.deviceCredentialRevision,
+				input.candidateId,
+				input.candidateDigest,
+				receipt.vaultSequence,
+				now,
+				now + CANDIDATE_RECEIPT_TTL_MS,
+			).toArray();
+			this.storage.sql.exec(
+				`INSERT INTO vault_candidate_receipts(
+					 body_id, client_id, candidate_id, candidate_digest, durable_generation,
+					 vault_sequence, runtime_epoch, created_at
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+				receipt.bodyId,
+				receipt.clientId,
+				receipt.candidateId,
+				receipt.candidateDigest,
+				receipt.durableGeneration,
+				receipt.vaultSequence,
+				receipt.runtimeEpoch,
+				now,
+			).toArray();
+		});
 		return receipt;
 	}
 
@@ -250,6 +445,11 @@ export class VaultStore extends RecoveryAuthorityStore {
 		completeCreation?: { bodyId: string; candidateId: string; candidateDigest: string };
 		completeCreations?: Array<{ bodyId: string; candidateId: string; candidateDigest: string }>;
 		rootPublications?: Array<{ operationId: string; lifecycleSequence: number; vaultGeneration: string; runtimeEpoch: string }>;
+		actorAttributions?: Array<{
+			actor: { principalId: string; membershipRevision: number; deviceId: string; deviceCredentialRevision: number };
+			operationId?: string;
+			requestDigest?: string;
+		}>;
 		attachmentCatalog?: Array<Omit<AttachmentCatalogEvent, "sequence"> & { operationId: string }>;
 		attachmentOperation?: { operationId: string; requestDigest: string };
 		provisioning?: { vaultId: string; vaultGeneration: string; provisionedAt: number };
@@ -307,6 +507,17 @@ export class VaultStore extends RecoveryAuthorityStore {
 			);
 			journal.toArray();
 			rowsWritten += journal.rowsWritten;
+			for (const [mutationIndex, attribution] of (input.actorAttributions ?? []).entries()) {
+				const actor = attribution.actor;
+				const written = this.storage.sql.exec(`INSERT INTO vault_mutation_attribution(
+				 sequence, mutation_index, principal_id, membership_revision, device_id,
+				 device_credential_revision, operation_id, request_digest
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, sequence, mutationIndex, actor.principalId,
+					actor.membershipRevision, actor.deviceId, actor.deviceCredentialRevision,
+					attribution.operationId ?? null, attribution.requestDigest ?? null);
+				written.toArray();
+				rowsWritten += written.rowsWritten;
+			}
 			rowsWritten += this.insertJournalChunks(sequence, input.update);
 			const writeHead = this.storage.sql.exec(
 				`INSERT INTO vault_document_heads(document_id, generation, latest_sequence)
@@ -459,6 +670,11 @@ export class VaultStore extends RecoveryAuthorityStore {
 		completeCreation?: { bodyId: string; candidateId: string; candidateDigest: string };
 		completeCreations?: Array<{ bodyId: string; candidateId: string; candidateDigest: string }>;
 		rootPublications?: Array<{ operationId: string; lifecycleSequence: number; vaultGeneration: string; runtimeEpoch: string }>;
+		actorAttributions?: Array<{
+			actor: { principalId: string; membershipRevision: number; deviceId: string; deviceCredentialRevision: number };
+			operationId?: string;
+			requestDigest?: string;
+		}>;
 		now?: number;
 	}): DurableCommitResult {
 		return this.commitUpdate({
@@ -471,6 +687,7 @@ export class VaultStore extends RecoveryAuthorityStore {
 			completeCreations: input.completeCreations,
 			lifecycleReceipts: input.lifecycleReceipts,
 			rootPublications: input.rootPublications,
+			actorAttributions: input.actorAttributions,
 			now: input.now,
 		});
 	}
@@ -480,6 +697,11 @@ export class VaultStore extends RecoveryAuthorityStore {
 		events: Array<Omit<AttachmentCatalogEvent, "sequence"> & { operationId: string }>,
 		operation: { operationId: string; requestDigest: string },
 		now = Date.now(),
+		actorAttributions: Array<{
+			actor: { principalId: string; membershipRevision: number; deviceId: string; deviceCredentialRevision: number };
+			operationId?: string;
+			requestDigest?: string;
+		}> = [],
 	): DurableCommitResult {
 		if (events.length === 0) throw new Error("attachment publication requires an event");
 		if (!operation.operationId || operation.operationId.length > 256
@@ -489,6 +711,7 @@ export class VaultStore extends RecoveryAuthorityStore {
 			|| events.some((event) => event.operationId !== operation.operationId)) {
 			throw new Error("invalid attachment publication commit");
 		}
-		return this.commitUpdate({ documentId: "root", update: rootUpdate, kind: "blob", attachmentCatalog: events, attachmentOperation: operation, now });
+		return this.commitUpdate({ documentId: "root", update: rootUpdate, kind: "blob", attachmentCatalog: events,
+			attachmentOperation: operation, actorAttributions, now });
 	}
 }

@@ -11,6 +11,8 @@ import {
 import type { RetainedSnapshotRoot } from "./recoveryReadService";
 import type { RecoveryRouteAuthority, RestoreItemResult, StartRestoreRequest } from "./recoveryRoutes";
 import type { ActorCallPort } from "./platformPorts";
+import type { VaultActorContext } from "./collaboration";
+import { actorHeaders } from "./vaultAuthority";
 
 const encoder = new TextEncoder();
 
@@ -20,19 +22,24 @@ export class ActorRecoveryRouteAuthority implements RecoveryRouteAuthority {
 		private readonly actorName: string,
 		private readonly vaultId: string,
 		private readonly vaultGeneration: string,
+		private readonly actor: VaultActorContext,
 	) {}
+
+	private headers(): Headers {
+		const headers = actorHeaders(this.actor);
+		headers.set("content-type", "application/json");
+		headers.set(RECOVERY_PUBLIC_RPC_HEADER, "1");
+		headers.set("x-yaos-vault-id", this.vaultId);
+		headers.set("x-yaos-vault-generation", this.vaultGeneration);
+		return headers;
+	}
 
 	private async call<T>(method: string, params: unknown): Promise<T> {
 		const body = JSON.stringify({ method, params: encodeRecoveryRpcPayload(params) });
 		if (encoder.encode(body).byteLength > RECOVERY_RPC_MAX_JSON_BYTES) throw new Error("recovery request too large");
 		const response = await this.actors.call(this.actorName, new Request(`https://internal${RECOVERY_PUBLIC_RPC_PATH}`, {
 			method: "POST",
-			headers: {
-				"content-type": "application/json",
-				[RECOVERY_PUBLIC_RPC_HEADER]: "1",
-				"x-yaos-vault-id": this.vaultId,
-				"x-yaos-vault-generation": this.vaultGeneration,
-			},
+				headers: this.headers(),
 			body,
 		}));
 		const bytes = new Uint8Array(await response.arrayBuffer());
@@ -82,12 +89,7 @@ export class ActorRecoveryRouteAuthority implements RecoveryRouteAuthority {
 		const body = JSON.stringify({ method: "getRecoveryRestoreItemContent", params: input });
 		return this.actors.call(this.actorName, new Request(`https://internal${RECOVERY_PUBLIC_RPC_PATH}`, {
 			method: "POST",
-			headers: {
-				"content-type": "application/json",
-				[RECOVERY_PUBLIC_RPC_HEADER]: "1",
-				"x-yaos-vault-id": this.vaultId,
-				"x-yaos-vault-generation": this.vaultGeneration,
-			},
+				headers: this.headers(),
 			body,
 		}));
 	}

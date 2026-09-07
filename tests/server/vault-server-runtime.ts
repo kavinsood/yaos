@@ -2,10 +2,24 @@ import { strict as assert } from "node:assert";
 import { VaultRuntime } from "../../server/src/server";
 import { makeDurableObjectState } from "../mocks/workerEnv.ts";
 import { suite } from "../harness.ts";
+import { actorHeaders } from "../../server/src/vaultAuthority";
+import type { VaultActorContext } from "../../server/src/collaboration";
+import { principalSettingsKey } from "../../server/src/settingsSyncStore";
 
 const s = suite("vault-server-runtime");
 const VAULT_ID = "vault-runtime-0001";
 const GENERATION = "generation-runtime-0001";
+const ACTOR: VaultActorContext = {
+	vaultId: VAULT_ID,
+	vaultGeneration: GENERATION,
+	principalId: "principal-runtime-0001",
+	membershipRevision: 1,
+	deviceId: "device-runtime-0001",
+	deviceCredentialRevision: 1,
+	role: "member",
+	policyVersion: 1,
+	capabilityDigest: "runtime-member-capabilities",
+};
 
 class RuntimeStore {
 	metadata: { vaultId: string; vaultGeneration: string; schemaVersion: number; storageFormatVersion: number; provisionedAt: number } | null = null;
@@ -16,10 +30,11 @@ class RuntimeStore {
 			if (this.metadata.vaultId !== vaultId || this.metadata.vaultGeneration !== vaultGeneration) throw new Error("vault generation mismatch");
 			return { ...this.metadata, created: false };
 		}
-		this.metadata = { vaultId, vaultGeneration, schemaVersion: 6, storageFormatVersion: 2, provisionedAt: 1 };
+		this.metadata = { vaultId, vaultGeneration, schemaVersion: 7, storageFormatVersion: 2, provisionedAt: 1 };
 		return { ...this.metadata, created: true };
 	}
 	vaultMetadata() { return this.metadata; }
+	storedVaultSchemaVersion(): number | null { return null; }
 	vaultDeletionBegun(vaultGeneration: string): boolean { return this.deletion?.vaultGeneration === vaultGeneration; }
 	beginVaultDeletion(deletionId: string, vaultGeneration: string): { captureJobIds: string[]; restoreIds: string[] } {
 		if (this.metadata?.vaultGeneration !== vaultGeneration) throw new Error("vault generation mismatch");
@@ -27,6 +42,9 @@ class RuntimeStore {
 		return { captureJobIds: [], restoreIds: [] };
 	}
 	isDeviceRevoked(deviceId: string): boolean { return this.revokedDevices.has(deviceId); }
+	validateActor(actor: VaultActorContext): "allowed" | "authority_superseded" {
+		return this.revokedDevices.has(actor.deviceId) ? "authority_superseded" : "allowed";
+	}
 	currentSequence(): number { return 1; }
 	journalFloor(): number { return 0; }
 	activePins(): unknown[] { return []; }
@@ -80,8 +98,8 @@ function makeServer() {
 		lifecycle: { value: { activeBodyHead: (bodyId: string) => bodyId === "body-runtime-0001" ? {} : null } },
 		sockets: {
 			value: {
-				accept: (documentId: string, kind: "root" | "body", deviceId: string) => {
-					accepted.push({ documentId, kind, deviceId });
+				accept: (documentId: string, kind: "root" | "body", actor: VaultActorContext) => {
+					accepted.push({ documentId, kind, deviceId: actor.deviceId });
 					return new Response(null, { status: 204 });
 				},
 				closeAll: (reason: string) => {
@@ -93,8 +111,9 @@ function makeServer() {
 	return { server, store, accepted, closed, settingsReads, deleteAllCalls: () => deleteAllCalls };
 }
 
-function request(path: string, init: RequestInit = {}): Request {
-	const headers = new Headers(init.headers);
+function request(path: string, init: RequestInit = {}, trusted = true): Request {
+	const headers = trusted ? actorHeaders(ACTOR) : new Headers();
+	new Headers(init.headers).forEach((value, name) => headers.set(name, value));
 	headers.set("x-yaos-vault-id", VAULT_ID);
 	if (!headers.has("x-yaos-vault-generation")) {
 		headers.set("x-yaos-vault-generation", GENERATION);
@@ -134,7 +153,7 @@ s.test("a different generation cannot claim an already-provisioned DO identity",
 s.test("root/body socket runtime requires trusted device identity and exact body authority", async () => {
 	const { server, accepted } = makeServer();
 	await server.fetch(request("/__yaos/provision", { method: "POST", body: JSON.stringify({ vaultGeneration: GENERATION }) }));
-	assert.equal((await server.fetch(request("/ws/root", { headers: { Upgrade: "websocket" } }))).status, 401);
+	assert.equal((await server.fetch(request("/ws/root", { headers: { Upgrade: "websocket" } }, false))).status, 401);
 	const headers = { Upgrade: "websocket", "x-yaos-device-id": "device-runtime-0001" };
 	assert.equal((await server.fetch(request("/ws/root", { headers }))).status, 204);
 	assert.equal((await server.fetch(request("/ws/body/body-runtime-0001", { headers }))).status, 204);
@@ -230,15 +249,16 @@ s.test("settings sidecar requires generation and trusted device authority withou
 	}));
 	assert.equal(stale.status, 409);
 	assert.deepEqual(settingsReads, []);
-	const missing = await server.fetch(request("/settings-sync/.obsidian"));
+	const missing = await server.fetch(request("/settings-sync/.obsidian", {}, false));
 	assert.equal(missing.status, 401);
-	assert.deepEqual(await missing.json(), { error: "missing_trusted_device_identity" });
+	assert.deepEqual(await missing.json(), { error: "missing_trusted_actor" });
 	assert.deepEqual(settingsReads, []);
 	store.revokedDevices.add("device-runtime-revoked");
 	const revoked = await server.fetch(request("/settings-sync/.obsidian", {
 		headers: { "x-yaos-device-id": "device-runtime-revoked" },
 	}));
-	assert.equal(revoked.status, 401);
+	assert.equal(revoked.status, 409);
+	assert.deepEqual(await revoked.json(), { error: "authority_superseded" });
 	assert.deepEqual(settingsReads, []);
 	const undeclaredFormat = await server.fetch(request("/settings-sync/.obsidian", {
 		headers: { "x-yaos-device-id": "device-runtime-0001" },
@@ -266,6 +286,6 @@ s.test("settings sidecar requires generation and trusted device authority withou
 	}));
 	assert.equal(admitted.status, 200);
 	assert.deepEqual(await admitted.json(), { seeded: false });
-	assert.deepEqual(settingsReads, [".obsidian"]);
+	assert.deepEqual(settingsReads, [principalSettingsKey(ACTOR.principalId, ".obsidian")]);
 });
 await s.done();

@@ -690,7 +690,7 @@ export function renderOperatorConsole(options: OperatorPageOptions): string {
     body { margin: 0; font-family: ui-sans-serif, system-ui, sans-serif; background: #08111d; color: #f4f7fb; padding: 32px 16px; }
     main { width: min(720px, 100%); margin: 0 auto; }
     h1 { font-size: 24px; }
-    p, li { color: #a9c0d8; line-height: 1.5; }
+    p, li, label { color: #a9c0d8; line-height: 1.5; }
     button, input { border-radius: 8px; border: 1px solid rgba(255,255,255,0.15); background: #040a12; color: #f4f7fb; padding: 8px 12px; }
     button { cursor: pointer; background: #163044; }
     button:disabled { opacity: 0.45; cursor: not-allowed; }
@@ -698,15 +698,22 @@ export function renderOperatorConsole(options: OperatorPageOptions): string {
     .card { background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08); border-radius: 12px; padding: 16px; margin-bottom: 16px; }
     code { color: #7bdff6; }
     .err { color: #ff8a8a; }
-    .pair img { display: block; width: 160px; height: 160px; margin-top: 8px; }
-    .pair a { color: #7bdff6; }
     .danger { color: #ff8a8a; }
+    .collaboration-action { margin: 16px 0; padding: 14px; border: 1px solid rgba(123,223,246,0.2); border-radius: 10px; background: rgba(123,223,246,0.04); }
+    .collaboration-action h3 { margin: 0 0 8px; font-size: 16px; }
+    .collaboration-action fieldset { margin: 12px 0; border: 1px solid rgba(255,255,255,0.12); border-radius: 8px; }
+    .collaboration-action label { display: block; margin: 6px 0; }
+    .collaboration-action input[type="text"] { box-sizing: border-box; width: min(360px, 100%); }
+    .collaboration-action .row label { margin: 0; }
+    .action-status { min-height: 1.5em; }
+    .secret-result { overflow-wrap: anywhere; }
+    .secret-result a { color: #7bdff6; }
   </style>
 </head>
 <body>
   <main>
     <h1>YAOS console</h1>
-    <p>Attachments ${attachments} · Snapshots ${snapshots}. Codes work once for 15 minutes. Anyone who enrolls is a full peer on that vault and can add more devices. Add-device and invite are the same enroll, not different permissions. Kick removes that device only.</p>
+    <p>Attachments ${attachments} · Snapshots ${snapshots}. Each vault has one owner and full content members. People invite people; each person links their own additional devices. Operator owner codes work once for 15 minutes and are only for bootstrap or lost-owner recovery.</p>
     <div class="row">
       <input id="vault-name" placeholder="New vault name" />
       <button id="create-vault" disabled>Create vault</button>
@@ -732,34 +739,85 @@ export function renderOperatorConsole(options: OperatorPageOptions): string {
       const date = new Date(ts);
       return isNaN(date.getTime()) ? "" : date.toISOString();
     }
-    function showPairing(slot, purpose, data, ritual) {
+    function actionError(data, fallback) {
+      const error = data && typeof data.error === "string" ? data.error : "";
+      if (error === "owner_invariant") return fallback + " The vault owner state changed; reload and review it.";
+      if (error === "authority_superseded") return fallback + " Vault authority changed; reload before retrying.";
+      if (error === "already_migrated") return "This vault already has collaboration identities. Reload the console.";
+      return error ? fallback + " (" + error + ")" : fallback;
+    }
+    function showOwnerCode(slot, purpose, data) {
       slot.replaceChildren();
-      if (!data || !data.pairingCode) {
-        slot.textContent = "Could not mint a pairing code.";
-      } else {
-        const line = document.createElement("p");
-        if (purpose === "invite") {
-          line.textContent = "Invite code (once, 15 min): " + data.pairingCode + ". Same enroll as add-device — not a different permission. Enrollee is a full peer.";
-        } else {
-          line.textContent = "Add-device code (once, 15 min): " + data.pairingCode + ". Same enroll as invite — not a different permission. Enrollee is a full peer.";
-        }
-        slot.appendChild(line);
-        if (typeof data.mobileSetupQrDataUrl === "string" && data.mobileSetupQrDataUrl) {
-          const image = document.createElement("img");
-          image.src = data.mobileSetupQrDataUrl;
-          image.alt = "Pairing QR";
-          slot.appendChild(image);
-        }
+      if (!data || typeof data.pairingCode !== "string" || !data.pairingCode) {
+        slot.textContent = "The owner code response was invalid. Reload before trying again.";
+        slot.classList.add("err");
+        return;
       }
-      if (ritual) {
-        const hint = document.createElement("p");
-        hint.textContent = "Open a new empty Obsidian vault, enable YAOS, then scan or paste.";
-        slot.appendChild(hint);
-        const picker = document.createElement("a");
-        picker.href = "obsidian://choose-vault";
-        picker.textContent = "Open vault picker";
-        slot.appendChild(picker);
+      slot.classList.remove("err");
+      slot.classList.add("secret-result");
+      const warning = document.createElement("p");
+      warning.textContent = (purpose === "owner-recovery" ? "Owner recovery" : "Owner setup") +
+        " code (once, expires " + (formatWhen(data.expiresAt) || "in 15 minutes") + "):";
+      slot.appendChild(warning);
+      const code = document.createElement("code");
+      code.textContent = data.pairingCode;
+      slot.appendChild(code);
+      const disclosure = document.createElement("p");
+      disclosure.textContent = "This secret is shown only in this result. Use it now; reloading removes it from the console.";
+      slot.appendChild(disclosure);
+      const links = document.createElement("p");
+      if (typeof data.obsidianUrl === "string" && data.obsidianUrl) {
+        const desktop = document.createElement("a");
+        desktop.href = data.obsidianUrl;
+        desktop.textContent = "Open in Obsidian";
+        links.appendChild(desktop);
       }
+      if (typeof data.mobileSetupUrl === "string" && data.mobileSetupUrl) {
+        if (links.childNodes.length > 0) links.appendChild(document.createTextNode(" · "));
+        const mobile = document.createElement("a");
+        mobile.href = data.mobileSetupUrl;
+        mobile.textContent = "Open mobile setup";
+        links.appendChild(mobile);
+      }
+      if (links.childNodes.length > 0) slot.appendChild(links);
+    }
+    function updateMigrationButton(card) {
+      const button = card && card.querySelector("[data-collaboration-migrate]");
+      if (!button || button.dataset.pending === "true") return;
+      const displayName = card.querySelector(".owner-display-name");
+      const confirmation = card.querySelector(".migration-confirm");
+      const selected = card.querySelectorAll(".migration-owner-device:checked");
+      button.disabled = !displayName || !displayName.value.trim() || selected.length === 0 || !confirmation || !confirmation.checked;
+    }
+    async function requestOwnerCode(vaultId, purpose, button, slot) {
+      button.disabled = true;
+      button.dataset.pending = "true";
+      slot.classList.remove("err");
+      slot.textContent = purpose === "owner-recovery" ? "Issuing owner recovery code…" : "Issuing owner setup code…";
+      let response;
+      try {
+        response = await fetch("/operator/vaults/" + encodeURIComponent(vaultId) + "/owner-code", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ purpose }),
+        });
+      } catch {
+        slot.classList.add("err");
+        slot.textContent = "Could not reach the server to issue the owner code.";
+        button.disabled = false;
+        button.dataset.pending = "false";
+        return;
+      }
+      const data = await response.json().catch(() => null);
+      if (!response.ok) {
+        slot.classList.add("err");
+        slot.textContent = actionError(data, "Could not issue the owner code.");
+        button.disabled = false;
+        button.dataset.pending = "false";
+        return;
+      }
+      button.textContent = "Code issued";
+      showOwnerCode(slot, purpose, data);
     }
     function isOperatorState(data) {
       return data !== null
@@ -807,7 +865,42 @@ export function renderOperatorConsole(options: OperatorPageOptions): string {
           && typeof pending.vaultGeneration === "string"
           && typeof pending.deviceId === "string"
           && typeof pending.requestedAt === "number"
-          && (pending.lastError === null || typeof pending.lastError === "string"));
+          && (pending.lastError === null || typeof pending.lastError === "string"))
+        && Array.isArray(data.principals)
+        && data.principals.every((principal) =>
+          principal !== null
+          && typeof principal === "object"
+          && !Array.isArray(principal)
+          && typeof principal.vaultId === "string"
+          && typeof principal.principalId === "string"
+          && typeof principal.displayName === "string")
+        && Array.isArray(data.memberships)
+        && data.memberships.every((membership) =>
+          membership !== null
+          && typeof membership === "object"
+          && !Array.isArray(membership)
+          && typeof membership.vaultId === "string"
+          && typeof membership.principalId === "string"
+          && (membership.role === "owner" || membership.role === "member")
+          && typeof membership.state === "string")
+        && Array.isArray(data.authorizationChanges)
+        && data.authorizationChanges.every((change) =>
+          change !== null
+          && typeof change === "object"
+          && !Array.isArray(change)
+          && typeof change.changeId === "string"
+          && typeof change.vaultId === "string"
+          && typeof change.kind === "string"
+          && typeof change.state === "string")
+        && Array.isArray(data.vaultGovernanceRequests)
+        && data.vaultGovernanceRequests.every((request) =>
+          request !== null
+          && typeof request === "object"
+          && !Array.isArray(request)
+          && typeof request.governanceRequestId === "string"
+          && typeof request.vaultId === "string"
+          && typeof request.kind === "string"
+          && typeof request.state === "string");
     }
     function showDestroyStatus(responseStatus) {
       if (responseStatus >= 500) {
@@ -817,12 +910,29 @@ export function renderOperatorConsole(options: OperatorPageOptions): string {
       status.textContent = destroyStatusMessages[String(responseStatus)]
         || "Vault destruction failed (HTTP " + responseStatus + ").";
     }
-    async function requestVaultDestroy(vaultId) {
+    async function requestVaultDestroy(vaultId, governanceRequestId) {
       try {
-        const res = await fetch("/operator/vaults/" + encodeURIComponent(vaultId), { method: "DELETE" });
+        const res = await fetch("/operator/vaults/" + encodeURIComponent(vaultId), {
+          method: "DELETE",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ governanceRequestId }),
+        });
         showDestroyStatus(res.status);
       } catch {
         status.textContent = "Could not reach the server to destroy the vault.";
+      }
+      await load(true);
+    }
+    async function requestEmergencyVaultDestroy(vaultId, reason) {
+      try {
+        const res = await fetch("/operator/vaults/" + encodeURIComponent(vaultId) + "/emergency-destroy", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ requestId: crypto.randomUUID().replaceAll("-", ""), reason }),
+        });
+        showDestroyStatus(res.status);
+      } catch {
+        status.textContent = "Could not reach the server for emergency vault destruction.";
       }
       await load(true);
     }
@@ -882,6 +992,20 @@ export function renderOperatorConsole(options: OperatorPageOptions): string {
         idLine.appendChild(idCode);
         card.appendChild(idLine);
 
+        const devices = (data.devices || []).filter((device) => device.vaultId === vault.vaultId);
+        const memberships = (data.memberships || []).filter((membership) => membership.vaultId === vault.vaultId);
+        const ownerMembership = memberships.find((membership) => membership.role === "owner" && membership.state !== "revoked");
+        const ownerPrincipal = ownerMembership
+          ? (data.principals || []).find((principal) => principal.principalId === ownerMembership.principalId)
+          : null;
+        const pendingMigration = (data.authorizationChanges || []).find((change) =>
+          change.vaultId === vault.vaultId
+          && change.kind === "authority-install"
+          && change.changeId.indexOf("collab_migrate_") === 0
+          && change.state !== "complete");
+        const needsMigration = devices.length > 0 && memberships.length === 0
+          && devices.every((device) => typeof device.principalId !== "string");
+
         if (vault.state === "provisioning") {
           const provisioning = document.createElement("p");
           provisioning.className = "err";
@@ -893,21 +1017,141 @@ export function renderOperatorConsole(options: OperatorPageOptions): string {
           card.appendChild(retryProvision);
         }
 
-        const renameRow = document.createElement("div");
-        renameRow.className = "row";
-        const renameInput = document.createElement("input");
-        renameInput.className = "rename-input";
-        renameInput.value = vault.name;
-        renameInput.setAttribute("aria-label", "Vault nickname");
-        const renameBtn = document.createElement("button");
-        renameBtn.textContent = "Rename";
-        renameBtn.dataset.rename = vault.vaultId;
-        renameRow.appendChild(renameInput);
-        renameRow.appendChild(renameBtn);
-        card.appendChild(renameRow);
+        if (vault.state === "awaiting_owner") {
+          const ownerSetup = document.createElement("section");
+          ownerSetup.className = "collaboration-action";
+          const ownerSetupHeading = document.createElement("h3");
+          ownerSetupHeading.textContent = "Set up the vault owner";
+          ownerSetup.appendChild(ownerSetupHeading);
+          const ownerSetupDetail = document.createElement("p");
+          ownerSetupDetail.textContent = ownerMembership
+            ? "Owner enrollment exists and its vault authority installation is still pending. Do not issue another bootstrap identity."
+            : "This vault has no owner yet. Issue one one-use code, then enroll the owner's first Obsidian device.";
+          ownerSetup.appendChild(ownerSetupDetail);
+          if (!ownerMembership) {
+            const ownerSetupButton = document.createElement("button");
+            ownerSetupButton.textContent = "Issue owner setup code";
+            ownerSetupButton.dataset.ownerCode = vault.vaultId;
+            ownerSetupButton.dataset.ownerCodePurpose = "owner-bootstrap";
+            ownerSetup.appendChild(ownerSetupButton);
+            const ownerSetupResult = document.createElement("div");
+            ownerSetupResult.className = "owner-code-result action-status";
+            ownerSetup.appendChild(ownerSetupResult);
+          }
+          card.appendChild(ownerSetup);
+        }
+
+        if (needsMigration || pendingMigration) {
+          const migration = document.createElement("section");
+          migration.className = "collaboration-action migration-action";
+          migration.dataset.locked = pendingMigration ? "true" : "false";
+          const migrationHeading = document.createElement("h3");
+          migrationHeading.textContent = pendingMigration ? "Finish collaboration migration" : "Upgrade to human collaboration";
+          migration.appendChild(migrationHeading);
+          const migrationDetail = document.createElement("p");
+          migrationDetail.textContent = pendingMigration
+            ? "The identity migration was prepared but did not finish installing vault authority. Review the locked owner grouping and retry the exact operation."
+            : "Choose every existing device that belongs to the owner. Selected devices become one owner identity; every unselected device becomes a separate full member. This cannot be inferred or safely undone.";
+          migration.appendChild(migrationDetail);
+          if (pendingMigration && pendingMigration.lastError) {
+            const migrationError = document.createElement("p");
+            migrationError.className = "err";
+            migrationError.textContent = "Last authority installation error: " + pendingMigration.lastError;
+            migration.appendChild(migrationError);
+          }
+          const nameLabel = document.createElement("label");
+          nameLabel.textContent = "Owner display name";
+          const nameInput = document.createElement("input");
+          nameInput.type = "text";
+          nameInput.className = "owner-display-name";
+          nameInput.maxLength = 80;
+          nameInput.placeholder = "Owner name";
+          nameInput.value = ownerPrincipal ? ownerPrincipal.displayName : "";
+          nameInput.disabled = Boolean(pendingMigration);
+          nameLabel.appendChild(document.createElement("br"));
+          nameLabel.appendChild(nameInput);
+          migration.appendChild(nameLabel);
+          const ownerDevices = document.createElement("fieldset");
+          const ownerDevicesLegend = document.createElement("legend");
+          ownerDevicesLegend.textContent = "Devices belonging to the owner";
+          ownerDevices.appendChild(ownerDevicesLegend);
+          for (const device of devices) {
+            const deviceLabel = document.createElement("label");
+            const deviceInput = document.createElement("input");
+            deviceInput.type = "checkbox";
+            deviceInput.className = "migration-owner-device";
+            deviceInput.value = device.deviceId;
+            deviceInput.checked = Boolean(ownerMembership && device.principalId === ownerMembership.principalId);
+            deviceInput.disabled = Boolean(pendingMigration);
+            deviceLabel.appendChild(deviceInput);
+            deviceLabel.appendChild(document.createTextNode(" " + device.name + " (" + device.deviceId.slice(0, 8) + ")"));
+            ownerDevices.appendChild(deviceLabel);
+          }
+          migration.appendChild(ownerDevices);
+          const migrationConfirmLabel = document.createElement("label");
+          const migrationConfirm = document.createElement("input");
+          migrationConfirm.type = "checkbox";
+          migrationConfirm.className = "migration-confirm";
+          migrationConfirmLabel.appendChild(migrationConfirm);
+          migrationConfirmLabel.appendChild(document.createTextNode(pendingMigration
+            ? " I reviewed this locked grouping and want to retry the incomplete migration."
+            : " I reviewed every device and understand unselected devices become separate members."));
+          migration.appendChild(migrationConfirmLabel);
+          const migrationButton = document.createElement("button");
+          migrationButton.textContent = pendingMigration ? "Retry collaboration migration" : "Migrate collaboration identities";
+          migrationButton.dataset.collaborationMigrate = vault.vaultId;
+          migrationButton.disabled = true;
+          migration.appendChild(migrationButton);
+          const migrationStatus = document.createElement("p");
+          migrationStatus.className = "migration-status action-status";
+          migration.appendChild(migrationStatus);
+          card.appendChild(migration);
+        }
+
+        if (vault.state === "active" && ownerMembership && ownerMembership.state === "active") {
+          const recovery = document.createElement("section");
+          recovery.className = "collaboration-action owner-recovery-action";
+          const recoveryHeading = document.createElement("h3");
+          recoveryHeading.textContent = "Owner access recovery";
+          recovery.appendChild(recoveryHeading);
+          const recoveryDetail = document.createElement("p");
+          recoveryDetail.textContent = "Use only when the existing owner has lost access to every enrolled device. Recovery links a replacement device to that same person; it does not create a new owner.";
+          recovery.appendChild(recoveryDetail);
+          const recoveryConfirmLabel = document.createElement("label");
+          const recoveryConfirm = document.createElement("input");
+          recoveryConfirm.type = "checkbox";
+          recoveryConfirm.className = "owner-recovery-confirm";
+          recoveryConfirmLabel.appendChild(recoveryConfirm);
+          recoveryConfirmLabel.appendChild(document.createTextNode(" I confirm the owner cannot use any enrolled device."));
+          recovery.appendChild(recoveryConfirmLabel);
+          const recoveryButton = document.createElement("button");
+          recoveryButton.textContent = "Issue owner recovery code";
+          recoveryButton.dataset.ownerCode = vault.vaultId;
+          recoveryButton.dataset.ownerCodePurpose = "owner-recovery";
+          recoveryButton.disabled = true;
+          recovery.appendChild(recoveryButton);
+          const recoveryResult = document.createElement("div");
+          recoveryResult.className = "owner-code-result action-status";
+          recovery.appendChild(recoveryResult);
+          card.appendChild(recovery);
+        }
+
+        if (memberships.length === 0) {
+          const renameRow = document.createElement("div");
+          renameRow.className = "row";
+          const renameInput = document.createElement("input");
+          renameInput.className = "rename-input";
+          renameInput.value = vault.name;
+          renameInput.setAttribute("aria-label", "Vault nickname");
+          const renameBtn = document.createElement("button");
+          renameBtn.textContent = "Rename";
+          renameBtn.dataset.rename = vault.vaultId;
+          renameRow.appendChild(renameInput);
+          renameRow.appendChild(renameBtn);
+          card.appendChild(renameRow);
+        }
 
         const list = document.createElement("ul");
-        const devices = (data.devices || []).filter((d) => d.vaultId === vault.vaultId);
         if (devices.length === 0) {
           const empty = document.createElement("li");
           empty.textContent = "No devices enrolled yet.";
@@ -923,76 +1167,97 @@ export function renderOperatorConsole(options: OperatorPageOptions): string {
               item.appendChild(document.createTextNode(" last seen " + formatWhen(d.lastSeenAt)));
             }
             item.appendChild(document.createTextNode(" "));
-            const kickBtn = document.createElement("button");
-            kickBtn.textContent = "Kick";
-            kickBtn.dataset.kick = d.deviceId;
-            item.appendChild(kickBtn);
+            if (!d.principalId) {
+              const kickBtn = document.createElement("button");
+              kickBtn.textContent = "Kick";
+              kickBtn.dataset.kick = d.deviceId;
+              item.appendChild(kickBtn);
+            }
             list.appendChild(item);
           }
         }
         card.appendChild(list);
 
-        const codesHeading = document.createElement("p");
-        codesHeading.textContent = "Unused pairing codes";
-        card.appendChild(codesHeading);
-        const codeList = document.createElement("ul");
-        const codes = (data.pairingCodes || []).filter((c) => c.vaultId === vault.vaultId);
-        if (codes.length === 0) {
-          const emptyCode = document.createElement("li");
-          emptyCode.textContent = "None.";
-          codeList.appendChild(emptyCode);
-        } else {
-          for (const c of codes) {
-            const item = document.createElement("li");
-            const purposeLabel = c.purpose === "invite" ? "Invite" : "Add-device";
-            const expiry = formatWhen(c.exp) || "unknown";
-            item.appendChild(document.createTextNode(purposeLabel + " · expires " + expiry + " "));
-            if (c.codeId) {
-              const revokeBtn = document.createElement("button");
-              revokeBtn.textContent = "Revoke";
-              revokeBtn.dataset.revoke = c.codeId;
-              item.appendChild(revokeBtn);
-            }
-            codeList.appendChild(item);
-          }
+        if (memberships.length > 0) {
+          const collaborationHint = document.createElement("p");
+          collaborationHint.textContent = "Vault membership and personal device links are managed by enrolled participants in YAOS Settings. The operator can only bootstrap or recover the owner.";
+          card.appendChild(collaborationHint);
         }
-        card.appendChild(codeList);
 
-        const row = document.createElement("div");
-        row.className = "row";
-        const addDevice = document.createElement("button");
-        addDevice.textContent = "Add my device";
-        addDevice.dataset.pair = vault.vaultId;
-        addDevice.dataset.purpose = "device";
-        const invite = document.createElement("button");
-        invite.textContent = "Invite to this vault";
-        invite.dataset.pair = vault.vaultId;
-        invite.dataset.purpose = "invite";
-        row.appendChild(addDevice);
-        row.appendChild(invite);
-        card.appendChild(row);
+        if (vault.state === "active" && memberships.length === 0 && !needsMigration) {
+          const codesHeading = document.createElement("p");
+          codesHeading.textContent = "Unused legacy pairing codes";
+          card.appendChild(codesHeading);
+          const codeList = document.createElement("ul");
+          const codes = (data.pairingCodes || []).filter((c) => c.vaultId === vault.vaultId);
+          if (codes.length === 0) {
+            const emptyCode = document.createElement("li");
+            emptyCode.textContent = "None.";
+            codeList.appendChild(emptyCode);
+          } else {
+            for (const c of codes) {
+              const item = document.createElement("li");
+              const purposeLabel = c.purpose === "invite" ? "Invite" : "Add-device";
+              const expiry = formatWhen(c.exp) || "unknown";
+              item.appendChild(document.createTextNode(purposeLabel + " · expires " + expiry + " "));
+              if (c.codeId) {
+                const revokeBtn = document.createElement("button");
+                revokeBtn.textContent = "Revoke";
+                revokeBtn.dataset.revoke = c.codeId;
+                item.appendChild(revokeBtn);
+              }
+              codeList.appendChild(item);
+            }
+          }
+          card.appendChild(codeList);
 
-        const pairSlot = document.createElement("p");
-        pairSlot.className = "pair";
-        card.appendChild(pairSlot);
+        }
 
-        const destroyHint = document.createElement("p");
-        destroyHint.className = "danger";
-        destroyHint.textContent = "Type the nickname to enable Destroy. This deletes the room, not just the listing.";
-        card.appendChild(destroyHint);
-        const destroyRow = document.createElement("div");
-        destroyRow.className = "row";
-        const destroyInput = document.createElement("input");
-        destroyInput.className = "destroy-confirm";
-        destroyInput.setAttribute("aria-label", "Type vault nickname to destroy");
-        destroyInput.placeholder = "Type " + vault.name + " to destroy";
-        const destroyBtn = document.createElement("button");
-        destroyBtn.textContent = "Destroy";
-        destroyBtn.dataset.destroy = vault.vaultId;
-        destroyBtn.disabled = true;
-        destroyRow.appendChild(destroyInput);
-        destroyRow.appendChild(destroyBtn);
-        card.appendChild(destroyRow);
+        const ownerDestroyRequest = (data.vaultGovernanceRequests || []).find((request) =>
+          request.vaultId === vault.vaultId
+          && request.kind !== "vault-rename"
+          && (request.state === "awaiting-operator-confirmation" || request.state === "confirmed"));
+        if (ownerDestroyRequest) {
+          const destroyHint = document.createElement("p");
+          destroyHint.className = "danger";
+          destroyHint.textContent = ownerDestroyRequest.kind === "vault-destroy"
+            ? "The vault owner requested permanent destruction. Type the nickname to independently confirm the purge."
+            : "An audited emergency destruction override is prepared. Type the nickname to execute the purge.";
+          card.appendChild(destroyHint);
+          const destroyRow = document.createElement("div");
+          destroyRow.className = "row";
+          const destroyInput = document.createElement("input");
+          destroyInput.className = "destroy-confirm";
+          destroyInput.setAttribute("aria-label", "Type vault nickname to confirm owner destruction request");
+          destroyInput.placeholder = "Type " + vault.name + " to confirm";
+          const destroyBtn = document.createElement("button");
+          destroyBtn.textContent = "Confirm owner request";
+          destroyBtn.dataset.destroy = vault.vaultId;
+          destroyBtn.dataset.governanceRequestId = ownerDestroyRequest.governanceRequestId;
+          destroyBtn.disabled = true;
+          destroyRow.appendChild(destroyInput);
+          destroyRow.appendChild(destroyBtn);
+          card.appendChild(destroyRow);
+        } else {
+          const emergency = document.createElement("section");
+          emergency.className = "collaboration-action";
+          const emergencyHeading = document.createElement("h3");
+          emergencyHeading.textContent = "Emergency destruction repair";
+          emergency.appendChild(emergencyHeading);
+          const emergencyDetail = document.createElement("p");
+          emergencyDetail.textContent = "No owner request is pending. This explicit override is only for an unrecoverable vault; its reason is durably recorded.";
+          emergency.appendChild(emergencyDetail);
+          const emergencyReason = document.createElement("input");
+          emergencyReason.className = "emergency-destroy-reason";
+          emergencyReason.placeholder = "Required repair reason";
+          emergencyReason.maxLength = 512;
+          emergency.appendChild(emergencyReason);
+          const emergencyBtn = document.createElement("button");
+          emergencyBtn.textContent = "Emergency destroy";
+          emergencyBtn.dataset.emergencyDestroy = vault.vaultId;
+          emergency.appendChild(emergencyBtn);
+          card.appendChild(emergency);
+        }
 
         rendered.appendChild(card);
       }
@@ -1063,7 +1328,34 @@ export function renderOperatorConsole(options: OperatorPageOptions): string {
         const retryBtn = document.createElement("button");
         retryBtn.textContent = "Retry cleanup";
         retryBtn.dataset.retryDestroy = pending.vaultId;
+        const executingGovernance = (data.vaultGovernanceRequests || []).find((request) =>
+          request.vaultId === pending.vaultId && request.state === "executing");
+        if (executingGovernance) retryBtn.dataset.governanceRequestId = executingGovernance.governanceRequestId;
+        else retryBtn.disabled = true;
         card.appendChild(retryBtn);
+        rendered.appendChild(card);
+      }
+      for (const change of (data.authorizationChanges || []).filter((record) =>
+        record.state !== "complete" && record.kind !== "authority-install")) {
+        const card = document.createElement("div");
+        card.className = "card";
+        const heading = document.createElement("h2");
+        heading.textContent = "Authorization fence repair";
+        card.appendChild(heading);
+        const detail = document.createElement("p");
+        detail.textContent = change.kind + " · " + change.state + " · " + change.changeId;
+        card.appendChild(detail);
+        if (change.lastError) {
+          const error = document.createElement("p");
+          error.className = "err";
+          error.textContent = change.lastError;
+          card.appendChild(error);
+        }
+        const retry = document.createElement("button");
+        retry.textContent = "Retry authority fence";
+        retry.dataset.retryAuthorization = change.changeId;
+        retry.dataset.vaultId = change.vaultId;
+        card.appendChild(retry);
         rendered.appendChild(card);
       }
       root.replaceChildren(rendered);
@@ -1072,21 +1364,26 @@ export function renderOperatorConsole(options: OperatorPageOptions): string {
     }
     createVault.addEventListener("click", async () => {
       const name = document.getElementById("vault-name").value.trim();
-      const res = await fetch("/operator/vaults", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name }) });
-      const created = await res.json().catch(() => null);
-      if (!res.ok) { status.textContent = "Could not create vault."; return; }
-      const vaultId = created && created.vault && created.vault.vaultId;
-      let pairData = null;
-      if (vaultId) {
-        const pairRes = await fetch("/operator/pairing-codes", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ vaultId, purpose: "device" }) });
-        pairData = await pairRes.json().catch(() => null);
-        if (!pairRes.ok) pairData = null;
+      createVault.disabled = true;
+      status.textContent = "Creating and provisioning vault…";
+      let res;
+      try {
+        res = await fetch("/operator/vaults", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name }) });
+      } catch {
+        status.textContent = "Could not reach the server to create the vault. Reload to inspect whether provisioning started.";
+        createVault.disabled = false;
+        return;
       }
+      const created = await res.json().catch(() => null);
+      if (!res.ok) { status.textContent = actionError(created, "Could not create vault."); createVault.disabled = false; return; }
+      const vaultId = created && created.vault && created.vault.vaultId;
       await load();
       if (vaultId) {
         const card = Array.from(document.querySelectorAll("#vaults .card")).find((c) => c.dataset.vaultId === vaultId);
-        const slot = card && card.querySelector(".pair");
-        if (slot) showPairing(slot, "device", pairData, true);
+        const button = card && card.querySelector('[data-owner-code-purpose="owner-bootstrap"]');
+        const slot = card && card.querySelector(".owner-code-result");
+        if (button && slot) await requestOwnerCode(vaultId, "owner-bootstrap", button, slot);
+        else status.textContent = "Vault created. Review its provisioning state below.";
       }
     });
     document.getElementById("save-update").addEventListener("click", async () => {
@@ -1112,22 +1409,94 @@ export function renderOperatorConsole(options: OperatorPageOptions): string {
     });
     document.getElementById("vaults").addEventListener("input", (event) => {
       const input = event.target;
-      if (!input || !input.classList || !input.classList.contains("destroy-confirm")) return;
+      if (!input || !input.classList) return;
       const card = input.closest(".card");
-      const btn = card && card.querySelector("[data-destroy]");
-      if (btn) btn.disabled = input.value !== (card.dataset.vaultName || "");
+      if (input.classList.contains("destroy-confirm")) {
+        const btn = card && card.querySelector("[data-destroy]");
+        if (btn) btn.disabled = input.value !== (card.dataset.vaultName || "");
+      }
+      if (input.classList.contains("owner-recovery-confirm")) {
+        const btn = card && card.querySelector('[data-owner-code-purpose="owner-recovery"]');
+        if (btn && btn.dataset.pending !== "true") btn.disabled = !input.checked;
+      }
+      if (input.classList.contains("owner-display-name")
+        || input.classList.contains("migration-owner-device")
+        || input.classList.contains("migration-confirm")) updateMigrationButton(card);
     });
     document.getElementById("vaults").addEventListener("click", async (event) => {
       const target = event.target;
       if (!target || !target.getAttribute) return;
       const kick = target.getAttribute("data-kick");
-      const pair = target.getAttribute("data-pair");
       const rename = target.getAttribute("data-rename");
       const destroy = target.getAttribute("data-destroy");
+      const emergencyDestroy = target.getAttribute("data-emergency-destroy");
       const retryDestroy = target.getAttribute("data-retry-destroy");
+      const retryAuthorization = target.getAttribute("data-retry-authorization");
       const retryProvision = target.getAttribute("data-retry-provision");
       const revoke = target.getAttribute("data-revoke");
       const retryRevocation = target.getAttribute("data-retry-revocation");
+      const ownerCode = target.getAttribute("data-owner-code");
+      const ownerCodePurpose = target.getAttribute("data-owner-code-purpose");
+      const collaborationMigrate = target.getAttribute("data-collaboration-migrate");
+      if (ownerCode && ownerCodePurpose) {
+        const card = target.closest(".card");
+        const slot = target.closest(".collaboration-action").querySelector(".owner-code-result");
+        if (ownerCodePurpose === "owner-recovery") {
+          const confirmation = card && card.querySelector(".owner-recovery-confirm");
+          if (!confirmation || !confirmation.checked) return;
+        }
+        await requestOwnerCode(ownerCode, ownerCodePurpose, target, slot);
+        return;
+      }
+      if (collaborationMigrate) {
+        const card = target.closest(".card");
+        const action = target.closest(".migration-action");
+        const migrationStatus = action && action.querySelector(".migration-status");
+        const ownerDisplayNameInput = action && action.querySelector(".owner-display-name");
+        const confirmation = action && action.querySelector(".migration-confirm");
+        const ownerDeviceIds = action
+          ? Array.from(action.querySelectorAll(".migration-owner-device:checked")).map((input) => input.value)
+          : [];
+        const ownerDisplayName = ownerDisplayNameInput ? ownerDisplayNameInput.value.trim() : "";
+        if (!migrationStatus || !confirmation || !confirmation.checked || !ownerDisplayName || ownerDeviceIds.length === 0) return;
+        target.disabled = true;
+        target.dataset.pending = "true";
+        for (const input of action.querySelectorAll("input")) input.disabled = true;
+        migrationStatus.classList.remove("err");
+        migrationStatus.textContent = "Installing collaboration identities and vault authority. Do not repeat this action…";
+        let migrationResponse;
+        try {
+          migrationResponse = await fetch("/operator/vaults/" + encodeURIComponent(collaborationMigrate) + "/collaboration-migrate", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ ownerDeviceIds, ownerDisplayName }),
+          });
+        } catch {
+          status.textContent = "The migration response was lost. Its durable state is shown below; confirm and retry only if it is marked incomplete.";
+          await load(true);
+          return;
+        }
+        const migrationData = await migrationResponse.json().catch(() => null);
+        if (!migrationResponse.ok) {
+          if (migrationData && migrationData.repairable) {
+            status.textContent = actionError(migrationData,
+              "Migration did not finish, but its prepared authority change is repairable. Review the locked grouping below and retry it.");
+            await load(true);
+            return;
+          }
+          migrationStatus.classList.add("err");
+          migrationStatus.textContent = actionError(migrationData, "Could not migrate collaboration identities.");
+          target.dataset.pending = "false";
+          for (const input of action.querySelectorAll("input")) {
+            input.disabled = action.dataset.locked === "true" && !input.classList.contains("migration-confirm");
+          }
+          updateMigrationButton(card);
+          return;
+        }
+        status.textContent = "Collaboration migration completed. Historical work remains unattributed; every device now belongs to a person.";
+        await load(true);
+        return;
+      }
       if (retryRevocation) {
         const res = await fetch("/operator/devices/" + encodeURIComponent(retryRevocation), { method: "DELETE" });
         status.textContent = res.status === 202
@@ -1144,7 +1513,17 @@ export function renderOperatorConsole(options: OperatorPageOptions): string {
         return;
       }
       if (retryDestroy) {
-        await requestVaultDestroy(retryDestroy);
+        const governanceRequestId = target.getAttribute("data-governance-request-id");
+        if (governanceRequestId) await requestVaultDestroy(retryDestroy, governanceRequestId);
+        return;
+      }
+      if (retryAuthorization) {
+        const vaultId = target.getAttribute("data-vault-id");
+        if (!vaultId) return;
+        const res = await fetch("/operator/vaults/" + encodeURIComponent(vaultId)
+          + "/authorization-changes/" + encodeURIComponent(retryAuthorization) + "/retry", { method: "POST" });
+        status.textContent = res.status === 202 ? "Authorization fence is still pending." : res.ok ? "Authorization fence completed." : "Could not retry authorization fence.";
+        await load(true);
         return;
       }
       if (kick) {
@@ -1174,7 +1553,17 @@ export function renderOperatorConsole(options: OperatorPageOptions): string {
         const input = card && card.querySelector(".destroy-confirm");
         const expected = card ? (card.dataset.vaultName || "") : "";
         if (!input || input.value !== expected) return;
-        await requestVaultDestroy(destroy);
+        const governanceRequestId = target.getAttribute("data-governance-request-id");
+        if (!governanceRequestId) return;
+        await requestVaultDestroy(destroy, governanceRequestId);
+        return;
+      }
+      if (emergencyDestroy) {
+        const card = target.closest(".card");
+        const reasonInput = card && card.querySelector(".emergency-destroy-reason");
+        const reason = reasonInput ? reasonInput.value.trim() : "";
+        if (reason.length < 8) { status.textContent = "Enter a specific emergency repair reason (at least 8 characters)."; return; }
+        await requestEmergencyVaultDestroy(emergencyDestroy, reason);
         return;
       }
       if (revoke) {
@@ -1183,13 +1572,6 @@ export function renderOperatorConsole(options: OperatorPageOptions): string {
         status.textContent = "";
         await load();
         return;
-      }
-      if (pair) {
-        const purpose = target.getAttribute("data-purpose") || "device";
-        const res = await fetch("/operator/pairing-codes", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ vaultId: pair, purpose }) });
-        const data = await res.json().catch(() => null);
-        const slot = target.closest(".card").querySelector(".pair");
-        showPairing(slot, purpose, res.ok ? data : null);
       }
     });
     load();

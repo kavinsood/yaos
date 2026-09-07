@@ -5,6 +5,7 @@ import { invalidateStoredServerConfigCache } from "../../server/src/routes/auth"
 import { handleOperatorVaultRuntimeRoute } from "../../server/src/routes/vault";
 import { makeConfigNamespace, makeEnv, makeVaultSyncNamespace } from "../mocks/workerEnv.ts";
 import { suite } from "../harness.ts";
+import { COLLABORATION_POLICY_VERSION, capabilityDigestForRole } from "../../server/src/collaboration";
 
 const s = suite("settings-sync-route-authority");
 const VAULT_ID = "vault-settings-route-0001";
@@ -16,6 +17,7 @@ const DEVICE_ID = "settings-device-0001";
 s.test("settings route requires current vault membership and forwards only trusted authority", async () => {
 	invalidateStoredServerConfigCache();
 	const tokenHash = await hashSecret(DEVICE_TOKEN);
+	const capabilityDigest = await capabilityDigestForRole("member");
 	let revoked = false;
 	let authorizationCalls = 0;
 	const config = makeConfigNamespace(async (request) => {
@@ -23,7 +25,7 @@ s.test("settings route requires current vault membership and forwards only trust
 		if (url.pathname === "/__yaos/config") {
 			return Response.json({
 				claimed: true,
-				configFormat: 2,
+				configFormat: 3,
 				operatorRecoveryHash: "operator-settings-route-hash",
 				ticketSigningKey: "ticket-settings-route-key",
 				updateProvider: null,
@@ -31,15 +33,27 @@ s.test("settings route requires current vault membership and forwards only trust
 				updateRepoBranch: null,
 			});
 		}
-		if (url.pathname === "/__yaos/authorize-device") {
+		if (url.pathname === "/__yaos/collaboration/authorize") {
 			authorizationCalls++;
 			const body = await request.json() as { tokenHash?: string; vaultId?: string };
 			if (!revoked && body.tokenHash === tokenHash && body.vaultId === VAULT_ID) {
 				return Response.json({
 					device: { deviceId: DEVICE_ID, vaultId: VAULT_ID, name: "Laptop", enrolledAt: 1 },
+					principal: { principalId: "principal-settings-route-0001", vaultId: VAULT_ID },
+					membership: { principalId: "principal-settings-route-0001", vaultId: VAULT_ID, role: "member", state: "active", revision: 1 },
+					actor: { vaultId: VAULT_ID, vaultGeneration: VAULT_GENERATION, principalId: "principal-settings-route-0001",
+						membershipRevision: 1, deviceId: DEVICE_ID, deviceCredentialRevision: 1, role: "member",
+						policyVersion: COLLABORATION_POLICY_VERSION, capabilityDigest },
 				});
 			}
 			return Response.json({ error: "unauthorized" }, { status: 401 });
+		}
+		if (url.pathname === "/__yaos/authorize-device") {
+			authorizationCalls++;
+			const body = await request.json() as { tokenHash?: string; vaultId?: string };
+			return !revoked && body.tokenHash === tokenHash && body.vaultId === VAULT_ID
+				? Response.json({ device: { deviceId: DEVICE_ID, vaultId: VAULT_ID, name: "Laptop", enrolledAt: 1 } })
+				: Response.json({ error: "unauthorized" }, { status: 401 });
 		}
 		if (url.pathname === "/__yaos/vault") {
 			assert.equal(url.searchParams.get("vaultId"), VAULT_ID);
@@ -97,6 +111,7 @@ s.test("settings route requires current vault membership and forwards only trust
 	assert.equal(forwarded[0]!.headers.get("x-yaos-vault-id"), VAULT_ID);
 	assert.equal(forwarded[0]!.headers.get("x-yaos-vault-generation"), VAULT_GENERATION);
 	assert.equal(forwarded[0]!.headers.get("x-yaos-device-id"), DEVICE_ID);
+	assert.equal(forwarded[0]!.headers.get("x-yaos-principal-id"), "principal-settings-route-0001");
 	assert.equal(forwarded[0]!.headers.get("authorization"), null, "bearer secret is not forwarded to the runtime");
 	invalidateStoredServerConfigCache();
 });

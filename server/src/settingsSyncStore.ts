@@ -86,6 +86,12 @@ export type SettingsSyncError = { ok: false; status: number; error: string };
 export type SettingsSyncOk<T> = { ok: true; value: T };
 export type SettingsSyncResult<T> = SettingsSyncOk<T> | SettingsSyncError;
 type MutationOk = { envRev: number; rev: number };
+export interface SettingsMutationActor {
+	principalId: string;
+	membershipRevision: number;
+	deviceId: string;
+	deviceCredentialRevision: number;
+}
 type ParsedIntent = { id: string; repo: string; version: string; enabled: boolean };
 type ParsedTheme = { name: string; repo: string; version: string };
 type ParsedFile = { path: string; sha256: string; body: Uint8Array };
@@ -162,6 +168,22 @@ function requireConfigKey(key: string): string {
 	const result = sanitizeConfigKey(key);
 	if (result === null) throw new StoreAbort(400, "invalid_config_key");
 	return result;
+}
+
+function requireStorageConfigKey(key: string): string {
+	if (!key.startsWith("\u0001")) return requireConfigKey(key);
+	const separator = key.indexOf("\0", 1);
+	if (separator < 0) throw new StoreAbort(400, "invalid_principal_identity");
+	const principalId = key.slice(1, separator);
+	const configKey = key.slice(separator + 1);
+	if (!principalId || principalId.length > MAX_SETTINGS_ID_LENGTH || principalId.includes("\0")) {
+		throw new StoreAbort(400, "invalid_principal_identity");
+	}
+	return `\u0001${principalId}\0${requireConfigKey(configKey)}`;
+}
+
+export function principalSettingsKey(principalId: string, configKey: string): string {
+	return requireStorageConfigKey(`\u0001${principalId}\0${configKey}`);
 }
 
 function pathHasTraversal(path: string): boolean {
@@ -354,6 +376,15 @@ export class SettingsSyncStore {
 			body BLOB NOT NULL,
 			PRIMARY KEY (config_key, plugin_id)
 		)`);
+		this.storage.sql.exec(`CREATE TABLE IF NOT EXISTS settings_mutation_attribution (
+			config_key TEXT NOT NULL,
+			env_rev INTEGER NOT NULL,
+			principal_id TEXT NOT NULL,
+			membership_revision INTEGER NOT NULL,
+			device_id TEXT NOT NULL,
+			device_credential_revision INTEGER NOT NULL,
+			PRIMARY KEY (config_key, env_rev)
+		)`);
 		this.initialized = true;
 	}
 
@@ -417,7 +448,7 @@ export class SettingsSyncStore {
 	getEnvironment(key: string): SettingsSyncResult<SettingsGetBody> {
 		return this.result(() => {
 			this.ensureSchema();
-			const configKey = requireConfigKey(key);
+			const configKey = requireStorageConfigKey(key);
 			const envRev = this.environmentRevision(configKey);
 			if (envRev === null) return { seeded: false as const };
 
@@ -487,23 +518,24 @@ export class SettingsSyncStore {
 		});
 	}
 
-	seed(key: string, snapshot: unknown): SettingsSyncResult<MutationOk> {
+	seed(key: string, snapshot: unknown, actor?: SettingsMutationActor): SettingsSyncResult<MutationOk> {
 		return this.result(() => {
-			const configKey = requireConfigKey(key);
+			const configKey = requireStorageConfigKey(key);
 			const parsed = parseSnapshot(snapshot);
 			this.ensureSchema();
 			return this.storage.transactionSync(() => {
 				if (this.environmentRevision(configKey) !== null) throw new StoreAbort(409, "already_seeded");
 				this.storage.sql.exec("INSERT INTO settings_env (config_key, env_rev) VALUES (?, ?)", configKey, 1);
 				this.replaceLiveRows(configKey, parsed, 1);
+				this.recordMutationActor(configKey, 1, actor);
 				return { envRev: 1, rev: 1 };
 			});
 		});
 	}
 
-	replace(key: string, snapshot: unknown): SettingsSyncResult<MutationOk> {
+	replace(key: string, snapshot: unknown, actor?: SettingsMutationActor): SettingsSyncResult<MutationOk> {
 		return this.result(() => {
-			const configKey = requireConfigKey(key);
+			const configKey = requireStorageConfigKey(key);
 			const parsed = parseSnapshot(snapshot);
 			this.ensureSchema();
 			return this.storage.transactionSync(() => {
@@ -533,14 +565,15 @@ export class SettingsSyncStore {
 					if (!liveThemes.has(row.name)) this.writeTombstone(configKey, "theme", row.name, rev);
 				}
 				this.replaceLiveRows(configKey, parsed, rev);
+				this.recordMutationActor(configKey, rev, actor);
 				return { envRev: rev, rev };
 			});
 		});
 	}
 
-	putFile(key: string, path: unknown, sha256: unknown, bodyBase64: unknown): SettingsSyncResult<MutationOk> {
+	putFile(key: string, path: unknown, sha256: unknown, bodyBase64: unknown, actor?: SettingsMutationActor): SettingsSyncResult<MutationOk> {
 		return this.result(() => {
-			const configKey = requireConfigKey(key);
+			const configKey = requireStorageConfigKey(key);
 			const file = parseFile({ path, sha256, bodyBase64 });
 			this.ensureSchema();
 			return this.storage.transactionSync(() => {
@@ -555,41 +588,44 @@ export class SettingsSyncStore {
 				}
 				const rev = this.nextRevision(configKey);
 				this.upsertFile(configKey, file, rev);
+				this.recordMutationActor(configKey, rev, actor);
 				return { envRev: rev, rev };
 			});
 		});
 	}
 
-	deleteFile(key: string, path: unknown): SettingsSyncResult<MutationOk> {
+	deleteFile(key: string, path: unknown, actor?: SettingsMutationActor): SettingsSyncResult<MutationOk> {
 		return this.result(() => {
-			const configKey = requireConfigKey(key);
+			const configKey = requireStorageConfigKey(key);
 			if (typeof path !== "string" || !isAllowlistedSettingsFile(path)) throw new StoreAbort(400, "path_not_allowed");
 			this.ensureSchema();
 			return this.storage.transactionSync(() => {
 				const rev = this.nextRevision(configKey);
 				this.storage.sql.exec("DELETE FROM settings_files WHERE config_key = ? AND path = ?", configKey, path);
+				this.recordMutationActor(configKey, rev, actor);
 				return { envRev: rev, rev };
 			});
 		});
 	}
 
-	putIntent(key: string, value: unknown): SettingsSyncResult<MutationOk> {
+	putIntent(key: string, value: unknown, actor?: SettingsMutationActor): SettingsSyncResult<MutationOk> {
 		return this.result(() => {
-			const configKey = requireConfigKey(key);
+			const configKey = requireStorageConfigKey(key);
 			const intent = parseIntent(value);
 			this.ensureSchema();
 			return this.storage.transactionSync(() => {
 				this.assertUniqueCapacity("settings_intents", "id", configKey, intent.id, MAX_SETTINGS_INTENTS);
 				const rev = this.nextRevision(configKey);
 				this.upsertIntent(configKey, intent, rev);
+				this.recordMutationActor(configKey, rev, actor);
 				return { envRev: rev, rev };
 			});
 		});
 	}
 
-	putTombstone(key: string, value: unknown): SettingsSyncResult<MutationOk> {
+	putTombstone(key: string, value: unknown, actor?: SettingsMutationActor): SettingsSyncResult<MutationOk> {
 		return this.result(() => {
-			const configKey = requireConfigKey(key);
+			const configKey = requireStorageConfigKey(key);
 			const input = record(value);
 			exactKeys(input, ["kind", "id"]);
 			if (input.kind !== "plugin" && input.kind !== "theme") throw new StoreAbort(400, "invalid_json");
@@ -607,14 +643,15 @@ export class SettingsSyncStore {
 					&& !existing.some((row) => `${row.kind}\0${row.id}` === identity)) throw new StoreAbort(413, "too_many_entries");
 				const rev = this.nextRevision(configKey);
 				this.writeTombstone(configKey, kind, id, rev);
+				this.recordMutationActor(configKey, rev, actor);
 				return { envRev: rev, rev };
 			});
 		});
 	}
 
-	putPluginData(key: string, value: unknown): SettingsSyncResult<MutationOk> {
+	putPluginData(key: string, value: unknown, actor?: SettingsMutationActor): SettingsSyncResult<MutationOk> {
 		return this.result(() => {
-			const configKey = requireConfigKey(key);
+			const configKey = requireStorageConfigKey(key);
 			const entry = parsePluginData(value);
 			this.ensureSchema();
 			return this.storage.transactionSync(() => {
@@ -630,6 +667,7 @@ export class SettingsSyncStore {
 				}
 				const rev = this.nextRevision(configKey);
 				this.upsertPluginData(configKey, entry, rev);
+				this.recordMutationActor(configKey, rev, actor);
 				return { envRev: rev, rev };
 			});
 		});
@@ -639,6 +677,14 @@ export class SettingsSyncStore {
 		if (!safeRevision(current)) throw new StoreAbort(500, "settings_corrupt");
 		if (current === Number.MAX_SAFE_INTEGER) throw new StoreAbort(409, "revision_exhausted");
 		return current + 1;
+	}
+
+	private recordMutationActor(configKey: string, envRevision: number, actor?: SettingsMutationActor): void {
+		if (!actor) return;
+		this.storage.sql.exec(`INSERT INTO settings_mutation_attribution(
+		 config_key, env_rev, principal_id, membership_revision, device_id, device_credential_revision
+		) VALUES (?, ?, ?, ?, ?, ?)`, configKey, envRevision, actor.principalId,
+			actor.membershipRevision, actor.deviceId, actor.deviceCredentialRevision);
 	}
 
 	private assertPluginDataGate(configKey: string, pluginId: string, pluginVersion: string): void {
@@ -791,7 +837,11 @@ export async function handleSettingsSyncRequest(
 	request: Request,
 	configKey: string,
 	action?: string,
+	principalId?: string,
+	validateMutationAuthority?: () => boolean,
+	actor?: SettingsMutationActor,
 ): Promise<Response> {
+	const storageKey = principalId === undefined ? configKey : principalSettingsKey(principalId, configKey);
 	const formatDeclarations = new URL(request.url).searchParams.getAll("settingsFormatVersion");
 	if (formatDeclarations.length !== 1 || formatDeclarations[0] !== String(SETTINGS_FORMAT_VERSION)) {
 		return Response.json({
@@ -801,11 +851,11 @@ export async function handleSettingsSyncRequest(
 			serverSettingsFormatVersion: SETTINGS_FORMAT_VERSION,
 		}, { status: 426, headers: { "cache-control": "no-store" } });
 	}
-	if (request.method === "GET" && action === undefined) return boundedGetResponse(store.getEnvironment(configKey));
+	if (request.method === "GET" && action === undefined) return boundedGetResponse(store.getEnvironment(storageKey));
 	if (request.method === "DELETE" && action === "file") {
 		const path = new URL(request.url).searchParams.get("path");
 		if (path === null) return errorResponse("invalid_json", 400);
-		return mutationResponse(store.deleteFile(configKey, path));
+		return mutationResponse(store.deleteFile(storageKey, path, actor));
 	}
 	const snapshotMutation = request.method === "PUT" && (action === "seed" || action === "replace");
 	const itemMutation = request.method === "PUT" && (action === "file" || action === "intent"
@@ -817,10 +867,11 @@ export async function handleSettingsSyncRequest(
 	);
 	if (!body.ok) return errorResponse(body.error, body.status);
 	if (!await requestBodyHashesMatch(action, body.value)) return errorResponse("hash_mismatch", 400);
-	if (action === "seed") return mutationResponse(store.seed(configKey, body.value));
-	if (action === "replace") return mutationResponse(store.replace(configKey, body.value));
-	if (action === "file") return mutationResponse(store.putFile(configKey, body.value.path, body.value.sha256, body.value.bodyBase64));
-	if (action === "intent") return mutationResponse(store.putIntent(configKey, body.value));
-	if (action === "tombstone") return mutationResponse(store.putTombstone(configKey, body.value));
-	return mutationResponse(store.putPluginData(configKey, body.value));
+	if (validateMutationAuthority && !validateMutationAuthority()) return errorResponse("authority_superseded", 409);
+	if (action === "seed") return mutationResponse(store.seed(storageKey, body.value, actor));
+	if (action === "replace") return mutationResponse(store.replace(storageKey, body.value, actor));
+	if (action === "file") return mutationResponse(store.putFile(storageKey, body.value.path, body.value.sha256, body.value.bodyBase64, actor));
+	if (action === "intent") return mutationResponse(store.putIntent(storageKey, body.value, actor));
+	if (action === "tombstone") return mutationResponse(store.putTombstone(storageKey, body.value, actor));
+	return mutationResponse(store.putPluginData(storageKey, body.value, actor));
 }

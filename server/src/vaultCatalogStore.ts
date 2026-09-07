@@ -259,6 +259,17 @@ export abstract class VaultCatalogStore extends VaultDocumentStore {
 		let rowsWritten = 0;
 		for (const cursor of [
 			this.storage.sql.exec(
+				"DELETE FROM vault_operation_outcomes WHERE expires_at <= ?",
+				now,
+			),
+			this.storage.sql.exec(
+				`DELETE FROM vault_operation_outcomes WHERE rowid IN (
+				   SELECT rowid FROM vault_operation_outcomes
+				   ORDER BY committed_at DESC, rowid DESC LIMIT -1 OFFSET ?
+				 )`,
+				MAX_CANDIDATE_RECEIPTS_GLOBAL - 1,
+			),
+			this.storage.sql.exec(
 				"DELETE FROM vault_candidate_receipts WHERE created_at <= ?",
 				now - CANDIDATE_RECEIPT_TTL_MS,
 			),

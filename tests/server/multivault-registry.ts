@@ -64,7 +64,7 @@ s.section("claim is one-shot and old claimed formats stay unsupported");
 		vaultId: "vault-claim-aa",
 		vaultName: "Personal",
 		pairingCodeHash: "p".repeat(64),
-		pairingPurpose: "device",
+		pairingPurpose: "origin",
 	};
 	const first = await config.fetch(jsonRequest("/__yaos/claim", claimBody));
 	const activated = await activateClaim(config, first);
@@ -117,15 +117,9 @@ s.section("enroll uniquifies names on one vault");
 		vaultName: "Work",
 		pairingCodeHash: "a".repeat(64),
 		pairingExp: Date.now() + 60_000,
-		pairingPurpose: "device",
+		pairingPurpose: "origin",
 	}));
-	s.check((await activateClaim(config, claimed, "a".repeat(64))).status === 200, "enrollment vault activates");
-	await config.fetch(jsonRequest("/__yaos/create-pairing-code", {
-		vaultId: "vault-one-aa",
-		codeHash: "b".repeat(64),
-		exp: Date.now() + 60_000,
-		purpose: "device",
-	}));
+	s.check((await activateClaim(config, claimed, "a".repeat(64), "origin")).status === 200, "enrollment vault activates");
 	const first = await config.fetch(jsonRequest("/__yaos/enroll", {
 		enrollmentRequestId: "request-vault-one-aa",
 		pairingCodeHash: "a".repeat(64),
@@ -133,9 +127,17 @@ s.section("enroll uniquifies names on one vault");
 		deviceTokenHash: "1".repeat(64),
 		deviceName: "Mac",
 	}));
-	const firstBody = await first.json() as { deviceName?: string };
+	const firstBody = await first.json() as { deviceName?: string; principalId: string; deviceId: string; change: { changeId: string; vaultId: string; vaultGeneration: string } };
 	s.check(first.ok, "first enroll ok");
 	s.check(firstBody.deviceName === "Mac", "first enroll keeps Mac");
+	await config.fetch(jsonRequest("/__yaos/collaboration/complete-change", firstBody.change));
+	await config.fetch(jsonRequest("/__yaos/collaboration/create-code", {
+		vaultId: "vault-one-aa",
+		principalId: firstBody.principalId,
+		deviceId: firstBody.deviceId,
+		purpose: "device-link",
+		codeHash: "b".repeat(64),
+	}));
 
 	const second = await config.fetch(jsonRequest("/__yaos/enroll", {
 		enrollmentRequestId: "request-vault-two-aa",
@@ -158,17 +160,31 @@ s.section("destroy revokes first, persists bounded retry state, and completes on
 		vaultId: "vault-gone-1",
 		vaultName: "Temp",
 		pairingCodeHash: "c".repeat(64),
-		pairingPurpose: "device",
+		pairingPurpose: "origin",
 	}));
-	s.check((await activateClaim(config, claimed, "c".repeat(64))).status === 200, "destroy target activates before enrollment");
-	await config.fetch(jsonRequest("/__yaos/enroll", {
+	s.check((await activateClaim(config, claimed, "c".repeat(64), "origin")).status === 200, "destroy target activates before enrollment");
+	const ownerEnrollment = await config.fetch(jsonRequest("/__yaos/enroll", {
 		enrollmentRequestId: "request-vault-gone-aa",
 		pairingCodeHash: "c".repeat(64),
 		deviceId: "dev-gone",
 		deviceTokenHash: "3".repeat(64),
 		deviceName: "Phone",
 	}));
-	const destroyed = await config.fetch(jsonRequest("/__yaos/destroy-vault", { vaultId: "vault-gone-1" }));
+	const owner = await ownerEnrollment.json() as { principalId: string; deviceId: string; change: { changeId: string; vaultId: string; vaultGeneration: string } };
+	await config.fetch(jsonRequest("/__yaos/collaboration/complete-change", owner.change));
+	const requestedDestroy = await config.fetch(jsonRequest("/__yaos/collaboration/request-destroy", {
+		vaultId: "vault-gone-1",
+		principalId: owner.principalId,
+		deviceId: owner.deviceId,
+		requestId: "request-destroy-vault-gone-1",
+	}));
+	const destroyRequest = await requestedDestroy.json() as { governanceRequest: { governanceRequestId: string } };
+	await config.fetch(jsonRequest("/__yaos/collaboration/operator-confirm-destroy", {
+		vaultId: "vault-gone-1",
+		governanceRequestId: destroyRequest.governanceRequest.governanceRequestId,
+	}));
+	const governanceRequestId = destroyRequest.governanceRequest.governanceRequestId;
+	const destroyed = await config.fetch(jsonRequest("/__yaos/destroy-vault", { vaultId: "vault-gone-1", governanceRequestId }));
 	const destroyedBody = await destroyed.json() as {
 		pending: {
 			requestedAt: number;
@@ -209,7 +225,7 @@ s.section("destroy revokes first, persists bounded retry state, and completes on
 		"purge actor identity is generation-scoped",
 	);
 
-	const retry = await config.fetch(jsonRequest("/__yaos/destroy-vault", { vaultId: "vault-gone-1" }));
+	const retry = await config.fetch(jsonRequest("/__yaos/destroy-vault", { vaultId: "vault-gone-1", governanceRequestId }));
 	const retryBody = await retry.json() as { pending: { requestedAt: number } };
 	s.check(retry.status === 200, "pending destroy is idempotent");
 	s.check(retryBody.pending.requestedAt === destroyedBody.pending.requestedAt, "retry preserves original request time");
@@ -288,8 +304,8 @@ s.section("destroy revokes first, persists bounded retry state, and completes on
 	const finalConsole = await config.fetch(new Request("https://internal/__yaos/console"));
 	const finalBody = await finalConsole.json() as { pendingDestroys: unknown[] };
 	s.check(finalBody.pendingDestroys.length === 0, "completed cleanup record is removed");
-	const missing = await config.fetch(jsonRequest("/__yaos/destroy-vault", { vaultId: "vault-gone-1" }));
-	s.check(missing.status === 404, "completed destroy is no longer pending");
+	const missing = await config.fetch(jsonRequest("/__yaos/destroy-vault", { vaultId: "vault-gone-1", governanceRequestId }));
+	s.check(missing.status === 409, "completed destroy cannot be executed again without a new confirmed request");
 }
 s.section("pairing expiry is authoritative in config despite a skewed caller timestamp");
 {
@@ -299,13 +315,13 @@ s.section("pairing expiry is authoritative in config despite a skewed caller tim
 		ticketSigningKey: "key",
 		vaultId: "vault-exp-aa",
 		vaultName: "Expiry",
-		pairingCodeHash: "x".repeat(64),
+		pairingCodeHash: "a".repeat(64),
 		pairingExp: Number.MAX_SAFE_INTEGER,
 		pairingPurpose: "device",
 	}));
 	s.check(claimed.status === 200, "caller clock ahead no longer rejects claim");
 	const activationStarted = Date.now();
-	const activated = await activateClaim(config, claimed, "x".repeat(64));
+	const activated = await activateClaim(config, claimed, "a".repeat(64), "origin");
 	const activationFinished = Date.now();
 	const activationBody = await activated.json() as { pairingExp: number };
 	s.check(activated.status === 200, "claimed vault activates with its initial pairing code");
@@ -314,6 +330,15 @@ s.section("pairing expiry is authoritative in config despite a skewed caller tim
 			&& activationBody.pairingExp <= activationFinished + PAIRING_CODE_TTL_MS,
 		"activation expiry comes from config time and fixed TTL",
 	);
+	const ownerEnrollment = await config.fetch(jsonRequest("/__yaos/enroll", {
+		enrollmentRequestId: "request-expiry-owner",
+		pairingCodeHash: "a".repeat(64),
+		deviceId: "device-expiry-owner",
+		deviceTokenHash: "7".repeat(64),
+		deviceName: "Owner",
+	}));
+	const owner = await ownerEnrollment.json() as { change: { changeId: string; vaultId: string; vaultGeneration: string } };
+	await config.fetch(jsonRequest("/__yaos/collaboration/complete-change", owner.change));
 
 	const mintStarted = Date.now();
 	const minted = await config.fetch(jsonRequest("/__yaos/create-pairing-code", {
@@ -324,11 +349,11 @@ s.section("pairing expiry is authoritative in config despite a skewed caller tim
 	}));
 	const mintFinished = Date.now();
 	const mintBody = await minted.json() as { exp: number };
-	s.check(minted.status === 200, "caller clock ahead no longer rejects pairing mint");
+	s.check(minted.status === 200, "internal pairing mint accepts the control-plane request");
 	s.check(
 		mintBody.exp >= mintStarted + PAIRING_CODE_TTL_MS
 			&& mintBody.exp <= mintFinished + PAIRING_CODE_TTL_MS,
-		"mint expiry cannot be extended by the caller",
+		"internal pairing expiry cannot be extended by the caller",
 	);
 }
 
@@ -426,8 +451,8 @@ s.section("operator console clears stale actions before loading state");
 	s.check(page.includes("data-retry-provision"), "provisioning vault has an operator retry action");
 	s.check(page.includes('"/provision"'), "provisioning retry uses the operator-only route");
 	s.check(page.includes("lastError.textContent = pending.lastError"), "pending error is rendered as text");
-	s.check(page.includes("await requestVaultDestroy(retryDestroy)"), "retry uses the shared truthful destroy response handler");
-	s.check(page.includes("await requestVaultDestroy(destroy)"), "initial destroy uses the shared truthful destroy response handler");
+	s.check(page.includes("await requestVaultDestroy(retryDestroy, governanceRequestId)"), "retry preserves the confirmed governance request through the shared truthful destroy handler");
+	s.check(page.includes("await requestVaultDestroy(destroy, governanceRequestId)"), "initial destroy confirms the exact owner governance request through the shared truthful destroy handler");
 	s.check(page.includes("responseStatus >= 500"), "all 5xx destroy responses use the server failure status");
 	s.check(!page.includes('res.status === 200 ? "" :'), "destroy errors are not conflated with pending cleanup");
 	s.check(!page.includes("innerHTML"), "operator console does not inject pending values as HTML");
@@ -458,7 +483,8 @@ s.section("rename-vault and revoke-pairing");
 		exp: Date.now() + 60_000,
 		purpose: "invite",
 	}));
-	s.check(minted.ok, "pairing minted");
+	const mintedBody = await minted.json() as { error?: string };
+	s.check(minted.status === 409 && mintedBody.error === "vault_not_active", "operator pairing mint cannot bypass the awaiting-owner state");
 	const listed = await config.fetch(new Request("https://internal/__yaos/console"));
 	const listedBody = await listed.json() as {
 		vaults: Array<{ name: string }>;

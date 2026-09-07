@@ -15,6 +15,7 @@ import type {
 } from "./vaultStore";
 import type { VaultDocumentCache } from "./vaultDocumentCache";
 import type { VaultSocketService } from "./vaultSocketService";
+import type { VaultActorContext } from "./collaboration";
 
 const MAX_IDENTITY_LENGTH = 256;
 
@@ -78,16 +79,17 @@ function parseLifecycleRequest(value: unknown): LifecycleRequest | null {
 		|| ("candidateDigest" in value && value.candidateDigest !== undefined && typeof value.candidateDigest !== "string")) {
 		return null;
 	}
+	const optional = value as Record<string, unknown>;
 	return {
 		operationId: value.operationId,
 		kind: value.kind,
 		fileId: value.fileId,
 		bodyId: value.bodyId,
-		path: "path" in value && typeof value.path === "string" ? value.path : undefined,
-		fromPath: "fromPath" in value && typeof value.fromPath === "string" ? value.fromPath : undefined,
-		toPath: "toPath" in value && typeof value.toPath === "string" ? value.toPath : undefined,
-		candidateId: "candidateId" in value && typeof value.candidateId === "string" ? value.candidateId : undefined,
-		candidateDigest: "candidateDigest" in value && typeof value.candidateDigest === "string" ? value.candidateDigest : undefined,
+		...(typeof optional.path === "string" ? { path: optional.path } : {}),
+		...(typeof optional.fromPath === "string" ? { fromPath: optional.fromPath } : {}),
+		...(typeof optional.toPath === "string" ? { toPath: optional.toPath } : {}),
+		...(typeof optional.candidateId === "string" ? { candidateId: optional.candidateId } : {}),
+		...(typeof optional.candidateDigest === "string" ? { candidateDigest: optional.candidateDigest } : {}),
 	};
 }
 
@@ -100,6 +102,7 @@ interface LifecycleServiceOptions {
 	runtimeEpoch: string;
 	hasBlob(hash: string): Promise<boolean>;
 	flush: (documentId: string) => Promise<boolean>;
+	validateActor: (actor: VaultActorContext) => boolean;
 }
 
 interface BodyMetadata {
@@ -120,7 +123,7 @@ export class VaultLifecycleService {
 		return head?.lifecycle === "active" && head.fileId === bodyId && !this.options.store.creationCandidate(bodyId) ? head : null;
 	}
 
-	async handle(request: Request): Promise<Response> {
+	async handle(request: Request, actor: VaultActorContext): Promise<Response> {
 		let decoded: unknown;
 		try { decoded = await boundedJson(request); }
 		catch (error) { return json({ error: error instanceof Error ? error.message : "invalid_json" }, 400); }
@@ -138,11 +141,12 @@ export class VaultLifecycleService {
 			if (!this.isCurrent(existing)) return json({ error: "lifecycle_operation_superseded" }, 409);
 			return json(this.receipt(existing));
 		}
-		if (input.kind === "create") return this.admitCreate(input);
-		return this.commitLifecycle(input);
+		const requestDigest = await this.lifecycleRequestDigest(input);
+		if (input.kind === "create") return this.admitCreate(input, actor, requestDigest);
+		return this.commitLifecycle(input, actor, requestDigest);
 	}
 
-	async handleBatch(request: Request): Promise<Response> {
+	async handleBatch(request: Request, actor: VaultActorContext): Promise<Response> {
 		let decoded: unknown;
 		try { decoded = await boundedJson(request); }
 		catch { return json({ error: "invalid_json" }, 400); }
@@ -166,6 +170,7 @@ export class VaultLifecycleService {
 			bodyIds.add(operation.bodyId);
 		}
 		const existing = operations.map((operation) => this.options.store.lifecycleRecord(operation.operationId));
+		const requestDigests = await Promise.all(operations.map((operation) => this.lifecycleRequestDigest(operation)));
 		if (existing.every((record) => record !== null)) {
 			const records = existing;
 			if (!records.every((record, index) => this.inputMatchesRecord(operations[index]!, record) && this.isCurrent(record))) {
@@ -179,6 +184,7 @@ export class VaultLifecycleService {
 		const mutexOwner = `lifecycle-batch:${crypto.randomUUID()}`;
 		if (!this.options.store.acquireRecoveryMutex(mutexOwner)) return json({ error: "recovery_boundary_in_progress" }, 409);
 		try {
+			if (!this.options.validateActor(actor)) return json({ error: "authority_superseded" }, 409);
 			const values: Array<{ catalog: CatalogMutation; receipt: Omit<DurableLifecycleRecord, "vaultSequence" | "rootGeneration"> }> = [];
 			for (const operation of operations) {
 				const prepared = this.prepareMutation(operation);
@@ -191,6 +197,8 @@ export class VaultLifecycleService {
 				kind: "lifecycle-batch",
 				catalog: values.map((value) => value.catalog),
 				lifecycleReceipts: values.map((value) => value.receipt),
+				actorAttributions: operations.map((operation, index) => ({ actor, operationId: operation.operationId,
+					requestDigest: requestDigests[index] })),
 			});
 			this.applyRoot(rootUpdate, commit.generation, request);
 			for (const operation of operations) if (operation.kind === "delete") this.options.sockets().closeBody(operation.bodyId);
@@ -201,7 +209,7 @@ export class VaultLifecycleService {
 		}
 	}
 
-	async publish(request: Request): Promise<Response> {
+	async publish(request: Request, actor: VaultActorContext): Promise<Response> {
 		let decoded: unknown;
 		try { decoded = await boundedJson(request); }
 		catch { return json({ error: "invalid_json" }, 400); }
@@ -244,21 +252,28 @@ export class VaultLifecycleService {
 		if (!await this.options.flush("root")) return json({ error: "root_persistence_unavailable" }, 503);
 		this.options.cache.load("root", false, () => true);
 		if (!this.publicationMatches(rootUpdate, records)) return json({ error: "root_publication_result_mismatch" }, 409);
+		if (!this.options.validateActor(actor)) return json({ error: "authority_superseded" }, 409);
 		const commit = this.options.store.commitUpdate({
 			documentId: "root",
 			update: rootUpdate,
 			kind: "root",
 			rootPublications: records.map((record) => ({ operationId: record.operationId, lifecycleSequence: record.vaultSequence,
 				vaultGeneration: this.options.vaultGeneration(), runtimeEpoch: this.options.runtimeEpoch })),
+			actorAttributions: records.map((record) => ({ actor, operationId: record.operationId })),
 		});
 		this.applyRoot(rootUpdate, commit.generation, request);
 		return json({ operationIds: [...operationIds], vaultSequence: commit.vaultSequence, rootGeneration: commit.generation,
 			vaultGeneration: this.options.vaultGeneration(), runtimeEpoch: this.options.runtimeEpoch } satisfies RootPublicationReceipt);
 	}
 
-	async publishAttachment(request: Request): Promise<Response> {
+	async publishAttachment(request: Request, suppliedActor?: VaultActorContext): Promise<Response> {
+		const actor = suppliedActor ?? { vaultId: this.options.vaultId(), vaultGeneration: this.options.vaultGeneration(),
+			principalId: request.headers.get("x-yaos-device-id") ?? "legacy", membershipRevision: 1,
+			deviceId: request.headers.get("x-yaos-device-id") ?? "legacy", deviceCredentialRevision: 1,
+			role: "member" as const, policyVersion: 1, capabilityDigest: "legacy" };
 		let decoded: unknown;
 		try {
+			if (!(this.options.validateActor?.(actor) ?? true)) return json({ error: "authority_superseded" }, 409);
 			decoded = await boundedJson(request);
 		} catch {
 			return json({ error: "invalid_json" }, 400);
@@ -283,6 +298,7 @@ export class VaultLifecycleService {
 			if (insideReplay || insideReplayEvents.length > 0) {
 				return this.attachmentReplayResult(mutation, requestDigest, insideReplay, insideReplayEvents);
 			}
+			if (!this.options.validateActor(actor)) return json({ error: "authority_superseded" }, 409);
 			const current = this.options.store.reconstructDocument("root");
 			try {
 				const vector = Y.encodeStateVector(current.doc);
@@ -346,7 +362,8 @@ export class VaultLifecycleService {
 				}
 				const update = Y.encodeStateAsUpdate(current.doc, vector);
 				if (update.byteLength === 0 || update.byteLength > MAX_JSON_BYTES) return json({ error: "invalid_attachment_root_update" }, 400);
-				const commit = this.options.store.commitRootAttachments(update, events, { operationId: mutation.operationId, requestDigest });
+				const commit = this.options.store.commitRootAttachments(update, events, { operationId: mutation.operationId, requestDigest },
+					undefined, [{ actor, operationId: mutation.operationId, requestDigest }]);
 				this.applyRoot(update, commit.generation, request);
 				return this.attachmentReceipt(mutation.operationId, events, update, commit.vaultSequence, commit.generation);
 			} finally {
@@ -357,7 +374,7 @@ export class VaultLifecycleService {
 		}
 	}
 
-	finalizeCreation(creation: PendingCreationCandidate, candidate: DurableCandidateReceipt, metadata: BodyMetadata): boolean {
+	finalizeCreation(creation: PendingCreationCandidate, candidate: DurableCandidateReceipt, metadata: BodyMetadata, actor: VaultActorContext): boolean {
 		const owner = `lifecycle-create:${creation.operationId}:${crypto.randomUUID()}`;
 		if (!this.options.store.acquireRecoveryMutex(owner)) return false;
 		try {
@@ -382,6 +399,7 @@ export class VaultLifecycleService {
 					resultLifecycle: "active", durableGeneration: candidate.durableGeneration,
 					vaultGeneration: this.options.vaultGeneration(), runtimeEpoch: creation.runtimeEpoch },
 				completeCreation: { bodyId: creation.bodyId, candidateId: creation.candidateId, candidateDigest: creation.candidateDigest },
+				actorAttributions: [{ actor, operationId: creation.operationId, requestDigest: creation.candidateDigest }],
 			});
 			this.applyRoot(rootUpdate, commit.generation, creation);
 			return true;
@@ -390,7 +408,7 @@ export class VaultLifecycleService {
 		}
 	}
 
-	private admitCreate(input: LifecycleRequest): Response {
+	private admitCreate(input: LifecycleRequest, actor: VaultActorContext, requestDigest: string): Response {
 		if (typeof input.path !== "string" || safeMarkdownPath(input.path) !== input.path) return json({ error: "path_required" }, 400);
 		const candidateId = input.candidateId!;
 		const candidateDigest = input.candidateDigest!.toLowerCase();
@@ -402,10 +420,12 @@ export class VaultLifecycleService {
 			return json(this.pendingReceipt(existing));
 		}
 		if (this.options.store.getCatalogHeadAt(this.options.store.currentSequence(), input.bodyId)) return json({ error: "body_identity_already_exists" }, 409);
+		if (!this.options.validateActor(actor)) return json({ error: "authority_superseded" }, 409);
 		let bodyHead = this.options.store.documentHead(input.bodyId);
 		if (!bodyHead) {
 			const empty = new Y.Doc({ guid: input.bodyId });
-			const commit = this.options.store.commitUpdate({ documentId: input.bodyId, update: Y.encodeStateAsUpdate(empty), kind: "body" });
+			const commit = this.options.store.commitUpdate({ documentId: input.bodyId, update: Y.encodeStateAsUpdate(empty), kind: "body",
+				actorAttributions: [{ actor, operationId: input.operationId, requestDigest }] });
 			empty.destroy();
 			bodyHead = { generation: commit.generation, latestSequence: commit.vaultSequence };
 		}
@@ -415,13 +435,15 @@ export class VaultLifecycleService {
 		return json(this.pendingReceipt(fence));
 	}
 
-	private async commitLifecycle(input: LifecycleRequest): Promise<Response> {
+	private async commitLifecycle(input: LifecycleRequest, actor: VaultActorContext, requestDigest: string): Promise<Response> {
 		if (!await this.options.flush("root")) return json({ error: "root_persistence_unavailable" }, 503);
 		if (!await this.options.flush(input.bodyId)) return json({ error: "body_persistence_unavailable" }, 503);
+		if (!this.options.validateActor(actor)) return json({ error: "authority_superseded" }, 409);
 		const prepared = this.prepareMutation(input);
 		if (prepared instanceof Response) return prepared;
 		const rootUpdate = this.markerUpdate([input]);
-		const commit = this.options.store.commitRootLifecycle({ rootUpdate, kind: input.kind, catalog: prepared.catalog, lifecycleReceipt: prepared.receipt });
+		const commit = this.options.store.commitRootLifecycle({ rootUpdate, kind: input.kind, catalog: prepared.catalog,
+			lifecycleReceipt: prepared.receipt, actorAttributions: [{ actor, operationId: input.operationId, requestDigest }] });
 		const record = this.options.store.lifecycleRecord(input.operationId)!;
 		this.applyRoot(rootUpdate, commit.generation, input);
 		if (input.kind === "delete") this.options.sockets().closeBody(input.bodyId);
@@ -632,6 +654,12 @@ export class VaultLifecycleService {
 
 	private async attachmentRequestDigest(mutation: AttachmentMutation): Promise<string> {
 		const bytes = new TextEncoder().encode(canonicalJsonText(mutation));
+		const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+		return [...digest].map((value) => value.toString(16).padStart(2, "0")).join("");
+	}
+
+	private async lifecycleRequestDigest(input: LifecycleRequest): Promise<string> {
+		const bytes = new TextEncoder().encode(canonicalJsonText(jsonValue(input)));
 		const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
 		return [...digest].map((value) => value.toString(16).padStart(2, "0")).join("");
 	}

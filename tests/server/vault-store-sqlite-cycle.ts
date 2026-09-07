@@ -309,6 +309,37 @@ export class StoreCycle {
     reconstructed.doc.destroy();
     body.destroy();
 
+    const ownerActor = { vaultId: "sqlite-cycle-vault", vaultGeneration, principalId: "principal-owner",
+      membershipRevision: 1, deviceId: "device-owner", deviceCredentialRevision: 1,
+      role: "owner", policyVersion: 1, capabilityDigest: "owner-digest" };
+    const authorityReceipt = store.installAuthorityFence({ changeId: "authority-bootstrap", vaultId: "sqlite-cycle-vault",
+      vaultGeneration, subjectDigest: "authority-bootstrap-digest", subjects: [
+        { principalId: ownerActor.principalId, role: "owner", state: "active", membershipRevision: 1,
+          policyVersion: 1, capabilityDigest: ownerActor.capabilityDigest, displayName: "Owner", colorSeed: "owner-color" },
+        { deviceId: ownerActor.deviceId, principalId: ownerActor.principalId, state: "active", credentialRevision: 1 },
+      ] });
+    const authorityMirror = store.validateActor(ownerActor) === "allowed"
+      && store.authorityFenceReceipt(authorityReceipt.changeId)?.subjectDigest === authorityReceipt.subjectDigest
+      && store.validateActor({ ...ownerActor, membershipRevision: 2 }) === "authority_superseded";
+	const redundantCandidateDocument = store.reconstructDocument("sqlite-cycle-body").doc;
+	const redundantCandidateUpdate = Y.encodeStateAsUpdate(redundantCandidateDocument);
+	redundantCandidateDocument.destroy();
+	const beforeRedundantCandidate = store.documentHead("sqlite-cycle-body");
+	const redundantCandidate = store.commitCandidate({
+	  bodyId: "sqlite-cycle-body",
+	  clientId: ownerActor.deviceId,
+	  candidateId: "candidate-redundant-sqlite-cycle",
+	  candidateDigest: "d".repeat(64),
+	  update: redundantCandidateUpdate,
+	  vaultGeneration,
+	  runtimeEpoch: "sqlite-cycle-runtime-epoch",
+	  actor: ownerActor,
+	});
+	const redundantCandidateOutcome = store.committedOperationOutcome(ownerActor,
+	  redundantCandidate.candidateId, redundantCandidate.candidateDigest);
+	const redundantCandidateRecovery = redundantCandidateOutcome?.vaultSequence === redundantCandidate.vaultSequence
+	  && store.documentHead("sqlite-cycle-body")?.generation === beforeRedundantCandidate?.generation;
+
     return Response.json({
       metadata: {
         created: provisioned.created,
@@ -334,8 +365,10 @@ export class StoreCycle {
         listed: listedHead?.previousPath ?? null,
         feed: renameFeed?.catalogs[0]?.previousPath ?? null,
       },
-	  attachmentAtomicity,
+      attachmentAtomicity,
+	  redundantCandidateRecovery,
       authority: {
+		authorityMirror,
         gcEpochAdvanced: gcTwo.epoch === gcOne.epoch + 1,
         indexedGarbageApproved: sweep.approvedKeys.includes(garbageKey),
         activeWriterBlockedSweep: blockedSweep.approvedKeys.length === 0,
@@ -424,6 +457,7 @@ s.test("VaultStore completes journal/checkpoint/pin/feed-floor cycle on real SQL
 			checkpointChunks: number;
 			floor: number;
 			authority: {
+				authorityMirror: boolean;
 				gcEpochAdvanced: boolean;
 				indexedGarbageApproved: boolean;
 				activeWriterBlockedSweep: boolean;
@@ -439,12 +473,13 @@ s.test("VaultStore completes journal/checkpoint/pin/feed-floor cycle on real SQL
 			textLength: number;
 			previousPath: { direct: string | null; listed: string | null; feed: string | null };
 			attachmentAtomicity: boolean;
+			redundantCandidateRecovery: boolean;
 		};
 		s.check(
 			result.metadata.created && result.metadata.replayed && result.metadata.generationFenceRejected
 				&& result.metadata.persisted && result.metadata.bootstrapCycle
-				&& result.metadata.schemaVersion === 6 && result.metadata.storageFormatVersion === 2,
-			"schema-6 metadata persists vaultGeneration and rejects a different provisioning incarnation",
+				&& result.metadata.schemaVersion === 7 && result.metadata.storageFormatVersion === 2,
+			"schema-7 metadata persists vaultGeneration and rejects a different provisioning incarnation",
 		);
 		s.check(result.before.entries === 61 && result.before.bytes > 1_200_000, "real SQLite journal contains the large update plus all semantic body edits");
 		s.check(result.blocked === "blocked-by-pin" && result.pinnedFloorRejected, "active capture pin blocks checkpoint compaction and feed-floor advancement");
@@ -455,6 +490,7 @@ s.test("VaultStore completes journal/checkpoint/pin/feed-floor cycle on real SQL
 		s.check(result.resetRequired, "cursor below retained floor receives reset-required response");
 		s.check(result.textLength === 1_200_060, "chunked checkpoint reconstruction preserves exact body state");
 		s.check(result.authority.deletionAuthority, "vault deletion authority remains generation-fenced");
+		s.check(result.authority.authorityMirror, "collaboration authority mirror and exact fence receipt survive SQLite");
 		s.check(
 			result.authority.crashReacquiredMaterializationLease
 				&& result.authority.differentOwnerRejected
@@ -471,6 +507,7 @@ s.test("VaultStore completes journal/checkpoint/pin/feed-floor cycle on real SQL
 			"real SQLite get/list/feed APIs preserve atomic rename previousPath",
 		);
 		s.check(result.attachmentAtomicity, "real SQLite atomically commits and rolls back root, attachment catalog, and exact replay ledger");
+		s.check(result.redundantCandidateRecovery, "redundant candidates preserve an exact committed outcome without inventing a semantic generation");
 	} finally {
 		if (child && child.exitCode === null) {
 			child.kill("SIGTERM");

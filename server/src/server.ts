@@ -5,6 +5,7 @@ import { MAX_BODY_ID_LENGTH, MAX_CATCH_UP_BODIES, MAX_CATCH_UP_BYTES, MAX_JSON_B
 import { sha256Hex } from "./hex";
 import { BoundedBodyError, readBoundedBytes } from "./readBoundedBytes";
 import { handleVaultRecoveryRpc } from "./recoveryRpcRouter";
+import { RECOVERY_PUBLIC_RPC_PATH } from "./recoveryProtocol";
 import type { ActorCallPort, AlarmPort, DrainPort, ExecutionPort, ObjectStorePort, VaultRuntimeStoragePort } from "./platformPorts";
 import { CloudflareActorCalls, CloudflareAlarmPort, CloudflareExecutionPort, CloudflareObjectStore, CloudflareSocketRegistry } from "./cloudflarePorts";
 import { handleSettingsSyncRequest, SettingsSyncStore } from "./settingsSyncStore";
@@ -24,6 +25,10 @@ import { VaultSocketService, type VaultSocketPort, type VaultSocketRegistryPort,
 import { VaultStore, type CatalogMutation } from "./vaultStore";
 import { isCanonicalVaultId } from "./vaultId";
 import { VaultRecoveryService } from "./vaultRecoveryService";
+import { authorizeRuntimeActor, OUTCOME_CLAIM_HEADER, parseVaultActor } from "./vaultAuthority";
+import { capabilityDigestForRole, COLLABORATION_POLICY_VERSION, type VaultActorContext, type VaultCapability } from "./collaboration";
+import { canonicalJsonHash } from "./recoveryCanonicalJson";
+import type { VaultAuthoritySubjectChange } from "./vaultDocumentStore";
 
 const PERSIST_DEBOUNCE_MS = 250;
 const PERSIST_RETRY_MS = 1_000;
@@ -123,6 +128,7 @@ export class VaultRuntime implements DrainPort {
 	private flushChain: Promise<void> = Promise.resolve();
 	private deleted = false;
 	private drainPromise: Promise<void> | null = null;
+	private authorityBoundary: Promise<void> = Promise.resolve();
 
 	constructor(private readonly options: VaultRuntimeOptions) {
 		this.store = new VaultStore(options.storage);
@@ -154,7 +160,11 @@ export class VaultRuntime implements DrainPort {
 				} : null;
 			},
 			currentSequence: () => this.store.currentSequence(),
-			isDeviceRevoked: (deviceId) => this.store.isDeviceRevoked(deviceId),
+			validateActor: (actor) => this.store.validateActor(actor) === "allowed",
+			principalPresence: (principalId) => {
+				const principal = this.store.principalAuthority(principalId);
+				return principal?.state === "active" ? { displayName: principal.displayName, colorSeed: principal.colorSeed } : null;
+			},
 			scheduleFlush: (documentId) => this.scheduleFlush(documentId),
 		});
 		this.sockets = socketOwner;
@@ -169,6 +179,7 @@ export class VaultRuntime implements DrainPort {
 			vaultGeneration,
 			runtimeEpoch: this.runtimeEpoch,
 			flush: (documentId) => this.flushDocument(documentId),
+			validateActor: (actor) => this.store.validateActor(actor) === "allowed",
 		});
 		this.candidates = new VaultCandidateService({
 			store: this.store,
@@ -179,6 +190,7 @@ export class VaultRuntime implements DrainPort {
 			vaultGeneration,
 			runtimeEpoch: this.runtimeEpoch,
 			flush: (documentId) => this.flushDocument(documentId),
+			validateActor: (actor) => this.store.validateActor(actor) === "allowed",
 		});
 		this.bootstrap = new BootstrapService(this.store);
 		this.recovery = new VaultRecoveryService({
@@ -206,14 +218,34 @@ export class VaultRuntime implements DrainPort {
 		if (!parts) return json({ error: "not_found" }, 404);
 		try {
 			if (request.method === "POST" && url.pathname === "/__yaos/provision") return await this.provision(vaultId, request);
+			if (request.method === "POST" && url.pathname === "/__yaos/collaboration-migrate") {
+				return await this.migrateCollaboration(vaultId, request);
+			}
 			const metadata = this.store.vaultMetadata();
-			if (!metadata) return json({ error: "vault_not_provisioned" }, 409);
+			if (!metadata) {
+				const storedSchemaVersion = this.store.storedVaultSchemaVersion();
+				return storedSchemaVersion === 6
+					? json({ error: "collaboration_migration_required", storedSchemaVersion, requiredSchemaVersion: SERVER_SCHEMA_VERSION }, 409)
+					: json({ error: "vault_not_provisioned" }, 409);
+			}
 			if (metadata.vaultId !== vaultId) return json({ error: "vault_identity_mismatch" }, 409);
 			const forwardedGeneration = request.headers.get(INTERNAL_GENERATION_HEADER);
 			if (forwardedGeneration !== metadata.vaultGeneration) {
 				return json({ error: "vault_generation_mismatch" }, 409);
 			}
-			const recoveryResponse = await handleVaultRecoveryRpc(request, vaultId, this.store, this.recovery);
+				if (request.method === "POST" && url.pathname === "/__yaos/authority-fence") {
+					return this.runAuthorityBoundary(() => this.installAuthorityFence(request));
+				}
+				if (url.pathname === RECOVERY_PUBLIC_RPC_PATH) {
+					return this.runAuthorityBoundary(async () => {
+						const recoveryActor = parseVaultActor(request, metadata.vaultId, metadata.vaultGeneration);
+						const authorized = this.authorize(recoveryActor, "vault.recovery.manage");
+						if (authorized instanceof Response) return authorized;
+						return await handleVaultRecoveryRpc(request, vaultId, this.store, this.recovery)
+							?? json({ error: "not_found" }, 404);
+					});
+				}
+				const recoveryResponse = await handleVaultRecoveryRpc(request, vaultId, this.store, this.recovery);
 			if (recoveryResponse) return recoveryResponse;
 			if (request.method === "POST" && url.pathname === "/__yaos/revoke-device-sockets") {
 				let body: { deviceId?: unknown };
@@ -231,35 +263,69 @@ export class VaultRuntime implements DrainPort {
 			if (request.method === "POST" && url.pathname === "/__yaos/begin-vault-deletion") return this.beginDeletion(request);
 			if (request.method === "POST" && url.pathname === "/__yaos/delete-all") return this.deleteAll();
 			if (this.store.vaultDeletionBegun(metadata.vaultGeneration)) return json({ error: "vault_deleting" }, 410);
+			const actor = parseVaultActor(request, metadata.vaultId, metadata.vaultGeneration);
 			if (parts[0] === "settings-sync") {
 				if (parts.length < 2 || parts.length > 3) return json({ error: "not_found" }, 404);
-				const deviceId = request.headers.get(INTERNAL_DEVICE_HEADER);
-				if (!deviceId || deviceId.length > 128) return json({ error: "missing_trusted_device_identity" }, 401);
-				if (this.store.isDeviceRevoked(deviceId)) return json({ error: "unauthorized" }, 401);
-				return handleSettingsSyncRequest(this.settings, request, parts[1]!, parts[2]);
+				const authorized = this.authorize(actor, "vault.settings.personal.sync", actor?.principalId);
+				if (authorized instanceof Response) return authorized;
+				return handleSettingsSyncRequest(this.settings, request, parts[1]!, parts[2], authorized.principalId,
+					() => this.store.validateActor(authorized) === "allowed", authorized);
 			}
 			if (request.method === "POST" && url.pathname === "/compact") return this.compact();
 
 			if (request.method === "GET" && request.headers.get("upgrade")?.toLowerCase() === "websocket") {
-				const deviceId = request.headers.get(INTERNAL_DEVICE_HEADER);
-				if (!deviceId) return json({ error: "missing_trusted_device_identity" }, 401);
-				if (url.pathname === "/ws/root") return this.sockets.accept("root", "root", deviceId);
+				const authorized = this.authorize(actor, "vault.content.read");
+				if (authorized instanceof Response) return authorized;
+				if (url.pathname === "/ws/root") return this.sockets.accept("root", "root", authorized);
 				if (parts.length === 3 && parts[0] === "ws" && parts[1] === "body") {
 					const bodyId = parts[2]!;
 					if (!this.lifecycle.activeBodyHead(bodyId)) return json({ error: "body_not_active" }, 409);
-					return this.sockets.accept(bodyId, "body", deviceId);
+					return this.sockets.accept(bodyId, "body", authorized);
 				}
 			}
 			if (request.method === "POST" && parts.length === 3 && parts[0] === "body" && parts[2] === "candidate") {
-				return this.candidates.handle(parts[1]!, request);
+				const authorized = this.authorize(actor, "vault.content.write");
+				return authorized instanceof Response ? authorized : this.candidates.handle(parts[1]!, request, authorized);
 			}
 			if (request.method === "POST" && url.pathname === "/attachments/publish") {
-				return this.lifecycle.publishAttachment(request);
+				const authorized = this.authorize(actor, "vault.attachments.write");
+				return authorized instanceof Response ? authorized : this.lifecycle.publishAttachment(request, authorized);
 			}
-			if (request.method === "POST" && url.pathname === "/lifecycle") return this.lifecycle.handle(request);
-			if (request.method === "POST" && url.pathname === "/lifecycle/batch") return this.lifecycle.handleBatch(request);
-			if (request.method === "POST" && url.pathname === "/lifecycle/publish") return this.lifecycle.publish(request);
-			if (request.method === "POST" && url.pathname === "/catch-up") return this.catchUp(request);
+			if (request.method === "POST" && url.pathname.startsWith("/lifecycle")) {
+				const authorized = this.authorize(actor, "vault.lifecycle.write");
+				if (authorized instanceof Response) return authorized;
+				if (url.pathname === "/lifecycle") return this.lifecycle.handle(request, authorized);
+				if (url.pathname === "/lifecycle/batch") return this.lifecycle.handleBatch(request, authorized);
+				if (url.pathname === "/lifecycle/publish") return this.lifecycle.publish(request, authorized);
+			}
+			if (request.method === "POST" && url.pathname === "/catch-up") {
+				const denied = this.authorize(actor, "vault.content.read");
+				return denied instanceof Response ? denied : this.catchUp(request);
+			}
+			if (request.method === "GET" && parts.length === 3 && parts[0] === "operations" && parts[2] === "outcome") {
+				const staleClaim = request.headers.get(OUTCOME_CLAIM_HEADER) === "1";
+				const authorized = staleClaim ? actor : this.authorize(actor, "vault.operations.read_own_outcome");
+				if (!authorized) return json({ error: "missing_trusted_actor" }, 401);
+				if (authorized instanceof Response) return authorized;
+				const digest = url.searchParams.get("requestDigest");
+				if (!digest || !/^[a-f0-9]{64}$/.test(digest)) return json({ error: "invalid_request_digest" }, 400);
+				const membershipRevision = Number(url.searchParams.get("membershipRevision") ?? authorized.membershipRevision);
+				const deviceCredentialRevision = Number(url.searchParams.get("deviceCredentialRevision") ?? authorized.deviceCredentialRevision);
+				const operationDeviceId = url.searchParams.get("deviceId") ?? authorized.deviceId;
+				if (!Number.isSafeInteger(membershipRevision) || membershipRevision < 1
+					|| !Number.isSafeInteger(deviceCredentialRevision) || deviceCredentialRevision < 1) {
+					return json({ error: "invalid_operation_authority" }, 400);
+				}
+				if ((staleClaim && operationDeviceId !== authorized.deviceId)
+					|| this.store.deviceAuthority(operationDeviceId)?.principalId !== authorized.principalId) {
+					return json({ error: "principal_target_mismatch" }, 403);
+				}
+				const outcome = this.store.committedOperationOutcome({ principalId: authorized.principalId,
+					deviceId: operationDeviceId, membershipRevision, deviceCredentialRevision }, parts[1]!, digest);
+				return outcome ? json(outcome) : json({ error: "operation_outcome_not_found" }, 404);
+			}
+			const contentRead = this.authorize(actor, url.pathname === "/diagnostics" ? "vault.diagnostics.read" : "vault.content.read");
+			if (contentRead instanceof Response) return contentRead;
 			const bootstrap = await this.bootstrapRoute(request, url, parts);
 			if (bootstrap) return bootstrap;
 			if (request.method === "GET" && url.pathname === "/changes") {
@@ -283,6 +349,159 @@ export class VaultRuntime implements DrainPort {
 		} catch (error) {
 			console.error("[yaos-vault] request failed", error);
 			return json({ error: error instanceof Error ? error.message : "vault_runtime_failed" }, 500);
+		}
+	}
+
+	private authorize(actor: VaultActorContext | null, capability: VaultCapability, targetPrincipalId?: string): VaultActorContext | Response {
+		const result = authorizeRuntimeActor(this.store, actor, capability, targetPrincipalId);
+		return result.allowed ? result.actor : result.response;
+	}
+
+	private runAuthorityBoundary<T>(work: () => Promise<T>): Promise<T> {
+		const result = this.authorityBoundary.then(work, work);
+		this.authorityBoundary = result.then(() => undefined, () => undefined);
+		return result;
+	}
+
+	private async installAuthorityFence(request: Request): Promise<Response> {
+		let input: { changeId?: unknown; vaultId?: unknown; vaultGeneration?: unknown; subjectDigest?: unknown; subjects?: unknown };
+		try { input = await request.json(); } catch { return json({ error: "invalid_json" }, 400); }
+		if (typeof input.changeId !== "string" || !input.changeId || input.changeId.length > 256
+			|| typeof input.vaultId !== "string" || typeof input.vaultGeneration !== "string"
+			|| !Array.isArray(input.subjects) || input.subjects.length === 0 || input.subjects.length > 512) {
+			return json({ error: "invalid_authorization_change" }, 400);
+		}
+		const subjects: VaultAuthoritySubjectChange[] = [];
+		for (const value of input.subjects) {
+			if (!value || typeof value !== "object" || Array.isArray(value)) return json({ error: "invalid_authorization_subject" }, 400);
+			const subject = value as Record<string, unknown>;
+			if (typeof subject.deviceId === "string") {
+				const credentialRevision = Number.isSafeInteger(subject.credentialRevision)
+					? subject.credentialRevision as number
+					: subject.targetRevision;
+				if (typeof subject.principalId !== "string" || (subject.state !== "active" && subject.state !== "revoked")
+					&& (subject.targetState !== "active" && subject.targetState !== "revoked")
+					|| !Number.isSafeInteger(credentialRevision) || (credentialRevision as number) < 1) {
+					return json({ error: "invalid_device_authority" }, 400);
+				}
+				subjects.push({ deviceId: subject.deviceId, principalId: subject.principalId,
+					state: (subject.state ?? subject.targetState) as "active" | "revoked", credentialRevision: credentialRevision as number });
+			} else {
+				const current = typeof subject.principalId === "string" ? this.store.principalAuthority(subject.principalId) : null;
+				const role = subject.role ?? subject.targetRole;
+				const state = subject.state ?? subject.targetState;
+				const membershipRevision = Number.isSafeInteger(subject.membershipRevision)
+					? subject.membershipRevision as number
+					: subject.targetRevision;
+				if (typeof subject.principalId !== "string" || (role !== "owner" && role !== "member")
+					|| (state !== "active" && state !== "revoked")
+					|| !Number.isSafeInteger(membershipRevision) || (membershipRevision as number) < 1) {
+					return json({ error: "invalid_principal_authority" }, 400);
+				}
+				const policyVersion = Number.isSafeInteger(subject.policyVersion) ? subject.policyVersion as number : COLLABORATION_POLICY_VERSION;
+				const capabilityDigest = await capabilityDigestForRole(role);
+				if (subject.capabilityDigest !== undefined && subject.capabilityDigest !== capabilityDigest) {
+					return json({ error: "capability_digest_mismatch" }, 409);
+				}
+				subjects.push({ principalId: subject.principalId, role, state,
+					membershipRevision: membershipRevision as number, policyVersion,
+					capabilityDigest,
+					displayName: typeof subject.displayName === "string" ? subject.displayName : current?.displayName ?? subject.principalId,
+					colorSeed: typeof subject.colorSeed === "string" ? subject.colorSeed : current?.colorSeed ?? subject.principalId });
+			}
+		}
+		const suppliedSubjectDigest = typeof input.subjectDigest === "string" ? input.subjectDigest : null;
+		if (suppliedSubjectDigest) {
+			const sourceDigest = await sha256Hex(new TextEncoder().encode(JSON.stringify(input.subjects)));
+			if (sourceDigest !== suppliedSubjectDigest) return json({ error: "authorization_subject_digest_mismatch" }, 409);
+		}
+		const subjectDigest = suppliedSubjectDigest ?? await canonicalJsonHash(subjects);
+		try {
+			await this.flushLoadedDocuments();
+			const receipt = this.store.installAuthorityFence({ changeId: input.changeId, vaultId: input.vaultId,
+				vaultGeneration: input.vaultGeneration, subjectDigest, subjects });
+			const principalIds = new Set(subjects.filter((subject) => !("deviceId" in subject))
+				.map((subject) => subject.principalId));
+			for (const subject of subjects) {
+				if ("deviceId" in subject) this.sockets.closeDevice(subject.deviceId);
+			}
+			for (const principalId of principalIds) this.sockets.closePrincipal(principalId);
+			return json({ ...receipt, runtimeEpoch: this.runtimeEpoch });
+		} catch (error) {
+			return json({ error: error instanceof Error ? error.message : "authorization_fence_failed" }, 409);
+		}
+	}
+
+	private async migrateCollaboration(vaultId: string, request: Request): Promise<Response> {
+		let input: {
+			migrationId?: unknown;
+			vaultGeneration?: unknown;
+			requestDigest?: unknown;
+			subjectDigest?: unknown;
+			ownerPrincipalId?: unknown;
+			subjects?: unknown;
+		};
+		try { input = await request.json(); } catch { return json({ error: "invalid_json" }, 400); }
+		if (typeof input.migrationId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(input.migrationId)
+			|| typeof input.vaultGeneration !== "string"
+			|| typeof input.requestDigest !== "string" || !/^[a-f0-9]{64}$/.test(input.requestDigest)
+			|| typeof input.subjectDigest !== "string" || !/^[a-f0-9]{64}$/.test(input.subjectDigest)
+			|| typeof input.ownerPrincipalId !== "string"
+			|| !Array.isArray(input.subjects) || input.subjects.length === 0 || input.subjects.length > 8_192) {
+			return json({ error: "invalid_collaboration_migration" }, 400);
+		}
+		const sourceDigest = await sha256Hex(new TextEncoder().encode(JSON.stringify(input.subjects)));
+		if (sourceDigest !== input.subjectDigest) {
+			return json({ error: "authorization_subject_digest_mismatch" }, 409);
+		}
+		const subjects: VaultAuthoritySubjectChange[] = [];
+		for (const value of input.subjects) {
+			if (!value || typeof value !== "object" || Array.isArray(value)) {
+				return json({ error: "invalid_authorization_subject" }, 400);
+			}
+			const subject = value as Record<string, unknown>;
+			if (subject.kind === "device") {
+				if (typeof subject.deviceId !== "string" || typeof subject.principalId !== "string"
+					|| subject.targetState !== "active" || !Number.isSafeInteger(subject.targetRevision)
+					|| (subject.targetRevision as number) < 1) {
+					return json({ error: "invalid_device_authority" }, 400);
+				}
+				subjects.push({ deviceId: subject.deviceId, principalId: subject.principalId,
+					state: "active", credentialRevision: subject.targetRevision as number });
+			} else if (subject.kind === "membership") {
+				if (typeof subject.principalId !== "string"
+					|| (subject.targetRole !== "owner" && subject.targetRole !== "member")
+					|| subject.targetState !== "active" || !Number.isSafeInteger(subject.targetRevision)
+					|| (subject.targetRevision as number) < 1
+					|| typeof subject.displayName !== "string" || typeof subject.colorSeed !== "string") {
+					return json({ error: "invalid_principal_authority" }, 400);
+				}
+				const capabilityDigest = await capabilityDigestForRole(subject.targetRole);
+				subjects.push({ principalId: subject.principalId, role: subject.targetRole,
+					state: "active", membershipRevision: subject.targetRevision as number,
+					policyVersion: COLLABORATION_POLICY_VERSION, capabilityDigest,
+					displayName: subject.displayName, colorSeed: subject.colorSeed });
+			} else {
+				return json({ error: "invalid_authorization_subject" }, 400);
+			}
+		}
+		try {
+			this.sockets.closeAll("vault collaboration migration");
+			await this.flushLoadedDocuments();
+			const receipt = this.store.migrateCollaboration({
+				migrationId: input.migrationId,
+				vaultId,
+				vaultGeneration: input.vaultGeneration,
+				requestDigest: input.requestDigest,
+				subjectDigest: input.subjectDigest,
+				ownerPrincipalId: input.ownerPrincipalId,
+				subjects,
+			});
+			this.cache.clear();
+			this.persistence.clear();
+			return json({ ...receipt, runtimeEpoch: this.runtimeEpoch });
+		} catch (error) {
+			return json({ error: error instanceof Error ? error.message : "collaboration_migration_failed" }, 409);
 		}
 	}
 
@@ -632,11 +851,15 @@ export class VaultRuntime implements DrainPort {
 			if (entries.length === 0) return;
 			let processed = 0;
 			try {
+				if (entries.some((entry) => !entry.actor || this.store.validateActor(entry.actor) !== "allowed")) {
+					throw new Error("authority_superseded");
+				}
 				const update = entries.length === 1
 					? entries[0]!.bytes
 					: Y.mergeUpdates(entries.map((entry) => entry.bytes));
 				const catalog = documentId === "root" ? undefined : await this.catalogForUpdate(documentId, update);
-				const commit = this.store.commitUpdate({ documentId, update, kind: documentId === "root" ? "root" : "body", catalog });
+				const commit = this.store.commitUpdate({ documentId, update, kind: documentId === "root" ? "root" : "body", catalog,
+					actorAttributions: entries.map((entry) => ({ actor: entry.actor!, requestDigest: entry.digest })) });
 				processed = entries.length;
 				const loaded = this.cache.get(documentId);
 				if (loaded) loaded.generation = commit.generation;
@@ -646,7 +869,13 @@ export class VaultRuntime implements DrainPort {
 				this.persistence.set(documentId, { status: "healthy", lastError: null, lastSuccessAt: Date.now(), failures: this.persistence.get(documentId)?.failures ?? 0 });
 			} catch (error) {
 				success = false;
-				this.cache.restorePending(documentId, entries.slice(processed));
+				if (error instanceof Error && error.message === "authority_superseded") {
+					processed = entries.length;
+					this.sockets.closeAll("queued authority superseded");
+					this.cache.clear();
+				} else {
+					this.cache.restorePending(documentId, entries.slice(processed));
+				}
 				const prior = this.persistence.get(documentId);
 				this.persistence.set(documentId, { status: "degraded", lastError: error instanceof Error ? error.message : String(error),
 					lastSuccessAt: prior?.lastSuccessAt ?? null, failures: (prior?.failures ?? 0) + 1 });

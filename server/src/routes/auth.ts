@@ -1,6 +1,8 @@
 import { randomBase64Url } from "../base64url";
 import type { ConsoleState, StoredServerConfig } from "../config";
+import type { PrincipalRecord, VaultMembershipRecord } from "../collaborationIdentity";
 import type { VaultRecord } from "../identity";
+import type { VaultActorContext } from "../collaboration";
 import { MAX_BLOB_UPLOAD_BYTES } from "../contracts";
 import {
 	CONFIG_FORMAT,
@@ -125,6 +127,45 @@ export async function authorizeDevice(
 	if (!response.ok) return null;
 	const body: { device?: DevicePublic } = await response.json();
 	return body.device ?? null;
+}
+
+export interface AuthorizedVaultActor {
+	device: DevicePublic;
+	principal: PrincipalRecord;
+	membership: VaultMembershipRecord;
+	actor: VaultActorContext;
+}
+
+export async function authorizeVaultActor(
+	env: Env,
+	token: string | null,
+	vaultId: string,
+): Promise<AuthorizedVaultActor | null> {
+	if (!token) return null;
+	const response = await configFetch(env, "/__yaos/collaboration/authorize", {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ tokenHash: await hashSecret(token), vaultId }),
+	});
+	if (!response.ok) return null;
+	const payload = await response.json().catch(() => null) as AuthorizedVaultActor | null;
+	return payload?.actor?.vaultId === vaultId ? payload : null;
+}
+
+export async function authorizeVaultOutcomeActor(
+	env: Env,
+	token: string | null,
+	vaultId: string,
+): Promise<AuthorizedVaultActor | null> {
+	if (!token) return null;
+	const response = await configFetch(env, "/__yaos/collaboration/authorize-outcome", {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ tokenHash: await hashSecret(token), vaultId }),
+	});
+	if (!response.ok) return null;
+	const payload = await response.json().catch(() => null) as AuthorizedVaultActor | null;
+	return payload?.actor?.vaultId === vaultId ? payload : null;
 }
 
 export async function authorizeAnyDevice(env: Env, token: string | null): Promise<boolean> {
@@ -325,7 +366,10 @@ export async function handleClaimRoute(req: Request, env: Env, authState: AuthSt
 		pairingExp?: number;
 		vault?: VaultRecord;
 	} | null;
-	if (typeof activation?.pairingExp !== "number" || activation.vault?.state !== "active") {
+	if (
+		typeof activation?.pairingExp !== "number"
+		|| (activation.vault?.state !== "active" && activation.vault?.state !== "awaiting_owner")
+	) {
 		return json({ error: "claim_activation_invalid" }, 502);
 	}
 	invalidateStoredServerConfigCache();

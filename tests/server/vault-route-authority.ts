@@ -1,6 +1,8 @@
 import { strict as assert } from "node:assert";
+import * as decoding from "lib0/decoding";
 import * as encoding from "lib0/encoding";
 import * as syncProtocol from "y-protocols/sync";
+import { applyAwarenessUpdate, Awareness, encodeAwarenessUpdate } from "y-protocols/awareness";
 import * as Y from "yjs";
 import { encodeRootPathPublicationUpdate } from "../../server/src/server";
 import { VaultDocumentCachePressureError } from "../../server/src/vaultDocumentCache";
@@ -8,6 +10,7 @@ import {
 	parseVaultSocketAttachment,
 	rootUpdateChangesProtectedAttachmentMaps,
 	rootUpdateHasSafeAttachmentSemantics,
+	type VaultSocketAttachment,
 	rootUpdateChangesDocument,
 	type VaultSocketPort,
 	type VaultSocketRegistryPort,
@@ -24,6 +27,13 @@ const attachment = {
 	documentId: "root",
 	kind: "root" as const,
 	deviceId: "device-authority-0001",
+	deviceName: "Authority laptop",
+	principalId: "principal-authority-0001",
+	membershipRevision: 1,
+	deviceCredentialRevision: 1,
+	role: "member" as const,
+	policyVersion: 1,
+	capabilityDigest: "capability-digest-authority-0001",
 	socketId: "socket-authority-0001",
 };
 
@@ -382,9 +392,142 @@ s.test("device revocation closes every active root and body socket for that devi
 	} as never);
 	assert.equal(service.closeDevice("device-revoked"), 2);
 	assert.deepEqual(closed, [
-		"device-revoked:root:device membership revoked",
-		"device-revoked:body-revoked:device membership revoked",
+		"device-revoked:root:device authority changed",
+		"device-revoked:body-revoked:device authority changed",
 	]);
+});
+
+s.test("body awareness is principal-rewritten and confined to the exact body room", async () => {
+	const bodyId = "body-presence-authority-0001";
+	const sent: Array<string | ArrayBuffer | ArrayBufferView> = [];
+	const makeSocket = (overrides: Partial<typeof attachment>): VaultSocketPort => ({
+		deserializeAttachment: () => ({ ...attachment, kind: "body" as const, documentId: bodyId, ...overrides }),
+		serializeAttachment: () => {},
+		send: (message) => { sent.push(message); },
+		close: () => {},
+	});
+	const source = makeSocket({ socketId: "source-presence-socket" });
+	const peer = makeSocket({ deviceId: "peer-device", deviceName: "Peer laptop", socketId: "peer-presence-socket" });
+	const otherBody = makeSocket({ documentId: "body-other-room", socketId: "other-body-socket" });
+	const root = makeSocket({ kind: "root", documentId: "root", socketId: "root-presence-socket" });
+	const service = new VaultSocketService({
+		sockets: registry([source, peer, otherBody, root]),
+		cache: {},
+		vaultId: () => attachment.vaultId,
+		vaultGeneration: () => attachment.vaultGeneration,
+		runtimeEpoch: attachment.runtimeEpoch,
+		isActiveBody: () => true,
+		validateActor: () => true,
+		principalPresence: () => ({ displayName: "Alice", colorSeed: "alice-color-seed" }),
+		scheduleFlush: () => {},
+	} as never);
+	const sourceDoc = new Y.Doc();
+	const sourceAwareness = new Awareness(sourceDoc);
+	sourceAwareness.setLocalState({ user: { name: "Mallory", principalId: "spoofed", deviceName: "Spoofed" } });
+	const encoder = encoding.createEncoder();
+	encoding.writeVarUint(encoder, 1);
+	encoding.writeVarUint8Array(encoder, encodeAwarenessUpdate(sourceAwareness, [sourceDoc.clientID]));
+	await service.message(source, encoding.toUint8Array(encoder).buffer);
+	assert.equal(sent.length, 1, "only the peer in the same body room receives presence");
+	const trustedDecoder = decoding.createDecoder(sent[0] as Uint8Array);
+	assert.equal(decoding.readVarUint(trustedDecoder), 1);
+	const targetDoc = new Y.Doc();
+	const targetAwareness = new Awareness(targetDoc);
+	applyAwarenessUpdate(targetAwareness, decoding.readVarUint8Array(trustedDecoder), "test");
+	const state = [...targetAwareness.getStates().values()].find((candidate) => "user" in candidate) as { user?: Record<string, unknown> };
+	assert.deepEqual(state.user, {
+		name: "Alice",
+		id: attachment.deviceId,
+		principalId: attachment.principalId,
+		deviceId: attachment.deviceId,
+		deviceName: attachment.deviceName,
+		colorSeed: "alice-color-seed",
+		color: "hsl(73, 72%, 52%)",
+		colorLight: "hsla(73, 72%, 52%, 0.2)",
+	});
+	sourceAwareness.destroy();
+	targetAwareness.destroy();
+	sourceDoc.destroy();
+	targetDoc.destroy();
+});
+
+function awarenessFrame(entries: Array<{ clientId: number; clock?: number; state?: unknown }>): ArrayBuffer {
+	const payload = encoding.createEncoder();
+	encoding.writeVarUint(payload, entries.length);
+	for (const entry of entries) {
+		encoding.writeVarUint(payload, entry.clientId);
+		encoding.writeVarUint(payload, entry.clock ?? 1);
+		encoding.writeVarString(payload, JSON.stringify(entry.state ?? { cursor: null }));
+	}
+	const frame = encoding.createEncoder();
+	encoding.writeVarUint(frame, 1);
+	encoding.writeVarUint8Array(frame, encoding.toUint8Array(payload));
+	const bytes = encoding.toUint8Array(frame);
+	return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+}
+
+function presenceService(sockets: VaultSocketPort[]): VaultSocketService {
+	return new VaultSocketService({
+		sockets: registry(sockets),
+		cache: {},
+		vaultId: () => attachment.vaultId,
+		vaultGeneration: () => attachment.vaultGeneration,
+		runtimeEpoch: attachment.runtimeEpoch,
+		isActiveBody: () => true,
+		validateActor: () => true,
+		principalPresence: () => ({ displayName: "Alice", colorSeed: "alice-color-seed" }),
+		scheduleFlush: () => {},
+	} as never);
+}
+
+s.test("awareness rejects frames that claim multiple client identities", async () => {
+	let close: { code: number; reason: string } | null = null;
+	const socket: VaultSocketPort = {
+		deserializeAttachment: () => ({ ...attachment, kind: "body" as const, documentId: "body-presence-multi-id" }),
+		serializeAttachment: () => {},
+		send: () => {},
+		close: (code = 1000, reason = "") => { close = { code, reason }; },
+	};
+	await presenceService([socket]).message(socket, awarenessFrame([
+		{ clientId: 101 },
+		{ clientId: 102 },
+	]));
+	assert.deepEqual(close, { code: 1008, reason: "invalid awareness identity" });
+});
+
+s.test("awareness identity is immutable for the lifetime of a socket", async () => {
+	let current: VaultSocketAttachment = { ...attachment, kind: "body" as const, documentId: "body-presence-stable-id" };
+	let close: { code: number; reason: string } | null = null;
+	const socket: VaultSocketPort = {
+		deserializeAttachment: () => current,
+		serializeAttachment: (value) => { current = value as VaultSocketAttachment; },
+		send: () => {},
+		close: (code = 1000, reason = "") => { close = { code, reason }; },
+	};
+	const service = presenceService([socket]);
+	await service.message(socket, awarenessFrame([{ clientId: 201 }]));
+	assert.equal(current.awarenessClientId, 201);
+	await service.message(socket, awarenessFrame([{ clientId: 202 }]));
+	assert.deepEqual(close, { code: 1008, reason: "awareness identity changed" });
+});
+
+s.test("awareness identity cannot be reused by another socket in the same room", async () => {
+	const documentId = "body-presence-collision";
+	const first: VaultSocketPort = {
+		deserializeAttachment: () => ({ ...attachment, kind: "body" as const, documentId, awarenessClientId: 301 }),
+		serializeAttachment: () => {},
+		send: () => {},
+		close: () => {},
+	};
+	let close: { code: number; reason: string } | null = null;
+	const second: VaultSocketPort = {
+		deserializeAttachment: () => ({ ...attachment, kind: "body" as const, documentId, socketId: "presence-collision-second" }),
+		serializeAttachment: () => {},
+		send: () => {},
+		close: (code = 1000, reason = "") => { close = { code, reason }; },
+	};
+	await presenceService([first, second]).message(second, awarenessFrame([{ clientId: 301 }]));
+	assert.deepEqual(close, { code: 1008, reason: "awareness identity already in use" });
 });
 
 await s.done();

@@ -1,16 +1,15 @@
 import { randomBase64Url } from "../base64url";
-import { hashSecret } from "../identity";
+import { PAIRING_CODE_BYTES, hashSecret, randomSecret } from "../identity";
 import type { VaultRecord } from "../identity";
 import type { PendingDestroyRecord } from "../config";
 import { ActorRecoveryJobExecutor, type RecoveryJobStatus } from "../recoveryExecutor";
 import { RECOVERY_RPC_HEADER, vaultGenerationPrefix } from "../recoveryProtocol";
-import { buildMobileSetupUrl, renderSetupQrDataUrl } from "../setupQr";
+import { buildMobileSetupUrl } from "../setupQr";
 import {
 	buildObsidianPairingUrl,
 	clearOperatorCookieHeader,
 	configFetch,
 	createOperatorSession,
-	mintPairingCode,
 	readOperatorSessionToken,
 	readConsoleState,
 	verifyOperatorSession,
@@ -18,7 +17,7 @@ import {
 import { json } from "./http";
 import { provisionReservedVault } from "./provisioning";
 import type { Env } from "./types";
-import { attemptPendingDeviceRevocation, isPendingDeviceRevocation } from "./enroll";
+import { attemptPendingDeviceRevocation, isPendingDeviceRevocation, settleAuthorizationChange } from "./enroll";
 import { readVault } from "./vault";
 
 async function requireOperator(req: Request, env: Env): Promise<Response | null> {
@@ -147,38 +146,137 @@ export async function handleOperatorProvisionVault(req: Request, env: Env, vault
 export async function handleOperatorPairingCode(req: Request, env: Env): Promise<Response> {
 	const denied = await requireOperator(req, env);
 	if (denied) return denied;
-	let body: { vaultId?: string; purpose?: string };
-	try {
-		body = await req.json();
-	} catch {
-		return json({ error: "invalid json" }, 400);
-	}
-	const vaultId = typeof body.vaultId === "string" ? body.vaultId.trim() : "";
-	if (!vaultId) return json({ error: "invalid vaultId" }, 400);
-	const purpose = body.purpose === "invite" ? "invite" : "device";
-	const minted = await mintPairingCode(env, vaultId, purpose);
-	if ("error" in minted) return json({ error: minted.error }, minted.status);
-	const origin = new URL(req.url).origin;
-	let mobileSetupQrDataUrl: string | null = null;
-	try {
-		mobileSetupQrDataUrl = await renderSetupQrDataUrl(buildMobileSetupUrl(origin, minted.pairingCode));
-	} catch {
-		// The plain URL remains usable.
-	}
 	return json({
-		ok: true,
-		pairingCode: minted.pairingCode,
-		expiresAt: minted.exp,
-		purpose,
-		obsidianUrl: buildObsidianPairingUrl(origin, minted.pairingCode),
-		mobileSetupUrl: buildMobileSetupUrl(origin, minted.pairingCode),
-		mobileSetupQrDataUrl,
+		error: "collaboration_authority_required",
+		message: "Invite people and link personal devices from an enrolled vault. Operators may only issue owner bootstrap or recovery codes.",
+	}, 409);
+}
+
+export async function handleOperatorOwnerCode(req: Request, env: Env, vaultId: string): Promise<Response> {
+	const denied = await requireOperator(req, env);
+	if (denied) return denied;
+	let body: { purpose?: unknown };
+	try { body = await req.json(); } catch { body = {}; }
+	const purpose = body.purpose === "owner-recovery" ? "owner-recovery" : "owner-bootstrap";
+	const pairingCode = randomSecret(PAIRING_CODE_BYTES);
+	const response = await configFetch(env, "/__yaos/collaboration/operator-code", {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ vaultId, purpose, codeHash: await hashSecret(pairingCode) }),
 	});
+	const payload = await response.json().catch(() => null) as { error?: string; code?: { codeId?: string; expiresAt?: number } } | null;
+	if (!response.ok || !payload?.code?.codeId || !Number.isSafeInteger(payload.code.expiresAt)) {
+		return json({ error: payload?.error ?? "owner_code_failed" }, response.ok ? 502 : response.status);
+	}
+	const origin = new URL(req.url).origin;
+	return json({ ok: true, codeId: payload.code.codeId, pairingCode, expiresAt: payload.code.expiresAt, purpose, obsidianUrl: buildObsidianPairingUrl(origin, pairingCode), mobileSetupUrl: buildMobileSetupUrl(origin, pairingCode) });
+}
+
+export async function handleOperatorCollaborationMigration(req: Request, env: Env, vaultId: string): Promise<Response> {
+	const denied = await requireOperator(req, env);
+	if (denied) return denied;
+	let body: Record<string, unknown>;
+	try { body = await req.json(); } catch { return json({ error: "invalid json" }, 400); }
+	const migrationRequest = {
+		vaultId,
+		ownerDeviceIds: body.ownerDeviceIds,
+		ownerDisplayName: body.ownerDisplayName,
+	};
+	const prepared = await configFetch(env, "/__yaos/collaboration/migrate", {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify(migrationRequest),
+	});
+	const preparation = await prepared.json().catch(() => null) as {
+		error?: string;
+		ownerPrincipalId?: string;
+		change?: {
+			changeId?: string;
+			vaultGeneration?: string;
+			requestDigest?: string;
+			subjectDigest?: string;
+			subjects?: unknown[];
+		};
+	} | null;
+	if (!prepared.ok || !preparation?.ownerPrincipalId || !preparation.change?.changeId
+		|| !preparation.change.vaultGeneration || !preparation.change.requestDigest
+		|| !preparation.change.subjectDigest || !Array.isArray(preparation.change.subjects)) {
+		return json({ error: preparation?.error ?? "collaboration_migration_prepare_failed" }, prepared.ok ? 502 : prepared.status);
+	}
+	let migrated: Response;
+	try {
+		migrated = await env.YAOS_SYNC.call(vaultId, new Request("https://internal/__yaos/collaboration-migrate", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				"x-yaos-vault-id": vaultId,
+				"x-yaos-vault-generation": preparation.change.vaultGeneration,
+			},
+			body: JSON.stringify({
+				migrationId: preparation.change.changeId,
+				vaultGeneration: preparation.change.vaultGeneration,
+				requestDigest: preparation.change.requestDigest,
+				subjectDigest: preparation.change.subjectDigest,
+				ownerPrincipalId: preparation.ownerPrincipalId,
+				subjects: preparation.change.subjects,
+			}),
+		}));
+	} catch (error) {
+		const message = error instanceof Error ? error.message : "vault runtime unavailable";
+		await configFetch(env, "/__yaos/collaboration/fail-change", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ changeId: preparation.change.changeId, lastError: message }),
+		}).catch(() => null);
+		return json({ error: "collaboration_migration_vault_unavailable", repairable: true,
+			migrationId: preparation.change.changeId }, 503);
+	}
+	const receipt = await migrated.json().catch(() => null) as Record<string, unknown> | null;
+	if (!migrated.ok || !receipt) {
+		const error = typeof receipt?.error === "string" ? receipt.error : "collaboration_migration_vault_failed";
+		await configFetch(env, "/__yaos/collaboration/fail-change", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ changeId: preparation.change.changeId, lastError: error }),
+		}).catch(() => null);
+		return json({ error,
+			repairable: true, migrationId: preparation.change.changeId }, migrated.ok ? 502 : migrated.status);
+	}
+	let completed: Response;
+	try {
+		completed = await configFetch(env, "/__yaos/collaboration/migrate", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ ...migrationRequest, receipt }),
+		});
+	} catch {
+		return json({ error: "collaboration_migration_finalize_unavailable", repairable: true,
+			migrationId: preparation.change.changeId }, 503);
+	}
+	const completion = await completed.json().catch(() => null) as Record<string, unknown> | null;
+	if (!completed.ok) {
+		const error = typeof completion?.error === "string" ? completion.error : "collaboration_migration_finalize_failed";
+		await configFetch(env, "/__yaos/collaboration/fail-change", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ changeId: preparation.change.changeId, lastError: error }),
+		}).catch(() => null);
+		return json({ error, repairable: true, migrationId: preparation.change.changeId }, completed.status);
+	}
+	return json(completion);
 }
 
 export async function handleOperatorRenameVault(req: Request, env: Env, vaultId: string): Promise<Response> {
 	const denied = await requireOperator(req, env);
 	if (denied) return denied;
+	const state = await readConsoleState(env);
+	if (!state) return json({ error: "config_unavailable" }, 500);
+	if (state.memberships.some((membership) => membership.vaultId === vaultId)) {
+		return json({
+			error: "collaboration_authority_required",
+			message: "An enrolled vault owner must rename this vault.",
+		}, 409);
+	}
 	let body: { name?: unknown };
 	try {
 		body = await req.json();
@@ -344,12 +442,29 @@ export async function attemptVaultCleanup(
 export async function handleOperatorDestroyVault(req: Request, env: Env, vaultId: string): Promise<Response> {
 	const denied = await requireOperator(req, env);
 	if (denied) return denied;
+	let body: { governanceRequestId?: unknown };
+	try { body = await req.json(); } catch { body = {}; }
+	if (typeof body.governanceRequestId !== "string" || !body.governanceRequestId) {
+		return json({ error: "destroy_confirmation_required", message: "Confirm a durable owner destruction request." }, 409);
+	}
+	const confirmed = await configFetch(env, "/__yaos/collaboration/operator-confirm-destroy", {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ vaultId, governanceRequestId: body.governanceRequestId }),
+	});
+	const confirmation = await confirmed.json().catch(() => null) as { error?: string; governanceRequest?: { state?: string } } | null;
+	if (!confirmed.ok) return json({ error: confirmation?.error ?? "destroy_confirmation_failed" }, confirmed.status);
+	if (confirmation?.governanceRequest?.state === "complete") return json({ ok: true, completed: true, replayed: true });
+	return executeConfirmedVaultDestroy(env, vaultId, body.governanceRequestId);
+}
+
+async function executeConfirmedVaultDestroy(env: Env, vaultId: string, governanceRequestId: string): Promise<Response> {
 	let registry: Response;
 	try {
 		registry = await configFetch(env, "/__yaos/destroy-vault", {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ vaultId }),
+			body: JSON.stringify({ vaultId, governanceRequestId }),
 		});
 	} catch {
 		return json({ error: "destroy_registry_unavailable" }, 503);
@@ -403,6 +518,41 @@ export async function handleOperatorDestroyVault(req: Request, env: Env, vaultId
 		pending: updatePayload?.pending ?? cleanup,
 		error: updatePayload?.error ?? cleanup.lastError ?? "destroy_pending",
 	}, 202);
+}
+
+export async function handleOperatorEmergencyDestroyVault(req: Request, env: Env, vaultId: string): Promise<Response> {
+	const denied = await requireOperator(req, env);
+	if (denied) return denied;
+	let body: { requestId?: unknown; reason?: unknown };
+	try { body = await req.json(); } catch { return json({ error: "invalid json" }, 400); }
+	const prepared = await configFetch(env, "/__yaos/collaboration/operator-emergency-destroy", {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ vaultId, requestId: body.requestId, reason: body.reason }),
+	});
+	const payload = await prepared.json().catch(() => null) as { error?: string; governanceRequest?: { governanceRequestId?: string; state?: string } } | null;
+	if (!prepared.ok || !payload?.governanceRequest?.governanceRequestId) {
+		return json({ error: payload?.error ?? "emergency_destroy_prepare_failed" }, prepared.ok ? 502 : prepared.status);
+	}
+	if (payload.governanceRequest.state === "complete") return json({ ok: true, completed: true, replayed: true });
+	return executeConfirmedVaultDestroy(env, vaultId, payload.governanceRequest.governanceRequestId);
+}
+
+export async function handleOperatorRetryAuthorizationChange(req: Request, env: Env, vaultId: string, changeId: string): Promise<Response> {
+	const denied = await requireOperator(req, env);
+	if (denied) return denied;
+	const pending = await configFetch(env, "/__yaos/collaboration/pending-changes", {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ vaultId }),
+	});
+	const payload = await pending.json().catch(() => null) as { changes?: import("../collaborationIdentity").AuthorizationChangeRecord[]; error?: string } | null;
+	if (!pending.ok) return json({ error: payload?.error ?? "authorization_changes_unavailable" }, pending.status);
+	const change = payload?.changes?.find((record) => record.changeId === changeId && record.vaultId === vaultId);
+	if (!change) return json({ error: "authorization_change_missing" }, 404);
+	return await settleAuthorizationChange(env, change)
+		? json({ ok: true, changeId })
+		: json({ ok: false, error: "authorization_fence_pending", changeId }, 202);
 }
 
 export async function handleOperatorVaultDeletionStatus(req: Request, env: Env, vaultId: string): Promise<Response> {

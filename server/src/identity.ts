@@ -1,7 +1,7 @@
 import { randomBase64Url } from "./base64url";
 import { sha256Hex } from "./hex";
 
-export const CONFIG_FORMAT = 2 as const;
+export const CONFIG_FORMAT = 3 as const;
 export const PAIRING_CODE_TTL_MS = 15 * 60 * 1_000;
 export const OPERATOR_SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1_000;
 export const DEVICE_TOKEN_BYTES = 32;
@@ -24,14 +24,21 @@ const MAX_DEVICE_NAME_LENGTH = 80;
 const MAX_RECORD_COUNT = 1_000_000;
 const MAX_CORRUPT_STATE_ERROR_LENGTH = 192;
 
-type IdentityCollection =
+export type IdentityCollection =
 	| "vaults"
 	| "devices"
 	| "pairingCodes"
 	| "operatorSessions"
 	| "pendingVaultDestroys"
 	| "pendingDeviceRevocations"
-	| "enrollmentReplays";
+	| "enrollmentReplays"
+	| "principals"
+	| "vaultMemberships"
+	| "collaborationCodes"
+	| "ownershipTransfers"
+	| "authorizationChanges"
+	| "securityAuditEvents"
+	| "vaultGovernanceRequests";
 
 export class CorruptIdentityStateError extends Error {
 	readonly code = "corrupt_identity_state";
@@ -45,10 +52,14 @@ export class CorruptIdentityStateError extends Error {
 export type DeviceRecord = {
 	deviceId: string;
 	vaultId: string;
+	principalId?: string;
 	tokenHash: string;
+	credentialRevision?: number;
 	name: string;
+	state?: "active" | "changing" | "revoking" | "revoked";
 	enrolledAt: number;
 	lastSeenAt?: number;
+	revokedAt?: number | null;
 };
 
 export type PairingCodeRecord = {
@@ -62,7 +73,7 @@ export type PairingCodeRecord = {
 	createdAt: number;
 };
 
-export type VaultState = "provisioning" | "active" | "deleting" | "delete_failed";
+export type VaultState = "provisioning" | "awaiting_owner" | "active" | "deleting" | "delete_failed";
 
 export type VaultRecord = {
 	vaultId: string;
@@ -71,6 +82,7 @@ export type VaultRecord = {
 	vaultGeneration: string;
 	createdAt: number;
 	provisionedAt: number | null;
+	ownerPrincipalId?: string | null;
 };
 
 export type OperatorSessionRecord = {
@@ -179,9 +191,12 @@ export function parseVaultRecords(value: unknown): VaultRecord[] {
 	const generations = new Set<string>();
 	return records.map((item, index) => {
 		const record = readRecord(item, collection, index);
+		const hasOwnerPrincipalId = Object.prototype.hasOwnProperty.call(record, "ownerPrincipalId");
 		requireExactKeys(
 			record,
-			["vaultId", "name", "state", "vaultGeneration", "createdAt", "provisionedAt"],
+			hasOwnerPrincipalId
+				? ["vaultId", "name", "state", "vaultGeneration", "createdAt", "provisionedAt", "ownerPrincipalId"]
+				: ["vaultId", "name", "state", "vaultGeneration", "createdAt", "provisionedAt"],
 			collection,
 			index,
 		);
@@ -200,6 +215,7 @@ export function parseVaultRecords(value: unknown): VaultRecord[] {
 		if (
 			record.state !== "provisioning"
 			&& record.state !== "active"
+			&& record.state !== "awaiting_owner"
 			&& record.state !== "deleting"
 			&& record.state !== "delete_failed"
 		) {
@@ -214,6 +230,15 @@ export function parseVaultRecords(value: unknown): VaultRecord[] {
 		if ((record.state === "provisioning") !== (provisionedAt === null)) {
 			corrupt(collection, `record ${index} has inconsistent provisioning state`);
 		}
+		let ownerPrincipalId: string | null | undefined;
+		if (hasOwnerPrincipalId) {
+			ownerPrincipalId = record.ownerPrincipalId === null
+				? null
+				: readString(record.ownerPrincipalId, MAX_ID_LENGTH, collection, index, "ownerPrincipalId");
+			if (record.state === "active" && ownerPrincipalId === null) {
+				corrupt(collection, `record ${index} has active vault without ownerPrincipalId`);
+			}
+		}
 		requireUnique(vaultIds, vaultId, collection, "vaultId");
 		requireUnique(generations, vaultGeneration, collection, "vaultGeneration");
 		return {
@@ -223,6 +248,7 @@ export function parseVaultRecords(value: unknown): VaultRecord[] {
 			vaultGeneration,
 			createdAt,
 			provisionedAt,
+			...(hasOwnerPrincipalId ? { ownerPrincipalId } : {}),
 		};
 	});
 }
@@ -235,11 +261,16 @@ export function parseDeviceRecords(value: unknown, knownVaultIds?: ReadonlySet<s
 	return records.map((item, index) => {
 		const record = readRecord(item, collection, index);
 		const hasLastSeenAt = Object.prototype.hasOwnProperty.call(record, "lastSeenAt");
+		const isV3 = Object.prototype.hasOwnProperty.call(record, "principalId");
 		requireExactKeys(
 			record,
-			hasLastSeenAt
-				? ["deviceId", "vaultId", "tokenHash", "name", "enrolledAt", "lastSeenAt"]
-				: ["deviceId", "vaultId", "tokenHash", "name", "enrolledAt"],
+			isV3
+				? (hasLastSeenAt
+					? ["deviceId", "vaultId", "principalId", "tokenHash", "credentialRevision", "name", "state", "enrolledAt", "lastSeenAt", "revokedAt"]
+					: ["deviceId", "vaultId", "principalId", "tokenHash", "credentialRevision", "name", "state", "enrolledAt", "revokedAt"])
+				: hasLastSeenAt
+					? ["deviceId", "vaultId", "tokenHash", "name", "enrolledAt", "lastSeenAt"]
+					: ["deviceId", "vaultId", "tokenHash", "name", "enrolledAt"],
 			collection,
 			index,
 		);
@@ -251,7 +282,12 @@ export function parseDeviceRecords(value: unknown, knownVaultIds?: ReadonlySet<s
 		const tokenHash = readHash(record.tokenHash, collection, index, "tokenHash");
 		const enrolledAt = readTimestamp(record.enrolledAt, collection, index, "enrolledAt");
 		let lastSeenAt: number | undefined;
-		if (hasLastSeenAt) {
+		if (isV3 && hasLastSeenAt) {
+			if (record.lastSeenAt !== null) {
+				lastSeenAt = readTimestamp(record.lastSeenAt, collection, index, "lastSeenAt");
+				if (lastSeenAt < enrolledAt) corrupt(collection, `record ${index} has invalid lastSeenAt`);
+			}
+		} else if (hasLastSeenAt) {
 			lastSeenAt = readTimestamp(record.lastSeenAt, collection, index, "lastSeenAt");
 			if (lastSeenAt < enrolledAt) corrupt(collection, `record ${index} has invalid lastSeenAt`);
 		}
@@ -260,6 +296,30 @@ export function parseDeviceRecords(value: unknown, knownVaultIds?: ReadonlySet<s
 		}
 		requireUnique(deviceIds, deviceId, collection, "deviceId");
 		requireUnique(tokenHashes, tokenHash, collection, "tokenHash");
+		if (isV3) {
+			const principalId = readString(record.principalId, MAX_ID_LENGTH, collection, index, "principalId");
+			const credentialRevision = readCount(record.credentialRevision, collection, index, "credentialRevision", 1);
+			if (record.state !== "active" && record.state !== "changing" && record.state !== "revoking" && record.state !== "revoked") {
+				corrupt(collection, `record ${index} has invalid state`);
+			}
+			let revokedAt: number | null = null;
+			if (record.revokedAt !== null) revokedAt = readTimestamp(record.revokedAt, collection, index, "revokedAt");
+			if ((record.state === "revoked") !== (revokedAt !== null)) {
+				corrupt(collection, `record ${index} has inconsistent revokedAt`);
+			}
+			return {
+				deviceId,
+				vaultId,
+				principalId,
+				tokenHash,
+				credentialRevision,
+				name: readString(record.name, MAX_DEVICE_NAME_LENGTH, collection, index, "name"),
+				state: record.state,
+				enrolledAt,
+				...(lastSeenAt === undefined ? {} : { lastSeenAt }),
+				revokedAt,
+			};
+		}
 		return {
 			deviceId,
 			vaultId,

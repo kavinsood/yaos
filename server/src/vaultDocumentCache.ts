@@ -9,6 +9,7 @@ import {
 } from "./contracts";
 import type { VaultStore } from "./vaultStore";
 import type { ReconstructedDocument } from "./vaultDocumentStore";
+import type { VaultActorContext } from "./collaboration";
 
 export interface LoadedVaultDocument {
 	doc: Y.Doc;
@@ -23,6 +24,7 @@ export interface PendingVaultUpdate {
 	bytes: Uint8Array;
 	digest: string;
 	socketId: string;
+	actor?: VaultActorContext;
 }
 
 export type CachePressureReason =

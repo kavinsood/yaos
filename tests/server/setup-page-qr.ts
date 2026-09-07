@@ -1,6 +1,6 @@
 import { handleClaimRoute } from "../../server/src/routes/auth";
 import type { AuthState, Env } from "../../server/src/routes/types";
-import { renderMobileSetupPage, renderSetupPage } from "../../server/src/setupPage";
+import { renderMobileSetupPage, renderOperatorConsole, renderSetupPage } from "../../server/src/setupPage";
 import { buildMobileSetupUrl, renderSetupQrDataUrl } from "../../server/src/setupQr";
 import { makeConfigNamespace, makeEnv, makeVaultSyncNamespace } from "../mocks/workerEnv.ts";
 import { suite } from "../harness.ts";
@@ -35,6 +35,23 @@ s.section("setup pages use honest identity names");
 	s.check(setup.includes("operatorRecoveryKey"), "claim body names the operator recovery key");
 	s.check(setup.includes("pairingCode"), "claim page uses pairing code for enrollment");
 	s.check(mobile.includes('params.get("pairingCode")'), "mobile page reads pairingCode");
+}
+
+s.section("operator console owns collaboration bootstrap, recovery, and migration rituals");
+{
+	const consolePage = renderOperatorConsole({ host, attachments: true, snapshots: true });
+	s.check(consolePage.includes("Each vault has one owner and full content members"), "console explains the fixed owner/member model");
+	s.check(consolePage.includes('dataset.ownerCodePurpose = "owner-bootstrap"')
+		&& consolePage.includes('dataset.ownerCodePurpose = "owner-recovery"'), "console renders distinct owner bootstrap and recovery actions");
+	s.check(consolePage.includes('/owner-code"') && consolePage.includes('JSON.stringify({ purpose })'), "owner code request is purpose-bound");
+	s.check(consolePage.includes("This secret is shown only in this result")
+		&& consolePage.includes("reloading removes it from the console"), "one-use owner secret is presented as an ephemeral result");
+	s.check(consolePage.includes("Choose every existing device that belongs to the owner")
+		&& consolePage.includes("every unselected device becomes a separate full member"), "migration makes device grouping consequences explicit");
+	s.check(consolePage.includes('/collaboration-migrate"')
+		&& consolePage.includes("JSON.stringify({ ownerDeviceIds, ownerDisplayName })"), "migration sends only reviewed owner grouping and display name");
+	s.check(consolePage.includes("The migration response was lost")
+		&& consolePage.includes("prepared authority change is repairable"), "uncertain migration failures reload durable repair truth");
 }
 
 s.section("claim stores only recovery hash and returns pairing material");

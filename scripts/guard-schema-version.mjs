@@ -1,16 +1,16 @@
 #!/usr/bin/env node
 /**
- * Enforce the schema-6 ownership contract.
+ * Enforce the schema-7 ownership contract.
  *
  * The plugin owns its pin in src/sync/schema.ts. The server owns its pin in
  * server/src/shared/productVersions.ts and exposes that same symbol through
  * server/src/version.ts. Both canonical sources must exist, the plugin source
- * must remain on schema 6, and the server source must match it exactly.
+ * must remain on schema 7, and the server source must match it exactly.
  */
 
 import { readFileSync, existsSync } from "node:fs";
 
-const EXPECTED_PLUGIN_SCHEMA_VERSION = 6;
+const EXPECTED_PLUGIN_SCHEMA_VERSION = 7;
 let failures = 0;
 
 function fail(msg) {
