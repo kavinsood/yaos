@@ -1,4 +1,5 @@
 import { vaultIdbName } from "./vaultPersistence";
+import type { StoredBodySettlement } from "./bodySettlement";
 
 export interface StoredDocument {
 	documentId: string;
@@ -121,7 +122,7 @@ export function assertResetAllowed(
 }
 
 
-const DATABASE_VERSION = 4;
+const DATABASE_VERSION = 5;
 const DOCUMENTS = "documents";
 const CANDIDATES = "pendingCandidates";
 const LIFECYCLE = "lifecycleOperations";
@@ -132,6 +133,7 @@ const FEED_CURSOR = "feedCursor";
 const PATHS = "paths";
 const RECOVERY_STATE = "recoveryState";
 const ATTACHMENT_SEQUENCE = "attachmentSequence";
+const BODY_SETTLEMENTS = "bodySettlements";
 const SCHEMA_5_DATABASE_SUFFIX = ":schema-5";
 
 function transactionDone(transaction: IDBTransaction): Promise<void> {
@@ -192,6 +194,7 @@ export class VaultIndexedDb {
 					db.createObjectStore(ATTACHMENT_OPERATIONS, { keyPath: "mutation.operationId" });
 				}
 				if (event.oldVersion < 4) db.createObjectStore(ATTACHMENT_SEQUENCE);
+				if (event.oldVersion < 5) db.createObjectStore(BODY_SETTLEMENTS, { keyPath: "bodyId" });
 			};
 			request.onsuccess = () => resolve(request.result);
 			request.onerror = () => reject(request.error ?? new Error(`Failed to open ${this.databaseName}`));
@@ -217,6 +220,42 @@ export class VaultIndexedDb {
 		const db = await this.database;
 		const transaction = db.transaction(DOCUMENTS, "readwrite");
 		transaction.objectStore(DOCUMENTS).delete(documentId);
+		await transactionDone(transaction);
+	}
+
+	async getBodySettlement(bodyId: string): Promise<StoredBodySettlement | null> {
+		const db = await this.database;
+		const transaction = db.transaction(BODY_SETTLEMENTS, "readonly");
+		const value = await requestValue(transaction.objectStore(BODY_SETTLEMENTS).get(bodyId)) as
+			| StoredBodySettlement
+			| undefined;
+		await transactionDone(transaction);
+		return value ?? null;
+	}
+
+	async compareAndSwapBodySettlement(
+		settlement: StoredBodySettlement,
+		expectedLocalSettlementRevision: number | null,
+	): Promise<boolean> {
+		const db = await this.database;
+		const transaction = db.transaction(BODY_SETTLEMENTS, "readwrite");
+		const store = transaction.objectStore(BODY_SETTLEMENTS);
+		const current = await requestValue(store.get(settlement.bodyId)) as StoredBodySettlement | undefined;
+		const currentRevision = current?.localSettlementRevision ?? null;
+		if (currentRevision !== expectedLocalSettlementRevision) {
+			transaction.abort();
+			try { await transactionDone(transaction); } catch { /* expected abort */ }
+			return false;
+		}
+		store.put(structuredClone(settlement));
+		await transactionDone(transaction);
+		return true;
+	}
+
+	async deleteBodySettlement(bodyId: string): Promise<void> {
+		const db = await this.database;
+		const transaction = db.transaction(BODY_SETTLEMENTS, "readwrite");
+		transaction.objectStore(BODY_SETTLEMENTS).delete(bodyId);
 		await transactionDone(transaction);
 	}
 	async putPendingCandidate(candidate: StoredBodyCandidate): Promise<void> {
@@ -568,6 +607,7 @@ export class VaultIndexedDb {
 			FEED_CURSOR,
 			PATHS,
 			RECOVERY_STATE,
+			BODY_SETTLEMENTS,
 		];
 		const transaction = db.transaction(stores, "readwrite");
 		const summary = await this.readPendingWorkSummary(transaction);

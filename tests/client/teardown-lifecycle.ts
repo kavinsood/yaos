@@ -12,7 +12,9 @@ s.section("Teardown lifecycle");
 {
 	const lifecycle = new RuntimeTeardownCoordinator();
 	const initialGeneration = lifecycle.beginInitialization();
+	const operationEpoch = lifecycle.captureOperationEpoch();
 	s.check(initialGeneration !== null, "initialization starts while the lifecycle is open");
+	s.check(operationEpoch?.isCurrent() === true, "runtime publication epoch starts current");
 	s.check(
 		initialGeneration !== null && lifecycle.isInitializationCurrent(initialGeneration),
 		"current initialization generation is accepted before teardown",
@@ -34,6 +36,7 @@ s.section("Teardown lifecycle");
 	s.check(first === second, "concurrent teardown callers receive one retained promise");
 	s.check(teardownRuns === 1, "concurrent teardown callers do not run cleanup twice");
 	s.check(lifecycle.isClosing, "teardown closes the lifecycle synchronously");
+	s.check(operationEpoch?.isCurrent() === false, "teardown synchronously invalidates operation publication rights");
 	s.check(!lifecycle.reopenAfterTeardown(), "reset cannot reopen while teardown is still pending");
 	s.check(lifecycle.beginInitialization() === null, "closing gate rejects late initialization");
 	s.check(
@@ -48,6 +51,7 @@ s.section("Teardown lifecycle");
 	s.check(lifecycle.reopenAfterTeardown(), "intentional reset can reopen a completed teardown");
 	const restartedGeneration = lifecycle.beginInitialization();
 	s.check(restartedGeneration !== null, "reopened lifecycle permits reset initialization");
+	s.check(lifecycle.captureOperationEpoch()?.isCurrent() === true, "reopened lifecycle owns a fresh operation epoch");
 
 	lifecycle.requestPermanentShutdown();
 	s.check(lifecycle.beginInitialization() === null, "permanent unload gate rejects initialization");

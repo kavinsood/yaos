@@ -1,4 +1,5 @@
 import { App, Platform, apiVersion, normalizePath } from "obsidian";
+import { canonicalizeMarkdown, canonicalMarkdownHash } from "@shared/markdownCodec";
 import { deriveSyncFacts } from "../../runtime/connectionFacts";
 import type {
 	BlobSyncSnapshot,
@@ -80,9 +81,9 @@ export class DiagnosticsService {
 		const diskHashes = new Map<string, { hash: string; length: number }>();
 		for (const file of diskFiles) {
 			try {
-				const content = await this.deps.app.vault.read(file);
+				const content = canonicalizeMarkdown(await this.deps.app.vault.read(file));
 				diskHashes.set(file.path, {
-					hash: await sha256TextHex(content),
+					hash: await canonicalMarkdownHash(content),
 					length: content.length,
 				});
 			} catch (err) {
@@ -94,10 +95,11 @@ export class DiagnosticsService {
 		const crdtHashes = new Map<string, { hash: string; length: number }>();
 		for (const path of activePaths) {
 			if (!this.deps.isMarkdownPathSyncable(path)) continue;
-			const content = vaultSync.getPathContent(path);
+			const rawContent = vaultSync.getPathContent(path);
+			const content = rawContent === null ? null : canonicalizeMarkdown(rawContent);
 			if (content === null) continue;
 			crdtHashes.set(path, {
-				hash: await sha256TextHex(content),
+				hash: await canonicalMarkdownHash(content),
 				length: content.length,
 			});
 		}
@@ -177,6 +179,9 @@ export class DiagnosticsService {
 			openFiles: await this.deps.collectOpenFileTraceState(),
 			diskMirrorSnapshot: this.deps.getDiskMirrorSnapshot(),
 			blobSyncSnapshot,
+			bodyResidencySnapshot: vaultSync.getBodyResidencySnapshot?.() ?? null,
+			residencyAdmissionSnapshot: vaultSync.getResidencyAdmissionSnapshot?.() ?? null,
+			overdueWorkDiagnostics: vaultSync.getOverdueWorkDiagnostics?.() ?? null,
 			frontmatterQuarantine: this.deps.getFrontmatterQuarantineEntries(),
 			sha256Hex: sha256TextHex,
 		};

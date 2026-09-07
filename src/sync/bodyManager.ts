@@ -1,5 +1,31 @@
 import * as Y from "yjs";
 import type { StoredDocument } from "./vaultIndexedDb";
+import {
+	BodyCoordinator,
+	type BodyLease,
+	type BodyRevisionToken,
+} from "./bodyCoordinator";
+import { RuntimeScope } from "../runtime/operationLifecycle";
+import {
+	BODY_RESIDENCY_ESTIMATOR_VERSION,
+	EMPTY_BODY_EXTERNAL_RESOURCE_SIGNALS,
+	EMPTY_SHARED_RESIDENCY_RESOURCE_SIGNALS,
+	estimateColdLoadAdmission,
+	estimateSharedResidencyBytes,
+	estimateReconstructionReservation,
+	measureBodyResidency,
+	normalizeBodyExternalResourceSignals,
+	normalizeSharedResidencyResourceSignals,
+	numericDistribution,
+	type BodyEvictionBlocker,
+	type BodyExternalResourceSignals,
+	type BodyResidencyMeasurement,
+	type BodyResidencySnapshot,
+	type ColdLoadAdmissionEstimate,
+	type SharedResidencyResourceSignals,
+	type TemporaryResidencyKind,
+	type TemporaryResidencyReservation,
+} from "./bodyResidencyAccounting";
 export const DEFAULT_BODY_ESTIMATED_COST_BUDGET = 48 * 1024 * 1024;
 
 export interface DocumentStore {
@@ -11,6 +37,7 @@ export interface BodyCostInput {
 	bodyId: string;
 	doc: Y.Doc;
 	encodedBytes: number;
+	measurement: BodyResidencyMeasurement;
 }
 
 export interface BodyCostChange {
@@ -28,6 +55,12 @@ export interface BodyManagerLimits {
 	estimatedCost: number;
 }
 
+export interface BodyTemporaryReservationLease {
+	readonly reservation: TemporaryResidencyReservation;
+	readonly released: boolean;
+	release(): void;
+}
+
 const DEFAULT_BODY_MANAGER_LIMITS: BodyManagerLimits = {
 	estimatedCost: DEFAULT_BODY_ESTIMATED_COST_BUDGET,
 };
@@ -42,19 +75,38 @@ export interface LoadedBody {
 	pins: number;
 	lastUsedAt: number;
 	estimatedCost: number;
+	residencyMeasurement: BodyResidencyMeasurement;
 }
 
 /** Explicit body lifecycle and clean-only eviction for the canonical vault. */
 export class BodyManager {
 	private readonly loaded = new Map<string, LoadedBody>();
 	private readonly loading = new Map<string, Promise<LoadedBody>>();
+	private readonly updateObservers = new Map<string, (update: Uint8Array, origin: unknown) => void>();
+	private readonly externalResourceSignals = new Map<string, BodyExternalResourceSignals>();
+	private readonly temporaryReservations = new Map<string, TemporaryResidencyReservation>();
 	private admissionTail: Promise<void> = Promise.resolve();
+	private nextReservationId = 0;
+	private sharedResourceSignals = EMPTY_SHARED_RESIDENCY_RESOURCE_SIGNALS;
+	private loadRequests = 0;
+	private loadCacheHits = 0;
+	private loadJoinedInFlight = 0;
+	private coldLoads = 0;
+	private loadFailures = 0;
+	private readonly loadLatenciesMs: number[] = [];
+	private completedEvictions = 0;
+	private blockedEvictionAttempts = 0;
+	private readonly blockerObservations = new Map<BodyEvictionBlocker, number>();
+	private highWaterResidentBytes = 0;
+	private highWaterAccountedBytes = 0;
+	private highWaterLoadedBodies = 0;
 
 	constructor(
 		private readonly database: DocumentStore,
 		private readonly now: () => number = Date.now,
 		private readonly costHooks: BodyCostAccountingHooks = {},
 		private readonly limits: BodyManagerLimits = DEFAULT_BODY_MANAGER_LIMITS,
+		readonly coordinator: BodyCoordinator = new BodyCoordinator(new RuntimeScope()),
 	) {
 		if (!Number.isSafeInteger(limits.estimatedCost) || limits.estimatedCost < 0) {
 			throw new Error("body estimated-cost limit must be a non-negative safe integer");
@@ -62,18 +114,33 @@ export class BodyManager {
 	}
 
 	async load(bodyId: string): Promise<LoadedBody> {
+		this.loadRequests++;
 		const existing = this.loaded.get(bodyId);
 		if (existing) {
+			this.loadCacheHits++;
 			existing.lastUsedAt = this.now();
 			return existing;
 		}
 		const inFlight = this.loading.get(bodyId);
-		if (inFlight) return inFlight;
+		if (inFlight) {
+			this.loadJoinedInFlight++;
+			return inFlight;
+		}
+		this.coldLoads++;
+		const startedAt = this.now();
+		this.coordinator.setResidency(bodyId, "loading");
 		const run = this.loadFresh(bodyId);
 		this.loading.set(bodyId, run);
 		try {
 			return await run;
+		} catch (error) {
+			this.loadFailures++;
+			if (!this.loaded.has(bodyId) && this.coordinator.snapshot(bodyId)?.lifetime === "accepting") {
+				this.coordinator.setResidency(bodyId, "absent");
+			}
+			throw error;
 		} finally {
+			this.recordLoadLatency(Math.max(0, this.now() - startedAt));
 			this.loading.delete(bodyId);
 		}
 	}
@@ -97,6 +164,7 @@ export class BodyManager {
 		if (!body) throw new Error(`body ${bodyId} is not loaded`);
 		body.pendingLocalUpdates++;
 		body.dirty = true;
+		this.coordinator.setSynchronization(bodyId, "locally-pending");
 		body.lastUsedAt = this.now();
 		await this.persist(body);
 	}
@@ -105,6 +173,7 @@ export class BodyManager {
 		const body = this.loaded.get(bodyId);
 		if (!body) throw new Error(`body ${bodyId} is not loaded`);
 		body.dirty = true;
+		this.coordinator.setSynchronization(bodyId, "locally-pending");
 		body.lastUsedAt = this.now();
 		await this.persist(body);
 	}
@@ -114,6 +183,7 @@ export class BodyManager {
 		if (!body) throw new Error(`body ${bodyId} is not loaded`);
 		body.unsettled++;
 		body.dirty = true;
+		this.coordinator.setSynchronization(bodyId, "durably-pending");
 		body.lastUsedAt = this.now();
 	}
 
@@ -131,6 +201,10 @@ export class BodyManager {
 			body.pendingLocalUpdates - capturedLocalUpdates,
 		);
 		body.dirty = body.unsettled > 0 || body.pendingLocalUpdates > 0;
+		this.coordinator.setSynchronization(
+			bodyId,
+			body.dirty ? "durably-pending" : "clean",
+		);
 		body.lastUsedAt = this.now();
 		await this.persist(body);
 	}
@@ -145,13 +219,18 @@ export class BodyManager {
 		return this.withAdmission(async () => {
 			const current = this.loaded.get(bodyId);
 			if (!current || current !== body) throw new Error(`body ${bodyId} changed while merging server state`);
+			const scratch = this.reserveTemporary(
+				"server-reconstruction",
+				bodyId,
+				estimateReconstructionReservation(encodedState.byteLength, body.residencyMeasurement),
+			);
 			const candidate = new Y.Doc({ guid: bodyId });
 			try {
 				Y.applyUpdate(candidate, Y.encodeStateAsUpdate(body.doc), "budget-baseline");
 				if (encodedState.byteLength > 0) Y.applyUpdate(candidate, encodedState, "server-catch-up");
 				const candidateState = Y.encodeStateAsUpdate(candidate);
-				const nextCost = this.measureCost(bodyId, candidate, candidateState.byteLength);
-				if (!await this.ensureEstimatedCostCapacity(bodyId, nextCost)) {
+				const next = this.measureCost(bodyId, candidate, candidateState.byteLength);
+				if (!await this.ensureEstimatedCostCapacity(bodyId, next.cost)) {
 					throw new Error("body_estimated_cost_budget");
 				}
 				if (encodedState.byteLength > 0) Y.applyUpdate(body.doc, encodedState, "server-catch-up");
@@ -161,6 +240,7 @@ export class BodyManager {
 				return body;
 			} finally {
 				candidate.destroy();
+				scratch.release();
 			}
 		});
 	}
@@ -176,12 +256,17 @@ export class BodyManager {
 			) {
 				throw new Error(`cannot replace dirty, unsettled, pending, or pinned body ${bodyId}`);
 			}
+			const scratch = this.reserveTemporary(
+				"server-replacement",
+				bodyId,
+				estimateReconstructionReservation(encodedState.byteLength),
+			);
 			const doc = new Y.Doc({ guid: bodyId });
 			try {
 				if (encodedState.byteLength > 0) Y.applyUpdate(doc, encodedState, "server-bootstrap");
 				const canonicalState = Y.encodeStateAsUpdate(doc);
-				const nextCost = this.measureCost(bodyId, doc, canonicalState.byteLength);
-				if (!await this.ensureEstimatedCostCapacity(bodyId, nextCost)) {
+				const next = this.measureCost(bodyId, doc, canonicalState.byteLength);
+				if (!await this.ensureEstimatedCostCapacity(bodyId, next.cost)) {
 					throw new Error("body_estimated_cost_budget");
 				}
 				const body: LoadedBody = {
@@ -193,7 +278,8 @@ export class BodyManager {
 					pendingLocalUpdates: 0,
 					pins: 0,
 					lastUsedAt: this.now(),
-					estimatedCost: nextCost,
+					estimatedCost: next.cost,
+					residencyMeasurement: next.measurement,
 				};
 				await this.database.putDocument({
 					documentId: bodyId,
@@ -203,31 +289,50 @@ export class BodyManager {
 					pendingLocalUpdates: 0,
 					updatedAt: this.now(),
 				});
+				if (prior) this.detachUpdateObserver(prior);
 				this.loaded.set(bodyId, body);
+				this.coordinator.installDocument(bodyId);
+				this.attachUpdateObserver(body);
+				this.coordinator.setResidency(bodyId, "warm");
 				prior?.doc.destroy();
 				const previousCost = prior?.estimatedCost ?? 0;
-				if (previousCost !== nextCost) {
-					this.costHooks.onChange?.({ bodyId, previousCost, currentCost: nextCost });
+				if (previousCost !== next.cost) {
+					this.costHooks.onChange?.({ bodyId, previousCost, currentCost: next.cost });
 				}
+				this.updateHighWater();
 				return body;
 			} catch (error) {
 				doc.destroy();
 				throw error;
+			} finally {
+				scratch.release();
 			}
 		});
 	}
 
-	async evict(bodyId: string): Promise<boolean> {
+	async evict(bodyId: string, expectedRevision?: BodyRevisionToken): Promise<boolean> {
 		const body = this.loaded.get(bodyId);
 		if (!body) return true;
-		if (
-			body.dirty
-			|| body.unsettled > 0
-			|| body.pendingLocalUpdates > 0
-			|| body.pins > 0
-		) return false;
+		if (expectedRevision && !this.isRevisionCurrent(expectedRevision)) return false;
+		const blockers = this.evictionBlockers(body);
+		if (blockers.length > 0) {
+			this.blockedEvictionAttempts++;
+			for (const blocker of blockers) {
+				this.blockerObservations.set(blocker, (this.blockerObservations.get(blocker) ?? 0) + 1);
+			}
+			return false;
+		}
+		this.coordinator.setResidency(bodyId, "evicting");
 		await this.persist(body);
+		if ((expectedRevision && !this.isRevisionCurrent(expectedRevision))
+			|| this.evictionBlockers(body).length > 0) {
+			if (this.coordinator.snapshot(bodyId)?.lifetime === "accepting") {
+				this.coordinator.setResidency(bodyId, "warm");
+			}
+			return false;
+		}
 		this.removeLoaded(body);
+		this.completedEvictions++;
 		return true;
 	}
 
@@ -251,6 +356,20 @@ export class BodyManager {
 
 	get(bodyId: string): LoadedBody | null {
 		return this.loaded.get(bodyId) ?? null;
+	}
+
+	acquireLease(bodyId: string): BodyLease {
+		if (!this.loaded.has(bodyId)) throw new Error(`body ${bodyId} is not loaded`);
+		return this.coordinator.acquireLease(bodyId);
+	}
+
+	captureRevision(bodyId: string): BodyRevisionToken {
+		if (!this.loaded.has(bodyId)) throw new Error(`body ${bodyId} is not loaded`);
+		return this.coordinator.capture(bodyId);
+	}
+
+	isRevisionCurrent(token: BodyRevisionToken): boolean {
+		return this.coordinator.isCurrent(token);
 	}
 	discardTransient(bodyId: string): void {
 		const body = this.loaded.get(bodyId);
@@ -294,12 +413,184 @@ export class BodyManager {
 		};
 	}
 
+	setExternalResourceSignals(
+		bodyId: string,
+		input: Partial<BodyExternalResourceSignals>,
+	): void {
+		const signals = normalizeBodyExternalResourceSignals(input);
+		const prior = this.externalResourceSignals.get(bodyId);
+		if (prior && Object.keys(signals).every((key) =>
+			prior[key as keyof BodyExternalResourceSignals] === signals[key as keyof BodyExternalResourceSignals]
+		)) return;
+		this.externalResourceSignals.set(bodyId, signals);
+		const body = this.loaded.get(bodyId);
+		if (!body) return;
+		const encodedBytes = Y.encodeStateAsUpdate(body.doc).byteLength;
+		const next = this.measureCost(bodyId, body.doc, encodedBytes);
+		this.updateCost(body, next.cost, next.measurement);
+	}
+
+	clearExternalResourceSignals(bodyId: string): void {
+		this.externalResourceSignals.delete(bodyId);
+		const body = this.loaded.get(bodyId);
+		if (!body) return;
+		const encodedBytes = Y.encodeStateAsUpdate(body.doc).byteLength;
+		const next = this.measureCost(bodyId, body.doc, encodedBytes);
+		this.updateCost(body, next.cost, next.measurement);
+	}
+
+	setSharedResourceSignals(input: Partial<SharedResidencyResourceSignals>): void {
+		this.sharedResourceSignals = normalizeSharedResidencyResourceSignals(input);
+		this.updateHighWater();
+	}
+
+	reserveTemporary(
+		kind: TemporaryResidencyKind,
+		ownerId: string,
+		estimatedBytes: number,
+	): BodyTemporaryReservationLease {
+		if (!ownerId) throw new Error("temporary residency reservation owner is required");
+		if (!Number.isSafeInteger(estimatedBytes) || estimatedBytes < 0) {
+			throw new Error("temporary residency reservation must be a non-negative safe integer");
+		}
+		const reservationId = `residency-${++this.nextReservationId}`;
+		const reservation: TemporaryResidencyReservation = {
+			reservationId,
+			kind,
+			ownerId,
+			estimatedBytes,
+			createdAt: this.now(),
+		};
+		this.temporaryReservations.set(reservationId, reservation);
+		this.updateHighWater();
+		let released = false;
+		return {
+			reservation,
+			get released() { return released; },
+			release: () => {
+				if (released) return;
+				released = true;
+				this.temporaryReservations.delete(reservationId);
+			},
+		};
+	}
+
+	residencySnapshot(): BodyResidencySnapshot {
+		const bodies = [...this.loaded.values()].map((body) => {
+			const measurement = body.residencyMeasurement;
+			return {
+				bodyId: body.bodyId,
+				estimatedResidentBytes: body.estimatedCost,
+				encodedDocumentBytes: measurement.encodedDocumentBytes,
+				materializedTextCodeUnits: measurement.materializedTextCodeUnits,
+				yjsStructCount: measurement.yjsStructCount,
+				yjsDeletedStructCount: measurement.yjsDeletedStructCount,
+				fragmentation: measurement.fragmentation,
+				providerCount: measurement.external.providerCount,
+				socketCount: measurement.external.socketCount,
+				awarenessPeerCount: measurement.external.awarenessPeerCount,
+				localPendingBufferBytes: measurement.external.localPendingBufferBytes,
+				remotePendingBufferBytes: measurement.external.remotePendingBufferBytes,
+				blockers: this.evictionBlockers(body),
+			};
+		});
+		const residentBytes = this.estimatedCostTotal();
+		const temporaryBytes = this.temporaryReservedTotal();
+		const sharedReportedBytes = estimateSharedResidencyBytes(this.sharedResourceSignals);
+		const accountedBytes = residentBytes + temporaryBytes + sharedReportedBytes;
+		const blockedBodies = bodies.filter((body) => body.blockers.length > 0).length;
+		return {
+			formatVersion: 1,
+			estimatorVersion: BODY_RESIDENCY_ESTIMATOR_VERSION,
+			claim: "heuristic-resident-estimate-not-heap-measurement",
+			capturedAt: this.now(),
+			residentBudget: {
+				bytes: this.limits.estimatedCost,
+				scope: "body-resident-estimates-only",
+				includesTemporaryReservations: false,
+				includesSharedRootAndCatalog: false,
+			},
+			totals: {
+				loadedBodies: bodies.length,
+				loadingBodies: this.loading.size,
+				estimatedResidentBytes: residentBytes,
+				temporaryReservedBytes: temporaryBytes,
+				sharedReportedBytes,
+				accountedEstimatedBytes: accountedBytes,
+				evictableBodies: bodies.length - blockedBodies,
+				blockedBodies,
+			},
+			shared: { ...this.sharedResourceSignals, estimatedBytes: sharedReportedBytes },
+			highWater: {
+				estimatedResidentBytes: this.highWaterResidentBytes,
+				accountedEstimatedBytes: this.highWaterAccountedBytes,
+				loadedBodies: this.highWaterLoadedBodies,
+			},
+			loads: {
+				requests: this.loadRequests,
+				cacheHits: this.loadCacheHits,
+				joinedInFlight: this.loadJoinedInFlight,
+				coldLoads: this.coldLoads,
+				failures: this.loadFailures,
+				cacheHitRate: this.loadRequests === 0 ? null : this.loadCacheHits / this.loadRequests,
+				latencyMs: numericDistribution(this.loadLatenciesMs),
+			},
+			evictions: {
+				completed: this.completedEvictions,
+				blockedAttempts: this.blockedEvictionAttempts,
+				blockerObservations: Object.fromEntries(this.blockerObservations),
+			},
+			distributions: {
+				estimatedResidentBytes: numericDistribution(bodies.map((body) => body.estimatedResidentBytes)),
+				encodedDocumentBytes: numericDistribution(bodies.map((body) => body.encodedDocumentBytes)),
+				yjsStructCount: numericDistribution(bodies.map((body) => body.yjsStructCount)),
+				structsPerThousandTextCodeUnits: numericDistribution(
+					bodies.map((body) => body.fragmentation.structsPerThousandTextCodeUnits),
+				),
+			},
+			temporaryReservations: [...this.temporaryReservations.values()].map((reservation) => ({ ...reservation })),
+			bodies,
+			caveats: [
+				"Estimated bytes are a versioned heuristic and are not process or JavaScript heap measurements.",
+				"Encoded document bytes are a serialization-size proxy; a Y.Doc does not necessarily retain that encoding.",
+				"Provider, socket, awareness, root/catalog, and candidate-buffer values are present only when their owner reports them.",
+			],
+		};
+	}
+
+	estimateColdLoadAdmission(encodedInputBytes: number): ColdLoadAdmissionEstimate {
+		return estimateColdLoadAdmission(encodedInputBytes);
+	}
+
+	async estimateColdLoadForBody(bodyId: string): Promise<ColdLoadAdmissionEstimate> {
+		const stored = await this.database.getDocument(bodyId);
+		return estimateColdLoadAdmission(stored?.encodedState.byteLength ?? 0);
+	}
+
+	loadedBodyIds(): string[] {
+		return [...this.loaded.keys()];
+	}
+
+	bodyResidencyObservation(bodyId: string): BodyResidencySnapshot["bodies"][number] | null {
+		const body = this.residencySnapshot().bodies.find((entry) => entry.bodyId === bodyId);
+		return body ? {
+			...body,
+			fragmentation: { ...body.fragmentation },
+			blockers: [...body.blockers],
+		} : null;
+	}
+
 	async destroy(): Promise<void> {
+		this.coordinator.quiesce();
 		for (const body of [...this.loaded.values()]) {
 			await this.persist(body);
 			this.removeLoaded(body);
 		}
 		this.loading.clear();
+		this.temporaryReservations.clear();
+		this.externalResourceSignals.clear();
+		this.sharedResourceSignals = EMPTY_SHARED_RESIDENCY_RESOURCE_SIGNALS;
+		this.coordinator.dispose();
 	}
 
 	private async loadFresh(bodyId: string): Promise<LoadedBody> {
@@ -310,6 +601,12 @@ export class BodyManager {
 				winner.lastUsedAt = this.now();
 				return winner;
 			}
+			const storedBytes = stored?.encodedState.byteLength ?? 0;
+			const scratch = this.reserveTemporary(
+				"load-decode",
+				bodyId,
+				estimateReconstructionReservation(storedBytes),
+			);
 			const doc = new Y.Doc({ guid: bodyId });
 			try {
 				if (stored?.encodedState.byteLength) {
@@ -325,42 +622,67 @@ export class BodyManager {
 					pins: 0,
 					lastUsedAt: this.now(),
 					estimatedCost: 0,
+					residencyMeasurement: measureBodyResidency(doc, 0),
 				};
 				const encodedBytes = Y.encodeStateAsUpdate(doc).byteLength;
-				const nextCost = this.measureCost(bodyId, doc, encodedBytes);
-				if (!await this.ensureEstimatedCostCapacity(bodyId, nextCost)) {
+				const next = this.measureCost(bodyId, doc, encodedBytes);
+				if (!await this.ensureEstimatedCostCapacity(bodyId, next.cost)) {
 					throw new Error("body_estimated_cost_budget");
 				}
 				this.loaded.set(bodyId, body);
-				this.updateCost(body, nextCost);
+				this.coordinator.installDocument(bodyId);
+				this.attachUpdateObserver(body);
+				this.coordinator.setResidency(bodyId, "warm");
+				this.updateCost(body, next.cost, next.measurement);
 				return body;
 			} catch (error) {
 				doc.destroy();
 				throw error;
+			} finally {
+				scratch.release();
 			}
 		});
 	}
 
 	private async persist(body: LoadedBody): Promise<void> {
-		const encoded = Y.encodeStateAsUpdate(body.doc);
-		const nextCost = this.measureCost(body.bodyId, body.doc, encoded.byteLength);
-		await this.database.putDocument({
-			documentId: body.bodyId,
-			generation: body.generation,
-			encodedState: encoded.slice().buffer,
-			dirty: body.dirty,
-			pendingLocalUpdates: body.pendingLocalUpdates,
-			updatedAt: this.now(),
-		});
-		this.updateCost(body, nextCost);
+		const scratch = this.reserveTemporary(
+			"persistence-encode",
+			body.bodyId,
+			Math.max(1024, body.residencyMeasurement.encodedDocumentBytes),
+		);
+		try {
+			const encoded = Y.encodeStateAsUpdate(body.doc);
+			const next = this.measureCost(body.bodyId, body.doc, encoded.byteLength);
+			await this.database.putDocument({
+				documentId: body.bodyId,
+				generation: body.generation,
+				encodedState: encoded.slice().buffer,
+				dirty: body.dirty,
+				pendingLocalUpdates: body.pendingLocalUpdates,
+				updatedAt: this.now(),
+			});
+			this.updateCost(body, next.cost, next.measurement);
+		} finally {
+			scratch.release();
+		}
 	}
 
-	private measureCost(bodyId: string, doc: Y.Doc, encodedBytes: number): number {
-		const measured = this.costHooks.measure?.({ bodyId, doc, encodedBytes }) ?? encodedBytes;
+	private measureCost(
+		bodyId: string,
+		doc: Y.Doc,
+		encodedBytes: number,
+	): { measurement: BodyResidencyMeasurement; cost: number } {
+		const measurement = measureBodyResidency(
+			doc,
+			encodedBytes,
+			this.externalResourceSignals.get(bodyId) ?? EMPTY_BODY_EXTERNAL_RESOURCE_SIGNALS,
+		);
+		const measured = this.costHooks.measure?.({ bodyId, doc, encodedBytes, measurement })
+			?? measurement.estimatedResidentBytes;
 		if (!Number.isFinite(measured) || measured < 0) {
 			throw new Error(`body ${bodyId} cost must be a non-negative finite number`);
 		}
-		return measured;
+		return { measurement, cost: measured };
 	}
 
 	private async ensureEstimatedCostCapacity(bodyId: string, incomingCost: number): Promise<boolean> {
@@ -400,17 +722,28 @@ export class BodyManager {
 		}
 	}
 
-	private updateCost(body: LoadedBody, currentCost: number): void {
+	private updateCost(
+		body: LoadedBody,
+		currentCost: number,
+		measurement: BodyResidencyMeasurement,
+	): void {
 		const previousCost = body.estimatedCost;
 		body.estimatedCost = currentCost;
+		body.residencyMeasurement = measurement;
 		if (previousCost !== currentCost) {
 			this.costHooks.onChange?.({ bodyId: body.bodyId, previousCost, currentCost });
 		}
+		this.updateHighWater();
 	}
 
 	private removeLoaded(body: LoadedBody): void {
 		this.loaded.delete(body.bodyId);
+		this.externalResourceSignals.delete(body.bodyId);
+		this.detachUpdateObserver(body);
 		body.doc.destroy();
+		if (this.coordinator.snapshot(body.bodyId)?.lifetime === "accepting") {
+			this.coordinator.setResidency(body.bodyId, "absent");
+		}
 		if (body.estimatedCost !== 0) {
 			this.costHooks.onChange?.({
 				bodyId: body.bodyId,
@@ -419,5 +752,56 @@ export class BodyManager {
 			});
 			body.estimatedCost = 0;
 		}
+		this.updateHighWater();
+	}
+
+	private temporaryReservedTotal(): number {
+		let total = 0;
+		for (const reservation of this.temporaryReservations.values()) total += reservation.estimatedBytes;
+		return total;
+	}
+
+	private evictionBlockers(body: LoadedBody): BodyEvictionBlocker[] {
+		const blockers: BodyEvictionBlocker[] = [];
+		if (body.dirty) blockers.push("dirty");
+		if (body.unsettled > 0) blockers.push("unsettled-candidate");
+		if (body.pendingLocalUpdates > 0) blockers.push("pending-local-update");
+		if (body.pins > 0) blockers.push("pin");
+		const coordinator = this.coordinator.snapshot(body.bodyId);
+		if ((coordinator?.leaseCount ?? 0) > 0) blockers.push("lease");
+		if (coordinator?.projectionOwner != null) blockers.push("projection-owner");
+		if (coordinator && coordinator.synchronization !== "clean") blockers.push("synchronization");
+		if (coordinator && coordinator.lifetime !== "accepting") blockers.push("runtime-lifetime");
+		return blockers;
+	}
+
+	private recordLoadLatency(latencyMs: number): void {
+		this.loadLatenciesMs.push(latencyMs);
+		if (this.loadLatenciesMs.length > 256) this.loadLatenciesMs.shift();
+	}
+
+	private updateHighWater(): void {
+		const resident = this.estimatedCostTotal();
+		const accounted = resident
+			+ this.temporaryReservedTotal()
+			+ estimateSharedResidencyBytes(this.sharedResourceSignals);
+		this.highWaterResidentBytes = Math.max(this.highWaterResidentBytes, resident);
+		this.highWaterAccountedBytes = Math.max(this.highWaterAccountedBytes, accounted);
+		this.highWaterLoadedBodies = Math.max(this.highWaterLoadedBodies, this.loaded.size);
+	}
+
+	private attachUpdateObserver(body: LoadedBody): void {
+		const observer = () => {
+			this.coordinator.advanceContent(body.bodyId);
+		};
+		body.doc.on("update", observer);
+		this.updateObservers.set(body.bodyId, observer);
+	}
+
+	private detachUpdateObserver(body: LoadedBody): void {
+		const observer = this.updateObservers.get(body.bodyId);
+		if (!observer) return;
+		body.doc.off("update", observer);
+		this.updateObservers.delete(body.bodyId);
 	}
 }

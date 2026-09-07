@@ -13,6 +13,9 @@ import type {
 	StoredDocument,
 } from "../../src/sync/vaultIndexedDb";
 import { suite } from "../harness.ts";
+import { BodyManager } from "../../src/sync/bodyManager";
+import { BodySettlementRepository, type StoredBodySettlement } from "../../src/sync/bodySettlement";
+import { canonicalMarkdownHash, exactMarkdownDiskFingerprint } from "../../server/src/shared/markdownCodec";
 
 const s = suite("bootstrap-settlement");
 
@@ -205,6 +208,81 @@ s.test("feed pages collapse repeated body and catalog work to latest durable sta
 	assert.deepEqual(page.catalogs, [{ ...active, generation: 2 }]);
 	assert.equal(page.bodyGenerations.has("body-a"), false, "catalog settlement subsumes same-page body updates");
 	assert.deepEqual(page.bodyGenerations.get("body-b"), { generation: 4, kind: "body" });
+});
+
+s.test("verified server-body-disk agreement creates a restart-safe common base", async () => {
+	const bodyId = "body-common-base";
+	const path = "notes/common.md";
+	const content = "shared base\n";
+	const contentHash = await canonicalMarkdownHash(content);
+	const bodyDoc = new Y.Doc({ guid: bodyId });
+	bodyDoc.getText("body").insert(0, content);
+	const encodedState = Y.encodeStateAsUpdate(bodyDoc);
+	bodyDoc.destroy();
+	const head: ClientCatalogEntry = {
+		bodyId, fileId: bodyId, path, generation: 7,
+		contentHash, size: new TextEncoder().encode(content).byteLength,
+	};
+	const progress: StoredBootstrapProgress = {
+		bootstrapId: "prepared", highWater: 0, nextCatalogCursor: null,
+		stage: "complete", settledBodies: 1, totalBodies: 1, feedCursor: 0,
+	};
+	const documents = new Map<string, StoredDocument>();
+	let materializedPath: string | null = null;
+	let settlement: StoredBodySettlement | null = null;
+	let diskContent = content;
+	let bodyFetches = 0;
+	let diskWrites = 0;
+	const database = {
+		getDocument: async (id: string) => documents.get(id) ?? null,
+		putDocument: async (document: StoredDocument) => { documents.set(document.documentId, document); },
+		deleteDocument: async () => {},
+		getBootstrapProgress: async () => progress,
+		putBootstrapProgress: async () => {}, putFeedCursor: async () => {},
+		getOutstanding: async () => null, putOutstanding: async () => {},
+		deleteOutstanding: async () => {}, listOutstanding: async () => [],
+		getMaterializedPath: async () => materializedPath,
+		setMaterializedPath: async (_id: string, value: string) => { materializedPath = value; },
+		setMaterializedPaths: async () => {}, deleteMaterializedPath: async () => {}, listMaterializedPaths: async () => [],
+		getBodySettlement: async () => settlement,
+		compareAndSwapBodySettlement: async (next: StoredBodySettlement, expected: number | null) => {
+			if ((settlement?.localSettlementRevision ?? null) !== expected) return false;
+			settlement = structuredClone(next); return true;
+		},
+		deleteBodySettlement: async () => { settlement = null; },
+	};
+	const server = {
+		currentHead: async () => head,
+		currentBody: async () => { bodyFetches++; return { bodyId, generation: 7, encodedState }; },
+	};
+	const disk = {
+		settleBody: async (input: { content: string }) => { diskWrites++; diskContent = input.content; return "settled" as const; },
+		moveBodies: async () => {}, deleteBody: async () => "deleted" as const,
+		markPendingPath: () => {}, clearPendingPath: () => {},
+		readCanonicalDiskEvidence: async () => ({
+			content: diskContent,
+			fingerprint: await exactMarkdownDiskFingerprint(diskContent),
+		}),
+	};
+	const bodies = new BodyManager(database);
+	bodies.coordinator.bindPath(path, bodyId);
+	const repository = new BodySettlementRepository(
+		database,
+		BodySettlementRepository.markdownScope("vault-generation"),
+		canonicalMarkdownHash,
+	);
+	const client = new BootstrapClient(server as never, database as never, bodies, disk as never);
+	client.configureSettlements(repository);
+	await client.settleBodyNow(bodyId);
+	const storedSettlement = settlement as StoredBodySettlement | null;
+	assert.equal(storedSettlement?.content, content);
+	assert.equal(storedSettlement?.durableGeneration, 7);
+	assert.equal(storedSettlement?.pathAtSettlement, path);
+	assert.equal(diskWrites, 1);
+	await client.settleBodyNow(bodyId);
+	assert.equal(bodyFetches, 1, "valid persisted base enables the fenced fast path");
+	assert.equal(diskWrites, 1, "valid exact disk evidence skips rematerialization");
+	await bodies.destroy();
 });
 
 s.test("null feed head records delete settlement before advancing the cursor", async () => {

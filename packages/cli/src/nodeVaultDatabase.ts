@@ -23,7 +23,8 @@ import type {
 	LocalVaultImportStateStore,
 } from "../../../src/onboarding/localVaultImport";
 import type { PreservedUnresolvedEntry } from "../../../src/sync/preservedUnresolved";
-import type { DiskIndex } from "../../../src/sync/diskIndex";
+import type { StoredBodySettlement } from "../../../src/sync/bodySettlement";
+import { readDiskIndex, type DiskIndex } from "../../../src/sync/diskIndex";
 
 /**
  * Convert a binary binding without allocating or copying its bytes.
@@ -154,6 +155,10 @@ export class NodeVaultDatabase implements VaultDatabasePort, BootstrapDatabasePo
 				body_id TEXT PRIMARY KEY,
 				path TEXT NOT NULL
 			) STRICT;
+			CREATE TABLE IF NOT EXISTS body_settlements (
+				body_id TEXT PRIMARY KEY,
+				value_json TEXT NOT NULL
+			) STRICT;
 			CREATE TABLE IF NOT EXISTS recovery_state (
 				singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
 				value_json TEXT NOT NULL
@@ -256,6 +261,34 @@ export class NodeVaultDatabase implements VaultDatabasePort, BootstrapDatabasePo
 
 	async deleteDocument(documentId: string): Promise<void> {
 		this.statement("DELETE FROM documents WHERE document_id = ?").run(documentId);
+	}
+
+	async getBodySettlement(bodyId: string): Promise<StoredBodySettlement | null> {
+		const row = this.statement("SELECT value_json FROM body_settlements WHERE body_id = ?")
+			.get(bodyId) as SqlRow | undefined;
+		return row ? jsonValue<StoredBodySettlement>(row.value_json, "body_settlements.value_json") : null;
+	}
+
+	async compareAndSwapBodySettlement(
+		settlement: StoredBodySettlement,
+		expectedLocalSettlementRevision: number | null,
+	): Promise<boolean> {
+		return this.transaction(() => {
+			const current = this.statement("SELECT value_json FROM body_settlements WHERE body_id = ?")
+				.get(settlement.bodyId) as SqlRow | undefined;
+			const currentRevision = current
+				? jsonValue<StoredBodySettlement>(current.value_json, "body_settlements.value_json").localSettlementRevision
+				: null;
+			if (currentRevision !== expectedLocalSettlementRevision) return false;
+			this.statement(`INSERT INTO body_settlements(body_id, value_json) VALUES (?, ?)
+				ON CONFLICT(body_id) DO UPDATE SET value_json=excluded.value_json`)
+				.run(settlement.bodyId, JSON.stringify(settlement));
+			return true;
+		});
+	}
+
+	async deleteBodySettlement(bodyId: string): Promise<void> {
+		this.statement("DELETE FROM body_settlements WHERE body_id = ?").run(bodyId);
 	}
 
 	async putPendingCandidate(candidate: StoredBodyCandidate): Promise<void> {
@@ -483,7 +516,7 @@ export class NodeVaultDatabase implements VaultDatabasePort, BootstrapDatabasePo
 		).get() as SqlRow | undefined;
 		return row
 			? {
-				index: jsonValue<DiskIndex>(row.value_json, "disk_index.value_json"),
+				index: readDiskIndex(jsonValue<unknown>(row.value_json, "disk_index.value_json")),
 				updatedAt: Number(row.updated_at),
 			}
 			: { index: {}, updatedAt: 0 };
@@ -551,7 +584,7 @@ export class NodeVaultDatabase implements VaultDatabasePort, BootstrapDatabasePo
 		this.transaction(() => {
 			for (const table of ["documents", "pending_candidates", "lifecycle_operations", "attachment_operations",
 				"bootstrap_progress", "feed_cursor", "outstanding_settlements", "materialized_paths", "recovery_state",
-				"initial_import", "disk_index", "preserved_unresolved"]) {
+				"initial_import", "disk_index", "preserved_unresolved", "body_settlements"]) {
 				this.database.exec(`DELETE FROM ${table}`);
 			}
 		});

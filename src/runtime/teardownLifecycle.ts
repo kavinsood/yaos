@@ -1,3 +1,10 @@
+import {
+	RuntimeScope,
+	type Lease,
+	type OperationEpoch,
+	type RuntimeDrainReport,
+} from "./operationLifecycle";
+
 export interface TeardownStage {
 	name: string;
 	run: () => void | Promise<void>;
@@ -48,6 +55,7 @@ export class RuntimeTeardownCoordinator {
 	private closing = false;
 	private permanentlyShutdown = false;
 	private generation = 0;
+	private scope = new RuntimeScope();
 
 	get isClosing(): boolean {
 		return this.closing;
@@ -57,12 +65,14 @@ export class RuntimeTeardownCoordinator {
 		this.permanentlyShutdown = true;
 		this.closing = true;
 		this.generation++;
+		this.scope.stopAdmission();
 	}
 
 	beginTeardown(run: () => Promise<void>): Promise<void> {
 		if (this.teardownPromise) return this.teardownPromise;
 		this.closing = true;
 		this.generation++;
+		this.scope.stopAdmission();
 		const teardownPromise = run();
 		this.teardownPromise = teardownPromise;
 		this.teardownSettled = false;
@@ -86,6 +96,22 @@ export class RuntimeTeardownCoordinator {
 		return !this.closing && !this.permanentlyShutdown && this.generation === generation;
 	}
 
+	captureOperationEpoch(): OperationEpoch | null {
+		return this.scope.captureEpoch();
+	}
+
+	acquireLease(label: string): Lease | null {
+		return this.scope.acquireLease(label);
+	}
+
+	track<T>(label: string, work: Promise<T>): Promise<T> {
+		return this.scope.track(label, work);
+	}
+
+	drain(timeoutMs: number): Promise<RuntimeDrainReport> {
+		return this.scope.drain(timeoutMs);
+	}
+
 	/** Reopen only after an awaited, intentional in-process reset. */
 	reopenAfterTeardown(): boolean {
 		if (this.permanentlyShutdown || !this.teardownPromise || !this.teardownSettled) return false;
@@ -93,6 +119,7 @@ export class RuntimeTeardownCoordinator {
 		this.teardownSettled = false;
 		this.closing = false;
 		this.generation++;
+		this.scope = new RuntimeScope();
 		return true;
 	}
 }

@@ -80,14 +80,61 @@ s.section("Unsupported format is terminal and visible");
 	s.check(/server console/.test(notice.message), "notice gives a dedicated server-console action");
 }
 
+s.test("manual reconnect delegates to the unified runtime admission owner", async () => {
+	let runtimeReconnects = 0;
+	let directConnects = 0;
+	let directDisconnects = 0;
+	const sync = {
+		fatalAuthError: false,
+		fatalAuthCode: null,
+		fatalAuthDetails: null,
+		idbError: false,
+		idbErrorDetails: null,
+		localReady: true,
+		connected: false,
+		connectionGeneration: 1,
+		reconnect: async () => {
+			runtimeReconnects++;
+			return { kind: "completed", value: undefined } as const;
+		},
+		provider: {
+			disconnect: () => { directDisconnects++; },
+			connect: () => { directConnects++; },
+		},
+	} as unknown as VaultSync;
+	const controller = new ConnectionController({
+		getVaultSync: () => sync,
+		isReconciled: () => false,
+		getAwaitingFirstProviderSyncAfterStartup: () => false,
+		setAwaitingFirstProviderSyncAfterStartup: () => {},
+		getLastReconciledGeneration: () => 0,
+		setReconnectPending: () => {},
+		isReconcileInFlight: () => false,
+		runReconnectReconciliation: () => {},
+		refreshServerCapabilities: () => {},
+		flushOpenWrites: () => {},
+		updateOfflineStatus: () => {},
+		refreshStatusBar: () => {},
+		scheduleTraceStateSnapshot: () => {},
+		log: () => {},
+		trace: (() => {}) as never,
+		registerCleanup: () => {},
+	});
+	controller.reconnect("manual-test");
+	await Promise.resolve();
+	s.check(runtimeReconnects === 1, "manual reconnect reaches one runtime admission attempt");
+	s.check(directConnects === 0 && directDisconnects === 0, "connection controller never manipulates provider transport directly");
+});
+
 s.section("Fatal auth stops ticket refresh lifecycle");
 {
 	const source = readSource("src/sync/vaultSync.ts");
 	s.check(source.includes("this._fatalAuthCode = fatal.code"), "parsed fatal code is stored on VaultSync");
 	s.check(
-		source.includes("window.clearTimeout(this.ticketRefreshTimer)") &&
-		source.includes("this.destroyed || this.fatalAuthError"),
-		"fatal auth clears and gates proactive ticket refresh",
+		source.includes('this.workScheduler.queueReconnect("ticket-refresh-due"') &&
+		source.includes("this.destroyed || this.fatalAuthError") &&
+		!source.includes("ticketRefreshTimer"),
+		"fatal auth gates scheduler-owned proactive ticket refresh",
 	);
 	s.check(
 		source.includes('status === "disconnected" && !this.fatalAuthError'),

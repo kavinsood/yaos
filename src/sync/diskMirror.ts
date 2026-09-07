@@ -1,4 +1,8 @@
-import { type App, arrayBufferToHex, MarkdownView, TFile, normalizePath } from "obsidian";
+import { type App, MarkdownView, TFile, normalizePath } from "obsidian";
+import {
+	canonicalizeMarkdown,
+	exactMarkdownDiskFingerprint,
+} from "@shared/markdownCodec";
 import type { VaultSync } from "./vaultSync";
 import type { EditorBindingManager } from "./editorBinding";
 import type { TraceRecord } from "../observability/traceContext";
@@ -16,6 +20,8 @@ import {
 } from "../runtime/reconcile/markdownConflictArtifact";
 import { PreservedUnresolvedRegistry, type PreservedUnresolvedEntry, type PreservedUnresolvedReason } from "./preservedUnresolved";
 import { safeMarkdownPath } from "./pathPolicy";
+import { mergeThreeWayText, type ThreeWayMergeResult } from "./threeWayMerge";
+import type { BodySettlementRead, DiskSettlementFingerprint } from "./bodySettlement";
 export { isLocalOrigin };
 
 export interface DiskSettlementOptions {
@@ -29,6 +35,19 @@ export interface DiskSettlementOptions {
 		content: string;
 		reason: "external-edit" | "delete-revive";
 	}): Promise<void>;
+	getCommonBase?(bodyId: string): Promise<BodySettlementRead>;
+	commitMergedBody?(input: {
+		bodyId: string;
+		path: string;
+		expectedBodyContent: string;
+		mergedContent: string;
+	}): Promise<"completed" | "superseded">;
+	markDivergence?(bodyId: string, state: "none" | "preserved" | "decision-required"): void;
+	reviewConflict?(input: {
+		path: string;
+		conflict: Extract<ThreeWayMergeResult, { kind: "conflict" }>;
+		stillCurrent: () => boolean;
+	}): Promise<string | null>;
 	settleClosedBody?(path: string): Promise<void>;
 	isPathAllowed?(path: string): boolean;
 	isBodyLive?(bodyId: string): boolean;
@@ -225,10 +244,34 @@ export class DiskMirror {
 		bodyId: string;
 		generation: number;
 		content: string;
-	}): Promise<"settled" | "preserved-unresolved"> {
+	}): Promise<"settled" | "replan" | "preserved-unresolved"> {
 		const path = this.acceptPath(input.path);
 		if (!path) return "preserved-unresolved";
-		return this.runPathWriteLocked(path, () => this.settleBodyUnlocked({ ...input, path }));
+		return this.runPathWriteLocked(path, async () => {
+			let lease;
+			try {
+				lease = this.vaultSync.bodies.coordinator.acquireProjection(
+					path,
+					input.bodyId,
+					"disk",
+					crypto.randomUUID(),
+				);
+			} catch {
+				this.recordPreservedUnresolved(path, "body-open-deferred");
+				return "preserved-unresolved";
+			}
+			try {
+				const proof = this.vaultSync.bodies.captureRevision(input.bodyId);
+				const isCurrent = () => this.vaultSync.bodies.coordinator.isProjectionCurrent(proof, path);
+				return await this.settleBodyUnlocked({
+					...input,
+					path,
+					content: canonicalizeMarkdown(input.content),
+				}, isCurrent);
+			} finally {
+				lease.release();
+			}
+		});
 	}
 	async discardStaleBody(input: {
 		path: string;
@@ -237,6 +280,7 @@ export class DiskMirror {
 	}): Promise<boolean> {
 		const path = this.acceptPath(input.path);
 		if (!path) return false;
+		const expectedContent = canonicalizeMarkdown(input.expectedContent);
 		return this.runPathWriteLocked(path, async () => {
 			if (this.openPaths.has(path) || this.editorBindings.isBound(path)) {
 				this.recordPreservedUnresolved(path, "body-open-deferred");
@@ -246,12 +290,12 @@ export class DiskMirror {
 			if (!(file instanceof TFile)) return true;
 			let content: string;
 			try {
-				content = await this.app.vault.read(file);
+				content = canonicalizeMarkdown(await this.app.vault.read(file));
 			} catch {
 				this.recordPreservedUnresolved(path, "body-settlement-failed");
 				return false;
 			}
-			if (content !== input.expectedContent) {
+			if (content !== expectedContent) {
 				this.recordPreservedUnresolved(path, "body-settlement-failed");
 				return false;
 			}
@@ -272,17 +316,18 @@ export class DiskMirror {
 		const from = this.acceptPath(input.from);
 		const to = this.acceptPath(input.to);
 		if (!from || !to) return "preserved-unresolved";
+		const currentContent = canonicalizeMarkdown(input.currentContent);
 		const source = this.app.vault.getAbstractFileByPath(from);
 		if (!(source instanceof TFile)) return "source-absent";
 		const target = this.app.vault.getAbstractFileByPath(to);
 		if (target instanceof TFile) {
-			const [sourceContent, targetContent] = await Promise.all([
+			const [sourceContent, targetContent] = (await Promise.all([
 				this.app.vault.read(source),
 				this.app.vault.read(target),
-			]);
+			])).map(canonicalizeMarkdown);
 			if (
-				sourceContent !== input.currentContent
-				|| targetContent !== input.currentContent
+				sourceContent !== currentContent
+				|| targetContent !== currentContent
 				|| this.openPaths.has(from)
 				|| this.editorBindings.isBound(from)
 			) {
@@ -449,7 +494,7 @@ export class DiskMirror {
 
 		let diskContent: string;
 		try {
-			diskContent = await this.app.vault.read(file);
+			diskContent = canonicalizeMarkdown(await this.app.vault.read(file));
 		} catch {
 			this.recordPreservedUnresolved(path, "remote-delete-read-failed");
 			return "preserved-unresolved";
@@ -458,7 +503,7 @@ export class DiskMirror {
 			this.recordPreservedUnresolved(path, "remote-delete-missing-baseline");
 			return "preserved-unresolved";
 		}
-		if (diskContent !== input.baselineContent) {
+		if (diskContent !== canonicalizeMarkdown(input.baselineContent)) {
 			if (!this.settlement) {
 				this.recordPreservedUnresolved(path, "body-settlement-failed");
 				return "preserved-unresolved";
@@ -743,8 +788,9 @@ export class DiskMirror {
 		bodyId: string;
 		generation: number;
 		content: string;
-	}): Promise<"settled" | "preserved-unresolved"> {
+	}, isCurrent: () => boolean): Promise<"settled" | "replan" | "preserved-unresolved"> {
 		const { path, bodyId, content } = input;
+		if (!isCurrent()) return "replan";
 		if (this.openPaths.has(path) || this.editorBindings.isBound(path)) {
 			this.recordPreservedUnresolved(path, "body-open-deferred");
 			return "preserved-unresolved";
@@ -756,7 +802,7 @@ export class DiskMirror {
 			return "preserved-unresolved";
 		}
 		if (!(existing instanceof TFile)) {
-			const written = await this.writeSettledBody(path, null, content);
+			const written = await this.writeSettledBody(path, null, content, isCurrent);
 			if (!written) return "preserved-unresolved";
 			this.clearPreservedUnresolved(path);
 			this.trace?.("disk", "body-settled", {
@@ -770,11 +816,12 @@ export class DiskMirror {
 
 		let diskContent: string;
 		try {
-			diskContent = await this.app.vault.read(existing);
+			diskContent = canonicalizeMarkdown(await this.app.vault.read(existing));
 		} catch {
 			this.recordPreservedUnresolved(path, "body-settlement-failed");
 			return "preserved-unresolved";
 		}
+		if (!isCurrent()) return "replan";
 		const [diskHash, remoteHash] = await Promise.all([
 			contentBaselineHash(diskContent),
 			contentBaselineHash(content),
@@ -783,6 +830,70 @@ export class DiskMirror {
 			this._onDiskWriteCallback?.(path, remoteHash);
 			this.clearPreservedUnresolved(path);
 			return "settled";
+		}
+
+		if (this.settlement?.getCommonBase && this.settlement.commitMergedBody) {
+			const base = await this.settlement.getCommonBase(bodyId);
+			if (base.kind !== "available") {
+				this.settlement.markDivergence?.(bodyId, "preserved");
+				this.recordPreservedUnresolved(path, "body-settlement-failed");
+				return "preserved-unresolved";
+			}
+			const merge = mergeThreeWayText(base.settlement.content, diskContent, content);
+			if (merge.kind === "too-large") {
+				this.settlement.markDivergence?.(bodyId, "preserved");
+				this.recordPreservedUnresolved(path, "body-settlement-failed");
+				return "preserved-unresolved";
+			}
+			if (merge.kind === "conflict") {
+				try {
+					await createMarkdownConflictArtifact(this.app, path, content, {
+						deviceName: this.getDeviceName(),
+						reason: "three-way-overlap",
+						source: "crdt",
+						trace: (message, details) => this.trace?.("conflict", message, details),
+					});
+				} catch {
+					this.recordPreservedUnresolved(path, "conflict-artifact-write-failed");
+					return "preserved-unresolved";
+				}
+				this.settlement.markDivergence?.(bodyId, "decision-required");
+				this.recordPreservedUnresolved(path, "body-settlement-failed");
+				const reviewed = this.settlement.reviewConflict
+					? await this.settlement.reviewConflict({ path, conflict: merge, stillCurrent: isCurrent })
+					: null;
+				if (reviewed === null || !isCurrent()) return "preserved-unresolved";
+				if (reviewed === content) {
+					const written = await this.writeSettledBody(path, diskContent, content, isCurrent);
+					if (!written) return "preserved-unresolved";
+					this.settlement.markDivergence?.(bodyId, "none");
+					this.clearPreservedUnresolved(path);
+					return "settled";
+				}
+				await this.settlement.commitMergedBody({
+					bodyId,
+					path,
+					expectedBodyContent: content,
+					mergedContent: reviewed,
+				});
+				return "replan";
+			}
+			if (merge.content === content) {
+				const written = await this.writeSettledBody(path, diskContent, content, isCurrent);
+				if (!written) return "preserved-unresolved";
+				this.settlement.markDivergence?.(bodyId, "none");
+				this.clearPreservedUnresolved(path);
+				return "settled";
+			}
+			const committed = await this.settlement.commitMergedBody({
+				bodyId,
+				path,
+				expectedBodyContent: content,
+				mergedContent: merge.content,
+			});
+			if (committed === "superseded") return "replan";
+			this.settlement.markDivergence?.(bodyId, "none");
+			return "replan";
 		}
 
 		const baseline = this.settlement?.getBaseline(path) ?? null;
@@ -795,7 +906,7 @@ export class DiskMirror {
 		});
 
 		if (decision.kind === "apply-remote-to-disk") {
-			const written = await this.writeSettledBody(path, diskContent, content);
+			const written = await this.writeSettledBody(path, diskContent, content, isCurrent);
 			if (!written) return "preserved-unresolved";
 			this.clearPreservedUnresolved(path);
 			return "settled";
@@ -827,10 +938,25 @@ export class DiskMirror {
 		if (decision.winner === "disk") {
 			return this.commitDiskWinner(bodyId, path, diskContent, "external-edit", diskHash);
 		}
-		const written = await this.writeSettledBody(path, diskContent, content);
+		const written = await this.writeSettledBody(path, diskContent, content, isCurrent);
 		if (!written) return "preserved-unresolved";
 		this.clearPreservedUnresolved(path);
 		return "settled";
+	}
+
+	async readCanonicalDiskEvidence(path: string): Promise<{
+		content: string;
+		fingerprint: DiskSettlementFingerprint;
+	} | null> {
+		const accepted = this.acceptPath(path);
+		if (!accepted) return null;
+		const file = this.app.vault.getAbstractFileByPath(accepted);
+		if (!(file instanceof TFile)) return null;
+		const raw = await this.app.vault.read(file);
+		return {
+			content: canonicalizeMarkdown(raw),
+			fingerprint: await exactMarkdownDiskFingerprint(raw),
+		};
 	}
 
 	private async commitDiskWinner(
@@ -859,14 +985,19 @@ export class DiskMirror {
 		path: string,
 		previousContent: string | null,
 		content: string,
+		isCurrent: () => boolean,
 	): Promise<boolean> {
+		content = canonicalizeMarkdown(content);
+		previousContent = previousContent === null ? null : canonicalizeMarkdown(previousContent);
 		if (this.shouldBlockFrontmatterWrite(path, previousContent, content)) {
 			this.recordPreservedUnresolved(path, "body-settlement-failed");
 			return false;
 		}
 		try {
+			if (!isCurrent()) return false;
 			const existing = this.app.vault.getAbstractFileByPath(path);
 			await this.suppressWrite(path, content, existing instanceof TFile ? 1 : 2);
+			if (!isCurrent()) return false;
 			if (existing instanceof TFile) {
 				await this.app.vault.modify(existing, content);
 			} else {
@@ -908,12 +1039,20 @@ export class DiskMirror {
 	}
 
 	private async flushWriteUnlocked(path: string, force: boolean): Promise<void> {
+		if (this.isPreservedUnresolved(path)) {
+			this.log(`flushWrite: preserving unresolved disk content at "${path}"`);
+			return;
+		}
 		const ytext = this.vaultSync.getTextForPath(path);
 		if (!ytext) {
 			this.log(`flushWrite: no Y.Text for "${path}", skipping`);
 			return;
 		}
-		const content = ytext.toJSON();
+		const bodyId = this.vaultSync.getFileId(path);
+		if (!bodyId) return;
+		const proof = this.vaultSync.bodies.captureRevision(bodyId);
+		const isCurrent = () => this.vaultSync.bodies.coordinator.isProjectionCurrent(proof, path);
+		const content = canonicalizeMarkdown(ytext.toJSON());
 
 		if (!force && this.openPaths.has(path)) {
 			if (
@@ -936,7 +1075,11 @@ export class DiskMirror {
 		try {
 			const existing = this.app.vault.getAbstractFileByPath(normalized);
 			if (existing instanceof TFile) {
-				const currentContent = await this.app.vault.read(existing);
+				const currentContent = canonicalizeMarkdown(await this.app.vault.read(existing));
+				if (!isCurrent()) {
+					this.queueImmediateWrite(path, "superseded-disk-proof", force);
+					return;
+				}
 				if (currentContent === content) {
 					this.log(`flushWrite: "${path}" unchanged, skipping`);
 					return;
@@ -946,6 +1089,10 @@ export class DiskMirror {
 				}
 
 				await this.suppressWrite(path, content, 1);
+				if (!isCurrent()) {
+					this.queueImmediateWrite(path, "superseded-before-modify", force);
+					return;
+				}
 				await this.app.vault.modify(existing, content);
 				this.log(`flushWrite: updated "${path}" (${content.length} chars)`);
 				this.lastDiskWriteOkAt.set(normalized, Date.now());
@@ -965,6 +1112,10 @@ export class DiskMirror {
 					return;
 				}
 				await this.suppressWrite(path, content, 2);
+				if (!isCurrent()) {
+					this.queueImmediateWrite(path, "superseded-before-create", force);
+					return;
+				}
 				const dir = normalized.substring(0, normalized.lastIndexOf("/"));
 				if (dir) {
 					const dirExists =
@@ -1470,12 +1621,7 @@ export class DiskMirror {
 	}
 
 	private async fingerprintContent(content: string): Promise<{ bytes: number; hash: string }> {
-		const bytes = new TextEncoder().encode(content);
-		const digest = await crypto.subtle.digest("SHA-256", bytes);
-		return {
-			bytes: bytes.length,
-			hash: arrayBufferToHex(digest),
-		};
+		return exactMarkdownDiskFingerprint(content);
 	}
 
 	private runPathWriteLocked<T>(path: string, work: () => Promise<T>): Promise<T> {

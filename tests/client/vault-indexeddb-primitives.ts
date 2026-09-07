@@ -106,4 +106,30 @@ s.test("attachment operations allocate a durable causal sequence transactionally
 	assert.deepEqual((await database.listAttachmentOperations()).map((operation) => operation.mutation.operationId), ["operation-z", "operation-a"]);
 	await database.close();
 });
+
+s.test("body common bases survive restart in the generation-scoped database", async () => {
+	const indexedDb = new FakeIndexedDb();
+	const first = new VaultIndexedDb("vault-base", "generation-base", "folder-base", indexedDb);
+	assert.equal(await first.compareAndSwapBodySettlement({
+		format: 1,
+		bodyId: "body-base",
+		vaultGeneration: "generation-base",
+		canonicalVersion: "markdown-lf-v1",
+		content: "common content",
+		contentHash: "c".repeat(64),
+		durableGeneration: 3,
+		serverContentHash: "c".repeat(64),
+		diskFingerprint: { bytes: 14, hash: "d".repeat(64) },
+		pathAtSettlement: "common.md",
+		localSettlementRevision: 1,
+		settledAt: 100,
+	}, null), true);
+	await first.close();
+
+	const restarted = new VaultIndexedDb("vault-base", "generation-base", "folder-base", indexedDb);
+	assert.equal((await restarted.getBodySettlement("body-base"))?.content, "common content");
+	await restarted.deleteBodySettlement("body-base");
+	assert.equal(await restarted.getBodySettlement("body-base"), null);
+	await restarted.close();
+});
 await s.done();

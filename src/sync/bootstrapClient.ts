@@ -9,6 +9,8 @@ import type {
 import { safeMarkdownPath } from "./pathPolicy";
 import { sha256BytesHex } from "../utils/sha256";
 import { SCHEMA_VERSION } from "./schema";
+import { canonicalMarkdownBytes, canonicalizeMarkdown } from "@shared/markdownCodec";
+import type { BodySettlementRepository, DiskSettlementFingerprint } from "./bodySettlement";
 
 export interface BootstrapHttpRequest {
 	url: string;
@@ -117,7 +119,7 @@ export interface BootstrapDiskPort {
 		bodyId: string;
 		generation: number;
 		content: string;
-	}): Promise<"settled" | "preserved-unresolved">;
+	}): Promise<"settled" | "replan" | "preserved-unresolved">;
 	moveBodies(moves: Array<{ from: string; to: string; bodyId: string }>): Promise<void>;
 	settleRename?(input: {
 		from: string;
@@ -138,6 +140,10 @@ export interface BootstrapDiskPort {
 	}): Promise<boolean>;
 	markPendingPath?(path: string, bodyId: string): void;
 	clearPendingPath?(path: string, bodyId: string): void;
+	readCanonicalDiskEvidence?(path: string): Promise<{
+		content: string;
+		fingerprint: DiskSettlementFingerprint;
+	} | null>;
 }
 export interface BootstrapProgressEvent {
 	stage: StoredBootstrapProgress["stage"];
@@ -231,17 +237,24 @@ export async function decodeVerifiedBodyContent(
 	} finally {
 		candidate.destroy();
 	}
-	const contentBytes = new TextEncoder().encode(content);
-	if (entry.size !== null && entry.size !== contentBytes.byteLength) {
+	const rawContentBytes = new TextEncoder().encode(content);
+	const canonicalContent = canonicalizeMarkdown(content);
+	const canonicalContentBytes = canonicalMarkdownBytes(canonicalContent);
+	const canonicalSizeMatches = entry.size === null || entry.size === canonicalContentBytes.byteLength;
+	const legacyRawSizeMatches = entry.size === null || entry.size === rawContentBytes.byteLength;
+	if (!canonicalSizeMatches && !legacyRawSizeMatches) {
 		throw new Error(`body size mismatch for ${entry.bodyId}`);
 	}
-	if (
-		entry.contentHash !== null
-		&& await sha256BytesHex(contentBytes) !== entry.contentHash
-	) {
-		throw new Error(`body content hash mismatch for ${entry.bodyId}`);
+	if (entry.contentHash !== null) {
+		const canonicalHashMatches = canonicalSizeMatches
+			&& await sha256BytesHex(canonicalContentBytes) === entry.contentHash;
+		const legacyRawHashMatches = legacyRawSizeMatches
+			&& await sha256BytesHex(rawContentBytes) === entry.contentHash;
+		if (!canonicalHashMatches && !legacyRawHashMatches) {
+			throw new Error(`body content hash mismatch for ${entry.bodyId}`);
+		}
 	}
-	return content;
+	return canonicalContent;
 }
 
 function decodeBytesBase64(value: string): Uint8Array | null {
@@ -504,6 +517,7 @@ export async function prepareBootstrapRoot(
 /** Resumable bootstrap that materializes every active ordinary file. */
 export class BootstrapClient {
 	private readonly bodySettlementWork = new Map<string, Promise<void>>();
+	private settlements: BodySettlementRepository | null = null;
 	constructor(
 		private readonly server: BootstrapServerPort,
 		private readonly database: BootstrapDatabasePort,
@@ -513,6 +527,10 @@ export class BootstrapClient {
 		private readonly now: () => number = Date.now,
 		private readonly materializeConcurrency = 16,
 	) {}
+
+	configureSettlements(settlements: BodySettlementRepository): void {
+		this.settlements = settlements;
+	}
 
 	async run(attemptId?: string): Promise<StoredBootstrapProgress> {
 		let progress = await this.database.getBootstrapProgress();
@@ -848,6 +866,7 @@ export class BootstrapClient {
 					&& materializedPath === expected.path
 					&& (local?.generation ?? -1) >= expected.generation
 					&& local?.dirty === false
+					&& await this.hasCurrentSettlement(expected)
 				) return true;
 				const state = suppliedForHead ?? await this.server.currentBody(expected.bodyId);
 				const content = await decodeVerifiedBodyContent(expected, state);
@@ -889,7 +908,7 @@ export class BootstrapClient {
 					}
 				}
 				this.disk.markPendingPath?.(expected.path, expected.bodyId);
-				let outcome: "settled" | "preserved-unresolved";
+				let outcome: "settled" | "replan" | "preserved-unresolved";
 				try {
 					outcome = await this.disk.settleBody({
 						path: expected.path,
@@ -903,6 +922,15 @@ export class BootstrapClient {
 				if (outcome === "preserved-unresolved") {
 					await this.recordOutstanding(expected, "body could not safely settle to disk");
 					return false;
+				}
+				if (outcome === "replan") {
+					const current = await this.server.currentHead(expected.bodyId);
+					if (!current) {
+						await this.settleMissingHead(expected.bodyId, expected.generation);
+						return true;
+					}
+					expected = current;
+					continue;
 				}
 				const afterApply = await this.server.currentHead(expected.bodyId);
 				if (!afterApply || !this.sameCatalogHead(expected, afterApply)) {
@@ -925,6 +953,10 @@ export class BootstrapClient {
 					continue;
 				}
 				await this.database.setMaterializedPath(expected.bodyId, expected.path);
+				if (!await this.establishSettlement(expected, content)) {
+					await this.recordOutstanding(expected, "body and disk agreement could not be durably recorded");
+					return false;
+				}
 				await this.database.deleteOutstanding(expected.bodyId);
 				await this.bodies.evict(expected.bodyId);
 				return true;
@@ -938,6 +970,56 @@ export class BootstrapClient {
 		}
 		await this.recordOutstanding(expected, "body catalog kept changing during settlement");
 		return false;
+	}
+
+	private async hasCurrentSettlement(head: ClientCatalogEntry): Promise<boolean> {
+		if (!this.settlements || !this.disk.readCanonicalDiskEvidence || head.contentHash === null) return false;
+		const current = await this.settlements.read(head.bodyId);
+		if (current.kind !== "available") return false;
+		const settlement = current.settlement;
+		if (settlement.durableGeneration < head.generation
+			|| settlement.serverContentHash !== head.contentHash
+			|| settlement.pathAtSettlement !== head.path) return false;
+		const disk = await this.disk.readCanonicalDiskEvidence(head.path);
+		return !!disk
+			&& disk.content === settlement.content
+			&& disk.fingerprint.bytes === settlement.diskFingerprint.bytes
+			&& disk.fingerprint.hash === settlement.diskFingerprint.hash;
+	}
+
+	private async establishSettlement(head: ClientCatalogEntry, content: string): Promise<boolean> {
+		if (!this.settlements) return true;
+		if (!this.disk.readCanonicalDiskEvidence || head.contentHash === null) return false;
+		const body = this.bodies.get(head.bodyId);
+		if (!body || body.dirty || body.unsettled > 0 || body.pendingLocalUpdates > 0) return false;
+		const lease = this.bodies.acquireLease(head.bodyId);
+		try {
+			const proof = this.bodies.captureRevision(head.bodyId);
+			const disk = await this.disk.readCanonicalDiskEvidence(head.path);
+			if (!disk || disk.content !== content || !this.bodies.coordinator.isProjectionCurrent(proof, head.path)) return false;
+			const currentHead = await this.server.currentHead(head.bodyId);
+			if (!currentHead || !this.sameCatalogHead(head, currentHead)
+				|| currentHead.contentHash !== head.contentHash
+				|| !this.bodies.coordinator.isProjectionCurrent(proof, head.path)) return false;
+			const current = await this.settlements.read(head.bodyId);
+			const expectedRevision = current.kind === "available"
+				? current.settlement.localSettlementRevision
+				: null;
+			const result = await this.settlements.settle({
+				bodyId: head.bodyId,
+				content,
+				contentHash: head.contentHash,
+				durableGeneration: head.generation,
+				serverContentHash: head.contentHash,
+				diskFingerprint: disk.fingerprint,
+				pathAtSettlement: head.path,
+				expectedLocalSettlementRevision: expectedRevision,
+				settledAt: this.now(),
+			});
+			return result.kind === "stored";
+		} finally {
+			lease.release();
+		}
 	}
 
 	private sameCatalogHead(left: ClientCatalogEntry, right: ClientCatalogEntry): boolean {

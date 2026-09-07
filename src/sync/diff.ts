@@ -56,6 +56,22 @@ export function applyDiffToYText(
 	}, origin);
 }
 
+export type SafeTextApplyOutcome = "applied" | "unchanged" | "superseded";
+
+/** Ordinary sync commit: stale observations never replace newer Y.Text state. */
+export function tryApplyDiffToYText(
+	ytext: Y.Text,
+	expectedCurrentText: string,
+	newText: string,
+	origin: string,
+): SafeTextApplyOutcome {
+	const currentText = yTextToString(ytext) ?? "";
+	if (currentText !== expectedCurrentText) return "superseded";
+	if (currentText === newText) return "unchanged";
+	applyDiffToYText(ytext, expectedCurrentText, newText, origin);
+	return (yTextToString(ytext) ?? "") === newText ? "applied" : "superseded";
+}
+
 export interface DiffPostconditionResult {
 	diffSkippedDueToStaleBase: boolean;
 	matchesAfterDiff: boolean;

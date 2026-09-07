@@ -5,13 +5,20 @@ import { TFile } from "obsidian";
 import { BootstrapClient, BootstrapHttpPort, prepareBootstrapRoot } from "../../../src/sync/bootstrapClient";
 import { DiskMirror } from "../../../src/sync/diskMirror";
 import { createSocketTicketCache } from "../../../src/sync/socketTicket";
+import { BodySettlementRepository } from "../../../src/sync/bodySettlement";
+import { canonicalMarkdownHash } from "../../../server/src/shared/markdownCodec";
 import { VaultSync, type ReconcileMode } from "../../../src/sync/vaultSync";
 import { ReconciliationController } from "../../../src/runtime/reconciliationController";
 import { buildRuntimeConfig, type RuntimeConfig } from "../../../src/runtime/runtimeConfig";
 import { DEFAULT_SETTINGS, type VaultSyncSettings } from "../../../src/settings/settingsStore";
 import { FrontmatterGuardCoordinator } from "../../../src/sync/frontmatterGuardCoordinator";
 import type { FrontmatterQuarantineEntry } from "../../../src/sync/frontmatterQuarantine";
-import { contentBaselineHash, type DiskIndex } from "../../../src/sync/diskIndex";
+import {
+	contentBaselineHash,
+	currentContentHash,
+	setCurrentContentHash,
+	type DiskIndex,
+} from "../../../src/sync/diskIndex";
 import type { DiskIngestPort } from "../../../src/runtime/engineControlPort";
 import { isMarkdownSyncable } from "../../../src/types";
 import { createFetchRequester } from "../../../src/utils/http";
@@ -412,6 +419,7 @@ export class DaemonEngine {
 			onAttachmentReconciliationRequired: () => this.scheduleBootstrapCatchUp("attachment-revision-mismatch"),
 			onDurableBodyCommitted: () => this.scheduleBootstrapCatchUp("body-committed"),
 		});
+		vaultSync.setResidencyRuntimeContext("desktop", "foreground");
 		this.vaultSync = vaultSync;
 		this.cleanup.defer(() => vaultSync.destroy());
 		await vaultSync.initialize();
@@ -449,13 +457,22 @@ export class DaemonEngine {
 		this.cleanup.defer(() => diskMirror.destroy());
 		diskMirror.setDiskWriteCallback((path, contentHash) => {
 			const existing = this.diskIndex[path];
-			if (existing) existing.contentHash = contentHash;
-			else this.diskIndex[path] = { mtime: 0, size: 0, contentHash };
+			if (existing) setCurrentContentHash(existing, contentHash);
+			else {
+				const entry = { mtime: 0, size: 0 };
+				setCurrentContentHash(entry, contentHash);
+				this.diskIndex[path] = entry;
+			}
 			this.withdrawDeleteCandidate(path, "the daemon wrote it");
 		});
+		const bodySettlements = new BodySettlementRepository(
+			database,
+			BodySettlementRepository.markdownScope(this.membership.vaultGeneration),
+			canonicalMarkdownHash,
+		);
 		diskMirror.configureSettlement({
 			getBaseline: (path) => ({
-				contentHash: this.diskIndex[path]?.contentHash ?? null,
+				contentHash: currentContentHash(this.diskIndex[path]) ?? null,
 				lastDiskIndexPersistedAt: this.lastDiskIndexPersistedAt,
 			}),
 			commitLocalBody: async (input) => {
@@ -464,6 +481,19 @@ export class DaemonEngine {
 					...(input.reason === "delete-revive" ? { lifecycle: "revive" as const } : {}),
 				});
 			},
+			getCommonBase: (bodyId) => bodySettlements.read(bodyId),
+			commitMergedBody: async (input) => {
+				const outcome = await vaultSync.commitBodyCandidateIfCurrent({
+					bodyId: input.bodyId,
+					path: input.path,
+					expectedContent: input.expectedBodyContent,
+					content: input.mergedContent,
+					candidateId: crypto.randomUUID(),
+					reason: "three-way-merge",
+				});
+				return outcome.kind;
+			},
+			markDivergence: (bodyId, state) => vaultSync.bodies.coordinator.setDivergence(bodyId, state),
 			settleClosedBody: async (path) => {
 				const bodyId = vaultSync.getFileId(path);
 				if (!bodyId || !this.bootstrapClient) return;
@@ -480,6 +510,7 @@ export class DaemonEngine {
 			vaultSync.bodies,
 			diskMirror,
 		);
+		bootstrapClient.configureSettlements(bodySettlements);
 		this.bootstrapClient = bootstrapClient;
 		const controller = new ReconciliationController(this.buildControllerDeps());
 		this.controller = controller;
@@ -780,7 +811,7 @@ export class DaemonEngine {
 			const entry = this.diskIndex[path];
 			if (
 				entry !== undefined
-				&& entry.contentHash === candidate.baselineHash
+				&& currentContentHash(entry) === candidate.baselineHash
 				&& entry.mtime === candidate.baselineMtime
 				&& entry.size === candidate.baselineSize
 			) {
@@ -803,7 +834,7 @@ export class DaemonEngine {
 				const entry = this.diskIndex[path];
 				if (entry === undefined) continue;
 				this.deleteCandidates.set(path, {
-					baselineHash: entry.contentHash,
+					baselineHash: currentContentHash(entry),
 					baselineMtime: entry.mtime,
 					baselineSize: entry.size,
 					firstMissingAt: now,
@@ -972,12 +1003,13 @@ export class DaemonEngine {
 		}
 		const activeBodyId = runtime.getFileId(path);
 		const baseline = this.diskIndex[path];
-		if (activeBodyId && baseline?.contentHash === contentHash) {
-			this.diskIndex[path] = {
+		if (activeBodyId && currentContentHash(baseline) === contentHash) {
+			const entry = {
 				mtime: abstractFile.stat.mtime,
 				size: abstractFile.stat.size,
-				contentHash,
 			};
+			setCurrentContentHash(entry, contentHash);
+			this.diskIndex[path] = entry;
 			return;
 		}
 		await ingest.ingestDiskFileNow(path, activeBodyId ? "modify" : "create");
@@ -1046,11 +1078,11 @@ export class DaemonEngine {
 			const existing = this.deleteCandidates.get(path);
 			const existingMatches = existing !== undefined
 				&& entry !== undefined
-				&& existing.baselineHash === entry.contentHash
+				&& existing.baselineHash === currentContentHash(entry)
 				&& existing.baselineMtime === entry.mtime
 				&& existing.baselineSize === entry.size;
 			const candidate: DeleteCandidate = existingMatches ? existing : {
-				baselineHash: entry?.contentHash,
+				baselineHash: currentContentHash(entry),
 				baselineMtime: entry?.mtime ?? 0,
 				baselineSize: entry?.size ?? 0,
 				firstMissingAt,
@@ -1115,7 +1147,7 @@ export class DaemonEngine {
 				? candidate.baselineHash === undefined
 					&& candidate.baselineMtime === 0
 					&& candidate.baselineSize === 0
-				: entry.contentHash === candidate.baselineHash
+				: currentContentHash(entry) === candidate.baselineHash
 					&& entry.mtime === candidate.baselineMtime
 					&& entry.size === candidate.baselineSize;
 			if (!baselineMatches) {

@@ -62,6 +62,8 @@ import {
 	type TraceHeaderStateInput,
 	type TraceHeaderTraceFacts,
 } from "../../src/telemetry/diagnostics/diagnosticsBundle";
+import { BodyManager } from "../../src/sync/bodyManager";
+import { ResidencyAdmissionCoordinator } from "../../src/runtime/residencyAdmissionCoordinator";
 import { suite } from "../harness.ts";
 
 const s = suite("diagnostics-bundle");
@@ -253,6 +255,52 @@ function makeState(overrides: Partial<TraceHeaderStateInput> = {}): TraceHeaderS
 function makeInput(overrides: Partial<TraceHeaderInput> = {}): TraceHeaderInput {
 	return { trace: makeTrace(), state: makeState(), ...overrides };
 }
+
+// ── Test -1: resource snapshots remain plain diagnostic values ───────────────
+
+s.test("body residency accounting is included with its estimate caveat", async () => {
+	const manager = new BodyManager({ getDocument: async () => null, putDocument: async () => {} });
+	const snapshot = manager.residencySnapshot();
+	const admission = new ResidencyAdmissionCoordinator({
+		residentCost: 100,
+		transientCost: 50,
+		concurrentLoads: 2,
+		warmBodies: 4,
+		sockets: 3,
+		reservedSockets: 1,
+		warmRetentionMs: 1_000,
+		backgroundPromotionMs: 100,
+		maxPreferredBurst: 2,
+	}).snapshot();
+	const { header } = await buildTraceHeader(makeInput({
+		state: makeState({
+			bodyResidencySnapshot: snapshot,
+			residencyAdmissionSnapshot: admission,
+			overdueWorkDiagnostics: {
+				stopped: false,
+				draining: false,
+				pokePending: false,
+				lastPokeReason: "network-online",
+				nextWakeAt: 123,
+				queue: [],
+			},
+		}),
+	}));
+	const residency = header.bodyResidency as Record<string, unknown>;
+	const admissionHeader = header.residencyAdmission as Record<string, unknown>;
+	const overdueWork = header.overdueWork as Record<string, unknown>;
+	s.check(residency.estimatorVersion === "yaos-body-residency-v1", "header carries estimator version");
+	s.check(
+		residency.claim === "heuristic-resident-estimate-not-heap-measurement",
+		"header does not present the estimate as measured heap",
+	);
+	s.check(
+		(admissionHeader.sockets as { fixed: number }).fixed === 1,
+		"header includes scalar residency admission budgets without runtime handles",
+	);
+	s.check(overdueWork.lastPokeReason === "network-online", "header includes overdue-work diagnostics");
+	await manager.destroy();
+});
 
 // ── Test 0: server receipt startup validation is explained in prose ──────────
 

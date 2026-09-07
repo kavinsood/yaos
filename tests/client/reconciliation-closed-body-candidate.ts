@@ -61,7 +61,7 @@ s.test("a loaded but closed body submits a durable candidate before advancing it
 		close: async () => {},
 	};
 
-	const observed: { submitted?: CandidateRecord } = {};
+	const observed: { submitted?: CandidateRecord; submissions: CandidateRecord[] } = { submissions: [] };
 	let resolveReceipt!: (receipt: BodyReceipt) => void;
 	const receipt = new Promise<BodyReceipt>((resolve) => {
 		resolveReceipt = resolve;
@@ -70,7 +70,18 @@ s.test("a loaded but closed body submits a durable candidate before advancing it
 		currentHead: async (requestedBodyId) => ({ bodyId: requestedBodyId, generation: 1 }),
 		submitCandidate: async (candidate) => {
 			observed.submitted = candidate;
-			return receipt;
+			observed.submissions.push(candidate);
+			if (observed.submissions.length === 1) return receipt;
+			return {
+				vaultId: "vault-1",
+				vaultGeneration: "generation-1",
+				bodyId: candidate.bodyId,
+				clientId: "device-1",
+				candidateId: candidate.candidateId,
+				candidateDigest: candidate.candidateDigest,
+				durableGeneration: 3,
+				runtimeEpoch: "epoch-1",
+			};
 		},
 	});
 	const awareness = partialOf<SyncAwarenessPort>({
@@ -172,6 +183,26 @@ s.test("a loaded but closed body submits a durable candidate before advancing it
 	assert.equal(candidates.size, 0, "validated receipt clears the persisted candidate");
 	assert.equal(runtime.getPathContent(path), "after");
 	assert.equal((diskIndex as DiskIndex)[path]?.size, 5, "disk baseline advances after candidate receipt");
+
+	const beforeMerge = documents.get(bodyId)?.encodedState;
+	if (!beforeMerge) throw new Error("settled body state was not persisted");
+	const mergeOutcome = await runtime.commitBodyCandidateIfCurrent({
+		bodyId,
+		path,
+		expectedContent: "after",
+		content: "after + merged",
+		candidateId: "merge-candidate",
+		reason: "three-way-merge",
+	});
+	assert.equal(mergeOutcome.kind, "completed");
+	const mergeCandidate = observed.submissions.at(-1);
+	if (!mergeCandidate) throw new Error("merge candidate was not submitted");
+	assert.ok(mergeCandidate.encodedUpdate.byteLength > 2, "safe merge submits a nonempty captured Yjs delta");
+	const reconstructed = new Y.Doc({ guid: bodyId });
+	Y.applyUpdate(reconstructed, new Uint8Array(beforeMerge));
+	Y.applyUpdate(reconstructed, new Uint8Array(mergeCandidate.encodedUpdate));
+	assert.equal(reconstructed.getText("body").toString(), "after + merged");
+	reconstructed.destroy();
 	await runtime.destroy();
 });
 

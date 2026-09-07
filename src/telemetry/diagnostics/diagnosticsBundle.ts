@@ -20,6 +20,9 @@
 
 import { type SyncFacts } from "../../runtime/connectionFacts";
 import type { ReconciliationStats } from "../../runtime/reconciliationController";
+import type { BodyResidencySnapshot } from "../../sync/bodyResidencyAccounting";
+import type { ResidencyAdmissionSnapshot } from "../../runtime/residencyAdmissionCoordinator";
+import type { OverdueWorkDiagnostics } from "../../runtime/overdueWorkKernel";
 
 import {
 	buildFrontmatterQuarantineDebugLines,
@@ -131,6 +134,9 @@ export interface TraceHeaderStateInput {
 	openFiles: Array<Record<string, unknown>>;
 	diskMirrorSnapshot: unknown;
 	blobSyncSnapshot: unknown;
+	bodyResidencySnapshot?: BodyResidencySnapshot | null;
+	residencyAdmissionSnapshot?: ResidencyAdmissionSnapshot | null;
+	overdueWorkDiagnostics?: OverdueWorkDiagnostics | null;
 	frontmatterQuarantine: FrontmatterQuarantineEntry[];
 	sha256Hex: Sha256Hex;
 }
@@ -313,6 +319,9 @@ export async function buildTraceHeader(
 		openFiles: state?.openFiles ?? [],
 		diskMirror: state?.diskMirrorSnapshot ?? null,
 		blobSync: state?.blobSyncSnapshot ?? null,
+		bodyResidency: state?.bodyResidencySnapshot ?? null,
+		residencyAdmission: state?.residencyAdmissionSnapshot ?? null,
+		overdueWork: state?.overdueWorkDiagnostics ?? null,
 		serverTraceEvents: state?.serverTraceEvents ?? [],
 		frontmatterQuarantineNotes: state
 			? buildFrontmatterQuarantineDebugLines(state.frontmatterQuarantine)

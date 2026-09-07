@@ -1,10 +1,13 @@
 import { App, MarkdownView, Notice, TFile } from "obsidian";
+import { canonicalMarkdownBytes, canonicalizeMarkdown } from "@shared/markdownCodec";
 import type { BlobSyncManager } from "../sync/blobSync";
 import type { DiskMirror } from "../sync/diskMirror";
 import {
 	type DiskIndex,
 	contentBaselineHash,
 	contentFingerprint,
+	currentContentHash,
+	setCurrentContentHash,
 } from "../sync/diskIndex";
 import type { ReconcileMode, VaultSync } from "../sync/vaultSync";
 import type { VaultSyncSettings } from "../settings";
@@ -22,9 +25,9 @@ import type {
 	RecoverySkippedFrontmatterData,
 } from "../observability/recoveryEventTypes";
 import {
-	applyDiffToYText,
 	applyDiffToYTextWithPostcondition,
 	forceReplaceYText,
+	tryApplyDiffToYText,
 	type DiffPostconditionResult,
 } from "../sync/diff";
 import { decideExternalEditImport } from "../sync/externalEditPolicy";
@@ -473,7 +476,7 @@ export class ReconciliationController {
 				continue;
 			}
 			try {
-				const content = await this.deps.app.vault.read(file);
+				const content = canonicalizeMarkdown(await this.deps.app.vault.read(file));
 				if (this.deps.shouldBlockFrontmatterIngest(
 					path,
 					null,
@@ -743,10 +746,11 @@ export class ReconciliationController {
 		}
 
 		try {
-			const content = await this.deps.app.vault.read(file);
+			const content = canonicalizeMarkdown(await this.deps.app.vault.read(file));
 
-			if (runtimeConfig.maxFileSizeBytes > 0 && content.length > runtimeConfig.maxFileSizeBytes) {
-				this.deps.log(`syncFileFromDisk: skipping "${file.path}" (${Math.round(content.length / 1024)} KB exceeds limit)`);
+			const contentBytes = canonicalMarkdownBytes(content).byteLength;
+			if (runtimeConfig.maxFileSizeBytes > 0 && contentBytes > runtimeConfig.maxFileSizeBytes) {
+				this.deps.log(`syncFileFromDisk: skipping "${file.path}" (${Math.round(contentBytes / 1024)} KB exceeds limit)`);
 				return;
 			}
 			const existingText = vaultSync.getTextForPath(file.path);
@@ -784,7 +788,17 @@ export class ReconciliationController {
 
 			const bodyId = vaultSync.getFileId(file.path);
 			if (existingText && bodyId && vaultSync.isBodyOpen(bodyId)) {
-				applyDiffToYText(existingText, previousContent ?? "", content, ORIGIN_DISK_SYNC);
+				const outcome = tryApplyDiffToYText(
+					existingText,
+					previousContent ?? "",
+					content,
+					ORIGIN_DISK_SYNC,
+				);
+				if (outcome === "superseded") {
+					this.deps.log(`syncFileFromDisk: superseded stale text apply for "${file.path}"; replanning`);
+					this.markMarkdownDirty(file, "modify", opId);
+					return;
+				}
 			} else {
 				const admittedBodyId = bodyId ?? crypto.randomUUID();
 				await vaultSync.commitDiskBody({
@@ -1834,15 +1848,11 @@ export class ReconciliationController {
 				const nextEntry: import("../sync/diskIndex").DiskIndexEntry = {
 					mtime: stat.mtime,
 					size: stat.size,
-					// Advance the baseline hash if settled content is provided.
-					// This covers disk→CRDT imports (external edits while YAOS is running).
-					contentHash: settledContent !== undefined
-						? await contentBaselineHash(settledContent)
-						: existing?.contentHash,
 				};
-				if (nextEntry.contentHash === undefined) {
-					delete nextEntry.contentHash;
-				}
+				const contentHash = settledContent !== undefined
+					? await contentBaselineHash(settledContent)
+					: currentContentHash(existing);
+				if (contentHash !== undefined) setCurrentContentHash(nextEntry, contentHash);
 				this.deps.setDiskIndex({
 					...this.deps.getDiskIndex(),
 					[path]: nextEntry,

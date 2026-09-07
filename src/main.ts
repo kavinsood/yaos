@@ -47,7 +47,11 @@ import { isMarkdownSyncable, isBlobSyncable } from "./types";
 import { planCategoryRenameAction } from "./sync/policy/renameAdmissionPolicy";
 import { classifySyncPath } from "./paths/pathCategory";
 import { isCanonicalPathFileIdCollision } from "./paths/pathCollision";
-import { sha256TextHex } from "./utils/sha256";
+import {
+	canonicalMarkdownBytes,
+	canonicalMarkdownHash,
+	canonicalizeMarkdown,
+} from "@shared/markdownCodec";
 import { defaultDeviceName } from "./utils/defaultDeviceName";
 import type { TraceSink } from "./observability/traceSink";
 import type { FlightEventInput, FlightPathEventInput } from "./observability/flightEnvelope";
@@ -64,9 +68,14 @@ import {
 	FrontmatterGuardCoordinator,
 } from "./sync/frontmatterGuardCoordinator";
 import { createSocketTicketCache } from "./sync/socketTicket";
+import { BodySettlementRepository } from "./sync/bodySettlement";
+import { reviewThreeWayConflict } from "./ui/ThreeWayConflictModal";
 import {
 	type DiskIndex,
+	currentContentHash,
 	moveIndexEntries,
+	readDiskIndex,
+	setCurrentContentHash,
 	waitForDiskQuiet,
 } from "./sync/diskIndex";
 import {
@@ -383,10 +392,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				if (!(file instanceof TFile)) {
 					throw new Error(`recovery disk settlement did not materialize target: ${input.path}`);
 				}
-				const content = await this.app.vault.read(file);
+				const content = canonicalizeMarkdown(await this.app.vault.read(file));
 				return {
-					contentHash: await sha256TextHex(content),
-					size: new TextEncoder().encode(content).byteLength,
+					contentHash: await canonicalMarkdownHash(content),
+					size: canonicalMarkdownBytes(content).byteLength,
 				};
 			},
 		});
@@ -452,7 +461,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					this.log("QA offline hold activated — provider disconnected, reconnects blocked");
 				} else {
 					this.log("QA offline hold released — reconnects permitted, connecting…");
-					void Promise.resolve(sync.provider.connect()).catch((e: unknown) =>
+					void Promise.resolve(this.connectionController?.reconnect("qa-network-hold-online")).catch((e: unknown) =>
 						this.log(`QA connectProvider error: ${String(e)}`),
 					);
 				}
@@ -592,6 +601,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 							getActiveMarkdownPaths: () => vs.getActiveMarkdownPaths(),
 							getRecentEvents: (limit?: number) => vs.getRecentEvents(limit),
 							getSafeReconcileMode: () => vs.getSafeReconcileMode(),
+							getBodyResidencySnapshot: () => vs.getBodyResidencySnapshot(),
+							getResidencyAdmissionSnapshot: () => vs.getResidencyAdmissionSnapshot(),
+							getOverdueWorkDiagnostics: () => vs.getOverdueWorkDiagnostics(),
 						};  // satisfies SyncReadPort — narrower union types on VaultSync are compatible
 					},
 					getTraceSink: () => this.traceSink,
@@ -922,9 +934,14 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				this.preservedUnresolvedEntries,
 				() => this.persistPreservedUnresolvedState(),
 			);
+			const bodySettlements = new BodySettlementRepository(
+				database,
+				BodySettlementRepository.markdownScope(this.settings.vaultGeneration),
+				canonicalMarkdownHash,
+			);
 			this.diskMirror.configureSettlement({
 				getBaseline: (path) => ({
-					contentHash: this.diskIndex[path]?.contentHash ?? null,
+					contentHash: currentContentHash(this.diskIndex[path]) ?? null,
 					lastDiskIndexPersistedAt: this.lastDiskIndexPersistedAt,
 				}),
 				commitLocalBody: async (input) => {
@@ -935,6 +952,21 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 							: {}),
 					});
 				},
+				getCommonBase: (bodyId) => bodySettlements.read(bodyId),
+				commitMergedBody: async (input) => {
+					const outcome = await runtime.commitBodyCandidateIfCurrent({
+						bodyId: input.bodyId,
+						path: input.path,
+						expectedContent: input.expectedBodyContent,
+						content: input.mergedContent,
+						candidateId: crypto.randomUUID(),
+						reason: "three-way-merge",
+					});
+					return outcome.kind;
+				},
+				markDivergence: (bodyId, state) => runtime.bodies.coordinator.setDivergence(bodyId, state),
+				reviewConflict: ({ path, conflict, stillCurrent }) =>
+					reviewThreeWayConflict(this.app, path, conflict, stillCurrent),
 				settleClosedBody: async (path) => {
 					const bodyId = runtime.getFileId(path);
 					if (!bodyId || !this.bootstrapClient) return;
@@ -958,15 +990,18 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					this.refreshStatusBar();
 				},
 			);
+			this.bootstrapClient.configureSettlements(bodySettlements);
 			// Track SHA-256 baseline hash after every successful flushWrite.
 			// Used by decideClosedFileConflict on startup/re-enable to determine
 			// which side actually changed from the last known stable state.
 			this.diskMirror.setDiskWriteCallback((path, contentHash) => {
 				const existing = this.diskIndex[path];
 				if (existing) {
-					existing.contentHash = contentHash;
+					setCurrentContentHash(existing, contentHash);
 				} else {
-					this.diskIndex[path] = { mtime: 0, size: 0, contentHash };
+					const entry = { mtime: 0, size: 0 };
+					setCurrentContentHash(entry, contentHash);
+					this.diskIndex[path] = entry;
 				}
 			});
 
@@ -976,6 +1011,12 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			// 5. Status tracking
 			this.connectionController = new ConnectionController({
 				getVaultSync: () => this.vaultSync,
+				setResidencyVisibility: (visibility) => {
+					this.vaultSync?.setResidencyRuntimeContext(
+						Platform.isMobile ? "mobile" : "desktop",
+						visibility,
+					);
+				},
 				getAttachmentStatus: () => {
 					const blobSnapshot = this.getBlobSync()?.getDebugSnapshot();
 					return {
@@ -2360,7 +2401,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	private async hashIfPresent(text: string | null): Promise<string | null> {
 		if (text == null) return null;
-		return sha256TextHex(text);
+		return canonicalMarkdownHash(text);
 	}
 
 	private describeContentDiff(
@@ -2434,7 +2475,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.settings = settings;
 		// Load disk index from plugin data (stored under _diskIndex key)
 		if (data && typeof data._diskIndex === "object" && data._diskIndex !== null) {
-			this.diskIndex = data._diskIndex;
+			this.diskIndex = readDiskIndex(data._diskIndex);
 		}
 		// Load lastDiskIndexPersistedAt for missing-baseline conflict tie-breaking
 		if (data && typeof data._lastDiskIndexPersistedAt === "number" && data._lastDiskIndexPersistedAt > 0) {

@@ -33,6 +33,7 @@ import {
 } from "node:fs";
 import nodePath from "node:path";
 import { TFile, TFolder, type TAbstractFile } from "obsidian";
+import { canonicalizeMarkdown } from "@shared/markdownCodec";
 /**
  * Stat shape this host tracks. Declared locally: the daemon no longer depends
  * on the client `VaultFs` port, which is unfinished and stays out of this
@@ -63,7 +64,7 @@ import {
  * refuses to index it at all rather than reading it into memory to find out.
  *
  * This is a MECHANISM guard and not the user's size limit: the configured
- * `maxFileSizeBytes` is applied by `ReconciliationController` to `content.length`
+ * `maxFileSizeBytes` is applied by `ReconciliationController` to canonical UTF-8 bytes
  * after a successful read, and stays there.
  */
 export const MAX_MARKDOWN_FILE_BYTES = 64 * 1024 * 1024;
@@ -491,6 +492,7 @@ export class NodeVault {
 	}
 
 	async modify(file: TFile, content: string): Promise<void> {
+		content = canonicalizeMarkdown(content);
 		const absolute = this.host.absolutePathFor(file.path);
 		await this.host.assertWritable(file.path, absolute);
 		await writeFileAtomic(absolute, content);
@@ -502,6 +504,7 @@ export class NodeVault {
 	 * behaviour and the reason `BlobSync`'s already-exists recovery exists.
 	 */
 	async create(path: string, content: string): Promise<TFile> {
+		content = canonicalizeMarkdown(content);
 		const normalized = normalizeVaultPath(path);
 		const absolute = this.host.absolutePathFor(normalized);
 		if (this.host.statSyncEntry(normalized) !== null) {

@@ -1,4 +1,5 @@
 import type { App } from "obsidian";
+import { canonicalizeMarkdown } from "@shared/markdownCodec";
 
 export type MarkdownConflictSource = "crdt" | "disk" | "editor";
 
@@ -35,6 +36,7 @@ export async function createMarkdownConflictArtifact(
 	content: string,
 	options: MarkdownConflictArtifactOptions,
 ): Promise<string> {
+	content = canonicalizeMarkdown(content);
 	const basePath = markdownConflictArtifactPath(path, options.deviceName, options.source);
 	for (let index = 0; index < 100; index++) {
 		const candidate = index === 0 ? basePath : basePath.replace(/(\.md)?$/, ` ${index + 1}$1`);

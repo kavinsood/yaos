@@ -34,6 +34,9 @@ import type { FrontmatterQuarantineEntry } from "../sync/frontmatterQuarantine";
 import type { ReconciliationState } from "../runtime/reconciliationController";
 import type { VaultSyncReceiptSnapshot } from "../sync/vaultSync";
 import type { RecoveryReadiness } from "../snapshots/recoveryState";
+import type { BodyResidencySnapshot } from "../sync/bodyResidencyAccounting";
+import type { OverdueWorkDiagnostics } from "../runtime/overdueWorkKernel";
+import type { ResidencyAdmissionSnapshot } from "../runtime/residencyAdmissionCoordinator";
 
 
 /**
@@ -145,6 +148,10 @@ export interface SyncReadPort {
 	getRecentEvents(limit?: number): ReadonlyArray<{ ts: string; msg: string }>;
 	/** Returns the current reconcile mode. */
 	getSafeReconcileMode(): import("../sync/vaultSync").ReconcileMode;
+	/** Optional plain-value resource snapshot; absent until the product adapter wires BodyManager. */
+	getBodyResidencySnapshot?(): BodyResidencySnapshot;
+	getResidencyAdmissionSnapshot?(): ResidencyAdmissionSnapshot;
+	getOverdueWorkDiagnostics?(): OverdueWorkDiagnostics;
 }
 
 export interface DiskMirrorSnapshot {

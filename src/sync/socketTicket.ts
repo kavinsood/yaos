@@ -9,7 +9,10 @@ import { obsidianRequest, type HttpRequester } from "../utils/http";
  * callers branch on `err.status` rather than regexing an English message.
  */
 export class SocketTicketHttpError extends Error {
-	constructor(readonly status: number) {
+	constructor(
+		readonly status: number,
+		readonly retryAfterMs?: number,
+	) {
 		super(`socket ticket request failed (${status})`);
 		this.name = "SocketTicketHttpError";
 	}
@@ -43,19 +46,37 @@ export interface SocketTicketCache {
 
 export function createSocketTicketCache(request: HttpRequester = obsidianRequest): SocketTicketCache {
 	let cached: CachedSocketTicket | null = null;
+	let cachedKey: string | null = null;
+	let inFlight: { key: string; revision: number; promise: Promise<CachedSocketTicket> } | null = null;
+	let revision = 0;
 
 	return {
 		async get(host: string, deviceToken: string, vaultId: string): Promise<CachedSocketTicket> {
+			const key = `${host.replace(/\/$/, "")}\0${deviceToken}\0${vaultId}`;
 			const now = Date.now();
-			if (cached && cached.localExpiresAt - now > TICKET_REFRESH_BUFFER_MS) {
+			if (cached && cachedKey === key && cached.localExpiresAt - now > TICKET_REFRESH_BUFFER_MS) {
 				return cached;
 			}
-			const fresh = await fetchSocketTicket(host, deviceToken, vaultId, request);
-			cached = fresh;
-			return fresh;
+			if (inFlight?.key === key && inFlight.revision === revision) return inFlight.promise;
+			const requestRevision = revision;
+			const promise = fetchSocketTicket(host, deviceToken, vaultId, request).then((fresh) => {
+				if (revision === requestRevision) {
+					cached = fresh;
+					cachedKey = key;
+				}
+				return fresh;
+			});
+			inFlight = { key, revision: requestRevision, promise };
+			try {
+				return await promise;
+			} finally {
+				if (inFlight?.promise === promise) inFlight = null;
+			}
 		},
 		invalidate() {
+			revision++;
 			cached = null;
+			cachedKey = null;
 		},
 	};
 }
@@ -90,7 +111,7 @@ async function fetchSocketTicket(
 	});
 
 	if (res.status !== 200) {
-		throw new SocketTicketHttpError(res.status);
+		throw new SocketTicketHttpError(res.status, parseRetryAfterMs(res.headers));
 	}
 
 	const body = res.json as { ticket?: unknown; expiresAt?: unknown; ttlMs?: unknown };
@@ -112,4 +133,14 @@ async function fetchSocketTicket(
 		localExpiresAt: receivedAt + body.ttlMs,
 		ttlMs: body.ttlMs,
 	};
+}
+
+function parseRetryAfterMs(headers: Record<string, string>): number | undefined {
+	const raw = headers["retry-after"] ?? headers["Retry-After"];
+	if (!raw) return undefined;
+	const seconds = Number(raw);
+	if (Number.isFinite(seconds) && seconds >= 0) return Math.ceil(seconds * 1_000);
+	const deadline = Date.parse(raw);
+	if (!Number.isFinite(deadline)) return undefined;
+	return Math.max(0, deadline - Date.now());
 }

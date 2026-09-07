@@ -1,5 +1,5 @@
 import { strict as assert } from "node:assert";
-import { createSocketTicketCache, patchTicketInUrl } from "../../src/sync/socketTicket";
+import { createSocketTicketCache, patchTicketInUrl, SocketTicketHttpError } from "../../src/sync/socketTicket";
 import { readSource, suite } from "../harness.ts";
 
 const s = suite("mandatory-socket-ticket");
@@ -52,6 +52,48 @@ s.test("ticket cache uses the injected requester without changing cache policy",
 		"https://sync.example/vault/vault%2Fid/auth/ticket",
 	);
 	assert.equal(requests[0]?.headers?.Authorization, "Bearer device-token");
+});
+
+s.test("concurrent cache misses are single-flight and invalidation fences late cache population", async () => {
+	let requests = 0;
+	let release!: () => void;
+	const barrier = new Promise<void>((resolve) => { release = resolve; });
+	const cache = createSocketTicketCache(async () => {
+		requests++;
+		const ticket = `ticket-${requests}`;
+		if (requests === 1) await barrier;
+		return {
+			status: 200,
+			headers: {},
+			arrayBuffer: new ArrayBuffer(0),
+			json: { ticket, expiresAt: Date.now() + 120_000, ttlMs: 120_000 },
+			text: "",
+		};
+	});
+	const first = cache.get("https://sync.example", "device", "vault");
+	const shared = cache.get("https://sync.example", "device", "vault");
+	cache.invalidate();
+	release();
+	assert.equal((await first).value, "ticket-1");
+	assert.equal((await shared).value, "ticket-1");
+	assert.equal((await cache.get("https://sync.example", "device", "vault")).value, "ticket-2");
+	assert.equal(requests, 2);
+});
+
+s.test("ticket rate limits retain bounded retry-after metadata", async () => {
+	const cache = createSocketTicketCache(async () => ({
+		status: 429,
+		headers: { "retry-after": "3" },
+		arrayBuffer: new ArrayBuffer(0),
+		json: {},
+		text: "",
+	}));
+	await assert.rejects(
+		cache.get("https://sync.example", "device", "vault"),
+		(error: unknown) => error instanceof SocketTicketHttpError
+			&& error.status === 429
+			&& error.retryAfterMs === 3_000,
+	);
 });
 
 await s.done();

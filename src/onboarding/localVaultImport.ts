@@ -3,6 +3,11 @@ import { validateFrontmatterTransition } from "../sync/frontmatterGuard";
 import { safeMarkdownPath } from "../sync/pathPolicy";
 import { isExcluded } from "../sync/exclude";
 import { sha256TextHex } from "../utils/sha256";
+import {
+	canonicalMarkdownBytes,
+	canonicalMarkdownHash,
+	canonicalizeMarkdown,
+} from "@shared/markdownCodec";
 
 export const LOCAL_VAULT_IMPORT_FORMAT = 1 as const;
 
@@ -413,7 +418,7 @@ export class LocalVaultImporter {
 				item.lastError = "file-removed-during-import";
 				return null;
 			}
-			const content = await this.source.read(item.path);
+			const content = canonicalizeMarkdown(await this.source.read(item.path));
 			const afterRead = await this.source.stat(item.path);
 			if (!afterRead) {
 				item.status = "missing";
@@ -426,7 +431,7 @@ export class LocalVaultImporter {
 				return null;
 			}
 
-			const bytes = new TextEncoder().encode(content).byteLength;
+			const bytes = canonicalMarkdownBytes(content).byteLength;
 			const frontmatterReasons = validateBoundedImportFrontmatter(content);
 			if (frontmatterReasons.length > 0) {
 				item.status = "invalid-frontmatter";
@@ -438,7 +443,7 @@ export class LocalVaultImporter {
 				item.lastError = `file-size-${bytes}-exceeds-${this.options.maxFileSizeBytes}`;
 				return null;
 			}
-			const contentHash = await sha256TextHex(content);
+			const contentHash = await canonicalMarkdownHash(content);
 			item.lastContentHash = contentHash;
 			item.candidateId = await candidateIdFor(item.bodyId, contentHash);
 			return { item, content, revision: afterRead, contentHash };

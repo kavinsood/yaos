@@ -8,8 +8,13 @@
  */
 import { type App, TFile, normalizePath } from "obsidian";
 import { mapWithConcurrency } from "@shared/concurrency";
+import {
+	MARKDOWN_CANONICAL_VERSION,
+	canonicalMarkdownHash,
+	canonicalizeMarkdown,
+	type MarkdownCanonicalVersion,
+} from "@shared/markdownCodec";
 import { fnv1a32, toHex8 } from "../utils/fnv1a";
-import { sha256TextHex } from "../utils/sha256";
 
 const DEFAULT_STAT_CONCURRENCY = 16;
 
@@ -28,7 +33,8 @@ const DEFAULT_STAT_CONCURRENCY = 16;
  * entry or a duplicate conflict artifact, not data corruption.
  */
 export function contentFingerprint(text: string): string {
-	return `${toHex8(fnv1a32(text))}:${text.length}`;
+	const canonical = canonicalizeMarkdown(text);
+	return `${toHex8(fnv1a32(canonical))}:${canonical.length}`;
 }
 
 /**
@@ -49,7 +55,7 @@ export function contentFingerprint(text: string): string {
  * desktop without Node's unavailable `crypto` module.
  */
 export function contentBaselineHash(content: string): Promise<string> {
-	return sha256TextHex(content);
+	return canonicalMarkdownHash(content);
 }
 
 export interface DiskIndexEntry {
@@ -67,9 +73,50 @@ export interface DiskIndexEntry {
 	 * reconciliation falls back to the safe preserve-conflict/missing-baseline path.
 	 */
 	contentHash?: string;
+	/** Representation contract under which contentHash was computed. */
+	contentHashVersion?: MarkdownCanonicalVersion;
 }
 
 export type DiskIndex = Record<string, DiskIndexEntry>;
+
+export function currentContentHash(entry: DiskIndexEntry | undefined): string | undefined {
+	return entry?.contentHashVersion === MARKDOWN_CANONICAL_VERSION
+		? entry.contentHash
+		: undefined;
+}
+
+export function setCurrentContentHash(entry: DiskIndexEntry, contentHash: string): void {
+	entry.contentHash = contentHash;
+	entry.contentHashVersion = MARKDOWN_CANONICAL_VERSION;
+}
+
+/**
+ * Parse persisted disk-index state and conservatively invalidate hashes whose
+ * representation version is absent or obsolete. Stats remain useful for scan
+ * admission, but an old hash can never participate in an authority decision.
+ */
+export function readDiskIndex(value: unknown): DiskIndex {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return {};
+	const result: DiskIndex = {};
+	for (const [path, candidate] of Object.entries(value)) {
+		if (typeof candidate !== "object" || candidate === null || Array.isArray(candidate)) continue;
+		const entry = candidate as Record<string, unknown>;
+		if (
+			typeof entry.mtime !== "number" || !Number.isFinite(entry.mtime)
+			|| typeof entry.size !== "number" || !Number.isFinite(entry.size) || entry.size < 0
+		) continue;
+		const parsed: DiskIndexEntry = { mtime: entry.mtime, size: entry.size };
+		if (
+			entry.contentHashVersion === MARKDOWN_CANONICAL_VERSION
+			&& typeof entry.contentHash === "string"
+			&& /^[a-f0-9]{64}$/.test(entry.contentHash)
+		) {
+			setCurrentContentHash(parsed, entry.contentHash);
+		}
+		result[path] = parsed;
+	}
+	return result;
+}
 
 /**
  * Stat a file using Obsidian's adapter.
@@ -216,12 +263,15 @@ export function updateIndex(
 		//    Stat changes alone don't invalidate the hash — the hash is updated
 		//    by settledHashes, updateDiskIndexForPath, or setDiskWriteCallback
 		//    whenever content actually changes in a known direction.
-		const contentHash: string | undefined = settledHash ?? oldEntry?.contentHash;
+		const contentHash: string | undefined = settledHash ?? currentContentHash(oldEntry);
 
 		newIndex[path] = {
 			mtime: stat.mtime,
 			size: stat.size,
-			...(contentHash !== undefined && { contentHash }),
+			...(contentHash !== undefined && {
+				contentHash,
+				contentHashVersion: MARKDOWN_CANONICAL_VERSION,
+			}),
 		};
 	}
 

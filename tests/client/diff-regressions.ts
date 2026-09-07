@@ -3,6 +3,7 @@ import {
 	applyDiffToYText,
 	applyDiffToYTextWithPostcondition,
 	forceReplaceYText,
+	tryApplyDiffToYText,
 } from "../../src/sync/diff";
 import { suite } from "../harness.ts";
 
@@ -171,6 +172,28 @@ s.section("Test 8: forceReplaceYText replaces the whole Y.Text exactly");
 	forceReplaceYText(ytext, "new", "disk-sync-open-idle-recover");
 
 	s.check(ytext.toString() === "new", "forceReplaceYText replaces old content exactly");
+	doc.destroy();
+}
+
+s.section("Test 9: ordinary stale-base application is superseded without mutation");
+{
+	const doc = new Y.Doc();
+	const ytext = doc.getText("content");
+	ytext.insert(0, "newer remote value");
+	const outcome = tryApplyDiffToYText(ytext, "stale observed value", "disk value", "disk-sync");
+	s.check(outcome === "superseded", "stale base produces a replan outcome");
+	s.check(ytext.toString() === "newer remote value", "stale apply preserves newer content");
+	doc.destroy();
+}
+
+s.section("Test 10: current-base application remains targeted and exact");
+{
+	const doc = new Y.Doc();
+	const ytext = doc.getText("content");
+	ytext.insert(0, "alpha beta");
+	const outcome = tryApplyDiffToYText(ytext, "alpha beta", "alpha BETA", "disk-sync");
+	s.check(outcome === "applied", "current base applies normally");
+	s.check(ytext.toString() === "alpha BETA", "safe apply reaches requested content");
 	doc.destroy();
 }
 await s.done();

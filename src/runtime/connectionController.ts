@@ -49,11 +49,7 @@ export class ConnectionStateLatch {
 	}
 }
 
-type FastReconnectReason = "app-foregrounded" | "network-online";
-
 const FAST_RECONNECT_DEBOUNCE_MS = 1_000;
-const FAST_RECONNECT_JITTER_MS = 500;
-const FAST_RECONNECT_MIN_INTERVAL_MS = 2_000;
 
 interface ConnectionControllerDeps {
 	getVaultSync(): VaultSync | null;
@@ -78,6 +74,7 @@ interface ConnectionControllerDeps {
 	log(message: string): void;
 	trace: TraceRecord;
 	registerCleanup(cleanup: () => void): void;
+	setResidencyVisibility?(visibility: "foreground" | "background"): void;
 	/**
 	 * Optional QA reconnect blocker. When provided and returns true, all
 	 * reconnect paths (manual, visibility, network-online) are blocked.
@@ -91,13 +88,12 @@ export class ConnectionController {
 	private visibilityHandler: (() => void) | null = null;
 	private onlineHandler: (() => void) | null = null;
 	private offlineHandler: (() => void) | null = null;
-	private fastReconnectDebounceTimer: number | null = null;
-	private fastReconnectConnectTimer: number | null = null;
-	private lastFastReconnectAt = 0;
 
 	constructor(private readonly deps: ConnectionControllerDeps) {}
 
 	start(): void {
+		this.deps.getVaultSync()?.setReconnectRequester((reason) => this.requestFastReconnect(reason));
+		this.deps.getVaultSync()?.setReconnectBlocked(() => this.deps.isReconnectBlocked?.() ?? false);
 		this.setupProviderStatusHandler();
 		this.setupReconnectionHandler();
 		this.setupVisibilityHandler();
@@ -105,6 +101,8 @@ export class ConnectionController {
 	}
 
 	stop(): void {
+		this.deps.getVaultSync()?.setReconnectRequester(null);
+		this.deps.getVaultSync()?.setReconnectBlocked(null);
 		if (this.visibilityHandler) {
 			document.removeEventListener("visibilitychange", this.visibilityHandler);
 			this.visibilityHandler = null;
@@ -116,14 +114,6 @@ export class ConnectionController {
 		if (this.offlineHandler) {
 			window.removeEventListener("offline", this.offlineHandler);
 			this.offlineHandler = null;
-		}
-		if (this.fastReconnectDebounceTimer) {
-			window.clearTimeout(this.fastReconnectDebounceTimer);
-			this.fastReconnectDebounceTimer = null;
-		}
-		if (this.fastReconnectConnectTimer) {
-			window.clearTimeout(this.fastReconnectConnectTimer);
-			this.fastReconnectConnectTimer = null;
 		}
 	}
 
@@ -138,8 +128,7 @@ export class ConnectionController {
 			this.deps.log(`Reconnect blocked (${reason}): QA offline hold is active`);
 			return;
 		}
-		sync.provider.disconnect();
-		void sync.provider.connect();
+		void sync.reconnect(reason);
 	}
 
 	getSyncFacts(blobPendingUploads = 0): SyncFacts {
@@ -287,10 +276,12 @@ export class ConnectionController {
 
 		this.visibilityHandler = () => {
 			if (document.visibilityState === "hidden") {
+				this.deps.setResidencyVisibility?.("background");
 				this.deps.flushOpenWrites("app-backgrounded");
 				return;
 			}
 			if (document.visibilityState !== "visible") return;
+			this.deps.setResidencyVisibility?.("foreground");
 			const sync = this.deps.getVaultSync();
 			if (!sync) return;
 			if (sync.fatalAuthError) return;
@@ -300,6 +291,9 @@ export class ConnectionController {
 		};
 
 		document.addEventListener("visibilitychange", this.visibilityHandler);
+		this.deps.setResidencyVisibility?.(
+			document.visibilityState === "hidden" ? "background" : "foreground",
+		);
 		this.deps.registerCleanup(() => {
 			if (this.visibilityHandler) {
 				document.removeEventListener("visibilitychange", this.visibilityHandler);
@@ -344,7 +338,7 @@ export class ConnectionController {
 		});
 	}
 
-	private requestFastReconnect(reason: FastReconnectReason): void {
+	private requestFastReconnect(reason: string): void {
 		const sync = this.deps.getVaultSync();
 		if (!sync) return;
 		if (sync.fatalAuthError) {
@@ -355,41 +349,16 @@ export class ConnectionController {
 			this.deps.log(`Fast reconnect blocked (${reason}): QA offline hold is active`);
 			return;
 		}
-		if (sync.connected || sync.provider.wsconnecting) {
+		sync.pokeOverdueWork(reason);
+		const credentialMaintenance = reason === "ticket-refresh-due" || reason.startsWith("retry:");
+		if (!credentialMaintenance && (sync.connected || sync.provider.wsconnecting)) {
 			return;
 		}
 
-		const now = Date.now();
-		if (now - this.lastFastReconnectAt < FAST_RECONNECT_MIN_INTERVAL_MS) {
-			return;
-		}
-
-		if (this.fastReconnectDebounceTimer) {
-			window.clearTimeout(this.fastReconnectDebounceTimer);
-		}
-		this.fastReconnectDebounceTimer = window.setTimeout(() => {
-			this.fastReconnectDebounceTimer = null;
-
-			const liveSync = this.deps.getVaultSync();
-			if (!liveSync || liveSync !== sync) return;
-			if (liveSync.fatalAuthError) return;
-			if (liveSync.connected || liveSync.provider.wsconnecting) return;
-
-			this.lastFastReconnectAt = Date.now();
-			this.deps.log(`Fast reconnect triggered (${reason})`);
-			liveSync.provider.disconnect();
-
-			if (this.fastReconnectConnectTimer) {
-				window.clearTimeout(this.fastReconnectConnectTimer);
-			}
-			this.fastReconnectConnectTimer = window.setTimeout(() => {
-				this.fastReconnectConnectTimer = null;
-				const currentSync = this.deps.getVaultSync();
-				if (!currentSync || currentSync !== sync) return;
-				if (currentSync.fatalAuthError) return;
-				if (currentSync.connected || currentSync.provider.wsconnecting) return;
-				void currentSync.provider.connect();
-			}, FAST_RECONNECT_JITTER_MS);
-		}, FAST_RECONNECT_DEBOUNCE_MS);
+		this.deps.log(`Fast reconnect queued (${reason})`);
+		void sync.queueReconnect(
+			reason,
+			FAST_RECONNECT_DEBOUNCE_MS,
+		).catch((error) => this.deps.log(`Fast reconnect scheduling failed (${reason}): ${String(error)}`));
 	}
 }
