@@ -1,5 +1,4 @@
 import { access } from "node:fs/promises";
-import WebSocket from "ws";
 import { TFile } from "obsidian";
 
 import { BootstrapClient, BootstrapHttpPort, prepareBootstrapRoot } from "../../../src/sync/bootstrapClient";
@@ -10,7 +9,6 @@ import { canonicalMarkdownHash } from "../../../server/src/shared/markdownCodec"
 import {
 	VaultSync,
 	type ReconcileMode,
-	type WebSocketImplementation,
 } from "../../../src/sync/vaultSync";
 import { ReconciliationController } from "../../../src/runtime/reconciliationController";
 import { buildRuntimeConfig, type RuntimeConfig } from "../../../src/runtime/runtimeConfig";
@@ -39,7 +37,8 @@ import type {
 } from "../../../src/onboarding/localVaultImport";
 
 import type { CleanupStack } from "./cleanup";
-import type { DaemonConfig } from "./config";
+import { createAccessFetch, createAccessWebSocketImplementation } from "./access";
+import type { AccessServiceCredentials, DaemonConfig } from "./config";
 import { NodeVaultDatabase } from "./nodeVaultDatabase";
 import {
 	createNodeHost,
@@ -292,6 +291,7 @@ export class DaemonEngine {
 		private readonly statePaths: StatePaths,
 		private readonly cleanup: CleanupStack,
 		private readonly log: (message: string) => void,
+		private readonly accessCredentials: AccessServiceCredentials | null = null,
 	) {
 		this.settings = {
 			...DEFAULT_SETTINGS,
@@ -345,7 +345,7 @@ export class DaemonEngine {
 		const host = await createNodeHost(this.realVaultPath);
 		this.host = host;
 		this.cleanup.defer(() => host.dispose());
-		const requester = createFetchRequester(fetch);
+		const requester = createFetchRequester(createAccessFetch(fetch, this.accessCredentials));
 		let provisioning;
 		try {
 			provisioning = await fetchVaultProvisioningProof({
@@ -415,7 +415,7 @@ export class DaemonEngine {
 			token: this.membership.deviceToken,
 			database,
 			request: requester,
-			webSocket: WebSocket as unknown as WebSocketImplementation,
+			webSocket: createAccessWebSocketImplementation(this.accessCredentials),
 			getSocketTicket: async (scope, force = false) => {
 				if (force) tickets.invalidate();
 				return tickets.get(
@@ -433,12 +433,9 @@ export class DaemonEngine {
 		vaultSync.setResidencyRuntimeContext("desktop", "foreground");
 		this.vaultSync = vaultSync;
 		this.cleanup.defer(() => vaultSync.destroy());
+		const stopFatalAuthListener = vaultSync.onFatalAuth(() => this.recordFatalAuth());
+		this.cleanup.defer(stopFatalAuthListener);
 		await vaultSync.initialize();
-		vaultSync.provider.on("custom-message", () => {
-			queueMicrotask(() => {
-				if (vaultSync.fatalAuthError) this.recordFatalAuth();
-			});
-		});
 		if (vaultSync.fatalAuthError) throw this.recordFatalAuth();
 
 		const initialPreserved = await database.loadPreservedUnresolved();

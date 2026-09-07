@@ -22,6 +22,8 @@ Environment:
   YAOS_PAIRING_CODE                      Required by enroll. One-time code.
   YAOS_STATE_DIR                         Optional explicit state leaf for this vault.
   XDG_STATE_HOME                         Optional state root when YAOS_STATE_DIR is unset.
+  YAOS_CF_ACCESS_CLIENT_ID               Optional Cloudflare Access service-token ID.
+  YAOS_CF_ACCESS_CLIENT_SECRET           Required with the Access service-token ID.
   YAOS_TEST_ONLY_DROP_HINT               Test-only watcher loss injection.
   YAOS_TEST_ONLY_RECONCILE_INTERVAL_MS   Test-only authoritative scan period.
 
@@ -63,6 +65,24 @@ export interface DaemonConfig extends ParsedCommand {
 	readonly command: "daemon";
 	readonly reconcileIntervalMs: number;
 	readonly debug: boolean;
+}
+
+export interface AccessServiceCredentials {
+	readonly clientId: string;
+	readonly clientSecret: string;
+}
+
+export function resolveAccessServiceCredentials(env: NodeJS.ProcessEnv): AccessServiceCredentials | null {
+	const clientId = (env.YAOS_CF_ACCESS_CLIENT_ID ?? "").trim();
+	const clientSecret = (env.YAOS_CF_ACCESS_CLIENT_SECRET ?? "").trim();
+	if (!clientId && !clientSecret) return null;
+	if (!clientId || !clientSecret) {
+		throw new ConfigError("YAOS_CF_ACCESS_CLIENT_ID and YAOS_CF_ACCESS_CLIENT_SECRET must be set together");
+	}
+	if (clientId.length > 512 || clientSecret.length > 512 || clientId.includes("\0") || clientSecret.includes("\0")) {
+		throw new ConfigError("Cloudflare Access service-token credentials are invalid");
+	}
+	return { clientId, clientSecret };
 }
 
 export function parseArgs(argv: readonly string[]): ParsedCommand {

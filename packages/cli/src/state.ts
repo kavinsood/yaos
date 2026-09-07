@@ -177,7 +177,7 @@ function readMembership(value: unknown): EnrollmentMembership | null {
 function readProof(value: unknown): VaultProvisioningProof | null {
 	if (value === null) return null;
 	const proof = record(value, "provisioningProof");
-	if (proof.schemaVersion !== 7 || proof.storageFormatVersion !== 2 || proof.protocolVersion !== 3) {
+	if (proof.schemaVersion !== 7 || proof.storageFormatVersion !== 3 || proof.protocolVersion !== 4) {
 		throw new StateProvisioningMismatchError("Enrollment state has incompatible provisioning proof");
 	}
 	const provisionedAt = proof.provisionedAt;
@@ -189,8 +189,8 @@ function readProof(value: unknown): VaultProvisioningProof | null {
 		vaultGeneration: requiredString(proof.vaultGeneration, "provisioningProof.vaultGeneration"),
 		provisionedAt: provisionedAt as number,
 		schemaVersion: 7,
-		storageFormatVersion: 2,
-	protocolVersion: 3,
+		storageFormatVersion: 3,
+	protocolVersion: 4,
 		runtimeEpoch: requiredString(proof.runtimeEpoch, "provisioningProof.runtimeEpoch"),
 	};
 }

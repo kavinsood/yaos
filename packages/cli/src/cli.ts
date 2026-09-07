@@ -3,6 +3,7 @@ import {
 	ConfigError,
 	EXIT,
 	parseArgs,
+	resolveAccessServiceCredentials,
 	resolveDaemonConfig,
 	resolveEnrollmentConfig,
 	resolveRealVaultPath,
@@ -11,6 +12,7 @@ import { DaemonEngine, FatalAuthError, StartupError } from "./engine";
 import { enrollDevice, EnrollmentError } from "./enrollment";
 import { acquireProcessLock, LockHeldError } from "./lock";
 import { NodeVaultDatabaseIdentityError } from "./nodeVaultDatabase";
+import { createAccessFetch } from "./access";
 import {
 	prepareStatePaths,
 	readEnrollmentState,
@@ -40,6 +42,7 @@ async function run(): Promise<number> {
 	const paths = await prepareStatePaths(realVaultPath);
 	const cleanup = new CleanupStack();
 	try {
+		const accessCredentials = resolveAccessServiceCredentials(process.env);
 		const lock = await acquireProcessLock(paths.lockFile);
 		cleanup.defer(() => lock.release());
 		if (parsed.command === "enroll") {
@@ -47,6 +50,7 @@ async function run(): Promise<number> {
 				resolveEnrollmentConfig(parsed, process.env),
 				realVaultPath,
 				paths,
+				createAccessFetch(fetch, accessCredentials),
 			);
 			process.stdout.write(`YAOS_ENROLLED ${membership.vaultId} ${membership.deviceId}\n`);
 			return EXIT.ok;
@@ -65,6 +69,7 @@ async function run(): Promise<number> {
 			paths,
 			cleanup,
 			log,
+			accessCredentials,
 		);
 
 		let requestedCode: number | null = null;

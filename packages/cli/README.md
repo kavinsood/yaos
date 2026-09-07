@@ -48,6 +48,11 @@ YAOS_STATE_DIR=/var/lib/yaos/team-notes yaos daemon /srv/notes
 
 The override is resolved to an absolute path, wins over `XDG_STATE_HOME`, and is not given another `yaos/headless/...` suffix. It must be non-empty, and the same leaf must be supplied to enrollment and the daemon. Enrollment state is bound to the vault's real path, so reusing a leaf for another vault is rejected.
 
+For a server protected by Cloudflare Access, set `YAOS_CF_ACCESS_CLIENT_ID` and
+`YAOS_CF_ACCESS_CLIENT_SECRET` for both `enroll` and `daemon`. The CLI sends the
+service-token identity on HTTP and WebSocket handshakes and never writes either
+credential into its state directory.
+
 The leaf directory is mode `0700`; enrollment and database files are mode `0600`. No YAOS state is written inside the vault.
 
 ## Exit codes
