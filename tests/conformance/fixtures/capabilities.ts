@@ -8,7 +8,7 @@ assert.equal(response.status, 200);
 expect(body !== null, "capabilities endpoint returns JSON");
 assert.deepEqual(Object.keys(body).sort(), [
 	"attachments", "claimed", "maxBlobUploadBytes", "protocolVersion", "recoveryJobs", "schemaVersion",
-	"serverVersion", "settingsFormatVersion", "settingsSync", "snapshotFormatVersion", "snapshots",
+	"semanticCanvas", "serverVersion", "settingsFormatVersion", "settingsSync", "snapshotFormatVersion", "snapshots",
 	"storageFormatVersion", "updateProvider", "updateRepoBranch", "updateRepoUrl",
 ].sort());
 pass("capabilities document has the complete public key set");
@@ -22,10 +22,11 @@ assert.equal(body.attachments, true);
 assert.equal(body.snapshots, true);
 assert.equal(body.recoveryJobs, true);
 assert.equal(body.settingsSync, true);
+assert.equal(body.semanticCanvas, true);
 assert.ok(typeof body.maxBlobUploadBytes === "number" && body.maxBlobUploadBytes > 0);
 assert.ok(typeof body.serverVersion === "string" && body.serverVersion.length > 0);
 assert.equal(body.updateProvider, null);
 assert.equal(body.updateRepoUrl, null);
 assert.equal(body.updateRepoBranch, null);
 assert.match(response.headers.get("content-type") ?? "", /^application\/json\b/);
-pass("capabilities freeze schema7/storage3/protocol4/snapshot2/settings2 and the complete feature surface");
+pass("capabilities freeze schema8/storage3/protocol4/snapshot3/settings2 and the complete feature surface");

@@ -52,5 +52,11 @@ Operational queue totals combine vault work with the recovery and settings
 adapters. The raw `overdueWork` diagnostics field remains the vault scheduler's
 detail view; `operationalResources` is the bounded cross-adapter aggregate.
 
+Semantic Canvas adds bounded per-kind facts: semantic/resident/pending counts,
+encoded and estimated structural bytes, nodes, edges, text bytes/code units,
+rank bytes, tombstones, resolved conflicts, and invalid, oversized, conflict,
+or degraded projections. These remain heuristic admission observations, not
+heap measurements or document-content diagnostics.
+
 The source of truth remains the domain diagnostics. Product UX never changes a
 limit or retries work merely because it rendered this snapshot.

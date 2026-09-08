@@ -61,7 +61,7 @@ YAOS synchronizes a closed allowlist of Obsidian JSON files, CSS snippets, commu
 
 ## Attachments and recovery
 
-Markdown uses Durable Object SQLite and works without R2. Add a `YAOS_BUCKET` R2 binding to synchronize images, PDFs, Canvas files, and other non-Markdown content and to enable asynchronous recovery points.
+Markdown and explicitly promoted semantic Canvas files use Durable Object SQLite and work without R2. Add a `YAOS_BUCKET` R2 binding to synchronize images, PDFs, opaque Canvas fallback, and other non-Markdown content; enable Canvas promotion/demotion rollback; and enable asynchronous recovery points.
 
 <a href="https://youtu.be/Z7xCMEYfdFM">
   <img src="https://img.youtube.com/vi/Z7xCMEYfdFM/maxresdefault.jpg" width="480" alt="Watch the R2 setup video" />

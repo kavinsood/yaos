@@ -1,6 +1,6 @@
 # Sync and conflict contract
 
-This is the current schema-7 contract for `main`. [BACKLOG.md](BACKLOG.md) contains only evidenced unresolved risks and missing external-scale proof.
+This is the current schema-8 contract. [BACKLOG.md](BACKLOG.md) contains only evidenced unresolved risks and missing external-scale proof.
 
 ## Subjects
 
@@ -14,7 +14,12 @@ This is the current schema-7 contract for `main`. [BACKLOG.md](BACKLOG.md) conta
 | Recovery | Optional asynchronous recovery-v2 snapshots when R2 and `RecoveryJob` are configured |
 | Obsidian settings | Allowlisted paths and package intents in a principal-owned, named SQL environment |
 
-Canvas, Excalidraw, Base, and other non-Markdown formats use the attachment plane rather than Markdown character merging.
+Explicitly promoted JSON Canvas 1.0 files use a dedicated semantic plane with
+stable identity, typed field groups, Y.Text card content, explicit order,
+tombstones, exact common bases, and revision-fenced disk/view projection.
+Unpromoted, invalid, unsupported, or oversized Canvas files remain attachments.
+Excalidraw, Base, and other non-Markdown formats continue to use the attachment
+plane rather than Markdown or Canvas merging.
 
 ## Vault, membership, and transport scope
 

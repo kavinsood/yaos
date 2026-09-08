@@ -110,7 +110,7 @@ export async function waitFor(predicate: () => boolean | Promise<boolean>, label
 
 export async function socketTicket(
 	identity: DeviceIdentity,
-	purpose: "root" | "body" = "root",
+	purpose: "root" | "body" | "semantic" = "root",
 	documentId = purpose === "root" ? "root" : "",
 ): Promise<{ ticket: string; expiresAt: number; ttlMs: number }> {
 	const { response, body } = await vaultJson(identity, "auth/ticket", {
@@ -126,15 +126,17 @@ export async function socketTicket(
 	return { ticket: body.ticket, expiresAt: body.expiresAt, ttlMs: body.ttlMs };
 }
 
-function socketPrefix(identity: DeviceIdentity, kind: "root" | "body", documentId: string): string {
+function socketPrefix(identity: DeviceIdentity, kind: "root" | "body" | "semantic", documentId: string): string {
 	return kind === "root"
 		? `/vault/${encodeURIComponent(identity.vaultId)}/ws/root`
-		: `/vault/${encodeURIComponent(identity.vaultId)}/ws/body/${encodeURIComponent(documentId)}`;
+		: kind === "body"
+			? `/vault/${encodeURIComponent(identity.vaultId)}/ws/body/${encodeURIComponent(documentId)}`
+			: `/vault/${encodeURIComponent(identity.vaultId)}/ws/semantic/${encodeURIComponent(documentId)}`;
 }
 
 export async function connectDocument(
 	identity: DeviceIdentity,
-	kind: "root" | "body",
+	kind: "root" | "body" | "semantic",
 	documentId: string,
 	doc = new Y.Doc({ guid: documentId }),
 ): Promise<ConnectedDocument> {

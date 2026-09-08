@@ -35,6 +35,10 @@ aggregate counts. Subscription registration and its returned snapshot are
 synchronous, so a consumer cannot miss the next published revision between
 those operations.
 
+Aggregate counts also report semantic/resident/pending Canvas documents and
+invalid, oversized, conflict-preserved, or degraded Canvas projections. The
+first API version intentionally exposes no per-Canvas identity or content.
+
 The immutable `collaboration` projection includes:
 
 - authority state (`active`, `refreshing`, `changing`, `revoked`, or

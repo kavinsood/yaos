@@ -1,7 +1,7 @@
-export const SCHEMA_VERSION = 7 as const;
+export const SCHEMA_VERSION = 8 as const;
 export const STORAGE_FORMAT_VERSION = 3 as const;
 export const PROTOCOL_VERSION = 4 as const;
-export const SNAPSHOT_FORMAT_VERSION = 2 as const;
+export const SNAPSHOT_FORMAT_VERSION = 3 as const;
 export const SETTINGS_FORMAT_VERSION = 2 as const;
 
 export type RuntimeName = "wrangler" | "node";
@@ -9,7 +9,7 @@ export type RuntimeName = "wrangler" | "node";
 export const ALL_CAPABILITIES = [
 	"capabilities", "routing", "identity", "admission", "root-body", "bootstrap",
 	"durability", "settings", "attachments", "recovery", "recovery-crash-resume",
-	"deletion", "awareness", "restart",
+	"deletion", "awareness", "semantic-canvas", "restart",
 ] as const;
 export type Capability = typeof ALL_CAPABILITIES[number];
 

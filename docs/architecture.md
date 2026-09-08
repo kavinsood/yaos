@@ -21,7 +21,7 @@ credentials, invitation secrets, providers, diagnostics, or mutation controls.
 Consumers reacquire after `yaos:api-ready`; unload fences retained handles.
 The contract is in [Public plugin API](public-api.md).
 
-The headless client under `packages/cli` hosts the same `VaultSync`, `BodyManager`, `DiskMirror`, and reconciliation policy on a local Linux filesystem. It is Markdown-only, stores its complete principal/device authority tuple and schema-7 retry/cache state in machine-local SQLite, and never copies another enrollment's bearer.
+The headless client under `packages/cli` hosts the same `VaultSync`, `BodyManager`, Canvas manager, disk mirrors, and reconciliation policy on a local Linux filesystem. It synchronizes Markdown and closed semantic Canvas files, stores its complete principal/device authority tuple and schema-8 retry/cache state in machine-local SQLite, and never copies another enrollment's bearer.
 
 The Cloudflare Worker classes are thin platform wrappers around portable `ControlPlaneRuntime`, `VaultRuntime`, and `RecoveryJobRuntime` compositions. `packages/server-node` supplies Node-specific SQLite/KV, actor, WebSocket, alarm, and filesystem-object mechanisms to those same domain owners; it does not implement a second sync policy.
 
@@ -120,7 +120,12 @@ Inbound JSON must decode, hash correctly, and parse before replacement; invalid 
 
 ## Attachments
 
-Non-Markdown files, including Canvas, Excalidraw, Base, images, and PDFs, use whole-file content-addressed R2 objects. After bytes are durable, the client persists a generation-scoped attachment operation before submitting its stable operation ID. The server validates the object and commits the root mutation with its attachment catalog event before broadcasting it. Lost responses, publication failures, and restarts replay the same upsert/delete/rename intent; root sockets never accept direct attachment-map writes.
+Non-Markdown files, including Excalidraw, Base, images, PDFs, and Canvas files
+not explicitly promoted to semantic authority, use whole-file content-addressed
+R2 objects. Promoted JSON Canvas uses a separately validated semantic Yjs
+document and SQL catalog. Promotion/demotion atomically switch the root between
+those authorities while retaining rollback content. Root sockets never accept
+direct attachment or semantic-catalog writes.
 
 Without `YAOS_BUCKET`, attachment sync is unavailable while root/body Markdown sync, SQL persistence, and SQL bootstrap continue normally.
 

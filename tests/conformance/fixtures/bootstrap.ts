@@ -11,7 +11,7 @@ const started = await vaultJson(target.deviceA, "bootstrap/start", {
 });
 assert.equal(started.response.status, 200);
 assert.ok(started.body);
-assert.equal(started.body.format, "yaos-bootstrap-v1");
+assert.equal(started.body.format, "yaos-bootstrap-v2");
 assert.equal(started.body.schemaVersion, SCHEMA_VERSION);
 assert.equal(started.body.storageFormatVersion, STORAGE_FORMAT_VERSION);
 assert.equal(typeof started.body.bootstrapId, "string");
