@@ -1,4 +1,6 @@
-# Temporary benchmark build of the existing storage-v3 validation Worker.
+# Validation build of the existing Worker with a fresh schema-8/storage-4
+# Durable Object lineage. Older benchmark lineages remain exported only because
+# Wrangler requires every previously-created class name to stay available.
 # The three YAOS namespaces and their complete migration lineage are preserved;
 # benchmark bytes go only to the additional STORAGE_BENCHMARK_RUNS namespace.
 name = "yaos-rfc08-10-validation-open"
@@ -12,15 +14,15 @@ YAOS_ENABLE_STORAGE_BENCHMARK = "true"
 
 [[durable_objects.bindings]]
 name = "YAOS_SYNC"
-class_name = "VaultSyncServerStorage3Stress5"
+class_name = "VaultSyncServerStorage4RemediationAuditFinal2"
 
 [[durable_objects.bindings]]
 name = "YAOS_CONFIG"
-class_name = "ServerConfigStorage3Stress5"
+class_name = "ServerConfigStorage4RemediationAuditFinal2"
 
 [[durable_objects.bindings]]
 name = "YAOS_RECOVERY_JOBS"
-class_name = "RecoveryJobStorage3Stress5"
+class_name = "RecoveryJobStorage4RemediationAuditFinal2"
 
 [[durable_objects.bindings]]
 name = "STORAGE_BENCHMARK_RUNS"
@@ -57,6 +59,26 @@ new_sqlite_classes = ["VaultSyncServerStorage3Stress5", "ServerConfigStorage3Str
 [[migrations]]
 tag = "storage-benchmark-20260908"
 new_sqlite_classes = ["StorageBenchmarkRun"]
+
+[[migrations]]
+tag = "storage-v4-semantic-final-20260908"
+new_sqlite_classes = ["VaultSyncServerStorage4SemanticFinal", "ServerConfigStorage4SemanticFinal", "RecoveryJobStorage4SemanticFinal"]
+
+[[migrations]]
+tag = "storage-v4-epoch-receipts-final-20260908"
+new_sqlite_classes = ["VaultSyncServerStorage4EpochReceiptsFinal", "ServerConfigStorage4EpochReceiptsFinal", "RecoveryJobStorage4EpochReceiptsFinal"]
+
+[[migrations]]
+tag = "storage-v4-remediation-final-20260908"
+new_sqlite_classes = ["VaultSyncServerStorage4RemediationFinal", "ServerConfigStorage4RemediationFinal", "RecoveryJobStorage4RemediationFinal"]
+
+[[migrations]]
+tag = "storage-v4-remediation-audit-final-20260908"
+new_sqlite_classes = ["VaultSyncServerStorage4RemediationAuditFinal", "ServerConfigStorage4RemediationAuditFinal", "RecoveryJobStorage4RemediationAuditFinal"]
+
+[[migrations]]
+tag = "storage-v4-remediation-audit-final-2-20260908"
+new_sqlite_classes = ["VaultSyncServerStorage4RemediationAuditFinal2", "ServerConfigStorage4RemediationAuditFinal2", "RecoveryJobStorage4RemediationAuditFinal2"]
 
 [[r2_buckets]]
 binding = "YAOS_BUCKET"

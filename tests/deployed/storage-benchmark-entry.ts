@@ -81,5 +81,30 @@ export {
 	ServerConfig as ServerConfigStorage3Stress5,
 	RecoveryJob as RecoveryJobStorage3Stress5,
 };
+export {
+	VaultSyncServer as VaultSyncServerStorage4SemanticFinal,
+	ServerConfig as ServerConfigStorage4SemanticFinal,
+	RecoveryJob as RecoveryJobStorage4SemanticFinal,
+};
+export {
+	VaultSyncServer as VaultSyncServerStorage4EpochReceiptsFinal,
+	ServerConfig as ServerConfigStorage4EpochReceiptsFinal,
+	RecoveryJob as RecoveryJobStorage4EpochReceiptsFinal,
+};
+export {
+	VaultSyncServer as VaultSyncServerStorage4RemediationFinal,
+	ServerConfig as ServerConfigStorage4RemediationFinal,
+	RecoveryJob as RecoveryJobStorage4RemediationFinal,
+};
+export {
+	VaultSyncServer as VaultSyncServerStorage4RemediationAuditFinal,
+	ServerConfig as ServerConfigStorage4RemediationAuditFinal,
+	RecoveryJob as RecoveryJobStorage4RemediationAuditFinal,
+};
+export {
+	VaultSyncServer as VaultSyncServerStorage4RemediationAuditFinal2,
+	ServerConfig as ServerConfigStorage4RemediationAuditFinal2,
+	RecoveryJob as RecoveryJobStorage4RemediationAuditFinal2,
+};
 
 export default worker;
