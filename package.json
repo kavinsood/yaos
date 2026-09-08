@@ -17,7 +17,7 @@
 		"typecheck:cli": "tsc -noEmit -p packages/cli/tsconfig.json",
 		"typecheck:server-node": "tsc -noEmit -p packages/server-node/tsconfig.json",
 		"test:server-update-local": "npm run build:server-release && node tests/run-typescript.mjs --test-aliases tests/contracts/server-update-local.ts",
-		"test:regressions": "npm run guard:no-src-js-artifacts && npm run guard:qa-isolation && npm run guard:schema-version && node tests/run-suites.mjs",
+		"test:regressions": "npm run guard:no-src-js-artifacts && npm run guard:qa-isolation && npm run guard:schema-version && npm run lab:pathology:typecheck && npm run lab:pathology:self-test && node tests/run-suites.mjs",
 		"test:ci": "npm run test:regressions && npm run test:integration:worker && npm run test:node-runtime && npm run test:conformance && npm run test:headless && npm run test:cli",
 		"test:integration:worker": "node tests/run-typescript.mjs tests/live/run-live.ts",
 		"test:integration:deployed": "node tests/run-typescript.mjs tests/live/run-live.ts",
@@ -47,6 +47,9 @@
 		"guard:no-any": "node scripts/guard-no-any.mjs",
 		"guard:qa-isolation": "node scripts/guard-qa-isolation.mjs",
 		"guard:schema-version": "node scripts/guard-schema-version.mjs",
+		"lab:pathology": "node --expose-gc tests/run-typescript.mjs scripts/pathology-lab/run.ts",
+		"lab:pathology:self-test": "node tests/run-typescript.mjs scripts/pathology-lab/self-test.ts",
+		"lab:pathology:typecheck": "tsc -noEmit -p scripts/pathology-lab/tsconfig.json",
 		"clean:src-js-artifacts": "find src -name '*.js' -o -name '*.js.map' | xargs rm -f 2>/dev/null; echo 'cleaned'"
 	},
 	"license": "0-BSD",
