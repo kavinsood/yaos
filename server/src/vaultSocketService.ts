@@ -10,7 +10,8 @@ import {
 	type LoadedVaultDocument,
 	type VaultDocumentCache,
 } from "./vaultDocumentCache";
-import { safeBlobPath } from "./shared/vaultPath";
+import { safeBlobPath, safeCanvasPath } from "./shared/vaultPath";
+import type { SemanticPathRef } from "./shared/canvasTypes";
 import { isCanonicalVaultId } from "./vaultId";
 import {
 	SOCKET_CONTROL_CAPABILITIES,
@@ -24,6 +25,7 @@ import { canonicalMarkdownBytes } from "./shared/markdownCodec";
 import { MAX_CLIENT_MARKDOWN_BYTES } from "./shared/durableLimits";
 import { AUTHORITY_SUPERSEDED_SOCKET_CLOSE_CODE } from "./shared/socketCloseCodes";
 import type { VaultActorContext } from "./collaboration";
+import { validateCanvasDocument } from "./shared/canvasSemanticDocument";
 
 const MESSAGE_SYNC = 0;
 const MESSAGE_AWARENESS = 1;
@@ -34,7 +36,7 @@ export interface VaultSocketAttachment {
 	vaultGeneration: string;
 	runtimeEpoch: string;
 	documentId: string;
-	kind: "root" | "body";
+	kind: "root" | "body" | "semantic";
 	deviceId: string;
 	deviceName?: string;
 	principalId: string;
@@ -95,10 +97,11 @@ export function parseVaultSocketAttachment(value: unknown): VaultSocketAttachmen
 		|| (attachment.awarenessClientId !== undefined && (!Number.isSafeInteger(attachment.awarenessClientId)
 			|| attachment.awarenessClientId < 0))
 		|| typeof attachment.socketId !== "string" || !validIdentity(attachment.socketId)
-		|| (attachment.kind !== "root" && attachment.kind !== "body")
+		|| (attachment.kind !== "root" && attachment.kind !== "body" && attachment.kind !== "semantic")
 		|| typeof attachment.documentId !== "string") return null;
 	if (attachment.kind === "root" && attachment.documentId !== "root") return null;
 	if (attachment.kind === "body" && attachment.documentId === "root") return null;
+	if (attachment.kind === "semantic" && attachment.documentId === "root") return null;
 	return attachment as VaultSocketAttachment;
 }
 
@@ -107,6 +110,7 @@ function protectedAttachmentState(doc: Y.Doc): string {
 		Object.fromEntries([...map.entries()].sort(([left], [right]) => left.localeCompare(right)));
 	return JSON.stringify({
 		pathToBlob: sorted(doc.getMap("pathToBlob")),
+		pathToSemantic: sorted(doc.getMap("pathToSemantic")),
 		blobMeta: sorted(doc.getMap("blobMeta")),
 		blobTombstones: sorted(doc.getMap("blobTombstones")),
 	});
@@ -128,6 +132,8 @@ export function rootUpdateChangesProtectedAttachmentMaps(current: Y.Doc, update:
 
 export function hasSafeRootAttachmentSemantics(doc: Y.Doc): boolean {
 	const refs = doc.getMap<unknown>("pathToBlob");
+	const markdown = doc.getMap<unknown>("pathToId");
+	const semantic = doc.getMap<unknown>("pathToSemantic");
 	const tombstones = doc.getMap<unknown>("blobTombstones");
 	for (const [path, value] of refs.entries()) {
 		if (typeof value !== "object" || value === null || Array.isArray(value)
@@ -149,6 +155,20 @@ export function hasSafeRootAttachmentSemantics(doc: Y.Doc): boolean {
 			|| !("size" in value) || !Number.isSafeInteger(value.size) || (value.size as number) < 0
 			|| !("mime" in value) || typeof value.mime !== "string" || value.mime.length === 0 || value.mime.length > 256
 			|| !("createdAt" in value) || !Number.isSafeInteger(value.createdAt) || (value.createdAt as number) < 0) return false;
+	}
+	for (const [path, value] of markdown.entries()) {
+		if (typeof value !== "string" || !validIdentity(value) || !path.endsWith(".md")
+			|| refs.has(path) || semantic.has(path)) return false;
+	}
+	const semanticIds = new Set<string>();
+	for (const [path, value] of semantic.entries()) {
+		if (safeCanvasPath(path) !== path || refs.has(path) || markdown.has(path)
+			|| typeof value !== "object" || value === null || Array.isArray(value)) return false;
+		const ref = value as Partial<SemanticPathRef>;
+		const documentId = ref.documentId;
+		if (typeof documentId !== "string" || !validIdentity(documentId) || ref.kind !== "canvas" || ref.format !== "json-canvas"
+			|| ref.formatVersion !== 1 || semanticIds.has(documentId)) return false;
+		semanticIds.add(documentId);
 	}
 	return true;
 }
@@ -212,6 +232,7 @@ export interface SocketServiceOptions {
 	vaultGeneration: () => string;
 	runtimeEpoch: string;
 	isActiveBody: (bodyId: string) => boolean;
+	isActiveSemantic?: (documentId: string) => boolean;
 	currentBodyHead: (bodyId: string) => (BodyCurrentnessHead & { sequence: number }) | null;
 	currentSequence: () => number;
 	validateActor(actor: VaultActorContext): boolean;
@@ -234,7 +255,7 @@ export class VaultSocketService {
 		const result = new Set<string>();
 		for (const socket of this.options.sockets.sockets()) {
 			const attachment = parseVaultSocketAttachment(socket.deserializeAttachment());
-			if (attachment?.kind === "body") result.add(attachment.documentId);
+			if (attachment?.kind === "body" || attachment?.kind === "semantic") result.add(attachment.documentId);
 		}
 		return result;
 	}
@@ -251,18 +272,19 @@ export class VaultSocketService {
 		for (const socket of this.options.sockets.sockets()) {
 			const attachment = parseVaultSocketAttachment(socket.deserializeAttachment());
 			if (attachment?.kind === "root") rootCount++;
-			if (attachment?.kind === "body") bodyCount++;
+			if (attachment?.kind === "body" || attachment?.kind === "semantic") bodyCount++;
 		}
 		if (kind === "root" && rootCount >= MAX_ROOT_SOCKETS) return Response.json({ error: "root_socket_limit" }, { status: 429 });
-		if (kind === "body" && bodyCount >= MAX_BODY_SOCKETS) return Response.json({ error: "body_socket_limit" }, { status: 429 });
-		if (kind === "body" && !this.options.cache.admitBody(documentId)) {
+		if ((kind === "body" || kind === "semantic") && bodyCount >= MAX_BODY_SOCKETS) return Response.json({ error: "body_socket_limit" }, { status: 429 });
+		if ((kind === "body" || kind === "semantic") && !this.options.cache.admitBody(documentId)) {
 			return cachePressureResponse("body_cache_count");
 		}
 		let loaded: LoadedVaultDocument;
 		try {
-			loaded = this.options.cache.load(documentId, kind === "body", () => this.options.isActiveBody(documentId));
+			loaded = this.options.cache.load(documentId, kind !== "root", () => kind === "body"
+				? this.options.isActiveBody(documentId) : this.options.isActiveSemantic?.(documentId) === true);
 		} catch (error) {
-			if (kind === "body" && error instanceof VaultDocumentCachePressureError) {
+			if (kind !== "root" && error instanceof VaultDocumentCachePressureError) {
 				if (error.reason === "body_cache_count"
 					|| error.reason === "body_cache_encoded_state_bytes"
 					|| error.reason === "vault_transient_bytes") {
@@ -330,7 +352,8 @@ export class VaultSocketService {
 			socket.close(1008, "socket authority superseded");
 			return;
 		}
-		if (attachment.kind === "body" && !this.options.isActiveBody(attachment.documentId)) {
+		if ((attachment.kind === "body" && !this.options.isActiveBody(attachment.documentId))
+			|| (attachment.kind === "semantic" && this.options.isActiveSemantic?.(attachment.documentId) !== true)) {
 			socket.close(1008, "body is not active");
 			return;
 		}
@@ -411,6 +434,15 @@ export class VaultSocketService {
 		}
 		this.options.cache.evict(bodyId);
 	}
+	closeSemantic(documentId: string): void {
+		for (const socket of this.options.sockets.sockets()) {
+			const attachment = parseVaultSocketAttachment(socket.deserializeAttachment());
+			if (attachment?.kind === "semantic" && attachment.documentId === documentId) {
+				socket.close(1008, "semantic document demoted");
+			}
+		}
+		this.options.cache.evict(documentId);
+	}
 	closeDevice(deviceId: string): number {
 		let closed = 0;
 		for (const socket of this.options.sockets.sockets()) {
@@ -463,6 +495,17 @@ export class VaultSocketService {
 		}
 	}
 
+	notifySemanticCommitted(documentId: string, durableGeneration: number, vaultSequence: number,
+		head: { lifecycle: string; contentHash: string | null; size: number | null }): void {
+		const value = { type: "SEMANTIC_COMMITTED", documentId, kind: "canvas", format: "json-canvas",
+			vaultGeneration: this.options.vaultGeneration(), durableGeneration, vaultSequence,
+			lifecycle: head.lifecycle, contentHash: head.contentHash, size: head.size, runtimeEpoch: this.options.runtimeEpoch };
+		for (const socket of this.options.sockets.sockets()) {
+			const attachment = parseVaultSocketAttachment(socket.deserializeAttachment());
+			if (attachment?.kind === "root" || attachment?.documentId === documentId) this.sendControl(socket, value);
+		}
+	}
+
 	broadcastDocumentUpdate(documentId: string, update: Uint8Array, origin: unknown): void {
 		const encoder = encoding.createEncoder();
 		encoding.writeVarUint(encoder, MESSAGE_SYNC);
@@ -480,8 +523,10 @@ export class VaultSocketService {
 	private async handleSyncFrame(socket: VaultSocketPort, attachment: VaultSocketAttachment, decoder: decoding.Decoder): Promise<void> {
 		const loaded = this.options.cache.load(
 			attachment.documentId,
-			attachment.kind === "body",
-			() => this.options.isActiveBody(attachment.documentId),
+			attachment.kind !== "root",
+			() => attachment.kind === "body"
+				? this.options.isActiveBody(attachment.documentId)
+				: attachment.kind === "semantic" && this.options.isActiveSemantic?.(attachment.documentId) === true,
 		);
 		const syncType = decoding.readVarUint(decoder);
 		if (syncType === 0) {
@@ -503,10 +548,13 @@ export class VaultSocketService {
 			}
 			return;
 		}
-		const semanticError = bodyUpdateAdmissionError(loaded.doc, update);
+		const semanticError = attachment.kind === "semantic"
+			? await this.canvasUpdateAdmissionError(loaded.doc, update)
+			: bodyUpdateAdmissionError(loaded.doc, update);
 		if (semanticError) {
-			this.sendControl(socket, { type: "VAULT_ERROR", code: semanticError, message: "invalid semantic frontmatter" });
-			socket.close(1008, "invalid semantic frontmatter");
+			const message = attachment.kind === "semantic" ? "invalid semantic Canvas update" : "invalid semantic frontmatter";
+			this.sendControl(socket, { type: "VAULT_ERROR", code: semanticError, message });
+			socket.close(1008, message);
 			return;
 		}
 		const owned = update.slice();
@@ -533,6 +581,16 @@ export class VaultSocketService {
 		}
 		this.broadcastDocumentUpdate(attachment.documentId, owned, socket);
 		this.options.scheduleFlush(attachment.documentId);
+	}
+
+	private async canvasUpdateAdmissionError(current: Y.Doc, update: Uint8Array): Promise<string | null> {
+		const candidate = new Y.Doc({ guid: "canvas-socket-validation" });
+		try {
+			Y.applyUpdate(candidate, Y.encodeStateAsUpdate(current));
+			Y.applyUpdate(candidate, update);
+			return await validateCanvasDocument(candidate);
+		} catch { return "invalid_canvas_update"; }
+		finally { candidate.destroy(); }
 	}
 
 	private relayAwareness(origin: VaultSocketPort, source: VaultSocketAttachment, frame: Uint8Array): void {

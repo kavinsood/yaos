@@ -118,7 +118,7 @@ export type RestoreItemOutcome = "restored" | "created-fresh" | "skipped-changed
 export interface StoredRestoreItem {
 	itemId: string;
 	cursorOrder: number;
-	kind: "markdown" | "attachment";
+	kind: "markdown" | "canvas" | "attachment";
 	path: string;
 	contentHash: string;
 	size: number;
@@ -813,7 +813,7 @@ export class RecoveryJobStateStore {
 	getRestoreItem(itemId: string): StoredRestoreItem | null {
 		this.initializeSchema();
 		const row = this.storage.sql.exec<{
-			item_id: string; cursor_order: number; kind: "markdown" | "attachment"; path: string;
+			item_id: string; cursor_order: number; kind: "markdown" | "canvas" | "attachment"; path: string;
 			content_hash: string; size: number; outcome: RestoreItemOutcome | null; error_code: string | null;
 			metadata_json: string;
 		}>("SELECT * FROM restore_items WHERE item_id = ? LIMIT 1", itemId).toArray()[0];
@@ -829,7 +829,7 @@ export class RecoveryJobStateStore {
 		const bounded = Math.max(1, Math.min(100, Math.floor(limit)));
 		const where = onlyPending ? "AND outcome IS NULL" : "";
 		return this.storage.sql.exec<{
-			item_id: string; cursor_order: number; kind: "markdown" | "attachment"; path: string;
+			item_id: string; cursor_order: number; kind: "markdown" | "canvas" | "attachment"; path: string;
 			content_hash: string; size: number; outcome: RestoreItemOutcome | null; error_code: string | null;
 			metadata_json: string;
 		}>(

@@ -10,11 +10,11 @@ import {
 	parseCanonicalJson,
 	type EncodedRecoveryObject,
 } from "./recoveryCanonicalJson.js";
-import { safeBlobPath, safeMarkdownPath } from "./shared/vaultPath.js";
+import { safeBlobPath, safeCanvasPath, safeMarkdownPath } from "./shared/vaultPath.js";
 import { MAX_CLIENT_MARKDOWN_BYTES } from "./shared/durableLimits.js";
 
 export const RECOVERY_SNAPSHOT_FORMAT = "yaos-recovery-v2" as const;
-export const RECOVERY_SNAPSHOT_FORMAT_VERSION = 2 as const;
+export const RECOVERY_SNAPSHOT_FORMAT_VERSION = 3 as const;
 export const MANIFEST_BRANCH_FORMAT = "yaos-manifest-branch-v1" as const;
 export const MANIFEST_LEAF_FORMAT = "yaos-manifest-leaf-v1" as const;
 export const MANIFEST_MAX_ENTRIES = 512;
@@ -54,6 +54,30 @@ export type ActiveFileManifestEntry =
 		fileId: string;
 		bodyId: string;
 		bodyGeneration: number;
+		errorCode: "corrupt_history" | "hash_mismatch" | "missing_history";
+		errorReference: string;
+	}
+	| {
+		availability: "available";
+		kind: "canvas";
+		path: string;
+		documentId: string;
+		fileId: string;
+		format: "json-canvas";
+		formatVersion: 1;
+		generation: number;
+		contentHash: string;
+		size: number;
+	}
+	| {
+		availability: "unavailable";
+		kind: "canvas";
+		path: string;
+		documentId: string;
+		fileId: string;
+		format: "json-canvas";
+		formatVersion: 1;
+		generation: number;
 		errorCode: "corrupt_history" | "hash_mismatch" | "missing_history";
 		errorReference: string;
 	};
@@ -264,6 +288,10 @@ function assertMarkdownPath(value: unknown, label: string): asserts value is str
 	if (typeof value !== "string" || !isWellFormedUnicode(value) || safeMarkdownPath(value) !== value) throw new Error(`invalid ${label}`);
 }
 
+function assertCanvasPath(value: unknown, label: string): asserts value is string {
+	if (typeof value !== "string" || safeCanvasPath(value) !== value) throw new Error(`invalid ${label}`);
+}
+
 function assertAttachmentPath(value: unknown, label: string): asserts value is string {
 	if (typeof value !== "string" || !isWellFormedUnicode(value) || safeBlobPath(value) !== value) throw new Error(`invalid ${label}`);
 }
@@ -284,6 +312,28 @@ function assertMime(value: unknown): asserts value is string | null {
 
 function validateActiveEntry(value: unknown): ActiveFileManifestEntry {
 	const entry = asRecord(value, "active manifest entry");
+	if (entry.kind === "canvas") {
+		assertCanvasPath(entry.path, "Canvas path");
+		assertString(entry.documentId, "Canvas document ID");
+		assertString(entry.fileId, "Canvas file ID");
+		if (entry.format !== "json-canvas" || entry.formatVersion !== 1) throw new Error("invalid Canvas manifest format");
+		assertSafeInteger(entry.generation, "Canvas generation");
+		const common = { kind: "canvas" as const, path: entry.path, documentId: entry.documentId,
+			fileId: entry.fileId, format: "json-canvas" as const, formatVersion: 1 as const, generation: entry.generation };
+		if (entry.availability === "available") {
+			assertExactKeys(entry, ["availability", "kind", "path", "documentId", "fileId", "format", "formatVersion", "generation", "contentHash", "size"], "Canvas manifest entry");
+			assertHash(entry.contentHash, "Canvas content hash");
+			assertSafeInteger(entry.size, "Canvas content size", 1024 * 1024);
+			return { availability: "available", ...common, contentHash: entry.contentHash, size: entry.size };
+		}
+		if (entry.availability === "unavailable") {
+			assertExactKeys(entry, ["availability", "kind", "path", "documentId", "fileId", "format", "formatVersion", "generation", "errorCode", "errorReference"], "Canvas manifest entry");
+			if (entry.errorCode !== "corrupt_history" && entry.errorCode !== "hash_mismatch" && entry.errorCode !== "missing_history") throw new Error("invalid Canvas unavailability code");
+			assertString(entry.errorReference, "Canvas error reference", MAX_REFERENCE_BYTES);
+			return { availability: "unavailable", ...common, errorCode: entry.errorCode, errorReference: entry.errorReference };
+		}
+		throw new Error("invalid Canvas availability");
+	}
 	assertMarkdownPath(entry.path, "active path");
 	assertString(entry.fileId, "active file ID");
 	assertString(entry.bodyId, "active body ID");
@@ -410,7 +460,7 @@ export function manifestEntryKey<K extends ManifestTreeKind>(tree: K, entry: Man
 function manifestEntryIdentity(tree: ManifestTreeKind, entry: RecoveryManifestEntry): string {
 	if (tree === "active") {
 		const active = entry as ActiveFileManifestEntry;
-		return `${active.fileId}\u0000${active.bodyId}`;
+		return "kind" in active ? `${active.fileId}\u0000${active.documentId}` : `${active.fileId}\u0000${active.bodyId}`;
 	}
 	if (tree === "deleted") {
 		const deleted = entry as DeletedFileManifestEntry;

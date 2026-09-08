@@ -42,6 +42,7 @@ import { corsPreflight, html, json, safeDecodeUriComponent, withCors } from "./r
 import {
 	handleOperatorCreateVault,
 	handleOperatorCollaborationMigration,
+	handleOperatorCanvasMigration,
 	handleOperatorDestroyVault,
 	handleOperatorEmergencyDestroyVault,
 	handleOperatorLogin,
@@ -82,7 +83,7 @@ type WorkerRoute =
 	| { kind: "claim" }
 	| { kind: "enroll" }
 	| { kind: "operator-login" | "operator-logout" | "operator-state" | "operator-pairing" | "operator-vaults" }
-	| { kind: "operator-vault-patch" | "operator-vault-destroy" | "operator-vault-emergency-destroy" | "operator-vault-deletion" | "operator-vault-provision" | "operator-owner-code" | "operator-collaboration-migrate"; id: string }
+	| { kind: "operator-vault-patch" | "operator-vault-destroy" | "operator-vault-emergency-destroy" | "operator-vault-deletion" | "operator-vault-provision" | "operator-owner-code" | "operator-collaboration-migrate" | "operator-canvas-migrate"; id: string }
 	| { kind: "operator-authorization-retry"; id: string; changeId: string }
 	| { kind: "operator-pairing-revoke" | "operator-revoke"; id: string }
 	| { kind: "update-metadata" }
@@ -118,7 +119,14 @@ function validVaultRest(method: string, rest: string[]): boolean {
 	}
 	if (method === "GET" && rest.length === 2 && rest[0] === "ws" && rest[1] === "root") return true;
 	if (method === "GET" && rest.length === 3 && rest[0] === "ws" && rest[1] === "body" && !!rest[2]) return true;
+	if (method === "GET" && rest.length === 3 && rest[0] === "ws" && rest[1] === "semantic" && !!rest[2]) return true;
 	if (method === "POST" && rest.length === 3 && rest[0] === "body" && !!rest[1] && rest[2] === "candidate") return true;
+	if (method === "POST" && rest.length === 3 && rest[0] === "semantic" && !!rest[1] && rest[2] === "candidate") return true;
+	if (method === "POST" && rest.length === 2 && rest[0] === "semantic" && rest[1] === "lifecycle") return true;
+	if (method === "POST" && rest.length === 3 && rest[0] === "semantic" && rest[1] === "authority"
+		&& (rest[2] === "promote" || rest[2] === "demote")) return true;
+	if (method === "GET" && rest.length === 3 && rest[0] === "semantic" && !!rest[1]
+		&& (rest[2] === "head" || rest[2] === "state")) return true;
 	if (method === "GET" && rest.length === 3 && rest[0] === "operations" && !!rest[1] && rest[2] === "outcome") return true;
 	if (method === "GET" && rest.length === 2 && (rest[0] === "body" || rest[0] === "head") && !!rest[1]) return true;
 	if (method === "POST" && rest.length === 1 && (rest[0] === "lifecycle" || rest[0] === "catch-up")) return true;
@@ -126,10 +134,11 @@ function validVaultRest(method: string, rest: string[]): boolean {
 	if (method === "POST" && rest.length === 2 && rest[0] === "attachments" && rest[1] === "publish") return true;
 	if (method === "POST" && rest.length === 2 && rest[0] === "bootstrap" && rest[1] === "start") return true;
 	if (rest.length === 3 && rest[0] === "bootstrap" && !!rest[1]) {
-		return (method === "GET" && (rest[2] === "root" || rest[2] === "catalog"))
+		return (method === "GET" && (rest[2] === "root" || rest[2] === "catalog" || rest[2] === "semantic-catalog"))
 			|| (method === "POST" && (rest[2] === "bodies" || rest[2] === "renew" || rest[2] === "complete"));
 	}
 	if (method === "GET" && rest.length === 4 && rest[0] === "bootstrap" && !!rest[1] && rest[2] === "body" && !!rest[3]) return true;
+	if (method === "GET" && rest.length === 4 && rest[0] === "bootstrap" && !!rest[1] && rest[2] === "semantic" && !!rest[3]) return true;
 	return method === "GET" && rest.length === 1
 		&& ["root", "changes", "heads", "status", "health", "diagnostics"].includes(rest[0]!);
 }
@@ -179,6 +188,11 @@ export function classifyWorkerRoute(request: Request, url = new URL(request.url)
 	if (operatorCollaborationMigrate?.[1] && request.method === "POST") {
 		const id = safeDecodeUriComponent(operatorCollaborationMigrate[1]);
 		return id ? { kind: "operator-collaboration-migrate", id } : { kind: "not-found" };
+	}
+	const operatorCanvasMigrate = url.pathname.match(/^\/operator\/vaults\/([^/]+)\/canvas-migrate$/);
+	if (operatorCanvasMigrate?.[1] && request.method === "POST") {
+		const id = safeDecodeUriComponent(operatorCanvasMigrate[1]);
+		return id ? { kind: "operator-canvas-migrate", id } : { kind: "not-found" };
 	}
 	const operatorVaultDeletion = url.pathname.match(/^\/operator\/vaults\/([^/]+)\/deletion$/);
 	if (operatorVaultDeletion?.[1] && request.method === "GET") {
@@ -266,6 +280,7 @@ export async function handleWorkerRequest(request: Request, env: Env): Promise<R
 		else if (route.kind === "claim") response = await handleClaimRoute(request, env, authState);
 		else if (route.kind === "operator-login") response = await handleOperatorLogin(request, env);
 		else if (route.kind === "operator-collaboration-migrate") response = withCors(await handleOperatorCollaborationMigration(request, env, route.id));
+		else if (route.kind === "operator-canvas-migrate") response = withCors(await handleOperatorCanvasMigration(request, env, route.id));
 		else if (authState.mode === "unsupported") response = withCors(json({ error: "server_format_unsupported" }, 503));
 		else if (route.kind === "enroll") response = withCors(await handleEnrollRoute(request, env));
 		else if (route.kind === "operator-state") response = await handleOperatorState(request, env);

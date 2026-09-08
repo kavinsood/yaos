@@ -40,7 +40,7 @@ export interface CachedSocketTicket {
 }
 
 export interface SocketTicketScope {
-	purpose: "root" | "body";
+	purpose: "root" | "body" | "semantic";
 	documentId: string;
 }
 

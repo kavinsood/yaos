@@ -271,6 +271,7 @@ export function getCapabilities(
 	snapshots: boolean;
 	recoveryJobs: boolean;
 	settingsSync: boolean;
+	semanticCanvas: boolean;
 	maxBlobUploadBytes: number;
 	serverVersion: string;
 	schemaVersion: number;
@@ -290,6 +291,7 @@ export function getCapabilities(
 		snapshots: recoveryJobs,
 		recoveryJobs,
 		settingsSync: true,
+		semanticCanvas: true,
 		maxBlobUploadBytes: MAX_BLOB_UPLOAD_BYTES,
 		serverVersion: SERVER_VERSION,
 		schemaVersion: SERVER_SCHEMA_VERSION,

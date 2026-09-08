@@ -16,6 +16,8 @@ export type RestoreSelection =
 	| { kind: "deleted-identities"; bodyIds: string[] };
 export type CapturePlanEntry =
 	| { kind: "active"; bodyId: string; fileId: string; canonicalPath: string; generation: number; contentHash: string; size: number }
+	| { kind: "canvas"; documentId: string; fileId: string; canonicalPath: string; generation: number;
+		contentHash: string; size: number; format: "json-canvas"; formatVersion: 1 }
 	| { kind: "deleted"; bodyId: string; fileId: string; lastPath: string; generation: number; baselineContentHash: string; baselineSize: number; bodyReaped: boolean; deletedAtSequence: number }
 	| { kind: "attachment"; canonicalPath: string; contentHash: string; size: number; mime: string | null };
 export type RecoveryRootKind = "restore";
@@ -36,7 +38,7 @@ export interface BodyRecipeDescriptor {
 }
 export interface MaterializationLease { leaseId: string; ownerKind: "capture" | "projection"; ownerId: string; objectKeys: string[]; expiresAt: number }
 export interface RecoveryDefectRecord {
-	captureId: string; kind: "active" | "deleted" | "attachment"; identity: string; generation: number | null;
+	captureId: string; kind: "active" | "canvas" | "deleted" | "attachment"; identity: string; generation: number | null;
 	code: string; referenceHash: string; createdAt: number;
 }
 export interface RecoverySnapshotCatalogEntry {
@@ -511,7 +513,34 @@ export class RecoveryAuthorityStore extends VaultBootstrapStore {
 					};
 				});
 		}
-		const orderColumn = stream === "active" ? "path" : "body_id";
+		if (stream === "active") {
+			const rows = this.storage.sql.exec<{ item_kind: "active" | "canvas"; identity: string; file_id: string;
+				path: string; generation: number; content_hash: string; size: number }>(`WITH
+			 latest_markdown AS (
+			  SELECT body_id, MAX(sequence) AS sequence FROM vault_catalog_events WHERE sequence <= ? GROUP BY body_id
+			 ), latest_semantic AS (
+			  SELECT document_id, MAX(sequence) AS sequence FROM vault_semantic_catalog_events WHERE sequence <= ? GROUP BY document_id
+			 ), active_documents AS (
+			  SELECT 'active' AS item_kind, e.body_id AS identity, e.file_id, e.path, e.generation, e.content_hash, e.size
+			  FROM vault_catalog_events e JOIN latest_markdown l ON l.body_id = e.body_id AND l.sequence = e.sequence
+			  WHERE e.lifecycle = 'active'
+			  UNION ALL
+			  SELECT 'canvas' AS item_kind, e.document_id AS identity, e.file_id, e.path, e.generation, e.content_hash, e.size
+			  FROM vault_semantic_catalog_events e JOIN latest_semantic l ON l.document_id = e.document_id AND l.sequence = e.sequence
+			  WHERE e.lifecycle = 'active' AND e.kind = 'canvas' AND e.format = 'json-canvas' AND e.format_version = 1
+			 ) SELECT item_kind, identity, file_id, path, generation, content_hash, size FROM active_documents
+			 WHERE path > ? ORDER BY path, identity LIMIT ?`, capture.boundarySequence, capture.boundarySequence, after, bounded).toArray();
+			return rows.map((row): CapturePlanEntry => {
+				if (!row.content_hash || row.size === null) throw new Error("catalog entry is missing durable content identity");
+				return row.item_kind === "canvas"
+					? { kind: "canvas", documentId: row.identity, fileId: row.file_id, canonicalPath: row.path,
+						generation: row.generation, contentHash: row.content_hash, size: row.size,
+						format: "json-canvas", formatVersion: 1 }
+					: { kind: "active", bodyId: row.identity, fileId: row.file_id, canonicalPath: row.path,
+						generation: row.generation, contentHash: row.content_hash, size: row.size };
+			});
+		}
+		const orderColumn = "body_id";
 		const rows = this.storage.sql.exec<{
 			sequence: number; body_id: string; file_id: string; path: string; lifecycle: BodyLifecycle;
 			generation: number; content_hash: string | null; size: number | null;
@@ -534,15 +563,7 @@ export class RecoveryAuthorityStore extends VaultBootstrapStore {
 		).toArray();
 		return rows.flatMap((row): CapturePlanEntry[] => {
 			if (row.content_hash === null || row.size === null) throw new Error("catalog entry is missing durable content identity");
-			return stream === "active" ? [{
-				kind: "active",
-				bodyId: row.body_id,
-				fileId: row.file_id,
-				canonicalPath: row.path,
-				generation: row.generation,
-				contentHash: row.content_hash,
-				size: row.size,
-			}] : [{
+			return [{
 				kind: "deleted",
 				bodyId: row.body_id,
 				fileId: row.file_id,
@@ -633,7 +654,8 @@ export class RecoveryAuthorityStore extends VaultBootstrapStore {
 		this.initialize();
 		const capture = this.recoveryCapture(captureId);
 		if (!capture) throw new Error("capture not found");
-		const head = this.getCatalogHeadAt(capture.boundarySequence, bodyId);
+		const head = this.getCatalogHeadAt(capture.boundarySequence, bodyId)
+			?? this.semanticHeadAt(capture.boundarySequence, bodyId);
 		if (!head || head.generation !== generation || head.contentHash === null || head.size === null) {
 			throw new Error("body generation is outside capture plan");
 		}
@@ -1163,6 +1185,14 @@ export class RecoveryAuthorityStore extends VaultBootstrapStore {
 					    ) latest ON latest.body_id = e.body_id AND latest.sequence = e.sequence
 					    WHERE e.lifecycle IN ('active','tombstoned','reaped')
 					      AND e.content_hash IS NOT NULL
+					      AND instr(?, e.content_hash) > 0) +
+					   (SELECT COUNT(*) FROM vault_semantic_catalog_events e
+					    JOIN (
+					      SELECT document_id, MAX(sequence) AS sequence
+					      FROM vault_semantic_catalog_events GROUP BY document_id
+					    ) latest ON latest.document_id = e.document_id AND latest.sequence = e.sequence
+					    WHERE e.lifecycle IN ('active','tombstoned','reaped')
+					      AND e.content_hash IS NOT NULL
 					      AND instr(?, e.content_hash) > 0)
 					 ) AS count`,
 					key,
@@ -1170,14 +1200,19 @@ export class RecoveryAuthorityStore extends VaultBootstrapStore {
 					key,
 					key,
 					key,
+					key,
 				).one().count > 0;
 				const attachmentLive = input.domain === "blob" && this.storage.sql.exec<{ count: number }>(
-					`SELECT COUNT(*) AS count FROM vault_attachment_catalog_events e
+					`SELECT (
+					 (SELECT COUNT(*) FROM vault_attachment_catalog_events e
 					 JOIN (
 					   SELECT path, MAX(sequence) AS sequence FROM vault_attachment_catalog_events GROUP BY path
 					 ) latest ON latest.path = e.path AND latest.sequence = e.sequence
-					 WHERE e.lifecycle = 'active' AND e.content_hash IS NOT NULL AND instr(?, e.content_hash) > 0`,
-					key,
+					 WHERE e.lifecycle = 'active' AND e.content_hash IS NOT NULL AND instr(?, e.content_hash) > 0) +
+					 (SELECT COUNT(*) FROM vault_semantic_rollback_blobs r
+					  WHERE r.retained_until > ? AND instr(?, r.content_hash) > 0)
+					) AS count`,
+					key, now, key,
 				).one().count > 0;
 				if (leased || rooted || attachmentLive) continue;
 				this.storage.sql.exec(

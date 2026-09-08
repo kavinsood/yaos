@@ -19,10 +19,12 @@ import {
 	type SnapshotRootV2,
 } from "./recoveryManifestTree";
 import { sha256Hex } from "./hex";
-import { safeBlobPath, safeMarkdownPath } from "./shared/vaultPath";
+import { safeBlobPath, safeCanvasPath, safeMarkdownPath } from "./shared/vaultPath";
 import { blobObjectKey, recoveryPrefix } from "./recoveryProtocol";
 import type { ObjectStorePort } from "./platformPorts";
 import { MAX_CLIENT_MARKDOWN_BYTES } from "./shared/durableLimits.js";
+import { CANVAS_LIMITS } from "./shared/canvasLimits";
+import { canonicalCanvasBytes, parseCanvasBytes } from "./shared/canvasCodec";
 
 const MAX_ROOT_BYTES = 1024 * 1024;
 const MAX_MARKDOWN_BYTES = MAX_CLIENT_MARKDOWN_BYTES;
@@ -70,7 +72,7 @@ export class RecoveryReadService {
 		return this.readRoot(retained);
 	}
 	async entry(retained: RetainedSnapshotRoot, path: string): Promise<ActiveFileManifestEntry | AttachmentManifestEntry | null> {
-		if (safeMarkdownPath(path) === path) return this.activeEntry(retained, path);
+		if (safeMarkdownPath(path) === path || safeCanvasPath(path) === path) return this.activeEntry(retained, path);
 		if (safeBlobPath(path) !== path) throw new RecoveryReadError("invalid_path", 400);
 		const root = await this.readRoot(retained);
 		return this.lookup("attachments", root.attachmentsTreeHash, path);
@@ -82,12 +84,13 @@ export class RecoveryReadService {
 		hash: string;
 		contentType: string;
 	}> {
-		if (safeMarkdownPath(path) === path) {
+		if (safeMarkdownPath(path) === path || safeCanvasPath(path) === path) {
 			const result = await this.activeFile(retained, path);
 			return {
 				...result,
 				hash: result.entry.availability === "available" ? result.entry.contentHash : "",
-				contentType: "text/markdown; charset=utf-8",
+				contentType: "kind" in result.entry && result.entry.kind === "canvas"
+					? "application/json" : "text/markdown; charset=utf-8",
 			};
 		}
 		if (safeBlobPath(path) !== path) throw new RecoveryReadError("invalid_path", 400);
@@ -100,18 +103,19 @@ export class RecoveryReadService {
 	}
 
 	async activeEntry(retained: RetainedSnapshotRoot, path: string): Promise<ActiveFileManifestEntry | null> {
-		if (safeMarkdownPath(path) !== path) throw new RecoveryReadError("invalid_path", 400);
+		if (safeMarkdownPath(path) !== path && safeCanvasPath(path) !== path) throw new RecoveryReadError("invalid_path", 400);
 		const root = await this.readRoot(retained);
 		return this.lookup("active", root.activeFilesTreeHash, path);
 	}
 
 	async activeFile(retained: RetainedSnapshotRoot, path: string): Promise<{ entry: ActiveFileManifestEntry; bytes: Uint8Array }> {
-		if (safeMarkdownPath(path) !== path) throw new RecoveryReadError("invalid_path", 400);
+		if (safeMarkdownPath(path) !== path && safeCanvasPath(path) !== path) throw new RecoveryReadError("invalid_path", 400);
 		const root = await this.readRoot(retained);
 		const entry = await this.lookup("active", root.activeFilesTreeHash, path);
 		if (!entry) throw new RecoveryReadError("snapshot_entry_not_found", 404);
 		if (entry.availability !== "available") throw new RecoveryReadError("snapshot_content_unavailable", 409);
-		return { entry, bytes: await this.readMarkdown(entry.contentHash, entry.size) };
+		return { entry, bytes: "kind" in entry && entry.kind === "canvas"
+			? await this.readCanvas(entry.contentHash, entry.size) : await this.readMarkdown(entry.contentHash, entry.size) };
 	}
 
 	async deletedEntry(retained: RetainedSnapshotRoot, bodyId: string): Promise<DeletedFileManifestEntry | null> {
@@ -142,7 +146,7 @@ export class RecoveryReadService {
 		catch { throw new RecoveryReadError("corrupt_snapshot_root", 503); }
 		if (!unverified || typeof unverified !== "object" || Array.isArray(unverified)
 			|| !("format" in unverified) || unverified.format !== "yaos-recovery-v2"
-			|| !("snapshotFormatVersion" in unverified) || unverified.snapshotFormatVersion !== 2) {
+			|| !("snapshotFormatVersion" in unverified) || unverified.snapshotFormatVersion !== 3) {
 			throw new RecoveryReadError("unsupported_snapshot_format", 409);
 		}
 		let root: SnapshotRootV2;
@@ -192,6 +196,21 @@ export class RecoveryReadService {
 		try { decoder.decode(bytes); } catch { throw new RecoveryReadError("snapshot_content_invalid_utf8", 503); }
 		return bytes;
 	}
+	private async readCanvas(hash: string, expectedSize: number): Promise<Uint8Array> {
+		if (!Number.isSafeInteger(expectedSize) || expectedSize < 0 || expectedSize > CANVAS_LIMITS.canonicalBytes) {
+			throw new RecoveryReadError("snapshot_content_too_large", 413);
+		}
+		const compressed = await this.readObject(recoveryContentObjectKey(this.prefix, hash), MAX_CONTENT_COMPRESSED_BYTES);
+		let bytes: Uint8Array;
+		try { bytes = gunzipRecoveryBytes(compressed, MAX_CONTENT_COMPRESSED_BYTES, Math.max(1, expectedSize)); }
+		catch { throw new RecoveryReadError("snapshot_content_corrupt", 503); }
+		if (bytes.byteLength !== expectedSize || await sha256Hex(bytes) !== hash) throw new RecoveryReadError("snapshot_content_hash_mismatch", 503);
+		const parsed = parseCanvasBytes(bytes);
+		if (parsed.kind !== "valid" || await sha256Hex(canonicalCanvasBytes(parsed.data)) !== hash) {
+			throw new RecoveryReadError("snapshot_canvas_invalid", 503);
+		}
+		return bytes;
+	}
 	private async readAttachment(hash: string, expectedSize: number): Promise<Uint8Array> {
 		if (!Number.isSafeInteger(expectedSize) || expectedSize < 0 || expectedSize > MAX_BLOB_UPLOAD_BYTES) {
 			throw new RecoveryReadError("snapshot_content_too_large", 413);
@@ -218,6 +237,6 @@ export class RecoveryReadService {
 export const RECOVERY_READ_LIMITS = Object.freeze({
 	maximumTreeDepth: MANIFEST_MAX_DEPTH,
 	maximumNodeBytesPerRequest: MANIFEST_LOOKUP_MAX_BYTES,
-	maximumContentBytesPerRequest: Math.max(MAX_MARKDOWN_BYTES, MAX_BLOB_UPLOAD_BYTES),
+	maximumContentBytesPerRequest: Math.max(MAX_MARKDOWN_BYTES, CANVAS_LIMITS.canonicalBytes, MAX_BLOB_UPLOAD_BYTES),
 	maximumR2ReadsPerRequest: MANIFEST_LOOKUP_MAX_READS + 2,
 });

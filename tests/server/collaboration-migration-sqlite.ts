@@ -37,6 +37,7 @@ export class MigrationCycle {
     root.getMap("sys").set("schemaVersion", 6);
     root.getMap("sys").set("protocolVersion", 2);
     root.getMap("pathToId").set("kept.md", "kept-body");
+    root.getMap("pathToBlob").set("Board.canvas", { hash: "b".repeat(64), size: 42, revision: "blob-revision" });
     const rootUpdate = Y.encodeStateAsUpdate(root);
     root.destroy();
     sql.exec(
@@ -78,11 +79,30 @@ export class MigrationCycle {
     };
     const receipt = store.migrateCollaboration(input);
     const replay = store.migrateCollaboration(input);
-    const metadata = store.vaultMetadata();
+    const metadata = store.storedVaultMetadata();
     const reconstructed = store.reconstructDocument("root");
     const system = reconstructed.doc.getMap("sys");
     const path = reconstructed.doc.getMap("pathToId").get("kept.md");
     reconstructed.doc.destroy();
+	const canvasRoot = store.reconstructDocument("root");
+	const canvasVector = Y.encodeStateVector(canvasRoot.doc);
+	canvasRoot.doc.getMap("pathToSemantic");
+	canvasRoot.doc.getMap("sys").set("schemaVersion", 8);
+	canvasRoot.doc.getMap("sys").set("protocolVersion", 4);
+	const canvasRootUpdate = Y.encodeStateAsUpdate(canvasRoot.doc, canvasVector);
+	canvasRoot.doc.destroy();
+	const canvasMigration = store.migrateCanvasSchema({ migrationId: "canvas-schema-8-legacy-generation",
+	  vaultId: "legacy-vault", vaultGeneration: "legacy-generation", rootUpdate: canvasRootUpdate,
+	  rootStateHash: "3".repeat(64), now: 600 });
+	const canvasReplay = store.migrateCanvasSchema({ migrationId: "canvas-schema-8-legacy-generation",
+	  vaultId: "legacy-vault", vaultGeneration: "legacy-generation", rootUpdate: new Uint8Array(),
+	  rootStateHash: "0".repeat(64), now: 601 });
+	const canvasMetadata = store.storedVaultMetadata();
+	const finalRoot = store.reconstructDocument("root");
+	const retainedCanvasBlob = finalRoot.doc.getMap("pathToBlob").get("Board.canvas");
+	const semanticPaths = finalRoot.doc.getMap("pathToSemantic").size;
+	const finalSchema = finalRoot.doc.getMap("sys").get("schemaVersion");
+	finalRoot.doc.destroy();
     const settingsKey = sql.exec("SELECT config_key FROM settings_env").one().config_key;
     const fileSettingsKey = sql.exec("SELECT config_key FROM settings_files").one().config_key;
     const journal = sql.exec("SELECT sequence FROM vault_journal ORDER BY sequence").toArray().map((row) => row.sequence);
@@ -96,6 +116,8 @@ export class MigrationCycle {
       fileSettingsKey,
       journal,
       authority: store.principalAuthority("owner-principal")?.role,
+	  canvasMigration, canvasReplayExact: JSON.stringify(canvasMigration) === JSON.stringify(canvasReplay),
+	  canvasMetadata, retainedCanvasBlob, semanticPaths, finalSchema,
     });
   }
 }
@@ -155,11 +177,17 @@ s.test("schema-6 vault migration preserves history and atomically installs schem
 			fileSettingsKey: string;
 			journal: number[];
 			authority: string;
+			canvasMigration: { rootSequence: number; rootStateHash: string };
+			canvasReplayExact: boolean;
+			canvasMetadata: { schemaVersion: number; storageFormatVersion: number };
+			retainedCanvasBlob: { hash: string; size: number; revision: string };
+			semanticPaths: number;
+			finalSchema: number;
 		};
 		s.check(result.replayExact && result.receipt.rootSequence === 2, "migration replays its exact durable receipt");
 		s.check(result.metadata.schemaVersion === 7 && result.metadata.storageFormatVersion === 3,
 			"vault_meta CHECK constraint is rebuilt for schema 7");
-		s.check(result.journal.join(",") === "1,2" && result.root.path === "kept-body",
+		s.check(result.journal.join(",") === "1,2,3" && result.root.path === "kept-body",
 			"legacy journal and root content survive the schema transition");
 		s.check(result.root.schemaVersion === 7 && result.root.protocolVersion === 4
 			&& result.root.historyAttribution === "legacy_unattributed",
@@ -168,6 +196,14 @@ s.test("schema-6 vault migration preserves history and atomically installs schem
 			&& result.fileSettingsKey === result.settingsKey && result.receipt.settingsEnvironmentCount === 1,
 			"legacy settings environments become owner-principal scoped in the same transaction");
 		s.check(result.authority === "owner", "principal and device authority mirror is installed before activation");
+		s.check(result.canvasReplayExact && result.canvasMigration.rootSequence === 3
+			&& result.canvasMigration.rootStateHash === "3".repeat(64),
+			"schema-7 to schema-8 migration is durably idempotent");
+		s.check(result.canvasMetadata.schemaVersion === 8 && result.canvasMetadata.storageFormatVersion === 3
+			&& result.finalSchema === 8, "Canvas migration advances durable and root schema together");
+		s.check(result.semanticPaths === 0 && result.retainedCanvasBlob.hash === "b".repeat(64)
+			&& result.retainedCanvasBlob.revision === "blob-revision",
+			"Canvas migration preserves every attachment head and performs no implicit promotion");
 	} finally {
 		if (child && child.exitCode === null) {
 			child.kill("SIGTERM");

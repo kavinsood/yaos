@@ -12,7 +12,7 @@ export interface TicketPayload extends VaultActorContext {
 	v: 3;
 	aud: "yaos-vault-ws";
 	deploymentId: string;
-	purpose: "root" | "body";
+	purpose: "root" | "body" | "semantic";
 	documentId: string;
 	iat: number;
 	exp: number;
@@ -36,7 +36,7 @@ async function deploymentId(authState: AuthState): Promise<string> {
 }
 
 export async function createTicket(authState: AuthState, actor: VaultActorContext,
-	purpose: "root" | "body", documentId: string, ttlMs = TICKET_TTL_MS,
+	purpose: "root" | "body" | "semantic", documentId: string, ttlMs = TICKET_TTL_MS,
 ): Promise<{ ticket: string; expiresAt: number; ttlMs: number }> {
 	if (authState.mode !== "claim") throw new Error("cannot sign ticket: server is unavailable");
 	if ((purpose === "root") !== (documentId === "root")) throw new Error("ticket purpose does not match document");
@@ -52,7 +52,7 @@ export async function createTicket(authState: AuthState, actor: VaultActorContex
 }
 
 export async function inspectTicket(ticket: string, authState: AuthState,
-	expected: string | { vaultId: string; vaultGeneration?: string; purpose?: "root" | "body"; documentId?: string },
+	expected: string | { vaultId: string; vaultGeneration?: string; purpose?: "root" | "body" | "semantic"; documentId?: string },
 ): Promise<TicketPayload | null> {
 	if (authState.mode !== "claim") return null;
 	const scope = typeof expected === "string" ? { vaultId: expected } : expected;
@@ -85,7 +85,7 @@ function isTicketPayload(value: unknown): value is TicketPayload {
 	const payload = value as Record<string, unknown>;
 	return payload.v === 3 && payload.aud === "yaos-vault-ws"
 		&& typeof payload.deploymentId === "string" && payload.deploymentId.length > 0
-		&& (payload.purpose === "root" || payload.purpose === "body")
+		&& (payload.purpose === "root" || payload.purpose === "body" || payload.purpose === "semantic")
 		&& typeof payload.documentId === "string" && payload.documentId.length > 0
 		&& (payload.purpose === "root") === (payload.documentId === "root")
 		&& typeof payload.vaultId === "string" && payload.vaultId.length > 0
@@ -108,7 +108,7 @@ export async function handleTicketRoute(req: Request, authState: AuthState, acto
 	try {
 		let input: { purpose?: unknown; documentId?: unknown } = {};
 		try { input = await req.json(); } catch { /* invalid below */ }
-		if ((input.purpose !== "root" && input.purpose !== "body")
+		if ((input.purpose !== "root" && input.purpose !== "body" && input.purpose !== "semantic")
 			|| typeof input.documentId !== "string" || input.documentId.length === 0) return json({ error: "invalid_ticket_scope" }, 400);
 		const result = await createTicket(authState, actor, input.purpose, input.documentId, readTicketTtlMs(env?.YAOS_TICKET_TTL_MS));
 		if (env) try {

@@ -3,6 +3,9 @@
  */
 
 import { isExcluded } from "./sync/exclude";
+import type { SemanticPathRef } from "@shared/canvasTypes";
+
+export type { SemanticPathRef };
 
 // Blob / attachment types
 // -------------------------------------------------------------------
@@ -75,4 +78,8 @@ export function isMarkdownSyncable(path: string, excludePatterns: string[], conf
 export function isBlobSyncable(path: string, excludePatterns: string[], configDir: string): boolean {
 	if (path.endsWith(".md")) return false;
 	return !isExcluded(path, excludePatterns, configDir);
+}
+
+export function isCanvasSyncable(path: string, excludePatterns: string[], configDir: string): boolean {
+	return path.toLowerCase().endsWith(".canvas") && !isExcluded(path, excludePatterns, configDir);
 }

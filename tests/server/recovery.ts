@@ -49,7 +49,7 @@ function hashFor(index: number): string {
 	return index.toString(16).padStart(64, "0");
 }
 
-function activeEntry(index: number, path = `notes/${String(index).padStart(5, "0")}.md`): ActiveFileManifestEntry {
+function activeEntry(index: number, path = `notes/${String(index).padStart(5, "0")}.md`): Extract<ActiveFileManifestEntry, { bodyId: string }> {
 	return {
 		availability: "available",
 		path,
@@ -73,7 +73,7 @@ async function rejects(work: () => unknown | Promise<unknown>, label: string): P
 function rootFixture(): SnapshotRootV2 {
 	return {
 		format: "yaos-recovery-v2",
-		snapshotFormatVersion: 2,
+		snapshotFormatVersion: 3,
 		snapshotId: "snapshot-1",
 		vaultIdHash: "a".repeat(64),
 		vaultGenerationHash: "b".repeat(64),
@@ -145,7 +145,8 @@ s.test("manifest split and lookup follow one bounded digest branch", async () =>
 	}
 	store.reads = 0;
 	const found = await lookupManifestEntry(store, "active", tree.rootHash, entries[519]!.path);
-	if (found.entry?.bodyId !== entries[519]!.bodyId || found.nodeReads > 2 || found.nodeReads !== store.reads) {
+	if (!found.entry || !("bodyId" in found.entry) || found.entry.bodyId !== entries[519]!.bodyId
+		|| found.nodeReads > 2 || found.nodeReads !== store.reads) {
 		throw new Error("lookup scanned outside its digest branch");
 	}
 	await rejects(() => lookupManifestEntry(store, "active", tree.rootHash, entries[0]!.path, { maxReads: 1 }), "read bound");
@@ -221,7 +222,8 @@ s.test("deleted identities remain independent from canonical active paths", asyn
 	};
 	const activeTree = await rebuildManifestTree(store, "recovery-v2", "active", [active]);
 	const deletedTree = await rebuildManifestTree(store, "recovery-v2", "deleted", [deleted]);
-	if ((await lookupManifestEntry(store, "active", activeTree.rootHash, active.path)).entry?.bodyId !== active.bodyId
+	const foundActive = (await lookupManifestEntry(store, "active", activeTree.rootHash, active.path)).entry;
+	if (!foundActive || !("bodyId" in foundActive) || foundActive.bodyId !== active.bodyId
 		|| (await lookupManifestEntry(store, "deleted", deletedTree.rootHash, deleted.bodyId)).entry?.bodyId !== deleted.bodyId) {
 		throw new Error("path and body identity lookup collapsed");
 	}

@@ -19,6 +19,63 @@ export interface CatalogMutation {
 	size?: number | null;
 }
 
+export interface SemanticCatalogMutation {
+	documentId: string;
+	fileId: string;
+	kind: "canvas";
+	format: "json-canvas";
+	formatVersion: 1;
+	path: string;
+	previousPath: string | null;
+	lifecycle: "active" | "tombstoned" | "reaped";
+	documentGeneration: number;
+	contentHash?: string | null;
+	size?: number | null;
+}
+
+export interface SemanticCatalogHead {
+	sequence: number;
+	documentId: string;
+	fileId: string;
+	kind: "canvas";
+	format: "json-canvas";
+	formatVersion: 1;
+	path: string;
+	previousPath: string | null;
+	lifecycle: "active" | "tombstoned" | "reaped";
+	generation: number;
+	contentHash: string | null;
+	size: number | null;
+}
+
+export interface SemanticCandidateReceipt {
+	documentId: string;
+	clientId: string;
+	candidateId: string;
+	candidateDigest: string;
+	durableGeneration: number;
+	vaultSequence: number;
+	vaultGeneration: string;
+	runtimeEpoch: string;
+	contentHash: string;
+	size: number;
+}
+
+export interface SemanticLifecycleReceipt {
+	operationId: string;
+	requestDigest: string;
+	documentId: string;
+	fileId: string;
+	kind: "create" | "rename" | "delete" | "revive";
+	resultPath: string;
+	resultLifecycle: "active" | "tombstoned";
+	durableGeneration: number;
+	vaultSequence: number;
+	rootGeneration: number;
+	vaultGeneration: string;
+	runtimeEpoch: string;
+}
+
 export interface DurableCandidateReceipt {
 	bodyId: string;
 	clientId: string;
@@ -112,6 +169,90 @@ export interface CatalogDeltaEntry {
 
 /** File, body, attachment, candidate, and lifecycle catalog storage. */
 export abstract class VaultCatalogStore extends VaultDocumentStore {
+	semanticHeadAt(boundarySequence: number, documentId: string): SemanticCatalogHead | null {
+		this.initialize();
+		const row = this.storage.sql.exec<{
+			sequence: number; document_id: string; file_id: string; kind: "canvas"; format: "json-canvas";
+			format_version: 1; path: string; previous_path: string | null; lifecycle: SemanticCatalogHead["lifecycle"];
+			generation: number; content_hash: string | null; size: number | null;
+		}>(`SELECT sequence, document_id, file_id, kind, format, format_version, path, previous_path,
+		          lifecycle, generation, content_hash, size
+		   FROM vault_semantic_catalog_events
+		   WHERE document_id = ? AND sequence <= ? ORDER BY sequence DESC LIMIT 1`, documentId, boundarySequence).toArray()[0];
+		return row ? { sequence: row.sequence, documentId: row.document_id, fileId: row.file_id, kind: row.kind,
+			format: row.format, formatVersion: row.format_version, path: row.path, previousPath: row.previous_path,
+			lifecycle: row.lifecycle, generation: row.generation, contentHash: row.content_hash, size: row.size } : null;
+	}
+
+	listActiveSemanticAt(boundarySequence: number, afterDocumentId = "", limit = 1000): SemanticCatalogHead[] {
+		this.initialize();
+		return this.storage.sql.exec<{
+			sequence: number; document_id: string; file_id: string; kind: "canvas"; format: "json-canvas";
+			format_version: 1; path: string; previous_path: string | null; lifecycle: "active";
+			generation: number; content_hash: string | null; size: number | null;
+		}>(`SELECT e.sequence, e.document_id, e.file_id, e.kind, e.format, e.format_version, e.path,
+		          e.previous_path, e.lifecycle, e.generation, e.content_hash, e.size
+		   FROM vault_semantic_catalog_events e JOIN (
+		     SELECT document_id, MAX(sequence) AS sequence FROM vault_semantic_catalog_events
+		     WHERE sequence <= ? GROUP BY document_id
+		   ) latest ON latest.document_id = e.document_id AND latest.sequence = e.sequence
+		   WHERE e.lifecycle = 'active' AND e.document_id > ? ORDER BY e.document_id LIMIT ?`,
+		boundarySequence, afterDocumentId, Math.min(1000, Math.max(1, limit))).toArray().map((row) => ({
+			sequence: row.sequence, documentId: row.document_id, fileId: row.file_id, kind: row.kind,
+			format: row.format, formatVersion: row.format_version, path: row.path, previousPath: row.previous_path,
+			lifecycle: row.lifecycle, generation: row.generation, contentHash: row.content_hash, size: row.size,
+		}));
+	}
+
+	countActiveSemanticAt(boundarySequence: number): number {
+		this.initialize();
+		return this.storage.sql.exec<{ count: number }>(`SELECT COUNT(*) AS count
+		 FROM vault_semantic_catalog_events e JOIN (
+		   SELECT document_id, MAX(sequence) AS sequence FROM vault_semantic_catalog_events
+		   WHERE sequence <= ? GROUP BY document_id
+		 ) latest ON latest.document_id = e.document_id AND latest.sequence = e.sequence
+		 WHERE e.lifecycle = 'active'`, boundarySequence).one().count;
+	}
+
+	semanticCandidateReceipt(documentId: string, clientId: string, candidateId: string): SemanticCandidateReceipt | null {
+		this.initialize();
+		const row = this.storage.sql.exec<{ document_id: string; client_id: string; candidate_id: string;
+			candidate_digest: string; durable_generation: number; vault_sequence: number; runtime_epoch: string;
+			content_hash: string; size: number }>(
+			`SELECT document_id, client_id, candidate_id, candidate_digest, durable_generation,
+			        vault_sequence, runtime_epoch, content_hash, size FROM vault_semantic_candidate_receipts
+			 WHERE document_id = ? AND client_id = ? AND candidate_id = ?`, documentId, clientId, candidateId).toArray()[0];
+		return row ? { documentId: row.document_id, clientId: row.client_id, candidateId: row.candidate_id,
+			candidateDigest: row.candidate_digest, durableGeneration: row.durable_generation,
+			vaultSequence: row.vault_sequence, vaultGeneration: this.currentVaultGeneration(), runtimeEpoch: row.runtime_epoch,
+			contentHash: row.content_hash, size: row.size } : null;
+	}
+
+	recordSemanticCandidateReceipt(receipt: SemanticCandidateReceipt, now = Date.now()): void {
+		this.initialize();
+		this.assertVaultGeneration(receipt.vaultGeneration);
+		this.storage.sql.exec(`INSERT INTO vault_semantic_candidate_receipts(
+		 document_id, client_id, candidate_id, candidate_digest, durable_generation, vault_sequence, runtime_epoch,
+		 content_hash, size, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, receipt.documentId, receipt.clientId, receipt.candidateId,
+		receipt.candidateDigest, receipt.durableGeneration, receipt.vaultSequence, receipt.runtimeEpoch,
+		receipt.contentHash, receipt.size, now).toArray();
+	}
+
+	semanticLifecycleReceipt(operationId: string): SemanticLifecycleReceipt | null {
+		this.initialize();
+		const row = this.storage.sql.exec<{ operation_id: string; request_digest: string; document_id: string;
+			file_id: string; kind: SemanticLifecycleReceipt["kind"]; result_path: string;
+			result_lifecycle: SemanticLifecycleReceipt["resultLifecycle"]; durable_generation: number;
+			vault_sequence: number; root_generation: number; runtime_epoch: string }>(
+			`SELECT operation_id, request_digest, document_id, file_id, kind, result_path, result_lifecycle,
+			        durable_generation, vault_sequence, root_generation, runtime_epoch
+			 FROM vault_semantic_lifecycle_receipts WHERE operation_id = ?`, operationId).toArray()[0];
+		return row ? { operationId: row.operation_id, requestDigest: row.request_digest, documentId: row.document_id,
+			fileId: row.file_id, kind: row.kind, resultPath: row.result_path, resultLifecycle: row.result_lifecycle,
+			durableGeneration: row.durable_generation, vaultSequence: row.vault_sequence,
+			rootGeneration: row.root_generation, vaultGeneration: this.currentVaultGeneration(), runtimeEpoch: row.runtime_epoch } : null;
+	}
 	candidateReceipt(bodyId: string, clientId: string, candidateId: string): DurableCandidateReceipt | null {
 		this.initialize();
 		const row = this.storage.sql.exec<{

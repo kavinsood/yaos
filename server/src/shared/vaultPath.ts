@@ -57,3 +57,8 @@ export function safeBlobPath(
 	const canonical = safeBasePath(path, configDir);
 	return canonical && !canonical.toLowerCase().endsWith(".md") ? canonical : null;
 }
+
+export function safeCanvasPath(path: string, configDir = ""): string | null {
+	const canonical = safeBasePath(path, configDir);
+	return canonical?.toLowerCase().endsWith(".canvas") ? canonical : null;
+}

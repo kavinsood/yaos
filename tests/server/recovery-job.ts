@@ -226,7 +226,7 @@ s.test("create-only root publication reuses exact bytes and rejects poisoned obj
 	const prefix = recoveryPrefix(vaultId, vaultGeneration);
 	const encoded = await encodeSnapshotRoot(prefix, {
 		format: "yaos-recovery-v2",
-		snapshotFormatVersion: 2,
+		snapshotFormatVersion: 3,
 		snapshotId: "snapshot_1",
 		vaultIdHash: hashA,
 		vaultGenerationHash: hashB,

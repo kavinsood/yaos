@@ -8,6 +8,9 @@ import {
 	MAX_CANDIDATE_RECEIPTS_PER_BODY,
 	type AttachmentCatalogEvent,
 	type CatalogMutation,
+	type SemanticCatalogMutation,
+	type SemanticCandidateReceipt,
+	type SemanticLifecycleReceipt,
 	type DurableCandidateReceipt,
 	type DurableLifecycleRecord,
 } from "./vaultCatalogStore";
@@ -18,6 +21,8 @@ import type {
 	VaultCommitKind,
 	VaultProvisioningResult,
 } from "./vaultDocumentStore";
+
+const COLLABORATION_SCHEMA_VERSION = 7;
 
 export type {
 	DurableCommitResult,
@@ -35,6 +40,24 @@ export {
 	MAX_CANDIDATE_RECEIPTS_PER_BODY,
 	MAX_CANDIDATE_RECEIPT_LEDGER_BYTES,
 } from "./vaultCatalogStore";
+
+export interface SemanticAuthorityReceipt {
+	operationId: string;
+	requestDigest: string;
+	kind: "promote" | "demote";
+	path: string;
+	documentId: string;
+	sourceRevision: string;
+	contentHash: string;
+	size: number;
+	documentGeneration: number;
+	rootSequence: number;
+	rootGeneration: number;
+	rollbackBlobHash: string | null;
+	vaultGeneration: string;
+	runtimeEpoch: string;
+	createdAt: number;
+}
 export type {
 	AttachmentCatalogEvent,
 	BodyLifecycle,
@@ -45,6 +68,10 @@ export type {
 	DurableLifecycleRecord,
 	DurableRootPublication,
 	PendingCreationCandidate,
+	SemanticCandidateReceipt,
+	SemanticCatalogHead,
+	SemanticCatalogMutation,
+	SemanticLifecycleReceipt,
 } from "./vaultCatalogStore";
 export { isValidOperationId } from "./vaultBootstrapStore";
 export type {
@@ -81,6 +108,242 @@ export type {
 
 /** Compatibility facade for cross-domain atomic vault mutations. */
 export class VaultStore extends RecoveryAuthorityStore {
+	semanticAuthorityReceipt(operationId: string): SemanticAuthorityReceipt | null {
+		this.initialize();
+		const row = this.storage.sql.exec<{
+			operation_id: string; request_digest: string; kind: "promote" | "demote"; path: string;
+			document_id: string; source_revision: string; content_hash: string; size: number;
+			document_generation: number; root_sequence: number; root_generation: number;
+			rollback_blob_hash: string | null; runtime_epoch: string; created_at: number;
+		}>(`SELECT operation_id, request_digest, kind, path, document_id, source_revision,
+		          content_hash, size, document_generation, root_sequence, root_generation,
+		          rollback_blob_hash, runtime_epoch, created_at
+		   FROM vault_semantic_authority_receipts WHERE operation_id = ?`, operationId).toArray()[0];
+		return row ? { operationId: row.operation_id, requestDigest: row.request_digest, kind: row.kind,
+			path: row.path, documentId: row.document_id, sourceRevision: row.source_revision,
+			contentHash: row.content_hash, size: row.size, documentGeneration: row.document_generation,
+			rootSequence: row.root_sequence, rootGeneration: row.root_generation,
+			rollbackBlobHash: row.rollback_blob_hash, vaultGeneration: this.currentVaultGeneration(),
+			runtimeEpoch: row.runtime_epoch, createdAt: row.created_at } : null;
+	}
+
+	commitSemanticPromotion(input: {
+		operationId: string; requestDigest: string; path: string; documentId: string;
+		sourceRevision: string; contentHash: string; size: number; rollbackBlobHash: string;
+		rollbackBlobSize: number; semanticUpdate: Uint8Array;
+		rootUpdate: Uint8Array; expectedRootGeneration: number; runtimeEpoch: string; rollbackRetainedUntil: number;
+		actor: { principalId: string; membershipRevision: number; deviceId: string; deviceCredentialRevision: number };
+		now?: number;
+	}): SemanticAuthorityReceipt {
+		this.initialize();
+		const existing = this.semanticAuthorityReceipt(input.operationId);
+		if (existing) {
+			if (existing.requestDigest !== input.requestDigest || existing.kind !== "promote") throw new Error("semantic_authority_operation_reused");
+			return existing;
+		}
+		if (this.documentHead(input.documentId)) throw new Error("semantic_document_already_exists");
+		const now = input.now ?? Date.now();
+		let documentGeneration = 0;
+		let rootSequence = 0;
+		let rootGeneration = 0;
+		this.storage.transactionSync(() => {
+			if (this.documentHead(input.documentId)) throw new Error("semantic_document_already_exists");
+			const rootHead = this.documentHead("root");
+			if (!rootHead || rootHead.generation !== input.expectedRootGeneration) throw new Error("semantic_root_head_changed");
+			const attachmentHead = this.attachmentHead(input.path);
+			if (!attachmentHead || attachmentHead.lifecycle !== "active"
+				|| attachmentHead.operationId !== input.sourceRevision
+				|| attachmentHead.contentHash !== input.rollbackBlobHash
+				|| attachmentHead.size !== input.rollbackBlobSize) throw new Error("attachment_head_changed");
+			const documentSequence = this.storage.sql.exec<{ sequence: number }>(
+				"UPDATE vault_clock SET sequence = sequence + 1 WHERE id = 1 RETURNING sequence").one().sequence;
+			documentGeneration = 1;
+			this.storage.sql.exec(`INSERT INTO vault_journal(sequence, document_id, generation, kind, update_byte_length, created_at)
+			 VALUES (?, ?, ?, 'semantic-promote', ?, ?)`, documentSequence, input.documentId,
+				documentGeneration, input.semanticUpdate.byteLength, now).toArray();
+			this.insertJournalChunks(documentSequence, input.semanticUpdate);
+			this.storage.sql.exec(`INSERT INTO vault_document_heads(document_id, generation, latest_sequence)
+			 VALUES (?, ?, ?)`, input.documentId, documentGeneration, documentSequence).toArray();
+
+			rootSequence = this.storage.sql.exec<{ sequence: number }>(
+				"UPDATE vault_clock SET sequence = sequence + 1 WHERE id = 1 RETURNING sequence").one().sequence;
+			rootGeneration = rootHead.generation + 1;
+			this.storage.sql.exec(`INSERT INTO vault_journal(sequence, document_id, generation, kind, update_byte_length, created_at)
+			 VALUES (?, 'root', ?, 'semantic-promote', ?, ?)`, rootSequence, rootGeneration,
+				input.rootUpdate.byteLength, now).toArray();
+			this.insertJournalChunks(rootSequence, input.rootUpdate);
+			this.storage.sql.exec("UPDATE vault_document_heads SET generation = ?, latest_sequence = ? WHERE document_id = 'root'",
+				rootGeneration, rootSequence).toArray();
+			this.storage.sql.exec(`INSERT INTO vault_semantic_catalog_events(
+			 sequence, document_id, file_id, kind, format, format_version, path, previous_path,
+			 lifecycle, generation, content_hash, size, mutation_index
+			) VALUES (?, ?, ?, 'canvas', 'json-canvas', 1, ?, NULL, 'active', ?, ?, ?, 0)`,
+				rootSequence, input.documentId, input.documentId, input.path, documentGeneration,
+				input.contentHash, input.size).toArray();
+			this.storage.sql.exec(`INSERT INTO vault_attachment_catalog_events(
+			 sequence, path, content_hash, size, mime, lifecycle, operation_id
+			) VALUES (?, ?, ?, ?, 'application/json', 'deleted', ?)`, rootSequence, input.path,
+				input.rollbackBlobHash, input.rollbackBlobSize, input.operationId).toArray();
+			this.storage.sql.exec(`INSERT INTO vault_semantic_authority_receipts(
+			 operation_id, request_digest, kind, path, document_id, source_revision, content_hash,
+			 size, document_generation, root_sequence, root_generation, rollback_blob_hash, runtime_epoch, created_at
+			) VALUES (?, ?, 'promote', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, input.operationId,
+				input.requestDigest, input.path, input.documentId, input.sourceRevision, input.contentHash,
+				input.size, documentGeneration, rootSequence, rootGeneration, input.rollbackBlobHash,
+				input.runtimeEpoch, now).toArray();
+			this.storage.sql.exec(`INSERT INTO vault_semantic_rollback_blobs(
+			 document_id, content_hash, size, retained_until, operation_id
+			) VALUES (?, ?, ?, ?, ?)`, input.documentId, input.rollbackBlobHash, input.rollbackBlobSize,
+				input.rollbackRetainedUntil, input.operationId).toArray();
+			this.storage.sql.exec(`INSERT INTO vault_mutation_attribution(
+			 sequence, mutation_index, principal_id, membership_revision, device_id,
+			 device_credential_revision, operation_id, request_digest
+			) VALUES (?, 0, ?, ?, ?, ?, ?, ?)`, rootSequence, input.actor.principalId,
+				input.actor.membershipRevision, input.actor.deviceId, input.actor.deviceCredentialRevision,
+				input.operationId, input.requestDigest).toArray();
+		});
+		return { operationId: input.operationId, requestDigest: input.requestDigest, kind: "promote",
+			path: input.path, documentId: input.documentId, sourceRevision: input.sourceRevision,
+			contentHash: input.contentHash, size: input.size, documentGeneration, rootSequence,
+			rootGeneration, rollbackBlobHash: input.rollbackBlobHash, vaultGeneration: this.currentVaultGeneration(),
+			runtimeEpoch: input.runtimeEpoch, createdAt: now };
+	}
+
+	commitSemanticDemotion(input: {
+		operationId: string; requestDigest: string; path: string; documentId: string;
+		sourceRevision: string; expectedDocumentGeneration: number; contentHash: string; size: number;
+		mime: string; rootUpdate: Uint8Array; expectedRootGeneration: number; runtimeEpoch: string;
+		actor: { principalId: string; membershipRevision: number; deviceId: string; deviceCredentialRevision: number };
+		now?: number;
+	}): SemanticAuthorityReceipt {
+		this.initialize();
+		const existing = this.semanticAuthorityReceipt(input.operationId);
+		if (existing) {
+			if (existing.requestDigest !== input.requestDigest || existing.kind !== "demote") throw new Error("semantic_authority_operation_reused");
+			return existing;
+		}
+		const now = input.now ?? Date.now();
+		let rootSequence = 0;
+		let rootGeneration = 0;
+		this.storage.transactionSync(() => {
+			const documentHead = this.documentHead(input.documentId);
+			if (!documentHead || documentHead.generation !== input.expectedDocumentGeneration) throw new Error("semantic_head_changed");
+			const rootHead = this.documentHead("root");
+			if (!rootHead || rootHead.generation !== input.expectedRootGeneration) throw new Error("semantic_root_head_changed");
+			const semanticHead = this.semanticHeadAt(this.currentSequence(), input.documentId);
+			if (!semanticHead || semanticHead.lifecycle !== "active" || semanticHead.path !== input.path
+				|| semanticHead.generation !== input.expectedDocumentGeneration
+				|| semanticHead.contentHash !== input.contentHash || semanticHead.size !== input.size) {
+				throw new Error("semantic_catalog_head_changed");
+			}
+			rootSequence = this.storage.sql.exec<{ sequence: number }>(
+				"UPDATE vault_clock SET sequence = sequence + 1 WHERE id = 1 RETURNING sequence").one().sequence;
+			rootGeneration = rootHead.generation + 1;
+			this.storage.sql.exec(`INSERT INTO vault_journal(sequence, document_id, generation, kind, update_byte_length, created_at)
+			 VALUES (?, 'root', ?, 'semantic-demote', ?, ?)`, rootSequence, rootGeneration,
+				input.rootUpdate.byteLength, now).toArray();
+			this.insertJournalChunks(rootSequence, input.rootUpdate);
+			this.storage.sql.exec("UPDATE vault_document_heads SET generation = ?, latest_sequence = ? WHERE document_id = 'root'",
+				rootGeneration, rootSequence).toArray();
+			this.storage.sql.exec(`INSERT INTO vault_semantic_catalog_events(
+			 sequence, document_id, file_id, kind, format, format_version, path, previous_path,
+			 lifecycle, generation, content_hash, size, mutation_index
+			) VALUES (?, ?, ?, 'canvas', 'json-canvas', 1, ?, NULL, 'tombstoned', ?, ?, ?, 0)`,
+				rootSequence, input.documentId, input.documentId, input.path, input.expectedDocumentGeneration,
+				input.contentHash, input.size).toArray();
+			this.storage.sql.exec(`INSERT INTO vault_attachment_catalog_events(
+			 sequence, path, content_hash, size, mime, lifecycle, operation_id
+			) VALUES (?, ?, ?, ?, ?, 'active', ?)`, rootSequence, input.path, input.contentHash,
+				input.size, input.mime, input.operationId).toArray();
+			this.storage.sql.exec(`INSERT INTO vault_semantic_authority_receipts(
+			 operation_id, request_digest, kind, path, document_id, source_revision, content_hash,
+			 size, document_generation, root_sequence, root_generation, rollback_blob_hash, runtime_epoch, created_at
+			) VALUES (?, ?, 'demote', ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`, input.operationId,
+				input.requestDigest, input.path, input.documentId, input.sourceRevision, input.contentHash,
+				input.size, input.expectedDocumentGeneration, rootSequence, rootGeneration,
+				input.runtimeEpoch, now).toArray();
+			this.storage.sql.exec(`INSERT INTO vault_mutation_attribution(
+			 sequence, mutation_index, principal_id, membership_revision, device_id,
+			 device_credential_revision, operation_id, request_digest
+			) VALUES (?, 0, ?, ?, ?, ?, ?, ?)`, rootSequence, input.actor.principalId,
+				input.actor.membershipRevision, input.actor.deviceId, input.actor.deviceCredentialRevision,
+				input.operationId, input.requestDigest).toArray();
+		});
+		return { operationId: input.operationId, requestDigest: input.requestDigest, kind: "demote",
+			path: input.path, documentId: input.documentId, sourceRevision: input.sourceRevision,
+			contentHash: input.contentHash, size: input.size, documentGeneration: input.expectedDocumentGeneration,
+			rootSequence, rootGeneration, rollbackBlobHash: null, vaultGeneration: this.currentVaultGeneration(),
+			runtimeEpoch: input.runtimeEpoch, createdAt: now };
+	}
+
+	listRetainedSemanticRollbackBlobs(afterDocumentId = "", limit = 1000, now = Date.now()): Array<{
+		documentId: string; contentHash: string; size: number; retainedUntil: number;
+	}> {
+		this.initialize();
+		return this.storage.sql.exec<{ document_id: string; content_hash: string; size: number; retained_until: number }>(
+			`SELECT document_id, content_hash, size, retained_until FROM vault_semantic_rollback_blobs
+			 WHERE retained_until > ? AND document_id > ? ORDER BY document_id LIMIT ?`, now, afterDocumentId,
+			Math.min(1000, Math.max(1, limit))).toArray().map((row) => ({ documentId: row.document_id,
+				contentHash: row.content_hash, size: row.size, retainedUntil: row.retained_until }));
+	}
+
+	countRetainedSemanticRollbackBlobs(now = Date.now()): number {
+		this.initialize();
+		return this.storage.sql.exec<{ count: number }>(
+			"SELECT COUNT(*) AS count FROM vault_semantic_rollback_blobs WHERE retained_until > ?", now).one().count;
+	}
+
+	migrateCanvasSchema(input: { migrationId: string; vaultId: string; vaultGeneration: string;
+		rootUpdate: Uint8Array; rootStateHash: string; now?: number }): {
+		migrationId: string; vaultId: string; vaultGeneration: string; fromSchema: 7; toSchema: 8;
+		rootSequence: number; rootStateHash: string; completedAt: number;
+	} {
+		this.initialize();
+		const existing = this.storage.sql.exec<{ migration_id: string; vault_id: string; vault_generation: string;
+			from_schema: 7; to_schema: 8; root_sequence: number; root_state_hash: string; completed_at: number }>(
+			"SELECT * FROM vault_schema_migration_receipts WHERE migration_id = ?", input.migrationId).toArray()[0];
+		if (existing) return { migrationId: existing.migration_id, vaultId: existing.vault_id,
+			vaultGeneration: existing.vault_generation, fromSchema: existing.from_schema, toSchema: existing.to_schema,
+			rootSequence: existing.root_sequence, rootStateHash: existing.root_state_hash, completedAt: existing.completed_at };
+		const metadata = this.storedVaultMetadata();
+		if (!metadata || metadata.vaultId !== input.vaultId || metadata.vaultGeneration !== input.vaultGeneration
+			|| metadata.schemaVersion !== 7 || metadata.storageFormatVersion !== STORAGE_FORMAT_VERSION) {
+			throw new Error("canvas_schema_migration_source_mismatch");
+		}
+		if (!input.migrationId || !/^[A-Za-z0-9_-]{1,128}$/.test(input.migrationId)
+			|| !/^[a-f0-9]{64}$/.test(input.rootStateHash) || input.rootUpdate.byteLength === 0) {
+			throw new Error("invalid_canvas_schema_migration");
+		}
+		const completedAt = input.now ?? Date.now();
+		let rootSequence = 0;
+		this.storage.transactionSync(() => {
+			const head = this.storage.sql.exec<{ generation: number }>(
+				"SELECT generation FROM vault_document_heads WHERE document_id = 'root'").toArray()[0];
+			if (!head) throw new Error("canvas_schema_migration_root_missing");
+			rootSequence = this.storage.sql.exec<{ sequence: number }>(
+				"UPDATE vault_clock SET sequence = sequence + 1 WHERE id = 1 RETURNING sequence").one().sequence;
+			const generation = head.generation + 1;
+			this.storage.sql.exec(`INSERT INTO vault_journal(sequence, document_id, generation, kind, update_byte_length, created_at)
+			 VALUES (?, 'root', ?, 'root', ?, ?)`, rootSequence, generation, input.rootUpdate.byteLength, completedAt).toArray();
+			this.insertJournalChunks(rootSequence, input.rootUpdate);
+			this.storage.sql.exec("UPDATE vault_document_heads SET generation = ?, latest_sequence = ? WHERE document_id = 'root'",
+				generation, rootSequence).toArray();
+			this.storage.sql.exec("DROP TABLE vault_meta").toArray();
+			this.storage.sql.exec(`CREATE TABLE vault_meta (
+			 id INTEGER PRIMARY KEY CHECK(id = 1), vault_id TEXT NOT NULL, vault_generation TEXT NOT NULL,
+			 schema_version INTEGER NOT NULL CHECK(schema_version = 8),
+			 storage_format_version INTEGER NOT NULL CHECK(storage_format_version = 3), provisioned_at INTEGER NOT NULL)`).toArray();
+			this.storage.sql.exec(`INSERT INTO vault_meta(id, vault_id, vault_generation, schema_version, storage_format_version, provisioned_at)
+			 VALUES (1, ?, ?, 8, 3, ?)`, metadata.vaultId, metadata.vaultGeneration, metadata.provisionedAt).toArray();
+			this.storage.sql.exec(`INSERT INTO vault_schema_migration_receipts(
+			 migration_id, vault_id, vault_generation, from_schema, to_schema, root_sequence, root_state_hash, completed_at
+			) VALUES (?, ?, ?, 7, 8, ?, ?, ?)`, input.migrationId, input.vaultId, input.vaultGeneration,
+				rootSequence, input.rootStateHash, completedAt).toArray();
+		});
+		return { migrationId: input.migrationId, vaultId: input.vaultId, vaultGeneration: input.vaultGeneration,
+			fromSchema: 7, toSchema: 8, rootSequence, rootStateHash: input.rootStateHash, completedAt };
+	}
+
 	migrateCollaboration(input: {
 		migrationId: string;
 		vaultId: string;
@@ -136,7 +399,7 @@ export class VaultStore extends RecoveryAuthorityStore {
 		const reconstructed = this.reconstructDocument("root");
 		const stateVector = Y.encodeStateVector(reconstructed.doc);
 		const system = reconstructed.doc.getMap("sys");
-		system.set("schemaVersion", SCHEMA_VERSION);
+		system.set("schemaVersion", COLLABORATION_SCHEMA_VERSION);
 		system.set("protocolVersion", PROTOCOL_VERSION);
 		system.set("historyAttribution", "legacy_unattributed");
 		const rootUpdate = Y.encodeStateAsUpdate(reconstructed.doc, stateVector);
@@ -223,7 +486,7 @@ export class VaultStore extends RecoveryAuthorityStore {
 			this.storage.sql.exec(
 				`INSERT INTO vault_meta(id, vault_id, vault_generation, schema_version,
 				 storage_format_version, provisioned_at) VALUES (1, ?, ?, ?, ?, ?)`,
-				metadata.vaultId, metadata.vaultGeneration, SCHEMA_VERSION,
+				metadata.vaultId, metadata.vaultGeneration, COLLABORATION_SCHEMA_VERSION,
 				STORAGE_FORMAT_VERSION, metadata.provisionedAt,
 			).toArray();
 			this.storage.sql.exec(`INSERT INTO vault_authorization_change_receipts(
@@ -302,6 +565,11 @@ export class VaultStore extends RecoveryAuthorityStore {
 				"vault_lifecycle_receipts",
 				"vault_creation_candidates",
 				"vault_candidate_receipts",
+				"vault_semantic_lifecycle_receipts",
+				"vault_semantic_authority_receipts",
+				"vault_semantic_rollback_blobs",
+				"vault_semantic_candidate_receipts",
+				"vault_semantic_catalog_events",
 				"vault_attachment_operations",
 				"vault_attachment_catalog_events",
 				"vault_catalog_events",
@@ -437,6 +705,9 @@ export class VaultStore extends RecoveryAuthorityStore {
 		update: Uint8Array;
 		kind: VaultCommitKind;
 		catalog?: CatalogMutation | CatalogMutation[];
+		semanticCatalog?: SemanticCatalogMutation | SemanticCatalogMutation[];
+		semanticCandidateReceipt?: Omit<SemanticCandidateReceipt, "vaultSequence">;
+		semanticLifecycleReceipt?: Omit<SemanticLifecycleReceipt, "vaultSequence" | "rootGeneration">;
 		lifecycleReceipt?: Omit<DurableLifecycleRecord, "vaultSequence" | "rootGeneration">;
 		lifecycleReceipts?: Array<Omit<DurableLifecycleRecord, "vaultSequence" | "rootGeneration">>;
 		completeCreation?: { bodyId: string; candidateId: string; candidateDigest: string };
@@ -551,6 +822,39 @@ export class VaultStore extends RecoveryAuthorityStore {
 				);
 				catalog.toArray();
 				rowsWritten += catalog.rowsWritten;
+			}
+			const semanticMutations = input.semanticCatalog
+				? (Array.isArray(input.semanticCatalog) ? input.semanticCatalog : [input.semanticCatalog]) : [];
+			for (const [mutationIndex, mutation] of semanticMutations.entries()) {
+				const catalog = this.storage.sql.exec(`INSERT INTO vault_semantic_catalog_events(
+				 sequence, document_id, file_id, kind, format, format_version, path, previous_path,
+				 lifecycle, generation, content_hash, size, mutation_index
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, sequence, mutation.documentId,
+				mutation.fileId, mutation.kind, mutation.format, mutation.formatVersion, mutation.path,
+				mutation.previousPath, mutation.lifecycle, mutation.documentGeneration,
+				mutation.contentHash ?? null, mutation.size ?? null, mutationIndex);
+				catalog.toArray();
+				rowsWritten += catalog.rowsWritten;
+			}
+			if (input.semanticLifecycleReceipt) {
+				const receipt = input.semanticLifecycleReceipt;
+				this.assertVaultGeneration(receipt.vaultGeneration);
+				this.storage.sql.exec(`INSERT INTO vault_semantic_lifecycle_receipts(
+				 operation_id, request_digest, document_id, file_id, kind, result_path, result_lifecycle,
+				 durable_generation, vault_sequence, root_generation, runtime_epoch, created_at
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, receipt.operationId, receipt.requestDigest,
+				receipt.documentId, receipt.fileId, receipt.kind, receipt.resultPath, receipt.resultLifecycle,
+				receipt.durableGeneration, sequence, generation, receipt.runtimeEpoch, now).toArray();
+			}
+			if (input.semanticCandidateReceipt) {
+				const receipt = input.semanticCandidateReceipt;
+				this.assertVaultGeneration(receipt.vaultGeneration);
+				this.storage.sql.exec(`INSERT INTO vault_semantic_candidate_receipts(
+				 document_id, client_id, candidate_id, candidate_digest, durable_generation, vault_sequence,
+				 runtime_epoch, content_hash, size, created_at
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, receipt.documentId, receipt.clientId,
+				receipt.candidateId, receipt.candidateDigest, receipt.durableGeneration, sequence,
+				receipt.runtimeEpoch, receipt.contentHash, receipt.size, now).toArray();
 			}
 			for (const receipt of [
 				...(input.lifecycleReceipt ? [input.lifecycleReceipt] : []),

@@ -315,7 +315,7 @@ export async function bootstrapFromSql(identity: LiveIdentity): Promise<{
 	if (started.response.status !== 200 || !started.body || typeof started.body.bootstrapId !== "string") {
 		throw new Error(`bootstrap start failed (${started.response.status}): ${JSON.stringify(started.body)}`);
 	}
-	if (started.body.format !== "yaos-bootstrap-v1" || started.body.schemaVersion !== SCHEMA_VERSION) {
+	if (started.body.format !== "yaos-bootstrap-v2" || started.body.schemaVersion !== SCHEMA_VERSION) {
 		throw new Error(`bootstrap descriptor has wrong format: ${JSON.stringify(started.body)}`);
 	}
 	const bootstrapId = started.body.bootstrapId;

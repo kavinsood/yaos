@@ -17,12 +17,15 @@ import {
 	SERVER_STORAGE_FORMAT_VERSION,
 } from "./version";
 import { VaultCandidateService } from "./vaultCandidateService";
+import { VaultSemanticService } from "./vaultSemanticService";
 import { canonicalMarkdownBytes } from "./shared/markdownCodec";
+import { canonicalCanvasBytes } from "./shared/canvasCodec";
+import { materializeCanvasDocument, validateCanvasDocument } from "./shared/canvasSemanticDocument";
 import { blobKey } from "./vaultObjectStore";
 import { VaultDocumentCache } from "./vaultDocumentCache";
 import { VaultLifecycleService } from "./vaultLifecycleService";
 import { VaultSocketService, type VaultSocketPort, type VaultSocketRegistryPort, hasSafeRootAttachmentSemantics, rootUpdateChangesProtectedAttachmentMaps, rootUpdateHasSafeAttachmentSemantics } from "./vaultSocketService";
-import { VaultStore, type CatalogMutation } from "./vaultStore";
+import { VaultStore, type CatalogMutation, type SemanticCatalogMutation } from "./vaultStore";
 import { isCanonicalVaultId } from "./vaultId";
 import { VaultRecoveryService } from "./vaultRecoveryService";
 import { authorizeRuntimeActor, OUTCOME_CLAIM_HEADER, parseVaultActor } from "./vaultAuthority";
@@ -142,6 +145,7 @@ export class VaultRuntime implements DrainPort {
 	private readonly sockets: VaultSocketService;
 	private readonly lifecycle: VaultLifecycleService;
 	private readonly candidates: VaultCandidateService;
+	private readonly semantic: VaultSemanticService;
 	private readonly bootstrap: BootstrapService;
 	private readonly recovery: VaultRecoveryService;
 	private readonly persistence = new Map<string, PersistenceStatus>();
@@ -169,6 +173,7 @@ export class VaultRuntime implements DrainPort {
 			vaultGeneration,
 			runtimeEpoch: this.runtimeEpoch,
 			isActiveBody: (bodyId) => this.lifecycle?.activeBodyHead(bodyId) !== null,
+			isActiveSemantic: (documentId) => this.store.semanticHeadAt(this.store.currentSequence(), documentId)?.lifecycle === "active",
 			currentBodyHead: (bodyId) => {
 				const head = this.store.getCatalogHeadAt(this.store.currentSequence(), bodyId);
 				return head ? {
@@ -213,6 +218,17 @@ export class VaultRuntime implements DrainPort {
 			flush: (documentId) => this.flushDocument(documentId),
 			validateActor: (actor) => this.store.validateActor(actor) === "allowed",
 		});
+		this.semantic = new VaultSemanticService({
+			store: this.store,
+			cache: this.cache,
+			sockets: this.sockets,
+			vaultId,
+			vaultGeneration,
+			runtimeEpoch: this.runtimeEpoch,
+			validateActor: (actor) => this.store.validateActor(actor) === "allowed",
+			flush: (documentId) => this.flushDocument(documentId),
+			objectStore: options.objectStore,
+		});
 		this.bootstrap = new BootstrapService(this.store);
 		this.recovery = new VaultRecoveryService({
 			alarms: options.alarms,
@@ -242,11 +258,16 @@ export class VaultRuntime implements DrainPort {
 			if (request.method === "POST" && url.pathname === "/__yaos/collaboration-migrate") {
 				return await this.migrateCollaboration(vaultId, request);
 			}
+			if (request.method === "POST" && url.pathname === "/__yaos/canvas-migrate") {
+				return json(await this.migrateCanvasSchema(vaultId));
+			}
 			const metadata = this.store.vaultMetadata();
 			if (!metadata) {
 				const storedSchemaVersion = this.store.storedVaultSchemaVersion();
 				return storedSchemaVersion === 6
 					? json({ error: "collaboration_migration_required", storedSchemaVersion, requiredSchemaVersion: SERVER_SCHEMA_VERSION }, 409)
+					: storedSchemaVersion === 7
+						? json({ error: "canvas_migration_required", storedSchemaVersion, requiredSchemaVersion: SERVER_SCHEMA_VERSION }, 409)
 					: json({ error: "vault_not_provisioned" }, 409);
 			}
 			if (metadata.vaultId !== vaultId) return json({ error: "vault_identity_mismatch" }, 409);
@@ -303,10 +324,31 @@ export class VaultRuntime implements DrainPort {
 					if (!this.lifecycle.activeBodyHead(bodyId)) return json({ error: "body_not_active" }, 409);
 					return this.sockets.accept(bodyId, "body", authorized);
 				}
+				if (parts.length === 3 && parts[0] === "ws" && parts[1] === "semantic") {
+					const documentId = parts[2]!;
+					if (!this.semantic.activeHead(documentId)) return json({ error: "semantic_document_not_active" }, 409);
+					return this.sockets.accept(documentId, "semantic", authorized);
+				}
 			}
 			if (request.method === "POST" && parts.length === 3 && parts[0] === "body" && parts[2] === "candidate") {
 				const authorized = this.authorize(actor, "vault.content.write");
 				return authorized instanceof Response ? authorized : this.candidates.handle(parts[1]!, request, authorized);
+			}
+			if (request.method === "POST" && parts.length === 3 && parts[0] === "semantic" && parts[2] === "candidate") {
+				const authorized = this.authorize(actor, "vault.content.write");
+				return authorized instanceof Response ? authorized : this.semantic.candidate(parts[1]!, request, authorized);
+			}
+			if (request.method === "POST" && url.pathname === "/semantic/lifecycle") {
+				const authorized = this.authorize(actor, "vault.lifecycle.write");
+				return authorized instanceof Response ? authorized : this.semantic.lifecycle(request, authorized);
+			}
+			if (request.method === "POST" && url.pathname === "/semantic/authority/promote") {
+				const authorized = this.authorize(actor, "vault.attachments.write");
+				return authorized instanceof Response ? authorized : this.semantic.promote(request, authorized);
+			}
+			if (request.method === "POST" && url.pathname === "/semantic/authority/demote") {
+				const authorized = this.authorize(actor, "vault.attachments.write");
+				return authorized instanceof Response ? authorized : this.semantic.demote(request, authorized);
 			}
 			if (request.method === "POST" && url.pathname === "/attachments/publish") {
 				const authorized = this.authorize(actor, "vault.attachments.write");
@@ -362,6 +404,13 @@ export class VaultRuntime implements DrainPort {
 			}
 			if (request.method === "GET" && parts.length === 2 && parts[0] === "head") return json(this.lifecycle.activeBodyHead(parts[1]!));
 			if (request.method === "GET" && parts.length === 2 && parts[0] === "body") return this.bodyState(parts[1]!);
+			if (request.method === "GET" && parts.length === 3 && parts[0] === "semantic" && parts[2] === "head") {
+				return json(this.semantic.activeHead(parts[1]!) ?? { error: "semantic_document_not_active" },
+					this.semantic.activeHead(parts[1]!) ? 200 : 404);
+			}
+			if (request.method === "GET" && parts.length === 3 && parts[0] === "semantic" && parts[2] === "state") {
+				return this.semantic.state(parts[1]!);
+			}
 			if (request.method === "GET" && url.pathname === "/root") return this.rootState(url);
 			if (request.method === "GET" && url.pathname === "/status") return this.status();
 			if (request.method === "GET" && url.pathname === "/health") return this.health();
@@ -371,6 +420,36 @@ export class VaultRuntime implements DrainPort {
 			console.error("[yaos-vault] request failed", error);
 			return json({ error: error instanceof Error ? error.message : "vault_runtime_failed" }, 500);
 		}
+	}
+
+	private async migrateCanvasSchema(vaultId: string): Promise<ReturnType<VaultStore["migrateCanvasSchema"]>> {
+		const metadata = this.store.storedVaultMetadata();
+		if (metadata?.schemaVersion === 8 && metadata.vaultId === vaultId) {
+			return this.store.migrateCanvasSchema({ migrationId: `canvas-schema-8-${metadata.vaultGeneration}`,
+				vaultId, vaultGeneration: metadata.vaultGeneration, rootUpdate: new Uint8Array(), rootStateHash: "0".repeat(64) });
+		}
+		if (!metadata || metadata.schemaVersion !== 7 || metadata.vaultId !== vaultId) {
+			throw new Error("canvas_schema_migration_source_mismatch");
+		}
+		this.sockets.closeAll("vault schema migration");
+		await this.flushLoadedDocuments();
+		const reconstructed = this.store.reconstructDocument("root");
+		const vector = Y.encodeStateVector(reconstructed.doc);
+		if (reconstructed.doc.getMap("sys").get("schemaVersion") !== 7) {
+			reconstructed.doc.destroy();
+			throw new Error("canvas_schema_migration_root_mismatch");
+		}
+		reconstructed.doc.getMap("pathToSemantic");
+		reconstructed.doc.getMap("sys").set("schemaVersion", SERVER_SCHEMA_VERSION);
+		reconstructed.doc.getMap("sys").set("protocolVersion", SERVER_PROTOCOL_VERSION);
+		const update = Y.encodeStateAsUpdate(reconstructed.doc, vector);
+		const stateHash = await sha256Hex(Y.encodeStateAsUpdate(reconstructed.doc));
+		reconstructed.doc.destroy();
+		const receipt = this.store.migrateCanvasSchema({ migrationId: `canvas-schema-8-${metadata.vaultGeneration}`,
+			vaultId, vaultGeneration: metadata.vaultGeneration, rootUpdate: update, rootStateHash: stateHash });
+		this.cache.clear();
+		this.persistence.clear();
+		return receipt;
 	}
 
 	private authorize(actor: VaultActorContext | null, capability: VaultCapability, targetPrincipalId?: string): VaultActorContext | Response {
@@ -695,6 +774,15 @@ export class VaultRuntime implements DrainPort {
 			return new Response(state.encodedState.slice().buffer, { headers: { "content-type": "application/octet-stream", "x-yaos-sha256": await state.hash } });
 		}
 		if (request.method === "GET" && parts.length === 3 && parts[2] === "catalog") return json(this.bootstrap.catalogPage(bootstrapId, url.searchParams.get("cursor"), boundedLimit(url)));
+		if (request.method === "GET" && parts.length === 3 && parts[2] === "semantic-catalog") {
+			return json(this.bootstrap.semanticCatalogPage(bootstrapId, url.searchParams.get("cursor"), boundedLimit(url)));
+		}
+		if (request.method === "GET" && parts.length === 4 && parts[2] === "semantic") {
+			const state = this.bootstrap.semanticState(bootstrapId, parts[3]!);
+			return new Response(state.encodedState.slice().buffer, { headers: { "content-type": "application/octet-stream",
+				"x-yaos-document-id": state.documentId, "x-yaos-generation": String(state.generation),
+				"x-yaos-through-sequence": String(state.throughSequence) } });
+		}
 		if (request.method === "POST" && parts.length === 3 && parts[2] === "bodies") {
 			let bytes: Uint8Array;
 			try {
@@ -819,12 +907,14 @@ export class VaultRuntime implements DrainPort {
 
 	private status(): Response {
 		const metadata = this.requireMetadata();
+		const sequence = this.store.currentSequence();
 		return json({ vaultId: metadata.vaultId, vaultGeneration: metadata.vaultGeneration, runtimeEpoch: this.runtimeEpoch,
 			provisionedAt: metadata.provisionedAt, schemaVersion: SERVER_SCHEMA_VERSION,
 			storageFormatVersion: SERVER_STORAGE_FORMAT_VERSION, protocolVersion: SERVER_PROTOCOL_VERSION,
 			snapshotFormatVersion: SERVER_SNAPSHOT_FORMAT_VERSION,
 			settingsFormatVersion: SERVER_SETTINGS_FORMAT_VERSION,
-			sequence: this.store.currentSequence(), feedFloor: this.store.journalFloor(), activePins: this.store.activePins().length });
+			sequence, feedFloor: this.store.journalFloor(), activePins: this.store.activePins().length,
+			semanticCanvas: this.semanticCanvasStatus(sequence) });
 	}
 
 	private health(): Response {
@@ -841,12 +931,24 @@ export class VaultRuntime implements DrainPort {
 
 	private statusObject() {
 		const metadata = this.requireMetadata();
+		const sequence = this.store.currentSequence();
 		return { vaultId: metadata.vaultId, vaultGeneration: metadata.vaultGeneration, runtimeEpoch: this.runtimeEpoch,
 			provisionedAt: metadata.provisionedAt, schemaVersion: SERVER_SCHEMA_VERSION,
 			storageFormatVersion: SERVER_STORAGE_FORMAT_VERSION, protocolVersion: SERVER_PROTOCOL_VERSION,
 			snapshotFormatVersion: SERVER_SNAPSHOT_FORMAT_VERSION,
 			settingsFormatVersion: SERVER_SETTINGS_FORMAT_VERSION,
-			sequence: this.store.currentSequence(), feedFloor: this.store.journalFloor() };
+			sequence, feedFloor: this.store.journalFloor(), semanticCanvas: this.semanticCanvasStatus(sequence) };
+	}
+
+	private semanticCanvasStatus(sequence: number): { enabled: true; available: true; active: number; retainedRollbackBlobs: number } {
+		const store = this.store as VaultStore & {
+			countActiveSemanticAt?: (boundary: number) => number;
+			countRetainedSemanticRollbackBlobs?: () => number;
+		};
+		return { enabled: true, available: true,
+			active: typeof store.countActiveSemanticAt === "function" ? store.countActiveSemanticAt(sequence) : 0,
+			retainedRollbackBlobs: typeof store.countRetainedSemanticRollbackBlobs === "function"
+				? store.countRetainedSemanticRollbackBlobs() : 0 };
 	}
 
 	private scheduleFlush(documentId: string): void {
@@ -879,13 +981,21 @@ export class VaultRuntime implements DrainPort {
 					if (update.byteLength > MAX_DURABLE_UPDATE_BYTES) {
 						throw new Error("merged pending update exceeds durable value limit");
 					}
-					const catalog = documentId === "root" ? undefined : await this.catalogForUpdate(documentId, update);
-					const commit = this.store.commitUpdate({ documentId, update, kind: documentId === "root" ? "root" : "body", catalog,
+					const semanticHead = this.store.semanticHeadAt(this.store.currentSequence(), documentId);
+					const catalog = documentId === "root" || semanticHead?.lifecycle === "active"
+						? undefined : await this.catalogForUpdate(documentId, update);
+					const semanticCatalog = semanticHead?.lifecycle === "active"
+						? await this.semanticCatalogForUpdate(semanticHead, update) : undefined;
+					const commit = this.store.commitUpdate({ documentId, update,
+						kind: documentId === "root" ? "root" : semanticCatalog ? "semantic" : "body", catalog, semanticCatalog,
 						actorAttributions: batch.map((entry) => ({ actor: entry.actor!, requestDigest: entry.digest })) });
 					processed += batch.length;
 					const loaded = this.cache.get(documentId);
 					if (loaded) loaded.generation = commit.generation;
-					if (documentId !== "root") {
+					if (semanticCatalog) {
+						this.sockets.notifySemanticCommitted(documentId, commit.generation, commit.vaultSequence,
+							{ lifecycle: semanticCatalog.lifecycle, contentHash: semanticCatalog.contentHash ?? null, size: semanticCatalog.size ?? null });
+					} else if (documentId !== "root") {
 						this.sockets.notifyBodyCommitted(documentId, commit.generation, commit.vaultSequence);
 					}
 				}
@@ -922,6 +1032,22 @@ export class VaultRuntime implements DrainPort {
 		} finally {
 			reconstructed.doc.destroy();
 		}
+	}
+
+	private async semanticCatalogForUpdate(
+		current: NonNullable<ReturnType<VaultStore["semanticHeadAt"]>>,
+		update: Uint8Array,
+	): Promise<SemanticCatalogMutation> {
+		const reconstructed = this.store.reconstructDocument(current.documentId);
+		try {
+			Y.applyUpdate(reconstructed.doc, update, "semantic-flush-metadata");
+			const validation = await validateCanvasDocument(reconstructed.doc);
+			if (validation) throw new Error(validation);
+			const content = canonicalCanvasBytes(await materializeCanvasDocument(reconstructed.doc, false));
+			return { documentId: current.documentId, fileId: current.fileId, kind: "canvas", format: "json-canvas",
+				formatVersion: 1, path: current.path, previousPath: null, lifecycle: "active",
+				documentGeneration: reconstructed.generation + 1, contentHash: await sha256Hex(content), size: content.byteLength };
+		} finally { reconstructed.doc.destroy(); }
 	}
 
 	private maintain(documentId: string): void {

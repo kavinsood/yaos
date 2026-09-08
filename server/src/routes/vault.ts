@@ -32,7 +32,7 @@ export async function readVault(env: Env, vaultId: string): Promise<VaultRecord 
 
 function forwardedBodyLimit(request: Request, runtimePath: string): number | null {
 	if (!request.body || request.method === "GET" || request.method === "HEAD") return null;
-	if (/^\/body\/[^/]+\/candidate$/.test(runtimePath)) return MAX_CANDIDATE_BYTES;
+	if (/^\/(?:body|semantic)\/[^/]+\/candidate$/.test(runtimePath)) return MAX_CANDIDATE_BYTES;
 	if (runtimePath === "/catch-up") return MAX_CATCH_UP_BYTES;
 	if (runtimePath.startsWith("/settings-sync/") && request.method === "PUT") {
 		const action = runtimePath.split("/")[3];
@@ -123,7 +123,7 @@ export async function handleVaultSocketRoute(
 	if (!authState.claimed) return rejectSocket(request, env, "unclaimed");
 	const url = new URL(request.url);
 	const ticket = url.searchParams.get("ticket");
-	const purpose = runtimePath === "/ws/root" ? "root" : "body";
+	const purpose = runtimePath === "/ws/root" ? "root" : runtimePath.startsWith("/ws/semantic/") ? "semantic" : "body";
 	const documentId = purpose === "root" ? "root" : runtimePath.split("/").at(-1) ?? "";
 	const payload = ticket ? await inspectTicket(ticket, authState, { vaultId, purpose, documentId }) : null;
 	if (!payload) return rejectSocket(request, env, "unauthorized");

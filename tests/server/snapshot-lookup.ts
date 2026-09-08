@@ -71,7 +71,7 @@ async function seededSnapshot() {
 	bucket.objects.set(`${prefix}/content/sha256/ff/${"f".repeat(64)}.md.gz`, gzipRecoveryBytes(encoder.encode("unreachable")));
 	const rootValue: SnapshotRootV2 = {
 		format: "yaos-recovery-v2",
-		snapshotFormatVersion: 2,
+		snapshotFormatVersion: 3,
 		snapshotId: "snapshot-lookup-1",
 		vaultIdHash,
 		vaultGenerationHash,

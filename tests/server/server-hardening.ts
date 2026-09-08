@@ -111,6 +111,7 @@ s.section("Test 9: capabilities expose one final identity-neutral shape");
 			"protocolVersion",
 			"recoveryJobs",
 			"schemaVersion",
+			"semanticCanvas",
 			"serverVersion",
 			"settingsFormatVersion",
 			"settingsSync",

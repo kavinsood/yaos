@@ -31,7 +31,7 @@ class RuntimeStore {
 			if (this.metadata.vaultId !== vaultId || this.metadata.vaultGeneration !== vaultGeneration) throw new Error("vault generation mismatch");
 			return { ...this.metadata, created: false };
 		}
-		this.metadata = { vaultId, vaultGeneration, schemaVersion: 7, storageFormatVersion: 3, provisionedAt: 1 };
+		this.metadata = { vaultId, vaultGeneration, schemaVersion: 8, storageFormatVersion: 3, provisionedAt: 1 };
 		return { ...this.metadata, created: true };
 	}
 	vaultMetadata() { return this.metadata; }

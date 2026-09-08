@@ -22,7 +22,7 @@ const guardPath = resolve(repoRoot(), "scripts/guard-schema-version.mjs");
 
 function makePluginFixture(dir: string) {
 	mkdirSync(join(dir, "src/sync"), { recursive: true });
-	writeFileSync(join(dir, "src/sync/schema.ts"), "export const SCHEMA_VERSION = 7;\n");
+	writeFileSync(join(dir, "src/sync/schema.ts"), "export const SCHEMA_VERSION = 8;\n");
 }
 
 function writeServerVersionModule(dir: string) {
@@ -93,24 +93,24 @@ await withTempDir("yaos-schema-version-guard-", (fixtureDir) => {
 	);
 });
 
-s.section("Test 3: exact schema-7 pins pass");
+s.section("Test 3: exact schema-8 pins pass");
 await withTempDir("yaos-schema-version-guard-", (fixtureDir) => {
 	makePluginFixture(fixtureDir);
-	makeServerFixture(fixtureDir, 7);
+	makeServerFixture(fixtureDir, 8);
 
 	const result = runGuard(fixtureDir);
 
-	s.check(result.status === 0, "guard accepts matching schema-7 source pins");
+	s.check(result.status === 0, "guard accepts matching schema-8 source pins");
 	s.check(
 		result.stdout.includes("PASS: schema version guard — all checks passed."),
-		"guard reports overall success for the exact schema-7 contract",
+		"guard reports overall success for the exact schema-8 contract",
 	);
 });
 
 s.section("Test 4: a stale durable SQL schema constraint fails closed");
 await withTempDir("yaos-schema-version-guard-", (fixtureDir) => {
 	makePluginFixture(fixtureDir);
-	makeServerFixture(fixtureDir, 7);
+	makeServerFixture(fixtureDir, 8);
 	writeFileSync(
 		join(fixtureDir, "server/src/vaultDocumentStore.ts"),
 		"const sql = `schema_version INTEGER NOT NULL CHECK(schema_version = 5)`;\n",
@@ -119,7 +119,7 @@ await withTempDir("yaos-schema-version-guard-", (fixtureDir) => {
 
 	s.check(result.status === 1, "guard exits non-zero for a stale SQLite schema constraint");
 	s.check(
-		result.stderr.includes("schema_version CHECK pins 5, expected canonical server schema 7"),
+		result.stderr.includes("schema_version CHECK pins 5, expected canonical server schema 8"),
 		"guard reports the stale durable constraint",
 	);
 });

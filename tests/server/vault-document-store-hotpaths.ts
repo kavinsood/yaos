@@ -72,7 +72,7 @@ s.test("reconstruction, recipes, and feed catalogs use a constant number of SQL 
 
 		queries.value = 0;
 		const feed = store.listChangesAfter(0, 1000);
-		assert.equal(queries.value, 2, "catalog lookup must be one batched statement, not one per feed row");
+		assert.equal(queries.value, 3, "Markdown and semantic catalog lookups must each be one batched statement, not one per feed row");
 		assert.deepEqual(feed.at(-1)?.catalogs.map((entry) => entry.path), ["a.md", "b.md"]);
 
 		queries.value = 0;

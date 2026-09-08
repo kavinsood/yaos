@@ -141,6 +141,8 @@ export interface CapturePlanRequest {
 }
 export type CapturePlanEntry =
 	| { kind: "active"; bodyId: string; fileId: string; canonicalPath: string; generation: number; contentHash: string; size: number }
+	| { kind: "canvas"; documentId: string; fileId: string; canonicalPath: string; generation: number;
+		contentHash: string; size: number; format: "json-canvas"; formatVersion: 1 }
 	| { kind: "deleted"; bodyId: string; fileId: string; lastPath: string; generation: number; baselineContentHash: string; baselineSize: number; bodyReaped: boolean; deletedAtSequence: number }
 	| { kind: "attachment"; canonicalPath: string; contentHash: string; size: number; mime: string | null };
 export interface CapturePlanResponse {
@@ -198,7 +200,7 @@ export interface CatalogDeltaEntry {
 export interface CatalogDeltaPageResponse { entries: CatalogDeltaEntry[]; nextCursor: string | null; terminal: boolean; pageHash: string; deltaDigest: string }
 
 export interface RecoveryDefectRecord {
-	captureId: string; kind: "active" | "deleted" | "attachment"; identity: string; generation: number | null;
+	captureId: string; kind: "active" | "canvas" | "deleted" | "attachment"; identity: string; generation: number | null;
 	code: string; referenceHash: string; createdAt: number;
 }
 export interface RecordRecoveryDefectsRequest { captureId: string; boundarySequence: number; capability: string; defects: RecoveryDefectRecord[] }

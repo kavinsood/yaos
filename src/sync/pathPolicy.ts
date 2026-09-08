@@ -1,9 +1,10 @@
 import {
 	safeBlobPath as safeSharedBlobPath,
 	safeMarkdownPath as safeSharedMarkdownPath,
+	safeCanvasPath as safeSharedCanvasPath,
 } from "@shared/vaultPath";
 import { canonicalizeVaultPath } from "../paths/canonicalPath";
-import { isBlobSyncable, isMarkdownSyncable } from "../types";
+import { isBlobSyncable, isCanvasSyncable, isMarkdownSyncable } from "../types";
 
 type BlobPathRef = { hash: string; size: number };
 
@@ -36,4 +37,11 @@ export function safeBlobPath(
 		&& isBlobSyncable(canonical, [...excludePatterns], configDir)
 		? canonical
 		: null;
+}
+
+export function safeCanvasPath(path: string, excludePatterns: readonly string[] = [], configDir = ""): string | null {
+	const canonical = safeSharedCanvasPath(path, configDir);
+	const canonicalKey = canonicalizeVaultPath(path).canonicalKey;
+	return canonical !== null && canonical === canonicalKey
+		&& isCanvasSyncable(canonical, [...excludePatterns], configDir) ? canonical : null;
 }

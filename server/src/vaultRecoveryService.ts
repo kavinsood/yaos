@@ -323,7 +323,7 @@ export class VaultRecoveryService {
 			entries.push(entry);
 			entriesBytes = nextBytes;
 		}
-		const key = (entry: CapturePlanEntry): string => entry.kind === "active" ? entry.canonicalPath
+		const key = (entry: CapturePlanEntry): string => entry.kind === "active" || entry.kind === "canvas" ? entry.canonicalPath
 			: entry.kind === "deleted" ? entry.bodyId : entry.canonicalPath;
 		const hasMore = entries.length < candidates.length;
 		const nextCursor = hasMore ? key(entries.at(-1)!) : null;
@@ -351,7 +351,7 @@ export class VaultRecoveryService {
 				rollingDigest: planDigest,
 			});
 		}
-		const hashes = entries.flatMap((entry) => entry.kind === "active" ? [entry.contentHash]
+		const hashes = entries.flatMap((entry) => entry.kind === "active" || entry.kind === "canvas" ? [entry.contentHash]
 			: entry.kind === "deleted" ? [entry.baselineContentHash] : []);
 		const missing = new Set(this.store.missingCoverage(capture.captureId, hashes, [], capture.gcEpoch).contentHashes);
 		const casHints = Object.fromEntries(hashes.map((hash) => [hash, !missing.has(hash)]));
@@ -1139,14 +1139,28 @@ export class VaultRecoveryService {
 				if (entry.contentHash === null) throw new Error("GC catalog content identity missing");
 				return { objectKey: contentObjectKey(request.vaultId, request.vaultGeneration, entry.contentHash), domain: "recovery" };
 			});
-			nextCursor = entries.length === request.maxEntries ? `markdown:${entries.at(-1)!.bodyId}` : "attachments:";
+			nextCursor = entries.length === request.maxEntries ? `markdown:${entries.at(-1)!.bodyId}` : "semantic:";
+		} else if (stream === "semantic") {
+			const entries = this.store.listActiveSemanticAt(epoch.markBoundarySequence, after, request.maxEntries);
+			objects = entries.map((entry): { objectKey: string; domain: "recovery" } => {
+				if (entry.contentHash === null) throw new Error("GC semantic content identity missing");
+				return { objectKey: contentObjectKey(request.vaultId, request.vaultGeneration, entry.contentHash), domain: "recovery" };
+			});
+			nextCursor = entries.length === request.maxEntries ? `semantic:${entries.at(-1)!.documentId}` : "attachments:";
 		} else if (stream === "attachments") {
 			const entries = this.store.activeAttachmentCatalogAt(epoch.markBoundarySequence, after, request.maxEntries);
 			objects = entries.map((entry): { objectKey: string; domain: "blob" } => {
 				if (entry.contentHash === null) throw new Error("GC attachment identity missing");
 				return { objectKey: `vault/${encodeURIComponent(request.vaultId)}/${encodeURIComponent(request.vaultGeneration)}/blobs/${entry.contentHash}`, domain: "blob" };
 			});
-			nextCursor = entries.length === request.maxEntries ? `attachments:${entries.at(-1)!.path}` : null;
+			nextCursor = entries.length === request.maxEntries ? `attachments:${entries.at(-1)!.path}` : "rollback:";
+		} else if (stream === "rollback") {
+			const entries = this.store.listRetainedSemanticRollbackBlobs(after, request.maxEntries);
+			objects = entries.map((entry): { objectKey: string; domain: "blob" } => ({
+				objectKey: `vault/${encodeURIComponent(request.vaultId)}/${encodeURIComponent(request.vaultGeneration)}/blobs/${entry.contentHash}`,
+				domain: "blob",
+			}));
+			nextCursor = entries.length === request.maxEntries ? `rollback:${entries.at(-1)!.documentId}` : null;
 		} else {
 			throw new Error("invalid GC root cursor");
 		}

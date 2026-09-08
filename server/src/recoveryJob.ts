@@ -78,6 +78,8 @@ import {
 	type RestoreDescriptor,
 } from "./recoveryExecutor.js";
 import { isCanonicalVaultId } from "./vaultId.js";
+import { canonicalCanvasBytes } from "./shared/canvasCodec.js";
+import { materializeCanvasDocument, validateCanvasDocument } from "./shared/canvasSemanticDocument.js";
 import {
 	RecoveryJobStateStore,
 	isTerminalRecoveryState,
@@ -231,7 +233,7 @@ interface TreeCheckpointMetadata {
 }
 
 interface RestoreItem {
-	kind: "markdown" | "attachment";
+	kind: "markdown" | "canvas" | "attachment";
 	itemId: string;
 	path: string;
 	contentHash: string;
@@ -240,6 +242,7 @@ interface RestoreItem {
 	sourceKind?: "active" | "deleted";
 	sourceFileId?: string;
 	sourceBodyId?: string;
+	sourceDocumentId?: string;
 	mime?: string | null;
 }
 
@@ -258,7 +261,7 @@ class TerminalRecoveryError extends Error {
 class BodyDefectError extends Error {
 	constructor(
 		readonly code: "corrupt_history" | "hash_mismatch" | "missing_history",
-		readonly entry: Extract<CapturePlanEntry, { kind: "active" | "deleted" }>,
+		readonly entry: Extract<CapturePlanEntry, { kind: "active" | "canvas" | "deleted" }>,
 		message: string,
 	) {
 		super(message);
@@ -690,17 +693,18 @@ export async function createFailedRestoreItem(
 	} else {
 		const active = entry as Extract<ActiveFileManifestEntry, { availability: "unavailable" }> | null;
 		if (active) path = active.path;
-		metadata = {
+		metadata = active && "kind" in active ? { sourceDocumentId: active.documentId,
+			sourceFileId: active.fileId, format: active.format, formatVersion: active.formatVersion } : {
 			sourceKind: "active",
 			sourceFileId: active?.fileId ?? "",
-			sourceBodyId: active?.bodyId ?? "",
+			sourceBodyId: active && !("kind" in active) ? active.bodyId : "",
 		};
 	}
 	const errorCode = entry && "errorCode" in entry ? entry.errorCode : "snapshot_item_missing";
 	return {
 		itemId: (await sha256Hex(encoder.encode(`${restoreId}:${tree}:${selectionKey}:${errorCode}`))).slice(0, 48),
 		cursorOrder,
-		kind: tree === "attachments" ? "attachment" : "markdown",
+		kind: tree === "attachments" ? "attachment" : entry && "kind" in entry && entry.kind === "canvas" ? "canvas" : "markdown",
 		path,
 		contentHash,
 		size,
@@ -738,6 +742,16 @@ function parseCapturePlanEntry(value: unknown): CapturePlanEntry {
 			contentHash: rpcHash(entry.contentHash, "active content hash"),
 			size: metadataInteger(entry.size, "active content size"),
 		};
+	}
+	if (entry.kind === "canvas") {
+		assertMetadataKeys(entry, ["kind", "documentId", "fileId", "canonicalPath", "generation", "contentHash", "size", "format", "formatVersion"], "Canvas capture plan entry");
+		if (entry.format !== "json-canvas" || entry.formatVersion !== 1) {
+			throw new TerminalRecoveryError("invalid_authority_response", "invalid Canvas format");
+		}
+		return { kind: "canvas", documentId: metadataString(entry.documentId, "Canvas document ID"),
+			fileId: metadataString(entry.fileId, "Canvas file ID"), canonicalPath: metadataString(entry.canonicalPath, "Canvas path"),
+			generation: metadataInteger(entry.generation, "Canvas generation"), contentHash: rpcHash(entry.contentHash, "Canvas content hash"),
+			size: metadataInteger(entry.size, "Canvas content size"), format: "json-canvas", formatVersion: 1 };
 	}
 	if (entry.kind === "deleted") {
 		assertMetadataKeys(entry, ["kind", "bodyId", "fileId", "lastPath", "generation", "baselineContentHash", "baselineSize", "bodyReaped", "deletedAtSequence"], "deleted capture plan entry");
@@ -1774,11 +1788,11 @@ export class RecoveryJobRuntime {
 			let reused = 0;
 			for (const entry of page.entries) {
 				if (entry.kind === "attachment") continue;
-				const hash = entry.kind === "active" ? entry.contentHash : entry.baselineContentHash;
+				const hash = entry.kind === "deleted" ? entry.baselineContentHash : entry.contentHash;
 				if (page.casHints[hash] !== true) continue;
-				const identity = `${entry.bodyId}:${entry.generation}`;
+				const identity = `${entry.kind === "canvas" ? entry.documentId : entry.bodyId}:${entry.generation}`;
 				if (this.store.getArtifact("content-reused", identity)) continue;
-				const size = entry.kind === "active" ? entry.size : entry.baselineSize;
+				const size = entry.kind === "deleted" ? entry.baselineSize : entry.size;
 				this.store.putArtifact({
 					artifactKind: "content-reused",
 					logicalKey: identity,
@@ -1802,7 +1816,8 @@ export class RecoveryJobRuntime {
 		while (reusedEnd < entries.length) {
 			const candidate = entries[reusedEnd]!;
 			if (candidate.kind === "attachment") break;
-			if (!this.store.getArtifact("content-reused", `${candidate.bodyId}:${candidate.generation}`)) break;
+			const documentId = candidate.kind === "canvas" ? candidate.documentId : candidate.bodyId;
+			if (!this.store.getArtifact("content-reused", `${documentId}:${candidate.generation}`)) break;
 			reusedEnd++;
 		}
 		if (reusedEnd > progress.entryIndex) {
@@ -1821,7 +1836,8 @@ export class RecoveryJobRuntime {
 			} catch (error) {
 				if (!(error instanceof BodyDefectError)) throw error;
 				const reconstruction = this.store.getReconstruction();
-				const retryKey = `${error.entry.kind}:${error.entry.bodyId}:${error.entry.generation}`;
+				const documentId = error.entry.kind === "canvas" ? error.entry.documentId : error.entry.bodyId;
+				const retryKey = `${error.entry.kind}:${documentId}:${error.entry.generation}`;
 				const retryMetadata = this.store.getParsedMetadata("body-defect-retry", parseBodyDefectRetry);
 				const metadataAttempts = retryMetadata?.key === retryKey ? retryMetadata.attempts : 0;
 				const attempts = reconstruction?.attempts ?? metadataAttempts;
@@ -1833,7 +1849,7 @@ export class RecoveryJobRuntime {
 				console.error("[yaos-recovery-job] body defect", {
 					jobId: record.jobId,
 					kind: error.entry.kind,
-					identity: await sha256Hex(encoder.encode(error.entry.bodyId)),
+					identity: await sha256Hex(encoder.encode(documentId)),
 					error: RecoveryJobStateStore.safeInternalError(error),
 				});
 				await this.recordBodyDefect(descriptor, authority, error);
@@ -1901,12 +1917,13 @@ export class RecoveryJobRuntime {
 			});
 			return true;
 		}
-		const hash = entry.kind === "active" ? entry.contentHash : entry.baselineContentHash;
-		const size = entry.kind === "active" ? entry.size : entry.baselineSize;
-		const identity = `${entry.bodyId}:${entry.generation}`;
+		const hash = entry.kind === "deleted" ? entry.baselineContentHash : entry.contentHash;
+		const size = entry.kind === "deleted" ? entry.baselineSize : entry.size;
+		const documentId = entry.kind === "canvas" ? entry.documentId : entry.bodyId;
+		const identity = `${documentId}:${entry.generation}`;
 		const written = this.store.getArtifact("content-object", identity);
 		if (written) {
-			await authority.acknowledgeContentMaterialized({ captureId: descriptor.captureId, boundarySequence: descriptor.boundarySequence, capability: descriptor.capability, bodyId: entry.bodyId, generation: entry.generation, contentHash: hash, plainBytes: size, objectKey: written.objectKey });
+			await authority.acknowledgeContentMaterialized({ captureId: descriptor.captureId, boundarySequence: descriptor.boundarySequence, capability: descriptor.capability, bodyId: documentId, generation: entry.generation, contentHash: hash, plainBytes: size, objectKey: written.objectKey });
 			return true;
 		}
 		const reused = this.store.getArtifact("content-reused", identity);
@@ -1922,21 +1939,22 @@ export class RecoveryJobRuntime {
 		if (!reconstruction) {
 			let recipes: BodyRecipeDescriptor[];
 			try {
-				recipes = await authority.getRecipeDescriptors({ vaultId: descriptor.vaultId, vaultGeneration: descriptor.vaultGeneration, captureId: descriptor.captureId, boundarySequence: descriptor.boundarySequence, capability: descriptor.capability, entries: [{ bodyId: entry.bodyId, generation: entry.generation }] });
+				recipes = await authority.getRecipeDescriptors({ vaultId: descriptor.vaultId, vaultGeneration: descriptor.vaultGeneration, captureId: descriptor.captureId, boundarySequence: descriptor.boundarySequence, capability: descriptor.capability, entries: [{ bodyId: documentId, generation: entry.generation }] });
 			} catch (error) {
 				if (isRetryableFailure(error)) throw new RetryableRecoveryError("recipe_descriptor_transient", RecoveryJobStateStore.safeInternalError(error));
 				throw new BodyDefectError("missing_history", entry, RecoveryJobStateStore.safeInternalError(error));
 			}
 			const recipe = recipes[0];
 			if (!recipe || recipe.expectedContentHash !== hash || recipe.expectedSize !== size) throw new BodyDefectError("corrupt_history", entry, "recipe descriptor mismatch");
-			reconstruction = { bodyId: entry.bodyId, generation: entry.generation, recipeId: recipe.recipeId, expectedContentHash: hash, expectedSize: size, cursor: recipe.firstCursor, stagingKey: null, stagingHash: null, encodedBytes: 0, attempts: 0 };
+			reconstruction = { bodyId: documentId, generation: entry.generation, recipeId: recipe.recipeId, expectedContentHash: hash, expectedSize: size, cursor: recipe.firstCursor, stagingKey: null, stagingHash: null, encodedBytes: 0, attempts: 0 };
 			this.store.setReconstruction(reconstruction);
 		}
 		return this.advanceCaptureReconstruction(descriptor, authority, entry, reconstruction);
 	}
 
-	private async advanceCaptureReconstruction(descriptor: CaptureStartDescriptor, authority: RecoveryAuthorityRpc, entry: Extract<CapturePlanEntry, { kind: "active" | "deleted" }>, reconstruction: NonNullable<ReturnType<RecoveryJobStateStore["getReconstruction"]>>): Promise<boolean> {
-		const doc = new Y.Doc({ guid: entry.bodyId });
+	private async advanceCaptureReconstruction(descriptor: CaptureStartDescriptor, authority: RecoveryAuthorityRpc, entry: Extract<CapturePlanEntry, { kind: "active" | "canvas" | "deleted" }>, reconstruction: NonNullable<ReturnType<RecoveryJobStateStore["getReconstruction"]>>): Promise<boolean> {
+		const documentId = entry.kind === "canvas" ? entry.documentId : entry.bodyId;
+		const doc = new Y.Doc({ guid: documentId });
 		let oldStagingKey: string | null = null;
 		try {
 			if (reconstruction.stagingKey) {
@@ -1968,14 +1986,18 @@ export class RecoveryJobRuntime {
 			if (chunk.nextCursor !== null) {
 				const encoded = Y.encodeStateAsUpdate(doc);
 				const hash = await sha256Hex(encoded);
-				const key = `${recoveryStagingPrefix(recoveryV2Prefix(vaultPrefix(descriptor.vaultId, descriptor.vaultGeneration)), recoveryJobId("capture", descriptor.vaultId, descriptor.vaultGeneration, descriptor.captureId))}/body/${entry.bodyId}/${hash}.yjs`;
+				const key = `${recoveryStagingPrefix(recoveryV2Prefix(vaultPrefix(descriptor.vaultId, descriptor.vaultGeneration)), recoveryJobId("capture", descriptor.vaultId, descriptor.vaultGeneration, descriptor.captureId))}/body/${documentId}/${hash}.yjs`;
 				await this.bucket().put(key, encoded, { contentType: "application/octet-stream" });
 				this.store.setReconstruction({ ...reconstruction, cursor: chunk.nextCursor, stagingKey: key, stagingHash: hash, encodedBytes: reconstruction.encodedBytes + chunk.encodedBytes });
 				if (oldStagingKey && oldStagingKey !== key) await this.bucket().delete(oldStagingKey);
 				return false;
 			}
-			const bodyText: string = doc.getText("body").toJSON();
-			const plain = encoder.encode(bodyText);
+			let plain: Uint8Array;
+			if (entry.kind === "canvas") {
+				const validation = await validateCanvasDocument(doc);
+				if (validation) throw new BodyDefectError("corrupt_history", entry, validation);
+				plain = canonicalCanvasBytes(await materializeCanvasDocument(doc, false));
+			} else plain = encoder.encode(doc.getText("body").toJSON());
 			if (plain.byteLength !== reconstruction.expectedSize || await sha256Hex(plain) !== reconstruction.expectedContentHash) {
 				throw new BodyDefectError("hash_mismatch", entry, "reconstructed Markdown mismatch");
 			}
@@ -1997,8 +2019,8 @@ export class RecoveryJobRuntime {
 				} else {
 					await this.bucket().put(key, compressed, { contentType: "application/gzip" });
 				}
-				this.store.putArtifact({ artifactKind: "content-object", logicalKey: `${entry.bodyId}:${entry.generation}`, objectKey: key, objectHash: reconstruction.expectedContentHash, entries: 1, bytes: plain.byteLength, metadata: null });
-				await authority.acknowledgeContentMaterialized({ captureId: descriptor.captureId, boundarySequence: descriptor.boundarySequence, capability: descriptor.capability, bodyId: entry.bodyId, generation: entry.generation, contentHash: reconstruction.expectedContentHash, plainBytes: plain.byteLength, objectKey: key });
+				this.store.putArtifact({ artifactKind: "content-object", logicalKey: `${documentId}:${entry.generation}`, objectKey: key, objectHash: reconstruction.expectedContentHash, entries: 1, bytes: plain.byteLength, metadata: null });
+				await authority.acknowledgeContentMaterialized({ captureId: descriptor.captureId, boundarySequence: descriptor.boundarySequence, capability: descriptor.capability, bodyId: documentId, generation: entry.generation, contentHash: reconstruction.expectedContentHash, plainBytes: plain.byteLength, objectKey: key });
 				const record = this.store.load();
 				if (record) this.commit(record, { contentObjectsWritten: record.contentObjectsWritten + 1, bytesRead: record.bytesRead + reconstruction.encodedBytes + chunk.encodedBytes, bytesWritten: record.bytesWritten + compressed.byteLength, updatedAt: Date.now() });
 			} finally {
@@ -2016,13 +2038,23 @@ export class RecoveryJobRuntime {
 	}
 
 	private async recordBodyDefect(descriptor: CaptureStartDescriptor, authority: RecoveryAuthorityRpc, error: BodyDefectError): Promise<void> {
-		const reference = await sha256Hex(encoder.encode(`${error.entry.bodyId}:${error.entry.generation}:${error.code}`));
-		const defect: RecoveryDefectRecord = { captureId: descriptor.captureId, kind: error.entry.kind, identity: error.entry.bodyId, generation: error.entry.generation, code: error.code, referenceHash: reference, createdAt: Date.now() };
+		const documentId = error.entry.kind === "canvas" ? error.entry.documentId : error.entry.bodyId;
+		const reference = await sha256Hex(encoder.encode(`${documentId}:${error.entry.generation}:${error.code}`));
+		const defect: RecoveryDefectRecord = { captureId: descriptor.captureId, kind: error.entry.kind, identity: documentId, generation: error.entry.generation, code: error.code, referenceHash: reference, createdAt: Date.now() };
 		await authority.recordRecoveryDefects({ captureId: descriptor.captureId, boundarySequence: descriptor.boundarySequence, capability: descriptor.capability, defects: [defect] });
-		this.store.putDefect({ logicalKey: `${error.entry.kind}:${error.entry.bodyId}:${error.entry.generation}`, kind: "body", code: error.code, reference, metadata: {} });
+		this.store.putDefect({ logicalKey: `${error.entry.kind}:${documentId}:${error.entry.generation}`, kind: "body", code: error.code, reference, metadata: {} });
 	}
 
 	private planEntryToManifest(entry: CapturePlanEntry): ManifestEntryByTree[ManifestTreeKind] {
+		if (entry.kind === "canvas") {
+			const defect = this.store.getDefect(`canvas:${entry.documentId}:${entry.generation}`);
+			return defect ? { availability: "unavailable", kind: "canvas", path: entry.canonicalPath,
+				documentId: entry.documentId, fileId: entry.fileId, format: "json-canvas", formatVersion: 1,
+				generation: entry.generation, errorCode: defect.code as "corrupt_history" | "hash_mismatch" | "missing_history",
+				errorReference: defect.reference } : { availability: "available", kind: "canvas", path: entry.canonicalPath,
+				documentId: entry.documentId, fileId: entry.fileId, format: "json-canvas", formatVersion: 1,
+				generation: entry.generation, contentHash: entry.contentHash, size: entry.size };
+		}
 		if (entry.kind === "active") {
 			const defect = this.store.getDefect(`active:${entry.bodyId}:${entry.generation}`);
 			return defect ? { availability: "unavailable", path: entry.canonicalPath, fileId: entry.fileId, bodyId: entry.bodyId, bodyGeneration: entry.generation, errorCode: defect.code as "corrupt_history" | "hash_mismatch" | "missing_history", errorReference: defect.reference } : { availability: "available", path: entry.canonicalPath, fileId: entry.fileId, bodyId: entry.bodyId, bodyGeneration: entry.generation, contentHash: entry.contentHash, size: entry.size };
@@ -2229,7 +2261,7 @@ export class RecoveryJobRuntime {
 		if (!rootArtifact) {
 			const root: SnapshotRootV2 = {
 				format: "yaos-recovery-v2",
-				snapshotFormatVersion: 2,
+				snapshotFormatVersion: 3,
 				snapshotId: descriptor.snapshotId,
 				vaultIdHash: await sha256Hex(encoder.encode(descriptor.vaultId)),
 				vaultGenerationHash: await sha256Hex(encoder.encode(descriptor.vaultGeneration)),
@@ -2530,6 +2562,14 @@ export class RecoveryJobRuntime {
 			if (entry.availability !== "available") continue;
 			if (tree === "active") {
 				const active = entry as Extract<ActiveFileManifestEntry, { availability: "available" }>;
+				if ("kind" in active) {
+					items.push({ itemId: (await sha256Hex(encoder.encode(`${descriptor.restoreId}:canvas:${active.path}:${active.contentHash}`))).slice(0, 48),
+						cursorOrder: counts.total + items.length, kind: "canvas", path: active.path,
+						contentHash: active.contentHash, size: active.size, outcome: null, errorCode: null,
+						metadata: { sourceDocumentId: active.documentId, sourceFileId: active.fileId,
+							format: active.format, formatVersion: active.formatVersion } });
+					continue;
+				}
 				items.push({
 					itemId: (await sha256Hex(encoder.encode(`${descriptor.restoreId}:active:${active.path}:${active.contentHash}`))).slice(0, 48),
 					cursorOrder: counts.total + items.length,
@@ -2603,6 +2643,9 @@ export class RecoveryJobRuntime {
 				sourceKind: row.metadata.sourceKind === "deleted" ? "deleted" as const : "active" as const,
 				sourceFileId: typeof row.metadata.sourceFileId === "string" ? row.metadata.sourceFileId : "",
 				sourceBodyId: typeof row.metadata.sourceBodyId === "string" ? row.metadata.sourceBodyId : "",
+			} : row.kind === "canvas" ? {
+				sourceDocumentId: typeof row.metadata.sourceDocumentId === "string" ? row.metadata.sourceDocumentId : "",
+				sourceFileId: typeof row.metadata.sourceFileId === "string" ? row.metadata.sourceFileId : "",
 			} : { mime: typeof row.metadata.mime === "string" ? row.metadata.mime : null }),
 		}));
 		const counts = this.store.restoreCounts();

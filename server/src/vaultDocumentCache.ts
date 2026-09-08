@@ -57,6 +57,7 @@ const DEFAULT_CACHE_LIMITS: VaultDocumentCacheLimits = {
 export interface VaultDocumentCacheDiagnostics {
 	loaded: Array<{
 		documentId: string;
+		kind: "root" | "markdown" | "canvas";
 		generation: number;
 		dirty: boolean;
 		lastUsedAt: number;
@@ -320,8 +321,10 @@ export class VaultDocumentCache {
 				encodedStateBytes += value.encodedStateBytes;
 			}
 			const transientBytes = this.documentTransientBytes(documentId);
+			const kind = this.documentKind(documentId);
 			return {
 				documentId,
+				kind,
 				generation: value.generation,
 				dirty: value.dirty,
 				lastUsedAt: value.lastUsedAt,
@@ -350,6 +353,16 @@ export class VaultDocumentCache {
 			},
 			loadFailures: Object.fromEntries(this.loadFailures),
 		};
+	}
+
+	private documentKind(documentId: string): "root" | "markdown" | "canvas" {
+		if (documentId === "root") return "root";
+		const store = this.store as VaultStore & {
+			currentSequence?: () => number;
+			semanticHeadAt?: (sequence: number, id: string) => unknown;
+		};
+		return typeof store.currentSequence === "function" && typeof store.semanticHeadAt === "function"
+			&& store.semanticHeadAt(store.currentSequence(), documentId) ? "canvas" : "markdown";
 	}
 
 	private loadedBodyCount(): number {

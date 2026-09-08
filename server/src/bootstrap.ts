@@ -1,7 +1,7 @@
 import * as Y from "yjs";
 import { sha256Hex } from "./hex";
 import { SERVER_SCHEMA_VERSION, SERVER_STORAGE_FORMAT_VERSION } from "./version";
-import { isValidOperationId, type CatalogHeadAtBoundary, type VaultOperation, type VaultStore } from "./vaultStore";
+import { isValidOperationId, type CatalogHeadAtBoundary, type SemanticCatalogHead, type VaultOperation, type VaultStore } from "./vaultStore";
 
 const DEFAULT_PAGE_SIZE = 1000;
 const SOFT_TTL_MS = 60 * 60_000;
@@ -15,9 +15,9 @@ export interface ImmutableArtifactStore {
 
 
 export interface BootstrapDescriptor {
-	format: "yaos-bootstrap-v1";
+	format: "yaos-bootstrap-v2";
 	bootstrapId: string;
-	schemaVersion: 7;
+	schemaVersion: 8;
 	storageFormatVersion: 3;
 	createdAt: string;
 	serverCompleted: boolean;
@@ -31,6 +31,7 @@ export interface BootstrapDescriptor {
 	};
 	catalog: {
 		activeBodyCount: number;
+		activeSemanticCount: number;
 		pageSize: number;
 		firstCursor: string | null;
 		feedFloor: number;
@@ -47,6 +48,20 @@ export interface BootstrapCatalogPage {
 
 export interface BootstrapBodyState {
 	bodyId: string;
+	generation: number;
+	throughSequence: number;
+	encodedState: Uint8Array;
+}
+
+export interface BootstrapSemanticCatalogPage {
+	bootstrapId: string;
+	highWater: number;
+	entries: SemanticCatalogHead[];
+	nextCursor: string | null;
+}
+
+export interface BootstrapSemanticState {
+	documentId: string;
 	generation: number;
 	throughSequence: number;
 	encodedState: Uint8Array;
@@ -126,6 +141,25 @@ export class BootstrapService {
 		};
 	}
 
+	semanticCatalogPage(bootstrapId: string, cursor: string | null, limit = DEFAULT_PAGE_SIZE): BootstrapSemanticCatalogPage {
+		const operation = this.requireRunning(bootstrapId);
+		const bounded = Math.min(DEFAULT_PAGE_SIZE, Math.max(1, limit));
+		const entries = this.store.listActiveSemanticAt(operation.boundarySequence, cursor ?? "", bounded);
+		return { bootstrapId, highWater: operation.boundarySequence, entries,
+			nextCursor: entries.length === bounded ? entries.at(-1)!.documentId : null };
+	}
+
+	semanticState(bootstrapId: string, documentId: string): BootstrapSemanticState {
+		const operation = this.requireRunning(bootstrapId);
+		const head = this.store.semanticHeadAt(operation.boundarySequence, documentId);
+		if (!head || head.lifecycle !== "active") throw new Error("semantic document is not active at bootstrap boundary");
+		const reconstructed = this.store.reconstructDocument(documentId, operation.boundarySequence);
+		const encodedState = Y.encodeStateAsUpdate(reconstructed.doc);
+		reconstructed.doc.destroy();
+		return { documentId, generation: reconstructed.generation,
+			throughSequence: operation.boundarySequence, encodedState };
+	}
+
 	renew(bootstrapId: string, settledBodies: number): void {
 		this.requireRunning(bootstrapId);
 		this.store.renewPin(bootstrapId, settledBodies, SOFT_TTL_MS, this.now());
@@ -159,9 +193,9 @@ export class BootstrapService {
 		reconstructed.doc.destroy();
 		const pin = this.store.getPin(operation.operationId);
 		return {
-			format: "yaos-bootstrap-v1",
+			format: "yaos-bootstrap-v2",
 			bootstrapId: operation.operationId,
-			schemaVersion: SERVER_SCHEMA_VERSION as 7,
+			schemaVersion: SERVER_SCHEMA_VERSION,
 			storageFormatVersion: SERVER_STORAGE_FORMAT_VERSION as 3,
 			serverCompleted: operation.state === "complete",
 			createdAt: new Date(operation.createdAt).toISOString(),
@@ -175,6 +209,8 @@ export class BootstrapService {
 			},
 			catalog: {
 				activeBodyCount: this.store.countActiveCatalogAt(operation.boundarySequence),
+				activeSemanticCount: typeof this.store.countActiveSemanticAt === "function"
+					? this.store.countActiveSemanticAt(operation.boundarySequence) : 0,
 				pageSize: DEFAULT_PAGE_SIZE,
 				firstCursor: null,
 				feedFloor: this.store.journalFloor(),

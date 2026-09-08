@@ -1,6 +1,6 @@
 import * as Y from "yjs";
 import { SCHEMA_VERSION, STORAGE_FORMAT_VERSION } from "./shared/productVersions";
-import type { BodyLifecycle, CatalogHeadAtBoundary } from "./vaultCatalogStore";
+import type { BodyLifecycle, CatalogHeadAtBoundary, SemanticCatalogHead } from "./vaultCatalogStore";
 import type { HistoryPin } from "./vaultBootstrapStore";
 import type { VaultActorContext, VaultRole } from "./collaboration";
 import { SQLITE_ROW_SAFE_BYTES } from "./shared/durableLimits";
@@ -41,7 +41,10 @@ export interface VaultProvisioningResult extends VaultMetadata {
 	created: boolean;
 }
 
-export type VaultCommitKind = "root" | "body" | "create" | "rename" | "delete" | "revive" | "lifecycle-batch" | "blob" | "restore";
+export type VaultCommitKind = "root" | "body" | "semantic" | "semantic-create" | "semantic-rename"
+	| "semantic-delete" | "semantic-revive" | "semantic-promote" | "semantic-demote"
+	| "create" | "rename" | "delete" | "revive"
+	| "lifecycle-batch" | "blob" | "restore";
 
 export interface DurableCommitResult {
 	vaultSequence: number;
@@ -68,6 +71,7 @@ export interface JournalFeedEntry {
 	generation: number;
 	kind: VaultCommitKind;
 	catalogs: CatalogHeadAtBoundary[];
+	semanticCatalogs: SemanticCatalogHead[];
 }
 
 export interface JournalFeedPage {
@@ -252,7 +256,7 @@ export abstract class VaultDocumentStore {
 				id INTEGER PRIMARY KEY CHECK(id = 1),
 				vault_id TEXT NOT NULL,
 				vault_generation TEXT NOT NULL,
-				schema_version INTEGER NOT NULL CHECK(schema_version = 7),
+				schema_version INTEGER NOT NULL CHECK(schema_version = 8),
 				storage_format_version INTEGER NOT NULL CHECK(storage_format_version = 3),
 				provisioned_at INTEGER NOT NULL
 			);
@@ -298,6 +302,16 @@ export abstract class VaultDocumentStore {
 				settings_environment_count INTEGER NOT NULL,
 				history_attribution TEXT NOT NULL,
 				installed_at INTEGER NOT NULL
+			);
+			CREATE TABLE IF NOT EXISTS vault_schema_migration_receipts (
+				migration_id TEXT PRIMARY KEY,
+				vault_id TEXT NOT NULL,
+				vault_generation TEXT NOT NULL,
+				from_schema INTEGER NOT NULL,
+				to_schema INTEGER NOT NULL,
+				root_sequence INTEGER NOT NULL,
+				root_state_hash TEXT NOT NULL,
+				completed_at INTEGER NOT NULL
 			);
 			CREATE TABLE IF NOT EXISTS vault_mutation_attribution (
 				sequence INTEGER NOT NULL,
@@ -346,6 +360,75 @@ export abstract class VaultDocumentStore {
 				durable_generation INTEGER NOT NULL,
 				vault_sequence INTEGER NOT NULL,
 				runtime_epoch TEXT NOT NULL
+			);
+			CREATE TABLE IF NOT EXISTS vault_semantic_catalog_events (
+				sequence INTEGER NOT NULL,
+				document_id TEXT NOT NULL,
+				file_id TEXT NOT NULL,
+				kind TEXT NOT NULL,
+				format TEXT NOT NULL,
+				format_version INTEGER NOT NULL,
+				path TEXT NOT NULL,
+				previous_path TEXT,
+				lifecycle TEXT NOT NULL,
+				generation INTEGER NOT NULL,
+				content_hash TEXT,
+				size INTEGER,
+				mutation_index INTEGER NOT NULL,
+				PRIMARY KEY(sequence, document_id)
+			);
+			CREATE INDEX IF NOT EXISTS vault_semantic_catalog_document_sequence
+				ON vault_semantic_catalog_events(document_id, sequence DESC);
+			CREATE TABLE IF NOT EXISTS vault_semantic_candidate_receipts (
+				document_id TEXT NOT NULL,
+				client_id TEXT NOT NULL,
+				candidate_id TEXT NOT NULL,
+				candidate_digest TEXT NOT NULL,
+				durable_generation INTEGER NOT NULL,
+				vault_sequence INTEGER NOT NULL,
+				runtime_epoch TEXT NOT NULL,
+				content_hash TEXT NOT NULL,
+				size INTEGER NOT NULL,
+				created_at INTEGER NOT NULL,
+				PRIMARY KEY(document_id, client_id, candidate_id)
+			);
+			CREATE TABLE IF NOT EXISTS vault_semantic_lifecycle_receipts (
+				operation_id TEXT PRIMARY KEY,
+				request_digest TEXT NOT NULL,
+				document_id TEXT NOT NULL,
+				file_id TEXT NOT NULL,
+				kind TEXT NOT NULL,
+				result_path TEXT NOT NULL,
+				result_lifecycle TEXT NOT NULL,
+				durable_generation INTEGER NOT NULL,
+				vault_sequence INTEGER NOT NULL,
+				root_generation INTEGER NOT NULL,
+				runtime_epoch TEXT NOT NULL,
+				created_at INTEGER NOT NULL
+			);
+			CREATE TABLE IF NOT EXISTS vault_semantic_authority_receipts (
+				operation_id TEXT PRIMARY KEY,
+				request_digest TEXT NOT NULL,
+				kind TEXT NOT NULL,
+				path TEXT NOT NULL,
+				document_id TEXT NOT NULL,
+				source_revision TEXT NOT NULL,
+				content_hash TEXT NOT NULL,
+				size INTEGER NOT NULL,
+				document_generation INTEGER NOT NULL,
+				root_sequence INTEGER NOT NULL,
+				root_generation INTEGER NOT NULL,
+				rollback_blob_hash TEXT,
+				runtime_epoch TEXT NOT NULL,
+				created_at INTEGER NOT NULL
+			);
+			CREATE TABLE IF NOT EXISTS vault_semantic_rollback_blobs (
+				document_id TEXT NOT NULL,
+				content_hash TEXT NOT NULL,
+				size INTEGER NOT NULL,
+				retained_until INTEGER NOT NULL,
+				operation_id TEXT NOT NULL UNIQUE,
+				PRIMARY KEY(document_id, content_hash)
 			);
 			CREATE TABLE IF NOT EXISTS vault_lifecycle_receipts (
 				operation_id TEXT PRIMARY KEY,
@@ -1117,12 +1200,31 @@ export abstract class VaultDocumentStore {
 			if (entries) entries.push(mapped);
 			else catalogsBySequence.set(catalog.sequence, [mapped]);
 		}
+		const semanticCatalogs = this.storage.sql.exec<{
+			sequence: number; document_id: string; file_id: string; kind: "canvas"; format: "json-canvas";
+			format_version: 1; path: string; previous_path: string | null;
+			lifecycle: SemanticCatalogHead["lifecycle"]; generation: number; content_hash: string | null; size: number | null;
+		}>(`SELECT c.sequence, c.document_id, c.file_id, c.kind, c.format, c.format_version, c.path,
+		          c.previous_path, c.lifecycle, c.generation, c.content_hash, c.size
+		   FROM vault_semantic_catalog_events c JOIN (
+		     SELECT sequence FROM vault_journal WHERE sequence > ? ORDER BY sequence LIMIT ?
+		   ) page ON page.sequence = c.sequence ORDER BY c.sequence, c.mutation_index`, sequence, boundedLimit).toArray();
+		const semanticBySequence = new Map<number, SemanticCatalogHead[]>();
+		for (const value of semanticCatalogs) {
+			const mapped: SemanticCatalogHead = { sequence: value.sequence, documentId: value.document_id,
+				fileId: value.file_id, kind: value.kind, format: value.format, formatVersion: value.format_version,
+				path: value.path, previousPath: value.previous_path, lifecycle: value.lifecycle,
+				generation: value.generation, contentHash: value.content_hash, size: value.size };
+			const entries = semanticBySequence.get(value.sequence);
+			if (entries) entries.push(mapped); else semanticBySequence.set(value.sequence, [mapped]);
+		}
 		return rows.map((row) => ({
 			sequence: row.sequence,
 			documentId: row.document_id,
 			generation: row.generation,
 			kind: row.kind,
 			catalogs: catalogsBySequence.get(row.sequence) ?? [],
+			semanticCatalogs: semanticBySequence.get(row.sequence) ?? [],
 		}));
 	}
 

@@ -5,6 +5,7 @@ export interface ServerCapabilities {
 	attachments: boolean;
 	snapshots: boolean;
 	settingsSync?: boolean;
+	semanticCanvas?: boolean;
 	settingsFormatVersion?: number;
 	maxBlobUploadBytes?: number;
 	serverVersion: string;

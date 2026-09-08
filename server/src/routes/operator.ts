@@ -266,6 +266,23 @@ export async function handleOperatorCollaborationMigration(req: Request, env: En
 	return json(completion);
 }
 
+export async function handleOperatorCanvasMigration(req: Request, env: Env, vaultId: string): Promise<Response> {
+	const denied = await requireOperator(req, env);
+	if (denied) return denied;
+	const vault = await readVault(env, vaultId).catch(() => null);
+	if (!vault) return json({ error: "unknown_vault" }, 404);
+	try {
+		const response = await env.YAOS_SYNC.call(vaultId, new Request("https://internal/__yaos/canvas-migrate", {
+			method: "POST",
+			headers: { "x-yaos-vault-id": vaultId, "x-yaos-vault-generation": vault.vaultGeneration },
+		}));
+		const body = await response.json().catch(() => null);
+		return json(body ?? { error: "canvas_migration_invalid_response" }, response.status);
+	} catch {
+		return json({ error: "canvas_migration_vault_unavailable", repairable: true }, 503);
+	}
+}
+
 export async function handleOperatorRenameVault(req: Request, env: Env, vaultId: string): Promise<Response> {
 	const denied = await requireOperator(req, env);
 	if (denied) return denied;
