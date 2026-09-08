@@ -91,6 +91,7 @@ export function isServerCapabilities(value: unknown): value is ServerCapabilitie
 		typeof candidate.attachments === "boolean" &&
 		typeof candidate.snapshots === "boolean" &&
 		(candidate.settingsSync === undefined || typeof candidate.settingsSync === "boolean") &&
+		(candidate.semanticCanvas === undefined || typeof candidate.semanticCanvas === "boolean") &&
 		(candidate.settingsFormatVersion === undefined ||
 			(typeof candidate.settingsFormatVersion === "number" && Number.isSafeInteger(candidate.settingsFormatVersion))) &&
 		(candidate.maxBlobUploadBytes === undefined ||

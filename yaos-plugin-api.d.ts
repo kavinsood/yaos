@@ -98,6 +98,13 @@ export interface YaosPublicCounts {
 	readonly pendingSettlements: number;
 	readonly preservedUnresolved: number;
 	readonly frontmatterQuarantined: number;
+	readonly semanticCanvases: number;
+	readonly residentCanvases: number;
+	readonly pendingCanvasOperations: number;
+	readonly invalidCanvases: number;
+	readonly oversizedCanvases: number;
+	readonly conflictCanvases: number;
+	readonly degradedCanvases: number;
 }
 
 export interface YaosPublicSnapshot {

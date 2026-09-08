@@ -2,8 +2,8 @@ import type { VaultSyncSettings } from "../settings";
 import { appendTraceParams, type TraceHttpContext } from "../observability/traceContext";
 import { obsidianRequest } from "../utils/http";
 
-export const RECOVERY_SCHEMA_VERSION = 7 as const;
-export const RECOVERY_SNAPSHOT_FORMAT_VERSION = 2 as const;
+export const RECOVERY_SCHEMA_VERSION = 8 as const;
+export const RECOVERY_SNAPSHOT_FORMAT_VERSION = 3 as const;
 export const RECOVERY_MANIFEST_TREE_FORMAT_VERSION = 1 as const;
 const MAX_RECOVERY_CONTENT_BYTES = 10 * 1024 * 1024;
 
@@ -70,6 +70,30 @@ export type ActiveFileManifestEntry =
 		fileId: string;
 		bodyId: string;
 		bodyGeneration: number;
+		errorCode: "corrupt_history" | "hash_mismatch" | "missing_history";
+		errorReference: string;
+	}
+	| {
+		availability: "available";
+		kind: "canvas";
+		path: string;
+		documentId: string;
+		fileId: string;
+		format: "json-canvas";
+		formatVersion: 1;
+		generation: number;
+		contentHash: string;
+		size: number;
+	}
+	| {
+		availability: "unavailable";
+		kind: "canvas";
+		path: string;
+		documentId: string;
+		fileId: string;
+		format: "json-canvas";
+		formatVersion: 1;
+		generation: number;
 		errorCode: "corrupt_history" | "hash_mismatch" | "missing_history";
 		errorReference: string;
 	};
@@ -261,6 +285,16 @@ export type RestoreItem =
 		sourceFileId: string;
 		sourceKind: "active" | "deleted";
 		sourceBodyId: string;
+		contentHash: string;
+		size: number;
+		contentUrl: string;
+	}
+	| {
+		kind: "canvas";
+		itemId: string;
+		path: string;
+		sourceDocumentId: string;
+		sourceFileId: string;
 		contentHash: string;
 		size: number;
 		contentUrl: string;
@@ -503,6 +537,16 @@ function parsePathEntry(value: unknown): SnapshotPathEntry {
 	assertSafePath(candidate.path);
 	const path = candidate.path;
 	const availability = requiredChoice(candidate.availability, "entry.availability", ENTRY_AVAILABILITIES);
+	if (candidate.kind === "canvas") {
+		if (candidate.format !== "json-canvas" || candidate.formatVersion !== 1) throw new Error("unsupported recovery Canvas format");
+		const common = { kind: "canvas" as const, path, documentId: requiredString(candidate.documentId, "entry.documentId"),
+			fileId: requiredString(candidate.fileId, "entry.fileId"), format: "json-canvas" as const,
+			formatVersion: 1 as const, generation: requiredInteger(candidate.generation, "entry.generation") };
+		return availability === "available"
+			? { availability, ...common, contentHash: requiredHash(candidate.contentHash, "entry.contentHash"), size: requiredInteger(candidate.size, "entry.size") }
+			: { availability, ...common, errorCode: requiredChoice(candidate.errorCode, "entry.errorCode", ACTIVE_UNAVAILABLE_CODES),
+				errorReference: requiredString(candidate.errorReference, "entry.errorReference") };
+	}
 	if ("bodyGeneration" in candidate) {
 		const fileId = requiredString(candidate.fileId, "entry.fileId");
 		const bodyId = requiredString(candidate.bodyId, "entry.bodyId");
@@ -629,6 +673,9 @@ function parseRestoreItem(value: unknown): RestoreItem {
 			sourceBodyId: requiredString(value.sourceBodyId, "sourceBodyId"),
 		};
 	}
+	if (value.kind === "canvas") return { kind: "canvas", ...common,
+		sourceDocumentId: requiredString(value.sourceDocumentId, "sourceDocumentId"),
+		sourceFileId: requiredString(value.sourceFileId, "sourceFileId") };
 	if (value.kind === "attachment") {
 		if (value.mime !== null && typeof value.mime !== "string") throw new Error("restore attachment MIME is invalid");
 		return { kind: "attachment", ...common, mime: value.mime };

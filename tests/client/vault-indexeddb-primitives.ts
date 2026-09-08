@@ -23,11 +23,11 @@ const clean: PendingWorkSummary = {
 	activeRecoveryOperations: 0,
 };
 
-s.test("schema-7 databases fence vault generation and local folder identity", () => {
+s.test("schema-8 databases fence vault generation and local folder identity", () => {
 	const legacyCache = vaultIdbName("vault-a", "folder-a");
 	assert.equal(
 		schema6VaultIdbName("vault-a", "generation-a", "folder-a"),
-		"yaos:vault-a:generation-a:folder-a:schema-7",
+		"yaos:vault-a:generation-a:folder-a:schema-8",
 	);
 	assert.notEqual(schema6VaultIdbName("vault-a", "generation-a", "folder-a"), legacyCache);
 	assert.notEqual(
@@ -40,7 +40,7 @@ s.test("schema-7 databases fence vault generation and local folder identity", ()
 		schema6VaultIdbName("vault-a", "generation-a", "folder-b"),
 		"two local folders enrolled in the same vault never share schema-4 state",
 	);
-	assert.equal(localVaultImportIdbName("vault-a", "folder-a"), `${legacyCache}:schema-7:local-import`);
+	assert.equal(localVaultImportIdbName("vault-a", "folder-a"), `${legacyCache}:schema-8:local-import`);
 	assert.throws(() => schema6VaultIdbName("vault-a", "", "folder-a"), /generation/);
 	assert.throws(() => schema6VaultIdbName("vault-a", "generation-a", ""), /folder key/);
 	assert.throws(() => localVaultImportIdbName("", "folder-a"), /vault ID/);

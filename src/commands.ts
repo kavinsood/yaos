@@ -22,6 +22,8 @@ export interface CommandsRuntimeHost {
 	isSettingsSyncDebugEnabled(): boolean;
 	runSettingsSyncInstallSmoke(): Promise<void>;
 	runSettingsSyncCommand(action: "apply" | "replace" | "seed" | "take" | "defer"): Promise<void>;
+	promoteActiveCanvas(): Promise<void>;
+	demoteActiveCanvas(): Promise<void>;
 	canManageRecovery?(): boolean;
 }
 
@@ -48,6 +50,28 @@ export function registerCommands(
 			if (!vaultSync) return;
 			const mode = vaultSync.getSafeReconcileMode();
 			void host.runReconciliation(mode);
+		},
+	});
+
+	registrar.addCommand({
+		id: "promote-active-canvas",
+		name: "Use semantic sync for active Canvas",
+		checkCallback: (checking) => {
+			const runtime = host.getVaultSync();
+			if (!runtime?.canvases) return false;
+			if (!checking) void host.promoteActiveCanvas().catch((error: unknown) => new Notice(`Canvas promotion failed: ${String(error)}`, 8000));
+			return true;
+		},
+	});
+
+	registrar.addCommand({
+		id: "demote-active-canvas",
+		name: "Use attachment sync for active Canvas",
+		checkCallback: (checking) => {
+			const runtime = host.getVaultSync();
+			if (!runtime?.canvases) return false;
+			if (!checking) void host.demoteActiveCanvas().catch((error: unknown) => new Notice(`Canvas demotion failed: ${String(error)}`, 8000));
+			return true;
 		},
 	});
 

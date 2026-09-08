@@ -5,6 +5,7 @@ import { PRODUCT_EVENT_KIND } from "../observability/productEventKinds";
 import type { ProductFlightEventInput } from "../observability/traceSink";
 import type { AttachmentCatalogPort, BlobSyncManager } from "../sync/blobSync";
 import type { VaultSync } from "../sync/vaultSync";
+import type { CanvasLiveReview } from "../sync/canvas/canvasManager";
 import type { AttachmentHead } from "../types";
 import { ConfirmModal } from "../ui/ConfirmModal";
 import { formatUnknown } from "../utils/format";
@@ -295,10 +296,13 @@ export class SnapshotService {
 	private async applyRestorePage(restoreId: string, snapshotId: string, items: RestoreItem[], runtime: RecoveryRuntimePort): Promise<RestoreItemResult[]> {
 		const catalog = this.deps.getAttachmentCatalog();
 		const markdownReviews = new Map<string, RecoveryLiveFile | null>();
+		const canvasReviews = new Map<string, CanvasLiveReview | null>();
 		const attachmentReviews = new Map<string, AttachmentHead>();
 		for (const item of items) {
 			if (item.kind === "markdown") markdownReviews.set(item.itemId, await runtime.getLive(item.path));
-			else attachmentReviews.set(item.itemId, catalog?.getObservedAttachmentHead(item.path) ?? { kind: "missing", revision: null });
+			else if (item.kind === "canvas") canvasReviews.set(item.itemId,
+				await this.deps.getVaultSync()?.canvases?.getLive(item.path) ?? null);
+			else if (item.kind === "attachment") attachmentReviews.set(item.itemId, catalog?.getObservedAttachmentHead(item.path) ?? { kind: "missing", revision: null });
 		}
 		const backupHook = new RecoveryBackupHook(this.deps.app, {
 			log: (message) => this.deps.log(message),
@@ -316,6 +320,19 @@ export class SnapshotService {
 			try {
 				if (item.kind === "markdown") {
 					results.push(await this.client().applyMarkdownItem(restoreId, snapshotId, item, markdownReviews.get(item.itemId) ?? null, runtime));
+				} else if (item.kind === "canvas") {
+					const canvases = this.deps.getVaultSync()?.canvases;
+					if (!canvases) throw new Error("Canvas recovery runtime is unavailable");
+					const bytes = await this.client().downloadRestoreItem(restoreId, item);
+					const reviewed = canvasReviews.get(item.itemId) ?? null;
+					const current = await canvases.getLive(item.path);
+					if (!sameCanvasLive(current, reviewed)) {
+						results.push({ itemId: item.itemId, outcome: "skipped-changed" });
+						continue;
+					}
+					const outcome = await canvases.ingest(item.path, bytes);
+					results.push({ itemId: item.itemId, outcome: outcome === "blocked" ? "failed" : "restored",
+						...(outcome === "blocked" ? { errorCode: "canvas_restore_blocked" } : {}) });
 				} else {
 					results.push(await this.applyAttachmentItem(restoreId, item, attachmentReviews.get(item.itemId) ?? { kind: "missing", revision: null }));
 				}
@@ -516,4 +533,10 @@ export class SnapshotService {
 			data,
 		});
 	}
+}
+
+function sameCanvasLive(left: CanvasLiveReview | null, right: CanvasLiveReview | null): boolean {
+	return left === null ? right === null : right !== null
+		&& left.documentId === right.documentId && left.generation === right.generation
+		&& left.contentHash === right.contentHash && left.size === right.size;
 }

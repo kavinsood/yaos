@@ -44,7 +44,9 @@ import {
 	noticeForInstallResult,
 } from "./sync/settingsSync/obsidianPluginInstall";
 import { type BlobQueueSnapshot, type BlobSyncManager } from "./sync/blobSync";
-import { isMarkdownSyncable, isBlobSyncable } from "./types";
+import { isMarkdownSyncable, isBlobSyncable, isCanvasSyncable } from "./types";
+import { ObsidianCanvasDiskMirror } from "./sync/canvas/canvasDiskMirror";
+import { CanvasProjectionRouter } from "./sync/canvas/canvasProjectionRouter";
 import { planCategoryRenameAction } from "./sync/policy/renameAdmissionPolicy";
 import { classifySyncPath } from "./paths/pathCategory";
 import { isCanonicalPathFileIdCollision } from "./paths/pathCollision";
@@ -228,6 +230,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private connectionController: ConnectionController | null = null;
 	private editorBindings: EditorBindingManager | null = null;
 	private diskMirror: DiskMirror | null = null;
+	private canvasProjection: CanvasProjectionRouter | null = null;
 	private attachmentOrchestrator: AttachmentOrchestrator | null = null;
 	private editorWorkspace: EditorWorkspaceOrchestrator | null = null;
 	private snapshotService: SnapshotService | null = null;
@@ -399,7 +402,36 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	}
 
 	private isBlobPathSyncable(path: string): boolean {
-		return isBlobSyncable(path, this.excludePatterns, this.getRuntimeConfig().vaultConfigDir);
+		return !this.vaultSync?.canvases?.isSemanticPath(path)
+			&& isBlobSyncable(path, this.excludePatterns, this.getRuntimeConfig().vaultConfigDir);
+	}
+
+	private isCanvasPathSyncable(path: string): boolean {
+		return isCanvasSyncable(path, this.excludePatterns, this.getRuntimeConfig().vaultConfigDir);
+	}
+
+	private async promoteActiveCanvas(): Promise<void> {
+		const file = this.app.workspace.getActiveFile();
+		const runtime = this.vaultSync;
+		if (!file || !this.isCanvasPathSyncable(file.path) || !runtime?.canvases) throw new Error("Open a synchronized Canvas first");
+		if (runtime.canvases.isSemanticPath(file.path)) throw new Error("This Canvas already uses semantic sync");
+		const ref = runtime.getAttachmentRef(file.path);
+		if (!ref) throw new Error("The attachment must finish syncing before promotion");
+		const bytes = new Uint8Array(await this.app.vault.readBinary(file));
+		await runtime.canvases.promote(file.path, bytes, ref);
+		new Notice("Canvas promoted to semantic sync");
+		this.queueReceiptStatusRefresh();
+	}
+
+	private async demoteActiveCanvas(): Promise<void> {
+		const file = this.app.workspace.getActiveFile();
+		const runtime = this.vaultSync;
+		if (!file || !this.isCanvasPathSyncable(file.path) || !runtime?.canvases?.isSemanticPath(file.path)) {
+			throw new Error("Open a semantic Canvas first");
+		}
+		await runtime.canvases.demote(file.path);
+		new Notice("Canvas returned to attachment sync");
+		this.queueReceiptStatusRefresh();
 	}
 
 	private getRuntimeConfig(): RuntimeConfig {
@@ -901,6 +933,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			);
 			await prepareBootstrapRoot(bootstrapServer, database);
 			const ticketCache = createSocketTicketCache();
+			const canvasProjection = new CanvasProjectionRouter(new ObsidianCanvasDiskMirror(this.app));
+			this.canvasProjection = canvasProjection;
 			const runtime = await VaultSync.create({
 				vaultId: this.settings.vaultId,
 				vaultGeneration: this.settings.vaultGeneration,
@@ -923,6 +957,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				host: this.settings.host,
 				token: this.settings.deviceToken,
 				database,
+				canvasProjection,
 				getSocketTicket: async (scope, force = false) => {
 					if (force) ticketCache.invalidate();
 					return ticketCache.get(
@@ -944,6 +979,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				onControlFrame: () => this.queueReceiptStatusRefresh(),
 			});
 			this.vaultSync = runtime;
+			if (runtime.canvases) canvasProjection.attachManager(runtime.canvases);
+			this.syncCanvasLeaves();
 
 			// 2. EditorBindingManager
 			const bindingPropagationGate: BindingPropagationGate = {
@@ -1064,6 +1101,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				},
 			);
 			this.bootstrapClient.configureSettlements(bodySettlements);
+			if (runtime.canvases) this.bootstrapClient.configureCanvases(runtime.canvases);
 			// Track SHA-256 baseline hash after every successful flushWrite.
 			// Used by decideClosedFileConflict on startup/re-enable to determine
 			// which side actually changed from the last known stable state.
@@ -1240,6 +1278,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						noticeForInstallResult(await confirmAndSmokeInstallCalendar(this.app));
 					},
 					runSettingsSyncCommand: (action) => this.runSettingsSyncCommand(action),
+					promoteActiveCanvas: () => this.promoteActiveCanvas(),
+					demoteActiveCanvas: () => this.demoteActiveCanvas(),
 				});
 				// Debug-runtime commands are registered separately by the debug runtime.
 				this.lab?.registerCommands(this);
@@ -1428,6 +1468,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			this.app.workspace.on("layout-change", () => {
 				if (!this.reconciliationController.isReconciled) return;
 				this.editorWorkspace?.onLayoutChange();
+				this.syncCanvasLeaves();
 			}),
 		);
 
@@ -1435,6 +1476,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			this.app.workspace.on("active-leaf-change", (leaf) => {
 				if (!this.reconciliationController.isReconciled) return;
 				this.editorWorkspace?.onActiveLeafChange(leaf);
+				this.syncCanvasLeaves();
 			}),
 		);
 
@@ -1442,6 +1484,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			this.app.workspace.on("file-open", (file) => {
 				if (!this.reconciliationController.isReconciled) return;
 				this.editorWorkspace?.onFileOpen(file?.path ?? null);
+				this.syncCanvasLeaves();
 				if (!file) return;
 
 				// Prefetch embedded attachments for the opened note
@@ -1503,6 +1546,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						},
 					});
 					this.reconciliationController.markMarkdownDirty(file, "modify", opId);
+				} else if (this.isCanvasPathSyncable(file.path) && this.vaultSync?.canvases?.isSemanticPath(file.path)) {
+					void this.app.vault.readBinary(file)
+						.then((bytes) => this.vaultSync?.canvases?.ingest(file.path, new Uint8Array(bytes)))
+						.catch((error) => this.log(`Canvas ingest failed for "${file.path}": ${formatUnknown(error)}`));
 				} else {
 					const blobSync = this.getBlobSync();
 					if (blobSync && this.isBlobPathSyncable(file.path) && !blobSync.isSuppressed(file.path)) {
@@ -1519,6 +1566,12 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			this.app.vault.on("rename", (file, oldPath) => {
 				if (!this.reconciliationController.isReconciled) return;
 				if (!(file instanceof TFile)) return;
+				const canvasDocumentId = this.vaultSync?.canvases?.documentIdForPath(oldPath);
+				if (canvasDocumentId && this.isCanvasPathSyncable(file.path)) {
+					void this.vaultSync?.canvases?.rename(canvasDocumentId, oldPath, file.path)
+						.catch((error) => this.log(`Canvas rename failed: ${formatUnknown(error)}`));
+					return;
+				}
 
 				// Classify both paths using canonical path identity.
 				const configDir = this.getRuntimeConfig().vaultConfigDir;
@@ -1700,6 +1753,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						opId,
 					);
 					this.log(`Delete: "${file.path}"`);
+					} else if (this.vaultSync?.canvases?.isSemanticPath(file.path)) {
+						const documentId = this.vaultSync.canvases.documentIdForPath(file.path);
+						if (documentId) void this.vaultSync.canvases.delete(documentId)
+							.catch((error) => this.log(`Canvas delete failed for "${file.path}": ${formatUnknown(error)}`));
 					} else {
 						const blobSync = this.getBlobSync();
 						if (blobSync && this.isBlobPathSyncable(file.path) && !blobSync.isSuppressed(file.path)) {
@@ -1727,6 +1784,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						data: { size: file.stat?.size ?? null },
 					});
 					this.reconciliationController.markMarkdownDirty(file, "create", createOpId);
+				} else if (this.isCanvasPathSyncable(file.path) && this.vaultSync?.canvases?.isSemanticPath(file.path)) {
+					void this.app.vault.readBinary(file)
+						.then((bytes) => this.vaultSync?.canvases?.ingest(file.path, new Uint8Array(bytes)))
+						.catch((error) => this.log(`Canvas create failed for "${file.path}": ${formatUnknown(error)}`));
 				} else if (this.isBlobPathSyncable(file.path)) {
 					const blobSync = this.getBlobSync();
 					if (blobSync && !blobSync.isSuppressed(file.path)) {
@@ -1748,6 +1809,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				}
 			}),
 		);
+	}
+
+	private syncCanvasLeaves(): void {
+		this.canvasProjection?.syncLeaves(this.app.workspace.getLeavesOfType("canvas"));
 	}
 
 	// -------------------------------------------------------------------
@@ -1819,6 +1884,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				run: () => this.connectionController?.stop(),
 			},
 			{
+				name: "canvas-projection",
+				run: () => this.canvasProjection?.destroy(),
+			},
+			{
 				name: "vault-sync",
 				run: () => this.vaultSync?.destroy(),
 			},
@@ -1830,6 +1899,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					this.connectionController = null;
 					this.editorBindings = null;
 					this.diskMirror = null;
+					this.canvasProjection = null;
 					this.vaultDatabase = null;
 					this.bootstrapClient = null;
 					this.bodySettlementRepository = null;
@@ -2100,6 +2170,13 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					pendingSettlements: 0,
 					preservedUnresolved: preserved.length,
 					frontmatterQuarantined: frontmatter.length,
+					semanticCanvases: 0,
+					residentCanvases: 0,
+					pendingCanvasOperations: 0,
+					invalidCanvases: 0,
+					oversizedCanvases: 0,
+					conflictCanvases: 0,
+					degradedCanvases: 0,
 				},
 			};
 		}
@@ -2145,6 +2222,14 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				pendingSettlements,
 				preservedUnresolved: preserved.length,
 				frontmatterQuarantined: frontmatter.length,
+				semanticCanvases: runtime.getCanvasStats()?.semanticDocuments ?? 0,
+				residentCanvases: runtime.getCanvasStats()?.residentDocuments ?? 0,
+				pendingCanvasOperations: (runtime.getCanvasStats()?.pendingSubmissions ?? 0)
+					+ (runtime.getCanvasStats()?.pendingDocuments ?? 0),
+				invalidCanvases: runtime.getCanvasStats()?.invalidDocuments ?? 0,
+				oversizedCanvases: runtime.getCanvasStats()?.oversizedDocuments ?? 0,
+				conflictCanvases: runtime.getCanvasStats()?.conflictDocuments ?? 0,
+				degradedCanvases: runtime.getCanvasStats()?.degradedDocuments ?? 0,
 			},
 		};
 	}

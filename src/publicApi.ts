@@ -95,6 +95,13 @@ export interface YaosPublicCounts {
 	readonly pendingSettlements: number;
 	readonly preservedUnresolved: number;
 	readonly frontmatterQuarantined: number;
+	readonly semanticCanvases: number;
+	readonly residentCanvases: number;
+	readonly pendingCanvasOperations: number;
+	readonly invalidCanvases: number;
+	readonly oversizedCanvases: number;
+	readonly conflictCanvases: number;
+	readonly degradedCanvases: number;
 }
 
 /** The snapshot supplied by YAOS's runtime projection, before API metadata. */
@@ -197,6 +204,13 @@ function copyCounts(counts: YaosPublicCounts): YaosPublicCounts {
 		pendingSettlements: counts.pendingSettlements,
 		preservedUnresolved: counts.preservedUnresolved,
 		frontmatterQuarantined: counts.frontmatterQuarantined,
+		semanticCanvases: counts.semanticCanvases,
+		residentCanvases: counts.residentCanvases,
+		pendingCanvasOperations: counts.pendingCanvasOperations,
+		invalidCanvases: counts.invalidCanvases,
+		oversizedCanvases: counts.oversizedCanvases,
+		conflictCanvases: counts.conflictCanvases,
+		degradedCanvases: counts.degradedCanvases,
 	});
 }
 

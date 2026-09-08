@@ -87,7 +87,7 @@ s.test("persisted capture and restore identities survive restart without persist
 
 s.test("complete-with-gaps roots and unavailable entries remain visible but lack restorable content", async () => {
 	const root = {
-		format: "yaos-recovery-v2", snapshotFormatVersion: 2, snapshotId: "snapshot-1", vaultIdHash: HASH,
+		format: "yaos-recovery-v2", snapshotFormatVersion: 3, snapshotId: "snapshot-1", vaultIdHash: HASH,
 		vaultGenerationHash: OTHER_HASH, runtimeEpoch: "epoch-1", boundarySequence: 42, rootGeneration: 4, sourcePlanDigest: HASH,
 		manifestGraphDigest: HASH, manifestNodeCount: 3, createdAt: "2026-08-24T00:00:00.000Z",
 		completedAt: "2026-08-24T00:01:00.000Z", health: "complete_with_gaps", reason: "manual",
@@ -137,6 +137,20 @@ s.test("manifest entry parsers reject unsupported error codes", async () => {
 				errorReference: "error-ref",
 			});
 		}
+		if (url.searchParams.get("path") === "Broken.canvas") {
+			return response(200, {
+				availability: "unavailable",
+				kind: "canvas",
+				path: "Broken.canvas",
+				documentId: "canvas-1",
+				fileId: "file-canvas-1",
+				format: "json-canvas",
+				formatVersion: 1,
+				generation: 2,
+				errorCode: "unexpected_canvas_error",
+				errorReference: "error-ref",
+			});
+		}
 		return response(200, {
 			availability: "unavailable",
 			path: "Broken.png",
@@ -150,6 +164,7 @@ s.test("manifest entry parsers reject unsupported error codes", async () => {
 	let rejected = 0;
 	for (const lookup of [
 		() => recovery.lookupPathEntry("snapshot-1", "Broken.md"),
+		() => recovery.lookupPathEntry("snapshot-1", "Broken.canvas"),
 		() => recovery.lookupPathEntry("snapshot-1", "Broken.png"),
 		() => recovery.lookupDeletedEntry("snapshot-1", "body-1"),
 	]) {
@@ -159,7 +174,27 @@ s.test("manifest entry parsers reject unsupported error codes", async () => {
 			rejected++;
 		}
 	}
-	s.check(rejected === 3, "unknown manifest error codes fail closed across all entry kinds");
+	s.check(rejected === 4, "unknown manifest error codes fail closed across all entry kinds");
+});
+
+s.test("Canvas recovery entries retain identity and content integrity", async () => {
+	const bytes = new TextEncoder().encode(JSON.stringify({ nodes: [], edges: [] }));
+	const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+	const hash = [...digest].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+	const recovery = client(transport((url) => url.pathname.endsWith("/entry")
+		? response(200, { availability: "available", kind: "canvas", path: "Board.canvas",
+			documentId: "canvas-1", fileId: "file-canvas-1", format: "json-canvas", formatVersion: 1,
+			generation: 7, contentHash: hash, size: bytes.byteLength })
+		: response(200, null, bytes, { "x-yaos-content-sha256": hash, "x-yaos-content-size": String(bytes.byteLength) })));
+	const entry = await recovery.lookupPathEntry("snapshot-1", "Board.canvas");
+	s.check(entry?.availability === "available" && "kind" in entry && entry.kind === "canvas"
+		&& entry.documentId === "canvas-1" && entry.generation === 7, "Canvas manifest identity survives browse");
+	const item: Extract<RestoreItem, { kind: "canvas" }> = { kind: "canvas", itemId: "canvas-item",
+		path: "Board.canvas", sourceDocumentId: "canvas-1", sourceFileId: "file-canvas-1",
+		contentHash: hash, size: bytes.byteLength, contentUrl: "/content" };
+	const downloaded = await recovery.downloadRestoreItem(RESTORE_ID, item);
+	s.check(new TextDecoder().decode(downloaded) === new TextDecoder().decode(bytes),
+		"Canvas restore bytes are hash- and size-verified");
 });
 
 s.test("attachment descriptors are bounded and corrupt content fails closed", async () => {

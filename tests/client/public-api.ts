@@ -68,6 +68,13 @@ function state(path = "Notes/alpha.md", bodyId = "body-alpha"): YaosPublicSnapsh
 			pendingSettlements: 0,
 			preservedUnresolved: 0,
 			frontmatterQuarantined: 0,
+			semanticCanvases: 0,
+			residentCanvases: 0,
+			pendingCanvasOperations: 0,
+			invalidCanvases: 0,
+			oversizedCanvases: 0,
+			conflictCanvases: 0,
+			degradedCanvases: 0,
 		},
 	};
 }

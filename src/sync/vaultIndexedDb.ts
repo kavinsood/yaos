@@ -35,6 +35,53 @@ export interface StoredBodyReceipt {
 	runtimeEpoch: string;
 }
 
+export interface StoredCanvasCandidate {
+	candidateId: string;
+	documentId: string;
+	candidateDigest: string;
+	encodedUpdate: ArrayBuffer;
+	capturedAt: number;
+	createPath?: string;
+	operationId?: string;
+	operationDigest?: string;
+	attempts: number;
+	lastAttemptAt: number | null;
+}
+
+export interface StoredCanvasSettlement {
+	format: 1;
+	documentId: string;
+	vaultGeneration: string;
+	canonicalContent: ArrayBuffer;
+	contentHash: string;
+	durableGeneration: number;
+	serverContentHash: string;
+	diskFingerprint: { bytes: number; hash: string };
+	pathAtSettlement: string;
+	localSettlementRevision: number;
+	settledAt: number;
+}
+
+interface StoredCanvasOperationBase {
+	operationId: string;
+	requestDigest: string;
+	documentId: string;
+	createdAt: number;
+	attempts: number;
+	lastAttemptAt: number | null;
+}
+
+export type StoredCanvasLifecycle = StoredCanvasOperationBase & (
+	| { kind: "rename"; fromPath: string; toPath: string }
+	| { kind: "delete" }
+	| { kind: "revive"; path: string }
+	| { kind: "promote"; path: string; sourceRevision: string; sourceHash: string; sourceSize: number;
+		contentHash: string; contentSize: number; candidateDigest: string; encodedUpdateBase64: string;
+		sourceBytesBase64: string }
+	| { kind: "demote"; path: string; expectedGeneration: number; expectedContentHash: string;
+		expectedSize: number; blobHash: string; blobSize: number; mime: string; semanticBytesBase64: string }
+);
+
 export type LifecycleOperationKind = "create" | "rename" | "delete" | "revive";
 
 export interface StoredLifecycleOperation {
@@ -128,7 +175,7 @@ export function assertResetAllowed(
 }
 
 
-const DATABASE_VERSION = 5;
+const DATABASE_VERSION = 7;
 const DOCUMENTS = "documents";
 const CANDIDATES = "pendingCandidates";
 const LIFECYCLE = "lifecycleOperations";
@@ -140,7 +187,10 @@ const PATHS = "paths";
 const RECOVERY_STATE = "recoveryState";
 const ATTACHMENT_SEQUENCE = "attachmentSequence";
 const BODY_SETTLEMENTS = "bodySettlements";
-const SCHEMA_7_DATABASE_SUFFIX = ":schema-7";
+const CANVAS_CANDIDATES = "canvasCandidates";
+const CANVAS_SETTLEMENTS = "canvasSettlements";
+const CANVAS_LIFECYCLE = "canvasLifecycle";
+const SCHEMA_8_DATABASE_SUFFIX = ":schema-8";
 
 function transactionDone(transaction: IDBTransaction): Promise<void> {
 	return new Promise((resolve, reject) => {
@@ -162,16 +212,16 @@ function requestValue<T>(request: IDBRequest<T>): Promise<T> {
  */
 export function schema7VaultIdbName(vaultId: string, vaultGeneration: string, folderKey: string): string {
 	if (!vaultId.trim() || !vaultGeneration.trim() || !folderKey.trim()) {
-		throw new Error("vault ID, generation, and folder key are required for schema-7 storage");
+		throw new Error("vault ID, generation, and folder key are required for schema-8 storage");
 	}
-	return `${vaultIdbName(`${vaultId}:${vaultGeneration}`, folderKey)}${SCHEMA_7_DATABASE_SUFFIX}`;
+	return `${vaultIdbName(`${vaultId}:${vaultGeneration}`, folderKey)}${SCHEMA_8_DATABASE_SUFFIX}`;
 }
 
 /** Compatibility alias for callers which only need deterministic namespace construction. */
 export const schema6VaultIdbName = schema7VaultIdbName;
 
 
-/** One fresh schema-7 database per enrolled vault generation, authority, and local folder. */
+/** One fresh schema-8 database per enrolled vault generation, authority, and local folder. */
 export class VaultIndexedDb {
 	private readonly database: Promise<IDBDatabase>;
 	private readonly databaseName: string;
@@ -204,6 +254,11 @@ export class VaultIndexedDb {
 				}
 				if (event.oldVersion < 4) db.createObjectStore(ATTACHMENT_SEQUENCE);
 				if (event.oldVersion < 5) db.createObjectStore(BODY_SETTLEMENTS, { keyPath: "bodyId" });
+				if (event.oldVersion < 6) {
+					db.createObjectStore(CANVAS_CANDIDATES, { keyPath: "candidateId" });
+					db.createObjectStore(CANVAS_SETTLEMENTS, { keyPath: "documentId" });
+				}
+				if (event.oldVersion < 7) db.createObjectStore(CANVAS_LIFECYCLE, { keyPath: "operationId" });
 			};
 			request.onsuccess = () => resolve(request.result);
 			request.onerror = () => reject(request.error ?? new Error(`Failed to open ${this.databaseName}`));
@@ -230,6 +285,70 @@ export class VaultIndexedDb {
 		const transaction = db.transaction(DOCUMENTS, "readwrite");
 		transaction.objectStore(DOCUMENTS).delete(documentId);
 		await transactionDone(transaction);
+	}
+
+	async putCanvasCandidate(candidate: StoredCanvasCandidate): Promise<void> {
+		const db = await this.database;
+		const transaction = db.transaction(CANVAS_CANDIDATES, "readwrite");
+		transaction.objectStore(CANVAS_CANDIDATES).put({ ...candidate, encodedUpdate: candidate.encodedUpdate.slice(0) });
+		await transactionDone(transaction);
+	}
+
+	async listCanvasCandidates(): Promise<StoredCanvasCandidate[]> {
+		const db = await this.database;
+		const transaction = db.transaction(CANVAS_CANDIDATES, "readonly");
+		const values = await requestValue(transaction.objectStore(CANVAS_CANDIDATES).getAll()) as StoredCanvasCandidate[];
+		await transactionDone(transaction);
+		return values.map((value) => ({ ...value, encodedUpdate: value.encodedUpdate.slice(0) }));
+	}
+
+	async deleteCanvasCandidate(candidateId: string): Promise<void> {
+		const db = await this.database;
+		const transaction = db.transaction(CANVAS_CANDIDATES, "readwrite");
+		transaction.objectStore(CANVAS_CANDIDATES).delete(candidateId);
+		await transactionDone(transaction);
+	}
+
+	async putCanvasLifecycle(operation: StoredCanvasLifecycle): Promise<void> {
+		const db = await this.database;
+		const transaction = db.transaction(CANVAS_LIFECYCLE, "readwrite");
+		transaction.objectStore(CANVAS_LIFECYCLE).put(structuredClone(operation));
+		await transactionDone(transaction);
+	}
+
+	async listCanvasLifecycle(): Promise<StoredCanvasLifecycle[]> {
+		const db = await this.database;
+		const transaction = db.transaction(CANVAS_LIFECYCLE, "readonly");
+		const values = await requestValue(transaction.objectStore(CANVAS_LIFECYCLE).getAll()) as StoredCanvasLifecycle[];
+		await transactionDone(transaction);
+		return values.map((value) => structuredClone(value));
+	}
+
+	async deleteCanvasLifecycle(operationId: string): Promise<void> {
+		const db = await this.database;
+		const transaction = db.transaction(CANVAS_LIFECYCLE, "readwrite");
+		transaction.objectStore(CANVAS_LIFECYCLE).delete(operationId);
+		await transactionDone(transaction);
+	}
+
+	async getCanvasSettlement(documentId: string): Promise<StoredCanvasSettlement | null> {
+		const db = await this.database;
+		const transaction = db.transaction(CANVAS_SETTLEMENTS, "readonly");
+		const value = await requestValue(transaction.objectStore(CANVAS_SETTLEMENTS).get(documentId)) as StoredCanvasSettlement | undefined;
+		await transactionDone(transaction);
+		return value ? { ...value, canonicalContent: value.canonicalContent.slice(0) } : null;
+	}
+
+	async putCanvasSettlement(settlement: StoredCanvasSettlement, expectedRevision: number | null): Promise<boolean> {
+		const db = await this.database;
+		const transaction = db.transaction(CANVAS_SETTLEMENTS, "readwrite");
+		const store = transaction.objectStore(CANVAS_SETTLEMENTS);
+		const current = await requestValue(store.get(settlement.documentId)) as StoredCanvasSettlement | undefined;
+		const currentRevision = current?.localSettlementRevision ?? null;
+		if (currentRevision !== expectedRevision) { transaction.abort(); return false; }
+		store.put({ ...settlement, canonicalContent: settlement.canonicalContent.slice(0) });
+		await transactionDone(transaction);
+		return true;
 	}
 
 	async getBodySettlement(bodyId: string): Promise<StoredBodySettlement | null> {
@@ -586,7 +705,8 @@ export class VaultIndexedDb {
 	async getPendingWorkSummary(): Promise<PendingWorkSummary> {
 		const db = await this.database;
 		const transaction = db.transaction(
-			[DOCUMENTS, CANDIDATES, LIFECYCLE, ATTACHMENT_OPERATIONS, OUTSTANDING, RECOVERY_STATE],
+			[DOCUMENTS, CANDIDATES, LIFECYCLE, ATTACHMENT_OPERATIONS, OUTSTANDING, RECOVERY_STATE,
+				CANVAS_CANDIDATES, CANVAS_LIFECYCLE],
 			"readonly",
 		);
 		const summary = await this.readPendingWorkSummary(transaction);
@@ -617,6 +737,9 @@ export class VaultIndexedDb {
 			PATHS,
 			RECOVERY_STATE,
 			BODY_SETTLEMENTS,
+			CANVAS_CANDIDATES,
+			CANVAS_SETTLEMENTS,
+			CANVAS_LIFECYCLE,
 		];
 		const transaction = db.transaction(stores, "readwrite");
 		const summary = await this.readPendingWorkSummary(transaction);
@@ -688,8 +811,10 @@ export class VaultIndexedDb {
 			recoveryState,
 		] = await Promise.all([
 			requestValue(transaction.objectStore(DOCUMENTS).getAll()) as Promise<StoredDocument[]>,
-			requestValue(transaction.objectStore(CANDIDATES).count()),
-			requestValue(transaction.objectStore(LIFECYCLE).count()),
+			Promise.all([requestValue(transaction.objectStore(CANDIDATES).count()),
+				requestValue(transaction.objectStore(CANVAS_CANDIDATES).count())]).then(([body, canvas]) => body + canvas),
+			Promise.all([requestValue(transaction.objectStore(LIFECYCLE).count()),
+				requestValue(transaction.objectStore(CANVAS_LIFECYCLE).count())]).then(([body, canvas]) => body + canvas),
 			requestValue(transaction.objectStore(ATTACHMENT_OPERATIONS).count()),
 			requestValue(transaction.objectStore(OUTSTANDING).count()),
 			requestValue<unknown>(transaction.objectStore(RECOVERY_STATE).get("state")),

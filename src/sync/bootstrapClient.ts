@@ -13,6 +13,7 @@ import { canonicalMarkdownBytes, canonicalizeMarkdown } from "@shared/markdownCo
 import type { BodySettlementRepository, DiskSettlementFingerprint } from "./bodySettlement";
 import { splitMarkdownComponents } from "./frontmatterBoundary";
 import { decodeBinaryEnvelope, YAOS_BINARY_CONTENT_TYPE } from "@shared/binaryEnvelope";
+import type { CanvasManager } from "./canvas/canvasManager";
 
 export interface BootstrapHttpRequest {
 	url: string;
@@ -34,6 +35,7 @@ export type BootstrapHttpRequester = (
 ) => Promise<BootstrapHttpResponse>;
 
 export interface ClientBootstrapDescriptor {
+	format?: "yaos-bootstrap-v2";
 	bootstrapId: string;
 	createdAt: string;
 	expiresAt: string;
@@ -45,6 +47,7 @@ export interface ClientBootstrapDescriptor {
 	};
 	catalog: {
 		activeBodyCount: number;
+		activeSemanticCount?: number;
 		pageSize: number;
 		firstCursor: string | null;
 		feedFloor: number;
@@ -72,6 +75,19 @@ export interface ClientBodyState {
 	generation: number;
 	encodedState: Uint8Array;
 }
+export interface ClientSemanticCatalogEntry {
+	documentId: string;
+	fileId: string;
+	kind: "canvas";
+	format: "json-canvas";
+	formatVersion: 1;
+	path: string;
+	generation: number;
+	contentHash: string;
+	size: number;
+}
+export interface ClientSemanticCatalogPage { entries: ClientSemanticCatalogEntry[]; nextCursor: string | null }
+export interface ClientSemanticState { documentId: string; generation: number; encodedState: Uint8Array }
 
 export interface ClientCatchUpBody {
 	head: ClientCatalogEntry & { lifecycle: "active" | "tombstoned" | "reaped" };
@@ -84,12 +100,15 @@ export interface ClientFeedEntry {
 	generation: number;
 	kind: string;
 	catalogs?: Array<ClientCatalogEntry & { lifecycle: "active" | "tombstoned" | "reaped" }>;
+	semanticCatalogs?: Array<ClientSemanticCatalogEntry & { lifecycle: "active" | "tombstoned" | "reaped" }>;
 }
 export interface BootstrapServerPort {
 	start(attemptId?: string): Promise<ClientBootstrapDescriptor>;
 	root(bootstrapId: string): Promise<Uint8Array>;
 	catalog(bootstrapId: string, cursor: string | null, limit: number): Promise<ClientCatalogPage>;
 	body(bootstrapId: string, bodyId: string): Promise<ClientBodyState>;
+	semanticCatalog?(bootstrapId: string, cursor: string | null, limit: number): Promise<ClientSemanticCatalogPage>;
+	semantic?(bootstrapId: string, documentId: string): Promise<ClientSemanticState>;
 	renew(bootstrapId: string, settledBodies: number): Promise<void>;
 	bodies(bootstrapId: string, bodyIds: string[]): Promise<Map<string, ClientBodyState>>;
 	complete(bootstrapId: string): Promise<{ currentHighWater: number }>;
@@ -184,6 +203,7 @@ export interface CoalescedFeedPage {
 	throughSequence: number;
 	catalogs: Array<ClientCatalogEntry & { lifecycle: "active" | "tombstoned" | "reaped" }>;
 	bodyGenerations: Map<string, { generation: number; kind: string }>;
+	semanticCatalogs: Array<ClientSemanticCatalogEntry & { lifecycle: "active" | "tombstoned" | "reaped" }>;
 }
 
 /**
@@ -200,14 +220,17 @@ export function coalesceFeedPage(
 		ClientCatalogEntry & { lifecycle: "active" | "tombstoned" | "reaped" }
 	>();
 	const bodyGenerations = new Map<string, { generation: number; kind: string }>();
+	const semanticCatalogs = new Map<string, ClientSemanticCatalogEntry & { lifecycle: "active" | "tombstoned" | "reaped" }>();
 	for (const entry of entries) {
 		throughSequence = Math.max(throughSequence, entry.sequence);
 		for (const catalog of entry.catalogs ?? []) {
 			catalogs.set(catalog.bodyId, catalog);
 			bodyGenerations.delete(catalog.bodyId);
 		}
+		for (const catalog of entry.semanticCatalogs ?? []) semanticCatalogs.set(catalog.documentId, catalog);
 		if (
 			entry.documentId !== "root"
+			&& !entry.kind.startsWith("semantic")
 			&& (entry.catalogs?.length ?? 0) === 0
 			&& !catalogs.has(entry.documentId)
 		) {
@@ -224,6 +247,7 @@ export function coalesceFeedPage(
 		throughSequence,
 		catalogs: [...catalogs.values()],
 		bodyGenerations,
+		semanticCatalogs: [...semanticCatalogs.values()],
 	};
 }
 
@@ -308,6 +332,19 @@ export class BootstrapHttpPort implements BootstrapServerPort {
 		return this.json<ClientCatalogPage>(
 			`bootstrap/${encodeURIComponent(bootstrapId)}/catalog?${query}`,
 		);
+	}
+
+	async semanticCatalog(bootstrapId: string, cursor: string | null, limit: number): Promise<ClientSemanticCatalogPage> {
+		const query = new URLSearchParams({ limit: String(limit) });
+		if (cursor !== null) query.set("cursor", cursor);
+		return this.json(`bootstrap/${encodeURIComponent(bootstrapId)}/semantic-catalog?${query}`);
+	}
+
+	async semantic(bootstrapId: string, documentId: string): Promise<ClientSemanticState> {
+		const response = await this.raw(`bootstrap/${encodeURIComponent(bootstrapId)}/semantic/${encodeURIComponent(documentId)}`);
+		const returned = response.headers["x-yaos-document-id"] ?? response.headers["X-Yaos-Document-Id"];
+		if (returned !== documentId) throw new Error("semantic bootstrap identity mismatch");
+		return { documentId, generation: this.generationHeader(response.headers), encodedState: new Uint8Array(response.arrayBuffer) };
 	}
 
 	async body(bootstrapId: string, bodyId: string): Promise<ClientBodyState> {
@@ -580,6 +617,23 @@ export async function prepareBootstrapRoot(
 		dirty: false,
 		updatedAt: now(),
 	});
+	if ((descriptor.catalog.activeSemanticCount ?? 0) > 0 && server.semanticCatalog && server.semantic) {
+		let semanticCursor: string | null = null;
+		do {
+			const page = await server.semanticCatalog(descriptor.bootstrapId, semanticCursor, PAGE_SIZE);
+			await runBounded(page.entries, 4, async (entry) => {
+				if (entry.kind !== "canvas" || entry.format !== "json-canvas" || entry.formatVersion !== 1
+					|| !entry.documentId || !entry.path || !Number.isSafeInteger(entry.generation) || entry.generation < 1) {
+					throw new Error("invalid semantic bootstrap catalog entry");
+				}
+				const state = await server.semantic!(descriptor.bootstrapId, entry.documentId);
+				if (state.generation < entry.generation) throw new Error("stale semantic bootstrap state");
+				await database.putDocument({ documentId: entry.documentId, generation: state.generation,
+					encodedState: exactArrayBuffer(state.encodedState), dirty: false, updatedAt: now() });
+			});
+			semanticCursor = page.nextCursor;
+		} while (semanticCursor !== null);
+	}
 	const progress: StoredBootstrapProgress = {
 		bootstrapId: descriptor.bootstrapId,
 		highWater: descriptor.catalog.highWater,
@@ -597,6 +651,7 @@ export async function prepareBootstrapRoot(
 export class BootstrapClient {
 	private readonly bodySettlementWork = new Map<string, Promise<void>>();
 	private settlements: BodySettlementRepository | null = null;
+	private canvases: CanvasManager | null = null;
 	constructor(
 		private readonly server: BootstrapServerPort,
 		private readonly database: BootstrapDatabasePort,
@@ -610,6 +665,8 @@ export class BootstrapClient {
 	configureSettlements(settlements: BodySettlementRepository): void {
 		this.settlements = settlements;
 	}
+
+	configureCanvases(canvases: CanvasManager): void { this.canvases = canvases; }
 
 	async run(attemptId?: string): Promise<StoredBootstrapProgress> {
 		let progress = await this.database.getBootstrapProgress();
@@ -720,6 +777,7 @@ export class BootstrapClient {
 			}
 			try {
 				await this.applyCatalogEvents(progress, coalesced.catalogs);
+				if (coalesced.semanticCatalogs.length > 0) await this.canvases?.applyCatalogEvents(coalesced.semanticCatalogs);
 			} catch (error) {
 				for (const catalog of coalesced.catalogs) {
 					await this.database.putOutstanding({

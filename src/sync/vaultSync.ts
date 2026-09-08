@@ -34,9 +34,9 @@ import type {
 import { obsidianRequest, type HttpRequester } from "../utils/http";
 import { patchTicketInUrl, SocketTicketHttpError, TICKET_REFRESH_BUFFER_MS, type SocketTicketScope } from "./socketTicket";
 import { PROTOCOL_VERSION, SCHEMA_VERSION } from "./schema";
-import type { AttachmentHead, BlobMeta, BlobRef, BlobTombstone } from "../types";
+import type { AttachmentHead, BlobMeta, BlobRef, BlobTombstone, SemanticPathRef } from "../types";
 import { applyDiffToYText, tryApplyDiffToYText } from "./diff";
-import { safeBlobPath, safeMarkdownPath } from "./pathPolicy";
+import { safeBlobPath, safeCanvasPath, safeMarkdownPath } from "./pathPolicy";
 import { ORIGIN_DISK_COMMIT } from "./origins";
 
 import { PRODUCT_EVENT_KIND } from "../observability/productEventKinds";
@@ -67,6 +67,8 @@ import {
 } from "../runtime/socketLivenessCoordinator";
 import { fencedWebSocketConstructor, type NativeSocketClose } from "./fencedWebSocket";
 import { sameAuthorityIdentity, type VaultAuthorityIdentity } from "../collaboration/authority";
+import { CanvasManager, type CanvasPersistencePort, type CanvasProjectionPort } from "./canvas/canvasManager";
+import { CanvasHttpTransport } from "./canvas/canvasTransport";
 export const ROOT_DOCUMENT_ID = "root";
 
 export interface SyncAwarenessPort {
@@ -458,7 +460,7 @@ export interface VaultServerPort {
 }
 
 export interface ProviderFactoryInput {
-	kind: "root" | "body";
+	kind: "root" | "body" | "semantic";
 	documentId: string;
 	doc: Y.Doc;
 	onClose: (event: NativeSocketClose) => void;
@@ -491,6 +493,7 @@ export interface VaultSyncOptions {
 	host: string;
 	token: string;
 	database: VaultDatabasePort;
+	canvasProjection?: CanvasProjectionPort;
 	server?: VaultServerPort;
 	providerFactory?: ProviderFactory;
 	getSocketTicket?: (scope: SocketTicketScope, force?: boolean) => Promise<SocketTicketResult | null>;
@@ -729,6 +732,14 @@ function asBodyCommittedNotification(payload: string): BodyCommittedNotification
 		...(record.contentHash === undefined ? {} : { contentHash: record.contentHash }),
 		...(record.size === undefined ? {} : { size: record.size as number | null }),
 	};
+}
+
+function semanticCommittedDocumentId(payload: string): string | null {
+	try {
+		const value = JSON.parse(payload) as Record<string, unknown>;
+		return value.type === "SEMANTIC_COMMITTED" && value.kind === "canvas"
+			&& typeof value.documentId === "string" ? value.documentId : null;
+	} catch { return null; }
 }
 async function sha256Hex(bytes: Uint8Array): Promise<string> {
 	const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
@@ -1020,10 +1031,12 @@ export class VaultSync implements SyncRuntimePort {
 	readonly ydoc = new Y.Doc({ guid: ROOT_DOCUMENT_ID });
 	readonly pathToId = this.ydoc.getMap<string>("pathToId");
 	readonly pathToBlob = this.ydoc.getMap<BlobRef>("pathToBlob");
+	readonly pathToSemantic = this.ydoc.getMap<SemanticPathRef>("pathToSemantic");
 	readonly blobMeta = this.ydoc.getMap<BlobMeta>("blobMeta");
 	readonly blobTombstones = this.ydoc.getMap<BlobTombstone & { previousHash?: string | null }>("blobTombstones");
 	readonly meta = this.ydoc.getMap<unknown>("meta");
 	readonly bodies: BodyManager;
+	readonly canvases: CanvasManager | null;
 	readonly provider: SyncProviderPort;
 	readonly deviceId: string;
 
@@ -1106,6 +1119,37 @@ export class VaultSync implements SyncRuntimePort {
 			options.token,
 			options.request,
 		);
+		const factory = options.providerFactory ?? ((input: ProviderFactoryInput) => this.createDefaultProvider(input));
+		const canvasDatabase = this.canvasPersistence(options.database);
+		this.canvases = canvasDatabase && options.canvasProjection ? new CanvasManager(
+			options.vaultGeneration,
+			canvasDatabase,
+			new CanvasHttpTransport(options.host, options.vaultId, options.token, options.request),
+			options.canvasProjection,
+			options.now,
+			32,
+			(documentId, doc) => factory({ kind: "semantic", documentId, doc,
+				onClose: (event) => this.handleNativeSocketClose(event) }),
+			{
+				created: (documentId, provider) => {
+					this.registerSocketLiveness(documentId, provider, () => this.canvases?.reconnectLive(documentId));
+					provider.on("custom-message", (payload) => this.handleVaultControl(payload, documentId, provider));
+					provider.on("status", ({ status }) => {
+						if (status === "connected") {
+							this.invalidateSocketSession(provider);
+							this.socketLiveness.connected(documentId);
+						} else if (status === "disconnected") {
+							this.invalidateSocketSession(provider);
+							this.socketLiveness.disconnected(documentId);
+						}
+					});
+				},
+				destroyed: (documentId, provider) => {
+					this.socketLiveness.unregister(documentId);
+					this.invalidateSocketSession(provider);
+				},
+			},
+		) : null;
 		this.bodies = new BodyManager(
 			options.database,
 			options.now,
@@ -1133,7 +1177,6 @@ export class VaultSync implements SyncRuntimePort {
 			prepare: (reservation) => this.prepareResidencyReservation(reservation),
 			onBackpressure: (bodyId, reason) => this.log(`body admission backpressured for ${bodyId}: ${reason}`),
 		});
-		const factory = options.providerFactory ?? ((input) => this.createDefaultProvider(input));
 		this.provider = factory({ kind: "root", documentId: ROOT_DOCUMENT_ID, doc: this.ydoc,
 			onClose: (event) => this.handleNativeSocketClose(event) });
 		this.socketAdmission = new SocketAdmissionCoordinator({
@@ -1170,6 +1213,19 @@ export class VaultSync implements SyncRuntimePort {
 		this.wireRootProvider();
 	}
 
+	private canvasPersistence(database: VaultDatabasePort): CanvasPersistencePort | null {
+		const candidate = database as VaultDatabasePort & Partial<CanvasPersistencePort>;
+		return typeof candidate.putCanvasCandidate === "function"
+			&& typeof candidate.listCanvasCandidates === "function"
+			&& typeof candidate.deleteCanvasCandidate === "function"
+			&& typeof candidate.putCanvasLifecycle === "function"
+			&& typeof candidate.listCanvasLifecycle === "function"
+			&& typeof candidate.deleteCanvasLifecycle === "function"
+			&& typeof candidate.getCanvasSettlement === "function"
+			&& typeof candidate.putCanvasSettlement === "function"
+			? candidate as CanvasPersistencePort : null;
+	}
+
 	get localReady(): boolean { return this._localReady; }
 	get connected(): boolean {
 		const root = this.socketLiveness.snapshot().find((entry) => entry.id === ROOT_DOCUMENT_ID);
@@ -1192,6 +1248,7 @@ export class VaultSync implements SyncRuntimePort {
 		return this.socketLiveness.snapshot().find((entry) => entry.id === ROOT_DOCUMENT_ID)?.lastAcknowledgedAt ?? null;
 	}
 	getSocketLivenessSnapshot(): readonly SocketLivenessSnapshot[] { return this.socketLiveness.snapshot(); }
+	getCanvasStats(): ReturnType<CanvasManager["stats"]> | null { return this.canvases?.stats() ?? null; }
 	get hasPendingLocalWork(): boolean {
 		const bodyStats = this.bodies.stats();
 		return (
@@ -1303,6 +1360,7 @@ export class VaultSync implements SyncRuntimePort {
 		if (root && this.ydoc.getMap("sys").get("schemaVersion") !== SCHEMA_VERSION) {
 			throw new Error(`local root cache is not schema ${SCHEMA_VERSION}`);
 		}
+		await this.canvases?.initialize(this.pathToSemantic.entries());
 		await this.restoreCandidates();
 		await this.retryLifecycleOperations();
 		await this.restoreAttachmentOperations();
@@ -2940,6 +2998,7 @@ export class VaultSync implements SyncRuntimePort {
 		const outcome = await this.socketAdmission.request(reason);
 		this.applyTerminalAdmissionOutcome(outcome);
 		if (outcome.kind === "completed") {
+			this.canvases?.resumeLiveProviders();
 			for (const session of this.sessions.values()) {
 				if (session.consumers.size === 0
 					|| (session.provider.wsconnected && session.provider.ws?.readyState === 1)) continue;
@@ -2951,6 +3010,10 @@ export class VaultSync implements SyncRuntimePort {
 						return { kind: "retryable_failure", failure: "network" };
 					}
 				}
+			}
+			for (const { documentId, provider } of this.canvases?.activeProviders() ?? []) {
+				if (provider.wsconnected || provider.wsconnecting) continue;
+				this.canvases?.reconnectLive(documentId);
 			}
 		}
 		return outcome;
@@ -3081,6 +3144,7 @@ export class VaultSync implements SyncRuntimePort {
 		if (!drain.completed) {
 			this.log(`runtime drain incomplete: work=${drain.unfinishedWork.join(",")} leases=${drain.activeLeases.join(",")}`);
 		}
+		this.canvases?.destroy();
 		await this.options.database.close();
 	}
 
@@ -3090,6 +3154,7 @@ export class VaultSync implements SyncRuntimePort {
 		this._fatalAuthDetails = details;
 		this.provider.disconnect();
 		for (const session of this.sessions.values()) session.provider.disconnect();
+		this.canvases?.pauseLiveProviders();
 		for (const callback of this.fatalAuthListeners) callback();
 	}
 
@@ -3105,7 +3170,10 @@ export class VaultSync implements SyncRuntimePort {
 	private wireRootProvider(): void {
 		this.bodies.coordinator.replacePathBindings(this.pathToId.entries());
 		this.ydoc.on("afterTransaction", () => {
-			if (!this.destroyed) this.bodies.coordinator.replacePathBindings(this.pathToId.entries());
+			if (!this.destroyed) {
+				this.bodies.coordinator.replacePathBindings(this.pathToId.entries());
+				this.canvases?.replaceCatalog(this.pathToSemantic.entries());
+			}
 		});
 		this.provider.on("status", ({ status }) => {
 			if (status === "connected") {
@@ -3147,6 +3215,10 @@ export class VaultSync implements SyncRuntimePort {
 				&& committed.runtimeEpoch === session.runtimeEpoch) {
 				void this.handleDurableBodyCommitted(committed);
 			}
+			const semanticDocumentId = semanticCommittedDocumentId(payload);
+			if (semanticDocumentId) void this.canvases?.refresh(semanticDocumentId).catch((error) => {
+				this.log(`Canvas refresh failed for ${semanticDocumentId}: ${String(error)}`);
+			});
 		};
 		this.provider.on("custom-message", handleRootControl);
 		this.ydoc.on("update", (_update, origin) => {
@@ -3915,7 +3987,7 @@ export class VaultSync implements SyncRuntimePort {
 		this.socketLiveness.probeNow(reason);
 	}
 
-	private registerSocketLiveness(documentId: string, provider: SyncProviderPort): void {
+	private registerSocketLiveness(documentId: string, provider: SyncProviderPort, recover?: () => void): void {
 		this.socketLiveness.register({
 			id: documentId,
 			documentId,
@@ -3928,9 +4000,13 @@ export class VaultSync implements SyncRuntimePort {
 			onFailure: (reason) => {
 				this.log(`socket liveness failed for ${documentId}: ${reason}`);
 				if (documentId === ROOT_DOCUMENT_ID) {
+					this.canvases?.pauseLiveProviders();
 					this.forceAbortProvider(ROOT_DOCUMENT_ID, this.provider);
 					for (const session of this.sessions.values()) {
 						this.forceAbortProvider(session.bodyId, session.provider);
+					}
+					for (const semantic of this.canvases?.activeProviders() ?? []) {
+						this.forceAbortProvider(semantic.documentId, semantic.provider);
 					}
 					this.refreshResidencyObservations();
 					this.requestReconnect(`socket-liveness:${documentId}:${reason}`);
@@ -3938,6 +4014,10 @@ export class VaultSync implements SyncRuntimePort {
 				}
 				this.forceAbortProvider(documentId, provider);
 				this.refreshResidencyObservations();
+				if (recover) {
+					recover();
+					return;
+				}
 				const session = this.sessions.get(documentId);
 				if (!session || session.provider !== provider || session.consumers.size === 0) return;
 				void this.reconnectBodySession(session).catch((error) => {
@@ -4581,10 +4661,16 @@ export class VaultSync implements SyncRuntimePort {
 
 	private invalidRootPath(): string | null {
 		for (const [path, bodyId] of this.pathToId) {
-			if (safeMarkdownPath(path) !== path || !bodyId) return path;
+			if (safeMarkdownPath(path) !== path || !bodyId || this.pathToBlob.has(path) || this.pathToSemantic.has(path)) return path;
 		}
 		for (const [path, ref] of this.pathToBlob) {
-			if (safeBlobPath(path, [], "", ref) !== path) return path;
+			if (safeBlobPath(path, [], "", ref) !== path || this.pathToSemantic.has(path)) return path;
+		}
+		const semanticIds = new Set<string>();
+		for (const [path, ref] of this.pathToSemantic) {
+			if (safeCanvasPath(path) !== path || ref.kind !== "canvas" || ref.format !== "json-canvas"
+				|| ref.formatVersion !== 1 || !ref.documentId || semanticIds.has(ref.documentId)) return path;
+			semanticIds.add(ref.documentId);
 		}
 		for (const path of this.blobTombstones.keys()) {
 			if (safeBlobPath(path) !== path) return path;
@@ -4709,7 +4795,9 @@ export class VaultSync implements SyncRuntimePort {
 	private createDefaultProvider(input: ProviderFactoryInput): SyncProviderPort {
 		const prefix = input.kind === "root"
 			? `/vault/${encodeURIComponent(this.options.vaultId)}/ws/root`
-			: `/vault/${encodeURIComponent(this.options.vaultId)}/ws/body/${encodeURIComponent(input.documentId)}`;
+			: input.kind === "body"
+				? `/vault/${encodeURIComponent(this.options.vaultId)}/ws/body/${encodeURIComponent(input.documentId)}`
+				: `/vault/${encodeURIComponent(this.options.vaultId)}/ws/semantic/${encodeURIComponent(input.documentId)}`;
 		const baseWebSocket = this.options.webSocket ?? WebSocket;
 		const provider = new YSyncProvider(this.options.host, input.documentId, input.doc, {
 			prefix,
@@ -4731,7 +4819,7 @@ export class VaultSync implements SyncRuntimePort {
 			},
 			awareness: input.kind === "root" ? undefined : new (this.providerAwarenessConstructor())(input.doc),
 		});
-		if (input.kind === "body") provider.awareness.setLocalState(null);
+		if (input.kind !== "root") provider.awareness.setLocalState(null);
 		return adaptProvider(provider);
 	}
 
