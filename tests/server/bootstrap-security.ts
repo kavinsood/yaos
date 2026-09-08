@@ -1,6 +1,7 @@
 import { strict as assert } from "node:assert";
 import * as Y from "yjs";
 import { BootstrapService } from "../../server/src/bootstrap";
+import { SCHEMA_VERSION } from "../../server/src/shared/productVersions";
 import { suite } from "../harness.ts";
 
 const s = suite("bootstrap-security");
@@ -53,8 +54,8 @@ function makeBootstrapStore() {
 		},
 		reconstructDocument: () => {
 			const doc = new Y.Doc({ guid: "root" });
-			doc.getMap("sys").set("schemaVersion", 8);
-			return { doc, generation: 3 };
+			doc.getMap("sys").set("schemaVersion", SCHEMA_VERSION);
+			return { doc, generation: 3, semanticEpoch: 4 };
 		},
 		getPin: () => pin(),
 		stageOperationArtifact: (id: string, key: string, hash: string) => {
@@ -64,6 +65,7 @@ function makeBootstrapStore() {
 			return operation;
 		},
 		countActiveCatalogAt: () => 0,
+		countActiveSemanticAt: () => 0,
 		journalFloor: () => 2,
 	};
 	return { store, begins: () => begins, stages: () => stages };
@@ -73,9 +75,10 @@ s.test("bootstrap root is captured in SQLite without an R2 dependency", async ()
 	const fixture = makeBootstrapStore();
 	const service = new BootstrapService(fixture.store as never, () => NOW);
 	const descriptor = await service.start("bootstrap-device-0001");
-	assert.equal(descriptor.schemaVersion, 8);
+	assert.equal(descriptor.schemaVersion, SCHEMA_VERSION);
 	assert.equal(descriptor.capture.vaultSequence, 7);
 	assert.equal(descriptor.capture.rootGeneration, 3);
+	assert.equal(descriptor.capture.rootEpoch, 4);
 	assert.equal(descriptor.capture.rootCheckpointKey, "sql:root:7");
 	assert.match(descriptor.capture.rootCheckpointHash, /^[a-f0-9]{64}$/);
 	assert.equal(fixture.stages(), 1);
@@ -93,6 +96,34 @@ s.test("invalid and unknown bootstrap IDs allocate no SQL operation", async () =
 	await assert.rejects(() => service.describe("unknown-bootstrap"), /bootstrap not found/);
 	assert.equal(fixture.begins(), 0);
 	assert.equal(fixture.stages(), 0);
+});
+
+s.test("Canvas bootstrap state holds transient headroom through reconstruction and encoding", async () => {
+	const fixture = makeBootstrapStore();
+	let activeReservations = 0;
+	let semanticDestroyed = false;
+	const store = {
+		...fixture.store,
+		semanticHeadAt: () => ({ lifecycle: "active" }),
+		reconstructDocument: (documentId: string) => {
+			const doc = new Y.Doc({ guid: documentId });
+			doc.getMap("rootFields").set("theme", "dark");
+			if (documentId === "canvas-bootstrap") doc.on("destroy", () => { semanticDestroyed = true; });
+			return { doc, generation: 3, semanticEpoch: 4 };
+		},
+	};
+	const service = new BootstrapService(store as never, () => NOW, (documentId, copies) => {
+		if (documentId !== "canvas-bootstrap") return () => {};
+		assert.equal(copies, 2);
+		activeReservations++;
+		return () => { activeReservations--; };
+	});
+	await service.start("bootstrap-device-0002");
+	const state = service.semanticState("bootstrap-device-0002", "canvas-bootstrap");
+	assert.ok(state.encodedState.byteLength > 0);
+	assert.equal(state.bodyEpoch, 4);
+	assert.equal(activeReservations, 0, "the semantic full-state reservation is released exactly once");
+	assert.equal(semanticDestroyed, true, "the reconstructed Canvas is destroyed after encoding");
 });
 
 await s.done();

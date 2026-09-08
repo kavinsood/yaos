@@ -490,9 +490,43 @@ export class EditorBindingManager {
 			this.healthWorkInFlight.delete(leafId);
 			this.cmToLeafId.delete(binding.cm);
 			binding.undoManager.destroy();
+			try {
+				binding.cm.dispatch({
+					effects: this.compartment.reconfigure([]),
+				});
+			} catch {
+				// View may already be destroyed
+			}
 			this.log(`unbindAll: destroyed binding for "${binding.path}"`);
 		}
 		this.bindings.clear();
+	}
+
+	/**
+	 * Fail closed across a semantic body reset. The CRDT document is about to
+	 * be destroyed, so every CodeMirror compartment using that exact file
+	 * identity must be cleared before best-effort rebinding begins.
+	 */
+	unbindByFileId(fileId: string): void {
+		for (const [leafId, binding] of Array.from(this.bindings)) {
+			if (binding.fileId !== fileId) continue;
+			this.cancelPendingBodyLoad(leafId);
+			this.releaseBodyLease(leafId);
+			this.clearScheduledHealthCheck(leafId);
+			this.clearCmResolveRetry(leafId);
+			this.healthWorkInFlight.delete(leafId);
+			binding.undoManager.destroy();
+			try {
+				binding.cm.dispatch({
+					effects: this.compartment.reconfigure([]),
+				});
+			} catch {
+				// View may already be destroyed
+			}
+			this.cmToLeafId.delete(binding.cm);
+			this.bindings.delete(leafId);
+			this.log(`unbindByFileId: unbound "${binding.path}" (leaf=${leafId}, file=${fileId})`);
+		}
 	}
 
 	/**

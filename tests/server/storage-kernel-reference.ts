@@ -31,11 +31,11 @@ const s = suite("storage-kernel-reference");
 s.section("Independent format pins");
 s.check(
 	SCHEMA_VERSION === 8
-		&& STORAGE_FORMAT_VERSION === 3
-		&& PROTOCOL_VERSION === 4
+		&& STORAGE_FORMAT_VERSION === 4
+		&& PROTOCOL_VERSION === 5
 		&& SNAPSHOT_FORMAT_VERSION === 3
 		&& SETTINGS_FORMAT_VERSION === 2,
-	"schema/storage/protocol/snapshot/settings formats remain independently pinned to 7/3/4/2/2",
+	"schema/storage/protocol/snapshot/settings formats remain independently pinned to 8/4/5/3/2",
 );
 
 function withVersion(component: keyof ProductVersions, version: number): ProductVersions {
@@ -107,7 +107,7 @@ const metadata: VaultMetadata = {
 	vaultId: "vault-reference-01",
 	vaultGeneration: "generation-reference-01",
 	schemaVersion: 8,
-	storageFormatVersion: 3,
+	storageFormatVersion: 4,
 	provisionedAt: 1,
 };
 const provisioning: VaultProvisioningResult = { ...metadata, created: true };
@@ -115,6 +115,7 @@ const receipt: DurableReceipt = {
 	vaultId: metadata.vaultId,
 	vaultGeneration: metadata.vaultGeneration,
 	bodyId: "body-reference-01",
+	bodyEpoch: 1,
 	clientId: "client-reference-01",
 	candidateId: "candidate-reference-01",
 	candidateDigest: "a".repeat(64),

@@ -25,6 +25,7 @@ export interface LifecycleRequest {
 	readonly kind: "create" | "delete" | "revive" | "rename";
 	readonly fileId: string;
 	readonly bodyId: string;
+	readonly bodyEpoch: number;
 	readonly path?: string;
 	readonly fromPath?: string;
 	readonly toPath?: string;
@@ -36,6 +37,7 @@ export interface LifecycleReceipt {
 	readonly vaultId: string;
 	readonly vaultGeneration: string;
 	readonly bodyId: string;
+	readonly bodyEpoch: number;
 	readonly fileId: string;
 	readonly operationId: string;
 	readonly kind: LifecycleRequest["kind"];
@@ -112,11 +114,15 @@ export async function socketTicket(
 	identity: DeviceIdentity,
 	purpose: "root" | "body" | "semantic" = "root",
 	documentId = purpose === "root" ? "root" : "",
+	documentEpoch?: number,
 ): Promise<{ ticket: string; expiresAt: number; ttlMs: number }> {
+	const epoch = documentEpoch ?? await currentDocumentEpoch(identity, purpose, documentId);
 	const { response, body } = await vaultJson(identity, "auth/ticket", {
 		method: "POST",
 		headers: { "content-type": "application/json" },
-		body: JSON.stringify({ purpose, documentId }),
+		body: JSON.stringify(purpose === "root"
+			? { purpose, documentId: "root", rootEpoch: epoch }
+			: { purpose, documentId, bodyEpoch: epoch }),
 	});
 	if (response.status !== 200 || typeof body?.ticket !== "string"
 		|| typeof body.expiresAt !== "number" || typeof body.ttlMs !== "number") {
@@ -124,6 +130,24 @@ export async function socketTicket(
 	}
 	pass("device bearer mints a bounded socket ticket");
 	return { ticket: body.ticket, expiresAt: body.expiresAt, ttlMs: body.ttlMs };
+}
+
+async function currentDocumentEpoch(
+	identity: DeviceIdentity,
+	purpose: "root" | "body" | "semantic",
+	documentId: string,
+): Promise<number> {
+	const suffix = purpose === "root"
+		? "root"
+		: purpose === "semantic"
+			? `semantic/${encodeURIComponent(documentId)}/state`
+			: `body/${encodeURIComponent(documentId)}`;
+	const response = await fetch(vaultUrl(identity, suffix), { headers: bearer(identity) });
+	if (!response.ok) throw new Error(`cannot read ${purpose}/${documentId} epoch (${response.status})`);
+	const raw = response.headers.get(purpose === "root" ? "x-yaos-root-epoch" : "x-yaos-body-epoch");
+	const epoch = Number(raw);
+	if (!Number.isSafeInteger(epoch) || epoch < 1) throw new Error(`invalid ${purpose}/${documentId} epoch`);
+	return epoch;
 }
 
 function socketPrefix(identity: DeviceIdentity, kind: "root" | "body" | "semantic", documentId: string): string {
@@ -140,10 +164,11 @@ export async function connectDocument(
 	documentId: string,
 	doc = new Y.Doc({ guid: documentId }),
 ): Promise<ConnectedDocument> {
+	const documentEpoch = await currentDocumentEpoch(identity, kind, documentId);
 	const provider = new YSyncProvider(identity.host, documentId, doc, {
 		prefix: socketPrefix(identity, kind, documentId),
 		params: async () => ({
-			ticket: (await socketTicket(identity, kind, documentId)).ticket,
+			ticket: (await socketTicket(identity, kind, documentId, documentEpoch)).ticket,
 			schemaVersion: String(SCHEMA_VERSION),
 			protocolVersion: String(PROTOCOL_VERSION),
 		}),
@@ -235,7 +260,8 @@ export function parseLifecycleReceipt(body: Record<string, unknown> | null): Lif
 		|| (body.lifecycle !== "active" && body.lifecycle !== "tombstoned")) throw new Error("invalid lifecycle receipt");
 	return {
 		vaultId: text(body.vaultId, "vaultId"), vaultGeneration: text(body.vaultGeneration, "vaultGeneration"),
-		bodyId: text(body.bodyId, "bodyId"), fileId: text(body.fileId, "fileId"), operationId: text(body.operationId, "operationId"),
+		bodyId: text(body.bodyId, "bodyId"), bodyEpoch: integer(body.bodyEpoch, "bodyEpoch"),
+		fileId: text(body.fileId, "fileId"), operationId: text(body.operationId, "operationId"),
 		kind: body.kind as LifecycleReceipt["kind"], lifecycle: body.lifecycle, path: text(body.path, "path"),
 		durableGeneration: integer(body.durableGeneration, "durableGeneration"), vaultSequence: integer(body.vaultSequence, "vaultSequence"),
 		runtimeEpoch: text(body.runtimeEpoch, "runtimeEpoch"),
@@ -252,6 +278,8 @@ export async function postLifecycle(identity: DeviceIdentity, request: Lifecycle
 export async function publishLifecycle(identity: DeviceIdentity, request: LifecycleRequest, receipt: LifecycleReceipt): Promise<JsonResult> {
 	const current = await fetch(vaultUrl(identity, "root"), { headers: bearer(identity) });
 	assert.equal(current.status, 200);
+	const rootEpoch = Number(current.headers.get("x-yaos-root-epoch"));
+	assert.ok(Number.isSafeInteger(rootEpoch) && rootEpoch >= 1);
 	const root = new Y.Doc({ guid: "root-publication" });
 	Y.applyUpdate(root, new Uint8Array(await current.arrayBuffer()));
 	const before = Y.encodeStateVector(root);
@@ -263,7 +291,7 @@ export async function publishLifecycle(identity: DeviceIdentity, request: Lifecy
 	root.destroy();
 	return vaultJson(identity, "lifecycle/publish", {
 		method: "POST", headers: { "content-type": YAOS_BINARY_CONTENT_TYPE },
-		body: encodeBinaryEnvelope({ operations: [{ ...request, vaultSequence: receipt.vaultSequence }], rootUpdate: update }),
+		body: encodeBinaryEnvelope({ operations: [{ ...request, vaultSequence: receipt.vaultSequence }], rootUpdate: update, rootEpoch }),
 	});
 }
 
@@ -274,12 +302,13 @@ export async function createBody(identity: DeviceIdentity, path: string, content
 	doc.destroy();
 	const candidateId = `candidate_${randomBytes(12).toString("hex")}`;
 	const candidateDigest = await sha256Hex(update);
-	const request: LifecycleRequest = { operationId: `create_${randomBytes(12).toString("hex")}`, kind: "create", fileId: bodyId, bodyId, path, candidateId, candidateDigest };
+	const request: LifecycleRequest = { operationId: `create_${randomBytes(12).toString("hex")}`, kind: "create",
+		fileId: bodyId, bodyId, bodyEpoch: 1, path, candidateId, candidateDigest };
 	const admission = await postLifecycle(identity, request);
 	assert.equal(admission.result.response.status, 200, `create lifecycle admits its named candidate fence: ${JSON.stringify(admission.result.body)}`);
 	assert.ok(admission.receipt);
 	const candidate = await fetch(vaultUrl(identity, `body/${encodeURIComponent(bodyId)}/candidate`), {
-		method: "POST", headers: bearer(identity, { "content-type": "application/octet-stream", "x-yaos-candidate-id": candidateId, "x-yaos-candidate-digest": candidateDigest }), body: update,
+		method: "POST", headers: bearer(identity, { "content-type": "application/octet-stream", "x-yaos-candidate-id": candidateId, "x-yaos-candidate-digest": candidateDigest, "x-yaos-body-epoch": "1" }), body: update,
 	});
 	assert.equal(candidate.status, 200, `candidate failed: ${await candidate.clone().text()}`);
 	const committed = await postLifecycle(identity, request);

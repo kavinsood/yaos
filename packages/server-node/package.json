@@ -2,7 +2,7 @@
 	"name": "@yaos/server-node",
 	"version": "2.1.0",
 	"private": true,
-	"description": "Production Node.js host for the YAOS schema-6 server",
+	"description": "Production Node.js host for the YAOS schema-8 server",
 	"type": "module",
 	"engines": {
 		"node": ">=24"

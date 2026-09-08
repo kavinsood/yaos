@@ -125,6 +125,7 @@ import {
 	ReconciliationController,
 } from "./runtime/reconciliationController";
 import { getFatalSyncNotice } from "./runtime/fatalSyncNotice";
+import { createMarkdownConflictArtifact } from "./runtime/reconcile/markdownConflictArtifact";
 import { AttachmentOrchestrator } from "./runtime/attachmentOrchestrator";
 import {
 	RuntimeTeardownCoordinator,
@@ -977,6 +978,23 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				onDurableBodyCommitted: () => this.scheduleSchema4CatchUp("body-committed"),
 				onProductEvent: (event) => this.recordFlightPathEvent(event),
 				onControlFrame: () => this.queueReceiptStatusRefresh(),
+				onSemanticEpochReset: ({ purpose, documentId }) => {
+					// Detach first: validation/rebinding is allowed to fail or retry, but
+					// no editor may remain connected to the Y.Doc retired by the reset.
+					if (purpose === "body") this.editorBindings?.unbindByFileId(documentId);
+					else this.editorBindings?.unbindAll();
+					this.editorWorkspace?.validateOpenBindings(`semantic-epoch-reset:${purpose}:${documentId}`);
+					this.scheduleSchema4CatchUp(`semantic-epoch-reset:${purpose}`);
+				},
+				onSemanticEpochRebaseConflict: async ({ path, pendingMarkdown, kind }) => {
+					const conflictPath = await createMarkdownConflictArtifact(this.app, path, pendingMarkdown, {
+						deviceName: this.settings.deviceName,
+						reason: `semantic-epoch-${kind}`,
+						source: "editor",
+						trace: (message, details) => this.trace("recovery", message, details),
+					});
+					new Notice(`YAOS preserved an offline edit as “${conflictPath}” before refreshing its sync history.`, 10_000);
+				},
 			});
 			this.vaultSync = runtime;
 			if (runtime.canvases) canvasProjection.attachManager(runtime.canvases);
@@ -1333,14 +1351,14 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				}
 			});
 
-			// Materialize the validated schema-7 root and every active body before
+			// Materialize the validated schema-8 root and every active body before
 			// admitting editor/disk events. Bootstrap progress and outstanding
 			// safety settlements are durable in the folder-scoped database.
 			this.updateStatusBar({ kind: "loading_cache" });
 			const bootstrap = this.bootstrapClient;
-			if (!bootstrap) throw new Error("schema-7 bootstrap client is unavailable");
+			if (!bootstrap) throw new Error("schema-8 bootstrap client is unavailable");
 			const bootstrapState = await bootstrap.run();
-			if (abortIfStale("schema-7 bootstrap")) return;
+			if (abortIfStale("schema-8 bootstrap")) return;
 			const outstanding = await database.listOutstanding();
 			this.bootstrapProgress = {
 				stage: bootstrapState.stage,
@@ -1360,7 +1378,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			}
 
 			await this.runReconciliation("authoritative");
-			if (abortIfStale("schema-7 admission")) return;
+			if (abortIfStale("schema-8 admission")) return;
 			this.reconciliationController.lastGeneration = runtime.connectionGeneration;
 			if (providerSynced) this.awaitingFirstProviderSyncAfterStartup = false;
 			if (this.settings.originImportPending) {
@@ -1932,7 +1950,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		new ConfirmModal(
 			this.app,
 			"Reset local cache",
-			"This clears this folder’s schema-7 cache and downloads the vault again. Pending local work must settle first. Continue?",
+			"This clears this folder’s schema-8 cache and downloads the vault again. Pending local work must settle first. Continue?",
 			async () => {
 				const database = this.vaultDatabase;
 				if (!database) return;
@@ -1943,7 +1961,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					await this.initSync(true);
 					new Notice("Cache reset complete.");
 				} catch (error) {
-					console.error("[yaos] Failed to reset schema-7 cache:", error);
+					console.error("[yaos] Failed to reset schema-8 cache:", error);
 					new Notice(`Cache reset refused: ${formatUnknown(error)}`, 8000);
 				}
 			},
@@ -1961,16 +1979,17 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		new ConfirmModal(
 			this.app,
 			"Nuclear reset",
-			`This durably deletes ${pathCount} synced notes from the server, clears this folder’s schema-7 cache, then imports the current disk files. Continue?`,
+			`This durably deletes ${pathCount} synced notes from the server, clears this folder’s schema-8 cache, then imports the current disk files. Continue?`,
 			async () => {
 				try {
-					const requests = [...runtime.pathToId].map(([path, bodyId]) => ({
+					const requests = await Promise.all([...runtime.pathToId].map(async ([path, bodyId]) => ({
 						operationId: crypto.randomUUID(),
 						kind: "delete" as const,
 						fileId: bodyId,
 						bodyId,
+						bodyEpoch: await runtime.currentBodyEpoch(bodyId),
 						path,
-					}));
+					})));
 					if (requests.length > 0) await runtime.commitStructuralBatch(requests);
 					for (const [path] of runtime.listAttachmentRefs()) {
 						await runtime.deleteAttachmentRef(path, this.settings.deviceName);

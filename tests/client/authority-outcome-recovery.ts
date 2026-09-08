@@ -13,6 +13,7 @@ import type { StoredDocument, StoredLifecycleOperation } from "../../src/sync/va
 import { suite } from "../harness.ts";
 import { partialOf } from "../mocks/productFixture.ts";
 import { installDomCrypto } from "./helpers/installDomCrypto.ts";
+import { PROTOCOL_VERSION, SCHEMA_VERSION } from "../../src/sync/schema";
 
 installDomCrypto();
 const s = suite("authority-outcome-recovery");
@@ -26,13 +27,15 @@ const currentAuthority: VaultAuthorityIdentity = { ...oldAuthority, membershipRe
 function encodedDocument(documentId: string, configure?: (doc: Y.Doc) => void): StoredDocument {
 	const doc = new Y.Doc({ guid: documentId });
 	if (documentId === "root") {
-		doc.getMap("sys").set("schemaVersion", 8);
-		doc.getMap("sys").set("protocolVersion", 4);
+		doc.getMap("sys").set("schemaVersion", SCHEMA_VERSION);
+		doc.getMap("sys").set("protocolVersion", PROTOCOL_VERSION);
 	}
 	configure?.(doc);
 	const encodedState = Y.encodeStateAsUpdate(doc).slice().buffer;
 	doc.destroy();
-	return { documentId, generation: 1, encodedState, dirty: true, updatedAt: 1 };
+	return documentId === "root"
+		? { kind: "root", documentId: "root", rootEpoch: 1, generation: 1, encodedState, dirty: true, updatedAt: 1 }
+		: { kind: "body", documentId, bodyEpoch: 1, durableBaseline: "committed", generation: 1, encodedState, dirty: true, updatedAt: 1 };
 }
 
 function provider(): SyncProviderPort {
@@ -49,6 +52,7 @@ function provider(): SyncProviderPort {
 s.test("stale candidate recovery clears only an exact committed prior-authority operation", async () => {
 	const candidate: CandidateRecord = {
 		vaultId: "vault-1", bodyId: "body-1", candidateId: "candidate-1", candidateDigest: "a".repeat(64),
+		bodyEpoch: 1, previousBaseline: "", pendingMarkdown: "committed",
 		encodedUpdate: new Uint8Array([1]).buffer, capturedAt: 1, capturedLocalUpdates: 1, authority: oldAuthority,
 	};
 	const documents = new Map<string, StoredDocument>([
@@ -90,7 +94,7 @@ s.test("stale lifecycle recovery uses the exact outcome then only publishes its 
 	const lifecycle = new Map<string, StoredLifecycleOperation>();
 	lifecycle.set("lifecycle-1", {
 		operationId: "lifecycle-1", kind: "delete", bodyId: "body-1", path: "Old.md", previousPath: null,
-		content: null, createdAt: 1, attempts: 1, lastAttemptAt: 1, authority: oldAuthority,
+		bodyEpoch: 1, content: null, createdAt: 1, attempts: 1, lastAttemptAt: 1, authority: oldAuthority,
 	});
 	let lifecycleMutations = 0;
 	let rootPublications = 0;
@@ -109,7 +113,7 @@ s.test("stale lifecycle recovery uses the exact outcome then only publishes its 
 		committedOperationOutcome: async ({ operationId, requestDigest }) => ({ operationId, requestDigest, vaultSequence: 11, committed: true }),
 		publishLifecycleRoot: async (operations) => {
 			rootPublications++;
-			return { operationIds: operations.map((operation) => operation.operationId), vaultGeneration: "generation-1", runtimeEpoch: "epoch-2", vaultSequence: 12, rootGeneration: 2 };
+			return { operationIds: operations.map((operation) => operation.operationId), vaultGeneration: "generation-1", runtimeEpoch: "epoch-2", vaultSequence: 12, rootGeneration: 2, rootEpoch: 1 };
 		},
 	});
 	const runtime = await VaultSync.create({

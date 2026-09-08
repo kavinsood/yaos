@@ -77,25 +77,24 @@ function validateServerVersionModule() {
 	pass(`${SERVER_VERSION_MODULE} exposes the canonical server schema pin`);
 }
 
-function validateServerSqlConstraint(schemaVersion) {
+function validateServerSqlConstraint() {
 	if (!existsSync(SERVER_DOCUMENT_STORE)) {
 		fail(`${SERVER_DOCUMENT_STORE} is missing — the durable schema constraint cannot be validated.`);
 		return;
 	}
 	const content = readFileSync(SERVER_DOCUMENT_STORE, "utf8");
 	const matches = [...content.matchAll(
-		/schema_version\s+INTEGER\s+NOT\s+NULL\s+CHECK\s*\(\s*schema_version\s*=\s*(\d+)\s*\)/g,
+		/schema_version\s+INTEGER\s+NOT\s+NULL\s+CHECK\s*\(\s*schema_version\s*=\s*\$\{SCHEMA_VERSION\}\s*\)/g,
 	)];
 	if (matches.length !== 1) {
-		fail(`${SERVER_DOCUMENT_STORE} must contain exactly one literal vault_meta schema_version CHECK constraint.`);
+		fail(`${SERVER_DOCUMENT_STORE} must contain exactly one vault_meta schema_version CHECK derived from SCHEMA_VERSION.`);
 		return;
 	}
-	const constrainedVersion = Number(matches[0][1]);
-	if (constrainedVersion !== schemaVersion) {
-		fail(`${SERVER_DOCUMENT_STORE} schema_version CHECK pins ${constrainedVersion}, expected canonical server schema ${schemaVersion}.`);
+	if (!/import\s*{[^}]*\bSCHEMA_VERSION\b[^}]*}\s*from\s*["']\.\/shared\/productVersions["']\s*;?/s.test(content)) {
+		fail(`${SERVER_DOCUMENT_STORE} must import SCHEMA_VERSION from the canonical product-version source.`);
 		return;
 	}
-	pass(`${SERVER_DOCUMENT_STORE}: schema_version CHECK = ${constrainedVersion}`);
+	pass(`${SERVER_DOCUMENT_STORE}: schema_version CHECK derives from SCHEMA_VERSION`);
 }
 
 const pluginSchemaVersion = readSchemaVersion(PLUGIN_SCHEMA_SOURCE, "plugin");
@@ -121,7 +120,7 @@ if (
 }
 
 validateServerVersionModule();
-if (serverSchemaVersion !== null) validateServerSqlConstraint(serverSchemaVersion);
+if (serverSchemaVersion !== null) validateServerSqlConstraint();
 
 if (failures > 0) {
 	console.error(`\nFAIL: ${failures} schema-version guard violation(s).`);

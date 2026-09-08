@@ -7,6 +7,7 @@ import { MAX_AWARENESS_BYTES, MAX_BODY_SOCKETS, MAX_CANDIDATE_BYTES, MAX_ROOT_SO
 import { sha256Hex } from "./hex";
 import {
 	VaultDocumentCachePressureError,
+	VaultDocumentValidationError,
 	type LoadedVaultDocument,
 	type VaultDocumentCache,
 } from "./vaultDocumentCache";
@@ -25,7 +26,13 @@ import { canonicalMarkdownBytes } from "./shared/markdownCodec";
 import { MAX_CLIENT_MARKDOWN_BYTES } from "./shared/durableLimits";
 import { AUTHORITY_SUPERSEDED_SOCKET_CLOSE_CODE } from "./shared/socketCloseCodes";
 import type { VaultActorContext } from "./collaboration";
-import { validateCanvasDocument } from "./shared/canvasSemanticDocument";
+import type { SemanticCatalogHead } from "./vaultStore";
+import {
+	SEMANTIC_EPOCH_RESET_SOCKET_CLOSE_CODE,
+	SemanticEpochMismatchError,
+	parseSemanticEpoch,
+	type SemanticEpoch,
+} from "./shared/semanticEpoch";
 
 const MESSAGE_SYNC = 0;
 const MESSAGE_AWARENESS = 1;
@@ -37,6 +44,7 @@ export interface VaultSocketAttachment {
 	runtimeEpoch: string;
 	documentId: string;
 	kind: "root" | "body" | "semantic";
+	documentEpoch: SemanticEpoch;
 	deviceId: string;
 	deviceName?: string;
 	principalId: string;
@@ -98,7 +106,9 @@ export function parseVaultSocketAttachment(value: unknown): VaultSocketAttachmen
 			|| attachment.awarenessClientId < 0))
 		|| typeof attachment.socketId !== "string" || !validIdentity(attachment.socketId)
 		|| (attachment.kind !== "root" && attachment.kind !== "body" && attachment.kind !== "semantic")
-		|| typeof attachment.documentId !== "string") return null;
+		|| typeof attachment.documentId !== "string"
+		|| typeof attachment.documentEpoch !== "number"
+		|| !Number.isSafeInteger(attachment.documentEpoch) || attachment.documentEpoch < 1) return null;
 	if (attachment.kind === "root" && attachment.documentId !== "root") return null;
 	if (attachment.kind === "body" && attachment.documentId === "root") return null;
 	if (attachment.kind === "semantic" && attachment.documentId === "root") return null;
@@ -207,6 +217,16 @@ export function rootUpdateChangesDocument(current: Y.Doc, update: Uint8Array): b
 	}
 }
 
+/** The Yjs handshake sends a sync-step-2 update even when the peer has no data. */
+export function isStructurallyEmptyYjsUpdate(update: Uint8Array): boolean {
+	try {
+		const decoded = Y.decodeUpdate(update);
+		return decoded.structs.length === 0 && decoded.ds.clients.size === 0;
+	} catch {
+		return false;
+	}
+}
+
 export function bodyUpdateAdmissionError(current: Y.Doc, update: Uint8Array): string | null {
 	const candidate = new Y.Doc({ guid: "body-frontmatter-semantic-validation" });
 	try {
@@ -233,11 +253,15 @@ export interface SocketServiceOptions {
 	runtimeEpoch: string;
 	isActiveBody: (bodyId: string) => boolean;
 	isActiveSemantic?: (documentId: string) => boolean;
+	currentSemanticHead?: (documentId: string) => SemanticCatalogHead | null;
+	currentRootEpoch: () => SemanticEpoch;
+	currentSemanticEpoch?: (documentId: string) => SemanticEpoch | null;
 	currentBodyHead: (bodyId: string) => (BodyCurrentnessHead & { sequence: number }) | null;
 	currentSequence: () => number;
 	validateActor(actor: VaultActorContext): boolean;
 	principalPresence(principalId: string): { displayName: string; colorSeed: string } | null;
 	scheduleFlush: (documentId: string) => void;
+	shouldPauseAdmission?: (documentId: string) => boolean;
 }
 
 function cachePressureResponse(reason: "body_cache_count" | "body_cache_encoded_state_bytes" | "vault_transient_bytes"): Response {
@@ -255,12 +279,21 @@ export class VaultSocketService {
 		const result = new Set<string>();
 		for (const socket of this.options.sockets.sockets()) {
 			const attachment = parseVaultSocketAttachment(socket.deserializeAttachment());
-			if (attachment?.kind === "body" || attachment?.kind === "semantic") result.add(attachment.documentId);
+			if (attachment?.kind === "body"
+				&& this.options.currentBodyHead(attachment.documentId)?.bodyEpoch === attachment.documentEpoch) {
+				result.add(attachment.documentId);
+			}
+			if (attachment?.kind === "semantic"
+				&& this.options.currentSemanticEpoch?.(attachment.documentId) === attachment.documentEpoch) {
+				result.add(attachment.documentId);
+			}
 		}
 		return result;
 	}
 
-	accept(documentId: string, kind: VaultSocketAttachment["kind"], actorOrDevice: VaultActorContext | string): Response {
+	accept(documentId: string, kind: VaultSocketAttachment["kind"], documentEpoch: SemanticEpoch,
+		actorOrDevice: VaultActorContext | string): Response {
+		documentEpoch = parseSemanticEpoch(documentEpoch, "socket document epoch");
 		const actor: VaultActorContext = typeof actorOrDevice === "string"
 			? { vaultId: this.options.vaultId(), vaultGeneration: this.options.vaultGeneration(), principalId: actorOrDevice,
 				membershipRevision: 1, deviceId: actorOrDevice, deviceCredentialRevision: 1, role: "member",
@@ -271,18 +304,25 @@ export class VaultSocketService {
 		let bodyCount = 0;
 		for (const socket of this.options.sockets.sockets()) {
 			const attachment = parseVaultSocketAttachment(socket.deserializeAttachment());
+			if (attachment && this.fenceSocketIfStale(socket, attachment)) continue;
 			if (attachment?.kind === "root") rootCount++;
 			if (attachment?.kind === "body" || attachment?.kind === "semantic") bodyCount++;
 		}
 		if (kind === "root" && rootCount >= MAX_ROOT_SOCKETS) return Response.json({ error: "root_socket_limit" }, { status: 429 });
-		if ((kind === "body" || kind === "semantic") && bodyCount >= MAX_BODY_SOCKETS) return Response.json({ error: "body_socket_limit" }, { status: 429 });
-		if ((kind === "body" || kind === "semantic") && !this.options.cache.admitBody(documentId)) {
+		if (kind !== "root" && bodyCount >= MAX_BODY_SOCKETS) return Response.json({ error: "body_socket_limit" }, { status: 429 });
+		if (kind !== "root" && this.options.shouldPauseAdmission?.(documentId)) {
+			return Response.json({ error: "semantic_compaction_backpressure" }, {
+				status: 429, headers: { "Retry-After": "1" },
+			});
+		}
+		if (kind !== "root" && !this.options.cache.admitBody(documentId)) {
 			return cachePressureResponse("body_cache_count");
 		}
 		let loaded: LoadedVaultDocument;
 		try {
 			loaded = this.options.cache.load(documentId, kind !== "root", () => kind === "body"
-				? this.options.isActiveBody(documentId) : this.options.isActiveSemantic?.(documentId) === true);
+				? this.options.isActiveBody(documentId) : this.options.isActiveSemantic?.(documentId) === true,
+				kind === "root" ? "root" : kind === "semantic" ? "canvas" : "body");
 		} catch (error) {
 			if (kind !== "root" && error instanceof VaultDocumentCachePressureError) {
 				if (error.reason === "body_cache_count"
@@ -293,6 +333,14 @@ export class VaultSocketService {
 			}
 			throw error;
 		}
+		if (loaded.semanticEpoch !== documentEpoch) {
+			const mismatch = kind === "root"
+				? new SemanticEpochMismatchError({ purpose: "root", documentId: "root",
+					expectedRootEpoch: loaded.semanticEpoch, receivedRootEpoch: documentEpoch })
+				: new SemanticEpochMismatchError({ purpose: "body", documentId,
+					expectedBodyEpoch: loaded.semanticEpoch, receivedBodyEpoch: documentEpoch });
+			return Response.json(mismatch.toPayload(), { status: mismatch.status });
+		}
 		const pair = this.options.sockets.createPair();
 		const client = pair.client;
 		const server = pair.server;
@@ -302,6 +350,7 @@ export class VaultSocketService {
 			runtimeEpoch: this.options.runtimeEpoch,
 			documentId,
 			kind,
+			documentEpoch,
 			deviceId: actor.deviceId,
 			...(actor.deviceName ? { deviceName: actor.deviceName } : {}),
 			principalId: actor.principalId,
@@ -321,6 +370,7 @@ export class VaultSocketService {
 		this.sendControl(server, {
 			type: "VAULT_READY",
 			documentId,
+			documentEpoch: attachment.documentEpoch,
 			socketSessionId: attachment.socketId,
 			vaultGeneration: attachment.vaultGeneration,
 			durableGeneration: loaded.generation,
@@ -352,6 +402,7 @@ export class VaultSocketService {
 			socket.close(1008, "socket authority superseded");
 			return;
 		}
+		if (this.fenceSocketIfStale(socket, attachment)) return;
 		if ((attachment.kind === "body" && !this.options.isActiveBody(attachment.documentId))
 			|| (attachment.kind === "semantic" && this.options.isActiveSemantic?.(attachment.documentId) !== true)) {
 			socket.close(1008, "body is not active");
@@ -372,6 +423,7 @@ export class VaultSocketService {
 					type: "VAULT_PONG",
 					probeId: ping.probeId,
 					documentId: attachment.documentId,
+					documentEpoch: attachment.documentEpoch,
 					vaultGeneration: attachment.vaultGeneration,
 					runtimeEpoch: attachment.runtimeEpoch,
 				});
@@ -390,6 +442,7 @@ export class VaultSocketService {
 				const head = this.options.currentBodyHead(bodyId);
 				if (head) heads.push({
 					bodyId: head.bodyId,
+					bodyEpoch: head.bodyEpoch,
 					lifecycle: head.lifecycle,
 					generation: head.generation,
 					contentHash: head.contentHash,
@@ -443,6 +496,27 @@ export class VaultSocketService {
 		}
 		this.options.cache.evict(documentId);
 	}
+
+	/** Fences all hibernated/open sockets that still speak the retired CRDT lineage. */
+	fenceSemanticEpoch(documentId: string, previousEpoch: SemanticEpoch, currentEpoch: SemanticEpoch): number {
+		const receivedEpoch = parseSemanticEpoch(previousEpoch, "previous semantic epoch");
+		const expectedEpoch = parseSemanticEpoch(currentEpoch, "current semantic epoch");
+		if (receivedEpoch === expectedEpoch) throw new Error("semantic epoch fence requires an advancing epoch");
+		let closed = 0;
+		for (const socket of this.options.sockets.sockets()) {
+			const attachment = parseVaultSocketAttachment(socket.deserializeAttachment());
+			if (!attachment || attachment.documentId !== documentId || attachment.documentEpoch !== receivedEpoch) continue;
+			const mismatch = attachment.kind === "root"
+				? new SemanticEpochMismatchError({ purpose: "root", documentId: "root",
+					expectedRootEpoch: expectedEpoch, receivedRootEpoch: receivedEpoch })
+				: new SemanticEpochMismatchError({ purpose: "body", documentId,
+					expectedBodyEpoch: expectedEpoch, receivedBodyEpoch: receivedEpoch });
+			this.sendControl(socket, mismatch.toSocketFrame());
+			try { socket.close(SEMANTIC_EPOCH_RESET_SOCKET_CLOSE_CODE, "semantic epoch reset"); } catch { /* durable fence remains */ }
+			closed++;
+		}
+		return closed;
+	}
 	closeDevice(deviceId: string): number {
 		let closed = 0;
 		for (const socket of this.options.sockets.sockets()) {
@@ -478,9 +552,12 @@ export class VaultSocketService {
 
 	notifyBodyCommitted(bodyId: string, durableGeneration: number, vaultSequence: number): void {
 		const head = this.options.currentBodyHead(bodyId);
+		const bodyEpoch = head?.bodyEpoch ?? this.options.cache.get(bodyId)?.semanticEpoch;
+		if (bodyEpoch === undefined) throw new Error(`body ${bodyId} has no semantic epoch for commit notification`);
 		const value = {
 			type: "BODY_COMMITTED",
 			bodyId,
+			bodyEpoch,
 			vaultGeneration: this.options.vaultGeneration(),
 			durableGeneration,
 			vaultSequence,
@@ -491,14 +568,18 @@ export class VaultSocketService {
 		};
 		for (const socket of this.options.sockets.sockets()) {
 			const attachment = parseVaultSocketAttachment(socket.deserializeAttachment());
-			if (attachment?.kind === "root" || attachment?.documentId === bodyId) this.sendControl(socket, value);
+			if (attachment?.kind === "root"
+				|| (attachment?.documentId === bodyId && attachment.documentEpoch === bodyEpoch)) this.sendControl(socket, value);
 		}
 	}
 
 	notifySemanticCommitted(documentId: string, durableGeneration: number, vaultSequence: number,
 		head: { lifecycle: string; contentHash: string | null; size: number | null }): void {
+		const bodyEpoch = this.options.currentSemanticEpoch?.(documentId)
+			?? this.options.cache.get(documentId)?.semanticEpoch;
+		if (bodyEpoch === undefined || bodyEpoch === null) throw new Error(`Canvas ${documentId} has no semantic epoch`);
 		const value = { type: "SEMANTIC_COMMITTED", documentId, kind: "canvas", format: "json-canvas",
-			vaultGeneration: this.options.vaultGeneration(), durableGeneration, vaultSequence,
+			bodyEpoch, vaultGeneration: this.options.vaultGeneration(), durableGeneration, vaultSequence,
 			lifecycle: head.lifecycle, contentHash: head.contentHash, size: head.size, runtimeEpoch: this.options.runtimeEpoch };
 		for (const socket of this.options.sockets.sockets()) {
 			const attachment = parseVaultSocketAttachment(socket.deserializeAttachment());
@@ -507,29 +588,75 @@ export class VaultSocketService {
 	}
 
 	broadcastDocumentUpdate(documentId: string, update: Uint8Array, origin: unknown): void {
+		this.broadcastDocumentUpdateExcept(documentId, update, (socket) => socket === origin);
+	}
+
+	/** Publishes a durably committed socket frame without echoing it to its origin. */
+	broadcastCommittedSocketUpdate(documentId: string, update: Uint8Array, originSocketId: string): void {
+		this.broadcastDocumentUpdateExcept(documentId, update, (socket) => {
+			const attachment = parseVaultSocketAttachment(socket.deserializeAttachment());
+			return attachment?.socketId === originSocketId;
+		});
+	}
+
+	closeUndurableOrigins(documentId: string, entries: readonly { socketId: string }[]): void {
+		const socketIds = new Set(entries.map((entry) => entry.socketId));
+		for (const socket of this.options.sockets.sockets()) {
+			const attachment = parseVaultSocketAttachment(socket.deserializeAttachment());
+			if (attachment?.documentId !== documentId || !socketIds.has(attachment.socketId)) continue;
+			this.sendControl(socket, { type: "VAULT_ERROR", code: "durability_failed", message: "update was not committed; reconnect to resend" });
+			try { socket.close(1011, "durable commit failed"); } catch { /* reconnect is still required */ }
+		}
+	}
+
+	private broadcastDocumentUpdateExcept(
+		documentId: string,
+		update: Uint8Array,
+		excluded: (socket: VaultSocketPort) => boolean,
+	): void {
+		// A Durable Object may wake with hibernated sockets before its document
+		// cache has been rebuilt.  Publication is already durable at this point,
+		// so lack of residency must neither turn the successful mutation into a
+		// 500 nor suppress its delta to those sockets.  The durable head is the
+		// epoch authority when no resident document is available.
+		const documentEpoch = this.options.cache.get(documentId)?.semanticEpoch
+			?? (documentId === "root"
+				? this.options.currentRootEpoch()
+				: this.options.currentSemanticEpoch?.(documentId) ?? null);
+		if (documentEpoch === null) return;
 		const encoder = encoding.createEncoder();
 		encoding.writeVarUint(encoder, MESSAGE_SYNC);
 		syncProtocol.writeUpdate(encoder, update);
 		const frame = encoding.toUint8Array(encoder);
 		for (const socket of this.options.sockets.sockets()) {
-			if (socket === origin) continue;
+			if (excluded(socket)) continue;
 			const attachment = parseVaultSocketAttachment(socket.deserializeAttachment());
-			if (attachment?.documentId === documentId) {
+			if (attachment?.documentId === documentId && attachment.documentEpoch === documentEpoch) {
 				try { socket.send(frame); } catch { /* peer closed */ }
 			}
 		}
 	}
 
 	private async handleSyncFrame(socket: VaultSocketPort, attachment: VaultSocketAttachment, decoder: decoding.Decoder): Promise<void> {
-		const loaded = this.options.cache.load(
-			attachment.documentId,
-			attachment.kind !== "root",
-			() => attachment.kind === "body"
-				? this.options.isActiveBody(attachment.documentId)
-				: attachment.kind === "semantic" && this.options.isActiveSemantic?.(attachment.documentId) === true,
-		);
+		if (attachment.kind !== "root" && this.options.shouldPauseAdmission?.(attachment.documentId)) {
+			this.sendControl(socket, { type: "VAULT_BACKPRESSURE", reason: "semantic_compaction_backpressure" });
+			socket.close(1013, "semantic compaction pressure");
+			return;
+		}
 		const syncType = decoding.readVarUint(decoder);
 		if (syncType === 0) {
+			const loaded = this.options.cache.load(
+				attachment.documentId,
+				attachment.kind !== "root",
+				() => attachment.kind === "body"
+					? this.options.isActiveBody(attachment.documentId)
+					: attachment.kind === "semantic" && this.options.isActiveSemantic?.(attachment.documentId) === true,
+				attachment.kind === "root" ? "root" : attachment.kind === "semantic" ? "canvas" : "body",
+			);
+			if (loaded.semanticEpoch !== attachment.documentEpoch) {
+				this.fenceSocketIfStale(socket, attachment, loaded.semanticEpoch);
+				return;
+			}
 			const encoder = encoding.createEncoder();
 			encoding.writeVarUint(encoder, MESSAGE_SYNC);
 			syncProtocol.writeSyncStep2(encoder, loaded.doc, decoding.readVarUint8Array(decoder));
@@ -543,54 +670,118 @@ export class VaultSocketService {
 			return;
 		}
 		if (attachment.kind === "root") {
-			if (rootUpdateChangesDocument(loaded.doc, update)) {
-				socket.close(1008, "root updates require durable publication");
+			// Root sockets are download-only, but Yjs itself emits a structurally
+			// empty sync-step-2 update during every handshake. Inspect its decoded
+			// structure without applying or cloning; any structs/deletes are a real
+			// client mutation and remain forbidden.
+			if (isStructurallyEmptyYjsUpdate(update)) return;
+			const root = this.options.cache.load("root", false, () => true, "root");
+			if (root.semanticEpoch !== attachment.documentEpoch) {
+				this.fenceSocketIfStale(socket, attachment, root.semanticEpoch);
+				return;
 			}
-			return;
-		}
-		const semanticError = attachment.kind === "semantic"
-			? await this.canvasUpdateAdmissionError(loaded.doc, update)
-			: bodyUpdateAdmissionError(loaded.doc, update);
-		if (semanticError) {
-			const message = attachment.kind === "semantic" ? "invalid semantic Canvas update" : "invalid semantic frontmatter";
-			this.sendControl(socket, { type: "VAULT_ERROR", code: semanticError, message });
-			socket.close(1008, message);
+			if (this.options.cache.validateRootSyncNoop("root", update)) return;
+			socket.close(1008, "root updates require durable publication");
 			return;
 		}
 		const owned = update.slice();
 		const digest = await sha256Hex(owned);
-		const queued = this.options.cache.queue(attachment.documentId, {
-			bytes: owned,
-			digest,
-			socketId: attachment.socketId,
-			actor: this.actorFromAttachment(attachment),
+		await this.options.cache.serializeDocument(attachment.documentId, async () => {
+			if (this.options.shouldPauseAdmission?.(attachment.documentId)) {
+				this.sendControl(socket, { type: "VAULT_BACKPRESSURE", reason: "semantic_compaction_backpressure" });
+				socket.close(1013, "semantic compaction pressure");
+				return;
+			}
+			const current = this.options.cache.load(
+				attachment.documentId,
+				true,
+				() => attachment.kind === "body"
+					? this.options.isActiveBody(attachment.documentId)
+					: this.options.isActiveSemantic?.(attachment.documentId) === true,
+				attachment.kind === "semantic" ? "canvas" : "body",
+			);
+			if (current.semanticEpoch !== attachment.documentEpoch) {
+				this.fenceSocketIfStale(socket, attachment, current.semanticEpoch);
+				return;
+			}
+			let validated;
+			try {
+				validated = attachment.kind === "semantic"
+					? await this.options.cache.validateCanvasUpdate(attachment.documentId, owned)
+					: this.options.cache.validateBodyUpdate(attachment.documentId, owned);
+			} catch (error) {
+				if (error instanceof VaultDocumentValidationError) {
+					const message = attachment.kind === "semantic" ? "invalid semantic Canvas update" : "invalid body update";
+					this.sendControl(socket, { type: "VAULT_ERROR", code: error.reason, message });
+					socket.close(1008, message);
+					return;
+				}
+				if (error instanceof VaultDocumentCachePressureError) {
+					this.sendControl(socket, { type: "VAULT_BACKPRESSURE", reason: error.reason });
+					socket.close(1013, "body cache budget exceeded");
+					return;
+				}
+				throw error;
+			}
+			const contentHash = await sha256Hex(validated.contentBytes);
+			const actor = this.actorFromAttachment(attachment);
+			if (!(this.options.validateActor?.(actor) ?? true)) {
+				this.options.cache.discardValidatedBodyUpdate(attachment.documentId);
+				this.sendControl(socket, { type: "error", code: "authority_superseded", reason: "socket authority superseded" });
+				socket.close(AUTHORITY_SUPERSEDED_SOCKET_CLOSE_CODE, "socket authority superseded");
+				return;
+			}
+			if (this.fenceSocketIfStale(socket, attachment)) {
+				this.options.cache.discardValidatedBodyUpdate(attachment.documentId);
+				return;
+			}
+			let semanticHead: SemanticCatalogHead | undefined;
+			if (attachment.kind === "semantic") {
+				const current = this.options.currentSemanticHead?.(attachment.documentId);
+				if ((this.options.currentSemanticHead && (!current || current.lifecycle !== "active"))
+					|| (!this.options.currentSemanticHead && this.options.isActiveSemantic?.(attachment.documentId) !== true)) {
+					this.options.cache.discardValidatedBodyUpdate(attachment.documentId);
+					this.sendControl(socket, { type: "VAULT_ERROR", code: "semantic_document_not_active",
+						message: "semantic Canvas is no longer active" });
+					socket.close(1008, "semantic document is not active");
+					return;
+				}
+				if (current?.bodyEpoch !== undefined && current.bodyEpoch !== attachment.documentEpoch) {
+					this.options.cache.discardValidatedBodyUpdate(attachment.documentId);
+					this.fenceSocketIfStale(socket, attachment, current.bodyEpoch);
+					return;
+				}
+				semanticHead = current ?? undefined;
+			} else if (!this.options.isActiveBody(attachment.documentId)) {
+				this.options.cache.discardValidatedBodyUpdate(attachment.documentId);
+				this.sendControl(socket, { type: "VAULT_ERROR", code: "body_not_active", message: "body is no longer active" });
+				socket.close(1008, "body is not active");
+				return;
+			}
+			if (!validated.requiresDurableCommit) {
+				this.options.cache.stageValidatedBodyUpdate(attachment.documentId, validated);
+				return;
+			}
+			const queued = this.options.cache.queue(attachment.documentId, {
+				bytes: owned,
+				digest,
+				socketId: attachment.socketId,
+				actor,
+				kind: attachment.kind === "semantic" ? "semantic" : "body",
+				documentEpoch: attachment.documentEpoch,
+				...(semanticHead ? { semanticHead } : {}),
+				contentHash,
+				contentSize: validated.contentBytes.byteLength,
+			});
+			if (!queued.ok) {
+				this.options.cache.discardValidatedBodyUpdate(attachment.documentId);
+				this.sendControl(socket, { type: "VAULT_BACKPRESSURE", reason: queued.reason });
+				socket.close(1013, "pending durability budget exceeded");
+				return;
+			}
+			this.options.cache.stageValidatedBodyUpdate(attachment.documentId, validated);
+			this.options.scheduleFlush(attachment.documentId);
 		});
-		if (!queued.ok) {
-			this.sendControl(socket, { type: "VAULT_BACKPRESSURE", reason: queued.reason });
-			socket.close(1013, "pending durability budget exceeded");
-			return;
-		}
-		let changed = false;
-		const observer = () => { changed = true; };
-		loaded.doc.on("update", observer);
-		try { Y.applyUpdate(loaded.doc, owned, socket); }
-		finally { loaded.doc.off("update", observer); }
-		if (!changed) {
-			this.options.cache.removePendingDigest(attachment.documentId, digest);
-			return;
-		}
-		this.broadcastDocumentUpdate(attachment.documentId, owned, socket);
-		this.options.scheduleFlush(attachment.documentId);
-	}
-
-	private async canvasUpdateAdmissionError(current: Y.Doc, update: Uint8Array): Promise<string | null> {
-		const candidate = new Y.Doc({ guid: "canvas-socket-validation" });
-		try {
-			Y.applyUpdate(candidate, Y.encodeStateAsUpdate(current));
-			Y.applyUpdate(candidate, update);
-			return await validateCanvasDocument(candidate);
-		} catch { return "invalid_canvas_update"; }
-		finally { candidate.destroy(); }
 	}
 
 	private relayAwareness(origin: VaultSocketPort, source: VaultSocketAttachment, frame: Uint8Array): void {
@@ -648,10 +839,31 @@ export class VaultSocketService {
 			if (socket === origin) continue;
 			const attachment = parseVaultSocketAttachment(socket.deserializeAttachment());
 			if (attachment?.kind === source.kind && attachment.documentId === source.documentId
+				&& attachment.documentEpoch === source.documentEpoch
 				&& attachment.vaultId === source.vaultId && attachment.vaultGeneration === source.vaultGeneration) {
 				try { socket.send(trustedFrame); } catch { /* peer closed */ }
 			}
 		}
+	}
+
+	private fenceSocketIfStale(socket: VaultSocketPort, attachment: VaultSocketAttachment,
+		knownCurrentEpoch?: SemanticEpoch): boolean {
+		const currentEpoch = knownCurrentEpoch ?? (attachment.kind === "root"
+			? this.options.currentRootEpoch?.() ?? attachment.documentEpoch
+			: attachment.kind === "semantic"
+				? this.options.currentSemanticEpoch?.(attachment.documentId)
+					?? this.options.currentSemanticHead?.(attachment.documentId)?.bodyEpoch
+					?? attachment.documentEpoch
+				: this.options.currentBodyHead?.(attachment.documentId)?.bodyEpoch ?? attachment.documentEpoch);
+		if (currentEpoch === undefined || currentEpoch === attachment.documentEpoch) return false;
+		const mismatch = attachment.kind === "root"
+			? new SemanticEpochMismatchError({ purpose: "root", documentId: "root",
+				expectedRootEpoch: currentEpoch, receivedRootEpoch: attachment.documentEpoch })
+			: new SemanticEpochMismatchError({ purpose: "body", documentId: attachment.documentId,
+				expectedBodyEpoch: currentEpoch, receivedBodyEpoch: attachment.documentEpoch });
+		this.sendControl(socket, mismatch.toSocketFrame());
+		try { socket.close(SEMANTIC_EPOCH_RESET_SOCKET_CLOSE_CODE, "semantic epoch reset"); } catch { /* durably fenced */ }
+		return true;
 	}
 
 	private actorFromAttachment(attachment: VaultSocketAttachment): VaultActorContext {

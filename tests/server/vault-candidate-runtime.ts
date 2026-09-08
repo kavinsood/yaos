@@ -1,6 +1,7 @@
 import { strict as assert } from "node:assert";
 import * as Y from "yjs";
 import { VaultCandidateService } from "../../server/src/vaultCandidateService";
+import { VaultDocumentCache } from "../../server/src/vaultDocumentCache";
 import { suite } from "../harness.ts";
 
 const s = suite("vault-candidate-runtime");
@@ -15,6 +16,7 @@ async function digest(bytes: Uint8Array): Promise<string> {
 
 interface Receipt {
 	bodyId: string;
+	bodyEpoch: number;
 	clientId: string;
 	candidateId: string;
 	candidateDigest: string;
@@ -29,12 +31,19 @@ class CandidateStore {
 	commits = 0;
 	reconstructions = 0;
 	appliedUpdates = 0;
-	lastCommit: { expectedHead: { generation: number; latestSequence: number } | null; changesState: boolean } | null = null;
+	lastCommit: { expectedHead: { generation: number; semanticEpoch: number; latestSequence: number } | null; changesState: boolean } | null = null;
 	throwAfterCommit = false;
-	private head = { generation: 1, latestSequence: 1 };
+	private durableUpdate: Uint8Array | null = null;
+	creation: {
+		bodyId: string; fileId: string; path: string; operationId: string;
+		candidateId: string; candidateDigest: string; bodyEpoch: number;
+		durableGeneration: number; vaultSequence: number; vaultGeneration: string; runtimeEpoch: string;
+	} | null = null;
+	private head = { generation: 1, semanticEpoch: 1, latestSequence: 1 };
 	currentSequence(): number { return 1; }
-	creationCandidate(): null { return null; }
+	creationCandidate() { return this.creation; }
 	getCatalogHeadAt() {
+		if (this.creation) return null;
 		return { bodyId: BODY_ID, fileId: BODY_ID, path: "candidate.md", previousPath: null, lifecycle: "active", generation: 1, sequence: 1, contentHash: null, size: 0 } as const;
 	}
 	candidateReceipt(bodyId: string, clientId: string, candidateId: string): Receipt | null {
@@ -44,18 +53,27 @@ class CandidateStore {
 		this.reconstructions++;
 		const doc = new Y.Doc({ guid: BODY_ID });
 		doc.on("update", () => { this.appliedUpdates++; });
-		return { doc, generation: this.head.generation };
+		if (this.durableUpdate) Y.applyUpdate(doc, this.durableUpdate);
+		return { doc, generation: this.head.generation, semanticEpoch: 1 };
 	}
 	documentHead() { return { ...this.head }; }
+	advanceSemanticEpoch(): void { this.head = { ...this.head, semanticEpoch: this.head.semanticEpoch + 1 }; }
 	documentEncodedHistoryBytes(): number { return 1; }
 	commitCandidate(input: { bodyId: string; clientId: string; candidateId: string; candidateDigest: string;
-		expectedHead: { generation: number; latestSequence: number } | null; changesState: boolean;
+		update: Uint8Array;
+		bodyEpoch: number; expectedHead: { generation: number; semanticEpoch: number; latestSequence: number } | null; changesState: boolean;
 		vaultGeneration: string; runtimeEpoch: string }): Receipt {
+		const key = `${input.bodyId}\u0000${input.clientId}\u0000${input.candidateId}`;
+		const replay = this.receipts.get(key);
+		if (replay) return replay;
 		this.commits++;
 		this.lastCommit = { expectedHead: input.expectedHead, changesState: input.changesState };
-		if (input.changesState) this.head = { generation: this.head.generation + 1, latestSequence: this.head.latestSequence + 1 };
+		if (input.changesState) {
+			this.head = { ...this.head, generation: this.head.generation + 1, latestSequence: this.head.latestSequence + 1 };
+			this.durableUpdate = input.update.slice();
+		}
 		const receipt = { ...input, durableGeneration: this.head.generation, vaultSequence: this.head.latestSequence };
-		this.receipts.set(`${input.bodyId}\u0000${input.clientId}\u0000${input.candidateId}`, receipt);
+		this.receipts.set(key, receipt);
 		if (this.throwAfterCommit) {
 			this.throwAfterCommit = false;
 			throw new Error("reply was lost after durable commit");
@@ -64,17 +82,18 @@ class CandidateStore {
 	}
 }
 
-function makeService(store: CandidateStore) {
+function makeService(
+	store: CandidateStore,
+	shouldPauseAdmission: () => boolean = () => false,
+	finalizeCreation: () => "committed" | "busy" | "superseded" = () => "committed",
+) {
 	let flushes = 0;
 	let notifications = 0;
+	const cache = new VaultDocumentCache(store as never, () => new Set(), () => new Set());
 	const service = new VaultCandidateService({
 		store,
-		cache: {
-			recordTransient: () => () => {},
-			applyDurableUpdate: () => false,
-			removePendingDigest: () => {},
-		},
-		lifecycle: () => ({ finalizeCreation: () => true }),
+		cache,
+		lifecycle: () => ({ finalizeCreation }),
 		sockets: () => ({
 			broadcastDocumentUpdate: () => {},
 			notifyBodyCommitted: () => { notifications++; },
@@ -83,17 +102,88 @@ function makeService(store: CandidateStore) {
 		vaultGeneration: () => "generation-candidate-0001",
 		runtimeEpoch: "epoch-candidate-0001",
 		flush: async () => { flushes++; return true; },
+		shouldPauseAdmission,
 	} as never);
 	return { service, flushes: () => flushes, notifications: () => notifications };
 }
 
-function candidateRequest(candidateDigest: string, body?: Uint8Array): Request {
+s.test("durable creation replay re-enters exact lifecycle finalization after restart", async () => {
+	const document = new Y.Doc({ guid: BODY_ID });
+	document.getText("body").insert(0, "restart-safe creation");
+	const update = Y.encodeStateAsUpdate(document);
+	document.destroy();
+	const candidateDigest = await digest(update);
+	const store = new CandidateStore();
+	store.creation = {
+		bodyId: BODY_ID,
+		fileId: BODY_ID,
+		path: "restart-safe.md",
+		operationId: "create-restart-safe",
+		candidateId: CANDIDATE_ID,
+		candidateDigest,
+		bodyEpoch: 1,
+		durableGeneration: 1,
+		vaultSequence: 1,
+		vaultGeneration: "generation-candidate-0001",
+		runtimeEpoch: "epoch-candidate-0001",
+	};
+	let firstFinalizations = 0;
+	const beforeRestart = makeService(store, () => false, () => {
+		firstFinalizations++;
+		return "busy";
+	});
+	const interrupted = await beforeRestart.service.handle(BODY_ID, candidateRequest(candidateDigest, update));
+	assert.equal(interrupted.status, 409);
+	assert.deepEqual(await interrupted.json(), { error: "recovery_boundary_in_progress" });
+	assert.equal(store.commits, 1);
+	assert.equal(firstFinalizations, 1);
+
+	let replayFinalizations = 0;
+	const afterRestart = makeService(store, () => false, () => {
+		replayFinalizations++;
+		return "committed";
+	});
+	const replayed = await afterRestart.service.handle(BODY_ID, candidateRequest(candidateDigest, update));
+	assert.equal(replayed.status, 200);
+	assert.equal(store.commits, 1, "restart replay does not create another durable commit");
+	assert.equal(store.receipts.size, 1, "creation replay remains exactly idempotent");
+	assert.equal(replayFinalizations, 1, "restart replay retries the missing root lifecycle transaction");
+});
+
+s.test("compaction pressure rejects new candidates before body work but preserves receipt replay", async () => {
+	const document = new Y.Doc({ guid: BODY_ID });
+	document.getText("body").insert(0, "pressure candidate");
+	const update = Y.encodeStateAsUpdate(document);
+	document.destroy();
+	const candidateDigest = await digest(update);
+	const store = new CandidateStore();
+	let paused = false;
+	const harness = makeService(store, () => paused);
+	const committed = await harness.service.handle(BODY_ID, candidateRequest(candidateDigest, update));
+	assert.equal(committed.status, 200);
+	paused = true;
+	const replay = await harness.service.handle(BODY_ID, candidateRequest(candidateDigest));
+	assert.equal(replay.status, 200, "durable idempotency replay remains available during pressure");
+
+	const freshId = "candidate-pressure-fresh";
+	const fresh = candidateRequest(candidateDigest, update);
+	fresh.headers.set("x-yaos-candidate-id", freshId);
+	const rejected = await harness.service.handle(BODY_ID, fresh);
+	assert.equal(rejected.status, 429);
+	assert.equal(rejected.headers.get("retry-after"), "1");
+	assert.deepEqual(await rejected.json(), { error: "semantic_compaction_backpressure" });
+	assert.equal(harness.flushes(), 1, "paused candidate is rejected before flushing or Yjs validation");
+	assert.equal(store.commits, 1);
+});
+
+function candidateRequest(candidateDigest: string, body?: Uint8Array, bodyEpoch = 1): Request {
 	return new Request(`https://internal/body/${BODY_ID}/candidate`, {
 		method: "POST",
 		headers: {
 			"x-yaos-device-id": DEVICE_ID,
 			"x-yaos-candidate-id": CANDIDATE_ID,
 			"x-yaos-candidate-digest": candidateDigest,
+			"x-yaos-body-epoch": String(bodyEpoch),
 		},
 		body: body?.slice().buffer,
 	});
@@ -125,6 +215,7 @@ s.test("durable candidate receipt is device-scoped and exact", async () => {
 		vaultId: "vault-candidate-0001",
 		vaultGeneration: "generation-candidate-0001",
 		bodyId: BODY_ID,
+		bodyEpoch: 1,
 		clientId: DEVICE_ID,
 		candidateId: CANDIDATE_ID,
 		candidateDigest,
@@ -136,9 +227,29 @@ s.test("durable candidate receipt is device-scoped and exact", async () => {
 	assert.equal(store.reconstructions, 1, "candidate metadata validation reconstructs exactly once");
 	assert.equal(store.appliedUpdates, 1, "the changed update is applied exactly once during validation");
 	assert.deepEqual(store.lastCommit, {
-		expectedHead: { generation: 1, latestSequence: 1 },
+		expectedHead: { generation: 1, semanticEpoch: 1, latestSequence: 1 },
 		changesState: true,
 	}, "the validated state decision and exact head are reused by commit");
+});
+
+s.test("stale semantic-epoch candidates are fenced before validation or persistence", async () => {
+	const doc = new Y.Doc({ guid: BODY_ID });
+	doc.getText("body").insert(0, "stale identity");
+	const update = Y.encodeStateAsUpdate(doc);
+	doc.destroy();
+	const candidateDigest = await digest(update);
+	const store = new CandidateStore();
+	store.advanceSemanticEpoch();
+	const { service, flushes } = makeService(store);
+	const response = await service.handle(BODY_ID, candidateRequest(candidateDigest, update, 1));
+	assert.equal(response.status, 409);
+	assert.deepEqual(await response.json(), {
+		error: "semantic_epoch_mismatch", purpose: "body", documentId: BODY_ID,
+		expectedEpoch: 2, receivedEpoch: 1, reset: "fetch_fresh_baseline",
+	});
+	assert.equal(flushes(), 0);
+	assert.equal(store.reconstructions, 0);
+	assert.equal(store.commits, 0);
 });
 
 s.test("semantic no-op preserves the current generation while writing an exact receipt", async () => {
@@ -154,7 +265,7 @@ s.test("semantic no-op preserves the current generation while writing an exact r
 	assert.equal(receipt.durableGeneration, 1);
 	assert.equal(receipt.candidateDigest, candidateDigest);
 	assert.deepEqual(store.lastCommit, {
-		expectedHead: { generation: 1, latestSequence: 1 },
+		expectedHead: { generation: 1, semanticEpoch: 1, latestSequence: 1 },
 		changesState: false,
 	});
 	assert.equal(store.reconstructions, 1);

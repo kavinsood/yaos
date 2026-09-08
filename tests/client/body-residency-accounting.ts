@@ -71,7 +71,7 @@ s.test("manager reports scratch reservations, transport signals, and eviction bl
 			snapshotDuringPersistence = manager.residencySnapshot().totals.temporaryReservedBytes;
 		},
 	});
-	const body = await manager.replaceFromServer("measured-body", encoded("body text"), 1);
+	const body = await manager.replaceFromServer("measured-body", encoded("body text"), 1, 1);
 	assert.ok(snapshotDuringPersistence > 0, "replacement/persistence reserves scratch before work completes");
 	manager.setExternalResourceSignals(body.bodyId, {
 		localPendingBufferBytes: 512,

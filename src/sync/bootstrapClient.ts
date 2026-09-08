@@ -14,6 +14,7 @@ import type { BodySettlementRepository, DiskSettlementFingerprint } from "./body
 import { splitMarkdownComponents } from "./frontmatterBoundary";
 import { decodeBinaryEnvelope, YAOS_BINARY_CONTENT_TYPE } from "@shared/binaryEnvelope";
 import type { CanvasManager } from "./canvas/canvasManager";
+import { parseSemanticEpoch, parseSemanticEpochHeader, type SemanticEpoch } from "@shared/semanticEpoch";
 
 export interface BootstrapHttpRequest {
 	url: string;
@@ -42,6 +43,7 @@ export interface ClientBootstrapDescriptor {
 	serverCompleted: boolean;
 	capture: {
 		vaultSequence: number;
+		rootEpoch: SemanticEpoch;
 		rootGeneration: number;
 		rootCheckpointHash: string;
 	};
@@ -60,6 +62,7 @@ export interface ClientCatalogEntry {
 	fileId: string;
 	path: string;
 	generation: number;
+	bodyEpoch: SemanticEpoch;
 	contentHash: string | null;
 	size: number | null;
 	previousPath?: string | null;
@@ -72,11 +75,13 @@ export interface ClientCatalogPage {
 
 export interface ClientBodyState {
 	bodyId: string;
+	bodyEpoch: SemanticEpoch;
 	generation: number;
 	encodedState: Uint8Array;
 }
 export interface ClientSemanticCatalogEntry {
 	documentId: string;
+	bodyEpoch: SemanticEpoch;
 	fileId: string;
 	kind: "canvas";
 	format: "json-canvas";
@@ -87,7 +92,12 @@ export interface ClientSemanticCatalogEntry {
 	size: number;
 }
 export interface ClientSemanticCatalogPage { entries: ClientSemanticCatalogEntry[]; nextCursor: string | null }
-export interface ClientSemanticState { documentId: string; generation: number; encodedState: Uint8Array }
+export interface ClientSemanticState {
+	documentId: string;
+	bodyEpoch: SemanticEpoch;
+	generation: number;
+	encodedState: Uint8Array;
+}
 
 export interface ClientCatchUpBody {
 	head: ClientCatalogEntry & { lifecycle: "active" | "tombstoned" | "reaped" };
@@ -98,6 +108,7 @@ export interface ClientFeedEntry {
 	sequence: number;
 	documentId: string;
 	generation: number;
+	documentEpoch: SemanticEpoch;
 	kind: string;
 	catalogs?: Array<ClientCatalogEntry & { lifecycle: "active" | "tombstoned" | "reaped" }>;
 	semanticCatalogs?: Array<ClientSemanticCatalogEntry & { lifecycle: "active" | "tombstoned" | "reaped" }>;
@@ -120,7 +131,7 @@ export interface BootstrapServerPort {
 	currentHeads(cursor: string | null, limit: number): Promise<ClientCatalogPage>;
 	currentHead(bodyId: string): Promise<ClientCatalogEntry | null>;
 	currentBody(bodyId: string): Promise<ClientBodyState>;
-	catchUpBodies?(requests: Array<{ bodyId: string; generation: number; contentHash?: string | null }>): Promise<Map<string, ClientCatchUpBody>>;
+	catchUpBodies?(requests: Array<{ bodyId: string; bodyEpoch: SemanticEpoch; generation: number; contentHash?: string | null }>): Promise<Map<string, ClientCatchUpBody>>;
 	settleRootThrough(sequence: number): Promise<void>;
 }
 export interface BootstrapDatabasePort {
@@ -202,7 +213,7 @@ async function runBounded<T, R>(
 export interface CoalescedFeedPage {
 	throughSequence: number;
 	catalogs: Array<ClientCatalogEntry & { lifecycle: "active" | "tombstoned" | "reaped" }>;
-	bodyGenerations: Map<string, { generation: number; kind: string }>;
+	bodyGenerations: Map<string, { bodyEpoch: SemanticEpoch; generation: number; kind: string }>;
 	semanticCatalogs: Array<ClientSemanticCatalogEntry & { lifecycle: "active" | "tombstoned" | "reaped" }>;
 }
 
@@ -219,7 +230,7 @@ export function coalesceFeedPage(
 		string,
 		ClientCatalogEntry & { lifecycle: "active" | "tombstoned" | "reaped" }
 	>();
-	const bodyGenerations = new Map<string, { generation: number; kind: string }>();
+	const bodyGenerations = new Map<string, { bodyEpoch: SemanticEpoch; generation: number; kind: string }>();
 	const semanticCatalogs = new Map<string, ClientSemanticCatalogEntry & { lifecycle: "active" | "tombstoned" | "reaped" }>();
 	for (const entry of entries) {
 		throughSequence = Math.max(throughSequence, entry.sequence);
@@ -237,6 +248,7 @@ export function coalesceFeedPage(
 			const prior = bodyGenerations.get(entry.documentId);
 			if (!prior || entry.generation >= prior.generation) {
 				bodyGenerations.set(entry.documentId, {
+					bodyEpoch: entry.documentEpoch,
 					generation: entry.generation,
 					kind: entry.kind,
 				});
@@ -257,6 +269,9 @@ export async function decodeVerifiedBodyContent(
 ): Promise<string> {
 	if (state.bodyId !== entry.bodyId) {
 		throw new Error(`body response identity mismatch for ${entry.bodyId}`);
+	}
+	if (state.bodyEpoch !== entry.bodyEpoch) {
+		throw new Error(`body epoch mismatch for ${entry.bodyId}`);
 	}
 	if (!Number.isSafeInteger(state.generation) || state.generation < entry.generation) {
 		throw new Error(`stale body generation for ${entry.bodyId}`);
@@ -306,6 +321,7 @@ function exactArrayBuffer(bytes: Uint8Array): ArrayBuffer {
 /** Authenticated bounded HTTP adapter for bootstrap and closed-body catch-up. */
 export class BootstrapHttpPort implements BootstrapServerPort {
 	private readonly base: string;
+	private readonly rootEpochByBootstrap = new Map<string, SemanticEpoch>();
 
 	constructor(
 		host: string,
@@ -319,11 +335,20 @@ export class BootstrapHttpPort implements BootstrapServerPort {
 	}
 
 	async start(attemptId?: string): Promise<ClientBootstrapDescriptor> {
-		return this.json<ClientBootstrapDescriptor>("bootstrap/start", "POST", { attemptId });
+		const descriptor = await this.json<ClientBootstrapDescriptor>("bootstrap/start", "POST", { attemptId });
+		descriptor.capture.rootEpoch = parseSemanticEpoch(descriptor.capture.rootEpoch, "bootstrap root epoch");
+		this.rootEpochByBootstrap.set(descriptor.bootstrapId, descriptor.capture.rootEpoch);
+		return descriptor;
 	}
 
 	async root(bootstrapId: string): Promise<Uint8Array> {
-		return this.bytes(`bootstrap/${encodeURIComponent(bootstrapId)}/root`);
+		const response = await this.raw(`bootstrap/${encodeURIComponent(bootstrapId)}/root`);
+		const receivedEpoch = parseSemanticEpochHeader(response.headers, "root");
+		const expectedEpoch = this.rootEpochByBootstrap.get(bootstrapId);
+		if (expectedEpoch === undefined || receivedEpoch !== expectedEpoch) {
+			throw new Error("bootstrap root epoch mismatch");
+		}
+		return new Uint8Array(response.arrayBuffer);
 	}
 
 	async catalog(bootstrapId: string, cursor: string | null, limit: number): Promise<ClientCatalogPage> {
@@ -344,7 +369,12 @@ export class BootstrapHttpPort implements BootstrapServerPort {
 		const response = await this.raw(`bootstrap/${encodeURIComponent(bootstrapId)}/semantic/${encodeURIComponent(documentId)}`);
 		const returned = response.headers["x-yaos-document-id"] ?? response.headers["X-Yaos-Document-Id"];
 		if (returned !== documentId) throw new Error("semantic bootstrap identity mismatch");
-		return { documentId, generation: this.generationHeader(response.headers), encodedState: new Uint8Array(response.arrayBuffer) };
+		return {
+			documentId,
+			bodyEpoch: parseSemanticEpochHeader(response.headers, "body"),
+			generation: this.generationHeader(response.headers),
+			encodedState: new Uint8Array(response.arrayBuffer),
+		};
 	}
 
 	async body(bootstrapId: string, bodyId: string): Promise<ClientBodyState> {
@@ -353,6 +383,7 @@ export class BootstrapHttpPort implements BootstrapServerPort {
 		);
 		return {
 			bodyId,
+			bodyEpoch: parseSemanticEpochHeader(response.headers, "body"),
 			generation: this.generationHeader(response.headers),
 			encodedState: new Uint8Array(response.arrayBuffer),
 		};
@@ -389,7 +420,7 @@ export class BootstrapHttpPort implements BootstrapServerPort {
 		}
 		if (response.status !== 200) throw new Error(`vault request failed (${response.status})`);
 		const value = decodeBinaryEnvelope(new Uint8Array(response.arrayBuffer)) as {
-			bodies: Array<{ bodyId: string; generation: number; encodedState: Uint8Array }>;
+			bodies: Array<{ bodyId: string; bodyEpoch: number; generation: number; encodedState: Uint8Array }>;
 		};
 		if (!Array.isArray(value.bodies) || value.bodies.length !== bodyIds.length) {
 			throw new Error("body batch response count mismatch");
@@ -400,6 +431,8 @@ export class BootstrapHttpPort implements BootstrapServerPort {
 			if (
 				!expected.has(body.bodyId)
 				|| states.has(body.bodyId)
+				|| !Number.isSafeInteger(body.bodyEpoch)
+				|| body.bodyEpoch < 1
 				|| !Number.isSafeInteger(body.generation)
 				|| body.generation < 0
 				|| !(body.encodedState instanceof Uint8Array)
@@ -408,6 +441,7 @@ export class BootstrapHttpPort implements BootstrapServerPort {
 			}
 			states.set(body.bodyId, {
 				bodyId: body.bodyId,
+				bodyEpoch: parseSemanticEpoch(body.bodyEpoch, "bootstrap body epoch"),
 				generation: body.generation,
 				encodedState: body.encodedState,
 			});
@@ -452,13 +486,14 @@ export class BootstrapHttpPort implements BootstrapServerPort {
 		const response = await this.raw(`body/${encodeURIComponent(bodyId)}`);
 		return {
 			bodyId,
+			bodyEpoch: parseSemanticEpochHeader(response.headers, "body"),
 			generation: this.generationHeader(response.headers),
 			encodedState: new Uint8Array(response.arrayBuffer),
 		};
 	}
 
 	async catchUpBodies(
-		requests: Array<{ bodyId: string; generation: number; contentHash?: string | null }>,
+		requests: Array<{ bodyId: string; bodyEpoch: SemanticEpoch; generation: number; contentHash?: string | null }>,
 	): Promise<Map<string, ClientCatchUpBody>> {
 		if (requests.length === 0) return new Map();
 		const response = await this.request({
@@ -509,10 +544,12 @@ export class BootstrapHttpPort implements BootstrapServerPort {
 			if ((entry.status !== 200 && entry.status !== 304)
 				|| entry.fileId !== entry.bodyId || typeof entry.path !== "string"
 				|| entry.lifecycle !== "active" || !Number.isSafeInteger(entry.generation)
+				|| !Number.isSafeInteger(entry.bodyEpoch) || (entry.bodyEpoch as number) < 1
 				|| typeof entry.contentHash !== "string" || !/^[a-f0-9]{64}$/.test(entry.contentHash)
 				|| !Number.isSafeInteger(entry.size)) throw new Error("invalid body catch-up metadata");
 			const head: ClientCatchUpBody["head"] = {
 				bodyId: entry.bodyId,
+				bodyEpoch: parseSemanticEpoch(entry.bodyEpoch, "catch-up body epoch"),
 				fileId: entry.fileId,
 				path: entry.path,
 				generation: entry.generation as number,
@@ -524,6 +561,7 @@ export class BootstrapHttpPort implements BootstrapServerPort {
 			const state = entry.status === 200
 				? {
 					bodyId: entry.bodyId,
+					bodyEpoch: parseSemanticEpoch(entry.bodyEpoch, "catch-up body epoch"),
 					generation: entry.generation as number,
 					encodedState: entry.update instanceof Uint8Array ? entry.update : (() => { throw new Error("invalid body catch-up update"); })(),
 				}
@@ -536,7 +574,9 @@ export class BootstrapHttpPort implements BootstrapServerPort {
 	async settleRootThrough(sequence: number): Promise<void> {
 		const response = await this.raw(`root?through=${sequence}`);
 		await this.database.putDocument({
+			kind: "root",
 			documentId: "root",
+			rootEpoch: parseSemanticEpochHeader(response.headers, "root"),
 			generation: this.generationHeader(response.headers),
 			encodedState: response.arrayBuffer,
 			dirty: false,
@@ -611,7 +651,9 @@ export async function prepareBootstrapRoot(
 	const validatedRoot = decodeBootstrapRoot(rootBytes);
 	validatedRoot.destroy();
 	await database.putDocument({
+		kind: "root",
 		documentId: "root",
+		rootEpoch: descriptor.capture.rootEpoch,
 		generation: descriptor.capture.rootGeneration,
 		encodedState: exactArrayBuffer(rootBytes),
 		dirty: false,
@@ -619,16 +661,20 @@ export async function prepareBootstrapRoot(
 	});
 	if ((descriptor.catalog.activeSemanticCount ?? 0) > 0 && server.semanticCatalog && server.semantic) {
 		let semanticCursor: string | null = null;
-		do {
+			do {
 			const page = await server.semanticCatalog(descriptor.bootstrapId, semanticCursor, PAGE_SIZE);
 			await runBounded(page.entries, 4, async (entry) => {
 				if (entry.kind !== "canvas" || entry.format !== "json-canvas" || entry.formatVersion !== 1
 					|| !entry.documentId || !entry.path || !Number.isSafeInteger(entry.generation) || entry.generation < 1) {
 					throw new Error("invalid semantic bootstrap catalog entry");
 				}
+				parseSemanticEpoch(entry.bodyEpoch, "semantic catalog body epoch");
 				const state = await server.semantic!(descriptor.bootstrapId, entry.documentId);
-				if (state.generation < entry.generation) throw new Error("stale semantic bootstrap state");
-				await database.putDocument({ documentId: entry.documentId, generation: state.generation,
+				if (state.bodyEpoch !== entry.bodyEpoch || state.generation < entry.generation) {
+					throw new Error("stale semantic bootstrap state");
+				}
+				await database.putDocument({ kind: "semantic", documentId: entry.documentId,
+					bodyEpoch: state.bodyEpoch, generation: state.generation,
 					encodedState: exactArrayBuffer(state.encodedState), dirty: false, updatedAt: now() });
 			});
 			semanticCursor = page.nextCursor;
@@ -636,6 +682,7 @@ export async function prepareBootstrapRoot(
 	}
 	const progress: StoredBootstrapProgress = {
 		bootstrapId: descriptor.bootstrapId,
+		rootEpoch: descriptor.capture.rootEpoch,
 		highWater: descriptor.catalog.highWater,
 		nextCatalogCursor: descriptor.catalog.firstCursor,
 		stage: "root-loaded",
@@ -803,18 +850,20 @@ export class BootstrapClient {
 
 	private async settleFeedBodies(
 		progress: StoredBootstrapProgress,
-		changes: ReadonlyMap<string, { generation: number; kind: string }>,
+		changes: ReadonlyMap<string, { bodyEpoch: SemanticEpoch; generation: number; kind: string }>,
 	): Promise<void> {
-		const pending: Array<{ bodyId: string; generation: number; contentHash?: string | null }> = [];
+		const pending: Array<{ bodyId: string; bodyEpoch: SemanticEpoch; generation: number; contentHash?: string | null }> = [];
 		for (const [bodyId, change] of changes) {
 			const [local, outstanding] = await Promise.all([
 				this.database.getDocument(bodyId),
 				this.database.getOutstanding(bodyId),
 			]);
 			if (change.kind === "body" && !outstanding && local && !local.dirty
+				&& local.kind === "body" && local.bodyEpoch === change.bodyEpoch
 				&& local.generation >= change.generation) continue;
 			pending.push({
 				bodyId,
+				bodyEpoch: change.bodyEpoch,
 				generation: outstanding
 					? Math.max(0, (local?.generation ?? 0) - 1)
 					: (local?.generation ?? 0),
@@ -1048,6 +1097,8 @@ export class BootstrapClient {
 				const materializedPath = await this.database.getMaterializedPath(expected.bodyId);
 				const currentAgreement = expected.previousPath == null
 					&& materializedPath === expected.path
+					&& local?.kind === "body"
+					&& local.bodyEpoch === expected.bodyEpoch
 					&& (local?.generation ?? -1) >= expected.generation
 					&& local?.dirty === false
 					? await this.currentSettlementAgreement(expected)
@@ -1081,6 +1132,7 @@ export class BootstrapClient {
 				await this.bodies.replaceFromServer(
 					expected.bodyId,
 					state.encodedState,
+					state.bodyEpoch,
 					state.generation,
 				);
 				const renameSources = new Set(
@@ -1247,6 +1299,7 @@ export class BootstrapClient {
 
 	private sameCatalogHead(left: ClientCatalogEntry, right: ClientCatalogEntry): boolean {
 		return left.bodyId === right.bodyId
+			&& left.bodyEpoch === right.bodyEpoch
 			&& left.path === right.path
 			&& left.previousPath === right.previousPath
 			&& left.generation === right.generation;
@@ -1323,6 +1376,7 @@ export class BootstrapClient {
 		if (!Number.isSafeInteger(entry.generation) || entry.generation < 0) {
 			throw new Error(`catalog entry has invalid generation for ${entry.bodyId}`);
 		}
+		parseSemanticEpoch(entry.bodyEpoch, `catalog body epoch for ${entry.bodyId}`);
 		if (entry.size !== null && (!Number.isSafeInteger(entry.size) || entry.size < 0)) {
 			throw new Error(`catalog entry has invalid size for ${entry.bodyId}`);
 		}

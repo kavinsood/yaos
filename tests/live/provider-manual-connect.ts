@@ -1,9 +1,8 @@
 import * as Y from "yjs";
 import YSyncProvider from "y-partyserver/provider";
-import WebSocket from "ws";
 import { PROTOCOL_VERSION, SCHEMA_VERSION } from "../../src/sync/schema.ts";
 import { describeFatalFrame, onFatalFrame } from "./fatalFrame.ts";
-import { fetchSocketTicket, requireLiveIdentity } from "./liveIdentity.ts";
+import { fetchSocketTicket, LiveWebSocket as WebSocket, requireLiveIdentity } from "./liveIdentity.ts";
 import { socketPrefix } from "./schema4Live.ts";
 
 const identity = requireLiveIdentity();
@@ -15,7 +14,7 @@ const provider = new YSyncProvider(identity.host, "root", doc, {
 		schemaVersion: String(SCHEMA_VERSION),
 		protocolVersion: String(PROTOCOL_VERSION),
 	}),
-	WebSocketPolyfill: globalThis.WebSocket ?? WebSocket,
+	WebSocketPolyfill: WebSocket as unknown as typeof globalThis.WebSocket,
 	connect: false,
 	maxBackoffTime: 500,
 });

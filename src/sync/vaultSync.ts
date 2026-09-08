@@ -30,6 +30,7 @@ import type {
 	StoredBodyReceipt,
 	StoredLifecycleOperation,
 	StoredDocument,
+	StoredSemanticEpochReplacement,
 } from "./vaultIndexedDb";
 import { obsidianRequest, type HttpRequester } from "../utils/http";
 import { patchTicketInUrl, SocketTicketHttpError, TICKET_REFRESH_BUFFER_MS, type SocketTicketScope } from "./socketTicket";
@@ -69,6 +70,20 @@ import { fencedWebSocketConstructor, type NativeSocketClose } from "./fencedWebS
 import { sameAuthorityIdentity, type VaultAuthorityIdentity } from "../collaboration/authority";
 import { CanvasManager, type CanvasPersistencePort, type CanvasProjectionPort } from "./canvas/canvasManager";
 import { CanvasHttpTransport } from "./canvas/canvasTransport";
+import {
+	INITIAL_SEMANTIC_EPOCH,
+	parseSemanticEpochMismatchPayload,
+	parseSemanticEpochResetFrame,
+	parseSemanticEpochHeader,
+	type SemanticEpoch,
+	type SemanticEpochMismatchPayload,
+	type SemanticEpochResetFrame,
+} from "@shared/semanticEpoch";
+import {
+	prepareSemanticEpochTransition,
+	prepareRootSemanticEpochTransition,
+	type SemanticEpochTransitionResult,
+} from "./semanticEpochTransition";
 export const ROOT_DOCUMENT_ID = "root";
 
 export interface SyncAwarenessPort {
@@ -240,12 +255,18 @@ interface EditorAdmissionTrace {
 
 export interface BodyHead {
 	bodyId: string;
+	bodyEpoch: SemanticEpoch;
 	generation: number;
 	contentHash?: string | null;
 	size?: number | null;
 	lifecycle?: "active" | "tombstoned" | "reaped";
 }
 export interface BodyState extends BodyHead {
+	encodedState: Uint8Array;
+}
+export interface RootState {
+	rootEpoch: SemanticEpoch;
+	generation: number;
 	encodedState: Uint8Array;
 }
 export type BodyReceipt = StoredBodyReceipt;
@@ -256,6 +277,7 @@ export interface LifecycleRequest {
 	kind: LifecycleKind;
 	fileId: string;
 	bodyId: string;
+	bodyEpoch: SemanticEpoch;
 	path?: string;
 	fromPath?: string;
 	toPath?: string;
@@ -266,6 +288,7 @@ export interface LifecycleReceipt {
 	vaultId: string;
 	vaultGeneration: string;
 	bodyId: string;
+	bodyEpoch: SemanticEpoch;
 	operationId: string;
 	kind: LifecycleKind;
 	durableGeneration: number;
@@ -279,6 +302,7 @@ export interface RootPublicationReceipt {
 	operationIds: string[];
 	vaultSequence: number;
 	rootGeneration: number;
+	rootEpoch: SemanticEpoch;
 	runtimeEpoch: string;
 }
 export interface LifecycleBatchReceipt {
@@ -294,6 +318,7 @@ export interface CandidateBatchReceipt {
 export interface BodyCommittedNotification {
 	type: "BODY_COMMITTED";
 	bodyId: string;
+	bodyEpoch: SemanticEpoch;
 	vaultGeneration: string;
 	durableGeneration: number;
 	runtimeEpoch: string;
@@ -309,6 +334,7 @@ export type VaultControlFrame =
 		socketSessionId: string | null;
 		vaultGeneration: string;
 		durableGeneration: number;
+		documentEpoch: SemanticEpoch;
 		runtimeEpoch: string;
 		liveness: SocketLivenessDescriptor;
 		capabilities: SocketControlCapabilities | null;
@@ -317,9 +343,11 @@ export type VaultControlFrame =
 		type: "VAULT_PONG";
 		probeId: string;
 		documentId: string;
+		documentEpoch: SemanticEpoch;
 		vaultGeneration: string;
 		runtimeEpoch: string;
 	}
+	| SemanticEpochResetFrame
 	| { type: "VAULT_BACKPRESSURE"; reason: string }
 	| { type: "VAULT_ERROR"; message: string };
 export interface DiskBodyCommitInput {
@@ -390,6 +418,7 @@ export interface AttachmentPublicationReceipt {
 	runtimeEpoch: string;
 	vaultSequence: number;
 	rootGeneration: number;
+	rootEpoch: SemanticEpoch;
 	rootUpdate: Uint8Array;
 }
 export interface CommittedOperationOutcome {
@@ -416,6 +445,7 @@ export class AttachmentPublicationError extends Error {
 		readonly status: number,
 		readonly code: string,
 		readonly mismatch: AttachmentRevisionMismatchDetails | null = null,
+		readonly semanticMismatch: SemanticEpochMismatchPayload | null = null,
 	) {
 		super(`attachment publication failed (${status}: ${code})`);
 		this.name = "AttachmentPublicationError";
@@ -423,7 +453,8 @@ export class AttachmentPublicationError extends Error {
 }
 
 export class VaultMutationRequestError extends Error {
-	constructor(readonly status: number, readonly code: string, operation: string) {
+	constructor(readonly status: number, readonly code: string, operation: string,
+		readonly semanticMismatch: SemanticEpochMismatchPayload | null = null) {
 		super(`${operation} failed (${status}: ${code})`);
 		this.name = "VaultMutationRequestError";
 	}
@@ -438,6 +469,7 @@ export class AttachmentPublicationProofError extends Error {
 export interface VaultServerPort {
 	currentHead(bodyId: string): Promise<BodyHead | null>;
 	currentBody(bodyId: string): Promise<BodyState>;
+	currentRoot?(): Promise<RootState>;
 	submitCandidate(record: CandidateRecord): Promise<BodyReceipt>;
 	submitCandidates?(records: readonly CandidateRecord[]): Promise<CandidateBatchReceipt>;
 	commitLifecycle(request: LifecycleRequest): Promise<LifecycleReceipt>;
@@ -447,11 +479,12 @@ export interface VaultServerPort {
 	publishLifecycleRoot(
 		operations: readonly LifecyclePublicationOperation[],
 		rootUpdate: Uint8Array,
+		rootEpoch: SemanticEpoch,
 	): Promise<RootPublicationReceipt>;
 	commitLifecycleBatch(
 		requests: readonly LifecycleRequest[],
 	): Promise<LifecycleBatchReceipt>;
-	publishAttachment(mutation: AttachmentPublicationMutation): Promise<AttachmentPublicationReceipt>;
+	publishAttachment(mutation: AttachmentPublicationMutation, rootEpoch: SemanticEpoch): Promise<AttachmentPublicationReceipt>;
 	committedOperationOutcome?(input: {
 		operationId: string;
 		requestDigest: string;
@@ -462,6 +495,7 @@ export interface VaultServerPort {
 export interface ProviderFactoryInput {
 	kind: "root" | "body" | "semantic";
 	documentId: string;
+	documentEpoch: SemanticEpoch;
 	doc: Y.Doc;
 	onClose: (event: NativeSocketClose) => void;
 }
@@ -477,6 +511,7 @@ export interface SocketTicketResult {
 export interface DocumentPersistencePort {
 	getDocument(documentId: string): Promise<StoredDocument | null>;
 	putDocument(document: StoredDocument): Promise<void>;
+	replaceBodySemanticEpoch?(replacement: StoredSemanticEpochReplacement): Promise<void>;
 	deleteDocument?(documentId: string): Promise<void>;
 	close(): Promise<void>;
 }
@@ -485,6 +520,13 @@ export type VaultDatabasePort =
 	DocumentPersistencePort
 	& AttachmentPersistencePort
 	& Partial<CandidatePersistencePort & LifecyclePersistencePort>;
+
+export interface SemanticEpochResetEvent {
+	purpose: "root" | "body";
+	documentId: string;
+	previousEpoch: SemanticEpoch;
+	currentEpoch: SemanticEpoch;
+}
 
 export interface VaultSyncOptions {
 	vaultId: string;
@@ -518,6 +560,16 @@ export interface VaultSyncOptions {
 	) => void | Promise<void>;
 	onProductEvent?: (event: ProductFlightPathEventInput) => void;
 	onControlFrame?: (frame: VaultControlFrame) => void;
+	onSemanticEpochReset?: (event: SemanticEpochResetEvent) => void | Promise<void>;
+	onSemanticEpochRebaseConflict?: (event: {
+		bodyId: string;
+		path: string;
+		previousEpoch: SemanticEpoch;
+		currentEpoch: SemanticEpoch;
+		kind: "conflict" | "too-large";
+		pendingMarkdown: string;
+		authoritativeContent: string;
+	}) => void | Promise<void>;
 	getAuthority?: () => VaultAuthorityIdentity;
 	onAuthoritySuperseded?: (
 		kind: "candidate" | "lifecycle" | "attachment",
@@ -568,6 +620,13 @@ export class FreshAdmissionCancelledError extends Error {
 	}
 }
 
+export class SemanticEpochRebaseError extends Error {
+	constructor(readonly result: Exclude<SemanticEpochTransitionResult, { kind: "ready" }>) {
+		super(`body ${result.bodyId} requires a preserved ${result.kind} rebase across semantic epoch`);
+		this.name = "SemanticEpochRebaseError";
+	}
+}
+
 const DEFAULT_CANDIDATE_MAX_WAIT_MS = 2_000;
 const DEFAULT_BODY_SYNC_TIMEOUT_MS = 10_000;
 const DEFAULT_CURRENTNESS_QUERY_TIMEOUT_MS = 2_000;
@@ -595,6 +654,8 @@ export function parseActiveBodyHead(bodyId: string, value: unknown): BodyHead | 
 	const candidate = value as Partial<BodyHead>;
 	if (
 		candidate.bodyId !== bodyId
+		|| !Number.isSafeInteger(candidate.bodyEpoch)
+		|| (candidate.bodyEpoch as number) < 1
 		|| typeof candidate.generation !== "number"
 		|| (candidate.lifecycle !== undefined
 			&& candidate.lifecycle !== "active"
@@ -610,6 +671,7 @@ export function parseActiveBodyHead(bodyId: string, value: unknown): BodyHead | 
 	if (candidate.lifecycle !== undefined && candidate.lifecycle !== "active") return null;
 	return {
 		bodyId,
+		bodyEpoch: candidate.bodyEpoch as SemanticEpoch,
 		generation: candidate.generation,
 		contentHash: candidate.contentHash,
 		size: candidate.size,
@@ -658,6 +720,8 @@ export function parseVaultControlFrame(payload: string): VaultControlFrame | nul
 				|| !record.vaultGeneration
 				|| !Number.isSafeInteger(record.durableGeneration)
 				|| (record.durableGeneration as number) < 0
+				|| !Number.isSafeInteger(record.documentEpoch)
+				|| (record.documentEpoch as number) < 1
 				|| typeof record.runtimeEpoch !== "string"
 				|| !record.runtimeEpoch
 				|| (capabilities !== null && socketSessionId === null)
@@ -669,6 +733,7 @@ export function parseVaultControlFrame(payload: string): VaultControlFrame | nul
 				socketSessionId,
 				vaultGeneration: record.vaultGeneration,
 				durableGeneration: record.durableGeneration as number,
+				documentEpoch: record.documentEpoch as SemanticEpoch,
 				runtimeEpoch: record.runtimeEpoch,
 				liveness,
 				capabilities,
@@ -678,6 +743,8 @@ export function parseVaultControlFrame(payload: string): VaultControlFrame | nul
 			const pong = parseVaultPongFrame(record);
 			return pong;
 		}
+		case "SEMANTIC_EPOCH_RESET_REQUIRED":
+			return parseSemanticEpochResetFrame(record);
 		case "VAULT_BACKPRESSURE":
 			return typeof record.reason === "string" && record.reason
 				? { type: "VAULT_BACKPRESSURE", reason: record.reason }
@@ -708,6 +775,8 @@ function asBodyCommittedNotification(payload: string): BodyCommittedNotification
 		|| typeof record.durableGeneration !== "number"
 		|| !Number.isSafeInteger(record.durableGeneration)
 		|| record.durableGeneration < 0
+		|| !Number.isSafeInteger(record.bodyEpoch)
+		|| (record.bodyEpoch as number) < 1
 		|| typeof record.runtimeEpoch !== "string"
 		|| !record.runtimeEpoch
 		|| (record.vaultSequence !== undefined
@@ -724,6 +793,7 @@ function asBodyCommittedNotification(payload: string): BodyCommittedNotification
 	return {
 		type: "BODY_COMMITTED",
 		bodyId: record.bodyId,
+		bodyEpoch: record.bodyEpoch as SemanticEpoch,
 		vaultGeneration: record.vaultGeneration,
 		durableGeneration: record.durableGeneration,
 		runtimeEpoch: record.runtimeEpoch,
@@ -764,7 +834,12 @@ function mutationRequestError(response: { status: number; json?: unknown }, oper
 	const code = value && typeof value === "object" && "error" in value && typeof value.error === "string"
 		? value.error
 		: "request_failed";
-	return new VaultMutationRequestError(response.status, code, operation);
+	return new VaultMutationRequestError(
+		response.status,
+		code,
+		operation,
+		parseSemanticEpochMismatchPayload(value),
+	);
 }
 function parseAttachmentHead(value: unknown): AttachmentHead | null {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
@@ -898,9 +973,24 @@ export class VaultSyncHttpPort implements VaultServerPort {
 		}
 		return {
 			bodyId,
+			bodyEpoch: parseSemanticEpochHeader(response.headers, "body"),
 			generation,
 			contentHash,
 			size,
+			encodedState: new Uint8Array(response.arrayBuffer),
+		};
+	}
+
+	async currentRoot(): Promise<RootState> {
+		const response = await this.request({
+			url: this.route("root"), method: "GET", headers: this.headers(),
+		});
+		if (response.status !== 200) throw new Error(`root state request failed (${response.status})`);
+		const generation = Number(response.headers["x-yaos-generation"] ?? response.headers["X-Yaos-Generation"]);
+		if (!Number.isSafeInteger(generation) || generation < 0) throw new Error("root state omitted generation");
+		return {
+			rootEpoch: parseSemanticEpochHeader(response.headers, "root"),
+			generation,
 			encodedState: new Uint8Array(response.arrayBuffer),
 		};
 	}
@@ -911,9 +1001,10 @@ export class VaultSyncHttpPort implements VaultServerPort {
 			method: "POST",
 			contentType: "application/octet-stream",
 			body: record.encodedUpdate,
-			headers: {
-				...this.headers(),
-				"x-yaos-candidate-id": record.candidateId,
+				headers: {
+					...this.headers(),
+					"x-yaos-body-epoch": String(record.bodyEpoch),
+					"x-yaos-candidate-id": record.candidateId,
 				"x-yaos-candidate-digest": record.candidateDigest,
 			},
 		});
@@ -951,26 +1042,27 @@ export class VaultSyncHttpPort implements VaultServerPort {
 	async publishLifecycleRoot(
 		operations: readonly LifecyclePublicationOperation[],
 		rootUpdate: Uint8Array,
+		rootEpoch: SemanticEpoch,
 	): Promise<RootPublicationReceipt> {
 		const response = await this.request({
 			url: this.route("lifecycle/publish"),
 			method: "POST",
 			contentType: YAOS_BINARY_CONTENT_TYPE,
-			body: encodeBinaryEnvelope({ operations, rootUpdate }).slice().buffer,
+			body: encodeBinaryEnvelope({ operations, rootUpdate, rootEpoch }).slice().buffer,
 			headers: this.headers(),
 		});
 		if (response.status !== 200) {
-			throw new Error(`lifecycle root publication failed (${response.status})`);
+			throw mutationRequestError(response, "lifecycle root publication");
 		}
 		return response.json as RootPublicationReceipt;
 	}
 
-	async publishAttachment(mutation: AttachmentPublicationMutation): Promise<AttachmentPublicationReceipt> {
+	async publishAttachment(mutation: AttachmentPublicationMutation, rootEpoch: SemanticEpoch): Promise<AttachmentPublicationReceipt> {
 		const response = await this.request({
 			url: this.route("attachments/publish"),
 			method: "POST",
 			contentType: "application/json",
-			body: JSON.stringify(mutation),
+			body: JSON.stringify({ ...mutation, rootEpoch }),
 			headers: this.headers(),
 		});
 		if (response.status !== 200) {
@@ -983,6 +1075,7 @@ export class VaultSyncHttpPort implements VaultServerPort {
 				response.status,
 				code,
 				mismatch,
+				parseSemanticEpochMismatchPayload(response.json),
 			);
 		}
 		return decodeBinaryEnvelope(new Uint8Array(response.arrayBuffer)) as AttachmentPublicationReceipt;
@@ -1028,16 +1121,16 @@ export class VaultSyncHttpPort implements VaultServerPort {
  * provider; open Markdown bodies own ordinary reference-counted providers.
  */
 export class VaultSync implements SyncRuntimePort {
-	readonly ydoc = new Y.Doc({ guid: ROOT_DOCUMENT_ID });
-	readonly pathToId = this.ydoc.getMap<string>("pathToId");
-	readonly pathToBlob = this.ydoc.getMap<BlobRef>("pathToBlob");
-	readonly pathToSemantic = this.ydoc.getMap<SemanticPathRef>("pathToSemantic");
-	readonly blobMeta = this.ydoc.getMap<BlobMeta>("blobMeta");
-	readonly blobTombstones = this.ydoc.getMap<BlobTombstone & { previousHash?: string | null }>("blobTombstones");
-	readonly meta = this.ydoc.getMap<unknown>("meta");
+	ydoc = new Y.Doc({ guid: ROOT_DOCUMENT_ID });
+	pathToId = this.ydoc.getMap<string>("pathToId");
+	pathToBlob = this.ydoc.getMap<BlobRef>("pathToBlob");
+	pathToSemantic = this.ydoc.getMap<SemanticPathRef>("pathToSemantic");
+	blobMeta = this.ydoc.getMap<BlobMeta>("blobMeta");
+	blobTombstones = this.ydoc.getMap<BlobTombstone & { previousHash?: string | null }>("blobTombstones");
+	meta = this.ydoc.getMap<unknown>("meta");
 	readonly bodies: BodyManager;
 	readonly canvases: CanvasManager | null;
-	readonly provider: SyncProviderPort;
+	provider: SyncProviderPort;
 	readonly deviceId: string;
 
 	private readonly options: Required<Pick<VaultSyncOptions,
@@ -1080,6 +1173,7 @@ export class VaultSync implements SyncRuntimePort {
 	private readonly pendingRenameTargets = new Map<string, string>();
 	private destroyed = false;
 	private _localReady = false;
+	private _rootEpoch: SemanticEpoch = INITIAL_SEMANTIC_EPOCH;
 	private _connectionGeneration = 0;
 	private _fatalAuthCode: FatalSyncCode | null = null;
 	private _fatalAuthDetails: FatalSyncDetails | null = null;
@@ -1096,14 +1190,16 @@ export class VaultSync implements SyncRuntimePort {
 	private backpressureLevel = 0;
 	private readonly editorAdmissionSamples: EditorAdmissionSample[] = [];
 	private readonly editorAdmissionPending = new Map<string, { sample: EditorAdmissionSample; startedAt: number }>();
+	private readonly semanticEpochResetRetryTimers = new Map<string, number>();
 
 	static async create(options: VaultSyncOptions): Promise<VaultSync> {
-		const runtime = new VaultSync(options);
-		await runtime.initialize();
+		const root = await options.database.getDocument(ROOT_DOCUMENT_ID);
+		const runtime = new VaultSync(options, root);
+		await runtime.initialize(root);
 		return runtime;
 	}
 
-	constructor(options: VaultSyncOptions) {
+	constructor(options: VaultSyncOptions, preloadedRoot?: StoredDocument | null) {
 		if (!options.vaultGeneration.trim()) throw new Error("vault generation is required");
 		this.options = {
 			...options,
@@ -1112,6 +1208,17 @@ export class VaultSync implements SyncRuntimePort {
 			candidateMaxWaitMs: options.candidateMaxWaitMs ?? DEFAULT_CANDIDATE_MAX_WAIT_MS,
 			bodySyncTimeoutMs: options.bodySyncTimeoutMs ?? DEFAULT_BODY_SYNC_TIMEOUT_MS,
 		};
+		if (preloadedRoot && preloadedRoot.kind !== "root") throw new Error("root cache has non-root epoch metadata");
+		if (preloadedRoot) {
+			this._rootEpoch = preloadedRoot.rootEpoch;
+			this._rootGeneration = preloadedRoot.generation;
+			if (preloadedRoot.encodedState.byteLength) {
+				Y.applyUpdate(this.ydoc, new Uint8Array(preloadedRoot.encodedState), "indexeddb-bootstrap");
+			}
+			if (this.ydoc.getMap("sys").get("schemaVersion") !== SCHEMA_VERSION) {
+				throw new Error(`local root cache is not schema ${SCHEMA_VERSION}`);
+			}
+		}
 		this.deviceId = options.deviceId;
 		this.server = options.server ?? new VaultSyncHttpPort(
 			options.host,
@@ -1128,7 +1235,8 @@ export class VaultSync implements SyncRuntimePort {
 			options.canvasProjection,
 			options.now,
 			32,
-			(documentId, doc) => factory({ kind: "semantic", documentId, doc,
+			(documentId, bodyEpoch, doc) => factory({ kind: "semantic", documentId,
+				documentEpoch: bodyEpoch, doc,
 				onClose: (event) => this.handleNativeSocketClose(event) }),
 			{
 				created: (documentId, provider) => {
@@ -1148,8 +1256,10 @@ export class VaultSync implements SyncRuntimePort {
 					this.socketLiveness.unregister(documentId);
 					this.invalidateSocketSession(provider);
 				},
-			},
-		) : null;
+				},
+				() => this._rootEpoch,
+				(minimumEpoch) => this.recoverRootSemanticEpoch(minimumEpoch),
+			) : null;
 		this.bodies = new BodyManager(
 			options.database,
 			options.now,
@@ -1177,7 +1287,8 @@ export class VaultSync implements SyncRuntimePort {
 			prepare: (reservation) => this.prepareResidencyReservation(reservation),
 			onBackpressure: (bodyId, reason) => this.log(`body admission backpressured for ${bodyId}: ${reason}`),
 		});
-		this.provider = factory({ kind: "root", documentId: ROOT_DOCUMENT_ID, doc: this.ydoc,
+		this.provider = factory({ kind: "root", documentId: ROOT_DOCUMENT_ID,
+			documentEpoch: this._rootEpoch, doc: this.ydoc,
 			onClose: (event) => this.handleNativeSocketClose(event) });
 		this.socketAdmission = new SocketAdmissionCoordinator({
 			scope: this.runtimeScope,
@@ -1223,6 +1334,7 @@ export class VaultSync implements SyncRuntimePort {
 			&& typeof candidate.deleteCanvasLifecycle === "function"
 			&& typeof candidate.getCanvasSettlement === "function"
 			&& typeof candidate.putCanvasSettlement === "function"
+			&& typeof candidate.replaceCanvasSemanticEpoch === "function"
 			? candidate as CanvasPersistencePort : null;
 	}
 
@@ -1349,16 +1461,22 @@ export class VaultSync implements SyncRuntimePort {
 		this.residencyRuntime.poke();
 	}
 
-	async initialize(): Promise<void> {
+	async initialize(preloadedRoot?: StoredDocument | null): Promise<void> {
 		if (this.destroyed) throw new Error("runtime is destroyed");
-		const root = await this.options.database.getDocument(ROOT_DOCUMENT_ID);
+		const root = preloadedRoot === undefined
+			? await this.options.database.getDocument(ROOT_DOCUMENT_ID)
+			: preloadedRoot;
 		if (this.destroyed) throw new Error("runtime closed during initialization");
-		this._rootGeneration = root?.generation ?? 0;
-		if (root?.encodedState.byteLength) {
-			Y.applyUpdate(this.ydoc, new Uint8Array(root.encodedState), "indexeddb-bootstrap");
-		}
-		if (root && this.ydoc.getMap("sys").get("schemaVersion") !== SCHEMA_VERSION) {
-			throw new Error(`local root cache is not schema ${SCHEMA_VERSION}`);
+		if (root && root.kind !== "root") throw new Error("root cache has non-root epoch metadata");
+		if (preloadedRoot === undefined) {
+			this._rootEpoch = root?.rootEpoch ?? INITIAL_SEMANTIC_EPOCH;
+			this._rootGeneration = root?.generation ?? 0;
+			if (root?.encodedState.byteLength) {
+				Y.applyUpdate(this.ydoc, new Uint8Array(root.encodedState), "indexeddb-bootstrap");
+			}
+			if (root && this.ydoc.getMap("sys").get("schemaVersion") !== SCHEMA_VERSION) {
+				throw new Error(`local root cache is not schema ${SCHEMA_VERSION}`);
+			}
 		}
 		await this.canvases?.initialize(this.pathToSemantic.entries());
 		await this.restoreCandidates();
@@ -1660,6 +1778,7 @@ export class VaultSync implements SyncRuntimePort {
 		const operation = existing ?? {
 			vaultId: this.options.vaultId,
 			vaultGeneration: this.options.vaultGeneration,
+			rootEpoch: this._rootEpoch,
 			mutation: proposed,
 			localSequence: 0,
 			createdAt: this.now(),
@@ -1781,12 +1900,23 @@ export class VaultSync implements SyncRuntimePort {
 		this.attachmentOperations.set(storedAttempt.mutation.operationId, storedAttempt);
 		let receipt: AttachmentPublicationReceipt;
 		try {
-			receipt = await this.server.publishAttachment(attempted.mutation);
+			receipt = await this.server.publishAttachment(attempted.mutation, attempted.rootEpoch);
 		} catch (error) {
 			if (this.shouldQueryAttachmentOutcome(error) && await this.recoverAttachmentOutcome(attempted)) return;
+			if (error instanceof AttachmentPublicationError
+				&& error.semanticMismatch?.purpose === "root"
+				&& error.semanticMismatch.documentId === ROOT_DOCUMENT_ID
+				&& error.semanticMismatch.receivedEpoch === attempted.rootEpoch) {
+				await this.recoverRootSemanticEpoch(error.semanticMismatch.expectedEpoch);
+				const rebased = { ...attempted, rootEpoch: this._rootEpoch };
+				const stored = await this.options.database.putAttachmentOperation(rebased);
+				this.assertStoredAttachmentOperation(rebased, stored);
+				this.attachmentOperations.set(stored.mutation.operationId, stored);
+				return;
+			}
 			throw error;
 		}
-		await this.applyAttachmentPublication(attempted.mutation, receipt);
+		await this.applyAttachmentPublication(attempted, receipt);
 		await this.options.database.deleteAttachmentOperation(attempted.mutation.operationId);
 		this.attachmentOperations.delete(attempted.mutation.operationId);
 		this.fatalAttachmentPublicationIds.delete(attempted.mutation.operationId);
@@ -1836,7 +1966,7 @@ export class VaultSync implements SyncRuntimePort {
 	private async recoverAttachmentOutcome(operation: StoredAttachmentPublicationOperation): Promise<boolean> {
 		const outcome = await this.exactCommittedOutcome(
 			operation.mutation.operationId,
-			await operationRequestDigest(operation.mutation),
+			await operationRequestDigest({ ...operation.mutation, rootEpoch: operation.rootEpoch }),
 			operation.authority,
 		);
 		if (!outcome) return false;
@@ -1866,6 +1996,7 @@ export class VaultSync implements SyncRuntimePort {
 		this.assertAttachmentMutation(stored.mutation);
 		if (expected.vaultId !== stored.vaultId
 			|| expected.vaultGeneration !== stored.vaultGeneration
+			|| expected.rootEpoch !== stored.rootEpoch
 			|| !this.sameAttachmentMutation(expected.mutation, stored.mutation)
 			|| !Number.isSafeInteger(stored.localSequence) || stored.localSequence <= 0
 			|| (expected.localSequence > 0 && stored.localSequence !== expected.localSequence)) {
@@ -1875,7 +2006,8 @@ export class VaultSync implements SyncRuntimePort {
 
 	private assertAttachmentOperationScope(operation: StoredAttachmentPublicationOperation): void {
 		if (operation.vaultId !== this.options.vaultId
-			|| operation.vaultGeneration !== this.options.vaultGeneration) {
+			|| operation.vaultGeneration !== this.options.vaultGeneration
+			|| !Number.isSafeInteger(operation.rootEpoch) || operation.rootEpoch < 1) {
 			throw new AttachmentPublicationProofError(
 				"attachment publication scope does not match the active vault generation",
 			);
@@ -2050,9 +2182,10 @@ export class VaultSync implements SyncRuntimePort {
 	}
 
 	private async applyAttachmentPublication(
-		mutation: AttachmentPublicationMutation,
+		operation: StoredAttachmentPublicationOperation,
 		receipt: AttachmentPublicationReceipt,
 	): Promise<void> {
+		const mutation = operation.mutation;
 		const expectedResults = mutation.kind === "rename"
 			? new Map([[mutation.fromPath, "deleted"], [mutation.toPath, "active"]] as const)
 			: new Map([[mutation.path, mutation.kind === "delete" ? "deleted" : "active"]] as const);
@@ -2065,6 +2198,7 @@ export class VaultSync implements SyncRuntimePort {
 			|| receipt.vaultGeneration !== this.options.vaultGeneration || !receipt.runtimeEpoch
 			|| !Number.isSafeInteger(receipt.vaultSequence) || receipt.vaultSequence < 0
 			|| !Number.isSafeInteger(receipt.rootGeneration) || receipt.rootGeneration < 0
+			|| receipt.rootEpoch !== operation.rootEpoch || receipt.rootEpoch !== this._rootEpoch
 			|| !(receipt.rootUpdate instanceof Uint8Array) || receipt.rootUpdate.byteLength === 0) {
 			throw new AttachmentPublicationProofError("attachment publication proof mismatch");
 		}
@@ -2247,6 +2381,7 @@ export class VaultSync implements SyncRuntimePort {
 			kind: "create",
 			fileId: input.bodyId,
 			bodyId: input.bodyId,
+			bodyEpoch: INITIAL_SEMANTIC_EPOCH,
 			path: input.path,
 		};
 		const storedOperation: StoredLifecycleOperation = {
@@ -2293,7 +2428,16 @@ export class VaultSync implements SyncRuntimePort {
 		}
 		request.candidateId = pending.record.candidateId;
 		request.candidateDigest = pending.record.candidateDigest;
-		const admissionReceipt = await this.server.commitLifecycle(request);
+		let admissionReceipt: LifecycleReceipt;
+		try {
+			admissionReceipt = await this.server.commitLifecycle(request);
+		} catch (error) {
+			if (this.isCreationPathSuperseded(error)) {
+				await this.cancelFreshAdmission(pending, operationId);
+				throw new FreshAdmissionCancelledError(input.path);
+			}
+			throw error;
+		}
 		this.validateLifecycleReceipt(request, admissionReceipt);
 		if (input.admissionStillCurrent?.() === false) {
 			await this.cancelFreshAdmission(pending, operationId);
@@ -2302,9 +2446,25 @@ export class VaultSync implements SyncRuntimePort {
 		const receipt = await this.submitCandidate(pending);
 		await save.call(this.options.database, {
 			...storedOperation,
+			candidateId: request.candidateId,
+			candidateDigest: request.candidateDigest,
 			content: null,
 		});
-		const lifecycleReceipt = await this.server.commitLifecycle(request);
+		let lifecycleReceipt: LifecycleReceipt;
+		try {
+			lifecycleReceipt = await this.server.commitLifecycle(request);
+		} catch (error) {
+			if (this.isCreationPathSuperseded(error)) {
+				await this.retireSupersededCreations([{
+					...storedOperation,
+					candidateId: request.candidateId,
+					candidateDigest: request.candidateDigest,
+					content: null,
+				}]);
+				throw new FreshAdmissionCancelledError(input.path);
+			}
+			throw error;
+		}
 		this.validateLifecycleReceipt(request, lifecycleReceipt);
 		if (lifecycleReceipt.vaultSequence < admissionReceipt.vaultSequence) {
 			throw new Error("fresh lifecycle final sequence regressed");
@@ -2369,6 +2529,7 @@ export class VaultSync implements SyncRuntimePort {
 				kind: "create",
 				fileId: input.bodyId,
 				bodyId: input.bodyId,
+				bodyEpoch: INITIAL_SEMANTIC_EPOCH,
 				path: input.path,
 			};
 			await save.call(this.options.database, {
@@ -2557,6 +2718,7 @@ export class VaultSync implements SyncRuntimePort {
 				kind: "revive",
 				fileId: input.bodyId,
 				bodyId: input.bodyId,
+				bodyEpoch: await this.currentBodyEpoch(input.bodyId),
 				path: input.path,
 			});
 		}
@@ -2583,6 +2745,13 @@ export class VaultSync implements SyncRuntimePort {
 
 	isBodyLoaded(bodyId: string): boolean {
 		return this.bodies.get(bodyId) !== null;
+	}
+
+	async currentBodyEpoch(bodyId: string): Promise<SemanticEpoch> {
+		const resident = this.bodies.get(bodyId);
+		if (resident) return resident.bodyEpoch;
+		const head = await this.server.currentHead(bodyId);
+		return head?.bodyEpoch ?? INITIAL_SEMANTIC_EPOCH;
 	}
 
 	isBodyOpen(bodyId: string): boolean {
@@ -2687,38 +2856,46 @@ export class VaultSync implements SyncRuntimePort {
 	}
 
 	handleDelete(path: string, _device?: string, opId: string = crypto.randomUUID()): void {
+		void this.commitDelete(path, _device, opId)
+			.catch((error) => this.log(`delete lifecycle remains pending for ${path}: ${String(error)}`));
+	}
+
+	/** Awaitable delete boundary for shutdown/final-drain callers. */
+	async commitDelete(path: string, _device?: string, opId: string = crypto.randomUUID()): Promise<void> {
 		const bodyId = this.getFileId(path);
 		if (!bodyId) {
 			if (this.getAttachmentRef(path)) {
-				void this.deleteAttachmentRef(path, _device)
-					.catch((error) => this.log(`attachment delete remains pending for ${path}: ${String(error)}`));
+				await this.deleteAttachmentRef(path, _device);
 			}
 			return;
 		}
-		void this.commitStructuralBatch([{
+		const bodyEpoch = await this.currentBodyEpoch(bodyId);
+		await this.commitStructuralBatch([{
 			operationId: opId,
 			kind: "delete",
 			fileId: bodyId,
 			bodyId,
+			bodyEpoch,
 			path,
-		}]).catch((error) => this.log(`delete lifecycle remains pending for ${path}: ${String(error)}`));
+		}]);
 	}
 
 	private async flushRenameBatch(): Promise<void> {
 		if (this.renameBatch.size === 0) return;
 		const batch = new Map(this.renameBatch);
 		this.renameBatch.clear();
-		const requests = [...batch].flatMap(([fromPath, toPath]) => {
+		const requests = (await Promise.all([...batch].map(async ([fromPath, toPath]): Promise<LifecycleRequest | null> => {
 			const bodyId = this.getFileId(fromPath);
-			return bodyId ? [{
+			return bodyId ? {
 				operationId: crypto.randomUUID(),
 				kind: "rename" as const,
 				fileId: bodyId,
 				bodyId,
+				bodyEpoch: await this.currentBodyEpoch(bodyId),
 				fromPath,
 				toPath,
-			}] : [];
-		});
+			} : null;
+		}))).filter((request): request is LifecycleRequest => request !== null);
 		try {
 			if (requests.length > 0) await this.commitStructuralBatch(requests);
 			this.renameBatchListener?.(batch);
@@ -3102,6 +3279,8 @@ export class VaultSync implements SyncRuntimePort {
 		this.runtimeScope.stopAdmission();
 		this.socketAdmission.stop();
 		this.socketLiveness.stop();
+		for (const timer of this.semanticEpochResetRetryTimers.values()) window.clearTimeout(timer);
+		this.semanticEpochResetRetryTimers.clear();
 		for (const waiter of this.currentnessWaiters.values()) {
 			window.clearTimeout(waiter.timer);
 			waiter.resolve(null);
@@ -3168,48 +3347,53 @@ export class VaultSync implements SyncRuntimePort {
 	}
 
 	private wireRootProvider(): void {
+		const provider = this.provider;
+		const document = this.ydoc;
 		this.bodies.coordinator.replacePathBindings(this.pathToId.entries());
 		this.ydoc.on("afterTransaction", () => {
-			if (!this.destroyed) {
+			if (!this.destroyed && this.ydoc === document) {
 				this.bodies.coordinator.replacePathBindings(this.pathToId.entries());
 				this.canvases?.replaceCatalog(this.pathToSemantic.entries());
 			}
 		});
-		this.provider.on("status", ({ status }) => {
+		provider.on("status", ({ status }) => {
+			if (this.provider !== provider) return;
 			if (status === "connected") {
-				this.expectedLivenessDisconnects.delete(this.provider);
-				this.invalidateSocketSession(this.provider);
+				this.expectedLivenessDisconnects.delete(provider);
+				this.invalidateSocketSession(provider);
 				this.socketLiveness.connected(ROOT_DOCUMENT_ID);
 				this._connectionGeneration++;
 				this.workScheduler.poke("root-connected");
-			} else if (status === "disconnected" && this.expectedLivenessDisconnects.delete(this.provider)) {
-				this.invalidateSocketSession(this.provider);
+			} else if (status === "disconnected" && this.expectedLivenessDisconnects.delete(provider)) {
+				this.invalidateSocketSession(provider);
 				this.socketLiveness.disconnected(ROOT_DOCUMENT_ID);
 			} else if (status === "disconnected" && !this.fatalAuthError && !this.socketAdmission.isAttempting) {
-				this.invalidateSocketSession(this.provider);
+				this.invalidateSocketSession(provider);
 				this.socketLiveness.disconnected(ROOT_DOCUMENT_ID);
-				this.provider.disconnect();
+				provider.disconnect();
 				this.requestReconnect("root-disconnected");
 			} else if (status === "disconnected") {
-				this.invalidateSocketSession(this.provider);
+				this.invalidateSocketSession(provider);
 				this.socketLiveness.disconnected(ROOT_DOCUMENT_ID);
 			}
 		});
-		this.provider.on("sync", (synced) => {
-			if (!synced) return;
+		provider.on("sync", (synced) => {
+			if (!synced || this.provider !== provider) return;
 			for (const callback of this.providerSyncListeners) callback(this._connectionGeneration);
 		});
 		const handleFatal = (payload: string) => {
+			if (this.provider !== provider) return;
 			const fatal = asFatalSyncMessage(payload);
 			if (!fatal) return;
 			this.setFatalAuth(fatal.code, fatal.details);
 		};
 		const handleRootControl = (payload: string) => {
+			if (this.provider !== provider) return;
 			handleFatal(payload);
-			this.handleVaultControl(payload, ROOT_DOCUMENT_ID, this.provider);
-			this.handleCurrentnessResult(payload, this.provider);
+			this.handleVaultControl(payload, ROOT_DOCUMENT_ID, provider);
+			this.handleCurrentnessResult(payload, provider);
 			const committed = asBodyCommittedNotification(payload);
-			const session = this.socketSessions.get(this.provider);
+			const session = this.socketSessions.get(provider);
 			if (committed && session
 				&& committed.vaultGeneration === this.options.vaultGeneration
 				&& committed.runtimeEpoch === session.runtimeEpoch) {
@@ -3220,9 +3404,10 @@ export class VaultSync implements SyncRuntimePort {
 				this.log(`Canvas refresh failed for ${semanticDocumentId}: ${String(error)}`);
 			});
 		};
-		this.provider.on("custom-message", handleRootControl);
+		provider.on("custom-message", handleRootControl);
 		this.ydoc.on("update", (_update, origin) => {
-			if (origin === this.provider.documentOrigin) {
+			if (this.ydoc !== document) return;
+			if (origin === provider.documentOrigin) {
 				this._lastRemoteUpdateAt = this.now();
 				const invalidPath = this.invalidRootPath();
 				if (invalidPath) {
@@ -3263,7 +3448,8 @@ export class VaultSync implements SyncRuntimePort {
 	private createBodySession(body: LoadedBody): BodySession {
 		this.ensureSemanticMirror(body);
 		const factory = this.options.providerFactory ?? ((input) => this.createDefaultProvider(input));
-		const provider = factory({ kind: "body", documentId: body.bodyId, doc: body.doc,
+		const provider = factory({ kind: "body", documentId: body.bodyId,
+			documentEpoch: body.bodyEpoch, doc: body.doc,
 			onClose: (event) => this.handleNativeSocketClose(event) });
 		this.registerSocketLiveness(body.bodyId, provider);
 		const lifetimeLease = this.bodies.acquireLease(body.bodyId);
@@ -3301,6 +3487,7 @@ export class VaultSync implements SyncRuntimePort {
 				void this.bodies.mergeFromServer(
 					body.bodyId,
 					new Uint8Array(),
+					body.bodyEpoch,
 					body.generation,
 				).catch((error) => {
 					this.log(`remote body persistence failed for ${body.bodyId}: ${String(error)}`);
@@ -3572,6 +3759,7 @@ export class VaultSync implements SyncRuntimePort {
 
 	private async promoteBodyFromCurrentness(body: LoadedBody, head: BodyCurrentnessHead): Promise<boolean> {
 		if (head.lifecycle !== "active") return false;
+		if (head.bodyEpoch !== body.bodyEpoch) return false;
 		const revision = this.bodies.captureRevision(body.bodyId);
 		if (!await this.bodyMatchesHead(body.doc, head)
 			|| !this.bodies.coordinator.isContentCurrent(revision)) return false;
@@ -3722,20 +3910,235 @@ export class VaultSync implements SyncRuntimePort {
 		}
 		if (!head) throw new Error(`body ${body.bodyId} is not active`);
 		if (
+			head.bodyEpoch === body.bodyEpoch
+			&&
 			head.generation <= body.generation
 			&& await this.bodyMatchesHead(body.doc, head)
 		) return body;
 		const stateFetchStartedAt = trace ? this.monotonicNow() : 0;
 		const state = await this.server.currentBody(body.bodyId);
-		if (state.bodyId !== body.bodyId || state.generation < head.generation) {
+		if (state.bodyId !== body.bodyId || state.bodyEpoch !== head.bodyEpoch || state.generation < head.generation) {
 			throw new Error("stale body catch-up response");
 		}
 		await this.validateBodyStateIntegrity(head, state);
 		if (trace) trace.stateFetchMs += Math.max(0, this.monotonicNow() - stateFetchStartedAt);
+		if (state.bodyEpoch !== body.bodyEpoch) {
+			return this.rebaseBodyAcrossSemanticEpoch(body, state);
+		}
 		return body.dirty || body.unsettled > 0 || body.pendingLocalUpdates > 0 || body.pins > 0
 			|| (this.bodies.coordinator.snapshot(body.bodyId)?.leaseCount ?? 0) > 0
-			? this.bodies.mergeFromServer(body.bodyId, state.encodedState, state.generation)
-			: this.bodies.replaceFromServer(body.bodyId, state.encodedState, state.generation);
+			? this.bodies.mergeFromServer(body.bodyId, state.encodedState, state.bodyEpoch, state.generation)
+			: this.bodies.replaceFromServer(body.bodyId, state.encodedState, state.bodyEpoch, state.generation);
+	}
+
+	private async rebaseBodyAcrossSemanticEpoch(body: LoadedBody, state: BodyState): Promise<LoadedBody> {
+		if (state.bodyEpoch <= body.bodyEpoch) throw new Error(`stale semantic epoch for body ${body.bodyId}`);
+		const session = this.sessions.get(body.bodyId);
+		let transition = prepareSemanticEpochTransition({
+			bodyId: body.bodyId,
+			previousBodyEpoch: body.bodyEpoch,
+			nextBodyEpoch: state.bodyEpoch,
+			previousBaseline: body.durableBaseline,
+			pendingMarkdown: body.doc.getText(BODY_TEXT_NAME).toJSON(),
+			authoritativeEncodedState: state.encodedState,
+		});
+		if (transition.kind !== "ready") {
+			const rejected = transition;
+			const path = this.pathForBodyId(body.bodyId);
+			if (!path || !this.options.onSemanticEpochRebaseConflict) {
+				throw new SemanticEpochRebaseError(rejected);
+			}
+			// Preserve the user's semantic intent outside the retired CRDT lineage
+			// before installing the fresh authoritative epoch.  If preservation
+			// fails, retain the old local document and fail closed.
+			await this.options.onSemanticEpochRebaseConflict({
+				bodyId: body.bodyId,
+				path,
+				previousEpoch: body.bodyEpoch,
+				currentEpoch: state.bodyEpoch,
+				kind: rejected.kind,
+				pendingMarkdown: rejected.pendingMarkdown,
+				authoritativeContent: rejected.authoritativeContent,
+			});
+			transition = prepareSemanticEpochTransition({
+				bodyId: body.bodyId,
+				previousBodyEpoch: body.bodyEpoch,
+				nextBodyEpoch: state.bodyEpoch,
+				previousBaseline: rejected.authoritativeContent,
+				pendingMarkdown: rejected.authoritativeContent,
+				authoritativeEncodedState: state.encodedState,
+			});
+			if (transition.kind !== "ready") throw new Error("authoritative semantic epoch transition did not converge");
+		}
+		const candidateId = transition.rebasedUpdate ? crypto.randomUUID() : null;
+		const capturedAt = this.now();
+		const candidateRecord: CandidateRecord | null = transition.rebasedUpdate && candidateId ? {
+			vaultId: this.options.vaultId,
+			bodyId: body.bodyId,
+			bodyEpoch: transition.bodyEpoch,
+			previousBaseline: transition.authoritativeContent,
+			pendingMarkdown: transition.rebasedContent,
+			candidateId,
+			candidateDigest: await sha256Hex(transition.rebasedUpdate),
+			encodedUpdate: transition.rebasedUpdate.slice().buffer,
+			capturedAt,
+			capturedLocalUpdates: body.pendingLocalUpdates,
+			authority: this.captureAuthority(),
+		} : null;
+		const consumers = session ? [...session.consumers] : [];
+		if (session) {
+			for (const consumerId of consumers) {
+				session.projectionLeases.get(consumerId)?.release();
+				this.bodies.unpin(body.bodyId);
+				this.consumerGenerations.set(consumerId, (this.consumerGenerations.get(consumerId) ?? 0) + 1);
+			}
+			session.projectionLeases.clear();
+			session.consumers.clear();
+			this.destroyBodySession(session);
+		}
+		let installed = false;
+		try {
+			const replacement = await this.bodies.installSemanticEpochTransition(
+				transition,
+				state.generation,
+				candidateRecord,
+			);
+			installed = true;
+			const staleCandidates = [...this.pendingCandidates.values()]
+				.filter((candidate) => candidate.record.bodyId === body.bodyId);
+			for (const candidate of staleCandidates) this.pendingCandidates.delete(candidate.record.candidateId);
+			this.pendingUpdates.delete(body.bodyId);
+			if (candidateRecord) {
+				const pending: PendingCandidate = {
+					record: candidateRecord,
+					submission: null,
+					path: this.pathForBodyId(body.bodyId),
+				};
+				this.pendingCandidates.set(candidateRecord.candidateId, pending);
+				this._lastCandidateCapturedAt = capturedAt;
+				this._candidatePersistenceHealthy = true;
+				void this.submitCandidate(pending).catch((error) => {
+					this.log(`semantic epoch rebase remains pending for ${body.bodyId}: ${String(error)}`);
+				});
+			}
+			await this.notifySemanticEpochReset({
+				purpose: "body", documentId: body.bodyId,
+				previousEpoch: body.bodyEpoch, currentEpoch: state.bodyEpoch,
+			});
+			return replacement;
+		} catch (error) {
+			if (!installed && session && consumers.length > 0 && this.bodies.get(body.bodyId) === body) {
+				const restored = this.createBodySession(body);
+				this.sessions.set(body.bodyId, restored);
+				for (const consumerId of consumers) {
+					const generation = (this.consumerGenerations.get(consumerId) ?? 0) + 1;
+					this.consumerGenerations.set(consumerId, generation);
+					const path = this.pathForBodyId(body.bodyId);
+					if (path) this.attachEditorConsumer(path, body.bodyId, consumerId, generation, restored, body);
+				}
+			}
+			throw error;
+		} finally {
+			if (!installed) transition.document.destroy();
+		}
+	}
+
+	/**
+	 * Deliver the editor/runtime integration hook without making an installed
+	 * authoritative epoch depend on UI code. A failed hook is retried until it
+	 * succeeds (or the runtime is destroyed), and a newer reset replaces an
+	 * older retry for the same document.
+	 */
+	private async notifySemanticEpochReset(event: SemanticEpochResetEvent, attempt = 0): Promise<void> {
+		const callback = this.options.onSemanticEpochReset;
+		if (!callback || this.destroyed) return;
+		const key = `${event.purpose}:${event.documentId}`;
+		try {
+			await Promise.resolve(callback(event));
+			const timer = this.semanticEpochResetRetryTimers.get(key);
+			if (timer !== undefined) window.clearTimeout(timer);
+			this.semanticEpochResetRetryTimers.delete(key);
+		} catch (error) {
+			this.log(`semantic epoch integration failed; retrying: ${String(error)}`);
+			const prior = this.semanticEpochResetRetryTimers.get(key);
+			if (prior !== undefined) window.clearTimeout(prior);
+			const delay = Math.min(5_000, 100 * (2 ** Math.min(attempt, 5)));
+			const timer = window.setTimeout(() => {
+				if (this.semanticEpochResetRetryTimers.get(key) !== timer) return;
+				this.semanticEpochResetRetryTimers.delete(key);
+				void this.notifySemanticEpochReset(event, attempt + 1);
+			}, delay);
+			this.semanticEpochResetRetryTimers.set(key, timer);
+		}
+	}
+
+	private async recoverBodySemanticEpoch(bodyId: string, minimumEpoch: SemanticEpoch): Promise<LoadedBody> {
+		const body = this.bodies.get(bodyId) ?? await this.loadBodyWithPriority(bodyId, "foreground", true);
+		if (body.bodyEpoch >= minimumEpoch) return body;
+		const state = await this.server.currentBody(bodyId);
+		if (state.bodyId !== bodyId || state.bodyEpoch < minimumEpoch) {
+			throw new Error(`body ${bodyId} semantic epoch recovery returned a stale baseline`);
+		}
+		await this.validateBodyStateIntegrity(state, state);
+		if (state.bodyEpoch === body.bodyEpoch) return body;
+		return this.rebaseBodyAcrossSemanticEpoch(body, state);
+	}
+
+	private async recoverRootSemanticEpoch(minimumEpoch: SemanticEpoch): Promise<void> {
+		if (this._rootEpoch >= minimumEpoch) return;
+		if (!this.server.currentRoot) throw new Error("root semantic epoch recovery is unavailable");
+		const state = await this.server.currentRoot();
+		if (state.rootEpoch < minimumEpoch || state.rootEpoch <= this._rootEpoch) {
+			throw new Error("root semantic epoch recovery returned a stale baseline");
+		}
+		const previousEpoch = this._rootEpoch;
+		const transition = prepareRootSemanticEpochTransition({
+			previousRootEpoch: previousEpoch,
+			nextRootEpoch: state.rootEpoch,
+			authoritativeEncodedState: state.encodedState,
+		});
+		await this.options.database.putDocument({
+			kind: "root", documentId: ROOT_DOCUMENT_ID, rootEpoch: transition.rootEpoch,
+			generation: state.generation,
+			encodedState: Y.encodeStateAsUpdate(transition.document).slice().buffer,
+			dirty: false, pendingLocalUpdates: 0, updatedAt: this.now(),
+		});
+		const previousDocument = this.ydoc;
+		const previousProvider = this.provider;
+		this.socketLiveness.unregister(ROOT_DOCUMENT_ID);
+		this.invalidateSocketSession(previousProvider);
+		this.terminateProvider(previousProvider);
+		previousProvider.awareness.destroy();
+		previousProvider.destroy();
+		this.ydoc = transition.document;
+		this.pathToId = this.ydoc.getMap<string>("pathToId");
+		this.pathToBlob = this.ydoc.getMap<BlobRef>("pathToBlob");
+		this.pathToSemantic = this.ydoc.getMap<SemanticPathRef>("pathToSemantic");
+		this.blobMeta = this.ydoc.getMap<BlobMeta>("blobMeta");
+		this.blobTombstones = this.ydoc.getMap<BlobTombstone & { previousHash?: string | null }>("blobTombstones");
+		this.meta = this.ydoc.getMap<unknown>("meta");
+		this._rootEpoch = transition.rootEpoch;
+		this._rootGeneration = state.generation;
+		const factory = this.options.providerFactory ?? ((input) => this.createDefaultProvider(input));
+		this.provider = factory({ kind: "root", documentId: ROOT_DOCUMENT_ID,
+			documentEpoch: this._rootEpoch, doc: this.ydoc,
+			onClose: (event) => this.handleNativeSocketClose(event) });
+		this.registerSocketLiveness(ROOT_DOCUMENT_ID, this.provider);
+		this.wireRootProvider();
+		previousDocument.destroy();
+		this.bodies.coordinator.replacePathBindings(this.pathToId.entries());
+		this.canvases?.replaceCatalog(this.pathToSemantic.entries());
+		const admission = await this.socketAdmission.admit(
+			this.asAdmissionProvider(ROOT_DOCUMENT_ID, this.provider),
+			"semantic-epoch-reset",
+		);
+		this.applyTerminalAdmissionOutcome(admission);
+		if (admission.kind !== "completed") throw new Error(`root socket epoch admission failed: ${admission.kind}`);
+		await this.notifySemanticEpochReset({
+			purpose: "root", documentId: ROOT_DOCUMENT_ID,
+			previousEpoch, currentEpoch: this._rootEpoch,
+		});
+		await Promise.resolve(this.options.onRemoteRootStructuralUpdate?.());
 	}
 	private async bodyMatchesHead(doc: Y.Doc, head: BodyHead): Promise<boolean> {
 		if (
@@ -3765,6 +4168,7 @@ export class VaultSync implements SyncRuntimePort {
 		head: BodyHead,
 		state: BodyState,
 	): Promise<void> {
+		if (head.bodyEpoch !== state.bodyEpoch) throw new Error("body response epoch mismatch");
 		const doc = new Y.Doc();
 		try {
 			Y.applyUpdate(doc, state.encodedState);
@@ -3911,6 +4315,7 @@ export class VaultSync implements SyncRuntimePort {
 			if (!body || body.doc !== session.doc) return;
 			const head: BodyCurrentnessHead = {
 				bodyId: current.bodyId,
+				bodyEpoch: current.bodyEpoch,
 				lifecycle: "active",
 				generation: current.durableGeneration,
 				contentHash: current.contentHash ?? null,
@@ -3936,8 +4341,14 @@ export class VaultSync implements SyncRuntimePort {
 		}
 		if (!frame) return;
 		if (frame.type === "VAULT_READY") {
+			const expectedEpoch = expectedDocumentId === ROOT_DOCUMENT_ID
+				? this._rootEpoch
+				: this.bodies.get(expectedDocumentId)?.bodyEpoch
+					?? this.canvases?.bodyEpoch(expectedDocumentId) ?? undefined;
 			if (frame.documentId !== expectedDocumentId
-				|| frame.vaultGeneration !== this.options.vaultGeneration) {
+				|| frame.vaultGeneration !== this.options.vaultGeneration
+				|| expectedEpoch === undefined
+				|| frame.documentEpoch !== expectedEpoch) {
 				this.invalidateSocketSession(provider);
 				frame = { type: "VAULT_ERROR", message: "ready socket authority mismatch" };
 			} else {
@@ -3959,11 +4370,38 @@ export class VaultSync implements SyncRuntimePort {
 				}
 			}
 		} else if (frame.type === "VAULT_PONG") {
+			const expectedEpoch = expectedDocumentId === ROOT_DOCUMENT_ID
+				? this._rootEpoch
+				: this.bodies.get(expectedDocumentId)?.bodyEpoch
+					?? this.canvases?.bodyEpoch(expectedDocumentId) ?? undefined;
 			if (frame.documentId !== expectedDocumentId
-				|| frame.vaultGeneration !== this.options.vaultGeneration) return;
+				|| frame.vaultGeneration !== this.options.vaultGeneration
+				|| frame.documentEpoch !== expectedEpoch) return;
 			this.socketLiveness.acknowledge(expectedDocumentId, frame.probeId, frame.runtimeEpoch);
 			this.options.onControlFrame?.(frame);
 			return;
+		} else if (frame.type === "SEMANTIC_EPOCH_RESET_REQUIRED") {
+			const reset = frame;
+			const purpose = expectedDocumentId === ROOT_DOCUMENT_ID ? "root" : "body";
+			const canvasEpoch = purpose === "body" ? this.canvases?.bodyEpoch(expectedDocumentId) ?? null : null;
+			const currentEpoch = purpose === "root"
+				? this._rootEpoch
+				: this.bodies.get(expectedDocumentId)?.bodyEpoch ?? canvasEpoch ?? undefined;
+			if (frame.purpose !== purpose || frame.documentId !== expectedDocumentId
+				|| currentEpoch === undefined || frame.receivedEpoch !== currentEpoch
+				|| frame.expectedEpoch <= currentEpoch) return;
+			this.invalidateSocketSession(provider);
+			this.forceAbortProvider(expectedDocumentId, provider);
+			const recovery = reset.purpose === "body" && canvasEpoch !== null
+				? this.canvases!.recoverSemanticEpoch(reset.documentId, reset.expectedEpoch).then(() =>
+					this.notifySemanticEpochReset({
+						purpose: "body", documentId: reset.documentId,
+						previousEpoch: canvasEpoch, currentEpoch: reset.expectedEpoch,
+					}))
+				: reset.purpose === "body"
+					? this.recoverBodySemanticEpoch(reset.documentId, reset.expectedEpoch)
+				: this.recoverRootSemanticEpoch(reset.expectedEpoch);
+			void recovery.catch((error) => this.log(`${purpose} semantic epoch recovery failed: ${String(error)}`));
 		} else if (frame.type === "VAULT_BACKPRESSURE") {
 			this.backpressureLevel = Math.min(this.backpressureLevel + 1, 5);
 			const delay = Math.min(
@@ -4071,9 +4509,14 @@ export class VaultSync implements SyncRuntimePort {
 			return existing;
 		}
 		const capturedAt = this.now();
+		const body = this.bodies.get(bodyId);
+		if (!body) throw new Error(`cannot capture candidate for unloaded body ${bodyId}`);
 		const record: CandidateRecord = {
 			vaultId: this.options.vaultId,
 			bodyId,
+			bodyEpoch: body.bodyEpoch,
+			previousBaseline: body.durableBaseline,
+			pendingMarkdown: body.doc.getText(BODY_TEXT_NAME).toJSON(),
 			candidateId,
 			candidateDigest,
 			encodedUpdate: encodedUpdate.slice().buffer,
@@ -4140,6 +4583,13 @@ export class VaultSync implements SyncRuntimePort {
 			const receipt = await this.server.submitCandidate(candidate.record);
 			return this.completeCandidateSubmission(candidate, receipt);
 		} catch (error) {
+			if (error instanceof VaultMutationRequestError && error.semanticMismatch
+				&& error.semanticMismatch.purpose === "body"
+				&& error.semanticMismatch.documentId === candidate.record.bodyId
+				&& error.semanticMismatch.receivedEpoch === candidate.record.bodyEpoch) {
+				await this.recoverBodySemanticEpoch(candidate.record.bodyId, error.semanticMismatch.expectedEpoch);
+				throw new Error(`candidate ${candidate.record.candidateId} was rebased onto semantic epoch ${error.semanticMismatch.expectedEpoch}`);
+			}
 			const recovered = this.shouldQueryOperationOutcome(error) ? await this.recoverCandidateOutcome(candidate) : null;
 			if (recovered) return recovered;
 			throw error;
@@ -4156,6 +4606,7 @@ export class VaultSync implements SyncRuntimePort {
 		this.pendingCandidates.delete(candidate.record.candidateId);
 		await this.bodies.markCandidateSettled(
 			candidate.record.bodyId,
+			receipt.bodyEpoch,
 			receipt.durableGeneration,
 			candidate.record.capturedLocalUpdates ?? 0,
 		);
@@ -4199,6 +4650,7 @@ export class VaultSync implements SyncRuntimePort {
 		if (
 			receipt.vaultId !== candidate.vaultId
 			|| receipt.bodyId !== candidate.bodyId
+			|| receipt.bodyEpoch !== candidate.bodyEpoch
 			|| receipt.clientId !== this.options.deviceId
 			|| receipt.candidateId !== candidate.candidateId
 			|| receipt.candidateDigest !== candidate.candidateDigest
@@ -4298,6 +4750,7 @@ export class VaultSync implements SyncRuntimePort {
 			vaultId: candidate.record.vaultId,
 			vaultGeneration: this.options.vaultGeneration,
 			bodyId: candidate.record.bodyId,
+			bodyEpoch: candidate.record.bodyEpoch,
 			clientId: candidate.record.authority?.deviceId ?? this.options.deviceId,
 			candidateId: candidate.record.candidateId,
 			candidateDigest: candidate.record.candidateDigest,
@@ -4459,6 +4912,34 @@ export class VaultSync implements SyncRuntimePort {
 				await remove.call(this.options.database, attempted[0]!.operationId);
 			}
 		} catch (error) {
+			if (error instanceof VaultMutationRequestError && error.semanticMismatch
+				&& error.semanticMismatch.purpose === "body") {
+				const mismatch = error.semanticMismatch;
+				const stale = attempted.filter((operation) => operation.bodyId === mismatch.documentId
+					&& operation.bodyEpoch === mismatch.receivedEpoch);
+				if (stale.length > 0) {
+					const body = await this.recoverBodySemanticEpoch(mismatch.documentId, mismatch.expectedEpoch);
+					for (const operation of stale) {
+						operation.bodyEpoch = body.bodyEpoch;
+						if (operation.kind === "create") {
+							// The candidate belongs to the retired CRDT lineage.  The next
+							// replay binds the same semantic lifecycle intent to the fresh
+							// epoch's persisted rebase candidate.
+							delete operation.candidateId;
+							delete operation.candidateDigest;
+						}
+						await save.call(this.options.database, operation);
+					}
+					this.log(`lifecycle group rebound to body semantic epoch ${body.bodyEpoch}`);
+					return;
+				}
+			}
+			if (this.isCreationPathSuperseded(error)
+				&& attempted.every((operation) => operation.kind === "create")) {
+				await this.retireSupersededCreations(attempted);
+				this.log("superseded creation lifecycle was retired after authoritative path ownership changed");
+				return;
+			}
 			const recovered = this.shouldQueryOperationOutcome(error)
 				? await this.recoverLifecycleReceipts(requests, attempted.map((operation) => operation.authority))
 				: null;
@@ -4491,6 +4972,7 @@ export class VaultSync implements SyncRuntimePort {
 			vaultId: this.options.vaultId,
 			vaultGeneration: this.options.vaultGeneration,
 			bodyId: requests[index]!.bodyId,
+			bodyEpoch: this.bodies.get(requests[index]!.bodyId)?.bodyEpoch ?? INITIAL_SEMANTIC_EPOCH,
 			operationId: requests[index]!.operationId,
 			kind: requests[index]!.kind,
 			durableGeneration: this.bodies.get(requests[index]!.bodyId)?.generation ?? 0,
@@ -4518,12 +5000,41 @@ export class VaultSync implements SyncRuntimePort {
 		this.pendingCandidates.delete(pending.record.candidateId);
 		await this.bodies.markCandidateSettled(
 			pending.record.bodyId,
+			pending.record.bodyEpoch,
 			this.bodies.get(pending.record.bodyId)?.generation ?? 0,
 			pending.record.capturedLocalUpdates ?? 0,
 		);
 		this.bodies.discardTransient(pending.record.bodyId);
 		await this.options.database.deleteDocument?.(pending.record.bodyId);
 		await this.options.database.deleteLifecycleOperation?.(operationId);
+	}
+
+	private isCreationPathSuperseded(error: unknown): boolean {
+		return error instanceof VaultMutationRequestError
+			&& error.status === 409
+			&& error.code === "creation_path_superseded";
+	}
+
+	private async retireSupersededCreations(
+		operations: readonly StoredLifecycleOperation[],
+	): Promise<void> {
+		for (const operation of operations) {
+			const pending = Array.from(this.pendingCandidates.values()).find(
+				(candidate) => candidate.record.bodyId === operation.bodyId
+					&& (!operation.candidateId || candidate.record.candidateId === operation.candidateId),
+			);
+			if (pending) {
+				await this.cancelFreshAdmission(pending, operation.operationId);
+				continue;
+			}
+			const loaded = this.bodies.get(operation.bodyId);
+			if (loaded && !loaded.dirty && loaded.unsettled === 0
+				&& loaded.pendingLocalUpdates === 0 && loaded.pins === 0) {
+				this.bodies.discardTransient(operation.bodyId);
+			}
+			await this.options.database.deleteDocument?.(operation.bodyId);
+			await this.options.database.deleteLifecycleOperation?.(operation.operationId);
+		}
 	}
 
 	private toStoredLifecycleOperation(request: LifecycleRequest): StoredLifecycleOperation {
@@ -4534,6 +5045,7 @@ export class VaultSync implements SyncRuntimePort {
 			operationId: request.operationId,
 			kind: request.kind,
 			bodyId: request.bodyId,
+			bodyEpoch: request.bodyEpoch,
 			path,
 			previousPath: request.fromPath ?? null,
 			content: null,
@@ -4552,6 +5064,7 @@ export class VaultSync implements SyncRuntimePort {
 			kind: operation.kind,
 			fileId: operation.bodyId,
 			bodyId: operation.bodyId,
+			bodyEpoch: operation.bodyEpoch,
 			path: operation.kind === "rename" ? undefined : operation.path,
 			fromPath: operation.previousPath ?? undefined,
 			toPath: operation.kind === "rename" ? operation.path : undefined,
@@ -4601,8 +5114,19 @@ export class VaultSync implements SyncRuntimePort {
 			...request,
 			vaultSequence: receipts[index]!.vaultSequence,
 		}));
-		const rootUpdate = this.buildLifecycleRootUpdate(requests);
-		const proof = await this.server.publishLifecycleRoot(operations, rootUpdate);
+		let rootUpdate = this.buildLifecycleRootUpdate(requests);
+		let proof: RootPublicationReceipt;
+		try {
+			proof = await this.server.publishLifecycleRoot(operations, rootUpdate, this._rootEpoch);
+		} catch (error) {
+			if (!(error instanceof VaultMutationRequestError)
+				|| error.semanticMismatch?.purpose !== "root"
+				|| error.semanticMismatch.documentId !== ROOT_DOCUMENT_ID
+				|| error.semanticMismatch.receivedEpoch !== this._rootEpoch) throw error;
+			await this.recoverRootSemanticEpoch(error.semanticMismatch.expectedEpoch);
+			rootUpdate = this.buildLifecycleRootUpdate(requests);
+			proof = await this.server.publishLifecycleRoot(operations, rootUpdate, this._rootEpoch);
+		}
 		const expectedIds = requests.map((request) => request.operationId);
 		const actualIds = proof.operationIds;
 		const minimumSequence = Math.max(...receipts.map((receipt) => receipt.vaultSequence));
@@ -4613,6 +5137,7 @@ export class VaultSync implements SyncRuntimePort {
 			|| proof.vaultSequence < minimumSequence
 			|| !Number.isSafeInteger(proof.rootGeneration)
 			|| proof.rootGeneration < 0
+			|| proof.rootEpoch !== this._rootEpoch
 			|| typeof proof.vaultGeneration !== "string"
 			|| !proof.vaultGeneration
 			|| !proof.runtimeEpoch
@@ -4695,6 +5220,8 @@ export class VaultSync implements SyncRuntimePort {
 		const before = Y.encodeStateVector(next);
 		next.transact(() => {
 			this.mutateLifecycleRoot(next.getMap<string>("pathToId"), requests);
+			const proofs = next.getMap("__yaosLifecyclePublicationProof");
+			for (const request of requests) proofs.set(request.operationId, true);
 		}, ORIGIN_DURABLE_ROOT_PUBLICATION);
 		const update = Y.encodeStateAsUpdate(next, before);
 		next.destroy();
@@ -4731,6 +5258,7 @@ export class VaultSync implements SyncRuntimePort {
 		if (
 			receipt.vaultId !== this.options.vaultId
 			|| receipt.bodyId !== request.bodyId
+			|| receipt.bodyEpoch !== request.bodyEpoch
 			|| receipt.operationId !== request.operationId
 			|| receipt.kind !== request.kind
 			|| !Number.isSafeInteger(receipt.durableGeneration)
@@ -4784,7 +5312,9 @@ export class VaultSync implements SyncRuntimePort {
 
 	private async persistRoot(): Promise<void> {
 		await this.options.database.putDocument({
+			kind: "root",
 			documentId: ROOT_DOCUMENT_ID,
+			rootEpoch: this._rootEpoch,
 			generation: this._rootGeneration,
 			encodedState: Y.encodeStateAsUpdate(this.ydoc).slice().buffer,
 			dirty: false,
@@ -4808,7 +5338,13 @@ export class VaultSync implements SyncRuntimePort {
 				if (!this.options.getSocketTicket) {
 					throw new Error("a short-lived socket ticket is required");
 				}
-				const ticket = await this.options.getSocketTicket({ purpose: input.kind, documentId: input.documentId });
+				const scope: SocketTicketScope = input.kind === "root"
+					? { purpose: "root", documentId: ROOT_DOCUMENT_ID, rootEpoch: this._rootEpoch }
+					: input.kind === "body"
+						? { purpose: "body", documentId: input.documentId,
+							bodyEpoch: this.bodies.get(input.documentId)?.bodyEpoch ?? input.documentEpoch }
+						: { purpose: "semantic", documentId: input.documentId, bodyEpoch: input.documentEpoch };
+				const ticket = await this.options.getSocketTicket(scope);
 				if (!ticket) throw new Error("socket ticket request returned no ticket");
 				this.scheduleTicketRefresh(ticket);
 				return {
@@ -4843,7 +5379,9 @@ export class VaultSync implements SyncRuntimePort {
 			return { value: "provider-factory", expiresAt: Number.MAX_SAFE_INTEGER, localExpiresAt: Number.MAX_SAFE_INTEGER, ttlMs: Number.MAX_SAFE_INTEGER };
 		}
 		if (this.destroyed || this.fatalAuthError || !epoch.isCurrent()) throw new Error("socket admission superseded");
-		const ticket = await this.options.getSocketTicket({ purpose: "root", documentId: ROOT_DOCUMENT_ID }, force);
+		const ticket = await this.options.getSocketTicket({
+			purpose: "root", documentId: ROOT_DOCUMENT_ID, rootEpoch: this._rootEpoch,
+		}, force);
 		if (this.destroyed || this.fatalAuthError || !epoch.isCurrent()) throw new Error("socket admission superseded");
 		if (!ticket) throw new Error("socket ticket request returned no ticket");
 		this.provider.url = patchTicketInUrl(this.provider.url, ticket.value);

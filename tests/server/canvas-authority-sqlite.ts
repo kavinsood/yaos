@@ -31,8 +31,9 @@ function update(doc, mutate) {
   return Y.encodeStateAsUpdate(doc, vector);
 }
 
-const actor = { principalId: "principal-owner", membershipRevision: 1,
-  deviceId: "device-owner", deviceCredentialRevision: 1 };
+const actor = { vaultId: "canvas-authority-vault", vaultGeneration: "canvas-authority-generation",
+  principalId: "principal-owner", membershipRevision: 1, deviceId: "device-owner",
+  deviceCredentialRevision: 1, role: "owner", policyVersion: 1, capabilityDigest: "owner-digest" };
 const semanticRef = (documentId) => ({ documentId, kind: "canvas", format: "json-canvas", formatVersion: 1 });
 
 export class CanvasAuthorityCycle {
@@ -42,9 +43,16 @@ export class CanvasAuthorityCycle {
     const store = new VaultStore(this.state.storage);
     const root = new Y.Doc({ guid: "root" });
     root.getMap("sys").set("schemaVersion", 8);
-    root.getMap("sys").set("protocolVersion", 4);
+    root.getMap("sys").set("protocolVersion", 5);
     store.provisionVault("canvas-authority-vault", "canvas-authority-generation", Y.encodeStateAsUpdate(root), 1);
     root.destroy();
+    store.installAuthorityFence({ changeId: "canvas-authority-bootstrap", vaultId: actor.vaultId,
+      vaultGeneration: actor.vaultGeneration, subjectDigest: "canvas-authority-bootstrap-digest", subjects: [
+        { principalId: actor.principalId, role: actor.role, state: "active", membershipRevision: actor.membershipRevision,
+          policyVersion: actor.policyVersion, capabilityDigest: actor.capabilityDigest, displayName: "Owner", colorSeed: "owner" },
+        { deviceId: actor.deviceId, principalId: actor.principalId, state: "active",
+          credentialRevision: actor.deviceCredentialRevision },
+      ] });
 
     const attachmentHash = "a".repeat(64);
     const attachmentOperationId = "canvas-attachment-source";
@@ -57,7 +65,8 @@ export class CanvasAuthorityCycle {
     const attachmentCommit = store.commitRootAttachments(attachmentUpdate, [{
       operationId: attachmentOperationId, path: "Board.canvas", contentHash: attachmentHash,
       size: 17, mime: "application/json", lifecycle: "active",
-    }], { operationId: attachmentOperationId, requestDigest: "b".repeat(64) }, 2);
+    }], { operationId: attachmentOperationId, requestDigest: "b".repeat(64), rootEpoch: 1 },
+	  store.documentHead("root"), 2);
     attachmentRoot.destroy();
 
     const canvas = new Y.Doc({ guid: "canvas-document" });
@@ -79,11 +88,58 @@ export class CanvasAuthorityCycle {
       operationId: "canvas-promotion", requestDigest: "d".repeat(64), path: "Board.canvas",
       documentId: "canvas-document", sourceRevision: attachmentOperationId, contentHash, size: 2,
       rollbackBlobHash: attachmentHash, rollbackBlobSize: 17, semanticUpdate,
+	  bodyEpoch: 1, rootEpoch: 1,
       rootUpdate: promotionRootUpdate, expectedRootGeneration: attachmentCommit.generation,
       runtimeEpoch: "canvas-runtime", rollbackRetainedUntil: 10000, actor, now: 3,
     };
+	const staleActor = { ...actor, membershipRevision: actor.membershipRevision + 1 };
+	let staleActorPromotionRejected = false;
+	try {
+	  store.commitSemanticPromotion({ ...promotionInput, operationId: "stale-actor-promotion",
+		requestDigest: "8".repeat(64), actor: staleActor });
+	} catch (error) {
+	  staleActorPromotionRejected = error instanceof Error && error.message === "authority_superseded";
+	}
     const promotion = store.commitSemanticPromotion(promotionInput);
     const promotionReplay = store.commitSemanticPromotion(promotionInput);
+	const lifecycleRoot = store.reconstructDocument("root");
+	const lifecycleUpdate = update(lifecycleRoot.doc, () => lifecycleRoot.doc.getMap("sys").set("canvasReceipt", 1));
+	const lifecycleHead = store.semanticHeadAt(store.currentSequence(), "canvas-document");
+	store.commitUpdate({ documentId: "root", update: lifecycleUpdate, kind: "semantic-rename",
+	  expectedHead: store.documentHead("root"), expectedSemanticHead: lifecycleHead,
+	  semanticCatalog: { documentId: "canvas-document", fileId: "canvas-document", kind: "canvas",
+		format: "json-canvas", formatVersion: 1, path: "Board.canvas", previousPath: "Board.canvas",
+		lifecycle: "active", documentGeneration: 1, contentHash, size: 2 },
+	  semanticLifecycleReceipt: { operationId: "canvas-lifecycle", requestDigest: "9".repeat(64),
+		documentId: "canvas-document", fileId: "canvas-document", kind: "rename", resultPath: "Board.canvas",
+		resultLifecycle: "active", durableGeneration: 1, bodyEpoch: 1, rootEpoch: 1,
+		vaultGeneration: "canvas-authority-generation", runtimeEpoch: "canvas-runtime" },
+	  actorAttributions: [{ actor, operationId: "canvas-lifecycle", requestDigest: "9".repeat(64) }], now: 3 });
+	lifecycleRoot.doc.destroy();
+	const lifecycleReceipt = store.semanticLifecycleReceipt("canvas-lifecycle");
+	const staleCanvas = store.reconstructDocument("canvas-document").doc;
+	const staleCanvasUpdate = update(staleCanvas, () => staleCanvas.getMap("rootFields").set("casProbe", true));
+	staleCanvas.destroy();
+	let semanticCatalogCasRejected = false;
+	try {
+	  store.commitUpdate({ documentId: "canvas-document", update: staleCanvasUpdate, kind: "semantic",
+		expectedHead: store.documentHead("canvas-document"), expectedSemanticHead: lifecycleHead,
+		actorAttributions: [{ actor, operationId: "stale-semantic-cas", requestDigest: "7".repeat(64) }] });
+	} catch (error) {
+	  semanticCatalogCasRejected = error instanceof Error && error.message === "semantic_catalog_head_changed";
+	}
+	const receiptHead = store.documentHead("canvas-document");
+	const receiptSemanticHead = store.semanticHeadAt(store.currentSequence(), "canvas-document");
+	let staleActorReceiptRejected = false;
+	try {
+	  store.recordSemanticCandidateReceipt({ documentId: "canvas-document", clientId: staleActor.deviceId,
+		candidateId: "stale-actor-receipt", candidateDigest: "6".repeat(64), bodyEpoch: 1,
+		durableGeneration: receiptHead.generation, vaultSequence: receiptHead.latestSequence,
+		vaultGeneration: actor.vaultGeneration, runtimeEpoch: "canvas-runtime", contentHash, size: 2 },
+		staleActor, receiptHead, receiptSemanticHead, 3);
+	} catch (error) {
+	  staleActorReceiptRejected = error instanceof Error && error.message === "authority_superseded";
+	}
 
     const staleHash = "e".repeat(64);
     const staleOperationId = "stale-source";
@@ -94,7 +150,8 @@ export class CanvasAuthorityCycle {
     const staleAttachmentCommit = store.commitRootAttachments(staleAttachmentUpdate, [{
       operationId: staleOperationId, path: "Stale.canvas", contentHash: staleHash,
       size: 4, mime: "application/json", lifecycle: "active",
-    }], { operationId: staleOperationId, requestDigest: "f".repeat(64) }, 4);
+    }], { operationId: staleOperationId, requestDigest: "f".repeat(64), rootEpoch: 1 },
+	  store.documentHead("root"), 4);
     const stalePromotionUpdate = update(staleRoot, () => {
       staleRoot.getMap("pathToBlob").delete("Stale.canvas");
       staleRoot.getMap("pathToSemantic").set("Stale.canvas", semanticRef("stale-document"));
@@ -116,6 +173,7 @@ export class CanvasAuthorityCycle {
 
     const staleDemotionRoot = store.reconstructDocument("root").doc;
     const staleDemotionGeneration = store.documentHead("root").generation;
+	const semanticHeadBeforeDemotion = store.semanticHeadAt(store.currentSequence(), "canvas-document");
     const staleDemotionUpdate = update(staleDemotionRoot, () => {
       staleDemotionRoot.getMap("pathToSemantic").delete("Board.canvas");
       staleDemotionRoot.getMap("pathToBlob").set("Board.canvas", {
@@ -123,6 +181,17 @@ export class CanvasAuthorityCycle {
       });
     });
     staleDemotionRoot.destroy();
+	let staleActorDemotionRejected = false;
+	try {
+	  store.commitSemanticDemotion({ operationId: "stale-actor-demotion", requestDigest: "5".repeat(64),
+		path: "Board.canvas", documentId: "canvas-document", sourceRevision: "1:" + contentHash,
+		expectedDocumentGeneration: 1, contentHash, size: 2, mime: "application/json",
+		bodyEpoch: 1, rootEpoch: 1, expectedSemanticHead: semanticHeadBeforeDemotion,
+		rootUpdate: staleDemotionUpdate, expectedRootGeneration: staleDemotionGeneration,
+		runtimeEpoch: "canvas-runtime", actor: staleActor, now: 5 });
+	} catch (error) {
+	  staleActorDemotionRejected = error instanceof Error && error.message === "authority_superseded";
+	}
     const secondUnrelatedRoot = store.reconstructDocument("root").doc;
     const secondUnrelatedUpdate = update(secondUnrelatedRoot, () => secondUnrelatedRoot.getMap("sys").set("race", 2));
     store.commitUpdate({ documentId: "root", update: secondUnrelatedUpdate, kind: "root" });
@@ -132,6 +201,8 @@ export class CanvasAuthorityCycle {
       store.commitSemanticDemotion({ operationId: "stale-demotion", requestDigest: "2".repeat(64),
         path: "Board.canvas", documentId: "canvas-document", sourceRevision: "1:" + contentHash,
         expectedDocumentGeneration: 1, contentHash, size: 2, mime: "application/json",
+		bodyEpoch: 1, rootEpoch: 1,
+		expectedSemanticHead: semanticHeadBeforeDemotion,
         rootUpdate: staleDemotionUpdate, expectedRootGeneration: staleDemotionGeneration,
         runtimeEpoch: "canvas-runtime", actor, now: 5 });
     } catch (error) {
@@ -150,6 +221,8 @@ export class CanvasAuthorityCycle {
     const demotionInput = { operationId: "canvas-demotion", requestDigest: "3".repeat(64),
       path: "Board.canvas", documentId: "canvas-document", sourceRevision: "1:" + contentHash,
       expectedDocumentGeneration: 1, contentHash, size: 2, mime: "application/json",
+	  bodyEpoch: 1, rootEpoch: 1,
+	  expectedSemanticHead: semanticHeadBeforeDemotion,
       rootUpdate: demotionUpdate, expectedRootGeneration: demotionGeneration,
       runtimeEpoch: "canvas-runtime", actor, now: 6 };
     const demotion = store.commitSemanticDemotion(demotionInput);
@@ -161,6 +234,15 @@ export class CanvasAuthorityCycle {
 
     return Response.json({
       promotionReplay: promotion.rootSequence === promotionReplay.rootSequence,
+	  staleActorPromotionRejected,
+	  staleActorDemotionRejected,
+	  staleActorReceiptRejected: staleActorReceiptRejected
+		&& store.semanticCandidateReceipt("canvas-document", staleActor.deviceId, "stale-actor-receipt") === null,
+	  semanticCatalogCasRejected,
+	  authorityEpochs: promotion.bodyEpoch === 1 && promotion.rootEpoch === 1
+		&& promotionReplay.bodyEpoch === 1 && demotion.bodyEpoch === 1 && demotion.rootEpoch === 1
+		&& store.semanticAuthorityReceipt("canvas-demotion")?.rootEpoch === 1,
+	  lifecycleEpochs: lifecycleReceipt?.bodyEpoch === 1 && lifecycleReceipt.rootEpoch === 1,
       stalePromotionRejected,
       stalePromotionUncommitted: store.documentHead("stale-document") === null
         && store.semanticAuthorityReceipt("stale-promotion") === null,

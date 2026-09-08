@@ -31,11 +31,10 @@ class RuntimeStore {
 			if (this.metadata.vaultId !== vaultId || this.metadata.vaultGeneration !== vaultGeneration) throw new Error("vault generation mismatch");
 			return { ...this.metadata, created: false };
 		}
-		this.metadata = { vaultId, vaultGeneration, schemaVersion: 8, storageFormatVersion: 3, provisionedAt: 1 };
+		this.metadata = { vaultId, vaultGeneration, schemaVersion: 8, storageFormatVersion: 4, provisionedAt: 1 };
 		return { ...this.metadata, created: true };
 	}
 	vaultMetadata() { return this.metadata; }
-	storedVaultSchemaVersion(): number | null { return null; }
 	vaultDeletionBegun(vaultGeneration: string): boolean { return this.deletion?.vaultGeneration === vaultGeneration; }
 	beginVaultDeletion(deletionId: string, vaultGeneration: string): { captureJobIds: string[]; restoreIds: string[] } {
 		if (this.metadata?.vaultGeneration !== vaultGeneration) throw new Error("vault generation mismatch");
@@ -73,7 +72,7 @@ function makeServer() {
 		execution: { waitUntil: (task) => { context.waitUntil(task); } },
 	});
 	const store = new RuntimeStore();
-	const accepted: Array<{ documentId: string; kind: "root" | "body"; deviceId: string }> = [];
+	const accepted: Array<{ documentId: string; kind: "root" | "body"; documentEpoch: number; deviceId: string }> = [];
 	const closed: string[] = [];
 	const settingsReads: string[] = [];
 	Object.defineProperties(server, {
@@ -81,6 +80,7 @@ function makeServer() {
 			value: {
 				bodyState: (_bootstrapId: string, bodyId: string) => ({
 					bodyId,
+					bodyEpoch: bodyId.endsWith("1") ? 2 : 3,
 					generation: bodyId.endsWith("1") ? 7 : 8,
 					encodedState: new Uint8Array(bodyId.endsWith("1") ? [1, 2] : [3, 4]),
 				}),
@@ -99,8 +99,8 @@ function makeServer() {
 		lifecycle: { value: { activeBodyHead: (bodyId: string) => bodyId === "body-runtime-0001" ? {} : null } },
 		sockets: {
 			value: {
-				accept: (documentId: string, kind: "root" | "body", actor: VaultActorContext) => {
-					accepted.push({ documentId, kind, deviceId: actor.deviceId });
+				accept: (documentId: string, kind: "root" | "body", documentEpoch: number, actor: VaultActorContext) => {
+					accepted.push({ documentId, kind, documentEpoch, deviceId: actor.deviceId });
 					return new Response(null, { status: 204 });
 				},
 				closeAll: (reason: string) => {
@@ -156,12 +156,12 @@ s.test("root/body socket runtime requires trusted device identity and exact body
 	await server.fetch(request("/__yaos/provision", { method: "POST", body: JSON.stringify({ vaultGeneration: GENERATION }) }));
 	assert.equal((await server.fetch(request("/ws/root", { headers: { Upgrade: "websocket" } }, false))).status, 401);
 	const headers = { Upgrade: "websocket", "x-yaos-device-id": "device-runtime-0001" };
-	assert.equal((await server.fetch(request("/ws/root", { headers }))).status, 204);
-	assert.equal((await server.fetch(request("/ws/body/body-runtime-0001", { headers }))).status, 204);
-	assert.equal((await server.fetch(request("/ws/body/body-unknown-0001", { headers }))).status, 409);
+	assert.equal((await server.fetch(request("/ws/root", { headers: { ...headers, "x-yaos-root-epoch": "1" } }))).status, 204);
+	assert.equal((await server.fetch(request("/ws/body/body-runtime-0001", { headers: { ...headers, "x-yaos-body-epoch": "1" } }))).status, 204);
+	assert.equal((await server.fetch(request("/ws/body/body-unknown-0001", { headers: { ...headers, "x-yaos-body-epoch": "1" } }))).status, 409);
 	assert.deepEqual(accepted, [
-		{ documentId: "root", kind: "root", deviceId: "device-runtime-0001" },
-		{ documentId: "body-runtime-0001", kind: "body", deviceId: "device-runtime-0001" },
+		{ documentId: "root", kind: "root", documentEpoch: 1, deviceId: "device-runtime-0001" },
+		{ documentId: "body-runtime-0001", kind: "body", documentEpoch: 1, deviceId: "device-runtime-0001" },
 	]);
 });
 
@@ -221,8 +221,8 @@ s.test("bootstrap body batch is bounded and returns every requested body", async
 	assert.equal(response.headers.get("content-type"), "application/vnd.yaos.binary-envelope");
 	assert.deepEqual(decodeBinaryEnvelope(new Uint8Array(await response.arrayBuffer())), {
 		bodies: [
-			{ bodyId: "body-runtime-0001", generation: 7, encodedState: new Uint8Array([1, 2]) },
-			{ bodyId: "body-runtime-0002", generation: 8, encodedState: new Uint8Array([3, 4]) },
+			{ bodyId: "body-runtime-0001", bodyEpoch: 2, generation: 7, encodedState: new Uint8Array([1, 2]) },
+			{ bodyId: "body-runtime-0002", bodyEpoch: 3, generation: 8, encodedState: new Uint8Array([3, 4]) },
 		],
 	});
 	const duplicate = await server.fetch(request("/bootstrap/bootstrap-runtime-0001/bodies", {

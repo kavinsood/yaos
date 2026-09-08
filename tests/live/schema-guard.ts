@@ -1,7 +1,6 @@
-import WebSocket from "ws";
 import { PROTOCOL_VERSION, SCHEMA_VERSION } from "../../src/sync/schema.ts";
 import { parseFatalFrame, type FatalFrame } from "./fatalFrame.ts";
-import { fetchSocketTicket, requireLiveIdentity } from "./liveIdentity.ts";
+import { fetchSocketTicket, LiveWebSocket as WebSocket, requireLiveIdentity } from "./liveIdentity.ts";
 import { socketPrefix } from "./schema4Live.ts";
 
 const identity = requireLiveIdentity();

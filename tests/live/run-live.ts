@@ -4,7 +4,9 @@ import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { sleep } from "../harness.ts";
-import type { LiveIdentity, LiveIdentityContext } from "./liveIdentity.ts";
+import { installLiveAccessTransport, type LiveIdentity, type LiveIdentityContext } from "./liveIdentity.ts";
+
+installLiveAccessTransport();
 
 const DEPLOYED_HOST = process.env.YAOS_TEST_DEPLOYED_HOST?.trim().replace(/\/+$/, "") || null;
 const HOST = DEPLOYED_HOST ?? "http://127.0.0.1:8787";
@@ -157,7 +159,7 @@ async function claimEnrollAndProvision(): Promise<LiveIdentityContext> {
 		headers: { Authorization: `Bearer ${deviceA.deviceToken}` },
 	});
 	const status = await statusResponse.json().catch(() => null) as Record<string, unknown> | null;
-	if (!statusResponse.ok || status?.vaultId !== claim.vaultId || status.schemaVersion !== 7 || status.protocolVersion !== 4
+	if (!statusResponse.ok || status?.vaultId !== claim.vaultId || status.schemaVersion !== 8 || status.protocolVersion !== 5
 		|| typeof status.vaultGeneration !== "string" || typeof status.runtimeEpoch !== "string") {
 		throw new Error(`claimed vault was not active and provisioned: ${JSON.stringify(status)}`);
 	}
@@ -170,7 +172,7 @@ async function claimEnrollAndProvision(): Promise<LiveIdentityContext> {
 	const setCookie = login.headers.get("set-cookie");
 	if (!login.ok || !setCookie) throw new Error(`operator login failed (${login.status})`);
 	const operatorCookie = setCookie.split(";", 1)[0]!;
-	console.log("Live driver claimed and provisioned schema 7, then enrolled distinct A/B devices.");
+	console.log("Live driver claimed and provisioned schema 8, then enrolled distinct A/B devices.");
 	return { deviceA, deviceB, operatorRecoveryKey, operatorCookie, settingsConfigKey: SETTINGS_CONFIG_KEY };
 }
 

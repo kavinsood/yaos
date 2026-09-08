@@ -15,7 +15,7 @@ doc.destroy();
 const candidateId = `edit_${crypto.randomUUID().replaceAll("-", "")}`;
 const candidate = await fetch(vaultUrl(target.deviceA, `body/${created.bodyId}/candidate`), {
 	method: "POST",
-	headers: bearer(target.deviceA, { "content-type": "application/octet-stream", "x-yaos-candidate-id": candidateId, "x-yaos-candidate-digest": await sha256Hex(update) }),
+		headers: bearer(target.deviceA, { "content-type": "application/octet-stream", "x-yaos-candidate-id": candidateId, "x-yaos-candidate-digest": await sha256Hex(update), "x-yaos-body-epoch": "1" }),
 	body: update,
 });
 assert.equal(candidate.status, 200, await candidate.clone().text());
@@ -27,7 +27,8 @@ await hardRestart(target);
 assert.equal(await bodyText(target.deviceA, created.bodyId), "before-crash-acknowledged");
 pass("acknowledged body candidate survives SIGKILL");
 
-const deletion = { operationId: `delete_${crypto.randomUUID().replaceAll("-", "")}`, kind: "delete" as const, fileId: created.bodyId, bodyId: created.bodyId, path: "durable.md" };
+const deletion = { operationId: `delete_${crypto.randomUUID().replaceAll("-", "")}`, kind: "delete" as const,
+	fileId: created.bodyId, bodyId: created.bodyId, bodyEpoch: created.receipt.bodyEpoch, path: "durable.md" };
 const committed = await postLifecycle(target.deviceA, deletion);
 assert.equal(committed.result.response.status, 200);
 assert.ok(committed.receipt);

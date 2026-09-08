@@ -6,11 +6,13 @@ import { applyAwarenessUpdate, Awareness, encodeAwarenessUpdate } from "y-protoc
 import * as Y from "yjs";
 import { encodeRootPathPublicationUpdate } from "../../server/src/server";
 import { AUTHORITY_SUPERSEDED_SOCKET_CLOSE_CODE } from "../../server/src/shared/socketCloseCodes";
-import { VaultDocumentCachePressureError } from "../../server/src/vaultDocumentCache";
+import { SEMANTIC_EPOCH_RESET_SOCKET_CLOSE_CODE } from "../../server/src/shared/semanticEpoch";
+import { VaultDocumentCachePressureError, VaultDocumentValidationError } from "../../server/src/vaultDocumentCache";
 import {
 	parseVaultSocketAttachment,
 	rootUpdateChangesProtectedAttachmentMaps,
 	rootUpdateHasSafeAttachmentSemantics,
+	isStructurallyEmptyYjsUpdate,
 	type VaultSocketAttachment,
 	rootUpdateChangesDocument,
 	type VaultSocketPort,
@@ -28,6 +30,7 @@ const attachment = {
 	runtimeEpoch: "epoch-authority-0001",
 	documentId: "root",
 	kind: "root" as const,
+	documentEpoch: 1,
 	deviceId: "device-authority-0001",
 	deviceName: "Authority laptop",
 	principalId: "principal-authority-0001",
@@ -75,6 +78,74 @@ s.test("hibernated attachments preserve exact vault, generation, device, and doc
 	assert.deepEqual(parseVaultSocketAttachment(body), body);
 });
 
+s.test("durable root publication reaches a hibernated socket before cache residency", () => {
+	const sent: Array<ArrayBuffer | ArrayBufferView | string> = [];
+	const socket: VaultSocketPort = {
+		deserializeAttachment: () => attachment,
+		serializeAttachment: () => {},
+		send: (value) => { sent.push(value); },
+		close: () => {},
+	};
+	const service = new VaultSocketService({
+		sockets: registry([socket]),
+		cache: { get: () => undefined },
+		vaultId: () => attachment.vaultId,
+		vaultGeneration: () => attachment.vaultGeneration,
+		runtimeEpoch: attachment.runtimeEpoch,
+		isActiveBody: () => true,
+		currentRootEpoch: () => attachment.documentEpoch,
+	} as never);
+	const update = new Uint8Array([1, 2, 3]);
+	assert.doesNotThrow(() => service.broadcastDocumentUpdate("root", update, null));
+	assert.equal(sent.length, 1, "the durable delta is fanned out without hydrating root state");
+});
+
+s.test("socket admission rejects a signed but retired semantic lineage before allocation", async () => {
+	const service = new VaultSocketService({
+		sockets: registry([]),
+		cache: { admitBody: () => true, load: () => ({ semanticEpoch: 4, generation: 1, doc: new Y.Doc() }) },
+		vaultId: () => attachment.vaultId,
+		vaultGeneration: () => attachment.vaultGeneration,
+		runtimeEpoch: attachment.runtimeEpoch,
+		isActiveBody: () => true,
+		validateActor: () => true,
+	} as never);
+	const response = service.accept("body-retired-lineage", "body", 3, "device-authority-0001");
+	assert.equal(response.status, 409);
+	assert.deepEqual(await response.json(), {
+		error: "semantic_epoch_mismatch", purpose: "body", documentId: "body-retired-lineage",
+		expectedEpoch: 4, receivedEpoch: 3, reset: "fetch_fresh_baseline",
+	});
+});
+
+s.test("hibernated stale-epoch sockets are fenced before frame decoding or document access", async () => {
+	let cacheLoads = 0;
+	let close: { code: number; reason: string } | null = null;
+	const sent: string[] = [];
+	const stale = { ...attachment, kind: "body" as const, documentId: "body-retired-lineage", documentEpoch: 3 };
+	const socket: VaultSocketPort = {
+		deserializeAttachment: () => stale,
+		serializeAttachment: () => {},
+		send: (value) => { if (typeof value === "string") sent.push(value); },
+		close: (code = 1000, reason = "") => { close = { code, reason }; },
+	};
+	const service = new VaultSocketService({
+		sockets: registry([socket]),
+		cache: { load: () => { cacheLoads++; throw new Error("stale frame must not load"); } },
+		vaultId: () => attachment.vaultId,
+		vaultGeneration: () => attachment.vaultGeneration,
+		runtimeEpoch: attachment.runtimeEpoch,
+		isActiveBody: () => true,
+		currentBodyHead: (bodyId: string) => ({ bodyId, bodyEpoch: 4, lifecycle: "active",
+			generation: 2, contentHash: null, size: null, sequence: 2 }),
+		validateActor: () => true,
+	} as never);
+	await service.message(socket, new Uint8Array([255, 255, 255]).buffer);
+	assert.equal(cacheLoads, 0);
+	assert.deepEqual(close, { code: SEMANTIC_EPOCH_RESET_SOCKET_CLOSE_CODE, reason: "semantic epoch reset" });
+	assert.equal(JSON.parse(sent[0]!.slice(6)).type, "SEMANTIC_EPOCH_RESET_REQUIRED");
+});
+
 s.test("stale-generation sockets are fenced before decoding or document access", async () => {
 	let close: { code: number; reason: string } | null = null;
 	let cacheLoads = 0;
@@ -107,6 +178,49 @@ s.test("root socket validation rejects structural changes and accepts duplicate 
 	assert.equal(rootUpdateChangesDocument(current, Y.encodeStateAsUpdate(changed, vector)), true);
 	current.destroy();
 	changed.destroy();
+});
+
+s.test("download-only root sockets accept the empty Yjs handshake but reject client structs", async () => {
+	let close: { code: number; reason: string } | null = null;
+	const socket: VaultSocketPort = {
+		deserializeAttachment: () => attachment,
+		serializeAttachment: () => {},
+		send: () => {},
+		close: (code = 1000, reason = "") => { close = { code, reason }; },
+	};
+	const service = new VaultSocketService({
+		sockets: registry([socket]),
+		cache: {
+			load: () => ({ semanticEpoch: attachment.documentEpoch }),
+			validateRootSyncNoop: () => false,
+		},
+		vaultId: () => attachment.vaultId,
+		vaultGeneration: () => attachment.vaultGeneration,
+		runtimeEpoch: attachment.runtimeEpoch,
+		isActiveBody: () => true,
+		currentRootEpoch: () => attachment.documentEpoch,
+		validateActor: () => true,
+	} as never);
+	const frame = (update: Uint8Array): ArrayBuffer => {
+		const encoder = encoding.createEncoder();
+		encoding.writeVarUint(encoder, 0);
+		syncProtocol.writeUpdate(encoder, update);
+		return encoding.toUint8Array(encoder).slice().buffer;
+	};
+	const empty = new Y.Doc({ guid: "empty-root-peer" });
+	const emptyUpdate = Y.encodeStateAsUpdate(empty);
+	empty.destroy();
+	assert.equal(isStructurallyEmptyYjsUpdate(emptyUpdate), true);
+	await service.message(socket, frame(emptyUpdate));
+	assert.equal(close, null, "protocol-required empty sync step does not disconnect the root");
+
+	const changed = new Y.Doc({ guid: "malicious-root-peer" });
+	changed.getMap("pathToId").set("ghost.md", "ghost-body");
+	const changedUpdate = Y.encodeStateAsUpdate(changed);
+	changed.destroy();
+	assert.equal(isStructurallyEmptyYjsUpdate(changedUpdate), false);
+	await service.message(socket, frame(changedUpdate));
+	assert.deepEqual(close, { code: 1008, reason: "root updates require durable publication" });
 });
 
 s.test("body socket admission rejects a bounded update that grows Markdown beyond recovery limits", () => {
@@ -164,6 +278,7 @@ s.test("application liveness is acknowledged on the exact socket without loading
 		type: "VAULT_PONG",
 		probeId: "probe-1",
 		documentId: "root",
+		documentEpoch: 1,
 		vaultGeneration: attachment.vaultGeneration,
 		runtimeEpoch: attachment.runtimeEpoch,
 	});
@@ -188,7 +303,7 @@ s.test("root currentness queries return bounded exact heads without loading docu
 		runtimeEpoch: attachment.runtimeEpoch,
 		isActiveBody: () => true,
 		currentBodyHead: (bodyId: string) => bodyId === "body-current"
-			? { bodyId, lifecycle: "active", generation: 7, contentHash: "a".repeat(64), size: 12, sequence: 19 }
+			? { bodyId, bodyEpoch: 1, lifecycle: "active", generation: 7, contentHash: "a".repeat(64), size: 12, sequence: 19 }
 			: null,
 		currentSequence: () => 21,
 		isDeviceRevoked: () => false,
@@ -208,6 +323,7 @@ s.test("root currentness queries return bounded exact heads without loading docu
 		vaultSequence: 21,
 		heads: [{
 			bodyId: "body-current",
+			bodyEpoch: 1,
 			lifecycle: "active",
 			generation: 7,
 			contentHash: "a".repeat(64),
@@ -240,6 +356,43 @@ s.test("an inactive body cannot renew liveness", async () => {
 });
 
 s.test("body socket cache pressure is bounded to explicit 429 responses", async () => {
+	const compactionService = new VaultSocketService({
+		sockets: registry([]),
+		cache: { admitBody: () => { throw new Error("paused admission must not touch cache"); } },
+		vaultId: () => attachment.vaultId,
+		vaultGeneration: () => attachment.vaultGeneration,
+		runtimeEpoch: attachment.runtimeEpoch,
+		isActiveBody: () => true,
+		shouldPauseAdmission: () => true,
+	} as never);
+	const compactionResponse = compactionService.accept("body-compaction-pressure", "body", 1, "device-pressure");
+	assert.equal(compactionResponse.status, 429);
+	assert.equal(compactionResponse.headers.get("retry-after"), "1");
+	assert.deepEqual(await compactionResponse.json(), { error: "semantic_compaction_backpressure" });
+	let frameClose: { code: number; reason: string } | null = null;
+	const frameControl: string[] = [];
+	const frameSocket: VaultSocketPort = {
+		deserializeAttachment: () => ({ ...attachment, kind: "body", documentId: "body-compaction-pressure" }),
+		serializeAttachment: () => {},
+		send: (value) => { if (typeof value === "string") frameControl.push(value); },
+		close: (code = 1000, reason = "") => { frameClose = { code, reason }; },
+	};
+	const frameService = new VaultSocketService({
+		sockets: registry([frameSocket]),
+		cache: { load: () => { throw new Error("paused frame must not reconstruct"); } },
+		vaultId: () => attachment.vaultId,
+		vaultGeneration: () => attachment.vaultGeneration,
+		runtimeEpoch: attachment.runtimeEpoch,
+		isActiveBody: () => true,
+		currentBodyHead: (bodyId: string) => ({ bodyId, bodyEpoch: 1, lifecycle: "active", generation: 1,
+			contentHash: null, size: null, sequence: 1 }),
+		validateActor: () => true,
+		shouldPauseAdmission: () => true,
+	} as never);
+	await frameService.message(frameSocket, new Uint8Array([0]).buffer);
+	assert.deepEqual(frameClose, { code: 1013, reason: "semantic compaction pressure" });
+	assert.equal(JSON.parse(frameControl[0]!.slice(6)).reason, "semantic_compaction_backpressure");
+
 	for (const reason of ["body_cache_encoded_state_bytes", "vault_transient_bytes"] as const) {
 		const service = new VaultSocketService({
 			sockets: registry([]),
@@ -254,7 +407,7 @@ s.test("body socket cache pressure is bounded to explicit 429 responses", async 
 			isDeviceRevoked: () => false,
 			scheduleFlush: () => {},
 		} as never);
-		const response = service.accept("body-pressure", "body", "device-pressure");
+		const response = service.accept("body-pressure", "body", 1, "device-pressure");
 		assert.equal(response.status, 429);
 		assert.equal(response.headers.get("retry-after"), "1");
 		assert.deepEqual(await response.json(), { error: reason });
@@ -270,7 +423,7 @@ s.test("body socket cache pressure is bounded to explicit 429 responses", async 
 		isDeviceRevoked: () => false,
 		scheduleFlush: () => {},
 	} as never);
-	const countResponse = countService.accept("body-count", "body", "device-pressure");
+	const countResponse = countService.accept("body-count", "body", 1, "device-pressure");
 	assert.equal(countResponse.status, 429);
 	assert.equal(countResponse.headers.get("retry-after"), "1");
 	assert.deepEqual(await countResponse.json(), { error: "body_cache_count" });
@@ -292,7 +445,7 @@ s.test("body socket admission preserves unknown cache failures", () => {
 		scheduleFlush: () => {},
 	} as never);
 	assert.throws(
-		() => service.accept("body-unknown", "body", "device-pressure"),
+		() => service.accept("body-unknown", "body", 1, "device-pressure"),
 		(error: unknown) => error === failure,
 	);
 });
@@ -356,18 +509,26 @@ s.test("body sockets reject invalid semantic roots before queue, apply, broadcas
 	const service = new VaultSocketService({
 		sockets: registry([bodySocket]),
 		cache: {
-			load: () => ({ doc: loaded, generation: 1 }),
+			load: () => ({ doc: loaded, generation: 1, semanticEpoch: 1 }),
+			serializeDocument: async (_documentId: string, operation: () => Promise<unknown>) => operation(),
+			validateBodyUpdate: (_documentId: string, update: Uint8Array) => {
+				const reason = bodyUpdateAdmissionError(loaded, update);
+				if (reason) throw new VaultDocumentValidationError(reason);
+				throw new Error("fixture expected an invalid update");
+			},
 			queue: () => { queued++; return { ok: true }; },
 		},
 		vaultId: () => attachment.vaultId,
 		vaultGeneration: () => attachment.vaultGeneration,
 		runtimeEpoch: attachment.runtimeEpoch,
 		isActiveBody: () => true,
+		currentBodyHead: (bodyId: string) => ({ bodyId, bodyEpoch: 1, lifecycle: "active", generation: 1,
+			contentHash: null, size: null, sequence: 1 }),
 		isDeviceRevoked: () => false,
 		scheduleFlush: () => { flushes++; },
 	} as never);
 	await service.message(bodySocket, frame.slice().buffer);
-	assert.deepEqual(close, { code: 1008, reason: "invalid semantic frontmatter" });
+	assert.deepEqual(close, { code: 1008, reason: "invalid body update" });
 	assert.equal(queued, 0);
 	assert.equal(flushes, 0);
 	assert.equal(loaded.share.has("frontmatter:future-root"), false);
@@ -375,6 +536,96 @@ s.test("body sockets reject invalid semantic roots before queue, apply, broadcas
 	assert.equal(JSON.parse((sent[0] as string).slice(6)).code, "frontmatter_semantic_root_invalid");
 	loaded.destroy();
 	malicious.destroy();
+});
+
+s.test("valid socket frames remain speculative until the durable flush publishes them", async () => {
+	const bodyId = "body-durable-order-0001";
+	const live = new Y.Doc({ guid: bodyId });
+	live.getText("body").insert(0, "before");
+	const validation = new Y.Doc({ guid: `${bodyId}-validation` });
+	Y.applyUpdate(validation, Y.encodeStateAsUpdate(live));
+	const producer = new Y.Doc({ guid: bodyId });
+	Y.applyUpdate(producer, Y.encodeStateAsUpdate(live));
+	const vector = Y.encodeStateVector(producer);
+	producer.getText("body").insert(producer.getText("body").length, "-after");
+	const update = Y.encodeStateAsUpdate(producer, vector);
+	const encoder = encoding.createEncoder();
+	encoding.writeVarUint(encoder, 0);
+	syncProtocol.writeUpdate(encoder, update);
+	const frame = encoding.toUint8Array(encoder);
+	const originAttachment = { ...attachment, kind: "body" as const, documentId: bodyId };
+	const peerAttachment = { ...originAttachment, socketId: "socket-durable-peer" };
+	const originSent: Array<string | ArrayBuffer | ArrayBufferView> = [];
+	const peerSent: Array<string | ArrayBuffer | ArrayBufferView> = [];
+	const origin: VaultSocketPort = {
+		deserializeAttachment: () => originAttachment,
+		serializeAttachment: () => {},
+		send: (message) => { originSent.push(message); },
+		close: () => {},
+	};
+	const peer: VaultSocketPort = {
+		deserializeAttachment: () => peerAttachment,
+		serializeAttachment: () => {},
+		send: (message) => { peerSent.push(message); },
+		close: () => {},
+	};
+	let validationPending = false;
+	let queued = 0;
+	let flushes = 0;
+	const loaded = { doc: live, validationDoc: validation, generation: 1, semanticEpoch: 1 };
+	const service = new VaultSocketService({
+		sockets: registry([origin, peer]),
+		cache: {
+			load: () => loaded,
+			serializeDocument: async (_documentId: string, operation: () => Promise<unknown>) => operation(),
+			validateBodyUpdate: (_documentId: string, candidate: Uint8Array) => {
+				let changed = false;
+				const observer = () => { changed = true; };
+				validation.on("update", observer);
+				try { Y.applyUpdate(validation, candidate); }
+				finally { validation.off("update", observer); }
+				validationPending = true;
+				return {
+					changesState: changed,
+					requiresDurableCommit: changed || queued > 0,
+					contentBytes: new TextEncoder().encode(validation.getText("body").toString()),
+					encodedStateBytes: Y.encodeStateAsUpdate(validation).byteLength,
+					exactEncodedStateBytes: true,
+				};
+			},
+			stageValidatedBodyUpdate: (_documentId: string, validated: { changesState: boolean }) => {
+				assert.equal(validationPending, true);
+				validationPending = false;
+				return validated.changesState;
+			},
+			queue: () => { queued++; return { ok: true }; },
+		},
+		vaultId: () => attachment.vaultId,
+		vaultGeneration: () => attachment.vaultGeneration,
+		runtimeEpoch: attachment.runtimeEpoch,
+		isActiveBody: () => true,
+		currentBodyHead: (id: string) => ({ bodyId: id, bodyEpoch: 1, lifecycle: "active",
+			generation: 1, contentHash: null, size: null, sequence: 1 }),
+		validateActor: () => true,
+		principalPresence: () => null,
+		scheduleFlush: () => { flushes++; },
+	} as never);
+
+	await service.message(origin, frame.slice().buffer);
+	assert.equal(live.getText("body").toString(), "before", "validated socket state is not authoritative yet");
+	assert.equal(validation.getText("body").toString(), "before-after");
+	assert.equal(queued, 1);
+	assert.equal(flushes, 1);
+	assert.equal(peerSent.length, 0, "no peer observes a frame before SQLite commits it");
+	assert.equal(originSent.length, 0);
+
+	await service.message(origin, frame.slice().buffer);
+	assert.equal(queued, 2, "a speculative duplicate remains attached to the durability outcome");
+	assert.equal(flushes, 2, "the scheduler coalesces the repeated document key in production");
+	assert.equal(validationPending, false);
+	live.destroy();
+	validation.destroy();
+	producer.destroy();
 });
 
 s.test("device revocation closes every active root and body socket for that device", () => {

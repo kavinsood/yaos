@@ -37,7 +37,7 @@ s.section("setup pages use honest identity names");
 	s.check(mobile.includes('params.get("pairingCode")'), "mobile page reads pairingCode");
 }
 
-s.section("operator console owns collaboration bootstrap, recovery, and migration rituals");
+s.section("operator console owns collaboration bootstrap and recovery rituals");
 {
 	const consolePage = renderOperatorConsole({ host, attachments: true, snapshots: true });
 	s.check(consolePage.includes("Each vault has one owner and full content members"), "console explains the fixed owner/member model");
@@ -46,12 +46,8 @@ s.section("operator console owns collaboration bootstrap, recovery, and migratio
 	s.check(consolePage.includes('/owner-code"') && consolePage.includes('JSON.stringify({ purpose })'), "owner code request is purpose-bound");
 	s.check(consolePage.includes("This secret is shown only in this result")
 		&& consolePage.includes("reloading removes it from the console"), "one-use owner secret is presented as an ephemeral result");
-	s.check(consolePage.includes("Choose every existing device that belongs to the owner")
-		&& consolePage.includes("every unselected device becomes a separate full member"), "migration makes device grouping consequences explicit");
-	s.check(consolePage.includes('/collaboration-migrate"')
-		&& consolePage.includes("JSON.stringify({ ownerDeviceIds, ownerDisplayName })"), "migration sends only reviewed owner grouping and display name");
-	s.check(consolePage.includes("The migration response was lost")
-		&& consolePage.includes("prepared authority change is repairable"), "uncertain migration failures reload durable repair truth");
+	s.check(!consolePage.includes("collaboration-migrate") && !consolePage.includes("Migrate collaboration identities"),
+		"greenfield console does not offer an unsupported legacy migration");
 }
 
 s.section("claim stores only recovery hash and returns pairing material");

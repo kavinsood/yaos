@@ -48,10 +48,14 @@ class AttachmentStore {
 		return this.sequence;
 	}
 
-	reconstructDocument(): { doc: Y.Doc; generation: number } {
+	documentHead(): { generation: number; semanticEpoch: number; latestSequence: number } {
+		return { generation: this.generation, semanticEpoch: 1, latestSequence: this.sequence };
+	}
+
+	reconstructDocument(): { doc: Y.Doc; generation: number; semanticEpoch: number } {
 		const doc = new Y.Doc({ guid: "root" });
 		Y.applyUpdate(doc, Y.encodeStateAsUpdate(this.root));
-		return { doc, generation: this.generation };
+		return { doc, generation: this.generation, semanticEpoch: 1 };
 	}
 
 	acquireVaultMutationLease(): boolean {
@@ -70,8 +74,8 @@ class AttachmentStore {
 	commitRootAttachments(
 		update: Uint8Array,
 		events: Array<Omit<AttachmentCatalogEvent, "sequence">>,
-		operation: { operationId: string; requestDigest: string },
-	): { vaultSequence: number; generation: number } {
+		operation: { operationId: string; requestDigest: string; rootEpoch: number },
+	): { vaultSequence: number; generation: number; semanticEpoch: number } {
 		assert.equal(this.leaseHeld, true, "CAS commit must remain inside the mutation lease");
 		this.commitCalls++;
 		if (this.failNextCommit) {
@@ -87,7 +91,7 @@ class AttachmentStore {
 			rootSequence: this.sequence,
 			rootGeneration: this.generation,
 		});
-		return { vaultSequence: this.sequence, generation: this.generation };
+		return { vaultSequence: this.sequence, generation: this.generation, semanticEpoch: 1 };
 	}
 
 	seedActive(path: string, revision: string, hash = HASH_A, size = 1): void {
@@ -109,7 +113,10 @@ function fixture(input: { store?: AttachmentStore; hasBlob?: (hash: string) => P
 	let broadcasts = 0;
 	const service = new VaultLifecycleService({
 		store,
-		cache: { applyDurableUpdate: () => false },
+		cache: {
+			applyDurableUpdate: () => false,
+			reserveFullStateOperation: () => () => {},
+		},
 		sockets: () => ({ broadcastDocumentUpdate: () => { broadcasts++; } }),
 		vaultId: () => "vault-attachment-cas-0001",
 		vaultGeneration: () => VAULT_GENERATION,
@@ -122,10 +129,13 @@ function fixture(input: { store?: AttachmentStore; hasBlob?: (hash: string) => P
 }
 
 function request(mutation: unknown): Request {
+	const body = mutation && typeof mutation === "object" && !Array.isArray(mutation)
+		? { rootEpoch: 1, ...mutation }
+		: mutation;
 	return new Request("https://internal/attachments/publish", {
 		method: "POST",
 		headers: { "content-type": "application/json", "x-yaos-device-id": "device-attachment-cas-0001" },
-		body: JSON.stringify(mutation),
+		body: JSON.stringify(body),
 	});
 }
 
@@ -162,6 +172,22 @@ s.test("blob existence is checked before the lease and missing bytes cannot crea
 	const result = await publish(service, upsert("missing-blob", "missing.bin", null));
 	assert.equal(result.response.status, 409);
 	assert.equal(result.body.error, "attachment_blob_missing");
+	assert.equal(store.leaseAcquisitions, 0);
+	assert.equal(store.commitCalls, 0);
+});
+
+s.test("a stale root epoch is fenced before attachment validation or durable mutation", async () => {
+	const { service, store } = fixture();
+	const result = await publish(service, { ...upsert("stale-root-epoch", "stale-epoch.bin", null), rootEpoch: 2 });
+	assert.equal(result.response.status, 409);
+	assert.deepEqual(result.body, {
+		error: "semantic_epoch_mismatch",
+		purpose: "root",
+		documentId: "root",
+		expectedEpoch: 1,
+		receivedEpoch: 2,
+		reset: "fetch_fresh_baseline",
+	});
 	assert.equal(store.leaseAcquisitions, 0);
 	assert.equal(store.commitCalls, 0);
 });
@@ -302,7 +328,8 @@ s.test("event-only and ledger-only replay corruption fail closed before identity
 	assert.equal(eventResult.body.error, "attachment_replay_corrupt");
 
 	const ledgerOnly = new AttachmentStore();
-	ledgerOnly.operations.set("corrupt-ledger", { operationId: "corrupt-ledger", requestDigest: HASH_B, rootSequence: 1, rootGeneration: 1 });
+	ledgerOnly.operations.set("corrupt-ledger", { operationId: "corrupt-ledger", requestDigest: HASH_B,
+		rootSequence: 1, rootGeneration: 1, rootEpoch: 1 });
 	const ledgerResult = await publish(fixture({ store: ledgerOnly }).service, upsert("corrupt-ledger", "ledger.bin", null));
 	assert.equal(ledgerResult.response.status, 500);
 	assert.equal(ledgerResult.body.error, "attachment_replay_corrupt");

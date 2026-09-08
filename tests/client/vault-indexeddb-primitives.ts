@@ -5,6 +5,7 @@ import {
 	schema6VaultIdbName,
 	VaultIndexedDb,
 	type PendingWorkSummary,
+	type StoredCanvasLifecycle,
 } from "../../src/sync/vaultIndexedDb";
 import { parsePendingRecoveryState } from "../../src/snapshots/recoveryState";
 import { FakeIndexedDb } from "../mocks/indexedDb";
@@ -85,6 +86,7 @@ s.test("attachment operations allocate a durable causal sequence transactionally
 	const first = await database.putAttachmentOperation({
 		vaultId: "vault-attachments",
 		vaultGeneration: "generation-attachments",
+		rootEpoch: 1,
 		mutation: { operationId: "operation-z", kind: "upsert", path: "assets/order.bin", expectedRevision: null,
 			hash: "a".repeat(64), size: 1, mime: "application/octet-stream" },
 		localSequence: 0,
@@ -95,6 +97,7 @@ s.test("attachment operations allocate a durable causal sequence transactionally
 	const second = await database.putAttachmentOperation({
 		vaultId: "vault-attachments",
 		vaultGeneration: "generation-attachments",
+		rootEpoch: 1,
 		mutation: { operationId: "operation-a", kind: "delete", path: "assets/order.bin", expectedRevision: first.mutation.operationId },
 		localSequence: 0,
 		createdAt: 1,
@@ -142,5 +145,51 @@ s.test("body common bases survive restart in the generation-scoped database", as
 	await restarted.deleteBodySettlement("body-base");
 	assert.equal(await restarted.getBodySettlement("body-base"), null);
 	await restarted.close();
+});
+
+s.test("Canvas lifecycle binary payloads are owned across IndexedDB writes and reads", async () => {
+	const indexedDb = new FakeIndexedDb();
+	const database = new VaultIndexedDb("vault-canvas-binary", "generation-canvas-binary", "folder-canvas-binary", indexedDb);
+	const encodedUpdate = new Uint8Array([1, 2, 3]).buffer;
+	const sourceBytes = new Uint8Array([4, 5, 6]).buffer;
+	const promotion: StoredCanvasLifecycle = {
+		operationId: "promote-binary",
+		requestDigest: "digest-promote",
+		documentId: "canvas-binary",
+		bodyEpoch: 1,
+		rootEpoch: 2,
+		kind: "promote",
+		path: "Binary.canvas",
+		sourceRevision: "revision",
+		sourceHash: "a".repeat(64),
+		sourceSize: 3,
+		contentHash: "b".repeat(64),
+		contentSize: 3,
+		candidateDigest: "c".repeat(64),
+		encodedUpdate,
+		sourceBytes,
+		createdAt: 1,
+		attempts: 0,
+		lastAttemptAt: null,
+	};
+	await database.putCanvasLifecycle(promotion);
+	new Uint8Array(encodedUpdate)[0] = 99;
+	new Uint8Array(sourceBytes)[0] = 98;
+
+	const first = (await database.listCanvasLifecycle())[0];
+	assert.equal(first?.kind, "promote");
+	if (!first || first.kind !== "promote") return;
+	assert.deepEqual([first.bodyEpoch, first.rootEpoch], [1, 2]);
+	assert.deepEqual([...new Uint8Array(first.encodedUpdate)], [1, 2, 3]);
+	assert.deepEqual([...new Uint8Array(first.sourceBytes)], [4, 5, 6]);
+	new Uint8Array(first.encodedUpdate)[1] = 97;
+	new Uint8Array(first.sourceBytes)[1] = 96;
+
+	const second = (await database.listCanvasLifecycle())[0];
+	assert.equal(second?.kind, "promote");
+	if (!second || second.kind !== "promote") return;
+	assert.deepEqual([...new Uint8Array(second.encodedUpdate)], [1, 2, 3]);
+	assert.deepEqual([...new Uint8Array(second.sourceBytes)], [4, 5, 6]);
+	await database.close();
 });
 await s.done();

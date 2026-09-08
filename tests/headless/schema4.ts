@@ -12,7 +12,7 @@ for (const method of ["addEventListener", "removeEventListener"] as const) {
 }
 
 const SCHEMA_VERSION = 8;
-const PROTOCOL_VERSION = 4;
+const PROTOCOL_VERSION = 5;
 const NETWORK_WAIT_MS = 15_000;
 function fetchBounded(input: string | URL | Request, init: RequestInit = {}): Promise<Response> {
 	return globalThis.fetch(input, {
@@ -50,6 +50,7 @@ interface LifecycleRequest {
 	readonly kind: "create" | "delete" | "revive" | "rename";
 	readonly fileId: string;
 	readonly bodyId: string;
+	readonly bodyEpoch: number;
 	readonly path?: string;
 	readonly fromPath?: string;
 	readonly toPath?: string;
@@ -61,6 +62,7 @@ interface LifecycleReceipt {
 	readonly vaultId: string;
 	readonly vaultGeneration: string;
 	readonly bodyId: string;
+	readonly bodyEpoch: number;
 	readonly fileId: string;
 	readonly operationId: string;
 	readonly kind: LifecycleRequest["kind"];
@@ -136,7 +138,7 @@ export async function claimServer(host: string): Promise<ClaimedServer> {
 		operatorCookie,
 	};
 	const capabilities = await fetchBounded(`${host}/api/capabilities`).then((result) => json(result, "capabilities"));
-	if (capabilities.claimed !== true || capabilities.schemaVersion !== 8 || capabilities.protocolVersion !== 4
+	if (capabilities.claimed !== true || capabilities.schemaVersion !== 8 || capabilities.protocolVersion !== 5
 		|| capabilities.semanticCanvas !== true) {
 		throw new Error(`claimed Worker has the wrong public contract: ${JSON.stringify(capabilities)}`);
 	}
@@ -203,10 +205,19 @@ function route(identity: Identity, suffix: string): string {
 }
 
 async function socketTicket(identity: Identity, purpose: "root" | "body", documentId: string): Promise<string> {
+	const epochResponse = await fetchBounded(route(identity, purpose === "root" ? "root" : `body/${encodeURIComponent(documentId)}`), {
+		headers: headers(identity),
+	});
+	if (!epochResponse.ok) throw new Error(`${purpose}/${documentId} epoch read failed (${epochResponse.status})`);
+	const epochHeader = purpose === "root" ? "x-yaos-root-epoch" : "x-yaos-body-epoch";
+	const documentEpoch = Number(epochResponse.headers.get(epochHeader));
+	if (!Number.isSafeInteger(documentEpoch) || documentEpoch < 1) throw new Error(`${purpose}/${documentId} returned an invalid epoch`);
 	const body = await json(await fetchBounded(route(identity, "auth/ticket"), {
 		method: "POST",
 		headers: headers(identity, { "Content-Type": "application/json" }),
-		body: JSON.stringify({ purpose, documentId }),
+		body: JSON.stringify(purpose === "root"
+			? { purpose, documentId: "root", rootEpoch: documentEpoch }
+			: { purpose, documentId, bodyEpoch: documentEpoch }),
 	}), "socket ticket");
 	const ticket = stringField(body.ticket, "socket ticket");
 	const expiresAt = integerField(body.expiresAt, "socket ticket expiresAt");
@@ -262,6 +273,7 @@ function parseReceipt(value: unknown): LifecycleReceipt {
 		vaultId: stringField(body.vaultId, "receipt vaultId"),
 		vaultGeneration: stringField(body.vaultGeneration, "receipt vaultGeneration"),
 		bodyId: stringField(body.bodyId, "receipt bodyId"),
+		bodyEpoch: integerField(body.bodyEpoch, "receipt bodyEpoch"),
 		fileId: stringField(body.fileId, "receipt fileId"),
 		operationId: stringField(body.operationId, "receipt operationId"),
 		kind: body.kind,
@@ -291,6 +303,8 @@ async function postLifecycle(identity: Identity, request: LifecycleRequest): Pro
 async function publishRoot(identity: Identity, request: LifecycleRequest, receipt: LifecycleReceipt): Promise<void> {
 	const current = await fetchBounded(route(identity, "root"), { headers: headers(identity) });
 	if (!current.ok) throw new Error(`root read failed (${current.status})`);
+	const rootEpoch = Number(current.headers.get("x-yaos-root-epoch"));
+	if (!Number.isSafeInteger(rootEpoch) || rootEpoch < 1) throw new Error("root read omitted root epoch");
 	const root = new Y.Doc({ guid: "headless-root-publication" });
 	Y.applyUpdate(root, new Uint8Array(await current.arrayBuffer()));
 	const before = Y.encodeStateVector(root);
@@ -308,6 +322,7 @@ async function publishRoot(identity: Identity, request: LifecycleRequest, receip
 		body: encodeBinaryEnvelope({
 			operations: [{ ...request, vaultSequence: receipt.vaultSequence }],
 			rootUpdate: update,
+			rootEpoch,
 		}),
 	}), "root publication");
 	if (publication.vaultGeneration !== identity.vaultGeneration
@@ -324,22 +339,25 @@ async function sha256Hex(bytes: Uint8Array): Promise<string> {
 	return Buffer.from(digest).toString("hex");
 }
 
-async function bodyUpdate(identity: Identity, bodyId: string): Promise<Uint8Array> {
+async function bodyUpdate(identity: Identity, bodyId: string): Promise<{ update: Uint8Array; bodyEpoch: number }> {
 	const response = await fetchBounded(route(identity, `body/${encodeURIComponent(bodyId)}`), { headers: headers(identity) });
 	if (!response.ok) throw new Error(`body ${bodyId} read failed (${response.status})`);
-	return new Uint8Array(await response.arrayBuffer());
+	const bodyEpoch = Number(response.headers.get("x-yaos-body-epoch"));
+	if (!Number.isSafeInteger(bodyEpoch) || bodyEpoch < 1) throw new Error(`body ${bodyId} returned an invalid epoch`);
+	return { update: new Uint8Array(await response.arrayBuffer()), bodyEpoch };
 }
 
-async function submitCandidate(identity: Identity, bodyId: string, update: Uint8Array, prefix: string): Promise<void> {
+async function submitCandidate(identity: Identity, bodyId: string, bodyEpoch: number, update: Uint8Array, prefix: string): Promise<void> {
 	const candidateId = `${prefix}-${crypto.randomUUID()}`;
 	const candidateDigest = await sha256Hex(update);
 	const response = await fetchBounded(route(identity, `body/${encodeURIComponent(bodyId)}/candidate`), {
 		method: "POST",
-		headers: headers(identity, {
-			"Content-Type": "application/octet-stream",
-			"x-yaos-candidate-id": candidateId,
-			"x-yaos-candidate-digest": candidateDigest,
-		}),
+			headers: headers(identity, {
+				"Content-Type": "application/octet-stream",
+				"x-yaos-candidate-id": candidateId,
+				"x-yaos-candidate-digest": candidateDigest,
+				"x-yaos-body-epoch": String(bodyEpoch),
+			}),
 		body: update,
 	});
 	const receipt = await json(response, `body candidate ${bodyId}`);
@@ -448,6 +466,7 @@ export class PublicPeer {
 			kind: "create",
 			fileId: bodyId,
 			bodyId,
+			bodyEpoch: 1,
 			path,
 			candidateId,
 			candidateDigest,
@@ -459,6 +478,7 @@ export class PublicPeer {
 				"Content-Type": "application/octet-stream",
 				"x-yaos-candidate-id": candidateId,
 				"x-yaos-candidate-digest": candidateDigest,
+					"x-yaos-body-epoch": "1",
 			}),
 			body: update,
 		});
@@ -478,14 +498,15 @@ export class PublicPeer {
 		const bodyId = this.activePaths().get(path);
 		if (!bodyId) throw new Error(`cannot edit missing remote path ${path}`);
 		const doc = new Y.Doc({ guid: bodyId });
-		Y.applyUpdate(doc, await bodyUpdate(this.identity, bodyId));
+		const current = await bodyUpdate(this.identity, bodyId);
+		Y.applyUpdate(doc, current.update);
 		const before = Y.encodeStateVector(doc);
 		const text = doc.getText("body");
 		text.delete(0, text.length);
 		text.insert(0, content);
 		const update = Y.encodeStateAsUpdate(doc, before);
 		doc.destroy();
-		await submitCandidate(this.identity, bodyId, update, "edit");
+		await submitCandidate(this.identity, bodyId, current.bodyEpoch, update, "edit");
 	}
 
 	async delete(path: string): Promise<void> {
@@ -496,6 +517,7 @@ export class PublicPeer {
 			kind: "delete",
 			fileId: bodyId,
 			bodyId,
+			bodyEpoch: (await bodyUpdate(this.identity, bodyId)).bodyEpoch,
 			path,
 		};
 		const receipt = await postLifecycle(this.identity, request);

@@ -56,12 +56,14 @@ s.test("bootstrap verifies canonical and legacy metadata before canonicalizing",
 	doc.getText("body").insert(0, rawContent);
 	const state = {
 		bodyId: doc.guid,
+		bodyEpoch: 1,
 		generation: 4,
 		encodedState: Y.encodeStateAsUpdate(doc),
 	};
 	doc.destroy();
 	const baseEntry: ClientCatalogEntry = {
 		bodyId: state.bodyId,
+		bodyEpoch: 1,
 		fileId: state.bodyId,
 		path: "Note.md",
 		generation: 4,

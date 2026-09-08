@@ -743,8 +743,7 @@ export function renderOperatorConsole(options: OperatorPageOptions): string {
       const error = data && typeof data.error === "string" ? data.error : "";
       if (error === "owner_invariant") return fallback + " The vault owner state changed; reload and review it.";
       if (error === "authority_superseded") return fallback + " Vault authority changed; reload before retrying.";
-      if (error === "already_migrated") return "This vault already has collaboration identities. Reload the console.";
-      return error ? fallback + " (" + error + ")" : fallback;
+	      return error ? fallback + " (" + error + ")" : fallback;
     }
     function showOwnerCode(slot, purpose, data) {
       slot.replaceChildren();
@@ -780,14 +779,6 @@ export function renderOperatorConsole(options: OperatorPageOptions): string {
         links.appendChild(mobile);
       }
       if (links.childNodes.length > 0) slot.appendChild(links);
-    }
-    function updateMigrationButton(card) {
-      const button = card && card.querySelector("[data-collaboration-migrate]");
-      if (!button || button.dataset.pending === "true") return;
-      const displayName = card.querySelector(".owner-display-name");
-      const confirmation = card.querySelector(".migration-confirm");
-      const selected = card.querySelectorAll(".migration-owner-device:checked");
-      button.disabled = !displayName || !displayName.value.trim() || selected.length === 0 || !confirmation || !confirmation.checked;
     }
     async function requestOwnerCode(vaultId, purpose, button, slot) {
       button.disabled = true;
@@ -998,13 +989,6 @@ export function renderOperatorConsole(options: OperatorPageOptions): string {
         const ownerPrincipal = ownerMembership
           ? (data.principals || []).find((principal) => principal.principalId === ownerMembership.principalId)
           : null;
-        const pendingMigration = (data.authorizationChanges || []).find((change) =>
-          change.vaultId === vault.vaultId
-          && change.kind === "authority-install"
-          && change.changeId.indexOf("collab_migrate_") === 0
-          && change.state !== "complete");
-        const needsMigration = devices.length > 0 && memberships.length === 0
-          && devices.every((device) => typeof device.principalId !== "string");
 
         if (vault.state === "provisioning") {
           const provisioning = document.createElement("p");
@@ -1039,73 +1023,6 @@ export function renderOperatorConsole(options: OperatorPageOptions): string {
             ownerSetup.appendChild(ownerSetupResult);
           }
           card.appendChild(ownerSetup);
-        }
-
-        if (needsMigration || pendingMigration) {
-          const migration = document.createElement("section");
-          migration.className = "collaboration-action migration-action";
-          migration.dataset.locked = pendingMigration ? "true" : "false";
-          const migrationHeading = document.createElement("h3");
-          migrationHeading.textContent = pendingMigration ? "Finish collaboration migration" : "Upgrade to human collaboration";
-          migration.appendChild(migrationHeading);
-          const migrationDetail = document.createElement("p");
-          migrationDetail.textContent = pendingMigration
-            ? "The identity migration was prepared but did not finish installing vault authority. Review the locked owner grouping and retry the exact operation."
-            : "Choose every existing device that belongs to the owner. Selected devices become one owner identity; every unselected device becomes a separate full member. This cannot be inferred or safely undone.";
-          migration.appendChild(migrationDetail);
-          if (pendingMigration && pendingMigration.lastError) {
-            const migrationError = document.createElement("p");
-            migrationError.className = "err";
-            migrationError.textContent = "Last authority installation error: " + pendingMigration.lastError;
-            migration.appendChild(migrationError);
-          }
-          const nameLabel = document.createElement("label");
-          nameLabel.textContent = "Owner display name";
-          const nameInput = document.createElement("input");
-          nameInput.type = "text";
-          nameInput.className = "owner-display-name";
-          nameInput.maxLength = 80;
-          nameInput.placeholder = "Owner name";
-          nameInput.value = ownerPrincipal ? ownerPrincipal.displayName : "";
-          nameInput.disabled = Boolean(pendingMigration);
-          nameLabel.appendChild(document.createElement("br"));
-          nameLabel.appendChild(nameInput);
-          migration.appendChild(nameLabel);
-          const ownerDevices = document.createElement("fieldset");
-          const ownerDevicesLegend = document.createElement("legend");
-          ownerDevicesLegend.textContent = "Devices belonging to the owner";
-          ownerDevices.appendChild(ownerDevicesLegend);
-          for (const device of devices) {
-            const deviceLabel = document.createElement("label");
-            const deviceInput = document.createElement("input");
-            deviceInput.type = "checkbox";
-            deviceInput.className = "migration-owner-device";
-            deviceInput.value = device.deviceId;
-            deviceInput.checked = Boolean(ownerMembership && device.principalId === ownerMembership.principalId);
-            deviceInput.disabled = Boolean(pendingMigration);
-            deviceLabel.appendChild(deviceInput);
-            deviceLabel.appendChild(document.createTextNode(" " + device.name + " (" + device.deviceId.slice(0, 8) + ")"));
-            ownerDevices.appendChild(deviceLabel);
-          }
-          migration.appendChild(ownerDevices);
-          const migrationConfirmLabel = document.createElement("label");
-          const migrationConfirm = document.createElement("input");
-          migrationConfirm.type = "checkbox";
-          migrationConfirm.className = "migration-confirm";
-          migrationConfirmLabel.appendChild(migrationConfirm);
-          migrationConfirmLabel.appendChild(document.createTextNode(pendingMigration
-            ? " I reviewed this locked grouping and want to retry the incomplete migration."
-            : " I reviewed every device and understand unselected devices become separate members."));
-          migration.appendChild(migrationConfirmLabel);
-          const migrationButton = document.createElement("button");
-          migrationButton.textContent = pendingMigration ? "Retry collaboration migration" : "Migrate collaboration identities";
-          migrationButton.dataset.collaborationMigrate = vault.vaultId;
-          migrationButton.disabled = true;
-          migration.appendChild(migrationButton);
-          const migrationStatus = document.createElement("p");
-          migrationStatus.className = "migration-status action-status";
-          migration.appendChild(migrationStatus);
-          card.appendChild(migration);
         }
 
         if (vault.state === "active" && ownerMembership && ownerMembership.state === "active") {
@@ -1184,7 +1101,7 @@ export function renderOperatorConsole(options: OperatorPageOptions): string {
           card.appendChild(collaborationHint);
         }
 
-        if (vault.state === "active" && memberships.length === 0 && !needsMigration) {
+	        if (vault.state === "active" && memberships.length === 0) {
           const codesHeading = document.createElement("p");
           codesHeading.textContent = "Unused legacy pairing codes";
           card.appendChild(codesHeading);
@@ -1419,10 +1336,7 @@ export function renderOperatorConsole(options: OperatorPageOptions): string {
         const btn = card && card.querySelector('[data-owner-code-purpose="owner-recovery"]');
         if (btn && btn.dataset.pending !== "true") btn.disabled = !input.checked;
       }
-      if (input.classList.contains("owner-display-name")
-        || input.classList.contains("migration-owner-device")
-        || input.classList.contains("migration-confirm")) updateMigrationButton(card);
-    });
+	    });
     document.getElementById("vaults").addEventListener("click", async (event) => {
       const target = event.target;
       if (!target || !target.getAttribute) return;
@@ -1437,7 +1351,6 @@ export function renderOperatorConsole(options: OperatorPageOptions): string {
       const retryRevocation = target.getAttribute("data-retry-revocation");
       const ownerCode = target.getAttribute("data-owner-code");
       const ownerCodePurpose = target.getAttribute("data-owner-code-purpose");
-      const collaborationMigrate = target.getAttribute("data-collaboration-migrate");
       if (ownerCode && ownerCodePurpose) {
         const card = target.closest(".card");
         const slot = target.closest(".collaboration-action").querySelector(".owner-code-result");
@@ -1446,55 +1359,6 @@ export function renderOperatorConsole(options: OperatorPageOptions): string {
           if (!confirmation || !confirmation.checked) return;
         }
         await requestOwnerCode(ownerCode, ownerCodePurpose, target, slot);
-        return;
-      }
-      if (collaborationMigrate) {
-        const card = target.closest(".card");
-        const action = target.closest(".migration-action");
-        const migrationStatus = action && action.querySelector(".migration-status");
-        const ownerDisplayNameInput = action && action.querySelector(".owner-display-name");
-        const confirmation = action && action.querySelector(".migration-confirm");
-        const ownerDeviceIds = action
-          ? Array.from(action.querySelectorAll(".migration-owner-device:checked")).map((input) => input.value)
-          : [];
-        const ownerDisplayName = ownerDisplayNameInput ? ownerDisplayNameInput.value.trim() : "";
-        if (!migrationStatus || !confirmation || !confirmation.checked || !ownerDisplayName || ownerDeviceIds.length === 0) return;
-        target.disabled = true;
-        target.dataset.pending = "true";
-        for (const input of action.querySelectorAll("input")) input.disabled = true;
-        migrationStatus.classList.remove("err");
-        migrationStatus.textContent = "Installing collaboration identities and vault authority. Do not repeat this action…";
-        let migrationResponse;
-        try {
-          migrationResponse = await fetch("/operator/vaults/" + encodeURIComponent(collaborationMigrate) + "/collaboration-migrate", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ ownerDeviceIds, ownerDisplayName }),
-          });
-        } catch {
-          status.textContent = "The migration response was lost. Its durable state is shown below; confirm and retry only if it is marked incomplete.";
-          await load(true);
-          return;
-        }
-        const migrationData = await migrationResponse.json().catch(() => null);
-        if (!migrationResponse.ok) {
-          if (migrationData && migrationData.repairable) {
-            status.textContent = actionError(migrationData,
-              "Migration did not finish, but its prepared authority change is repairable. Review the locked grouping below and retry it.");
-            await load(true);
-            return;
-          }
-          migrationStatus.classList.add("err");
-          migrationStatus.textContent = actionError(migrationData, "Could not migrate collaboration identities.");
-          target.dataset.pending = "false";
-          for (const input of action.querySelectorAll("input")) {
-            input.disabled = action.dataset.locked === "true" && !input.classList.contains("migration-confirm");
-          }
-          updateMigrationButton(card);
-          return;
-        }
-        status.textContent = "Collaboration migration completed. Historical work remains unattributed; every device now belongs to a person.";
-        await load(true);
         return;
       }
       if (retryRevocation) {

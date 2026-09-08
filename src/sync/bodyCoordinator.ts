@@ -3,6 +3,11 @@ import {
 	type Lease,
 	type OperationEpoch,
 } from "../runtime/operationLifecycle";
+import {
+	INITIAL_SEMANTIC_EPOCH,
+	parseSemanticEpoch,
+	type SemanticEpoch,
+} from "@shared/semanticEpoch";
 
 export type BodyResidency = "absent" | "loading" | "warm" | "active" | "evicting";
 export type BodyProjectionOwner = "editor" | "disk" | "recovery";
@@ -12,6 +17,7 @@ export type BodyLifetime = "accepting" | "quiescing" | "disposed";
 
 export interface BodyRevisionToken {
 	readonly bodyId: string;
+	readonly bodyEpoch: SemanticEpoch;
 	readonly docIdentity: string;
 	readonly contentRevision: number;
 	readonly lifecycleRevision: number;
@@ -21,6 +27,7 @@ export interface BodyRevisionToken {
 
 export interface BodyCoordinatorSnapshot {
 	bodyId: string;
+	bodyEpoch: SemanticEpoch;
 	docIdentity: string;
 	contentRevision: number;
 	lifecycleRevision: number;
@@ -39,6 +46,7 @@ export interface BodyLease extends Lease {
 }
 
 interface BodyRecord {
+	bodyEpoch: SemanticEpoch;
 	docIdentity: string;
 	contentRevision: number;
 	lifecycleRevision: number;
@@ -96,6 +104,7 @@ export class BodyCoordinator {
 		if (!localRuntimeEpoch) throw new Error("runtime scope is not accepting work");
 		return {
 			bodyId,
+			bodyEpoch: record.bodyEpoch,
 			docIdentity: record.docIdentity,
 			contentRevision: record.contentRevision,
 			lifecycleRevision: record.lifecycleRevision,
@@ -107,6 +116,7 @@ export class BodyCoordinator {
 	isContentCurrent(token: BodyRevisionToken): boolean {
 		const record = this.currentRecord(token);
 		return record !== null
+			&& record.bodyEpoch === token.bodyEpoch
 			&& record.docIdentity === token.docIdentity
 			&& record.contentRevision === token.contentRevision;
 	}
@@ -119,6 +129,7 @@ export class BodyCoordinator {
 	isProjectionCurrent(token: BodyRevisionToken, path?: string): boolean {
 		const record = this.currentRecord(token);
 		return record !== null
+			&& record.bodyEpoch === token.bodyEpoch
 			&& record.docIdentity === token.docIdentity
 			&& record.contentRevision === token.contentRevision
 			&& record.lifecycleRevision === token.lifecycleRevision
@@ -146,6 +157,20 @@ export class BodyCoordinator {
 		this.assertAccepting(record);
 		record.docIdentity = this.createId();
 		record.contentRevision = 0;
+		return this.capture(bodyId);
+	}
+
+	/** Replaces the complete local CRDT identity after a server semantic reset. */
+	installSemanticEpoch(bodyId: string, bodyEpoch: SemanticEpoch): BodyRevisionToken {
+		const record = this.record(bodyId);
+		this.assertAccepting(record);
+		const next = parseSemanticEpoch(bodyEpoch, "body epoch");
+		if (next <= record.bodyEpoch) throw new Error("body epoch must advance monotonically");
+		record.bodyEpoch = next;
+		record.docIdentity = this.createId();
+		record.contentRevision = 0;
+		record.lifecycleRevision++;
+		record.ownershipRevision++;
 		return this.capture(bodyId);
 	}
 
@@ -343,6 +368,7 @@ export class BodyCoordinator {
 		if (!record) {
 			if (!this.accepting || this.disposed || !this.runtimeScope.isAccepting) throw new Error("body coordinator is not accepting work");
 			record = {
+				bodyEpoch: INITIAL_SEMANTIC_EPOCH,
 				docIdentity: this.createId(), contentRevision: 0, lifecycleRevision: 0, ownershipRevision: 0,
 				residency: "absent", projectionOwner: null, projectionHolders: new Set(),
 				synchronization: "clean", divergence: "none", lifetime: "accepting", leases: new Set(),
@@ -360,7 +386,8 @@ export class BodyCoordinator {
 
 	private snapshotRecord(bodyId: string, record: BodyRecord): BodyCoordinatorSnapshot {
 		return {
-			bodyId, docIdentity: record.docIdentity, contentRevision: record.contentRevision,
+			bodyId, bodyEpoch: record.bodyEpoch,
+			docIdentity: record.docIdentity, contentRevision: record.contentRevision,
 			lifecycleRevision: record.lifecycleRevision, ownershipRevision: record.ownershipRevision,
 			residency: record.residency, projectionOwner: record.projectionOwner,
 			synchronization: record.synchronization, divergence: record.divergence,

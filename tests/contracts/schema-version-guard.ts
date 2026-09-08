@@ -2,7 +2,7 @@
 /**
  * Regression coverage for scripts/guard-schema-version.mjs.
  *
- * Schema 6 is pinned in the plugin's sync schema and the server's shared
+ * Schema 8 is pinned in the plugin's sync schema and the server's shared
  * product-version source. The public server version module must derive its
  * schema export from that canonical server pin rather than duplicate a number.
  *
@@ -42,7 +42,8 @@ function makeServerFixture(dir: string, schemaVersion: number) {
 	);
 	writeFileSync(
 		join(dir, "server/src/vaultDocumentStore.ts"),
-		`const sql = \`schema_version INTEGER NOT NULL CHECK(schema_version = ${schemaVersion})\`;\n`,
+		'import { SCHEMA_VERSION } from "./shared/productVersions";\n' +
+			'const sql = `schema_version INTEGER NOT NULL CHECK(schema_version = ${SCHEMA_VERSION})`;\n',
 	);
 	writeServerVersionModule(dir);
 }
@@ -113,13 +114,14 @@ await withTempDir("yaos-schema-version-guard-", (fixtureDir) => {
 	makeServerFixture(fixtureDir, 8);
 	writeFileSync(
 		join(fixtureDir, "server/src/vaultDocumentStore.ts"),
-		"const sql = `schema_version INTEGER NOT NULL CHECK(schema_version = 5)`;\n",
+		'import { SCHEMA_VERSION } from "./shared/productVersions";\n' +
+			"const sql = `schema_version INTEGER NOT NULL CHECK(schema_version = 7)`;\n",
 	);
 	const result = runGuard(fixtureDir);
 
 	s.check(result.status === 1, "guard exits non-zero for a stale SQLite schema constraint");
 	s.check(
-		result.stderr.includes("schema_version CHECK pins 5, expected canonical server schema 8"),
+		result.stderr.includes("must contain exactly one vault_meta schema_version CHECK derived from SCHEMA_VERSION"),
 		"guard reports the stale durable constraint",
 	);
 });

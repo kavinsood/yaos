@@ -17,6 +17,7 @@ import type { StoredAttachmentPublicationOperation, StoredDocument } from "../..
 import { readSource, suite, until } from "../harness.ts";
 import { partialOf } from "../mocks/productFixture.ts";
 import { installDomCrypto } from "./helpers/installDomCrypto.ts";
+import { PROTOCOL_VERSION, SCHEMA_VERSION } from "../../src/sync/schema";
 
 installDomCrypto();
 const s = suite("vault-work-scheduler-integration");
@@ -152,10 +153,12 @@ s.test("VaultSync reconstructs and drains candidate, body-wake, and ticket work"
 	const clock = new FakeClock();
 	const documents = new Map<string, StoredDocument>();
 	const root = new Y.Doc({ guid: "root" });
-	root.getMap("sys").set("schemaVersion", 8);
-	root.getMap("sys").set("protocolVersion", 4);
+	root.getMap("sys").set("schemaVersion", SCHEMA_VERSION);
+	root.getMap("sys").set("protocolVersion", PROTOCOL_VERSION);
 	documents.set("root", {
+		kind: "root",
 		documentId: "root",
+		rootEpoch: 1,
 		generation: 1,
 		encodedState: Y.encodeStateAsUpdate(root).slice().buffer,
 		dirty: false,
@@ -163,7 +166,10 @@ s.test("VaultSync reconstructs and drains candidate, body-wake, and ticket work"
 	});
 	root.destroy();
 	documents.set("body-1", {
+		kind: "body",
 		documentId: "body-1",
+		bodyEpoch: 1,
+		durableBaseline: "old",
 		generation: 1,
 		encodedState: encodedBody("body-1", "old").slice().buffer,
 		dirty: true,
@@ -173,6 +179,9 @@ s.test("VaultSync reconstructs and drains candidate, body-wake, and ticket work"
 	const candidate: CandidateRecord = {
 		vaultId: "vault-1",
 		bodyId: "body-1",
+		bodyEpoch: 1,
+		previousBaseline: "old",
+		pendingMarkdown: "old",
 		candidateId: "candidate-1",
 		candidateDigest: "digest-1",
 		encodedUpdate: new Uint8Array([1, 2, 3]).buffer,
@@ -200,8 +209,8 @@ s.test("VaultSync reconstructs and drains candidate, body-wake, and ticket work"
 	let candidateAttempts = 0;
 	const remoteBody = encodedBody("body-1", "new");
 	const server = partialOf<VaultServerPort>({
-		currentHead: async (bodyId) => ({ bodyId, generation: 2 }),
-		currentBody: async (bodyId) => ({ bodyId, generation: 2, encodedState: remoteBody }),
+		currentHead: async (bodyId) => ({ bodyId, bodyEpoch: 1, generation: 2 }),
+		currentBody: async (bodyId) => ({ bodyId, bodyEpoch: 1, generation: 2, encodedState: remoteBody }),
 		submitCandidate: async (record): Promise<BodyReceipt> => {
 			candidateAttempts++;
 			if (candidateAttempts === 1) throw new Error("temporary candidate outage");
@@ -209,6 +218,7 @@ s.test("VaultSync reconstructs and drains candidate, body-wake, and ticket work"
 				vaultId: "vault-1",
 				vaultGeneration: "generation-1",
 				bodyId: record.bodyId,
+				bodyEpoch: record.bodyEpoch,
 				clientId: "device-1",
 				candidateId: record.candidateId,
 				candidateDigest: record.candidateDigest,
@@ -249,6 +259,7 @@ s.test("VaultSync reconstructs and drains candidate, body-wake, and ticket work"
 	provider.emitCustom(JSON.stringify({
 		type: "VAULT_READY",
 		documentId: "root",
+		documentEpoch: 1,
 		vaultGeneration: "wrong-generation",
 		durableGeneration: 1,
 		runtimeEpoch: "runtime-wrong",
@@ -258,6 +269,7 @@ s.test("VaultSync reconstructs and drains candidate, body-wake, and ticket work"
 	provider.emitCustom(JSON.stringify({
 		type: "VAULT_READY",
 		documentId: "root",
+		documentEpoch: 1,
 		vaultGeneration: "generation-1",
 		durableGeneration: 1,
 		runtimeEpoch: "runtime-1",
@@ -269,10 +281,10 @@ s.test("VaultSync reconstructs and drains candidate, body-wake, and ticket work"
 	assert.equal(typeof probe.probeId, "string");
 	assert.equal(runtime.getSocketLivenessSnapshot()[0]?.phase, "probing");
 	for (const frame of [
-		{ documentId: "other", vaultGeneration: "generation-1", runtimeEpoch: "runtime-1", probeId: probe.probeId },
-		{ documentId: "root", vaultGeneration: "wrong-generation", runtimeEpoch: "runtime-1", probeId: probe.probeId },
-		{ documentId: "root", vaultGeneration: "generation-1", runtimeEpoch: "runtime-wrong", probeId: probe.probeId },
-		{ documentId: "root", vaultGeneration: "generation-1", runtimeEpoch: "runtime-1", probeId: "wrong-probe" },
+		{ documentId: "other", documentEpoch: 1, vaultGeneration: "generation-1", runtimeEpoch: "runtime-1", probeId: probe.probeId },
+		{ documentId: "root", documentEpoch: 1, vaultGeneration: "wrong-generation", runtimeEpoch: "runtime-1", probeId: probe.probeId },
+		{ documentId: "root", documentEpoch: 1, vaultGeneration: "generation-1", runtimeEpoch: "runtime-wrong", probeId: probe.probeId },
+		{ documentId: "root", documentEpoch: 1, vaultGeneration: "generation-1", runtimeEpoch: "runtime-1", probeId: "wrong-probe" },
 	]) {
 		provider.emitCustom(JSON.stringify({ type: "VAULT_PONG", ...frame }));
 		assert.equal(runtime.getSocketLivenessSnapshot()[0]?.phase, "probing");
@@ -280,6 +292,7 @@ s.test("VaultSync reconstructs and drains candidate, body-wake, and ticket work"
 	provider.emitCustom(JSON.stringify({
 		type: "VAULT_PONG",
 		documentId: "root",
+		documentEpoch: 1,
 		vaultGeneration: "generation-1",
 		runtimeEpoch: "runtime-1",
 		probeId: probe.probeId,
@@ -298,6 +311,7 @@ s.test("VaultSync reconstructs and drains candidate, body-wake, and ticket work"
 	provider.emitCustom(JSON.stringify({
 		type: "BODY_COMMITTED",
 		bodyId: "body-1",
+		bodyEpoch: 1,
 		vaultGeneration: "generation-1",
 		durableGeneration: 2,
 		runtimeEpoch: "runtime-1",

@@ -1,7 +1,6 @@
-import WebSocket from "ws";
 import { decodeBinaryEnvelope } from "../../server/src/shared/binaryEnvelope.ts";
 import { parseFatalFrame, type FatalFrame } from "./fatalFrame.ts";
-import { deviceBearerHeaders, fetchSocketTicket, requireLiveIdentityContext } from "./liveIdentity.ts";
+import { deviceBearerHeaders, fetchSocketTicket, LiveWebSocket as WebSocket, requireLiveIdentityContext } from "./liveIdentity.ts";
 
 const { deviceA, deviceB, operatorCookie, settingsConfigKey } = requireLiveIdentityContext();
 const vaultPath = `/operator/vaults/${encodeURIComponent(deviceA.vaultId)}`;
@@ -77,7 +76,10 @@ if (result.response.status === 202) {
 	assert(pending?.purgeJobId === statusBody?.pending?.purgeJobId, "destroy retry retains the original purge job identity");
 }
 
-const deadline = Date.now() + 15_000;
+// Deployed R2/DO purge is alarm-driven and can legitimately outlive a busy
+// platform's first scheduling quantum. Keep the terminal assertion, but allow
+// a bounded minute before classifying the durable retry loop as stuck.
+const deadline = Date.now() + 60_000;
 while (result.response.status !== 200 && Date.now() < deadline) {
 	await new Promise((resolve) => setTimeout(resolve, 100));
 	result = await destroy(governanceRequestId);

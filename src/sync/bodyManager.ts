@@ -1,11 +1,13 @@
 import * as Y from "yjs";
-import type { StoredDocument } from "./vaultIndexedDb";
+import type { StoredBodyCandidate, StoredDocument, StoredSemanticEpochReplacement } from "./vaultIndexedDb";
 import {
 	BodyCoordinator,
 	type BodyLease,
 	type BodyRevisionToken,
 } from "./bodyCoordinator";
 import { RuntimeScope } from "../runtime/operationLifecycle";
+import { INITIAL_SEMANTIC_EPOCH, parseSemanticEpoch, type SemanticEpoch } from "@shared/semanticEpoch";
+import type { ReadySemanticEpochTransition } from "./semanticEpochTransition";
 import {
 	BODY_RESIDENCY_ESTIMATOR_VERSION,
 	EMPTY_BODY_EXTERNAL_RESOURCE_SIGNALS,
@@ -31,6 +33,7 @@ export const DEFAULT_BODY_ESTIMATED_COST_BUDGET = 48 * 1024 * 1024;
 export interface DocumentStore {
 	getDocument(documentId: string): Promise<StoredDocument | null>;
 	putDocument(document: StoredDocument): Promise<void>;
+	replaceBodySemanticEpoch?(replacement: StoredSemanticEpochReplacement): Promise<void>;
 }
 
 export interface BodyCostInput {
@@ -67,6 +70,8 @@ const DEFAULT_BODY_MANAGER_LIMITS: BodyManagerLimits = {
 
 export interface LoadedBody {
 	bodyId: string;
+	bodyEpoch: SemanticEpoch;
+	durableBaseline: string;
 	doc: Y.Doc;
 	generation: number;
 	dirty: boolean;
@@ -189,11 +194,15 @@ export class BodyManager {
 
 	async markCandidateSettled(
 		bodyId: string,
+		bodyEpoch: SemanticEpoch,
 		generation: number,
 		capturedLocalUpdates = 0,
 	): Promise<void> {
 		const body = this.loaded.get(bodyId);
 		if (!body) throw new Error(`body ${bodyId} is not loaded`);
+		if (body.bodyEpoch !== parseSemanticEpoch(bodyEpoch, "receipt body epoch")) {
+			throw new Error(`candidate receipt crossed the semantic epoch for ${bodyId}`);
+		}
 		body.generation = Math.max(body.generation, generation);
 		body.unsettled = Math.max(0, body.unsettled - 1);
 		body.pendingLocalUpdates = Math.max(
@@ -201,6 +210,7 @@ export class BodyManager {
 			body.pendingLocalUpdates - capturedLocalUpdates,
 		);
 		body.dirty = body.unsettled > 0 || body.pendingLocalUpdates > 0;
+		if (!body.dirty) body.durableBaseline = body.doc.getText("body").toJSON();
 		this.coordinator.setSynchronization(
 			bodyId,
 			body.dirty ? "durably-pending" : "clean",
@@ -209,13 +219,89 @@ export class BodyManager {
 		await this.persist(body);
 	}
 
+	/** Atomically adopts a fresh epoch document prepared without old Yjs identities. */
+	async installSemanticEpochTransition(
+		transition: ReadySemanticEpochTransition,
+		generation: number,
+		candidate: StoredBodyCandidate | null,
+	): Promise<LoadedBody> {
+		return this.withAdmission(async () => {
+			const prior = this.loaded.get(transition.bodyId);
+			if (!prior) throw new Error(`body ${transition.bodyId} is not loaded`);
+			if (transition.bodyEpoch <= prior.bodyEpoch) throw new Error(`stale semantic epoch for body ${transition.bodyId}`);
+			const coordination = this.coordinator.snapshot(transition.bodyId);
+			if ((coordination?.leaseCount ?? 0) > 0 || prior.pins > 0) {
+				throw new Error(`cannot replace leased or pinned body ${transition.bodyId} across semantic epoch`);
+			}
+			const encoded = Y.encodeStateAsUpdate(transition.document);
+			const next = this.measureCost(transition.bodyId, transition.document, encoded.byteLength);
+			if (!await this.ensureEstimatedCostCapacity(transition.bodyId, next.cost)) {
+				throw new Error("body_estimated_cost_budget");
+			}
+			const hasPendingRebase = candidate !== null;
+			if (hasPendingRebase !== (transition.rebasedUpdate !== null)
+				|| (candidate && (candidate.bodyId !== transition.bodyId || candidate.bodyEpoch !== transition.bodyEpoch))) {
+				throw new Error("semantic epoch candidate does not match prepared transition");
+			}
+			const replacement: LoadedBody = {
+				bodyId: transition.bodyId,
+				bodyEpoch: transition.bodyEpoch,
+				durableBaseline: transition.authoritativeContent,
+				doc: transition.document,
+				generation,
+				dirty: hasPendingRebase,
+				unsettled: hasPendingRebase ? 1 : 0,
+				pendingLocalUpdates: candidate?.capturedLocalUpdates ?? 0,
+				pins: 0,
+				lastUsedAt: this.now(),
+				estimatedCost: next.cost,
+				residencyMeasurement: next.measurement,
+			};
+			const storedDocument: Extract<StoredDocument, { kind: "body" }> = {
+				kind: "body",
+				documentId: replacement.bodyId,
+				bodyEpoch: replacement.bodyEpoch,
+				durableBaseline: replacement.durableBaseline,
+				generation: replacement.generation,
+				encodedState: encoded.slice().buffer,
+				dirty: replacement.dirty,
+				pendingLocalUpdates: replacement.pendingLocalUpdates,
+				updatedAt: this.now(),
+			};
+			if (!this.database.replaceBodySemanticEpoch) {
+				throw new Error("atomic semantic epoch persistence is unavailable");
+			}
+			await this.database.replaceBodySemanticEpoch({ document: storedDocument, candidate });
+			this.detachUpdateObserver(prior);
+			this.loaded.set(replacement.bodyId, replacement);
+			this.coordinator.installSemanticEpoch(replacement.bodyId, replacement.bodyEpoch);
+			this.attachUpdateObserver(replacement);
+			this.coordinator.setSynchronization(replacement.bodyId, hasPendingRebase ? "locally-pending" : "clean");
+			this.coordinator.setResidency(replacement.bodyId, "warm");
+			prior.doc.destroy();
+			if (prior.estimatedCost !== replacement.estimatedCost) {
+				this.costHooks.onChange?.({
+					bodyId: replacement.bodyId,
+					previousCost: prior.estimatedCost,
+					currentCost: replacement.estimatedCost,
+				});
+			}
+			this.updateHighWater();
+			return replacement;
+		});
+	}
+
 
 	async mergeFromServer(
 		bodyId: string,
 		encodedState: Uint8Array,
+		bodyEpoch: SemanticEpoch,
 		generation: number,
 	): Promise<LoadedBody> {
 		const body = await this.load(bodyId);
+		if (body.bodyEpoch !== parseSemanticEpoch(bodyEpoch, "server body epoch")) {
+			throw new Error(`cannot merge a different semantic epoch into body ${bodyId}`);
+		}
 		return this.withAdmission(async () => {
 			const current = this.loaded.get(bodyId);
 			if (!current || current !== body) throw new Error(`body ${bodyId} changed while merging server state`);
@@ -245,9 +331,16 @@ export class BodyManager {
 		});
 	}
 
-	async replaceFromServer(bodyId: string, encodedState: Uint8Array, generation: number): Promise<LoadedBody> {
+	async replaceFromServer(
+		bodyId: string,
+		encodedState: Uint8Array,
+		bodyEpoch: SemanticEpoch,
+		generation: number,
+	): Promise<LoadedBody> {
 		return this.withAdmission(async () => {
+			const nextBodyEpoch = parseSemanticEpoch(bodyEpoch, "server body epoch");
 			const prior = this.loaded.get(bodyId);
+			if (prior && nextBodyEpoch < prior.bodyEpoch) throw new Error(`stale semantic epoch for body ${bodyId}`);
 			const coordination = this.coordinator.snapshot(bodyId);
 			if (
 				prior?.dirty
@@ -286,6 +379,8 @@ export class BodyManager {
 				)) throw new Error(`body ${bodyId} changed while preparing replacement`);
 				const body: LoadedBody = {
 					bodyId,
+					bodyEpoch: nextBodyEpoch,
+					durableBaseline: doc.getText("body").toJSON(),
 					doc,
 					generation,
 					dirty: false,
@@ -297,7 +392,10 @@ export class BodyManager {
 					residencyMeasurement: next.measurement,
 				};
 				await this.database.putDocument({
+					kind: "body",
 					documentId: bodyId,
+					bodyEpoch: nextBodyEpoch,
+					durableBaseline: body.durableBaseline,
 					generation,
 					encodedState: canonicalState.slice().buffer,
 					dirty: false,
@@ -306,7 +404,11 @@ export class BodyManager {
 				});
 				if (prior) this.detachUpdateObserver(prior);
 				this.loaded.set(bodyId, body);
-				this.coordinator.installDocument(bodyId);
+				if (nextBodyEpoch > (prior?.bodyEpoch ?? INITIAL_SEMANTIC_EPOCH)) {
+					this.coordinator.installSemanticEpoch(bodyId, nextBodyEpoch);
+				} else {
+					this.coordinator.installDocument(bodyId);
+				}
 				this.attachUpdateObserver(body);
 				this.coordinator.setResidency(bodyId, "warm");
 				prior?.doc.destroy();
@@ -632,6 +734,7 @@ export class BodyManager {
 
 	private async loadFresh(bodyId: string): Promise<LoadedBody> {
 		const stored = await this.database.getDocument(bodyId);
+		if (stored && stored.kind !== "body") throw new Error(`non-body document cannot be loaded as body ${bodyId}`);
 		return this.withAdmission(async () => {
 			const winner = this.loaded.get(bodyId);
 			if (winner) {
@@ -651,6 +754,8 @@ export class BodyManager {
 				}
 				const body: LoadedBody = {
 					bodyId,
+					bodyEpoch: stored?.bodyEpoch ?? INITIAL_SEMANTIC_EPOCH,
+					durableBaseline: stored?.durableBaseline ?? "",
 					doc,
 					generation: stored?.generation ?? 0,
 					dirty: stored?.dirty ?? false,
@@ -667,7 +772,11 @@ export class BodyManager {
 					throw new Error("body_estimated_cost_budget");
 				}
 				this.loaded.set(bodyId, body);
-				this.coordinator.installDocument(bodyId);
+				if (body.bodyEpoch > INITIAL_SEMANTIC_EPOCH) {
+					this.coordinator.installSemanticEpoch(bodyId, body.bodyEpoch);
+				} else {
+					this.coordinator.installDocument(bodyId);
+				}
 				this.attachUpdateObserver(body);
 				this.coordinator.setResidency(bodyId, "warm");
 				this.updateCost(body, next.cost, next.measurement);
@@ -691,7 +800,10 @@ export class BodyManager {
 			const encoded = Y.encodeStateAsUpdate(body.doc);
 			const next = this.measureCost(body.bodyId, body.doc, encoded.byteLength);
 			await this.database.putDocument({
+				kind: "body",
 				documentId: body.bodyId,
+				bodyEpoch: body.bodyEpoch,
+				durableBaseline: body.durableBaseline,
 				generation: body.generation,
 				encodedState: encoded.slice().buffer,
 				dirty: body.dirty,

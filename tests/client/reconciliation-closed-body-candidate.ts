@@ -41,7 +41,10 @@ s.test("a loaded but closed body submits a durable candidate before advancing it
 	const bodyDoc = new Y.Doc({ guid: bodyId });
 	bodyDoc.getText("body").insert(0, "before");
 	documents.set(bodyId, {
+		kind: "body",
 		documentId: bodyId,
+		bodyEpoch: 1,
+		durableBaseline: "before",
 		generation: 1,
 		encodedState: exactArrayBuffer(Y.encodeStateAsUpdate(bodyDoc)),
 		dirty: false,
@@ -67,7 +70,7 @@ s.test("a loaded but closed body submits a durable candidate before advancing it
 		resolveReceipt = resolve;
 	});
 	const server = partialOf<VaultServerPort>({
-		currentHead: async (requestedBodyId) => ({ bodyId: requestedBodyId, generation: 1 }),
+		currentHead: async (requestedBodyId) => ({ bodyId: requestedBodyId, bodyEpoch: 1, generation: 1 }),
 		submitCandidate: async (candidate) => {
 			observed.submitted = candidate;
 			observed.submissions.push(candidate);
@@ -76,6 +79,7 @@ s.test("a loaded but closed body submits a durable candidate before advancing it
 				vaultId: "vault-1",
 				vaultGeneration: "generation-1",
 				bodyId: candidate.bodyId,
+				bodyEpoch: candidate.bodyEpoch,
 				clientId: "device-1",
 				candidateId: candidate.candidateId,
 				candidateDigest: candidate.candidateDigest,
@@ -172,6 +176,7 @@ s.test("a loaded but closed body submits a durable candidate before advancing it
 		vaultId: "vault-1",
 		vaultGeneration: "generation-1",
 		bodyId,
+		bodyEpoch: 1,
 		clientId: "device-1",
 		candidateId: candidate.candidateId,
 		candidateDigest: candidate.candidateDigest,

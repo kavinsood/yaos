@@ -21,7 +21,8 @@ function storedBody(bodyId: string, content: string): StoredDocument {
 	doc.getText("body").insert(0, content);
 	const encodedState = Y.encodeStateAsUpdate(doc).slice().buffer;
 	doc.destroy();
-	return { documentId: bodyId, generation: 1, encodedState, dirty: false, updatedAt: 1 };
+	return { kind: "body", documentId: bodyId, bodyEpoch: 1, durableBaseline: content,
+		generation: 1, encodedState, dirty: false, updatedAt: 1 };
 }
 
 function providerFactory(
@@ -103,7 +104,7 @@ async function createFailFastCurrentnessRuntime(failure: CurrentnessFailure): Pr
 	const server = partialOf<VaultServerPort>({
 		currentHead: async (requestedBodyId) => {
 			headReads++;
-			return { bodyId: requestedBodyId, generation: 1, contentHash, size: bytes.byteLength };
+			return { bodyId: requestedBodyId, bodyEpoch: 1, generation: 1, contentHash, size: bytes.byteLength };
 		},
 	});
 	const factory: ProviderFactory = ({ kind, documentId }) => {
@@ -122,6 +123,7 @@ async function createFailFastCurrentnessRuntime(failure: CurrentnessFailure): Pr
 			socketSessionId,
 			vaultGeneration: "generation-fail-fast",
 			durableGeneration: 1,
+			documentEpoch: 1,
 			runtimeEpoch: "runtime-fail-fast",
 			liveness: { version: 1, idleMs: 60_000, timeoutMs: 15_000 },
 			capabilities: kind === "body" ? { currentnessQuery: 2, committedHead: 2 } : null,
@@ -226,7 +228,7 @@ s.test("editor admission reserves decode and socket, then socket pressure closes
 	const server = partialOf<VaultServerPort>({
 		currentHead: async (bodyId) => {
 			headReads++;
-			return { bodyId, generation: 1 };
+			return { bodyId, bodyEpoch: 1, generation: 1 };
 		},
 	});
 	let releaseFirstBody!: () => void;
@@ -303,7 +305,7 @@ s.test("rapid editor switching leaves bounded warm bodies, sockets, and provider
 		close: async () => {},
 	});
 	const server = partialOf<VaultServerPort>({
-		currentHead: async (bodyId) => ({ bodyId, generation: 1 }),
+		currentHead: async (bodyId) => ({ bodyId, bodyEpoch: 1, generation: 1 }),
 	});
 	const providerStats = { created: 0, destroyed: 0 };
 	const runtime = new VaultSync({
@@ -373,7 +375,7 @@ s.test("warm synced reacquisition uses the exact body-socket currentness query",
 	const server = partialOf<VaultServerPort>({
 		currentHead: async (requestedBodyId) => {
 			headReads++;
-			return { bodyId: requestedBodyId, generation: 1, contentHash, size: bytes.byteLength };
+			return { bodyId: requestedBodyId, bodyEpoch: 1, generation: 1, contentHash, size: bytes.byteLength };
 		},
 	});
 	const factory: ProviderFactory = ({ kind, documentId }) => {
@@ -400,6 +402,7 @@ s.test("warm synced reacquisition uses the exact body-socket currentness query",
 					socketSessionId: `socket-${documentId}`,
 					vaultGeneration: "generation-currentness",
 					durableGeneration: 1,
+					documentEpoch: 1,
 					runtimeEpoch: "runtime-currentness",
 					liveness: { version: 1, idleMs: 60_000, timeoutMs: 15_000 },
 					capabilities: { currentnessQuery: 2, committedHead: 2 },
@@ -419,6 +422,7 @@ s.test("warm synced reacquisition uses the exact body-socket currentness query",
 						vaultSequence: 4,
 						heads: query.bodyIds.map((requestedBodyId) => ({
 							bodyId: requestedBodyId,
+							bodyEpoch: 1,
 							lifecycle: "active",
 							generation: 1,
 							contentHash,

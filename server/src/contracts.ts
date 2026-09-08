@@ -1,4 +1,5 @@
 import { MAX_DURABLE_UPDATE_BYTES } from "./shared/durableLimits";
+import type { SemanticEpoch } from "./shared/semanticEpoch";
 export { MAX_DURABLE_UPDATE_BYTES } from "./shared/durableLimits";
 
 export const MAX_BLOB_UPLOAD_BYTES = 10 * 1024 * 1024;
@@ -15,12 +16,15 @@ export const MAX_BODY_SOCKETS = 32;
 export const MAX_ROOT_SOCKETS = 32;
 export const MAX_AWARENESS_BYTES = 64 * 1024;
 export const MAX_LOADED_BODY_ENCODED_STATE_BYTES = 48 * 1024 * 1024;
+/** Root is non-evictable, so it has a separate pressure budget from body LRU residency. */
+export const MAX_ROOT_RESIDENT_ENCODED_STATE_BYTES = 16 * 1024 * 1024;
 export const MAX_TRANSIENT_PENDING_BYTES = 16 * 1024 * 1024;
 
 export interface DurableReceipt {
 	vaultId: string;
 	vaultGeneration: string;
 	bodyId: string;
+	bodyEpoch: SemanticEpoch;
 	clientId: string;
 	candidateId: string;
 	candidateDigest: string;
@@ -47,6 +51,7 @@ export interface LifecycleRequest {
 	kind: LifecycleKind;
 	fileId: string;
 	bodyId: string;
+	bodyEpoch: SemanticEpoch;
 	path?: string;
 	fromPath?: string;
 	toPath?: string;
@@ -58,6 +63,7 @@ export interface LifecycleReceipt {
 	vaultId: string;
 	vaultGeneration: string;
 	bodyId: string;
+	bodyEpoch: SemanticEpoch;
 	fileId: string;
 	operationId: string;
 	kind: LifecycleKind;
@@ -73,5 +79,6 @@ export interface RootPublicationReceipt {
 	operationIds: string[];
 	vaultSequence: number;
 	rootGeneration: number;
+	rootEpoch: SemanticEpoch;
 	runtimeEpoch: string;
 }

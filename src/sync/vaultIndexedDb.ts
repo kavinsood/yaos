@@ -1,8 +1,9 @@
 import { vaultIdbName } from "./vaultPersistence";
 import type { StoredBodySettlement } from "./bodySettlement";
 import type { VaultAuthorityIdentity } from "../collaboration/authority";
+import type { SemanticEpoch } from "@shared/semanticEpoch";
 
-export interface StoredDocument {
+interface StoredDocumentFields {
 	documentId: string;
 	generation: number;
 	encodedState: ArrayBuffer;
@@ -11,10 +12,26 @@ export interface StoredDocument {
 	updatedAt: number;
 }
 
+export type StoredDocument =
+	| (StoredDocumentFields & { kind: "root"; documentId: "root"; rootEpoch: SemanticEpoch })
+	| (StoredDocumentFields & {
+		kind: "body";
+		bodyEpoch: SemanticEpoch;
+		/** Last server-authoritative Markdown used as the diff3 base after an epoch reset. */
+		durableBaseline: string;
+	})
+	| (StoredDocumentFields & {
+		kind: "semantic";
+		bodyEpoch: SemanticEpoch;
+	});
+
 export interface StoredBodyCandidate {
 	candidateId: string;
 	vaultId: string;
 	bodyId: string;
+	bodyEpoch: SemanticEpoch;
+	previousBaseline: string;
+	pendingMarkdown: string;
 	candidateDigest: string;
 	encodedUpdate: ArrayBuffer;
 	capturedAt: number;
@@ -28,6 +45,7 @@ export interface StoredBodyReceipt {
 	vaultId: string;
 	vaultGeneration: string;
 	bodyId: string;
+	bodyEpoch: SemanticEpoch;
 	clientId: string;
 	candidateId: string;
 	candidateDigest: string;
@@ -38,6 +56,7 @@ export interface StoredBodyReceipt {
 export interface StoredCanvasCandidate {
 	candidateId: string;
 	documentId: string;
+	bodyEpoch: SemanticEpoch;
 	candidateDigest: string;
 	encodedUpdate: ArrayBuffer;
 	capturedAt: number;
@@ -51,6 +70,7 @@ export interface StoredCanvasCandidate {
 export interface StoredCanvasSettlement {
 	format: 1;
 	documentId: string;
+	bodyEpoch: SemanticEpoch;
 	vaultGeneration: string;
 	canonicalContent: ArrayBuffer;
 	contentHash: string;
@@ -62,10 +82,20 @@ export interface StoredCanvasSettlement {
 	settledAt: number;
 }
 
+export interface StoredCanvasEpochReplacement {
+	document: Extract<StoredDocument, { kind: "semantic" }>;
+	settlement: StoredCanvasSettlement;
+	candidate: StoredCanvasCandidate | null;
+	/** Pending lifecycle intents carried through the replacement transaction. */
+	lifecycle: StoredCanvasLifecycle[];
+}
+
 interface StoredCanvasOperationBase {
 	operationId: string;
 	requestDigest: string;
 	documentId: string;
+	bodyEpoch: SemanticEpoch;
+	rootEpoch: SemanticEpoch;
 	createdAt: number;
 	attempts: number;
 	lastAttemptAt: number | null;
@@ -76,11 +106,29 @@ export type StoredCanvasLifecycle = StoredCanvasOperationBase & (
 	| { kind: "delete" }
 	| { kind: "revive"; path: string }
 	| { kind: "promote"; path: string; sourceRevision: string; sourceHash: string; sourceSize: number;
-		contentHash: string; contentSize: number; candidateDigest: string; encodedUpdateBase64: string;
-		sourceBytesBase64: string }
+		contentHash: string; contentSize: number; candidateDigest: string; encodedUpdate: ArrayBuffer;
+		sourceBytes: ArrayBuffer }
 	| { kind: "demote"; path: string; expectedGeneration: number; expectedContentHash: string;
-		expectedSize: number; blobHash: string; blobSize: number; mime: string; semanticBytesBase64: string }
+		expectedSize: number; blobHash: string; blobSize: number; mime: string; semanticBytes: ArrayBuffer }
 );
+
+function cloneCanvasLifecycle(operation: StoredCanvasLifecycle): StoredCanvasLifecycle {
+	if (operation.kind === "promote") return {
+		...operation,
+		encodedUpdate: operation.encodedUpdate.slice(0),
+		sourceBytes: operation.sourceBytes.slice(0),
+	};
+	if (operation.kind === "demote") return {
+		...operation,
+		semanticBytes: operation.semanticBytes.slice(0),
+	};
+	return { ...operation };
+}
+
+export interface StoredSemanticEpochReplacement {
+	document: Extract<StoredDocument, { kind: "body" }>;
+	candidate: StoredBodyCandidate | null;
+}
 
 export type LifecycleOperationKind = "create" | "rename" | "delete" | "revive";
 
@@ -88,6 +136,7 @@ export interface StoredLifecycleOperation {
 	operationId: string;
 	kind: LifecycleOperationKind;
 	bodyId: string;
+	bodyEpoch: SemanticEpoch;
 	path: string;
 	previousPath: string | null;
 	content: string | null;
@@ -109,6 +158,7 @@ export type StoredAttachmentPublicationMutation =
 export interface StoredAttachmentPublicationOperation {
 	vaultId: string;
 	vaultGeneration: string;
+	rootEpoch: SemanticEpoch;
 	mutation: StoredAttachmentPublicationMutation;
 	localSequence: number;
 	createdAt: number;
@@ -119,6 +169,7 @@ export interface StoredAttachmentPublicationOperation {
 
 export interface StoredBootstrapProgress {
 	bootstrapId: string;
+	rootEpoch: SemanticEpoch;
 	highWater: number;
 	nextCatalogCursor: string | null;
 	stage: "root-loaded" | "catalog-paging" | "feed-catching-up" | "complete";
@@ -210,7 +261,7 @@ function requestValue<T>(request: IDBRequest<T>): Promise<T> {
  * Schema-6 state is scoped to one server vault incarnation and local folder.
  * A destructive reprovision can never open the prior generation's cache.
  */
-export function schema7VaultIdbName(vaultId: string, vaultGeneration: string, folderKey: string): string {
+export function schema8VaultIdbName(vaultId: string, vaultGeneration: string, folderKey: string): string {
 	if (!vaultId.trim() || !vaultGeneration.trim() || !folderKey.trim()) {
 		throw new Error("vault ID, generation, and folder key are required for schema-8 storage");
 	}
@@ -218,7 +269,7 @@ export function schema7VaultIdbName(vaultId: string, vaultGeneration: string, fo
 }
 
 /** Compatibility alias for callers which only need deterministic namespace construction. */
-export const schema6VaultIdbName = schema7VaultIdbName;
+export const schema6VaultIdbName = schema8VaultIdbName;
 
 
 /** One fresh schema-8 database per enrolled vault generation, authority, and local folder. */
@@ -232,7 +283,7 @@ export class VaultIndexedDb {
 		folderKey: string,
 		private readonly indexedDb: IDBFactory = window.indexedDB,
 	) {
-		this.databaseName = schema7VaultIdbName(vaultId, vaultGeneration, folderKey);
+		this.databaseName = schema8VaultIdbName(vaultId, vaultGeneration, folderKey);
 		this.database = new Promise((resolve, reject) => {
 			const request = this.indexedDb.open(this.databaseName, DATABASE_VERSION);
 			request.onupgradeneeded = (event) => {
@@ -270,10 +321,18 @@ export class VaultIndexedDb {
 		const transaction = db.transaction(DOCUMENTS, "readonly");
 		const value = await requestValue(transaction.objectStore(DOCUMENTS).get(documentId)) as StoredDocument | undefined;
 		await transactionDone(transaction);
-		return value ?? null;
+		if (!value) return null;
+		if ((value.kind === "root") !== (documentId === "root")
+			|| (value.kind !== "root" && value.kind !== "body" && value.kind !== "semantic")) {
+			throw new Error("stored document epoch kind mismatch");
+		}
+		return value;
 	}
 
 	async putDocument(document: StoredDocument): Promise<void> {
+		if ((document.kind === "root") !== (document.documentId === "root")) {
+			throw new Error("stored document epoch kind mismatch");
+		}
 		const db = await this.database;
 		const transaction = db.transaction(DOCUMENTS, "readwrite");
 		transaction.objectStore(DOCUMENTS).put({ ...document, encodedState: document.encodedState.slice(0) });
@@ -312,7 +371,7 @@ export class VaultIndexedDb {
 	async putCanvasLifecycle(operation: StoredCanvasLifecycle): Promise<void> {
 		const db = await this.database;
 		const transaction = db.transaction(CANVAS_LIFECYCLE, "readwrite");
-		transaction.objectStore(CANVAS_LIFECYCLE).put(structuredClone(operation));
+		transaction.objectStore(CANVAS_LIFECYCLE).put(cloneCanvasLifecycle(operation));
 		await transactionDone(transaction);
 	}
 
@@ -321,7 +380,7 @@ export class VaultIndexedDb {
 		const transaction = db.transaction(CANVAS_LIFECYCLE, "readonly");
 		const values = await requestValue(transaction.objectStore(CANVAS_LIFECYCLE).getAll()) as StoredCanvasLifecycle[];
 		await transactionDone(transaction);
-		return values.map((value) => structuredClone(value));
+		return values.map(cloneCanvasLifecycle);
 	}
 
 	async deleteCanvasLifecycle(operationId: string): Promise<void> {
@@ -349,6 +408,36 @@ export class VaultIndexedDb {
 		store.put({ ...settlement, canonicalContent: settlement.canonicalContent.slice(0) });
 		await transactionDone(transaction);
 		return true;
+	}
+
+	/** Atomically abandons an old Canvas CRDT lineage and installs its semantic rebase. */
+	async replaceCanvasSemanticEpoch(replacement: StoredCanvasEpochReplacement): Promise<void> {
+		const { document, settlement, candidate, lifecycle } = replacement;
+		if (settlement.documentId !== document.documentId || settlement.bodyEpoch !== document.bodyEpoch
+			|| (candidate && (candidate.documentId !== document.documentId
+				|| candidate.bodyEpoch !== document.bodyEpoch))
+			|| lifecycle.some((operation) => operation.documentId !== document.documentId
+				|| operation.bodyEpoch !== document.bodyEpoch)) {
+			throw new Error("Canvas semantic epoch replacement identity mismatch");
+		}
+		const db = await this.database;
+		const transaction = db.transaction([DOCUMENTS, CANVAS_CANDIDATES, CANVAS_SETTLEMENTS, CANVAS_LIFECYCLE], "readwrite");
+		const candidates = transaction.objectStore(CANVAS_CANDIDATES);
+		for (const stored of await requestValue(candidates.getAll()) as StoredCanvasCandidate[]) {
+			if (stored.documentId === document.documentId) candidates.delete(stored.candidateId);
+		}
+		transaction.objectStore(DOCUMENTS).put({ ...document, encodedState: document.encodedState.slice(0) });
+		transaction.objectStore(CANVAS_SETTLEMENTS).put({
+			...settlement,
+			canonicalContent: settlement.canonicalContent.slice(0),
+		});
+		if (candidate) candidates.put({ ...candidate, encodedUpdate: candidate.encodedUpdate.slice(0) });
+		const lifecycleStore = transaction.objectStore(CANVAS_LIFECYCLE);
+		for (const stored of await requestValue(lifecycleStore.getAll()) as StoredCanvasLifecycle[]) {
+			if (stored.documentId === document.documentId) lifecycleStore.delete(stored.operationId);
+		}
+		for (const operation of lifecycle) lifecycleStore.put(cloneCanvasLifecycle(operation));
+		await transactionDone(transaction);
 	}
 
 	async getBodySettlement(bodyId: string): Promise<StoredBodySettlement | null> {
@@ -437,6 +526,24 @@ export class VaultIndexedDb {
 		await this.deletePendingCandidate(candidateId);
 	}
 
+	/** Atomically abandons every old-lineage candidate and installs the rebased lineage. */
+	async replaceBodySemanticEpoch(replacement: StoredSemanticEpochReplacement): Promise<void> {
+		const { document, candidate } = replacement;
+		if (candidate && (candidate.bodyId !== document.documentId || candidate.bodyEpoch !== document.bodyEpoch)) {
+			throw new Error("semantic epoch replacement candidate identity mismatch");
+		}
+		const db = await this.database;
+		const transaction = db.transaction([DOCUMENTS, CANDIDATES], "readwrite");
+		const documents = transaction.objectStore(DOCUMENTS);
+		const candidates = transaction.objectStore(CANDIDATES);
+		for (const stored of await requestValue(candidates.getAll()) as StoredBodyCandidate[]) {
+			if (stored.bodyId === document.documentId) candidates.delete(stored.candidateId);
+		}
+		documents.put({ ...document, encodedState: document.encodedState.slice(0) });
+		if (candidate) candidates.put({ ...candidate, encodedUpdate: candidate.encodedUpdate.slice(0) });
+		await transactionDone(transaction);
+	}
+
 	async confirmPendingCandidate(receipt: StoredBodyReceipt): Promise<void> {
 		const db = await this.database;
 		const transaction = db.transaction([CANDIDATES, DOCUMENTS], "readwrite");
@@ -460,6 +567,7 @@ export class VaultIndexedDb {
 		if (
 			stored.vaultId !== receipt.vaultId
 			|| stored.bodyId !== receipt.bodyId
+			|| stored.bodyEpoch !== receipt.bodyEpoch
 			|| stored.candidateDigest !== receipt.candidateDigest
 		) {
 			transaction.abort();

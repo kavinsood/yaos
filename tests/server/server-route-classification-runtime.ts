@@ -67,6 +67,7 @@ s.test("schema-4 root/body, candidate, lifecycle, and bootstrap shapes classify 
 		["GET", "/vault/vault-route-0001/ws/body"],
 		["GET", "/vault/vault-route-0001/bootstrap/bootstrap-route-0001/unknown"],
 		["POST", "/vault/vault-route-0001/provision"],
+		["POST", "/operator/vaults/vault-route-0001/collaboration-migrate"],
 		["DELETE", "/vault/vault-route-0001/body/body-route-0001/candidate"],
 	] as Array<[string, string]>) {
 		assert.equal(classifyWorkerRoute(new Request(`https://example.test${path}`, { method })).kind, "not-found", `${method} ${path}`);

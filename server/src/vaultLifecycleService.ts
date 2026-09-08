@@ -16,13 +16,20 @@ import type { VaultDocumentCache } from "./vaultDocumentCache";
 import type { VaultSocketService } from "./vaultSocketService";
 import type { VaultActorContext } from "./collaboration";
 import { decodeBinaryEnvelope, encodeBinaryEnvelope, YAOS_BINARY_CONTENT_TYPE } from "./shared/binaryEnvelope";
+import {
+	INITIAL_SEMANTIC_EPOCH,
+	SemanticEpochMismatchError,
+	parseSemanticEpoch,
+	type SemanticEpoch,
+} from "./shared/semanticEpoch";
 
 const MAX_IDENTITY_LENGTH = 256;
 
 type AttachmentMutation =
-	| { operationId: string; kind: "upsert"; path: string; expectedRevision: string | null; hash: string; size: number; mime: string }
+	(| { operationId: string; kind: "upsert"; path: string; expectedRevision: string | null; hash: string; size: number; mime: string }
 	| { operationId: string; kind: "delete"; path: string; expectedRevision: string | null }
-	| { operationId: string; kind: "rename"; fromPath: string; toPath: string; expectedFromRevision: string; expectedToRevision: string | null };
+	| { operationId: string; kind: "rename"; fromPath: string; toPath: string; expectedFromRevision: string; expectedToRevision: string | null })
+	& { rootEpoch: SemanticEpoch };
 
 type AttachmentHeadSummary =
 	| { kind: "missing"; revision: null }
@@ -70,6 +77,7 @@ function parseLifecycleRequest(value: unknown): LifecycleRequest | null {
 		|| !("operationId" in value) || !validIdentity(value.operationId)
 		|| !("fileId" in value) || !validIdentity(value.fileId)
 		|| !("bodyId" in value) || typeof value.bodyId !== "string" || !isValidBodyId(value.bodyId)
+		|| !("bodyEpoch" in value) || !Number.isSafeInteger(value.bodyEpoch) || (value.bodyEpoch as number) < 1
 		|| !("kind" in value)
 		|| (value.kind !== "create" && value.kind !== "delete" && value.kind !== "revive" && value.kind !== "rename")
 		|| ("path" in value && value.path !== undefined && typeof value.path !== "string")
@@ -85,6 +93,7 @@ function parseLifecycleRequest(value: unknown): LifecycleRequest | null {
 		kind: value.kind,
 		fileId: value.fileId,
 		bodyId: value.bodyId,
+		bodyEpoch: value.bodyEpoch as SemanticEpoch,
 		...(typeof optional.path === "string" ? { path: optional.path } : {}),
 		...(typeof optional.fromPath === "string" ? { fromPath: optional.fromPath } : {}),
 		...(typeof optional.toPath === "string" ? { toPath: optional.toPath } : {}),
@@ -103,6 +112,7 @@ interface LifecycleServiceOptions {
 	hasBlob(hash: string): Promise<boolean>;
 	flush: (documentId: string) => Promise<boolean>;
 	validateActor: (actor: VaultActorContext) => boolean;
+	onDocumentCommitted?: (documentId: string, ingressBytes: number) => void;
 }
 
 interface BodyMetadata {
@@ -137,11 +147,21 @@ export class VaultLifecycleService {
 		}
 		const existing = this.options.store.lifecycleRecord(input.operationId);
 		if (existing) {
+			if (existing.bodyEpoch !== input.bodyEpoch) return this.bodyEpochMismatch(input.bodyId, input.bodyEpoch);
 			if (!this.inputMatchesRecord(input, existing)) return json({ error: "operation_identity_mismatch" }, 409);
-			if (!this.isCurrent(existing)) return json({ error: "lifecycle_operation_superseded" }, 409);
+			// A root publication is the terminal durable outcome. Once it exists,
+			// replaying the immutable lifecycle request must keep returning its
+			// receipt even if a later semantic reset makes the historical body
+			// epoch non-current. This is what lets a restarted client retire a local
+			// row after losing the original response.
+			if (!this.isCurrent(existing) && !this.options.store.lifecyclePublication(existing.operationId)) {
+				return json({ error: "lifecycle_operation_superseded" }, 409);
+			}
 			return json(this.receipt(existing));
 		}
 		const requestDigest = await this.lifecycleRequestDigest(input);
+		const currentEpoch = this.options.store.documentHead(input.bodyId)?.semanticEpoch ?? INITIAL_SEMANTIC_EPOCH;
+		if (currentEpoch !== input.bodyEpoch) return this.bodyEpochMismatch(input.bodyId, input.bodyEpoch, currentEpoch);
 		if (input.kind === "create") return this.admitCreate(input, actor, requestDigest);
 		return this.commitLifecycle(input, actor, requestDigest);
 	}
@@ -173,12 +193,30 @@ export class VaultLifecycleService {
 		const requestDigests = await Promise.all(operations.map((operation) => this.lifecycleRequestDigest(operation)));
 		if (existing.every((record) => record !== null)) {
 			const records = existing;
-			if (!records.every((record, index) => this.inputMatchesRecord(operations[index]!, record) && this.isCurrent(record))) {
+			for (let index = 0; index < records.length; index++) {
+				if (records[index]!.bodyEpoch !== operations[index]!.bodyEpoch) {
+					return this.bodyEpochMismatch(operations[index]!.bodyId, operations[index]!.bodyEpoch);
+				}
+			}
+			if (!records.every((record, index) => this.inputMatchesRecord(operations[index]!, record)
+				&& (this.isCurrent(record) || this.options.store.lifecyclePublication(record.operationId) !== null))) {
 				return json({ error: "lifecycle_batch_superseded" }, 409);
 			}
 			return json({ receipts: records.map((record) => this.receipt(record)), vaultSequence: records[0]!.vaultSequence, runtimeEpoch: records[0]!.runtimeEpoch });
 		}
-		if (existing.some((record) => record !== null)) return json({ error: "lifecycle_batch_partial_retry" }, 409);
+		if (existing.some((record) => record !== null)) {
+			for (let index = 0; index < existing.length; index++) {
+				const record = existing[index];
+				if (record && record.bodyEpoch !== operations[index]!.bodyEpoch) {
+					return this.bodyEpochMismatch(operations[index]!.bodyId, operations[index]!.bodyEpoch);
+				}
+			}
+			return json({ error: "lifecycle_batch_partial_retry" }, 409);
+		}
+		for (const operation of operations) {
+			const currentEpoch = this.options.store.documentHead(operation.bodyId)?.semanticEpoch ?? INITIAL_SEMANTIC_EPOCH;
+			if (currentEpoch !== operation.bodyEpoch) return this.bodyEpochMismatch(operation.bodyId, operation.bodyEpoch, currentEpoch);
+		}
 		if (!await this.options.flush("root")) return json({ error: "root_persistence_unavailable" }, 503);
 		for (const bodyId of bodyIds) if (!await this.options.flush(bodyId)) return json({ error: "body_persistence_unavailable" }, 503);
 		const mutexOwner = `lifecycle-batch:${crypto.randomUUID()}`;
@@ -216,9 +254,11 @@ export class VaultLifecycleService {
 		if (typeof decoded !== "object" || decoded === null || Array.isArray(decoded)
 			|| !("operations" in decoded) || !Array.isArray(decoded.operations) || decoded.operations.length === 0
 			|| decoded.operations.length > MAX_CATCH_UP_BODIES
-			|| !("rootUpdate" in decoded) || !(decoded.rootUpdate instanceof Uint8Array)) {
+			|| !("rootUpdate" in decoded) || !(decoded.rootUpdate instanceof Uint8Array)
+			|| !("rootEpoch" in decoded) || !Number.isSafeInteger(decoded.rootEpoch) || (decoded.rootEpoch as number) < 1) {
 			return json({ error: "invalid_lifecycle_publication" }, 400);
 		}
+		const rootEpoch = parseSemanticEpoch(decoded.rootEpoch, "lifecycle publication root epoch");
 		const candidates: unknown[] = decoded.operations;
 		const records: DurableLifecycleRecord[] = [];
 		const prior: Array<DurableRootPublication | null> = [];
@@ -233,18 +273,30 @@ export class VaultLifecycleService {
 			const published: LifecyclePublicationOperation = { ...operation, vaultSequence: candidate.vaultSequence };
 			operationIds.add(published.operationId);
 			const record = this.options.store.lifecycleRecord(published.operationId);
-			if (!record || record.vaultSequence !== published.vaultSequence || !this.inputMatchesRecord(published, record) || !this.isCurrent(record)) {
+			if (!record || record.vaultSequence !== published.vaultSequence || !this.inputMatchesRecord(published, record)) {
+				return json({ error: "lifecycle_publication_mismatch" }, 409);
+			}
+			const publication = this.options.store.lifecyclePublication(published.operationId);
+			// An exact durable publication remains replayable after a later body
+			// epoch reset makes the historical lifecycle receipt non-current. This
+			// is also how a client retires work which root compaction migrated on
+			// its behalf. Unpublished receipts must still describe current catalog
+			// authority before they are allowed to mutate the root.
+			if (!publication && !this.isCurrent(record)) {
 				return json({ error: "lifecycle_publication_mismatch" }, 409);
 			}
 			records.push(record);
-			prior.push(this.options.store.lifecyclePublication(published.operationId));
+			prior.push(publication);
 		}
 		if (prior.every((value) => value !== null)) {
 			const first = prior[0]!;
 			return json({ operationIds: [...operationIds], vaultSequence: first.rootSequence, rootGeneration: first.rootGeneration,
-				vaultGeneration: first.vaultGeneration, runtimeEpoch: first.runtimeEpoch } satisfies RootPublicationReceipt);
+				rootEpoch: first.rootEpoch, vaultGeneration: first.vaultGeneration,
+				runtimeEpoch: first.runtimeEpoch } satisfies RootPublicationReceipt);
 		}
 		if (prior.some((value) => value !== null)) return json({ error: "lifecycle_publication_partial_retry" }, 409);
+		const currentRootEpoch = this.options.store.documentHead("root")?.semanticEpoch ?? INITIAL_SEMANTIC_EPOCH;
+		if (currentRootEpoch !== rootEpoch) return this.rootEpochMismatch(rootEpoch, currentRootEpoch);
 		const rootUpdate = decoded.rootUpdate;
 		if (rootUpdate.byteLength === 0 || rootUpdate.byteLength > MAX_JSON_BYTES) return json({ error: "invalid_root_update_size" }, 400);
 		if (!await this.options.flush("root")) return json({ error: "root_persistence_unavailable" }, 503);
@@ -256,12 +308,13 @@ export class VaultLifecycleService {
 			update: rootUpdate,
 			kind: "root",
 			rootPublications: records.map((record) => ({ operationId: record.operationId, lifecycleSequence: record.vaultSequence,
-				vaultGeneration: this.options.vaultGeneration(), runtimeEpoch: this.options.runtimeEpoch })),
+				rootEpoch, vaultGeneration: this.options.vaultGeneration(), runtimeEpoch: this.options.runtimeEpoch })),
 			actorAttributions: records.map((record) => ({ actor, operationId: record.operationId })),
 		});
 		this.applyRoot(rootUpdate, commit.generation, request);
 		return json({ operationIds: [...operationIds], vaultSequence: commit.vaultSequence, rootGeneration: commit.generation,
-			vaultGeneration: this.options.vaultGeneration(), runtimeEpoch: this.options.runtimeEpoch } satisfies RootPublicationReceipt);
+			rootEpoch: commit.semanticEpoch, vaultGeneration: this.options.vaultGeneration(),
+			runtimeEpoch: this.options.runtimeEpoch } satisfies RootPublicationReceipt);
 	}
 
 	async publishAttachment(request: Request, suppliedActor?: VaultActorContext): Promise<Response> {
@@ -282,6 +335,8 @@ export class VaultLifecycleService {
 		const replay = this.options.store.attachmentOperation(mutation.operationId);
 		const replayEvents = this.options.store.attachmentEventsForOperation(mutation.operationId);
 		if (replay || replayEvents.length > 0) return this.attachmentReplayResult(mutation, requestDigest, replay, replayEvents);
+		const currentRootEpoch = this.options.store.documentHead("root")?.semanticEpoch ?? INITIAL_SEMANTIC_EPOCH;
+		if (mutation.rootEpoch !== currentRootEpoch) return this.rootEpochMismatch(mutation.rootEpoch, currentRootEpoch);
 		if (mutation.kind === "upsert" && !await this.options.hasBlob(mutation.hash)) {
 			return json({ error: "attachment_blob_missing" }, 409);
 		}
@@ -297,7 +352,18 @@ export class VaultLifecycleService {
 				return this.attachmentReplayResult(mutation, requestDigest, insideReplay, insideReplayEvents);
 			}
 			if (!this.options.validateActor(actor)) return json({ error: "authority_superseded" }, 409);
-			const current = this.options.store.reconstructDocument("root");
+			const rootHead = this.options.store.documentHead("root");
+			if (!rootHead) return json({ error: "root_state_missing" }, 500);
+			if (rootHead.semanticEpoch !== mutation.rootEpoch) {
+				return this.rootEpochMismatch(mutation.rootEpoch, rootHead.semanticEpoch);
+			}
+			const releaseTransient = this.options.cache.reserveFullStateOperation("root", 2);
+			let current: ReturnType<VaultStore["reconstructDocument"]>;
+			try { current = this.options.store.reconstructDocument("root"); }
+			catch (error) {
+				releaseTransient();
+				throw error;
+			}
 			try {
 				const vector = Y.encodeStateVector(current.doc);
 				const refs = current.doc.getMap<{ hash: string; size: number; revision: string }>("pathToBlob");
@@ -360,31 +426,53 @@ export class VaultLifecycleService {
 				}
 				const update = Y.encodeStateAsUpdate(current.doc, vector);
 				if (update.byteLength === 0 || update.byteLength > MAX_JSON_BYTES) return json({ error: "invalid_attachment_root_update" }, 400);
-				const commit = this.options.store.commitRootAttachments(update, events, { operationId: mutation.operationId, requestDigest },
+				const commit = this.options.store.commitRootAttachments(update, events,
+					{ operationId: mutation.operationId, requestDigest, rootEpoch: mutation.rootEpoch }, rootHead,
 					undefined, [{ actor, operationId: mutation.operationId, requestDigest }]);
 				this.applyRoot(update, commit.generation, request);
-				return this.attachmentReceipt(mutation.operationId, events, update, commit.vaultSequence, commit.generation);
+				return this.attachmentReceipt(mutation.operationId, events, update, commit.vaultSequence,
+					commit.generation, commit.semanticEpoch);
 			} finally {
 				current.doc.destroy();
+				releaseTransient();
 			}
 		} finally {
 			this.options.store.releaseVaultMutationLease(mutexOwner);
 		}
 	}
 
-	finalizeCreation(creation: PendingCreationCandidate, candidate: DurableCandidateReceipt, metadata: BodyMetadata, actor: VaultActorContext): boolean {
+	finalizeCreation(
+		creation: PendingCreationCandidate,
+		candidate: DurableCandidateReceipt,
+		metadata: BodyMetadata,
+		actor: VaultActorContext,
+	): "committed" | "busy" | "superseded" {
 		const owner = `lifecycle-create:${creation.operationId}:${crypto.randomUUID()}`;
-		if (!this.options.store.acquireRecoveryMutex(owner)) return false;
+		if (!this.options.store.acquireRecoveryMutex(owner)) return "busy";
 		try {
+			if (creation.bodyEpoch !== candidate.bodyEpoch) throw new Error("creation candidate body epoch mismatch");
 			const existing = this.options.store.lifecycleRecord(creation.operationId);
 			if (existing) {
 				if (existing.candidateId !== creation.candidateId || existing.candidateDigest !== creation.candidateDigest) {
 					throw new Error("completed creation identity mismatch");
 				}
 				this.options.store.completeCreationCandidate(creation.bodyId, creation.candidateId, creation.candidateDigest);
-				return true;
+				return "committed";
+			}
+			const pathOwner = this.options.store.activeCatalogHeadAtPath(
+				this.options.store.currentSequence(), creation.path,
+			);
+			if (pathOwner) {
+				// A concurrent/replayed creation won this path before this exact fence
+				// could publish. Retire the fence so it cannot retry forever. The body
+				// candidate remains a harmless orphan until normal retention reaps it.
+				this.options.store.completeCreationCandidate(
+					creation.bodyId, creation.candidateId, creation.candidateDigest,
+				);
+				return "superseded";
 			}
 			const request: LifecycleRequest = { operationId: creation.operationId, kind: "create", fileId: creation.fileId,
+				bodyEpoch: creation.bodyEpoch,
 				bodyId: creation.bodyId, path: creation.path, candidateId: creation.candidateId, candidateDigest: creation.candidateDigest };
 			const rootUpdate = this.markerUpdate([request]);
 			const commit = this.options.store.commitRootLifecycle({
@@ -393,6 +481,7 @@ export class VaultLifecycleService {
 				catalog: { bodyId: creation.bodyId, fileId: creation.fileId, path: creation.path, previousPath: null,
 					lifecycle: "active", bodyGeneration: candidate.durableGeneration, contentHash: metadata.contentHash, size: metadata.size },
 				lifecycleReceipt: { operationId: creation.operationId, kind: "create", bodyId: creation.bodyId, fileId: creation.fileId,
+					bodyEpoch: candidate.bodyEpoch,
 					candidateId: creation.candidateId, candidateDigest: creation.candidateDigest, sourcePath: null, resultPath: creation.path,
 					resultLifecycle: "active", durableGeneration: candidate.durableGeneration,
 					vaultGeneration: this.options.vaultGeneration(), runtimeEpoch: creation.runtimeEpoch },
@@ -400,7 +489,7 @@ export class VaultLifecycleService {
 				actorAttributions: [{ actor, operationId: creation.operationId, requestDigest: creation.candidateDigest }],
 			});
 			this.applyRoot(rootUpdate, commit.generation, creation);
-			return true;
+			return "committed";
 		} finally {
 			this.options.store.releaseRecoveryMutex(owner);
 		}
@@ -411,10 +500,20 @@ export class VaultLifecycleService {
 		const candidateId = input.candidateId!;
 		const candidateDigest = input.candidateDigest!.toLowerCase();
 		const existing = this.options.store.creationCandidate(input.bodyId);
-		if (existing) {
-			if (existing.operationId !== input.operationId || existing.path !== input.path || existing.candidateId !== candidateId || existing.candidateDigest !== candidateDigest) {
-				return json({ error: "creation_candidate_fence_mismatch" }, 409);
+		if (existing && (existing.operationId !== input.operationId || existing.path !== input.path
+			|| existing.candidateId !== candidateId || existing.candidateDigest !== candidateDigest)) {
+			return json({ error: "creation_candidate_fence_mismatch" }, 409);
+		}
+		const pathOwner = this.options.store.activeCatalogHeadAtPath(
+			this.options.store.currentSequence(), input.path,
+		);
+		if (pathOwner) {
+			if (existing) {
+				this.options.store.completeCreationCandidate(input.bodyId, existing.candidateId, existing.candidateDigest);
 			}
+			return json({ error: "creation_path_superseded", path: input.path, ownerBodyId: pathOwner.bodyId }, 409);
+		}
+		if (existing) {
 			return json(this.pendingReceipt(existing));
 		}
 		if (this.options.store.getCatalogHeadAt(this.options.store.currentSequence(), input.bodyId)) return json({ error: "body_identity_already_exists" }, 409);
@@ -425,9 +524,14 @@ export class VaultLifecycleService {
 			const commit = this.options.store.commitUpdate({ documentId: input.bodyId, update: Y.encodeStateAsUpdate(empty), kind: "body",
 				actorAttributions: [{ actor, operationId: input.operationId, requestDigest }] });
 			empty.destroy();
-			bodyHead = { generation: commit.generation, latestSequence: commit.vaultSequence };
+			bodyHead = {
+				generation: commit.generation,
+				semanticEpoch: commit.semanticEpoch,
+				latestSequence: commit.vaultSequence,
+			};
 		}
 		const fence = this.options.store.expectCreationCandidate({ bodyId: input.bodyId, fileId: input.fileId, path: input.path,
+			bodyEpoch: bodyHead.semanticEpoch,
 			operationId: input.operationId, candidateId, candidateDigest, durableGeneration: bodyHead.generation,
 			vaultSequence: bodyHead.latestSequence, vaultGeneration: this.options.vaultGeneration(), runtimeEpoch: this.options.runtimeEpoch });
 		return json(this.pendingReceipt(fence));
@@ -460,42 +564,60 @@ export class VaultLifecycleService {
 		if (typeof path !== "string" || safeMarkdownPath(path) !== path) return json({ error: "path_required" }, 400);
 		const head = this.options.store.documentHead(input.bodyId);
 		if (!head || head.generation <= 0) return json({ error: "body_state_missing" }, 500);
+		if (head.semanticEpoch !== input.bodyEpoch) return this.bodyEpochMismatch(input.bodyId, input.bodyEpoch, head.semanticEpoch);
 		const lifecycle = input.kind === "delete" ? "tombstoned" : "active";
 		return {
 			catalog: { bodyId: input.bodyId, fileId: input.fileId, path, previousPath: input.kind === "rename" ? current.path : null,
 				lifecycle, bodyGeneration: head.generation, contentHash: current.contentHash, size: current.size },
 			receipt: { operationId: input.operationId, kind: input.kind as "rename" | "delete" | "revive", bodyId: input.bodyId,
+				bodyEpoch: head.semanticEpoch,
 				fileId: input.fileId, candidateId: null, candidateDigest: null, sourcePath: current.path, resultPath: path,
 				resultLifecycle: lifecycle, durableGeneration: head.generation, vaultGeneration: this.options.vaultGeneration(), runtimeEpoch: this.options.runtimeEpoch },
 		};
 	}
 
 	private markerUpdate(inputs: LifecycleRequest[]): Uint8Array {
-		const root = this.options.store.reconstructDocument("root");
-		const vector = Y.encodeStateVector(root.doc);
-		const markers = root.doc.getMap("__yaosLifecycle");
-		for (const input of inputs) markers.set(input.operationId, { kind: input.kind, fileId: input.fileId, bodyId: input.bodyId,
-			path: input.path ?? null, fromPath: input.fromPath ?? null, toPath: input.toPath ?? null });
-		const update = Y.encodeStateAsUpdate(root.doc, vector);
-		root.doc.destroy();
-		return update;
+		const release = this.options.cache.reserveFullStateOperation("root", 2);
+		try {
+			const root = this.options.store.reconstructDocument("root");
+			try {
+				const vector = Y.encodeStateVector(root.doc);
+				const markers = root.doc.getMap("__yaosLifecycle");
+				for (const input of inputs) markers.set(input.operationId, { kind: input.kind, fileId: input.fileId, bodyId: input.bodyId,
+					path: input.path ?? null, fromPath: input.fromPath ?? null, toPath: input.toPath ?? null });
+				return Y.encodeStateAsUpdate(root.doc, vector);
+			} finally { root.doc.destroy(); }
+		} finally { release(); }
 	}
 
 	private attachmentReplay(operationId: string): Response {
-		const root = this.options.store.reconstructDocument("root");
+		const release = this.options.cache.reserveFullStateOperation("root", 2);
+		let root: ReturnType<VaultStore["reconstructDocument"]>;
+		const operation = this.options.store.attachmentOperation(operationId);
+		if (!operation) {
+			release();
+			return json({ error: "attachment_replay_corrupt" }, 500);
+		}
+		try { root = this.options.store.reconstructDocument("root", operation.rootSequence); }
+		catch (error) {
+			release();
+			throw error;
+		}
 		try {
 			const events = this.options.store.attachmentEventsForOperation(operationId);
-			const operation = this.options.store.attachmentOperation(operationId);
-			if (!operation || events.length === 0) return json({ error: "attachment_replay_corrupt" }, 500);
+			if (events.length === 0 || root.generation !== operation.rootGeneration
+				|| root.semanticEpoch !== operation.rootEpoch) return json({ error: "attachment_replay_corrupt" }, 500);
 			return this.attachmentReceipt(
 				operationId,
 				events,
 				Y.encodeStateAsUpdate(root.doc),
 				operation.rootSequence,
-				root.generation,
+				operation.rootGeneration,
+				operation.rootEpoch,
 			);
 		} finally {
 			root.doc.destroy();
+			release();
 		}
 	}
 
@@ -508,6 +630,7 @@ export class VaultLifecycleService {
 		if (!operation || events.length === 0
 			|| !Number.isSafeInteger(operation.rootSequence) || operation.rootSequence <= 0
 			|| !Number.isSafeInteger(operation.rootGeneration) || operation.rootGeneration <= 0
+			|| !Number.isSafeInteger(operation.rootEpoch) || operation.rootEpoch < 1
 			|| !/^[a-f0-9]{64}$/.test(operation.requestDigest)
 			|| events.some((event) => event.operationId !== mutation.operationId || event.sequence !== operation.rootSequence)) {
 			return json({ error: "attachment_replay_corrupt" }, 500);
@@ -595,6 +718,7 @@ export class VaultLifecycleService {
 		update: Uint8Array,
 		vaultSequence: number,
 		rootGeneration: number,
+		rootEpoch: SemanticEpoch,
 	): Response {
 		const body = encodeBinaryEnvelope({
 			operationId,
@@ -608,6 +732,7 @@ export class VaultLifecycleService {
 			runtimeEpoch: this.options.runtimeEpoch,
 			vaultSequence,
 			rootGeneration,
+			rootEpoch,
 			rootUpdate: update,
 		}, MAX_JSON_BYTES);
 		return new Response(body.slice().buffer, { headers: { "content-type": YAOS_BINARY_CONTENT_TYPE, "cache-control": "no-store" } });
@@ -617,6 +742,8 @@ export class VaultLifecycleService {
 		if (typeof decoded !== "object" || decoded === null || Array.isArray(decoded)) return null;
 		const value = decoded as Record<string, unknown>;
 		if (!validIdentity(value.operationId)) return null;
+		if (!Number.isSafeInteger(value.rootEpoch) || (value.rootEpoch as number) < 1) return null;
+		const rootEpoch = parseSemanticEpoch(value.rootEpoch, "attachment root epoch");
 		const validRevision = (revision: unknown): revision is string | null => revision === null || validIdentity(revision);
 		const exactKeys = (keys: string[]): boolean => {
 			const actual = Object.keys(value).sort();
@@ -625,27 +752,27 @@ export class VaultLifecycleService {
 		if (value.kind === "upsert") {
 			const hash = typeof value.hash === "string" ? value.hash.toLowerCase() : "";
 			const ref = { hash, size: typeof value.size === "number" ? value.size : -1 };
-			if (!exactKeys(["operationId", "kind", "path", "expectedRevision", "hash", "size", "mime"])
+			if (!exactKeys(["operationId", "kind", "path", "expectedRevision", "hash", "size", "mime", "rootEpoch"])
 				|| typeof value.path !== "string" || safeBlobPath(value.path, "", ref) !== value.path
 				|| !validRevision(value.expectedRevision) || !/^[a-f0-9]{64}$/.test(hash)
 				|| !Number.isSafeInteger(value.size) || (value.size as number) < 0 || (value.size as number) > MAX_BLOB_UPLOAD_BYTES
 				|| typeof value.mime !== "string" || !value.mime || value.mime.length > 256) return null;
-			return { operationId: value.operationId, kind: "upsert", path: value.path, expectedRevision: value.expectedRevision,
+			return { operationId: value.operationId, kind: "upsert", rootEpoch, path: value.path, expectedRevision: value.expectedRevision,
 				hash, size: value.size as number, mime: value.mime };
 		}
 		if (value.kind === "delete") {
-			if (!exactKeys(["operationId", "kind", "path", "expectedRevision"])
+			if (!exactKeys(["operationId", "kind", "path", "expectedRevision", "rootEpoch"])
 				|| typeof value.path !== "string" || safeBlobPath(value.path) !== value.path
 				|| !validRevision(value.expectedRevision)) return null;
-			return { operationId: value.operationId, kind: "delete", path: value.path, expectedRevision: value.expectedRevision };
+			return { operationId: value.operationId, kind: "delete", rootEpoch, path: value.path, expectedRevision: value.expectedRevision };
 		}
 		if (value.kind === "rename") {
-			if (!exactKeys(["operationId", "kind", "fromPath", "toPath", "expectedFromRevision", "expectedToRevision"])
+			if (!exactKeys(["operationId", "kind", "fromPath", "toPath", "expectedFromRevision", "expectedToRevision", "rootEpoch"])
 				|| typeof value.fromPath !== "string" || safeBlobPath(value.fromPath) !== value.fromPath
 				|| typeof value.toPath !== "string" || safeBlobPath(value.toPath) !== value.toPath
 				|| value.fromPath === value.toPath || !validIdentity(value.expectedFromRevision)
 				|| !validRevision(value.expectedToRevision)) return null;
-			return { operationId: value.operationId, kind: "rename", fromPath: value.fromPath, toPath: value.toPath,
+			return { operationId: value.operationId, kind: "rename", rootEpoch, fromPath: value.fromPath, toPath: value.toPath,
 				expectedFromRevision: value.expectedFromRevision, expectedToRevision: value.expectedToRevision };
 		}
 		return null;
@@ -678,9 +805,16 @@ export class VaultLifecycleService {
 	private applyRoot(update: Uint8Array, generation: number, origin: unknown): void {
 		this.options.cache.applyDurableUpdate("root", update, generation, origin);
 		this.options.sockets().broadcastDocumentUpdate("root", update, origin);
+		this.options.onDocumentCommitted?.("root", update.byteLength);
 	}
 	private publicationMatches(update: Uint8Array, records: DurableLifecycleRecord[]): boolean {
-		const reconstructed = this.options.store.reconstructDocument("root");
+		const release = this.options.cache.reserveFullStateOperation("root", 4);
+		let reconstructed: ReturnType<VaultStore["reconstructDocument"]>;
+		try { reconstructed = this.options.store.reconstructDocument("root"); }
+		catch (error) {
+			release();
+			throw error;
+		}
 		const expected = new Y.Doc();
 		const actual = new Y.Doc();
 		try {
@@ -696,6 +830,7 @@ export class VaultLifecycleService {
 			const actualPathEntries = [...actualPaths.entries()].sort(([left], [right]) => left.localeCompare(right));
 			const keys = [...new Set([...expected.share.keys(), ...actual.share.keys()])].sort();
 			for (const key of keys) {
+				if (key === "__yaosLifecyclePublicationProof") continue;
 				if (key === "pathToId") {
 					if (canonicalJsonText(expectedPathEntries) !== canonicalJsonText(actualPathEntries)) return false;
 					continue;
@@ -716,11 +851,13 @@ export class VaultLifecycleService {
 			reconstructed.doc.destroy();
 			expected.destroy();
 			actual.destroy();
+			release();
 		}
 	}
 
 	private inputMatchesRecord(input: LifecycleRequest, record: DurableLifecycleRecord): boolean {
 		if (input.operationId !== record.operationId || input.kind !== record.kind || input.bodyId !== record.bodyId || input.fileId !== record.fileId
+			|| input.bodyEpoch !== record.bodyEpoch
 			|| (input.candidateId ?? null) !== record.candidateId || (input.candidateDigest?.toLowerCase() ?? null) !== record.candidateDigest) return false;
 		if (input.kind === "create") return record.sourcePath === null && input.path === record.resultPath;
 		if (input.kind === "rename") return input.fromPath === record.sourcePath && input.toPath === record.resultPath;
@@ -731,18 +868,35 @@ export class VaultLifecycleService {
 	private isCurrent(record: DurableLifecycleRecord): boolean {
 		const current = this.options.store.getCatalogHeadAt(this.options.store.currentSequence(), record.bodyId);
 		return current !== null && current.sequence === record.vaultSequence && current.path === record.resultPath
-			&& current.lifecycle === record.resultLifecycle && current.generation === record.durableGeneration;
+			&& current.lifecycle === record.resultLifecycle && current.generation === record.durableGeneration
+			&& current.bodyEpoch === record.bodyEpoch;
 	}
 
 	private receipt(record: DurableLifecycleRecord): LifecycleReceipt {
 		return { vaultId: this.options.vaultId(), vaultGeneration: record.vaultGeneration, bodyId: record.bodyId, fileId: record.fileId,
+			bodyEpoch: record.bodyEpoch,
 			operationId: record.operationId, kind: record.kind, lifecycle: record.resultLifecycle, path: record.resultPath,
 			durableGeneration: record.durableGeneration, vaultSequence: record.vaultSequence, runtimeEpoch: record.runtimeEpoch };
 	}
 
 	private pendingReceipt(record: PendingCreationCandidate): LifecycleReceipt {
 		return { vaultId: this.options.vaultId(), vaultGeneration: record.vaultGeneration, bodyId: record.bodyId, fileId: record.fileId,
+			bodyEpoch: record.bodyEpoch,
 			operationId: record.operationId, kind: "create", lifecycle: "active", path: record.path,
 			durableGeneration: record.durableGeneration, vaultSequence: record.vaultSequence, runtimeEpoch: record.runtimeEpoch };
+	}
+
+	private bodyEpochMismatch(bodyId: string, received: SemanticEpoch, expected?: SemanticEpoch): Response {
+		const current = expected ?? this.options.store.documentHead(bodyId)?.semanticEpoch ?? INITIAL_SEMANTIC_EPOCH;
+		if (current === received) return json({ error: "lifecycle_epoch_identity_mismatch" }, 409);
+		const mismatch = new SemanticEpochMismatchError({ purpose: "body", documentId: bodyId,
+			expectedBodyEpoch: current, receivedBodyEpoch: received });
+		return json(mismatch.toPayload(), mismatch.status);
+	}
+
+	private rootEpochMismatch(received: SemanticEpoch, expected: SemanticEpoch): Response {
+		const mismatch = new SemanticEpochMismatchError({ purpose: "root", documentId: "root",
+			expectedRootEpoch: expected, receivedRootEpoch: received });
+		return json(mismatch.toPayload(), mismatch.status);
 	}
 }

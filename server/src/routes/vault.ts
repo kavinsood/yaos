@@ -16,6 +16,12 @@ import { authorizeVaultActor, authorizeVaultOutcomeActor } from "./auth";
 import type { VaultActorContext } from "../collaboration";
 import { actorHeaders, OUTCOME_CLAIM_HEADER, stripActorHeaders } from "../vaultAuthority";
 import type { AuthState, Env } from "./types";
+import {
+	BODY_EPOCH_HEADER,
+	ROOT_EPOCH_HEADER,
+	semanticEpochHeaders,
+	type SemanticEpochScope,
+} from "../shared/semanticEpoch";
 
 export const TRUSTED_DEVICE_HEADER = "x-yaos-device-id";
 
@@ -32,7 +38,8 @@ export async function readVault(env: Env, vaultId: string): Promise<VaultRecord 
 
 function forwardedBodyLimit(request: Request, runtimePath: string): number | null {
 	if (!request.body || request.method === "GET" || request.method === "HEAD") return null;
-	if (/^\/(?:body|semantic)\/[^/]+\/candidate$/.test(runtimePath)) return MAX_CANDIDATE_BYTES;
+	if (/^\/(?:body|semantic)\/[^/]+\/candidate$/.test(runtimePath)
+		|| runtimePath === "/semantic/authority/promote") return MAX_CANDIDATE_BYTES;
 	if (runtimePath === "/catch-up") return MAX_CATCH_UP_BYTES;
 	if (runtimePath.startsWith("/settings-sync/") && request.method === "PUT") {
 		const action = runtimePath.split("/")[3];
@@ -43,7 +50,8 @@ function forwardedBodyLimit(request: Request, runtimePath: string): number | nul
 	return MAX_JSON_BYTES;
 }
 
-async function forward(env: Env, vault: VaultRecord, request: Request, runtimePath: string, actor?: VaultActorContext, outcomeClaim = false): Promise<Response> {
+async function forward(env: Env, vault: VaultRecord, request: Request, runtimePath: string, actor?: VaultActorContext,
+	outcomeClaim = false, trustedSocketScope?: SemanticEpochScope): Promise<Response> {
 	const url = new URL(request.url);
 	url.pathname = runtimePath;
 	const headers = new Headers(request.headers);
@@ -52,6 +60,15 @@ async function forward(env: Env, vault: VaultRecord, request: Request, runtimePa
 	headers.delete("authorization");
 	stripActorHeaders(headers);
 	if (actor) actorHeaders(actor).forEach((value, name) => headers.set(name, value));
+	if (trustedSocketScope) {
+		// Socket epoch authority comes only from the HMAC ticket, never from a
+		// caller-controlled forwarding header.
+		headers.delete(BODY_EPOCH_HEADER);
+		headers.delete(ROOT_EPOCH_HEADER);
+		for (const [name, value] of Object.entries(semanticEpochHeaders(trustedSocketScope))) {
+			headers.set(name, value);
+		}
+	}
 	if (outcomeClaim) headers.set(OUTCOME_CLAIM_HEADER, "1");
 	const init: RequestInit = { method: request.method, headers };
 	const maximumBodyBytes = forwardedBodyLimit(request, runtimePath);
@@ -152,7 +169,10 @@ export async function handleVaultSocketRoute(
 		...(payload.deviceName ? { deviceName: payload.deviceName } : {}),
 		role: payload.role, policyVersion: payload.policyVersion, capabilityDigest: payload.capabilityDigest,
 	};
-	return forward(env, vault, request, runtimePath, actor);
+	const semanticScope: SemanticEpochScope = payload.purpose === "root"
+		? { purpose: "root", documentId: "root", rootEpoch: payload.rootEpoch }
+		: { purpose: "body", documentId: payload.documentId, bodyEpoch: payload.bodyEpoch };
+	return forward(env, vault, request, runtimePath, actor, false, semanticScope);
 }
 
 export async function handleVaultRuntimeRoute(

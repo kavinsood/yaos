@@ -24,9 +24,12 @@ s.test("late IndexedDB load returns the newer in-memory winner", async () => {
 	}, () => 10);
 	const loading = manager.load("body-race");
 	await Promise.resolve();
-	const winner = await manager.replaceFromServer("body-race", new Uint8Array(encoded("server-winner")), 5);
+	const winner = await manager.replaceFromServer("body-race", new Uint8Array(encoded("server-winner")), 1, 5);
 	release({
+		kind: "body",
 		documentId: "body-race",
+		bodyEpoch: 1,
+		durableBaseline: "stale-indexeddb",
 		generation: 1,
 		encodedState: encoded("stale-indexeddb"),
 		dirty: false,
@@ -56,6 +59,7 @@ s.test("pin, dirty, unsettled, clean eviction, and body-local cost hooks remain 
 		"body-state",
 		new Uint8Array(encoded("costed")),
 		1,
+		1,
 	);
 	assert.equal(body.estimatedCost, writes.at(-1)!.encodedState.byteLength * 2);
 	assert.equal(manager.stats().estimatedCost, body.estimatedCost);
@@ -77,7 +81,7 @@ s.test("pin, dirty, unsettled, clean eviction, and body-local cost hooks remain 
 		},
 	);
 
-	await manager.markCandidateSettled(body.bodyId, 2, 1);
+	await manager.markCandidateSettled(body.bodyId, 1, 2, 1);
 	manager.unpin(body.bodyId);
 	assert.equal(await manager.evict(body.bodyId), true, "clean unpinned body is evictable");
 	assert.equal(manager.stats().loaded, 0);
@@ -95,13 +99,13 @@ s.test("least-recently-used eviction skips dirty and pinned bodies", async () =>
 		getDocument: async () => null,
 		putDocument: async () => {},
 	}, () => ++now);
-	await manager.replaceFromServer("old-dirty", new Uint8Array(encoded("old")), 1);
+	await manager.replaceFromServer("old-dirty", new Uint8Array(encoded("old")), 1, 1);
 	await manager.markDirty("old-dirty");
-	await manager.replaceFromServer("new-clean", new Uint8Array(encoded("new")), 1);
+	await manager.replaceFromServer("new-clean", new Uint8Array(encoded("new")), 1, 1);
 	assert.deepEqual(await manager.evictLeastRecentlyUsed(0), ["new-clean"]);
 	assert.ok(manager.get("old-dirty"), "dirty LRU remains resident");
 
-	await manager.markCandidateSettled("old-dirty", 2);
+	await manager.markCandidateSettled("old-dirty", 1, 2);
 	manager.pin("old-dirty");
 	assert.deepEqual(await manager.evictLeastRecentlyUsed(0), []);
 	manager.unpin("old-dirty");
@@ -114,7 +118,10 @@ s.test("aggregate load admission evicts mixed-size bodies in least-recently-used
 	const stored = new Map<string, StoredDocument>();
 	for (const bodyId of ["old-large", "new-small", "incoming"]) {
 		stored.set(bodyId, {
+			kind: "body",
 			documentId: bodyId,
+			bodyEpoch: 1,
+			durableBaseline: bodyId,
 			generation: 1,
 			encodedState: encoded(bodyId),
 			dirty: false,
@@ -155,12 +162,12 @@ s.test("dirty and pinned bodies make aggregate replacement admission refuse safe
 	}, Date.now, {
 		measure: ({ bodyId }) => costs[bodyId]!,
 	}, { estimatedCost: 6 });
-	await manager.replaceFromServer("dirty", new Uint8Array(encoded("dirty")), 1);
+	await manager.replaceFromServer("dirty", new Uint8Array(encoded("dirty")), 1, 1);
 	await manager.markLocalUpdate("dirty");
-	await manager.replaceFromServer("pinned", new Uint8Array(encoded("pinned")), 1);
+	await manager.replaceFromServer("pinned", new Uint8Array(encoded("pinned")), 1, 1);
 	manager.pin("pinned");
 	await assert.rejects(
-		manager.replaceFromServer("incoming", new Uint8Array(encoded("incoming")), 1),
+		manager.replaceFromServer("incoming", new Uint8Array(encoded("incoming")), 1, 1),
 		/body_estimated_cost_budget/,
 	);
 	assert.ok(manager.get("dirty"));
@@ -180,7 +187,7 @@ s.test("a single over-budget body is rejected before persistence or retention", 
 		measure: () => 11,
 	}, { estimatedCost: 10 });
 	await assert.rejects(
-		manager.replaceFromServer("oversized", new Uint8Array(encoded("oversized")), 1),
+		manager.replaceFromServer("oversized", new Uint8Array(encoded("oversized")), 1, 1),
 		/body_estimated_cost_budget/,
 	);
 	assert.equal(writes.length, 0);
@@ -208,12 +215,12 @@ s.test("replacement blocks a projection from claiming the prior document across 
 	}, Date.now, {
 		measure: ({ bodyId }) => costs[bodyId]!,
 	}, { estimatedCost: 10 });
-	await manager.replaceFromServer("target", new Uint8Array(encoded("old")), 1);
-	await manager.replaceFromServer("other", new Uint8Array(encoded("other")), 1);
+	await manager.replaceFromServer("target", new Uint8Array(encoded("old")), 1, 1);
+	await manager.replaceFromServer("other", new Uint8Array(encoded("other")), 1, 1);
 	gateEviction = true;
 	manager.coordinator.bindPath("Target.md", "target");
 	costs.target = 7;
-	const replacing = manager.replaceFromServer("target", new Uint8Array(encoded("new")), 2);
+	const replacing = manager.replaceFromServer("target", new Uint8Array(encoded("new")), 1, 2);
 	await started;
 	assert.throws(
 		() => manager.coordinator.acquireProjection("Target.md", "target", "editor", "editor-race"),

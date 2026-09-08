@@ -45,6 +45,15 @@ async function withStore(check: (
 
 s.test("reconstruction, recipes, and feed catalogs use a constant number of SQL statements", async () => {
 	await withStore((store, _sqlite, queries) => {
+		for (const bodyId of ["catalog-a", "catalog-b"]) {
+			const catalogBody = new Y.Doc({ guid: bodyId });
+			store.commitUpdate({
+				documentId: bodyId,
+				update: update(catalogBody, () => catalogBody.getText("body").insert(0, bodyId)),
+				kind: "body",
+			});
+			catalogBody.destroy();
+		}
 		const doc = new Y.Doc({ guid: "hot-body" });
 		for (let index = 0; index < 80; index++) {
 			const bytes = update(doc, () => doc.getText("body").insert(doc.getText("body").length, String(index % 10)));
@@ -142,7 +151,7 @@ s.test("checkpoint accounting stays in SQL and live pins retain their historical
 		).one().bytes;
 		queries.value = 0;
 		assert.equal(store.documentEncodedHistoryBytes("pin-body", latest), physicalCheckpointBytes);
-		assert.equal(queries.value, 3, "checkpoint size accounting must use one aggregate row, not read every BLOB");
+		assert.equal(queries.value, 2, "checkpoint size accounting must use manifest metadata, not read every BLOB");
 		assert.equal(store.releasePin(pin.pinId), true);
 		assert.equal(store.releasePin(laterPinId), true);
 		doc.destroy();

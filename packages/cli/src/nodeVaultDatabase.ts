@@ -4,9 +4,11 @@ import { DatabaseSync, type StatementSync } from "node:sqlite";
 import type {
 	StoredAttachmentPublicationOperation,
 	StoredBodyCandidate,
+	StoredSemanticEpochReplacement,
 	StoredBodyReceipt,
 	StoredBootstrapProgress,
 	StoredCanvasCandidate,
+	StoredCanvasEpochReplacement,
 	StoredCanvasLifecycle,
 	StoredCanvasSettlement,
 	StoredDocument,
@@ -109,16 +111,26 @@ export class NodeVaultDatabase implements VaultDatabasePort, BootstrapDatabasePo
 			) STRICT;
 			CREATE TABLE IF NOT EXISTS documents (
 				document_id TEXT PRIMARY KEY,
+				document_kind TEXT NOT NULL CHECK (document_kind IN ('root', 'body', 'semantic')),
+				body_epoch INTEGER,
+				root_epoch INTEGER,
+				durable_baseline TEXT,
 				generation INTEGER NOT NULL,
 				encoded_state BLOB NOT NULL,
 				dirty INTEGER NOT NULL CHECK (dirty IN (0, 1)),
 				pending_local_updates INTEGER,
-				updated_at INTEGER NOT NULL
+				updated_at INTEGER NOT NULL,
+				CHECK ((document_kind = 'root' AND document_id = 'root' AND root_epoch >= 1 AND body_epoch IS NULL AND durable_baseline IS NULL)
+					OR (document_kind = 'body' AND document_id <> 'root' AND body_epoch >= 1 AND root_epoch IS NULL AND durable_baseline IS NOT NULL)
+					OR (document_kind = 'semantic' AND document_id <> 'root' AND body_epoch >= 1 AND root_epoch IS NULL AND durable_baseline IS NULL))
 			) STRICT;
 			CREATE TABLE IF NOT EXISTS pending_candidates (
 				candidate_id TEXT PRIMARY KEY,
 				vault_id TEXT NOT NULL,
 				body_id TEXT NOT NULL,
+				body_epoch INTEGER NOT NULL CHECK (body_epoch >= 1),
+				previous_baseline TEXT NOT NULL,
+				pending_markdown TEXT NOT NULL,
 				candidate_digest TEXT NOT NULL,
 				encoded_update BLOB NOT NULL,
 				captured_at INTEGER NOT NULL,
@@ -170,11 +182,16 @@ export class NodeVaultDatabase implements VaultDatabasePort, BootstrapDatabasePo
 				value_json TEXT NOT NULL
 			) STRICT;
 			CREATE INDEX IF NOT EXISTS canvas_candidates_document ON canvas_candidates(document_id);
-			CREATE TABLE IF NOT EXISTS canvas_lifecycle (
-				operation_id TEXT PRIMARY KEY,
-				created_at INTEGER NOT NULL,
+				CREATE TABLE IF NOT EXISTS canvas_lifecycle (
+					operation_id TEXT PRIMARY KEY,
+					document_id TEXT NOT NULL,
+					created_at INTEGER NOT NULL,
+				encoded_update BLOB,
+				source_bytes BLOB,
+				semantic_bytes BLOB,
 				value_json TEXT NOT NULL
-			) STRICT;
+				) STRICT;
+				CREATE INDEX IF NOT EXISTS canvas_lifecycle_document ON canvas_lifecycle(document_id);
 			CREATE TABLE IF NOT EXISTS canvas_settlements (
 				document_id TEXT PRIMARY KEY,
 				canonical_content BLOB NOT NULL,
@@ -259,7 +276,7 @@ export class NodeVaultDatabase implements VaultDatabasePort, BootstrapDatabasePo
 	async getDocument(documentId: string): Promise<StoredDocument | null> {
 		const row = this.statement("SELECT * FROM documents WHERE document_id = ?").get(documentId) as SqlRow | undefined;
 		if (!row) return null;
-		return {
+		const common = {
 			documentId: String(row.document_id),
 			generation: Number(row.generation),
 			encodedState: storedArrayBuffer(row.encoded_state, "documents.encoded_state"),
@@ -267,16 +284,33 @@ export class NodeVaultDatabase implements VaultDatabasePort, BootstrapDatabasePo
 			...(row.pending_local_updates === null ? {} : { pendingLocalUpdates: Number(row.pending_local_updates) }),
 			updatedAt: Number(row.updated_at),
 		};
+		if (row.document_kind === "root") {
+			return { ...common, kind: "root", documentId: "root", rootEpoch: Number(row.root_epoch) };
+		}
+		if (row.document_kind === "semantic") {
+			return { ...common, kind: "semantic", bodyEpoch: Number(row.body_epoch) };
+		}
+		return {
+				...common, kind: "body", bodyEpoch: Number(row.body_epoch),
+				durableBaseline: String(row.durable_baseline),
+		};
 	}
 
 	async putDocument(document: StoredDocument): Promise<void> {
 		this.statement(`INSERT INTO documents
-			(document_id, generation, encoded_state, dirty, pending_local_updates, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?)
+			(document_id, document_kind, body_epoch, root_epoch, durable_baseline, generation,
+			 encoded_state, dirty, pending_local_updates, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(document_id) DO UPDATE SET generation=excluded.generation,
+			document_kind=excluded.document_kind, body_epoch=excluded.body_epoch,
+			root_epoch=excluded.root_epoch, durable_baseline=excluded.durable_baseline,
 			encoded_state=excluded.encoded_state, dirty=excluded.dirty,
 			pending_local_updates=excluded.pending_local_updates, updated_at=excluded.updated_at`)
-			.run(document.documentId, document.generation, sqliteBytes(document.encodedState), document.dirty ? 1 : 0,
+			.run(document.documentId, document.kind,
+				document.kind === "body" || document.kind === "semantic" ? document.bodyEpoch : null,
+				document.kind === "root" ? document.rootEpoch : null,
+				document.kind === "body" ? document.durableBaseline : null,
+				document.generation, sqliteBytes(document.encodedState), document.dirty ? 1 : 0,
 				optionalInteger(document.pendingLocalUpdates), document.updatedAt);
 	}
 
@@ -305,14 +339,40 @@ export class NodeVaultDatabase implements VaultDatabasePort, BootstrapDatabasePo
 	}
 
 	async putCanvasLifecycle(operation: StoredCanvasLifecycle): Promise<void> {
-		this.statement(`INSERT INTO canvas_lifecycle(operation_id, created_at, value_json) VALUES (?, ?, ?)
-			ON CONFLICT(operation_id) DO UPDATE SET created_at=excluded.created_at, value_json=excluded.value_json`)
-			.run(operation.operationId, operation.createdAt, JSON.stringify(operation));
+		const value = operation.kind === "promote"
+			? { ...operation, encodedUpdate: undefined, sourceBytes: undefined }
+			: operation.kind === "demote" ? { ...operation, semanticBytes: undefined } : operation;
+		this.statement(`INSERT INTO canvas_lifecycle(
+			operation_id, document_id, created_at, encoded_update, source_bytes, semantic_bytes, value_json
+		) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(operation_id) DO UPDATE SET
+			document_id=excluded.document_id, created_at=excluded.created_at, encoded_update=excluded.encoded_update,
+			source_bytes=excluded.source_bytes, semantic_bytes=excluded.semantic_bytes,
+			value_json=excluded.value_json`).run(
+			operation.operationId,
+			operation.documentId,
+			operation.createdAt,
+			operation.kind === "promote" ? sqliteBytes(operation.encodedUpdate) : null,
+			operation.kind === "promote" ? sqliteBytes(operation.sourceBytes) : null,
+			operation.kind === "demote" ? sqliteBytes(operation.semanticBytes) : null,
+			JSON.stringify(value),
+		);
 	}
 
 	async listCanvasLifecycle(): Promise<StoredCanvasLifecycle[]> {
-		return (this.statement("SELECT value_json FROM canvas_lifecycle ORDER BY created_at, operation_id").all() as SqlRow[])
-			.map((row) => jsonValue<StoredCanvasLifecycle>(row.value_json, "canvas_lifecycle.value_json"));
+		return (this.statement("SELECT * FROM canvas_lifecycle ORDER BY created_at, operation_id").all() as SqlRow[])
+			.map((row) => {
+				const value = jsonValue<StoredCanvasLifecycle>(row.value_json, "canvas_lifecycle.value_json");
+				if (value.kind === "promote") return {
+					...value,
+					encodedUpdate: storedArrayBuffer(row.encoded_update, "canvas_lifecycle.encoded_update"),
+					sourceBytes: storedArrayBuffer(row.source_bytes, "canvas_lifecycle.source_bytes"),
+				};
+				if (value.kind === "demote") return {
+					...value,
+					semanticBytes: storedArrayBuffer(row.semantic_bytes, "canvas_lifecycle.semantic_bytes"),
+				};
+				return value;
+			});
 	}
 
 	async deleteCanvasLifecycle(operationId: string): Promise<void> {
@@ -338,6 +398,61 @@ export class NodeVaultDatabase implements VaultDatabasePort, BootstrapDatabasePo
 				ON CONFLICT(document_id) DO UPDATE SET canonical_content=excluded.canonical_content,
 				value_json=excluded.value_json`).run(settlement.documentId, sqliteBytes(settlement.canonicalContent), JSON.stringify(value));
 			return true;
+		});
+	}
+
+	/** Atomically abandons an old Canvas CRDT lineage and installs its semantic rebase. */
+	async replaceCanvasSemanticEpoch(replacement: StoredCanvasEpochReplacement): Promise<void> {
+		const { document, settlement, candidate, lifecycle } = replacement;
+		if (settlement.documentId !== document.documentId || settlement.bodyEpoch !== document.bodyEpoch
+			|| (candidate && (candidate.documentId !== document.documentId
+				|| candidate.bodyEpoch !== document.bodyEpoch))
+			|| lifecycle.some((operation) => operation.documentId !== document.documentId
+				|| operation.bodyEpoch !== document.bodyEpoch)) {
+			throw new Error("Canvas semantic epoch replacement identity mismatch");
+		}
+		this.transaction(() => {
+			this.statement("DELETE FROM canvas_candidates WHERE document_id = ?").run(document.documentId);
+			this.statement("DELETE FROM canvas_lifecycle WHERE document_id = ?").run(document.documentId);
+			this.statement(`INSERT INTO documents
+				(document_id, document_kind, body_epoch, root_epoch, durable_baseline, generation,
+				 encoded_state, dirty, pending_local_updates, updated_at)
+				VALUES (?, 'semantic', ?, NULL, NULL, ?, ?, ?, ?, ?)
+				ON CONFLICT(document_id) DO UPDATE SET generation=excluded.generation,
+				document_kind='semantic', body_epoch=excluded.body_epoch, root_epoch=NULL,
+				durable_baseline=NULL, encoded_state=excluded.encoded_state,
+				dirty=excluded.dirty, pending_local_updates=excluded.pending_local_updates,
+				updated_at=excluded.updated_at`)
+				.run(document.documentId, document.bodyEpoch, document.generation,
+					sqliteBytes(document.encodedState), document.dirty ? 1 : 0,
+					optionalInteger(document.pendingLocalUpdates), document.updatedAt);
+			const settlementValue = { ...settlement, canonicalContent: undefined };
+			this.statement(`INSERT INTO canvas_settlements(document_id, canonical_content, value_json)
+				VALUES (?, ?, ?) ON CONFLICT(document_id) DO UPDATE SET
+				canonical_content=excluded.canonical_content, value_json=excluded.value_json`)
+				.run(settlement.documentId, sqliteBytes(settlement.canonicalContent), JSON.stringify(settlementValue));
+			if (candidate) {
+				const candidateValue = { ...candidate, encodedUpdate: undefined };
+				this.statement(`INSERT INTO canvas_candidates(
+					candidate_id, document_id, encoded_update, captured_at, value_json
+				) VALUES (?, ?, ?, ?, ?)`)
+					.run(candidate.candidateId, candidate.documentId, sqliteBytes(candidate.encodedUpdate),
+						candidate.capturedAt, JSON.stringify(candidateValue));
+			}
+			for (const operation of lifecycle) {
+				const value = operation.kind === "promote"
+					? { ...operation, encodedUpdate: undefined, sourceBytes: undefined }
+					: operation.kind === "demote" ? { ...operation, semanticBytes: undefined } : operation;
+				this.statement(`INSERT INTO canvas_lifecycle(
+					operation_id, document_id, created_at, encoded_update, source_bytes, semantic_bytes, value_json
+				) VALUES (?, ?, ?, ?, ?, ?, ?)`).run(
+					operation.operationId, operation.documentId, operation.createdAt,
+					operation.kind === "promote" ? sqliteBytes(operation.encodedUpdate) : null,
+					operation.kind === "promote" ? sqliteBytes(operation.sourceBytes) : null,
+					operation.kind === "demote" ? sqliteBytes(operation.semanticBytes) : null,
+					JSON.stringify(value),
+				);
+			}
 		});
 	}
 
@@ -371,15 +486,19 @@ export class NodeVaultDatabase implements VaultDatabasePort, BootstrapDatabasePo
 
 	async putPendingCandidate(candidate: StoredBodyCandidate): Promise<void> {
 		this.statement(`INSERT INTO pending_candidates
-			(candidate_id, vault_id, body_id, candidate_digest, encoded_update, captured_at,
+			(candidate_id, vault_id, body_id, body_epoch, previous_baseline, pending_markdown,
+			 candidate_digest, encoded_update, captured_at,
 			 captured_local_updates, attempts, last_attempt_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(candidate_id) DO UPDATE SET vault_id=excluded.vault_id,
-			body_id=excluded.body_id, candidate_digest=excluded.candidate_digest,
+			body_id=excluded.body_id, body_epoch=excluded.body_epoch,
+			previous_baseline=excluded.previous_baseline, pending_markdown=excluded.pending_markdown,
+			candidate_digest=excluded.candidate_digest,
 			encoded_update=excluded.encoded_update, captured_at=excluded.captured_at,
 			captured_local_updates=excluded.captured_local_updates, attempts=excluded.attempts,
 			last_attempt_at=excluded.last_attempt_at`)
-			.run(candidate.candidateId, candidate.vaultId, candidate.bodyId, candidate.candidateDigest,
+			.run(candidate.candidateId, candidate.vaultId, candidate.bodyId, candidate.bodyEpoch,
+				candidate.previousBaseline, candidate.pendingMarkdown, candidate.candidateDigest,
 				sqliteBytes(candidate.encodedUpdate), candidate.capturedAt,
 				optionalInteger(candidate.capturedLocalUpdates), optionalInteger(candidate.attempts),
 				candidate.lastAttemptAt ?? null);
@@ -394,6 +513,9 @@ export class NodeVaultDatabase implements VaultDatabasePort, BootstrapDatabasePo
 			candidateId: String(row.candidate_id),
 			vaultId: String(row.vault_id),
 			bodyId: String(row.body_id),
+			bodyEpoch: Number(row.body_epoch),
+			previousBaseline: String(row.previous_baseline),
+			pendingMarkdown: String(row.pending_markdown),
 			candidateDigest: String(row.candidate_digest),
 			encodedUpdate: storedArrayBuffer(row.encoded_update, "pending_candidates.encoded_update"),
 			capturedAt: Number(row.captured_at),
@@ -429,6 +551,39 @@ export class NodeVaultDatabase implements VaultDatabasePort, BootstrapDatabasePo
 		});
 	}
 
+	async replaceBodySemanticEpoch(replacement: StoredSemanticEpochReplacement): Promise<void> {
+		const { document, candidate } = replacement;
+		if (candidate && (candidate.bodyId !== document.documentId || candidate.bodyEpoch !== document.bodyEpoch)) {
+			throw new Error("semantic epoch replacement candidate identity mismatch");
+		}
+		this.transaction(() => {
+			this.statement("DELETE FROM pending_candidates WHERE body_id = ?").run(document.documentId);
+			this.statement(`INSERT INTO documents
+				(document_id, document_kind, body_epoch, root_epoch, durable_baseline, generation,
+				 encoded_state, dirty, pending_local_updates, updated_at)
+				VALUES (?, 'body', ?, NULL, ?, ?, ?, ?, ?, ?)
+				ON CONFLICT(document_id) DO UPDATE SET generation=excluded.generation,
+				document_kind='body', body_epoch=excluded.body_epoch, root_epoch=NULL,
+				durable_baseline=excluded.durable_baseline, encoded_state=excluded.encoded_state,
+				dirty=excluded.dirty, pending_local_updates=excluded.pending_local_updates,
+				updated_at=excluded.updated_at`)
+				.run(document.documentId, document.bodyEpoch, document.durableBaseline,
+					document.generation, sqliteBytes(document.encodedState), document.dirty ? 1 : 0,
+					optionalInteger(document.pendingLocalUpdates), document.updatedAt);
+			if (candidate) {
+				this.statement(`INSERT INTO pending_candidates
+					(candidate_id, vault_id, body_id, body_epoch, previous_baseline, pending_markdown,
+					 candidate_digest, encoded_update, captured_at, captured_local_updates, attempts, last_attempt_at)
+					VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+					.run(candidate.candidateId, candidate.vaultId, candidate.bodyId, candidate.bodyEpoch,
+						candidate.previousBaseline, candidate.pendingMarkdown, candidate.candidateDigest,
+						sqliteBytes(candidate.encodedUpdate), candidate.capturedAt,
+						optionalInteger(candidate.capturedLocalUpdates), optionalInteger(candidate.attempts),
+						candidate.lastAttemptAt ?? null);
+			}
+		});
+	}
+
 	async confirmPendingCandidate(receipt: StoredBodyReceipt): Promise<void> {
 		if (!receipt.runtimeEpoch || !receipt.vaultGeneration || !Number.isSafeInteger(receipt.durableGeneration) || receipt.durableGeneration < 0) {
 			throw new Error(`Invalid durable receipt for candidate ${receipt.candidateId}`);
@@ -437,7 +592,8 @@ export class NodeVaultDatabase implements VaultDatabasePort, BootstrapDatabasePo
 			const row = this.statement("SELECT * FROM pending_candidates WHERE candidate_id = ?").get(receipt.candidateId) as SqlRow | undefined;
 			if (!row) throw new Error(`Unknown candidate ${receipt.candidateId}`);
 			const stored = this.candidateFromRow(row);
-			if (stored.vaultId !== receipt.vaultId || stored.bodyId !== receipt.bodyId || stored.candidateDigest !== receipt.candidateDigest) {
+			if (stored.vaultId !== receipt.vaultId || stored.bodyId !== receipt.bodyId
+				|| stored.bodyEpoch !== receipt.bodyEpoch || stored.candidateDigest !== receipt.candidateDigest) {
 				throw new Error(`Receipt identity mismatch for candidate ${receipt.candidateId}`);
 			}
 			const remaining = Number((this.statement(

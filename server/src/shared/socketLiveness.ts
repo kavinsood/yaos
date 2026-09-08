@@ -36,6 +36,7 @@ export interface BodyCurrentnessQueryFrame {
 
 export interface BodyCurrentnessHead {
 	bodyId: string;
+	bodyEpoch: SemanticEpoch;
 	lifecycle: "active" | "tombstoned" | "reaped";
 	generation: number;
 	contentHash: string | null;
@@ -55,6 +56,7 @@ export interface VaultPongFrame {
 	type: "VAULT_PONG";
 	probeId: string;
 	documentId: string;
+	documentEpoch: SemanticEpoch;
 	vaultGeneration: string;
 	runtimeEpoch: string;
 }
@@ -117,10 +119,12 @@ function parseCurrentnessHead(value: unknown): BodyCurrentnessHead | null {
 	if (typeof record.bodyId !== "string" || !record.bodyId
 		|| (record.lifecycle !== "active" && record.lifecycle !== "tombstoned" && record.lifecycle !== "reaped")
 		|| !Number.isSafeInteger(record.generation) || (record.generation as number) < 0
+		|| !Number.isSafeInteger(record.bodyEpoch) || (record.bodyEpoch as number) < 1
 		|| (record.contentHash !== null && (typeof record.contentHash !== "string" || !/^[a-f0-9]{64}$/.test(record.contentHash)))
 		|| (record.size !== null && (!Number.isSafeInteger(record.size) || (record.size as number) < 0))) return null;
 	return {
 		bodyId: record.bodyId,
+		bodyEpoch: parseSemanticEpoch(record.bodyEpoch, "currentness body epoch"),
 		lifecycle: record.lifecycle,
 		generation: record.generation as number,
 		contentHash: record.contentHash,
@@ -180,13 +184,16 @@ export function parseVaultPongFrame(value: unknown): VaultPongFrame | null {
 	if (record.type !== "VAULT_PONG"
 		|| !isProbeId(record.probeId)
 		|| typeof record.documentId !== "string" || !record.documentId
+		|| !Number.isSafeInteger(record.documentEpoch) || (record.documentEpoch as number) < 1
 		|| typeof record.vaultGeneration !== "string" || !record.vaultGeneration
 		|| typeof record.runtimeEpoch !== "string" || !record.runtimeEpoch) return null;
 	return {
 		type: "VAULT_PONG",
 		probeId: record.probeId,
 		documentId: record.documentId,
+		documentEpoch: parseSemanticEpoch(record.documentEpoch, "pong document epoch"),
 		vaultGeneration: record.vaultGeneration,
 		runtimeEpoch: record.runtimeEpoch,
 	};
 }
+import { parseSemanticEpoch, type SemanticEpoch } from "./semanticEpoch";

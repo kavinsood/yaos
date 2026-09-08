@@ -322,59 +322,12 @@ s.test("owner governance is fixed, replayable, and operator-confirmed", async ()
 	s.check(admitted.status === 200, "confirmed request admits the existing purge-first deletion workflow");
 });
 
-s.section("legacy identity migration is explicit, fenced, and exactly resumable");
-{
-	const data = new Map<string, unknown>([
-		["claimed", true],
-		["configFormat", 2],
-		["operatorRecoveryHash", "a".repeat(64)],
-		["ticketSigningKey", "legacy-ticket-key"],
-		["vaults", [{ vaultId: "legacy-vault", name: "Legacy", state: "active",
-			vaultGeneration: "legacy-generation", createdAt: 1, provisionedAt: 2 }]],
-		["devices", [
-			{ deviceId: "owner-laptop", vaultId: "legacy-vault", tokenHash: "b".repeat(64), name: "Laptop", enrolledAt: 3 },
-			{ deviceId: "owner-phone", vaultId: "legacy-vault", tokenHash: "c".repeat(64), name: "Phone", enrolledAt: 4 },
-			{ deviceId: "member-laptop", vaultId: "legacy-vault", tokenHash: "d".repeat(64), name: "Collaborator", enrolledAt: 5 },
-		]],
-	]);
-	const runtime = memoryRuntime(data);
-	const request = { vaultId: "legacy-vault", ownerDeviceIds: ["owner-phone", "owner-laptop"], ownerDisplayName: "Alice" };
-	const first = await runtime.fetch(post("/__yaos/collaboration/migrate", request));
-	const prepared = await first.json() as { phase: string; ownerPrincipalId: string; formatActivated: boolean; change: {
-		changeId: string; vaultId: string; vaultGeneration: string; requestDigest: string; subjectDigest: string; subjects: unknown[];
-	} };
-	s.check(first.status === 200 && prepared.phase === "prepared" && !prepared.formatActivated,
-		"migration prepares identities without activating the new config format");
-	const replay = await runtime.fetch(post("/__yaos/collaboration/migrate", request));
-	const replayed = await replay.json() as typeof prepared;
-	s.check(replayed.change.changeId === prepared.change.changeId
-		&& replayed.change.subjectDigest === prepared.change.subjectDigest,
-		"preparation replay returns the exact pending authority change");
-	const principals = data.get("principals") as Array<{ principalId: string }>;
-	const memberships = data.get("vaultMemberships") as Array<{ principalId: string; role: string; state: string }>;
-	const devices = data.get("devices") as Array<{ deviceId: string; principalId: string; state: string }>;
-	s.check(principals.length === 2 && memberships.every((membership) => membership.state === "changing")
-		&& devices.every((device) => device.state === "changing"),
-		"owner devices are grouped while each remaining device becomes one fenced member");
-	s.check(devices.find((device) => device.deviceId === "owner-laptop")?.principalId === prepared.ownerPrincipalId
-		&& devices.find((device) => device.deviceId === "owner-phone")?.principalId === prepared.ownerPrincipalId
-		&& devices.find((device) => device.deviceId === "member-laptop")?.principalId !== prepared.ownerPrincipalId,
-		"operator-selected owner grouping is exact");
-	const receipt = { migrationId: prepared.change.changeId, vaultId: prepared.change.vaultId,
-		vaultGeneration: prepared.change.vaultGeneration, requestDigest: prepared.change.requestDigest,
-		subjectDigest: prepared.change.subjectDigest, rootSequence: 9,
-		settingsAssignment: "owner_principal_scoped", settingsEnvironmentCount: 1,
-		historyAttribution: "legacy_unattributed", installedAt: 10 };
-	const finalized = await runtime.fetch(post("/__yaos/collaboration/migrate", { ...request, receipt }));
-	const complete = await finalized.json() as { phase: string; formatActivated: boolean };
-	const completedMemberships = data.get("vaultMemberships") as Array<{ state: string }>;
-	const completedDevices = data.get("devices") as Array<{ state: string }>;
-	s.check(finalized.status === 200 && complete.phase === "complete" && complete.formatActivated
-		&& completedMemberships.every((membership) => membership.state === "active")
-		&& completedDevices.every((device) => device.state === "active") && data.get("configFormat") === 3,
-		"only the exact vault receipt activates identities and config format 3");
-	const finalizedReplay = await runtime.fetch(post("/__yaos/collaboration/migrate", { ...request, receipt }));
-	s.check(finalizedReplay.status === 200, "completed migration receipt replays idempotently");
-}
+s.test("legacy collaboration migration RPC is absent", async () => {
+	const response = await memoryRuntime().fetch(post("/__yaos/collaboration/migrate", {
+		vaultId: "legacy-vault",
+		ownerDeviceIds: ["legacy-device"],
+	}));
+	s.check(response.status === 404, "schema-6 identity migration cannot be invoked through the control plane");
+});
 
 await s.done();

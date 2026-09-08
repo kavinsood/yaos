@@ -1,9 +1,9 @@
-import WebSocket from "ws";
 import { PROTOCOL_VERSION, SCHEMA_VERSION } from "../../src/sync/schema.ts";
 import { parseFatalFrame, type FatalFrame } from "./fatalFrame.ts";
 import {
 	deviceBearerHeaders,
 	fetchSocketTicket,
+	LiveWebSocket as WebSocket,
 	type LiveIdentity,
 	requireLiveIdentityContext,
 } from "./liveIdentity.ts";

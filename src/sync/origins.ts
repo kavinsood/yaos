@@ -12,6 +12,7 @@
 
 export const ORIGIN_SEED = "vault-crdt-seed" as const;
 export const ORIGIN_RESTORE = "snapshot-restore" as const;
+export const ORIGIN_SEMANTIC_EPOCH_REBASE = "semantic-epoch-rebase" as const;
 export const ORIGIN_DISK_SYNC = "disk-sync" as const;
 export const ORIGIN_DISK_COMMIT = "disk-commit" as const;
 export const ORIGIN_DISK_SYNC_RECOVER_BOUND = "disk-sync-recover-bound" as const;
@@ -34,6 +35,7 @@ const LOCAL_STRING_ORIGIN_SET = new Set<string>([
 	ORIGIN_DISK_SYNC_OPEN_IDLE_RECOVER,
 	ORIGIN_EDITOR_HEALTH_HEAL,
 	ORIGIN_RESTORE,
+	ORIGIN_SEMANTIC_EPOCH_REBASE,
 ]);
 
 /**

@@ -3,9 +3,17 @@ import { canonicalCanvasBytes, formatCanvasBytes, parseCanvasBytes } from "@shar
 import { applyCanvasSnapshot, createCanvasDocument, materializeCanvasDocument, validateCanvasDocument } from "@shared/canvasSemanticDocument";
 import { mergeCanvasThreeWay } from "@shared/canvasMerge";
 import type { CanvasMergeConflict, CanvasSemanticData, SemanticPathRef } from "@shared/canvasTypes";
+import {
+	INITIAL_SEMANTIC_EPOCH,
+	parseSemanticEpoch,
+	parseSemanticEpochResetFrame,
+	type SemanticEpoch,
+} from "@shared/semanticEpoch";
 import { sha256BytesHex } from "../../utils/sha256";
 import { randomId } from "../../utils/randomId";
-import type { StoredCanvasCandidate, StoredCanvasLifecycle, StoredCanvasSettlement, StoredDocument } from "../vaultIndexedDb";
+import type { StoredCanvasCandidate, StoredCanvasEpochReplacement, StoredCanvasLifecycle,
+	StoredCanvasSettlement, StoredDocument } from "../vaultIndexedDb";
+import { CanvasSemanticEpochMismatchError } from "./canvasTransport";
 import type { CanvasAuthorityReceipt, CanvasCandidateReceipt, CanvasDemotionRequest, CanvasLifecycleReceipt,
 	CanvasLifecycleRequest, CanvasPromotionRequest, CanvasState } from "./canvasTransport";
 
@@ -20,6 +28,7 @@ export interface CanvasPersistencePort {
 	deleteCanvasLifecycle(operationId: string): Promise<void>;
 	getCanvasSettlement(documentId: string): Promise<StoredCanvasSettlement | null>;
 	putCanvasSettlement(settlement: StoredCanvasSettlement, expectedRevision: number | null): Promise<boolean>;
+	replaceCanvasSemanticEpoch(replacement: StoredCanvasEpochReplacement): Promise<void>;
 }
 
 export interface CanvasTransportPort {
@@ -53,7 +62,7 @@ export interface CanvasProviderPort {
 	on(event: "custom-message", callback: (payload: string) => void): void;
 }
 
-export type CanvasProviderFactory = (documentId: string, doc: Y.Doc) => CanvasProviderPort;
+export type CanvasProviderFactory = (documentId: string, bodyEpoch: SemanticEpoch, doc: Y.Doc) => CanvasProviderPort;
 
 export interface CanvasProviderLifecycle {
 	created(documentId: string, provider: CanvasProviderPort): void;
@@ -69,7 +78,7 @@ export interface CanvasProjectionPort {
 }
 
 interface ResidentCanvas {
-	documentId: string; path: string; doc: Y.Doc; generation: number; revision: number;
+	documentId: string; path: string; doc: Y.Doc; bodyEpoch: SemanticEpoch; generation: number; revision: number;
 	lastUsedAt: number; encodedBytes: number;
 }
 
@@ -105,6 +114,7 @@ export interface CanvasManagerStats {
 
 export interface CanvasLiveReview {
 	documentId: string;
+	bodyEpoch: SemanticEpoch;
 	generation: number;
 	contentHash: string;
 	size: number;
@@ -116,19 +126,20 @@ function ownedBuffer(bytes: Uint8Array): ArrayBuffer {
 	return buffer;
 }
 
-function encodeBase64(bytes: Uint8Array): string {
-	let binary = "";
-	for (let offset = 0; offset < bytes.byteLength; offset += 0x8000) {
-		binary += String.fromCharCode(...bytes.subarray(offset, Math.min(bytes.byteLength, offset + 0x8000)));
-	}
-	return btoa(binary);
+class CanvasEpochRecoveredError extends Error {
+	constructor() { super("Canvas candidate was semantically rebased onto a newer epoch"); }
 }
 
-function decodeBase64(value: string): Uint8Array {
-	const binary = atob(value);
-	const bytes = new Uint8Array(binary.length);
-	for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
-	return bytes;
+class CanvasLifecycleRetiredError extends Error {
+	constructor(kind: StoredCanvasLifecycle["kind"], reason: string) {
+		super(`Canvas ${kind} intent was retired: ${reason}`);
+	}
+}
+
+class CanvasLifecycleReplannedError extends Error {
+	constructor(kind: StoredCanvasLifecycle["kind"]) {
+		super(`Canvas ${kind} intent was rebound to the current semantic epoch`);
+	}
 }
 
 export class CanvasManager {
@@ -139,6 +150,7 @@ export class CanvasManager {
 	private readonly retryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 	private readonly refreshes = new Map<string, Promise<void>>();
 	private readonly refreshAttempts = new Map<string, number>();
+	private readonly epochRecoveries = new Map<string, Promise<void>>();
 	private readonly pendingDocuments = new Set<string>();
 	private readonly pathStates = new Map<string, "semantic" | "invalid" | "oversized" | "conflict" | "degraded">();
 	private readonly liveSessions = new Map<string, CanvasLiveSession>();
@@ -152,7 +164,9 @@ export class CanvasManager {
 		private readonly transport: CanvasTransportPort, private readonly projection: CanvasProjectionPort,
 		private readonly now: () => number = Date.now, private readonly maximumResidents = 32,
 		private readonly providerFactory?: CanvasProviderFactory,
-		private readonly providerLifecycle?: CanvasProviderLifecycle) {}
+		private readonly providerLifecycle?: CanvasProviderLifecycle,
+		private readonly currentRootEpoch: () => SemanticEpoch = () => INITIAL_SEMANTIC_EPOCH,
+		private readonly recoverRootEpoch?: (minimumEpoch: SemanticEpoch) => Promise<void>) {}
 
 	async initialize(catalog: Iterable<[string, SemanticPathRef]>): Promise<void> {
 		this.replaceCatalog(catalog);
@@ -264,6 +278,9 @@ export class CanvasManager {
 	activeEntries(): ReadonlyArray<{ path: string; documentId: string }> {
 		return [...this.pathToDocument].map(([path, documentId]) => ({ path, documentId }));
 	}
+	bodyEpoch(documentId: string): SemanticEpoch | null {
+		return this.residents.get(documentId)?.bodyEpoch ?? null;
+	}
 	async findExactRenameSource(bytes: Uint8Array, candidatePaths: readonly string[]): Promise<string | null> {
 		const parsed = parseCanvasBytes(bytes);
 		if (parsed.kind !== "valid") return null;
@@ -281,7 +298,8 @@ export class CanvasManager {
 		if (!documentId) return null;
 		const state = await this.transport.state(documentId);
 		if (this.pathToDocument.get(path) !== documentId) return null;
-		return { documentId, generation: state.generation, contentHash: state.contentHash, size: state.size };
+		return { documentId, bodyEpoch: state.bodyEpoch, generation: state.generation,
+			contentHash: state.contentHash, size: state.size };
 	}
 
 	stats(): CanvasManagerStats {
@@ -322,14 +340,17 @@ export class CanvasManager {
 		const doc = createCanvasDocument(parsed.data);
 		const update = Y.encodeStateAsUpdate(doc);
 		const candidateDigest = await sha256BytesHex(update);
+		const bodyEpoch = INITIAL_SEMANTIC_EPOCH;
+		const rootEpoch = parseSemanticEpoch(this.currentRootEpoch(), "Canvas promotion root epoch");
 		const requestDigest = await sha256BytesHex(new TextEncoder().encode(JSON.stringify({ operationId, path,
 			documentId, sourceRevision: expected.revision, sourceHash: expected.hash, sourceSize: expected.size,
-			contentHash, contentSize: parsed.canonicalBytes.byteLength, candidateDigest })));
+			contentHash, contentSize: parsed.canonicalBytes.byteLength, candidateDigest, bodyEpoch, rootEpoch })));
 		doc.destroy();
 		const operation: StoredCanvasLifecycle = { operationId, requestDigest, kind: "promote", path, documentId,
+			bodyEpoch, rootEpoch,
 			sourceRevision: expected.revision, sourceHash: expected.hash, sourceSize: expected.size,
 			contentHash, contentSize: parsed.canonicalBytes.byteLength, candidateDigest,
-			encodedUpdateBase64: encodeBase64(update), sourceBytesBase64: encodeBase64(bytes),
+			encodedUpdate: ownedBuffer(update), sourceBytes: ownedBuffer(bytes),
 			createdAt: this.now(), attempts: 0, lastAttemptAt: null };
 		await this.persistence.putCanvasLifecycle(operation);
 		try {
@@ -337,7 +358,7 @@ export class CanvasManager {
 			if (!("kind" in receipt) || receipt.kind !== "promote") throw new Error("Canvas promotion receipt mismatch");
 			return receipt;
 		}
-		catch (error) { this.scheduleLifecycleRetry(operation); throw error; }
+		catch (error) { if (!(error instanceof CanvasLifecycleRetiredError)) this.scheduleLifecycleRetry(operation); throw error; }
 	}
 
 	async demote(path: string): Promise<CanvasAuthorityReceipt> {
@@ -346,25 +367,33 @@ export class CanvasManager {
 		if (!documentId) throw new Error("Canvas is not under semantic authority");
 		const resident = await this.load(documentId, path);
 		const remote = await this.transport.state(documentId);
+		if (remote.bodyEpoch > resident.bodyEpoch) {
+			await this.recoverSemanticEpoch(documentId, remote.bodyEpoch, remote);
+			return this.demote(path);
+		}
+		if (remote.bodyEpoch < resident.bodyEpoch) throw new Error("Canvas demotion state returned a stale semantic epoch");
 		Y.applyUpdate(resident.doc, remote.encodedState, "canvas-demotion-currentness");
 		const data = await materializeCanvasDocument(resident.doc, false);
 		const bytes = canonicalCanvasBytes(data);
 		const contentHash = await sha256BytesHex(bytes);
 		if (contentHash !== remote.contentHash || bytes.byteLength !== remote.size) throw new Error("Canvas semantic head changed during demotion");
 		const operationId = randomId(32);
+		const bodyEpoch = remote.bodyEpoch;
+		const rootEpoch = parseSemanticEpoch(this.currentRootEpoch(), "Canvas demotion root epoch");
 		const requestDigest = await sha256BytesHex(new TextEncoder().encode(JSON.stringify({ operationId, documentId,
-			path, generation: remote.generation, contentHash, size: bytes.byteLength })));
+			path, generation: remote.generation, contentHash, size: bytes.byteLength, bodyEpoch, rootEpoch })));
 		const operation: StoredCanvasLifecycle = { operationId, requestDigest, kind: "demote", documentId, path,
+			bodyEpoch, rootEpoch,
 			expectedGeneration: remote.generation, expectedContentHash: contentHash, expectedSize: bytes.byteLength,
 			blobHash: contentHash, blobSize: bytes.byteLength, mime: "application/json",
-			semanticBytesBase64: encodeBase64(bytes), createdAt: this.now(), attempts: 0, lastAttemptAt: null };
+			semanticBytes: ownedBuffer(bytes), createdAt: this.now(), attempts: 0, lastAttemptAt: null };
 		await this.persistence.putCanvasLifecycle(operation);
 		try {
 			const receipt = await this.submitLifecycle(operation);
 			if (!("kind" in receipt) || receipt.kind !== "demote") throw new Error("Canvas demotion receipt mismatch");
 			return receipt;
 		}
-		catch (error) { this.scheduleLifecycleRetry(operation); throw error; }
+		catch (error) { if (!(error instanceof CanvasLifecycleRetiredError)) this.scheduleLifecycleRetry(operation); throw error; }
 	}
 
 	async ingest(path: string, bytes: Uint8Array): Promise<"created" | "updated" | "formatting-only" | "blocked"> {
@@ -386,6 +415,11 @@ export class CanvasManager {
 		if (await sha256BytesHex(canonicalCanvasBytes(shared)) === await sha256BytesHex(parsed.canonicalBytes)) {
 			if (!this.pendingDocuments.has(documentId)) {
 				const remote = await this.transport.state(documentId);
+				if (remote.bodyEpoch > resident.bodyEpoch) {
+					await this.recoverSemanticEpoch(documentId, remote.bodyEpoch, remote);
+					return "formatting-only";
+				}
+				if (remote.bodyEpoch < resident.bodyEpoch) throw new Error("Canvas state returned a stale semantic epoch");
 				const contentHash = await sha256BytesHex(parsed.canonicalBytes);
 				if (remote.contentHash === contentHash && remote.size === parsed.canonicalBytes.byteLength) {
 					await this.settle(resident, parsed.canonicalBytes, bytes, remote.generation, remote.contentHash);
@@ -394,7 +428,7 @@ export class CanvasManager {
 			return "formatting-only";
 		}
 		const settlement = await this.persistence.getCanvasSettlement(documentId);
-		const base = settlement ? this.parseSettlement(settlement) : null;
+		const base = settlement?.bodyEpoch === resident.bodyEpoch ? this.parseSettlement(settlement) : null;
 		const merged = mergeCanvasThreeWay(base, shared, parsed.data);
 		if (merged.conflicts.length > 0 && !await this.projection.preserveConflict({ path, documentId, bytes, conflicts: merged.conflicts })) {
 			this.pathStates.set(path, "conflict");
@@ -414,6 +448,175 @@ export class CanvasManager {
 		});
 		this.refreshes.set(documentId, work);
 		return work;
+	}
+
+	async recoverSemanticEpoch(documentId: string, minimumEpoch: SemanticEpoch,
+		knownState?: CanvasState): Promise<void> {
+		const current = this.epochRecoveries.get(documentId);
+		if (current) return current;
+		const work = this.runSemanticEpochRecovery(documentId,
+			parseSemanticEpoch(minimumEpoch, "Canvas recovery epoch"), knownState)
+			.finally(() => {
+				if (this.epochRecoveries.get(documentId) === work) this.epochRecoveries.delete(documentId);
+			});
+		this.epochRecoveries.set(documentId, work);
+		return work;
+	}
+
+	private async runSemanticEpochRecovery(documentId: string, minimumEpoch: SemanticEpoch,
+		knownState?: CanvasState): Promise<void> {
+		const path = [...this.pathToDocument].find((entry) => entry[1] === documentId)?.[0];
+		if (!path) return;
+		const resident = await this.load(documentId, path);
+		if (resident.bodyEpoch >= minimumEpoch) return;
+		const proof = { revision: resident.revision, path };
+		const previousEpoch = resident.bodyEpoch;
+		const previousSettlement = await this.persistence.getCanvasSettlement(documentId);
+		const base = previousSettlement?.bodyEpoch === previousEpoch
+			? this.parseSettlement(previousSettlement)
+			: null;
+		let local = await materializeCanvasDocument(resident.doc);
+		let diskBytes: Uint8Array | null;
+		try { diskBytes = await this.projection.read(path); }
+		catch (error) { this.pathStates.set(path, "degraded"); throw error; }
+		if (diskBytes) {
+			const parsedDisk = parseCanvasBytes(diskBytes);
+			if (parsedDisk.kind !== "valid") {
+				this.pathStates.set(path, parsedDisk.kind === "oversized" ? "oversized" : "invalid");
+				throw new Error(`Canvas epoch recovery cannot semantically rebase ${parsedDisk.kind} local bytes`);
+			}
+			const localMerge = mergeCanvasThreeWay(base, local, parsedDisk.data);
+			if (localMerge.conflicts.length > 0 && !await this.projection.preserveConflict({
+				path, documentId, bytes: diskBytes, conflicts: localMerge.conflicts,
+			})) {
+				this.pathStates.set(path, "conflict");
+				throw new Error("Canvas epoch recovery conflict was not preserved");
+			}
+			local = localMerge.data;
+		}
+		const remote = knownState && knownState.bodyEpoch >= minimumEpoch
+			? knownState
+			: await this.transport.state(documentId);
+		if (remote.documentId !== documentId || remote.bodyEpoch < minimumEpoch
+			|| remote.bodyEpoch <= previousEpoch) {
+			throw new Error("Canvas semantic epoch recovery returned a stale baseline");
+		}
+		const authoritativeDoc = new Y.Doc({ guid: documentId });
+		try { Y.applyUpdate(authoritativeDoc, remote.encodedState, "canvas-epoch-authoritative-baseline"); }
+		catch (error) { authoritativeDoc.destroy(); throw error; }
+		const validation = await validateCanvasDocument(authoritativeDoc);
+		if (validation) { authoritativeDoc.destroy(); throw new Error(validation); }
+		const authoritative = await materializeCanvasDocument(authoritativeDoc, false);
+		const authoritativeCanonical = canonicalCanvasBytes(authoritative);
+		if (authoritativeCanonical.byteLength !== remote.size
+			|| await sha256BytesHex(authoritativeCanonical) !== remote.contentHash) {
+			authoritativeDoc.destroy();
+			throw new Error("Canvas epoch baseline content proof mismatch");
+		}
+		authoritativeDoc.destroy();
+		const merged = mergeCanvasThreeWay(base, authoritative, local);
+		const conflictBytes = diskBytes ?? canonicalCanvasBytes(local);
+		if (merged.conflicts.length > 0 && !await this.projection.preserveConflict({
+			path, documentId, bytes: conflictBytes, conflicts: merged.conflicts,
+		})) {
+			this.pathStates.set(path, "conflict");
+			throw new Error("Canvas epoch recovery conflict was not preserved");
+		}
+		if (!this.current(resident, proof)) return;
+		const nextDoc = new Y.Doc({ guid: documentId });
+		Y.applyUpdate(nextDoc, remote.encodedState, "canvas-epoch-fresh-baseline");
+		const origin = {};
+		const updates: Uint8Array[] = [];
+		const observer = (update: Uint8Array, updateOrigin: unknown): void => {
+			if (updateOrigin === origin) updates.push(update.slice());
+		};
+		nextDoc.on("update", observer);
+		try { await applyCanvasSnapshot(nextDoc, merged.data, randomId(32), origin); }
+		finally { nextDoc.off("update", observer); }
+		const nextValidation = await validateCanvasDocument(nextDoc);
+		if (nextValidation) { nextDoc.destroy(); throw new Error(nextValidation); }
+		const mergedCanonical = canonicalCanvasBytes(merged.data);
+		const update = updates.length === 0 ? null : updates.length === 1 ? updates[0]! : Y.mergeUpdates(updates);
+		const candidate: StoredCanvasCandidate | null = update ? {
+			candidateId: randomId(32), documentId, bodyEpoch: remote.bodyEpoch,
+			candidateDigest: await sha256BytesHex(update), encodedUpdate: ownedBuffer(update), capturedAt: this.now(),
+			attempts: 0, lastAttemptAt: null,
+		} : null;
+		const encodedState = Y.encodeStateAsUpdate(nextDoc);
+		const nextSettlement: StoredCanvasSettlement = {
+			format: 1, documentId, bodyEpoch: remote.bodyEpoch, vaultGeneration: this.vaultGeneration,
+			canonicalContent: ownedBuffer(authoritativeCanonical),
+			contentHash: remote.contentHash, durableGeneration: remote.generation,
+			serverContentHash: remote.contentHash,
+			diskFingerprint: { bytes: authoritativeCanonical.byteLength, hash: remote.contentHash },
+			pathAtSettlement: path,
+			localSettlementRevision: (previousSettlement?.localSettlementRevision ?? 0) + 1,
+			settledAt: this.now(),
+		};
+		const pendingLifecycle = (await this.persistence.listCanvasLifecycle())
+			.filter((operation) => operation.documentId === documentId);
+		const lifecycle: StoredCanvasLifecycle[] = [];
+		for (const operation of pendingLifecycle) {
+			// Probe the immutable old request before changing its identity.  A
+			// response-lost commit replays its exact receipt; only a typed epoch fence
+			// proves that the old operation is absent and therefore safe to replan.
+			if (await this.probeLifecycleBeforeSemanticReplacement(operation)) continue;
+			const rebound = await this.replanLifecycleForSemanticReplacement(
+				operation, remote, candidate, mergedCanonical,
+			);
+			if (rebound) lifecycle.push(rebound);
+		}
+		const replacement: StoredCanvasEpochReplacement = {
+			document: { kind: "semantic", documentId, bodyEpoch: remote.bodyEpoch,
+				generation: remote.generation, encodedState: ownedBuffer(encodedState), dirty: candidate !== null,
+				updatedAt: this.now() },
+			settlement: nextSettlement,
+			candidate,
+			lifecycle,
+		};
+		if (!this.current(resident, proof)) { nextDoc.destroy(); return; }
+		const staleCandidates = (await this.persistence.listCanvasCandidates())
+			.filter((stored) => stored.documentId === documentId);
+		if (!this.current(resident, proof)) { nextDoc.destroy(); return; }
+		await this.persistence.replaceCanvasSemanticEpoch(replacement);
+		for (const stale of staleCandidates) this.clearRetry(`candidate:${stale.candidateId}`);
+		for (const operation of replacement.lifecycle) this.clearRetry(`lifecycle:${operation.operationId}`);
+		const consumers = [...(this.liveSessions.get(documentId)?.consumers ?? [])];
+		this.closeLiveSession(documentId);
+		const previousDoc = resident.doc;
+		resident.doc = nextDoc;
+		resident.bodyEpoch = remote.bodyEpoch;
+		resident.generation = remote.generation;
+		resident.encodedBytes = encodedState.byteLength;
+		resident.lastUsedAt = this.now();
+		resident.revision++;
+		previousDoc.destroy();
+		if (candidate) this.pendingDocuments.add(documentId);
+		else this.pendingDocuments.delete(documentId);
+		// Do not start rebound lifecycle work until the resident epoch has moved
+		// with the atomic disk replacement.  This keeps in-process retries behind
+		// the same fence a restart would observe.
+		for (const operation of replacement.lifecycle) this.scheduleLifecycle(operation);
+		if (consumers.length > 0 && this.providerFactory) {
+			const session = this.createLiveSession(resident);
+			for (const consumerId of consumers) {
+				session.consumers.add(consumerId);
+				this.liveConsumers.set(consumerId, {
+					documentId,
+					revision: this.liveConsumerRevisions.get(consumerId) ?? 0,
+				});
+			}
+			if (!this.liveProvidersPaused) await session.provider.connect();
+		}
+		const formatted = formatCanvasBytes(merged.data);
+		try { await this.projection.write(path, formatted); }
+		catch (error) { this.pathStates.set(path, "degraded"); throw error; }
+		this.pathStates.set(path, merged.conflicts.length > 0 ? "conflict" : "semantic");
+		if (candidate) {
+			const receipt = await this.submit(candidate, resident);
+			const canonical = canonicalCanvasBytes(await materializeCanvasDocument(resident.doc));
+			await this.settle(resident, canonical, formatted, receipt.durableGeneration, receipt.contentHash);
+		}
 	}
 
 	private async runRefresh(documentId: string): Promise<void> {
@@ -437,6 +640,11 @@ export class CanvasManager {
 		const proof = { revision: resident.revision, path };
 		const remote = await this.transport.state(documentId);
 		if (!this.current(resident, proof)) return;
+		if (remote.bodyEpoch > resident.bodyEpoch) {
+			await this.recoverSemanticEpoch(documentId, remote.bodyEpoch, remote);
+			return;
+		}
+		if (remote.bodyEpoch < resident.bodyEpoch) throw new Error("Canvas state returned a stale semantic epoch");
 		Y.applyUpdate(resident.doc, remote.encodedState, "canvas-remote-state");
 		const validation = await validateCanvasDocument(resident.doc);
 		if (validation) throw new Error(validation);
@@ -454,7 +662,8 @@ export class CanvasManager {
 			}
 			const shared = await materializeCanvasDocument(resident.doc);
 			const settlement = await this.persistence.getCanvasSettlement(documentId);
-			const merged = mergeCanvasThreeWay(settlement ? this.parseSettlement(settlement) : null, shared, parsed.data);
+			const merged = mergeCanvasThreeWay(settlement?.bodyEpoch === resident.bodyEpoch
+				? this.parseSettlement(settlement) : null, shared, parsed.data);
 			if (merged.conflicts.length > 0 && !await this.projection.preserveConflict({ path, documentId, bytes: disk,
 				conflicts: merged.conflicts })) {
 				this.pathStates.set(path, "conflict");
@@ -505,10 +714,14 @@ export class CanvasManager {
 		this.closeLiveSession(documentId);
 	}
 
-	private async lifecycle(input: Omit<CanvasLifecycleRequest, "operationId" | "requestDigest">): Promise<void> {
+	private async lifecycle(input: Omit<CanvasLifecycleRequest, "operationId" | "requestDigest" | "bodyEpoch" | "rootEpoch">): Promise<void> {
 		const operationId = randomId(32);
-		const requestDigest = await sha256BytesHex(new TextEncoder().encode(JSON.stringify({ operationId, ...input })));
+		const bodyEpoch = await this.operationBodyEpoch(input.documentId);
+		const rootEpoch = parseSemanticEpoch(this.currentRootEpoch(), "Canvas lifecycle root epoch");
+		const requestDigest = await sha256BytesHex(new TextEncoder().encode(JSON.stringify({ operationId, ...input,
+			bodyEpoch, rootEpoch })));
 		const common = { operationId, requestDigest, documentId: input.documentId,
+			bodyEpoch, rootEpoch,
 			createdAt: this.now(), attempts: 0, lastAttemptAt: null };
 		const operation: StoredCanvasLifecycle = input.kind === "rename"
 			? { ...common, kind: "rename", fromPath: input.fromPath ?? "", toPath: input.toPath ?? "" }
@@ -516,7 +729,7 @@ export class CanvasManager {
 				: { ...common, kind: "delete" };
 		await this.persistence.putCanvasLifecycle(operation);
 		try { await this.submitLifecycle(operation); }
-		catch (error) { this.scheduleLifecycleRetry(operation); throw error; }
+		catch (error) { if (!(error instanceof CanvasLifecycleRetiredError)) this.scheduleLifecycleRetry(operation); throw error; }
 	}
 
 	private async submitLifecycle(operation: StoredCanvasLifecycle): Promise<CanvasLifecycleReceipt | CanvasAuthorityReceipt> {
@@ -528,34 +741,200 @@ export class CanvasManager {
 				: operation.kind === "demote" ? await this.submitDemotion(operation)
 				: await this.transport.lifecycle(operation.kind === "rename"
 					? { operationId: operation.operationId, requestDigest: operation.requestDigest,
-						documentId: operation.documentId, kind: "rename", fromPath: operation.fromPath, toPath: operation.toPath }
+						documentId: operation.documentId, bodyEpoch: operation.bodyEpoch, rootEpoch: operation.rootEpoch,
+						kind: "rename", fromPath: operation.fromPath, toPath: operation.toPath }
 					: operation.kind === "revive"
 						? { operationId: operation.operationId, requestDigest: operation.requestDigest,
-							documentId: operation.documentId, kind: "revive", path: operation.path }
+							documentId: operation.documentId, bodyEpoch: operation.bodyEpoch, rootEpoch: operation.rootEpoch,
+							kind: "revive", path: operation.path }
 						: { operationId: operation.operationId, requestDigest: operation.requestDigest,
-							documentId: operation.documentId, kind: "delete" });
+							documentId: operation.documentId, bodyEpoch: operation.bodyEpoch,
+							rootEpoch: operation.rootEpoch, kind: "delete" });
 			if (receipt.operationId !== operation.operationId || receipt.requestDigest !== operation.requestDigest
-				|| receipt.documentId !== operation.documentId) throw new Error("Canvas lifecycle receipt mismatch");
+				|| receipt.documentId !== operation.documentId || receipt.bodyEpoch !== operation.bodyEpoch
+				|| receipt.rootEpoch !== operation.rootEpoch) throw new Error("Canvas lifecycle receipt mismatch");
 			await this.persistence.deleteCanvasLifecycle(operation.operationId);
 			this.clearRetry(`lifecycle:${operation.operationId}`);
 			return receipt;
 		} catch (error) {
+			if (error instanceof CanvasSemanticEpochMismatchError) {
+				const rebound = await this.rebindLifecycleEpoch(operation, error);
+				if (!rebound) {
+					await this.persistence.deleteCanvasLifecycle(operation.operationId);
+					this.clearRetry(`lifecycle:${operation.operationId}`);
+					throw new CanvasLifecycleRetiredError(operation.kind, "its semantic identity is already occupied");
+				}
+				Object.assign(operation, rebound);
+				await this.persistence.putCanvasLifecycle(operation);
+				this.scheduleLifecycleRetry(operation);
+				throw new CanvasLifecycleReplannedError(operation.kind);
+			}
 			this.scheduleLifecycleRetry(operation);
 			throw error;
 		}
 	}
 
+	private async rebindLifecycleEpoch(operation: StoredCanvasLifecycle,
+		error: CanvasSemanticEpochMismatchError): Promise<StoredCanvasLifecycle | null> {
+		let bodyEpoch = operation.bodyEpoch;
+		let rootEpoch = operation.rootEpoch;
+		if (error.mismatch.purpose === "root") {
+			if (!this.recoverRootEpoch) throw error;
+			await this.recoverRootEpoch(error.mismatch.expectedEpoch);
+			rootEpoch = parseSemanticEpoch(this.currentRootEpoch(), "recovered Canvas root epoch");
+			if (rootEpoch < error.mismatch.expectedEpoch) throw new Error("Canvas root epoch recovery remained stale");
+		} else {
+			if (error.mismatch.documentId !== operation.documentId) throw error;
+			if (operation.kind === "promote") return null;
+			await this.recoverSemanticEpoch(operation.documentId, error.mismatch.expectedEpoch);
+			// Body recovery atomically replans or retires every lifecycle operation
+			// for this document. Read that decision back instead of rebuilding the
+			// old object: an unsafe demotion intentionally omitted from the
+			// replacement must stay retired rather than being resurrected here.
+			const replacement = (await this.persistence.listCanvasLifecycle())
+				.find((candidate) => candidate.operationId === operation.operationId);
+			if (!replacement) return null;
+			if (replacement.documentId !== operation.documentId
+				|| replacement.bodyEpoch < error.mismatch.expectedEpoch) {
+				throw new Error("Canvas body epoch recovery returned an invalid lifecycle replacement");
+			}
+			return replacement;
+		}
+		return { ...operation, bodyEpoch, rootEpoch,
+			requestDigest: await this.lifecycleRequestDigest(operation, bodyEpoch, rootEpoch),
+			attempts: 0, lastAttemptAt: null };
+	}
+
+	private async replanLifecycleForSemanticReplacement(operation: StoredCanvasLifecycle,
+		remote: CanvasState, candidate: StoredCanvasCandidate | null,
+		mergedCanonical: Uint8Array): Promise<StoredCanvasLifecycle | null> {
+		const rootEpoch = parseSemanticEpoch(this.currentRootEpoch(), "Canvas replacement root epoch");
+		if (operation.kind === "promote") {
+			// A remotely visible semantic document means this promotion identity is
+			// already occupied.  Replaying its epoch-one create update is unsafe.
+			return null;
+		}
+		if (operation.kind === "demote") {
+			// Demotion carries exact content bytes.  It can cross a history-only reset
+			// only when no semantic rebase candidate is pending and those bytes still
+			// identify the authoritative head.  Any content-changing reset retires it.
+			const semanticBytes = new Uint8Array(operation.semanticBytes);
+			if (candidate || semanticBytes.byteLength !== remote.size
+				|| mergedCanonical.byteLength !== remote.size
+				|| await sha256BytesHex(semanticBytes) !== remote.contentHash
+				|| await sha256BytesHex(mergedCanonical) !== remote.contentHash) return null;
+			const rebound: StoredCanvasLifecycle = {
+				...operation, bodyEpoch: remote.bodyEpoch, rootEpoch,
+				expectedGeneration: remote.generation, expectedContentHash: remote.contentHash,
+				expectedSize: remote.size, attempts: 0, lastAttemptAt: null,
+			};
+			return { ...rebound,
+				requestDigest: await this.lifecycleRequestDigest(rebound, rebound.bodyEpoch, rebound.rootEpoch) };
+		}
+		const rebound: StoredCanvasLifecycle = {
+			...operation, bodyEpoch: remote.bodyEpoch, rootEpoch, attempts: 0, lastAttemptAt: null,
+		};
+		return { ...rebound,
+			requestDigest: await this.lifecycleRequestDigest(rebound, rebound.bodyEpoch, rebound.rootEpoch) };
+	}
+
+	/** Returns true only when the server replayed an exact durable old-epoch receipt. */
+	private async probeLifecycleBeforeSemanticReplacement(operation: StoredCanvasLifecycle): Promise<boolean> {
+		try {
+			const receipt = operation.kind === "promote"
+				? await this.transport.promote?.({
+					operationId: operation.operationId, requestDigest: operation.requestDigest,
+					path: operation.path, documentId: operation.documentId,
+					bodyEpoch: operation.bodyEpoch, rootEpoch: operation.rootEpoch,
+					sourceRevision: operation.sourceRevision, sourceHash: operation.sourceHash,
+					sourceSize: operation.sourceSize, contentHash: operation.contentHash,
+					contentSize: operation.contentSize, candidateDigest: operation.candidateDigest,
+					encodedUpdate: operation.encodedUpdate.slice(0),
+				})
+				: operation.kind === "demote"
+					? await this.probeDemotion(operation)
+					: await this.transport.lifecycle(operation.kind === "rename"
+						? { operationId: operation.operationId, requestDigest: operation.requestDigest,
+							documentId: operation.documentId, bodyEpoch: operation.bodyEpoch,
+							rootEpoch: operation.rootEpoch, kind: "rename",
+							fromPath: operation.fromPath, toPath: operation.toPath }
+						: operation.kind === "revive"
+							? { operationId: operation.operationId, requestDigest: operation.requestDigest,
+								documentId: operation.documentId, bodyEpoch: operation.bodyEpoch,
+								rootEpoch: operation.rootEpoch, kind: "revive", path: operation.path }
+							: { operationId: operation.operationId, requestDigest: operation.requestDigest,
+								documentId: operation.documentId, bodyEpoch: operation.bodyEpoch,
+								rootEpoch: operation.rootEpoch, kind: "delete" });
+			if (!receipt || receipt.operationId !== operation.operationId
+				|| receipt.requestDigest !== operation.requestDigest
+				|| receipt.documentId !== operation.documentId
+				|| receipt.bodyEpoch !== operation.bodyEpoch
+				|| receipt.rootEpoch !== operation.rootEpoch) {
+				throw new Error("Canvas lifecycle outcome replay mismatch");
+			}
+			return true;
+		} catch (error) {
+			if (!(error instanceof CanvasSemanticEpochMismatchError)) throw error;
+			const mismatch = error.mismatch;
+			const provesOldRequestAbsent = mismatch.purpose === "body"
+				? mismatch.documentId === operation.documentId && mismatch.receivedEpoch === operation.bodyEpoch
+				: mismatch.documentId === "root" && mismatch.receivedEpoch === operation.rootEpoch;
+			if (!provesOldRequestAbsent) throw error;
+			return false;
+		}
+	}
+
+	private async probeDemotion(operation: Extract<StoredCanvasLifecycle, { kind: "demote" }>): Promise<CanvasAuthorityReceipt> {
+		if (!this.transport.demote || !this.transport.uploadBlob) {
+			throw new Error("Canvas demotion outcome recovery is unavailable");
+		}
+		await this.transport.uploadBlob(operation.blobHash, operation.semanticBytes.slice(0), operation.mime);
+		return this.transport.demote({ operationId: operation.operationId,
+			requestDigest: operation.requestDigest, documentId: operation.documentId, path: operation.path,
+			bodyEpoch: operation.bodyEpoch, rootEpoch: operation.rootEpoch,
+			expectedGeneration: operation.expectedGeneration,
+			expectedContentHash: operation.expectedContentHash, expectedSize: operation.expectedSize,
+			blobHash: operation.blobHash, blobSize: operation.blobSize, mime: operation.mime });
+	}
+
+	private async lifecycleRequestDigest(operation: StoredCanvasLifecycle, bodyEpoch: SemanticEpoch,
+		rootEpoch: SemanticEpoch): Promise<string> {
+		let identity: Record<string, unknown>;
+		if (operation.kind === "promote") identity = {
+			operationId: operation.operationId, path: operation.path, documentId: operation.documentId,
+			sourceRevision: operation.sourceRevision, sourceHash: operation.sourceHash, sourceSize: operation.sourceSize,
+			contentHash: operation.contentHash, contentSize: operation.contentSize,
+			candidateDigest: operation.candidateDigest, bodyEpoch, rootEpoch,
+		};
+		else if (operation.kind === "demote") identity = {
+			operationId: operation.operationId, documentId: operation.documentId, path: operation.path,
+			generation: operation.expectedGeneration, contentHash: operation.expectedContentHash,
+			size: operation.expectedSize, bodyEpoch, rootEpoch,
+		};
+		else identity = operation.kind === "rename"
+			? { operationId: operation.operationId, documentId: operation.documentId, kind: operation.kind,
+				fromPath: operation.fromPath, toPath: operation.toPath, bodyEpoch, rootEpoch }
+			: operation.kind === "revive"
+				? { operationId: operation.operationId, documentId: operation.documentId, kind: operation.kind,
+					path: operation.path, bodyEpoch, rootEpoch }
+				: { operationId: operation.operationId, documentId: operation.documentId, kind: operation.kind,
+					bodyEpoch, rootEpoch };
+		return sha256BytesHex(new TextEncoder().encode(JSON.stringify(identity)));
+	}
+
 	private async submitPromotion(operation: Extract<StoredCanvasLifecycle, { kind: "promote" }>): Promise<CanvasAuthorityReceipt> {
 		if (!this.transport.promote) throw new Error("Canvas promotion is unavailable");
-		const update = decodeBase64(operation.encodedUpdateBase64);
-		const sourceBytes = decodeBase64(operation.sourceBytesBase64);
+		const update = new Uint8Array(operation.encodedUpdate);
+		const sourceBytes = new Uint8Array(operation.sourceBytes);
 		const receipt = await this.transport.promote({ operationId: operation.operationId,
 			requestDigest: operation.requestDigest, path: operation.path, documentId: operation.documentId,
+			bodyEpoch: operation.bodyEpoch, rootEpoch: operation.rootEpoch,
 			sourceRevision: operation.sourceRevision, sourceHash: operation.sourceHash, sourceSize: operation.sourceSize,
 			contentHash: operation.contentHash, contentSize: operation.contentSize,
 			candidateDigest: operation.candidateDigest, encodedUpdate: ownedBuffer(update) });
 		if (receipt.operationId !== operation.operationId || receipt.requestDigest !== operation.requestDigest
 			|| receipt.kind !== "promote" || receipt.documentId !== operation.documentId
+			|| receipt.bodyEpoch !== operation.bodyEpoch || receipt.rootEpoch !== operation.rootEpoch
 			|| receipt.path !== operation.path || receipt.contentHash !== operation.contentHash
 			|| receipt.rollbackBlobHash !== operation.sourceHash) throw new Error("Canvas promotion receipt mismatch");
 		let resident = this.residents.get(operation.documentId);
@@ -563,6 +942,7 @@ export class CanvasManager {
 			const doc = new Y.Doc({ guid: operation.documentId });
 			Y.applyUpdate(doc, update, "canvas-promotion-replay");
 			resident = { documentId: operation.documentId, path: operation.path, doc,
+				bodyEpoch: INITIAL_SEMANTIC_EPOCH,
 				generation: receipt.documentGeneration, revision: 1, lastUsedAt: this.now(), encodedBytes: update.byteLength };
 			this.residents.set(operation.documentId, resident);
 		} else {
@@ -583,15 +963,17 @@ export class CanvasManager {
 
 	private async submitDemotion(operation: Extract<StoredCanvasLifecycle, { kind: "demote" }>): Promise<CanvasAuthorityReceipt> {
 		if (!this.transport.demote || !this.transport.uploadBlob) throw new Error("Canvas demotion is unavailable");
-		const bytes = decodeBase64(operation.semanticBytesBase64);
+		const bytes = new Uint8Array(operation.semanticBytes);
 		await this.transport.uploadBlob(operation.blobHash, ownedBuffer(bytes), operation.mime);
 		const receipt = await this.transport.demote({ operationId: operation.operationId,
 			requestDigest: operation.requestDigest, documentId: operation.documentId, path: operation.path,
+			bodyEpoch: operation.bodyEpoch, rootEpoch: operation.rootEpoch,
 			expectedGeneration: operation.expectedGeneration, expectedContentHash: operation.expectedContentHash,
 			expectedSize: operation.expectedSize, blobHash: operation.blobHash, blobSize: operation.blobSize,
 			mime: operation.mime });
 		if (receipt.operationId !== operation.operationId || receipt.requestDigest !== operation.requestDigest
 			|| receipt.kind !== "demote" || receipt.documentId !== operation.documentId
+			|| receipt.bodyEpoch !== operation.bodyEpoch || receipt.rootEpoch !== operation.rootEpoch
 			|| receipt.path !== operation.path || receipt.contentHash !== operation.expectedContentHash) {
 			throw new Error("Canvas demotion receipt mismatch");
 		}
@@ -607,12 +989,20 @@ export class CanvasManager {
 		return receipt;
 	}
 
+	private async operationBodyEpoch(documentId: string): Promise<SemanticEpoch> {
+		const resident = this.residents.get(documentId);
+		if (resident) return resident.bodyEpoch;
+		const stored = await this.persistence.getDocument(documentId);
+		if (stored?.kind === "semantic") return stored.bodyEpoch;
+		return (await this.transport.state(documentId)).bodyEpoch;
+	}
+
 	private async create(path: string, data: CanvasSemanticData): Promise<void> {
 		const documentId = randomId(32);
 		const doc = createCanvasDocument(data);
 		const validation = await validateCanvasDocument(doc);
 		if (validation) { doc.destroy(); throw new Error(validation); }
-		const resident = { documentId, path, doc, generation: 0, revision: 1,
+		const resident = { documentId, path, doc, bodyEpoch: INITIAL_SEMANTIC_EPOCH, generation: 0, revision: 1,
 			lastUsedAt: this.now(), encodedBytes: Y.encodeStateAsUpdate(doc).byteLength };
 		this.residents.set(documentId, resident);
 		this.pathToDocument.set(path, documentId);
@@ -630,15 +1020,24 @@ export class CanvasManager {
 		if (existing) { existing.lastUsedAt = this.now(); return existing; }
 		this.evictIfNeeded(documentId);
 		const stored = await this.persistence.getDocument(documentId);
+		if (stored && stored.kind !== "semantic") throw new Error("Canvas cache has non-semantic epoch metadata");
 		const doc = new Y.Doc({ guid: documentId });
-		if (stored) Y.applyUpdate(doc, new Uint8Array(stored.encodedState), "canvas-local-load");
+		let bodyEpoch: SemanticEpoch;
+		let generation: number;
+		if (stored) {
+			bodyEpoch = parseSemanticEpoch(stored.bodyEpoch, "stored Canvas body epoch");
+			generation = stored.generation;
+			Y.applyUpdate(doc, new Uint8Array(stored.encodedState), "canvas-local-load");
+		}
 		else {
 			const remote = await this.transport.state(documentId);
+			bodyEpoch = remote.bodyEpoch;
+			generation = remote.generation;
 			Y.applyUpdate(doc, remote.encodedState, "canvas-remote-load");
 		}
 		const validation = await validateCanvasDocument(doc);
 		if (validation) { doc.destroy(); throw new Error(validation); }
-		const resident = { documentId, path, doc, generation: stored?.generation ?? 0, revision: 1,
+		const resident = { documentId, path, doc, bodyEpoch, generation, revision: 1,
 			lastUsedAt: this.now(), encodedBytes: Y.encodeStateAsUpdate(doc).byteLength };
 		this.residents.set(documentId, resident);
 		return resident;
@@ -657,12 +1056,19 @@ export class CanvasManager {
 		const update = updates.length === 1 ? updates[0]! : Y.mergeUpdates(updates);
 		await this.persist(resident, true);
 		const candidate = await this.persistCandidate(resident.documentId, update);
-		return this.submit(candidate, resident);
+		try { return await this.submit(candidate, resident); }
+		catch (error) {
+			if (error instanceof CanvasEpochRecoveredError) return null;
+			throw error;
+		}
 	}
 
 	private async persistCandidate(documentId: string, update: Uint8Array,
 		creation: Pick<StoredCanvasCandidate, "createPath" | "operationId" | "operationDigest"> = {}): Promise<StoredCanvasCandidate> {
+		const resident = this.residents.get(documentId);
+		if (!resident) throw new Error("Canvas candidate requires a resident document");
 		const candidate: StoredCanvasCandidate = { candidateId: randomId(32), documentId,
+			bodyEpoch: resident.bodyEpoch,
 			candidateDigest: await sha256BytesHex(update), encodedUpdate: ownedBuffer(update), capturedAt: this.now(),
 			attempts: 0, lastAttemptAt: null, ...creation };
 		await this.persistence.putCanvasCandidate(candidate);
@@ -690,13 +1096,19 @@ export class CanvasManager {
 	}
 
 	private async submit(candidate: StoredCanvasCandidate, resident: ResidentCanvas): Promise<CanvasCandidateReceipt> {
+		if (candidate.bodyEpoch !== resident.bodyEpoch) {
+			await this.persistence.deleteCanvasCandidate(candidate.candidateId);
+			this.clearRetry(`candidate:${candidate.candidateId}`);
+			throw new Error("stale Canvas candidate semantic epoch");
+		}
 		candidate.attempts++;
 		candidate.lastAttemptAt = this.now();
 		await this.persistence.putCanvasCandidate(candidate);
 		try {
 			const receipt = await this.transport.submit(candidate);
 			if (receipt.candidateId !== candidate.candidateId || receipt.candidateDigest !== candidate.candidateDigest
-				|| receipt.documentId !== candidate.documentId) throw new Error("Canvas candidate receipt mismatch");
+				|| receipt.documentId !== candidate.documentId || receipt.bodyEpoch !== candidate.bodyEpoch
+				|| resident.bodyEpoch !== candidate.bodyEpoch) throw new Error("Canvas candidate receipt mismatch");
 			resident.generation = Math.max(resident.generation, receipt.durableGeneration);
 			await this.persistence.deleteCanvasCandidate(candidate.candidateId);
 			this.clearRetry(`candidate:${candidate.candidateId}`);
@@ -708,7 +1120,13 @@ export class CanvasManager {
 			}
 			return receipt;
 		} catch (error) {
-			this.scheduleCandidateRetry(candidate);
+			if (error instanceof CanvasSemanticEpochMismatchError
+				&& error.mismatch.expectedEpoch > candidate.bodyEpoch
+				&& !this.epochRecoveries.has(candidate.documentId)) {
+				await this.recoverSemanticEpoch(candidate.documentId, error.mismatch.expectedEpoch);
+				throw new CanvasEpochRecoveredError();
+			}
+			if (resident.bodyEpoch === candidate.bodyEpoch) this.scheduleCandidateRetry(candidate);
 			throw error;
 		}
 	}
@@ -741,7 +1159,8 @@ export class CanvasManager {
 		const encoded = Y.encodeStateAsUpdate(resident.doc);
 		resident.encodedBytes = encoded.byteLength;
 		resident.lastUsedAt = this.now();
-		await this.persistence.putDocument({ documentId: resident.documentId, generation: resident.generation,
+		await this.persistence.putDocument({ kind: "semantic", documentId: resident.documentId,
+			bodyEpoch: resident.bodyEpoch, generation: resident.generation,
 			encodedState: ownedBuffer(encoded), dirty, updatedAt: this.now() });
 	}
 
@@ -755,6 +1174,7 @@ export class CanvasManager {
 		const current = await this.persistence.getCanvasSettlement(resident.documentId);
 		const contentHash = await sha256BytesHex(canonical);
 		const settlement: StoredCanvasSettlement = { format: 1, documentId: resident.documentId,
+			bodyEpoch: resident.bodyEpoch,
 			vaultGeneration: this.vaultGeneration, canonicalContent: ownedBuffer(canonical), contentHash,
 			durableGeneration, serverContentHash, diskFingerprint: { bytes: disk.byteLength, hash: await sha256BytesHex(disk) },
 			pathAtSettlement: resident.path, localSettlementRevision: (current?.localSettlementRevision ?? 0) + 1,
@@ -795,7 +1215,7 @@ export class CanvasManager {
 
 	private createLiveSession(resident: ResidentCanvas): CanvasLiveSession {
 		if (!this.providerFactory) throw new Error("Canvas live provider is unavailable");
-		const provider = this.providerFactory(resident.documentId, resident.doc);
+		const provider = this.providerFactory(resident.documentId, resident.bodyEpoch, resident.doc);
 		let session!: CanvasLiveSession;
 		const updateObserver = (_update: Uint8Array, origin: unknown): void => {
 			if (origin !== provider.documentOrigin || this.disposed) return;
@@ -814,6 +1234,14 @@ export class CanvasManager {
 			}
 		});
 		provider.on("custom-message", (payload) => {
+			let reset = null;
+			try { reset = parseSemanticEpochResetFrame(JSON.parse(payload)); }
+			catch { reset = null; }
+			if (reset?.purpose === "body" && reset.documentId === resident.documentId
+				&& reset.receivedEpoch === resident.bodyEpoch && reset.expectedEpoch > resident.bodyEpoch) {
+				void this.recoverSemanticEpoch(resident.documentId, reset.expectedEpoch).catch(() => undefined);
+				return;
+			}
 			if (semanticCommitMatches(payload, resident.documentId)) {
 				void this.refresh(resident.documentId).catch(() => undefined);
 			}
@@ -857,7 +1285,8 @@ export class CanvasManager {
 			}
 			const shared = await materializeCanvasDocument(resident.doc);
 			const settlement = await this.persistence.getCanvasSettlement(resident.documentId);
-			const merged = mergeCanvasThreeWay(settlement ? this.parseSettlement(settlement) : null, shared, parsed.data);
+			const merged = mergeCanvasThreeWay(settlement?.bodyEpoch === resident.bodyEpoch
+				? this.parseSettlement(settlement) : null, shared, parsed.data);
 			if (merged.conflicts.length > 0 && !await this.projection.preserveConflict({ path: proof.path,
 				documentId: resident.documentId, bytes: local, conflicts: merged.conflicts })) {
 				this.pathStates.set(proof.path, "conflict");
@@ -895,7 +1324,7 @@ function estimateCanvasResident(resident: ResidentCanvas): { estimatedBytes: num
 	for (const node of nodes.values()) {
 		const text = node instanceof Y.Map ? node.get("text") : null;
 		if (!(text instanceof Y.Text)) continue;
-		const value = text.toString();
+		const value = text.toJSON();
 		textCodeUnits += value.length;
 		textUtf8Bytes += new TextEncoder().encode(value).byteLength;
 	}

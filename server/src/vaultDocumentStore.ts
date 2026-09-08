@@ -3,7 +3,13 @@ import { SCHEMA_VERSION, STORAGE_FORMAT_VERSION } from "./shared/productVersions
 import type { BodyLifecycle, CatalogHeadAtBoundary, SemanticCatalogHead } from "./vaultCatalogStore";
 import type { HistoryPin } from "./vaultBootstrapStore";
 import type { VaultActorContext, VaultRole } from "./collaboration";
-import { SQLITE_ROW_SAFE_BYTES } from "./shared/durableLimits";
+import { MAX_DURABLE_UPDATE_BYTES, SQLITE_ROW_SAFE_BYTES } from "./shared/durableLimits";
+import {
+	INITIAL_SEMANTIC_EPOCH,
+	nextSemanticEpoch,
+	parseSemanticEpoch,
+	type SemanticEpoch,
+} from "./shared/semanticEpoch";
 
 /**
  * Durable Object SQLite rows are limited to 2 MB. Durable updates are capped
@@ -11,7 +17,83 @@ import { SQLITE_ROW_SAFE_BYTES } from "./shared/durableLimits";
  * larger and are split into independently bounded binary rows.
  */
 export const SQLITE_BLOB_CHUNK_BYTES = SQLITE_ROW_SAFE_BYTES;
+/** Hard ceiling for checkpoint bytes retained solely by active history pins. */
+export const MAX_PIN_RETAINED_CHECKPOINT_BYTES = 128 * 1024 * 1024;
 export type DurableChunkValue = ArrayBuffer;
+
+const SHA256_INITIAL = new Uint32Array([
+	0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+	0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+]);
+const SHA256_ROUND = new Uint32Array([
+	0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+	0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+	0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+	0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+	0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+	0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+	0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+	0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+]);
+
+function rotateRight(value: number, bits: number): number {
+	return (value >>> bits) | (value << (32 - bits));
+}
+
+/** Synchronous, allocation-bounded SHA-256 for storage transactions. */
+function sha256HexSync(bytes: Uint8Array): string {
+	const state = SHA256_INITIAL.slice();
+	const words = new Uint32Array(64);
+	const processBlock = (block: Uint8Array): void => {
+		for (let index = 0; index < 16; index++) {
+			const offset = index * 4;
+			words[index] = ((block[offset]! << 24) | (block[offset + 1]! << 16)
+				| (block[offset + 2]! << 8) | block[offset + 3]!) >>> 0;
+		}
+		for (let index = 16; index < 64; index++) {
+			const a = words[index - 15]!;
+			const b = words[index - 2]!;
+			const sigma0 = rotateRight(a, 7) ^ rotateRight(a, 18) ^ (a >>> 3);
+			const sigma1 = rotateRight(b, 17) ^ rotateRight(b, 19) ^ (b >>> 10);
+			words[index] = (words[index - 16]! + sigma0 + words[index - 7]! + sigma1) >>> 0;
+		}
+		let [a, b, c, d, e, f, g, h] = state;
+		for (let index = 0; index < 64; index++) {
+			const sum1 = rotateRight(e!, 6) ^ rotateRight(e!, 11) ^ rotateRight(e!, 25);
+			const choice = (e! & f!) ^ (~e! & g!);
+			const temp1 = (h! + sum1 + choice + SHA256_ROUND[index]! + words[index]!) >>> 0;
+			const sum0 = rotateRight(a!, 2) ^ rotateRight(a!, 13) ^ rotateRight(a!, 22);
+			const majority = (a! & b!) ^ (a! & c!) ^ (b! & c!);
+			const temp2 = (sum0 + majority) >>> 0;
+			h = g; g = f; f = e; e = (d! + temp1) >>> 0;
+			d = c; c = b; b = a; a = (temp1 + temp2) >>> 0;
+		}
+		state[0] = (state[0]! + a!) >>> 0; state[1] = (state[1]! + b!) >>> 0;
+		state[2] = (state[2]! + c!) >>> 0; state[3] = (state[3]! + d!) >>> 0;
+		state[4] = (state[4]! + e!) >>> 0; state[5] = (state[5]! + f!) >>> 0;
+		state[6] = (state[6]! + g!) >>> 0; state[7] = (state[7]! + h!) >>> 0;
+	};
+	let offset = 0;
+	while (offset + 64 <= bytes.byteLength) {
+		processBlock(bytes.subarray(offset, offset + 64));
+		offset += 64;
+	}
+	const remainder = bytes.byteLength - offset;
+	const tail = new Uint8Array(remainder < 56 ? 64 : 128);
+	tail.set(bytes.subarray(offset));
+	tail[remainder] = 0x80;
+	const bitHigh = Math.floor(bytes.byteLength / 0x20000000);
+	const bitLow = (bytes.byteLength << 3) >>> 0;
+	const lengthOffset = tail.byteLength - 8;
+	tail[lengthOffset] = bitHigh >>> 24; tail[lengthOffset + 1] = bitHigh >>> 16;
+	tail[lengthOffset + 2] = bitHigh >>> 8; tail[lengthOffset + 3] = bitHigh;
+	tail[lengthOffset + 4] = bitLow >>> 24; tail[lengthOffset + 5] = bitLow >>> 16;
+	tail[lengthOffset + 6] = bitLow >>> 8; tail[lengthOffset + 7] = bitLow;
+	for (let tailOffset = 0; tailOffset < tail.byteLength; tailOffset += 64) {
+		processBlock(tail.subarray(tailOffset, tailOffset + 64));
+	}
+	return [...state].map((word) => word.toString(16).padStart(8, "0")).join("");
+}
 
 interface SqlCursor<T> extends Iterable<T> {
 	toArray(): T[];
@@ -44,12 +126,13 @@ export interface VaultProvisioningResult extends VaultMetadata {
 export type VaultCommitKind = "root" | "body" | "semantic" | "semantic-create" | "semantic-rename"
 	| "semantic-delete" | "semantic-revive" | "semantic-promote" | "semantic-demote"
 	| "create" | "rename" | "delete" | "revive"
-	| "lifecycle-batch" | "blob" | "restore";
+	| "lifecycle-batch" | "blob" | "restore" | "semantic-reset";
 
 export interface DurableCommitResult {
 	vaultSequence: number;
 	documentId: string;
 	generation: number;
+	semanticEpoch: SemanticEpoch;
 	kind: VaultCommitKind;
 	rowsRead: number;
 	rowsWritten: number;
@@ -59,16 +142,46 @@ export interface ReconstructedDocument {
 	documentId: string;
 	throughSequence: number;
 	generation: number;
+	semanticEpoch: SemanticEpoch;
 	checkpointSequence: number;
 	journalUpdates: number;
 	doc: Y.Doc;
 	rowsRead: number;
 }
 
+export interface CheckpointExpectedHead {
+	throughSequence: number;
+	generation: number;
+	semanticEpoch: SemanticEpoch;
+}
+
+export interface CheckpointWriteResult {
+	status: "written";
+	checkpointSequence: number;
+	generation: number;
+	semanticEpoch: SemanticEpoch;
+	chunks: number;
+	totalBytes: number;
+	stateSha256: string;
+	rowsWritten: number;
+}
+
+export interface SemanticResetResult extends CheckpointWriteResult {
+	vaultSequence: number;
+	previousSemanticEpoch: SemanticEpoch;
+}
+
+export interface DurableSemanticCompactionState {
+	documentId: string;
+	lastCompactedAt: number | null;
+	postCompactionEncodedStateBytes: number | null;
+}
+
 export interface JournalFeedEntry {
 	sequence: number;
 	documentId: string;
 	generation: number;
+	documentEpoch: SemanticEpoch;
 	kind: VaultCommitKind;
 	catalogs: CatalogHeadAtBoundary[];
 	semanticCatalogs: SemanticCatalogHead[];
@@ -113,19 +226,6 @@ export interface VaultAuthorityFenceReceipt {
 	installedAt: number;
 }
 
-export interface VaultCollaborationMigrationReceipt {
-	migrationId: string;
-	vaultId: string;
-	vaultGeneration: string;
-	requestDigest: string;
-	subjectDigest: string;
-	rootSequence: number;
-	settingsAssignment: "owner_principal_scoped";
-	settingsEnvironmentCount: number;
-	historyAttribution: "legacy_unattributed";
-	installedAt: number;
-}
-
 function ownedBuffer(bytes: Uint8Array): ArrayBuffer {
 	const buffer = new ArrayBuffer(bytes.byteLength);
 	new Uint8Array(buffer).set(bytes);
@@ -149,6 +249,119 @@ export function decodeSqlChunks(rows: Iterable<{ data: DurableChunkValue }>): Ui
 	return bytes;
 }
 
+interface CheckpointStorageRow extends Record<string, SqlStorageValue> {
+	checkpoint_sequence: number;
+	manifest_generation: number | null;
+	manifest_semantic_epoch: number | null;
+	chunk_count: number | null;
+	total_byte_length: number | null;
+	state_sha256: string | null;
+	complete: number | null;
+	chunk_generation: number | null;
+	chunk_semantic_epoch: number | null;
+	chunk_index: number | null;
+	chunk_byte_length: number | null;
+	chunk_sha256: string | null;
+	data: DurableChunkValue | null;
+}
+
+function checkpointIntegrityError(reason: string): Error {
+	return new Error(`checkpoint integrity failure: ${reason}`);
+}
+
+function decodeVerifiedCheckpoint(rows: CheckpointStorageRow[]): {
+	checkpointSequence: number;
+	generation: number;
+	semanticEpoch: SemanticEpoch;
+	bytes: Uint8Array;
+} | null {
+	if (rows.length === 0) return null;
+	const first = rows[0]!;
+	if (first.manifest_generation === null || first.manifest_semantic_epoch === null || first.chunk_count === null
+		|| first.total_byte_length === null || first.state_sha256 === null || first.complete !== 1) {
+		throw checkpointIntegrityError("missing or incomplete manifest");
+	}
+	if (!Number.isSafeInteger(first.checkpoint_sequence) || first.checkpoint_sequence < 0
+		|| !Number.isSafeInteger(first.manifest_generation) || first.manifest_generation < 0
+		|| !Number.isSafeInteger(first.manifest_semantic_epoch) || first.manifest_semantic_epoch < INITIAL_SEMANTIC_EPOCH
+		|| !Number.isSafeInteger(first.chunk_count) || first.chunk_count < 1
+		|| !Number.isSafeInteger(first.total_byte_length) || first.total_byte_length < 1
+		|| !/^[a-f0-9]{64}$/.test(first.state_sha256)) {
+		throw checkpointIntegrityError("invalid manifest metadata");
+	}
+	if (rows.length !== first.chunk_count) throw checkpointIntegrityError("chunk count mismatch");
+	const chunks: Array<{ data: DurableChunkValue }> = [];
+	let total = 0;
+	for (let index = 0; index < rows.length; index++) {
+		const row = rows[index]!;
+		if (row.checkpoint_sequence !== first.checkpoint_sequence
+			|| row.manifest_generation !== first.manifest_generation
+			|| row.manifest_semantic_epoch !== first.manifest_semantic_epoch
+			|| row.chunk_count !== first.chunk_count
+			|| row.total_byte_length !== first.total_byte_length
+			|| row.state_sha256 !== first.state_sha256 || row.complete !== 1) {
+			throw checkpointIntegrityError("inconsistent manifest metadata");
+		}
+		if (row.chunk_index !== index) throw checkpointIntegrityError("chunk indices are not contiguous");
+		if (row.chunk_generation !== first.manifest_generation) throw checkpointIntegrityError("chunk generation mismatch");
+		if (row.chunk_semantic_epoch !== first.manifest_semantic_epoch) throw checkpointIntegrityError("chunk semantic epoch mismatch");
+		if (row.data === null || row.chunk_byte_length === null || row.chunk_sha256 === null) {
+			throw checkpointIntegrityError("checkpoint chunk is missing");
+		}
+		const chunk = new Uint8Array(row.data);
+		if (chunk.byteLength < 1 || chunk.byteLength > SQLITE_BLOB_CHUNK_BYTES
+			|| chunk.byteLength !== row.chunk_byte_length) {
+			throw checkpointIntegrityError("chunk length mismatch");
+		}
+		if (!/^[a-f0-9]{64}$/.test(row.chunk_sha256) || sha256HexSync(chunk) !== row.chunk_sha256) {
+			throw checkpointIntegrityError("chunk digest mismatch");
+		}
+		total += chunk.byteLength;
+		chunks.push({ data: row.data });
+	}
+	if (total !== first.total_byte_length) throw checkpointIntegrityError("total byte length mismatch");
+	const bytes = decodeSqlChunks(chunks);
+	if (sha256HexSync(bytes) !== first.state_sha256) throw checkpointIntegrityError("state digest mismatch");
+	return {
+		checkpointSequence: first.checkpoint_sequence,
+		generation: first.manifest_generation,
+		semanticEpoch: parseSemanticEpoch(first.manifest_semantic_epoch),
+		bytes,
+	};
+}
+
+interface CheckpointSummaryRow extends Record<string, SqlStorageValue> {
+	checkpoint_sequence: number;
+	generation: number | null;
+	semantic_epoch: number | null;
+	chunk_count: number | null;
+	total_byte_length: number | null;
+	state_sha256: string | null;
+	complete: number | null;
+	physical_chunks: number;
+	physical_bytes: number;
+	first_index: number;
+	last_index: number;
+	minimum_chunk_epoch: number;
+	maximum_chunk_epoch: number;
+}
+
+function assertCheckpointSummary(row: CheckpointSummaryRow): void {
+	if (row.generation === null || row.semantic_epoch === null || row.chunk_count === null || row.total_byte_length === null
+		|| row.state_sha256 === null || row.complete !== 1) {
+		throw checkpointIntegrityError("missing or incomplete manifest");
+	}
+	if (!Number.isSafeInteger(row.chunk_count) || row.chunk_count < 1
+		|| !Number.isSafeInteger(row.semantic_epoch) || row.semantic_epoch < INITIAL_SEMANTIC_EPOCH
+		|| !Number.isSafeInteger(row.total_byte_length) || row.total_byte_length < 1
+		|| !/^[a-f0-9]{64}$/.test(row.state_sha256)
+		|| row.physical_chunks !== row.chunk_count || row.physical_bytes !== row.total_byte_length
+		|| row.first_index !== 0 || row.last_index !== row.chunk_count - 1
+		|| row.minimum_chunk_epoch !== row.semantic_epoch || row.maximum_chunk_epoch !== row.semantic_epoch) {
+		throw checkpointIntegrityError("manifest does not match physical chunks");
+	}
+}
+
 /** Document metadata, journal, reconstruction, checkpoint, and feed storage. */
 export abstract class VaultDocumentStore {
 	private initialized = false;
@@ -156,6 +369,11 @@ export abstract class VaultDocumentStore {
 	constructor(protected readonly storage: VaultStoragePort) {}
 
 	abstract activePins(now?: number): HistoryPin[];
+
+	/** Override only in bounded storage tests; production always uses the exported hard ceiling. */
+	protected historyPinRetainedCheckpointByteLimit(): number {
+		return MAX_PIN_RETAINED_CHECKPOINT_BYTES;
+	}
 
 	initialize(): void {
 		if (this.initialized) return;
@@ -173,34 +391,59 @@ export abstract class VaultDocumentStore {
 			CREATE TABLE IF NOT EXISTS vault_document_heads (
 				document_id TEXT PRIMARY KEY,
 				generation INTEGER NOT NULL,
+				semantic_epoch INTEGER NOT NULL CHECK(semantic_epoch >= 1),
 				latest_sequence INTEGER NOT NULL
+			);
+			CREATE TABLE IF NOT EXISTS vault_semantic_compaction_state (
+				document_id TEXT PRIMARY KEY,
+				last_compacted_at INTEGER CHECK(last_compacted_at IS NULL OR last_compacted_at >= 0),
+				post_compaction_encoded_state_bytes INTEGER
+					CHECK(post_compaction_encoded_state_bytes IS NULL OR post_compaction_encoded_state_bytes >= 0)
 			);
 			CREATE TABLE IF NOT EXISTS vault_journal (
 				sequence INTEGER PRIMARY KEY,
 				document_id TEXT NOT NULL,
 				generation INTEGER NOT NULL,
+				semantic_epoch INTEGER NOT NULL CHECK(semantic_epoch >= 1),
 				kind TEXT NOT NULL,
-				update_byte_length INTEGER NOT NULL,
+				update_byte_length INTEGER NOT NULL
+					CHECK(update_byte_length >= 0 AND update_byte_length <= ${MAX_DURABLE_UPDATE_BYTES}),
+				data BLOB NOT NULL
+					CHECK(typeof(data) = 'blob' AND length(data) = update_byte_length
+						AND length(data) <= ${MAX_DURABLE_UPDATE_BYTES}),
 				created_at INTEGER NOT NULL
 			);
 			CREATE INDEX IF NOT EXISTS vault_journal_document_sequence
 				ON vault_journal(document_id, sequence);
-			CREATE TABLE IF NOT EXISTS vault_journal_chunks (
-				sequence INTEGER NOT NULL,
-				chunk_index INTEGER NOT NULL,
-				data BLOB NOT NULL,
-				PRIMARY KEY(sequence, chunk_index)
-			);
 			CREATE TABLE IF NOT EXISTS vault_checkpoints (
 				document_id TEXT NOT NULL,
 				checkpoint_sequence INTEGER NOT NULL,
 				generation INTEGER NOT NULL,
+				semantic_epoch INTEGER NOT NULL CHECK(semantic_epoch >= 1),
 				chunk_index INTEGER NOT NULL,
-				data BLOB NOT NULL,
+				chunk_byte_length INTEGER NOT NULL CHECK(chunk_byte_length > 0 AND chunk_byte_length <= ${SQLITE_BLOB_CHUNK_BYTES}),
+				chunk_sha256 TEXT NOT NULL CHECK(length(chunk_sha256) = 64),
+				data BLOB NOT NULL
+					CHECK(typeof(data) = 'blob' AND length(data) = chunk_byte_length
+						AND length(data) <= ${SQLITE_BLOB_CHUNK_BYTES}),
 				PRIMARY KEY(document_id, checkpoint_sequence, chunk_index)
 			);
 			CREATE INDEX IF NOT EXISTS vault_checkpoint_lookup
 				ON vault_checkpoints(document_id, checkpoint_sequence DESC);
+			CREATE TABLE IF NOT EXISTS vault_checkpoint_manifests (
+				document_id TEXT NOT NULL,
+				checkpoint_sequence INTEGER NOT NULL,
+				generation INTEGER NOT NULL,
+				semantic_epoch INTEGER NOT NULL CHECK(semantic_epoch >= 1),
+				chunk_count INTEGER NOT NULL CHECK(chunk_count > 0),
+				total_byte_length INTEGER NOT NULL CHECK(total_byte_length > 0),
+				state_sha256 TEXT NOT NULL CHECK(length(state_sha256) = 64),
+				complete INTEGER NOT NULL CHECK(complete = 1),
+				created_at INTEGER NOT NULL,
+				PRIMARY KEY(document_id, checkpoint_sequence)
+			);
+			CREATE INDEX IF NOT EXISTS vault_checkpoint_manifest_lookup
+				ON vault_checkpoint_manifests(document_id, checkpoint_sequence DESC);
 			CREATE TABLE IF NOT EXISTS vault_catalog_events (
 				sequence INTEGER NOT NULL,
 				body_id TEXT NOT NULL,
@@ -209,6 +452,7 @@ export abstract class VaultDocumentStore {
 				previous_path TEXT,
 				lifecycle TEXT NOT NULL,
 				generation INTEGER NOT NULL,
+				body_epoch INTEGER NOT NULL CHECK(body_epoch >= 1),
 				content_hash TEXT,
 				size INTEGER,
 				mutation_index INTEGER NOT NULL,
@@ -256,8 +500,8 @@ export abstract class VaultDocumentStore {
 				id INTEGER PRIMARY KEY CHECK(id = 1),
 				vault_id TEXT NOT NULL,
 				vault_generation TEXT NOT NULL,
-				schema_version INTEGER NOT NULL CHECK(schema_version = 8),
-				storage_format_version INTEGER NOT NULL CHECK(storage_format_version = 3),
+				schema_version INTEGER NOT NULL CHECK(schema_version = ${SCHEMA_VERSION}),
+				storage_format_version INTEGER NOT NULL CHECK(storage_format_version = ${STORAGE_FORMAT_VERSION}),
 				provisioned_at INTEGER NOT NULL
 			);
 			CREATE TABLE IF NOT EXISTS vault_revoked_devices (
@@ -291,28 +535,6 @@ export abstract class VaultDocumentStore {
 				subject_digest TEXT NOT NULL,
 				installed_at INTEGER NOT NULL
 			);
-			CREATE TABLE IF NOT EXISTS vault_collaboration_migration_receipts (
-				migration_id TEXT PRIMARY KEY,
-				vault_id TEXT NOT NULL,
-				vault_generation TEXT NOT NULL,
-				request_digest TEXT NOT NULL,
-				subject_digest TEXT NOT NULL,
-				root_sequence INTEGER NOT NULL,
-				settings_assignment TEXT NOT NULL,
-				settings_environment_count INTEGER NOT NULL,
-				history_attribution TEXT NOT NULL,
-				installed_at INTEGER NOT NULL
-			);
-			CREATE TABLE IF NOT EXISTS vault_schema_migration_receipts (
-				migration_id TEXT PRIMARY KEY,
-				vault_id TEXT NOT NULL,
-				vault_generation TEXT NOT NULL,
-				from_schema INTEGER NOT NULL,
-				to_schema INTEGER NOT NULL,
-				root_sequence INTEGER NOT NULL,
-				root_state_hash TEXT NOT NULL,
-				completed_at INTEGER NOT NULL
-			);
 			CREATE TABLE IF NOT EXISTS vault_mutation_attribution (
 				sequence INTEGER NOT NULL,
 				mutation_index INTEGER NOT NULL,
@@ -344,6 +566,7 @@ export abstract class VaultDocumentStore {
 				client_id TEXT NOT NULL,
 				candidate_id TEXT NOT NULL,
 				candidate_digest TEXT NOT NULL,
+				body_epoch INTEGER NOT NULL CHECK(body_epoch >= 1),
 				durable_generation INTEGER NOT NULL,
 				vault_sequence INTEGER NOT NULL,
 				runtime_epoch TEXT NOT NULL,
@@ -352,6 +575,7 @@ export abstract class VaultDocumentStore {
 			);
 			CREATE TABLE IF NOT EXISTS vault_creation_candidates (
 				body_id TEXT PRIMARY KEY,
+				body_epoch INTEGER NOT NULL CHECK(body_epoch >= 1),
 				file_id TEXT NOT NULL,
 				path TEXT NOT NULL,
 				operation_id TEXT NOT NULL UNIQUE,
@@ -372,6 +596,7 @@ export abstract class VaultDocumentStore {
 				previous_path TEXT,
 				lifecycle TEXT NOT NULL,
 				generation INTEGER NOT NULL,
+				document_epoch INTEGER NOT NULL CHECK (document_epoch >= 1),
 				content_hash TEXT,
 				size INTEGER,
 				mutation_index INTEGER NOT NULL,
@@ -384,6 +609,7 @@ export abstract class VaultDocumentStore {
 				client_id TEXT NOT NULL,
 				candidate_id TEXT NOT NULL,
 				candidate_digest TEXT NOT NULL,
+				body_epoch INTEGER NOT NULL CHECK (body_epoch >= 1),
 				durable_generation INTEGER NOT NULL,
 				vault_sequence INTEGER NOT NULL,
 				runtime_epoch TEXT NOT NULL,
@@ -401,8 +627,10 @@ export abstract class VaultDocumentStore {
 				result_path TEXT NOT NULL,
 				result_lifecycle TEXT NOT NULL,
 				durable_generation INTEGER NOT NULL,
+				body_epoch INTEGER NOT NULL CHECK (body_epoch >= 1),
 				vault_sequence INTEGER NOT NULL,
 				root_generation INTEGER NOT NULL,
+				root_epoch INTEGER NOT NULL CHECK (root_epoch >= 1),
 				runtime_epoch TEXT NOT NULL,
 				created_at INTEGER NOT NULL
 			);
@@ -416,8 +644,10 @@ export abstract class VaultDocumentStore {
 				content_hash TEXT NOT NULL,
 				size INTEGER NOT NULL,
 				document_generation INTEGER NOT NULL,
+				body_epoch INTEGER NOT NULL CHECK (body_epoch >= 1),
 				root_sequence INTEGER NOT NULL,
 				root_generation INTEGER NOT NULL,
+				root_epoch INTEGER NOT NULL CHECK (root_epoch >= 1),
 				rollback_blob_hash TEXT,
 				runtime_epoch TEXT NOT NULL,
 				created_at INTEGER NOT NULL
@@ -434,6 +664,7 @@ export abstract class VaultDocumentStore {
 				operation_id TEXT PRIMARY KEY,
 				kind TEXT NOT NULL,
 				body_id TEXT NOT NULL,
+				body_epoch INTEGER NOT NULL CHECK(body_epoch >= 1),
 				file_id TEXT NOT NULL,
 				durable_generation INTEGER NOT NULL,
 				candidate_id TEXT,
@@ -451,6 +682,7 @@ export abstract class VaultDocumentStore {
 				lifecycle_sequence INTEGER NOT NULL,
 				root_sequence INTEGER NOT NULL,
 				root_generation INTEGER NOT NULL,
+				root_epoch INTEGER NOT NULL CHECK(root_epoch >= 1),
 				runtime_epoch TEXT NOT NULL,
 				created_at INTEGER NOT NULL
 			);
@@ -499,6 +731,7 @@ export abstract class VaultDocumentStore {
 				request_digest TEXT NOT NULL,
 				root_sequence INTEGER NOT NULL,
 				root_generation INTEGER NOT NULL,
+				root_epoch INTEGER NOT NULL CHECK(root_epoch >= 1),
 				created_at INTEGER NOT NULL
 			);
 			CREATE TABLE IF NOT EXISTS recovery_captures (
@@ -684,23 +917,6 @@ export abstract class VaultDocumentStore {
 		this.initialized = true;
 	}
 
-	protected insertJournalChunks(sequence: number, update: Uint8Array): number {
-		let chunkIndex = 0;
-		let rowsWritten = 0;
-		for (let offset = 0; offset < update.byteLength; offset += SQLITE_BLOB_CHUNK_BYTES) {
-			const chunk = update.subarray(offset, Math.min(offset + SQLITE_BLOB_CHUNK_BYTES, update.byteLength));
-			const write = this.storage.sql.exec(
-				"INSERT INTO vault_journal_chunks(sequence, chunk_index, data) VALUES (?, ?, ?)",
-				sequence,
-				chunkIndex++,
-				ownedBuffer(chunk),
-			);
-			write.toArray();
-			rowsWritten += write.rowsWritten;
-		}
-		return rowsWritten;
-	}
-
 	currentSequence(): number {
 		this.initialize();
 		return this.storage.sql.exec<{ sequence: number }>(
@@ -729,70 +945,6 @@ export abstract class VaultDocumentStore {
 			schemaVersion: row.schema_version,
 			storageFormatVersion: row.storage_format_version,
 			provisionedAt: row.provisioned_at,
-		} : null;
-	}
-
-	storedVaultSchemaVersion(): number | null {
-		this.initialize();
-		return this.storage.sql.exec<{ schema_version: number }>(
-			"SELECT schema_version FROM vault_meta WHERE id = 1",
-		).toArray()[0]?.schema_version ?? null;
-	}
-
-	storedVaultMetadata(): {
-		vaultId: string;
-		vaultGeneration: string;
-		schemaVersion: number;
-		storageFormatVersion: number;
-		provisionedAt: number;
-	} | null {
-		this.initialize();
-		const row = this.storage.sql.exec<{
-			vault_id: string;
-			vault_generation: string;
-			schema_version: number;
-			storage_format_version: number;
-			provisioned_at: number;
-		}>(`SELECT vault_id, vault_generation, schema_version,
-		          storage_format_version, provisioned_at
-		   FROM vault_meta WHERE id = 1`).toArray()[0];
-		return row ? {
-			vaultId: row.vault_id,
-			vaultGeneration: row.vault_generation,
-			schemaVersion: row.schema_version,
-			storageFormatVersion: row.storage_format_version,
-			provisionedAt: row.provisioned_at,
-		} : null;
-	}
-
-	collaborationMigrationReceipt(migrationId: string): VaultCollaborationMigrationReceipt | null {
-		this.initialize();
-		const row = this.storage.sql.exec<{
-			migration_id: string;
-			vault_id: string;
-			vault_generation: string;
-			request_digest: string;
-			subject_digest: string;
-			root_sequence: number;
-			settings_assignment: "owner_principal_scoped";
-			settings_environment_count: number;
-			history_attribution: "legacy_unattributed";
-			installed_at: number;
-		}>(`SELECT migration_id, vault_id, vault_generation, request_digest,
-		          subject_digest, root_sequence, settings_assignment,
-		          settings_environment_count, history_attribution, installed_at
-		   FROM vault_collaboration_migration_receipts WHERE migration_id = ?`, migrationId).toArray()[0];
-		return row ? {
-			migrationId: row.migration_id,
-			vaultId: row.vault_id,
-			vaultGeneration: row.vault_generation,
-			requestDigest: row.request_digest,
-			subjectDigest: row.subject_digest,
-			rootSequence: row.root_sequence,
-			settingsAssignment: row.settings_assignment,
-			settingsEnvironmentCount: row.settings_environment_count,
-			historyAttribution: row.history_attribution,
-			installedAt: row.installed_at,
 		} : null;
 	}
 
@@ -872,6 +1024,10 @@ export abstract class VaultDocumentStore {
 			|| principal.policyVersion !== actor.policyVersion
 			|| principal.capabilityDigest !== actor.capabilityDigest) return "authority_superseded";
 		return "allowed";
+	}
+
+	protected assertActorCurrent(actor: VaultActorContext): void {
+		if (this.validateActor(actor) !== "allowed") throw new Error("authority_superseded");
 	}
 
 	authorityFenceReceipt(changeId: string): VaultAuthorityFenceReceipt | null {
@@ -991,13 +1147,31 @@ export abstract class VaultDocumentStore {
 		).toArray()[0]?.generation ?? null;
 	}
 
-	documentHead(documentId: string): { generation: number; latestSequence: number } | null {
+	documentHead(documentId: string): { generation: number; semanticEpoch: SemanticEpoch; latestSequence: number } | null {
 		this.initialize();
-		const row = this.storage.sql.exec<{ generation: number; latest_sequence: number }>(
-			"SELECT generation, latest_sequence FROM vault_document_heads WHERE document_id = ?",
+		const row = this.storage.sql.exec<{ generation: number; semantic_epoch: number; latest_sequence: number }>(
+			"SELECT generation, semantic_epoch, latest_sequence FROM vault_document_heads WHERE document_id = ?",
 			documentId,
 		).toArray()[0];
-		return row ? { generation: row.generation, latestSequence: row.latest_sequence } : null;
+		return row ? {
+			generation: row.generation,
+			semanticEpoch: parseSemanticEpoch(row.semantic_epoch),
+			latestSequence: row.latest_sequence,
+		} : null;
+	}
+
+	semanticCompactionState(documentId: string): DurableSemanticCompactionState | null {
+		this.initialize();
+		const row = this.storage.sql.exec<{
+			document_id: string; last_compacted_at: number | null;
+			post_compaction_encoded_state_bytes: number | null;
+		}>(`SELECT document_id, last_compacted_at, post_compaction_encoded_state_bytes
+		   FROM vault_semantic_compaction_state WHERE document_id = ?`, documentId).toArray()[0];
+		return row ? {
+			documentId: row.document_id,
+			lastCompactedAt: row.last_compacted_at,
+			postCompactionEncodedStateBytes: row.post_compaction_encoded_state_bytes,
+		} : null;
 	}
 
 	documentJournalStats(documentId: string): { entries: number; bytes: number } {
@@ -1014,116 +1188,540 @@ export abstract class VaultDocumentStore {
 		this.initialize();
 		if (throughSequence < 0) throw new Error("throughSequence must be non-negative");
 		let rowsRead = 0;
-		const checkpointRows = this.storage.sql.exec<{
-			checkpoint_sequence: number; generation: number; chunk_index: number; data: DurableChunkValue;
-		}>(
-			`SELECT checkpoint_sequence, generation, chunk_index, data
-			 FROM vault_checkpoints
-			 WHERE document_id = ?
-			   AND checkpoint_sequence = (
-			     SELECT MAX(checkpoint_sequence) FROM vault_checkpoints
-			     WHERE document_id = ? AND checkpoint_sequence <= ?
+		const checkpointRows = this.storage.sql.exec<CheckpointStorageRow>(
+			`WITH target AS (
+			   SELECT MAX(checkpoint_sequence) AS checkpoint_sequence FROM (
+			     SELECT checkpoint_sequence FROM vault_checkpoints
+			      WHERE document_id = ? AND checkpoint_sequence <= ?
+			     UNION ALL
+			     SELECT checkpoint_sequence FROM vault_checkpoint_manifests
+			      WHERE document_id = ? AND checkpoint_sequence <= ?
 			   )
-			 ORDER BY chunk_index`,
-			documentId,
-			documentId,
-			throughSequence,
+			 )
+			 SELECT target.checkpoint_sequence,
+			        manifest.generation AS manifest_generation,
+			        manifest.semantic_epoch AS manifest_semantic_epoch, manifest.chunk_count,
+			        manifest.total_byte_length, manifest.state_sha256, manifest.complete,
+			        chunk.generation AS chunk_generation, chunk.semantic_epoch AS chunk_semantic_epoch, chunk.chunk_index,
+			        chunk.chunk_byte_length, chunk.chunk_sha256, chunk.data
+			 FROM target
+			 LEFT JOIN vault_checkpoint_manifests manifest
+			   ON manifest.document_id = ? AND manifest.checkpoint_sequence = target.checkpoint_sequence
+			 LEFT JOIN vault_checkpoints chunk
+			   ON chunk.document_id = ? AND chunk.checkpoint_sequence = target.checkpoint_sequence
+			 WHERE target.checkpoint_sequence IS NOT NULL
+			 ORDER BY chunk.chunk_index`,
+			documentId, throughSequence,
+			documentId, throughSequence,
+			documentId, documentId,
 		);
 		const checkpointChunks = checkpointRows.toArray();
 		rowsRead += checkpointRows.rowsRead;
-		const checkpoint = checkpointChunks[0];
-		const checkpointSequence = checkpoint?.checkpoint_sequence ?? 0;
+		const checkpoint = decodeVerifiedCheckpoint(checkpointChunks);
+		const checkpointSequence = checkpoint?.checkpointSequence ?? 0;
 		let generation = checkpoint?.generation ?? 0;
+		let semanticEpoch = checkpoint?.semanticEpoch ?? INITIAL_SEMANTIC_EPOCH;
 		const doc = new Y.Doc({ guid: documentId });
 		if (checkpoint) {
-			const checkpointBytes = decodeSqlChunks(checkpointChunks);
-			if (checkpointBytes.byteLength === 0) throw new Error("checkpoint chunks are missing");
-			Y.applyUpdate(doc, checkpointBytes, "checkpoint-load");
+			Y.applyUpdate(doc, checkpoint.bytes, "checkpoint-load");
 		}
 		const journal = this.storage.sql.exec<{
-			sequence: number; generation: number; update_byte_length: number;
-			chunk_index: number | null; data: DurableChunkValue | null;
+			sequence: number; generation: number; semantic_epoch: number;
+			update_byte_length: number; data: DurableChunkValue;
 		}>(
-			`SELECT j.sequence, j.generation, j.update_byte_length, c.chunk_index, c.data
-			 FROM vault_journal j
-			 LEFT JOIN vault_journal_chunks c ON c.sequence = j.sequence
-			 WHERE j.document_id = ? AND j.sequence > ? AND j.sequence <= ?
-			 ORDER BY j.sequence, c.chunk_index`,
+			`SELECT sequence, generation, semantic_epoch, update_byte_length, data
+			 FROM vault_journal
+			 WHERE document_id = ? AND sequence > ? AND sequence <= ?
+			 ORDER BY sequence`,
 			documentId,
 			checkpointSequence,
 			throughSequence,
 		);
 		let journalUpdates = 0;
-		let journalSequence: number | null = null;
-		let journalGeneration = 0;
-		let expectedBytes = 0;
-		let chunks: Array<{ data: DurableChunkValue }> = [];
-		const applyJournal = (): void => {
-			if (journalSequence === null) return;
-			const update = decodeSqlChunks(chunks);
-			if (update.byteLength !== expectedBytes) throw new Error("journal chunk length mismatch");
-			if (update.byteLength === 0) throw new Error("journal chunks are missing");
-			Y.applyUpdate(doc, update, "journal-load");
-			generation = journalGeneration;
-			journalUpdates++;
-		};
 		for (const row of journal) {
-			if (journalSequence !== row.sequence) {
-				applyJournal();
-				journalSequence = row.sequence;
-				journalGeneration = row.generation;
-				expectedBytes = row.update_byte_length;
-				chunks = [];
+			const update = new Uint8Array(row.data);
+			if (update.byteLength !== row.update_byte_length || update.byteLength === 0) {
+				throw new Error("journal update length mismatch");
 			}
-			if (row.data !== null) chunks.push({ data: row.data });
+			if (parseSemanticEpoch(row.semantic_epoch) !== semanticEpoch) {
+				throw new Error("journal crosses a semantic epoch without a checkpoint");
+			}
+			Y.applyUpdate(doc, update, "journal-load");
+			generation = row.generation;
+			journalUpdates++;
 		}
-		applyJournal();
 		rowsRead += journal.rowsRead;
-		return { documentId, throughSequence, generation, checkpointSequence, journalUpdates, doc, rowsRead };
+		return { documentId, throughSequence, generation, semanticEpoch, checkpointSequence, journalUpdates, doc, rowsRead };
 	}
 
-	writeCheckpoint(documentId: string, throughSequence = this.currentSequence()): {
-		status: "written";
-		checkpointSequence: number;
-		generation: number;
-		chunks: number;
-		rowsWritten: number;
-	} {
+	writeCheckpoint(documentId: string, throughSequence = this.currentSequence()): CheckpointWriteResult {
 		this.initialize();
-		const now = Date.now();
 		const reconstructed = this.reconstructDocument(documentId, throughSequence);
 		const encoded = Y.encodeStateAsUpdate(reconstructed.doc);
 		reconstructed.doc.destroy();
+		return this.persistCheckpoint(documentId, encoded, {
+			throughSequence,
+			generation: reconstructed.generation,
+			semanticEpoch: reconstructed.semanticEpoch,
+		}, false);
+	}
+
+	/** Checkpoints an already-resident authoritative document without reconstructing its history. */
+	writeCheckpointFromDocument(
+		documentId: string,
+		doc: Y.Doc,
+		expectedHead: CheckpointExpectedHead,
+	): CheckpointWriteResult {
+		this.initialize();
+		this.assertExactCheckpointHead(documentId, expectedHead);
+		return this.persistCheckpoint(documentId, Y.encodeStateAsUpdate(doc), expectedHead, true);
+	}
+
+	/** Persists an exact encoded authoritative state, fenced against the current durable document head. */
+	writeCheckpointFromEncodedState(
+		documentId: string,
+		encodedState: Uint8Array,
+		expectedHead: CheckpointExpectedHead,
+	): CheckpointWriteResult {
+		this.initialize();
+		this.assertExactCheckpointHead(documentId, expectedHead);
+		return this.persistCheckpoint(documentId, encodedState, expectedHead, true);
+	}
+
+	/**
+	 * Atomically abandons the current CRDT lineage and installs a caller-built,
+	 * fresh state. Content generation is deliberately unchanged; only semantic
+	 * identity and the durable sequence advance.
+	 */
+	semanticResetFromEncodedState(
+		documentId: string,
+		freshEncodedState: Uint8Array,
+		expectedHead: CheckpointExpectedHead,
+		now = Date.now(),
+	): SemanticResetResult {
+		this.initialize();
+		this.assertExactCheckpointHead(documentId, expectedHead);
+		if (freshEncodedState.byteLength < 1) throw new Error("invalid semantic reset state");
+		const semanticEpoch = nextSemanticEpoch(expectedHead.semanticEpoch);
+		const stateSha256 = sha256HexSync(freshEncodedState);
+		const chunks: Array<{ offset: number; byteLength: number; sha256: string }> = [];
+		for (let offset = 0; offset < freshEncodedState.byteLength; offset += SQLITE_BLOB_CHUNK_BYTES) {
+			const chunk = freshEncodedState.subarray(offset,
+				Math.min(freshEncodedState.byteLength, offset + SQLITE_BLOB_CHUNK_BYTES));
+			chunks.push({ offset, byteLength: chunk.byteLength, sha256: sha256HexSync(chunk) });
+		}
+		let sequence = 0;
 		let rowsWritten = 0;
-		let chunks = 0;
 		this.storage.transactionSync(() => {
-			for (let offset = 0; offset < encoded.byteLength || (offset === 0 && encoded.byteLength === 0); offset += SQLITE_BLOB_CHUNK_BYTES) {
-				const chunk = encoded.subarray(offset, Math.min(encoded.byteLength, offset + SQLITE_BLOB_CHUNK_BYTES));
-				const write = this.storage.sql.exec(
-					`INSERT INTO vault_checkpoints(document_id, checkpoint_sequence, generation, chunk_index, data)
-					 VALUES (?, ?, ?, ?, ?)`,
+			this.assertExactCheckpointHead(documentId, expectedHead);
+			if (documentId !== "root") {
+				const pendingCreation = this.storage.sql.exec<{ operation_id: string }>(
+					"SELECT operation_id FROM vault_creation_candidates WHERE body_id = ? LIMIT 1",
 					documentId,
-					throughSequence,
-					reconstructed.generation,
-					chunks,
+				).toArray()[0];
+				const unpublishedLifecycle = this.storage.sql.exec<{ operation_id: string }>(
+					`SELECT receipt.operation_id
+					   FROM vault_lifecycle_receipts receipt
+					   LEFT JOIN vault_lifecycle_publications publication
+					     ON publication.operation_id = receipt.operation_id
+					  WHERE receipt.body_id = ? AND publication.operation_id IS NULL
+					  LIMIT 1`,
+					documentId,
+				).toArray()[0];
+				if (pendingCreation || unpublishedLifecycle) {
+					throw new Error("semantic_reset_blocked_by_unpublished_lifecycle");
+				}
+			}
+			const clock = this.storage.sql.exec<{ sequence: number }>(
+				"UPDATE vault_clock SET sequence = sequence + 1 WHERE id = 1 RETURNING sequence",
+			);
+			sequence = clock.one().sequence;
+			rowsWritten += clock.rowsWritten;
+			const journal = this.storage.sql.exec(
+				`INSERT INTO vault_journal(sequence, document_id, generation, semantic_epoch, kind,
+				 update_byte_length, data, created_at) VALUES (?, ?, ?, ?, 'semantic-reset', 0, zeroblob(0), ?)`,
+				sequence, documentId, expectedHead.generation, semanticEpoch, now,
+			);
+			journal.toArray();
+			rowsWritten += journal.rowsWritten;
+			for (let index = 0; index < chunks.length; index++) {
+				const metadata = chunks[index]!;
+				const bytes = freshEncodedState.subarray(metadata.offset, metadata.offset + metadata.byteLength);
+				const write = this.storage.sql.exec(
+					`INSERT INTO vault_checkpoints(document_id, checkpoint_sequence, generation, semantic_epoch,
+					 chunk_index, chunk_byte_length, chunk_sha256, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+					documentId, sequence, expectedHead.generation, semanticEpoch,
+					index, metadata.byteLength, metadata.sha256, ownedBuffer(bytes),
+				);
+				write.toArray();
+				rowsWritten += write.rowsWritten;
+			}
+			const physical = this.storage.sql.exec<{
+				chunks: number; total_bytes: number; first_index: number; last_index: number;
+				minimum_epoch: number; maximum_epoch: number;
+			}>(`SELECT COUNT(*) AS chunks, COALESCE(SUM(length(data)), 0) AS total_bytes,
+			          COALESCE(MIN(chunk_index), -1) AS first_index,
+			          COALESCE(MAX(chunk_index), -1) AS last_index,
+			          COALESCE(MIN(semantic_epoch), -1) AS minimum_epoch,
+			          COALESCE(MAX(semantic_epoch), -1) AS maximum_epoch
+			   FROM vault_checkpoints WHERE document_id = ? AND checkpoint_sequence = ?`,
+				documentId, sequence).one();
+			if (physical.chunks !== chunks.length || physical.total_bytes !== freshEncodedState.byteLength
+				|| physical.first_index !== 0 || physical.last_index !== chunks.length - 1
+				|| physical.minimum_epoch !== semanticEpoch || physical.maximum_epoch !== semanticEpoch) {
+				throw checkpointIntegrityError("semantic reset checkpoint is incomplete");
+			}
+			const manifest = this.storage.sql.exec(
+				`INSERT INTO vault_checkpoint_manifests(document_id, checkpoint_sequence, generation,
+				 semantic_epoch, chunk_count, total_byte_length, state_sha256, complete, created_at)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)`,
+				documentId, sequence, expectedHead.generation, semanticEpoch,
+				chunks.length, freshEncodedState.byteLength, stateSha256, now,
+			);
+			manifest.toArray();
+			rowsWritten += manifest.rowsWritten;
+			this.assertActivePinRetainedCheckpointCapacity(now);
+			const head = this.storage.sql.exec(
+				`UPDATE vault_document_heads
+				 SET semantic_epoch = ?, latest_sequence = ?
+				 WHERE document_id = ? AND generation = ? AND semantic_epoch = ? AND latest_sequence = ?`,
+				semanticEpoch, sequence, documentId, expectedHead.generation,
+				expectedHead.semanticEpoch, expectedHead.throughSequence,
+			);
+			head.toArray();
+			if (head.rowsWritten !== 1) throw new Error("checkpoint head mismatch");
+			rowsWritten += head.rowsWritten;
+			if (documentId !== "root") {
+				// Publish the new body lineage as catalog authority in the same
+				// transaction. Catalog epochs must not be reconstructed from journal
+				// rows because retired history is intentionally prunable.
+				const catalog = this.storage.sql.exec(
+					`INSERT INTO vault_catalog_events(
+					 sequence, body_id, file_id, path, previous_path, lifecycle, generation,
+					 body_epoch, content_hash, size, mutation_index
+					)
+					SELECT ?, body_id, file_id, path, NULL, lifecycle, generation,
+					       ?, content_hash, size, 0
+					  FROM vault_catalog_events
+					 WHERE body_id = ?
+					 ORDER BY sequence DESC LIMIT 1`,
+					sequence, semanticEpoch, documentId,
+				);
+				catalog.toArray();
+				rowsWritten += catalog.rowsWritten;
+				const semanticCatalog = this.storage.sql.exec(
+					`INSERT INTO vault_semantic_catalog_events(
+					 sequence, document_id, file_id, kind, format, format_version, path,
+					 previous_path, lifecycle, generation, document_epoch, content_hash, size, mutation_index
+					)
+					SELECT ?, document_id, file_id, kind, format, format_version, path,
+					       NULL, lifecycle, generation, ?, content_hash, size, 0
+					  FROM vault_semantic_catalog_events
+					 WHERE document_id = ?
+					 ORDER BY sequence DESC LIMIT 1`,
+					sequence, semanticEpoch, documentId,
+				);
+				semanticCatalog.toArray();
+				rowsWritten += semanticCatalog.rowsWritten;
+			} else {
+				// The fresh root was rebuilt from SQL catalog authority, so every
+				// lifecycle receipt at-or-before that immutable boundary is now
+				// represented by this root lineage. Rebase both missing publications
+				// and existing exact-replay proofs to the new root epoch. The latter
+				// matters when a client crashed after server publication but before
+				// deleting its local queue: returning an old-epoch proof would make
+				// that otherwise exact retry immortal after root compaction.
+				const migratedPublications = this.storage.sql.exec(
+					`INSERT INTO vault_lifecycle_publications(
+					 operation_id, lifecycle_sequence, root_sequence, root_generation,
+					 root_epoch, runtime_epoch, created_at
+					)
+					SELECT receipt.operation_id, receipt.vault_sequence, ?, ?, ?,
+					       receipt.runtime_epoch, ?
+					  FROM vault_lifecycle_receipts receipt
+					 WHERE receipt.vault_sequence <= ?
+					 ON CONFLICT(operation_id) DO UPDATE SET
+					   lifecycle_sequence=excluded.lifecycle_sequence,
+					   root_sequence=excluded.root_sequence,
+					   root_generation=excluded.root_generation,
+					   root_epoch=excluded.root_epoch,
+					   runtime_epoch=excluded.runtime_epoch,
+					   created_at=excluded.created_at`,
+					sequence,
+					expectedHead.generation,
+					semanticEpoch,
+					now,
+					expectedHead.throughSequence,
+				);
+				migratedPublications.toArray();
+				rowsWritten += migratedPublications.rowsWritten;
+			}
+			const compactionState = this.storage.sql.exec(`INSERT INTO vault_semantic_compaction_state(
+			 document_id, last_compacted_at, post_compaction_encoded_state_bytes
+			) VALUES (?, ?, ?)
+			ON CONFLICT(document_id) DO UPDATE SET
+			 last_compacted_at=excluded.last_compacted_at,
+			 post_compaction_encoded_state_bytes=excluded.post_compaction_encoded_state_bytes`,
+				documentId, now, freshEncodedState.byteLength);
+			compactionState.toArray();
+			rowsWritten += compactionState.rowsWritten;
+			rowsWritten += this.pruneUnpinnedDocumentHistory(now, documentId);
+		});
+		return {
+			status: "written",
+			vaultSequence: sequence,
+			checkpointSequence: sequence,
+			generation: expectedHead.generation,
+			previousSemanticEpoch: expectedHead.semanticEpoch,
+			semanticEpoch,
+			chunks: chunks.length,
+			totalBytes: freshEncodedState.byteLength,
+			stateSha256,
+			rowsWritten,
+		};
+	}
+
+	/**
+	 * Retire storage which belongs to an abandoned semantic lineage.  An active
+	 * history pin protects the exact recipe needed at its boundary: the newest
+	 * complete checkpoint at-or-before the boundary and every later journal row
+	 * through that boundary.  Pins after a reset therefore do not accidentally
+	 * retain the older lineage.
+	 *
+	 * Current-lineage checkpoints keep the ordinary three-generation safety
+	 * window. Retired-lineage checkpoints have no implicit grace period: once
+	 * their final relevant pin disappears they are removed immediately.
+	 */
+	protected pruneUnpinnedDocumentHistory(now: number, documentId: string | null = null): number {
+		let rowsWritten = 0;
+		const journal = this.storage.sql.exec(
+			`DELETE FROM vault_journal AS journal
+			 WHERE (? IS NULL OR journal.document_id = ?)
+			   AND EXISTS (
+			     SELECT 1 FROM vault_document_heads head
+			      WHERE head.document_id = journal.document_id
+			        AND journal.semantic_epoch < head.semantic_epoch
+			   )
+			   AND NOT EXISTS (
+			     SELECT 1 FROM vault_history_pins pin
+			      WHERE pin.soft_expires_at > ? AND pin.hard_expires_at > ?
+			        AND journal.sequence <= pin.boundary_sequence
+			        AND journal.sequence > COALESCE((
+			          SELECT MAX(manifest.checkpoint_sequence)
+			            FROM vault_checkpoint_manifests manifest
+			           WHERE manifest.document_id = journal.document_id
+			             AND manifest.complete = 1
+			             AND manifest.checkpoint_sequence <= pin.boundary_sequence
+			        ), 0)
+			   )`,
+			documentId,
+			documentId,
+			now,
+			now,
+		);
+		journal.toArray();
+		rowsWritten += journal.rowsWritten;
+
+		const checkpoints = this.storage.sql.exec(
+			`DELETE FROM vault_checkpoints AS checkpoint
+			 WHERE (? IS NULL OR checkpoint.document_id = ?)
+			   AND EXISTS (
+			     SELECT 1 FROM vault_document_heads head
+			      WHERE head.document_id = checkpoint.document_id
+			        AND (
+			          checkpoint.semantic_epoch < head.semantic_epoch
+			          OR checkpoint.checkpoint_sequence NOT IN (
+			            SELECT recent.checkpoint_sequence
+			              FROM vault_checkpoint_manifests recent
+			             WHERE recent.document_id = checkpoint.document_id
+			               AND recent.semantic_epoch = head.semantic_epoch
+			               AND recent.complete = 1
+			             ORDER BY recent.checkpoint_sequence DESC LIMIT 3
+			          )
+			        )
+			   )
+			   AND NOT EXISTS (
+			     SELECT 1 FROM vault_history_pins pin
+			      WHERE pin.soft_expires_at > ? AND pin.hard_expires_at > ?
+			        AND checkpoint.checkpoint_sequence = (
+			          SELECT MAX(protected.checkpoint_sequence)
+			            FROM vault_checkpoint_manifests protected
+			           WHERE protected.document_id = checkpoint.document_id
+			             AND protected.complete = 1
+			             AND protected.checkpoint_sequence <= pin.boundary_sequence
+			        )
+			   )`,
+			documentId,
+			documentId,
+			now,
+			now,
+		);
+		checkpoints.toArray();
+		rowsWritten += checkpoints.rowsWritten;
+
+		const manifests = this.storage.sql.exec(
+			`DELETE FROM vault_checkpoint_manifests AS manifest
+			 WHERE (? IS NULL OR manifest.document_id = ?)
+			   AND EXISTS (
+			     SELECT 1 FROM vault_document_heads head
+			      WHERE head.document_id = manifest.document_id
+			        AND (
+			          manifest.semantic_epoch < head.semantic_epoch
+			          OR manifest.checkpoint_sequence NOT IN (
+			            SELECT recent.checkpoint_sequence
+			              FROM vault_checkpoint_manifests recent
+			             WHERE recent.document_id = manifest.document_id
+			               AND recent.semantic_epoch = head.semantic_epoch
+			               AND recent.complete = 1
+			             ORDER BY recent.checkpoint_sequence DESC LIMIT 3
+			          )
+			        )
+			   )
+			   AND NOT EXISTS (
+			     SELECT 1 FROM vault_history_pins pin
+			      WHERE pin.soft_expires_at > ? AND pin.hard_expires_at > ?
+			        AND manifest.checkpoint_sequence = (
+			          SELECT MAX(protected.checkpoint_sequence)
+			            FROM vault_checkpoint_manifests protected
+			           WHERE protected.document_id = manifest.document_id
+			             AND protected.complete = 1
+			             AND protected.checkpoint_sequence <= pin.boundary_sequence
+			        )
+			   )`,
+			documentId,
+			documentId,
+			now,
+			now,
+		);
+		manifests.toArray();
+		rowsWritten += manifests.rowsWritten;
+		return rowsWritten;
+	}
+
+	private assertExactCheckpointHead(documentId: string, expectedHead: CheckpointExpectedHead): void {
+		const head = this.storage.sql.exec<{ generation: number; semantic_epoch: number; latest_sequence: number }>(
+			"SELECT generation, semantic_epoch, latest_sequence FROM vault_document_heads WHERE document_id = ?",
+			documentId,
+		).toArray()[0];
+		if (!head || head.generation !== expectedHead.generation
+			|| head.semantic_epoch !== expectedHead.semanticEpoch
+			|| head.latest_sequence !== expectedHead.throughSequence) {
+			throw new Error("checkpoint head mismatch");
+		}
+	}
+
+	/**
+	 * Counts the union of complete logical checkpoints retained by active pins.
+	 * A candidate boundary is used while admitting a new pin; checkpoint/reset
+	 * writers call this after inserting their manifest but before committing.
+	 */
+	protected retainedCheckpointBytes(now: number, candidateBoundary: number | null = null): number {
+		const row = this.storage.sql.exec<{ bytes: number }>(
+			`WITH logical_checkpoint AS (
+			   SELECT checkpoint.document_id, checkpoint.checkpoint_sequence,
+			          SUM(length(checkpoint.data)) AS bytes
+			     FROM vault_checkpoints checkpoint
+			     JOIN vault_checkpoint_manifests manifest
+			       ON manifest.document_id = checkpoint.document_id
+			      AND manifest.checkpoint_sequence = checkpoint.checkpoint_sequence
+			    WHERE manifest.complete = 1
+			    GROUP BY checkpoint.document_id, checkpoint.checkpoint_sequence
+			 )
+			 SELECT COALESCE(SUM(checkpoint.bytes), 0) AS bytes
+			   FROM logical_checkpoint checkpoint
+			  WHERE EXISTS (
+			    SELECT 1 FROM vault_history_pins pin
+			     WHERE pin.soft_expires_at > ? AND pin.hard_expires_at > ?
+			       AND checkpoint.checkpoint_sequence = (
+			         SELECT MAX(candidate.checkpoint_sequence)
+			           FROM logical_checkpoint candidate
+			          WHERE candidate.document_id = checkpoint.document_id
+			            AND candidate.checkpoint_sequence <= pin.boundary_sequence
+			       )
+			  ) OR (? IS NOT NULL AND checkpoint.checkpoint_sequence = (
+			    SELECT MAX(candidate.checkpoint_sequence)
+			      FROM logical_checkpoint candidate
+			     WHERE candidate.document_id = checkpoint.document_id
+			       AND candidate.checkpoint_sequence <= ?
+			  ))`,
+			now,
+			now,
+			candidateBoundary,
+			candidateBoundary,
+		).toArray()[0];
+		return row?.bytes ?? 0;
+	}
+
+	private assertActivePinRetainedCheckpointCapacity(now: number): void {
+		if (this.retainedCheckpointBytes(now) > this.historyPinRetainedCheckpointByteLimit()) {
+			throw new Error("history_pin_retained_checkpoint_bytes_limit");
+		}
+	}
+
+	private persistCheckpoint(
+		documentId: string,
+		encoded: Uint8Array,
+		expectedHead: CheckpointExpectedHead,
+		requireExactHead: boolean,
+	): CheckpointWriteResult {
+		if (!documentId || encoded.byteLength < 1
+			|| !Number.isSafeInteger(expectedHead.throughSequence) || expectedHead.throughSequence < 0
+			|| !Number.isSafeInteger(expectedHead.generation) || expectedHead.generation < 0
+			|| !Number.isSafeInteger(expectedHead.semanticEpoch)
+			|| expectedHead.semanticEpoch < INITIAL_SEMANTIC_EPOCH) {
+			throw new Error("invalid checkpoint input");
+		}
+		const now = Date.now();
+		const stateSha256 = sha256HexSync(encoded);
+		const chunkMetadata: Array<{ offset: number; byteLength: number; sha256: string }> = [];
+		for (let offset = 0; offset < encoded.byteLength; offset += SQLITE_BLOB_CHUNK_BYTES) {
+			const chunk = encoded.subarray(offset, Math.min(encoded.byteLength, offset + SQLITE_BLOB_CHUNK_BYTES));
+			chunkMetadata.push({ offset, byteLength: chunk.byteLength, sha256: sha256HexSync(chunk) });
+		}
+		let rowsWritten = 0;
+		this.storage.transactionSync(() => {
+			if (requireExactHead) this.assertExactCheckpointHead(documentId, expectedHead);
+			for (let index = 0; index < chunkMetadata.length; index++) {
+				const metadata = chunkMetadata[index]!;
+				const chunk = encoded.subarray(metadata.offset, metadata.offset + metadata.byteLength);
+				const write = this.storage.sql.exec(
+					`INSERT INTO vault_checkpoints(document_id, checkpoint_sequence, generation, semantic_epoch, chunk_index,
+					                                  chunk_byte_length, chunk_sha256, data)
+					 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+					documentId,
+					expectedHead.throughSequence,
+					expectedHead.generation,
+					expectedHead.semanticEpoch,
+					index,
+					metadata.byteLength,
+					metadata.sha256,
 					ownedBuffer(chunk),
 				);
 				write.toArray();
 				rowsWritten += write.rowsWritten;
-				chunks++;
-				if (encoded.byteLength === 0) break;
 			}
-			const feedFloor = this.journalFloor();
-			const deleteThrough = Math.min(throughSequence, feedFloor);
-			const deleteJournalChunks = this.storage.sql.exec(
-				`DELETE FROM vault_journal_chunks WHERE sequence IN (
-				 SELECT sequence FROM vault_journal WHERE document_id = ? AND sequence <= ?
-				)`,
-				documentId,
-				deleteThrough,
+			const physical = this.storage.sql.exec<{
+				chunks: number; total_bytes: number; first_index: number; last_index: number;
+			}>(`SELECT COUNT(*) AS chunks, COALESCE(SUM(length(data)), 0) AS total_bytes,
+			          COALESCE(MIN(chunk_index), -1) AS first_index, COALESCE(MAX(chunk_index), -1) AS last_index
+			   FROM vault_checkpoints WHERE document_id = ? AND checkpoint_sequence = ?`,
+				documentId, expectedHead.throughSequence).one();
+			if (physical.chunks !== chunkMetadata.length || physical.total_bytes !== encoded.byteLength
+				|| physical.first_index !== 0 || physical.last_index !== chunkMetadata.length - 1) {
+				throw checkpointIntegrityError("new checkpoint is incomplete");
+			}
+			const manifest = this.storage.sql.exec(
+				`INSERT INTO vault_checkpoint_manifests(document_id, checkpoint_sequence, generation, semantic_epoch,
+				 chunk_count, total_byte_length, state_sha256, complete, created_at)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)`,
+				documentId, expectedHead.throughSequence, expectedHead.generation, expectedHead.semanticEpoch,
+				chunkMetadata.length, encoded.byteLength, stateSha256, now,
 			);
-			deleteJournalChunks.toArray();
-			rowsWritten += deleteJournalChunks.rowsWritten;
+			manifest.toArray();
+			rowsWritten += manifest.rowsWritten;
+			this.assertActivePinRetainedCheckpointCapacity(now);
+			const feedFloor = this.journalFloor();
+			const deleteThrough = Math.min(expectedHead.throughSequence, feedFloor);
 			const deleteJournal = this.storage.sql.exec(
 				"DELETE FROM vault_journal WHERE document_id = ? AND sequence <= ?",
 				documentId,
@@ -1131,49 +1729,38 @@ export abstract class VaultDocumentStore {
 			);
 			deleteJournal.toArray();
 			rowsWritten += deleteJournal.rowsWritten;
-			const oldCheckpoints = this.storage.sql.exec(
-				`DELETE FROM vault_checkpoints
-				 WHERE document_id = ? AND checkpoint_sequence NOT IN (
-				   SELECT DISTINCT checkpoint_sequence FROM vault_checkpoints
-				   WHERE document_id = ? ORDER BY checkpoint_sequence DESC LIMIT 3
-				 )
-				 AND NOT EXISTS (
-				   SELECT 1 FROM vault_history_pins p
-				   WHERE p.hard_expires_at > ?
-				     AND vault_checkpoints.checkpoint_sequence = (
-				       SELECT MAX(protected.checkpoint_sequence)
-				       FROM vault_checkpoints protected
-				       WHERE protected.document_id = vault_checkpoints.document_id
-				         AND protected.checkpoint_sequence <= p.boundary_sequence
-				     )
-				 )`,
-				documentId,
-				documentId,
-				now,
-			);
-			oldCheckpoints.toArray();
-			rowsWritten += oldCheckpoints.rowsWritten;
+			rowsWritten += this.pruneUnpinnedDocumentHistory(now, documentId);
 		});
-		return { status: "written", checkpointSequence: throughSequence, generation: reconstructed.generation, chunks, rowsWritten };
+		return {
+			status: "written",
+			checkpointSequence: expectedHead.throughSequence,
+			generation: expectedHead.generation,
+			semanticEpoch: expectedHead.semanticEpoch,
+			chunks: chunkMetadata.length,
+			totalBytes: encoded.byteLength,
+			stateSha256,
+			rowsWritten,
+		};
 	}
 
 	listChangesAfter(sequence: number, limit = 1000): JournalFeedEntry[] {
 		this.initialize();
 		const boundedLimit = Math.min(1000, Math.max(1, limit));
 		const rows = this.storage.sql.exec<{
-			sequence: number; document_id: string; generation: number; kind: VaultCommitKind;
+			sequence: number; document_id: string; generation: number; semantic_epoch: number; kind: VaultCommitKind;
 		}>(
-			`SELECT sequence, document_id, generation, kind FROM vault_journal
+			`SELECT sequence, document_id, generation, semantic_epoch, kind FROM vault_journal
 			 WHERE sequence > ? ORDER BY sequence LIMIT ?`,
 			sequence,
 			boundedLimit,
 		).toArray();
 		const catalogs = this.storage.sql.exec<{
 			sequence: number; body_id: string; file_id: string; path: string; previous_path: string | null;
-			lifecycle: BodyLifecycle; generation: number; content_hash: string | null; size: number | null;
+			lifecycle: BodyLifecycle; generation: number; body_epoch: number; content_hash: string | null; size: number | null;
 		}>(
 			`SELECT c.sequence, c.body_id, c.file_id, c.path, c.previous_path, c.lifecycle,
-			        c.generation, c.content_hash, c.size
+			        c.generation, c.body_epoch,
+			        c.content_hash, c.size
 			 FROM vault_catalog_events c
 			 JOIN (
 			   SELECT sequence FROM vault_journal
@@ -1188,6 +1775,7 @@ export abstract class VaultDocumentStore {
 			const mapped: CatalogHeadAtBoundary = {
 				sequence: catalog.sequence,
 				bodyId: catalog.body_id,
+				bodyEpoch: parseSemanticEpoch(catalog.body_epoch, "feed catalog body epoch"),
 				fileId: catalog.file_id,
 				path: catalog.path,
 				previousPath: catalog.previous_path,
@@ -1203,9 +1791,10 @@ export abstract class VaultDocumentStore {
 		const semanticCatalogs = this.storage.sql.exec<{
 			sequence: number; document_id: string; file_id: string; kind: "canvas"; format: "json-canvas";
 			format_version: 1; path: string; previous_path: string | null;
-			lifecycle: SemanticCatalogHead["lifecycle"]; generation: number; content_hash: string | null; size: number | null;
+			lifecycle: SemanticCatalogHead["lifecycle"]; generation: number; document_epoch: number;
+			content_hash: string | null; size: number | null;
 		}>(`SELECT c.sequence, c.document_id, c.file_id, c.kind, c.format, c.format_version, c.path,
-		          c.previous_path, c.lifecycle, c.generation, c.content_hash, c.size
+		          c.previous_path, c.lifecycle, c.generation, c.document_epoch, c.content_hash, c.size
 		   FROM vault_semantic_catalog_events c JOIN (
 		     SELECT sequence FROM vault_journal WHERE sequence > ? ORDER BY sequence LIMIT ?
 		   ) page ON page.sequence = c.sequence ORDER BY c.sequence, c.mutation_index`, sequence, boundedLimit).toArray();
@@ -1214,7 +1803,9 @@ export abstract class VaultDocumentStore {
 			const mapped: SemanticCatalogHead = { sequence: value.sequence, documentId: value.document_id,
 				fileId: value.file_id, kind: value.kind, format: value.format, formatVersion: value.format_version,
 				path: value.path, previousPath: value.previous_path, lifecycle: value.lifecycle,
-				generation: value.generation, contentHash: value.content_hash, size: value.size };
+				generation: value.generation,
+				bodyEpoch: parseSemanticEpoch(value.document_epoch, "feed semantic document epoch"),
+				contentHash: value.content_hash, size: value.size };
 			const entries = semanticBySequence.get(value.sequence);
 			if (entries) entries.push(mapped); else semanticBySequence.set(value.sequence, [mapped]);
 		}
@@ -1222,6 +1813,7 @@ export abstract class VaultDocumentStore {
 			sequence: row.sequence,
 			documentId: row.document_id,
 			generation: row.generation,
+			documentEpoch: parseSemanticEpoch(row.semantic_epoch),
 			kind: row.kind,
 			catalogs: catalogsBySequence.get(row.sequence) ?? [],
 			semanticCatalogs: semanticBySequence.get(row.sequence) ?? [],
@@ -1261,25 +1853,15 @@ export abstract class VaultDocumentStore {
 			);
 			floor.toArray();
 			rowsWritten += floor.rowsWritten;
-			const pruneChunks = this.storage.sql.exec(
-				`DELETE FROM vault_journal_chunks WHERE sequence IN (
-				   SELECT j.sequence FROM vault_journal j
-				   WHERE j.sequence <= ?
-				     AND EXISTS (
-				       SELECT 1 FROM vault_checkpoints c
-				       WHERE c.document_id = j.document_id
-				         AND c.checkpoint_sequence >= j.sequence
-				     )
-				 )`,
-				throughSequence,
-			);
-			pruneChunks.toArray();
-			rowsWritten += pruneChunks.rowsWritten;
 			const prune = this.storage.sql.exec(
 				`DELETE FROM vault_journal
 				 WHERE sequence <= ?
 				   AND EXISTS (
 				     SELECT 1 FROM vault_checkpoints c
+				     JOIN vault_checkpoint_manifests manifest
+				       ON manifest.document_id = c.document_id
+				      AND manifest.checkpoint_sequence = c.checkpoint_sequence
+				      AND manifest.complete = 1
 				     WHERE c.document_id = vault_journal.document_id
 				       AND c.checkpoint_sequence >= vault_journal.sequence
 				   )`,
@@ -1293,19 +1875,35 @@ export abstract class VaultDocumentStore {
 
 	documentEncodedHistoryBytes(documentId: string, throughSequence: number): number {
 		this.initialize();
-		const checkpoint = this.storage.sql.exec<{ checkpoint_sequence: number }>(
-			`SELECT checkpoint_sequence FROM vault_checkpoints
-			 WHERE document_id = ? AND checkpoint_sequence <= ? ORDER BY checkpoint_sequence DESC LIMIT 1`,
-			documentId,
-			throughSequence,
+		const checkpoint = this.storage.sql.exec<CheckpointSummaryRow>(
+			`WITH target AS (
+			   SELECT MAX(checkpoint_sequence) AS checkpoint_sequence FROM (
+			     SELECT checkpoint_sequence FROM vault_checkpoints WHERE document_id = ? AND checkpoint_sequence <= ?
+			     UNION ALL
+			     SELECT checkpoint_sequence FROM vault_checkpoint_manifests WHERE document_id = ? AND checkpoint_sequence <= ?
+			   )
+			 )
+			 SELECT target.checkpoint_sequence, manifest.generation, manifest.semantic_epoch, manifest.chunk_count,
+			        manifest.total_byte_length, manifest.state_sha256, manifest.complete,
+			        COUNT(chunk.chunk_index) AS physical_chunks,
+			        COALESCE(SUM(length(chunk.data)), 0) AS physical_bytes,
+			        COALESCE(MIN(chunk.chunk_index), -1) AS first_index,
+			        COALESCE(MAX(chunk.chunk_index), -1) AS last_index,
+			        COALESCE(MIN(chunk.semantic_epoch), -1) AS minimum_chunk_epoch,
+			        COALESCE(MAX(chunk.semantic_epoch), -1) AS maximum_chunk_epoch
+			 FROM target
+			 LEFT JOIN vault_checkpoint_manifests manifest
+			   ON manifest.document_id = ? AND manifest.checkpoint_sequence = target.checkpoint_sequence
+			 LEFT JOIN vault_checkpoints chunk
+			   ON chunk.document_id = ? AND chunk.checkpoint_sequence = target.checkpoint_sequence
+			 WHERE target.checkpoint_sequence IS NOT NULL
+			 GROUP BY target.checkpoint_sequence, manifest.generation, manifest.semantic_epoch, manifest.chunk_count,
+			          manifest.total_byte_length, manifest.state_sha256, manifest.complete`,
+			documentId, throughSequence, documentId, throughSequence, documentId, documentId,
 		).toArray()[0];
+		if (checkpoint) assertCheckpointSummary(checkpoint);
 		const checkpointSequence = checkpoint?.checkpoint_sequence ?? 0;
-		let bytes = checkpoint ? this.storage.sql.exec<{ bytes: number }>(
-			`SELECT COALESCE(SUM(length(data)), 0) AS bytes FROM vault_checkpoints
-			 WHERE document_id = ? AND checkpoint_sequence = ?`,
-			documentId,
-			checkpointSequence,
-		).one().bytes : 0;
+		let bytes = checkpoint?.total_byte_length ?? 0;
 		bytes += this.storage.sql.exec<{ bytes: number }>(
 			`SELECT COALESCE(SUM(update_byte_length), 0) AS bytes FROM vault_journal
 			 WHERE document_id = ? AND sequence > ? AND sequence <= ?`,
@@ -1324,25 +1922,40 @@ export abstract class VaultDocumentStore {
 		this.initialize();
 		const offset = Number(cursor);
 		if (!Number.isSafeInteger(offset) || offset < 0 || maxBytes <= 0) throw new Error("invalid recipe cursor or byte budget");
-		const checkpoint = this.storage.sql.exec<{ checkpoint_sequence: number; chunk_count: number }>(
-			`SELECT checkpoint_sequence, COUNT(*) AS chunk_count FROM vault_checkpoints
-			 WHERE document_id = ?
-			   AND checkpoint_sequence = (
-			     SELECT MAX(checkpoint_sequence) FROM vault_checkpoints
-			     WHERE document_id = ? AND checkpoint_sequence <= ?
+		const checkpoint = this.storage.sql.exec<CheckpointSummaryRow>(
+			`WITH target AS (
+			   SELECT MAX(checkpoint_sequence) AS checkpoint_sequence FROM (
+			     SELECT checkpoint_sequence FROM vault_checkpoints WHERE document_id = ? AND checkpoint_sequence <= ?
+			     UNION ALL
+			     SELECT checkpoint_sequence FROM vault_checkpoint_manifests WHERE document_id = ? AND checkpoint_sequence <= ?
 			   )
-			 GROUP BY checkpoint_sequence`,
-			documentId,
-			documentId,
-			throughSequence,
+			 )
+			 SELECT target.checkpoint_sequence, manifest.generation, manifest.semantic_epoch, manifest.chunk_count,
+			        manifest.total_byte_length, manifest.state_sha256, manifest.complete,
+			        COUNT(chunk.chunk_index) AS physical_chunks,
+			        COALESCE(SUM(length(chunk.data)), 0) AS physical_bytes,
+			        COALESCE(MIN(chunk.chunk_index), -1) AS first_index,
+			        COALESCE(MAX(chunk.chunk_index), -1) AS last_index,
+			        COALESCE(MIN(chunk.semantic_epoch), -1) AS minimum_chunk_epoch,
+			        COALESCE(MAX(chunk.semantic_epoch), -1) AS maximum_chunk_epoch
+			 FROM target
+			 LEFT JOIN vault_checkpoint_manifests manifest
+			   ON manifest.document_id = ? AND manifest.checkpoint_sequence = target.checkpoint_sequence
+			 LEFT JOIN vault_checkpoints chunk
+			   ON chunk.document_id = ? AND chunk.checkpoint_sequence = target.checkpoint_sequence
+			 WHERE target.checkpoint_sequence IS NOT NULL
+			 GROUP BY target.checkpoint_sequence, manifest.generation, manifest.semantic_epoch, manifest.chunk_count,
+			          manifest.total_byte_length, manifest.state_sha256, manifest.complete`,
+			documentId, throughSequence, documentId, throughSequence, documentId, documentId,
 		).toArray()[0];
+		if (checkpoint) assertCheckpointSummary(checkpoint);
 		const checkpointSequence = checkpoint?.checkpoint_sequence ?? 0;
 		const checkpointCount = checkpoint?.chunk_count ?? 0;
 		const checkpointRows = checkpoint && offset < checkpointCount ? this.storage.sql.exec<{
-			chunk_index: number; expected_bytes: number; data: DurableChunkValue;
+			chunk_index: number; expected_bytes: number; chunk_sha256: string; data: DurableChunkValue;
 		}>(
 			`WITH candidates AS (
-			   SELECT chunk_index, length(data) AS expected_bytes
+			   SELECT chunk_index, chunk_byte_length AS expected_bytes, chunk_sha256
 			   FROM vault_checkpoints
 			   WHERE document_id = ? AND checkpoint_sequence = ? AND chunk_index >= ?
 			   ORDER BY chunk_index LIMIT 256
@@ -1352,7 +1965,7 @@ export abstract class VaultDocumentStore {
 			          SUM(expected_bytes) OVER (ORDER BY chunk_index ROWS UNBOUNDED PRECEDING) AS running_bytes
 			   FROM candidates
 			 )
-			 SELECT sized.chunk_index, sized.expected_bytes, checkpoint.data
+			 SELECT sized.chunk_index, sized.expected_bytes, checkpoint.chunk_sha256, checkpoint.data
 			 FROM sized
 			 JOIN vault_checkpoints checkpoint
 			   ON checkpoint.document_id = ? AND checkpoint.checkpoint_sequence = ?
@@ -1365,11 +1978,20 @@ export abstract class VaultDocumentStore {
 		const journalOffset = Math.max(0, offset - checkpointCount);
 		const candidates: Array<{
 			kind: "checkpoint" | "journal"; sequence: number; fragmentIndex: number;
-			fragmentCount: number; expectedBytes: number; bytes: Uint8Array;
+			fragmentCount: number; expectedBytes: number; expectedSha256?: string; bytes: Uint8Array;
 		}> = checkpointRows.map((row) => ({
 			kind: "checkpoint", sequence: checkpointSequence, fragmentIndex: row.chunk_index,
-			fragmentCount: checkpointCount, expectedBytes: row.expected_bytes, bytes: new Uint8Array(row.data),
+			fragmentCount: checkpointCount, expectedBytes: row.expected_bytes,
+			expectedSha256: row.chunk_sha256, bytes: new Uint8Array(row.data),
 		}));
+		for (let index = 0; index < candidates.length; index++) {
+			const candidate = candidates[index]!;
+			if (candidate.fragmentIndex !== offset + index
+				|| candidate.expectedSha256 === undefined
+				|| sha256HexSync(candidate.bytes) !== candidate.expectedSha256) {
+				throw checkpointIntegrityError("recipe checkpoint chunk mismatch");
+			}
+		}
 		const checkpointBytes = candidates.reduce((total, candidate) => total + candidate.expectedBytes, 0);
 		const checkpointExhausted = offset >= checkpointCount
 			|| offset + checkpointRows.length >= checkpointCount;
@@ -1377,25 +1999,22 @@ export abstract class VaultDocumentStore {
 		const remainingBytes = maxBytes - checkpointBytes;
 		const forceFirstJournal = checkpointRows.length === 0;
 		const journalRows = journalLimit > 0 && (remainingBytes > 0 || forceFirstJournal) ? this.storage.sql.exec<{
-			sequence: number; update_byte_length: number; chunk_index: number | null; data: DurableChunkValue | null;
+			sequence: number; update_byte_length: number; data: DurableChunkValue;
 		}>(
 			`WITH candidates AS (
-			   SELECT sequence, update_byte_length FROM vault_journal
+			   SELECT sequence, update_byte_length, data FROM vault_journal
 			   WHERE document_id = ? AND sequence > ? AND sequence <= ?
 			   ORDER BY sequence LIMIT ? OFFSET ?
 			 ), sized AS (
-			   SELECT sequence, update_byte_length,
+			   SELECT sequence, update_byte_length, data,
 			          ROW_NUMBER() OVER (ORDER BY sequence) AS ordinal,
 			          SUM(update_byte_length) OVER (ORDER BY sequence ROWS UNBOUNDED PRECEDING) AS running_bytes
 			   FROM candidates
 			 ), selected AS (
-			   SELECT sequence, update_byte_length FROM sized
+			   SELECT sequence, update_byte_length, data FROM sized
 			   WHERE running_bytes <= ? OR (? = 1 AND ordinal = 1)
 			 )
-			 SELECT selected.sequence, selected.update_byte_length, chunks.chunk_index, chunks.data
-			 FROM selected
-			 LEFT JOIN vault_journal_chunks chunks ON chunks.sequence = selected.sequence
-			 ORDER BY selected.sequence, chunks.chunk_index`,
+			 SELECT sequence, update_byte_length, data FROM selected ORDER BY sequence`,
 			documentId,
 			checkpointSequence,
 			throughSequence,
@@ -1404,18 +2023,11 @@ export abstract class VaultDocumentStore {
 			Math.max(0, remainingBytes),
 			forceFirstJournal ? 1 : 0,
 		).toArray() : [];
-		for (let start = 0; start < journalRows.length;) {
-			const first = journalRows[start]!;
-			let end = start + 1;
-			while (end < journalRows.length && journalRows[end]!.sequence === first.sequence) end++;
-			const bytes = decodeSqlChunks(journalRows.slice(start, end)
-				.filter((row): row is typeof row & { data: DurableChunkValue } => row.data !== null)
-				.map((row) => ({ data: row.data })));
+		for (const row of journalRows) {
 			candidates.push({
-				kind: "journal", sequence: first.sequence, fragmentIndex: 0, fragmentCount: 1,
-				expectedBytes: first.update_byte_length, bytes,
+				kind: "journal", sequence: row.sequence, fragmentIndex: 0, fragmentCount: 1,
+				expectedBytes: row.update_byte_length, bytes: new Uint8Array(row.data),
 			});
-			start = end;
 		}
 		const selected: typeof candidates = [];
 		let encodedBytes = 0;

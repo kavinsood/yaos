@@ -169,7 +169,6 @@ export class VaultRecoveryService {
 				|| initialized.boundarySequence !== descriptor.boundarySequence
 				|| initialized.capabilityHash !== descriptor.capabilityHash) {
 				this.store.setRecoveryCaptureState(descriptor.captureId, "failed", "job_initialization_mismatch");
-				this.store.releasePin(descriptor.captureId);
 				throw new Error("capture job initialization mismatch");
 			}
 		} else {
@@ -243,7 +242,6 @@ export class VaultRecoveryService {
 				status.state,
 				status.error?.code ?? status.state,
 			);
-			this.store.releasePin(capture.captureId);
 		}
 		return {
 			captureId: input.captureId,
@@ -1028,7 +1026,8 @@ export class VaultRecoveryService {
 		const active = this.store.activeRecoveryCapture();
 		const snapshots = this.store.listSnapshots(null, 1000);
 		const latest = [...snapshots].sort((left, right) => right.completedAt - left.completedAt)[0] ?? null;
-		const oldestPin = this.store.activePins().sort((left, right) => left.createdAt - right.createdAt)[0] ?? null;
+		const historyPins = this.store.historyPinHealth();
+		const oldestPin = [...historyPins.pins].sort((left, right) => right.ageMs - left.ageMs)[0] ?? null;
 		const projectionLease = this.store.projectionLease();
 		type ProjectionStatusView = {
 			state: string;
@@ -1103,10 +1102,11 @@ export class VaultRecoveryService {
 			projection: projectionStatus,
 			oldestPin: oldestPin ? {
 				sequence: oldestPin.boundarySequence,
-				ageMs: Date.now() - oldestPin.createdAt,
+				ageMs: oldestPin.ageMs,
 				softExpiresAt: oldestPin.softExpiresAt,
 				hardExpiresAt: oldestPin.hardExpiresAt,
 			} : null,
+			historyPins,
 			lastSuccessfulSnapshot: latest ? {
 				snapshotId: latest.snapshotId,
 				completedAt: latest.completedAt,

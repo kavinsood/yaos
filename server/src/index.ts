@@ -41,8 +41,6 @@ import {
 import { corsPreflight, html, json, safeDecodeUriComponent, withCors } from "./routes/http";
 import {
 	handleOperatorCreateVault,
-	handleOperatorCollaborationMigration,
-	handleOperatorCanvasMigration,
 	handleOperatorDestroyVault,
 	handleOperatorEmergencyDestroyVault,
 	handleOperatorLogin,
@@ -83,7 +81,7 @@ type WorkerRoute =
 	| { kind: "claim" }
 	| { kind: "enroll" }
 	| { kind: "operator-login" | "operator-logout" | "operator-state" | "operator-pairing" | "operator-vaults" }
-	| { kind: "operator-vault-patch" | "operator-vault-destroy" | "operator-vault-emergency-destroy" | "operator-vault-deletion" | "operator-vault-provision" | "operator-owner-code" | "operator-collaboration-migrate" | "operator-canvas-migrate"; id: string }
+	| { kind: "operator-vault-patch" | "operator-vault-destroy" | "operator-vault-emergency-destroy" | "operator-vault-deletion" | "operator-vault-provision" | "operator-owner-code"; id: string }
 	| { kind: "operator-authorization-retry"; id: string; changeId: string }
 	| { kind: "operator-pairing-revoke" | "operator-revoke"; id: string }
 	| { kind: "update-metadata" }
@@ -184,16 +182,6 @@ export function classifyWorkerRoute(request: Request, url = new URL(request.url)
 		const id = safeDecodeUriComponent(operatorOwnerCode[1]);
 		return id ? { kind: "operator-owner-code", id } : { kind: "not-found" };
 	}
-	const operatorCollaborationMigrate = url.pathname.match(/^\/operator\/vaults\/([^/]+)\/collaboration-migrate$/);
-	if (operatorCollaborationMigrate?.[1] && request.method === "POST") {
-		const id = safeDecodeUriComponent(operatorCollaborationMigrate[1]);
-		return id ? { kind: "operator-collaboration-migrate", id } : { kind: "not-found" };
-	}
-	const operatorCanvasMigrate = url.pathname.match(/^\/operator\/vaults\/([^/]+)\/canvas-migrate$/);
-	if (operatorCanvasMigrate?.[1] && request.method === "POST") {
-		const id = safeDecodeUriComponent(operatorCanvasMigrate[1]);
-		return id ? { kind: "operator-canvas-migrate", id } : { kind: "not-found" };
-	}
 	const operatorVaultDeletion = url.pathname.match(/^\/operator\/vaults\/([^/]+)\/deletion$/);
 	if (operatorVaultDeletion?.[1] && request.method === "GET") {
 		const id = safeDecodeUriComponent(operatorVaultDeletion[1]);
@@ -279,8 +267,6 @@ export async function handleWorkerRequest(request: Request, env: Env): Promise<R
 		else if (route.kind === "capabilities") response = withCors(await capabilities(request, env, authState));
 		else if (route.kind === "claim") response = await handleClaimRoute(request, env, authState);
 		else if (route.kind === "operator-login") response = await handleOperatorLogin(request, env);
-		else if (route.kind === "operator-collaboration-migrate") response = withCors(await handleOperatorCollaborationMigration(request, env, route.id));
-		else if (route.kind === "operator-canvas-migrate") response = withCors(await handleOperatorCanvasMigration(request, env, route.id));
 		else if (authState.mode === "unsupported") response = withCors(json({ error: "server_format_unsupported" }, 503));
 		else if (route.kind === "enroll") response = withCors(await handleEnrollRoute(request, env));
 		else if (route.kind === "operator-state") response = await handleOperatorState(request, env);

@@ -1,14 +1,20 @@
 import { VaultCatalogStore } from "./vaultCatalogStore";
+import { MAX_PIN_RETAINED_CHECKPOINT_BYTES } from "./vaultDocumentStore";
+
+export { MAX_PIN_RETAINED_CHECKPOINT_BYTES } from "./vaultDocumentStore";
 
 export const DEFAULT_SOFT_TTL_MS = 60 * 60_000;
 export const DEFAULT_HARD_TTL_MS = 24 * 60 * 60_000;
-
+export const MAX_ACTIVE_HISTORY_PINS = 32;
+export const MAX_HISTORY_PIN_HARD_TTL_MS = DEFAULT_HARD_TTL_MS;
 export type HistoryPinKind = "capture" | "bootstrap";
 export type VaultOperationKind = "bootstrap";
 
 export interface HistoryPin {
 	pinId: string;
 	kind: HistoryPinKind;
+	/** The durable operation which owns and must eventually release this pin. */
+	owner: { kind: HistoryPinKind; id: string };
 	boundarySequence: number;
 	createdAt: number;
 	softExpiresAt: number;
@@ -51,6 +57,52 @@ export interface HistoryPinHealth {
 	hardExpired: number;
 	oldestActiveAgeMs: number | null;
 	oldestProgressAgeMs: number | null;
+	retainedCheckpointBytes: number;
+	limits: HistoryPinLimits;
+	countLimitReached: boolean;
+	retainedBytesLimitReached: boolean;
+	pins: HistoryPinDiagnostic[];
+}
+
+export interface HistoryPinLimits {
+	maxActivePins: number;
+	maxHardTtlMs: number;
+	maxRetainedCheckpointBytes: number;
+}
+
+export interface HistoryPinDiagnostic {
+	pinId: string;
+	kind: HistoryPinKind;
+	ownerId: string;
+	boundarySequence: number;
+	ageMs: number;
+	progressAgeMs: number;
+	softExpiresAt: number;
+	hardExpiresAt: number;
+	progress: number;
+	retainedCheckpointBytes: number;
+}
+
+export const DEFAULT_HISTORY_PIN_LIMITS: Readonly<HistoryPinLimits> = Object.freeze({
+	maxActivePins: MAX_ACTIVE_HISTORY_PINS,
+	maxHardTtlMs: MAX_HISTORY_PIN_HARD_TTL_MS,
+	maxRetainedCheckpointBytes: MAX_PIN_RETAINED_CHECKPOINT_BYTES,
+});
+
+export function assertHistoryPinAdmission(
+	usage: { activePins: number; retainedCheckpointBytes: number; requestedHardTtlMs: number },
+	limits: Readonly<HistoryPinLimits> = DEFAULT_HISTORY_PIN_LIMITS,
+): void {
+	if (!Number.isInteger(usage.activePins) || usage.activePins < 0
+		|| !Number.isFinite(usage.retainedCheckpointBytes) || usage.retainedCheckpointBytes < 0
+		|| !Number.isFinite(usage.requestedHardTtlMs) || usage.requestedHardTtlMs <= 0) {
+		throw new Error("invalid history pin admission usage");
+	}
+	if (usage.requestedHardTtlMs > limits.maxHardTtlMs) throw new Error("history_pin_hard_ttl_limit");
+	if (usage.activePins >= limits.maxActivePins) throw new Error("history_pin_count_limit");
+	if (usage.retainedCheckpointBytes > limits.maxRetainedCheckpointBytes) {
+		throw new Error("history_pin_retained_checkpoint_bytes_limit");
+	}
 }
 
 function randomId(): string {
@@ -75,11 +127,21 @@ export class VaultBootstrapStore extends VaultCatalogStore {
 		const now = input.now ?? Date.now();
 		const softTtl = input.softTtlMs ?? DEFAULT_SOFT_TTL_MS;
 		const hardTtl = input.hardTtlMs ?? DEFAULT_HARD_TTL_MS;
-		if (softTtl <= 0 || hardTtl < softTtl) throw new Error("invalid pin TTLs");
+		if (!Number.isFinite(now) || !Number.isFinite(softTtl) || !Number.isFinite(hardTtl)
+			|| softTtl <= 0 || hardTtl < softTtl) throw new Error("invalid pin TTLs");
+		const pinId = input.pinId ?? randomId();
+		if (!isValidOperationId(pinId)) throw new Error("invalid pin ID");
+		const boundarySequence = input.boundarySequence ?? this.currentSequence();
+		if (!Number.isInteger(boundarySequence) || boundarySequence < 0 || boundarySequence > this.currentSequence()) {
+			throw new Error("invalid pin boundary");
+		}
+		if (this.getPin(pinId)) throw new Error("history pin ID already exists");
+		this.assertHistoryPinCapacity(boundarySequence, hardTtl, now);
 		const pin: HistoryPin = {
-			pinId: input.pinId ?? randomId(),
+			pinId,
 			kind: input.kind,
-			boundarySequence: input.boundarySequence ?? this.currentSequence(),
+			owner: { kind: input.kind, id: pinId },
+			boundarySequence,
 			createdAt: now,
 			softExpiresAt: now + softTtl,
 			hardExpiresAt: now + hardTtl,
@@ -107,7 +169,9 @@ export class VaultBootstrapStore extends VaultCatalogStore {
 		this.initialize();
 		const existing = this.getPin(pinId);
 		if (!existing) throw new Error("pin not found");
-		if (now >= existing.hardExpiresAt) throw new Error("pin hard-expired");
+		if (now >= existing.softExpiresAt || now >= existing.hardExpiresAt) throw new Error("pin expired");
+		if (!Number.isFinite(softTtlMs) || softTtlMs <= 0) throw new Error("invalid pin renewal TTL");
+		if (!Number.isInteger(progress) || progress < 0) throw new Error("invalid pin progress");
 		if (progress <= existing.progress) return existing;
 		const softExpiresAt = Math.min(existing.hardExpiresAt, now + softTtlMs);
 		this.storage.sql.exec(
@@ -122,11 +186,22 @@ export class VaultBootstrapStore extends VaultCatalogStore {
 		return { ...existing, progress, lastProgressAt: now, softExpiresAt };
 	}
 
-	releasePin(pinId: string): boolean {
+	releasePin(pinId: string, now = Date.now()): boolean {
 		this.initialize();
+		let released = false;
+		this.storage.transactionSync(() => {
+			released = this.releaseHistoryPinInTransaction(pinId, now);
+		});
+		return released;
+	}
+
+	/** Release a pin while already inside the caller's durable transaction. */
+	protected releaseHistoryPinInTransaction(pinId: string, now: number): boolean {
 		const cursor = this.storage.sql.exec("DELETE FROM vault_history_pins WHERE pin_id = ?", pinId);
 		cursor.toArray();
-		return cursor.rowsWritten > 0;
+		const released = cursor.rowsWritten > 0;
+		if (released) this.pruneUnpinnedDocumentHistory(now);
+		return released;
 	}
 
 	getPin(pinId: string): HistoryPin | null {
@@ -144,7 +219,8 @@ export class VaultBootstrapStore extends VaultCatalogStore {
 			pin_id: string; kind: HistoryPinKind; boundary_sequence: number; created_at: number;
 			soft_expires_at: number; hard_expires_at: number; last_progress_at: number; progress: number;
 		}>(
-			"SELECT * FROM vault_history_pins WHERE hard_expires_at > ? ORDER BY boundary_sequence",
+			"SELECT * FROM vault_history_pins WHERE soft_expires_at > ? AND hard_expires_at > ? ORDER BY boundary_sequence",
+			now,
 			now,
 		).toArray().map((row) => this.mapPin(row));
 	}
@@ -165,21 +241,28 @@ export class VaultBootstrapStore extends VaultCatalogStore {
 		const now = input.now ?? Date.now();
 		const softTtl = input.softTtlMs ?? DEFAULT_SOFT_TTL_MS;
 		const hardTtl = input.hardTtlMs ?? DEFAULT_HARD_TTL_MS;
-		if (softTtl <= 0 || hardTtl < softTtl) throw new Error("invalid operation TTLs");
+		if (!Number.isFinite(now) || !Number.isFinite(softTtl) || !Number.isFinite(hardTtl)
+			|| softTtl <= 0 || hardTtl < softTtl) throw new Error("invalid operation TTLs");
 		const operationId = input.operationId ?? randomId();
 		if (!isValidOperationId(operationId)) throw new Error("invalid operation ID");
 		const boundarySequence = input.boundarySequence ?? this.currentSequence();
+		if (!Number.isInteger(boundarySequence) || boundarySequence < 0 || boundarySequence > this.currentSequence()) {
+			throw new Error("invalid operation boundary");
+		}
 		const existing = this.getOperation(operationId);
 		if (existing) {
 			if (existing.kind !== input.kind) throw new Error("operation ID belongs to a different operation kind");
 			const pin = this.getPin(operationId);
 			if (!pin) throw new Error("operation exists without its history pin");
 			if (pin.kind !== input.kind) throw new Error("operation pin kind mismatch");
+			if (now >= pin.softExpiresAt || now >= pin.hardExpiresAt) throw new Error("operation pin expired");
 			return { operation: existing, pin };
 		}
+		this.assertHistoryPinCapacity(boundarySequence, hardTtl, now);
 		const pin: HistoryPin = {
 			pinId: operationId,
 			kind: input.kind,
+			owner: { kind: input.kind, id: operationId },
 			boundarySequence,
 			createdAt: now,
 			softExpiresAt: now + softTtl,
@@ -261,7 +344,7 @@ export class VaultBootstrapStore extends VaultCatalogStore {
 	resumeFailedOperation(operationId: string, now = Date.now()): VaultOperation {
 		this.initialize();
 		const pin = this.getPin(operationId);
-		if (!pin || now >= pin.hardExpiresAt) throw new Error("operation cannot resume without an active pin");
+		if (!pin || now >= pin.softExpiresAt || now >= pin.hardExpiresAt) throw new Error("operation cannot resume without an active pin");
 		const update = this.storage.sql.exec(
 			"UPDATE vault_operations SET state = 'running', error = NULL, updated_at = ? WHERE operation_id = ? AND state = 'failed'",
 			now,
@@ -360,7 +443,7 @@ export class VaultBootstrapStore extends VaultCatalogStore {
 			);
 			update.toArray();
 			if (update.rowsWritten === 0) throw new Error("operation not found");
-			this.storage.sql.exec("DELETE FROM vault_history_pins WHERE pin_id = ?", operationId).toArray();
+			this.releaseHistoryPinInTransaction(operationId, now);
 		});
 		const operation = this.getOperation(operationId);
 		if (!operation) throw new Error("completed operation disappeared");
@@ -487,40 +570,122 @@ export class VaultBootstrapStore extends VaultCatalogStore {
 			last_progress_at: number;
 			progress: number;
 		}>("SELECT * FROM vault_history_pins").toArray().map((row) => this.mapPin(row));
-		const active = pins.filter((pin) => pin.hardExpiresAt > now);
+		const active = pins.filter((pin) => pin.softExpiresAt > now && pin.hardExpiresAt > now);
+		const retainedByPin = this.retainedCheckpointBytesByPin(now);
+		const retainedCheckpointBytes = this.retainedCheckpointBytes(now);
 		return {
 			active: active.length,
-			softExpired: active.filter((pin) => pin.softExpiresAt <= now).length,
-			hardExpired: pins.length - active.length,
+			softExpired: pins.filter((pin) => pin.softExpiresAt <= now && pin.hardExpiresAt > now).length,
+			hardExpired: pins.filter((pin) => pin.hardExpiresAt <= now).length,
 			oldestActiveAgeMs: active.length > 0 ? Math.max(...active.map((pin) => now - pin.createdAt)) : null,
 			oldestProgressAgeMs: active.length > 0 ? Math.max(...active.map((pin) => now - pin.lastProgressAt)) : null,
+			retainedCheckpointBytes,
+			limits: {
+				...DEFAULT_HISTORY_PIN_LIMITS,
+				maxRetainedCheckpointBytes: this.historyPinRetainedCheckpointByteLimit(),
+			},
+			countLimitReached: active.length >= MAX_ACTIVE_HISTORY_PINS,
+			retainedBytesLimitReached: retainedCheckpointBytes >= this.historyPinRetainedCheckpointByteLimit(),
+			pins: active.map((pin) => ({
+				pinId: pin.pinId,
+				kind: pin.kind,
+				ownerId: pin.owner.id,
+				boundarySequence: pin.boundarySequence,
+				ageMs: now - pin.createdAt,
+				progressAgeMs: now - pin.lastProgressAt,
+				softExpiresAt: pin.softExpiresAt,
+				hardExpiresAt: pin.hardExpiresAt,
+				progress: pin.progress,
+				retainedCheckpointBytes: retainedByPin.get(pin.pinId) ?? 0,
+			})),
 		};
 	}
 
-	cleanupStuckPins(now = Date.now()): { released: number; failedOperations: number } {
+	cleanupStuckPins(now = Date.now()): { released: number; failedOperations: number; failedCaptures: number } {
 		this.initialize();
 		let released = 0;
 		let failedOperations = 0;
+		let failedCaptures = 0;
 		this.storage.transactionSync(() => {
 			const fail = this.storage.sql.exec(
 				`UPDATE vault_operations
-				 SET state = 'failed', error = 'history pin hard-expired', updated_at = ?
+				 SET state = 'failed', error = 'history pin expired', updated_at = ?
 				 WHERE state = 'running' AND operation_id IN (
-				   SELECT pin_id FROM vault_history_pins WHERE hard_expires_at <= ?
+				   SELECT pin_id FROM vault_history_pins WHERE soft_expires_at <= ? OR hard_expires_at <= ?
 				 )`,
+				now,
 				now,
 				now,
 			);
 			fail.toArray();
 			failedOperations = fail.rowsWritten;
+			const failCapture = this.storage.sql.exec(
+				`UPDATE recovery_captures
+				 SET state = 'failed', capability_hash = '', error = 'capture_authority_expired', updated_at = ?
+				 WHERE state NOT IN ('complete','complete_with_gaps','failed','cancelled') AND capture_id IN (
+				   SELECT pin_id FROM vault_history_pins
+				   WHERE kind = 'capture' AND (soft_expires_at <= ? OR hard_expires_at <= ?)
+				 )`,
+				now,
+				now,
+				now,
+			);
+			failCapture.toArray();
+			failedCaptures = failCapture.rowsWritten;
+			this.storage.sql.exec(
+				`DELETE FROM recovery_snapshot_dependencies
+				 WHERE operation_kind = 'capture' AND operation_id IN (
+				   SELECT pin_id FROM vault_history_pins
+				   WHERE kind = 'capture' AND (soft_expires_at <= ? OR hard_expires_at <= ?)
+				 )`,
+				now,
+				now,
+			).toArray();
 			const remove = this.storage.sql.exec(
-				"DELETE FROM vault_history_pins WHERE hard_expires_at <= ?",
+				"DELETE FROM vault_history_pins WHERE soft_expires_at <= ? OR hard_expires_at <= ?",
+				now,
 				now,
 			);
 			remove.toArray();
 			released = remove.rowsWritten;
+			if (released > 0) this.pruneUnpinnedDocumentHistory(now);
 		});
-		return { released, failedOperations };
+		return { released, failedOperations, failedCaptures };
+	}
+
+	/** Admission hook shared by bootstrap and recovery capture creation. */
+	protected assertHistoryPinCapacity(boundarySequence: number, hardTtlMs: number, now: number): void {
+		this.cleanupStuckPins(now);
+		assertHistoryPinAdmission({
+			activePins: this.activePins(now).length,
+			retainedCheckpointBytes: this.retainedCheckpointBytes(now, boundarySequence),
+			requestedHardTtlMs: hardTtlMs,
+		}, {
+			...DEFAULT_HISTORY_PIN_LIMITS,
+			maxRetainedCheckpointBytes: this.historyPinRetainedCheckpointByteLimit(),
+		});
+	}
+
+	private retainedCheckpointBytesByPin(now: number): Map<string, number> {
+		const rows = this.storage.sql.exec<{ pin_id: string; bytes: number }>(
+			`WITH logical_checkpoint AS (
+			   SELECT c.document_id, c.checkpoint_sequence, SUM(length(c.data)) AS bytes
+			   FROM vault_checkpoints c JOIN vault_checkpoint_manifests m
+			     ON m.document_id = c.document_id AND m.checkpoint_sequence = c.checkpoint_sequence
+			   WHERE m.complete = 1 GROUP BY c.document_id, c.checkpoint_sequence
+			 )
+			 SELECT p.pin_id, COALESCE(SUM(c.bytes), 0) AS bytes
+			 FROM vault_history_pins p LEFT JOIN logical_checkpoint c
+			   ON c.checkpoint_sequence = (
+			     SELECT MAX(x.checkpoint_sequence) FROM logical_checkpoint x
+			     WHERE x.document_id = c.document_id AND x.checkpoint_sequence <= p.boundary_sequence
+			   )
+			 WHERE p.soft_expires_at > ? AND p.hard_expires_at > ?
+			 GROUP BY p.pin_id`,
+			now,
+			now,
+		).toArray();
+		return new Map(rows.map((row) => [row.pin_id, row.bytes]));
 	}
 
 	private mapPin(row: {
@@ -530,6 +695,7 @@ export class VaultBootstrapStore extends VaultCatalogStore {
 		return {
 			pinId: row.pin_id,
 			kind: row.kind,
+			owner: { kind: row.kind, id: row.pin_id },
 			boundarySequence: row.boundary_sequence,
 			createdAt: row.created_at,
 			softExpiresAt: row.soft_expires_at,

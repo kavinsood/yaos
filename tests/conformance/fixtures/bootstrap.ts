@@ -48,7 +48,8 @@ assert.equal(complete.response.status, 200);
 assert.ok(typeof complete.body?.currentHighWater === "number" && complete.body.currentHighWater > descriptorCatalog.highWater);
 
 const catchUpResponse = await fetch(vaultUrl(target.deviceA, "catch-up"), {
-	method: "POST", headers: bearer(target.deviceA, { "content-type": "application/json" }), body: JSON.stringify({ bodies: [{ bodyId: after.bodyId }] }),
+	method: "POST", headers: bearer(target.deviceA, { "content-type": "application/json" }),
+	body: JSON.stringify({ bodies: [{ bodyId: after.bodyId, bodyEpoch: 1 }] }),
 });
 assert.equal(catchUpResponse.status, 200);
 assert.ok(catchUpResponse.headers.get("content-type")?.startsWith(YAOS_BINARY_CONTENT_TYPE));

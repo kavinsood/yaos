@@ -1,6 +1,5 @@
 import * as Y from "yjs";
 import YSyncProvider from "y-partyserver/provider";
-import WebSocket from "ws";
 import { PROTOCOL_VERSION, SCHEMA_VERSION } from "../../src/sync/schema.ts";
 import type {
 	LifecycleReceipt as ServerLifecycleReceipt,
@@ -10,6 +9,7 @@ import { describeFatalFrame, onFatalFrame } from "./fatalFrame.ts";
 import {
 	deviceBearerHeaders,
 	fetchSocketTicket,
+	LiveWebSocket as WebSocket,
 	type LiveIdentity,
 } from "./liveIdentity.ts";
 import { decodeBinaryEnvelope, encodeBinaryEnvelope, YAOS_BINARY_CONTENT_TYPE } from "../../server/src/shared/binaryEnvelope.ts";
@@ -66,6 +66,7 @@ function parseLifecycleReceipt(value: unknown): LifecycleReceipt {
 		vaultId: requiredString(value.vaultId, "lifecycle receipt vaultId"),
 		vaultGeneration: requiredString(value.vaultGeneration, "lifecycle receipt vaultGeneration"),
 		bodyId: requiredString(value.bodyId, "lifecycle receipt bodyId"),
+		bodyEpoch: requiredInteger(value.bodyEpoch, "lifecycle receipt bodyEpoch"),
 		fileId: requiredString(value.fileId, "lifecycle receipt fileId"),
 		operationId: requiredString(value.operationId, "lifecycle receipt operationId"),
 		kind: value.kind,
@@ -153,7 +154,7 @@ export async function connectDocument(
 				protocolVersion: String(PROTOCOL_VERSION),
 			};
 		},
-		WebSocketPolyfill: globalThis.WebSocket ?? WebSocket,
+		WebSocketPolyfill: WebSocket as unknown as typeof globalThis.WebSocket,
 		connect: false,
 		maxBackoffTime: 500,
 	});
@@ -206,6 +207,8 @@ async function publishRoot(
 ): Promise<void> {
 	const current = await fetch(vaultRoute(identity, "root"), { headers: deviceBearerHeaders(identity) });
 	if (!current.ok) throw new Error(`root read failed (${current.status})`);
+	const rootEpoch = Number(current.headers.get("x-yaos-root-epoch"));
+	if (!Number.isSafeInteger(rootEpoch) || rootEpoch < 1) throw new Error("root read omitted root epoch");
 	const root = new Y.Doc({ guid: "root-publication" });
 	Y.applyUpdate(root, new Uint8Array(await current.arrayBuffer()));
 	const before = Y.encodeStateVector(root);
@@ -213,6 +216,10 @@ async function publishRoot(
 	if (request.kind === "rename") paths.delete(request.fromPath!);
 	if (request.kind === "delete") paths.delete(receipt.path);
 	else paths.set(receipt.path, request.fileId);
+	root.getMap("__yaosLifecycle").set(request.operationId, {
+		kind: request.kind, fileId: request.fileId, bodyId: request.bodyId,
+		path: request.path ?? null, fromPath: request.fromPath ?? null, toPath: request.toPath ?? null,
+	});
 	const update = Y.encodeStateAsUpdate(root, before);
 	root.destroy();
 	const { response, body } = await requestJson(identity, "lifecycle/publish", {
@@ -221,6 +228,7 @@ async function publishRoot(
 		body: encodeBinaryEnvelope({
 			operations: [{ ...request, vaultSequence: receipt.vaultSequence }],
 			rootUpdate: update,
+			rootEpoch,
 		}),
 	});
 	if (response.status !== 200) throw new Error(`root publication failed (${response.status}): ${JSON.stringify(body)}`);
@@ -243,6 +251,7 @@ export async function createBody(
 		kind: "create",
 		fileId: bodyId,
 		bodyId,
+		bodyEpoch: 1,
 		path,
 		candidateId,
 		candidateDigest,
@@ -254,6 +263,7 @@ export async function createBody(
 			"Content-Type": "application/octet-stream",
 			"x-yaos-candidate-id": candidateId,
 			"x-yaos-candidate-digest": candidateDigest,
+			"x-yaos-body-epoch": "1",
 		}),
 		body: update,
 	});
@@ -275,6 +285,7 @@ export async function submitBodyUpdate(
 			"Content-Type": "application/octet-stream",
 			"x-yaos-candidate-id": candidateId,
 			"x-yaos-candidate-digest": await sha256Hex(update),
+			"x-yaos-body-epoch": "1",
 		}),
 		body: update,
 	});

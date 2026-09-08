@@ -19,7 +19,7 @@ const s = suite("bootstrap-http-boundaries");
 function response(overrides: Partial<BootstrapHttpResponse> = {}): BootstrapHttpResponse {
 	return {
 		status: 200,
-		headers: { "x-yaos-generation": "7" },
+		headers: { "x-yaos-generation": "7", "x-yaos-body-epoch": "1", "x-yaos-root-epoch": "1" },
 		arrayBuffer: new Uint8Array([1, 2, 3]).buffer,
 		json: {},
 		...overrides,
@@ -32,7 +32,7 @@ s.test("HTTP adapter consumes authenticated root, catalog, and body boundaries d
 	const request = async (input: BootstrapHttpRequest): Promise<BootstrapHttpResponse> => {
 		requests.push(input);
 		if (input.url.endsWith("/bootstrap/start")) {
-			return response({ json: { bootstrapId: "boot" } });
+			return response({ json: { bootstrapId: "boot/id", capture: { rootEpoch: 1 } } });
 		}
 		if (input.url.includes("/catalog?")) {
 			return response({ json: { entries: [], nextCursor: null } });
@@ -44,6 +44,7 @@ s.test("HTTP adapter consumes authenticated root, catalog, and body boundaries d
 				path: "Current.md",
 				previousPath: null,
 				lifecycle: "active",
+				bodyEpoch: 1,
 				generation: 8,
 				contentHash: "a".repeat(64),
 				size: 3,
@@ -72,7 +73,7 @@ s.test("HTTP adapter consumes authenticated root, catalog, and body boundaries d
 	assert.equal((await port.currentBody("body/id")).generation, 7);
 	await port.settleRootThrough(41);
 	assert.equal((await port.bodies("boot/id", [])).size, 0);
-	const caught = await port.catchUpBodies([{ bodyId: "body-current", generation: 7 }]);
+	const caught = await port.catchUpBodies([{ bodyId: "body-current", bodyEpoch: 1, generation: 7 }]);
 	assert.deepEqual(caught.get("body-current")?.state?.encodedState, new Uint8Array([1, 2, 3]));
 
 	assert.deepEqual(
@@ -130,7 +131,7 @@ s.test("oversized bootstrap batches split and a single oversized body falls back
 	const request = async (input: BootstrapHttpRequest): Promise<BootstrapHttpResponse> => {
 		requests.push(input);
 		if (input.method === "POST") return response({ status: 413, json: { error: "bootstrap_response_too_large" } });
-		return response({ headers: { "x-yaos-generation": "11" }, arrayBuffer: new Uint8Array([4, 5, 6]).buffer });
+		return response({ headers: { "x-yaos-generation": "11", "x-yaos-body-epoch": "1" }, arrayBuffer: new Uint8Array([4, 5, 6]).buffer });
 	};
 	const port = new BootstrapHttpPort("https://sync.test", "vault", "token", {} as never, request);
 	const states = await port.bodies("boot", ["large-a", "large-b"]);
@@ -151,13 +152,14 @@ s.test("a single oversized catch-up body falls back to generation-matched raw st
 		if (input.url.endsWith("/head/large")) {
 			return response({ json: {
 				bodyId: "large", fileId: "large", path: "large.md", generation: 17,
+				bodyEpoch: 1,
 				contentHash: "a".repeat(64), size: 1_700_000,
 			} });
 		}
-		return response({ headers: { "x-yaos-generation": "17" }, arrayBuffer: new Uint8Array([7, 8, 9]).buffer });
+		return response({ headers: { "x-yaos-generation": "17", "x-yaos-body-epoch": "1" }, arrayBuffer: new Uint8Array([7, 8, 9]).buffer });
 	};
 	const port = new BootstrapHttpPort("https://sync.test", "vault", "token", {} as never, request);
-	const caught = await port.catchUpBodies([{ bodyId: "large", generation: 16 }]);
+	const caught = await port.catchUpBodies([{ bodyId: "large", bodyEpoch: 1, generation: 16 }]);
 	assert.equal(caught.get("large")?.head.path, "large.md");
 	assert.deepEqual(caught.get("large")?.state?.encodedState, new Uint8Array([7, 8, 9]));
 	assert.deepEqual(requests.map((entry) => entry.method), ["POST", "GET", "GET"]);
@@ -194,6 +196,9 @@ s.test("VaultSync HTTP injection sends candidate bytes without copying", async (
 	await port.submitCandidate({
 		vaultId: "vault/id",
 		bodyId: "body/id",
+		bodyEpoch: 1,
+		previousBaseline: "",
+		pendingMarkdown: "test",
 		candidateId: "candidate",
 		candidateDigest: "digest",
 		encodedUpdate,

@@ -2,21 +2,40 @@ import { base64UrlToBytes, bytesToBase64Url, randomBase64Url } from "../base64ur
 import type { VaultActorContext } from "../collaboration";
 import { sha256Hex } from "../hex";
 import type { AuthState, Env } from "./types";
+import {
+	parseSemanticEpoch,
+	semanticEpochOf,
+	type SemanticEpoch,
+	type SemanticEpochScope,
+} from "../shared/semanticEpoch";
 
-const TICKET_VERSION = 3;
+const TICKET_VERSION = 4;
 const TICKET_AUDIENCE = "yaos-vault-ws";
 export const TICKET_TTL_MS = 5 * 60 * 1_000;
 const MAX_TICKET_TTL_MS = 24 * 60 * 60 * 1_000;
 
-export interface TicketPayload extends VaultActorContext {
-	v: 3;
+interface TicketPayloadFields extends VaultActorContext {
+	v: 4;
 	aud: "yaos-vault-ws";
 	deploymentId: string;
-	purpose: "root" | "body" | "semantic";
-	documentId: string;
 	iat: number;
 	exp: number;
 	nonce: string;
+}
+
+/** The signed ticket binds one actor to one CRDT identity lineage. */
+type TicketEpochScope = SemanticEpochScope
+	| { purpose: "semantic"; documentId: string; bodyEpoch: SemanticEpoch };
+
+export type TicketPayload = TicketPayloadFields & TicketEpochScope;
+
+export interface ExpectedTicketScope {
+	vaultId: string;
+	vaultGeneration?: string;
+	purpose?: "root" | "body" | "semantic";
+	documentId?: string;
+	rootEpoch?: number;
+	bodyEpoch?: number;
 }
 
 function readTicketTtlMs(raw: string | undefined): number {
@@ -36,14 +55,17 @@ async function deploymentId(authState: AuthState): Promise<string> {
 }
 
 export async function createTicket(authState: AuthState, actor: VaultActorContext,
-	purpose: "root" | "body" | "semantic", documentId: string, ttlMs = TICKET_TTL_MS,
+	scope: TicketEpochScope, ttlMs = TICKET_TTL_MS,
 ): Promise<{ ticket: string; expiresAt: number; ttlMs: number }> {
 	if (authState.mode !== "claim") throw new Error("cannot sign ticket: server is unavailable");
-	if ((purpose === "root") !== (documentId === "root")) throw new Error("ticket purpose does not match document");
+	if (scope.purpose === "semantic") {
+		if (!scope.documentId || scope.documentId === "root") throw new Error("invalid semantic epoch scope identity");
+		parseSemanticEpoch(scope.bodyEpoch, "semantic document epoch");
+	} else semanticEpochOf(scope);
 	const now = Date.now();
 	const exp = now + ttlMs;
 	const payload: TicketPayload = { ...actor, v: TICKET_VERSION, aud: TICKET_AUDIENCE,
-		deploymentId: await deploymentId(authState), purpose, documentId,
+		deploymentId: await deploymentId(authState), ...scope,
 		iat: now, exp, nonce: randomBase64Url(16) };
 	const encodedPayload = bytesToBase64Url(new TextEncoder().encode(JSON.stringify(payload)));
 	const signature = await crypto.subtle.sign("HMAC", await importSigningKey(authState.ticketSigningKey),
@@ -52,7 +74,7 @@ export async function createTicket(authState: AuthState, actor: VaultActorContex
 }
 
 export async function inspectTicket(ticket: string, authState: AuthState,
-	expected: string | { vaultId: string; vaultGeneration?: string; purpose?: "root" | "body" | "semantic"; documentId?: string },
+	expected: string | ExpectedTicketScope,
 ): Promise<TicketPayload | null> {
 	if (authState.mode !== "claim") return null;
 	const scope = typeof expected === "string" ? { vaultId: expected } : expected;
@@ -72,6 +94,11 @@ export async function inspectTicket(ticket: string, authState: AuthState,
 		|| (scope.vaultGeneration !== undefined && payload.vaultGeneration !== scope.vaultGeneration)
 		|| (scope.purpose !== undefined && payload.purpose !== scope.purpose)
 		|| (scope.documentId !== undefined && payload.documentId !== scope.documentId)
+		|| ("rootEpoch" in scope && scope.rootEpoch !== undefined
+			&& (payload.purpose !== "root" || payload.rootEpoch !== scope.rootEpoch))
+		|| ("bodyEpoch" in scope && scope.bodyEpoch !== undefined
+			&& ((payload.purpose !== "body" && payload.purpose !== "semantic")
+				|| payload.bodyEpoch !== scope.bodyEpoch))
 		|| payload.exp <= Date.now() || payload.iat > Date.now() + 60_000) return null;
 	return payload;
 }
@@ -83,11 +110,14 @@ export async function verifyTicket(ticket: string, authState: AuthState, expecte
 function isTicketPayload(value: unknown): value is TicketPayload {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
 	const payload = value as Record<string, unknown>;
-	return payload.v === 3 && payload.aud === "yaos-vault-ws"
+	return payload.v === 4 && payload.aud === "yaos-vault-ws"
 		&& typeof payload.deploymentId === "string" && payload.deploymentId.length > 0
 		&& (payload.purpose === "root" || payload.purpose === "body" || payload.purpose === "semantic")
 		&& typeof payload.documentId === "string" && payload.documentId.length > 0
 		&& (payload.purpose === "root") === (payload.documentId === "root")
+		&& (payload.purpose === "root"
+			? Number.isSafeInteger(payload.rootEpoch) && (payload.rootEpoch as number) >= 1 && payload.bodyEpoch === undefined
+			: Number.isSafeInteger(payload.bodyEpoch) && (payload.bodyEpoch as number) >= 1 && payload.rootEpoch === undefined)
 		&& typeof payload.vaultId === "string" && payload.vaultId.length > 0
 		&& typeof payload.vaultGeneration === "string" && payload.vaultGeneration.length > 0
 		&& typeof payload.principalId === "string" && payload.principalId.length > 0
@@ -106,11 +136,23 @@ export async function handleTicketRoute(req: Request, authState: AuthState, acto
 	json: (body: unknown, status?: number) => Response, env?: Env,
 ): Promise<Response> {
 	try {
-		let input: { purpose?: unknown; documentId?: unknown } = {};
+		let input: { purpose?: unknown; documentId?: unknown; rootEpoch?: unknown; bodyEpoch?: unknown } = {};
 		try { input = await req.json(); } catch { /* invalid below */ }
 		if ((input.purpose !== "root" && input.purpose !== "body" && input.purpose !== "semantic")
 			|| typeof input.documentId !== "string" || input.documentId.length === 0) return json({ error: "invalid_ticket_scope" }, 400);
-		const result = await createTicket(authState, actor, input.purpose, input.documentId, readTicketTtlMs(env?.YAOS_TICKET_TTL_MS));
+		let scope: TicketEpochScope;
+		try {
+			scope = input.purpose === "root"
+				? { purpose: "root", documentId: "root", rootEpoch: parseSemanticEpoch(input.rootEpoch, "root epoch") }
+				: { purpose: input.purpose, documentId: input.documentId,
+					bodyEpoch: parseSemanticEpoch(input.bodyEpoch, `${input.purpose} epoch`) };
+			if (scope.purpose === "semantic") {
+				if (scope.documentId === "root") throw new Error("invalid semantic ticket scope");
+			} else semanticEpochOf(scope);
+		} catch {
+			return json({ error: "invalid_ticket_scope" }, 400);
+		}
+		const result = await createTicket(authState, actor, scope, readTicketTtlMs(env?.YAOS_TICKET_TTL_MS));
 		if (env) try {
 			await env.YAOS_CONFIG.call("global-config", new Request("https://internal/__yaos/touch-device", {
 				method: "POST", headers: { "Content-Type": "application/json" },

@@ -1,6 +1,7 @@
 /** Fetches and caches the mandatory short-lived WebSocket ticket. */
 
 import { obsidianRequest, type HttpRequester } from "../utils/http";
+import type { SemanticEpoch, SemanticEpochScope } from "@shared/semanticEpoch";
 
 
 /**
@@ -39,10 +40,11 @@ export interface CachedSocketTicket {
 	ttlMs: number;
 }
 
-export interface SocketTicketScope {
-	purpose: "root" | "body" | "semantic";
+export type SocketTicketScope = SemanticEpochScope | {
+	purpose: "semantic";
 	documentId: string;
-}
+	bodyEpoch: SemanticEpoch;
+};
 
 export interface SocketTicketCache {
 	get(host: string, deviceToken: string, vaultId: string, scope: SocketTicketScope): Promise<CachedSocketTicket>;
@@ -57,7 +59,8 @@ export function createSocketTicketCache(request: HttpRequester = obsidianRequest
 
 	return {
 		async get(host: string, deviceToken: string, vaultId: string, scope: SocketTicketScope): Promise<CachedSocketTicket> {
-			const key = `${host.replace(/\/$/, "")}\0${deviceToken}\0${vaultId}\0${scope.purpose}\0${scope.documentId}`;
+			const semanticEpoch = scope.purpose === "root" ? scope.rootEpoch : scope.bodyEpoch;
+			const key = `${host.replace(/\/$/, "")}\0${deviceToken}\0${vaultId}\0${scope.purpose}\0${scope.documentId}\0${semanticEpoch}`;
 			const now = Date.now();
 			if (cached && cachedKey === key && cached.localExpiresAt - now > TICKET_REFRESH_BUFFER_MS) {
 				return cached;

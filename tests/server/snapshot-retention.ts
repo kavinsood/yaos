@@ -48,7 +48,7 @@ class RetentionStore extends VaultStore {
 			vaultId,
 			vaultGeneration,
 			schemaVersion: 8 as const,
-			storageFormatVersion: 3 as const,
+			storageFormatVersion: 4 as const,
 			provisionedAt: 1,
 		};
 	}

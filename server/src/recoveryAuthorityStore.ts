@@ -1,5 +1,4 @@
 import { canonicalJsonText } from "./recoveryCanonicalJson";
-import { decodeSqlChunks, type DurableChunkValue } from "./vaultDocumentStore";
 import { DEFAULT_SOFT_TTL_MS, VaultBootstrapStore } from "./vaultBootstrapStore";
 import type { BodyLifecycle } from "./vaultCatalogStore";
 
@@ -333,6 +332,7 @@ export class RecoveryAuthorityStore extends VaultBootstrapStore {
 		if (input.capabilityExpiresAt !== input.hardExpiresAt || input.softExpiresAt > input.hardExpiresAt || now >= input.softExpiresAt) {
 			throw new Error("invalid capture expiry");
 		}
+		this.assertHistoryPinCapacity(input.boundarySequence, input.hardExpiresAt - now, now);
 		this.storage.transactionSync(() => {
 			this.storage.sql.exec(
 				`INSERT INTO vault_history_pins(
@@ -441,15 +441,24 @@ export class RecoveryAuthorityStore extends VaultBootstrapStore {
 
 	setRecoveryCaptureState(captureId: string, state: RecoveryCaptureState, error: string | null = null, now = Date.now()): CaptureDescriptor {
 		this.initialize();
-		const update = this.storage.sql.exec(
-			"UPDATE recovery_captures SET state = ?, error = ?, updated_at = ? WHERE capture_id = ?",
-			state,
-			error,
-			now,
-			captureId,
-		);
-		update.toArray();
-		if (update.rowsWritten === 0) throw new Error("capture not found");
+		this.storage.transactionSync(() => {
+			const update = this.storage.sql.exec(
+				"UPDATE recovery_captures SET state = ?, error = ?, updated_at = ? WHERE capture_id = ?",
+				state,
+				error,
+				now,
+				captureId,
+			);
+			update.toArray();
+			if (update.rowsWritten === 0) throw new Error("capture not found");
+			if (state === "complete" || state === "complete_with_gaps" || state === "failed" || state === "cancelled") {
+				this.releaseHistoryPinInTransaction(captureId, now);
+				this.storage.sql.exec(
+					"DELETE FROM recovery_snapshot_dependencies WHERE operation_kind = 'capture' AND operation_id = ?",
+					captureId,
+				).toArray();
+			}
+		});
 		const result = this.recoveryCapture(captureId);
 		if (!result) throw new Error("capture disappeared");
 		return result;
@@ -468,7 +477,7 @@ export class RecoveryAuthorityStore extends VaultBootstrapStore {
 		const ids = this.storage.sql.exec<{ capture_id: string }>(
 			`SELECT c.capture_id FROM recovery_captures c
 			 JOIN vault_history_pins p ON p.pin_id = c.capture_id
-			 WHERE c.state NOT IN ('complete','failed')
+			 WHERE c.state NOT IN ('complete','complete_with_gaps','failed')
 			   AND (p.soft_expires_at <= ? OR p.hard_expires_at <= ? OR c.capability_expires_at <= ?)
 			 ORDER BY c.updated_at LIMIT ?`,
 			now,
@@ -488,7 +497,7 @@ export class RecoveryAuthorityStore extends VaultBootstrapStore {
 					now,
 					captureId,
 				).toArray();
-				this.storage.sql.exec("DELETE FROM vault_history_pins WHERE pin_id = ?", captureId).toArray();
+				this.releaseHistoryPinInTransaction(captureId, now);
 				this.storage.sql.exec("DELETE FROM recovery_snapshot_dependencies WHERE operation_kind = 'capture' AND operation_id = ?", captureId).toArray();
 			}
 		});
@@ -659,29 +668,7 @@ export class RecoveryAuthorityStore extends VaultBootstrapStore {
 		if (!head || head.generation !== generation || head.contentHash === null || head.size === null) {
 			throw new Error("body generation is outside capture plan");
 		}
-		const checkpoint = this.storage.sql.exec<{ checkpoint_sequence: number }>(
-			`SELECT checkpoint_sequence FROM vault_checkpoints
-			 WHERE document_id = ? AND checkpoint_sequence <= ? ORDER BY checkpoint_sequence DESC LIMIT 1`,
-			bodyId,
-			capture.boundarySequence,
-		).toArray()[0];
-		const checkpointSequence = checkpoint?.checkpoint_sequence ?? 0;
-		let encodedHistoryBytes = 0;
-		if (checkpoint) {
-			const chunks = this.storage.sql.exec<{ data: DurableChunkValue }>(
-				"SELECT data FROM vault_checkpoints WHERE document_id = ? AND checkpoint_sequence = ? ORDER BY chunk_index",
-				bodyId,
-				checkpointSequence,
-			);
-			encodedHistoryBytes += decodeSqlChunks(chunks).byteLength;
-		}
-		encodedHistoryBytes += this.storage.sql.exec<{ bytes: number }>(
-			`SELECT COALESCE(SUM(update_byte_length), 0) AS bytes FROM vault_journal
-			 WHERE document_id = ? AND sequence > ? AND sequence <= ?`,
-			bodyId,
-			checkpointSequence,
-			capture.boundarySequence,
-		).one().bytes;
+		const encodedHistoryBytes = this.documentEncodedHistoryBytes(bodyId, capture.boundarySequence);
 		this.storage.sql.exec(
 			`INSERT INTO recovery_recipes(
 			 recipe_id, capture_id, body_id, generation, expected_content_hash, expected_size, encoded_history_bytes
@@ -1417,7 +1404,7 @@ export class RecoveryAuthorityStore extends VaultBootstrapStore {
 				input.completedAt,
 				input.captureId,
 			).toArray();
-			this.storage.sql.exec("DELETE FROM vault_history_pins WHERE pin_id = ?", input.captureId).toArray();
+			this.releaseHistoryPinInTransaction(input.captureId, input.completedAt);
 			this.storage.sql.exec(
 				"DELETE FROM recovery_snapshot_dependencies WHERE operation_kind = 'capture' AND operation_id = ?",
 				input.captureId,
@@ -1692,6 +1679,9 @@ export class RecoveryAuthorityStore extends VaultBootstrapStore {
 		const restoreIds = this.storage.sql.exec<{ operation_id: string }>(
 			"SELECT DISTINCT operation_id FROM recovery_snapshot_dependencies WHERE operation_kind = 'restore'",
 		).toArray().map((row) => row.operation_id);
+		const capturePinIds = this.storage.sql.exec<{ pin_id: string }>(
+			"SELECT pin_id FROM vault_history_pins WHERE kind = 'capture'",
+		).toArray().map((row) => row.pin_id);
 		this.storage.transactionSync(() => {
 			this.storage.sql.exec(
 				"INSERT OR IGNORE INTO vault_deletion_authority(id, deletion_id, vault_generation, begun_at) VALUES (1, ?, ?, ?)",
@@ -1716,7 +1706,7 @@ export class RecoveryAuthorityStore extends VaultBootstrapStore {
 				 WHERE state IN ('initializing','active')`,
 				now,
 			).toArray();
-			this.storage.sql.exec("DELETE FROM vault_history_pins WHERE kind = 'capture'").toArray();
+			for (const pinId of capturePinIds) this.releaseHistoryPinInTransaction(pinId, now);
 			this.storage.sql.exec("UPDATE recovery_projection_lease SET enabled = 0, capability_hash = '', updated_at = ? WHERE id = 1", now).toArray();
 			this.storage.sql.exec(
 				"UPDATE recovery_gc_epochs SET state = 'aborted', capability_hash = '' WHERE state IN ('marking','sweeping')",

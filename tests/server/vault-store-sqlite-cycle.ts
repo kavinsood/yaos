@@ -89,7 +89,7 @@ export class StoreCycle {
     const largeUpdate = incremental(body, () => body.getText("payload").insert(0, "x".repeat(1_200_000)));
     const largeCommit = store.commitUpdate({ documentId: "sqlite-cycle-body", update: largeUpdate, kind: "body" });
     const largeUpdateStorage = this.state.storage.sql.exec(
-      "SELECT COUNT(*) AS chunks, MIN(typeof(data)) AS storage_type, COALESCE(SUM(length(data)), 0) AS stored_bytes FROM vault_journal_chunks WHERE sequence = ?",
+      "SELECT 1 AS chunks, typeof(data) AS storage_type, length(data) AS stored_bytes FROM vault_journal WHERE sequence = ?",
       largeCommit.vaultSequence,
     ).one();
     for (let index = 0; index < 60; index++) {
@@ -157,6 +157,7 @@ export class StoreCycle {
 	  catalogRoot.getMap("pathToBlob").set("assets/atomic.bin", { hash: attachmentHash, size: 1, revision: attachmentOperationId });
 	  catalogRoot.getMap("blobMeta").set(attachmentHash, { size: 1, mime: "application/octet-stream", createdAt: 700 });
 	});
+	const attachmentExpectedHead = store.documentHead("root")!;
 	const attachmentCommit = store.commitRootAttachments(attachmentUpdate, [{
 	  operationId: attachmentOperationId,
 	  path: "assets/atomic.bin",
@@ -164,7 +165,7 @@ export class StoreCycle {
 	  size: 1,
 	  mime: "application/octet-stream",
 	  lifecycle: "active",
-	}], { operationId: attachmentOperationId, requestDigest: "b".repeat(64) }, 700);
+	}], { operationId: attachmentOperationId, requestDigest: "b".repeat(64), rootEpoch: 1 }, attachmentExpectedHead, 700);
 	const attachmentHead = store.attachmentHead("assets/atomic.bin");
 	const attachmentOperation = store.attachmentOperation(attachmentOperationId);
 	const beforeFailedAttachmentSequence = store.currentSequence();
@@ -173,6 +174,7 @@ export class StoreCycle {
 	});
 	let attachmentCommitRejected = false;
 	try {
+	  const failedExpectedHead = store.documentHead("root")!;
 	  store.commitRootAttachments(failedAttachmentUpdate, [{
 	    operationId: attachmentOperationId,
 	    path: "assets/must-rollback.bin",
@@ -180,7 +182,7 @@ export class StoreCycle {
 	    size: 1,
 	    mime: "application/octet-stream",
 	    lifecycle: "active",
-	  }], { operationId: attachmentOperationId, requestDigest: "c".repeat(64) }, 701);
+	  }], { operationId: attachmentOperationId, requestDigest: "c".repeat(64), rootEpoch: 1 }, failedExpectedHead, 701);
 	} catch {
 	  attachmentCommitRejected = true;
 	}
@@ -188,6 +190,7 @@ export class StoreCycle {
 	const attachmentAtomicity = attachmentCommit.vaultSequence === attachmentHead?.sequence
 	  && attachmentCommit.vaultSequence === attachmentOperation?.rootSequence
 	  && attachmentCommit.generation === attachmentOperation?.rootGeneration
+	  && attachmentCommit.semanticEpoch === attachmentOperation?.rootEpoch
 	  && attachmentCommitRejected
 	  && store.currentSequence() === beforeFailedAttachmentSequence
 	  && store.attachmentHead("assets/must-rollback.bin") === null
@@ -342,6 +345,7 @@ export class StoreCycle {
 	  clientId: ownerActor.deviceId,
 	  candidateId: "candidate-changed-sqlite-cycle",
 	  candidateDigest: "c".repeat(64),
+	  bodyEpoch: beforeChangedCandidate?.semanticEpoch ?? 1,
 	  update: changedCandidateUpdate,
 	  expectedHead: beforeChangedCandidate,
 	  changesState: true,
@@ -361,6 +365,7 @@ export class StoreCycle {
 		clientId: ownerActor.deviceId,
 		candidateId: "candidate-stale-sqlite-cycle",
 		candidateDigest: "b".repeat(64),
+		bodyEpoch: beforeChangedCandidate?.semanticEpoch ?? 1,
 		update: changedCandidateUpdate,
 		expectedHead: beforeChangedCandidate,
 		changesState: true,
@@ -384,6 +389,7 @@ export class StoreCycle {
 	  clientId: ownerActor.deviceId,
 	  candidateId: "candidate-redundant-sqlite-cycle",
 	  candidateDigest: "d".repeat(64),
+	  bodyEpoch: beforeRedundantCandidate?.semanticEpoch ?? 1,
 	  update: redundantCandidateUpdate,
 	  expectedHead: beforeRedundantCandidate,
 	  changesState: false,
@@ -549,7 +555,7 @@ s.test("VaultStore completes journal/checkpoint/pin/feed-floor cycle on real SQL
 		s.check(
 			result.metadata.created && result.metadata.replayed && result.metadata.generationFenceRejected
 				&& result.metadata.persisted && result.metadata.bootstrapCycle
-				&& result.metadata.schemaVersion === 8 && result.metadata.storageFormatVersion === 3,
+				&& result.metadata.schemaVersion === 8 && result.metadata.storageFormatVersion === 4,
 			"schema-8 metadata persists vaultGeneration and rejects a different provisioning incarnation",
 		);
 		s.check(result.before.entries === 61 && result.before.bytes > 1_200_000, "real SQLite journal contains the large update plus all semantic body edits");

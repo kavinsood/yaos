@@ -2,6 +2,7 @@ import * as Y from "yjs";
 import { sha256Hex } from "./hex";
 import { SERVER_SCHEMA_VERSION, SERVER_STORAGE_FORMAT_VERSION } from "./version";
 import { isValidOperationId, type CatalogHeadAtBoundary, type SemanticCatalogHead, type VaultOperation, type VaultStore } from "./vaultStore";
+import type { SemanticEpoch } from "./shared/semanticEpoch";
 
 const DEFAULT_PAGE_SIZE = 1000;
 const SOFT_TTL_MS = 60 * 60_000;
@@ -18,12 +19,13 @@ export interface BootstrapDescriptor {
 	format: "yaos-bootstrap-v2";
 	bootstrapId: string;
 	schemaVersion: 8;
-	storageFormatVersion: 3;
+	storageFormatVersion: 4;
 	createdAt: string;
 	serverCompleted: boolean;
 	expiresAt: string;
 	capture: {
 		vaultSequence: number;
+		rootEpoch: SemanticEpoch;
 		rootGeneration: number;
 		rootCheckpointHash: string;
 		rootCheckpointBytes: number;
@@ -48,6 +50,7 @@ export interface BootstrapCatalogPage {
 
 export interface BootstrapBodyState {
 	bodyId: string;
+	bodyEpoch: SemanticEpoch;
 	generation: number;
 	throughSequence: number;
 	encodedState: Uint8Array;
@@ -62,6 +65,7 @@ export interface BootstrapSemanticCatalogPage {
 
 export interface BootstrapSemanticState {
 	documentId: string;
+	bodyEpoch: SemanticEpoch;
 	generation: number;
 	throughSequence: number;
 	encodedState: Uint8Array;
@@ -69,7 +73,11 @@ export interface BootstrapSemanticState {
 
 /** Owns one exact SQLite-backed bootstrap boundary; object storage is never required. */
 export class BootstrapService {
-	constructor(private readonly store: VaultStore, private readonly now: () => number = Date.now) {}
+	constructor(
+		private readonly store: VaultStore,
+		private readonly now: () => number = Date.now,
+		private readonly reserveFullState: (documentId: string, overlappingCopies: number) => () => void = () => () => {},
+	) {}
 
 	async start(attemptId?: string): Promise<BootstrapDescriptor> {
 		const now = this.now();
@@ -78,7 +86,7 @@ export class BootstrapService {
 		let operation = attemptId ? this.store.getOperation(attemptId) : this.store.runningOperation("bootstrap");
 		if (operation?.state === "failed") {
 			const pin = this.store.getPin(operation.operationId);
-			if (!pin || now >= pin.hardExpiresAt) throw new Error("bootstrap lease hard-expired");
+			if (!pin || now >= pin.softExpiresAt || now >= pin.hardExpiresAt) throw new Error("bootstrap lease expired");
 			operation = this.store.resumeFailedOperation(operation.operationId, now);
 		}
 		if (operation?.state === "complete") return this.describeOperation(operation);
@@ -106,12 +114,16 @@ export class BootstrapService {
 		return this.describeOperation(operation);
 	}
 
-	rootState(bootstrapId: string): { encodedState: Uint8Array; hash: Promise<string> } {
+	rootState(bootstrapId: string): { encodedState: Uint8Array; rootEpoch: SemanticEpoch; hash: Promise<string> } {
 		const operation = this.requireOperation(bootstrapId);
-		const reconstructed = this.store.reconstructDocument("root", operation.boundarySequence);
-		const encodedState = Y.encodeStateAsUpdate(reconstructed.doc);
-		reconstructed.doc.destroy();
-		return { encodedState, hash: sha256Hex(encodedState) };
+		const release = this.reserveFullState("root", 2);
+		try {
+			const reconstructed = this.store.reconstructDocument("root", operation.boundarySequence);
+			try {
+				const encodedState = Y.encodeStateAsUpdate(reconstructed.doc);
+				return { encodedState, rootEpoch: reconstructed.semanticEpoch, hash: sha256Hex(encodedState) };
+			} finally { reconstructed.doc.destroy(); }
+		} finally { release(); }
 	}
 
 	catalogPage(bootstrapId: string, cursor: string | null, limit = DEFAULT_PAGE_SIZE): BootstrapCatalogPage {
@@ -130,15 +142,20 @@ export class BootstrapService {
 		const operation = this.requireRunning(bootstrapId);
 		const catalog = this.store.getCatalogHeadAt(operation.boundarySequence, bodyId);
 		if (!catalog || catalog.lifecycle !== "active") throw new Error("body is not active at bootstrap boundary");
-		const reconstructed = this.store.reconstructDocument(bodyId, operation.boundarySequence);
-		const encodedState = Y.encodeStateAsUpdate(reconstructed.doc);
-		reconstructed.doc.destroy();
-		return {
-			bodyId,
-			generation: reconstructed.generation,
-			throughSequence: operation.boundarySequence,
-			encodedState,
-		};
+		const release = this.reserveFullState(bodyId, 2);
+		try {
+			const reconstructed = this.store.reconstructDocument(bodyId, operation.boundarySequence);
+			try {
+				const encodedState = Y.encodeStateAsUpdate(reconstructed.doc);
+				return {
+					bodyId,
+					bodyEpoch: reconstructed.semanticEpoch,
+					generation: reconstructed.generation,
+					throughSequence: operation.boundarySequence,
+					encodedState,
+				};
+			} finally { reconstructed.doc.destroy(); }
+		} finally { release(); }
 	}
 
 	semanticCatalogPage(bootstrapId: string, cursor: string | null, limit = DEFAULT_PAGE_SIZE): BootstrapSemanticCatalogPage {
@@ -153,11 +170,15 @@ export class BootstrapService {
 		const operation = this.requireRunning(bootstrapId);
 		const head = this.store.semanticHeadAt(operation.boundarySequence, documentId);
 		if (!head || head.lifecycle !== "active") throw new Error("semantic document is not active at bootstrap boundary");
-		const reconstructed = this.store.reconstructDocument(documentId, operation.boundarySequence);
-		const encodedState = Y.encodeStateAsUpdate(reconstructed.doc);
-		reconstructed.doc.destroy();
-		return { documentId, generation: reconstructed.generation,
-			throughSequence: operation.boundarySequence, encodedState };
+		const release = this.reserveFullState(documentId, 2);
+		try {
+			const reconstructed = this.store.reconstructDocument(documentId, operation.boundarySequence);
+			try {
+				const encodedState = Y.encodeStateAsUpdate(reconstructed.doc);
+				return { documentId, bodyEpoch: reconstructed.semanticEpoch, generation: reconstructed.generation,
+					throughSequence: operation.boundarySequence, encodedState };
+			} finally { reconstructed.doc.destroy(); }
+		} finally { release(); }
 	}
 
 	renew(bootstrapId: string, settledBodies: number): void {
@@ -183,39 +204,47 @@ export class BootstrapService {
 		if (operation.state !== "running") throw new Error(`bootstrap is ${operation.state}`);
 		const pin = this.store.getPin(bootstrapId);
 		if (!pin) throw new Error("bootstrap lease missing");
-		if (this.now() >= pin.hardExpiresAt) throw new Error("bootstrap lease hard-expired");
+		if (this.now() >= pin.softExpiresAt || this.now() >= pin.hardExpiresAt) throw new Error("bootstrap lease expired");
 		return operation;
 	}
 	private async describeOperation(operation: VaultOperation): Promise<BootstrapDescriptor> {
-		const reconstructed = this.store.reconstructDocument("root", operation.boundarySequence);
-		const rootGeneration = reconstructed.generation;
-		const encodedRoot = Y.encodeStateAsUpdate(reconstructed.doc);
-		reconstructed.doc.destroy();
-		const pin = this.store.getPin(operation.operationId);
-		return {
-			format: "yaos-bootstrap-v2",
-			bootstrapId: operation.operationId,
-			schemaVersion: SERVER_SCHEMA_VERSION,
-			storageFormatVersion: SERVER_STORAGE_FORMAT_VERSION as 3,
-			serverCompleted: operation.state === "complete",
-			createdAt: new Date(operation.createdAt).toISOString(),
-			expiresAt: new Date(pin?.softExpiresAt ?? operation.updatedAt).toISOString(),
-			capture: {
-				vaultSequence: operation.boundarySequence,
-				rootGeneration,
-				rootCheckpointKey: operation.artifactKey ?? `sql:root:${operation.boundarySequence}`,
-				rootCheckpointHash: operation.artifactHash ?? await sha256Hex(encodedRoot),
-				rootCheckpointBytes: encodedRoot.byteLength,
-			},
-			catalog: {
-				activeBodyCount: this.store.countActiveCatalogAt(operation.boundarySequence),
-				activeSemanticCount: typeof this.store.countActiveSemanticAt === "function"
-					? this.store.countActiveSemanticAt(operation.boundarySequence) : 0,
-				pageSize: DEFAULT_PAGE_SIZE,
-				firstCursor: null,
-				feedFloor: this.store.journalFloor(),
-				highWater: operation.boundarySequence,
-			},
-		};
+		const release = this.reserveFullState("root", 2);
+		try {
+			const reconstructed = this.store.reconstructDocument("root", operation.boundarySequence);
+			let rootGeneration: number;
+			let rootEpoch: SemanticEpoch;
+			let encodedRoot: Uint8Array;
+			try {
+				rootGeneration = reconstructed.generation;
+				rootEpoch = reconstructed.semanticEpoch;
+				encodedRoot = Y.encodeStateAsUpdate(reconstructed.doc);
+			} finally { reconstructed.doc.destroy(); }
+			const pin = this.store.getPin(operation.operationId);
+			return {
+				format: "yaos-bootstrap-v2",
+				bootstrapId: operation.operationId,
+				schemaVersion: SERVER_SCHEMA_VERSION as 8,
+				storageFormatVersion: SERVER_STORAGE_FORMAT_VERSION as 4,
+				serverCompleted: operation.state === "complete",
+				createdAt: new Date(operation.createdAt).toISOString(),
+				expiresAt: new Date(pin?.softExpiresAt ?? operation.updatedAt).toISOString(),
+				capture: {
+					vaultSequence: operation.boundarySequence,
+					rootEpoch,
+					rootGeneration,
+					rootCheckpointKey: operation.artifactKey ?? `sql:root:${operation.boundarySequence}`,
+					rootCheckpointHash: operation.artifactHash ?? await sha256Hex(encodedRoot),
+					rootCheckpointBytes: encodedRoot.byteLength,
+				},
+				catalog: {
+					activeBodyCount: this.store.countActiveCatalogAt(operation.boundarySequence),
+					activeSemanticCount: this.store.countActiveSemanticAt(operation.boundarySequence),
+					pageSize: DEFAULT_PAGE_SIZE,
+					firstCursor: null,
+					feedFloor: this.store.journalFloor(),
+					highWater: operation.boundarySequence,
+				},
+			};
+		} finally { release(); }
 	}
 }

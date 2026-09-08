@@ -22,16 +22,18 @@ import { canonicalMarkdownBytes } from "./shared/markdownCodec";
 import { canonicalCanvasBytes } from "./shared/canvasCodec";
 import { materializeCanvasDocument, validateCanvasDocument } from "./shared/canvasSemanticDocument";
 import { blobKey } from "./vaultObjectStore";
-import { VaultDocumentCache } from "./vaultDocumentCache";
+import { VaultDocumentCache, type PendingVaultUpdate } from "./vaultDocumentCache";
 import { VaultLifecycleService } from "./vaultLifecycleService";
 import { VaultSocketService, type VaultSocketPort, type VaultSocketRegistryPort, hasSafeRootAttachmentSemantics, rootUpdateChangesProtectedAttachmentMaps, rootUpdateHasSafeAttachmentSemantics } from "./vaultSocketService";
-import { VaultStore, type CatalogMutation, type SemanticCatalogMutation } from "./vaultStore";
+import { VaultStore, type CatalogMutation, type SemanticCatalogHead, type SemanticCatalogMutation } from "./vaultStore";
 import { isCanonicalVaultId } from "./vaultId";
 import { VaultRecoveryService } from "./vaultRecoveryService";
 import { authorizeRuntimeActor, OUTCOME_CLAIM_HEADER, parseVaultActor } from "./vaultAuthority";
 import { capabilityDigestForRole, COLLABORATION_POLICY_VERSION, type VaultActorContext, type VaultCapability } from "./collaboration";
 import { canonicalJsonHash } from "./recoveryCanonicalJson";
 import type { VaultAuthoritySubjectChange } from "./vaultDocumentStore";
+import { SemanticCompactionRuntime } from "./semanticCompactionRuntime";
+import { BODY_EPOCH_HEADER, ROOT_EPOCH_HEADER, parseSemanticEpoch, parseSemanticEpochHeader } from "./shared/semanticEpoch";
 
 const PERSIST_DEBOUNCE_MS = 250;
 const PERSIST_RETRY_MS = 1_000;
@@ -93,6 +95,16 @@ export function partitionDurableUpdateBatches<T extends { bytes: Uint8Array }>(e
 	return batches;
 }
 
+function sameSemanticCatalogHead(left: SemanticCatalogHead | null, right: SemanticCatalogHead): boolean {
+	return left !== null
+		&& left.documentId === right.documentId
+		&& left.sequence === right.sequence
+		&& left.path === right.path
+		&& left.lifecycle === right.lifecycle
+		&& left.generation === right.generation
+		&& left.bodyEpoch === right.bodyEpoch;
+}
+
 export function createVaultDocument(guid?: string): Y.Doc {
 	return new Y.Doc(guid ? { guid } : undefined);
 }
@@ -136,7 +148,7 @@ export interface VaultRuntimeOptions {
 	recoveryJobs?: ActorCallPort;
 }
 
-/** Schema-6 root/body composition, independent of a worker or process host. */
+/** Schema-8 root/Markdown/Canvas composition, independent of a worker or process host. */
 export class VaultRuntime implements DrainPort {
 	private store: VaultStore;
 	private settings: SettingsSyncStore;
@@ -148,6 +160,7 @@ export class VaultRuntime implements DrainPort {
 	private readonly semantic: VaultSemanticService;
 	private readonly bootstrap: BootstrapService;
 	private readonly recovery: VaultRecoveryService;
+	private readonly semanticCompaction: SemanticCompactionRuntime;
 	private readonly persistence = new Map<string, PersistenceStatus>();
 	private readonly scheduledFlushes = new Map<string, Promise<void>>();
 	private flushChain: Promise<void> = Promise.resolve();
@@ -162,7 +175,11 @@ export class VaultRuntime implements DrainPort {
 		this.cache = new VaultDocumentCache(
 			this.store,
 			() => socketOwner?.openBodyIds() ?? new Set<string>(),
-			() => new Set(this.store.activePins().flatMap(() => this.store.listActiveCatalogAt(this.store.currentSequence()).map((entry) => entry.bodyId))),
+			// History pins retain durable SQLite lineage. They do not require every
+			// body at the pinned boundary to remain materialized in RAM. Runtime
+			// owners that genuinely need residency must be represented explicitly;
+			// today open sockets are the only such owners.
+			() => new Set<string>(),
 		);
 		const vaultId = () => this.requireMetadata().vaultId;
 		const vaultGeneration = () => this.requireMetadata().vaultGeneration;
@@ -174,10 +191,15 @@ export class VaultRuntime implements DrainPort {
 			runtimeEpoch: this.runtimeEpoch,
 			isActiveBody: (bodyId) => this.lifecycle?.activeBodyHead(bodyId) !== null,
 			isActiveSemantic: (documentId) => this.store.semanticHeadAt(this.store.currentSequence(), documentId)?.lifecycle === "active",
+			currentSemanticHead: (documentId) => this.store.semanticHeadAt(this.store.currentSequence(), documentId),
+			currentRootEpoch: () => this.store.documentHead("root")?.semanticEpoch ?? 1,
+			currentSemanticEpoch: (documentId) => this.store.documentHead(documentId)?.semanticEpoch ?? null,
 			currentBodyHead: (bodyId) => {
 				const head = this.store.getCatalogHeadAt(this.store.currentSequence(), bodyId);
-				return head ? {
+				const documentHead = this.store.documentHead(bodyId);
+				return head && documentHead ? {
 					bodyId: head.bodyId,
+					bodyEpoch: documentHead.semanticEpoch,
 					lifecycle: head.lifecycle,
 					generation: head.generation,
 					contentHash: head.contentHash,
@@ -192,8 +214,15 @@ export class VaultRuntime implements DrainPort {
 				return principal?.state === "active" ? { displayName: principal.displayName, colorSeed: principal.colorSeed } : null;
 			},
 			scheduleFlush: (documentId) => this.scheduleFlush(documentId),
+			shouldPauseAdmission: (documentId) => this.semanticCompaction?.shouldPauseAdmission(documentId) ?? false,
 		});
 		this.sockets = socketOwner;
+		this.semanticCompaction = new SemanticCompactionRuntime({
+			store: this.store,
+			cache: this.cache,
+			fenceSockets: (documentId, previousEpoch, currentEpoch) =>
+				this.sockets.fenceSemanticEpoch(documentId, previousEpoch, currentEpoch),
+		});
 		this.lifecycle = new VaultLifecycleService({
 			store: this.store,
 			cache: this.cache,
@@ -206,6 +235,7 @@ export class VaultRuntime implements DrainPort {
 			runtimeEpoch: this.runtimeEpoch,
 			flush: (documentId) => this.flushDocument(documentId),
 			validateActor: (actor) => this.store.validateActor(actor) === "allowed",
+			onDocumentCommitted: (documentId, ingressBytes) => this.recordCompactionCommit(documentId, ingressBytes),
 		});
 		this.candidates = new VaultCandidateService({
 			store: this.store,
@@ -217,6 +247,9 @@ export class VaultRuntime implements DrainPort {
 			runtimeEpoch: this.runtimeEpoch,
 			flush: (documentId) => this.flushDocument(documentId),
 			validateActor: (actor) => this.store.validateActor(actor) === "allowed",
+			shouldPauseAdmission: (documentId) => this.semanticCompaction.shouldPauseAdmission(documentId),
+			onDocumentCommitted: (documentId, ingressBytes, commitLatencyMs) =>
+				this.recordCompactionCommit(documentId, ingressBytes, commitLatencyMs),
 		});
 		this.semantic = new VaultSemanticService({
 			store: this.store,
@@ -227,9 +260,16 @@ export class VaultRuntime implements DrainPort {
 			runtimeEpoch: this.runtimeEpoch,
 			validateActor: (actor) => this.store.validateActor(actor) === "allowed",
 			flush: (documentId) => this.flushDocument(documentId),
+			shouldPauseAdmission: (documentId) => this.semanticCompaction.shouldPauseAdmission(documentId),
+			onDocumentCommitted: (documentId, ingressBytes, commitLatencyMs) =>
+				this.recordCompactionCommit(documentId, ingressBytes, commitLatencyMs),
 			objectStore: options.objectStore,
 		});
-		this.bootstrap = new BootstrapService(this.store);
+		this.bootstrap = new BootstrapService(
+			this.store,
+			Date.now,
+			(documentId, overlappingCopies) => this.cache.reserveFullStateOperation(documentId, overlappingCopies),
+		);
 		this.recovery = new VaultRecoveryService({
 			alarms: options.alarms,
 			objectStore: options.objectStore,
@@ -255,21 +295,8 @@ export class VaultRuntime implements DrainPort {
 		if (!parts) return json({ error: "not_found" }, 404);
 		try {
 			if (request.method === "POST" && url.pathname === "/__yaos/provision") return await this.provision(vaultId, request);
-			if (request.method === "POST" && url.pathname === "/__yaos/collaboration-migrate") {
-				return await this.migrateCollaboration(vaultId, request);
-			}
-			if (request.method === "POST" && url.pathname === "/__yaos/canvas-migrate") {
-				return json(await this.migrateCanvasSchema(vaultId));
-			}
 			const metadata = this.store.vaultMetadata();
-			if (!metadata) {
-				const storedSchemaVersion = this.store.storedVaultSchemaVersion();
-				return storedSchemaVersion === 6
-					? json({ error: "collaboration_migration_required", storedSchemaVersion, requiredSchemaVersion: SERVER_SCHEMA_VERSION }, 409)
-					: storedSchemaVersion === 7
-						? json({ error: "canvas_migration_required", storedSchemaVersion, requiredSchemaVersion: SERVER_SCHEMA_VERSION }, 409)
-					: json({ error: "vault_not_provisioned" }, 409);
-			}
+			if (!metadata) return json({ error: "vault_not_provisioned" }, 409);
 			if (metadata.vaultId !== vaultId) return json({ error: "vault_identity_mismatch" }, 409);
 			const forwardedGeneration = request.headers.get(INTERNAL_GENERATION_HEADER);
 			if (forwardedGeneration !== metadata.vaultGeneration) {
@@ -318,16 +345,27 @@ export class VaultRuntime implements DrainPort {
 			if (request.method === "GET" && request.headers.get("upgrade")?.toLowerCase() === "websocket") {
 				const authorized = this.authorize(actor, "vault.content.read");
 				if (authorized instanceof Response) return authorized;
-				if (url.pathname === "/ws/root") return this.sockets.accept("root", "root", authorized);
+				if (url.pathname === "/ws/root") {
+					let rootEpoch;
+					try { rootEpoch = parseSemanticEpochHeader(request.headers, "root"); }
+					catch { return json({ error: "root_epoch_required" }, 400); }
+					return this.sockets.accept("root", "root", rootEpoch, authorized);
+				}
 				if (parts.length === 3 && parts[0] === "ws" && parts[1] === "body") {
 					const bodyId = parts[2]!;
+					let bodyEpoch;
+					try { bodyEpoch = parseSemanticEpochHeader(request.headers, "body"); }
+					catch { return json({ error: "body_epoch_required" }, 400); }
 					if (!this.lifecycle.activeBodyHead(bodyId)) return json({ error: "body_not_active" }, 409);
-					return this.sockets.accept(bodyId, "body", authorized);
+					return this.sockets.accept(bodyId, "body", bodyEpoch, authorized);
 				}
 				if (parts.length === 3 && parts[0] === "ws" && parts[1] === "semantic") {
 					const documentId = parts[2]!;
+					let documentEpoch;
+					try { documentEpoch = parseSemanticEpochHeader(request.headers, "body"); }
+					catch { return json({ error: "body_epoch_required" }, 400); }
 					if (!this.semantic.activeHead(documentId)) return json({ error: "semantic_document_not_active" }, 409);
-					return this.sockets.accept(documentId, "semantic", authorized);
+					return this.sockets.accept(documentId, "semantic", documentEpoch, authorized);
 				}
 			}
 			if (request.method === "POST" && parts.length === 3 && parts[0] === "body" && parts[2] === "candidate") {
@@ -422,36 +460,6 @@ export class VaultRuntime implements DrainPort {
 		}
 	}
 
-	private async migrateCanvasSchema(vaultId: string): Promise<ReturnType<VaultStore["migrateCanvasSchema"]>> {
-		const metadata = this.store.storedVaultMetadata();
-		if (metadata?.schemaVersion === 8 && metadata.vaultId === vaultId) {
-			return this.store.migrateCanvasSchema({ migrationId: `canvas-schema-8-${metadata.vaultGeneration}`,
-				vaultId, vaultGeneration: metadata.vaultGeneration, rootUpdate: new Uint8Array(), rootStateHash: "0".repeat(64) });
-		}
-		if (!metadata || metadata.schemaVersion !== 7 || metadata.vaultId !== vaultId) {
-			throw new Error("canvas_schema_migration_source_mismatch");
-		}
-		this.sockets.closeAll("vault schema migration");
-		await this.flushLoadedDocuments();
-		const reconstructed = this.store.reconstructDocument("root");
-		const vector = Y.encodeStateVector(reconstructed.doc);
-		if (reconstructed.doc.getMap("sys").get("schemaVersion") !== 7) {
-			reconstructed.doc.destroy();
-			throw new Error("canvas_schema_migration_root_mismatch");
-		}
-		reconstructed.doc.getMap("pathToSemantic");
-		reconstructed.doc.getMap("sys").set("schemaVersion", SERVER_SCHEMA_VERSION);
-		reconstructed.doc.getMap("sys").set("protocolVersion", SERVER_PROTOCOL_VERSION);
-		const update = Y.encodeStateAsUpdate(reconstructed.doc, vector);
-		const stateHash = await sha256Hex(Y.encodeStateAsUpdate(reconstructed.doc));
-		reconstructed.doc.destroy();
-		const receipt = this.store.migrateCanvasSchema({ migrationId: `canvas-schema-8-${metadata.vaultGeneration}`,
-			vaultId, vaultGeneration: metadata.vaultGeneration, rootUpdate: update, rootStateHash: stateHash });
-		this.cache.clear();
-		this.persistence.clear();
-		return receipt;
-	}
-
 	private authorize(actor: VaultActorContext | null, capability: VaultCapability, targetPrincipalId?: string): VaultActorContext | Response {
 		const result = authorizeRuntimeActor(this.store, actor, capability, targetPrincipalId);
 		return result.allowed ? result.actor : result.response;
@@ -532,79 +540,6 @@ export class VaultRuntime implements DrainPort {
 		}
 	}
 
-	private async migrateCollaboration(vaultId: string, request: Request): Promise<Response> {
-		let input: {
-			migrationId?: unknown;
-			vaultGeneration?: unknown;
-			requestDigest?: unknown;
-			subjectDigest?: unknown;
-			ownerPrincipalId?: unknown;
-			subjects?: unknown;
-		};
-		try { input = await request.json(); } catch { return json({ error: "invalid_json" }, 400); }
-		if (typeof input.migrationId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(input.migrationId)
-			|| typeof input.vaultGeneration !== "string"
-			|| typeof input.requestDigest !== "string" || !/^[a-f0-9]{64}$/.test(input.requestDigest)
-			|| typeof input.subjectDigest !== "string" || !/^[a-f0-9]{64}$/.test(input.subjectDigest)
-			|| typeof input.ownerPrincipalId !== "string"
-			|| !Array.isArray(input.subjects) || input.subjects.length === 0 || input.subjects.length > 8_192) {
-			return json({ error: "invalid_collaboration_migration" }, 400);
-		}
-		const sourceDigest = await sha256Hex(new TextEncoder().encode(JSON.stringify(input.subjects)));
-		if (sourceDigest !== input.subjectDigest) {
-			return json({ error: "authorization_subject_digest_mismatch" }, 409);
-		}
-		const subjects: VaultAuthoritySubjectChange[] = [];
-		for (const value of input.subjects) {
-			if (!value || typeof value !== "object" || Array.isArray(value)) {
-				return json({ error: "invalid_authorization_subject" }, 400);
-			}
-			const subject = value as Record<string, unknown>;
-			if (subject.kind === "device") {
-				if (typeof subject.deviceId !== "string" || typeof subject.principalId !== "string"
-					|| subject.targetState !== "active" || !Number.isSafeInteger(subject.targetRevision)
-					|| (subject.targetRevision as number) < 1) {
-					return json({ error: "invalid_device_authority" }, 400);
-				}
-				subjects.push({ deviceId: subject.deviceId, principalId: subject.principalId,
-					state: "active", credentialRevision: subject.targetRevision as number });
-			} else if (subject.kind === "membership") {
-				if (typeof subject.principalId !== "string"
-					|| (subject.targetRole !== "owner" && subject.targetRole !== "member")
-					|| subject.targetState !== "active" || !Number.isSafeInteger(subject.targetRevision)
-					|| (subject.targetRevision as number) < 1
-					|| typeof subject.displayName !== "string" || typeof subject.colorSeed !== "string") {
-					return json({ error: "invalid_principal_authority" }, 400);
-				}
-				const capabilityDigest = await capabilityDigestForRole(subject.targetRole);
-				subjects.push({ principalId: subject.principalId, role: subject.targetRole,
-					state: "active", membershipRevision: subject.targetRevision as number,
-					policyVersion: COLLABORATION_POLICY_VERSION, capabilityDigest,
-					displayName: subject.displayName, colorSeed: subject.colorSeed });
-			} else {
-				return json({ error: "invalid_authorization_subject" }, 400);
-			}
-		}
-		try {
-			this.sockets.closeAll("vault collaboration migration");
-			await this.flushLoadedDocuments();
-			const receipt = this.store.migrateCollaboration({
-				migrationId: input.migrationId,
-				vaultId,
-				vaultGeneration: input.vaultGeneration,
-				requestDigest: input.requestDigest,
-				subjectDigest: input.subjectDigest,
-				ownerPrincipalId: input.ownerPrincipalId,
-				subjects,
-			});
-			this.cache.clear();
-			this.persistence.clear();
-			return json({ ...receipt, runtimeEpoch: this.runtimeEpoch });
-		} catch (error) {
-			return json({ error: error instanceof Error ? error.message : "collaboration_migration_failed" }, 409);
-		}
-	}
-
 	async webSocketMessage(socket: VaultSocketPort, message: string | ArrayBuffer): Promise<void> {
 		if (this.deleted || this.drainPromise) socket.close(1001, "vault maintenance");
 		else await this.sockets.message(socket, message);
@@ -630,13 +565,20 @@ export class VaultRuntime implements DrainPort {
 
 	async alarm(): Promise<void> {
 		for (const documentId of Object.keys(this.cache.diagnostics().pending)) await this.flushDocument(documentId);
+		for (const [documentId, state] of Object.entries(this.semanticCompaction.diagnostics())) {
+			if (state.admissionPaused) await this.semanticCompaction.measureAndMaybeCompact(documentId);
+		}
 		this.store.reapExpiredRecoveryCaptures(Date.now(), 25);
 		this.store.reapExpiredRestoreAuthorities(Date.now(), 25);
 		const gc = this.store.latestGcEpoch();
 		if (gc && (gc.state === "marking" || gc.state === "sweeping") && gc.deadlineAt <= Date.now()) {
 			this.store.advanceGcEpoch(gc.epoch, "aborted");
 		}
-		if (this.store.activeRecoveryCapture() || this.store.activeRestoreAuthority()
+		const compactionRetry = Object.values(this.semanticCompaction.diagnostics())
+			.some((state) => state.admissionPaused);
+		if (compactionRetry) {
+			await this.options.alarms.setAlarm(Date.now() + PERSIST_RETRY_MS);
+		} else if (this.store.activeRecoveryCapture() || this.store.activeRestoreAuthority()
 			|| gc?.state === "marking" || gc?.state === "sweeping") {
 			await this.options.alarms.setAlarm(Date.now() + 60_000);
 		}
@@ -699,6 +641,7 @@ export class VaultRuntime implements DrainPort {
 		}
 		const requestedBodies: unknown[] = input.bodies;
 		const bodies: unknown[] = [];
+		const responseReservations: Array<() => void> = [];
 		const requestedBodyIds = new Set<string>();
 		let reconstructedBodies = 0;
 		for (const item of requestedBodies) {
@@ -708,6 +651,7 @@ export class VaultRuntime implements DrainPort {
 			const bodyId = "bodyId" in item && typeof item.bodyId === "string" ? item.bodyId : "";
 			if (!bodyId || bodyId.length > MAX_BODY_ID_LENGTH || !/^[A-Za-z0-9_-]+$/.test(bodyId)
 				|| requestedBodyIds.has(bodyId)
+				|| !("bodyEpoch" in item) || !Number.isSafeInteger(item.bodyEpoch) || (item.bodyEpoch as number) < 1
 				|| ("generation" in item && item.generation !== undefined
 					&& (!Number.isSafeInteger(item.generation) || (item.generation as number) < 0))
 				|| ("contentHash" in item && item.contentHash !== undefined && item.contentHash !== null
@@ -720,11 +664,13 @@ export class VaultRuntime implements DrainPort {
 			const knownGeneration = "generation" in item && Number.isSafeInteger(item.generation)
 				? item.generation as number
 				: null;
+			const knownBodyEpoch = parseSemanticEpoch(item.bodyEpoch, "catch-up body epoch");
 			const knownContentHash = "contentHash" in item && typeof item.contentHash === "string"
 				? item.contentHash
 				: null;
 			const metadata = {
 				bodyId,
+				bodyEpoch: head.bodyEpoch,
 				fileId: head.fileId,
 				path: head.path,
 				previousPath: head.previousPath,
@@ -733,28 +679,47 @@ export class VaultRuntime implements DrainPort {
 				contentHash: head.contentHash,
 				size: head.size,
 			};
-			if (knownGeneration === head.generation
+			if (knownBodyEpoch === head.bodyEpoch && knownGeneration === head.generation
 				&& (knownContentHash === null || knownContentHash === head.contentHash)) {
 				bodies.push({ ...metadata, status: 304 });
 				continue;
 			}
 			let reconstructedThisBody = false;
+			let failedRelease: (() => void) | null = null;
 			try {
+				const release = this.cache.reserveFullStateOperation(bodyId, 2);
+				failedRelease = release;
 				const reconstructed = this.store.reconstructDocument(bodyId);
-				const update = Y.encodeStateAsUpdate(reconstructed.doc);
-				reconstructed.doc.destroy();
-				bodies.push({ ...metadata, status: 200, generation: reconstructed.generation, update });
-				reconstructedBodies++;
-				reconstructedThisBody = true;
-			} catch { bodies.push({ bodyId, status: 500, error: "body_state_corrupt" }); }
+				try {
+					const update = Y.encodeStateAsUpdate(reconstructed.doc);
+					release();
+					const responseRelease = this.cache.reserveFullStateOperation(bodyId, 1, update.byteLength);
+					bodies.push({ ...metadata, status: 200, bodyEpoch: reconstructed.semanticEpoch,
+						generation: reconstructed.generation, update });
+					responseReservations.push(responseRelease);
+					failedRelease = null;
+					reconstructedBodies++;
+					reconstructedThisBody = true;
+				} catch (error) {
+					release();
+					throw error;
+				} finally { reconstructed.doc.destroy(); }
+			} catch {
+				failedRelease?.();
+				bodies.push({ bodyId, status: 500, error: "body_state_corrupt" });
+			}
 			if (reconstructedThisBody && reconstructedBodies % CATCH_UP_YIELD_INTERVAL === 0) {
 				await new Promise<void>((resolve) => setTimeout(resolve, 0));
 			}
 		}
-		let response: Uint8Array;
-		try { response = encodeBinaryEnvelope({ bodies, highWater: this.store.currentSequence() }, MAX_CATCH_UP_BYTES); }
-		catch { return json({ error: "catch_up_response_too_large" }, 413); }
-		return new Response(response.slice().buffer, { headers: { "content-type": YAOS_BINARY_CONTENT_TYPE, "cache-control": "no-store" } });
+		try {
+			let response: Uint8Array;
+			try { response = encodeBinaryEnvelope({ bodies, highWater: this.store.currentSequence() }, MAX_CATCH_UP_BYTES); }
+			catch { return json({ error: "catch_up_response_too_large" }, 413); }
+			return new Response(response.slice().buffer, { headers: { "content-type": YAOS_BINARY_CONTENT_TYPE, "cache-control": "no-store" } });
+		} finally {
+			for (const release of responseReservations) release();
+		}
 	}
 
 	private async bootstrapRoute(request: Request, url: URL, parts: string[]): Promise<Response | null> {
@@ -771,7 +736,11 @@ export class VaultRuntime implements DrainPort {
 		if (!bootstrapId) return json({ error: "not_found" }, 404);
 		if (request.method === "GET" && parts.length === 3 && parts[2] === "root") {
 			const state = this.bootstrap.rootState(bootstrapId);
-			return new Response(state.encodedState.slice().buffer, { headers: { "content-type": "application/octet-stream", "x-yaos-sha256": await state.hash } });
+			const release = this.cache.reserveFullStateOperation("root", 1, state.encodedState.byteLength);
+			try {
+				return new Response(state.encodedState.slice().buffer, { headers: { "content-type": "application/octet-stream",
+					[ROOT_EPOCH_HEADER]: String(state.rootEpoch), "x-yaos-sha256": await state.hash } });
+			} finally { release(); }
 		}
 		if (request.method === "GET" && parts.length === 3 && parts[2] === "catalog") return json(this.bootstrap.catalogPage(bootstrapId, url.searchParams.get("cursor"), boundedLimit(url)));
 		if (request.method === "GET" && parts.length === 3 && parts[2] === "semantic-catalog") {
@@ -779,9 +748,13 @@ export class VaultRuntime implements DrainPort {
 		}
 		if (request.method === "GET" && parts.length === 4 && parts[2] === "semantic") {
 			const state = this.bootstrap.semanticState(bootstrapId, parts[3]!);
-			return new Response(state.encodedState.slice().buffer, { headers: { "content-type": "application/octet-stream",
-				"x-yaos-document-id": state.documentId, "x-yaos-generation": String(state.generation),
-				"x-yaos-through-sequence": String(state.throughSequence) } });
+			const release = this.cache.reserveFullStateOperation(state.documentId, 1, state.encodedState.byteLength);
+			try {
+				return new Response(state.encodedState.slice().buffer, { headers: { "content-type": "application/octet-stream",
+					[BODY_EPOCH_HEADER]: String(state.bodyEpoch),
+					"x-yaos-document-id": state.documentId, "x-yaos-generation": String(state.generation),
+					"x-yaos-through-sequence": String(state.throughSequence) } });
+			} finally { release(); }
 		}
 		if (request.method === "POST" && parts.length === 3 && parts[2] === "bodies") {
 			let bytes: Uint8Array;
@@ -818,27 +791,40 @@ export class VaultRuntime implements DrainPort {
 				bodyIds.push(value);
 			}
 			if (new Set(bodyIds).size !== bodyIds.length) return json({ error: "duplicate_body_id" }, 400);
-			const bodies = bodyIds.map((bodyId) => {
-				const state = this.bootstrap.bodyState(bootstrapId, bodyId);
-				return {
-					bodyId,
-					generation: state.generation,
-					encodedState: state.encodedState,
-				};
-			});
-			let response: Uint8Array;
-			try { response = encodeBinaryEnvelope({ bodies }, MAX_CATCH_UP_BYTES); }
-			catch { return json({ error: "bootstrap_response_too_large" }, 413); }
-			return new Response(response.slice().buffer, {
-				headers: { "content-type": YAOS_BINARY_CONTENT_TYPE, "cache-control": "no-store" },
-			});
+			const releases: Array<() => void> = [];
+			try {
+				const bodies = bodyIds.map((bodyId) => {
+					const state = this.bootstrap.bodyState(bootstrapId, bodyId);
+					const release = this.cache.reserveFullStateOperation(bodyId, 1, state.encodedState.byteLength);
+					releases.push(release);
+					return {
+						bodyId,
+						bodyEpoch: state.bodyEpoch,
+						generation: state.generation,
+						encodedState: state.encodedState,
+					};
+				});
+				let response: Uint8Array;
+				try { response = encodeBinaryEnvelope({ bodies }, MAX_CATCH_UP_BYTES); }
+				catch { return json({ error: "bootstrap_response_too_large" }, 413); }
+				return new Response(response.slice().buffer, {
+					headers: { "content-type": YAOS_BINARY_CONTENT_TYPE, "cache-control": "no-store" },
+				});
+			} finally {
+				for (const release of releases) release();
+			}
 		}
 		if (request.method === "GET" && parts.length === 4 && parts[2] === "body") {
-			const state = this.bootstrap.bodyState(bootstrapId, parts[3]!);
-			const head = this.store.getCatalogHeadAt(state.throughSequence, state.bodyId);
-			return new Response(state.encodedState.slice().buffer, { headers: { "content-type": "application/octet-stream", "x-yaos-body-id": state.bodyId,
-				"x-yaos-generation": String(state.generation), "x-yaos-through-sequence": String(state.throughSequence),
-				"x-yaos-content-hash": head?.contentHash ?? "", "x-yaos-size": String(head?.size ?? 0) } });
+			const bodyId = parts[3]!;
+			const state = this.bootstrap.bodyState(bootstrapId, bodyId);
+			const release = this.cache.reserveFullStateOperation(bodyId, 1, state.encodedState.byteLength);
+			try {
+				const head = this.store.getCatalogHeadAt(state.throughSequence, state.bodyId);
+				return new Response(state.encodedState.slice().buffer, { headers: { "content-type": "application/octet-stream", "x-yaos-body-id": state.bodyId,
+					[BODY_EPOCH_HEADER]: String(state.bodyEpoch),
+					"x-yaos-generation": String(state.generation), "x-yaos-through-sequence": String(state.throughSequence),
+					"x-yaos-content-hash": head?.contentHash ?? "", "x-yaos-size": String(head?.size ?? 0) } });
+			} finally { release(); }
 		}
 		if (request.method === "POST" && parts.length === 3 && parts[2] === "renew") {
 			const input: unknown = await request.json();
@@ -861,23 +847,33 @@ export class VaultRuntime implements DrainPort {
 	private async bodyState(bodyId: string): Promise<Response> {
 		const head = this.lifecycle.activeBodyHead(bodyId);
 		if (!head) return json({ error: "body_not_active" }, 404);
-		const reconstructed = this.store.reconstructDocument(bodyId);
-		const bytes = Y.encodeStateAsUpdate(reconstructed.doc);
-		const content = canonicalMarkdownBytes(Y.Text.prototype.toString.call(reconstructed.doc.getText("body")));
-		reconstructed.doc.destroy();
-		return new Response(bytes.slice().buffer, { headers: { "content-type": "application/octet-stream", "cache-control": "no-store",
-			"x-yaos-body-id": bodyId, "x-yaos-generation": String(reconstructed.generation), "x-yaos-content-hash": await sha256Hex(content), "x-yaos-size": String(content.byteLength) } });
+		const release = this.cache.reserveFullStateOperation(bodyId, 2);
+		try {
+			const reconstructed = this.store.reconstructDocument(bodyId);
+			try {
+				const bytes = Y.encodeStateAsUpdate(reconstructed.doc);
+				const content = canonicalMarkdownBytes(Y.Text.prototype.toString.call(reconstructed.doc.getText("body")));
+				return new Response(bytes.slice().buffer, { headers: { "content-type": "application/octet-stream", "cache-control": "no-store",
+					[BODY_EPOCH_HEADER]: String(reconstructed.semanticEpoch),
+					"x-yaos-body-id": bodyId, "x-yaos-generation": String(reconstructed.generation), "x-yaos-content-hash": await sha256Hex(content), "x-yaos-size": String(content.byteLength) } });
+			} finally { reconstructed.doc.destroy(); }
+		} finally { release(); }
 	}
 
 	private rootState(url: URL): Response {
 		const current = this.store.currentSequence();
 		const through = Number(url.searchParams.get("through") ?? current);
 		if (!Number.isInteger(through) || through < 0 || through > current) return json({ error: "invalid_root_sequence" }, 400);
-		const reconstructed = this.store.reconstructDocument("root", through);
-		const bytes = Y.encodeStateAsUpdate(reconstructed.doc);
-		reconstructed.doc.destroy();
-		return new Response(bytes.slice().buffer, { headers: { "content-type": "application/octet-stream", "cache-control": "no-store",
-			"x-yaos-generation": String(reconstructed.generation), "x-yaos-through-sequence": String(through) } });
+		const release = this.cache.reserveFullStateOperation("root", 2);
+		try {
+			const reconstructed = this.store.reconstructDocument("root", through);
+			try {
+				const bytes = Y.encodeStateAsUpdate(reconstructed.doc);
+				return new Response(bytes.slice().buffer, { headers: { "content-type": "application/octet-stream", "cache-control": "no-store",
+					[ROOT_EPOCH_HEADER]: String(reconstructed.semanticEpoch),
+					"x-yaos-generation": String(reconstructed.generation), "x-yaos-through-sequence": String(through) } });
+			} finally { reconstructed.doc.destroy(); }
+		} finally { release(); }
 	}
 
 	private async compact(): Promise<Response> {
@@ -886,9 +882,12 @@ export class VaultRuntime implements DrainPort {
 		for (const entry of this.store.listActiveCatalogAt(this.store.currentSequence())) {
 			documentIds.add(entry.bodyId);
 		}
+		for (const entry of this.store.listActiveSemanticAt(this.store.currentSequence())) {
+			documentIds.add(entry.documentId);
+		}
 		let written = 0;
 		for (const documentId of documentIds) {
-			this.store.writeCheckpoint(documentId);
+			this.writeLiveCheckpoint(documentId);
 			written++;
 		}
 		if (this.store.activePins().length === 0) {
@@ -926,7 +925,8 @@ export class VaultRuntime implements DrainPort {
 	}
 
 	private diagnostics(): Response {
-		return json({ ...this.statusObject(), sockets: this.options.sockets.sockets().length, ...this.cache.diagnostics(), persistence: Object.fromEntries(this.persistence) });
+		return json({ ...this.statusObject(), sockets: this.options.sockets.sockets().length, ...this.cache.diagnostics(),
+			semanticCompaction: this.semanticCompaction.diagnostics(), persistence: Object.fromEntries(this.persistence) });
 	}
 
 	private statusObject() {
@@ -966,99 +966,210 @@ export class VaultRuntime implements DrainPort {
 	private async flushDocument(documentId: string): Promise<boolean> {
 		if (this.deleted) return false;
 		let success = true;
-		this.flushChain = this.flushChain.then(async () => {
+		this.flushChain = this.flushChain.then(() => this.cache.serializeDocument(documentId, async () => {
 			const entries = this.cache.takePending(documentId);
 			if (entries.length === 0) return;
-			let processed = 0;
+			let published = 0;
+				const committedIngress: Array<{ bytes: number; latencyMs: number }> = [];
 			try {
 				if (entries.some((entry) => !entry.actor || this.store.validateActor(entry.actor) !== "allowed")) {
 					throw new Error("authority_superseded");
 				}
 				for (const batch of partitionDurableUpdateBatches(entries)) {
+					const frozenKind = batch[0]?.kind;
+					const frozenEpoch = batch[0]?.documentEpoch;
+					if ((frozenKind !== "body" && frozenKind !== "semantic") || frozenEpoch === undefined
+						|| batch.some((entry) => entry.kind !== frozenKind || entry.documentEpoch !== frozenEpoch)) {
+						throw new Error("pending_admission_scope_invalid");
+					}
 					const update = batch.length === 1
 						? batch[0]!.bytes
 						: Y.mergeUpdates(batch.map((entry) => entry.bytes));
 					if (update.byteLength > MAX_DURABLE_UPDATE_BYTES) {
 						throw new Error("merged pending update exceeds durable value limit");
 					}
-					const semanticHead = this.store.semanticHeadAt(this.store.currentSequence(), documentId);
-					const catalog = documentId === "root" || semanticHead?.lifecycle === "active"
-						? undefined : await this.catalogForUpdate(documentId, update);
-					const semanticCatalog = semanticHead?.lifecycle === "active"
-						? await this.semanticCatalogForUpdate(semanticHead, update) : undefined;
+					const expectedHead = this.store.documentHead(documentId);
+					if (!expectedHead || expectedHead.semanticEpoch !== frozenEpoch) throw new Error("document_head_changed");
+					let expectedSemanticHead: SemanticCatalogHead | undefined;
+					let catalog: CatalogMutation | undefined;
+					let semanticCatalog: SemanticCatalogMutation | undefined;
+					if (frozenKind === "semantic") {
+						expectedSemanticHead = batch[0]!.semanticHead;
+						if (!expectedSemanticHead || expectedSemanticHead.lifecycle !== "active"
+							|| expectedSemanticHead.bodyEpoch !== frozenEpoch
+							|| batch.some((entry) => !entry.semanticHead
+								|| !sameSemanticCatalogHead(entry.semanticHead, expectedSemanticHead!))
+							|| !sameSemanticCatalogHead(
+								this.store.semanticHeadAt(this.store.currentSequence(), documentId), expectedSemanticHead)) {
+							throw new Error("semantic_catalog_head_changed");
+						}
+						semanticCatalog = await this.semanticCatalogForUpdate(expectedSemanticHead, batch, update);
+					} else {
+						if (!this.lifecycle.activeBodyHead(documentId)) throw new Error("body_not_active");
+						catalog = await this.catalogForBatch(documentId, batch, update);
+					}
+					const commitStartedAt = performance.now();
 					const commit = this.store.commitUpdate({ documentId, update,
-						kind: documentId === "root" ? "root" : semanticCatalog ? "semantic" : "body", catalog, semanticCatalog,
+						kind: frozenKind, expectedHead, catalog, semanticCatalog,
+						...(expectedSemanticHead ? { expectedSemanticHead } : {}),
 						actorAttributions: batch.map((entry) => ({ actor: entry.actor!, requestDigest: entry.digest })) });
-					processed += batch.length;
-					const loaded = this.cache.get(documentId);
-					if (loaded) loaded.generation = commit.generation;
+					const commitLatencyMs = performance.now() - commitStartedAt;
+					const changed = this.cache.applyDurableUpdate(documentId, update, commit.generation, "durable-socket-flush");
+					if (changed) {
+						for (const entry of batch) {
+							this.sockets.broadcastCommittedSocketUpdate(documentId, entry.bytes, entry.socketId);
+						}
+					}
 					if (semanticCatalog) {
 						this.sockets.notifySemanticCommitted(documentId, commit.generation, commit.vaultSequence,
 							{ lifecycle: semanticCatalog.lifecycle, contentHash: semanticCatalog.contentHash ?? null, size: semanticCatalog.size ?? null });
 					} else if (documentId !== "root") {
 						this.sockets.notifyBodyCommitted(documentId, commit.generation, commit.vaultSequence);
 					}
+					published += batch.length;
+					committedIngress.push({ bytes: update.byteLength, latencyMs: commitLatencyMs });
+				}
+				this.cache.completePendingPersistence(documentId);
+				for (const ingress of committedIngress) {
+					this.recordCompactionCommit(documentId, ingress.bytes, ingress.latencyMs);
 				}
 				this.persistence.set(documentId, { status: "healthy", lastError: null, lastSuccessAt: Date.now(), failures: this.persistence.get(documentId)?.failures ?? 0 });
 			} catch (error) {
 				success = false;
-				if (error instanceof Error && error.message === "authority_superseded") {
-					processed = entries.length;
+				const reason = error instanceof Error ? error.message : String(error);
+				const terminalFence = reason === "authority_superseded"
+					|| reason === "document_head_changed"
+					|| reason === "semantic_catalog_head_changed"
+					|| reason === "body_not_active";
+				if (reason === "authority_superseded") {
 					this.sockets.closeAll("queued authority superseded");
 					this.cache.clear();
 				} else {
-					this.cache.restorePending(documentId, entries.slice(processed));
+					try {
+						this.cache.reloadFromDurable(documentId);
+					} catch {
+						// If even exceptional reconstruction is unavailable, discard every
+						// resident view. The next socket admission must reconstruct from SQL.
+						this.cache.clear();
+					} finally {
+						this.sockets.closeUndurableOrigins(documentId, entries.slice(published));
+					}
 				}
+				if (terminalFence) return;
 				const prior = this.persistence.get(documentId);
-				this.persistence.set(documentId, { status: "degraded", lastError: error instanceof Error ? error.message : String(error),
+				this.persistence.set(documentId, { status: "degraded", lastError: reason,
 					lastSuccessAt: prior?.lastSuccessAt ?? null, failures: (prior?.failures ?? 0) + 1 });
 				await this.options.alarms.setAlarm(Date.now() + PERSIST_RETRY_MS);
 			}
-		});
+		}));
 		await this.flushChain;
 		if (success) this.maintain(documentId);
 		return success;
 	}
 
-	private async catalogForUpdate(bodyId: string, update: Uint8Array): Promise<CatalogMutation | undefined> {
+	private async catalogForBatch(
+		bodyId: string,
+		batch: readonly PendingVaultUpdate[],
+		update: Uint8Array,
+	): Promise<CatalogMutation | undefined> {
 		const current = this.lifecycle.activeBodyHead(bodyId);
 		if (!current) return undefined;
-		const reconstructed = this.store.reconstructDocument(bodyId);
-		try {
-			Y.applyUpdate(reconstructed.doc, update, "flush-metadata");
-			const content = canonicalMarkdownBytes(Y.Text.prototype.toString.call(reconstructed.doc.getText("body")));
+		const final = batch.at(-1);
+		if (final?.contentHash && Number.isSafeInteger(final.contentSize) && final.contentSize! >= 0) {
 			return { bodyId, fileId: current.fileId, path: current.path, previousPath: null, lifecycle: "active",
-				bodyGeneration: reconstructed.generation + 1, contentHash: await sha256Hex(content), size: content.byteLength };
-		} finally {
-			reconstructed.doc.destroy();
+				bodyGeneration: (this.store.documentHead(bodyId)?.generation ?? 0) + 1,
+				contentHash: final.contentHash, size: final.contentSize! };
 		}
+		// Fail-safe path for queues restored from an older in-memory producer or
+		// tests which intentionally omit admission metadata.
+		const release = this.cache.reserveFullStateOperation(bodyId, 2);
+		try {
+			const reconstructed = this.store.reconstructDocument(bodyId);
+			try {
+				Y.applyUpdate(reconstructed.doc, update, "flush-metadata");
+				const content = canonicalMarkdownBytes(Y.Text.prototype.toString.call(reconstructed.doc.getText("body")));
+				return { bodyId, fileId: current.fileId, path: current.path, previousPath: null, lifecycle: "active",
+					bodyGeneration: reconstructed.generation + 1, contentHash: await sha256Hex(content), size: content.byteLength };
+			} finally { reconstructed.doc.destroy(); }
+		} finally { release(); }
 	}
 
 	private async semanticCatalogForUpdate(
 		current: NonNullable<ReturnType<VaultStore["semanticHeadAt"]>>,
+		batch: readonly PendingVaultUpdate[],
 		update: Uint8Array,
 	): Promise<SemanticCatalogMutation> {
-		const reconstructed = this.store.reconstructDocument(current.documentId);
-		try {
-			Y.applyUpdate(reconstructed.doc, update, "semantic-flush-metadata");
-			const validation = await validateCanvasDocument(reconstructed.doc);
-			if (validation) throw new Error(validation);
-			const content = canonicalCanvasBytes(await materializeCanvasDocument(reconstructed.doc, false));
+		const final = batch.at(-1);
+		if (final?.contentHash && Number.isSafeInteger(final.contentSize) && final.contentSize! >= 0) {
 			return { documentId: current.documentId, fileId: current.fileId, kind: "canvas", format: "json-canvas",
 				formatVersion: 1, path: current.path, previousPath: null, lifecycle: "active",
-				documentGeneration: reconstructed.generation + 1, contentHash: await sha256Hex(content), size: content.byteLength };
-		} finally { reconstructed.doc.destroy(); }
+				documentGeneration: (this.store.documentHead(current.documentId)?.generation ?? 0) + 1,
+				contentHash: final.contentHash, size: final.contentSize! };
+		}
+		// Exceptional fallback for restored/injected queues that predate exact
+		// semantic metadata. Normal admitted frames never reconstruct here.
+		const durableHead = this.store.documentHead(current.documentId);
+		const durableBytes = durableHead
+			? this.store.documentEncodedHistoryBytes(current.documentId, durableHead.latestSequence)
+			: 0;
+		const knownBytes = durableBytes > Number.MAX_SAFE_INTEGER - update.byteLength
+			? Number.MAX_SAFE_INTEGER : durableBytes + update.byteLength;
+		const release = this.cache.reserveFullStateOperation(current.documentId, 2, knownBytes);
+		try {
+			const reconstructed = this.store.reconstructDocument(current.documentId);
+			try {
+				Y.applyUpdate(reconstructed.doc, update, "semantic-flush-metadata");
+				const validation = await validateCanvasDocument(reconstructed.doc);
+				if (validation) throw new Error(validation);
+				const content = canonicalCanvasBytes(await materializeCanvasDocument(reconstructed.doc, false));
+				return { documentId: current.documentId, fileId: current.fileId, kind: "canvas", format: "json-canvas",
+					formatVersion: 1, path: current.path, previousPath: null, lifecycle: "active",
+					documentGeneration: reconstructed.generation + 1, contentHash: await sha256Hex(content), size: content.byteLength };
+			} finally { reconstructed.doc.destroy(); }
+		} finally { release(); }
 	}
 
 	private maintain(documentId: string): void {
 		try {
 			if (!shouldCompactJournal(this.store.documentJournalStats(documentId))) return;
-			this.store.writeCheckpoint(documentId);
+			this.writeLiveCheckpoint(documentId);
 			if (this.store.activePins().length > 0) return;
 			const floor = Math.max(0, this.store.currentSequence() - FEED_RETAIN_SEQUENCES);
 			if (floor > this.store.journalFloor()) this.store.advanceFeedFloor(floor);
 		} catch (error) {
 			console.warn("[yaos-vault] maintenance failed", error);
+		}
+	}
+
+	private recordCompactionCommit(documentId: string, ingressBytes: number, commitLatencyMs?: number): void {
+		const task = this.semanticCompaction.recordCommit(documentId, ingressBytes, commitLatencyMs)
+			.then(async () => {
+				if (this.semanticCompaction.shouldPauseAdmission?.(documentId) ?? false) {
+					await this.options.alarms.setAlarm(Date.now() + PERSIST_RETRY_MS);
+				}
+			})
+			.catch((error: unknown) => console.warn("[yaos-vault] semantic compaction failed", error));
+		this.options.execution.waitUntil(task);
+	}
+
+	private writeLiveCheckpoint(documentId: string): void {
+		const loaded = this.cache.get(documentId);
+		const head = this.store.documentHead(documentId);
+		if (!loaded || loaded.dirty || !head || loaded.generation !== head.generation) {
+			const release = this.cache.reserveFullStateOperation(documentId, 3);
+			try { this.store.writeCheckpoint(documentId); }
+			finally { release(); }
+			return;
+		}
+		const release = this.cache.reserveFullStateOperation(documentId, 2);
+		try {
+			this.store.writeCheckpointFromDocument(documentId, loaded.doc, {
+				throughSequence: head.latestSequence,
+				generation: head.generation,
+				semanticEpoch: head.semanticEpoch,
+			});
+		} finally {
+			release();
 		}
 	}
 
@@ -1084,7 +1195,7 @@ export interface CloudflareVaultEnvironment {
 // eslint-disable-next-line @typescript-eslint/no-empty-object-type, @typescript-eslint/no-unsafe-declaration-merging -- Workers RPC requires the exported class type to carry its brand.
 export interface VaultSyncServer extends Rpc.DurableObjectBranded {}
 
-/** Cloudflare Durable Object wrapper for the portable schema-6 vault runtime. */
+/** Cloudflare Durable Object wrapper for the portable schema-8 vault runtime. */
 // eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging -- Declaration merging preserves the Workers RPC brand on the Cloudflare wrapper.
 export class VaultSyncServer implements DurableObject {
 	private readonly runtime: VaultRuntime;

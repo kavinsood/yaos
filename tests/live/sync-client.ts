@@ -74,6 +74,7 @@ try {
 		kind: "rename",
 		fileId: bodyId,
 		bodyId,
+		bodyEpoch: 1,
 		fromPath: originalPath,
 		toPath: renamedPath,
 	});
@@ -104,6 +105,7 @@ try {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
 		body: JSON.stringify({
+			rootEpoch: 1,
 			operationId: attachmentOperationId,
 			kind: "upsert",
 			path: attachmentPath,
@@ -120,6 +122,7 @@ try {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
 		body: JSON.stringify({
+			rootEpoch: 1,
 			operationId: `attachment-delete-${crypto.randomUUID()}`,
 			kind: "delete",
 			path: attachmentPath,
@@ -138,6 +141,7 @@ try {
 		kind: "delete",
 		fileId: bodyId,
 		bodyId,
+		bodyEpoch: 1,
 	});
 	assert(deleted.lifecycle === "tombstoned", "delete tombstones the catalog identity");
 	await waitFor(() => !rootA.doc.getMap<string>("pathToId").has(renamedPath), "deleted root publication");

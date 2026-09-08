@@ -15,6 +15,10 @@ function operationId(prefix: string): string {
 	return `${prefix}_${crypto.randomUUID().replaceAll("-", "")}`;
 }
 
+function attachmentJson(mutation: AttachmentMutation): string {
+	return JSON.stringify({ ...mutation, rootEpoch: 1 });
+}
+
 async function uploadBlob(identity: DeviceIdentity, content: string): Promise<{ bytes: Uint8Array; hash: string }> {
 	const blobBytes = new TextEncoder().encode(content);
 	const blobHash = await sha256Hex(blobBytes);
@@ -28,7 +32,7 @@ async function uploadBlob(identity: DeviceIdentity, content: string): Promise<{ 
 async function publishUntilSettled(identity: DeviceIdentity, mutation: AttachmentMutation): Promise<JsonResult> {
 	for (let attempt = 0; attempt < 10; attempt++) {
 		const result = await vaultJson(identity, "attachments/publish", {
-			method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(mutation),
+			method: "POST", headers: { "content-type": "application/json" }, body: attachmentJson(mutation),
 		});
 		if (result.response.status !== 503 || result.body?.error !== "attachment_mutation_busy") return result;
 		await new Promise((resolve) => setTimeout(resolve, 10));
@@ -64,7 +68,7 @@ async function attachmentState(path: string): Promise<{ ref: AttachmentRef | und
 	}
 }
 
-const bytes = new TextEncoder().encode("schema-7 attachment bytes");
+const bytes = new TextEncoder().encode("schema-8 attachment bytes");
 const hash = await sha256Hex(bytes);
 const upload = await fetch(vaultUrl(target.deviceA, `blobs/${hash}`), {
 	method: "PUT", headers: bearer(target.deviceA, { "content-type": "text/plain" }), body: bytes,
@@ -75,16 +79,16 @@ const exists = await vaultJson(target.deviceB, "blobs/exists", {
 });
 assert.deepEqual(exists.body, { present: [hash] });
 const downloaded = await fetch(vaultUrl(target.deviceB, `blobs/${hash}`), { headers: bearer(target.deviceB) });
-assert.equal(await downloaded.text(), "schema-7 attachment bytes");
+assert.equal(await downloaded.text(), "schema-8 attachment bytes");
 pass("attachment bytes are content-addressed and visible to vault peers");
 
 const path = "assets/conformance.txt";
 const upsertOperationId = `attach_${crypto.randomUUID().replaceAll("-", "")}`;
-const upsertBody = {
+const upsertBody: AttachmentMutation = {
 	operationId: upsertOperationId, kind: "upsert", path, expectedRevision: null, hash, size: bytes.byteLength, mime: "text/plain",
 };
 const upsert = await vaultJson(target.deviceA, "attachments/publish", {
-	method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({
+	method: "POST", headers: { "content-type": "application/json" }, body: attachmentJson({
 		...upsertBody,
 	}),
 });
@@ -98,11 +102,11 @@ root.destroy();
 pass("attachment publication durably updates the root catalog");
 
 const replay = await vaultJson(target.deviceA, "attachments/publish", {
-	method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(upsertBody),
+	method: "POST", headers: { "content-type": "application/json" }, body: attachmentJson(upsertBody),
 });
 assert.equal(replay.response.status, 200);
 const identityMismatch = await vaultJson(target.deviceA, "attachments/publish", {
-	method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...upsertBody, expectedRevision: upsertOperationId }),
+	method: "POST", headers: { "content-type": "application/json" }, body: attachmentJson({ ...upsertBody, expectedRevision: upsertOperationId }),
 });
 assert.equal(identityMismatch.response.status, 409);
 assert.equal(identityMismatch.body?.error, "attachment_operation_identity_mismatch");
@@ -111,14 +115,14 @@ pass("attachment operation replay requires the exact canonical request identity"
 const renamed = "assets/renamed.txt";
 const renameOperationId = `rename_${crypto.randomUUID().replaceAll("-", "")}`;
 const rename = await vaultJson(target.deviceA, "attachments/publish", {
-	method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({
+	method: "POST", headers: { "content-type": "application/json" }, body: attachmentJson({
 		operationId: renameOperationId, kind: "rename", fromPath: path, toPath: renamed,
 		expectedFromRevision: upsertOperationId, expectedToRevision: null,
 	}),
 });
 assert.equal(rename.response.status, 200);
 const stale = await vaultJson(target.deviceB, "attachments/publish", {
-	method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({
+	method: "POST", headers: { "content-type": "application/json" }, body: attachmentJson({
 		operationId: `stale_${crypto.randomUUID().replaceAll("-", "")}`, kind: "upsert", path,
 		expectedRevision: upsertOperationId, hash, size: bytes.byteLength, mime: "text/plain",
 	}),
@@ -129,7 +133,7 @@ assert.equal(stale.body?.vaultGeneration, target.deviceA.vaultGeneration);
 assert.equal(Array.isArray(stale.body?.currentHeads), true);
 
 const staleDelete = await vaultJson(target.deviceB, "attachments/publish", {
-	method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({
+	method: "POST", headers: { "content-type": "application/json" }, body: attachmentJson({
 		operationId: `stale_delete_${crypto.randomUUID().replaceAll("-", "")}`, kind: "delete", path: renamed,
 		expectedRevision: upsertOperationId,
 	}),
@@ -140,14 +144,14 @@ assert.equal(staleDelete.body?.error, "attachment_revision_mismatch");
 const collisionPath = "assets/collision.txt";
 const collisionOperationId = `collision_${crypto.randomUUID().replaceAll("-", "")}`;
 const collision = await vaultJson(target.deviceA, "attachments/publish", {
-	method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({
+	method: "POST", headers: { "content-type": "application/json" }, body: attachmentJson({
 		operationId: collisionOperationId, kind: "upsert", path: collisionPath,
 		expectedRevision: null, hash, size: bytes.byteLength, mime: "text/plain",
 	}),
 });
 assert.equal(collision.response.status, 200);
 const rejectedRename = await vaultJson(target.deviceA, "attachments/publish", {
-	method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({
+	method: "POST", headers: { "content-type": "application/json" }, body: attachmentJson({
 		operationId: `rename_collision_${crypto.randomUUID().replaceAll("-", "")}`, kind: "rename",
 		fromPath: renamed, toPath: collisionPath,
 		expectedFromRevision: renameOperationId, expectedToRevision: null,
@@ -159,7 +163,7 @@ assert.equal((rejectedRename.body?.currentHeads as unknown[]).length, 2);
 
 const deleteOperationId = `delete_${crypto.randomUUID().replaceAll("-", "")}`;
 const remove = await vaultJson(target.deviceA, "attachments/publish", {
-	method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({
+	method: "POST", headers: { "content-type": "application/json" }, body: attachmentJson({
 		operationId: deleteOperationId, kind: "delete", path: renamed,
 		expectedRevision: renameOperationId,
 	}),
@@ -167,7 +171,7 @@ const remove = await vaultJson(target.deviceA, "attachments/publish", {
 assert.equal(remove.response.status, 200);
 const revivalOperationId = `revive_${crypto.randomUUID().replaceAll("-", "")}`;
 const revival = await vaultJson(target.deviceA, "attachments/publish", {
-	method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({
+	method: "POST", headers: { "content-type": "application/json" }, body: attachmentJson({
 		operationId: revivalOperationId, kind: "upsert", path: renamed,
 		expectedRevision: deleteOperationId, hash, size: bytes.byteLength, mime: "text/plain",
 	}),
@@ -175,14 +179,14 @@ const revival = await vaultJson(target.deviceA, "attachments/publish", {
 assert.equal(revival.response.status, 200);
 const finalDeleteOperationId = `delete_final_${crypto.randomUUID().replaceAll("-", "")}`;
 const finalDelete = await vaultJson(target.deviceA, "attachments/publish", {
-	method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({
+	method: "POST", headers: { "content-type": "application/json" }, body: attachmentJson({
 		operationId: finalDeleteOperationId, kind: "delete", path: renamed,
 		expectedRevision: revivalOperationId,
 	}),
 });
 assert.equal(finalDelete.response.status, 200);
 const collisionDelete = await vaultJson(target.deviceA, "attachments/publish", {
-	method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({
+	method: "POST", headers: { "content-type": "application/json" }, body: attachmentJson({
 		operationId: `delete_collision_${crypto.randomUUID().replaceAll("-", "")}`, kind: "delete", path: collisionPath,
 		expectedRevision: collisionOperationId,
 	}),
@@ -202,7 +206,7 @@ const racePath = "assets/concurrent.txt";
 const raceA = `race_a_${crypto.randomUUID().replaceAll("-", "")}`;
 const raceB = `race_b_${crypto.randomUUID().replaceAll("-", "")}`;
 const concurrent = await Promise.all([raceA, raceB].map((operationId) => vaultJson(target.deviceA, "attachments/publish", {
-	method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({
+	method: "POST", headers: { "content-type": "application/json" }, body: attachmentJson({
 		operationId, kind: "upsert", path: racePath, expectedRevision: null,
 		hash, size: bytes.byteLength, mime: "text/plain",
 	}),

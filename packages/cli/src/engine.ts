@@ -411,7 +411,7 @@ export class DaemonEngine {
 		// Phase 3: construct the canonical runtime and its disk mirror.
 		const tickets = createSocketTicketCache(requester);
 		const canvasProjection = new ObsidianCanvasDiskMirror(host.app);
-		const vaultSync = new VaultSync({
+		const vaultSync = await VaultSync.create({
 			vaultId: this.membership.vaultId,
 			vaultGeneration: this.membership.vaultGeneration,
 			deviceId: this.membership.deviceId,
@@ -440,7 +440,6 @@ export class DaemonEngine {
 		this.cleanup.defer(() => vaultSync.destroy());
 		const stopFatalAuthListener = vaultSync.onFatalAuth(() => this.recordFatalAuth());
 		this.cleanup.defer(stopFatalAuthListener);
-		await vaultSync.initialize();
 		if (vaultSync.fatalAuthError) throw this.recordFatalAuth();
 
 		const initialPreserved = await database.loadPreservedUnresolved();
@@ -1243,7 +1242,7 @@ export class DaemonEngine {
 				continue;
 			}
 			this.withdrawDeleteCandidate(path, "shutdown confirmed the missing path");
-			vaultSync.handleDelete(path, this.settings.deviceName);
+			await vaultSync.commitDelete(path, this.settings.deviceName);
 			delete this.diskIndex[path];
 			this.log(`shutdown-delete path="${path}"`);
 		}

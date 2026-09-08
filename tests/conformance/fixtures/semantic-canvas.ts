@@ -27,6 +27,7 @@ async function submit(identity: typeof target.deviceA, update: Uint8Array, candi
 		"content-type": "application/octet-stream",
 		"x-yaos-candidate-id": candidateId,
 		"x-yaos-candidate-digest": candidateDigest,
+		"x-yaos-body-epoch": "1",
 	};
 	if (creation) {
 		headers["x-yaos-semantic-create-path"] = creation.path;
@@ -106,7 +107,7 @@ const renameOperationId = `rename_${crypto.randomUUID().replaceAll("-", "")}`;
 const renamed = await vaultJson(target.deviceA, "semantic/lifecycle", {
 	method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({
 		operationId: renameOperationId, requestDigest: "b".repeat(64), documentId,
-		kind: "rename", fromPath: path, toPath: renamedPath,
+		kind: "rename", bodyEpoch: 1, rootEpoch: 1, fromPath: path, toPath: renamedPath,
 	}),
 });
 assert.equal(renamed.response.status, 200, JSON.stringify(renamed.body));
@@ -126,7 +127,7 @@ pass("semantic Canvas rename retains identity and one exclusive root authority")
 const deleted = await vaultJson(target.deviceB, "semantic/lifecycle", {
 	method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({
 		operationId: `delete_${crypto.randomUUID().replaceAll("-", "")}`,
-		requestDigest: "c".repeat(64), documentId, kind: "delete",
+		requestDigest: "c".repeat(64), documentId, kind: "delete", bodyEpoch: 1, rootEpoch: 1,
 	}),
 });
 assert.equal(deleted.response.status, 200, JSON.stringify(deleted.body));

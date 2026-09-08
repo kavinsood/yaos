@@ -5,8 +5,8 @@
  * is exact until a future release deliberately defines a wider contract.
  */
 export const SCHEMA_VERSION = 8;
-export const STORAGE_FORMAT_VERSION = 3;
-export const PROTOCOL_VERSION = 4;
+export const STORAGE_FORMAT_VERSION = 4;
+export const PROTOCOL_VERSION = 5;
 export const SNAPSHOT_FORMAT_VERSION = 3;
 export const SETTINGS_FORMAT_VERSION = 2;
 

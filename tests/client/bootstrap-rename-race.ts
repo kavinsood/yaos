@@ -4,6 +4,7 @@ import { BootstrapClient, type ClientBodyState, type ClientCatalogEntry } from "
 import { BodyManager } from "../../src/sync/bodyManager";
 import type { StoredBootstrapProgress, StoredDocument, StoredOutstandingBody } from "../../src/sync/vaultIndexedDb";
 import { suite } from "../harness.ts";
+import { SCHEMA_VERSION } from "../../src/sync/schema";
 
 const s = suite("bootstrap-rename-race");
 
@@ -17,7 +18,7 @@ function bodyState(bodyId: string, content: string, generation: number): ClientB
 	doc.getText("body").insert(0, content);
 	const encodedState = Y.encodeStateAsUpdate(doc);
 	doc.destroy();
-	return { bodyId, generation, encodedState };
+	return { bodyId, bodyEpoch: 1, generation, encodedState };
 }
 
 s.test("200 creates with 100 mid-bootstrap renames leave only authoritative targets", async () => {
@@ -29,6 +30,7 @@ s.test("200 creates with 100 mid-bootstrap renames leave only authoritative targ
 		const content = `content-${index}`;
 		const entry: ClientCatalogEntry = {
 			bodyId,
+			bodyEpoch: 1,
 			fileId: bodyId,
 			path: `created/${index}.md`,
 			generation: 1,
@@ -64,7 +66,7 @@ s.test("200 creates with 100 mid-bootstrap renames leave only authoritative targ
 		listMaterializedPaths: async () => [...materializedPaths].map(([bodyId, path]) => ({ bodyId, path })),
 	};
 	const root = new Y.Doc();
-	root.getMap("sys").set("schemaVersion", 8);
+	root.getMap("sys").set("schemaVersion", SCHEMA_VERSION);
 	const rootBytes = Y.encodeStateAsUpdate(root);
 	root.destroy();
 	const server = {
@@ -73,7 +75,7 @@ s.test("200 creates with 100 mid-bootstrap renames leave only authoritative targ
 			createdAt: "2026-08-23T00:00:00.000Z",
 			expiresAt: "2026-08-24T00:00:00.000Z",
 			serverCompleted: false,
-			capture: { vaultSequence: 0, rootGeneration: 1, rootCheckpointHash: await hashBytes(rootBytes) },
+			capture: { vaultSequence: 0, rootEpoch: 1, rootGeneration: 1, rootCheckpointHash: await hashBytes(rootBytes) },
 			catalog: { activeBodyCount: 200, pageSize: 1000, firstCursor: null, feedFloor: 0, highWater: 0 },
 		}),
 		root: async () => rootBytes,

@@ -16,6 +16,7 @@ import { suite } from "../harness.ts";
 import { BodyManager } from "../../src/sync/bodyManager";
 import { BodySettlementRepository, type StoredBodySettlement } from "../../src/sync/bodySettlement";
 import { canonicalMarkdownHash, exactMarkdownDiskFingerprint } from "../../server/src/shared/markdownCodec";
+import { SCHEMA_VERSION } from "../../src/sync/schema";
 
 const s = suite("bootstrap-settlement");
 
@@ -26,12 +27,13 @@ async function sha256(bytes: Uint8Array): Promise<string> {
 
 s.test("missing body state never creates a placeholder and remains durably outstanding", async () => {
 	const root = new Y.Doc({ guid: "root" });
-	root.getMap("sys").set("schemaVersion", 8);
+	root.getMap("sys").set("schemaVersion", SCHEMA_VERSION);
 	const rootBytes = Y.encodeStateAsUpdate(root);
 	root.destroy();
 
 	const entry: ClientCatalogEntry = {
 		bodyId: "file-1",
+		bodyEpoch: 1,
 		fileId: "file-1",
 		path: "notes/real.md",
 		generation: 3,
@@ -40,6 +42,7 @@ s.test("missing body state never creates a placeholder and remains durably outst
 	};
 	const maliciousEntry: ClientCatalogEntry = {
 		bodyId: "file-malicious",
+		bodyEpoch: 1,
 		fileId: "file-malicious",
 		path: ".obsidian/plugins/yaos/main.md",
 		generation: 1,
@@ -75,6 +78,7 @@ s.test("missing body state never creates a placeholder and remains durably outst
 			serverCompleted: false,
 			capture: {
 				vaultSequence: 0,
+				rootEpoch: 1,
 				rootGeneration: 1,
 				rootCheckpointHash: await sha256(rootBytes),
 			},
@@ -129,6 +133,7 @@ s.test("body verification rejects corrupt, mismatched, and wrong-identity 200 re
 	const contentBytes = new TextEncoder().encode("verified content");
 	const entry: ClientCatalogEntry = {
 		bodyId: "file-verified",
+		bodyEpoch: 1,
 		fileId: "file-verified",
 		path: "notes/verified.md",
 		generation: 4,
@@ -138,6 +143,7 @@ s.test("body verification rejects corrupt, mismatched, and wrong-identity 200 re
 	assert.equal(
 		await decodeVerifiedBodyContent(entry, {
 			bodyId: entry.bodyId,
+			bodyEpoch: 1,
 			generation: 4,
 			encodedState,
 		}),
@@ -146,6 +152,7 @@ s.test("body verification rejects corrupt, mismatched, and wrong-identity 200 re
 	await assert.rejects(
 		decodeVerifiedBodyContent(entry, {
 			bodyId: "different-body",
+			bodyEpoch: 1,
 			generation: 4,
 			encodedState,
 		}),
@@ -154,6 +161,7 @@ s.test("body verification rejects corrupt, mismatched, and wrong-identity 200 re
 	await assert.rejects(
 		decodeVerifiedBodyContent({ ...entry, size: entry.size! + 1 }, {
 			bodyId: entry.bodyId,
+			bodyEpoch: 1,
 			generation: 4,
 			encodedState,
 		}),
@@ -162,6 +170,7 @@ s.test("body verification rejects corrupt, mismatched, and wrong-identity 200 re
 	await assert.rejects(
 		decodeVerifiedBodyContent({ ...entry, contentHash: "0".repeat(64) }, {
 			bodyId: entry.bodyId,
+			bodyEpoch: 1,
 			generation: 4,
 			encodedState,
 
@@ -171,6 +180,7 @@ s.test("body verification rejects corrupt, mismatched, and wrong-identity 200 re
 	await assert.rejects(
 		decodeVerifiedBodyContent(entry, {
 			bodyId: entry.bodyId,
+			bodyEpoch: 1,
 			generation: 4,
 			encodedState: new Uint8Array([255, 255, 255]),
 		}),
@@ -182,12 +192,13 @@ s.test("bootstrap root rejects schema-3 state instead of migrating it", () => {
 	legacy.getMap("sys").set("schemaVersion", 3);
 	const encodedState = Y.encodeStateAsUpdate(legacy);
 	legacy.destroy();
-	assert.throws(() => decodeBootstrapRoot(encodedState), /not schema 8/);
+	assert.throws(() => decodeBootstrapRoot(encodedState), new RegExp(`not schema ${SCHEMA_VERSION}`));
 });
 
 s.test("feed pages collapse repeated body and catalog work to latest durable state", () => {
 	const active = {
 		bodyId: "body-a",
+		bodyEpoch: 1,
 		fileId: "body-a",
 		path: "renamed/final.md",
 		generation: 9,
@@ -196,18 +207,18 @@ s.test("feed pages collapse repeated body and catalog work to latest durable sta
 		lifecycle: "active" as const,
 	};
 	const page = coalesceFeedPage([
-		{ sequence: 1, documentId: "body-a", generation: 1, kind: "body" },
-		{ sequence: 2, documentId: "body-a", generation: 2, kind: "body" },
-		{ sequence: 3, documentId: "root", generation: 2, kind: "rename", catalogs: [{ ...active, generation: 2 }] },
-		{ sequence: 4, documentId: "body-a", generation: 9, kind: "body" },
-		{ sequence: 5, documentId: "body-b", generation: 3, kind: "body" },
-		{ sequence: 6, documentId: "body-b", generation: 4, kind: "body" },
-		{ sequence: 7, documentId: "root", generation: 3, kind: "root" },
+		{ sequence: 1, documentId: "body-a", documentEpoch: 1, generation: 1, kind: "body" },
+		{ sequence: 2, documentId: "body-a", documentEpoch: 1, generation: 2, kind: "body" },
+		{ sequence: 3, documentId: "root", documentEpoch: 1, generation: 2, kind: "rename", catalogs: [{ ...active, generation: 2 }] },
+		{ sequence: 4, documentId: "body-a", documentEpoch: 1, generation: 9, kind: "body" },
+		{ sequence: 5, documentId: "body-b", documentEpoch: 1, generation: 3, kind: "body" },
+		{ sequence: 6, documentId: "body-b", documentEpoch: 1, generation: 4, kind: "body" },
+		{ sequence: 7, documentId: "root", documentEpoch: 1, generation: 3, kind: "root" },
 	]);
 	assert.equal(page.throughSequence, 7);
 	assert.deepEqual(page.catalogs, [{ ...active, generation: 2 }]);
 	assert.equal(page.bodyGenerations.has("body-a"), false, "catalog settlement subsumes same-page body updates");
-	assert.deepEqual(page.bodyGenerations.get("body-b"), { generation: 4, kind: "body" });
+	assert.deepEqual(page.bodyGenerations.get("body-b"), { bodyEpoch: 1, generation: 4, kind: "body" });
 });
 
 s.test("body-only feed catch-up batches state and skips root settlement", async () => {
@@ -218,19 +229,19 @@ s.test("body-only feed catch-up batches state and skips root settlement", async 
 		doc.destroy();
 		return {
 			head: {
-				bodyId, fileId: bodyId, path, generation,
+				bodyId, bodyEpoch: 1, fileId: bodyId, path, generation,
 				contentHash: await canonicalMarkdownHash(content),
 				size: new TextEncoder().encode(content).byteLength,
 				lifecycle: "active" as const,
 			},
-			state: { bodyId, generation, encodedState },
+			state: { bodyId, bodyEpoch: 1, generation, encodedState },
 		};
 	};
 	const first = await makeBody("batch-a", "Batch A.md", "first", 2);
 	const second = await makeBody("batch-b", "Batch B.md", "second", 3);
 	const documents = new Map<string, StoredDocument>();
 	let progress: StoredBootstrapProgress = {
-		bootstrapId: "batch-bootstrap", highWater: 0, nextCatalogCursor: null,
+		bootstrapId: "batch-bootstrap", rootEpoch: 1, highWater: 0, nextCatalogCursor: null,
 		stage: "complete", settledBodies: 0, totalBodies: 2, feedCursor: 0,
 	};
 	const materialized = new Map<string, string>();
@@ -255,8 +266,8 @@ s.test("body-only feed catch-up batches state and skips root settlement", async 
 		changesAfter: async () => page++ === 0
 			? {
 				entries: [
-					{ sequence: 1, documentId: first.head.bodyId, generation: 2, kind: "body" },
-					{ sequence: 2, documentId: second.head.bodyId, generation: 3, kind: "body" },
+					{ sequence: 1, documentId: first.head.bodyId, documentEpoch: 1, generation: 2, kind: "body" },
+					{ sequence: 2, documentId: second.head.bodyId, documentEpoch: 1, generation: 3, kind: "body" },
 				],
 				currentHighWater: 2,
 				resetRequired: false,
@@ -296,11 +307,11 @@ s.test("verified body-only agreement creates a restart-safe component base", asy
 	const encodedState = Y.encodeStateAsUpdate(bodyDoc);
 	bodyDoc.destroy();
 	const head: ClientCatalogEntry = {
-		bodyId, fileId: bodyId, path, generation: 7,
+		bodyId, bodyEpoch: 1, fileId: bodyId, path, generation: 7,
 		contentHash, size: new TextEncoder().encode(content).byteLength,
 	};
 	const progress: StoredBootstrapProgress = {
-		bootstrapId: "prepared", highWater: 0, nextCatalogCursor: null,
+		bootstrapId: "prepared", rootEpoch: 1, highWater: 0, nextCatalogCursor: null,
 		stage: "complete", settledBodies: 1, totalBodies: 1, feedCursor: 0,
 	};
 	const documents = new Map<string, StoredDocument>();
@@ -332,7 +343,7 @@ s.test("verified body-only agreement creates a restart-safe component base", asy
 	};
 	const server = {
 		currentHead: async () => head,
-		currentBody: async () => { bodyFetches++; return { bodyId, generation: 7, encodedState }; },
+		currentBody: async () => { bodyFetches++; return { bodyId, bodyEpoch: 1, generation: 7, encodedState }; },
 	};
 	const disk = {
 		settleBody: async () => { diskWrites++; return "settled" as const; },
@@ -394,7 +405,10 @@ s.test("null feed head records delete settlement before advancing the cursor", a
 	const baseline = new Y.Doc({ guid: "deleted-body" });
 	baseline.getText("body").insert(0, "last durable body");
 	const stored: StoredDocument = {
+		kind: "body",
 		documentId: "deleted-body",
+		bodyEpoch: 1,
+		durableBaseline: "last durable body",
 		generation: 2,
 		encodedState: Y.encodeStateAsUpdate(baseline).slice().buffer,
 		dirty: false,
@@ -403,6 +417,7 @@ s.test("null feed head records delete settlement before advancing the cursor", a
 	baseline.destroy();
 	let progress: StoredBootstrapProgress = {
 		bootstrapId: "complete-bootstrap",
+		rootEpoch: 1,
 		highWater: 0,
 		nextCatalogCursor: null,
 		stage: "complete",
@@ -433,7 +448,7 @@ s.test("null feed head records delete settlement before advancing the cursor", a
 	const server = {
 		changesAfter: async () => page++ === 0
 			? {
-				entries: [{ sequence: 1, documentId: "deleted-body", generation: 2, kind: "delete" }],
+				entries: [{ sequence: 1, documentId: "deleted-body", documentEpoch: 1, generation: 2, kind: "delete" }],
 				currentHighWater: 1,
 				resetRequired: false,
 			}

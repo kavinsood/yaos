@@ -19,6 +19,7 @@ import { suite } from "../harness.ts";
 import { installDomCrypto } from "./helpers/installDomCrypto";
 import { partialOf } from "../mocks/productFixture.ts";
 import type { VaultAuthorityIdentity } from "../../src/collaboration/authority";
+import { PROTOCOL_VERSION, SCHEMA_VERSION } from "../../src/sync/schema";
 
 installDomCrypto();
 const s = suite("attachment-publication-replay");
@@ -93,8 +94,8 @@ class AttachmentServer {
 	isClientReady: (() => boolean) | null = null;
 
 	constructor() {
-		this.root.getMap("sys").set("schemaVersion", 8);
-		this.root.getMap("sys").set("protocolVersion", 4);
+		this.root.getMap("sys").set("schemaVersion", SCHEMA_VERSION);
+		this.root.getMap("sys").set("protocolVersion", PROTOCOL_VERSION);
 	}
 
 	loseNextResponse(): void {
@@ -227,6 +228,7 @@ class AttachmentServer {
 			runtimeEpoch: "runtime-1",
 			vaultSequence: this.vaultSequence,
 			rootGeneration: this.rootGeneration,
+			rootEpoch: 1,
 			rootUpdate: Y.encodeStateAsUpdate(this.root),
 		};
 		this.receipts.set(mutation.operationId, receipt);
@@ -253,10 +255,12 @@ async function startRuntime(
 ): Promise<RuntimeFixture> {
 	if (!state.documents.has("root")) {
 		const root = new Y.Doc({ guid: "root" });
-		root.getMap("sys").set("schemaVersion", 8);
-		root.getMap("sys").set("protocolVersion", 4);
+		root.getMap("sys").set("schemaVersion", SCHEMA_VERSION);
+		root.getMap("sys").set("protocolVersion", PROTOCOL_VERSION);
 		state.documents.set("root", {
+			kind: "root",
 			documentId: "root",
+			rootEpoch: 1,
 			generation: 1,
 			encodedState: Y.encodeStateAsUpdate(root).slice().buffer,
 			dirty: false,
@@ -350,9 +354,9 @@ s.test("a stale attachment queue clears only when exact prior authority proves i
 		operationId: "attachment-fenced", kind: "upsert", path: "attachments/fenced.png",
 		expectedRevision: null, hash: "f".repeat(64), size: 42, mime: "image/png",
 	};
-	await server.port().publishAttachment(mutation);
+	await server.port().publishAttachment(mutation, 1);
 	state.attachmentOperations.set(mutation.operationId, {
-		vaultId: "vault-1", vaultGeneration: "generation-1", mutation, localSequence: 1,
+		vaultId: "vault-1", vaultGeneration: "generation-1", rootEpoch: 1, mutation, localSequence: 1,
 		createdAt: 1, attempts: 1, lastAttemptAt: 1, authority: oldAuthority,
 	});
 	assert.equal(state.attachmentOperations.size, 1);
@@ -448,6 +452,7 @@ s.test("startup replay uses local sequence ordering independent of timestamps an
 	state.attachmentOperations.set("operation-z", {
 		vaultId: "vault-1",
 		vaultGeneration: "generation-1",
+		rootEpoch: 1,
 		mutation: { operationId: "operation-z", kind: "delete", path: "attachments/order.bin", expectedRevision: "operation-a" },
 		localSequence: 2,
 		createdAt: 10,
@@ -457,6 +462,7 @@ s.test("startup replay uses local sequence ordering independent of timestamps an
 	state.attachmentOperations.set("operation-a", {
 		vaultId: "vault-1",
 		vaultGeneration: "generation-1",
+		rootEpoch: 1,
 		mutation: {
 			operationId: "operation-a",
 			kind: "upsert",
@@ -691,6 +697,7 @@ s.test("startup refuses a durable attachment publication from another vault gene
 	state.attachmentOperations.set("operation-old-generation", {
 		vaultId: "vault-1",
 		vaultGeneration: "generation-old",
+		rootEpoch: 1,
 		mutation: {
 			operationId: "operation-old-generation",
 			kind: "upsert",
