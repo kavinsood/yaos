@@ -58,6 +58,7 @@ export interface NodeHost {
 	 * that carries them can make that possible.
 	 */
 	scanMarkdown(): Promise<MarkdownScan>;
+	scanCanvases(): Promise<MarkdownScan>;
 	/**
 	 * Is this one path definitely gone? See `NodeApp.probePath`: only a
 	 * kernel-confirmed absence answers `"absent"`.
@@ -139,6 +140,11 @@ export async function createNodeHost(vaultRoot: string): Promise<NodeHost> {
 		 */
 		async scanMarkdown(): Promise<MarkdownScan> {
 			const walk: MarkdownWalk = app.walkMarkdown();
+			return { paths: walk.files.map((entry) => entry.vaultPath), unreadable: walk.unreadable };
+		},
+
+		async scanCanvases(): Promise<MarkdownScan> {
+			const walk: MarkdownWalk = app.walkCanvases();
 			return { paths: walk.files.map((entry) => entry.vaultPath), unreadable: walk.unreadable };
 		},
 

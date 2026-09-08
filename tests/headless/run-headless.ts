@@ -44,7 +44,7 @@ const NEGATIVE_HOLD_MS = 7_000;
 const SLOW_INTERVAL_MS = 12_000;
 const SLOW_HOLD_MS = 8_000;
 const SLOW_WAIT_MS = 60_000;
-const s = suite("schema-7 headless daemon");
+const s = suite("schema-8 headless daemon");
 
 function describe(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
@@ -336,7 +336,7 @@ try {
 		"the pairing secret is supplied only through environment, never argv",
 	);
 	originIdentity = await enrollmentIdentity(enrollmentPath);
-	s.check(originIdentity.vaultId === server.vaultId && originIdentity.vaultGeneration === server.vaultGeneration, "durable enrollment is fenced to the claimed schema-7 vault generation");
+	s.check(originIdentity.vaultId === server.vaultId && originIdentity.vaultGeneration === server.vaultGeneration, "durable enrollment is fenced to the claimed schema-8 vault generation");
 	s.check(originIdentity.originImport, "the first enrolled CLI persistently owns originImport authority");
 	s.check(
 		originIdentity.deviceId === pendingDeviceId && originIdentity.deviceToken === pendingDeviceToken,
@@ -416,7 +416,7 @@ try {
 	));
 
 	const remotePath = "remote-exact.md";
-	const remoteV1 = "# remote\n\ncreated through schema-7 lifecycle and candidate receipts\n";
+	const remoteV1 = "# remote\n\ncreated through schema-8 lifecycle and candidate receipts\n";
 	await requirePeer().create(remotePath, remoteV1);
 	await checked("remote create materializes exact content on disk", () => waitFor(
 		async () => await readIfExists(join(originVault, remotePath)) === remoteV1,
@@ -496,7 +496,7 @@ try {
 	const originStateDir = dirname(enrollmentPath);
 	const originSqlite = join(originStateDir, "client.sqlite");
 	const sqliteBefore = await stat(originSqlite);
-	s.check(sqliteBefore.size > 0, "the stopped origin daemon left a non-empty schema-7 SQLite cache");
+	s.check(sqliteBefore.size > 0, "the stopped origin daemon left a non-empty schema-8 SQLite cache");
 	const offlineLocalPath = "offline-local.md";
 	const offlineLocalText = "written while daemon was stopped\n";
 	await writeFile(join(originVault, offlineLocalPath), offlineLocalText, "utf8");

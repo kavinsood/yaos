@@ -6,6 +6,9 @@ import type {
 	StoredBodyCandidate,
 	StoredBodyReceipt,
 	StoredBootstrapProgress,
+	StoredCanvasCandidate,
+	StoredCanvasLifecycle,
+	StoredCanvasSettlement,
 	StoredDocument,
 	StoredFeedCursor,
 	StoredLifecycleOperation,
@@ -76,7 +79,7 @@ export class NodeVaultDatabaseIdentityError extends Error {
 
 
 /**
- * Durable schema-7 client persistence for Node 24.
+ * Durable schema-8 client persistence for Node 24.
  *
  * The database owns no sync policy. It is the SQLite implementation of the
  * client database ports, plus the two small daemon-only ledgers that replace
@@ -157,6 +160,24 @@ export class NodeVaultDatabase implements VaultDatabasePort, BootstrapDatabasePo
 			) STRICT;
 			CREATE TABLE IF NOT EXISTS body_settlements (
 				body_id TEXT PRIMARY KEY,
+				value_json TEXT NOT NULL
+			) STRICT;
+			CREATE TABLE IF NOT EXISTS canvas_candidates (
+				candidate_id TEXT PRIMARY KEY,
+				document_id TEXT NOT NULL,
+				encoded_update BLOB NOT NULL,
+				captured_at INTEGER NOT NULL,
+				value_json TEXT NOT NULL
+			) STRICT;
+			CREATE INDEX IF NOT EXISTS canvas_candidates_document ON canvas_candidates(document_id);
+			CREATE TABLE IF NOT EXISTS canvas_lifecycle (
+				operation_id TEXT PRIMARY KEY,
+				created_at INTEGER NOT NULL,
+				value_json TEXT NOT NULL
+			) STRICT;
+			CREATE TABLE IF NOT EXISTS canvas_settlements (
+				document_id TEXT PRIMARY KEY,
+				canonical_content BLOB NOT NULL,
 				value_json TEXT NOT NULL
 			) STRICT;
 			CREATE TABLE IF NOT EXISTS recovery_state (
@@ -261,6 +282,63 @@ export class NodeVaultDatabase implements VaultDatabasePort, BootstrapDatabasePo
 
 	async deleteDocument(documentId: string): Promise<void> {
 		this.statement("DELETE FROM documents WHERE document_id = ?").run(documentId);
+	}
+
+	async putCanvasCandidate(candidate: StoredCanvasCandidate): Promise<void> {
+		const value = { ...candidate, encodedUpdate: undefined };
+		this.statement(`INSERT INTO canvas_candidates(candidate_id, document_id, encoded_update, captured_at, value_json)
+			VALUES (?, ?, ?, ?, ?) ON CONFLICT(candidate_id) DO UPDATE SET
+			document_id=excluded.document_id, encoded_update=excluded.encoded_update,
+			captured_at=excluded.captured_at, value_json=excluded.value_json`).run(candidate.candidateId,
+			candidate.documentId, sqliteBytes(candidate.encodedUpdate), candidate.capturedAt, JSON.stringify(value));
+	}
+
+	async listCanvasCandidates(): Promise<StoredCanvasCandidate[]> {
+		return (this.statement("SELECT * FROM canvas_candidates ORDER BY captured_at, candidate_id").all() as SqlRow[])
+			.map((row) => ({ ...jsonValue<Omit<StoredCanvasCandidate, "encodedUpdate">>(row.value_json,
+				"canvas_candidates.value_json"), encodedUpdate: storedArrayBuffer(row.encoded_update,
+				"canvas_candidates.encoded_update") }));
+	}
+
+	async deleteCanvasCandidate(candidateId: string): Promise<void> {
+		this.statement("DELETE FROM canvas_candidates WHERE candidate_id = ?").run(candidateId);
+	}
+
+	async putCanvasLifecycle(operation: StoredCanvasLifecycle): Promise<void> {
+		this.statement(`INSERT INTO canvas_lifecycle(operation_id, created_at, value_json) VALUES (?, ?, ?)
+			ON CONFLICT(operation_id) DO UPDATE SET created_at=excluded.created_at, value_json=excluded.value_json`)
+			.run(operation.operationId, operation.createdAt, JSON.stringify(operation));
+	}
+
+	async listCanvasLifecycle(): Promise<StoredCanvasLifecycle[]> {
+		return (this.statement("SELECT value_json FROM canvas_lifecycle ORDER BY created_at, operation_id").all() as SqlRow[])
+			.map((row) => jsonValue<StoredCanvasLifecycle>(row.value_json, "canvas_lifecycle.value_json"));
+	}
+
+	async deleteCanvasLifecycle(operationId: string): Promise<void> {
+		this.statement("DELETE FROM canvas_lifecycle WHERE operation_id = ?").run(operationId);
+	}
+
+	async getCanvasSettlement(documentId: string): Promise<StoredCanvasSettlement | null> {
+		const row = this.statement("SELECT * FROM canvas_settlements WHERE document_id = ?").get(documentId) as SqlRow | undefined;
+		return row ? { ...jsonValue<Omit<StoredCanvasSettlement, "canonicalContent">>(row.value_json,
+			"canvas_settlements.value_json"), canonicalContent: storedArrayBuffer(row.canonical_content,
+			"canvas_settlements.canonical_content") } : null;
+	}
+
+	async putCanvasSettlement(settlement: StoredCanvasSettlement, expectedRevision: number | null): Promise<boolean> {
+		return this.transaction(() => {
+			const current = this.statement("SELECT value_json FROM canvas_settlements WHERE document_id = ?")
+				.get(settlement.documentId) as SqlRow | undefined;
+			const currentRevision = current ? jsonValue<Omit<StoredCanvasSettlement, "canonicalContent">>(current.value_json,
+				"canvas_settlements.value_json").localSettlementRevision : null;
+			if (currentRevision !== expectedRevision) return false;
+			const value = { ...settlement, canonicalContent: undefined };
+			this.statement(`INSERT INTO canvas_settlements(document_id, canonical_content, value_json) VALUES (?, ?, ?)
+				ON CONFLICT(document_id) DO UPDATE SET canonical_content=excluded.canonical_content,
+				value_json=excluded.value_json`).run(settlement.documentId, sqliteBytes(settlement.canonicalContent), JSON.stringify(value));
+			return true;
+		});
 	}
 
 	async getBodySettlement(bodyId: string): Promise<StoredBodySettlement | null> {
@@ -565,8 +643,8 @@ export class NodeVaultDatabase implements VaultDatabasePort, BootstrapDatabasePo
 		const recovery = await this.getRecoveryState() as { activeCaptureId?: unknown; activeRestore?: unknown } | null;
 		return {
 			dirtyDocuments: scalar("SELECT COUNT(*) AS count FROM documents WHERE dirty = 1"),
-			pendingCandidates: scalar("SELECT COUNT(*) AS count FROM pending_candidates"),
-			lifecycleOperations: scalar("SELECT COUNT(*) AS count FROM lifecycle_operations"),
+			pendingCandidates: scalar("SELECT COUNT(*) AS count FROM pending_candidates") + scalar("SELECT COUNT(*) AS count FROM canvas_candidates"),
+			lifecycleOperations: scalar("SELECT COUNT(*) AS count FROM lifecycle_operations") + scalar("SELECT COUNT(*) AS count FROM canvas_lifecycle"),
 			attachmentOperations: scalar("SELECT COUNT(*) AS count FROM attachment_operations"),
 			outstandingSettlements: scalar("SELECT COUNT(*) AS count FROM outstanding_settlements"),
 			activeRecoveryOperations: (typeof recovery?.activeCaptureId === "string" ? 1 : 0)
@@ -584,7 +662,8 @@ export class NodeVaultDatabase implements VaultDatabasePort, BootstrapDatabasePo
 		this.transaction(() => {
 			for (const table of ["documents", "pending_candidates", "lifecycle_operations", "attachment_operations",
 				"bootstrap_progress", "feed_cursor", "outstanding_settlements", "materialized_paths", "recovery_state",
-				"initial_import", "disk_index", "preserved_unresolved", "body_settlements"]) {
+				"initial_import", "disk_index", "preserved_unresolved", "body_settlements", "canvas_candidates",
+				"canvas_lifecycle", "canvas_settlements"]) {
 				this.database.exec(`DELETE FROM ${table}`);
 			}
 		});

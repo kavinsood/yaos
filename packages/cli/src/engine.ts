@@ -3,6 +3,7 @@ import { TFile } from "obsidian";
 
 import { BootstrapClient, BootstrapHttpPort, prepareBootstrapRoot } from "../../../src/sync/bootstrapClient";
 import { DiskMirror } from "../../../src/sync/diskMirror";
+import { ObsidianCanvasDiskMirror } from "../../../src/sync/canvas/canvasDiskMirror";
 import { createSocketTicketCache } from "../../../src/sync/socketTicket";
 import { BodySettlementRepository } from "../../../src/sync/bodySettlement";
 import { canonicalMarkdownHash } from "../../../server/src/shared/markdownCodec";
@@ -22,7 +23,7 @@ import {
 	type DiskIndex,
 } from "../../../src/sync/diskIndex";
 import type { DiskIngestPort } from "../../../src/runtime/engineControlPort";
-import { isMarkdownSyncable } from "../../../src/types";
+import { isCanvasSyncable, isMarkdownSyncable } from "../../../src/types";
 import { createFetchRequester } from "../../../src/utils/http";
 import { fetchVaultProvisioningProof } from "../../../src/onboarding/provisioningClient";
 import { LocalVaultImporter } from "../../../src/onboarding/localVaultImport";
@@ -256,6 +257,8 @@ export class DaemonEngine {
 	 * or the CRDT changes because a candidate exists.
 	 */
 	private readonly deleteCandidates = new Map<string, DeleteCandidate>();
+	private readonly canvasDeleteCandidates = new Map<string, { firstMissingAt: number; firstMissingScan: number }>();
+	private canvasHintWork: Promise<void> = Promise.resolve();
 
 	/**
 	 * Authoritative scans completed by `runPeriodicReconcile`, counted so a
@@ -407,6 +410,7 @@ export class DaemonEngine {
 
 		// Phase 3: construct the canonical runtime and its disk mirror.
 		const tickets = createSocketTicketCache(requester);
+		const canvasProjection = new ObsidianCanvasDiskMirror(host.app);
 		const vaultSync = new VaultSync({
 			vaultId: this.membership.vaultId,
 			vaultGeneration: this.membership.vaultGeneration,
@@ -414,6 +418,7 @@ export class DaemonEngine {
 			host: this.membership.host,
 			token: this.membership.deviceToken,
 			database,
+			canvasProjection,
 			request: requester,
 			webSocket: createAccessWebSocketImplementation(this.accessCredentials),
 			getSocketTicket: async (scope, force = false) => {
@@ -519,6 +524,7 @@ export class DaemonEngine {
 			diskMirror,
 		);
 		bootstrapClient.configureSettlements(bodySettlements);
+		if (vaultSync.canvases) bootstrapClient.configureCanvases(vaultSync.canvases);
 		this.bootstrapClient = bootstrapClient;
 		const controller = new ReconciliationController(this.buildControllerDeps());
 		this.controller = controller;
@@ -555,9 +561,10 @@ export class DaemonEngine {
 		const providerSynced = await vaultSync.waitForProviderSync();
 		if (vaultSync.fatalAuthError) throw this.recordFatalAuth();
 		if (!providerSynced) {
-			throw new StartupError(`Timed out waiting for ${this.membership.host} to synchronize the schema-7 root`);
+			throw new StartupError(`Timed out waiting for ${this.membership.host} to synchronize the schema-8 root`);
 		}
 		await this.admitAuthoritativeDiskChanges(await host.scanMarkdown());
+		await this.admitAuthoritativeCanvasChanges(await host.scanCanvases());
 		const mode = vaultSync.getSafeReconcileMode();
 		if (mode !== "authoritative") throw new StartupError("Root provider did not establish authoritative reconciliation");
 		await controller.runReconciliation(mode);
@@ -645,6 +652,7 @@ export class DaemonEngine {
 		}
 		this.stopped = true;
 		this.log("shutdown-watcher-closed");
+		await this.canvasHintWork;
 
 		const periodic = this.periodicReconcileInFlight;
 		if (periodic !== null) {
@@ -706,6 +714,19 @@ export class DaemonEngine {
 		switch (hint.kind) {
 			case "create":
 			case "modify": {
+				if (this.isCanvasPathSyncable(hint.path) && vaultSync.canvases?.isSemanticPath(hint.path)) {
+					const file = this.host?.app.vault.getAbstractFileByPath(hint.path);
+					if (file instanceof TFile) this.canvasHintWork = this.canvasHintWork
+						.then(() => this.host?.app.vault.readBinary(file))
+						.then((content) => content ? vaultSync.canvases?.ingest(hint.path, new Uint8Array(content)) : undefined)
+						.then(() => undefined)
+						.catch((error: unknown) => this.log(`Canvas hint failed for "${hint.path}": ${String(error)}`));
+					return;
+				}
+				if (this.isCanvasPathSyncable(hint.path)) {
+					void this.runPeriodicReconcile();
+					return;
+				}
 				if (!this.isMarkdownPathSyncable(hint.path)) return;
 				const file = this.host?.app.vault.getAbstractFileByPath(hint.path);
 				if (!(file instanceof TFile)) return;
@@ -718,6 +739,11 @@ export class DaemonEngine {
 				return;
 			}
 			case "delete": {
+				if (this.isCanvasPathSyncable(hint.path)) {
+					this.log(`Canvas delete hint deferred for identity-safe review: "${hint.path}"`);
+					void this.runPeriodicReconcile();
+					return;
+				}
 				if (!this.isMarkdownPathSyncable(hint.path)) return;
 				if (this.diskMirror?.consumeDeleteSuppression(hint.path)) {
 					this.log(`Suppressed delete event for "${hint.path}"`);
@@ -966,6 +992,7 @@ export class DaemonEngine {
 			await this.bootstrapCatchUp;
 			if (mode === "authoritative") {
 				await this.admitAuthoritativeDiskChanges(await host.scanMarkdown());
+				await this.admitAuthoritativeCanvasChanges(await host.scanCanvases());
 			}
 			await controller.runReconciliation(mode);
 			if (mode === "authoritative") {
@@ -991,6 +1018,58 @@ export class DaemonEngine {
 			if (this.diskMirror?.isPreservedUnresolved(path)) continue;
 			await this.ingestAuthoritativeDiskPath(path);
 		}
+	}
+
+	private async admitAuthoritativeCanvasChanges(scan: MarkdownScan): Promise<void> {
+		const runtime = this.vaultSync;
+		const host = this.host;
+		if (!runtime?.canvases || !host) return;
+		const present = new Set(scan.paths);
+		const active = runtime.canvases.activeEntries();
+		const missing = new Set(active.filter((entry) => !present.has(entry.path)
+			&& shadowedBy(entry.path, scan.unreadable) === null).map((entry) => entry.path));
+		for (const path of scan.paths) {
+			if (!this.isCanvasPathSyncable(path)) continue;
+			const file = host.app.vault.getAbstractFileByPath(path);
+			if (!(file instanceof TFile)) continue;
+			try {
+				const bytes = new Uint8Array(await host.app.vault.readBinary(file));
+				if (runtime.canvases.isSemanticPath(path)) {
+					await runtime.canvases.ingest(path, bytes);
+					this.canvasDeleteCandidates.delete(path);
+				} else if (missing.size > 0) {
+					const sourcePath = await runtime.canvases.findExactRenameSource(bytes, [...missing]);
+					if (sourcePath) {
+						const documentId = runtime.canvases.documentIdForPath(sourcePath);
+						if (documentId) {
+							await runtime.canvases.rename(documentId, sourcePath, path);
+							missing.delete(sourcePath);
+							this.canvasDeleteCandidates.delete(sourcePath);
+							this.log(`Canvas rename inferred from exact semantic content: "${sourcePath}" -> "${path}"`);
+						}
+					}
+				}
+			} catch (error) {
+				this.log(`Canvas scan could not ingest "${path}": ${String(error)}`);
+			}
+		}
+		for (const path of missing) {
+			const existing = this.canvasDeleteCandidates.get(path);
+			if (!existing) {
+				this.canvasDeleteCandidates.set(path, { firstMissingAt: Date.now(), firstMissingScan: this.authoritativeScans });
+				continue;
+			}
+			if (this.authoritativeScans <= existing.firstMissingScan || Date.now() - existing.firstMissingAt < this.deleteStabilityMs) continue;
+			const documentId = runtime.canvases.documentIdForPath(path);
+			if (documentId) await runtime.canvases.delete(documentId);
+			this.canvasDeleteCandidates.delete(path);
+			this.log(`Canvas delete confirmed after identity-safe review: "${path}"`);
+		}
+		for (const path of [...this.canvasDeleteCandidates.keys()]) if (!missing.has(path)) this.canvasDeleteCandidates.delete(path);
+	}
+
+	private isCanvasPathSyncable(path: string): boolean {
+		return isCanvasSyncable(path, this.runtimeConfig.excludePatterns, VAULT_CONFIG_DIR);
 	}
 
 	private async ingestAuthoritativeDiskPath(path: string): Promise<void> {

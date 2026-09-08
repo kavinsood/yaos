@@ -35,6 +35,7 @@ import nodePath from "node:path";
 import { TFile, TFolder, type TAbstractFile } from "obsidian";
 import { canonicalizeMarkdown } from "@shared/markdownCodec";
 import { MAX_CLIENT_MARKDOWN_BYTES } from "@shared/durableLimits";
+import { CANVAS_LIMITS } from "@shared/canvasLimits";
 /**
  * Stat shape this host tracks. Declared locally: the daemon no longer depends
  * on the client `VaultFs` port, which is unfinished and stays out of this
@@ -338,7 +339,14 @@ export class NodeApp {
 	walkMarkdown(): MarkdownWalk {
 		const files: WalkedFile[] = [];
 		const unreadable: string[] = [];
-		this.walkInto(this.vaultRoot, "", files, unreadable);
+		this.walkInto(this.vaultRoot, "", files, unreadable, ".md", MAX_MARKDOWN_FILE_BYTES);
+		return { files, unreadable };
+	}
+
+	walkCanvases(): MarkdownWalk {
+		const files: WalkedFile[] = [];
+		const unreadable: string[] = [];
+		this.walkInto(this.vaultRoot, "", files, unreadable, ".canvas", CANVAS_LIMITS.canonicalBytes * 2);
 		return { files, unreadable };
 	}
 
@@ -347,6 +355,8 @@ export class NodeApp {
 		relativeDir: string,
 		out: WalkedFile[],
 		unreadable: string[],
+		extension: string,
+		maximumBytes: number,
 	): void {
 		let entries;
 		try {
@@ -380,12 +390,12 @@ export class NodeApp {
 			if (stats.isDirectory()) {
 				const folderPath = normalizeVaultPath(diskRelPath);
 				this.index.set(folderPath, toVaultFsStat(stats, "folder"), diskRelPath);
-				this.walkInto(absolute, diskRelPath, out, unreadable);
+				this.walkInto(absolute, diskRelPath, out, unreadable, extension, maximumBytes);
 				continue;
 			}
 			if (!stats.isFile()) continue;
-			if (!entry.name.toLowerCase().endsWith(".md")) continue;
-			if (stats.size > MAX_MARKDOWN_FILE_BYTES) continue;
+			if (!entry.name.toLowerCase().endsWith(extension)) continue;
+			if (stats.size > maximumBytes) continue;
 			const vaultPath = normalizeVaultPath(diskRelPath);
 			const stat = toVaultFsStat(stats, "file");
 			this.index.set(vaultPath, stat, diskRelPath);
@@ -494,11 +504,23 @@ export class NodeVault {
 		return await fs.readFile(this.host.absolutePathFor(file.path), "utf8");
 	}
 
+	async readBinary(file: TFile): Promise<ArrayBuffer> {
+		const bytes = await fs.readFile(this.host.absolutePathFor(file.path));
+		return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+	}
+
 	async modify(file: TFile, content: string): Promise<void> {
 		content = canonicalizeMarkdown(content);
 		const absolute = this.host.absolutePathFor(file.path);
 		await this.host.assertWritable(file.path, absolute);
 		await writeFileAtomic(absolute, content);
+		this.refreshAfterWrite(file.path, absolute);
+	}
+
+	async modifyBinary(file: TFile, content: ArrayBuffer): Promise<void> {
+		const absolute = this.host.absolutePathFor(file.path);
+		await this.host.assertWritable(file.path, absolute);
+		await writeFileAtomic(absolute, new Uint8Array(content));
 		this.refreshAfterWrite(file.path, absolute);
 	}
 
@@ -522,6 +544,17 @@ export class NodeVault {
 		await writeFileAtomic(absolute, content);
 		const stat = this.refreshAfterWrite(normalized, absolute);
 		return this.host.makeTFile(normalized, stat);
+	}
+
+	async createBinary(path: string, content: ArrayBuffer): Promise<TFile> {
+		const normalized = normalizeVaultPath(path);
+		const absolute = this.host.absolutePathFor(normalized);
+		if (this.host.statSyncEntry(normalized) !== null) throw new Error(`File already exists: ${normalized}`);
+		await this.host.assertWritable(normalized, absolute);
+		await ensureDirectoryDurable(nodePath.dirname(absolute));
+		await this.host.assertWritable(normalized, absolute);
+		await writeFileAtomic(absolute, new Uint8Array(content));
+		return this.host.makeTFile(normalized, this.refreshAfterWrite(normalized, absolute));
 	}
 
 	async createFolder(path: string): Promise<TFolder> {
@@ -582,6 +615,33 @@ export class NodeVaultAdapter {
 			mtime: Math.floor(stats.mtimeMs),
 			size: stats.size,
 		};
+	}
+
+	async exists(path: string): Promise<boolean> { return (await this.stat(path)) !== null; }
+
+	async mkdir(path: string): Promise<void> {
+		const normalized = normalizeVaultPath(path);
+		const absolute = this.host.absolutePathFor(normalized);
+		await this.host.assertWritable(normalized, absolute);
+		await ensureDirectoryDurable(absolute);
+	}
+
+	async write(path: string, content: string): Promise<void> {
+		const normalized = normalizeVaultPath(path);
+		const absolute = this.host.absolutePathFor(normalized);
+		await this.host.assertWritable(normalized, absolute);
+		await ensureDirectoryDurable(nodePath.dirname(absolute));
+		await this.host.assertWritable(normalized, absolute);
+		await writeFileAtomic(absolute, content);
+	}
+
+	async writeBinary(path: string, content: ArrayBuffer): Promise<void> {
+		const normalized = normalizeVaultPath(path);
+		const absolute = this.host.absolutePathFor(normalized);
+		await this.host.assertWritable(normalized, absolute);
+		await ensureDirectoryDurable(nodePath.dirname(absolute));
+		await this.host.assertWritable(normalized, absolute);
+		await writeFileAtomic(absolute, new Uint8Array(content));
 	}
 }
 
