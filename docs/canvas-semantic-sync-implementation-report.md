@@ -1,7 +1,7 @@
 # Canvas semantic synchronization implementation report
 
 The JSON Canvas 1.0 semantic plane is implemented for schema 8, storage format
-3, socket protocol 4, and recovery format 3. It remains opt-in per file.
+4, socket protocol 5, and recovery format 3. It remains opt-in per file.
 Attachment authority remains the fallback for invalid, unsupported, oversized,
 excluded, or unpromoted `.canvas` files.
 
@@ -13,7 +13,8 @@ excluded, or unpromoted `.canvas` files.
 - Three-way projection merge uses an exact local settlement when available, preserves conflicting local bytes before choosing shared values, retains edit/delete evidence, and internally retains dangling edges.
 - Semantic candidates and lifecycle operations are persisted locally before submission, replay exact identities after restart or transient failure, and clear only on matching durable receipts.
 - Each active Canvas owns at most one semantic WebSocket provider across split views. Pending peer updates project immediately, providers release when the last view closes, application-level liveness covers them, and durable HTTP candidates/receipts remain the settlement authority.
-- Server candidates reconstruct and validate the complete resulting Canvas before committing content hash, size, attribution, semantic catalog, journal, and receipt state.
+- Server candidates and socket frames use a resident authoritative document plus a private validation mirror. SQLite commits the exact bounded binary update before live state advances or peers see it; failure rebuilds the mirror without contaminating live state.
+- Canvas carries a body-like semantic epoch through state, candidates, receipts, tickets, sockets, bootstrap, catalogs, feed, and client persistence. Genuine compaction rebuilds a fresh Y.Doc from canonical Canvas JSON, fences stale clients, and semantically rebases offline JSON intent instead of accepting retired Yjs identities.
 - Promotion consumes an exact attachment revision while retaining that exact blob as rollback material. Demotion uploads canonical semantic bytes before switching authority. Both transitions are idempotent and transaction-time fenced by exact root, catalog, and document heads.
 - Bootstrap, ordered feed, recovery capture/read/restore, recovery GC, retained rollback blobs, Cloudflare storage, Node storage, and headless closed-file projection are kind-aware.
 - The Obsidian host adapter is the sole private Canvas boundary. It proves file/view/load ownership, blocks unproven open views, updates every owned split view once per batch, suppresses observer echo, and preserves active text conservatively.
@@ -22,9 +23,9 @@ excluded, or unpromoted `.canvas` files.
 
 ## Operator workflow
 
-Schema 7 to 8 migration is an explicit idempotent operator action. It installs
-an empty semantic catalog and leaves every existing `.canvas` attachment head
-unchanged. The active-file **Promote Canvas to semantic sync** and **Return
+Schema 8 is a greenfield reinstall boundary; there is no schema-7 or storage-3
+migration endpoint. Existing ordinary `.canvas` files are imported under fresh
+authority. The active-file **Promote Canvas to semantic sync** and **Return
 Canvas to attachment sync** commands perform the only authority switches in
 this release.
 
@@ -46,7 +47,7 @@ receipt; reusing its identity with different input is rejected.
 
 The implementation is covered by the pure Canvas core, Canvas manager and live-provider lifecycle,
 projection router, host adapter, semantic server hardening, real-SQLite
-authority race, schema migration, bootstrap, recovery, public API, Node runtime,
+authority race, epoch reset/rebase, bootstrap, recovery, public API, Node runtime,
 headless, regression, and Cloudflare/Node conformance suites. Both runtimes prove semantic socket admission, pending peer relay, and durable socket flush. Promotion and
 demotion tests prove exact replay, rollback reachability, cross-authority
 exclusivity, stale root rejection, and absence of partial receipts/documents.

@@ -1,6 +1,6 @@
 # Canvas semantic synchronization
 
-Status: implemented behind explicit per-file promotion; default-on rollout remains field-gated.
+Status: proposed implementation plan.
 
 This document specifies the complete Canvas feature: durable semantic authority,
 closed-file synchronization, live Obsidian Canvas projection, conflict handling,
@@ -773,9 +773,8 @@ remote text waits behind the active card edit and merges at its commit boundary.
 ### Embedded Markdown editors
 
 Markdown file nodes can expose child editors that normal top-level leaf
-orchestration does not see. Their native save path and the independent Markdown
-file plane provide the correctness fallback. Where host probing demonstrates a
-stable child-view capability, YAOS may add a bounded low-latency bridge:
+orchestration does not see. Complete Canvas integration therefore includes a
+bounded embedded-editor bridge:
 
 - only actual Markdown child views are eligible;
 - resolve their vault path through normal root authority;
@@ -876,35 +875,14 @@ existing files require a controlled background promotion pass.
 The blob backing a promoted Canvas remains GC-reachable for a rollback retention
 window and through existing recovery roots. It is not a second live authority.
 
-### Schema-7 vault migration
+### Greenfield schema-8 installation
 
-The schema cutover does not promote files implicitly:
-
-1. stop new schema-7 admission and drain the serialized vault mutation owner;
-2. checkpoint every loaded root/body and verify no server-side publication is
-   half-installed;
-3. install storage format 3 and transform the root to schema 8 with an empty
-   `pathToSemantic` map;
-4. leave every existing `.canvas` path in `pathToBlob` with its exact attachment
-   revision and R2 object;
-5. advance server schema/protocol atomically and reject all old tickets,
-   candidates, lifecycle work, and socket sessions;
-6. make schema-8 clients discard incompatible document caches, bootstrap from
-   SQL, and conservatively reconcile local disk against the retained attachment
-   heads;
-7. promote eligible canvases later through the explicit expected-head operation.
-
-An offline schema-7 client cannot write after cutover. Its unsynchronized disk
-content is rediscovered by the schema-8 client and goes through ordinary
-attachment preservation before any promotion. Operator migration must be
-idempotent and leave a durable receipt naming the old/new versions, root
-sequence, transformed-root hash, and completion time.
-
-Rollback across this schema boundary is not a binary-only Worker rollback.
-Before deploying schema 8, operations must provide either a tested reverse
-migration for vaults with no semantic entries or an explicit export/demote
-procedure for vaults that have promoted entries. Deployment UI must not imply
-that an old Worker binary can safely open storage format 3.
+There is no schema-7, storage-3, cache, or Yjs-history migration. A schema-8
+installation claims fresh Durable Object namespaces and fresh local caches,
+then imports ordinary Markdown, Canvas, and attachment files from disk. Old
+tickets, candidates, lifecycle work, receipts, and socket sessions are not
+accepted. Rollback means exporting ordinary semantic files and reinstalling;
+an older Worker must never open storage-format-4 state.
 
 ### Missing R2
 
@@ -1264,14 +1242,12 @@ Canvas content without R2 dependence for ordinary semantic sync.
 3. Capture local mutation, save, and undo/redo boundaries.
 4. Apply remote semantic state with one deferred save and exact echo proof.
 5. Handle actively edited text nodes conservatively.
-6. Probe embedded Markdown child editors and connect them only where a stable,
-   capability-gated host boundary is demonstrated.
+6. Connect and release embedded Markdown child editors.
 7. Validate split views, rapid switching, external disk reload, plugin reload,
    workspace restore, mobile suspension, and unavailable private APIs.
 
 Exit: open and closed Canvas projections converge without cross-file splicing,
-undo pollution, save storms, or stale completion; unavailable child-editor
-private APIs fall back to native Markdown saves without weakening correctness.
+undo pollution, save storms, or stale completion.
 
 ### Phase 6 — Migration and staged rollout
 

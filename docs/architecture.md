@@ -36,16 +36,16 @@ A physical installation may enroll different folders in different vaults, but ea
 Vault creation is a recoverable provisioning saga:
 
 1. The registry reserves a unique `vaultId` and `vaultGeneration` in `provisioning` state.
-2. The vault Durable Object idempotently creates schema-7 metadata and an empty root in SQLite.
+2. The vault Durable Object idempotently creates schema-8 metadata and an empty root in SQLite.
 3. The registry moves the matching generation to `awaiting_owner` and, for claim, publishes the one-use owner-bootstrap code.
 4. Owner enrollment installs the first complete principal/device authority fence and then activates the vault.
 5. A failure remains recorded as retryable provisioning or authorization-change state; it is not exposed as an active partial vault.
 
 `vaultGeneration` identifies one storage incarnation of a vault and scopes every R2 key and asynchronous job. `runtimeEpoch` identifies one live Durable Object runtime and prevents receipts or capabilities from being mistaken for evidence from another runtime.
 
-## Schema-7 vault authority
+## Schema-8 vault authority
 
-Schema 7 retains the schema-6 root/body, semantic-frontmatter, component-settlement, and revisioned-attachment architecture while adding human collaboration authority:
+Schema 8 is a greenfield root/Markdown/semantic-Canvas design with human collaboration authority, binary Yjs storage, and semantic epoch resets:
 
 - the root Yjs document carries `pathToId`, attachment references and metadata, attachment tombstones, and schema metadata;
 - every Markdown file has a stable file/body identity and its own Yjs document whose text key is `body`;
@@ -62,10 +62,10 @@ The exact product pins are:
 
 | Boundary | Version |
 |---|---:|
-| Document schema | 7 |
-| Durable SQL storage format | 3 |
-| Socket protocol | 4 |
-| Recovery snapshot format | 2 |
+| Document schema | 8 |
+| Durable SQL storage format | 4 |
+| Socket protocol | 5 |
+| Recovery snapshot format | 3 |
 | Settings sync format | 2 |
 | Control-plane identity format | 3 |
 
@@ -76,7 +76,7 @@ Missing or mismatched schema or protocol declarations fail admission with `updat
 The vault Durable Object contains separate durable and live owners:
 
 - `VaultStore` composes the SQLite document, catalog, bootstrap, recovery-authority, receipt, pin, and deletion stores. SQLite is the durable source for root/body generations, vault sequence, lifecycle, and recovery authority.
-- `VaultDocumentCache` owns loaded Yjs documents and pending updates. It enforces body-count, a 48 MiB encoded-Yjs-state proxy budget, and a 16 MiB transient/pending budget and may evict only clean, unpinned bodies with no open socket. Known count, encoded-state, and transient pressure at body WebSocket admission returns a bounded `429` with the exact pressure reason and a one-second retry hint; unknown reconstruction/storage failures retain the generic error path. Encoded state is a representation bound, not server heap measurement. The client `BodyManager` independently bounds a versioned 48 MiB loaded-body resident estimate; temporary and shared estimates are reported separately pending RFC 09 policy. The client estimate's evidence and limits are defined in [body residency accounting](residency-accounting.md).
+- `VaultDocumentCache` owns persistent authoritative and private validation Yjs documents for loaded Markdown and Canvas bodies plus ordered pending updates. It enforces body-count, encoded-state proxy, and transient/pending budgets and may evict only clean bodies with no open socket or pending update. Durable history pins retain SQL reconstruction boundaries; they deliberately do not pin every corresponding `Y.Doc` in RAM. Exact wire bytes gate SQLite-row admission; canonical Markdown/Canvas bytes gate content; encoded-state sampling schedules compaction but is never treated as a hard post-state proof. Validation mirrors take that exact census after 500 tiny updates or 256 KiB of ingress, whichever comes first; intervening values are explicitly operational proxies.
 - `VaultSocketService` owns root and body WebSocket sessions. The root socket is structural; a body socket is admitted only for an active body.
 - `VaultLifecycleService` owns durable create, rename, delete, and revive ordering plus root publication checks.
 - `VaultCandidateService` owns device-scoped body candidate admission, idempotency, and durable receipts.
@@ -92,7 +92,7 @@ The client `SettingsSyncEngine` is a separate serialized lifecycle. It gates on 
 A new or reset client bootstraps without R2:
 
 1. The server flushes loaded documents and creates a time-bounded SQL history pin at one vault sequence.
-2. The client verifies the schema-7 root checkpoint.
+2. The client verifies the schema-8 root checkpoint and root epoch.
 3. It pages the SQL catalog and fetches each referenced body at the pinned boundary.
 4. Each body is identity-, generation-, size-, hash-, and path-checked before disk settlement.
 5. The client catches up from the ordered SQL feed, rechecks current heads before mutation, and records unresolved bodies for retry.
@@ -135,7 +135,7 @@ Recovery is optional and requires both R2 and the `RecoveryJob` Durable Object b
 
 The vault object remains the authority for fixed-boundary plans, history pins, recovery leases, catalogs, restore authority, and GC marks. Deterministically named `RecoveryJob` objects own alarm-driven execution and durable job progress for projection, capture, restore, garbage collection, and purge.
 
-The projection job materializes content-addressed Markdown objects needed by recovery. A capture pins one SQL sequence, pages active bodies, deleted identities, and attachments, verifies materialization coverage, builds bounded content-addressed manifest trees, and publishes an immutable `yaos-recovery-v2` root. Jobs are resumable, capability-scoped, bounded per alarm, and may report `complete_with_gaps` when a manifest explicitly records unavailable content.
+The projection job materializes content-addressed Markdown and Canvas objects needed by recovery. A capture pins one SQL sequence, pages active bodies, deleted identities, and attachments, verifies materialization coverage, builds bounded content-addressed manifest trees, and publishes an immutable `yaos-recovery-v2` root. Jobs are resumable, capability-scoped, bounded per alarm, and may report `complete_with_gaps` when a manifest explicitly records unavailable content. Each RecoveryJob also enforces a standalone 64 MiB transient-memory budget: recipe totals and fragment aggregates are persisted and checked, checkpoint BLOBs are assembled one row at a time, object size is preflighted before reads, and manifest/inventory work is pagewise and concurrency-bounded.
 
 Browsing follows only the requested manifest branch. Restore is asynchronous and selection-scoped. Before replacement, the client backs up affected local paths and rechecks disk state; it then submits body candidates and lifecycle operations through normal durable paths, settles disk, and reports per-item outcomes. Recovery never replaces the live SQL root/body authority with an R2 snapshot.
 
@@ -147,11 +147,11 @@ GC marks retained recovery and blob roots, acquires bounded sweep leases, and de
 
 Vault HTTP routes require the device bearer and selected vault ID. The public route resolves the current principal, membership, device credential, role, policy version, capability digest, and active generation, then replaces any caller-supplied actor headers with this trusted context before forwarding. The vault runtime verifies the context against its durable authority mirror and checks the fixed capability for the route. Settings routes additionally bind the environment to the admitted principal and require exactly one `settingsFormatVersion=2`.
 
-A short-lived protocol-4 ticket is deployment-, vault-generation-, principal-, membership-, device-, credential-, purpose-, and document-bound; long-lived credentials never appear in socket URLs. Root and body handshakes require exact `schemaVersion=7` and `protocolVersion=4`. Current control-plane authority is checked before runtime admission and the vault mirror checks it again. Protocol liveness still requires exact per-socket acknowledgements; browser `OPEN` alone is not responsive evidence.
+A short-lived protocol-5 ticket is deployment-, vault-generation-, principal-, membership-, device-, credential-, purpose-, document-, and semantic-epoch-bound; long-lived credentials never appear in socket URLs. Root, Markdown, and Canvas handshakes require exact `schemaVersion=8` and `protocolVersion=5`. Current control-plane authority is checked before runtime admission and the vault mirror checks it again. Protocol liveness still requires exact per-socket acknowledgements; browser `OPEN` alone is not responsive evidence.
 
 Revocation or ownership transfer first prevents new admission, then installs one idempotent authority change in the vault mutation order and closes affected sockets. A mutation ordered before the fence remains committed; one ordered after it fails as `authority_superseded`. Exact operation-outcome lookup can recover a bounded receipt for work that committed before a response was lost, but cannot create new work. The client preserves stale-authority work as unpublished rather than replaying it under new authority.
 
-Leaving revokes a member principal and all of their devices, retires only its exact settings queue and acceptance, clears the folder's schema-7 enrollment cache, and leaves ordinary files and configuration on disk. Revoking a last member device has the same membership result. An owner cannot leave or lose the last device through ordinary self-service; owner loss uses an audited operator-issued recovery code. Recovery restores content only and never rewinds principals, devices, invitations, authority changes, or audit.
+Leaving revokes a member principal and all of their devices, retires only its exact settings queue and acceptance, clears the folder's schema-8 enrollment cache, and leaves ordinary files and configuration on disk. Revoking a last member device has the same membership result. An owner cannot leave or lose the last device through ordinary self-service; owner loss uses an audited operator-issued recovery code. Recovery restores content only and never rewinds principals, devices, invitations, authority changes, or audit.
 
 ## Purge-first vault deletion
 
@@ -169,4 +169,9 @@ When R2 is absent, the R2 phase is already complete and SQL deletion can proceed
 
 Persistence corruption, invalid identity, wrong generation, stale candidate, and incompatible versions fail closed. Diagnostics fail open. Uncertain filesystem deletion preserves data. Settings JSON and hashes are quarantined before apply, and incompatible settings capability or clashes isolate the settings subsystem. Recovery jobs expose retries and terminal gaps rather than reporting false completeness.
 
-Large-vault benchmark and soak evidence, deployed-Cloudflare recovery/deletion/settings evidence, broader real desktop settings/recovery flows, and all real mobile settings/recovery evidence are deferred; current evidence is described only in [QA](qa.md). The Docker image packages the conformant Node host without changing the shared domain runtimes. Evidenced open risks are tracked in [BACKLOG.md](BACKLOG.md).
+Long-duration deployed-Cloudflare eviction/outage evidence, broader real desktop
+settings/recovery flows, and all real mobile settings/recovery evidence remain
+deferred; the completed pathological large-document run and disposable deployed
+two-device run are described in [QA](qa.md). The Docker image packages the
+conformant Node host without changing the shared domain runtimes. Evidenced open
+risks are tracked in [BACKLOG.md](BACKLOG.md).

@@ -1,6 +1,6 @@
 # YAOS documentation
 
-Current `main` has durable engineering documents for the schema-7 collaboration
+Current `yaos3` has durable engineering documents for the schema-8 collaboration
 product and the Relay-derived text/lifetime program. Git history preserves
 replaced RFCs, audits, incident reports, and implementation notes; they are not
 parallel current specifications.
@@ -8,14 +8,14 @@ parallel current specifications.
 - [Vault collaboration](collaboration.md) — owner/member product contract,
   people and devices, fixed authority, principal-scoped settings, transfer,
   revocation, presence, and compatibility.
-- [Architecture](architecture.md) — schema-7 root/body and collaboration authority, principal/device identity, semantic frontmatter, settings, recovery, and deletion.
+- [Architecture](architecture.md) — schema-8 root/Markdown/Canvas authority, semantic epochs, principal/device identity, settings, recovery, and deletion.
 - [Sync and conflict contract](sync-contract.md) — current note, attachment, and named settings-environment contracts, including lifecycle and preservation rules.
 - [Canonical Markdown](canonical-markdown.md) — the shared logical text representation, hash domains, and baseline cutover.
-- [Operations](operations.md) — claim, invitations/device links, owner recovery and transfer, settings setup, required bindings, recovery, and the schema-7 cutover.
+- [Operations](operations.md) — claim, invitations/device links, owner recovery and transfer, settings setup, required bindings, recovery, and the greenfield schema-8 boundary.
 - [QA](qa.md) — focused, regression, and local Worker coverage, with real-runtime and external evidence gaps stated separately.
 - [Backlog](BACKLOG.md) — only evidenced unresolved product risks and concrete external validation gaps.
 - [Runtime lifecycle and socket admission](runtime-lifecycle-and-admission.md) — publication epochs, bounded drain, and refresh-first socket ownership.
-- [Application-level socket liveness](socket-liveness.md) — protocol-2 heartbeat evidence, background suspension, and force-abort recovery.
+- [Application-level socket liveness](socket-liveness.md) — heartbeat evidence, background suspension, and force-abort recovery.
 - [Multiplexed body transport evaluation](multiplexed-body-transport-evaluation.md) — deployed Cloudflare measurements, formal protocol-2 rejection, and evidence thresholds for reconsideration.
 - [Currentness plane and editor admission investigation](currentness-plane-investigation.md) — measured admission and catch-up amplification, exact socket watermarks, batched head queries, lifetime prerequisites, and staged implementation plan.
 - [Currentness plane implementation report](currentness-plane-implementation-report.md) — six-phase delivery, public Cloudflare profiling, flush compaction, contention remediation, and final outcome.
@@ -32,5 +32,6 @@ parallel current specifications.
 - [Public plugin API](public-api.md) — versioned immutable state projection, subscriptions, and reload fencing.
 - [Canvas semantic synchronization](canvas-semantic-sync-plan.md) — implemented semantic model, authority, projection, migration, recovery, validation, and field-gated rollout plan for JSON Canvas.
 - [Canvas implementation report](canvas-semantic-sync-implementation-report.md) — shipped schema-8 behavior, safe degradation, automated evidence, and remaining external release gates.
+- [Yjs pathology remediation report](pathology-remediation-report.md) — binary storage, resident validation, semantic epochs and compaction, retention fixes, frozen-trace measurements, and deployed validation.
 
 The repository-root [README](../README.md) is the public product guide. Generated evidence belongs under ignored `qa-runs/`; workstation notes belong under ignored `notes/`.

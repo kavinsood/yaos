@@ -92,7 +92,7 @@ The daemon is Linux/local-filesystem only, Markdown only, and single-process per
 ## Self-hosted Docker server
 
 The production image packages `packages/server-node`, which runs the same
-schema-7 control-plane, vault, settings, attachment, recovery, and deletion
+schema-8 control-plane, vault, settings, attachment, recovery, and deletion
 owners as the Cloudflare Worker over Node 24, SQLite, WebSockets, and filesystem
 object storage.
 

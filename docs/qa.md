@@ -2,13 +2,13 @@
 
 QA claims only the surface that was executed. Unit/model tests do not prove Cloudflare deployment behavior, Obsidian filesystem behavior, or mobile lifecycle ordering.
 
-Generated reports and device artifacts belong under ignored `qa-runs/`. Historical runs are not current schema-7 evidence unless they exercise the current principal/device authority, storage, protocol, attachment revision, and recovery formats.
+Generated reports and device artifacts belong under ignored `qa-runs/`. Historical runs are not current schema-8 evidence unless they exercise the current principal/device authority, storage, protocol, attachment revision, semantic-epoch, and recovery formats.
 
 ## Current integration evidence
 
-The integrated schema-7 collaboration change has automated evidence from:
+The integrated schema-8 collaboration and pathology redesign has automated evidence from:
 
-- focused schema-7 client, control-plane, vault-authority, settings, and public-API suites;
+- focused schema-8 client, control-plane, vault-authority, settings, Canvas, compaction, and public-API suites;
 - the complete discovered regression suite;
 - the separately accountable local Wrangler Worker driver;
 - the runtime-blind Wrangler/Node conformance matrix;
@@ -29,15 +29,15 @@ The first attempt exposed a real hibernation boundary: a committed attachment up
 
 Current client suites exercise:
 
-- `onboarding-import.ts`: origin versus joining provisioning, exact schema-7 provisioning proof, bounded initial inventory, and bulk import;
+- `onboarding-import.ts`: origin versus joining provisioning, exact schema-8 provisioning proof, bounded initial inventory, and bulk import;
 - `collaboration-authority.ts`: fixed owner/member roles and capabilities, authority epochs, stale-work rejection, and complete persisted principal/device authority tuples;
 - `body-manager-load-race.ts`: one load winner and no stale IndexedDB overwrite;
 - `bootstrap-http-boundaries.ts`: authenticated root/catalog/body SQL bootstrap routes and generation headers;
 - `bootstrap-settlement.ts`: root/body verification, safe paths, hash/size/generation checks, feed catch-up, and outstanding retry state;
 - `bootstrap-rename-race.ts`: 200 creates with 100 concurrent renames settle only current heads;
-- `recovery-snapshot-v2.ts`: strict format-2 root and manifest parsing;
+- `recovery-snapshot-v2.ts`: strict current-format root and manifest parsing;
 - `recovery-backup.ts`: backup-before-replacement and changed-target review;
-- `multivault-enrollment-contract.ts`: complete principal/device authority and schema-7 cache retirement;
+- `multivault-enrollment-contract.ts`: complete principal/device authority and schema-8 cache retirement;
 - existing reconciliation, delete-preservation, editor-binding, diagnostics, attachment-conflict, and lifecycle suites through the full regression discovery.
 - `public-api.ts`: immutable collaboration authority, member/presence projection, preserved-unpublished-work counts, and reload fencing without credential exposure;
 - `attachment-publication-replay.ts`: lost responses, root-persistence failure, stable operation-ID replay, and durable upsert/delete/rename intent;
@@ -56,7 +56,7 @@ These tests use controlled ports and models. They prove policy and orchestration
 
 Current server suites exercise:
 
-- `vault-store-sqlite-cycle.ts`: schema-7 root/body SQL persistence and reconstruction;
+- `vault-store-sqlite-cycle.ts`: schema-8 binary journal/checkpoint persistence and reconstruction;
 - `vault-server-runtime.ts` and `vault-document-cache.ts`: root/body runtime ownership, persistence, and clean-only cache behavior;
 - `vault-candidate-runtime.ts`: device-scoped candidate identity, digest validation, idempotent receipts, and stale-candidate rejection;
 - `bootstrap-security.ts`: fixed-boundary SQL bootstrap, pins, bounds, and failure behavior;
@@ -66,7 +66,7 @@ Current server suites exercise:
 - `multivault-registry.ts` and `identity-control-plane.ts`: provisioning state, identity-format admission, retryable deletion obligations, and purge identity;
 - `collaboration-control-plane.ts`: principals versus devices, owner/member invariants, invitation/device-link separation, owner governance, accepted ownership transfer, last-owner-device rejection, and exact actor revisions;
 - `vault-collaboration-authority.ts`: trusted actor parsing, forged-header stripping, fixed capability policy, and non-colliding principal settings namespaces;
-- `vault-route-authority.ts` and socket admission suites: principal/device revisions, vault generation, schema 7, protocol 4, purpose/document ticket binding, and stale-authority rejection.
+- `vault-route-authority.ts` and socket admission suites: principal/device revisions, vault generation, schema 8, protocol 5, purpose/document/epoch ticket binding, and stale-authority rejection.
 - `vault-document-cache.ts`: aggregate encoded-state/transient limits, mixed-size LRU, protected-body refusal, and exactly-once reservation release;
 - identity suites: response-loss-safe enrollment replay and durable retryable device revocation obligations;
 - `settings-sync-store.ts`: SQL seed/replace, monotonic LWW revisions, intents/tombstones, plugin-data gates, atomic failure, JSON/hash/path/count/body bounds, and bounded HTTP reads;
@@ -76,7 +76,7 @@ The full regression runner discovers suites under `tests/client`, `tests/server`
 
 ## Local Worker coverage
 
-`tests/live/run-live.ts` starts one fresh local Wrangler Worker with isolated persistence, claims and provisions schema 7, and enrolls multiple independently credentialed devices under the owner principal. It accounts for every TypeScript file under `tests/live`.
+`tests/live/run-live.ts` starts one fresh local Wrangler Worker with isolated persistence, claims and provisions schema 8, and enrolls multiple independently credentialed devices under the owner principal. It accounts for every TypeScript file under `tests/live`.
 
 The current passing local Worker run covers:
 
@@ -86,7 +86,7 @@ The current passing local Worker run covers:
 - device A create/candidate/root publication and device B cold SQL bootstrap;
 - device B durable body edit, device A catch-up, rename publication, delete tombstone, and stale candidate rejection;
 - SQL persistence across local Worker restart;
-- asynchronous recovery-v2 capture, format-2 root/catalog/branch/content reads, and selective restore result handshake;
+- asynchronous recovery capture, format-3 root/catalog/branch/content reads, and selective restore result handshake;
 - ticket refresh, missing/wrong admission values, wrong vault access, and hardening paths;
 - active socket closure and stale-ticket rejection after device revocation;
 - operator destroy, stable generation-scoped purge identity, and R2 purge completion before SQL deletion;
@@ -128,7 +128,16 @@ Prior long-run Worker soak evidence exists. The integrated build has not repeate
 
 ### Deployed Cloudflare boundary
 
-Local Wrangler does not prove production WebSocket upgrade routing, Durable Object placement/eviction, alarms under platform scheduling, R2 list/delete consistency, deployment migration behavior, or operator retry behavior against an actual Cloudflare account.
+A disposable two-device run against the deployed validation Worker passed
+enrollment, HTTP and WebSocket synchronization, Markdown/Canvas lifecycle,
+attachments, recovery, settings, revocation, and generation purge. The exact
+deployment and Access policy boundary are recorded in the
+[Yjs pathology remediation report](pathology-remediation-report.md).
+
+That one destructive run proves the exercised Cloudflare routing and Durable
+Object paths; it does not prove prolonged placement/eviction behavior, alarms
+under every platform scheduling condition, R2 consistency during outages,
+rollback across every deployment migration, or long-duration operator retries.
 
 The same live suite can target a fresh disposable deployed Worker without starting local Wrangler. Set `YAOS_TEST_DEPLOYED_HOST` to its exact HTTPS origin and explicitly acknowledge teardown with `YAOS_TEST_DEPLOYED_DISPOSABLE=true`, then run `npm run test:integration:deployed`. The suite claims the fresh deployment, mutates it, exercises HTTP and WebSocket behavior, and destroys its test vault; it must never target a retained or production deployment.
 
@@ -142,9 +151,9 @@ A disposable local run on Obsidian 1.13.7 passed `qa/controllers/settings-sync-s
 
 This proves one desktop seed/apply/install path against a local current Worker. It does not prove two real Obsidian folders, LWW deletion, invalid-JSON quarantine, crash/restart queue resume, plugin/theme tombstones, version-held plugin data, clash pause, mobile behavior, or deployed Cloudflare placement/eviction.
 
-### Schema-7 migration rehearsal
+### Greenfield reinstall rehearsal
 
-The supported boundary is a fresh schema-7 deployment or the guided schema-6 identity migration. A complete user-facing rehearsal with several real people/devices, explicit owner grouping, settings assignment, queue settlement/preservation, mirror verification, old-ticket invalidation, and rollback/retry remains external validation.
+The supported boundary is a fresh current-schema deployment. No earlier-schema or storage-format migration exists. A complete user-facing rehearsal with several real people/devices, semantic file import, owner bootstrap, settings assignment, mirror verification, and old-ticket rejection remains external validation.
 
 ## Required evidence discipline
 

@@ -2,19 +2,17 @@
 
 ## Deployment boundary
 
-Schema 7, protocol 4, and control-plane identity format 3 form one breaking collaboration boundary. Older clients are rejected before partial synchronization, and schema-7 clients never open an older local cache.
+The current schema, protocol, storage format, and control-plane identity format form one breaking boundary. Older clients and storage are rejected before partial synchronization.
 
 For a fresh deployment:
 
 1. preserve the ordinary vault files on at least one trusted device;
 2. deploy and claim the current server;
 3. save the operator recovery key and the one-use owner-bootstrap code;
-4. enroll the trusted origin folder as the owner so its local files can enter schema 7;
+4. enroll the trusted origin folder as the owner so its local files can enter the current schema;
 5. use **Add my device** for another owner installation or **Invite person** for a collaborator.
 
-An existing schema-6 deployment requires an operator-reviewed identity migration because old device records cannot reveal which devices belong to one person. Select the owner devices explicitly; they become one owner principal, while every ungrouped device becomes a separate full member principal. Settle or preserve old queued work, install the complete vault authority mirror, invalidate old tickets/sockets, and only then activate schema 7/protocol 4. Historical operations remain `legacy_unattributed`; migration never invents a person identity for them.
-
-Do not manually reuse old plugin caches. Exact admission fails closed, but bypassing the guided migration can strand authority or settings state.
+There is no in-place migration from any earlier schema or storage format. Preserve ordinary Markdown, Canvas, and attachment files on a trusted device, install the schema-8/storage-4 client and server from scratch, then import those semantic files through normal owner enrollment. Do not manually reuse old Durable Object storage or plugin caches.
 
 The Deploy button creates a detached deployment repository. Upstream changes do not update it automatically. After this breaking cutover, ordinary releases can use the generated repository's updater workflow so deployment and rollback remain Git-visible.
 
@@ -99,7 +97,7 @@ All blob and recovery keys are scoped by both `vaultId` and `vaultGeneration`. D
 
 ## Node server runtime
 
-The Node 24 server uses the same schema-7 collaboration and sync domain runtimes as the Worker. Build with `npm run build:server-node`, then run:
+The Node 24 server uses the same schema-8 collaboration and sync domain runtimes as the Worker. Build with `npm run build:server-node`, then run:
 
 ```sh
 YAOS_NODE_HOST=127.0.0.1 \
@@ -110,7 +108,7 @@ node packages/server-node/dist/server.mjs
 
 The data directory contains the process lock, control-plane SQLite, generation-scoped vault and recovery-job databases, and immutable object storage. One process owns a data directory. Startup applies forward-only SQLite migrations and refuses databases written by a newer binary. `/health` reports process liveness; `/health/ready` reports storage, lock, migration, and drain readiness without exposing vault identity or paths.
 
-Recovery alarms persist deadlines and dispatch leases. A process death resumes overdue work; three consecutive abandoned dispatch leases quarantine that job until the explicit retry command. Quarantined recovery work does not block note sync or server startup. Immutable object publication writes and flushes a sibling temporary file, atomically links it into place, and validates rather than overwrites an existing winner.
+Recovery alarms persist deadlines and dispatch leases. A process death resumes overdue work; three consecutive abandoned dispatch leases quarantine that job until the explicit retry command. Quarantined recovery work does not block note sync or server startup. Immutable object publication writes and flushes a sibling temporary file, atomically links it into place, and validates rather than overwrites an existing winner. Each recovery actor has a 64 MiB transient-memory budget with high-water, owner, and denial diagnostics. Oversized recipe totals, fragment sets, canonical nodes, and staged objects fail before full allocation; temporary contention is retryable.
 
 Retry only a quarantined alarm, with the server stopped so the command can take exclusive ownership of the same data directory. The exact syntax is `--retry-alarm <vault|recovery-job> <actor-name>`; use the actor kind and name printed by the quarantine log:
 
@@ -197,7 +195,7 @@ docker compose start server
 
 ## Claim and vault provisioning
 
-Open the fresh server URL and choose **Claim**. Save the operator recovery key; the server stores only its hash. Claim reserves a Personal vault, provisions its schema-7 SQL root in `awaiting_owner`, and returns a one-use owner-bootstrap code. The first successful owner enrollment and authority fence activate the vault. The operator identity controls deployment recovery and provisioning; it is not automatically a content principal.
+Open the fresh server URL and choose **Claim**. Save the operator recovery key; the server stores only its hash. Claim reserves a Personal vault, provisions its schema-8 SQL root in `awaiting_owner`, and returns a one-use owner-bootstrap code. The first successful owner enrollment and authority fence activate the vault. The operator identity controls deployment recovery and provisioning; it is not automatically a content principal.
 
 Provisioning is a three-step saga: registry reservation, idempotent vault-runtime provisioning, then matching-generation activation. A partial failure remains in `provisioning` state with a retryable error and cannot admit devices as an active vault.
 
@@ -215,7 +213,7 @@ Before enrollment, the client persists a random request ID, device ID, bearer, a
 
 An enrolled person can inspect the member roster, rename their own profile and devices, revoke their own non-final device, add another device, or leave if they are a member. The owner can invite/remove members and manage every device. Revoking a member's final active device revokes that membership.
 
-**Leave this vault** revokes the current member and all of their devices when reachable, stops sync, clears this folder's enrollment and schema-7 IndexedDB cache, and keeps ordinary files and configuration on disk. The owner cannot leave or revoke the final owner device. If the owner loses every device, the operator issues an audited one-use owner-recovery code; the operator does not become a vault participant.
+**Leave this vault** revokes the current member and all of their devices when reachable, stops sync, clears this folder's enrollment and schema-8 IndexedDB cache, and keeps ordinary files and configuration on disk. The owner cannot leave or revoke the final owner device. If the owner loses every device, the operator issues an audited one-use owner-recovery code; the operator does not become a vault participant.
 
 Ownership transfer is offered by the current owner to one active member. The target must explicitly accept before one atomic authority fence changes the target to owner and the former owner to member. An unaccepted offer can be cancelled or expires; the vault never exposes zero or two owners.
 
@@ -270,7 +268,7 @@ Leaving or replacing enrollment retires only that exact principal/membership/dev
 
 The operator recovery key signs in to the console and is never a plugin credential. The browser receives a short-lived HTTP-only session. Sign-out revokes the presented session before clearing its cookie.
 
-The console creates/provisions vaults, performs the explicit schema-6 identity migration, issues owner-bootstrap or owner-recovery codes, reports provisioning failures, and tracks pending deletion and authorization-change obligations. The operator remains outside ordinary content presence and attribution. Failed vault authority fences stay retryable without restoring the revoked credential or membership.
+The console creates/provisions vaults, issues owner-bootstrap or owner-recovery codes, reports provisioning failures, and tracks pending deletion and authorization-change obligations. It deliberately offers no legacy storage migration. The operator remains outside ordinary content presence and attribution. Failed vault authority fences stay retryable without restoring the revoked credential or membership.
 
 Vault rename and ordinary destruction originate with the enrolled owner. A rename is replay-safe shared metadata and never renames local folders. Destruction is a durable owner request which does nothing until the operator confirms that exact request; confirmation then runs the existing R2-first, room-second purge workflow. The separately named emergency-destruction repair path requires a recorded reason and must not be used as a silent substitute for owner authorization. Final deletion removes vault-scoped identities, invitations, transfers, authorization changes, and security events while retaining the bounded governance outcome needed to make retries unambiguous.
 
@@ -286,7 +284,7 @@ With recovery capability available:
 
 Capture and restore continue in alarm-driven `RecoveryJob` objects after Obsidian closes. `queued`, active phase, `retrying`, `complete`, `complete_with_gaps`, `failed`, and `cancelled` are meaningful states. Do not report a retry or terminal gap as complete coverage.
 
-Before applying a restore item, the client creates a local backup and verifies that the target has not changed since review. Changed targets are skipped rather than overwritten. Body, lifecycle, and attachment mutations still pass through normal schema-7 actor authority, durable receipts, and attachment revision checks. Recovery contains content only; it cannot restore or roll back principals, memberships, devices, codes, transfers, revocations, audit, or settings.
+Before applying a restore item, the client creates a local backup and verifies that the target has not changed since review. Changed targets are skipped rather than overwritten. Markdown, Canvas, lifecycle, and attachment mutations still pass through normal schema-8 actor authority, semantic epochs, durable receipts, and attachment revision checks. Recovery contains content only; it cannot restore or roll back principals, memberships, devices, codes, transfers, revocations, audit, or settings.
 
 Recovery roots and manifest/content objects are immutable. Recovery catalog deletion, retention, GC, and purge are asynchronous; UI completion means the corresponding durable state reached its terminal contract, not that another device has materialized anything.
 
@@ -308,18 +306,19 @@ Without R2, the purge phase is already complete and SQL cleanup can proceed. A p
 
 Public setup routes are limited to claim, enrollment, and capability discovery. Vault HTTP routes require the device bearer in `Authorization` and the selected vault ID in the route.
 
-The socket ticket endpoint exchanges that bearer for a short-lived protocol-4 ticket bound to the deployment, vault generation, principal/membership revision, device/credential revision, purpose, and exact document. Root and body sockets require:
+The socket ticket endpoint exchanges that bearer for a short-lived protocol-5 ticket bound to the deployment, vault generation, principal/membership revision, device/credential revision, purpose, exact document, and current semantic epoch. Root and body sockets require:
 
 - a valid ticket;
-- document schema `7`;
-- socket protocol `4`;
+- document schema `8`;
+- socket protocol `5`;
+- the current root or body semantic epoch;
 - active matching authority in both the control plane and vault mirror.
 
-The complete version set is document schema `7`, durable SQL format `3`, socket protocol `4`, recovery snapshot format `2`, settings sync format `2`, and control-plane identity format `3`. These pins change only through a coordinated client/server/storage cutover.
+The complete version set is document schema `8`, durable SQL format `4`, socket protocol `5`, recovery snapshot format `3`, settings sync format `2`, and control-plane identity format `3`. These pins change only through a coordinated client/server/storage cutover.
 
-## Updating after the schema-7 cutover
+## Installing the schema-8 boundary
 
-Establish the fresh deployment or complete the guided identity migration described above first. Do not activate schema 7 until every active vault has exactly one owner and its complete principal/device authority mirror is installed.
+Establish a fresh deployment and reinstall clients from ordinary semantic files. Do not point schema-8 clients at earlier Durable Object namespaces or reuse earlier local caches; there is deliberately no compatibility or migration mode.
 
 Future releases may use the generated deployment repository's updater only when their schema, storage, protocol, snapshot, and Durable Object class boundaries remain unchanged. A release changing any pin or required class must declare another fresh or guided cutover rather than relying on code-only revert.
 
@@ -361,10 +360,13 @@ The vault status surface additionally exposes `vaultGeneration`, `runtimeEpoch`,
 - Empty folders are not synchronized.
 - Attachment upload size is bounded by the server and client caps; publication operations survive response loss and restart.
 - Root/body persistence is bounded by Durable Object SQL row, statement, and account limits.
-- Server body admission enforces 32 bodies, a 48 MiB aggregate encoded-Yjs-state proxy budget, and a 16 MiB transient/pending reserve. Known cache pressure rejects the body WebSocket handshake with `429`, an exact count/encoded/transient reason, and `Retry-After: 1`; operators should treat it as backpressure rather than an internal failure. The proxy is not a server heap measurement. Client body admission enforces a separate 48 MiB aggregate estimated-cost budget. Only clean, unpinned bodies without open sockets may be evicted.
+- Server body admission enforces 32 bodies, a 48 MiB aggregate encoded-Yjs-state proxy budget, and a 16 MiB transient/pending reserve. Known cache pressure rejects the body WebSocket handshake with `429`, an exact count/encoded/transient reason, and `Retry-After: 1`; operators should treat it as backpressure rather than an internal failure. The proxy is not a server heap measurement. Client body admission enforces a separate 48 MiB aggregate estimated-cost budget. Only clean bodies without open sockets or pending updates may be evicted. Durable capture/bootstrap pins protect historical SQL and checkpoint retention, not resident Yjs memory.
 - Recovery requires R2 and the job binding and may finish with explicit unavailable entries.
 - Settings environment key: 1–64 characters; no `.`, `..`, NUL, slash, or backslash. Settings paths: at most 256 characters and must match the closed allowlist without traversal.
 - Settings bodies: at most 1,000,000 bytes each and 4,000,000 bytes total per environment. Snapshot requests are at most 6,000,000 bytes; item requests 1,500,000 bytes; GET responses 6,000,000 bytes.
 - Settings counts per environment: 256 ordinary files, 256 plugin intents, 64 theme intents, 256 plugin-data rows, and 512 tombstones. IDs are at most 128 characters, repository strings 256, and version strings 64.
-- Large benchmark/soak, deployed Cloudflare settings/recovery/deletion, broader desktop settings/recovery, and all real mobile settings/recovery evidence remain deferred.
+- Long-duration Cloudflare eviction/outage soak, broader desktop
+  settings/recovery, and all real mobile settings/recovery evidence remain
+  deferred. The pathological stress run and disposable deployed two-device
+  validation are recorded in the QA and remediation reports.
 - Network-filesystem support for headless clients remains future work.

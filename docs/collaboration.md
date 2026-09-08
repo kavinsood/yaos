@@ -1,6 +1,6 @@
 # Vault collaboration
 
-Schema 7 makes a YAOS vault a human collaboration boundary rather than a set of
+Schema 8 makes a YAOS vault a human collaboration boundary rather than a set of
 unrelated device memberships.
 
 ## Product contract
@@ -88,7 +88,7 @@ devices, invitations, revocations, authority changes, or security audit state.
 
 ## Presence and attribution
 
-Schema 7 keeps YAOS's existing live cursors. Awareness remains distinct for each
+Schema 8 keeps YAOS's existing live cursors. Awareness remains distinct for each
 device/socket instance, while the server replaces client identity fields with
 the current principal display name and principal color. The UI may group several
 device cursors under one person without merging their awareness state.
@@ -103,9 +103,10 @@ Collaboration is an exact breaking boundary:
 
 | Boundary | Version |
 |---|---:|
-| Document schema | 7 |
-| Socket protocol | 4 |
+| Document schema | 8 |
+| Socket protocol | 5 |
 | Control-plane identity format | 3 |
 
-Older clients fail before partial synchronization. Historical schema-6 work is
-`legacy_unattributed`; migration never invents person attribution for it.
+Older clients and storage fail before partial synchronization. Historical files
+may be imported semantically into a fresh installation; old collaboration and
+CRDT identities are not migrated.
