@@ -145,12 +145,20 @@ export interface EncodedRecoveryObject<T> {
 	readonly hash: string;
 }
 
-export async function encodeHashedRecoveryObject<T>(value: T): Promise<EncodedRecoveryObject<T>> {
+export async function encodeHashedRecoveryObject<T>(
+	value: T,
+	limits: { canonicalBytes?: number; compressedBytes?: number } = {},
+): Promise<EncodedRecoveryObject<T>> {
 	const canonicalBytes = canonicalJsonBytes(value);
+	const canonicalLimit = limits.canonicalBytes ?? MAX_RECOVERY_NODE_BYTES;
+	if (canonicalBytes.byteLength > canonicalLimit) throw new Error("recovery object exceeds canonical byte bound");
+	const compressedBytes = gzipRecoveryBytes(canonicalBytes);
+	const compressedLimit = limits.compressedBytes ?? MAX_RECOVERY_COMPRESSED_NODE_BYTES;
+	if (compressedBytes.byteLength > compressedLimit) throw new Error("recovery object exceeds compressed byte bound");
 	return {
 		value,
 		canonicalBytes,
-		compressedBytes: gzipRecoveryBytes(canonicalBytes),
+		compressedBytes,
 		hash: await sha256Hex(canonicalBytes),
 	};
 }

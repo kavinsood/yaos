@@ -1,6 +1,6 @@
 import { SQLITE_ROW_SAFE_BYTES } from "./shared/durableLimits";
 
-export const RECOVERY_JOB_SCHEMA_VERSION = 2;
+export const RECOVERY_JOB_SCHEMA_VERSION = 3;
 
 export type RecoveryJobKind = "capture" | "projection" | "restore" | "gc" | "purge";
 
@@ -89,6 +89,8 @@ export interface ReconstructionProgress {
 	cursor: string;
 	stagingKey: string | null;
 	stagingHash: string | null;
+	stagingBytes: number;
+	expectedHistoryBytes: number;
 	encodedBytes: number;
 	attempts: number;
 }
@@ -102,8 +104,19 @@ export interface ReconstructionPart {
 	bytes: Uint8Array;
 }
 
+export interface ReconstructionPartsStats {
+	count: number;
+	bytes: number;
+}
+
+export interface ReconstructionPartMetadata extends Omit<ReconstructionPart, "bytes"> {
+	byteLength: number;
+}
+
 const MAX_RECONSTRUCTION_PARTS_PER_SLICE = 256;
 const RECONSTRUCTION_PART_SQL_BATCH = 16;
+const MAX_RECONSTRUCTION_PARTS_TOTAL = 4_096;
+const MAX_RECONSTRUCTION_BUFFER_BYTES = 64 * 1024 * 1024;
 
 export interface RecoveryDefect {
 	logicalKey: string;
@@ -318,6 +331,8 @@ export class RecoveryJobStateStore {
 				cursor TEXT NOT NULL,
 				staging_key TEXT,
 				staging_hash TEXT,
+				staging_bytes INTEGER NOT NULL,
+				expected_history_bytes INTEGER NOT NULL,
 				encoded_bytes INTEGER NOT NULL,
 				attempts INTEGER NOT NULL
 			);
@@ -536,12 +551,13 @@ export class RecoveryJobStateStore {
 		const row = this.storage.sql.exec<{
 			body_id: string; generation: number; recipe_id: string; expected_content_hash: string;
 			expected_size: number; cursor: string; staging_key: string | null; staging_hash: string | null;
-			encoded_bytes: number; attempts: number;
+			staging_bytes: number; expected_history_bytes: number; encoded_bytes: number; attempts: number;
 		}>("SELECT * FROM reconstruction_progress WHERE id = 1").toArray()[0];
 		return row ? {
 			bodyId: row.body_id, generation: row.generation, recipeId: row.recipe_id,
 			expectedContentHash: row.expected_content_hash, expectedSize: row.expected_size,
 			cursor: row.cursor, stagingKey: row.staging_key, stagingHash: row.staging_hash,
+			stagingBytes: row.staging_bytes, expectedHistoryBytes: row.expected_history_bytes,
 			encodedBytes: row.encoded_bytes, attempts: row.attempts,
 		} : null;
 	}
@@ -551,15 +567,17 @@ export class RecoveryJobStateStore {
 		this.storage.sql.exec(
 			`INSERT INTO reconstruction_progress(
 			 id, body_id, generation, recipe_id, expected_content_hash, expected_size, cursor,
-			 staging_key, staging_hash, encoded_bytes, attempts
-			) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			 staging_key, staging_hash, staging_bytes, expected_history_bytes, encoded_bytes, attempts
+			) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			 ON CONFLICT(id) DO UPDATE SET body_id = excluded.body_id, generation = excluded.generation,
 			 recipe_id = excluded.recipe_id, expected_content_hash = excluded.expected_content_hash,
 			 expected_size = excluded.expected_size, cursor = excluded.cursor, staging_key = excluded.staging_key,
-			 staging_hash = excluded.staging_hash, encoded_bytes = excluded.encoded_bytes, attempts = excluded.attempts`,
+			 staging_hash = excluded.staging_hash, staging_bytes = excluded.staging_bytes,
+			 expected_history_bytes = excluded.expected_history_bytes,
+			 encoded_bytes = excluded.encoded_bytes, attempts = excluded.attempts`,
 			progress.bodyId, progress.generation, progress.recipeId, progress.expectedContentHash,
 			progress.expectedSize, progress.cursor, progress.stagingKey, progress.stagingHash,
-			progress.encodedBytes, progress.attempts,
+			progress.stagingBytes, progress.expectedHistoryBytes, progress.encodedBytes, progress.attempts,
 		);
 	}
 
@@ -574,6 +592,7 @@ export class RecoveryJobStateStore {
 				throw new Error("reconstruction part exceeds the SQLite row safety limit");
 			}
 			if (ordinals.has(part.ordinal)) throw new Error("duplicate reconstruction part ordinal");
+			if (part.fragmentCount > MAX_RECONSTRUCTION_PARTS_TOTAL) throw new Error("reconstruction fragment count exceeds bound");
 			ordinals.add(part.ordinal);
 		}
 		this.storage.transactionSync(() => {
@@ -592,17 +611,12 @@ export class RecoveryJobStateStore {
 					) VALUES ${values}`,
 					...bindings,
 				);
-				const stored = this.storage.sql.exec<{
-					ordinal: number; kind: string; sequence: number; fragment_index: number;
-					fragment_count: number; data: ArrayBuffer;
-				}>(
-					`SELECT ordinal, kind, sequence, fragment_index, fragment_count, data
-					 FROM reconstruction_parts WHERE ordinal IN (${batch.map(() => "?").join(", ")})`,
-					...batch.map((part) => part.ordinal),
-				).toArray();
-				const storedByOrdinal = new Map(stored.map((row) => [row.ordinal, row]));
 				for (const part of batch) {
-					const existing = storedByOrdinal.get(part.ordinal);
+					const existing = this.storage.sql.exec<{
+						ordinal: number; kind: string; sequence: number; fragment_index: number;
+						fragment_count: number; data: ArrayBuffer;
+					}>(`SELECT ordinal, kind, sequence, fragment_index, fragment_count, data
+						FROM reconstruction_parts WHERE ordinal = ? LIMIT 1`, part.ordinal).toArray()[0];
 					if (!existing) throw new Error("reconstruction part insert missing");
 					const bytes = new Uint8Array(existing.data);
 					if (existing.kind !== part.kind || existing.sequence !== part.sequence
@@ -612,7 +626,60 @@ export class RecoveryJobStateStore {
 					}
 				}
 			}
+			const stats = this.reconstructionPartsStats();
+			if (stats.count > MAX_RECONSTRUCTION_PARTS_TOTAL || stats.bytes > MAX_RECONSTRUCTION_BUFFER_BYTES) {
+				throw new Error("aggregate reconstruction parts exceed bound");
+			}
 		});
+	}
+
+	reconstructionPartsStats(): ReconstructionPartsStats {
+		this.initializeSchema();
+		const row = this.storage.sql.exec<{ count: number; bytes: number | null }>(
+			"SELECT COUNT(*) AS count, SUM(length(data)) AS bytes FROM reconstruction_parts",
+		).one();
+		return { count: row.count, bytes: row.bytes ?? 0 };
+	}
+
+	reconstructionPartMetadata(): ReconstructionPartMetadata[] {
+		this.initializeSchema();
+		return this.storage.sql.exec<{
+			ordinal: number; kind: "checkpoint" | "journal"; sequence: number;
+			fragment_index: number; fragment_count: number; byte_length: number;
+		}>(`SELECT ordinal, kind, sequence, fragment_index, fragment_count, length(data) AS byte_length
+			FROM reconstruction_parts ORDER BY ordinal`).toArray().map((row) => ({
+			ordinal: row.ordinal,
+			kind: row.kind,
+			sequence: row.sequence,
+			fragmentIndex: row.fragment_index,
+			fragmentCount: row.fragment_count,
+			byteLength: row.byte_length,
+		}));
+	}
+
+	reconstructionPartMetadataAtOrAfter(ordinal: number): ReconstructionPartMetadata | null {
+		this.initializeSchema();
+		const row = this.storage.sql.exec<{
+			ordinal: number; kind: "checkpoint" | "journal"; sequence: number;
+			fragment_index: number; fragment_count: number; byte_length: number;
+		}>(`SELECT ordinal, kind, sequence, fragment_index, fragment_count, length(data) AS byte_length
+			FROM reconstruction_parts WHERE ordinal >= ? ORDER BY ordinal LIMIT 1`, ordinal).toArray()[0];
+		return row ? {
+			ordinal: row.ordinal,
+			kind: row.kind,
+			sequence: row.sequence,
+			fragmentIndex: row.fragment_index,
+			fragmentCount: row.fragment_count,
+			byteLength: row.byte_length,
+		} : null;
+	}
+
+	readReconstructionPart(ordinal: number): Uint8Array | null {
+		this.initializeSchema();
+		const row = this.storage.sql.exec<{ data: ArrayBuffer }>(
+			"SELECT data FROM reconstruction_parts WHERE ordinal = ? LIMIT 1", ordinal,
+		).toArray()[0];
+		return row ? new Uint8Array(row.data) : null;
 	}
 
 	reconstructionParts(): ReconstructionPart[] {

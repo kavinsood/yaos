@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as Y from "yjs";
 import { NodeSqliteStorage } from "../../packages/server-node/src/storage";
-import { applyCompleteRecoveryRecipeParts } from "../../server/src/recoveryJob";
+import { applyCompleteRecoveryRecipeParts, applyStoredRecoveryRecipeParts, createRecoveryDocument } from "../../server/src/recoveryJob";
 import {
 	RecoveryJobStateStore,
 	type RecoveryJobStoragePort,
@@ -67,11 +67,11 @@ s.test("reconstruction parts use bounded batch SQL and conflicting replay is ato
 
 		queries.value = 0;
 		store.putReconstructionParts(parts);
-		assert.equal(queries.value, 10, "80 parts should use five insert/readback batches");
+		assert.equal(queries.value, 86, "80 parts should use five inserts, one-row replay verification, and aggregate stats");
 
 		queries.value = 0;
 		store.putReconstructionParts(parts);
-		assert.equal(queries.value, 10, "identical replay should retain the bounded query count");
+		assert.equal(queries.value, 86, "identical replay should retain bounded one-row verification");
 
 		const newParts = Array.from({ length: 16 }, (_, index) => journalPart(80 + index));
 		const changedReplay = journalPart(0, 252);
@@ -80,7 +80,7 @@ s.test("reconstruction parts use bounded batch SQL and conflicting replay is ato
 			() => store.putReconstructionParts([...newParts, changedReplay]),
 			/reconstruction part replay changed/u,
 		);
-		assert.equal(queries.value, 4, "conflict detection should remain batched");
+		assert.equal(queries.value, 19, "conflict detection should stop before aggregate stats and never read a batch of BLOB payloads");
 		assert.deepEqual(
 			store.reconstructionParts().map((part) => part.ordinal),
 			parts.map((part) => part.ordinal),
@@ -118,7 +118,7 @@ s.test(">4 MiB checkpoint fragments survive slices and apply only when complete"
 	const directory = await mkdtemp(join(tmpdir(), "yaos-recovery-fragments-"));
 	const storage = NodeSqliteStorage.open(join(directory, "state.sqlite"));
 	const source = new Y.Doc({ guid: "large-checkpoint-source" });
-	const target = new Y.Doc({ guid: "large-checkpoint-target" });
+	const target = createRecoveryDocument("large-checkpoint-target");
 	try {
 		source.getText("body").insert(0, "x".repeat(4 * 1024 * 1024 + 400_000));
 		const update = Y.encodeStateAsUpdate(source);
@@ -137,6 +137,8 @@ s.test(">4 MiB checkpoint fragments survive slices and apply only when complete"
 			cursor: "slice-2",
 			stagingKey: null,
 			stagingHash: null,
+			stagingBytes: 0,
+			expectedHistoryBytes: update.byteLength,
 			encodedBytes: fragments[0]!.bytes.byteLength + fragments[1]!.bytes.byteLength,
 			attempts: 0,
 		};
@@ -167,7 +169,7 @@ s.test(">4 MiB checkpoint fragments survive slices and apply only when complete"
 		assert.throws(() => resumedSlice.putReconstructionParts([changedReplay]), /reconstruction part replay changed/u);
 		resumedSlice.putReconstructionParts(fragments.slice(2));
 		const complete = resumedSlice.reconstructionParts();
-		assert.equal(applyCompleteRecoveryRecipeParts(target, complete), true);
+		assert.equal(applyStoredRecoveryRecipeParts(target, resumedSlice), true);
 		assert.equal(appliedUpdates, 1, "complete logical checkpoint was not applied exactly once");
 		assert.equal(target.getText("body").toString(), source.getText("body").toString());
 

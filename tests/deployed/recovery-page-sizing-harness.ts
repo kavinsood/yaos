@@ -73,7 +73,7 @@ class DeployedPageSizingStore extends VaultStore {
 			vaultId: VAULT_ID,
 			vaultGeneration: VAULT_GENERATION,
 			schemaVersion: 8 as const,
-			storageFormatVersion: 3 as const,
+			storageFormatVersion: 4 as const,
 			provisionedAt: 1,
 		};
 	}
@@ -87,6 +87,7 @@ class DeployedPageSizingStore extends VaultStore {
 		return {
 			pinId: CAPTURE_ID,
 			kind: "capture" as const,
+			owner: { kind: "capture" as const, id: CAPTURE_ID },
 			boundarySequence: this.capture.boundarySequence,
 			createdAt: this.capture.createdAt,
 			softExpiresAt: this.capture.pinSoftExpiresAt,
