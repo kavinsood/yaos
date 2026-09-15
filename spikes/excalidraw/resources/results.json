@@ -1,0 +1,24 @@
+{
+  "graph": {
+    "depth": 7,
+    "branching": 3,
+    "nodes": 3280
+  },
+  "recursivePublication": {
+    "publishedNodes": 3280,
+    "privateNotesLeaked": 729
+  },
+  "explicitPublication": {
+    "publishedResources": 2,
+    "privateLocators": 0,
+    "totalBytes": 70
+  },
+  "securityChecks": {
+    "hashSubstitutionRejected": true,
+    "crossDrawingRejected": true,
+    "staleGrantRejected": true,
+    "privateLocatorRejected": true,
+    "manifestBoundsEnforced": true
+  },
+  "durationMs": 3.59
+}

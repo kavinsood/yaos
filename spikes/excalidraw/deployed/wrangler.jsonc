@@ -1,0 +1,19 @@
+{
+	"$schema": "../../../excalidraw-cloudflare/node_modules/wrangler/config-schema.json",
+	"name": "yaos-excalidraw-native-spike",
+	"main": "worker.mjs",
+	"compatibility_date": "2026-09-01",
+	"routes": [
+		{ "pattern": "yaos-excalidraw-spike-20260909.kavin.me.cloudflare.dev", "custom_domain": true }
+	],
+	"durable_objects": {
+		"bindings": [
+			{ "name": "DRAWING", "class_name": "ExcalidrawRoomSpike" },
+			{ "name": "AUTHORITY", "class_name": "AuthoritySpike" }
+		]
+	},
+	"migrations": [
+		{ "tag": "v1", "new_sqlite_classes": ["ExcalidrawRoomSpike", "AuthoritySpike"] }
+	],
+	"observability": { "enabled": true }
+}

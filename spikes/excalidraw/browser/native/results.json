@@ -1,0 +1,12 @@
+{
+  "component": "@excalidraw/excalidraw@0.18.0",
+  "mountMs": 912.46,
+  "remoteApply": {
+    "elementsObserved": 1,
+    "onChangeEventsWithin100ms": 1
+  },
+  "presence": {
+    "collaboratorCount": 1,
+    "pointerCallbacksObserved": 4
+  }
+}

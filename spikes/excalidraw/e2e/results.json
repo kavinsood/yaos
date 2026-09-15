@@ -1,0 +1,53 @@
+{
+  "date": "2026-09-08T21:58:29.837Z",
+  "backend": "https://yaos-excalidraw-spike-20260909.kavin.me.cloudflare.dev",
+  "component": "@excalidraw/excalidraw@0.18.0",
+  "browser": "system Google Chrome",
+  "vaultId": "e2e-vault-1788904705535-8fb7448c",
+  "roomId": "e2e-room-1788904705535-8fb7448c",
+  "checks": {
+    "bootstrap": "two isolated browser contexts joined at sequence 0; first native onChange committed sequence 1",
+    "mutationConvergence": "peer A mutation reached the Drawing DO and peer B through monotonic replay polling",
+    "equalVersionConflict": "concurrent version 7 records converged on Excalidraw-native lower versionNonce 100 in server and both React scenes",
+    "deletion": "version 8 native tombstone remained in the DO snapshot and both getSceneElementsIncludingDeleted() views",
+    "reconnectReplay": "peer B resumed from sequence 4 and recovered sequence 5",
+    "echoSuppression": "peer B observed remote updateScene/onChange without emitting an operation (0 writes)",
+    "presenceIdentity": "same actor used distinct session-a/session-b collaborators; spoofed payload identity was overwritten by socket attachment"
+  },
+  "timingsMs": {
+    "mountTwoContexts": 1447.71,
+    "equalVersionConvergence": 212.47,
+    "reconnectReplay": 219.19
+  },
+  "final": {
+    "sequence": 5,
+    "elements": 1,
+    "metricsA": {
+      "bootstrapApplies": 0,
+      "onChangeCallbacks": 7,
+      "outboundOperations": 4,
+      "remoteApplyCallbacks": 0,
+      "remoteApplyEchoes": 0,
+      "remoteApplies": 0,
+      "replayPolls": 28,
+      "webSocketConnects": 1
+    },
+    "metricsB": {
+      "bootstrapApplies": 0,
+      "onChangeCallbacks": 8,
+      "outboundOperations": 1,
+      "remoteApplyCallbacks": 4,
+      "remoteApplyEchoes": 0,
+      "remoteApplies": 4,
+      "replayPolls": 22,
+      "webSocketConnects": 2
+    },
+    "collaboratorSessionsA": [
+      "session-b"
+    ],
+    "collaboratorSessionsB": [
+      "session-a"
+    ],
+    "browserErrors": []
+  }
+}

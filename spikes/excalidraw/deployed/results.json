@@ -1,0 +1,18 @@
+{
+  "baseUrl": "https://yaos-excalidraw-spike-20260909.kavin.me.cloudflare.dev",
+  "vaultId": "vault-1788904543475-6c21e2c5",
+  "roomId": "room-1788904543475-6c21e2c5",
+  "checks": {
+    "equalVersionNonce": "pinned upstream rule converged on lower nonce; higher nonce rejected",
+    "operationReceipt": "same operation ID replayed original outcome",
+    "tombstone": "deleted element retained in canonical snapshot",
+    "revocationOrdering": "reservation before fence remained recoverable; later operation rejected",
+    "monotonicReplay": "2 changes after cursor 2",
+    "load": "10000 elements in 40 transactional batches",
+    "presence": "two sessions for one actor remained distinct; spoofed identity overwritten"
+  },
+  "timingsMs": {
+    "apply10k": 6646.5,
+    "snapshot10k": 513.85
+  }
+}

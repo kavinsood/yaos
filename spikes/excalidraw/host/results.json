@@ -1,0 +1,21 @@
+{
+  "sourceRoot": "/tmp/yaos-obsidian-excalidraw-source",
+  "pluginVersion": "2.27.3",
+  "excalidrawVersion": "0.18.135",
+  "checks": {
+    "pluginId": true,
+    "sceneHookDeclared": true,
+    "sceneHookReceivesFiles": true,
+    "reactOnChangeDelegates": true,
+    "reactPointerDelegates": true,
+    "publicUpdateScene": true,
+    "deletedElementGetterUsed": true,
+    "remoteCaptureMode": true,
+    "durableIncrementMarksDirty": true,
+    "sceneVersionFallbackMarksDirty": true,
+    "sceneIncludesFiles": true,
+    "embeddedResourceRegistries": true
+  },
+  "passed": true,
+  "failed": []
+}

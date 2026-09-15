@@ -1,0 +1,11 @@
+name = "yaos-excalidraw-room-spike"
+main = "worker.ts"
+compatibility_date = "2026-03-02"
+
+[[durable_objects.bindings]]
+name = "DRAWING_ROOMS"
+class_name = "DrawingRoomDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["DrawingRoomDO"]
