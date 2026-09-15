@@ -51,6 +51,26 @@ export interface SemanticCatalogHead {
 	size: number | null;
 }
 
+export interface ExcalidrawCatalogMutation {
+	documentId: string;
+	fileId: string;
+	kind: "excalidraw";
+	format: "excalidraw-native";
+	formatVersion: 1;
+	path: string;
+	previousPath: string | null;
+	lifecycle: "active" | "tombstoned" | "reaped";
+	documentGeneration: number;
+	documentEpoch: SemanticEpoch;
+	contentHash?: string | null;
+	size?: number | null;
+}
+
+export interface ExcalidrawCatalogHead extends ExcalidrawCatalogMutation {
+	sequence: number;
+	bodyEpoch: SemanticEpoch;
+}
+
 export interface SemanticCandidateReceipt {
 	documentId: string;
 	clientId: string;
@@ -168,6 +188,7 @@ export interface RootAuthoritySnapshot {
 	boundarySequence: number;
 	markdown: CatalogHeadAtBoundary[];
 	semantic: SemanticCatalogHead[];
+	excalidraw: ExcalidrawCatalogHead[];
 	attachments: Array<AttachmentCatalogEvent & { createdAt: number }>;
 	blobs: Array<{ contentHash: string; size: number | null; mime: string | null; createdAt: number }>;
 }
@@ -229,9 +250,9 @@ export abstract class VaultCatalogStore extends VaultDocumentStore {
 		          e.content_hash, e.size
 		   FROM vault_semantic_catalog_events e JOIN (
 		     SELECT document_id, MAX(sequence) AS sequence FROM vault_semantic_catalog_events
-		     WHERE sequence <= ? GROUP BY document_id
+		     WHERE sequence <= ? AND kind = 'canvas' GROUP BY document_id
 		   ) latest ON latest.document_id = e.document_id AND latest.sequence = e.sequence
-		   ORDER BY e.document_id`, boundarySequence).toArray().map((row) => ({
+		   WHERE e.kind = 'canvas' ORDER BY e.document_id`, boundarySequence).toArray().map((row) => ({
 			sequence: row.sequence,
 			documentId: row.document_id,
 			fileId: row.file_id,
@@ -246,6 +267,7 @@ export abstract class VaultCatalogStore extends VaultDocumentStore {
 			contentHash: row.content_hash,
 			size: row.size,
 		}));
+		const excalidraw = this.listActiveExcalidrawAt(boundarySequence, "", 1000);
 		const attachments = this.storage.sql.exec<{
 			sequence: number; path: string; content_hash: string | null; size: number | null;
 			mime: string | null; lifecycle: AttachmentCatalogEvent["lifecycle"]; operation_id: string;
@@ -298,7 +320,7 @@ export abstract class VaultCatalogStore extends VaultDocumentStore {
 			mime: row.mime,
 			createdAt: row.created_at,
 		}));
-		return { boundarySequence, markdown, semantic, attachments, blobs };
+		return { boundarySequence, markdown, semantic, excalidraw, attachments, blobs };
 	}
 
 	semanticHeadAt(boundarySequence: number, documentId: string): SemanticCatalogHead | null {
@@ -310,7 +332,7 @@ export abstract class VaultCatalogStore extends VaultDocumentStore {
 		}>(`SELECT sequence, document_id, file_id, kind, format, format_version, path, previous_path,
 		          lifecycle, generation, document_epoch, content_hash, size
 		   FROM vault_semantic_catalog_events
-		   WHERE document_id = ? AND sequence <= ? ORDER BY sequence DESC LIMIT 1`, documentId, boundarySequence).toArray()[0];
+		   WHERE document_id = ? AND kind = 'canvas' AND sequence <= ? ORDER BY sequence DESC LIMIT 1`, documentId, boundarySequence).toArray()[0];
 		return row ? { sequence: row.sequence, documentId: row.document_id, fileId: row.file_id, kind: row.kind,
 			format: row.format, formatVersion: row.format_version, path: row.path, previousPath: row.previous_path,
 			lifecycle: row.lifecycle, generation: row.generation,
@@ -328,9 +350,9 @@ export abstract class VaultCatalogStore extends VaultDocumentStore {
 		          e.previous_path, e.lifecycle, e.generation, e.document_epoch, e.content_hash, e.size
 		   FROM vault_semantic_catalog_events e JOIN (
 		     SELECT document_id, MAX(sequence) AS sequence FROM vault_semantic_catalog_events
-		     WHERE sequence <= ? GROUP BY document_id
+		     WHERE sequence <= ? AND kind = 'canvas' GROUP BY document_id
 		   ) latest ON latest.document_id = e.document_id AND latest.sequence = e.sequence
-		   WHERE e.lifecycle = 'active' AND e.document_id > ? ORDER BY e.document_id LIMIT ?`,
+		 WHERE e.lifecycle = 'active' AND e.kind = 'canvas' AND e.document_id > ? ORDER BY e.document_id LIMIT ?`,
 		boundarySequence, afterDocumentId, Math.min(1000, Math.max(1, limit))).toArray().map((row) => ({
 			sequence: row.sequence, documentId: row.document_id, fileId: row.file_id, kind: row.kind,
 			format: row.format, formatVersion: row.format_version, path: row.path, previousPath: row.previous_path,
@@ -345,9 +367,50 @@ export abstract class VaultCatalogStore extends VaultDocumentStore {
 		return this.storage.sql.exec<{ count: number }>(`SELECT COUNT(*) AS count
 		 FROM vault_semantic_catalog_events e JOIN (
 		   SELECT document_id, MAX(sequence) AS sequence FROM vault_semantic_catalog_events
-		   WHERE sequence <= ? GROUP BY document_id
+		   WHERE sequence <= ? AND kind = 'canvas' GROUP BY document_id
 		 ) latest ON latest.document_id = e.document_id AND latest.sequence = e.sequence
-		 WHERE e.lifecycle = 'active'`, boundarySequence).one().count;
+		 WHERE e.lifecycle = 'active' AND e.kind = 'canvas'`, boundarySequence).one().count;
+	}
+
+	excalidrawHeadAt(boundarySequence: number, documentId: string): ExcalidrawCatalogHead | null {
+		this.initialize();
+		const row = this.storage.sql.exec<{
+			sequence: number; document_id: string; file_id: string; path: string; previous_path: string | null;
+			lifecycle: ExcalidrawCatalogHead["lifecycle"]; generation: number; document_epoch: number;
+			content_hash: string | null; size: number | null;
+		}>(`SELECT sequence, document_id, file_id, path, previous_path, lifecycle, generation,
+		          document_epoch, content_hash, size
+		   FROM vault_semantic_catalog_events
+		   WHERE document_id = ? AND kind = 'excalidraw' AND sequence <= ?
+		   ORDER BY sequence DESC LIMIT 1`, documentId, boundarySequence).toArray()[0];
+		return row ? { sequence: row.sequence, documentId: row.document_id, fileId: row.file_id,
+			kind: "excalidraw", format: "excalidraw-native", formatVersion: 1, path: row.path,
+			previousPath: row.previous_path, lifecycle: row.lifecycle, documentGeneration: row.generation,
+			documentEpoch: parseSemanticEpoch(row.document_epoch, "Excalidraw catalog document epoch"),
+			bodyEpoch: parseSemanticEpoch(row.document_epoch, "Excalidraw catalog document epoch"),
+			contentHash: row.content_hash, size: row.size } : null;
+	}
+
+	listActiveExcalidrawAt(boundarySequence: number, afterDocumentId = "", limit = 1000): ExcalidrawCatalogHead[] {
+		this.initialize();
+		return this.storage.sql.exec<{
+			sequence: number; document_id: string; file_id: string; path: string; previous_path: string | null;
+			lifecycle: "active"; generation: number; document_epoch: number; content_hash: string | null; size: number | null;
+		}>(`SELECT e.sequence, e.document_id, e.file_id, e.path, e.previous_path, e.lifecycle,
+		          e.generation, e.document_epoch, e.content_hash, e.size
+		   FROM vault_semantic_catalog_events e JOIN (
+		     SELECT document_id, MAX(sequence) AS sequence FROM vault_semantic_catalog_events
+		     WHERE sequence <= ? AND kind = 'excalidraw' GROUP BY document_id
+		   ) latest ON latest.document_id = e.document_id AND latest.sequence = e.sequence
+		   WHERE e.lifecycle = 'active' AND e.kind = 'excalidraw' AND e.document_id > ?
+		   ORDER BY e.document_id LIMIT ?`, boundarySequence, afterDocumentId,
+		Math.min(1000, Math.max(1, limit))).toArray().map((row) => ({ sequence: row.sequence,
+			documentId: row.document_id, fileId: row.file_id, kind: "excalidraw", format: "excalidraw-native",
+			formatVersion: 1, path: row.path, previousPath: row.previous_path, lifecycle: row.lifecycle,
+			documentGeneration: row.generation,
+			documentEpoch: parseSemanticEpoch(row.document_epoch, "Excalidraw catalog document epoch"),
+			bodyEpoch: parseSemanticEpoch(row.document_epoch, "Excalidraw catalog document epoch"),
+			contentHash: row.content_hash, size: row.size }));
 	}
 
 	semanticCandidateReceipt(documentId: string, clientId: string, candidateId: string): SemanticCandidateReceipt | null {

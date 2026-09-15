@@ -5,6 +5,7 @@ import { handleWorkerRequest, type WorkerRuntimeEnvironment } from "../../../ser
 import type { ActorCallPort, ExecutionPort } from "../../../server/src/platformPorts";
 import { RecoveryJobRuntime } from "../../../server/src/recoveryJob";
 import { VaultRuntime } from "../../../server/src/server";
+import { ExcalidrawRoomRuntime, type ExcalidrawRoomSocketPort } from "../../../server/src/excalidrawRoom";
 import type { VaultSocketPort } from "../../../server/src/vaultSocketService";
 import { FilesystemObjectStore } from "./objectStore";
 import {
@@ -98,6 +99,7 @@ class VaultActor implements RuntimeActor {
 		alarms: AlarmPort,
 		objects: FilesystemObjectStore,
 		recoveryJobs: ActorCallPort,
+		drawings: ActorCallPort,
 	) {
 		this.runtime = new VaultRuntime({
 			storage,
@@ -106,6 +108,7 @@ class VaultActor implements RuntimeActor {
 			execution,
 			objectStore: objects,
 			recoveryJobs,
+			drawings,
 		});
 	}
 
@@ -134,6 +137,21 @@ class VaultActor implements RuntimeActor {
 		await this.execution.drain();
 		this.sockets.closeAll();
 	}
+}
+
+class DrawingActor implements RuntimeActor {
+	readonly runtime: ExcalidrawRoomRuntime;
+	constructor(storage: NodeSqliteStorage, readonly sockets: NodeSocketRegistry, vaults: ActorCallPort,
+		objects: FilesystemObjectStore) {
+		this.runtime = new ExcalidrawRoomRuntime({ storage, sockets, vaults, objectStore: objects });
+	}
+	fetch(request: Request): Promise<Response> { return this.runtime.fetch(request); }
+	message(socket: ExcalidrawRoomSocketPort, message: string | ArrayBuffer): Promise<void> {
+		return this.runtime.webSocketMessage(socket, message);
+	}
+	closed(socket: ExcalidrawRoomSocketPort): void { this.runtime.webSocketClose(socket); }
+	socketError(socket: ExcalidrawRoomSocketPort): void { this.runtime.webSocketError(socket); }
+	close(): void { this.sockets.closeAll(); }
 }
 
 class RecoveryActor implements RuntimeActor {
@@ -241,6 +259,7 @@ export async function runNodeServer(options: NodeServerOptions): Promise<void> {
 		const configCalls = new NodeActorCalls(() => actors, "config");
 		const vaultCalls = new NodeActorCalls(() => actors, "vault");
 		const recoveryCalls = new NodeActorCalls(() => actors, "recovery-job");
+		const drawingCalls = new NodeActorCalls(() => actors, "drawing");
 		let alarms: DurableAlarmScheduler;
 
 		const actorFactory: ActorFactory = (kind, name) => {
@@ -253,6 +272,17 @@ export async function runNodeServer(options: NodeServerOptions): Promise<void> {
 					vaultCalls,
 					configCalls,
 				);
+			}
+			if (kind === "drawing") {
+				const sockets = new NodeSocketRegistry(socketHub, {
+					message: (socket, message) => { void actors.call("drawing", name, async (actor) =>
+						(actor as DrawingActor).message(socket, message)); },
+					close: (socket) => { void actors.call("drawing", name, async (actor) =>
+						(actor as DrawingActor).closed(socket)); },
+					error: (socket) => { void actors.call("drawing", name, async (actor) =>
+						(actor as DrawingActor).socketError(socket)); },
+				});
+				return new DrawingActor(databases.drawing(name), sockets, vaultCalls, objects);
 			}
 			const execution = new NodeExecution();
 			const sockets = new NodeSocketRegistry(socketHub, {
@@ -279,6 +309,7 @@ export async function runNodeServer(options: NodeServerOptions): Promise<void> {
 				alarms.forActor(kind, name),
 				objects,
 				recoveryCalls,
+				drawingCalls,
 			);
 		};
 
@@ -298,6 +329,7 @@ export async function runNodeServer(options: NodeServerOptions): Promise<void> {
 			YAOS_SYNC: vaultCalls,
 			YAOS_CONFIG: configCalls,
 			YAOS_RECOVERY_JOBS: recoveryCalls,
+			YAOS_EXCALIDRAW: drawingCalls,
 			YAOS_BUCKET: objects,
 			socketUpgrades: socketHub,
 			...(options.ticketTtlMs ? { YAOS_TICKET_TTL_MS: options.ticketTtlMs } : {}),

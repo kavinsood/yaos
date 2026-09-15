@@ -9,6 +9,7 @@ import {
 import { canonicalizeMarkdown } from "./shared/markdownCodec";
 import { validateFrontmatterSemanticRoots } from "./shared/frontmatterSemanticValidation";
 import { safeBlobPath, safeCanvasPath, safeMarkdownPath } from "./shared/vaultPath";
+import { isSupportedExcalidrawPath } from "./shared/excalidrawProtocol";
 import type { SemanticPathRef } from "./shared/canvasTypes";
 import { PROTOCOL_VERSION, SCHEMA_VERSION } from "./shared/productVersions";
 import type { RootAuthoritySnapshot } from "./vaultCatalogStore";
@@ -157,6 +158,23 @@ export function prepareRootSemanticReset(
 			if (safeCanvasPath(entry.path) !== entry.path) throw new Error("semantic reset rejected unsafe Canvas path");
 			claimRootPath(occupiedPaths, entry.path);
 			semantic.set(entry.path, { documentId: entry.documentId, kind: "canvas", format: "json-canvas", formatVersion: 1 });
+		}
+
+		for (const entry of authority.excalidraw) {
+			assertCatalogInteger(entry.sequence, "Excalidraw sequence");
+			assertCatalogInteger(entry.documentGeneration, "Excalidraw generation", 1);
+			assertCatalogInteger(entry.documentEpoch, "Excalidraw epoch", 1);
+			if (!validIdentity(entry.documentId) || !validIdentity(entry.fileId)
+				|| entry.kind !== "excalidraw" || entry.format !== "excalidraw-native" || entry.formatVersion !== 1) {
+				throw new Error("semantic reset rejected invalid Excalidraw authority");
+			}
+			if (identities.has(entry.documentId)) throw new Error("semantic reset rejected duplicate cross-kind document identity");
+			identities.add(entry.documentId);
+			if (entry.lifecycle !== "active") continue;
+			if (!isSupportedExcalidrawPath(entry.path)) throw new Error("semantic reset rejected unsafe Excalidraw path");
+			claimRootPath(occupiedPaths, entry.path);
+			semantic.set(entry.path, { documentId: entry.documentId, kind: "excalidraw",
+				format: "excalidraw-native", formatVersion: 1 });
 		}
 
 		for (const entry of authority.attachments) {

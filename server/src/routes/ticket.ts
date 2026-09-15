@@ -9,13 +9,13 @@ import {
 	type SemanticEpochScope,
 } from "../shared/semanticEpoch";
 
-const TICKET_VERSION = 4;
+const TICKET_VERSION = 5;
 const TICKET_AUDIENCE = "yaos-vault-ws";
 export const TICKET_TTL_MS = 5 * 60 * 1_000;
 const MAX_TICKET_TTL_MS = 24 * 60 * 60 * 1_000;
 
 interface TicketPayloadFields extends VaultActorContext {
-	v: 4;
+	v: 5;
 	aud: "yaos-vault-ws";
 	deploymentId: string;
 	iat: number;
@@ -25,17 +25,19 @@ interface TicketPayloadFields extends VaultActorContext {
 
 /** The signed ticket binds one actor to one CRDT identity lineage. */
 type TicketEpochScope = SemanticEpochScope
-	| { purpose: "semantic"; documentId: string; bodyEpoch: SemanticEpoch };
+	| { purpose: "semantic"; documentId: string; bodyEpoch: SemanticEpoch }
+	| { purpose: "excalidraw"; documentId: string; drawingEpoch: number };
 
 export type TicketPayload = TicketPayloadFields & TicketEpochScope;
 
 export interface ExpectedTicketScope {
 	vaultId: string;
 	vaultGeneration?: string;
-	purpose?: "root" | "body" | "semantic";
+	purpose?: "root" | "body" | "semantic" | "excalidraw";
 	documentId?: string;
 	rootEpoch?: number;
 	bodyEpoch?: number;
+	drawingEpoch?: number;
 }
 
 function readTicketTtlMs(raw: string | undefined): number {
@@ -58,7 +60,11 @@ export async function createTicket(authState: AuthState, actor: VaultActorContex
 	scope: TicketEpochScope, ttlMs = TICKET_TTL_MS,
 ): Promise<{ ticket: string; expiresAt: number; ttlMs: number }> {
 	if (authState.mode !== "claim") throw new Error("cannot sign ticket: server is unavailable");
-	if (scope.purpose === "semantic") {
+	if (scope.purpose === "excalidraw") {
+		if (!scope.documentId || scope.documentId === "root" || !Number.isSafeInteger(scope.drawingEpoch) || scope.drawingEpoch < 1) {
+			throw new Error("invalid Excalidraw epoch scope identity");
+		}
+	} else if (scope.purpose === "semantic") {
 		if (!scope.documentId || scope.documentId === "root") throw new Error("invalid semantic epoch scope identity");
 		parseSemanticEpoch(scope.bodyEpoch, "semantic document epoch");
 	} else semanticEpochOf(scope);
@@ -99,6 +105,8 @@ export async function inspectTicket(ticket: string, authState: AuthState,
 		|| ("bodyEpoch" in scope && scope.bodyEpoch !== undefined
 			&& ((payload.purpose !== "body" && payload.purpose !== "semantic")
 				|| payload.bodyEpoch !== scope.bodyEpoch))
+		|| ("drawingEpoch" in scope && scope.drawingEpoch !== undefined
+			&& (payload.purpose !== "excalidraw" || payload.drawingEpoch !== scope.drawingEpoch))
 		|| payload.exp <= Date.now() || payload.iat > Date.now() + 60_000) return null;
 	return payload;
 }
@@ -110,14 +118,17 @@ export async function verifyTicket(ticket: string, authState: AuthState, expecte
 function isTicketPayload(value: unknown): value is TicketPayload {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
 	const payload = value as Record<string, unknown>;
-	return payload.v === 4 && payload.aud === "yaos-vault-ws"
+	return payload.v === 5 && payload.aud === "yaos-vault-ws"
 		&& typeof payload.deploymentId === "string" && payload.deploymentId.length > 0
-		&& (payload.purpose === "root" || payload.purpose === "body" || payload.purpose === "semantic")
+		&& (payload.purpose === "root" || payload.purpose === "body" || payload.purpose === "semantic" || payload.purpose === "excalidraw")
 		&& typeof payload.documentId === "string" && payload.documentId.length > 0
 		&& (payload.purpose === "root") === (payload.documentId === "root")
 		&& (payload.purpose === "root"
 			? Number.isSafeInteger(payload.rootEpoch) && (payload.rootEpoch as number) >= 1 && payload.bodyEpoch === undefined
-			: Number.isSafeInteger(payload.bodyEpoch) && (payload.bodyEpoch as number) >= 1 && payload.rootEpoch === undefined)
+			: payload.purpose === "excalidraw"
+				? Number.isSafeInteger(payload.drawingEpoch) && (payload.drawingEpoch as number) >= 1
+					&& payload.rootEpoch === undefined && payload.bodyEpoch === undefined
+				: Number.isSafeInteger(payload.bodyEpoch) && (payload.bodyEpoch as number) >= 1 && payload.rootEpoch === undefined)
 		&& typeof payload.vaultId === "string" && payload.vaultId.length > 0
 		&& typeof payload.vaultGeneration === "string" && payload.vaultGeneration.length > 0
 		&& typeof payload.principalId === "string" && payload.principalId.length > 0
@@ -136,17 +147,22 @@ export async function handleTicketRoute(req: Request, authState: AuthState, acto
 	json: (body: unknown, status?: number) => Response, env?: Env,
 ): Promise<Response> {
 	try {
-		let input: { purpose?: unknown; documentId?: unknown; rootEpoch?: unknown; bodyEpoch?: unknown } = {};
+		let input: { purpose?: unknown; documentId?: unknown; rootEpoch?: unknown; bodyEpoch?: unknown; drawingEpoch?: unknown } = {};
 		try { input = await req.json(); } catch { /* invalid below */ }
-		if ((input.purpose !== "root" && input.purpose !== "body" && input.purpose !== "semantic")
+		if ((input.purpose !== "root" && input.purpose !== "body" && input.purpose !== "semantic" && input.purpose !== "excalidraw")
 			|| typeof input.documentId !== "string" || input.documentId.length === 0) return json({ error: "invalid_ticket_scope" }, 400);
 		let scope: TicketEpochScope;
 		try {
 			scope = input.purpose === "root"
 				? { purpose: "root", documentId: "root", rootEpoch: parseSemanticEpoch(input.rootEpoch, "root epoch") }
-				: { purpose: input.purpose, documentId: input.documentId,
-					bodyEpoch: parseSemanticEpoch(input.bodyEpoch, `${input.purpose} epoch`) };
-			if (scope.purpose === "semantic") {
+				: input.purpose === "excalidraw"
+					? { purpose: "excalidraw", documentId: input.documentId,
+						drawingEpoch: parseSemanticEpoch(input.drawingEpoch, "Excalidraw drawing epoch") }
+					: { purpose: input.purpose, documentId: input.documentId,
+						bodyEpoch: parseSemanticEpoch(input.bodyEpoch, `${input.purpose} epoch`) };
+			if (scope.purpose === "excalidraw") {
+				if (scope.documentId === "root") throw new Error("invalid Excalidraw ticket scope");
+			} else if (scope.purpose === "semantic") {
 				if (scope.documentId === "root") throw new Error("invalid semantic ticket scope");
 			} else semanticEpochOf(scope);
 		} catch {

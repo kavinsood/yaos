@@ -41,6 +41,7 @@ s.test("root reset preserves catalog and attachment authority", () => {
 		semantic: [{ sequence: 12, documentId: "canvas-1", fileId: "canvas-1", kind: "canvas",
 			format: "json-canvas", formatVersion: 1, path: "Board.canvas", previousPath: "Old.canvas",
 			lifecycle: "active", generation: 2, bodyEpoch: 1, contentHash: "c".repeat(64), size: 20 }],
+		excalidraw: [],
 		attachments: [
 			{ sequence: 14, path: "asset.png", contentHash: hash, size: 4, mime: "image/png",
 				lifecycle: "active", operationId: "attachment-upsert", createdAt: 5 },
@@ -75,6 +76,7 @@ s.test("root reset rejects conflicting SQL path authority", () => {
 		semantic: [{ sequence: 1, documentId: "canvas-1", fileId: "canvas-1", kind: "canvas",
 			format: "json-canvas", formatVersion: 1, path: "Conflict.canvas", previousPath: null,
 			lifecycle: "active", generation: 1, bodyEpoch: 1, contentHash: null, size: null }],
+		excalidraw: [],
 		attachments: [{ sequence: 2, path: "Conflict.canvas", contentHash: "a".repeat(64), size: 1,
 			mime: "application/octet-stream", lifecycle: "active", operationId: "conflicting-upsert", createdAt: 2 }],
 		blobs: [{ contentHash: "a".repeat(64), size: 1, mime: "application/octet-stream", createdAt: 2 }],
@@ -93,6 +95,7 @@ s.test("root reset rejects one document identity claimed by Markdown and Canvas"
 		semantic: [{ sequence: 2, documentId: "cross-kind-id", fileId: "cross-kind-id", kind: "canvas",
 			format: "json-canvas", formatVersion: 1, path: "Board.canvas", previousPath: null,
 			lifecycle: "active", generation: 1, bodyEpoch: 1, contentHash: null, size: null }],
+		excalidraw: [],
 		attachments: [],
 		blobs: [],
 	};

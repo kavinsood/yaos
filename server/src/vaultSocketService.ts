@@ -13,6 +13,7 @@ import {
 } from "./vaultDocumentCache";
 import { safeBlobPath, safeCanvasPath } from "./shared/vaultPath";
 import type { SemanticPathRef } from "./shared/canvasTypes";
+import { isSupportedExcalidrawPath } from "./shared/excalidrawProtocol";
 import { isCanonicalVaultId } from "./vaultId";
 import {
 	SOCKET_CONTROL_CAPABILITIES,
@@ -172,12 +173,15 @@ export function hasSafeRootAttachmentSemantics(doc: Y.Doc): boolean {
 	}
 	const semanticIds = new Set<string>();
 	for (const [path, value] of semantic.entries()) {
-		if (safeCanvasPath(path) !== path || refs.has(path) || markdown.has(path)
+		if (refs.has(path) || markdown.has(path)
 			|| typeof value !== "object" || value === null || Array.isArray(value)) return false;
 		const ref = value as Partial<SemanticPathRef>;
 		const documentId = ref.documentId;
-		if (typeof documentId !== "string" || !validIdentity(documentId) || ref.kind !== "canvas" || ref.format !== "json-canvas"
-			|| ref.formatVersion !== 1 || semanticIds.has(documentId)) return false;
+		const validFormat = ref.kind === "canvas"
+			? safeCanvasPath(path) === path && ref.format === "json-canvas" && ref.formatVersion === 1
+			: ref.kind === "excalidraw" && isSupportedExcalidrawPath(path)
+				&& ref.format === "excalidraw-native" && ref.formatVersion === 1;
+		if (typeof documentId !== "string" || !validIdentity(documentId) || !validFormat || semanticIds.has(documentId)) return false;
 		semanticIds.add(documentId);
 	}
 	return true;

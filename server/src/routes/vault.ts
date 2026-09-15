@@ -17,6 +17,11 @@ import type { VaultActorContext } from "../collaboration";
 import { actorHeaders, OUTCOME_CLAIM_HEADER, stripActorHeaders } from "../vaultAuthority";
 import type { AuthState, Env } from "./types";
 import {
+	MAX_EXCALIDRAW_BATCH_BYTES,
+	MAX_EXCALIDRAW_INITIALIZE_BYTES,
+	isExcalidrawIdentity,
+} from "../shared/excalidrawProtocol";
+import {
 	BODY_EPOCH_HEADER,
 	ROOT_EPOCH_HEADER,
 	semanticEpochHeaders,
@@ -48,6 +53,59 @@ function forwardedBodyLimit(request: Request, runtimePath: string): number | nul
 			: MAX_SETTINGS_ITEM_REQUEST_BYTES;
 	}
 	return MAX_JSON_BYTES;
+}
+
+async function forwardExcalidraw(
+	env: Env,
+	vault: VaultRecord,
+	request: Request,
+	drawingId: string,
+	roomPath: string,
+	actor: VaultActorContext,
+	drawingEpoch?: number,
+): Promise<Response> {
+	if (!env.YAOS_EXCALIDRAW) return Response.json({ error: "excalidraw_unavailable" }, { status: 503 });
+	const url = new URL(request.url);
+	url.pathname = roomPath;
+	const headers = new Headers(request.headers);
+	headers.delete("authorization");
+	stripActorHeaders(headers);
+	actorHeaders(actor).forEach((value, name) => headers.set(name, value));
+	headers.set("x-yaos-vault-id", vault.vaultId);
+	headers.set("x-yaos-vault-generation", vault.vaultGeneration);
+	headers.set("x-yaos-drawing-id", drawingId);
+	if (drawingEpoch !== undefined) headers.set("x-yaos-drawing-epoch", String(drawingEpoch));
+	const init: RequestInit = { method: request.method, headers };
+	if (request.body && request.method !== "GET" && request.method !== "HEAD") {
+		const maximum = roomPath === "/initialize" || roomPath === "/reset"
+			? MAX_EXCALIDRAW_INITIALIZE_BYTES : MAX_EXCALIDRAW_BATCH_BYTES;
+		try {
+			const bytes = await readBoundedBytes(request, maximum);
+			init.body = bytes.slice().buffer;
+		} catch (error) {
+			const kind = error instanceof BoundedBodyError ? error.kind : "body_read_failed";
+			return Response.json({ error: kind }, { status: kind === "body_too_large" ? 413 : 400 });
+		}
+	}
+	return env.YAOS_EXCALIDRAW.call(`${vault.vaultGeneration}:${drawingId}`, new Request(url, init));
+}
+
+export async function handleExcalidrawRoomRoute(
+	request: Request,
+	env: Env,
+	vaultId: string,
+	drawingId: string,
+	roomPath: string,
+): Promise<Response> {
+	if (!isExcalidrawIdentity(drawingId)) return Response.json({ error: "invalid_excalidraw_drawing_id" }, { status: 400 });
+	let vault: VaultRecord | null;
+	try { vault = await readVault(env, vaultId); }
+	catch { return Response.json({ error: "vault_authority_unavailable" }, { status: 503 }); }
+	if (!vault) return Response.json({ error: "unknown_vault" }, { status: 404 });
+	if (vault.state !== "active") return Response.json({ error: `vault_${vault.state}` }, { status: 409 });
+	const authorized = await authorizeVaultActor(env, getHttpAuthToken(request), vaultId);
+	if (!authorized) return Response.json({ error: "unauthorized" }, { status: 401 });
+	return forwardExcalidraw(env, vault, request, drawingId, roomPath, authorized.actor);
 }
 
 async function forward(env: Env, vault: VaultRecord, request: Request, runtimePath: string, actor?: VaultActorContext,
@@ -140,7 +198,9 @@ export async function handleVaultSocketRoute(
 	if (!authState.claimed) return rejectSocket(request, env, "unclaimed");
 	const url = new URL(request.url);
 	const ticket = url.searchParams.get("ticket");
-	const purpose = runtimePath === "/ws/root" ? "root" : runtimePath.startsWith("/ws/semantic/") ? "semantic" : "body";
+	const purpose = runtimePath === "/ws/root" ? "root"
+		: runtimePath.startsWith("/ws/semantic/") ? "semantic"
+			: runtimePath.startsWith("/ws/excalidraw/") ? "excalidraw" : "body";
 	const documentId = purpose === "root" ? "root" : runtimePath.split("/").at(-1) ?? "";
 	const payload = ticket ? await inspectTicket(ticket, authState, { vaultId, purpose, documentId }) : null;
 	if (!payload) return rejectSocket(request, env, "unauthorized");
@@ -169,6 +229,9 @@ export async function handleVaultSocketRoute(
 		...(payload.deviceName ? { deviceName: payload.deviceName } : {}),
 		role: payload.role, policyVersion: payload.policyVersion, capabilityDigest: payload.capabilityDigest,
 	};
+	if (payload.purpose === "excalidraw") {
+		return forwardExcalidraw(env, vault, request, documentId, "/ws", actor, payload.drawingEpoch);
+	}
 	const semanticScope: SemanticEpochScope = payload.purpose === "root"
 		? { purpose: "root", documentId: "root", rootEpoch: payload.rootEpoch }
 		: { purpose: "body", documentId: payload.documentId, bodyEpoch: payload.bodyEpoch };

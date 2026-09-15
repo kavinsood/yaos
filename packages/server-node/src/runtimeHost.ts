@@ -78,7 +78,7 @@ export class ProcessDataLock {
 	}
 }
 
-export type ActorKind = "config" | "vault" | "recovery-job";
+export type ActorKind = "config" | "vault" | "recovery-job" | "drawing";
 export interface RuntimeActor {
 	fetch?(request: Request): Promise<Response>;
 	dispatch?(dispatchId: string): Promise<void>;

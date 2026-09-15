@@ -9,6 +9,7 @@ import {
 	MAX_CANDIDATE_RECEIPTS_PER_BODY,
 	type AttachmentCatalogEvent,
 	type CatalogMutation,
+	type ExcalidrawCatalogMutation,
 	type SemanticCatalogMutation,
 	type SemanticCatalogHead,
 	type SemanticCandidateReceipt,
@@ -71,6 +72,8 @@ export type {
 	CatalogDeltaEntry,
 	CatalogHeadAtBoundary,
 	CatalogMutation,
+	ExcalidrawCatalogHead,
+	ExcalidrawCatalogMutation,
 	DurableCandidateReceipt,
 	DurableLifecycleRecord,
 	DurableRootPublication,
@@ -378,6 +381,10 @@ export class VaultStore extends RecoveryAuthorityStore {
 		if (this.activePins(now).length > 0) throw new Error("active_state_reset_blocked_by_history_pin");
 		this.storage.transactionSync(() => {
 			for (const table of [
+				"vault_excalidraw_finalize_receipts",
+				"vault_excalidraw_permits",
+				"vault_excalidraw_drawings",
+				"vault_excalidraw_prepares",
 				"vault_restore_entries",
 				"vault_operation_outcomes",
 				"vault_mutation_attribution",
@@ -539,8 +546,10 @@ export class VaultStore extends RecoveryAuthorityStore {
 		expectedSemanticHead?: SemanticCatalogHead | null;
 		catalog?: CatalogMutation | CatalogMutation[];
 		semanticCatalog?: SemanticCatalogMutation | SemanticCatalogMutation[];
+		excalidrawCatalog?: ExcalidrawCatalogMutation;
 		semanticCandidateReceipt?: Omit<SemanticCandidateReceipt, "vaultSequence">;
 		semanticLifecycleReceipt?: Omit<SemanticLifecycleReceipt, "vaultSequence" | "rootGeneration">;
+		excalidrawLifecycleReceipt?: Omit<SemanticLifecycleReceipt, "vaultSequence" | "rootGeneration">;
 		lifecycleReceipt?: Omit<DurableLifecycleRecord, "vaultSequence" | "rootGeneration">;
 		lifecycleReceipts?: Array<Omit<DurableLifecycleRecord, "vaultSequence" | "rootGeneration">>;
 		completeCreation?: { bodyId: string; candidateId: string; candidateDigest: string };
@@ -568,8 +577,9 @@ export class VaultStore extends RecoveryAuthorityStore {
 			if (receipt) this.assertVaultGeneration(receipt.vaultGeneration);
 		}
 		for (const publication of input.rootPublications ?? []) this.assertVaultGeneration(publication.vaultGeneration);
-		if ((input.lifecycleReceipt || input.lifecycleReceipts || input.completeCreation
-			|| input.completeCreations || input.rootPublications || input.attachmentCatalog || input.attachmentOperation) && input.documentId !== "root") {
+			if ((input.lifecycleReceipt || input.lifecycleReceipts || input.completeCreation
+				|| input.excalidrawLifecycleReceipt
+				|| input.completeCreations || input.rootPublications || input.attachmentCatalog || input.attachmentOperation) && input.documentId !== "root") {
 			throw new Error("root publication metadata must commit through root");
 		}
 		if (input.completeCreation && !input.lifecycleReceipt) {
@@ -720,7 +730,19 @@ export class VaultStore extends RecoveryAuthorityStore {
 				catalog.toArray();
 				rowsWritten += catalog.rowsWritten;
 			}
-			if (input.semanticLifecycleReceipt) {
+			if (input.excalidrawCatalog) {
+				const mutation = input.excalidrawCatalog;
+				const catalog = this.storage.sql.exec(`INSERT INTO vault_semantic_catalog_events(
+				 sequence, document_id, file_id, kind, format, format_version, path, previous_path,
+				 lifecycle, generation, document_epoch, content_hash, size, mutation_index
+				) VALUES (?, ?, ?, 'excalidraw', 'excalidraw-native', 1, ?, ?, ?, ?, ?, ?, ?, 0)`,
+				sequence, mutation.documentId, mutation.fileId, mutation.path, mutation.previousPath,
+				mutation.lifecycle, mutation.documentGeneration, mutation.documentEpoch,
+				mutation.contentHash ?? null, mutation.size ?? null);
+				catalog.toArray();
+				rowsWritten += catalog.rowsWritten;
+			}
+				if (input.semanticLifecycleReceipt) {
 				const receipt = input.semanticLifecycleReceipt;
 				this.assertVaultGeneration(receipt.vaultGeneration);
 				if (input.documentId !== "root" || semanticEpoch !== receipt.rootEpoch) {
@@ -736,8 +758,22 @@ export class VaultStore extends RecoveryAuthorityStore {
 				 durable_generation, body_epoch, vault_sequence, root_generation, root_epoch, runtime_epoch, created_at
 				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, receipt.operationId, receipt.requestDigest,
 				receipt.documentId, receipt.fileId, receipt.kind, receipt.resultPath, receipt.resultLifecycle,
-				receipt.durableGeneration, receipt.bodyEpoch, sequence, generation, receipt.rootEpoch, receipt.runtimeEpoch, now).toArray();
-			}
+					receipt.durableGeneration, receipt.bodyEpoch, sequence, generation, receipt.rootEpoch, receipt.runtimeEpoch, now).toArray();
+				}
+				if (input.excalidrawLifecycleReceipt) {
+					const receipt = input.excalidrawLifecycleReceipt;
+					this.assertVaultGeneration(receipt.vaultGeneration);
+					if (input.documentId !== "root" || semanticEpoch !== receipt.rootEpoch) {
+						throw new Error("excalidraw_lifecycle_root_epoch_changed");
+					}
+					this.storage.sql.exec(`INSERT INTO vault_semantic_lifecycle_receipts(
+						operation_id, request_digest, document_id, file_id, kind, result_path, result_lifecycle,
+						durable_generation, body_epoch, vault_sequence, root_generation, root_epoch, runtime_epoch, created_at
+					) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, receipt.operationId, receipt.requestDigest,
+						receipt.documentId, receipt.fileId, receipt.kind, receipt.resultPath, receipt.resultLifecycle,
+						receipt.durableGeneration, receipt.bodyEpoch, sequence, generation, receipt.rootEpoch,
+						receipt.runtimeEpoch, now).toArray();
+				}
 			if (input.semanticCandidateReceipt) {
 				const receipt = input.semanticCandidateReceipt;
 				this.assertVaultGeneration(receipt.vaultGeneration);

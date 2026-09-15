@@ -34,6 +34,7 @@ import { canonicalJsonHash } from "./recoveryCanonicalJson";
 import type { VaultAuthoritySubjectChange } from "./vaultDocumentStore";
 import { SemanticCompactionRuntime } from "./semanticCompactionRuntime";
 import { BODY_EPOCH_HEADER, ROOT_EPOCH_HEADER, parseSemanticEpoch, parseSemanticEpochHeader } from "./shared/semanticEpoch";
+import { VaultExcalidrawAuthorityService } from "./vaultExcalidrawAuthority";
 
 const PERSIST_DEBOUNCE_MS = 250;
 const PERSIST_RETRY_MS = 1_000;
@@ -146,9 +147,10 @@ export interface VaultRuntimeOptions {
 	execution: ExecutionPort;
 	objectStore?: ObjectStorePort;
 	recoveryJobs?: ActorCallPort;
+	drawings?: ActorCallPort;
 }
 
-/** Schema-8 root/Markdown/Canvas composition, independent of a worker or process host. */
+/** Schema-9 root/Markdown/Canvas/Excalidraw composition, independent of a worker or process host. */
 export class VaultRuntime implements DrainPort {
 	private store: VaultStore;
 	private settings: SettingsSyncStore;
@@ -158,6 +160,7 @@ export class VaultRuntime implements DrainPort {
 	private readonly lifecycle: VaultLifecycleService;
 	private readonly candidates: VaultCandidateService;
 	private readonly semantic: VaultSemanticService;
+	private readonly excalidraw: VaultExcalidrawAuthorityService;
 	private readonly bootstrap: BootstrapService;
 	private readonly recovery: VaultRecoveryService;
 	private readonly semanticCompaction: SemanticCompactionRuntime;
@@ -265,6 +268,16 @@ export class VaultRuntime implements DrainPort {
 				this.recordCompactionCommit(documentId, ingressBytes, commitLatencyMs),
 			objectStore: options.objectStore,
 		});
+		this.excalidraw = new VaultExcalidrawAuthorityService({
+			storage: options.storage,
+			store: () => this.store,
+			drawings: options.drawings,
+			runtimeEpoch: this.runtimeEpoch,
+			onRootCommitted: (update, generation) => {
+				this.cache.applyDurableUpdate("root", update, generation, this);
+				this.sockets.broadcastDocumentUpdate("root", update, this);
+			},
+		});
 		this.bootstrap = new BootstrapService(
 			this.store,
 			Date.now,
@@ -327,12 +340,33 @@ export class VaultRuntime implements DrainPort {
 					return json({ error: "invalid_device_identity" }, 400);
 				}
 				this.store.revokeDevice(body.deviceId);
-				return json({ closed: this.sockets.closeDevice(body.deviceId) });
+				const closed = this.sockets.closeDevice(body.deviceId);
+				await this.excalidraw.closeActorSockets([], [body.deviceId]);
+				return json({ closed });
 			}
 			if (request.method === "POST" && url.pathname === "/__yaos/begin-vault-deletion") return this.beginDeletion(request);
 			if (request.method === "POST" && url.pathname === "/__yaos/delete-all") return this.deleteAll();
 			if (this.store.vaultDeletionBegun(metadata.vaultGeneration)) return json({ error: "vault_deleting" }, 410);
 			const actor = parseVaultActor(request, metadata.vaultId, metadata.vaultGeneration);
+			if (request.method === "POST" && url.pathname === "/__yaos/excalidraw/reserve") {
+				return this.runAuthorityBoundary(() => this.excalidraw.reserve(request));
+			}
+			if (request.method === "POST" && url.pathname === "/__yaos/excalidraw/share-reserve") {
+				return this.runAuthorityBoundary(() => this.excalidraw.reserveShare(request));
+			}
+			if (request.method === "GET" && url.pathname === "/__yaos/excalidraw/read") {
+				return this.excalidraw.read(request);
+			}
+			if (request.method === "POST" && parts.length === 4 && parts[0] === "excalidraw"
+				&& parts[2] === "authority" && ["prepare", "finalize", "lifecycle"].includes(parts[3]!)) {
+				const authorized = this.authorize(actor, parts[3] === "lifecycle"
+					? "vault.lifecycle.write" : "vault.attachments.write");
+				if (authorized instanceof Response) return authorized;
+				return parts[3] === "prepare"
+					? this.excalidraw.prepare(request, authorized)
+					: parts[3] === "finalize" ? this.excalidraw.finalize(request, authorized)
+						: this.excalidraw.lifecycle(request, authorized);
+			}
 			if (parts[0] === "settings-sync") {
 				if (parts.length < 2 || parts.length > 3) return json({ error: "not_found" }, 404);
 				const authorized = this.authorize(actor, "vault.settings.personal.sync", actor?.principalId);
@@ -534,6 +568,8 @@ export class VaultRuntime implements DrainPort {
 				if ("deviceId" in subject) this.sockets.closeDevice(subject.deviceId);
 			}
 			for (const principalId of principalIds) this.sockets.closePrincipal(principalId);
+			await this.excalidraw.closeActorSockets([...principalIds], subjects.flatMap((subject) =>
+				"deviceId" in subject ? [subject.deviceId] : []));
 			return json({ ...receipt, runtimeEpoch: this.runtimeEpoch });
 		} catch (error) {
 			return json({ error: error instanceof Error ? error.message : "authorization_fence_failed" }, 409);
@@ -611,6 +647,7 @@ export class VaultRuntime implements DrainPort {
 		}
 		await this.flushLoadedDocuments();
 		await this.recovery.beginVaultDeletion({ vaultId: metadata.vaultId, deletionId: body.deletionId });
+		await this.excalidraw.fenceAllDrawings();
 		return json({ deleting: true });
 	}
 
@@ -1189,13 +1226,14 @@ export class VaultRuntime implements DrainPort {
 export interface CloudflareVaultEnvironment {
 	YAOS_BUCKET?: R2Bucket;
 	YAOS_RECOVERY_JOBS?: DurableObjectNamespace;
+	YAOS_EXCALIDRAW?: DurableObjectNamespace;
 }
 
 // Workers namespaces require the exported class type to carry the RPC brand.
 // eslint-disable-next-line @typescript-eslint/no-empty-object-type, @typescript-eslint/no-unsafe-declaration-merging -- Workers RPC requires the exported class type to carry its brand.
 export interface VaultSyncServer extends Rpc.DurableObjectBranded {}
 
-/** Cloudflare Durable Object wrapper for the portable schema-8 vault runtime. */
+/** Cloudflare Durable Object wrapper for the portable schema-10 vault runtime. */
 // eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging -- Declaration merging preserves the Workers RPC brand on the Cloudflare wrapper.
 export class VaultSyncServer implements DurableObject {
 	private readonly runtime: VaultRuntime;
@@ -1207,6 +1245,7 @@ export class VaultSyncServer implements DurableObject {
 			alarms: new CloudflareAlarmPort(state.storage),
 			execution: new CloudflareExecutionPort(state),
 			objectStore: env.YAOS_BUCKET ? new CloudflareObjectStore(env.YAOS_BUCKET) : undefined,
+			drawings: env.YAOS_EXCALIDRAW ? new CloudflareActorCalls(env.YAOS_EXCALIDRAW) : undefined,
 			recoveryJobs: env.YAOS_RECOVERY_JOBS
 				? new CloudflareActorCalls(env.YAOS_RECOVERY_JOBS)
 				: undefined,

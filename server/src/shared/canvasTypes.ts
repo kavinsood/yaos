@@ -99,9 +99,18 @@ export interface CanvasMergeResult {
 	resolvedEditDeletes: Array<{ itemKind: "node" | "edge"; itemId: string }>;
 }
 
-export interface SemanticPathRef {
+export interface CanvasSemanticPathRef {
 	documentId: string;
 	kind: "canvas";
 	format: "json-canvas";
 	formatVersion: 1;
 }
+
+export interface ExcalidrawSemanticPathRef {
+	documentId: string;
+	kind: "excalidraw";
+	format: "excalidraw-native";
+	formatVersion: 1;
+}
+
+export type SemanticPathRef = CanvasSemanticPathRef | ExcalidrawSemanticPathRef;

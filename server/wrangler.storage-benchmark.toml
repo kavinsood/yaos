@@ -1,4 +1,4 @@
-# Validation build of the existing Worker with a fresh schema-8/storage-4
+# Validation build of the existing Worker with a fresh schema-9/storage-5
 # Durable Object lineage. Older benchmark lineages remain exported only because
 # Wrangler requires every previously-created class name to stay available.
 # The three YAOS namespaces and their complete migration lineage are preserved;

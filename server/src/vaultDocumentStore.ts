@@ -604,6 +604,26 @@ export abstract class VaultDocumentStore {
 			);
 			CREATE INDEX IF NOT EXISTS vault_semantic_catalog_document_sequence
 				ON vault_semantic_catalog_events(document_id, sequence DESC);
+			CREATE TABLE IF NOT EXISTS vault_excalidraw_prepares (
+				operation_id TEXT PRIMARY KEY, request_digest TEXT NOT NULL, drawing_id TEXT NOT NULL,
+				path TEXT NOT NULL, source_json TEXT NOT NULL, initialization_request_digest TEXT NOT NULL,
+				prepare_permit_id TEXT NOT NULL UNIQUE,
+				principal_id TEXT NOT NULL, membership_revision INTEGER NOT NULL, device_id TEXT NOT NULL,
+				device_credential_revision INTEGER NOT NULL, created_at INTEGER NOT NULL
+			);
+			CREATE UNIQUE INDEX IF NOT EXISTS vault_excalidraw_prepare_drawing ON vault_excalidraw_prepares(drawing_id);
+			CREATE TABLE IF NOT EXISTS vault_excalidraw_drawings (
+				drawing_id TEXT PRIMARY KEY, file_id TEXT NOT NULL, path TEXT NOT NULL UNIQUE,
+				drawing_epoch INTEGER NOT NULL, lifecycle TEXT NOT NULL, room_sequence INTEGER NOT NULL,
+				initialized_operation_id TEXT NOT NULL, updated_at INTEGER NOT NULL
+			);
+			CREATE TABLE IF NOT EXISTS vault_excalidraw_permits (
+				operation_id TEXT PRIMARY KEY, request_digest TEXT NOT NULL, drawing_id TEXT NOT NULL,
+				drawing_epoch INTEGER NOT NULL, kind TEXT NOT NULL, permit_json TEXT NOT NULL, created_at INTEGER NOT NULL
+			);
+			CREATE TABLE IF NOT EXISTS vault_excalidraw_finalize_receipts (
+				operation_id TEXT PRIMARY KEY, request_digest TEXT NOT NULL, receipt_json TEXT NOT NULL, created_at INTEGER NOT NULL
+			);
 			CREATE TABLE IF NOT EXISTS vault_semantic_candidate_receipts (
 				document_id TEXT NOT NULL,
 				client_id TEXT NOT NULL,

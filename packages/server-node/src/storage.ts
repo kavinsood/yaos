@@ -599,17 +599,20 @@ export class NodeDatabaseSet {
 	readonly control: NodeSqliteStorage;
 	private readonly vaults = new Map<string, NodeSqliteStorage>();
 	private readonly jobs = new Map<string, NodeSqliteStorage>();
+	private readonly drawings = new Map<string, NodeSqliteStorage>();
 	private closed = false;
 
 	constructor(readonly dataDirectory: string) {
 		mkdirSync(dataDirectory, { recursive: true, mode: 0o700 });
 		const vaultDirectory = join(dataDirectory, "vaults");
 		const jobDirectory = join(dataDirectory, "jobs");
+		const drawingDirectory = join(dataDirectory, "drawings");
 		mkdirSync(vaultDirectory, { recursive: true, mode: 0o700 });
 		mkdirSync(jobDirectory, { recursive: true, mode: 0o700 });
+		mkdirSync(drawingDirectory, { recursive: true, mode: 0o700 });
 		this.control = NodeSqliteStorage.open(join(dataDirectory, "control.sqlite"), CONTROL_MIGRATIONS);
 		try {
-			for (const directory of [vaultDirectory, jobDirectory]) {
+			for (const directory of [vaultDirectory, jobDirectory, drawingDirectory]) {
 				for (const entry of readdirSync(directory, { withFileTypes: true })) {
 					if (!entry.isFile() || !entry.name.endsWith(".sqlite")) continue;
 					const database = NodeSqliteStorage.open(join(directory, entry.name));
@@ -638,6 +641,10 @@ export class NodeDatabaseSet {
 		return this.actorDatabase("job", actorName, this.jobs);
 	}
 
+	drawing(actorName: string): NodeSqliteStorage {
+		return this.actorDatabase("drawing", actorName, this.drawings);
+	}
+
 	readinessFailure(): NodeStorageReadinessFailure | null {
 		const controlFailure = this.control.readinessFailure();
 		if (controlFailure) return controlFailure;
@@ -649,6 +656,10 @@ export class NodeDatabaseSet {
 			const failure = database.readinessFailure();
 			if (failure) return failure;
 		}
+		for (const database of this.drawings.values()) {
+			const failure = database.readinessFailure();
+			if (failure) return failure;
+		}
 		return null;
 	}
 
@@ -656,14 +667,16 @@ export class NodeDatabaseSet {
 		if (this.closed) return;
 		this.closed = true;
 		for (const database of this.jobs.values()) database.close();
+		for (const database of this.drawings.values()) database.close();
 		for (const database of this.vaults.values()) database.close();
 		this.control.close();
 		this.jobs.clear();
+		this.drawings.clear();
 		this.vaults.clear();
 	}
 
 	private actorDatabase(
-		kind: "vault" | "job",
+		kind: "vault" | "job" | "drawing",
 		actorName: string,
 		cache: Map<string, NodeSqliteStorage>,
 	): NodeSqliteStorage {

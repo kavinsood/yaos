@@ -181,7 +181,7 @@ export class VaultLifecycleService {
 		const bodyIds = new Set<string>();
 		for (const candidate of candidates) {
 			const operation = parseLifecycleRequest(candidate);
-			if (!operation || operation.bodyId !== operation.fileId || operation.kind === "create"
+			if (!operation || operation.bodyId !== operation.fileId
 				|| operationIds.has(operation.operationId) || bodyIds.has(operation.bodyId)) {
 				return json({ error: "invalid_lifecycle_batch_operation" }, 400);
 			}
@@ -202,7 +202,11 @@ export class VaultLifecycleService {
 				&& (this.isCurrent(record) || this.options.store.lifecyclePublication(record.operationId) !== null))) {
 				return json({ error: "lifecycle_batch_superseded" }, 409);
 			}
-			return json({ receipts: records.map((record) => this.receipt(record)), vaultSequence: records[0]!.vaultSequence, runtimeEpoch: records[0]!.runtimeEpoch });
+			return json({
+				receipts: records.map((record) => this.receipt(record)),
+				vaultSequence: Math.max(...records.map((record) => record.vaultSequence)),
+				runtimeEpoch: records[0]!.runtimeEpoch,
+			});
 		}
 		if (existing.some((record) => record !== null)) {
 			for (let index = 0; index < existing.length; index++) {
@@ -212,6 +216,9 @@ export class VaultLifecycleService {
 				}
 			}
 			return json({ error: "lifecycle_batch_partial_retry" }, 409);
+		}
+		if (operations.some((operation) => operation.kind === "create")) {
+			return json({ error: "invalid_lifecycle_batch_operation" }, 400);
 		}
 		for (const operation of operations) {
 			const currentEpoch = this.options.store.documentHead(operation.bodyId)?.semanticEpoch ?? INITIAL_SEMANTIC_EPOCH;
