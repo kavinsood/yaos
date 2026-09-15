@@ -290,7 +290,7 @@ export async function attemptVaultCleanup(
 						createdAt: pending.requestedAt,
 						capability,
 						capabilityExpiresAt,
-						allowedPrefixes: [`${prefix}/recovery-v2/`, `${prefix}/blobs/`],
+						allowedPrefixes: [`${prefix}/recovery-v2/`, `${prefix}/blobs/`, `${prefix}/excalidraw-shares/`],
 						deletionId: pending.deletionId,
 					});
 					status = await executor.getStatus(pending.purgeJobId);

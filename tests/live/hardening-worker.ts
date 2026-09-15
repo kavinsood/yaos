@@ -1,4 +1,4 @@
-import { PROTOCOL_VERSION } from "../../src/sync/schema.ts";
+import { PROTOCOL_VERSION, SCHEMA_VERSION } from "../../src/sync/schema.ts";
 import { parseFatalFrame, type FatalFrame } from "./fatalFrame.ts";
 import { deviceBearerHeaders, fetchSocketTicket, LiveWebSocket as WebSocket, requireLiveIdentity } from "./liveIdentity.ts";
 import { socketPrefix } from "./schema4Live.ts";
@@ -30,5 +30,5 @@ const diagnostics = await fetch(`${identity.host}/vault/${encodeURIComponent(ide
 });
 if (!diagnostics.ok) throw new Error(`diagnostics failed after oversized schema rejection (${diagnostics.status})`);
 const body = await diagnostics.json() as { schemaVersion?: unknown; protocolVersion?: unknown };
-if (body.schemaVersion !== 8 || body.protocolVersion !== 5) throw new Error(`diagnostics lost schema-8 pins: ${JSON.stringify(body)}`);
+if (body.schemaVersion !== SCHEMA_VERSION || body.protocolVersion !== PROTOCOL_VERSION) throw new Error(`diagnostics lost schema-${SCHEMA_VERSION} pins: ${JSON.stringify(body)}`);
 console.log("Oversized /ws/root schema input is bounded and leaves schema-4 diagnostics healthy.");

@@ -63,10 +63,10 @@ function service(capabilities: ServerCapabilities): { blocked: boolean; errors: 
 s.section("Exact product boundary");
 s.check(packageJson.version === manifest.version, "package and plugin manifest versions agree");
 s.check(versions[manifest.version] === manifest.minAppVersion, "Obsidian version map contains this plugin release");
-s.check(SCHEMA_VERSION === 8, "document schema is 8");
-s.check(STORAGE_FORMAT_VERSION === 4, "storage format is 4");
-s.check(PROTOCOL_VERSION === 5, "socket protocol is 5");
-s.check(SNAPSHOT_FORMAT_VERSION === 3, "snapshot format is 3");
+s.check(SCHEMA_VERSION === 10, "document schema is 10");
+s.check(STORAGE_FORMAT_VERSION === 6, "storage format is 6");
+s.check(PROTOCOL_VERSION === 8, "socket protocol is 8");
+s.check(SNAPSHOT_FORMAT_VERSION === 4, "snapshot format is 4");
 s.check(serverCapabilityProtocolError(baseCapabilities) === null, "current capability envelope is recognized");
 s.check(!service(baseCapabilities).blocked, "exact product pins are admitted");
 for (const [field, value] of [
@@ -86,8 +86,8 @@ s.check(isUpdateManifest(emitted), "emitted update manifest has the exact curren
 s.check(emitted.deploymentBoundary === "fresh", "breaking storage release requires a fresh deployment");
 s.check(emitted.latestServerVersion === SERVER_VERSION, "manifest publishes the current server version");
 s.check(emitted.latestPluginVersion === manifest.version, "manifest publishes the current plugin version");
-s.check(emitted.schemaVersion === 8 && emitted.storageFormatVersion === 4
-	&& emitted.protocolVersion === 5 && emitted.snapshotFormatVersion === 3,
+s.check(emitted.schemaVersion === 10 && emitted.storageFormatVersion === 6
+	&& emitted.protocolVersion === 8 && emitted.snapshotFormatVersion === 4,
 "manifest publishes all independent product pins");
 s.check(!("upgradeOrder" in emitted) && !("autoUpdateEligible" in emitted)
 	&& !("minCompatibleServerVersionForPlugin" in emitted),
@@ -96,8 +96,8 @@ s.check(!("upgradeOrder" in emitted) && !("autoUpdateEligible" in emitted)
 const archivePath = resolve(root, "dist/release-assets/yaos-server.zip");
 const embedded = JSON.parse(execFileSync("unzip", ["-p", archivePath, "yaos-server-manifest.json"], { encoding: "utf8" })) as Record<string, unknown>;
 s.check(embedded.serverVersion === SERVER_VERSION, "server archive publishes its version");
-s.check(embedded.schemaVersion === 8 && embedded.storageFormatVersion === 4
-	&& embedded.protocolVersion === 5 && embedded.snapshotFormatVersion === 3,
+s.check(embedded.schemaVersion === 10 && embedded.storageFormatVersion === 6
+	&& embedded.protocolVersion === 8 && embedded.snapshotFormatVersion === 4,
 "server archive publishes all product pins");
 s.check(!("pluginVersion" in embedded) && !("protectedFiles" in embedded), "obsolete compatibility metadata is absent");
 

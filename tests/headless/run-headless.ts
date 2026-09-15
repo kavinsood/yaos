@@ -44,7 +44,7 @@ const NEGATIVE_HOLD_MS = 7_000;
 const SLOW_INTERVAL_MS = 12_000;
 const SLOW_HOLD_MS = 8_000;
 const SLOW_WAIT_MS = 60_000;
-const s = suite("schema-8 headless daemon");
+const s = suite("schema-10 headless daemon");
 
 function describe(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
@@ -336,7 +336,7 @@ try {
 		"the pairing secret is supplied only through environment, never argv",
 	);
 	originIdentity = await enrollmentIdentity(enrollmentPath);
-	s.check(originIdentity.vaultId === server.vaultId && originIdentity.vaultGeneration === server.vaultGeneration, "durable enrollment is fenced to the claimed schema-8 vault generation");
+	s.check(originIdentity.vaultId === server.vaultId && originIdentity.vaultGeneration === server.vaultGeneration, "durable enrollment is fenced to the claimed schema-10 vault generation");
 	s.check(originIdentity.originImport, "the first enrolled CLI persistently owns originImport authority");
 	s.check(
 		originIdentity.deviceId === pendingDeviceId && originIdentity.deviceToken === pendingDeviceToken,
@@ -416,7 +416,7 @@ try {
 	));
 
 	const remotePath = "remote-exact.md";
-	const remoteV1 = "# remote\n\ncreated through schema-8 lifecycle and candidate receipts\n";
+	const remoteV1 = "# remote\n\ncreated through schema-10 lifecycle and candidate receipts\n";
 	await requirePeer().create(remotePath, remoteV1);
 	await checked("remote create materializes exact content on disk", () => waitFor(
 		async () => await readIfExists(join(originVault, remotePath)) === remoteV1,
@@ -491,12 +491,12 @@ try {
 		BURST_MS,
 	));
 	await stopOrigin();
-	const sqliteFiles = await findNamed(xdgState, "client.sqlite");
+	const sqliteFiles = await findNamed(xdgState, "client-schema-10.sqlite");
 	s.check(sqliteFiles.length >= 2, `origin and joining devices persist independent SQLite databases (found ${String(sqliteFiles.length)})`);
 	const originStateDir = dirname(enrollmentPath);
-	const originSqlite = join(originStateDir, "client.sqlite");
+	const originSqlite = join(originStateDir, "client-schema-10.sqlite");
 	const sqliteBefore = await stat(originSqlite);
-	s.check(sqliteBefore.size > 0, "the stopped origin daemon left a non-empty schema-8 SQLite cache");
+	s.check(sqliteBefore.size > 0, "the stopped origin daemon left a non-empty schema-10 SQLite cache");
 	const offlineLocalPath = "offline-local.md";
 	const offlineLocalText = "written while daemon was stopped\n";
 	await writeFile(join(originVault, offlineLocalPath), offlineLocalText, "utf8");
@@ -993,7 +993,7 @@ try {
 	const vaultFiles = await listVaultFiles(originVault);
 	const localState = vaultFiles.filter((path) => {
 		const name = basename(path);
-		return name.startsWith("enrollment.json") || name.startsWith("client.sqlite")
+		return name.startsWith("enrollment.json") || name.startsWith("client-schema-10.sqlite")
 			|| name === "daemon.lock" || name.startsWith(".yaos");
 	});
 	s.check(await readIfExists(join(originStateDir, "daemon.lock")) === null, "state-directory lock is released after clean SIGTERM");

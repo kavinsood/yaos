@@ -4,6 +4,11 @@ import os from "node:os";
 import nodePath from "node:path";
 
 import type { VaultProvisioningProof } from "../../../src/onboarding/provisioningClient";
+import {
+	PROTOCOL_VERSION,
+	SCHEMA_VERSION,
+	STORAGE_FORMAT_VERSION,
+} from "../../../src/sync/schema";
 import type { VaultCapability, VaultRole } from "../../../src/collaboration/authority";
 import { ConfigError, resolveStateDirectoryOverride } from "./config";
 import { ensureDirectoryDurable, writeFileAtomic } from "./fs";
@@ -97,7 +102,7 @@ export function resolveStatePaths(realVaultPath: string, env: NodeJS.ProcessEnv 
 		dir,
 		lockFile: nodePath.join(dir, "daemon.lock"),
 		enrollmentFile: nodePath.join(dir, "enrollment.json"),
-		databaseFile: nodePath.join(dir, "client.sqlite"),
+		databaseFile: nodePath.join(dir, `client-schema-${SCHEMA_VERSION}.sqlite`),
 	};
 }
 
@@ -177,7 +182,9 @@ function readMembership(value: unknown): EnrollmentMembership | null {
 function readProof(value: unknown): VaultProvisioningProof | null {
 	if (value === null) return null;
 	const proof = record(value, "provisioningProof");
-	if (proof.schemaVersion !== 8 || proof.storageFormatVersion !== 4 || proof.protocolVersion !== 5) {
+	if (proof.schemaVersion !== SCHEMA_VERSION
+		|| proof.storageFormatVersion !== STORAGE_FORMAT_VERSION
+		|| proof.protocolVersion !== PROTOCOL_VERSION) {
 		throw new StateProvisioningMismatchError("Enrollment state has incompatible provisioning proof");
 	}
 	const provisionedAt = proof.provisionedAt;
@@ -188,9 +195,9 @@ function readProof(value: unknown): VaultProvisioningProof | null {
 		vaultId: requiredString(proof.vaultId, "provisioningProof.vaultId"),
 		vaultGeneration: requiredString(proof.vaultGeneration, "provisioningProof.vaultGeneration"),
 		provisionedAt: provisionedAt as number,
-		schemaVersion: 8,
-		storageFormatVersion: 4,
-		protocolVersion: 5,
+		schemaVersion: SCHEMA_VERSION,
+		storageFormatVersion: STORAGE_FORMAT_VERSION,
+		protocolVersion: PROTOCOL_VERSION,
 		runtimeEpoch: requiredString(proof.runtimeEpoch, "provisioningProof.runtimeEpoch"),
 	};
 }

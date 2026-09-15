@@ -30,7 +30,7 @@ Environment:
 State:
   YAOS_STATE_DIR is used exactly when set; otherwise state defaults to:
   ~/.local/state/yaos/headless/<vault-name>-<path-hash>/
-  Directories are mode 0700; enrollment.json and client.sqlite are mode 0600.
+  Directories are mode 0700; enrollment.json and client-schema-10.sqlite are mode 0600.
   Use the same YAOS_STATE_DIR for enroll and daemon. Credentials never belong
   in argv, and no state is written inside the vault.
 

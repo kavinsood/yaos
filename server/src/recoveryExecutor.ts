@@ -200,7 +200,7 @@ function validateDescriptor(descriptor: RecoveryJobDescriptor): string {
 		const purge = descriptor as PurgeDescriptor;
 		assertSafeId(purge.deletionId, "deletion id");
 		const prefix = vaultGenerationPrefix(purge.vaultId, purge.vaultGeneration);
-		const expectedPrefixes = [`${prefix}/recovery-v2/`, `${prefix}/blobs/`];
+		const expectedPrefixes = [`${prefix}/recovery-v2/`, `${prefix}/blobs/`, `${prefix}/excalidraw-shares/`];
 		if (purge.allowedPrefixes.length !== expectedPrefixes.length
 			|| purge.allowedPrefixes.some((value, index) => value !== expectedPrefixes[index])) {
 			throw new Error("invalid purge prefixes");

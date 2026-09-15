@@ -555,8 +555,8 @@ s.test("VaultStore completes journal/checkpoint/pin/feed-floor cycle on real SQL
 		s.check(
 			result.metadata.created && result.metadata.replayed && result.metadata.generationFenceRejected
 				&& result.metadata.persisted && result.metadata.bootstrapCycle
-				&& result.metadata.schemaVersion === 8 && result.metadata.storageFormatVersion === 4,
-			"schema-8 metadata persists vaultGeneration and rejects a different provisioning incarnation",
+				&& result.metadata.schemaVersion === 10 && result.metadata.storageFormatVersion === 6,
+			"schema-10 metadata persists vaultGeneration and rejects a different provisioning incarnation",
 		);
 		s.check(result.before.entries === 61 && result.before.bytes > 1_200_000, "real SQLite journal contains the large update plus all semantic body edits");
 		s.check(

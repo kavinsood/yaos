@@ -18,7 +18,7 @@ const ACTOR: VaultActorContext = {
 	deviceId: "device-runtime-0001",
 	deviceCredentialRevision: 1,
 	role: "member",
-	policyVersion: 1,
+	policyVersion: 2,
 	capabilityDigest: "runtime-member-capabilities",
 };
 
@@ -31,7 +31,7 @@ class RuntimeStore {
 			if (this.metadata.vaultId !== vaultId || this.metadata.vaultGeneration !== vaultGeneration) throw new Error("vault generation mismatch");
 			return { ...this.metadata, created: false };
 		}
-		this.metadata = { vaultId, vaultGeneration, schemaVersion: 8, storageFormatVersion: 4, provisionedAt: 1 };
+		this.metadata = { vaultId, vaultGeneration, schemaVersion: 10, storageFormatVersion: 6, provisionedAt: 1 };
 		return { ...this.metadata, created: true };
 	}
 	vaultMetadata() { return this.metadata; }
@@ -123,7 +123,7 @@ function request(path: string, init: RequestInit = {}, trusted = true): Request 
 }
 
 s.test("provisioning is explicit, idempotent, and generation-fenced", async () => {
-	const { server } = makeServer();
+	const { server, store } = makeServer();
 	assert.equal((await server.fetch(request("/status"))).status, 409);
 	const first = await server.fetch(request("/__yaos/provision", { method: "POST", body: JSON.stringify({ vaultGeneration: GENERATION }) }));
 	assert.equal(first.status, 201);
@@ -131,7 +131,11 @@ s.test("provisioning is explicit, idempotent, and generation-fenced", async () =
 	const replay = await server.fetch(request("/__yaos/provision", { method: "POST", body: JSON.stringify({ vaultGeneration: GENERATION }) }));
 	assert.equal(replay.status, 200);
 	assert.equal((await replay.json() as { created: boolean }).created, false);
-	const status = await server.fetch(request("/status"));
+	assert.equal(store.metadata?.vaultGeneration, GENERATION);
+	const statusRequest = request("/status");
+	assert.equal(statusRequest.headers.get("x-yaos-vault-generation"), GENERATION);
+	const status = await server.fetch(statusRequest);
+	assert.equal(status.status, 200);
 	assert.equal((await status.json() as { vaultGeneration: string }).vaultGeneration, GENERATION);
 });
 

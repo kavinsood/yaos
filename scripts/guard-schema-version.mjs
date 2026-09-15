@@ -1,16 +1,21 @@
 #!/usr/bin/env node
 /**
- * Enforce the schema-8 ownership contract.
+ * Enforce the schema-10 ownership contract.
  *
  * The plugin owns its pin in src/sync/schema.ts. The server owns its pin in
  * server/src/shared/productVersions.ts and exposes that same symbol through
  * server/src/version.ts. Both canonical sources must exist, the plugin source
- * must remain on schema 8, and the server source must match it exactly.
+ * must remain on schema 10, and the server source must match it exactly.
  */
 
 import { readFileSync, existsSync } from "node:fs";
 
-const EXPECTED_PLUGIN_SCHEMA_VERSION = 8;
+const EXPECTED_PRODUCT_VERSIONS = Object.freeze({
+	SCHEMA_VERSION: 10,
+	STORAGE_FORMAT_VERSION: 6,
+	PROTOCOL_VERSION: 8,
+	SNAPSHOT_FORMAT_VERSION: 4,
+});
 let failures = 0;
 
 function fail(msg) {
@@ -27,24 +32,27 @@ const SERVER_SCHEMA_SOURCE = "server/src/shared/productVersions.ts";
 const SERVER_VERSION_MODULE = "server/src/version.ts";
 const SERVER_DOCUMENT_STORE = "server/src/vaultDocumentStore.ts";
 
-function readSchemaVersion(path, owner) {
+function readProductVersions(path, owner) {
 	if (!existsSync(path)) {
-		fail(`${path} is missing — ${owner} schema pin cannot be validated.`);
+		fail(`${path} is missing — ${owner} product-version pins cannot be validated.`);
 		return null;
 	}
 
 	const content = readFileSync(path, "utf8");
-	const match = content.match(
-		/^\s*export\s+const\s+SCHEMA_VERSION(?:\s*:\s*number)?\s*=\s*(\d+)(?:\s+as\s+const)?\s*;?\s*$/m,
-	);
-	if (!match) {
-		fail(`${path} does not export SCHEMA_VERSION as a numeric literal.`);
-		return null;
+	const versions = {};
+	for (const name of Object.keys(EXPECTED_PRODUCT_VERSIONS)) {
+		const match = content.match(new RegExp(
+			`^\\s*export\\s+const\\s+${name}(?:\\s*:\\s*number)?\\s*=\\s*(\\d+)(?:\\s+as\\s+const)?\\s*;?\\s*$`,
+			"m",
+		));
+		if (!match) {
+			fail(`${path} does not export ${name} as a numeric literal.`);
+			continue;
+		}
+		versions[name] = Number(match[1]);
+		pass(`${path}: ${name} = ${versions[name]}`);
 	}
-
-	const version = Number(match[1]);
-	pass(`${path}: SCHEMA_VERSION = ${version}`);
-	return version;
+	return versions;
 }
 
 function validateServerVersionModule() {
@@ -97,35 +105,28 @@ function validateServerSqlConstraint() {
 	pass(`${SERVER_DOCUMENT_STORE}: schema_version CHECK derives from SCHEMA_VERSION`);
 }
 
-const pluginSchemaVersion = readSchemaVersion(PLUGIN_SCHEMA_SOURCE, "plugin");
-const serverSchemaVersion = readSchemaVersion(SERVER_SCHEMA_SOURCE, "server");
+const pluginVersions = readProductVersions(PLUGIN_SCHEMA_SOURCE, "plugin");
+const serverVersions = readProductVersions(SERVER_SCHEMA_SOURCE, "server");
 
-if (
-	pluginSchemaVersion !== null &&
-	pluginSchemaVersion !== EXPECTED_PLUGIN_SCHEMA_VERSION
-) {
-	fail(
-		`${PLUGIN_SCHEMA_SOURCE} has SCHEMA_VERSION = ${pluginSchemaVersion}, expected ${EXPECTED_PLUGIN_SCHEMA_VERSION}.`,
-	);
-}
-
-if (
-	pluginSchemaVersion !== null &&
-	serverSchemaVersion !== null &&
-	serverSchemaVersion !== pluginSchemaVersion
-) {
-	fail(
-		`${SERVER_SCHEMA_SOURCE} must pin the plugin's schema version exactly: plugin=${pluginSchemaVersion}, server=${serverSchemaVersion}.`,
-	);
+for (const [name, expected] of Object.entries(EXPECTED_PRODUCT_VERSIONS)) {
+	const pluginVersion = pluginVersions?.[name];
+	const serverVersion = serverVersions?.[name];
+	if (pluginVersion !== undefined && pluginVersion !== expected) {
+		fail(`${PLUGIN_SCHEMA_SOURCE} has ${name} = ${pluginVersion}, expected ${expected}.`);
+	}
+	if (pluginVersion !== undefined && serverVersion !== undefined && serverVersion !== pluginVersion) {
+		const component = name === "SCHEMA_VERSION" ? "schema version" : name;
+		fail(`${SERVER_SCHEMA_SOURCE} must pin the plugin's ${component} exactly: plugin=${pluginVersion}, server=${serverVersion}.`);
+	}
 }
 
 validateServerVersionModule();
-if (serverSchemaVersion !== null) validateServerSqlConstraint();
+if (serverVersions !== null) validateServerSqlConstraint();
 
 if (failures > 0) {
 	console.error(`\nFAIL: ${failures} schema-version guard violation(s).`);
-	console.error(`  ${PLUGIN_SCHEMA_SOURCE} must pin schema ${EXPECTED_PLUGIN_SCHEMA_VERSION}, and`);
-	console.error(`  ${SERVER_SCHEMA_SOURCE} and ${SERVER_VERSION_MODULE} must expose that same exact pin.`);
+	console.error(`  ${PLUGIN_SCHEMA_SOURCE} must pin schema/storage/protocol/snapshot 10/6/8/4, and`);
+	console.error(`  ${SERVER_SCHEMA_SOURCE} must expose those same exact pins.`);
 	process.exit(1);
 } else {
 	console.log("\nPASS: schema version guard — all checks passed.");

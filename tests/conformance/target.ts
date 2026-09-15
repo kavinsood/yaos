@@ -1,7 +1,7 @@
-export const SCHEMA_VERSION = 8 as const;
-export const STORAGE_FORMAT_VERSION = 4 as const;
-export const PROTOCOL_VERSION = 5 as const;
-export const SNAPSHOT_FORMAT_VERSION = 3 as const;
+export const SCHEMA_VERSION = 10 as const;
+export const STORAGE_FORMAT_VERSION = 6 as const;
+export const PROTOCOL_VERSION = 8 as const;
+export const SNAPSHOT_FORMAT_VERSION = 4 as const;
 export const SETTINGS_FORMAT_VERSION = 2 as const;
 
 export type RuntimeName = "wrangler" | "node";

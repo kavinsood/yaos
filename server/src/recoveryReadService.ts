@@ -5,6 +5,8 @@ import {
 	MANIFEST_LOOKUP_MAX_READS,
 	MANIFEST_MAX_COMPRESSED_BYTES,
 	MANIFEST_MAX_DEPTH,
+	RECOVERY_SNAPSHOT_FORMAT,
+	RECOVERY_SNAPSHOT_FORMAT_VERSION,
 	lookupManifestEntry,
 	manifestNodeObjectKey,
 	parseAndVerifySnapshotRoot,
@@ -145,8 +147,8 @@ export class RecoveryReadService {
 		try { unverified = parseCanonicalJson(bytes); }
 		catch { throw new RecoveryReadError("corrupt_snapshot_root", 503); }
 		if (!unverified || typeof unverified !== "object" || Array.isArray(unverified)
-			|| !("format" in unverified) || unverified.format !== "yaos-recovery-v2"
-			|| !("snapshotFormatVersion" in unverified) || unverified.snapshotFormatVersion !== 3) {
+			|| !("format" in unverified) || unverified.format !== RECOVERY_SNAPSHOT_FORMAT
+			|| !("snapshotFormatVersion" in unverified) || unverified.snapshotFormatVersion !== RECOVERY_SNAPSHOT_FORMAT_VERSION) {
 			throw new RecoveryReadError("unsupported_snapshot_format", 409);
 		}
 		let root: SnapshotRootV2;

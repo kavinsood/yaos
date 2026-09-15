@@ -12,9 +12,10 @@ import {
 } from "./recoveryCanonicalJson.js";
 import { safeBlobPath, safeCanvasPath, safeMarkdownPath } from "./shared/vaultPath.js";
 import { MAX_CLIENT_MARKDOWN_BYTES } from "./shared/durableLimits.js";
+import { SNAPSHOT_FORMAT_VERSION } from "./shared/productVersions.js";
 
 export const RECOVERY_SNAPSHOT_FORMAT = "yaos-recovery-v2" as const;
-export const RECOVERY_SNAPSHOT_FORMAT_VERSION = 3 as const;
+export const RECOVERY_SNAPSHOT_FORMAT_VERSION = SNAPSHOT_FORMAT_VERSION;
 export const MANIFEST_BRANCH_FORMAT = "yaos-manifest-branch-v1" as const;
 export const MANIFEST_LEAF_FORMAT = "yaos-manifest-leaf-v1" as const;
 export const MANIFEST_MAX_ENTRIES = 512;

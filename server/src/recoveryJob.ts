@@ -42,6 +42,7 @@ import {
 import {
 	MANIFEST_BRANCH_FORMAT,
 	MANIFEST_MUTATION_CHUNK_ENTRIES,
+	RECOVERY_SNAPSHOT_FORMAT_VERSION,
 	R2ManifestNodeStore,
 	lookupManifestEntry,
 	createEmptyManifestTree,
@@ -1499,7 +1500,7 @@ export class RecoveryJobRuntime {
 		if ("allowedPrefixes" in descriptor) {
 			const purge = descriptor;
 			const prefix = vaultPrefix(descriptor.vaultId, descriptor.vaultGeneration);
-			const expectedPrefixes = [`${prefix}/recovery-v2/`, `${prefix}/blobs/`];
+			const expectedPrefixes = [`${prefix}/recovery-v2/`, `${prefix}/blobs/`, `${prefix}/excalidraw-shares/`];
 			if (purge.allowedPrefixes.length !== expectedPrefixes.length
 				|| purge.allowedPrefixes.some((value, index) => value !== expectedPrefixes[index])) {
 				throw new Error("invalid purge prefixes");
@@ -2441,7 +2442,7 @@ export class RecoveryJobRuntime {
 		if (!rootArtifact) {
 			const root: SnapshotRootV2 = {
 				format: "yaos-recovery-v2",
-				snapshotFormatVersion: 3,
+				snapshotFormatVersion: RECOVERY_SNAPSHOT_FORMAT_VERSION,
 				snapshotId: descriptor.snapshotId,
 				vaultIdHash: await sha256Hex(encoder.encode(descriptor.vaultId)),
 				vaultGenerationHash: await sha256Hex(encoder.encode(descriptor.vaultGeneration)),

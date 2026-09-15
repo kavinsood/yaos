@@ -202,7 +202,7 @@ s.test("purge admission is restricted to the exact generation recovery and blob 
 		capability: "purge-capability",
 		capabilityExpiresAt: 10_000,
 		deletionId: "deletion_1",
-		allowedPrefixes: [`${generationPrefix}/recovery-v2/`, `${generationPrefix}/blobs/`],
+		allowedPrefixes: [`${generationPrefix}/recovery-v2/`, `${generationPrefix}/blobs/`, `${generationPrefix}/excalidraw-shares/`],
 	});
 	let rejected = false;
 	try {
@@ -213,7 +213,11 @@ s.test("purge admission is restricted to the exact generation recovery and blob 
 			capability: "purge-capability",
 			capabilityExpiresAt: 10_000,
 			deletionId: "deletion_1",
-			allowedPrefixes: [`vault/${vaultId}/older-generation/recovery-v2/`, `${generationPrefix}/blobs/`],
+			allowedPrefixes: [
+				`vault/${vaultId}/older-generation/recovery-v2/`,
+				`${generationPrefix}/blobs/`,
+				`${generationPrefix}/excalidraw-shares/`,
+			],
 		});
 	} catch {
 		rejected = true;
@@ -226,7 +230,7 @@ s.test("create-only root publication reuses exact bytes and rejects poisoned obj
 	const prefix = recoveryPrefix(vaultId, vaultGeneration);
 	const encoded = await encodeSnapshotRoot(prefix, {
 		format: "yaos-recovery-v2",
-		snapshotFormatVersion: 3,
+		snapshotFormatVersion: 4,
 		snapshotId: "snapshot_1",
 		vaultIdHash: hashA,
 		vaultGenerationHash: hashB,

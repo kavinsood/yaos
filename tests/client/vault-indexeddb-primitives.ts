@@ -2,7 +2,7 @@ import { strict as assert } from "node:assert";
 import {
 	assertResetAllowed,
 	PendingWorkError,
-	schema6VaultIdbName,
+	schema10VaultIdbName,
 	VaultIndexedDb,
 	type PendingWorkSummary,
 	type StoredCanvasLifecycle,
@@ -24,26 +24,26 @@ const clean: PendingWorkSummary = {
 	activeRecoveryOperations: 0,
 };
 
-s.test("schema-8 databases fence vault generation and local folder identity", () => {
+s.test("schema-10 databases fence vault generation and local folder identity", () => {
 	const legacyCache = vaultIdbName("vault-a", "folder-a");
 	assert.equal(
-		schema6VaultIdbName("vault-a", "generation-a", "folder-a"),
-		"yaos:vault-a:generation-a:folder-a:schema-8",
+		schema10VaultIdbName("vault-a", "generation-a", "folder-a"),
+		"yaos:vault-a:generation-a:folder-a:schema-10",
 	);
-	assert.notEqual(schema6VaultIdbName("vault-a", "generation-a", "folder-a"), legacyCache);
+	assert.notEqual(schema10VaultIdbName("vault-a", "generation-a", "folder-a"), legacyCache);
 	assert.notEqual(
-		schema6VaultIdbName("vault-a", "generation-a", "folder-a"),
-		schema6VaultIdbName("vault-a", "generation-b", "folder-a"),
+		schema10VaultIdbName("vault-a", "generation-a", "folder-a"),
+		schema10VaultIdbName("vault-a", "generation-b", "folder-a"),
 		"destructive reprovisioning never opens the prior generation cache",
 	);
 	assert.notEqual(
-		schema6VaultIdbName("vault-a", "generation-a", "folder-a"),
-		schema6VaultIdbName("vault-a", "generation-a", "folder-b"),
+		schema10VaultIdbName("vault-a", "generation-a", "folder-a"),
+		schema10VaultIdbName("vault-a", "generation-a", "folder-b"),
 		"two local folders enrolled in the same vault never share schema-4 state",
 	);
-	assert.equal(localVaultImportIdbName("vault-a", "folder-a"), `${legacyCache}:schema-8:local-import`);
-	assert.throws(() => schema6VaultIdbName("vault-a", "", "folder-a"), /generation/);
-	assert.throws(() => schema6VaultIdbName("vault-a", "generation-a", ""), /folder key/);
+	assert.equal(localVaultImportIdbName("vault-a", "folder-a"), `${legacyCache}:schema-10:local-import`);
+	assert.throws(() => schema10VaultIdbName("vault-a", "", "folder-a"), /generation/);
+	assert.throws(() => schema10VaultIdbName("vault-a", "generation-a", ""), /folder key/);
 	assert.throws(() => localVaultImportIdbName("", "folder-a"), /vault ID/);
 });
 

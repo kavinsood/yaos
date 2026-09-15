@@ -1,9 +1,10 @@
 import type { VaultSyncSettings } from "../settings";
 import { appendTraceParams, type TraceHttpContext } from "../observability/traceContext";
 import { obsidianRequest } from "../utils/http";
+import { SCHEMA_VERSION, SNAPSHOT_FORMAT_VERSION } from "../sync/schema";
 
-export const RECOVERY_SCHEMA_VERSION = 8 as const;
-export const RECOVERY_SNAPSHOT_FORMAT_VERSION = 3 as const;
+export const RECOVERY_SCHEMA_VERSION = SCHEMA_VERSION;
+export const RECOVERY_SNAPSHOT_FORMAT_VERSION = SNAPSHOT_FORMAT_VERSION;
 export const RECOVERY_MANIFEST_TREE_FORMAT_VERSION = 1 as const;
 const MAX_RECOVERY_CONTENT_BYTES = 10 * 1024 * 1024;
 

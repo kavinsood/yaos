@@ -19,12 +19,12 @@ assert.equal(schema.code, "update_required");
 assert.equal(schema.reason, "schema_mismatch");
 assert.equal(schema.clientSchemaVersion, SCHEMA_VERSION - 1);
 assert.equal(schema.serverSchemaVersion, SCHEMA_VERSION);
-pass("authenticated sockets enforce schema 8");
+pass("authenticated sockets enforce schema 10");
 const protocol = await rejectedSocket(target.deviceA, { ticket: ticket.ticket, schemaVersion: SCHEMA_VERSION, protocolVersion: PROTOCOL_VERSION + 1 });
 assert.equal(protocol.code, "update_required");
 assert.equal(protocol.reason, "protocol_mismatch");
 assert.equal(protocol.serverProtocolVersion, PROTOCOL_VERSION);
-pass("authenticated sockets enforce protocol 5");
+pass("authenticated sockets enforce protocol 8");
 
 const wrongVault = await jsonRequest(`${target.baseUrl}/vault/${encodeURIComponent(`${target.deviceA.vaultId}x`)}/auth/ticket`, {
 	method: "POST", headers: { authorization: `Bearer ${target.deviceA.deviceToken}` },

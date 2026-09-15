@@ -1,6 +1,6 @@
 import { SQLITE_ROW_SAFE_BYTES } from "./shared/durableLimits";
 
-export const RECOVERY_JOB_SCHEMA_VERSION = 3;
+export const RECOVERY_JOB_SCHEMA_VERSION = 4;
 
 export type RecoveryJobKind = "capture" | "projection" | "restore" | "gc" | "purge";
 

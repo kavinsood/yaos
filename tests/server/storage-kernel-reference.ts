@@ -30,12 +30,12 @@ const s = suite("storage-kernel-reference");
 
 s.section("Independent format pins");
 s.check(
-	SCHEMA_VERSION === 8
-		&& STORAGE_FORMAT_VERSION === 4
-		&& PROTOCOL_VERSION === 5
-		&& SNAPSHOT_FORMAT_VERSION === 3
+	SCHEMA_VERSION === 10
+		&& STORAGE_FORMAT_VERSION === 6
+		&& PROTOCOL_VERSION === 8
+		&& SNAPSHOT_FORMAT_VERSION === 4
 		&& SETTINGS_FORMAT_VERSION === 2,
-	"schema/storage/protocol/snapshot/settings formats remain independently pinned to 8/4/5/3/2",
+	"schema/storage/protocol/snapshot/settings formats remain independently pinned to 10/6/8/4/2",
 );
 
 function withVersion(component: keyof ProductVersions, version: number): ProductVersions {
@@ -106,8 +106,8 @@ s.section("Durable generation and runtime epoch are distinct");
 const metadata: VaultMetadata = {
 	vaultId: "vault-reference-01",
 	vaultGeneration: "generation-reference-01",
-	schemaVersion: 8,
-	storageFormatVersion: 4,
+	schemaVersion: 10,
+	storageFormatVersion: 6,
 	provisionedAt: 1,
 };
 const provisioning: VaultProvisioningResult = { ...metadata, created: true };

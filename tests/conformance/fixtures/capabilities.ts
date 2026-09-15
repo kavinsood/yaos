@@ -29,4 +29,4 @@ assert.equal(body.updateProvider, null);
 assert.equal(body.updateRepoUrl, null);
 assert.equal(body.updateRepoBranch, null);
 assert.match(response.headers.get("content-type") ?? "", /^application\/json\b/);
-pass("capabilities freeze schema8/storage4/protocol5/snapshot3/settings2 and the complete feature surface");
+pass("capabilities freeze schema10/storage6/protocol8/snapshot4/settings2 and the complete feature surface");

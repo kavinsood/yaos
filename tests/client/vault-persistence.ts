@@ -4,12 +4,12 @@ import {
 	folderKeySeed,
 	vaultIdbName,
 } from "../../src/sync/vaultPersistence";
-import { schema6VaultIdbName } from "../../src/sync/vaultIndexedDb";
+import { schema10VaultIdbName } from "../../src/sync/vaultIndexedDb";
 import { readSource, suite } from "../harness.ts";
 
 const s = suite("vault-persistence");
 
-s.section("Folder-keyed schema-8 persistence");
+s.section("Folder-keyed schema-10 persistence");
 {
 	s.check(folderKeySeed({ basePath: "/Users/me/Work", vaultName: "Notes" }) === "/Users/me/Work", "base path scopes the folder key");
 	s.check(folderKeySeed({ basePath: "   ", vaultName: "Notes" }) === "Notes", "vault name is the fallback seed");
@@ -18,18 +18,18 @@ s.section("Folder-keyed schema-8 persistence");
 	s.check(folderKey === digest.slice(0, 16), "folder key is the first 16 SHA-256 hex characters");
 	s.check(vaultIdbName("vault-1", folderKey) === `yaos:vault-1:${folderKey}`, "base identity combines vault and local folder");
 	s.check(
-		schema6VaultIdbName("vault-1", "generation-1", folderKey)
-			=== `yaos:vault-1:generation-1:${folderKey}:schema-8`,
-		"schema-8 cache uses a generation-fenced namespace",
+		schema10VaultIdbName("vault-1", "generation-1", folderKey)
+			=== `yaos:vault-1:generation-1:${folderKey}:schema-10`,
+		"schema-10 cache uses a generation-fenced namespace",
 	);
 	s.check(
-		schema6VaultIdbName("vault-1", "generation-1", "folder-a")
-			!== schema6VaultIdbName("vault-1", "generation-1", "folder-b"),
+		schema10VaultIdbName("vault-1", "generation-1", "folder-a")
+			!== schema10VaultIdbName("vault-1", "generation-1", "folder-b"),
 		"two local folders never share body candidates or documents",
 	);
 }
 
-s.section("Runtime uses explicit schema-8 storage and server-derived device receipts");
+s.section("Runtime uses explicit schema-10 storage and server-derived device receipts");
 {
 	const runtime = readSource("src/sync/vaultSync.ts");
 	const database = readSource("src/sync/vaultIndexedDb.ts");

@@ -1,12 +1,17 @@
 import { obsidianRequest } from "../utils/http";
+import {
+	PROTOCOL_VERSION,
+	SCHEMA_VERSION,
+	STORAGE_FORMAT_VERSION,
+} from "../sync/schema";
 
 export interface VaultProvisioningProof {
 	vaultId: string;
 	vaultGeneration: string;
 	provisionedAt: number;
-	schemaVersion: 8;
-	storageFormatVersion: 4;
-	protocolVersion: 5;
+	schemaVersion: typeof SCHEMA_VERSION;
+	storageFormatVersion: typeof STORAGE_FORMAT_VERSION;
+	protocolVersion: typeof PROTOCOL_VERSION;
 	runtimeEpoch: string;
 }
 
@@ -33,16 +38,18 @@ export function readVaultProvisioningProof(value: unknown): VaultProvisioningPro
 		throw new Error("vault status is not an object");
 	}
 	const record = value as Record<string, unknown>;
-	if (record.schemaVersion !== 8 || record.storageFormatVersion !== 4 || record.protocolVersion !== 5) {
+	if (record.schemaVersion !== SCHEMA_VERSION
+		|| record.storageFormatVersion !== STORAGE_FORMAT_VERSION
+		|| record.protocolVersion !== PROTOCOL_VERSION) {
 		throw new Error("vault status has incompatible product versions");
 	}
 	return {
 		vaultId: requiredString(record.vaultId, "vaultId"),
 		vaultGeneration: requiredString(record.vaultGeneration, "vaultGeneration"),
 		provisionedAt: requiredNonNegativeInteger(record.provisionedAt, "provisionedAt"),
-		schemaVersion: 8,
-		storageFormatVersion: 4,
-		protocolVersion: 5,
+		schemaVersion: SCHEMA_VERSION,
+		storageFormatVersion: STORAGE_FORMAT_VERSION,
+		protocolVersion: PROTOCOL_VERSION,
 		runtimeEpoch: requiredString(record.runtimeEpoch, "runtimeEpoch"),
 	};
 }

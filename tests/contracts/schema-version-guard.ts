@@ -2,7 +2,7 @@
 /**
  * Regression coverage for scripts/guard-schema-version.mjs.
  *
- * Schema 8 is pinned in the plugin's sync schema and the server's shared
+ * Schema 9 is pinned in the plugin's sync schema and the server's shared
  * product-version source. The public server version module must derive its
  * schema export from that canonical server pin rather than duplicate a number.
  *
@@ -22,7 +22,11 @@ const guardPath = resolve(repoRoot(), "scripts/guard-schema-version.mjs");
 
 function makePluginFixture(dir: string) {
 	mkdirSync(join(dir, "src/sync"), { recursive: true });
-	writeFileSync(join(dir, "src/sync/schema.ts"), "export const SCHEMA_VERSION = 8;\n");
+	writeFileSync(join(dir, "src/sync/schema.ts"),
+		"export const SCHEMA_VERSION = 10;\n" +
+			"export const STORAGE_FORMAT_VERSION = 6;\n" +
+			"export const PROTOCOL_VERSION = 8;\n" +
+		"export const SNAPSHOT_FORMAT_VERSION = 4;\n");
 }
 
 function writeServerVersionModule(dir: string) {
@@ -34,11 +38,14 @@ function writeServerVersionModule(dir: string) {
 	);
 }
 
-function makeServerFixture(dir: string, schemaVersion: number) {
+function makeServerFixture(dir: string, schemaVersion: number, protocolVersion = 8) {
 	mkdirSync(join(dir, "server/src/shared"), { recursive: true });
 	writeFileSync(
 		join(dir, "server/src/shared/productVersions.ts"),
-		`export const SCHEMA_VERSION = ${schemaVersion};\n`,
+		`export const SCHEMA_VERSION = ${schemaVersion};\n` +
+			"export const STORAGE_FORMAT_VERSION = 6;\n" +
+			`export const PROTOCOL_VERSION = ${protocolVersion};\n` +
+			"export const SNAPSHOT_FORMAT_VERSION = 4;\n",
 	);
 	writeFileSync(
 		join(dir, "server/src/vaultDocumentStore.ts"),
@@ -94,24 +101,24 @@ await withTempDir("yaos-schema-version-guard-", (fixtureDir) => {
 	);
 });
 
-s.section("Test 3: exact schema-8 pins pass");
+s.section("Test 3: exact schema-10 pins pass");
 await withTempDir("yaos-schema-version-guard-", (fixtureDir) => {
 	makePluginFixture(fixtureDir);
-	makeServerFixture(fixtureDir, 8);
+	makeServerFixture(fixtureDir, 10);
 
 	const result = runGuard(fixtureDir);
 
-	s.check(result.status === 0, "guard accepts matching schema-8 source pins");
+	s.check(result.status === 0, "guard accepts matching schema-10 source pins");
 	s.check(
 		result.stdout.includes("PASS: schema version guard — all checks passed."),
-		"guard reports overall success for the exact schema-8 contract",
+		"guard reports overall success for the exact schema-10 contract",
 	);
 });
 
 s.section("Test 4: a stale durable SQL schema constraint fails closed");
 await withTempDir("yaos-schema-version-guard-", (fixtureDir) => {
 	makePluginFixture(fixtureDir);
-	makeServerFixture(fixtureDir, 8);
+	makeServerFixture(fixtureDir, 10);
 	writeFileSync(
 		join(fixtureDir, "server/src/vaultDocumentStore.ts"),
 		'import { SCHEMA_VERSION } from "./shared/productVersions";\n' +
@@ -123,6 +130,19 @@ await withTempDir("yaos-schema-version-guard-", (fixtureDir) => {
 	s.check(
 		result.stderr.includes("must contain exactly one vault_meta schema_version CHECK derived from SCHEMA_VERSION"),
 		"guard reports the stale durable constraint",
+	);
+});
+
+s.section("Test 5: a non-schema product pin mismatch fails closed");
+await withTempDir("yaos-schema-version-guard-", (fixtureDir) => {
+	makePluginFixture(fixtureDir);
+	makeServerFixture(fixtureDir, 9, 5);
+	const result = runGuard(fixtureDir);
+
+	s.check(result.status === 1, "guard exits non-zero when the server protocol pin drifts");
+	s.check(
+		result.stderr.includes("must pin the plugin's PROTOCOL_VERSION exactly"),
+		"guard reports the protocol mismatch as a product-boundary violation",
 	);
 });
 await s.done();

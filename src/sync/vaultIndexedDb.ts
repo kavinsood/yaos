@@ -2,6 +2,7 @@ import { vaultIdbName } from "./vaultPersistence";
 import type { StoredBodySettlement } from "./bodySettlement";
 import type { VaultAuthorityIdentity } from "../collaboration/authority";
 import type { SemanticEpoch } from "@shared/semanticEpoch";
+import { SCHEMA_VERSION } from "./schema";
 
 interface StoredDocumentFields {
 	documentId: string;
@@ -241,7 +242,7 @@ const BODY_SETTLEMENTS = "bodySettlements";
 const CANVAS_CANDIDATES = "canvasCandidates";
 const CANVAS_SETTLEMENTS = "canvasSettlements";
 const CANVAS_LIFECYCLE = "canvasLifecycle";
-const SCHEMA_8_DATABASE_SUFFIX = ":schema-8";
+const CURRENT_SCHEMA_DATABASE_SUFFIX = `:schema-${SCHEMA_VERSION}`;
 
 function transactionDone(transaction: IDBTransaction): Promise<void> {
 	return new Promise((resolve, reject) => {
@@ -258,21 +259,17 @@ function requestValue<T>(request: IDBRequest<T>): Promise<T> {
 	});
 }
 /**
- * Schema-6 state is scoped to one server vault incarnation and local folder.
+ * Schema-10 state is scoped to one server vault incarnation and local folder.
  * A destructive reprovision can never open the prior generation's cache.
  */
-export function schema8VaultIdbName(vaultId: string, vaultGeneration: string, folderKey: string): string {
+export function schema10VaultIdbName(vaultId: string, vaultGeneration: string, folderKey: string): string {
 	if (!vaultId.trim() || !vaultGeneration.trim() || !folderKey.trim()) {
-		throw new Error("vault ID, generation, and folder key are required for schema-8 storage");
+		throw new Error("vault ID, generation, and folder key are required for schema-10 storage");
 	}
-	return `${vaultIdbName(`${vaultId}:${vaultGeneration}`, folderKey)}${SCHEMA_8_DATABASE_SUFFIX}`;
+	return `${vaultIdbName(`${vaultId}:${vaultGeneration}`, folderKey)}${CURRENT_SCHEMA_DATABASE_SUFFIX}`;
 }
 
-/** Compatibility alias for callers which only need deterministic namespace construction. */
-export const schema6VaultIdbName = schema8VaultIdbName;
-
-
-/** One fresh schema-8 database per enrolled vault generation, authority, and local folder. */
+/** One fresh schema-10 database per enrolled vault generation, authority, and local folder. */
 export class VaultIndexedDb {
 	private readonly database: Promise<IDBDatabase>;
 	private readonly databaseName: string;
@@ -283,7 +280,7 @@ export class VaultIndexedDb {
 		folderKey: string,
 		private readonly indexedDb: IDBFactory = window.indexedDB,
 	) {
-		this.databaseName = schema8VaultIdbName(vaultId, vaultGeneration, folderKey);
+		this.databaseName = schema10VaultIdbName(vaultId, vaultGeneration, folderKey);
 		this.database = new Promise((resolve, reject) => {
 			const request = this.indexedDb.open(this.databaseName, DATABASE_VERSION);
 			request.onupgradeneeded = (event) => {

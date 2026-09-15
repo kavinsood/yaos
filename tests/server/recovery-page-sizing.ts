@@ -66,8 +66,8 @@ class PageSizingStore extends VaultStore {
 		return {
 			vaultId,
 			vaultGeneration,
-			schemaVersion: 8 as const,
-			storageFormatVersion: 4 as const,
+			schemaVersion: 10 as const,
+			storageFormatVersion: 6 as const,
 			provisionedAt: 1,
 		};
 	}

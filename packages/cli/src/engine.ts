@@ -560,7 +560,7 @@ export class DaemonEngine {
 		const providerSynced = await vaultSync.waitForProviderSync();
 		if (vaultSync.fatalAuthError) throw this.recordFatalAuth();
 		if (!providerSynced) {
-			throw new StartupError(`Timed out waiting for ${this.membership.host} to synchronize the schema-8 root`);
+			throw new StartupError(`Timed out waiting for ${this.membership.host} to synchronize the schema-10 root`);
 		}
 		await this.admitAuthoritativeDiskChanges(await host.scanMarkdown());
 		await this.admitAuthoritativeCanvasChanges(await host.scanCanvases());

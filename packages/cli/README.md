@@ -36,7 +36,7 @@ By default, YAOS derives a separate state directory for each real vault path:
 ${XDG_STATE_HOME:-~/.local/state}/yaos/headless/<vault-name>-<real-path-hash>/
   daemon.lock
   enrollment.json
-  client.sqlite
+  client-schema-10.sqlite
 ```
 
 Set `YAOS_STATE_DIR` to use an explicit leaf directory instead:

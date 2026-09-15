@@ -122,7 +122,7 @@ async function readBoundedJson(response: Response): Promise<Record<string, unkno
 function exactMembership(payload: Record<string, unknown>, pending: PendingEnrollment): EnrollmentMembership {
 	const keys = Object.keys(payload).sort();
 	if (keys.length !== RESPONSE_KEYS.length || keys.some((key, index) => key !== RESPONSE_KEYS[index])) {
-		throw new EnrollmentError("Enrollment response fields did not match the schema-8 contract");
+		throw new EnrollmentError("Enrollment response fields did not match the schema-10 contract");
 	}
 	const host = requiredBoundedString(payload.host, "host");
 	if (host !== pending.host) throw new EnrollmentError("Enrollment response host does not match YAOS_HOST");
