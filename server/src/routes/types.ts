@@ -6,10 +6,14 @@ export interface Env {
 	YAOS_SYNC: ActorCallPort;
 	YAOS_CONFIG: ActorCallPort;
 	YAOS_RECOVERY_JOBS?: ActorCallPort;
+	YAOS_EXCALIDRAW?: ActorCallPort;
 	YAOS_BUCKET?: ObjectStorePort;
 	socketUpgrades: SocketUpgradePort;
 	YAOS_TICKET_TTL_MS?: string;
 	YAOS_ENABLE_ADMIN_ROUTES?: string;
+	YAOS_EXCALIDRAW_PUBLIC_READ?: string;
+	YAOS_EXCALIDRAW_PUBLIC_WRITE?: string;
+	YAOS_SHARE_ASSETS?: { fetch(request: Request): Promise<Response> };
 }
 
 export type JsonResponse = (body: unknown, status?: number) => Response;

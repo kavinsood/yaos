@@ -2,6 +2,11 @@ name = "yaos"
 main = "src/index.ts"
 compatibility_date = "2026-03-02"
 
+[assets]
+directory = "./public"
+binding = "ASSETS"
+run_worker_first = true
+
 [[durable_objects.bindings]]
 name = "YAOS_SYNC"
 class_name = "VaultSyncServer"
@@ -14,6 +19,10 @@ class_name = "ServerConfig"
 name = "YAOS_RECOVERY_JOBS"
 class_name = "RecoveryJob"
 
+[[durable_objects.bindings]]
+name = "YAOS_EXCALIDRAW"
+class_name = "ExcalidrawRoomDO"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["VaultSyncServer", "ServerConfig"]
@@ -21,6 +30,10 @@ new_sqlite_classes = ["VaultSyncServer", "ServerConfig"]
 [[migrations]]
 tag = "v2"
 new_sqlite_classes = ["RecoveryJob"]
+
+[[migrations]]
+tag = "v3"
+new_sqlite_classes = ["ExcalidrawRoomDO"]
 
 [[r2_buckets]]
 binding = "YAOS_BUCKET"
@@ -39,3 +52,5 @@ enabled = true
 #
 # [vars]
 # YAOS_ENABLE_ADMIN_ROUTES = "true"
+# YAOS_EXCALIDRAW_PUBLIC_READ = "true"
+# YAOS_EXCALIDRAW_PUBLIC_WRITE = "true"

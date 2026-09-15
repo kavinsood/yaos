@@ -18,15 +18,27 @@ const productVersionsSource = readFileSync(
 );
 const wranglerSource = readFileSync(resolve(rootDir, "server/wrangler.toml"), "utf8");
 
-function requireRecoveryDeploymentContract(source) {
-	const binding = /\[\[durable_objects\.bindings\]\][\s\S]*?name\s*=\s*"YAOS_RECOVERY_JOBS"[\s\S]*?class_name\s*=\s*"RecoveryJob"/.test(source);
-	const sqliteClass = /\[\[migrations\]\][\s\S]*?new_sqlite_classes\s*=\s*\[[^\]]*"RecoveryJob"[^\]]*\]/.test(source);
+execFileSync(process.execPath, [resolve(rootDir, "scripts/build-excalidraw-share.mjs")], {
+	cwd: rootDir,
+	stdio: "inherit",
+});
+
+function requireDurableObjectDeploymentContract(source, bindingName, className) {
+	const escapedBinding = bindingName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	const escapedClass = className.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	const binding = new RegExp(
+		`\\[\\[durable_objects\\.bindings\\]\\][\\s\\S]*?name\\s*=\\s*"${escapedBinding}"[\\s\\S]*?class_name\\s*=\\s*"${escapedClass}"`,
+	).test(source);
+	const sqliteClass = new RegExp(
+		`\\[\\[migrations\\]\\][\\s\\S]*?new_sqlite_classes\\s*=\\s*\\[[^\\]]*"${escapedClass}"[^\\]]*\\]`,
+	).test(source);
 	if (!binding || !sqliteClass) {
-		throw new Error("server/wrangler.toml must bind YAOS_RECOVERY_JOBS to the SQLite RecoveryJob class");
+		throw new Error(`server/wrangler.toml must bind ${bindingName} to the SQLite ${className} class`);
 	}
 }
 
-requireRecoveryDeploymentContract(wranglerSource);
+requireDurableObjectDeploymentContract(wranglerSource, "YAOS_RECOVERY_JOBS", "RecoveryJob");
+requireDurableObjectDeploymentContract(wranglerSource, "YAOS_EXCALIDRAW", "ExcalidrawRoomDO");
 
 function readStringConst(source, name) {
 	const match = source.match(new RegExp(`export const ${name} = "([^"]*)";`));
@@ -48,8 +60,8 @@ const schemaVersion = readNumberConst(productVersionsSource, "SCHEMA_VERSION");
 const storageFormatVersion = readNumberConst(productVersionsSource, "STORAGE_FORMAT_VERSION");
 const protocolVersion = readNumberConst(productVersionsSource, "PROTOCOL_VERSION");
 const snapshotFormatVersion = readNumberConst(productVersionsSource, "SNAPSHOT_FORMAT_VERSION");
-if (schemaVersion !== 8 || storageFormatVersion !== 4 || protocolVersion !== 5 || snapshotFormatVersion !== 3) {
-	throw new Error("server product versions must remain schema 8 / storage 4 / protocol 5 / snapshot 3");
+if (schemaVersion !== 10 || storageFormatVersion !== 6 || protocolVersion !== 8 || snapshotFormatVersion !== 4) {
+	throw new Error("server product versions must remain schema 10 / storage 6 / protocol 8 / snapshot 4");
 }
 
 if (serverPackage.version !== serverVersion) {
@@ -64,6 +76,7 @@ const serverReleaseOwnedPaths = [
 	"scripts",
 	"tsconfig.json",
 	"src",
+	"public",
 ];
 const serverReleaseCopyPaths = [...serverReleaseOwnedPaths, "wrangler.toml"];
 

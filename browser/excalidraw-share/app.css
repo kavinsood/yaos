@@ -1,0 +1,103 @@
+@import "@excalidraw/excalidraw/index.css";
+
+:root {
+	color-scheme: light dark;
+	font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+* {
+	box-sizing: border-box;
+}
+
+html,
+body,
+#root,
+.share-shell,
+.share-canvas {
+	width: 100%;
+	height: 100%;
+	margin: 0;
+}
+
+body {
+	overflow: hidden;
+	background: #f8f7fc;
+}
+
+.share-state {
+	display: flex;
+	min-height: 100%;
+	align-items: center;
+	justify-content: center;
+	flex-direction: column;
+	gap: 16px;
+	padding: 32px;
+	color: #2f2b3a;
+}
+
+.share-card {
+	width: min(520px, 100%);
+	padding: 32px;
+	border: 1px solid #ddd8e8;
+	border-radius: 18px;
+	background: #fff;
+	box-shadow: 0 24px 70px rgb(42 33 66 / 12%);
+}
+
+.share-card h1 {
+	margin: 8px 0 12px;
+	font-size: 28px;
+}
+
+.share-kicker {
+	margin: 0;
+	color: #6c5ce7;
+	font-weight: 700;
+	letter-spacing: .08em;
+	text-transform: uppercase;
+}
+
+.share-status {
+	position: fixed;
+	top: 12px;
+	left: 50%;
+	z-index: 10;
+	transform: translateX(-50%);
+	padding: 7px 12px;
+	border: 1px solid rgb(81 69 121 / 18%);
+	border-radius: 999px;
+	background: rgb(255 255 255 / 90%);
+	box-shadow: 0 6px 24px rgb(42 33 66 / 10%);
+	color: #433b59;
+	font-size: 13px;
+	font-weight: 600;
+	backdrop-filter: blur(10px);
+}
+
+.share-spinner {
+	width: 28px;
+	height: 28px;
+	border: 3px solid #ddd8e8;
+	border-top-color: #6c5ce7;
+	border-radius: 50%;
+	animation: share-spin .8s linear infinite;
+}
+
+@keyframes share-spin {
+	to { transform: rotate(360deg); }
+}
+
+@media (prefers-color-scheme: dark) {
+	body,
+	.share-state {
+		background: #17151d;
+		color: #f3f0fa;
+	}
+
+	.share-card,
+	.share-status {
+		border-color: #393344;
+		background: #24212b;
+		color: #f3f0fa;
+	}
+}

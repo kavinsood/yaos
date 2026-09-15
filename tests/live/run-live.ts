@@ -3,6 +3,7 @@ import { randomBytes } from "node:crypto";
 import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { PROTOCOL_VERSION, SCHEMA_VERSION } from "../../src/sync/schema.ts";
 import { sleep } from "../harness.ts";
 import { installLiveAccessTransport, type LiveIdentity, type LiveIdentityContext } from "./liveIdentity.ts";
 
@@ -30,9 +31,18 @@ const LIVE_COMMANDS: readonly LiveCommand[] = [
 	{ file: "ws-ticket-reconnect.ts" },
 	{ file: "ws-admission-protocol.ts" },
 	{ file: "settings-sync.ts" },
+	{ file: "excalidraw.ts" },
 	{ file: "operator-destroy.ts" },
 ];
 const LIVE_NON_SUITES = ["fatalFrame.ts", "liveIdentity.ts", "run-live.ts", "schema4Live.ts"] as const;
+
+function selectedCommands(): readonly LiveCommand[] {
+	const selected = process.env.YAOS_TEST_LIVE_ONLY?.trim();
+	if (!selected) return LIVE_COMMANDS;
+	const command = LIVE_COMMANDS.find(({ file }) => file === selected || file === `${selected}.ts`);
+	if (!command) throw new Error(`YAOS_TEST_LIVE_ONLY does not name a live command: ${selected}`);
+	return [command];
+}
 
 function assertLiveAccountability(): void {
 	const actual = readdirSync(new URL(".", import.meta.url)).filter((name) => name.endsWith(".ts")).sort();
@@ -159,7 +169,8 @@ async function claimEnrollAndProvision(): Promise<LiveIdentityContext> {
 		headers: { Authorization: `Bearer ${deviceA.deviceToken}` },
 	});
 	const status = await statusResponse.json().catch(() => null) as Record<string, unknown> | null;
-	if (!statusResponse.ok || status?.vaultId !== claim.vaultId || status.schemaVersion !== 8 || status.protocolVersion !== 5
+	if (!statusResponse.ok || status?.vaultId !== claim.vaultId || status.schemaVersion !== SCHEMA_VERSION
+		|| status.protocolVersion !== PROTOCOL_VERSION
 		|| typeof status.vaultGeneration !== "string" || typeof status.runtimeEpoch !== "string") {
 		throw new Error(`claimed vault was not active and provisioned: ${JSON.stringify(status)}`);
 	}
@@ -172,7 +183,7 @@ async function claimEnrollAndProvision(): Promise<LiveIdentityContext> {
 	const setCookie = login.headers.get("set-cookie");
 	if (!login.ok || !setCookie) throw new Error(`operator login failed (${login.status})`);
 	const operatorCookie = setCookie.split(";", 1)[0]!;
-	console.log("Live driver claimed and provisioned schema 8, then enrolled distinct A/B devices.");
+	console.log("Live driver claimed and provisioned schema 10, then enrolled distinct A/B devices.");
 	return { deviceA, deviceB, operatorRecoveryKey, operatorCookie, settingsConfigKey: SETTINGS_CONFIG_KEY };
 }
 
@@ -188,13 +199,14 @@ async function main(): Promise<void> {
 		}
 		await waitForWorker();
 		const context = await claimEnrollAndProvision();
-		for (const command of LIVE_COMMANDS) await runCommand(command, context);
+		for (const command of selectedCommands()) await runCommand(command, context);
 		return;
 	}
 	const persistDir = mkdtempSync(join(tmpdir(), "yaos-wrangler-"));
 	const wrangler = spawn(WRANGLER_BIN, [
 		"dev", "--ip", "127.0.0.1", "--port", "8787", "--local-protocol", "http",
 		"--persist-to", persistDir, "--log-level", "error",
+		"--var", "YAOS_EXCALIDRAW_PUBLIC_READ:true", "--var", "YAOS_EXCALIDRAW_PUBLIC_WRITE:true",
 	], {
 		cwd: resolve("server"),
 		stdio: ["ignore", "pipe", "pipe"],
@@ -212,7 +224,7 @@ async function main(): Promise<void> {
 	try {
 		await waitForWorker();
 		const context = await claimEnrollAndProvision();
-		for (const command of LIVE_COMMANDS) await runCommand(command, context);
+		for (const command of selectedCommands()) await runCommand(command, context);
 	} catch (error) {
 		if (output.trim()) console.error(`\n[wrangler output]\n${output.trim()}`);
 		throw error;

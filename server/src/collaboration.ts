@@ -1,6 +1,6 @@
 import { sha256Hex } from "./hex";
 
-export const COLLABORATION_POLICY_VERSION = 1 as const;
+export const COLLABORATION_POLICY_VERSION = 2 as const;
 
 export type VaultRole = "owner" | "member";
 
@@ -28,6 +28,7 @@ export const VAULT_CAPABILITIES = [
 	"vault.metadata.rename",
 	"vault.ownership.transfer",
 	"vault.destroy.request",
+	"vault.excalidraw.shares.manage",
 ] as const;
 
 export type VaultCapability = typeof VAULT_CAPABILITIES[number];
@@ -60,6 +61,7 @@ const OWNER_CAPABILITIES = new Set<VaultCapability>([
 	"vault.metadata.rename",
 	"vault.ownership.transfer",
 	"vault.destroy.request",
+	"vault.excalidraw.shares.manage",
 ]);
 OWNER_CAPABILITIES.delete("vault.leave");
 

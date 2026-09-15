@@ -32,6 +32,7 @@ server/.env
 .wrangler
 server/.partykit
 server/.wrangler
+server/public/share/
 
 # Agent/session artifacts
 session-*.md

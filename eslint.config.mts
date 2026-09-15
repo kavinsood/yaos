@@ -69,6 +69,18 @@ export default tseslint.config(
 		},
 	},
 	{
+		files: ["browser/**/*.ts", "browser/**/*.tsx"],
+		languageOptions: {
+			globals: {
+				...globals.browser,
+			},
+			parserOptions: {
+				project: "./browser/excalidraw-share/tsconfig.json",
+				tsconfigRootDir: import.meta.dirname,
+			},
+		},
+	},
+	{
 		// Benches sit beside the worker rather than under tests/ because they
 		// import server/src and must resolve yjs from server/node_modules — two
 		// copies of Yjs break its constructor checks.  They need the same typed

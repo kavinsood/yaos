@@ -56,19 +56,24 @@ import {
 	handleOperatorState,
 } from "./routes/operator";
 import { handleTicketRoute } from "./routes/ticket";
-import { handleOperatorVaultRuntimeRoute, handleVaultRuntimeRoute, handleVaultSocketRoute, readVault } from "./routes/vault";
+import { handleExcalidrawRoomRoute, handleOperatorVaultRuntimeRoute, handleVaultRuntimeRoute, handleVaultSocketRoute, readVault } from "./routes/vault";
 import type { AuthState, AuthStateCached, Env } from "./routes/types";
 import { decodeCanonicalVaultIdSegment } from "./vaultId";
 import { CloudflareActorCalls, CloudflareObjectStore, CloudflareSocketUpgrades } from "./cloudflarePorts";
 import { authorizeVaultAction } from "./collaboration";
+import { handleExcalidrawShareOwnerRoute, handleExcalidrawSharePublicRoute } from "./routes/excalidrawShares";
 
 interface CloudflareWorkerEnvironment {
 	YAOS_SYNC: DurableObjectNamespace;
 	YAOS_CONFIG: DurableObjectNamespace;
 	YAOS_RECOVERY_JOBS?: DurableObjectNamespace;
+	YAOS_EXCALIDRAW?: DurableObjectNamespace;
 	YAOS_BUCKET?: R2Bucket;
 	YAOS_TICKET_TTL_MS?: string;
 	YAOS_ENABLE_ADMIN_ROUTES?: string;
+	YAOS_EXCALIDRAW_PUBLIC_READ?: string;
+	YAOS_EXCALIDRAW_PUBLIC_WRITE?: string;
+	ASSETS?: Fetcher;
 }
 
 const LOG_PREFIX = "[yaos-sync:worker]";
@@ -77,6 +82,7 @@ type WorkerRoute =
 	| { kind: "cors-preflight" }
 	| { kind: "home" }
 	| { kind: "mobile-setup" }
+	| { kind: "excalidraw-share-app" }
 	| { kind: "capabilities" }
 	| { kind: "claim" }
 	| { kind: "enroll" }
@@ -85,6 +91,7 @@ type WorkerRoute =
 	| { kind: "operator-authorization-retry"; id: string; changeId: string }
 	| { kind: "operator-pairing-revoke" | "operator-revoke"; id: string }
 	| { kind: "update-metadata" }
+	| { kind: "excalidraw-public-share"; action: "session" | "snapshot" | "replay" | "batch" | "ws" | "resource" | "resources"; resourceId?: string }
 	| { kind: "vault"; vaultId: string; rest: string[] }
 	| { kind: "not-found" };
 
@@ -118,6 +125,19 @@ function validVaultRest(method: string, rest: string[]): boolean {
 	if (method === "GET" && rest.length === 2 && rest[0] === "ws" && rest[1] === "root") return true;
 	if (method === "GET" && rest.length === 3 && rest[0] === "ws" && rest[1] === "body" && !!rest[2]) return true;
 	if (method === "GET" && rest.length === 3 && rest[0] === "ws" && rest[1] === "semantic" && !!rest[2]) return true;
+	if (method === "GET" && rest.length === 3 && rest[0] === "ws" && rest[1] === "excalidraw" && !!rest[2]) return true;
+	if (rest.length === 3 && rest[0] === "excalidraw" && !!rest[1] && rest[2] === "shares") {
+		return method === "GET" || method === "POST";
+	}
+	if (rest.length === 4 && rest[0] === "excalidraw" && !!rest[1] && rest[2] === "shares" && !!rest[3]) {
+		return method === "PATCH" || method === "DELETE";
+	}
+	if (rest.length === 3 && rest[0] === "excalidraw" && !!rest[1]) {
+		if (method === "GET") return rest[2] === "snapshot" || rest[2] === "replay";
+		return method === "POST" && (rest[2] === "initialize" || rest[2] === "batch" || rest[2] === "reset");
+	}
+	if (method === "POST" && rest.length === 4 && rest[0] === "excalidraw" && !!rest[1]
+		&& rest[2] === "authority" && ["prepare", "finalize", "lifecycle"].includes(rest[3]!)) return true;
 	if (method === "POST" && rest.length === 3 && rest[0] === "body" && !!rest[1] && rest[2] === "candidate") return true;
 	if (method === "POST" && rest.length === 3 && rest[0] === "semantic" && !!rest[1] && rest[2] === "candidate") return true;
 	if (method === "POST" && rest.length === 2 && rest[0] === "semantic" && rest[1] === "lifecycle") return true;
@@ -159,10 +179,24 @@ export function classifyWorkerRoute(request: Request, url = new URL(request.url)
 	if (request.method === "OPTIONS" && (url.pathname.startsWith("/vault/") || url.pathname.startsWith("/api/") || url.pathname === "/enroll" || url.pathname.startsWith("/operator/"))) return { kind: "cors-preflight" };
 	if (request.method === "GET" && url.pathname === "/") return { kind: "home" };
 	if (request.method === "GET" && url.pathname === "/mobile-setup") return { kind: "mobile-setup" };
+	if (request.method === "GET" && (url.pathname === "/share" || url.pathname === "/share/"
+		|| url.pathname.startsWith("/share/"))) return { kind: "excalidraw-share-app" };
 	if (request.method === "GET" && url.pathname === "/api/capabilities") return { kind: "capabilities" };
 	if (request.method === "POST" && url.pathname === "/claim") return { kind: "claim" };
 	if (request.method === "POST" && url.pathname === "/enroll") return { kind: "enroll" };
 	if (request.method === "POST" && url.pathname === "/api/update-metadata") return { kind: "update-metadata" };
+	const shareBase = "/api/excalidraw/shares/session";
+	if (request.method === "POST" && url.pathname === shareBase) return { kind: "excalidraw-public-share", action: "session" };
+	if (request.method === "GET" && url.pathname === `${shareBase}/snapshot`) return { kind: "excalidraw-public-share", action: "snapshot" };
+	if (request.method === "GET" && url.pathname === `${shareBase}/replay`) return { kind: "excalidraw-public-share", action: "replay" };
+	if (request.method === "POST" && url.pathname === `${shareBase}/batch`) return { kind: "excalidraw-public-share", action: "batch" };
+	if (request.method === "GET" && url.pathname === `${shareBase}/ws`) return { kind: "excalidraw-public-share", action: "ws" };
+	if (request.method === "POST" && url.pathname === `${shareBase}/resources`) return { kind: "excalidraw-public-share", action: "resources" };
+	const shareResource = url.pathname.match(/^\/api\/excalidraw\/shares\/session\/resources\/([^/]+)$/);
+	if (request.method === "GET" && shareResource?.[1]) {
+		const resourceId = safeDecodeUriComponent(shareResource[1]);
+		return resourceId ? { kind: "excalidraw-public-share", action: "resource", resourceId } : { kind: "not-found" };
+	}
 	const fixed: Record<string, WorkerRoute["kind"]> = {
 		"POST /operator/login": "operator-login",
 		"POST /operator/logout": "operator-logout",
@@ -249,6 +283,20 @@ export async function handleWorkerRequest(request: Request, env: Env): Promise<R
 			return response;
 		}
 		if (route.kind === "operator-logout") return handleOperatorLogout(request, env);
+		if (route.kind === "excalidraw-share-app") {
+			if (env.YAOS_EXCALIDRAW_PUBLIC_READ !== "true" || !env.YAOS_SHARE_ASSETS) {
+				return html("<!doctype html><title>YAOS shared drawing unavailable</title><h1>Shared drawing unavailable</h1>", 404);
+			}
+			const asset = await env.YAOS_SHARE_ASSETS.fetch(request);
+			const headers = new Headers(asset.headers);
+			headers.set("Cache-Control", "no-store");
+			headers.set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' wss:; img-src 'self' blob: data:; font-src 'self'; media-src 'none'; object-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'");
+			headers.set("Referrer-Policy", "no-referrer");
+			headers.set("X-Content-Type-Options", "nosniff");
+			headers.set("Cross-Origin-Opener-Policy", "same-origin");
+			headers.set("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+			return new Response(asset.body, { status: asset.status, statusText: asset.statusText, headers });
+		}
 		const authState = await getAuthStateCached(env);
 		let response: Response;
 		if (route.kind === "home") {
@@ -282,6 +330,8 @@ export async function handleWorkerRequest(request: Request, env: Env): Promise<R
 		else if (route.kind === "operator-pairing-revoke") response = withCors(await handleOperatorRevokePairing(request, env, route.id));
 		else if (route.kind === "operator-revoke") response = withCors(await handleOperatorRevokeDevice(request, env, route.id));
 		else if (route.kind === "update-metadata") response = withCors(await handleUpdateMetadataRoute(request, env, authState));
+		else if (route.kind === "excalidraw-public-share") response = await handleExcalidrawSharePublicRoute(request, env,
+			authState, route.action, route.resourceId);
 		else if (route.kind === "vault") {
 			const runtimePath = `/${route.rest.map(encodeURIComponent).join("/")}`;
 			const socket = request.headers.get("upgrade")?.toLowerCase() === "websocket" && route.rest[0] === "ws";
@@ -357,6 +407,13 @@ export async function handleWorkerRequest(request: Request, env: Env): Promise<R
 					}
 				}
 				else if (route.rest[0] === "blobs") response = withCors(await handleBlobRoute(env, route.vaultId, request, route.rest.slice(1), json));
+				else if (route.rest[0] === "excalidraw" && route.rest[1] && route.rest[2] === "shares") {
+					response = withCors(await handleExcalidrawShareOwnerRoute(request, env, authState, route.vaultId,
+						route.rest[1], route.rest[3]));
+				}
+				else if (route.rest[0] === "excalidraw" && route.rest[1] && route.rest[2] !== "authority") {
+					response = withCors(await handleExcalidrawRoomRoute(request, env, route.vaultId, route.rest[1], `/${route.rest[2]}`));
+				}
 				else if (route.rest[0] === "debug" && route.rest[1] === "recent") response = withCors(await handleVaultRuntimeRoute(request, env, route.vaultId, "/diagnostics"));
 				else response = withCors(await handleVaultRuntimeRoute(request, env, route.vaultId, runtimePath));
 				}
@@ -374,12 +431,15 @@ const worker = {
 			YAOS_SYNC: new CloudflareActorCalls(env.YAOS_SYNC),
 			YAOS_CONFIG: new CloudflareActorCalls(env.YAOS_CONFIG),
 			YAOS_RECOVERY_JOBS: env.YAOS_RECOVERY_JOBS ? new CloudflareActorCalls(env.YAOS_RECOVERY_JOBS) : undefined,
+			YAOS_EXCALIDRAW: env.YAOS_EXCALIDRAW ? new CloudflareActorCalls(env.YAOS_EXCALIDRAW) : undefined,
 			YAOS_BUCKET: env.YAOS_BUCKET ? new CloudflareObjectStore(env.YAOS_BUCKET) : undefined,
+			YAOS_SHARE_ASSETS: env.ASSETS,
 			socketUpgrades: new CloudflareSocketUpgrades(),
 		});
 	},
 };
 export { ControlPlaneRuntime, RecoveryJob, RecoveryJobRuntime, ServerConfig, VaultRuntime, VaultSyncServer };
+export { ExcalidrawRoomDO, ExcalidrawRoomRuntime } from "./excalidrawRoom";
 export type {
 	ActorCallPort,
 	AlarmPort,

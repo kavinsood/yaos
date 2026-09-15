@@ -1,0 +1,17 @@
+{
+	"compilerOptions": {
+		"baseUrl": "../..",
+		"paths": {
+			"@shared/*": ["server/src/shared/*"]
+		},
+		"target": "ES2020",
+		"module": "ESNext",
+		"moduleResolution": "bundler",
+		"strict": true,
+		"noUncheckedIndexedAccess": true,
+		"skipLibCheck": true,
+		"lib": ["DOM", "ES2020"],
+		"types": ["react", "react-dom"]
+	},
+	"include": ["app.ts", "../../src/sync/excalidraw/**/*.ts", "../../src/utils/**/*.ts", "../../server/src/shared/**/*.ts"]
+}

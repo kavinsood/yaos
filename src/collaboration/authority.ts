@@ -23,7 +23,8 @@ export type VaultCapability =
 	| "vault.policy.manage"
 	| "vault.metadata.rename"
 	| "vault.ownership.transfer"
-	| "vault.destroy.request";
+	| "vault.destroy.request"
+	| "vault.excalidraw.shares.manage";
 
 export const MEMBER_CAPABILITIES: readonly VaultCapability[] = Object.freeze([
 	"vault.catalog.read",
@@ -53,6 +54,7 @@ export const OWNER_CAPABILITIES: readonly VaultCapability[] = Object.freeze([
 	"vault.metadata.rename",
 	"vault.ownership.transfer",
 	"vault.destroy.request",
+	"vault.excalidraw.shares.manage",
 ]);
 
 const ALL_CAPABILITIES: readonly VaultCapability[] = Object.freeze([
