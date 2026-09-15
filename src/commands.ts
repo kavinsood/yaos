@@ -24,6 +24,8 @@ export interface CommandsRuntimeHost {
 	runSettingsSyncCommand(action: "apply" | "replace" | "seed" | "take" | "defer"): Promise<void>;
 	promoteActiveCanvas(): Promise<void>;
 	demoteActiveCanvas(): Promise<void>;
+	promoteActiveExcalidraw(): Promise<void>;
+	createReadOnlyExcalidrawShare(): Promise<void>;
 	canManageRecovery?(): boolean;
 }
 
@@ -71,6 +73,28 @@ export function registerCommands(
 			const runtime = host.getVaultSync();
 			if (!runtime?.canvases) return false;
 			if (!checking) void host.demoteActiveCanvas().catch((error: unknown) => new Notice(`Canvas demotion failed: ${String(error)}`, 8000));
+			return true;
+		},
+	});
+
+	registrar.addCommand({
+		id: "promote-active-excalidraw",
+		name: "Use realtime scene sync for active Excalidraw drawing",
+		checkCallback: (checking) => {
+			if (!host.getVaultSync()) return false;
+			if (!checking) void host.promoteActiveExcalidraw()
+				.catch((error: unknown) => new Notice(`Excalidraw promotion failed: ${String(error)}`, 8000));
+			return true;
+		},
+	});
+
+	registrar.addCommand({
+		id: "create-read-only-excalidraw-share",
+		name: "Create read-only browser link for active Excalidraw drawing",
+		checkCallback: (checking) => {
+			if (!host.getVaultSync()) return false;
+			if (!checking) void host.createReadOnlyExcalidrawShare()
+				.catch((error: unknown) => new Notice(`Excalidraw sharing failed: ${String(error)}`, 8000));
 			return true;
 		},
 	});

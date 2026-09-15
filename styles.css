@@ -48,6 +48,10 @@
 	box-sizing: border-box;
 }
 
+.yaos-excalidraw-share-link {
+	width: 100%;
+}
+
 .yaos-settings-callout {
 	margin-bottom: 12px;
 }

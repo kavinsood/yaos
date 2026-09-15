@@ -12,7 +12,7 @@ import { SCHEMA_VERSION } from "./sync/schema";
 import { computeFolderKey, folderKeySeedFromVault } from "./sync/vaultPersistence";
 import { EditorBindingManager } from "./sync/editorBinding";
 import { DiskMirror } from "./sync/diskMirror";
-import { VaultIndexedDb } from "./sync/vaultIndexedDb";
+import { schema10VaultIdbName, VaultIndexedDb } from "./sync/vaultIndexedDb";
 import {
 	BootstrapClient,
 	BootstrapHttpPort,
@@ -169,6 +169,16 @@ import {
 	type CollaborationOwnershipTransfer,
 	type SecurityAuditEvent,
 } from "./collaboration/client";
+import { ObsidianExcalidrawHostAdapter } from "./host/obsidianExcalidrawHostAdapter";
+import { ExcalidrawManager, type ExcalidrawCatalogEntry } from "./sync/excalidraw/manager";
+import { ExcalidrawIndexedDbPersistence } from "./sync/excalidraw/persistence";
+import { ExcalidrawProjectionRouter } from "./sync/excalidraw/projectionRouter";
+import { ExcalidrawPromotionCoordinator } from "./sync/excalidraw/promotion";
+import { ExcalidrawLifecycleCoordinator } from "./sync/excalidraw/lifecycle";
+import { ExcalidrawShareManagementClient } from "./sync/excalidraw/shareManagement";
+import { ExcalidrawShareLinkModal } from "./ui/ExcalidrawShareLinkModal";
+import { SameVaultExcalidrawResources, type ExcalidrawResourceStorePort } from "./sync/excalidraw/resources";
+import { ExcalidrawHttpTransport, ExcalidrawMemberSocketTickets } from "./sync/excalidraw/transport";
 
 // Build-time constant injected by esbuild.
 //   production build (main.js):          define __YAOS_QA_HARNESS_ENABLED__ = false
@@ -232,6 +242,13 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private editorBindings: EditorBindingManager | null = null;
 	private diskMirror: DiskMirror | null = null;
 	private canvasProjection: CanvasProjectionRouter | null = null;
+	private excalidrawProjection: ExcalidrawProjectionRouter | null = null;
+	private excalidrawManager: ExcalidrawManager | null = null;
+	private excalidrawHost: ObsidianExcalidrawHostAdapter | null = null;
+	private excalidrawResources: SameVaultExcalidrawResources | null = null;
+	private excalidrawPromotion: ExcalidrawPromotionCoordinator | null = null;
+	private excalidrawLifecycle: ExcalidrawLifecycleCoordinator | null = null;
+	private excalidrawCatalogUnobserve: (() => void) | null = null;
 	private attachmentOrchestrator: AttachmentOrchestrator | null = null;
 	private editorWorkspace: EditorWorkspaceOrchestrator | null = null;
 	private snapshotService: SnapshotService | null = null;
@@ -399,11 +416,14 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	}
 
 	private isMarkdownPathSyncable(path: string): boolean {
-		return isMarkdownSyncable(path, this.excludePatterns, this.getRuntimeConfig().vaultConfigDir);
+		return !this.vaultSync?.pathToSemantic.has(path)
+			&& isMarkdownSyncable(path, this.excludePatterns, this.getRuntimeConfig().vaultConfigDir);
 	}
 
 	private isBlobPathSyncable(path: string): boolean {
-		return !this.vaultSync?.canvases?.isSemanticPath(path)
+		return !this.vaultSync?.pathToSemantic.has(path)
+			&& (this.excalidrawProjection?.shouldPublishAsAttachment(path) ?? true)
+			&& !this.vaultSync?.canvases?.isSemanticPath(path)
 			&& isBlobSyncable(path, this.excludePatterns, this.getRuntimeConfig().vaultConfigDir);
 	}
 
@@ -433,6 +453,65 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		await runtime.canvases.demote(file.path);
 		new Notice("Canvas returned to attachment sync");
 		this.queueReceiptStatusRefresh();
+	}
+
+	private async promoteActiveExcalidraw(): Promise<void> {
+		const file = this.app.workspace.getActiveFile();
+		const runtime = this.vaultSync;
+		const host = this.excalidrawHost;
+		const resources = this.excalidrawResources;
+		const promotion = this.excalidrawPromotion;
+		if (!file || (!file.path.endsWith(".excalidraw") && !file.path.endsWith(".excalidraw.md"))
+			|| !runtime || !host || !resources || !promotion) throw new Error("Open a synchronized Excalidraw drawing first");
+		if (runtime.pathToSemantic.has(file.path)) throw new Error("This drawing already uses semantic sync");
+		const leaf = host.discoverLeaves().find((candidate) =>
+			(candidate.view as unknown as { file?: TFile | null }).file === file);
+		if (!leaf) throw new Error("The active drawing must be open in Excalidraw");
+		const capability = host.capabilities(leaf);
+		if (!capability.realtime) throw new Error(capability.reason ?? "Excalidraw realtime APIs are unavailable");
+		let degradedReason: string | null = null;
+		const binding = host.bind(leaf, {
+			onSceneChange: () => {},
+			onDegraded: (reason) => { degradedReason = reason; },
+		});
+		let snapshot;
+		try { snapshot = await binding.read(); }
+		finally { binding.release(); }
+		if (!snapshot) throw new Error(degradedReason ?? "Could not capture the live Excalidraw scene");
+		const source = file.path.endsWith(".md")
+			? await (async () => {
+				const live = await runtime.getRecoveryLive(file.path);
+				if (!live) throw new Error("The Markdown drawing must finish syncing before promotion");
+				return { kind: "markdown" as const, documentId: live.bodyId, fileId: live.fileId,
+					bodyEpoch: live.bodyEpoch, generation: live.generation,
+					contentHash: live.contentHash, size: live.size };
+			})()
+			: (() => {
+				const ref = runtime.getAttachmentRef(file.path);
+				if (!ref) throw new Error("The drawing attachment must finish syncing before promotion");
+				return { kind: "attachment" as const, revision: ref.revision,
+					contentHash: ref.hash, size: ref.size };
+			})();
+		await promotion.create({ drawingId: randomId(32), path: file.path, source,
+			elements: snapshot.elements, metadata: { resourceManifest: await resources.publish(snapshot.files) } });
+		new Notice("Excalidraw drawing promoted to realtime scene sync");
+		this.queueReceiptStatusRefresh();
+	}
+
+	private async createReadOnlyExcalidrawShare(): Promise<void> {
+		const file = this.app.workspace.getActiveFile();
+		const entry = file ? this.excalidrawManager?.entryForPath(file.path) : null;
+		if (!file || !entry) throw new Error("Open a promoted Excalidraw drawing first");
+		if (!this.settings.host || !this.settings.vaultId || !this.settings.deviceToken) {
+			throw new Error("YAOS enrollment is unavailable");
+		}
+		const share = await new ExcalidrawShareManagementClient(this.settings.host,
+			this.settings.vaultId, this.settings.deviceToken).create(entry.documentId, {
+				permission: "read-only",
+				expiresAt: Date.now() + 24 * 60 * 60 * 1000,
+				resources: [],
+			});
+		new ExcalidrawShareLinkModal(this.app, share.url, share.expiresAt).open();
 	}
 
 	private getRuntimeConfig(): RuntimeConfig {
@@ -969,7 +1048,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					);
 				},
 				log: (message) => this.log(`[sync] ${message}`),
-				onRemoteRootStructuralUpdate: () => this.scheduleSchema4CatchUp("remote-root"),
+				onRemoteRootStructuralUpdate: () => {
+					this.syncExcalidrawLeaves();
+					this.scheduleSchema4CatchUp("remote-root");
+				},
 				onAttachmentReconciliationRequired: () => {
 					this.attachmentReconciliationPending = true;
 					this.reconciliationController.markPending();
@@ -982,7 +1064,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					// Detach first: validation/rebinding is allowed to fail or retry, but
 					// no editor may remain connected to the Y.Doc retired by the reset.
 					if (purpose === "body") this.editorBindings?.unbindByFileId(documentId);
-					else this.editorBindings?.unbindAll();
+					else {
+						this.editorBindings?.unbindAll();
+						this.observeExcalidrawCatalog(runtime);
+					}
 					this.editorWorkspace?.validateOpenBindings(`semantic-epoch-reset:${purpose}:${documentId}`);
 					this.scheduleSchema4CatchUp(`semantic-epoch-reset:${purpose}`);
 				},
@@ -998,6 +1083,49 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			});
 			this.vaultSync = runtime;
 			if (runtime.canvases) canvasProjection.attachManager(runtime.canvases);
+			const excalidrawPersistence = new ExcalidrawIndexedDbPersistence(schema10VaultIdbName(
+				this.settings.vaultId, this.settings.vaultGeneration, folderKey));
+			const excalidrawTickets = new ExcalidrawMemberSocketTickets(this.settings.host,
+				this.settings.vaultId, this.settings.deviceToken);
+			const excalidrawTransport = new ExcalidrawHttpTransport(this.settings.host,
+				this.settings.vaultId, this.settings.deviceToken, excalidrawTickets);
+			const excalidrawResourceStore: ExcalidrawResourceStorePort = {
+				put: async (hash, bytes, mime) => {
+					const owned = new Uint8Array(bytes.byteLength);
+					owned.set(bytes);
+					const response = await obsidianRequest({
+						url: `${this.settings.host.replace(/\/$/, "")}/vault/${encodeURIComponent(this.settings.vaultId)}/blobs/${hash}`,
+						method: "PUT", contentType: mime, body: owned.buffer,
+						headers: { Authorization: `Bearer ${this.settings.deviceToken}` },
+					});
+					if (response.status !== 204) throw new Error(`Excalidraw resource upload failed (${response.status})`);
+				},
+				get: async (hash) => {
+					const response = await obsidianRequest({
+						url: `${this.settings.host.replace(/\/$/, "")}/vault/${encodeURIComponent(this.settings.vaultId)}/blobs/${hash}`,
+						method: "GET", headers: { Authorization: `Bearer ${this.settings.deviceToken}` },
+					});
+					return response.status === 200 ? new Uint8Array(response.arrayBuffer) : null;
+				},
+				resolveVaultResource: async () => null,
+			};
+			this.excalidrawResources = new SameVaultExcalidrawResources(excalidrawResourceStore);
+			this.excalidrawHost = new ObsidianExcalidrawHostAdapter(this.app);
+			this.excalidrawProjection = new ExcalidrawProjectionRouter();
+			this.excalidrawManager = new ExcalidrawManager({
+				host: this.excalidrawHost,
+				persistence: excalidrawPersistence,
+				transport: () => excalidrawTransport,
+				resources: () => this.excalidrawResources!,
+				onDegraded: (path, reason) => this.log(`Excalidraw degraded for "${path}": ${reason}`),
+			});
+			this.excalidrawPromotion = new ExcalidrawPromotionCoordinator(excalidrawPersistence, excalidrawTransport);
+			this.excalidrawLifecycle = new ExcalidrawLifecycleCoordinator(excalidrawPersistence, excalidrawTransport);
+			this.observeExcalidrawCatalog(runtime);
+			void this.excalidrawPromotion.resumeAll()
+				.catch((error) => this.log(`Excalidraw promotion recovery deferred: ${formatUnknown(error)}`));
+			void this.excalidrawLifecycle.resumeAll()
+				.catch((error) => this.log(`Excalidraw lifecycle recovery deferred: ${formatUnknown(error)}`));
 			this.syncCanvasLeaves();
 
 			// 2. EditorBindingManager
@@ -1298,6 +1426,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					runSettingsSyncCommand: (action) => this.runSettingsSyncCommand(action),
 					promoteActiveCanvas: () => this.promoteActiveCanvas(),
 					demoteActiveCanvas: () => this.demoteActiveCanvas(),
+					promoteActiveExcalidraw: () => this.promoteActiveExcalidraw(),
+					createReadOnlyExcalidrawShare: () => this.createReadOnlyExcalidrawShare(),
 				});
 				// Debug-runtime commands are registered separately by the debug runtime.
 				this.lab?.registerCommands(this);
@@ -1351,14 +1481,14 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				}
 			});
 
-			// Materialize the validated schema-8 root and every active body before
+			// Materialize the validated schema-10 root and every active body before
 			// admitting editor/disk events. Bootstrap progress and outstanding
 			// safety settlements are durable in the folder-scoped database.
 			this.updateStatusBar({ kind: "loading_cache" });
 			const bootstrap = this.bootstrapClient;
-			if (!bootstrap) throw new Error("schema-8 bootstrap client is unavailable");
+			if (!bootstrap) throw new Error("schema-10 bootstrap client is unavailable");
 			const bootstrapState = await bootstrap.run();
-			if (abortIfStale("schema-8 bootstrap")) return;
+			if (abortIfStale("schema-10 bootstrap")) return;
 			const outstanding = await database.listOutstanding();
 			this.bootstrapProgress = {
 				stage: bootstrapState.stage,
@@ -1378,7 +1508,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			}
 
 			await this.runReconciliation("authoritative");
-			if (abortIfStale("schema-8 admission")) return;
+			if (abortIfStale("schema-10 admission")) return;
 			this.reconciliationController.lastGeneration = runtime.connectionGeneration;
 			if (providerSynced) this.awaitingFirstProviderSyncAfterStartup = false;
 			if (this.settings.originImportPending) {
@@ -1582,9 +1712,20 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		// Blob renames still go through the batch (blob exclusion is separate).
 		this.registerEvent(
 			this.app.vault.on("rename", (file, oldPath) => {
-				if (!this.reconciliationController.isReconciled) return;
-				if (!(file instanceof TFile)) return;
-				const canvasDocumentId = this.vaultSync?.canvases?.documentIdForPath(oldPath);
+					if (!this.reconciliationController.isReconciled) return;
+					if (!(file instanceof TFile)) return;
+					const excalidrawEntry = this.excalidrawManager?.entryForPath(oldPath);
+					if (excalidrawEntry) {
+						if (!file.path.endsWith(".excalidraw") && !file.path.endsWith(".excalidraw.md")) {
+							this.log(`Excalidraw semantic rename refused outside supported formats: "${oldPath}" -> "${file.path}"`);
+							return;
+						}
+						void this.excalidrawLifecycle?.rename(excalidrawEntry.documentId,
+							excalidrawEntry.drawingEpoch, oldPath, file.path)
+							.catch((error) => this.log(`Excalidraw rename failed: ${formatUnknown(error)}`));
+						return;
+					}
+					const canvasDocumentId = this.vaultSync?.canvases?.documentIdForPath(oldPath);
 				if (canvasDocumentId && this.isCanvasPathSyncable(file.path)) {
 					void this.vaultSync?.canvases?.rename(canvasDocumentId, oldPath, file.path)
 						.catch((error) => this.log(`Canvas rename failed: ${formatUnknown(error)}`));
@@ -1734,10 +1875,17 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 		this.registerEvent(
 			this.app.vault.on("delete", (file) => {
-				if (!this.reconciliationController.isReconciled) return;
-				if (!(file instanceof TFile)) return;
+					if (!this.reconciliationController.isReconciled) return;
+					if (!(file instanceof TFile)) return;
+					const excalidrawEntry = this.excalidrawManager?.entryForPath(file.path);
+					if (excalidrawEntry) {
+						void this.excalidrawLifecycle?.delete(excalidrawEntry.documentId,
+							excalidrawEntry.drawingEpoch, file.path)
+							.catch((error) => this.log(`Excalidraw delete failed for "${file.path}": ${formatUnknown(error)}`));
+						return;
+					}
 
-				if (this.isMarkdownPathSyncable(file.path)) {
+					if (this.isMarkdownPathSyncable(file.path)) {
 					const opId = this.newOpId();
 					if (this.diskMirror?.consumeDeleteSuppression(file.path)) {
 						this.log(`Suppressed delete event for "${file.path}"`);
@@ -1831,6 +1979,28 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	private syncCanvasLeaves(): void {
 		this.canvasProjection?.syncLeaves(this.app.workspace.getLeavesOfType("canvas"));
+		this.syncExcalidrawLeaves();
+	}
+
+	private syncExcalidrawLeaves(): void {
+		const runtime = this.vaultSync;
+		if (!runtime || !this.excalidrawManager || !this.excalidrawProjection) return;
+		const entries: Array<[string, ExcalidrawCatalogEntry]> = [];
+		for (const [path, ref] of runtime.pathToSemantic) if (ref.kind === "excalidraw") {
+			entries.push([path, { documentId: ref.documentId, drawingEpoch: 1,
+				kind: "excalidraw", format: "excalidraw-native", formatVersion: 1 }]);
+		}
+		this.excalidrawProjection.replaceCatalog(entries);
+		this.excalidrawManager.replaceCatalog(entries);
+		this.excalidrawManager.syncLeaves(this.app.workspace.getLeavesOfType("excalidraw"));
+	}
+
+	private observeExcalidrawCatalog(runtime: VaultSync): void {
+		this.excalidrawCatalogUnobserve?.();
+		const catalog = runtime.pathToSemantic;
+		const observer = () => this.syncExcalidrawLeaves();
+		catalog.observe(observer);
+		this.excalidrawCatalogUnobserve = () => catalog.unobserve(observer);
 	}
 
 	// -------------------------------------------------------------------
@@ -1902,6 +2072,14 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				run: () => this.connectionController?.stop(),
 			},
 			{
+				name: "excalidraw",
+				run: () => {
+					this.excalidrawCatalogUnobserve?.();
+					this.excalidrawCatalogUnobserve = null;
+					this.excalidrawManager?.destroy();
+				},
+			},
+			{
 				name: "canvas-projection",
 				run: () => this.canvasProjection?.destroy(),
 			},
@@ -1918,6 +2096,12 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					this.editorBindings = null;
 					this.diskMirror = null;
 					this.canvasProjection = null;
+					this.excalidrawProjection = null;
+					this.excalidrawManager = null;
+					this.excalidrawHost = null;
+					this.excalidrawResources = null;
+					this.excalidrawPromotion = null;
+					this.excalidrawLifecycle = null;
 					this.vaultDatabase = null;
 					this.bootstrapClient = null;
 					this.bodySettlementRepository = null;
@@ -1950,7 +2134,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		new ConfirmModal(
 			this.app,
 			"Reset local cache",
-			"This clears this folder’s schema-8 cache and downloads the vault again. Pending local work must settle first. Continue?",
+			"This clears this folder’s schema-10 cache and downloads the vault again. Pending local work must settle first. Continue?",
 			async () => {
 				const database = this.vaultDatabase;
 				if (!database) return;
@@ -1961,7 +2145,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					await this.initSync(true);
 					new Notice("Cache reset complete.");
 				} catch (error) {
-					console.error("[yaos] Failed to reset schema-8 cache:", error);
+					console.error("[yaos] Failed to reset schema-10 cache:", error);
 					new Notice(`Cache reset refused: ${formatUnknown(error)}`, 8000);
 				}
 			},
@@ -1979,7 +2163,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		new ConfirmModal(
 			this.app,
 			"Nuclear reset",
-			`This durably deletes ${pathCount} synced notes from the server, clears this folder’s schema-8 cache, then imports the current disk files. Continue?`,
+			`This durably deletes ${pathCount} synced notes from the server, clears this folder’s schema-10 cache, then imports the current disk files. Continue?`,
 			async () => {
 				try {
 					const requests = await Promise.all([...runtime.pathToId].map(async ([path, bodyId]) => ({

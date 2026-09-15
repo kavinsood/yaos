@@ -84,6 +84,7 @@ import {
 	prepareRootSemanticEpochTransition,
 	type SemanticEpochTransitionResult,
 } from "./semanticEpochTransition";
+import { isSupportedExcalidrawPath } from "@shared/excalidrawProtocol";
 export const ROOT_DOCUMENT_ID = "root";
 
 export interface SyncAwarenessPort {
@@ -1624,18 +1625,23 @@ export class VaultSync implements SyncRuntimePort {
 	async getRecoveryLive(path: string): Promise<{
 		fileId: string;
 		bodyId: string;
+		bodyEpoch: SemanticEpoch;
 		generation: number;
 		contentHash: string;
+		size: number;
 	} | null> {
 		const bodyId = this.getFileId(path);
 		if (!bodyId) return null;
 		const head = await this.server.currentHead(bodyId);
-		if (!head || head.bodyId !== bodyId || typeof head.contentHash !== "string") return null;
+		if (!head || head.bodyId !== bodyId || typeof head.contentHash !== "string"
+			|| typeof head.size !== "number") return null;
 		return {
 			fileId: bodyId,
 			bodyId,
+			bodyEpoch: head.bodyEpoch,
 			generation: head.generation,
 			contentHash: head.contentHash,
+			size: head.size,
 		};
 	}
 
@@ -2552,6 +2558,12 @@ export class VaultSync implements SyncRuntimePort {
 			);
 			request.candidateId = pending.record.candidateId;
 			request.candidateDigest = pending.record.candidateDigest;
+			await save.call(this.options.database, {
+				...this.toStoredLifecycleOperation(request),
+				content: input.content,
+				batchId,
+				batchIndex: index,
+			});
 			prepared.push({ input, request, pending });
 		}
 
@@ -5193,8 +5205,11 @@ export class VaultSync implements SyncRuntimePort {
 		}
 		const semanticIds = new Set<string>();
 		for (const [path, ref] of this.pathToSemantic) {
-			if (safeCanvasPath(path) !== path || ref.kind !== "canvas" || ref.format !== "json-canvas"
-				|| ref.formatVersion !== 1 || !ref.documentId || semanticIds.has(ref.documentId)) return path;
+			const valid = ref.kind === "canvas"
+				? safeCanvasPath(path) === path && ref.format === "json-canvas" && ref.formatVersion === 1
+				: ref.kind === "excalidraw" && isSupportedExcalidrawPath(path)
+					&& ref.format === "excalidraw-native" && ref.formatVersion === 1;
+			if (!valid || !ref.documentId || semanticIds.has(ref.documentId)) return path;
 			semanticIds.add(ref.documentId);
 		}
 		for (const path of this.blobTombstones.keys()) {

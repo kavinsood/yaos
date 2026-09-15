@@ -12,7 +12,7 @@ For a fresh deployment:
 4. enroll the trusted origin folder as the owner so its local files can enter the current schema;
 5. use **Add my device** for another owner installation or **Invite person** for a collaborator.
 
-There is no in-place migration from any earlier schema or storage format. Preserve ordinary Markdown, Canvas, and attachment files on a trusted device, install the schema-8/storage-4 client and server from scratch, then import those semantic files through normal owner enrollment. Do not manually reuse old Durable Object storage or plugin caches.
+There is no in-place migration from any earlier schema or storage format. Preserve ordinary Markdown, Canvas, Excalidraw, and attachment files on a trusted device, install the schema-10/storage-6 client and server from scratch, then import those semantic files through normal owner enrollment. Do not manually reuse old Durable Object storage or plugin caches.
 
 The Deploy button creates a detached deployment repository. Upstream changes do not update it automatically. After this breaking cutover, ordinary releases can use the generated repository's updater workflow so deployment and rollback remain Git-visible.
 
@@ -49,7 +49,7 @@ YAOS setup code, device bearer, ticket, and revision checks.
 
 ## Required Durable Object configuration
 
-Every current deployment must bind all three Durable Object classes:
+Every current deployment must bind all four Durable Object classes:
 
 ```toml
 [[durable_objects.bindings]]
@@ -63,6 +63,10 @@ class_name = "ServerConfig"
 [[durable_objects.bindings]]
 name = "YAOS_RECOVERY_JOBS"
 class_name = "RecoveryJob"
+
+[[durable_objects.bindings]]
+name = "YAOS_EXCALIDRAW"
+class_name = "ExcalidrawRoomDO"
 ```
 
 The migration history must include the SQLite recovery-job class:
@@ -75,9 +79,53 @@ new_sqlite_classes = ["VaultSyncServer", "ServerConfig"]
 [[migrations]]
 tag = "v2"
 new_sqlite_classes = ["RecoveryJob"]
+
+[[migrations]]
+tag = "v3"
+new_sqlite_classes = ["ExcalidrawRoomDO"]
 ```
 
-`YAOS_RECOVERY_JOBS` and migration `v2` are part of the current deployment shape even when no R2 bucket is configured. Omitting either makes recovery unavailable and prevents safe generation purge when a configured bucket contains vault objects.
+`YAOS_RECOVERY_JOBS`, `YAOS_EXCALIDRAW`, and their migrations are part of the current deployment shape even when no R2 bucket is configured. Omitting them disables recovery or semantic drawing rooms and prevents safe generation purge when a configured bucket contains vault objects.
+
+Public Excalidraw routes are independently default-off. Enable read-only publication with `YAOS_EXCALIDRAW_PUBLIC_READ="true"`; enable public writes only after every RFC-15 write and quarantine gate passes with `YAOS_EXCALIDRAW_PUBLIC_WRITE="true"`. Leaving either variable absent returns `404` before public share work proceeds.
+
+### Read-only Excalidraw browser demo
+
+The current vertical slice supports one concrete journey: promote a drawing in
+Obsidian, create a 24-hour bearer link, open the self-hosted React Excalidraw
+viewer, and watch shape and text changes arrive live from Obsidian. It does not
+publish embedded images, linked notes, auxiliary Markdown, or other vault
+resources.
+
+To enable the demo on a Worker deployment:
+
+1. deploy the current server release, including the `YAOS_EXCALIDRAW` binding,
+   its `v3` migration, and the packaged `public/share` assets;
+2. set the non-secret Worker variable `YAOS_EXCALIDRAW_PUBLIC_READ` to the exact
+   string `true`, then deploy the configuration;
+3. leave `YAOS_EXCALIDRAW_PUBLIC_WRITE` unset;
+4. install the matching YAOS plugin build and the Obsidian Excalidraw plugin;
+5. open a synchronized `.excalidraw` or `.excalidraw.md` file in the Excalidraw
+   view and run **YAOS: Use realtime scene sync for active Excalidraw drawing**;
+6. after promotion succeeds, run **YAOS: Create read-only browser link for
+   active Excalidraw drawing** and choose **Open in browser** or **Copy link**;
+7. keep the drawing open in Obsidian and add, move, resize, or edit a shape or
+   text element. The browser status changes to **Live · read-only** and renders
+   the update without a refresh.
+
+For source deployments, `npm run build:excalidraw-share` creates the ignored
+`server/public/share` tree before `npm --prefix server run deploy`. The normal
+root build and server release builder run this step automatically. The viewer
+ships its pinned Excalidraw code and fonts from the same Worker origin; it does
+not load Excalidraw assets from a third-party CDN.
+
+Each command invocation creates a separate link which expires after 24 hours.
+The fragment secret is removed from browser history during exchange and the
+resulting session is held in an `HttpOnly`, `SameSite=Strict` cookie. The
+current demo has no share-management UI, manual revoke button, resource
+publication, or browser editing. If Cloudflare Access protects the Worker
+hostname, the viewing browser must also satisfy that Access policy; a separate
+public edge boundary remains a release gate for sharing with arbitrary guests.
 
 ## Optional R2 capability
 
@@ -97,7 +145,7 @@ All blob and recovery keys are scoped by both `vaultId` and `vaultGeneration`. D
 
 ## Node server runtime
 
-The Node 24 server uses the same schema-8 collaboration and sync domain runtimes as the Worker. Build with `npm run build:server-node`, then run:
+The Node 24 server uses the same schema-10 collaboration and sync domain runtimes as the Worker. Build with `npm run build:server-node`, then run:
 
 ```sh
 YAOS_NODE_HOST=127.0.0.1 \
@@ -195,7 +243,7 @@ docker compose start server
 
 ## Claim and vault provisioning
 
-Open the fresh server URL and choose **Claim**. Save the operator recovery key; the server stores only its hash. Claim reserves a Personal vault, provisions its schema-8 SQL root in `awaiting_owner`, and returns a one-use owner-bootstrap code. The first successful owner enrollment and authority fence activate the vault. The operator identity controls deployment recovery and provisioning; it is not automatically a content principal.
+Open the fresh server URL and choose **Claim**. Save the operator recovery key; the server stores only its hash. Claim reserves a Personal vault, provisions its schema-10 SQL root in `awaiting_owner`, and returns a one-use owner-bootstrap code. The first successful owner enrollment and authority fence activate the vault. The operator identity controls deployment recovery and provisioning; it is not automatically a content principal.
 
 Provisioning is a three-step saga: registry reservation, idempotent vault-runtime provisioning, then matching-generation activation. A partial failure remains in `provisioning` state with a retryable error and cannot admit devices as an active vault.
 
@@ -213,7 +261,7 @@ Before enrollment, the client persists a random request ID, device ID, bearer, a
 
 An enrolled person can inspect the member roster, rename their own profile and devices, revoke their own non-final device, add another device, or leave if they are a member. The owner can invite/remove members and manage every device. Revoking a member's final active device revokes that membership.
 
-**Leave this vault** revokes the current member and all of their devices when reachable, stops sync, clears this folder's enrollment and schema-8 IndexedDB cache, and keeps ordinary files and configuration on disk. The owner cannot leave or revoke the final owner device. If the owner loses every device, the operator issues an audited one-use owner-recovery code; the operator does not become a vault participant.
+**Leave this vault** revokes the current member and all of their devices when reachable, stops sync, clears this folder's enrollment and schema-10 IndexedDB cache, and keeps ordinary files and configuration on disk. The owner cannot leave or revoke the final owner device. If the owner loses every device, the operator issues an audited one-use owner-recovery code; the operator does not become a vault participant.
 
 Ownership transfer is offered by the current owner to one active member. The target must explicitly accept before one atomic authority fence changes the target to owner and the former owner to member. An unaccepted offer can be cancelled or expires; the vault never exposes zero or two owners.
 
@@ -284,7 +332,7 @@ With recovery capability available:
 
 Capture and restore continue in alarm-driven `RecoveryJob` objects after Obsidian closes. `queued`, active phase, `retrying`, `complete`, `complete_with_gaps`, `failed`, and `cancelled` are meaningful states. Do not report a retry or terminal gap as complete coverage.
 
-Before applying a restore item, the client creates a local backup and verifies that the target has not changed since review. Changed targets are skipped rather than overwritten. Markdown, Canvas, lifecycle, and attachment mutations still pass through normal schema-8 actor authority, semantic epochs, durable receipts, and attachment revision checks. Recovery contains content only; it cannot restore or roll back principals, memberships, devices, codes, transfers, revocations, audit, or settings.
+Before applying a restore item, the client creates a local backup and verifies that the target has not changed since review. Changed targets are skipped rather than overwritten. Markdown, Canvas, Excalidraw, lifecycle, and attachment mutations still pass through normal schema-10 actor authority, semantic epochs, durable receipts, and attachment revision checks. Recovery contains content only; it cannot restore or roll back principals, memberships, devices, codes, transfers, revocations, audit, or settings.
 
 Recovery roots and manifest/content objects are immutable. Recovery catalog deletion, retention, GC, and purge are asynchronous; UI completion means the corresponding durable state reached its terminal contract, not that another device has materialized anything.
 
@@ -306,19 +354,19 @@ Without R2, the purge phase is already complete and SQL cleanup can proceed. A p
 
 Public setup routes are limited to claim, enrollment, and capability discovery. Vault HTTP routes require the device bearer in `Authorization` and the selected vault ID in the route.
 
-The socket ticket endpoint exchanges that bearer for a short-lived protocol-5 ticket bound to the deployment, vault generation, principal/membership revision, device/credential revision, purpose, exact document, and current semantic epoch. Root and body sockets require:
+The socket ticket endpoint exchanges that bearer for a short-lived protocol-8 ticket bound to the deployment, vault generation, principal/membership revision, device/credential revision, purpose, exact document, and current semantic epoch. Root, body, semantic Canvas, and Excalidraw sockets require:
 
 - a valid ticket;
-- document schema `8`;
-- socket protocol `5`;
+- document schema `10`;
+- socket protocol `8`;
 - the current root or body semantic epoch;
 - active matching authority in both the control plane and vault mirror.
 
-The complete version set is document schema `8`, durable SQL format `4`, socket protocol `5`, recovery snapshot format `3`, settings sync format `2`, and control-plane identity format `3`. These pins change only through a coordinated client/server/storage cutover.
+The complete version set is document schema `10`, durable SQL format `6`, socket protocol `8`, recovery snapshot format `4`, settings sync format `2`, and control-plane identity format `3`. These pins change only through a coordinated client/server/storage cutover.
 
-## Installing the schema-8 boundary
+## Installing the schema-10 boundary
 
-Establish a fresh deployment and reinstall clients from ordinary semantic files. Do not point schema-8 clients at earlier Durable Object namespaces or reuse earlier local caches; there is deliberately no compatibility or migration mode.
+Establish a fresh deployment and reinstall clients from ordinary semantic files. Do not point schema-10 clients at earlier Durable Object namespaces or reuse earlier local caches; there is deliberately no compatibility or migration mode.
 
 Future releases may use the generated deployment repository's updater only when their schema, storage, protocol, snapshot, and Durable Object class boundaries remain unchanged. A release changing any pin or required class must declare another fresh or guided cutover rather than relying on code-only revert.
 

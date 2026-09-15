@@ -21,7 +21,7 @@ credentials, invitation secrets, providers, diagnostics, or mutation controls.
 Consumers reacquire after `yaos:api-ready`; unload fences retained handles.
 The contract is in [Public plugin API](public-api.md).
 
-The headless client under `packages/cli` hosts the same `VaultSync`, `BodyManager`, Canvas manager, disk mirrors, and reconciliation policy on a local Linux filesystem. It synchronizes Markdown and closed semantic Canvas files, stores its complete principal/device authority tuple and schema-8 retry/cache state in machine-local SQLite, and never copies another enrollment's bearer.
+The headless client under `packages/cli` hosts the same `VaultSync`, `BodyManager`, Canvas manager, disk mirrors, and reconciliation policy on a local Linux filesystem. It synchronizes Markdown and closed semantic Canvas files, stores its complete principal/device authority tuple and schema-10 retry/cache state in machine-local SQLite, and never copies another enrollment's bearer.
 
 The Cloudflare Worker classes are thin platform wrappers around portable `ControlPlaneRuntime`, `VaultRuntime`, and `RecoveryJobRuntime` compositions. `packages/server-node` supplies Node-specific SQLite/KV, actor, WebSocket, alarm, and filesystem-object mechanisms to those same domain owners; it does not implement a second sync policy.
 
@@ -36,16 +36,16 @@ A physical installation may enroll different folders in different vaults, but ea
 Vault creation is a recoverable provisioning saga:
 
 1. The registry reserves a unique `vaultId` and `vaultGeneration` in `provisioning` state.
-2. The vault Durable Object idempotently creates schema-8 metadata and an empty root in SQLite.
+2. The vault Durable Object idempotently creates schema-10 metadata and an empty root in SQLite.
 3. The registry moves the matching generation to `awaiting_owner` and, for claim, publishes the one-use owner-bootstrap code.
 4. Owner enrollment installs the first complete principal/device authority fence and then activates the vault.
 5. A failure remains recorded as retryable provisioning or authorization-change state; it is not exposed as an active partial vault.
 
 `vaultGeneration` identifies one storage incarnation of a vault and scopes every R2 key and asynchronous job. `runtimeEpoch` identifies one live Durable Object runtime and prevents receipts or capabilities from being mistaken for evidence from another runtime.
 
-## Schema-8 vault authority
+## Schema-9 vault authority
 
-Schema 8 is a greenfield root/Markdown/semantic-Canvas design with human collaboration authority, binary Yjs storage, and semantic epoch resets:
+Schema 9 is a greenfield root/Markdown/semantic-Canvas/Excalidraw design with human collaboration authority, binary Yjs storage for root, Markdown, and Canvas, native Excalidraw scene records, and semantic epoch resets:
 
 - the root Yjs document carries `pathToId`, attachment references and metadata, attachment tombstones, and schema metadata;
 - every Markdown file has a stable file/body identity and its own Yjs document whose text key is `body`;
@@ -92,7 +92,7 @@ The client `SettingsSyncEngine` is a separate serialized lifecycle. It gates on 
 A new or reset client bootstraps without R2:
 
 1. The server flushes loaded documents and creates a time-bounded SQL history pin at one vault sequence.
-2. The client verifies the schema-8 root checkpoint and root epoch.
+2. The client verifies the schema-10 root checkpoint and root epoch.
 3. It pages the SQL catalog and fetches each referenced body at the pinned boundary.
 4. Each body is identity-, generation-, size-, hash-, and path-checked before disk settlement.
 5. The client catches up from the ordered SQL feed, rechecks current heads before mutation, and records unresolved bodies for retry.
@@ -147,11 +147,13 @@ GC marks retained recovery and blob roots, acquires bounded sweep leases, and de
 
 Vault HTTP routes require the device bearer and selected vault ID. The public route resolves the current principal, membership, device credential, role, policy version, capability digest, and active generation, then replaces any caller-supplied actor headers with this trusted context before forwarding. The vault runtime verifies the context against its durable authority mirror and checks the fixed capability for the route. Settings routes additionally bind the environment to the admitted principal and require exactly one `settingsFormatVersion=2`.
 
-A short-lived protocol-5 ticket is deployment-, vault-generation-, principal-, membership-, device-, credential-, purpose-, document-, and semantic-epoch-bound; long-lived credentials never appear in socket URLs. Root, Markdown, and Canvas handshakes require exact `schemaVersion=8` and `protocolVersion=5`. Current control-plane authority is checked before runtime admission and the vault mirror checks it again. Protocol liveness still requires exact per-socket acknowledgements; browser `OPEN` alone is not responsive evidence.
+A short-lived protocol-8 ticket is deployment-, vault-generation-, principal-, membership-, device-, credential-, purpose-, document-, and semantic-epoch-bound; long-lived credentials never appear in socket URLs. Root, Markdown, Canvas, and Excalidraw handshakes require exact `schemaVersion=10` and `protocolVersion=8`. Current control-plane authority is checked before runtime admission and the vault mirror checks it again. Protocol liveness still requires exact per-socket acknowledgements; browser `OPEN` alone is not responsive evidence.
+
+Promoted Excalidraw rooms also carry RFC-14 transient presence on the same authenticated Drawing socket. The Drawing DO keeps one bounded full state per socket in hibernatable attachments, derives identity from the trusted actor, coalesces and expires it, and drops it before durable scene traffic under backpressure. Presence never enters Drawing SQL, scene sequence, replay, receipts, snapshots, resource manifests, Yjs, or the durable client outbox. Obsidian renders native collaborators but does not apply remote viewport/follow state because that host path can dirty persisted AppState.
 
 Revocation or ownership transfer first prevents new admission, then installs one idempotent authority change in the vault mutation order and closes affected sockets. A mutation ordered before the fence remains committed; one ordered after it fails as `authority_superseded`. Exact operation-outcome lookup can recover a bounded receipt for work that committed before a response was lost, but cannot create new work. The client preserves stale-authority work as unpublished rather than replaying it under new authority.
 
-Leaving revokes a member principal and all of their devices, retires only its exact settings queue and acceptance, clears the folder's schema-8 enrollment cache, and leaves ordinary files and configuration on disk. Revoking a last member device has the same membership result. An owner cannot leave or lose the last device through ordinary self-service; owner loss uses an audited operator-issued recovery code. Recovery restores content only and never rewinds principals, devices, invitations, authority changes, or audit.
+Leaving revokes a member principal and all of their devices, retires only its exact settings queue and acceptance, clears the folder's schema-10 enrollment cache, and leaves ordinary files and configuration on disk. Revoking a last member device has the same membership result. An owner cannot leave or lose the last device through ordinary self-service; owner loss uses an audited operator-issued recovery code. Recovery restores content only and never rewinds principals, devices, invitations, authority changes, or audit.
 
 ## Purge-first vault deletion
 

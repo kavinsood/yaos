@@ -1,6 +1,6 @@
 # Sync and conflict contract
 
-This is the current schema-8 contract. [BACKLOG.md](BACKLOG.md) contains only evidenced unresolved risks and missing external-scale proof.
+This is the current schema-10 contract. [BACKLOG.md](BACKLOG.md) contains only evidenced unresolved risks and missing external-scale proof.
 
 ## Subjects
 
@@ -18,16 +18,20 @@ Explicitly promoted JSON Canvas 1.0 files use a dedicated semantic plane with
 stable identity, typed field groups, Y.Text card content, explicit order,
 tombstones, exact common bases, and revision-fenced disk/view projection.
 Unpromoted, invalid, unsupported, or oversized Canvas files remain attachments.
-Excalidraw, Base, and other non-Markdown formats continue to use the attachment
-plane rather than Markdown or Canvas merging.
+Base and other non-Markdown formats continue to use the attachment plane.
+Excalidraw may also be explicitly promoted: it then uses native element records,
+lower-nonce reconciliation, atomic scene batches, Drawing-room replay and
+snapshots, and durable resource manifests rather than Yjs.
 
 ## Vault, membership, and transport scope
 
 One server hosts multiple independent vaults. Each active vault has exactly one owner and any number of members. Both roles are full content peers for the complete vault; only the owner governs membership, other people's devices, recovery, audit, vault policy and metadata, ownership transfer, and destruction. YAOS has no viewer role, delegated administrator, folder ACL, or per-person capability toggle.
 
-A principal is a stable vault-scoped person identity; a device is one separately revocable credential-bearing installation for that principal. **Invite person** creates a member principal and first device. **Add my device** adds a device to the current principal. Both codes are one-use, expire, and are purpose-bound. Each local folder stores its complete principal/membership/device authority tuple and has its own schema-8 IndexedDB database.
+A principal is a stable vault-scoped person identity; a device is one separately revocable credential-bearing installation for that principal. **Invite person** creates a member principal and first device. **Add my device** adds a device to the current principal. Both codes are one-use, expire, and are purpose-bound. Each local folder stores its complete principal/membership/device authority tuple and has its own schema-10 IndexedDB database.
 
-All vault HTTP requests use a device bearer and vault ID. The control plane resolves a trusted actor containing vault generation, principal ID, membership revision, device ID, credential revision, owner/member role, policy version, and capability digest; the vault runtime accepts no caller-asserted identity. WebSocket URLs never carry the long-lived bearer. The client exchanges it for a short-lived protocol-5 ticket bound to the deployment, exact actor, purpose, document, and semantic epoch. Root and body handshakes require exact `schemaVersion=8` and `protocolVersion=5`, the current root/body epoch, current control-plane authority, current vault-mirror authority, and exact application liveness.
+All vault HTTP requests use a device bearer and vault ID. The control plane resolves a trusted actor containing vault generation, principal ID, membership revision, device ID, credential revision, owner/member role, policy version, and capability digest; the vault runtime accepts no caller-asserted identity. WebSocket URLs never carry the long-lived bearer. The client exchanges it for a short-lived protocol-8 ticket bound to the deployment, exact actor, purpose, document, and semantic epoch. Root, body, semantic Canvas, and Excalidraw handshakes require exact `schemaVersion=10` and `protocolVersion=8`, the current semantic epoch, current control-plane authority, current vault-mirror authority, and exact application liveness.
+
+RFC-14 Excalidraw presence shares the Drawing socket but remains outside every durable synchronization contract. Full replacement states are authenticated by their socket actor, bounded, rate-limited, coalesced, and expired after 15 seconds. Receivers derive monotonic local deadlines from relative expiry. Dropped presence is repaired by periodic full-state refresh; it is never replayed and cannot change scene sequence, conflict resolution, resources, files, or recovery state.
 
 Leave revokes a member principal and all of their devices while keeping ordinary files. Revoking a member's final device has the same membership effect. The owner cannot self-leave or revoke the last owner device. Owner loss is repaired by an audited, operator-issued one-use recovery code. Operator destroy revokes the full vault before generation-scoped physical cleanup.
 

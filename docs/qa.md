@@ -2,13 +2,13 @@
 
 QA claims only the surface that was executed. Unit/model tests do not prove Cloudflare deployment behavior, Obsidian filesystem behavior, or mobile lifecycle ordering.
 
-Generated reports and device artifacts belong under ignored `qa-runs/`. Historical runs are not current schema-8 evidence unless they exercise the current principal/device authority, storage, protocol, attachment revision, semantic-epoch, and recovery formats.
+Generated reports and device artifacts belong under ignored `qa-runs/`. Historical runs are not current schema-10 evidence unless they exercise the current principal/device authority, storage, protocol, attachment revision, semantic-epoch, and recovery formats.
 
 ## Current integration evidence
 
-The integrated schema-8 collaboration and pathology redesign has automated evidence from:
+The integrated schema-10 collaboration and pathology redesign has automated evidence from:
 
-- focused schema-8 client, control-plane, vault-authority, settings, Canvas, compaction, and public-API suites;
+- focused schema-10 client, control-plane, vault-authority, settings, Canvas, Excalidraw, compaction, and public-API suites;
 - the complete discovered regression suite;
 - the separately accountable local Wrangler Worker driver;
 - the runtime-blind Wrangler/Node conformance matrix;
@@ -29,7 +29,7 @@ The first attempt exposed a real hibernation boundary: a committed attachment up
 
 Current client suites exercise:
 
-- `onboarding-import.ts`: origin versus joining provisioning, exact schema-8 provisioning proof, bounded initial inventory, and bulk import;
+- `onboarding-import.ts`: origin versus joining provisioning, exact schema-10 provisioning proof, bounded initial inventory, and bulk import;
 - `collaboration-authority.ts`: fixed owner/member roles and capabilities, authority epochs, stale-work rejection, and complete persisted principal/device authority tuples;
 - `body-manager-load-race.ts`: one load winner and no stale IndexedDB overwrite;
 - `bootstrap-http-boundaries.ts`: authenticated root/catalog/body SQL bootstrap routes and generation headers;
@@ -37,7 +37,7 @@ Current client suites exercise:
 - `bootstrap-rename-race.ts`: 200 creates with 100 concurrent renames settle only current heads;
 - `recovery-snapshot-v2.ts`: strict current-format root and manifest parsing;
 - `recovery-backup.ts`: backup-before-replacement and changed-target review;
-- `multivault-enrollment-contract.ts`: complete principal/device authority and schema-8 cache retirement;
+- `multivault-enrollment-contract.ts`: complete principal/device authority and schema-10 cache retirement;
 - existing reconciliation, delete-preservation, editor-binding, diagnostics, attachment-conflict, and lifecycle suites through the full regression discovery.
 - `public-api.ts`: immutable collaboration authority, member/presence projection, preserved-unpublished-work counts, and reload fencing without credential exposure;
 - `attachment-publication-replay.ts`: lost responses, root-persistence failure, stable operation-ID replay, and durable upsert/delete/rename intent;
@@ -56,7 +56,7 @@ These tests use controlled ports and models. They prove policy and orchestration
 
 Current server suites exercise:
 
-- `vault-store-sqlite-cycle.ts`: schema-8 binary journal/checkpoint persistence and reconstruction;
+- `vault-store-sqlite-cycle.ts`: schema-10 binary journal/checkpoint persistence and reconstruction;
 - `vault-server-runtime.ts` and `vault-document-cache.ts`: root/body runtime ownership, persistence, and clean-only cache behavior;
 - `vault-candidate-runtime.ts`: device-scoped candidate identity, digest validation, idempotent receipts, and stale-candidate rejection;
 - `bootstrap-security.ts`: fixed-boundary SQL bootstrap, pins, bounds, and failure behavior;
@@ -66,7 +66,7 @@ Current server suites exercise:
 - `multivault-registry.ts` and `identity-control-plane.ts`: provisioning state, identity-format admission, retryable deletion obligations, and purge identity;
 - `collaboration-control-plane.ts`: principals versus devices, owner/member invariants, invitation/device-link separation, owner governance, accepted ownership transfer, last-owner-device rejection, and exact actor revisions;
 - `vault-collaboration-authority.ts`: trusted actor parsing, forged-header stripping, fixed capability policy, and non-colliding principal settings namespaces;
-- `vault-route-authority.ts` and socket admission suites: principal/device revisions, vault generation, schema 8, protocol 5, purpose/document/epoch ticket binding, and stale-authority rejection.
+- `vault-route-authority.ts` and socket admission suites: principal/device revisions, vault generation, schema 10, protocol 8, purpose/document/epoch ticket binding, and stale-authority rejection.
 - `vault-document-cache.ts`: aggregate encoded-state/transient limits, mixed-size LRU, protected-body refusal, and exactly-once reservation release;
 - identity suites: response-loss-safe enrollment replay and durable retryable device revocation obligations;
 - `settings-sync-store.ts`: SQL seed/replace, monotonic LWW revisions, intents/tombstones, plugin-data gates, atomic failure, JSON/hash/path/count/body bounds, and bounded HTTP reads;
@@ -76,12 +76,12 @@ The full regression runner discovers suites under `tests/client`, `tests/server`
 
 ## Local Worker coverage
 
-`tests/live/run-live.ts` starts one fresh local Wrangler Worker with isolated persistence, claims and provisions schema 8, and enrolls multiple independently credentialed devices under the owner principal. It accounts for every TypeScript file under `tests/live`.
+`tests/live/run-live.ts` starts one fresh local Wrangler Worker with isolated persistence, claims and provisions schema 10, and enrolls multiple independently credentialed devices under the owner principal. It accounts for every TypeScript file under `tests/live`.
 
 The current passing local Worker run covers:
 
 - claim, owner bootstrap, same-principal device link, device roster, device revocation, and consumed-code rejection;
-- exact document schema `7`, socket protocol `4`, and identity format `3` admission;
+- exact document schema `10`, socket protocol `8`, and identity format `3` admission;
 - root and body socket connections using deployment-, actor-, purpose-, and document-bound tickets;
 - device A create/candidate/root publication and device B cold SQL bootstrap;
 - device B durable body edit, device A catch-up, rename publication, delete tombstone, and stale candidate rejection;
