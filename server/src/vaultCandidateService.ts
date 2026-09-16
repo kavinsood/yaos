@@ -1,4 +1,4 @@
-import { MAX_CANDIDATE_BYTES, type DurableReceipt } from "./contracts";
+import { MAX_CANDIDATE_BYTES, MAX_CATCH_UP_BODIES, MAX_CATCH_UP_BYTES, type DurableReceipt } from "./contracts";
 import { sha256Hex } from "./hex";
 import { BoundedBodyError, readBoundedBytes } from "./readBoundedBytes";
 import type { CatalogMutation, VaultStore } from "./vaultStore";
@@ -11,6 +11,13 @@ import {
 import type { VaultLifecycleService } from "./vaultLifecycleService";
 import type { VaultSocketService } from "./vaultSocketService";
 import type { VaultActorContext } from "./collaboration";
+import { decodeBinaryEnvelope } from "./shared/binaryEnvelope";
+import { ywasmCrdtEngine as crdtEngine } from "@yaos/crdt-engine";
+import {
+	MAX_CANDIDATE_UPDATE_BYTES,
+	MAX_CANDIDATE_UPDATE_FRAMES,
+	MAX_DURABLE_UPDATE_BYTES,
+} from "./shared/durableLimits";
 import {
 	BODY_EPOCH_HEADER,
 	SemanticEpochMismatchError,
@@ -32,6 +39,25 @@ function validIdentity(value: string | null): value is string {
 		});
 }
 
+function boundedFrames(value: unknown): readonly Uint8Array[] | null {
+	const frames = value instanceof Uint8Array
+		? [value]
+		: Array.isArray(value) ? value : null;
+	if (!frames || frames.length === 0 || frames.length > MAX_CANDIDATE_UPDATE_FRAMES) return null;
+	let total = 0;
+	for (const frame of frames) {
+		if (!(frame instanceof Uint8Array) || frame.byteLength === 0
+			|| frame.byteLength > MAX_DURABLE_UPDATE_BYTES) return null;
+		total += frame.byteLength;
+		if (!Number.isSafeInteger(total) || total > MAX_CANDIDATE_UPDATE_BYTES) return null;
+	}
+	return frames;
+}
+
+function digestMaterial(frames: readonly Uint8Array[]): Uint8Array {
+	return frames.length === 1 ? frames[0]! : crdtEngine.mergeUpdates(frames);
+}
+
 interface CandidateServiceOptions {
 	store: VaultStore;
 	cache: VaultDocumentCache;
@@ -43,12 +69,75 @@ interface CandidateServiceOptions {
 	flush: (documentId: string) => Promise<boolean>;
 	validateActor: (actor: VaultActorContext) => boolean;
 	shouldPauseAdmission?: (documentId: string) => boolean;
-	onDocumentCommitted?: (documentId: string, ingressBytes: number, commitLatencyMs?: number) => void;
 }
 
 /** Owns device-scoped candidate admission, idempotency, and durable receipts. */
 export class VaultCandidateService {
 	constructor(private readonly options: CandidateServiceOptions) {}
+
+	async handleBatch(request: Request, actor: VaultActorContext): Promise<Response> {
+		let decoded: unknown;
+		try {
+			decoded = decodeBinaryEnvelope(
+				await readBoundedBytes(request, MAX_CATCH_UP_BYTES),
+				MAX_CATCH_UP_BYTES,
+			);
+		} catch {
+			return json({ error: "invalid_candidate_batch" }, 400);
+		}
+		if (typeof decoded !== "object" || decoded === null || Array.isArray(decoded)
+			|| !("candidates" in decoded) || !Array.isArray(decoded.candidates)
+			|| decoded.candidates.length === 0 || decoded.candidates.length > MAX_CATCH_UP_BODIES) {
+			return json({ error: "invalid_candidate_batch" }, 400);
+		}
+		const candidates: Array<{
+			bodyId: string;
+			bodyEpoch: SemanticEpoch;
+			candidateId: string;
+			candidateDigest: string;
+			encodedUpdates: readonly Uint8Array[];
+		}> = [];
+		const bodyIds = new Set<string>();
+		const candidateIds = new Set<string>();
+		for (const value of decoded.candidates) {
+			if (typeof value !== "object" || value === null || Array.isArray(value)) {
+				return json({ error: "invalid_candidate_batch_item" }, 400);
+			}
+			const item = value as Record<string, unknown>;
+			const bodyId = typeof item.bodyId === "string" ? item.bodyId : "";
+			const candidateId = typeof item.candidateId === "string" ? item.candidateId : null;
+			const candidateDigest = typeof item.candidateDigest === "string"
+				? item.candidateDigest.toLowerCase()
+				: "";
+			let bodyEpoch: SemanticEpoch;
+			try { bodyEpoch = parseSemanticEpoch(item.bodyEpoch, "candidate batch body epoch"); }
+			catch { return json({ error: "invalid_candidate_batch_item" }, 400); }
+			const encodedUpdates = boundedFrames(item.encodedUpdates ?? item.encodedUpdate);
+			if (!bodyId || bodyId.length > 256 || !/^[A-Za-z0-9_-]+$/.test(bodyId)
+				|| !validIdentity(candidateId) || !/^[a-f0-9]{64}$/.test(candidateDigest)
+				|| !encodedUpdates
+				|| bodyIds.has(bodyId) || candidateIds.has(candidateId)) {
+				return json({ error: "invalid_candidate_batch_item" }, 400);
+			}
+			bodyIds.add(bodyId);
+			candidateIds.add(candidateId);
+			try {
+				if (await sha256Hex(digestMaterial(encodedUpdates)) !== candidateDigest) {
+					return json({ error: "candidate_digest_mismatch" }, 400);
+				}
+			} catch {
+				return json({ error: "invalid_candidate_batch_item" }, 400);
+			}
+			candidates.push({ bodyId, bodyEpoch, candidateId, candidateDigest, encodedUpdates });
+		}
+		const receipts: DurableReceipt[] = [];
+		for (const candidate of candidates) {
+			const response = await this.handlePrepared({ ...candidate, request, actor, digestValidated: true });
+			if (response.status !== 200) return response;
+			receipts.push(await response.json() as DurableReceipt);
+		}
+		return json({ receipts, highWater: this.options.store.currentSequence() });
+	}
 
 	async handle(bodyId: string, request: Request, suppliedActor?: VaultActorContext): Promise<Response> {
 		const actor = suppliedActor ?? this.legacyActor(request);
@@ -70,6 +159,22 @@ export class VaultCandidateService {
 			const tooLarge = error instanceof BoundedBodyError && error.kind === "body_too_large";
 			return json({ error: error instanceof BoundedBodyError ? error.kind : "candidate_read_failed" }, tooLarge ? 413 : 400);
 		}
+		return this.handlePrepared({ bodyId, bodyEpoch, candidateId, candidateDigest,
+			encodedUpdates: [update], request, actor, digestValidated: false });
+	}
+
+	private async handlePrepared(input: {
+		bodyId: string;
+		bodyEpoch: SemanticEpoch;
+		candidateId: string;
+		candidateDigest: string;
+		encodedUpdates: readonly Uint8Array[];
+		request: Request;
+		actor: VaultActorContext;
+		digestValidated: boolean;
+	}): Promise<Response> {
+		const { bodyId, bodyEpoch, candidateId, candidateDigest, encodedUpdates, request, actor } = input;
+		const deviceId = actor.deviceId;
 		const creation = this.options.store.creationCandidate(bodyId);
 		const catalog = this.options.store.getCatalogHeadAt(this.options.store.currentSequence(), bodyId);
 		if (!creation && (!catalog || catalog.lifecycle !== "active" || catalog.fileId !== bodyId)) return json({ error: "body_not_active" }, 409);
@@ -90,12 +195,18 @@ export class VaultCandidateService {
 			// replays can return without re-entering exact-fence finalization.
 			if (!creation) return json(this.receipt(replay));
 		}
-		const actualDigest = await sha256Hex(update);
-		if (actualDigest !== candidateDigest) return json({ error: "candidate_digest_mismatch" }, 400);
+		const updates = boundedFrames(encodedUpdates);
+		if (!updates) return json({ error: "invalid_candidate_frames" }, 400);
+		if (!input.digestValidated) {
+			let actualDigest: string;
+			try { actualDigest = await sha256Hex(digestMaterial(updates)); }
+			catch { return json({ error: "invalid_candidate_frames" }, 400); }
+			if (actualDigest !== candidateDigest) return json({ error: "candidate_digest_mismatch" }, 400);
+		}
 		if (this.options.shouldPauseAdmission?.(bodyId)) return this.compactionBackpressure();
 		if (!await this.options.flush(bodyId)) return json({ error: "body_persistence_unavailable" }, 503);
 		return this.options.cache.serializeDocument(bodyId, async () => this.commitValidatedCandidate({
-			bodyId, bodyEpoch, request, actor, deviceId, candidateId, candidateDigest, creation, update,
+			bodyId, bodyEpoch, request, actor, deviceId, candidateId, candidateDigest, creation, updates,
 		}));
 	}
 
@@ -108,9 +219,9 @@ export class VaultCandidateService {
 		candidateId: string;
 		candidateDigest: string;
 		creation: ReturnType<VaultStore["creationCandidate"]>;
-		update: Uint8Array;
+		updates: readonly Uint8Array[];
 	}): Promise<Response> {
-		const { bodyId, bodyEpoch, request, actor, deviceId, candidateId, candidateDigest, creation, update } = input;
+		const { bodyId, bodyEpoch, request, actor, deviceId, candidateId, candidateDigest, creation, updates } = input;
 		const currentHead = this.options.store.documentHead(bodyId);
 		if (!currentHead) return json({ error: "body_state_missing" }, 409);
 		// Compaction may have advanced the lineage while this request was being
@@ -127,7 +238,7 @@ export class VaultCandidateService {
 		}
 		let state: Awaited<ReturnType<VaultCandidateService["candidateCatalog"]>>;
 		try {
-			state = await this.candidateCatalog(bodyId, update);
+			state = await this.candidateCatalog(bodyId, updates);
 		} catch (error) {
 			if (error instanceof VaultDocumentValidationError && error.reason === "candidate_markdown_not_canonical") {
 				return json({ error: "candidate_markdown_not_canonical" }, 409);
@@ -142,7 +253,6 @@ export class VaultCandidateService {
 			throw error;
 		}
 		let durable;
-		const commitStartedAt = performance.now();
 		try {
 			if (!(this.options.validateActor?.(actor) ?? true)) {
 				this.options.cache.discardValidatedBodyUpdate(bodyId);
@@ -154,7 +264,7 @@ export class VaultCandidateService {
 				clientId: deviceId,
 				candidateId,
 				candidateDigest,
-				update,
+				updates,
 				catalog: state.catalog,
 				expectedHead: state.expectedHead,
 				changesState: state.changesState,
@@ -170,7 +280,6 @@ export class VaultCandidateService {
 			}
 			durable = current;
 		}
-		const commitLatencyMs = performance.now() - commitStartedAt;
 		const creationResult = creation
 			? this.options.lifecycle().finalizeCreation(creation, durable, state.metadata, actor)
 			: "committed";
@@ -178,18 +287,16 @@ export class VaultCandidateService {
 			// The body candidate is already durable even though root publication is
 			// temporarily fenced. Keep the resident document aligned with storage;
 			// lifecycle recovery will publish or retire it.
-			this.options.cache.commitValidatedBodyUpdate(bodyId, update, durable.durableGeneration,
+			this.options.cache.commitValidatedBodyUpdate(bodyId, updates, durable.durableGeneration,
 				this.options.cache.get(bodyId)!.semanticEpoch, request, state.validated);
-			if (state.changesState) this.options.onDocumentCommitted?.(bodyId, update.byteLength, commitLatencyMs);
 			this.options.cache.removePendingDigest(bodyId, candidateDigest);
 			return json({ error: "recovery_boundary_in_progress" }, 409);
 		}
-		if (this.options.cache.commitValidatedBodyUpdate(bodyId, update, durable.durableGeneration,
+		if (this.options.cache.commitValidatedBodyUpdate(bodyId, updates, durable.durableGeneration,
 			this.options.cache.get(bodyId)!.semanticEpoch, request, state.validated)
 			&& creationResult !== "superseded") {
-			this.options.sockets().broadcastDocumentUpdate(bodyId, update, request);
+			for (const update of updates) this.options.sockets().broadcastDocumentUpdate(bodyId, update, request);
 		}
-		if (state.changesState) this.options.onDocumentCommitted?.(bodyId, update.byteLength, commitLatencyMs);
 		this.options.cache.removePendingDigest(bodyId, candidateDigest);
 		if (creationResult !== "superseded") {
 			this.options.sockets().notifyBodyCommitted(bodyId, durable.durableGeneration, durable.vaultSequence);
@@ -204,7 +311,7 @@ export class VaultCandidateService {
 			role: "member", policyVersion: 1, capabilityDigest: "legacy" };
 	}
 
-	private async candidateCatalog(bodyId: string, update: Uint8Array): Promise<{
+	private async candidateCatalog(bodyId: string, updates: readonly Uint8Array[]): Promise<{
 		metadata: { contentHash: string; size: number };
 		catalog?: CatalogMutation;
 		expectedHead: { generation: number; semanticEpoch: SemanticEpoch; latestSequence: number } | null;
@@ -218,7 +325,7 @@ export class VaultCandidateService {
 			}
 			return true;
 		});
-		const validated = this.options.cache.validateBodyUpdate(bodyId, update);
+		const validated = this.options.cache.validateBodyUpdate(bodyId, updates);
 		try {
 			const metadata = { contentHash: await sha256Hex(validated.contentBytes), size: validated.contentBytes.byteLength };
 			const current = this.options.store.getCatalogHeadAt(this.options.store.currentSequence(), bodyId);

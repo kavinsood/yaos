@@ -4,8 +4,10 @@ import * as encoding from "lib0/encoding";
 import * as syncProtocol from "y-protocols/sync";
 import { applyAwarenessUpdate, Awareness, encodeAwarenessUpdate } from "y-protocols/awareness";
 import * as Y from "yjs";
+import { ywasmCrdtEngine as testCrdtEngine } from "../../packages/server-node/src/ywasmNodeCrdtEngine";
 import { encodeRootPathPublicationUpdate } from "../../server/src/server";
 import { AUTHORITY_SUPERSEDED_SOCKET_CLOSE_CODE } from "../../server/src/shared/socketCloseCodes";
+import { MAX_CLIENT_MARKDOWN_BYTES } from "../../server/src/shared/durableLimits";
 import { SEMANTIC_EPOCH_RESET_SOCKET_CLOSE_CODE } from "../../server/src/shared/semanticEpoch";
 import { VaultDocumentCachePressureError, VaultDocumentValidationError } from "../../server/src/vaultDocumentCache";
 import {
@@ -167,17 +169,27 @@ s.test("stale-generation sockets are fenced before decoding or document access",
 });
 
 s.test("root socket validation rejects structural changes and accepts duplicate state", () => {
-	const current = new Y.Doc({ guid: "root" });
-	current.getMap("sys").set("schemaVersion", 6);
-	const duplicate = Y.encodeStateAsUpdate(current);
-	assert.equal(rootUpdateChangesDocument(current, duplicate), false);
+	const oracle = new Y.Doc({ guid: "root" });
+	oracle.getMap("sys").set("schemaVersion", 6);
+	const duplicate = Y.encodeStateAsUpdate(oracle);
+	const current = testCrdtEngine.openDocument("root", duplicate);
+	assert.equal(rootUpdateChangesDocument(current, duplicate, testCrdtEngine), false);
 	const changed = new Y.Doc({ guid: "root" });
 	Y.applyUpdate(changed, duplicate);
 	const vector = Y.encodeStateVector(changed);
 	changed.getMap("pathToId").set("ghost.md", "ghost-body");
-	assert.equal(rootUpdateChangesDocument(current, Y.encodeStateAsUpdate(changed, vector)), true);
-	current.destroy();
+	assert.equal(rootUpdateChangesDocument(current, Y.encodeStateAsUpdate(changed, vector), testCrdtEngine), true);
+	const deleted = new Y.Doc({ guid: "root" });
+	Y.applyUpdate(deleted, duplicate);
+	const deletionVector = Y.encodeStateVector(deleted);
+	deleted.getMap("sys").delete("schemaVersion");
+	assert.equal(rootUpdateChangesDocument(
+		current, Y.encodeStateAsUpdate(deleted, deletionVector), testCrdtEngine,
+	), true, "delete-only updates change full state even when their state vector does not advance");
+	testCrdtEngine.destroyDocument(current);
+	oracle.destroy();
 	changed.destroy();
+	deleted.destroy();
 });
 
 s.test("download-only root sockets accept the empty Yjs handshake but reject client structs", async () => {
@@ -189,6 +201,7 @@ s.test("download-only root sockets accept the empty Yjs handshake but reject cli
 		close: (code = 1000, reason = "") => { close = { code, reason }; },
 	};
 	const service = new VaultSocketService({
+		crdtEngine: testCrdtEngine,
 		sockets: registry([socket]),
 		cache: {
 			load: () => ({ semanticEpoch: attachment.documentEpoch }),
@@ -210,7 +223,7 @@ s.test("download-only root sockets accept the empty Yjs handshake but reject cli
 	const empty = new Y.Doc({ guid: "empty-root-peer" });
 	const emptyUpdate = Y.encodeStateAsUpdate(empty);
 	empty.destroy();
-	assert.equal(isStructurallyEmptyYjsUpdate(emptyUpdate), true);
+	assert.equal(isStructurallyEmptyYjsUpdate(emptyUpdate, testCrdtEngine), true);
 	await service.message(socket, frame(emptyUpdate));
 	assert.equal(close, null, "protocol-required empty sync step does not disconnect the root");
 
@@ -218,20 +231,23 @@ s.test("download-only root sockets accept the empty Yjs handshake but reject cli
 	changed.getMap("pathToId").set("ghost.md", "ghost-body");
 	const changedUpdate = Y.encodeStateAsUpdate(changed);
 	changed.destroy();
-	assert.equal(isStructurallyEmptyYjsUpdate(changedUpdate), false);
+	assert.equal(isStructurallyEmptyYjsUpdate(changedUpdate, testCrdtEngine), false);
 	await service.message(socket, frame(changedUpdate));
 	assert.deepEqual(close, { code: 1008, reason: "root updates require durable publication" });
 });
 
 s.test("body socket admission rejects a bounded update that grows Markdown beyond recovery limits", () => {
-	const current = new Y.Doc({ guid: "body-size-admission" });
-	const candidate = new Y.Doc({ guid: "body-size-admission" });
+	const current = testCrdtEngine.createDocument("body-size-admission");
+	const candidate = new Y.Doc({ guid: "body-size-admission-source" });
+	const prefixBytes = MAX_CLIENT_MARKDOWN_BYTES - (1024 * 1024);
+	candidate.getText("body").insert(0, "x".repeat(prefixBytes));
+	testCrdtEngine.applyUpdate(current, Y.encodeStateAsUpdate(candidate), "body-size-fixture");
 	const vector = Y.encodeStateVector(candidate);
-	candidate.getText("body").insert(0, "x".repeat(1_500_001));
+	candidate.getText("body").insert(candidate.getText("body").length, "y".repeat((1024 * 1024) + 1));
 	const update = Y.encodeStateAsUpdate(candidate, vector);
 	assert.ok(update.byteLength < 1_750_000, "fixture must pass the per-frame durable update gate");
-	assert.equal(bodyUpdateAdmissionError(current, update), "markdown_size_limit");
-	current.destroy();
+	assert.equal(bodyUpdateAdmissionError(current, update, testCrdtEngine), "markdown_size_limit");
+	testCrdtEngine.destroyDocument(current);
 	candidate.destroy();
 });
 
@@ -473,22 +489,37 @@ s.test("direct protected attachment-map mutations are detected and validated", (
 	const vector = Y.encodeStateVector(root);
 	root.getMap("pathToBlob").set("assets/image.png", { hash: "a".repeat(64), size: 1, revision: "operation-valid" });
 	const safeUpdate = Y.encodeStateAsUpdate(root, vector);
-	const empty = new Y.Doc({ guid: "empty-root" });
-	assert.equal(rootUpdateChangesProtectedAttachmentMaps(empty, safeUpdate), true);
-	assert.equal(rootUpdateHasSafeAttachmentSemantics(empty, safeUpdate), true);
+	const empty = testCrdtEngine.createDocument("empty-root");
+	assert.equal(rootUpdateChangesProtectedAttachmentMaps(empty, safeUpdate, testCrdtEngine), true);
+	assert.equal(rootUpdateHasSafeAttachmentSemantics(empty, safeUpdate, testCrdtEngine), true);
 	const unsafe = new Y.Doc({ guid: "unsafe-root" });
 	Y.applyUpdate(unsafe, Y.encodeStateAsUpdate(root));
 	const unsafeVector = Y.encodeStateVector(unsafe);
 	unsafe.getMap("pathToBlob").set("../escape", { hash: "b".repeat(64), size: 1 });
-	assert.equal(rootUpdateHasSafeAttachmentSemantics(root, Y.encodeStateAsUpdate(unsafe, unsafeVector)), false);
+	const current = testCrdtEngine.openDocument("root-current", Y.encodeStateAsUpdate(root));
+	assert.equal(rootUpdateHasSafeAttachmentSemantics(
+		current, Y.encodeStateAsUpdate(unsafe, unsafeVector), testCrdtEngine,
+	), false);
+	const sharedValue = new Y.Doc({ guid: "shared-attachment-root" });
+	const sharedVector = Y.encodeStateVector(sharedValue);
+	const nested = new Y.Map<unknown>();
+	nested.set("hash", "c".repeat(64));
+	nested.set("size", 1);
+	nested.set("revision", "shared-value-is-not-a-plain-record");
+	sharedValue.getMap("pathToBlob").set("assets/shared.png", nested);
+	assert.equal(rootUpdateHasSafeAttachmentSemantics(
+		empty, Y.encodeStateAsUpdate(sharedValue, sharedVector), testCrdtEngine,
+	), false, "engine-owned nested shared types cannot masquerade as plain attachment records");
 	root.destroy();
-	empty.destroy();
+	testCrdtEngine.destroyDocument(empty);
+	testCrdtEngine.destroyDocument(current);
 	unsafe.destroy();
+	sharedValue.destroy();
 });
 
 s.test("body sockets reject invalid semantic roots before queue, apply, broadcast, or flush", async () => {
 	const bodyId = "body-semantic-authority-0001";
-	const loaded = new Y.Doc({ guid: bodyId });
+	const loaded = testCrdtEngine.createDocument(bodyId);
 	const malicious = new Y.Doc({ guid: bodyId });
 	malicious.getMap<number>("frontmatter:meta").set("format", 1);
 	malicious.getMap("frontmatter:future-root").set("payload", "not admitted");
@@ -512,7 +543,7 @@ s.test("body sockets reject invalid semantic roots before queue, apply, broadcas
 			load: () => ({ doc: loaded, generation: 1, semanticEpoch: 1 }),
 			serializeDocument: async (_documentId: string, operation: () => Promise<unknown>) => operation(),
 			validateBodyUpdate: (_documentId: string, update: Uint8Array) => {
-				const reason = bodyUpdateAdmissionError(loaded, update);
+				const reason = bodyUpdateAdmissionError(loaded, update, testCrdtEngine);
 				if (reason) throw new VaultDocumentValidationError(reason);
 				throw new Error("fixture expected an invalid update");
 			},
@@ -531,10 +562,10 @@ s.test("body sockets reject invalid semantic roots before queue, apply, broadcas
 	assert.deepEqual(close, { code: 1008, reason: "invalid body update" });
 	assert.equal(queued, 0);
 	assert.equal(flushes, 0);
-	assert.equal(loaded.share.has("frontmatter:future-root"), false);
+	assert.equal(testCrdtEngine.snapshotRoots(loaded).some((root) => root.name === "frontmatter:future-root"), false);
 	assert.equal(sent.length, 1, "only the typed rejection is sent; no document update is broadcast");
 	assert.equal(JSON.parse((sent[0] as string).slice(6)).code, "frontmatter_semantic_root_invalid");
-	loaded.destroy();
+	testCrdtEngine.destroyDocument(loaded);
 	malicious.destroy();
 });
 

@@ -39,6 +39,7 @@ import type { AttachmentHead, BlobMeta, BlobRef, BlobTombstone, SemanticPathRef 
 import { applyDiffToYText, tryApplyDiffToYText } from "./diff";
 import { safeBlobPath, safeCanvasPath, safeMarkdownPath } from "./pathPolicy";
 import { ORIGIN_DISK_COMMIT } from "./origins";
+import { materializeFreshMarkdownUpdates } from "./freshMarkdownUpdates";
 
 import { PRODUCT_EVENT_KIND } from "../observability/productEventKinds";
 import type { ProductFlightPathEventInput } from "../observability/traceSink";
@@ -611,7 +612,9 @@ interface PendingCandidate {
 
 const BODY_TEXT_NAME = "body";
 
-const DEFAULT_MAX_LOADED_BODIES = 24;
+// Initial import publishes up to 32 ordinary notes in one four-request batch.
+// The byte-cost budget remains the controlling guard for large documents.
+const DEFAULT_MAX_LOADED_BODIES = 32;
 const DEFAULT_CANDIDATE_DEBOUNCE_MS = 250;
 export class FreshAdmissionCancelledError extends Error {
 	constructor(readonly path: string) {
@@ -1007,11 +1010,20 @@ export class VaultSyncHttpPort implements VaultServerPort {
 	}
 
 	async submitCandidate(record: CandidateRecord): Promise<BodyReceipt> {
+		const persistedFrames = record.encodedUpdates;
+		const encodedUpdates = this.candidateUpdateFrames(record);
+		if (encodedUpdates.length > 1) {
+			const batch = await this.submitCandidates([record]);
+			if (batch.receipts.length !== 1) throw new Error("single framed candidate receipt mismatch");
+			return batch.receipts[0]!;
+		}
 		const response = await this.request({
 			url: `${this.route("body")}/${encodeURIComponent(record.bodyId)}/candidate`,
 			method: "POST",
 			contentType: "application/octet-stream",
-			body: record.encodedUpdate,
+			body: persistedFrames?.length === 1
+				? persistedFrames[0]
+				: record.encodedUpdate,
 				headers: {
 					...this.headers(),
 					"x-yaos-body-epoch": String(record.bodyEpoch),
@@ -1021,6 +1033,29 @@ export class VaultSyncHttpPort implements VaultServerPort {
 		});
 		if (response.status !== 200) throw mutationRequestError(response, "body candidate request");
 		return response.json as BodyReceipt;
+	}
+
+	async submitCandidates(records: readonly CandidateRecord[]): Promise<CandidateBatchReceipt> {
+		// Candidate persistence carries local replay metadata (including the full
+		// pending Markdown string). Never mirror that record onto the wire: doing
+		// so would duplicate a 5 MiB note beside its CRDT frames and defeat the
+		// bounded candidate envelope.
+		const candidates = records.map((candidate) => ({
+			bodyId: candidate.bodyId,
+			bodyEpoch: candidate.bodyEpoch,
+			candidateId: candidate.candidateId,
+			candidateDigest: candidate.candidateDigest,
+			encodedUpdates: this.candidateUpdateFrames(candidate),
+		}));
+		const response = await this.request({
+			url: this.route("body/candidates"),
+			method: "POST",
+			contentType: YAOS_BINARY_CONTENT_TYPE,
+			body: encodeBinaryEnvelope({ candidates }).slice().buffer,
+			headers: this.headers(),
+		});
+		if (response.status !== 200) throw mutationRequestError(response, "body candidate batch request");
+		return response.json as CandidateBatchReceipt;
 	}
 
 	async commitLifecycle(request: LifecycleRequest): Promise<LifecycleReceipt> {
@@ -1033,6 +1068,22 @@ export class VaultSyncHttpPort implements VaultServerPort {
 		});
 		if (response.status !== 200) throw mutationRequestError(response, "lifecycle commit");
 		return response.json as LifecycleReceipt;
+	}
+
+	async commitCreateAdmissionsBatch(
+		requests: readonly LifecycleRequest[],
+	): Promise<LifecycleBatchReceipt> {
+		const response = await this.request({
+			url: this.route("lifecycle/admissions"),
+			method: "POST",
+			contentType: "application/json",
+			body: JSON.stringify({ operations: requests }),
+			headers: this.headers(),
+		});
+		if (response.status !== 200) {
+			throw mutationRequestError(response, "create admission batch request");
+		}
+		return response.json as LifecycleBatchReceipt;
 	}
 
 	async commitLifecycleBatch(
@@ -1124,6 +1175,12 @@ export class VaultSyncHttpPort implements VaultServerPort {
 
 	private headers(): Record<string, string> {
 		return { Authorization: `Bearer ${this.token}` };
+	}
+
+	private candidateUpdateFrames(record: CandidateRecord): Uint8Array[] {
+		const updates = record.encodedUpdates;
+		if (!updates || updates.length === 0) return [new Uint8Array(record.encodedUpdate)];
+		return updates.map((update) => new Uint8Array(update.slice(0)));
 	}
 }
 
@@ -2425,21 +2482,18 @@ export class VaultSync implements SyncRuntimePort {
 				await this.options.database.deleteDocument?.(input.bodyId);
 				throw new FreshAdmissionCancelledError(input.path);
 			}
-			const text = body.doc.getText(BODY_TEXT_NAME);
-			const before = Y.encodeStateVector(body.doc);
-			applyDiffToYText(
-				text,
-				text.toJSON(),
+			const materialized = materializeFreshMarkdownUpdates(
+				body.doc,
 				input.content,
-				ORIGIN_DISK_COMMIT,
+				() => this.ensureSemanticMirror(body).seedCurrent(),
 			);
-			this.ensureSemanticMirror(body).seedCurrent();
 			pending = await this.captureCandidate(
 				input.bodyId,
-				Y.encodeStateAsUpdate(body.doc, before),
+				materialized.encodedUpdate,
 				input.candidateId,
 				0,
 				input.path,
+				materialized.encodedUpdates,
 			);
 		}
 		if (input.admissionStillCurrent?.() === false) {
@@ -2448,6 +2502,14 @@ export class VaultSync implements SyncRuntimePort {
 		}
 		request.candidateId = pending.record.candidateId;
 		request.candidateDigest = pending.record.candidateDigest;
+		// The server's first lifecycle commit binds this exact candidate fence.
+		// Persist it before that request so a crash after candidate settlement
+		// cannot leave replay to invent a different, permanently rejected fence.
+		await save.call(this.options.database, {
+			...storedOperation,
+			candidateId: request.candidateId,
+			candidateDigest: request.candidateDigest,
+		});
 		let admissionReceipt: LifecycleReceipt;
 		try {
 			admissionReceipt = await this.server.commitLifecycle(request);
@@ -2459,10 +2521,12 @@ export class VaultSync implements SyncRuntimePort {
 			throw error;
 		}
 		this.validateLifecycleReceipt(request, admissionReceipt);
-		if (input.admissionStillCurrent?.() === false) {
-			await this.cancelFreshAdmission(pending, operationId);
-			throw new FreshAdmissionCancelledError(input.path);
-		}
+		// Admission is the distributed commitment point: the server now owns an
+		// exact operation/candidate fence and exposes no cancellation mutation.
+		// A newer local revision may supersede this snapshot, but abandoning it
+		// here would orphan that server fence and make the newer revision fail
+		// forever. Finish this admission; the scheduler will apply the newer
+		// revision as the next body candidate.
 		const receipt = await this.submitCandidate(pending);
 		await save.call(this.options.database, {
 			...storedOperation,
@@ -2565,31 +2629,33 @@ export class VaultSync implements SyncRuntimePort {
 				batchIndex: index,
 			});
 			const body = await this.loadBodyWithPriority(input.bodyId, "background");
-			const text = body.doc.getText(BODY_TEXT_NAME);
-			const before = Y.encodeStateVector(body.doc);
-			applyDiffToYText(text, text.toJSON(), input.content, ORIGIN_DISK_COMMIT);
-			this.ensureSemanticMirror(body).seedCurrent();
+			const materialized = materializeFreshMarkdownUpdates(
+				body.doc,
+				input.content,
+				() => this.ensureSemanticMirror(body).seedCurrent(),
+			);
 			const pending = await this.captureCandidate(
 				input.bodyId,
-				Y.encodeStateAsUpdate(body.doc, before),
+				materialized.encodedUpdate,
 				input.candidateId,
 				0,
 				input.path,
+				materialized.encodedUpdates,
 			);
 			request.candidateId = pending.record.candidateId;
 			request.candidateDigest = pending.record.candidateDigest;
+			await save.call(this.options.database, {
+				...this.toStoredLifecycleOperation(request),
+				content: input.content,
+				batchId,
+				batchIndex: index,
+			});
 			prepared.push({ input, request, pending });
 		}
 
 		const requests = prepared.map((item) => item.request);
 		if (this.server.commitCreateAdmissionsBatch) {
-			const admissions = await this.server.commitCreateAdmissionsBatch(requests);
-			if (admissions.receipts.length !== requests.length) {
-				throw new Error("create admission batch response count mismatch");
-			}
-			for (let index = 0; index < requests.length; index++) {
-				this.validateLifecycleReceipt(requests[index]!, admissions.receipts[index]!);
-			}
+			await this.commitCreateAdmissionRequests(requests);
 		} else {
 			for (const request of requests) {
 				this.validateLifecycleReceipt(request, await this.server.commitLifecycle(request));
@@ -2614,7 +2680,17 @@ export class VaultSync implements SyncRuntimePort {
 			for (const item of prepared) bodyReceipts.push(await this.submitCandidate(item.pending));
 		}
 
-		const lifecycleReceipts = await this.commitLifecycleRequests(requests);
+		let lifecycleReceipts: LifecycleReceipt[];
+		if (this.server.commitCreateAdmissionsBatch) {
+			lifecycleReceipts = await this.commitCreateAdmissionRequests(requests);
+		} else {
+			lifecycleReceipts = [];
+			for (const request of requests) {
+				const receipt = await this.server.commitLifecycle(request);
+				this.validateLifecycleReceipt(request, receipt);
+				lifecycleReceipts.push(receipt);
+			}
+		}
 		await this.publishLifecycleRoot(requests, lifecycleReceipts);
 		await removeBatch.call(
 			this.options.database,
@@ -4521,6 +4597,7 @@ export class VaultSync implements SyncRuntimePort {
 		candidateId: string | undefined = crypto.randomUUID(),
 		capturedLocalUpdates = 0,
 		path?: string,
+		encodedUpdates?: readonly Uint8Array[],
 	): Promise<PendingCandidate> {
 		if (!candidateId) throw new Error("candidateId is required");
 		const candidateDigest = await sha256Hex(encodedUpdate);
@@ -4550,6 +4627,7 @@ export class VaultSync implements SyncRuntimePort {
 			candidateId,
 			candidateDigest,
 			encodedUpdate: encodedUpdate.slice().buffer,
+			encodedUpdates: encodedUpdates?.map((update) => update.slice().buffer),
 			capturedAt,
 			capturedLocalUpdates,
 			authority: this.captureAuthority(),
@@ -4912,6 +4990,22 @@ export class VaultSync implements SyncRuntimePort {
 						&& (!operation.candidateId || candidate.record.candidateId === operation.candidateId),
 				);
 				if (!pending) {
+					// A missing persisted candidate with a known fence can mean the
+					// candidate receipt was committed immediately before a crash.  Prove
+					// that outcome first; the admission can then be finalized without
+					// manufacturing a second candidate for the already-bound creation.
+					if (operation.candidateId && operation.candidateDigest) {
+						const outcome = await this.exactCommittedOutcome(
+							operation.candidateId,
+							operation.candidateDigest,
+							operation.authority,
+						);
+						if (outcome) {
+							operation.content = null;
+							await save.call(this.options.database, operation);
+							continue;
+						}
+					}
 					const body = await this.loadBodyWithPriority(operation.bodyId, "background", true);
 					const text = body.doc.getText(BODY_TEXT_NAME);
 					if (text.toJSON() !== operation.content) {
@@ -4923,9 +5017,15 @@ export class VaultSync implements SyncRuntimePort {
 						);
 						await this.bodies.markDirty(operation.bodyId);
 					}
+					const encodedUpdate = Y.encodeStateAsUpdate(body.doc);
+					if (operation.candidateDigest
+						&& await sha256Hex(encodedUpdate) !== operation.candidateDigest) {
+						throw new Error(`fresh body ${operation.bodyId} cannot reproduce its creation candidate`);
+					}
 					pending = await this.captureCandidate(
 						operation.bodyId,
-						Y.encodeStateAsUpdate(body.doc),
+						encodedUpdate,
+						operation.candidateId,
 					);
 				}
 				request.candidateId = pending.record.candidateId;
@@ -4935,7 +5035,10 @@ export class VaultSync implements SyncRuntimePort {
 				await save.call(this.options.database, operation);
 			}
 			if (this.destroyed) return;
-			const receipts = await this.commitLifecycleRequests(requests);
+			const allCreates = requests.every((request) => request.kind === "create");
+			const receipts = allCreates && this.server.commitCreateAdmissionsBatch
+				? await this.commitCreateAdmissionRequests(requests)
+				: await this.commitLifecycleRequests(requests);
 			if (this.destroyed) return;
 			for (const operation of attempted) {
 				if (this.destroyed) return;
@@ -4950,10 +5053,19 @@ export class VaultSync implements SyncRuntimePort {
 					content: null,
 				});
 			}
+			if (allCreates && this.server.commitCreateAdmissionsBatch) {
+				const finalReceipts = await this.commitCreateAdmissionRequests(requests);
+				for (let index = 0; index < receipts.length; index++) {
+					if (finalReceipts[index]!.vaultSequence < receipts[index]!.vaultSequence) {
+						throw new Error("fresh lifecycle final sequence regressed");
+					}
+					receipts[index] = finalReceipts[index]!;
+				}
+			}
 			for (let index = 0; index < attempted.length; index++) {
 				if (this.destroyed) return;
 				const operation = attempted[index]!;
-				if (operation.kind !== "create" || operation.content === null) continue;
+				if (allCreates || operation.kind !== "create" || operation.content === null) continue;
 				const finalReceipt = await this.server.commitLifecycle(requests[index]!);
 				this.validateLifecycleReceipt(requests[index]!, finalReceipt);
 				if (finalReceipt.vaultSequence < receipts[index]!.vaultSequence) {
@@ -5160,6 +5272,29 @@ export class VaultSync implements SyncRuntimePort {
 		);
 		if (batch.vaultSequence < maxReceiptSequence) {
 			throw new Error("lifecycle batch sequence mismatch");
+		}
+		return batch.receipts;
+	}
+
+	private async commitCreateAdmissionRequests(
+		requests: readonly LifecycleRequest[],
+	): Promise<LifecycleReceipt[]> {
+		if (!this.server.commitCreateAdmissionsBatch || requests.length === 0
+			|| requests.some((request) => request.kind !== "create")) {
+			throw new Error("create admission batch is unavailable");
+		}
+		await this.waitForSubmissionWindow();
+		const batch = await this.server.commitCreateAdmissionsBatch(requests);
+		if (
+			batch.receipts.length !== requests.length
+			|| !Number.isSafeInteger(batch.vaultSequence)
+			|| batch.vaultSequence < 0
+			|| !batch.runtimeEpoch
+		) {
+			throw new Error("create admission batch receipt mismatch");
+		}
+		for (let index = 0; index < requests.length; index++) {
+			this.validateLifecycleReceipt(requests[index]!, batch.receipts[index]!);
 		}
 		return batch.receipts;
 	}

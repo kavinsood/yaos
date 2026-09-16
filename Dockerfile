@@ -11,7 +11,9 @@ RUN npm ci --prefix server --ignore-scripts
 
 COPY packages/server-node/package.json packages/server-node/esbuild.config.mjs ./packages/server-node/
 COPY packages/server-node/src ./packages/server-node/src
+COPY packages/server-node/vendor ./packages/server-node/vendor
 COPY server/src ./server/src
+COPY server/vendor ./server/vendor
 RUN npm run build:server-node
 
 FROM node:24-bookworm-slim AS runtime
@@ -26,7 +28,7 @@ ENV NODE_ENV=production \
     YAOS_NODE_DATA_DIR=/data
 WORKDIR /app
 
-COPY --from=build --chown=node:node /src/packages/server-node/dist/server.mjs ./dist/server.mjs
+COPY --from=build --chown=node:node /src/packages/server-node/dist ./dist
 COPY --from=build --chown=node:node /src/node_modules/ws ./node_modules/ws
 RUN mkdir -p /data && chown node:node /data
 

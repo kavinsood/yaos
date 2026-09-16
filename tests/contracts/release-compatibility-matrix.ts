@@ -100,5 +100,19 @@ s.check(embedded.schemaVersion === 8 && embedded.storageFormatVersion === 4
 	&& embedded.protocolVersion === 5 && embedded.snapshotFormatVersion === 3,
 "server archive publishes all product pins");
 s.check(!("pluginVersion" in embedded) && !("protectedFiles" in embedded), "obsolete compatibility metadata is absent");
+const crdtEngine = embedded.crdtEngine as Record<string, unknown> | undefined;
+s.check(crdtEngine?.name === "ywasm"
+	&& typeof crdtEngine.sourceCommit === "string" && crdtEngine.sourceCommit.length === 40
+	&& typeof crdtEngine.artifactSha256 === "string" && crdtEngine.artifactSha256.length === 64,
+"server archive identifies its pinned CRDT source and artifact");
+const archiveEntries = execFileSync("unzip", ["-Z1", archivePath], { encoding: "utf8" }).split("\n");
+for (const required of [
+	"scripts/build-ywasm.mjs",
+	"vendor/ywasm/SOURCE.json",
+	"vendor/ywasm/rust-toolchain.toml",
+	"vendor/ywasm/patches/0001-document-stats.patch",
+]) {
+	s.check(archiveEntries.includes(required), `server archive carries hermetic ywasm input ${required}`);
+}
 
 await s.done();

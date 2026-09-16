@@ -143,6 +143,7 @@ export async function connectDocument(
 	kind: "root" | "body",
 	documentId: string,
 	doc = new Y.Doc({ guid: documentId }),
+	webSocketPolyfill: typeof globalThis.WebSocket = WebSocket as unknown as typeof globalThis.WebSocket,
 ): Promise<ConnectedDocument> {
 	const provider = new YSyncProvider(identity.host, documentId, doc, {
 		prefix: socketPrefix(identity, kind, documentId),
@@ -154,7 +155,7 @@ export async function connectDocument(
 				protocolVersion: String(PROTOCOL_VERSION),
 			};
 		},
-		WebSocketPolyfill: WebSocket as unknown as typeof globalThis.WebSocket,
+		WebSocketPolyfill: webSocketPolyfill,
 		connect: false,
 		maxBackoffTime: 500,
 	});

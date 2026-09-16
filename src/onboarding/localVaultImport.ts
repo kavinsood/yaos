@@ -382,18 +382,48 @@ export class LocalVaultImporter {
 		for (let round = 0; round < this.maxEditRetries; round++) {
 			const pending = page.filter((item) => item.status === "pending");
 			if (pending.length === 0) return;
-			const prepared = (await this.mapBounded(
-				pending,
-				(item) => this.prepareItem(state, item),
-			)).filter((value): value is PreparedLocalImport => value !== null);
 			if (this.sink.importFiles) {
-				for (const chunk of this.importBatches(prepared)) {
-					await this.commitPreparedBatch(state, chunk);
+				// Do not retain an entire inventory page in memory before publishing it.
+				// With multi-megabyte notes a 250-item page could otherwise duplicate
+				// gigabytes between the canonical string and byte representation. Prepare
+				// only one bounded read window at a time, while still filling efficient
+				// network batches for ordinary small notes.
+				let batch: PreparedLocalImport[] = [];
+				let batchBytes = 0;
+				const flush = async (): Promise<void> => {
+					if (batch.length === 0) return;
+					const current = batch;
+					batch = [];
+					batchBytes = 0;
+					await this.commitPreparedBatch(state, current);
+				};
+				// A prepared note retains both its string and canonical bytes. Prepare
+				// one at a time so allowing 5 MiB notes does not turn count-bounded
+				// read concurrency into an 80+ MiB transient allocation.
+				for (const item of pending) {
+					const value = await this.prepareItem(state, item);
+					if (value) {
+						const bytes = value.canonicalBytes.byteLength;
+						if (batch.length > 0 && (batch.length >= 32 || batchBytes + bytes > 4 * 1024 * 1024)) {
+							await flush();
+						}
+						batch.push(value);
+						batchBytes += bytes;
+						// A legal note can be larger than the ordinary aggregate batch
+						// target; publish it alone instead of retaining it beside another
+						// preparation window.
+						if (bytes > 4 * 1024 * 1024) await flush();
+					}
 				}
+				await flush();
 			} else {
-				for (let offset = 0; offset < prepared.length; offset += this.concurrency) {
-					const chunk = prepared.slice(offset, offset + this.concurrency);
-					await Promise.all(chunk.map((value) => this.commitPrepared(state, value)));
+				for (let offset = 0; offset < pending.length; offset += this.concurrency) {
+					const window = pending.slice(offset, offset + this.concurrency);
+					const prepared = (await this.mapBounded(
+						window,
+						(item) => this.prepareItem(state, item),
+					)).filter((value): value is PreparedLocalImport => value !== null);
+					await Promise.all(prepared.map((value) => this.commitPrepared(state, value)));
 				}
 			}
 		}
@@ -461,26 +491,6 @@ export class LocalVaultImporter {
 		} finally {
 			state.updatedAt = this.now();
 		}
-	}
-
-	private importBatches(
-		prepared: readonly PreparedLocalImport[],
-	): PreparedLocalImport[][] {
-		const batches: PreparedLocalImport[][] = [];
-		let current: PreparedLocalImport[] = [];
-		let bytes = 0;
-		for (const item of prepared) {
-			const itemBytes = item.canonicalBytes.byteLength;
-			if (current.length > 0 && (current.length >= 32 || bytes + itemBytes > 4 * 1024 * 1024)) {
-				batches.push(current);
-				current = [];
-				bytes = 0;
-			}
-			current.push(item);
-			bytes += itemBytes;
-		}
-		if (current.length > 0) batches.push(current);
-		return batches;
 	}
 
 	private async commitPreparedBatch(

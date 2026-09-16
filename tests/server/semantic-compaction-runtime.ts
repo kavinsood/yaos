@@ -3,11 +3,14 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as Y from "yjs";
+import { ywasmCrdtEngine as crdtEngine } from "@yaos/crdt-engine";
 import { NodeSqliteStorage } from "../../packages/server-node/src/storage";
+import { snapshotRootMap } from "../../server/src/crdt/rootSchema";
+import { materializeCanvasDocument as materializeServerCanvasDocument } from "../../server/src/crdt/canvasSemanticDocument";
 import { semanticDocumentCensus } from "../../server/src/semanticCompaction";
 import { SemanticCompactionRuntime } from "../../server/src/semanticCompactionRuntime";
 import type { SemanticCompactionThresholds } from "../../server/src/semanticCompactionPolicy";
-import { VaultDocumentCache } from "../../server/src/vaultDocumentCache";
+import { VaultDocumentCache, VaultDocumentCachePressureError } from "../../server/src/vaultDocumentCache";
 import { VaultStore, type VaultStoragePort } from "../../server/src/vaultStore";
 import { canonicalCanvasBytes } from "../../server/src/shared/canvasCodec";
 import {
@@ -180,13 +183,13 @@ s.test("body reset preserves content, advances epoch, shrinks structs and fences
 			}]);
 			const resident = cache.get(documentId)!;
 			assert.equal(resident.semanticEpoch, headAfter.semanticEpoch);
-			assert.equal(resident.doc.getText("body").toString(), preserved);
+			assert.equal(crdtEngine.readText(resident.doc, "body"), preserved);
 			const recovered = store.reconstructDocument(documentId);
 			try {
 				assert.equal(recovered.semanticEpoch, headAfter.semanticEpoch);
-				assert.equal(recovered.doc.getText("body").toString(), preserved);
+				assert.equal(crdtEngine.readText(recovered.doc, "body"), preserved);
 			} finally {
-				recovered.doc.destroy();
+				crdtEngine.destroyDocument(recovered.doc);
 			}
 		});
 });
@@ -588,19 +591,20 @@ s.test("root reset rebuilds only fixed maps from SQL authority and ignores diver
 
 		for (const document of [cache.get("root")!.doc, store.reconstructDocument("root").doc]) {
 			try {
-				assert.equal(document.getMap("pathToId").get("renamed.md"), "catalog-body");
-				assert.equal((document.getMap<{ documentId: string }>("pathToSemantic")
-					.get("Renamed.canvas"))?.documentId, "catalog-canvas");
-				assert.deepEqual(document.getMap("pathToBlob").get("active.bin"),
-					{ hash, size: 4, revision: "attachment-operation" });
-				assert.deepEqual(document.getMap("blobTombstones").get("deleted.bin"),
-					{ deletedAt: 700, previousHash: "b".repeat(64), revision: "attachment-operation" });
-				assert.equal(document.getMap("pathToId").has("resident-lie.md"), false);
-				assert.equal(document.share.has("meta"), false);
-				assert.equal(document.share.has("__yaosLifecycle"), false);
-				assert.equal(document.share.has("__yaosLifecyclePublicationProof"), false);
-			} finally {
-				if (document !== cache.get("root")!.doc) document.destroy();
+					assert.equal(snapshotRootMap(document, "pathToId").get("renamed.md"), "catalog-body");
+					assert.equal((snapshotRootMap(document, "pathToSemantic")
+						.get("Renamed.canvas") as { documentId?: string } | undefined)?.documentId, "catalog-canvas");
+					assert.deepEqual(snapshotRootMap(document, "pathToBlob").get("active.bin"),
+						{ hash, size: 4, revision: "attachment-operation" });
+					assert.deepEqual(snapshotRootMap(document, "blobTombstones").get("deleted.bin"),
+						{ deletedAt: 700, previousHash: "b".repeat(64), revision: "attachment-operation" });
+					assert.equal(snapshotRootMap(document, "pathToId").has("resident-lie.md"), false);
+					const roots = crdtEngine.snapshotRoots(document).map(({ name }) => name);
+					assert.equal(roots.includes("meta"), false);
+					assert.equal(roots.includes("__yaosLifecycle"), false);
+					assert.equal(roots.includes("__yaosLifecyclePublicationProof"), false);
+				} finally {
+					if (document !== cache.get("root")!.doc) crdtEngine.destroyDocument(document);
 			}
 		}
 	});
@@ -634,7 +638,7 @@ s.test("Canvas reset preserves canonical JSON, drops tombstones, advances epoch,
 		const loaded = cache.load(documentId, true, () => true, "canvas");
 		const censusBefore = semanticDocumentCensus(loaded.doc);
 		const headBefore = store.documentHead(documentId)!;
-		assert.equal(loaded.doc.getMap("nodeTombstones").size, 1);
+		assert.equal(snapshotRootMap(loaded.doc, "nodeTombstones").size, 1);
 
 		const outcome = await compaction.recordCommit(documentId, 1);
 		assert.equal(outcome.status, "compacted");
@@ -649,22 +653,22 @@ s.test("Canvas reset preserves canonical JSON, drops tombstones, advances epoch,
 		const resident = cache.get(documentId)!;
 		assert.equal(resident.kind, "canvas");
 		assert.equal(resident.semanticEpoch, 2);
-		assert.equal(resident.doc.getMap("nodeTombstones").size, 0,
+		assert.equal(snapshotRootMap(resident.doc, "nodeTombstones").size, 0,
 			"fresh semantic state does not carry retired Canvas tombstones");
-		assert.deepEqual(canonicalCanvasBytes(await materializeCanvasDocument(resident.doc, false)), canonicalBefore);
+		assert.deepEqual(canonicalCanvasBytes(await materializeServerCanvasDocument(resident.doc, false)), canonicalBefore);
 
 		const recovered = store.reconstructDocument(documentId);
 		try {
 			assert.equal(recovered.semanticEpoch, 2);
-			assert.equal(recovered.doc.getMap("nodeTombstones").size, 0);
-			assert.deepEqual(canonicalCanvasBytes(await materializeCanvasDocument(recovered.doc, false)), canonicalBefore);
+			assert.equal(snapshotRootMap(recovered.doc, "nodeTombstones").size, 0);
+			assert.deepEqual(canonicalCanvasBytes(await materializeServerCanvasDocument(recovered.doc, false)), canonicalBefore);
 		} finally {
-			recovered.doc.destroy();
+			crdtEngine.destroyDocument(recovered.doc);
 		}
 
 		assert.throws(() => store.semanticResetFromEncodedState(
 			documentId,
-			Y.encodeStateAsUpdate(resident.doc),
+			crdtEngine.encodeStateAsUpdate(resident.doc),
 			{
 				throughSequence: headBefore.latestSequence,
 				generation: headBefore.generation,
@@ -695,8 +699,8 @@ s.test("post-durable reset install failure drops stale RAM and still fences the 
 		const recovered = store.reconstructDocument(documentId);
 		try {
 			assert.equal(recovered.semanticEpoch, previousEpoch + 1);
-			assert.equal(recovered.doc.getText("body").toString(), preserved);
-		} finally { recovered.doc.destroy(); }
+			assert.equal(crdtEngine.readText(recovered.doc, "body"), preserved);
+		} finally { crdtEngine.destroyDocument(recovered.doc); }
 	});
 });
 
@@ -713,7 +717,7 @@ s.test("repeated body resets keep fresh identities small, recoverable, and CAS f
 		for (let cycle = 0; cycle < 3; cycle++) {
 			const resident = cache.get(documentId)!;
 			const producer = new Y.Doc({ guid: documentId });
-			Y.applyUpdate(producer, Y.encodeStateAsUpdate(resident.doc), "fresh-client-baseline");
+			Y.applyUpdate(producer, crdtEngine.encodeStateAsUpdate(resident.doc), "fresh-client-baseline");
 			const before = Y.encodeStateVector(producer);
 			const text = producer.getText("body");
 			const preserved = text.toString();
@@ -729,7 +733,7 @@ s.test("repeated body resets keep fresh identities small, recoverable, and CAS f
 
 			const durable = store.commitUpdate({ documentId, update, kind: "body" });
 			assert.equal(cache.applyDurableUpdate(documentId, update, durable.generation, "test-churn"), true);
-			assert.equal(cache.get(documentId)!.doc.getText("body").toString(), preserved);
+			assert.equal(crdtEngine.readText(cache.get(documentId)!.doc, "body"), preserved);
 			const resetFromHead = store.documentHead(documentId)!;
 			assert.equal(resetFromHead.semanticEpoch, expectedEpoch);
 
@@ -744,19 +748,19 @@ s.test("repeated body resets keep fresh identities small, recoverable, and CAS f
 				"reset advances lineage, not content generation");
 			assert.ok(outcome.freshStructs <= 4,
 				`cycle ${cycle + 1} fresh lineage should remain tiny, got ${outcome.freshStructs}`);
-			assert.equal(cache.get(documentId)!.doc.getText("body").toString(), preserved);
+			assert.equal(crdtEngine.readText(cache.get(documentId)!.doc, "body"), preserved);
 
 			const recovered = store.reconstructDocument(documentId);
 			try {
 				assert.equal(recovered.semanticEpoch, expectedEpoch);
-				assert.equal(recovered.doc.getText("body").toString(), preserved);
+				assert.equal(crdtEngine.readText(recovered.doc, "body"), preserved);
 			} finally {
-				recovered.doc.destroy();
+				crdtEngine.destroyDocument(recovered.doc);
 			}
 
 			assert.throws(() => store.semanticResetFromEncodedState(
 				documentId,
-				Y.encodeStateAsUpdate(cache.get(documentId)!.doc),
+				crdtEngine.encodeStateAsUpdate(cache.get(documentId)!.doc),
 				{
 					throughSequence: resetFromHead.latestSequence,
 					generation: resetFromHead.generation,
@@ -787,7 +791,7 @@ s.test("cooldown and low-water mark survive runtime restart without hot-path sta
 		assert.equal(durableAfterReset.postCompactionEncodedStateBytes, first.result.totalBytes);
 
 		const producer = new Y.Doc({ guid: documentId });
-		Y.applyUpdate(producer, Y.encodeStateAsUpdate(cache.get(documentId)!.doc));
+		Y.applyUpdate(producer, crdtEngine.encodeStateAsUpdate(cache.get(documentId)!.doc));
 		const before = Y.encodeStateVector(producer);
 		const text = producer.getText("body");
 		for (let index = 0; index < 30; index++) {
@@ -851,6 +855,28 @@ s.test("first-call memory pressure fences admission before a busy document can s
 	}, { thresholds: OPERATIONAL_ONLY_THRESHOLDS });
 });
 
+s.test("duplicate compaction triggers coalesce to one document attempt", async () => {
+	await withRuntime(async ({ store, cache, compaction }) => {
+		const documentId = "coalesced-pressure-body";
+		const document = new Y.Doc({ guid: documentId });
+		document.getText("body").insert(0, "busy\n");
+		store.commitUpdate({ documentId, update: Y.encodeStateAsUpdate(document), kind: "body" });
+		document.destroy();
+		const loaded = cache.load(documentId, true, () => true);
+		loaded.dirty = true;
+		cache.hasResidentMemoryPressure = () => true;
+
+		const [first, second] = await Promise.all([
+			compaction.measureAndMaybeCompact(documentId),
+			compaction.measureAndMaybeCompact(documentId),
+		]);
+		assert.deepEqual(first, { status: "busy" });
+		assert.deepEqual(second, first);
+		assert.equal(store.semanticCompactionState(documentId)?.retryFailureCount, 1,
+			"duplicate alarm/commit triggers share one classified failure");
+	}, { thresholds: OPERATIONAL_ONLY_THRESHOLDS });
+});
+
 s.test("first hard latency measurement retains its fence when transient reservation fails", async () => {
 	await withRuntime(async ({ store, cache, compaction }) => {
 		const documentId = "reservation-latency-pressure-body";
@@ -858,15 +884,38 @@ s.test("first hard latency measurement retains its fence when transient reservat
 		cache.load(documentId, true, () => true);
 		await compaction.recordCommit(documentId, 1, 51);
 		await compaction.recordCommit(documentId, 1, 52);
-		cache.recordTransient = () => { throw new Error("transient reservation denied"); };
+		cache.recordTransient = () => { throw new VaultDocumentCachePressureError("vault_transient_bytes"); };
 
 		await assert.rejects(
 			() => compaction.recordCommit(documentId, 1, 53),
-			/transient reservation denied/,
+			/vault_transient_bytes/,
 		);
 		assert.equal(compaction.shouldPauseAdmission(documentId), true);
+		assert.deepEqual(store.semanticCompactionState(documentId), {
+			documentId,
+			lastCompactedAt: null,
+			postCompactionEncodedStateBytes: null,
+			retryRequired: true,
+			admissionPaused: true,
+			retryNotBefore: 2_148,
+			retryFailureCount: 1,
+			lastFailureClass: "transient-budget",
+			lastFailureAt: 1_003,
+		});
 		assert.equal(compaction.diagnostics()[documentId]?.latencyViolationStreak, 3,
 			"failed preflight retains the evidence for the next exact attempt");
+
+		const restarted = new SemanticCompactionRuntime({
+			store,
+			cache,
+			fenceSockets: () => 0,
+			now: () => 10_000,
+			thresholds: () => OPERATIONAL_ONLY_THRESHOLDS,
+		});
+		assert.equal(restarted.shouldPauseAdmission(documentId), true,
+			"a fresh runtime restores the durable admission fence");
+		assert.deepEqual(restarted.dueRetries(10_000), [documentId],
+			"the alarm drain discovers work without an in-memory document map");
 	}, {
 		commitLatencyObjectiveMs: 50,
 		cadence: {
@@ -875,6 +924,120 @@ s.test("first hard latency measurement retains its fence when transient reservat
 			maxIntervalMs: Number.MAX_SAFE_INTEGER,
 		},
 		thresholds: OPERATIONAL_ONLY_THRESHOLDS,
+	});
+});
+
+s.test("journal checkpoint thresholds count only the replay tail", async () => {
+	await withRuntime(({ store }) => {
+		const documentId = "retained-feed-history";
+		const document = new Y.Doc({ guid: documentId });
+		for (let index = 0; index < 3; index++) {
+			store.commitUpdate({ documentId, kind: "body", update: delta(document, () => {
+				document.getText("body").insert(document.getText("body").length, String(index));
+			}) });
+		}
+		assert.equal(store.documentJournalStats(documentId).entries, 3);
+		assert.deepEqual(store.listJournalCheckpointCandidates(3, Number.MAX_SAFE_INTEGER), [documentId]);
+		const head = store.documentHead(documentId)!;
+		store.writeCheckpointFromEncodedState(documentId, Y.encodeStateAsUpdate(document), {
+			throughSequence: head.latestSequence,
+			generation: head.generation,
+			semanticEpoch: head.semanticEpoch,
+		});
+		assert.deepEqual(store.documentJournalTailStats(documentId), {
+			entries: 0,
+			bytes: 0,
+			checkpointSequence: head.latestSequence,
+		});
+		assert.equal(store.documentJournalStats(documentId).entries, 3,
+			"feed-retained rows remain physical but do not count toward reconstruction");
+		assert.deepEqual(store.listJournalCheckpointCandidates(3, Number.MAX_SAFE_INTEGER), []);
+		store.commitUpdate({ documentId, kind: "body", update: delta(document, () => {
+			document.getText("body").insert(document.getText("body").length, "tail");
+		}) });
+		assert.equal(store.documentJournalTailStats(documentId).entries, 1);
+		document.destroy();
+	});
+});
+
+s.test("durable retry backoff advances and clearing is exact-head conditional", async () => {
+	await withRuntime(({ store }) => {
+		const documentId = "retry-state-cas";
+		const document = new Y.Doc({ guid: documentId });
+		store.commitUpdate({ documentId, kind: "body", update: delta(document, () => {
+			document.getText("body").insert(0, "retry\n");
+		}) });
+		const head = store.documentHead(documentId)!;
+		store.markSemanticCompactionRetry(documentId, {
+			admissionPaused: true,
+			retryNotBefore: 200,
+			now: 100,
+		});
+		store.markSemanticCompactionRetry(documentId, {
+			admissionPaused: true,
+			retryNotBefore: 500,
+			failureClass: "busy",
+			failedAttempt: true,
+			now: 300,
+		});
+		assert.equal(store.semanticCompactionState(documentId)?.retryNotBefore, 500,
+			"a failed due attempt advances rather than retaining an already-due deadline");
+		assert.equal(store.clearSemanticCompactionRetry(documentId, {
+			throughSequence: head.latestSequence + 1,
+			generation: head.generation,
+			semanticEpoch: head.semanticEpoch,
+		}), false);
+		assert.equal(store.semanticCompactionState(documentId)?.retryRequired, true);
+		assert.equal(store.clearSemanticCompactionRetry(documentId, {
+			throughSequence: head.latestSequence,
+			generation: head.generation,
+			semanticEpoch: head.semanticEpoch,
+		}), true);
+		assert.equal(store.semanticCompactionState(documentId)?.retryRequired, false);
+		document.destroy();
+	});
+});
+
+s.test("load discovery runs only after reconstruction headroom is released", async () => {
+	await withRuntime(async ({ store, cache }) => {
+		const documentId = "load-discovery-body";
+		const document = new Y.Doc({ guid: documentId });
+		store.commitUpdate({ documentId, kind: "body", update: delta(document, () => {
+			document.getText("body").insert(0, "loaded\n");
+		}) });
+		const observations: Array<{ documentId: string; transientBytes: number }> = [];
+		cache.setLoadObserver((loaded) => observations.push({
+			documentId: loaded.documentId,
+			transientBytes: loaded.transientBytes,
+		}));
+		cache.load(documentId, true, () => true);
+		assert.deepEqual(observations, [], "load maintenance is not called inside reconstruction");
+		await Promise.resolve();
+		assert.deepEqual(observations, [{ documentId, transientBytes: 0 }]);
+		document.destroy();
+	});
+});
+
+s.test("the store completion boundary observes direct and helper root commits exactly once", async () => {
+	await withRuntime(({ store }) => {
+		const observations: Array<{ documentId: string; sequence: number }> = [];
+		store.setCommitObserver((entry) => observations.push({
+			documentId: entry.documentId,
+			sequence: entry.vaultSequence,
+		}));
+		const root = new Y.Doc({ guid: "root" });
+		const first = store.commitUpdate({ documentId: "root", kind: "root",
+			update: delta(root, () => root.getMap("meta").set("one", true)) });
+		const second = store.commitRootLifecycle({
+			rootUpdate: delta(root, () => root.getMap("meta").set("two", true)),
+			kind: "lifecycle-batch",
+			catalog: [],
+		});
+		assert.deepEqual(observations, [
+			{ documentId: "root", sequence: first.vaultSequence },
+			{ documentId: "root", sequence: second.vaultSequence },
+		]);
+		root.destroy();
 	});
 });
 
@@ -931,6 +1094,9 @@ s.test("automatic cache pressure pauses admission until a clean exact measuremen
 		assert.equal(hard.decision.semanticResetRecommended, false);
 		assert.equal(compaction.shouldPauseAdmission(documentId), true);
 		assert.equal(compaction.diagnostics()[documentId]?.admissionPaused, true);
+		assert.equal(store.semanticCompactionState(documentId)?.retryRequired, false,
+			"irreducible live state is a terminal resource limit, not an alarm loop");
+		assert.equal(store.semanticCompactionState(documentId)?.lastFailureClass, "resource-limit");
 
 		loaded.dirty = true;
 		assert.deepEqual(await compaction.measureAndMaybeCompact(documentId), { status: "busy" });
@@ -942,6 +1108,9 @@ s.test("automatic cache pressure pauses admission until a clean exact measuremen
 		assert.equal(cleared.status, "measured");
 		if (cleared.status === "measured") assert.equal(cleared.decision.urgency, "none");
 		assert.equal(compaction.shouldPauseAdmission(documentId), false);
+		assert.equal(store.semanticCompactionState(documentId)?.retryRequired, false);
+		assert.equal(store.semanticCompactionState(documentId)?.admissionPaused, false);
+		assert.equal(store.semanticCompactionState(documentId)?.lastFailureClass, null);
 	}, { thresholds: OPERATIONAL_ONLY_THRESHOLDS });
 });
 

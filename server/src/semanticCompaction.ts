@@ -1,13 +1,14 @@
-import * as Y from "yjs";
-import { canonicalCanvasBytes } from "./shared/canvasCodec";
+import type { CrdtRootOperation, CrdtValueSnapshot } from "./crdt/crdtEngine";
+import type { YwasmCrdtDocument } from "./crdt/ywasmCrdtEngine";
+import { ywasmCrdtEngine as crdtEngine } from "@yaos/crdt-engine";
+import { parseCanvasBytes } from "./shared/canvasCodec";
 import {
 	importCanvasData,
 	initializeCanvasDocument,
-	materializeCanvasDocument,
 	validateCanvasDocument,
-} from "./shared/canvasSemanticDocument";
+} from "./crdt/canvasSemanticDocument";
 import { canonicalizeMarkdown } from "./shared/markdownCodec";
-import { validateFrontmatterSemanticRoots } from "./shared/frontmatterSemanticValidation";
+import { validateFrontmatterSemanticRoots } from "./crdt/frontmatterSemanticValidation";
 import { safeBlobPath, safeCanvasPath, safeMarkdownPath } from "./shared/vaultPath";
 import type { SemanticPathRef } from "./shared/canvasTypes";
 import { PROTOCOL_VERSION, SCHEMA_VERSION } from "./shared/productVersions";
@@ -19,7 +20,7 @@ export interface SemanticDocumentCensus {
 }
 
 export interface PreparedSemanticReset {
-	document: Y.Doc;
+	document: YwasmCrdtDocument;
 	encodedState: Uint8Array;
 	previous: SemanticDocumentCensus & { encodedStateBytes: number };
 	fresh: SemanticDocumentCensus & { encodedStateBytes: number };
@@ -29,16 +30,8 @@ export interface PreparedCanvasSemanticReset extends PreparedSemanticReset {
 	liveStateBytes: number;
 }
 
-type InternalStruct = { deleted?: boolean };
-type InternalDoc = Y.Doc & { store: { clients: Map<number, InternalStruct[]> } };
-
-export function semanticDocumentCensus(doc: Y.Doc): SemanticDocumentCensus {
-	let totalStructs = 0;
-	let deletedStructs = 0;
-	for (const structs of (doc as InternalDoc).store.clients.values()) {
-		totalStructs += structs.length;
-		for (const struct of structs) if (struct.deleted === true) deletedStructs++;
-	}
+export function semanticDocumentCensus(doc: YwasmCrdtDocument): SemanticDocumentCensus {
+	const { totalStructs, deletedStructs } = crdtEngine.documentStats(doc);
 	return { totalStructs, deletedStructs };
 }
 
@@ -46,37 +39,27 @@ export function semanticDocumentCensus(doc: Y.Doc): SemanticDocumentCensus {
  * Builds a genuinely fresh CRDT from current semantic values. No encoded Yjs
  * state from the old document is applied to the result.
  */
-export function prepareSemanticReset(current: Y.Doc, scope: "body"): PreparedSemanticReset {
-	materializeSemanticRoots(current, scope);
+export function prepareSemanticReset(current: YwasmCrdtDocument, scope: "body"): PreparedSemanticReset {
 	const semanticError = validateFrontmatterSemanticRoots(current);
 	if (semanticError) throw new Error(`semantic reset rejected invalid body: ${semanticError}`);
-	const previousEncoded = Y.encodeStateAsUpdate(current);
-	const fresh = new Y.Doc({ guid: current.guid });
+	const previousEncoded = crdtEngine.encodeStateAsUpdate(current);
+	const fresh = crdtEngine.createDocument(current.guid);
 	try {
-		for (const [name, shared] of current.share) {
-			const kind = shared.constructor.name;
-			if (kind === "YText") {
-				const source = shared as unknown as Y.Text;
-				const sourceText = source.toJSON();
-				const text = name === "body"
-					? canonicalizeMarkdown(sourceText)
-					: sourceText;
-				if (text.length > 0) fresh.getText(name).insert(0, text);
-				continue;
+		const operations: CrdtRootOperation[] = [];
+		for (const root of crdtEngine.snapshotRoots(current)) {
+			if (root.value.shared === "text") {
+				operations.push({ kind: "text-replace", root: root.name,
+					value: root.name === "body" ? canonicalizeMarkdown(root.value.value) : root.value.value });
+			} else if (root.value.shared === "array") {
+				operations.push({ kind: "array-replace", root: root.name, values: root.value.values });
+			} else {
+				for (const [key, value] of root.value.entries) {
+					operations.push({ kind: "map-set", root: root.name, key, value: cloneSemanticSnapshot(value) });
+				}
 			}
-			if (kind === "YMap") {
-				const target = fresh.getMap<unknown>(name);
-				for (const [key, value] of (shared as unknown as Y.Map<unknown>).entries()) target.set(key, cloneSemanticValue(value));
-				continue;
-			}
-			if (kind === "YArray") {
-				const values = (shared as unknown as Y.Array<unknown>).toArray().map(cloneSemanticValue);
-				if (values.length > 0) fresh.getArray(name).insert(0, values);
-				continue;
-			}
-			throw new Error(`semantic reset does not support shared root ${name} (${kind})`);
 		}
-		const encodedState = Y.encodeStateAsUpdate(fresh);
+		crdtEngine.applyRootOperations(fresh, operations, "semantic-reset");
+		const encodedState = crdtEngine.encodeStateAsUpdate(fresh);
 		return {
 			document: fresh,
 			encodedState,
@@ -84,7 +67,7 @@ export function prepareSemanticReset(current: Y.Doc, scope: "body"): PreparedSem
 			fresh: { ...semanticDocumentCensus(fresh), encodedStateBytes: encodedState.byteLength },
 		};
 	} catch (error) {
-		fresh.destroy();
+		crdtEngine.destroyDocument(fresh);
 		throw error;
 	}
 }
@@ -100,22 +83,20 @@ export const ROOT_SEMANTIC_ROOTS = Object.freeze([
  * census: they are deliberately never copied into the fresh lineage.
  */
 export function prepareRootSemanticReset(
-	current: Y.Doc,
+	current: YwasmCrdtDocument,
 	authority: RootAuthoritySnapshot,
 ): PreparedSemanticReset {
 	if (authority.boundarySequence < 0 || !Number.isSafeInteger(authority.boundarySequence)) {
 		throw new Error("semantic reset rejected invalid root authority boundary");
 	}
-	const previousEncoded = Y.encodeStateAsUpdate(current);
-	const fresh = new Y.Doc({ guid: current.guid });
+	const previousEncoded = crdtEngine.encodeStateAsUpdate(current);
+	const fresh = crdtEngine.createDocument(current.guid);
 	try {
-		fresh.getMap("sys").set("schemaVersion", SCHEMA_VERSION);
-		fresh.getMap("sys").set("protocolVersion", PROTOCOL_VERSION);
-		const markdown = fresh.getMap<string>("pathToId");
-		const semantic = fresh.getMap<SemanticPathRef>("pathToSemantic");
-		const refs = fresh.getMap<{ hash: string; size: number; revision: string }>("pathToBlob");
-		const metadata = fresh.getMap<{ size: number; mime: string; createdAt: number }>("blobMeta");
-		const tombstones = fresh.getMap<{ deletedAt: number; previousHash: string | null; revision: string }>("blobTombstones");
+		const markdown = new Map<string, string>();
+		const semantic = new Map<string, SemanticPathRef>();
+		const refs = new Map<string, { hash: string; size: number; revision: string }>();
+		const metadata = new Map<string, { size: number; mime: string; createdAt: number }>();
+		const tombstones = new Map<string, { deletedAt: number; previousHash: string | null; revision: string }>();
 		const occupiedPaths = new Set<string>();
 		const identities = new Set<string>();
 		const attachmentPaths = new Set<string>();
@@ -205,7 +186,17 @@ export function prepareRootSemanticReset(
 			if (!meta || meta.size !== ref.size) throw new Error("semantic reset rejected incomplete blob metadata");
 		}
 
-		const encodedState = Y.encodeStateAsUpdate(fresh);
+		const operations: CrdtRootOperation[] = [
+			mapSet("sys", "schemaVersion", SCHEMA_VERSION),
+			mapSet("sys", "protocolVersion", PROTOCOL_VERSION),
+			...[...markdown].map(([key, value]) => mapSet("pathToId", key, value)),
+			...[...semantic].map(([key, value]) => mapSet("pathToSemantic", key, value)),
+			...[...refs].map(([key, value]) => mapSet("pathToBlob", key, value)),
+			...[...metadata].map(([key, value]) => mapSet("blobMeta", key, value)),
+			...[...tombstones].map(([key, value]) => mapSet("blobTombstones", key, value)),
+		];
+		crdtEngine.applyRootOperations(fresh, operations, "root-semantic-reset");
+		const encodedState = crdtEngine.encodeStateAsUpdate(fresh);
 		return {
 			document: fresh,
 			encodedState,
@@ -213,7 +204,7 @@ export function prepareRootSemanticReset(
 			fresh: { ...semanticDocumentCensus(fresh), encodedStateBytes: encodedState.byteLength },
 		};
 	} catch (error) {
-		fresh.destroy();
+		crdtEngine.destroyDocument(fresh);
 		throw error;
 	}
 }
@@ -223,19 +214,21 @@ export function prepareRootSemanticReset(
  * conflict records, ordering churn, and all prior CRDT identities deliberately
  * stay in the retired epoch.
  */
-export async function prepareCanvasSemanticReset(current: Y.Doc): Promise<PreparedCanvasSemanticReset> {
+export async function prepareCanvasSemanticReset(current: YwasmCrdtDocument): Promise<PreparedCanvasSemanticReset> {
 	const validation = await validateCanvasDocument(current);
-	if (validation) throw new Error(`semantic reset rejected invalid canvas: ${validation}`);
-	const data = await materializeCanvasDocument(current, false);
-	const canonical = canonicalCanvasBytes(data);
-	const previousEncoded = Y.encodeStateAsUpdate(current);
-	const fresh = new Y.Doc({ guid: current.guid });
+	if (validation.error !== null) throw new Error(`semantic reset rejected invalid canvas: ${validation.error}`);
+	const parsed = parseCanvasBytes(validation.canonicalBytes);
+	if (parsed.kind !== "valid") throw new Error("semantic reset rejected invalid canonical canvas");
+	const data = parsed.data;
+	const canonical = validation.canonicalBytes;
+	const previousEncoded = crdtEngine.encodeStateAsUpdate(current);
+	const fresh = crdtEngine.createDocument(current.guid);
 	try {
 		initializeCanvasDocument(fresh);
 		importCanvasData(fresh, data, "canvas-semantic-reset");
 		const freshValidation = await validateCanvasDocument(fresh);
-		if (freshValidation) throw new Error(`semantic reset produced invalid canvas: ${freshValidation}`);
-		const encodedState = Y.encodeStateAsUpdate(fresh);
+		if (freshValidation.error) throw new Error(`semantic reset produced invalid canvas: ${freshValidation.error}`);
+		const encodedState = crdtEngine.encodeStateAsUpdate(fresh);
 		return {
 			document: fresh,
 			encodedState,
@@ -244,22 +237,8 @@ export async function prepareCanvasSemanticReset(current: Y.Doc): Promise<Prepar
 			fresh: { ...semanticDocumentCensus(fresh), encodedStateBytes: encodedState.byteLength },
 		};
 	} catch (error) {
-		fresh.destroy();
+		crdtEngine.destroyDocument(fresh);
 		throw error;
-	}
-}
-
-/**
- * Updates loaded into an otherwise empty Y.Doc initially expose AbstractType
- * placeholders. Resolve them through YAOS's schema before inspecting their
- * constructors; guessing from the placeholder would conflate Y.Text/Y.Array.
- */
-function materializeSemanticRoots(doc: Y.Doc, scope: "body"): void {
-	doc.getText("body");
-	for (const name of doc.share.keys()) {
-		if (!name.startsWith("frontmatter:")) continue;
-		if (name.startsWith("frontmatter:ordered:")) doc.getArray(name);
-		else doc.getMap(name);
 	}
 }
 
@@ -287,6 +266,15 @@ function validBlob(hash: string | null, size: number | null): hash is string {
 
 function assertCatalogInteger(value: number, label: string, minimum = 0): void {
 	if (!Number.isSafeInteger(value) || value < minimum) throw new Error(`semantic reset rejected invalid ${label}`);
+}
+
+function mapSet(root: string, key: string, value: unknown): CrdtRootOperation {
+	return { kind: "map-set", root, key, value: { shared: "value", value: cloneSemanticValue(value) } };
+}
+
+function cloneSemanticSnapshot(value: CrdtValueSnapshot): CrdtValueSnapshot {
+	if (value.shared !== "value") throw new Error("nested shared types are not semantic reset values");
+	return { shared: "value", value: cloneSemanticValue(value.value) };
 }
 
 function cloneSemanticValue(value: unknown): unknown {

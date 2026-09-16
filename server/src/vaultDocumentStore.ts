@@ -1,4 +1,5 @@
-import * as Y from "yjs";
+import type { YwasmCrdtDocument } from "./crdt/ywasmCrdtEngine";
+import { ywasmCrdtEngine as crdtEngine } from "@yaos/crdt-engine";
 import { SCHEMA_VERSION, STORAGE_FORMAT_VERSION } from "./shared/productVersions";
 import type { BodyLifecycle, CatalogHeadAtBoundary, SemanticCatalogHead } from "./vaultCatalogStore";
 import type { HistoryPin } from "./vaultBootstrapStore";
@@ -145,7 +146,7 @@ export interface ReconstructedDocument {
 	semanticEpoch: SemanticEpoch;
 	checkpointSequence: number;
 	journalUpdates: number;
-	doc: Y.Doc;
+	doc: YwasmCrdtDocument;
 	rowsRead: number;
 }
 
@@ -175,6 +176,27 @@ export interface DurableSemanticCompactionState {
 	documentId: string;
 	lastCompactedAt: number | null;
 	postCompactionEncodedStateBytes: number | null;
+	retryRequired: boolean;
+	admissionPaused: boolean;
+	retryNotBefore: number | null;
+	retryFailureCount: number;
+	lastFailureClass: SemanticCompactionFailureClass | null;
+	lastFailureAt: number | null;
+}
+
+export type SemanticCompactionFailureClass =
+	| "transient-budget"
+	| "busy"
+	| "not-resident"
+	| "head-changed"
+	| "resource-limit"
+	| "trap"
+	| "internal";
+
+export interface DocumentJournalTailStats {
+	entries: number;
+	bytes: number;
+	checkpointSequence: number;
 }
 
 export interface JournalFeedEntry {
@@ -398,8 +420,19 @@ export abstract class VaultDocumentStore {
 				document_id TEXT PRIMARY KEY,
 				last_compacted_at INTEGER CHECK(last_compacted_at IS NULL OR last_compacted_at >= 0),
 				post_compaction_encoded_state_bytes INTEGER
-					CHECK(post_compaction_encoded_state_bytes IS NULL OR post_compaction_encoded_state_bytes >= 0)
+					CHECK(post_compaction_encoded_state_bytes IS NULL OR post_compaction_encoded_state_bytes >= 0),
+				retry_required INTEGER NOT NULL DEFAULT 0 CHECK(retry_required IN (0, 1)),
+				admission_paused INTEGER NOT NULL DEFAULT 0 CHECK(admission_paused IN (0, 1)),
+				retry_not_before INTEGER CHECK(retry_not_before IS NULL OR retry_not_before >= 0),
+				retry_failure_count INTEGER NOT NULL DEFAULT 0 CHECK(retry_failure_count >= 0),
+				last_failure_class TEXT CHECK(last_failure_class IS NULL OR last_failure_class IN
+					('transient-budget', 'busy', 'not-resident', 'head-changed', 'resource-limit', 'trap', 'internal')),
+				last_failure_at INTEGER CHECK(last_failure_at IS NULL OR last_failure_at >= 0),
+				CHECK(retry_required = 1 OR (retry_not_before IS NULL
+					AND (admission_paused = 0 OR last_failure_class = 'resource-limit')))
 			);
+			CREATE INDEX IF NOT EXISTS vault_semantic_compaction_retry_due
+				ON vault_semantic_compaction_state(retry_required, retry_not_before, document_id);
 			CREATE TABLE IF NOT EXISTS vault_journal (
 				sequence INTEGER PRIMARY KEY,
 				document_id TEXT NOT NULL,
@@ -1165,13 +1198,129 @@ export abstract class VaultDocumentStore {
 		const row = this.storage.sql.exec<{
 			document_id: string; last_compacted_at: number | null;
 			post_compaction_encoded_state_bytes: number | null;
-		}>(`SELECT document_id, last_compacted_at, post_compaction_encoded_state_bytes
+			retry_required: number; admission_paused: number; retry_not_before: number | null;
+			retry_failure_count: number; last_failure_class: SemanticCompactionFailureClass | null;
+			last_failure_at: number | null;
+		}>(`SELECT document_id, last_compacted_at, post_compaction_encoded_state_bytes,
+		          retry_required, admission_paused, retry_not_before, retry_failure_count,
+		          last_failure_class, last_failure_at
 		   FROM vault_semantic_compaction_state WHERE document_id = ?`, documentId).toArray()[0];
 		return row ? {
 			documentId: row.document_id,
 			lastCompactedAt: row.last_compacted_at,
 			postCompactionEncodedStateBytes: row.post_compaction_encoded_state_bytes,
+			retryRequired: row.retry_required === 1,
+			admissionPaused: row.admission_paused === 1,
+			retryNotBefore: row.retry_not_before,
+			retryFailureCount: row.retry_failure_count,
+			lastFailureClass: row.last_failure_class,
+			lastFailureAt: row.last_failure_at,
 		} : null;
+	}
+
+	markSemanticCompactionRetry(documentId: string, input: {
+		admissionPaused: boolean;
+		retryNotBefore: number;
+		failureClass?: SemanticCompactionFailureClass;
+		failedAttempt?: boolean;
+		now?: number;
+	}): DurableSemanticCompactionState {
+		this.initialize();
+		if (!documentId || !Number.isSafeInteger(input.retryNotBefore) || input.retryNotBefore < 0) {
+			throw new Error("invalid semantic compaction retry");
+		}
+		const now = input.now ?? Date.now();
+		if (!Number.isSafeInteger(now) || now < 0) throw new Error("invalid semantic compaction retry time");
+		const failed = input.failedAttempt === true;
+		if (failed && !input.failureClass) throw new Error("failed semantic compaction retry requires a class");
+		this.storage.sql.exec(`INSERT INTO vault_semantic_compaction_state(
+		 document_id, retry_required, admission_paused, retry_not_before, retry_failure_count,
+		 last_failure_class, last_failure_at
+		) VALUES (?, 1, ?, ?, ?, ?, ?)
+		ON CONFLICT(document_id) DO UPDATE SET
+		 retry_required=1,
+		 admission_paused=MAX(vault_semantic_compaction_state.admission_paused, excluded.admission_paused),
+		 retry_not_before=CASE
+		   WHEN ? = 1 THEN excluded.retry_not_before
+		   WHEN vault_semantic_compaction_state.retry_not_before IS NULL THEN excluded.retry_not_before
+		   ELSE MIN(vault_semantic_compaction_state.retry_not_before, excluded.retry_not_before)
+		 END,
+		 retry_failure_count=CASE WHEN ? = 1
+		   THEN MIN(9007199254740991, vault_semantic_compaction_state.retry_failure_count + 1)
+		   ELSE vault_semantic_compaction_state.retry_failure_count END,
+		 last_failure_class=CASE WHEN ? = 1 THEN excluded.last_failure_class
+		   ELSE vault_semantic_compaction_state.last_failure_class END,
+		 last_failure_at=CASE WHEN ? = 1 THEN excluded.last_failure_at
+		   ELSE vault_semantic_compaction_state.last_failure_at END`,
+			documentId, input.admissionPaused ? 1 : 0, input.retryNotBefore,
+			failed ? 1 : 0, failed ? input.failureClass : null, failed ? now : null,
+			failed ? 1 : 0, failed ? 1 : 0, failed ? 1 : 0, failed ? 1 : 0).toArray();
+		return this.semanticCompactionState(documentId)!;
+	}
+
+	markSemanticCompactionResourceLimit(
+		documentId: string,
+		expectedHead: CheckpointExpectedHead,
+		now = Date.now(),
+	): boolean {
+		this.initialize();
+		const limited = this.storage.sql.exec(`INSERT INTO vault_semantic_compaction_state(
+		 document_id, retry_required, admission_paused, retry_not_before, retry_failure_count,
+		 last_failure_class, last_failure_at
+		) SELECT ?, 0, 1, NULL, 0, 'resource-limit', ?
+		 WHERE EXISTS (SELECT 1 FROM vault_document_heads head WHERE head.document_id = ?
+		   AND head.generation = ? AND head.semantic_epoch = ? AND head.latest_sequence = ?)
+		ON CONFLICT(document_id) DO UPDATE SET
+		 retry_required=0, admission_paused=1, retry_not_before=NULL,
+		 last_failure_class='resource-limit', last_failure_at=excluded.last_failure_at
+		WHERE EXISTS (SELECT 1 FROM vault_document_heads head WHERE head.document_id = ?
+		   AND head.generation = ? AND head.semantic_epoch = ? AND head.latest_sequence = ?)`,
+			documentId, now, documentId, expectedHead.generation, expectedHead.semanticEpoch,
+			expectedHead.throughSequence, documentId, expectedHead.generation,
+			expectedHead.semanticEpoch, expectedHead.throughSequence);
+		limited.toArray();
+		return limited.rowsWritten === 1;
+	}
+
+	listSemanticCompactionRetries(now = Date.now(), limit = 25): DurableSemanticCompactionState[] {
+		this.initialize();
+		if (!Number.isSafeInteger(now) || now < 0 || !Number.isSafeInteger(limit) || limit < 1) {
+			throw new Error("invalid semantic compaction retry query");
+		}
+		const ids = this.storage.sql.exec<{ document_id: string }>(`SELECT document_id
+		  FROM vault_semantic_compaction_state
+		 WHERE retry_required = 1 AND COALESCE(retry_not_before, 0) <= ?
+		 ORDER BY COALESCE(retry_not_before, 0), document_id LIMIT ?`, now, limit).toArray();
+		return ids.map(({ document_id }) => this.semanticCompactionState(document_id)!);
+	}
+
+	listSemanticCompactionStates(limit = 100): DurableSemanticCompactionState[] {
+		this.initialize();
+		if (!Number.isSafeInteger(limit) || limit < 1) throw new Error("invalid semantic compaction state limit");
+		return this.storage.sql.exec<{ document_id: string }>(`SELECT document_id
+		  FROM vault_semantic_compaction_state
+		 ORDER BY retry_required DESC, COALESCE(retry_not_before, 0), document_id LIMIT ?`, limit)
+			.toArray().map(({ document_id }) => this.semanticCompactionState(document_id)!);
+	}
+
+	nextSemanticCompactionRetryAt(): number | null {
+		this.initialize();
+		return this.storage.sql.exec<{ due: number | null }>(`SELECT MIN(COALESCE(retry_not_before, 0)) AS due
+		  FROM vault_semantic_compaction_state WHERE retry_required = 1`).one().due;
+	}
+
+	clearSemanticCompactionRetry(documentId: string, expectedHead: CheckpointExpectedHead): boolean {
+		this.initialize();
+		const cleared = this.storage.sql.exec(`UPDATE vault_semantic_compaction_state
+		 SET retry_required=0, admission_paused=0, retry_not_before=NULL,
+		     retry_failure_count=0, last_failure_class=NULL, last_failure_at=NULL
+		 WHERE document_id = ? AND EXISTS (
+		   SELECT 1 FROM vault_document_heads head WHERE head.document_id = ?
+		    AND head.generation = ? AND head.semantic_epoch = ? AND head.latest_sequence = ?
+		 )`, documentId, documentId, expectedHead.generation, expectedHead.semanticEpoch,
+			expectedHead.throughSequence);
+		cleared.toArray();
+		return cleared.rowsWritten === 1;
 	}
 
 	documentJournalStats(documentId: string): { entries: number; bytes: number } {
@@ -1182,6 +1331,45 @@ export abstract class VaultDocumentStore {
 			documentId,
 		).one();
 		return row;
+	}
+
+	documentJournalTailStats(documentId: string): DocumentJournalTailStats {
+		this.initialize();
+		const row = this.storage.sql.exec<{ entries: number; bytes: number; checkpoint_sequence: number }>(`WITH checkpoint AS (
+		  SELECT COALESCE(MAX(checkpoint_sequence), 0) AS checkpoint_sequence
+		    FROM vault_checkpoint_manifests
+		   WHERE document_id = ? AND complete = 1
+		)
+		SELECT COUNT(journal.sequence) AS entries,
+		       COALESCE(SUM(journal.update_byte_length), 0) AS bytes,
+		       checkpoint.checkpoint_sequence AS checkpoint_sequence
+		  FROM checkpoint
+		  LEFT JOIN vault_journal journal
+		    ON journal.document_id = ? AND journal.sequence > checkpoint.checkpoint_sequence`,
+			documentId, documentId).one();
+		return { entries: row.entries, bytes: row.bytes, checkpointSequence: row.checkpoint_sequence };
+	}
+
+	listJournalCheckpointCandidates(entryThreshold: number, byteThreshold: number, limit = 25): string[] {
+		this.initialize();
+		if (!Number.isSafeInteger(entryThreshold) || entryThreshold < 1
+			|| !Number.isSafeInteger(byteThreshold) || byteThreshold < 1
+			|| !Number.isSafeInteger(limit) || limit < 1) throw new Error("invalid checkpoint candidate query");
+		return this.storage.sql.exec<{ document_id: string }>(`WITH checkpoint AS (
+		  SELECT head.document_id, COALESCE(MAX(manifest.checkpoint_sequence), 0) AS checkpoint_sequence
+		    FROM vault_document_heads head
+		    LEFT JOIN vault_checkpoint_manifests manifest
+		      ON manifest.document_id = head.document_id AND manifest.complete = 1
+		   GROUP BY head.document_id
+		)
+		SELECT journal.document_id
+		  FROM vault_journal journal
+		  JOIN checkpoint ON checkpoint.document_id = journal.document_id
+		   AND journal.sequence > checkpoint.checkpoint_sequence
+		 GROUP BY journal.document_id
+		HAVING COUNT(*) >= ? OR COALESCE(SUM(journal.update_byte_length), 0) >= ?
+		 ORDER BY MIN(journal.sequence), journal.document_id LIMIT ?`,
+			entryThreshold, byteThreshold, limit).toArray().map((row) => row.document_id);
 	}
 
 	reconstructDocument(documentId: string, throughSequence = this.currentSequence()): ReconstructedDocument {
@@ -1221,10 +1409,11 @@ export abstract class VaultDocumentStore {
 		const checkpointSequence = checkpoint?.checkpointSequence ?? 0;
 		let generation = checkpoint?.generation ?? 0;
 		let semanticEpoch = checkpoint?.semanticEpoch ?? INITIAL_SEMANTIC_EPOCH;
-		const doc = new Y.Doc({ guid: documentId });
-		if (checkpoint) {
-			Y.applyUpdate(doc, checkpoint.bytes, "checkpoint-load");
-		}
+		const doc = crdtEngine.createDocument(documentId);
+		try {
+			if (checkpoint) {
+				crdtEngine.applyUpdate(doc, checkpoint.bytes, "checkpoint-load");
+			}
 		const journal = this.storage.sql.exec<{
 			sequence: number; generation: number; semantic_epoch: number;
 			update_byte_length: number; data: DurableChunkValue;
@@ -1246,19 +1435,23 @@ export abstract class VaultDocumentStore {
 			if (parseSemanticEpoch(row.semantic_epoch) !== semanticEpoch) {
 				throw new Error("journal crosses a semantic epoch without a checkpoint");
 			}
-			Y.applyUpdate(doc, update, "journal-load");
+			crdtEngine.applyUpdate(doc, update, "journal-load");
 			generation = row.generation;
 			journalUpdates++;
 		}
 		rowsRead += journal.rowsRead;
-		return { documentId, throughSequence, generation, semanticEpoch, checkpointSequence, journalUpdates, doc, rowsRead };
+			return { documentId, throughSequence, generation, semanticEpoch, checkpointSequence, journalUpdates, doc, rowsRead };
+		} catch (error) {
+			crdtEngine.destroyDocument(doc);
+			throw error;
+		}
 	}
 
 	writeCheckpoint(documentId: string, throughSequence = this.currentSequence()): CheckpointWriteResult {
 		this.initialize();
 		const reconstructed = this.reconstructDocument(documentId, throughSequence);
-		const encoded = Y.encodeStateAsUpdate(reconstructed.doc);
-		reconstructed.doc.destroy();
+		const encoded = crdtEngine.encodeStateAsUpdate(reconstructed.doc);
+		crdtEngine.destroyDocument(reconstructed.doc);
 		return this.persistCheckpoint(documentId, encoded, {
 			throughSequence,
 			generation: reconstructed.generation,
@@ -1269,12 +1462,12 @@ export abstract class VaultDocumentStore {
 	/** Checkpoints an already-resident authoritative document without reconstructing its history. */
 	writeCheckpointFromDocument(
 		documentId: string,
-		doc: Y.Doc,
+		doc: YwasmCrdtDocument,
 		expectedHead: CheckpointExpectedHead,
 	): CheckpointWriteResult {
 		this.initialize();
 		this.assertExactCheckpointHead(documentId, expectedHead);
-		return this.persistCheckpoint(documentId, Y.encodeStateAsUpdate(doc), expectedHead, true);
+		return this.persistCheckpoint(documentId, crdtEngine.encodeStateAsUpdate(doc), expectedHead, true);
 	}
 
 	/** Persists an exact encoded authoritative state, fenced against the current durable document head. */
@@ -1457,11 +1650,15 @@ export abstract class VaultDocumentStore {
 				rowsWritten += migratedPublications.rowsWritten;
 			}
 			const compactionState = this.storage.sql.exec(`INSERT INTO vault_semantic_compaction_state(
-			 document_id, last_compacted_at, post_compaction_encoded_state_bytes
-			) VALUES (?, ?, ?)
+			 document_id, last_compacted_at, post_compaction_encoded_state_bytes,
+			 retry_required, admission_paused, retry_not_before, retry_failure_count,
+			 last_failure_class, last_failure_at
+			) VALUES (?, ?, ?, 0, 0, NULL, 0, NULL, NULL)
 			ON CONFLICT(document_id) DO UPDATE SET
 			 last_compacted_at=excluded.last_compacted_at,
-			 post_compaction_encoded_state_bytes=excluded.post_compaction_encoded_state_bytes`,
+			 post_compaction_encoded_state_bytes=excluded.post_compaction_encoded_state_bytes,
+			 retry_required=0, admission_paused=0, retry_not_before=NULL,
+			 retry_failure_count=0, last_failure_class=NULL, last_failure_at=NULL`,
 				documentId, now, freshEncodedState.byteLength);
 			compactionState.toArray();
 			rowsWritten += compactionState.rowsWritten;

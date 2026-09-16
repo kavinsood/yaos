@@ -10,12 +10,12 @@
 	"scripts": {
 		"build": "node esbuild.config.mjs",
 		"typecheck": "tsc --noEmit -p tsconfig.json",
-		"dev": "node --import jiti/register src/index.ts",
+		"dev": "npm run build && npm run start",
 		"start": "node dist/server.mjs",
 		"retry-alarm": "node dist/server.mjs --retry-alarm"
 	},
 	"files": [
-		"dist/server.mjs"
+		"dist"
 	],
 	"dependencies": {
 		"ws": "8.21.3"

@@ -40,6 +40,7 @@ function forwardedBodyLimit(request: Request, runtimePath: string): number | nul
 	if (!request.body || request.method === "GET" || request.method === "HEAD") return null;
 	if (/^\/(?:body|semantic)\/[^/]+\/candidate$/.test(runtimePath)
 		|| runtimePath === "/semantic/authority/promote") return MAX_CANDIDATE_BYTES;
+	if (runtimePath === "/body/candidates") return MAX_CATCH_UP_BYTES;
 	if (runtimePath === "/catch-up") return MAX_CATCH_UP_BYTES;
 	if (runtimePath.startsWith("/settings-sync/") && request.method === "PUT") {
 		const action = runtimePath.split("/")[3];

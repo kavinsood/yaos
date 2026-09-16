@@ -1,6 +1,7 @@
 import { SCHEMA_VERSION, STORAGE_FORMAT_VERSION } from "./shared/productVersions";
 import { isCanonicalVaultId } from "./vaultId";
 import { MAX_DURABLE_UPDATE_BYTES } from "./contracts";
+import { MAX_CANDIDATE_UPDATE_BYTES, MAX_CANDIDATE_UPDATE_FRAMES } from "./shared/durableLimits";
 import { INITIAL_SEMANTIC_EPOCH, parseSemanticEpoch, type SemanticEpoch } from "./shared/semanticEpoch";
 import { RecoveryAuthorityStore } from "./recoveryAuthorityStore";
 import type { VaultActorContext } from "./collaboration";
@@ -17,7 +18,9 @@ import {
 	type DurableLifecycleRecord,
 } from "./vaultCatalogStore";
 import type {
+	CheckpointExpectedHead,
 	DurableCommitResult,
+	SemanticResetResult,
 	VaultCommitKind,
 	VaultProvisioningResult,
 } from "./vaultDocumentStore";
@@ -64,6 +67,14 @@ export interface SemanticAuthorityReceipt {
 	vaultGeneration: string;
 	runtimeEpoch: string;
 	createdAt: number;
+}
+
+export interface DurableCommitObservation {
+	documentId: string;
+	ingressBytes: number;
+	commitLatencyMs: number;
+	vaultSequence: number;
+	sequenceReset?: boolean;
 }
 export type {
 	AttachmentCatalogEvent,
@@ -124,6 +135,33 @@ export type {
 
 /** Compatibility facade for cross-domain atomic vault mutations. */
 export class VaultStore extends RecoveryAuthorityStore {
+	private commitObserver: ((observation: DurableCommitObservation) => void) | null = null;
+
+	setCommitObserver(observer: ((observation: DurableCommitObservation) => void) | null): void {
+		this.commitObserver = observer;
+	}
+
+	private observeCommit(observation: DurableCommitObservation): void {
+		try { this.commitObserver?.(observation); }
+		catch (error) {
+			// The SQLite transaction is already authoritative. Observability and
+			// maintenance must never turn a committed mutation into a reported failure.
+			console.warn("[yaos-vault] post-commit observer failed", error);
+		}
+	}
+
+	override semanticResetFromEncodedState(
+		documentId: string,
+		freshEncodedState: Uint8Array,
+		expectedHead: CheckpointExpectedHead,
+		now = Date.now(),
+	): SemanticResetResult {
+		const startedAt = performance.now();
+		const result = super.semanticResetFromEncodedState(documentId, freshEncodedState, expectedHead, now);
+		this.observeCommit({ documentId, ingressBytes: freshEncodedState.byteLength,
+			commitLatencyMs: performance.now() - startedAt, vaultSequence: result.vaultSequence });
+		return result;
+	}
 	semanticAuthorityReceipt(operationId: string): SemanticAuthorityReceipt | null {
 		this.initialize();
 		const row = this.storage.sql.exec<{
@@ -154,6 +192,7 @@ export class VaultStore extends RecoveryAuthorityStore {
 		actor: VaultActorContext;
 		now?: number;
 	}): SemanticAuthorityReceipt {
+		const commitStartedAt = performance.now();
 		this.initialize();
 		const existing = this.semanticAuthorityReceipt(input.operationId);
 		if (existing) {
@@ -230,6 +269,11 @@ export class VaultStore extends RecoveryAuthorityStore {
 				input.actor.membershipRevision, input.actor.deviceId, input.actor.deviceCredentialRevision,
 				input.operationId, input.requestDigest).toArray();
 		});
+		const commitLatencyMs = performance.now() - commitStartedAt;
+		this.observeCommit({ documentId: input.documentId, ingressBytes: input.semanticUpdate.byteLength,
+			commitLatencyMs, vaultSequence: rootSequence - 1 });
+		this.observeCommit({ documentId: "root", ingressBytes: input.rootUpdate.byteLength,
+			commitLatencyMs, vaultSequence: rootSequence });
 		return { operationId: input.operationId, requestDigest: input.requestDigest, kind: "promote",
 			path: input.path, documentId: input.documentId, sourceRevision: input.sourceRevision,
 			contentHash: input.contentHash, size: input.size, documentGeneration, bodyEpoch: input.bodyEpoch, rootSequence,
@@ -246,6 +290,7 @@ export class VaultStore extends RecoveryAuthorityStore {
 		actor: VaultActorContext;
 		now?: number;
 	}): SemanticAuthorityReceipt {
+		const commitStartedAt = performance.now();
 		this.initialize();
 		const existing = this.semanticAuthorityReceipt(input.operationId);
 		if (existing) {
@@ -307,6 +352,8 @@ export class VaultStore extends RecoveryAuthorityStore {
 				input.actor.membershipRevision, input.actor.deviceId, input.actor.deviceCredentialRevision,
 				input.operationId, input.requestDigest).toArray();
 		});
+		this.observeCommit({ documentId: "root", ingressBytes: input.rootUpdate.byteLength,
+			commitLatencyMs: performance.now() - commitStartedAt, vaultSequence: rootSequence });
 		return { operationId: input.operationId, requestDigest: input.requestDigest, kind: "demote",
 			path: input.path, documentId: input.documentId, sourceRevision: input.sourceRevision,
 			contentHash: input.contentHash, size: input.size, documentGeneration: input.expectedDocumentGeneration,
@@ -371,6 +418,7 @@ export class VaultStore extends RecoveryAuthorityStore {
 	}
 
 	resetActiveState(rootUpdate: Uint8Array, now = Date.now()): void {
+		const commitStartedAt = performance.now();
 		if (rootUpdate.byteLength === 0 || rootUpdate.byteLength > MAX_DURABLE_UPDATE_BYTES) {
 			throw new Error("root update exceeds durable value limit");
 		}
@@ -419,6 +467,8 @@ export class VaultStore extends RecoveryAuthorityStore {
 			"INSERT INTO vault_document_heads(document_id, generation, semantic_epoch, latest_sequence) VALUES ('root', 1, 1, 1)",
 			).toArray();
 		});
+		this.observeCommit({ documentId: "root", ingressBytes: rootUpdate.byteLength,
+			commitLatencyMs: performance.now() - commitStartedAt, vaultSequence: 1, sequenceReset: true });
 	}
 
 	commitCandidate(input: {
@@ -428,7 +478,10 @@ export class VaultStore extends RecoveryAuthorityStore {
 		candidateId: string;
 		candidateDigest: string;
 		bodyEpoch: SemanticEpoch;
-		update: Uint8Array;
+		/** Legacy one-frame form. */
+		update?: Uint8Array;
+		/** Ordered, independently valid CRDT frames for one logical candidate. */
+		updates?: readonly Uint8Array[];
 		expectedHead: { generation: number; semanticEpoch: SemanticEpoch; latestSequence: number } | null;
 		changesState: boolean;
 		vaultGeneration: string;
@@ -436,8 +489,21 @@ export class VaultStore extends RecoveryAuthorityStore {
 		actor: VaultActorContext;
 		now?: number;
 	}): DurableCandidateReceipt {
-		if (input.update.byteLength === 0 || input.update.byteLength > MAX_DURABLE_UPDATE_BYTES) {
-			throw new Error("candidate update exceeds durable value limit");
+		if (input.update && input.updates) throw new Error("candidate update form is ambiguous");
+		const updates = input.updates ?? (input.update ? [input.update] : []);
+		if (updates.length === 0 || updates.length > MAX_CANDIDATE_UPDATE_FRAMES) {
+			throw new Error("invalid candidate frame count");
+		}
+		let ingressBytes = 0;
+		for (const update of updates) {
+			if (!(update instanceof Uint8Array) || update.byteLength === 0
+				|| update.byteLength > MAX_DURABLE_UPDATE_BYTES) {
+				throw new Error("candidate update exceeds durable value limit");
+			}
+			ingressBytes += update.byteLength;
+			if (!Number.isSafeInteger(ingressBytes) || ingressBytes > MAX_CANDIDATE_UPDATE_BYTES) {
+				throw new Error("candidate update exceeds aggregate limit");
+			}
 		}
 		if (!input.bodyId || input.bodyId.length > 256 || !input.clientId || input.clientId.length > 256
 			|| !input.candidateId || input.candidateId.length > 256
@@ -465,38 +531,103 @@ export class VaultStore extends RecoveryAuthorityStore {
 			}
 			return existing;
 		}
-		const currentHead = this.documentHead(input.bodyId);
-		if (currentHead?.generation !== input.expectedHead?.generation
-			|| currentHead?.semanticEpoch !== input.expectedHead?.semanticEpoch
-			|| currentHead?.latestSequence !== input.expectedHead?.latestSequence) {
-			throw new Error("candidate_generation_fence_changed");
-		}
-		if (currentHead?.semanticEpoch !== parseSemanticEpoch(input.bodyEpoch, "candidate body epoch")) {
-			throw new Error("candidate_semantic_epoch_fence_changed");
-		}
-		const commit = input.changesState
-			? this.commitUpdate({ documentId: input.bodyId, update: input.update, kind: "body", expectedHead: input.expectedHead,
-				catalog: input.catalog, now: input.now,
-				actorAttributions: [{ actor: input.actor, operationId: input.candidateId, requestDigest: input.candidateDigest }] })
-			: {
-				vaultSequence: currentHead?.latestSequence ?? 0,
-				generation: currentHead?.generation ?? 0,
-				semanticEpoch: currentHead?.semanticEpoch ?? input.bodyEpoch,
-			};
-		if (commit.generation <= 0) throw new Error("body state is missing");
-		const receipt: DurableCandidateReceipt = {
-			bodyId: input.bodyId,
-			clientId: input.clientId,
-			candidateId: input.candidateId,
-			candidateDigest: input.candidateDigest,
-			bodyEpoch: commit.semanticEpoch,
-			durableGeneration: commit.generation,
-			vaultSequence: commit.vaultSequence,
-			vaultGeneration: input.vaultGeneration,
-			runtimeEpoch: input.runtimeEpoch,
-		};
+		const commitStartedAt = performance.now();
+		let receipt!: DurableCandidateReceipt;
 		this.storage.transactionSync(() => {
 			this.assertActorCurrent(input.actor);
+			const headQuery = this.storage.sql.exec<{ generation: number; semantic_epoch: number; latest_sequence: number }>(
+				"SELECT generation, semantic_epoch, latest_sequence FROM vault_document_heads WHERE document_id = ?",
+				input.bodyId,
+			);
+			const currentHead = headQuery.toArray()[0];
+			if (currentHead?.generation !== input.expectedHead?.generation
+				|| currentHead?.semantic_epoch !== input.expectedHead?.semanticEpoch
+				|| currentHead?.latest_sequence !== input.expectedHead?.latestSequence) {
+				throw new Error("candidate_generation_fence_changed");
+			}
+			const semanticEpoch = parseSemanticEpoch(input.bodyEpoch, "candidate body epoch");
+			if (currentHead?.semantic_epoch !== semanticEpoch) {
+				throw new Error("candidate_semantic_epoch_fence_changed");
+			}
+			if (!currentHead || currentHead.generation <= 0) throw new Error("body state is missing");
+
+			let vaultSequence = currentHead.latest_sequence;
+			let generation = currentHead.generation;
+			if (input.changesState) {
+				generation++;
+				const clock = this.storage.sql.exec<{ sequence: number }>(
+					"UPDATE vault_clock SET sequence = sequence + ? WHERE id = 1 RETURNING sequence",
+					updates.length,
+				);
+				vaultSequence = clock.one().sequence;
+				const firstSequence = vaultSequence - updates.length + 1;
+				for (const [index, update] of updates.entries()) {
+					this.storage.sql.exec(
+						`INSERT INTO vault_journal(sequence, document_id, generation, semantic_epoch, kind,
+						 update_byte_length, data, created_at) VALUES (?, ?, ?, ?, 'body', ?, ?, ?)`,
+						firstSequence + index,
+						input.bodyId,
+						generation,
+						semanticEpoch,
+						update.byteLength,
+						update.slice().buffer,
+						now,
+					).toArray();
+				}
+				this.storage.sql.exec(
+					`INSERT INTO vault_mutation_attribution(
+					 sequence, mutation_index, principal_id, membership_revision, device_id,
+					 device_credential_revision, operation_id, request_digest
+					) VALUES (?, 0, ?, ?, ?, ?, ?, ?)`,
+					vaultSequence,
+					input.actor.principalId,
+					input.actor.membershipRevision,
+					input.actor.deviceId,
+					input.actor.deviceCredentialRevision,
+					input.candidateId,
+					input.candidateDigest,
+				).toArray();
+				this.storage.sql.exec(
+					`INSERT INTO vault_document_heads(document_id, generation, semantic_epoch, latest_sequence)
+					 VALUES (?, ?, ?, ?)
+					 ON CONFLICT(document_id) DO UPDATE SET generation = excluded.generation,
+					 semantic_epoch = excluded.semantic_epoch, latest_sequence = excluded.latest_sequence`,
+					input.bodyId,
+					generation,
+					semanticEpoch,
+					vaultSequence,
+				).toArray();
+				if (input.catalog) {
+					this.assertCatalogPathUniqueness([input.catalog], vaultSequence - 1);
+					this.storage.sql.exec(
+						`INSERT INTO vault_catalog_events(
+						 sequence, body_id, file_id, path, previous_path, lifecycle, generation, body_epoch,
+						 content_hash, size, mutation_index
+						) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
+						vaultSequence,
+						input.catalog.bodyId,
+						input.catalog.fileId,
+						input.catalog.path,
+						input.catalog.previousPath ?? null,
+						input.catalog.lifecycle,
+						input.catalog.bodyGeneration,
+						semanticEpoch,
+						input.catalog.contentHash ?? null,
+						input.catalog.size ?? null,
+					).toArray();
+				}
+			}
+			receipt = {
+				bodyId: input.bodyId,
+				clientId: input.clientId,
+				candidateId: input.candidateId,
+				candidateDigest: input.candidateDigest,
+				bodyEpoch: semanticEpoch,
+				durableGeneration: generation,
+				vaultSequence,
+				vaultGeneration: input.vaultGeneration,
+				runtimeEpoch: input.runtimeEpoch,
+			};
 			this.storage.sql.exec(
 				`INSERT INTO vault_operation_outcomes(
 					 principal_id, membership_revision, device_id, device_credential_revision,
@@ -528,6 +659,10 @@ export class VaultStore extends RecoveryAuthorityStore {
 				now,
 			).toArray();
 		});
+		if (input.changesState) {
+			this.observeCommit({ documentId: input.bodyId, ingressBytes,
+				commitLatencyMs: performance.now() - commitStartedAt, vaultSequence: receipt.vaultSequence });
+		}
 		return receipt;
 	}
 
@@ -557,6 +692,7 @@ export class VaultStore extends RecoveryAuthorityStore {
 		provisioning?: { vaultId: string; vaultGeneration: string; provisionedAt: number };
 		now?: number;
 	}): DurableCommitResult {
+		const commitStartedAt = performance.now();
 		if (!input.documentId) throw new Error("documentId is required");
 		if (input.update.byteLength === 0) throw new Error("empty semantic update is not a commit");
 		if (input.update.byteLength > MAX_DURABLE_UPDATE_BYTES) {
@@ -853,7 +989,11 @@ export class VaultStore extends RecoveryAuthorityStore {
 				rowsWritten += inserted.rowsWritten;
 			}
 		});
-		return { vaultSequence: sequence, documentId: input.documentId, generation, semanticEpoch, kind: input.kind, rowsRead, rowsWritten };
+		const result = { vaultSequence: sequence, documentId: input.documentId, generation, semanticEpoch,
+			kind: input.kind, rowsRead, rowsWritten };
+		this.observeCommit({ documentId: input.documentId, ingressBytes: input.update.byteLength,
+			commitLatencyMs: performance.now() - commitStartedAt, vaultSequence: sequence });
+		return result;
 	}
 
 	/** Record lifecycle/catalog events in the same sequence as their root update. */

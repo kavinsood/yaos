@@ -2,6 +2,9 @@ name = "yaos"
 main = "src/index.ts"
 compatibility_date = "2026-03-02"
 
+[alias]
+"@yaos/crdt-engine" = "./src/crdt/ywasmWorkerCrdtEngine.ts"
+
 [[durable_objects.bindings]]
 name = "YAOS_SYNC"
 class_name = "VaultSyncServer"

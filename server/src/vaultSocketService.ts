@@ -1,8 +1,8 @@
 import * as decoding from "lib0/decoding";
 import * as encoding from "lib0/encoding";
-import * as syncProtocol from "y-protocols/sync";
 import { modifyAwarenessUpdate } from "y-protocols/awareness";
-import * as Y from "yjs";
+import type { CrdtDocument, CrdtEngine, CrdtRootSnapshot, CrdtValueSnapshot } from "./crdt/crdtEngine";
+import { readSyncMessage, writeSyncStep1, writeSyncStep2, writeSyncUpdate } from "./crdt/syncFraming";
 import { MAX_AWARENESS_BYTES, MAX_BODY_SOCKETS, MAX_CANDIDATE_BYTES, MAX_ROOT_SOCKETS } from "./contracts";
 import { sha256Hex } from "./hex";
 import {
@@ -21,7 +21,7 @@ import {
 	parseVaultPingFrame,
 	type BodyCurrentnessHead,
 } from "./shared/socketLiveness";
-import { validateFrontmatterSemanticRoots } from "./shared/frontmatterSemanticValidation";
+import { validateFrontmatterSemanticSnapshots } from "./crdt/frontmatterSemanticSnapshots";
 import { canonicalMarkdownBytes } from "./shared/markdownCodec";
 import { MAX_CLIENT_MARKDOWN_BYTES } from "./shared/durableLimits";
 import { AUTHORITY_SUPERSEDED_SOCKET_CLOSE_CODE } from "./shared/socketCloseCodes";
@@ -115,64 +115,107 @@ export function parseVaultSocketAttachment(value: unknown): VaultSocketAttachmen
 	return attachment as VaultSocketAttachment;
 }
 
-function protectedAttachmentState(doc: Y.Doc): string {
-	const sorted = (map: Y.Map<unknown>): Record<string, unknown> =>
-		Object.fromEntries([...map.entries()].sort(([left], [right]) => left.localeCompare(right)));
-	return JSON.stringify({
-		pathToBlob: sorted(doc.getMap("pathToBlob")),
-		pathToSemantic: sorted(doc.getMap("pathToSemantic")),
-		blobMeta: sorted(doc.getMap("blobMeta")),
-		blobTombstones: sorted(doc.getMap("blobTombstones")),
-	});
+function snapshotRoot(roots: readonly CrdtRootSnapshot[], name: string): CrdtRootSnapshot["value"] | undefined {
+	return roots.find((root) => root.name === name)?.value;
 }
 
-export function rootUpdateChangesProtectedAttachmentMaps(current: Y.Doc, update: Uint8Array): boolean {
-	const candidate = new Y.Doc({ guid: "root-protected-map-validation" });
+function snapshotMap(
+	roots: readonly CrdtRootSnapshot[],
+	name: string,
+): readonly (readonly [string, CrdtValueSnapshot])[] | null {
+	const value = snapshotRoot(roots, name);
+	return value === undefined ? [] : value.shared === "map" ? value.entries : null;
+}
+
+function directValue(value: CrdtValueSnapshot): unknown {
+	return value.shared === "value" ? value.value : undefined;
+}
+
+function protectedAttachmentState(roots: readonly CrdtRootSnapshot[]): string | null {
+	const sorted = (name: string): readonly (readonly [string, CrdtValueSnapshot])[] | null => {
+		const entries = snapshotMap(roots, name);
+		return entries && [...entries].sort(([left], [right]) => left.localeCompare(right));
+	};
+	const pathToBlob = sorted("pathToBlob");
+	const pathToSemantic = sorted("pathToSemantic");
+	const blobMeta = sorted("blobMeta");
+	const blobTombstones = sorted("blobTombstones");
+	return pathToBlob && pathToSemantic && blobMeta && blobTombstones
+		? JSON.stringify({ pathToBlob, pathToSemantic, blobMeta, blobTombstones })
+		: null;
+}
+
+function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
+	if (left.byteLength !== right.byteLength) return false;
+	for (let index = 0; index < left.byteLength; index++) if (left[index] !== right[index]) return false;
+	return true;
+}
+
+export function rootUpdateChangesProtectedAttachmentMaps<Doc extends CrdtDocument>(
+	current: Doc,
+	update: Uint8Array,
+	engine: CrdtEngine<Doc>,
+): boolean {
+	const candidate = engine.openDocument("root-protected-map-validation", engine.encodeStateAsUpdate(current));
 	try {
-		Y.applyUpdate(candidate, Y.encodeStateAsUpdate(current));
-		const before = protectedAttachmentState(candidate);
-		Y.applyUpdate(candidate, update);
-		return protectedAttachmentState(candidate) !== before;
+		const before = protectedAttachmentState(engine.snapshotRoots(candidate));
+		engine.applyUpdate(candidate, update, "root-protected-map-validation");
+		return before === null || protectedAttachmentState(engine.snapshotRoots(candidate)) !== before;
 	} catch {
 		return true;
 	} finally {
-		candidate.destroy();
+		engine.destroyDocument(candidate);
 	}
 }
 
-export function hasSafeRootAttachmentSemantics(doc: Y.Doc): boolean {
-	const refs = doc.getMap<unknown>("pathToBlob");
-	const markdown = doc.getMap<unknown>("pathToId");
-	const semantic = doc.getMap<unknown>("pathToSemantic");
-	const tombstones = doc.getMap<unknown>("blobTombstones");
-	for (const [path, value] of refs.entries()) {
+export function hasSafeRootAttachmentSemantics<Doc extends CrdtDocument>(
+	doc: Doc,
+	engine: CrdtEngine<Doc>,
+): boolean {
+	const roots = engine.snapshotRoots(doc);
+	const refs = snapshotMap(roots, "pathToBlob");
+	const markdown = snapshotMap(roots, "pathToId");
+	const semantic = snapshotMap(roots, "pathToSemantic");
+	const tombstones = snapshotMap(roots, "blobTombstones");
+	const blobMeta = snapshotMap(roots, "blobMeta");
+	if (!refs || !markdown || !semantic || !tombstones || !blobMeta) return false;
+	const refPaths = new Set(refs.map(([path]) => path));
+	const markdownPaths = new Set(markdown.map(([path]) => path));
+	const semanticPaths = new Set(semantic.map(([path]) => path));
+	const tombstonePaths = new Set(tombstones.map(([path]) => path));
+	for (const [path, snapshot] of refs) {
+		const value = directValue(snapshot);
 		if (typeof value !== "object" || value === null || Array.isArray(value)
 			|| !("hash" in value) || typeof value.hash !== "string"
 			|| !("size" in value) || typeof value.size !== "number"
 			|| !("revision" in value) || typeof value.revision !== "string" || !validIdentity(value.revision)
 			|| safeBlobPath(path, "", { hash: value.hash, size: value.size }) !== path
-			|| tombstones.has(path)) return false;
+			|| tombstonePaths.has(path)) return false;
 	}
-	for (const [path, value] of tombstones.entries()) {
+	for (const [path, snapshot] of tombstones) {
+		const value = directValue(snapshot);
 		if (safeBlobPath(path) !== path || typeof value !== "object" || value === null || Array.isArray(value)
 			|| !("deletedAt" in value) || !Number.isSafeInteger(value.deletedAt) || (value.deletedAt as number) < 0
 			|| !("revision" in value) || typeof value.revision !== "string" || !validIdentity(value.revision)
 			|| !("previousHash" in value) || (value.previousHash !== null
-				&& (typeof value.previousHash !== "string" || !/^[a-f0-9]{64}$/.test(value.previousHash)))) return false;
+			&& (typeof value.previousHash !== "string" || !/^[a-f0-9]{64}$/.test(value.previousHash)))) return false;
 	}
-	for (const [hash, value] of doc.getMap<unknown>("blobMeta").entries()) {
+	for (const [hash, snapshot] of blobMeta) {
+		const value = directValue(snapshot);
 		if (!/^[a-f0-9]{64}$/.test(hash) || typeof value !== "object" || value === null || Array.isArray(value)
 			|| !("size" in value) || !Number.isSafeInteger(value.size) || (value.size as number) < 0
 			|| !("mime" in value) || typeof value.mime !== "string" || value.mime.length === 0 || value.mime.length > 256
 			|| !("createdAt" in value) || !Number.isSafeInteger(value.createdAt) || (value.createdAt as number) < 0) return false;
 	}
-	for (const [path, value] of markdown.entries()) {
+	for (const [path, snapshot] of markdown) {
+		const value = directValue(snapshot);
 		if (typeof value !== "string" || !validIdentity(value) || !path.endsWith(".md")
-			|| refs.has(path) || semantic.has(path)) return false;
+			|| refPaths.has(path) || semanticPaths.has(path)) return false;
 	}
 	const semanticIds = new Set<string>();
-	for (const [path, value] of semantic.entries()) {
-		if (safeCanvasPath(path) !== path || refs.has(path) || markdown.has(path)
+	for (const [path, snapshot] of semantic) {
+		const value = directValue(snapshot);
+		if (safeCanvasPath(path) !== path || refPaths.has(path) || markdownPaths.has(path)
 			|| typeof value !== "object" || value === null || Array.isArray(value)) return false;
 		const ref = value as Partial<SemanticPathRef>;
 		const documentId = ref.documentId;
@@ -183,69 +226,80 @@ export function hasSafeRootAttachmentSemantics(doc: Y.Doc): boolean {
 	return true;
 }
 
-export function rootUpdateHasSafeAttachmentSemantics(current: Y.Doc, update: Uint8Array): boolean {
-	const candidate = new Y.Doc({ guid: "root-attachment-validation" });
+export function rootUpdateHasSafeAttachmentSemantics<Doc extends CrdtDocument>(
+	current: Doc,
+	update: Uint8Array,
+	engine: CrdtEngine<Doc>,
+): boolean {
+	const candidate = engine.openDocument("root-attachment-validation", engine.encodeStateAsUpdate(current));
 	try {
-		Y.applyUpdate(candidate, Y.encodeStateAsUpdate(current));
-		Y.applyUpdate(candidate, update);
-		return hasSafeRootAttachmentSemantics(candidate);
+		engine.applyUpdate(candidate, update, "root-attachment-validation");
+		return hasSafeRootAttachmentSemantics(candidate, engine);
 	} catch {
 		return false;
 	} finally {
-		candidate.destroy();
+		engine.destroyDocument(candidate);
 	}
 }
 
 /** Root sockets are replication outputs. Only durable publication services may mutate the root. */
-export function rootUpdateChangesDocument(current: Y.Doc, update: Uint8Array): boolean {
-	const candidate = new Y.Doc({ guid: "root-client-update-validation" });
-	let changed = false;
+export function rootUpdateChangesDocument<Doc extends CrdtDocument>(
+	current: Doc,
+	update: Uint8Array,
+	engine: CrdtEngine<Doc>,
+): boolean {
+	const before = engine.encodeStateAsUpdate(current);
+	const candidate = engine.openDocument("root-client-update-validation", before);
 	try {
-		Y.applyUpdate(candidate, Y.encodeStateAsUpdate(current));
-		const observer = (): void => { changed = true; };
-		candidate.on("update", observer);
-		try {
-			Y.applyUpdate(candidate, update, "root-client-update-validation");
-		} finally {
-			candidate.off("update", observer);
-		}
-		return changed;
+		engine.applyUpdate(candidate, update, "root-client-update-validation");
+		return !sameBytes(before, engine.encodeStateAsUpdate(candidate));
 	} catch {
 		return true;
 	} finally {
-		candidate.destroy();
+		engine.destroyDocument(candidate);
 	}
 }
 
 /** The Yjs handshake sends a sync-step-2 update even when the peer has no data. */
-export function isStructurallyEmptyYjsUpdate(update: Uint8Array): boolean {
+export function isStructurallyEmptyYjsUpdate<Doc extends CrdtDocument>(
+	update: Uint8Array,
+	engine: CrdtEngine<Doc>,
+): boolean {
+	const empty = engine.createDocument("empty-handshake-update");
 	try {
-		const decoded = Y.decodeUpdate(update);
-		return decoded.structs.length === 0 && decoded.ds.clients.size === 0;
+		return sameBytes(update, engine.encodeStateAsUpdate(empty));
 	} catch {
 		return false;
+	} finally {
+		engine.destroyDocument(empty);
 	}
 }
 
-export function bodyUpdateAdmissionError(current: Y.Doc, update: Uint8Array): string | null {
-	const candidate = new Y.Doc({ guid: "body-frontmatter-semantic-validation" });
+const FRONTMATTER_ROOT_FILTER = { prefixes: ["frontmatter:"] } as const;
+
+export function bodyUpdateAdmissionError<Doc extends CrdtDocument>(
+	current: Doc,
+	update: Uint8Array,
+	engine: CrdtEngine<Doc>,
+): string | null {
+	const candidate = engine.openDocument("body-frontmatter-semantic-validation", engine.encodeStateAsUpdate(current));
 	try {
-		Y.applyUpdate(candidate, Y.encodeStateAsUpdate(current));
-		Y.applyUpdate(candidate, update, "body-frontmatter-semantic-validation");
-		const semanticError = validateFrontmatterSemanticRoots(candidate);
+		engine.applyUpdate(candidate, update, "body-frontmatter-semantic-validation");
+		const semanticError = validateFrontmatterSemanticSnapshots(engine.snapshotRoots(candidate, FRONTMATTER_ROOT_FILTER));
 		if (semanticError) return semanticError;
-		return canonicalMarkdownBytes(Y.Text.prototype.toString.call(candidate.getText("body"))).byteLength
+		return canonicalMarkdownBytes(engine.readText(candidate, "body")).byteLength
 			> MAX_CLIENT_MARKDOWN_BYTES ? "markdown_size_limit" : null;
 	} catch {
 		return "frontmatter_semantic_root_invalid";
 	} finally {
-		candidate.destroy();
+		engine.destroyDocument(candidate);
 	}
 }
 
 export const bodyUpdateFrontmatterSemanticError = bodyUpdateAdmissionError;
 
 export interface SocketServiceOptions {
+	crdtEngine: CrdtEngine;
 	sockets: VaultSocketRegistryPort;
 	cache: VaultDocumentCache;
 	vaultId: () => string;
@@ -264,7 +318,8 @@ export interface SocketServiceOptions {
 	shouldPauseAdmission?: (documentId: string) => boolean;
 }
 
-function cachePressureResponse(reason: "body_cache_count" | "body_cache_encoded_state_bytes" | "vault_transient_bytes"): Response {
+function cachePressureResponse(reason: "body_cache_count" | "body_cache_encoded_state_bytes" | "vault_transient_bytes"
+	| "wasm_linear_memory_envelope"): Response {
 	return Response.json(
 		{ error: reason },
 		{ status: 429, headers: { "Retry-After": "1" } },
@@ -327,7 +382,8 @@ export class VaultSocketService {
 			if (kind !== "root" && error instanceof VaultDocumentCachePressureError) {
 				if (error.reason === "body_cache_count"
 					|| error.reason === "body_cache_encoded_state_bytes"
-					|| error.reason === "vault_transient_bytes") {
+					|| error.reason === "vault_transient_bytes"
+					|| error.reason === "wasm_linear_memory_envelope") {
 					return cachePressureResponse(error.reason);
 				}
 			}
@@ -365,7 +421,7 @@ export class VaultSocketService {
 		this.options.sockets.accept(server);
 		const encoder = encoding.createEncoder();
 		encoding.writeVarUint(encoder, MESSAGE_SYNC);
-		syncProtocol.writeSyncStep1(encoder, loaded.doc);
+		writeSyncStep1(encoder, this.options.crdtEngine, loaded.doc);
 		server.send(encoding.toUint8Array(encoder));
 		this.sendControl(server, {
 			type: "VAULT_READY",
@@ -626,7 +682,7 @@ export class VaultSocketService {
 		if (documentEpoch === null) return;
 		const encoder = encoding.createEncoder();
 		encoding.writeVarUint(encoder, MESSAGE_SYNC);
-		syncProtocol.writeUpdate(encoder, update);
+		writeSyncUpdate(encoder, update);
 		const frame = encoding.toUint8Array(encoder);
 		for (const socket of this.options.sockets.sockets()) {
 			if (excluded(socket)) continue;
@@ -643,8 +699,8 @@ export class VaultSocketService {
 			socket.close(1013, "semantic compaction pressure");
 			return;
 		}
-		const syncType = decoding.readVarUint(decoder);
-		if (syncType === 0) {
+		const syncMessage = readSyncMessage(decoder);
+		if (syncMessage.kind === "step-1") {
 			const loaded = this.options.cache.load(
 				attachment.documentId,
 				attachment.kind !== "root",
@@ -659,12 +715,11 @@ export class VaultSocketService {
 			}
 			const encoder = encoding.createEncoder();
 			encoding.writeVarUint(encoder, MESSAGE_SYNC);
-			syncProtocol.writeSyncStep2(encoder, loaded.doc, decoding.readVarUint8Array(decoder));
+			writeSyncStep2(encoder, this.options.crdtEngine, loaded.doc, syncMessage.stateVector);
 			socket.send(encoding.toUint8Array(encoder));
 			return;
 		}
-		if (syncType !== 1 && syncType !== 2) throw new Error(`unsupported sync message ${syncType}`);
-		const update = decoding.readVarUint8Array(decoder);
+		const update = syncMessage.update;
 		if (update.byteLength === 0 || update.byteLength > MAX_CANDIDATE_BYTES) {
 			socket.close(1009, "sync update exceeds durable value limit");
 			return;
@@ -674,7 +729,7 @@ export class VaultSocketService {
 			// empty sync-step-2 update during every handshake. Inspect its decoded
 			// structure without applying or cloning; any structs/deletes are a real
 			// client mutation and remain forbidden.
-			if (isStructurallyEmptyYjsUpdate(update)) return;
+			if (isStructurallyEmptyYjsUpdate(update, this.options.crdtEngine)) return;
 			const root = this.options.cache.load("root", false, () => true, "root");
 			if (root.semanticEpoch !== attachment.documentEpoch) {
 				this.fenceSocketIfStale(socket, attachment, root.semanticEpoch);
@@ -723,64 +778,67 @@ export class VaultSocketService {
 				}
 				throw error;
 			}
-			const contentHash = await sha256Hex(validated.contentBytes);
-			const actor = this.actorFromAttachment(attachment);
-			if (!(this.options.validateActor?.(actor) ?? true)) {
-				this.options.cache.discardValidatedBodyUpdate(attachment.documentId);
-				this.sendControl(socket, { type: "error", code: "authority_superseded", reason: "socket authority superseded" });
-				socket.close(AUTHORITY_SUPERSEDED_SOCKET_CLOSE_CODE, "socket authority superseded");
-				return;
-			}
-			if (this.fenceSocketIfStale(socket, attachment)) {
-				this.options.cache.discardValidatedBodyUpdate(attachment.documentId);
-				return;
-			}
-			let semanticHead: SemanticCatalogHead | undefined;
-			if (attachment.kind === "semantic") {
-				const current = this.options.currentSemanticHead?.(attachment.documentId);
-				if ((this.options.currentSemanticHead && (!current || current.lifecycle !== "active"))
-					|| (!this.options.currentSemanticHead && this.options.isActiveSemantic?.(attachment.documentId) !== true)) {
-					this.options.cache.discardValidatedBodyUpdate(attachment.documentId);
-					this.sendControl(socket, { type: "VAULT_ERROR", code: "semantic_document_not_active",
-						message: "semantic Canvas is no longer active" });
-					socket.close(1008, "semantic document is not active");
+			// Validation leaves the private mirror under this frame's ownership.
+			// Every exit before a successful stage must undo it, including an
+			// unexpected rejection from asynchronous content hashing.
+			let ownsValidation = true;
+			try {
+				const actor = this.actorFromAttachment(attachment);
+				if (!(this.options.validateActor?.(actor) ?? true)) {
+					this.sendControl(socket, { type: "error", code: "authority_superseded", reason: "socket authority superseded" });
+					socket.close(AUTHORITY_SUPERSEDED_SOCKET_CLOSE_CODE, "socket authority superseded");
 					return;
 				}
-				if (current?.bodyEpoch !== undefined && current.bodyEpoch !== attachment.documentEpoch) {
-					this.options.cache.discardValidatedBodyUpdate(attachment.documentId);
-					this.fenceSocketIfStale(socket, attachment, current.bodyEpoch);
+				if (this.fenceSocketIfStale(socket, attachment)) return;
+				let semanticHead: SemanticCatalogHead | undefined;
+				if (attachment.kind === "semantic") {
+					const current = this.options.currentSemanticHead?.(attachment.documentId);
+					if ((this.options.currentSemanticHead && (!current || current.lifecycle !== "active"))
+						|| (!this.options.currentSemanticHead && this.options.isActiveSemantic?.(attachment.documentId) !== true)) {
+						this.sendControl(socket, { type: "VAULT_ERROR", code: "semantic_document_not_active",
+							message: "semantic Canvas is no longer active" });
+						socket.close(1008, "semantic document is not active");
+						return;
+					}
+					if (current?.bodyEpoch !== undefined && current.bodyEpoch !== attachment.documentEpoch) {
+						this.fenceSocketIfStale(socket, attachment, current.bodyEpoch);
+						return;
+					}
+					semanticHead = current ?? undefined;
+				} else if (!this.options.isActiveBody(attachment.documentId)) {
+					this.sendControl(socket, { type: "VAULT_ERROR", code: "body_not_active", message: "body is no longer active" });
+					socket.close(1008, "body is not active");
 					return;
 				}
-				semanticHead = current ?? undefined;
-			} else if (!this.options.isActiveBody(attachment.documentId)) {
-				this.options.cache.discardValidatedBodyUpdate(attachment.documentId);
-				this.sendControl(socket, { type: "VAULT_ERROR", code: "body_not_active", message: "body is no longer active" });
-				socket.close(1008, "body is not active");
-				return;
-			}
-			if (!validated.requiresDurableCommit) {
+				if (!validated.requiresDurableCommit) {
+					this.options.cache.stageValidatedBodyUpdate(attachment.documentId, validated);
+					ownsValidation = false;
+					return;
+				}
+				// Content identity is derived at the debounced durable boundary. The
+				// flush reconstructs each partition against its exact durable prefix, so
+				// every intermediate catalog generation still receives the right hash
+				// without retaining one whole-document byte array per queued frame.
+				const queued = this.options.cache.queue(attachment.documentId, {
+					bytes: owned,
+					digest,
+					socketId: attachment.socketId,
+					actor,
+					kind: attachment.kind === "semantic" ? "semantic" : "body",
+					documentEpoch: attachment.documentEpoch,
+					...(semanticHead ? { semanticHead } : {}),
+				});
+				if (!queued.ok) {
+					this.sendControl(socket, { type: "VAULT_BACKPRESSURE", reason: queued.reason });
+					socket.close(1013, "pending durability budget exceeded");
+					return;
+				}
 				this.options.cache.stageValidatedBodyUpdate(attachment.documentId, validated);
-				return;
+				ownsValidation = false;
+				this.options.scheduleFlush(attachment.documentId);
+			} finally {
+				if (ownsValidation) this.options.cache.discardValidatedBodyUpdate(attachment.documentId);
 			}
-			const queued = this.options.cache.queue(attachment.documentId, {
-				bytes: owned,
-				digest,
-				socketId: attachment.socketId,
-				actor,
-				kind: attachment.kind === "semantic" ? "semantic" : "body",
-				documentEpoch: attachment.documentEpoch,
-				...(semanticHead ? { semanticHead } : {}),
-				contentHash,
-				contentSize: validated.contentBytes.byteLength,
-			});
-			if (!queued.ok) {
-				this.options.cache.discardValidatedBodyUpdate(attachment.documentId);
-				this.sendControl(socket, { type: "VAULT_BACKPRESSURE", reason: queued.reason });
-				socket.close(1013, "pending durability budget exceeded");
-				return;
-			}
-			this.options.cache.stageValidatedBodyUpdate(attachment.documentId, validated);
-			this.options.scheduleFlush(attachment.documentId);
 		});
 	}
 

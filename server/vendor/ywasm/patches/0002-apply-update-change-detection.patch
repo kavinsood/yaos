@@ -1,0 +1,117 @@
+diff --git a/yrs/src/doc.rs b/yrs/src/doc.rs
+index 84497e5..1c2e9f0 100644
+--- a/yrs/src/doc.rs
++++ b/yrs/src/doc.rs
+@@ -2241,6 +2241,38 @@ mod test {
+         assert!(stats.deleted_structs <= stats.total_structs);
+     }
+ 
++    #[test]
++    fn update_change_detection_covers_duplicate_and_delete_only_updates() {
++        let source = Doc::with_client_id(1);
++        let source_text = source.get_or_insert_text("body");
++        source_text.insert(&mut source.transact_mut(), 0, "hello");
++        let inserted = source.transact().encode_state_as_update_v1(&StateVector::default());
++
++        let target = Doc::with_client_id(2);
++        let mut txn = target.transact_mut();
++        txn.apply_update(Update::decode_v1(&inserted).unwrap()).unwrap();
++        assert!(txn.has_update_changes());
++        drop(txn);
++
++        let mut txn = target.transact_mut();
++        txn.apply_update(Update::decode_v1(&inserted).unwrap()).unwrap();
++        assert!(!txn.has_update_changes());
++        drop(txn);
++
++        let before_delete = source.transact().state_vector();
++        source_text.remove_range(&mut source.transact_mut(), 0, 1);
++        let deleted = source.transact().encode_state_as_update_v1(&before_delete);
++        let mut txn = target.transact_mut();
++        txn.apply_update(Update::decode_v1(&deleted).unwrap()).unwrap();
++        assert!(txn.has_update_changes());
++        assert_eq!(txn.before_state(), txn.after_state());
++        drop(txn);
++
++        let mut txn = target.transact_mut();
++        txn.apply_update(Update::decode_v1(&deleted).unwrap()).unwrap();
++        assert!(!txn.has_update_changes());
++    }
++
+     #[test]
+     fn pending_delete_out_of_order() {
+         // Test for bug fix: pending deletes should be recorded when the target client
+diff --git a/yrs/src/store.rs b/yrs/src/store.rs
+index a90c92f..66d6080 100644
+--- a/yrs/src/store.rs
++++ b/yrs/src/store.rs
+@@ -612,7 +612,7 @@ pub struct StoreEvents {
+ impl StoreEvents {
+     pub fn emit_update_v1(&mut self, txn: &TransactionMut) {
+         if self.update_v1_events.has_subscribers() {
+-            if !txn.delete_set.is_empty() || txn.after_state() != txn.before_state() {
++            if txn.has_update_changes() {
+                 let update = UpdateEvent::new_v1(txn);
+                 self.update_v1_events
+                     .trigger(|callback| callback(txn, &update));
+@@ -622,7 +622,7 @@ impl StoreEvents {
+ 
+     pub fn emit_update_v2(&mut self, txn: &TransactionMut) {
+         if self.update_v2_events.has_subscribers() {
+-            if !txn.delete_set.is_empty() || txn.after_state() != txn.before_state() {
++            if txn.has_update_changes() {
+                 let update = UpdateEvent::new_v2(txn);
+                 self.update_v2_events.trigger(|fun| fun(txn, &update));
+             }
+diff --git a/yrs/src/transaction.rs b/yrs/src/transaction.rs
+index 8a671fe..ea3b790 100644
+--- a/yrs/src/transaction.rs
++++ b/yrs/src/transaction.rs
+@@ -564,6 +564,13 @@ impl<'doc> TransactionMut<'doc> {
+         &self.delete_set
+     }
+ 
++    /// Returns whether this transaction contains a change which would be
++    /// emitted as a document update. Unlike comparing state vectors, this also
++    /// detects transactions which only delete existing content.
++    pub fn has_update_changes(&self) -> bool {
++        !self.delete_set.is_empty() || self.after_state() != self.before_state()
++    }
++
+     /// Returns origin of the transaction if any was defined. Read-write transactions can get an
+     /// origin assigned via [Transact::try_transact_mut_with]/[Transact::transact_mut_with] methods.
+     pub fn origin(&self) -> Option<&Origin> {
+diff --git a/ywasm/src/lib.rs b/ywasm/src/lib.rs
+index bf99fd9..361bf86 100644
+--- a/ywasm/src/lib.rs
++++ b/ywasm/src/lib.rs
+@@ -337,6 +337,29 @@ pub fn apply_update(doc: &Doc, update: js_sys::Uint8Array, origin: JsValue) -> R
+     }
+ }
+ 
++/// Applies a lib0 v1 update and returns whether it changed the document.
++/// This performs change detection inside the same Yrs transaction and includes
++/// meaningful delete-only updates, which are invisible to state-vector
++/// comparisons.
++#[wasm_bindgen(js_name = applyUpdateAndCheckIfChanged)]
++pub fn apply_update_and_check_if_changed(
++    doc: &Doc,
++    update: js_sys::Uint8Array,
++    origin: JsValue,
++) -> Result<bool> {
++    let txn = if !origin.is_undefined() {
++        doc.0.try_transact_mut_with(js::Js::from(origin))
++    } else {
++        doc.0.try_transact_mut()
++    };
++    let mut txn = txn.map_err(|_| JsValue::from_str(crate::js::errors::ANOTHER_TX))?;
++    let diff: Vec<u8> = update.to_vec();
++    let update = Update::decode_v1(&diff).map_err(|e| JsValue::from(e.to_string()))?;
++    txn.apply_update(update)
++        .map_err(|e| JsValue::from(e.to_string()))?;
++    Ok(txn.has_update_changes())
++}
++
+ /// Applies delta update generated by the remote document replica to a current document. This
+ /// method assumes that a payload maintains lib0 v2 encoding format.
+ ///

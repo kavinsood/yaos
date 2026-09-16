@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import * as Y from "yjs";
+import { ywasmCrdtEngine as crdtEngine } from "@yaos/crdt-engine";
 import { NodeSqliteStorage } from "../../packages/server-node/src/storage";
 import { VaultStore, type VaultStoragePort } from "../../server/src/vaultStore";
 import { suite } from "../harness.ts";
@@ -76,8 +77,8 @@ s.test("reconstruction, recipes, and feed catalogs use a constant number of SQL 
 		const reconstructed = store.reconstructDocument("hot-body", boundary);
 		assert.equal(queries.value, 2, "journal length must not affect reconstruction statement count");
 		assert.equal(reconstructed.journalUpdates, 80);
-		assert.equal(reconstructed.doc.getText("body").toString(), doc.getText("body").toString());
-		reconstructed.doc.destroy();
+		assert.equal(crdtEngine.readText(reconstructed.doc, "body"), doc.getText("body").toString());
+		crdtEngine.destroyDocument(reconstructed.doc);
 
 		queries.value = 0;
 		const feed = store.listChangesAfter(0, 1000);
@@ -141,8 +142,8 @@ s.test("checkpoint accounting stays in SQL and live pins retain their historical
 		queries.value = 0;
 		const historical = store.reconstructDocument("pin-body", pinBoundary);
 		assert.equal(queries.value, 2, "checkpoint reconstruction must be one checkpoint read plus one joined journal read");
-		assert.equal(historical.doc.getText("body").toString(), "boundary");
-		historical.doc.destroy();
+		assert.equal(crdtEngine.readText(historical.doc, "body"), "boundary");
+		crdtEngine.destroyDocument(historical.doc);
 
 		const latest = newerCheckpoints.at(-1)!;
 		const physicalCheckpointBytes = sqlite.sql.exec<{ bytes: number }>(

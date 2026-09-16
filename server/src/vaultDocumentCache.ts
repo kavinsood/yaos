@@ -1,4 +1,5 @@
-import * as Y from "yjs";
+import type { YwasmCrdtDocument } from "./crdt/ywasmCrdtEngine";
+import { ywasmCrdtEngine as crdtEngine } from "@yaos/crdt-engine";
 import {
 	MAX_BODY_SOCKETS,
 	MAX_LOADED_BODY_ENCODED_STATE_BYTES,
@@ -11,11 +12,15 @@ import {
 import type { SemanticCatalogHead, VaultStore } from "./vaultStore";
 import type { ReconstructedDocument } from "./vaultDocumentStore";
 import type { VaultActorContext } from "./collaboration";
-import { canonicalCanvasBytes } from "./shared/canvasCodec";
-import { materializeCanvasDocument, validateCanvasDocument } from "./shared/canvasSemanticDocument";
+import { validateCanvasDocument } from "./crdt/canvasSemanticDocument";
 import { canonicalMarkdownBytes, canonicalizeMarkdown } from "./shared/markdownCodec";
-import { MAX_CLIENT_MARKDOWN_BYTES } from "./shared/durableLimits";
-import { validateFrontmatterSemanticRoots } from "./shared/frontmatterSemanticValidation";
+import {
+	MAX_CANDIDATE_UPDATE_BYTES,
+	MAX_CANDIDATE_UPDATE_FRAMES,
+	MAX_CLIENT_MARKDOWN_BYTES,
+	MAX_DURABLE_UPDATE_BYTES,
+} from "./shared/durableLimits";
+import { validateFrontmatterSemanticRoots } from "./crdt/frontmatterSemanticValidation";
 import { INITIAL_SEMANTIC_EPOCH, type SemanticEpoch } from "./shared/semanticEpoch";
 
 // Exact encoding is an observability/compaction census, not an admission
@@ -24,6 +29,8 @@ import { INITIAL_SEMANTIC_EPOCH, type SemanticEpoch } from "./shared/semanticEpo
 // ingress bursts promptly.
 const VALIDATION_EXACT_EVERY = 500;
 const VALIDATION_EXACT_INPUT_BYTES = 256 * 1024;
+/** Reserved below the compiled maximum for allocator metadata and unmodelled binding copies. */
+const YWASM_LINEAR_MEMORY_SAFETY_MARGIN = 8 * 1024 * 1024;
 
 export type VaultDocumentKind = "root" | "body" | "canvas";
 
@@ -31,8 +38,8 @@ export interface LoadedVaultDocument {
 	documentId: string;
 	lineageKey: string;
 	kind: VaultDocumentKind;
-	doc: Y.Doc;
-	validationDoc: Y.Doc;
+	doc: YwasmCrdtDocument;
+	validationDoc: YwasmCrdtDocument;
 	generation: number;
 	semanticEpoch: SemanticEpoch;
 	lastUsedAt: number;
@@ -81,6 +88,7 @@ export type CachePressureReason =
 	| "socket_pending_bytes"
 	| "vault_pending_bytes"
 	| "vault_transient_bytes"
+	| "wasm_linear_memory_envelope"
 	| "body_cache_count"
 	| "body_cache_encoded_state_bytes"
 	| "root_cache_encoded_state_bytes";
@@ -123,8 +131,9 @@ export interface VaultDocumentCacheDiagnostics {
 	}>;
 	accounting: {
 		formatVersion: 1;
-		claim: "encoded-yjs-state-proxy-not-heap-measurement";
+		claim: "encoded-crdt-state-proxy-plus-wasm-linear-memory";
 	};
+	crdtMemory: ReturnType<typeof crdtEngine.memoryDiagnostics>;
 	costs: {
 		encodedStateBytes: number;
 		bodyEncodedStateBytes: number;
@@ -147,8 +156,40 @@ function message(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
+function applyAndDetect(doc: YwasmCrdtDocument, update: Uint8Array, origin: string): boolean {
+	return crdtEngine.applyUpdateAndCheckIfChanged(doc, update, origin);
+}
+
+function boundedCandidateFrames(value: Uint8Array | readonly Uint8Array[]): readonly Uint8Array[] {
+	const frames = value instanceof Uint8Array ? [value] : value;
+	if (frames.length === 0 || frames.length > MAX_CANDIDATE_UPDATE_FRAMES) {
+		throw new VaultDocumentValidationError("invalid_candidate_frames");
+	}
+	let total = 0;
+	for (const frame of frames) {
+		if (!(frame instanceof Uint8Array) || frame.byteLength === 0
+			|| frame.byteLength > MAX_DURABLE_UPDATE_BYTES) {
+			throw new VaultDocumentValidationError("invalid_candidate_frames");
+		}
+		total += frame.byteLength;
+		if (!Number.isSafeInteger(total) || total > MAX_CANDIDATE_UPDATE_BYTES) {
+			throw new VaultDocumentValidationError("candidate_update_too_large");
+		}
+	}
+	return frames;
+}
+
+function applyManyAndDetect(doc: YwasmCrdtDocument, updates: readonly Uint8Array[], origin: string): boolean {
+	let changed = false;
+	for (const update of updates) {
+		changed = crdtEngine.applyUpdateAndCheckIfChanged(doc, update, origin) || changed;
+	}
+	return changed;
+}
+
 /** Owns loaded Y.Docs, dirty queues, cost accounting, and clean-body LRU admission. */
 export class VaultDocumentCache {
+	private loadObserver: ((loaded: Readonly<LoadedVaultDocument>) => void) | null = null;
 	/** Resident and speculative state is keyed by immutable CRDT lineage. */
 	private readonly loaded = new Map<string, LoadedVaultDocument>();
 	/** One active lineage per logical document; old lineages are never addressable by document ID. */
@@ -177,6 +218,10 @@ export class VaultDocumentCache {
 			|| !Number.isSafeInteger(limits.transientBytes) || limits.transientBytes < 0) {
 			throw new Error("cache limits must be non-negative safe integers");
 		}
+	}
+
+	setLoadObserver(observer: ((loaded: Readonly<LoadedVaultDocument>) => void) | null): void {
+		this.loadObserver = observer;
 	}
 
 	get(documentId: string): LoadedVaultDocument | undefined {
@@ -221,7 +266,7 @@ export class VaultDocumentCache {
 		try {
 			reconstructed = this.store.reconstructDocument(documentId);
 			if (reconstructed.generation <= 0 && !allowMissing) {
-				reconstructed.doc.destroy();
+				crdtEngine.destroyDocument(reconstructed.doc);
 				throw new Error(`${body ? "body" : "root"} state is missing`);
 			}
 		} catch (error) {
@@ -230,12 +275,12 @@ export class VaultDocumentCache {
 			throw error;
 		}
 		try {
-			const encoded = Y.encodeStateAsUpdate(reconstructed.doc);
+			const encoded = crdtEngine.encodeStateAsUpdate(reconstructed.doc);
 			const encodedStateBytes = encoded.byteLength;
 			if (body) {
 				const reason = this.ensureBodyCapacity(documentId, this.mirroredResidentCost(encodedStateBytes));
 				if (reason) {
-					reconstructed.doc.destroy();
+					crdtEngine.destroyDocument(reconstructed.doc);
 					throw new VaultDocumentCachePressureError(reason);
 				}
 			}
@@ -244,7 +289,7 @@ export class VaultDocumentCache {
 					lineageKey: this.lineageKey(documentId, reconstructed.semanticEpoch),
 				kind,
 				doc: reconstructed.doc,
-				validationDoc: new Y.Doc({ guid: `${documentId}-validation` }),
+				validationDoc: crdtEngine.createDocument(`${documentId}-validation`),
 				generation: reconstructed.generation,
 				semanticEpoch: reconstructed.semanticEpoch,
 				lastUsedAt: Date.now(),
@@ -257,11 +302,17 @@ export class VaultDocumentCache {
 				validationUpdatesSinceExact: 0,
 				validationInputBytesSinceExact: 0,
 			};
-			Y.applyUpdate(loaded.validationDoc, encoded, "validation-baseline");
+			crdtEngine.applyUpdate(loaded.validationDoc, encoded, "validation-baseline");
 				this.retirePendingLineages(documentId, loaded.lineageKey);
 				this.loaded.set(loaded.lineageKey, loaded);
 				this.activeLineageByDocument.set(documentId, loaded.lineageKey);
 				this.clearLoadFailures(documentId);
+				// Defer the observer so the reconstruction reservation in this method's
+				// finally block is always released before maintenance allocates again.
+				queueMicrotask(() => {
+					try { this.loadObserver?.(loaded); }
+					catch (error) { console.warn("[yaos-vault] document load observer failed", error); }
+				});
 			return loaded;
 		} finally {
 			releaseTransient();
@@ -297,8 +348,8 @@ export class VaultDocumentCache {
 			const [id, value] = candidates.shift()!;
 			this.loaded.delete(id);
 			this.activeLineageByDocument.delete(value.documentId);
-			value.doc.destroy();
-			value.validationDoc.destroy();
+			crdtEngine.destroyDocument(value.doc);
+			crdtEngine.destroyDocument(value.validationDoc);
 			count--;
 		}
 		return count < this.limits.loadedBodies;
@@ -389,7 +440,9 @@ export class VaultDocumentCache {
 		}
 	}
 
-	validateBodyUpdate(documentId: string, update: Uint8Array): ValidatedBodyUpdate {
+	validateBodyUpdate(documentId: string, update: Uint8Array | readonly Uint8Array[]): ValidatedBodyUpdate {
+		const updates = boundedCandidateFrames(update);
+		const inputBytes = updates.reduce((sum, frame) => sum + frame.byteLength, 0);
 		const loaded = this.get(documentId);
 		if (!loaded || loaded.kind !== "body") throw new Error("body validation requires a loaded Markdown body");
 		if (loaded.validationPending) throw new Error("body validation already has a staged update");
@@ -398,24 +451,20 @@ export class VaultDocumentCache {
 		// mirror is touched; incoming bytes are deliberately not the estimate.
 		const hadSpeculativeDurability = loaded.dirty || this.hasPending(documentId);
 		const releaseTransient = this.reserveFullStateOperation(
-			documentId, 2, this.safeAdd(this.stateSizeEstimate(documentId), update.byteLength),
+			documentId, 2, this.safeAdd(this.stateSizeEstimate(documentId), inputBytes),
 		);
 		try {
 			let changesState = false;
-			const observer = (): void => { changesState = true; };
-			loaded.validationDoc.on("update", observer);
 			try {
-				Y.applyUpdate(loaded.validationDoc, update, "persistent-validation");
+				changesState = applyManyAndDetect(loaded.validationDoc, updates, "persistent-validation");
 			} catch {
 				this.rebuildValidation(loaded, documentId);
 				throw new VaultDocumentValidationError("invalid_yjs_update");
-			} finally {
-				loaded.validationDoc.off("update", observer);
 			}
 			try {
 				const semanticError = validateFrontmatterSemanticRoots(loaded.validationDoc);
 				if (semanticError) throw new VaultDocumentValidationError(semanticError);
-				const content = Y.Text.prototype.toString.call(loaded.validationDoc.getText("body"));
+				const content = crdtEngine.readText(loaded.validationDoc, "body");
 				if (content !== canonicalizeMarkdown(content)) {
 					throw new VaultDocumentValidationError("candidate_markdown_not_canonical");
 				}
@@ -425,14 +474,14 @@ export class VaultDocumentCache {
 				}
 				loaded.validationPending = true;
 				loaded.validationUpdatesSinceExact++;
-				loaded.validationInputBytesSinceExact += update.byteLength;
+				loaded.validationInputBytesSinceExact += inputBytes;
 				const exact = loaded.validationUpdatesSinceExact >= VALIDATION_EXACT_EVERY
 					|| loaded.validationInputBytesSinceExact >= VALIDATION_EXACT_INPUT_BYTES;
 				// Between exact samples this is deliberately an operational proxy, not
 				// a proof about Yjs encoding size. The multiplier supplies cache headroom;
 				// row admission relies only on the exact wire byte length.
 				const measuredBytes = exact
-					? Y.encodeStateAsUpdate(loaded.validationDoc).byteLength
+					? crdtEngine.encodeStateAsUpdate(loaded.validationDoc).byteLength
 					: loaded.validationLastExactEncodedBytes + (2 * loaded.validationInputBytesSinceExact)
 						+ (64 * loaded.validationUpdatesSinceExact);
 				// This periodic/proxy census is observability for residency and semantic
@@ -465,27 +514,23 @@ export class VaultDocumentCache {
 		);
 		try {
 			let changesState = false;
-			const observer = (): void => { changesState = true; };
-			loaded.validationDoc.on("update", observer);
 			try {
-				Y.applyUpdate(loaded.validationDoc, update, "persistent-canvas-validation");
+				changesState = applyAndDetect(loaded.validationDoc, update, "persistent-canvas-validation");
 			} catch {
 				this.rebuildValidation(loaded, documentId);
 				throw new VaultDocumentValidationError("invalid_canvas_update");
-			} finally {
-				loaded.validationDoc.off("update", observer);
 			}
 			try {
-				const semanticError = await validateCanvasDocument(loaded.validationDoc);
-				if (semanticError) throw new VaultDocumentValidationError(semanticError);
-				const contentBytes = canonicalCanvasBytes(await materializeCanvasDocument(loaded.validationDoc, false));
+				const validation = await validateCanvasDocument(loaded.validationDoc);
+				if (validation.error !== null) throw new VaultDocumentValidationError(validation.error);
+				const contentBytes = validation.canonicalBytes;
 				loaded.validationPending = true;
 				loaded.validationUpdatesSinceExact++;
 				loaded.validationInputBytesSinceExact += update.byteLength;
 				const exact = loaded.validationUpdatesSinceExact >= VALIDATION_EXACT_EVERY
 					|| loaded.validationInputBytesSinceExact >= VALIDATION_EXACT_INPUT_BYTES;
 				const measuredBytes = exact
-					? Y.encodeStateAsUpdate(loaded.validationDoc).byteLength
+					? crdtEngine.encodeStateAsUpdate(loaded.validationDoc).byteLength
 					: loaded.validationLastExactEncodedBytes + (2 * loaded.validationInputBytesSinceExact)
 						+ (64 * loaded.validationUpdatesSinceExact);
 				// See Markdown validation above: the proxy schedules pressure work but
@@ -509,26 +554,25 @@ export class VaultDocumentCache {
 
 	commitValidatedBodyUpdate(
 		documentId: string,
-		update: Uint8Array,
+		update: Uint8Array | readonly Uint8Array[],
 		generation: number,
 		semanticEpoch: SemanticEpoch,
 		origin: unknown,
 		validated: ValidatedBodyUpdate,
 	): boolean {
+		const updates = boundedCandidateFrames(update);
 		const loaded = this.get(documentId);
 		if (!loaded || !loaded.validationPending) throw new Error("body update was not validated");
 		let changed = false;
-		const observer = (): void => { changed = true; };
-		loaded.doc.on("update", observer);
 		try {
-			Y.applyUpdate(loaded.doc, update.slice(), origin);
+			changed = applyManyAndDetect(loaded.doc, updates.map((frame) => frame.slice()), String(origin));
 		} catch {
 			// The receipt/journal commit precedes this resident application. An
 			// exceptional local apply failure must not leave the old durable view in
 			// RAM; publish the accepted update and reconstruct on next admission.
 			this.discardResident(documentId);
 			return true;
-		} finally { loaded.doc.off("update", observer); }
+		}
 		loaded.generation = Math.max(loaded.generation, generation);
 		loaded.semanticEpoch = semanticEpoch;
 		loaded.lastUsedAt = Date.now();
@@ -582,11 +626,8 @@ export class VaultDocumentCache {
 		const releaseTransient = this.reserveFullStateOperation(
 			documentId, 2, this.safeAdd(this.stateSizeEstimate(documentId), update.byteLength),
 		);
-		let changed = false;
-		const observer = (): void => { changed = true; };
-		loaded.validationDoc.on("update", observer);
 		try {
-			Y.applyUpdate(loaded.validationDoc, update, "root-sync-validation");
+			const changed = applyAndDetect(loaded.validationDoc, update, "root-sync-validation");
 			if (!changed) return true;
 			this.rebuildValidation(loaded, documentId);
 			return false;
@@ -594,7 +635,6 @@ export class VaultDocumentCache {
 			this.rebuildValidation(loaded, documentId);
 			return false;
 		} finally {
-			loaded.validationDoc.off("update", observer);
 			releaseTransient();
 		}
 	}
@@ -607,15 +647,15 @@ export class VaultDocumentCache {
 		let reconstructed: ReconstructedDocument | null = null;
 		try {
 			reconstructed = this.store.reconstructDocument(documentId);
-			const encoded = Y.encodeStateAsUpdate(reconstructed.doc);
+			const encoded = crdtEngine.encodeStateAsUpdate(reconstructed.doc);
 			if (documentId !== "root") {
 				const reason = this.ensureBodyCapacity(documentId, this.mirroredResidentCost(encoded.byteLength));
 				if (reason) throw new VaultDocumentCachePressureError(reason);
 			}
-			const validationDoc = new Y.Doc({ guid: `${documentId}-validation` });
-			Y.applyUpdate(validationDoc, encoded, "durable-reload-validation");
-			loaded.doc.destroy();
-			loaded.validationDoc.destroy();
+			const validationDoc = crdtEngine.createDocument(`${documentId}-validation`);
+			crdtEngine.applyUpdate(validationDoc, encoded, "durable-reload-validation");
+			crdtEngine.destroyDocument(loaded.doc);
+			crdtEngine.destroyDocument(loaded.validationDoc);
 			this.loaded.delete(loaded.lineageKey);
 			loaded.doc = reconstructed.doc;
 			reconstructed = null;
@@ -636,7 +676,7 @@ export class VaultDocumentCache {
 			this.loaded.set(loaded.lineageKey, loaded);
 			this.activeLineageByDocument.set(documentId, loaded.lineageKey);
 		} finally {
-			reconstructed?.doc.destroy();
+			if (reconstructed) crdtEngine.destroyDocument(reconstructed.doc);
 			releaseTransient();
 		}
 	}
@@ -647,36 +687,36 @@ export class VaultDocumentCache {
 		if (!loaded) return;
 		this.loaded.delete(loaded.lineageKey);
 		this.activeLineageByDocument.delete(documentId);
-		loaded.doc.destroy();
-		loaded.validationDoc.destroy();
+		crdtEngine.destroyDocument(loaded.doc);
+		crdtEngine.destroyDocument(loaded.validationDoc);
 	}
 
-	installSemanticReset(documentId: string, document: Y.Doc, generation: number, semanticEpoch: SemanticEpoch): void {
+	installSemanticReset(documentId: string, document: YwasmCrdtDocument, generation: number, semanticEpoch: SemanticEpoch): void {
 		const loaded = this.get(documentId);
 		if (!loaded) {
-			document.destroy();
+			crdtEngine.destroyDocument(document);
 			return;
 		}
 		if (loaded.dirty || loaded.validationPending || this.hasPendingAnyLineage(documentId)) {
-			document.destroy();
+			crdtEngine.destroyDocument(document);
 			throw new Error("semantic reset requires a clean resident document");
 		}
-		const encoded = Y.encodeStateAsUpdate(document);
+		const encoded = crdtEngine.encodeStateAsUpdate(document);
 		if (documentId !== "root") {
 			const reason = this.ensureBodyCapacity(documentId, this.mirroredResidentCost(encoded.byteLength));
 			if (reason) {
-				document.destroy();
+				crdtEngine.destroyDocument(document);
 				throw new VaultDocumentCachePressureError(reason);
 			}
 		}
-		const validationDoc = new Y.Doc({ guid: `${documentId}-validation` });
-		try { Y.applyUpdate(validationDoc, encoded, "semantic-reset-validation"); }
+		const validationDoc = crdtEngine.createDocument(`${documentId}-validation`);
+		try { crdtEngine.applyUpdate(validationDoc, encoded, "semantic-reset-validation"); }
 		catch (error) {
-			validationDoc.destroy();
+			crdtEngine.destroyDocument(validationDoc);
 			throw error;
 		}
-		loaded.doc.destroy();
-		loaded.validationDoc.destroy();
+		crdtEngine.destroyDocument(loaded.doc);
+		crdtEngine.destroyDocument(loaded.validationDoc);
 		this.loaded.delete(loaded.lineageKey);
 		loaded.doc = document;
 		loaded.validationDoc = validationDoc;
@@ -714,18 +754,17 @@ export class VaultDocumentCache {
 		}
 		try {
 		let changed = false;
-		const observer = () => { changed = true; };
-		loaded.doc.on("update", observer);
 		try {
-			Y.applyUpdate(loaded.doc, update, origin);
-			Y.applyUpdate(loaded.validationDoc, update, "durable-validation-sync");
-		} finally {
-			loaded.doc.off("update", observer);
+			changed = applyAndDetect(loaded.doc, update, String(origin));
+			crdtEngine.applyUpdate(loaded.validationDoc, update, "durable-validation-sync");
+		} catch (error) {
+			this.discardResident(documentId);
+			throw error;
 		}
 		loaded.generation = Math.max(loaded.generation, generation);
 		loaded.lastUsedAt = Date.now();
-		loaded.encodedStateBytes = Y.encodeStateAsUpdate(loaded.doc).byteLength;
-		loaded.validationEncodedStateBytes = Y.encodeStateAsUpdate(loaded.validationDoc).byteLength;
+		loaded.encodedStateBytes = crdtEngine.encodeStateAsUpdate(loaded.doc).byteLength;
+		loaded.validationEncodedStateBytes = crdtEngine.encodeStateAsUpdate(loaded.validationDoc).byteLength;
 		if (documentId !== "root") {
 			// The update is already durable and therefore cannot be rejected here.
 			// Evict clean peers where possible; any remaining overage is surfaced as
@@ -736,6 +775,48 @@ export class VaultDocumentCache {
 		loaded.validationUpdatesSinceExact = 0;
 		loaded.validationInputBytesSinceExact = 0;
 		return changed;
+		} finally {
+			releaseTransient();
+		}
+	}
+
+	/**
+	 * Advances the authoritative mirror after a socket batch becomes durable.
+	 * Socket admission already applied every frame to validationDoc, so applying
+	 * the merged batch there again would only repeat work across the Wasm FFI.
+	 */
+	applyStagedDurableUpdate(documentId: string, update: Uint8Array, generation: number, origin: unknown): boolean {
+		const loaded = this.get(documentId);
+		if (!loaded) return false;
+		if (loaded.validationPending) throw new Error("cannot commit while validation is in progress");
+		let releaseTransient: () => void;
+		try {
+			releaseTransient = this.reserveFullStateOperation(
+				documentId, 1, this.safeAdd(this.stateSizeEstimate(documentId), update.byteLength),
+			);
+		} catch (error) {
+			if (!(error instanceof VaultDocumentCachePressureError)) throw error;
+			this.discardResident(documentId);
+			return true;
+		}
+		try {
+			let changed: boolean;
+			try {
+				changed = applyAndDetect(loaded.doc, update, String(origin));
+			} catch (error) {
+				this.discardResident(documentId);
+				throw error;
+			}
+			loaded.generation = Math.max(loaded.generation, generation);
+			loaded.lastUsedAt = Date.now();
+			// validationDoc represents the end of the detached queue. During a
+			// partitioned flush this may temporarily overestimate doc, but cannot
+			// undercount resident state and is exact once the final partition lands.
+			loaded.encodedStateBytes = loaded.validationEncodedStateBytes;
+			if (documentId !== "root") {
+				this.ensureBodyCapacity(documentId, this.mirroredResidentCost(loaded.validationEncodedStateBytes));
+			}
+			return changed;
 		} finally {
 			releaseTransient();
 		}
@@ -766,6 +847,13 @@ export class VaultDocumentCache {
 
 	recordTransient(documentId: string, bytes: number): () => void {
 		if (!Number.isSafeInteger(bytes) || bytes < 0) throw new Error("transient reservation must be a non-negative safe integer");
+		const memory = crdtEngine.memoryDiagnostics();
+		if (memory && this.safeAdd(
+			this.safeAdd(memory.linearMemoryBytes, this.transientReservationsTotal),
+			this.safeAdd(bytes, YWASM_LINEAR_MEMORY_SAFETY_MARGIN),
+		) > memory.maximumLinearMemoryBytes) {
+			throw new VaultDocumentCachePressureError("wasm_linear_memory_envelope");
+		}
 		if (this.transientBytesTotal() + bytes > this.limits.transientBytes) {
 			throw new VaultDocumentCachePressureError("vault_transient_bytes");
 		}
@@ -797,15 +885,15 @@ export class VaultDocumentCache {
 		if (!loaded || loaded.dirty || this.openBodyIds().has(documentId) || this.pinnedBodyIds().has(documentId)) return false;
 		this.loaded.delete(loaded.lineageKey);
 		this.activeLineageByDocument.delete(documentId);
-		loaded.doc.destroy();
-		loaded.validationDoc.destroy();
+		crdtEngine.destroyDocument(loaded.doc);
+		crdtEngine.destroyDocument(loaded.validationDoc);
 		return true;
 	}
 
 	clear(): void {
 		for (const loaded of this.loaded.values()) {
-			loaded.doc.destroy();
-			loaded.validationDoc.destroy();
+			crdtEngine.destroyDocument(loaded.doc);
+			crdtEngine.destroyDocument(loaded.validationDoc);
 		}
 		this.loaded.clear();
 		this.activeLineageByDocument.clear();
@@ -848,8 +936,9 @@ export class VaultDocumentCache {
 			loaded,
 			accounting: {
 				formatVersion: 1,
-				claim: "encoded-yjs-state-proxy-not-heap-measurement",
+				claim: "encoded-crdt-state-proxy-plus-wasm-linear-memory",
 			},
+			crdtMemory: crdtEngine.memoryDiagnostics(),
 			costs: {
 				encodedStateBytes: this.safeAdd(bodyEncodedStateBytes, rootEncodedStateBytes),
 				bodyEncodedStateBytes,
@@ -909,8 +998,8 @@ export class VaultDocumentCache {
 			this.activeLineageByDocument.delete(value.documentId);
 			encodedStateBytes -= this.residentCost(value);
 			count--;
-			value.doc.destroy();
-			value.validationDoc.destroy();
+			crdtEngine.destroyDocument(value.doc);
+			crdtEngine.destroyDocument(value.validationDoc);
 		}
 		if (count + additionalCount > this.limits.loadedBodies) return "body_cache_count";
 		if (encodedStateBytes + incomingBytes > this.limits.encodedStateBytes) return "body_cache_encoded_state_bytes";
@@ -978,15 +1067,15 @@ export class VaultDocumentCache {
 	}
 
 	private rebuildValidation(loaded: LoadedVaultDocument, documentId: string): void {
-		loaded.validationDoc.destroy();
-		loaded.validationDoc = new Y.Doc({ guid: `${documentId}-validation` });
-		const encoded = Y.encodeStateAsUpdate(loaded.doc);
-		Y.applyUpdate(loaded.validationDoc, encoded, "validation-rebuild");
+		crdtEngine.destroyDocument(loaded.validationDoc);
+		loaded.validationDoc = crdtEngine.createDocument(`${documentId}-validation`);
+		const encoded = crdtEngine.encodeStateAsUpdate(loaded.doc);
+		crdtEngine.applyUpdate(loaded.validationDoc, encoded, "validation-rebuild");
 		for (const entry of this.pendingEntries(documentId)) {
-			Y.applyUpdate(loaded.validationDoc, entry.bytes, "validation-rebuild-pending");
+			crdtEngine.applyUpdate(loaded.validationDoc, entry.bytes, "validation-rebuild-pending");
 		}
 		loaded.encodedStateBytes = encoded.byteLength;
-		const validationBytes = Y.encodeStateAsUpdate(loaded.validationDoc).byteLength;
+		const validationBytes = crdtEngine.encodeStateAsUpdate(loaded.validationDoc).byteLength;
 		loaded.validationEncodedStateBytes = validationBytes;
 		loaded.validationLastExactEncodedBytes = validationBytes;
 		loaded.validationPending = false;

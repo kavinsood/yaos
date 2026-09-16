@@ -1,4 +1,4 @@
-import { MAX_DURABLE_UPDATE_BYTES } from "./shared/durableLimits";
+import { MAX_CANDIDATE_UPDATE_BYTES, MAX_DURABLE_UPDATE_BYTES } from "./shared/durableLimits";
 import type { SemanticEpoch } from "./shared/semanticEpoch";
 export { MAX_DURABLE_UPDATE_BYTES } from "./shared/durableLimits";
 
@@ -6,6 +6,7 @@ export const MAX_BLOB_UPLOAD_BYTES = 10 * 1024 * 1024;
 
 export const MAX_BODY_ID_LENGTH = 256;
 export const MAX_CANDIDATE_BYTES = MAX_DURABLE_UPDATE_BYTES;
+export const MAX_LOGICAL_CANDIDATE_BYTES = MAX_CANDIDATE_UPDATE_BYTES;
 export const MAX_PENDING_BYTES_PER_DOCUMENT = 3_500_000;
 export const MAX_PENDING_BYTES_PER_SOCKET = 3_500_000;
 export const MAX_PENDING_BYTES_PER_VAULT = 14_000_000;
@@ -18,7 +19,10 @@ export const MAX_AWARENESS_BYTES = 64 * 1024;
 export const MAX_LOADED_BODY_ENCODED_STATE_BYTES = 48 * 1024 * 1024;
 /** Root is non-evictable, so it has a separate pressure budget from body LRU residency. */
 export const MAX_ROOT_RESIDENT_ENCODED_STATE_BYTES = 16 * 1024 * 1024;
-export const MAX_TRANSIENT_PENDING_BYTES = 16 * 1024 * 1024;
+// A 5 MiB logical candidate can transiently coexist with both resident CRDT
+// mirrors plus validation/re-encoding copies. The Wasm linear-memory envelope
+// remains the final admission guard.
+export const MAX_TRANSIENT_PENDING_BYTES = 48 * 1024 * 1024;
 
 export interface DurableReceipt {
 	vaultId: string;

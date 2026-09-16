@@ -15,6 +15,11 @@ import { splitMarkdownComponents } from "./frontmatterBoundary";
 import { decodeBinaryEnvelope, YAOS_BINARY_CONTENT_TYPE } from "@shared/binaryEnvelope";
 import type { CanvasManager } from "./canvas/canvasManager";
 import { parseSemanticEpoch, parseSemanticEpochHeader, type SemanticEpoch } from "@shared/semanticEpoch";
+import {
+	canonicalCrdtRootDigestBytes,
+	type DetachedCrdtRoot,
+	type DetachedCrdtValue,
+} from "@shared/crdtRootDigest";
 
 export interface BootstrapHttpRequest {
 	url: string;
@@ -46,6 +51,7 @@ export interface ClientBootstrapDescriptor {
 		rootEpoch: SemanticEpoch;
 		rootGeneration: number;
 		rootCheckpointHash: string;
+		rootCheckpointHashFormat?: "canonical-root-v1";
 	};
 	catalog: {
 		activeBodyCount: number;
@@ -316,6 +322,19 @@ function exactArrayBuffer(bytes: Uint8Array): ArrayBuffer {
 	const copy = new Uint8Array(bytes.byteLength);
 	copy.set(bytes);
 	return copy.buffer;
+}
+
+function snapshotYjsValue(value: unknown): DetachedCrdtValue {
+	if (value instanceof Y.Text) return { shared: "text", value: value.toString() };
+	if (value instanceof Y.Array) return { shared: "array", values: value.toArray().map(snapshotYjsValue) };
+	if (value instanceof Y.Map) {
+		return { shared: "map", entries: [...value.entries()].map(([key, nested]) => [key, snapshotYjsValue(nested)]) };
+	}
+	return { shared: "value", value };
+}
+
+function snapshotYjsRoot(doc: Y.Doc): DetachedCrdtRoot[] {
+	return [...doc.share.keys()].map((name) => ({ name, value: snapshotYjsValue(doc.getMap(name)) }));
 }
 
 /** Authenticated bounded HTTP adapter for bootstrap and closed-body catch-up. */
@@ -646,10 +665,15 @@ export async function prepareBootstrapRoot(
 		return { descriptor, progress: existing };
 	}
 	const rootBytes = await server.root(descriptor.bootstrapId);
-	const rootHash = await sha256BytesHex(rootBytes);
-	if (rootHash !== descriptor.capture.rootCheckpointHash) throw new Error("bootstrap root hash mismatch");
 	const validatedRoot = decodeBootstrapRoot(rootBytes);
-	validatedRoot.destroy();
+	try {
+		const digestBytes = descriptor.capture.rootCheckpointHashFormat === "canonical-root-v1"
+			? canonicalCrdtRootDigestBytes(snapshotYjsRoot(validatedRoot))
+			: rootBytes;
+		if (await sha256BytesHex(digestBytes) !== descriptor.capture.rootCheckpointHash) {
+			throw new Error("bootstrap root hash mismatch");
+		}
+	} finally { validatedRoot.destroy(); }
 	await database.putDocument({
 		kind: "root",
 		documentId: "root",

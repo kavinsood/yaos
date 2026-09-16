@@ -1,5 +1,7 @@
 import { strict as assert } from "node:assert";
 import * as Y from "yjs";
+import { ywasmCrdtEngine as crdtEngine } from "../../packages/server-node/src/ywasmNodeCrdtEngine";
+import type { YwasmCrdtDocument } from "../../server/src/crdt/ywasmCrdtEngine";
 import { BootstrapService } from "../../server/src/bootstrap";
 import { SCHEMA_VERSION } from "../../server/src/shared/productVersions";
 import { suite } from "../harness.ts";
@@ -53,8 +55,10 @@ function makeBootstrapStore() {
 			return { operation, pin: pin()! };
 		},
 		reconstructDocument: () => {
-			const doc = new Y.Doc({ guid: "root" });
-			doc.getMap("sys").set("schemaVersion", SCHEMA_VERSION);
+			const source = new Y.Doc({ guid: "root" });
+			source.getMap("sys").set("schemaVersion", SCHEMA_VERSION);
+			const doc = crdtEngine.openDocument("root", Y.encodeStateAsUpdate(source));
+			source.destroy();
 			return { doc, generation: 3, semanticEpoch: 4 };
 		},
 		getPin: () => pin(),
@@ -81,7 +85,11 @@ s.test("bootstrap root is captured in SQLite without an R2 dependency", async ()
 	assert.equal(descriptor.capture.rootEpoch, 4);
 	assert.equal(descriptor.capture.rootCheckpointKey, "sql:root:7");
 	assert.match(descriptor.capture.rootCheckpointHash, /^[a-f0-9]{64}$/);
+	assert.equal(descriptor.capture.rootCheckpointHashFormat, "canonical-root-v1");
 	assert.equal(fixture.stages(), 1);
+	const rootState = service.rootState(descriptor.bootstrapId);
+	assert.equal(await rootState.hash, descriptor.capture.rootCheckpointHash,
+		"separate reconstructions retain one engine-independent root identity");
 	const replay = await service.start("bootstrap-device-0001");
 	assert.equal(replay.bootstrapId, descriptor.bootstrapId);
 	assert.equal(replay.capture.rootCheckpointHash, descriptor.capture.rootCheckpointHash);
@@ -101,14 +109,16 @@ s.test("invalid and unknown bootstrap IDs allocate no SQL operation", async () =
 s.test("Canvas bootstrap state holds transient headroom through reconstruction and encoding", async () => {
 	const fixture = makeBootstrapStore();
 	let activeReservations = 0;
-	let semanticDestroyed = false;
+	let semanticDocument: YwasmCrdtDocument | null = null;
 	const store = {
 		...fixture.store,
 		semanticHeadAt: () => ({ lifecycle: "active" }),
 		reconstructDocument: (documentId: string) => {
-			const doc = new Y.Doc({ guid: documentId });
-			doc.getMap("rootFields").set("theme", "dark");
-			if (documentId === "canvas-bootstrap") doc.on("destroy", () => { semanticDestroyed = true; });
+			const source = new Y.Doc({ guid: documentId });
+			source.getMap("rootFields").set("theme", "dark");
+			const doc = crdtEngine.openDocument(documentId, Y.encodeStateAsUpdate(source));
+			source.destroy();
+			if (documentId === "canvas-bootstrap") semanticDocument = doc;
 			return { doc, generation: 3, semanticEpoch: 4 };
 		},
 	};
@@ -123,7 +133,8 @@ s.test("Canvas bootstrap state holds transient headroom through reconstruction a
 	assert.ok(state.encodedState.byteLength > 0);
 	assert.equal(state.bodyEpoch, 4);
 	assert.equal(activeReservations, 0, "the semantic full-state reservation is released exactly once");
-	assert.equal(semanticDestroyed, true, "the reconstructed Canvas is destroyed after encoding");
+	assert.throws(() => crdtEngine.encodeStateAsUpdate(semanticDocument!), /destroyed/,
+		"the reconstructed Canvas is destroyed after encoding");
 });
 
 await s.done();

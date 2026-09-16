@@ -3,6 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as Y from "yjs";
+import { ywasmCrdtEngine as crdtEngine } from "@yaos/crdt-engine";
 import {
 	NodeDatabaseSet,
 	NodeSqliteStorage,
@@ -171,11 +172,16 @@ s.test("live-state checkpoints use exact-head CAS and corrupt checkpoint sets fa
 			update: Y.encodeStateAsUpdate(doc, firstVector),
 			kind: "body",
 		});
-		const firstCheckpoint = store.writeCheckpointFromDocument(documentId, doc, {
-			throughSequence: firstCommit.vaultSequence,
-			generation: firstCommit.generation,
-			semanticEpoch: firstCommit.semanticEpoch,
-		});
+		const firstLive = crdtEngine.openDocument(documentId, Y.encodeStateAsUpdate(doc));
+		const firstCheckpoint = (() => {
+			try {
+				return store.writeCheckpointFromDocument(documentId, firstLive, {
+					throughSequence: firstCommit.vaultSequence,
+					generation: firstCommit.generation,
+					semanticEpoch: firstCommit.semanticEpoch,
+				});
+			} finally { crdtEngine.destroyDocument(firstLive); }
+		})();
 		assert.equal(firstCheckpoint.chunks, 1);
 
 		const secondVector = Y.encodeStateVector(doc);
@@ -245,8 +251,8 @@ s.test("live-state checkpoints use exact-head CAS and corrupt checkpoint sets fa
 		).toArray());
 
 		const reconstructed = store.reconstructDocument(documentId);
-		assert.equal(reconstructed.doc.getText("body").toString(), doc.getText("body").toString());
-		reconstructed.doc.destroy();
+		assert.equal(crdtEngine.readText(reconstructed.doc, "body"), doc.getText("body").toString());
+		crdtEngine.destroyDocument(reconstructed.doc);
 	} finally {
 		doc.destroy();
 		storage.close();
@@ -270,11 +276,14 @@ s.test("checkpoint manifest failure rolls back chunks and preserves the journal"
 		storage.sql.exec(`CREATE TRIGGER reject_checkpoint_manifest
 		 BEFORE INSERT ON vault_checkpoint_manifests
 		 BEGIN SELECT RAISE(ABORT, 'injected manifest failure'); END`).toArray();
-		assert.throws(() => store.writeCheckpointFromDocument(documentId, doc, {
-			throughSequence: commit.vaultSequence,
-			generation: commit.generation,
-			semanticEpoch: commit.semanticEpoch,
-		}), /injected manifest failure/);
+		const live = crdtEngine.openDocument(documentId, Y.encodeStateAsUpdate(doc));
+		try {
+			assert.throws(() => store.writeCheckpointFromDocument(documentId, live, {
+				throughSequence: commit.vaultSequence,
+				generation: commit.generation,
+				semanticEpoch: commit.semanticEpoch,
+			}), /injected manifest failure/);
+		} finally { crdtEngine.destroyDocument(live); }
 		assert.equal(storage.sql.exec<{ count: number }>(
 			"SELECT COUNT(*) AS count FROM vault_checkpoints WHERE document_id = ?", documentId,
 		).one().count, 0);
@@ -285,8 +294,8 @@ s.test("checkpoint manifest failure rolls back chunks and preserves the journal"
 			"SELECT COUNT(*) AS count FROM vault_journal WHERE document_id = ?", documentId,
 		).one().count, 1);
 		const reconstructed = store.reconstructDocument(documentId);
-		assert.equal(reconstructed.doc.getText("body").toString(), "must remain reconstructable");
-		reconstructed.doc.destroy();
+		assert.equal(crdtEngine.readText(reconstructed.doc, "body"), "must remain reconstructable");
+		crdtEngine.destroyDocument(reconstructed.doc);
 	} finally {
 		doc.destroy();
 		storage.close();
@@ -355,10 +364,10 @@ s.test("semantic reset atomically replaces CRDT identity and advances only its e
 		assert.equal(reconstructed.generation, commit.generation);
 		assert.equal(reconstructed.checkpointSequence, reset.vaultSequence);
 		assert.equal(reconstructed.journalUpdates, 0);
-		assert.equal(reconstructed.doc.getText("body").toString(), text.toString());
-		assert.deepEqual(Y.encodeStateAsUpdate(reconstructed.doc), freshState,
+		assert.equal(crdtEngine.readText(reconstructed.doc, "body"), text.toString());
+		assert.deepEqual(crdtEngine.encodeStateAsUpdate(reconstructed.doc), freshState,
 			"reset baseline must contain only the caller's fresh identities");
-		reconstructed.doc.destroy();
+		crdtEngine.destroyDocument(reconstructed.doc);
 		const resetFeed = store.listChangesAfter(commit.vaultSequence);
 		assert.deepEqual(resetFeed.map((entry) => ({
 			kind: entry.kind, generation: entry.generation, semanticEpoch: entry.documentEpoch,

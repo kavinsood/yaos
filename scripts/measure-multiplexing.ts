@@ -8,8 +8,9 @@ import * as Y from "yjs";
 import * as syncProtocol from "y-protocols/sync";
 import { PROTOCOL_VERSION, SCHEMA_VERSION } from "../src/sync/schema";
 import {
-	connectDocument,
+	connectDocument as connectLiveDocument,
 	createBody,
+	type ConnectedDocument,
 	vaultRoute,
 	waitFor,
 } from "../tests/live/schema4Live";
@@ -24,8 +25,10 @@ const host = requiredEnv("YAOS_MULTIPLEX_BENCH_HOST").replace(/\/+$/, "");
 const outputPath = process.env.YAOS_MULTIPLEX_BENCH_OUTPUT?.trim() || null;
 const accessTokenFile = process.env.YAOS_MULTIPLEX_ACCESS_TOKEN_FILE?.trim() || null;
 const accessToken = accessTokenFile ? readFileSync(accessTokenFile, "utf8").trim() : null;
-const accessClientId = process.env.CF_ACCESS_CLIENT_ID?.trim() || null;
-const accessClientSecret = process.env.CF_ACCESS_CLIENT_SECRET?.trim() || null;
+const accessClientId = process.env.YAOS_CF_ACCESS_CLIENT_ID?.trim()
+	|| process.env.CF_ACCESS_CLIENT_ID?.trim() || null;
+const accessClientSecret = process.env.YAOS_CF_ACCESS_CLIENT_SECRET?.trim()
+	|| process.env.CF_ACCESS_CLIENT_SECRET?.trim() || null;
 const deploymentVersion = process.env.YAOS_MULTIPLEX_BENCH_DEPLOYMENT_VERSION?.trim() || null;
 const bodyCount = Number(process.env.YAOS_CURRENTNESS_BENCH_BODY_COUNT ?? "100");
 const smallBodyBytes = 4 * 1024;
@@ -82,6 +85,16 @@ interface UnexpectedResponse extends Error {
 	readonly status: number;
 }
 
+interface CapabilityProbe {
+	readonly status: number;
+	readonly claimed: boolean | null;
+	readonly error: string | null;
+	readonly cfRay: string | null;
+	readonly redirected: boolean;
+	readonly responseOrigin: string;
+	readonly location: string | null;
+}
+
 class BenchmarkWebSocket extends WebSocket {
 	constructor(address: string | URL, protocols?: string | string[]) {
 		const headers: Record<string, string> = {};
@@ -92,6 +105,20 @@ class BenchmarkWebSocket extends WebSocket {
 		}
 		super(address, protocols, { headers });
 	}
+}
+
+function connectDocument(
+	identity: LiveIdentity,
+	kind: "root" | "body",
+	documentId: string,
+): Promise<ConnectedDocument> {
+	return connectLiveDocument(
+		identity,
+		kind,
+		documentId,
+		new Y.Doc({ guid: documentId }),
+		BenchmarkWebSocket as unknown as typeof globalThis.WebSocket,
+	);
 }
 
 function requiredEnv(name: string): string {
@@ -165,6 +192,31 @@ async function json(response: Response): Promise<Record<string, unknown> | null>
 		: null;
 }
 
+async function capabilityProbe(label: string): Promise<CapabilityProbe> {
+	const url = new URL(`${host}/api/capabilities`);
+	url.searchParams.set("profileProbe", `${label}-${randomBytes(6).toString("hex")}`);
+	const response = await fetch(url, {
+		redirect: "manual",
+		headers: { "Cache-Control": "no-cache" },
+	});
+	const value = await json(response);
+	return {
+		status: response.status,
+		claimed: typeof value?.claimed === "boolean" ? value.claimed : null,
+		error: typeof value?.error === "string" ? value.error : null,
+		cfRay: response.headers.get("cf-ray"),
+		redirected: response.redirected,
+		responseOrigin: new URL(response.url).origin,
+		location: response.headers.get("location"),
+	};
+}
+
+function probeSummary(probes: readonly CapabilityProbe[]): string {
+	return JSON.stringify(probes.map(({ status, claimed, error, cfRay, redirected, responseOrigin, location }) => ({
+		status, claimed, error, cfRay, redirected, responseOrigin, location,
+	})));
+}
+
 async function enroll(pairingCode: string, deviceName: string, vaultId: string): Promise<LiveIdentity> {
 	const deviceId = randomBytes(16).toString("base64url");
 	const deviceToken = randomBytes(32).toString("base64url");
@@ -187,8 +239,10 @@ async function enroll(pairingCode: string, deviceName: string, vaultId: string):
 }
 
 async function provision(): Promise<BenchmarkContext> {
-	const capabilities = await fetch(`${host}/api/capabilities`).then(json);
-	if (capabilities?.claimed !== false) throw new Error("benchmark Worker must be fresh and unclaimed");
+	const beforeClaim = await capabilityProbe("before-claim");
+	if (beforeClaim.status !== 200 || beforeClaim.claimed !== false) {
+		throw new Error(`benchmark Worker must be fresh and unclaimed: ${probeSummary([beforeClaim])}`);
+	}
 	const operatorRecoveryKey = randomBytes(32).toString("base64url");
 	const claimResponse = await fetch(`${host}/claim`, {
 		method: "POST",
@@ -198,6 +252,14 @@ async function provision(): Promise<BenchmarkContext> {
 	const claim = await json(claimResponse);
 	if (!claimResponse.ok || typeof claim?.vaultId !== "string" || typeof claim.pairingCode !== "string") {
 		throw new Error(`claim failed (${claimResponse.status}): ${JSON.stringify(claim)}`);
+	}
+	// A deployed Worker can have several warm isolates. Probe concurrently so
+	// a stale pre-claim auth cache is diagnosed before it appears midway through
+	// publication as an intermittent application-level 503.
+	const claimVisibility = await Promise.all(Array.from({ length: 8 }, (_value, index) =>
+		capabilityProbe(`after-claim-${index}`)));
+	if (claimVisibility.some((probe) => probe.status !== 200 || probe.claimed !== true)) {
+		throw new Error(`claim is not visible across edge requests: ${probeSummary(claimVisibility)}`);
 	}
 	const deviceA = await enroll(claim.pairingCode, "mux-bench-a", claim.vaultId);
 	const pairingResponse = await fetch(vaultRoute(deviceA, "auth/pairing-code"), {
@@ -222,7 +284,14 @@ async function provision(): Promise<BenchmarkContext> {
 
 async function seed(identity: LiveIdentity): Promise<void> {
 	for (let index = 0; index < bodyCount; index++) {
-		await createBody(identity, bodyId(index), `Multiplex/${String(index).padStart(2, "0")}.md`, bodyContent(index));
+		try {
+			await createBody(identity, bodyId(index), `Multiplex/${String(index).padStart(2, "0")}.md`, bodyContent(index));
+		} catch (error) {
+			const probes = await Promise.all(Array.from({ length: 4 }, (_value, probeIndex) =>
+				capabilityProbe(`seed-${index}-failure-${probeIndex}`)));
+			const detail = error instanceof Error ? error.message : String(error);
+			throw new Error(`seed ${index + 1}/${bodyCount} failed: ${detail}; edge auth probes=${probeSummary(probes)}`);
+		}
 		if ((index + 1) % 5 === 0) console.log(`Seeded ${index + 1}/${bodyCount} bodies`);
 	}
 }
@@ -240,8 +309,8 @@ async function openRawBody(
 	identity: LiveIdentity,
 	body: string,
 	expectedContent: string,
-	ticket: string,
 ): Promise<OpenRawSocket> {
+	const ticket = (await fetchSocketTicket(identity, identity.vaultId, "body", body, 1)).ticket;
 	const startedAt = performance.now();
 	const doc = new Y.Doc({ guid: body });
 	const socket = new BenchmarkWebSocket(socketUrl(identity, body, ticket));
@@ -511,11 +580,14 @@ async function measureCatchUp(
 			headers: deviceBearerHeaders(identity, { "Content-Type": "application/json" }),
 			body: JSON.stringify({ bodies: bodyIds.map((bodyId) => ({
 				bodyId,
+				bodyEpoch: 1,
 				generation: current ? generations.get(bodyId) ?? 0 : 0,
 			})) }),
 		});
 		const bytes = await response.arrayBuffer();
-		if (!response.ok) throw new Error(`catch-up read failed (${response.status})`);
+		if (!response.ok) {
+			throw new Error(`catch-up read failed (${response.status}): ${new TextDecoder().decode(bytes)}`);
+		}
 		latencies.push(elapsed(startedAt));
 		sizes.push(bytes.byteLength);
 	}
@@ -531,21 +603,22 @@ async function catchUpRequest(
 	const response = await fetch(vaultRoute(identity, "catch-up"), {
 		method: "POST",
 		headers: deviceBearerHeaders(identity, { "Content-Type": "application/json" }),
-		body: JSON.stringify({ bodies: bodyIds.map((bodyId) => ({ bodyId, generation })) }),
+		body: JSON.stringify({ bodies: bodyIds.map((bodyId) => ({ bodyId, bodyEpoch: 1, generation })) }),
 	});
 	const bytes = await response.arrayBuffer();
-	if (!response.ok) throw new Error(`catch-up read failed (${response.status})`);
+	if (!response.ok) {
+		throw new Error(`catch-up read failed (${response.status}): ${new TextDecoder().decode(bytes)}`);
+	}
 	return { latency: elapsed(startedAt), bytes: bytes.byteLength };
 }
 
 async function runSequential(
 	identity: LiveIdentity,
-	ticket: string,
 	indices: readonly number[],
 ): Promise<RawSocketMeasurement[]> {
 	const values: RawSocketMeasurement[] = [];
 	for (const index of indices) {
-		const opened = await openRawBody(identity, bodyId(index), bodyContent(index), ticket);
+		const opened = await openRawBody(identity, bodyId(index), bodyContent(index));
 		values.push(opened.measurement);
 		await closeRaw(opened);
 	}
@@ -554,11 +627,10 @@ async function runSequential(
 
 async function runParallel(
 	identity: LiveIdentity,
-	ticket: string,
 	indices: readonly number[],
 ): Promise<{ wallMs: number; measurements: RawSocketMeasurement[] }> {
 	const startedAt = performance.now();
-	const opened = await Promise.all(indices.map((index) => openRawBody(identity, bodyId(index), bodyContent(index), ticket)));
+	const opened = await Promise.all(indices.map((index) => openRawBody(identity, bodyId(index), bodyContent(index))));
 	const wallMs = elapsed(startedAt);
 	await Promise.all(opened.map(closeRaw));
 	return { wallMs: rounded(wallMs), measurements: opened.map((value) => value.measurement) };
@@ -738,9 +810,27 @@ async function measureFlushCompaction(
 
 async function destroyVault(context: BenchmarkContext): Promise<void> {
 	const url = `${host}/operator/vaults/${encodeURIComponent(context.deviceA.vaultId)}`;
-	const deadline = Date.now() + 30_000;
+	const ownerRequest = await fetch(vaultRoute(context.deviceA, "governance"), {
+		method: "DELETE",
+		headers: deviceBearerHeaders(context.deviceA, { "Content-Type": "application/json" }),
+		body: JSON.stringify({ requestId: randomBytes(16).toString("base64url") }),
+	});
+	const requested = await json(ownerRequest);
+	const governance = requested?.governanceRequest;
+	const governanceRequestId = governance && typeof governance === "object" && !Array.isArray(governance)
+		&& typeof (governance as Record<string, unknown>).governanceRequestId === "string"
+		? String((governance as Record<string, unknown>).governanceRequestId)
+		: null;
+	if (ownerRequest.status !== 202 || governanceRequestId === null) {
+		throw new Error(`owner destroy request failed (${ownerRequest.status}): ${JSON.stringify(requested)}`);
+	}
+	const deadline = Date.now() + 60_000;
 	while (Date.now() < deadline) {
-		const response = await fetch(url, { method: "DELETE", headers: { Cookie: context.operatorCookie } });
+		const response = await fetch(url, {
+			method: "DELETE",
+			headers: { Cookie: context.operatorCookie, "Content-Type": "application/json" },
+			body: JSON.stringify({ governanceRequestId }),
+		});
 		if (response.status === 200) return;
 		if (response.status !== 202) throw new Error(`vault destroy failed (${response.status}): ${await response.text()}`);
 		await new Promise((resolvePromise) => setTimeout(resolvePromise, 200));
@@ -761,6 +851,7 @@ async function main(): Promise<void> {
 		bodyCount,
 		bodyBytes: smallBodyBytes,
 		deploymentVersion,
+		accessTransport: accessClientId ? "service-token" : accessToken ? "authorization-cookie" : "none",
 		cfRay: edgeProbe.headers.get("cf-ray"),
 	};
 	try {
@@ -769,9 +860,8 @@ async function main(): Promise<void> {
 		report.seedMs = rounded(elapsed(seedStartedAt));
 		console.log("Waiting 20 seconds for a deployed-runtime idle boundary...");
 		await new Promise((resolvePromise) => setTimeout(resolvePromise, 20_000));
-		const ticket = (await fetchSocketTicket(context.deviceB)).ticket;
 
-		const idleResume = await runSequential(context.deviceB, ticket, [0]);
+		const idleResume = await runSequential(context.deviceB, [0]);
 		report.idleResume = summarizeRaw(idleResume);
 		console.log(`Idle-resume body sync: ${idleResume[0]!.syncMs} ms`);
 		report.steadyHttpReads = {
@@ -821,8 +911,8 @@ async function main(): Promise<void> {
 			bodyId(bodyCount - 1),
 		);
 
-		const firstPass = await runSequential(context.deviceB, ticket, Array.from({ length: 16 }, (_value, index) => index));
-		const repeatPass = await runSequential(context.deviceB, ticket, Array.from({ length: 16 }, (_value, index) => index));
+		const firstPass = await runSequential(context.deviceB, Array.from({ length: 16 }, (_value, index) => index));
+		const repeatPass = await runSequential(context.deviceB, Array.from({ length: 16 }, (_value, index) => index));
 		report.sequentialFirstPass = summarizeRaw(firstPass);
 		report.sequentialRepeatPass = summarizeRaw(repeatPass);
 		console.log(`Sequential first/repeat sync p50: ${distribution(firstPass.map((value) => value.syncMs)).p50}/${distribution(repeatPass.map((value) => value.syncMs)).p50} ms`);
@@ -832,7 +922,7 @@ async function main(): Promise<void> {
 			const trials = [];
 			for (let trial = 0; trial < 4; trial++) {
 				const start = (trial * 7) % 28;
-				trials.push(await runParallel(context.deviceB, ticket, Array.from({ length: width }, (_value, offset) => start + offset)));
+				trials.push(await runParallel(context.deviceB, Array.from({ length: width }, (_value, offset) => start + offset)));
 			}
 			parallel[String(width)] = {
 				wallMs: distribution(trials.map((trial) => trial.wallMs)),
@@ -843,16 +933,16 @@ async function main(): Promise<void> {
 		report.parallel = parallel;
 
 		const churnStartedAt = performance.now();
-		const churn = await runSequential(context.deviceB, ticket, Array.from({ length: 40 }, (_value, index) => index % 20));
+		const churn = await runSequential(context.deviceB, Array.from({ length: 40 }, (_value, index) => index % 20));
 		report.switchChurn = { wallMs: rounded(elapsed(churnStartedAt)), ...summarizeRaw(churn) };
 		console.log(`40-note switch churn: ${rounded(elapsed(churnStartedAt))} ms`);
 
 		const saturationStartedAt = performance.now();
 		const saturationSockets = await Promise.all(Array.from({ length: 32 }, (_value, index) =>
-			openRawBody(context.deviceB, bodyId(index), bodyContent(index), ticket)));
+			openRawBody(context.deviceB, bodyId(index), bodyContent(index))));
 		let thirtyThirdStatus: number | null = null;
 		try {
-			const unexpected = await openRawBody(context.deviceB, bodyId(32), bodyContent(32), ticket);
+			const unexpected = await openRawBody(context.deviceB, bodyId(32), bodyContent(32));
 			await closeRaw(unexpected);
 		} catch (error) {
 			thirtyThirdStatus = typeof error === "object" && error !== null && "status" in error

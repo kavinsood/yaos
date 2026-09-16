@@ -3,6 +3,10 @@
 		"target": "ES2022",
 		"module": "ESNext",
 		"moduleResolution": "bundler",
+		"baseUrl": "..",
+		"paths": {
+			"@yaos/crdt-engine": ["server/src/crdt/ywasmWorkerCrdtEngine.ts"]
+		},
 		"strict": true,
 		// Matches the plugin's tsconfig.json. Without it the Worker was the one
 		// tree in the repo where an unchecked array or record index could land

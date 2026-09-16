@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -17,6 +18,17 @@ const productVersionsSource = readFileSync(
 	"utf8",
 );
 const wranglerSource = readFileSync(resolve(rootDir, "server/wrangler.toml"), "utf8");
+const ywasmSource = JSON.parse(readFileSync(resolve(rootDir, "server/vendor/ywasm/SOURCE.json"), "utf8"));
+
+function sha256(path) {
+	return createHash("sha256").update(readFileSync(path)).digest("hex");
+}
+
+function requirePinnedArtifact(path, expectedHash, expectedBytes, label) {
+	if (sha256(path) !== expectedHash || statSync(path).size !== expectedBytes) {
+		throw new Error(`${label} does not match server/vendor/ywasm/SOURCE.json`);
+	}
+}
 
 function requireRecoveryDeploymentContract(source) {
 	const binding = /\[\[durable_objects\.bindings\]\][\s\S]*?name\s*=\s*"YAOS_RECOVERY_JOBS"[\s\S]*?class_name\s*=\s*"RecoveryJob"/.test(source);
@@ -64,6 +76,7 @@ const serverReleaseOwnedPaths = [
 	"scripts",
 	"tsconfig.json",
 	"src",
+	"vendor",
 ];
 const serverReleaseCopyPaths = [...serverReleaseOwnedPaths, "wrangler.toml"];
 
@@ -86,7 +99,20 @@ const serverZipManifest = {
 	protocolVersion,
 	snapshotFormatVersion,
 	updateOwnedPaths: serverReleaseOwnedPaths,
+	crdtEngine: {
+		name: "ywasm",
+		sourceCommit: ywasmSource.commit,
+		rustToolchain: ywasmSource.rustToolchain,
+		wasmPack: ywasmSource.wasmPack,
+		maximumLinearMemoryBytes: ywasmSource.maximumLinearMemoryBytes,
+		artifactSha256: ywasmSource.artifact.wasmSha256,
+	},
 };
+
+requirePinnedArtifact(resolve(rootDir, "server/src/crdt/vendor/ywasm/ywasm_bg.wasm"),
+	ywasmSource.artifact.wasmSha256, ywasmSource.artifact.wasmBytes, "Worker Wasm artifact");
+requirePinnedArtifact(resolve(rootDir, "server/src/crdt/vendor/ywasm/ywasm.mjs"),
+	ywasmSource.artifact.wrapperSha256, ywasmSource.artifact.wrapperBytes, "Worker ywasm wrapper");
 
 mkdirSync(outputDir, { recursive: true });
 mkdirSync(serverTempDir, { recursive: true });

@@ -1,8 +1,8 @@
 # RFC: ywasm as the YAOS3 server CRDT engine
 
-Status: Proposed
+Status: Implemented and deployed for YAOS3 qualification
 
-Date: 16 September 2026
+Date: 17 September 2026
 
 Target: `yaos3` greenfield server
 
@@ -16,12 +16,13 @@ storage, authorization, validation, catalog projection, and socket coordination
 remain TypeScript. Wasm owns only CRDT document computation.
 
 This is worthwhile because the expensive large-history operations YAOS performs
-are materially faster in the real Cloudflare Workers runtime, and a multi-shard
-local soak retained less process memory than Yjs. The improvement is small for
-ordinary notes, so this is not a claim that Wasm makes the whole service several
-times faster. It removes a costly tail from reconstruction, catch-up,
-checkpointing, and update application while leaving SQL and network time
-essentially unchanged.
+are materially faster in the real Cloudflare Workers runtime. The improvement
+is small for ordinary notes, so this is not a claim that Wasm makes the whole
+service several times faster. It removes a costly tail from reconstruction,
+catch-up, checkpointing, and update application while leaving SQL and network
+time essentially unchanged. Memory remains an admission-envelope result, not a
+blanket Wasm win: page growth stabilizes after warmup, but allocator high-water
+RSS is workload- and run-sensitive.
 
 This is not a drop-in dependency replacement. YAOS must own a narrow engine
 boundary, a reproducible Rust/Wasm artifact, one missing document-census API,
@@ -29,10 +30,129 @@ explicit wrapper disposal, sync framing, memory admission, trap recovery, and a
 cross-engine conformance suite. Those are release requirements, not follow-up
 cleanup.
 
-Before the engine port, YAOS must repair its existing SQL and semantic
-compaction scheduling. Faster replay is not a substitute for preventing an
-unbounded replay tail or an unnecessarily old CRDT lineage. Step 1 of this RFC
-specifies that repair in implementation detail; it does not implement it.
+Before the engine port, YAOS repaired its existing SQL and semantic compaction
+scheduling. Faster replay is not a substitute for preventing an unbounded
+replay tail or an unnecessarily old CRDT lineage. Step 1 of this RFC records
+the implementation and its acceptance criteria.
+
+## Implementation outcome
+
+The RFC is implemented in the YAOS3 worktree. Production server document
+computation now uses the pinned ywasm artifact exclusively; Yjs remains a client
+dependency and an independent wire/test oracle. Durable Object SQLite, R2,
+authorization, alarms, receipts, catalogs, recovery, and socket coordination
+remain TypeScript and byte-oriented.
+
+The pinned artifact is built from `y-crdt/y-crdt` commit
+`37dfed7eaeeddc70205577c6d92b50c53023b133` with Rust 1.98.1 and wasm-pack
+0.15.0. The Wasm is 983,035 bytes with SHA-256
+`3d0dc3fceba1de16ae21d7d345999f75a09ea3743339f1911a1e419db8c703c3`;
+its configured maximum is 1,536 pages (96 MiB). Two clean builds produced
+identical Wasm and JavaScript wrapper hashes. The source pin, build inputs,
+license, census/change-detection patches, generated bindings, and checksums are
+vendored together.
+
+Qualification completed on 17 September 2026:
+
+- all 169 regression suites passed;
+- Worker and production Node capability conformance passed for every declared
+  admission, durability, recovery, attachment, collaboration, and semantic
+  Canvas capability;
+- the local destructive Worker integration suite and a fresh deployed
+  destructive integration suite passed through final generation-scoped purge;
+- 100,000 current-release Unicode differential operations passed across CJK,
+  emoji/ZWJ, combining text, RTL text, and both Yjs/ywasm directions; the
+  preceding census artifact also passed a 200,000-operation qualification;
+- 10,000 create/apply/encode/free cycles settled at 3,932,160 bytes with zero
+  late Wasm-page growth;
+- corrupt input, trap recovery, multi-shard residency, exact census, schema
+  helpers, sync framing, and memory pre-admission gates passed;
+- the current full headless lifecycle run passed 92/92 after closing an
+  admitted-creation replay race, and the full regression suite then passed
+  169/169;
+- the final deployed Worker bundle was 2,518.64 KiB (605.69 KiB gzip), starts in
+  8 ms on the retained deployment, and binds all three Durable Object classes
+  plus the production R2 bucket. The exact bundle also passed a fresh
+  destructive validation deployment, which started in 8 ms and was deleted
+  after its generation-scoped purge completed. A preceding clean deployment
+  passed every sync/recovery/settings check but its alarm-driven R2 purge did
+  not reach terminal state within the suite's bounded 60-second window; the
+  fresh rerun completed the same purge normally, so this remains a measured
+  platform-scheduling tail rather than a hidden success claim.
+
+The retained qualification deployment is version
+`2ec4bef7-ad14-461a-a5a5-ab0e6c10fe82` at
+`yaos3-ywasm-final-20260917.kavinsood.workers.dev`. Cloudflare Access is
+exact-host and permits only `kavin@cloudflare.com`. The temporary service token
+used by automated QA and every disposable profiling deployment were deleted.
+
+The final hot-path hardening preserves the authoritative/validation document
+pair while removing avoidable work around it. Frontmatter validation filters
+`snapshotRoots()` before materialization, so it never copies the Markdown body.
+Canvas validation returns its canonical bytes to every caller instead of
+materializing twice. A pinned Rust/Wasm `applyUpdateAndCheckIfChanged` export
+uses the exact Yrs update-event predicate, including delete-only transactions,
+instead of encoding two state vectors. Socket validation owns its speculative
+mirror through a `finally` cleanup, and unrelated notes now use independent
+persistence lanes. Durable socket flushes advance only the authoritative mirror
+because the validation mirror already contains the staged frames.
+
+Whole-note hashing now runs at the 250 ms durable flush rather than on every
+accepted socket frame. A flush reconstructs each size-bounded partition against
+its exact durable prefix, so split queues still produce the correct intermediate
+catalog hashes without retaining a whole canonical byte array per frame. One
+Markdown materialization remains at admission because canonical-form and exact
+size limits are per-frame security invariants; filtering `snapshotRoots()`
+removes the accidental second body materialization.
+
+Bootstrap verification uses an engine-independent `canonical-root-v1` digest
+rather than comparing Yjs and ywasm checkpoint bytes, because two valid wire
+encodings can represent the same root state. The digest sorts roots, CRDT map
+entries, and plain-object keys by deterministic UTF-16 code-unit order (never
+locale/ICU order). Focused tests cover multiple roots, reversed insertion
+orders, Unicode keys, nested maps, and semantic mutation across both engines.
+
+Final headless qualification also found an adjacent lifecycle crash/race: once
+the server admitted a creation it owned an exact operation/candidate fence, but
+a newer local watcher revision could make the client abandon that operation.
+The newer revision then reused the body behind a second operation ID and was
+permanently rejected with a fence mismatch. YAOS now treats admission as the
+irreversible distributed commitment point, persists the candidate ID and
+digest before single or batch admission, and after restart either proves the
+exact committed candidate outcome or reconstructs only that same fence. A
+deterministic crash/supersession regression and two consecutive 92/92 headless
+runs cover this boundary.
+
+The exact pinned artifact's current local lifecycle medians were 75.57 to 27.55
+ms for cold reconstruction, 1.45 to 0.52 ms for resident-tail apply, 0.094 to
+0.048 ms for catch-up, and 0.623 to 0.182 ms for checkpoint encoding (Yjs to
+ywasm). Semantic rebuild was slower, 0.187 to 0.539 ms, but remained
+sub-millisecond. In the 10,000-cycle, eight-shard Node soak, ywasm's
+post-warmup RSS growth (7.37 MiB) and resident-pair high-water allocation (17.9
+MiB) exceeded Yjs in that run (0.84 MiB and effectively zero). That result
+reinforces the 96 MiB admission envelope and explicit disposal requirement; it
+does not support marketing ywasm as universally lower-memory.
+The earlier real-Workers large-history measurements below remain the isolated
+deployed CRDT-compute evidence. A public-network 100-shard operational profile
+also exposed an intermittent application-level `503 {"error":"unclaimed"}`.
+The cause was a real cross-isolate cache race: pre-claim capabilities traffic
+cached `claimed:false` for 60 seconds, while `/claim` could invalidate only the
+isolate that handled it. ServerConfig SQLite and Durable Object hibernation were
+correct. YAOS now never caches the one-way unclaimed state, while retaining the
+bounded cache after claim. Regression tests model another isolate completing
+claim without local invalidation.
+
+After that fix, a fresh public deployment published all 100 notes, crossed a
+20-second idle boundary, completed the full profile, and destroyed its
+generation-scoped data without another 503. Public-network medians included
+88.81 ms for one 100-body currentness query, 905.95 ms wall time for 100 parallel
+head reads, 835.87 ms for stale 100-body catch-up, 562.93 ms for unchanged
+100-body catch-up, and 372.32/360.86 ms propagation with one/seven receiving
+sockets. Thirty-two body sockets opened in 13.29 seconds and the thirty-third
+received the designed 429. The profiler also gained cross-edge claim probes,
+exact Access diagnostics, provider-socket Access headers, document-scoped
+tickets, current catch-up epochs, and the owner-request/operator-confirmed
+destruction flow.
 
 ## Scope
 
@@ -750,13 +870,12 @@ The ywasm production switch may ship only after:
 
 ## Final recommendation
 
-Proceed. The measured benefit is large on the exact pathological and lifecycle
+Proceed with the implemented design. The measured benefit is large on the exact pathological and lifecycle
 operations that threaten a constrained Durable Object, while the greenfield
 window makes the architectural cost lower now than later. But treat ywasm as a
 storage-engine component YAOS owns operationally, not as an npm optimization.
 
-The immediate next task is Step 1 only. Its purpose is to guarantee that YAOS
-does not create pathological replay or CRDT states silently, regardless of which
-engine executes them. Once that foundation is proven, the Rust/Wasm build and
-engine boundary can proceed without confusing a scheduling defect with an
-engine performance result.
+Step 1, the Rust/Wasm build, the engine boundary, the production port, the
+cross-isolate claim fix, and the qualification matrix are complete in this
+worktree. Continue recalibrating memory admission from production telemetry;
+that operational tuning does not change the adopted engine boundary.

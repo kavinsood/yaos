@@ -88,6 +88,10 @@ export class CloudflareAlarmPort implements AlarmPort {
 	deleteAlarm(): Promise<void> {
 		return this.storage.deleteAlarm();
 	}
+
+	getAlarm(): Promise<number | null> {
+		return this.storage.getAlarm();
+	}
 }
 
 export class CloudflareExecutionPort implements ExecutionPort {
