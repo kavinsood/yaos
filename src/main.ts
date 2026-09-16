@@ -1387,6 +1387,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					await this.updateSettings((settings) => {
 						settings.originImportPending = false;
 					}, "origin-import-complete");
+					await this.reconciliationController.reconcileMarkdownInventory("origin-import-post");
 				}
 			}
 

@@ -8,9 +8,15 @@ import {
 	contentBaselineHash,
 	contentFingerprint,
 	currentContentHash,
+	filterChangedFiles,
 	setCurrentContentHash,
 } from "../sync/diskIndex";
-import type { ReconcileMode, VaultSync } from "../sync/vaultSync";
+import {
+	FreshAdmissionCancelledError,
+	FreshAdmissionDurablyPendingError,
+	type ReconcileMode,
+	type VaultSync,
+} from "../sync/vaultSync";
 import type { VaultSyncSettings } from "../settings";
 import type { RuntimeConfig } from "./runtimeConfig";
 import type { EditorBindingManager } from "../sync/editorBinding";
@@ -51,6 +57,11 @@ import {
 	AMPLIFICATION_WINDOW_MS,
 	type AmplificationEntry,
 } from "./reconcile/amplificationQuarantinePolicy";
+import {
+	MarkdownAdmissionScheduler,
+	type MarkdownAdmissionIntent,
+} from "./markdownAdmissionScheduler";
+import type { OperationOutcome } from "./operationLifecycle";
 
 export interface ReconciliationStats {
 	at: string;
@@ -70,6 +81,9 @@ export interface ReconciliationState {
 	lastReconcileStats: ReconciliationStats | null;
 	lastReconciledGeneration: number;
 	untrackedFileCount: number;
+	markdownAdmissionPending: number;
+	markdownAdmissionOldestAgeMs: number;
+	markdownAdmissionNextDeadlineAt: number | null;
 	blockedDivergenceCount: number;
 	lastBlockedDivergenceAt: string | null;
 	/** Safe sample of blocked paths: extensions + fingerprint hashes (no raw filenames). */
@@ -134,7 +148,6 @@ interface ReconciliationControllerDeps {
 	registerDiskIngestPort?(port: DiskIngestPort): void;
 }
 
-const MARKDOWN_DIRTY_SETTLE_MS = 350;
 const OPEN_FILE_EXTERNAL_EDIT_IDLE_GRACE_MS = 1200;
 /**
  * Idle window for the bound-file-local-only-divergence branch.
@@ -264,11 +277,8 @@ export class ReconciliationController {
 	private lastReconcileTime = 0;
 	private reconcileCooldownTimer: number | null = null;
 	private lastReconcileStats: ReconciliationStats | null = null;
-	private dirtyMarkdownPaths = new Map<string, { reason: "create" | "modify"; primaryOpId?: string; coalescedOpIds: string[] }>();
 	private closedOnlyDeferredImports = new Set<string>();
-	private markdownDrainPromise: Promise<void> | null = null;
-	private markdownDrainTimer: number | null = null;
-	private lastMarkdownDirtyAt = 0;
+	private readonly markdownAdmission: MarkdownAdmissionScheduler;
 	private boundRecoveryLocks = new Map<string, number>();
 	private recoveryFingerprints = new Map<string, FingerprintEntry>();
 	/**
@@ -293,6 +303,10 @@ export class ReconciliationController {
 	private static readonly AMPLIFICATION_NOTICE_COOLDOWN_MS = 60_000;
 
 	constructor(private readonly deps: ReconciliationControllerDeps) {
+		this.markdownAdmission = new MarkdownAdmissionScheduler({
+			process: (intent, isCurrent) => this.processMarkdownAdmission(intent, isCurrent),
+			onError: (error) => this.deps.log(`Markdown admission scheduler failed: ${String(error)}`),
+		});
 		// If a QA harness is attached, register the disk-ingest control port now.
 		// In normal production, registerDiskIngestHarnessPort is absent.
 		deps.registerDiskIngestPort?.({
@@ -331,6 +345,7 @@ export class ReconciliationController {
 	}
 
 	getState(): ReconciliationState {
+		const admission = this.markdownAdmission.diagnostics();
 		return {
 			reconciled: this.reconciled,
 			reconcileInFlight: this.reconcileInFlight,
@@ -338,6 +353,12 @@ export class ReconciliationController {
 			lastReconcileStats: this.lastReconcileStats,
 			lastReconciledGeneration: this.lastReconciledGeneration,
 			untrackedFileCount: this.untrackedFiles.length,
+			markdownAdmissionPending: admission.queue.length,
+			markdownAdmissionOldestAgeMs: admission.queue.reduce(
+				(oldest, item) => Math.max(oldest, item.queueAgeMs),
+				0,
+			),
+			markdownAdmissionNextDeadlineAt: admission.nextWakeAt,
 			blockedDivergenceCount: this.blockedDivergenceCount,
 			lastBlockedDivergenceAt: this.lastBlockedDivergenceAt,
 			blockedDivergenceSample: this.blockedDivergenceSample,
@@ -353,10 +374,6 @@ export class ReconciliationController {
 			window.clearTimeout(this.reconcileCooldownTimer);
 			this.reconcileCooldownTimer = null;
 		}
-		if (this.markdownDrainTimer) {
-			window.clearTimeout(this.markdownDrainTimer);
-			this.markdownDrainTimer = null;
-		}
 		this.reconciled = false;
 		this.reconcileInFlight = false;
 		this.reconcilePending = false;
@@ -364,10 +381,8 @@ export class ReconciliationController {
 		this.lastReconciledGeneration = 0;
 		this.lastReconcileTime = 0;
 		this.lastReconcileStats = null;
-		this.dirtyMarkdownPaths.clear();
+		this.markdownAdmission.reset();
 		this.closedOnlyDeferredImports.clear();
-		this.markdownDrainPromise = null;
-		this.lastMarkdownDirtyAt = 0;
 		this.recoveryFingerprints.clear();
 		this.amplificationHistory.clear();
 		this.lastConflictFingerprints.clear();
@@ -392,10 +407,6 @@ export class ReconciliationController {
 		this.deps.log(`Running reconnect reconciliation (gen ${generation})`);
 		await this.deps.refreshServerCapabilities("provider-sync");
 		this.deps.validateOpenEditorBindings(`reconnect-pre:${generation}`);
-
-		if (this.untrackedFiles.length > 0) {
-			await this.importUntrackedFiles();
-		}
 
 		await this.runReconciliation("authoritative");
 		this.lastReconciledGeneration = generation;
@@ -430,7 +441,9 @@ export class ReconciliationController {
 					`${blobResult.downloadQueued} downloads, ${blobResult.skipped} skipped`,
 				);
 			}
-			this.untrackedFiles = [];
+			await this.reconcileMarkdownInventory(`reconcile:${mode}`, {
+				includeUntracked: this.deps.getSettings().originImportPending !== true,
+			});
 			this.reconciled = true;
 			this.lastReconciledGeneration = vaultSync.connectionGeneration;
 			this.lastReconcileStats = {
@@ -462,6 +475,41 @@ export class ReconciliationController {
 			this.lastReconcileTime = Date.now();
 			this.deps.scheduleTraceStateSnapshot(`schema4-${mode}`);
 		}
+	}
+
+	/**
+	 * Reconstructs volatile Markdown admission work from the filesystem.
+	 * Missing catalog identities are always queued, even when their persisted
+	 * disk-index stats look unchanged. Tracked files use the disk index to avoid
+	 * unnecessary reads.
+	 */
+	async reconcileMarkdownInventory(
+		reason: string,
+		options: { includeUntracked?: boolean } = {},
+	): Promise<void> {
+		const vaultSync = this.deps.getVaultSync();
+		if (!vaultSync) return;
+		const files = this.deps.app.vault.getMarkdownFiles()
+			.filter((file) => this.deps.isMarkdownPathSyncable(file.path));
+		const { changed } = await filterChangedFiles(
+			this.deps.app,
+			files,
+			this.deps.getDiskIndex(),
+		);
+		const changedPaths = new Set(changed.map((file) => file.path));
+		const untracked = files.filter((file) => !vaultSync.getFileId(file.path));
+		this.untrackedFiles = untracked.map((file) => file.path);
+
+		for (const file of files) {
+			const missing = !vaultSync.getFileId(file.path);
+			if (missing && options.includeUntracked === false) continue;
+			if (missing || changedPaths.has(file.path)) {
+				this.markMarkdownDirty(file, missing ? "create" : "modify");
+			}
+		}
+		this.deps.log(
+			`Markdown inventory (${reason}): ${untracked.length} untracked, ${changedPaths.size} changed`,
+		);
 	}
 
 	async importUntrackedFiles(): Promise<void> {
@@ -510,29 +558,7 @@ export class ReconciliationController {
 	}
 
 	markMarkdownDirty(file: TFile, reason: "create" | "modify", opId?: string): void {
-		const previous = this.dirtyMarkdownPaths.get(file.path);
-		if (!previous) {
-			this.dirtyMarkdownPaths.set(file.path, {
-				reason,
-				primaryOpId: opId,
-				coalescedOpIds: opId ? [opId] : [],
-			});
-		} else {
-			// Keep "create" if either is "create" (higher priority)
-			const mergedReason = previous.reason === "create" || reason === "create" ? "create" : "modify";
-			// Append new opId to coalesced list
-			const coalescedOpIds = [...previous.coalescedOpIds];
-			if (opId && !coalescedOpIds.includes(opId)) {
-				coalescedOpIds.push(opId);
-			}
-			this.dirtyMarkdownPaths.set(file.path, {
-				reason: mergedReason,
-				primaryOpId: previous.primaryOpId ?? opId,
-				coalescedOpIds,
-			});
-		}
-		this.lastMarkdownDirtyAt = Date.now();
-		this.scheduleMarkdownDrain();
+		this.markdownAdmission.queue({ path: file.path, reason, opId });
 	}
 
 	/**
@@ -562,29 +588,9 @@ export class ReconciliationController {
 	 *   - If no entry exists for oldPath, this is a no-op.
 	 */
 	redirectPendingDirtyPath(oldPath: string, newPath: string): void {
-		const entry = this.dirtyMarkdownPaths.get(oldPath);
-		if (!entry) return;
-
-		this.dirtyMarkdownPaths.delete(oldPath);
-
-		const existing = this.dirtyMarkdownPaths.get(newPath);
-		if (existing) {
-			// Merge — preserve create priority, coalesce op IDs.
-			this.dirtyMarkdownPaths.set(newPath, {
-				reason: existing.reason === "create" || entry.reason === "create" ? "create" : "modify",
-				primaryOpId: existing.primaryOpId ?? entry.primaryOpId,
-				coalescedOpIds: Array.from(new Set([
-					...existing.coalescedOpIds,
-					...entry.coalescedOpIds,
-				])),
-			});
-		} else {
-			this.dirtyMarkdownPaths.set(newPath, entry);
+		if (this.markdownAdmission.redirect(oldPath, newPath)) {
+			this.deps.log(`redirectPendingDirtyPath: "${oldPath}" -> "${newPath}"`);
 		}
-
-		const label = entry.reason === "create" ? "race recovery" : "modify redirect";
-		this.deps.log(`redirectPendingDirtyPath(${entry.reason}): "${oldPath}" -> "${newPath}" (${label})`);
-		this.scheduleMarkdownDrain();
 	}
 
 
@@ -598,7 +604,7 @@ export class ReconciliationController {
 	 * but is noisy and unnecessary).
 	 */
 	dropDirtyPath(path: string): void {
-		if (this.dirtyMarkdownPaths.delete(path)) {
+		if (this.markdownAdmission.drop(path)) {
 			this.deps.log(`dropDirtyPath: dropped excluded dirty entry for "${path}"`);
 		}
 	}
@@ -628,44 +634,29 @@ export class ReconciliationController {
 			});
 	}
 
-	private scheduleMarkdownDrain(): void {
-		if (this.markdownDrainTimer) {
-			window.clearTimeout(this.markdownDrainTimer);
-		}
-		const elapsed = Date.now() - this.lastMarkdownDirtyAt;
-		const delay = Math.max(0, MARKDOWN_DIRTY_SETTLE_MS - elapsed);
-		this.markdownDrainTimer = window.setTimeout(() => {
-			this.markdownDrainTimer = null;
-			const sinceLastDirty = Date.now() - this.lastMarkdownDirtyAt;
-			if (sinceLastDirty < MARKDOWN_DIRTY_SETTLE_MS) {
-				this.scheduleMarkdownDrain();
-				return;
+	private async processMarkdownAdmission(
+		intent: MarkdownAdmissionIntent,
+		isCurrent: () => boolean,
+	): Promise<OperationOutcome> {
+		if (!isCurrent()) return { kind: "superseded" };
+		try {
+			await this.processDirtyMarkdownPath(
+				intent.path,
+				intent.reason,
+				intent.primaryOpId,
+				[...intent.coalescedOpIds],
+				{ bodyId: intent.bodyId, candidateId: intent.candidateId, isCurrent },
+			);
+			if (!isCurrent()) return { kind: "superseded" };
+			if (intent.reason === "create" && this.deps.getVaultSync()?.getFileId(intent.path)) {
+				this.untrackedFiles = this.untrackedFiles.filter((candidate) => candidate !== intent.path);
 			}
-			this.kickMarkdownDrain();
-		}, delay);
-	}
-
-	private kickMarkdownDrain(): void {
-		if (this.markdownDrainPromise) return;
-		this.markdownDrainPromise = this.drainDirtyMarkdownPaths()
-			.catch((err) => {
-				console.error("[yaos] markdown drain failed:", err);
-			})
-			.finally(() => {
-				this.markdownDrainPromise = null;
-				if (this.dirtyMarkdownPaths.size > 0) {
-					this.scheduleMarkdownDrain();
-				}
-			});
-	}
-
-	private async drainDirtyMarkdownPaths(): Promise<void> {
-		if (this.dirtyMarkdownPaths.size === 0) return;
-		const batch = Array.from(this.dirtyMarkdownPaths.entries());
-		this.dirtyMarkdownPaths.clear();
-
-		for (const [path, { reason, primaryOpId, coalescedOpIds }] of batch) {
-			await this.processDirtyMarkdownPath(path, reason, primaryOpId, coalescedOpIds);
+			return { kind: "completed", value: undefined };
+		} catch (error) {
+			if (error instanceof FreshAdmissionDurablyPendingError) return { kind: "durably_pending" };
+			if (error instanceof FreshAdmissionCancelledError) return { kind: "superseded" };
+			this.deps.log(`Markdown ${intent.reason} remains pending for "${intent.path}": ${String(error)}`);
+			return { kind: "retryable_failure", failure: "local_persistence" };
 		}
 	}
 
@@ -674,6 +665,7 @@ export class ReconciliationController {
 		reason: "create" | "modify",
 		opId?: string,
 		coalescedOpIds?: string[],
+		admission?: { bodyId: string; candidateId: string; isCurrent: () => boolean },
 	): Promise<void> {
 		const abstractFile = this.deps.app.vault.getAbstractFileByPath(path);
 		if (!(abstractFile instanceof TFile)) {
@@ -700,7 +692,7 @@ export class ReconciliationController {
 			}
 		}
 
-		await this.syncFileFromDisk(abstractFile, reason, opId, coalescedOpIds);
+		await this.syncFileFromDisk(abstractFile, reason, opId, coalescedOpIds, admission);
 	}
 
 	private async syncFileFromDisk(
@@ -708,6 +700,7 @@ export class ReconciliationController {
 		sourceReason: "create" | "modify" = "modify",
 		opId?: string,
 		coalescedOpIds?: string[],
+		admission?: { bodyId: string; candidateId: string; isCurrent: () => boolean },
 	): Promise<void> {
 		const vaultSync = this.deps.getVaultSync();
 		const editorBindings = this.deps.getEditorBindings();
@@ -806,14 +799,15 @@ export class ReconciliationController {
 					return;
 				}
 			} else {
-				const admittedBodyId = bodyId ?? crypto.randomUUID();
+				const admittedBodyId = bodyId ?? admission?.bodyId ?? crypto.randomUUID();
 				await vaultSync.commitDiskBody({
 					bodyId: admittedBodyId,
 					path: file.path,
 					content,
 					reason: "external-edit",
 					...(bodyId ? {} : { lifecycle: "create" as const }),
-					candidateId: opId ?? crypto.randomUUID(),
+					candidateId: admission?.candidateId ?? opId ?? crypto.randomUUID(),
+					...(admission ? { admissionStillCurrent: admission.isCurrent } : {}),
 				});
 			}
 			this.deps.recordFlightPathEvent?.({
@@ -835,6 +829,7 @@ export class ReconciliationController {
 			await this.updateDiskIndexForPath(file.path, content);
 		} catch (err) {
 			console.error(`[yaos] syncFileFromDisk failed for "${file.path}":`, err);
+			throw err;
 		}
 	}
 
