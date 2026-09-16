@@ -1,11 +1,10 @@
 import type { CrdtRootOperation, CrdtValueSnapshot } from "./crdt/crdtEngine";
 import type { YwasmCrdtDocument } from "./crdt/ywasmCrdtEngine";
 import { ywasmCrdtEngine as crdtEngine } from "@yaos/crdt-engine";
-import { canonicalCanvasBytes } from "./shared/canvasCodec";
+import { parseCanvasBytes } from "./shared/canvasCodec";
 import {
 	importCanvasData,
 	initializeCanvasDocument,
-	materializeCanvasDocument,
 	validateCanvasDocument,
 } from "./crdt/canvasSemanticDocument";
 import { canonicalizeMarkdown } from "./shared/markdownCodec";
@@ -217,16 +216,18 @@ export function prepareRootSemanticReset(
  */
 export async function prepareCanvasSemanticReset(current: YwasmCrdtDocument): Promise<PreparedCanvasSemanticReset> {
 	const validation = await validateCanvasDocument(current);
-	if (validation) throw new Error(`semantic reset rejected invalid canvas: ${validation}`);
-	const data = await materializeCanvasDocument(current, false);
-	const canonical = canonicalCanvasBytes(data);
+	if (validation.error !== null) throw new Error(`semantic reset rejected invalid canvas: ${validation.error}`);
+	const parsed = parseCanvasBytes(validation.canonicalBytes);
+	if (parsed.kind !== "valid") throw new Error("semantic reset rejected invalid canonical canvas");
+	const data = parsed.data;
+	const canonical = validation.canonicalBytes;
 	const previousEncoded = crdtEngine.encodeStateAsUpdate(current);
 	const fresh = crdtEngine.createDocument(current.guid);
 	try {
 		initializeCanvasDocument(fresh);
 		importCanvasData(fresh, data, "canvas-semantic-reset");
 		const freshValidation = await validateCanvasDocument(fresh);
-		if (freshValidation) throw new Error(`semantic reset produced invalid canvas: ${freshValidation}`);
+		if (freshValidation.error) throw new Error(`semantic reset produced invalid canvas: ${freshValidation.error}`);
 		const encodedState = crdtEngine.encodeStateAsUpdate(fresh);
 		return {
 			document: fresh,

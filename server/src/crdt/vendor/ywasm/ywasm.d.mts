@@ -41,6 +41,7 @@ export class YDoc {
 }
 
 export function applyUpdate(doc: YDoc, update: Uint8Array, origin: unknown): void;
+export function applyUpdateAndCheckIfChanged(doc: YDoc, update: Uint8Array, origin: unknown): boolean;
 export function encodeStateVector(doc: YDoc): Uint8Array;
 export function encodeStateAsUpdate(doc: YDoc, vector?: Uint8Array | null): Uint8Array;
 export function mergeUpdatesV1(updates: Array<Uint8Array>): Uint8Array;

@@ -100,7 +100,10 @@ s.test("revocation during asynchronous Canvas validation cannot reach the pendin
 				entered.resolve();
 				await resume.promise;
 				return { changesState: true, requiresDurableCommit: true,
-					contentBytes: new TextEncoder().encode("canvas"), encodedStateBytes: 12, exactEncodedStateBytes: true };
+					// Revocation must be checked before hashing; this deliberately invalid
+					// BufferSource would make WebCrypto reject if the digest were reached.
+					contentBytes: { byteLength: 6 } as unknown as Uint8Array,
+					encodedStateBytes: 12, exactEncodedStateBytes: true };
 			},
 			discardValidatedBodyUpdate: () => { discarded++; },
 			stageValidatedBodyUpdate: () => { staged++; },
@@ -184,6 +187,76 @@ s.test("semantic deletion during asynchronous Canvas validation cannot reach the
 	assert.equal(JSON.parse(sent[0]!.slice(6)).code, "semantic_document_not_active");
 });
 
+s.test("a queue exception discards staged validation and does not poison the next frame", async () => {
+	let validationPending = false;
+	let validations = 0;
+	let discarded = 0;
+	let queued = 0;
+	let staged = 0;
+	const socket: VaultSocketPort = {
+		deserializeAttachment: () => attachment,
+		serializeAttachment: () => {},
+		send: () => {},
+		close: () => {},
+	};
+	const service = new VaultSocketService({
+		sockets: registry([socket]),
+		cache: {
+			serializeDocument: async (_id: string, operation: () => Promise<void>) => operation(),
+			load: () => ({ semanticEpoch: 1 }),
+			validateCanvasUpdate: async () => {
+				assert.equal(validationPending, false, "a prior exceptional frame released validation ownership");
+				validationPending = true;
+				validations++;
+				return { changesState: true, requiresDurableCommit: true,
+					contentBytes: new TextEncoder().encode("canvas"),
+					encodedStateBytes: 12, exactEncodedStateBytes: true };
+			},
+			discardValidatedBodyUpdate: () => {
+				assert.equal(validationPending, true);
+				validationPending = false;
+				discarded++;
+			},
+			queue: (_id: string, entry: Record<string, unknown>) => {
+				queued++;
+				assert.equal("contentHash" in entry, false, "whole-note hashing is deferred to the flush");
+				assert.equal("contentSize" in entry, false, "whole-note bytes are not retained per queued frame");
+				if (queued === 1) throw new Error("injected queue failure");
+				return { ok: true };
+			},
+			stageValidatedBodyUpdate: () => {
+				assert.equal(validationPending, true);
+				validationPending = false;
+				staged++;
+			},
+		},
+		vaultId: () => actor.vaultId,
+		vaultGeneration: () => actor.vaultGeneration,
+		runtimeEpoch: attachment.runtimeEpoch,
+		isActiveBody: () => false,
+		isActiveSemantic: () => true,
+		currentSemanticHead: () => activeHead,
+		currentSemanticEpoch: () => 1,
+		currentBodyHead: () => null,
+		currentSequence: () => activeHead.sequence,
+		validateActor: () => true,
+		principalPresence: () => null,
+		scheduleFlush: () => {},
+	} as never);
+
+	await service.message(socket, updateFrame());
+	assert.equal(discarded, 1);
+	assert.equal(queued, 1);
+	assert.equal(staged, 0);
+	assert.equal(validationPending, false);
+
+	await service.message(socket, updateFrame());
+	assert.equal(validations, 2);
+	assert.equal(queued, 2);
+	assert.equal(staged, 1);
+	assert.equal(validationPending, false);
+});
+
 interface FlushProbe {
 	flushDocument(documentId: string): Promise<boolean>;
 }
@@ -227,7 +300,7 @@ function flushRuntime(input: {
 		semanticCompaction: { value: { recordCommit: async () => {} } },
 		options: { value: { execution: { waitUntil: () => {} }, alarms: { setAlarm: async () => { events.push("alarm"); } } } },
 		persistence: { value: new Map() },
-		flushChain: { value: Promise.resolve(), writable: true },
+		flushLanes: { value: new Map() },
 		...(input.semanticCatalogForUpdate ? { semanticCatalogForUpdate: { value: input.semanticCatalogForUpdate } } : {}),
 	});
 	return { runtime, events };

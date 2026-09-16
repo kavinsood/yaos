@@ -158,6 +158,11 @@ export default tseslint.config(
 		"packages/*/dist",
 		"server/.wrangler",
 		"server/.partykit",
+		// Hermetically generated wasm-bindgen output is checksum-verified by the
+		// ywasm build and QA gates. Its declarations are not members of either
+		// typed ESLint project and must not be parsed as handwritten source.
+		"server/src/crdt/vendor/ywasm",
+		"packages/server-node/vendor/ywasm",
 		"tests",
 		// The Obsidian preset targets plugin runtime code. Build tooling,
 		// Worker maintenance scripts, benches, and server-only tests execute in

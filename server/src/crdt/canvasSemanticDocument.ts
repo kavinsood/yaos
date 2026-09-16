@@ -28,8 +28,13 @@ interface CanvasRoots {
 	readonly resolvedConflicts: ReadonlyMap<string, CrdtValueSnapshot>;
 }
 
+const CANVAS_ROOT_FILTER = { names: [
+	"canvasMeta", "rootFields", "nodes", "nodeOrder", "nodeTombstones", "edges", "edgeOrder", "edgeTombstones",
+	"resolvedConflicts",
+] } as const;
+
 function canvasRoots(doc: YwasmCrdtDocument): CanvasRoots {
-	const roots = rootsByName(crdtEngine.snapshotRoots(doc));
+	const roots = rootsByName(crdtEngine.snapshotRoots(doc, CANVAS_ROOT_FILTER));
 	const map = (name: string): ReadonlyMap<string, CrdtValueSnapshot> => mapEntries(mapSnapshot(roots.get(name)));
 	return {
 		meta: map("canvasMeta"), rootFields: map("rootFields"), nodes: map("nodes"),
@@ -364,25 +369,29 @@ export async function applyCanvasSnapshot(
 	crdtEngine.applyRootOperations(doc, operations, origin);
 }
 
-export async function validateCanvasDocument(doc: YwasmCrdtDocument): Promise<string | null> {
+export type CanvasDocumentValidation =
+	| { readonly error: string; readonly canonicalBytes?: never }
+	| { readonly error: null; readonly canonicalBytes: Uint8Array };
+
+export async function validateCanvasDocument(doc: YwasmCrdtDocument): Promise<CanvasDocumentValidation> {
 	const value = canvasRoots(doc);
 	if (snapshotValue(value.meta.get("format")) !== "yaos-json-canvas"
 		|| snapshotValue(value.meta.get("representationVersion")) !== CANVAS_REPRESENTATION_VERSION
 		|| snapshotValue(value.meta.get("jsonCanvasVersion")) !== JSON_CANVAS_VERSION
-		|| snapshotValue(value.meta.get("enrolled")) !== true) return "canvas_meta_invalid";
+		|| snapshotValue(value.meta.get("enrolled")) !== true) return { error: "canvas_meta_invalid" };
 	for (const [id, entry] of value.nodes) {
 		const map = mapSnapshot(entry);
-		if (!map || !readNode(id, map)) return "canvas_node_invalid";
-		if (typeof snapshotValue(value.nodeOrder.get(id)) !== "string") return "canvas_node_order_missing";
+		if (!map || !readNode(id, map)) return { error: "canvas_node_invalid" };
+		if (typeof snapshotValue(value.nodeOrder.get(id)) !== "string") return { error: "canvas_node_order_missing" };
 	}
 	for (const [id, entry] of value.edges) {
 		const map = mapSnapshot(entry);
 		const edge = map ? readEdge(id, map) : null;
-		if (!edge) return "canvas_edge_invalid";
+		if (!edge) return { error: "canvas_edge_invalid" };
 		if (!value.nodes.has(edge.endpoints.fromNode) || !value.nodes.has(edge.endpoints.toNode)) {
-			return "canvas_edge_endpoint_unknown";
+			return { error: "canvas_edge_endpoint_unknown" };
 		}
-		if (typeof snapshotValue(value.edgeOrder.get(id)) !== "string") return "canvas_edge_order_missing";
+		if (typeof snapshotValue(value.edgeOrder.get(id)) !== "string") return { error: "canvas_edge_order_missing" };
 	}
 	for (const [id, entry] of [...value.nodeTombstones, ...value.edgeTombstones]) {
 		const tombstone = snapshotValue(entry) as CanvasItemTombstone | undefined;
@@ -390,19 +399,21 @@ export async function validateCanvasDocument(doc: YwasmCrdtDocument): Promise<st
 			|| tombstone.operationId.length === 0 || !/^[a-f0-9]{64}$/.test(tombstone.baseSemanticHash)
 			|| !Number.isSafeInteger(tombstone.deletedAt) || tombstone.deletedAt < 0
 			|| (tombstone.lastOrderRank !== null && typeof tombstone.lastOrderRank !== "string")) {
-			return "canvas_tombstone_invalid";
+			return { error: "canvas_tombstone_invalid" };
 		}
 	}
 	const data = await materializeCanvasDocument(doc, false);
-	if (data.nodes.size > CANVAS_LIMITS.nodes || data.edges.size > CANVAS_LIMITS.edges) return "canvas_item_limit_exceeded";
-	for (const rank of [...stringMap(value.nodeOrder).values(), ...stringMap(value.edgeOrder).values()]) {
-		if (new TextEncoder().encode(rank).byteLength > CANVAS_LIMITS.rankBytes) return "canvas_rank_limit_exceeded";
+	if (data.nodes.size > CANVAS_LIMITS.nodes || data.edges.size > CANVAS_LIMITS.edges) {
+		return { error: "canvas_item_limit_exceeded" };
 	}
-	if (value.resolvedConflicts.size > CANVAS_LIMITS.resolvedConflicts) return "canvas_conflict_limit_exceeded";
+	for (const rank of [...stringMap(value.nodeOrder).values(), ...stringMap(value.edgeOrder).values()]) {
+		if (new TextEncoder().encode(rank).byteLength > CANVAS_LIMITS.rankBytes) return { error: "canvas_rank_limit_exceeded" };
+	}
+	if (value.resolvedConflicts.size > CANVAS_LIMITS.resolvedConflicts) return { error: "canvas_conflict_limit_exceeded" };
 	const canonical = canonicalCanvasBytes(data);
-	if (canonical.byteLength > CANVAS_LIMITS.canonicalBytes) return "canvas_content_limit_exceeded";
-	if (parseCanvasBytes(canonical).kind !== "valid") return "canvas_materialization_invalid";
-	return null;
+	if (canonical.byteLength > CANVAS_LIMITS.canonicalBytes) return { error: "canvas_content_limit_exceeded" };
+	if (parseCanvasBytes(canonical).kind !== "valid") return { error: "canvas_materialization_invalid" };
+	return { error: null, canonicalBytes: canonical };
 }
 
 export function canvasDocumentStats(doc: YwasmCrdtDocument): {

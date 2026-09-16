@@ -6,6 +6,7 @@ import {
 	type CrdtMemoryDiagnostics,
 	type CrdtRootOperation,
 	type CrdtRootSnapshot,
+	type CrdtRootSnapshotFilter,
 	type CrdtValueSnapshot,
 } from "./crdtEngine";
 
@@ -53,6 +54,7 @@ export interface YwasmBindings {
 	readonly YArray: new (initial?: unknown[] | null) => YwasmArray;
 	readonly YMap: new (initial?: object | null) => YwasmMap;
 	applyUpdate(doc: YwasmDocument, update: Uint8Array, origin: unknown): void;
+	applyUpdateAndCheckIfChanged(doc: YwasmDocument, update: Uint8Array, origin: unknown): boolean;
 	encodeStateVector(doc: YwasmDocument): Uint8Array;
 	encodeStateAsUpdate(doc: YwasmDocument, vector?: Uint8Array | null): Uint8Array;
 	mergeUpdatesV1(updates: Array<Uint8Array>): Uint8Array;
@@ -170,11 +172,24 @@ function resolveUndefinedRoot(doc: YwasmDocument, name: string): YwasmMap | Ywas
 	return null;
 }
 
-function wasmRootSnapshots(doc: YwasmDocument, bindings: YwasmBindings): CrdtRootSnapshot[] {
+function includesRoot(name: string, filter: CrdtRootSnapshotFilter | undefined): boolean {
+	return filter === undefined || filter.names?.includes(name) === true
+		|| filter.prefixes?.some((prefix) => name.startsWith(prefix)) === true;
+}
+
+function wasmRootSnapshots(
+	doc: YwasmDocument,
+	bindings: YwasmBindings,
+	filter?: CrdtRootSnapshotFilter,
+): CrdtRootSnapshot[] {
 	const owned: Disposable[] = [];
 	try {
 		const result: CrdtRootSnapshot[] = [];
 		for (const [name, returnedRoot] of doc.roots(undefined)) {
+			if (!includesRoot(name, filter)) {
+				if (isDisposable(returnedRoot)) returnedRoot.free();
+				continue;
+			}
 			const root = returnedRoot === undefined ? resolveUndefinedRoot(doc, name) : returnedRoot;
 			if (root === null) {
 				result.push({ name, value: { shared: "map", entries: [] } });
@@ -289,6 +304,9 @@ export function createYwasmCrdtEngine(
 		applyUpdate(doc, update, origin) {
 			bindings.applyUpdate(handle(doc).assertLive(), update, origin);
 		},
+		applyUpdateAndCheckIfChanged(doc, update, origin) {
+			return bindings.applyUpdateAndCheckIfChanged(handle(doc).assertLive(), update, origin);
+		},
 		encodeStateVector(doc) {
 			return bindings.encodeStateVector(handle(doc).assertLive());
 		},
@@ -321,8 +339,8 @@ export function createYwasmCrdtEngine(
 				text.delete(index, length, txn);
 			});
 		},
-		snapshotRoots(doc) {
-			return wasmRootSnapshots(handle(doc).assertLive(), bindings);
+		snapshotRoots(doc, filter) {
+			return wasmRootSnapshots(handle(doc).assertLive(), bindings, filter);
 		},
 		applyRootOperations(doc, operations, origin) {
 			const value = handle(doc).assertLive();

@@ -1,7 +1,7 @@
 import { gzipSync } from "fflate";
 import type { YwasmCrdtDocument } from "./crdt/ywasmCrdtEngine.js";
 import { ywasmCrdtEngine as crdtEngine } from "./crdt/ywasmWorkerCrdtEngine.js";
-import { materializeCanvasDocument, validateCanvasDocument } from "./crdt/canvasSemanticDocument.js";
+import { validateCanvasDocument } from "./crdt/canvasSemanticDocument.js";
 import { sha256Hex } from "./hex.js";
 import {
 	decodeHashedRecoveryObject,
@@ -81,7 +81,6 @@ import {
 	type RestoreDescriptor,
 } from "./recoveryExecutor.js";
 import { isCanonicalVaultId } from "./vaultId.js";
-import { canonicalCanvasBytes } from "./shared/canvasCodec.js";
 import {
 	RecoveryJobStateStore,
 	isTerminalRecoveryState,
@@ -2183,8 +2182,8 @@ export class RecoveryJobRuntime {
 			let plain: Uint8Array;
 			if (entry.kind === "canvas") {
 				const validation = await validateCanvasDocument(doc);
-				if (validation) throw new BodyDefectError("corrupt_history", entry, validation);
-				plain = canonicalCanvasBytes(await materializeCanvasDocument(doc, false));
+				if (validation.error !== null) throw new BodyDefectError("corrupt_history", entry, validation.error);
+				plain = validation.canonicalBytes;
 			} else plain = encoder.encode(crdtEngine.readText(doc, "body"));
 			if (plain.byteLength !== reconstruction.expectedSize || await sha256Hex(plain) !== reconstruction.expectedContentHash) {
 				throw new BodyDefectError("hash_mismatch", entry, "reconstructed Markdown mismatch");

@@ -4,7 +4,7 @@ import {
 	applyCanvasSnapshot, createCanvasDocument, materializeCanvasDocument, validateCanvasDocument,
 } from "../../server/src/crdt/canvasSemanticDocument";
 import { validateFrontmatterSemanticRoots } from "../../server/src/crdt/frontmatterSemanticValidation";
-import { parseCanvasBytes } from "../../server/src/shared/canvasCodec";
+import { canonicalCanvasBytes, parseCanvasBytes } from "../../server/src/shared/canvasCodec";
 import type { CanvasSemanticData } from "../../server/src/shared/canvasTypes";
 import { suite } from "../harness.ts";
 
@@ -28,7 +28,10 @@ function canvas(): CanvasSemanticData {
 s.test("server Canvas helpers materialize, update, validate, and preserve nested shared types", async () => {
 	const doc = createCanvasDocument(canvas());
 	try {
-		assert.equal(await validateCanvasDocument(doc), null);
+		const initialValidation = await validateCanvasDocument(doc);
+		assert.equal(initialValidation.error, null);
+		assert.equal(parseCanvasBytes(initialValidation.canonicalBytes!).kind, "valid");
+		assert.deepEqual(initialValidation.canonicalBytes, canonicalCanvasBytes(canvas()));
 		const updated = canvas();
 		updated.nodes.get("text")!.text = "עברית 👩🏾‍💻";
 		updated.nodes.get("text")!.position = { x: 12, y: 34 };
@@ -38,7 +41,7 @@ s.test("server Canvas helpers materialize, update, validate, and preserve nested
 		assert.equal(materialized.nodes.get("text")?.text, "עברית 👩🏾‍💻");
 		assert.deepEqual(materialized.nodes.get("text")?.position, { x: 12, y: 34 });
 		assert.deepEqual(materialized.nodes.get("text")?.extensions.added, { deep: [true, "值"] });
-		assert.equal(await validateCanvasDocument(doc), null);
+		assert.equal((await validateCanvasDocument(doc)).error, null);
 	} finally {
 		crdtEngine.destroyDocument(doc);
 	}
@@ -62,7 +65,7 @@ s.test("server Canvas batches preserve independent concurrent move and resize gr
 			const materialized = await materializeCanvasDocument(doc, false);
 			assert.deepEqual(materialized.nodes.get("text")?.position, { x: 90, y: 80 });
 			assert.deepEqual(materialized.nodes.get("text")?.size, { width: 640, height: 480 });
-			assert.equal(await validateCanvasDocument(doc), null);
+			assert.equal((await validateCanvasDocument(doc)).error, null);
 		}
 	} finally {
 		crdtEngine.destroyDocument(first);

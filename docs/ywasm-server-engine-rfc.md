@@ -16,12 +16,13 @@ storage, authorization, validation, catalog projection, and socket coordination
 remain TypeScript. Wasm owns only CRDT document computation.
 
 This is worthwhile because the expensive large-history operations YAOS performs
-are materially faster in the real Cloudflare Workers runtime, and a multi-shard
-local soak retained less process memory than Yjs. The improvement is small for
-ordinary notes, so this is not a claim that Wasm makes the whole service several
-times faster. It removes a costly tail from reconstruction, catch-up,
-checkpointing, and update application while leaving SQL and network time
-essentially unchanged.
+are materially faster in the real Cloudflare Workers runtime. The improvement
+is small for ordinary notes, so this is not a claim that Wasm makes the whole
+service several times faster. It removes a costly tail from reconstruction,
+catch-up, checkpointing, and update application while leaving SQL and network
+time essentially unchanged. Memory remains an admission-envelope result, not a
+blanket Wasm win: page growth stabilizes after warmup, but allocator high-water
+RSS is workload- and run-sensitive.
 
 This is not a drop-in dependency replacement. YAOS must own a narrow engine
 boundary, a reproducible Rust/Wasm artifact, one missing document-census API,
@@ -44,11 +45,12 @@ remain TypeScript and byte-oriented.
 
 The pinned artifact is built from `y-crdt/y-crdt` commit
 `37dfed7eaeeddc70205577c6d92b50c53023b133` with Rust 1.98.1 and wasm-pack
-0.15.0. The Wasm is 981,855 bytes with SHA-256
-`e66c0a21ddf9852b383c9b76e6f6ef29123d0760ffe7fb6a4358524a4f3cbf3b`;
+0.15.0. The Wasm is 983,035 bytes with SHA-256
+`3d0dc3fceba1de16ae21d7d345999f75a09ea3743339f1911a1e419db8c703c3`;
 its configured maximum is 1,536 pages (96 MiB). Two clean builds produced
 identical Wasm and JavaScript wrapper hashes. The source pin, build inputs,
-license, census patch, generated bindings, and checksums are vendored together.
+license, census/change-detection patches, generated bindings, and checksums are
+vendored together.
 
 Qualification completed on 17 September 2026:
 
@@ -63,8 +65,9 @@ Qualification completed on 17 September 2026:
   Canvas capability;
 - the local destructive Worker integration suite and a fresh deployed
   destructive integration suite passed through final generation-scoped purge;
-- 200,000 Unicode differential operations passed across CJK, emoji/ZWJ,
-  combining text, RTL text, and both Yjs/ywasm directions;
+- 100,000 current-release Unicode differential operations passed across CJK,
+  emoji/ZWJ, combining text, RTL text, and both Yjs/ywasm directions; the
+  preceding census artifact also passed a 200,000-operation qualification;
 - 10,000 create/apply/encode/free cycles settled at 3,932,160 bytes with zero
   late Wasm-page growth;
 - corrupt input, trap recovery, multi-shard residency, exact census, schema
@@ -82,19 +85,48 @@ Qualification completed on 17 September 2026:
 - focused final counts were 2/2 for exact-5-MiB and 32-note production HTTP
   imports, 15/15 candidate admission, 12/12 onboarding, 21/21 SQLite lifecycle,
   and 30/30 document-cache tests;
-- the pinned-engine qualification Worker bundle was 2,503.05 KiB (602.66 KiB
-  gzip), started in 11 ms, and bound all three Durable Object classes plus the
-  production R2 bucket. The exact bundle also passed a fresh
-  destructive validation deployment, which started in 16 ms and was deleted
-  after its generation-scoped purge completed.
+- the final integrated qualification Worker bundle was 2,519.21 KiB (605.85
+  KiB gzip), started in 9 ms, and bound all three Durable Object classes plus
+  the production R2 bucket. Version
+  `367f6d1d-2da5-411a-8dbd-3d745b4c459d` at
+  `yaos3-ywasm-integration-20260917045452.kavinsood.workers.dev` passed the
+  complete fresh destructive HTTPS/WSS suite and was deleted after its
+  generation-scoped purge completed;
+- the complete conformance matrix passed for Worker and production Node. One
+  full-matrix Worker awareness run intermittently timed out at its ordered
+  cross-vault barrier; the same cell had passed in the preceding complete run
+  and passed again immediately when isolated. No capability or isolation
+  assertion failed.
 
-The retained qualification deployment is version
+The earlier large-note qualification deployment retained for interactive
+inspection is version
 `9b0f2a02-d655-4c2b-99ca-980ecc6423ca` at
 `yaos3-large-notes-final-20260917.kavinsood.workers.dev` in Cloudflare account
 `e142a43bd0cd02aa1d554f727b5f0b6c`. Cloudflare Access application
 `d44456b3-772a-4ce5-9daa-3a4f6aa714f5` is exact-host and permits only
-`kavin@cloudflare.com`. Temporary service tokens used by automated QA and
-disposable profiling deployments were deleted.
+`kavin@cloudflare.com`. It predates the final hot-path integration and is not
+the evidence for the exact integrated bundle above. The integrated QA Access
+application, its `non_identity` service-token policy, the temporary service
+token, and the disposable Worker were all deleted and their absence verified.
+
+The final hot-path hardening preserves the authoritative/validation document
+pair while removing avoidable work around it. Frontmatter validation filters
+`snapshotRoots()` before materialization, so it never copies the Markdown body.
+Canvas validation returns its canonical bytes to every caller instead of
+materializing twice. A pinned Rust/Wasm `applyUpdateAndCheckIfChanged` export
+uses the exact Yrs update-event predicate, including delete-only transactions,
+instead of encoding two state vectors. Socket validation owns its speculative
+mirror through a `finally` cleanup, and unrelated notes now use independent
+persistence lanes. Durable socket flushes advance only the authoritative mirror
+because the validation mirror already contains the staged frames.
+
+Whole-note hashing now runs at the 250 ms durable flush rather than on every
+accepted socket frame. A flush reconstructs each size-bounded partition against
+its exact durable prefix, so split queues still produce the correct intermediate
+catalog hashes without retaining a whole canonical byte array per frame. One
+Markdown materialization remains at admission because canonical-form and exact
+size limits are per-frame security invariants; filtering `snapshotRoots()`
+removes the accidental second body materialization.
 
 Bootstrap verification uses an engine-independent `canonical-root-v1` digest
 rather than comparing Yjs and ywasm checkpoint bytes, because two valid wire
@@ -114,10 +146,15 @@ exact committed candidate outcome or reconstructs only that same fence. A
 deterministic crash/supersession regression and two consecutive 92/92 headless
 runs cover this boundary.
 
-The exact pinned artifact's local lifecycle medians were 81.94 to 28.73 ms for
-cold reconstruction, 1.60 to 0.50 ms for resident-tail apply, 0.076 to 0.045 ms
-for catch-up, and 0.658 to 0.189 ms for checkpoint encoding (Yjs to ywasm).
-Semantic rebuild was slower, 0.188 to 0.541 ms, but remained sub-millisecond.
+The exact pinned artifact's current local lifecycle medians were 75.57 to 27.55
+ms for cold reconstruction, 1.45 to 0.52 ms for resident-tail apply, 0.094 to
+0.048 ms for catch-up, and 0.623 to 0.182 ms for checkpoint encoding (Yjs to
+ywasm). Semantic rebuild was slower, 0.187 to 0.539 ms, but remained
+sub-millisecond. In the 10,000-cycle, eight-shard Node soak, ywasm's
+post-warmup RSS growth (7.37 MiB) and resident-pair high-water allocation (17.9
+MiB) exceeded Yjs in that run (0.84 MiB and effectively zero). That result
+reinforces the 96 MiB admission envelope and explicit disposal requirement; it
+does not support marketing ywasm as universally lower-memory.
 The earlier real-Workers large-history measurements below remain the isolated
 deployed CRDT-compute evidence. A public-network 100-shard operational profile
 also exposed an intermittent application-level `503 {"error":"unclaimed"}`.

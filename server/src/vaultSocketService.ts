@@ -275,6 +275,8 @@ export function isStructurallyEmptyYjsUpdate<Doc extends CrdtDocument>(
 	}
 }
 
+const FRONTMATTER_ROOT_FILTER = { prefixes: ["frontmatter:"] } as const;
+
 export function bodyUpdateAdmissionError<Doc extends CrdtDocument>(
 	current: Doc,
 	update: Uint8Array,
@@ -283,7 +285,7 @@ export function bodyUpdateAdmissionError<Doc extends CrdtDocument>(
 	const candidate = engine.openDocument("body-frontmatter-semantic-validation", engine.encodeStateAsUpdate(current));
 	try {
 		engine.applyUpdate(candidate, update, "body-frontmatter-semantic-validation");
-		const semanticError = validateFrontmatterSemanticSnapshots(engine.snapshotRoots(candidate));
+		const semanticError = validateFrontmatterSemanticSnapshots(engine.snapshotRoots(candidate, FRONTMATTER_ROOT_FILTER));
 		if (semanticError) return semanticError;
 		return canonicalMarkdownBytes(engine.readText(candidate, "body")).byteLength
 			> MAX_CLIENT_MARKDOWN_BYTES ? "markdown_size_limit" : null;
@@ -776,64 +778,67 @@ export class VaultSocketService {
 				}
 				throw error;
 			}
-			const contentHash = await sha256Hex(validated.contentBytes);
-			const actor = this.actorFromAttachment(attachment);
-			if (!(this.options.validateActor?.(actor) ?? true)) {
-				this.options.cache.discardValidatedBodyUpdate(attachment.documentId);
-				this.sendControl(socket, { type: "error", code: "authority_superseded", reason: "socket authority superseded" });
-				socket.close(AUTHORITY_SUPERSEDED_SOCKET_CLOSE_CODE, "socket authority superseded");
-				return;
-			}
-			if (this.fenceSocketIfStale(socket, attachment)) {
-				this.options.cache.discardValidatedBodyUpdate(attachment.documentId);
-				return;
-			}
-			let semanticHead: SemanticCatalogHead | undefined;
-			if (attachment.kind === "semantic") {
-				const current = this.options.currentSemanticHead?.(attachment.documentId);
-				if ((this.options.currentSemanticHead && (!current || current.lifecycle !== "active"))
-					|| (!this.options.currentSemanticHead && this.options.isActiveSemantic?.(attachment.documentId) !== true)) {
-					this.options.cache.discardValidatedBodyUpdate(attachment.documentId);
-					this.sendControl(socket, { type: "VAULT_ERROR", code: "semantic_document_not_active",
-						message: "semantic Canvas is no longer active" });
-					socket.close(1008, "semantic document is not active");
+			// Validation leaves the private mirror under this frame's ownership.
+			// Every exit before a successful stage must undo it, including an
+			// unexpected rejection from asynchronous content hashing.
+			let ownsValidation = true;
+			try {
+				const actor = this.actorFromAttachment(attachment);
+				if (!(this.options.validateActor?.(actor) ?? true)) {
+					this.sendControl(socket, { type: "error", code: "authority_superseded", reason: "socket authority superseded" });
+					socket.close(AUTHORITY_SUPERSEDED_SOCKET_CLOSE_CODE, "socket authority superseded");
 					return;
 				}
-				if (current?.bodyEpoch !== undefined && current.bodyEpoch !== attachment.documentEpoch) {
-					this.options.cache.discardValidatedBodyUpdate(attachment.documentId);
-					this.fenceSocketIfStale(socket, attachment, current.bodyEpoch);
+				if (this.fenceSocketIfStale(socket, attachment)) return;
+				let semanticHead: SemanticCatalogHead | undefined;
+				if (attachment.kind === "semantic") {
+					const current = this.options.currentSemanticHead?.(attachment.documentId);
+					if ((this.options.currentSemanticHead && (!current || current.lifecycle !== "active"))
+						|| (!this.options.currentSemanticHead && this.options.isActiveSemantic?.(attachment.documentId) !== true)) {
+						this.sendControl(socket, { type: "VAULT_ERROR", code: "semantic_document_not_active",
+							message: "semantic Canvas is no longer active" });
+						socket.close(1008, "semantic document is not active");
+						return;
+					}
+					if (current?.bodyEpoch !== undefined && current.bodyEpoch !== attachment.documentEpoch) {
+						this.fenceSocketIfStale(socket, attachment, current.bodyEpoch);
+						return;
+					}
+					semanticHead = current ?? undefined;
+				} else if (!this.options.isActiveBody(attachment.documentId)) {
+					this.sendControl(socket, { type: "VAULT_ERROR", code: "body_not_active", message: "body is no longer active" });
+					socket.close(1008, "body is not active");
 					return;
 				}
-				semanticHead = current ?? undefined;
-			} else if (!this.options.isActiveBody(attachment.documentId)) {
-				this.options.cache.discardValidatedBodyUpdate(attachment.documentId);
-				this.sendControl(socket, { type: "VAULT_ERROR", code: "body_not_active", message: "body is no longer active" });
-				socket.close(1008, "body is not active");
-				return;
-			}
-			if (!validated.requiresDurableCommit) {
+				if (!validated.requiresDurableCommit) {
+					this.options.cache.stageValidatedBodyUpdate(attachment.documentId, validated);
+					ownsValidation = false;
+					return;
+				}
+				// Content identity is derived at the debounced durable boundary. The
+				// flush reconstructs each partition against its exact durable prefix, so
+				// every intermediate catalog generation still receives the right hash
+				// without retaining one whole-document byte array per queued frame.
+				const queued = this.options.cache.queue(attachment.documentId, {
+					bytes: owned,
+					digest,
+					socketId: attachment.socketId,
+					actor,
+					kind: attachment.kind === "semantic" ? "semantic" : "body",
+					documentEpoch: attachment.documentEpoch,
+					...(semanticHead ? { semanticHead } : {}),
+				});
+				if (!queued.ok) {
+					this.sendControl(socket, { type: "VAULT_BACKPRESSURE", reason: queued.reason });
+					socket.close(1013, "pending durability budget exceeded");
+					return;
+				}
 				this.options.cache.stageValidatedBodyUpdate(attachment.documentId, validated);
-				return;
+				ownsValidation = false;
+				this.options.scheduleFlush(attachment.documentId);
+			} finally {
+				if (ownsValidation) this.options.cache.discardValidatedBodyUpdate(attachment.documentId);
 			}
-			const queued = this.options.cache.queue(attachment.documentId, {
-				bytes: owned,
-				digest,
-				socketId: attachment.socketId,
-				actor,
-				kind: attachment.kind === "semantic" ? "semantic" : "body",
-				documentEpoch: attachment.documentEpoch,
-				...(semanticHead ? { semanticHead } : {}),
-				contentHash,
-				contentSize: validated.contentBytes.byteLength,
-			});
-			if (!queued.ok) {
-				this.options.cache.discardValidatedBodyUpdate(attachment.documentId);
-				this.sendControl(socket, { type: "VAULT_BACKPRESSURE", reason: queued.reason });
-				socket.close(1013, "pending durability budget exceeded");
-				return;
-			}
-			this.options.cache.stageValidatedBodyUpdate(attachment.documentId, validated);
-			this.options.scheduleFlush(attachment.documentId);
 		});
 	}
 

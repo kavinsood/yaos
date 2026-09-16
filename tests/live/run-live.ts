@@ -32,7 +32,7 @@ const LIVE_COMMANDS: readonly LiveCommand[] = [
 	{ file: "settings-sync.ts" },
 	{ file: "operator-destroy.ts" },
 ];
-const LIVE_NON_SUITES = ["fatalFrame.ts", "liveIdentity.ts", "run-live.ts", "schema4Live.ts"] as const;
+const LIVE_NON_SUITES = ["fatalFrame.ts", "liveIdentity.ts", "productionImport.ts", "run-live.ts", "schema4Live.ts"] as const;
 
 function assertLiveAccountability(): void {
 	const actual = readdirSync(new URL(".", import.meta.url)).filter((name) => name.endsWith(".ts")).sort();

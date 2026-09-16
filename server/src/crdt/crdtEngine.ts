@@ -33,6 +33,13 @@ export interface CrdtRootSnapshot {
 	readonly value: Exclude<CrdtValueSnapshot, { readonly shared: "value" }>;
 }
 
+export interface CrdtRootSnapshotFilter {
+	/** Include an exact root name. */
+	readonly names?: readonly string[];
+	/** Include roots whose names begin with one of these prefixes. */
+	readonly prefixes?: readonly string[];
+}
+
 export type CrdtRootOperation =
 	| { readonly kind: "map-set"; readonly root: string; readonly path?: readonly string[];
 		readonly key: string; readonly value: CrdtValueSnapshot }
@@ -46,6 +53,8 @@ export interface CrdtEngine<Doc extends CrdtDocument = CrdtDocument> {
 	createDocument(guid: string): Doc;
 	openDocument(guid: string, encodedState: Uint8Array): Doc;
 	applyUpdate(doc: Doc, update: Uint8Array, origin?: string): void;
+	/** Applies an update and reports whether it introduced a meaningful insert or deletion. */
+	applyUpdateAndCheckIfChanged(doc: Doc, update: Uint8Array, origin?: string): boolean;
 	encodeStateVector(doc: Doc): Uint8Array;
 	encodeStateAsUpdate(doc: Doc, vector?: Uint8Array): Uint8Array;
 	mergeUpdates(updates: readonly Uint8Array[]): Uint8Array;
@@ -54,7 +63,7 @@ export interface CrdtEngine<Doc extends CrdtDocument = CrdtDocument> {
 	insertText(doc: Doc, name: string, index: number, value: string, origin?: string): void;
 	deleteText(doc: Doc, name: string, index: number, length: number, origin?: string): void;
 	/** Deep, type-preserving snapshot; all engine wrappers are disposed before return. */
-	snapshotRoots(doc: Doc): readonly CrdtRootSnapshot[];
+	snapshotRoots(doc: Doc, filter?: CrdtRootSnapshotFilter): readonly CrdtRootSnapshot[];
 	/** Applies a synchronous schema batch in one engine transaction. */
 	applyRootOperations(doc: Doc, operations: readonly CrdtRootOperation[], origin?: string): void;
 	destroyDocument(doc: Doc): void;

@@ -199,7 +199,10 @@ s.test("recovery Canvas reader preserves canonical data across the ywasm boundar
 	const source = createCanvasDocument(parsed.data);
 	const target = crdtEngine.openDocument("recovery-canvas", Y.encodeStateAsUpdate(source));
 	try {
-		assert.equal(await validateProductionCanvas(target), null);
+		const validation = await validateProductionCanvas(target);
+		assert.equal(validation.error, null);
+		if (validation.error !== null) return;
+		assert.deepEqual(validation.canonicalBytes, parsed.canonicalBytes);
 		const materialized = await materializeProductionCanvas(target, false);
 		assert.deepEqual(canonicalCanvasBytes(materialized), parsed.canonicalBytes);
 	} finally {

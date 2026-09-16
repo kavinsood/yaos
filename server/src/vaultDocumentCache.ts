@@ -12,8 +12,7 @@ import {
 import type { SemanticCatalogHead, VaultStore } from "./vaultStore";
 import type { ReconstructedDocument } from "./vaultDocumentStore";
 import type { VaultActorContext } from "./collaboration";
-import { canonicalCanvasBytes } from "./shared/canvasCodec";
-import { materializeCanvasDocument, validateCanvasDocument } from "./crdt/canvasSemanticDocument";
+import { validateCanvasDocument } from "./crdt/canvasSemanticDocument";
 import { canonicalMarkdownBytes, canonicalizeMarkdown } from "./shared/markdownCodec";
 import {
 	MAX_CANDIDATE_UPDATE_BYTES,
@@ -157,16 +156,8 @@ function message(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
-function bytesEqual(left: Uint8Array, right: Uint8Array): boolean {
-	if (left.byteLength !== right.byteLength) return false;
-	for (let index = 0; index < left.byteLength; index++) if (left[index] !== right[index]) return false;
-	return true;
-}
-
 function applyAndDetect(doc: YwasmCrdtDocument, update: Uint8Array, origin: string): boolean {
-	const before = crdtEngine.encodeStateVector(doc);
-	crdtEngine.applyUpdate(doc, update, origin);
-	return !bytesEqual(before, crdtEngine.encodeStateVector(doc));
+	return crdtEngine.applyUpdateAndCheckIfChanged(doc, update, origin);
 }
 
 function boundedCandidateFrames(value: Uint8Array | readonly Uint8Array[]): readonly Uint8Array[] {
@@ -189,9 +180,11 @@ function boundedCandidateFrames(value: Uint8Array | readonly Uint8Array[]): read
 }
 
 function applyManyAndDetect(doc: YwasmCrdtDocument, updates: readonly Uint8Array[], origin: string): boolean {
-	const before = crdtEngine.encodeStateVector(doc);
-	for (const update of updates) crdtEngine.applyUpdate(doc, update, origin);
-	return !bytesEqual(before, crdtEngine.encodeStateVector(doc));
+	let changed = false;
+	for (const update of updates) {
+		changed = crdtEngine.applyUpdateAndCheckIfChanged(doc, update, origin) || changed;
+	}
+	return changed;
 }
 
 /** Owns loaded Y.Docs, dirty queues, cost accounting, and clean-body LRU admission. */
@@ -528,9 +521,9 @@ export class VaultDocumentCache {
 				throw new VaultDocumentValidationError("invalid_canvas_update");
 			}
 			try {
-				const semanticError = await validateCanvasDocument(loaded.validationDoc);
-				if (semanticError) throw new VaultDocumentValidationError(semanticError);
-				const contentBytes = canonicalCanvasBytes(await materializeCanvasDocument(loaded.validationDoc, false));
+				const validation = await validateCanvasDocument(loaded.validationDoc);
+				if (validation.error !== null) throw new VaultDocumentValidationError(validation.error);
+				const contentBytes = validation.canonicalBytes;
 				loaded.validationPending = true;
 				loaded.validationUpdatesSinceExact++;
 				loaded.validationInputBytesSinceExact += update.byteLength;
@@ -782,6 +775,48 @@ export class VaultDocumentCache {
 		loaded.validationUpdatesSinceExact = 0;
 		loaded.validationInputBytesSinceExact = 0;
 		return changed;
+		} finally {
+			releaseTransient();
+		}
+	}
+
+	/**
+	 * Advances the authoritative mirror after a socket batch becomes durable.
+	 * Socket admission already applied every frame to validationDoc, so applying
+	 * the merged batch there again would only repeat work across the Wasm FFI.
+	 */
+	applyStagedDurableUpdate(documentId: string, update: Uint8Array, generation: number, origin: unknown): boolean {
+		const loaded = this.get(documentId);
+		if (!loaded) return false;
+		if (loaded.validationPending) throw new Error("cannot commit while validation is in progress");
+		let releaseTransient: () => void;
+		try {
+			releaseTransient = this.reserveFullStateOperation(
+				documentId, 1, this.safeAdd(this.stateSizeEstimate(documentId), update.byteLength),
+			);
+		} catch (error) {
+			if (!(error instanceof VaultDocumentCachePressureError)) throw error;
+			this.discardResident(documentId);
+			return true;
+		}
+		try {
+			let changed: boolean;
+			try {
+				changed = applyAndDetect(loaded.doc, update, String(origin));
+			} catch (error) {
+				this.discardResident(documentId);
+				throw error;
+			}
+			loaded.generation = Math.max(loaded.generation, generation);
+			loaded.lastUsedAt = Date.now();
+			// validationDoc represents the end of the detached queue. During a
+			// partitioned flush this may temporarily overestimate doc, but cannot
+			// undercount resident state and is exact once the final partition lands.
+			loaded.encodedStateBytes = loaded.validationEncodedStateBytes;
+			if (documentId !== "root") {
+				this.ensureBodyCapacity(documentId, this.mirroredResidentCost(loaded.validationEncodedStateBytes));
+			}
+			return changed;
 		} finally {
 			releaseTransient();
 		}

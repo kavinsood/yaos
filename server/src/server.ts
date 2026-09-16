@@ -20,8 +20,7 @@ import {
 import { VaultCandidateService } from "./vaultCandidateService";
 import { VaultSemanticService } from "./vaultSemanticService";
 import { canonicalMarkdownBytes } from "./shared/markdownCodec";
-import { canonicalCanvasBytes } from "./shared/canvasCodec";
-import { materializeCanvasDocument, validateCanvasDocument } from "./crdt/canvasSemanticDocument";
+import { validateCanvasDocument } from "./crdt/canvasSemanticDocument";
 import { blobKey } from "./vaultObjectStore";
 import { VaultDocumentCache, type PendingVaultUpdate } from "./vaultDocumentCache";
 import { VaultLifecycleService } from "./vaultLifecycleService";
@@ -171,7 +170,8 @@ export class VaultRuntime implements DrainPort {
 	private lastObservedCommitSequence = 0;
 	private readonly persistence = new Map<string, PersistenceStatus>();
 	private readonly scheduledFlushes = new Map<string, Promise<void>>();
-	private flushChain: Promise<void> = Promise.resolve();
+	/** Persistence work is serialized per document; unrelated notes must not block one another. */
+	private readonly flushLanes = new Map<string, Promise<void>>();
 	private deleted = false;
 	private drainPromise: Promise<void> | null = null;
 	private authorityBoundary: Promise<void> = Promise.resolve();
@@ -574,7 +574,7 @@ export class VaultRuntime implements DrainPort {
 				this.sockets.closeAll("server draining");
 				await Promise.all([...this.scheduledFlushes.values()]);
 				await this.flushLoadedDocuments();
-				await this.flushChain;
+				await this.waitForFlushLanes();
 			})();
 		}
 		return this.drainPromise;
@@ -656,7 +656,7 @@ export class VaultRuntime implements DrainPort {
 	private async deleteAll(): Promise<Response> {
 		this.deleted = true;
 		this.sockets.closeAll("vault deleted");
-		await this.flushChain;
+		await this.waitForFlushLanes();
 		this.cache.clear();
 		this.persistence.clear();
 		await this.options.alarms.deleteAlarm();
@@ -1014,7 +1014,8 @@ export class VaultRuntime implements DrainPort {
 	private async flushDocument(documentId: string): Promise<boolean> {
 		if (this.deleted) return false;
 		let success = true;
-		this.flushChain = this.flushChain.then(() => this.cache.serializeDocument(documentId, async () => {
+		const prior = this.flushLanes.get(documentId) ?? Promise.resolve();
+		const flush = prior.catch(() => undefined).then(() => this.cache.serializeDocument(documentId, async () => {
 			const entries = this.cache.takePending(documentId);
 			if (entries.length === 0) return;
 			let published = 0;
@@ -1059,7 +1060,9 @@ export class VaultRuntime implements DrainPort {
 						kind: frozenKind, expectedHead, catalog, semanticCatalog,
 						...(expectedSemanticHead ? { expectedSemanticHead } : {}),
 						actorAttributions: batch.map((entry) => ({ actor: entry.actor!, requestDigest: entry.digest })) });
-					const changed = this.cache.applyDurableUpdate(documentId, update, commit.generation, "durable-socket-flush");
+					const changed = this.cache.applyStagedDurableUpdate(
+						documentId, update, commit.generation, "durable-socket-flush",
+					);
 					if (changed) {
 						for (const entry of batch) {
 							this.sockets.broadcastCommittedSocketUpdate(documentId, entry.bytes, entry.socketId);
@@ -1103,9 +1106,20 @@ export class VaultRuntime implements DrainPort {
 				await this.options.alarms.setAlarm(Date.now() + PERSIST_RETRY_MS);
 			}
 		}));
-		await this.flushChain;
+		this.flushLanes.set(documentId, flush);
+		try {
+			await flush;
+		} finally {
+			if (this.flushLanes.get(documentId) === flush) this.flushLanes.delete(documentId);
+		}
 		if (success) this.maintain(documentId);
 		return success;
+	}
+
+	private async waitForFlushLanes(): Promise<void> {
+		// A lane can be replaced by a follow-up flush while the current snapshot is
+		// settling, so continue until no document owns persistence work.
+		while (this.flushLanes.size > 0) await Promise.all([...this.flushLanes.values()]);
 	}
 
 	private async catalogForBatch(
@@ -1121,8 +1135,9 @@ export class VaultRuntime implements DrainPort {
 				bodyGeneration: (this.store.documentHead(bodyId)?.generation ?? 0) + 1,
 				contentHash: final.contentHash, size: final.contentSize! };
 		}
-		// Fail-safe path for queues restored from an older in-memory producer or
-		// tests which intentionally omit admission metadata.
+		// Normal socket queues defer whole-document extraction and hashing to this
+		// debounced boundary. Reconstructing from the current durable prefix keeps
+		// metadata exact even when one queue splits into multiple commits.
 		const release = this.cache.reserveFullStateOperation(bodyId, 2);
 		try {
 			const reconstructed = this.store.reconstructDocument(bodyId);
@@ -1147,8 +1162,8 @@ export class VaultRuntime implements DrainPort {
 				documentGeneration: (this.store.documentHead(current.documentId)?.generation ?? 0) + 1,
 				contentHash: final.contentHash, size: final.contentSize! };
 		}
-		// Exceptional fallback for restored/injected queues that predate exact
-		// semantic metadata. Normal admitted frames never reconstruct here.
+		// Normal socket queues defer Canvas content hashing to this debounced
+		// boundary. Each partition reconstructs from its exact durable prefix.
 		const durableHead = this.store.documentHead(current.documentId);
 		const durableBytes = durableHead
 			? this.store.documentEncodedHistoryBytes(current.documentId, durableHead.latestSequence)
@@ -1161,8 +1176,8 @@ export class VaultRuntime implements DrainPort {
 			try {
 				crdtEngine.applyUpdate(reconstructed.doc, update, "semantic-flush-metadata");
 				const validation = await validateCanvasDocument(reconstructed.doc);
-				if (validation) throw new Error(validation);
-				const content = canonicalCanvasBytes(await materializeCanvasDocument(reconstructed.doc, false));
+				if (validation.error !== null) throw new Error(validation.error);
+				const content = validation.canonicalBytes;
 				return { documentId: current.documentId, fileId: current.fileId, kind: "canvas", format: "json-canvas",
 					formatVersion: 1, path: current.path, previousPath: null, lifecycle: "active",
 					documentGeneration: reconstructed.generation + 1, contentHash: await sha256Hex(content), size: content.byteLength };

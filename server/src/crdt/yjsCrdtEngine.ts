@@ -5,6 +5,7 @@ import {
 	type CrdtDocumentStats,
 	type CrdtEngine,
 	type CrdtRootOperation,
+	type CrdtRootSnapshotFilter,
 	type CrdtRootSnapshot,
 	type CrdtValueSnapshot,
 } from "./crdtEngine";
@@ -68,9 +69,15 @@ function materializeValue(value: CrdtValueSnapshot): unknown {
 	return result;
 }
 
-function yjsRootSnapshots(doc: Y.Doc): CrdtRootSnapshot[] {
+function includesRoot(name: string, filter: CrdtRootSnapshotFilter | undefined): boolean {
+	return filter === undefined || filter.names?.includes(name) === true
+		|| filter.prefixes?.some((prefix) => name.startsWith(prefix)) === true;
+}
+
+function yjsRootSnapshots(doc: Y.Doc, filter?: CrdtRootSnapshotFilter): CrdtRootSnapshot[] {
 	const result: CrdtRootSnapshot[] = [];
 	for (const [name, value] of doc.share) {
+		if (!includesRoot(name, filter)) continue;
 		const snapshot = snapshotValue(value);
 		if (snapshot.shared === "value") throw new Error(`unsupported scalar root: ${name}`);
 		result.push({ name, value: snapshot });
@@ -130,6 +137,18 @@ export const yjsCrdtEngine: CrdtEngine<YjsCrdtDocument> = {
 	applyUpdate(doc, update, origin) {
 		Y.applyUpdate(handle(doc).assertLive(), update, origin);
 	},
+	applyUpdateAndCheckIfChanged(doc, update, origin) {
+		const value = handle(doc).assertLive();
+		let changed = false;
+		const onUpdate = () => { changed = true; };
+		value.on("update", onUpdate);
+		try {
+			Y.applyUpdate(value, update, origin);
+			return changed;
+		} finally {
+			value.off("update", onUpdate);
+		}
+	},
 	encodeStateVector(doc) {
 		return Y.encodeStateVector(handle(doc).assertLive());
 	},
@@ -155,8 +174,8 @@ export const yjsCrdtEngine: CrdtEngine<YjsCrdtDocument> = {
 		assertTextRange(index, length);
 		handle(doc).assertLive().transact(() => handle(doc).assertLive().getText(name).delete(index, length), origin);
 	},
-	snapshotRoots(doc) {
-		return yjsRootSnapshots(handle(doc).assertLive());
+	snapshotRoots(doc, filter) {
+		return yjsRootSnapshots(handle(doc).assertLive(), filter);
 	},
 	applyRootOperations(doc, operations, origin) {
 		const value = handle(doc).assertLive();

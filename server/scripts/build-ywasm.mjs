@@ -10,6 +10,7 @@ const vendorDir = join(serverDir, "vendor/ywasm");
 const outputDir = join(serverDir, "src/crdt/vendor/ywasm");
 const nodeOutputDir = resolve(serverDir, "../packages/server-node/vendor/ywasm");
 const metadata = JSON.parse(readFileSync(join(vendorDir, "SOURCE.json"), "utf8"));
+const refreshArtifact = process.argv.includes("--refresh-artifact");
 const sourceOverrideIndex = process.argv.indexOf("--source");
 const sourceOverride = sourceOverrideIndex >= 0 ? resolve(process.argv[sourceOverrideIndex + 1]) : null;
 const temporary = mkdtempSync(join(tmpdir(), "yaos-ywasm-build-"));
@@ -52,9 +53,19 @@ try {
 		|| statSync(join(vendorDir, "LICENSE")).size !== metadata.licenseBytes) {
 		throw new Error("upstream license checksum mismatch");
 	}
-	output("git", ["apply", "--check", join(vendorDir, "patches/0001-document-stats.patch")], { cwd: sourceDir });
-	output("git", ["apply", join(vendorDir, "patches/0001-document-stats.patch")], { cwd: sourceDir });
+	const patches = [
+		join(vendorDir, "patches/0001-document-stats.patch"),
+		join(vendorDir, "patches/0002-apply-update-change-detection.patch"),
+	];
+	for (const patch of patches) {
+		// The change-detection patch is generated with zero diff context so the
+		// vendored patch itself contains no whitespace-only context lines.
+		// Cargo.lock and the exact source commit are verified before this point.
+		output("git", ["apply", "--unidiff-zero", "--check", patch], { cwd: sourceDir });
+		output("git", ["apply", "--unidiff-zero", patch], { cwd: sourceDir });
+	}
 	output("cargo", ["test", "-p", "yrs", "--lib", "document_stats_counts_deleted_integrated_structs", "--locked"], { cwd: sourceDir });
+	output("cargo", ["test", "-p", "yrs", "--lib", "update_change_detection_covers_duplicate_and_delete_only_updates", "--locked"], { cwd: sourceDir });
 
 	const rustflags = `-C link-arg=--max-memory=${metadata.maximumLinearMemoryBytes} -C link-arg=--export-memory`;
 	const build = (target, outDir) => output("wasm-pack", [
@@ -75,10 +86,10 @@ try {
 	writeFileSync(generatedWrapper, wrapperA);
 	const wasmPath = join(webA, "ywasm_bg.wasm");
 	const expected = metadata.artifact;
-	if (sha256(wasmPath) !== expected.wasmSha256 || statSync(wasmPath).size !== expected.wasmBytes) {
+	if (!refreshArtifact && (sha256(wasmPath) !== expected.wasmSha256 || statSync(wasmPath).size !== expected.wasmBytes)) {
 		throw new Error("Wasm artifact differs from SOURCE.json");
 	}
-	if (sha256(generatedWrapper) !== expected.wrapperSha256 || statSync(generatedWrapper).size !== expected.wrapperBytes) {
+	if (!refreshArtifact && (sha256(generatedWrapper) !== expected.wrapperSha256 || statSync(generatedWrapper).size !== expected.wrapperBytes)) {
 		throw new Error("Worker wrapper differs from SOURCE.json");
 	}
 
@@ -87,9 +98,9 @@ try {
 	const nodeWasm = join(sourceDir, "ywasm/pkg-yaos-node/ywasm_bg.wasm");
 	const nodeTypes = join(sourceDir, "ywasm/pkg-yaos-node/ywasm.d.ts");
 	appendFileSync(nodeEntry, "\nexports.wasmMemoryByteLength = () => wasm.memory.buffer.byteLength;\n");
-	if (sha256(nodeEntry) !== expected.nodeWrapperSha256 || statSync(nodeEntry).size !== expected.nodeWrapperBytes
+	if (!refreshArtifact && (sha256(nodeEntry) !== expected.nodeWrapperSha256 || statSync(nodeEntry).size !== expected.nodeWrapperBytes
 		|| sha256(nodeTypes) !== expected.nodeTypesSha256 || statSync(nodeTypes).size !== expected.nodeTypesBytes
-		|| sha256(nodeWasm) !== expected.wasmSha256) throw new Error("Node artifact differs from SOURCE.json");
+		|| sha256(nodeWasm) !== expected.wasmSha256)) throw new Error("Node artifact differs from SOURCE.json");
 	const nodeVerificationDir = join(temporary, "node-verification");
 	mkdirSync(nodeVerificationDir);
 	cpSync(nodeEntry, join(nodeVerificationDir, "ywasm.js"));
@@ -106,7 +117,20 @@ try {
 	cpSync(nodeWasm, join(nodeOutputDir, "ywasm_bg.wasm"));
 	cpSync(nodeTypes, join(nodeOutputDir, "ywasm.d.ts"));
 	cpSync(join(vendorDir, "LICENSE"), join(nodeOutputDir, "LICENSE"));
-	console.log(JSON.stringify({ wasm: expected.wasmSha256, wrapper: expected.wrapperSha256 }));
+	if (refreshArtifact) {
+		metadata.artifact = {
+			wasmSha256: sha256(wasmPath),
+			wasmBytes: statSync(wasmPath).size,
+			wrapperSha256: sha256(generatedWrapper),
+			wrapperBytes: statSync(generatedWrapper).size,
+			nodeWrapperSha256: sha256(nodeEntry),
+			nodeWrapperBytes: statSync(nodeEntry).size,
+			nodeTypesSha256: sha256(nodeTypes),
+			nodeTypesBytes: statSync(nodeTypes).size,
+		};
+		writeFileSync(join(vendorDir, "SOURCE.json"), `${JSON.stringify(metadata, null, "\t")}\n`);
+	}
+	console.log(JSON.stringify({ wasm: sha256(wasmPath), wrapper: sha256(generatedWrapper) }));
 } finally {
 	rmSync(temporary, { recursive: true, force: true });
 }

@@ -97,6 +97,38 @@ s.test("merge and state-vector catch-up are wire-compatible", () => {
 	}
 });
 
+s.test("apply-and-check detects inserts and delete-only updates but rejects duplicates", () => {
+	const engines = process.env.YAOS_REQUIRE_PATCHED_YWASM === "1"
+		? [yjsCrdtEngine, ywasm] as const
+		: [yjsCrdtEngine] as const;
+	for (const engine of engines) {
+		const source = new Y.Doc({ guid: `change-detection-source-${engine.name}` });
+		const text = source.getText("body");
+		text.insert(0, "hello");
+		const inserted = Y.encodeStateAsUpdate(source);
+		try {
+			const target = engine.createDocument(`change-detection-${engine.name}`);
+			try {
+				assert.equal(engine.applyUpdateAndCheckIfChanged(target as never, inserted, "insert"), true);
+				assert.equal(engine.applyUpdateAndCheckIfChanged(target as never, inserted, "duplicate"), false);
+
+				const beforeDelete = Y.encodeStateVector(source);
+				text.delete(0, 1);
+				const deleted = Y.encodeStateAsUpdate(source, beforeDelete);
+				const targetVector = engine.encodeStateVector(target as never);
+				assert.equal(engine.applyUpdateAndCheckIfChanged(target as never, deleted, "delete"), true);
+				assert.deepEqual(engine.encodeStateVector(target as never), targetVector,
+					"delete-only updates do not advance the state vector");
+				assert.equal(engine.applyUpdateAndCheckIfChanged(target as never, deleted, "duplicate-delete"), false);
+			} finally {
+				engine.destroyDocument(target as never);
+			}
+		} finally {
+			source.destroy();
+		}
+	}
+});
+
 s.test("Canvas and root schemas survive a ywasm checkpoint round trip", async () => {
 	const canvas = createCanvasDocument({
 		rootFields: { theme: "dark", viewport: { x: 12, y: 34 } },
@@ -158,6 +190,27 @@ s.test("document ownership rejects cross-engine handles and use after destroy", 
 	// Destroy is deliberately idempotent at the adapter boundary.
 	yjsCrdtEngine.destroyDocument(ydoc);
 	ywasm.destroyDocument(wdoc);
+});
+
+s.test("root snapshot filters exclude large unrelated text roots", () => {
+	for (const engine of [yjsCrdtEngine, ywasm] as const) {
+		const doc = engine.createDocument(`filtered-roots-${engine.name}`);
+		try {
+			engine.insertText(doc as never, "body", 0, "large-body-not-requested".repeat(10_000));
+			engine.applyRootOperations(doc as never, [{
+				kind: "map-set",
+				root: "frontmatter:meta",
+				key: "format",
+				value: { shared: "value", value: 1 },
+			}], "filtered-root-fixture");
+			assert.deepEqual(engine.snapshotRoots(doc as never, { prefixes: ["frontmatter:"] }).map((root) => root.name), [
+				"frontmatter:meta",
+			]);
+			assert.deepEqual(engine.snapshotRoots(doc as never, { names: ["body"] }).map((root) => root.name), ["body"]);
+		} finally {
+			engine.destroyDocument(doc as never);
+		}
+	}
 });
 
 s.test("invalid indexes fail before crossing the FFI boundary", () => {

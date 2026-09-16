@@ -371,10 +371,10 @@ s.test("socket validation mirror stages ordered frames without touching authorit
 	const duplicate = cache.validateBodyUpdate("staged", first);
 	assert.equal(cache.stageValidatedBodyUpdate("staged", duplicate), false, "duplicate is a speculative no-op");
 	assert.equal(loaded.validationPending, false);
-	assert.equal(cache.applyDurableUpdate("staged", first, 2, "durable-prefix"), true);
+	assert.equal(cache.applyStagedDurableUpdate("staged", first, 2, "durable-prefix"), true);
 	assert.equal(crdtEngine.readText(loaded.doc, "body"), "before-one");
 	assert.equal(crdtEngine.readText(loaded.validationDoc, "body"), "before-one-two");
-	assert.equal(cache.applyDurableUpdate("staged", second, 3, "durable-prefix"), true);
+	assert.equal(cache.applyStagedDurableUpdate("staged", second, 3, "durable-prefix"), true);
 	assert.equal(crdtEngine.readText(loaded.doc, "body"), "before-one-two");
 	producer.destroy();
 });
@@ -411,7 +411,7 @@ function flushProbe(
 			return operation();
 		},
 		takePending: () => { events.push("take"); return entries; },
-		applyDurableUpdate: (_documentId: string, _update: Uint8Array, generation: number) => {
+		applyStagedDurableUpdate: (_documentId: string, _update: Uint8Array, generation: number) => {
 			events.push(`apply:${generation}`);
 			return true;
 		},
@@ -454,7 +454,7 @@ function flushProbe(
 			alarms: { setAlarm: async () => { events.push("alarm"); } },
 		} },
 		persistence: { value: new Map() },
-		flushChain: { value: Promise.resolve(), writable: true },
+		flushLanes: { value: new Map() },
 	});
 	return { runtime, events };
 }
@@ -479,6 +479,32 @@ s.test("socket flush publishes only after durable success and preserves frame or
 		"broadcast:socket-a", "broadcast:socket-b",
 	]);
 	assert.ok(harness.events.includes("complete"));
+});
+
+s.test("a slow note flush does not head-of-line block another note", async () => {
+	const harness = flushProbe([flushEntry("socket-a", updateBytes("frame"))], null);
+	let releaseSlow!: () => void;
+	let markSlowStarted!: () => void;
+	const slowStarted = new Promise<void>((resolve) => { markSlowStarted = resolve; });
+	const slowGate = new Promise<void>((resolve) => { releaseSlow = resolve; });
+	Object.defineProperty(harness.runtime, "catalogForBatch", { value: async (bodyId: string) => {
+		if (bodyId === "slow-body") {
+			markSlowStarted();
+			await slowGate;
+		}
+		return { bodyId, fileId: bodyId, path: `${bodyId}.md`, previousPath: null, lifecycle: "active",
+			bodyGeneration: 2, contentHash: "a".repeat(64), size: 5 };
+	} });
+
+	const slow = harness.runtime.flushDocument("slow-body");
+	await slowStarted;
+	const fast = harness.runtime.flushDocument("fast-body");
+	assert.equal(await Promise.race([
+		fast,
+		new Promise<"blocked">((resolve) => setTimeout(() => resolve("blocked"), 100)),
+	]), true);
+	releaseSlow();
+	assert.equal(await slow, true);
 });
 
 s.test("socket flush failure publishes nothing, rebuilds durability, and closes origins", async () => {

@@ -130,8 +130,8 @@ export class VaultSemanticService {
 					try { crdtEngine.applyUpdate(semantic, update, "semantic-promotion-validation"); }
 					catch { return json({ error: "invalid_semantic_update" }, 409); }
 					const validation = await validateCanvasDocument(semantic);
-					if (validation) return json({ error: validation }, 409);
-					const content = canonicalCanvasBytes(await materializeCanvasDocument(semantic, false));
+					if (validation.error !== null) return json({ error: validation.error }, 409);
+					const content = validation.canonicalBytes;
 					if (content.byteLength !== contentSize || await sha256Hex(content) !== contentHash) {
 						return json({ error: "promotion_content_mismatch" }, 409);
 					}
