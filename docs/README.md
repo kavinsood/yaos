@@ -30,5 +30,6 @@ parallel current specifications.
 - [Canvas semantic synchronization](canvas-semantic-sync-plan.md) — implemented semantic model, authority, projection, migration, recovery, validation, and field-gated rollout plan for JSON Canvas.
 - [Canvas implementation report](canvas-semantic-sync-implementation-report.md) — shipped schema-8 behavior, safe degradation, automated evidence, and remaining external release gates.
 - [Yjs pathology remediation report](pathology-remediation-report.md) — binary storage, resident validation, semantic epochs and compaction, retention fixes, frozen-trace measurements, and deployed validation.
+- [ywasm server engine RFC](ywasm-server-engine-rfc.md) — adoption decision, Worker and Unicode evidence, engine/build/memory architecture, and the detailed compaction-reliability implementation plan.
 
 The repository-root [README](../README.md) is the public product guide. Generated evidence belongs under ignored `qa-runs/`; workstation notes belong under ignored `notes/`.
