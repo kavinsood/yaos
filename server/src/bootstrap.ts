@@ -1,8 +1,9 @@
-import * as Y from "yjs";
+import { ywasmCrdtEngine as crdtEngine } from "./crdt/ywasmWorkerCrdtEngine";
 import { sha256Hex } from "./hex";
 import { SERVER_SCHEMA_VERSION, SERVER_STORAGE_FORMAT_VERSION } from "./version";
 import { isValidOperationId, type CatalogHeadAtBoundary, type SemanticCatalogHead, type VaultOperation, type VaultStore } from "./vaultStore";
 import type { SemanticEpoch } from "./shared/semanticEpoch";
+import { canonicalCrdtRootDigestBytes } from "./shared/crdtRootDigest";
 
 const DEFAULT_PAGE_SIZE = 1000;
 const SOFT_TTL_MS = 60 * 60_000;
@@ -28,6 +29,7 @@ export interface BootstrapDescriptor {
 		rootEpoch: SemanticEpoch;
 		rootGeneration: number;
 		rootCheckpointHash: string;
+		rootCheckpointHashFormat: "canonical-root-v1";
 		rootCheckpointBytes: number;
 		rootCheckpointKey: string;
 	};
@@ -120,9 +122,10 @@ export class BootstrapService {
 		try {
 			const reconstructed = this.store.reconstructDocument("root", operation.boundarySequence);
 			try {
-				const encodedState = Y.encodeStateAsUpdate(reconstructed.doc);
-				return { encodedState, rootEpoch: reconstructed.semanticEpoch, hash: sha256Hex(encodedState) };
-			} finally { reconstructed.doc.destroy(); }
+				const encodedState = crdtEngine.encodeStateAsUpdate(reconstructed.doc);
+				return { encodedState, rootEpoch: reconstructed.semanticEpoch,
+					hash: sha256Hex(canonicalCrdtRootDigestBytes(crdtEngine.snapshotRoots(reconstructed.doc))) };
+			} finally { crdtEngine.destroyDocument(reconstructed.doc); }
 		} finally { release(); }
 	}
 
@@ -146,7 +149,7 @@ export class BootstrapService {
 		try {
 			const reconstructed = this.store.reconstructDocument(bodyId, operation.boundarySequence);
 			try {
-				const encodedState = Y.encodeStateAsUpdate(reconstructed.doc);
+				const encodedState = crdtEngine.encodeStateAsUpdate(reconstructed.doc);
 				return {
 					bodyId,
 					bodyEpoch: reconstructed.semanticEpoch,
@@ -154,7 +157,7 @@ export class BootstrapService {
 					throughSequence: operation.boundarySequence,
 					encodedState,
 				};
-			} finally { reconstructed.doc.destroy(); }
+			} finally { crdtEngine.destroyDocument(reconstructed.doc); }
 		} finally { release(); }
 	}
 
@@ -174,10 +177,10 @@ export class BootstrapService {
 		try {
 			const reconstructed = this.store.reconstructDocument(documentId, operation.boundarySequence);
 			try {
-				const encodedState = Y.encodeStateAsUpdate(reconstructed.doc);
+				const encodedState = crdtEngine.encodeStateAsUpdate(reconstructed.doc);
 				return { documentId, bodyEpoch: reconstructed.semanticEpoch, generation: reconstructed.generation,
 					throughSequence: operation.boundarySequence, encodedState };
-			} finally { reconstructed.doc.destroy(); }
+			} finally { crdtEngine.destroyDocument(reconstructed.doc); }
 		} finally { release(); }
 	}
 
@@ -214,11 +217,13 @@ export class BootstrapService {
 			let rootGeneration: number;
 			let rootEpoch: SemanticEpoch;
 			let encodedRoot: Uint8Array;
+			let canonicalRootHash: string;
 			try {
 				rootGeneration = reconstructed.generation;
 				rootEpoch = reconstructed.semanticEpoch;
-				encodedRoot = Y.encodeStateAsUpdate(reconstructed.doc);
-			} finally { reconstructed.doc.destroy(); }
+				encodedRoot = crdtEngine.encodeStateAsUpdate(reconstructed.doc);
+				canonicalRootHash = await sha256Hex(canonicalCrdtRootDigestBytes(crdtEngine.snapshotRoots(reconstructed.doc)));
+			} finally { crdtEngine.destroyDocument(reconstructed.doc); }
 			const pin = this.store.getPin(operation.operationId);
 			return {
 				format: "yaos-bootstrap-v2",
@@ -233,7 +238,8 @@ export class BootstrapService {
 					rootEpoch,
 					rootGeneration,
 					rootCheckpointKey: operation.artifactKey ?? `sql:root:${operation.boundarySequence}`,
-					rootCheckpointHash: operation.artifactHash ?? await sha256Hex(encodedRoot),
+					rootCheckpointHash: operation.artifactHash ?? canonicalRootHash,
+					rootCheckpointHashFormat: "canonical-root-v1",
 					rootCheckpointBytes: encodedRoot.byteLength,
 				},
 				catalog: {

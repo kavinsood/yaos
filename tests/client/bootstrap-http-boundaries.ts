@@ -12,7 +12,7 @@ import {
 	type HttpResponse,
 } from "../../src/utils/http";
 import { suite } from "../harness.ts";
-import { encodeBinaryEnvelope } from "../../server/src/shared/binaryEnvelope";
+import { decodeBinaryEnvelope, encodeBinaryEnvelope } from "../../server/src/shared/binaryEnvelope";
 
 const s = suite("bootstrap-http-boundaries");
 
@@ -211,6 +211,86 @@ s.test("VaultSync HTTP injection sends candidate bytes without copying", async (
 		"https://sync.test/vault/vault%2Fid/body/body%2Fid/candidate",
 	);
 	assert.equal(requests[0]?.headers?.Authorization, "Bearer token");
+});
+
+s.test("VaultSync HTTP adapter batches create admissions and candidate updates into one request each", async () => {
+	const requests: HttpRequest[] = [];
+	const port = new VaultSyncHttpPort(
+		"https://sync.test",
+		"vault",
+		"token",
+		async (request) => {
+			requests.push(request);
+			return {
+				status: 200,
+				headers: {},
+				arrayBuffer: new ArrayBuffer(0),
+				json: request.url.endsWith("/lifecycle/admissions")
+					? { receipts: [], vaultSequence: 2, runtimeEpoch: "runtime" }
+					: { receipts: [], highWater: 4 },
+				text: "",
+			};
+		},
+	);
+	const operations = ["a", "b"].map((suffix) => ({
+		operationId: `operation-${suffix}`,
+		kind: "create" as const,
+		fileId: `body-${suffix}`,
+		bodyId: `body-${suffix}`,
+		bodyEpoch: 1 as const,
+		path: `${suffix}.md`,
+		candidateId: `candidate-${suffix}`,
+		candidateDigest: suffix.repeat(64),
+	}));
+	await port.commitCreateAdmissionsBatch(operations);
+	await port.submitCandidates(operations.map((operation, index) => ({
+		vaultId: "vault",
+		bodyId: operation.bodyId,
+		bodyEpoch: 1,
+		previousBaseline: "",
+		pendingMarkdown: operation.path,
+		candidateId: operation.candidateId,
+		candidateDigest: operation.candidateDigest,
+		encodedUpdate: Uint8Array.of(index + 1, index + 2).buffer,
+		capturedAt: index,
+	})));
+
+	assert.deepEqual(requests.map((request) => request.url), [
+		"https://sync.test/vault/vault/lifecycle/admissions",
+		"https://sync.test/vault/vault/body/candidates",
+	]);
+	assert.deepEqual(JSON.parse(requests[0]!.body as string), { operations });
+	const envelope = decodeBinaryEnvelope(new Uint8Array(requests[1]!.body as ArrayBuffer)) as {
+		candidates: Array<{ bodyId: string; encodedUpdates: Uint8Array[] }>;
+	};
+	assert.deepEqual(envelope.candidates.map((candidate) => candidate.bodyId), ["body-a", "body-b"]);
+	assert.deepEqual(envelope.candidates.map((candidate) => candidate.encodedUpdates.map((update) => [...update])),
+		[[[1, 2]], [[2, 3]]]);
+	assert.ok(requests.every((request) => request.headers?.Authorization === "Bearer token"));
+});
+
+s.test("VaultSync HTTP adapter routes a persisted multi-frame candidate through the batch envelope", async () => {
+	const requests: HttpRequest[] = [];
+	const port = new VaultSyncHttpPort("https://sync.test", "vault", "token", async (request) => {
+		requests.push(request);
+		return {
+			status: 200, headers: {}, arrayBuffer: new ArrayBuffer(0), text: "",
+			json: { receipts: [{ candidateId: "candidate" }], highWater: 1 },
+		};
+	});
+	await port.submitCandidate({
+		vaultId: "vault", bodyId: "body", bodyEpoch: 1, previousBaseline: "",
+		pendingMarkdown: "framed", candidateId: "candidate", candidateDigest: "a".repeat(64),
+		encodedUpdate: Uint8Array.of(1).buffer,
+		encodedUpdates: [Uint8Array.of(2, 3).buffer, Uint8Array.of(4, 5).buffer],
+		capturedAt: 1,
+	});
+	assert.equal(requests.length, 1);
+	assert.equal(requests[0]!.url, "https://sync.test/vault/vault/body/candidates");
+	const envelope = decodeBinaryEnvelope(new Uint8Array(requests[0]!.body as ArrayBuffer)) as {
+		candidates: Array<{ encodedUpdates: Uint8Array[] }>;
+	};
+	assert.deepEqual(envelope.candidates[0]!.encodedUpdates.map((update) => [...update]), [[2, 3], [4, 5]]);
 });
 
 await s.done();

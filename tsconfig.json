@@ -2,6 +2,9 @@
 	"compilerOptions": {
 		"baseUrl": "src",
 		"paths": {
+			"@yaos/crdt-engine": [
+				"../server/src/crdt/ywasmWorkerCrdtEngine.ts"
+			],
 			"@shared/*": [
 				"../server/src/shared/*"
 			]

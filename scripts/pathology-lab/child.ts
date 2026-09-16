@@ -4,9 +4,14 @@ import { join, resolve } from "node:path";
 import * as encoding from "lib0/encoding";
 import * as syncProtocol from "y-protocols/sync";
 import * as Y from "yjs";
+import { ywasmCrdtEngine as crdtEngine } from "@yaos/crdt-engine";
+import type { CrdtRootOperation, CrdtValueSnapshot } from "../../server/src/crdt/crdtEngine";
+import type { YwasmCrdtDocument } from "../../server/src/crdt/ywasmCrdtEngine";
+import { snapshotRootMap, mapValue } from "../../server/src/crdt/rootSchema";
 import { canonicalMarkdownBytes, canonicalizeMarkdown } from "../../server/src/shared/markdownCodec";
 import { MAX_CLIENT_MARKDOWN_BYTES } from "../../server/src/shared/durableLimits";
-import { validateFrontmatterSemanticRoots } from "../../server/src/shared/frontmatterSemanticValidation";
+import { validateFrontmatterSemanticRoots as validateYjsFrontmatterSemanticRoots } from "../../server/src/shared/frontmatterSemanticValidation";
+import { validateFrontmatterSemanticRoots as validateServerFrontmatterSemanticRoots } from "../../server/src/crdt/frontmatterSemanticValidation";
 import { initializeCanvasDocument } from "../../server/src/shared/canvasSemanticDocument";
 import { ROOT_SEMANTIC_ROOTS } from "../../server/src/semanticCompaction";
 import { VaultCandidateService } from "../../server/src/vaultCandidateService";
@@ -28,6 +33,7 @@ import {
 import { MemoryTracker, operatingSystemMaxRssBytes } from "./metrics";
 import { census, readFrozenFrames, readFrozenSemanticEdits, readTraceManifest, sha256, validateFrozenTrace } from "./trace";
 import type { LabMeasurement, PathologyProfile, SemanticEdit } from "./types";
+import type { YjsCensus } from "./types";
 
 interface ChildSpec {
 	readonly arm: string;
@@ -62,6 +68,54 @@ function verifyFinalDocument(traceDirectory: string, doc: Y.Doc): { text: string
 		throw new Error(`final Markdown mismatch: ${textDigest} != ${manifest.final.textSha256}`);
 	}
 	return { text, encodedBytes: Y.encodeStateAsUpdate(doc).byteLength };
+}
+
+function verifyFinalServerDocument(
+	traceDirectory: string,
+	doc: YwasmCrdtDocument,
+): { text: string; encodedBytes: number } {
+	const manifest = readTraceManifest(traceDirectory);
+	const text = crdtEngine.readText(doc, "body");
+	const textDigest = sha256(text);
+	if (textDigest !== manifest.final.textSha256) {
+		throw new Error(`final Markdown mismatch: ${textDigest} != ${manifest.final.textSha256}`);
+	}
+	return { text, encodedBytes: crdtEngine.encodeStateAsUpdate(doc).byteLength };
+}
+
+function serverCensus(doc: YwasmCrdtDocument): YjsCensus {
+	const stats = crdtEngine.documentStats(doc);
+	return {
+		structs: stats.totalStructs,
+		deletedStructs: stats.deletedStructs,
+		gcStructs: 0,
+		clientBuckets: 0,
+		pendingStructBytes: 0,
+		pendingDeleteSetBytes: 0,
+	};
+}
+
+function canonicalDetachedValue(value: unknown): unknown {
+	if (Array.isArray(value)) return value.map(canonicalDetachedValue);
+	if (value === null || typeof value !== "object") return value;
+	return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+		.sort(([left], [right]) => left.localeCompare(right))
+		.map(([key, nested]) => [key, canonicalDetachedValue(nested)]));
+}
+
+function canonicalSnapshotValue(value: CrdtValueSnapshot): unknown {
+	if (value.shared === "value") return ["value", canonicalDetachedValue(value.value)];
+	if (value.shared === "text") return ["text", value.value];
+	if (value.shared === "array") return ["array", value.values.map(canonicalSnapshotValue)];
+	return ["map", [...value.entries]
+		.sort(([left], [right]) => left.localeCompare(right))
+		.map(([key, nested]) => [key, canonicalSnapshotValue(nested)])];
+}
+
+function canonicalRootState(doc: YwasmCrdtDocument): string {
+	return JSON.stringify([...crdtEngine.snapshotRoots(doc)]
+		.sort((left, right) => left.name.localeCompare(right.name))
+		.map((root) => [root.name, canonicalSnapshotValue(root.value)]));
 }
 
 function bodyArm(spec: ChildSpec): LabMeasurement {
@@ -228,12 +282,12 @@ async function serverCurrentArm(spec: ChildSpec): Promise<LabMeasurement> {
 		if (compaction) tracker.mark("production-semantic-compaction", true);
 		const loaded = cache.get(manifest.bodyId);
 		if (!loaded) throw new Error("pathological body was unexpectedly evicted");
-		const final = verifyFinalDocument(spec.traceDirectory, loaded.doc);
+		const final = verifyFinalServerDocument(spec.traceDirectory, loaded.doc);
 		const result = tracker.finish({
 			textSha256: sha256(final.text),
 			textCodeUnits: final.text.length,
 			encodedStateBytes: final.encodedBytes,
-			census: census(loaded.doc),
+			census: serverCensus(loaded.doc),
 			counters: {
 				candidates,
 				rejected,
@@ -257,8 +311,8 @@ interface SoakClients {
 	readonly epoch: number;
 }
 
-function freshSoakClients(baseline: Y.Doc, count: number, epoch: number): SoakClients {
-	const state = Y.encodeStateAsUpdate(baseline);
+function freshSoakClients(baseline: YwasmCrdtDocument, count: number, epoch: number): SoakClients {
+	const state = crdtEngine.encodeStateAsUpdate(baseline);
 	const documents = Array.from({ length: count }, (_, index) => {
 		const document = new Y.Doc({ guid: baseline.guid });
 		Y.applyUpdate(document, state, "semantic-soak-baseline");
@@ -322,7 +376,10 @@ function soakResourceCeilings(profile: PathologyProfile): {
 	// 5.98s/+212.5 MiB with 2 GiB old-space and 8.85s/+179.8 MiB with
 	// 128 MiB old-space. These are Node process ceilings, not Worker limits.
 	if (profile.name === "stress") return { elapsedMs: 20_000, peakAdditionalRssBytes: 320 * 1024 * 1024, reconstructionMs: 2_000 };
-	if (profile.name === "quick") return { elapsedMs: 2_500, peakAdditionalRssBytes: 64 * 1024 * 1024, reconstructionMs: 500 };
+	// The Wasm adapter reserves linear-memory pages outside V8's heap. The quick
+	// soak still settles well inside the Worker admission envelope, but its Node
+	// process high-water mark needs room for that separately-accounted arena.
+	if (profile.name === "quick") return { elapsedMs: 2_500, peakAdditionalRssBytes: 96 * 1024 * 1024, reconstructionMs: 500 };
 	return {
 		elapsedMs: Math.max(2_500, profile.edits * 0.4),
 		peakAdditionalRssBytes: 64 * 1024 * 1024,
@@ -390,8 +447,8 @@ async function serverSemanticCompactionSoakArm(spec: ChildSpec): Promise<LabMeas
 		let compactions = 0;
 		let staleEpochRejections = 0;
 		let regeneratedClientSets = 1;
-		let maximumStructs = census(loaded.doc).structs;
-		let maximumEncodedBytes = Y.encodeStateAsUpdate(loaded.doc).byteLength;
+		let maximumStructs = serverCensus(loaded.doc).structs;
+		let maximumEncodedBytes = crdtEngine.encodeStateAsUpdate(loaded.doc).byteLength;
 		let maximumPostResetStructs = 0;
 		let maximumPostResetEncodedBytes = 0;
 		let maximumFreshEncodedBytes = maximumEncodedBytes;
@@ -434,9 +491,9 @@ async function serverSemanticCompactionSoakArm(spec: ChildSpec): Promise<LabMeas
 				|| candidates === manifest.candidates.frames;
 			if (!compactionBoundary) continue;
 			loaded = cache.get(manifest.bodyId)!;
-			const semanticBefore = loaded.doc.getText("body").toString();
-			const beforeCensus = census(loaded.doc);
-			const beforeEncodedBytes = Y.encodeStateAsUpdate(loaded.doc).byteLength;
+			const semanticBefore = crdtEngine.readText(loaded.doc, "body");
+			const beforeCensus = serverCensus(loaded.doc);
+			const beforeEncodedBytes = crdtEngine.encodeStateAsUpdate(loaded.doc).byteLength;
 			maximumStructs = Math.max(maximumStructs, beforeCensus.structs);
 			maximumEncodedBytes = Math.max(maximumEncodedBytes, beforeEncodedBytes);
 			const oldEpoch = loaded.semanticEpoch;
@@ -449,9 +506,9 @@ async function serverSemanticCompactionSoakArm(spec: ChildSpec): Promise<LabMeas
 			compactions++;
 			loaded = cache.get(manifest.bodyId)!;
 			if (loaded.semanticEpoch !== oldEpoch + 1) throw new Error("semantic compaction did not advance body epoch exactly once");
-			if (loaded.doc.getText("body").toString() !== semanticBefore) throw new Error("semantic compaction changed Markdown");
-			const afterCensus = census(loaded.doc);
-			const afterEncodedBytes = Y.encodeStateAsUpdate(loaded.doc).byteLength;
+			if (crdtEngine.readText(loaded.doc, "body") !== semanticBefore) throw new Error("semantic compaction changed Markdown");
+			const afterCensus = serverCensus(loaded.doc);
+			const afterEncodedBytes = crdtEngine.encodeStateAsUpdate(loaded.doc).byteLength;
 			maximumPostResetStructs = Math.max(maximumPostResetStructs, afterCensus.structs);
 			maximumPostResetEncodedBytes = Math.max(maximumPostResetEncodedBytes, afterEncodedBytes);
 			maximumFreshEncodedBytes = Math.max(maximumFreshEncodedBytes, afterEncodedBytes);
@@ -470,15 +527,15 @@ async function serverSemanticCompactionSoakArm(spec: ChildSpec): Promise<LabMeas
 		}
 
 		loaded = cache.get(manifest.bodyId)!;
-		const final = verifyFinalDocument(spec.traceDirectory, loaded.doc);
+		const final = verifyFinalServerDocument(spec.traceDirectory, loaded.doc);
 		const reconstructionStartedAt = performance.now();
 		const recovered = fixture.store.reconstructDocument(manifest.bodyId);
 		const reconstructionMs = performance.now() - reconstructionStartedAt;
 		try {
-			verifyFinalDocument(spec.traceDirectory, recovered.doc);
+			verifyFinalServerDocument(spec.traceDirectory, recovered.doc);
 			if (recovered.semanticEpoch !== loaded.semanticEpoch) throw new Error("recovery returned the wrong semantic epoch");
 		} finally {
-			recovered.doc.destroy();
+			crdtEngine.destroyDocument(recovered.doc);
 		}
 		const ceilings = soakCeilings({ manifest, plannedCompactions, maximumOperationsPerEpoch, maximumFreshEncodedBytes });
 		const resourceCeilings = soakResourceCeilings(manifest.profile);
@@ -495,7 +552,7 @@ async function serverSemanticCompactionSoakArm(spec: ChildSpec): Promise<LabMeas
 			textSha256: sha256(final.text),
 			textCodeUnits: final.text.length,
 			encodedStateBytes: final.encodedBytes,
-			census: census(loaded.doc),
+			census: serverCensus(loaded.doc),
 			counters: {
 				candidates,
 				semanticOperations: edits.length,
@@ -569,10 +626,10 @@ async function serverValidatedOnceArm(spec: ChildSpec): Promise<LabMeasurement> 
 			const started = performance.now();
 			const head = fixture.store.documentHead(manifest.bodyId);
 			const validated = fixture.store.reconstructDocument(manifest.bodyId);
-			Y.applyUpdate(validated.doc, update, "validated-once");
-			const content = canonicalizeMarkdown(validated.doc.getText("body").toString());
+			crdtEngine.applyUpdate(validated.doc, update, "validated-once");
+			const content = canonicalizeMarkdown(crdtEngine.readText(validated.doc, "body"));
 			const contentBytes = canonicalMarkdownBytes(content);
-			const measuredBytes = Y.encodeStateAsUpdate(validated.doc).byteLength;
+			const measuredBytes = crdtEngine.encodeStateAsUpdate(validated.doc).byteLength;
 			exactEncodes++;
 			const candidateId = `pathology-lean-${String(candidates).padStart(8, "0")}`;
 			const candidateDigest = await digest(update);
@@ -602,8 +659,8 @@ async function serverValidatedOnceArm(spec: ChildSpec): Promise<LabMeasurement> 
 			// This is the proposed lean boundary: the validated post-state supplies
 			// the exact size, while the live socket document receives the update
 			// directly instead of constructing and encoding a second candidate doc.
-			Y.applyUpdate(live, update, "validated-once-live");
-			validated.doc.destroy();
+			crdtEngine.applyUpdate(live, update, "validated-once-live");
+			crdtEngine.destroyDocument(validated.doc);
 			void measuredBytes;
 			const elapsed = performance.now() - started;
 			latencies.push(elapsed);
@@ -611,12 +668,12 @@ async function serverValidatedOnceArm(spec: ChildSpec): Promise<LabMeasurement> 
 			candidates++;
 			if (candidates % sampleEvery === 0) tracker.mark(`candidate-${candidates}`);
 		}
-		const final = verifyFinalDocument(spec.traceDirectory, live);
+		const final = verifyFinalServerDocument(spec.traceDirectory, live);
 		const result = tracker.finish({
 			textSha256: sha256(final.text),
 			textCodeUnits: final.text.length,
 			encodedStateBytes: final.encodedBytes,
-			census: census(live),
+			census: serverCensus(live),
 			counters: {
 				candidates,
 				candidateBytes,
@@ -625,7 +682,7 @@ async function serverValidatedOnceArm(spec: ChildSpec): Promise<LabMeasurement> 
 				...latencyCounters(latencies),
 			},
 		});
-		live.destroy();
+		crdtEngine.destroyDocument(live);
 		return result;
 	} finally {
 		closeStore(fixture);
@@ -643,7 +700,7 @@ async function serverPersistentValidationArm(spec: ChildSpec): Promise<LabMeasur
 		tracker.mark("persistent-validation-seeded", true);
 		const exactEvery = spec.arm === "server-persistent-exact" ? 1 : 50;
 		let exactEncodes = 1;
-		let measuredBytes = Y.encodeStateAsUpdate(validation).byteLength;
+		let measuredBytes = crdtEngine.encodeStateAsUpdate(validation).byteLength;
 		let unmeasuredInputBytes = 0;
 		let maximumInputLedgerBytes = measuredBytes;
 		let ledgerUnderestimateMaximumBytes = 0;
@@ -654,10 +711,10 @@ async function serverPersistentValidationArm(spec: ChildSpec): Promise<LabMeasur
 		for (const update of readFrozenFrames(join(spec.traceDirectory, "candidates.bin"))) {
 			const started = performance.now();
 			const head = fixture.store.documentHead(manifest.bodyId);
-			Y.applyUpdate(validation, update, "persistent-validation");
-			const semanticError = validateFrontmatterSemanticRoots(validation);
+			crdtEngine.applyUpdate(validation, update, "persistent-validation");
+			const semanticError = validateServerFrontmatterSemanticRoots(validation);
 			if (semanticError) throw new Error(`persistent validation failed: ${semanticError}`);
-			const content = validation.getText("body").toString();
+			const content = crdtEngine.readText(validation, "body");
 			if (content !== canonicalizeMarkdown(content)) throw new Error("persistent validation produced non-canonical Markdown");
 			const contentBytes = canonicalMarkdownBytes(content);
 			if (contentBytes.byteLength > MAX_CLIENT_MARKDOWN_BYTES) throw new Error("persistent validation crossed Markdown limit");
@@ -665,7 +722,7 @@ async function serverPersistentValidationArm(spec: ChildSpec): Promise<LabMeasur
 			maximumInputLedgerBytes = Math.max(maximumInputLedgerBytes, measuredBytes + unmeasuredInputBytes);
 			if ((candidates + 1) % exactEvery === 0) {
 				const ledgerBytes = measuredBytes + unmeasuredInputBytes;
-				const exactBytes = Y.encodeStateAsUpdate(validation).byteLength;
+				const exactBytes = crdtEngine.encodeStateAsUpdate(validation).byteLength;
 				ledgerUnderestimateMaximumBytes = Math.max(ledgerUnderestimateMaximumBytes, exactBytes - ledgerBytes);
 				measuredBytes = exactBytes;
 				unmeasuredInputBytes = 0;
@@ -696,23 +753,23 @@ async function serverPersistentValidationArm(spec: ChildSpec): Promise<LabMeasur
 				runtimeEpoch: "pathology-runtime-0001",
 				actor: ACTOR,
 			});
-			Y.applyUpdate(live, update, "persistent-validation-live");
+			crdtEngine.applyUpdate(live, update, "persistent-validation-live");
 			candidateBytes += update.byteLength;
 			candidates++;
 			latencies.push(performance.now() - started);
 			if (candidates % sampleEvery === 0) tracker.mark(`candidate-${candidates}`);
 		}
 		if (unmeasuredInputBytes > 0) {
-			measuredBytes = Y.encodeStateAsUpdate(validation).byteLength;
+			measuredBytes = crdtEngine.encodeStateAsUpdate(validation).byteLength;
 			exactEncodes++;
 		}
-		const final = verifyFinalDocument(spec.traceDirectory, validation);
-		verifyFinalDocument(spec.traceDirectory, live);
+		const final = verifyFinalServerDocument(spec.traceDirectory, validation);
+		verifyFinalServerDocument(spec.traceDirectory, live);
 		const result = tracker.finish({
 			textSha256: sha256(final.text),
 			textCodeUnits: final.text.length,
 			encodedStateBytes: final.encodedBytes,
-			census: census(validation),
+			census: serverCensus(validation),
 			counters: {
 				candidates,
 				candidateBytes,
@@ -725,8 +782,8 @@ async function serverPersistentValidationArm(spec: ChildSpec): Promise<LabMeasur
 				...latencyCounters(latencies),
 			},
 		});
-		validation.destroy();
-		live.destroy();
+		crdtEngine.destroyDocument(validation);
+		crdtEngine.destroyDocument(live);
 		return result;
 	} finally {
 		closeStore(fixture);
@@ -739,6 +796,9 @@ function socketAdmissionArm(spec: ChildSpec): LabMeasurement {
 	const live = new Y.Doc({ guid: manifest.bodyId });
 	const base = new Uint8Array(readFileSync(join(spec.traceDirectory, "base.update")));
 	Y.applyUpdate(live, base, "socket-base");
+	const productionDoc = spec.arm === "socket-admission-current"
+		? crdtEngine.openDocument(manifest.bodyId, base)
+		: null;
 	let validationMirror: Y.Doc | null = null;
 	if (spec.arm === "socket-validation-mirror") {
 		validationMirror = new Y.Doc({ guid: `${manifest.bodyId}-validation` });
@@ -755,12 +815,12 @@ function socketAdmissionArm(spec: ChildSpec): LabMeasurement {
 		if (frames >= frameLimit) break;
 		const started = performance.now();
 		if (spec.arm === "socket-admission-current") {
-			const error = bodyUpdateAdmissionError(live, update);
+			const error = bodyUpdateAdmissionError(productionDoc!, update, crdtEngine);
 			if (error) throw new Error(`production socket admission rejected frame ${frames}: ${error}`);
-			Y.applyUpdate(live, update, "socket-current");
+			crdtEngine.applyUpdate(productionDoc!, update, "socket-current");
 		} else if (spec.arm === "socket-validation-mirror") {
 			Y.applyUpdate(validationMirror!, update, "socket-validation-mirror");
-			const semanticError = validateFrontmatterSemanticRoots(validationMirror!);
+			const semanticError = validateYjsFrontmatterSemanticRoots(validationMirror!);
 			if (semanticError) throw new Error(`validation mirror rejected frame ${frames}: ${semanticError}`);
 			const contentBytes = canonicalMarkdownBytes(validationMirror!.getText("body").toString());
 			if (contentBytes.byteLength > MAX_CLIENT_MARKDOWN_BYTES) throw new Error("validation mirror crossed Markdown limit");
@@ -774,9 +834,14 @@ function socketAdmissionArm(spec: ChildSpec): LabMeasurement {
 		frames++;
 		if (frames % sampleEvery === 0) tracker.mark(`socket-frame-${frames}`);
 	}
-	const text = live.getText("body").toString();
-	const encodedBytes = Y.encodeStateAsUpdate(live).byteLength;
-	const finalCensus = census(live);
+	const encodedState = productionDoc
+		? crdtEngine.encodeStateAsUpdate(productionDoc)
+		: Y.encodeStateAsUpdate(live);
+	const text = productionDoc ? crdtEngine.readText(productionDoc, "body") : live.getText("body").toString();
+	const encodedBytes = encodedState.byteLength;
+	const censusDoc = productionDoc ? new Y.Doc({ guid: manifest.bodyId }) : live;
+	if (productionDoc) Y.applyUpdate(censusDoc, encodedState, "socket-census");
+	const finalCensus = census(censusDoc);
 	const result = tracker.finish({
 		textSha256: sha256(text),
 		textCodeUnits: text.length,
@@ -791,6 +856,10 @@ function socketAdmissionArm(spec: ChildSpec): LabMeasurement {
 		},
 	});
 	live.destroy();
+	if (productionDoc) {
+		censusDoc.destroy();
+		crdtEngine.destroyDocument(productionDoc);
+	}
 	validationMirror?.destroy();
 	return result;
 }
@@ -821,6 +890,7 @@ async function productionSocketMirrorArm(spec: ChildSpec): Promise<LabMeasuremen
 		};
 		let scheduledFlushes = 0;
 		const service = new VaultSocketService({
+			crdtEngine,
 			sockets: {
 				sockets: () => [socket],
 				createPair: () => { throw new Error("socket pair is outside the admission arm"); },
@@ -865,14 +935,14 @@ async function productionSocketMirrorArm(spec: ChildSpec): Promise<LabMeasuremen
 		}
 		const validation = cache.get(manifest.bodyId)?.validationDoc;
 		if (!validation) throw new Error("production validation mirror was evicted");
-		const text = validation.getText("body").toString();
+		const text = crdtEngine.readText(validation, "body");
 		if (frames !== manifest.updates.frames || sha256(text) !== manifest.final.textSha256) {
 			throw new Error("production validation mirror diverged from the complete frozen wire trace");
 		}
 		const measured = tracker.finish({
 			textSha256: sha256(text), textCodeUnits: text.length,
-			encodedStateBytes: Y.encodeStateAsUpdate(validation).byteLength,
-			census: census(validation),
+			encodedStateBytes: crdtEngine.encodeStateAsUpdate(validation).byteLength,
+			census: serverCensus(validation),
 			counters: { frames, frameLimit, traceFrames: manifest.updates.frames,
 				truncated: frames < manifest.updates.frames, scheduledFlushes,
 				pendingFrames: cache.pendingFor(manifest.bodyId).length, ...latencyCounters(latencies) },
@@ -908,7 +978,7 @@ function checkpointArm(spec: ChildSpec): LabMeasurement {
 		const commits = spec.fixturePath
 			? manifest.candidates.frames
 			: populateStoreFromCandidates(spec.traceDirectory, fixture);
-		let doc: Y.Doc | null = spec.arm === "checkpoint-live"
+		let doc: YwasmCrdtDocument | null = spec.arm === "checkpoint-live"
 			? fixture.store.reconstructDocument(manifest.bodyId).doc
 			: null;
 		const tracker = new MemoryTracker(spec.arm, spec.traceDirectory);
@@ -942,15 +1012,15 @@ function checkpointArm(spec: ChildSpec): LabMeasurement {
 		} else {
 			throw new Error(`unknown checkpoint arm ${spec.arm}`);
 		}
-		if (doc) verifyFinalDocument(spec.traceDirectory, doc);
+		if (doc) verifyFinalServerDocument(spec.traceDirectory, doc);
 		const result = tracker.finish({
 			textSha256: manifest.final.textSha256,
 			textCodeUnits: manifest.final.textCodeUnits,
 			encodedStateBytes: encodedBytes,
-			census: doc ? census(doc) : manifest.final.census,
+			census: doc ? serverCensus(doc) : manifest.final.census,
 			counters: { commits, checkpointChunks, checkpointRows, queries: fixture.queries.count },
 		});
-		doc?.destroy();
+		if (doc) crdtEngine.destroyDocument(doc);
 		return result;
 	} finally {
 		closeStore(fixture);
@@ -960,7 +1030,7 @@ function checkpointArm(spec: ChildSpec): LabMeasurement {
 function reconstructionArm(spec: ChildSpec): LabMeasurement {
 	const manifest = readTraceManifest(spec.traceDirectory);
 	const tracker = new MemoryTracker(spec.arm, spec.traceDirectory);
-	let doc: Y.Doc;
+	let doc: YwasmCrdtDocument;
 	let rowsRead = 0;
 	let commits = 0;
 	if (spec.arm === "reconstruct-current") {
@@ -976,25 +1046,25 @@ function reconstructionArm(spec: ChildSpec): LabMeasurement {
 			closeStore(fixture);
 		}
 	} else if (spec.arm === "reconstruct-self-contained") {
-		doc = new Y.Doc({ guid: manifest.bodyId });
-		Y.applyUpdate(doc, new Uint8Array(readFileSync(join(spec.traceDirectory, "base.update"))), "self-contained-base");
+		doc = crdtEngine.createDocument(manifest.bodyId);
+		crdtEngine.applyUpdate(doc, new Uint8Array(readFileSync(join(spec.traceDirectory, "base.update"))), "self-contained-base");
 		for (const update of readFrozenFrames(join(spec.traceDirectory, "candidates.bin"))) {
-			Y.applyUpdate(doc, update, "self-contained-update");
+			crdtEngine.applyUpdate(doc, update, "self-contained-update");
 			commits++;
 		}
 		tracker.mark("reconstruct-self-contained-loaded");
 	} else {
 		throw new Error(`unknown reconstruction arm ${spec.arm}`);
 	}
-	const final = verifyFinalDocument(spec.traceDirectory, doc);
+	const final = verifyFinalServerDocument(spec.traceDirectory, doc);
 	const result = tracker.finish({
 		textSha256: sha256(final.text),
 		textCodeUnits: final.text.length,
 		encodedStateBytes: final.encodedBytes,
-		census: census(doc),
+		census: serverCensus(doc),
 		counters: { commits, rowsRead },
 	});
-	doc.destroy();
+	crdtEngine.destroyDocument(doc);
 	return result;
 }
 
@@ -1034,14 +1104,12 @@ function pinRetentionArm(spec: ChildSpec): LabMeasurement {
 		tracker.mark("pin-retention-measured");
 		for (const pinId of pinIds) fixture.store.releasePin(pinId);
 		const latest = fixture.store.reconstructDocument(manifest.bodyId);
-		const before = Y.encodeStateVector(latest.doc);
-		latest.doc.transact(() => {
-			const body = latest.doc.getText("body");
-			body.insert(body.length, "x");
-			body.delete(body.length - 1, 1);
-		});
-		const pruningUpdate = Y.encodeStateAsUpdate(latest.doc, before);
-		latest.doc.destroy();
+		const before = crdtEngine.encodeStateVector(latest.doc);
+		const bodyLength = crdtEngine.readText(latest.doc, "body").length;
+		crdtEngine.insertText(latest.doc, "body", bodyLength, "x", "pin-pruning-insert");
+		crdtEngine.deleteText(latest.doc, "body", bodyLength, 1, "pin-pruning-delete");
+		const pruningUpdate = crdtEngine.encodeStateAsUpdate(latest.doc, before);
+		crdtEngine.destroyDocument(latest.doc);
 		fixture.store.commitUpdate({ documentId: manifest.bodyId, update: pruningUpdate, kind: "body" });
 		fixture.store.writeCheckpoint(manifest.bodyId);
 		const withoutPins = storageStats();
@@ -1122,22 +1190,25 @@ async function productionRootSemanticResetArm(spec: ChildSpec): Promise<LabMeasu
 		seedStore(spec.traceDirectory, fixture);
 		const manifest = readTraceManifest(spec.traceDirectory);
 		const root = fixture.store.reconstructDocument("root").doc;
-		const before = Y.encodeStateVector(root);
-		const paths = root.getMap<string>("pathToId");
+		const before = crdtEngine.encodeStateVector(root);
 		const currentPaths = Array.from({ length: manifest.profile.activeRootEntries }, (_, index) => `note-${index}.md`);
-		root.transact(() => {
-			for (let index = 0; index < currentPaths.length; index++) paths.set(currentPaths[index]!, `root-body-${index}`);
-			for (let operation = 0; operation < manifest.profile.rootOperations; operation++) {
-				const body = operation % currentPaths.length;
-				paths.delete(currentPaths[body]!);
-				const nextPath = `note-${body}-${Math.floor(operation / currentPaths.length) + 1}.md`;
-				paths.set(nextPath, `root-body-${body}`);
-				currentPaths[body] = nextPath;
-			}
-			root.getMap("unknown-root-history").set("discard-me", true);
-			root.getMap("__yaosLifecycle").set("retired-lifecycle-marker", true);
-			root.getMap("__yaosLifecyclePublicationProof").set("retired-publication-proof", true);
-		}, "production-root-pathology");
+		const rootOperations: CrdtRootOperation[] = [];
+		for (let index = 0; index < currentPaths.length; index++) {
+			rootOperations.push({ kind: "map-set", root: "pathToId", key: currentPaths[index]!, value: mapValue(`root-body-${index}`) });
+		}
+		for (let operation = 0; operation < manifest.profile.rootOperations; operation++) {
+			const body = operation % currentPaths.length;
+			rootOperations.push({ kind: "map-delete", root: "pathToId", key: currentPaths[body]! });
+			const nextPath = `note-${body}-${Math.floor(operation / currentPaths.length) + 1}.md`;
+			rootOperations.push({ kind: "map-set", root: "pathToId", key: nextPath, value: mapValue(`root-body-${body}`) });
+			currentPaths[body] = nextPath;
+		}
+		rootOperations.push(
+			{ kind: "map-set", root: "unknown-root-history", key: "discard-me", value: mapValue(true) },
+			{ kind: "map-set", root: "__yaosLifecycle", key: "retired-lifecycle-marker", value: mapValue(true) },
+			{ kind: "map-set", root: "__yaosLifecyclePublicationProof", key: "retired-publication-proof", value: mapValue(true) },
+		);
+		crdtEngine.applyRootOperations(root, rootOperations, "production-root-pathology");
 		for (let index = 0; index < currentPaths.length; index++) {
 			const bodyId = `root-body-${index}`;
 			const body = new Y.Doc({ guid: bodyId });
@@ -1147,7 +1218,7 @@ async function productionRootSemanticResetArm(spec: ChildSpec): Promise<LabMeasu
 		}
 		fixture.store.commitUpdate({
 			documentId: "root",
-			update: Y.encodeStateAsUpdate(root, before),
+			update: crdtEngine.encodeStateAsUpdate(root, before),
 			kind: "root",
 			// Production root compaction deliberately ignores resident Yjs maps and
 			// rebuilds from SQL catalog authority. Seed both sides of that contract:
@@ -1162,7 +1233,7 @@ async function productionRootSemanticResetArm(spec: ChildSpec): Promise<LabMeasu
 				bodyGeneration: 1,
 			})),
 		});
-		root.destroy();
+		crdtEngine.destroyDocument(root);
 
 		const canvasId = "root-authority-canvas";
 		const canvasPath = "Authority.canvas";
@@ -1175,13 +1246,13 @@ async function productionRootSemanticResetArm(spec: ChildSpec): Promise<LabMeasu
 		});
 		canvas.destroy();
 		const canvasRoot = fixture.store.reconstructDocument("root");
-		const canvasRootVector = Y.encodeStateVector(canvasRoot.doc);
-		canvasRoot.doc.getMap("pathToSemantic").set(canvasPath, {
-			documentId: canvasId, kind: "canvas", format: "json-canvas", formatVersion: 1,
-		});
+		const canvasRootVector = crdtEngine.encodeStateVector(canvasRoot.doc);
+		crdtEngine.applyRootOperations(canvasRoot.doc, [{ kind: "map-set", root: "pathToSemantic", key: canvasPath,
+			value: mapValue({ documentId: canvasId, kind: "canvas", format: "json-canvas", formatVersion: 1 }) }],
+		"pathology-canvas-root");
 		fixture.store.commitUpdate({
 			documentId: "root",
-			update: Y.encodeStateAsUpdate(canvasRoot.doc, canvasRootVector),
+			update: crdtEngine.encodeStateAsUpdate(canvasRoot.doc, canvasRootVector),
 			kind: "semantic-create",
 			semanticCatalog: {
 				documentId: canvasId, fileId: canvasId, kind: "canvas", format: "json-canvas",
@@ -1189,25 +1260,24 @@ async function productionRootSemanticResetArm(spec: ChildSpec): Promise<LabMeasu
 				documentGeneration: canvasCommit.generation, contentHash: "c".repeat(64), size: 17,
 			},
 		});
-		canvasRoot.doc.destroy();
+		crdtEngine.destroyDocument(canvasRoot.doc);
 
 		const attachmentHash = "a".repeat(64);
 		const tombstoneHash = "b".repeat(64);
 		const attachmentOperationId = "root-authority-attachment-operation";
 		const attachmentRoot = fixture.store.reconstructDocument("root");
-		const attachmentRootVector = Y.encodeStateVector(attachmentRoot.doc);
-		attachmentRoot.doc.getMap("pathToBlob").set("authority.bin", {
-			hash: attachmentHash, size: 4, revision: attachmentOperationId,
-		});
-		attachmentRoot.doc.getMap("blobMeta").set(attachmentHash, {
-			size: 4, mime: "application/octet-stream", createdAt: 700,
-		});
-		attachmentRoot.doc.getMap("blobTombstones").set("retired.bin", {
-			deletedAt: 700, previousHash: tombstoneHash, revision: attachmentOperationId,
-		});
+		const attachmentRootVector = crdtEngine.encodeStateVector(attachmentRoot.doc);
+		crdtEngine.applyRootOperations(attachmentRoot.doc, [
+			{ kind: "map-set", root: "pathToBlob", key: "authority.bin",
+				value: mapValue({ hash: attachmentHash, size: 4, revision: attachmentOperationId }) },
+			{ kind: "map-set", root: "blobMeta", key: attachmentHash,
+				value: mapValue({ size: 4, mime: "application/octet-stream", createdAt: 700 }) },
+			{ kind: "map-set", root: "blobTombstones", key: "retired.bin",
+				value: mapValue({ deletedAt: 700, previousHash: tombstoneHash, revision: attachmentOperationId }) },
+		], "pathology-attachment-root");
 		const attachmentHead = fixture.store.documentHead("root")!;
 		fixture.store.commitRootAttachments(
-			Y.encodeStateAsUpdate(attachmentRoot.doc, attachmentRootVector),
+			crdtEngine.encodeStateAsUpdate(attachmentRoot.doc, attachmentRootVector),
 			[
 				{ operationId: attachmentOperationId, path: "authority.bin", contentHash: attachmentHash,
 					size: 4, mime: "application/octet-stream", lifecycle: "active" },
@@ -1218,7 +1288,7 @@ async function productionRootSemanticResetArm(spec: ChildSpec): Promise<LabMeasu
 			attachmentHead,
 			700,
 		);
-		attachmentRoot.doc.destroy();
+		crdtEngine.destroyDocument(attachmentRoot.doc);
 
 		const seedLifecycle = (suffix: string, publish: boolean) => {
 			const bodyId = `root-proof-body-${suffix}`;
@@ -1231,11 +1301,13 @@ async function productionRootSemanticResetArm(spec: ChildSpec): Promise<LabMeasu
 			});
 			body.destroy();
 			const lifecycleRoot = fixture.store.reconstructDocument("root");
-			const lifecycleVector = Y.encodeStateVector(lifecycleRoot.doc);
-			lifecycleRoot.doc.getMap("pathToId").set(path, bodyId);
-			lifecycleRoot.doc.getMap("__yaosLifecycle").set(operationId, true);
+			const lifecycleVector = crdtEngine.encodeStateVector(lifecycleRoot.doc);
+			crdtEngine.applyRootOperations(lifecycleRoot.doc, [
+				{ kind: "map-set", root: "pathToId", key: path, value: mapValue(bodyId) },
+				{ kind: "map-set", root: "__yaosLifecycle", key: operationId, value: mapValue(true) },
+			], "pathology-lifecycle-root");
 			const lifecycleCommit = fixture.store.commitRootLifecycle({
-				rootUpdate: Y.encodeStateAsUpdate(lifecycleRoot.doc, lifecycleVector),
+				rootUpdate: crdtEngine.encodeStateAsUpdate(lifecycleRoot.doc, lifecycleVector),
 				kind: "rename",
 				catalog: { bodyId, fileId: bodyId, path, previousPath: `old-${suffix}.md`,
 					lifecycle: "active", bodyGeneration: bodyCommit.generation },
@@ -1245,19 +1317,21 @@ async function productionRootSemanticResetArm(spec: ChildSpec): Promise<LabMeasu
 					resultLifecycle: "active", durableGeneration: bodyCommit.generation,
 					vaultGeneration: VAULT_GENERATION, runtimeEpoch: "pathology-root-runtime" },
 			});
-			lifecycleRoot.doc.destroy();
+			crdtEngine.destroyDocument(lifecycleRoot.doc);
 			if (publish) {
 				const proofRoot = fixture.store.reconstructDocument("root");
-				const proofVector = Y.encodeStateVector(proofRoot.doc);
-				proofRoot.doc.getMap("__yaosLifecyclePublicationProof").set(operationId, true);
+				const proofVector = crdtEngine.encodeStateVector(proofRoot.doc);
+				crdtEngine.applyRootOperations(proofRoot.doc, [{ kind: "map-set",
+					root: "__yaosLifecyclePublicationProof", key: operationId, value: mapValue(true) }],
+				"pathology-publication-proof");
 				fixture.store.commitUpdate({
 					documentId: "root", kind: "root",
-					update: Y.encodeStateAsUpdate(proofRoot.doc, proofVector),
+					update: crdtEngine.encodeStateAsUpdate(proofRoot.doc, proofVector),
 					rootPublications: [{ operationId, lifecycleSequence: lifecycleCommit.vaultSequence,
 						rootEpoch: lifecycleCommit.semanticEpoch, vaultGeneration: VAULT_GENERATION,
 						runtimeEpoch: "pathology-root-runtime" }],
 				});
-				proofRoot.doc.destroy();
+				crdtEngine.destroyDocument(proofRoot.doc);
 			}
 			return { bodyId, operationId, path, lifecycleSequence: lifecycleCommit.vaultSequence };
 		};
@@ -1265,7 +1339,7 @@ async function productionRootSemanticResetArm(spec: ChildSpec): Promise<LabMeasu
 		const publishedProof = seedLifecycle("published", true);
 		const cache = new VaultDocumentCache(fixture.store, () => new Set(), () => new Set());
 		const loaded = cache.load("root", false, () => true, "root");
-		const history = census(loaded.doc);
+		const history = serverCensus(loaded.doc);
 		const tracker = new MemoryTracker(spec.arm, spec.traceDirectory);
 		tracker.mark("production-root-history-loaded", true);
 		const forceCompaction: Readonly<SemanticCompactionThresholds> = {
@@ -1288,36 +1362,45 @@ async function productionRootSemanticResetArm(spec: ChildSpec): Promise<LabMeasu
 		if (outcome.status !== "compacted") throw new Error(`production root compaction did not run: ${outcome.status}`);
 		tracker.mark("production-root-semantic-reset", true);
 		const fresh = cache.get("root")!;
-		const assertFreshAuthority = (document: Y.Doc) => {
+		const assertFreshAuthority = (document: YwasmCrdtDocument) => {
+			const pathToId = snapshotRootMap(document, "pathToId");
 			for (let index = 0; index < currentPaths.length; index++) {
-				if (document.getMap<string>("pathToId").get(currentPaths[index]!) !== `root-body-${index}`) {
+				if (pathToId.get(currentPaths[index]!) !== `root-body-${index}`) {
 					throw new Error(`production root reset lost catalog entry ${index}`);
 				}
 			}
 			for (const proof of [unpublishedProof, publishedProof]) {
-				if (document.getMap<string>("pathToId").get(proof.path) !== proof.bodyId) {
+				if (pathToId.get(proof.path) !== proof.bodyId) {
 					throw new Error(`production root reset lost lifecycle authority ${proof.operationId}`);
 				}
 			}
-			const semantic = document.getMap<{ documentId: string; kind: string; format: string; formatVersion: number }>("pathToSemantic").get(canvasPath);
+			const semantic = snapshotRootMap(document, "pathToSemantic").get(canvasPath) as
+				| { documentId?: unknown; kind?: unknown; format?: unknown; formatVersion?: unknown }
+				| undefined;
 			if (semantic?.documentId !== canvasId || semantic.kind !== "canvas"
 				|| semantic.format !== "json-canvas" || semantic.formatVersion !== 1) {
 				throw new Error("production root reset lost Canvas SQL authority");
 			}
-			const blob = document.getMap<{ hash: string; size: number; revision: string }>("pathToBlob").get("authority.bin");
+			const blob = snapshotRootMap(document, "pathToBlob").get("authority.bin") as
+				| { hash?: unknown; size?: unknown; revision?: unknown }
+				| undefined;
 			if (blob?.hash !== attachmentHash || blob.size !== 4 || blob.revision !== attachmentOperationId) {
 				throw new Error("production root reset lost active attachment authority");
 			}
-			const tombstone = document.getMap<{ deletedAt: number; previousHash: string | null; revision: string }>("blobTombstones").get("retired.bin");
+			const tombstone = snapshotRootMap(document, "blobTombstones").get("retired.bin") as
+				| { deletedAt?: unknown; previousHash?: unknown; revision?: unknown }
+				| undefined;
 			if (tombstone?.deletedAt !== 700 || tombstone.previousHash !== tombstoneHash
 				|| tombstone.revision !== attachmentOperationId) {
 				throw new Error("production root reset lost attachment tombstone authority");
 			}
-			const metadata = document.getMap<{ size: number; mime: string; createdAt: number }>("blobMeta").get(attachmentHash);
+			const metadata = snapshotRootMap(document, "blobMeta").get(attachmentHash) as
+				| { size?: unknown; mime?: unknown; createdAt?: unknown }
+				| undefined;
 			if (metadata?.size !== 4 || metadata.mime !== "application/octet-stream" || metadata.createdAt !== 700) {
 				throw new Error("production root reset lost blob metadata authority");
 			}
-			const roots = [...document.share.keys()].sort();
+			const roots = crdtEngine.snapshotRoots(document).map((root) => root.name).sort();
 			if (JSON.stringify(roots) !== JSON.stringify([...ROOT_SEMANTIC_ROOTS].sort())) {
 				throw new Error(`production root reset retained non-authoritative maps: ${roots.join(",")}`);
 			}
@@ -1333,14 +1416,17 @@ async function productionRootSemanticResetArm(spec: ChildSpec): Promise<LabMeasu
 		}
 		const recovered = fixture.store.reconstructDocument("root");
 		assertFreshAuthority(recovered.doc);
-		const durableEquivalent = sha256(Y.encodeStateAsUpdate(recovered.doc)) === sha256(Y.encodeStateAsUpdate(fresh.doc));
-		recovered.doc.destroy();
+		// Equivalent CRDT state need not have a byte-identical encoding when the
+		// reconstruction path merges chunks in a different legal order. Compare the
+		// detached, type-preserving root snapshot instead of an artifact hash.
+		const durableEquivalent = canonicalRootState(recovered.doc) === canonicalRootState(fresh.doc);
+		crdtEngine.destroyDocument(recovered.doc);
 		if (!durableEquivalent) throw new Error("production root reset durable reconstruction diverged");
-		const finalCensus = census(fresh.doc);
+		const finalCensus = serverCensus(fresh.doc);
 		const result = tracker.finish({
-			encodedStateBytes: Y.encodeStateAsUpdate(fresh.doc).byteLength,
+			encodedStateBytes: crdtEngine.encodeStateAsUpdate(fresh.doc).byteLength,
 			census: finalCensus,
-			counters: { activeEntries: fresh.doc.getMap("pathToId").size,
+			counters: { activeEntries: snapshotRootMap(fresh.doc, "pathToId").size,
 				rootOperations: manifest.profile.rootOperations, historyStructs: history.structs,
 				structsRemoved: history.structs - finalCensus.structs,
 				previousEpoch: outcome.result.previousSemanticEpoch,
@@ -1349,7 +1435,10 @@ async function productionRootSemanticResetArm(spec: ChildSpec): Promise<LabMeasu
 				sqlTombstonePreserved: true, markerMapsRemoved: true, proofsMigrated: 2,
 				durableRootEquivalent: durableEquivalent },
 		});
-		const semanticEntries = ROOT_SEMANTIC_ROOTS.reduce((count, name) => count + fresh.doc.getMap(name).size, 0);
+		const semanticEntries = ROOT_SEMANTIC_ROOTS.reduce(
+			(count, name) => count + snapshotRootMap(fresh.doc, name).size,
+			0,
+		);
 		const structCeiling = semanticEntries + 8;
 		const elapsedMsCeiling = 10_000;
 		const structCeilingPassed = finalCensus.structs <= structCeiling;

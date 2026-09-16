@@ -1,4 +1,6 @@
-import * as Y from "yjs";
+import type { CrdtRootOperation, CrdtRootSnapshot, CrdtValueSnapshot } from "./crdt/crdtEngine";
+import { mapValue, snapshotRootMap } from "./crdt/rootSchema";
+import { ywasmCrdtEngine as crdtEngine } from "@yaos/crdt-engine";
 import { MAX_BLOB_UPLOAD_BYTES, MAX_CATCH_UP_BODIES, MAX_JSON_BYTES, type LifecycleRequest, type LifecycleReceipt, type RootPublicationReceipt } from "./contracts";
 import { canonicalJsonText } from "./recoveryCanonicalJson";
 import { readBoundedBytes } from "./readBoundedBytes";
@@ -42,6 +44,22 @@ type AttachmentTombstone = {
 	previousHash: string | null;
 	revision: string;
 };
+
+function canonicalSnapshotValue(value: CrdtValueSnapshot): unknown {
+	if (value.shared === "value") return value.value;
+	if (value.shared === "text") return { shared: "text", value: value.value };
+	if (value.shared === "array") return { shared: "array", values: value.values.map(canonicalSnapshotValue) };
+	return { shared: "map", entries: [...value.entries]
+		.sort(([left], [right]) => left.localeCompare(right))
+		.map(([key, nested]) => [key, canonicalSnapshotValue(nested)]) };
+}
+
+function canonicalRootState(doc: Parameters<typeof crdtEngine.snapshotRoots>[0]): string {
+	const roots: CrdtRootSnapshot[] = crdtEngine.snapshotRoots(doc)
+		.filter((root) => root.name !== "__yaosLifecyclePublicationProof")
+		.slice().sort((left, right) => left.name.localeCompare(right.name));
+	return canonicalJsonText(jsonValue(roots.map((root) => [root.name, canonicalSnapshotValue(root.value)])));
+}
 
 function json(value: unknown, status = 200): Response {
 	return Response.json(value, { status, headers: { "cache-control": "no-store" } });
@@ -112,7 +130,6 @@ interface LifecycleServiceOptions {
 	hasBlob(hash: string): Promise<boolean>;
 	flush: (documentId: string) => Promise<boolean>;
 	validateActor: (actor: VaultActorContext) => boolean;
-	onDocumentCommitted?: (documentId: string, ingressBytes: number) => void;
 }
 
 interface BodyMetadata {
@@ -138,6 +155,54 @@ export class VaultLifecycleService {
 		try { decoded = await boundedJson(request); }
 		catch (error) { return json({ error: error instanceof Error ? error.message : "invalid_json" }, 400); }
 		const input = parseLifecycleRequest(decoded);
+		return this.handleInput(input, actor);
+	}
+
+	async handleCreateAdmissionsBatch(request: Request, actor: VaultActorContext): Promise<Response> {
+		let decoded: unknown;
+		try { decoded = await boundedJson(request); }
+		catch { return json({ error: "invalid_json" }, 400); }
+		if (typeof decoded !== "object" || decoded === null || Array.isArray(decoded)
+			|| !("operations" in decoded) || !Array.isArray(decoded.operations)
+			|| decoded.operations.length === 0 || decoded.operations.length > MAX_CATCH_UP_BODIES) {
+			return json({ error: "invalid_create_admission_batch" }, 400);
+		}
+		const operations: LifecycleRequest[] = [];
+		const operationIds = new Set<string>();
+		const bodyIds = new Set<string>();
+		const paths = new Set<string>();
+		const candidateIds = new Set<string>();
+		for (const candidate of decoded.operations) {
+			const operation = parseLifecycleRequest(candidate);
+			if (!operation || operation.kind !== "create" || operation.bodyId !== operation.fileId
+				|| !validIdentity(operation.candidateId)
+				|| typeof operation.candidateDigest !== "string"
+				|| !/^[a-f0-9]{64}$/.test(operation.candidateDigest.toLowerCase())
+				|| typeof operation.path !== "string" || safeMarkdownPath(operation.path) !== operation.path
+				|| operationIds.has(operation.operationId) || bodyIds.has(operation.bodyId)
+				|| paths.has(operation.path) || candidateIds.has(operation.candidateId)) {
+				return json({ error: "invalid_create_admission_batch_item" }, 400);
+			}
+			operations.push(operation);
+			operationIds.add(operation.operationId);
+			bodyIds.add(operation.bodyId);
+			paths.add(operation.path);
+			candidateIds.add(operation.candidateId);
+		}
+		const receipts: LifecycleReceipt[] = [];
+		for (const operation of operations) {
+			const response = await this.handleInput(operation, actor);
+			if (response.status !== 200) return response;
+			receipts.push(await response.json());
+		}
+		return json({
+			receipts,
+			vaultSequence: Math.max(...receipts.map((receipt) => receipt.vaultSequence)),
+			runtimeEpoch: this.options.runtimeEpoch,
+		});
+	}
+
+	private async handleInput(input: LifecycleRequest | null, actor: VaultActorContext): Promise<Response> {
 		if (!input || input.bodyId !== input.fileId) {
 			return json({ error: "invalid_lifecycle_request" }, 400);
 		}
@@ -365,10 +430,10 @@ export class VaultLifecycleService {
 				throw error;
 			}
 			try {
-				const vector = Y.encodeStateVector(current.doc);
-				const refs = current.doc.getMap<{ hash: string; size: number; revision: string }>("pathToBlob");
-				const metadata = current.doc.getMap<{ size: number; mime: string; createdAt: number }>("blobMeta");
-				const tombstones = current.doc.getMap<AttachmentTombstone>("blobTombstones");
+				const vector = crdtEngine.encodeStateVector(current.doc);
+				const refs = new Map(snapshotRootMap(current.doc, "pathToBlob")) as Map<string, { hash: string; size: number; revision: string }>;
+				const metadata = new Map(snapshotRootMap(current.doc, "blobMeta")) as Map<string, { size: number; mime: string; createdAt: number }>;
+				const tombstones = new Map(snapshotRootMap(current.doc, "blobTombstones")) as Map<string, AttachmentTombstone>;
 				const affected = mutation.kind === "rename" ? [mutation.fromPath, mutation.toPath] : [mutation.path];
 				for (const path of affected) {
 					const sql = this.options.store.attachmentHead(path);
@@ -400,10 +465,18 @@ export class VaultLifecycleService {
 					}
 				}
 				const events: Array<Omit<AttachmentCatalogEvent, "sequence"> & { operationId: string }> = [];
+				const operations: CrdtRootOperation[] = [];
 				if (mutation.kind === "upsert") {
 					refs.set(mutation.path, { hash: mutation.hash, size: mutation.size, revision: mutation.operationId });
-					if (!metadata.has(mutation.hash)) metadata.set(mutation.hash, { size: mutation.size, mime: mutation.mime, createdAt: Date.now() });
+					operations.push({ kind: "map-set", root: "pathToBlob", key: mutation.path,
+						value: mapValue(refs.get(mutation.path)) });
+					if (!metadata.has(mutation.hash)) {
+						metadata.set(mutation.hash, { size: mutation.size, mime: mutation.mime, createdAt: Date.now() });
+						operations.push({ kind: "map-set", root: "blobMeta", key: mutation.hash,
+							value: mapValue(metadata.get(mutation.hash)) });
+					}
 					tombstones.delete(mutation.path);
+					operations.push({ kind: "map-delete", root: "blobTombstones", key: mutation.path });
 					events.push({ operationId: mutation.operationId, path: mutation.path, contentHash: mutation.hash, size: mutation.size, mime: mutation.mime, lifecycle: "active" });
 				} else if (mutation.kind === "delete") {
 					const prior = refs.get(mutation.path);
@@ -411,6 +484,11 @@ export class VaultLifecycleService {
 					refs.delete(mutation.path);
 					tombstones.set(mutation.path, { deletedAt: Date.now(), device: request.headers.get("x-yaos-device-id") ?? undefined,
 						previousHash, revision: mutation.operationId });
+					operations.push(
+						{ kind: "map-delete", root: "pathToBlob", key: mutation.path },
+						{ kind: "map-set", root: "blobTombstones", key: mutation.path,
+							value: mapValue(tombstones.get(mutation.path)) },
+					);
 					events.push({ operationId: mutation.operationId, path: mutation.path, contentHash: previousHash, size: prior?.size ?? null, mime: null, lifecycle: "deleted" });
 				} else {
 					const prior = refs.get(mutation.fromPath)!;
@@ -419,12 +497,21 @@ export class VaultLifecycleService {
 					refs.set(mutation.toPath, { ...prior, revision: mutation.operationId });
 					tombstones.set(mutation.fromPath, { deletedAt: Date.now(), previousHash: prior.hash, revision: mutation.operationId });
 					tombstones.delete(mutation.toPath);
+					operations.push(
+						{ kind: "map-delete", root: "pathToBlob", key: mutation.fromPath },
+						{ kind: "map-set", root: "pathToBlob", key: mutation.toPath,
+							value: mapValue(refs.get(mutation.toPath)) },
+						{ kind: "map-set", root: "blobTombstones", key: mutation.fromPath,
+							value: mapValue(tombstones.get(mutation.fromPath)) },
+						{ kind: "map-delete", root: "blobTombstones", key: mutation.toPath },
+					);
 					events.push(
 						{ operationId: mutation.operationId, path: mutation.fromPath, contentHash: prior.hash, size: prior.size, mime: meta?.mime ?? null, lifecycle: "deleted" },
 						{ operationId: mutation.operationId, path: mutation.toPath, contentHash: prior.hash, size: prior.size, mime: meta?.mime ?? null, lifecycle: "active" },
 					);
 				}
-				const update = Y.encodeStateAsUpdate(current.doc, vector);
+				crdtEngine.applyRootOperations(current.doc, operations, `attachment-${mutation.kind}`);
+				const update = crdtEngine.encodeStateAsUpdate(current.doc, vector);
 				if (update.byteLength === 0 || update.byteLength > MAX_JSON_BYTES) return json({ error: "invalid_attachment_root_update" }, 400);
 				const commit = this.options.store.commitRootAttachments(update, events,
 					{ operationId: mutation.operationId, requestDigest, rootEpoch: mutation.rootEpoch }, rootHead,
@@ -433,7 +520,7 @@ export class VaultLifecycleService {
 				return this.attachmentReceipt(mutation.operationId, events, update, commit.vaultSequence,
 					commit.generation, commit.semanticEpoch);
 			} finally {
-				current.doc.destroy();
+				crdtEngine.destroyDocument(current.doc);
 				releaseTransient();
 			}
 		} finally {
@@ -520,10 +607,11 @@ export class VaultLifecycleService {
 		if (!this.options.validateActor(actor)) return json({ error: "authority_superseded" }, 409);
 		let bodyHead = this.options.store.documentHead(input.bodyId);
 		if (!bodyHead) {
-			const empty = new Y.Doc({ guid: input.bodyId });
-			const commit = this.options.store.commitUpdate({ documentId: input.bodyId, update: Y.encodeStateAsUpdate(empty), kind: "body",
+			const empty = crdtEngine.createDocument(input.bodyId);
+			const commit = this.options.store.commitUpdate({ documentId: input.bodyId,
+				update: crdtEngine.encodeStateAsUpdate(empty), kind: "body",
 				actorAttributions: [{ actor, operationId: input.operationId, requestDigest }] });
-			empty.destroy();
+			crdtEngine.destroyDocument(empty);
 			bodyHead = {
 				generation: commit.generation,
 				semanticEpoch: commit.semanticEpoch,
@@ -581,12 +669,14 @@ export class VaultLifecycleService {
 		try {
 			const root = this.options.store.reconstructDocument("root");
 			try {
-				const vector = Y.encodeStateVector(root.doc);
-				const markers = root.doc.getMap("__yaosLifecycle");
-				for (const input of inputs) markers.set(input.operationId, { kind: input.kind, fileId: input.fileId, bodyId: input.bodyId,
-					path: input.path ?? null, fromPath: input.fromPath ?? null, toPath: input.toPath ?? null });
-				return Y.encodeStateAsUpdate(root.doc, vector);
-			} finally { root.doc.destroy(); }
+				const vector = crdtEngine.encodeStateVector(root.doc);
+				crdtEngine.applyRootOperations(root.doc, inputs.map((input) => ({
+					kind: "map-set" as const, root: "__yaosLifecycle", key: input.operationId,
+					value: mapValue({ kind: input.kind, fileId: input.fileId, bodyId: input.bodyId,
+						path: input.path ?? null, fromPath: input.fromPath ?? null, toPath: input.toPath ?? null }),
+				})), "lifecycle-marker");
+				return crdtEngine.encodeStateAsUpdate(root.doc, vector);
+			} finally { crdtEngine.destroyDocument(root.doc); }
 		} finally { release(); }
 	}
 
@@ -610,13 +700,13 @@ export class VaultLifecycleService {
 			return this.attachmentReceipt(
 				operationId,
 				events,
-				Y.encodeStateAsUpdate(root.doc),
+				crdtEngine.encodeStateAsUpdate(root.doc),
 				operation.rootSequence,
 				operation.rootGeneration,
 				operation.rootEpoch,
 			);
 		} finally {
-			root.doc.destroy();
+			crdtEngine.destroyDocument(root.doc);
 			release();
 		}
 	}
@@ -662,8 +752,8 @@ export class VaultLifecycleService {
 		path: string,
 		current: AttachmentHeadSummary,
 		affected: string[],
-		refs: Y.Map<{ hash: string; size: number; revision: string }>,
-		tombstones: Y.Map<AttachmentTombstone>,
+		refs: ReadonlyMap<string, { hash: string; size: number; revision: string }>,
+		tombstones: ReadonlyMap<string, AttachmentTombstone>,
 	): Response {
 		return json({
 			error: "attachment_revision_mismatch",
@@ -681,9 +771,9 @@ export class VaultLifecycleService {
 	private attachmentHeadIsConsistent(
 		path: string,
 		sql: AttachmentCatalogEvent | null,
-		refs: Y.Map<{ hash: string; size: number; revision: string }>,
-		metadata: Y.Map<{ size: number; mime: string; createdAt: number }>,
-		tombstones: Y.Map<AttachmentTombstone>,
+		refs: ReadonlyMap<string, { hash: string; size: number; revision: string }>,
+		metadata: ReadonlyMap<string, { size: number; mime: string; createdAt: number }>,
+		tombstones: ReadonlyMap<string, AttachmentTombstone>,
 	): boolean {
 		const ref = refs.get(path);
 		const tombstone = tombstones.get(path);
@@ -792,8 +882,8 @@ export class VaultLifecycleService {
 
 	private attachmentHeadSummary(
 		path: string,
-		refs: Y.Map<{ hash: string; size: number; revision: string }>,
-		tombstones: Y.Map<AttachmentTombstone>,
+		refs: ReadonlyMap<string, { hash: string; size: number; revision: string }>,
+		tombstones: ReadonlyMap<string, AttachmentTombstone>,
 	): AttachmentHeadSummary {
 		const ref = refs.get(path);
 		if (ref) return { kind: "active", revision: ref.revision, hash: ref.hash, size: ref.size };
@@ -805,7 +895,6 @@ export class VaultLifecycleService {
 	private applyRoot(update: Uint8Array, generation: number, origin: unknown): void {
 		this.options.cache.applyDurableUpdate("root", update, generation, origin);
 		this.options.sockets().broadcastDocumentUpdate("root", update, origin);
-		this.options.onDocumentCommitted?.("root", update.byteLength);
 	}
 	private publicationMatches(update: Uint8Array, records: DurableLifecycleRecord[]): boolean {
 		const release = this.options.cache.reserveFullStateOperation("root", 4);
@@ -815,42 +904,29 @@ export class VaultLifecycleService {
 			release();
 			throw error;
 		}
-		const expected = new Y.Doc();
-		const actual = new Y.Doc();
+		const expected = crdtEngine.createDocument("root-publication-expected");
+		const actual = crdtEngine.createDocument("root-publication-actual");
 		try {
-			const baseline = Y.encodeStateAsUpdate(reconstructed.doc);
-			Y.applyUpdate(expected, baseline);
-			Y.applyUpdate(actual, baseline);
-			const expectedPaths = expected.getMap<string>("pathToId");
-			for (const record of records) if (record.sourcePath) expectedPaths.delete(record.sourcePath);
-			for (const record of records) if (record.resultLifecycle === "active") expectedPaths.set(record.resultPath, record.fileId);
-			Y.applyUpdate(actual, update);
-			const actualPaths = actual.getMap<string>("pathToId");
-			const expectedPathEntries = [...expectedPaths.entries()].sort(([left], [right]) => left.localeCompare(right));
-			const actualPathEntries = [...actualPaths.entries()].sort(([left], [right]) => left.localeCompare(right));
-			const keys = [...new Set([...expected.share.keys(), ...actual.share.keys()])].sort();
-			for (const key of keys) {
-				if (key === "__yaosLifecyclePublicationProof") continue;
-				if (key === "pathToId") {
-					if (canonicalJsonText(expectedPathEntries) !== canonicalJsonText(actualPathEntries)) return false;
-					continue;
-				}
-				const expectedType = expected.share.get(key);
-				const actualType = actual.share.get(key);
-				if (!expectedType || !actualType
-					|| canonicalJsonText(jsonValue(expectedType.toJSON()))
-						!== canonicalJsonText(jsonValue(actualType.toJSON()))) {
-					return false;
-				}
-			}
-			return true;
+			const baseline = crdtEngine.encodeStateAsUpdate(reconstructed.doc);
+			crdtEngine.applyUpdate(expected, baseline);
+			crdtEngine.applyUpdate(actual, baseline);
+			crdtEngine.applyRootOperations(expected, [
+				...records.filter((record) => record.sourcePath).map((record) => ({
+					kind: "map-delete" as const, root: "pathToId", key: record.sourcePath!,
+				})),
+				...records.filter((record) => record.resultLifecycle === "active").map((record) => ({
+					kind: "map-set" as const, root: "pathToId", key: record.resultPath, value: mapValue(record.fileId),
+				})),
+			], "publication-expected");
+			crdtEngine.applyUpdate(actual, update);
+			return canonicalRootState(expected) === canonicalRootState(actual);
 		} catch {
 			return false;
 		}
 		finally {
-			reconstructed.doc.destroy();
-			expected.destroy();
-			actual.destroy();
+			crdtEngine.destroyDocument(reconstructed.doc);
+			crdtEngine.destroyDocument(expected);
+			crdtEngine.destroyDocument(actual);
 			release();
 		}
 	}

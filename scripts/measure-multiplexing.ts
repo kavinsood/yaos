@@ -8,11 +8,13 @@ import * as Y from "yjs";
 import * as syncProtocol from "y-protocols/sync";
 import { PROTOCOL_VERSION, SCHEMA_VERSION } from "../src/sync/schema";
 import {
-	connectDocument,
-	createBody,
+	connectDocument as connectLiveDocument,
+	type ConnectedDocument,
 	vaultRoute,
 	waitFor,
 } from "../tests/live/schema4Live";
+import { ProductionImportSession, type ProductionImportRequestMeasurement } from "../tests/live/productionImport";
+import { MAX_CLIENT_MARKDOWN_BYTES } from "../server/src/shared/durableLimits";
 import type YSyncProvider from "y-partyserver/provider";
 import {
 	deviceBearerHeaders,
@@ -24,11 +26,17 @@ const host = requiredEnv("YAOS_MULTIPLEX_BENCH_HOST").replace(/\/+$/, "");
 const outputPath = process.env.YAOS_MULTIPLEX_BENCH_OUTPUT?.trim() || null;
 const accessTokenFile = process.env.YAOS_MULTIPLEX_ACCESS_TOKEN_FILE?.trim() || null;
 const accessToken = accessTokenFile ? readFileSync(accessTokenFile, "utf8").trim() : null;
-const accessClientId = process.env.CF_ACCESS_CLIENT_ID?.trim() || null;
-const accessClientSecret = process.env.CF_ACCESS_CLIENT_SECRET?.trim() || null;
+const accessClientId = process.env.YAOS_CF_ACCESS_CLIENT_ID?.trim()
+	|| process.env.CF_ACCESS_CLIENT_ID?.trim() || null;
+const accessClientSecret = process.env.YAOS_CF_ACCESS_CLIENT_SECRET?.trim()
+	|| process.env.CF_ACCESS_CLIENT_SECRET?.trim() || null;
 const deploymentVersion = process.env.YAOS_MULTIPLEX_BENCH_DEPLOYMENT_VERSION?.trim() || null;
 const bodyCount = Number(process.env.YAOS_CURRENTNESS_BENCH_BODY_COUNT ?? "100");
 const smallBodyBytes = 4 * 1024;
+const importBatchItems = 32;
+const importBatchBytes = 4 * 1024 * 1024;
+const runLargeNoteProbe = process.env.YAOS_MULTIPLEX_LARGE_NOTE_PROBE !== "0";
+const largeNoteOnly = process.env.YAOS_MULTIPLEX_LARGE_NOTE_ONLY === "1";
 const timeoutMs = 30_000;
 const currentnessWidths = [1, 2, 4, 7, 24, 100] as const;
 const catchUpWidths = [1, 7, 24, 100] as const;
@@ -43,7 +51,26 @@ if ((accessClientId === null) !== (accessClientSecret === null)) {
 interface BenchmarkContext {
 	readonly deviceA: LiveIdentity;
 	readonly deviceB: LiveIdentity;
+	readonly vaultGeneration: string;
 	readonly operatorCookie: string;
+}
+
+interface ImportBatchMeasurement {
+	readonly batch: number;
+	readonly notes: number;
+	readonly markdownBytes: number;
+	readonly wallMs: number;
+	readonly httpRequestCount: number;
+	readonly requests: readonly ProductionImportRequestMeasurement[];
+}
+
+interface ImportMeasurement {
+	readonly notes: number;
+	readonly markdownBytes: number;
+	readonly batchCount: number;
+	readonly httpRequestCount: number;
+	readonly wallMs: number;
+	readonly batches: readonly ImportBatchMeasurement[];
 }
 
 interface RawSocketMeasurement {
@@ -82,6 +109,16 @@ interface UnexpectedResponse extends Error {
 	readonly status: number;
 }
 
+interface CapabilityProbe {
+	readonly status: number;
+	readonly claimed: boolean | null;
+	readonly error: string | null;
+	readonly cfRay: string | null;
+	readonly redirected: boolean;
+	readonly responseOrigin: string;
+	readonly location: string | null;
+}
+
 class BenchmarkWebSocket extends WebSocket {
 	constructor(address: string | URL, protocols?: string | string[]) {
 		const headers: Record<string, string> = {};
@@ -92,6 +129,20 @@ class BenchmarkWebSocket extends WebSocket {
 		}
 		super(address, protocols, { headers });
 	}
+}
+
+function connectDocument(
+	identity: LiveIdentity,
+	kind: "root" | "body",
+	documentId: string,
+): Promise<ConnectedDocument> {
+	return connectLiveDocument(
+		identity,
+		kind,
+		documentId,
+		new Y.Doc({ guid: documentId }),
+		BenchmarkWebSocket as unknown as typeof globalThis.WebSocket,
+	);
 }
 
 function requiredEnv(name: string): string {
@@ -165,7 +216,35 @@ async function json(response: Response): Promise<Record<string, unknown> | null>
 		: null;
 }
 
-async function enroll(pairingCode: string, deviceName: string, vaultId: string): Promise<LiveIdentity> {
+async function capabilityProbe(label: string): Promise<CapabilityProbe> {
+	const url = new URL(`${host}/api/capabilities`);
+	url.searchParams.set("profileProbe", `${label}-${randomBytes(6).toString("hex")}`);
+	const response = await fetch(url, {
+		redirect: "manual",
+		headers: { "Cache-Control": "no-cache" },
+	});
+	const value = await json(response);
+	return {
+		status: response.status,
+		claimed: typeof value?.claimed === "boolean" ? value.claimed : null,
+		error: typeof value?.error === "string" ? value.error : null,
+		cfRay: response.headers.get("cf-ray"),
+		redirected: response.redirected,
+		responseOrigin: new URL(response.url).origin,
+		location: response.headers.get("location"),
+	};
+}
+
+function probeSummary(probes: readonly CapabilityProbe[]): string {
+	return JSON.stringify(probes.map(({ status, claimed, error, cfRay, redirected, responseOrigin, location }) => ({
+		status, claimed, error, cfRay, redirected, responseOrigin, location,
+	})));
+}
+
+async function enroll(pairingCode: string, deviceName: string, vaultId: string): Promise<{
+	identity: LiveIdentity;
+	vaultGeneration: string;
+}> {
 	const deviceId = randomBytes(16).toString("base64url");
 	const deviceToken = randomBytes(32).toString("base64url");
 	const response = await fetch(`${host}/enroll`, {
@@ -180,15 +259,18 @@ async function enroll(pairingCode: string, deviceName: string, vaultId: string):
 		}),
 	});
 	const value = await json(response);
-	if (!response.ok || value?.vaultId !== vaultId || value.deviceId !== deviceId || value.deviceToken !== deviceToken) {
+	if (!response.ok || value?.vaultId !== vaultId || value.deviceId !== deviceId || value.deviceToken !== deviceToken
+		|| typeof value.vaultGeneration !== "string" || value.vaultGeneration.length === 0) {
 		throw new Error(`enrollment failed (${response.status}): ${JSON.stringify(value)}`);
 	}
-	return { host, vaultId, deviceId, deviceToken };
+	return { identity: { host, vaultId, deviceId, deviceToken }, vaultGeneration: value.vaultGeneration };
 }
 
 async function provision(): Promise<BenchmarkContext> {
-	const capabilities = await fetch(`${host}/api/capabilities`).then(json);
-	if (capabilities?.claimed !== false) throw new Error("benchmark Worker must be fresh and unclaimed");
+	const beforeClaim = await capabilityProbe("before-claim");
+	if (beforeClaim.status !== 200 || beforeClaim.claimed !== false) {
+		throw new Error(`benchmark Worker must be fresh and unclaimed: ${probeSummary([beforeClaim])}`);
+	}
 	const operatorRecoveryKey = randomBytes(32).toString("base64url");
 	const claimResponse = await fetch(`${host}/claim`, {
 		method: "POST",
@@ -199,7 +281,16 @@ async function provision(): Promise<BenchmarkContext> {
 	if (!claimResponse.ok || typeof claim?.vaultId !== "string" || typeof claim.pairingCode !== "string") {
 		throw new Error(`claim failed (${claimResponse.status}): ${JSON.stringify(claim)}`);
 	}
-	const deviceA = await enroll(claim.pairingCode, "mux-bench-a", claim.vaultId);
+	// A deployed Worker can have several warm isolates. Probe concurrently so
+	// a stale pre-claim auth cache is diagnosed before it appears midway through
+	// publication as an intermittent application-level 503.
+	const claimVisibility = await Promise.all(Array.from({ length: 8 }, (_value, index) =>
+		capabilityProbe(`after-claim-${index}`)));
+	if (claimVisibility.some((probe) => probe.status !== 200 || probe.claimed !== true)) {
+		throw new Error(`claim is not visible across edge requests: ${probeSummary(claimVisibility)}`);
+	}
+	const enrolledA = await enroll(claim.pairingCode, "mux-bench-a", claim.vaultId);
+	const deviceA = enrolledA.identity;
 	const pairingResponse = await fetch(vaultRoute(deviceA, "auth/pairing-code"), {
 		method: "POST",
 		headers: deviceBearerHeaders(deviceA, { "Content-Type": "application/json" }),
@@ -209,7 +300,11 @@ async function provision(): Promise<BenchmarkContext> {
 	if (!pairingResponse.ok || typeof pairing?.pairingCode !== "string") {
 		throw new Error(`pairing failed (${pairingResponse.status}): ${JSON.stringify(pairing)}`);
 	}
-	const deviceB = await enroll(pairing.pairingCode, "mux-bench-b", claim.vaultId);
+	const enrolledB = await enroll(pairing.pairingCode, "mux-bench-b", claim.vaultId);
+	const deviceB = enrolledB.identity;
+	if (enrolledB.vaultGeneration !== enrolledA.vaultGeneration) {
+		throw new Error("enrolled devices disagree on vault generation");
+	}
 	const login = await fetch(`${host}/operator/login`, {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
@@ -217,14 +312,122 @@ async function provision(): Promise<BenchmarkContext> {
 	});
 	const cookie = login.headers.get("set-cookie")?.split(";", 1)[0];
 	if (!login.ok || !cookie) throw new Error(`operator login failed (${login.status})`);
-	return { deviceA, deviceB, operatorCookie: cookie };
+	return { deviceA, deviceB, vaultGeneration: enrolledA.vaultGeneration, operatorCookie: cookie };
 }
 
-async function seed(identity: LiveIdentity): Promise<void> {
-	for (let index = 0; index < bodyCount; index++) {
-		await createBody(identity, bodyId(index), `Multiplex/${String(index).padStart(2, "0")}.md`, bodyContent(index));
-		if ((index + 1) % 5 === 0) console.log(`Seeded ${index + 1}/${bodyCount} bodies`);
+function importBatches<T extends { content: string }>(inputs: readonly T[]): T[][] {
+	const encoder = new TextEncoder();
+	const batches: T[][] = [];
+	let batch: T[] = [];
+	let batchBytes = 0;
+	for (const input of inputs) {
+		const bytes = encoder.encode(input.content).byteLength;
+		if (batch.length > 0 && (batch.length === importBatchItems || batchBytes + bytes > importBatchBytes)) {
+			batches.push(batch);
+			batch = [];
+			batchBytes = 0;
+		}
+		batch.push(input);
+		batchBytes += bytes;
 	}
+	if (batch.length > 0) batches.push(batch);
+	return batches;
+}
+
+function assertFourRequestImport(requests: readonly ProductionImportRequestMeasurement[]): void {
+	const resources = requests.map((request) => request.pathname.replace(/^\/vault\/[^/]+\//, ""));
+	const expected = ["lifecycle/admissions", "body/candidates", "lifecycle/admissions", "lifecycle/publish"];
+	if (requests.length !== expected.length || resources.some((resource, index) => resource !== expected[index])) {
+		throw new Error(`production import made ${requests.length} requests: ${resources.join(", ")}`);
+	}
+}
+
+async function importThroughProductionPath(
+	context: BenchmarkContext,
+	inputs: ReadonlyArray<{ bodyId: string; path: string; content: string; candidateId: string; reason: string }>,
+): Promise<ImportMeasurement> {
+	const encoder = new TextEncoder();
+	const session = new ProductionImportSession(context.deviceA, context.vaultGeneration);
+	const batches = importBatches(inputs);
+	const measurements: ImportBatchMeasurement[] = [];
+	const startedAt = performance.now();
+	try {
+		for (let index = 0; index < batches.length; index++) {
+			const batch = batches[index]!;
+			const requestStart = session.requests.length;
+			const batchStartedAt = performance.now();
+			await session.commitFreshBodies(batch);
+			const requests = session.requests.slice(requestStart);
+			assertFourRequestImport(requests);
+			const measurement = {
+				batch: index + 1,
+				notes: batch.length,
+				markdownBytes: batch.reduce((sum, input) => sum + encoder.encode(input.content).byteLength, 0),
+				wallMs: rounded(elapsed(batchStartedAt)),
+				httpRequestCount: requests.length,
+				requests,
+			};
+			measurements.push(measurement);
+			console.log(`Imported batch ${index + 1}/${batches.length}: ${batch.length} notes, ${measurement.wallMs} ms, ${requests.length} requests`);
+		}
+		return {
+			notes: inputs.length,
+			markdownBytes: inputs.reduce((sum, input) => sum + encoder.encode(input.content).byteLength, 0),
+			batchCount: measurements.length,
+			httpRequestCount: measurements.reduce((sum, batch) => sum + batch.httpRequestCount, 0),
+			wallMs: rounded(elapsed(startedAt)),
+			batches: measurements,
+		};
+	} finally {
+		await session.destroy();
+	}
+}
+
+async function seed(context: BenchmarkContext): Promise<ImportMeasurement> {
+	return importThroughProductionPath(context, Array.from({ length: bodyCount }, (_value, index) => ({
+		bodyId: bodyId(index),
+		path: `Multiplex/${String(index).padStart(3, "0")}.md`,
+		content: bodyContent(index),
+		candidateId: `candidate-mux-${crypto.randomUUID()}`,
+		reason: "multiplex-profiler-import",
+	})));
+}
+
+async function probeLargeNote(context: BenchmarkContext): Promise<Record<string, unknown>> {
+	const prefix = "---\ntitle: 大きなノート 👩‍🚀\n---\n";
+	const prefixBytes = new TextEncoder().encode(prefix).byteLength;
+	const content = prefix + "x".repeat(MAX_CLIENT_MARKDOWN_BYTES - prefixBytes);
+	if (new TextEncoder().encode(content).byteLength !== MAX_CLIENT_MARKDOWN_BYTES) {
+		throw new Error("large-note probe fixture is not exactly the product limit");
+	}
+	const largeBodyId = "mux-large-note-5mib";
+	const imported = await importThroughProductionPath(context, [{
+		bodyId: largeBodyId,
+		path: "Multiplex/Large-5MiB.md",
+		content,
+		candidateId: `candidate-large-${crypto.randomUUID()}`,
+		reason: "multiplex-profiler-large-note",
+	}]);
+	const readStartedAt = performance.now();
+	const response = await fetch(vaultRoute(context.deviceB, `body/${encodeURIComponent(largeBodyId)}`), {
+		headers: deviceBearerHeaders(context.deviceB),
+	});
+	const encodedState = new Uint8Array(await response.arrayBuffer());
+	if (!response.ok) throw new Error(`5 MiB readback failed (${response.status})`);
+	const doc = new Y.Doc({ guid: largeBodyId });
+	try {
+		Y.applyUpdate(doc, encodedState);
+		if (doc.getText("body").toString() !== content) throw new Error("5 MiB readback content mismatch");
+	} finally {
+		doc.destroy();
+	}
+	return {
+		...imported,
+		logicalMarkdownBytes: MAX_CLIENT_MARKDOWN_BYTES,
+		readbackMs: rounded(elapsed(readStartedAt)),
+		readbackEncodedStateBytes: encodedState.byteLength,
+		verified: true,
+	};
 }
 
 function socketUrl(identity: LiveIdentity, body: string, ticket: string): string {
@@ -240,8 +443,8 @@ async function openRawBody(
 	identity: LiveIdentity,
 	body: string,
 	expectedContent: string,
-	ticket: string,
 ): Promise<OpenRawSocket> {
+	const ticket = (await fetchSocketTicket(identity, identity.vaultId, "body", body, 1)).ticket;
 	const startedAt = performance.now();
 	const doc = new Y.Doc({ guid: body });
 	const socket = new BenchmarkWebSocket(socketUrl(identity, body, ticket));
@@ -511,11 +714,14 @@ async function measureCatchUp(
 			headers: deviceBearerHeaders(identity, { "Content-Type": "application/json" }),
 			body: JSON.stringify({ bodies: bodyIds.map((bodyId) => ({
 				bodyId,
+				bodyEpoch: 1,
 				generation: current ? generations.get(bodyId) ?? 0 : 0,
 			})) }),
 		});
 		const bytes = await response.arrayBuffer();
-		if (!response.ok) throw new Error(`catch-up read failed (${response.status})`);
+		if (!response.ok) {
+			throw new Error(`catch-up read failed (${response.status}): ${new TextDecoder().decode(bytes)}`);
+		}
 		latencies.push(elapsed(startedAt));
 		sizes.push(bytes.byteLength);
 	}
@@ -531,21 +737,22 @@ async function catchUpRequest(
 	const response = await fetch(vaultRoute(identity, "catch-up"), {
 		method: "POST",
 		headers: deviceBearerHeaders(identity, { "Content-Type": "application/json" }),
-		body: JSON.stringify({ bodies: bodyIds.map((bodyId) => ({ bodyId, generation })) }),
+		body: JSON.stringify({ bodies: bodyIds.map((bodyId) => ({ bodyId, bodyEpoch: 1, generation })) }),
 	});
 	const bytes = await response.arrayBuffer();
-	if (!response.ok) throw new Error(`catch-up read failed (${response.status})`);
+	if (!response.ok) {
+		throw new Error(`catch-up read failed (${response.status}): ${new TextDecoder().decode(bytes)}`);
+	}
 	return { latency: elapsed(startedAt), bytes: bytes.byteLength };
 }
 
 async function runSequential(
 	identity: LiveIdentity,
-	ticket: string,
 	indices: readonly number[],
 ): Promise<RawSocketMeasurement[]> {
 	const values: RawSocketMeasurement[] = [];
 	for (const index of indices) {
-		const opened = await openRawBody(identity, bodyId(index), bodyContent(index), ticket);
+		const opened = await openRawBody(identity, bodyId(index), bodyContent(index));
 		values.push(opened.measurement);
 		await closeRaw(opened);
 	}
@@ -554,11 +761,10 @@ async function runSequential(
 
 async function runParallel(
 	identity: LiveIdentity,
-	ticket: string,
 	indices: readonly number[],
 ): Promise<{ wallMs: number; measurements: RawSocketMeasurement[] }> {
 	const startedAt = performance.now();
-	const opened = await Promise.all(indices.map((index) => openRawBody(identity, bodyId(index), bodyContent(index), ticket)));
+	const opened = await Promise.all(indices.map((index) => openRawBody(identity, bodyId(index), bodyContent(index))));
 	const wallMs = elapsed(startedAt);
 	await Promise.all(opened.map(closeRaw));
 	return { wallMs: rounded(wallMs), measurements: opened.map((value) => value.measurement) };
@@ -738,9 +944,27 @@ async function measureFlushCompaction(
 
 async function destroyVault(context: BenchmarkContext): Promise<void> {
 	const url = `${host}/operator/vaults/${encodeURIComponent(context.deviceA.vaultId)}`;
-	const deadline = Date.now() + 30_000;
+	const ownerRequest = await fetch(vaultRoute(context.deviceA, "governance"), {
+		method: "DELETE",
+		headers: deviceBearerHeaders(context.deviceA, { "Content-Type": "application/json" }),
+		body: JSON.stringify({ requestId: randomBytes(16).toString("base64url") }),
+	});
+	const requested = await json(ownerRequest);
+	const governance = requested?.governanceRequest;
+	const governanceRequestId = governance && typeof governance === "object" && !Array.isArray(governance)
+		&& typeof (governance as Record<string, unknown>).governanceRequestId === "string"
+		? String((governance as Record<string, unknown>).governanceRequestId)
+		: null;
+	if (ownerRequest.status !== 202 || governanceRequestId === null) {
+		throw new Error(`owner destroy request failed (${ownerRequest.status}): ${JSON.stringify(requested)}`);
+	}
+	const deadline = Date.now() + 60_000;
 	while (Date.now() < deadline) {
-		const response = await fetch(url, { method: "DELETE", headers: { Cookie: context.operatorCookie } });
+		const response = await fetch(url, {
+			method: "DELETE",
+			headers: { Cookie: context.operatorCookie, "Content-Type": "application/json" },
+			body: JSON.stringify({ governanceRequestId }),
+		});
 		if (response.status === 200) return;
 		if (response.status !== 202) throw new Error(`vault destroy failed (${response.status}): ${await response.text()}`);
 		await new Promise((resolvePromise) => setTimeout(resolvePromise, 200));
@@ -761,17 +985,29 @@ async function main(): Promise<void> {
 		bodyCount,
 		bodyBytes: smallBodyBytes,
 		deploymentVersion,
+		accessTransport: accessClientId ? "service-token" : accessToken ? "authorization-cookie" : "none",
 		cfRay: edgeProbe.headers.get("cf-ray"),
 	};
 	try {
-		const seedStartedAt = performance.now();
-		await seed(context.deviceA);
-		report.seedMs = rounded(elapsed(seedStartedAt));
+		if (largeNoteOnly) {
+			report.largeNoteProbe = await probeLargeNote(context);
+			await new Promise((resolvePromise) => setTimeout(resolvePromise, 3_000));
+			report.largeNoteDiagnostics = await serverDiagnostics(context.deviceA);
+			report.finishedAt = new Date().toISOString();
+			writeReport(report);
+			return;
+		}
+		const seeded = await seed(context);
+		report.seedMs = seeded.wallMs;
+		report.seed = seeded;
+		if (runLargeNoteProbe) {
+			report.largeNoteProbe = await probeLargeNote(context);
+			console.log("Verified exact 5 MiB production import and durable readback");
+		}
 		console.log("Waiting 20 seconds for a deployed-runtime idle boundary...");
 		await new Promise((resolvePromise) => setTimeout(resolvePromise, 20_000));
-		const ticket = (await fetchSocketTicket(context.deviceB)).ticket;
 
-		const idleResume = await runSequential(context.deviceB, ticket, [0]);
+		const idleResume = await runSequential(context.deviceB, [0]);
 		report.idleResume = summarizeRaw(idleResume);
 		console.log(`Idle-resume body sync: ${idleResume[0]!.syncMs} ms`);
 		report.steadyHttpReads = {
@@ -821,8 +1057,8 @@ async function main(): Promise<void> {
 			bodyId(bodyCount - 1),
 		);
 
-		const firstPass = await runSequential(context.deviceB, ticket, Array.from({ length: 16 }, (_value, index) => index));
-		const repeatPass = await runSequential(context.deviceB, ticket, Array.from({ length: 16 }, (_value, index) => index));
+		const firstPass = await runSequential(context.deviceB, Array.from({ length: 16 }, (_value, index) => index));
+		const repeatPass = await runSequential(context.deviceB, Array.from({ length: 16 }, (_value, index) => index));
 		report.sequentialFirstPass = summarizeRaw(firstPass);
 		report.sequentialRepeatPass = summarizeRaw(repeatPass);
 		console.log(`Sequential first/repeat sync p50: ${distribution(firstPass.map((value) => value.syncMs)).p50}/${distribution(repeatPass.map((value) => value.syncMs)).p50} ms`);
@@ -832,7 +1068,7 @@ async function main(): Promise<void> {
 			const trials = [];
 			for (let trial = 0; trial < 4; trial++) {
 				const start = (trial * 7) % 28;
-				trials.push(await runParallel(context.deviceB, ticket, Array.from({ length: width }, (_value, offset) => start + offset)));
+				trials.push(await runParallel(context.deviceB, Array.from({ length: width }, (_value, offset) => start + offset)));
 			}
 			parallel[String(width)] = {
 				wallMs: distribution(trials.map((trial) => trial.wallMs)),
@@ -843,16 +1079,16 @@ async function main(): Promise<void> {
 		report.parallel = parallel;
 
 		const churnStartedAt = performance.now();
-		const churn = await runSequential(context.deviceB, ticket, Array.from({ length: 40 }, (_value, index) => index % 20));
+		const churn = await runSequential(context.deviceB, Array.from({ length: 40 }, (_value, index) => index % 20));
 		report.switchChurn = { wallMs: rounded(elapsed(churnStartedAt)), ...summarizeRaw(churn) };
 		console.log(`40-note switch churn: ${rounded(elapsed(churnStartedAt))} ms`);
 
 		const saturationStartedAt = performance.now();
 		const saturationSockets = await Promise.all(Array.from({ length: 32 }, (_value, index) =>
-			openRawBody(context.deviceB, bodyId(index), bodyContent(index), ticket)));
+			openRawBody(context.deviceB, bodyId(index), bodyContent(index))));
 		let thirtyThirdStatus: number | null = null;
 		try {
-			const unexpected = await openRawBody(context.deviceB, bodyId(32), bodyContent(32), ticket);
+			const unexpected = await openRawBody(context.deviceB, bodyId(32), bodyContent(32));
 			await closeRaw(unexpected);
 		} catch (error) {
 			thirtyThirdStatus = typeof error === "object" && error !== null && "status" in error
@@ -921,18 +1157,21 @@ async function main(): Promise<void> {
 			probePairsPerForegroundHourAtEightSockets: 8 * 60,
 		};
 		report.finishedAt = new Date().toISOString();
-		const serialized = `${JSON.stringify(report, null, 2)}\n`;
-		console.log(serialized);
-		if (outputPath) {
-			const absolute = resolve(outputPath);
-			mkdirSync(dirname(absolute), { recursive: true });
-			writeFileSync(absolute, serialized, "utf8");
-			console.log(`Wrote ${absolute}`);
-		}
+		writeReport(report);
 	} finally {
 		await destroyVault(context);
 		console.log("Destroyed benchmark vault and generation-scoped data.");
 	}
+}
+
+function writeReport(report: Record<string, unknown>): void {
+	const serialized = `${JSON.stringify(report, null, 2)}\n`;
+	console.log(serialized);
+	if (!outputPath) return;
+	const absolute = resolve(outputPath);
+	mkdirSync(dirname(absolute), { recursive: true });
+	writeFileSync(absolute, serialized, "utf8");
+	console.log(`Wrote ${absolute}`);
 }
 
 main().catch((error) => {

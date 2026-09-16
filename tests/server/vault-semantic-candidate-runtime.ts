@@ -1,5 +1,6 @@
 import { strict as assert } from "node:assert";
 import * as Y from "yjs";
+import { ywasmCrdtEngine as crdtEngine } from "@yaos/crdt-engine";
 import { VaultSemanticService } from "../../server/src/vaultSemanticService";
 import { BODY_EPOCH_HEADER, ROOT_EPOCH_HEADER } from "../../server/src/shared/semanticEpoch";
 import type { VaultActorContext } from "../../server/src/collaboration";
@@ -48,6 +49,16 @@ async function emptyCanvas(): Promise<{ update: Uint8Array; content: Uint8Array;
 	const content = canonicalCanvasBytes(await materializeCanvasDocument(document, false));
 	document.destroy();
 	return { update, content, contentHash: await digest(content) };
+}
+
+function engineDocument(guid: string, configure: (doc: Y.Doc) => void): ReturnType<typeof crdtEngine.createDocument> {
+	const source = new Y.Doc({ guid });
+	try {
+		configure(source);
+		return crdtEngine.openDocument(guid, Y.encodeStateAsUpdate(source));
+	} finally {
+		source.destroy();
+	}
 }
 
 s.test("stale Canvas candidate epoch is rejected before body read, cache admission, or durability", async () => {
@@ -259,9 +270,10 @@ s.test("revocation during Canvas promotion prevents the authority commit", async
 	const canvas = await emptyCanvas();
 	const sourceHash = "b".repeat(64);
 	const sourceSize = 17;
-	const root = new Y.Doc({ guid: "root" });
-	root.getMap("pathToBlob").set("Board.canvas", {
-		hash: sourceHash, size: sourceSize, revision: "promotion-source",
+	const root = engineDocument("root", (source) => {
+		source.getMap("pathToBlob").set("Board.canvas", {
+			hash: sourceHash, size: sourceSize, revision: "promotion-source",
+		});
 	});
 	let actorAllowed = true;
 	let commits = 0;
@@ -360,14 +372,14 @@ s.test("revocation during Canvas demotion prevents the authority commit", async 
 				: { generation: active.generation, semanticEpoch: active.bodyEpoch, latestSequence: active.sequence },
 			reconstructDocument: (documentId: string) => {
 				if (documentId === DOCUMENT_ID) {
-					const document = new Y.Doc({ guid: DOCUMENT_ID });
-					Y.applyUpdate(document, canvas.update);
+					const document = crdtEngine.openDocument(DOCUMENT_ID, canvas.update);
 					return { doc: document, generation: active.generation,
 						semanticEpoch: active.bodyEpoch, latestSequence: active.sequence };
 				}
-				const document = new Y.Doc({ guid: "root" });
-				document.getMap("pathToSemantic").set(active.path, {
-					documentId: DOCUMENT_ID, kind: "canvas", format: "json-canvas", formatVersion: 1,
+				const document = engineDocument("root", (source) => {
+					source.getMap("pathToSemantic").set(active.path, {
+						documentId: DOCUMENT_ID, kind: "canvas", format: "json-canvas", formatVersion: 1,
+					});
 				});
 				return { doc: document, generation: 4, semanticEpoch: 1, latestSequence: 8 };
 			},

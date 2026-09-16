@@ -125,4 +125,59 @@ s.test("finalization retires a creation whose path gained an authoritative owner
 	assert.equal(completions(), 1);
 });
 
+s.test("create admission batch returns multiple exact pending fences in one service call", async () => {
+	const pending = ["a", "b"].map((suffix, index) => ({
+		...creation(),
+		bodyId: `body-batch-${suffix}`,
+		fileId: `body-batch-${suffix}`,
+		path: `${suffix}.md`,
+		operationId: `operation-batch-${suffix}`,
+		candidateId: `candidate-batch-${suffix}`,
+		candidateDigest: suffix.repeat(64),
+		vaultSequence: index + 1,
+	}));
+	const byBody = new Map([[pending[0]!.bodyId, pending[0]!]]);
+	const validBodies = new Set(pending.map((item) => item.bodyId));
+	let allowNewAdmissions = false;
+	const service = new VaultLifecycleService({
+		store: {
+			lifecycleRecord: () => null,
+			documentHead: (bodyId: string) => validBodies.has(bodyId)
+				? { generation: 1, semanticEpoch: 1, latestSequence: 1 }
+				: null,
+			creationCandidate: (bodyId: string) => byBody.get(bodyId) ?? null,
+			currentSequence: () => 2,
+			activeCatalogHeadAtPath: () => null,
+			getCatalogHeadAt: () => null,
+			expectCreationCandidate: (candidate: ReturnType<typeof creation>) => {
+				byBody.set(candidate.bodyId, candidate);
+				return candidate;
+			},
+		} as never,
+		cache: {}, sockets: () => ({}), vaultId: () => actor.vaultId,
+		vaultGeneration: () => actor.vaultGeneration, runtimeEpoch: "runtime-lifecycle-create-0001",
+		hasBlob: async () => true, flush: async () => true, validateActor: () => allowNewAdmissions,
+	} as never);
+	const operations = pending.map((item) => ({
+		operationId: item.operationId, kind: "create", fileId: item.fileId, bodyId: item.bodyId,
+		bodyEpoch: item.bodyEpoch, path: item.path, candidateId: item.candidateId,
+		candidateDigest: item.candidateDigest,
+	}));
+	const batchRequest = () => new Request("https://internal/lifecycle/admissions", {
+		method: "POST", headers: { "content-type": "application/json" },
+		body: JSON.stringify({ operations }),
+	});
+	const interrupted = await service.handleCreateAdmissionsBatch(batchRequest(), actor);
+	assert.equal(interrupted.status, 409);
+	assert.deepEqual(await interrupted.json(), { error: "authority_superseded" });
+	assert.equal(byBody.size, 1, "an interrupted batch retains the exact admitted prefix");
+	allowNewAdmissions = true;
+	const response = await service.handleCreateAdmissionsBatch(batchRequest(), actor);
+	assert.equal(response.status, 200);
+	const result = await response.json() as { receipts: Array<{ operationId: string }>; vaultSequence: number };
+	assert.deepEqual(result.receipts.map((receipt) => receipt.operationId), ["operation-batch-a", "operation-batch-b"]);
+	assert.equal(result.vaultSequence, 1);
+	assert.equal(byBody.size, 2, "retry replays the prefix and admits only the missing item");
+});
+
 await s.done();

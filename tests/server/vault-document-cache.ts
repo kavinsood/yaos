@@ -1,5 +1,8 @@
 import { strict as assert } from "node:assert";
 import * as Y from "yjs";
+import { ywasmCrdtEngine as crdtEngine } from "@yaos/crdt-engine";
+import type { YwasmCrdtDocument } from "../../server/src/crdt/ywasmCrdtEngine";
+import { snapshotRootMap } from "../../server/src/crdt/rootSchema";
 import {
 	MAX_BODY_SOCKETS,
 	MAX_DURABLE_UPDATE_BYTES,
@@ -15,13 +18,32 @@ import {
 	type VaultDocumentCacheLimits,
 } from "../../server/src/vaultDocumentCache";
 import { VaultRuntime } from "../../server/src/server";
-import {
-	initializeCanvasDocument,
-	materializeCanvasDocument,
-} from "../../server/src/shared/canvasSemanticDocument";
+import { materializeCanvasDocument } from "../../server/src/crdt/canvasSemanticDocument";
+import { initializeCanvasDocument } from "../../server/src/shared/canvasSemanticDocument";
 import { suite } from "../harness.ts";
 
 const s = suite("vault-document-cache");
+const MIB = 1024 * 1024;
+
+function withMockCrdtMemory<T>(
+	linearMemoryBytes: number,
+	body: () => T,
+): T {
+	const original = crdtEngine.memoryDiagnostics;
+	Object.defineProperty(crdtEngine, "memoryDiagnostics", {
+		configurable: true,
+		value: () => ({
+			linearMemoryBytes,
+			maximumLinearMemoryBytes: 96 * MIB,
+			artifactSha256: "a".repeat(64),
+		}),
+	});
+	try {
+		return body();
+	} finally {
+		Object.defineProperty(crdtEngine, "memoryDiagnostics", { configurable: true, value: original });
+	}
+}
 
 function testDoc(documentId: string): Y.Doc {
 	const doc = new Y.Doc({ guid: documentId });
@@ -46,9 +68,9 @@ function updateBytes(content: string): Uint8Array {
 	return update;
 }
 
-function measuredAfterUpdate(doc: Y.Doc, update: Uint8Array): number {
+function measuredAfterUpdate(doc: YwasmCrdtDocument, update: Uint8Array): number {
 	const candidate = new Y.Doc();
-	Y.applyUpdate(candidate, Y.encodeStateAsUpdate(doc));
+	Y.applyUpdate(candidate, crdtEngine.encodeStateAsUpdate(doc));
 	Y.applyUpdate(candidate, update);
 	const bytes = Y.encodeStateAsUpdate(candidate).byteLength;
 	candidate.destroy();
@@ -59,6 +81,16 @@ function cacheLimits(input: Omit<VaultDocumentCacheLimits, "rootEncodedStateByte
 	rootEncodedStateBytes?: number;
 }): VaultDocumentCacheLimits {
 	return { rootEncodedStateBytes: MAX_ROOT_RESIDENT_ENCODED_STATE_BYTES, ...input };
+}
+
+function engineDocument(documentId: string, configure?: (doc: Y.Doc) => void): YwasmCrdtDocument {
+	const source = testDoc(documentId);
+	try {
+		configure?.(source);
+		return crdtEngine.openDocument(documentId, Y.encodeStateAsUpdate(source));
+	} finally {
+		source.destroy();
+	}
 }
 
 function makeStore(
@@ -76,8 +108,9 @@ function makeStore(
 		},
 		reconstructDocument(documentId: string) {
 			reconstructions.set(documentId, (reconstructions.get(documentId) ?? 0) + 1);
-			const doc = testDoc(documentId);
-			doc.getText("body").insert(0, contents[documentId] ?? documentId);
+			const doc = engineDocument(documentId, (source) => {
+				source.getText("body").insert(0, contents[documentId] ?? documentId);
+			});
 			return {
 				documentId,
 				throughSequence: 1,
@@ -181,8 +214,8 @@ s.test("durable updates evict safe LRU state or expose pressure after mutating p
 	const protectedBody = rejecting.load("protected", true, () => true);
 	assert.equal(rejecting.applyDurableUpdate("protected", update, 2, "test"), true,
 		"an already-durable update cannot be rejected from the resident authority");
-	assert.match(protectedBody.doc.getText("body").toString(), /before/);
-	assert.match(protectedBody.doc.getText("body").toString(), /u{100}/);
+	assert.match(crdtEngine.readText(protectedBody.doc, "body"), /before/);
+	assert.match(crdtEngine.readText(protectedBody.doc, "body"), /u{100}/);
 	assert.equal(protectedBody.generation, 2);
 	assert.equal(rejecting.hasResidentMemoryPressure("protected"), true,
 		"non-evictable overage becomes a compaction/admission pressure signal");
@@ -214,17 +247,17 @@ s.test("persistent validation rejects poison, rebuilds its mirror, and reuses on
 	const loaded = cache.load("protected", true, () => true);
 	const invalid = new Y.Doc({ guid: "protected" });
 	invalid.clientID = 0x1a05_4101;
-	Y.applyUpdate(invalid, Y.encodeStateAsUpdate(loaded.doc));
+	Y.applyUpdate(invalid, crdtEngine.encodeStateAsUpdate(loaded.doc));
 	const invalidVector = Y.encodeStateVector(invalid);
-	invalid.getMap("frontmatter:future-root").set("poison", true);
+	invalid.getMap("frontmatter:meta").set("format", 2);
 	const invalidUpdate = Y.encodeStateAsUpdate(invalid, invalidVector);
 	invalid.destroy();
 	assert.throws(
 		() => cache.validateBodyUpdate("protected", invalidUpdate),
 		(error: unknown) => error instanceof VaultDocumentValidationError
-			&& error.reason === "frontmatter_semantic_root_invalid",
+			&& error.reason === "frontmatter_semantic_format_invalid",
 	);
-	assert.equal(loaded.doc.getText("body").toString(), "before", "rejected state never reaches the live document");
+	assert.equal(crdtEngine.readText(loaded.doc, "body"), "before", "rejected state never reaches the live document");
 
 	const valid = new Y.Doc({ guid: "protected" });
 	valid.clientID = 0x1a05_4102;
@@ -233,7 +266,7 @@ s.test("persistent validation rejects poison, rebuilds its mirror, and reuses on
 	valid.destroy();
 	const staged = cache.validateBodyUpdate("protected", validUpdate);
 	assert.equal(staged.changesState, true);
-	const validatedText = loaded.validationDoc.getText("body").toString();
+	const validatedText = crdtEngine.readText(loaded.validationDoc, "body");
 	assert.match(validatedText, /after/, "validation mirror accepted the next update");
 	assert.equal(cache.commitValidatedBodyUpdate("protected", validUpdate, 2, 1, "test", staged), true,
 		"committed validated state emits exactly one live update");
@@ -260,8 +293,7 @@ s.test("Canvas mirror rejects malformed and semantic poison while preserving an 
 		documentEncodedHistoryBytes: () => durableState.byteLength,
 		reconstructDocument: () => {
 			reconstructions++;
-			const doc = new Y.Doc({ guid: documentId });
-			Y.applyUpdate(doc, durableState);
+			const doc = crdtEngine.openDocument(documentId, durableState);
 			return { documentId, throughSequence: 1, generation: 1, semanticEpoch: 1,
 				checkpointSequence: 0, journalUpdates: 1, doc, rowsRead: 1 };
 		},
@@ -269,7 +301,7 @@ s.test("Canvas mirror rejects malformed and semantic poison while preserving an 
 	const cache = new VaultDocumentCache(store as never, () => new Set(), () => new Set());
 	const loaded = cache.load(documentId, true, () => true, "canvas");
 	const validProducer = new Y.Doc({ guid: documentId });
-	Y.applyUpdate(validProducer, Y.encodeStateAsUpdate(loaded.doc));
+	Y.applyUpdate(validProducer, crdtEngine.encodeStateAsUpdate(loaded.doc));
 	const validVector = Y.encodeStateVector(validProducer);
 	validProducer.getMap("rootFields").set("theme", "dark");
 	const valid = Y.encodeStateAsUpdate(validProducer, validVector);
@@ -281,19 +313,19 @@ s.test("Canvas mirror rejects malformed and semantic poison while preserving an 
 		digest: "a".repeat(64),
 		socketId: "canvas-socket-valid",
 	}), { ok: true });
-	assert.equal(loaded.doc.getMap("rootFields").get("theme"), "light");
-	assert.equal(loaded.validationDoc.getMap("rootFields").get("theme"), "dark");
+	assert.equal(snapshotRootMap(loaded.doc, "rootFields").get("theme"), "light");
+	assert.equal(snapshotRootMap(loaded.validationDoc, "rootFields").get("theme"), "dark");
 
 	await assert.rejects(
 		() => cache.validateCanvasUpdate(documentId, new Uint8Array([255])),
 		(error: unknown) => error instanceof VaultDocumentValidationError
 			&& error.reason === "invalid_canvas_update",
 	);
-	assert.equal(loaded.validationDoc.getMap("rootFields").get("theme"), "dark",
+	assert.equal(snapshotRootMap(loaded.validationDoc, "rootFields").get("theme"), "dark",
 		"malformed frame rebuild retains the earlier queued valid state");
 
 	const poisonProducer = new Y.Doc({ guid: documentId });
-	Y.applyUpdate(poisonProducer, Y.encodeStateAsUpdate(loaded.validationDoc));
+	Y.applyUpdate(poisonProducer, crdtEngine.encodeStateAsUpdate(loaded.validationDoc));
 	const poisonVector = Y.encodeStateVector(poisonProducer);
 	poisonProducer.getMap("canvasMeta").set("format", "poison");
 	const poison = Y.encodeStateAsUpdate(poisonProducer, poisonVector);
@@ -305,11 +337,11 @@ s.test("Canvas mirror rejects malformed and semantic poison while preserving an 
 	);
 
 	assert.equal(cache.pendingFor(documentId).length, 1);
-	assert.equal(loaded.doc.getMap("rootFields").get("theme"), "light",
+	assert.equal(snapshotRootMap(loaded.doc, "rootFields").get("theme"), "light",
 		"neither valid queued state nor poison reaches authoritative live state before durability");
-	assert.equal(loaded.doc.getMap("canvasMeta").get("format"), "yaos-json-canvas");
-	assert.equal(loaded.validationDoc.getMap("rootFields").get("theme"), "dark");
-	assert.equal(loaded.validationDoc.getMap("canvasMeta").get("format"), "yaos-json-canvas");
+	assert.equal(snapshotRootMap(loaded.doc, "canvasMeta").get("format"), "yaos-json-canvas");
+	assert.equal(snapshotRootMap(loaded.validationDoc, "rootFields").get("theme"), "dark");
+	assert.equal(snapshotRootMap(loaded.validationDoc, "canvasMeta").get("format"), "yaos-json-canvas");
 	assert.equal((await materializeCanvasDocument(loaded.validationDoc, false)).rootFields.theme, "dark");
 	assert.equal(reconstructions, 1, "ordinary rejection rebuilds from resident live + queue, not SQLite");
 	cache.clear();
@@ -319,7 +351,7 @@ s.test("socket validation mirror stages ordered frames without touching authorit
 	const cache = new VaultDocumentCache(makeStore({ staged: "before" }) as never, () => new Set(), () => new Set());
 	const loaded = cache.load("staged", true, () => true);
 	const producer = new Y.Doc({ guid: "staged" });
-	Y.applyUpdate(producer, Y.encodeStateAsUpdate(loaded.doc));
+	Y.applyUpdate(producer, crdtEngine.encodeStateAsUpdate(loaded.doc));
 	const firstVector = Y.encodeStateVector(producer);
 	producer.getText("body").insert(producer.getText("body").length, "-one");
 	const first = Y.encodeStateAsUpdate(producer, firstVector);
@@ -329,21 +361,21 @@ s.test("socket validation mirror stages ordered frames without touching authorit
 
 	const firstValidated = cache.validateBodyUpdate("staged", first);
 	assert.equal(cache.stageValidatedBodyUpdate("staged", firstValidated), true);
-	assert.equal(loaded.doc.getText("body").toString(), "before");
-	assert.equal(loaded.validationDoc.getText("body").toString(), "before-one");
+	assert.equal(crdtEngine.readText(loaded.doc, "body"), "before");
+	assert.equal(crdtEngine.readText(loaded.validationDoc, "body"), "before-one");
 	const secondValidated = cache.validateBodyUpdate("staged", second);
 	assert.equal(cache.stageValidatedBodyUpdate("staged", secondValidated), true);
-	assert.equal(loaded.doc.getText("body").toString(), "before");
-	assert.equal(loaded.validationDoc.getText("body").toString(), "before-one-two");
+	assert.equal(crdtEngine.readText(loaded.doc, "body"), "before");
+	assert.equal(crdtEngine.readText(loaded.validationDoc, "body"), "before-one-two");
 
 	const duplicate = cache.validateBodyUpdate("staged", first);
 	assert.equal(cache.stageValidatedBodyUpdate("staged", duplicate), false, "duplicate is a speculative no-op");
 	assert.equal(loaded.validationPending, false);
 	assert.equal(cache.applyDurableUpdate("staged", first, 2, "durable-prefix"), true);
-	assert.equal(loaded.doc.getText("body").toString(), "before-one");
-	assert.equal(loaded.validationDoc.getText("body").toString(), "before-one-two");
+	assert.equal(crdtEngine.readText(loaded.doc, "body"), "before-one");
+	assert.equal(crdtEngine.readText(loaded.validationDoc, "body"), "before-one-two");
 	assert.equal(cache.applyDurableUpdate("staged", second, 3, "durable-prefix"), true);
-	assert.equal(loaded.doc.getText("body").toString(), "before-one-two");
+	assert.equal(crdtEngine.readText(loaded.doc, "body"), "before-one-two");
 	producer.destroy();
 });
 
@@ -353,11 +385,11 @@ s.test("exceptional socket failure reloads both live and mirror from exact durab
 	const speculative = updateBytes("speculative");
 	const validated = cache.validateBodyUpdate("recovered", speculative);
 	assert.equal(cache.stageValidatedBodyUpdate("recovered", validated), true);
-	assert.match(loaded.validationDoc.getText("body").toString(), /speculative/);
-	assert.equal(loaded.doc.getText("body").toString(), "durable");
+	assert.match(crdtEngine.readText(loaded.validationDoc, "body"), /speculative/);
+	assert.equal(crdtEngine.readText(loaded.doc, "body"), "durable");
 	cache.reloadFromDurable("recovered");
-	assert.equal(loaded.doc.getText("body").toString(), "durable");
-	assert.equal(loaded.validationDoc.getText("body").toString(), "durable");
+	assert.equal(crdtEngine.readText(loaded.doc, "body"), "durable");
+	assert.equal(crdtEngine.readText(loaded.validationDoc, "body"), "durable");
 	assert.equal(loaded.validationPending, false);
 	assert.equal(loaded.dirty, false);
 });
@@ -489,8 +521,7 @@ s.test("resident cache identity changes atomically with the semantic epoch", () 
 	const cache = new VaultDocumentCache(makeStore({ lineage: "before" }) as never, () => new Set(), () => new Set());
 	const loaded = cache.load("lineage", true, () => true);
 	assert.equal(loaded.lineageKey, "lineage@epoch:1");
-	const fresh = testDoc("lineage");
-	fresh.getText("body").insert(0, "after");
+	const fresh = engineDocument("lineage", (source) => source.getText("body").insert(0, "after"));
 	cache.installSemanticReset("lineage", fresh, 1, 2);
 	assert.equal(cache.get("lineage")?.semanticEpoch, 2);
 	assert.equal(cache.get("lineage")?.lineageKey, "lineage@epoch:2");
@@ -504,8 +535,9 @@ s.test("observing a durable epoch advance retires old queued bytes before rebuil
 		documentHead: () => ({ generation: 1, semanticEpoch: epoch, latestSequence: epoch }),
 		documentEncodedHistoryBytes: () => encodedBytes(documentId, epoch === 1 ? "old" : "fresh"),
 		reconstructDocument: () => {
-			const doc = testDoc(documentId);
-			doc.getText("body").insert(0, epoch === 1 ? "old" : "fresh");
+			const doc = engineDocument(documentId, (source) => {
+				source.getText("body").insert(0, epoch === 1 ? "old" : "fresh");
+			});
 			return { documentId, throughSequence: epoch, generation: 1, semanticEpoch: epoch,
 				checkpointSequence: epoch, journalUpdates: 0, doc, rowsRead: 1 };
 		},
@@ -517,7 +549,7 @@ s.test("observing a durable epoch advance retires old queued bytes before rebuil
 	epoch = 2;
 	const fresh = cache.load(documentId, true, () => true);
 	assert.equal(fresh.lineageKey, `${documentId}@epoch:2`);
-	assert.equal(fresh.validationDoc.getText("body").toString(), "fresh");
+	assert.equal(crdtEngine.readText(fresh.validationDoc, "body"), "fresh");
 	assert.equal(cache.pendingFor(documentId).length, 0);
 	assert.equal(cache.diagnostics().pendingBytes.total, 0);
 	assert.deepEqual(cache.diagnostics().pendingByLineage, {});
@@ -539,8 +571,7 @@ s.test("a fresh-epoch operation lane waits for the retiring lineage", async () =
 		events.push("old-end");
 	});
 	await started;
-	const fresh = testDoc("lane-reset");
-	fresh.getText("body").insert(0, "after");
+	const fresh = engineDocument("lane-reset", (source) => source.getText("body").insert(0, "after"));
 	cache.installSemanticReset("lane-reset", fresh, 1, 2);
 	const second = cache.serializeDocument("lane-reset", async () => { events.push("new"); });
 	await Promise.resolve();
@@ -572,7 +603,7 @@ s.test("exact validation census is periodic without taxing every tiny frame", ()
 		() => new Set([documentId]), () => new Set());
 	const loaded = cache.load(documentId, true, () => true);
 	const producer = testDoc(`${documentId}-producer`);
-	Y.applyUpdate(producer, Y.encodeStateAsUpdate(loaded.doc));
+	Y.applyUpdate(producer, crdtEngine.encodeStateAsUpdate(loaded.doc));
 	for (let index = 1; index <= 500; index++) {
 		const vector = Y.encodeStateVector(producer);
 		producer.getText("body").insert(producer.getText("body").length, "x");
@@ -604,8 +635,8 @@ s.test("full-state reservation rejects validation before touching either documen
 		(error: unknown) => error instanceof VaultDocumentCachePressureError
 			&& error.reason === "vault_transient_bytes",
 	);
-	assert.equal(loaded.doc.getText("body").toString(), "before");
-	assert.equal(loaded.validationDoc.getText("body").toString(), "before");
+	assert.equal(crdtEngine.readText(loaded.doc, "body"), "before");
+	assert.equal(crdtEngine.readText(loaded.validationDoc, "body"), "before");
 	assert.equal(loaded.validationPending, false);
 	assert.equal(cache.diagnostics().costs.transientBytes, externalReservation,
 		"rejected validation releases its attempted full-state and exact-wire reservation");
@@ -638,7 +669,7 @@ s.test("non-evictable root residency is accounted and exposes compaction pressur
 s.test("root handshake validation accepts durable duplicates and rebuilds after a real mutation", () => {
 	const cache = new VaultDocumentCache(makeStore({ root: "catalog" }) as never, () => new Set(), () => new Set());
 	const root = cache.load("root", false, () => true);
-	const duplicate = Y.encodeStateAsUpdate(root.doc);
+	const duplicate = crdtEngine.encodeStateAsUpdate(root.doc);
 	assert.equal(cache.validateRootSyncNoop("root", duplicate), true);
 
 	const peer = testDoc("root-peer-mutation");
@@ -648,7 +679,7 @@ s.test("root handshake validation accepts durable duplicates and rebuilds after 
 	const mutation = Y.encodeStateAsUpdate(peer, vector);
 	peer.destroy();
 	assert.equal(cache.validateRootSyncNoop("root", mutation), false);
-	assert.equal(root.validationDoc.getMap("pathToId").has("forbidden.md"), false,
+	assert.equal(snapshotRootMap(root.validationDoc, "pathToId").has("forbidden.md"), false,
 		"rejected root state is removed from the private mirror");
 	assert.equal(cache.validateRootSyncNoop("root", duplicate), true,
 		"the rebuilt mirror remains usable by the next handshake");
@@ -663,7 +694,7 @@ s.test("live checkpoint falls back to durable reconstruction while a detached fl
 		() => new Set(),
 	);
 	const loaded = cache.load(documentId, true, () => true);
-	loaded.doc.getText("body").insert(loaded.doc.getText("body").length, "-not-durable");
+	crdtEngine.insertText(loaded.doc, "body", crdtEngine.readText(loaded.doc, "body").length, "-not-durable");
 	const pending = updateBytes("wire-update");
 	assert.deepEqual(cache.queue(documentId, {
 		bytes: pending,
@@ -684,9 +715,9 @@ s.test("live checkpoint falls back to durable reconstruction while a detached fl
 			reconstructedWrites++;
 			persistedContent = "durable";
 		},
-		writeCheckpointFromDocument: (_id: string, doc: Y.Doc) => {
+		writeCheckpointFromDocument: (_id: string, doc: YwasmCrdtDocument) => {
 			liveWrites++;
-			persistedContent = doc.getText("body").toString();
+			persistedContent = crdtEngine.readText(doc, "body");
 		},
 	};
 	type LiveCheckpointProbe = {
@@ -844,13 +875,62 @@ s.test("default aggregate limits are explicit in diagnostics", () => {
 	const cache = new VaultDocumentCache(makeStore() as never, () => new Set(), () => new Set());
 	assert.deepEqual(cache.diagnostics().accounting, {
 		formatVersion: 1,
-		claim: "encoded-yjs-state-proxy-not-heap-measurement",
+		claim: "encoded-crdt-state-proxy-plus-wasm-linear-memory",
 	});
 	assert.deepEqual(cache.diagnostics().limits, {
 		loadedBodies: MAX_BODY_SOCKETS,
 		encodedStateBytes: MAX_LOADED_BODY_ENCODED_STATE_BYTES,
 		rootEncodedStateBytes: MAX_ROOT_RESIDENT_ENCODED_STATE_BYTES,
 		transientBytes: MAX_TRANSIENT_PENDING_BYTES,
+	});
+});
+
+s.test("Wasm envelope rejects before CRDT apply when current memory, reservation, and margin cross 96 MiB", () => {
+	const documentId = "wasm-envelope-rejection";
+	const cache = new VaultDocumentCache(makeStore({ [documentId]: "before" }) as never,
+		() => new Set([documentId]), () => new Set());
+	const loaded = cache.load(documentId, true, () => true);
+	const update = updateBytes("must-not-apply");
+	const originalApply = crdtEngine.applyUpdate;
+	let applyCalls = 0;
+	Object.defineProperty(crdtEngine, "applyUpdate", {
+		configurable: true,
+		value: (...args: Parameters<typeof crdtEngine.applyUpdate>) => {
+			applyCalls++;
+			return originalApply(...args);
+		},
+	});
+	try {
+		withMockCrdtMemory(88 * MIB, () => {
+			assert.deepEqual(cache.diagnostics().crdtMemory, {
+				linearMemoryBytes: 88 * MIB,
+				maximumLinearMemoryBytes: 96 * MIB,
+				artifactSha256: "a".repeat(64),
+			});
+			assert.throws(
+				() => cache.validateBodyUpdate(documentId, update),
+				(error: unknown) => error instanceof VaultDocumentCachePressureError
+					&& error.reason === "wasm_linear_memory_envelope",
+			);
+			assert.equal(applyCalls, 0, "admission must fail before the update reaches Wasm");
+			assert.equal(crdtEngine.readText(loaded.validationDoc, "body"), "before");
+			assert.equal(cache.diagnostics().costs.transientBytes, 0,
+				"a rejected envelope reservation must not change cache accounting");
+		});
+	} finally {
+		Object.defineProperty(crdtEngine, "applyUpdate", { configurable: true, value: originalApply });
+		cache.clear();
+	}
+});
+
+s.test("Wasm envelope admits an ordinary modeled full-state reservation below the safety margin", () => {
+	const cache = new VaultDocumentCache(makeStore() as never, () => new Set(), () => new Set());
+	withMockCrdtMemory(64 * MIB, () => {
+		const release = cache.reserveFullStateOperation("ordinary-reservation", 2, 1 * MIB);
+		assert.equal(cache.diagnostics().costs.transientBytes, 4 * MIB,
+			"one MiB doubled for uncertainty across two copies reserves four MiB");
+		release();
+		assert.equal(cache.diagnostics().costs.transientBytes, 0);
 	});
 });
 

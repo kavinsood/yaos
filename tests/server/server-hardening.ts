@@ -1,6 +1,12 @@
 import { runSingleFlight } from "../../server/src/asyncConcurrency";
 import { MAX_BLOB_UPLOAD_BYTES, MAX_DURABLE_UPDATE_BYTES } from "../../server/src/contracts";
-import { getCapabilities } from "../../server/src/routes/auth";
+import { CONFIG_FORMAT } from "../../server/src/identity";
+import {
+	getAuthStateCached,
+	getCapabilities,
+	invalidateStoredServerConfigCache,
+} from "../../server/src/routes/auth";
+import type { Env } from "../../server/src/routes/types";
 import { partitionDurableUpdateBatches } from "../../server/src/server";
 import { FakeObjectStore, makeEnv } from "../mocks/workerEnv.ts";
 import { suite } from "../harness.ts";
@@ -126,6 +132,45 @@ s.section("Test 9: capabilities expose one final identity-neutral shape");
 	);
 	s.check(caps.claimed === true, "capabilities preserve claimed state");
 }
+
+s.test("an unclaimed config is not retained across the one-way claim transition", async () => {
+	let claimed = false;
+	let reads = 0;
+	const env = {
+		YAOS_CONFIG: {
+			call: async () => {
+				reads++;
+				return Response.json({
+					configFormat: claimed ? CONFIG_FORMAT : null,
+					claimed,
+					operatorRecoveryHash: claimed ? "operator-hash" : null,
+					ticketSigningKey: claimed ? "ticket-signing-key" : null,
+					updateProvider: null,
+					updateRepoUrl: null,
+					updateRepoBranch: null,
+				});
+			},
+		},
+	} as unknown as Env;
+
+	invalidateStoredServerConfigCache();
+	try {
+		const before = await getAuthStateCached(env);
+		s.check(!before.claimed && reads === 1, "the first read observes the fresh unclaimed deployment");
+
+		// Model /claim being handled by another warm Worker isolate. This
+		// isolate receives no direct cache invalidation signal.
+		claimed = true;
+		const after = await getAuthStateCached(env);
+		s.check(after.mode === "claim" && reads === 2,
+			"the next request re-reads ServerConfig instead of serving stale unclaimed state");
+
+		await getAuthStateCached(env);
+		s.check(reads === 2, "the stable claimed state retains the normal bounded cache");
+	} finally {
+		invalidateStoredServerConfigCache();
+	}
+});
 
 s.section("Debounced persistence never merges a batch beyond one durable row");
 {

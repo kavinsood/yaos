@@ -60,7 +60,14 @@ export async function getStoredServerConfigCached(env: Env): Promise<StoredServe
 	if (configInflight) return configInflight;
 	configInflight = getStoredServerConfig(env)
 		.then((config) => {
-			cachedConfig = { value: config, expiresAt: Date.now() + AUTH_CONFIG_CACHE_TTL_MS };
+			// Claim is a one-way transition owned by the ServerConfig Durable
+			// Object, but this Worker can have many isolates. Invalidating the
+			// cache after /claim only reaches the isolate that handled that
+			// request. Never retain the pre-claim value, otherwise another warm
+			// isolate can reject valid traffic as "unclaimed" for the full TTL.
+			cachedConfig = config.claimed
+				? { value: config, expiresAt: Date.now() + AUTH_CONFIG_CACHE_TTL_MS }
+				: null;
 			return config;
 		})
 		.finally(() => {

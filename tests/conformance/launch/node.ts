@@ -98,7 +98,7 @@ export async function launchNode(): Promise<LaunchedRuntime> {
 		capabilities: ALL_CAPABILITIES,
 		port,
 		spawn() {
-			return spawn(process.execPath, ["--import", "jiti/register", "packages/server-node/src/index.ts"], {
+			return spawn(process.execPath, ["packages/server-node/dist/server.mjs"], {
 				cwd: REPO_ROOT,
 				detached: true,
 				stdio: ["ignore", "pipe", "pipe"],

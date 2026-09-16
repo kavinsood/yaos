@@ -119,6 +119,7 @@ function validVaultRest(method: string, rest: string[]): boolean {
 	if (method === "GET" && rest.length === 3 && rest[0] === "ws" && rest[1] === "body" && !!rest[2]) return true;
 	if (method === "GET" && rest.length === 3 && rest[0] === "ws" && rest[1] === "semantic" && !!rest[2]) return true;
 	if (method === "POST" && rest.length === 3 && rest[0] === "body" && !!rest[1] && rest[2] === "candidate") return true;
+	if (method === "POST" && rest.length === 2 && rest[0] === "body" && rest[1] === "candidates") return true;
 	if (method === "POST" && rest.length === 3 && rest[0] === "semantic" && !!rest[1] && rest[2] === "candidate") return true;
 	if (method === "POST" && rest.length === 2 && rest[0] === "semantic" && rest[1] === "lifecycle") return true;
 	if (method === "POST" && rest.length === 3 && rest[0] === "semantic" && rest[1] === "authority"
@@ -128,7 +129,7 @@ function validVaultRest(method: string, rest: string[]): boolean {
 	if (method === "GET" && rest.length === 3 && rest[0] === "operations" && !!rest[1] && rest[2] === "outcome") return true;
 	if (method === "GET" && rest.length === 2 && (rest[0] === "body" || rest[0] === "head") && !!rest[1]) return true;
 	if (method === "POST" && rest.length === 1 && (rest[0] === "lifecycle" || rest[0] === "catch-up")) return true;
-	if (method === "POST" && rest.length === 2 && rest[0] === "lifecycle") return rest[1] === "batch" || rest[1] === "publish";
+	if (method === "POST" && rest.length === 2 && rest[0] === "lifecycle") return rest[1] === "admissions" || rest[1] === "batch" || rest[1] === "publish";
 	if (method === "POST" && rest.length === 2 && rest[0] === "attachments" && rest[1] === "publish") return true;
 	if (method === "POST" && rest.length === 2 && rest[0] === "bootstrap" && rest[1] === "start") return true;
 	if (rest.length === 3 && rest[0] === "bootstrap" && !!rest[1]) {

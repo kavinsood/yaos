@@ -5,6 +5,7 @@ import type { RecoveryJobStoragePort } from "./recoveryJobState";
 export interface AlarmPort {
 	setAlarm(scheduledTime: number): Promise<void>;
 	deleteAlarm(): Promise<void>;
+	getAlarm?(): Promise<number | null>;
 }
 
 export interface ExecutionPort {

@@ -1,0 +1,26 @@
+{
+	"repository": "https://github.com/y-crdt/y-crdt.git",
+	"commit": "37dfed7eaeeddc70205577c6d92b50c53023b133",
+	"commitDate": "2026-09-09T05:10:18+02:00",
+	"rustToolchain": "1.98.1",
+	"rustCommit": "48a229ceaefd4985c50990b14116b6d856af0985",
+	"wasmTarget": "wasm32-unknown-unknown",
+	"wasmPack": "0.15.0",
+	"wasmBindgen": "0.2.126",
+	"wasmOpt": "version 117",
+	"cargoLockSha256": "85f70962db8786791405da8bb01fb0e61dfb5c10a6dcc78b138e157f778ac07a",
+	"licenseSha256": "b6d81564e9c46473907bd3c09d4d5ab0f21cfbe6ac35d46daf1bdb0423182a5b",
+	"licenseBytes": 1153,
+	"maximumLinearMemoryBytes": 100663296,
+	"features": [],
+	"artifact": {
+		"wasmSha256": "e66c0a21ddf9852b383c9b76e6f6ef29123d0760ffe7fb6a4358524a4f3cbf3b",
+		"wasmBytes": 981855,
+		"wrapperSha256": "08429e94c30f5b68b32809b540d4d972e8985d2c886930bf336ba5c5d98ca286",
+		"wrapperBytes": 158957,
+		"nodeWrapperSha256": "38564efb4cb772e80e787b693ffe1e51ce247538c7849d18cc930720e92e25fc",
+		"nodeWrapperBytes": 160405,
+		"nodeTypesSha256": "9f06866975f96c0a08a090d6bdfe3d8e638d18f14f3eefdf591de95bf06e9695",
+		"nodeTypesBytes": 64521
+	}
+}

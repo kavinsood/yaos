@@ -28,7 +28,9 @@ import { canonicalCanvasBytes, parseCanvasBytes } from "./shared/canvasCodec";
 
 const MAX_ROOT_BYTES = 1024 * 1024;
 const MAX_MARKDOWN_BYTES = MAX_CLIENT_MARKDOWN_BYTES;
-const MAX_CONTENT_COMPRESSED_BYTES = 4 * 1024 * 1024;
+// Gzip can be slightly larger than incompressible input. Keep recovery reads
+// above the 5 MiB logical Markdown ceiling without making this unbounded.
+const MAX_CONTENT_COMPRESSED_BYTES = 6 * 1024 * 1024;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false });
 

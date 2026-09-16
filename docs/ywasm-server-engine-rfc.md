@@ -1,8 +1,8 @@
 # RFC: ywasm as the YAOS3 server CRDT engine
 
-Status: Proposed
+Status: Implemented and deployed for YAOS3 qualification
 
-Date: 16 September 2026
+Date: 17 September 2026
 
 Target: `yaos3` greenfield server
 
@@ -29,10 +29,144 @@ explicit wrapper disposal, sync framing, memory admission, trap recovery, and a
 cross-engine conformance suite. Those are release requirements, not follow-up
 cleanup.
 
-Before the engine port, YAOS must repair its existing SQL and semantic
-compaction scheduling. Faster replay is not a substitute for preventing an
-unbounded replay tail or an unnecessarily old CRDT lineage. Step 1 of this RFC
-specifies that repair in implementation detail; it does not implement it.
+Before the engine port, YAOS repaired its existing SQL and semantic compaction
+scheduling. Faster replay is not a substitute for preventing an unbounded
+replay tail or an unnecessarily old CRDT lineage. Step 1 of this RFC records
+the implementation and its acceptance criteria.
+
+## Implementation outcome
+
+The RFC is implemented in the YAOS3 worktree. Production server document
+computation now uses the pinned ywasm artifact exclusively; Yjs remains a client
+dependency and an independent wire/test oracle. Durable Object SQLite, R2,
+authorization, alarms, receipts, catalogs, recovery, and socket coordination
+remain TypeScript and byte-oriented.
+
+The pinned artifact is built from `y-crdt/y-crdt` commit
+`37dfed7eaeeddc70205577c6d92b50c53023b133` with Rust 1.98.1 and wasm-pack
+0.15.0. The Wasm is 981,855 bytes with SHA-256
+`e66c0a21ddf9852b383c9b76e6f6ef29123d0760ffe7fb6a4358524a4f3cbf3b`;
+its configured maximum is 1,536 pages (96 MiB). Two clean builds produced
+identical Wasm and JavaScript wrapper hashes. The source pin, build inputs,
+license, census patch, generated bindings, and checksums are vendored together.
+
+Qualification completed on 17 September 2026:
+
+- all 169 regression suites passed with zero failures;
+- all six TypeScript programs passed (root product, tests, QA, Worker server,
+  production Node server, and CLI), as did the product, QA-product, Worker
+  release, and server-node builds;
+- worktree lint passed with three explicitly reported pre-existing or non-gated
+  findings, and `git diff --check` passed;
+- Worker and production Node capability conformance passed for every declared
+  admission, durability, recovery, attachment, collaboration, and semantic
+  Canvas capability;
+- the local destructive Worker integration suite and a fresh deployed
+  destructive integration suite passed through final generation-scoped purge;
+- 200,000 Unicode differential operations passed across CJK, emoji/ZWJ,
+  combining text, RTL text, and both Yjs/ywasm directions;
+- 10,000 create/apply/encode/free cycles settled at 3,932,160 bytes with zero
+  late Wasm-page growth;
+- corrupt input, trap recovery, multi-shard residency, exact census, schema
+  helpers, sync framing, and memory pre-admission gates passed;
+- full real-Worker headless lifecycle qualification passed 92/92 after closing
+  an admitted-creation replay race;
+- the framed-note matrix passed exact 5 MiB Unicode creation, one-byte-over
+  rejection, per-frame SQLite bounds, ordered-frame validation, atomic rollback
+  on a later-frame fault, validation-mirror isolation, cold reconstruction,
+  checkpoint fragmentation, recovery fragmentation, and semantic-compaction
+  policy coverage;
+- the production import path passed both a 32-note/four-request boundary test
+  and bounded preparation tests proving that only one potentially 5 MiB note is
+  read at a time;
+- focused final counts were 2/2 for exact-5-MiB and 32-note production HTTP
+  imports, 15/15 candidate admission, 12/12 onboarding, 21/21 SQLite lifecycle,
+  and 30/30 document-cache tests;
+- the pinned-engine qualification Worker bundle was 2,503.05 KiB (602.66 KiB
+  gzip), started in 11 ms, and bound all three Durable Object classes plus the
+  production R2 bucket. The exact bundle also passed a fresh
+  destructive validation deployment, which started in 16 ms and was deleted
+  after its generation-scoped purge completed.
+
+The retained qualification deployment is version
+`9b0f2a02-d655-4c2b-99ca-980ecc6423ca` at
+`yaos3-large-notes-final-20260917.kavinsood.workers.dev` in Cloudflare account
+`e142a43bd0cd02aa1d554f727b5f0b6c`. Cloudflare Access application
+`d44456b3-772a-4ce5-9daa-3a4f6aa714f5` is exact-host and permits only
+`kavin@cloudflare.com`. Temporary service tokens used by automated QA and
+disposable profiling deployments were deleted.
+
+Bootstrap verification uses an engine-independent `canonical-root-v1` digest
+rather than comparing Yjs and ywasm checkpoint bytes, because two valid wire
+encodings can represent the same root state. The digest sorts roots, CRDT map
+entries, and plain-object keys by deterministic UTF-16 code-unit order (never
+locale/ICU order). Focused tests cover multiple roots, reversed insertion
+orders, Unicode keys, nested maps, and semantic mutation across both engines.
+
+Final headless qualification also found an adjacent lifecycle crash/race: once
+the server admitted a creation it owned an exact operation/candidate fence, but
+a newer local watcher revision could make the client abandon that operation.
+The newer revision then reused the body behind a second operation ID and was
+permanently rejected with a fence mismatch. YAOS now treats admission as the
+irreversible distributed commitment point, persists the candidate ID and
+digest before single or batch admission, and after restart either proves the
+exact committed candidate outcome or reconstructs only that same fence. A
+deterministic crash/supersession regression and two consecutive 92/92 headless
+runs cover this boundary.
+
+The exact pinned artifact's local lifecycle medians were 81.94 to 28.73 ms for
+cold reconstruction, 1.60 to 0.50 ms for resident-tail apply, 0.076 to 0.045 ms
+for catch-up, and 0.658 to 0.189 ms for checkpoint encoding (Yjs to ywasm).
+Semantic rebuild was slower, 0.188 to 0.541 ms, but remained sub-millisecond.
+The earlier real-Workers large-history measurements below remain the isolated
+deployed CRDT-compute evidence. A public-network 100-shard operational profile
+also exposed an intermittent application-level `503 {"error":"unclaimed"}`.
+The cause was a real cross-isolate cache race: pre-claim capabilities traffic
+cached `claimed:false` for 60 seconds, while `/claim` could invalidate only the
+isolate that handled it. ServerConfig SQLite and Durable Object hibernation were
+correct. YAOS now never caches the one-way unclaimed state, while retaining the
+bounded cache after claim. Regression tests model another isolate completing
+claim without local invalidation.
+
+After that fix, a fresh public deployment published all 100 notes, crossed a
+20-second idle boundary, completed the full profile, and destroyed its
+generation-scoped data without another 503. Public-network medians included
+88.81 ms for one 100-body currentness query, 905.95 ms wall time for 100 parallel
+head reads, 835.87 ms for stale 100-body catch-up, 562.93 ms for unchanged
+100-body catch-up, and 372.32/360.86 ms propagation with one/seven receiving
+sockets. Thirty-two body sockets opened in 13.29 seconds and the thirty-third
+received the designed 429. The profiler also gained cross-edge claim probes,
+exact Access diagnostics, provider-socket Access headers, document-scoped
+tickets, current catch-up epochs, and the owner-request/operator-confirmed
+destruction flow.
+
+The original 263-second seed was not a CRDT-compute result: its helper made five
+serialized HTTP requests for each note. The production import profiler now
+calls `VaultSync.commitFreshBodies()` itself. On qualification deployment version
+`7e84d1e5-0812-43d2-a170-b160c2a1772a`, 100 × 4 KiB notes (409,600 Markdown
+bytes) completed in 7.787 seconds as four batches of 32, 32, 32, and 4 notes.
+Each batch made exactly four requests, for 16 requests total instead of 500;
+batch wall times were 1.919, 2.042, 2.218, and 1.605 seconds. This is a 33.8x
+wall-time reduction and a 31.25x request-count reduction in that public-network
+comparison. It does not imply local or same-region import must take eight
+seconds: every batch still paid four public Delhi-edge round trips.
+
+The same run imported an exact 5 MiB Unicode Markdown note in four mutation
+requests in 4.701 seconds, then reconstructed and byte-verified its
+5,243,035-byte encoded state in 2.789 seconds. A separate post-policy probe on
+version `6aa93222-1a22-4f65-ad7e-844de39f62a6` completed import in 3.656 seconds and
+readback in 1.625 seconds. After readback, the authoritative and validation
+states occupied 10,486,070 encoded bytes together, Wasm linear memory was
+43,646,976 bytes against its 100,663,296-byte maximum, transient reservation
+was zero, and neither memory pressure nor semantic-compaction retry was active.
+
+The final full profile's updated public-network medians were 87.45 ms for one
+100-body currentness query, 815.07 ms for 100 parallel head reads, 720.40 ms for
+stale 100-body catch-up, 389.74 ms for unchanged catch-up, and 362.12/798.76 ms
+propagation with one/seven receiving sockets. Thirty-two sockets opened in
+8.525 seconds and the thirty-third received the designed 429. These numbers
+replace the earlier profile above for the large-note/batched-import build; the
+isolated lifecycle table remains the CRDT-engine comparison.
 
 ## Scope
 
@@ -155,9 +289,10 @@ prevent unsafe growth before it happens.
 
 ### Regression boundary
 
-The current TypeScript implementation passed 164 suites with zero failures at
-the end of the experiment. This proves the baseline used for comparison, not
-that a future engine port automatically preserves those semantics.
+The pre-port TypeScript baseline passed 164 suites with zero failures. The
+implemented ywasm/framed-import worktree now passes 169 suites with zero
+failures. The former proves the comparison baseline; the latter is the final
+regression result rather than an assumption of semantic compatibility.
 
 ## Why adopt now
 
@@ -197,6 +332,118 @@ Wasm never calls Durable Object storage. TypeScript passes bounded
 `Uint8Array`s across the Wasm boundary and writes returned bytes using the same
 SQLite schema and transactional rules. This preserves the current durable model
 and avoids importing coordination policy into Rust.
+
+### Five MiB framed Markdown and batched initial import
+
+The former approximately 1.5 MB note limit conflated two different boundaries:
+the size of one SQLite value and the logical size of one Markdown document. The
+SQLite boundary is real and unchanged; the logical product boundary is now
+5 MiB of canonical UTF-8 Markdown.
+
+The implemented limits are:
+
+- `MAX_CLIENT_MARKDOWN_BYTES = 5 * 1024 * 1024`;
+- `MAX_DURABLE_UPDATE_BYTES = 1,750,000` for every journal row and checkpoint
+  fragment;
+- `MAX_CANDIDATE_UPDATE_BYTES = 6 * 1024 * 1024` for one logical candidate;
+- at most 16 independently valid CRDT frames per candidate;
+- an 8 MiB binary-envelope limit for candidate batches and catch-up;
+- 48 MiB encoded-state and 48 MiB transient server admission budgets beneath
+  the hard 96 MiB Wasm linear-memory maximum.
+
+Large-note creation does not split an opaque Yjs update at arbitrary byte
+offsets. The client appends canonical Markdown in UTF-8-scalar-safe chunks,
+capturing each transaction as a complete, independently decodable Yjs update.
+It seeds semantic roots only after the complete text exists, persists the
+ordered frames for exact replay, and also retains the aggregate state needed by
+normal client bookkeeping. The server validates frame count, each frame's
+1,750,000-byte limit, aggregate size, body epoch, candidate identity, and digest
+before CRDT work. It applies all frames in order to the isolated validation
+document, validates final canonical Markdown and metadata, then writes the
+frames as separate journal rows in one SQLite candidate transaction. A partial
+logical note is never committed.
+
+The candidate digest deliberately does not hash `mergeUpdates(frames)`. Yjs and
+yrs may produce different valid merged encodings for the same state, and a
+re-merge would bind the lifecycle fence to an engine-specific normalization
+rather than the exact durable evidence. A multi-frame digest is SHA-256 over
+`YAOSCF1\0`, frame count, and each ordered frame's little-endian length plus exact
+bytes. This makes order and boundaries unambiguous. A one-frame candidate keeps
+the previous SHA-256-of-update contract for compatibility.
+
+Creation remains behind the lifecycle fence throughout the upload. The four
+batch phases are:
+
+1. `POST /lifecycle/admissions` binds every operation to its exact candidate
+   ID and digest without publishing a root path;
+2. `POST /body/candidates` validates and atomically settles each complete
+   candidate (a batch may have durable per-note progress, but never a partial
+   note);
+3. `POST /lifecycle/admissions` reads back and proves the settled lifecycle
+   receipts idempotently;
+4. `POST /lifecycle/publish` publishes one root update for the batch.
+
+The client durably records each operation and candidate fence before the first
+network request. If a batch fails after some notes settle, replay asks for the
+same receipts and candidates; it does not invent replacement operation IDs.
+Initial import groups at most 32 ordinary notes and approximately 4 MiB of
+Markdown into one four-request batch. A note larger than the ordinary batch
+budget is a singleton. Preparation uses rolling bounded concurrency and reads
+only one potentially 5 MiB note at a time.
+
+This design preserves the sharded product model: the logical ceiling is per
+note, not per vault. Vault size is governed by durable storage, while concurrent
+resident notes share the cache, transient, and 96 MiB Wasm envelopes. The two
+resident CRDT states reported for a note are both ywasm documents: one is the
+durable authority and one is the pre-commit validation mirror. They are not a
+Yjs/Wasm duplicate representation.
+
+### Large-note and batch-import defects found during implementation
+
+The implementation and deployed profile found and fixed these additional
+issues:
+
+1. Arbitrary byte slicing would have produced invalid CRDT updates. Creation
+   now emits independently valid ordered transaction frames at Unicode-safe
+   text boundaries.
+2. Hashing a merged update was not an engine-independent exact fence. The
+   length-delimited ordered-frame digest above now binds precisely what SQLite
+   persists.
+3. The client and server ports declared batch operations, but the HTTP routes
+   and production orchestration did not implement them. Dedicated
+   `/lifecycle/admissions` and `/body/candidates` routes now make the intended
+   four requests; `/lifecycle/batch` correctly remains unavailable for creates.
+4. Edge forwarding treated the new binary route like an ordinary small JSON
+   request. `/body/candidates` now receives the bounded 8 MiB forwarding cap.
+5. The first batch DTO serialized the entire local `CandidateRecord`, including
+   the 5 MiB `pendingMarkdown` string beside its CRDT frames. The resulting
+   10,486,722-byte request exceeded the 8 MiB envelope. The wire DTO now carries
+   only identity, digest, epoch, and ordered frames.
+6. Default client residency allowed 24 loaded bodies, so a valid 32-note batch
+   could fail locally before making its intended request. Initial-import
+   residency now admits 32 while byte-cost admission remains authoritative.
+7. The old 16 MiB transient budget could reject a healthy 5 MiB reconstruction
+   after accounting for authority, validation, and overlapping buffers. The
+   budget is now 48 MiB, still gated by observed linear memory and the hard
+   96 MiB maximum.
+8. Import preparation previously risked retaining an entire count-bounded page
+   of large strings. Rolling preparation now keeps an ordinary batch plus only
+   one potentially 5 MiB read in flight.
+9. The compaction hard-size policy inherited from the 1.5 MB era could classify
+   a healthy 5 MiB live note as pathological, leading to repeated `head-changed`
+   retries in the first full profile. Hard size now requires actual history
+   amplification or operational pressure. The post-fix exact-note probe had no
+   pause, retry, or memory pressure.
+10. Creation replay assumed one update and could reproduce a different digest
+   after a crash. The local record now persists ordered frames and the admitted
+   candidate fence; replay proves or resubmits only those exact bytes.
+11. Partial candidate-batch settlement and a lost successful response needed
+    explicit coverage. Fault tests now prove that settled notes replay their
+    exact receipts and unsettled notes resume without duplicate publication.
+
+Together with the cross-isolate `unclaimed` cache race and admitted-creation
+supersession race described in the implementation outcome, these were product
+correctness issues uncovered by qualification, not merely profiler cleanup.
 
 ### Server-only `CrdtEngine`
 
@@ -300,9 +547,11 @@ the entire journal in JavaScript. If the reservation cannot fit, YAOS returns
 explicit resource backpressure before invoking Wasm. Throwing an exception is
 not treated as an isolate reset.
 
-Budgets must be recalibrated from deployed Worker telemetry. The current 48 MiB
-server encoded-state cache ceiling cannot simply be copied to a different
-allocator model.
+The initial budgets were recalibrated from deployed Worker telemetry to 48 MiB
+for encoded body state and 48 MiB for transient work, with observed linear
+memory as the final gate beneath the 96 MiB linker maximum. Continue tuning
+these product budgets from deployed evidence rather than treating them as
+allocator-independent constants.
 
 ### Traps and corrupt input
 
@@ -342,12 +591,15 @@ metadata and operational diagnostics.
 | Yjs-specific APIs throughout the server | Server-only `CrdtEngine`; forbid direct imports outside adapters/tests |
 | `y-protocols/sync` requires Yjs docs | Implement the small sync state machine over engine byte APIs |
 | Wrapper leaks | Scoped disposal, lint/review rule, 10,000-cycle leak soak |
-| Linear-memory high-water growth | Export telemetry, maximum pages, conservative pre-admission, per-note limits |
+| Linear-memory high-water growth | Export telemetry, 96 MiB maximum, conservative pre-admission, 5 MiB per-note limit |
 | No reliable Worker self-termination | Never depend on self-termination; fail before memory growth |
 | Wasm traps or panics | Bound input, fail closed, discard resident state, durable reconstruction |
 | Upstream/build drift | Exact source/toolchain pins, checksums, reproducible CI, tiny reviewed patch |
 | Incorrect offset documentation | YAOS-owned UTF-16 contract and Unicode differential fuzzing |
 | FFI copy overhead | Keep SQL byte-oriented, measure copies, avoid wrapper churn and whole-tail merges |
+| Logical notes exceed one SQLite row | Persist only independently valid updates of at most 1,750,000 bytes, in one candidate transaction |
+| Partial batch/network failure | Persist exact operation/candidate fences locally; make every settled note and phase idempotently replayable |
+| Larger healthy notes trigger compaction | Base hard compaction on history amplification or operational pressure, not live size alone |
 | “Wasm fixes everything” expectation | Report end-to-end SQL/network/coordination timings, not CRDT-only speedups |
 
 ## Delivery sequence
@@ -741,6 +993,10 @@ The ywasm production switch may ship only after:
 - 10,000 create/apply/encode/free cycles settle within the memory allowance;
 - multi-shard and one-pathological-note tests stay within the calibrated Worker
   admission envelope;
+- exact 5 MiB Unicode creation and one-byte-over rejection pass while every
+  durable update and checkpoint fragment remains at most 1,750,000 bytes;
+- 32-note production import uses exactly admission, candidates, lifecycle
+  readback, and root publication, with partial-batch replay coverage;
 - traps, corrupt updates, allocation failure, and restart recover from SQLite
   without partial publication;
 - deployed Worker lifecycle medians do not materially regress from the measured
@@ -750,13 +1006,14 @@ The ywasm production switch may ship only after:
 
 ## Final recommendation
 
-Proceed. The measured benefit is large on the exact pathological and lifecycle
-operations that threaten a constrained Durable Object, while the greenfield
-window makes the architectural cost lower now than later. But treat ywasm as a
-storage-engine component YAOS owns operationally, not as an npm optimization.
+Proceed with the implemented design. The measured benefit is large on the exact
+pathological and lifecycle operations that threaten a constrained Durable
+Object, while the greenfield window makes the architectural cost lower now than
+later. But treat ywasm as a storage-engine component YAOS owns operationally,
+not as an npm optimization.
 
-The immediate next task is Step 1 only. Its purpose is to guarantee that YAOS
-does not create pathological replay or CRDT states silently, regardless of which
-engine executes them. Once that foundation is proven, the Rust/Wasm build and
-engine boundary can proceed without confusing a scheduling defect with an
-engine performance result.
+Step 1, the Rust/Wasm build, the engine boundary, the production port, framed
+5 MiB notes, four-request initial import, the cross-isolate claim fix, and the
+qualification matrix are complete in this worktree. Continue recalibrating
+memory admission from production telemetry; that operational tuning does not
+change the adopted engine boundary.

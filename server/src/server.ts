@@ -1,4 +1,5 @@
-import * as Y from "yjs";
+import type { YwasmCrdtDocument } from "./crdt/ywasmCrdtEngine";
+import { ywasmCrdtEngine as crdtEngine } from "@yaos/crdt-engine";
 import { encodeBinaryEnvelope, YAOS_BINARY_CONTENT_TYPE } from "./shared/binaryEnvelope";
 import { BootstrapService } from "./bootstrap";
 import { MAX_BODY_ID_LENGTH, MAX_CATCH_UP_BODIES, MAX_CATCH_UP_BYTES, MAX_DURABLE_UPDATE_BYTES, MAX_JSON_BYTES } from "./contracts";
@@ -20,7 +21,7 @@ import { VaultCandidateService } from "./vaultCandidateService";
 import { VaultSemanticService } from "./vaultSemanticService";
 import { canonicalMarkdownBytes } from "./shared/markdownCodec";
 import { canonicalCanvasBytes } from "./shared/canvasCodec";
-import { materializeCanvasDocument, validateCanvasDocument } from "./shared/canvasSemanticDocument";
+import { materializeCanvasDocument, validateCanvasDocument } from "./crdt/canvasSemanticDocument";
 import { blobKey } from "./vaultObjectStore";
 import { VaultDocumentCache, type PendingVaultUpdate } from "./vaultDocumentCache";
 import { VaultLifecycleService } from "./vaultLifecycleService";
@@ -105,16 +106,16 @@ function sameSemanticCatalogHead(left: SemanticCatalogHead | null, right: Semant
 		&& left.bodyEpoch === right.bodyEpoch;
 }
 
-export function createVaultDocument(guid?: string): Y.Doc {
-	return new Y.Doc(guid ? { guid } : undefined);
+export function createVaultDocument(guid?: string): YwasmCrdtDocument {
+	return crdtEngine.createDocument(guid ?? crypto.randomUUID());
 }
 
-export function applyVaultUpdate(doc: Y.Doc, update: Uint8Array): void {
-	Y.applyUpdate(doc, update);
+export function applyVaultUpdate(doc: YwasmCrdtDocument, update: Uint8Array): void {
+	crdtEngine.applyUpdate(doc, update);
 }
 
-export function encodeVaultState(doc: Y.Doc): Uint8Array {
-	return Y.encodeStateAsUpdate(doc);
+export function encodeVaultState(doc: YwasmCrdtDocument): Uint8Array {
+	return crdtEngine.encodeStateAsUpdate(doc);
 }
 
 export interface RootPathPublication {
@@ -125,15 +126,21 @@ export interface RootPathPublication {
 }
 
 export function encodeRootPathPublicationUpdate(rootState: Uint8Array, operations: RootPathPublication[]): Uint8Array {
-	const doc = new Y.Doc({ guid: "root-publication" });
+	const doc = crdtEngine.createDocument("root-publication");
 	try {
-		Y.applyUpdate(doc, rootState);
-		const paths = doc.getMap<string>("pathToId");
-		for (const operation of operations) if (operation.sourcePath) paths.delete(operation.sourcePath);
-		for (const operation of operations) if (operation.lifecycle === "active") paths.set(operation.resultPath, operation.fileId);
-		return Y.encodeStateAsUpdate(doc);
+		crdtEngine.applyUpdate(doc, rootState);
+		crdtEngine.applyRootOperations(doc, [
+			...operations.filter((operation) => operation.sourcePath).map((operation) => ({
+				kind: "map-delete" as const, root: "pathToId", key: operation.sourcePath!,
+			})),
+			...operations.filter((operation) => operation.lifecycle === "active").map((operation) => ({
+				kind: "map-set" as const, root: "pathToId", key: operation.resultPath,
+				value: { shared: "value" as const, value: operation.fileId },
+			})),
+		], "root-path-publication");
+		return crdtEngine.encodeStateAsUpdate(doc);
 	} finally {
-		doc.destroy();
+		crdtEngine.destroyDocument(doc);
 	}
 }
 
@@ -161,6 +168,7 @@ export class VaultRuntime implements DrainPort {
 	private readonly bootstrap: BootstrapService;
 	private readonly recovery: VaultRecoveryService;
 	private readonly semanticCompaction: SemanticCompactionRuntime;
+	private lastObservedCommitSequence = 0;
 	private readonly persistence = new Map<string, PersistenceStatus>();
 	private readonly scheduledFlushes = new Map<string, Promise<void>>();
 	private flushChain: Promise<void> = Promise.resolve();
@@ -184,6 +192,7 @@ export class VaultRuntime implements DrainPort {
 		const vaultId = () => this.requireMetadata().vaultId;
 		const vaultGeneration = () => this.requireMetadata().vaultGeneration;
 		socketOwner = new VaultSocketService({
+			crdtEngine,
 			sockets: options.sockets,
 			cache: this.cache,
 			vaultId,
@@ -223,6 +232,10 @@ export class VaultRuntime implements DrainPort {
 			fenceSockets: (documentId, previousEpoch, currentEpoch) =>
 				this.sockets.fenceSemanticEpoch(documentId, previousEpoch, currentEpoch),
 		});
+		this.store.setCommitObserver((observation) => this.afterDurableCommit(observation));
+		this.cache.setLoadObserver((loaded) => this.afterDocumentLoaded(
+			loaded.documentId, loaded.encodedStateBytes,
+		));
 		this.lifecycle = new VaultLifecycleService({
 			store: this.store,
 			cache: this.cache,
@@ -235,7 +248,6 @@ export class VaultRuntime implements DrainPort {
 			runtimeEpoch: this.runtimeEpoch,
 			flush: (documentId) => this.flushDocument(documentId),
 			validateActor: (actor) => this.store.validateActor(actor) === "allowed",
-			onDocumentCommitted: (documentId, ingressBytes) => this.recordCompactionCommit(documentId, ingressBytes),
 		});
 		this.candidates = new VaultCandidateService({
 			store: this.store,
@@ -248,8 +260,6 @@ export class VaultRuntime implements DrainPort {
 			flush: (documentId) => this.flushDocument(documentId),
 			validateActor: (actor) => this.store.validateActor(actor) === "allowed",
 			shouldPauseAdmission: (documentId) => this.semanticCompaction.shouldPauseAdmission(documentId),
-			onDocumentCommitted: (documentId, ingressBytes, commitLatencyMs) =>
-				this.recordCompactionCommit(documentId, ingressBytes, commitLatencyMs),
 		});
 		this.semantic = new VaultSemanticService({
 			store: this.store,
@@ -261,8 +271,6 @@ export class VaultRuntime implements DrainPort {
 			validateActor: (actor) => this.store.validateActor(actor) === "allowed",
 			flush: (documentId) => this.flushDocument(documentId),
 			shouldPauseAdmission: (documentId) => this.semanticCompaction.shouldPauseAdmission(documentId),
-			onDocumentCommitted: (documentId, ingressBytes, commitLatencyMs) =>
-				this.recordCompactionCommit(documentId, ingressBytes, commitLatencyMs),
 			objectStore: options.objectStore,
 		});
 		this.bootstrap = new BootstrapService(
@@ -271,7 +279,11 @@ export class VaultRuntime implements DrainPort {
 			(documentId, overlappingCopies) => this.cache.reserveFullStateOperation(documentId, overlappingCopies),
 		);
 		this.recovery = new VaultRecoveryService({
-			alarms: options.alarms,
+			alarms: {
+				setAlarm: (scheduledTime) => this.armAlarmEarliest(scheduledTime),
+				deleteAlarm: () => options.alarms.deleteAlarm(),
+				getAlarm: () => options.alarms.getAlarm?.() ?? Promise.resolve(null),
+			},
 			objectStore: options.objectStore,
 			recoveryJobs: options.recoveryJobs,
 			store: () => this.store,
@@ -372,6 +384,10 @@ export class VaultRuntime implements DrainPort {
 				const authorized = this.authorize(actor, "vault.content.write");
 				return authorized instanceof Response ? authorized : this.candidates.handle(parts[1]!, request, authorized);
 			}
+			if (request.method === "POST" && url.pathname === "/body/candidates") {
+				const authorized = this.authorize(actor, "vault.content.write");
+				return authorized instanceof Response ? authorized : this.candidates.handleBatch(request, authorized);
+			}
 			if (request.method === "POST" && parts.length === 3 && parts[0] === "semantic" && parts[2] === "candidate") {
 				const authorized = this.authorize(actor, "vault.content.write");
 				return authorized instanceof Response ? authorized : this.semantic.candidate(parts[1]!, request, authorized);
@@ -396,6 +412,7 @@ export class VaultRuntime implements DrainPort {
 				const authorized = this.authorize(actor, "vault.lifecycle.write");
 				if (authorized instanceof Response) return authorized;
 				if (url.pathname === "/lifecycle") return this.lifecycle.handle(request, authorized);
+				if (url.pathname === "/lifecycle/admissions") return this.lifecycle.handleCreateAdmissionsBatch(request, authorized);
 				if (url.pathname === "/lifecycle/batch") return this.lifecycle.handleBatch(request, authorized);
 				if (url.pathname === "/lifecycle/publish") return this.lifecycle.publish(request, authorized);
 			}
@@ -565,8 +582,25 @@ export class VaultRuntime implements DrainPort {
 
 	async alarm(): Promise<void> {
 		for (const documentId of Object.keys(this.cache.diagnostics().pending)) await this.flushDocument(documentId);
-		for (const [documentId, state] of Object.entries(this.semanticCompaction.diagnostics())) {
-			if (state.admissionPaused) await this.semanticCompaction.measureAndMaybeCompact(documentId);
+		for (const documentId of this.store.listJournalCheckpointCandidates(
+			JOURNAL_COMPACT_ENTRIES, JOURNAL_COMPACT_BYTES, 25,
+		)) this.maintain(documentId);
+		for (const documentId of this.semanticCompaction.dueRetries(Date.now(), 25)) {
+			let enteredAttempt = false;
+			try {
+				if (!this.cache.get(documentId)) {
+					const kind = this.cache.documentKind(documentId);
+					this.cache.load(documentId, documentId !== "root", () => true, kind);
+				}
+				enteredAttempt = true;
+				await this.semanticCompaction.measureAndMaybeCompact(documentId);
+			} catch (error) {
+				if (!enteredAttempt) {
+					try { this.semanticCompaction.recordLoadFailure(documentId, error); }
+					catch (retryError) { console.warn("[yaos-vault] compaction load retry persistence failed", retryError); }
+				}
+				console.warn("[yaos-vault] semantic compaction alarm attempt failed", error);
+			}
 		}
 		this.store.reapExpiredRecoveryCaptures(Date.now(), 25);
 		this.store.reapExpiredRestoreAuthorities(Date.now(), 25);
@@ -574,13 +608,16 @@ export class VaultRuntime implements DrainPort {
 		if (gc && (gc.state === "marking" || gc.state === "sweeping") && gc.deadlineAt <= Date.now()) {
 			this.store.advanceGcEpoch(gc.epoch, "aborted");
 		}
-		const compactionRetry = Object.values(this.semanticCompaction.diagnostics())
-			.some((state) => state.admissionPaused);
-		if (compactionRetry) {
-			await this.options.alarms.setAlarm(Date.now() + PERSIST_RETRY_MS);
+		const compactionRetryAt = this.semanticCompaction.nextRetryAt();
+		const checkpointRetry = this.store.listJournalCheckpointCandidates(
+			JOURNAL_COMPACT_ENTRIES, JOURNAL_COMPACT_BYTES, 1,
+		).length > 0;
+		if (checkpointRetry) await this.armAlarmEarliest(Date.now() + PERSIST_RETRY_MS);
+		if (compactionRetryAt !== null) {
+			await this.armAlarmEarliest(Math.max(Date.now(), compactionRetryAt));
 		} else if (this.store.activeRecoveryCapture() || this.store.activeRestoreAuthority()
 			|| gc?.state === "marking" || gc?.state === "sweeping") {
-			await this.options.alarms.setAlarm(Date.now() + 60_000);
+			await this.armAlarmEarliest(Date.now() + 60_000);
 		}
 	}
 
@@ -588,11 +625,13 @@ export class VaultRuntime implements DrainPort {
 		let body: { vaultGeneration?: unknown };
 		try { body = await request.json(); } catch { return json({ error: "invalid_json" }, 400); }
 		if (!isCanonicalVaultId(body.vaultGeneration)) return json({ error: "invalid_vault_generation" }, 400);
-		const root = new Y.Doc({ guid: "root" });
-		root.getMap("sys").set("schemaVersion", SERVER_SCHEMA_VERSION);
-		root.getMap("sys").set("protocolVersion", SERVER_PROTOCOL_VERSION);
-		const result = this.store.provisionVault(vaultId, body.vaultGeneration, Y.encodeStateAsUpdate(root));
-		root.destroy();
+		const root = crdtEngine.createDocument("root");
+		crdtEngine.applyRootOperations(root, [
+			{ kind: "map-set", root: "sys", key: "schemaVersion", value: { shared: "value", value: SERVER_SCHEMA_VERSION } },
+			{ kind: "map-set", root: "sys", key: "protocolVersion", value: { shared: "value", value: SERVER_PROTOCOL_VERSION } },
+		], "vault-provision");
+		const result = this.store.provisionVault(vaultId, body.vaultGeneration, crdtEngine.encodeStateAsUpdate(root));
+		crdtEngine.destroyDocument(root);
 		this.deleted = false;
 		try {
 			await this.recovery.initializeProjection(vaultId);
@@ -623,6 +662,7 @@ export class VaultRuntime implements DrainPort {
 		await this.options.alarms.deleteAlarm();
 		await this.options.storage.deleteAll();
 		this.store = new VaultStore(this.options.storage);
+		this.store.setCommitObserver((observation) => this.afterDurableCommit(observation));
 		this.settings = new SettingsSyncStore(this.options.storage);
 		return json({ deleted: true });
 	}
@@ -691,7 +731,7 @@ export class VaultRuntime implements DrainPort {
 				failedRelease = release;
 				const reconstructed = this.store.reconstructDocument(bodyId);
 				try {
-					const update = Y.encodeStateAsUpdate(reconstructed.doc);
+					const update = crdtEngine.encodeStateAsUpdate(reconstructed.doc);
 					release();
 					const responseRelease = this.cache.reserveFullStateOperation(bodyId, 1, update.byteLength);
 					bodies.push({ ...metadata, status: 200, bodyEpoch: reconstructed.semanticEpoch,
@@ -703,7 +743,7 @@ export class VaultRuntime implements DrainPort {
 				} catch (error) {
 					release();
 					throw error;
-				} finally { reconstructed.doc.destroy(); }
+				} finally { crdtEngine.destroyDocument(reconstructed.doc); }
 			} catch {
 				failedRelease?.();
 				bodies.push({ bodyId, status: 500, error: "body_state_corrupt" });
@@ -851,12 +891,12 @@ export class VaultRuntime implements DrainPort {
 		try {
 			const reconstructed = this.store.reconstructDocument(bodyId);
 			try {
-				const bytes = Y.encodeStateAsUpdate(reconstructed.doc);
-				const content = canonicalMarkdownBytes(Y.Text.prototype.toString.call(reconstructed.doc.getText("body")));
+				const bytes = crdtEngine.encodeStateAsUpdate(reconstructed.doc);
+				const content = canonicalMarkdownBytes(crdtEngine.readText(reconstructed.doc, "body"));
 				return new Response(bytes.slice().buffer, { headers: { "content-type": "application/octet-stream", "cache-control": "no-store",
 					[BODY_EPOCH_HEADER]: String(reconstructed.semanticEpoch),
 					"x-yaos-body-id": bodyId, "x-yaos-generation": String(reconstructed.generation), "x-yaos-content-hash": await sha256Hex(content), "x-yaos-size": String(content.byteLength) } });
-			} finally { reconstructed.doc.destroy(); }
+			} finally { crdtEngine.destroyDocument(reconstructed.doc); }
 		} finally { release(); }
 	}
 
@@ -868,11 +908,11 @@ export class VaultRuntime implements DrainPort {
 		try {
 			const reconstructed = this.store.reconstructDocument("root", through);
 			try {
-				const bytes = Y.encodeStateAsUpdate(reconstructed.doc);
+				const bytes = crdtEngine.encodeStateAsUpdate(reconstructed.doc);
 				return new Response(bytes.slice().buffer, { headers: { "content-type": "application/octet-stream", "cache-control": "no-store",
 					[ROOT_EPOCH_HEADER]: String(reconstructed.semanticEpoch),
 					"x-yaos-generation": String(reconstructed.generation), "x-yaos-through-sequence": String(through) } });
-			} finally { reconstructed.doc.destroy(); }
+			} finally { crdtEngine.destroyDocument(reconstructed.doc); }
 		} finally { release(); }
 	}
 
@@ -925,8 +965,16 @@ export class VaultRuntime implements DrainPort {
 	}
 
 	private diagnostics(): Response {
+		const durableCompaction = this.store.listSemanticCompactionStates(100).map((state) => ({
+			...state,
+			journal: this.store.documentJournalStats(state.documentId),
+			tail: this.store.documentJournalTailStats(state.documentId),
+		}));
 		return json({ ...this.statusObject(), sockets: this.options.sockets.sockets().length, ...this.cache.diagnostics(),
-			semanticCompaction: this.semanticCompaction.diagnostics(), persistence: Object.fromEntries(this.persistence) });
+			semanticCompaction: this.semanticCompaction.diagnostics(),
+			semanticCompactionDurable: durableCompaction,
+			semanticCompactionNextRetryAt: this.semanticCompaction.nextRetryAt(),
+			persistence: Object.fromEntries(this.persistence) });
 	}
 
 	private statusObject() {
@@ -970,7 +1018,6 @@ export class VaultRuntime implements DrainPort {
 			const entries = this.cache.takePending(documentId);
 			if (entries.length === 0) return;
 			let published = 0;
-				const committedIngress: Array<{ bytes: number; latencyMs: number }> = [];
 			try {
 				if (entries.some((entry) => !entry.actor || this.store.validateActor(entry.actor) !== "allowed")) {
 					throw new Error("authority_superseded");
@@ -984,7 +1031,7 @@ export class VaultRuntime implements DrainPort {
 					}
 					const update = batch.length === 1
 						? batch[0]!.bytes
-						: Y.mergeUpdates(batch.map((entry) => entry.bytes));
+						: crdtEngine.mergeUpdates(batch.map((entry) => entry.bytes));
 					if (update.byteLength > MAX_DURABLE_UPDATE_BYTES) {
 						throw new Error("merged pending update exceeds durable value limit");
 					}
@@ -1008,12 +1055,10 @@ export class VaultRuntime implements DrainPort {
 						if (!this.lifecycle.activeBodyHead(documentId)) throw new Error("body_not_active");
 						catalog = await this.catalogForBatch(documentId, batch, update);
 					}
-					const commitStartedAt = performance.now();
 					const commit = this.store.commitUpdate({ documentId, update,
 						kind: frozenKind, expectedHead, catalog, semanticCatalog,
 						...(expectedSemanticHead ? { expectedSemanticHead } : {}),
 						actorAttributions: batch.map((entry) => ({ actor: entry.actor!, requestDigest: entry.digest })) });
-					const commitLatencyMs = performance.now() - commitStartedAt;
 					const changed = this.cache.applyDurableUpdate(documentId, update, commit.generation, "durable-socket-flush");
 					if (changed) {
 						for (const entry of batch) {
@@ -1027,12 +1072,8 @@ export class VaultRuntime implements DrainPort {
 						this.sockets.notifyBodyCommitted(documentId, commit.generation, commit.vaultSequence);
 					}
 					published += batch.length;
-					committedIngress.push({ bytes: update.byteLength, latencyMs: commitLatencyMs });
 				}
 				this.cache.completePendingPersistence(documentId);
-				for (const ingress of committedIngress) {
-					this.recordCompactionCommit(documentId, ingress.bytes, ingress.latencyMs);
-				}
 				this.persistence.set(documentId, { status: "healthy", lastError: null, lastSuccessAt: Date.now(), failures: this.persistence.get(documentId)?.failures ?? 0 });
 			} catch (error) {
 				success = false;
@@ -1086,11 +1127,11 @@ export class VaultRuntime implements DrainPort {
 		try {
 			const reconstructed = this.store.reconstructDocument(bodyId);
 			try {
-				Y.applyUpdate(reconstructed.doc, update, "flush-metadata");
-				const content = canonicalMarkdownBytes(Y.Text.prototype.toString.call(reconstructed.doc.getText("body")));
+				crdtEngine.applyUpdate(reconstructed.doc, update, "flush-metadata");
+				const content = canonicalMarkdownBytes(crdtEngine.readText(reconstructed.doc, "body"));
 				return { bodyId, fileId: current.fileId, path: current.path, previousPath: null, lifecycle: "active",
 					bodyGeneration: reconstructed.generation + 1, contentHash: await sha256Hex(content), size: content.byteLength };
-			} finally { reconstructed.doc.destroy(); }
+			} finally { crdtEngine.destroyDocument(reconstructed.doc); }
 		} finally { release(); }
 	}
 
@@ -1118,38 +1159,75 @@ export class VaultRuntime implements DrainPort {
 		try {
 			const reconstructed = this.store.reconstructDocument(current.documentId);
 			try {
-				Y.applyUpdate(reconstructed.doc, update, "semantic-flush-metadata");
+				crdtEngine.applyUpdate(reconstructed.doc, update, "semantic-flush-metadata");
 				const validation = await validateCanvasDocument(reconstructed.doc);
 				if (validation) throw new Error(validation);
 				const content = canonicalCanvasBytes(await materializeCanvasDocument(reconstructed.doc, false));
 				return { documentId: current.documentId, fileId: current.fileId, kind: "canvas", format: "json-canvas",
 					formatVersion: 1, path: current.path, previousPath: null, lifecycle: "active",
 					documentGeneration: reconstructed.generation + 1, contentHash: await sha256Hex(content), size: content.byteLength };
-			} finally { reconstructed.doc.destroy(); }
+			} finally { crdtEngine.destroyDocument(reconstructed.doc); }
 		} finally { release(); }
 	}
 
 	private maintain(documentId: string): void {
 		try {
-			if (!shouldCompactJournal(this.store.documentJournalStats(documentId))) return;
+			// A few narrow unit fakes predate tail accounting; production VaultStore
+			// always supplies the tail query.
+			const tailStore = this.store as VaultStore & {
+				documentJournalTailStats?: (id: string) => { entries: number; bytes: number };
+			};
+			const stats = typeof tailStore.documentJournalTailStats === "function"
+				? tailStore.documentJournalTailStats(documentId)
+				: this.store.documentJournalStats(documentId);
+			if (!shouldCompactJournal(stats)) return;
 			this.writeLiveCheckpoint(documentId);
 			if (this.store.activePins().length > 0) return;
 			const floor = Math.max(0, this.store.currentSequence() - FEED_RETAIN_SEQUENCES);
 			if (floor > this.store.journalFloor()) this.store.advanceFeedFloor(floor);
 		} catch (error) {
 			console.warn("[yaos-vault] maintenance failed", error);
+			this.options.execution.waitUntil(this.armAlarmEarliest(Date.now() + PERSIST_RETRY_MS)
+				.catch((alarmError) => console.warn("[yaos-vault] maintenance retry alarm failed", alarmError)));
 		}
 	}
 
-	private recordCompactionCommit(documentId: string, ingressBytes: number, commitLatencyMs?: number): void {
-		const task = this.semanticCompaction.recordCommit(documentId, ingressBytes, commitLatencyMs)
-			.then(async () => {
-				if (this.semanticCompaction.shouldPauseAdmission?.(documentId) ?? false) {
-					await this.options.alarms.setAlarm(Date.now() + PERSIST_RETRY_MS);
-				}
-			})
-			.catch((error: unknown) => console.warn("[yaos-vault] semantic compaction failed", error));
+	private afterDurableCommit(observation: {
+		documentId: string; ingressBytes: number; commitLatencyMs: number; vaultSequence: number; sequenceReset?: boolean;
+	}): void {
+		if (observation.sequenceReset) this.lastObservedCommitSequence = 0;
+		if (observation.vaultSequence <= this.lastObservedCommitSequence) return;
+		this.lastObservedCommitSequence = observation.vaultSequence;
+		const task = Promise.resolve().then(async () => {
+			this.maintain(observation.documentId);
+			try {
+				await this.semanticCompaction.recordCommit(
+					observation.documentId, observation.ingressBytes, observation.commitLatencyMs,
+				);
+			} finally {
+				const retryAt = this.semanticCompaction.nextRetryAt();
+				if (retryAt !== null) await this.armAlarmEarliest(Math.max(Date.now(), retryAt));
+			}
+		}).catch((error: unknown) => console.warn("[yaos-vault] semantic compaction failed", error));
 		this.options.execution.waitUntil(task);
+	}
+
+	private afterDocumentLoaded(documentId: string, encodedStateBytes: number): void {
+		const task = Promise.resolve().then(async () => {
+			this.maintain(documentId);
+			try { await this.semanticCompaction.documentLoaded(documentId, encodedStateBytes); }
+			finally {
+				const retryAt = this.semanticCompaction.nextRetryAt();
+				if (retryAt !== null) await this.armAlarmEarliest(Math.max(Date.now(), retryAt));
+			}
+		}).catch((error: unknown) => console.warn("[yaos-vault] post-load maintenance failed", error));
+		this.options.execution.waitUntil(task);
+	}
+
+	private async armAlarmEarliest(scheduledTime: number): Promise<void> {
+		const current = await this.options.alarms.getAlarm?.();
+		if (current !== undefined && current !== null && current <= scheduledTime) return;
+		await this.options.alarms.setAlarm(scheduledTime);
 	}
 
 	private writeLiveCheckpoint(documentId: string): void {

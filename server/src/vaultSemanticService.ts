@@ -1,11 +1,12 @@
-import * as Y from "yjs";
+import { mapValue, snapshotRootMap } from "./crdt/rootSchema";
+import { ywasmCrdtEngine as crdtEngine } from "@yaos/crdt-engine";
 import { MAX_CANDIDATE_BYTES } from "./contracts";
 import type { VaultActorContext } from "./collaboration";
 import type { ObjectStorePort } from "./platformPorts";
 import { sha256Hex } from "./hex";
 import { BoundedBodyError, readBoundedBytes } from "./readBoundedBytes";
 import { canonicalCanvasBytes } from "./shared/canvasCodec";
-import { materializeCanvasDocument, validateCanvasDocument } from "./shared/canvasSemanticDocument";
+import { materializeCanvasDocument, validateCanvasDocument } from "./crdt/canvasSemanticDocument";
 import type { SemanticPathRef } from "./shared/canvasTypes";
 import { safeCanvasPath } from "./shared/vaultPath";
 import { blobKey } from "./vaultObjectStore";
@@ -48,7 +49,6 @@ interface SemanticServiceOptions {
 	sockets: VaultSocketService;
 	flush: (documentId: string) => Promise<boolean>;
 	shouldPauseAdmission?: (documentId: string) => boolean;
-	onDocumentCommitted?: (documentId: string, ingressBytes: number, commitLatencyMs?: number) => void;
 	objectStore?: ObjectStorePort;
 }
 
@@ -111,12 +111,13 @@ export class VaultSemanticService {
 		try {
 			const root = this.options.store.reconstructDocument("root");
 			try {
-				const vector = Y.encodeStateVector(root.doc);
-				const blob = root.doc.getMap<{ hash: string; size: number; revision: string }>("pathToBlob").get(path);
+				const vector = crdtEngine.encodeStateVector(root.doc);
+				const blob = snapshotRootMap(root.doc, "pathToBlob").get(path) as
+					{ hash: string; size: number; revision: string } | undefined;
 				if (!blob || blob.revision !== sourceRevision || blob.hash !== sourceHash || blob.size !== sourceSize) {
 					return json({ error: "attachment_head_changed" }, 409);
 				}
-				if (root.doc.getMap("pathToId").has(path) || root.doc.getMap("pathToSemantic").has(path)) {
+				if (snapshotRootMap(root.doc, "pathToId").has(path) || snapshotRootMap(root.doc, "pathToSemantic").has(path)) {
 					return json({ error: "path_authority_conflict" }, 409);
 				}
 				const object = await this.options.objectStore?.head(blobKey(this.options.vaultId(), this.options.vaultGeneration(), sourceHash));
@@ -124,9 +125,9 @@ export class VaultSemanticService {
 					return json({ error: this.options.objectStore ? "promotion_blob_missing" : "attachments_unavailable" }, 409);
 				}
 				const releaseSemantic = this.options.cache.reserveFullStateOperation(documentId, 2, update.byteLength);
-				const semantic = new Y.Doc({ guid: documentId });
+				const semantic = crdtEngine.createDocument(documentId);
 				try {
-					try { Y.applyUpdate(semantic, update, "semantic-promotion-validation"); }
+					try { crdtEngine.applyUpdate(semantic, update, "semantic-promotion-validation"); }
 					catch { return json({ error: "invalid_semantic_update" }, 409); }
 					const validation = await validateCanvasDocument(semantic);
 					if (validation) return json({ error: validation }, 409);
@@ -135,14 +136,16 @@ export class VaultSemanticService {
 						return json({ error: "promotion_content_mismatch" }, 409);
 					}
 				} finally {
-					semantic.destroy();
+					crdtEngine.destroyDocument(semantic);
 					releaseSemantic();
 				}
-				root.doc.getMap("pathToBlob").delete(path);
-				root.doc.getMap<SemanticPathRef>("pathToSemantic").set(path, semanticRef(documentId));
-				if (!hasSafeRootAttachmentSemantics(root.doc)) return json({ error: "unsafe_root_authority" }, 409);
-				rootUpdate = Y.encodeStateAsUpdate(root.doc, vector);
-			} finally { root.doc.destroy(); }
+				crdtEngine.applyRootOperations(root.doc, [
+					{ kind: "map-delete", root: "pathToBlob", key: path },
+					{ kind: "map-set", root: "pathToSemantic", key: path, value: mapValue(semanticRef(documentId)) },
+				], "semantic-promotion");
+				if (!hasSafeRootAttachmentSemantics(root.doc, crdtEngine)) return json({ error: "unsafe_root_authority" }, 409);
+				rootUpdate = crdtEngine.encodeStateAsUpdate(root.doc, vector);
+			} finally { crdtEngine.destroyDocument(root.doc); }
 		} finally { releaseRoot(); }
 		try {
 			if (!this.options.validateActor(actor)) return json({ error: "authority_superseded" }, 409);
@@ -215,7 +218,7 @@ export class VaultSemanticService {
 		try {
 			const state = this.options.store.reconstructDocument(documentId);
 			try { materialized = canonicalCanvasBytes(await materializeCanvasDocument(state.doc, false)); }
-			finally { state.doc.destroy(); }
+			finally { crdtEngine.destroyDocument(state.doc); }
 		} finally { releaseState(); }
 		if (materialized.byteLength !== size || await sha256Hex(materialized) !== contentHash) return json({ error: "semantic_head_content_mismatch" }, 409);
 		const releaseRoot = this.options.cache.reserveFullStateOperation("root", 3);
@@ -223,17 +226,22 @@ export class VaultSemanticService {
 		try {
 			const root = this.options.store.reconstructDocument("root");
 			try {
-				const vector = Y.encodeStateVector(root.doc);
-				const current = root.doc.getMap<SemanticPathRef>("pathToSemantic").get(path);
-				if (current?.documentId !== documentId || root.doc.getMap("pathToBlob").has(path) || root.doc.getMap("pathToId").has(path)) {
+				const vector = crdtEngine.encodeStateVector(root.doc);
+				const current = snapshotRootMap(root.doc, "pathToSemantic").get(path) as SemanticPathRef | undefined;
+				if (current?.documentId !== documentId || snapshotRootMap(root.doc, "pathToBlob").has(path)
+					|| snapshotRootMap(root.doc, "pathToId").has(path)) {
 					return json({ error: "root_semantic_head_changed" }, 409);
 				}
-				root.doc.getMap("pathToSemantic").delete(path);
-				root.doc.getMap("pathToBlob").set(path, { hash: blobHash, size: blobSize, revision: operationId });
-				root.doc.getMap("blobMeta").set(blobHash, { size: blobSize, mime, createdAt: Date.now(), device: actor.deviceId });
-				if (!hasSafeRootAttachmentSemantics(root.doc)) return json({ error: "unsafe_root_authority" }, 409);
-				rootUpdate = Y.encodeStateAsUpdate(root.doc, vector);
-			} finally { root.doc.destroy(); }
+				crdtEngine.applyRootOperations(root.doc, [
+					{ kind: "map-delete", root: "pathToSemantic", key: path },
+					{ kind: "map-set", root: "pathToBlob", key: path,
+						value: mapValue({ hash: blobHash, size: blobSize, revision: operationId }) },
+					{ kind: "map-set", root: "blobMeta", key: blobHash,
+						value: mapValue({ size: blobSize, mime, createdAt: Date.now(), device: actor.deviceId }) },
+				], "semantic-demotion");
+				if (!hasSafeRootAttachmentSemantics(root.doc, crdtEngine)) return json({ error: "unsafe_root_authority" }, 409);
+				rootUpdate = crdtEngine.encodeStateAsUpdate(root.doc, vector);
+			} finally { crdtEngine.destroyDocument(root.doc); }
 		} finally { releaseRoot(); }
 		try {
 			if (!this.options.validateActor(actor)) return json({ error: "authority_superseded" }, 409);
@@ -334,10 +342,8 @@ export class VaultSemanticService {
 			let durableGeneration = currentHead?.generation ?? 0;
 			let vaultSequence = currentHead?.latestSequence ?? 0;
 			let receiptCommitted = false;
-			let commitLatencyMs: number | undefined;
 			if (validated.changesState) {
 				const nextGeneration = durableGeneration + 1;
-				const startedAt = performance.now();
 				try {
 					if (!this.options.validateActor(actor)) {
 						this.options.cache.discardValidatedBodyUpdate(documentId);
@@ -353,7 +359,6 @@ export class VaultSemanticService {
 							bodyEpoch, durableGeneration: nextGeneration, vaultGeneration: this.options.vaultGeneration(),
 							runtimeEpoch: this.options.runtimeEpoch, contentHash, size: validated.contentBytes.byteLength } : undefined,
 						actorAttributions: [{ actor, operationId: candidateId, requestDigest: candidateDigest }] });
-					commitLatencyMs = performance.now() - startedAt;
 					durableGeneration = commit.generation;
 					vaultSequence = commit.vaultSequence;
 					receiptCommitted = active !== null;
@@ -365,7 +370,6 @@ export class VaultSemanticService {
 				}
 				if (this.options.cache.commitValidatedBodyUpdate(documentId, update, durableGeneration,
 					bodyEpoch, request, validated)) this.options.sockets.broadcastDocumentUpdate(documentId, update, request);
-				this.options.onDocumentCommitted?.(documentId, update.byteLength, commitLatencyMs);
 			}
 			if (!active) {
 				if (!this.options.validateActor(actor)) {
@@ -432,15 +436,17 @@ export class VaultSemanticService {
 		try {
 			const root = this.options.store.reconstructDocument("root");
 			try {
-				const stateVector = Y.encodeStateVector(root.doc);
-				if (root.doc.getMap("pathToId").has(path) || root.doc.getMap("pathToBlob").has(path)
-					|| root.doc.getMap("pathToSemantic").has(path)) {
+				const stateVector = crdtEngine.encodeStateVector(root.doc);
+				if (snapshotRootMap(root.doc, "pathToId").has(path) || snapshotRootMap(root.doc, "pathToBlob").has(path)
+					|| snapshotRootMap(root.doc, "pathToSemantic").has(path)) {
 					return json({ error: "path_authority_conflict" }, 409);
 				}
-				root.doc.getMap<SemanticPathRef>("pathToSemantic").set(path, semanticRef(documentId));
-				if (!hasSafeRootAttachmentSemantics(root.doc)) return json({ error: "unsafe_root_authority" }, 409);
-				rootUpdate = Y.encodeStateAsUpdate(root.doc, stateVector);
-			} finally { root.doc.destroy(); }
+				crdtEngine.applyRootOperations(root.doc, [
+					{ kind: "map-set", root: "pathToSemantic", key: path, value: mapValue(semanticRef(documentId)) },
+				], "semantic-create");
+				if (!hasSafeRootAttachmentSemantics(root.doc, crdtEngine)) return json({ error: "unsafe_root_authority" }, 409);
+				rootUpdate = crdtEngine.encodeStateAsUpdate(root.doc, stateVector);
+			} finally { crdtEngine.destroyDocument(root.doc); }
 		} finally { releaseRoot(); }
 		if (!this.options.validateActor(actor)) return json({ error: "authority_superseded" }, 409);
 		const commit = this.options.store.commitUpdate({ documentId: "root", update: rootUpdate, kind: "semantic-create",
@@ -507,21 +513,24 @@ export class VaultSemanticService {
 		try {
 			const root = this.options.store.reconstructDocument("root");
 			try {
-				const stateVector = Y.encodeStateVector(root.doc);
-				const semantic = root.doc.getMap<SemanticPathRef>("pathToSemantic");
+				const stateVector = crdtEngine.encodeStateVector(root.doc);
+				const semantic = snapshotRootMap(root.doc, "pathToSemantic") as ReadonlyMap<string, SemanticPathRef>;
+				const operations = [];
 				if (kind !== "revive") {
 					const current = semantic.get(head.path);
 					if (current?.documentId !== documentId) return json({ error: "root_semantic_head_changed" }, 409);
-					semantic.delete(head.path);
+					operations.push({ kind: "map-delete" as const, root: "pathToSemantic", key: head.path });
 				}
 				if (kind !== "delete") {
-					if (root.doc.getMap("pathToId").has(resultPath) || root.doc.getMap("pathToBlob").has(resultPath)
+					if (snapshotRootMap(root.doc, "pathToId").has(resultPath) || snapshotRootMap(root.doc, "pathToBlob").has(resultPath)
 						|| semantic.has(resultPath)) return json({ error: "path_authority_conflict" }, 409);
-					semantic.set(resultPath, semanticRef(documentId));
+					operations.push({ kind: "map-set" as const, root: "pathToSemantic", key: resultPath,
+						value: mapValue(semanticRef(documentId)) });
 				}
-				if (!hasSafeRootAttachmentSemantics(root.doc)) return json({ error: "unsafe_root_authority" }, 409);
-				rootUpdate = Y.encodeStateAsUpdate(root.doc, stateVector);
-			} finally { root.doc.destroy(); }
+				crdtEngine.applyRootOperations(root.doc, operations, `semantic-${kind}`);
+				if (!hasSafeRootAttachmentSemantics(root.doc, crdtEngine)) return json({ error: "unsafe_root_authority" }, 409);
+				rootUpdate = crdtEngine.encodeStateAsUpdate(root.doc, stateVector);
+			} finally { crdtEngine.destroyDocument(root.doc); }
 		} finally { releaseRoot(); }
 		const documentGeneration = this.options.store.documentHead(documentId)?.generation ?? head.generation;
 		const lifecycle = kind === "delete" ? "tombstoned" as const : "active" as const;
@@ -556,7 +565,7 @@ export class VaultSemanticService {
 		const state = this.options.cache.load(documentId, true, () => this.options.cache.admitBody(documentId), "canvas");
 		const release = this.options.cache.reserveFullStateOperation(documentId, 1);
 		try {
-			const bytes = Y.encodeStateAsUpdate(state.doc);
+			const bytes = crdtEngine.encodeStateAsUpdate(state.doc);
 			return new Response(bytes.slice().buffer, { headers: { "content-type": "application/octet-stream",
 				"cache-control": "no-store", "x-yaos-document-id": documentId,
 				[BODY_EPOCH_HEADER]: String(state.semanticEpoch),

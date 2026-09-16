@@ -1,5 +1,7 @@
-import * as Y from "yjs";
 import { gzipSync } from "fflate";
+import type { YwasmCrdtDocument } from "./crdt/ywasmCrdtEngine.js";
+import { ywasmCrdtEngine as crdtEngine } from "./crdt/ywasmWorkerCrdtEngine.js";
+import { materializeCanvasDocument, validateCanvasDocument } from "./crdt/canvasSemanticDocument.js";
 import { sha256Hex } from "./hex.js";
 import {
 	decodeHashedRecoveryObject,
@@ -80,7 +82,6 @@ import {
 } from "./recoveryExecutor.js";
 import { isCanonicalVaultId } from "./vaultId.js";
 import { canonicalCanvasBytes } from "./shared/canvasCodec.js";
-import { materializeCanvasDocument, validateCanvasDocument } from "./shared/canvasSemanticDocument.js";
 import {
 	RecoveryJobStateStore,
 	isTerminalRecoveryState,
@@ -164,17 +165,17 @@ function concatenateBytes(parts: readonly Uint8Array[], knownTotal?: number): Ui
 	return bytes;
 }
 
-export function createRecoveryDocument(guid: string): Y.Doc {
-	return new Y.Doc({ guid });
+export function createRecoveryDocument(guid: string): YwasmCrdtDocument {
+	return crdtEngine.createDocument(guid);
 }
 
 /** Applies only complete logical Yjs updates; an incomplete checkpoint stays durable for the next slice. */
-export function applyCompleteRecoveryRecipeParts(doc: Y.Doc, parts: readonly ReconstructionPart[]): boolean {
+export function applyCompleteRecoveryRecipeParts(doc: YwasmCrdtDocument, parts: readonly ReconstructionPart[]): boolean {
 	for (let index = 0; index < parts.length;) {
 		const first = parts[index]!;
 		if (first.kind === "journal") {
 			if (first.fragmentIndex !== 0 || first.fragmentCount !== 1) throw new Error("journal recipe part is fragmented");
-			Y.applyUpdate(doc, first.bytes, "journal-load");
+			crdtEngine.applyUpdate(doc, first.bytes, "journal-load");
 			index++;
 			continue;
 		}
@@ -188,14 +189,14 @@ export function applyCompleteRecoveryRecipeParts(doc: Y.Doc, parts: readonly Rec
 				throw new Error("checkpoint recipe fragments are inconsistent");
 			}
 		}
-		Y.applyUpdate(doc, concatenateBytes(fragments.map((fragment) => fragment.bytes)), "checkpoint-load");
+		crdtEngine.applyUpdate(doc, concatenateBytes(fragments.map((fragment) => fragment.bytes)), "checkpoint-load");
 		index += fragments.length;
 	}
 	return true;
 }
 
 /** Applies durable parts without ever loading an array of their BLOB payloads. */
-export function applyStoredRecoveryRecipeParts(doc: Y.Doc, store: RecoveryJobStateStore): boolean {
+export function applyStoredRecoveryRecipeParts(doc: YwasmCrdtDocument, store: RecoveryJobStateStore): boolean {
 	let ordinal = store.reconstructionPartMetadataAtOrAfter(0)?.ordinal ?? 0;
 	for (;;) {
 		const first = store.reconstructionPartMetadataAtOrAfter(ordinal);
@@ -205,7 +206,7 @@ export function applyStoredRecoveryRecipeParts(doc: Y.Doc, store: RecoveryJobSta
 			if (first.fragmentIndex !== 0 || first.fragmentCount !== 1) throw new Error("journal recipe part is fragmented");
 			const bytes = store.readReconstructionPart(first.ordinal);
 			if (!bytes || bytes.byteLength !== first.byteLength) throw new Error("journal recipe part disappeared");
-			Y.applyUpdate(doc, bytes, "journal-load");
+			crdtEngine.applyUpdate(doc, bytes, "journal-load");
 			ordinal++;
 			continue;
 		}
@@ -232,7 +233,7 @@ export function applyStoredRecoveryRecipeParts(doc: Y.Doc, store: RecoveryJobSta
 			checkpoint.set(bytes, offset);
 			offset += bytes.byteLength;
 		}
-		Y.applyUpdate(doc, checkpoint, "checkpoint-load");
+		crdtEngine.applyUpdate(doc, checkpoint, "checkpoint-load");
 		ordinal += first.fragmentCount;
 	}
 }
@@ -2143,7 +2144,7 @@ export class RecoveryJobRuntime {
 				if (!staged || !reconstruction.stagingHash) throw new BodyDefectError("missing_history", entry, "staged reconstruction missing");
 				const encoded = staged.bytes;
 				if (await sha256Hex(encoded) !== reconstruction.stagingHash) throw new BodyDefectError("corrupt_history", entry, "staged reconstruction corrupt");
-				Y.applyUpdate(doc, encoded);
+				crdtEngine.applyUpdate(doc, encoded, "staging-load");
 				oldStagingKey = reconstruction.stagingKey;
 			}
 			let chunk: RecipeChunk;
@@ -2171,7 +2172,7 @@ export class RecoveryJobRuntime {
 			}
 			this.store.clearReconstructionParts();
 			if (chunk.nextCursor !== null) {
-				const encoded = Y.encodeStateAsUpdate(doc);
+				const encoded = crdtEngine.encodeStateAsUpdate(doc);
 				const hash = await sha256Hex(encoded);
 				const key = `${recoveryStagingPrefix(recoveryV2Prefix(vaultPrefix(descriptor.vaultId, descriptor.vaultGeneration)), recoveryJobId("capture", descriptor.vaultId, descriptor.vaultGeneration, descriptor.captureId))}/body/${documentId}/${hash}.yjs`;
 				await this.bucket().put(key, encoded, { contentType: "application/octet-stream" });
@@ -2184,7 +2185,7 @@ export class RecoveryJobRuntime {
 				const validation = await validateCanvasDocument(doc);
 				if (validation) throw new BodyDefectError("corrupt_history", entry, validation);
 				plain = canonicalCanvasBytes(await materializeCanvasDocument(doc, false));
-			} else plain = encoder.encode(doc.getText("body").toJSON());
+			} else plain = encoder.encode(crdtEngine.readText(doc, "body"));
 			if (plain.byteLength !== reconstruction.expectedSize || await sha256Hex(plain) !== reconstruction.expectedContentHash) {
 				throw new BodyDefectError("hash_mismatch", entry, "reconstructed Markdown mismatch");
 			}
@@ -2221,7 +2222,7 @@ export class RecoveryJobRuntime {
 			if (isRetryableFailure(error)) throw new RetryableRecoveryError("reconstruction_transient", RecoveryJobStateStore.safeInternalError(error));
 			throw new BodyDefectError("corrupt_history", entry, RecoveryJobStateStore.safeInternalError(error));
 		} finally {
-			doc.destroy();
+			crdtEngine.destroyDocument(doc);
 			memoryLease.release();
 			this.persistMemoryDiagnostics();
 		}
@@ -2584,7 +2585,7 @@ export class RecoveryJobRuntime {
 				if (!staged || !reconstruction.stagingHash) throw new RetryableRecoveryError("projection_staging_missing", "projection staging state missing");
 				const encoded = staged.bytes;
 				if (await sha256Hex(encoded) !== reconstruction.stagingHash) throw new TerminalRecoveryError("projection_staging_corrupt", "projection staging state corrupt");
-				Y.applyUpdate(doc, encoded);
+				crdtEngine.applyUpdate(doc, encoded, "staging-load");
 				oldStagingKey = reconstruction.stagingKey;
 			}
 			const chunk = await authority.getProjectionRecipeChunk({
@@ -2616,7 +2617,7 @@ export class RecoveryJobRuntime {
 			}
 			this.store.clearReconstructionParts();
 			if (chunk.nextCursor !== null) {
-				const encoded = Y.encodeStateAsUpdate(doc);
+				const encoded = crdtEngine.encodeStateAsUpdate(doc);
 				const hash = await sha256Hex(encoded);
 				const key = `${recoveryStagingPrefix(recoveryV2Prefix(vaultPrefix(descriptor.vaultId, descriptor.vaultGeneration)), recoveryJobId("projection", descriptor.vaultId, descriptor.vaultGeneration))}/body/${entry.bodyId}/${hash}.yjs`;
 				await this.bucket().put(key, encoded, { contentType: "application/octet-stream" });
@@ -2624,7 +2625,7 @@ export class RecoveryJobRuntime {
 				if (oldStagingKey && oldStagingKey !== key) await this.bucket().delete(oldStagingKey);
 				return;
 			}
-			const bodyText: string = doc.getText("body").toJSON();
+			const bodyText = crdtEngine.readText(doc, "body");
 			const plain = encoder.encode(bodyText);
 			if (plain.byteLength !== entry.size || await sha256Hex(plain) !== entry.contentHash) {
 				throw new TerminalRecoveryError("projection_hash_mismatch", "projection content mismatch");
@@ -2659,7 +2660,7 @@ export class RecoveryJobRuntime {
 			this.store.setMetadata("projection-cursor", { cursor: page.nextCursor });
 			this.commit(record, { state: "materializing", processedEntries: record.processedEntries + 1, updatedAt: Date.now() });
 		} finally {
-			doc.destroy();
+			crdtEngine.destroyDocument(doc);
 			memoryLease.release();
 			this.persistMemoryDiagnostics();
 		}

@@ -196,6 +196,7 @@ interface AlarmClaim {
 export interface AlarmPort {
 	setAlarm(scheduledTime: number | Date): Promise<void>;
 	deleteAlarm(): Promise<void>;
+	getAlarm(): Promise<number | null>;
 }
 
 export interface AlarmSchedulerOptions {
@@ -239,7 +240,15 @@ export class DurableAlarmScheduler {
 			deleteAlarm: async () => {
 				await this.delete(kind, name);
 			},
+			getAlarm: async () => this.get(kind, name),
 		};
+	}
+
+	get(kind: ActorKind, name: string): number | null {
+		return this.storage.sql.exec<{ deadline_ms: number }>(
+			`SELECT deadline_ms FROM node_alarms
+			 WHERE actor_kind = ? AND actor_name = ? AND quarantine_reason IS NULL`, kind, name,
+		).toArray()[0]?.deadline_ms ?? null;
 	}
 
 	async set(kind: ActorKind, name: string, deadlineMs: number): Promise<void> {

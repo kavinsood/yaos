@@ -1,4 +1,5 @@
 import * as Y from "yjs";
+import type { CrdtRootSnapshot, CrdtValueSnapshot } from "../crdt/crdtEngine";
 import {
 	MAX_FRONTMATTER_FIELD_BYTES,
 	MAX_FRONTMATTER_NORMALIZED_VALUE_BYTES,
@@ -40,16 +41,60 @@ export function validateFrontmatterSemanticRoots(doc: Y.Doc): string | null {
 		}
 	}
 
-	const meta = existingMap(doc, META_ROOT);
+	return validateSemanticValues(
+		existingMap(doc, META_ROOT),
+		existingMap(doc, REGISTERS_ROOT),
+		existingMap(doc, PRESENCE_ROOT),
+		existingMap(doc, SET_ADDS_ROOT),
+		existingMap(doc, SET_REMOVES_ROOT),
+		existingArray(doc, ALIASES_ROOT)?.toArray() ?? null,
+	);
+}
+
+/** Validate the same contract without exposing an engine-specific document. */
+export function validateFrontmatterSemanticSnapshots(roots: readonly CrdtRootSnapshot[]): string | null {
+	const semanticRoots = roots.filter(({ name }) => name.startsWith("frontmatter:"));
+	if (semanticRoots.length === 0) return null;
+	for (const root of semanticRoots) {
+		const expected = ALLOWED_ROOTS.get(root.name);
+		if (!expected || root.value.shared !== expected) return "frontmatter_semantic_root_invalid";
+	}
+	const byName = new Map(semanticRoots.map((root) => [root.name, root.value]));
+	const map = (name: string): Map<string, unknown> | null => {
+		const value = byName.get(name);
+		return value?.shared === "map"
+			? new Map(value.entries.map(([key, nested]) => [key, materializeSnapshot(nested)]))
+			: null;
+	};
+	const array = (name: string): unknown[] | null => {
+		const value = byName.get(name);
+		return value?.shared === "array" ? value.values.map(materializeSnapshot) : null;
+	};
+	return validateSemanticValues(
+		map(META_ROOT), map(REGISTERS_ROOT), map(PRESENCE_ROOT),
+		map(SET_ADDS_ROOT), map(SET_REMOVES_ROOT), array(ALIASES_ROOT),
+	);
+}
+
+interface SemanticMapView {
+	readonly size: number;
+	get(key: string): unknown;
+	entries(): Iterable<[string, unknown]>;
+	[Symbol.iterator](): Iterator<[string, unknown]>;
+}
+
+function validateSemanticValues(
+	meta: SemanticMapView | null,
+	registers: SemanticMapView | null,
+	presence: SemanticMapView | null,
+	additions: SemanticMapView | null,
+	removals: SemanticMapView | null,
+	orderedValues: readonly unknown[] | null,
+): string | null {
 	if (!meta || meta.size !== 1 || meta.get("format") !== 1) return "frontmatter_semantic_format_invalid";
-	const registers = existingMap(doc, REGISTERS_ROOT);
-	const presence = existingMap(doc, PRESENCE_ROOT);
-	const additions = existingMap(doc, SET_ADDS_ROOT);
-	const removals = existingMap(doc, SET_REMOVES_ROOT);
-	const ordered = existingArray(doc, ALIASES_ROOT);
 	if ((registers?.size ?? 0) > MAX_FRONTMATTER_SEMANTIC_FIELDS || (presence?.size ?? 0) > MAX_FRONTMATTER_SEMANTIC_FIELDS
 		|| (additions?.size ?? 0) > MAX_FRONTMATTER_SET_TOKENS || (removals?.size ?? 0) > MAX_FRONTMATTER_SET_TOKENS
-		|| (ordered?.length ?? 0) > MAX_FRONTMATTER_ORDERED_VALUES) {
+		|| (orderedValues?.length ?? 0) > MAX_FRONTMATTER_ORDERED_VALUES) {
 		return "frontmatter_semantic_limit_exceeded";
 	}
 	for (const [field, value] of registers ?? []) {
@@ -64,8 +109,8 @@ export function validateFrontmatterSemanticRoots(doc: Y.Doc): string | null {
 	for (const [token, value] of removals ?? []) {
 		if (!boundedIdentifier(token, MAX_FRONTMATTER_TOKEN_BYTES) || value !== true) return "frontmatter_semantic_remove_invalid";
 	}
-	const orderedValues = ordered?.toArray() ?? [];
-	if (!orderedValues.every(isBoundedScalar)) return "frontmatter_semantic_ordered_invalid";
+	const aliases = orderedValues ?? [];
+	if (!aliases.every(isBoundedScalar)) return "frontmatter_semantic_ordered_invalid";
 
 	const serialized = JSON.stringify({
 		meta: Array.from(meta.entries()),
@@ -73,11 +118,17 @@ export function validateFrontmatterSemanticRoots(doc: Y.Doc): string | null {
 		presence: Array.from(presence?.entries() ?? []),
 		additions: Array.from(additions?.entries() ?? []),
 		removals: Array.from(removals?.entries() ?? []),
-		ordered: { aliases: orderedValues },
+		ordered: { aliases },
 	});
 	return encoder.encode(serialized).byteLength <= MAX_FRONTMATTER_SEMANTIC_SERIALIZED_BYTES
 		? null
 		: "frontmatter_semantic_limit_exceeded";
+}
+
+function materializeSnapshot(value: CrdtValueSnapshot): unknown {
+	if (value.shared === "value" || value.shared === "text") return value.value;
+	if (value.shared === "array") return value.values.map(materializeSnapshot);
+	return Object.fromEntries(value.entries.map(([key, nested]) => [key, materializeSnapshot(nested)]));
 }
 
 function existingMap(doc: Y.Doc, name: string): Y.Map<unknown> | null {

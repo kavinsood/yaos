@@ -53,6 +53,22 @@ class FakeSource implements LocalVaultImportSource {
 	}
 }
 
+class ObservedReadSource extends FakeSource {
+	activeReads = 0;
+	maxActiveReads = 0;
+
+	override async read(path: string): Promise<string> {
+		this.activeReads++;
+		this.maxActiveReads = Math.max(this.maxActiveReads, this.activeReads);
+		try {
+			await Promise.resolve();
+			return await super.read(path);
+		} finally {
+			this.activeReads--;
+		}
+	}
+}
+
 class FakeSink implements LocalVaultImportSink {
 	readonly commits: LocalVaultImportSinkInput[] = [];
 	readonly failPaths = new Set<string>();
@@ -196,12 +212,17 @@ s.test("an edit during upload is retried with the latest content and a fresh can
 });
 s.test("configured Markdown byte boundary accepts exact limit and rejects one byte over without sink writes", async () => {
 	const limit = MAX_CLIENT_MARKDOWN_BYTES;
+	const unicodeStem = "漢👩‍🚀e\u0301";
+	const unicodeStemBytes = new TextEncoder().encode(unicodeStem).byteLength;
+	const unicodeExact = unicodeStem.repeat(Math.floor(limit / unicodeStemBytes))
+		+ "x".repeat(limit % unicodeStemBytes);
+	assert.equal(new TextEncoder().encode(unicodeExact).byteLength, limit);
 	const source = new FakeSource();
 	source.set("near.md", "a".repeat(1_490_000), 1);
 	source.set("exact.md", "b".repeat(limit), 1);
 	source.set("over.md", "c".repeat(limit + 1), 1);
-	source.set("unicode-exact.md", `${"€".repeat(499_999)}abc`, 1);
-	source.set("unicode-over.md", `${"€".repeat(500_000)}x`, 1);
+	source.set("unicode-exact.md", unicodeExact, 1);
+	source.set("unicode-over.md", `${unicodeExact}x`, 1);
 	const sink = new FakeSink();
 	const state = await importer(source, sink, undefined, {
 		maxFileSizeBytes: limit,
@@ -214,7 +235,7 @@ s.test("configured Markdown byte boundary accepts exact limit and rejects one by
 	assert.equal(state.items.find((item) => item.path === "unicode-over.md")?.status, "oversized");
 	assert.match(
 		state.items.find((item) => item.path === "over.md")?.lastError ?? "",
-		/file-size-1500001-exceeds-1500000/,
+		new RegExp(`file-size-${limit + 1}-exceeds-${limit}`),
 	);
 	assert.deepEqual(
 		sink.commits.map((commit) => commit.path).sort(),
@@ -267,6 +288,21 @@ s.test("large initial import uses bounded bulk submissions instead of one reques
 	assert.equal(sink.batches.reduce((sum, count) => sum + count, 0), 1000);
 	assert.ok(sink.batches.every((count) => count > 0 && count <= 32));
 	assert.ok(sink.batches.length <= 32, `expected at most 32 network batches, got ${sink.batches.length}`);
+});
+
+s.test("bulk preparation reads only one potentially 5 MiB note at a time", async () => {
+	const source = new ObservedReadSource();
+	for (let index = 0; index < 12; index++) {
+		source.set(`bounded/note-${index}.md`, "x".repeat(512 * 1024), 1);
+	}
+	const state = await importer(source, new BatchFakeSink(), undefined, {
+		concurrency: 16,
+		pageSize: 100,
+		maxFileSizeBytes: MAX_CLIENT_MARKDOWN_BYTES,
+	}).run();
+	assert.equal(state.stage, "complete");
+	assert.equal(source.maxActiveReads, 1,
+		"bulk import must not retain a count-sized window of multi-megabyte strings and byte arrays");
 });
 
 

@@ -26,7 +26,11 @@ import {
 	parsePairingCodeRecords,
 	parseVaultRecords,
 } from "../../server/src/identity";
-import { handleUpdateMetadataRoute, invalidateStoredServerConfigCache } from "../../server/src/routes/auth";
+import {
+	getStoredServerConfigCached,
+	handleUpdateMetadataRoute,
+	invalidateStoredServerConfigCache,
+} from "../../server/src/routes/auth";
 import { handleEnrollRoute, handleVaultDeviceRoute } from "../../server/src/routes/enroll";
 import type { AuthState } from "../../server/src/routes/types";
 import { handleWorkerRequest } from "../../server/src/index";
@@ -455,6 +459,39 @@ s.section("update-metadata: device bearer 401, operator session 200");
 	}), env);
 
 	s.check(workerDevice.status === 401, "worker device bearer is 401");
+	invalidateStoredServerConfigCache();
+}
+
+s.section("auth config cache: pre-claim state cannot poison another isolate");
+{
+	invalidateStoredServerConfigCache();
+	let reads = 0;
+	let claimed = false;
+	const env = makeEnv({
+		YAOS_CONFIG: makeConfigNamespace(async (request) => {
+			if (new URL(request.url).pathname !== "/__yaos/config") throw new Error("unexpected config request");
+			reads++;
+			return Response.json({
+				claimed,
+				configFormat: claimed ? 3 : null,
+				operatorRecoveryHash: claimed ? CLAIM_AUTH.operatorRecoveryHash : null,
+				ticketSigningKey: claimed ? CLAIM_AUTH.ticketSigningKey : null,
+				updateProvider: null,
+				updateRepoUrl: null,
+				updateRepoBranch: null,
+			});
+		}),
+	});
+
+	const first = await getStoredServerConfigCached(env);
+	const second = await getStoredServerConfigCached(env);
+	s.check(!first.claimed && !second.claimed && reads === 2,
+		"unclaimed config is not retained by a warm isolate");
+	claimed = true;
+	const afterClaim = await getStoredServerConfigCached(env);
+	const cachedClaim = await getStoredServerConfigCached(env);
+	s.check(afterClaim.claimed && cachedClaim.claimed && reads === 3,
+		"another isolate's completed claim is observed and then cached");
 	invalidateStoredServerConfigCache();
 }
 

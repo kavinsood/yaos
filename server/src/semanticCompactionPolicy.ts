@@ -175,7 +175,14 @@ export function evaluateSemanticCompaction(
 	const projectedReduction = encoded === 0 ? 0 : Math.max(0, 1 - metrics.estimatedFreshStateBytes / encoded);
 
 	const hardReasons: string[] = [];
-	if (encoded >= thresholds.hardEncodedStateBytes) hardReasons.push("encoded-state-hard-limit");
+	// The product permits large live notes. Absolute encoded bytes are pressure
+	// only when they are also amplified relative to the semantic payload; a
+	// healthy 5 MiB note must not be mistaken for 5 MiB of compactable history.
+	const hardEncodedLimit = Math.max(
+		thresholds.hardEncodedStateBytes,
+		metrics.liveStateBytes * thresholds.hardAmplification,
+	);
+	if (encoded >= hardEncodedLimit) hardReasons.push("encoded-state-hard-limit");
 	if (metrics.totalStructs >= thresholds.hardStructs) hardReasons.push("struct-count-hard-limit");
 	if (metrics.totalStructs >= thresholds.minimumRatioStructs && deletedRatio >= thresholds.hardDeletedRatio) {
 		hardReasons.push("deleted-ratio-hard-limit");

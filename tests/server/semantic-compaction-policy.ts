@@ -54,6 +54,20 @@ s.test("a large but irreducible document is not churned by a soft reset", () => 
 	assert.deepEqual(decision.reasons, ["insufficient-projected-reduction"]);
 });
 
+s.test("a healthy 5 MiB note is not treated as compactable hard pressure", () => {
+	const liveBytes = 5 * 1024 * 1024;
+	const decision = evaluateSemanticCompaction(body({
+		encodedStateBytes: liveBytes + 512,
+		liveStateBytes: liveBytes,
+		estimatedFreshStateBytes: liveBytes + 128,
+		totalStructs: 8,
+		deletedStructs: 0,
+	}), { lastCompactedAt: null, postCompactionEncodedStateBytes: null }, DAY);
+	assert.equal(decision.urgency, "none");
+	assert.equal(decision.pauseAdmission, false);
+	assert.equal(decision.semanticResetRecommended, false);
+});
+
 s.test("cooldown and low-water hysteresis prevent reset loops", () => {
 	const metrics = body({
 		encodedStateBytes: 1_600_000,

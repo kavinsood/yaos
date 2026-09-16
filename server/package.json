@@ -4,6 +4,7 @@
 	"private": true,
 	"description": "Cloudflare Worker server for multivault root/body CRDT sync and recovery",
 	"scripts": {
+		"build:ywasm": "node scripts/build-ywasm.mjs",
 		"dev": "wrangler dev",
 		"deploy": "wrangler deploy",
 		"typecheck": "tsc --noEmit"

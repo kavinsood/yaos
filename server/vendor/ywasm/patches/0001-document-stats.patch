@@ -1,0 +1,138 @@
+diff --git a/yrs/src/doc.rs b/yrs/src/doc.rs
+index c2c5b5c..84497e5 100644
+--- a/yrs/src/doc.rs
++++ b/yrs/src/doc.rs
+@@ -2225,6 +2225,22 @@ mod test {
+         assert_eq!(&*uuid.to_string(), &*guid);
+     }
+ 
++    #[test]
++    fn document_stats_counts_deleted_integrated_structs() {
++        let doc = Doc::new();
++        let text = doc.get_or_insert_text("body");
++        {
++            let mut txn = doc.transact_mut();
++            text.insert(&mut txn, 0, "hello world");
++            text.remove_range(&mut txn, 5, 1);
++        }
++
++        let stats = doc.transact().document_stats();
++        assert!(stats.total_structs >= 2);
++        assert!(stats.deleted_structs >= 1);
++        assert!(stats.deleted_structs <= stats.total_structs);
++    }
++
+     #[test]
+     fn pending_delete_out_of_order() {
+         // Test for bug fix: pending deletes should be recorded when the target client
+diff --git a/yrs/src/store.rs b/yrs/src/store.rs
+index 2e42dd4..a90c92f 100644
+--- a/yrs/src/store.rs
++++ b/yrs/src/store.rs
+@@ -63,7 +63,35 @@ pub struct Store {
+     pub(crate) linked_by: HashMap<ItemPtr, HashSet<BranchPtr>>,
+ }
+ 
++/// Stable, read-only census of the integrated blocks in a document.
++///
++/// This deliberately exposes counts rather than the block store itself so
++/// consumers do not couple policy to Yrs internals.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct DocumentStats {
++    pub total_structs: usize,
++    pub deleted_structs: usize,
++}
++
+ impl Store {
++    /// Counts integrated block structs and the subset which are tombstoned or
++    /// garbage-collected. Pending, not-yet-integrated updates are excluded.
++    pub fn document_stats(&self) -> DocumentStats {
++        let mut total_structs = 0;
++        let mut deleted_structs = 0;
++        for (_, blocks) in self.blocks.iter() {
++            total_structs += blocks.len();
++            deleted_structs += blocks
++                .iter()
++                .filter(|block| block.as_ref().is_deleted())
++                .count();
++        }
++        DocumentStats {
++            total_structs,
++            deleted_structs,
++        }
++    }
++
+     /// Create a new empty store in context of a given `client_id`.
+     pub(crate) fn new(options: &Options) -> Self {
+         Store {
+diff --git a/yrs/src/transaction.rs b/yrs/src/transaction.rs
+index 9bac30c..8a671fe 100644
+--- a/yrs/src/transaction.rs
++++ b/yrs/src/transaction.rs
+@@ -7,7 +7,7 @@ use crate::gc::GCCollector;
+ use crate::id_set::DeleteSet;
+ use crate::iter::TxnIterator;
+ use crate::slice::BlockSlice;
+-use crate::store::{Store, StoreEvents, SubdocGuids, SubdocsIter};
++use crate::store::{DocumentStats, Store, StoreEvents, SubdocGuids, SubdocsIter};
+ use crate::types::{Event, Events, RootRef, TypePtr, TypeRef};
+ use crate::update::Update;
+ use crate::updates::encoder::{Encode, Encoder, EncoderV1, EncoderV2};
+@@ -31,6 +31,11 @@ use std::sync::Arc;
+ pub trait ReadTxn: Sized {
+     fn store(&self) -> &Store;
+ 
++    /// Returns a stable census without exposing the document's block store.
++    fn document_stats(&self) -> DocumentStats {
++        self.store().document_stats()
++    }
++
+     /// Returns state vector describing current state of the updates.
+     fn state_vector(&self) -> StateVector {
+         self.store().blocks.get_state_vector()
+diff --git a/ywasm/src/doc.rs b/ywasm/src/doc.rs
+index 4ef8cf6..125fa9d 100644
+--- a/ywasm/src/doc.rs
++++ b/ywasm/src/doc.rs
+@@ -7,7 +7,7 @@ use crate::transaction::YTransaction;
+ use crate::xml_frag::YXmlFragment;
+ use crate::ImplicitTransaction;
+ use crate::Result;
+-use serde::Deserialize;
++use serde::{Deserialize, Serialize};
+ use std::iter::FromIterator;
+ use std::ops::Deref;
+ use wasm_bindgen::prelude::wasm_bindgen;
+@@ -77,6 +77,18 @@ impl YDoc {
+         Ok(Doc::with_options(options).into())
+     }
+ 
++    /// Returns a stable census of integrated CRDT structs. This intentionally
++    /// does not expose Yrs block-store internals to JavaScript.
++    #[wasm_bindgen(js_name = documentStats)]
++    pub fn document_stats(&self) -> Result<JsValue> {
++        let txn = self.transact();
++        let stats = txn.document_stats();
++        Ok(serde_wasm_bindgen::to_value(&DocumentStats {
++            total_structs: stats.total_structs,
++            deleted_structs: stats.deleted_structs,
++        })?)
++    }
++
+     #[wasm_bindgen(getter, js_name = type)]
+     #[inline]
+     pub fn get_type(&self) -> u8 {
+@@ -428,6 +440,13 @@ impl YDoc {
+     }
+ }
+ 
++#[derive(Serialize)]
++#[serde(rename_all = "camelCase")]
++struct DocumentStats {
++    total_structs: usize,
++    deleted_structs: usize,
++}
++
+ #[wasm_bindgen]
+ pub struct YSubdocsEvent {
+     added: js_sys::Array,

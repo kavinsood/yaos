@@ -34,6 +34,8 @@ export interface StoredBodyCandidate {
 	pendingMarkdown: string;
 	candidateDigest: string;
 	encodedUpdate: ArrayBuffer;
+	/** Ordered valid Yjs updates for a large fresh-note candidate. */
+	encodedUpdates?: ArrayBuffer[];
 	capturedAt: number;
 	capturedLocalUpdates?: number;
 	attempts?: number;

@@ -1,5 +1,6 @@
 import { strict as assert } from "node:assert";
 import * as Y from "yjs";
+import { ywasmCrdtEngine as crdtEngine } from "@yaos/crdt-engine";
 import { VaultLifecycleService } from "../../server/src/vaultLifecycleService.ts";
 import type { AttachmentCatalogEvent, DurableAttachmentOperation } from "../../server/src/vaultCatalogStore.ts";
 import { suite } from "../harness.ts";
@@ -52,9 +53,8 @@ class AttachmentStore {
 		return { generation: this.generation, semanticEpoch: 1, latestSequence: this.sequence };
 	}
 
-	reconstructDocument(): { doc: Y.Doc; generation: number; semanticEpoch: number } {
-		const doc = new Y.Doc({ guid: "root" });
-		Y.applyUpdate(doc, Y.encodeStateAsUpdate(this.root));
+	reconstructDocument() {
+		const doc = crdtEngine.openDocument("root", Y.encodeStateAsUpdate(this.root));
 		return { doc, generation: this.generation, semanticEpoch: 1 };
 	}
 

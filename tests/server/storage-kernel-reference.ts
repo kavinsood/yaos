@@ -71,7 +71,7 @@ s.check(
 
 s.section("Durable hard limits");
 s.check(MAX_DURABLE_UPDATE_BYTES === 1_750_000, "durable update values retain the SQLite-safe bound");
-s.check(MAX_CLIENT_MARKDOWN_BYTES === 1_500_000, "client markdown retains deterministic wire headroom");
+s.check(MAX_CLIENT_MARKDOWN_BYTES === 5 * 1024 * 1024, "client markdown supports the 5 MiB logical ceiling");
 s.check(
 	MAX_CLIENT_MARKDOWN_KB === Math.ceil(MAX_CLIENT_MARKDOWN_BYTES / 1024),
 	"displayed markdown KB limit derives from the byte limit",

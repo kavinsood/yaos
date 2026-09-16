@@ -4,6 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as Y from "yjs";
 import { NodeSqliteStorage } from "../../packages/server-node/src/storage";
+import { ywasmCrdtEngine as crdtEngine } from "../../packages/server-node/src/ywasmNodeCrdtEngine";
+import {
+	materializeCanvasDocument as materializeProductionCanvas,
+	validateCanvasDocument as validateProductionCanvas,
+} from "../../server/src/crdt/canvasSemanticDocument";
 import { applyCompleteRecoveryRecipeParts, applyStoredRecoveryRecipeParts, createRecoveryDocument } from "../../server/src/recoveryJob";
 import {
 	RecoveryJobStateStore,
@@ -13,6 +18,8 @@ import {
 } from "../../server/src/recoveryJobState";
 import { SQLITE_ROW_SAFE_BYTES } from "../../server/src/shared/durableLimits";
 import { SQLITE_BLOB_CHUNK_BYTES } from "../../server/src/vaultDocumentStore";
+import { canonicalCanvasBytes, parseCanvasBytes } from "../../server/src/shared/canvasCodec";
+import { createCanvasDocument } from "../../server/src/shared/canvasSemanticDocument";
 import { suite } from "../harness.ts";
 
 const s = suite("recovery-fragmentation");
@@ -157,11 +164,8 @@ s.test(">4 MiB checkpoint fragments survive slices and apply only when complete"
 		).toArray();
 		assert.ok(storedRows.every((row) => row.storage_type === "blob" && row.stored_bytes <= SQLITE_BLOB_CHUNK_BYTES));
 
-		let appliedUpdates = 0;
-		target.on("update", () => { appliedUpdates++; });
 		assert.equal(applyCompleteRecoveryRecipeParts(target, partial), false);
-		assert.equal(target.getText("body").length, 0, "partial checkpoint mutated the reconstruction document");
-		assert.equal(appliedUpdates, 0);
+		assert.equal(crdtEngine.readText(target, "body").length, 0, "partial checkpoint mutated the reconstruction document");
 
 		resumedSlice.putReconstructionParts(partial); // retrying an identical slice is idempotent
 		const changedReplay = { ...partial[0]!, bytes: partial[0]!.bytes.slice() };
@@ -170,17 +174,37 @@ s.test(">4 MiB checkpoint fragments survive slices and apply only when complete"
 		resumedSlice.putReconstructionParts(fragments.slice(2));
 		const complete = resumedSlice.reconstructionParts();
 		assert.equal(applyStoredRecoveryRecipeParts(target, resumedSlice), true);
-		assert.equal(appliedUpdates, 1, "complete logical checkpoint was not applied exactly once");
-		assert.equal(target.getText("body").toString(), source.getText("body").toString());
+		assert.equal(crdtEngine.readText(target, "body"), source.getText("body").toString());
 
 		resumedSlice.clearReconstruction();
 		assert.equal(resumedSlice.getReconstruction(), null);
 		assert.deepEqual(resumedSlice.reconstructionParts(), []);
 	} finally {
 		source.destroy();
-		target.destroy();
+		crdtEngine.destroyDocument(target);
 		storage.close();
 		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+s.test("recovery Canvas reader preserves canonical data across the ywasm boundary", async () => {
+	const input = new TextEncoder().encode(JSON.stringify({
+		nodes: [{ id: "node-中文-😀", type: "text", text: "hello 世界 👩🏽‍💻", x: 1, y: 2, width: 300, height: 120 }],
+		edges: [],
+		background: "#123456",
+	}));
+	const parsed = parseCanvasBytes(input);
+	assert.equal(parsed.kind, "valid");
+	if (parsed.kind !== "valid") return;
+	const source = createCanvasDocument(parsed.data);
+	const target = crdtEngine.openDocument("recovery-canvas", Y.encodeStateAsUpdate(source));
+	try {
+		assert.equal(await validateProductionCanvas(target), null);
+		const materialized = await materializeProductionCanvas(target, false);
+		assert.deepEqual(canonicalCanvasBytes(materialized), parsed.canonicalBytes);
+	} finally {
+		crdtEngine.destroyDocument(target);
+		source.destroy();
 	}
 });
 

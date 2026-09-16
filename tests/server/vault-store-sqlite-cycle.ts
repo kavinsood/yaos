@@ -26,12 +26,20 @@ const s = suite("vault-store-sqlite-cycle");
 const workerSource = String.raw`
 import * as Y from "yjs";
 import { VaultStore } from "./server/src/vaultStore.ts";
+import { ywasmCrdtEngine as crdtEngine } from "@yaos/crdt-engine";
+import { mapValue, snapshotRootMap } from "./server/src/crdt/rootSchema.ts";
 
 
 function incremental(doc, mutate) {
   const vector = Y.encodeStateVector(doc);
   mutate();
   return Y.encodeStateAsUpdate(doc, vector);
+}
+
+function rootIncremental(doc, operations) {
+  const vector = crdtEngine.encodeStateVector(doc);
+  crdtEngine.applyRootOperations(doc, operations, "vault-store-sqlite-cycle");
+  return crdtEngine.encodeStateAsUpdate(doc, vector);
 }
 
 export class StoreCycle {
@@ -113,13 +121,15 @@ export class StoreCycle {
     const after = store.documentJournalStats("sqlite-cycle-body");
     const feed = store.changesPageAfter(0, 100);
     const reconstructed = store.reconstructDocument("sqlite-cycle-body");
-    const text = reconstructed.doc.getText("body").toString();
-    const payloadLength = reconstructed.doc.getText("payload").length;
+    const text = crdtEngine.readText(reconstructed.doc, "body");
+    const payloadLength = crdtEngine.readText(reconstructed.doc, "payload").length;
     const catalogBody = new Y.Doc({ guid: "catalog-body" });
     const catalogBodyUpdate = incremental(catalogBody, () => catalogBody.getText("body").insert(0, "catalog"));
     const catalogBodyCommit = store.commitUpdate({ documentId: "catalog-body", update: catalogBodyUpdate, kind: "body" });
     const catalogRoot = store.reconstructDocument("root").doc;
-    const createCatalogUpdate = incremental(catalogRoot, () => catalogRoot.getMap("pathToId").set("old.md", "catalog-body"));
+    const createCatalogUpdate = rootIncremental(catalogRoot, [
+      { kind: "map-set", root: "pathToId", key: "old.md", value: mapValue("catalog-body") },
+    ]);
     const createCatalogCommit = store.commitRootLifecycle({
       rootUpdate: createCatalogUpdate,
       kind: "create",
@@ -132,10 +142,10 @@ export class StoreCycle {
         bodyGeneration: catalogBodyCommit.generation,
       },
     });
-    const renameCatalogUpdate = incremental(catalogRoot, () => {
-      catalogRoot.getMap("pathToId").delete("old.md");
-      catalogRoot.getMap("pathToId").set("new.md", "catalog-body");
-    });
+    const renameCatalogUpdate = rootIncremental(catalogRoot, [
+      { kind: "map-delete", root: "pathToId", key: "old.md" },
+      { kind: "map-set", root: "pathToId", key: "new.md", value: mapValue("catalog-body") },
+    ]);
     const renameCatalogCommit = store.commitRootLifecycle({
       rootUpdate: renameCatalogUpdate,
       kind: "rename",
@@ -153,10 +163,12 @@ export class StoreCycle {
     const renameFeed = store.changesPageAfter(createCatalogCommit.vaultSequence).entries.find((entry) => entry.sequence === renameCatalogCommit.vaultSequence);
 	const attachmentOperationId = "attachment-sqlite-cycle";
 	const attachmentHash = "a".repeat(64);
-	const attachmentUpdate = incremental(catalogRoot, () => {
-	  catalogRoot.getMap("pathToBlob").set("assets/atomic.bin", { hash: attachmentHash, size: 1, revision: attachmentOperationId });
-	  catalogRoot.getMap("blobMeta").set(attachmentHash, { size: 1, mime: "application/octet-stream", createdAt: 700 });
-	});
+	const attachmentUpdate = rootIncremental(catalogRoot, [
+	  { kind: "map-set", root: "pathToBlob", key: "assets/atomic.bin",
+	    value: mapValue({ hash: attachmentHash, size: 1, revision: attachmentOperationId }) },
+	  { kind: "map-set", root: "blobMeta", key: attachmentHash,
+	    value: mapValue({ size: 1, mime: "application/octet-stream", createdAt: 700 }) },
+	]);
 	const attachmentExpectedHead = store.documentHead("root")!;
 	const attachmentCommit = store.commitRootAttachments(attachmentUpdate, [{
 	  operationId: attachmentOperationId,
@@ -169,9 +181,10 @@ export class StoreCycle {
 	const attachmentHead = store.attachmentHead("assets/atomic.bin");
 	const attachmentOperation = store.attachmentOperation(attachmentOperationId);
 	const beforeFailedAttachmentSequence = store.currentSequence();
-	const failedAttachmentUpdate = incremental(catalogRoot, () => {
-	  catalogRoot.getMap("pathToBlob").set("assets/must-rollback.bin", { hash: attachmentHash, size: 1, revision: attachmentOperationId });
-	});
+	const failedAttachmentUpdate = rootIncremental(catalogRoot, [
+	  { kind: "map-set", root: "pathToBlob", key: "assets/must-rollback.bin",
+	    value: mapValue({ hash: attachmentHash, size: 1, revision: attachmentOperationId }) },
+	]);
 	let attachmentCommitRejected = false;
 	try {
 	  const failedExpectedHead = store.documentHead("root")!;
@@ -194,9 +207,9 @@ export class StoreCycle {
 	  && attachmentCommitRejected
 	  && store.currentSequence() === beforeFailedAttachmentSequence
 	  && store.attachmentHead("assets/must-rollback.bin") === null
-	  && !attachmentRootAfterRollback.doc.getMap("pathToBlob").has("assets/must-rollback.bin");
-	attachmentRootAfterRollback.doc.destroy();
-    catalogRoot.destroy();
+	  && !snapshotRootMap(attachmentRootAfterRollback.doc, "pathToBlob").has("assets/must-rollback.bin");
+	crdtEngine.destroyDocument(attachmentRootAfterRollback.doc);
+    crdtEngine.destroyDocument(catalogRoot);
     const gcOne = store.createGcEpoch({
       requestId: "gc-request-one",
       vaultId: "sqlite-cycle-vault",
@@ -313,7 +326,7 @@ export class StoreCycle {
       && deletion.captureJobIds.includes(capture.jobId)
       && store.vaultDeletionBegun(vaultGeneration);
     catalogBody.destroy();
-    reconstructed.doc.destroy();
+    crdtEngine.destroyDocument(reconstructed.doc);
     body.destroy();
 
     const ownerActor = { vaultId: "sqlite-cycle-vault", vaultGeneration, principalId: "principal-owner",
@@ -330,10 +343,11 @@ export class StoreCycle {
       && store.validateActor({ ...ownerActor, membershipRevision: 2 }) === "authority_superseded";
 	const originalReconstructDocument = store.reconstructDocument.bind(store);
 	const changedCandidateDocument = originalReconstructDocument("sqlite-cycle-body").doc;
-	const changedCandidateVector = Y.encodeStateVector(changedCandidateDocument);
-	changedCandidateDocument.getText("body").insert(changedCandidateDocument.getText("body").length, "changed");
-	const changedCandidateUpdate = Y.encodeStateAsUpdate(changedCandidateDocument, changedCandidateVector);
-	changedCandidateDocument.destroy();
+	const changedCandidateVector = crdtEngine.encodeStateVector(changedCandidateDocument);
+	crdtEngine.insertText(changedCandidateDocument, "body",
+	  crdtEngine.readText(changedCandidateDocument, "body").length, "changed", "candidate-test");
+	const changedCandidateUpdate = crdtEngine.encodeStateAsUpdate(changedCandidateDocument, changedCandidateVector);
+	crdtEngine.destroyDocument(changedCandidateDocument);
 	let commitReconstructionCalls = 0;
 	store.reconstructDocument = (...args) => {
 	  commitReconstructionCalls++;
@@ -381,8 +395,8 @@ export class StoreCycle {
 	  && store.candidateReceipt("sqlite-cycle-body", ownerActor.deviceId, "candidate-stale-sqlite-cycle") === null;
 
 	const redundantCandidateDocument = originalReconstructDocument("sqlite-cycle-body").doc;
-	const redundantCandidateUpdate = Y.encodeStateAsUpdate(redundantCandidateDocument);
-	redundantCandidateDocument.destroy();
+	const redundantCandidateUpdate = crdtEngine.encodeStateAsUpdate(redundantCandidateDocument);
+	crdtEngine.destroyDocument(redundantCandidateDocument);
 	const beforeRedundantCandidate = store.documentHead("sqlite-cycle-body");
 	const redundantCandidate = store.commitCandidate({
 	  bodyId: "sqlite-cycle-body",
@@ -406,6 +420,59 @@ export class StoreCycle {
 	  && redundantCandidate.durableGeneration === beforeRedundantCandidate?.generation
 	  && store.documentHead("sqlite-cycle-body")?.generation === beforeRedundantCandidate?.generation
 	  && JSON.stringify(storedRedundantCandidate) === JSON.stringify(redundantCandidate);
+
+	const framedDocument = originalReconstructDocument("sqlite-cycle-body").doc;
+	const framedUpdates = [];
+	for (const value of ["frame-one", "frame-two"]) {
+	  const vector = crdtEngine.encodeStateVector(framedDocument);
+	  crdtEngine.insertText(framedDocument, "body", crdtEngine.readText(framedDocument, "body").length,
+	    value, "candidate-frame-test");
+	  framedUpdates.push(crdtEngine.encodeStateAsUpdate(framedDocument, vector));
+	}
+	crdtEngine.destroyDocument(framedDocument);
+	const beforeFramed = store.documentHead("sqlite-cycle-body");
+	const framed = store.commitCandidate({ bodyId: "sqlite-cycle-body", clientId: ownerActor.deviceId,
+	  candidateId: "candidate-framed-sqlite-cycle", candidateDigest: "e".repeat(64),
+	  bodyEpoch: beforeFramed?.semanticEpoch ?? 1, updates: framedUpdates, expectedHead: beforeFramed,
+	  changesState: true, vaultGeneration, runtimeEpoch: "sqlite-cycle-runtime-epoch", actor: ownerActor });
+	const framedRows = this.state.storage.sql.exec(
+	  "SELECT sequence, generation, length(data) AS bytes FROM vault_journal WHERE document_id = ? AND generation = ? ORDER BY sequence",
+	  "sqlite-cycle-body", framed.durableGeneration).toArray();
+	const framedReconstructed = originalReconstructDocument("sqlite-cycle-body").doc;
+	const framedAtomic = framedRows.length === 2
+	  && framedRows.every((row) => row.generation === framed.durableGeneration && row.bytes <= 1750000)
+	  && framedRows[1].sequence === framed.vaultSequence
+	  && store.documentHead("sqlite-cycle-body")?.latestSequence === framed.vaultSequence
+	  && crdtEngine.readText(framedReconstructed, "body").endsWith("frame-oneframe-two");
+	crdtEngine.destroyDocument(framedReconstructed);
+
+	const rollbackDocument = originalReconstructDocument("sqlite-cycle-body").doc;
+	const rollbackUpdates = [];
+	for (const value of ["rollback-one", "rollback-two-with-distinct-length"]) {
+	  const vector = crdtEngine.encodeStateVector(rollbackDocument);
+	  crdtEngine.insertText(rollbackDocument, "body", crdtEngine.readText(rollbackDocument, "body").length,
+	    value, "candidate-rollback-test");
+	  rollbackUpdates.push(crdtEngine.encodeStateAsUpdate(rollbackDocument, vector));
+	}
+	crdtEngine.destroyDocument(rollbackDocument);
+	const beforeRollback = store.documentHead("sqlite-cycle-body");
+	this.state.storage.sql.exec("CREATE TRIGGER reject_candidate_second_frame BEFORE INSERT ON vault_journal "
+	  + "WHEN NEW.document_id = 'sqlite-cycle-body' AND NEW.update_byte_length = " + rollbackUpdates[1].byteLength
+	  + " BEGIN SELECT RAISE(ABORT, 'injected candidate frame failure'); END").toArray();
+	let rollbackRejected = false;
+	try {
+	  store.commitCandidate({ bodyId: "sqlite-cycle-body", clientId: ownerActor.deviceId,
+	    candidateId: "candidate-rollback-sqlite-cycle", candidateDigest: "f".repeat(64),
+	    bodyEpoch: beforeRollback?.semanticEpoch ?? 1, updates: rollbackUpdates, expectedHead: beforeRollback,
+	    changesState: true, vaultGeneration, runtimeEpoch: "sqlite-cycle-runtime-epoch", actor: ownerActor });
+	} catch { rollbackRejected = true; }
+	this.state.storage.sql.exec("DROP TRIGGER reject_candidate_second_frame").toArray();
+	const failedRows = this.state.storage.sql.exec(
+	  "SELECT COUNT(*) AS count FROM vault_journal WHERE document_id = ? AND generation = ?",
+	  "sqlite-cycle-body", (beforeRollback?.generation ?? 0) + 1).one();
+	const framedRollback = rollbackRejected && failedRows.count === 0
+	  && JSON.stringify(store.documentHead("sqlite-cycle-body")) === JSON.stringify(beforeRollback)
+	  && store.candidateReceipt("sqlite-cycle-body", ownerActor.deviceId, "candidate-rollback-sqlite-cycle") === null;
 
     return Response.json({
       metadata: {
@@ -438,6 +505,8 @@ export class StoreCycle {
 		changedCandidateReusedValidation,
 		staleCandidateFailedClosed,
 		redundantCandidateRecovery,
+		framedAtomic,
+		framedRollback,
 	  },
       authority: {
 		authorityMirror,
@@ -481,6 +550,7 @@ s.test("VaultStore completes journal/checkpoint/pin/feed-floor cycle on real SQL
 			platform: "browser",
 			target: "es2022",
 			logLevel: "silent",
+			loader: { ".wasm": "copy" },
 			external: ["cloudflare:workers"],
 		});
 		await writeFile(configPath, JSON.stringify({
@@ -550,6 +620,8 @@ s.test("VaultStore completes journal/checkpoint/pin/feed-floor cycle on real SQL
 				changedCandidateReusedValidation: boolean;
 				staleCandidateFailedClosed: boolean;
 				redundantCandidateRecovery: boolean;
+				framedAtomic: boolean;
+				framedRollback: boolean;
 			};
 		};
 		s.check(
@@ -595,8 +667,12 @@ s.test("VaultStore completes journal/checkpoint/pin/feed-floor cycle on real SQL
 			"validated changed candidate commits without a second reconstruction/application pass");
 		s.check(result.candidateGenerationFence.staleCandidateFailedClosed,
 			"candidate whose expected durable head went stale fails closed without a receipt or generation");
-		s.check(result.candidateGenerationFence.redundantCandidateRecovery,
-			"redundant candidate preserves its exact durable receipt without inventing a semantic generation");
+			s.check(result.candidateGenerationFence.redundantCandidateRecovery,
+				"redundant candidate preserves its exact durable receipt without inventing a semantic generation");
+			s.check(result.candidateGenerationFence.framedAtomic,
+				"multi-frame candidate uses bounded rows, one generation, final sequence, and exact reconstruction");
+			s.check(result.candidateGenerationFence.framedRollback,
+				"failure on a later candidate frame rolls back every frame, head, and receipt");
 	} finally {
 		if (child && child.exitCode === null) {
 			child.kill("SIGTERM");

@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import * as Y from "yjs";
+import { ywasmCrdtEngine as crdtEngine } from "@yaos/crdt-engine";
 import { NodeSqliteStorage } from "../../packages/server-node/src/storage";
 import {
 	assertHistoryPinAdmission,
@@ -211,8 +212,8 @@ s.test("repeated semantic resets retain exact pinned recipes, then release retir
 				"only the old journal row needed by the first pin and the reset marker survive");
 			assert.deepEqual(retainedSequences(sqlite, "vault_checkpoints", documentId), [first, firstReset]);
 			const firstHistorical = store.reconstructDocument(documentId, firstBoundary);
-			assert.equal(firstHistorical.doc.getText("body").toString(), "ab");
-			firstHistorical.doc.destroy();
+			assert.equal(crdtEngine.readText(firstHistorical.doc, "body"), "ab");
+			crdtEngine.destroyDocument(firstHistorical.doc);
 
 			store.commitUpdate({
 				documentId, kind: "body",
@@ -227,8 +228,8 @@ s.test("repeated semantic resets retain exact pinned recipes, then release retir
 
 			assert.deepEqual(retainedSequences(sqlite, "vault_checkpoints", documentId), [first, firstReset, secondReset]);
 			const secondHistorical = store.reconstructDocument(documentId, secondBoundary);
-			assert.equal(secondHistorical.doc.getText("body").toString(), "ab-current+epoch-two");
-			secondHistorical.doc.destroy();
+			assert.equal(crdtEngine.readText(secondHistorical.doc, "body"), "ab-current+epoch-two");
+			crdtEngine.destroyDocument(secondHistorical.doc);
 
 			assert.equal(store.releasePin("first-lineage", 140), true);
 			assert.deepEqual(retainedSequences(sqlite, "vault_checkpoints", documentId), [firstReset, secondReset]);
@@ -317,12 +318,15 @@ s.test("post-admission checkpoint growth is transactionally capped across docume
 			/history_pin_retained_checkpoint_bytes_limit/,
 			"normal reconstruction checkpoint must fail closed when it would grow pinned retention past the cap");
 		const thirdHead = store.documentHead(third.guid)!;
-		assert.throws(() => store.writeCheckpointFromDocument(third.guid, third, {
-			throughSequence: thirdHead.latestSequence,
-			generation: thirdHead.generation,
-			semanticEpoch: thirdHead.semanticEpoch,
-		}), /history_pin_retained_checkpoint_bytes_limit/,
-		"the live checkpoint path used by bulk /compact must enforce the same cap");
+		const liveThird = crdtEngine.openDocument(third.guid, Y.encodeStateAsUpdate(third));
+		try {
+			assert.throws(() => store.writeCheckpointFromDocument(third.guid, liveThird, {
+				throughSequence: thirdHead.latestSequence,
+				generation: thirdHead.generation,
+				semanticEpoch: thirdHead.semanticEpoch,
+			}), /history_pin_retained_checkpoint_bytes_limit/,
+			"the live checkpoint path used by bulk /compact must enforce the same cap");
+		} finally { crdtEngine.destroyDocument(liveThird); }
 
 		for (const documentId of [second.guid, third.guid]) {
 			assert.equal(sqlite.sql.exec<{ count: number }>(
@@ -350,14 +354,14 @@ s.test("post-admission checkpoint growth is transactionally capped across docume
 
 		const pinnedSecond = store.reconstructDocument(second.guid, boundary);
 		try {
-			assert.equal(pinnedSecond.doc.getText("body").toString(), "b".repeat(700),
+			assert.equal(crdtEngine.readText(pinnedSecond.doc, "body"), "b".repeat(700),
 				"failed checkpoint writes and later semantic reset must preserve the pinned recipe");
 		} finally {
-			pinnedSecond.doc.destroy();
+			crdtEngine.destroyDocument(pinnedSecond.doc);
 		}
 		const currentSecond = store.reconstructDocument(second.guid);
-		try { assert.equal(currentSecond.doc.getText("body").toString(), "fresh-b"); }
-		finally { currentSecond.doc.destroy(); }
+		try { assert.equal(crdtEngine.readText(currentSecond.doc, "body"), "fresh-b"); }
+		finally { crdtEngine.destroyDocument(currentSecond.doc); }
 		assert.equal(store.releasePin(pin.pinId), true);
 	} finally {
 		first.destroy();

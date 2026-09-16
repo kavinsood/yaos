@@ -24,11 +24,13 @@ async function availablePort(): Promise<number> {
 const workerSource = String.raw`
 import * as Y from "yjs";
 import { VaultStore } from "./server/src/vaultStore.ts";
+import { ywasmCrdtEngine as crdtEngine } from "@yaos/crdt-engine";
+import { mapValue, snapshotRootMap } from "./server/src/crdt/rootSchema.ts";
 
-function update(doc, mutate) {
-  const vector = Y.encodeStateVector(doc);
-  mutate();
-  return Y.encodeStateAsUpdate(doc, vector);
+function update(doc, operations) {
+	const vector = crdtEngine.encodeStateVector(doc);
+	crdtEngine.applyRootOperations(doc, operations, "canvas-authority-test");
+	return crdtEngine.encodeStateAsUpdate(doc, vector);
 }
 
 const actor = { vaultId: "canvas-authority-vault", vaultGeneration: "canvas-authority-generation",
@@ -57,17 +59,14 @@ export class CanvasAuthorityCycle {
     const attachmentHash = "a".repeat(64);
     const attachmentOperationId = "canvas-attachment-source";
     const attachmentRoot = store.reconstructDocument("root").doc;
-    const attachmentUpdate = update(attachmentRoot, () => {
-      attachmentRoot.getMap("pathToBlob").set("Board.canvas", {
-        hash: attachmentHash, size: 17, revision: attachmentOperationId,
-      });
-    });
+	const attachmentUpdate = update(attachmentRoot, [{ kind: "map-set", root: "pathToBlob", key: "Board.canvas",
+	  value: mapValue({ hash: attachmentHash, size: 17, revision: attachmentOperationId }) }]);
     const attachmentCommit = store.commitRootAttachments(attachmentUpdate, [{
       operationId: attachmentOperationId, path: "Board.canvas", contentHash: attachmentHash,
       size: 17, mime: "application/json", lifecycle: "active",
     }], { operationId: attachmentOperationId, requestDigest: "b".repeat(64), rootEpoch: 1 },
 	  store.documentHead("root"), 2);
-    attachmentRoot.destroy();
+	crdtEngine.destroyDocument(attachmentRoot);
 
     const canvas = new Y.Doc({ guid: "canvas-document" });
     canvas.getMap("canvasMeta").set("format", "yaos-json-canvas");
@@ -79,11 +78,11 @@ export class CanvasAuthorityCycle {
     canvas.destroy();
     const contentHash = "c".repeat(64);
     const transitionRoot = store.reconstructDocument("root").doc;
-    const promotionRootUpdate = update(transitionRoot, () => {
-      transitionRoot.getMap("pathToBlob").delete("Board.canvas");
-      transitionRoot.getMap("pathToSemantic").set("Board.canvas", semanticRef("canvas-document"));
-    });
-    transitionRoot.destroy();
+	const promotionRootUpdate = update(transitionRoot, [
+	  { kind: "map-delete", root: "pathToBlob", key: "Board.canvas" },
+	  { kind: "map-set", root: "pathToSemantic", key: "Board.canvas", value: mapValue(semanticRef("canvas-document")) },
+	]);
+	crdtEngine.destroyDocument(transitionRoot);
     const promotionInput = {
       operationId: "canvas-promotion", requestDigest: "d".repeat(64), path: "Board.canvas",
       documentId: "canvas-document", sourceRevision: attachmentOperationId, contentHash, size: 2,
@@ -103,7 +102,9 @@ export class CanvasAuthorityCycle {
     const promotion = store.commitSemanticPromotion(promotionInput);
     const promotionReplay = store.commitSemanticPromotion(promotionInput);
 	const lifecycleRoot = store.reconstructDocument("root");
-	const lifecycleUpdate = update(lifecycleRoot.doc, () => lifecycleRoot.doc.getMap("sys").set("canvasReceipt", 1));
+	const lifecycleUpdate = update(lifecycleRoot.doc, [
+	  { kind: "map-set", root: "sys", key: "canvasReceipt", value: mapValue(1) },
+	]);
 	const lifecycleHead = store.semanticHeadAt(store.currentSequence(), "canvas-document");
 	store.commitUpdate({ documentId: "root", update: lifecycleUpdate, kind: "semantic-rename",
 	  expectedHead: store.documentHead("root"), expectedSemanticHead: lifecycleHead,
@@ -115,11 +116,13 @@ export class CanvasAuthorityCycle {
 		resultLifecycle: "active", durableGeneration: 1, bodyEpoch: 1, rootEpoch: 1,
 		vaultGeneration: "canvas-authority-generation", runtimeEpoch: "canvas-runtime" },
 	  actorAttributions: [{ actor, operationId: "canvas-lifecycle", requestDigest: "9".repeat(64) }], now: 3 });
-	lifecycleRoot.doc.destroy();
+	crdtEngine.destroyDocument(lifecycleRoot.doc);
 	const lifecycleReceipt = store.semanticLifecycleReceipt("canvas-lifecycle");
 	const staleCanvas = store.reconstructDocument("canvas-document").doc;
-	const staleCanvasUpdate = update(staleCanvas, () => staleCanvas.getMap("rootFields").set("casProbe", true));
-	staleCanvas.destroy();
+	const staleCanvasUpdate = update(staleCanvas, [
+	  { kind: "map-set", root: "rootFields", key: "casProbe", value: mapValue(true) },
+	]);
+	crdtEngine.destroyDocument(staleCanvas);
 	let semanticCatalogCasRejected = false;
 	try {
 	  store.commitUpdate({ documentId: "canvas-document", update: staleCanvasUpdate, kind: "semantic",
@@ -144,23 +147,22 @@ export class CanvasAuthorityCycle {
     const staleHash = "e".repeat(64);
     const staleOperationId = "stale-source";
     const staleRoot = store.reconstructDocument("root").doc;
-    const staleAttachmentUpdate = update(staleRoot, () => staleRoot.getMap("pathToBlob").set("Stale.canvas", {
-      hash: staleHash, size: 4, revision: staleOperationId,
-    }));
+	const staleAttachmentUpdate = update(staleRoot, [{ kind: "map-set", root: "pathToBlob", key: "Stale.canvas",
+	  value: mapValue({ hash: staleHash, size: 4, revision: staleOperationId }) }]);
     const staleAttachmentCommit = store.commitRootAttachments(staleAttachmentUpdate, [{
       operationId: staleOperationId, path: "Stale.canvas", contentHash: staleHash,
       size: 4, mime: "application/json", lifecycle: "active",
     }], { operationId: staleOperationId, requestDigest: "f".repeat(64), rootEpoch: 1 },
 	  store.documentHead("root"), 4);
-    const stalePromotionUpdate = update(staleRoot, () => {
-      staleRoot.getMap("pathToBlob").delete("Stale.canvas");
-      staleRoot.getMap("pathToSemantic").set("Stale.canvas", semanticRef("stale-document"));
-    });
-    staleRoot.destroy();
+	const stalePromotionUpdate = update(staleRoot, [
+	  { kind: "map-delete", root: "pathToBlob", key: "Stale.canvas" },
+	  { kind: "map-set", root: "pathToSemantic", key: "Stale.canvas", value: mapValue(semanticRef("stale-document")) },
+	]);
+	crdtEngine.destroyDocument(staleRoot);
     const unrelatedRoot = store.reconstructDocument("root").doc;
-    const unrelatedUpdate = update(unrelatedRoot, () => unrelatedRoot.getMap("sys").set("race", 1));
+	const unrelatedUpdate = update(unrelatedRoot, [{ kind: "map-set", root: "sys", key: "race", value: mapValue(1) }]);
     store.commitUpdate({ documentId: "root", update: unrelatedUpdate, kind: "root" });
-    unrelatedRoot.destroy();
+	crdtEngine.destroyDocument(unrelatedRoot);
     let stalePromotionRejected = false;
     try {
       store.commitSemanticPromotion({ ...promotionInput, operationId: "stale-promotion",
@@ -174,13 +176,12 @@ export class CanvasAuthorityCycle {
     const staleDemotionRoot = store.reconstructDocument("root").doc;
     const staleDemotionGeneration = store.documentHead("root").generation;
 	const semanticHeadBeforeDemotion = store.semanticHeadAt(store.currentSequence(), "canvas-document");
-    const staleDemotionUpdate = update(staleDemotionRoot, () => {
-      staleDemotionRoot.getMap("pathToSemantic").delete("Board.canvas");
-      staleDemotionRoot.getMap("pathToBlob").set("Board.canvas", {
-        hash: contentHash, size: 2, revision: "stale-demotion",
-      });
-    });
-    staleDemotionRoot.destroy();
+	const staleDemotionUpdate = update(staleDemotionRoot, [
+	  { kind: "map-delete", root: "pathToSemantic", key: "Board.canvas" },
+	  { kind: "map-set", root: "pathToBlob", key: "Board.canvas",
+		value: mapValue({ hash: contentHash, size: 2, revision: "stale-demotion" }) },
+	]);
+	crdtEngine.destroyDocument(staleDemotionRoot);
 	let staleActorDemotionRejected = false;
 	try {
 	  store.commitSemanticDemotion({ operationId: "stale-actor-demotion", requestDigest: "5".repeat(64),
@@ -193,9 +194,9 @@ export class CanvasAuthorityCycle {
 	  staleActorDemotionRejected = error instanceof Error && error.message === "authority_superseded";
 	}
     const secondUnrelatedRoot = store.reconstructDocument("root").doc;
-    const secondUnrelatedUpdate = update(secondUnrelatedRoot, () => secondUnrelatedRoot.getMap("sys").set("race", 2));
+	const secondUnrelatedUpdate = update(secondUnrelatedRoot, [{ kind: "map-set", root: "sys", key: "race", value: mapValue(2) }]);
     store.commitUpdate({ documentId: "root", update: secondUnrelatedUpdate, kind: "root" });
-    secondUnrelatedRoot.destroy();
+	crdtEngine.destroyDocument(secondUnrelatedRoot);
     let staleDemotionRejected = false;
     try {
       store.commitSemanticDemotion({ operationId: "stale-demotion", requestDigest: "2".repeat(64),
@@ -211,13 +212,12 @@ export class CanvasAuthorityCycle {
 
     const demotionRoot = store.reconstructDocument("root").doc;
     const demotionGeneration = store.documentHead("root").generation;
-    const demotionUpdate = update(demotionRoot, () => {
-      demotionRoot.getMap("pathToSemantic").delete("Board.canvas");
-      demotionRoot.getMap("pathToBlob").set("Board.canvas", {
-        hash: contentHash, size: 2, revision: "canvas-demotion",
-      });
-    });
-    demotionRoot.destroy();
+	const demotionUpdate = update(demotionRoot, [
+	  { kind: "map-delete", root: "pathToSemantic", key: "Board.canvas" },
+	  { kind: "map-set", root: "pathToBlob", key: "Board.canvas",
+		value: mapValue({ hash: contentHash, size: 2, revision: "canvas-demotion" }) },
+	]);
+	crdtEngine.destroyDocument(demotionRoot);
     const demotionInput = { operationId: "canvas-demotion", requestDigest: "3".repeat(64),
       path: "Board.canvas", documentId: "canvas-document", sourceRevision: "1:" + contentHash,
       expectedDocumentGeneration: 1, contentHash, size: 2, mime: "application/json",
@@ -228,9 +228,9 @@ export class CanvasAuthorityCycle {
     const demotion = store.commitSemanticDemotion(demotionInput);
     const demotionReplay = store.commitSemanticDemotion(demotionInput);
     const finalRoot = store.reconstructDocument("root").doc;
-    const exclusive = !finalRoot.getMap("pathToSemantic").has("Board.canvas")
-      && finalRoot.getMap("pathToBlob").get("Board.canvas")?.hash === contentHash;
-    finalRoot.destroy();
+	const exclusive = !snapshotRootMap(finalRoot, "pathToSemantic").has("Board.canvas")
+	  && snapshotRootMap(finalRoot, "pathToBlob").get("Board.canvas")?.hash === contentHash;
+	crdtEngine.destroyDocument(finalRoot);
 
     return Response.json({
       promotionReplay: promotion.rootSequence === promotionReplay.rootSequence,
@@ -275,6 +275,7 @@ s.test("promotion and demotion are atomic, replay-safe, and root-generation fenc
 			alias: { yjs: join(process.cwd(), "node_modules/yjs/dist/yjs.mjs") },
 			stdin: { contents: workerSource, resolveDir: process.cwd(), sourcefile: "canvas-authority-worker.ts", loader: "ts" },
 			outfile, bundle: true, format: "esm", platform: "browser", target: "es2022", logLevel: "silent",
+			loader: { ".wasm": "copy" },
 			external: ["cloudflare:workers"],
 		});
 		await writeFile(configPath, JSON.stringify({
