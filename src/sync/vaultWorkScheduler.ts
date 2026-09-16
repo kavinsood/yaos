@@ -13,6 +13,7 @@ export type VaultWorkMetadata =
 	| { readonly kind: "reconnect"; readonly reason: string }
 	| { readonly kind: "body-wake"; readonly bodyId: string; readonly minimumGeneration: number }
 	| { readonly kind: "candidate"; readonly bodyId: string }
+	| { readonly kind: "lifecycle-replay"; readonly groupKey: string }
 	| { readonly kind: "attachment-publication" };
 
 export interface VaultWorkSchedulerDeps {
@@ -22,6 +23,7 @@ export interface VaultWorkSchedulerDeps {
 	reconnect(reason: string): Promise<OperationOutcome>;
 	wakeBody(bodyId: string, minimumGeneration: number): Promise<OperationOutcome>;
 	flushCandidate(bodyId: string): Promise<OperationOutcome>;
+	retryLifecycle(groupKey: string): Promise<OperationOutcome>;
 	retryAttachmentPublications(): Promise<OperationOutcome>;
 	onError(error: unknown): void;
 }
@@ -117,6 +119,15 @@ export class VaultWorkScheduler {
 		});
 	}
 
+	queueLifecycleReplay(groupKey: string): Promise<void> {
+		if (!this.accepting) return Promise.reject(new Error("vault work scheduler is stopped"));
+		this.assertKeyPart(groupKey, "lifecycle groupKey");
+		return this.upsert(`lifecycle:${groupKey}`, "normal", this.clock.now(), undefined, {
+			kind: "lifecycle-replay",
+			groupKey,
+		});
+	}
+
 	queueAttachmentPublications(dueAt = this.clock.now()): Promise<void> {
 		if (!this.accepting) return Promise.reject(new Error("vault work scheduler is stopped"));
 		this.assertTimestamp(dueAt, "attachment publication dueAt");
@@ -172,6 +183,8 @@ export class VaultWorkScheduler {
 				return this.deps.wakeBody(metadata.bodyId, metadata.minimumGeneration);
 			case "candidate":
 				return this.deps.flushCandidate(metadata.bodyId);
+			case "lifecycle-replay":
+				return this.deps.retryLifecycle(metadata.groupKey);
 			case "attachment-publication":
 				return this.deps.retryAttachmentPublications();
 		}

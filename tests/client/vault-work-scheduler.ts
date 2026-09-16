@@ -80,6 +80,7 @@ function createScheduler(
 		reconnect: async () => completed(),
 		wakeBody: async () => completed(),
 		flushCandidate: async () => completed(),
+		retryLifecycle: async () => completed(),
 		retryAttachmentPublications: async () => completed(),
 		onError: (error) => { errors.push(error); },
 		...overrides,
@@ -164,11 +165,13 @@ s.test("domain callbacks route through explicit stable keys", async () => {
 		wakeBody: async (bodyId, generation) => { calls.push(`wake:${bodyId}:${generation}`); return completed(); },
 		flushCandidate: async (bodyId) => { calls.push(`candidate:${bodyId}`); return completed(); },
 		retryAttachmentPublications: async () => { calls.push("attachment"); return completed(); },
+		retryLifecycle: async (groupKey) => { calls.push(`lifecycle:${groupKey}`); return completed(); },
 	});
 	await Promise.all([
 		scheduler.queueReconnect("online"),
 		scheduler.queueBodyWake("body-1", 7),
 		scheduler.queueCandidateNow("body-2"),
+		scheduler.queueLifecycleReplay("single:operation-1"),
 		scheduler.queueAttachmentPublications(),
 	]);
 	await idle(scheduler);
@@ -176,6 +179,7 @@ s.test("domain callbacks route through explicit stable keys", async () => {
 		"reconnect:online",
 		"wake:body-1:7",
 		"candidate:body-2",
+		"lifecycle:single:operation-1",
 		"attachment",
 	]));
 	assert.equal(scheduler.diagnostics().queue.length, 0);

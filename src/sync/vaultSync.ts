@@ -620,6 +620,17 @@ export class FreshAdmissionCancelledError extends Error {
 	}
 }
 
+export class FreshAdmissionDurablyPendingError extends Error {
+	constructor(
+		readonly path: string,
+		readonly lifecycleOperationId: string,
+		readonly cause?: unknown,
+	) {
+		super(`fresh admission is durably pending for ${path}`);
+		this.name = "FreshAdmissionDurablyPendingError";
+	}
+}
+
 export class SemanticEpochRebaseError extends Error {
 	constructor(readonly result: Exclude<SemanticEpochTransitionResult, { kind: "ready" }>) {
 		super(`body ${result.bodyId} requires a preserved ${result.kind} rebase across semantic epoch`);
@@ -1318,6 +1329,7 @@ export class VaultSync implements SyncRuntimePort {
 			reconnect: (reason) => this.runReconnectWork(reason),
 			wakeBody: (bodyId, minimumGeneration) => this.runBodyWakeWork(bodyId, minimumGeneration),
 			flushCandidate: (bodyId) => this.runCandidateWork(bodyId),
+			retryLifecycle: (groupKey) => this.runLifecycleReplayWork(groupKey),
 			retryAttachmentPublications: () => this.runAttachmentPublicationWork(),
 			onError: (error) => this.log(`overdue work kernel error: ${String(error)}`),
 		});
@@ -1480,7 +1492,8 @@ export class VaultSync implements SyncRuntimePort {
 		}
 		await this.canvases?.initialize(this.pathToSemantic.entries());
 		await this.restoreCandidates();
-		await this.retryLifecycleOperations();
+		await this.queueStoredLifecycleOperations();
+		await this.workScheduler.whenIdle();
 		await this.restoreAttachmentOperations();
 		if (this.attachmentOperations.size > 0) {
 			await this.workScheduler.queueAttachmentPublications();
@@ -1558,6 +1571,8 @@ export class VaultSync implements SyncRuntimePort {
 		}
 		const batchId = requests.length > 1 ? crypto.randomUUID() : null;
 		const capturedAuthority = this.captureAuthority();
+		const replayGroupKey = batchId ? `batch:${batchId}` : `single:${requests[0]!.operationId}`;
+		try {
 		for (let index = 0; index < requests.length; index++) {
 			const request = requests[index]!;
 			this.assertLifecyclePaths(request);
@@ -1605,6 +1620,10 @@ export class VaultSync implements SyncRuntimePort {
 			await remove.call(this.options.database, requests[0]!.operationId);
 		}
 		return receipts;
+		} catch (error) {
+			await this.queueLifecycleReplaySafely(replayGroupKey);
+			throw error;
+		}
 	}
 
 	onProviderSync(callback: (generation: number) => void): void {
@@ -2389,6 +2408,7 @@ export class VaultSync implements SyncRuntimePort {
 			content: input.content,
 		};
 		await save.call(this.options.database, storedOperation);
+		try {
 		if (input.admissionStillCurrent?.() === false) {
 			await remove.call(this.options.database, operationId);
 			throw new FreshAdmissionCancelledError(input.path);
@@ -2478,6 +2498,11 @@ export class VaultSync implements SyncRuntimePort {
 			lifecycleOperationId: operationId,
 			receipt,
 		};
+		} catch (error) {
+			if (error instanceof FreshAdmissionCancelledError) throw error;
+			await this.queueLifecycleReplaySafely(`single:${operationId}`);
+			throw new FreshAdmissionDurablyPendingError(input.path, operationId, error);
+		}
 	}
 
 	/**
@@ -2507,6 +2532,7 @@ export class VaultSync implements SyncRuntimePort {
 			pending: PendingCandidate;
 		}> = [];
 		const batchId = crypto.randomUUID();
+		try {
 		for (let index = 0; index < inputs.length; index++) {
 			const input = inputs[index]!;
 			if (input.admissionStillCurrent?.() === false) {
@@ -2603,6 +2629,10 @@ export class VaultSync implements SyncRuntimePort {
 				receipt: receiptByBody.get(input.bodyId)!,
 			})),
 		};
+		} catch (error) {
+			await this.queueLifecycleReplaySafely(`batch:${batchId}`);
+			throw error;
+		}
 	}
 
 	/** Durable exact-candidate write for an already admitted body. */
@@ -4777,37 +4807,63 @@ export class VaultSync implements SyncRuntimePort {
 		}
 	}
 
-	private async retryLifecycleOperations(): Promise<void> {
+	private lifecycleGroupKey(operation: StoredLifecycleOperation): string {
+		return operation.batchId
+			? `batch:${operation.batchId}`
+			: `single:${operation.operationId}`;
+	}
+
+	private async queueStoredLifecycleOperations(): Promise<void> {
 		const list = this.options.database.listLifecycleOperations;
 		if (!list) return;
 		const operations = await list.call(this.options.database);
-		const groups = new Map<string, StoredLifecycleOperation[]>();
-		for (const operation of operations) {
-			const key = operation.batchId
-				? `batch:${operation.batchId}`
-				: `single:${operation.operationId}`;
-			const group = groups.get(key) ?? [];
-			group.push(operation);
-			groups.set(key, group);
+		const groupKeys = new Set(operations.map((operation) => this.lifecycleGroupKey(operation)));
+		for (const groupKey of groupKeys) await this.workScheduler.queueLifecycleReplay(groupKey);
+	}
+
+	private async queueLifecycleReplaySafely(groupKey: string): Promise<void> {
+		try {
+			await this.workScheduler.queueLifecycleReplay(groupKey);
+		} catch (error) {
+			this.log(`lifecycle ${groupKey} remains reconstructible after scheduler handoff failed: ${String(error)}`);
 		}
-		for (const group of groups.values()) {
-			group.sort((left, right) => (left.batchIndex ?? 0) - (right.batchIndex ?? 0));
+	}
+
+	private async runLifecycleReplayWork(groupKey: string): Promise<OperationOutcome> {
+		if (this.destroyed) return { kind: "cancelled" };
+		const list = this.options.database.listLifecycleOperations;
+		if (!list) return { kind: "permanently_blocked", failure: "local_persistence" };
+		try {
+			const operations = await list.call(this.options.database);
+			const group = operations
+				.filter((operation) => this.lifecycleGroupKey(operation) === groupKey)
+				.sort((left, right) => (left.batchIndex ?? 0) - (right.batchIndex ?? 0));
+			if (group.length === 0) return { kind: "completed", value: undefined };
 			if (group.some((operation) => !this.isCapturedAuthorityCurrent(operation.authority))) {
 				const requests = group.map((operation) => this.fromStoredLifecycleOperation(operation));
 				const recovered = await this.recoverLifecycleReceipts(requests, group.map((operation) => operation.authority));
+				if (this.destroyed) return { kind: "cancelled" };
 				if (recovered) {
 					try {
 						await this.publishLifecycleRoot(requests, recovered);
 						await this.deleteLifecycleGroup(group);
-						continue;
+						return { kind: "completed", value: undefined };
 					} catch (error) {
 						this.log(`recovered lifecycle root publication remains pending: ${String(error)}`);
 					}
 				}
 				for (const operation of group) this.noteAuthoritySuperseded("lifecycle", operation.operationId, operation.authority);
-				continue;
+				return { kind: "decision_required", failure: "unauthorized" };
 			}
 			await this.retryLifecycleGroup(group);
+			if (this.destroyed) return { kind: "cancelled" };
+			const remaining = await list.call(this.options.database);
+			return remaining.some((operation) => this.lifecycleGroupKey(operation) === groupKey)
+				? { kind: "retryable_failure", failure: "network" }
+				: { kind: "completed", value: undefined };
+		} catch (error) {
+			this.log(`lifecycle scheduler failed for ${groupKey}: ${String(error)}`);
+			return { kind: "retryable_failure", failure: "local_persistence" };
 		}
 	}
 
@@ -4878,8 +4934,11 @@ export class VaultSync implements SyncRuntimePort {
 				operation.candidateDigest = pending.record.candidateDigest;
 				await save.call(this.options.database, operation);
 			}
+			if (this.destroyed) return;
 			const receipts = await this.commitLifecycleRequests(requests);
+			if (this.destroyed) return;
 			for (const operation of attempted) {
+				if (this.destroyed) return;
 				if (operation.kind !== "create" || operation.content === null) continue;
 				await this.submitPendingForBody(operation.bodyId);
 				const stillPending = Array.from(this.pendingCandidates.values()).some(
@@ -4892,6 +4951,7 @@ export class VaultSync implements SyncRuntimePort {
 				});
 			}
 			for (let index = 0; index < attempted.length; index++) {
+				if (this.destroyed) return;
 				const operation = attempted[index]!;
 				if (operation.kind !== "create" || operation.content === null) continue;
 				const finalReceipt = await this.server.commitLifecycle(requests[index]!);
@@ -4902,6 +4962,7 @@ export class VaultSync implements SyncRuntimePort {
 				}
 				receipts[index] = finalReceipt;
 			}
+			if (this.destroyed) return;
 			await this.publishLifecycleRoot(requests, receipts);
 			if (attempted.length > 1) {
 				await removeBatch!.call(
