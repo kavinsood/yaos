@@ -324,7 +324,7 @@ export async function buildTraceHeader(
 				comparedFileCount: allPaths.size,
 			}
 			: null,
-		httpTraceContext: state?.httpTraceContext ?? null,
+		httpTraceContext: redacted ? null : (state?.httpTraceContext ?? null),
 		recentLogLines: {
 			plugin: state?.pluginLogLines.slice(-240) ?? [],
 			sync: state?.syncLogLines.slice(-240) ?? [],

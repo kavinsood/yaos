@@ -223,7 +223,12 @@ function makeState(overrides: Partial<TraceHeaderStateInput> = {}): TraceHeaderS
 				candidateCapturedAt: null,
 			},
 		},
-		httpTraceContext: null,
+		httpTraceContext: {
+			traceId: "trace-test-001",
+			bootId: "boot-test-001",
+			deviceName: SENSITIVE_DEVICE,
+			vaultId: SENSITIVE_VAULT,
+		},
 		diskHashes,
 		crdtHashes,
 		pluginLogLines: [
@@ -387,6 +392,7 @@ s.section("Test 2: redacted — settings snapshot");
 		!JSON.stringify(settings).includes("secret-device-token"),
 		"redacted: the device token value itself never appears",
 	);
+	s.check(header.httpTraceContext === null, "redacted: raw HTTP trace context is withheld");
 	s.check(settings.debugModeEnabled === true, "settings snapshot records that debug was on");
 	s.check(
 		settings.externalEditPolicy === "always",
@@ -520,6 +526,9 @@ s.section("Test 8: with filenames — settings and directory included");
 	s.check(settings.serverHost === SENSITIVE_HOST, "with filenames: serverHost is present");
 	s.check(settings.vaultId === SENSITIVE_VAULT, "with filenames: vaultId is present");
 	s.check(settings.deviceName === SENSITIVE_DEVICE, "with filenames: deviceName is present");
+	const httpTraceContext = header.httpTraceContext as Record<string, unknown>;
+	s.check(httpTraceContext.vaultId === SENSITIVE_VAULT, "with filenames: HTTP trace vault ID is present");
+	s.check(httpTraceContext.deviceName === SENSITIVE_DEVICE, "with filenames: HTTP trace device name is present");
 	s.check(serialized.includes(KNOWN_PATH_1), `with filenames: "${KNOWN_PATH_1}" is present`);
 
 	const directory = header.pathDirectory as Array<{ pathId: string; path: string }>;
