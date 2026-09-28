@@ -81,7 +81,7 @@ The full regression runner discovers suites under `tests/client`, `tests/server`
 The current passing local Worker run covers:
 
 - claim, owner bootstrap, same-principal device link, device roster, device revocation, and consumed-code rejection;
-- exact document schema `7`, socket protocol `4`, and identity format `3` admission;
+- exact document schema `8`, socket protocol `5`, and identity format `3` admission;
 - root and body socket connections using deployment-, actor-, purpose-, and document-bound tickets;
 - device A create/candidate/root publication and device B cold SQL bootstrap;
 - device B durable body edit, device A catch-up, rename publication, delete tombstone, and stale candidate rejection;
@@ -130,9 +130,9 @@ Prior long-run Worker soak evidence exists. The integrated build has not repeate
 
 A disposable two-device run against the deployed validation Worker passed
 enrollment, HTTP and WebSocket synchronization, Markdown/Canvas lifecycle,
-attachments, recovery, settings, revocation, and generation purge. The exact
-deployment and Access policy boundary are recorded in the
-[Yjs pathology remediation report](pathology-remediation-report.md).
+attachments, recovery, settings, revocation, and generation purge. The detailed
+deployment and Access-policy record is historical validation evidence and is
+kept outside the current product documentation.
 
 That one destructive run proves the exercised Cloudflare routing and Durable
 Object paths; it does not prove prolonged placement/eviction behavior, alarms

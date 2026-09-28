@@ -128,7 +128,7 @@ The exact file allowlist is:
 
 `workspace.json`, `workspace-mobile.json`, `community-plugins.json`, `file-recovery.json`, `publish.json`, `types.json`, unknown root JSON, YAOS/QA-harness plugin data, manifests, JavaScript, CSS theme packages, and all other paths remain local. Unknown root JSON is surfaced but never silently admitted. Plugin and theme binaries are never uploaded to YAOS, Yjs, SQL, or R2.
 
-Settings format `1` uses environment, file, plugin-intent, theme-intent, tombstone, and plugin-data tables inside the vault Durable Object. A named environment has one monotonic safe-integer `envRev`; every accepted item mutation advances it once and assigns the same revision to the changed row. Corrupt rows, exhausted revision space, duplicate snapshot identities, invalid UTF-8/JSON, bad hashes, traversal, and exceeded bounds fail closed.
+Settings format `2` uses environment, file, plugin-intent, theme-intent, tombstone, and plugin-data tables inside the vault Durable Object. A named environment has one monotonic safe-integer `envRev`; every accepted item mutation advances it once and assigns the same revision to the changed row. Corrupt rows, exhausted revision space, duplicate snapshot identities, invalid UTF-8/JSON, bad hashes, traversal, and exceeded bounds fail closed.
 
 ### Initialization and LWW
 
@@ -215,7 +215,7 @@ Unresolved paths remain guarded from later scan/import resurrection until explic
 
 Ordinary Markdown sync and SQL bootstrap do not depend on recovery storage. If either R2 or `RecoveryJob` is absent, the recovery API reports unavailable and core sync continues.
 
-Capture is asynchronous. The vault authority pins one SQL boundary; a generation-scoped job materializes verified content, builds bounded active/deleted/attachment manifest trees, and publishes one immutable format-2 root. `complete_with_gaps` is a successful terminal state only because every unavailable entry and its reason remain explicit. Recovery points contain content, never principals, memberships, devices, invitations, revocations, authority changes, settings environments, or security audit.
+Capture is asynchronous. The vault authority pins one SQL boundary; a generation-scoped job materializes verified content, builds bounded active/deleted/attachment manifest trees, and publishes one immutable format-3 root. `complete_with_gaps` is a successful terminal state only because every unavailable entry and its reason remain explicit. Recovery points contain content, never principals, memberships, devices, invitations, revocations, authority changes, settings environments, or security audit.
 
 Restore is asynchronous and selection-scoped. The client must:
 

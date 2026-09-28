@@ -1,8 +1,8 @@
 # YAOS documentation
 
-Current `yaos3` has durable engineering documents for the schema-8 collaboration
-product and the Relay-derived text/lifetime program. Git history preserves
-replaced RFCs, audits, incident reports, and implementation notes; they are not
+Current `yaos3` documentation describes the schema-8 product, its operating
+boundary, and the contracts consumers and maintainers need to use safely. Git
+history preserves replaced RFCs, audits, incident reports, and implementation notes; they are not
 parallel current specifications.
 
 - [Vault collaboration](collaboration.md) — owner/member product contract,
@@ -14,22 +14,7 @@ parallel current specifications.
 - [Operations](operations.md) — claim, invitations/device links, owner recovery and transfer, settings setup, required bindings, recovery, and the greenfield schema-8 boundary.
 - [QA](qa.md) — focused, regression, and local Worker coverage, with real-runtime and external evidence gaps stated separately.
 - [Backlog](BACKLOG.md) — only evidenced unresolved product risks and concrete external validation gaps.
-- [Runtime lifecycle and socket admission](runtime-lifecycle-and-admission.md) — publication epochs, bounded drain, and refresh-first socket ownership.
-- [Application-level socket liveness](socket-liveness.md) — heartbeat evidence, background suspension, and force-abort recovery.
-- [Currentness plane implementation report](currentness-plane-implementation-report.md) — six-phase delivery, public Cloudflare profiling, flush compaction, contention remediation, and final outcome.
-- [Body coordination and safe apply](body-coordination-and-safe-apply.md) — effect-specific proofs, catalog identity, editor/disk leases, and stale-safe text commit.
-- [Common bases and three-way merge](common-base-and-three-way-merge.md) — CAS ancestry, bootstrap backfill, bounded diff3, preservation, and revision-fenced review.
-- [RFC 01–07 implementation report](relay-rfcs-01-07-implementation-report.md) — delivered work, observations, pitfalls, validation, and next recommendations.
-- [Residency admission policy](residency-admission-policy.md) — measured load/scratch/socket reservations, priority aging, clean warm eviction, mobile background behavior, and backpressure.
-- [Overdue-work kernel](overdue-work-kernel.md) — durable-intent scheduling, single-flight keys, fairness, retry ownership, quiesce, and staged producer migration.
-- [Operational resource UX](operational-resource-ux.md) — read-only heuristic budgets, queues, blockers, socket counts, and actionable pressure guidance.
-- [RFC 08–10 implementation report](relay-rfcs-08-10-implementation-report.md) — integrated resource and scheduling work, server reuse, pitfalls, validation, and calibration recommendations.
-- [Relay follow-up implementation and deferral report](relay-followups-implementation-report.md) — explicit rename/audit migration prerequisites, field-evidence gaps, exit criteria, and recommended execution order.
 - [Obsidian host compatibility](obsidian-host-compatibility.md) — supported private-host seams, capability fallbacks, and reversible patching rules.
 - [Public plugin API](public-api.md) — versioned immutable state projection, subscriptions, and reload fencing.
-- [Canvas semantic synchronization](canvas-semantic-sync-plan.md) — implemented semantic model, authority, projection, migration, recovery, validation, and field-gated rollout plan for JSON Canvas.
-- [Canvas implementation report](canvas-semantic-sync-implementation-report.md) — shipped schema-8 behavior, safe degradation, automated evidence, and remaining external release gates.
-- [Yjs pathology remediation report](pathology-remediation-report.md) — binary storage, resident validation, semantic epochs and compaction, retention fixes, frozen-trace measurements, and deployed validation.
-- [ywasm server engine RFC](ywasm-server-engine-rfc.md) — adoption decision, Worker and Unicode evidence, engine/build/memory architecture, and the detailed compaction-reliability implementation plan.
 
 The repository-root [README](../README.md) is the public product guide. Generated evidence belongs under ignored `qa-runs/`; workstation notes belong under ignored `notes/`.
