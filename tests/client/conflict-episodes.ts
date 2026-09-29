@@ -23,6 +23,29 @@ function fixture(initial: ConflictEpisodeState = { episodes: {}, artifacts: {} }
 
 const input = { bodyId: "body-1", path: "Note.md", epoch: 1, disk: "disk edit", body: "remote edit", base: "common base", device: "B" };
 
+tests.test("G5: artifact exemption requires both the recorded path and exact content", async () => {
+	const { store, files } = fixture();
+	const path = await store.preserve(input);
+	const content = files.get(path)!;
+	assert.equal(await store.isArtifact(path, content), true);
+	assert.equal(await store.isArtifact(path, `${content}\nuser edit`), false);
+	assert.equal(await store.isArtifact("Unrecorded (YAOS conflict).md", content), false);
+	await store.close(input.bodyId);
+	assert.equal(await store.isArtifact(path, content), true);
+	store.dispose();
+});
+
+tests.test("G4: a single version above the soft cap gets its own bounded part", async () => {
+	const { store, files } = fixture();
+	const disk = "x".repeat(2 * 1024 * 1024);
+	await store.preserve({ ...input, disk });
+	const episode = store.get(input.bodyId)!;
+	assert.equal(await store.readVersion(input.bodyId, episode.latestDiskHash!), disk);
+	assert.equal(episode.parts.length, 2);
+	for (const content of files.values()) assert.ok(Buffer.byteLength(content) < MAX_CLIENT_MARKDOWN_BYTES);
+	store.dispose();
+});
+
 tests.test("G1/G3: body identity and all versions survive restart, rename and semantic reset", async () => {
 	const first = fixture();
 	await first.store.preserve(input);
