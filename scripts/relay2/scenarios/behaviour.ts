@@ -1,7 +1,10 @@
 /**
  * §7.3 behaviour scenarios: B1 hibernation/restart, B2 catch-up, B3 bootstrap, B4 revocation,
- * B7 overload, B8 delete while open. (B5/B6 belong to the reset/relay work and plug in later.)
+ * B6 lost-ack resend / candidate-id reuse (relay), B7 overload, B8 delete while open. (B5 lives with the reset work.)
  */
+import { createHash, randomBytes } from "node:crypto";
+import * as encoding from "lib0/encoding";
+import * as syncProtocol from "y-protocols/sync";
 import * as Y from "yjs";
 import { decodeBinaryEnvelope } from "../../../server/src/shared/binaryEnvelope";
 import { vaultRoute, mutateLifecycle } from "../../../tests/live/schema4Live";
@@ -10,7 +13,7 @@ import type { LifecycleRequest } from "../../../server/src/contracts";
 import { log, now, r2, series, sleep } from "../lib/common";
 import { addDevice, smallContent, smallId } from "../lib/context";
 import { bodyGet, bodyHead, convergence, diagnostics } from "../lib/checks";
-import { RawClient } from "../lib/rawClient";
+import { contentHashOf, RawClient } from "../lib/rawClient";
 import { CoverageTracker, ensureOpen, freshNotes, freshSmallNote, freshTraceBody, keystrokes, loadTrace, openOrThrow,
 	operatorVaultPost, pctChange, replayTrace, revokeDevice, type RunCtx } from "../lib/run";
 import { SMALL_COUNT } from "../context";
@@ -343,4 +346,137 @@ export async function B8(ctx: RunCtx): Promise<Result> {
 	return { bodyId: body, deleteMs, deleteError, headBefore: headBefore.value, closes: { a: closeInfo(ca), b: closeInfo(cb) },
 		postEdit, reopenAfterDelete: reopen, headAfter, getAfterStatus: getAfter.status, diagnostics: d,
 		convergence: { pass, note: "body deleted: convergence = head/GET report not active" } };
+}
+
+/**
+ * B6 (relay): lost-ack resend + candidate-id reuse. One local edit is sent as envelope(candidateId X)+frame, then
+ * the SAME envelope+frame is resent twice on the same socket and once more after a reconnect (a client that
+ * lost the ack). Expected: exactly one append (relay counters appends +1, dedupeHits +3), every resend answered
+ * with BODY_COMMITTED deduped:true carrying the same vaultSequence/durableGeneration. Then a different update
+ * reusing candidateId X must get BODY_UPDATE_REJECTED {reason:"candidate_id_reused"} and must not be appended;
+ * resending it under a fresh id recovers. Base: not applicable (no socket candidates) — reported as skipped.
+ */
+export async function B6(ctx: RunCtx): Promise<Result> {
+	if (!ctx.adapter.name.startsWith("relay") || ctx.adapter.name.includes("nocand")) {
+		return { skipped: "B6 needs a relay adapter with candidate fields", convergence: { pass: null } };
+	}
+	const resends = ctx.num("resends", 3);
+	const body = await freshSmallNote(ctx);
+	const a = await openOrThrow(await ctx.client("A", body));
+	const b = await openOrThrow(await ctx.client("B", body));
+	const diagDev = await ctx.dev("C");
+	const counters = async () => ((await diagnostics(diagDev)).relay as { counters?: Record<string, number> } | undefined)?.counters ?? {};
+	const captureLocal = (fn: (t: Y.Text) => void) => {
+		let update: Uint8Array | null = null;
+		const cap = (u: Uint8Array, o: unknown) => { if (o !== a) update = u; };
+		a.forwardLocal = false;
+		a.doc.on("update", cap);
+		a.edit(fn);
+		a.doc.off("update", cap);
+		a.forwardLocal = true;
+		return update!;
+	};
+	const frameOf = (update: Uint8Array) => {
+		const e = encoding.createEncoder();
+		encoding.writeVarUint(e, 0);
+		syncProtocol.writeUpdate(e, update);
+		return encoding.toUint8Array(e);
+	};
+	const envelopeFor = (update: Uint8Array, candidateId: string, clientFrameId: string) => {
+		const digest = createHash("sha256").update(update).digest("hex");
+		const { contentHash, size } = contentHashOf(a.text());
+		return `__YPS:${JSON.stringify({ type: "BODY_UPDATE_ENVELOPE", bodyId: body, bodyEpoch: a.bodyEpoch, clientFrameId,
+			payloadDigest: digest, candidateId, candidateDigest: digest, contentHash, size, frameKind: "update",
+			stateVector: Buffer.from(Y.encodeStateVector(a.doc)).toString("base64") })}`;
+	};
+	const sendOnce = async (client: RawClient, update: Uint8Array, candidateId: string, label: string) => {
+		const clientFrameId = `${label}-${randomBytes(4).toString("hex")}`;
+		const t0 = now();
+		const wait = client.waitControl((v) => v.clientFrameId === clientFrameId
+			&& (v.type === "BODY_COMMITTED" || v.type === "BODY_UPDATE_REJECTED"), 10_000);
+		client.send(envelopeFor(update, candidateId, clientFrameId));
+		client.send(frameOf(update));
+		const got = await wait;
+		const v = got?.value ?? null;
+		return { label, clientFrameId, ms: got ? r2(got.at - t0) : null, type: v?.type ?? null, deduped: v?.deduped ?? null,
+			noop: v?.noop ?? null, reason: v?.reason ?? null, vaultSequence: v?.vaultSequence ?? null,
+			durableGeneration: v?.durableGeneration ?? null, candidateId: v?.candidateId ?? null, candidateDigest: v?.candidateDigest ?? null };
+	};
+	await sleep(500);
+	const c0 = await counters();
+	const update = captureLocal((t) => t.insert(t.length, ` b6-${ctx.tag} `));
+	const candidateId = crypto.randomUUID();
+	const sends: Result[] = [await sendOnce(a, update, candidateId, "first")];
+	for (let i = 0; i < resends - 1; i++) sends.push(await sendOnce(a, update, candidateId, `resend${i + 1}`));
+	await sleep(1000);
+	const c1 = await counters();
+	// Lost ack across a reconnect: close, reopen, let the reconnect's own step1/step2 exchange finish (its
+	// step2 reply may carry the delete set and is appended/counted on its own), then resend the same candidate.
+	await a.close();
+	await openOrThrow(a);
+	await sleep(2000);
+	const c1r = await counters();
+	sends.push(await sendOnce(a, update, candidateId, "resend-after-reconnect"));
+	await sleep(1000);
+	const c1s = await counters();
+	const first = sends[0]!;
+	const repeats = sends.slice(1);
+	const sameReceipt = repeats.every((s) => s.type === "BODY_COMMITTED" && s.deduped === true
+		&& s.vaultSequence === first.vaultSequence && s.durableGeneration === first.durableGeneration
+		&& s.candidateId === candidateId && s.candidateDigest === first.candidateDigest);
+	const d = (x: Record<string, number>, y: Record<string, number>, k: string) => (y[k] ?? 0) - (x[k] ?? 0);
+	const appends = d(c0, c1, "appends") + d(c1r, c1s, "appends");
+	const resend = { sends, appendsDelta: appends, dedupeHitsDelta: d(c0, c1, "dedupeHits") + d(c1r, c1s, "dedupeHits"),
+		reconnectExchange: { appends: d(c1, c1r, "appends"), step2Replies: d(c1, c1r, "step2Replies"), emptySkips: d(c1, c1r, "emptySkips"),
+			note: "the reconnect's own step1/step2 exchange, excluded from the resend accounting" },
+		exactlyOneAppend: appends === 1, sameReceiptReturned: sameReceipt, firstDeduped: first.deduped };
+
+	// HTTP fallback after a socket commit whose ack was lost: POST /candidate with the same id + digest must return
+	// the same receipt (shared vault_candidate_receipts), not a second append. And the reverse: HTTP first, then socket.
+	const postCandidate = async (upd: Uint8Array, id: string) => {
+		const digest = createHash("sha256").update(upd).digest("hex");
+		const t0 = now();
+		const res = await fetch(vaultRoute(a.identity, `body/${encodeURIComponent(body)}/candidate`), { method: "POST",
+			headers: { ...deviceBearerHeaders(a.identity), "content-type": "application/octet-stream", "x-yaos-body-epoch": String(a.bodyEpoch),
+				"x-yaos-candidate-id": id, "x-yaos-candidate-digest": digest }, body: upd });
+		const v = await res.json().catch(() => null) as Record<string, unknown> | null;
+		return { status: res.status, ms: r2(now() - t0), durableGeneration: v?.durableGeneration ?? null, candidateId: v?.candidateId ?? null,
+			candidateDigest: v?.candidateDigest ?? null, runtimeEpoch: v?.runtimeEpoch ?? null, body: res.ok ? null : v };
+	};
+	const h0 = await counters();
+	const httpAfterSocket = await postCandidate(update, candidateId);
+	const viaHttp = captureLocal((t) => t.insert(t.length, ` http-first-${ctx.tag} `));
+	const httpId = crypto.randomUUID();
+	const httpFirst = await postCandidate(viaHttp, httpId);
+	await sleep(500);
+	const socketAfterHttp = await sendOnce(a, viaHttp, httpId, "socket-after-http");
+	await sleep(1000);
+	const h1 = await counters();
+	const httpFallback = { httpAfterSocket, httpAfterSocketSameReceipt: httpAfterSocket.status === 200
+			&& httpAfterSocket.durableGeneration === first.durableGeneration && httpAfterSocket.candidateId === candidateId,
+		httpFirst, socketAfterHttp, socketAfterHttpDeduped: socketAfterHttp.type === "BODY_COMMITTED" && socketAfterHttp.deduped === true
+			&& socketAfterHttp.durableGeneration === httpFirst.durableGeneration,
+		relayAppendsDelta: d(h0, h1, "appends"), dedupeHitsDelta: d(h0, h1, "dedupeHits"),
+		note: "relayAppendsDelta counts socket appends only; the HTTP candidate goes through the base candidate path" };
+
+	// Reused candidateId with different bytes → rejected, not appended.
+	const other = captureLocal((t) => t.insert(0, ` reuse-${ctx.tag} `));
+	await sleep(500);
+	const c2 = await counters();
+	const reuse = await sendOnce(a, other, candidateId, "reuse");
+	await sleep(1500);
+	const c3 = await counters();
+	const serverAfterReuse = await bodyGet(diagDev, body);
+	const bSawReuse = b.text().includes(`reuse-${ctx.tag}`);
+	const recovery = await sendOnce(a, other, crypto.randomUUID(), "recover-fresh-id");
+	const reused = { result: reuse, rejected: reuse.type === "BODY_UPDATE_REJECTED" && reuse.reason === "candidate_id_reused",
+		appendsDelta: (c3.appends ?? 0) - (c2.appends ?? 0), notOnServer: !(serverAfterReuse.text ?? "").includes(`reuse-${ctx.tag}`),
+		notFannedOutToB: !bSawReuse, socketStillOpen: a.isOpen, recovery };
+	const conv = await convergence({ bodyId: body, clients: [a, b], fresh: diagDev, adapter: ctx.adapter });
+	await a.close(); await b.close();
+	const pass = resend.exactlyOneAppend && resend.sameReceiptReturned && reused.rejected && reused.appendsDelta === 0
+		&& reused.notOnServer && httpFallback.httpAfterSocketSameReceipt && httpFallback.socketAfterHttpDeduped && conv.pass === true;
+	return { bodyId: body, resends, resend, httpFallback, reused, counters: { before: c0, afterResends: c1, afterReconnect: c1r, afterReconnectResend: c1s,
+		beforeReuse: c2, afterReuse: c3 },
+		pass, convergence: { ...conv, pass: conv.pass === true && pass } };
 }

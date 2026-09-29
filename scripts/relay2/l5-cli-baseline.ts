@@ -3,7 +3,14 @@
  * through the REAL production candidate path, with the real 250 ms / 2 s candidate debounce.
  *
  *   node tests/run-typescript.mjs --test-aliases scripts/relay2/l5-cli-baseline.ts --host <url> \
- *        [--n 100] [--mode prod|nodebounce|both] [--burst 1] [--burst-interval 80] [--spacing 1500] [--out file.json]
+ *        [--n 100] [--mode prod|nodebounce|relay|relay250|both|all|a,b] [--burst 1] [--burst-interval 80] [--spacing 1500]
+ *        [--offline-probe] [--persist before-send|after-send] [--out file.json]
+ *
+ * relay / relay250 (flag-on worker only): the §5.3 harness receipt client (lib/socketReceipts.ts, RECEIPTS.md)
+ * settles candidates from the socket BODY_COMMITTED echo; VaultSync's own HTTP candidate debounce is parked at
+ * 10 min (fallback only). relay250 adds a 250 ms / 2 s harness-side debounce (merged frames) to separate
+ * "relay is faster" from "relay has no debounce". Every sample records per-burst wire counts (WS frames/bytes,
+ * HTTP requests/bytes, DO request units).
  *
  * What is real (nothing reimplemented, src/sync/vaultSync.ts untouched):
  *   - `VaultSync.create` (src/sync/vaultSync.ts) with its DEFAULT providerFactory: OwnAwarenessProvider
@@ -36,62 +43,28 @@ import "../../packages/cli/src/globals";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { join } from "node:path";
-import WebSocket from "ws";
 import { LOG_DIR, flagNum, flagStr, log, now, parseArgs, r2, series, sleep, startMeta, workerName } from "./lib/common";
 import { addDevice, loadContext, seedNotes, smallContent } from "./lib/context";
 import { contentHashOf } from "./lib/rawClient";
+import { type FrameRecord, type ReceiptOptions, type ReceiptStore, newReceiptStats, pairingSummary, receiptWebSocket } from "./lib/socketReceipts";
+
+const RELAY_PARKED_DEBOUNCE_MS = 600_000;
+const sum = (m: Record<string, number>) => Object.values(m).reduce((a, b) => a + b, 0);
 
 type Obj = Record<string, unknown>;
 
 interface CandidateEvent { at: number; op: "put" | "confirm" | "delete"; candidateId: string; bodyId: string; ms: number }
 
 /**
- * ENVELOPE HOOK (documented for the relay client): every frame the real provider sends goes
- * YSyncProvider → FencedWebSocket.send(data) → Base.send(data), where Base = VaultSyncOptions.webSocket.
- * A relay client can pass a Base whose send() emits `__YPS:{BODY_UPDATE_ENVELOPE…}` immediately before a
- * binary sync step2/update frame (bytes[0]==0 && bytes[1] in {1,2}). The required envelope fields are all
- * derivable at this layer: bodyId from the socket URL (/ws/body/<id>), bodyEpoch from
- * VaultSync.currentBodyEpoch(bodyId), payloadDigest = sha256(inner update) from the frame itself, clientFrameId
- * generated here. Optional contentHash/size/stateVector need the body Y.Doc (VaultSync.getTextForPath).
- * `connectDocument`'s webSocketPolyfill param is the same seam. Here the hook only observes (flag-off worker).
+ * ENVELOPE HOOK: every frame the real provider sends goes YSyncProvider → FencedWebSocket.send(data) →
+ * Base.send(data), where Base = VaultSyncOptions.webSocket. `lib/socketReceipts.ts` is that Base: passive
+ * (counting only) in the base modes, and the §5.3 harness receipt client in the relay modes (see RECEIPTS.md).
  */
-function instrumentedWebSocket(stats: Obj) {
-	const frames = (stats.frames ??= { out: { binary: 0, text: 0, syncUpdate: 0, syncStep1: 0, syncStep2: 0 }, in: { binary: 0, text: 0 } }) as {
-		out: Record<string, number>; in: Record<string, number> };
-	const sockets = (stats.sockets ??= []) as Obj[];
-	const controlsIn = (stats.controlsIn ??= {}) as Record<string, number>;
-	return class InstrumentedWebSocket extends WebSocket {
-		private readonly rec: Obj;
-		constructor(url: string | URL, protocols?: string | string[]) {
-			super(url, protocols ?? []);
-			const u = new URL(String(url));
-			this.rec = { path: u.pathname.replace(/\/vault\/[^/]+/, "/vault/<id>"), openedAt: null, closed: null, createdAt: r2(now()) };
-			sockets.push(this.rec);
-			this.on("open", () => { this.rec.openedAt = r2(now()); });
-			this.on("close", (code, reason) => { this.rec.closed = { code, reason: reason.toString(), at: r2(now()) }; });
-			this.on("message", (data, isBinary) => {
-				if (isBinary) { frames.in.binary!++; return; }
-				frames.in.text!++;
-				const text = data.toString();
-				if (text.startsWith("__YPS:")) {
-					try { const t = String((JSON.parse(text.slice(6)) as Obj).type); controlsIn[t] = (controlsIn[t] ?? 0) + 1; } catch { /* ignore */ }
-				}
-			});
-		}
-		override send(data: unknown, ...rest: unknown[]): void {
-			if (typeof data === "string") frames.out.text!++;
-			else {
-				frames.out.binary!++;
-				const b = data instanceof Uint8Array ? data : new Uint8Array(data as ArrayBuffer);
-				if (b[0] === 0) frames.out[b[1] === 0 ? "syncStep1" : b[1] === 1 ? "syncStep2" : "syncUpdate"]!++;
-				// Relay: `super.send("__YPS:" + JSON.stringify(envelope))` would go here, before the binary frame.
-			}
-			(super.send as (...a: unknown[]) => void)(data, ...rest);
-		}
-	};
-}
+type Mode = "prod" | "nodebounce" | "relay" | "relay250";
+const MODES: Mode[] = ["prod", "nodebounce", "relay", "relay250"];
+const DEVICE: Record<Mode, string> = { prod: "L5p", nodebounce: "L5n", relay: "L5r", relay250: "L5d" };
 
-async function runMode(host: string, mode: "prod" | "nodebounce", opts: { n: number; burst: number; burstInterval: number; spacing: number; tag: string }) {
+async function runMode(host: string, mode: Mode, opts: { n: number; offlineProbe: boolean; persist: "before-send" | "after-send"; burst: number; burstInterval: number; spacing: number; tag: string }) {
 	const { VaultSync } = await import("../../src/sync/vaultSync");
 	const { createSocketTicketCache } = await import("../../src/sync/socketTicket");
 	const { createFetchRequester } = await import("../../src/utils/http");
@@ -99,7 +72,8 @@ async function runMode(host: string, mode: "prod" | "nodebounce", opts: { n: num
 	const { NodeVaultDatabase } = await import("../../packages/cli/src/nodeVaultDatabase");
 
 	const context = loadContext(host);
-	const identity = await addDevice(context, `L5${mode === "prod" ? "p" : "n"}`);
+	const identity = await addDevice(context, DEVICE[mode]);
+	const relayMode = mode === "relay" || mode === "relay250";
 	const bodyId = `${opts.tag}-l5-${mode}`;
 	const path = `R2/${opts.tag}/l5-${mode}.md`;
 	await seedNotes(context, [{ bodyId, path, content: smallContent(7) }]);
@@ -107,9 +81,10 @@ async function runMode(host: string, mode: "prod" | "nodebounce", opts: { n: num
 	const dir = join(LOG_DIR, "l5", `${workerName(host)}-${opts.tag}-${mode}`);
 	rmSync(dir, { recursive: true, force: true });
 	mkdirSync(dir, { recursive: true });
+	const folderKey = randomBytes(16).toString("hex");
 	const real = new NodeVaultDatabase(join(dir, "client.sqlite"), {
 		host, realVaultPath: dir, vaultId: identity.vaultId, vaultGeneration: context.vaultGeneration,
-		deviceId: identity.deviceId, folderKey: randomBytes(16).toString("hex") });
+		deviceId: identity.deviceId, folderKey });
 	const events: CandidateEvent[] = [];
 	const traced = new Set(["putCandidate", "confirmPendingCandidate", "deleteCandidate"]);
 	const database = new Proxy(real, {
@@ -134,13 +109,25 @@ async function runMode(host: string, mode: "prod" | "nodebounce", opts: { n: num
 	const fetchRequester = createFetchRequester(globalThis.fetch.bind(globalThis));
 	const requester: typeof fetchRequester = async (request) => {
 		const t0 = now();
+		if (process.env.L5_TRACE && /candidate/.test(request.url) && logs.length < 1990) logs.push(`TRACE ${new Error().stack}`);
 		const response = await fetchRequester(request);
-		httpLog.push({ at: r2(t0), method: request.method ?? "GET",
+		const reqBody = (request as { body?: unknown }).body;
+		const reqBytes = typeof reqBody === "string" ? Buffer.byteLength(reqBody)
+			: reqBody instanceof ArrayBuffer ? reqBody.byteLength : ArrayBuffer.isView(reqBody) ? reqBody.byteLength : 0;
+		httpLog.push({ at: r2(t0), method: request.method ?? "GET", reqBytes,
+			resBytes: Number(response.headers?.get?.("content-length") ?? 0) || 0,
 			path: new URL(request.url).pathname.replace(/\/vault\/[^/]+/, "/vault/<id>").replace(/\/ws\/.*$/, "/ws/…"),
 			status: response.status, ms: r2(now() - t0) });
 		return response;
 	};
-	const wsStats: Obj = {};
+	const wsStats = newReceiptStats();
+	const frames: FrameRecord[] = [];
+	const registry = new Set<import("ws").WebSocket & { bodyId: string | null }>();
+	const bodies = new Map<string, { doc: import("yjs").Doc; bodyEpoch: number }>();
+	const receiptOptions: ReceiptOptions = { vaultId: identity.vaultId, vaultGeneration: context.vaultGeneration,
+		deviceId: identity.deviceId, database: database as unknown as ReceiptStore, bodies, passive: !relayMode,
+		debounceMs: mode === "relay250" ? 250 : 0, maxWaitMs: 2000, registry, persist: opts.persist };
+	const ReceiptWs = receiptWebSocket(receiptOptions, wsStats, frames);
 	const logs: string[] = [];
 	const t0 = now();
 	await prepareBootstrapRoot(new BootstrapHttpPort(host, identity.vaultId, identity.deviceToken, real, requester), real);
@@ -149,13 +136,15 @@ async function runMode(host: string, mode: "prod" | "nodebounce", opts: { n: num
 	const vaultSync = await VaultSync.create({
 		vaultId: identity.vaultId, vaultGeneration: context.vaultGeneration, deviceId: identity.deviceId,
 		host, token: identity.deviceToken, database, request: requester,
-		webSocket: instrumentedWebSocket(wsStats) as unknown as typeof globalThis.WebSocket,
+		webSocket: ReceiptWs as unknown as typeof globalThis.WebSocket,
 		getSocketTicket: async (scope, force = false) => {
 			if (force) tickets.invalidate();
 			return tickets.get(host, identity.deviceToken, identity.vaultId, scope);
 		},
 		log: (m) => { if (logs.length < 2000) logs.push(`${r2(now())} ${m}`); },
 		...(mode === "nodebounce" ? { candidateDebounceMs: 0, candidateMaxWaitMs: 0 } : {}),
+		// Relay modes: VaultSync's own HTTP candidate path is parked (10 min debounce) and stays the fallback.
+		...(relayMode ? { candidateDebounceMs: RELAY_PARKED_DEBOUNCE_MS, candidateMaxWaitMs: RELAY_PARKED_DEBOUNCE_MS } : {}),
 	});
 	vaultSync.setResidencyRuntimeContext("desktop", "foreground");
 	const createMs = r2(now() - t0);
@@ -169,11 +158,17 @@ async function runMode(host: string, mode: "prod" | "nodebounce", opts: { n: num
 	const acquireMs = r2(now() - a0);
 	const text = vaultSync.getTextForPath(path);
 	if (!text) throw new Error("no Y.Text for editor body");
+	const realBodyId = vaultSync.getFileId(path)!;
+	if (relayMode) bodies.set(realBodyId, { doc: text.doc!, bodyEpoch: await vaultSync.currentBodyEpoch(realBodyId) });
 	await sleep(1500);
+	const counters = () => ({ wsOut: sum(wsStats.framesOut) + sum(wsStats.envelopesSent), wsBytesOut: wsStats.bytesOut, wsIn: sum(wsStats.framesIn),
+		wsBytesIn: wsStats.bytesIn, http: httpLog.length,
+		httpBytes: httpLog.reduce((a, h) => a + Number(h.reqBytes ?? 0) + Number(h.resBytes ?? 0), 0) });
 
 	const samples: Obj[] = [];
 	for (let i = 0; i < opts.n; i++) {
 		const startIdx = events.length;
+		const c0 = counters();
 		const editAt: number[] = [];
 		for (let k = 0; k < opts.burst; k++) {
 			text.doc!.transact(() => text.insert(Math.floor(text.length / 2), `[l5 ${i}.${k}]`));
@@ -197,7 +192,11 @@ async function runMode(host: string, mode: "prod" | "nodebounce", opts: { n: num
 		}
 		const mine = events.slice(startIdx);
 		const firstPut = mine.find((e) => e.op === "put");
-		samples.push({ i, burst: opts.burst,
+		const c1 = counters();
+		const d = Object.fromEntries(Object.entries(c1).map(([k, v]) => [k, v - (c0 as Record<string, number>)[k]!])) as typeof c1;
+		samples.push({ i, burst: opts.burst, firstEditAt: r2(first),
+			wire: { ...d, doRequestUnits: r2(d.http + d.wsOut / 20) },
+			httpDuring: httpLog.slice(c0.http).map((h) => `${h.method} ${String(h.path).replace(/^.*\/body\/[^/]+/, "body")} +${r2(Number(h.at) - first)}`),
 			editToClearedMs: settledAt === null ? null : r2(settledAt - first),
 			lastEditToClearedMs: settledAt === null ? null : r2(settledAt - last),
 			editToCaptureMs: firstPut ? r2(firstPut.at - first) : null,
@@ -207,7 +206,49 @@ async function runMode(host: string, mode: "prod" | "nodebounce", opts: { n: num
 		if (i % 10 === 0) log(`L5 ${mode} ${i}/${opts.n} editToCleared=${samples.at(-1)!.editToClearedMs}`);
 		await sleep(opts.spacing);
 	}
+	// Offline probe (relay modes): kill the body socket, edit while disconnected (the provider does not queue
+	// those frames), let VaultSync reconnect. The offline edits then travel in the provider's step2 reply to the
+	// server's step1; the wrapper envelopes that non-empty step2 and it must pair + settle like an update.
+	const { diagnostics } = await import("./lib/checks");
+	const relayCounters = async () => ((await diagnostics(context.devices.A!)).relay as { counters?: Record<string, number> } | undefined)?.counters ?? {};
+	const probe = async (envelopeStep2: boolean) => {
+		receiptOptions.envelopeStep2 = envelopeStep2;
+		const before = await relayCounters();
+		const framesBefore = frames.length;
+		const lessBefore = wsStats.envelopeLessBinary.step2 ?? 0;
+		const sock = [...registry].find((w) => w.bodyId === realBodyId);
+		const p0 = now();
+		sock?.terminate();
+		await sleep(50);
+		for (let k = 0; k < 3; k++) text.doc!.transact(() => text.insert(0, `[offline ${envelopeStep2 ? "e" : "n"}${k}]`));
+		const editedAt = now();
+		const until = now() + 20_000;
+		let settledAt: number | null = null;
+		while (now() < until) {
+			const mine = frames.slice(framesBefore);
+			if (envelopeStep2 ? mine.length > 0 && mine.every((f) => f.outcome !== "pending")
+				: (wsStats.envelopeLessBinary.step2 ?? 0) > lessBefore) { settledAt = now(); break; }
+			await sleep(20);
+		}
+		await sleep(1500);
+		const after = await relayCounters();
+		const delta = Object.fromEntries(Object.keys(after).filter((k) => typeof after[k] === "number" && after[k] !== (before[k] ?? 0))
+			.map((k) => [k, after[k]! - (before[k] ?? 0)]));
+		receiptOptions.envelopeStep2 = true;
+		const mine = frames.slice(framesBefore);
+		return { envelopeStep2, terminated: Boolean(sock), editsWhileOffline: 3,
+			envelopedFrames: mine.map((f) => ({ kind: f.kind, outcome: f.outcome, echo: f.echo, bytes: f.bytes })),
+			envelopeLessStep2Sent: (wsStats.envelopeLessBinary.step2 ?? 0) - lessBefore,
+			serverRelayCounterDelta: delta,
+			editToSettledMs: settledAt === null ? null : r2(settledAt - editedAt),
+			editToSettledMeaning: envelopeStep2 ? "edit → enveloped step2 receipt settled" : "edit → envelope-less step2 sent (no receipt possible)",
+			killToSettledMs: settledAt === null ? null : r2(settledAt - p0),
+			note: envelopeStep2 ? "offline edits ride the provider's step2 reply; enveloped + candidate → echo settles it"
+				: "step2 sent envelope-less (provider-internal behaviour without a wrapper): server appends it (hashUnknown), no echo, no receipt; HTTP candidate would be the fallback" };
+	};
+	const offlineProbe = relayMode && opts.offlineProbe ? { enveloped: await probe(true), envelopeLess: await probe(false) } : null;
 	const finalText = text.toString();
+	const destroyAt = now();
 	const receipt = vaultSync.getServerReceiptSnapshot();
 	vaultSync.releaseEditorBody(path, consumer);
 	await vaultSync.destroy();
@@ -220,22 +261,48 @@ async function runMode(host: string, mode: "prod" | "nodebounce", opts: { n: num
 	const expect = contentHashOf(finalText);
 	const col = (k: string) => samples.map((s) => s[k] as number | null);
 	const submitPosts = httpLog.filter((h) => String(h.method) === "POST" && /candidate/.test(String(h.path)));
+	const wire = (k: string) => series(samples.map((s) => (s.wire as Record<string, number>)[k]!), 0);
+	const leftover = await (async () => {
+		try {
+			const again = new NodeVaultDatabase(join(dir, "client.sqlite"), {
+				host, realVaultPath: dir, vaultId: identity.vaultId, vaultGeneration: context.vaultGeneration,
+				deviceId: identity.deviceId, folderKey });
+			const rows = await again.listCandidates();
+			await again.close();
+			const harnessIds = new Set(frames.map((f) => f.candidateId));
+			return { total: rows.length, harness: rows.filter((r) => harnessIds.has(r.candidateId)).length,
+				vaultSyncOwn: rows.filter((r) => !harnessIds.has(r.candidateId)).length };
+		} catch (e) { return `error: ${String(e)}`; }
+	})();
 	return {
-		mode, bodyId, deviceName: `L5${mode === "prod" ? "p" : "n"}`,
+		mode, bodyId, deviceName: DEVICE[mode],
 		debounce: mode === "prod" ? { candidateDebounceMs: "production default (250)", candidateMaxWaitMs: "production default (2000)" }
-			: { candidateDebounceMs: 0, candidateMaxWaitMs: 0 },
+			: mode === "nodebounce" ? { candidateDebounceMs: 0, candidateMaxWaitMs: 0 }
+			: { receiptPath: "socket (harness receipt client)", harnessDebounceMs: mode === "relay250" ? 250 : 0, harnessMaxWaitMs: 2000,
+				vaultSyncHttpPath: `parked (candidateDebounceMs=${RELAY_PARKED_DEBOUNCE_MS}); fallback via restoreCandidates` },
+		wirePerSample: { wsFramesOut: wire("wsOut"), wsBytesOut: wire("wsBytesOut"), wsFramesIn: wire("wsIn"), wsBytesIn: wire("wsBytesIn"),
+			httpRequests: wire("http"), httpBytes: wire("httpBytes"), doRequestUnits: wire("doRequestUnits"),
+			note: "per burst; DO units = HTTP requests + client→DO WebSocket messages / 20 (20:1 billing); HTTP bytes = request body + response content-length" },
+		pairing: relayMode ? pairingSummary(wsStats, frames) : null,
+		offlineProbe,
+		leftoverCandidatesInStore: leftover,
 		setup: { bootstrapMs, createMs, acquireMs },
 		editToClearedMs: series(col("editToClearedMs")),
 		lastEditToClearedMs: series(col("lastEditToClearedMs")),
 		editToCaptureMs: series(col("editToCaptureMs")),
 		captureToClearedMs: series(col("captureToClearedMs")),
 		candidateSubmitHttpMs: series(submitPosts.map((h) => h.ms as number)),
+		candidatePostsMsAfterPrecedingEdit: submitPosts.map((h) => {
+			const prior = samples.map((x) => Number(x.firstEditAt)).filter((t) => t <= Number(h.at)).at(-1);
+			return prior === undefined ? null : r2(Number(h.at) - prior); }),
+		candidatePostsAfterDestroyStart: submitPosts.filter((h) => Number(h.at) >= destroyAt).length,
 		candidateSubmitRoutes: [...new Set(submitPosts.map((h) => `${h.method} ${h.path}`))],
 		samples,
 		convergence: { pass: get.text === finalText && head.value?.contentHash === expect.contentHash,
 			getTextEqual: get.text === finalText, headHashEqual: head.value?.contentHash === expect.contentHash,
 			headGeneration: head.value?.generation ?? null },
-		providerProof: { ...wsStats, receiptSnapshot: receipt },
+		providerProof: { framesOut: wsStats.framesOut, framesIn: wsStats.framesIn, sockets: wsStats.sockets,
+			bodySockets: wsStats.bodySockets, closes: wsStats.closes, receiptSnapshot: receipt },
 		httpSummary: Object.entries(httpLog.reduce<Record<string, number>>((acc, h) => {
 			const k = `${h.method} ${h.path} ${h.status}`; acc[k] = (acc[k] ?? 0) + 1; return acc; }, {})),
 		runtimeLogTail: logs.slice(-40),
@@ -247,11 +314,13 @@ async function main() {
 	const host = flagStr(args, "host")?.replace(/\/+$/, "");
 	if (!host) { console.error("usage: l5-cli-baseline.ts --host <url> [--n 100] [--mode prod|nodebounce|both]"); process.exit(2); }
 	const modeArg = flagStr(args, "mode", "both")!;
-	const opts = { n: flagNum(args, "n", 100), burst: flagNum(args, "burst", 1), burstInterval: flagNum(args, "burst-interval", 80),
+	const opts = { n: flagNum(args, "n", 100), offlineProbe: args.flags["offline-probe"] === true,
+		persist: (flagStr(args, "persist", "before-send") === "after-send" ? "after-send" : "before-send") as "before-send" | "after-send", burst: flagNum(args, "burst", 1), burstInterval: flagNum(args, "burst-interval", 80),
 		spacing: flagNum(args, "spacing", 1500), tag: `l5${Date.now().toString(36)}` };
-	const meta = await startMeta("L5", host, "base (real VaultSync)");
+	const meta = await startMeta("L5", host, `real VaultSync; modes ${modeArg}`);
 	const out = flagStr(args, "out") ?? join(LOG_DIR, "runs", `${workerName(host)}-L5-${Date.now()}.json`);
-	const modes: Array<"prod" | "nodebounce"> = modeArg === "both" ? ["prod", "nodebounce"] : [modeArg as "prod" | "nodebounce"];
+	const modes: Mode[] = modeArg === "both" ? ["prod", "nodebounce"] : modeArg === "all" ? MODES : modeArg.split(",") as Mode[];
+	if (!modes.every((m) => MODES.includes(m))) { console.error(`--mode must be one of ${MODES.join(",")},both,all`); process.exit(2); }
 	const results: Obj = {};
 	let error: string | null = null;
 	for (const m of modes) {

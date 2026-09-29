@@ -22,7 +22,7 @@ type Scenario = (ctx: RunCtx) => Promise<Record<string, unknown>>;
 const SCENARIOS: Record<string, Scenario> = {
 	L1: latency.L1, L2: latency.L2, L3: latency.L3, L4: latency.L4, L6: latency.L6, L7: latency.L7,
 	C1: cost.C1, C3: cost.C3, C4: cost.C4,
-	B1: behaviour.B1, B2: behaviour.B2, B3: behaviour.B3, B4: behaviour.B4, B7: behaviour.B7, B8: behaviour.B8,
+	B1: behaviour.B1, B2: behaviour.B2, B3: behaviour.B3, B4: behaviour.B4, B6: behaviour.B6, B7: behaviour.B7, B8: behaviour.B8,
 	X1: limits.X1, X2: limits.X2, X3: limits.X3, X4: limits.X4,
 	diag: cost.diag,
 };

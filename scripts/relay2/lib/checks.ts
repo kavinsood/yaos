@@ -68,7 +68,10 @@ export async function bodyGet(identity: LiveIdentity, bodyId: string) {
 	doc.destroy();
 	return { status: response.status, elapsedMs, text, bytes: bytes.byteLength,
 		contentHash: response.headers.get("x-yaos-content-hash"), size: Number(response.headers.get("x-yaos-size")),
-		generation: Number(response.headers.get("x-yaos-generation")) };
+		generation: Number(response.headers.get("x-yaos-generation")),
+		// All X-YAOS-* headers (round-2 relay adds body sequence headers; see docs/relay2-protocol.md).
+		yaosHeaders: Object.fromEntries([...response.headers.entries()].filter(([k]) => k.startsWith("x-yaos-"))),
+		storedHash: contentHashOf(text).contentHash };
 }
 
 function svEqual(a: Uint8Array, b: Uint8Array) {
@@ -122,10 +125,19 @@ export async function convergence(options: {
 		recordedHead: { status: head.status, contentHashEqual: head.value?.contentHash === expected.contentHash,
 			sizeEqual: head.value?.size === expected.size, generation: head.value?.generation ?? null },
 		expectedTextSha: options.expectedTextSha ?? null,
+		// Server-recorded hash vs client canonical hash; "unknown" = the server recorded no hash (envelope-less frames).
+		hashStatus: head.value?.contentHash == null ? "unknown" : head.value.contentHash === expected.contentHash ? "match" : "mismatch",
+		// D6 invariant #7: a recorded hash always describes the stored merged state (GET body), whether or not it equals the client.
+		d6Invariant7: {
+			headVsStored: head.value?.contentHash == null ? "unknown" : head.value.contentHash === get.storedHash ? "holds" : "VIOLATED",
+			getHeaderVsStored: get.contentHash == null ? "unknown" : get.contentHash === get.storedHash ? "holds" : "VIOLATED",
+		},
+		getYaosHeaders: get.yaosHeaders ?? null,
 		pass: false,
 	};
 	result.pass = result.liveClientsAgree && result.liveClientsSvAgree && result.freshC.textEqual && result.freshC.svEqual
-		&& result.httpGet.textEqual && result.httpGet.headerHashEqual && result.recordedHead.contentHashEqual;
+		&& result.httpGet.textEqual && result.httpGet.headerHashEqual && result.recordedHead.contentHashEqual
+		&& result.d6Invariant7.headVsStored !== "VIOLATED" && result.d6Invariant7.getHeaderVsStored !== "VIOLATED";
 	log(`convergence ${bodyId}: ${result.pass ? "PASS" : "FAIL"} ${JSON.stringify({ c: result.freshC, get: result.httpGet, head: result.recordedHead })}`);
 	return result;
 }
