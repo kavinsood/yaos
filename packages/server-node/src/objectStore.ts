@@ -16,7 +16,9 @@ import type {
 	ObjectMetadata,
 	ObjectStorePort,
 	ObjectWriteOptions,
+	VerifiedObjectStreamOptions,
 } from "../../../server/src/platformPorts";
+import { verifyObjectStream } from "../../../server/src/verifiedObjectStream";
 
 const MAGIC = Buffer.from("YAOSOBJ1", "ascii");
 const PREFIX_BYTES = MAGIC.byteLength + 4;
@@ -214,6 +216,67 @@ export class FilesystemObjectStore implements ObjectStorePort {
 	): Promise<"created" | "exists"> {
 		await this.ensureIndex();
 		return await this.publish(key, bytes, options);
+	}
+
+	async createOnlyVerifiedStream(
+		key: string,
+		body: ReadableStream<Uint8Array>,
+		options: VerifiedObjectStreamOptions,
+	): Promise<"created" | "exists"> {
+		const location = this.location(key);
+		await this.ensureIndex();
+		const hash = createHash("sha256");
+		const verify = (consume: (chunk: Uint8Array) => Promise<void>) => verifyObjectStream(
+			body, options,
+			async (chunk) => { hash.update(chunk); },
+			async () => hash.digest("hex"),
+			consume,
+		);
+		if (await this.head(key)) {
+			await verify(async () => undefined);
+			return "exists";
+		}
+		const directory = dirname(location);
+		await mkdir(directory, { recursive: true, mode: 0o700 });
+		const header: StoredHeader = {
+			format: 1, key, size: options.length, sha256: options.sha256, uploadedAt: Date.now(),
+			contentType: options.contentType ?? null,
+			customMetadata: canonicalCustomMetadata(options.customMetadata),
+		};
+		const encodedHeader = Buffer.from(JSON.stringify(header));
+		if (encodedHeader.byteLength > MAX_HEADER_BYTES) throw new Error("object metadata is too large");
+		const prefix = Buffer.allocUnsafe(PREFIX_BYTES);
+		MAGIC.copy(prefix, 0);
+		prefix.writeUInt32BE(encodedHeader.byteLength, MAGIC.byteLength);
+		const temporary = join(directory, `.yaos-tmp-${process.pid}-${randomUUID()}`);
+		try {
+			const file = await this.operations.open(temporary, "wx", 0o600);
+			try {
+				await writeAll(file, prefix, 0);
+				await writeAll(file, encodedHeader, PREFIX_BYTES);
+				let position = PREFIX_BYTES + encodedHeader.byteLength;
+				await verify(async (chunk) => {
+					await writeAll(file, chunk, position);
+					position += chunk.byteLength;
+				});
+				await file.sync();
+			} finally {
+				await file.close();
+			}
+			try {
+				await this.operations.link(temporary, location);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+				this.addIndexedKey(key);
+				return "exists";
+			}
+			await fsyncDirectory(directory);
+			this.addIndexedKey(key);
+			return "created";
+		} finally {
+			await this.operations.remove(temporary);
+			await fsyncDirectory(directory);
+		}
 	}
 
 	async delete(key: string): Promise<void> {

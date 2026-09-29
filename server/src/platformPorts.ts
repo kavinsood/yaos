@@ -91,6 +91,11 @@ export interface ObjectWriteOptions {
 	customMetadata?: Readonly<Record<string, string>>;
 }
 
+export interface VerifiedObjectStreamOptions extends ObjectWriteOptions {
+	length: number;
+	sha256: string;
+}
+
 export interface ObjectListPage {
 	objects: ObjectMetadata[];
 	cursor: string | null;
@@ -103,6 +108,7 @@ export interface ObjectStorePort {
 	get(key: string): Promise<ObjectBody | null>;
 	put(key: string, bytes: Uint8Array, options?: ObjectWriteOptions): Promise<void>;
 	createOnly(key: string, bytes: Uint8Array, options?: ObjectWriteOptions): Promise<"created" | "exists">;
+	createOnlyVerifiedStream?(key: string, body: ReadableStream<Uint8Array>, options: VerifiedObjectStreamOptions): Promise<"created" | "exists">;
 	delete(key: string): Promise<void>;
 	list(input: { prefix: string; cursor?: string; limit?: number }): Promise<ObjectListPage>;
 }

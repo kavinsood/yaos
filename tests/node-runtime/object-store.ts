@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdtemp, open, opendir, readdir, rm, unlink } from "node:fs/promises";
+import { mkdtemp, open, opendir, readdir, rm, unlink, link, stat } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import {
@@ -8,6 +9,7 @@ import {
 	ImmutableObjectConflictError,
 } from "../../packages/server-node/src/objectStore";
 import { suite } from "../harness.ts";
+import { ObjectStreamValidationError } from "../../server/src/verifiedObjectStream";
 
 const s = suite("node-runtime-object-store");
 
@@ -268,6 +270,128 @@ s.test("listing tolerates an indexed object being concurrently deleted", async (
 		assert.equal(page.truncated, false);
 	} finally {
 		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+function streamedBytes(bytes: Uint8Array): ReadableStream<Uint8Array> {
+	let offset = 0;
+	return new ReadableStream({
+		pull(controller) {
+			if (offset === bytes.byteLength) return controller.close();
+			controller.enqueue(bytes.slice(offset, offset + 1024));
+			offset = Math.min(offset + 1024, bytes.byteLength);
+		},
+	});
+}
+
+s.test("R4 verifies existing bytes, preserves mtime and publishes a race exactly once", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "yaos-r4-race-"));
+	try {
+		let publications = 0;
+		const store = new FilesystemObjectStore(directory, {
+			link: async (temporary, final) => { await link(temporary, final); publications++; },
+		});
+		const bytes = new TextEncoder().encode("verified immutable blob");
+		const sha256 = createHash("sha256").update(bytes).digest("hex");
+		const options = { length: bytes.byteLength, sha256, contentType: "text/plain" };
+		const key = `blobs/${sha256}`;
+		const results = await Promise.all(Array.from({ length: 8 }, () => store.createOnlyVerifiedStream(key, streamedBytes(bytes), options)));
+		assert.deepEqual(results.sort(), ["created", ...Array<string>(7).fill("exists")]);
+		assert.equal(publications, 1);
+		const before = await stat(join(directory, key));
+		assert.equal(await store.createOnlyVerifiedStream(key, streamedBytes(bytes), { ...options, contentType: "image/png" }), "exists");
+		const wrong = bytes.slice();
+		wrong[0] = wrong[0]! ^ 1;
+		await assert.rejects(store.createOnlyVerifiedStream(key, streamedBytes(wrong), options),
+			(error: unknown) => error instanceof ObjectStreamValidationError && error.kind === "hash_mismatch");
+		assert.equal((await stat(join(directory, key))).mtimeMs, before.mtimeMs);
+		assert.equal((await store.head(key))?.contentType, "text/plain");
+		assert.equal(publications, 1);
+		await assertNoTemporaryFiles(directory);
+	} finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+s.test("R4 hash, length and disconnect failures never publish or leak temp files", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "yaos-r4-invalid-"));
+	try {
+		const store = new FilesystemObjectStore(directory);
+		const bytes = new TextEncoder().encode("streamed blob");
+		const sha256 = createHash("sha256").update(bytes).digest("hex");
+		for (const [name, options] of [
+			["hash", { length: bytes.byteLength, sha256: "0".repeat(64) }],
+			["short", { length: bytes.byteLength + 1, sha256 }],
+			["long", { length: bytes.byteLength - 1, sha256 }],
+		] as const) {
+			await assert.rejects(store.createOnlyVerifiedStream(name, streamedBytes(bytes), options), ObjectStreamValidationError);
+			assert.equal(await store.head(name), null);
+			await assertNoTemporaryFiles(directory);
+		}
+		let first = true;
+		const disconnected = new ReadableStream<Uint8Array>({ pull(controller) {
+			if (first) { first = false; controller.enqueue(bytes.subarray(0, 2)); }
+			else controller.error(new Error("disconnected"));
+		} });
+		await assert.rejects(store.createOnlyVerifiedStream("disconnect", disconnected, { length: bytes.byteLength, sha256 }), ObjectStreamValidationError);
+		assert.equal(await store.head("disconnect"), null);
+		await assertNoTemporaryFiles(directory);
+	} finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+s.test("R4 10 MiB upload uses chunk-sized writes and no full-body allocation", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "yaos-r4-memory-"));
+	try {
+		const chunkSize = 64 * 1024;
+		const chunk = new Uint8Array(chunkSize).fill(42);
+		const length = 10 * 1024 * 1024;
+		const hash = createHash("sha256");
+		for (let offset = 0; offset < length; offset += chunkSize) hash.update(chunk);
+		let written = 0;
+		let produced = 0;
+		const store = new FilesystemObjectStore(directory, { open: async (path, flags, mode) => {
+			const file = await open(path, flags, mode);
+			if (!basename(path).startsWith(".yaos-tmp-")) return file;
+			return new Proxy(file, { get(target, property) {
+				if (property === "write") return async (bytes: Uint8Array, offset: number, count: number, position: number) => {
+					assert.ok(bytes.byteLength <= chunkSize, "write retained a whole body");
+					assert.ok(produced - written <= chunkSize * 2, "producer outran disk backpressure");
+					const result = await target.write(bytes, offset, count, position);
+					if (bytes.byteLength === chunkSize) written += result.bytesWritten;
+					return result;
+				};
+				const value: unknown = Reflect.get(target, property);
+				return typeof value === "function" ? value.bind(target) : value;
+			} });
+		} });
+		const body = new ReadableStream<Uint8Array>({ pull(controller) {
+			if (produced === length) return controller.close();
+			produced += chunkSize;
+			controller.enqueue(chunk.slice());
+		} });
+		assert.equal(await store.createOnlyVerifiedStream("large", body, { length, sha256: hash.digest("hex") }), "created");
+		assert.equal(written, length);
+		assert.equal((await store.head("large"))?.size, length);
+		await assertNoTemporaryFiles(directory);
+	} finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+s.test("R4 temp write/fsync failures never hard-link an unverified or unsynced object", async () => {
+	for (const method of ["write", "sync"] as const) {
+		const directory = await mkdtemp(join(tmpdir(), "yaos-r4-io-"));
+		try {
+			let failures = 0;
+			let links = 0;
+			const store = new FilesystemObjectStore(directory, {
+				open: failTemporaryFileOperation(method, () => failures++),
+				link: async (temporary, final) => { links++; await link(temporary, final); },
+			});
+			const bytes = new TextEncoder().encode("R4 io failure");
+			const sha256 = createHash("sha256").update(bytes).digest("hex");
+			await assert.rejects(store.createOnlyVerifiedStream("blob", streamedBytes(bytes), { length: bytes.length, sha256 }), new RegExp(`injected ${method} failure`));
+			assert.equal(failures, 1);
+			assert.equal(links, 0);
+			assert.equal(await store.head("blob"), null);
+			await assertNoTemporaryFiles(directory);
+		} finally { await rm(directory, { recursive: true, force: true }); }
 	}
 });
 

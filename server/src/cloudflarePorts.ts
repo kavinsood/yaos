@@ -8,7 +8,9 @@ import type {
 	ObjectStorePort,
 	ObjectWriteOptions,
 	SocketUpgradePort,
+	VerifiedObjectStreamOptions,
 } from "./platformPorts";
+import { createCloudflareVerifiedObjectStream } from "./cloudflareVerifiedObjectStream";
 import type { VaultSocketPort, VaultSocketRegistryPort } from "./vaultSocketService";
 
 function metadata(object: R2Object): ObjectMetadata {
@@ -54,6 +56,10 @@ export class CloudflareObjectStore implements ObjectStorePort {
 			onlyIf: { etagDoesNotMatch: "*" },
 		});
 		return written === null ? "exists" : "created";
+	}
+
+	async createOnlyVerifiedStream(key: string, body: ReadableStream<Uint8Array>, options: VerifiedObjectStreamOptions): Promise<"created" | "exists"> {
+		return await createCloudflareVerifiedObjectStream(this.bucket, key, body, options);
 	}
 
 	async delete(key: string): Promise<void> {
