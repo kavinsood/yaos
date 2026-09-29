@@ -1,0 +1,39 @@
+packages/server-node/src/index.ts
+  s_06158d5aa75452::t_ab6c5f4d627fc9 82-83,249
+tests/server/R2-socket-authority-node.ts
+  s_3fa8c41e3d4d37::t_ac4be7af3040fb 1-443
+tests/server/R2-ws-hop-probe.ts
+  s_d157206730843c::t_6baa11787da813 1-49
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "90c50b66b3351fdb457de9195cdefb7783ac4d52",
+  "prompts": {},
+  "sessions": {
+    "s_06158d5aa75452": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aabbc0b8c933cb988",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_3fa8c41e3d4d37": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a0da75a62b227384a",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_d157206730843c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ac9fff1be1f00827f",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
