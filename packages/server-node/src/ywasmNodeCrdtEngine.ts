@@ -25,3 +25,6 @@ export const ywasmCrdtEngine = createYwasmCrdtEngine(bindings, {
 	artifactSha256: source.artifact.wasmSha256,
 	memoryByteLength: () => bindings.wasmMemoryByteLength(),
 });
+
+/** Raw pinned bindings (relay v2 spike: stateless byte ops in server/src/crdt/ywasmByteOps.ts). */
+export { bindings as ywasmBindings };
