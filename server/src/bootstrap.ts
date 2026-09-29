@@ -3,6 +3,7 @@ import { sha256Hex } from "./hex";
 import { SERVER_SCHEMA_VERSION, SERVER_STORAGE_FORMAT_VERSION } from "./version";
 import { isValidOperationId, type CatalogHeadAtBoundary, type SemanticCatalogHead, type VaultOperation, type VaultStore } from "./vaultStore";
 import type { SemanticEpoch } from "./shared/semanticEpoch";
+import { RelayMergeBudgetError } from "./vaultDocumentStore";
 import { canonicalCrdtRootDigestBytes } from "./shared/crdtRootDigest";
 
 const DEFAULT_PAGE_SIZE = 1000;
@@ -74,6 +75,25 @@ export interface BootstrapSemanticState {
 }
 
 /** Owns one exact SQLite-backed bootstrap boundary; object storage is never required. */
+/**
+ * Batch body read. Relay v2 (G20): an over-budget body is collected in
+ * `overBudgetBodyIds` instead of failing the batch at the first one (the
+ * budget check runs before any merge, so flagging costs no wasm call). A free
+ * function over `bodyState` so injected bootstrap services keep working.
+ */
+export function bootstrapBodyStatesForBatch(service: Pick<BootstrapService, "bodyState">, bootstrapId: string,
+	bodyIds: readonly string[]): { bodies: BootstrapBodyState[]; overBudgetBodyIds: string[] } {
+	const bodies: BootstrapBodyState[] = [];
+	const overBudgetBodyIds: string[] = [];
+	for (const bodyId of bodyIds) {
+		try { bodies.push(service.bodyState(bootstrapId, bodyId)); } catch (error) {
+			if (!(error instanceof RelayMergeBudgetError)) throw error;
+			overBudgetBodyIds.push(bodyId);
+		}
+	}
+	return { bodies, overBudgetBodyIds };
+}
+
 export class BootstrapService {
 	constructor(
 		private readonly store: VaultStore,
@@ -175,6 +195,12 @@ export class BootstrapService {
 				};
 			} finally { crdtEngine.destroyDocument(reconstructed.doc); }
 		} finally { release(); }
+	}
+
+	/** Batch body read that flags over-budget bodies (relay v2, G20); see `bootstrapBodyStatesForBatch`. */
+	bodyStatesForBatch(bootstrapId: string, bodyIds: readonly string[]):
+		{ bodies: BootstrapBodyState[]; overBudgetBodyIds: string[] } {
+		return bootstrapBodyStatesForBatch(this, bootstrapId, bodyIds);
 	}
 
 	semanticCatalogPage(bootstrapId: string, cursor: string | null, limit = DEFAULT_PAGE_SIZE): BootstrapSemanticCatalogPage {

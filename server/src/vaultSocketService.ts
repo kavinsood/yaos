@@ -466,8 +466,8 @@ export class VaultSocketService {
 					try { socket.send(frame); } catch { /* peer closed */ }
 				}
 			},
-			notifyBodyCommitted: (bodyId, durableGeneration, vaultSequence, excludeSocketId) => {
-				this.notifyBodyCommitted(bodyId, durableGeneration, vaultSequence, excludeSocketId);
+			notifyBodyCommitted: (bodyId, durableGeneration, vaultSequence, excludeSocketIds) => {
+				this.notifyBodyCommitted(bodyId, durableGeneration, vaultSequence, excludeSocketIds);
 			},
 		});
 	}
@@ -920,7 +920,8 @@ export class VaultSocketService {
 		}
 	}
 
-	notifyBodyCommitted(bodyId: string, durableGeneration: number, vaultSequence: number, excludeSocketId?: string): void {
+	notifyBodyCommitted(bodyId: string, durableGeneration: number, vaultSequence: number,
+		exclude?: string | ReadonlySet<string>): void {
 		const head = this.options.currentBodyHead(bodyId);
 		const bodyEpoch = head?.bodyEpoch ?? this.options.cache.get(bodyId)?.semanticEpoch;
 		if (bodyEpoch === undefined) throw new Error(`body ${bodyId} has no semantic epoch for commit notification`);
@@ -948,7 +949,8 @@ export class VaultSocketService {
 			const attachment = parseVaultSocketAttachment(socket.deserializeAttachment());
 			if (!attachment || (attachment.kind !== "root"
 				&& (attachment.documentId !== bodyId || attachment.documentEpoch !== bodyEpoch))) continue;
-			if (excludeSocketId !== undefined && attachment.socketId === excludeSocketId) continue;
+			if (exclude !== undefined && (typeof exclude === "string"
+				? attachment.socketId === exclude : exclude.has(attachment.socketId))) continue;
 			// Relay body sockets hold no runtime-scoped receipts (every frame is
 			// durable before its own ack), so peers get the notice under their
 			// admission runtime epoch instead of a close.

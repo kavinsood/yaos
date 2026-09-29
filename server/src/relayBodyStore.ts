@@ -25,8 +25,13 @@ export interface RelayAppendInput {
 	expectedEpoch: SemanticEpoch;
 	/** One journal row: the (possibly micro-batch merged) update. */
 	update: Uint8Array;
-	/** One attribution row per frame (`mutation_index` = index). */
-	attributions: Array<{ actor: VaultActorContext; requestDigest?: string }>;
+	/**
+	 * One attribution row per frame (`mutation_index` = index). Candidate frames
+	 * carry `operationId` = candidateId and `requestDigest` = candidateDigest, as
+	 * the base candidate commit does, so `committedOperationOutcome` finds them
+	 * (G14) without a `vault_operation_outcomes` row.
+	 */
+	attributions: Array<{ actor: VaultActorContext; requestDigest?: string; operationId?: string }>;
 	/** Recorded only when the D6 SV rule accepted the client's claim; NULL otherwise. */
 	catalogContent: { contentHash: string; size: number } | null;
 	receipts: Array<{ clientId: string; candidateId: string; candidateDigest: string; runtimeEpoch: string }>;
@@ -58,13 +63,15 @@ export interface RelayResetPolicyState {
 export type RelayLeaseResult =
 	| { granted: true; leaseId: string; expiresAt: number; epoch: SemanticEpoch; headSequence: number; generation: number;
 		policy: RelayResetPolicyState }
-	| { granted: false; reason: "held" | "epoch_mismatch" | "not_found" | "cooldown"; epoch: SemanticEpoch | null;
+	| { granted: false; reason: "held" | "epoch_mismatch" | "not_found" | "cooldown" | "authority_superseded"; epoch: SemanticEpoch | null;
 		headSequence: number | null; holderDeviceId?: string; expiresAt?: number; policy?: RelayResetPolicyState };
 
 export type RelayResetOutcome =
 	| { ok: true; result: SemanticResetResult }
-	| { ok: false; reason: "lease_invalid" | "lease_expired" | "epoch_mismatch" | "head_advanced" | "cooldown";
-		epoch: SemanticEpoch | null; headSequence: number | null };
+	| { ok: false; reason: RelayResetFailure; epoch: SemanticEpoch | null; headSequence: number | null };
+
+export type RelayResetFailure =
+	| "lease_invalid" | "lease_expired" | "epoch_mismatch" | "head_advanced" | "cooldown" | "authority_superseded";
 
 export const RELAY_LEASE_DEFAULT_TTL_MS = 120_000;
 export const RELAY_LEASE_MIN_TTL_MS = 1_000;
@@ -72,6 +79,7 @@ export const RELAY_LEASE_MAX_TTL_MS = 600_000;
 
 export class RelayBodyStore {
 	private leaseTableReady = false;
+	private budgetTableReady = false;
 
 	constructor(private readonly storage: VaultStoragePort, private readonly store: VaultStore) {}
 
@@ -126,9 +134,9 @@ export class RelayBodyStore {
 				const written = this.storage.sql.exec(`INSERT INTO vault_mutation_attribution(
 				 sequence, mutation_index, principal_id, membership_revision, device_id,
 				 device_credential_revision, operation_id, request_digest
-				) VALUES (?, ?, ?, ?, ?, ?, NULL, ?)`, sequence, mutationIndex, actor.principalId,
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, sequence, mutationIndex, actor.principalId,
 					actor.membershipRevision, actor.deviceId, actor.deviceCredentialRevision,
-					attribution.requestDigest ?? null);
+					attribution.operationId ?? null, attribution.requestDigest ?? null);
 				written.toArray();
 				rowsWritten += written.rowsWritten;
 			}
@@ -250,6 +258,27 @@ export class RelayBodyStore {
 		return outcome;
 	}
 
+	/**
+	 * G19: drops every lease held by these devices / principals (called after an
+	 * authority change touches them). The install path re-checks authority anyway;
+	 * this frees the body for other devices at once instead of at lease expiry.
+	 */
+	releaseLeasesFor(subjects: { deviceIds?: Iterable<string>; principalIds?: Iterable<string> }): number {
+		this.ensureLeaseTable();
+		let released = 0;
+		for (const deviceId of subjects.deviceIds ?? []) {
+			const cursor = this.storage.sql.exec("DELETE FROM relay_compaction_leases WHERE device_id = ?", deviceId);
+			cursor.toArray();
+			released += cursor.rowsWritten;
+		}
+		for (const principalId of subjects.principalIds ?? []) {
+			const cursor = this.storage.sql.exec("DELETE FROM relay_compaction_leases WHERE principal_id = ?", principalId);
+			cursor.toArray();
+			released += cursor.rowsWritten;
+		}
+		return released;
+	}
+
 	releaseLease(bodyId: string, leaseId: string, actor: VaultActorContext): boolean {
 		this.ensureLeaseTable();
 		const cursor = this.storage.sql.exec(
@@ -269,13 +298,21 @@ export class RelayBodyStore {
 	semanticReset(input: {
 		bodyId: string; actor: VaultActorContext; leaseId: string; expectedEpoch: number; coveredSequence: number;
 		snapshot: Uint8Array; contentHash: string; contentBytes: number; now?: number; cooldownMs?: number;
+		/** G19: authority re-check at install time (after the possibly long body read). */
+		authorize?: () => boolean;
 	}): RelayResetOutcome {
 		this.store.initialize();
 		this.ensureLeaseTable();
 		const now = input.now ?? Date.now();
 		const head = this.store.documentHead(input.bodyId);
-		const fail = (reason: "lease_invalid" | "lease_expired" | "epoch_mismatch" | "head_advanced" | "cooldown"): RelayResetOutcome =>
+		const fail = (reason: RelayResetFailure): RelayResetOutcome =>
 			({ ok: false, reason, epoch: head?.semanticEpoch ?? null, headSequence: head?.latestSequence ?? null });
+		// Everything below is synchronous in the DO: nothing interleaves between this
+		// check and the reset transaction, so it is equivalent to checking inside it.
+		if (input.authorize && !input.authorize()) {
+			this.storage.sql.exec("DELETE FROM relay_compaction_leases WHERE device_id = ?", input.actor.deviceId).toArray();
+			return fail("authority_superseded");
+		}
 		const lease = this.storage.sql.exec<{ lease_id: string; device_id: string; body_epoch: number; expires_at: number }>(
 			"SELECT lease_id, device_id, body_epoch, expires_at FROM relay_compaction_leases WHERE body_id = ?", input.bodyId,
 		).toArray()[0];
@@ -310,6 +347,73 @@ export class RelayBodyStore {
 		return counts;
 	}
 
+	/** Byte length of a stored checkpoint (manifest total, else the sum of its chunks); 0 when none. */
+	checkpointByteLength(bodyId: string, checkpointSequence: number): number {
+		if (checkpointSequence <= 0) return 0;
+		return this.storage.sql.exec<{ bytes: number | null }>(
+			`SELECT COALESCE(
+			   (SELECT total_byte_length FROM vault_checkpoint_manifests WHERE document_id = ? AND checkpoint_sequence = ?),
+			   (SELECT SUM(chunk_byte_length) FROM vault_checkpoints WHERE document_id = ? AND checkpoint_sequence = ?),
+			   0) AS bytes`,
+			bodyId, checkpointSequence, bodyId, checkpointSequence,
+		).one().bytes ?? 0;
+	}
+
+	/**
+	 * G20: the last journal sequence of the longest tail prefix after
+	 * `afterSequence` with at most `maxRows` rows and at most `maxBytes` summed
+	 * update bytes. `null` when even the first row does not fit (or no rows).
+	 */
+	tailPrefixBounded(bodyId: string, afterSequence: number, maxRows: number, maxBytes: number):
+		{ sequence: number; rows: number; bytes: number } | null {
+		const rows = this.storage.sql.exec<{ sequence: number; update_byte_length: number }>(
+			`SELECT sequence, update_byte_length FROM vault_journal WHERE document_id = ? AND sequence > ?
+			 ORDER BY sequence LIMIT ?`,
+			bodyId, afterSequence, Math.max(1, maxRows),
+		).toArray();
+		let best: { sequence: number; rows: number; bytes: number } | null = null;
+		let bytes = 0;
+		for (const [index, row] of rows.entries()) {
+			bytes += row.update_byte_length;
+			if (bytes > maxBytes) break;
+			best = { sequence: row.sequence, rows: index + 1, bytes };
+		}
+		return best;
+	}
+
+	private ensureBudgetTable(): void {
+		if (this.budgetTableReady) return;
+		this.storage.sql.exec(`CREATE TABLE IF NOT EXISTS relay_body_budget (
+			body_id TEXT PRIMARY KEY,
+			body_epoch INTEGER NOT NULL,
+			input_bytes INTEGER NOT NULL,
+			marked_at INTEGER NOT NULL
+		)`).toArray();
+		this.budgetTableReady = true;
+	}
+
+	/** G20: persists "checkpoint cannot progress within the merge budget" for this epoch. */
+	markOverBudget(bodyId: string, bodyEpoch: number, inputBytes: number, now = Date.now()): void {
+		this.ensureBudgetTable();
+		this.storage.sql.exec(`INSERT INTO relay_body_budget(body_id, body_epoch, input_bytes, marked_at)
+			VALUES (?, ?, ?, ?) ON CONFLICT(body_id) DO UPDATE SET body_epoch = excluded.body_epoch,
+			input_bytes = excluded.input_bytes, marked_at = excluded.marked_at`,
+		bodyId, bodyEpoch, inputBytes, now).toArray();
+	}
+
+	clearOverBudget(bodyId: string): void {
+		this.ensureBudgetTable();
+		this.storage.sql.exec("DELETE FROM relay_body_budget WHERE body_id = ?", bodyId).toArray();
+	}
+
+	/** Every persisted over-budget marker (read once per runtime; valid only while the epoch matches). */
+	overBudgetMarkers(): Map<string, number> {
+		this.ensureBudgetTable();
+		const rows = this.storage.sql.exec<{ body_id: string; body_epoch: number }>(
+			"SELECT body_id, body_epoch FROM relay_body_budget").toArray();
+		return new Map(rows.map((row) => [row.body_id, row.body_epoch]));
+	}
+
 	/** Sequence of the `maxRows`-th journal row after `afterSequence`, or null when the tail is shorter. */
 	tailPrefixSequence(bodyId: string, afterSequence: number, maxRows: number): number | null {
 		const row = this.storage.sql.exec<{ sequence: number }>(
@@ -320,6 +424,7 @@ export class RelayBodyStore {
 		return row ? row.sequence : null;
 	}
 
+	/** COUNT(*) over the whole journal: diagnostics/debug routes and tests only (G15), never a hot path. */
 	journalRowCount(): number {
 		return this.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM vault_journal").one().count;
 	}

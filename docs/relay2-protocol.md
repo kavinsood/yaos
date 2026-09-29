@@ -105,9 +105,12 @@ Pairing rules:
   - A second envelope before a binary frame replaces the first.
 - An envelope for another `bodyId` or `bodyEpoch` is ignored.
   - A binary frame on a socket whose epoch is stale is fenced with 4409 anyway (§4.3).
-- Pending envelopes live in DO memory only. If the DO hibernates between the envelope and the
-  binary frame (practically never, since the two are adjacent), the frame counts as envelope-less.
-  The client sees no echo and retries.
+- Pending envelopes live in DO memory only (G13, kept by design). If the DO hibernates between
+  the envelope and the binary frame (practically never, since the two are adjacent), the frame
+  counts as envelope-less: it is appended with an unknown hash and gets no `clientFrameId` echo.
+  The client times out and resends; the resend is a no-op (`noop: true`) or, with a `candidateId`,
+  a dedupe hit. A lost envelope can never pair with a different frame, because pairing requires
+  `sha256(innerUpdate) === payloadDigest`.
 
 Currentness (D6, invariant #7): `contentHash`/`size` are recorded on the new catalog event
 **only if** `stateVector` is present **and** it equals (semantic map equality) the state vector
@@ -128,23 +131,27 @@ Reconciling "unknown":
 ### 3.3 Append path (per binary step2/update frame)
 
 The path is synchronous in the DO; nothing awaits between the merge and the commit. Steps run in
-this order (as implemented): size limit (1009), envelope pairing, 1 empty skip, 2 dedupe,
-3 authority, 4 budget, then (inside commit) epoch fence, 5 growth cap, D6 check, 6 transaction,
+this order (as implemented): size limit (1009), envelope pairing, 1 empty skip, 2 authority,
+3 dedupe, 4 budget, then (inside commit) epoch fence, 5 growth cap, D6 check, 6 transaction,
 7 fan-out. The growth cap runs after authority and budget because it needs the merged state; a
-revoked or rate-limited socket never costs a merge.
+revoked or rate-limited socket never costs a merge. Authority runs before dedupe (round 3, G7), so
+a revoked device cannot use `candidateId` probes to learn receipts.
+
+`SYNC_STEP_1` from a body socket is authority-checked the same way before it is answered (round 3,
+G6): a revoked actor gets close 4403 instead of a step2 carrying the body.
 
 1. **Empty skip.** An inner update equal to `[0,0]` is not appended (`emptySkips++`).
-2. **Candidate dedupe.** This step applies only if the envelope carries `candidateId`. The server
+2. **Authority re-check.** `validateActor` runs against the DO's own authority tables, with a
+   per-runtime cache keyed by an in-memory authority version. The version is bumped by device
+   revocation, authority fences, membership and provisioning writes, and there is a 5 s TTL safety
+   net. A revoked actor gets `{type:"error", code:"authority_superseded"}` and close 4403.
+3. **Candidate dedupe.** This step applies only if the envelope carries `candidateId`. The server
    looks up `vault_candidate_receipts(bodyId, deviceId, candidateId)`:
    - Same digest (`candidateDigest ?? payloadDigest`): the original receipt is re-sent as
      `BODY_COMMITTED` with `deduped: true`. Nothing is appended.
    - Different digest: the frame is rejected with
      `{type:"BODY_UPDATE_REJECTED", clientFrameId, candidateId, reason:"candidate_id_reused"}`.
      Nothing is appended.
-3. **Authority re-check.** `validateActor` runs against the DO's own authority tables, with a
-   per-runtime cache keyed by an in-memory authority version. The version is bumped by device
-   revocation, authority fences, membership and provisioning writes, and there is a 5 s TTL safety
-   net. A revoked actor gets `{type:"error", code:"authority_superseded"}` and close 4403.
 4. **Budgets.** Each socket has a token bucket: `YAOS_RELAY_RATE_BYTES_PER_SEC` (default
    262144) refilling a burst of `max(YAOS_RELAY_BURST_BYTES, MAX_DURABLE_UPDATE_BYTES)` (default
    and floor 1,750,000 bytes). The floor guarantees one maximum-size frame always fits; before round 2,
@@ -160,7 +167,10 @@ revoked or rate-limited socket never costs a merge.
    - active-body check against the latest catalog event
    - clock +1
    - journal insert (`kind='body'`)
-   - attribution row(s)
+   - attribution row(s); a candidate frame's row carries `operation_id = candidateId` and
+     `request_digest = candidateDigest` (round 3, G14), so `GET /operations/:candidateId/outcome`
+     finds the commit through the base `committedOperationOutcome` lookup. No
+     `vault_operation_outcomes` row is written.
    - head update (`generation+1`, `latest_sequence`)
    - catalog event (copies file/path; new generation; hash or NULL)
    - candidate receipt row, only when `candidateId` is present
@@ -171,16 +181,28 @@ revoked or rate-limited socket never costs a merge.
    - The raw update frame is broadcast to the other body sockets of that body and epoch.
    - The base `BODY_COMMITTED` goes to root sockets. Peer relay body sockets of the same body and
      epoch get it too, with `relay: true, peer: true` and their own admission `runtimeEpoch`, and
-     are never closed by it. The origin socket is excluded.
+     are never closed by it. Every origin socket of the commit is excluded (for a micro-batch,
+     all origins and duplicate senders; round 3, G16), since each already got its own receipt.
    - The checkpoint alarm is armed if the tail is over the thresholds.
 
-**Micro-batching:** `YAOS_RELAY_MICROBATCH_MS` (default `0` = off). When it is greater than 0,
-frames arriving within the window share one transaction and one clock sequence:
+**Micro-batching:** `YAOS_RELAY_MICROBATCH_MS` (default `0` = off, clamped to 0..250; the cap
+was 50 before round 3). When it is greater than 0, frames arriving within the window share one
+transaction and one clock sequence:
 
 - One journal row holds the merged update.
 - There is one attribution row per frame (`mutation_index` = frame index).
 - There is one catalog event per batch.
 - Every origin gets its own `BODY_COMMITTED`, all with the same `vaultSequence`.
+- Batches are keyed by `(bodyId, bodyEpoch)` (round 3, G3). A frame for another epoch never joins
+  a batch, and the epoch fence judges each batch separately. `semantic-reset` flushes the body's
+  pending batches before its CAS, so a queued frame either commits first (and the reset sees
+  `head_advanced`) or is fenced with 4409 after it.
+- At flush time every frame's actor is re-validated (round 3, G2). A frame whose actor was revoked
+  while it waited is dropped, and its socket gets 4403 once (`authorityDrops++`).
+- Duplicate `(deviceId, candidateId)` inside one batch (round 3, G11): the first frame is
+  appended. A later frame with the same digest is not appended and gets the first frame's receipt
+  with `deduped: true`. A later frame with a different digest gets `BODY_UPDATE_REJECTED`
+  `candidate_id_reused` (`batchDuplicateCandidates++`).
 
 ## 4. Socket: server → client frames
 
@@ -218,6 +240,7 @@ This is the base `BODY_COMMITTED` frame with extra fields:
   update frame, after commit.
 - Root sockets get the base `BODY_COMMITTED`. Peer relay body sockets get it with
   `relay: true, peer: true` and no `clientFrameId` (it is a head notice, not a receipt).
+- The origin sockets of a commit never get the peer notice (§3.3 step 7).
 
 ### 4.3 Close codes
 
@@ -272,6 +295,14 @@ the row has expired, or the row is held by the same device (re-grant, new `lease
   re-checks the cooldown, so a lease granted just before a concurrent reset cannot slip through.
   Test workers set the var small in `[vars]`.
 - `409 {"granted": false, "reason": "held"|"epoch_mismatch", "epoch", "headSequence", "holderDeviceId"?, "expiresAt"?}`
+- `403 {"granted": false, "reason": "authority_superseded", "epoch": null, "headSequence": null}`
+  (round 3, G19): the actor is re-validated right before the lease CAS, not only at request
+  start.
+
+Leases are released when authority goes away (round 3, G19). Device revocation deletes every
+lease that device holds. An authority fence deletes the leases of every device and principal
+subject it names. This is conservative: a fence over a principal drops the leases of all that
+principal's devices.
 - `404 {"granted": false, "reason": "not_found", …}`: the body is unknown or not active.
 
 **Client shape change (round 2, `scripts/relay2/reset/leaseClient.ts` + `httpTransport.ts`).** A
@@ -308,7 +339,10 @@ isolate.
  "contentHash": "…", "contentBytes": 1234, "snapshot": "<base64 Yjs v1 full-state update>"}
 ```
 
-The server checks, and then installs, in order:
+The server checks, and then installs, in order. Before step 1 it flushes the body's pending
+micro-batches (§3.3). Authority is re-validated inside the reset transaction (round 3, G19); the
+snapshot upload before it can take minutes. A revoked actor gets
+`403 {"ok": false, "reason": "authority_superseded"}` and its leases are deleted.
 
 0. **Structural sanity only:** the snapshot has between 2 bytes and 8 MiB, its state vector
    decodes (`stateVectorFromUpdate`), and the SV is non-empty unless `contentBytes == 0`.
@@ -354,6 +388,7 @@ Responses:
 
 - `200 {"ok": true, "epoch", "previousEpoch", "sequence", "generation", "fencedSockets", "policy"}`
 - `409 {"ok": false, "reason": "lease_invalid"|"lease_expired"|"epoch_mismatch"|"head_advanced"|"cooldown", "epoch", "headSequence", "policy"?}`
+- `403 {"ok": false, "reason": "authority_superseded"}` (round 3)
   - `head_advanced`: rebuild from the current head and retry while the lease is valid.
 - `400 {"ok": false, "reason": "invalid_request"|"invalid_snapshot"}`
 - `413 {"ok": false, "reason": "too_large"|…}`: the body is over the 8 MiB bound.
@@ -388,12 +423,20 @@ a doc. Clients are trusted, as with envelope hashes.
   relay mode (round 2). They merge the pinned checkpoint at or before the boundary with the
   journal tail through the boundary (`durableMergedBytes(bodyId, boundarySequence)`), with no
   document. A reset after the boundary still serves the old lineage, because the pin keeps the
-  old epoch's rows. Over budget, the batch returns 413.
+  old epoch's rows (this is what the WIP and committed code do; an older revision of this doc
+  said bootstrap reconstructs a document, G17). Over budget, the batch route returns
+  `413 {"error": "relay_merge_budget_exceeded", "bodyId", "overBudgetBodyIds"}` before it reserves
+  any budget (round 3, G20). An unmodified client bisects on 413, so it ends up failing only on
+  the over-budget body; the extra merges of the other bodies in the rejected batches are bounded
+  by the bisection depth.
 - **Lazy hash.** If the head catalog event has a NULL hash and the merged bytes are at most
   `YAOS_RELAY_LAZY_HASH_MAX_BYTES` (default 3 MiB), the server materialises the document once,
   computes `canonicalMarkdownHash` and backfills that catalog event in place
   (`materialisations++`). Above that size the hash stays unknown (`lazyHashSkips++`), because a
   document for a large, struct-dense body can exceed the wasm memory budget (§6.2).
+  A per-runtime cache (round 3, G4; at most 256 bodies) remembers the computed hash per
+  `(bodyId, epoch, headSequence)`, so repeated reads of a head whose catalog event is no longer the
+  newest one do not materialise again (`lazyHashCacheHits++`). A reset clears the body's entry.
 
 ### 5.4 Diagnostics
 
@@ -407,17 +450,22 @@ a doc. Clients are trusted, as with envelope hashes.
                   "epochFences", "authorityCloses", "commitFailures", "mergedCacheRebuilds",
                   "step2Replies", "envelopeMismatches", "hashAccepted", "hashUnknown",
                   "incrementalAppends", "stateVectorDrift", "partialCheckpoints", "mergeBudgetRejects",
-                  "unmergedStep2Replies", "lazyHashSkips", "appendsPerSecond" },
+                  "unmergedStep2Replies", "lazyHashSkips", "lazyHashCacheHits", "authorityDrops",
+                  "batchDuplicateCandidates", "residentStaleSkips", "floorAdvances", "floorRowsPruned",
+                  "appendsPerSecond" },
     "documentMaterialisations": { "root", "nonRoot", "recentNonRoot": [ { "documentId", "throughSequence", "at" } ] },
     "byteOps": "<ywasm byte-ops backend name>",
     "bodies": [ { "bodyId", "epoch", "latestSequence", "generation", "logRows", "logBytes",
                   "checkpointSequence", "stateVectorBytes", "mergedBytes|null", "stateVectorExact" } ],
     "mergedCacheBytes": 0, "pendingEnvelopes": 0, "pendingBatches": 0,
+    "staleResidents": 0, "overBudgetBodies": 0,
     "vaultJournalRows": 123,
     "ywasmLinearMemoryBytes": 0 }
   ```
 
-  Counters are per runtime; they reset when the DO is evicted. `documentMaterialisations` counts
+  Counters are per runtime; they reset when the DO is evicted. `vaultJournalRows` is a
+  `COUNT(*)`; it runs only here and in tests (round 3, G15), never on the append or alarm path,
+  and the feed floor (§6.3) keeps the table bounded. `documentMaterialisations` counts
   every `VaultDocumentStore.reconstructDocument` call, relay or base, for any reason. In relay mode
   `nonRoot` should move only for the paths listed in §6.1.
 
@@ -429,7 +477,7 @@ a doc. Clients are trusted, as with envelope hashes.
 | Var | Default | Meaning |
 |---|---|---|
 | `YAOS_RELAY_BODIES` | unset | `"true"` enables everything in this doc. |
-| `YAOS_RELAY_MICROBATCH_MS` | `0` | Micro-batch window (ms); 0 means one tx per frame. Capped at 50. |
+| `YAOS_RELAY_MICROBATCH_MS` | `0` | Micro-batch window (ms); 0 means one tx per frame. Clamped to 0..250 (round 3; was 50). |
 | `YAOS_RELAY_MAX_BODY_SOCKETS` | `5000` | Sanity cap on body sockets per vault DO. |
 | `YAOS_RELAY_RATE_BYTES_PER_SEC` | `262144` | Token-bucket refill per socket. |
 | `YAOS_RELAY_BURST_BYTES` | `1048576` | Token-bucket capacity per socket. |
@@ -458,7 +506,12 @@ These code paths still build a server Y.Doc for a relay body. Each is counted in
 |---|---|---|
 | Lazy hash (`bodyHttpState`) | HTTP GET/catch-up of a body whose head catalog hash is NULL, merged bytes ≤ 3 MiB | This is the only way to get text from bytes without a doc. It is at most once per unknown head, then backfilled. Clients avoid it by sending D6 claims. |
 | HTTP candidate path / create (`vaultLifecycleService.createDocument`, candidate commit) | Closed-file edits and file creates go through the base HTTP candidate path, which loads the body into the document cache | The markdown → CRDT diff (and validation) needs a document. Relay covers only open-editor socket edits. Moving closed-file edits to "client builds the update, server appends" is a client change. |
-| Dirty-doc `writeLiveCheckpoint` | A body resident in the cache (from the candidate path) that is dirty gets a live checkpoint from the doc | This belongs to the base cache lifecycle. `syncDocumentCache` discards a clean resident doc on each relay append, so this happens only while a candidate is in flight. |
+| Dirty-doc `writeLiveCheckpoint` | A body resident in the cache (from the candidate path) that is dirty gets a live checkpoint from the doc | This belongs to the base cache lifecycle. The relay alarm pass skips dirty residents; the base pass handles them. |
+
+Relay appends never apply an update to a resident document (round 3, G5). `syncDocumentCache`
+discards a clean resident. A dirty or validating resident is left alone, counted in
+`residentStaleSkips`, remembered, and evicted by the next alarm pass once it is clean. That
+resident can be behind the durable head until then; the next reader reloads from durable state.
 | Semantic docs / base compaction | Server semantic compaction | Disabled for relay bodies (§7.9). It can still run for bodies created before the flag. |
 | Root | All root reads and writes | Out of scope: the relay covers bodies only. |
 
@@ -502,10 +555,31 @@ the ywasm agent. The server side now **refuses before calling into wasm**:
   - **Step1** is answered with the stored parts, one `SYNC_STEP_2` per part, unmerged and undiffed
     (`unmergedStep2Replies++`). y-protocols clients apply them idempotently.
   - **GET/catch-up/bootstrap** return 413 `relay_merge_budget_exceeded`.
-  - **The checkpoint** is skipped (`mergeBudgetRejects++`), and the alarm stops re-arming for that
-    body until a semantic reset shrinks it.
+  - **The checkpoint** is bounded (round 3, G20). When the tail is over
+    `YAOS_RELAY_CHECKPOINT_MAX_ROWS` or the checkpoint plus the tail is over the merge budget, it
+    merges the longest tail prefix that fits (`tailPrefixBounded`) and writes a partial
+    checkpoint. When not even one row fits, the body is marked over budget in
+    `relay_body_budget(body_id, body_epoch, input_bytes, marked_at)` (`mergeBudgetRejects++`). The
+    marker survives DO eviction, so the alarm stops re-arming for that body. It is valid only
+    while the head epoch matches, and a semantic reset clears it.
 - Exact per-append merges only run for bodies ≤ `YAOS_RELAY_EXACT_MERGE_BYTES` (256 KiB), which
   is far below the budget.
+
+### 6.3 Feed floor (round 3, G1)
+
+Before round 3 relay bodies were never pruned from `vault_journal`: the base maintenance loop
+skipped them and nothing advanced the feed floor, so the table grew by one row per append forever.
+Now the alarm calls `runCheckpointPass`, which:
+
+1. evicts stale residents (§6.1);
+2. checkpoints relay bodies over the thresholds, skipping dirty residents and over-budget bodies;
+3. sets `floor = min(currentSequence - 1000, pinBoundary - 1 for every active pin)` and calls
+   `advanceFeedFloor(floor)` when it is above the current floor. That prunes journal rows at or
+   below the floor that a complete checkpoint covers.
+
+Bootstrap and restore pins are respected (the floor stays below every pin boundary). The base
+maintenance loop now runs only for non-relay bodies. Measured in the unit suite: 5,000 relay
+appends leave 1,001 journal rows (floor 4002, 41 floor advances, 2.45 s total).
 
 **5 MB bloated note: no server doc is needed.** Server compaction is disabled for relay bodies.
 The reset takes the client's snapshot and runs only the structural SV parse. GET, step2 and the
@@ -559,7 +633,8 @@ each time; results in `results/relay2/core2-live-reset-5mb.json`):
    interleave across frames.
 7. **The receipt is commit-before-send**, not runtime identity (§4.4).
 8. **Dedupe uses `vault_candidate_receipts`.** `vault_operation_outcomes` is not written per
-   append (write amplification). Receipt pruning runs in the checkpoint alarm, not per append.
+   append (write amplification). The outcome route still works through the attribution row's
+   `operation_id` (round 3, G14). Receipt pruning runs in the checkpoint alarm, not per append.
 9. **Server-side semantic compaction is disabled for relay bodies.** Lease-based client reset
    replaces it; `recordCommit` is skipped for relay appends.
 
@@ -567,12 +642,15 @@ each time; results in `results/relay2/core2-live-reset-5mb.json`):
 
 - **Validation.** There is no server-side frontmatter or markdown-size validation on relay
   appends, because it would need a doc. The per-frame byte limit still applies.
-- **Pending envelopes are memory-only** (§3.2). Hibernation between the envelope and its frame
-  means no echo.
+- **Pending envelopes are memory-only** (§3.2, G13, not fixed on purpose). Hibernation between the
+  envelope and its frame means an envelope-less commit with an unknown hash and no echo. The
+  client resends; the resend is a no-op or a dedupe hit. Persisting envelopes would cost one row
+  write per frame for a case that practically never happens.
 - **Checkpoint at `YAOS_RELAY_CHECKPOINT_*`** uses the byte merge. Checkpoints of relay bodies
   never touch the document cache.
-- **`vault_operation_outcomes` is not written** for relay appends. Relay receipts are not
-  retrievable through `GET /operations/:id/outcome`.
+- **`vault_operation_outcomes` is not written** for relay appends (G14). Since round 3 candidate
+  frames are still retrievable through `GET /operations/:candidateId/outcome`, via the attribution
+  row's `operation_id`. Envelope-only frames without `candidateId` have no operation id.
 - **The reset lease is at least as strict as needed**: `coveredSequence` must equal the head
   exactly, so a busy note can starve resets. See §5.2 for the hot-note mitigations.
 - **Incremental SV on large bodies (K3).** For bodies over `YAOS_RELAY_EXACT_MERGE_BYTES` the head
@@ -581,14 +659,30 @@ each time; results in `results/relay2/core2-live-reset-5mb.json`):
   so a D6 hash claim can be accepted when it should not be. Well-behaved y-protocols clients send
   causally complete updates, so this should not happen in practice. Every rebuild or checkpoint
   compares the incremental SV with the exact one and counts mismatches in
-  `counters.stateVectorDrift`; it was 0 in all tests. The growth cap on large bodies only catches
+  `counters.stateVectorDrift`; it was 0 in all tests.
+  - Round 3 (G8): a rebuild that could not merge (over the exact size or the budget) marks the SV
+    `stateVectorExact: false`, and D6 accepts a hash only while the SV is exact. So for bodies
+    over 256 KiB **a client hash claim is never accepted**: the hash stays unknown and is filled
+    by the lazy hash (up to 3 MiB). Above 3 MiB it stays unknown until a semantic reset records the
+    client's hash. This trades hash availability for never recording an overstated claim. The growth cap on large bodies only catches
   exact resends, so a covered-but-different re-send (e.g. a reconnect step2) of a large body is
   appended (it is idempotent, and costs one journal row).
 - **Bootstrap body reads use a byte merge** (round 2; §5.3). The bootstrap catalog page can carry
   `contentHash: null` for relay appends whose hash was not accepted; clients must treat that as
   unknown.
-- **Over-budget bodies** (§6.2) are not served by GET, catch-up or bootstrap (413) and are not
-  checkpointed until a client reset shrinks them.
+- **Over-budget bodies** (§6.2) are not served by GET, catch-up or bootstrap (413). They are
+  checkpointed only as far as a bounded prefix fits, and then marked (persisted) until a client
+  reset shrinks them.
+- **Queued frames of a closed socket still commit** (G2). Re-validation at flush checks
+  authority, not socket liveness; the frame was received before the close, and the sender resends
+  anyway.
+- **Reset flushes pending batches first** (G3). A reset that races queued frames can therefore fail
+  with `head_advanced` where, without batching, the frames would have been fenced instead.
+- **Lease release on fence is conservative** (G19): every lease of every listed device and
+  principal subject is deleted.
+- **Dirty residents are left stale** (G5) instead of having relay updates applied in-process.
+- **Unused helper:** `RelayBodyStore.tailPrefixSequence` is superseded by `tailPrefixBounded` and
+  is kept only until the spike is folded.
 - **Checkpoints are bounded** to `YAOS_RELAY_CHECKPOINT_MAX_ROWS` rows per pass (partial
   checkpoint + immediate alarm re-arm) instead of one merge of the whole tail.
 

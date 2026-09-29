@@ -48,8 +48,9 @@ export interface RelaySocketHost {
 	/** Sends the epoch-mismatch frame and closes 4409. */
 	fenceRelaySocket(socket: VaultSocketPort, attachment: VaultSocketAttachment, currentEpoch: SemanticEpoch): void;
 	broadcastRelayUpdate(bodyId: string, epoch: SemanticEpoch, frame: Uint8Array, excludeSocketId: string): void;
-	/** Base BODY_COMMITTED to root sockets and peer body sockets (not the origin). */
-	notifyBodyCommitted(bodyId: string, durableGeneration: number, vaultSequence: number, excludeSocketId?: string): void;
+	/** Base BODY_COMMITTED to root sockets and peer body sockets (never the origins: they get their own ack). */
+	notifyBodyCommitted(bodyId: string, durableGeneration: number, vaultSequence: number,
+		excludeSocketIds?: ReadonlySet<string>): void;
 }
 
 export interface RelayEnvelope {
@@ -128,6 +129,18 @@ export interface RelayCounters {
 	unmergedStep2Replies: number;
 	/** HTTP reads that left an unknown hash unknown because the body is over `lazyHashMaxBytes`. */
 	lazyHashSkips: number;
+	/** HTTP reads served from the per-(body, epoch, head sequence) lazy hash cache (G4). */
+	lazyHashCacheHits: number;
+	/** Queued micro-batch frames dropped at commit because the device lost authority (G2). */
+	authorityDrops: number;
+	/** Frames in one micro-batch that repeated an earlier frame's (device, candidateId) (G11). */
+	batchDuplicateCandidates: number;
+	/** Relay appends that found a dirty/validating resident document and left it for later eviction (G5). */
+	residentStaleSkips: number;
+	/** Feed-floor advances performed by the relay checkpoint pass (G1). */
+	floorAdvances: number;
+	/** Journal rows pruned by those floor advances. */
+	floorRowsPruned: number;
 }
 
 export interface RelayBodyServiceOptions {
@@ -232,15 +245,23 @@ export class RelayBodyService {
 	private mergedBytesTotal = 0;
 	private readonly batches = new Map<string, { frames: QueuedFrame[]; timer: ReturnType<typeof setTimeout> }>();
 	private readonly appendTimes: number[] = [];
-	/** Bodies whose checkpoint merge was refused by the budget; skipped by the alarm until a reset. */
-	private readonly overBudgetBodies = new Set<string>();
+	/**
+	 * Bodies whose checkpoint cannot progress within the merge budget, by epoch
+	 * (G20: persisted in `relay_body_budget`, loaded lazily; a new epoch clears it).
+	 */
+	private overBudgetBodies: Map<string, number> | null = null;
+	/** Resident base-path documents left stale by a relay append (dirty or validating); evicted later (G5). */
+	private readonly staleResidents = new Set<string>();
+	/** Lazily materialised hashes keyed by body, valid for one (epoch, head sequence) (G4). */
+	private readonly lazyHashes = new Map<string, { epoch: SemanticEpoch; sequence: number; contentHash: string; size: number }>();
 	readonly counters: RelayCounters = {
 		appends: 0, appendFrames: 0, emptySkips: 0, noopSkips: 0, dedupeHits: 0, dedupeConflicts: 0,
 		envelopeMismatches: 0, hashAccepted: 0, hashUnknown: 0, materialisations: 0, checkpoints: 0,
 		lastCheckpointMs: 0, checkpointRowsWritten: 0, resets: 0, leaseGrants: 0, leaseDenials: 0,
 		rowsWritten: 0, rateLimitCloses: 0, epochFences: 0, authorityCloses: 0, commitFailures: 0,
 		mergedCacheRebuilds: 0, step2Replies: 0, incrementalAppends: 0, stateVectorDrift: 0, partialCheckpoints: 0,
-		mergeBudgetRejects: 0, unmergedStep2Replies: 0, lazyHashSkips: 0,
+		mergeBudgetRejects: 0, unmergedStep2Replies: 0, lazyHashSkips: 0, lazyHashCacheHits: 0, authorityDrops: 0,
+		batchDuplicateCandidates: 0, residentStaleSkips: 0, floorAdvances: 0, floorRowsPruned: 0,
 	};
 
 	constructor(private readonly options: RelayBodyServiceOptions) {
@@ -300,9 +321,10 @@ export class RelayBodyService {
 
 	/**
 	 * Rebuilds the head entry from checkpoint + tail. Over the merge budget the
-	 * entry keeps `bytes: null` and an exact SV (pointwise max of the parts' SVs,
-	 * each part is at most one checkpoint or one durable frame), so appends and
-	 * step1 still work; merged-byte readers get `RelayMergeBudgetError`.
+	 * entry keeps `bytes: null` and the pointwise max of the parts' SVs, which
+	 * can overstate the true head SV when a part has gaps (pending structs), so
+	 * it is marked inexact (G8: no content-hash claim is accepted against it).
+	 * Appends and step1 still work; merged-byte readers get `RelayMergeBudgetError`.
 	 */
 	private rebuild(bodyId: string, throughSequence: number, previous?: MergedEntry): MergedEntry {
 		let durable: { semanticEpoch: SemanticEpoch; latestSequence: number; generation: number; tailEntries: number;
@@ -329,7 +351,7 @@ export class RelayBodyService {
 			generation: durable.generation,
 			bytes: durable.bytes,
 			stateVector,
-			stateVectorExact: true,
+			stateVectorExact: durable.bytes !== null,
 			lastUpdate: previous?.lastUpdate ?? null,
 			tailEntries: durable.tailEntries,
 			tailBytes: durable.tailBytes,
@@ -404,9 +426,23 @@ export class RelayBodyService {
 		try { for (const part of parts) socket.send(syncFrame(SYNC_STEP_2, part)); } catch { /* closed */ }
 	}
 
+	/**
+	 * Per-socket in-memory state only. A pending envelope is lost on close and on
+	 * hibernation (G13): the next binary frame is then simply envelope-less (it
+	 * commits, the origin gets no ack and resends on reconnect as a no-op). It can
+	 * never pair with a different frame: pairing requires the payload digest.
+	 * Queued micro-batch frames of a closed socket still commit (they were
+	 * authorised and are re-checked at commit, G2).
+	 */
 	socketClosed(socketId: string): void {
 		this.pendingEnvelopes.delete(socketId);
 		this.buckets.delete(socketId);
+	}
+
+	private rejectAuthority(socket: VaultSocketPort): void {
+		this.counters.authorityCloses++;
+		this.requireHost().sendControl(socket, { type: "error", code: "authority_superseded", reason: "socket authority superseded" });
+		try { socket.close(AUTHORITY_SUPERSEDED_SOCKET_CLOSE_CODE, "socket authority superseded"); } catch { /* closed */ }
 	}
 
 	/** Binary MESSAGE_SYNC on a relay body socket (outer tag already read). Synchronous. */
@@ -415,6 +451,8 @@ export class RelayBodyService {
 		const message = readSyncMessage(decoder);
 		const bodyId = attachment.documentId;
 		if (message.kind === "step-1") {
+			// G6: never serve body bytes to a socket whose authority was superseded (cached check).
+			if (!this.validateActor(actorOf(attachment))) { this.rejectAuthority(socket); return; }
 			let state: MergedEntry | null;
 			try { state = this.fullState(bodyId); } catch (error) {
 				if (!(error instanceof RelayMergeBudgetError)) throw error;
@@ -452,7 +490,10 @@ export class RelayBodyService {
 			if (envelope) this.ackNoop(socket, attachment, envelope, digest);
 			return;
 		}
-		// 2. Candidate dedupe.
+		// 2. Authority (cached, invalidated by every in-process authority writer).
+		// Before dedupe (G7): a revoked device gets 4403, never a re-ack.
+		if (!this.validateActor(actor)) { this.rejectAuthority(socket); return; }
+		// 3. Candidate dedupe.
 		if (envelope?.candidateId) {
 			const candidateDigest = envelope.candidateDigest ?? envelope.payloadDigest;
 			const receipt = this.options.store().candidateReceipt(bodyId, attachment.deviceId, envelope.candidateId);
@@ -471,13 +512,6 @@ export class RelayBodyService {
 				return;
 			}
 		}
-		// 3. Authority (cached, invalidated by every in-process authority writer).
-		if (!this.validateActor(actor)) {
-			this.counters.authorityCloses++;
-			host.sendControl(socket, { type: "error", code: "authority_superseded", reason: "socket authority superseded" });
-			try { socket.close(AUTHORITY_SUPERSEDED_SOCKET_CLOSE_CODE, "socket authority superseded"); } catch { /* closed */ }
-			return;
-		}
 		// 4. Budget.
 		if (!this.consumeTokens(attachment.socketId, update.byteLength)) {
 			this.counters.rateLimitCloses++;
@@ -490,30 +524,41 @@ export class RelayBodyService {
 			this.enqueue(bodyId, frame);
 			return;
 		}
-		this.commitFrames(bodyId, [frame]);
+		this.commitFrames(bodyId, [frame], false);
+	}
+
+	/** G3: batches are keyed by (body, epoch); frames of different epochs never share a commit. */
+	private static batchKey(bodyId: string, epoch: SemanticEpoch): string {
+		return `${bodyId}\u0000${epoch}`;
 	}
 
 	private enqueue(bodyId: string, frame: QueuedFrame): void {
-		const existing = this.batches.get(bodyId);
+		const key = RelayBodyService.batchKey(bodyId, frame.attachment.documentEpoch);
+		const existing = this.batches.get(key);
 		if (existing) {
 			existing.frames.push(frame);
 			return;
 		}
-		const timer = setTimeout(() => this.flushBatch(bodyId), this.config.microbatchMs);
-		this.batches.set(bodyId, { frames: [frame], timer });
+		const timer = setTimeout(() => this.flushKey(bodyId, key), this.config.microbatchMs);
+		this.batches.set(key, { frames: [frame], timer });
 	}
 
-	/** Commits a pending micro-batch now (timer, tests, drain). */
-	flushBatch(bodyId: string): void {
-		const batch = this.batches.get(bodyId);
+	private flushKey(bodyId: string, key: string): void {
+		const batch = this.batches.get(key);
 		if (!batch) return;
 		clearTimeout(batch.timer);
-		this.batches.delete(bodyId);
-		this.commitFrames(bodyId, batch.frames);
+		this.batches.delete(key);
+		this.commitFrames(bodyId, batch.frames, true);
+	}
+
+	/** Commits every pending micro-batch of a body now (timer, reset, tests, drain). */
+	flushBatch(bodyId: string): void {
+		const prefix = `${bodyId}\u0000`;
+		for (const key of [...this.batches.keys()]) if (key.startsWith(prefix)) this.flushKey(bodyId, key);
 	}
 
 	flushAllBatches(): void {
-		for (const bodyId of [...this.batches.keys()]) this.flushBatch(bodyId);
+		for (const key of [...this.batches.keys()]) this.flushKey(key.slice(0, key.indexOf("\u0000")), key);
 	}
 
 	private consumeTokens(socketId: string, bytes: number): boolean {
@@ -528,10 +573,52 @@ export class RelayBodyService {
 		return true;
 	}
 
+	/**
+	 * G2 + G11 for queued frames: drop frames whose device lost authority since
+	 * they were queued (4403, invariant #4 holds with batching on), and collapse
+	 * repeated (device, candidateId) pairs inside the batch: the same digest is
+	 * acked as a dedupe of the first frame's commit, a different digest is
+	 * rejected `candidate_id_reused`. Returns the frames to commit and the
+	 * duplicates to ack after the commit.
+	 */
+	private screenBatch(frames: QueuedFrame[]): { live: QueuedFrame[]; duplicates: QueuedFrame[] } {
+		const live: QueuedFrame[] = [];
+		const duplicates: QueuedFrame[] = [];
+		const seen = new Map<string, string>();
+		const revoked = new Set<string>();
+		for (const frame of frames) {
+			if (revoked.has(frame.attachment.socketId) || !this.validateActor(frame.actor)) {
+				this.counters.authorityDrops++;
+				if (!revoked.has(frame.attachment.socketId)) this.rejectAuthority(frame.socket);
+				revoked.add(frame.attachment.socketId);
+				continue;
+			}
+			const candidateId = frame.envelope?.candidateId;
+			if (candidateId) {
+				const key = `${frame.attachment.deviceId}\u0000${candidateId}`;
+				const digest = frame.envelope!.candidateDigest ?? frame.envelope!.payloadDigest;
+				const first = seen.get(key);
+				if (first !== undefined) {
+					this.counters.batchDuplicateCandidates++;
+					if (first === digest) duplicates.push(frame);
+					else {
+						this.counters.dedupeConflicts++;
+						this.requireHost().sendControl(frame.socket, { type: "BODY_UPDATE_REJECTED",
+							clientFrameId: frame.envelope!.clientFrameId, candidateId, reason: "candidate_id_reused" });
+					}
+					continue;
+				}
+				seen.set(key, digest);
+			}
+			live.push(frame);
+		}
+		return { live, duplicates };
+	}
+
 	/** Steps 5–7: growth cap, single-transaction commit, then acks and fan-out. */
-	private commitFrames(bodyId: string, frames: QueuedFrame[]): void {
+	private commitFrames(bodyId: string, frames: QueuedFrame[], batched: boolean): void {
 		const host = this.requireHost();
-		const live = frames;
+		const { live, duplicates } = batched ? this.screenBatch(frames) : { live: frames, duplicates: [] as QueuedFrame[] };
 		if (live.length === 0) return;
 		const epoch = live[0]!.attachment.documentEpoch;
 		const state = this.headState(bodyId);
@@ -549,7 +636,8 @@ export class RelayBodyService {
 		const update = live.length === 1 ? live[0]!.update : mergeUpdates(live.map((frame) => frame.update));
 		if (update.byteLength > MAX_DURABLE_UPDATE_BYTES) {
 			// Only reachable by micro-batching many near-limit frames: commit one by one.
-			for (const frame of live) this.commitFrames(bodyId, [frame]);
+			for (const frame of live) this.commitFrames(bodyId, [frame], false);
+			for (const frame of duplicates) this.ackNoop(frame.socket, frame.attachment, frame.envelope!, frame.digest);
 			return;
 		}
 		// 5. Growth cap. Small bodies: exact byte merge (no-op iff merged bytes are
@@ -569,16 +657,18 @@ export class RelayBodyService {
 			nextStateVector = noop ? state.stateVector : maxStateVector(state.stateVector, stateVectorFromUpdate(update));
 		}
 		if (noop) {
-			this.counters.noopSkips += live.length;
-			for (const frame of live) {
+			this.counters.noopSkips += live.length + duplicates.length;
+			for (const frame of [...live, ...duplicates]) {
 				if (frame.envelope) this.ackNoop(frame.socket, frame.attachment, frame.envelope, frame.digest, state);
 			}
 			return;
 		}
 		if (!exact) this.counters.incrementalAppends++;
-		// D6 currentness: the newest paired claim whose SV equals the merged SV.
+		// D6 currentness: the newest paired claim whose SV equals the merged SV,
+		// and only when that SV is exact (G8): the incremental SV of the large-body
+		// path can overstate the head (update gaps), so claims there stay unknown.
 		let acceptedIndex = -1;
-		for (let index = live.length - 1; index >= 0; index--) {
+		for (let index = exact ? live.length - 1 : -1; index >= 0; index--) {
 			const envelope = live[index]!.envelope;
 			if (envelope?.stateVector && envelope.contentHash !== undefined && envelope.size !== undefined
 				&& stateVectorsEqual(envelope.stateVector, nextStateVector)) {
@@ -599,8 +689,10 @@ export class RelayBodyService {
 				bodyId,
 				expectedEpoch: epoch,
 				update,
-				attributions: live.map((frame) => ({ actor: frame.actor,
-					...(frame.digest ? { requestDigest: frame.digest } : {}) })),
+				attributions: live.map((frame) => frame.envelope?.candidateId
+					? { actor: frame.actor, operationId: frame.envelope.candidateId,
+						requestDigest: frame.envelope.candidateDigest ?? frame.envelope.payloadDigest }
+					: { actor: frame.actor, ...(frame.digest ? { requestDigest: frame.digest } : {}) }),
 				catalogContent: accepted ? { contentHash: accepted.contentHash!, size: accepted.size! } : null,
 				receipts,
 				now: this.now(),
@@ -650,7 +742,7 @@ export class RelayBodyService {
 			...(state.overBudget ? { overBudget: true } : {}),
 		};
 		this.remember(bodyId, entry);
-		this.syncDocumentCache(bodyId, update, result.generation);
+		this.syncDocumentCache(bodyId);
 		// 7. After commit: origin acks, peer fan-out, base notices.
 		for (const [index, frame] of live.entries()) {
 			if (frame.envelope) {
@@ -661,34 +753,61 @@ export class RelayBodyService {
 				});
 			}
 		}
-		const origins = new Set(live.map((frame) => frame.attachment.socketId));
+		for (const frame of duplicates) {
+			this.ackOrigin(frame.socket, frame.attachment, frame.envelope!, frame.digest, {
+				durableGeneration: result.generation, vaultSequence: result.vaultSequence,
+				contentHashAccepted: false, deduped: true, noop: false,
+				contentHash: result.contentHash, size: result.size,
+			});
+		}
+		const origins = new Set([...live, ...duplicates].map((frame) => frame.attachment.socketId));
 		for (const frame of live) {
 			host.broadcastRelayUpdate(bodyId, epoch, syncFrame(SYNC_UPDATE, frame.update), frame.attachment.socketId);
 		}
-		for (const socketId of origins.size === 1 ? origins : [undefined]) {
-			host.notifyBodyCommitted(bodyId, result.generation, result.vaultSequence, socketId);
-		}
+		// G16: every origin gets exactly its own ack, never a peer notice as well.
+		host.notifyBodyCommitted(bodyId, result.generation, result.vaultSequence, origins);
 		if (entry.tailEntries >= this.config.checkpointEntries || entry.tailBytes >= this.config.checkpointBytes) {
 			this.options.armCheckpointAlarm();
 		}
 	}
 
-	/** Keeps a resident base-path document (HTTP candidate path) from going stale. */
-	private syncDocumentCache(bodyId: string, update: Uint8Array, generation: number): void {
+	/**
+	 * G5: a relay append never runs ywasm on a resident base-path document (the
+	 * HTTP candidate path may have one loaded). A clean resident is discarded (the
+	 * next user reloads from durable state). A dirty one (pending base-path queue
+	 * entries, not reachable for relay bodies in practice) or one with a staged
+	 * candidate validation is left alone and remembered; `evictStaleResidents`
+	 * drops it once it is clean. Neither case applies the update in-process.
+	 */
+	private syncDocumentCache(bodyId: string): void {
 		const loaded = this.options.cache.get(bodyId);
 		if (!loaded) return;
-		try {
-			if (!loaded.dirty && !loaded.validationPending && this.options.cache.pendingFor(bodyId).length === 0) {
-				this.options.cache.discardResident(bodyId);
-			} else if (!loaded.validationPending) {
-				this.options.cache.applyDurableUpdate(bodyId, update, generation, "relay-append");
-			} else {
-				this.options.cache.discardResident(bodyId);
-			}
-		} catch (error) {
-			console.warn("[yaos-relay] document cache sync failed", error);
+		if (!loaded.dirty && !loaded.validationPending && this.options.cache.pendingFor(bodyId).length === 0) {
 			this.options.cache.discardResident(bodyId);
+			this.staleResidents.delete(bodyId);
+			return;
 		}
+		this.counters.residentStaleSkips++;
+		this.staleResidents.add(bodyId);
+	}
+
+	/** Drops resident documents a relay append left stale, once they are clean (alarm pass). */
+	evictStaleResidents(): number {
+		let evicted = 0;
+		for (const bodyId of [...this.staleResidents]) {
+			const loaded = this.options.cache.get(bodyId);
+			if (!loaded) { this.staleResidents.delete(bodyId); continue; }
+			if (loaded.dirty || loaded.validationPending || this.options.cache.pendingFor(bodyId).length > 0) continue;
+			this.options.cache.discardResident(bodyId);
+			this.staleResidents.delete(bodyId);
+			evicted++;
+		}
+		return evicted;
+	}
+
+	/** True while a relay append left this body's resident document behind the durable head. */
+	residentIsStale(bodyId: string): boolean {
+		return this.staleResidents.has(bodyId);
 	}
 
 	private ackNoop(socket: VaultSocketPort, attachment: VaultSocketAttachment, envelope: RelayEnvelope,
@@ -741,19 +860,30 @@ export class RelayBodyService {
 		if (tail.entries === 0) return null;
 		// K3: merge cost is superlinear in frame count, so merge checkpoint + at most
 		// `checkpointMaxRows` tail rows per pass; the alarm re-arms for the rest.
-		const prefix = tail.entries > this.config.checkpointMaxRows
-			? this.options.relayStore().tailPrefixSequence(bodyId, tail.checkpointSequence, this.config.checkpointMaxRows)
-			: null;
-		const throughSequence = prefix ?? head.latestSequence;
+		// G20: the prefix is also bounded by bytes, so checkpoint + prefix input
+		// stays within `maxMergeInputBytes` and big bodies advance incrementally.
+		const relayStore = this.options.relayStore();
+		const checkpointBytes = relayStore.checkpointByteLength(bodyId, tail.checkpointSequence);
+		const budget = this.config.maxMergeInputBytes;
+		let throughSequence = head.latestSequence;
+		if (tail.entries > this.config.checkpointMaxRows || checkpointBytes + tail.bytes > budget) {
+			const prefix = relayStore.tailPrefixBounded(bodyId, tail.checkpointSequence, this.config.checkpointMaxRows,
+				budget - checkpointBytes);
+			if (!prefix) {
+				// Not even one tail row fits next to the checkpoint: the body stays
+				// checkpoint + tail until a client semantic reset shrinks it.
+				this.markOverBudget(bodyId, head.semanticEpoch, checkpointBytes + tail.bytes);
+				return null;
+			}
+			throughSequence = prefix.sequence;
+		}
 		let durable: ReturnType<VaultStore["durableMergedBytes"]>;
 		try {
-			durable = this.options.store().durableMergedBytes(bodyId, throughSequence, this.config.maxMergeInputBytes);
+			durable = this.options.store().durableMergedBytes(bodyId, throughSequence, budget);
 		} catch (error) {
 			if (!(error instanceof RelayMergeBudgetError)) throw error;
-			// Never call into wasm past the budget; the body stays checkpoint + tail
-			// until a client semantic reset shrinks it (the alarm skips it meanwhile).
-			this.counters.mergeBudgetRejects++;
-			this.overBudgetBodies.add(bodyId);
+			// Never call into wasm past the budget (defence in depth; the prefix is sized to fit).
+			this.markOverBudget(bodyId, head.semanticEpoch, error.inputBytes);
 			return null;
 		}
 		if (durable.tailEntries === 0) return null;
@@ -785,9 +915,73 @@ export class RelayBodyService {
 			bytes: durable.bytes.byteLength, partial };
 	}
 
+	private overBudgetMarkers(): Map<string, number> {
+		this.overBudgetBodies ??= this.options.relayStore().overBudgetMarkers();
+		return this.overBudgetBodies;
+	}
+
+	private markOverBudget(bodyId: string, epoch: SemanticEpoch, inputBytes: number): void {
+		this.counters.mergeBudgetRejects++;
+		this.overBudgetMarkers().set(bodyId, epoch);
+		this.options.relayStore().markOverBudget(bodyId, epoch, inputBytes, this.now());
+	}
+
+	/** True while the checkpoint of this body cannot progress within the merge budget (this epoch). */
+	isOverBudget(bodyId: string): boolean {
+		const epoch = this.overBudgetMarkers().get(bodyId);
+		if (epoch === undefined) return false;
+		if (this.options.store().documentHead(bodyId)?.semanticEpoch === epoch) return true;
+		this.overBudgetMarkers().delete(bodyId);
+		this.options.relayStore().clearOverBudget(bodyId);
+		return false;
+	}
+
+	/**
+	 * One relay checkpoint pass (the DO alarm): byte-merge checkpoints for the
+	 * bodies over the relay thresholds, then (G1) advance the feed floor so the
+	 * journal rows those checkpoints cover are pruned. The floor keeps the last
+	 * `retainSequences` sequences and stops below the oldest active pin, so
+	 * relay-only workloads have a bounded journal without `maintain()`.
+	 */
+	runCheckpointPass(options: { retainSequences: number; skip?: (bodyId: string) => boolean; limit?: number }):
+		{ checkpoints: number; retry: boolean; floor: number; rowsPruned: number } {
+		const store = this.options.store();
+		let checkpoints = 0;
+		let retry = false;
+		this.evictStaleResidents();
+		for (const bodyId of store.listJournalCheckpointCandidates(
+			this.config.checkpointEntries, this.config.checkpointBytes, options.limit ?? 25,
+		)) {
+			if (options.skip?.(bodyId) || this.isOverBudget(bodyId)) continue;
+			try {
+				const written = this.checkpointBody(bodyId);
+				if (written) checkpoints++;
+				if (written?.partial || this.needsCheckpoint(bodyId)) retry = true;
+			} catch (error) {
+				retry = true;
+				console.warn("[yaos-relay] checkpoint failed", error);
+			}
+		}
+		let rowsPruned = 0;
+		const now = this.now();
+		const pins = store.activePins(now);
+		let floor = Math.max(0, store.currentSequence() - options.retainSequences);
+		for (const pin of pins) floor = Math.min(floor, pin.boundarySequence - 1);
+		if (floor > store.journalFloor()) {
+			try {
+				rowsPruned = store.advanceFeedFloor(floor, now).rowsWritten;
+				this.counters.floorAdvances++;
+				this.counters.floorRowsPruned += rowsPruned;
+			} catch (error) {
+				console.warn("[yaos-relay] feed floor advance failed", error);
+			}
+		}
+		return { checkpoints, retry, floor: store.journalFloor(), rowsPruned };
+	}
+
 	/** True when a body's journal tail is over the relay checkpoint thresholds. */
 	needsCheckpoint(bodyId: string): boolean {
-		if (this.overBudgetBodies.has(bodyId)) return false;
+		if (this.isOverBudget(bodyId)) return false;
 		const tail = this.options.store().documentJournalTailStats(bodyId);
 		return tail.entries >= this.config.checkpointEntries || tail.bytes >= this.config.checkpointBytes;
 	}
@@ -811,6 +1005,12 @@ export class RelayBodyService {
 		if (catalog.contentHash !== null && catalog.size !== null) {
 			return { ...base, contentHash: catalog.contentHash, size: catalog.size, materialised: false, hashState: "known" };
 		}
+		const cached = this.lazyHashes.get(bodyId);
+		if (cached && cached.epoch === state.epoch && cached.sequence === state.latestSequence) {
+			// G4: backfill normally makes the hash "known"; this covers a refused backfill.
+			this.counters.lazyHashCacheHits++;
+			return { ...base, contentHash: cached.contentHash, size: cached.size, materialised: false, hashState: "known" };
+		}
 		if (state.bytes.byteLength > this.config.lazyHashMaxBytes) {
 			// A document for a large (possibly struct-dense) body can exceed the
 			// wasm budget; leave the hash unknown until a client reset/hash claim.
@@ -823,6 +1023,10 @@ export class RelayBodyService {
 			const contentHash = sha256HexSync(content);
 			this.counters.materialisations++;
 			this.options.relayStore().backfillCatalogHash(bodyId, catalog.sequence, contentHash, content.byteLength);
+			this.lazyHashes.delete(bodyId);
+			this.lazyHashes.set(bodyId, { epoch: state.epoch, sequence: state.latestSequence, contentHash,
+				size: content.byteLength });
+			while (this.lazyHashes.size > 256) this.lazyHashes.delete(this.lazyHashes.keys().next().value!);
 			return { ...base, contentHash, size: content.byteLength, materialised: true, hashState: "materialised" };
 		} finally {
 			crdtEngine.destroyDocument(reconstructed.doc);
@@ -843,6 +1047,11 @@ export class RelayBodyService {
 
 	acquireLease(bodyId: string, actor: VaultActorContext, expectedEpoch: number, ttlMs: number | undefined):
 		RelayLeaseResult & { stateVector?: string } {
+		// G19: the route authorised before reading the body; re-check (cached) now.
+		if (!this.validateActor(actor)) {
+			this.counters.leaseDenials++;
+			return { granted: false, reason: "authority_superseded", epoch: null, headSequence: null };
+		}
 		const result = this.options.relayStore().acquireLease(bodyId, actor, expectedEpoch, ttlMs, this.now(),
 			this.config.resetCooldownMs);
 		if (!result.granted) {
@@ -873,18 +1082,25 @@ export class RelayBodyService {
 		return contentBytes === 0 || decodeStateVector(stateVector).size > 0;
 	}
 
-	/** Lease-fenced reset; drops the merged cache entry on success. */
+	/**
+	 * Lease-fenced reset; drops the merged cache entry on success. Pending
+	 * micro-batches of the body are committed first (G3): frames received before
+	 * the reset are then either covered by it or make it fail `head_advanced`.
+	 * Authority is re-checked at install time (G19), after the body read.
+	 */
 	semanticReset(bodyId: string, actor: VaultActorContext, input: { leaseId: string; expectedEpoch: number;
 		coveredSequence: number; snapshot: Uint8Array; contentHash: string; contentBytes: number }): RelayResetOutcome {
+		this.flushBatch(bodyId);
 		const outcome = this.options.relayStore().semanticReset({ bodyId, actor, ...input, now: this.now(),
-			cooldownMs: this.config.resetCooldownMs });
+			cooldownMs: this.config.resetCooldownMs, authorize: () => this.validateActor(actor) });
 		if (!outcome.ok) {
 			this.counters.leaseDenials++;
 			return outcome;
 		}
 		this.counters.resets++;
 		this.invalidate(bodyId);
-		this.overBudgetBodies.delete(bodyId);
+		this.lazyHashes.delete(bodyId);
+		if (this.overBudgetMarkers().delete(bodyId)) this.options.relayStore().clearOverBudget(bodyId);
 		return outcome;
 	}
 
@@ -904,6 +1120,9 @@ export class RelayBodyService {
 			mergedCacheBytes: this.mergedBytesTotal,
 			pendingEnvelopes: this.pendingEnvelopes.size,
 			pendingBatches: this.batches.size,
+			staleResidents: this.staleResidents.size,
+			overBudgetBodies: [...this.overBudgetMarkers().keys()],
+			// COUNT(*) over the journal: this method backs /diagnostics only (G15).
 			vaultJournalRows: this.options.relayStore().journalRowCount(),
 			documentMaterialisations: this.options.store().documentMaterialisations,
 			ywasmLinearMemoryBytes: ywasmLinearMemoryBytes(),

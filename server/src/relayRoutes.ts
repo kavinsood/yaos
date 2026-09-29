@@ -55,7 +55,7 @@ export async function handleCompactionLease(deps: RelayRouteDeps, bodyId: string
 		response.headers.set("retry-after", String(Math.ceil((result.policy?.cooldownRemainingMs ?? 0) / 1000)));
 		return response;
 	}
-	return json(result, result.reason === "not_found" ? 404 : 409);
+	return json(result, result.reason === "not_found" ? 404 : result.reason === "authority_superseded" ? 403 : 409);
 }
 
 
@@ -126,8 +126,9 @@ export async function handleSemanticReset(deps: RelayRouteDeps, bodyId: string, 
 	if (!deps.relay.snapshotStructurallyValid(input.snapshot, input.contentBytes)) {
 		return json({ ok: false, reason: "invalid_snapshot" }, 400);
 	}
+	// Authority is re-checked inside (G19): the body read above may have been long.
 	const outcome = deps.relay.semanticReset(bodyId, actor, input);
-	if (!outcome.ok) return json(outcome, 409);
+	if (!outcome.ok) return json(outcome, outcome.reason === "authority_superseded" ? 403 : 409);
 	deps.discardResident(bodyId);
 	const fencedSockets = deps.fenceSockets(bodyId, outcome.result.previousSemanticEpoch, outcome.result.semanticEpoch);
 	return json({ ok: true, epoch: outcome.result.semanticEpoch, previousEpoch: outcome.result.previousSemanticEpoch,

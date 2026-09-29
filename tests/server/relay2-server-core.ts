@@ -84,10 +84,13 @@ interface Harness {
 	claim(doc: Y.Doc): Record<string, unknown>;
 	journalRows(): number;
 	catalogHead(): { contentHash: string | null; size: number | null; sequence: number };
+	/** A second service over the same storage (a new runtime after eviction/hibernation). */
+	freshRelay(): RelayBodyService;
+	revoke(deviceId: string): void;
 }
 
 async function withRelay(check: (harness: Harness) => void | Promise<void>,
-	config: Partial<RelayConfig> = {}): Promise<void> {
+	config: Partial<RelayConfig> = {}, cache: VaultDocumentCache = { get: () => undefined } as unknown as VaultDocumentCache): Promise<void> {
 	const directory = await mkdtemp(join(tmpdir(), "yaos-relay2-core-"));
 	const sqlite = NodeSqliteStorage.open(join(directory, "vault.sqlite"));
 	const storage = {
@@ -118,15 +121,16 @@ async function withRelay(check: (harness: Harness) => void | Promise<void>,
 		const alarms = { value: 0 };
 		const clock = { now: Date.now() };
 		const sockets: FakeSocket[] = [];
-		const relay = new RelayBodyService({
+		const makeRelay = () => new RelayBodyService({
 			config: { ...DEFAULT_RELAY_CONFIG, ...config },
 			store: () => store,
 			relayStore: () => relayStore,
-			cache: { get: () => undefined } as unknown as VaultDocumentCache,
+			cache,
 			runtimeEpoch: "runtime-test",
 			armCheckpointAlarm: () => { alarms.value++; },
 			now: () => clock.now,
 		});
+		const relay = makeRelay();
 		const host: RelaySocketHost = {
 			sockets: () => sockets,
 			sendControl: (socket, value) => socket.send(`__YPS:${JSON.stringify(value)}`),
@@ -139,7 +143,8 @@ async function withRelay(check: (harness: Harness) => void | Promise<void>,
 				for (const socket of sockets) if (socket.attachment.socketId !== exclude) socket.send(frame);
 			},
 			notifyBodyCommitted: (bodyId, _generation, sequence, exclude) => {
-				events.push({ kind: "committed", bodyId, exclude, headSequence: sequence });
+				events.push({ kind: "committed", bodyId, exclude: exclude ? [...exclude].sort().join(",") : undefined,
+					headSequence: sequence });
 			},
 		};
 		relay.bindHost(host);
@@ -178,6 +183,17 @@ async function withRelay(check: (harness: Harness) => void | Promise<void>,
 			},
 			journalRows: () => relayStore.journalRowCount(),
 			catalogHead: () => store.getCatalogHeadAt(store.currentSequence(), BODY)!,
+			freshRelay() {
+				const fresh = makeRelay();
+				fresh.bindHost(host);
+				return fresh;
+			},
+			revoke(deviceId) {
+				store.installAuthorityFence({ changeId: `relay2-revoke-${deviceId}-${Math.random()}`, vaultId: VAULT_ID,
+					vaultGeneration: VAULT_GENERATION, subjectDigest: `relay2-revoke-${deviceId}`, subjects: [
+						{ deviceId, principalId: owner.principalId, state: "revoked", credentialRevision: 2 },
+					] });
+			},
 		};
 		await check(harness);
 	} finally {
@@ -198,7 +214,8 @@ s.test("flag gating: env, config parsing, and relay routes only classify with th
 	assert.equal(relayBodiesEnabled({ YAOS_RELAY_BODIES: "false" }), false);
 	assert.equal(relayBodiesEnabled({ YAOS_RELAY_BODIES: "1" }), false);
 	const config = readRelayConfig({ YAOS_RELAY_MICROBATCH_MS: "999", YAOS_RELAY_CHECKPOINT_MAX_ROWS: "7" });
-	assert.equal(config.microbatchMs, 50, "micro-batch window is clamped");
+	assert.equal(config.microbatchMs, 250, "micro-batch window is clamped to 250 ms");
+	assert.equal(readRelayConfig({ YAOS_RELAY_MICROBATCH_MS: "100" }).microbatchMs, 100);
 	assert.equal(config.checkpointMaxRows, 7);
 	for (const [method, path] of [
 		["POST", "/vault/vault-route-0001/body/body-1/compaction-lease"],
@@ -669,17 +686,24 @@ s.test("HTTP reads: GET/HEAD state carries sequence + hash state; bootstrap body
 });
 
 s.test("merge budget: over-budget bodies never call a wasm merge; step1 sends parts, reads 413, checkpoint skips", async () => {
-	await withRelay(async ({ store, relay, socket, update, step1, seed, claim, envelope }) => {
+	await withRelay(async ({ store, relay, socket, update, step1, seed, claim, envelope, freshRelay }) => {
 		const origin = socket();
 		for (let index = 0; index < 4; index++) {
 			update(origin, textUpdate(seed, (text) => text.insert(text.length, String(index).repeat(900))));
 		}
 		assert.throws(() => relay.bodyHttpState(BODY), RelayMergeBudgetError);
 		assert.equal(relay.counters.mergeBudgetRejects > 0, true);
-		// Checkpoint refuses and the alarm stops asking for this body.
+		// G20: the checkpoint advances in byte-bounded prefixes while checkpoint +
+		// prefix fits the budget, then refuses; the marker is persisted per epoch.
 		assert.equal(relay.needsCheckpoint(BODY), true);
-		assert.equal(relay.checkpointBody(BODY), null);
+		let passes = 0;
+		while (relay.checkpointBody(BODY) !== null) { passes++; assert.ok(passes < 10); }
+		assert.equal(passes >= 1 && relay.counters.partialCheckpoints >= 1, true, "big tails advance incrementally");
 		assert.equal(relay.needsCheckpoint(BODY), false);
+		assert.equal(relay.isOverBudget(BODY), true);
+		assert.equal(freshRelay().isOverBudget(BODY), true, "over-budget marker survives a new runtime");
+		assert.equal(relay.runCheckpointPass({ retainSequences: 1000, skip: (id) => id !== BODY }).checkpoints, 0,
+			"the alarm pass skips it");
 		// Appends still commit (incremental SV path, bytes stay unmerged).
 		const peer = socket();
 		const tail = textUpdate(seed, (text) => text.insert(0, "!"));
@@ -705,6 +729,9 @@ s.test("merge budget: over-budget bodies never call a wasm merge; step1 sends pa
 		const bootstrap = new BootstrapService(store, Date.now, undefined, relay.config.maxMergeInputBytes);
 		const descriptor = await bootstrap.start();
 		assert.throws(() => bootstrap.bodyState(descriptor.bootstrapId, BODY), RelayMergeBudgetError);
+		// The batch flags the body instead of throwing at the first one.
+		assert.deepEqual(bootstrap.bodyStatesForBatch(descriptor.bootstrapId, [BODY]),
+			{ bodies: [], overBudgetBodyIds: [BODY] });
 		// A client reset shrinks the body below the budget and re-enables everything.
 		const head = store.documentHead(BODY)!;
 		const lease = relay.acquireLease(BODY, owner, head.semanticEpoch, 60_000);
@@ -717,6 +744,8 @@ s.test("merge budget: over-budget bodies never call a wasm merge; step1 sends pa
 			contentBytes: content.size }).ok);
 		fresh.destroy();
 		assert.equal(relay.bodyHttpState(BODY)!.hashState, "known");
+		assert.equal(relay.isOverBudget(BODY), false);
+		assert.equal(freshRelay().isOverBudget(BODY), false, "a reset clears the persisted marker");
 	}, { maxMergeInputBytes: 2048, exactMergeBytes: 0, checkpointEntries: 1, resetCooldownMs: 0 });
 });
 
@@ -734,6 +763,248 @@ s.test("lazy hash guard: bodies above lazyHashMaxBytes keep an unknown hash with
 		assert.equal(readRelayConfig({ YAOS_RELAY_LAZY_HASH_MAX_BYTES: "5" }).lazyHashMaxBytes, 5);
 		assert.equal(readRelayConfig({}).maxMergeInputBytes, 9 * 1024 * 1024);
 	}, { lazyHashMaxBytes: 8 });
+});
+
+// ---- round 3 (RFC §12 gaps) ------------------------------------------------
+
+function cloneOf(doc: Y.Doc): Y.Doc {
+	const clone = new Y.Doc();
+	Y.applyUpdate(clone, Y.encodeStateAsUpdate(doc));
+	return clone;
+}
+
+s.test("G6/G7: a revoked device gets 4403 on step1 and before candidate dedupe (never a re-ack)", async () => {
+	await withRelay(({ socket, update, step1, envelope, seed, revoke, relay }) => {
+		const origin = socket();
+		const bytes = textUpdate(seed, (text) => text.insert(0, "1"));
+		envelope(origin, bytes, { candidateId: "cand-r", candidateDigest: "digest-r" });
+		update(origin, bytes);
+		assert.equal(origin.last("BODY_COMMITTED")!.deduped, false);
+		revoke(owner.deviceId);
+		const replay = socket();
+		envelope(replay, bytes, { candidateId: "cand-r", candidateDigest: "digest-r" });
+		update(replay, bytes);
+		assert.equal(replay.closed?.code, 4403);
+		assert.equal(replay.last("BODY_COMMITTED"), undefined, "no dedupe re-ack for a revoked device");
+		assert.equal(relay.counters.dedupeHits, 0);
+		const reader = socket();
+		step1(reader, new Uint8Array([0]));
+		assert.equal(reader.binary.length, 0, "no step2 bytes for a revoked device");
+		assert.equal(reader.closed?.code, 4403);
+	});
+});
+
+s.test("G2/G11/G16: micro-batch drops revoked frames, collapses duplicate candidates, excludes every origin", async () => {
+	await withRelay(({ socket, update, envelope, seed, revoke, journalRows, relay, relayStore, store, events }) => {
+		const a = socket();
+		const b = socket(peer);
+		const writerA = cloneOf(seed);
+		const rows = journalRows();
+		update(a, textUpdate(writerA, (text) => text.insert(0, "A")));
+		update(b, textUpdate(seed, (text) => text.insert(0, "B")));
+		revoke(owner.deviceId);
+		relay.flushBatch(BODY);
+		assert.equal(a.closed?.code, 4403, "queued frame of a device revoked before commit is dropped");
+		assert.equal(b.closed, null);
+		assert.equal(journalRows(), rows + 1);
+		assert.equal(relay.counters.authorityDrops, 1);
+		assert.equal(reconstructedText(store), "Bhello");
+		writerA.destroy();
+		// Duplicate candidate ids inside one batch.
+		const c = socket(peer);
+		const attributions = relayStore.tableCounts().vault_mutation_attribution!;
+		const bytes = textUpdate(seed, (text) => text.insert(0, "C"));
+		for (const digest of ["d1", "d1", "d2"]) {
+			envelope(c, bytes, { candidateId: "dup", candidateDigest: digest });
+			update(c, bytes);
+		}
+		// A second origin in the same batch.
+		const d = socket(peer);
+		const other = textUpdate(seed, (text) => text.insert(0, "D"));
+		envelope(d, other);
+		update(d, other);
+		relay.flushBatch(BODY);
+		assert.equal(journalRows(), rows + 2, "one row for the whole batch");
+		assert.equal(relayStore.tableCounts().vault_mutation_attribution, attributions + 2, "duplicate not attributed");
+		const acks = c.controls.filter((value) => value.type === "BODY_COMMITTED");
+		assert.equal(acks.length, 2);
+		assert.deepEqual(acks.map((ack) => ack.deduped).sort(), [false, true]);
+		assert.equal(acks[0]!.vaultSequence, acks[1]!.vaultSequence);
+		assert.equal(c.last("BODY_UPDATE_REJECTED")!.reason, "candidate_id_reused");
+		assert.equal(relay.counters.batchDuplicateCandidates, 2);
+		assert.equal(d.controls.filter((value) => value.type === "BODY_COMMITTED").length, 1);
+		const notice = events.filter((event) => event.kind === "committed").at(-1)!;
+		assert.equal(notice.exclude, [c.attachment.socketId, d.attachment.socketId].sort().join(","),
+			"base notice excludes every origin (each gets exactly its own ack)");
+		assert.equal(reconstructedText(store), "DCBhello");
+	}, { microbatchMs: 250 });
+});
+
+s.test("G3: batches are keyed by (body, epoch); a reset flushes pending frames first", async () => {
+	await withRelay(({ socket, update, seed, journalRows, relay, relayStore, store }) => {
+		const stale = socket(owner, 99);
+		const live = socket(peer);
+		const rows = journalRows();
+		update(stale, textUpdate(cloneOf(seed), (text) => text.insert(0, "S")));
+		update(live, textUpdate(seed, (text) => text.insert(0, "L")));
+		relay.flushBatch(BODY);
+		assert.equal(stale.closed?.code, 4409);
+		assert.equal(live.closed, null, "a stale-epoch frame no longer fences the whole batch");
+		assert.equal(journalRows(), rows + 1);
+		const head = store.documentHead(BODY)!;
+		const lease = relay.acquireLease(BODY, peer, head.semanticEpoch, 60_000);
+		assert.ok(lease.granted);
+		update(live, textUpdate(seed, (text) => text.insert(0, "Q")));
+		const fresh = new Y.Doc({ gc: true });
+		fresh.getText("body").insert(0, "Lhello");
+		const content = contentHashOf("Lhello");
+		const outcome = relay.semanticReset(BODY, peer, { leaseId: lease.leaseId, expectedEpoch: head.semanticEpoch,
+			coveredSequence: head.latestSequence, snapshot: Y.encodeStateAsUpdate(fresh), contentHash: content.hash,
+			contentBytes: content.size });
+		fresh.destroy();
+		assert.equal(!outcome.ok && outcome.reason, "head_advanced", "the queued frame committed before the reset");
+		assert.equal(reconstructedText(store), "QLhello");
+		assert.equal(relayStore.tableCounts().vault_journal! >= rows + 2, true);
+	}, { microbatchMs: 250, resetCooldownMs: 0 });
+});
+
+s.test("G8: claims are accepted only against an exact SV; over-budget rebuild SV is inexact", async () => {
+	await withRelay(({ socket, update, envelope, seed, claim, catalogHead, relay }) => {
+		const origin = socket();
+		const bytes = textUpdate(seed, (text) => text.insert(0, "i"));
+		envelope(origin, bytes, claim(seed));
+		update(origin, bytes);
+		assert.equal(origin.last("BODY_COMMITTED")!.contentHashAccepted, false, "incremental SV path never accepts");
+		assert.equal(catalogHead().contentHash, null);
+		for (let index = 0; index < 3; index++) {
+			update(origin, textUpdate(seed, (text) => text.insert(0, String(index).repeat(900))));
+		}
+		relay.invalidate(BODY);
+		const entry = relay.headState(BODY)!;
+		assert.equal(entry.bytes, null);
+		assert.equal(entry.stateVectorExact, false, "part-SV max can overstate: marked inexact");
+	}, { exactMergeBytes: 0, maxMergeInputBytes: 2048, checkpointEntries: 1_000 });
+});
+
+s.test("G5: relay appends never apply to a resident document; clean ones are discarded, dirty ones evicted later", async () => {
+	const resident = { loaded: null as null | { dirty: boolean; validationPending: boolean }, discards: 0, applies: 0 };
+	const cache = {
+		get: () => resident.loaded ?? undefined,
+		pendingFor: () => [],
+		discardResident: () => { resident.discards++; resident.loaded = null; },
+		applyDurableUpdate: () => { resident.applies++; return true; },
+	} as unknown as VaultDocumentCache;
+	await withRelay(({ socket, update, seed, relay }) => {
+		const origin = socket();
+		resident.loaded = { dirty: false, validationPending: false };
+		update(origin, textUpdate(seed, (text) => text.insert(0, "1")));
+		assert.equal(resident.discards, 1);
+		resident.loaded = { dirty: true, validationPending: false };
+		update(origin, textUpdate(seed, (text) => text.insert(0, "2")));
+		assert.equal(resident.discards, 1, "a dirty resident is not discarded");
+		assert.equal(relay.residentIsStale(BODY), true);
+		assert.equal(relay.counters.residentStaleSkips, 1);
+		assert.equal(relay.evictStaleResidents(), 0, "still dirty");
+		resident.loaded.dirty = false;
+		assert.equal(relay.evictStaleResidents(), 1);
+		assert.equal(relay.residentIsStale(BODY), false);
+		assert.equal(resident.applies, 0, "ywasm never runs on a resident document from the relay hot path");
+	}, {}, cache);
+});
+
+s.test("G19: lease and reset re-check authority at install; revocation releases leases", async () => {
+	await withRelay(async (harness) => {
+		const { store, relay, relayStore, revoke } = harness;
+		const head = store.documentHead(BODY)!;
+		const lease = relay.acquireLease(BODY, owner, head.semanticEpoch, 60_000);
+		assert.ok(lease.granted);
+		const fresh = new Y.Doc({ gc: true });
+		fresh.getText("body").insert(0, "hello");
+		const snapshot = Y.encodeStateAsUpdate(fresh);
+		fresh.destroy();
+		const content = contentHashOf("hello");
+		revoke(owner.deviceId);
+		const response = await handleSemanticReset(resetDeps(harness), BODY, binaryReset({ leaseId: lease.leaseId,
+			expectedEpoch: head.semanticEpoch, coveredSequence: head.latestSequence, contentHash: content.hash,
+			contentBytes: content.size }, snapshot), owner);
+		assert.equal(response.status, 403);
+		assert.equal(((await response.json()) as { reason: string }).reason, "authority_superseded");
+		assert.equal(store.documentHead(BODY)!.semanticEpoch, head.semanticEpoch, "nothing installed");
+		const denied = relay.acquireLease(BODY, owner, head.semanticEpoch, 60_000);
+		assert.equal(!denied.granted && denied.reason, "authority_superseded");
+		const other = relay.acquireLease(BODY, peer, head.semanticEpoch, 60_000);
+		assert.ok(other.granted, "the revoked holder's lease was released");
+		assert.equal(relayStore.releaseLeasesFor({ deviceIds: [peer.deviceId] }), 1);
+		assert.equal(relayStore.releaseLeasesFor({ principalIds: [peer.principalId] }), 0);
+	}, { resetCooldownMs: 0 });
+});
+
+s.test("G13/G14: a lost envelope leaves the frame envelope-less (no mis-pairing); candidate frames have outcomes", async () => {
+	await withRelay(({ store, socket, update, envelope, seed, relay }) => {
+		const origin = socket();
+		const bytes = textUpdate(seed, (text) => text.insert(0, "1"));
+		envelope(origin, bytes, { candidateId: "cand-o", candidateDigest: "digest-o" });
+		update(origin, bytes);
+		const ack = origin.last("BODY_COMMITTED")!;
+		const outcome = store.committedOperationOutcome(owner, "cand-o", "digest-o");
+		assert.equal(outcome?.vaultSequence, ack.vaultSequence, "exact operation outcome found via attribution");
+		// Hibernation/close drops the in-memory envelope before its frame arrives.
+		const next = textUpdate(seed, (text) => text.insert(0, "2"));
+		envelope(origin, next, { candidateId: "cand-p", candidateDigest: "digest-p" });
+		relay.socketClosed(origin.attachment.socketId);
+		const acks = origin.controls.length;
+		update(origin, next);
+		assert.equal(origin.controls.length, acks, "committed without an ack (the client resends as a no-op)");
+		assert.equal(relay.counters.envelopeMismatches, 0);
+		assert.equal(store.committedOperationOutcome(owner, "cand-p", "digest-p"), null);
+		assert.equal(reconstructedText(store), "21hello");
+	});
+});
+
+s.test("G1: relay-only workloads keep a bounded journal (checkpoint pass advances the feed floor, respecting pins)", async () => {
+	await withRelay(async ({ socket, update, seed, relay, store, journalRows }) => {
+		const origin = socket();
+		const started = performance.now();
+		for (let index = 0; index < 5_000; index++) {
+			update(origin, textUpdate(seed, (text) => text.insert(text.length, "x")));
+			if (index % 100 === 99) relay.runCheckpointPass({ retainSequences: 1000 });
+		}
+		const pass = relay.runCheckpointPass({ retainSequences: 1000 });
+		const rows = journalRows();
+		console.log(`[relay2-core] G1 5000 appends: journal rows ${rows}, floor ${pass.floor}, `
+			+ `floor advances ${relay.counters.floorAdvances}, pruned ${relay.counters.floorRowsPruned}, `
+			+ `${Math.round(performance.now() - started)} ms`);
+		assert.equal(rows <= 1000 + relay.config.checkpointEntries + 10, true, `bounded journal (${rows} rows)`);
+		assert.equal(pass.floor >= store.currentSequence() - 1000 - 1, true);
+		assert.equal(reconstructedText(store).length, 5 + 5_000);
+		// An active pin holds the floor below its boundary.
+		const bootstrap = new BootstrapService(store, Date.now, undefined, relay.config.maxMergeInputBytes);
+		await bootstrap.start();
+		const boundary = store.currentSequence();
+		for (let index = 0; index < 300; index++) update(origin, textUpdate(seed, (text) => text.insert(0, "y")));
+		relay.runCheckpointPass({ retainSequences: 10 });
+		assert.equal(store.journalFloor() < boundary, true, "floor stays below the active pin boundary");
+	}, { rateBytesPerSec: 1 << 30 });
+});
+
+s.test("G4: the lazy hash is computed once per (body, head sequence) and never on the append path", async () => {
+	await withRelay(({ store, socket, update, seed, relay, relayStore }) => {
+		const origin = socket();
+		const baseline = store.documentMaterialisations.nonRoot;
+		for (let index = 0; index < 5; index++) update(origin, textUpdate(seed, (text) => text.insert(0, String(index))));
+		assert.equal(store.documentMaterialisations.nonRoot, baseline, "appends never materialise");
+		const catalog = store.getCatalogHeadAt(store.currentSequence(), BODY)!;
+		// Simulate a refused backfill (the head catalog event moved): the cache still serves repeats.
+		const original = relayStore.backfillCatalogHash.bind(relayStore);
+		relayStore.backfillCatalogHash = () => false;
+		assert.equal(relay.bodyHttpState(BODY)!.hashState, "materialised");
+		assert.equal(relay.bodyHttpState(BODY)!.hashState, "known");
+		assert.equal(relay.bodyHttpState(BODY)!.contentHash, contentHashOf("43210hello").hash);
+		assert.equal(relay.counters.lazyHashCacheHits, 2);
+		assert.equal(store.documentMaterialisations.nonRoot, baseline + 1, "one materialisation for repeated GETs");
+		relayStore.backfillCatalogHash = original;
+		assert.equal(catalog.contentHash, null);
+	});
 });
 
 await s.done();

@@ -101,7 +101,7 @@ export function readRelayConfig(env: RelayFlagEnv | null | undefined): RelayConf
 	const source: RelayFlagEnv = { ...(testProcessEnv() as RelayFlagEnv | undefined ?? {}), ...(env ?? {}) };
 	// Ambient process env only fills knobs in tests; the flag itself never comes from it.
 	return {
-		microbatchMs: positiveInt(source.YAOS_RELAY_MICROBATCH_MS, DEFAULT_RELAY_CONFIG.microbatchMs, 0, 50),
+		microbatchMs: positiveInt(source.YAOS_RELAY_MICROBATCH_MS, DEFAULT_RELAY_CONFIG.microbatchMs, 0, 250),
 		maxBodySockets: positiveInt(source.YAOS_RELAY_MAX_BODY_SOCKETS, DEFAULT_RELAY_CONFIG.maxBodySockets, 1, 32_000),
 		rateBytesPerSec: positiveInt(source.YAOS_RELAY_RATE_BYTES_PER_SEC, DEFAULT_RELAY_CONFIG.rateBytesPerSec, 1, 1 << 30),
 		burstBytes: Math.max(RELAY_MIN_BURST_BYTES,

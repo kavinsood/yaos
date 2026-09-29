@@ -1,7 +1,7 @@
 import type { YwasmCrdtDocument } from "./crdt/ywasmCrdtEngine";
 import { ywasmCrdtEngine as crdtEngine } from "@yaos/crdt-engine";
 import { encodeBinaryEnvelope, YAOS_BINARY_CONTENT_TYPE } from "./shared/binaryEnvelope";
-import { BootstrapService } from "./bootstrap";
+import { BootstrapService, bootstrapBodyStatesForBatch } from "./bootstrap";
 import { MAX_BODY_ID_LENGTH, MAX_CATCH_UP_BODIES, MAX_CATCH_UP_BYTES, MAX_DURABLE_UPDATE_BYTES, MAX_JSON_BYTES } from "./contracts";
 import { sha256Hex } from "./hex";
 import { BoundedBodyError, readBoundedBytes } from "./readBoundedBytes";
@@ -409,6 +409,7 @@ export class VaultRuntime implements DrainPort {
 					return json({ error: "invalid_device_identity" }, 400);
 				}
 				this.store.revokeDevice(body.deviceId);
+				this.relayStore?.releaseLeasesFor({ deviceIds: [body.deviceId] });
 				return json({ closed: this.sockets.closeDevice(body.deviceId) });
 			}
 			if (request.method === "POST" && url.pathname === "/__yaos/begin-vault-deletion") return this.beginDeletion(request);
@@ -649,6 +650,14 @@ export class VaultRuntime implements DrainPort {
 			for (const subject of subjects) {
 				if ("deviceId" in subject) this.sockets.closeDevice(subject.deviceId);
 			}
+			// Relay v2 (G19): any authority change to a device or principal releases its
+			// compaction leases (the reset install re-checks authority regardless).
+			if (this.relay) {
+				this.relayStore?.releaseLeasesFor({
+					deviceIds: subjects.flatMap((subject) => "deviceId" in subject ? [subject.deviceId] : []),
+					principalIds: principalIds,
+				});
+			}
 			for (const principalId of principalIds) this.sockets.closePrincipal(principalId);
 			return json({ ...receipt, runtimeEpoch: this.runtimeEpoch });
 		} catch (error) {
@@ -729,20 +738,19 @@ export class VaultRuntime implements DrainPort {
 
 	async alarm(): Promise<void> {
 		for (const documentId of Object.keys(this.cache.diagnostics().pending)) await this.flushDocument(documentId);
+		// Relay v2: relay bodies are checkpointed only by the relay pass (byte merge,
+		// merge budget, feed floor advance: G1/G20); the base loop skips them so an
+		// over-budget body neither materialises nor re-arms the alarm forever.
+		const baseMaintained = (documentId: string) => !this.relay || !this.isRelayBody(documentId);
 		if (this.relay) {
 			this.relayCheckpointAlarmArmed = false;
 			let relayRetry = false;
-			for (const documentId of this.store.listJournalCheckpointCandidates(
-				this.relay.config.checkpointEntries, this.relay.config.checkpointBytes, 25,
-			)) {
-				if (!this.isRelayBody(documentId) || this.cache.get(documentId)?.dirty) continue;
-				try {
-					const written = this.relay.checkpointBody(documentId);
-					if (written?.partial || this.relay.needsCheckpoint(documentId)) relayRetry = true;
-				} catch (error) {
-					relayRetry = true;
-					console.warn("[yaos-relay] checkpoint failed", error);
-				}
+			try {
+				relayRetry = this.relay.runCheckpointPass({ retainSequences: FEED_RETAIN_SEQUENCES,
+					skip: (documentId) => !this.isRelayBody(documentId) || this.cache.get(documentId)?.dirty === true }).retry;
+			} catch (error) {
+				relayRetry = true;
+				console.warn("[yaos-relay] checkpoint pass failed", error);
 			}
 			try { this.store.pruneCandidateReceipts(Date.now()); }
 			catch (error) { console.warn("[yaos-relay] receipt pruning failed", error); }
@@ -750,7 +758,7 @@ export class VaultRuntime implements DrainPort {
 		}
 		for (const documentId of this.store.listJournalCheckpointCandidates(
 			JOURNAL_COMPACT_ENTRIES, JOURNAL_COMPACT_BYTES, 25,
-		)) this.maintain(documentId);
+		)) if (baseMaintained(documentId)) this.maintain(documentId);
 		for (const documentId of this.semanticCompaction.dueRetries(Date.now(), 25)) {
 			let enteredAttempt = false;
 			try {
@@ -776,8 +784,8 @@ export class VaultRuntime implements DrainPort {
 		}
 		const compactionRetryAt = this.semanticCompaction.nextRetryAt();
 		const checkpointRetry = this.store.listJournalCheckpointCandidates(
-			JOURNAL_COMPACT_ENTRIES, JOURNAL_COMPACT_BYTES, 1,
-		).length > 0;
+			JOURNAL_COMPACT_ENTRIES, JOURNAL_COMPACT_BYTES, this.relay ? 25 : 1,
+		).some(baseMaintained);
 		if (checkpointRetry) await this.armAlarmEarliest(Date.now() + PERSIST_RETRY_MS);
 		if (compactionRetryAt !== null) {
 			await this.armAlarmEarliest(Math.max(Date.now(), compactionRetryAt));
@@ -1014,21 +1022,20 @@ export class VaultRuntime implements DrainPort {
 			if (new Set(bodyIds).size !== bodyIds.length) return json({ error: "duplicate_body_id" }, 400);
 			const releases: Array<() => void> = [];
 			try {
-				let bodies;
-				try { bodies = bodyIds.map((bodyId) => {
-					const state = this.bootstrap.bodyState(bootstrapId, bodyId);
-					const release = this.cache.reserveFullStateOperation(bodyId, 1, state.encodedState.byteLength);
-					releases.push(release);
-					return {
-						bodyId,
-						bodyEpoch: state.bodyEpoch,
-						generation: state.generation,
-						encodedState: state.encodedState,
-					};
-				}); } catch (error) {
-					if (!(error instanceof RelayMergeBudgetError)) throw error;
-					return json({ error: "relay_merge_budget_exceeded", bodyId: error.documentId }, 413);
+				// Relay v2 (G20): an over-budget body flags itself instead of aborting at
+				// the first one: the 413 lists every such body (`overBudgetBodyIds`), so a
+				// relay-aware client drops them and retries, and an unmodified client's
+				// 413 bisection still fetches the rest (it fails only on the flagged body).
+				const batch = bootstrapBodyStatesForBatch(this.bootstrap, bootstrapId, bodyIds);
+				const overBudgetBodyIds = batch.overBudgetBodyIds;
+				if (overBudgetBodyIds.length > 0) {
+					return json({ error: "relay_merge_budget_exceeded", bodyId: overBudgetBodyIds[0], overBudgetBodyIds }, 413);
 				}
+				const bodies = batch.bodies.map((state) => {
+					releases.push(this.cache.reserveFullStateOperation(state.bodyId, 1, state.encodedState.byteLength));
+					return { bodyId: state.bodyId, bodyEpoch: state.bodyEpoch, generation: state.generation,
+						encodedState: state.encodedState };
+				});
 				let response: Uint8Array;
 				try { response = encodeBinaryEnvelope({ bodies }, MAX_CATCH_UP_BYTES); }
 				catch { return json({ error: "bootstrap_response_too_large" }, 413); }
