@@ -1108,7 +1108,7 @@ export class ControlPlaneRuntime {
 		if (!device || device.principalId || vault?.state !== "active" || (body.vaultId !== undefined && device.vaultId !== body.vaultId)) {
 			return json({ error: "unauthorized" }, 401);
 		}
-		return json({ ok: true, device: toDevicePublic(device) });
+		return json({ ok: true, device: toDevicePublic(device), actor: null });
 	}
 
 	private async handleCreateSession(request: Request): Promise<Response> {

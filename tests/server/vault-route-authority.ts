@@ -28,8 +28,187 @@ import {
 	bodyUpdateAdmissionError,
 } from "../../server/src/vaultSocketService";
 import { suite } from "../harness.ts";
+import { classifyWorkerRoute, handleWorkerRequest } from "../../server/src/index";
+import { hashSecret } from "../../server/src/identity";
+import { invalidateStoredServerConfigCache, rejectUnauthorizedVaultRequest } from "../../server/src/routes/auth";
+import { withVaultRequestAuthorization } from "../../server/src/routes/vaultRequestAuthorization";
+import type { AuthState } from "../../server/src/routes/types";
+import { makeConfigNamespace, makeEnv, makeVaultSyncNamespace } from "../mocks/workerEnv.ts";
+import { capabilityDigestForRole, COLLABORATION_POLICY_VERSION } from "../../server/src/collaboration";
 
 const s = suite("vault-route-authority");
+
+const httpAuthorityRoutes: Array<{ method: string; path: string; before: number; reads: number }> = [
+	{ method: "POST", path: "auth/pairing-code", before: 2, reads: 0 },
+	{ method: "POST", path: "auth/device", before: 2, reads: 0 },
+	{ method: "DELETE", path: "auth/device", before: 3, reads: 0 },
+	{ method: "GET", path: "devices", before: 3, reads: 0 },
+	...["GET blobs/hash", "PUT blobs/hash", "POST blobs/exists"].map((route) => {
+		const [method, path] = route.split(" ") as [string, string];
+		return { method, path, before: 2, reads: 1 };
+	}),
+	...[
+		"POST recovery/captures", "POST recovery/restores", "POST recovery/retention", "POST recovery/gc",
+		"GET recovery/snapshots", "GET recovery/status", "GET recovery/captures/id", "DELETE recovery/captures/id",
+		"GET recovery/snapshots/id", "DELETE recovery/snapshots/id", "GET recovery/restores/id", "DELETE recovery/restores/id",
+		"GET recovery/snapshots/id/entry", "GET recovery/snapshots/id/file", "GET recovery/restores/id/items",
+		"POST recovery/restores/id/results", "GET recovery/snapshots/id/deleted/body",
+		"GET recovery/snapshots/id/deleted/body/file", "GET recovery/restores/id/items/item/content",
+	].map((route) => {
+		const [method, path] = route.split(" ") as [string, string];
+		return { method, path, before: 2, reads: 0 };
+	}),
+	...[
+		"GET root", "GET changes", "GET heads", "GET status", "GET health", "GET diagnostics", "GET debug/recent",
+		"GET body/id", "GET head/id", "POST body/id/candidate", "POST body/candidates", "POST lifecycle",
+		"POST lifecycle/admissions", "POST lifecycle/batch", "POST lifecycle/publish", "POST attachments/publish", "POST catch-up",
+		"POST semantic/id/candidate", "POST semantic/lifecycle", "POST semantic/authority/promote", "POST semantic/authority/demote",
+		"GET semantic/id/head", "GET semantic/id/state", "GET operations/id/outcome",
+		"GET settings-sync/.obsidian", "PUT settings-sync/.obsidian/seed", "PUT settings-sync/.obsidian/replace",
+		"PUT settings-sync/.obsidian/file", "PUT settings-sync/.obsidian/intent", "PUT settings-sync/.obsidian/tombstone",
+		"PUT settings-sync/.obsidian/plugin-data", "DELETE settings-sync/.obsidian/file",
+		"POST bootstrap/start", "GET bootstrap/id/root", "GET bootstrap/id/catalog", "GET bootstrap/id/semantic-catalog",
+		"POST bootstrap/id/bodies", "POST bootstrap/id/renew", "POST bootstrap/id/complete", "GET bootstrap/id/body/body",
+		"GET bootstrap/id/semantic/canvas", "GET ws/root", "GET ws/body/body", "GET ws/semantic/canvas",
+	].map((route) => {
+		const [method, path] = route.split(" ") as [string, string];
+		return { method, path, before: 2, reads: 1 };
+	}),
+];
+
+const httpVaultId = "vault-http-authority-0001";
+const httpToken = "http-authority-device-token";
+const beforeR1 = process.env.YAOS_R1_BEFORE === "1";
+
+async function httpAuthorityFixture(reason = "valid", legacy = false) {
+	invalidateStoredServerConfigCache();
+	const tokenHash = await hashSecret(httpToken);
+	const actor = {
+		vaultId: httpVaultId, vaultGeneration: "generation-http-authority-0001", principalId: "principal-http-authority-0001",
+		deviceId: "device-http-authority-0001", membershipRevision: 1, deviceCredentialRevision: 1,
+		role: "owner" as const, policyVersion: COLLABORATION_POLICY_VERSION, capabilityDigest: await capabilityDigestForRole("owner"),
+	};
+	const device = { deviceId: actor.deviceId, vaultId: httpVaultId, name: "HTTP authority laptop", enrolledAt: 1 };
+	const authorization = { device, principal: { principalId: actor.principalId, vaultId: httpVaultId },
+		membership: { principalId: actor.principalId, vaultId: httpVaultId, role: "owner", state: "active", revision: 1 },
+		actor: legacy ? null : actor };
+	const calls: string[] = [];
+	const forwarded: Request[] = [];
+	const env = makeEnv({
+		YAOS_CONFIG: makeConfigNamespace(async (request) => {
+			const url = new URL(request.url);
+			const path = url.pathname;
+			calls.push(path);
+			if (path === "/__yaos/config") return Response.json({ claimed: reason !== "unclaimed",
+				configFormat: reason === "unsupported" ? 999 : 3,
+				operatorRecoveryHash: "operator-authority-hash", ticketSigningKey: "ticket-authority-key" });
+			if (path === "/__yaos/authorize-device" || path === "/__yaos/collaboration/authorize"
+				|| path === "/__yaos/collaboration/authorize-outcome") {
+				const input = await request.json() as { tokenHash: string; vaultId: string };
+				if (input.tokenHash !== tokenHash || input.vaultId !== httpVaultId
+					|| !["valid", "unclaimed", "unsupported", "registry-unavailable", "registry-missing", "registry-deleting"].includes(reason)) {
+					return Response.json({ error: reason }, { status: 401 });
+				}
+				if (legacy && path !== "/__yaos/authorize-device") return Response.json({ error: "unauthorized" }, { status: 401 });
+				return Response.json(authorization);
+			}
+			if (path === "/__yaos/vault") {
+				if (reason === "registry-unavailable") return Response.json({ error: "unavailable" }, { status: 503 });
+				if (reason === "registry-missing") return Response.json({ error: "unknown_vault" }, { status: 404 });
+				return Response.json({ vault: { vaultId: httpVaultId, vaultGeneration: actor.vaultGeneration,
+					state: reason === "registry-deleting" ? "deleting" : "active" } });
+			}
+			return Response.json({ ok: true, devices: [], device });
+		}),
+		YAOS_SYNC: makeVaultSyncNamespace(async (request) => { forwarded.push(request); return Response.json({ ok: true }); }),
+	});
+	return { env, calls, forwarded, actor };
+}
+
+function httpAuthorityRequest(method: string, path: string, bearer = true): Request {
+	return new Request(`https://example.test/vault/${httpVaultId}/${path}`, {
+		method, headers: bearer ? { authorization: `Bearer ${httpToken}` } : {},
+		...(method === "POST" || method === "PUT" ? { body: "{}" } : {}),
+	});
+}
+
+function httpAuthorizationCalls(calls: string[]): number {
+	return calls.filter((path) => path === "/__yaos/authorize-device" || path === "/__yaos/collaboration/authorize"
+		|| path === "/__yaos/collaboration/authorize-outcome").length;
+}
+
+for (const route of httpAuthorityRoutes) {
+	s.test(`HTTP ${route.method} ${route.path}: rejection precedence and call budget`, async () => {
+		for (const reason of ["missing-bearer", "unauthorized-device", "revoked-device", "non-member", "wrong-vault", "deleted-vault", "unclaimed", "unsupported"]) {
+			const fixture = await httpAuthorityFixture(reason);
+			const request = httpAuthorityRequest(route.method, route.path, reason !== "missing-bearer");
+			assert.equal(classifyWorkerRoute(request).kind, "vault", `${route.path} is classified`);
+			const response = await handleWorkerRequest(request, fixture.env);
+			const local = reason === "unclaimed" || reason === "unsupported";
+			assert.equal(response.status, local ? 503 : 401, reason);
+			assert.deepEqual(await response.json(), { error: reason === "unsupported" ? "server_format_unsupported" : local ? reason : "unauthorized" }, reason);
+			assert.equal(httpAuthorizationCalls(fixture.calls), local || reason === "missing-bearer" ? 0 : 1, reason);
+			assert.equal(fixture.calls.includes("/__yaos/vault"), false, "registry errors cannot outrank initial auth rejection");
+			assert.equal(fixture.forwarded.length, 0, "rejection must not allocate a vault runtime");
+		}
+	});
+	s.test(`HTTP ${route.method} ${route.path}: admitted request authorizes once`, async () => {
+		const fixture = await httpAuthorityFixture();
+		await handleWorkerRequest(httpAuthorityRequest(route.method, route.path), fixture.env);
+		assert.equal(httpAuthorizationCalls(fixture.calls), beforeR1 ? route.before : 1);
+		assert.equal(fixture.calls.filter((path) => path === "/__yaos/vault").length, route.reads);
+		for (const request of fixture.forwarded) {
+			assert.equal(request.headers.get("authorization"), null);
+			assert.equal(request.headers.get("x-yaos-device-id"), fixture.actor.deviceId);
+			assert.equal(request.headers.get("x-yaos-principal-id"), fixture.actor.principalId);
+		}
+	});
+}
+
+s.test("legacy device acceptance preserves readVault-before-actor error ordering", async () => {
+	for (const legacy of [false, true]) {
+		for (const [reason, status, error] of [["registry-unavailable", 503, "vault_authority_unavailable"],
+			["registry-missing", 404, "unknown_vault"], ["registry-deleting", 409, "vault_deleting"]] as const) {
+			const fixture = await httpAuthorityFixture(reason, legacy);
+			const response = await handleWorkerRequest(httpAuthorityRequest("GET", "head/id"), fixture.env);
+			assert.equal(response.status, status);
+			assert.deepEqual(await response.json(), { error });
+			assert.equal(httpAuthorizationCalls(fixture.calls), 1);
+		}
+	}
+	const fixture = await httpAuthorityFixture("valid", true);
+	const response = await handleWorkerRequest(httpAuthorityRequest("GET", "head/id"), fixture.env);
+	assert.equal(response.status, 401);
+	assert.deepEqual(await response.json(), { error: "unauthorized" });
+	assert.equal(httpAuthorizationCalls(fixture.calls), beforeR1 ? 2 : 1);
+});
+
+s.test("local malformed claimed state remains server_misconfigured without any control-plane call", async () => {
+	const fixture = await httpAuthorityFixture();
+	const rejection = await rejectUnauthorizedVaultRequest(httpAuthorityRequest("GET", "head/id"), fixture.env,
+		{ mode: "claim", claimed: true, ticketSigningKey: "" } as AuthState, httpVaultId);
+	assert.equal(rejection?.response.status, 503);
+	assert.deepEqual(await rejection!.response.json(), { error: "server_misconfigured" });
+	assert.equal(fixture.calls.length, 0);
+});
+
+s.test("authorization reuse is scoped to one request, token, vault and singleton", async () => {
+	const fixture = await httpAuthorityFixture();
+	const scoped = withVaultRequestAuthorization(fixture.env, httpVaultId);
+	const tokenHash = await hashSecret(httpToken);
+	const call = (env: typeof scoped, path: string, vaultId = httpVaultId, hash = tokenHash, actorName = "global-config") => env.YAOS_CONFIG.call(actorName,
+		new Request(`https://internal${path}`, { method: "POST", headers: { "content-type": "application/json" },
+			body: JSON.stringify({ tokenHash: hash, vaultId }) }));
+	await (await call(scoped, "/__yaos/authorize-device")).json();
+	assert.equal((await (await call(scoped, "/__yaos/collaboration/authorize")).json() as { actor: unknown }).actor !== null, true);
+	await call(scoped, "/__yaos/collaboration/authorize-outcome");
+	assert.equal(httpAuthorizationCalls(fixture.calls), 1);
+	await call(scoped, "/__yaos/collaboration/authorize", "other-vault");
+	await call(scoped, "/__yaos/collaboration/authorize", httpVaultId, "other-token");
+	await call(scoped, "/__yaos/collaboration/authorize", httpVaultId, tokenHash, "other-singleton");
+	await call(withVaultRequestAuthorization(fixture.env, httpVaultId), "/__yaos/authorize-device");
+	assert.equal(httpAuthorizationCalls(fixture.calls), 5);
+});
 
 const attachment = {
 	vaultId: "vault-authority-0001",

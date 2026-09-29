@@ -62,6 +62,7 @@ import { decodeCanonicalVaultIdSegment } from "./vaultId";
 import { CloudflareActorCalls, CloudflareObjectStore, CloudflareSocketUpgrades } from "./cloudflarePorts";
 import { authorizeVaultAction } from "./collaboration";
 import { testOnlyDebugRoutesEnabled } from "./testOnlyTimers";
+import { withVaultRequestAuthorization } from "./routes/vaultRequestAuthorization";
 
 interface CloudflareWorkerEnvironment {
 	YAOS_SYNC: DurableObjectNamespace;
@@ -323,6 +324,7 @@ export async function handleWorkerRequest(request: Request, env: Env): Promise<R
 				else if (route.rest[0] === "leave") response = withCors(await handleVaultLeaveRoute(request, env, route.vaultId));
 				else if (route.rest[0] === "ownership" && route.rest[1] === "transfers") response = withCors(await handleOwnershipTransferRoute(request, env, route.vaultId, route.rest[2]));
 				else {
+				env = withVaultRequestAuthorization(env, route.vaultId);
 				const authFailure = await authorizedVaultControl(request, env, authState, route.vaultId);
 				if (authFailure) response = withCors(authFailure);
 				else if (route.rest[0] === "auth" && route.rest[1] === "pairing-code") response = withCors(await handleVaultPairingCodeRoute(request, env, route.vaultId));
