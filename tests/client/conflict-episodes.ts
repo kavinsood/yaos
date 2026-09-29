@@ -1,8 +1,10 @@
 import { strict as assert } from "node:assert";
 import { ConflictEpisodes, type ConflictEpisodeState } from "../../src/sync/conflictEpisodes";
+import { VaultIndexedDb } from "../../src/sync/vaultIndexedDb";
 import { canonicalMarkdownHash } from "../../server/src/shared/markdownCodec";
 import { MAX_CLIENT_MARKDOWN_BYTES } from "../../server/src/shared/durableLimits";
 import { suite } from "../harness.ts";
+import { FakeIndexedDb } from "../mocks/indexedDb";
 
 const tests = suite("conflict-episodes");
 
@@ -85,28 +87,105 @@ tests.test("G4: rollover retains every version, linking sibling parts to the fir
 	current.store.dispose();
 });
 
-tests.test("G4: an impossible oversized single version leaves an actionable durable error", async () => {
-	const current = fixture();
-	await assert.rejects(current.store.preserve({ ...input, disk: "x".repeat(MAX_CLIENT_MARKDOWN_BYTES) }), /size limit/);
+tests.test("G4: an impossible oversized single version leaves disk untouched and an actionable durable error", async () => {
+	const disk = "x".repeat(MAX_CLIENT_MARKDOWN_BYTES);
+	const current = fixture(undefined, new Map([[input.path, disk], ["Unrelated.md", "unrelated content"]]));
+	await current.store.preserve(input);
+	const previousDiskHash = current.store.get(input.bodyId)!.latestDiskHash!;
+	const previousFiles = new Map(current.files);
+	await assert.rejects(current.store.preserve({ ...input, disk }), /size limit/);
 	assert.ok(current.saved().episodes[input.bodyId]!.error?.includes("keep the original file"));
-	for (const content of current.files.values()) assert.ok(new TextEncoder().encode(content).length <= MAX_CLIENT_MARKDOWN_BYTES);
+	assert.deepEqual(current.files, previousFiles);
+	assert.equal(current.store.get(input.bodyId)!.latestDiskHash, previousDiskHash);
+	assert.equal(await current.store.readVersion(input.bodyId, previousDiskHash), input.disk);
+	for (const path of current.store.get(input.bodyId)!.parts) assert.ok(new TextEncoder().encode(current.files.get(path)!).length <= MAX_CLIENT_MARKDOWN_BYTES);
 	current.store.dispose();
 });
 
-tests.test("G3: resolution/deletion keeps artifacts; a later conflict starts a new episode", async () => {
+tests.test("G3: explicit resolution retains the old artifact; a later same-body conflict gets a new ID and artifact", async () => {
 	const current = fixture();
 	await current.store.preserve(input);
 	const previousId = current.store.get(input.bodyId)!.id;
 	const previousPath = current.store.get(input.bodyId)!.parts[0]!;
+	const previousContent = current.files.get(previousPath)!;
+	const previousArtifactHash = current.saved().artifacts[previousPath]!;
 	assert.equal(await current.store.isArtifact(previousPath, current.files.get(previousPath)!), true);
 	assert.equal(await current.store.isArtifact(previousPath, "user replaced the artifact"), false);
 	await current.store.close(input.bodyId);
 	assert.equal(current.store.list().length, 0);
-	assert.ok(current.files.has(previousPath));
+	assert.equal(current.store.get(input.bodyId), undefined);
+	assert.equal(current.saved().episodes[input.bodyId], undefined);
+	assert.equal(current.files.get(previousPath), previousContent);
 	await current.store.preserve(input);
-	assert.notEqual(current.store.get(input.bodyId)!.id, previousId);
+	const next = current.store.get(input.bodyId)!;
+	assert.equal(next.bodyId, input.bodyId);
+	assert.notEqual(next.id, previousId);
+	assert.notEqual(next.parts[0], previousPath);
+	assert.equal(current.files.get(previousPath), previousContent);
+	assert.equal(current.saved().artifacts[previousPath], previousArtifactHash);
+	assert.equal(await current.store.isArtifact(previousPath, previousContent), true);
+	assert.equal(await current.store.isArtifact(next.parts[0]!, current.files.get(next.parts[0]!)!), true);
+	for (const text of [input.base, input.disk, input.body]) {
+		assert.equal(await current.store.readVersion(input.bodyId, await canonicalMarkdownHash(text)), text);
+	}
 	assert.equal(current.files.size, 2);
 	current.store.dispose();
+});
+
+tests.test("G3: body deletion closes the pending episode while every artifact retains its content after restart", async () => {
+	const current = fixture(undefined, new Map([[input.path, input.disk]]));
+	await current.store.preserve(input);
+	await current.store.preserve({ ...input, disk: "deleted note input".repeat(100_000) });
+	const episode = structuredClone(current.store.get(input.bodyId)!);
+	assert.equal(episode.parts.length, 2);
+	const artifacts = new Map(episode.parts.map((path) => [path, current.files.get(path)!]));
+	const artifactHashes = current.saved().artifacts;
+	current.files.delete(input.path);
+	await current.store.close(input.bodyId);
+	assert.equal(current.store.get(input.bodyId), undefined);
+	assert.deepEqual(current.saved().episodes, {});
+	assert.deepEqual(current.saved().artifacts, artifactHashes);
+	assert.deepEqual(current.files, artifacts);
+	current.store.dispose();
+	const restarted = fixture(current.saved(), current.files);
+	assert.deepEqual(restarted.store.list(), []);
+	for (const [path, content] of artifacts) assert.equal(await restarted.store.isArtifact(path, content), true);
+	for (const version of episode.versions) {
+		const content = restarted.files.get(version.part)!;
+		assert.equal(await canonicalMarkdownHash(content.slice(version.offset, version.offset + version.length)), version.hash);
+	}
+	restarted.store.dispose();
+});
+
+tests.test("G3: pending episodes recover from independent plugin persistence after IndexedDB loss", async () => {
+	const cached = new VaultIndexedDb("conflict-vault", "generation-1", "folder-1", new FakeIndexedDb());
+	await cached.putRecoveryState({ activeCaptureId: "cached-marker" });
+	assert.deepEqual(await cached.getRecoveryState(), { activeCaptureId: "cached-marker" });
+	const first = fixture(undefined, new Map([[input.path, input.disk]]));
+	await first.store.preserve(input);
+	const episode = structuredClone(first.store.get(input.bodyId)!);
+	const pluginPersistStore = JSON.stringify({ _conflictEpisodes: first.saved() });
+	const previousFiles = new Map(first.files);
+	first.store.dispose();
+	await cached.close();
+	const emptyCache = new VaultIndexedDb("conflict-vault", "generation-1", "folder-1", new FakeIndexedDb());
+	assert.equal(await emptyCache.getRecoveryState(), null);
+	const persisted = JSON.parse(pluginPersistStore) as { _conflictEpisodes: ConflictEpisodeState };
+	const restarted = fixture(persisted._conflictEpisodes, first.files);
+	assert.deepEqual(restarted.store.get(input.bodyId), episode);
+	assert.equal(restarted.store.list().length, 1);
+	assert.deepEqual(restarted.files, previousFiles);
+	for (const text of [input.base, input.disk, input.body]) {
+		assert.equal(await restarted.store.readVersion(input.bodyId, await canonicalMarkdownHash(text)), text);
+	}
+	for (const path of episode.parts) assert.equal(await restarted.store.isArtifact(path, restarted.files.get(path)!), true);
+	await restarted.store.preserve({ ...input, disk: "disk edit after cache loss" });
+	assert.equal(restarted.store.get(input.bodyId)!.id, episode.id);
+	assert.deepEqual(restarted.store.get(input.bodyId)!.parts, episode.parts);
+	assert.equal(await restarted.store.readVersion(input.bodyId, episode.latestDiskHash!), input.disk);
+	assert.equal(await restarted.store.readVersion(input.bodyId, await canonicalMarkdownHash("disk edit after cache loss")), "disk edit after cache loss");
+	restarted.store.dispose();
+	await emptyCache.close();
 });
 
 tests.test("G1/G5: a startup burst emits one notice, never another for autosaves or remote edits", async () => {
