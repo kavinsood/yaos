@@ -35,7 +35,7 @@ import { canonicalJsonHash } from "./recoveryCanonicalJson";
 import type { VaultAuthoritySubjectChange } from "./vaultDocumentStore";
 import { SemanticCompactionRuntime } from "./semanticCompactionRuntime";
 import { BODY_EPOCH_HEADER, ROOT_EPOCH_HEADER, parseSemanticEpoch, parseSemanticEpochHeader } from "./shared/semanticEpoch";
-import { SOCKET_CLIENT_CAPABILITIES_PARAM, parseSocketClientCapabilities } from "./shared/socketLiveness";
+import { SOCKET_CLIENT_CAPABILITIES_PARAM, SOCKET_LIVENESS_AUTO_RESPONSE_REQUEST, SOCKET_LIVENESS_AUTO_RESPONSE_RESPONSE, parseSocketClientCapabilities } from "./shared/socketLiveness";
 import { readFallbackSocketAuthority, readVaultAdmissionState, rejectSocketAuthority } from "./vaultSocketAuthorization";
 
 // Production PERSIST_DEBOUNCE_MS (250 ms) lives in testOnlyTimers.ts so the
@@ -1425,6 +1425,10 @@ export class VaultSyncServer implements DurableObject {
 	private restarting: Promise<void> | null = null;
 
 	constructor(private readonly state: DurableObjectState, private readonly env: CloudflareVaultEnvironment) {
+		state.setWebSocketAutoResponse(new WebSocketRequestResponsePair(
+			SOCKET_LIVENESS_AUTO_RESPONSE_REQUEST,
+			SOCKET_LIVENESS_AUTO_RESPONSE_RESPONSE,
+		));
 		this.runtime = this.createRuntime(state, env);
 	}
 

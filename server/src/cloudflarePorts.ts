@@ -12,6 +12,7 @@ import type {
 } from "./platformPorts";
 import { createCloudflareVerifiedObjectStream } from "./cloudflareVerifiedObjectStream";
 import type { VaultSocketPort, VaultSocketRegistryPort } from "./vaultSocketService";
+import { SOCKET_LIVENESS_AUTO_RESPONSE_REQUEST, SOCKET_LIVENESS_AUTO_RESPONSE_RESPONSE } from "./shared/socketLiveness";
 
 function metadata(object: R2Object): ObjectMetadata {
 	return {
@@ -110,6 +111,20 @@ export class CloudflareExecutionPort implements ExecutionPort {
 
 export class CloudflareSocketRegistry implements VaultSocketRegistryPort {
 	constructor(private readonly state: DurableObjectState) {}
+
+	supportsAutoResponse(): boolean {
+		const pair = this.state.getWebSocketAutoResponse() as (WebSocketRequestResponsePair & {
+			getRequest?: () => string;
+			getResponse?: () => string;
+		}) | null;
+		return pair !== null
+			&& (pair.getRequest?.() ?? pair.request) === SOCKET_LIVENESS_AUTO_RESPONSE_REQUEST
+			&& (pair.getResponse?.() ?? pair.response) === SOCKET_LIVENESS_AUTO_RESPONSE_RESPONSE;
+	}
+
+	getAutoResponseTimestamp(socket: VaultSocketPort): number | null {
+		return this.state.getWebSocketAutoResponseTimestamp(socket as WebSocket)?.getTime() ?? null;
+	}
 
 	sockets(): readonly VaultSocketPort[] {
 		return this.state.getWebSockets();
