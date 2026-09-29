@@ -1,0 +1,5 @@
+{
+	// Typecheck the reset spike: npx tsc -noEmit -p scripts/relay2/reset/tsconfig.json
+	"extends": "../../../tsconfig.tests.json",
+	"include": ["./*.ts", "../../../tests/client/relay2-reset*.ts"]
+}
