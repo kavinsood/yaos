@@ -1,0 +1,19 @@
+scripts/relay2/k3/bench.ts
+  s_9ad601cc7abbf7::t_8d3d6c41b2f6c5 1-407
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "5771b31df6eb2799c1f1488bceefeab59270b123",
+  "prompts": {},
+  "sessions": {
+    "s_9ad601cc7abbf7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a0c3f851a1219b01f",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
