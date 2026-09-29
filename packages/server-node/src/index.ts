@@ -79,8 +79,8 @@ class NodeExecution implements ExecutionPort {
 class ConfigActor implements RuntimeActor {
 	private readonly runtime;
 
-	constructor(databases: NodeDatabaseSet, name: string) {
-		this.runtime = new ControlPlaneRuntime(databases.controlPlane(`config:${name}`));
+	constructor(databases: NodeDatabaseSet, name: string, vaults: ActorCallPort) {
+		this.runtime = new ControlPlaneRuntime(databases.controlPlane(`config:${name}`), undefined, vaults);
 	}
 
 	fetch(request: Request): Promise<Response> {
@@ -246,7 +246,7 @@ export async function runNodeServer(options: NodeServerOptions): Promise<void> {
 		let alarms: DurableAlarmScheduler;
 
 		const actorFactory: ActorFactory = (kind, name) => {
-			if (kind === "config") return new ConfigActor(databases, name);
+			if (kind === "config") return new ConfigActor(databases, name, vaultCalls);
 			if (kind === "recovery-job") {
 				return new RecoveryActor(
 					databases.job(name),

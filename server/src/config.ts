@@ -25,7 +25,8 @@ import {
 	uniqueDeviceName,
 } from "./identity";
 import { json } from "./routes/http";
-import type { ControlPlaneStoragePort, ControlPlaneTransactionPort } from "./platformPorts";
+import type { ActorCallPort, ControlPlaneStoragePort, ControlPlaneTransactionPort } from "./platformPorts";
+import { CloudflareActorCalls } from "./cloudflarePorts";
 import { SqlControlPlaneStorage, type ControlPlaneSqlHost } from "./controlPlaneSql";
 import {
 	CollaborationControlPlane,
@@ -413,6 +414,7 @@ export class ControlPlaneRuntime {
 		private readonly storage: ControlPlaneStoragePort,
 		/** Test-only override of DEVICE_LAST_SEEN_RESOLUTION_MS (testOnlyTimers.ts). */
 		private readonly deviceLastSeenResolutionMs: number = DEVICE_LAST_SEEN_RESOLUTION_MS,
+		private readonly vaults?: ActorCallPort,
 	) {
 		this.collaboration = new CollaborationControlPlane(storage);
 	}
@@ -1563,8 +1565,9 @@ export class ControlPlaneRuntime {
 			return json({ error: "destroy_confirmation_required" }, 409);
 		}
 		const vaultId = body.vaultId.trim();
-		return this.storage.transaction(async (txn) => {
-			if (txn.records) return this.handleIndexedDestroyVault(txn, vaultId, body.governanceRequestId!);
+		let preparedRecord: PendingDestroyRecord | null = null;
+		const transition = (prepare: boolean) => this.storage.transaction(async (txn) => {
+			if (txn.records) return this.handleIndexedDestroyVault(txn, vaultId, body.governanceRequestId!, prepare, preparedRecord);
 			const vaults = parseVaultRecords(await txn.get(VAULTS_KEY));
 			const vaultIds = new Set(vaults.map((vault) => vault.vaultId));
 			const nonDeletingVaultIds = new Set(
@@ -1586,13 +1589,15 @@ export class ControlPlaneRuntime {
 			}
 			if (pending) return json({ ok: true, pending });
 
-			const vault = vaults.find((record) => record.vaultId === vaultId);
-			if (!vault) return json({ error: "unknown_vault" }, 404);
+		const vault = vaults.find((record) => record.vaultId === vaultId);
+		if (!vault) return json({ error: "unknown_vault" }, 404);
+		if (governance.vaultGeneration !== vault.vaultGeneration) return json({ error: "authority_superseded" }, 409);
+			if (preparedRecord && preparedRecord.vaultGeneration !== vault.vaultGeneration) return json({ error: "authority_superseded" }, 409);
 			if (pendingDestroys.length >= MAX_PENDING_DESTROYS) {
 				return json({ error: "pending_destroy_capacity" }, 503);
 			}
 
-			const deletionId = randomBase64Url(16);
+			const deletionId = body.governanceRequestId!;
 			const record: PendingDestroyRecord = {
 				vaultId,
 				vaultGeneration: vault.vaultGeneration,
@@ -1608,6 +1613,7 @@ export class ControlPlaneRuntime {
 				deletedBytes: 0,
 				lastError: null,
 			};
+			if (prepare) return json({ ok: true, pending: record });
 			vault.state = "deleting";
 			governance.state = "executing";
 			governance.lastError = null;
@@ -1628,12 +1634,34 @@ export class ControlPlaneRuntime {
 			await txn.put("vaultGovernanceRequests", governanceRequests);
 			return json({ ok: true, pending: record });
 		});
+		const prepared = await transition(true);
+		if (!prepared.ok) return prepared;
+		const payload = await prepared.json<{ pending: PendingDestroyRecord }>();
+		preparedRecord = payload.pending;
+		if (!this.vaults) return json({ error: "vault_deletion_fence_unavailable" }, 503);
+		try {
+			const fenced = await this.vaults.call(vaultId, new Request("https://internal/__yaos/fence-vault-admission", {
+				method: "POST", headers: { "content-type": "application/json", "x-yaos-vault-id": vaultId,
+					"x-yaos-vault-generation": preparedRecord.vaultGeneration },
+				body: JSON.stringify({ vaultGeneration: preparedRecord.vaultGeneration, deletionId: preparedRecord.deletionId }),
+			}));
+			const receipt = await fenced.json().catch(() => null) as { vaultId?: string; vaultGeneration?: string; deletionId?: string; fenced?: boolean } | null;
+			if (!fenced.ok || receipt?.fenced !== true || receipt.vaultId !== vaultId
+				|| receipt.vaultGeneration !== preparedRecord.vaultGeneration || receipt.deletionId !== preparedRecord.deletionId) {
+				return json({ error: "vault_deletion_fence_unavailable" }, 503);
+			}
+		} catch {
+			return json({ error: "vault_deletion_fence_unavailable" }, 503);
+		}
+		return transition(false);
 	}
 
 	private async handleIndexedDestroyVault(
 		txn: ControlPlaneTransactionPort,
 		vaultId: string,
 		governanceRequestId: string,
+		prepare: boolean,
+		preparedRecord: PendingDestroyRecord | null,
 	): Promise<Response> {
 		const records = txn.records!;
 		const governanceRaw = await records.get("vaultGovernanceRequests", { recordKey: governanceRequestId });
@@ -1650,16 +1678,19 @@ export class ControlPlaneRuntime {
 		const vaultRaw = await records.get<VaultRecord>(VAULTS_KEY, { recordKey: vaultId });
 		const vault = vaultRaw ? parseVaultRecords([vaultRaw])[0] : undefined;
 		if (!vault) return json({ error: "unknown_vault" }, 404);
+		if (governance.vaultGeneration !== vault.vaultGeneration) return json({ error: "authority_superseded" }, 409);
+		if (preparedRecord && preparedRecord.vaultGeneration !== vault.vaultGeneration) return json({ error: "authority_superseded" }, 409);
 		if (await records.count(PENDING_DESTROYS_KEY) >= MAX_PENDING_DESTROYS) {
 			return json({ error: "pending_destroy_capacity" }, 503);
 		}
 		const record: PendingDestroyRecord = {
-			vaultId, vaultGeneration: vault.vaultGeneration, deletionId: randomBase64Url(16),
+			vaultId, vaultGeneration: vault.vaultGeneration, deletionId: governanceRequestId,
 			purgeJobId: `purge:${vaultId}:${vault.vaultGeneration}`, requestedAt: Date.now(),
 			roomComplete: false, r2Complete: false, purgeState: "pending",
 			capabilityHash: null, capabilityExpiresAt: null, deletedObjects: 0,
 			deletedBytes: 0, lastError: null,
 		};
+		if (prepare) return json({ ok: true, pending: record });
 		vault.state = "deleting";
 		governance.state = "executing";
 		governance.lastError = null;
@@ -1982,11 +2013,11 @@ export class ControlPlaneRuntime {
 export class ServerConfig {
 	private readonly runtime: ControlPlaneRuntime;
 
-	constructor(state: DurableObjectState, env?: TestOnlyServerTimerEnv) {
+	constructor(state: DurableObjectState, env?: TestOnlyServerTimerEnv & { YAOS_SYNC?: DurableObjectNamespace }) {
 		this.runtime = new ControlPlaneRuntime(new SqlControlPlaneStorage(
 			state.storage as unknown as ControlPlaneSqlHost,
 			"global-config",
-		), readServerTimers(env).deviceLastSeenResolutionMs);
+		), readServerTimers(env).deviceLastSeenResolutionMs, env?.YAOS_SYNC ? new CloudflareActorCalls(env.YAOS_SYNC) : undefined);
 	}
 
 	fetch(request: Request): Promise<Response> {

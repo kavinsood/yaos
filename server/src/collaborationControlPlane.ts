@@ -467,6 +467,7 @@ export class CollaborationControlPlane {
 		switch (`${request.method} ${pathname}`) {
 			case "POST /__yaos/collaboration/authorize": return this.authorize(body);
 			case "POST /__yaos/collaboration/authorize-outcome": return this.authorizeOutcome(body);
+			case "POST /__yaos/collaboration/socket-authority": return this.verifyActor(body, true);
 			case "POST /__yaos/collaboration/verify-actor": return this.verifyActor(body);
 			case "POST /__yaos/collaboration/me": return this.me(body);
 			case "POST /__yaos/collaboration/members": return this.members(body);
@@ -550,7 +551,7 @@ export class CollaborationControlPlane {
 		});
 	}
 
-	private async verifyActor(body: Record<string, unknown>): Promise<Response> {
+	private async verifyActor(body: Record<string, unknown>, includeMirror = false): Promise<Response> {
 		if (!isId(body.vaultId) || !isId(body.principalId) || !isId(body.deviceId)) return json({ error: "unauthorized" }, 401);
 		return this.storage.transaction(async (txn) => {
 			const state = await readVaultState(txn, body.vaultId as string);
@@ -565,7 +566,26 @@ export class CollaborationControlPlane {
 			|| body.capabilityDigest !== await capabilityDigestForRole(resolved.membership.role)) {
 				return json({ error: "authority_superseded" }, 401);
 			}
-			return json({ ok: true, actor: await buildActorContext(vault.vaultGeneration, resolved.principal, resolved.membership, resolved.device) });
+			const actor = await buildActorContext(vault.vaultGeneration, resolved.principal, resolved.membership, resolved.device);
+			if (!includeMirror) return json({ ok: true, actor });
+			if (state.memberships.length + state.devices.length > 512
+				|| state.memberships.some((membership) => membership.state !== "active" && membership.state !== "revoked")
+				|| state.devices.some((device) => device.state !== "active" && device.state !== "revoked")) {
+				return json({ error: "authority_mirror_unavailable" }, 409);
+			}
+			const subjects = [
+				...await Promise.all(state.memberships.map(async (membership) => {
+					const principal = state.principals.find((entry) => entry.principalId === membership.principalId);
+					return { principalId: membership.principalId, role: membership.role, state: membership.state,
+						membershipRevision: membership.revision, policyVersion: COLLABORATION_POLICY_VERSION,
+						capabilityDigest: await capabilityDigestForRole(membership.role),
+						displayName: principal?.displayName ?? membership.principalId, colorSeed: principal?.colorSeed ?? membership.principalId };
+				})),
+				...state.devices.map((device) => ({ deviceId: device.deviceId, principalId: device.principalId,
+					state: device.state, credentialRevision: device.credentialRevision })),
+			];
+			return json({ actor, vaultId: actor.vaultId, vaultGeneration: actor.vaultGeneration,
+				changeId: `mirror:${actor.vaultGeneration}`, subjects, subjectDigest: await requestDigest(subjects) });
 		});
 	}
 

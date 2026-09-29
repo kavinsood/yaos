@@ -942,6 +942,16 @@ export abstract class VaultDocumentStore {
 				vault_generation TEXT NOT NULL,
 				begun_at INTEGER NOT NULL
 			);
+			CREATE TABLE IF NOT EXISTS vault_admission_fences (
+				vault_generation TEXT PRIMARY KEY,
+				vault_id TEXT NOT NULL,
+				deletion_id TEXT NOT NULL,
+				begun_at INTEGER NOT NULL
+			);
+			CREATE TABLE IF NOT EXISTS vault_admission_activations (
+				vault_generation TEXT PRIMARY KEY,
+				vault_id TEXT NOT NULL
+			);
 			CREATE TABLE IF NOT EXISTS vault_deletion_jobs (
 				job_id TEXT PRIMARY KEY,
 				kind TEXT NOT NULL
@@ -1043,9 +1053,52 @@ export abstract class VaultDocumentStore {
 		} : null;
 	}
 
+	hasAuthorityMirror(): boolean {
+		this.initialize();
+		return this.storage.sql.exec<{ present: number }>(`SELECT 1 AS present
+		 WHERE EXISTS (SELECT 1 FROM vault_authorization_change_receipts)
+		 OR EXISTS (SELECT 1 FROM vault_principal_authority)
+		 OR EXISTS (SELECT 1 FROM vault_device_authority)`).toArray().length > 0;
+	}
+
+	vaultAdmissionActive(vaultId: string, vaultGeneration: string): boolean {
+		this.initialize();
+		return this.storage.sql.exec<{ present: number }>(
+			"SELECT 1 AS present FROM vault_admission_activations WHERE vault_generation = ? AND vault_id = ?",
+			vaultGeneration, vaultId).toArray().length > 0;
+	}
+
+	activateVaultAdmission(vaultId: string, vaultGeneration: string): void {
+		const metadata = this.assertVaultGeneration(vaultGeneration);
+		if (metadata.vaultId !== vaultId || this.vaultAdmissionFence(vaultGeneration)) throw new Error("vault_admission_not_active");
+		this.storage.sql.exec("INSERT OR IGNORE INTO vault_admission_activations(vault_generation, vault_id) VALUES (?, ?)",
+			vaultGeneration, vaultId).toArray();
+	}
+
+	vaultAdmissionFence(vaultGeneration: string): { vaultId: string; vaultGeneration: string; deletionId: string } | null {
+		this.initialize();
+		const row = this.storage.sql.exec<{ vault_id: string; deletion_id: string }>(
+			"SELECT vault_id, deletion_id FROM vault_admission_fences WHERE vault_generation = ?", vaultGeneration).toArray()[0];
+		return row ? { vaultId: row.vault_id, vaultGeneration, deletionId: row.deletion_id } : null;
+	}
+
+	fenceVaultAdmission(vaultId: string, vaultGeneration: string, deletionId: string): void {
+		this.initialize();
+		const existing = this.vaultAdmissionFence(vaultGeneration);
+		if (existing && (existing.vaultId !== vaultId || existing.deletionId !== deletionId)) {
+			throw new Error("vault_deletion_identity_mismatch");
+		}
+		this.storage.sql.exec(`INSERT OR IGNORE INTO vault_admission_fences(
+		 vault_generation, vault_id, deletion_id, begun_at) VALUES (?, ?, ?, ?)`,
+			vaultGeneration, vaultId, deletionId, Date.now()).toArray();
+	}
+
 	validateActor(actor: VaultActorContext): "allowed" | "authority_superseded" {
 		const metadata = this.vaultMetadata();
-		if (!metadata || actor.vaultId !== metadata.vaultId || actor.vaultGeneration !== metadata.vaultGeneration) {
+		if (!metadata || actor.vaultId !== metadata.vaultId || actor.vaultGeneration !== metadata.vaultGeneration
+			|| this.vaultAdmissionFence(metadata.vaultGeneration) || this.isDeviceRevoked(actor.deviceId)
+			|| this.storage.sql.exec<{ present: number }>(
+				"SELECT 1 AS present FROM vault_deletion_authority WHERE vault_generation = ?", metadata.vaultGeneration).toArray().length > 0) {
 			return "authority_superseded";
 		}
 		const principal = this.principalAuthority(actor.principalId);

@@ -36,6 +36,7 @@ import type { VaultAuthoritySubjectChange } from "./vaultDocumentStore";
 import { SemanticCompactionRuntime } from "./semanticCompactionRuntime";
 import { BODY_EPOCH_HEADER, ROOT_EPOCH_HEADER, parseSemanticEpoch, parseSemanticEpochHeader } from "./shared/semanticEpoch";
 import { SOCKET_CLIENT_CAPABILITIES_PARAM, parseSocketClientCapabilities } from "./shared/socketLiveness";
+import { readFallbackSocketAuthority, readVaultAdmissionState, rejectSocketAuthority } from "./vaultSocketAuthorization";
 
 // Production PERSIST_DEBOUNCE_MS (250 ms) lives in testOnlyTimers.ts so the
 // test-only override can never drift from it.
@@ -320,14 +321,20 @@ export class VaultRuntime implements DrainPort {
 	}
 
 	async fetch(request: Request): Promise<Response> {
-		if (this.drainPromise) return json({ error: "vault_draining" }, 503);
+		const socketRequest = request.method === "GET" && request.headers.get("upgrade")?.toLowerCase() === "websocket";
+		if (this.drainPromise) return socketRequest ? rejectSocketAuthority("vault_draining") : json({ error: "vault_draining" }, 503);
 		const vaultId = request.headers.get("x-yaos-vault-id");
 		if (!isCanonicalVaultId(vaultId)) return json({ error: "invalid_vault_identity" }, 400);
 		const url = new URL(request.url);
 		const parts = pathParts(url.pathname);
 		if (!parts) return json({ error: "not_found" }, 404);
 		try {
-			if (request.method === "POST" && url.pathname === "/__yaos/provision") return await this.provision(vaultId, request);
+			if (request.method === "POST" && url.pathname === "/__yaos/provision") return this.runAuthorityBoundary(() => this.provision(vaultId, request));
+			if (request.method === "POST" && url.pathname === "/__yaos/fence-vault-admission") {
+				return this.runAuthorityBoundary(() => this.fenceDeletionAdmission(vaultId, request));
+			}
+			if (socketRequest) return this.runAuthorityBoundary(() => this.admitSocket(vaultId, request, url, parts))
+				.catch(() => rejectSocketAuthority("authority_unavailable"));
 			const metadata = this.store.vaultMetadata();
 			if (!metadata) return json({ error: "vault_not_provisioned" }, 409);
 			if (metadata.vaultId !== vaultId) return json({ error: "vault_identity_mismatch" }, 409);
@@ -362,12 +369,15 @@ export class VaultRuntime implements DrainPort {
 				if (typeof body.deviceId !== "string" || !body.deviceId || body.deviceId.length > 128) {
 					return json({ error: "invalid_device_identity" }, 400);
 				}
-				this.store.revokeDevice(body.deviceId);
-				return json({ closed: this.sockets.closeDevice(body.deviceId) });
+				const deviceId = body.deviceId;
+				return this.runAuthorityBoundary(async () => {
+					this.store.revokeDevice(deviceId);
+					return json({ closed: this.sockets.closeDevice(deviceId) });
+				});
 			}
-			if (request.method === "POST" && url.pathname === "/__yaos/begin-vault-deletion") return this.beginDeletion(request);
-			if (request.method === "POST" && url.pathname === "/__yaos/delete-all") return this.deleteAll();
-			if (this.store.vaultDeletionBegun(metadata.vaultGeneration)) return json({ error: "vault_deleting" }, 410);
+			if (request.method === "POST" && url.pathname === "/__yaos/begin-vault-deletion") return this.runAuthorityBoundary(() => this.beginDeletion(request));
+			if (request.method === "POST" && url.pathname === "/__yaos/delete-all") return this.runAuthorityBoundary(() => this.deleteAll());
+			if (this.store.vaultAdmissionFence(metadata.vaultGeneration) || this.store.vaultDeletionBegun(metadata.vaultGeneration)) return json({ error: "vault_deleting" }, 410);
 			const actor = parseVaultActor(request, metadata.vaultId, metadata.vaultGeneration);
 			if (parts[0] === "settings-sync") {
 				if (parts.length < 2 || parts.length > 3) return json({ error: "not_found" }, 404);
@@ -378,35 +388,6 @@ export class VaultRuntime implements DrainPort {
 			}
 			if (request.method === "POST" && url.pathname === "/compact") return this.compact();
 
-			if (request.method === "GET" && request.headers.get("upgrade")?.toLowerCase() === "websocket") {
-				const authorized = this.authorize(actor, "vault.content.read");
-				if (authorized instanceof Response) return authorized;
-				const acceptOptions = {
-					capabilities: parseSocketClientCapabilities(url.searchParams.get(SOCKET_CLIENT_CAPABILITIES_PARAM)),
-				};
-				if (url.pathname === "/ws/root") {
-					let rootEpoch;
-					try { rootEpoch = parseSemanticEpochHeader(request.headers, "root"); }
-					catch { return json({ error: "root_epoch_required" }, 400); }
-					return this.sockets.accept("root", "root", rootEpoch, authorized, acceptOptions);
-				}
-				if (parts.length === 3 && parts[0] === "ws" && parts[1] === "body") {
-					const bodyId = parts[2]!;
-					let bodyEpoch;
-					try { bodyEpoch = parseSemanticEpochHeader(request.headers, "body"); }
-					catch { return json({ error: "body_epoch_required" }, 400); }
-					if (!this.lifecycle.activeBodyHead(bodyId)) return json({ error: "body_not_active" }, 409);
-					return this.sockets.accept(bodyId, "body", bodyEpoch, authorized, acceptOptions);
-				}
-				if (parts.length === 3 && parts[0] === "ws" && parts[1] === "semantic") {
-					const documentId = parts[2]!;
-					let documentEpoch;
-					try { documentEpoch = parseSemanticEpochHeader(request.headers, "body"); }
-					catch { return json({ error: "body_epoch_required" }, 400); }
-					if (!this.semantic.activeHead(documentId)) return json({ error: "semantic_document_not_active" }, 409);
-					return this.sockets.accept(documentId, "semantic", documentEpoch, authorized, acceptOptions);
-				}
-			}
 			if (request.method === "POST" && parts.length === 3 && parts[0] === "body" && parts[2] === "candidate") {
 				const authorized = this.authorize(actor, "vault.content.write");
 				return authorized instanceof Response ? authorized : this.candidates.handle(parts[1]!, request, authorized);
@@ -507,6 +488,54 @@ export class VaultRuntime implements DrainPort {
 	private authorize(actor: VaultActorContext | null, capability: VaultCapability, targetPrincipalId?: string): VaultActorContext | Response {
 		const result = authorizeRuntimeActor(this.store, actor, capability, targetPrincipalId);
 		return result.allowed ? result.actor : result.response;
+	}
+
+	private async admitSocket(vaultId: string, request: Request, url: URL, parts: string[]): Promise<Response> {
+		if (this.drainPromise) return rejectSocketAuthority("vault_draining");
+		const metadata = this.store.vaultMetadata();
+		if (!metadata) return rejectSocketAuthority("vault_not_provisioned");
+		if (metadata.vaultId !== vaultId) return rejectSocketAuthority("vault_identity_mismatch");
+		if (request.headers.get(INTERNAL_GENERATION_HEADER) !== metadata.vaultGeneration) return rejectSocketAuthority("vault_generation_mismatch");
+		if (this.deleted || this.store.vaultAdmissionFence(metadata.vaultGeneration)
+			|| this.store.vaultDeletionBegun(metadata.vaultGeneration)) return rejectSocketAuthority("vault_deleting");
+		const actor = parseVaultActor(request, vaultId, metadata.vaultGeneration);
+		if (!actor) return rejectSocketAuthority("missing_trusted_actor");
+		if (actor.policyVersion !== COLLABORATION_POLICY_VERSION || this.store.isDeviceRevoked(actor.deviceId)) return rejectSocketAuthority("authority_superseded");
+		if (!this.store.hasAuthorityMirror()) {
+			const snapshot = await readFallbackSocketAuthority(this.options.controlPlane, actor);
+			if (!snapshot) return rejectSocketAuthority("authority_unavailable");
+			const installed = await this.installAuthorityFence(new Request("https://internal/__yaos/authority-fence", {
+				method: "POST", headers: { "content-type": "application/json" }, body: await snapshot.text(),
+			}));
+			if (!installed.ok) return rejectSocketAuthority("mirror_uninitialized");
+			if (this.store.validateActor(actor) !== "allowed") return rejectSocketAuthority("authority_superseded");
+			this.store.activateVaultAdmission(vaultId, metadata.vaultGeneration);
+		}
+		if (this.store.validateActor(actor) !== "allowed") return rejectSocketAuthority("authority_superseded");
+		if (!this.store.vaultAdmissionActive(vaultId, metadata.vaultGeneration)) {
+			const state = await readVaultAdmissionState(this.options.controlPlane, actor);
+			if (state !== "active") return rejectSocketAuthority(state === "inactive" ? "vault_deleting" : "authority_unavailable");
+			this.store.activateVaultAdmission(vaultId, metadata.vaultGeneration);
+		}
+		const authorized = this.authorize(actor, "vault.content.read");
+		if (authorized instanceof Response) return rejectSocketAuthority("authority_superseded");
+		const acceptOptions = { capabilities: parseSocketClientCapabilities(url.searchParams.get(SOCKET_CLIENT_CAPABILITIES_PARAM)) };
+		if (url.pathname === "/ws/root") {
+			let rootEpoch;
+			try { rootEpoch = parseSemanticEpochHeader(request.headers, "root"); }
+			catch { return json({ error: "root_epoch_required" }, 400); }
+			return this.sockets.accept("root", "root", rootEpoch, authorized, acceptOptions);
+		}
+		if (parts.length === 3 && parts[0] === "ws" && (parts[1] === "body" || parts[1] === "semantic")) {
+			const documentId = parts[2]!;
+			let documentEpoch;
+			try { documentEpoch = parseSemanticEpochHeader(request.headers, "body"); }
+			catch { return json({ error: "body_epoch_required" }, 400); }
+			if (parts[1] === "body" && !this.lifecycle.activeBodyHead(documentId)) return json({ error: "body_not_active" }, 409);
+			if (parts[1] === "semantic" && !this.semantic.activeHead(documentId)) return json({ error: "semantic_document_not_active" }, 409);
+			return this.sockets.accept(documentId, parts[1], documentEpoch, authorized, acceptOptions);
+		}
+		return json({ error: "not_found" }, 404);
 	}
 
 	private runAuthorityBoundary<T>(work: () => Promise<T>): Promise<T> {
@@ -700,6 +729,7 @@ export class VaultRuntime implements DrainPort {
 		let body: { vaultGeneration?: unknown };
 		try { body = await request.json(); } catch { return json({ error: "invalid_json" }, 400); }
 		if (!isCanonicalVaultId(body.vaultGeneration)) return json({ error: "invalid_vault_generation" }, 400);
+		if (this.store.vaultAdmissionFence(body.vaultGeneration)) return json({ error: "vault_deleting" }, 410);
 		const root = crdtEngine.createDocument("root");
 		crdtEngine.applyRootOperations(root, [
 			{ kind: "map-set", root: "sys", key: "schemaVersion", value: { shared: "value", value: SERVER_SCHEMA_VERSION } },
@@ -724,11 +754,28 @@ export class VaultRuntime implements DrainPort {
 			return json({ error: "invalid_vault_deletion_fence" }, 400);
 		}
 		await this.flushLoadedDocuments();
+		this.store.fenceVaultAdmission(metadata.vaultId, metadata.vaultGeneration, body.deletionId);
 		await this.recovery.beginVaultDeletion({ vaultId: metadata.vaultId, deletionId: body.deletionId });
 		return json({ deleting: true });
 	}
 
+	private async fenceDeletionAdmission(vaultId: string, request: Request): Promise<Response> {
+		let body: { deletionId?: unknown; vaultGeneration?: unknown };
+		try { body = await request.json(); } catch { return json({ error: "invalid_json" }, 400); }
+		if (!isCanonicalVaultId(body.vaultGeneration) || typeof body.deletionId !== "string"
+			|| !/^[A-Za-z0-9_-]{1,128}$/.test(body.deletionId)
+			|| request.headers.get(INTERNAL_GENERATION_HEADER) !== body.vaultGeneration) return json({ error: "invalid_vault_deletion_fence" }, 400);
+		const metadata = this.store.vaultMetadata();
+		if (metadata && (metadata.vaultId !== vaultId || metadata.vaultGeneration !== body.vaultGeneration)) return json({ error: "vault_generation_mismatch" }, 409);
+		await this.flushLoadedDocuments();
+		this.store.fenceVaultAdmission(vaultId, body.vaultGeneration, body.deletionId);
+		this.sockets.closeAll("vault deleting");
+		return json({ vaultId, vaultGeneration: body.vaultGeneration, deletionId: body.deletionId, fenced: true });
+	}
+
 	private async deleteAll(): Promise<Response> {
+		const metadata = this.store.vaultMetadata();
+		const fence = metadata ? this.store.vaultAdmissionFence(metadata.vaultGeneration) : null;
 		this.deleted = true;
 		this.sockets.closeAll("vault deleted");
 		await this.waitForFlushLanes();
@@ -737,6 +784,7 @@ export class VaultRuntime implements DrainPort {
 		await this.options.alarms.deleteAlarm();
 		await this.options.storage.deleteAll();
 		this.store = new VaultStore(this.options.storage);
+		if (fence) this.store.fenceVaultAdmission(fence.vaultId, fence.vaultGeneration, fence.deletionId);
 		this.store.setCommitObserver((observation) => this.afterDurableCommit(observation));
 		this.settings = new SettingsSyncStore(this.options.storage);
 		return json({ deleted: true });

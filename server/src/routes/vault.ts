@@ -11,7 +11,7 @@ import { BoundedBodyError, readBoundedBytes } from "../readBoundedBytes";
 import { SERVER_PROTOCOL_VERSION, SERVER_SCHEMA_VERSION } from "../version";
 import type { VaultRecord } from "../identity";
 import { inspectTicket } from "./ticket";
-import { authorizeDevice, configFetch, getHttpAuthToken } from "./auth";
+import { configFetch, getHttpAuthToken } from "./auth";
 import { authorizeVaultActor, authorizeVaultOutcomeActor } from "./auth";
 import type { VaultActorContext } from "../collaboration";
 import { actorHeaders, OUTCOME_CLAIM_HEADER, stripActorHeaders } from "../vaultAuthority";
@@ -51,7 +51,7 @@ function forwardedBodyLimit(request: Request, runtimePath: string): number | nul
 	return MAX_JSON_BYTES;
 }
 
-async function forward(env: Env, vault: VaultRecord, request: Request, runtimePath: string, actor?: VaultActorContext,
+async function forward(env: Env, vault: Pick<VaultRecord, "vaultId" | "vaultGeneration">, request: Request, runtimePath: string, actor?: VaultActorContext,
 	outcomeClaim = false, trustedSocketScope?: SemanticEpochScope): Promise<Response> {
 	const url = new URL(request.url);
 	url.pathname = runtimePath;
@@ -145,12 +145,6 @@ export async function handleVaultSocketRoute(
 	const documentId = purpose === "root" ? "root" : runtimePath.split("/").at(-1) ?? "";
 	const payload = ticket ? await inspectTicket(ticket, authState, { vaultId, purpose, documentId }) : null;
 	if (!payload) return rejectSocket(request, env, "unauthorized");
-	const membership = await configFetch(env, "/__yaos/verify-device", {
-		method: "POST",
-		headers: { "content-type": "application/json" },
-		body: JSON.stringify({ vaultId, deviceId: payload.deviceId }),
-	});
-	if (!membership.ok) return rejectSocket(request, env, "unauthorized");
 	const schemaVersion = declaredVersion(url, "schemaVersion");
 	if (schemaVersion !== SERVER_SCHEMA_VERSION) return rejectSocket(request, env, "update_required", {
 		reason: "schema_mismatch", clientSchemaVersion: schemaVersion, serverSchemaVersion: SERVER_SCHEMA_VERSION,
@@ -159,10 +153,6 @@ export async function handleVaultSocketRoute(
 	if (protocolVersion !== SERVER_PROTOCOL_VERSION) return rejectSocket(request, env, "update_required", {
 		reason: "protocol_mismatch", clientProtocolVersion: protocolVersion, serverProtocolVersion: SERVER_PROTOCOL_VERSION,
 	});
-	let vault: VaultRecord | null;
-	try { vault = await readVault(env, vaultId); } catch { return rejectSocket(request, env, "unauthorized"); }
-	if (!vault || vault.state !== "active") return rejectSocket(request, env, "unauthorized");
-	if (payload.vaultGeneration !== vault.vaultGeneration) return rejectSocket(request, env, "unauthorized");
 	const actor: VaultActorContext = {
 		vaultId: payload.vaultId, vaultGeneration: payload.vaultGeneration,
 		principalId: payload.principalId, membershipRevision: payload.membershipRevision,
@@ -173,7 +163,14 @@ export async function handleVaultSocketRoute(
 	const semanticScope: SemanticEpochScope = payload.purpose === "root"
 		? { purpose: "root", documentId: "root", rootEpoch: payload.rootEpoch }
 		: { purpose: "body", documentId: payload.documentId, bodyEpoch: payload.bodyEpoch };
-	return forward(env, vault, request, runtimePath, actor, false, semanticScope);
+	let response: Response;
+	try { response = await forward(env, actor, request, runtimePath, actor, false, semanticScope); }
+	catch { return rejectSocket(request, env, "unauthorized", { reason: "authority_unavailable" }); }
+	if (response.status === 401) {
+		const rejection = await response.json().catch(() => null) as { reason?: unknown } | null;
+		return rejectSocket(request, env, "unauthorized", typeof rejection?.reason === "string" ? { reason: rejection.reason } : {});
+	}
+	return response;
 }
 
 export async function handleVaultRuntimeRoute(
