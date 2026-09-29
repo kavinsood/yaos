@@ -1,0 +1,19 @@
+docs/relay2-protocol.md
+  s_9ad601cc7abbf7::t_3086ca4f916da0 1-358
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "81c45abd4526e02140ecd13f7e532723557cd0d3",
+  "prompts": {},
+  "sessions": {
+    "s_9ad601cc7abbf7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a0c3f851a1219b01f",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
