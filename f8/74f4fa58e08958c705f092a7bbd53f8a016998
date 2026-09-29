@@ -1,0 +1,21 @@
+packages/server-node/src/ywasmNodeCrdtEngine.ts
+  s_3fa8c41e3d4d37::t_1da2813a9449ec 28-30
+server/src/crdt/ywasmWorkerCrdtEngine.ts
+  s_3fa8c41e3d4d37::t_fbccb5dcd3223e 14-16
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "f874f4fa58e08958c705f092a7bbd53f8a016998",
+  "prompts": {},
+  "sessions": {
+    "s_3fa8c41e3d4d37": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a0da75a62b227384a",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
