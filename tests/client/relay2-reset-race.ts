@@ -123,6 +123,48 @@ s.test("holder edits between snapshot and install → rebased onto its own snaps
 	checkConverged("self-rebase", server, [A, B, new SimDevice("D", server)], ["[A-late]"]);
 });
 
+s.test("state vector is not a currency proof; server-sourced snapshot needs none", async () => {
+	const server = new MockRelayBody("sv-body", seedState("sv-body", 6_000, 8));
+	const A = new SimDevice("A", server);
+	const B = new SimDevice("B", server);
+	B.insertAt(120, "[GONE]");
+	await quiesce([A, B]);
+	A.goOffline();
+	const svOf = (state: Uint8Array) => Buffer.from(Y.encodeStateVectorFromUpdate(state));
+	const svBefore = svOf(server.encodedState());
+	B.edit((text) => { const at = text.toString().indexOf("[GONE]"); text.delete(at, "[GONE]".length); });
+	await quiesce([B]);
+	s.check(svOf(server.encodedState()).equals(svBefore), "a delete-only append leaves the server state vector unchanged");
+	s.check(Buffer.from(Y.encodeStateVector(A.doc())).equals(svBefore) && A.text().includes("[GONE]"),
+		"stale A has the same state vector as the server yet still shows the deleted text");
+	A.insertAt(30, "[A-off]");
+	const local = await runCompaction(A, A.transport, { force: true, currencyWaitMs: 20 });
+	s.check(local.status === "not-current", `local snapshot refused by the sequence gate (${local.status})`);
+	const remote = await runCompaction(A, A.transport, { force: true, snapshotSource: "server" });
+	s.check(remote.status === "installed" && (remote.timings.fetchBytes ?? 0) > 0,
+		`server-sourced snapshot installs from a stale, dirty holder (${remote.status}, fetched ${remote.status === "installed" ? remote.timings.fetchBytes : 0} B)`);
+	A.goOnline();
+	await quiesce([A, B]);
+	checkConverged("server-sourced", server, [A, B, new SimDevice("D", server)], ["[A-off]"]);
+	s.check(!server.text().includes("[GONE]") && !A.text().includes("[GONE]"), "B's delete survives the reset");
+});
+
+s.test("server-sourced snapshot: head_advanced → same-holder re-grant → refetch → install", async () => {
+	const server = new MockRelayBody("sv-head", seedState("sv-head", 6_000, 9));
+	const A = new SimDevice("A", server);
+	const B = new SimDevice("B", server);
+	let injected = false;
+	const result = await runCompaction(A, A.transport, {
+		force: true, snapshotSource: "server",
+		beforeUpload: () => { if (!injected) { injected = true; B.insertAt(90, "[B-race]"); } },
+	});
+	await quiesce([A, B]);
+	s.check(result.status === "installed", `installed (${result.status})`);
+	s.check(server.resetAttempts.map((a) => a.reason ?? "ok").join(",") === "head_advanced,ok", `attempts ${server.resetAttempts.map((a) => a.reason ?? "ok").join(",")}`);
+	s.check(server.leaseAttempts.filter((a) => a.from === "A" && a.granted).length === 2, "re-granted to the same holder");
+	checkConverged("server head_advanced", server, [A, B, new SimDevice("D", server)], ["[B-race]"]);
+});
+
 s.test("device that missed the fence is rejected on append (4409) and rebases", async () => {
 	const server = new MockRelayBody("fence-body", seedState("fence-body", 6_000, 5));
 	const A = new SimDevice("A", server);

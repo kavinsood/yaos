@@ -165,6 +165,9 @@ export interface CompactionTimings {
 	uploadMs: number;
 	installMs: number;
 	totalMs: number;
+	/** snapshotSource "server" only: GET of the current state after the lease. */
+	fetchMs?: number;
+	fetchBytes?: number;
 }
 
 export interface CompactionOptions {
@@ -179,6 +182,20 @@ export interface CompactionOptions {
 	maxHeadRetries?: number;
 	/** Hook between build and upload (tests use it to inject races). */
 	beforeUpload?: (fresh: FreshSnapshot) => Promise<void> | void;
+	/**
+	 * Where the snapshot comes from.
+	 *  - "local" (default): the holder's own doc, gated on exact currency
+	 *    (no pending local updates AND appliedSequence == lease headSequence).
+	 *    Zero download, but needs a per-update sequence on the socket.
+	 *  - "server": GET the body AFTER the lease grant and build from that exact
+	 *    server state; coveredSequence = lease headSequence. Needs no currency
+	 *    proof: the GET state contains everything ≤ headSequence, and if it
+	 *    contains anything later the head has advanced, so the CAS fails with
+	 *    head_advanced. (A state-vector comparison is NOT a currency proof: a
+	 *    delete-only update leaves the state vector unchanged.) Costs one
+	 *    download of the (bloated) current state.
+	 */
+	snapshotSource?: "local" | "server";
 }
 
 function summarize(fresh: FreshSnapshot): FreshSnapshotSummary {
@@ -301,23 +318,46 @@ export async function runCompaction(
 		return { status: "lease-denied", reason: lease.reason, ...(lease.holderDeviceId ? { holderDeviceId: lease.holderDeviceId } : {}) };
 	}
 	if (lease.policy) policyState = lease.policy;
-	const release = async () => { try { await transport.releaseLease?.(handle.bodyId, lease.leaseId); } catch { /* lease expires anyway */ } };
+	let leaseId = lease.leaseId;
+	const release = async () => { try { await transport.releaseLease?.(handle.bodyId, leaseId); } catch { /* lease expires anyway */ } };
+	const fromServer = options.snapshotSource === "server";
 
 	let headSequence = lease.headSequence;
 	let fresh: FreshSnapshot | null = null;
 	let buildMs = 0;
+	let fetchMs = 0;
+	let fetchBytes = 0;
 	for (let attempt = 0; attempt <= (options.maxHeadRetries ?? 2); attempt++) {
-		if (!isCurrent(handle, headSequence)) {
-			const ok = await handle.awaitCurrent?.(headSequence, options.currencyWaitMs ?? 2_000) ?? false;
-			if (!ok || !isCurrent(handle, headSequence)) {
-				await release();
-				return { status: "not-current", appliedSequence: handle.appliedSequence(), headSequence };
+		let coveredSequence: number;
+		let source: Y.Doc;
+		let scratch: Y.Doc | null = null;
+		if (fromServer) {
+			const fetchStarted = performance.now();
+			const state = await transport.fetchBody(handle.bodyId);
+			fetchMs += performance.now() - fetchStarted;
+			fetchBytes += state.encodedState.byteLength;
+			if (state.epoch !== epoch) {
+				const rebase = await rebaseOntoCurrent(handle, transport);
+				return { status: "lost", reason: "epoch_mismatch", rebase, fresh: null, timings: { leaseMs, buildMs, fetchMs } };
 			}
+			scratch = new Y.Doc({ guid: handle.bodyId });
+			Y.applyUpdate(scratch, state.encodedState);
+			source = scratch;
+			coveredSequence = headSequence;
+		} else {
+			if (!isCurrent(handle, headSequence)) {
+				const ok = await handle.awaitCurrent?.(headSequence, options.currencyWaitMs ?? 2_000) ?? false;
+				if (!ok || !isCurrent(handle, headSequence)) {
+					await release();
+					return { status: "not-current", appliedSequence: handle.appliedSequence(), headSequence };
+				}
+			}
+			// Snapshot + covered sequence captured in the same synchronous turn.
+			coveredSequence = handle.appliedSequence();
+			source = handle.doc();
 		}
-		// Snapshot + covered sequence captured in the same synchronous turn.
-		const coveredSequence = handle.appliedSequence();
 		const buildStarted = performance.now();
-		fresh = await buildFreshSnapshot(handle.doc());
+		try { fresh = await buildFreshSnapshot(source); } finally { scratch?.destroy(); }
 		buildMs += performance.now() - buildStarted;
 		if (!options.force) {
 			const decision = confirmAfterBuild(fresh, policyState, now());
@@ -329,7 +369,7 @@ export async function runCompaction(
 		await options.beforeUpload?.(fresh);
 		const uploadStarted = performance.now();
 		const result = await transport.semanticReset(handle.bodyId, {
-			leaseId: lease.leaseId,
+			leaseId,
 			expectedEpoch: epoch,
 			coveredSequence,
 			contentHash: fresh.contentHash,
@@ -348,12 +388,20 @@ export async function runCompaction(
 			const installMs = performance.now() - installStarted;
 			return {
 				status: "installed", epoch: result.epoch, sequence: result.sequence, fresh: summarize(fresh),
-				timings: { leaseMs, buildMs, uploadMs, installMs, totalMs: performance.now() - started },
+				timings: { leaseMs, buildMs, uploadMs, installMs, totalMs: performance.now() - started,
+					...(fromServer ? { fetchMs, fetchBytes } : {}) },
 			};
 		}
 		if (result.reason === "head_advanced" && result.epoch === epoch) {
 			// Someone appended to the old epoch after our lease. Catch up and rebuild.
-			headSequence = result.headSequence;
+			if (fromServer) {
+				// Server-sourced snapshots need a fresh (headSequence, state) pair: a
+				// same-holder re-grant returns the current head; then GET again.
+				const regrant = await transport.requestLease(handle.bodyId, { expectedEpoch: epoch, ...(options.ttlMs ? { ttlMs: options.ttlMs } : {}) });
+				if (!regrant.granted) return { status: "lost", reason: `regrant_${regrant.reason}`, rebase: null, fresh: summarize(fresh), timings: { leaseMs, buildMs, uploadMs } };
+				leaseId = regrant.leaseId;
+				headSequence = regrant.headSequence;
+			} else headSequence = result.headSequence;
 			continue;
 		}
 		if (result.reason === "epoch_mismatch" || result.epoch !== epoch) {
