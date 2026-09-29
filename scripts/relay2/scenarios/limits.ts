@@ -170,10 +170,32 @@ export async function X2(ctx: RunCtx): Promise<Result> {
 }
 
 /** Largest note: seed 1/5/10 MB, fresh client step2 (time/bytes), one edit + ack, forced checkpoint (debug/compact). */
+/** One VAULT_PING RTT on an open socket (network-drift probe next to a large open). */
+export async function pingRtt(client: RawClient, timeoutMs = 5000): Promise<number | null> {
+	if (!client.isOpen) return null;
+	const probeId = `x3-${Math.random().toString(36).slice(2)}`;
+	const got = client.waitControl((v) => v.type === "VAULT_PONG" && v.probeId === probeId, timeoutMs);
+	const t0 = now();
+	client.send(`__YPS:${JSON.stringify({ type: "VAULT_PING", probeId })}`);
+	const pong = await got;
+	return pong ? r2(pong.at - t0) : null;
+}
+
+/**
+ * Large notes 1/5/10 MB: seed, then `--repeats` socket opens with per-phase timing (ticket, upgrade, step1→step2,
+ * step2 bytes), a ping RTT on a separate small socket right before each open (network drift), and two HTTP GETs
+ * split into TTFB (server merge/serialise + RTT) and download (transfer). The second GET usually hits the merged
+ * cache, so its download time is a pure-network reference for the same byte count: step1→step2 minus that
+ * reference ≈ server-side cost of the socket open. `phaseSamples[].sentAtWall` = step1 send time, so analyze.py
+ * can join each open with the DO ws-message tail event (wall/cpu) when run with --tail.
+ */
 export async function X3(ctx: RunCtx): Promise<Result> {
 	const sizes = (ctx.str("sizes-mb", "1,5,10")!).split(",").map(Number);
+	const repeats = ctx.num("repeats", 3);
 	const results: Result[] = [];
+	const phaseSamples: Result[] = [];
 	let lastConv: Result | null = null;
+	const pinger = await openOrThrow(await ctx.client("A", await freshNotes(ctx, "x3-ping", 1, () => smallContent(3)).then((ids) => ids[0]!)));
 	for (const mb of sizes) {
 		const bytes = Math.round(mb * 1_000_000);
 		const content = wordsContent(mb * 7, bytes);
@@ -183,12 +205,37 @@ export async function X3(ctx: RunCtx): Promise<Result> {
 		try { id = (await freshNotes(ctx, `x3-${mb}mb`, 1, () => content))[0]!; r.seedMs = r2(now() - t0); }
 		catch (error) { r.seedError = String(error).slice(0, 300); r.seedMs = r2(now() - t0); results.push(r); log(`X3 ${mb} MB seed failed`); continue; }
 		const d0 = await diagnostics(ctx.context.devices.A!);
-		const c = await ctx.client("B", id);
-		const outcome = await c.open(120_000);
-		r.open = { ...outcome, totalMs: r2(now() - c.startedAt), syncMs: c.syncedAt ? r2(c.syncedAt - c.openAt) : null, bytesIn: c.bytesIn,
-			correct: outcome.status === "ok" ? c.text() === content : null };
+		const opens: Result[] = [];
+		let c: RawClient | null = null;
+		for (let k = 0; k < repeats; k++) {
+			if (c) { c.terminate(); c.doc.destroy(); await sleep(1000); }
+			const pingBeforeMs = await pingRtt(pinger);
+			c = await ctx.client("B", id);
+			const outcome = await c.open(180_000);
+			const phases = c.openPhases();
+			const row = { k, ...outcome, pingBeforeMs, ...phases, bytesIn: c.bytesIn,
+				correct: outcome.status === "ok" ? c.text() === content : null, pingAfterMs: await pingRtt(pinger) };
+			opens.push(row);
+			phaseSamples.push({ mb, k, sentAtWall: phases.step1SentWall, step1ToStep2Ms: phases.step1ToStep2Ms, step2Bytes: phases.step2Bytes });
+			log(`X3 ${mb} MB open#${k}: ${JSON.stringify(row).slice(0, 220)}`);
+			if (outcome.status !== "ok") break;
+		}
+		r.opens = opens;
+		r.open = opens[0] ?? null;
 		const d1 = await diagnostics(ctx.context.devices.A!);
-		if (outcome.status === "ok") {
+		const gets: Result[] = [];
+		for (let k = 0; k < 2; k++) {
+			const g = await bodyGet(ctx.context.devices.C!, id);
+			gets.push({ k, status: g.status, ttfbMs: g.ttfbMs, downloadMs: g.downloadMs ?? null, totalMs: g.elapsedMs, bytes: g.bytes,
+				mbitPerSec: g.downloadMs ? r2((g.bytes * 8) / 1000 / g.downloadMs) : null, cfRay: g.cfRay, textEqual: g.text === content });
+		}
+		r.gets = gets;
+		const netRef = gets.at(-1)?.downloadMs as number | undefined;
+		const s2 = opens.filter((o) => typeof o.step1ToStep2Ms === "number").map((o) => o.step1ToStep2Ms as number);
+		r.breakdown = { step1ToStep2Ms: s2, networkRefDownloadMs: netRef ?? null, pingMs: opens.map((o) => o.pingBeforeMs),
+			inferredServerMs: netRef !== undefined ? s2.map((v) => r2(v - netRef - Number(opens[0]?.pingBeforeMs ?? 0))) : null,
+			note: "inferredServerMs = step1→step2 − cached-GET download time for the same bytes − ping RTT (inferred; tail wall time is the direct measure)" };
+		if (c && c.isOpen) {
 			const tracked = c.editTracked((t) => t.insert(Math.floor(t.length / 2), "X3"));
 			const ack = await c.waitAck(tracked.frameId, tracked.sentAt, 30_000);
 			r.editAckMs = ack ? r2(ack.at - tracked.sentAt) : null;
@@ -197,14 +244,14 @@ export async function X3(ctx: RunCtx): Promise<Result> {
 		const c0 = now();
 		r.compact = { ...(await operatorVaultPost(ctx, "debug/compact")), ms: r2(now() - c0) };
 		const g = await bodyGet(ctx.context.devices.C!, id);
-		r.get = { status: g.status, ms: g.elapsedMs, bytes: g.bytes, textEqual: g.text === c.text() };
+		r.get = { status: g.status, ms: g.elapsedMs, ttfbMs: g.ttfbMs, bytes: g.bytes, textEqual: c ? g.text === c.text() : null };
 		r.diagnostics = { before: d0, afterOpen: d1, afterCompact: await diagnostics(ctx.context.devices.A!) };
-		if (c.isOpen) lastConv = await convergence({ bodyId: id, clients: [c], fresh: await ctx.dev("C"), adapter: ctx.adapter, settleMs: 60_000 });
-		c.terminate(); c.doc.destroy();
+		if (c?.isOpen) lastConv = await convergence({ bodyId: id, clients: [c], fresh: await ctx.dev("C"), adapter: ctx.adapter, settleMs: 60_000 });
+		if (c) { c.terminate(); c.doc.destroy(); }
 		results.push(r);
-		log(`X3 ${mb} MB: open ${JSON.stringify(r.open).slice(0, 160)}`);
 	}
-	return { sizesMb: sizes, results, convergence: lastConv };
+	await pinger.close();
+	return { sizesMb: sizes, repeats, results, phaseSamples, convergence: lastConv };
 }
 
 /** 100 bodies × 50 edits while B is stale: HTTP /catch-up (one batch) and socket reopen of every body. */

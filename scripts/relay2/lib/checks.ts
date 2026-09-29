@@ -59,14 +59,17 @@ export async function bodyHead(identity: LiveIdentity, bodyId: string) {
 export async function bodyGet(identity: LiveIdentity, bodyId: string) {
 	const t0 = now();
 	const response = await fetch(vaultRoute(identity, `body/${encodeURIComponent(bodyId)}`), { headers: deviceBearerHeaders(identity) });
+	// Headers arrive once the server has produced the response (fetch resolves); the rest is transfer.
+	const ttfbMs = r2(now() - t0);
 	const bytes = new Uint8Array(await response.arrayBuffer());
 	const elapsedMs = r2(now() - t0);
-	if (!response.ok) return { status: response.status, elapsedMs, text: null as string | null, bytes: bytes.byteLength };
+	const cfRay = response.headers.get("cf-ray");
+	if (!response.ok) return { status: response.status, elapsedMs, ttfbMs, cfRay, text: null as string | null, bytes: bytes.byteLength };
 	const doc = new Y.Doc();
 	Y.applyUpdate(doc, bytes);
 	const text = doc.getText("body").toString();
 	doc.destroy();
-	return { status: response.status, elapsedMs, text, bytes: bytes.byteLength,
+	return { status: response.status, elapsedMs, ttfbMs, downloadMs: r2(elapsedMs - ttfbMs), cfRay, text, bytes: bytes.byteLength,
 		contentHash: response.headers.get("x-yaos-content-hash"), size: Number(response.headers.get("x-yaos-size")),
 		generation: Number(response.headers.get("x-yaos-generation")),
 		// All X-YAOS-* headers (round-2 relay adds body sequence headers; see docs/relay2-protocol.md).

@@ -111,7 +111,7 @@ export async function C3(ctx: RunCtx): Promise<Result> {
 		for (let i = 0; i < bigCount; i++) {
 			const c = await ctx.client(i % 2 ? "B" : "A", bigId(i));
 			const outcome = await c.open(60_000);
-			bigResults.push({ index: i, ...outcome, totalMs: r2(now() - c.startedAt), bytesIn: c.bytesIn,
+			bigResults.push({ index: i, ...outcome, totalMs: r2(now() - c.startedAt), phases: c.openPhases(), bytesIn: c.bytesIn,
 				correct: outcome.status === "ok" ? c.text() === wordsContent(i, BIG_BYTES) : null });
 			if (outcome.status === "ok") bigClients.push(c);
 			if ([1, 8, 16, 32].includes(i + 1)) snapshots.push({ step: `big-${i + 1}`, open: bigClients.length, ...(await diagnostics(ctx.context.devices.A!)) });
@@ -122,7 +122,9 @@ export async function C3(ctx: RunCtx): Promise<Result> {
 		: clients[0] ? { pass: null, note: "no big clients" } : null;
 	for (const c of bigClients) { c.terminate(); c.doc.destroy(); }
 	return { steps, smallFailures: failures, big: { count: bigCount, bytes: BIG_BYTES,
-		openTotalMs: series(bigResults.map((r) => (r.status === "ok" ? r.totalMs as number : null)), 0), results: bigResults },
+		openTotalMs: series(bigResults.map((r) => (r.status === "ok" ? r.totalMs as number : null)), 0),
+		step1ToStep2Ms: series(bigResults.map((r) => (r.status === "ok" ? (r.phases as Result).step1ToStep2Ms as number : null)), 0),
+		ticketMs: series(bigResults.map((r) => (r.phases as Result).ticketMs as number | null), 0), results: bigResults },
 		snapshots, convergence: conv };
 }
 

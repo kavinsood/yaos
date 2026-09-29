@@ -4,7 +4,7 @@
  *
  *   node tests/run-typescript.mjs --test-aliases scripts/relay2/l5-cli-baseline.ts --host <url> \
  *        [--n 100] [--mode prod|nodebounce|relay|relay250|both|all|a,b] [--burst 1] [--burst-interval 80] [--spacing 1500]
- *        [--offline-probe] [--persist before-send|after-send] [--out file.json]
+ *        [--offline-probe] [--typing-probe] [--persist before-send|after-send] [--out file.json]
  *
  * relay / relay250 (flag-on worker only): the §5.3 harness receipt client (lib/socketReceipts.ts, RECEIPTS.md)
  * settles candidates from the socket BODY_COMMITTED echo; VaultSync's own HTTP candidate debounce is parked at
@@ -64,7 +64,7 @@ type Mode = "prod" | "nodebounce" | "relay" | "relay250";
 const MODES: Mode[] = ["prod", "nodebounce", "relay", "relay250"];
 const DEVICE: Record<Mode, string> = { prod: "L5p", nodebounce: "L5n", relay: "L5r", relay250: "L5d" };
 
-async function runMode(host: string, mode: Mode, opts: { n: number; offlineProbe: boolean; persist: "before-send" | "after-send"; burst: number; burstInterval: number; spacing: number; tag: string }) {
+async function runMode(host: string, mode: Mode, opts: { n: number; offlineProbe: boolean; typingProbe: boolean; persist: "before-send" | "after-send"; burst: number; burstInterval: number; spacing: number; tag: string }) {
 	const { VaultSync } = await import("../../src/sync/vaultSync");
 	const { createSocketTicketCache } = await import("../../src/sync/socketTicket");
 	const { createFetchRequester } = await import("../../src/utils/http");
@@ -123,10 +123,11 @@ async function runMode(host: string, mode: Mode, opts: { n: number; offlineProbe
 	const wsStats = newReceiptStats();
 	const frames: FrameRecord[] = [];
 	const registry = new Set<import("ws").WebSocket & { bodyId: string | null }>();
+	const sendLog: NonNullable<ReceiptOptions["sendLog"]> = [];
 	const bodies = new Map<string, { doc: import("yjs").Doc; bodyEpoch: number }>();
 	const receiptOptions: ReceiptOptions = { vaultId: identity.vaultId, vaultGeneration: context.vaultGeneration,
 		deviceId: identity.deviceId, database: database as unknown as ReceiptStore, bodies, passive: !relayMode,
-		debounceMs: mode === "relay250" ? 250 : 0, maxWaitMs: 2000, registry, persist: opts.persist };
+		debounceMs: mode === "relay250" ? 250 : 0, maxWaitMs: 2000, registry, persist: opts.persist, sendLog };
 	const ReceiptWs = receiptWebSocket(receiptOptions, wsStats, frames);
 	const logs: string[] = [];
 	const t0 = now();
@@ -184,7 +185,9 @@ async function runMode(host: string, mode: Mode, opts: { n: number; offlineProbe
 			const mine = events.slice(startIdx);
 			const puts = mine.filter((e) => e.op === "put");
 			const cleared = new Set(mine.filter((e) => e.op !== "put").map((e) => e.candidateId));
-			if (puts.length > 0 && puts.every((p) => cleared.has(p.candidateId))) {
+			// The last edit's own candidate must exist (latest put at/after the last edit), else a no-debounce burst
+			// could "settle" on the previous edit's receipt before the last frame was captured.
+			if (puts.length > 0 && Math.max(...puts.map((p) => p.at)) >= last && puts.every((p) => cleared.has(p.candidateId))) {
 				settledAt = Math.max(...mine.filter((e) => e.op !== "put").map((e) => e.at));
 				break;
 			}
@@ -246,6 +249,29 @@ async function runMode(host: string, mode: Mode, opts: { n: number; offlineProbe
 			note: envelopeStep2 ? "offline edits ride the provider's step2 reply; enveloped + candidate → echo settles it"
 				: "step2 sent envelope-less (provider-internal behaviour without a wrapper): server appends it (hashUnknown), no echo, no receipt; HTTP candidate would be the fallback" };
 	};
+	// Typing probe: does the real provider coalesce keystrokes? One Y transaction per keystroke, exactly what
+	// y-codemirror.next's ySync does per CodeMirror ViewUpdate (y-sync.js: one ytext.doc.transact per update).
+	// Counts the binary update frames the provider hands to the socket (sendLog, before any harness debounce).
+	const typingProbe = opts.typingProbe ? await (async () => {
+		const out: Obj[] = [];
+		for (const cps of [2, 8, 30]) {
+			await sleep(1500);
+			const from = sendLog.length;
+			const keys = cps * 5;
+			const t0 = now();
+			for (let k = 0; k < keys; k++) {
+				text.doc!.transact(() => text.insert(Math.floor(text.length / 2), "abcdefghij"[k % 10]!));
+				await sleep(1000 / cps);
+			}
+			const typedMs = now() - t0;
+			await sleep(mode === "relay250" ? 2500 : 500);
+			const mine = sendLog.slice(from).filter((f) => f.bodyId === realBodyId && f.kind === "update");
+			out.push({ charsPerSec: cps, keystrokes: keys, typedMs: r2(typedMs), providerUpdateFrames: mine.length,
+				framesPerKeystroke: r2(mine.length / keys), framesPerSec: r2(mine.length / (typedMs / 1000)),
+				meanFrameBytes: mine.length ? r2(mine.reduce((a, f) => a + f.bytes, 0) / mine.length) : null });
+		}
+		return { note: "provider = y-partyserver OwnAwarenessProvider via real VaultSync; Y.Text driven one transaction per keystroke like y-codemirror.next", rates: out };
+	})() : null;
 	const offlineProbe = relayMode && opts.offlineProbe ? { enveloped: await probe(true), envelopeLess: await probe(false) } : null;
 	const finalText = text.toString();
 	const destroyAt = now();
@@ -285,6 +311,7 @@ async function runMode(host: string, mode: Mode, opts: { n: number; offlineProbe
 			note: "per burst; DO units = HTTP requests + client→DO WebSocket messages / 20 (20:1 billing); HTTP bytes = request body + response content-length" },
 		pairing: relayMode ? pairingSummary(wsStats, frames) : null,
 		offlineProbe,
+		typingProbe,
 		leftoverCandidatesInStore: leftover,
 		setup: { bootstrapMs, createMs, acquireMs },
 		editToClearedMs: series(col("editToClearedMs")),
@@ -314,7 +341,7 @@ async function main() {
 	const host = flagStr(args, "host")?.replace(/\/+$/, "");
 	if (!host) { console.error("usage: l5-cli-baseline.ts --host <url> [--n 100] [--mode prod|nodebounce|both]"); process.exit(2); }
 	const modeArg = flagStr(args, "mode", "both")!;
-	const opts = { n: flagNum(args, "n", 100), offlineProbe: args.flags["offline-probe"] === true,
+	const opts = { n: flagNum(args, "n", 100), offlineProbe: args.flags["offline-probe"] === true, typingProbe: args.flags["typing-probe"] === true,
 		persist: (flagStr(args, "persist", "before-send") === "after-send" ? "after-send" : "before-send") as "before-send" | "after-send", burst: flagNum(args, "burst", 1), burstInterval: flagNum(args, "burst-interval", 80),
 		spacing: flagNum(args, "spacing", 1500), tag: `l5${Date.now().toString(36)}` };
 	const meta = await startMeta("L5", host, `real VaultSync; modes ${modeArg}`);

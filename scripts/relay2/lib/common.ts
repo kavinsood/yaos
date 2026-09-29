@@ -7,7 +7,8 @@ import { dirname, join } from "node:path";
 
 export const EXP_ROOT = "/Users/kavin/personal/obsidiansync/experiments";
 export const LOG_DIR = join(EXP_ROOT, "logs/relay2");
-export const WORKTREE = join(EXP_ROOT, "yaos-relay2");
+/** Checkout the harness runs from (run from the worktree root; runall.sh uses a detached worktree at the run SHA; RELAY2_WORKTREE overrides). */
+export const WORKTREE = process.env.RELAY2_WORKTREE ?? process.cwd();
 export const BASE_SHA = "5dd32f31d3c380605db44558d089d37adaa293d5";
 export const WARMUP_DISCARD = 10;
 

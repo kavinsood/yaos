@@ -151,7 +151,36 @@ Relay compared with base at small n (the n values are too small to cite):
 
 X3 relay 1/5 MB showed transient 11–15 s opens in one run, during a local `UND_ERR_CONNECT_TIMEOUT` window. A 1 MB recheck gave 1.23 s, so verify at full n.
 
-Still pending:
-- The L5 relay variant, which needs the socket-layer echo timing described above.
-- `relay-nosv` / `relay-nocand` adapters: they exist but have not been exercised.
-- Harness checks for the compaction-lease / semantic-reset HTTP flows (the reset agent covers these in `reset/`).
+The X3 11–15 s opens were a network blip: the per-phase X3 (section 7) shows 1 MB opens at 0.5–0.6 s and 5 MB at about 1 s, dominated by transfer time. The L5 relay variant (`--mode relay,relay250`) and `relay-nocand` (MB sweep) are now exercised; see section 7.
+
+## 7. Round-3 additions
+
+New scenarios live in `scenarios/extra.ts`. Cost windows are minute-aligned because `durableObjectsPeriodicGroups` buckets by minute. Each scenario takes an idle window, then the measured windows; gql is queried after `--gql-settle-ms` (180 s; `--no-gql` skips it). DO request units = http requests + inbound WS messages / 20.
+
+| Scen | What | Key flags |
+|---|---|---|
+| C2 | CPU and rows per update while streaming a trace (µs, periodic cpuTime net of idle) | `--trace quick\|stress --rate 25 --clients 5` (stress: 50k frames, writers A,S1..S4, observer B) |
+| C5 | DO requests per burst and per catch-up (WS messages billed 20:1) | `--n <bursts> --burst 8 --burst-interval 125 --burst-gap 3000 --catchups 10 --catchup-edits 10 [--l5 <L5 json>]` |
+| C6 | bundle size + startup from the deploy record | `--compare <host>` |
+| K1 | checkpoint cost vs tail length | `--tails 50,500,5000 --repeats 3 --trigger compact\|alarm --rate 200`; needs a worker with checkpoint knobs raised (runall `g-k1`) so tails can build |
+| MB | micro-batch / write amplification: rows per edit (gql and relay counter) + propagation for l2/burst/stream patterns | `--patterns l2,burst,stream --pattern-seconds 110`; records requested vs effective `microbatchMs` and `clamped` |
+| CW | concurrent writers + GET checker: invariant #7 (`x-yaos-content-hash` describes the stored merged state) | `--writers 4 --seconds 60 --edit-ms 200 --get-ms 1000` |
+
+Other changes:
+- **X3** now records per-open phases (ticket, upgrade, step1→step2, ready), a ping before/after each open, GET TTFB/download and `inferredServerMs` (step1→step2 − cached-GET download − ping). `--repeats 3`.
+- **L5 `--typing-probe`** types at 2/8/30 cps for 5 s through the real provider and reports update frames per keystroke. The provider sends one frame per keystroke at every rate (no coalescing).
+- **Base closes sockets across DO eviction.** C2 and C5 therefore open their sockets after the idle window. Otherwise base senders are closed with 1008 "socket authority mismatch" (the B1 behaviour).
+- **Server-side ms timers.** `lastCheckpointMs` reads 0 because Date.now() does not advance during DO CPU. Use tail cpuTime or gql instead.
+- **`convergence.ts`** summarises the §8.2 suite from `<ID>-<variant>.json` files (L2, L4, C2-stress, B2, B3, B5, B6, X1, CW). It reports pass/FAIL/unknown for text, state vector, GET, server hash and invariant #7 (`--require-all` exits 1 on any miss).
+- **`runall.sh`** is the resumable full-run orchestrator:
+
+```
+zsh scripts/relay2/runall.sh --sha <commit> [--tag rMMDD] [--only g-lat,g-mb,...] [--small] [--dry-run]
+```
+
+  - It creates a clean detached worktree for `<commit>` and deploys fresh `yaos-relay2-<tag>-<group>-<variant>` workers with `--require-clean`.
+  - A deploy is skipped when the record already matches the sha and vars; `FORCE_DEPLOY=1` overrides this.
+  - A run is skipped when its JSON already exists without an `error`. Base/relay order alternates.
+  - Outputs go to `results/relay2/raw/` and the manifest to `raw/runall-manifest.jsonl`. Logs go to `logs/relay2/runall-<tag>/`.
+  - `--small` writes under `logs/relay2/runall-<tag>-small/` at small n.
+  - The final step runs `convergence.ts`.

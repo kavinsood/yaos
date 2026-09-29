@@ -59,6 +59,8 @@ export interface ReceiptOptions {
 	passive?: boolean;
 	/** Live socket registry (harness fault injection: terminate a body socket to force an offline window). */
 	registry?: Set<WebSocket & { bodyId: string | null }>;
+	/** Every binary frame the provider hands to send() on a body socket (before any harness debounce/envelope). */
+	sendLog?: { at: number; bodyId: string; kind: string; bytes: number }[];
 }
 
 export interface FrameRecord {
@@ -162,6 +164,7 @@ export function receiptWebSocket(options: ReceiptOptions, stats: ReceiptStats, f
 			const parsed = parseSyncFrame(bytes);
 			const name = frameName(parsed);
 			bump(stats.framesOut, name);
+			options.sendLog?.push({ at: now(), bodyId: this.bodyId, kind: name, bytes: bytes.byteLength });
 			if (options.passive) { this.enqueue(() => raw(bytes)); return; }
 			const body = options.bodies.get(this.bodyId);
 			const appendable = parsed.type === 0 && (parsed.sync === 1 || parsed.sync === 2) && parsed.inner;

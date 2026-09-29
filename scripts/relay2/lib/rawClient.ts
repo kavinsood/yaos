@@ -13,7 +13,7 @@ import { PROTOCOL_VERSION, SCHEMA_VERSION } from "../../../src/sync/schema";
 import { canonicalMarkdownBytes } from "../../../server/src/shared/markdownCodec";
 import { vaultRoute } from "../../../tests/live/schema4Live";
 import { fetchSocketTicket, type LiveIdentity } from "../../../tests/live/liveIdentity";
-import { now } from "./common";
+import { now, r2 } from "./common";
 
 export type Control = Record<string, unknown>;
 
@@ -121,6 +121,14 @@ export class RawClient {
 	openAt = 0;
 	startedAt = 0;
 	ticketAt = 0;
+	/** HTTP 101 received (upgrade complete, before the ws 'open' callback). */
+	upgradeAt = 0;
+	/** Wall clock when our step1 was sent (tail join). */
+	step1SentWall = 0;
+	/** First inbound frame (any type) after open. */
+	firstFrameAt = 0;
+	/** Size of the server step2 (reply to our step1) as received. */
+	step2Bytes = 0;
 	runtimeEpoch: unknown = null;
 	controls: Array<{ at: number; value: Control }> = [];
 	sent: Array<{ at: number; clientFrameId: string; kind: SyncKind; bytes: number }> = [];
@@ -185,6 +193,9 @@ export class RawClient {
 		this.closed = null;
 		this.readyAt = 0;
 		this.syncedAt = 0;
+		this.upgradeAt = 0;
+		this.firstFrameAt = 0;
+		this.step2Bytes = 0;
 		let ticket: string;
 		try { ticket = (await fetchSocketTicket(this.identity, this.identity.vaultId, "body", this.body, this.bodyEpoch)).ticket; }
 		catch (error) { return { status: "error", message: String(error) }; }
@@ -200,8 +211,10 @@ export class RawClient {
 			let done = false;
 			const finish = (v: OpenResult) => { if (done) return; done = true; clearTimeout(timer); resolve(v); };
 			const timer = setTimeout(() => finish({ status: "error", message: "timeout" }), timeoutMs);
+			this.socket.on("upgrade", () => { this.upgradeAt = now(); });
 			this.socket.on("open", () => {
 				this.openAt = now();
+				this.step1SentWall = Date.now();
 				const e = encoding.createEncoder();
 				encoding.writeVarUint(e, 0);
 				syncProtocol.writeSyncStep1(e, this.doc);
@@ -223,6 +236,7 @@ export class RawClient {
 				const bytes = rawBytes(data);
 				this.framesIn++;
 				this.bytesIn += bytes.byteLength;
+				if (!this.firstFrameAt) this.firstFrameAt = at;
 				if (!isBinary) {
 					const text = Buffer.from(bytes).toString("utf8");
 					if (!text.startsWith("__YPS:")) return;
@@ -260,7 +274,7 @@ export class RawClient {
 						this.sendSyncFrame("step2", decoding.readVarUint8Array(r), frame);
 					} else this.send(frame);
 				}
-				if (syncType === 1 && !this.syncedAt) this.syncedAt = at;
+				if (syncType === 1 && !this.syncedAt) { this.syncedAt = at; this.step2Bytes = bytes.byteLength; }
 				if (syncType === 2 && inner) {
 					this.updatesIn++;
 					this.updateBytesIn += inner.byteLength;
@@ -269,6 +283,19 @@ export class RawClient {
 				if (this.readyAt && this.syncedAt) finish({ status: "ok" });
 			});
 		});
+	}
+
+	/**
+	 * Per-phase open timing (ms, relative): ticket (HTTP), upgrade (TLS/WS 101), step1→step2 (server build + transfer
+	 * of the full step2 message; ws delivers whole messages, so transfer is not separable here), ready.
+	 */
+	openPhases() {
+		const rel = (a: number, b: number) => (a && b ? r2(a - b) : null);
+		return { ticketMs: rel(this.ticketAt, this.startedAt), upgradeMs: rel(this.upgradeAt || this.openAt, this.ticketAt),
+			openCallbackMs: rel(this.openAt, this.upgradeAt), firstFrameAfterOpenMs: rel(this.firstFrameAt, this.openAt),
+			step1ToStep2Ms: rel(this.syncedAt, this.openAt), readyAfterOpenMs: rel(this.readyAt, this.openAt),
+			totalMs: rel(Math.max(this.syncedAt, this.readyAt), this.startedAt), step2Bytes: this.step2Bytes,
+			step1SentWall: this.step1SentWall };
 	}
 
 	text() { return this.doc.getText("body").toString(); }
