@@ -1,0 +1,29 @@
+docs/obsidian-host-compatibility.md
+  s_3fa8c41e3d4d37::t_d1be8df653c026 17
+src/host/obsidianHostAdapter.ts
+  s_3fa8c41e3d4d37::t_3b326d4aea388c 1,22,57,157-166
+src/ui/ConfirmModal.ts
+  s_3fa8c41e3d4d37::t_34fde1bb919c53 2,46-49
+src/ui/ConflictListModal.ts
+  s_3fa8c41e3d4d37::t_055b94d5fe4f39 3,25-27
+src/ui/ThreeWayConflictModal.ts
+  s_3fa8c41e3d4d37::t_49a127aee3ac20 2,79-82
+tests/client/obsidian-host-adapter.ts
+  s_3fa8c41e3d4d37::t_7537b1af215418 79-94
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "f6d374ae14c0a1a0d4734604a841499bd3772f3b",
+  "prompts": {},
+  "sessions": {
+    "s_3fa8c41e3d4d37": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a0da75a62b227384a",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
