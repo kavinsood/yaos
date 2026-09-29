@@ -74,7 +74,7 @@ async function withBootstrapRestart<T>(database: BootstrapDatabasePort, work: (r
 			const previous = await database.getBootstrapProgress();
 			await database.putBootstrapProgress({
 				bootstrapId: "", rootEpoch: previous?.rootEpoch ?? 1, highWater: 0,
-				nextCatalogCursor: null, stage: "root-loaded", settledBodies: 0, totalBodies: 0, feedCursor: 0,
+				nextCatalogCursor: null, stage: "root-loaded", settledBodies: 0, totalBodies: 0, feedCursor: previous?.feedCursor ?? 0,
 			});
 			if (restarts >= BOOTSTRAP_RESTART_LIMIT) throw new Error("bootstrap restart limit reached");
 		}
@@ -764,7 +764,7 @@ async function prepareBootstrapRootAttempt(
 		stage: "root-loaded",
 		settledBodies: 0,
 		totalBodies: descriptor.catalog.activeBodyCount,
-		feedCursor: descriptor.catalog.highWater,
+		feedCursor: Math.min(existing?.feedCursor ?? descriptor.catalog.highWater, descriptor.catalog.highWater),
 	};
 	await database.putBootstrapProgress(progress);
 	return { descriptor, progress };

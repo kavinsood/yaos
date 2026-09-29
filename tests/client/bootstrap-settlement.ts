@@ -593,6 +593,25 @@ s.test("G7 prepare-root entry point independently recovers a stale operation", a
 	assert.equal(fixture.starts(), 2);
 });
 
+s.test("G7 stale bootstrap recovery retains the feed cursor for deletions absent from the new active catalog", async () => {
+	const fixture = await g7ClientFixture("start");
+	await fixture.database.putBootstrapProgress({
+		bootstrapId: "completed-old-operation", rootEpoch: 1, highWater: 12,
+		nextCatalogCursor: null, stage: "complete", settledBodies: 1, totalBodies: 1, feedCursor: 12,
+	});
+	const originalStart = fixture.server.start;
+	fixture.server.start = async (attemptId) => {
+		const descriptor = await originalStart(attemptId);
+		return { ...descriptor, capture: { ...descriptor.capture, vaultSequence: 25 },
+			catalog: { ...descriptor.catalog, highWater: 25 } };
+	};
+	const result = await prepareBootstrapRoot(fixture.server as never, fixture.database as never);
+	assert.equal(result.progress.bootstrapId, "fresh-g7");
+	assert.equal(result.progress.highWater, 25);
+	assert.equal(result.progress.feedCursor, 12, "unseen deletion events must be replayed after the fresh catalog");
+	assert.equal(fixture.writes.find((entry) => entry.bootstrapId === "")?.feedCursor, 12);
+});
+
 s.test("G7 semantic restart drains in-flight work before resetting progress", async () => {
 	const fixture = await g7ClientFixture("semantic");
 	const order: string[] = [];
