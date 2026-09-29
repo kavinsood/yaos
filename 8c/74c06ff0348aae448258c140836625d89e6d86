@@ -1,0 +1,33 @@
+src/main.ts
+  s_da01c445b2cb68::t_d3031826796a4d 425,1417-1421,2931,2945-2948,2966-2974
+src/runtime/reconciliationController.ts
+  s_2fcf9537e00472::t_9f79ff31de4137 17,140,1155-1175
+src/sync/diskMirror.ts
+  s_da01c445b2cb68::t_1e036b775da755 557,930-942
+tests/client/stale-disk-never-reverts-body.ts
+  s_2fcf9537e00472::t_5f7935e7ef5387 43,72,127,257-265,302,338,372,403,948-969
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "8c74c06ff0348aae448258c140836625d89e6d86",
+  "prompts": {},
+  "sessions": {
+    "s_2fcf9537e00472": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a752c3f5e15027938",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_da01c445b2cb68": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a10c2c6b0718e5b0f",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
