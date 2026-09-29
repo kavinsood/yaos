@@ -27,9 +27,11 @@ import { PreservedUnresolvedRegistry, type PreservedUnresolvedEntry, type Preser
 import { safeMarkdownPath } from "./pathPolicy";
 import { mergeThreeWayText, type ThreeWayMergeResult } from "./threeWayMerge";
 import type { BodySettlementRead, DiskSettlementFingerprint } from "./bodySettlement";
+import type { ConflictEpisodes } from "./conflictEpisodes";
 export { isLocalOrigin };
 
 export interface DiskSettlementOptions {
+	conflictEpisodes?: ConflictEpisodes;
 	getBaseline(path: string): {
 		contentHash: string | null;
 		lastDiskIndexPersistedAt?: number;
@@ -973,6 +975,21 @@ export class DiskMirror {
 				return "preserved-unresolved";
 			}
 			if (merge.kind === "conflict") {
+				if (this.settlement.conflictEpisodes) {
+					try {
+						await this.settlement.conflictEpisodes.preserve({
+							bodyId, path, disk: diskContent, body: content,
+							base: input.baseContent ?? base?.settlement.content ?? merge.base, device: this.getDeviceName(),
+						});
+					} catch {
+						this.recordPreservedUnresolved(path, "conflict-artifact-write-failed");
+						return "preserved-unresolved";
+					}
+					this.settlement.markDivergence?.(bodyId, "decision-required");
+					this.recordPreservedUnresolved(path, "body-settlement-failed");
+					await this.writeSettledBody(path, diskContent, content, isCurrent);
+					return "preserved-unresolved";
+				}
 				const overlapKey = remoteHash;
 				if (this.preservedOverlaps.get(path) === overlapKey || this.openReviews.has(path)) {
 					// Already preserved and offered for review: nothing new to decide.
@@ -994,31 +1011,7 @@ export class DiskMirror {
 				this.preservedOverlaps.set(path, overlapKey);
 				this.settlement.markDivergence?.(bodyId, "decision-required");
 				this.recordPreservedUnresolved(path, "body-settlement-failed");
-				let reviewed: string | null = null;
-				if (this.settlement.reviewConflict) {
-					this.openReviews.add(path);
-					try {
-						reviewed = await this.settlement.reviewConflict({ path, conflict: merge, stillCurrent: isCurrent });
-					} finally {
-						this.openReviews.delete(path);
-					}
-				}
-				if (reviewed === null || !isCurrent()) return "preserved-unresolved";
-				const reviewedContent = composeMerged(reviewed);
-				if (reviewedContent === content) {
-					const written = await this.writeSettledBody(path, diskContent, content, isCurrent);
-					if (written !== "written") return written === "moved" ? "replan" : "preserved-unresolved";
-					this.settlement.markDivergence?.(bodyId, "none");
-					this.clearPreservedUnresolved(path);
-					return "settled";
-				}
-				await this.settlement.commitMergedBody({
-					bodyId,
-					path,
-					expectedBodyContent: content,
-					mergedContent: reviewedContent,
-				});
-				return "replan";
+				return "preserved-unresolved";
 			}
 			const mergedContent = composeMerged(merge.content);
 			if (mergedContent === content) {

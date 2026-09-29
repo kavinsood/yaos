@@ -12,6 +12,9 @@ import { SCHEMA_VERSION } from "./sync/schema";
 import { computeFolderKey, folderKeySeedFromVault } from "./sync/vaultPersistence";
 import { EditorBindingManager } from "./sync/editorBinding";
 import { DiskMirror } from "./sync/diskMirror";
+import { ConflictEpisodes, type ConflictEpisodeState } from "./sync/conflictEpisodes";
+import { ConflictListModal } from "./ui/ConflictListModal";
+import { mergeThreeWayText } from "./sync/threeWayMerge";
 import { VaultIndexedDb } from "./sync/vaultIndexedDb";
 import {
 	BootstrapClient,
@@ -188,6 +191,8 @@ declare const __YAOS_QA_HARNESS_ENABLED__: boolean;
 declare const __YAOS_TEST_ONLY_TIMERS__: string | undefined;
 
 type PersistedPluginState = Partial<VaultSyncSettings> & {
+	_conflictEpisodes?: ConflictEpisodeState;
+	_conflictEpisodeScope?: string;
 	_diskIndex?: DiskIndex;
 	_blobHashCache?: BlobHashCache;
 	/**
@@ -236,6 +241,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private runtimeConfig: RuntimeConfig | null = null;
 
 	private vaultSync: VaultSync | null = null;
+	private conflictEpisodes: ConflictEpisodes | null = null;
+	private readonly openConflictReviews = new Set<string>();
 	private vaultDatabase: VaultIndexedDb | null = null;
 	private bootstrapClient: BootstrapClient | null = null;
 	private bootstrapProgress: BootstrapProgressEvent | null = null;
@@ -615,6 +622,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			updateSettings: (mutator, reason) => this.updateSettings(mutator, reason),
 		});
 		await this.loadSettings();
+		this.setupConflictEpisodes();
+		this.addCommand({ id: "review-conflicts", name: "Review YAOS conflicts", callback: () => this.reviewYaosConflicts() });
+		this.register(() => this.conflictEpisodes?.dispose());
 		if (!this.settings.deviceName.trim()) {
 			this.settings.deviceName = defaultDeviceName(Platform);
 			await this.persistPluginState();
@@ -819,6 +829,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.addSettingTab(this.settingsSyncTab);
 
 		this.statusBarEl = this.addStatusBarItem();
+		this.statusBarEl.addEventListener("click", () => this.reviewYaosConflicts());
 		this.updateStatusBar({ kind: "disconnected" });
 
 		const finishOnload = (outcome: string): void => {
@@ -1105,6 +1116,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			);
 
 			// 4. DiskMirror
+			this.conflictEpisodes?.dispose();
+			this.setupConflictEpisodes();
 			this.diskMirror = new DiskMirror(
 				this.app,
 				this.vaultSync,
@@ -1132,6 +1145,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			);
 			this.bodySettlementRepository = bodySettlements;
 			this.diskMirror.configureSettlement({
+				conflictEpisodes: this.conflictEpisodes ?? undefined,
 				getBaseline: (path) => ({
 					// Include a session agreement whose persistence is held back
 					// while the body's local work settles (recordProjectedDiskWrite).
@@ -2848,6 +2862,94 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		}, Date.now(), `${this.settings.vaultGeneration}\0${this.folderKey ?? ""}`);
 	}
 
+	private setupConflictEpisodes(): void {
+		const scope = `${this.settings.vaultId}\0${this.settings.vaultGeneration}`;
+		const state = this.persistedState._conflictEpisodeScope === scope && this.persistedState._conflictEpisodes
+			? this.persistedState._conflictEpisodes : { episodes: {}, artifacts: {} };
+		this.conflictEpisodes = new ConflictEpisodes(state, {
+			read: async (path) => {
+				const file = this.app.vault.getAbstractFileByPath(path);
+				return file instanceof TFile ? this.app.vault.read(file) : null;
+			},
+			write: async (path, content, expected) => {
+				const file = this.app.vault.getAbstractFileByPath(path);
+				if (expected === null) {
+					if (file) throw new Error("Conflict artifact appeared while creating it");
+					await this.app.vault.create(path, content);
+				} else {
+					if (!(file instanceof TFile)) throw new Error("Conflict artifact disappeared");
+					await this.app.vault.process(file, (current) => {
+						if (current !== expected) throw new Error("Conflict artifact changed while appending");
+						return content;
+					});
+				}
+			},
+			persist: async (snapshot) => this.persistPluginState((persisted) => {
+				persisted._conflictEpisodes = snapshot;
+				persisted._conflictEpisodeScope = scope;
+			}),
+			changed: () => this.refreshStatusBar(),
+			notify: (bodyIds) => {
+				const fragment = document.createDocumentFragment();
+				const button = document.createElement("button");
+				button.textContent = `${bodyIds.length} note${bodyIds.length === 1 ? "" : "s"} need a conflict decision — Review YAOS conflicts`;
+				button.addEventListener("click", () => this.reviewYaosConflicts());
+				fragment.appendChild(button);
+				new Notice(fragment, 12_000);
+			},
+		});
+	}
+
+	private reviewYaosConflicts(): void {
+		new ConflictListModal(this.app, this.conflictEpisodes?.list() ?? [], (bodyId) => {
+			void this.reviewConflictEpisode(bodyId).catch((error: unknown) => {
+				new Notice(`YAOS conflict remains pending: ${formatUnknown(error)}`, 12_000);
+			});
+		}).open();
+	}
+
+	private async reviewConflictEpisode(bodyId: string): Promise<void> {
+		if (this.openConflictReviews.has(bodyId)) return;
+		const episodes = this.conflictEpisodes;
+		const runtime = this.vaultSync;
+		const episode = episodes?.get(bodyId);
+		if (!episodes || !runtime || !episode || !episode.latestDiskHash) return;
+		this.openConflictReviews.add(bodyId);
+		try {
+			const body = await runtime.bodies.load(bodyId);
+			const current = yTextToString(body.doc.getText("body"));
+			if (current === null) throw new Error("Could not read the synchronized body");
+			const disk = await episodes.readVersion(bodyId, episode.latestDiskHash);
+			const base = episode.baseHash ? await episodes.readVersion(bodyId, episode.baseHash) : null;
+			const plannedHash = episode.latestDiskHash;
+			const proof = runtime.bodies.captureRevision(bodyId);
+			const stillCurrent = () => this.vaultSync === runtime && episodes.get(bodyId) === episode
+				&& episode.latestDiskHash === plannedHash
+				&& runtime.bodies.coordinator.isProjectionCurrent(proof, episode.path)
+				&& yTextToString(body.doc.getText("body")) === current;
+			const merge = base === null ? null : mergeThreeWayText(base, disk, current);
+			const conflict = merge?.kind === "conflict" ? merge : {
+				kind: "conflict" as const, outcome: "conflict" as const, base: "", cleanEdits: [],
+				conflicts: [{ baseStart: 0, baseEnd: 0, base: "", disk: merge?.kind === "clean" ? merge.content : disk, body: current }],
+			};
+			const chosen = await reviewThreeWayConflict(this.app, episode.path, conflict, stillCurrent);
+			if (chosen === null) return;
+			if (!stillCurrent()) throw new Error("The note changed during review. Open review again for the current versions.");
+			if (this.shouldBlockFrontmatterIngest(episode.path, current, chosen, "conflict-resolution")) throw new Error("Selected properties are unsafe; repair the preserved version before resolving.");
+			const outcome = await runtime.commitBodyCandidateIfCurrent({
+				bodyId, path: episode.path, expectedContent: current, content: chosen,
+				candidateId: crypto.randomUUID(), reason: "three-way-merge",
+			});
+			if (outcome.kind === "superseded") throw new Error("The synchronized body changed. Review again.");
+			runtime.bodies.coordinator.setDivergence(bodyId, "none");
+			this.diskMirror?.clearPreservedUnresolved(episode.path);
+			await episodes.close(bodyId);
+			this.diskMirror?.scheduleWrite(episode.path);
+		} finally {
+			this.openConflictReviews.delete(bodyId);
+		}
+	}
+
 	private updateStatusBar(connectionState: ConnectionState = this.getCurrentConnectionState()): void {
 		if (!this.statusBarEl) return;
 		const visibleState = this.connectionStateLatch.resolve(connectionState);
@@ -2856,7 +2958,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			(this.diskMirror?.getDebugSnapshot().preservedUnresolved.totalCount ?? 0);
 		const blobAttention =
 			(this.getBlobSync()?.getDebugSnapshot().preservedUnresolved.totalCount ?? 0);
-		const attentionCount = diskAttention + blobAttention;
+		const attentionCount = Math.max(diskAttention, this.conflictEpisodes?.list().length ?? 0) + blobAttention;
 		const serverReceipt = this.vaultSync?.getServerReceiptSnapshot() ?? null;
 		const resourcePressure = this.getOperationalResourceSnapshot()?.currentPressure ?? null;
 		this.noticeServerPersistenceHealth(serverReceipt?.serverPersistenceDegraded ?? false);

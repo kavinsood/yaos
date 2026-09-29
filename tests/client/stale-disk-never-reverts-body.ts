@@ -121,6 +121,7 @@ async function closedBodyFixture(options: {
 	seedContent?: string;
 	/** The frontmatter ingest guard (default: never blocks). */
 	blockFrontmatter?: (previous: string | null, next: string) => boolean;
+	reviewNeverResolves?: boolean;
 }): Promise<ClosedFixture> {
 	const path = "Closed.md";
 	const bodyId = "body-closed";
@@ -289,7 +290,11 @@ async function closedBodyFixture(options: {
 			getBaseline: (requested) => ({ contentHash: currentContentHash(diskIndex[requested]) ?? null }),
 			commitLocalBody,
 			shouldBlockDiskIngest: (_path, current, next) => guard(current, next),
-			reviewConflict: async ({ path: reviewed }) => { reviews.push(reviewed); return null; },
+			reviewConflict: async ({ path: reviewed }) => {
+				reviews.push(reviewed);
+				if (options.reviewNeverResolves) return new Promise<string | null>(() => {});
+				return null;
+			},
 			getCommonBase: async () => commonBase === null
 				? { kind: "missing" as const }
 				: {
@@ -925,6 +930,22 @@ s.test("REVIEW N11: a bound editor that keeps diverging after rebinds is detache
 	assert.equal(fixture.ytext.toString(), REMOTE);
 });
 
+s.test("G1: an unresolved human decision never blocks settlement or opens a modal", async () => {
+	const fixture = await closedBodyFixture({
+		disk: LOCAL, baseline: BASE, loadBody: true, realMirror: true, commonBase: BASE,
+		reviewNeverResolves: true,
+	});
+	fixture.applyRemote(REMOTE);
+	const outcome = await Promise.race([
+		fixture.mirror!.settleBody({ path: "Closed.md", bodyId: "body-closed", generation: 2, content: REMOTE }),
+		new Promise<string>((resolve) => setTimeout(() => resolve("blocked"), 200)),
+	]);
+	assert.equal(outcome, "preserved-unresolved");
+	assert.equal(fixture.artifacts.size, 1);
+	assert.equal(fixture.reviews.length, 0);
+	await fixture.destroy();
+});
+
 s.test("REVIEW N4: a preserved overlap is not preserved or offered for review again by later ingests", async () => {
 	const fixture = await closedBodyFixture({
 		disk: LOCAL, baseline: BASE, loadBody: true, realMirror: true, commonBase: BASE,
@@ -935,7 +956,7 @@ s.test("REVIEW N4: a preserved overlap is not preserved or offered for review ag
 	await fixture.ingest();
 	await fixture.ingest();
 	assert.equal(fixture.artifactWrites.length, 1, "one conflict note per unresolved overlap");
-	assert.deepEqual(fixture.reviews, ["Closed.md"], "one review per unresolved overlap");
+	assert.deepEqual(fixture.reviews, [], "review opens only on explicit user action");
 	assert.equal(fixture.runtime.getPathContent("Closed.md"), REMOTE);
 	assert.equal(fixture.disk(), LOCAL);
 	await fixture.destroy();
@@ -955,7 +976,7 @@ s.test("round 4 (2): external autosaves during an unresolved overlap add no conf
 	}
 	assert.equal(fixture.artifactWrites.length, 1, "the note already holds the body (C); nothing new to preserve");
 	assert.deepEqual(fixture.artifactWrites, [REMOTE]);
-	assert.deepEqual(fixture.reviews, ["Closed.md"], "no second review modal");
+	assert.deepEqual(fixture.reviews, [], "autosaves never open a review modal");
 	assert.equal(fixture.runtime.getPathContent("Closed.md"), REMOTE, "the body is untouched");
 	assert.equal(fixture.disk(), `${LOCAL} (autosave 4)`, "and so is the disk");
 	// A new body state is a new overlap to preserve.
