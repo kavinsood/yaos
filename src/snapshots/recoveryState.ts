@@ -20,11 +20,14 @@ export type RecoveryReadiness =
 	| "gaps"
 	| "failure";
 
-export function getRecoveryReadiness(state: PendingRecoveryState): RecoveryReadiness {
+export function getRecoveryReadiness(
+	state: PendingRecoveryState,
+	recoveryAvailable: boolean | null = null,
+): RecoveryReadiness {
 	const recovery = state.lastRecoveryStatus;
 	const capture = state.lastCaptureStatus;
 	const restore = state.lastRestoreStatus;
-	if (recovery?.storageAvailable === false) return "unavailable";
+	if (recoveryAvailable === false || recovery?.storageAvailable === false) return "unavailable";
 	if (capture?.state === "failed" || restore?.state === "failed") return "failure";
 	if (capture?.state === "retrying" || restore?.state === "retrying" || recovery?.projectionState === "retrying") {
 		return "retrying";

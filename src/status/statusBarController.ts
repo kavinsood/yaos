@@ -2,6 +2,19 @@ import type { ConnectionState } from "../runtime/connectionController";
 import type { VaultSyncReceiptSnapshot } from "../sync/vaultSync";
 import type { RecoveryReadiness } from "../snapshots/recoveryState";
 import type { OperationalResourcePressure } from "../runtime/operationalResourceSnapshot";
+import type { PreservedUnresolvedEntry } from "../sync/preservedUnresolved";
+
+export function getAttentionCount(
+	diskEntries: readonly Pick<PreservedUnresolvedEntry, "path" | "reason">[],
+	conflictEpisodes: readonly { path: string }[],
+	blobEntries: readonly Pick<PreservedUnresolvedEntry, "path">[],
+): number {
+	return new Set([
+		...diskEntries.filter((entry) => entry.reason !== "body-open-deferred").map((entry) => entry.path),
+		...conflictEpisodes.map((episode) => episode.path),
+		...blobEntries.map((entry) => entry.path),
+	]).size;
+}
 
 
 export type ServerReceiptStatus = Readonly<
@@ -87,7 +100,7 @@ export function getLabelFromConnectionState(
 	if (serverReceipt?.serverPersistenceDegraded === true) {
 		base = `${base} · Server not saving`;
 	}
-	if (recovery) {
+	if (recovery && recovery !== "unavailable") {
 		base = `${base} · Recovery ${recovery}`;
 	}
 	if (resourcePressure?.actionable) {
@@ -157,7 +170,7 @@ export function renderConnectionState(
 	const receiptTitle = serverReceipt && shouldShowReceiptStatus(state)
 		? getServerReceiptStatusTitle()
 		: "";
-	const recoveryTitle = recovery
+	const recoveryTitle = recovery && recovery !== "unavailable"
 		? `Recovery is ${recovery}; sync connectivity and recovery preparation are independent.`
 		: "";
 	const resourceTitle = resourcePressure?.actionable

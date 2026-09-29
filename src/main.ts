@@ -146,6 +146,7 @@ import {
 } from "./runtime/setupLinkController";
 import { registerCommands } from "./commands";
 import {
+	getAttentionCount,
 	getLabelFromConnectionState,
 	renderConnectionState,
 } from "./status/statusBarController";
@@ -773,7 +774,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						awaitingFirstProviderSyncAfterStartup: this.awaitingFirstProviderSyncAfterStartup,
 						openFileCount: this.editorWorkspace?.openFileCount ?? 0,
 						recovery: {
-							readiness: getRecoveryReadiness(this.pendingRecoveryState),
+							readiness: getRecoveryReadiness(this.pendingRecoveryState, this.capabilityUpdateService?.capabilities?.snapshots ?? null),
 							storageAvailable: this.pendingRecoveryState.lastRecoveryStatus?.storageAvailable ?? null,
 							projectionState: this.pendingRecoveryState.lastRecoveryStatus?.projectionState ?? null,
 							projectionLag: this.pendingRecoveryState.lastRecoveryStatus?.projectionLag ?? null,
@@ -2850,7 +2851,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				null,
 				null,
 				0,
-				getRecoveryReadiness(this.pendingRecoveryState),
+				getRecoveryReadiness(this.pendingRecoveryState, this.capabilityUpdateService?.capabilities?.snapshots ?? null),
 			).replace(/^YAOS:\s*/, ""),
 		};
 	}
@@ -2976,11 +2977,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		}
 		const visibleState = this.connectionStateLatch.resolve(connectionState);
 		const transferStatus = this.getBlobSync()?.transferStatus;
-		const diskAttention =
-			(this.diskMirror?.getDebugSnapshot().preservedUnresolved.totalCount ?? 0);
-		const blobAttention =
-			(this.getBlobSync()?.getDebugSnapshot().preservedUnresolved.totalCount ?? 0);
-		const attentionCount = Math.max(diskAttention, this.conflictEpisodes?.list().length ?? 0) + blobAttention;
+		const attentionCount = getAttentionCount(
+			this.diskMirror?.getPreservedUnresolvedEntries() ?? [],
+			this.conflictEpisodes?.list() ?? [],
+			this.getBlobSync()?.getPreservedUnresolvedEntries() ?? [],
+		);
 		const serverReceipt = this.vaultSync?.getServerReceiptSnapshot() ?? null;
 		const resourcePressure = this.getOperationalResourceSnapshot()?.currentPressure ?? null;
 		this.noticeServerPersistenceHealth(serverReceipt?.serverPersistenceDegraded ?? false);
@@ -2990,7 +2991,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			transferStatus,
 			serverReceipt,
 			attentionCount,
-			getRecoveryReadiness(this.pendingRecoveryState),
+			getRecoveryReadiness(this.pendingRecoveryState, this.capabilityUpdateService?.capabilities?.snapshots ?? null),
 			resourcePressure,
 		);
 	}
@@ -3085,7 +3086,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			reconcileInFlight: this.reconciliationController?.isReconcileInFlight ?? false,
 			safetyBrakeActive: this.reconciliationController?.getState().lastReconcileStats?.safetyBrakeTriggered ?? false,
 			recovery: {
-				readiness: getRecoveryReadiness(this.pendingRecoveryState),
+				readiness: getRecoveryReadiness(this.pendingRecoveryState, this.capabilityUpdateService?.capabilities?.snapshots ?? null),
 				captureState: this.pendingRecoveryState.lastCaptureStatus?.state ?? null,
 				restoreState: this.pendingRecoveryState.lastRestoreStatus?.state ?? null,
 				projectionState: this.pendingRecoveryState.lastRecoveryStatus?.projectionState ?? null,

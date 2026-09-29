@@ -204,11 +204,13 @@ export class ConnectionController {
 			return { kind: "loading_cache" };
 		}
 
-		const transportConnecting = sync.provider.wsconnecting
-			|| (sync.websocketOpen && sync.applicationResponsive === null);
+		const connected = sync.websocketOpen && sync.applicationResponsive !== false
+			&& (sync.connected || sync.provider.synced);
+		const transportConnecting = sync.applicationResponsive !== false
+			&& (sync.provider.wsconnecting || (sync.websocketOpen && !connected));
 
 		if (!this.deps.isReconciled()) {
-			return sync.connected || transportConnecting
+			return connected || transportConnecting
 				? { kind: "connecting" }
 				: {
 					kind: "offline",
@@ -217,7 +219,7 @@ export class ConnectionController {
 				};
 		}
 
-		if (sync.connected) {
+		if (connected) {
 			return {
 				kind: "online",
 				generation: sync.connectionGeneration,

@@ -118,7 +118,9 @@ export function deriveSyncFacts(
 	const { connected, fatalAuthError, fatalAuthCode } = snapshot;
 
 	const websocketOpen = snapshot.websocketOpen ?? connected;
-	const applicationResponsive = snapshot.applicationResponsive ?? (connected ? true : null);
+	const applicationResponsive = snapshot.applicationResponsive === undefined
+		? (connected ? true : null)
+		: snapshot.applicationResponsive;
 
 	// serverReachable: we can only claim "true" if we've successfully communicated
 	// (ws connected) or the server sent an auth response. Unknown otherwise.
