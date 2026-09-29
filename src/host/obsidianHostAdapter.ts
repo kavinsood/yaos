@@ -1,4 +1,4 @@
-import type { App, PluginManifest, WorkspaceLeaf } from "obsidian";
+import type { App, Modal, PluginManifest, WorkspaceLeaf } from "obsidian";
 import { HostPatchRegistry, type HostPatchRelease } from "./hostPatchRegistry";
 
 export type { HostPatchRelease } from "./hostPatchRegistry";
@@ -19,6 +19,7 @@ export type CommunityPluginInstallCapability = {
 };
 
 export type ObsidianHostAdapter = {
+	openModalInMainWindow(modal: Modal): void;
 	communityEnabledIds(): Set<string>;
 	communityPluginVersion(id: string): string | undefined;
 	communityPluginInstallCapability(): CommunityPluginInstallCapability;
@@ -53,6 +54,7 @@ export function leafIdentity(leaf: WorkspaceLeaf, fallbackPath: string): string 
 /** The sole runtime boundary for Obsidian's undocumented plugin manager. */
 export function createObsidianHostAdapter(app: App, patches = new HostPatchRegistry()): ObsidianHostAdapter {
 	return {
+		openModalInMainWindow: (modal) => openModalInMainWindow(app, modal),
 		communityEnabledIds(): Set<string> {
 			const enabled = app.plugins?.enabledPlugins;
 			return enabled instanceof Set ? new Set([...enabled].filter((id): id is string => typeof id === "string")) : new Set();
@@ -151,4 +153,14 @@ export function createObsidianHostAdapter(app: App, patches = new HostPatchRegis
 			if (typeof workspacePlugin?.loadData === "function") void workspacePlugin.loadData();
 		},
 	};
+}
+
+export function openModalInMainWindow(app: App, modal: Modal, open: () => void = () => modal.open()): void {
+	const mainDocument = app.workspace?.containerEl?.ownerDocument;
+	open();
+	if (!mainDocument?.body || !modal.containerEl) return;
+	if (modal.containerEl.ownerDocument !== mainDocument) {
+		mainDocument.body.appendChild(modal.containerEl);
+	}
+	mainDocument.defaultView?.focus();
 }

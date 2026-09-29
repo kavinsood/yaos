@@ -1,5 +1,6 @@
 import { App, Modal } from "obsidian";
 import type { ConflictEpisode } from "../sync/conflictEpisodes";
+import { openModalInMainWindow } from "../host/obsidianHostAdapter";
 
 export class ConflictListModal extends Modal {
 	constructor(app: App, private readonly episodes: ConflictEpisode[], private readonly review: (bodyId: string) => void) {
@@ -20,5 +21,8 @@ export class ConflictListModal extends Modal {
 	}
 	onClose(): void {
 		this.contentEl.empty();
+	}
+	open(): void {
+		openModalInMainWindow(this.app, this, () => super.open());
 	}
 }

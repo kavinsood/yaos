@@ -1,4 +1,5 @@
 import { type App, Modal } from "obsidian";
+import { openModalInMainWindow } from "../host/obsidianHostAdapter";
 import {
 	resolveThreeWayText,
 	type ThreeWayConflictChoice,
@@ -73,6 +74,10 @@ export class ThreeWayConflictModal extends Modal {
 				this.choices as ThreeWayConflictChoice[],
 			));
 		});
+	}
+
+	open(): void {
+		openModalInMainWindow(this.app, this, () => super.open());
 	}
 
 	onClose(): void {

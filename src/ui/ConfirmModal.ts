@@ -1,4 +1,5 @@
 import { type App, Modal } from "obsidian";
+import { openModalInMainWindow } from "../host/obsidianHostAdapter";
 
 /**
  * Simple confirmation modal with a message and confirm/cancel buttons.
@@ -40,6 +41,10 @@ export class ConfirmModal extends Modal {
 			this.close();
 			void this.onConfirm();
 		});
+	}
+
+	open(): void {
+		openModalInMainWindow(this.app, this, () => super.open());
 	}
 
 	onClose(): void {

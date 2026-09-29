@@ -14,6 +14,7 @@ safely instead of assuming an implementation detail is present.
 | Capability | Host behavior | YAOS use | Safe fallback |
 | --- | --- | --- | --- |
 | Leaf identity | optional `WorkspaceLeaf.id` | distinguish concurrent editor bindings | canonical file path |
+| Main-window modals | Modal placement after `open`, capability-checked DOM adoption to `workspace.containerEl.ownerDocument` | user-requested reviews and background confirmations stay in the main vault window | retain host placement when the main document or modal container is unavailable |
 | Community-plugin manager | optional `app.plugins` operations and manifest map | opt-in settings environment install/enable work | skip that step and retain the queued plan/manual instruction |
 | Community-plugin observation | `installPlugin` and `enablePluginAndSave` | record user-initiated catalog installs for settings sync | no observation; no host operation is changed |
 | Workspace refresh | internal workspaces plugin lookup | refresh workspace names after settings apply | no refresh |

@@ -76,4 +76,20 @@ s.test("adapter observes installer completion and safely degrades without host A
 	s.check(leafIdentity({ id: "leaf-a" } as never, "fallback") === "leaf-a" && leafIdentity({} as never, "fallback") === "fallback", "leaf identity has a stable fallback");
 });
 
+s.test("G2: a modal from a focused popout is adopted into the main vault window", async () => {
+	const popoutDocument = {};
+	let focused = 0;
+	const container = { ownerDocument: popoutDocument };
+	const mainDocument = {
+		body: { appendChild: (child: typeof container) => { child.ownerDocument = mainDocument; } },
+		defaultView: { focus: () => { focused++; } },
+	};
+	let opens = 0;
+	const modal = { containerEl: container, open: () => { opens++; } };
+	const adapter = createObsidianHostAdapter({ workspace: { containerEl: { ownerDocument: mainDocument } } } as never);
+	adapter.openModalInMainWindow(modal as never);
+	s.check(container.ownerDocument === mainDocument, "modal is in the main document, not the popout");
+	s.check(opens === 1 && focused === 1, "opens once and brings the main window to the foreground");
+});
+
 await s.done();
