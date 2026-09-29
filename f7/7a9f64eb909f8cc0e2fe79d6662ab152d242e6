@@ -1,0 +1,21 @@
+tests/server/G7-bootstrap-node.ts
+  s_06158d5aa75452::t_30b9aa762ac5c7 1,15-17
+tests/server/G7-bootstrap-routes-node.ts
+  s_06158d5aa75452::t_da57e95cece59f 1,16-18
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "f77a9f64eb909f8cc0e2fe79d6662ab152d242e6",
+  "prompts": {},
+  "sessions": {
+    "s_06158d5aa75452": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aabbc0b8c933cb988",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
