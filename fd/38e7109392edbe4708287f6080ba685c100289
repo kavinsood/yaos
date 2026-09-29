@@ -1,0 +1,55 @@
+scripts/relay2/reset/bloat.ts
+  s_06158d5aa75452::t_25e73d3dba1ab4 1-59
+scripts/relay2/reset/builder.ts
+  s_06158d5aa75452::t_7612f76722b6fd 1-252
+scripts/relay2/reset/fixtures.ts
+  s_06158d5aa75452::t_a193baa75d946e 1-202
+scripts/relay2/reset/k2-governor.mjs
+  s_06158d5aa75452::t_4ca3f06a24e255 1-44
+scripts/relay2/reset/k2-task.ts
+  s_9ad601cc7abbf7::t_7f7348a72a7b9f 1-105
+scripts/relay2/reset/k2-worker.mjs
+  s_06158d5aa75452::t_e776cab6fe7cba 1-65
+scripts/relay2/reset/leaseClient.ts
+  s_06158d5aa75452::t_c46c2b415d8d6c 1-369
+scripts/relay2/reset/mockServer.ts
+  s_3fa8c41e3d4d37::t_0fd4ce6d390bbf 1-391
+scripts/relay2/reset/policy.ts
+  s_9ad601cc7abbf7::t_f3b4673cd40b3b 1-165
+tests/client/relay2-reset-policy.ts
+  s_9ad601cc7abbf7::t_23a4a74812aad8 1-110
+tests/client/relay2-reset-race.ts
+  s_3fa8c41e3d4d37::t_924a148e11ee5a 1-286
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "fd38e7109392edbe4708287f6080ba685c100289",
+  "prompts": {},
+  "sessions": {
+    "s_06158d5aa75452": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aabbc0b8c933cb988",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_3fa8c41e3d4d37": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a0da75a62b227384a",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_9ad601cc7abbf7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a0c3f851a1219b01f",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
