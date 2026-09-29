@@ -1,0 +1,19 @@
+docs/phase0-no-baseline-frontmatter-decision.md
+  s_06158d5aa75452::t_8ca4aafdb8f434 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "9a4c3ad722dc4badac78bd37af379fbaa8046484",
+  "prompts": {},
+  "sessions": {
+    "s_06158d5aa75452": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aabbc0b8c933cb988",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
