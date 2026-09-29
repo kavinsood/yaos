@@ -375,9 +375,9 @@ export async function K1(ctx: RunCtx): Promise<Result> {
 		await sleep(1500);
 	}
 	const d00 = await diagnostics(ctx.context.devices.A!);
-	for (const tail of tails) {
+	for (const [ti, tail] of tails.entries()) {
 		for (let rep = 0; rep < repeats; rep++) {
-			const body = await freshTraceBody(ctx, trace, `k1-${tail}-${rep}`);
+			const body = await freshTraceBody(ctx, trace, `k1-${tail}-${ti}-${rep}`);
 			const a = await openOrThrow(await ctx.client("A", body), 60_000);
 			const n = Math.min(tail, trace.frames.length);
 			const replay = await replayTrace(a, trace.frames, rate, { limit: n });

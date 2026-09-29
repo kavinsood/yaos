@@ -105,8 +105,14 @@ context() {
   [[ -f $ctx ]] && return 0
   say "context $suffix (claim + standard seed)"
   (( DRY )) && return 0
-  (cd $TREE && RELAY2_WORKTREE=$TREE node tests/run-typescript.mjs --test-aliases scripts/relay2/context.ts --host $(host $suffix) --devices A,B,C --seed standard) \
-    > $LOGS/context-$suffix.log 2>&1 || { say "CONTEXT FAILED $suffix"; return 1; }
+  # A just-deployed worker can answer the claim with 503 for a few seconds after capabilities is already 200.
+  local attempt
+  for attempt in 1 2 3 4; do
+    (cd $TREE && RELAY2_WORKTREE=$TREE node tests/run-typescript.mjs --test-aliases scripts/relay2/context.ts --host $(host $suffix) --devices A,B,C --seed standard) \
+      >> $LOGS/context-$suffix.log 2>&1 && return 0
+    say "context $suffix attempt $attempt failed; retry in 20 s"; sleep 20
+  done
+  say "CONTEXT FAILED $suffix"; return 1
 }
 
 setup() { deploy "$@" && context $1; }
