@@ -15,6 +15,12 @@ export async function diagnostics(identity: LiveIdentity, full = false): Promise
 	const response = await fetch(vaultRoute(identity, "debug/recent"), { headers: deviceBearerHeaders(identity) });
 	const value = await json(response);
 	if (!value) return { status: response.status };
+	// Relay deploys expose counters on GET /diagnostics (protocol doc §5.4); absent/404 on base.
+	if (value.relay === undefined) {
+		const r = await fetch(vaultRoute(identity, "diagnostics"), { headers: deviceBearerHeaders(identity) }).catch(() => null);
+		const d = r?.ok ? await json(r) : null;
+		if (d?.relay !== undefined) value.relay = d.relay;
+	}
 	if (full) return { at: Date.now(), elapsedMs: r2(now() - t0), ...value };
 	const loaded = (value.loaded as Array<Obj> | undefined) ?? [];
 	const durable = (value.semanticCompactionDurable as Array<Obj> | undefined) ?? [];

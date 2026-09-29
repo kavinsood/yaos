@@ -43,6 +43,8 @@ export interface ProtocolAdapter {
 	isAck(control: Control, client: RawClient): boolean;
 	/** Echoed client frame id in an ack, if the protocol has one. */
 	ackFrameId(control: Control): string | null;
+	/** Acks without an echoed frame id never satisfy waitAck (relay: unpaired envelope = no receipt). */
+	requireEcho?: boolean;
 }
 
 export function contentHashOf(text: string): { contentHash: string; size: number } {
@@ -59,27 +61,31 @@ export const baseAdapter: ProtocolAdapter = {
 };
 
 /**
- * Relay v2 adapter. Frame layout follows docs/relay2-protocol.md once published by the server-core
- * agent; until then field names are provisional (RELAY2_ENVELOPE_TYPE overrides the type name).
- * The envelope is a `__YPS:` text frame immediately preceding each binary update.
+ * Relay v2 adapter, per docs/relay2-protocol.md §3.2/§4.1: a `__YPS:` BODY_UPDATE_ENVELOPE text frame
+ * immediately before each binary step2/update. payloadDigest = sha256 hex of the INNER update bytes.
+ * stateVector (client SV after applying) is included by default because the server records
+ * contentHash/size only when it equals the merged SV after the append (D6 currentness).
+ * The origin ack is the relay BODY_COMMITTED (relay:true) echoing clientFrameId.
  */
-export function relayAdapter(options: { envelopeType?: string; includeStateVector?: boolean } = {}): ProtocolAdapter {
+export function relayAdapter(options: { envelopeType?: string; includeStateVector?: boolean; includeCandidate?: boolean } = {}): ProtocolAdapter {
 	const type = options.envelopeType ?? process.env.RELAY2_ENVELOPE_TYPE ?? "BODY_UPDATE_ENVELOPE";
+	const sv = options.includeStateVector ?? true;
+	const cand = options.includeCandidate ?? true;
 	return {
-		name: `relay:${type}`,
+		name: `relay:${type}${sv ? "" : ":nosv"}${cand ? "" : ":nocand"}`,
+		requireEcho: true,
 		envelope(client, frame) {
 			const { contentHash, size } = contentHashOf(frame.text);
 			const digest = createHash("sha256").update(frame.update).digest("hex");
 			const value: Control = {
 				type, bodyId: client.body, bodyEpoch: client.bodyEpoch, clientFrameId: frame.clientFrameId,
-				candidateId: frame.clientFrameId, payloadDigest: digest, contentHash, size,
-				// step2 carries whole-doc diffs; only authoritative text snapshots update currentness.
-				frameKind: frame.kind,
+				payloadDigest: digest, contentHash, size, frameKind: frame.kind,
 			};
-			if (options.includeStateVector) value.stateVector = Buffer.from(Y.encodeStateVector(client.doc)).toString("base64");
+			if (cand) { value.candidateId = frame.clientFrameId; value.candidateDigest = digest; }
+			if (sv) value.stateVector = Buffer.from(Y.encodeStateVector(client.doc)).toString("base64");
 			return [`__YPS:${JSON.stringify(value)}`];
 		},
-		isAck: (c, client) => (c.type === "BODY_COMMITTED" || c.type === "BODY_RELAYED")
+		isAck: (c, client) => c.type === "BODY_COMMITTED" && c.relay === true
 			&& (c.bodyId === undefined || c.bodyId === client.body),
 		ackFrameId: (c) => typeof c.clientFrameId === "string" ? c.clientFrameId : null,
 	};
@@ -87,8 +93,9 @@ export function relayAdapter(options: { envelopeType?: string; includeStateVecto
 
 export function adapterFor(name: string | undefined): ProtocolAdapter {
 	if (!name || name === "base") return baseAdapter;
-	if (name === "relay") return relayAdapter();
-	if (name === "relay-sv") return relayAdapter({ includeStateVector: true });
+	if (name === "relay" || name === "relay-sv") return relayAdapter();
+	if (name === "relay-nosv") return relayAdapter({ includeStateVector: false });
+	if (name === "relay-nocand") return relayAdapter({ includeCandidate: false });
 	throw new Error(`unknown adapter ${name}`);
 }
 
@@ -121,6 +128,8 @@ export class RawClient {
 	controlListeners: Array<(value: Control, at: number) => void> = [];
 	/** Acks (per adapter) with arrival time and echoed frame id. */
 	acks: Array<{ at: number; frameId: string | null; value: Control }> = [];
+	/** BODY_UPDATE_REJECTED / VAULT_BACKPRESSURE / error control frames (relay failure signals). */
+	rejects: Array<{ at: number; value: Control }> = [];
 	closeListeners: Array<(code: number, reason: string) => void> = [];
 	/** When false, local doc updates are not forwarded (used for offline edits). */
 	forwardLocal = true;
@@ -221,6 +230,10 @@ export class RawClient {
 					try { value = JSON.parse(text.slice(6)); } catch { return; }
 					if (this.keepControls) this.controls.push({ at, value });
 					if (this.controls.length > 20_000) this.controls.splice(0, 10_000);
+					if (value.type === "BODY_UPDATE_REJECTED" || value.type === "VAULT_BACKPRESSURE" || value.type === "error") {
+						this.rejects.push({ at, value });
+						if (this.rejects.length > 5000) this.rejects.splice(0, 2500);
+					}
 					if (value.type === "VAULT_READY") { this.readyAt = at; this.runtimeEpoch = value.runtimeEpoch ?? null; }
 					if (this.adapter.isAck(value, this)) {
 						this.acks.push({ at, frameId: this.adapter.ackFrameId(value), value });
@@ -314,13 +327,14 @@ export class RawClient {
 	 * otherwise (base) the first ack arriving after `since` counts.
 	 */
 	async waitAck(frameId: string, since: number, timeoutMs: number): Promise<{ at: number; value: Control } | null> {
-		const matches = (a: { at: number; frameId: string | null }) => a.frameId === null ? a.at >= since : a.frameId === frameId;
+		const strict = this.adapter.requireEcho === true;
+		const matches = (a: { at: number; frameId: string | null }) => a.frameId === null ? !strict && a.at >= since : a.frameId === frameId;
 		const seen = this.acks.find(matches);
 		if (seen) return seen;
 		return this.waitControl((v) => {
 			if (!this.adapter.isAck(v, this)) return false;
 			const echoed = this.adapter.ackFrameId(v);
-			return echoed === null || echoed === frameId;
+			return echoed === null ? !strict : echoed === frameId;
 		}, timeoutMs);
 	}
 

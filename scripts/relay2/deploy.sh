@@ -2,6 +2,11 @@
 # Relay v2 spike deploy helper.
 #
 #   scripts/relay2/deploy.sh <name> [--relay on|off] [--var KEY=VALUE]... [--no-debug-routes] [--dry-run]
+#        [--src <tree>] [--require-clean]
+#
+# --src deploys server/ from another checkout (e.g. a clean `git worktree add` at a pinned SHA) instead of
+# this worktree; --require-clean aborts when server/src, server/scripts or server/vendor have uncommitted
+# changes (use for full-n baseline/relay deploys so the recorded spikeSha is exactly what ran).
 #
 # <name> must start with "yaos-relay2-". Generates server/wrangler.relay2-<suffix>.toml (gitignored via
 # .git/info/exclude) from experiments/wrangler.exp.template.toml after a drift check against
@@ -21,6 +26,7 @@ shift
 RELAY=off
 DEBUG_ROUTES=1
 DRY=0
+CLEAN=0
 typeset -a VARS
 while (( $# )); do
   case $1 in
@@ -28,6 +34,8 @@ while (( $# )); do
     --var) VARS+=("$2"); shift 2;;
     --no-debug-routes) DEBUG_ROUTES=0; shift;;
     --dry-run) DRY=1; shift;;
+    --src) WT=${2:A}; shift 2;;
+    --require-clean) CLEAN=1; shift;;
     *) echo "unknown arg $1" >&2; exit 2;;
   esac
 done
@@ -82,7 +90,8 @@ grep -A50 '^\[vars\]' $TOML || true
 
 SPIKE_SHA=$(git -C $WT rev-parse HEAD)
 DIRTY=$(git -C $WT status --porcelain -- server/src server/scripts server/vendor | wc -l | tr -d ' ')
-echo "spike sha $SPIKE_SHA (dirty server files: $DIRTY)"
+echo "spike sha $SPIKE_SHA src $WT (dirty server files: $DIRTY)"
+if (( CLEAN && DIRTY > 0 )); then echo "--require-clean: $WT has uncommitted server changes; refusing" >&2; exit 3; fi
 (( DRY )) && { echo "dry run; not deploying"; exit 0; }
 
 OUT=$LOGDIR/deploy-$NAME.wrangler.out
@@ -98,11 +107,11 @@ URL=$(grep -Eo "https://$NAME\.[a-z0-9-]+\.workers\.dev" $OUT | tail -1)
 VARS_JSON=$(for kv in "${ALLVARS[@]}"; do print -r -- "$kv"; done | node -e '
   const lines=require("fs").readFileSync(0,"utf8").split("\n").filter(Boolean);
   console.log(JSON.stringify(Object.fromEntries(lines.map(l=>[l.slice(0,l.indexOf("=")),l.slice(l.indexOf("=")+1)]))));')
-JSON_OUT=$JSON node -e '
+JSON_OUT=$JSON SRC_TREE=$WT node -e '
   const [name,url,relay,version,raw,gz,startup,sha,dirty,source,vars]=process.argv.slice(1);
   const out={workerName:name,host:url,relay:relay==="on",deploymentVersionId:version||null,
     bundle:{uploadKiB:raw?Number(raw):null,gzipKiB:gz?Number(gz):null},startupMs:startup?Number(startup):null,
-    spikeSha:sha,dirtyServerFiles:Number(dirty),configSource:source,vars:JSON.parse(vars),deployedAt:new Date().toISOString()};
+    spikeSha:sha,srcTree:process.env.SRC_TREE,dirtyServerFiles:Number(dirty),configSource:source,vars:JSON.parse(vars),deployedAt:new Date().toISOString()};
   require("fs").writeFileSync(process.env.JSON_OUT,JSON.stringify(out,null,2)+"\n");console.log(JSON.stringify(out));' \
   $NAME $URL $RELAY "$VERSION" "$RAW" "$GZ" "$STARTUP" $SPIKE_SHA $DIRTY $SOURCE "$VARS_JSON"
 

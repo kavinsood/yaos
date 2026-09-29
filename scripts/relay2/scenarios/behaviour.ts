@@ -30,8 +30,28 @@ async function wakeProbe(a: RawClient, b: RawClient, label: string): Promise<Res
 		a.waitAck(tracked.frameId, tracked.sentAt, 15_000)]);
 	tracker.stop();
 	await sleep(1000);
-	return { label, sent: true, propagationMs: p, ackMs: k ? r2(k.at - tracked.sentAt) : null, ack: k?.value ?? null,
+	const out: Result = { label, sent: true, propagationMs: p, ackMs: k ? r2(k.at - tracked.sentAt) : null, ack: k?.value ?? null,
 		aClosed: a.closed, bClosed: b.closed };
+	// Base closes a socket that outlived its runtime (1008 "socket authority mismatch") on the next
+	// runtime-dependent frame. Measure what a real client pays: reconnect + sync until B sees the edit.
+	if (p === null && (!a.isOpen || !b.isOpen)) {
+		const marker = ` ${label} `;
+		const closeAt = Math.min(...[a.closed?.at, b.closed?.at].filter((x): x is number => typeof x === "number" && x >= tracked.sentAt));
+		const reopenStart = now();
+		const reopenA = !a.isOpen ? await a.open(30_000) : null;
+		const reopenB = !b.isOpen ? await b.open(30_000) : null;
+		const deadline = now() + 15_000;
+		while (now() < deadline && !b.text().includes(marker)) await sleep(10);
+		out.recovery = { reopenedA: reopenA?.status ?? null, reopenedB: reopenB?.status ?? null,
+			delivered: b.text().includes(marker),
+			// Harness-inclusive (starts after the probe's 15 s wait); do not report as latency.
+			editToVisibleViaReconnectMs: b.text().includes(marker) ? r2(now() - tracked.sentAt) : null,
+			closeAfterEditMs: Number.isFinite(closeAt) ? r2(closeAt - tracked.sentAt) : null,
+			reconnectToVisibleMs: b.text().includes(marker) ? r2(now() - reopenStart) : null,
+			// What an immediately-reconnecting client pays: server close latency + reopen/sync to peer visibility.
+			clientPathMs: b.text().includes(marker) && Number.isFinite(closeAt) ? r2(closeAt - tracked.sentAt + now() - reopenStart) : null };
+	}
+	return out;
 }
 
 /** Idle ≥150 s with no app traffic (raw clients send no pings), edit on the same sockets; then simulate-restart and repeat. */

@@ -61,6 +61,12 @@ export async function X1(ctx: RunCtx): Promise<Result> {
 		const alive = clients.filter((c) => c.isOpen).length;
 		const diag = await diagnostics(ctx.context.devices.A!);
 		let probe: Result = { skipped: true };
+		// Saturated (e.g. base MAX_BODY_SOCKETS=32): free two slots so the probe measures latency at ~cap.
+		let probeFreedSlots = 0;
+		if (stepFailures > 0) {
+			for (const c of clients.filter((x) => x.isOpen).slice(-2)) { await c.close(); probeFreedSlots++; }
+			await sleep(500);
+		}
 		const pa = new RawClient(ctx.context.devices.A!, probeBody!, undefined, ctx.adapter);
 		const pb = new RawClient(ctx.context.devices.B!, probeBody!, undefined, ctx.adapter);
 		const [oa, ob] = [await pa.open(30_000), await pb.open(30_000)];
@@ -71,11 +77,14 @@ export async function X1(ctx: RunCtx): Promise<Result> {
 		await pa.close(); await pb.close();
 		const closeCodes: Record<string, number> = {};
 		for (const c of clients) if (c.closed) closeCodes[c.closed.code] = (closeCodes[c.closed.code] ?? 0) + 1;
-		stepResults.push({ target, open: alive, attempted: stepAttempts, failed: stepFailures, openMs, closeCodes, probe, diag });
+		stepResults.push({ target, open: alive, attempted: stepAttempts, failed: stepFailures, openMs, closeCodes, probeFreedSlots, probe, diag });
 		log(`X1 step ${target}: alive=${alive} failed=${stepFailures}/${stepAttempts} probe p50=${(probe.propagationMs as { summary?: { p50: number } } | undefined)?.summary?.p50}`);
 		if (stepFailures > 0 && stepFailures / Math.max(1, stepAttempts) > stopFail) break;
 	}
 	const sample = clients.find((c) => c.isOpen);
+	// Release every other socket first so fresh C is not refused by the socket cap.
+	await Promise.all(clients.filter((c) => c !== sample).map(async (c) => { if (c.isOpen) await c.close(); }));
+	await sleep(1000);
 	const conv = sample ? await convergence({ bodyId: sample.body, clients: [sample], fresh: await ctx.dev("C"), adapter: ctx.adapter }) : null;
 	await Promise.all(clients.map((c) => { c.terminate(); c.doc.destroy(); return null; }));
 	const failureModes: Record<string, number> = {};

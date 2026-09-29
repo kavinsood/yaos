@@ -6,7 +6,7 @@ import { createWriteStream, readFileSync } from "node:fs";
 import { join } from "node:path";
 import * as Y from "yjs";
 import { readFrozenFrames, readTraceManifest } from "../../pathology-lab/trace";
-import type { LiveIdentity } from "../../../tests/live/liveIdentity";
+import { deviceBearerHeaders, type LiveIdentity } from "../../../tests/live/liveIdentity";
 import { vaultRoute } from "../../../tests/live/schema4Live";
 import { EXP_ROOT, LOG_DIR, type Args, flagNum, flagStr, log, now, r2, sleep, workerName } from "./common";
 import { type Context, createBodyFromUpdate, device, refreshOperatorCookie, seedNotes, smallContent } from "./context";
@@ -193,10 +193,15 @@ export async function operatorVaultPost(ctx: RunCtx, suffix: string) {
 	return { status: response.status, value };
 }
 
+/**
+ * Revoke a device as the vault owner (device A): DELETE /vault/:id/devices/:deviceId. Collaboration devices
+ * (principalId set) cannot be revoked through the operator route (409 collaboration_authority_required).
+ */
 export async function revokeDevice(ctx: RunCtx, deviceId: string) {
-	const go = () => fetch(`${ctx.host}/operator/devices/${encodeURIComponent(deviceId)}`, { method: "DELETE", headers: { cookie: ctx.context.operatorCookie } });
-	let response = await go();
-	if (response.status === 401) { await refreshOperatorCookie(ctx.context); response = await go(); }
+	const owner = ctx.context.devices.A!;
+	const response = await fetch(vaultRoute(owner, `devices/${encodeURIComponent(deviceId)}`), {
+		method: "DELETE", headers: { ...deviceBearerHeaders(owner), "content-type": "application/json" },
+		body: JSON.stringify({ requestId: `r2-revoke-${deviceId}-${Date.now()}` }) });
 	return { status: response.status, body: (await response.text()).slice(0, 300) };
 }
 
