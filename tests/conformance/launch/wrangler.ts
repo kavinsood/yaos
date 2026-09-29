@@ -22,6 +22,8 @@ export async function launchWrangler(): Promise<LaunchedRuntime> {
 			return spawn(resolve(REPO_ROOT, "server/node_modules/.bin/wrangler"), [
 				"dev", "--ip", "127.0.0.1", "--port", String(port), "--local-protocol", "http",
 				"--persist-to", persistDir, "--log-level", "error",
+				// Relay v2 spike: flag-on suite runs.
+				...(process.env.YAOS_RELAY_BODIES ? ["--var", `YAOS_RELAY_BODIES:${process.env.YAOS_RELAY_BODIES}`] : []),
 			], {
 				cwd: resolve(REPO_ROOT, "server"), detached: true, stdio: ["ignore", "pipe", "pipe"],
 				env: { ...env, CLOUDFLARE_INCLUDE_PROCESS_ENV: "false", CLOUDFLARE_LOAD_DEV_VARS_FROM_DOT_ENV: "false" },

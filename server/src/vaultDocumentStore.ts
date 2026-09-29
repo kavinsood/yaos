@@ -5,6 +5,7 @@ import type { BodyLifecycle, CatalogHeadAtBoundary, SemanticCatalogHead } from "
 import type { HistoryPin } from "./vaultBootstrapStore";
 import type { VaultActorContext, VaultRole } from "./collaboration";
 import { MAX_DURABLE_UPDATE_BYTES, SQLITE_ROW_SAFE_BYTES } from "./shared/durableLimits";
+import { mergeUpdates as mergeUpdateBytes } from "./crdt/ywasmByteOps";
 import {
 	INITIAL_SEMANTIC_EPOCH,
 	nextSemanticEpoch,
@@ -42,7 +43,7 @@ function rotateRight(value: number, bits: number): number {
 }
 
 /** Synchronous, allocation-bounded SHA-256 for storage transactions. */
-function sha256HexSync(bytes: Uint8Array): string {
+export function sha256HexSync(bytes: Uint8Array): string {
 	const state = SHA256_INITIAL.slice();
 	const words = new Uint32Array(64);
 	const processBlock = (block: Uint8Array): void => {
@@ -165,6 +166,21 @@ export interface CheckpointWriteResult {
 	totalBytes: number;
 	stateSha256: string;
 	rowsWritten: number;
+}
+
+/** Relay v2 spike: byte-level durable state (see `durableMergedBytes`). */
+export interface DurableMergedBytes {
+	documentId: string;
+	throughSequence: number;
+	/** Sequence of the last row merged (checkpoint sequence when the tail is empty). */
+	latestSequence: number;
+	generation: number;
+	semanticEpoch: SemanticEpoch;
+	checkpointSequence: number;
+	tailEntries: number;
+	tailBytes: number;
+	bytes: Uint8Array;
+	rowsRead: number;
 }
 
 export interface SemanticResetResult extends CheckpointWriteResult {
@@ -995,9 +1011,40 @@ export abstract class VaultDocumentStore {
 		return metadata.vaultGeneration;
 	}
 
+	/**
+	 * Relay v2 spike: bumped by every in-process authority writer so
+	 * {@link validateActorCached} never serves a stale "allowed".
+	 */
+	private authorityVersion = 0;
+	private readonly actorValidationCache = new Map<string, { version: number; at: number }>();
+
+	/** Relay v2 spike: invalidates cached actor validations. */
+	bumpAuthorityVersion(): void {
+		this.authorityVersion++;
+		this.actorValidationCache.clear();
+	}
+
+	/**
+	 * Relay v2 spike: `validateActor` with a per-instance cache of "allowed"
+	 * results, keyed by the full actor context. Invalidated by
+	 * {@link bumpAuthorityVersion} (all authority writers) and a short TTL.
+	 */
+	validateActorCached(actor: VaultActorContext, now = Date.now(), ttlMs = 5_000): "allowed" | "authority_superseded" {
+		const key = `${actor.vaultId}\u0000${actor.vaultGeneration}\u0000${actor.principalId}\u0000${actor.membershipRevision}\u0000${actor.deviceId}\u0000${actor.deviceCredentialRevision}\u0000${actor.role}\u0000${actor.policyVersion}\u0000${actor.capabilityDigest}`;
+		const cached = this.actorValidationCache.get(key);
+		if (cached && cached.version === this.authorityVersion && now - cached.at < ttlMs && now >= cached.at) return "allowed";
+		const result = this.validateActor(actor);
+		if (result === "allowed") {
+			if (this.actorValidationCache.size >= 1024) this.actorValidationCache.clear();
+			this.actorValidationCache.set(key, { version: this.authorityVersion, at: now });
+		} else this.actorValidationCache.delete(key);
+		return result;
+	}
+
 	revokeDevice(deviceId: string, now = Date.now()): void {
 		this.initialize();
 		if (!deviceId || deviceId.length > 128) throw new Error("invalid device identity");
+		this.bumpAuthorityVersion();
 		this.storage.sql.exec(
 			"INSERT OR IGNORE INTO vault_revoked_devices(device_id, revoked_at) VALUES (?, ?)",
 			deviceId,
@@ -1093,6 +1140,7 @@ export abstract class VaultDocumentStore {
 			return existing;
 		}
 		const installedAt = input.now ?? Date.now();
+		this.bumpAuthorityVersion();
 		this.storage.transactionSync(() => {
 			for (const subject of input.subjects) {
 				if ("deviceId" in subject) {
@@ -1144,6 +1192,7 @@ export abstract class VaultDocumentStore {
 			) VALUES (?, ?, ?, ?, ?)`, input.changeId, input.vaultId, input.vaultGeneration,
 				input.subjectDigest, installedAt).toArray();
 		});
+		this.bumpAuthorityVersion();
 		return { changeId: input.changeId, vaultId: input.vaultId,
 			vaultGeneration: input.vaultGeneration, subjectDigest: input.subjectDigest, installedAt };
 	}
@@ -1447,6 +1496,83 @@ export abstract class VaultDocumentStore {
 		}
 	}
 
+	/**
+	 * Relay v2 spike (D5.3): the durable merged state of a document as bytes
+	 * (latest checkpoint + journal tail merged with ywasm byte ops), without
+	 * materialising a CRDT document. Same checkpoint/epoch rules as
+	 * {@link reconstructDocument}.
+	 */
+	durableMergedBytes(documentId: string, throughSequence = this.currentSequence()): DurableMergedBytes {
+		this.initialize();
+		if (throughSequence < 0) throw new Error("throughSequence must be non-negative");
+		let rowsRead = 0;
+		const checkpointRows = this.storage.sql.exec<CheckpointStorageRow>(
+			`WITH target AS (
+			   SELECT MAX(checkpoint_sequence) AS checkpoint_sequence FROM (
+			     SELECT checkpoint_sequence FROM vault_checkpoints
+			      WHERE document_id = ? AND checkpoint_sequence <= ?
+			     UNION ALL
+			     SELECT checkpoint_sequence FROM vault_checkpoint_manifests
+			      WHERE document_id = ? AND checkpoint_sequence <= ?
+			   )
+			 )
+			 SELECT target.checkpoint_sequence,
+			        manifest.generation AS manifest_generation,
+			        manifest.semantic_epoch AS manifest_semantic_epoch, manifest.chunk_count,
+			        manifest.total_byte_length, manifest.state_sha256, manifest.complete,
+			        chunk.generation AS chunk_generation, chunk.semantic_epoch AS chunk_semantic_epoch, chunk.chunk_index,
+			        chunk.chunk_byte_length, chunk.chunk_sha256, chunk.data
+			 FROM target
+			 LEFT JOIN vault_checkpoint_manifests manifest
+			   ON manifest.document_id = ? AND manifest.checkpoint_sequence = target.checkpoint_sequence
+			 LEFT JOIN vault_checkpoints chunk
+			   ON chunk.document_id = ? AND chunk.checkpoint_sequence = target.checkpoint_sequence
+			 WHERE target.checkpoint_sequence IS NOT NULL
+			 ORDER BY chunk.chunk_index`,
+			documentId, throughSequence,
+			documentId, throughSequence,
+			documentId, documentId,
+		);
+		const checkpointChunks = checkpointRows.toArray();
+		rowsRead += checkpointRows.rowsRead;
+		const checkpoint = decodeVerifiedCheckpoint(checkpointChunks);
+		const checkpointSequence = checkpoint?.checkpointSequence ?? 0;
+		let generation = checkpoint?.generation ?? 0;
+		const semanticEpoch = checkpoint?.semanticEpoch ?? INITIAL_SEMANTIC_EPOCH;
+		const updates: Uint8Array[] = checkpoint ? [checkpoint.bytes] : [];
+		const journal = this.storage.sql.exec<{
+			sequence: number; generation: number; semantic_epoch: number;
+			update_byte_length: number; data: DurableChunkValue;
+		}>(
+			`SELECT sequence, generation, semantic_epoch, update_byte_length, data
+			 FROM vault_journal
+			 WHERE document_id = ? AND sequence > ? AND sequence <= ?
+			 ORDER BY sequence`,
+			documentId, checkpointSequence, throughSequence,
+		);
+		let tailEntries = 0;
+		let tailBytes = 0;
+		let latestSequence = checkpointSequence;
+		for (const row of journal) {
+			const update = new Uint8Array(row.data);
+			if (update.byteLength !== row.update_byte_length || update.byteLength === 0) {
+				throw new Error("journal update length mismatch");
+			}
+			if (parseSemanticEpoch(row.semantic_epoch) !== semanticEpoch) {
+				throw new Error("journal crosses a semantic epoch without a checkpoint");
+			}
+			updates.push(update);
+			generation = row.generation;
+			latestSequence = row.sequence;
+			tailEntries++;
+			tailBytes += update.byteLength;
+		}
+		rowsRead += journal.rowsRead;
+		const bytes = updates.length === 1 ? updates[0]! : mergeUpdateBytes(updates);
+		return { documentId, throughSequence, latestSequence, generation, semanticEpoch, checkpointSequence,
+			tailEntries, tailBytes, bytes, rowsRead };
+	}
+
 	writeCheckpoint(documentId: string, throughSequence = this.currentSequence()): CheckpointWriteResult {
 		this.initialize();
 		const reconstructed = this.reconstructDocument(documentId, throughSequence);
@@ -1470,6 +1596,27 @@ export abstract class VaultDocumentStore {
 		return this.persistCheckpoint(documentId, crdtEngine.encodeStateAsUpdate(doc), expectedHead, true);
 	}
 
+	/**
+	 * Relay v2 spike: persists a byte-merged checkpoint through a prefix of the
+	 * journal (bounded merge per K3). Fenced on the durable semantic epoch and on
+	 * the head having reached `throughSequence`; later tail rows stay in place.
+	 */
+	writeRelayCheckpointThrough(
+		documentId: string,
+		encodedState: Uint8Array,
+		expected: CheckpointExpectedHead,
+	): CheckpointWriteResult {
+		this.initialize();
+		const head = this.documentHead(documentId);
+		if (!head || head.semanticEpoch !== expected.semanticEpoch || head.latestSequence < expected.throughSequence) {
+			throw new Error("checkpoint head mismatch");
+		}
+		if (head.latestSequence === expected.throughSequence) {
+			return this.writeCheckpointFromEncodedState(documentId, encodedState, expected);
+		}
+		return this.persistCheckpoint(documentId, encodedState, expected, false);
+	}
+
 	/** Persists an exact encoded authoritative state, fenced against the current durable document head. */
 	writeCheckpointFromEncodedState(
 		documentId: string,
@@ -1491,6 +1638,8 @@ export abstract class VaultDocumentStore {
 		freshEncodedState: Uint8Array,
 		expectedHead: CheckpointExpectedHead,
 		now = Date.now(),
+		/** Relay v2 spike: client-claimed content identity recorded on the reset catalog event. */
+		catalogContent?: { contentHash: string; size: number },
 	): SemanticResetResult {
 		this.initialize();
 		this.assertExactCheckpointHead(documentId, expectedHead);
@@ -1594,11 +1743,11 @@ export abstract class VaultDocumentStore {
 					 body_epoch, content_hash, size, mutation_index
 					)
 					SELECT ?, body_id, file_id, path, NULL, lifecycle, generation,
-					       ?, content_hash, size, 0
+					       ?, COALESCE(?, content_hash), COALESCE(?, size), 0
 					  FROM vault_catalog_events
 					 WHERE body_id = ?
 					 ORDER BY sequence DESC LIMIT 1`,
-					sequence, semanticEpoch, documentId,
+					sequence, semanticEpoch, catalogContent?.contentHash ?? null, catalogContent?.size ?? null, documentId,
 				);
 				catalog.toArray();
 				rowsWritten += catalog.rowsWritten;

@@ -1,5 +1,6 @@
 import { ControlPlaneRuntime, ServerConfig } from "./config";
-import { SIMULATE_RESTART_RUNTIME_PATH, VaultRuntime, VaultSyncServer } from "./server";
+import { RELAY_TABLE_COUNTS_RUNTIME_PATH, SIMULATE_RESTART_RUNTIME_PATH, VaultRuntime, VaultSyncServer } from "./server";
+import { relayBodiesEnabled } from "./relayFlag";
 import { ActorRecoveryRouteAuthority } from "./recoveryPublicAuthority";
 import { handleRecoveryRoute, isPublicRecoveryRouteShape } from "./recoveryRoutes";
 import type { VaultRecord } from "./identity";
@@ -93,7 +94,11 @@ type WorkerRoute =
 	| { kind: "vault"; vaultId: string; rest: string[] }
 	| { kind: "not-found" };
 
-function validVaultRest(method: string, rest: string[]): boolean {
+function validVaultRest(method: string, rest: string[], relayBodies = false): boolean {
+	// Relay v2 spike: routes that exist only with YAOS_RELAY_BODIES === "true".
+	if (relayBodies && method === "POST" && rest.length === 3 && rest[0] === "body" && !!rest[1]
+		&& (rest[2] === "compaction-lease" || rest[2] === "semantic-reset")) return true;
+	if (relayBodies && method === "GET" && rest.length === 2 && rest[0] === "debug" && rest[1] === "relay-table-counts") return true;
 	if (method === "GET" && rest.length === 1 && ["me", "members", "audit"].includes(rest[0]!)) return true;
 	if ((method === "PATCH" || method === "DELETE") && rest.length === 1 && rest[0] === "governance") return true;
 	if ((method === "POST" || method === "GET") && rest.length === 1 && rest[0] === "invitations") return true;
@@ -162,7 +167,7 @@ function parseVault(pathname: string): { vaultId: string; rest: string[] } | nul
 	return { vaultId, rest };
 }
 
-export function classifyWorkerRoute(request: Request, url = new URL(request.url)): WorkerRoute {
+export function classifyWorkerRoute(request: Request, url = new URL(request.url), relayBodies = false): WorkerRoute {
 	if (request.method === "OPTIONS" && (url.pathname.startsWith("/vault/") || url.pathname.startsWith("/api/") || url.pathname === "/enroll" || url.pathname.startsWith("/operator/"))) return { kind: "cors-preflight" };
 	if (request.method === "GET" && url.pathname === "/") return { kind: "home" };
 	if (request.method === "GET" && url.pathname === "/mobile-setup") return { kind: "mobile-setup" };
@@ -221,7 +226,7 @@ export function classifyWorkerRoute(request: Request, url = new URL(request.url)
 		return id ? { kind: "operator-pairing-revoke", id } : { kind: "not-found" };
 	}
 	const vault = parseVault(url.pathname);
-	return vault && validVaultRest(request.method, vault.rest) ? { kind: "vault", ...vault } : { kind: "not-found" };
+	return vault && validVaultRest(request.method, vault.rest, relayBodies) ? { kind: "vault", ...vault } : { kind: "not-found" };
 }
 
 function logRequest(route: WorkerRoute, request: Request, response: Response, start: number, auth: string): void {
@@ -248,7 +253,7 @@ async function authorizedVaultControl(request: Request, env: Env, authState: Aut
 export async function handleWorkerRequest(request: Request, env: Env): Promise<Response> {
 		const start = Date.now();
 		const url = new URL(request.url);
-		const route = classifyWorkerRoute(request, url);
+		const route = classifyWorkerRoute(request, url, relayBodiesEnabled(env));
 		if (route.kind === "cors-preflight") return corsPreflight();
 		if (route.kind === "not-found") {
 			const response = withCors(json({ error: "not found" }, 404));
@@ -302,6 +307,11 @@ export async function handleWorkerRequest(request: Request, env: Env): Promise<R
 				if (!env.YAOS_ENABLE_ADMIN_ROUTES) response = withCors(json({ error: "not found" }, 404));
 				else if (!await verifyOperatorSession(env, request)) response = withCors(json({ error: "unauthorized" }, 401));
 				else response = withCors(await handleOperatorVaultRuntimeRoute(request, env, route.vaultId, "/compact"));
+			} else if (route.rest[0] === "debug" && route.rest[1] === "relay-table-counts") {
+				// Relay v2 spike, experiment-only: same gate as simulate-restart plus the relay flag.
+				if (!testOnlyDebugRoutesEnabled(env) || !relayBodiesEnabled(env)) response = withCors(json({ error: "not found" }, 404));
+				else if (!await verifyOperatorSession(env, request)) response = withCors(json({ error: "unauthorized" }, 401));
+				else response = withCors(await handleOperatorVaultRuntimeRoute(request, env, route.vaultId, RELAY_TABLE_COUNTS_RUNTIME_PATH));
 			} else if (route.rest[0] === "debug" && route.rest[1] === "simulate-restart") {
 				// Experiment-only: gated like the admin routes (404 without the var,
 				// operator session when enabled). See testOnlyTimers.ts.

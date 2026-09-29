@@ -43,6 +43,8 @@ export async function launchWrangler(): Promise<WranglerTarget> {
 	const child = spawn(executable, [
 		"dev", "--ip", "127.0.0.1", "--port", String(port), "--local-protocol", "http",
 		"--persist-to", persistDir, "--log-level", "error",
+		// Relay v2 spike: flag-on suite runs.
+		...(process.env.YAOS_RELAY_BODIES ? ["--var", `YAOS_RELAY_BODIES:${process.env.YAOS_RELAY_BODIES}`] : []),
 	], {
 		cwd: resolve("server"),
 		stdio: ["ignore", "pipe", "pipe"],

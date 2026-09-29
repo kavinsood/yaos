@@ -37,6 +37,7 @@ import { MAX_CLIENT_MARKDOWN_BYTES } from "./shared/durableLimits";
 import { AUTHORITY_SUPERSEDED_SOCKET_CLOSE_CODE } from "./shared/socketCloseCodes";
 import type { VaultActorContext } from "./collaboration";
 import type { SemanticCatalogHead } from "./vaultStore";
+import { RELAY_BODIES_CAPABILITY_VERSION, type RelayBodyService } from "./relayBodies";
 import {
 	SEMANTIC_EPOCH_RESET_SOCKET_CLOSE_CODE,
 	SemanticEpochMismatchError,
@@ -144,6 +145,8 @@ export interface VaultSocketAttachment {
 	catchUpHint?: boolean;
 	/** Last time liveness on this socket refreshed the device's `lastSeenAt`. */
 	lastSeenTouchedAt?: number;
+	/** Relay v2 spike: admitted on the relay body path (no resident document). */
+	relay?: boolean;
 }
 function withoutAwarenessIdentity(attachment: VaultSocketAttachment): VaultSocketAttachment {
 	const released = { ...attachment };
@@ -205,6 +208,7 @@ export function parseVaultSocketAttachment(value: unknown): VaultSocketAttachmen
 		|| typeof attachment.socketId !== "string" || !validIdentity(attachment.socketId)
 		|| (attachment.admittedAt !== undefined && (!Number.isSafeInteger(attachment.admittedAt) || attachment.admittedAt < 0))
 		|| (attachment.catchUpHint !== undefined && typeof attachment.catchUpHint !== "boolean")
+		|| (attachment.relay !== undefined && attachment.relay !== true)
 		|| (attachment.lastSeenTouchedAt !== undefined
 			&& (!Number.isSafeInteger(attachment.lastSeenTouchedAt) || attachment.lastSeenTouchedAt < 0))
 		|| (attachment.kind !== "root" && attachment.kind !== "body" && attachment.kind !== "semantic")
@@ -428,6 +432,8 @@ export interface SocketServiceOptions {
 	/** Test-only override of {@link DEVICE_LAST_SEEN_RESOLUTION_MS} (testOnlyTimers.ts). */
 	deviceLastSeenResolutionMs?: number;
 	now?: () => number;
+	/** Relay v2 spike (`YAOS_RELAY_BODIES`): body sockets use the relay path. */
+	relay?: RelayBodyService;
 }
 
 export interface SocketAcceptOptions {
@@ -445,7 +451,168 @@ function cachePressureResponse(reason: "body_cache_count" | "body_cache_encoded_
 
 /** Owns hibernated root/body sockets, attachments, framing, and fan-out. */
 export class VaultSocketService {
-	constructor(private readonly options: SocketServiceOptions) {}
+	constructor(private readonly options: SocketServiceOptions) {
+		options.relay?.bindHost({
+			sockets: () => this.options.sockets.sockets(),
+			sendControl: (socket, value) => this.sendControl(socket, value),
+			fenceRelaySocket: (socket, attachment, currentEpoch) => {
+				this.fenceSocketIfStale(socket, attachment, currentEpoch);
+			},
+			broadcastRelayUpdate: (bodyId, epoch, frame, excludeSocketId) => {
+				for (const socket of this.options.sockets.sockets()) {
+					const attachment = parseVaultSocketAttachment(socket.deserializeAttachment());
+					if (!attachment || attachment.kind !== "body" || attachment.documentId !== bodyId
+						|| attachment.documentEpoch !== epoch || attachment.socketId === excludeSocketId) continue;
+					try { socket.send(frame); } catch { /* peer closed */ }
+				}
+			},
+			notifyBodyCommitted: (bodyId, durableGeneration, vaultSequence, excludeSocketId) => {
+				this.notifyBodyCommitted(bodyId, durableGeneration, vaultSequence, excludeSocketId);
+			},
+		});
+	}
+
+	/**
+	 * Relay v2 admission (brief §5.1): no MAX_BODY_SOCKETS, admitBody, cache
+	 * load, or compaction pause. The epoch is checked against the durable head
+	 * and step1 carries the state vector of the merged stored bytes.
+	 */
+	private acceptRelayBody(relay: RelayBodyService, documentId: string, documentEpoch: SemanticEpoch,
+		actor: VaultActorContext, acceptOptions: SocketAcceptOptions): Response {
+		if (!relay.validateActor(actor)) return Response.json({ error: "authority_superseded" }, { status: 409 });
+		let bodyCount = 0;
+		for (const socket of this.options.sockets.sockets()) {
+			const attachment = parseVaultSocketAttachment(socket.deserializeAttachment());
+			if (attachment?.kind === "body" || attachment?.kind === "semantic") bodyCount++;
+		}
+		if (bodyCount >= relay.config.maxBodySockets) {
+			return Response.json({ error: "body_socket_limit" }, { status: 429, headers: { "Retry-After": "1" } });
+		}
+		if (!this.options.isActiveBody(documentId)) return new Response("Body is not active", { status: 404 });
+		const head = relay.headState(documentId);
+		if (!head) return new Response("Body is not active", { status: 404 });
+		if (head.epoch !== documentEpoch) {
+			const mismatch = new SemanticEpochMismatchError({ purpose: "body", documentId,
+				expectedBodyEpoch: head.epoch, receivedBodyEpoch: documentEpoch });
+			return Response.json(mismatch.toPayload(), { status: mismatch.status });
+		}
+		const pair = this.options.sockets.createPair();
+		const server = pair.server;
+		const attachment: VaultSocketAttachment = {
+			vaultId: this.options.vaultId(),
+			vaultGeneration: this.options.vaultGeneration(),
+			runtimeEpoch: this.options.runtimeEpoch,
+			documentId,
+			kind: "body",
+			documentEpoch,
+			deviceId: actor.deviceId,
+			...(actor.deviceName ? { deviceName: actor.deviceName } : {}),
+			principalId: actor.principalId,
+			membershipRevision: actor.membershipRevision,
+			deviceCredentialRevision: actor.deviceCredentialRevision,
+			role: actor.role,
+			policyVersion: actor.policyVersion,
+			capabilityDigest: actor.capabilityDigest,
+			socketId: crypto.randomUUID(),
+			admittedAt: this.now(),
+			lastSeenTouchedAt: this.now(),
+			...(acceptOptions.capabilities?.has(SOCKET_CLIENT_CAPABILITY_CATCH_UP_HINT) ? { catchUpHint: true } : {}),
+			relay: true,
+		};
+		server.serializeAttachment(attachment);
+		this.options.sockets.accept(server);
+		const encoder = encoding.createEncoder();
+		encoding.writeVarUint(encoder, MESSAGE_SYNC);
+		encoding.writeVarUint(encoder, 0);
+		encoding.writeVarUint8Array(encoder, head.stateVector);
+		server.send(encoding.toUint8Array(encoder));
+		this.sendControl(server, {
+			type: "VAULT_READY",
+			documentId,
+			documentEpoch: attachment.documentEpoch,
+			socketSessionId: attachment.socketId,
+			vaultGeneration: attachment.vaultGeneration,
+			durableGeneration: head.generation,
+			runtimeEpoch: attachment.runtimeEpoch,
+			liveness: SOCKET_LIVENESS_DESCRIPTOR,
+			capabilities: { ...SOCKET_CONTROL_CAPABILITIES, relayBodies: RELAY_BODIES_CAPABILITY_VERSION },
+			principalId: actor.principalId,
+			deviceId: actor.deviceId,
+			role: actor.role,
+			membershipRevision: actor.membershipRevision,
+			deviceCredentialRevision: actor.deviceCredentialRevision,
+			policyVersion: actor.policyVersion,
+			capabilityDigest: actor.capabilityDigest,
+		});
+		return this.options.sockets.upgradeResponse(pair.client);
+	}
+
+	/** Relay body socket frames: cached authority, durable-per-frame commits, no runtime scoping. */
+	private relayMessage(relay: RelayBodyService, socket: VaultSocketPort, attachment: VaultSocketAttachment,
+		message: string | ArrayBuffer, control: ControlFrame | null): void {
+		if (typeof message === "string") {
+			if (message.length > MAX_TEXT_FRAME) {
+				socket.close(1009, "text frame too large");
+				return;
+			}
+			if (!control) return;
+			if (control.kind === "other") {
+				relay.handleControl(socket, attachment, message);
+				return;
+			}
+			if (!relay.validateActor(this.actorFromAttachment(attachment))) {
+				this.sendControl(socket, { type: "error", code: "authority_superseded", reason: "socket authority superseded" });
+				socket.close(AUTHORITY_SUPERSEDED_SOCKET_CLOSE_CODE, "socket authority superseded");
+				return;
+			}
+			if (control.kind === "ping") {
+				this.touchDeviceFromLiveness(socket, attachment);
+				this.sendControl(socket, {
+					type: "VAULT_PONG",
+					probeId: control.ping.probeId,
+					documentId: attachment.documentId,
+					documentEpoch: attachment.documentEpoch,
+					vaultGeneration: attachment.vaultGeneration,
+					runtimeEpoch: attachment.runtimeEpoch,
+				});
+				return;
+			}
+			const query = control.query;
+			if (query.bodyIds.length !== 1 || query.bodyIds[0] !== attachment.documentId) {
+				socket.close(1008, "body currentness query authority mismatch");
+				return;
+			}
+			const head = this.options.currentBodyHead(attachment.documentId);
+			this.sendControl(socket, {
+				type: "BODY_CURRENTNESS_RESULT",
+				queryId: query.queryId,
+				socketSessionId: attachment.socketId,
+				vaultSequence: this.options.currentSequence(),
+				heads: head ? [{ bodyId: head.bodyId, bodyEpoch: head.bodyEpoch, lifecycle: head.lifecycle,
+					generation: head.generation, contentHash: head.contentHash, size: head.size }] : [],
+				missingBodyIds: head ? [] : [attachment.documentId],
+			});
+			return;
+		}
+		try {
+			const frame = new Uint8Array(message);
+			if (frame.byteLength > MAX_CANDIDATE_BYTES + 64) {
+				socket.close(1009, "frame exceeds durable admission limit");
+				return;
+			}
+			const decoder = decoding.createDecoder(frame);
+			const type = decoding.readVarUint(decoder);
+			if (type === MESSAGE_AWARENESS) {
+				if (frame.byteLength > MAX_AWARENESS_BYTES) socket.close(1009, "awareness frame too large");
+				else this.relayAwareness(socket, attachment, frame);
+				return;
+			}
+			if (type !== MESSAGE_SYNC) return;
+			relay.handleSyncFrame(socket, attachment, decoder);
+		} catch (error) {
+			this.sendControl(socket, { type: "VAULT_ERROR", message: error instanceof Error ? error.message : String(error) });
+		}
+	}
 
 	private now(): number {
 		return this.options.now?.() ?? Date.now();
@@ -475,11 +642,15 @@ export class VaultSocketService {
 				membershipRevision: 1, deviceId: actorOrDevice, deviceCredentialRevision: 1, role: "member",
 				policyVersion: 1, capabilityDigest: "legacy" }
 			: actorOrDevice;
+		if (kind === "body" && this.options.relay) {
+			return this.acceptRelayBody(this.options.relay, documentId, documentEpoch, actor, acceptOptions);
+		}
 		if (!(this.options.validateActor?.(actor) ?? true)) return Response.json({ error: "authority_superseded" }, { status: 409 });
 		let rootCount = 0;
 		let bodyCount = 0;
 		for (const socket of this.options.sockets.sockets()) {
 			const attachment = parseVaultSocketAttachment(socket.deserializeAttachment());
+			if (attachment?.relay === true) continue;
 			if (attachment && this.fenceSocketIfStale(socket, attachment)) continue;
 			if (attachment?.kind === "root") rootCount++;
 			if (attachment?.kind === "body" || attachment?.kind === "semantic") bodyCount++;
@@ -576,7 +747,19 @@ export class VaultSocketService {
 			|| attachment.vaultId !== this.options.vaultId()
 			|| attachment.vaultGeneration !== this.options.vaultGeneration()
 			|| (attachment.runtimeEpoch !== this.options.runtimeEpoch && !isRuntimeIndependentFrame(message, control))) {
-			socket.close(1008, "socket authority mismatch");
+			if (!(attachment?.relay === true && this.options.relay
+				&& attachment.vaultId === this.options.vaultId()
+				&& attachment.vaultGeneration === this.options.vaultGeneration())) {
+				socket.close(1008, "socket authority mismatch");
+				return;
+			}
+		}
+		if (attachment.relay === true) {
+			if (!this.options.relay) {
+				socket.close(1008, "socket authority mismatch");
+				return;
+			}
+			this.relayMessage(this.options.relay, socket, attachment, message, control);
 			return;
 		}
 		// Every frame, including runtime-independent liveness, re-validates the
@@ -737,7 +920,7 @@ export class VaultSocketService {
 		}
 	}
 
-	notifyBodyCommitted(bodyId: string, durableGeneration: number, vaultSequence: number): void {
+	notifyBodyCommitted(bodyId: string, durableGeneration: number, vaultSequence: number, excludeSocketId?: string): void {
 		const head = this.options.currentBodyHead(bodyId);
 		const bodyEpoch = head?.bodyEpoch ?? this.options.cache.get(bodyId)?.semanticEpoch;
 		if (bodyEpoch === undefined) throw new Error(`body ${bodyId} has no semantic epoch for commit notification`);
@@ -765,6 +948,14 @@ export class VaultSocketService {
 			const attachment = parseVaultSocketAttachment(socket.deserializeAttachment());
 			if (!attachment || (attachment.kind !== "root"
 				&& (attachment.documentId !== bodyId || attachment.documentEpoch !== bodyEpoch))) continue;
+			if (excludeSocketId !== undefined && attachment.socketId === excludeSocketId) continue;
+			// Relay body sockets hold no runtime-scoped receipts (every frame is
+			// durable before its own ack), so peers get the notice under their
+			// admission runtime epoch instead of a close.
+			if (attachment.relay === true) {
+				this.sendControl(socket, { ...value, runtimeEpoch: attachment.runtimeEpoch, relay: true, peer: true });
+				continue;
+			}
 			// Clients accept commit notices only from the runtime that admitted
 			// the socket: the notice's runtime epoch is receipt evidence for
 			// frames that socket sent. A socket that outlived its runtime (kept
@@ -791,6 +982,7 @@ export class VaultSocketService {
 		try { attachment = parseVaultSocketAttachment(socket.deserializeAttachment()); }
 		catch { return; }
 		if (!attachment) return;
+		if (attachment.relay === true) this.options.relay?.socketClosed(attachment.socketId);
 		const clock = attachment.awarenessClock;
 		const clientId = attachment.awarenessClientId;
 		if (clientId === undefined) return;

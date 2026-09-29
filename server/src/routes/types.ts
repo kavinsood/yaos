@@ -18,6 +18,8 @@ export interface Env {
 	YAOS_TEST_ONLY_LAST_SEEN_RESOLUTION_MS?: string;
 	/** Test-only debug routes (simulate-restart); 404 unless exactly "true". */
 	YAOS_TEST_ONLY_DEBUG_ROUTES?: string;
+	/** Relay v2 spike: relay body path; inert unless exactly "true". */
+	YAOS_RELAY_BODIES?: string;
 }
 
 export type JsonResponse = (body: unknown, status?: number) => Response;

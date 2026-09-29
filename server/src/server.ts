@@ -36,6 +36,10 @@ import type { VaultAuthoritySubjectChange } from "./vaultDocumentStore";
 import { SemanticCompactionRuntime } from "./semanticCompactionRuntime";
 import { BODY_EPOCH_HEADER, ROOT_EPOCH_HEADER, parseSemanticEpoch, parseSemanticEpochHeader } from "./shared/semanticEpoch";
 import { SOCKET_CLIENT_CAPABILITIES_PARAM, parseSocketClientCapabilities } from "./shared/socketLiveness";
+import { readRelayConfig, relayBodiesEnabled, relayBodiesTestDefault, type RelayConfig, type RelayFlagEnv } from "./relayFlag";
+import { RelayBodyService } from "./relayBodies";
+import { RelayBodyStore } from "./relayBodyStore";
+import { handleCompactionLease, handleSemanticReset, type RelayRouteDeps } from "./relayRoutes";
 
 // Production PERSIST_DEBOUNCE_MS (250 ms) lives in testOnlyTimers.ts so the
 // test-only override can never drift from it.
@@ -165,7 +169,18 @@ export interface VaultRuntimeOptions {
 	 * runtime. Absent (production hosts), the runtime path is a plain 404.
 	 */
 	simulateRestart?: () => Promise<Response>;
+	/**
+	 * Relay v2 spike: `YAOS_RELAY_BODIES === "true"`. Absent, the TEST-ONLY
+	 * process default (`YAOS_TEST_FORCE_RELAY_BODIES`) applies; false in Workers.
+	 */
+	relayBodies?: boolean;
+	relayConfig?: RelayConfig;
+	/** Relay v2 spike: TEST-ONLY relay debug routes (Worker-gated like simulate-restart). */
+	relayDebugRoutes?: boolean;
 }
+
+/** Runtime path of the experiment-only relay table-count route. */
+export const RELAY_TABLE_COUNTS_RUNTIME_PATH = "/__yaos/test-only/relay-table-counts";
 
 /**
  * Runtime path of the experiment-only restart simulation. Reached only via the
@@ -194,6 +209,10 @@ export class VaultRuntime implements DrainPort {
 	private deleted = false;
 	private drainPromise: Promise<void> | null = null;
 	private authorityBoundary: Promise<void> = Promise.resolve();
+	/** Relay v2 spike; null with the flag off. */
+	private readonly relay: RelayBodyService | null = null;
+	private relayStore: RelayBodyStore | null = null;
+	private relayCheckpointAlarmArmed = false;
 
 	constructor(private readonly options: VaultRuntimeOptions) {
 		this.store = new VaultStore(options.storage);
@@ -210,6 +229,25 @@ export class VaultRuntime implements DrainPort {
 		);
 		const vaultId = () => this.requireMetadata().vaultId;
 		const vaultGeneration = () => this.requireMetadata().vaultGeneration;
+		if (options.relayBodies ?? relayBodiesTestDefault()) {
+			this.relayStore = new RelayBodyStore(options.storage, this.store);
+			this.relay = new RelayBodyService({
+				config: options.relayConfig ?? readRelayConfig(null),
+				store: () => this.store,
+				relayStore: () => this.relayStore!,
+				cache: this.cache,
+				runtimeEpoch: this.runtimeEpoch,
+				armCheckpointAlarm: () => {
+					if (this.relayCheckpointAlarmArmed) return;
+					this.relayCheckpointAlarmArmed = true;
+					this.options.execution.waitUntil(this.armAlarmEarliest(Date.now())
+						.catch((error) => {
+							this.relayCheckpointAlarmArmed = false;
+							console.warn("[yaos-relay] checkpoint alarm failed", error);
+						}));
+				},
+			});
+		}
 		socketOwner = new VaultSocketService({
 			crdtEngine,
 			sockets: options.sockets,
@@ -245,6 +283,7 @@ export class VaultRuntime implements DrainPort {
 			shouldPauseAdmission: (documentId) => this.semanticCompaction?.shouldPauseAdmission(documentId) ?? false,
 			...(options.controlPlane ? { touchDevice: (deviceId: string) => this.touchDevice(deviceId) } : {}),
 			...(options.timers ? { deviceLastSeenResolutionMs: options.timers.deviceLastSeenResolutionMs } : {}),
+			...(this.relay ? { relay: this.relay } : {}),
 		});
 		this.sockets = socketOwner;
 		this.semanticCompaction = new SemanticCompactionRuntime({
@@ -338,6 +377,11 @@ export class VaultRuntime implements DrainPort {
 			if (request.method === "POST" && url.pathname === SIMULATE_RESTART_RUNTIME_PATH) {
 				return this.options.simulateRestart ? await this.options.simulateRestart() : json({ error: "not_found" }, 404);
 			}
+			if (request.method === "GET" && url.pathname === RELAY_TABLE_COUNTS_RUNTIME_PATH) {
+				return this.relayStore && this.options.relayDebugRoutes
+					? json({ tables: this.relayStore.tableCounts() })
+					: json({ error: "not_found" }, 404);
+			}
 				if (request.method === "POST" && url.pathname === "/__yaos/authority-fence") {
 					return this.runAuthorityBoundary(() => this.installAuthorityFence(request));
 				}
@@ -406,6 +450,14 @@ export class VaultRuntime implements DrainPort {
 					if (!this.semantic.activeHead(documentId)) return json({ error: "semantic_document_not_active" }, 409);
 					return this.sockets.accept(documentId, "semantic", documentEpoch, authorized, acceptOptions);
 				}
+			}
+			if (this.relay && request.method === "POST" && parts.length === 3 && parts[0] === "body"
+				&& (parts[2] === "compaction-lease" || parts[2] === "semantic-reset")) {
+				const authorized = this.authorize(actor, "vault.content.write");
+				if (authorized instanceof Response) return authorized;
+				return parts[2] === "compaction-lease"
+					? handleCompactionLease(this.relayRouteDeps(), parts[1]!, request, authorized)
+					: handleSemanticReset(this.relayRouteDeps(), parts[1]!, request, authorized);
 			}
 			if (request.method === "POST" && parts.length === 3 && parts[0] === "body" && parts[2] === "candidate") {
 				const authorized = this.authorize(actor, "vault.content.write");
@@ -502,6 +554,23 @@ export class VaultRuntime implements DrainPort {
 			console.error("[yaos-vault] request failed", error);
 			return json({ error: error instanceof Error ? error.message : "vault_runtime_failed" }, 500);
 		}
+	}
+
+	private relayRouteDeps(): RelayRouteDeps {
+		return {
+			relay: this.relay!,
+			relayStore: () => this.relayStore!,
+			isActiveBody: (bodyId) => this.lifecycle.activeBodyHead(bodyId) !== null,
+			discardResident: (bodyId) => this.cache.discardResident(bodyId),
+			fenceSockets: (bodyId, previousEpoch, currentEpoch) =>
+				this.sockets.fenceSemanticEpoch(bodyId, previousEpoch, currentEpoch),
+		};
+	}
+
+	/** Relay v2 spike: a Markdown body document (bodies use the relay path when the flag is on). */
+	private isRelayBody(documentId: string): boolean {
+		return this.relay !== null && documentId !== "root"
+			&& this.store.getCatalogHeadAt(this.store.currentSequence(), documentId) !== null;
 	}
 
 	private authorize(actor: VaultActorContext | null, capability: VaultCapability, targetPrincipalId?: string): VaultActorContext | Response {
@@ -657,6 +726,25 @@ export class VaultRuntime implements DrainPort {
 
 	async alarm(): Promise<void> {
 		for (const documentId of Object.keys(this.cache.diagnostics().pending)) await this.flushDocument(documentId);
+		if (this.relay) {
+			this.relayCheckpointAlarmArmed = false;
+			let relayRetry = false;
+			for (const documentId of this.store.listJournalCheckpointCandidates(
+				this.relay.config.checkpointEntries, this.relay.config.checkpointBytes, 25,
+			)) {
+				if (!this.isRelayBody(documentId) || this.cache.get(documentId)?.dirty) continue;
+				try {
+					const written = this.relay.checkpointBody(documentId);
+					if (written?.partial || this.relay.needsCheckpoint(documentId)) relayRetry = true;
+				} catch (error) {
+					relayRetry = true;
+					console.warn("[yaos-relay] checkpoint failed", error);
+				}
+			}
+			try { this.store.pruneCandidateReceipts(Date.now()); }
+			catch (error) { console.warn("[yaos-relay] receipt pruning failed", error); }
+			if (relayRetry) await this.armAlarmEarliest(Date.now() + 1);
+		}
 		for (const documentId of this.store.listJournalCheckpointCandidates(
 			JOURNAL_COMPACT_ENTRIES, JOURNAL_COMPACT_BYTES, 25,
 		)) this.maintain(documentId);
@@ -738,6 +826,7 @@ export class VaultRuntime implements DrainPort {
 		await this.options.storage.deleteAll();
 		this.store = new VaultStore(this.options.storage);
 		this.store.setCommitObserver((observation) => this.afterDurableCommit(observation));
+		if (this.relayStore) this.relayStore = new RelayBodyStore(this.options.storage, this.store);
 		this.settings = new SettingsSyncStore(this.options.storage);
 		return json({ deleted: true });
 	}
@@ -783,6 +872,8 @@ export class VaultRuntime implements DrainPort {
 			const knownContentHash = "contentHash" in item && typeof item.contentHash === "string"
 				? item.contentHash
 				: null;
+			const relayState = this.relay ? this.relay.bodyHttpState(bodyId) : null;
+			if (this.relay && !relayState) { bodies.push({ bodyId, status: 409, error: "body_not_active" }); continue; }
 			const metadata = {
 				bodyId,
 				bodyEpoch: head.bodyEpoch,
@@ -791,12 +882,17 @@ export class VaultRuntime implements DrainPort {
 				previousPath: head.previousPath,
 				lifecycle: head.lifecycle,
 				generation: head.generation,
-				contentHash: head.contentHash,
-				size: head.size,
+				contentHash: relayState ? relayState.contentHash : head.contentHash,
+				size: relayState ? relayState.size : head.size,
 			};
 			if (knownBodyEpoch === head.bodyEpoch && knownGeneration === head.generation
-				&& (knownContentHash === null || knownContentHash === head.contentHash)) {
+				&& (knownContentHash === null || knownContentHash === metadata.contentHash)) {
 				bodies.push({ ...metadata, status: 304 });
+				continue;
+			}
+			if (relayState) {
+				bodies.push({ ...metadata, status: 200, bodyEpoch: relayState.semanticEpoch,
+					generation: relayState.generation, update: relayState.bytes });
 				continue;
 			}
 			let reconstructedThisBody = false;
@@ -962,6 +1058,14 @@ export class VaultRuntime implements DrainPort {
 	private async bodyState(bodyId: string): Promise<Response> {
 		const head = this.lifecycle.activeBodyHead(bodyId);
 		if (!head) return json({ error: "body_not_active" }, 404);
+		if (this.relay) {
+			// Relay v2: merged stored bytes + catalog hash; no document.
+			const state = this.relay.bodyHttpState(bodyId);
+			if (!state) return json({ error: "body_not_active" }, 404);
+			return new Response(state.bytes.slice().buffer, { headers: { "content-type": "application/octet-stream", "cache-control": "no-store",
+				[BODY_EPOCH_HEADER]: String(state.semanticEpoch),
+				"x-yaos-body-id": bodyId, "x-yaos-generation": String(state.generation), "x-yaos-content-hash": state.contentHash, "x-yaos-size": String(state.size) } });
+		}
 		const release = this.cache.reserveFullStateOperation(bodyId, 2);
 		try {
 			const reconstructed = this.store.reconstructDocument(bodyId);
@@ -1049,7 +1153,8 @@ export class VaultRuntime implements DrainPort {
 			semanticCompaction: this.semanticCompaction.diagnostics(),
 			semanticCompactionDurable: durableCompaction,
 			semanticCompactionNextRetryAt: this.semanticCompaction.nextRetryAt(),
-			persistence: Object.fromEntries(this.persistence) });
+			persistence: Object.fromEntries(this.persistence),
+			...(this.relay ? { relay: this.relay.diagnostics() } : {}) });
 	}
 
 	private statusObject() {
@@ -1291,6 +1396,8 @@ export class VaultRuntime implements DrainPort {
 		this.lastObservedCommitSequence = observation.vaultSequence;
 		const task = Promise.resolve().then(async () => {
 			this.maintain(observation.documentId);
+			// Relay v2: server semantic compaction is disabled for relay bodies (client lease reset).
+			if (this.isRelayBody(observation.documentId)) return;
 			try {
 				await this.semanticCompaction.recordCommit(
 					observation.documentId, observation.ingressBytes, observation.commitLatencyMs,
@@ -1306,6 +1413,7 @@ export class VaultRuntime implements DrainPort {
 	private afterDocumentLoaded(documentId: string, encodedStateBytes: number): void {
 		const task = Promise.resolve().then(async () => {
 			this.maintain(documentId);
+			if (this.isRelayBody(documentId)) return;
 			try { await this.semanticCompaction.documentLoaded(documentId, encodedStateBytes); }
 			finally {
 				const retryAt = this.semanticCompaction.nextRetryAt();
@@ -1322,6 +1430,11 @@ export class VaultRuntime implements DrainPort {
 	}
 
 	private writeLiveCheckpoint(documentId: string): void {
+		if (this.relay && this.isRelayBody(documentId) && !this.cache.get(documentId)?.dirty) {
+			// Relay v2 (D5.3): byte-merge checkpoint, no document.
+			this.relay.checkpointBody(documentId);
+			return;
+		}
 		const loaded = this.cache.get(documentId);
 		const head = this.store.documentHead(documentId);
 		if (!loaded || loaded.dirty || !head || loaded.generation !== head.generation) {
@@ -1355,7 +1468,7 @@ export class VaultRuntime implements DrainPort {
 	}
 }
 
-export interface CloudflareVaultEnvironment extends TestOnlyServerTimerEnv, TestOnlyDebugRouteEnv {
+export interface CloudflareVaultEnvironment extends TestOnlyServerTimerEnv, TestOnlyDebugRouteEnv, RelayFlagEnv {
 	YAOS_BUCKET?: R2Bucket;
 	YAOS_RECOVERY_JOBS?: DurableObjectNamespace;
 	/** The Worker's control-plane namespace; Durable Objects share the Worker's bindings. */
@@ -1391,6 +1504,9 @@ export class VaultSyncServer implements DurableObject {
 			...(testOnlyFastTimersEnabled(env) ? { timers: readServerTimers(env) } : {}),
 			// The Worker gate checks the same var plus the operator session.
 			...(testOnlyDebugRoutesEnabled(env) ? { simulateRestart: () => this.simulateRestart() } : {}),
+			relayBodies: relayBodiesEnabled(env),
+			...(relayBodiesEnabled(env) ? { relayConfig: readRelayConfig(env),
+				relayDebugRoutes: testOnlyDebugRoutesEnabled(env) } : {}),
 		});
 	}
 

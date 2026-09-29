@@ -5,6 +5,7 @@ import { handleWorkerRequest, type WorkerRuntimeEnvironment } from "../../../ser
 import type { ActorCallPort, ExecutionPort } from "../../../server/src/platformPorts";
 import { RecoveryJobRuntime } from "../../../server/src/recoveryJob";
 import { VaultRuntime } from "../../../server/src/server";
+import { readRelayConfig, relayBodiesEnabled } from "../../../server/src/relayFlag";
 import type { VaultSocketPort } from "../../../server/src/vaultSocketService";
 import { FilesystemObjectStore } from "./objectStore";
 import {
@@ -108,6 +109,9 @@ class VaultActor implements RuntimeActor {
 			objectStore: objects,
 			recoveryJobs,
 			controlPlane,
+			// Relay v2 spike: YAOS_RELAY_BODIES (test default YAOS_TEST_FORCE_RELAY_BODIES).
+			relayBodies: relayBodiesEnabled(process.env),
+			...(relayBodiesEnabled(process.env) ? { relayConfig: readRelayConfig(process.env) } : {}),
 		});
 	}
 
@@ -305,6 +309,7 @@ export async function runNodeServer(options: NodeServerOptions): Promise<void> {
 			socketUpgrades: socketHub,
 			...(options.ticketTtlMs ? { YAOS_TICKET_TTL_MS: options.ticketTtlMs } : {}),
 			...(options.enableAdminRoutes ? { YAOS_ENABLE_ADMIN_ROUTES: options.enableAdminRoutes } : {}),
+			...(process.env.YAOS_RELAY_BODIES ? { YAOS_RELAY_BODIES: process.env.YAOS_RELAY_BODIES } : {}),
 		};
 		const application: NodeTransportApplication = {
 			fetch: (request) => handleWorkerRequest(request, workerEnvironment),

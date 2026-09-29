@@ -155,9 +155,10 @@ export class VaultStore extends RecoveryAuthorityStore {
 		freshEncodedState: Uint8Array,
 		expectedHead: CheckpointExpectedHead,
 		now = Date.now(),
+		catalogContent?: { contentHash: string; size: number },
 	): SemanticResetResult {
 		const startedAt = performance.now();
-		const result = super.semanticResetFromEncodedState(documentId, freshEncodedState, expectedHead, now);
+		const result = super.semanticResetFromEncodedState(documentId, freshEncodedState, expectedHead, now, catalogContent);
 		this.observeCommit({ documentId, ingressBytes: freshEncodedState.byteLength,
 			commitLatencyMs: performance.now() - startedAt, vaultSequence: result.vaultSequence });
 		return result;

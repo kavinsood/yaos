@@ -42,6 +42,8 @@ function forwardedBodyLimit(request: Request, runtimePath: string): number | nul
 		|| runtimePath === "/semantic/authority/promote") return MAX_CANDIDATE_BYTES;
 	if (runtimePath === "/body/candidates") return MAX_CATCH_UP_BYTES;
 	if (runtimePath === "/catch-up") return MAX_CATCH_UP_BYTES;
+	// Relay v2 spike: the base64 snapshot of a client semantic reset (route exists only with the flag on).
+	if (/^\/body\/[^/]+\/semantic-reset$/.test(runtimePath)) return MAX_CATCH_UP_BYTES;
 	if (runtimePath.startsWith("/settings-sync/") && request.method === "PUT") {
 		const action = runtimePath.split("/")[3];
 		return action === "seed" || action === "replace"
