@@ -2,6 +2,7 @@
 
 import { obsidianRequest, type HttpRequester } from "../utils/http";
 import type { SemanticEpoch, SemanticEpochScope } from "@shared/semanticEpoch";
+import { clientTimer } from "../runtime/testOnlyTimers";
 
 
 /**
@@ -34,6 +35,11 @@ export class SocketTicketHttpError extends Error {
 export const TICKET_REFRESH_BUFFER_MS = 30_000;
 const MAX_REASONABLE_TICKET_TTL_MS = 24 * 60 * 60 * 1_000; // 24 hours
 
+/** {@link TICKET_REFRESH_BUFFER_MS}, unless a test-only override is installed. */
+export function ticketRefreshBufferMs(): number {
+	return clientTimer("ticketRefreshBufferMs", TICKET_REFRESH_BUFFER_MS);
+}
+
 export interface CachedSocketTicket {
 	value: string;
 	expiresAt: number;
@@ -63,7 +69,7 @@ export function createSocketTicketCache(request: HttpRequester = obsidianRequest
 			const semanticEpoch = scope.purpose === "root" ? scope.rootEpoch : scope.bodyEpoch;
 			const key = `${host.replace(/\/$/, "")}\0${deviceToken}\0${vaultId}\0${scope.purpose}\0${scope.documentId}\0${semanticEpoch}`;
 			const now = Date.now();
-			if (cached && cachedKey === key && cached.localExpiresAt - now > TICKET_REFRESH_BUFFER_MS) {
+			if (cached && cachedKey === key && cached.localExpiresAt - now > ticketRefreshBufferMs()) {
 				return cached;
 			}
 			if (inFlight?.key === key && inFlight.revision === revision) return inFlight.promise;

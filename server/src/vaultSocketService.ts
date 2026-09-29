@@ -425,6 +425,8 @@ export interface SocketServiceOptions {
 	 * socket, from liveness pings.
 	 */
 	touchDevice?: (deviceId: string) => void;
+	/** Test-only override of {@link DEVICE_LAST_SEEN_RESOLUTION_MS} (testOnlyTimers.ts). */
+	deviceLastSeenResolutionMs?: number;
 	now?: () => number;
 }
 
@@ -1133,7 +1135,7 @@ export class VaultSocketService {
 		if (!this.options.touchDevice || attachment.kind !== "root") return;
 		const now = this.now();
 		const last = attachment.lastSeenTouchedAt;
-		const resolutionMs = DEVICE_LAST_SEEN_RESOLUTION_MS;
+		const resolutionMs = this.options.deviceLastSeenResolutionMs ?? DEVICE_LAST_SEEN_RESOLUTION_MS;
 		if (last !== undefined && now >= last && now - last < resolutionMs) return;
 		try {
 			socket.serializeAttachment({ ...attachment, lastSeenTouchedAt: now });

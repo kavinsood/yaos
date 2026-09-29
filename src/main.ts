@@ -168,6 +168,7 @@ import {
 	type OperationalResourceSnapshot,
 } from "./runtime/operationalResourceSnapshot";
 import { AuthorityCoordinator, readVaultAuthoritySnapshot } from "./collaboration/authority";
+import { installClientTimerOverrides, parseClientTimerEnv } from "./runtime/testOnlyTimers";
 import {
 	CollaborationClient,
 	type CollaborationOwnershipTransfer,
@@ -180,6 +181,11 @@ import {
 // When false, esbuild dead-code-eliminates all blocks gated on this constant.
 // The declare tells TypeScript the type; the actual value comes from the esbuild define.
 declare const __YAOS_QA_HARNESS_ENABLED__: boolean;
+// TEST-ONLY timer overrides (src/runtime/testOnlyTimers.ts). Only an
+// experiment bundle built with this esbuild define (a JSON string of
+// YAOS_TEST_ONLY_* variables, master flag included) sets it; release builds
+// define it as undefined, so no user setting can enable fast timers.
+declare const __YAOS_TEST_ONLY_TIMERS__: string | undefined;
 
 type PersistedPluginState = Partial<VaultSyncSettings> & {
 	_diskIndex?: DiskIndex;
@@ -515,6 +521,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	async onload() {
 		const onloadStartedAt = Date.now();
+		if (typeof __YAOS_TEST_ONLY_TIMERS__ === "string") {
+			const timers = parseClientTimerEnv(JSON.parse(__YAOS_TEST_ONLY_TIMERS__) as Record<string, string>);
+			installClientTimerOverrides(timers.overrides);
+			console.warn("[yaos] TEST-ONLY fast timers installed", timers.overrides, timers.rejected);
+		}
 		this.installPublicApi();
 
 		// Initialize QA harness state before any component construction so that

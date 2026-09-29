@@ -1,5 +1,5 @@
 import { ControlPlaneRuntime, ServerConfig } from "./config";
-import { VaultRuntime, VaultSyncServer } from "./server";
+import { SIMULATE_RESTART_RUNTIME_PATH, VaultRuntime, VaultSyncServer } from "./server";
 import { ActorRecoveryRouteAuthority } from "./recoveryPublicAuthority";
 import { handleRecoveryRoute, isPublicRecoveryRouteShape } from "./recoveryRoutes";
 import type { VaultRecord } from "./identity";
@@ -61,6 +61,7 @@ import type { AuthState, AuthStateCached, Env } from "./routes/types";
 import { decodeCanonicalVaultIdSegment } from "./vaultId";
 import { CloudflareActorCalls, CloudflareObjectStore, CloudflareSocketUpgrades } from "./cloudflarePorts";
 import { authorizeVaultAction } from "./collaboration";
+import { testOnlyDebugRoutesEnabled } from "./testOnlyTimers";
 
 interface CloudflareWorkerEnvironment {
 	YAOS_SYNC: DurableObjectNamespace;
@@ -69,6 +70,10 @@ interface CloudflareWorkerEnvironment {
 	YAOS_BUCKET?: R2Bucket;
 	YAOS_TICKET_TTL_MS?: string;
 	YAOS_ENABLE_ADMIN_ROUTES?: string;
+	YAOS_TEST_ONLY_FAST_TIMERS?: string;
+	YAOS_TEST_ONLY_PERSIST_DEBOUNCE_MS?: string;
+	YAOS_TEST_ONLY_LAST_SEEN_RESOLUTION_MS?: string;
+	YAOS_TEST_ONLY_DEBUG_ROUTES?: string;
 }
 
 const LOG_PREFIX = "[yaos-sync:worker]";
@@ -113,7 +118,8 @@ function validVaultRest(method: string, rest: string[]): boolean {
 	if (method === "GET" && rest.length === 1 && rest[0] === "devices") return true;
 	if (rest[0] === "blobs" && rest.length === 2) return method === "GET" || method === "PUT" || (method === "POST" && rest[1] === "exists");
 	if (rest.length === 2 && rest[0] === "debug") {
-		return (method === "GET" && rest[1] === "recent") || (method === "POST" && rest[1] === "compact");
+		return (method === "GET" && rest[1] === "recent") || (method === "POST" && rest[1] === "compact")
+			|| (method === "POST" && rest[1] === "simulate-restart");
 	}
 	if (method === "GET" && rest.length === 2 && rest[0] === "ws" && rest[1] === "root") return true;
 	if (method === "GET" && rest.length === 3 && rest[0] === "ws" && rest[1] === "body" && !!rest[2]) return true;
@@ -296,6 +302,12 @@ export async function handleWorkerRequest(request: Request, env: Env): Promise<R
 				if (!env.YAOS_ENABLE_ADMIN_ROUTES) response = withCors(json({ error: "not found" }, 404));
 				else if (!await verifyOperatorSession(env, request)) response = withCors(json({ error: "unauthorized" }, 401));
 				else response = withCors(await handleOperatorVaultRuntimeRoute(request, env, route.vaultId, "/compact"));
+			} else if (route.rest[0] === "debug" && route.rest[1] === "simulate-restart") {
+				// Experiment-only: gated like the admin routes (404 without the var,
+				// operator session when enabled). See testOnlyTimers.ts.
+				if (!testOnlyDebugRoutesEnabled(env)) response = withCors(json({ error: "not found" }, 404));
+				else if (!await verifyOperatorSession(env, request)) response = withCors(json({ error: "unauthorized" }, 401));
+				else response = withCors(await handleOperatorVaultRuntimeRoute(request, env, route.vaultId, SIMULATE_RESTART_RUNTIME_PATH));
 			} else {
 				if (route.rest[0] === "me") response = withCors(await handleVaultMeRoute(request, env, route.vaultId));
 				else if (route.rest[0] === "members") response = withCors(await handleVaultMembersRoute(request, env, route.vaultId));

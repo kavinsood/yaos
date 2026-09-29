@@ -2,6 +2,7 @@ import {
 	SOCKET_LIVENESS_TIMEOUT_MS,
 	type SocketLivenessDescriptor,
 } from "@shared/socketLiveness";
+import { clientTimer } from "./testOnlyTimers";
 
 export type SocketLivenessPhase =
 	| "disconnected"
@@ -191,7 +192,7 @@ export class SocketLivenessCoordinator {
 			state.timer = null;
 			if (state.connectionEpoch !== epoch) return;
 			this.startProbe(state, "idle");
-		}, state.descriptor.idleMs);
+		}, clientTimer("livenessIdleMs", state.descriptor.idleMs));
 	}
 
 	private armReadyTimeout(state: TargetState): void {
@@ -202,7 +203,7 @@ export class SocketLivenessCoordinator {
 			state.timer = null;
 			if (state.connectionEpoch !== epoch || state.phase !== "awaiting_ready") return;
 			this.fail(state, "ready_timeout");
-		}, SOCKET_LIVENESS_TIMEOUT_MS);
+		}, clientTimer("livenessTimeoutMs", SOCKET_LIVENESS_TIMEOUT_MS));
 	}
 
 	private startProbe(state: TargetState, _reason: string): void {
@@ -224,7 +225,7 @@ export class SocketLivenessCoordinator {
 			state.timer = null;
 			if (state.connectionEpoch !== epoch || state.probeId !== probeId) return;
 			this.fail(state, "probe_timeout");
-		}, state.descriptor.timeoutMs);
+		}, clientTimer("livenessTimeoutMs", state.descriptor.timeoutMs));
 	}
 
 	private fail(state: TargetState, reason: SocketLivenessFailure): void {

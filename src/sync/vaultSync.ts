@@ -37,7 +37,8 @@ import type {
 	StoredSemanticEpochReplacement,
 } from "./vaultIndexedDb";
 import { obsidianRequest, type HttpRequester } from "../utils/http";
-import { patchTicketInUrl, SocketTicketHttpError, TICKET_REFRESH_BUFFER_MS, type SocketTicketScope } from "./socketTicket";
+import { patchTicketInUrl, SocketTicketHttpError, ticketRefreshBufferMs, type SocketTicketScope } from "./socketTicket";
+import { clientTimer } from "../runtime/testOnlyTimers";
 import { PROTOCOL_VERSION, SCHEMA_VERSION } from "./schema";
 import type { AttachmentHead, BlobMeta, BlobRef, BlobTombstone, SemanticPathRef } from "../types";
 import { applyDiffToYText, tryApplyDiffToYText } from "./diff";
@@ -1348,8 +1349,8 @@ export class VaultSync implements SyncRuntimePort {
 		this.options = {
 			...options,
 			maxLoadedBodies: options.maxLoadedBodies ?? DEFAULT_MAX_LOADED_BODIES,
-			candidateDebounceMs: options.candidateDebounceMs ?? DEFAULT_CANDIDATE_DEBOUNCE_MS,
-			candidateMaxWaitMs: options.candidateMaxWaitMs ?? DEFAULT_CANDIDATE_MAX_WAIT_MS,
+			candidateDebounceMs: options.candidateDebounceMs ?? clientTimer("candidateDebounceMs", DEFAULT_CANDIDATE_DEBOUNCE_MS),
+			candidateMaxWaitMs: options.candidateMaxWaitMs ?? clientTimer("candidateMaxWaitMs", DEFAULT_CANDIDATE_MAX_WAIT_MS),
 			bodySyncTimeoutMs: options.bodySyncTimeoutMs ?? DEFAULT_BODY_SYNC_TIMEOUT_MS,
 		};
 		if (preloadedRoot && preloadedRoot.kind !== "root") throw new Error("root cache has non-root epoch metadata");
@@ -3369,7 +3370,7 @@ export class VaultSync implements SyncRuntimePort {
 	async reconnect(reason = "explicit"): Promise<OperationOutcome> {
 		const outcome = await this.runReconnectWork(reason);
 		if (outcome.kind === "retryable_failure" && !this.destroyed && !this.fatalAuthError) {
-			const delayMs = outcome.retryAfterMs ?? TICKET_REFRESH_BUFFER_MS;
+			const delayMs = outcome.retryAfterMs ?? ticketRefreshBufferMs();
 			await this.workScheduler.queueReconnect(`retry:${reason}`, this.now() + delayMs);
 		}
 		return outcome;
@@ -5856,7 +5857,7 @@ export class VaultSync implements SyncRuntimePort {
 		if (this.destroyed || this.fatalAuthError) return;
 		const now = this.now();
 		const remaining = ticket.localExpiresAt - now;
-		const buffer = Math.min(TICKET_REFRESH_BUFFER_MS, Math.floor(remaining / 2));
+		const buffer = Math.min(ticketRefreshBufferMs(), Math.floor(remaining / 2));
 		const dueAt = now + Math.max(250, remaining - buffer);
 		void this.workScheduler.queueTicketExpiryCheck(TICKET_EXPIRY_CHECK_REASON, dueAt).catch((error) => {
 			this.log(`ticket expiry check scheduling failed: ${String(error)}`);
@@ -5868,7 +5869,7 @@ export class VaultSync implements SyncRuntimePort {
 		this.admissionRootTicket = null;
 		if (!stashed || stashed.rootEpoch !== rootEpoch
 			|| !this.isCapturedAuthorityCurrent(stashed.authority)
-			|| stashed.ticket.localExpiresAt - this.now() <= TICKET_REFRESH_BUFFER_MS) return null;
+			|| stashed.ticket.localExpiresAt - this.now() <= ticketRefreshBufferMs()) return null;
 		return stashed.ticket;
 	}
 

@@ -79,6 +79,8 @@ const mainContext = await esbuild.context({
 	define: {
 		// false → esbuild eliminates getEngineControlPort, ingestDiskFileNow, etc.
 		"__YAOS_QA_HARNESS_ENABLED__": "false",
+		// Release builds never carry test-only timer overrides (testOnlyTimers.ts).
+		"__YAOS_TEST_ONLY_TIMERS__": "undefined",
 	},
 });
 

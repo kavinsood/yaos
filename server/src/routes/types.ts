@@ -12,6 +12,12 @@ export interface Env {
 	execution?: ExecutionPort;
 	YAOS_TICKET_TTL_MS?: string;
 	YAOS_ENABLE_ADMIN_ROUTES?: string;
+	/** Test-only; see testOnlyTimers.ts. Inert unless exactly "true". */
+	YAOS_TEST_ONLY_FAST_TIMERS?: string;
+	YAOS_TEST_ONLY_PERSIST_DEBOUNCE_MS?: string;
+	YAOS_TEST_ONLY_LAST_SEEN_RESOLUTION_MS?: string;
+	/** Test-only debug routes (simulate-restart); 404 unless exactly "true". */
+	YAOS_TEST_ONLY_DEBUG_ROUTES?: string;
 }
 
 export type JsonResponse = (body: unknown, status?: number) => Response;

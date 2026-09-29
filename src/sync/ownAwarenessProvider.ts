@@ -1,6 +1,7 @@
 import * as encoding from "lib0/encoding";
 import YSyncProvider, { messageAwareness, messageQueryAwareness } from "y-partyserver/provider";
 import { encodeAwarenessUpdate, removeAwarenessStates } from "y-protocols/awareness";
+import { clientTimer } from "../runtime/testOnlyTimers";
 
 /**
  * y-partyserver clears y-protocols' awareness check interval (the 15 s own
@@ -56,7 +57,8 @@ export class OwnAwarenessProvider extends YSyncProvider {
 				encodeAwarenessUpdate(provider.awareness, [provider.awareness.clientID]),
 			);
 		};
-		this.awarenessCheckTimer = setInterval(() => this.checkAwareness(), AWARENESS_CHECK_MS);
+		this.awarenessCheckTimer = setInterval(() => this.checkAwareness(),
+			clientTimer("awarenessCheckMs", AWARENESS_CHECK_MS));
 		// Node: never keep a process alive for presence upkeep.
 		(this.awarenessCheckTimer as { unref?: () => void }).unref?.();
 	}
@@ -73,7 +75,7 @@ export class OwnAwarenessProvider extends YSyncProvider {
 		const local = awareness.getLocalState();
 		const ownMeta = awareness.meta.get(awareness.clientID);
 		if (this.wsconnected && local !== null && Object.keys(local).length > 0
-			&& ownMeta && now - ownMeta.lastUpdated >= AWARENESS_RENEW_MS) {
+			&& ownMeta && now - ownMeta.lastUpdated >= clientTimer("awarenessRenewMs", AWARENESS_RENEW_MS)) {
 			// Same state, next clock. An unchanged state emits only "update",
 			// and y-partyserver transmits on "change", so send it explicitly.
 			awareness.setLocalState(local);
@@ -82,7 +84,7 @@ export class OwnAwarenessProvider extends YSyncProvider {
 		const stale: number[] = [];
 		awareness.meta.forEach((meta, clientId) => {
 			if (clientId !== awareness.clientID && awareness.states.has(clientId)
-				&& now - meta.lastUpdated >= AWARENESS_REMOTE_TIMEOUT_MS) stale.push(clientId);
+				&& now - meta.lastUpdated >= clientTimer("awarenessRemoteTimeoutMs", AWARENESS_REMOTE_TIMEOUT_MS)) stale.push(clientId);
 		});
 		// Emits change/update with origin "timeout"; the own-only handler sends
 		// nothing for remote clients, so this cannot start a relay ping-pong.

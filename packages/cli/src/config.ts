@@ -1,6 +1,7 @@
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import nodePath from "node:path";
+import { parseClientTimerEnv, type ClientTimerOverrides } from "../../../src/runtime/testOnlyTimers.ts";
 
 export const EXIT = {
 	ok: 0,
@@ -26,6 +27,9 @@ Environment:
   YAOS_CF_ACCESS_CLIENT_SECRET           Required with the Access service-token ID.
   YAOS_TEST_ONLY_DROP_HINT               Test-only watcher loss injection.
   YAOS_TEST_ONLY_RECONCILE_INTERVAL_MS   Test-only authoritative scan period.
+  YAOS_TEST_ONLY_FAST_TIMERS=true        Test-only master flag for the
+                                         YAOS_TEST_ONLY_*_MS timer knobs
+                                         (src/runtime/testOnlyTimers.ts).
 
 State:
   YAOS_STATE_DIR is used exactly when set; otherwise state defaults to:
@@ -65,6 +69,8 @@ export interface DaemonConfig extends ParsedCommand {
 	readonly command: "daemon";
 	readonly reconcileIntervalMs: number;
 	readonly debug: boolean;
+	/** Test-only timer overrides; empty unless YAOS_TEST_ONLY_FAST_TIMERS=true. */
+	readonly testOnlyTimers: ClientTimerOverrides;
 }
 
 export interface AccessServiceCredentials {
@@ -163,5 +169,9 @@ export function resolveDaemonConfig(parsed: ParsedCommand, env: NodeJS.ProcessEn
 		reconcileIntervalMs = Math.floor(value);
 	}
 	const debug = /^(?:1|true|yes)$/i.test((env.YAOS_DEBUG ?? "").trim());
-	return { ...parsed, command: "daemon", reconcileIntervalMs, debug };
+	const timers = parseClientTimerEnv(env);
+	if (timers.rejected.length > 0) {
+		throw new ConfigError(`Invalid test-only timer configuration: ${timers.rejected.join(", ")}`);
+	}
+	return { ...parsed, command: "daemon", reconcileIntervalMs, debug, testOnlyTimers: timers.overrides };
 }

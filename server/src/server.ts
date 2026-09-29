@@ -8,6 +8,7 @@ import { BoundedBodyError, readBoundedBytes } from "./readBoundedBytes";
 import { handleVaultRecoveryRpc } from "./recoveryRpcRouter";
 import { RECOVERY_PUBLIC_RPC_PATH } from "./recoveryProtocol";
 import type { ActorCallPort, AlarmPort, DrainPort, ExecutionPort, ObjectStorePort, VaultRuntimeStoragePort } from "./platformPorts";
+import { PRODUCTION_PERSIST_DEBOUNCE_MS, readServerTimers, testOnlyDebugRoutesEnabled, testOnlyFastTimersEnabled, type ServerTimers, type TestOnlyDebugRouteEnv, type TestOnlyServerTimerEnv } from "./testOnlyTimers";
 import { CloudflareActorCalls, CloudflareAlarmPort, CloudflareExecutionPort, CloudflareObjectStore, CloudflareSocketRegistry, reciprocateSocketClose } from "./cloudflarePorts";
 import { handleSettingsSyncRequest, SettingsSyncStore } from "./settingsSyncStore";
 import {
@@ -36,7 +37,9 @@ import { SemanticCompactionRuntime } from "./semanticCompactionRuntime";
 import { BODY_EPOCH_HEADER, ROOT_EPOCH_HEADER, parseSemanticEpoch, parseSemanticEpochHeader } from "./shared/semanticEpoch";
 import { SOCKET_CLIENT_CAPABILITIES_PARAM, parseSocketClientCapabilities } from "./shared/socketLiveness";
 
-const PERSIST_DEBOUNCE_MS = 250;
+// Production PERSIST_DEBOUNCE_MS (250 ms) lives in testOnlyTimers.ts so the
+// test-only override can never drift from it.
+const PERSIST_DEBOUNCE_MS = PRODUCTION_PERSIST_DEBOUNCE_MS;
 const PERSIST_RETRY_MS = 1_000;
 const JOURNAL_COMPACT_ENTRIES = 50;
 const JOURNAL_COMPACT_BYTES = 1024 * 1024;
@@ -155,7 +158,20 @@ export interface VaultRuntimeOptions {
 	recoveryJobs?: ActorCallPort;
 	/** Control plane, for best-effort device presence (`lastSeenAt`) refreshes. */
 	controlPlane?: ActorCallPort;
+	/** Test-only timer overrides (testOnlyTimers.ts); production constants when absent. */
+	timers?: ServerTimers;
+	/**
+	 * Test-only restart simulation, provided by a host that can rebuild the
+	 * runtime. Absent (production hosts), the runtime path is a plain 404.
+	 */
+	simulateRestart?: () => Promise<Response>;
 }
+
+/**
+ * Runtime path of the experiment-only restart simulation. Reached only via the
+ * gated Worker route `POST /vault/:id/debug/simulate-restart`.
+ */
+export const SIMULATE_RESTART_RUNTIME_PATH = "/__yaos/test-only/simulate-restart";
 
 /** Schema-8 root/Markdown/Canvas composition, independent of a worker or process host. */
 export class VaultRuntime implements DrainPort {
@@ -228,6 +244,7 @@ export class VaultRuntime implements DrainPort {
 			scheduleFlush: (documentId) => this.scheduleFlush(documentId),
 			shouldPauseAdmission: (documentId) => this.semanticCompaction?.shouldPauseAdmission(documentId) ?? false,
 			...(options.controlPlane ? { touchDevice: (deviceId: string) => this.touchDevice(deviceId) } : {}),
+			...(options.timers ? { deviceLastSeenResolutionMs: options.timers.deviceLastSeenResolutionMs } : {}),
 		});
 		this.sockets = socketOwner;
 		this.semanticCompaction = new SemanticCompactionRuntime({
@@ -317,6 +334,9 @@ export class VaultRuntime implements DrainPort {
 			const forwardedGeneration = request.headers.get(INTERNAL_GENERATION_HEADER);
 			if (forwardedGeneration !== metadata.vaultGeneration) {
 				return json({ error: "vault_generation_mismatch" }, 409);
+			}
+			if (request.method === "POST" && url.pathname === SIMULATE_RESTART_RUNTIME_PATH) {
+				return this.options.simulateRestart ? await this.options.simulateRestart() : json({ error: "not_found" }, 404);
 			}
 				if (request.method === "POST" && url.pathname === "/__yaos/authority-fence") {
 					return this.runAuthorityBoundary(() => this.installAuthorityFence(request));
@@ -593,6 +613,34 @@ export class VaultRuntime implements DrainPort {
 			body: JSON.stringify({ deviceId, vaultId: metadata.vaultId }),
 		})).then(() => undefined, () => undefined);
 		this.options.execution.waitUntil(task);
+	}
+
+	/**
+	 * TEST-ONLY (restart simulation). Makes all pending in-memory work durable
+	 * without closing sockets, then retires this instance so a straggling
+	 * debounced flush is a no-op. The host then builds a fresh runtime over
+	 * the same storage and hibernated sockets, as a cold wake would.
+	 */
+	async retireForSimulatedRestart(): Promise<{ runtimeEpoch: string; flushedDocuments: number }> {
+		let flushedDocuments = 0;
+		for (let round = 0; round < 10; round++) {
+			await Promise.all([...this.scheduledFlushes.values()]);
+			const pending = Object.keys(this.cache.diagnostics().pending);
+			if (pending.length === 0 && this.scheduledFlushes.size === 0) break;
+			flushedDocuments += pending.length;
+			await this.flushLoadedDocuments();
+			await this.waitForFlushLanes();
+		}
+		await this.waitForFlushLanes();
+		if (Object.keys(this.cache.diagnostics().pending).length > 0) throw new Error("pending persistence did not settle");
+		this.deleted = true;
+		this.cache.clear();
+		return { runtimeEpoch: this.runtimeEpoch, flushedDocuments };
+	}
+
+	/** Current runtime epoch (test-only restart simulation reports it). */
+	get currentRuntimeEpoch(): string {
+		return this.runtimeEpoch;
 	}
 
 	drain(): Promise<void> {
@@ -1028,7 +1076,8 @@ export class VaultRuntime implements DrainPort {
 
 	private scheduleFlush(documentId: string): void {
 		if (this.scheduledFlushes.has(documentId)) return;
-		const scheduled = new Promise<void>((resolve) => setTimeout(resolve, PERSIST_DEBOUNCE_MS))
+		const debounceMs = this.options.timers?.persistDebounceMs ?? PERSIST_DEBOUNCE_MS;
+		const scheduled = new Promise<void>((resolve) => setTimeout(resolve, debounceMs))
 			.then(async () => { await this.flushDocument(documentId); })
 			.finally(() => {
 				this.scheduledFlushes.delete(documentId);
@@ -1306,7 +1355,7 @@ export class VaultRuntime implements DrainPort {
 	}
 }
 
-export interface CloudflareVaultEnvironment {
+export interface CloudflareVaultEnvironment extends TestOnlyServerTimerEnv, TestOnlyDebugRouteEnv {
 	YAOS_BUCKET?: R2Bucket;
 	YAOS_RECOVERY_JOBS?: DurableObjectNamespace;
 	/** The Worker's control-plane namespace; Durable Objects share the Worker's bindings. */
@@ -1320,10 +1369,16 @@ export interface VaultSyncServer extends Rpc.DurableObjectBranded {}
 /** Cloudflare Durable Object wrapper for the portable schema-8 vault runtime. */
 // eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging -- Declaration merging preserves the Workers RPC brand on the Cloudflare wrapper.
 export class VaultSyncServer implements DurableObject {
-	private readonly runtime: VaultRuntime;
+	private runtime: VaultRuntime;
+	/** Test-only: set while a simulated restart swaps the runtime. */
+	private restarting: Promise<void> | null = null;
 
-	constructor(state: DurableObjectState, env: CloudflareVaultEnvironment) {
-		this.runtime = new VaultRuntime({
+	constructor(private readonly state: DurableObjectState, private readonly env: CloudflareVaultEnvironment) {
+		this.runtime = this.createRuntime(state, env);
+	}
+
+	private createRuntime(state: DurableObjectState, env: CloudflareVaultEnvironment): VaultRuntime {
+		return new VaultRuntime({
 			storage: state.storage as VaultRuntimeStoragePort,
 			sockets: new CloudflareSocketRegistry(state),
 			alarms: new CloudflareAlarmPort(state.storage),
@@ -1333,14 +1388,42 @@ export class VaultSyncServer implements DurableObject {
 				? new CloudflareActorCalls(env.YAOS_RECOVERY_JOBS)
 				: undefined,
 			controlPlane: env.YAOS_CONFIG ? new CloudflareActorCalls(env.YAOS_CONFIG) : undefined,
+			...(testOnlyFastTimersEnabled(env) ? { timers: readServerTimers(env) } : {}),
+			// The Worker gate checks the same var plus the operator session.
+			...(testOnlyDebugRoutesEnabled(env) ? { simulateRestart: () => this.simulateRestart() } : {}),
 		});
 	}
 
-	fetch(request: Request): Promise<Response> {
+	/**
+	 * TEST-ONLY. Behave as after hibernation + wake: flush pending work, then
+	 * replace the runtime with a freshly constructed one (new runtimeEpoch,
+	 * empty resident document cache and in-memory state) while the accepted
+	 * hibernatable sockets stay attached, exactly the state a cold wake
+	 * constructor sees. Module-level isolate state is not reset.
+	 */
+	private async simulateRestart(): Promise<Response> {
+		if (this.restarting) return json({ error: "restart_in_progress" }, 409);
+		let release!: () => void;
+		this.restarting = new Promise<void>((resolve) => { release = resolve; });
+		try {
+			const retired = await this.runtime.retireForSimulatedRestart();
+			this.runtime = this.createRuntime(this.state, this.env);
+			return json({ simulated: "restart", previousRuntimeEpoch: retired.runtimeEpoch,
+				runtimeEpoch: this.runtime.currentRuntimeEpoch, flushedDocuments: retired.flushedDocuments,
+				sockets: this.state.getWebSockets().length });
+		} finally {
+			this.restarting = null;
+			release();
+		}
+	}
+
+	async fetch(request: Request): Promise<Response> {
+		if (this.restarting) await this.restarting;
 		return this.runtime.fetch(request);
 	}
 
-	webSocketMessage(socket: WebSocket, message: string | ArrayBuffer): Promise<void> {
+	async webSocketMessage(socket: WebSocket, message: string | ArrayBuffer): Promise<void> {
+		if (this.restarting) await this.restarting;
 		return this.runtime.webSocketMessage(socket, message);
 	}
 
@@ -1353,7 +1436,8 @@ export class VaultSyncServer implements DurableObject {
 		this.runtime.webSocketError(socket);
 	}
 
-	alarm(): Promise<void> {
+	async alarm(): Promise<void> {
+		if (this.restarting) await this.restarting;
 		return this.runtime.alarm();
 	}
 }

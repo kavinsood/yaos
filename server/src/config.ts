@@ -35,6 +35,7 @@ import {
 } from "./collaborationControlPlane";
 import { capabilitiesForRole } from "./collaboration";
 import { DEVICE_LAST_SEEN_RESOLUTION_MS } from "./contracts";
+import { readServerTimers, type TestOnlyServerTimerEnv } from "./testOnlyTimers";
 import { parseAuthorizationChangeRecords, parseCollaborationCodeRecords, parseMembershipRecords, parseOwnershipTransferRecords, parsePrincipalRecords, parseSecurityAuditEvents, parseVaultGovernanceRequestRecords, type AuthorizationChangeRecord, type VaultGovernanceRequestRecord } from "./collaborationIdentity";
 
 const CONFIG_FORMAT_KEY = "configFormat";
@@ -408,7 +409,11 @@ export function parsePendingDestroyRecords(
 export class ControlPlaneRuntime {
 	private readonly collaboration: CollaborationControlPlane;
 
-	constructor(private readonly storage: ControlPlaneStoragePort) {
+	constructor(
+		private readonly storage: ControlPlaneStoragePort,
+		/** Test-only override of DEVICE_LAST_SEEN_RESOLUTION_MS (testOnlyTimers.ts). */
+		private readonly deviceLastSeenResolutionMs: number = DEVICE_LAST_SEEN_RESOLUTION_MS,
+	) {
 		this.collaboration = new CollaborationControlPlane(storage);
 	}
 
@@ -1490,7 +1495,7 @@ export class ControlPlaneRuntime {
 		// Presence is kept at DEVICE_LAST_SEEN_RESOLUTION_MS; a fresher value
 		// is left alone so touches from many isolates do not each write.
 		const fresh = (device: DeviceRecord, now: number): boolean => device.lastSeenAt !== undefined
-			&& now >= device.lastSeenAt && now - device.lastSeenAt < DEVICE_LAST_SEEN_RESOLUTION_MS;
+			&& now >= device.lastSeenAt && now - device.lastSeenAt < this.deviceLastSeenResolutionMs;
 		return this.storage.transaction(async (txn) => {
 			const now = Date.now();
 			if (txn.records) {
@@ -1977,11 +1982,11 @@ export class ControlPlaneRuntime {
 export class ServerConfig {
 	private readonly runtime: ControlPlaneRuntime;
 
-	constructor(state: DurableObjectState) {
+	constructor(state: DurableObjectState, env?: TestOnlyServerTimerEnv) {
 		this.runtime = new ControlPlaneRuntime(new SqlControlPlaneStorage(
 			state.storage as unknown as ControlPlaneSqlHost,
 			"global-config",
-		));
+		), readServerTimers(env).deviceLastSeenResolutionMs);
 	}
 
 	fetch(request: Request): Promise<Response> {

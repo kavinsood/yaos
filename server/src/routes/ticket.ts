@@ -1,7 +1,7 @@
 import { base64UrlToBytes, bytesToBase64Url, randomBase64Url } from "../base64url";
 import type { VaultActorContext } from "../collaboration";
 import { sha256Hex } from "../hex";
-import { DEVICE_LAST_SEEN_RESOLUTION_MS } from "../contracts";
+import { readServerTimers } from "../testOnlyTimers";
 import type { AuthState, Env } from "./types";
 import {
 	parseSemanticEpoch,
@@ -151,7 +151,8 @@ const MAX_TOUCHED_DEVICES = 4_096;
  */
 function scheduleTouchDevice(env: Env, actor: VaultActorContext): void {
 	const now = Date.now();
-	const resolutionMs = DEVICE_LAST_SEEN_RESOLUTION_MS;
+	// DEVICE_LAST_SEEN_RESOLUTION_MS unless test-only fast timers are enabled.
+	const resolutionMs = readServerTimers(env).deviceLastSeenResolutionMs;
 	const key = `${actor.vaultId}\u0000${actor.deviceId}`;
 	const last = touchedDevices.get(key);
 	if (last !== undefined && now - last < resolutionMs) return;

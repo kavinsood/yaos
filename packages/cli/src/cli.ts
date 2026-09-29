@@ -13,6 +13,7 @@ import { enrollDevice, EnrollmentError } from "./enrollment";
 import { acquireProcessLock, LockHeldError } from "./lock";
 import { NodeVaultDatabaseIdentityError } from "./nodeVaultDatabase";
 import { createAccessFetch } from "./access";
+import { installClientTimerOverrides } from "../../../src/runtime/testOnlyTimers";
 import {
 	prepareStatePaths,
 	readEnrollmentState,
@@ -57,6 +58,8 @@ async function run(): Promise<number> {
 		}
 
 		const config = resolveDaemonConfig(parsed, process.env);
+		// Empty (production timers) unless YAOS_TEST_ONLY_FAST_TIMERS=true.
+		installClientTimerOverrides(config.testOnlyTimers);
 		const state = await readEnrollmentState(paths);
 		if (!state?.membership) {
 			throw new ConfigError(`This vault path is not enrolled. Run \`yaos enroll ${parsed.vaultPath}\` first.`);

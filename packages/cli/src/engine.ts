@@ -5,6 +5,7 @@ import { BootstrapClient, BootstrapHttpPort, prepareBootstrapRoot } from "../../
 import { DiskMirror } from "../../../src/sync/diskMirror";
 import { ObsidianCanvasDiskMirror } from "../../../src/sync/canvas/canvasDiskMirror";
 import { createSocketTicketCache } from "../../../src/sync/socketTicket";
+import { clientTimer } from "../../../src/runtime/testOnlyTimers";
 import { BodySettlementRepository } from "../../../src/sync/bodySettlement";
 import { canonicalMarkdownHash } from "../../../server/src/shared/markdownCodec";
 import {
@@ -329,7 +330,8 @@ export class DaemonEngine {
 			MAX_DELETE_STABILITY_MS,
 		);
 		this.deleteReviewDeadlineMs = this.deleteStabilityMs * 4;
-		this.remoteCatchUps = new RemoteCatchUpSchedule(config.reconcileIntervalMs * REMOTE_SAFETY_POLL_PERIODS);
+		this.remoteCatchUps = new RemoteCatchUpSchedule(
+			clientTimer("remoteSafetyPollMs", config.reconcileIntervalMs * REMOTE_SAFETY_POLL_PERIODS));
 	}
 
 	/** Register the post-startup fatal-auth notification. Fires at most once. */
