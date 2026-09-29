@@ -1,0 +1,47 @@
+server/src/bootstrap.ts
+  s_3fa8c41e3d4d37::t_ddfd9fb2cbcacf 11-28,100,103-108,110-113,115-117,119-120,123,142,147,226,228-235,241,243-244
+server/src/server.ts
+  s_06158d5aa75452::t_e5ddc74da16873 4,455,483,889,891,898-900,905,912,914,917,964,986,1003,1007
+tests/fixtures/G7-bootstrap-contract.ts
+  s_3fa8c41e3d4d37::t_f38950b40473c8 1-141
+tests/fixtures/G7-bootstrap-routes-contract.ts
+  s_3fa8c41e3d4d37::t_d0882af00c3b47 1-89
+tests/server/G7-bootstrap-node.ts
+  s_06158d5aa75452::t_ec9df529f2a14f 1-20
+tests/server/G7-bootstrap-routes-node.ts
+  s_d157206730843c::t_613368d318eabc 1-21
+tests/server/G7-bootstrap-worker.ts
+  s_d157206730843c::t_48a0185a74c589 1-65
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "af5ab3784a70198b0cf47b3a5dfca7c7cc12da19",
+  "prompts": {},
+  "sessions": {
+    "s_06158d5aa75452": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aabbc0b8c933cb988",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_3fa8c41e3d4d37": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a0da75a62b227384a",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_d157206730843c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ac9fff1be1f00827f",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
