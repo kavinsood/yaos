@@ -1,6 +1,6 @@
 # G8 — No-baseline frontmatter decision
 
-Date: September 30, 2026. Decision memo only; this item changes no ingestion policy.
+Date: September 29, 2026 (UTC). Decision memo only; this item changes no ingestion policy.
 
 ## Current contract and evidence
 
