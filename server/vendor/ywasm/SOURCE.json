@@ -14,13 +14,13 @@
 	"maximumLinearMemoryBytes": 100663296,
 	"features": [],
 	"artifact": {
-		"wasmSha256": "3d0dc3fceba1de16ae21d7d345999f75a09ea3743339f1911a1e419db8c703c3",
-		"wasmBytes": 983035,
-		"wrapperSha256": "f3b17b5eacf661a7139b418abf28122b60d302628d344a93bbd5eec5ad3f4449",
-		"wrapperBytes": 159578,
-		"nodeWrapperSha256": "59b8f9614507a6c86af852dd9d9a509d8d7dde923b5c863b63a0a7d988771b3f",
-		"nodeWrapperBytes": 161088,
-		"nodeTypesSha256": "eee772f7936b3ed8f4e9f69693b41157ad96b580340cc01a50a3cde7314a6085",
-		"nodeTypesBytes": 64868
+		"wasmSha256": "a0ed10a6fe8eca6fd34a0430718702df7fa97e4b33ff1b548b04873d65f84857",
+		"wasmBytes": 986393,
+		"wrapperSha256": "fffcc4b559029f54569332871936307d8818ed13de6d4de65a61b66ee9b877ff",
+		"wrapperBytes": 161248,
+		"nodeWrapperSha256": "d969aa85f0cabb8404baadec0af7fd297204325061e73feffea6ca8ad997c78f",
+		"nodeWrapperBytes": 162852,
+		"nodeTypesSha256": "4d121b838b84de9d0cc2491d48e9b21662cbb18c4da2befc04bb8a3790778cbe",
+		"nodeTypesBytes": 65625
 	}
 }

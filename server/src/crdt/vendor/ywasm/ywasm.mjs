@@ -3714,6 +3714,30 @@ export function decodeSnapshotV2(snapshot) {
 }
 
 /**
+ * YAOS patch 0003: given a lib0 v1 encoded `update` and a lib0 v1 encoded `state_vector`,
+ * returns a lib0 v1 encoded update containing the changes from `update` not observed by
+ * `state_vector`, without creating a document (yrs `diff_updates_v1`).
+ *
+ * Returns an error whenever either input couldn't be decoded.
+ * @param {Uint8Array} update
+ * @param {Uint8Array} state_vector
+ * @returns {Uint8Array}
+ */
+export function diffUpdateV1(update, state_vector) {
+    const ptr0 = passArray8ToWasm0(update, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passArray8ToWasm0(state_vector, wasm.__wbindgen_malloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.diffUpdateV1(ptr0, len0, ptr1, len1);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v3;
+}
+
+/**
  * @param {Awareness} awareness
  * @param {any} clients
  * @returns {Uint8Array}
@@ -3894,6 +3918,26 @@ export function encodeStateVector(doc) {
         throw takeFromExternrefTable0(ret[1]);
     }
     return takeFromExternrefTable0(ret[0]);
+}
+
+/**
+ * YAOS patch 0003: decodes a lib0 v1 encoded update and returns the lib0 v1 encoded state
+ * vector it covers, without creating a document (yrs `encode_state_vector_from_update_v1`).
+ *
+ * Returns an error whenever the input update couldn't be decoded.
+ * @param {Uint8Array} update
+ * @returns {Uint8Array}
+ */
+export function encodeStateVectorFromUpdateV1(update) {
+    const ptr0 = passArray8ToWasm0(update, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeStateVectorFromUpdateV1(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
 }
 
 /**

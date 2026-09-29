@@ -56,6 +56,8 @@ try {
 	const patches = [
 		join(vendorDir, "patches/0001-document-stats.patch"),
 		join(vendorDir, "patches/0002-apply-update-change-detection.patch"),
+		// Relay v2 spike (D4): stateless update-level ops (merge/SV-from-update/diff).
+		join(vendorDir, "patches/0003-byte-level-update-ops.patch"),
 	];
 	for (const patch of patches) {
 		// The change-detection patch is generated with zero diff context so the
@@ -66,6 +68,8 @@ try {
 	}
 	output("cargo", ["test", "-p", "yrs", "--lib", "document_stats_counts_deleted_integrated_structs", "--locked"], { cwd: sourceDir });
 	output("cargo", ["test", "-p", "yrs", "--lib", "update_change_detection_covers_duplicate_and_delete_only_updates", "--locked"], { cwd: sourceDir });
+	// Patch 0003 only re-exports yrs `alt` functions; run their upstream compatibility tests.
+	output("cargo", ["test", "-p", "yrs", "--lib", "alt::test", "--locked"], { cwd: sourceDir });
 
 	const rustflags = `-C link-arg=--max-memory=${metadata.maximumLinearMemoryBytes} -C link-arg=--export-memory`;
 	const build = (target, outDir) => output("wasm-pack", [

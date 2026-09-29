@@ -15,6 +15,40 @@ try {
 	doc.free();
 }
 
+// Patch 0003: stateless update-level ops must agree with a transient doc.
+{
+	const source = new bindings.YDoc({ guid: "yaos-build-byteops" });
+	const body = source.getText("body");
+	try {
+		body.insert(0, "hello", undefined, undefined);
+		const first = bindings.encodeStateAsUpdate(source);
+		const firstVector = bindings.encodeStateVector(source);
+		body.insert(5, " world", undefined, undefined);
+		body.delete(0, 1, undefined);
+		const second = bindings.encodeStateAsUpdate(source, firstVector);
+		const merged = bindings.mergeUpdatesV1([first, second]);
+		assert.deepEqual([...bindings.encodeStateVectorFromUpdateV1(merged)], [...bindings.encodeStateVector(source)]);
+		const delta = bindings.diffUpdateV1(merged, firstVector);
+		const target = new bindings.YDoc({ guid: "yaos-build-byteops-target" });
+		const targetBody = target.getText("body");
+		try {
+			bindings.applyUpdate(target, first, "verify");
+			bindings.applyUpdate(target, delta, "verify");
+			assert.equal(targetBody.toString(undefined), "ello world");
+		} finally {
+			targetBody.free();
+			target.destroy(undefined);
+			target.free();
+		}
+		assert.deepEqual([...bindings.encodeStateVectorFromUpdateV1(Uint8Array.of(0, 0))], [0]);
+		assert.throws(() => bindings.diffUpdateV1(Uint8Array.of(0xff), Uint8Array.of(0)));
+	} finally {
+		body.free();
+		source.destroy(undefined);
+		source.free();
+	}
+}
+
 // A repeated full lifecycle catches forgotten wrapper/transaction frees. The
 // allocator may reserve a few pages while warming, but must settle rather than
 // grow with the number of requests handled by one isolate.

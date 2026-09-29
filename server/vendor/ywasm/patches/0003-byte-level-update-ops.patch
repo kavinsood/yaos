@@ -1,0 +1,24 @@
+diff --git a/ywasm/src/lib.rs b/ywasm/src/lib.rs
+index bf99fd9..213200f 100644
+--- a/ywasm/src/lib.rs
++++ b/ywasm/src/lib.rs
+@@ -207,0 +208,19 @@ pub fn merge_updates_v1(updates: js_sys::Array) -> Result<js_sys::Uint8Array> {
++/// YAOS patch 0003: decodes a lib0 v1 encoded update and returns the lib0 v1 encoded state
++/// vector it covers, without creating a document (yrs `encode_state_vector_from_update_v1`).
++///
++/// Returns an error whenever the input update couldn't be decoded.
++#[wasm_bindgen(js_name = encodeStateVectorFromUpdateV1)]
++pub fn encode_state_vector_from_update_v1(update: &[u8]) -> Result<Vec<u8>> {
++    yrs::encode_state_vector_from_update_v1(update).map_err(|e| JsValue::from(e.to_string()))
++}
++
++/// YAOS patch 0003: given a lib0 v1 encoded `update` and a lib0 v1 encoded `state_vector`,
++/// returns a lib0 v1 encoded update containing the changes from `update` not observed by
++/// `state_vector`, without creating a document (yrs `diff_updates_v1`).
++///
++/// Returns an error whenever either input couldn't be decoded.
++#[wasm_bindgen(js_name = diffUpdateV1)]
++pub fn diff_update_v1(update: &[u8], state_vector: &[u8]) -> Result<Vec<u8>> {
++    yrs::diff_updates_v1(update, state_vector).map_err(|e| JsValue::from(e.to_string()))
++}
++

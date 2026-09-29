@@ -45,4 +45,8 @@ export function applyUpdateAndCheckIfChanged(doc: YDoc, update: Uint8Array, orig
 export function encodeStateVector(doc: YDoc): Uint8Array;
 export function encodeStateAsUpdate(doc: YDoc, vector?: Uint8Array | null): Uint8Array;
 export function mergeUpdatesV1(updates: Array<Uint8Array>): Uint8Array;
+/** YAOS patch 0003: yrs `encode_state_vector_from_update_v1`. */
+export function encodeStateVectorFromUpdateV1(update: Uint8Array): Uint8Array;
+/** YAOS patch 0003: yrs `diff_updates_v1`. */
+export function diffUpdateV1(update: Uint8Array, stateVector: Uint8Array): Uint8Array;
 export function wasmMemoryByteLength(): number;

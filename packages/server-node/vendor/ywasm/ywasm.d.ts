@@ -1510,6 +1510,15 @@ export function decodeSnapshotV1(snapshot: Uint8Array): any;
 
 export function decodeSnapshotV2(snapshot: Uint8Array): any;
 
+/**
+ * YAOS patch 0003: given a lib0 v1 encoded `update` and a lib0 v1 encoded `state_vector`,
+ * returns a lib0 v1 encoded update containing the changes from `update` not observed by
+ * `state_vector`, without creating a document (yrs `diff_updates_v1`).
+ *
+ * Returns an error whenever either input couldn't be decoded.
+ */
+export function diffUpdateV1(update: Uint8Array, state_vector: Uint8Array): Uint8Array;
+
 export function encodeAwarenessUpdate(awareness: Awareness, clients: any): Uint8Array;
 
 /**
@@ -1597,6 +1606,14 @@ export function encodeStateFromSnapshotV2(doc: YDoc, snapshot: any): Uint8Array;
  * ```
  */
 export function encodeStateVector(doc: YDoc): Uint8Array;
+
+/**
+ * YAOS patch 0003: decodes a lib0 v1 encoded update and returns the lib0 v1 encoded state
+ * vector it covers, without creating a document (yrs `encode_state_vector_from_update_v1`).
+ *
+ * Returns an error whenever the input update couldn't be decoded.
+ */
+export function encodeStateVectorFromUpdateV1(update: Uint8Array): Uint8Array;
 
 export function equalSnapshots(snap1: any, snap2: any): boolean;
 
