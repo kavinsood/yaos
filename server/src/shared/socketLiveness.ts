@@ -1,6 +1,14 @@
 export const SOCKET_LIVENESS_VERSION = 1;
 export const SOCKET_LIVENESS_IDLE_MS = 60_000;
 export const SOCKET_LIVENESS_TIMEOUT_MS = 15_000;
+export const SOCKET_CLIENT_CAPABILITY_AUTO_RESPONSE = "livenessAutoResponse";
+export const SOCKET_LIVENESS_AUTO_RESPONSE_REQUEST = '__YPS:{"type":"VAULT_PING_AR","v":1}';
+export const SOCKET_LIVENESS_AUTO_RESPONSE_RESPONSE = '__YPS:{"type":"VAULT_PONG_AR","v":1}';
+export const SOCKET_LIVENESS_AUTO_RESPONSE = Object.freeze({
+	version: 1 as const,
+	request: SOCKET_LIVENESS_AUTO_RESPONSE_REQUEST,
+	response: SOCKET_LIVENESS_AUTO_RESPONSE_RESPONSE,
+});
 
 const MAX_PROBE_ID_LENGTH = 128;
 
@@ -8,6 +16,7 @@ export interface SocketLivenessDescriptor {
 	version: typeof SOCKET_LIVENESS_VERSION;
 	idleMs: number;
 	timeoutMs: number;
+	autoResponse?: typeof SOCKET_LIVENESS_AUTO_RESPONSE;
 }
 
 export interface VaultPingFrame {
@@ -128,6 +137,19 @@ export const SOCKET_LIVENESS_DESCRIPTOR: Readonly<SocketLivenessDescriptor> = Ob
 	timeoutMs: SOCKET_LIVENESS_TIMEOUT_MS,
 });
 
+export const SOCKET_LIVENESS_AUTO_RESPONSE_DESCRIPTOR: Readonly<SocketLivenessDescriptor> = Object.freeze({
+	...SOCKET_LIVENESS_DESCRIPTOR,
+	autoResponse: SOCKET_LIVENESS_AUTO_RESPONSE,
+});
+
+export function negotiateSocketLiveness(
+	capabilities: ReadonlySet<string> | undefined,
+	hostSupportsAutoResponse: boolean,
+): Readonly<SocketLivenessDescriptor> {
+	return hostSupportsAutoResponse && capabilities?.has(SOCKET_CLIENT_CAPABILITY_AUTO_RESPONSE)
+		? SOCKET_LIVENESS_AUTO_RESPONSE_DESCRIPTOR : SOCKET_LIVENESS_DESCRIPTOR;
+}
+
 function isProbeId(value: unknown): value is string {
 	if (typeof value !== "string" || value.length === 0 || value.length > MAX_PROBE_ID_LENGTH) return false;
 	for (const character of value) {
@@ -232,10 +254,16 @@ export function parseSocketLivenessDescriptor(value: unknown): SocketLivenessDes
 		|| !Number.isSafeInteger(record.timeoutMs)
 		|| record.idleMs !== SOCKET_LIVENESS_IDLE_MS
 		|| record.timeoutMs !== SOCKET_LIVENESS_TIMEOUT_MS) return null;
+	const autoResponse = record.autoResponse;
+	const supported = autoResponse && typeof autoResponse === "object" && !Array.isArray(autoResponse)
+		&& "version" in autoResponse && autoResponse.version === SOCKET_LIVENESS_AUTO_RESPONSE.version
+		&& "request" in autoResponse && autoResponse.request === SOCKET_LIVENESS_AUTO_RESPONSE_REQUEST
+		&& "response" in autoResponse && autoResponse.response === SOCKET_LIVENESS_AUTO_RESPONSE_RESPONSE;
 	return {
 		version: SOCKET_LIVENESS_VERSION,
 		idleMs: SOCKET_LIVENESS_IDLE_MS,
 		timeoutMs: SOCKET_LIVENESS_TIMEOUT_MS,
+		...(supported ? { autoResponse: SOCKET_LIVENESS_AUTO_RESPONSE } : {}),
 	};
 }
 

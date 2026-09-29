@@ -2,6 +2,10 @@ import { randomUUID } from "node:crypto";
 import type { SocketUpgradePort } from "../../../server/src/platformPorts";
 import type { VaultSocketPort, VaultSocketRegistryPort } from "../../../server/src/vaultSocketService";
 import type { AcceptedWebSocketUpgrade, NodeServerSocket } from "./transport";
+import {
+	SOCKET_LIVENESS_AUTO_RESPONSE_REQUEST,
+	SOCKET_LIVENESS_AUTO_RESPONSE_RESPONSE,
+} from "../../../server/src/shared/socketLiveness";
 
 const UPGRADE_ID_HEADER = "x-yaos-node-upgrade-id";
 
@@ -17,6 +21,7 @@ class PendingVaultSocket implements VaultSocketPort {
 	private connected: NodeServerSocket | null = null;
 	private readonly queued: Array<string | Uint8Array> = [];
 	private closeFrame: { code?: number; reason?: string } | null = null;
+	private autoResponseAt: number | null = null;
 
 	constructor(private readonly events: SocketEvents) {}
 
@@ -49,11 +54,21 @@ class PendingVaultSocket implements VaultSocketPort {
 		this.accepted = true;
 	}
 
+	getAutoResponseTimestamp(): number | null {
+		return this.autoResponseAt;
+	}
+
 	attach(socket: NodeServerSocket): void {
 		if (this.connected) throw new Error("pending WebSocket was attached twice");
 		if (!this.accepted) throw new Error("pending WebSocket was not accepted by its actor");
 		this.connected = socket;
 		socket.addEventListener("message", (event) => {
+			if (this.closeFrame || socket.readyState !== 1) return;
+			if (event.data === SOCKET_LIVENESS_AUTO_RESPONSE_REQUEST) {
+				socket.send(SOCKET_LIVENESS_AUTO_RESPONSE_RESPONSE);
+				this.autoResponseAt = Date.now();
+				return;
+			}
 			if (event.data !== undefined) this.events.message(this, event.data);
 		});
 		socket.addEventListener("close", () => this.events.close(this));
@@ -113,6 +128,14 @@ export class NodeSocketRegistry implements VaultSocketRegistryPort {
 		private readonly hub: NodeSocketHub,
 		private readonly events: SocketEvents,
 	) {}
+
+	supportsAutoResponse(): boolean {
+		return true;
+	}
+
+	getAutoResponseTimestamp(socket: VaultSocketPort): number | null {
+		return (socket as PendingVaultSocket).getAutoResponseTimestamp();
+	}
 
 	sockets(): readonly VaultSocketPort[] {
 		return [...this.active];

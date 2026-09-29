@@ -5,6 +5,9 @@ import { candidateDigestMaterial } from "@shared/candidateDigest";
 import { AUTHORITY_SUPERSEDED_SOCKET_CLOSE_CODE } from "@shared/socketCloseCodes";
 import {
 	SOCKET_CLIENT_CAPABILITY_CATCH_UP_HINT,
+	SOCKET_CLIENT_CAPABILITY_AUTO_RESPONSE,
+	SOCKET_LIVENESS_AUTO_RESPONSE_REQUEST,
+	SOCKET_LIVENESS_AUTO_RESPONSE_RESPONSE,
 	SOCKET_LIVENESS_IDLE_MS,
 	SOCKET_LIVENESS_TIMEOUT_MS,
 	parseBodyChangedHintFrame,
@@ -4719,6 +4722,12 @@ export class VaultSync implements SyncRuntimePort {
 		expectedDocumentId: string,
 		provider: SyncProviderPort,
 	): void {
+		if (payload === SOCKET_LIVENESS_AUTO_RESPONSE_RESPONSE.slice(6)) {
+			if (this.socketSessions.has(provider) && provider.wsconnected && provider.ws?.readyState === 1) {
+				this.socketLiveness.acknowledgeAutoResponse(expectedDocumentId);
+			}
+			return;
+		}
 		let frame: VaultControlFrame | null;
 		try {
 			frame = parseVaultControlFrame(payload);
@@ -4748,7 +4757,7 @@ export class VaultSync implements SyncRuntimePort {
 						capabilities: frame.capabilities,
 					});
 				this.socketSessions.set(provider, session);
-				this.socketLiveness.ready(expectedDocumentId, frame.liveness, frame.runtimeEpoch);
+				this.socketLiveness.ready(expectedDocumentId, frame.liveness, frame.runtimeEpoch, true);
 				this.backpressureLevel = 0;
 				this.submissionPausedUntil = 0;
 				if (frame.documentId === ROOT_DOCUMENT_ID) {
@@ -4816,10 +4825,11 @@ export class VaultSync implements SyncRuntimePort {
 			id: documentId,
 			documentId,
 			isOpen: () => provider.wsconnected && provider.ws?.readyState === 1,
-			sendProbe: (probeId) => {
+			sendProbe: (probeId, autoResponse) => {
 				if (!provider.sendMessage) throw new Error("provider does not support protocol control messages");
 				// YSyncProvider owns the single `__YPS:` transport prefix.
-				provider.sendMessage(JSON.stringify({ type: "VAULT_PING", probeId }));
+				provider.sendMessage(autoResponse ? SOCKET_LIVENESS_AUTO_RESPONSE_REQUEST.slice(6)
+					: JSON.stringify({ type: "VAULT_PING", probeId }));
 			},
 			onFailure: (reason) => {
 				this.log(`socket liveness failed for ${documentId}: ${reason}`);
@@ -5834,7 +5844,7 @@ export class VaultSync implements SyncRuntimePort {
 					// Additive capability: lets the server keep this socket open
 					// across a runtime wake and send BODY_CHANGED_HINT instead
 					// of closing it on every commit.
-					caps: SOCKET_CLIENT_CAPABILITY_CATCH_UP_HINT,
+					caps: `${SOCKET_CLIENT_CAPABILITY_CATCH_UP_HINT},${SOCKET_CLIENT_CAPABILITY_AUTO_RESPONSE}`,
 				};
 			},
 			awareness: input.kind === "root" ? undefined : new (this.providerAwarenessConstructor())(input.doc),

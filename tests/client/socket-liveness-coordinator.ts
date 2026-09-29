@@ -1,6 +1,7 @@
 import { strict as assert } from "node:assert";
 import {
 	SOCKET_LIVENESS_DESCRIPTOR,
+	SOCKET_LIVENESS_AUTO_RESPONSE_DESCRIPTOR,
 	SOCKET_LIVENESS_TIMEOUT_MS,
 } from "../../server/src/shared/socketLiveness";
 import {
@@ -130,6 +131,85 @@ s.test("background time does not consume the VAULT_READY handshake deadline", ()
 	coordinator.setForeground(true);
 	clock.advance(SOCKET_LIVENESS_TIMEOUT_MS);
 	assert.deepEqual(failures, ["ready_timeout"]);
+});
+
+for (const clientCapable of [false, true]) {
+	for (const serverCapable of [false, true]) {
+		s.test(`R3 negotiation client=${clientCapable} server=${serverCapable}`, () => {
+			const clock = new ManualClock();
+			const modes: boolean[] = [];
+			const failures: string[] = [];
+			const coordinator = new SocketLivenessCoordinator(clock, () => "r3-probe");
+			coordinator.register({
+				id: "root", documentId: "root", isOpen: () => true,
+				sendProbe: (_probeId, autoResponse) => modes.push(autoResponse),
+				onFailure: (reason) => failures.push(reason),
+			});
+			coordinator.connected("root");
+			coordinator.ready("root", serverCapable ? SOCKET_LIVENESS_AUTO_RESPONSE_DESCRIPTOR
+				: SOCKET_LIVENESS_DESCRIPTOR, "runtime-1", clientCapable);
+			assert.equal(coordinator.acknowledgeAutoResponse("root"), false);
+			clock.advance(SOCKET_LIVENESS_DESCRIPTOR.idleMs);
+			coordinator.probeNow("duplicate");
+			assert.deepEqual(modes, [clientCapable && serverCapable]);
+			if (clientCapable && serverCapable) {
+				assert.equal(coordinator.acknowledge("root", "r3-probe", "runtime-1"), false);
+				assert.equal(coordinator.acknowledgeAutoResponse("root"), true);
+				assert.equal(coordinator.acknowledgeAutoResponse("root"), false);
+			} else {
+				assert.equal(coordinator.acknowledgeAutoResponse("root"), false);
+				assert.equal(coordinator.acknowledge("root", "r3-probe", "runtime-1"), true);
+			}
+			clock.advance(SOCKET_LIVENESS_DESCRIPTOR.timeoutMs);
+			assert.deepEqual(failures, []);
+			coordinator.disconnected("root");
+			assert.equal(coordinator.acknowledgeAutoResponse("root"), false);
+		});
+	}
+}
+
+s.test("R3 suspension, missing fixed pong, and reconnect cannot accept unsolicited pongs", () => {
+	const clock = new ManualClock();
+	const failures: string[] = [];
+	const coordinator = new SocketLivenessCoordinator(clock, () => "r3-probe");
+	coordinator.register({
+		id: "root", documentId: "root", isOpen: () => true,
+		sendProbe: () => {}, onFailure: (reason) => failures.push(reason),
+	});
+	coordinator.connected("root");
+	coordinator.ready("root", SOCKET_LIVENESS_AUTO_RESPONSE_DESCRIPTOR, "runtime-1", true);
+	coordinator.probeNow("first");
+	coordinator.setForeground(false);
+	assert.equal(coordinator.acknowledgeAutoResponse("root"), false);
+	clock.advance(SOCKET_LIVENESS_DESCRIPTOR.timeoutMs * 10);
+	assert.deepEqual(failures, []);
+	coordinator.setForeground(true);
+	clock.advance(SOCKET_LIVENESS_DESCRIPTOR.timeoutMs);
+	assert.deepEqual(failures, ["probe_timeout"]);
+	assert.equal(coordinator.acknowledgeAutoResponse("root"), false);
+	coordinator.connected("root");
+	assert.equal(coordinator.acknowledgeAutoResponse("root"), false);
+	coordinator.ready("root", SOCKET_LIVENESS_DESCRIPTOR, "runtime-2", true);
+	coordinator.probeNow("legacy-after-reconnect");
+	assert.equal(coordinator.acknowledgeAutoResponse("root"), false);
+	assert.equal(coordinator.acknowledge("root", "r3-probe", "runtime-1"), false);
+	assert.equal(coordinator.acknowledge("root", "r3-probe", "runtime-2"), true);
+});
+
+s.test("R3 synchronous auto-response does not leave a stray timeout", () => {
+	const clock = new ManualClock();
+	const coordinator = new SocketLivenessCoordinator(clock, () => "r3-sync");
+	coordinator.register({
+		id: "root", documentId: "root", isOpen: () => true,
+		sendProbe: () => { assert.equal(coordinator.acknowledgeAutoResponse("root"), true); },
+		onFailure: () => { throw new Error("synchronous response cannot time out"); },
+	});
+	coordinator.connected("root");
+	coordinator.ready("root", SOCKET_LIVENESS_AUTO_RESPONSE_DESCRIPTOR, "runtime-1", true);
+	coordinator.probeNow("synchronous");
+	assert.equal(clock.timers.size, 1);
+	clock.advance(SOCKET_LIVENESS_DESCRIPTOR.timeoutMs);
+	assert.equal(coordinator.snapshot()[0]?.phase, "healthy");
 });
 
 await s.done();

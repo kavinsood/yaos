@@ -27,7 +27,7 @@ export interface SocketLivenessTarget {
 	id: string;
 	documentId: string;
 	isOpen(): boolean;
-	sendProbe(probeId: string): void;
+	sendProbe(probeId: string, autoResponse: boolean): void;
 	onFailure(reason: SocketLivenessFailure): void;
 }
 
@@ -46,6 +46,7 @@ interface TargetState {
 	phase: SocketLivenessPhase;
 	descriptor: SocketLivenessDescriptor | null;
 	runtimeEpoch: string | null;
+	autoResponse: boolean;
 	lastAcknowledgedAt: number | null;
 	probeId: string | null;
 	probeStartedAt: number | null;
@@ -71,6 +72,7 @@ export class SocketLivenessCoordinator {
 			phase: "disconnected",
 			descriptor: null,
 			runtimeEpoch: null,
+			autoResponse: false,
 			lastAcknowledgedAt: null,
 			probeId: null,
 			probeStartedAt: null,
@@ -94,6 +96,7 @@ export class SocketLivenessCoordinator {
 		state.phase = this.foreground ? "awaiting_ready" : "suspended";
 		state.descriptor = null;
 		state.runtimeEpoch = null;
+		state.autoResponse = false;
 		state.lastAcknowledgedAt = null;
 		state.probeId = null;
 		state.probeStartedAt = null;
@@ -108,15 +111,17 @@ export class SocketLivenessCoordinator {
 		state.phase = "disconnected";
 		state.descriptor = null;
 		state.runtimeEpoch = null;
+		state.autoResponse = false;
 		state.probeId = null;
 		state.probeStartedAt = null;
 	}
 
-	ready(id: string, descriptor: SocketLivenessDescriptor, runtimeEpoch: string): void {
+	ready(id: string, descriptor: SocketLivenessDescriptor, runtimeEpoch: string, autoResponseCapable = false): void {
 		const state = this.states.get(id);
 		if (!state || this.stopped || !state.target.isOpen()) return;
 		state.descriptor = descriptor;
 		state.runtimeEpoch = runtimeEpoch;
+		state.autoResponse = autoResponseCapable && descriptor.autoResponse !== undefined;
 		state.lastAcknowledgedAt = this.clock.now();
 		state.probeId = null;
 		state.probeStartedAt = null;
@@ -126,8 +131,18 @@ export class SocketLivenessCoordinator {
 
 	acknowledge(id: string, probeId: string, runtimeEpoch: string): boolean {
 		const state = this.states.get(id);
-		if (!state || state.phase !== "probing" || state.probeId !== probeId
+		if (!state || state.autoResponse || state.phase !== "probing" || state.probeId !== probeId
 			|| state.runtimeEpoch !== runtimeEpoch || !state.target.isOpen()) return false;
+		return this.completeProbe(state);
+	}
+
+	acknowledgeAutoResponse(id: string): boolean {
+		const state = this.states.get(id);
+		if (!state || !state.autoResponse || state.phase !== "probing" || !state.target.isOpen()) return false;
+		return this.completeProbe(state);
+	}
+
+	private completeProbe(state: TargetState): boolean {
 		this.clearTimer(state);
 		state.probeId = null;
 		state.probeStartedAt = null;
@@ -215,11 +230,12 @@ export class SocketLivenessCoordinator {
 		state.probeStartedAt = this.clock.now();
 		state.phase = "probing";
 		try {
-			state.target.sendProbe(probeId);
+			state.target.sendProbe(probeId, state.autoResponse);
 		} catch {
 			this.fail(state, "probe_send_failed");
 			return;
 		}
+		if (state.phase !== "probing" || state.probeId !== probeId) return;
 		const epoch = state.connectionEpoch;
 		state.timer = this.clock.setTimer(() => {
 			state.timer = null;

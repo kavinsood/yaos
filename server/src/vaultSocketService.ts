@@ -23,7 +23,8 @@ import { isCanonicalVaultId } from "./vaultId";
 import {
 	SOCKET_CONTROL_CAPABILITIES,
 	SOCKET_CLIENT_CAPABILITY_CATCH_UP_HINT,
-	SOCKET_LIVENESS_DESCRIPTOR,
+	SOCKET_CLIENT_CAPABILITY_AUTO_RESPONSE,
+	negotiateSocketLiveness,
 	parseBodyCurrentnessQueryFrame,
 	parseVaultPingFrame,
 	type BodyChangedHintFrame,
@@ -142,6 +143,7 @@ export interface VaultSocketAttachment {
 	admittedAt?: number;
 	/** The client advertised {@link SOCKET_CLIENT_CAPABILITY_CATCH_UP_HINT}. */
 	catchUpHint?: boolean;
+	livenessAutoResponse?: boolean;
 	/** Last time liveness on this socket refreshed the device's `lastSeenAt`. */
 	lastSeenTouchedAt?: number;
 }
@@ -164,6 +166,8 @@ export interface VaultSocketRegistryPort {
 	createPair(): { client: unknown; server: VaultSocketPort };
 	accept(socket: VaultSocketPort): void;
 	upgradeResponse(client: unknown): Response;
+	supportsAutoResponse?(): boolean;
+	getAutoResponseTimestamp?(socket: VaultSocketPort): number | null;
 }
 
 function validIdentity(value: string): boolean {
@@ -205,6 +209,7 @@ export function parseVaultSocketAttachment(value: unknown): VaultSocketAttachmen
 		|| typeof attachment.socketId !== "string" || !validIdentity(attachment.socketId)
 		|| (attachment.admittedAt !== undefined && (!Number.isSafeInteger(attachment.admittedAt) || attachment.admittedAt < 0))
 		|| (attachment.catchUpHint !== undefined && typeof attachment.catchUpHint !== "boolean")
+		|| (attachment.livenessAutoResponse !== undefined && typeof attachment.livenessAutoResponse !== "boolean")
 		|| (attachment.lastSeenTouchedAt !== undefined
 			&& (!Number.isSafeInteger(attachment.lastSeenTouchedAt) || attachment.lastSeenTouchedAt < 0))
 		|| (attachment.kind !== "root" && attachment.kind !== "body" && attachment.kind !== "semantic")
@@ -422,7 +427,7 @@ export interface SocketServiceOptions {
 	 * Best-effort refresh of a device's `lastSeenAt`. Tickets are only minted
 	 * to open a socket, so a long-connected device is otherwise never seen.
 	 * Called at most once per {@link DEVICE_LAST_SEEN_RESOLUTION_MS} per root
-	 * socket, from liveness pings.
+	 * socket, from legacy pings or a real frame observing auto-response activity.
 	 */
 	touchDevice?: (deviceId: string) => void;
 	/** Test-only override of {@link DEVICE_LAST_SEEN_RESOLUTION_MS} (testOnlyTimers.ts). */
@@ -541,6 +546,8 @@ export class VaultSocketService {
 			// The ticket minted for this upgrade already refreshed lastSeenAt.
 			lastSeenTouchedAt: this.now(),
 			...(acceptOptions.capabilities?.has(SOCKET_CLIENT_CAPABILITY_CATCH_UP_HINT) ? { catchUpHint: true } : {}),
+			...(acceptOptions.capabilities?.has(SOCKET_CLIENT_CAPABILITY_AUTO_RESPONSE)
+				&& this.options.sockets.supportsAutoResponse?.() ? { livenessAutoResponse: true } : {}),
 		};
 		server.serializeAttachment(attachment);
 		this.options.sockets.accept(server);
@@ -556,7 +563,8 @@ export class VaultSocketService {
 			vaultGeneration: attachment.vaultGeneration,
 			durableGeneration: loaded.generation,
 			runtimeEpoch: attachment.runtimeEpoch,
-			liveness: SOCKET_LIVENESS_DESCRIPTOR,
+			liveness: negotiateSocketLiveness(acceptOptions.capabilities,
+				this.options.sockets.supportsAutoResponse?.() === true),
 			capabilities: SOCKET_CONTROL_CAPABILITIES,
 			principalId: actor.principalId,
 			deviceId: actor.deviceId,
@@ -570,7 +578,7 @@ export class VaultSocketService {
 	}
 
 	async message(socket: VaultSocketPort, message: string | ArrayBuffer): Promise<void> {
-		const attachment = parseVaultSocketAttachment(socket.deserializeAttachment());
+		let attachment = parseVaultSocketAttachment(socket.deserializeAttachment());
 		const control = typeof message === "string" ? parseControlFrame(message) : null;
 		if (!attachment
 			|| attachment.vaultId !== this.options.vaultId()
@@ -591,6 +599,12 @@ export class VaultSocketService {
 			|| (attachment.kind === "semantic" && this.options.isActiveSemantic?.(attachment.documentId) !== true)) {
 			socket.close(1008, "body is not active");
 			return;
+		}
+		const autoResponseAt = attachment.kind === "root" && attachment.livenessAutoResponse
+			? this.options.sockets.getAutoResponseTimestamp?.(socket) : null;
+		if (autoResponseAt != null && autoResponseAt > (attachment.lastSeenTouchedAt ?? 0)) {
+			this.touchDeviceFromLiveness(socket, attachment);
+			attachment = parseVaultSocketAttachment(socket.deserializeAttachment()) ?? attachment;
 		}
 		if (typeof message === "string") {
 			if (message.length > MAX_TEXT_FRAME) {
