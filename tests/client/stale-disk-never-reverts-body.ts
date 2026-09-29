@@ -945,6 +945,23 @@ s.test("REVIEW N11: a bound editor that keeps diverging after rebinds is detache
 	assert.equal(fixture.ytext.toString(), REMOTE);
 });
 
+s.test("G4: the in-place no-baseline path shares one body-keyed artifact across three autosaves", async () => {
+	const fixture = await closedBodyFixture({ disk: LOCAL, baseline: null, loadBody: true, durableEpisodes: true });
+	fixture.applyRemote(REMOTE);
+	const controller = fixture.controller as unknown as {
+		inPlaceThreeWay(path: string, bodyId: string, disk: string, body: string): Promise<unknown>;
+	};
+	for (const disk of ["autosave one", "autosave two", "autosave three"]) {
+		await controller.inPlaceThreeWay("Closed.md", "body-closed", disk, REMOTE);
+	}
+	assert.equal(fixture.artifacts.size, 1);
+	assert.equal(fixture.episodes!.list().length, 1);
+	for (const disk of ["autosave one", "autosave two", "autosave three"]) {
+		assert.equal(await fixture.episodes!.readVersion("body-closed", await canonicalMarkdownHash(disk)), disk);
+	}
+	await fixture.destroy();
+});
+
 s.test("G3: after dismissal every subsequent disk variant is preserved in one durable episode", async () => {
 	const fixture = await closedBodyFixture({ disk: LOCAL, baseline: BASE, loadBody: true, realMirror: true, commonBase: BASE, durableEpisodes: true });
 	fixture.applyRemote(REMOTE);

@@ -1441,6 +1441,16 @@ export class ReconciliationController {
 				return { kind: "import", content: merge.content };
 			}
 		}
+		const episodes = this.deps.getConflictEpisodes?.();
+		if (episodes) {
+			try {
+				await episodes.preserve({ bodyId, path, disk: preservedContent, body: bodyContent, base, device: this.deps.getSettings().deviceName });
+				this.deps.getVaultSync()?.bodies.coordinator.setDivergence(bodyId, "decision-required");
+			} catch (error) {
+				this.deps.log(`Conflict input remains on disk for "${path}": ${String(error)}`);
+			}
+			return { kind: "preserved" };
+		}
 		const fingerprint = `in-place\x00${contentFingerprint(bodyContent)}\x00${contentFingerprint(preservedContent)}`;
 		if (this.lastConflictFingerprints.get(path) === fingerprint) return { kind: "preserved" };
 		try {

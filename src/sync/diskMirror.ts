@@ -1109,7 +1109,9 @@ export class DiskMirror {
 		isCurrent: () => boolean,
 	): Promise<"settled" | "replan" | "preserved-unresolved"> {
 		try {
-			await createMarkdownConflictArtifact(this.app, path, diskContent, {
+			if (this.settlement?.conflictEpisodes) {
+				await this.settlement.conflictEpisodes.preserve({ bodyId, path, disk: diskContent, body: content, device: this.getDeviceName() });
+			} else await createMarkdownConflictArtifact(this.app, path, diskContent, {
 				deviceName: this.getDeviceName(),
 				reason: "closed-file-both-changed-no-common-base",
 				source: "disk",
@@ -1122,6 +1124,11 @@ export class DiskMirror {
 		}
 		const written = await this.writeSettledBody(path, diskContent, content, isCurrent);
 		if (written !== "written") return written === "moved" ? "replan" : "preserved-unresolved";
+		if (this.settlement?.conflictEpisodes?.get(bodyId)) {
+			this.settlement.markDivergence?.(bodyId, "decision-required");
+			this.recordPreservedUnresolved(path, "body-settlement-failed");
+			return "preserved-unresolved";
+		}
 		this.settlement?.markDivergence?.(bodyId, "none");
 		this.clearPreservedUnresolved(path);
 		return "settled";
