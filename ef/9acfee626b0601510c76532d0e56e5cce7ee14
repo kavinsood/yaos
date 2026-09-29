@@ -1,0 +1,21 @@
+src/sync/bootstrapClient.ts
+  s_7b2ef493da42e9::t_798dd891825993 77,767
+tests/client/bootstrap-settlement.ts
+  s_7b2ef493da42e9::t_98f6c0747f9983 596-614
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "ef9acfee626b0601510c76532d0e56e5cce7ee14",
+  "prompts": {},
+  "sessions": {
+    "s_7b2ef493da42e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aabf15f6ed7b647b5",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
