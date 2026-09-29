@@ -1,0 +1,19 @@
+server/src/server.ts
+  s_3fa8c41e3d4d37::t_ed10ff53de78c0 38,1428-1431
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "090fc3724127426789a6d3a652b700895db49f04",
+  "prompts": {},
+  "sessions": {
+    "s_3fa8c41e3d4d37": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a0da75a62b227384a",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
