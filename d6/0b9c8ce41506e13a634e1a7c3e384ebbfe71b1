@@ -1,0 +1,41 @@
+packages/server-node/src/objectStore.ts
+  s_3fa8c41e3d4d37::t_b4bcbf41822f71 19,21,221-281
+server/src/cloudflarePorts.ts
+  s_3fa8c41e3d4d37::t_dbf64ebec0dee4 11,13,61-64
+server/src/cloudflareVerifiedObjectStream.ts
+  s_06158d5aa75452::t_c56bde84cdfac8 1-98
+server/src/routes/blobs.ts
+  s_3fa8c41e3d4d37::t_2e87b19cf06146 2,119-130,132-136,138-145,175-176
+tests/r4/probe.ts
+  s_3fa8c41e3d4d37::t_ec93420ba05b60 1-20
+tests/r4/run-worker.mjs
+  s_3fa8c41e3d4d37::t_bccb399c3a2ce6 1-141
+tests/server/R4-streamed-uploads.ts
+  s_3fa8c41e3d4d37::t_357b71391dc670 1-103
+tests/server/blob-upload-bounds.ts
+  s_3fa8c41e3d4d37::t_ecc2858f6bda50 3-6,85-104,112,127,132-133,144,156,161,166,168-169,178,184-185,189,195,207,214,222,241,245,258,278-328
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "d60b9c8ce41506e13a634e1a7c3e384ebbfe71b1",
+  "prompts": {},
+  "sessions": {
+    "s_06158d5aa75452": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aabbc0b8c933cb988",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_3fa8c41e3d4d37": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a0da75a62b227384a",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
