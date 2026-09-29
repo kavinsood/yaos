@@ -1,0 +1,35 @@
+docs/relay2-protocol.md
+  s_3fa8c41e3d4d37::t_325ea6ebe8632c 108-113,134-135,137-141,144-148,170-173,184-185,188-190,196-205,243,298-305,342-345,391,426-431,437-439,453-455,461,466-468,480,509-514,558-564,568-583,636-637,645-648,651-653,662-667,673-685
+server/src/bootstrap.ts
+  s_3fa8c41e3d4d37::t_ca6f95d7a50d14 6,78-96,200-205
+server/src/relayBodies.ts
+  s_3fa8c41e3d4d37::t_4a291d27fd37c6 51-53,132-143,248-256,263-264,324-327,354,429-436,442-447,454-455,493-496,527-532,536-537,542-543,546-547,550-557,561,576-617,619,621,639-640,660-661,667-669,671,692-695,745,756-763,767-768,774-782,785,787-803,805-810,863-879,882,885-886,918-981,984,1008-1013,1026-1029,1050-1054,1085-1090,1093,1095,1102-1103,1123-1125
+server/src/relayBodyStore.ts
+  s_3fa8c41e3d4d37::t_61a4de94ca72b2 28-34,66,71-74,82,137,139,261-281,301-302,308,310-315,350-416,427
+server/src/relayFlag.ts
+  s_3fa8c41e3d4d37::t_259d8dfd2d31f2 104
+server/src/relayRoutes.ts
+  s_3fa8c41e3d4d37::t_2065a9ac4c51cf 58,129,131
+server/src/server.ts
+  s_3fa8c41e3d4d37::t_77fbaf82b80cd8 4,412,653-660,741-744,748-753,761,787-788,1025-1032,1034-1038
+server/src/vaultSocketService.ts
+  s_3fa8c41e3d4d37::t_1c67fa55e5602d 469-470,923-924,952-953
+tests/server/relay2-server-core.ts
+  s_3fa8c41e3d4d37::t_a1a9e6be37ddb9 87-89,93,124,128,133,146-147,186-196,217-218,689,696-697,699-701,703-706,732-734,747-748,768-1009
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "4cdc37e12cda7da8bd652d30cc856a6ce6ed6113",
+  "prompts": {},
+  "sessions": {
+    "s_3fa8c41e3d4d37": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a0da75a62b227384a",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
