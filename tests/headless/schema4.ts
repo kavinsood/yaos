@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import * as Y from "yjs";
-import YSyncProvider from "y-partyserver/provider";
+import { OwnAwarenessProvider as YSyncProvider } from "../../src/sync/ownAwarenessProvider.ts";
 import WebSocket from "ws";
 import { decodeBinaryEnvelope, encodeBinaryEnvelope, YAOS_BINARY_CONTENT_TYPE } from "../../server/src/shared/binaryEnvelope.ts";
 

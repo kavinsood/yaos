@@ -4,13 +4,16 @@ import { decodeBinaryEnvelope, encodeBinaryEnvelope, YAOS_BINARY_CONTENT_TYPE } 
 import { candidateDigestMaterial } from "@shared/candidateDigest";
 import { AUTHORITY_SUPERSEDED_SOCKET_CLOSE_CODE } from "@shared/socketCloseCodes";
 import {
+	SOCKET_CLIENT_CAPABILITY_CATCH_UP_HINT,
 	SOCKET_LIVENESS_IDLE_MS,
 	SOCKET_LIVENESS_TIMEOUT_MS,
+	parseBodyChangedHintFrame,
 	parseBodyCurrentnessResultFrame,
 	parseSocketControlCapabilities,
 	parseSocketLivenessDescriptor,
 	parseSocketSessionId,
 	parseVaultPongFrame,
+	type BodyChangedHintFrame,
 	type BodyCurrentnessHead,
 	type BodyCurrentnessResultFrame,
 	type SocketControlCapabilities,
@@ -47,6 +50,8 @@ import type { ProductFlightPathEventInput } from "../observability/traceSink";
 import { RuntimeScope, type OperationEpoch, type OperationOutcome } from "../runtime/operationLifecycle";
 import { BodyCoordinator, type BodyLease } from "./bodyCoordinator";
 import {
+	ShortLivedConnectionBackoff,
+	SocketAdmissionGate,
 	SocketAdmissionCoordinator,
 	type SocketAdmissionFailure,
 	type SocketAdmissionProvider,
@@ -62,7 +67,7 @@ import {
 } from "../runtime/residencyAdmissionCoordinator";
 import { ResidencyAdmissionRuntime } from "../runtime/residencyAdmissionRuntime";
 import type { OverdueWorkClock, OverdueWorkDiagnostics, OverdueWorkRandom } from "../runtime/overdueWorkKernel";
-import { VaultWorkScheduler } from "./vaultWorkScheduler";
+import { CONNECTION_WORK_KEYS, isDetachedProviderRepairReason, VaultWorkScheduler } from "./vaultWorkScheduler";
 import { FrontmatterSemanticMirror } from "./frontmatterSemanticMirror";
 import {
 	SocketLivenessCoordinator,
@@ -116,6 +121,8 @@ export interface SyncProviderPort {
 	on(event: "status", callback: (event: { status: string }) => void): void;
 	on(event: "sync", callback: (synced: boolean) => void): void;
 	on(event: "custom-message", callback: (payload: string) => void): void;
+	/** Optional so test fakes may omit it; production providers always remove listeners. */
+	off?(event: "sync", callback: (synced: boolean) => void): void;
 }
 
 export type FatalSyncCode =
@@ -558,6 +565,15 @@ export interface VaultSyncOptions {
 		paths: readonly string[],
 		reason: "revision-mismatch",
 	) => void | Promise<void>;
+	/**
+	 * A body committed while this client's socket belongs to an earlier
+	 * server runtime (after a hibernation wake), so no `BODY_COMMITTED`
+	 * receipt can be delivered on it. The hint carries no receipt or content
+	 * proof: it is only a reason to schedule change-feed catch-up. Without
+	 * this callback, `onRemoteRootStructuralUpdate` (also a catch-up trigger)
+	 * is used.
+	 */
+	onBodyChangedHint?: (hint: BodyChangedHintFrame) => void | Promise<void>;
 	onDurableBodyCommitted?: (
 		notification: BodyCommittedNotification,
 	) => void | Promise<void>;
@@ -652,6 +668,33 @@ const DEFAULT_WARM_RETENTION_MS = 5 * 60_000;
 const DEFAULT_BACKGROUND_PROMOTION_MS = 5_000;
 const DEFAULT_PREFERRED_BURST = 4;
 const MAX_BACKOFF_TIME_MS = 30_000;
+/**
+ * Scheduler reason for the ticket-expiry check. Tickets are admission
+ * credentials only: the server checks them at the WebSocket upgrade and never
+ * again, so an open socket is never rotated when its ticket nears expiry.
+ * The check only repairs providers that are not open, because y-partyserver's
+ * built-in retry loop reuses the URL (and ticket) of its last attempt and can
+ * never succeed once that ticket expires.
+ */
+const TICKET_EXPIRY_CHECK_REASON = "ticket-expiry-check";
+/**
+ * A socket still CONNECTING is an admission in flight, not a detached
+ * provider. Only one stuck this long is torn down and admitted again.
+ */
+const PROVIDER_CONNECT_TIMEOUT_MS = 20_000;
+/** Recheck delay for connection maintenance while root is still connecting. */
+const ROOT_CONNECTING_RECHECK_MS = 2_000;
+
+/** A socket admission the coordinator did not complete, with its outcome. */
+class SocketAdmissionNotCompletedError extends Error {
+	constructor(readonly outcome: OperationOutcome) {
+		super(`body socket admission failed: ${outcome.kind}`);
+		this.name = "SocketAdmissionNotCompletedError";
+	}
+}
+/** Bound on waiting for an admission-closed socket to finish closing. */
+const ADMISSION_SOCKET_RELEASE_TIMEOUT_MS = 3_000;
+const ADMISSION_SOCKET_RELEASE_POLL_MS = 20;
 const FATAL_CODES = new Set<FatalSyncCode>([
 	"unauthorized",
 	"server_misconfigured",
@@ -933,6 +976,7 @@ function adaptProvider(provider: YSyncProvider): SyncProviderPort {
 			else socket?.close();
 		},
 		on: ((event: string, callback: (...values: never[]) => void) => provider.on(event, callback)) as SyncProviderPort["on"],
+		off: (event, callback) => provider.off(event, callback),
 	};
 }
 
@@ -1230,12 +1274,31 @@ export class VaultSync implements SyncRuntimePort {
 	private readonly currentnessWaiters = new Map<string, CurrentnessWaiter>();
 	private readonly pendingRootCurrentness = new Map<string, Array<(value: { queried: boolean; head: BodyCurrentnessHead | null }) => void>>();
 	private rootCurrentnessScheduled = false;
-	private readonly expectedLivenessDisconnects = new WeakSet<SyncProviderPort>();
+	/**
+	 * Providers whose next `disconnected` status was caused by this runtime
+	 * (liveness abort or a socket admission replacing the socket) and is
+	 * already being recovered. Cleared by the next `connected` status.
+	 */
+	private readonly expectedDisconnects = new WeakSet<SyncProviderPort>();
+	/** Root ticket minted by the current admission, consumed by the socket open. */
+	private admissionRootTicket: {
+		readonly ticket: SocketTicketResult;
+		readonly rootEpoch: SemanticEpoch;
+		readonly authority: VaultAuthorityIdentity | undefined;
+	} | null = null;
 	private readonly residencyAdmission: ResidencyAdmissionCoordinator;
 	private readonly residencyRuntime: ResidencyAdmissionRuntime;
 	private readonly workScheduler: VaultWorkScheduler;
 	private readonly residencyObservedBodyIds = new Set<string>();
-	private reconnectRequester: ((reason: string) => void) | null = null;
+	private reconnectRequester: ((reason: string, delayMs?: number) => void) | null = null;
+	/** Reconnect delay for sockets that close again right after opening (see ShortLivedConnectionBackoff). */
+	private readonly flapBackoff: ShortLivedConnectionBackoff;
+	/** Per-document admission rate limit (never-opened churn + circuit breaker). */
+	private readonly admissionGate: SocketAdmissionGate;
+	/** When a provider was first seen CONNECTING (see PROVIDER_CONNECT_TIMEOUT_MS). */
+	private readonly providerConnectingSince = new WeakMap<SyncProviderPort, number>();
+	/** Flap-backoff reconnect floors per document (see queueReconnect). */
+	private readonly reconnectFloors = new Map<string, number>();
 	private reconnectBlocked: (() => boolean) | null = null;
 	private readonly renameBatch = new Map<string, string>();
 	private renameTimer: number | null = null;
@@ -1360,10 +1423,14 @@ export class VaultSync implements SyncRuntimePort {
 		this.provider = factory({ kind: "root", documentId: ROOT_DOCUMENT_ID,
 			documentEpoch: this._rootEpoch, doc: this.ydoc,
 			onClose: (event) => this.handleNativeSocketClose(event) });
+		const admissionRandom = options.workRandom;
+		this.admissionGate = new SocketAdmissionGate(admissionRandom ? { random: () => admissionRandom.next() } : {});
 		this.socketAdmission = new SocketAdmissionCoordinator({
 			scope: this.runtimeScope,
-			refreshCredential: async (epoch, force) => {
-				const ticket = await this.refreshProviderTickets(force, epoch);
+			gate: this.admissionGate,
+			now: () => this.now(),
+			refreshCredential: async (epoch, force, providerId) => {
+				const ticket = await this.refreshProviderTickets(force, epoch, providerId === undefined || providerId === ROOT_DOCUMENT_ID);
 				return { expiresAt: ticket.localExpiresAt };
 			},
 			providers: () => [this.asAdmissionProvider(ROOT_DOCUMENT_ID, this.provider)],
@@ -1381,6 +1448,8 @@ export class VaultSync implements SyncRuntimePort {
 			clearTimer: (handle: unknown) => window.clearTimeout(handle as number),
 		};
 		this.socketLiveness = new SocketLivenessCoordinator(workClock);
+		const workRandom = options.workRandom;
+		this.flapBackoff = new ShortLivedConnectionBackoff(workRandom ? { random: () => workRandom.next() } : {});
 		this.registerSocketLiveness(ROOT_DOCUMENT_ID, this.provider);
 		this.workScheduler = new VaultWorkScheduler({
 			clock: workClock,
@@ -1435,7 +1504,7 @@ export class VaultSync implements SyncRuntimePort {
 	get hasPendingLocalWork(): boolean {
 		const bodyStats = this.bodies.stats();
 		return (
-			this.workScheduler.diagnostics().queue.some((item) => item.key !== "reconnect")
+			this.workScheduler.diagnostics().queue.some((item) => !CONNECTION_WORK_KEYS.has(item.key))
 			|| this.pendingUpdates.size > 0
 			|| this.pendingCandidates.size > 0
 			|| this.bodyPersistenceWork.size > 0
@@ -1455,7 +1524,11 @@ export class VaultSync implements SyncRuntimePort {
 	get lastLocalUpdateWhileConnectedAt(): number | null { return this._lastLocalUpdateWhileConnectedAt; }
 	get lastRemoteUpdateAt(): number | null { return this._lastRemoteUpdateAt; }
 	get serverAppliedLocalState(): boolean | null {
-		return this.pendingCandidates.size > 0 ? false : (this._lastReceiptAt === null ? null : true);
+		// Local edits still inside the candidate debounce are not captured as
+		// candidates yet; claiming the server has "the latest local state" then
+		// was false during every burst of typing (and every stalled socket).
+		if (this.pendingCandidates.size > 0 || this.pendingUpdates.size > 0) return false;
+		return this._lastReceiptAt === null ? null : true;
 	}
 	get lastServerReceiptEchoAt(): number | null { return this._lastReceiptAt; }
 	get lastKnownServerReceiptEchoAt(): number | null { return this._lastReceiptAt; }
@@ -3094,6 +3167,7 @@ export class VaultSync implements SyncRuntimePort {
 			return;
 		}
 		const queuedAt = this.monotonicNow();
+		let reconnectInBackground = false;
 		await this.withBodyAdmission(bodyId, "editor", true, "active", async () => {
 			trace.queueDelayMs += Math.max(0, this.monotonicNow() - queuedAt);
 			const existing = this.sessions.get(bodyId);
@@ -3107,6 +3181,23 @@ export class VaultSync implements SyncRuntimePort {
 				this.sessions.set(bodyId, session);
 				session.ready = this.waitForBodySync(session, body);
 				trace.providerAdmissionMs += Math.max(0, this.monotonicNow() - providerAdmissionStartedAt);
+			} else if (!this.isProviderOpen(session.provider) && !session.provider.wsconnecting) {
+				// A warm session whose socket closed while no editor used it.
+				// Online, the editor waits for the reconnect so it does not bind
+				// to a body that cannot receive remote updates. Offline (root not
+				// open) that wait can only fail; the local warm body is bound at
+				// once, exactly as before, and reconnects in the background. A
+				// failed online reconnect degrades the same way instead of
+				// destroying a session that still holds the local state.
+				if (this.isProviderOpen(this.provider)) {
+					session.ready = this.waitForBodySync(session, body, true).catch((error: unknown) => {
+						this.log(`warm body reopen reconnect failed for ${bodyId}: ${String(error)}`);
+						reconnectInBackground = true;
+					});
+				} else {
+					session.ready = Promise.resolve();
+					reconnectInBackground = true;
+				}
 			}
 			try {
 				const providerSyncStartedAt = this.monotonicNow();
@@ -3130,6 +3221,8 @@ export class VaultSync implements SyncRuntimePort {
 			trace.projectionMs += Math.max(0, this.monotonicNow() - projectionStartedAt);
 		}, false, true);
 		this.refreshResidencyObservations();
+		// The consumer is attached now, so the repair treats it as an editor body.
+		if (reconnectInBackground && !this.destroyed) this.requestReconnect(`body-disconnected:${bodyId}`);
 	}
 
 	completeEditorBodyBinding(consumerId: string): void {
@@ -3258,11 +3351,30 @@ export class VaultSync implements SyncRuntimePort {
 
 	queueReconnect(reason: string, delayMs = 0, maxWaitMs?: number): Promise<void> {
 		const now = this.now();
+		// The reconnect slot is last-write-wins: a later fast reconnect (app
+		// foregrounded, network online, a second close) must not pull a
+		// flap-backoff reconnect forward. The floor holds until it passes or the
+		// flapping socket opens.
+		const floor = this.reconnectFloor(now);
 		return this.workScheduler.queueReconnect(
 			reason,
-			now + Math.max(0, delayMs),
-			maxWaitMs === undefined ? undefined : now + Math.max(0, maxWaitMs),
+			Math.max(now + Math.max(0, delayMs), floor),
+			maxWaitMs === undefined ? undefined : Math.max(now + Math.max(0, maxWaitMs), floor),
 		);
+	}
+
+	private holdReconnectFloor(documentId: string, delayMs: number): void {
+		const until = this.now() + Math.max(0, delayMs);
+		this.reconnectFloors.set(documentId, Math.max(this.reconnectFloors.get(documentId) ?? 0, until));
+	}
+
+	private reconnectFloor(now: number): number {
+		let floor = 0;
+		for (const [documentId, until] of this.reconnectFloors) {
+			if (until <= now) this.reconnectFloors.delete(documentId);
+			else floor = Math.max(floor, until);
+		}
+		return floor;
 	}
 
 	pokeOverdueWork(reason: string): void {
@@ -3280,28 +3392,94 @@ export class VaultSync implements SyncRuntimePort {
 	private async runReconnectWork(reason: string): Promise<OperationOutcome> {
 		if (this.destroyed) return { kind: "cancelled" };
 		if (this.reconnectBlocked?.()) return { kind: "cancelled" };
+		// Neither an expiring ticket nor a body close is a reason to replace an
+		// open root socket: repair only what is detached.
+		// `reconnect()` re-queues a failed pass as `retry:<reason>`; the retry
+		// concerns the same providers. Unprefixed, a failed body repair came
+		// back as a full admission that replaced the open root.
+		const baseReason = reason.replace(/^(?:retry:)+/, "");
+		if (baseReason === TICKET_EXPIRY_CHECK_REASON || isDetachedProviderRepairReason(baseReason)) {
+			if (this.isProviderOpen(this.provider)) return this.repairDetachedProviders();
+			// Root is mid-admission (CONNECTING). Replacing it here restarted
+			// the admission it was waiting on; recheck once it had time to open.
+			if (this.isProviderConnectingInTime(this.provider)) {
+				return { kind: "retryable_failure", failure: "network", retryAfterMs: ROOT_CONNECTING_RECHECK_MS };
+			}
+		}
 		const outcome = await this.socketAdmission.request(reason);
 		this.applyTerminalAdmissionOutcome(outcome);
 		if (outcome.kind === "completed") {
 			this.canvases?.resumeLiveProviders();
-			for (const session of this.sessions.values()) {
-				if (session.consumers.size === 0
-					|| (session.provider.wsconnected && session.provider.ws?.readyState === 1)) continue;
-				try {
-					await this.reconnectBodySession(session);
-				} catch (error) {
-					this.log(`body reconnect failed for ${session.bodyId}: ${String(error)}`);
-					if (!this.destroyed && !this.fatalAuthError) {
-						return { kind: "retryable_failure", failure: "network" };
-					}
-				}
-			}
-			for (const { documentId, provider } of this.canvases?.activeProviders() ?? []) {
-				if (provider.wsconnected || provider.wsconnecting) continue;
-				this.canvases?.reconnectLive(documentId);
-			}
+			const repaired = await this.repairDetachedProviders();
+			if (repaired.kind !== "completed") return repaired;
 		}
 		return outcome;
+	}
+
+	private isProviderOpen(provider: SyncProviderPort): boolean {
+		const open = provider.wsconnected && provider.ws?.readyState === 1;
+		if (open) this.providerConnectingSince.delete(provider);
+		return open;
+	}
+
+	/**
+	 * True while the provider's socket is CONNECTING and has been for less
+	 * than {@link PROVIDER_CONNECT_TIMEOUT_MS}. A CONNECTING socket is not
+	 * detached: tearing it down to "repair" it minted a new ticket, queued a
+	 * new expiry check and opened another CONNECTING socket, ~10 per second
+	 * (P0c storm).
+	 */
+	private isProviderConnectingInTime(provider: SyncProviderPort): boolean {
+		const connecting = provider.wsconnecting || provider.ws?.readyState === 0;
+		if (!connecting || this.isProviderOpen(provider)) {
+			this.providerConnectingSince.delete(provider);
+			return false;
+		}
+		const now = this.now();
+		const since = this.providerConnectingSince.get(provider);
+		if (since === undefined) {
+			this.providerConnectingSince.set(provider, now);
+			return true;
+		}
+		return now - since < PROVIDER_CONNECT_TIMEOUT_MS;
+	}
+
+	/**
+	 * Reconnects body sessions and live canvases that are not open. Warm
+	 * sessions (closed notes) are repaired too: a detached warm body keeps its
+	 * lease, so server catch-up cannot replace it either, and remote edits
+	 * would reach neither its Y.Doc nor disk until eviction.
+	 */
+	private async repairDetachedProviders(): Promise<OperationOutcome> {
+		for (const session of [...this.sessions.values()]) {
+			if (session.consumers.size === 0 || this.isProviderOpen(session.provider)) continue;
+			if (this.isProviderConnectingInTime(session.provider)) continue;
+			try {
+				await this.reconnectBodySession(session);
+			} catch (error) {
+				this.log(`body reconnect failed for ${session.bodyId}: ${String(error)}`);
+				if (!this.destroyed && !this.fatalAuthError) {
+					// Keep the coordinator's backoff (e.g. a rate-limited admission's
+					// retryAfterMs) instead of retrying on the generic network policy.
+					const outcome = error instanceof SocketAdmissionNotCompletedError ? error.outcome : null;
+					return outcome?.kind === "retryable_failure" ? outcome : { kind: "retryable_failure", failure: "network" };
+				}
+			}
+		}
+		for (const session of [...this.sessions.values()]) {
+			if (session.consumers.size > 0 || this.isProviderOpen(session.provider)) continue;
+			if (this.isProviderConnectingInTime(session.provider) || this.sessions.get(session.bodyId) !== session) continue;
+			try {
+				await this.reconnectBodySession(session, true);
+			} catch (error) {
+				this.log(`warm body reconnect failed for ${session.bodyId}: ${String(error)}`);
+			}
+		}
+		for (const { documentId, provider } of this.canvases?.activeProviders() ?? []) {
+			if (provider.wsconnected || provider.wsconnecting) continue;
+			this.canvases?.reconnectLive(documentId);
+		}
+		return { kind: "completed", value: undefined };
 	}
 
 	private async runCandidateWork(bodyId: string): Promise<OperationOutcome> {
@@ -3371,7 +3549,7 @@ export class VaultSync implements SyncRuntimePort {
 		}
 	}
 
-	setReconnectRequester(requester: ((reason: string) => void) | null): void {
+	setReconnectRequester(requester: ((reason: string, delayMs?: number) => void) | null): void {
 		this.reconnectRequester = requester;
 	}
 
@@ -3467,19 +3645,33 @@ export class VaultSync implements SyncRuntimePort {
 		provider.on("status", ({ status }) => {
 			if (this.provider !== provider) return;
 			if (status === "connected") {
-				this.expectedLivenessDisconnects.delete(provider);
+				this.expectedDisconnects.delete(provider);
+				this.flapBackoff.opened(ROOT_DOCUMENT_ID, this.now());
+				this.admissionGate.opened(ROOT_DOCUMENT_ID);
+				this.reconnectFloors.delete(ROOT_DOCUMENT_ID);
 				this.invalidateSocketSession(provider);
 				this.socketLiveness.connected(ROOT_DOCUMENT_ID);
 				this._connectionGeneration++;
 				this.workScheduler.poke("root-connected");
-			} else if (status === "disconnected" && this.expectedLivenessDisconnects.delete(provider)) {
+			} else if (status === "disconnected" && this.expectedDisconnects.delete(provider)) {
 				this.invalidateSocketSession(provider);
 				this.socketLiveness.disconnected(ROOT_DOCUMENT_ID);
-			} else if (status === "disconnected" && !this.fatalAuthError && !this.socketAdmission.isAttempting) {
+			} else if (status === "disconnected" && !this.fatalAuthError) {
+				// An unplanned root close is always recovered, even while another
+				// (e.g. body) admission is in flight: the coordinator runs the root
+				// admission after in-flight provider admissions settle, and
+				// admission-caused closes are marked expected above, so this
+				// cannot loop. Dropping it left root offline until the next
+				// ticket-expiry check. `disconnect()` stops y-partyserver's own
+				// retry loop, which would reuse the closed socket's ticket.
 				this.invalidateSocketSession(provider);
 				this.socketLiveness.disconnected(ROOT_DOCUMENT_ID);
 				provider.disconnect();
-				this.requestReconnect("root-disconnected");
+				// A socket closed right after it opened (e.g. rejected after
+				// upgrade) backs off instead of reconnecting every second.
+				const flapDelayMs = this.flapBackoff.closed(ROOT_DOCUMENT_ID, this.now());
+				if (flapDelayMs !== null) this.holdReconnectFloor(ROOT_DOCUMENT_ID, flapDelayMs);
+				this.requestReconnect("root-disconnected", flapDelayMs ?? undefined);
 			} else if (status === "disconnected") {
 				this.invalidateSocketSession(provider);
 				this.socketLiveness.disconnected(ROOT_DOCUMENT_ID);
@@ -3500,6 +3692,7 @@ export class VaultSync implements SyncRuntimePort {
 			handleFatal(payload);
 			this.handleVaultControl(payload, ROOT_DOCUMENT_ID, provider);
 			this.handleCurrentnessResult(payload, provider);
+			this.handleBodyChangedHint(payload);
 			const committed = asBodyCommittedNotification(payload);
 			const session = this.socketSessions.get(provider);
 			if (committed && session
@@ -3565,24 +3758,31 @@ export class VaultSync implements SyncRuntimePort {
 		const handleControl = (payload: string) => {
 			this.handleVaultControl(payload, body.bodyId, provider);
 			this.handleCurrentnessResult(payload, provider);
+			this.handleBodyChangedHint(payload, body.bodyId);
 			const committed = asBodyCommittedNotification(payload);
 			if (committed) this.handleBodySessionCommitted(session, committed);
 		};
 		provider.on("custom-message", handleControl);
 		provider.on("status", ({ status }) => {
 			if (status === "connected") {
-				this.expectedLivenessDisconnects.delete(provider);
+				this.expectedDisconnects.delete(provider);
+				this.flapBackoff.opened(body.bodyId, this.now());
+				this.admissionGate.opened(body.bodyId);
+				this.reconnectFloors.delete(body.bodyId);
 				this.invalidateSocketSession(provider);
 				this.socketLiveness.connected(body.bodyId);
-			} else if (status === "disconnected" && this.expectedLivenessDisconnects.delete(provider)) {
+			} else if (status === "disconnected" && this.expectedDisconnects.delete(provider)) {
 				this.invalidateSocketSession(provider);
 				this.socketLiveness.disconnected(body.bodyId);
-			} else if (status === "disconnected" && !this.fatalAuthError && !this.socketAdmission.isAttempting) {
+			} else if (status === "disconnected" && !this.fatalAuthError) {
+				// As for root: never dropped because another admission is in flight.
 				this.invalidateSocketSession(provider);
 				this.socketLiveness.disconnected(body.bodyId);
 				provider.disconnect();
+				const flapDelayMs = this.flapBackoff.closed(body.bodyId, this.now());
+				if (flapDelayMs !== null) this.holdReconnectFloor(body.bodyId, flapDelayMs);
 				if ((this.sessions.get(body.bodyId)?.consumers.size ?? 0) > 0) {
-					this.requestReconnect(`body-disconnected:${body.bodyId}`);
+					this.requestReconnect(`body-disconnected:${body.bodyId}`, flapDelayMs ?? undefined);
 				}
 			} else if (status === "disconnected") {
 				this.invalidateSocketSession(provider);
@@ -4300,45 +4500,56 @@ export class VaultSync implements SyncRuntimePort {
 	}
 
 
-	private async waitForBodySync(session: BodySession, body: LoadedBody): Promise<void> {
+	private async waitForBodySync(session: BodySession, body: LoadedBody, reopen = false): Promise<void> {
 		if (session.provider.synced && session.provider.wsconnected && session.provider.ws?.readyState === 1) return;
 		let timer: number | null = null;
+		let onSync: ((value: boolean) => void) | null = null;
 		const synced = new Promise<boolean>((resolve) => {
-			session.provider.on("sync", (value) => { if (value) resolve(true); });
+			onSync = (value) => { if (value) resolve(true); };
+			session.provider.on("sync", onSync);
 			timer = window.setTimeout(() => resolve(false), this.options.bodySyncTimeoutMs);
 		});
-		const admission = await this.socketAdmission.admit(
-			this.asAdmissionProvider(session.bodyId, session.provider),
-			"body-open",
-		);
-		this.applyTerminalAdmissionOutcome(admission);
-		if (admission.kind !== "completed") {
+		// Every call registers one listener; it must not outlive the wait
+		// (warm reopens call this repeatedly on the same provider).
+		const release = () => {
 			if (timer) window.clearTimeout(timer);
-			throw new Error(`body socket admission failed: ${admission.kind}`);
-		}
-		const completed = await synced;
-		if (timer) window.clearTimeout(timer);
-		if (!completed && body.generation === 0 && !body.dirty) {
-			session.provider.destroy();
-			throw new Error(`body ${body.bodyId} did not establish current state`);
+			if (onSync) session.provider.off?.("sync", onSync);
+			onSync = null;
+		};
+		try {
+			const admission = await this.socketAdmission.admit(
+				this.asAdmissionProvider(session.bodyId, session.provider),
+				"body-open",
+			);
+			this.applyTerminalAdmissionOutcome(admission);
+			if (admission.kind !== "completed") {
+				throw new Error(`body socket admission failed: ${admission.kind}`);
+			}
+			const completed = await synced;
+			// A warm reopen already holds local state; never tear its provider
+			// down over a slow sync.
+			if (!completed && !reopen && body.generation === 0 && !body.dirty) {
+				session.provider.destroy();
+				throw new Error(`body ${body.bodyId} did not establish current state`);
+			}
+		} finally {
+			release();
 		}
 	}
 
-	private async reconnectBodySession(session: BodySession): Promise<void> {
+	private async reconnectBodySession(session: BodySession, warm = false): Promise<void> {
 		await this.withBodyAdmission(
 			session.bodyId,
-			"editor",
+			warm ? "background" : "editor",
 			true,
-			"active",
+			warm ? "warm" : "active",
 			async () => {
 				const admission = await this.socketAdmission.admit(
 					this.asAdmissionProvider(session.bodyId, session.provider),
 					"body-reconnect",
 				);
 				this.applyTerminalAdmissionOutcome(admission);
-				if (admission.kind !== "completed") {
-					throw new Error(`body socket admission failed: ${admission.kind}`);
-				}
+				if (admission.kind !== "completed") throw new SocketAdmissionNotCompletedError(admission);
 			},
 		);
 	}
@@ -4397,6 +4608,25 @@ export class VaultSync implements SyncRuntimePort {
 			);
 			await this.workScheduler.whenIdle();
 		}
+	}
+
+	/**
+	 * Runtime-independent change hint from a socket admitted by an earlier
+	 * server runtime. Deliberately never a receipt, a durable promotion or a
+	 * watermark: it only schedules catch-up, which verifies content itself.
+	 */
+	private handleBodyChangedHint(payload: string, expectedBodyId?: string): void {
+		let value: unknown;
+		try { value = JSON.parse(payload); } catch { return; }
+		const hint = parseBodyChangedHintFrame(value);
+		if (!hint || hint.vaultGeneration !== this.options.vaultGeneration) return;
+		if (expectedBodyId !== undefined && hint.bodyId !== expectedBodyId) return;
+		this.log(`body changed hint for ${hint.bodyId} (generation ${hint.durableGeneration})`);
+		const callback = this.options.onBodyChangedHint
+			?? (() => this.options.onRemoteRootStructuralUpdate?.());
+		void Promise.resolve()
+			.then(() => callback(hint))
+			.catch((error) => this.log(`body changed hint catch-up scheduling failed: ${String(error)}`));
 	}
 
 	private handleBodySessionCommitted(session: BodySession, notification: BodyCommittedNotification): void {
@@ -4578,7 +4808,7 @@ export class VaultSync implements SyncRuntimePort {
 
 	private forceAbortProvider(documentId: string, provider: SyncProviderPort): void {
 		this.socketLiveness.disconnected(documentId);
-		this.expectedLivenessDisconnects.add(provider);
+		this.expectedDisconnects.add(provider);
 		if (provider.forceAbort) provider.forceAbort();
 		else {
 			provider.disconnect();
@@ -5542,13 +5772,21 @@ export class VaultSync implements SyncRuntimePort {
 						? { purpose: "body", documentId: input.documentId,
 							bodyEpoch: this.bodies.get(input.documentId)?.bodyEpoch ?? input.documentEpoch }
 						: { purpose: "semantic", documentId: input.documentId, bodyEpoch: input.documentEpoch };
-				const ticket = await this.options.getSocketTicket(scope);
+				// Tickets are fetched lazily, only to open a socket. A root open
+				// driven by an admission reuses the ticket that admission just
+				// minted instead of fetching a second one.
+				const ticket = (scope.purpose === "root" ? this.takeAdmissionRootTicket(scope.rootEpoch) : null)
+					?? await this.options.getSocketTicket(scope);
 				if (!ticket) throw new Error("socket ticket request returned no ticket");
-				this.scheduleTicketRefresh(ticket);
+				this.scheduleTicketExpiryCheck(ticket);
 				return {
 					ticket: ticket.value,
 					schemaVersion: String(SCHEMA_VERSION),
 					protocolVersion: String(PROTOCOL_VERSION),
+					// Additive capability: lets the server keep this socket open
+					// across a runtime wake and send BODY_CHANGED_HINT instead
+					// of closing it on every commit.
+					caps: SOCKET_CLIENT_CAPABILITY_CATCH_UP_HINT,
 				};
 			},
 			awareness: input.kind === "root" ? undefined : new (this.providerAwarenessConstructor())(input.doc),
@@ -5561,18 +5799,33 @@ export class VaultSync implements SyncRuntimePort {
 		return this.provider.awareness.constructor as new (doc: Y.Doc) => Awareness;
 	}
 
-	private scheduleTicketRefresh(ticket: SocketTicketResult): void {
+	/**
+	 * Schedules the check that rescues providers stuck retrying with this
+	 * ticket after it expires. It has its own scheduler slot so it can neither
+	 * postpone a pending reconnect nor be erased by one, and it never replaces
+	 * an open socket (see {@link TICKET_EXPIRY_CHECK_REASON}).
+	 */
+	private scheduleTicketExpiryCheck(ticket: SocketTicketResult): void {
 		if (this.destroyed || this.fatalAuthError) return;
 		const now = this.now();
 		const remaining = ticket.localExpiresAt - now;
 		const buffer = Math.min(TICKET_REFRESH_BUFFER_MS, Math.floor(remaining / 2));
 		const dueAt = now + Math.max(250, remaining - buffer);
-		void this.workScheduler.queueReconnect("ticket-refresh-due", dueAt).catch((error) => {
-			this.log(`ticket refresh scheduling failed: ${String(error)}`);
+		void this.workScheduler.queueTicketExpiryCheck(TICKET_EXPIRY_CHECK_REASON, dueAt).catch((error) => {
+			this.log(`ticket expiry check scheduling failed: ${String(error)}`);
 		});
 	}
 
-	private async refreshProviderTickets(force: boolean, epoch: OperationEpoch): Promise<SocketTicketResult> {
+	private takeAdmissionRootTicket(rootEpoch: SemanticEpoch): SocketTicketResult | null {
+		const stashed = this.admissionRootTicket;
+		this.admissionRootTicket = null;
+		if (!stashed || stashed.rootEpoch !== rootEpoch
+			|| !this.isCapturedAuthorityCurrent(stashed.authority)
+			|| stashed.ticket.localExpiresAt - this.now() <= TICKET_REFRESH_BUFFER_MS) return null;
+		return stashed.ticket;
+	}
+
+	private async refreshProviderTickets(force: boolean, epoch: OperationEpoch, opensRoot: boolean): Promise<SocketTicketResult> {
 		if (!this.options.getSocketTicket) {
 			return { value: "provider-factory", expiresAt: Number.MAX_SAFE_INTEGER, localExpiresAt: Number.MAX_SAFE_INTEGER, ttlMs: Number.MAX_SAFE_INTEGER };
 		}
@@ -5583,14 +5836,21 @@ export class VaultSync implements SyncRuntimePort {
 		if (this.destroyed || this.fatalAuthError || !epoch.isCurrent()) throw new Error("socket admission superseded");
 		if (!ticket) throw new Error("socket ticket request returned no ticket");
 		this.provider.url = patchTicketInUrl(this.provider.url, ticket.value);
-		this.scheduleTicketRefresh(ticket);
+		// Only an admission that opens root next (a full admission, or a root
+		// provider admission) may hand this ticket to the root open. A body
+		// admission's credential check (possibly a cached, already used root
+		// ticket) must not leave one behind for an unrelated later root open.
+		this.admissionRootTicket = opensRoot
+			? { ticket, rootEpoch: this._rootEpoch, authority: this.captureAuthority() }
+			: null;
+		this.scheduleTicketExpiryCheck(ticket);
 		return ticket;
 	}
 
-	private requestReconnect(reason: string): void {
+	private requestReconnect(reason: string, delayMs?: number): void {
 		if (this.destroyed || this.fatalAuthError) return;
-		if (this.reconnectRequester) this.reconnectRequester(reason);
-		else void this.queueReconnect(reason);
+		if (this.reconnectRequester) this.reconnectRequester(reason, delayMs);
+		else void this.queueReconnect(reason, delayMs ?? 0);
 	}
 
 	private asAdmissionProvider(id: string, provider: SyncProviderPort): SocketAdmissionProvider {
@@ -5598,9 +5858,40 @@ export class VaultSync implements SyncRuntimePort {
 			id,
 			get connected() { return provider.wsconnected && provider.ws?.readyState === 1; },
 			get connecting() { return provider.wsconnecting; },
-			disconnect: () => provider.disconnect(),
-			connect: () => provider.connect(),
+			disconnect: () => {
+				// The close of a live socket surfaces later as a `disconnected`
+				// status. The admission is already replacing it, so that status
+				// must not request a second admission (and a second ticket).
+				if (provider.wsconnected) this.expectedDisconnects.add(provider);
+				provider.disconnect();
+			},
+			connect: async () => {
+				if (!await this.waitForSocketRelease(provider)) {
+					// y-partyserver cannot open a new socket while the old one
+					// is still closing, so a connect() now would be a silent
+					// no-op and the admission would report a socket that does
+					// not exist. Fail retryably; the scheduler retries.
+					throw new Error("socket admission timed out waiting for the previous socket to close");
+				}
+				await provider.connect();
+			},
 		};
+	}
+
+	/**
+	 * y-partyserver only opens a new socket once the previous one has fully
+	 * closed (`ws === null`); before that `connect()` is a silent no-op and the
+	 * admission would complete without a socket. Wait, bounded, for the close.
+	 * Returns false when the previous socket is still there at the deadline.
+	 */
+	private async waitForSocketRelease(provider: SyncProviderPort): Promise<boolean> {
+		if (!provider.ws) return true;
+		const deadline = this.now() + ADMISSION_SOCKET_RELEASE_TIMEOUT_MS;
+		let polls = Math.ceil(ADMISSION_SOCKET_RELEASE_TIMEOUT_MS / ADMISSION_SOCKET_RELEASE_POLL_MS);
+		while (provider.ws && !this.destroyed && polls-- > 0 && this.now() < deadline) {
+			await new Promise<void>((resolve) => window.setTimeout(resolve, ADMISSION_SOCKET_RELEASE_POLL_MS));
+		}
+		return !provider.ws;
 	}
 
 	private classifySocketAdmissionFailure(error: unknown): SocketAdmissionFailure {

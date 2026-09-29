@@ -8,7 +8,7 @@ s.section("Provider credentials");
 {
 	const vaultSync = readSource("src/sync/vaultSync.ts");
 	s.check(
-		vaultSync.includes("const ticket = await this.options.getSocketTicket(scope)")
+		vaultSync.includes("?? await this.options.getSocketTicket(scope)")
 			&& vaultSync.includes("bodyEpoch:")
 			&& vaultSync.includes("rootEpoch:"),
 		"provider fetches an epoch-fenced exact-scope ticket before connecting",

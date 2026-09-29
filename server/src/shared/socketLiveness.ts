@@ -28,6 +28,67 @@ export const SOCKET_CONTROL_CAPABILITIES: Readonly<SocketControlCapabilities> = 
 	committedHead: SOCKET_CURRENTNESS_VERSION,
 });
 
+/**
+ * Client socket capabilities are advertised in the WebSocket upgrade query as
+ * a comma-separated `caps` parameter and recorded in the socket attachment.
+ * They are additive: a client that advertises nothing gets the behaviour of
+ * the pinned protocol version, so old clients stay compatible.
+ */
+export const SOCKET_CLIENT_CAPABILITIES_PARAM = "caps";
+/**
+ * The client understands {@link BodyChangedHintFrame}. A socket that outlived
+ * the runtime that admitted it (hibernation wake) then receives that hint
+ * instead of being closed when a body commits.
+ */
+export const SOCKET_CLIENT_CAPABILITY_CATCH_UP_HINT = "catchupHint";
+const MAX_SOCKET_CLIENT_CAPABILITIES = 16;
+
+/**
+ * Runtime-independent "a body changed" notice. It carries durable catalog
+ * coordinates only and deliberately no runtime epoch, content hash or size:
+ * it is never a receipt for frames the socket sent, nor proof that a local
+ * document matches a durable generation. Clients may only use it as a reason
+ * to schedule catch-up or a currentness query for that body.
+ */
+export interface BodyChangedHintFrame {
+	type: "BODY_CHANGED_HINT";
+	bodyId: string;
+	bodyEpoch: SemanticEpoch;
+	vaultGeneration: string;
+	durableGeneration: number;
+	vaultSequence: number;
+}
+
+export function parseSocketClientCapabilities(raw: string | null | undefined): ReadonlySet<string> {
+	const capabilities = new Set<string>();
+	if (!raw || raw.length > 512) return capabilities;
+	for (const entry of raw.split(",").slice(0, MAX_SOCKET_CLIENT_CAPABILITIES)) {
+		const capability = entry.trim();
+		if (/^[A-Za-z0-9_-]{1,64}$/.test(capability)) capabilities.add(capability);
+	}
+	return capabilities;
+}
+
+export function parseBodyChangedHintFrame(value: unknown): BodyChangedHintFrame | null {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+	const record = value as Record<string, unknown>;
+	if (record.type !== "BODY_CHANGED_HINT"
+		|| typeof record.bodyId !== "string" || !record.bodyId || record.bodyId.length > 256
+		|| !/^[A-Za-z0-9_-]+$/.test(record.bodyId)
+		|| !Number.isSafeInteger(record.bodyEpoch) || (record.bodyEpoch as number) < 1
+		|| typeof record.vaultGeneration !== "string" || !record.vaultGeneration
+		|| !Number.isSafeInteger(record.durableGeneration) || (record.durableGeneration as number) < 0
+		|| !Number.isSafeInteger(record.vaultSequence) || (record.vaultSequence as number) < 0) return null;
+	return {
+		type: "BODY_CHANGED_HINT",
+		bodyId: record.bodyId,
+		bodyEpoch: parseSemanticEpoch(record.bodyEpoch, "body changed hint epoch"),
+		vaultGeneration: record.vaultGeneration,
+		durableGeneration: record.durableGeneration as number,
+		vaultSequence: record.vaultSequence as number,
+	};
+}
+
 export interface BodyCurrentnessQueryFrame {
 	type: "BODY_CURRENTNESS_QUERY";
 	queryId: string;

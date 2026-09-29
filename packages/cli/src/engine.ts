@@ -41,6 +41,7 @@ import type { CleanupStack } from "./cleanup";
 import { createAccessFetch, createAccessWebSocketImplementation } from "./access";
 import type { AccessServiceCredentials, DaemonConfig } from "./config";
 import { NodeVaultDatabase } from "./nodeVaultDatabase";
+import { RemoteCatchUpSchedule, REMOTE_SAFETY_POLL_PERIODS, type RemotePollReason } from "./remotePoll";
 import {
 	createNodeHost,
 	shadowedBy,
@@ -270,6 +271,9 @@ export class DaemonEngine {
 	/** See `MIN_DELETE_STABILITY_MS`. Resolved once, from the configured period. */
 	private readonly deleteStabilityMs: number;
 
+	/** Whether a periodic reconcile also polls the change feed; see `remotePoll.ts`. */
+	private readonly remoteCatchUps: RemoteCatchUpSchedule;
+
 	/**
 	 * How long a candidate may stay unresolved before it is dropped as a stuck
 	 * state rather than kept as evidence. Four confirmation windows: a real
@@ -325,6 +329,7 @@ export class DaemonEngine {
 			MAX_DELETE_STABILITY_MS,
 		);
 		this.deleteReviewDeadlineMs = this.deleteStabilityMs * 4;
+		this.remoteCatchUps = new RemoteCatchUpSchedule(config.reconcileIntervalMs * REMOTE_SAFETY_POLL_PERIODS);
 	}
 
 	/** Register the post-startup fatal-auth notification. Fires at most once. */
@@ -434,6 +439,11 @@ export class DaemonEngine {
 			onRemoteRootStructuralUpdate: () => this.scheduleBootstrapCatchUp("remote-root"),
 			onAttachmentReconciliationRequired: () => this.scheduleBootstrapCatchUp("attachment-revision-mismatch"),
 			onDurableBodyCommitted: () => this.scheduleBootstrapCatchUp("body-committed"),
+			// After a server runtime wake the root socket stays open and gets a
+			// receipt-free hint instead of BODY_COMMITTED; it must still catch up,
+			// or the healthy root would suppress the remote poll (remotePoll.ts)
+			// while missing every commit until the safety interval.
+			onBodyChangedHint: () => this.scheduleBootstrapCatchUp("body-changed-hint"),
 		});
 		vaultSync.setResidencyRuntimeContext("desktop", "foreground");
 		this.vaultSync = vaultSync;
@@ -557,6 +567,7 @@ export class DaemonEngine {
 		}
 		await this.bootstrapCatchUp;
 		await bootstrapClient.run();
+		this.remoteCatchUps.recordSuccess();
 		const providerSynced = await vaultSync.waitForProviderSync();
 		if (vaultSync.fatalAuthError) throw this.recordFatalAuth();
 		if (!providerSynced) {
@@ -606,7 +617,9 @@ export class DaemonEngine {
 				this.bootstrapCatchUpPending = false;
 				try {
 					await bootstrap.run();
+					this.remoteCatchUps.recordSuccess();
 				} catch (error) {
+					this.remoteCatchUps.recordFailure();
 					this.log(`Bootstrap catch-up failed (${reason}): ${String(error)}`);
 				}
 			}
@@ -987,7 +1000,13 @@ export class DaemonEngine {
 				);
 				return;
 			}
-			this.scheduleBootstrapCatchUp("periodic");
+			const pollReason = await this.remotePollReason(vaultSync);
+			if (pollReason !== null) {
+				if (this.config.debug) this.log(`remote-poll reason=${pollReason}`);
+				this.scheduleBootstrapCatchUp(`periodic:${pollReason}`);
+			}
+			// Join any catch-up already running, including one a live
+			// notification started, before reconciling against the CRDT.
 			await this.bootstrapCatchUp;
 			if (mode === "authoritative") {
 				await this.admitAuthoritativeDiskChanges(await host.scanMarkdown());
@@ -1011,6 +1030,14 @@ export class DaemonEngine {
 			this.log(`Periodic reconcile failed: ${String(error)}`);
 		}
 	}
+	private async remotePollReason(vaultSync: VaultSync): Promise<RemotePollReason | null> {
+		const outstanding = await this.database?.listOutstanding() ?? [];
+		return this.remoteCatchUps.due({
+			rootHealthy: vaultSync.connected && vaultSync.providerSynced,
+			outstandingBodies: outstanding.length,
+		});
+	}
+
 	private async admitAuthoritativeDiskChanges(scan: MarkdownScan): Promise<void> {
 		for (const path of scan.paths) {
 			if (!this.isMarkdownPathSyncable(path) || this.hintedPaths.has(path)) continue;

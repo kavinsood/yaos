@@ -970,6 +970,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				},
 				log: (message) => this.log(`[sync] ${message}`),
 				onRemoteRootStructuralUpdate: () => this.scheduleSchema4CatchUp("remote-root"),
+				onBodyChangedHint: () => this.scheduleSchema4CatchUp("body-changed-hint"),
 				onAttachmentReconciliationRequired: () => {
 					this.attachmentReconciliationPending = true;
 					this.reconciliationController.markPending();
@@ -1183,6 +1184,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						}
 					});
 				},
+				onRootResync: (generation) => this.scheduleSchema4CatchUp(`root-resync:${generation}`),
 				refreshServerCapabilities: (reason) => {
 					void this.refreshServerCapabilities(reason);
 				},

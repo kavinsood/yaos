@@ -132,10 +132,10 @@ s.section("Fatal auth stops ticket refresh lifecycle");
 	const source = readSource("src/sync/vaultSync.ts");
 	s.check(source.includes("this.setFatalAuth(fatal.code, fatal.details)"), "parsed fatal code is stored on VaultSync");
 	s.check(
-		source.includes('this.workScheduler.queueReconnect("ticket-refresh-due"') &&
+		source.includes("this.workScheduler.queueTicketExpiryCheck(TICKET_EXPIRY_CHECK_REASON") &&
 		source.includes("this.destroyed || this.fatalAuthError") &&
 		!source.includes("ticketRefreshTimer"),
-		"fatal auth gates scheduler-owned proactive ticket refresh",
+		"fatal auth gates the scheduler-owned ticket-expiry check",
 	);
 	s.check(
 		source.includes('status === "disconnected" && !this.fatalAuthError'),

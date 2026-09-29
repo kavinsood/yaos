@@ -16,6 +16,21 @@ export type VaultWorkMetadata =
 	| { readonly kind: "lifecycle-replay"; readonly groupKey: string }
 	| { readonly kind: "attachment-publication" };
 
+const TICKET_EXPIRY_WORK_KEY = "ticket-expiry";
+
+/** Connection-maintenance slots; they are not pending local work. */
+export const CONNECTION_WORK_KEYS: ReadonlySet<string> = new Set(["reconnect", TICKET_EXPIRY_WORK_KEY]);
+
+/**
+ * Reconnect reasons that only concern a non-root provider (a body socket).
+ * While root is open they repair detached providers and never replace root;
+ * they must also reach the scheduler while root is connected, or the body
+ * never reconnects.
+ */
+export function isDetachedProviderRepairReason(reason: string): boolean {
+	return reason.startsWith("body-disconnected:") || reason.startsWith("socket-liveness-fallback:");
+}
+
 export interface VaultWorkSchedulerDeps {
 	readonly clock?: OverdueWorkClock;
 	readonly random?: OverdueWorkRandom;
@@ -48,11 +63,16 @@ export class VaultWorkScheduler {
 	private readonly bodyWakeGenerations = new Map<string, number>();
 	private readonly bodyWakePriorities = new Map<string, WorkPriority>();
 	private accepting = true;
+	/** Earliest dueAt queued for the ticket-expiry check that has not started. */
+	private pendingTicketExpiryDueAt: number | null = null;
 
 	constructor(private readonly deps: VaultWorkSchedulerDeps) {
 		this.clock = deps.clock ?? browserClock;
 		this.store = new ReconstructibleOverdueWorkStore(deps.initialIntents ?? []);
 		for (const intent of deps.initialIntents ?? []) {
+			if (intent.key === TICKET_EXPIRY_WORK_KEY && intent.blocker === undefined) {
+				this.pendingTicketExpiryDueAt = intent.dueAt;
+			}
 			if (intent.metadata?.kind === "body-wake") {
 				this.rememberBodyGeneration(intent.metadata.bodyId, intent.metadata.minimumGeneration);
 				this.rememberBodyPriority(intent.metadata.bodyId, intent.priority);
@@ -78,6 +98,33 @@ export class VaultWorkScheduler {
 		this.assertTimestamp(dueAt, "reconnect dueAt");
 		if (maxWaitAt !== undefined) this.assertTimestamp(maxWaitAt, "reconnect maxWaitAt");
 		return this.upsert("reconnect", "interactive", dueAt, maxWaitAt, {
+			kind: "reconnect",
+			reason,
+		});
+	}
+
+	/**
+	 * Reconnect-kind work in its own slot: a later-due check must not postpone
+	 * a pending reconnect, and a reconnect must not erase the check.
+	 */
+	queueTicketExpiryCheck(reason: string, dueAt: number): Promise<void> {
+		if (!this.accepting) return Promise.reject(new Error("vault work scheduler is stopped"));
+		this.assertTimestamp(dueAt, "ticket expiry check dueAt");
+		// One slot serves every ticket (root, body, canvas): the earliest
+		// expiry wins. Last-write-wins let a later-expiring ticket postpone the
+		// check an earlier one still needs.
+		//
+		// The minimum is kept synchronously, with no await between reading and
+		// writing it, so two concurrent queues cannot both read a stale record
+		// and let the later dueAt win. It only covers checks that have not
+		// started: once a check runs, its (past) dueAt is spent. Folding a
+		// running check's dueAt into the minimum re-armed the check in the
+		// past, so it re-fired immediately, forever (the P0c admission storm).
+		const effectiveDueAt = this.pendingTicketExpiryDueAt === null
+			? dueAt
+			: Math.min(this.pendingTicketExpiryDueAt, dueAt);
+		this.pendingTicketExpiryDueAt = effectiveDueAt;
+		return this.upsert(TICKET_EXPIRY_WORK_KEY, "normal", effectiveDueAt, undefined, {
 			kind: "reconnect",
 			reason,
 		});
@@ -176,6 +223,7 @@ export class VaultWorkScheduler {
 	private run(intent: DurableWorkIntent<VaultWorkMetadata>): Promise<OperationOutcome> {
 		const metadata = intent.metadata;
 		if (!metadata) return Promise.resolve({ kind: "permanently_blocked", failure: "malformed_response" });
+		if (intent.key === TICKET_EXPIRY_WORK_KEY) this.pendingTicketExpiryDueAt = null;
 		switch (metadata.kind) {
 			case "reconnect":
 				return this.deps.reconnect(metadata.reason);

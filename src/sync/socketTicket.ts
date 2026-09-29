@@ -26,9 +26,10 @@ export class SocketTicketHttpError extends Error {
 
 /**
  * Refresh when the cached ticket has less than 30 seconds remaining.
- * Also used by VaultSync to schedule the proactive provider URL refresh:
- * the timer fires at expiresAt - TICKET_REFRESH_BUFFER_MS so a fresh ticket
- * is in place before the current one becomes unusable.
+ * Tickets only authorize a WebSocket upgrade, so open sockets are never
+ * rotated. VaultSync uses this buffer to schedule its ticket-expiry check,
+ * which re-admits only providers that are not open (and would otherwise keep
+ * retrying with the expired ticket in their URL).
  */
 export const TICKET_REFRESH_BUFFER_MS = 30_000;
 const MAX_REASONABLE_TICKET_TTL_MS = 24 * 60 * 60 * 1_000; // 24 hours

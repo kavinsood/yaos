@@ -9,6 +9,11 @@ import { encodeRootPathPublicationUpdate, VaultSyncServer } from "../../server/s
 import { AUTHORITY_SUPERSEDED_SOCKET_CLOSE_CODE } from "../../server/src/shared/socketCloseCodes";
 import { MAX_CLIENT_MARKDOWN_BYTES } from "../../server/src/shared/durableLimits";
 import { SEMANTIC_EPOCH_RESET_SOCKET_CLOSE_CODE } from "../../server/src/shared/semanticEpoch";
+import {
+	parseBodyChangedHintFrame,
+	parseBodyCurrentnessResultFrame,
+	parseSocketClientCapabilities,
+} from "../../server/src/shared/socketLiveness";
 import { VaultDocumentCachePressureError, VaultDocumentValidationError } from "../../server/src/vaultDocumentCache";
 import {
 	parseVaultSocketAttachment,
@@ -1057,6 +1062,52 @@ s.test("a socket admitted by an earlier runtime keeps liveness but stays fenced 
 	assert.equal(root.sent.length, 1, "fenced frames receive no reply");
 });
 
+s.test("a socket admitted by an earlier runtime is answered a durable body currentness query", async () => {
+	const root = presenceSocket("root", { kind: "root", socketId: "stale-runtime-currentness" });
+	const validated: string[] = [];
+	const service = staleRuntimeService([root.socket], {
+		validateActor: (actor: { deviceId: string }) => { validated.push(actor.deviceId); return true; },
+		currentBodyHead: (bodyId: string) => bodyId === "body-current"
+			? { bodyId, bodyEpoch: 1, lifecycle: "active", generation: 7, contentHash: "c".repeat(64), size: 5, sequence: 11 }
+			: null,
+		currentSequence: () => 12,
+	});
+	// 100 maximal body ids exceed any small liveness-only frame budget.
+	const bodyIds = ["body-current", ...Array.from({ length: 99 }, (_, index) => `${"m".repeat(240)}${index}`)];
+	await service.message(root.socket, `__YPS:${JSON.stringify({
+		type: "BODY_CURRENTNESS_QUERY", queryId: "query-after-wake", bodyIds,
+	})}`);
+	assert.deepEqual(root.closes, [], "a read-only durable query must not close a stale-runtime socket");
+	assert.deepEqual(validated, [attachment.deviceId], "the actor is still validated before answering");
+	const result = parseBodyCurrentnessResultFrame(JSON.parse((root.sent[0] as string).slice(6)));
+	assert.ok(result);
+	assert.equal(result.queryId, "query-after-wake");
+	assert.equal(result.socketSessionId, "stale-runtime-currentness", "bound to the socket's own session");
+	assert.equal(result.vaultSequence, 12);
+	assert.deepEqual(result.heads.map((head) => [head.bodyId, head.generation]), [["body-current", 7]]);
+	assert.equal(result.missingBodyIds.length, 99);
+});
+
+s.test("a stale-runtime currentness query keeps actor, body-activity and body-scope fences", async () => {
+	const revoked = presenceSocket("root", { kind: "root", socketId: "stale-currentness-revoked" });
+	await staleRuntimeService([revoked.socket], { validateActor: () => false }).message(revoked.socket,
+		'__YPS:{"type":"BODY_CURRENTNESS_QUERY","queryId":"q-revoked","bodyIds":["body-a"]}');
+	assert.deepEqual(revoked.closes, [{ code: AUTHORITY_SUPERSEDED_SOCKET_CLOSE_CODE, reason: "socket authority superseded" }]);
+	const inactive = presenceSocket("body-inactive-currentness", { socketId: "stale-currentness-inactive" });
+	await staleRuntimeService([inactive.socket], { isActiveBody: () => false }).message(inactive.socket,
+		'__YPS:{"type":"BODY_CURRENTNESS_QUERY","queryId":"q-inactive","bodyIds":["body-inactive-currentness"]}');
+	assert.deepEqual(inactive.closes, [{ code: 1008, reason: "body is not active" }]);
+	const foreign = presenceSocket("body-own-currentness", { socketId: "stale-currentness-foreign" });
+	await staleRuntimeService([foreign.socket]).message(foreign.socket,
+		'__YPS:{"type":"BODY_CURRENTNESS_QUERY","queryId":"q-foreign","bodyIds":["body-other"]}');
+	assert.deepEqual(foreign.closes, [{ code: 1008, reason: "body currentness query authority mismatch" }]);
+	const malformed = presenceSocket("root", { kind: "root", socketId: "stale-currentness-malformed" });
+	await staleRuntimeService([malformed.socket]).message(malformed.socket,
+		'__YPS:{"type":"BODY_CURRENTNESS_QUERY","queryId":"q-bad","bodyIds":["bad id!"]}');
+	assert.deepEqual(malformed.closes, [{ code: 1008, reason: "socket authority mismatch" }],
+		"an unparseable query is not runtime independent");
+});
+
 s.test("a socket admitted by an earlier runtime still relays its own awareness", async () => {
 	const documentId = "body-presence-after-wake";
 	const source = presenceSocket(documentId, { awarenessClientId: 701, socketId: "wake-source" });
@@ -1113,6 +1164,69 @@ s.test("commit notices close sockets admitted by an earlier runtime that cannot 
 	assert.deepEqual(current.closes, []);
 	assert.equal(stale.sent.length, 0, "an old client would discard both the notice and an unknown hint");
 	assert.deepEqual(stale.closes, [{ code: 1008, reason: "socket authority mismatch" }]);
+});
+
+s.test("a capable stale-runtime socket gets a receipt-free catch-up hint and stays open", () => {
+	const bodyId = "body-hinted-after-wake";
+	const current = presenceSocket("root", { kind: "root", socketId: "hint-current", runtimeEpoch: "epoch-authority-after-wake",
+		catchUpHint: true });
+	const staleRoot = presenceSocket("root", { kind: "root", socketId: "hint-stale-root", catchUpHint: true });
+	const staleBody = presenceSocket(bodyId, { socketId: "hint-stale-body", catchUpHint: true });
+	const otherBody = presenceSocket("body-unrelated", { socketId: "hint-other-body", catchUpHint: true });
+	staleRuntimeService([current.socket, staleRoot.socket, staleBody.socket, otherBody.socket], {
+		cache: { get: () => undefined },
+		currentBodyHead: (id: string) => ({ bodyId: id, bodyEpoch: 1, lifecycle: "active",
+			generation: 4, contentHash: "b".repeat(64), size: 3, sequence: 9 }),
+	}).notifyBodyCommitted(bodyId, 4, 9);
+	assert.equal(JSON.parse((current.sent[0] as string).slice(6)).type, "BODY_COMMITTED",
+		"a current-runtime socket keeps receiving the receipt-bearing notice");
+	for (const stale of [staleRoot, staleBody]) {
+		assert.deepEqual(stale.closes, [], "no reconnect wave per wake");
+		assert.equal(stale.sent.length, 1);
+		const hint = JSON.parse((stale.sent[0] as string).slice(6));
+		assert.deepEqual(hint, {
+			type: "BODY_CHANGED_HINT", bodyId, bodyEpoch: 1, vaultGeneration: attachment.vaultGeneration,
+			durableGeneration: 4, vaultSequence: 9,
+		}, "no runtime epoch, content hash or size: never a receipt or promotion proof");
+		assert.deepEqual(parseBodyChangedHintFrame(hint), hint);
+	}
+	assert.equal(otherBody.sent.length, 0);
+});
+
+s.test("client socket capabilities are parsed from the upgrade query and recorded at admission", async () => {
+	assert.deepEqual([...parseSocketClientCapabilities("catchupHint, future_cap,bad cap,")], ["catchupHint", "future_cap"]);
+	assert.equal(parseSocketClientCapabilities(null).size, 0);
+	assert.equal(parseSocketClientCapabilities("x".repeat(600)).size, 0);
+	const admitted: VaultSocketAttachment[] = [];
+	const service = (): VaultSocketService => new VaultSocketService({
+		crdtEngine: testCrdtEngine,
+		sockets: {
+			sockets: () => [],
+			createPair: () => ({ client: {}, server: {
+				serializeAttachment: (value: unknown) => { admitted.push(value as VaultSocketAttachment); },
+				deserializeAttachment: () => admitted.at(-1),
+				send: () => {},
+				close: () => {},
+			} }),
+			accept: () => {},
+			upgradeResponse: () => new Response(null, { status: 200 }),
+		},
+		cache: { admitBody: () => true, load: () => ({ semanticEpoch: 1, generation: 1,
+			doc: testCrdtEngine.createDocument("capability-admission") }) },
+		vaultId: () => attachment.vaultId,
+		vaultGeneration: () => attachment.vaultGeneration,
+		runtimeEpoch: attachment.runtimeEpoch,
+		isActiveBody: () => true,
+		validateActor: () => true,
+		now: () => 1_234,
+	} as never);
+	service().accept("body-capable", "body", 1, "device-capable", { capabilities: parseSocketClientCapabilities("catchupHint") });
+	service().accept("body-legacy", "body", 1, "device-legacy");
+	assert.equal(admitted[0]!.catchUpHint, true);
+	assert.equal(admitted[0]!.admittedAt, 1_234);
+	assert.equal(admitted[1]!.catchUpHint, undefined, "an old client that advertised nothing keeps the close fallback");
+	assert.deepEqual(parseVaultSocketAttachment(admitted[0]), admitted[0]);
+	assert.equal(parseVaultSocketAttachment({ ...admitted[0], catchUpHint: "yes" }), null);
 });
 
 s.test("root liveness refreshes the device's lastSeenAt at most once per resolution window", async () => {

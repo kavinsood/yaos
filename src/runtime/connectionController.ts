@@ -2,6 +2,7 @@ import type { VaultSync } from "../sync/vaultSync";
 import type { TraceRecord } from "../observability/traceContext";
 import { deriveSyncFacts, type SyncFacts } from "./connectionFacts";
 import type { FatalAuthCode } from "../sync/fatalAuth";
+import { isDetachedProviderRepairReason } from "../sync/vaultWorkScheduler";
 
 export type OfflineReason =
 	| "provider_disconnected"
@@ -66,6 +67,13 @@ interface ConnectionControllerDeps {
 	setReconnectPending(): void;
 	isReconcileInFlight(): boolean;
 	runReconnectReconciliation(generation: number): void;
+	/**
+	 * Every root (re)sync after startup: durable commits made while this
+	 * device was disconnected (or whose notices it never received) are only
+	 * discoverable through the change feed, independent of the reconciled
+	 * generation, which feed catch-up itself advances.
+	 */
+	onRootResync?(generation: number): void;
 	refreshServerCapabilities(reason: string): void;
 	flushOpenWrites(reason: string): void;
 	updateOfflineStatus(): void;
@@ -92,7 +100,7 @@ export class ConnectionController {
 	constructor(private readonly deps: ConnectionControllerDeps) {}
 
 	start(): void {
-		this.deps.getVaultSync()?.setReconnectRequester((reason) => this.requestFastReconnect(reason));
+		this.deps.getVaultSync()?.setReconnectRequester((reason, delayMs) => this.requestFastReconnect(reason, delayMs));
 		this.deps.getVaultSync()?.setReconnectBlocked(() => this.deps.isReconnectBlocked?.() ?? false);
 		this.setupProviderStatusHandler();
 		this.setupReconnectionHandler();
@@ -247,6 +255,7 @@ export class ConnectionController {
 				this.deps.log(`Provider sync ignored: initial startup still running (gen ${generation})`);
 				return;
 			}
+			this.deps.onRootResync?.(generation);
 
 			if (this.deps.getAwaitingFirstProviderSyncAfterStartup()) {
 				this.deps.setAwaitingFirstProviderSyncAfterStartup(false);
@@ -353,7 +362,7 @@ export class ConnectionController {
 		});
 	}
 
-	private requestFastReconnect(reason: string): void {
+	private requestFastReconnect(reason: string, delayMs = FAST_RECONNECT_DEBOUNCE_MS): void {
 		const sync = this.deps.getVaultSync();
 		if (!sync) return;
 		if (sync.fatalAuthError) {
@@ -365,15 +374,18 @@ export class ConnectionController {
 			return;
 		}
 		sync.pokeOverdueWork(reason);
-		const credentialMaintenance = reason === "ticket-refresh-due" || reason.startsWith("retry:");
-		if (!credentialMaintenance && (sync.connected || sync.provider.wsconnecting)) {
+		// A connected root only makes root-level reconnects redundant. Retries
+		// and body repairs must still be queued: VaultSync repairs only the
+		// detached providers for them and leaves an open root alone.
+		const passesConnectedRoot = reason.startsWith("retry:") || isDetachedProviderRepairReason(reason);
+		if (!passesConnectedRoot && (sync.connected || sync.provider.wsconnecting)) {
 			return;
 		}
 
-		this.deps.log(`Fast reconnect queued (${reason})`);
+		this.deps.log(`Fast reconnect queued (${reason}${delayMs === FAST_RECONNECT_DEBOUNCE_MS ? "" : `, ${delayMs} ms`})`);
 		void sync.queueReconnect(
 			reason,
-			FAST_RECONNECT_DEBOUNCE_MS,
+			delayMs,
 		).catch((error) => this.deps.log(`Fast reconnect scheduling failed (${reason}): ${String(error)}`));
 	}
 }

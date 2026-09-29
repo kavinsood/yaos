@@ -34,6 +34,7 @@ import { canonicalJsonHash } from "./recoveryCanonicalJson";
 import type { VaultAuthoritySubjectChange } from "./vaultDocumentStore";
 import { SemanticCompactionRuntime } from "./semanticCompactionRuntime";
 import { BODY_EPOCH_HEADER, ROOT_EPOCH_HEADER, parseSemanticEpoch, parseSemanticEpochHeader } from "./shared/semanticEpoch";
+import { SOCKET_CLIENT_CAPABILITIES_PARAM, parseSocketClientCapabilities } from "./shared/socketLiveness";
 
 const PERSIST_DEBOUNCE_MS = 250;
 const PERSIST_RETRY_MS = 1_000;
@@ -360,11 +361,14 @@ export class VaultRuntime implements DrainPort {
 			if (request.method === "GET" && request.headers.get("upgrade")?.toLowerCase() === "websocket") {
 				const authorized = this.authorize(actor, "vault.content.read");
 				if (authorized instanceof Response) return authorized;
+				const acceptOptions = {
+					capabilities: parseSocketClientCapabilities(url.searchParams.get(SOCKET_CLIENT_CAPABILITIES_PARAM)),
+				};
 				if (url.pathname === "/ws/root") {
 					let rootEpoch;
 					try { rootEpoch = parseSemanticEpochHeader(request.headers, "root"); }
 					catch { return json({ error: "root_epoch_required" }, 400); }
-					return this.sockets.accept("root", "root", rootEpoch, authorized);
+					return this.sockets.accept("root", "root", rootEpoch, authorized, acceptOptions);
 				}
 				if (parts.length === 3 && parts[0] === "ws" && parts[1] === "body") {
 					const bodyId = parts[2]!;
@@ -372,7 +376,7 @@ export class VaultRuntime implements DrainPort {
 					try { bodyEpoch = parseSemanticEpochHeader(request.headers, "body"); }
 					catch { return json({ error: "body_epoch_required" }, 400); }
 					if (!this.lifecycle.activeBodyHead(bodyId)) return json({ error: "body_not_active" }, 409);
-					return this.sockets.accept(bodyId, "body", bodyEpoch, authorized);
+					return this.sockets.accept(bodyId, "body", bodyEpoch, authorized, acceptOptions);
 				}
 				if (parts.length === 3 && parts[0] === "ws" && parts[1] === "semantic") {
 					const documentId = parts[2]!;
@@ -380,7 +384,7 @@ export class VaultRuntime implements DrainPort {
 					try { documentEpoch = parseSemanticEpochHeader(request.headers, "body"); }
 					catch { return json({ error: "body_epoch_required" }, 400); }
 					if (!this.semantic.activeHead(documentId)) return json({ error: "semantic_document_not_active" }, 409);
-					return this.sockets.accept(documentId, "semantic", documentEpoch, authorized);
+					return this.sockets.accept(documentId, "semantic", documentEpoch, authorized, acceptOptions);
 				}
 			}
 			if (request.method === "POST" && parts.length === 3 && parts[0] === "body" && parts[2] === "candidate") {

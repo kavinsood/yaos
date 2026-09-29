@@ -22,9 +22,11 @@ import type { SemanticPathRef } from "./shared/canvasTypes";
 import { isCanonicalVaultId } from "./vaultId";
 import {
 	SOCKET_CONTROL_CAPABILITIES,
+	SOCKET_CLIENT_CAPABILITY_CATCH_UP_HINT,
 	SOCKET_LIVENESS_DESCRIPTOR,
 	parseBodyCurrentnessQueryFrame,
 	parseVaultPingFrame,
+	type BodyChangedHintFrame,
 	type BodyCurrentnessHead,
 	type BodyCurrentnessQueryFrame,
 	type VaultPingFrame,
@@ -55,7 +57,13 @@ const MAX_TEXT_FRAME = 64 * 1024;
  * semantic-epoch and body-activity checks:
  *
  * - liveness pings and awareness read only the socket attachment and the
- *   durable authority mirror.
+ *   durable authority mirror;
+ * - a body currentness query reads only the durable SQL catalog head and the
+ *   durable vault sequence. Its result is bound to the socket's own
+ *   `socketSessionId` (unique per admission, hence per runtime) and says
+ *   nothing about frames the socket sent to an earlier runtime, exactly like a
+ *   pong echoing the admission runtime. Fencing it closed the root socket on
+ *   every note open after a wake.
  */
 type ControlFrame =
 	| { kind: "ping"; ping: VaultPingFrame }
@@ -76,7 +84,7 @@ function parseControlFrame(message: string): ControlFrame | null {
 }
 
 function isRuntimeIndependentFrame(message: string | ArrayBuffer, control: ControlFrame | null): boolean {
-	if (typeof message === "string") return control?.kind === "ping";
+	if (typeof message === "string") return control !== null && control.kind !== "other";
 	// A leading 0x01 is exactly varuint 1: no continuation bit.
 	return message.byteLength > 0 && new Uint8Array(message, 0, 1)[0] === MESSAGE_AWARENESS;
 }
@@ -132,6 +140,8 @@ export interface VaultSocketAttachment {
 	socketId: string;
 	/** Wall-clock admission time; the newest admission wins an awareness identity. */
 	admittedAt?: number;
+	/** The client advertised {@link SOCKET_CLIENT_CAPABILITY_CATCH_UP_HINT}. */
+	catchUpHint?: boolean;
 	/** Last time liveness on this socket refreshed the device's `lastSeenAt`. */
 	lastSeenTouchedAt?: number;
 }
@@ -194,6 +204,7 @@ export function parseVaultSocketAttachment(value: unknown): VaultSocketAttachmen
 			|| attachment.awarenessClock < 0))
 		|| typeof attachment.socketId !== "string" || !validIdentity(attachment.socketId)
 		|| (attachment.admittedAt !== undefined && (!Number.isSafeInteger(attachment.admittedAt) || attachment.admittedAt < 0))
+		|| (attachment.catchUpHint !== undefined && typeof attachment.catchUpHint !== "boolean")
 		|| (attachment.lastSeenTouchedAt !== undefined
 			&& (!Number.isSafeInteger(attachment.lastSeenTouchedAt) || attachment.lastSeenTouchedAt < 0))
 		|| (attachment.kind !== "root" && attachment.kind !== "body" && attachment.kind !== "semantic")
@@ -417,6 +428,11 @@ export interface SocketServiceOptions {
 	now?: () => number;
 }
 
+export interface SocketAcceptOptions {
+	/** Capabilities the client advertised in the upgrade query. */
+	readonly capabilities?: ReadonlySet<string>;
+}
+
 function cachePressureResponse(reason: "body_cache_count" | "body_cache_encoded_state_bytes" | "vault_transient_bytes"
 	| "wasm_linear_memory_envelope"): Response {
 	return Response.json(
@@ -450,7 +466,7 @@ export class VaultSocketService {
 	}
 
 	accept(documentId: string, kind: VaultSocketAttachment["kind"], documentEpoch: SemanticEpoch,
-		actorOrDevice: VaultActorContext | string): Response {
+		actorOrDevice: VaultActorContext | string, acceptOptions: SocketAcceptOptions = {}): Response {
 		documentEpoch = parseSemanticEpoch(documentEpoch, "socket document epoch");
 		const actor: VaultActorContext = typeof actorOrDevice === "string"
 			? { vaultId: this.options.vaultId(), vaultGeneration: this.options.vaultGeneration(), principalId: actorOrDevice,
@@ -522,6 +538,7 @@ export class VaultSocketService {
 			admittedAt: this.now(),
 			// The ticket minted for this upgrade already refreshed lastSeenAt.
 			lastSeenTouchedAt: this.now(),
+			...(acceptOptions.capabilities?.has(SOCKET_CLIENT_CAPABILITY_CATCH_UP_HINT) ? { catchUpHint: true } : {}),
 		};
 		server.serializeAttachment(attachment);
 		this.options.sockets.accept(server);
@@ -596,6 +613,9 @@ export class VaultSocketService {
 				return;
 			}
 			const query = control.query;
+			// Durable reads only: this is also answered on sockets admitted by an
+			// earlier runtime (see isRuntimeIndependentFrame). No runtime epoch is
+			// reported; the client binds the result to the socket session.
 			if (attachment.kind === "body"
 				&& (query.bodyIds.length !== 1 || query.bodyIds[0] !== attachment.documentId)) {
 				socket.close(1008, "body currentness query authority mismatch");
@@ -731,6 +751,14 @@ export class VaultSocketService {
 			size: head?.size ?? null,
 			runtimeEpoch: this.options.runtimeEpoch,
 		};
+		const hint: BodyChangedHintFrame = {
+			type: "BODY_CHANGED_HINT",
+			bodyId,
+			bodyEpoch,
+			vaultGeneration: value.vaultGeneration,
+			durableGeneration,
+			vaultSequence,
+		};
 		for (const socket of this.options.sockets.sockets()) {
 			const attachment = parseVaultSocketAttachment(socket.deserializeAttachment());
 			if (!attachment || (attachment.kind !== "root"
@@ -738,9 +766,12 @@ export class VaultSocketService {
 			// Clients accept commit notices only from the runtime that admitted
 			// the socket: the notice's runtime epoch is receipt evidence for
 			// frames that socket sent. A socket that outlived its runtime (kept
-			// open by runtime-independent liveness) is closed and reconnects.
+			// open by runtime-independent liveness) gets a receipt-free hint
+			// that makes it catch up, when it advertised support. Older clients
+			// would ignore the hint, so they are closed and reconnect instead.
 			if (attachment.runtimeEpoch !== this.options.runtimeEpoch) {
-				try { socket.close(1008, "socket authority mismatch"); } catch { /* already closed */ }
+				if (attachment.catchUpHint === true) this.sendControl(socket, hint);
+				else try { socket.close(1008, "socket authority mismatch"); } catch { /* already closed */ }
 				continue;
 			}
 			this.sendControl(socket, value);

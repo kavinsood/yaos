@@ -301,11 +301,13 @@ s.test("VaultSync reconstructs and drains candidate, body-wake, and ticket work"
 
 	assert.equal(candidateAttempts, 1);
 	const candidateRetry = runtime.getOverdueWorkDiagnostics().queue.find((item) => item.key === "candidate:body-1");
-	const ticketRefresh = runtime.getOverdueWorkDiagnostics().queue.find((item) => item.key === "reconnect");
+	const ticketExpiry = runtime.getOverdueWorkDiagnostics().queue.find((item) => item.key === "ticket-expiry");
 	assert.equal(candidateRetry?.owner, "kernel");
 	assert.equal(candidateRetry?.attempt, 1);
 	assert.equal(candidateRetry?.dueAt, 1_000);
-	assert.equal(ticketRefresh?.dueAt, 500);
+	assert.equal(ticketExpiry?.dueAt, 500);
+	assert.equal(runtime.getOverdueWorkDiagnostics().queue.some((item) => item.key === "reconnect"), false,
+		"the ticket-expiry check does not occupy the reconnect slot");
 
 	await runtime.bodies.load("body-1");
 	provider.emitCustom(JSON.stringify({
@@ -323,10 +325,13 @@ s.test("VaultSync reconstructs and drains candidate, body-wake, and ticket work"
 	});
 	assert.equal(runtime.getOverdueWorkDiagnostics().queue.some((item) => item.key === "body-wake:body-1"), false);
 
+	const ticketsBeforeExpiry = ticketRequests;
 	assert.equal(clock.advance(500), 1);
 	await runtime.whenOverdueWorkIdle();
-	assert.equal(ticketRequests, 2);
-	assert.equal(runtime.getOverdueWorkDiagnostics().queue.find((item) => item.key === "reconnect")?.dueAt, 1_000);
+	assert.equal(ticketRequests, ticketsBeforeExpiry, "an open root socket is not rotated when its ticket nears expiry");
+	assert.equal(provider.wsconnected, true);
+	assert.equal(runtime.getOverdueWorkDiagnostics().queue.some((item) => item.key === "ticket-expiry"
+		|| item.key === "reconnect"), false);
 
 	assert.equal(clock.advance(500), 1);
 	await runtime.whenOverdueWorkIdle();
