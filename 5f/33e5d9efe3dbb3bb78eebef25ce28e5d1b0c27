@@ -1,0 +1,19 @@
+server/src/crdt/ywasmByteOps.ts
+  s_9ad601cc7abbf7::t_8fbb79647f219d 1-180
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "5f33e5d9efe3dbb3bb78eebef25ce28e5d1b0c27",
+  "prompts": {},
+  "sessions": {
+    "s_9ad601cc7abbf7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a0c3f851a1219b01f",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
