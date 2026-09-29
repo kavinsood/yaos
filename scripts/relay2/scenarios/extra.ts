@@ -82,10 +82,23 @@ export async function gqlWindows(ctx: RunCtx, windows: Win[]): Promise<Result[] 
 	const lastEnd = Math.max(...windows.map((w) => Date.parse(w.end)));
 	const wait = lastEnd + settle - Date.now();
 	if (wait > 0) { log(`gql: waiting ${Math.round(wait / 1000)} s for analytics to settle`); await sleep(wait); }
+	// Analytics lag varies (a freshly deployed worker lagged > 5 min). Wait until the latest non-idle window's last
+	// minute bucket is present (up to --gql-attempts × 60 s), then query every window; an idle window with no DO
+	// activity legitimately has no buckets.
+	const attempts = ctx.num("gql-attempts", 8);
+	const probe = [...windows].reverse().find((w) => w.name !== "idle") ?? windows[windows.length - 1]!;
+	let probeReady = false;
+	for (let attempt = 1; attempt <= attempts; attempt++) {
+		try {
+			const q = await queryWindow(ctx.host, probe.start, probe.end);
+			if (minuteTotals(q, probe).lastBucketPresent) { probeReady = true; break; }
+		} catch (error) { log(`gql probe error: ${String(error).slice(0, 200)}`); }
+		if (attempt < attempts) { log(`gql ${probe.name}: last minute bucket not yet present (attempt ${attempt}); retry in 60 s`); await sleep(60_000); }
+	}
 	const out: Result[] = [];
 	for (const w of windows) {
 		let entry: Result = { ...w };
-		for (let attempt = 1; attempt <= 4; attempt++) {
+		for (let attempt = 1; attempt <= 2; attempt++) {
 			try {
 				const q = await queryWindow(ctx.host, w.start, w.end);
 				const m = minuteTotals(q, w);
@@ -100,12 +113,9 @@ export async function gqlWindows(ctx: RunCtx, windows: Win[]): Promise<Result[] 
 				entry = { ...w, ...m, invocations: inv, httpRequests, wsInvocations, alarms,
 					doRequestUnits: r2(httpRequests + alarms + t.inboundWsEffective / 20),
 					doRequestUnitsNote: "HTTP invocations (incl. WS upgrades, tickets, debug routes) + alarms + inbound WS messages / 20 (Workers billing 20:1); inbound = max(periodic inboundWebsocketMsgCount, hibernation invocations)",
-					attempt };
-				// An idle window with no DO activity legitimately has no buckets; do not wait 4 minutes for it.
-				if (m.lastBucketPresent || attempt === 4 || (Number(m.objects ?? 0) === 0 && attempt >= 2)) break;
-				log(`gql ${w.name}: last minute bucket not yet present; retry in 60 s`);
-			} catch (error) { entry = { ...w, error: String(error).slice(0, 300), attempt }; }
-			await sleep(60_000);
+					probeReady, attempt };
+				break;
+			} catch (error) { entry = { ...w, error: String(error).slice(0, 300), attempt }; await sleep(15_000); }
 		}
 		out.push(entry);
 	}
@@ -496,6 +506,7 @@ export async function MB(ctx: RunCtx): Promise<Result> {
 		windows.push(await closeWindow(p, start, { edits }));
 		const delta = counterDelta(d0, d2);
 		parts.push({ pattern: p, bodyId: body, edits, drained, propagationMs: series(tracker.coveredMs, 0),
+			propagationSamplesMs: tracker.coveredMs.map((x) => (x == null ? null : r2(x))),
 			sequenceDelta: Number(d1.sequence) - Number(d0.sequence),
 			relayRowsWrittenPerEdit: delta?.rowsWritten !== undefined ? r2(delta.rowsWritten / edits) : null,
 			relayAppendsPerEdit: delta?.appends !== undefined ? r2(delta.appends / edits) : null,
