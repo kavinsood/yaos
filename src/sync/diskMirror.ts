@@ -34,6 +34,7 @@ export interface DiskSettlementOptions {
 	conflictEpisodes?: ConflictEpisodes;
 	getBaseline(path: string): {
 		contentHash: string | null;
+		trustedWhole?: boolean;
 		lastDiskIndexPersistedAt?: number;
 	} | null;
 	/**
@@ -954,6 +955,16 @@ export class DiskMirror {
 			const base = input.baseContent !== undefined
 				? null
 				: await this.settlement.getCommonBase(bodyId);
+			if (!isCurrent()) return "replan";
+			const baseline = this.settlement.getBaseline(path);
+			if (base !== null && base.kind !== "invalid"
+				&& baseline?.trustedWhole === true && baseline.contentHash === diskHash) {
+				const written = await this.writeSettledBody(path, diskContent, content, isCurrent);
+				if (written !== "written") return written === "moved" ? "replan" : "preserved-unresolved";
+				this.settlement.markDivergence?.(bodyId, "none");
+				this.clearPreservedUnresolved(path);
+				return "settled";
+			}
 			if (base !== null && base.kind !== "available") {
 				if (input.onMissingBase === "preserve-disk") {
 					return this.preserveDiskThenProjectBody(bodyId, path, diskContent, content, isCurrent);

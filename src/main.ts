@@ -1154,7 +1154,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					// Include a session agreement whose persistence is held back
 					// while the body's local work settles (recordProjectedDiskWrite).
 					contentHash: this.reconciliationController.effectiveBaselineHash(path)
-						?? currentContentHash(this.diskIndex[path]) ?? null,
+						?? null,
+					trustedWhole: true,
 					lastDiskIndexPersistedAt: this.lastDiskIndexPersistedAt,
 				}),
 				commitLocalBody: async (input) => {
