@@ -1,6 +1,7 @@
 import { canonicalizeMarkdown, canonicalMarkdownHash, canonicalMarkdownBytes, exactMarkdownDiskFingerprint } from "@shared/markdownCodec";
 import { MAX_CLIENT_MARKDOWN_BYTES } from "@shared/durableLimits";
 import { markdownConflictArtifactPath } from "../runtime/reconcile/markdownConflictArtifact";
+import { AttentionNoticeQueue } from "../ui/attentionNoticeQueue";
 
 export interface ConflictVersion {
 	hash: string;
@@ -42,8 +43,7 @@ export const CONFLICT_PART_SOFT_BYTES = 1024 * 1024;
 
 export class ConflictEpisodes {
 	private chain: Promise<unknown> = Promise.resolve();
-	private noticeTimer: ReturnType<typeof setTimeout> | null = null;
-	private pendingNotices = new Set<string>();
+	private readonly notices = new AttentionNoticeQueue((ids) => this.flushNotices(ids));
 
 	constructor(private state: ConflictEpisodeState, private readonly port: ConflictEpisodePort) {}
 
@@ -94,8 +94,7 @@ export class ConflictEpisodes {
 			await this.port.persist(this.snapshot());
 			this.port.changed();
 			if (!episode.notified) {
-				this.pendingNotices.add(input.bodyId);
-				if (this.noticeTimer === null) this.noticeTimer = setTimeout(() => { void this.flushNotices(); }, 250);
+				this.notices.add(input.bodyId);
 			}
 			return episode.parts[0]!;
 		});
@@ -153,7 +152,6 @@ export class ConflictEpisodes {
 	async close(bodyId: string): Promise<void> {
 		await this.serialized(async () => {
 			delete this.state.episodes[bodyId];
-			this.pendingNotices.delete(bodyId);
 			await this.port.persist(this.snapshot());
 			this.port.changed();
 		});
@@ -169,11 +167,9 @@ export class ConflictEpisodes {
 		});
 	}
 
-	private async flushNotices(): Promise<void> {
-		this.noticeTimer = null;
+	private async flushNotices(pending: string[]): Promise<void> {
 		await this.serialized(async () => {
-			const ids = [...this.pendingNotices].filter((bodyId) => this.get(bodyId) && !this.get(bodyId)!.notified);
-			this.pendingNotices.clear();
+			const ids = pending.filter((bodyId) => this.get(bodyId) && !this.get(bodyId)!.notified);
 			for (const bodyId of ids) this.get(bodyId)!.notified = true;
 			if (ids.length) {
 				await this.port.persist(this.snapshot());
@@ -183,7 +179,6 @@ export class ConflictEpisodes {
 	}
 
 	dispose(): void {
-		if (this.noticeTimer !== null) clearTimeout(this.noticeTimer);
-		this.noticeTimer = null;
+		this.notices.dispose();
 	}
 }

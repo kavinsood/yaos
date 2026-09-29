@@ -30,6 +30,7 @@ import {
 } from "./frontmatterQuarantine";
 import { sha256TextHex } from "../utils/sha256";
 import { FRONTMATTER_BOUNDARY_VERSION } from "./frontmatterBoundary";
+import { AttentionNoticeQueue } from "../ui/attentionNoticeQueue";
 
 // ---------------------------------------------------------------------------
 // Host interface
@@ -48,6 +49,7 @@ export interface FrontmatterGuardHost {
 	getFrontmatterQuarantineEntries(): FrontmatterQuarantineEntry[];
 	setFrontmatterQuarantineEntries(entries: FrontmatterQuarantineEntry[]): void;
 	getFrontmatterQuarantineEvidence?(path: string): Promise<FrontmatterQuarantineEvidence>;
+	isYaosArtifact?(path: string, content: string): Promise<boolean>;
 }
 
 // ---------------------------------------------------------------------------
@@ -61,6 +63,12 @@ export class FrontmatterGuardCoordinator {
 	 * Used to deduplicate repeated notices for the same unchanged validation.
 	 */
 	private readonly fingerprintMap = new Map<string, string>();
+	private readonly lastNoticeAt = new Map<string, number>();
+	private readonly notices = new AttentionNoticeQueue((paths) => {
+		new Notice(paths.length === 1
+			? `YAOS paused a properties update in "${paths[0]}" because the frontmatter looked unsafe. Check diagnostics before accepting the change.`
+			: `YAOS: ${paths.length} notes have blocked properties. Check diagnostics before accepting changes.`, 12_000);
+	});
 
 	constructor(private readonly host: FrontmatterGuardHost) {}
 
@@ -105,12 +113,14 @@ export class FrontmatterGuardCoordinator {
 		if (!isFrontmatterBlocked(validation)) return;
 
 		const noticeFingerprint = this.buildFrontmatterNoticeFingerprint(validation);
-		const shouldNotify = this.shouldNotifyFrontmatterQuarantine(
-			path,
-			direction,
-			noticeFingerprint,
-		);
-		const notifiedAt = shouldNotify ? Date.now() : null;
+		void (this.host.isYaosArtifact?.(path, nextContent) ?? Promise.resolve(false)).then((artifact) => {
+			const notify = !artifact && this.shouldNotifyFrontmatterQuarantine(path, direction, noticeFingerprint);
+			if (notify) this.showFrontmatterGuardNotice(path);
+			return this.persistFrontmatterQuarantine(
+				path, direction, validation, previousContent, nextContent, noticeFingerprint,
+				notify ? Date.now() : null,
+			);
+		}).catch(() => undefined);
 
 		this.traceFrontmatterQuarantine(
 			path,
@@ -120,25 +130,10 @@ export class FrontmatterGuardCoordinator {
 			previousContent?.length ?? null,
 			nextContent.length,
 		);
-		if (shouldNotify) {
-			this.showFrontmatterGuardNotice(path);
-		}
-		void this.persistFrontmatterQuarantine(
-			path,
-			direction,
-			validation,
-			previousContent,
-			nextContent,
-			noticeFingerprint,
-			notifiedAt,
-		);
 	}
 
 	showFrontmatterGuardNotice(path: string): void {
-		new Notice(
-			`YAOS paused a properties update in "${path}" because the frontmatter looked unsafe. Check diagnostics before accepting the change.`,
-			12_000,
-		);
+		this.notices.add(path);
 	}
 
 	buildFrontmatterNoticeFingerprint(
@@ -158,9 +153,16 @@ export class FrontmatterGuardCoordinator {
 		noticeFingerprint: string,
 	): boolean {
 		const key = `${direction}:${path}`;
+		const last = this.lastNoticeAt.get(path);
+		if (last !== undefined && Date.now() - last < 10 * 60_000) return false;
 		if (this.fingerprintMap.get(key) === noticeFingerprint) return false;
 		this.fingerprintMap.set(key, noticeFingerprint);
+		this.lastNoticeAt.set(path, Date.now());
 		return true;
+	}
+
+	dispose(): void {
+		this.notices.dispose();
 	}
 
 	clearFrontmatterNoticeFingerprint(

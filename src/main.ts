@@ -632,6 +632,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		}
 		this.applyRuntimeSettings("load-settings");
 		this.frontmatterGuardCoordinator = new FrontmatterGuardCoordinator({
+			isYaosArtifact: (path, content) => this.conflictEpisodes?.isArtifact(path, content) ?? Promise.resolve(false),
 			isFrontmatterGuardEnabled: () => this.settings.frontmatterGuardEnabled,
 			trace: (source, event, data) => this.trace(source, event, data),
 			persistPluginState: () => this.persistPluginState(),
@@ -642,6 +643,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			getFrontmatterQuarantineEvidence: (path) => this.getFrontmatterQuarantineEvidence(path),
 		});
 		this.createReconciliationController();
+		this.register(() => this.frontmatterGuardCoordinator.dispose());
 		this.editorWorkspace = new EditorWorkspaceOrchestrator({
 			app: this.app,
 			getSettings: () => this.settings,
