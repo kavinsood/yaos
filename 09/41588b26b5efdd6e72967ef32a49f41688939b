@@ -1,0 +1,21 @@
+tests/server/collaboration-control-plane.ts
+  s_d157206730843c::t_53824a96a205a8 24-28
+tests/server/ws-ticket-auth.ts
+  s_d157206730843c::t_a78db1ac32b916 80,84,104-105
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "0941588b26b5efdd6e72967ef32a49f41688939b",
+  "prompts": {},
+  "sessions": {
+    "s_d157206730843c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ac9fff1be1f00827f",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
