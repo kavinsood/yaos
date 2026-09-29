@@ -1,0 +1,19 @@
+scripts/relay2/lib/checks.ts
+  s_06158d5aa75452::t_66fb1cf45fdf72 14-25
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "713b318e931d74a125f9d9b95af7332d9f801b1b",
+  "prompts": {},
+  "sessions": {
+    "s_06158d5aa75452": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aabbc0b8c933cb988",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
