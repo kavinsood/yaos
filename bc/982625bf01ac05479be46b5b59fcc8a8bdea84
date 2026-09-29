@@ -1,0 +1,27 @@
+scripts/relay2/bench.ts
+  s_06158d5aa75452::t_9d1017fc275a5f 25
+scripts/relay2/l5-cli-baseline.ts
+  s_06158d5aa75452::t_34b7ad8c3af036 6-13,49-52,59-61,63-65,67,75-76,84,87,112,114-118,123-130,139,146-147,161-162,164-166,171,195-199,209-249,251,264-276,278,280-288,295-298,304-305,317-318,320,322-323
+scripts/relay2/lib/checks.ts
+  s_06158d5aa75452::t_843cc2d45e9087 71-74,128-135,139-140
+scripts/relay2/lib/socketReceipts.ts
+  s_06158d5aa75452::t_f14e13586a4406 1-325
+scripts/relay2/scenarios/behaviour.ts
+  s_06158d5aa75452::t_c8e75d2be09b4a 3,5-7,16,350-482
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "bc982625bf01ac05479be46b5b59fcc8a8bdea84",
+  "prompts": {},
+  "sessions": {
+    "s_06158d5aa75452": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aabbc0b8c933cb988",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
