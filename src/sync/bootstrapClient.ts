@@ -739,6 +739,17 @@ export class BootstrapClient {
 
 	configureCanvases(canvases: CanvasManager): void { this.canvases = canvases; }
 
+	/**
+	 * A loaded body that live sync already brought to the server's content
+	 * cannot (and need not) be replaced — replacement refuses leased or live
+	 * bodies. The hook proves content equality against the head's hash and
+	 * advances the stored generation; true means the body already holds it.
+	 */
+	configureLiveBodyPromotion(promote: (head: ClientCatalogEntry) => Promise<boolean>): void {
+		this.promoteLiveBody = promote;
+	}
+	private promoteLiveBody: ((head: ClientCatalogEntry) => Promise<boolean>) | null = null;
+
 	async run(attemptId?: string): Promise<StoredBootstrapProgress> {
 		let progress = await this.database.getBootstrapProgress();
 		if (progress?.stage === "complete") {
@@ -1153,12 +1164,17 @@ export class BootstrapClient {
 					expected = beforeApply;
 					continue;
 				}
-				await this.bodies.replaceFromServer(
-					expected.bodyId,
-					state.encodedState,
-					state.bodyEpoch,
-					state.generation,
-				);
+				const promoted = state.generation === expected.generation
+					&& !!this.promoteLiveBody
+					&& await this.promoteLiveBody(expected);
+				if (!promoted) {
+					await this.bodies.replaceFromServer(
+						expected.bodyId,
+						state.encodedState,
+						state.bodyEpoch,
+						state.generation,
+					);
+				}
 				const renameSources = new Set(
 					[expected.previousPath, materializedPath].filter(
 						(source): source is string => !!source && source !== expected.path,

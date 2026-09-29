@@ -34,12 +34,19 @@ export interface DiskSettlementOptions {
 		contentHash: string | null;
 		lastDiskIndexPersistedAt?: number;
 	} | null;
+	/**
+	 * Import disk content into the body. With `expectedBodyContent` the
+	 * import is conditional: it applies only while the body still holds
+	 * exactly the content the decision was planned against (checked in the
+	 * same synchronous section as the Y transaction), else "superseded".
+	 */
 	commitLocalBody(input: {
 		bodyId: string;
 		path: string;
 		content: string;
 		reason: "external-edit" | "delete-revive";
-	}): Promise<void>;
+		expectedBodyContent?: string;
+	}): Promise<void | "completed" | "superseded">;
 	getCommonBase?(bodyId: string): Promise<BodySettlementRead>;
 	commitMergedBody?(input: {
 		bodyId: string;
@@ -54,6 +61,12 @@ export interface DiskSettlementOptions {
 		stillCurrent: () => boolean;
 	}): Promise<string | null>;
 	settleClosedBody?(path: string): Promise<void>;
+	/**
+	 * The frontmatter ingest guard for disk-derived content about to be
+	 * committed into the body (`next`, from the body's `current`). True:
+	 * blocked (the guard records/quarantines it); nothing is committed.
+	 */
+	shouldBlockDiskIngest?(path: string, current: string, next: string): boolean;
 	isPathAllowed?(path: string): boolean;
 	isBodyLive?(bodyId: string): boolean;
 }
@@ -89,6 +102,13 @@ function describeOrigin(origin: unknown, provider: unknown): string {
 		return constructorName || "object";
 	}
 	return formatUnknown(origin);
+}
+
+/** Aborts a compare-and-swap disk write whose expected content moved. */
+class DiskMovedBeforeWriteError extends Error {
+	constructor() {
+		super("disk content changed before the write");
+	}
 }
 
 interface SuppressionEntry {
@@ -179,7 +199,25 @@ export class DiskMirror {
 	 * The hash is pre-computed here (where the content is in scope) to keep
 	 * the caller free of crypto concerns. Use to update disk index baselines.
 	 */
-	private _onDiskWriteCallback: ((path: string, contentHash: string) => void) | null = null;
+	private _onDiskWriteCallback: ((path: string, contentHash: string, content: string) => void) | null = null;
+	/**
+	 * Expected canonical disk hash per path for writes planned on the
+	 * evidence that disk still held a known state (e.g. its settled baseline).
+	 * The write happens only if disk still hashes to it; otherwise disk moved
+	 * after the plan (new local input) and the write is handed back.
+	 */
+	private expectedDiskHashes = new Map<string, string>();
+	/**
+	 * Per path, the body hash of the last three-way overlap that was
+	 * preserved (the conflict note holds the body, C) and offered for review.
+	 * While it is unresolved, further disk saves (an external tool's
+	 * autosave) add nothing to preserve: no new note, no new review. A new
+	 * body state is preserved again.
+	 */
+	private preservedOverlaps = new Map<string, string>();
+	/** Paths with a three-way review modal currently open. */
+	private openReviews = new Set<string>();
+	private _onDiskMovedBeforeWrite: ((path: string) => void) | null = null;
 	private _onPartialDiskWriteCallback: ((path: string, bodyHash: string, propertiesHash: string) => void) | null = null;
 
 	/**
@@ -230,8 +268,16 @@ export class DiskMirror {
 	 * content written (pre-computed in diskMirror to avoid redundant re-reads).
 	 * Use this to update content-hash baselines in the disk index.
 	 */
-	setDiskWriteCallback(callback: (path: string, contentHash: string) => void): void {
+	setDiskWriteCallback(callback: (path: string, contentHash: string, content: string) => void): void {
 		this._onDiskWriteCallback = callback;
+	}
+	/**
+	 * Register the re-plan hook for a planned write that found disk changed
+	 * underneath it (see `scheduleWrite`'s `expectedDiskHash`, and the
+	 * compare-and-swap immediately before every modify). Nothing was written.
+	 */
+	setDiskMovedBeforeWriteHandler(handler: ((path: string) => void) | null): void {
+		this._onDiskMovedBeforeWrite = handler;
 	}
 	setPartialDiskWriteCallback(callback: (path: string, bodyHash: string, propertiesHash: string) => void): void {
 		this._onPartialDiskWriteCallback = callback;
@@ -253,6 +299,18 @@ export class DiskMirror {
 		bodyId: string;
 		generation: number;
 		content: string;
+		/**
+		 * Exact content of the last disk/body agreement, when the caller
+		 * knows it. Takes precedence over the stored common base.
+		 */
+		baseContent?: string;
+		/**
+		 * What to do when disk and body both moved and no common base is
+		 * available. "preserve" (default) leaves both untouched and unresolved;
+		 * "preserve-disk" saves disk as a conflict artifact, then projects the
+		 * body (the durable, converged state) to disk.
+		 */
+		onMissingBase?: "preserve" | "preserve-disk";
 	}): Promise<"settled" | "replan" | "preserved-unresolved"> {
 		const path = this.acceptPath(input.path);
 		if (!path) return "preserved-unresolved";
@@ -272,11 +330,17 @@ export class DiskMirror {
 			try {
 				const proof = this.vaultSync.bodies.captureRevision(input.bodyId);
 				const isCurrent = () => this.vaultSync.bodies.coordinator.isProjectionCurrent(proof, path);
-				return await this.settleBodyUnlocked({
+				const outcome = await this.settleBodyUnlocked({
 					...input,
 					path,
 					content: canonicalizeMarkdown(input.content),
 				}, isCurrent);
+				if (outcome === "settled") {
+					// Disk and body agree: older closed-write plans are void.
+					this.expectedDiskHashes.delete(path);
+					this.preservedOverlaps.delete(path);
+				}
+				return outcome;
 			} finally {
 				lease.release();
 			}
@@ -312,6 +376,7 @@ export class DiskMirror {
 			this.suppressDelete(path, 2);
 			await this.deleteLocalReplica(file);
 			this.clearPreservedUnresolved(path);
+			this.forgetPathPlans([path]);
 			this.log(`discarded stale settlement for ${input.bodyId} at "${path}"`);
 			return true;
 		});
@@ -346,6 +411,7 @@ export class DiskMirror {
 			this.suppressDelete(from, 2);
 			await this.deleteLocalReplica(source);
 			this.clearPreservedUnresolved(from);
+			this.forgetPathPlans([from]);
 			this.log(`removed exact previous rename source "${from}" for ${input.bodyId}`);
 			return "source-deleted";
 		}
@@ -423,6 +489,7 @@ export class DiskMirror {
 			this.editorBindings.updatePathsAfterRename(
 				new Map(normalized.map((move) => [move.from, move.to])),
 			);
+			this.forgetPathPlans(normalized.flatMap((move) => [move.from, move.to]));
 			this.expireRemoteRenameMarkers([
 				...staged.map((item) => item.temp),
 				...normalized.map((move) => move.to),
@@ -536,6 +603,7 @@ export class DiskMirror {
 		this.suppressDelete(path, 2);
 		await this.deleteLocalReplica(file);
 		this.clearPreservedUnresolved(path);
+		this.forgetPathPlans([path]);
 		return "deleted";
 	}
 
@@ -573,6 +641,9 @@ export class DiskMirror {
 		}
 		this.trace?.("disk", "notifyFileOpened", { path });
 		this.openPaths.add(path);
+		// The editor is the authority for an open note; closed-note write plans
+		// (and their disk expectations) no longer apply.
+		this.expectedDiskHashes.delete(path);
 		if (this.writeQueue.delete(path)) {
 			this.forcedWritePaths.delete(path);
 			this.scheduleOpenWrite(path);
@@ -681,14 +752,34 @@ export class DiskMirror {
 	// Write scheduling (debounce + concurrency-limited queue)
 	// -------------------------------------------------------------------
 
-	scheduleWrite(path: string): void {
+	/**
+	 * Queue a body -> disk projection. With `expectedDiskHash` the write is
+	 * conditional: it happens only while disk still hashes to that value (the
+	 * evidence the write was planned on). If disk moved, nothing is written and
+	 * the disk-moved handler re-plans.
+	 */
+	scheduleWrite(path: string, options: { expectedDiskHash?: string } = {}): void {
 		path = normalizePath(path);
+		if (options.expectedDiskHash !== undefined) this.expectedDiskHashes.set(path, options.expectedDiskHash);
 		if (this.openPaths.has(path)) {
 			this.scheduleOpenWrite(path);
 			return;
 		}
 
 		this.scheduleClosedWrite(path);
+	}
+
+	/**
+	 * The file at these paths was deleted, renamed or otherwise replaced:
+	 * plans made on evidence about the old file (disk expectations, the
+	 * preserved-overlap dedupe) no longer describe it.
+	 */
+	forgetPathPlans(paths: Iterable<string>): void {
+		for (const raw of paths) {
+			const path = normalizePath(raw);
+			this.expectedDiskHashes.delete(path);
+			this.preservedOverlaps.delete(path);
+		}
 	}
 
 	private scheduleClosedWrite(path: string): void {
@@ -797,6 +888,8 @@ export class DiskMirror {
 		bodyId: string;
 		generation: number;
 		content: string;
+		baseContent?: string;
+		onMissingBase?: "preserve" | "preserve-disk";
 	}, isCurrent: () => boolean): Promise<"settled" | "replan" | "preserved-unresolved"> {
 		const { path, bodyId, content } = input;
 		if (!isCurrent()) return "replan";
@@ -812,7 +905,7 @@ export class DiskMirror {
 		}
 		if (!(existing instanceof TFile)) {
 			const written = await this.writeSettledBody(path, null, content, isCurrent);
-			if (!written) return "preserved-unresolved";
+			if (written !== "written") return written === "moved" ? "replan" : "preserved-unresolved";
 			this.clearPreservedUnresolved(path);
 			this.trace?.("disk", "body-settled", {
 				path,
@@ -836,21 +929,28 @@ export class DiskMirror {
 			contentBaselineHash(content),
 		]);
 		if (diskHash === remoteHash) {
-			this._onDiskWriteCallback?.(path, remoteHash);
+			this._onDiskWriteCallback?.(path, remoteHash, content);
 			this.clearPreservedUnresolved(path);
 			return "settled";
 		}
 
 		if (this.settlement?.getCommonBase && this.settlement.commitMergedBody) {
-			const base = await this.settlement.getCommonBase(bodyId);
-			if (base.kind !== "available") {
+			const base = input.baseContent !== undefined
+				? null
+				: await this.settlement.getCommonBase(bodyId);
+			if (base !== null && base.kind !== "available") {
+				if (input.onMissingBase === "preserve-disk") {
+					return this.preserveDiskThenProjectBody(bodyId, path, diskContent, content, isCurrent);
+				}
 				this.settlement.markDivergence?.(bodyId, "preserved");
 				this.recordPreservedUnresolved(path, "body-settlement-failed");
 				return "preserved-unresolved";
 			}
 			let merge: ThreeWayMergeResult;
 			let composeMerged = (merged: string): string => merged;
-			if (base.settlement.format === 2 && base.settlement.agreement === "body-only") {
+			if (base === null) {
+				merge = mergeThreeWayText(canonicalizeMarkdown(input.baseContent ?? ""), diskContent, content);
+			} else if (base.settlement.format === 2 && base.settlement.agreement === "body-only") {
 				const diskComponents = splitMarkdownComponents(diskContent);
 				const remoteComponents = splitMarkdownComponents(content);
 				if (diskComponents.kind === "ambiguous" || remoteComponents.kind === "ambiguous") {
@@ -873,6 +973,13 @@ export class DiskMirror {
 				return "preserved-unresolved";
 			}
 			if (merge.kind === "conflict") {
+				const overlapKey = remoteHash;
+				if (this.preservedOverlaps.get(path) === overlapKey || this.openReviews.has(path)) {
+					// Already preserved and offered for review: nothing new to decide.
+					this.settlement.markDivergence?.(bodyId, "decision-required");
+					this.recordPreservedUnresolved(path, "body-settlement-failed");
+					return "preserved-unresolved";
+				}
 				try {
 					await createMarkdownConflictArtifact(this.app, path, content, {
 						deviceName: this.getDeviceName(),
@@ -884,16 +991,23 @@ export class DiskMirror {
 					this.recordPreservedUnresolved(path, "conflict-artifact-write-failed");
 					return "preserved-unresolved";
 				}
+				this.preservedOverlaps.set(path, overlapKey);
 				this.settlement.markDivergence?.(bodyId, "decision-required");
 				this.recordPreservedUnresolved(path, "body-settlement-failed");
-				const reviewed = this.settlement.reviewConflict
-					? await this.settlement.reviewConflict({ path, conflict: merge, stillCurrent: isCurrent })
-					: null;
+				let reviewed: string | null = null;
+				if (this.settlement.reviewConflict) {
+					this.openReviews.add(path);
+					try {
+						reviewed = await this.settlement.reviewConflict({ path, conflict: merge, stillCurrent: isCurrent });
+					} finally {
+						this.openReviews.delete(path);
+					}
+				}
 				if (reviewed === null || !isCurrent()) return "preserved-unresolved";
 				const reviewedContent = composeMerged(reviewed);
 				if (reviewedContent === content) {
 					const written = await this.writeSettledBody(path, diskContent, content, isCurrent);
-					if (!written) return "preserved-unresolved";
+					if (written !== "written") return written === "moved" ? "replan" : "preserved-unresolved";
 					this.settlement.markDivergence?.(bodyId, "none");
 					this.clearPreservedUnresolved(path);
 					return "settled";
@@ -909,11 +1023,12 @@ export class DiskMirror {
 			const mergedContent = composeMerged(merge.content);
 			if (mergedContent === content) {
 				const written = await this.writeSettledBody(path, diskContent, content, isCurrent);
-				if (!written) return "preserved-unresolved";
+				if (written !== "written") return written === "moved" ? "replan" : "preserved-unresolved";
 				this.settlement.markDivergence?.(bodyId, "none");
 				this.clearPreservedUnresolved(path);
 				return "settled";
 			}
+			if (this.diskIngestBlocked(bodyId, path, content, mergedContent)) return "preserved-unresolved";
 			const committed = await this.settlement.commitMergedBody({
 				bodyId,
 				path,
@@ -936,15 +1051,15 @@ export class DiskMirror {
 
 		if (decision.kind === "apply-remote-to-disk") {
 			const written = await this.writeSettledBody(path, diskContent, content, isCurrent);
-			if (!written) return "preserved-unresolved";
+			if (written !== "written") return written === "moved" ? "replan" : "preserved-unresolved";
 			this.clearPreservedUnresolved(path);
 			return "settled";
 		}
 		if (decision.kind === "import-disk-to-crdt") {
-			return this.commitDiskWinner(bodyId, path, diskContent, "external-edit", diskHash);
+			return this.commitDiskWinner(bodyId, path, diskContent, "external-edit", diskHash, content);
 		}
 		if (decision.kind === "no-op") {
-			this._onDiskWriteCallback?.(path, remoteHash);
+			this._onDiskWriteCallback?.(path, remoteHash, content);
 			this.clearPreservedUnresolved(path);
 			return "settled";
 		}
@@ -965,12 +1080,74 @@ export class DiskMirror {
 		}
 
 		if (decision.winner === "disk") {
-			return this.commitDiskWinner(bodyId, path, diskContent, "external-edit", diskHash);
+			return this.commitDiskWinner(bodyId, path, diskContent, "external-edit", diskHash, content);
 		}
 		const written = await this.writeSettledBody(path, diskContent, content, isCurrent);
-		if (!written) return "preserved-unresolved";
+		if (written !== "written") return written === "moved" ? "replan" : "preserved-unresolved";
 		this.clearPreservedUnresolved(path);
 		return "settled";
+	}
+
+	/**
+	 * Both sides moved and no common base exists: preserve disk (the local
+	 * input) as a conflict artifact first, then project the body. The body is
+	 * the durable state other devices already hold; importing disk over it
+	 * would revert committed remote work. Never runs if preservation fails.
+	 */
+	private async preserveDiskThenProjectBody(
+		bodyId: string,
+		path: string,
+		diskContent: string,
+		content: string,
+		isCurrent: () => boolean,
+	): Promise<"settled" | "replan" | "preserved-unresolved"> {
+		try {
+			await createMarkdownConflictArtifact(this.app, path, diskContent, {
+				deviceName: this.getDeviceName(),
+				reason: "closed-file-both-changed-no-common-base",
+				source: "disk",
+				trace: (message, details) => this.trace?.("conflict", message, details),
+			});
+		} catch {
+			this.settlement?.markDivergence?.(bodyId, "preserved");
+			this.recordPreservedUnresolved(path, "conflict-artifact-write-failed");
+			return "preserved-unresolved";
+		}
+		const written = await this.writeSettledBody(path, diskContent, content, isCurrent);
+		if (written !== "written") return written === "moved" ? "replan" : "preserved-unresolved";
+		this.settlement?.markDivergence?.(bodyId, "none");
+		this.clearPreservedUnresolved(path);
+		return "settled";
+	}
+
+	/** Frontmatter ingest guard before committing disk-derived content. */
+	private diskIngestBlocked(bodyId: string, path: string, current: string, next: string): boolean {
+		if (current === next || !this.settlement?.shouldBlockDiskIngest?.(path, current, next)) return false;
+		this.log(`settle: frontmatter guard blocked disk-derived content for "${path}"; body and disk left as they are`);
+		this.settlement.markDivergence?.(bodyId, "preserved");
+		this.recordPreservedUnresolved(path, "body-settlement-failed");
+		return true;
+	}
+
+	/**
+	 * The stored whole-content common base of a body, only when it is exactly
+	 * the content named by `expectedHash` (the disk-index baseline).
+	 */
+	async readCommonBaseContent(bodyId: string, expectedHash: string): Promise<string | null> {
+		if (!this.settlement?.getCommonBase) return null;
+		const base = await this.settlement.getCommonBase(bodyId);
+		if (base.kind !== "available") return null;
+		if (base.settlement.format === 2 && base.settlement.agreement !== "whole") return null;
+		return base.settlement.contentHash === expectedHash ? base.settlement.content : null;
+	}
+
+	/** The stored whole-content common base of a body, whatever its hash. */
+	async readWholeCommonBase(bodyId: string): Promise<{ content: string; hash: string } | null> {
+		if (!this.settlement?.getCommonBase) return null;
+		const base = await this.settlement.getCommonBase(bodyId);
+		if (base.kind !== "available") return null;
+		if (base.settlement.format === 2 && base.settlement.agreement !== "whole") return null;
+		return { content: base.settlement.content, hash: base.settlement.contentHash };
 	}
 
 	async readCanonicalDiskEvidence(path: string): Promise<{
@@ -988,20 +1165,41 @@ export class DiskMirror {
 		};
 	}
 
+	/**
+	 * Disk wins over the body the decision was planned against
+	 * (`plannedBodyContent`). The import is conditional on the body still
+	 * holding exactly that content: a remote update that reached the body
+	 * after the plan must not be diffed away (P0c N2). "replan" then.
+	 */
 	private async commitDiskWinner(
 		bodyId: string,
 		path: string,
 		content: string,
 		reason: "external-edit" | "delete-revive",
 		contentHash: string,
-	): Promise<"settled" | "preserved-unresolved"> {
+		plannedBodyContent?: string,
+	): Promise<"settled" | "replan" | "preserved-unresolved"> {
 		if (!this.settlement) {
 			this.recordPreservedUnresolved(path, "body-settlement-failed");
 			return "preserved-unresolved";
 		}
+		if (plannedBodyContent !== undefined && this.diskIngestBlocked(bodyId, path, plannedBodyContent, content)) {
+			return "preserved-unresolved";
+		}
 		try {
-			await this.settlement.commitLocalBody({ bodyId, path, content, reason });
-			this._onDiskWriteCallback?.(path, contentHash);
+			const outcome = await this.settlement.commitLocalBody({
+				bodyId,
+				path,
+				content,
+				reason,
+				...(plannedBodyContent !== undefined ? { expectedBodyContent: plannedBodyContent } : {}),
+			});
+			if (outcome === "superseded") {
+				this.log(`settle: body of "${path}" moved after the disk-import decision; re-planning`);
+				return "replan";
+			}
+			this.expectedDiskHashes.delete(path);
+			this._onDiskWriteCallback?.(path, contentHash, content);
 			this.clearPreservedUnresolved(path);
 			return "settled";
 		} catch {
@@ -1015,7 +1213,7 @@ export class DiskMirror {
 		previousContent: string | null,
 		content: string,
 		isCurrent: () => boolean,
-	): Promise<boolean> {
+	): Promise<"written" | "moved" | "failed"> {
 		content = canonicalizeMarkdown(content);
 		previousContent = previousContent === null ? null : canonicalizeMarkdown(previousContent);
 		let partial = false;
@@ -1023,30 +1221,76 @@ export class DiskMirror {
 			const bodyOnly = this.frontmatterBodyOnlyWrite(previousContent ?? "", content);
 			if (bodyOnly === null) {
 				this.recordPreservedUnresolved(path, "body-settlement-failed");
-				return false;
+				return "failed";
 			}
 			content = bodyOnly;
 			partial = true;
 		}
 		try {
-			if (!isCurrent()) return false;
+			if (!isCurrent()) return "failed";
 			const existing = this.app.vault.getAbstractFileByPath(path);
+			if (existing instanceof TFile && previousContent === null) return "moved";
+			if (!(existing instanceof TFile) && previousContent !== null) return "moved";
 			await this.suppressWrite(path, content, existing instanceof TFile ? 1 : 2);
-			if (!isCurrent()) return false;
+			if (!isCurrent()) return "failed";
 			if (existing instanceof TFile) {
-				await this.app.vault.modify(existing, content);
+				const outcome = await this.compareAndModify(existing, previousContent ?? "", content);
+				if (outcome === "moved") {
+					this.suppressedPaths.delete(path);
+					this.log(`settle: disk at "${path}" changed before the write; not overwriting`);
+					return "moved";
+				}
 			} else {
 				await this.ensureParentFolder(path);
 				await this.app.vault.create(path, content);
 			}
 			this.lastDiskWriteOkAt.set(path, Date.now());
+			this.expectedDiskHashes.delete(path);
 			if (partial) await this.recordPartialDiskWrite(path, content);
-			else this._onDiskWriteCallback?.(path, await contentBaselineHash(content));
-			return true;
+			else this._onDiskWriteCallback?.(path, await contentBaselineHash(content), content);
+			return "written";
 		} catch {
 			this.recordPreservedUnresolved(path, "body-settlement-failed");
-			return false;
+			return "failed";
 		}
+	}
+
+	/**
+	 * Compare-and-swap disk write: replace the file only if it still holds
+	 * `expected` (canonical). Uses Obsidian's atomic `vault.process` where the
+	 * host provides it; otherwise re-reads immediately before `modify`, which
+	 * narrows the window to the host's own write latency.
+	 */
+	private async compareAndModify(file: TFile, expected: string, next: string): Promise<"written" | "moved"> {
+		const vault = this.app.vault as App["vault"] & {
+			process?: (file: TFile, fn: (data: string) => string) => Promise<string>;
+		};
+		if (typeof vault.process === "function") {
+			let moved = false;
+			try {
+				await vault.process(file, (data) => {
+					if (canonicalizeMarkdown(data) !== expected) {
+						moved = true;
+						throw new DiskMovedBeforeWriteError();
+					}
+					return next;
+				});
+			} catch (error) {
+				if (moved || error instanceof DiskMovedBeforeWriteError) return "moved";
+				throw error;
+			}
+			return "written";
+		}
+		const current = canonicalizeMarkdown(await this.app.vault.read(file));
+		if (current !== expected) return "moved";
+		await this.app.vault.modify(file, next);
+		return "written";
+	}
+
+	private handDiskMovedBack(path: string, reason: string): void {
+		this.log(`flushWrite: disk at "${path}" moved before the write (${reason}); not overwriting`);
+		this.trace?.("disk", "planned-write-disk-moved", { path, reason });
+		this._onDiskMovedBeforeWrite?.(path);
 	}
 
 	private async ensureParentFolder(path: string): Promise<void> {
@@ -1110,6 +1354,7 @@ export class DiskMirror {
 
 		try {
 			const existing = this.app.vault.getAbstractFileByPath(normalized);
+			const expectedDiskHash = this.expectedDiskHashes.get(normalized);
 			if (existing instanceof TFile) {
 				const currentContent = canonicalizeMarkdown(await this.app.vault.read(existing));
 				let writeContent = content;
@@ -1118,7 +1363,17 @@ export class DiskMirror {
 					this.queueImmediateWrite(path, "superseded-disk-proof", force);
 					return;
 				}
+				if (
+					expectedDiskHash !== undefined && currentContent !== content
+					&& await contentBaselineHash(currentContent) !== expectedDiskHash
+				) {
+					// Kept until a new plan replaces it: any other flush of this
+					// path must not overwrite the moved disk either.
+					this.handDiskMovedBack(normalized, "expected-disk-hash");
+					return;
+				}
 				if (currentContent === content) {
+					this.expectedDiskHashes.delete(normalized);
 					this.log(`flushWrite: "${path}" unchanged, skipping`);
 					return;
 				}
@@ -1134,11 +1389,16 @@ export class DiskMirror {
 					this.queueImmediateWrite(path, "superseded-before-modify", force);
 					return;
 				}
-				await this.app.vault.modify(existing, writeContent);
+				if (await this.compareAndModify(existing, currentContent, writeContent) === "moved") {
+					this.suppressedPaths.delete(normalized);
+					this.handDiskMovedBack(normalized, "compare-and-swap");
+					return;
+				}
+				this.expectedDiskHashes.delete(normalized);
 				this.log(`flushWrite: updated "${path}" (${writeContent.length} chars)`);
 				this.lastDiskWriteOkAt.set(normalized, Date.now());
 				if (partial) await this.recordPartialDiskWrite(normalized, writeContent);
-				else this._onDiskWriteCallback?.(normalized, await contentBaselineHash(writeContent));
+				else this._onDiskWriteCallback?.(normalized, await contentBaselineHash(writeContent), writeContent);
 				this._flightEventHandler?.({
 					priority: "important",
 					kind: "disk.write.ok",
@@ -1150,6 +1410,12 @@ export class DiskMirror {
 					data: { contentLength: writeContent.length, isCreate: false, partialFrontmatter: partial },
 				});
 			} else {
+				if (expectedDiskHash !== undefined) {
+					// Planned against a file that existed; it is gone now (a
+					// local delete or rename). Recreating it would undo that.
+					this.handDiskMovedBack(normalized, "file-removed");
+					return;
+				}
 				let writeContent = content;
 				let partial = false;
 				if (this.shouldBlockFrontmatterWrite(path, null, content)) {
@@ -1177,7 +1443,7 @@ export class DiskMirror {
 				);
 				this.lastDiskWriteOkAt.set(normalized, Date.now());
 				if (partial) await this.recordPartialDiskWrite(normalized, writeContent);
-				else this._onDiskWriteCallback?.(normalized, await contentBaselineHash(writeContent));
+				else this._onDiskWriteCallback?.(normalized, await contentBaselineHash(writeContent), writeContent);
 				this._flightEventHandler?.({
 					priority: "important",
 					kind: "disk.write.ok",

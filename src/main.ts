@@ -74,12 +74,16 @@ import {
 import { createSocketTicketCache } from "./sync/socketTicket";
 import { BodySettlementRepository } from "./sync/bodySettlement";
 import { reviewThreeWayConflict } from "./ui/ThreeWayConflictModal";
+import { BindDivergencePolicy, type BindDivergenceBaseline } from "./sync/bindDivergencePolicy";
 import {
 	type DiskIndex,
+	adoptUnscopedBaselines,
+	contentBaselineHash,
 	currentContentHash,
+	discardContentBaselines,
+	isBaselineTrusted,
 	moveIndexEntries,
 	readDiskIndex,
-	setCurrentContentHash,
 	setPartialContentHashes,
 	waitForDiskQuiet,
 } from "./sync/diskIndex";
@@ -151,7 +155,7 @@ import { installTelemetryRuntime, type TelemetryRuntimeHandle } from "./telemetr
 import { setupFlightTraceBestEffort } from "./telemetry/debug/flightTraceController";
 import type { SyncReadPort, TelemetryRuntimeHost } from "./telemetry/telemetryRuntimeHost";
 import type { EngineControlPort, DiskIngestPort } from "./runtime/engineControlPort";
-import type { BindingPropagationGate } from "./sync/editorBinding";
+import type { BindDivergenceDecision, BindingPropagationGate } from "./sync/editorBinding";
 import { leafIdentity } from "./host/obsidianHostAdapter";
 import {
 	YaosPublicApiService,
@@ -190,6 +194,12 @@ type PersistedPluginState = Partial<VaultSyncSettings> & {
 	 * See: src/sync/closedFileConflict.ts ClosedFileConflictInput.lastDiskIndexPersistedAt
 	 */
 	_lastDiskIndexPersistedAt?: number;
+	/**
+	 * Local-state identity (IndexedDB incarnation) the persisted disk-index
+	 * baselines were written under. On mismatch every baseline is discarded:
+	 * it may name content that was never committed through the current state.
+	 */
+	_diskIndexScope?: string;
 	_blobQueue?: BlobQueueSnapshot;
 	_serverCapabilitiesCache?: PersistedServerCapabilitiesCache;
 	_updateManifestCache?: PersistedUpdateManifestCache;
@@ -319,6 +329,27 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	 * not the same thing, and conflating them creates false certainty.
 	 */
 	private lastDiskIndexPersistedAt = 0;
+	/**
+	 * Identity of the open local database; disk-index baselines are trusted
+	 * for "disk carries no local edit" proofs only when established under it.
+	 * Null until the database is open (nothing is trusted meanwhile).
+	 */
+	private diskIndexScope: string | null = null;
+	private persistedDiskIndexScope: string | null = null;
+	/** Partial (body-only) agreements recorded while the local identity was unknown. */
+	private deferredPartialBaselines = new Map<string, { bodyHash: string; propertiesHash: string }>();
+	private readonly bindDivergencePolicy = new BindDivergencePolicy({
+		getBaseline: (path) => this.bindDivergenceBaseline(path),
+		hash: (content) => contentBaselineHash(content),
+		createArtifact: (path, content, reason) => createMarkdownConflictArtifact(this.app, path, content, {
+			deviceName: this.settings.deviceName,
+			reason,
+			source: "editor",
+			trace: (message, details) => this.trace("recovery", message, details),
+		}),
+		notify: (message) => new Notice(message, 10_000),
+		log: (message) => this.log(message),
+	});
 
 	/** Persisted blob hash cache: {path -> {mtime, size, hash}}. */
 	private blobHashCache: BlobHashCache = {};
@@ -377,6 +408,12 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			saveDiskIndex: () => this.saveDiskIndex(),
 			refreshStatusBar: () => this.refreshStatusBar(),
 			getLastSaveDiskIndexAt: () => this.lastDiskIndexPersistedAt,
+			getBaselineScope: () => this.diskIndexScope,
+			persistCommonBase: (path, hash, content) => {
+				void this.persistCommonBaseForBaseline(path, hash, content).catch((error: unknown) => {
+					this.log(`common base for "${path}" not stored: ${formatUnknown(error)}`);
+				});
+			},
 			trace: (source, msg, details) => this.trace(source, msg, details),
 			scheduleTraceStateSnapshot: (reason) => this.scheduleTraceStateSnapshot(reason),
 			log: (message) => this.log(message),
@@ -907,6 +944,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				folderKey,
 			);
 			this.vaultDatabase = database;
+			await this.bindDiskIndexToLocalState(database);
 			this.pendingRecoveryState = parsePendingRecoveryState(await database.getRecoveryState());
 			const bootstrapServer = new BootstrapHttpPort(
 				this.settings.host,
@@ -976,8 +1014,21 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					this.reconciliationController.markPending();
 					this.scheduleSchema4CatchUp("attachment-revision-mismatch");
 				},
-				onDurableBodyCommitted: () => this.scheduleSchema4CatchUp("body-committed"),
-				onProductEvent: (event) => this.recordFlightPathEvent(event),
+				onDurableBodyCommitted: () => {
+					this.reconciliationController.notifyLocalWorkSettled();
+					this.scheduleSchema4CatchUp("body-committed");
+				},
+				onRemoteUpdateToClosedBody: ({ path }) => {
+					this.reconciliationController.scheduleRemoteBodyMaterialization(path);
+				},
+				onProductEvent: (event) => {
+					this.recordFlightPathEvent(event);
+					// A persisted candidate receipt settles local work: agreements
+					// held back while the body was dirty may now become baselines.
+					if (event.kind === PRODUCT_EVENT_KIND.serverReceiptConfirmed) {
+						this.reconciliationController.notifyLocalWorkSettled();
+					}
+				},
 				onControlFrame: () => this.queueReceiptStatusRefresh(),
 				onSemanticEpochReset: ({ purpose, documentId }) => {
 					// Detach first: validation/rebinding is allowed to fail or retry, but
@@ -1027,6 +1078,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					principalId: this.settings.principalId,
 					colorSeed: this.settings.principalColorSeed,
 				}),
+				(input) => this.resolveEditorBindDivergence(input),
 			);
 
 			// 3. Global CM6 extension.
@@ -1070,16 +1122,35 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			this.bodySettlementRepository = bodySettlements;
 			this.diskMirror.configureSettlement({
 				getBaseline: (path) => ({
-					contentHash: currentContentHash(this.diskIndex[path]) ?? null,
+					// Include a session agreement whose persistence is held back
+					// while the body's local work settles (recordProjectedDiskWrite).
+					contentHash: this.reconciliationController.effectiveBaselineHash(path)
+						?? currentContentHash(this.diskIndex[path]) ?? null,
 					lastDiskIndexPersistedAt: this.lastDiskIndexPersistedAt,
 				}),
 				commitLocalBody: async (input) => {
+					if (input.expectedBodyContent !== undefined) {
+						// Conditional on the body the decision was planned against.
+						const outcome = await runtime.commitBodyCandidateIfCurrent({
+							bodyId: input.bodyId,
+							path: input.path,
+							expectedContent: input.expectedBodyContent,
+							content: input.content,
+							candidateId: crypto.randomUUID(),
+							reason: input.reason,
+						});
+						return outcome.kind;
+					}
 					await runtime.commitDiskBody({
-						...input,
+						bodyId: input.bodyId,
+						path: input.path,
+						content: input.content,
+						reason: input.reason,
 						...(input.reason === "delete-revive"
 							? { lifecycle: "revive" as const }
 							: {}),
 					});
+					return "completed";
 				},
 				getCommonBase: (bodyId) => bodySettlements.read(bodyId),
 				commitMergedBody: async (input) => {
@@ -1105,6 +1176,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				},
 				isPathAllowed: (path) => this.isMarkdownPathSyncable(path),
 				isBodyLive: (bodyId) => runtime.isBodyOpen(bodyId),
+				shouldBlockDiskIngest: (path, current, next) =>
+					this.shouldBlockFrontmatterIngest(path, current, next, "disk-to-crdt"),
 			});
 			this.diskMirror.setFlightEventHandler(
 				(event) => this.recordFlightPathEvent(event as FlightPathEventInput),
@@ -1120,24 +1193,31 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				},
 			);
 			this.bootstrapClient.configureSettlements(bodySettlements);
+			this.bootstrapClient.configureLiveBodyPromotion((head) => runtime.promoteLoadedBodyToHead(head));
 			if (runtime.canvases) this.bootstrapClient.configureCanvases(runtime.canvases);
 			// Track SHA-256 baseline hash after every successful flushWrite.
 			// Used by decideClosedFileConflict on startup/re-enable to determine
 			// which side actually changed from the last known stable state.
-			this.diskMirror.setDiskWriteCallback((path, contentHash) => {
-				const existing = this.diskIndex[path];
-				if (existing) {
-					setCurrentContentHash(existing, contentHash);
-				} else {
-					const entry = { mtime: 0, size: 0 };
-					setCurrentContentHash(entry, contentHash);
-					this.diskIndex[path] = entry;
-				}
+			// A projection only becomes the baseline once the body holds no local
+			// work that is not durably committed (see recordProjectedDiskWrite).
+			this.diskMirror.setDiskWriteCallback((path, contentHash, content) => {
+				this.reconciliationController.recordProjectedDiskWrite(path, contentHash, content);
 			});
 			this.diskMirror.setPartialDiskWriteCallback((path, bodyHash, propertiesHash) => {
+				this.reconciliationController.forgetSessionBaseline(path);
+				if (this.diskIndexScope === null) {
+					// Identity unknown: an unscoped write would strip the entry's
+					// scope for good. Held back until the identity is bound.
+					this.deferredPartialBaselines.set(path, { bodyHash, propertiesHash });
+					return;
+				}
+				this.deferredPartialBaselines.delete(path);
 				const entry = this.diskIndex[path] ?? { mtime: 0, size: 0 };
-				setPartialContentHashes(entry, bodyHash, propertiesHash);
+				setPartialContentHashes(entry, bodyHash, propertiesHash, this.diskIndexScope);
 				this.diskIndex[path] = entry;
+			});
+			this.diskMirror.setDiskMovedBeforeWriteHandler((path) => {
+				this.reconciliationController.handleDiskMovedBeforeWrite(path);
 			});
 
 			// 4b. BlobSyncManager (if attachment sync is enabled)
@@ -1312,6 +1392,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 				// Move disk index entries
 				moveIndexEntries(this.diskIndex, renames);
+				this.reconciliationController.moveSessionBaselines(renames);
+				this.diskMirror?.forgetPathPlans([...renames.keys(), ...renames.values()]);
 
 				// Move blob hash cache entries
 				moveCachedHashes(this.blobHashCache, renames);
@@ -1422,6 +1504,140 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				message: formatUnknown(err),
 			});
 			this.refreshStatusBar();
+		}
+	}
+
+	/** See BindDivergencePolicy (src/sync/bindDivergencePolicy.ts). */
+	private resolveEditorBindDivergence(input: {
+		path: string;
+		editorContent: string;
+		bodyContent: string;
+	}): Promise<BindDivergenceDecision> {
+		return this.bindDivergencePolicy.resolve(input);
+	}
+
+	private async bindDivergenceBaseline(path: string): Promise<BindDivergenceBaseline> {
+		// A session agreement, or a whole-content baseline established under
+		// the current local identity.
+		const hash = this.reconciliationController.effectiveBaselineHash(path);
+		if (hash !== undefined) {
+			const content = await this.reconciliationController.lookupBaselineContent(
+				path,
+				this.vaultSync?.getFileId(path) ?? null,
+				hash,
+			);
+			return { kind: "whole", hash, content };
+		}
+		const entry = this.diskIndex[path];
+		if (!entry) return { kind: "unknown", reason: "missing" };
+		if (!isBaselineTrusted(entry, this.diskIndexScope)) return { kind: "unknown", reason: "untrusted" };
+		if (entry.settlementKind === "body-only" && entry.bodyContentHash && entry.propertiesContentHash) {
+			return { kind: "body-only", bodyHash: entry.bodyContentHash, propertiesHash: entry.propertiesContentHash };
+		}
+		// A hash under an older canonical-Markdown version is dropped on load.
+		return { kind: "unknown", reason: entry.contentHash !== undefined ? "canonical-version" : "missing" };
+	}
+
+	/**
+	 * Bind persisted disk-index baselines to the local database incarnation
+	 * (itself scoped to vault ID + generation + folder). data.json outlives
+	 * IndexedDB loss, reset and re-enrollment; a baseline written under
+	 * another incarnation may name edits that were never committed through
+	 * this one, and would otherwise make disk look "unchanged" so that the
+	 * body overwrites the only copy of an offline edit. Legacy entries
+	 * without a scope stay, but prove nothing until re-established.
+	 */
+	private async bindDiskIndexToLocalState(database: VaultIndexedDb): Promise<void> {
+		let scope: string;
+		let origin: { created: boolean; priorState: boolean };
+		try {
+			const result = await database.getOrCreateLocalIdentityWithOrigin();
+			scope = result.identity;
+			origin = result;
+		} catch (error) {
+			this.diskIndexScope = null;
+			this.log(`disk-index baselines untrusted: local identity unavailable (${formatUnknown(error)})`);
+			return;
+		}
+		if (this.persistedDiskIndexScope !== null && this.persistedDiskIndexScope !== scope) {
+			// Real mismatch: the index was bound to another incarnation.
+			const discarded = discardContentBaselines(this.diskIndex);
+			this.log(`disk-index baselines discarded (${discarded}): written under another local state`);
+		} else if (this.persistedDiskIndexScope === null && origin.created) {
+			if (origin.priorState) {
+				// Upgrade: this database already held the vault's synced state,
+				// so legacy baselines were written alongside it.
+				const adopted = adoptUnscopedBaselines(this.diskIndex, scope);
+				this.log(`disk-index baselines adopted into the local identity (${adopted})`);
+			} else {
+				// A new or emptied database: legacy baselines may name content
+				// that was never committed through it.
+				const discarded = discardContentBaselines(this.diskIndex);
+				this.log(`disk-index baselines discarded (${discarded}): local state is new`);
+			}
+		}
+		this.diskIndexScope = scope;
+		this.applyDeferredPartialBaselines();
+		// Agreements held back while the identity was unknown can persist now.
+		this.reconciliationController.notifyLocalWorkSettled();
+		if (this.persistedDiskIndexScope !== scope) {
+			this.persistedDiskIndexScope = scope;
+			await this.persistPluginState();
+		}
+	}
+
+	private applyDeferredPartialBaselines(): void {
+		const scope = this.diskIndexScope;
+		if (scope === null) return;
+		for (const [path, hashes] of this.deferredPartialBaselines) {
+			const entry = this.diskIndex[path] ?? { mtime: 0, size: 0 };
+			setPartialContentHashes(entry, hashes.bodyHash, hashes.propertiesHash, scope);
+			this.diskIndex[path] = entry;
+		}
+		this.deferredPartialBaselines.clear();
+	}
+
+	/**
+	 * Store a just-persisted disk-index baseline as the body's common base
+	 * (whole agreement), so a later divergence of both sides three-way
+	 * merges on it even after a restart. Only while disk and a settled body
+	 * (no local work pending, so it is the server's state) both hold it.
+	 */
+	private async persistCommonBaseForBaseline(path: string, hash: string, content: string): Promise<void> {
+		const runtime = this.vaultSync;
+		const repository = this.bodySettlementRepository;
+		const diskMirror = this.diskMirror;
+		if (!runtime || !repository || !diskMirror) return;
+		const bodyId = runtime.getFileId(path);
+		const body = bodyId ? runtime.bodies.get(bodyId) : null;
+		if (!bodyId || !body || body.dirty || body.unsettled > 0 || body.pendingLocalUpdates > 0) return;
+		if (runtime.getTextForPath(path)?.toJSON() !== content) return;
+		const lease = runtime.bodies.acquireLease(bodyId);
+		try {
+			const proof = runtime.bodies.captureRevision(bodyId);
+			const current = await repository.read(bodyId);
+			if (current.kind === "available") {
+				if (current.settlement.contentHash === hash && current.settlement.durableGeneration >= body.generation) return;
+				if (current.settlement.durableGeneration > body.generation) return;
+			}
+			const disk = await diskMirror.readCanonicalDiskEvidence(path);
+			if (!disk || disk.content !== content) return;
+			if (!runtime.bodies.coordinator.isProjectionCurrent(proof, path)) return;
+			await repository.settleComponents({
+				bodyId,
+				serverContent: content,
+				diskContent: disk.content,
+				durableGeneration: body.generation,
+				serverContentHash: hash,
+				diskFingerprint: disk.fingerprint,
+				pathAtSettlement: path,
+				expectedLocalSettlementRevision: current.kind === "available"
+					? current.settlement.localSettlementRevision
+					: null,
+				settledAt: Date.now(),
+			});
+		} finally {
+			lease.release();
 		}
 	}
 
@@ -1767,6 +1983,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						path: file.path,
 					});
 					this.editorWorkspace?.onMarkdownDeleted(file.path);
+					this.diskMirror?.forgetPathPlans([file.path]);
 
 					this.vaultSync?.handleDelete(
 						file.path,
@@ -1869,7 +2086,12 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			},
 			{
 				name: "disk-index-persistence",
-				run: () => this.saveDiskIndex(),
+				run: () => {
+					// Agreements held back behind local work that has settled by now
+					// must reach the persisted index, or the next start sees no baseline.
+					this.reconciliationController.notifyLocalWorkSettled();
+					return this.saveDiskIndex();
+				},
 			},
 			{
 				name: "editor-bindings",
@@ -1922,6 +2144,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					this.diskMirror = null;
 					this.canvasProjection = null;
 					this.vaultDatabase = null;
+					// Baselines prove nothing until the next database identity is known.
+					this.diskIndexScope = null;
 					this.bootstrapClient = null;
 					this.bodySettlementRepository = null;
 					this.bootstrapProgress = null;
@@ -2895,6 +3119,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		if (data && typeof data._lastDiskIndexPersistedAt === "number" && data._lastDiskIndexPersistedAt > 0) {
 			this.lastDiskIndexPersistedAt = data._lastDiskIndexPersistedAt;
 		}
+		this.persistedDiskIndexScope = typeof data?._diskIndexScope === "string" && data._diskIndexScope.length > 0
+			? data._diskIndexScope
+			: null;
 		// Load blob hash cache
 		if (data && typeof data._blobHashCache === "object" && data._blobHashCache !== null) {
 			this.blobHashCache = data._blobHashCache;
@@ -3555,6 +3782,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			_diskIndex: this.diskIndex,
 			_blobHashCache: this.blobHashCache,
 			...(this.lastDiskIndexPersistedAt > 0 && { _lastDiskIndexPersistedAt: this.lastDiskIndexPersistedAt }),
+			...(this.persistedDiskIndexScope !== null && { _diskIndexScope: this.persistedDiskIndexScope }),
 		};
 		const cachedCapabilities = this.capabilityUpdateService?.getPersistedServerCapabilitiesCache();
 		if (cachedCapabilities) {

@@ -63,6 +63,33 @@ function editsFromBase(base: string, changed: string): SideEdit[] {
 		}
 	}
 	flush();
+	return slideInsertionsRight(base, edits);
+}
+
+/**
+ * A pure insertion has several equivalent positions when the text around it
+ * repeats (inserting "b\n" before or after an existing "b\n"). The diff picks
+ * one arbitrarily, so the same insertion made on both sides could land at
+ * different offsets and be applied twice. Slide each pure insertion to its
+ * rightmost equivalent position (never into the side's next edit), so equal
+ * insertions compare equal.
+ */
+function slideInsertionsRight(base: string, edits: SideEdit[]): SideEdit[] {
+	for (let index = 0; index < edits.length; index++) {
+		const edit = edits[index]!;
+		if (edit.start !== edit.end || edit.replacement.length === 0) continue;
+		const next = edits[index + 1];
+		// Two insertions at one offset would lose their order; stop before.
+		const limit = next === undefined
+			? base.length
+			: next.start === next.end ? next.start - 1 : next.start;
+		let { start, replacement } = edit;
+		while (start < limit && base[start] === replacement[0]) {
+			replacement = replacement.slice(1) + base[start];
+			start++;
+		}
+		edits[index] = { start, end: start, replacement };
+	}
 	return edits;
 }
 

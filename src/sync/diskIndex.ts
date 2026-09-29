@@ -79,6 +79,16 @@ export interface DiskIndexEntry {
 	settlementKind?: "whole" | "body-only";
 	bodyContentHash?: string;
 	propertiesContentHash?: string;
+	/**
+	 * Identity of the local state (IndexedDB incarnation, which is itself
+	 * scoped to vault ID + vault generation + folder) under which this
+	 * baseline was established. The disk index lives in data.json and
+	 * survives IndexedDB loss, reset, or re-enrollment into another vault; a
+	 * baseline from another incarnation may describe content that was never
+	 * durably committed there and must not prove "disk carries no local edit".
+	 * Absent on legacy entries: such a baseline is untrusted for that proof.
+	 */
+	baselineScope?: string;
 }
 
 export type DiskIndex = Record<string, DiskIndexEntry>;
@@ -90,24 +100,86 @@ export function currentContentHash(entry: DiskIndexEntry | undefined): string | 
 		: undefined;
 }
 
-export function setCurrentContentHash(entry: DiskIndexEntry, contentHash: string): void {
+export function setCurrentContentHash(entry: DiskIndexEntry, contentHash: string, baselineScope?: string): void {
 	entry.contentHash = contentHash;
 	entry.contentHashVersion = MARKDOWN_CANONICAL_VERSION;
 	entry.settlementKind = "whole";
 	delete entry.bodyContentHash;
 	delete entry.propertiesContentHash;
+	if (baselineScope) entry.baselineScope = baselineScope;
+	else delete entry.baselineScope;
 }
 
 export function setPartialContentHashes(
 	entry: DiskIndexEntry,
 	bodyContentHash: string,
 	propertiesContentHash: string,
+	baselineScope?: string,
 ): void {
 	delete entry.contentHash;
 	delete entry.contentHashVersion;
 	entry.settlementKind = "body-only";
 	entry.bodyContentHash = bodyContentHash;
 	entry.propertiesContentHash = propertiesContentHash;
+	if (baselineScope) entry.baselineScope = baselineScope;
+	else delete entry.baselineScope;
+}
+
+/**
+ * Whether a baseline may prove anything about the current local state.
+ * `scope === undefined` means the host does not scope baselines (the CLI
+ * persists its index inside its own database, gated on no pending work);
+ * `null` means the local identity is not known yet, so nothing is trusted.
+ */
+export function isBaselineTrusted(entry: DiskIndexEntry | undefined, scope: string | null | undefined): boolean {
+	if (!entry) return false;
+	if (scope === undefined) return true;
+	return scope !== null && entry.baselineScope === scope;
+}
+
+/** `currentContentHash`, restricted to baselines established under `scope`. */
+export function trustedContentHash(
+	entry: DiskIndexEntry | undefined,
+	scope: string | null | undefined,
+): string | undefined {
+	return isBaselineTrusted(entry, scope) ? currentContentHash(entry) : undefined;
+}
+
+/**
+ * Drop every content baseline (keeping stats, which only admit scans). Used
+ * when the persisted index is known to belong to another local incarnation:
+ * its hashes may name content that was never committed here.
+ */
+export function discardContentBaselines(index: DiskIndex): number {
+	let discarded = 0;
+	for (const entry of Object.values(index)) {
+		if (entry.contentHash === undefined && entry.bodyContentHash === undefined) continue;
+		delete entry.contentHash;
+		delete entry.contentHashVersion;
+		delete entry.settlementKind;
+		delete entry.bodyContentHash;
+		delete entry.propertiesContentHash;
+		delete entry.baselineScope;
+		discarded++;
+	}
+	return discarded;
+}
+
+/**
+ * Bind legacy (unscoped) baselines to `scope`. Only for the incarnation
+ * they were written under: a database that already held this vault's
+ * synced state when its identity was first created (the upgrade path).
+ * Entries scoped to another incarnation are left untrusted.
+ */
+export function adoptUnscopedBaselines(index: DiskIndex, scope: string): number {
+	let adopted = 0;
+	for (const entry of Object.values(index)) {
+		if (entry.baselineScope !== undefined) continue;
+		if (entry.contentHash === undefined && entry.bodyContentHash === undefined) continue;
+		entry.baselineScope = scope;
+		adopted++;
+	}
+	return adopted;
 }
 
 /**
@@ -139,6 +211,12 @@ export function readDiskIndex(value: unknown): DiskIndex {
 			&& typeof entry.propertiesContentHash === "string" && /^[a-f0-9]{64}$/.test(entry.propertiesContentHash)
 		) {
 			setPartialContentHashes(parsed, entry.bodyContentHash, entry.propertiesContentHash);
+		}
+		if (
+			typeof entry.baselineScope === "string" && entry.baselineScope.length > 0
+			&& (parsed.contentHash !== undefined || parsed.bodyContentHash !== undefined)
+		) {
+			parsed.baselineScope = entry.baselineScope;
 		}
 		result[path] = parsed;
 	}
@@ -299,10 +377,14 @@ export function updateIndex(
 				contentHash,
 				contentHashVersion: MARKDOWN_CANONICAL_VERSION,
 			}),
+			...(settledHash === undefined && contentHash !== undefined && oldEntry?.baselineScope && {
+				baselineScope: oldEntry.baselineScope,
+			}),
 			...(settledHash === undefined && oldEntry?.settlementKind === "body-only" && {
 				settlementKind: "body-only" as const,
 				bodyContentHash: oldEntry.bodyContentHash,
 				propertiesContentHash: oldEntry.propertiesContentHash,
+				...(oldEntry.baselineScope && { baselineScope: oldEntry.baselineScope }),
 			}),
 		};
 	}

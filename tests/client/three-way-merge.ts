@@ -21,6 +21,19 @@ s.test("deduplicates the same edit made by both sides", () => {
 	assert.deepEqual(result, { kind: "clean", outcome: "identical", content: "alpha BETA", edits: [] });
 });
 
+s.test("the same insertion is taken once even where the diff could place it at another offset", () => {
+	// The editor side's diff also moves a prefix, which can shift where it
+	// places the shared append by one repeated character.
+	const base = "# Note\n\nseed\n";
+	const body = `${base}remote edit\n`;
+	const editor = `local heading\n${body}`;
+	const merged = mergeThreeWayText(base, editor, body);
+	assert.equal(merged.kind, "clean");
+	assert.equal(merged.kind === "clean" ? merged.content : null, editor);
+	const repeated = mergeThreeWayText("a\nb\n", "x\na\nb\nb\n", "a\nb\nb\n");
+	assert.equal(repeated.kind === "clean" ? repeated.content : null, "x\na\nb\nb\n");
+});
+
 s.test("reports overlapping edits without inventing a winner", () => {
 	const result = mergeThreeWayText("alpha beta gamma", "alpha DISK gamma", "alpha BODY gamma");
 	assert.equal(result.kind, "conflict");

@@ -2,7 +2,7 @@ import { strict as assert } from "node:assert";
 import * as Y from "yjs";
 import { TFile } from "obsidian";
 import { ReconciliationController } from "../../src/runtime/reconciliationController";
-import type { DiskIndex } from "../../src/sync/diskIndex";
+import { contentBaselineHash, currentContentHash, setCurrentContentHash, type DiskIndex } from "../../src/sync/diskIndex";
 import {
 	VaultSync,
 	type CandidateRecord,
@@ -123,7 +123,13 @@ s.test("a loaded but closed body submits a durable candidate before advancing it
 
 	const file = new TFile();
 	file.path = path;
-	let diskIndex: DiskIndex = {};
+	// The last agreement was "before" (body == baseline): disk moved, so it
+	// is a plain local edit and imports. Without a baseline the controller
+	// would preserve both sides instead (stale-disk-never-reverts-body).
+	const beforeHash = await contentBaselineHash("before");
+	const baselineEntry = { mtime: 1, size: 6 };
+	setCurrentContentHash(baselineEntry, beforeHash);
+	let diskIndex: DiskIndex = { [path]: baselineEntry };
 	let ingest: DiskIngestPort | null = null;
 	new ReconciliationController({
 		app: {
@@ -169,7 +175,7 @@ s.test("a loaded but closed body submits a durable candidate before advancing it
 		message: "closed-body candidate was submitted",
 	});
 	assert.equal(candidates.size, 1, "candidate is persisted before submission receipt");
-	assert.equal(diskIndex[path], undefined, "disk baseline waits for the durable receipt");
+	assert.equal(currentContentHash(diskIndex[path]), beforeHash, "disk baseline waits for the durable receipt");
 	const candidate = observed.submitted;
 	if (!candidate) throw new Error("candidate submission was not observed");
 	resolveReceipt({
@@ -188,6 +194,7 @@ s.test("a loaded but closed body submits a durable candidate before advancing it
 	assert.equal(candidates.size, 0, "validated receipt clears the persisted candidate");
 	assert.equal(runtime.getPathContent(path), "after");
 	assert.equal((diskIndex as DiskIndex)[path]?.size, 5, "disk baseline advances after candidate receipt");
+	assert.equal(currentContentHash((diskIndex as DiskIndex)[path]), await contentBaselineHash("after"));
 
 	const beforeMerge = documents.get(bodyId)?.encodedState;
 	if (!beforeMerge) throw new Error("settled body state was not persisted");

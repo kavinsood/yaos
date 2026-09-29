@@ -10,7 +10,10 @@ import {
 	currentContentHash,
 	filterChangedFiles,
 	setCurrentContentHash,
+	setPartialContentHashes,
+	trustedContentHash,
 } from "../sync/diskIndex";
+import { mergeThreeWayText } from "../sync/threeWayMerge";
 import {
 	FreshAdmissionCancelledError,
 	FreshAdmissionDurablyPendingError,
@@ -126,6 +129,19 @@ interface ReconciliationControllerDeps {
 	 * plugin activity; conflating them creates false certainty.
 	 */
 	getLastSaveDiskIndexAt?(): number;
+	/**
+	 * Identity of the local state that disk-index baselines must have been
+	 * established under to prove anything (see `DiskIndexEntry.baselineScope`).
+	 * Absent: the host does not scope baselines and all are trusted (CLI).
+	 * Returning null: the identity is unknown yet, so no baseline is trusted.
+	 */
+	getBaselineScope?(): string | null;
+	/**
+	 * A disk/body agreement was just persisted as the baseline of `path`:
+	 * store its content as the body's common base, so a later divergence of
+	 * both sides can three-way merge on it after a restart (best effort).
+	 */
+	persistCommonBase?(path: string, hash: string, content: string): void;
 	trace(source: string, msg: string, details?: Record<string, unknown>): void;
 	scheduleTraceStateSnapshot(reason: string): void;
 	log(message: string): void;
@@ -160,6 +176,16 @@ const OPEN_FILE_EXTERNAL_EDIT_IDLE_GRACE_MS = 1200;
  */
 const OPEN_FILE_LOCAL_ONLY_RECOVERY_IDLE_MS = 3000;
 const BOUND_RECOVERY_LOCK_MS = 1500;
+/** Coalesces a burst of remote keystrokes into one closed-note disk write. */
+const REMOTE_BODY_MATERIALIZE_DEBOUNCE_MS = 300;
+/** Bounded re-plans of one closed-note materialization (merge commit, disk moved). */
+const REMOTE_BODY_MATERIALIZE_MAX_REPLANS = 3;
+/** Session cache of baseline contents, so a three-way merge can name its base. */
+const BASELINE_CONTENT_CACHE_MAX = 256;
+/** Loads of an unloaded body before a disk import is planned against it. */
+const SYNC_FROM_DISK_MAX_PLAN_ATTEMPTS = 2;
+/** Consecutive superseded disk imports of one path before ingest gives up. */
+const SYNC_FROM_DISK_MAX_REPLANS = 3;
 
 /**
  * Closed-shape result of the binding-health predicate. `reasons` is empty
@@ -288,6 +314,23 @@ export class ReconciliationController {
 	 */
 	private amplificationHistory = new Map<string, AmplificationEntry[]>();
 	private lastConflictFingerprints = new Map<string, string>();
+	/**
+	 * Session-only content of recent baselines (hash -> content per path),
+	 * so three-way decisions can name their base. Never persisted.
+	 */
+	private baselineContents = new Map<string, { hash: string; content: string }>();
+	/**
+	 * Agreements (disk == body) observed while the body still had local work
+	 * that was not durably committed. They are not persisted as baselines:
+	 * after IndexedDB loss the persisted index would claim disk carries no
+	 * local edit when it holds the only copy of it. They still describe the
+	 * last agreement for this session, and are persisted once the body's
+	 * local work settles (`notifyLocalWorkSettled`).
+	 */
+	private deferredBaselines = new Map<string, { hash: string; content: string }>();
+	/** Merges this controller committed for a closed note, awaiting projection to disk. */
+	private closedMerges = new Map<string, { disk: string; merged: string }>();
+	private materializeReplans = new Map<string, number>();
 	private blockedDivergenceCount = 0;
 	private lastBlockedDivergenceAt: string | null = null;
 	private blockedDivergenceSample: Array<{ ext: string; hash: string }> = [];
@@ -386,6 +429,12 @@ export class ReconciliationController {
 		this.recoveryFingerprints.clear();
 		this.amplificationHistory.clear();
 		this.lastConflictFingerprints.clear();
+		this.baselineContents.clear();
+		this.deferredBaselines.clear();
+		this.closedMerges.clear();
+		this.materializeReplans.clear();
+		for (const timer of this.remoteMaterializeTimers.values()) window.clearTimeout(timer);
+		this.remoteMaterializeTimers.clear();
 		this.blockedDivergenceCount = 0;
 		this.lastBlockedDivergenceAt = null;
 		this.blockedDivergenceSample = [];
@@ -489,6 +538,7 @@ export class ReconciliationController {
 	): Promise<void> {
 		const vaultSync = this.deps.getVaultSync();
 		if (!vaultSync) return;
+		this.flushDeferredBaselines();
 		const files = this.deps.app.vault.getMarkdownFiles()
 			.filter((file) => this.deps.isMarkdownPathSyncable(file.path));
 		const { changed } = await filterChangedFiles(
@@ -559,6 +609,353 @@ export class ReconciliationController {
 
 	markMarkdownDirty(file: TFile, reason: "create" | "modify", opId?: string): void {
 		this.markdownAdmission.queue({ path: file.path, reason, opId });
+	}
+
+	private remoteMaterializeTimers = new Map<string, number>();
+	/** Consecutive superseded disk-import plans per path (see requeueAfterSupersede). */
+	private ingestReplans = new Map<string, number>();
+
+	/**
+	 * A disk import found its plan superseded: queue a fresh plan, at most
+	 * SYNC_FROM_DISK_MAX_REPLANS times in a row. Beyond that the path is left
+	 * as is (a later disk change or inventory scan plans it again) instead
+	 * of re-queuing forever.
+	 */
+	private requeueAfterSupersede(file: TFile, opId: string | undefined, reason: string): void {
+		const replans = (this.ingestReplans.get(file.path) ?? 0) + 1;
+		if (replans > SYNC_FROM_DISK_MAX_REPLANS) {
+			this.ingestReplans.delete(file.path);
+			this.deps.log(
+				`syncFileFromDisk: giving up on "${file.path}" after ${replans - 1} superseded plans (${reason}); ` +
+				`leaving it to the next disk change or scan`,
+			);
+			return;
+		}
+		this.ingestReplans.set(file.path, replans);
+		this.deps.log(`syncFileFromDisk: ${reason} for "${file.path}"; replanning (${replans}/${SYNC_FROM_DISK_MAX_REPLANS})`);
+		this.markMarkdownDirty(file, "modify", opId);
+	}
+
+	/**
+	 * Project a remote change that reached the live body of a closed note to
+	 * disk. Only disk still at its settled baseline is overwritten; disk that
+	 * moved since is local input and goes through normal ingest; with no
+	 * baseline nothing is decided here (reconciliation owns that case).
+	 */
+	scheduleRemoteBodyMaterialization(path: string): void {
+		const existing = this.remoteMaterializeTimers.get(path);
+		if (existing !== undefined) window.clearTimeout(existing);
+		this.remoteMaterializeTimers.set(path, window.setTimeout(() => {
+			this.remoteMaterializeTimers.delete(path);
+			void this.materializeRemoteBodyUpdate(path).catch((error: unknown) => {
+				this.deps.log(`remote body materialization failed for "${path}": ${String(error)}`);
+			});
+		}, REMOTE_BODY_MATERIALIZE_DEBOUNCE_MS));
+	}
+
+	/**
+	 * Closed-file divergence table (docs/sync-contract.md), with baseline B,
+	 * disk D, body C:
+	 *   D == C           nothing to do;
+	 *   D == B, C != B   write the body to disk, conditional on D still on disk;
+	 *   D != B, C == B   import disk (normal ingest);
+	 *   D != B, C != B   three-way merge on B; overlap or no base: preserve both.
+	 * With no trustworthy baseline nothing is decided here.
+	 */
+	private async materializeRemoteBodyUpdate(path: string): Promise<void> {
+		if (!this.deps.isMarkdownPathSyncable(path)) return;
+		const file = this.deps.app.vault.getAbstractFileByPath(path);
+		if (!(file instanceof TFile)) return;
+		// An open note's editor binding projects remote changes itself.
+		if (this.getOpenMarkdownViewsForPath(path).length > 0) return;
+		// Preserved-unresolved (e.g. an overlap awaiting review): nothing is
+		// projected, and no further conflict copy is made, until the user acts.
+		if (this.deps.getDiskMirror()?.isPreservedUnresolved(path)) return;
+		const vaultSync = this.deps.getVaultSync();
+		const bodyId = vaultSync?.getFileId(path) ?? null;
+		const existingText = vaultSync?.getTextForPath(path);
+		if (!vaultSync || !bodyId || !existingText) return;
+		this.flushDeferredBaselines(path);
+		let content: string;
+		try {
+			content = canonicalizeMarkdown(await this.deps.app.vault.read(file));
+		} catch (error) {
+			// Read failure is uncertainty, never permission to overwrite.
+			this.deps.log(`remote update to closed "${path}": disk unreadable (${String(error)}); not writing`);
+			return;
+		}
+		const bodyContent = existingText.toJSON();
+		if (bodyContent === content) {
+			this.materializeReplans.delete(path);
+			return;
+		}
+		if (await this.isUnchangedSinceSettlement(path, content)) {
+			this.deps.log(`remote update to closed "${path}": writing body to unchanged disk`);
+			this.deps.getDiskMirror()?.scheduleWrite(path, { expectedDiskHash: await contentBaselineHash(content) });
+			return;
+		}
+		if (!this.hasBaseline(path)) {
+			this.deps.log(`remote update to closed "${path}": disk has no trusted baseline; leaving to reconciliation`);
+			return;
+		}
+		if (await this.matchesBaseline(path, bodyContent)) {
+			// Only disk moved: it is local input for the normal ingest path.
+			this.markMarkdownDirty(file, "modify");
+			return;
+		}
+		await this.reconcileClosedDivergence(file, content, bodyContent, bodyId, "remote-materialization");
+	}
+
+	/**
+	 * Disk and a loaded, closed body both moved away from their baseline. A
+	 * two-way import here would delete the remote edit, a two-way write the
+	 * local one. Merge on the baseline instead (DiskMirror.settleBody's
+	 * common-base three-way merge); overlapping edits keep both (conflict
+	 * artifact); with no base at all, disk is preserved as an artifact before
+	 * the durable body is projected.
+	 */
+	private async reconcileClosedDivergence(
+		file: TFile,
+		diskContent: string,
+		bodyContent: string,
+		bodyId: string,
+		source: "remote-materialization" | "disk-ingest",
+	): Promise<void> {
+		const path = file.path;
+		const vaultSync = this.deps.getVaultSync();
+		const diskMirror = this.deps.getDiskMirror();
+		if (!vaultSync || !diskMirror) return;
+		const ownMerge = this.closedMerges.get(path);
+		if (ownMerge && ownMerge.disk === diskContent && ownMerge.merged === bodyContent) {
+			// The body holds our own merge of exactly this disk: only the
+			// projection is left, conditional on that disk still being there.
+			this.closedMerges.delete(path);
+			this.deps.log(`closed divergence "${path}": projecting committed merge to disk`);
+			diskMirror.scheduleWrite(path, { expectedDiskHash: await contentBaselineHash(diskContent) });
+			return;
+		}
+		this.closedMerges.delete(path);
+		const baseline = this.effectiveBaselineHash(path);
+		const baseContent = baseline === undefined ? null : await this.lookupBaselineContent(path, bodyId, baseline);
+		this.deps.log(
+			`closed divergence "${path}" (${source}): disk and body both changed since their baseline; ` +
+			`three-way settle (${baseContent === null ? "stored common base" : "known baseline"})`,
+		);
+		this.deps.recordFlightPathEvent?.({
+			priority: "important",
+			kind: PRODUCT_EVENT_KIND.recoveryDecision,
+			severity: "info",
+			scope: "file",
+			source: "reconciliationController",
+			layer: "recovery",
+			path,
+			data: {
+				reason: "closed-file-both-changed",
+				signature: computeRecoveryFingerprint("closed-file-both-changed", bodyContent, diskContent),
+				action: "three-way-settle",
+				diskLength: diskContent.length,
+				crdtLength: bodyContent.length,
+			},
+		});
+		const outcome = await diskMirror.settleBody({
+			path,
+			bodyId,
+			generation: vaultSync.bodies.get(bodyId)?.generation ?? 0,
+			content: bodyContent,
+			...(baseContent !== null ? { baseContent } : {}),
+			onMissingBase: "preserve-disk",
+		});
+		if (outcome !== "replan") {
+			this.materializeReplans.delete(path);
+			return;
+		}
+		const after = vaultSync.getTextForPath(path);
+		const afterContent = after ? yTextToString(after) : null;
+		if (afterContent !== null && afterContent !== bodyContent) {
+			this.closedMerges.set(path, { disk: diskContent, merged: afterContent });
+		}
+		const replans = (this.materializeReplans.get(path) ?? 0) + 1;
+		if (replans > REMOTE_BODY_MATERIALIZE_MAX_REPLANS) {
+			this.materializeReplans.delete(path);
+			this.deps.log(`closed divergence "${path}": still re-planning after ${replans - 1} attempts; leaving to reconciliation`);
+			return;
+		}
+		this.materializeReplans.set(path, replans);
+		this.scheduleRemoteBodyMaterialization(path);
+	}
+
+	/**
+	 * Re-plan hook for a conditional disk write that found disk changed
+	 * after it was planned (DiskMirror compare-and-swap). Nothing was written.
+	 */
+	handleDiskMovedBeforeWrite(path: string): void {
+		this.deps.log(`disk moved before a planned write to "${path}"; re-planning`);
+		this.scheduleRemoteBodyMaterialization(path);
+	}
+
+	/**
+	 * Record a body projection DiskMirror just wrote (or found already on
+	 * disk). It becomes the baseline only once the body holds no local work
+	 * that is not durably committed; until then it is a session-only
+	 * agreement (see `deferredBaselines`).
+	 */
+	recordProjectedDiskWrite(path: string, contentHash: string, content: string): void {
+		this.rememberBaselineContent(path, contentHash, content);
+		if (this.hasPendingLocalWorkForPath(path)) {
+			this.deferredBaselines.set(path, { hash: contentHash, content });
+			return;
+		}
+		this.deferredBaselines.delete(path);
+		const index = this.deps.getDiskIndex();
+		const entry = index[path] ?? { mtime: 0, size: 0 };
+		if (this.persistAgreement(entry, path, contentHash, content)) index[path] = entry;
+	}
+
+	/**
+	 * Write an agreement into a disk-index entry under the current local
+	 * identity, and store its content as the body's common base. While the
+	 * identity is not known yet (scope null) nothing is written: an unscoped
+	 * write would strip the entry's scope, leaving a baseline that is never
+	 * trusted again. The agreement is held back (session-only) and persisted
+	 * by `flushDeferredBaselines` once the identity is bound.
+	 */
+	private persistAgreement(
+		entry: import("../sync/diskIndex").DiskIndexEntry,
+		path: string,
+		hash: string,
+		content: string,
+	): boolean {
+		const scope = this.baselineScope();
+		if (scope === null) {
+			this.deferredBaselines.set(path, { hash, content });
+			return false;
+		}
+		setCurrentContentHash(entry, hash, scope);
+		this.deps.persistCommonBase?.(path, hash, content);
+		return true;
+	}
+
+	/** A partial (properties-held) write replaced any whole-content agreement. */
+	forgetSessionBaseline(path: string): void {
+		this.deferredBaselines.delete(path);
+		this.baselineContents.delete(path);
+	}
+
+	/** Keep session baselines attached to their files across renames. */
+	moveSessionBaselines(renames: ReadonlyMap<string, string>): void {
+		for (const map of [this.deferredBaselines, this.baselineContents] as Map<string, { hash: string; content: string }>[]) {
+			for (const [from, to] of renames) {
+				const value = map.get(from);
+				map.delete(from);
+				if (value) map.set(to, value);
+				else map.delete(to);
+			}
+		}
+	}
+
+	/** Local work settled somewhere: persist agreements that were held back. */
+	notifyLocalWorkSettled(): void {
+		this.flushDeferredBaselines();
+	}
+
+	/**
+	 * The baseline content named by `hash`, if this session knows it: the
+	 * latest deferred agreement, the session cache, or the body's stored
+	 * common base when that is exactly this content.
+	 */
+	async lookupBaselineContent(path: string, bodyId: string | null, hash: string): Promise<string | null> {
+		const deferred = this.deferredBaselines.get(path);
+		if (deferred?.hash === hash) return deferred.content;
+		const cached = this.baselineContents.get(path);
+		if (cached?.hash === hash) return cached.content;
+		if (!bodyId) return null;
+		try {
+			return await this.deps.getDiskMirror()?.readCommonBaseContent(bodyId, hash) ?? null;
+		} catch {
+			return null;
+		}
+	}
+
+	/**
+	 * The hash of the latest disk/body agreement this controller may rely
+	 * on: a session agreement held back from persistence, else a persisted
+	 * baseline established under the current local identity.
+	 */
+	effectiveBaselineHash(path: string): string | undefined {
+		// An unknown local identity trusts no agreement at all.
+		if (this.baselineScope() === null) return undefined;
+		return this.deferredBaselines.get(path)?.hash ?? this.trustedBaseline(path);
+	}
+
+	private baselineScope(): string | null | undefined {
+		return this.deps.getBaselineScope ? this.deps.getBaselineScope() : undefined;
+	}
+
+	private trustedBaseline(path: string): string | undefined {
+		return trustedContentHash(this.deps.getDiskIndex()[path], this.baselineScope());
+	}
+
+	private hasBaseline(path: string): boolean {
+		return this.effectiveBaselineHash(path) !== undefined;
+	}
+
+	/** Whether `content` is one of the agreements the baseline rules may use. */
+	private async matchesBaseline(path: string, content: string): Promise<boolean> {
+		if (this.baselineScope() === null) return false;
+		const deferred = this.deferredBaselines.get(path)?.hash;
+		const persisted = this.trustedBaseline(path);
+		if (deferred === undefined && persisted === undefined) return false;
+		const hash = await contentBaselineHash(content);
+		return hash === deferred || hash === persisted;
+	}
+
+	private rememberBaselineContent(path: string, hash: string, content: string): void {
+		this.baselineContents.delete(path);
+		this.baselineContents.set(path, { hash, content });
+		for (const oldest of this.baselineContents.keys()) {
+			if (this.baselineContents.size <= BASELINE_CONTENT_CACHE_MAX) break;
+			this.baselineContents.delete(oldest);
+		}
+	}
+
+	/**
+	 * Per-path form of the CLI's persistence gate: a loaded body with local
+	 * updates not yet durably committed cannot vouch for disk. A body that is
+	 * not loaded holds no in-memory work; whatever it has pending lives in the
+	 * local database, whose identity the baseline is bound to (baselineScope),
+	 * so losing that database also discards the baseline. Unknown -> pending.
+	 */
+	private hasPendingLocalWorkForPath(path: string): boolean {
+		try {
+			const vaultSync = this.deps.getVaultSync();
+			if (!vaultSync) return true;
+			const bodyId = vaultSync.getFileId(path);
+			const body = bodyId ? vaultSync.bodies.get(bodyId) : null;
+			if (!body) return false;
+			return body.dirty || body.unsettled > 0 || body.pendingLocalUpdates > 0;
+		} catch {
+			return true;
+		}
+	}
+
+	private flushDeferredBaselines(onlyPath?: string): void {
+		const vaultSync = this.deps.getVaultSync();
+		if (!vaultSync) return;
+		// Unknown local identity: nothing can be persisted under it yet.
+		if (this.baselineScope() === null) return;
+		for (const [path, agreement] of Array.from(this.deferredBaselines)) {
+			if (onlyPath !== undefined && path !== onlyPath) continue;
+			if (this.hasPendingLocalWorkForPath(path)) continue;
+			this.deferredBaselines.delete(path);
+			const text = vaultSync.getTextForPath(path);
+			// The agreement is durable only if the body still holds it.
+			if (!text || yTextToString(text) !== agreement.content) continue;
+			// Hash only: the stat stays as last observed, so a disk change since
+			// the agreement is still detected by the next scan.
+			const index = this.deps.getDiskIndex();
+			const entry = index[path] ?? { mtime: 0, size: 0 };
+			if (this.persistAgreement(entry, path, agreement.hash, agreement.content)) index[path] = entry;
+		}
 	}
 
 	/**
@@ -701,6 +1098,7 @@ export class ReconciliationController {
 		opId?: string,
 		coalescedOpIds?: string[],
 		admission?: { bodyId: string; candidateId: string; isCurrent: () => boolean },
+		planAttempt = 0,
 	): Promise<void> {
 		const vaultSync = this.deps.getVaultSync();
 		const editorBindings = this.deps.getEditorBindings();
@@ -752,6 +1150,35 @@ export class ReconciliationController {
 				return;
 			}
 			const existingText = vaultSync.getTextForPath(file.path);
+			this.flushDeferredBaselines(file.path);
+			const baselineKnown = this.hasBaseline(file.path);
+			const activeBodyId = baselineKnown ? vaultSync.getFileId(file.path) : null;
+
+			// The unchanged-since-settlement proof is about a path that has an
+			// active body (loaded or not). With no body at the path, disk equal
+			// to a leftover baseline is a restore or recreate (trash restore,
+			// undo, checkout, an empty "Untitled.md") and must be admitted.
+			if (
+				activeBodyId
+				&& (!existingText || existingText.toJSON() !== content)
+				&& await this.isUnchangedSinceSettlement(file.path, content)
+			) {
+				this.ingestReplans.delete(file.path);
+				await this.skipUnchangedDisk(file, content, existingText, openViews, wasBound);
+				await this.updateDiskIndexForPath(file.path);
+				return;
+			}
+
+			// Every disk -> body import is planned against the body it would
+			// change; an unloaded body is loaded first, then the plan is made.
+			const pathBodyId = vaultSync.getFileId(file.path);
+			if (pathBodyId && !existingText) {
+				if (planAttempt >= SYNC_FROM_DISK_MAX_PLAN_ATTEMPTS) {
+					throw new Error(`body of "${file.path}" could not be loaded to plan the disk import`);
+				}
+				await this.loadBodyForPlanning(vaultSync, file.path, pathBodyId, content);
+				return this.syncFileFromDisk(file, sourceReason, opId, coalescedOpIds, admission, planAttempt + 1);
+			}
 
 			if (wasBound && isOpenInEditor) {
 				const handledBound = await this.handleBoundFileSyncGap(
@@ -762,13 +1189,44 @@ export class ReconciliationController {
 					sourceReason,
 				);
 				if (handledBound) {
-					await this.updateDiskIndexForPath(file.path);
+					if (yTextToString(existingText) === content) this.ingestReplans.delete(file.path);
+					// Disk and body agreeing is a clean settlement: advance the
+					// baseline so it keeps describing what YAOS last saw agree.
+					await this.updateDiskIndexForPath(
+						file.path,
+						yTextToString(existingText) === content ? content : undefined,
+					);
 					return;
 				}
 			}
 
 			const previousContent = existingText?.toJSON() ?? null;
-			if (previousContent === content) return;
+			if (previousContent === content) {
+				this.ingestReplans.delete(file.path);
+				await this.updateDiskIndexForPath(file.path, content);
+				return;
+			}
+			const boundNow = editorBindings?.isBound(file.path) ?? false;
+			if (isOpenInEditor && !boundNow && editorBindings?.isBindResolutionBlocked?.(file.path)) {
+				// The open editor's bind is waiting on (or gave up) resolving its
+				// divergence from the body; that resolution owns the disk content.
+				this.deps.log(`syncFileFromDisk: deferring "${file.path}" (open editor bind resolution pending or abandoned)`);
+				this.deps.recordFlightPathEvent?.({
+					priority: "verbose",
+					kind: PRODUCT_EVENT_KIND.recoverySkipped,
+					severity: "info",
+					scope: "file",
+					source: "reconciliationController",
+					layer: "recovery",
+					path: file.path,
+					data: { reason: "bind-resolution-blocked" },
+				});
+				return;
+			}
+			const diskContent = content;
+			// The frontmatter ingest guard applies to disk-derived content
+			// before any settle, merge or commit, whatever the baseline says.
+			let frontmatterHeld = false;
 			if (this.deps.shouldBlockFrontmatterIngest(
 				file.path,
 				previousContent,
@@ -779,37 +1237,87 @@ export class ReconciliationController {
 				const partial = this.frontmatterBodyOnlyProgress(file.path, previousContent ?? "", content, branch);
 				if (partial === null) {
 					this.recordFrontmatterIngestBlocked(file.path, false, branch);
+					this.ingestReplans.delete(file.path);
 					await this.updateDiskIndexForPath(file.path);
 					return;
 				}
 				content = partial;
+				frontmatterHeld = true;
+			}
+			const bodyMovedSinceBaseline = existingText && pathBodyId && previousContent !== null
+				&& !await this.matchesBaseline(file.path, previousContent);
+			let merged = false;
+			if (bodyMovedSinceBaseline && !isOpenInEditor && !frontmatterHeld) {
+				// D != B (the guard above did not fire) and C != B, or no trusted
+				// baseline at all: the body may hold changes disk never saw. A
+				// two-way import would delete them; three-way or preserve both.
+				this.ingestReplans.delete(file.path);
+				await this.reconcileClosedDivergence(file, content, previousContent, pathBodyId, "disk-ingest");
+				await this.updateDiskIndexForPath(file.path);
+				return;
+			}
+			if (bodyMovedSinceBaseline && (frontmatterHeld || (isOpenInEditor && !boundNow))) {
+				// Open but unbound (bind pending, reading view), or disk content
+				// the frontmatter guard transformed (DiskMirror would settle the
+				// raw file): the same three-way rule, merged in place, without
+				// projecting to disk.
+				const plan = await this.inPlaceThreeWay(file.path, pathBodyId, content, previousContent, diskContent);
+				if (plan.kind === "preserved") {
+					this.ingestReplans.delete(file.path);
+					await this.updateDiskIndexForPath(file.path);
+					return;
+				}
+				merged = plan.content !== content;
+				content = plan.content;
+			}
+			// Only an import of exactly the disk content (or of its body with
+			// held properties) makes disk and body agree on it.
+			const settledContent = !merged && (content === diskContent || frontmatterHeld) ? content : undefined;
+			if (previousContent !== null && content === previousContent) {
+				// The body already holds everything disk contributes (properties
+				// held back, or a merge equal to the body): nothing to commit.
+				this.deps.log(`syncFileFromDisk: "${file.path}" contributes nothing new to its body; settling`);
+				this.ingestReplans.delete(file.path);
+				await this.updateDiskIndexForPath(file.path, settledContent);
+				return;
 			}
 
 			const bodyId = vaultSync.getFileId(file.path);
-			if (existingText && bodyId && vaultSync.isBodyOpen(bodyId)) {
-				const outcome = tryApplyDiffToYText(
+			if (bodyId && bodyId !== pathBodyId) {
+				// The path changed hands while planning.
+				this.requeueAfterSupersede(file, opId, "the path changed hands while planning");
+				return;
+			}
+			if (bodyId && existingText && previousContent !== null) {
+				const outcome = await this.importDiskIfBodyCurrent(
+					vaultSync,
+					file.path,
+					bodyId,
 					existingText,
-					previousContent ?? "",
+					previousContent,
 					content,
-					ORIGIN_DISK_SYNC,
+					admission?.candidateId ?? opId ?? crypto.randomUUID(),
 				);
 				if (outcome === "superseded") {
-					this.deps.log(`syncFileFromDisk: superseded stale text apply for "${file.path}"; replanning`);
-					this.markMarkdownDirty(file, "modify", opId);
+					this.requeueAfterSupersede(file, opId, "the body moved since the plan");
 					return;
 				}
+			} else if (bodyId) {
+				this.requeueAfterSupersede(file, opId, "the body is not loaded");
+				return;
 			} else {
-				const admittedBodyId = bodyId ?? admission?.bodyId ?? crypto.randomUUID();
+				const admittedBodyId = admission?.bodyId ?? crypto.randomUUID();
 				await vaultSync.commitDiskBody({
 					bodyId: admittedBodyId,
 					path: file.path,
 					content,
 					reason: "external-edit",
-					...(bodyId ? {} : { lifecycle: "create" as const }),
+					lifecycle: "create" as const,
 					candidateId: admission?.candidateId ?? opId ?? crypto.randomUUID(),
 					...(admission ? { admissionStillCurrent: admission.isCurrent } : {}),
 				});
 			}
+			this.ingestReplans.delete(file.path);
 			this.deps.recordFlightPathEvent?.({
 				priority: "important",
 				kind: PRODUCT_EVENT_KIND.crdtFileUpdated,
@@ -826,10 +1334,200 @@ export class ReconciliationController {
 				},
 			});
 
-			await this.updateDiskIndexForPath(file.path, content);
+			await this.updateDiskIndexForPath(file.path, settledContent);
 		} catch (err) {
 			console.error(`[yaos] syncFileFromDisk failed for "${file.path}":`, err);
 			throw err;
+		}
+	}
+
+	/**
+	 * Load (and catch up) the current body of `path` so a disk import can be
+	 * planned against it. Never captures a candidate or changes the body.
+	 */
+	private async loadBodyForPlanning(
+		vaultSync: VaultSync,
+		_path: string,
+		bodyId: string,
+		_diskContent: string,
+	): Promise<void> {
+		await vaultSync.loadBodyForPlanning(bodyId);
+	}
+
+	/**
+	 * Disk -> body import conditional on the body content it was planned
+	 * against (`expectedBody`). The comparison and the Y transaction run in
+	 * one synchronous section: a remote update that reached the body after
+	 * the plan makes this "superseded" (nothing applied), never a two-way
+	 * diff that deletes it (P0c N2).
+	 */
+	private async importDiskIfBodyCurrent(
+		vaultSync: VaultSync,
+		path: string,
+		bodyId: string,
+		text: NonNullable<ReturnType<VaultSync["getTextForPath"]>>,
+		expectedBody: string,
+		content: string,
+		candidateId: string,
+	): Promise<"applied" | "superseded"> {
+		if (vaultSync.isBodyOpen(bodyId)) {
+			const outcome = tryApplyDiffToYText(text, expectedBody, content, ORIGIN_DISK_SYNC);
+			return outcome === "superseded" ? "superseded" : "applied";
+		}
+		const outcome = await vaultSync.commitBodyCandidateIfCurrent({
+			bodyId,
+			path,
+			expectedContent: expectedBody,
+			content,
+			candidateId,
+			reason: "external-edit",
+		});
+		return outcome.kind === "completed" ? "applied" : "superseded";
+	}
+
+	/**
+	 * Disk and the body of an open but unbound editor both moved from their
+	 * agreement (or no trusted agreement exists). Three-way on the baseline
+	 * or the stored common base; if the body still equals that base, disk is
+	 * a plain local edit. Overlap or no base: preserve disk as a conflict
+	 * note and leave the body alone (the editor's bind shows the body).
+	 */
+	private async inPlaceThreeWay(
+		path: string,
+		bodyId: string,
+		diskContent: string,
+		bodyContent: string,
+		/** What to preserve on overlap: the raw disk file, if `diskContent` was transformed. */
+		preservedContent: string = diskContent,
+	): Promise<{ kind: "import"; content: string } | { kind: "preserved" }> {
+		let base: string | null = null;
+		const baseline = this.effectiveBaselineHash(path);
+		if (baseline !== undefined) base = await this.lookupBaselineContent(path, bodyId, baseline);
+		if (base === null) {
+			try {
+				base = (await this.deps.getDiskMirror()?.readWholeCommonBase(bodyId))?.content ?? null;
+			} catch {
+				base = null;
+			}
+		}
+		if (base !== null) {
+			if (base === bodyContent) return { kind: "import", content: diskContent };
+			const merge = mergeThreeWayText(base, diskContent, bodyContent);
+			if (merge.kind === "clean") {
+				this.deps.log(`syncFileFromDisk: "${path}": merged disk and body on their base in place`);
+				return { kind: "import", content: merge.content };
+			}
+		}
+		const fingerprint = `in-place\x00${contentFingerprint(bodyContent)}\x00${contentFingerprint(preservedContent)}`;
+		if (this.lastConflictFingerprints.get(path) === fingerprint) return { kind: "preserved" };
+		try {
+			await this.createMarkdownConflictArtifact(path, preservedContent, "disk-body-both-changed", "disk");
+			this.lastConflictFingerprints.set(path, fingerprint);
+			this.showConflictNotice(
+				`Conflict detected for "${path.split("/").pop()}" — ` +
+				`the version on disk was preserved as a conflict note.`,
+			);
+		} catch (error) {
+			this.deps.log(`syncFileFromDisk: could not preserve disk of "${path}" (${String(error)}); not importing`);
+		}
+		return { kind: "preserved" };
+	}
+
+	/**
+	 * Whether disk still holds exactly the content YAOS last wrote or saw agree
+	 * with the body at this path (the disk-index baseline). Such disk content
+	 * carries no local edit, whatever the body now holds: the sync contract's
+	 * `D == B` row. An unknown baseline proves nothing and returns false.
+	 */
+	private async isUnchangedSinceSettlement(path: string, content: string): Promise<boolean> {
+		return this.matchesBaseline(path, content);
+	}
+
+	/**
+	 * Unchanged disk is never local input. If the body moved on (a remote
+	 * change not yet materialized, e.g. one merged into a warm body while the
+	 * note was closed), turning this stale disk into Y.Text ops would delete
+	 * committed remote content. The body wins instead (`D == B, C != B`: write
+	 * body state to disk); open editors are kept current by their binding.
+	 */
+	private async skipUnchangedDisk(
+		file: TFile,
+		content: string,
+		existingText: ReturnType<VaultSync["getTextForPath"]>,
+		openViews: MarkdownView[],
+		wasBound: boolean,
+	): Promise<void> {
+		const isOpenInEditor = openViews.length > 0;
+		const crdtContent = existingText ? yTextToString(existingText) : null;
+		if (crdtContent === null || crdtContent === content) return;
+		this.deps.log(
+			`syncFileFromDisk: "${file.path}" is unchanged since its last settlement; ` +
+			`the body is ahead (${content.length} -> ${crdtContent.length} chars), not importing stale disk`,
+		);
+		this.deps.recordFlightPathEvent?.({
+			priority: "important",
+			kind: PRODUCT_EVENT_KIND.recoverySkipped,
+			severity: "info",
+			scope: "file",
+			source: "reconciliationController",
+			layer: "recovery",
+			path: file.path,
+			data: {
+				reason: "disk-unchanged-since-settlement",
+				diskLength: content.length,
+				crdtLength: crdtContent.length,
+				isOpenInEditor,
+			},
+		});
+		if (!isOpenInEditor) {
+			// Conditional: written only while disk still holds this content.
+			this.deps.getDiskMirror()?.scheduleWrite(file.path, {
+				expectedDiskHash: await contentBaselineHash(content),
+			});
+			return;
+		}
+		if (wasBound) this.repairDivergedBoundEditors(file, openViews, crdtContent);
+	}
+
+	/**
+	 * A bound editor whose text differs from its Y.Text has a broken binding:
+	 * yCollab maps later keystrokes by offset, and the next disk save would
+	 * reach the local-only recovery as stale input. Rebind, which routes the
+	 * divergence through bind-time resolution (baseline-aware, preserving).
+	 */
+	private repairDivergedBoundEditors(file: TFile, openViews: MarkdownView[], crdtContent: string): void {
+		const editorBindings = this.deps.getEditorBindings();
+		if (!editorBindings) return;
+		for (const view of openViews) {
+			const editorContent = view.editor.getValue();
+			if (editorContent === crdtContent) continue;
+			if (this.shouldQuarantineRepeatedRecovery(
+				file.path,
+				"bound-editor-diverged-from-body",
+				crdtContent,
+				editorContent,
+			)) {
+				// Rebinding keeps failing: a binding known to diverge must not stay
+				// attached (yCollab would map keystrokes onto the wrong offsets).
+				editorBindings.quarantineBinding(view, "bound-editor-diverged-from-body");
+				this.deps.log(`syncFileFromDisk: unbound diverged editor of "${file.path}" after repeated rebinds`);
+				new Notice(
+					`YAOS stopped syncing the open editor of “${file.path.split("/").pop() ?? file.path}”: ` +
+					`it keeps diverging from the synced version. Close and reopen the note to retry.`,
+					15_000,
+				);
+				continue;
+			}
+			this.deps.log(
+				`syncFileFromDisk: bound editor of "${file.path}" differs from its body ` +
+				`(editor=${editorContent.length}, body=${crdtContent.length} chars); rebinding`,
+			);
+			this.deps.trace("recovery", "bound-editor-diverged-rebind", {
+				path: file.path,
+				editorLength: editorContent.length,
+				crdtLength: crdtContent.length,
+			});
+			editorBindings.rebind(view, this.deps.getSettings().deviceName, "bound-editor-diverged-from-body");
 		}
 	}
 
@@ -936,6 +1634,7 @@ export class ReconciliationController {
 			(state) => state.editorMatchesDisk && !state.editorMatchesCrdt,
 		);
 		if (localOnlyViews.length > 0) {
+			let editorsNeedBodyAdoption = false;
 			this.deps.trace("trace", "bound-file-local-only-divergence", {
 				path: file.path,
 				diskLength: content.length,
@@ -1008,9 +1707,16 @@ export class ReconciliationController {
 					}
 					content = partial;
 				}
+				const threeWay = await this.boundLocalOnlyThreeWay(file.path, content, crdtContent ?? "");
+				if (threeWay.kind === "preservation-failed") return true;
+				if (threeWay.kind === "merged") {
+					editorsNeedBodyAdoption = threeWay.content !== content;
+					content = threeWay.content;
+				}
 				this.deps.log(
 					`syncFileFromDisk: recovering "${file.path}" ` +
-					`(editor-bound local-only divergence: ${crdtContent?.length ?? 0} -> ${content.length} chars)`,
+					`(editor-bound local-only divergence, ${threeWay.kind}: ` +
+					`${crdtContent?.length ?? 0} -> ${content.length} chars)`,
 				);
 				this.deps.trace("trace", "bound-file-recovery-source-selected", {
 					path: file.path,
@@ -1092,6 +1798,11 @@ export class ReconciliationController {
 						crdtLength: crdtContent?.length ?? null,
 					},
 				});
+				// The plan above awaited: apply only to the body it was made on.
+				if (yTextToString(existingText) !== (crdtContent ?? "")) {
+					this.requeueAfterSupersede(file, undefined, "the body moved during bound recovery");
+					return true;
+				}
 				const recoveryResult = applyDiffToYTextWithPostcondition(
 					existingText,
 					crdtContent ?? "",
@@ -1180,16 +1891,19 @@ export class ReconciliationController {
 					path: file.path,
 					data: { reason: "bound-file-local-only-seed", action: "seed-crdt-from-disk", diskLength: content.length },
 				});
+				if (vaultSync?.getFileId(file.path)) {
+					// A body exists but is not loaded: never import blind. The
+					// unbound path loads it and plans against it.
+					this.requeueAfterSupersede(file, undefined, "the body is not loaded");
+					return true;
+				}
 				if (vaultSync) {
-					const bodyId = vaultSync.getFileId(file.path) ?? crypto.randomUUID();
 					await vaultSync.commitDiskBody({
-						bodyId,
+						bodyId: crypto.randomUUID(),
 						path: file.path,
 						content,
 						reason: "external-edit",
-						...(vaultSync.getFileId(file.path)
-							? {}
-							: { lifecycle: "create" as const }),
+						lifecycle: "create" as const,
 						candidateId: crypto.randomUUID(),
 					});
 				}
@@ -1253,6 +1967,17 @@ export class ReconciliationController {
 					);
 				}
 			}
+			if (editorsNeedBodyAdoption) {
+				// The body now holds the merge, which the editors lack; bind-time
+				// resolution shows it (the editor's edits are part of it).
+				for (const state of localOnlyViews) {
+					editorBindings?.rebind(
+						state.view,
+						this.deps.getSettings().deviceName,
+						"bound-file-local-only-three-way",
+					);
+				}
+			}
 
 			this.deps.scheduleTraceStateSnapshot("bound-file-desync-recovery");
 			return true;
@@ -1301,9 +2026,15 @@ export class ReconciliationController {
 					}
 					content = partial;
 				}
+				// Disk moved and so may the body (a remote edit disk never saw):
+				// three-way on their agreement rather than a two-way import.
+				const threeWay = await this.boundLocalOnlyThreeWay(file.path, content, crdtContent ?? "");
+				if (threeWay.kind === "preservation-failed") return true;
+				if (threeWay.kind === "merged") content = threeWay.content;
 				this.deps.log(
 					`syncFileFromDisk: recovering "${file.path}" ` +
-					`(editor-bound external disk edit while idle: ${crdtContent?.length ?? 0} -> ${content.length} chars)`,
+					`(editor-bound external disk edit while idle, ${threeWay.kind}: ` +
+					`${crdtContent?.length ?? 0} -> ${content.length} chars)`,
 				);
 			this.deps.recordFlightPathEvent?.({
 				priority: "important",
@@ -1349,6 +2080,11 @@ export class ReconciliationController {
 						crdtLength: crdtContent?.length ?? null,
 					},
 				});
+				// The plan above awaited: apply only to the body it was made on.
+				if (yTextToString(existingText) !== (crdtContent ?? "")) {
+					this.requeueAfterSupersede(file, undefined, "the body moved during idle disk recovery");
+					return true;
+				}
 				const recoveryResult = applyDiffToYTextWithPostcondition(
 					existingText,
 					crdtContent ?? "",
@@ -1427,16 +2163,19 @@ export class ReconciliationController {
 				)) {
 					return true;
 				}
+				if (vaultSync?.getFileId(file.path)) {
+					// A body exists but is not loaded: never import blind. The
+					// unbound path loads it and plans against it.
+					this.requeueAfterSupersede(file, undefined, "the body is not loaded");
+					return true;
+				}
 				if (vaultSync) {
-					const bodyId = vaultSync.getFileId(file.path) ?? crypto.randomUUID();
 					await vaultSync.commitDiskBody({
-						bodyId,
+						bodyId: crypto.randomUUID(),
 						path: file.path,
 						content,
 						reason: "external-edit",
-						...(vaultSync.getFileId(file.path)
-							? {}
-							: { lifecycle: "create" as const }),
+						lifecycle: "create" as const,
 						candidateId: crypto.randomUUID(),
 					});
 				}
@@ -1585,6 +2324,52 @@ export class ReconciliationController {
 		this.deps.log(`syncFileFromDisk: skipping "${file.path}" (editor-bound, ambiguous divergence)`);
 		this.deps.scheduleTraceStateSnapshot("bound-file-ambiguous");
 		return true;
+	}
+
+	/**
+	 * Bound local-only divergence: editor == disk (D), body C lags. When the
+	 * body also moved since the baseline B (C != B, e.g. a remote edit the
+	 * broken binding never showed), diffing C toward D would delete it.
+	 * Apply the B -> D delta onto C instead (three-way). Overlapping edits:
+	 * the editor stays the selected authority, but C is preserved first as a
+	 * conflict note. Without a known baseline or its content: two-way, as
+	 * before (C == B makes two-way exactly the B -> D delta).
+	 */
+	private async boundLocalOnlyThreeWay(
+		path: string,
+		diskContent: string,
+		crdtContent: string,
+	): Promise<
+		| { kind: "two-way" }
+		| { kind: "merged"; content: string }
+		| { kind: "conflict-preserved" }
+		| { kind: "preservation-failed" }
+	> {
+		const baseline = this.effectiveBaselineHash(path);
+		if (baseline === undefined) return { kind: "two-way" };
+		const [diskHash, crdtHash] = await Promise.all([
+			contentBaselineHash(diskContent),
+			contentBaselineHash(crdtContent),
+		]);
+		if (crdtHash === baseline || diskHash === baseline) return { kind: "two-way" };
+		const base = await this.lookupBaselineContent(path, this.deps.getVaultSync()?.getFileId(path) ?? null, baseline);
+		if (base === null) return { kind: "two-way" };
+		const merge = mergeThreeWayText(base, diskContent, crdtContent);
+		if (merge.kind === "clean") return { kind: "merged", content: merge.content };
+		const fingerprint = `local-only\x00${contentFingerprint(crdtContent)}\x00${contentFingerprint(diskContent)}`;
+		if (this.lastConflictFingerprints.get(path) === fingerprint) return { kind: "conflict-preserved" };
+		try {
+			await this.createMarkdownConflictArtifact(path, crdtContent, "bound-file-local-only-overlap", "crdt");
+			this.lastConflictFingerprints.set(path, fingerprint);
+			this.showConflictNotice(
+				`Conflict detected for "${path.split("/").pop()}" — ` +
+				`competing version preserved as conflict note.`,
+			);
+			return { kind: "conflict-preserved" };
+		} catch (error) {
+			this.deps.log(`bound local-only: could not preserve body of "${path}" (${String(error)}); not converging`);
+			return { kind: "preservation-failed" };
+		}
 	}
 
 	private frontmatterBodyOnlyProgress(
@@ -1885,6 +2670,12 @@ export class ReconciliationController {
 		return `${dir}${finalBase}${suffix}${ext}`;
 	}
 
+	/**
+	 * Refresh the stat of `path`. With `settledContent` (disk and body agree
+	 * on it), also advance the baseline - unless the body still holds local
+	 * work that is not durably committed, in which case the agreement is kept
+	 * for this session only and persisted once that work settles.
+	 */
 	private async updateDiskIndexForPath(path: string, settledContent?: string): Promise<void> {
 		try {
 			const stat = await this.deps.app.vault.adapter.stat(path);
@@ -1894,10 +2685,31 @@ export class ReconciliationController {
 					mtime: stat.mtime,
 					size: stat.size,
 				};
-				const contentHash = settledContent !== undefined
-					? await contentBaselineHash(settledContent)
-					: currentContentHash(existing);
-				if (contentHash !== undefined) setCurrentContentHash(nextEntry, contentHash);
+				const contentHash = currentContentHash(existing);
+				// Carry the previous agreement (and its scope) forward.
+				if (contentHash !== undefined) setCurrentContentHash(nextEntry, contentHash, existing?.baselineScope);
+				else if (
+					existing?.settlementKind === "body-only"
+					&& existing.bodyContentHash !== undefined
+					&& existing.propertiesContentHash !== undefined
+				) {
+					setPartialContentHashes(
+						nextEntry,
+						existing.bodyContentHash,
+						existing.propertiesContentHash,
+						existing.baselineScope,
+					);
+				}
+				if (settledContent !== undefined) {
+					const settledHash = await contentBaselineHash(settledContent);
+					this.rememberBaselineContent(path, settledHash, settledContent);
+					if (this.hasPendingLocalWorkForPath(path)) {
+						this.deferredBaselines.set(path, { hash: settledHash, content: settledContent });
+					} else {
+						this.deferredBaselines.delete(path);
+						this.persistAgreement(nextEntry, path, settledHash, settledContent);
+					}
+				}
 				this.deps.setDiskIndex({
 					...this.deps.getDiskIndex(),
 					[path]: nextEntry,

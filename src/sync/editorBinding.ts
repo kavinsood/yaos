@@ -15,6 +15,7 @@ import type { TraceRecord } from "../observability/traceContext";
 import type { ProductFlightPathEventInput } from "../observability/traceSink";
 import { PRODUCT_EVENT_KIND } from "../observability/productEventKinds";
 import { ORIGIN_EDITOR_HEALTH_HEAL } from "./origins";
+import { mergeThreeWayText } from "./threeWayMerge";
 import { awarenessCursorUser } from "../utils/deviceCursorColor";
 import { leafIdentity } from "../host/obsidianHostAdapter";
 
@@ -129,6 +130,54 @@ export interface BindingPropagationGate {
 	): void;
 }
 
+/**
+ * How an editor whose text differs from its body at bind time is reconciled
+ * before yCollab attaches (yCollab assumes both already agree, and maps every
+ * later delta by offset, so attaching over a divergence corrupts both).
+ *
+ * - "adopt-body": the editor holds nothing local (e.g. Obsidian loaded a disk
+ *   copy that remote changes had overtaken); show the body.
+ * - "adopt-editor": the body holds nothing the editor lacks; the editor's
+ *   text is local input and goes into the body.
+ *
+ * A resolver that sees both sides changed must preserve the editor text
+ * (conflict artifact) itself before answering "adopt-body".
+ */
+export type BindDivergenceDecision =
+	| "adopt-body"
+	| "adopt-editor"
+	/**
+	 * Both sides moved from a known agreement without overlapping: editor
+	 * and body both take `content` (their clean three-way merge).
+	 */
+	| { kind: "adopt-merged"; content: string };
+
+function describeDecision(decision: BindDivergenceDecision): string {
+	return typeof decision === "string" ? decision : decision.kind;
+}
+export type BindDivergenceResolver = (input: {
+	path: string;
+	editorContent: string;
+	bodyContent: string;
+}) => Promise<BindDivergenceDecision>;
+
+interface PendingBindDivergence {
+	path: string;
+	editorContent: string;
+	bodyContent: string;
+	decision: BindDivergenceDecision | null;
+}
+
+/** A resolver that must not be retried (e.g. quarantined repeats). */
+export interface NonRetryableBindDivergenceError {
+	readonly nonRetryable: true;
+}
+
+/** Backoff for a failed bind-divergence resolution; the editor stays unbound meanwhile. */
+const BIND_DIVERGENCE_RETRY_BASE_MS = 1_000;
+const BIND_DIVERGENCE_RETRY_MAX_MS = 30_000;
+const BIND_DIVERGENCE_MAX_RETRIES = 6;
+
 export class EditorBindingManager {
 	/** The CM6 compartment that holds yCollab for each editor. */
 	readonly compartment = new Compartment();
@@ -148,6 +197,10 @@ export class EditorBindingManager {
 	private pendingBodyLoads = new Map<string, { path: string; generation: number }>();
 	private bodyLeases = new Map<string, string>();
 	private bodyLoadGeneration = 0;
+	private bindDivergences = new Map<string, PendingBindDivergence>();
+	private bindDivergenceRetries = new Map<string, { attempt: number; timer: number | null; path: string }>();
+	/** Leaves whose divergence resolution was abandoned (quarantined or out of retries), by path. */
+	private abandonedBindDivergences = new Map<string, string>();
 	/**
 	 * Why the last getCmView() call returned null. Attached to the degraded
 	 * trace so field reports separate "no editor ever registered" (our CM6
@@ -170,6 +223,7 @@ export class EditorBindingManager {
 			principalId: string;
 			colorSeed: string;
 		},
+		private readonly resolveBindDivergence?: BindDivergenceResolver,
 	) {
 		this.debug = debug;
 		// Register the reconfigure hook so the harness can trigger CM extension
@@ -302,6 +356,9 @@ export class EditorBindingManager {
 			"bind",
 		);
 		if (!target) {
+			return;
+		}
+		if (!this.reconcileBindDivergence(view, cm, leafId, file.path, target.ytext)) {
 			return;
 		}
 
@@ -455,6 +512,9 @@ export class EditorBindingManager {
 		const file = view.file;
 		const leafId = leafIdentity(view.leaf, file?.path ?? "unknown");
 		this.cancelPendingBodyLoad(leafId);
+		this.bindDivergences.delete(leafId);
+		this.clearBindDivergenceRetry(leafId);
+		this.abandonedBindDivergences.delete(leafId);
 		this.releaseBodyLease(leafId);
 
 		const binding = this.bindings.get(leafId);
@@ -482,9 +542,47 @@ export class EditorBindingManager {
 	}
 
 	/**
+	 * Whether an open editor of `path` is unbound because its bind is still
+	 * resolving a divergence from the body (resolution in flight, a retry
+	 * scheduled, or the body still loading) or gave up (quarantined, out of
+	 * retries). Disk ingest must not decide for that editor meanwhile.
+	 */
+	isBindResolutionBlocked(path: string): boolean {
+		for (const pending of this.bindDivergences.values()) {
+			if (pending.path === path) return true;
+		}
+		for (const retry of this.bindDivergenceRetries.values()) {
+			if (retry.path === path) return true;
+		}
+		for (const abandonedPath of this.abandonedBindDivergences.values()) {
+			if (abandonedPath === path) return true;
+		}
+		for (const pending of this.pendingBodyLoads.values()) {
+			if (pending.path === path) return true;
+		}
+		return false;
+	}
+
+	/**
+	 * Detach a binding known to diverge from its body (repeated repair
+	 * failed). The editor stays unbound, and disk ingest treats it as an
+	 * abandoned bind, until the next bind of that leaf resolves afresh.
+	 */
+	quarantineBinding(view: MarkdownView, reason: string): void {
+		const path = view.file?.path;
+		this.unbind(view);
+		if (!path) return;
+		this.abandonedBindDivergences.set(leafIdentity(view.leaf, path), path);
+		this.log(`quarantine: detached diverged binding of "${path}" (${reason})`);
+	}
+
+	/**
 	 * Unbind all editors. Called on plugin unload.
 	 */
 	unbindAll(): void {
+		this.bindDivergences.clear();
+		this.abandonedBindDivergences.clear();
+		for (const leafId of Array.from(this.bindDivergenceRetries.keys())) this.clearBindDivergenceRetry(leafId);
 		for (const leafId of Array.from(this.pendingBodyLoads.keys())) {
 			this.cancelPendingBodyLoad(leafId);
 		}
@@ -544,6 +642,14 @@ export class EditorBindingManager {
 	 * Called when a file is deleted (locally or remotely).
 	 */
 	unbindByPath(path: string): void {
+		for (const [leafId, pending] of Array.from(this.bindDivergences)) {
+			if (pending.path !== path) continue;
+			this.bindDivergences.delete(leafId);
+			this.clearBindDivergenceRetry(leafId);
+		}
+		for (const [leafId, abandonedPath] of Array.from(this.abandonedBindDivergences)) {
+			if (abandonedPath === path) this.abandonedBindDivergences.delete(leafId);
+		}
 		for (const [leafId, pending] of Array.from(this.pendingBodyLoads)) {
 			if (pending.path === path) this.cancelPendingBodyLoad(leafId);
 		}
@@ -1386,6 +1492,223 @@ export class EditorBindingManager {
 			window.clearTimeout(timer);
 			this.pendingHealthChecks.delete(leafId);
 		}
+	}
+
+	/**
+	 * Make editor and body agree before a fresh bind. Returns true when they
+	 * agree (bind may proceed); false while a decision is pending, in which
+	 * case bind() is re-entered once the resolver answers.
+	 *
+	 * At most one resolution is in flight per leaf. Typing into the (still
+	 * unbound) editor meanwhile does not start another: the answer is applied
+	 * to the typed text where that is well defined (see `applyStaleDecision`),
+	 * so one divergence costs at most one preserved copy, not one per pass.
+	 */
+	private reconcileBindDivergence(
+		view: MarkdownView,
+		cm: EditorView,
+		leafId: string,
+		path: string,
+		ytext: Y.Text,
+	): boolean {
+		const editorContent = cm.state.doc.toString();
+		const bodyContent = ytext.toJSON();
+		const pending = this.bindDivergences.get(leafId);
+		if (editorContent === bodyContent) {
+			this.bindDivergences.delete(leafId);
+			this.clearBindDivergenceRetry(leafId);
+			this.abandonedBindDivergences.delete(leafId);
+			return true;
+		}
+		if (!this.resolveBindDivergence) return true;
+
+		const samePath = !!pending && pending.path === path;
+		if (samePath && pending.decision === null) return false;
+		if (samePath && pending.decision !== null) {
+			this.bindDivergences.delete(leafId);
+			if (pending.bodyContent === bodyContent) {
+				if (pending.editorContent === editorContent) {
+					this.clearBindDivergenceRetry(leafId);
+					this.applyBindDivergenceDecision(cm, path, ytext, editorContent, bodyContent, pending.decision);
+					return true;
+				}
+				if (this.applyStaleDecision(cm, path, ytext, pending, editorContent)) {
+					this.clearBindDivergenceRetry(leafId);
+					return true;
+				}
+			}
+			// The body moved, or the typed text cannot be carried over: decide again.
+		}
+
+		const request: PendingBindDivergence = { path, editorContent, bodyContent, decision: null };
+		this.abandonedBindDivergences.delete(leafId);
+		this.bindDivergences.set(leafId, request);
+		this.log(
+			`bind: editor and body differ for "${path}" ` +
+			`(editor=${editorContent.length}, body=${bodyContent.length} chars, leaf=${leafId}); resolving before attach`,
+		);
+		void this.resolveBindDivergence({ path, editorContent, bodyContent }).then(
+			(decision) => {
+				if (this.bindDivergences.get(leafId) !== request) return;
+				request.decision = decision;
+				if (view.file?.path !== path) {
+					this.bindDivergences.delete(leafId);
+					return;
+				}
+				this.bind(view, this.lastDeviceName);
+			},
+			(err: unknown) => {
+				if (this.bindDivergences.get(leafId) !== request) return;
+				this.bindDivergences.delete(leafId);
+				this.handleBindDivergenceFailure(view, leafId, path, err);
+			},
+		);
+		return false;
+	}
+
+	/**
+	 * A decision arrived for editor text the user has since typed into (the
+	 * body is unchanged). "adopt-editor": the current editor text is still the
+	 * local input and goes into the body. "adopt-body": the answered snapshot
+	 * is already preserved; carry only the typing done since then onto the
+	 * body (three-way on the snapshot). Returns false when that is ambiguous.
+	 */
+	private applyStaleDecision(
+		cm: EditorView,
+		path: string,
+		ytext: Y.Text,
+		pending: PendingBindDivergence,
+		editorContent: string,
+	): boolean {
+		const decision = pending.decision;
+		if (decision === "adopt-editor") {
+			this.applyBindDivergenceDecision(cm, path, ytext, editorContent, pending.bodyContent, decision);
+			return true;
+		}
+		if (decision === null) return false;
+		// The answered editor snapshot becomes `target`; carry the typing done
+		// since onto it (three-way on the snapshot).
+		const target = decision === "adopt-body" ? pending.bodyContent : decision.content;
+		const merge = mergeThreeWayText(pending.editorContent, editorContent, target);
+		if (merge.kind !== "clean") return false;
+		this.log(`bind: carrying typing made during resolution of "${path}" onto the ${describeDecision(decision)} result`);
+		this.replaceEditorContent(cm, editorContent, merge.content);
+		if (merge.content !== pending.bodyContent) {
+			applyDiffToYText(ytext, pending.bodyContent, merge.content, ORIGIN_EDITOR_HEALTH_HEAL);
+		}
+		return true;
+	}
+
+	private handleBindDivergenceFailure(view: MarkdownView, leafId: string, path: string, err: unknown): void {
+		const nonRetryable = typeof err === "object" && err !== null
+			&& (err as Partial<NonRetryableBindDivergenceError>).nonRetryable === true;
+		const previous = this.bindDivergenceRetries.get(leafId);
+		const attempt = (previous?.attempt ?? 0) + 1;
+		if (previous?.timer != null) window.clearTimeout(previous.timer);
+		const name = path.split("/").pop() ?? path;
+		if (nonRetryable || attempt > BIND_DIVERGENCE_MAX_RETRIES) {
+			this.bindDivergenceRetries.delete(leafId);
+			this.abandonedBindDivergences.set(leafId, path);
+			this.log(`bind: divergence resolution for "${path}" abandoned: ${String(err)}; editor left unbound`);
+			new Notice(
+				`YAOS could not reconcile the open editor of “${name}” with its synced version; ` +
+				`this editor is not syncing. Close and reopen the note to retry.`,
+				15_000,
+			);
+			return;
+		}
+		const delay = Math.min(BIND_DIVERGENCE_RETRY_MAX_MS, BIND_DIVERGENCE_RETRY_BASE_MS * 2 ** (attempt - 1));
+		this.log(
+			`bind: divergence resolution failed for "${path}": ${String(err)}; ` +
+			`editor unbound, retry ${attempt}/${BIND_DIVERGENCE_MAX_RETRIES} in ${delay}ms`,
+		);
+		if (attempt === 1) {
+			new Notice(
+				`YAOS could not yet reconcile the open editor of “${name}” with its synced version; ` +
+				`retrying. Edits in this editor are not syncing meanwhile.`,
+				10_000,
+			);
+		}
+		const timer = window.setTimeout(() => {
+			const retry = this.bindDivergenceRetries.get(leafId);
+			if (retry) retry.timer = null;
+			if (view.file?.path !== path) {
+				this.bindDivergenceRetries.delete(leafId);
+				return;
+			}
+			this.bind(view, this.lastDeviceName);
+		}, delay);
+		this.bindDivergenceRetries.set(leafId, { attempt, timer, path });
+	}
+
+	private clearBindDivergenceRetry(leafId: string): void {
+		const retry = this.bindDivergenceRetries.get(leafId);
+		if (!retry) return;
+		if (retry.timer !== null) window.clearTimeout(retry.timer);
+		this.bindDivergenceRetries.delete(leafId);
+	}
+
+	private applyBindDivergenceDecision(
+		cm: EditorView,
+		path: string,
+		ytext: Y.Text,
+		editorContent: string,
+		bodyContent: string,
+		decision: BindDivergenceDecision,
+	): void {
+		this.log(`bind: resolved divergence for "${path}" with ${describeDecision(decision)}`);
+		this.recordFlightPathEvent?.({
+			priority: "important",
+			kind: PRODUCT_EVENT_KIND.editorHealApplied,
+			severity: "info",
+			scope: "file",
+			source: "editorBinding",
+			layer: "editor",
+			path,
+			data: {
+				reason: `bind-divergence:${describeDecision(decision)}`,
+				crdtLength: bodyContent.length,
+				editorLength: editorContent.length,
+				crdtMatchesEditorBefore: false,
+				diffApplied: decision !== "adopt-body",
+			},
+		});
+		if (decision === "adopt-editor") {
+			applyDiffToYText(ytext, bodyContent, editorContent, ORIGIN_EDITOR_HEALTH_HEAL);
+			return;
+		}
+		if (typeof decision === "object") {
+			// Both take the merge; yCollab is not attached yet, so each edit
+			// reaches only its own side.
+			if (decision.content !== bodyContent) {
+				applyDiffToYText(ytext, bodyContent, decision.content, ORIGIN_EDITOR_HEALTH_HEAL);
+			}
+			this.replaceEditorContent(cm, editorContent, decision.content);
+			return;
+		}
+		// yCollab is not attached yet, so this edit reaches only the editor.
+		this.replaceEditorContent(cm, editorContent, bodyContent);
+	}
+
+	/** One minimal CM change turning `current` into `next`. */
+	private replaceEditorContent(cm: EditorView, current: string, next: string): void {
+		if (current === next) return;
+		let prefix = 0;
+		const limit = Math.min(current.length, next.length);
+		while (prefix < limit && current.charCodeAt(prefix) === next.charCodeAt(prefix)) prefix++;
+		let suffix = 0;
+		while (
+			suffix < limit - prefix
+			&& current.charCodeAt(current.length - 1 - suffix)
+				=== next.charCodeAt(next.length - 1 - suffix)
+		) suffix++;
+		cm.dispatch({
+			changes: {
+				from: prefix,
+				to: current.length - suffix,
+				insert: next.slice(prefix, next.length - suffix),
+			},
+		});
 	}
 
 	private applyBinding(options: {

@@ -207,6 +207,7 @@ function buildFixture(initial: {
 	const vaultSync = {
 		getTextForPath: (p: string) => (p === path ? ytext : null),
 		getFileIdForText: () => "stub-file-id",
+		getFileId: () => "stub-file-id",
 	};
 
 	const controller = new ReconciliationController({
@@ -227,6 +228,9 @@ function buildFixture(initial: {
 		getBlobSync: () => null,
 		getEditorBindings: () => editorBindings as never,
 		getDiskIndex: () => ({}),
+		// No trustworthy baseline: these scenarios exercise the recovery
+		// branches that run without one (disk/body agreements prove nothing).
+		getBaselineScope: () => null,
 		setDiskIndex: () => {},
 		isMarkdownPathSyncable: () => true,
 		shouldBlockFrontmatterIngest: () => false,

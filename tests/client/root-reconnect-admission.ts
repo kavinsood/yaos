@@ -825,4 +825,15 @@ s.test("local edits inside the candidate debounce are not reported as saved by t
 	await runtime.destroy();
 });
 
+s.test("loadBodyForPlanning loads the current body without capturing a candidate", async () => {
+	const { runtime } = harness({ ticketTtlMs: 300_000 });
+	runtime.ydoc.transact(() => runtime.pathToId.set("Note.md", "body-note"), "test");
+	assert.equal(runtime.isBodyLoaded("body-note"), false);
+	await runtime.loadBodyForPlanning("body-note");
+	assert.equal(runtime.isBodyLoaded("body-note"), true);
+	assert.equal(runtime.getTextForPath("Note.md")?.toJSON(), "note");
+	assert.equal(runtime.hasUnconfirmedServerReceiptCandidate, false, "planning never captures a candidate");
+	await runtime.destroy();
+});
+
 await s.done();

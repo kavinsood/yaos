@@ -276,6 +276,9 @@ function buildFrontmatterFixture(options: FixtureOptions): FrontmatterFixture {
 	const vaultSync = {
 		getTextForPath: (p: string) => (p === path ? ytext : null),
 		getFileIdForText: () => "stub-file-id",
+		// A seed (no Y.Text) means no body at the path: a path with a body is
+		// loaded before any disk import is planned against it.
+		getFileId: () => (ytext ? "stub-file-id" : undefined),
 		ensureFile: (
 			p: string,
 			content: string,
@@ -314,6 +317,9 @@ function buildFrontmatterFixture(options: FixtureOptions): FrontmatterFixture {
 		getBlobSync: () => null,
 		getEditorBindings: () => editorBindings as never,
 		getDiskIndex: () => ({}),
+		// No trustworthy baseline: these scenarios exercise the recovery
+		// branches that run without one (disk/body agreements prove nothing).
+		getBaselineScope: () => null,
 		setDiskIndex: () => {},
 		isMarkdownPathSyncable: () => true,
 		shouldBlockFrontmatterIngest: (

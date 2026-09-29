@@ -401,6 +401,11 @@ export interface BodyCandidateCommitInput {
 }
 export type CurrentBodyCandidateOutcome =
 	| { kind: "completed"; receipt: BodyReceipt }
+	/**
+	 * The body already holds exactly the requested content (and the
+	 * expected content): nothing to commit, no candidate was captured.
+	 */
+	| { kind: "completed"; receipt: null; unchanged: true }
 	| { kind: "superseded" };
 export interface CandidatePersistencePort {
 	putCandidate(record: CandidateRecord): Promise<void>;
@@ -577,6 +582,12 @@ export interface VaultSyncOptions {
 	onDurableBodyCommitted?: (
 		notification: BodyCommittedNotification,
 	) => void | Promise<void>;
+	/**
+	 * A remote update reached a live body that no editor is showing (a warm
+	 * body of a closed note). Nothing else projects it: disk mirroring only
+	 * observes open notes, and server catch-up will not replace a live body.
+	 */
+	onRemoteUpdateToClosedBody?: (event: { bodyId: string; path: string }) => void;
 	onProductEvent?: (event: ProductFlightPathEventInput) => void;
 	onControlFrame?: (frame: VaultControlFrame) => void;
 	onSemanticEpochReset?: (event: SemanticEpochResetEvent) => void | Promise<void>;
@@ -2819,6 +2830,20 @@ export class VaultSync implements SyncRuntimePort {
 		return receipt;
 	}
 
+	/**
+	 * Loads the current body of `bodyId` so a disk import can be planned
+	 * against it: residency-admitted and caught up with the server head
+	 * (offline, a body with local state is used as is). Never changes the
+	 * body and never captures a candidate. The body may be evicted again
+	 * later; callers re-read it and re-plan through the conditional commit
+	 * ({@link commitBodyCandidateIfCurrent}), which is what makes the import
+	 * safe, not this load.
+	 */
+	async loadBodyForPlanning(bodyId: string): Promise<void> {
+		if (this.destroyed) throw new Error("runtime closed before body planning load");
+		await this.loadCurrentBody(bodyId);
+	}
+
 	async commitBodyCandidateIfCurrent(
 		input: BodyCandidateCommitInput & { expectedContent: string; path?: string },
 	): Promise<CurrentBodyCandidateOutcome> {
@@ -2843,6 +2868,7 @@ export class VaultSync implements SyncRuntimePort {
 				input.content,
 				ORIGIN_DISK_COMMIT,
 			);
+			if (applyOutcome === "unchanged") return { kind: "completed", receipt: null, unchanged: true };
 			if (applyOutcome !== "applied") return { kind: "superseded" };
 			if (!proof.localRuntimeEpoch.isCurrent()
 				|| (input.path && !this.bodies.coordinator.isPathCurrent(input.path, input.bodyId))) {
@@ -3792,6 +3818,10 @@ export class VaultSync implements SyncRuntimePort {
 		const updateObserver = (update: Uint8Array, origin: unknown) => {
 			if (origin === provider.documentOrigin) {
 				this._lastRemoteUpdateAt = this.now();
+				if ((this.sessions.get(body.bodyId)?.consumers.size ?? 0) === 0) {
+					const path = this.pathForBodyId(body.bodyId);
+					if (path) this.options.onRemoteUpdateToClosedBody?.({ bodyId: body.bodyId, path });
+				}
 				void this.bodies.mergeFromServer(
 					body.bodyId,
 					new Uint8Array(),
@@ -4063,6 +4093,23 @@ export class VaultSync implements SyncRuntimePort {
 		trace.currentnessSource = "http-head";
 		trace.httpFallback = true;
 		return this.catchUpBody(body, undefined, trace);
+	}
+
+	/**
+	 * Feed catch-up for a body that is already loaded: if live sync already
+	 * brought it to exactly the head's content (hash and size verified), record
+	 * the head's generation instead of replacing the live document.
+	 */
+	async promoteLoadedBodyToHead(head: {
+		bodyId: string;
+		bodyEpoch: SemanticEpoch;
+		generation: number;
+		contentHash: string | null;
+		size: number | null;
+	}): Promise<boolean> {
+		const body = this.bodies.get(head.bodyId);
+		if (!body || body.dirty) return false;
+		return this.promoteBodyFromCurrentness(body, { ...head, lifecycle: "active" });
 	}
 
 	private async promoteBodyFromCurrentness(body: LoadedBody, head: BodyCurrentnessHead): Promise<boolean> {

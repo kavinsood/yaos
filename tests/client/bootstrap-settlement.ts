@@ -296,6 +296,91 @@ s.test("body-only feed catch-up batches state and skips root settlement", async 
 	await bodies.destroy();
 });
 
+s.test("feed catch-up settles a live body that sync already brought current instead of failing (B2)", async () => {
+	const bodyId = "live-body";
+	const content = "# Live\n\nremote edit already merged over the body socket\n";
+	const doc = new Y.Doc({ guid: bodyId });
+	doc.getText("body").insert(0, content);
+	const encodedState = Y.encodeStateAsUpdate(doc);
+	doc.destroy();
+	const head = {
+		bodyId, bodyEpoch: 1, fileId: bodyId, path: "Live.md", generation: 5,
+		contentHash: await canonicalMarkdownHash(content),
+		size: new TextEncoder().encode(content).byteLength,
+		lifecycle: "active" as const,
+	};
+	const run = async (withPromotion: boolean) => {
+		const documents = new Map<string, StoredDocument>([[bodyId, {
+			kind: "body", documentId: bodyId, bodyEpoch: 1, durableBaseline: content,
+			// Live sync merged the content, but the commit notice that would
+			// have advanced the generation never arrived.
+			generation: 2, encodedState: encodedState.slice().buffer, dirty: false, updatedAt: 1,
+		}]]);
+		const outstanding = new Map<string, StoredOutstandingBody>();
+		let progress: StoredBootstrapProgress = {
+			bootstrapId: "live-bootstrap", rootEpoch: 1, highWater: 0, nextCatalogCursor: null,
+			stage: "complete", settledBodies: 1, totalBodies: 1, feedCursor: 0,
+		};
+		const database = {
+			getBootstrapProgress: async () => progress,
+			putBootstrapProgress: async (next: StoredBootstrapProgress) => { progress = { ...next }; },
+			putFeedCursor: async () => {},
+			getDocument: async (id: string) => documents.get(id) ?? null,
+			putDocument: async (document: StoredDocument) => { documents.set(document.documentId, document); },
+			deleteDocument: async (id: string) => { documents.delete(id); },
+			getOutstanding: async (id: string) => outstanding.get(id) ?? null,
+			putOutstanding: async (record: StoredOutstandingBody) => { outstanding.set(record.bodyId, record); },
+			deleteOutstanding: async (id: string) => { outstanding.delete(id); },
+			listOutstanding: async () => [...outstanding.values()],
+			getMaterializedPath: async () => "Live.md",
+			setMaterializedPath: async () => {}, setMaterializedPaths: async () => {},
+			deleteMaterializedPath: async () => {}, listMaterializedPaths: async () => [],
+		};
+		let page = 0;
+		const server = {
+			changesAfter: async () => page++ === 0
+				? { entries: [{ sequence: 1, documentId: bodyId, documentEpoch: 1, generation: 5, kind: "body" }],
+					currentHighWater: 1, resetRequired: false }
+				: { entries: [], currentHighWater: 1, resetRequired: false },
+			settleRootThrough: async () => {},
+			catchUpBodies: async () => new Map([[bodyId, { head, state: { bodyId, bodyEpoch: 1, generation: 5, encodedState } }]]),
+			currentHead: async () => head,
+			currentBody: async () => ({ bodyId, bodyEpoch: 1, generation: 5, encodedState }),
+		};
+		const writes: Array<{ path: string; content: string }> = [];
+		const disk = {
+			settleBody: async (input: { path: string; content: string }) => { writes.push(input); return "settled" as const; },
+			moveBodies: async () => {}, deleteBody: async () => "deleted" as const,
+		};
+		const bodies = new BodyManager(database);
+		const live = await bodies.load(bodyId);
+		bodies.pin(bodyId); // an open (or warm, leased) body refuses replacement
+		const client = new BootstrapClient(server as never, database as never, bodies, disk);
+		const promotions: number[] = [];
+		if (withPromotion) {
+			client.configureLiveBodyPromotion(async (target) => {
+				promotions.push(target.generation);
+				return live.doc.getText("body").toJSON() === content;
+			});
+		}
+		await client.run();
+		bodies.unpin(bodyId);
+		await bodies.destroy();
+		return { outstanding: [...outstanding.values()], writes, promotions };
+	};
+
+	const without = await run(false);
+	assert.equal(without.outstanding.length, 1, "without promotion the live body is left needing attention");
+	assert.match(without.outstanding[0]!.reason, /cannot replace/);
+
+	const withHook = await run(true);
+	assert.deepEqual(withHook.promotions, [5]);
+	assert.equal(withHook.outstanding.length, 0, "the already-current live body settles");
+	assert.equal(withHook.writes.length, 1, "the verified server content is settled to disk");
+	assert.equal(withHook.writes[0]!.path, "Live.md");
+	assert.equal(withHook.writes[0]!.content, content);
+});
+
 s.test("verified body-only agreement creates a restart-safe component base", async () => {
 	const bodyId = "body-common-base";
 	const path = "notes/common.md";

@@ -244,6 +244,7 @@ const CANVAS_CANDIDATES = "canvasCandidates";
 const CANVAS_SETTLEMENTS = "canvasSettlements";
 const CANVAS_LIFECYCLE = "canvasLifecycle";
 const SCHEMA_8_DATABASE_SUFFIX = ":schema-8";
+const LOCAL_IDENTITY_KEY = "localIdentity";
 
 function transactionDone(transaction: IDBTransaction): Promise<void> {
 	return new Promise((resolve, reject) => {
@@ -703,6 +704,60 @@ export class VaultIndexedDb {
 			| undefined;
 		await transactionDone(transaction);
 		return value ?? null;
+	}
+
+	/**
+	 * A random identity for this database incarnation. It is created once and
+	 * lives in the bootstrap store, so `clearLocalCache` (and any loss or
+	 * recreation of the database) yields a new one. Disk-index baselines are
+	 * bound to it: a baseline established under another incarnation may name
+	 * content that was never durably committed through this one.
+	 */
+	async getOrCreateLocalIdentity(): Promise<string> {
+		return (await this.getOrCreateLocalIdentityWithOrigin()).identity;
+	}
+
+	/**
+	 * `getOrCreateLocalIdentity`, also telling whether the identity was just
+	 * created and, if so, whether this database already held synced state
+	 * (bootstrap progress or stored documents). Such a database predates
+	 * identities rather than being new: it is the incarnation that legacy
+	 * unscoped baselines were written under.
+	 */
+	async getOrCreateLocalIdentityWithOrigin(): Promise<{
+		identity: string;
+		created: boolean;
+		priorState: boolean;
+	}> {
+		const db = await this.database;
+		// Read what this database already holds (a read-only snapshot).
+		const read = db.transaction([BOOTSTRAP, DOCUMENTS], "readonly");
+		const readStore = read.objectStore(BOOTSTRAP);
+		const identityRequest = requestValue(readStore.get(LOCAL_IDENTITY_KEY)) as Promise<unknown>;
+		const progressRequest = requestValue(readStore.get("bootstrap")) as Promise<unknown>;
+		const documentsRequest = requestValue(read.objectStore(DOCUMENTS).getAll(null, 1)) as Promise<unknown[]>;
+		const readDone = transactionDone(read);
+		const [existing, progress, documents] = await Promise.all([identityRequest, progressRequest, documentsRequest]);
+		await readDone;
+		if (typeof existing === "string" && existing.length > 0) {
+			return { identity: existing, created: false, priorState: true };
+		}
+		const priorState = progress != null || documents.length > 0;
+		// Create it, unless a concurrent opener did so meanwhile.
+		const transaction = db.transaction(BOOTSTRAP, "readwrite");
+		const store = transaction.objectStore(BOOTSTRAP);
+		const raced = await requestValue(store.get(LOCAL_IDENTITY_KEY)) as unknown;
+		let identity: string;
+		let created = false;
+		if (typeof raced === "string" && raced.length > 0) {
+			identity = raced;
+		} else {
+			identity = crypto.randomUUID();
+			created = true;
+			store.put(identity, LOCAL_IDENTITY_KEY);
+		}
+		await transactionDone(transaction);
+		return { identity, created, priorState: created ? priorState : true };
 	}
 
 	async putBootstrapProgress(progress: StoredBootstrapProgress): Promise<void> {

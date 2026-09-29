@@ -498,10 +498,31 @@ export class DaemonEngine {
 				lastDiskIndexPersistedAt: this.lastDiskIndexPersistedAt,
 			}),
 			commitLocalBody: async (input) => {
+				if (input.expectedBodyContent !== undefined) {
+					// Conditional on the body the disk-import decision was planned
+					// against (P0c N2): a remote update that reached the body since
+					// makes this "superseded" and DiskMirror re-plans, instead of a
+					// two-way diff that deletes the remote edit.
+					const outcome = await vaultSync.commitBodyCandidateIfCurrent({
+						bodyId: input.bodyId,
+						path: input.path,
+						expectedContent: input.expectedBodyContent,
+						content: input.content,
+						candidateId: crypto.randomUUID(),
+						reason: input.reason,
+					});
+					return outcome.kind;
+				}
+				// Only a delete-revive has no planned body: the body was deleted,
+				// so there is no remote content the disk content could overwrite.
 				await vaultSync.commitDiskBody({
-					...input,
+					bodyId: input.bodyId,
+					path: input.path,
+					content: input.content,
+					reason: input.reason,
 					...(input.reason === "delete-revive" ? { lifecycle: "revive" as const } : {}),
 				});
+				return "completed";
 			},
 			getCommonBase: (bodyId) => bodySettlements.read(bodyId),
 			commitMergedBody: async (input) => {

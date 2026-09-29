@@ -17,6 +17,9 @@
  * - "crdt-current-no-op"          CRDT and disk already agree.
  * - "recovery-lock-active"        bound recovery lock is still active.
  * - "recent-editor-activity"      crdtOnly branch idle-grace bail.
+ * - "disk-unchanged-since-settlement" disk still equals its settled
+ *                                 baseline, so it carries no local edit;
+ *                                 a differing body is ahead and wins.
  * - "frontmatter-ingest-blocked"  shouldBlockFrontmatterIngest returned
  *                                 true at one of the six block sites.
  *                                 See FrontmatterIngestBlockBranch.
@@ -26,6 +29,7 @@ export type RecoverySkippedReason =
 	| "recovery-lock-active"
 	| "recent-editor-activity"
 	| "recent-editor-activity-local-only"
+	| "disk-unchanged-since-settlement"
 	| "frontmatter-ingest-blocked";
 
 /**
