@@ -1,0 +1,55 @@
+esbuild.config.mjs
+  s_4930c6081c2d41::t_92bb2af4aec313 82-83
+packages/cli/src/cli.ts
+  s_4930c6081c2d41::t_e78b4524b5fdea 16,61-62
+packages/cli/src/config.ts
+  s_4930c6081c2d41::t_dd51a3c718cc90 4,30-32,72-73,172-176
+packages/cli/src/engine.ts
+  s_4930c6081c2d41::t_f59b7be1d1d880 8,333-334
+server/src/config.ts
+  s_4930c6081c2d41::t_587e291797b660 38,412-416,1498,1985,1989
+server/src/index.ts
+  s_4930c6081c2d41::t_0bb0a35c6342fa 2,64,73-76,121-122,305-310
+server/src/routes/ticket.ts
+  s_4930c6081c2d41::t_2060d5b1f355b0 4,154-155
+server/src/routes/types.ts
+  s_4930c6081c2d41::t_6bb89b7b430734 15-20
+server/src/server.ts
+  s_4930c6081c2d41::t_980e47ee1e3b24 11,40-42,161-167,170-175,247,337-339,618-645,1079-1080,1358,1372-1378,1380-1381,1391-1393,1397-1421,1425-1426,1439-1440
+server/src/testOnlyTimers.ts
+  s_4930c6081c2d41::t_ce42857e0f6f40 1-78
+server/src/vaultSocketService.ts
+  s_4930c6081c2d41::t_7dbe9d1887e83a 428-429,1138
+src/main.ts
+  s_4930c6081c2d41::t_edfced62f5e695 171,184-188,524-528
+src/runtime/socketLivenessCoordinator.ts
+  s_4930c6081c2d41::t_07a499f682f955 5,195,206,228
+src/runtime/testOnlyTimers.ts
+  s_4930c6081c2d41::t_451ac647443503 1-105
+src/sync/ownAwarenessProvider.ts
+  s_4930c6081c2d41::t_d40fdcadabc3f1 4,60-61,78,87
+src/sync/socketTicket.ts
+  s_4930c6081c2d41::t_8c724f93ea7ad7 5,38-42,72
+src/sync/vaultSync.ts
+  s_4930c6081c2d41::t_170727205b43d8 40-41,1352-1353,3373,5860,5872
+tests/client/test-only-timers.ts
+  s_4930c6081c2d41::t_db00ba965c0a2e 1-94
+tests/server/test-only-fast-timers.ts
+  s_4930c6081c2d41::t_fde87dd032e38d 1-197
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "5dd32f31d3c380605db44558d089d37adaa293d5",
+  "prompts": {},
+  "sessions": {
+    "s_4930c6081c2d41": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f11e23fecffe1oQlIWIiAWRR83",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
