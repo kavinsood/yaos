@@ -1,0 +1,47 @@
+scripts/relay2/README.md
+  s_7b2ef493da42e9::t_0d859f85bc3c86 154-186
+scripts/relay2/bench.ts
+  s_3fa8c41e3d4d37::t_2e4d40297b8ade 20,28
+scripts/relay2/convergence.ts
+  s_3fa8c41e3d4d37::t_52f684c3e132a1 1-107
+scripts/relay2/l5-cli-baseline.ts
+  s_3fa8c41e3d4d37::t_9fecaa9e2c4143 7,67,126,130,188-190,252-274,314,344
+scripts/relay2/lib/checks.ts
+  s_7b2ef493da42e9::t_5405807e164ee1 62-63,66-67,72
+scripts/relay2/lib/common.ts
+  s_7b2ef493da42e9::t_9a835405eefdbb 10-11
+scripts/relay2/lib/rawClient.ts
+  s_7b2ef493da42e9::t_c305c62252bd37 16,124-131,196-198,214,217,239,277,288-300
+scripts/relay2/lib/socketReceipts.ts
+  s_3fa8c41e3d4d37::t_27f638e4458e08 62-63,167
+scripts/relay2/runall.sh
+  s_7b2ef493da42e9::t_5cb9479ea4a2e7 1-244
+scripts/relay2/scenarios/cost.ts
+  s_7b2ef493da42e9::t_0080228efeb281 114,125-127
+scripts/relay2/scenarios/limits.ts
+  s_7b2ef493da42e9::t_e15c2a1c55a994 173-191,194,196,198,208-224,226-238,247,249-250,253-254
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "163d263755b186adf3c49cc2fe5de4d781550a68",
+  "prompts": {},
+  "sessions": {
+    "s_3fa8c41e3d4d37": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a0da75a62b227384a",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_7b2ef493da42e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aabf15f6ed7b647b5",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
