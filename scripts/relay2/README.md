@@ -127,9 +127,31 @@ Small-n result (s2, n=14, 10 discarded, so 4 kept):
 
 The relay L5 "cleared" point is the BODY_COMMITTED `relay:true` echo. A client-side receipt that clears the pending candidate on that echo needs a vaultSync change; until then the harness would time the echo at the socket layer.
 
-## 6. Pending the relay deploy
+## 6. Relay validation (flag on) and what is still pending
 
-- Every adapter path (`relay*`) matches docs/relay2-protocol.md as of commit 81c45ab, but none has been run against a flag-on worker yet.
-- Still to check against a flag-on worker: envelope acceptance, echo matching, `rejects` capture, 1013/4409 close handling and C4 relay counters.
-- The L5 relay variant needs the socket-layer echo timing described above.
-- Relay-specific checks still to write once the server lands: the compaction-lease / semantic-reset HTTP flows, C3 `ywasmLinearMemoryBytes` from diagnostics `relay`, and B1 "socket survives" (on relay, a socket closed with 1008 counts as a failure).
+`yaos-relay2-scratch-3` runs relay on (version 3e0b531b), deployed with `--require-clean` from 022f8fd, so the server tree was clean. All 19 scenarios ran at small n with `--adapter relay` (the batch5/batch6 flags). Every run had convergence PASS; outputs are in `runs/scratch3-*-relay.json`.
+
+Behaviour confirmed:
+- The envelope is accepted and the `relay:true` echo matches.
+- C4 `relayStats` are populated from diagnostics `relay`.
+- B7: the flooder is closed with 1013 "relay rate limit" (256 KiB/s knob) while small-note p50 stays flat.
+- B1: the socket survives idle (the runtime epoch changed) and simulate-restart, with no 1008.
+- X1: 100 sockets open with no failures.
+- The unmodified real VaultSync client (L5 script) converges against the relay worker.
+
+Relay compared with base at small n (the n values are too small to cite):
+
+| | Base | Relay |
+|---|---|---|
+| L1 RTT | 88 | 87 |
+| L2 propagation | 412 | 90 (ack 101) |
+| L4 per frame | 293 | 116 |
+| B1 after idle | 1332 via reconnect | 309 on the same socket |
+| X1 cap | 32 | ≥100 |
+
+X3 relay 1/5 MB showed transient 11–15 s opens in one run, during a local `UND_ERR_CONNECT_TIMEOUT` window. A 1 MB recheck gave 1.23 s, so verify at full n.
+
+Still pending:
+- The L5 relay variant, which needs the socket-layer echo timing described above.
+- `relay-nosv` / `relay-nocand` adapters: they exist but have not been exercised.
+- Harness checks for the compaction-lease / semantic-reset HTTP flows (the reset agent covers these in `reset/`).

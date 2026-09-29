@@ -11,6 +11,18 @@ type Obj = Record<string, unknown>;
 
 /** Compact view of /debug/recent (→ DO /diagnostics). Unknown (future relay) fields pass through under `relay`. */
 export async function diagnostics(identity: LiveIdentity, full = false): Promise<Obj> {
+	// A transient network error (e.g. UND_ERR_CONNECT_TIMEOUT) must not abort a long scenario.
+	for (let attempt = 1; ; attempt++) {
+		try { return await diagnosticsOnce(identity, full); }
+		catch (error) {
+			if (attempt >= 3) return { at: Date.now(), error: String(error).slice(0, 300) };
+			log(`diagnostics attempt ${attempt} failed: ${String(error).slice(0, 120)}; retrying`);
+			await sleep(1000 * attempt);
+		}
+	}
+}
+
+async function diagnosticsOnce(identity: LiveIdentity, full: boolean): Promise<Obj> {
 	const t0 = now();
 	const response = await fetch(vaultRoute(identity, "debug/recent"), { headers: deviceBearerHeaders(identity) });
 	const value = await json(response);
