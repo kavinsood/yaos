@@ -1,3 +1,4 @@
+import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,7 +13,9 @@ tests.test("production VaultRuntime produces typed authenticated Node HTTP respo
 	const directory = await mkdtemp(join(tmpdir(), "yaos-g7-routes-"));
 	const storage = NodeSqliteStorage.open(join(directory, "vault.sqlite"));
 	try {
-		for (const result of await bootstrapRoutesContract(storage as unknown as VaultRuntimeStoragePort, VaultRuntime)) console.log(`PASS ${result}`);
+		const results = await bootstrapRoutesContract(storage as unknown as VaultRuntimeStoragePort, VaultRuntime);
+		assert.equal(results.length, 2, "both authenticated bootstrap route contract groups execute");
+		for (const result of results) console.log(`PASS ${result}`);
 	} finally {
 		storage.close();
 		await rm(directory, { recursive: true, force: true });
