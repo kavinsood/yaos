@@ -422,6 +422,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			refreshStatusBar: () => this.refreshStatusBar(),
 			getLastSaveDiskIndexAt: () => this.lastDiskIndexPersistedAt,
 			getBaselineScope: () => this.diskIndexScope,
+			getConflictEpisodes: () => this.conflictEpisodes,
 			persistCommonBase: (path, hash, content) => {
 				void this.persistCommonBaseForBaseline(path, hash, content).catch((error: unknown) => {
 					this.log(`common base for "${path}" not stored: ${formatUnknown(error)}`);
@@ -1413,6 +1414,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 			// 8. Rename batch callback → update editor bindings + disk mirror observers + disk index + blob hash cache
 			this.vaultSync.onRenameBatchFlushed((renames) => {
+				for (const episode of this.conflictEpisodes?.list() ?? []) {
+					const path = renames.get(episode.path);
+					if (path) void this.conflictEpisodes?.rename(episode.bodyId, path)
+						.catch((error: unknown) => this.log(`Conflict rename remains pending: ${formatUnknown(error)}`));
+				}
 				this.editorWorkspace?.onRenameBatchFlushed(renames);
 
 				// Move disk index entries
@@ -2922,6 +2928,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			const disk = await episodes.readVersion(bodyId, episode.latestDiskHash);
 			const base = episode.baseHash ? await episodes.readVersion(bodyId, episode.baseHash) : null;
 			const plannedHash = episode.latestDiskHash;
+			const plannedDisk = await this.diskMirror?.readCanonicalDiskEvidence(episode.path);
 			const proof = runtime.bodies.captureRevision(bodyId);
 			const stillCurrent = () => this.vaultSync === runtime && episodes.get(bodyId) === episode
 				&& episode.latestDiskHash === plannedHash
@@ -2935,6 +2942,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			const chosen = await reviewThreeWayConflict(this.app, episode.path, conflict, stillCurrent);
 			if (chosen === null) return;
 			if (!stillCurrent()) throw new Error("The note changed during review. Open review again for the current versions.");
+			const actualDisk = await this.diskMirror?.readCanonicalDiskEvidence(episode.path);
+			if (!plannedDisk || !actualDisk || plannedDisk.content !== actualDisk.content || !stillCurrent()) {
+				throw new Error("Disk changed during review. Its new input remains pending; review again.");
+			}
 			if (this.shouldBlockFrontmatterIngest(episode.path, current, chosen, "conflict-resolution")) throw new Error("Selected properties are unsafe; repair the preserved version before resolving.");
 			const outcome = await runtime.commitBodyCandidateIfCurrent({
 				bodyId, path: episode.path, expectedContent: current, content: chosen,
@@ -2952,6 +2963,15 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	private updateStatusBar(connectionState: ConnectionState = this.getCurrentConnectionState()): void {
 		if (!this.statusBarEl) return;
+		if (connectionState.kind === "online" && this.vaultSync?.provider.synced) {
+			const paths = new Map([...this.vaultSync.pathToId].map(([path, bodyId]) => [bodyId, path]));
+			for (const episode of this.conflictEpisodes?.list() ?? []) {
+				const path = paths.get(episode.bodyId);
+				if (path === episode.path) continue;
+				const update = path ? this.conflictEpisodes?.rename(episode.bodyId, path) : this.conflictEpisodes?.close(episode.bodyId);
+				void update?.catch((error: unknown) => this.log(`Conflict lifecycle update failed: ${formatUnknown(error)}`));
+			}
+		}
 		const visibleState = this.connectionStateLatch.resolve(connectionState);
 		const transferStatus = this.getBlobSync()?.transferStatus;
 		const diskAttention =

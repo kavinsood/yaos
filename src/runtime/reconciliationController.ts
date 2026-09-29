@@ -14,6 +14,7 @@ import {
 	trustedContentHash,
 } from "../sync/diskIndex";
 import { mergeThreeWayText } from "../sync/threeWayMerge";
+import type { ConflictEpisodes } from "../sync/conflictEpisodes";
 import {
 	FreshAdmissionCancelledError,
 	FreshAdmissionDurablyPendingError,
@@ -136,6 +137,7 @@ interface ReconciliationControllerDeps {
 	 * Returning null: the identity is unknown yet, so no baseline is trusted.
 	 */
 	getBaselineScope?(): string | null;
+	getConflictEpisodes?(): ConflictEpisodes | null;
 	/**
 	 * A disk/body agreement was just persisted as the baseline of `path`:
 	 * store its content as the body's common base, so a later divergence of
@@ -1150,6 +1152,27 @@ export class ReconciliationController {
 				return;
 			}
 			const existingText = vaultSync.getTextForPath(file.path);
+			const pendingBodyId = vaultSync.getFileId(file.path);
+			const episodes = this.deps.getConflictEpisodes?.();
+			const episode = pendingBodyId ? episodes?.get(pendingBodyId) : undefined;
+			const pendingBody = yTextToString(existingText);
+			if (pendingBodyId && episodes && episode && pendingBody !== null) {
+				await episodes.preserve({ bodyId: pendingBodyId, path: file.path, disk: content, body: pendingBody, device: this.deps.getSettings().deviceName });
+				vaultSync.bodies.coordinator.setDivergence(pendingBodyId, "decision-required");
+				if (episode.baseHash && content !== pendingBody) {
+					const base = await episodes.readVersion(pendingBodyId, episode.baseHash);
+					const merge = mergeThreeWayText(base, content, pendingBody);
+					if (merge.kind === "clean" && !this.deps.shouldBlockFrontmatterIngest(file.path, pendingBody, merge.content, "pending-conflict-edit")) {
+						const outcome = await vaultSync.commitBodyCandidateIfCurrent({
+							bodyId: pendingBodyId, path: file.path, expectedContent: pendingBody, content: merge.content,
+							candidateId: crypto.randomUUID(), reason: "three-way-merge",
+						});
+						if (outcome.kind === "superseded") this.requeueAfterSupersede(file, opId, "the pending conflict body moved");
+					}
+				}
+				this.deps.refreshStatusBar();
+				return;
+			}
 			this.flushDeferredBaselines(file.path);
 			const baselineKnown = this.hasBaseline(file.path);
 			const activeBodyId = baselineKnown ? vaultSync.getFileId(file.path) : null;

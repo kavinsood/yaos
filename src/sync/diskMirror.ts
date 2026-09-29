@@ -554,6 +554,7 @@ export class DiskMirror {
 		generation: number;
 		baselineContent?: string | null;
 	}): Promise<DeleteSettlement> {
+		await this.settlement?.conflictEpisodes?.close(input.bodyId);
 		const path = this.acceptPath(input.path);
 		if (!path) return "preserved-unresolved";
 		if (
@@ -926,6 +927,19 @@ export class DiskMirror {
 			return "preserved-unresolved";
 		}
 		if (!isCurrent()) return "replan";
+		const episodes = this.settlement?.conflictEpisodes;
+		if (episodes?.get(bodyId)) {
+			try {
+				await episodes.preserve({ bodyId, path, disk: diskContent, body: content, device: this.getDeviceName() });
+			} catch {
+				this.recordPreservedUnresolved(path, "conflict-artifact-write-failed");
+				return "preserved-unresolved";
+			}
+			this.settlement?.markDivergence?.(bodyId, "decision-required");
+			this.recordPreservedUnresolved(path, "body-settlement-failed");
+			if (diskContent !== content) await this.writeSettledBody(path, diskContent, content, isCurrent);
+			return "preserved-unresolved";
+		}
 		const [diskHash, remoteHash] = await Promise.all([
 			contentBaselineHash(diskContent),
 			contentBaselineHash(content),

@@ -40,6 +40,7 @@ import { suite } from "../harness.ts";
 import { partialOf } from "../mocks/productFixture.ts";
 import { installDomCrypto } from "./helpers/installDomCrypto.ts";
 import { canonicalMarkdownHash } from "../../server/src/shared/markdownCodec";
+import { ConflictEpisodes } from "../../src/sync/conflictEpisodes";
 
 installDomCrypto();
 const s = suite("stale-disk-never-reverts-body");
@@ -68,6 +69,7 @@ interface ClosedFixture {
 	runtime: VaultSync;
 	controller: ReconciliationController;
 	mirror: DiskMirror | null;
+	episodes: ConflictEpisodes | null;
 	submissions: CandidateRecord[];
 	scheduledWrites: string[];
 	createCommits: string[];
@@ -122,6 +124,7 @@ async function closedBodyFixture(options: {
 	/** The frontmatter ingest guard (default: never blocks). */
 	blockFrontmatter?: (previous: string | null, next: string) => boolean;
 	reviewNeverResolves?: boolean;
+	durableEpisodes?: boolean;
 }): Promise<ClosedFixture> {
 	const path = "Closed.md";
 	const bodyId = "body-closed";
@@ -251,6 +254,15 @@ async function closedBodyFixture(options: {
 		} : {}),
 	};
 	const app = { vault, workspace: { iterateAllLeaves: () => {}, getActiveViewOfType: () => null } };
+	const episodes = options.durableEpisodes ? new ConflictEpisodes({ episodes: {}, artifacts: {} }, {
+		read: async (artifactPath) => artifacts.get(artifactPath) ?? null,
+		write: async (artifactPath, content, expected) => {
+			assert.equal(artifacts.get(artifactPath) ?? null, expected);
+			artifacts.set(artifactPath, content);
+			artifactWrites.push(content);
+		},
+		persist: async () => {}, changed: () => {}, notify: () => {},
+	}) : null;
 	let controller: ReconciliationController | null = null;
 	let mirror: DiskMirror | null = null;
 	if (options.realMirror) {
@@ -287,6 +299,7 @@ async function closedBodyFixture(options: {
 				commitLocalBody,
 			});
 		} else mirror.configureSettlement({
+			conflictEpisodes: episodes ?? undefined,
 			getBaseline: (requested) => ({ contentHash: currentContentHash(diskIndex[requested]) ?? null }),
 			commitLocalBody,
 			shouldBlockDiskIngest: (_path, current, next) => guard(current, next),
@@ -322,6 +335,7 @@ async function closedBodyFixture(options: {
 		mirror.setDiskMovedBeforeWriteHandler((moved) => controller?.handleDiskMovedBeforeWrite(moved));
 	}
 	controller = new ReconciliationController({
+		getConflictEpisodes: () => episodes,
 		app: app as never,
 		getSettings: () => ({ deviceName: "Test device" }) as never,
 		getRuntimeConfig: () => ({ maxFileSizeBytes: 0, maxFileSizeKB: 0, excludePatterns: [], externalEditPolicy: "always" }) as never,
@@ -355,6 +369,7 @@ async function closedBodyFixture(options: {
 	});
 	return {
 		runtime,
+		episodes,
 		controller,
 		mirror,
 		reviews,
@@ -385,7 +400,7 @@ async function closedBodyFixture(options: {
 			Y.applyUpdate(target, Y.encodeStateAsUpdate(peer, before), "server-catch-up");
 		},
 		releaseSubmissions: () => { release(); gate = Promise.resolve(); },
-		destroy: async () => { mirror?.destroy(); peer.destroy(); await runtime.destroy(); },
+		destroy: async () => { episodes?.dispose(); mirror?.destroy(); peer.destroy(); await runtime.destroy(); },
 	};
 }
 
@@ -928,6 +943,28 @@ s.test("REVIEW N11: a bound editor that keeps diverging after rebinds is detache
 	for (let attempt = 0; attempt < 12 && fixture.quarantined.length === 0; attempt++) await fixture.ingest();
 	assert.deepEqual(fixture.quarantined, ["bound-editor-diverged-from-body"]);
 	assert.equal(fixture.ytext.toString(), REMOTE);
+});
+
+s.test("G3: after dismissal every subsequent disk variant is preserved in one durable episode", async () => {
+	const fixture = await closedBodyFixture({ disk: LOCAL, baseline: BASE, loadBody: true, realMirror: true, commonBase: BASE, durableEpisodes: true });
+	fixture.applyRemote(REMOTE);
+	await fixture.mirror!.settleBody({ path: "Closed.md", bodyId: "body-closed", generation: 2, content: REMOTE });
+	const episode = fixture.episodes!.get("body-closed")!;
+	for (const disk of ["autosave one", "autosave two", "autosave three"]) {
+		fixture.setDisk(disk);
+		await fixture.ingest();
+		assert.equal(await fixture.episodes!.readVersion("body-closed", await canonicalMarkdownHash(disk)), disk);
+	}
+	assert.equal(fixture.artifacts.size, 1);
+	assert.equal(fixture.episodes!.get("body-closed")!.id, episode.id);
+	assert.equal(fixture.reviews.length, 0);
+	const remote = `${REMOTE}\nnew remote edit`;
+	fixture.applyRemote(remote);
+	await fixture.mirror!.settleBody({ path: "Closed.md", bodyId: "body-closed", generation: 3, content: remote });
+	assert.equal(fixture.disk(), remote);
+	assert.equal(await fixture.episodes!.readVersion("body-closed", await canonicalMarkdownHash("autosave three")), "autosave three");
+	assert.equal(fixture.episodes!.list().length, 1);
+	await fixture.destroy();
 });
 
 s.test("G1: an unresolved human decision never blocks settlement or opens a modal", async () => {
