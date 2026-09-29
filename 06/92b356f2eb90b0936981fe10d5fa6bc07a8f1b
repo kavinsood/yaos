@@ -1,0 +1,57 @@
+package-lock.json
+  s_4930c6081c2d41::t_ba2e361fcb624a 15,20
+package.json
+  s_4930c6081c2d41::t_54ad8b3d8a6ccc 84,89
+packages/server-node/src/index.ts
+  s_4930c6081c2d41::t_622255d1b2a39e 101,110,126-127,266,268,284
+server/src/cloudflarePorts.ts
+  s_4930c6081c2d41::t_b6ad7c17c7ef18 126-155
+server/src/config.ts
+  s_4930c6081c2d41::t_65dafa7d72fd95 37,1490-1493,1495,1500-1501,1512-1513
+server/src/contracts.ts
+  s_4930c6081c2d41::t_d2c1048409dfb3 19-23
+server/src/controlPlaneSql.ts
+  s_4930c6081c2d41::t_dfd4113b5f743d 433,435-462,484,661-663,668-673,783
+server/src/index.ts
+  s_4930c6081c2d41::t_d3f805d81f84c4 372,375
+server/src/routes/ticket.ts
+  s_4930c6081c2d41::t_e87b680c0181e0 4,136-179,201
+server/src/routes/types.ts
+  s_4930c6081c2d41::t_b2fe8189b12f2f 2,11-12
+server/src/server.ts
+  s_4930c6081c2d41::t_ace0232bfdeea8 11,155-156,229,568-571,575-591,1308-1309,1331,1343-1345
+server/src/vaultSocketService.ts
+  s_4930c6081c2d41::t_03b81c24e5d9eb 6-12,29-30,48-108,126-131,133-136,138-144,193-194,196-198,410-417,432-435,522-524,555,559,563-564,567,577,581-587,598,736-788,1010,1012,1017-1020,1022-1025,1029,1031-1042,1045-1056,1059-1064,1067,1093-1112
+src/sync/editorBinding.ts
+  s_4930c6081c2d41::t_d2c83a09f902b5 6-12,479,509,511,538,573,935-970,1422-1428
+src/sync/ownAwarenessProvider.ts
+  s_4930c6081c2d41::t_6824af1cd1843f 1-97
+src/sync/vaultSync.ts
+  s_4930c6081c2d41::t_8f31b86889a249 19,72,5530
+tests/client/editor-body-presence.ts
+  s_4930c6081c2d41::t_254b78ea1ad1de 1-95
+tests/client/own-awareness-provider.ts
+  s_4930c6081c2d41::t_6743f8041cba45 1-254
+tests/deployed/storage-benchmark-entry.ts
+  s_4930c6081c2d41::t_848a71df3c95b6 29,46
+tests/server/ticket-touch-device.ts
+  s_4930c6081c2d41::t_e799122ad2c9fd 1-329
+tests/server/vault-route-authority.ts
+  s_4930c6081c2d41::t_ecd311fca14f41 8,760,769-809,824-825,828-829,833-842,845,854-855,858-862,865,867-946,948-1168
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "0692b356f2eb90b0936981fe10d5fa6bc07a8f1b",
+  "prompts": {},
+  "sessions": {
+    "s_4930c6081c2d41": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f11e23fecffe1oQlIWIiAWRR83",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
