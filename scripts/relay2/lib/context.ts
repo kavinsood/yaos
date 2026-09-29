@@ -59,6 +59,31 @@ export async function operatorLogin(host: string, operatorRecoveryKey: string): 
 	return cookie;
 }
 
+function findVaultId(v: unknown): string | null {
+	if (!v || typeof v !== "object") return null;
+	for (const [k, x] of Object.entries(v as Record<string, unknown>)) {
+		if (k === "vaultId" && typeof x === "string") return x;
+		const inner = findVaultId(x);
+		if (inner) return inner;
+	}
+	return null;
+}
+
+async function recoverClaim(host: string, operatorRecoveryKey: string): Promise<{ vaultId: string; pairingCode: string } | null> {
+	const cap = await json(await fetch(`${host}/api/capabilities`));
+	if (cap?.claimed !== true) return null;
+	let cookie: string;
+	try { cookie = await operatorLogin(host, operatorRecoveryKey); } catch { return null; }
+	const state = await json(await fetch(`${host}/operator/state`, { headers: { Cookie: cookie } }));
+	const vaultId = findVaultId(Array.isArray(state?.vaults) && state.vaults.length === 1 ? state.vaults[0] : null);
+	if (!vaultId) return null;
+	const code = await json(await fetch(`${host}/operator/vaults/${encodeURIComponent(vaultId)}/owner-code`, { method: "POST",
+		headers: { Cookie: cookie, "Content-Type": "application/json" }, body: JSON.stringify({ purpose: "owner-bootstrap" }) }));
+	if (typeof code?.pairingCode !== "string") return null;
+	log(`claim recovered via operator owner-bootstrap code (vault ${vaultId.slice(0, 8)}...)`);
+	return { vaultId, pairingCode: code.pairingCode };
+}
+
 export async function claim(host: string, deviceNames = ["A", "B"]): Promise<Context> {
 	const cap = await fetch(`${host}/api/capabilities`);
 	const capValue = await json(cap);
@@ -66,9 +91,28 @@ export async function claim(host: string, deviceNames = ["A", "B"]): Promise<Con
 	const operatorRecoveryKey = randomBytes(32).toString("base64url");
 	const claimResponse = await fetch(`${host}/claim`, { method: "POST", headers: { "Content-Type": "application/json" },
 		body: JSON.stringify({ operatorRecoveryKey }) });
-	const claimed = await json(claimResponse);
+	let claimed = await json(claimResponse);
 	if (!claimResponse.ok || typeof claimed?.vaultId !== "string" || typeof claimed.pairingCode !== "string") {
-		throw new Error(`claim failed ${claimResponse.status}`);
+		// A just-deployed worker has answered 503 while still committing the claim (the next capabilities probe
+		// says claimed=true). If our recovery key logs in, the claim is ours: mint an owner-bootstrap code.
+		log(`claim returned ${claimResponse.status} (${String(claimed?.error ?? "")}); checking whether it committed`);
+		claimed = null;
+		for (let attempt = 0; attempt < 6 && !claimed; attempt++) {
+			await sleep(3000 * (attempt + 1));
+			const now = await json(await fetch(`${host}/api/capabilities`));
+			if (now?.claimed === false) {
+				// Not committed: retry the claim with the same key.
+				const retry = await fetch(`${host}/claim`, { method: "POST", headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({ operatorRecoveryKey }) });
+				const body = await json(retry);
+				if (retry.ok && typeof body?.vaultId === "string" && typeof body.pairingCode === "string") claimed = body;
+				else log(`claim retry ${attempt + 1} returned ${retry.status}`);
+			} else if (now?.claimed === true) {
+				claimed = await recoverClaim(host, operatorRecoveryKey);
+				if (!claimed) log(`claim recovery attempt ${attempt + 1} failed`);
+			}
+		}
+		if (!claimed) throw new Error(`claim failed ${claimResponse.status}`);
 	}
 	for (let i = 0; i < 20; i++) {
 		const probes = await Promise.all(Array.from({ length: 8 }, () => fetch(`${host}/api/capabilities`).then(json)));
