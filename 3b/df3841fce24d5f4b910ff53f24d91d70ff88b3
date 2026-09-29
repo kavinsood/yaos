@@ -1,0 +1,59 @@
+packages/cli/src/engine.ts
+  s_4930c6081c2d41::t_8c7e7697fde742 44,274-276,332,442-446,570,620,622,1003-1009,1033-1040
+packages/cli/src/remotePoll.ts
+  s_4930c6081c2d41::t_70b85f423dc2e4 1-76
+server/src/server.ts
+  s_4930c6081c2d41::t_e70bf450edc622 37,364-366,371,379,387
+server/src/shared/socketLiveness.ts
+  s_4930c6081c2d41::t_e015db4bf80c50 31-91
+server/src/vaultSocketService.ts
+  s_4930c6081c2d41::t_215ef14f0ab0f1 25,29,60-66,87,143-144,207,431-435,469,541,616-618,754-761,769-771,773-774
+src/main.ts
+  s_4930c6081c2d41::t_dcc5ecd33b7c2d 973,1187
+src/runtime/connectionController.ts
+  s_4930c6081c2d41::t_2f23930e25e7fb 5,70-76,103,258,365,377-381,385,388
+src/runtime/socketAdmissionCoordinator.ts
+  s_4930c6081c2d41::t_2b58326eabc4eb 30-34,40-48,51-61,70-71,74,81-84,105-113,131-165,167-168,203-204,206,226-450
+src/sync/socketTicket.ts
+  s_4930c6081c2d41::t_eb3d55a493f2da 29-32
+src/sync/vaultSync.ts
+  s_4930c6081c2d41::t_210d3637bccd47 7,10,16,53-54,70,124-125,568-576,671-697,979,1277-1288,1293-1301,1426-1427,1430-1433,1451-1452,1507,1527-1531,3170,3184-3200,3224-3225,3354-3358,3361-3362,3366-3379,3395-3408,3413-3465,3468-3475,3478-3482,3552,3648-3651,3656,3659-3666,3670-3674,3695,3761,3768-3771,3774,3777-3778,3782-3783,3785,4503,4506,4508-4509,4512-4514,4516-4536,4540,4543,4545,4552,4613-4631,4811,5775-5779,5781,5786-5789,5802-5808,5814-5815,5819-5828,5839-5846,5850,5852-5853,5861-5877,5881-5896
+src/sync/vaultWorkScheduler.ts
+  s_4930c6081c2d41::t_e92958a9e5de77 19-33,66-67,73-75,106-132,226
+tests/client/cli-remote-poll.ts
+  s_4930c6081c2d41::t_d34b468cb0c2e4 1-80
+tests/client/fatal-auth-state.ts
+  s_4930c6081c2d41::t_25d40e667813b7 135,138
+tests/client/mandatory-socket-ticket.ts
+  s_4930c6081c2d41::t_55d184acb736bf 11
+tests/client/root-reconnect-admission.ts
+  s_4930c6081c2d41::t_2531ae708be434 1-828
+tests/client/socket-admission-coordinator.ts
+  s_4930c6081c2d41::t_6a238174dfcf9c 4,6,9,19-20,24-31,33,41,51,62,153-208,229-404
+tests/client/vault-work-scheduler-integration.ts
+  s_4930c6081c2d41::t_c5678ddcd22f01 304,308-310,328,331-334
+tests/conformance/client.ts
+  s_4930c6081c2d41::t_e7b338c3158aef 4
+tests/headless/schema4.ts
+  s_4930c6081c2d41::t_ccf0bb1e42e151 3
+tests/live/schema4Live.ts
+  s_4930c6081c2d41::t_d54ebfcf7379f6 2
+tests/server/vault-route-authority.ts
+  s_4930c6081c2d41::t_9742e70dd2b27f 12-16,1065-1110,1169-1231
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "3bdf3841fce24d5f4b910ff53f24d91d70ff88b3",
+  "prompts": {},
+  "sessions": {
+    "s_4930c6081c2d41": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f11e23fecffe1oQlIWIiAWRR83",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
