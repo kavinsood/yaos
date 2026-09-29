@@ -10,8 +10,9 @@ export function createConflictAttentionNotice(document: Document, count: number,
 	button.className = "yaos-attention-notice-action";
 	button.textContent = "Review YAOS conflicts";
 	button.addEventListener("click", review);
-	content.append(message, button);
-	fragment.append(content);
+	content.appendChild(message);
+	content.appendChild(button);
+	fragment.appendChild(content);
 	return fragment;
 }
 
