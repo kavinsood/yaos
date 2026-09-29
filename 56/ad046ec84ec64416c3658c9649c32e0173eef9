@@ -1,0 +1,19 @@
+tests/client/stale-disk-never-reverts-body.ts
+  s_3fa8c41e3d4d37::t_84ec46a3c63ed3 106,342,988-1001
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "56ad046ec84ec64416c3658c9649c32e0173eef9",
+  "prompts": {},
+  "sessions": {
+    "s_3fa8c41e3d4d37": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a0da75a62b227384a",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
