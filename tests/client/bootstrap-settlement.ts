@@ -2,6 +2,8 @@ import { strict as assert } from "node:assert";
 import * as Y from "yjs";
 import {
 	BootstrapClient,
+	BootstrapHttpPort,
+	prepareBootstrapRoot,
 	coalesceFeedPage,
 	decodeVerifiedBodyContent,
 	decodeBootstrapRoot,
@@ -562,4 +564,123 @@ s.test("null feed head records delete settlement before advancing the cursor", a
 		"durable outstanding delete precedes feed cursor advancement",
 	);
 });
+for (const endpoint of ["start", "root", "catalog", "bodies", "renew", "complete", "semanticCatalog", "semantic"] as const) {
+	s.test(`G7 typed ${endpoint} rejection resets durable progress and restarts`, async () => {
+		const fixture = await g7ClientFixture(endpoint);
+		const result = await fixture.client.run();
+		assert.equal(result.stage, "complete");
+		assert.equal(result.bootstrapId, "fresh-g7");
+		assert.equal(fixture.starts(), 2);
+		assert.ok(fixture.writes.some((entry) => entry.bootstrapId === ""), "invalid operation is durably discarded before restart");
+	});
+}
+
+s.test("G7 persistent rejection is bounded and ordinary failures do not restart", async () => {
+	const fixture = await g7ClientFixture("start", true);
+	await assert.rejects(() => fixture.client.run(), /bootstrap.*restart.*limit/i);
+	assert.equal(fixture.starts(), 3);
+	assert.equal(fixture.writes.at(-1)?.bootstrapId, "");
+	const ordinary = await g7ClientFixture("start", true, "permission_denied");
+	await assert.rejects(() => ordinary.client.run(), /permission_denied/);
+	assert.equal(ordinary.starts(), 1);
+	assert.equal(ordinary.writes.length, 0);
+});
+
+s.test("G7 prepare-root entry point independently recovers a stale operation", async () => {
+	const fixture = await g7ClientFixture("start");
+	const result = await prepareBootstrapRoot(fixture.server as never, fixture.database as never);
+	assert.equal(result.progress.bootstrapId, "fresh-g7");
+	assert.equal(fixture.starts(), 2);
+});
+
+s.test("G7 semantic restart drains in-flight work before resetting progress", async () => {
+	const fixture = await g7ClientFixture("semantic");
+	const order: string[] = [];
+	const originalWrite = fixture.database.putBootstrapProgress;
+	fixture.database.putBootstrapProgress = async (value) => {
+		if (value.bootstrapId === "") order.push("reset");
+		await originalWrite(value);
+	};
+	fixture.database.putDocument = async () => { order.push("document"); };
+	fixture.server.semanticCatalog = async () => ({ entries: ["fast", "slow"].map((documentId) => ({
+		documentId, fileId: documentId, kind: "canvas" as const, format: "json-canvas" as const, formatVersion: 1 as const,
+		path: `${documentId}.canvas`, bodyEpoch: 1, generation: 1, contentHash: "0".repeat(64), size: 0,
+	})), nextCursor: null });
+	let rejected = false;
+	fixture.server.semantic = async (_id, documentId) => {
+		if (documentId === "fast" && !rejected) {
+			rejected = true;
+			throw Object.assign(new Error("expired"), { code: "bootstrap_not_running", reason: "expired", status: 409 });
+		}
+		if (documentId === "slow") {
+			await new Promise<void>((resolve) => setTimeout(resolve, 15));
+			order.push("slow-finished");
+		}
+		return { documentId, bodyEpoch: 1, generation: 1, encodedState: new Uint8Array([0, 0]) };
+	};
+	await fixture.client.run();
+	assert.ok(order.indexOf("slow-finished") < order.indexOf("reset"), "old in-flight writes finish before clearing bootstrap state");
+});
+
+s.test("G7 HTTP adapter recognizes typed errors on JSON, raw, and batch endpoints only", async () => {
+	let errorCode = "bootstrap_not_running";
+	let status = 409;
+	const port = new BootstrapHttpPort("https://g7.invalid", "vault", "test-token", {} as never, async () => ({
+		status, headers: {}, arrayBuffer: new ArrayBuffer(0), json: { error: errorCode, reason: "expired" },
+	}));
+	for (const work of [() => port.start("stale", true), () => port.root("stale"), () => port.catalog("stale", null, 1),
+		() => port.bodies("stale", ["body"]), () => port.body("stale", "body"), () => port.semantic("stale", "canvas"),
+		() => port.semanticCatalog("stale", null, 1), () => port.renew("stale", 1), () => port.complete("stale")]) {
+		await assert.rejects(work, (error: unknown) => (error as { code?: string }).code === "bootstrap_not_running");
+	}
+	errorCode = "bootstrap_owner_mismatch";
+	status = 403;
+	await assert.rejects(() => port.root("foreign"), /vault request failed \(403\)/);
+});
+
+async function g7ClientFixture(failAt: string, persistent = false, code = "bootstrap_not_running") {
+	const root = new Y.Doc({ guid: "root" });
+	root.getMap("sys").set("schemaVersion", SCHEMA_VERSION);
+	const rootBytes = Y.encodeStateAsUpdate(root);
+	root.destroy();
+	let progress: StoredBootstrapProgress = { bootstrapId: "stale-g7", rootEpoch: 1, highWater: 0,
+		nextCatalogCursor: null, stage: failAt === "root" ? "root-loaded" : "catalog-paging", settledBodies: 0, totalBodies: 0, feedCursor: 0 };
+	const writes: StoredBootstrapProgress[] = [];
+	let calls = 0;
+	let failed = false;
+	const fail = (endpoint: string) => {
+		if (endpoint !== failAt || (failed && !persistent)) return;
+		failed = true;
+		throw Object.assign(new Error(code), { code, reason: "complete", status: 409 });
+	};
+	const database = {
+		getBootstrapProgress: async () => (failAt === "root" || failAt.startsWith("semantic")) && calls === 0 ? null : { ...progress },
+		putBootstrapProgress: async (value: StoredBootstrapProgress) => { progress = { ...value }; writes.push({ ...value }); },
+		putDocument: async () => {}, putFeedCursor: async () => {}, listOutstanding: async () => [],
+	};
+	const server = {
+		start: async (attemptId?: string) => {
+			calls++;
+			fail("start");
+			return { bootstrapId: failed ? "fresh-g7" : attemptId ?? "stale-g7", createdAt: "", expiresAt: "", serverCompleted: false,
+				capture: { vaultSequence: 0, rootEpoch: 1, rootGeneration: 1, rootCheckpointHash: await sha256(rootBytes) },
+				catalog: { activeBodyCount: 0, activeSemanticCount: failAt.startsWith("semantic") ? 1 : 0,
+					pageSize: 1000, firstCursor: null, feedFloor: 0, highWater: 0 } };
+		},
+		root: async () => { fail("root"); return rootBytes; },
+		catalog: async () => { fail("catalog"); return { entries: [], nextCursor: null }; },
+		bodies: async () => { fail("bodies"); return new Map(); },
+		semanticCatalog: async () => { fail("semanticCatalog"); return { entries: [{ documentId: "canvas", fileId: "canvas",
+			kind: "canvas" as const, format: "json-canvas" as const, formatVersion: 1 as const, path: "canvas.canvas",
+			bodyEpoch: 1, generation: 1, contentHash: "0".repeat(64), size: 0 }], nextCursor: null }; },
+		semantic: async (_id: string, documentId: string) => { fail("semantic");
+			return { documentId, bodyEpoch: 1, generation: 1, encodedState: new Uint8Array([0, 0]) }; },
+		renew: async () => { fail("renew"); },
+		complete: async () => { fail("complete"); return { currentHighWater: 0 }; },
+		changesAfter: async () => ({ entries: [], currentHighWater: 0, resetRequired: false }),
+		settleRootThrough: async () => {},
+	};
+	const client = new BootstrapClient(server as never, database as never, {} as never, {} as never);
+	return { client, database, server, writes, starts: () => calls };
+}
 await s.done();

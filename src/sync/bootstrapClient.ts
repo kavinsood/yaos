@@ -40,6 +40,47 @@ export type BootstrapHttpRequester = (
 	request: BootstrapHttpRequest,
 ) => Promise<BootstrapHttpResponse>;
 
+const BOOTSTRAP_RESTART_LIMIT = 2;
+const BOOTSTRAP_RESET_REASONS = new Set(["complete", "expired", "unknown", "failed", "ownership_unknown"]);
+
+export class BootstrapNotRunningError extends Error {
+	readonly code = "bootstrap_not_running";
+	readonly status = 409;
+	constructor(readonly reason: string) { super(`bootstrap_not_running: ${reason}`); }
+}
+
+function isBootstrapNotRunning(error: unknown): boolean {
+	if (!error || typeof error !== "object") return false;
+	const value = error as { code?: unknown; reason?: unknown; status?: unknown };
+	return value.code === "bootstrap_not_running" && value.status === 409
+		&& typeof value.reason === "string" && BOOTSTRAP_RESET_REASONS.has(value.reason);
+}
+
+function requireBootstrapResponse(response: BootstrapHttpResponse): void {
+	if (response.status === 200) return;
+	const value = response.json as { error?: unknown; reason?: unknown } | undefined;
+	if (response.status === 409 && value?.error === "bootstrap_not_running"
+		&& typeof value.reason === "string" && BOOTSTRAP_RESET_REASONS.has(value.reason)) {
+		throw new BootstrapNotRunningError(value.reason);
+	}
+	throw new Error(`vault request failed (${response.status})`);
+}
+
+async function withBootstrapRestart<T>(database: BootstrapDatabasePort, work: (restarted: boolean) => Promise<T>): Promise<T> {
+	for (let restarts = 0; ; restarts++) {
+		try { return await work(restarts > 0); }
+		catch (error) {
+			if (!isBootstrapNotRunning(error)) throw error;
+			const previous = await database.getBootstrapProgress();
+			await database.putBootstrapProgress({
+				bootstrapId: "", rootEpoch: previous?.rootEpoch ?? 1, highWater: 0,
+				nextCatalogCursor: null, stage: "root-loaded", settledBodies: 0, totalBodies: 0, feedCursor: 0,
+			});
+			if (restarts >= BOOTSTRAP_RESTART_LIMIT) throw new Error("bootstrap restart limit reached");
+		}
+	}
+}
+
 export interface ClientBootstrapDescriptor {
 	format?: "yaos-bootstrap-v2";
 	bootstrapId: string;
@@ -120,7 +161,7 @@ export interface ClientFeedEntry {
 	semanticCatalogs?: Array<ClientSemanticCatalogEntry & { lifecycle: "active" | "tombstoned" | "reaped" }>;
 }
 export interface BootstrapServerPort {
-	start(attemptId?: string): Promise<ClientBootstrapDescriptor>;
+	start(attemptId?: string, resume?: boolean): Promise<ClientBootstrapDescriptor>;
 	root(bootstrapId: string): Promise<Uint8Array>;
 	catalog(bootstrapId: string, cursor: string | null, limit: number): Promise<ClientCatalogPage>;
 	body(bootstrapId: string, bodyId: string): Promise<ClientBodyState>;
@@ -212,7 +253,9 @@ async function runBounded<T, R>(
 			results[index] = await work(items[index]!);
 		}
 	});
-	await Promise.all(workers);
+	const completed = await Promise.allSettled(workers);
+	const rejected = completed.find((entry): entry is PromiseRejectedResult => entry.status === "rejected");
+	if (rejected) throw rejected.reason;
 	return results;
 }
 
@@ -353,8 +396,8 @@ export class BootstrapHttpPort implements BootstrapServerPort {
 		this.base = host.replace(/\/$/, "");
 	}
 
-	async start(attemptId?: string): Promise<ClientBootstrapDescriptor> {
-		const descriptor = await this.json<ClientBootstrapDescriptor>("bootstrap/start", "POST", { attemptId });
+	async start(attemptId?: string, resume = false): Promise<ClientBootstrapDescriptor> {
+		const descriptor = await this.json<ClientBootstrapDescriptor>("bootstrap/start", "POST", { attemptId, ...(resume ? { resume: true } : {}) });
 		descriptor.capture.rootEpoch = parseSemanticEpoch(descriptor.capture.rootEpoch, "bootstrap root epoch");
 		this.rootEpochByBootstrap.set(descriptor.bootstrapId, descriptor.capture.rootEpoch);
 		return descriptor;
@@ -437,7 +480,7 @@ export class BootstrapHttpPort implements BootstrapServerPort {
 			]);
 			return new Map([...left, ...right]);
 		}
-		if (response.status !== 200) throw new Error(`vault request failed (${response.status})`);
+		requireBootstrapResponse(response);
 		const value = decodeBinaryEnvelope(new Uint8Array(response.arrayBuffer)) as {
 			bodies: Array<{ bodyId: string; bodyEpoch: number; generation: number; encodedState: Uint8Array }>;
 		};
@@ -617,7 +660,7 @@ export class BootstrapHttpPort implements BootstrapServerPort {
 			method: "GET",
 			headers: this.headers(),
 		});
-		if (response.status !== 200) throw new Error(`vault request failed (${response.status})`);
+		requireBootstrapResponse(response);
 		return response;
 	}
 
@@ -637,7 +680,7 @@ export class BootstrapHttpPort implements BootstrapServerPort {
 			headers: this.headers(),
 			...(body ? { contentType: "application/json" as const, body: JSON.stringify(body) } : {}),
 		});
-		if (response.status !== 200) throw new Error(`vault request failed (${response.status})`);
+		requireBootstrapResponse(response);
 		return response.json as T;
 	}
 
@@ -659,9 +702,18 @@ export async function prepareBootstrapRoot(
 	descriptor: ClientBootstrapDescriptor;
 	progress: StoredBootstrapProgress;
 }> {
+	return withBootstrapRestart(database, (restarted) => prepareBootstrapRootAttempt(server, database, restarted ? undefined : attemptId, now));
+}
+
+async function prepareBootstrapRootAttempt(
+	server: BootstrapServerPort,
+	database: BootstrapDatabasePort,
+	attemptId: string | undefined,
+	now: () => number,
+): Promise<{ descriptor: ClientBootstrapDescriptor; progress: StoredBootstrapProgress }> {
 	const existing = await database.getBootstrapProgress();
-	const descriptor = await server.start(existing?.bootstrapId ?? attemptId);
-	if (existing && existing.bootstrapId === descriptor.bootstrapId) {
+	const descriptor = await server.start(existing?.bootstrapId || attemptId, !!existing?.bootstrapId);
+	if (existing?.bootstrapId && existing.bootstrapId === descriptor.bootstrapId) {
 		return { descriptor, progress: existing };
 	}
 	const rootBytes = await server.root(descriptor.bootstrapId);
@@ -751,6 +803,10 @@ export class BootstrapClient {
 	private promoteLiveBody: ((head: ClientCatalogEntry) => Promise<boolean>) | null = null;
 
 	async run(attemptId?: string): Promise<StoredBootstrapProgress> {
+		return withBootstrapRestart(this.database, (restarted) => this.runAttempt(restarted ? undefined : attemptId));
+	}
+
+	private async runAttempt(attemptId?: string): Promise<StoredBootstrapProgress> {
 		let progress = await this.database.getBootstrapProgress();
 		if (progress?.stage === "complete") {
 			progress.stage = "feed-catching-up";
@@ -758,7 +814,7 @@ export class BootstrapClient {
 			await this.retryOutstanding(progress);
 			return progress;
 		}
-		const prepared = await prepareBootstrapRoot(
+		const prepared = await prepareBootstrapRootAttempt(
 			this.server,
 			this.database,
 			attemptId,

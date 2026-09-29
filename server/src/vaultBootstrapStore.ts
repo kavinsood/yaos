@@ -115,6 +115,35 @@ export function isValidOperationId(value: string): boolean {
 
 /** Bootstrap operations, pages, history pins, and content-object boundaries. */
 export class VaultBootstrapStore extends VaultCatalogStore {
+	private bootstrapOwnersInitialized = false;
+
+	private initializeBootstrapOwners(): void {
+		this.initialize();
+		if (this.bootstrapOwnersInitialized) return;
+		this.storage.sql.exec(`CREATE TABLE IF NOT EXISTS vault_bootstrap_owners (
+			operation_id TEXT PRIMARY KEY REFERENCES vault_operations(operation_id) ON DELETE CASCADE,
+			device_id TEXT NOT NULL
+		)`).toArray();
+		this.storage.sql.exec("CREATE INDEX IF NOT EXISTS vault_bootstrap_owners_device ON vault_bootstrap_owners(device_id)").toArray();
+		this.bootstrapOwnersInitialized = true;
+	}
+
+	bootstrapOwner(operationId: string): string | null {
+		this.initializeBootstrapOwners();
+		return this.storage.sql.exec<{ device_id: string }>(
+			"SELECT device_id FROM vault_bootstrap_owners WHERE operation_id = ?", operationId,
+		).toArray()[0]?.device_id ?? null;
+	}
+
+	runningBootstrapForDevice(deviceId: string): VaultOperation | null {
+		this.initializeBootstrapOwners();
+		const row = this.storage.sql.exec<{ operation_id: string }>(
+			`SELECT o.operation_id FROM vault_operations o JOIN vault_bootstrap_owners b ON b.operation_id = o.operation_id
+			 WHERE b.device_id = ? AND o.kind = 'bootstrap' AND o.state = 'running' ORDER BY o.created_at LIMIT 1`, deviceId,
+		).toArray()[0];
+		return row ? this.getOperation(row.operation_id) : null;
+	}
+
 	createPin(input: {
 		kind: HistoryPinKind;
 		boundarySequence?: number;
@@ -231,6 +260,7 @@ export class VaultBootstrapStore extends VaultCatalogStore {
 
 	beginPinnedOperation(input: {
 		operationId?: string;
+		ownerDeviceId?: string;
 		kind: VaultOperationKind;
 		boundarySequence?: number;
 		softTtlMs?: number;
@@ -238,6 +268,10 @@ export class VaultBootstrapStore extends VaultCatalogStore {
 		now?: number;
 	}): { operation: VaultOperation; pin: HistoryPin } {
 		this.initialize();
+		if (input.ownerDeviceId !== undefined) {
+			if (!input.ownerDeviceId || input.ownerDeviceId.length > 256) throw new Error("invalid bootstrap device identity");
+			this.initializeBootstrapOwners();
+		}
 		const now = input.now ?? Date.now();
 		const softTtl = input.softTtlMs ?? DEFAULT_SOFT_TTL_MS;
 		const hardTtl = input.hardTtlMs ?? DEFAULT_HARD_TTL_MS;
@@ -251,6 +285,9 @@ export class VaultBootstrapStore extends VaultCatalogStore {
 		}
 		const existing = this.getOperation(operationId);
 		if (existing) {
+			if (input.ownerDeviceId !== undefined && this.bootstrapOwner(operationId) !== input.ownerDeviceId) {
+				throw new Error("bootstrap_owner_mismatch");
+			}
 			if (existing.kind !== input.kind) throw new Error("operation ID belongs to a different operation kind");
 			const pin = this.getPin(operationId);
 			if (!pin) throw new Error("operation exists without its history pin");
@@ -306,6 +343,10 @@ export class VaultBootstrapStore extends VaultCatalogStore {
 				now,
 				now,
 			).toArray();
+			if (input.ownerDeviceId !== undefined) {
+				this.storage.sql.exec("INSERT INTO vault_bootstrap_owners(operation_id, device_id) VALUES (?, ?)",
+					operationId, input.ownerDeviceId).toArray();
+			}
 		});
 		return { operation, pin };
 	}

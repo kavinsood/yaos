@@ -1,7 +1,7 @@
 import type { YwasmCrdtDocument } from "./crdt/ywasmCrdtEngine";
 import { ywasmCrdtEngine as crdtEngine } from "@yaos/crdt-engine";
 import { encodeBinaryEnvelope, YAOS_BINARY_CONTENT_TYPE } from "./shared/binaryEnvelope";
-import { BootstrapService } from "./bootstrap";
+import { BootstrapOperationError, BootstrapService } from "./bootstrap";
 import { MAX_BODY_ID_LENGTH, MAX_CATCH_UP_BODIES, MAX_CATCH_UP_BYTES, MAX_DURABLE_UPDATE_BYTES, MAX_JSON_BYTES } from "./contracts";
 import { sha256Hex } from "./hex";
 import { BoundedBodyError, readBoundedBytes } from "./readBoundedBytes";
@@ -452,7 +452,7 @@ export class VaultRuntime implements DrainPort {
 			}
 			const contentRead = this.authorize(actor, url.pathname === "/diagnostics" ? "vault.diagnostics.read" : "vault.content.read");
 			if (contentRead instanceof Response) return contentRead;
-			const bootstrap = await this.bootstrapRoute(request, url, parts);
+			const bootstrap = await this.bootstrapRoute(request, url, parts, contentRead.deviceId);
 			if (bootstrap) return bootstrap;
 			if (request.method === "GET" && url.pathname === "/changes") {
 				const after = Number(url.searchParams.get("after") ?? "0");
@@ -480,6 +480,7 @@ export class VaultRuntime implements DrainPort {
 			if (request.method === "GET" && url.pathname === "/diagnostics") return this.diagnostics();
 			return json({ error: "not_found" }, 404);
 		} catch (error) {
+			if (error instanceof BootstrapOperationError) return error.response();
 			console.error("[yaos-vault] request failed", error);
 			return json({ error: error instanceof Error ? error.message : "vault_runtime_failed" }, 500);
 		}
@@ -885,32 +886,35 @@ export class VaultRuntime implements DrainPort {
 		}
 	}
 
-	private async bootstrapRoute(request: Request, url: URL, parts: string[]): Promise<Response | null> {
+	private async bootstrapRoute(request: Request, url: URL, parts: string[], deviceId: string): Promise<Response | null> {
 		if (parts[0] !== "bootstrap") return null;
+		const bootstrap = this.bootstrap.forDevice(deviceId);
 		if (request.method === "POST" && url.pathname === "/bootstrap/start") {
 			await this.flushLoadedDocuments();
 			let input: unknown = {};
 			try { input = await request.json(); } catch { /* optional body */ }
 			const attemptId = typeof input === "object" && input !== null && !Array.isArray(input)
 				&& "attemptId" in input && typeof input.attemptId === "string" ? input.attemptId : undefined;
-			return json(await this.bootstrap.start(attemptId));
+			const resume = typeof input === "object" && input !== null && !Array.isArray(input)
+				&& "resume" in input && input.resume === true;
+			return json(await bootstrap.start(attemptId, resume));
 		}
 		const bootstrapId = parts[1];
 		if (!bootstrapId) return json({ error: "not_found" }, 404);
 		if (request.method === "GET" && parts.length === 3 && parts[2] === "root") {
-			const state = this.bootstrap.rootState(bootstrapId);
+			const state = bootstrap.rootState(bootstrapId);
 			const release = this.cache.reserveFullStateOperation("root", 1, state.encodedState.byteLength);
 			try {
 				return new Response(state.encodedState.slice().buffer, { headers: { "content-type": "application/octet-stream",
 					[ROOT_EPOCH_HEADER]: String(state.rootEpoch), "x-yaos-sha256": await state.hash } });
 			} finally { release(); }
 		}
-		if (request.method === "GET" && parts.length === 3 && parts[2] === "catalog") return json(this.bootstrap.catalogPage(bootstrapId, url.searchParams.get("cursor"), boundedLimit(url)));
+		if (request.method === "GET" && parts.length === 3 && parts[2] === "catalog") return json(bootstrap.catalogPage(bootstrapId, url.searchParams.get("cursor"), boundedLimit(url)));
 		if (request.method === "GET" && parts.length === 3 && parts[2] === "semantic-catalog") {
-			return json(this.bootstrap.semanticCatalogPage(bootstrapId, url.searchParams.get("cursor"), boundedLimit(url)));
+			return json(bootstrap.semanticCatalogPage(bootstrapId, url.searchParams.get("cursor"), boundedLimit(url)));
 		}
 		if (request.method === "GET" && parts.length === 4 && parts[2] === "semantic") {
-			const state = this.bootstrap.semanticState(bootstrapId, parts[3]!);
+			const state = bootstrap.semanticState(bootstrapId, parts[3]!);
 			const release = this.cache.reserveFullStateOperation(state.documentId, 1, state.encodedState.byteLength);
 			try {
 				return new Response(state.encodedState.slice().buffer, { headers: { "content-type": "application/octet-stream",
@@ -957,7 +961,7 @@ export class VaultRuntime implements DrainPort {
 			const releases: Array<() => void> = [];
 			try {
 				const bodies = bodyIds.map((bodyId) => {
-					const state = this.bootstrap.bodyState(bootstrapId, bodyId);
+					const state = bootstrap.bodyState(bootstrapId, bodyId);
 					const release = this.cache.reserveFullStateOperation(bodyId, 1, state.encodedState.byteLength);
 					releases.push(release);
 					return {
@@ -979,7 +983,7 @@ export class VaultRuntime implements DrainPort {
 		}
 		if (request.method === "GET" && parts.length === 4 && parts[2] === "body") {
 			const bodyId = parts[3]!;
-			const state = this.bootstrap.bodyState(bootstrapId, bodyId);
+			const state = bootstrap.bodyState(bootstrapId, bodyId);
 			const release = this.cache.reserveFullStateOperation(bodyId, 1, state.encodedState.byteLength);
 			try {
 				const head = this.store.getCatalogHeadAt(state.throughSequence, state.bodyId);
@@ -996,12 +1000,11 @@ export class VaultRuntime implements DrainPort {
 				return json({ error: "invalid_json" }, 400);
 			}
 			const settledBodies = "settledBodies" in input && typeof input.settledBodies === "number" ? input.settledBodies : 0;
-			this.bootstrap.renew(bootstrapId, settledBodies);
+			bootstrap.renew(bootstrapId, settledBodies);
 			return json({ ok: true });
 		}
 		if (request.method === "POST" && parts.length === 3 && parts[2] === "complete") {
-			const operation = this.store.getOperation(bootstrapId);
-			if (operation?.state === "running") this.bootstrap.complete(bootstrapId);
+			bootstrap.complete(bootstrapId);
 			return json({ currentHighWater: this.store.currentSequence() });
 		}
 		return json({ error: "not_found" }, 404);

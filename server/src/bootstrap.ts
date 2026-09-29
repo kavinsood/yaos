@@ -8,6 +8,24 @@ import { canonicalCrdtRootDigestBytes } from "./shared/crdtRootDigest";
 const DEFAULT_PAGE_SIZE = 1000;
 const SOFT_TTL_MS = 60 * 60_000;
 const HARD_TTL_MS = 24 * 60 * 60_000;
+export type BootstrapNotRunningReason = "complete" | "expired" | "unknown" | "failed" | "ownership_unknown";
+
+export class BootstrapOperationError extends Error {
+	constructor(
+		readonly reason: BootstrapNotRunningReason | "owner_mismatch",
+		readonly status: 409 | 403 = 409,
+	) {
+		super(reason === "unknown" ? "bootstrap not found" : `bootstrap is not running: ${reason}`);
+	}
+
+	get code(): "bootstrap_not_running" | "bootstrap_owner_mismatch" {
+		return this.status === 403 ? "bootstrap_owner_mismatch" : "bootstrap_not_running";
+	}
+
+	response(): Response {
+		return Response.json({ error: this.code, reason: this.reason }, { status: this.status });
+	}
+}
 export interface ImmutableArtifactStore {
 	exists(key: string): Promise<boolean>;
 	get(key: string): Promise<Uint8Array | null>;
@@ -79,21 +97,30 @@ export class BootstrapService {
 		private readonly store: VaultStore,
 		private readonly now: () => number = Date.now,
 		private readonly reserveFullState: (documentId: string, overlappingCopies: number) => () => void = () => () => {},
+		private readonly ownerDeviceId?: string,
 	) {}
 
-	async start(attemptId?: string): Promise<BootstrapDescriptor> {
+	forDevice(deviceId: string): BootstrapService {
+		if (!deviceId || deviceId.length > 256) throw new Error("invalid bootstrap device identity");
+		return new BootstrapService(this.store, this.now, this.reserveFullState, deviceId);
+	}
+
+	async start(attemptId?: string, resume = false): Promise<BootstrapDescriptor> {
 		const now = this.now();
-		if (attemptId !== undefined && !isValidOperationId(attemptId)) throw new Error("invalid bootstrap attempt ID");
-		this.store.cleanupStuckPins(now);
-		let operation = attemptId ? this.store.getOperation(attemptId) : this.store.runningOperation("bootstrap");
-		if (operation?.state === "failed") {
-			const pin = this.store.getPin(operation.operationId);
-			if (!pin || now >= pin.softExpiresAt || now >= pin.hardExpiresAt) throw new Error("bootstrap lease expired");
-			operation = this.store.resumeFailedOperation(operation.operationId, now);
+		if (attemptId !== undefined && !isValidOperationId(attemptId)) {
+			if (resume) throw new BootstrapOperationError("unknown");
+			throw new Error("invalid bootstrap attempt ID");
 		}
-		if (operation?.state === "complete") return this.describeOperation(operation);
+		this.store.cleanupStuckPins(now);
+		let operation = attemptId ? this.store.getOperation(attemptId) : null;
+		if (!operation && !resume && this.ownerDeviceId) {
+			operation = this.store.runningBootstrapForDevice(this.ownerDeviceId);
+		}
+		if (resume && !operation) throw new BootstrapOperationError("unknown");
+		if (operation) this.requireRunning(operation.operationId);
 		const started = this.store.beginPinnedOperation({
 			operationId: operation?.operationId ?? attemptId,
+			ownerDeviceId: this.ownerDeviceId,
 			kind: "bootstrap",
 			softTtlMs: SOFT_TTL_MS,
 			hardTtlMs: HARD_TTL_MS,
@@ -112,12 +139,12 @@ export class BootstrapService {
 	}
 
 	async describe(bootstrapId: string): Promise<BootstrapDescriptor> {
-		const operation = this.requireOperation(bootstrapId);
+		const operation = this.requireRunning(bootstrapId);
 		return this.describeOperation(operation);
 	}
 
 	rootState(bootstrapId: string): { encodedState: Uint8Array; rootEpoch: SemanticEpoch; hash: Promise<string> } {
-		const operation = this.requireOperation(bootstrapId);
+		const operation = this.requireRunning(bootstrapId);
 		const release = this.reserveFullState("root", 2);
 		try {
 			const reconstructed = this.store.reconstructDocument("root", operation.boundarySequence);
@@ -196,18 +223,25 @@ export class BootstrapService {
 	}
 
 	private requireOperation(bootstrapId: string): VaultOperation {
-		if (!isValidOperationId(bootstrapId)) throw new Error("invalid bootstrap attempt ID");
+		if (!isValidOperationId(bootstrapId)) throw new BootstrapOperationError("unknown");
 		const operation = this.store.getOperation(bootstrapId);
-		if (!operation || operation.kind !== "bootstrap") throw new Error("bootstrap not found");
+		if (!operation || operation.kind !== "bootstrap") throw new BootstrapOperationError("unknown");
+		const owner = this.store.bootstrapOwner?.(bootstrapId) ?? null;
+		if (this.ownerDeviceId !== undefined) {
+			if (!owner) throw new BootstrapOperationError("ownership_unknown");
+			if (owner !== this.ownerDeviceId) throw new BootstrapOperationError("owner_mismatch", 403);
+		} else if (owner) {
+			throw new BootstrapOperationError("owner_mismatch", 403);
+		}
 		return operation;
 	}
 
 	private requireRunning(bootstrapId: string): VaultOperation {
 		const operation = this.requireOperation(bootstrapId);
-		if (operation.state !== "running") throw new Error(`bootstrap is ${operation.state}`);
+		if (operation.state === "complete") throw new BootstrapOperationError("complete");
 		const pin = this.store.getPin(bootstrapId);
-		if (!pin) throw new Error("bootstrap lease missing");
-		if (this.now() >= pin.softExpiresAt || this.now() >= pin.hardExpiresAt) throw new Error("bootstrap lease expired");
+		if (!pin || this.now() >= pin.softExpiresAt || this.now() >= pin.hardExpiresAt) throw new BootstrapOperationError("expired");
+		if (operation.state !== "running") throw new BootstrapOperationError("failed");
 		return operation;
 	}
 	private async describeOperation(operation: VaultOperation): Promise<BootstrapDescriptor> {
