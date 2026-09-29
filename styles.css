@@ -161,3 +161,30 @@ body.vault-crdt-show-cursors .cm-editor .cm-ySelectionCaret {
 body .cm-editor .cm-ySelectionInfo {
 	display: none;
 }
+
+.yaos-attention-notice {
+	display: flex;
+	flex-direction: column;
+	align-items: flex-start;
+	gap: 8px;
+	min-width: 0;
+	max-width: 100%;
+	white-space: normal;
+}
+
+.yaos-attention-notice-message {
+	white-space: normal;
+	overflow-wrap: anywhere;
+}
+
+button.yaos-attention-notice-action {
+	min-width: 0;
+	max-width: 100%;
+	height: auto;
+	white-space: normal;
+	overflow-wrap: anywhere;
+}
+
+.is-mobile button.yaos-attention-notice-action {
+	min-height: 44px;
+}

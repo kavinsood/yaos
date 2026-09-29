@@ -14,6 +14,7 @@ import { EditorBindingManager } from "./sync/editorBinding";
 import { DiskMirror } from "./sync/diskMirror";
 import { ConflictEpisodes, type ConflictEpisodeState } from "./sync/conflictEpisodes";
 import { ConflictListModal } from "./ui/ConflictListModal";
+import { createConflictAttentionNotice } from "./ui/attentionNoticeQueue";
 import { mergeThreeWayText } from "./sync/threeWayMerge";
 import { VaultIndexedDb } from "./sync/vaultIndexedDb";
 import {
@@ -2900,11 +2901,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			}),
 			changed: () => this.refreshStatusBar(),
 			notify: (bodyIds) => {
-				const fragment = document.createDocumentFragment();
-				const button = document.createElement("button");
-				button.textContent = `${bodyIds.length} note${bodyIds.length === 1 ? "" : "s"} need a conflict decision — Review YAOS conflicts`;
-				button.addEventListener("click", () => this.reviewYaosConflicts());
-				fragment.appendChild(button);
+				const fragment = createConflictAttentionNotice(
+					this.app.workspace.containerEl.ownerDocument,
+					bodyIds.length,
+					() => this.reviewYaosConflicts(),
+				);
 				new Notice(fragment, 12_000);
 			},
 		});
