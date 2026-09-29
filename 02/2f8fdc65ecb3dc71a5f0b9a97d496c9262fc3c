@@ -1,0 +1,39 @@
+scripts/relay2/analyze.py
+  s_06158d5aa75452::t_77844cee8fabf3 1-126
+scripts/relay2/deploy.sh
+  s_06158d5aa75452::t_9f378e6afbaee0 5-9,29,37-38,93-94,110,114
+scripts/relay2/gql.ts
+  s_06158d5aa75452::t_ca1ab61899f1fd 1-116
+scripts/relay2/l5-cli-baseline.ts
+  s_06158d5aa75452::t_b04c0f34e056d1 1-269
+scripts/relay2/lib/checks.ts
+  s_06158d5aa75452::t_be37ccd1768aa8 18-23
+scripts/relay2/lib/rawClient.ts
+  s_06158d5aa75452::t_7c681204380ea4 46-47,64-68,70,72-73,75-76,82,84-85,88,96-98,131-132,233-236,330-331,337
+scripts/relay2/lib/run.ts
+  s_06158d5aa75452::t_d066cb0ae73a3a 9,196-199,201-204
+scripts/relay2/scenarios/behaviour.ts
+  s_06158d5aa75452::t_fcdfcf92268008 33,35-54
+scripts/relay2/scenarios/limits.ts
+  s_06158d5aa75452::t_d5a25e4bcfd182 64-69,80,85-87
+scripts/relay2/tail.sh
+  s_06158d5aa75452::t_9e5f283286fa57 1-17
+scripts/relay2/tailparse.py
+  s_06158d5aa75452::t_11f888036a428c 1-43
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "022f8fdc65ecb3dc71a5f0b9a97d496c9262fc3c",
+  "prompts": {},
+  "sessions": {
+    "s_06158d5aa75452": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aabbc0b8c933cb988",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
