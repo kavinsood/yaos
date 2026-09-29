@@ -1,6 +1,7 @@
 import { base64UrlToBytes, bytesToBase64Url, randomBase64Url } from "../base64url";
 import type { VaultActorContext } from "../collaboration";
 import { sha256Hex } from "../hex";
+import { DEVICE_LAST_SEEN_RESOLUTION_MS } from "../contracts";
 import type { AuthState, Env } from "./types";
 import {
 	parseSemanticEpoch,
@@ -132,6 +133,50 @@ function isTicketPayload(value: unknown): value is TicketPayload {
 		&& typeof payload.nonce === "string" && payload.nonce.length > 0;
 }
 
+/** In-isolate record of recent `touch-device` calls, keyed by vault and device. */
+const touchedDevices = new Map<string, number>();
+const MAX_TOUCHED_DEVICES = 4_096;
+
+/**
+ * Refresh the device's `lastSeenAt` without holding the ticket response.
+ *
+ * Every socket open and ticket refresh mints a ticket, and the touch is a write
+ * on the singleton control plane, so awaiting it cost a round trip per ticket
+ * and serialized parallel ticket requests behind each other. The touch is
+ * coalesced to once per `DEVICE_LAST_SEEN_RESOLUTION_MS` per device in
+ * this isolate (the control plane also skips redundant writes across
+ * isolates) and handed to the host's `waitUntil`. It stays best effort: a
+ * failure is swallowed and only clears the coalescing entry so the next
+ * ticket retries.
+ */
+function scheduleTouchDevice(env: Env, actor: VaultActorContext): void {
+	const now = Date.now();
+	const resolutionMs = DEVICE_LAST_SEEN_RESOLUTION_MS;
+	const key = `${actor.vaultId}\u0000${actor.deviceId}`;
+	const last = touchedDevices.get(key);
+	if (last !== undefined && now - last < resolutionMs) return;
+	if (touchedDevices.size >= MAX_TOUCHED_DEVICES) {
+		for (const [entry, touchedAt] of touchedDevices) {
+			if (now - touchedAt >= resolutionMs) touchedDevices.delete(entry);
+		}
+		if (touchedDevices.size >= MAX_TOUCHED_DEVICES) touchedDevices.clear();
+	}
+	touchedDevices.set(key, now);
+	const forget = (): void => {
+		if (touchedDevices.get(key) === now) touchedDevices.delete(key);
+	};
+	const task = (async () => {
+		const response = await env.YAOS_CONFIG.call("global-config", new Request("https://internal/__yaos/touch-device", {
+			method: "POST", headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ deviceId: actor.deviceId, vaultId: actor.vaultId }),
+		}));
+		if (!response.ok) forget();
+	})().catch(forget);
+	// Without an execution port (e.g. the long-lived Node host) the promise
+	// simply runs to completion on its own.
+	env.execution?.waitUntil(task);
+}
+
 export async function handleTicketRoute(req: Request, authState: AuthState, actor: VaultActorContext,
 	json: (body: unknown, status?: number) => Response, env?: Env,
 ): Promise<Response> {
@@ -153,12 +198,7 @@ export async function handleTicketRoute(req: Request, authState: AuthState, acto
 			return json({ error: "invalid_ticket_scope" }, 400);
 		}
 		const result = await createTicket(authState, actor, scope, readTicketTtlMs(env?.YAOS_TICKET_TTL_MS));
-		if (env) try {
-			await env.YAOS_CONFIG.call("global-config", new Request("https://internal/__yaos/touch-device", {
-				method: "POST", headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({ deviceId: actor.deviceId, vaultId: actor.vaultId }),
-			}));
-		} catch { /* best effort */ }
+		if (env) scheduleTouchDevice(env, actor);
 		return json(result);
 	} catch (error) {
 		return json({ error: error instanceof Error ? error.message : "ticket creation failed" }, 500);

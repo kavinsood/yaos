@@ -369,9 +369,10 @@ export async function handleWorkerRequest(request: Request, env: Env): Promise<R
 }
 
 const worker = {
-	fetch(request: Request, env: CloudflareWorkerEnvironment): Promise<Response> {
+	fetch(request: Request, env: CloudflareWorkerEnvironment, ctx: ExecutionContext): Promise<Response> {
 		return handleWorkerRequest(request, {
 			...env,
+			execution: ctx,
 			YAOS_SYNC: new CloudflareActorCalls(env.YAOS_SYNC),
 			YAOS_CONFIG: new CloudflareActorCalls(env.YAOS_CONFIG),
 			YAOS_RECOVERY_JOBS: env.YAOS_RECOVERY_JOBS ? new CloudflareActorCalls(env.YAOS_RECOVERY_JOBS) : undefined,

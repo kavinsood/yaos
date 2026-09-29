@@ -8,7 +8,7 @@ import { BoundedBodyError, readBoundedBytes } from "./readBoundedBytes";
 import { handleVaultRecoveryRpc } from "./recoveryRpcRouter";
 import { RECOVERY_PUBLIC_RPC_PATH } from "./recoveryProtocol";
 import type { ActorCallPort, AlarmPort, DrainPort, ExecutionPort, ObjectStorePort, VaultRuntimeStoragePort } from "./platformPorts";
-import { CloudflareActorCalls, CloudflareAlarmPort, CloudflareExecutionPort, CloudflareObjectStore, CloudflareSocketRegistry } from "./cloudflarePorts";
+import { CloudflareActorCalls, CloudflareAlarmPort, CloudflareExecutionPort, CloudflareObjectStore, CloudflareSocketRegistry, reciprocateSocketClose } from "./cloudflarePorts";
 import { handleSettingsSyncRequest, SettingsSyncStore } from "./settingsSyncStore";
 import {
 	SERVER_PROTOCOL_VERSION,
@@ -152,6 +152,8 @@ export interface VaultRuntimeOptions {
 	execution: ExecutionPort;
 	objectStore?: ObjectStorePort;
 	recoveryJobs?: ActorCallPort;
+	/** Control plane, for best-effort device presence (`lastSeenAt`) refreshes. */
+	controlPlane?: ActorCallPort;
 }
 
 /** Schema-8 root/Markdown/Canvas composition, independent of a worker or process host. */
@@ -224,6 +226,7 @@ export class VaultRuntime implements DrainPort {
 			},
 			scheduleFlush: (documentId) => this.scheduleFlush(documentId),
 			shouldPauseAdmission: (documentId) => this.semanticCompaction?.shouldPauseAdmission(documentId) ?? false,
+			...(options.controlPlane ? { touchDevice: (deviceId: string) => this.touchDevice(deviceId) } : {}),
 		});
 		this.sockets = socketOwner;
 		this.semanticCompaction = new SemanticCompactionRuntime({
@@ -562,10 +565,30 @@ export class VaultRuntime implements DrainPort {
 		else await this.sockets.message(socket, message);
 	}
 
-	webSocketClose(): void {}
+	/** Hosts pass the closed socket; presence of its awareness identity is removed for peers. */
+	webSocketClose(socket?: VaultSocketPort): void {
+		if (socket) this.sockets.socketClosed(socket);
+	}
 
 	webSocketError(socket: VaultSocketPort): void {
 		try { socket.close(1011, "socket error"); } catch { /* already closed */ }
+		this.sockets.socketClosed(socket);
+	}
+
+	/**
+	 * Best-effort `lastSeenAt` refresh for a long-connected device, off the
+	 * socket's critical path. The socket service rate-limits per root socket
+	 * and the control plane skips writes within its own resolution.
+	 */
+	private touchDevice(deviceId: string): void {
+		const controlPlane = this.options.controlPlane;
+		const metadata = this.store.vaultMetadata();
+		if (!controlPlane || !metadata) return;
+		const task = controlPlane.call("global-config", new Request("https://internal/__yaos/touch-device", {
+			method: "POST", headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ deviceId, vaultId: metadata.vaultId }),
+		})).then(() => undefined, () => undefined);
+		this.options.execution.waitUntil(task);
 	}
 
 	drain(): Promise<void> {
@@ -1282,6 +1305,8 @@ export class VaultRuntime implements DrainPort {
 export interface CloudflareVaultEnvironment {
 	YAOS_BUCKET?: R2Bucket;
 	YAOS_RECOVERY_JOBS?: DurableObjectNamespace;
+	/** The Worker's control-plane namespace; Durable Objects share the Worker's bindings. */
+	YAOS_CONFIG?: DurableObjectNamespace;
 }
 
 // Workers namespaces require the exported class type to carry the RPC brand.
@@ -1303,6 +1328,7 @@ export class VaultSyncServer implements DurableObject {
 			recoveryJobs: env.YAOS_RECOVERY_JOBS
 				? new CloudflareActorCalls(env.YAOS_RECOVERY_JOBS)
 				: undefined,
+			controlPlane: env.YAOS_CONFIG ? new CloudflareActorCalls(env.YAOS_CONFIG) : undefined,
 		});
 	}
 
@@ -1314,8 +1340,9 @@ export class VaultSyncServer implements DurableObject {
 		return this.runtime.webSocketMessage(socket, message);
 	}
 
-	webSocketClose(): void {
-		this.runtime.webSocketClose();
+	webSocketClose(socket: WebSocket, code: number, reason: string): void {
+		reciprocateSocketClose(socket, code, reason);
+		this.runtime.webSocketClose(socket);
 	}
 
 	webSocketError(socket: WebSocket): void {

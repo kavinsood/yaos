@@ -98,6 +98,7 @@ class VaultActor implements RuntimeActor {
 		alarms: AlarmPort,
 		objects: FilesystemObjectStore,
 		recoveryJobs: ActorCallPort,
+		controlPlane: ActorCallPort,
 	) {
 		this.runtime = new VaultRuntime({
 			storage,
@@ -106,6 +107,7 @@ class VaultActor implements RuntimeActor {
 			execution,
 			objectStore: objects,
 			recoveryJobs,
+			controlPlane,
 		});
 	}
 
@@ -121,8 +123,8 @@ class VaultActor implements RuntimeActor {
 		return this.runtime.webSocketMessage(socket, message);
 	}
 
-	closed(): void {
-		this.runtime.webSocketClose();
+	closed(socket: VaultSocketPort): void {
+		this.runtime.webSocketClose(socket);
 	}
 
 	socketError(socket: VaultSocketPort): void {
@@ -261,9 +263,9 @@ export async function runNodeServer(options: NodeServerOptions): Promise<void> {
 						await (actor as VaultActor).message(socket, message);
 					}).catch((error) => console.error("[yaos-node] WebSocket message failed", error));
 				},
-				close: () => {
+				close: (socket) => {
 					void actors.call("vault", name, async (actor) => {
-						(actor as VaultActor).closed();
+						(actor as VaultActor).closed(socket);
 					}).catch((error) => console.error("[yaos-node] WebSocket close failed", error));
 				},
 				error: (socket) => {
@@ -279,6 +281,7 @@ export async function runNodeServer(options: NodeServerOptions): Promise<void> {
 				alarms.forActor(kind, name),
 				objects,
 				recoveryCalls,
+				configCalls,
 			);
 		};
 

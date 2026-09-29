@@ -26,7 +26,7 @@ interface CombinedEnvironment extends BenchmarkEnvironment {
 }
 
 const worker = {
-	async fetch(request: Request, env: CombinedEnvironment): Promise<Response> {
+	async fetch(request: Request, env: CombinedEnvironment, ctx: ExecutionContext): Promise<Response> {
 		const pathname = new URL(request.url).pathname;
 		if (request.method === "POST" && pathname === "/__yaos/benchmark/recovery-page-sizing") {
 			const rejection = authorizeBenchmarkRequest(request, env);
@@ -43,7 +43,7 @@ const worker = {
 		if (pathname.startsWith("/__yaos/benchmark/")) {
 			return benchmarkWorker.fetch(request, env);
 		}
-		return productionWorker.fetch(request, env);
+		return productionWorker.fetch(request, env, ctx);
 	},
 };
 

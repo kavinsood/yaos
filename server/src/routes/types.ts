@@ -1,5 +1,5 @@
 import type { StoredServerConfig } from "../config";
-import type { ActorCallPort, ObjectStorePort, SocketUpgradePort } from "../platformPorts";
+import type { ActorCallPort, ExecutionPort, ObjectStorePort, SocketUpgradePort } from "../platformPorts";
 
 
 export interface Env {
@@ -8,6 +8,8 @@ export interface Env {
 	YAOS_RECOVERY_JOBS?: ActorCallPort;
 	YAOS_BUCKET?: ObjectStorePort;
 	socketUpgrades: SocketUpgradePort;
+	/** Keeps best-effort background work alive past the response, when the host supports it. */
+	execution?: ExecutionPort;
 	YAOS_TICKET_TTL_MS?: string;
 	YAOS_ENABLE_ADMIN_ROUTES?: string;
 }

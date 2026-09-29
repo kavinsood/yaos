@@ -430,8 +430,36 @@ export class SqlControlPlaneStorage implements ControlPlaneStoragePort {
 		return rows.map((row) => ({ recordKey: row.record_key, value: decodeJson(row.payload_json) as T }));
 	}
 
-	upsertRecordDirect(collection: ControlPlaneCollection, value: unknown): void {
+	upsertRecordDirect(collection: ControlPlaneCollection, value: unknown, knownToExist = false): void {
 		const metadata = recordMetadata(collection, value);
+		const payload = encodeRecord(value);
+		if (!knownToExist) {
+			this.insertOrReplaceRecordDirect(collection, metadata, payload);
+			return;
+		}
+		// Fast path: when no indexed column changes (e.g. a device `lastSeenAt`
+		// touch), rewrite only the unindexed payload. SQLite then leaves all
+		// 13 secondary indexes alone, so the update costs one row write
+		// instead of one per index entry the upsert's full SET rewrites.
+		const updated = this.host.sql.exec(
+			`UPDATE control_plane_records SET payload_json = ?
+			 WHERE namespace = ? AND collection = ? AND record_key = ?
+				AND vault_id IS ? AND vault_generation IS ? AND state IS ? AND created_at IS ? AND expires_at IS ?
+				AND principal_id IS ? AND device_id IS ? AND token_hash IS ? AND code_hash IS ? AND pairing_code_hash IS ?
+				AND request_id IS ? AND authorization_change_id IS ? AND role IS ? AND purpose IS ?
+				AND consumed_at IS ? AND completed_at IS ?`,
+			payload, this.namespace, collection, metadata.recordKey,
+			metadata.vaultId, metadata.vaultGeneration, metadata.state, metadata.createdAt, metadata.expiresAt,
+			metadata.principalId, metadata.deviceId, metadata.tokenHash, metadata.codeHash, metadata.pairingCodeHash,
+			metadata.requestId, metadata.authorizationChangeId, metadata.role, metadata.purpose,
+			metadata.consumedAt, metadata.completedAt,
+		).rowsWritten;
+		// The record exists, so its collection is already registered.
+		if (updated !== 0) return;
+		this.insertOrReplaceRecordDirect(collection, metadata, payload);
+	}
+
+	private insertOrReplaceRecordDirect(collection: ControlPlaneCollection, metadata: RecordMetadata, payload: string): void {
 		this.host.sql.exec(
 			`INSERT INTO control_plane_records(
 				namespace, collection, record_key, vault_id, vault_generation, state, created_at, expires_at,
@@ -453,7 +481,7 @@ export class SqlControlPlaneStorage implements ControlPlaneStoragePort {
 			metadata.createdAt, metadata.expiresAt, metadata.principalId, metadata.deviceId,
 			metadata.tokenHash, metadata.codeHash, metadata.pairingCodeHash, metadata.requestId,
 			metadata.authorizationChangeId, metadata.role,
-			metadata.purpose, metadata.consumedAt, metadata.completedAt, encodeRecord(value),
+			metadata.purpose, metadata.consumedAt, metadata.completedAt, payload,
 		);
 		this.host.sql.exec(
 			"INSERT INTO control_plane_collections(namespace, collection) VALUES (?, ?) ON CONFLICT DO NOTHING",
@@ -630,11 +658,19 @@ class SqlControlPlaneTransaction implements ControlPlaneTransactionPort {
 			.map((write) => write.value as T);
 	}
 
+	/** Records this transaction read from storage (collection NUL recordKey). */
+	private readonly existingRecords = new Set<string>();
+
 	readonly records: ControlPlaneRecordTransactionPort = {
 		get: async <T = unknown>(collection: string, filter: ControlPlaneRecordFilter) => {
 			if (!isCollection(collection)) throw new TypeError(`unknown control-plane collection: ${collection}`);
 			const pending = this.pendingRecords<T>(collection, filter)[0];
-			return pending ?? this.storage.getRecordDirect<T>(collection, filter, this.overlayFor(collection));
+			if (pending !== undefined) return pending;
+			const stored = this.storage.getRecordDirect<T>(collection, filter, this.overlayFor(collection));
+			// Lets commit rewrite a read-then-updated record in place (see
+			// upsertRecordDirect); a stale hint only costs the fallback insert.
+			if (stored !== undefined) this.existingRecords.add(`${collection}\0${recordMetadata(collection, stored).recordKey}`);
+			return stored;
 		},
 		upsert: async (collection, record) => {
 			if (!isCollection(collection)) throw new TypeError(`unknown control-plane collection: ${collection}`);
@@ -744,7 +780,7 @@ class SqlControlPlaneTransaction implements ControlPlaneTransactionPort {
 		}
 		for (const write of this.recordWrites.values()) {
 			if (write.deleted) this.storage.deleteRecordDirect(write.collection, write.recordKey);
-			else this.storage.upsertRecordDirect(write.collection, write.value);
+			else this.storage.upsertRecordDirect(write.collection, write.value, this.existingRecords.has(`${write.collection}\0${write.recordKey}`));
 		}
 		for (const append of this.recordAppends) {
 			this.storage.retainRecordsDirect(append.collection, append.maximumRecords);

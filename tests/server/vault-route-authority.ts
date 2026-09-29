@@ -5,7 +5,7 @@ import * as syncProtocol from "y-protocols/sync";
 import { applyAwarenessUpdate, Awareness, encodeAwarenessUpdate } from "y-protocols/awareness";
 import * as Y from "yjs";
 import { ywasmCrdtEngine as testCrdtEngine } from "../../packages/server-node/src/ywasmNodeCrdtEngine";
-import { encodeRootPathPublicationUpdate } from "../../server/src/server";
+import { encodeRootPathPublicationUpdate, VaultSyncServer } from "../../server/src/server";
 import { AUTHORITY_SUPERSEDED_SOCKET_CLOSE_CODE } from "../../server/src/shared/socketCloseCodes";
 import { MAX_CLIENT_MARKDOWN_BYTES } from "../../server/src/shared/durableLimits";
 import { SEMANTIC_EPOCH_RESET_SOCKET_CLOSE_CODE } from "../../server/src/shared/semanticEpoch";
@@ -757,13 +757,54 @@ function awarenessFrame(entries: Array<{ clientId: number; clock?: number; state
 	for (const entry of entries) {
 		encoding.writeVarUint(payload, entry.clientId);
 		encoding.writeVarUint(payload, entry.clock ?? 1);
-		encoding.writeVarString(payload, JSON.stringify(entry.state ?? { cursor: null }));
+		encoding.writeVarString(payload, JSON.stringify(entry.state === undefined ? { cursor: null } : entry.state));
 	}
 	const frame = encoding.createEncoder();
 	encoding.writeVarUint(frame, 1);
 	encoding.writeVarUint8Array(frame, encoding.toUint8Array(payload));
 	const bytes = encoding.toUint8Array(frame);
 	return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+}
+
+function presenceSocket(documentId: string, overrides: Partial<VaultSocketAttachment> = {}): {
+	socket: VaultSocketPort;
+	sent: Array<string | ArrayBuffer | ArrayBufferView>;
+	closes: Array<{ code: number; reason: string }>;
+	current: () => VaultSocketAttachment;
+} {
+	let current: VaultSocketAttachment = { ...attachment, kind: "body", documentId, ...overrides };
+	const sent: Array<string | ArrayBuffer | ArrayBufferView> = [];
+	const closes: Array<{ code: number; reason: string }> = [];
+	return {
+		socket: {
+			deserializeAttachment: () => current,
+			serializeAttachment: (value) => { current = value as VaultSocketAttachment; },
+			send: (message) => { sent.push(message); },
+			close: (code = 1000, reason = "") => { closes.push({ code, reason }); },
+		},
+		sent,
+		closes,
+		current: () => current,
+	};
+}
+
+function relayedAwareness(sent: ReadonlyArray<string | ArrayBuffer | ArrayBufferView>): Array<{ clientId: number; state: unknown }> {
+	const entries: Array<{ clientId: number; state: unknown }> = [];
+	for (const message of sent) {
+		if (typeof message === "string") continue;
+		const bytes = message instanceof ArrayBuffer ? new Uint8Array(message)
+			: new Uint8Array(message.buffer, message.byteOffset, message.byteLength);
+		const frame = decoding.createDecoder(bytes);
+		assert.equal(decoding.readVarUint(frame), 1);
+		const payload = decoding.createDecoder(decoding.readVarUint8Array(frame));
+		const count = decoding.readVarUint(payload);
+		for (let index = 0; index < count; index++) {
+			const clientId = decoding.readVarUint(payload);
+			decoding.readVarUint(payload);
+			entries.push({ clientId, state: JSON.parse(decoding.readVarString(payload)) });
+		}
+	}
+	return entries;
 }
 
 function presenceService(sockets: VaultSocketPort[]): VaultSocketService {
@@ -780,22 +821,28 @@ function presenceService(sockets: VaultSocketPort[]): VaultSocketService {
 	} as never);
 }
 
-s.test("awareness rejects frames that claim multiple client identities", async () => {
+s.test("an unbound socket cannot bind its awareness identity from an ambiguous frame", async () => {
+	let current: VaultSocketAttachment = { ...attachment, kind: "body" as const, documentId: "body-presence-multi-id" };
 	let close: { code: number; reason: string } | null = null;
 	const socket: VaultSocketPort = {
-		deserializeAttachment: () => ({ ...attachment, kind: "body" as const, documentId: "body-presence-multi-id" }),
-		serializeAttachment: () => {},
+		deserializeAttachment: () => current,
+		serializeAttachment: (value) => { current = value as VaultSocketAttachment; },
 		send: () => {},
 		close: (code = 1000, reason = "") => { close = { code, reason }; },
 	};
-	await presenceService([socket]).message(socket, awarenessFrame([
-		{ clientId: 101 },
-		{ clientId: 102 },
-	]));
-	assert.deepEqual(close, { code: 1008, reason: "invalid awareness identity" });
+	const peer = presenceSocket("body-presence-multi-id", { deviceId: "peer-device", socketId: "multi-id-peer" });
+	const service = presenceService([socket, peer.socket]);
+	await service.message(socket, awarenessFrame([{ clientId: 101 }, { clientId: 102 }]));
+	await service.message(socket, awarenessFrame([{ clientId: 103, state: null }]));
+	assert.equal(close, null, "ambiguous presence is ignored, not fatal");
+	assert.equal(current.awarenessClientId, undefined, "neither a multi-entry frame nor a removal binds an identity");
+	assert.equal(peer.sent.length, 0);
+	await service.message(socket, awarenessFrame([{ clientId: 104 }]));
+	assert.equal(current.awarenessClientId, 104, "the first single live entry binds the socket");
+	assert.deepEqual(relayedAwareness(peer.sent).map(({ clientId }) => clientId), [104]);
 });
 
-s.test("awareness identity is immutable for the lifetime of a socket", async () => {
+s.test("awareness identity is immutable and foreign entries are dropped without closing", async () => {
 	let current: VaultSocketAttachment = { ...attachment, kind: "body" as const, documentId: "body-presence-stable-id" };
 	let close: { code: number; reason: string } | null = null;
 	const socket: VaultSocketPort = {
@@ -804,30 +851,321 @@ s.test("awareness identity is immutable for the lifetime of a socket", async () 
 		send: () => {},
 		close: (code = 1000, reason = "") => { close = { code, reason }; },
 	};
-	const service = presenceService([socket]);
+	const peer = presenceSocket("body-presence-stable-id", { deviceId: "peer-device", socketId: "stable-id-peer" });
+	const service = presenceService([socket, peer.socket]);
 	await service.message(socket, awarenessFrame([{ clientId: 201 }]));
 	assert.equal(current.awarenessClientId, 201);
-	await service.message(socket, awarenessFrame([{ clientId: 202 }]));
-	assert.deepEqual(close, { code: 1008, reason: "awareness identity changed" });
+	peer.sent.length = 0;
+	await service.message(socket, awarenessFrame([{ clientId: 202, state: { user: { name: "Echoed peer" } } }]));
+	assert.equal(close, null, "a re-broadcast peer state must not disconnect the socket");
+	assert.equal(current.awarenessClientId, 201);
+	assert.equal(peer.sent.length, 0, "a foreign-only frame is ignored, never relayed");
 });
 
-s.test("awareness identity cannot be reused by another socket in the same room", async () => {
+s.test("an older admission cannot take an awareness identity a newer socket holds", async () => {
 	const documentId = "body-presence-collision";
-	const first: VaultSocketPort = {
-		deserializeAttachment: () => ({ ...attachment, kind: "body" as const, documentId, awarenessClientId: 301 }),
-		serializeAttachment: () => {},
-		send: () => {},
-		close: () => {},
+	const newer = presenceSocket(documentId, { awarenessClientId: 301, socketId: "collision-newer", admittedAt: 2_000 });
+	const older = presenceSocket(documentId, { socketId: "collision-older", admittedAt: 1_000 });
+	await presenceService([newer.socket, older.socket]).message(older.socket, awarenessFrame([{ clientId: 301 }]));
+	assert.deepEqual(older.closes, [{ code: 1008, reason: "awareness identity already in use" }]);
+	assert.deepEqual(newer.closes, []);
+	assert.equal(newer.current().awarenessClientId, 301);
+});
+
+s.test("a same-device reconnect evicts the ghost socket holding its awareness identity (newest wins)", async () => {
+	const documentId = "body-presence-ghost";
+	// The server never saw the abnormal close of the device's previous socket.
+	const ghost = presenceSocket(documentId, { awarenessClientId: 311, socketId: "ghost-old", admittedAt: 1_000 });
+	const fresh = presenceSocket(documentId, { socketId: "ghost-new", admittedAt: 5_000 });
+	const peer = presenceSocket(documentId, { deviceId: "peer-device", socketId: "ghost-peer", awarenessClientId: 312 });
+	const service = presenceService([ghost.socket, fresh.socket, peer.socket]);
+	await service.message(fresh.socket, awarenessFrame([{ clientId: 311, clock: 9 }]));
+	assert.deepEqual(fresh.closes, [], "the new socket is not closed (that looped every ~1 s)");
+	assert.equal(fresh.current().awarenessClientId, 311);
+	assert.deepEqual(ghost.closes, [{ code: 1008, reason: "awareness identity superseded" }]);
+	assert.equal(ghost.current().awarenessClientId, undefined, "the ghost releases the identity before it closes");
+	assert.deepEqual(relayedAwareness(peer.sent).map(({ clientId }) => clientId), [311]);
+	// The ghost's close later must not remove the identity the new socket now holds.
+	peer.sent.length = 0;
+	service.socketClosed(ghost.socket);
+	assert.equal(peer.sent.length, 0);
+});
+
+s.test("a socket from another device cannot evict an identity it merely echoes", async () => {
+	const documentId = "body-presence-foreign-ghost";
+	const holder = presenceSocket(documentId, { awarenessClientId: 321, socketId: "foreign-holder", admittedAt: 1_000 });
+	const other = presenceSocket(documentId, { deviceId: "other-device", socketId: "foreign-other", admittedAt: 9_000 });
+	await presenceService([holder.socket, other.socket]).message(other.socket, awarenessFrame([{ clientId: 321 }]));
+	assert.deepEqual(holder.closes, []);
+	assert.equal(holder.current().awarenessClientId, 321);
+	assert.equal(other.current().awarenessClientId, undefined);
+});
+
+s.test("a closed socket's awareness identity is removed for peers at the last relayed clock", async () => {
+	const documentId = "body-presence-close";
+	const source = presenceSocket(documentId, { socketId: "close-source", admittedAt: 1_000 });
+	const peer = presenceSocket(documentId, { deviceId: "peer-device", socketId: "close-peer", awarenessClientId: 332 });
+	const elsewhere = presenceSocket("body-presence-other-room", { deviceId: "peer-device", socketId: "close-elsewhere" });
+	const service = presenceService([source.socket, peer.socket, elsewhere.socket]);
+	await service.message(source.socket, awarenessFrame([{ clientId: 331, clock: 4, state: { cursor: { anchor: 1 } } }]));
+	const peerDoc = new Y.Doc();
+	const peerAwareness = new Awareness(peerDoc);
+	for (const message of peer.sent) {
+		const bytes = new Uint8Array(message as ArrayBuffer);
+		const frame = decoding.createDecoder(bytes);
+		decoding.readVarUint(frame);
+		applyAwarenessUpdate(peerAwareness, decoding.readVarUint8Array(frame), "server");
+	}
+	assert.ok(peerAwareness.getStates().has(331));
+	peer.sent.length = 0;
+	service.socketClosed(source.socket);
+	assert.deepEqual(relayedAwareness(peer.sent), [{ clientId: 331, state: null }]);
+	assert.equal(elsewhere.sent.length, 0, "other rooms are untouched");
+	const removal = decoding.createDecoder(new Uint8Array(peer.sent[0] as ArrayBuffer));
+	decoding.readVarUint(removal);
+	applyAwarenessUpdate(peerAwareness, decoding.readVarUint8Array(removal), "server");
+	assert.equal(peerAwareness.getStates().has(331), false, "a Yjs peer accepts the removal");
+	service.socketClosed(source.socket);
+	assert.equal(peer.sent.length, 1, "error followed by close removes once");
+	peerAwareness.destroy();
+	peerDoc.destroy();
+});
+
+s.test("a close after a hibernation wake still removes the identity at a clock peers accept (N5)", async () => {
+	const documentId = "body-presence-wake";
+	const source = presenceSocket(documentId, { socketId: "wake-source", admittedAt: 1_000 });
+	const peer = presenceSocket(documentId, { deviceId: "peer-device", socketId: "wake-peer", awarenessClientId: 352 });
+	await presenceService([source.socket, peer.socket]).message(source.socket, awarenessFrame([
+		{ clientId: 351, clock: 7, state: { cursor: { anchor: 2 } } },
+	]));
+	assert.equal(source.current().awarenessClock, 7, "the relayed clock is persisted with the socket");
+	const peerAwareness = new Awareness(new Y.Doc());
+	const apply = (message: string | ArrayBuffer | ArrayBufferView) => {
+		const frame = decoding.createDecoder(new Uint8Array(message as ArrayBuffer));
+		decoding.readVarUint(frame);
+		applyAwarenessUpdate(peerAwareness, decoding.readVarUint8Array(frame), "server");
 	};
-	let close: { code: number; reason: string } | null = null;
-	const second: VaultSocketPort = {
-		deserializeAttachment: () => ({ ...attachment, kind: "body" as const, documentId, socketId: "presence-collision-second" }),
-		serializeAttachment: () => {},
-		send: () => {},
-		close: (code = 1000, reason = "") => { close = { code, reason }; },
-	};
-	await presenceService([first, second]).message(second, awarenessFrame([{ clientId: 301 }]));
-	assert.deepEqual(close, { code: 1008, reason: "awareness identity already in use" });
+	for (const message of peer.sent) apply(message);
+	assert.ok(peerAwareness.getStates().has(351));
+	peer.sent.length = 0;
+	// Hibernation: attachments survive (serialized), service memory does not.
+	const woken = presenceService([source.socket, peer.socket]);
+	assert.ok(parseVaultSocketAttachment(JSON.parse(JSON.stringify(source.current()))), "the clock survives serialization");
+	woken.socketClosed(source.socket);
+	assert.deepEqual(relayedAwareness(peer.sent), [{ clientId: 351, state: null }]);
+	apply(peer.sent[0]!);
+	assert.equal(peerAwareness.getStates().has(351), false,
+		"a removal at clock 0 (the in-memory map lost on wake) was ignored by a peer at clock 7");
+	assert.equal(source.current().awarenessClock, undefined, "released with the identity");
+	peerAwareness.destroy();
+});
+
+s.test("a closed socket keeps its identity for peers while the same device still holds it", async () => {
+	const documentId = "body-presence-close-held";
+	const closing = presenceSocket(documentId, { socketId: "held-closing", awarenessClientId: 341 });
+	const holder = presenceSocket(documentId, { socketId: "held-holder", awarenessClientId: 341 });
+	const peer = presenceSocket(documentId, { deviceId: "peer-device", socketId: "held-peer" });
+	const unbound = presenceSocket(documentId, { socketId: "held-unbound" });
+	const service = presenceService([closing.socket, holder.socket, peer.socket, unbound.socket]);
+	service.socketClosed(closing.socket);
+	assert.equal(peer.sent.length, 0);
+	service.socketClosed(unbound.socket);
+	assert.equal(peer.sent.length, 0, "a socket that never bound an identity removes nothing");
+});
+
+s.test("foreign awareness entries are filtered and the own entry is relayed with the server-authored user", async () => {
+	const documentId = "body-presence-filter";
+	const source = presenceSocket(documentId, { awarenessClientId: 401, socketId: "filter-source" });
+	const peer = presenceSocket(documentId, { deviceId: "peer-device", socketId: "filter-peer", awarenessClientId: 402 });
+	await presenceService([source.socket, peer.socket]).message(source.socket, awarenessFrame([
+		{ clientId: 402, state: { user: { name: "Echoed peer" } } },
+		{ clientId: 401, state: { user: { name: "Mallory", deviceId: "spoofed" }, cursor: { anchor: 3 } } },
+		{ clientId: 403, state: null },
+	]));
+	assert.deepEqual(source.closes, [], "a frame mixing peer echoes must not disconnect the socket");
+	assert.equal(peer.sent.length, 1);
+	const [relayed] = relayedAwareness(peer.sent);
+	assert.deepEqual(relayedAwareness(peer.sent).map(({ clientId }) => clientId), [401], "only the socket's own entry is relayed");
+	const state = relayed!.state as { user: Record<string, unknown>; cursor: unknown };
+	assert.deepEqual(state.cursor, { anchor: 3 });
+	assert.equal(state.user.name, "Alice");
+	assert.equal(state.user.deviceId, attachment.deviceId);
+	assert.equal(state.user.principalId, attachment.principalId);
+});
+
+s.test("an own awareness removal is relayed while a foreign-only removal is dropped", async () => {
+	const documentId = "body-presence-removal";
+	const source = presenceSocket(documentId, { awarenessClientId: 501, socketId: "removal-source" });
+	const peer = presenceSocket(documentId, { deviceId: "peer-device", socketId: "removal-peer" });
+	const service = presenceService([source.socket, peer.socket]);
+	await service.message(source.socket, awarenessFrame([{ clientId: 502, state: null }]));
+	assert.equal(peer.sent.length, 0, "a removal of another client can neither be relayed nor spoofed");
+	await service.message(source.socket, awarenessFrame([{ clientId: 501, state: null }]));
+	assert.deepEqual(source.closes, []);
+	assert.deepEqual(relayedAwareness(peer.sent), [{ clientId: 501, state: null }]);
+});
+
+s.test("an unbound socket echoing another device's live identity is ignored, not closed", async () => {
+	const documentId = "body-presence-echo";
+	const peer = presenceSocket(documentId, { deviceId: "peer-device", socketId: "echo-peer", awarenessClientId: 601 });
+	const source = presenceSocket(documentId, { socketId: "echo-source" });
+	const service = presenceService([peer.socket, source.socket]);
+	await service.message(source.socket, awarenessFrame([{ clientId: 601 }]));
+	assert.deepEqual(source.closes, []);
+	assert.equal(source.current().awarenessClientId, undefined);
+	assert.equal(peer.sent.length, 0);
+	await service.message(source.socket, awarenessFrame([{ clientId: 602 }]));
+	assert.equal(source.current().awarenessClientId, 602);
+	assert.deepEqual(relayedAwareness(peer.sent).map(({ clientId }) => clientId), [602]);
+});
+
+function staleRuntimeService(sockets: VaultSocketPort[], overrides: Record<string, unknown> = {}): VaultSocketService {
+	return new VaultSocketService({
+		sockets: registry(sockets),
+		cache: { load: () => { throw new Error("runtime-independent frames must not load documents"); } },
+		vaultId: () => attachment.vaultId,
+		vaultGeneration: () => attachment.vaultGeneration,
+		runtimeEpoch: "epoch-authority-after-wake",
+		isActiveBody: () => true,
+		currentRootEpoch: () => attachment.documentEpoch,
+		currentBodyHead: () => null,
+		validateActor: () => true,
+		principalPresence: () => ({ displayName: "Alice", colorSeed: "alice-color-seed" }),
+		scheduleFlush: () => {},
+		...overrides,
+	} as never);
+}
+
+s.test("a socket admitted by an earlier runtime keeps liveness but stays fenced for document frames", async () => {
+	const root = presenceSocket("root", { kind: "root", socketId: "stale-runtime-root" });
+	const service = staleRuntimeService([root.socket]);
+	await service.message(root.socket, '__YPS:{"type":"VAULT_PING","probeId":"probe-after-wake"}');
+	assert.deepEqual(root.closes, []);
+	assert.deepEqual(JSON.parse((root.sent[0] as string).slice(6)), {
+		type: "VAULT_PONG",
+		probeId: "probe-after-wake",
+		documentId: "root",
+		documentEpoch: 1,
+		vaultGeneration: attachment.vaultGeneration,
+		runtimeEpoch: attachment.runtimeEpoch,
+	}, "the pong reports the socket's admission runtime, not the new one");
+	const sync = encoding.createEncoder();
+	encoding.writeVarUint(sync, 0);
+	syncProtocol.writeSyncStep1(sync, new Y.Doc());
+	await service.message(root.socket, encoding.toUint8Array(sync).slice().buffer);
+	assert.deepEqual(root.closes, [{ code: 1008, reason: "socket authority mismatch" }]);
+	assert.equal(root.sent.length, 1, "fenced frames receive no reply");
+});
+
+s.test("a socket admitted by an earlier runtime still relays its own awareness", async () => {
+	const documentId = "body-presence-after-wake";
+	const source = presenceSocket(documentId, { awarenessClientId: 701, socketId: "wake-source" });
+	const peer = presenceSocket(documentId, { deviceId: "peer-device", socketId: "wake-peer" });
+	await staleRuntimeService([source.socket, peer.socket]).message(source.socket, awarenessFrame([{ clientId: 701, state: null }]));
+	assert.deepEqual(source.closes, []);
+	assert.deepEqual(relayedAwareness(peer.sent), [{ clientId: 701, state: null }]);
+});
+
+s.test("runtime-independent liveness keeps body activity and semantic epoch fences", async () => {
+	const inactive = presenceSocket("body-inactive-after-wake", { socketId: "wake-inactive" });
+	await staleRuntimeService([inactive.socket], { isActiveBody: () => false })
+		.message(inactive.socket, '__YPS:{"type":"VAULT_PING","probeId":"probe-inactive-after-wake"}');
+	assert.deepEqual(inactive.closes, [{ code: 1008, reason: "body is not active" }]);
+	assert.equal(inactive.sent.length, 0);
+	const retired = presenceSocket("body-retired-after-wake", { socketId: "wake-retired" });
+	await staleRuntimeService([retired.socket], {
+		currentBodyHead: (bodyId: string) => ({ bodyId, bodyEpoch: 2, lifecycle: "active",
+			generation: 2, contentHash: null, size: null, sequence: 2 }),
+	}).message(retired.socket, '__YPS:{"type":"VAULT_PING","probeId":"probe-retired-after-wake"}');
+	assert.deepEqual(retired.closes, [{ code: SEMANTIC_EPOCH_RESET_SOCKET_CLOSE_CODE, reason: "semantic epoch reset" }]);
+	assert.equal(JSON.parse((retired.sent[0] as string).slice(6)).type, "SEMANTIC_EPOCH_RESET_REQUIRED");
+});
+
+s.test("a revoked device's ping is answered with authority_superseded, not a pong", async () => {
+	for (const runtimeEpoch of [attachment.runtimeEpoch, "epoch-authority-after-wake"]) {
+		const root = presenceSocket("root", { kind: "root", socketId: `revoked-${runtimeEpoch}` });
+		const validated: string[] = [];
+		await staleRuntimeService([root.socket], {
+			runtimeEpoch,
+			validateActor: (actor: { deviceId: string }) => { validated.push(actor.deviceId); return false; },
+		}).message(root.socket, '__YPS:{"type":"VAULT_PING","probeId":"probe-revoked"}');
+		assert.deepEqual(validated, [attachment.deviceId]);
+		assert.equal(root.sent.length, 1);
+		assert.deepEqual(JSON.parse((root.sent[0] as string).slice(6)), {
+			type: "error", code: "authority_superseded", reason: "socket authority superseded",
+		});
+		assert.deepEqual(root.closes, [{ code: AUTHORITY_SUPERSEDED_SOCKET_CLOSE_CODE, reason: "socket authority superseded" }]);
+	}
+});
+
+s.test("commit notices close sockets admitted by an earlier runtime that cannot take a catch-up hint", () => {
+	const bodyId = "body-committed-after-wake";
+	const current = presenceSocket("root", { kind: "root", socketId: "commit-current", runtimeEpoch: "epoch-authority-after-wake" });
+	const stale = presenceSocket("root", { kind: "root", socketId: "commit-stale" });
+	staleRuntimeService([current.socket, stale.socket], {
+		cache: { get: () => undefined },
+		currentBodyHead: (id: string) => ({ bodyId: id, bodyEpoch: 1, lifecycle: "active",
+			generation: 4, contentHash: "b".repeat(64), size: 3, sequence: 9 }),
+	}).notifyBodyCommitted(bodyId, 4, 9);
+	const notice = JSON.parse((current.sent[0] as string).slice(6));
+	assert.equal(notice.type, "BODY_COMMITTED");
+	assert.equal(notice.runtimeEpoch, "epoch-authority-after-wake");
+	assert.deepEqual(current.closes, []);
+	assert.equal(stale.sent.length, 0, "an old client would discard both the notice and an unknown hint");
+	assert.deepEqual(stale.closes, [{ code: 1008, reason: "socket authority mismatch" }]);
+});
+
+s.test("root liveness refreshes the device's lastSeenAt at most once per resolution window", async () => {
+	let now = 10 * 60_000;
+	const touched: string[] = [];
+	const root = presenceSocket("root", { kind: "root", socketId: "touch-root", lastSeenTouchedAt: 0 });
+	const body = presenceSocket("body-touch", { socketId: "touch-body", lastSeenTouchedAt: 0 });
+	const service = staleRuntimeService([root.socket, body.socket], {
+		runtimeEpoch: attachment.runtimeEpoch,
+		touchDevice: (deviceId: string) => { touched.push(deviceId); },
+		now: () => now,
+	});
+	const ping = '__YPS:{"type":"VAULT_PING","probeId":"probe-touch"}';
+	await service.message(root.socket, ping);
+	assert.deepEqual(touched, [attachment.deviceId]);
+	assert.equal(root.current().lastSeenTouchedAt, now, "recorded on the socket, so it survives hibernation");
+	now += 60_000;
+	await service.message(root.socket, ping);
+	await service.message(body.socket, ping);
+	assert.deepEqual(touched, [attachment.deviceId], "coalesced; body sockets never touch");
+	now += 5 * 60_000;
+	await service.message(root.socket, ping);
+	assert.equal(touched.length, 2);
+	assert.equal(root.sent.filter((message) => typeof message === "string" && message.includes("VAULT_PONG")).length, 3);
+});
+
+s.test("the Durable Object reciprocates a peer-initiated close", () => {
+	const closes: unknown[][] = [];
+	let runtimeCloses = 0;
+	const server = Object.create(VaultSyncServer.prototype) as VaultSyncServer;
+	const closedSockets: unknown[] = [];
+	Object.defineProperty(server, "runtime", { value: { webSocketClose: (closed: unknown) => {
+		runtimeCloses++;
+		closedSockets.push(closed);
+	} } });
+	const socket = { close: (...args: unknown[]) => { closes.push(args); } };
+	server.webSocketClose(socket as never, 1000, "client done");
+	server.webSocketClose(socket as never, 4403, "device authority changed");
+	server.webSocketClose(socket as never, 1005, "");
+	server.webSocketClose(socket as never, 1006, "");
+	assert.deepEqual(closes, [[1000, "client done"], [4403, "device authority changed"], [], []],
+		"reserved codes are answered with a code-less close frame");
+	const closed = { close: () => { throw new Error("WebSocket already closed"); } };
+	assert.doesNotThrow(() => server.webSocketClose(closed as never, 1000, ""));
+	assert.equal(runtimeCloses, 5);
+	assert.equal(closedSockets[0], socket, "the runtime learns which socket closed (presence removal)");
+	const refused: unknown[][] = [];
+	const picky = { close: (...args: unknown[]) => {
+		refused.push(args);
+		if (args.length > 0) throw new Error("invalid close reason");
+	} };
+	assert.doesNotThrow(() => server.webSocketClose(picky as never, 1000, "r".repeat(200)));
+	assert.deepEqual(refused, [[1000, "r".repeat(200)], []], "a refused echo falls back to a code-less close");
 });
 
 await s.done();

@@ -3,7 +3,13 @@ import * as encoding from "lib0/encoding";
 import { modifyAwarenessUpdate } from "y-protocols/awareness";
 import type { CrdtDocument, CrdtEngine, CrdtRootSnapshot, CrdtValueSnapshot } from "./crdt/crdtEngine";
 import { readSyncMessage, writeSyncStep1, writeSyncStep2, writeSyncUpdate } from "./crdt/syncFraming";
-import { MAX_AWARENESS_BYTES, MAX_BODY_SOCKETS, MAX_CANDIDATE_BYTES, MAX_ROOT_SOCKETS } from "./contracts";
+import {
+	DEVICE_LAST_SEEN_RESOLUTION_MS,
+	MAX_AWARENESS_BYTES,
+	MAX_BODY_SOCKETS,
+	MAX_CANDIDATE_BYTES,
+	MAX_ROOT_SOCKETS,
+} from "./contracts";
 import { sha256Hex } from "./hex";
 import {
 	VaultDocumentCachePressureError,
@@ -20,6 +26,8 @@ import {
 	parseBodyCurrentnessQueryFrame,
 	parseVaultPingFrame,
 	type BodyCurrentnessHead,
+	type BodyCurrentnessQueryFrame,
+	type VaultPingFrame,
 } from "./shared/socketLiveness";
 import { validateFrontmatterSemanticSnapshots } from "./crdt/frontmatterSemanticSnapshots";
 import { canonicalMarkdownBytes } from "./shared/markdownCodec";
@@ -37,6 +45,67 @@ import {
 const MESSAGE_SYNC = 0;
 const MESSAGE_AWARENESS = 1;
 const MAX_IDENTITY_LENGTH = 256;
+const MAX_TEXT_FRAME = 64 * 1024;
+
+/**
+ * A hibernation wake constructs a new runtime (new runtimeEpoch) while sockets
+ * admitted by the previous runtime stay connected. Frames that touch runtime
+ * resident document or pending-durability state are fenced across that
+ * boundary. The frames below are served on such sockets after the usual actor,
+ * semantic-epoch and body-activity checks:
+ *
+ * - liveness pings and awareness read only the socket attachment and the
+ *   durable authority mirror.
+ */
+type ControlFrame =
+	| { kind: "ping"; ping: VaultPingFrame }
+	| { kind: "currentness"; query: BodyCurrentnessQueryFrame }
+	| { kind: "other" };
+
+/** Parses a `__YPS:` text frame once; null for anything that is not a control frame. */
+function parseControlFrame(message: string): ControlFrame | null {
+	if (message.length > MAX_TEXT_FRAME || !message.startsWith("__YPS:")) return null;
+	let value: unknown;
+	try { value = JSON.parse(message.slice(6)); }
+	catch { return null; }
+	const ping = parseVaultPingFrame(value);
+	if (ping) return { kind: "ping", ping };
+	const query = parseBodyCurrentnessQueryFrame(value);
+	if (query) return { kind: "currentness", query };
+	return { kind: "other" };
+}
+
+function isRuntimeIndependentFrame(message: string | ArrayBuffer, control: ControlFrame | null): boolean {
+	if (typeof message === "string") return control?.kind === "ping";
+	// A leading 0x01 is exactly varuint 1: no continuation bit.
+	return message.byteLength > 0 && new Uint8Array(message, 0, 1)[0] === MESSAGE_AWARENESS;
+}
+
+interface AwarenessEntry {
+	clientId: number;
+	clock: number;
+	state: string;
+}
+
+function decodeAwarenessEntries(payload: Uint8Array): AwarenessEntry[] {
+	const decoder = decoding.createDecoder(payload);
+	const count = decoding.readVarUint(decoder);
+	const entries: AwarenessEntry[] = [];
+	for (let index = 0; index < count; index++) {
+		const clientId = decoding.readVarUint(decoder);
+		const clock = decoding.readVarUint(decoder);
+		const state = decoding.readVarString(decoder);
+		if (decoder.pos > payload.byteLength) throw new Error("truncated awareness entry");
+		if (!Number.isSafeInteger(clientId) || clientId < 0) throw new Error("invalid awareness identity");
+		entries.push({ clientId, clock, state });
+	}
+	return entries;
+}
+
+function isAwarenessRemoval(entry: AwarenessEntry): boolean {
+	try { return JSON.parse(entry.state) === null; }
+	catch { return false; }
+}
 
 export interface VaultSocketAttachment {
 	vaultId: string;
@@ -54,8 +123,25 @@ export interface VaultSocketAttachment {
 	policyVersion: number;
 	capabilityDigest: string;
 	awarenessClientId?: number;
+	/**
+	 * Clock of the last awareness entry relayed for {@link awarenessClientId}.
+	 * Kept in the attachment, not in memory: after the runtime hibernates and
+	 * wakes, the close still publishes a removal at a clock peers accept.
+	 */
+	awarenessClock?: number;
 	socketId: string;
+	/** Wall-clock admission time; the newest admission wins an awareness identity. */
+	admittedAt?: number;
+	/** Last time liveness on this socket refreshed the device's `lastSeenAt`. */
+	lastSeenTouchedAt?: number;
 }
+function withoutAwarenessIdentity(attachment: VaultSocketAttachment): VaultSocketAttachment {
+	const released = { ...attachment };
+	delete released.awarenessClientId;
+	delete released.awarenessClock;
+	return released;
+}
+
 export interface VaultSocketPort {
 	close(code?: number, reason?: string): void;
 	deserializeAttachment(): unknown;
@@ -104,7 +190,12 @@ export function parseVaultSocketAttachment(value: unknown): VaultSocketAttachmen
 		|| typeof attachment.capabilityDigest !== "string" || !validIdentity(attachment.capabilityDigest)
 		|| (attachment.awarenessClientId !== undefined && (!Number.isSafeInteger(attachment.awarenessClientId)
 			|| attachment.awarenessClientId < 0))
+		|| (attachment.awarenessClock !== undefined && (!Number.isSafeInteger(attachment.awarenessClock)
+			|| attachment.awarenessClock < 0))
 		|| typeof attachment.socketId !== "string" || !validIdentity(attachment.socketId)
+		|| (attachment.admittedAt !== undefined && (!Number.isSafeInteger(attachment.admittedAt) || attachment.admittedAt < 0))
+		|| (attachment.lastSeenTouchedAt !== undefined
+			&& (!Number.isSafeInteger(attachment.lastSeenTouchedAt) || attachment.lastSeenTouchedAt < 0))
 		|| (attachment.kind !== "root" && attachment.kind !== "body" && attachment.kind !== "semantic")
 		|| typeof attachment.documentId !== "string"
 		|| typeof attachment.documentEpoch !== "number"
@@ -316,6 +407,14 @@ export interface SocketServiceOptions {
 	principalPresence(principalId: string): { displayName: string; colorSeed: string } | null;
 	scheduleFlush: (documentId: string) => void;
 	shouldPauseAdmission?: (documentId: string) => boolean;
+	/**
+	 * Best-effort refresh of a device's `lastSeenAt`. Tickets are only minted
+	 * to open a socket, so a long-connected device is otherwise never seen.
+	 * Called at most once per {@link DEVICE_LAST_SEEN_RESOLUTION_MS} per root
+	 * socket, from liveness pings.
+	 */
+	touchDevice?: (deviceId: string) => void;
+	now?: () => number;
 }
 
 function cachePressureResponse(reason: "body_cache_count" | "body_cache_encoded_state_bytes" | "vault_transient_bytes"
@@ -329,6 +428,10 @@ function cachePressureResponse(reason: "body_cache_count" | "body_cache_encoded_
 /** Owns hibernated root/body sockets, attachments, framing, and fan-out. */
 export class VaultSocketService {
 	constructor(private readonly options: SocketServiceOptions) {}
+
+	private now(): number {
+		return this.options.now?.() ?? Date.now();
+	}
 
 	openBodyIds(): ReadonlySet<string> {
 		const result = new Set<string>();
@@ -416,6 +519,9 @@ export class VaultSocketService {
 			policyVersion: actor.policyVersion,
 			capabilityDigest: actor.capabilityDigest,
 			socketId: crypto.randomUUID(),
+			admittedAt: this.now(),
+			// The ticket minted for this upgrade already refreshed lastSeenAt.
+			lastSeenTouchedAt: this.now(),
 		};
 		server.serializeAttachment(attachment);
 		this.options.sockets.accept(server);
@@ -446,16 +552,19 @@ export class VaultSocketService {
 
 	async message(socket: VaultSocketPort, message: string | ArrayBuffer): Promise<void> {
 		const attachment = parseVaultSocketAttachment(socket.deserializeAttachment());
+		const control = typeof message === "string" ? parseControlFrame(message) : null;
 		if (!attachment
 			|| attachment.vaultId !== this.options.vaultId()
 			|| attachment.vaultGeneration !== this.options.vaultGeneration()
-			|| attachment.runtimeEpoch !== this.options.runtimeEpoch) {
+			|| (attachment.runtimeEpoch !== this.options.runtimeEpoch && !isRuntimeIndependentFrame(message, control))) {
 			socket.close(1008, "socket authority mismatch");
 			return;
 		}
+		// Every frame, including runtime-independent liveness, re-validates the
+		// actor against the durable authority mirror before it is served.
 		if (!(this.options.validateActor?.(this.actorFromAttachment(attachment)) ?? true)) {
 			this.sendControl(socket, { type: "error", code: "authority_superseded", reason: "socket authority superseded" });
-			socket.close(1008, "socket authority superseded");
+			socket.close(AUTHORITY_SUPERSEDED_SOCKET_CLOSE_CODE, "socket authority superseded");
 			return;
 		}
 		if (this.fenceSocketIfStale(socket, attachment)) return;
@@ -465,16 +574,17 @@ export class VaultSocketService {
 			return;
 		}
 		if (typeof message === "string") {
-			if (message.length > 64 * 1024) {
+			if (message.length > MAX_TEXT_FRAME) {
 				socket.close(1009, "text frame too large");
 				return;
 			}
-			if (!message.startsWith("__YPS:")) return;
-			let value: unknown;
-			try { value = JSON.parse(message.slice(6)); }
-			catch { return; }
-			const ping = parseVaultPingFrame(value);
-			if (ping) {
+			if (!control || control.kind === "other") return;
+			if (control.kind === "ping") {
+				const ping = control.ping;
+				this.touchDeviceFromLiveness(socket, attachment);
+				// The pong echoes the socket's own admission runtime, never the
+				// current one: it proves the connection is live, not that this
+				// runtime holds frames the socket sent to an earlier runtime.
 				this.sendControl(socket, {
 					type: "VAULT_PONG",
 					probeId: ping.probeId,
@@ -485,8 +595,7 @@ export class VaultSocketService {
 				});
 				return;
 			}
-			const query = parseBodyCurrentnessQueryFrame(value);
-			if (!query) return;
+			const query = control.query;
 			if (attachment.kind === "body"
 				&& (query.bodyIds.length !== 1 || query.bodyIds[0] !== attachment.documentId)) {
 				socket.close(1008, "body currentness query authority mismatch");
@@ -624,8 +733,59 @@ export class VaultSocketService {
 		};
 		for (const socket of this.options.sockets.sockets()) {
 			const attachment = parseVaultSocketAttachment(socket.deserializeAttachment());
-			if (attachment?.kind === "root"
-				|| (attachment?.documentId === bodyId && attachment.documentEpoch === bodyEpoch)) this.sendControl(socket, value);
+			if (!attachment || (attachment.kind !== "root"
+				&& (attachment.documentId !== bodyId || attachment.documentEpoch !== bodyEpoch))) continue;
+			// Clients accept commit notices only from the runtime that admitted
+			// the socket: the notice's runtime epoch is receipt evidence for
+			// frames that socket sent. A socket that outlived its runtime (kept
+			// open by runtime-independent liveness) is closed and reconnects.
+			if (attachment.runtimeEpoch !== this.options.runtimeEpoch) {
+				try { socket.close(1008, "socket authority mismatch"); } catch { /* already closed */ }
+				continue;
+			}
+			this.sendControl(socket, value);
+		}
+	}
+
+	/**
+	 * A socket closed or errored. Peers learn at once that its awareness
+	 * identity left, instead of after their 30 s outdated-state timeout,
+	 * unless another socket of the same device still speaks for that identity
+	 * in the same room (a newer admission that took it over).
+	 */
+	socketClosed(socket: VaultSocketPort): void {
+		let attachment: VaultSocketAttachment | null;
+		try { attachment = parseVaultSocketAttachment(socket.deserializeAttachment()); }
+		catch { return; }
+		if (!attachment) return;
+		const clock = attachment.awarenessClock;
+		const clientId = attachment.awarenessClientId;
+		if (clientId === undefined) return;
+		// Only one removal per socket (close may follow error).
+		try { socket.serializeAttachment(withoutAwarenessIdentity(attachment)); } catch { /* closed */ }
+		const peers: VaultSocketPort[] = [];
+		for (const other of this.options.sockets.sockets()) {
+			if (other === socket) continue;
+			const peer = parseVaultSocketAttachment(other.deserializeAttachment());
+			if (!peer || peer.socketId === attachment.socketId || peer.kind !== attachment.kind
+				|| peer.documentId !== attachment.documentId || peer.documentEpoch !== attachment.documentEpoch
+				|| peer.vaultId !== attachment.vaultId || peer.vaultGeneration !== attachment.vaultGeneration) continue;
+			if (peer.awarenessClientId === clientId && peer.deviceId === attachment.deviceId) return;
+			peers.push(other);
+		}
+		if (peers.length === 0) return;
+		const removal = encoding.createEncoder();
+		encoding.writeVarUint(removal, 1);
+		encoding.writeVarUint(removal, clientId);
+		// Yjs applies a null state at the clock it last saw (or later).
+		encoding.writeVarUint(removal, clock ?? 0);
+		encoding.writeVarString(removal, "null");
+		const frame = encoding.createEncoder();
+		encoding.writeVarUint(frame, MESSAGE_AWARENESS);
+		encoding.writeVarUint8Array(frame, encoding.toUint8Array(removal));
+		const bytes = encoding.toUint8Array(frame);
+		for (const peer of peers) {
+			try { peer.send(bytes); } catch { /* peer closed */ }
 		}
 	}
 
@@ -847,38 +1007,64 @@ export class VaultSocketService {
 		decoding.readVarUint(decoder);
 		const presence = this.options.principalPresence(source.principalId);
 		if (!presence) return;
-		let payload: Uint8Array;
-		let awarenessClientId: number;
+		let entries: AwarenessEntry[];
 		try {
-			payload = decoding.readVarUint8Array(decoder);
-			const identity = decoding.createDecoder(payload);
-			if (decoding.readVarUint(identity) !== 1) throw new Error("one awareness identity required");
-			awarenessClientId = decoding.readVarUint(identity);
-			if (!Number.isSafeInteger(awarenessClientId) || awarenessClientId < 0) throw new Error("invalid awareness identity");
+			entries = decodeAwarenessEntries(decoding.readVarUint8Array(decoder));
 		} catch {
 			origin.close(1008, "invalid awareness identity");
 			return;
 		}
-		if (source.awarenessClientId !== undefined && source.awarenessClientId !== awarenessClientId) {
-			origin.close(1008, "awareness identity changed");
-			return;
-		}
+		// Yjs providers re-encode every awareness change, including states they
+		// received from peers. A socket may only speak for its own client id:
+		// foreign entries are dropped, never relayed, so they can neither spoof
+		// a peer nor resurrect a removed one.
 		if (source.awarenessClientId === undefined) {
+			// Providers announce their own state alone, on open and on local
+			// changes. A removal or multi-entry frame cannot identify the sender.
+			const [candidate] = entries;
+			if (!candidate || entries.length !== 1 || isAwarenessRemoval(candidate)) return;
 			for (const socket of this.options.sockets.sockets()) {
 				if (socket === origin) continue;
 				const attachment = parseVaultSocketAttachment(socket.deserializeAttachment());
-				if (attachment?.awarenessClientId === awarenessClientId
+				if (attachment?.awarenessClientId === candidate.clientId
 					&& attachment.documentId === source.documentId && attachment.kind === source.kind) {
-					origin.close(1008, "awareness identity already in use");
-					return;
+					// Another device's live identity is a relayed peer state.
+					if (attachment.deviceId !== source.deviceId) return;
+					// The same device reconnecting with its identity while the
+					// server still holds the previous socket (an abnormal close
+					// it has not observed yet). The newest admission wins:
+					// rejecting it made the device reconnect in a loop until the
+					// ghost timed out.
+					if ((attachment.admittedAt ?? 0) > (source.admittedAt ?? 0)) {
+						origin.close(1008, "awareness identity already in use");
+						return;
+					}
+					this.evictAwarenessHolder(socket, attachment);
 				}
 			}
-			source.awarenessClientId = awarenessClientId;
+			source.awarenessClientId = candidate.clientId;
 			origin.serializeAttachment(source);
 		}
+		const own = entries.filter((entry) => entry.clientId === source.awarenessClientId);
+		const [entry] = own;
+		if (!entry) return;
+		if (own.length > 1) {
+			origin.close(1008, "invalid awareness identity");
+			return;
+		}
+		if (source.awarenessClock !== entry.clock) {
+			source.awarenessClock = entry.clock;
+			origin.serializeAttachment(source);
+		}
+		// Only the socket's own entry survives; a null state is its own removal.
+		const filtered = encoding.createEncoder();
+		encoding.writeVarUint(filtered, 1);
+		encoding.writeVarUint(filtered, entry.clientId);
+		encoding.writeVarUint(filtered, entry.clock);
+		encoding.writeVarString(filtered, entry.state);
 		let update: Uint8Array;
 		try {
-			update = modifyAwarenessUpdate(payload, (state: unknown) => {
+			update = modifyAwarenessUpdate(encoding.toUint8Array(filtered), (state: unknown) => {
 				if (!state || typeof state !== "object" || Array.isArray(state)) return state;
 				return { ...state, user: {
 					name: presence.displayName, id: source.deviceId, principalId: source.principalId,
@@ -902,6 +1088,26 @@ export class VaultSocketService {
 				try { socket.send(trustedFrame); } catch { /* peer closed */ }
 			}
 		}
+	}
+
+	/** Closes an older same-device socket whose awareness identity a newer admission takes over. */
+	private evictAwarenessHolder(socket: VaultSocketPort, attachment: VaultSocketAttachment): void {
+		// Cleared first so its close does not publish a removal of the identity
+		// the new socket now holds.
+		try { socket.serializeAttachment(withoutAwarenessIdentity(attachment)); } catch { /* closed */ }
+		try { socket.close(1008, "awareness identity superseded"); } catch { /* already closed */ }
+	}
+
+	private touchDeviceFromLiveness(socket: VaultSocketPort, attachment: VaultSocketAttachment): void {
+		if (!this.options.touchDevice || attachment.kind !== "root") return;
+		const now = this.now();
+		const last = attachment.lastSeenTouchedAt;
+		const resolutionMs = DEVICE_LAST_SEEN_RESOLUTION_MS;
+		if (last !== undefined && now >= last && now - last < resolutionMs) return;
+		try {
+			socket.serializeAttachment({ ...attachment, lastSeenTouchedAt: now });
+			this.options.touchDevice(attachment.deviceId);
+		} catch { /* best effort */ }
 	}
 
 	private fenceSocketIfStale(socket: VaultSocketPort, attachment: VaultSocketAttachment,

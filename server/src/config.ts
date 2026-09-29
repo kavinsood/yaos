@@ -34,6 +34,7 @@ import {
 	installEnrollmentIdentity,
 } from "./collaborationControlPlane";
 import { capabilitiesForRole } from "./collaboration";
+import { DEVICE_LAST_SEEN_RESOLUTION_MS } from "./contracts";
 import { parseAuthorizationChangeRecords, parseCollaborationCodeRecords, parseMembershipRecords, parseOwnershipTransferRecords, parsePrincipalRecords, parseSecurityAuditEvents, parseVaultGovernanceRequestRecords, type AuthorizationChangeRecord, type VaultGovernanceRequestRecord } from "./collaborationIdentity";
 
 const CONFIG_FORMAT_KEY = "configFormat";
@@ -1486,12 +1487,18 @@ export class ControlPlaneRuntime {
 			return json({ error: "invalid json" }, 400);
 		}
 		if (!body.deviceId || !body.vaultId) return json({ error: "invalid device" }, 400);
+		// Presence is kept at DEVICE_LAST_SEEN_RESOLUTION_MS; a fresher value
+		// is left alone so touches from many isolates do not each write.
+		const fresh = (device: DeviceRecord, now: number): boolean => device.lastSeenAt !== undefined
+			&& now >= device.lastSeenAt && now - device.lastSeenAt < DEVICE_LAST_SEEN_RESOLUTION_MS;
 		return this.storage.transaction(async (txn) => {
+			const now = Date.now();
 			if (txn.records) {
 				const raw = await txn.records.get<DeviceRecord>(DEVICES_KEY, { recordKey: body.deviceId });
 				const device = raw ? parseDeviceRecords([raw], new Set([raw.vaultId]))[0] : undefined;
 				if (!device || device.vaultId !== body.vaultId) return json({ error: "unknown_device" }, 404);
-				device.lastSeenAt = Date.now();
+				if (fresh(device, now)) return json({ ok: true });
+				device.lastSeenAt = now;
 				await txn.records.upsert(DEVICES_KEY, device);
 				return json({ ok: true });
 			}
@@ -1502,7 +1509,8 @@ export class ControlPlaneRuntime {
 			);
 			const device = devices.find((record) => record.deviceId === body.deviceId && record.vaultId === body.vaultId);
 			if (!device) return json({ error: "unknown_device" }, 404);
-			device.lastSeenAt = Date.now();
+			if (fresh(device, now)) return json({ ok: true });
+			device.lastSeenAt = now;
 			await txn.put(DEVICES_KEY, devices);
 			return json({ ok: true });
 		});

@@ -16,6 +16,11 @@ export const MAX_JSON_BYTES = 1024 * 1024;
 export const MAX_BODY_SOCKETS = 32;
 export const MAX_ROOT_SOCKETS = 32;
 export const MAX_AWARENESS_BYTES = 64 * 1024;
+/**
+ * Freshness of a device's `lastSeenAt`. It is presence metadata read by people,
+ * so refreshing it more often only queues writes on the singleton control plane.
+ */
+export const DEVICE_LAST_SEEN_RESOLUTION_MS = 5 * 60 * 1_000;
 export const MAX_LOADED_BODY_ENCODED_STATE_BYTES = 48 * 1024 * 1024;
 /** Root is non-evictable, so it has a separate pressure budget from body LRU residency. */
 export const MAX_ROOT_RESIDENT_ENCODED_STATE_BYTES = 16 * 1024 * 1024;

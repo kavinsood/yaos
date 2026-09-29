@@ -3,7 +3,13 @@ import { EditorView, ViewPlugin, type ViewUpdate } from "@codemirror/view";
 import { yCollab, ySyncFacet } from "y-codemirror.next";
 import * as Y from "yjs";
 import { editorInfoField, MarkdownView, Notice, type MarkdownFileInfo, type Workspace } from "obsidian";
-import type { SyncRuntimePort } from "./vaultSync";
+import type { SyncAwarenessPort, SyncRuntimePort } from "./vaultSync";
+
+/** The y-protocols Awareness surface beyond `SyncAwarenessPort`. */
+interface LocalStateAwareness {
+	getLocalState(): unknown;
+	setLocalState(state: unknown): void;
+}
 import { applyDiffToYText } from "./diff";
 import type { TraceRecord } from "../observability/traceContext";
 import type { ProductFlightPathEventInput } from "../observability/traceSink";
@@ -470,6 +476,7 @@ export class EditorBindingManager {
 		}
 
 		this.clearLocalCursor("unbind");
+		this.releaseBodyPresence(binding.path);
 
 		this.log(`unbind: unbound "${binding.path}" (leaf=${leafId}, cm=${binding.cmId})`);
 	}
@@ -499,7 +506,9 @@ export class EditorBindingManager {
 			}
 			this.log(`unbindAll: destroyed binding for "${binding.path}"`);
 		}
+		const paths = new Set(Array.from(this.bindings.values(), (binding) => binding.path));
 		this.bindings.clear();
+		for (const path of paths) this.releaseBodyPresence(path);
 	}
 
 	/**
@@ -526,6 +535,7 @@ export class EditorBindingManager {
 			this.cmToLeafId.delete(binding.cm);
 			this.bindings.delete(leafId);
 			this.log(`unbindByFileId: unbound "${binding.path}" (leaf=${leafId}, file=${fileId})`);
+			this.releaseBodyPresence(binding.path);
 		}
 	}
 
@@ -560,6 +570,7 @@ export class EditorBindingManager {
 				// Don't break — a path could theoretically be open in multiple leaves
 			}
 		}
+		this.releaseBodyPresence(path);
 	}
 
 	/**
@@ -919,6 +930,42 @@ export class EditorBindingManager {
 						: null,
 			cmDocLength: cm.state.doc.length,
 		};
+	}
+
+	/**
+	 * Publish this device in a note's awareness. Body providers start with a
+	 * null local state (no presence while nothing is bound), and
+	 * `setLocalStateField` is a no-op on a null state, so remote cursors were
+	 * never published (P0c N4). yCollab's remote-selection plugin writes
+	 * `cursor` into an existing local state; it needs `user` for the label.
+	 */
+	private publishBodyPresence(awareness: SyncAwarenessPort, user: unknown): void {
+		const full = awareness as SyncAwarenessPort & Partial<LocalStateAwareness>;
+		if (typeof full.getLocalState === "function" && typeof full.setLocalState === "function"
+			&& full.getLocalState() === null) {
+			full.setLocalState({ user, cursor: null });
+			return;
+		}
+		awareness.setLocalStateField("user", user);
+	}
+
+	/**
+	 * Withdraw this device from the awareness of `path` once no editor of this
+	 * device shows it any more. The root awareness (the fallback when a note
+	 * has no body session) carries vault presence and is never cleared here.
+	 */
+	private releaseBodyPresence(path: string): void {
+		for (const binding of this.bindings.values()) {
+			if (binding.path === path) return;
+		}
+		try {
+			const awareness = this.vaultSync.getBodyAwareness(path) as SyncAwarenessPort & Partial<LocalStateAwareness>;
+			if (awareness === (this.vaultSync.provider.awareness as unknown)) return;
+			if (typeof awareness.getLocalState !== "function" || typeof awareness.setLocalState !== "function") return;
+			if (awareness.getLocalState() !== null) awareness.setLocalState(null);
+		} catch {
+			// Provider may be gone
+		}
 	}
 
 	clearLocalCursor(reason: string): void {
@@ -1372,16 +1419,13 @@ export class EditorBindingManager {
 
 		const awareness = this.vaultSync.getBodyAwareness(filePath);
 		const identity = this.getAwarenessIdentity?.();
-		awareness.setLocalStateField(
-			"user",
-			awarenessCursorUser(
-				identity?.displayName || deviceName,
-				identity?.principalId || this.vaultSync.deviceId,
-				identity?.colorSeed || this.vaultSync.deviceId,
-				deviceName,
-				this.vaultSync.deviceId,
-			),
-		);
+		this.publishBodyPresence(awareness, awarenessCursorUser(
+			identity?.displayName || deviceName,
+			identity?.principalId || this.vaultSync.deviceId,
+			identity?.colorSeed || this.vaultSync.deviceId,
+			deviceName,
+			this.vaultSync.deviceId,
+		));
 
 		const collabExtension = this.buildCollabExtension(ytext, undoManager, filePath);
 

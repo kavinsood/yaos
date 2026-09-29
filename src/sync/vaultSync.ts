@@ -16,7 +16,7 @@ import {
 	type SocketControlCapabilities,
 	type SocketLivenessDescriptor,
 } from "@shared/socketLiveness";
-import YSyncProvider from "y-partyserver/provider";
+import type YSyncProvider from "y-partyserver/provider";
 import type { Awareness } from "y-protocols/awareness";
 import {
 	BodyManager,
@@ -69,6 +69,7 @@ import {
 	type SocketLivenessSnapshot,
 } from "../runtime/socketLivenessCoordinator";
 import { fencedWebSocketConstructor, type NativeSocketClose } from "./fencedWebSocket";
+import { OwnAwarenessProvider } from "./ownAwarenessProvider";
 import { sameAuthorityIdentity, type VaultAuthorityIdentity } from "../collaboration/authority";
 import { CanvasManager, type CanvasPersistencePort, type CanvasProjectionPort } from "./canvas/canvasManager";
 import { CanvasHttpTransport } from "./canvas/canvasTransport";
@@ -5526,7 +5527,7 @@ export class VaultSync implements SyncRuntimePort {
 				? `/vault/${encodeURIComponent(this.options.vaultId)}/ws/body/${encodeURIComponent(input.documentId)}`
 				: `/vault/${encodeURIComponent(this.options.vaultId)}/ws/semantic/${encodeURIComponent(input.documentId)}`;
 		const baseWebSocket = this.options.webSocket ?? WebSocket;
-		const provider = new YSyncProvider(this.options.host, input.documentId, input.doc, {
+		const provider = new OwnAwarenessProvider(this.options.host, input.documentId, input.doc, {
 			prefix,
 			connect: false,
 			maxBackoffTime: MAX_BACKOFF_TIME_MS,

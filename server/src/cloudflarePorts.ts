@@ -123,6 +123,36 @@ export class CloudflareSocketRegistry implements VaultSocketRegistryPort {
 	}
 }
 
+function sendableCloseCode(code: number): boolean {
+	return Number.isInteger(code) && code >= 1000 && code < 5000
+		&& code !== 1004 && code !== 1005 && code !== 1006 && code !== 1015;
+}
+
+/**
+ * Completes a peer-initiated close handshake from a hibernation webSocketClose
+ * handler. Before compatibility date 2026-04-07 (web_socket_auto_reply_to_close)
+ * the runtime leaves the socket CLOSING until the Durable Object reciprocates;
+ * with auto-reply the socket is already CLOSED and the call is ignored.
+ */
+export function reciprocateSocketClose(socket: Pick<VaultSocketPort, "close">, code: number, reason: string): void {
+	if (sendableCloseCode(code)) {
+		try {
+			socket.close(code, reason);
+			return;
+		} catch {
+			// The echoed code or reason was refused (e.g. a reason over the
+			// 123-byte limit, or a code the runtime will not send); a code-less
+			// close still completes the handshake.
+		}
+	}
+	try {
+		// Reserved codes (1005 "no status", 1006 abnormal) cannot be sent back.
+		socket.close();
+	} catch {
+		// Already closed, or the runtime completed the handshake itself.
+	}
+}
+
 export class CloudflareSocketUpgrades implements SocketUpgradePort {
 	reject(frame: string, closeCode: number, reason: string): Response {
 		const pair = new WebSocketPair();
