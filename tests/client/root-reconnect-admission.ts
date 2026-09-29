@@ -632,14 +632,14 @@ s.test("a body changed hint schedules catch-up only; it is never a commit receip
 	await fallback.runtime.destroy();
 });
 
-s.test("the default provider advertises the catch-up hint capability in the upgrade URL", async () => {
+s.test("the default provider advertises catch-up hint and auto-response capabilities in the upgrade URL", async () => {
 	const restore = installDomEvents();
 	try {
 		FakeWebSocket.instances = [];
 		const { runtime } = harness({ providerFactory: null, webSocket: FakeWebSocket, ticketTtlMs: 300_000 });
 		assert.equal((await runtime.reconnect("initial")).kind, "completed");
 		const url = new URL(FakeWebSocket.instances[0]!.url);
-		assert.equal(url.searchParams.get("caps"), "catchupHint");
+		assert.equal(url.searchParams.get("caps"), "catchupHint,livenessAutoResponse");
 		assert.equal(url.searchParams.get("protocolVersion") !== null, true, "the pinned protocol version is unchanged");
 		await runtime.destroy();
 	} finally {

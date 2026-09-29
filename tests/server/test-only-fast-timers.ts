@@ -3,6 +3,11 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DEVICE_LAST_SEEN_RESOLUTION_MS } from "../../server/src/contracts";
+import { CloudflareSocketRegistry } from "../../server/src/cloudflarePorts";
+import {
+	SOCKET_LIVENESS_AUTO_RESPONSE_REQUEST,
+	SOCKET_LIVENESS_AUTO_RESPONSE_RESPONSE,
+} from "../../server/src/shared/socketLiveness";
 import { OPERATOR_COOKIE } from "../../server/src/identity";
 import { handleWorkerRequest } from "../../server/src/index";
 import { invalidateStoredServerConfigCache } from "../../server/src/routes/auth";
@@ -124,6 +129,61 @@ s.test("simulate-restart requires an operator session and forwards only the inte
 const VAULT_ID = "vault-restart-0001";
 const GENERATION = "generation-restart-0001";
 
+class FakeWebSocketRequestResponsePair implements WebSocketRequestResponsePair {
+	constructor(private readonly requestText: string, private readonly responseText: string) {}
+	get request(): string { return this.requestText; }
+	get response(): string { return this.responseText; }
+}
+
+function makeNativeSocketState(options: Parameters<typeof makeDurableObjectState>[0] = {}) {
+	let registeredPair: WebSocketRequestResponsePair | null = null;
+	const timestamps = new WeakMap<WebSocket, Date>();
+	const state = makeDurableObjectState(options);
+	state.setWebSocketAutoResponse = (pair?: WebSocketRequestResponsePair) => { registeredPair = pair ?? null; };
+	state.getWebSocketAutoResponse = () => registeredPair;
+	state.getWebSocketAutoResponseTimestamp = (socket: WebSocket) => timestamps.get(socket) ?? null;
+	return { state, timestamps };
+}
+
+s.test("the native auto-response state double preserves pair registration and Date/null timestamps", () => {
+	const { state, timestamps } = makeNativeSocketState();
+	const registry = new CloudflareSocketRegistry(state);
+	const socket = { send: () => {}, close: () => {}, serializeAttachment: () => {}, deserializeAttachment: () => null };
+	assert.equal(state.getWebSocketAutoResponse(), null);
+	assert.equal(registry.supportsAutoResponse(), false);
+	assert.equal(registry.getAutoResponseTimestamp(socket), null);
+	const pair = new FakeWebSocketRequestResponsePair(SOCKET_LIVENESS_AUTO_RESPONSE_REQUEST, SOCKET_LIVENESS_AUTO_RESPONSE_RESPONSE);
+	state.setWebSocketAutoResponse(pair);
+	assert.equal(state.getWebSocketAutoResponse(), pair);
+	assert.equal(pair.request, SOCKET_LIVENESS_AUTO_RESPONSE_REQUEST);
+	assert.equal(pair.response, SOCKET_LIVENESS_AUTO_RESPONSE_RESPONSE);
+	assert.equal(registry.supportsAutoResponse(), true);
+	const timestamp = new Date(1_234);
+	timestamps.set(socket as unknown as WebSocket, timestamp);
+	assert.equal(state.getWebSocketAutoResponseTimestamp(socket as unknown as WebSocket), timestamp);
+	assert.equal(registry.getAutoResponseTimestamp(socket), 1_234);
+	state.setWebSocketAutoResponse(new FakeWebSocketRequestResponsePair(SOCKET_LIVENESS_AUTO_RESPONSE_REQUEST, "wrong response"));
+	assert.equal(registry.supportsAutoResponse(), false);
+	state.setWebSocketAutoResponse();
+	assert.equal(state.getWebSocketAutoResponse(), null);
+	assert.equal(registry.supportsAutoResponse(), false);
+});
+
+s.test("native capability detection supports method-shaped pairs as well as pinned property getters", () => {
+	const { state } = makeNativeSocketState();
+	const registry = new CloudflareSocketRegistry(state);
+	state.setWebSocketAutoResponse({
+		getRequest: () => SOCKET_LIVENESS_AUTO_RESPONSE_REQUEST,
+		getResponse: () => SOCKET_LIVENESS_AUTO_RESPONSE_RESPONSE,
+	} as unknown as WebSocketRequestResponsePair);
+	assert.equal(registry.supportsAutoResponse(), true);
+	state.setWebSocketAutoResponse({
+		getRequest: () => SOCKET_LIVENESS_AUTO_RESPONSE_REQUEST,
+		getResponse: () => "wrong response",
+	} as unknown as WebSocketRequestResponsePair);
+	assert.equal(registry.supportsAutoResponse(), false);
+});
+
 async function withVaultObject(env: CloudflareVaultEnvironment,
 	check: (server: VaultSyncServer, sockets: { closed: number }) => Promise<void>): Promise<void> {
 	const directory = await mkdtemp(join(tmpdir(), "yaos-restart-sim-"));
@@ -136,7 +196,7 @@ async function withVaultObject(env: CloudflareVaultEnvironment,
 		deserializeAttachment: () => null,
 		serializeAttachment: () => {},
 	};
-	const base = makeDurableObjectState({ getWebSockets: () => [hibernated as never] });
+	const { state: base } = makeNativeSocketState({ getWebSockets: () => [hibernated as never] });
 	const storage = Object.assign(sqlite, {
 		setAlarm: async (time: number) => { alarm = time; },
 		getAlarm: async () => alarm,
@@ -144,9 +204,22 @@ async function withVaultObject(env: CloudflareVaultEnvironment,
 		deleteAll: async () => {},
 	});
 	const state = { ...base, storage: storage as never } as DurableObjectState;
+	const previousConstructor = Object.getOwnPropertyDescriptor(globalThis, "WebSocketRequestResponsePair");
+	Object.defineProperty(globalThis, "WebSocketRequestResponsePair", {
+		value: FakeWebSocketRequestResponsePair, configurable: true, writable: true,
+	});
 	try {
-		await check(new VaultSyncServer(state, env), socketState);
+		const server = new VaultSyncServer(state, env);
+		const registeredPair = state.getWebSocketAutoResponse();
+		assert.ok(registeredPair instanceof FakeWebSocketRequestResponsePair);
+		assert.equal(registeredPair.request, SOCKET_LIVENESS_AUTO_RESPONSE_REQUEST);
+		assert.equal(registeredPair.response, SOCKET_LIVENESS_AUTO_RESPONSE_RESPONSE);
+		assert.equal(new CloudflareSocketRegistry(state).supportsAutoResponse(), true);
+		await check(server, socketState);
+		assert.equal(state.getWebSocketAutoResponse(), registeredPair);
 	} finally {
+		if (previousConstructor) Object.defineProperty(globalThis, "WebSocketRequestResponsePair", previousConstructor);
+		else Reflect.deleteProperty(globalThis, "WebSocketRequestResponsePair");
 		sqlite.database.close();
 		await rm(directory, { recursive: true, force: true });
 	}
