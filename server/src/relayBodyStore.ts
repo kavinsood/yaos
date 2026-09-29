@@ -45,14 +45,25 @@ export interface RelayAppendResult {
 	rowsWritten: number;
 }
 
+/** Server-side reset policy state, returned with every lease response. */
+export interface RelayResetPolicyState {
+	/** Last semantic reset of this body (relay or server compaction), or null. */
+	lastResetAt: number | null;
+	cooldownMs: number;
+	/** 0 when a reset is allowed now. */
+	cooldownRemainingMs: number;
+	nextResetAllowedAt: number | null;
+}
+
 export type RelayLeaseResult =
-	| { granted: true; leaseId: string; expiresAt: number; epoch: SemanticEpoch; headSequence: number; generation: number }
-	| { granted: false; reason: "held" | "epoch_mismatch" | "not_found"; epoch: SemanticEpoch | null;
-		headSequence: number | null; holderDeviceId?: string; expiresAt?: number };
+	| { granted: true; leaseId: string; expiresAt: number; epoch: SemanticEpoch; headSequence: number; generation: number;
+		policy: RelayResetPolicyState }
+	| { granted: false; reason: "held" | "epoch_mismatch" | "not_found" | "cooldown"; epoch: SemanticEpoch | null;
+		headSequence: number | null; holderDeviceId?: string; expiresAt?: number; policy?: RelayResetPolicyState };
 
 export type RelayResetOutcome =
 	| { ok: true; result: SemanticResetResult }
-	| { ok: false; reason: "lease_invalid" | "lease_expired" | "epoch_mismatch" | "head_advanced";
+	| { ok: false; reason: "lease_invalid" | "lease_expired" | "epoch_mismatch" | "head_advanced" | "cooldown";
 		epoch: SemanticEpoch | null; headSequence: number | null };
 
 export const RELAY_LEASE_DEFAULT_TTL_MS = 120_000;
@@ -180,8 +191,20 @@ export class RelayBodyStore {
 		this.leaseTableReady = true;
 	}
 
+	/**
+	 * Cooldown state from `vault_semantic_compaction_state.last_compacted_at`,
+	 * which every semantic reset (relay or base compaction) already writes in
+	 * its own transaction, so no extra row is written per reset.
+	 */
+	resetPolicy(bodyId: string, cooldownMs: number, now = Date.now()): RelayResetPolicyState {
+		const lastResetAt = this.store.semanticCompactionState(bodyId)?.lastCompactedAt ?? null;
+		const nextResetAllowedAt = lastResetAt === null ? null : lastResetAt + cooldownMs;
+		return { lastResetAt, cooldownMs, nextResetAllowedAt,
+			cooldownRemainingMs: nextResetAllowedAt === null ? 0 : Math.max(0, nextResetAllowedAt - now) };
+	}
+
 	acquireLease(bodyId: string, actor: VaultActorContext, expectedEpoch: number, ttlMs: number | undefined,
-		now = Date.now()): RelayLeaseResult {
+		now = Date.now(), cooldownMs = 0): RelayLeaseResult {
 		this.store.initialize();
 		this.ensureLeaseTable();
 		const ttl = Math.min(RELAY_LEASE_MAX_TTL_MS, Math.max(RELAY_LEASE_MIN_TTL_MS,
@@ -193,8 +216,15 @@ export class RelayBodyStore {
 				outcome = { granted: false, reason: "not_found", epoch: null, headSequence: null };
 				return;
 			}
+			const policy = this.resetPolicy(bodyId, cooldownMs, now);
 			if (head.semanticEpoch !== expectedEpoch) {
-				outcome = { granted: false, reason: "epoch_mismatch", epoch: head.semanticEpoch, headSequence: head.latestSequence };
+				outcome = { granted: false, reason: "epoch_mismatch", epoch: head.semanticEpoch, headSequence: head.latestSequence,
+					policy };
+				return;
+			}
+			if (policy.cooldownRemainingMs > 0) {
+				outcome = { granted: false, reason: "cooldown", epoch: head.semanticEpoch, headSequence: head.latestSequence,
+					policy };
 				return;
 			}
 			const existing = this.storage.sql.exec<{ device_id: string; expires_at: number }>(
@@ -202,7 +232,7 @@ export class RelayBodyStore {
 			).toArray()[0];
 			if (existing && existing.expires_at > now && existing.device_id !== actor.deviceId) {
 				outcome = { granted: false, reason: "held", epoch: head.semanticEpoch, headSequence: head.latestSequence,
-					holderDeviceId: existing.device_id, expiresAt: existing.expires_at };
+					holderDeviceId: existing.device_id, expiresAt: existing.expires_at, policy };
 				return;
 			}
 			const leaseId = crypto.randomUUID();
@@ -215,7 +245,7 @@ export class RelayBodyStore {
 			  expires_at = excluded.expires_at, created_at = excluded.created_at`,
 			bodyId, leaseId, actor.deviceId, actor.principalId, head.semanticEpoch, expiresAt, now).toArray();
 			outcome = { granted: true, leaseId, expiresAt, epoch: head.semanticEpoch, headSequence: head.latestSequence,
-				generation: head.generation };
+				generation: head.generation, policy };
 		});
 		return outcome;
 	}
@@ -238,13 +268,13 @@ export class RelayBodyStore {
 	 */
 	semanticReset(input: {
 		bodyId: string; actor: VaultActorContext; leaseId: string; expectedEpoch: number; coveredSequence: number;
-		snapshot: Uint8Array; contentHash: string; contentBytes: number; now?: number;
+		snapshot: Uint8Array; contentHash: string; contentBytes: number; now?: number; cooldownMs?: number;
 	}): RelayResetOutcome {
 		this.store.initialize();
 		this.ensureLeaseTable();
 		const now = input.now ?? Date.now();
 		const head = this.store.documentHead(input.bodyId);
-		const fail = (reason: "lease_invalid" | "lease_expired" | "epoch_mismatch" | "head_advanced"): RelayResetOutcome =>
+		const fail = (reason: "lease_invalid" | "lease_expired" | "epoch_mismatch" | "head_advanced" | "cooldown"): RelayResetOutcome =>
 			({ ok: false, reason, epoch: head?.semanticEpoch ?? null, headSequence: head?.latestSequence ?? null });
 		const lease = this.storage.sql.exec<{ lease_id: string; device_id: string; body_epoch: number; expires_at: number }>(
 			"SELECT lease_id, device_id, body_epoch, expires_at FROM relay_compaction_leases WHERE body_id = ?", input.bodyId,
@@ -254,7 +284,12 @@ export class RelayBodyStore {
 		if (!head || head.semanticEpoch !== input.expectedEpoch || lease.body_epoch !== input.expectedEpoch) {
 			return fail("epoch_mismatch");
 		}
+		// Currency proof (round 2): epoch CAS + valid lease + coveredSequence == head.latest_sequence
+		// exactly. No state-vector check: SV coverage is not currency (a delete-only
+		// update leaves the SV unchanged) and a lineage-fresh snapshot never covers
+		// the old lineage's client ids.
 		if (head.latestSequence !== input.coveredSequence) return fail("head_advanced");
+		if (this.resetPolicy(input.bodyId, input.cooldownMs ?? 0, now).cooldownRemainingMs > 0) return fail("cooldown");
 		const result = this.store.semanticResetFromEncodedState(input.bodyId, input.snapshot, {
 			throughSequence: head.latestSequence, generation: head.generation, semanticEpoch: head.semanticEpoch,
 		}, now, { contentHash: input.contentHash, size: input.contentBytes });

@@ -12,14 +12,17 @@ import * as Y from "yjs";
 import { ywasmCrdtEngine as crdtEngine } from "@yaos/crdt-engine";
 import { NodeSqliteStorage } from "../../packages/server-node/src/storage";
 import { bytesToBase64 } from "../../server/src/base64url";
+import { BootstrapService } from "../../server/src/bootstrap";
+import { MAX_DURABLE_UPDATE_BYTES } from "../../server/src/contracts";
 import { classifyWorkerRoute } from "../../server/src/index";
 import {
 	RelayBodyService, maxStateVector, parseRelayEnvelope, type RelaySocketHost,
 } from "../../server/src/relayBodies";
 import { RelayBodyStore } from "../../server/src/relayBodyStore";
+import { handleCompactionLease, handleSemanticReset } from "../../server/src/relayRoutes";
 import { DEFAULT_RELAY_CONFIG, readRelayConfig, relayBodiesEnabled, type RelayConfig } from "../../server/src/relayFlag";
 import { canonicalMarkdownBytes } from "../../server/src/shared/markdownCodec";
-import { sha256HexSync } from "../../server/src/vaultDocumentStore";
+import { RelayMergeBudgetError, sha256HexSync } from "../../server/src/vaultDocumentStore";
 import type { VaultDocumentCache } from "../../server/src/vaultDocumentCache";
 import type { VaultSocketAttachment, VaultSocketPort } from "../../server/src/vaultSocketService";
 import { VaultStore, type VaultStoragePort } from "../../server/src/vaultStore";
@@ -439,39 +442,42 @@ s.test("checkpoint: full and bounded partial byte-merge checkpoints preserve con
 	}, { checkpointEntries: 5, checkpointMaxRows: 3 });
 });
 
-s.test("lease CAS and semantic reset CAS; snapshots must cover the head", async () => {
+s.test("lease CAS and semantic reset CAS; lineage-fresh snapshots are accepted (no SV coverage check)", async () => {
 	await withRelay(({ store, relayStore, relay, socket, update, seed, catalogHead, clock }) => {
 		const head = store.documentHead(BODY)!;
 		assert.equal(relayStore.acquireLease(BODY, owner, head.semanticEpoch + 1, undefined, clock.now).granted, false);
 		const lease = relay.acquireLease(BODY, owner, head.semanticEpoch, 10_000);
 		assert.ok(lease.granted && typeof lease.stateVector === "string");
+		assert.deepEqual(lease.granted && lease.policy, { lastResetAt: null, cooldownMs: 0, cooldownRemainingMs: 0,
+			nextResetAllowedAt: null });
 		const held = relayStore.acquireLease(BODY, peer, head.semanticEpoch, undefined, clock.now);
 		assert.equal(held.granted, false);
 		assert.equal(!held.granted && held.reason, "held");
-		// A GC'd snapshot rebuilt on a fresh lineage (new client ids).
+		// A GC'd snapshot rebuilt on a fresh lineage (new client ids): it does not
+		// cover the old head SV and must still be accepted structurally.
 		const fresh = new Y.Doc({ gc: true });
-		fresh.getText("body").insert(0, seed.getText("body").toString());
+		fresh.getText("body").insert(0, "!hello");
 		const snapshot = Y.encodeStateAsUpdate(fresh);
-		assert.equal(relay.snapshotCoversHead(BODY, snapshot), false, "fresh lineage does not cover the old head SV");
-		const covering = Y.encodeStateAsUpdate(seed);
-		assert.equal(relay.snapshotCoversHead(BODY, covering), true);
-		const content = contentHashOf("hello");
-		const common = { bodyId: BODY, actor: owner, leaseId: lease.granted ? lease.leaseId : "", snapshot: covering,
+		assert.equal(relay.snapshotStructurallyValid(snapshot, 6), true);
+		assert.equal(relay.snapshotStructurallyValid(new Uint8Array([0, 0]), 6), false, "empty update for non-empty content");
+		assert.equal(relay.snapshotStructurallyValid(new Uint8Array([0, 0]), 0), true);
+		assert.equal(relay.snapshotStructurallyValid(new Uint8Array([7, 200, 1, 3]), 6), false, "unparseable");
+		const content = contentHashOf("!hello");
+		const common = { bodyId: BODY, actor: owner, leaseId: lease.granted ? lease.leaseId : "", snapshot,
 			contentHash: content.hash, contentBytes: content.size, now: clock.now };
 		assert.equal((relayStore.semanticReset({ ...common, leaseId: "wrong", expectedEpoch: head.semanticEpoch,
 			coveredSequence: head.latestSequence }) as { reason?: string }).reason, "lease_invalid");
 		const origin = socket();
 		update(origin, textUpdate(seed, (text) => text.insert(0, "!")));
+		// Exact-head currency: one append after the lease makes the reset stale.
 		assert.equal((relayStore.semanticReset({ ...common, expectedEpoch: head.semanticEpoch,
 			coveredSequence: head.latestSequence }) as { reason?: string }).reason, "head_advanced");
 		const now = store.documentHead(BODY)!;
-		const resetContent = contentHashOf("!hello");
-		const outcome = relayStore.semanticReset({ ...common, snapshot: Y.encodeStateAsUpdate(seed),
-			contentHash: resetContent.hash, contentBytes: resetContent.size,
-			expectedEpoch: now.semanticEpoch, coveredSequence: now.latestSequence });
+		const outcome = relayStore.semanticReset({ ...common, expectedEpoch: now.semanticEpoch,
+			coveredSequence: now.latestSequence });
 		assert.ok(outcome.ok);
 		assert.equal(store.documentHead(BODY)!.semanticEpoch, now.semanticEpoch + 1);
-		assert.equal(catalogHead().contentHash, resetContent.hash);
+		assert.equal(catalogHead().contentHash, content.hash);
 		assert.equal(reconstructedText(store), "!hello");
 		// The lease is consumed; the old-epoch socket is fenced on its next frame.
 		relay.invalidate(BODY);
@@ -479,7 +485,255 @@ s.test("lease CAS and semantic reset CAS; snapshots must cover the head", async 
 		assert.equal(origin.closed?.code, 4409);
 		assert.equal(relayStore.releaseLease(BODY, common.leaseId, owner), false);
 		fresh.destroy();
-	});
+	}, { resetCooldownMs: 0 });
+});
+
+function resetDeps(harness: Harness) {
+	return { relay: harness.relay, relayStore: () => harness.relayStore, isActiveBody: () => true,
+		discardResident: () => {}, fenceSockets: () => 0 };
+}
+
+function binaryReset(meta: Record<string, string | number>, snapshot: Uint8Array, query = ""): Request {
+	const headers: Record<string, string> = { "content-type": "application/octet-stream" };
+	const names: Record<string, string> = { leaseId: "x-yaos-lease-id", expectedEpoch: "x-yaos-expected-epoch",
+		coveredSequence: "x-yaos-covered-sequence", contentHash: "x-yaos-content-hash", contentBytes: "x-yaos-content-bytes" };
+	for (const [key, value] of Object.entries(meta)) headers[names[key]!] = String(value);
+	return new Request(`http://runtime/body/${BODY}/semantic-reset${query}`, { method: "POST", headers, body: snapshot });
+}
+
+s.test("semantic-reset route: octet-stream body with header or query metadata, JSON still accepted", async () => {
+	await withRelay(async (harness) => {
+		const { store, relay } = harness;
+		const deps = resetDeps(harness);
+		const resetOnce = async (text: string, shape: "headers" | "query" | "json") => {
+			const head = store.documentHead(BODY)!;
+			const lease = relay.acquireLease(BODY, owner, head.semanticEpoch, 60_000);
+			assert.ok(lease.granted);
+			const fresh = new Y.Doc({ gc: true });
+			fresh.getText("body").insert(0, text);
+			const snapshot = Y.encodeStateAsUpdate(fresh);
+			fresh.destroy();
+			const content = contentHashOf(text);
+			const meta = { leaseId: lease.leaseId, expectedEpoch: head.semanticEpoch, coveredSequence: head.latestSequence,
+				contentHash: content.hash, contentBytes: content.size };
+			const request = shape === "headers" ? binaryReset(meta, snapshot)
+				: shape === "query" ? binaryReset({}, snapshot, `?${new URLSearchParams(Object.entries(meta)
+					.map(([key, value]) => [key, String(value)])).toString()}`)
+				: new Request(`http://runtime/body/${BODY}/semantic-reset`, { method: "POST",
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify({ ...meta, snapshot: bytesToBase64(snapshot) }) });
+			const response = await handleSemanticReset(deps, BODY, request, owner);
+			const body = await response.json() as Record<string, unknown>;
+			assert.equal(response.status, 200, JSON.stringify(body));
+			assert.equal(body.epoch, head.semanticEpoch + 1);
+			assert.equal(reconstructedText(store), text);
+			assert.equal((body.policy as { lastResetAt: number }).lastResetAt !== null, true);
+		};
+		await resetOnce("binary headers", "headers");
+		await resetOnce("binary query", "query");
+		await resetOnce("json base64", "json");
+		// Structural rejection and malformed metadata.
+		const head = store.documentHead(BODY)!;
+		const lease = relay.acquireLease(BODY, owner, head.semanticEpoch, 60_000);
+		assert.ok(lease.granted);
+		const meta = { leaseId: lease.leaseId, expectedEpoch: head.semanticEpoch, coveredSequence: head.latestSequence,
+			contentHash: "a".repeat(64), contentBytes: 5 };
+		const bad = await handleSemanticReset(deps, BODY, binaryReset(meta, new Uint8Array([9, 9, 9])), owner);
+		assert.equal(bad.status, 400);
+		assert.equal(((await bad.json()) as { reason: string }).reason, "invalid_snapshot");
+		const missing = await handleSemanticReset(deps, BODY, binaryReset({ ...meta, expectedEpoch: "x" },
+			new Uint8Array([0, 0])), owner);
+		assert.equal(missing.status, 400);
+		assert.equal(((await missing.json()) as { reason: string }).reason, "invalid_request");
+	}, { resetCooldownMs: 0 });
+});
+
+s.test("reset cooldown: lease denied (429 + policy state) until the cooldown elapses", async () => {
+	await withRelay(async (harness) => {
+		const { store, relay, relayStore, clock } = harness;
+		const head = store.documentHead(BODY)!;
+		const lease = relay.acquireLease(BODY, owner, head.semanticEpoch, 60_000);
+		assert.ok(lease.granted);
+		const fresh = new Y.Doc({ gc: true });
+		fresh.getText("body").insert(0, "hello");
+		const content = contentHashOf("hello");
+		const outcome = relay.semanticReset(BODY, owner, { leaseId: lease.leaseId, expectedEpoch: head.semanticEpoch,
+			coveredSequence: head.latestSequence, snapshot: Y.encodeStateAsUpdate(fresh), contentHash: content.hash,
+			contentBytes: content.size });
+		fresh.destroy();
+		assert.ok(outcome.ok);
+		const epoch = store.documentHead(BODY)!.semanticEpoch;
+		const denied = relay.acquireLease(BODY, owner, epoch, 60_000);
+		assert.equal(denied.granted, false);
+		assert.equal(!denied.granted && denied.reason, "cooldown");
+		const policy = !denied.granted ? denied.policy! : null;
+		assert.equal(policy?.cooldownMs, 60_000);
+		assert.equal(policy!.cooldownRemainingMs > 0 && policy!.cooldownRemainingMs <= 60_000, true);
+		assert.equal(policy?.lastResetAt, clock.now);
+		const response = await handleCompactionLease(resetDeps(harness), BODY, new Request("http://runtime/lease",
+			{ method: "POST", body: JSON.stringify({ expectedEpoch: epoch }) }), owner);
+		assert.equal(response.status, 429);
+		assert.equal(response.headers.get("retry-after"), "60");
+		assert.equal(((await response.json()) as { reason: string }).reason, "cooldown");
+		// The reset path enforces it too (defence in depth).
+		assert.equal((relayStore.semanticReset({ bodyId: BODY, actor: owner, leaseId: "none", expectedEpoch: epoch,
+			coveredSequence: 0, snapshot: new Uint8Array([0, 0]), contentHash: content.hash, contentBytes: 0,
+			now: clock.now, cooldownMs: 60_000 }) as { reason: string }).reason, "lease_invalid");
+		clock.now += 60_001;
+		const granted = relay.acquireLease(BODY, owner, epoch, 60_000);
+		assert.ok(granted.granted);
+		assert.equal(granted.granted && granted.policy.cooldownRemainingMs, 0);
+		// Default and env override.
+		assert.equal(DEFAULT_RELAY_CONFIG.resetCooldownMs, 24 * 60 * 60_000);
+		assert.equal(readRelayConfig({ YAOS_RELAY_RESET_COOLDOWN_MS: "1500" }).resetCooldownMs, 1500);
+		assert.equal(readRelayConfig({ YAOS_RELAY_RESET_COOLDOWN_MS: "0" }).resetCooldownMs, 0);
+	}, { resetCooldownMs: 60_000 });
+});
+
+s.test("rate-limit burst holds one max-size frame: a 1.5 MB frame is accepted", async () => {
+	assert.equal(readRelayConfig({ YAOS_RELAY_BURST_BYTES: "1024" }).burstBytes, MAX_DURABLE_UPDATE_BYTES);
+	assert.equal(readRelayConfig({}).burstBytes >= MAX_DURABLE_UPDATE_BYTES, true);
+	assert.equal(DEFAULT_RELAY_CONFIG.burstBytes >= MAX_DURABLE_UPDATE_BYTES, true);
+	assert.equal(readRelayConfig({ YAOS_RELAY_BURST_BYTES: String(4 * 1024 * 1024) }).burstBytes, 4 * 1024 * 1024);
+	await withRelay(({ store, socket, update, seed }) => {
+		const origin = socket();
+		const before = store.documentHead(BODY)!.latestSequence;
+		const big = textUpdate(seed, (text) => text.insert(text.length, "x".repeat(1_500_000)));
+		assert.equal(big.byteLength > 1024 * 1024 && big.byteLength < MAX_DURABLE_UPDATE_BYTES, true);
+		update(origin, big);
+		assert.equal(origin.closed, null, JSON.stringify(origin.closed));
+		assert.equal(store.documentHead(BODY)!.latestSequence > before, true);
+	}, { burstBytes: readRelayConfig({}).burstBytes });
+});
+
+s.test("HTTP reads: GET/HEAD state carries sequence + hash state; bootstrap body reads are byte merges", async () => {
+	await withRelay(async ({ store, relay, relayStore, socket, update, step1, seed, claim, envelope }) => {
+		const origin = socket();
+		const counter = store.documentMaterialisations;
+		const baseline = counter.nonRoot;
+		// Append without a claim: catalog hash unknown.
+		update(origin, textUpdate(seed, (text) => text.insert(5, " world")));
+		const head = relay.bodyHttpHead(BODY)!;
+		assert.equal(head.hashState, "unknown");
+		assert.equal(head.contentHash, null);
+		assert.equal(head.latestSequence, store.documentHead(BODY)!.latestSequence);
+		assert.equal(counter.nonRoot, baseline, "HEAD never materialises");
+		const lazy = relay.bodyHttpState(BODY)!;
+		assert.equal(lazy.hashState, "materialised");
+		assert.equal(lazy.latestSequence, head.latestSequence);
+		assert.equal(counter.nonRoot, baseline + 1, "the lazy hash is the one counted read-side materialisation");
+		assert.equal(relay.bodyHttpState(BODY)!.hashState, "known");
+		assert.equal(relay.bodyHttpHead(BODY)!.hashState, "known");
+		// Claimed appends, step1, checkpoints and bootstrap body reads: no documents.
+		const next = textUpdate(seed, (text) => text.insert(0, ">"));
+		envelope(origin, next, claim(seed));
+		update(origin, next);
+		step1(origin, new Uint8Array([0]));
+		const bootstrap = new BootstrapService(store, Date.now, undefined, DEFAULT_RELAY_CONFIG.maxMergeInputBytes);
+		const descriptor = await bootstrap.start();
+		const boundaryText = seed.getText("body").toString();
+		update(origin, textUpdate(seed, (text) => text.insert(0, "after-boundary ")));
+		relay.checkpointBody(BODY);
+		const before = counter.nonRoot;
+		const state = bootstrap.bodyState(descriptor.bootstrapId, BODY);
+		assert.equal(counter.nonRoot, before, "relay bootstrap body read uses byte merge");
+		const doc = new Y.Doc();
+		Y.applyUpdate(doc, state.encodedState);
+		assert.equal(doc.getText("body").toString(), boundaryText);
+		doc.destroy();
+		const base = new BootstrapService(store, Date.now).bodyState(descriptor.bootstrapId, BODY);
+		assert.equal(counter.nonRoot, before + 1, "base bootstrap path materialises (control)");
+		assert.equal(base.generation, state.generation);
+		assert.equal(base.bodyEpoch, state.bodyEpoch);
+		// A reset after the boundary: the pinned boundary recipe still serves the old lineage.
+		const now = store.documentHead(BODY)!;
+		const lease = relay.acquireLease(BODY, owner, now.semanticEpoch, 60_000);
+		assert.ok(lease.granted);
+		const fresh = new Y.Doc({ gc: true });
+		fresh.getText("body").insert(0, seed.getText("body").toString());
+		const content = contentHashOf(seed.getText("body").toString());
+		assert.ok(relay.semanticReset(BODY, owner, { leaseId: lease.leaseId, expectedEpoch: now.semanticEpoch,
+			coveredSequence: now.latestSequence, snapshot: Y.encodeStateAsUpdate(fresh), contentHash: content.hash,
+			contentBytes: content.size }).ok);
+		fresh.destroy();
+		const pinned = bootstrap.bodyState(descriptor.bootstrapId, BODY);
+		const pinnedDoc = new Y.Doc();
+		Y.applyUpdate(pinnedDoc, pinned.encodedState);
+		assert.equal(pinnedDoc.getText("body").toString(), boundaryText);
+		assert.equal(pinned.bodyEpoch, state.bodyEpoch);
+		pinnedDoc.destroy();
+		assert.equal(relay.bodyHttpState(BODY)!.semanticEpoch, now.semanticEpoch + 1);
+		assert.equal(counter.nonRoot, before + 1);
+		assert.equal(relayStore.journalRowCount() > 0, true);
+	}, { resetCooldownMs: 0 });
+});
+
+s.test("merge budget: over-budget bodies never call a wasm merge; step1 sends parts, reads 413, checkpoint skips", async () => {
+	await withRelay(async ({ store, relay, socket, update, step1, seed, claim, envelope }) => {
+		const origin = socket();
+		for (let index = 0; index < 4; index++) {
+			update(origin, textUpdate(seed, (text) => text.insert(text.length, String(index).repeat(900))));
+		}
+		assert.throws(() => relay.bodyHttpState(BODY), RelayMergeBudgetError);
+		assert.equal(relay.counters.mergeBudgetRejects > 0, true);
+		// Checkpoint refuses and the alarm stops asking for this body.
+		assert.equal(relay.needsCheckpoint(BODY), true);
+		assert.equal(relay.checkpointBody(BODY), null);
+		assert.equal(relay.needsCheckpoint(BODY), false);
+		// Appends still commit (incremental SV path, bytes stay unmerged).
+		const peer = socket();
+		const tail = textUpdate(seed, (text) => text.insert(0, "!"));
+		envelope(origin, tail, claim(seed));
+		update(origin, tail);
+		assert.equal(origin.last("BODY_COMMITTED")?.noop, false);
+		// Step1 on an over-budget body: raw parts, one SYNC_STEP_2 each; they converge.
+		const before = peer.binary.length;
+		step1(peer, new Uint8Array([0]));
+		const frames = peer.binary.slice(before);
+		assert.equal(frames.length > 1, true);
+		assert.equal(relay.counters.unmergedStep2Replies, 1);
+		const doc = new Y.Doc();
+		for (const bytes of frames) {
+			const decoder = decoding.createDecoder(bytes);
+			assert.equal(decoding.readVarUint(decoder), 0);
+			assert.equal(decoding.readVarUint(decoder), 1);
+			Y.applyUpdate(doc, decoding.readVarUint8Array(decoder));
+		}
+		assert.equal(doc.getText("body").toString(), seed.getText("body").toString());
+		doc.destroy();
+		// Bootstrap refuses too.
+		const bootstrap = new BootstrapService(store, Date.now, undefined, relay.config.maxMergeInputBytes);
+		const descriptor = await bootstrap.start();
+		assert.throws(() => bootstrap.bodyState(descriptor.bootstrapId, BODY), RelayMergeBudgetError);
+		// A client reset shrinks the body below the budget and re-enables everything.
+		const head = store.documentHead(BODY)!;
+		const lease = relay.acquireLease(BODY, owner, head.semanticEpoch, 60_000);
+		assert.ok(lease.granted);
+		const fresh = new Y.Doc({ gc: true });
+		fresh.getText("body").insert(0, "compact");
+		const content = contentHashOf("compact");
+		assert.ok(relay.semanticReset(BODY, owner, { leaseId: lease.leaseId, expectedEpoch: head.semanticEpoch,
+			coveredSequence: head.latestSequence, snapshot: Y.encodeStateAsUpdate(fresh), contentHash: content.hash,
+			contentBytes: content.size }).ok);
+		fresh.destroy();
+		assert.equal(relay.bodyHttpState(BODY)!.hashState, "known");
+	}, { maxMergeInputBytes: 2048, exactMergeBytes: 0, checkpointEntries: 1, resetCooldownMs: 0 });
+});
+
+s.test("lazy hash guard: bodies above lazyHashMaxBytes keep an unknown hash without materialising", async () => {
+	await withRelay(({ store, relay, socket, update, seed }) => {
+		const origin = socket();
+		update(origin, textUpdate(seed, (text) => text.insert(5, " world")));
+		const baseline = store.documentMaterialisations.nonRoot;
+		const state = relay.bodyHttpState(BODY)!;
+		assert.equal(state.hashState, "unknown");
+		assert.equal(state.contentHash, null);
+		assert.equal(state.size, null);
+		assert.equal(relay.counters.lazyHashSkips, 1);
+		assert.equal(store.documentMaterialisations.nonRoot, baseline);
+		assert.equal(readRelayConfig({ YAOS_RELAY_LAZY_HASH_MAX_BYTES: "5" }).lazyHashMaxBytes, 5);
+		assert.equal(readRelayConfig({}).maxMergeInputBytes, 9 * 1024 * 1024);
+	}, { lazyHashMaxBytes: 8 });
 });
 
 await s.done();

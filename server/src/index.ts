@@ -99,6 +99,7 @@ function validVaultRest(method: string, rest: string[], relayBodies = false): bo
 	if (relayBodies && method === "POST" && rest.length === 3 && rest[0] === "body" && !!rest[1]
 		&& (rest[2] === "compaction-lease" || rest[2] === "semantic-reset")) return true;
 	if (relayBodies && method === "GET" && rest.length === 2 && rest[0] === "debug" && rest[1] === "relay-table-counts") return true;
+	if (relayBodies && method === "HEAD" && rest.length === 2 && rest[0] === "body" && !!rest[1]) return true;
 	if (method === "GET" && rest.length === 1 && ["me", "members", "audit"].includes(rest[0]!)) return true;
 	if ((method === "PATCH" || method === "DELETE") && rest.length === 1 && rest[0] === "governance") return true;
 	if ((method === "POST" || method === "GET") && rest.length === 1 && rest[0] === "invitations") return true;

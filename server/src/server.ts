@@ -33,6 +33,7 @@ import { authorizeRuntimeActor, OUTCOME_CLAIM_HEADER, parseVaultActor } from "./
 import { capabilityDigestForRole, COLLABORATION_POLICY_VERSION, type VaultActorContext, type VaultCapability } from "./collaboration";
 import { canonicalJsonHash } from "./recoveryCanonicalJson";
 import type { VaultAuthoritySubjectChange } from "./vaultDocumentStore";
+import { RelayMergeBudgetError } from "./vaultDocumentStore";
 import { SemanticCompactionRuntime } from "./semanticCompactionRuntime";
 import { BODY_EPOCH_HEADER, ROOT_EPOCH_HEADER, parseSemanticEpoch, parseSemanticEpochHeader } from "./shared/semanticEpoch";
 import { SOCKET_CLIENT_CAPABILITIES_PARAM, parseSocketClientCapabilities } from "./shared/socketLiveness";
@@ -337,6 +338,7 @@ export class VaultRuntime implements DrainPort {
 			this.store,
 			Date.now,
 			(documentId, overlappingCopies) => this.cache.reserveFullStateOperation(documentId, overlappingCopies),
+			this.relay ? this.relay.config.maxMergeInputBytes : null,
 		);
 		this.recovery = new VaultRecoveryService({
 			alarms: {
@@ -538,6 +540,7 @@ export class VaultRuntime implements DrainPort {
 			}
 			if (request.method === "GET" && parts.length === 2 && parts[0] === "head") return json(this.lifecycle.activeBodyHead(parts[1]!));
 			if (request.method === "GET" && parts.length === 2 && parts[0] === "body") return this.bodyState(parts[1]!);
+			if (this.relay && request.method === "HEAD" && parts.length === 2 && parts[0] === "body") return this.relayBodyHead(parts[1]!);
 			if (request.method === "GET" && parts.length === 3 && parts[0] === "semantic" && parts[2] === "head") {
 				return json(this.semantic.activeHead(parts[1]!) ?? { error: "semantic_document_not_active" },
 					this.semantic.activeHead(parts[1]!) ? 200 : 404);
@@ -872,7 +875,14 @@ export class VaultRuntime implements DrainPort {
 			const knownContentHash = "contentHash" in item && typeof item.contentHash === "string"
 				? item.contentHash
 				: null;
-			const relayState = this.relay ? this.relay.bodyHttpState(bodyId) : null;
+			let relayState: ReturnType<RelayBodyService["bodyHttpState"]> = null;
+			if (this.relay) {
+				try { relayState = this.relay.bodyHttpState(bodyId); } catch (error) {
+					if (!(error instanceof RelayMergeBudgetError)) throw error;
+					bodies.push({ bodyId, status: 413, error: "relay_merge_budget_exceeded" });
+					continue;
+				}
+			}
 			if (this.relay && !relayState) { bodies.push({ bodyId, status: 409, error: "body_not_active" }); continue; }
 			const metadata = {
 				bodyId,
@@ -1004,7 +1014,8 @@ export class VaultRuntime implements DrainPort {
 			if (new Set(bodyIds).size !== bodyIds.length) return json({ error: "duplicate_body_id" }, 400);
 			const releases: Array<() => void> = [];
 			try {
-				const bodies = bodyIds.map((bodyId) => {
+				let bodies;
+				try { bodies = bodyIds.map((bodyId) => {
 					const state = this.bootstrap.bodyState(bootstrapId, bodyId);
 					const release = this.cache.reserveFullStateOperation(bodyId, 1, state.encodedState.byteLength);
 					releases.push(release);
@@ -1014,7 +1025,10 @@ export class VaultRuntime implements DrainPort {
 						generation: state.generation,
 						encodedState: state.encodedState,
 					};
-				});
+				}); } catch (error) {
+					if (!(error instanceof RelayMergeBudgetError)) throw error;
+					return json({ error: "relay_merge_budget_exceeded", bodyId: error.documentId }, 413);
+				}
 				let response: Uint8Array;
 				try { response = encodeBinaryEnvelope({ bodies }, MAX_CATCH_UP_BYTES); }
 				catch { return json({ error: "bootstrap_response_too_large" }, 413); }
@@ -1027,7 +1041,11 @@ export class VaultRuntime implements DrainPort {
 		}
 		if (request.method === "GET" && parts.length === 4 && parts[2] === "body") {
 			const bodyId = parts[3]!;
-			const state = this.bootstrap.bodyState(bootstrapId, bodyId);
+			let state: ReturnType<BootstrapService["bodyState"]>;
+			try { state = this.bootstrap.bodyState(bootstrapId, bodyId); } catch (error) {
+				if (!(error instanceof RelayMergeBudgetError)) throw error;
+				return json({ error: "relay_merge_budget_exceeded" }, 413);
+			}
 			const release = this.cache.reserveFullStateOperation(bodyId, 1, state.encodedState.byteLength);
 			try {
 				const head = this.store.getCatalogHeadAt(state.throughSequence, state.bodyId);
@@ -1060,11 +1078,16 @@ export class VaultRuntime implements DrainPort {
 		if (!head) return json({ error: "body_not_active" }, 404);
 		if (this.relay) {
 			// Relay v2: merged stored bytes + catalog hash; no document.
-			const state = this.relay.bodyHttpState(bodyId);
+			let state: ReturnType<RelayBodyService["bodyHttpState"]>;
+			try { state = this.relay.bodyHttpState(bodyId); } catch (error) {
+				if (!(error instanceof RelayMergeBudgetError)) throw error;
+				return json({ error: "relay_merge_budget_exceeded" }, 413);
+			}
 			if (!state) return json({ error: "body_not_active" }, 404);
 			return new Response(state.bytes.slice().buffer, { headers: { "content-type": "application/octet-stream", "cache-control": "no-store",
 				[BODY_EPOCH_HEADER]: String(state.semanticEpoch),
-				"x-yaos-body-id": bodyId, "x-yaos-generation": String(state.generation), "x-yaos-content-hash": state.contentHash, "x-yaos-size": String(state.size) } });
+				"x-yaos-body-id": bodyId, "x-yaos-generation": String(state.generation), "x-yaos-content-hash": state.contentHash ?? "", "x-yaos-size": state.size === null ? "" : String(state.size),
+				"x-yaos-head-sequence": String(state.latestSequence), "x-yaos-content-hash-state": state.hashState } });
 		}
 		const release = this.cache.reserveFullStateOperation(bodyId, 2);
 		try {
@@ -1077,6 +1100,17 @@ export class VaultRuntime implements DrainPort {
 					"x-yaos-body-id": bodyId, "x-yaos-generation": String(reconstructed.generation), "x-yaos-content-hash": await sha256Hex(content), "x-yaos-size": String(content.byteLength) } });
 			} finally { crdtEngine.destroyDocument(reconstructed.doc); }
 		} finally { release(); }
+	}
+
+	/** Relay v2 spike: HEAD body = sequence/generation/epoch/hash-state probe without bytes or a document. */
+	private relayBodyHead(bodyId: string): Response {
+		const state = this.lifecycle.activeBodyHead(bodyId) ? this.relay!.bodyHttpHead(bodyId) : null;
+		if (!state) return new Response(null, { status: 404, headers: { "cache-control": "no-store" } });
+		return new Response(null, { headers: { "content-type": "application/octet-stream", "cache-control": "no-store",
+			[BODY_EPOCH_HEADER]: String(state.semanticEpoch), "x-yaos-body-id": bodyId,
+			"x-yaos-generation": String(state.generation), "x-yaos-head-sequence": String(state.latestSequence),
+			"x-yaos-content-hash": state.contentHash ?? "", "x-yaos-size": state.size === null ? "" : String(state.size),
+			"x-yaos-content-hash-state": state.hashState } });
 	}
 
 	private rootState(url: URL): Response {

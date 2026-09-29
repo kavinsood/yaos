@@ -79,6 +79,12 @@ export class BootstrapService {
 		private readonly store: VaultStore,
 		private readonly now: () => number = Date.now,
 		private readonly reserveFullState: (documentId: string, overlappingCopies: number) => () => void = () => () => {},
+		/**
+		 * Relay v2 spike: when non-null, serve body bytes by byte merge (checkpoint +
+		 * tail through the boundary, no document), refusing merges whose input
+		 * exceeds this many bytes (`RelayMergeBudgetError`).
+		 */
+		private readonly relayMergeBudget: number | null = null,
 	) {}
 
 	async start(attemptId?: string): Promise<BootstrapDescriptor> {
@@ -145,6 +151,16 @@ export class BootstrapService {
 		const operation = this.requireRunning(bootstrapId);
 		const catalog = this.store.getCatalogHeadAt(operation.boundarySequence, bodyId);
 		if (!catalog || catalog.lifecycle !== "active") throw new Error("body is not active at bootstrap boundary");
+		if (this.relayMergeBudget !== null) {
+			// Relay v2: the pinned checkpoint at-or-before the boundary plus the
+			// journal tail through the boundary, merged as bytes (stateless byte ops).
+			const release = this.reserveFullState(bodyId, 1);
+			try {
+				const merged = this.store.durableMergedBytes(bodyId, operation.boundarySequence, this.relayMergeBudget);
+				return { bodyId, bodyEpoch: merged.semanticEpoch, generation: merged.generation,
+					throughSequence: operation.boundarySequence, encodedState: merged.bytes };
+			} finally { release(); }
+		}
 		const release = this.reserveFullState(bodyId, 2);
 		try {
 			const reconstructed = this.store.reconstructDocument(bodyId, operation.boundarySequence);

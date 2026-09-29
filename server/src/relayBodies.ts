@@ -8,7 +8,7 @@ import * as encoding from "lib0/encoding";
 import { ywasmCrdtEngine as crdtEngine } from "@yaos/crdt-engine";
 import { base64ToBytes, bytesToBase64 } from "./base64url";
 import type { VaultActorContext } from "./collaboration";
-import { MAX_DURABLE_UPDATE_BYTES } from "./contracts";
+import { MAX_CATCH_UP_BYTES, MAX_DURABLE_UPDATE_BYTES } from "./contracts";
 import {
 	EMPTY_UPDATE_V1,
 	decodeStateVector,
@@ -25,14 +25,18 @@ import { AUTHORITY_SUPERSEDED_SOCKET_CLOSE_CODE } from "./shared/socketCloseCode
 import { canonicalMarkdownBytes } from "./shared/markdownCodec";
 import type { SemanticEpoch } from "./shared/semanticEpoch";
 import type { RelayConfig } from "./relayFlag";
-import { RelayAppendError, RelayBodyStore, type RelayLeaseResult } from "./relayBodyStore";
-import { sha256HexSync } from "./vaultDocumentStore";
+import {
+	RelayAppendError, RelayBodyStore, type RelayLeaseResult, type RelayResetOutcome, type RelayResetPolicyState,
+} from "./relayBodyStore";
+import { RelayMergeBudgetError, sha256HexSync } from "./vaultDocumentStore";
 import type { VaultDocumentCache } from "./vaultDocumentCache";
 import type { VaultStore } from "./vaultStore";
 import type { VaultSocketAttachment, VaultSocketPort } from "./vaultSocketService";
 
 const MESSAGE_SYNC = 0;
 const MAX_ENVELOPE_ID_LENGTH = 256;
+/** Snapshot ceiling for one semantic reset (binary body; the JSON body shares the same request cap). */
+export const RELAY_MAX_RESET_SNAPSHOT_BYTES = MAX_CATCH_UP_BYTES;
 
 /** Capability advertised in VAULT_READY on relay body sockets. */
 export const RELAY_BODIES_CAPABILITY_VERSION = 2;
@@ -76,6 +80,8 @@ interface MergedEntry {
 	tailEntries: number;
 	tailBytes: number;
 	checkpointSequence: number;
+	/** True when checkpoint + tail exceed `maxMergeInputBytes`: bytes are never merged in-process. */
+	overBudget?: boolean;
 }
 
 interface QueuedFrame {
@@ -116,6 +122,12 @@ export interface RelayCounters {
 	incrementalAppends: number;
 	stateVectorDrift: number;
 	partialCheckpoints: number;
+	/** Byte merges refused by the `maxMergeInputBytes` budget (never called into wasm). */
+	mergeBudgetRejects: number;
+	/** Step1 replies sent as unmerged checkpoint + tail parts (over-budget bodies). */
+	unmergedStep2Replies: number;
+	/** HTTP reads that left an unknown hash unknown because the body is over `lazyHashMaxBytes`. */
+	lazyHashSkips: number;
 }
 
 export interface RelayBodyServiceOptions {
@@ -220,12 +232,15 @@ export class RelayBodyService {
 	private mergedBytesTotal = 0;
 	private readonly batches = new Map<string, { frames: QueuedFrame[]; timer: ReturnType<typeof setTimeout> }>();
 	private readonly appendTimes: number[] = [];
+	/** Bodies whose checkpoint merge was refused by the budget; skipped by the alarm until a reset. */
+	private readonly overBudgetBodies = new Set<string>();
 	readonly counters: RelayCounters = {
 		appends: 0, appendFrames: 0, emptySkips: 0, noopSkips: 0, dedupeHits: 0, dedupeConflicts: 0,
 		envelopeMismatches: 0, hashAccepted: 0, hashUnknown: 0, materialisations: 0, checkpoints: 0,
 		lastCheckpointMs: 0, checkpointRowsWritten: 0, resets: 0, leaseGrants: 0, leaseDenials: 0,
 		rowsWritten: 0, rateLimitCloses: 0, epochFences: 0, authorityCloses: 0, commitFailures: 0,
 		mergedCacheRebuilds: 0, step2Replies: 0, incrementalAppends: 0, stateVectorDrift: 0, partialCheckpoints: 0,
+		mergeBudgetRejects: 0, unmergedStep2Replies: 0, lazyHashSkips: 0,
 	};
 
 	constructor(private readonly options: RelayBodyServiceOptions) {
@@ -277,13 +292,34 @@ export class RelayBodyService {
 		const entry = this.headState(bodyId);
 		if (!entry) return null;
 		if (entry.bytes) return entry as MergedEntry & { bytes: Uint8Array };
-		return this.rebuild(bodyId, entry.latestSequence, entry) as MergedEntry & { bytes: Uint8Array };
+		if (entry.overBudget) throw new RelayMergeBudgetError(bodyId, -1, this.config.maxMergeInputBytes);
+		const rebuilt = this.rebuild(bodyId, entry.latestSequence, entry);
+		if (!rebuilt.bytes) throw new RelayMergeBudgetError(bodyId, -1, this.config.maxMergeInputBytes);
+		return rebuilt as MergedEntry & { bytes: Uint8Array };
 	}
 
+	/**
+	 * Rebuilds the head entry from checkpoint + tail. Over the merge budget the
+	 * entry keeps `bytes: null` and an exact SV (pointwise max of the parts' SVs,
+	 * each part is at most one checkpoint or one durable frame), so appends and
+	 * step1 still work; merged-byte readers get `RelayMergeBudgetError`.
+	 */
 	private rebuild(bodyId: string, throughSequence: number, previous?: MergedEntry): MergedEntry {
-		const durable = this.options.store().durableMergedBytes(bodyId, throughSequence);
+		let durable: { semanticEpoch: SemanticEpoch; latestSequence: number; generation: number; tailEntries: number;
+			tailBytes: number; checkpointSequence: number; bytes: Uint8Array | null };
+		let stateVector: Uint8Array;
+		try {
+			durable = this.options.store().durableMergedBytes(bodyId, throughSequence, this.config.maxMergeInputBytes);
+			stateVector = stateVectorFromUpdate(durable.bytes!);
+		} catch (error) {
+			if (!(error instanceof RelayMergeBudgetError)) throw error;
+			this.counters.mergeBudgetRejects++;
+			const { parts, ...rest } = this.options.store().durableParts(bodyId, throughSequence);
+			durable = { ...rest, bytes: null };
+			stateVector = parts.map((part) => stateVectorFromUpdate(part))
+				.reduce((left, right) => maxStateVector(left, right));
+		}
 		this.counters.mergedCacheRebuilds++;
-		const stateVector = stateVectorFromUpdate(durable.bytes);
 		if (previous && !previous.stateVectorExact && !stateVectorsEqual(previous.stateVector, stateVector)) {
 			this.counters.stateVectorDrift++;
 		}
@@ -298,6 +334,7 @@ export class RelayBodyService {
 			tailEntries: durable.tailEntries,
 			tailBytes: durable.tailBytes,
 			checkpointSequence: durable.checkpointSequence,
+			...(durable.bytes === null ? { overBudget: true } : {}),
 		};
 		this.remember(bodyId, entry);
 		return entry;
@@ -348,6 +385,25 @@ export class RelayBodyService {
 		return true;
 	}
 
+	/**
+	 * Over-budget step1: the checkpoint + tail parts as they are stored, one
+	 * SYNC_STEP_2 per part (no diff, no merge; clients merge idempotently).
+	 */
+	private replyStep2Unmerged(socket: VaultSocketPort, attachment: VaultSocketAttachment): void {
+		const bodyId = attachment.documentId;
+		const head = this.options.store().documentHead(bodyId);
+		if (!head) { socket.close(1008, "body is not active"); return; }
+		if (head.semanticEpoch !== attachment.documentEpoch) {
+			this.counters.epochFences++;
+			this.requireHost().fenceRelaySocket(socket, attachment, head.semanticEpoch);
+			return;
+		}
+		const { parts } = this.options.store().durableParts(bodyId, head.latestSequence);
+		this.counters.step2Replies++;
+		this.counters.unmergedStep2Replies++;
+		try { for (const part of parts) socket.send(syncFrame(SYNC_STEP_2, part)); } catch { /* closed */ }
+	}
+
 	socketClosed(socketId: string): void {
 		this.pendingEnvelopes.delete(socketId);
 		this.buckets.delete(socketId);
@@ -359,8 +415,13 @@ export class RelayBodyService {
 		const message = readSyncMessage(decoder);
 		const bodyId = attachment.documentId;
 		if (message.kind === "step-1") {
-			const state = this.fullState(bodyId);
-			if (!state) { socket.close(1008, "body is not active"); return; }
+			let state: MergedEntry | null;
+			try { state = this.fullState(bodyId); } catch (error) {
+				if (!(error instanceof RelayMergeBudgetError)) throw error;
+				this.replyStep2Unmerged(socket, attachment);
+				return;
+			}
+			if (!state?.bytes) { socket.close(1008, "body is not active"); return; }
 			if (state.epoch !== attachment.documentEpoch) {
 				this.counters.epochFences++;
 				host.fenceRelaySocket(socket, attachment, state.epoch);
@@ -586,6 +647,7 @@ export class RelayBodyService {
 			tailEntries: state.tailEntries + 1,
 			tailBytes: state.tailBytes + update.byteLength,
 			checkpointSequence: state.checkpointSequence,
+			...(state.overBudget ? { overBudget: true } : {}),
 		};
 		this.remember(bodyId, entry);
 		this.syncDocumentCache(bodyId, update, result.generation);
@@ -683,7 +745,17 @@ export class RelayBodyService {
 			? this.options.relayStore().tailPrefixSequence(bodyId, tail.checkpointSequence, this.config.checkpointMaxRows)
 			: null;
 		const throughSequence = prefix ?? head.latestSequence;
-		const durable = this.options.store().durableMergedBytes(bodyId, throughSequence);
+		let durable: ReturnType<VaultStore["durableMergedBytes"]>;
+		try {
+			durable = this.options.store().durableMergedBytes(bodyId, throughSequence, this.config.maxMergeInputBytes);
+		} catch (error) {
+			if (!(error instanceof RelayMergeBudgetError)) throw error;
+			// Never call into wasm past the budget; the body stays checkpoint + tail
+			// until a client semantic reset shrinks it (the alarm skips it meanwhile).
+			this.counters.mergeBudgetRejects++;
+			this.overBudgetBodies.add(bodyId);
+			return null;
+		}
 		if (durable.tailEntries === 0) return null;
 		const partial = throughSequence < head.latestSequence;
 		const written = partial
@@ -715,6 +787,7 @@ export class RelayBodyService {
 
 	/** True when a body's journal tail is over the relay checkpoint thresholds. */
 	needsCheckpoint(bodyId: string): boolean {
+		if (this.overBudgetBodies.has(bodyId)) return false;
 		const tail = this.options.store().documentJournalTailStats(bodyId);
 		return tail.entries >= this.config.checkpointEntries || tail.bytes >= this.config.checkpointBytes;
 	}
@@ -723,16 +796,26 @@ export class RelayBodyService {
 
 	/**
 	 * Body state for HTTP reads: merged stored bytes + catalog hash. An unknown
-	 * (NULL) hash is materialised once off the hot path and backfilled in place.
+	 * (NULL) hash is materialised once off the hot path and backfilled in place
+	 * (the one remaining relay-mode document materialisation on reads; counted
+	 * in `materialisations` and in the store's `documentMaterialisations`).
 	 */
 	bodyHttpState(bodyId: string): { bytes: Uint8Array; generation: number; semanticEpoch: SemanticEpoch;
-		contentHash: string; size: number; materialised: boolean } | null {
+		latestSequence: number; contentHash: string | null; size: number | null; materialised: boolean;
+		hashState: "known" | "materialised" | "unknown" } | null {
 		const state = this.fullState(bodyId);
 		const catalog = this.options.store().getCatalogHeadAt(this.options.store().currentSequence(), bodyId);
 		if (!state || !catalog) return null;
+		const base = { bytes: state.bytes, generation: state.generation, semanticEpoch: state.epoch,
+			latestSequence: state.latestSequence };
 		if (catalog.contentHash !== null && catalog.size !== null) {
-			return { bytes: state.bytes, generation: state.generation, semanticEpoch: state.epoch,
-				contentHash: catalog.contentHash, size: catalog.size, materialised: false };
+			return { ...base, contentHash: catalog.contentHash, size: catalog.size, materialised: false, hashState: "known" };
+		}
+		if (state.bytes.byteLength > this.config.lazyHashMaxBytes) {
+			// A document for a large (possibly struct-dense) body can exceed the
+			// wasm budget; leave the hash unknown until a client reset/hash claim.
+			this.counters.lazyHashSkips++;
+			return { ...base, contentHash: null, size: null, materialised: false, hashState: "unknown" };
 		}
 		const reconstructed = this.options.store().reconstructDocument(bodyId);
 		try {
@@ -740,16 +823,28 @@ export class RelayBodyService {
 			const contentHash = sha256HexSync(content);
 			this.counters.materialisations++;
 			this.options.relayStore().backfillCatalogHash(bodyId, catalog.sequence, contentHash, content.byteLength);
-			return { bytes: state.bytes, generation: state.generation, semanticEpoch: state.epoch,
-				contentHash, size: content.byteLength, materialised: true };
+			return { ...base, contentHash, size: content.byteLength, materialised: true, hashState: "materialised" };
 		} finally {
 			crdtEngine.destroyDocument(reconstructed.doc);
 		}
 	}
 
+	/** HEAD body: durable head + catalog only (no byte merge, no document; the hash may be unknown). */
+	bodyHttpHead(bodyId: string): { generation: number; semanticEpoch: SemanticEpoch; latestSequence: number;
+		contentHash: string | null; size: number | null; hashState: "known" | "unknown" } | null {
+		const head = this.options.store().documentHead(bodyId);
+		const catalog = this.options.store().getCatalogHeadAt(this.options.store().currentSequence(), bodyId);
+		if (!head || !catalog) return null;
+		const known = catalog.contentHash !== null && catalog.size !== null;
+		return { generation: head.generation, semanticEpoch: head.semanticEpoch, latestSequence: head.latestSequence,
+			contentHash: known ? catalog.contentHash : null, size: known ? catalog.size : null,
+			hashState: known ? "known" : "unknown" };
+	}
+
 	acquireLease(bodyId: string, actor: VaultActorContext, expectedEpoch: number, ttlMs: number | undefined):
 		RelayLeaseResult & { stateVector?: string } {
-		const result = this.options.relayStore().acquireLease(bodyId, actor, expectedEpoch, ttlMs, this.now());
+		const result = this.options.relayStore().acquireLease(bodyId, actor, expectedEpoch, ttlMs, this.now(),
+			this.config.resetCooldownMs);
 		if (!result.granted) {
 			this.counters.leaseDenials++;
 			return result;
@@ -759,12 +854,38 @@ export class RelayBodyService {
 		return { ...result, stateVector: bytesToBase64(state?.stateVector ?? new Uint8Array([0])) };
 	}
 
-	/** Validates a client snapshot: a decodable update that covers the merged head. */
-	snapshotCoversHead(bodyId: string, snapshot: Uint8Array): boolean {
-		let snapshotSv: Uint8Array;
-		try { snapshotSv = stateVectorFromUpdate(snapshot); } catch { return false; }
-		const state = this.fullState(bodyId);
-		return !!state && stateVectorCoveredBy(state.stateVector, snapshotSv);
+	resetPolicy(bodyId: string): RelayResetPolicyState {
+		return this.options.relayStore().resetPolicy(bodyId, this.config.resetCooldownMs, this.now());
+	}
+
+	/**
+	 * Structural snapshot check (round 2): a parseable v1 update (byte-op SV
+	 * extraction, no document), non-empty unless the claimed content is empty,
+	 * and under the snapshot cap. It deliberately does not compare state
+	 * vectors: a lineage-fresh snapshot never covers the old lineage's client
+	 * ids, and SV coverage is not a currency proof (delete-only updates leave
+	 * the SV unchanged). Currency = lease + epoch CAS + exact coveredSequence.
+	 */
+	snapshotStructurallyValid(snapshot: Uint8Array, contentBytes: number): boolean {
+		if (snapshot.byteLength < 2 || snapshot.byteLength > RELAY_MAX_RESET_SNAPSHOT_BYTES) return false;
+		let stateVector: Uint8Array;
+		try { stateVector = stateVectorFromUpdate(snapshot); } catch { return false; }
+		return contentBytes === 0 || decodeStateVector(stateVector).size > 0;
+	}
+
+	/** Lease-fenced reset; drops the merged cache entry on success. */
+	semanticReset(bodyId: string, actor: VaultActorContext, input: { leaseId: string; expectedEpoch: number;
+		coveredSequence: number; snapshot: Uint8Array; contentHash: string; contentBytes: number }): RelayResetOutcome {
+		const outcome = this.options.relayStore().semanticReset({ bodyId, actor, ...input, now: this.now(),
+			cooldownMs: this.config.resetCooldownMs });
+		if (!outcome.ok) {
+			this.counters.leaseDenials++;
+			return outcome;
+		}
+		this.counters.resets++;
+		this.invalidate(bodyId);
+		this.overBudgetBodies.delete(bodyId);
+		return outcome;
 	}
 
 	diagnostics(): Record<string, unknown> {
@@ -784,6 +905,7 @@ export class RelayBodyService {
 			pendingEnvelopes: this.pendingEnvelopes.size,
 			pendingBatches: this.batches.size,
 			vaultJournalRows: this.options.relayStore().journalRowCount(),
+			documentMaterialisations: this.options.store().documentMaterialisations,
 			ywasmLinearMemoryBytes: ywasmLinearMemoryBytes(),
 		};
 	}

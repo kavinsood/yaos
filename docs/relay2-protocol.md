@@ -146,7 +146,9 @@ revoked or rate-limited socket never costs a merge.
    revocation, authority fences, membership and provisioning writes, and there is a 5 s TTL safety
    net. A revoked actor gets `{type:"error", code:"authority_superseded"}` and close 4403.
 4. **Budgets.** Each socket has a token bucket: `YAOS_RELAY_RATE_BYTES_PER_SEC` (default
-   262144) refilling a burst of `YAOS_RELAY_BURST_BYTES` (default 1048576). An empty bucket gets
+   262144) refilling a burst of `max(YAOS_RELAY_BURST_BYTES, MAX_DURABLE_UPDATE_BYTES)` (default
+   and floor 1,750,000 bytes). The floor guarantees one maximum-size frame always fits; before round 2,
+   frames between 1 MiB and 1.75 MB were rejected forever. An empty bucket gets
    `{type:"VAULT_BACKPRESSURE", reason:"relay_rate_limit"}` and close 1013.
 5. **No-op skip (growth cap).** Small bodies (exact path): if `mergeUpdates([merged, u])` is
    byte-identical to `merged`, the update adds nothing (for example, a reconnect step2 re-sending
@@ -257,17 +259,49 @@ This is a CAS on `relay_compaction_leases(body_id PK)`. The lease is granted if 
 the row has expired, or the row is held by the same device (re-grant, new `leaseId`), **and**
 `expectedEpoch` equals the head epoch.
 
-- `200 {"granted": true, "leaseId", "expiresAt", "epoch", "headSequence", "generation", "stateVector"}`
+- `200 {"granted": true, "leaseId", "expiresAt", "epoch", "headSequence", "generation", "stateVector", "policy"}`
   - `headSequence` is the head `latest_sequence`.
   - `stateVector` is the base64 SV of the merged bytes at `headSequence`.
+  - `policy` (round 2) is `{"lastResetAt": ms|null, "cooldownMs", "cooldownRemainingMs", "nextResetAllowedAt": ms|null}`.
+- `429 {"granted": false, "reason": "cooldown", "epoch", "headSequence", "policy"}` with a
+  `retry-after` header in seconds. This is the server reset cooldown (round 2): no lease is granted
+  until `YAOS_RELAY_RESET_COOLDOWN_MS` (default 24 h, mirroring
+  `BODY_COMPACTION_THRESHOLDS.softCooldownMs`) has passed since the body's last semantic reset.
+  `lastResetAt` is `vault_semantic_compaction_state.last_compacted_at`, which
+  `semanticResetFromEncodedState` already writes, so the cooldown adds no table. `semantic-reset`
+  re-checks the cooldown, so a lease granted just before a concurrent reset cannot slip through.
+  Test workers set the var small in `[vars]`.
 - `409 {"granted": false, "reason": "held"|"epoch_mismatch", "epoch", "headSequence", "holderDeviceId"?, "expiresAt"?}`
 - `404 {"granted": false, "reason": "not_found", …}`: the body is unknown or not active.
+
+**Client shape change (round 2, `scripts/relay2/reset/leaseClient.ts` + `httpTransport.ts`).** A
+granted result gains `policy`. A denied result gains `reason: "cooldown"` (HTTP 429) and an
+optional `policy`; the client should wait `retry-after` or `policy.cooldownRemainingMs` rather than
+retry. The SV coverage check is gone (§5.2), so the builder's `coverStateVector` GC-struct prefix is
+no longer needed; it is still accepted. Transports should switch to the octet-stream reset body.
 
 ### 5.2 `POST /vault/:id/body/:bodyId/semantic-reset`
 
 Requires the `vault.content.write` capability.
 
-Request (JSON; the forwarded body limit is 8 MiB):
+Two request shapes are accepted.
+
+**Binary (preferred, round 2).** `Content-Type: application/octet-stream`. The body is the raw
+Yjs v1 full-state snapshot, up to `MAX_CATCH_UP_BYTES` (8 MiB). The metadata goes in headers:
+
+| Header | Query fallback | Value |
+|---|---|---|
+| `x-yaos-lease-id` | `leaseId` | lease id |
+| `x-yaos-expected-epoch` | `expectedEpoch` | integer ≥ 1 |
+| `x-yaos-covered-sequence` | `coveredSequence` | integer ≥ 0 |
+| `x-yaos-content-hash` | `contentHash` | 64 lowercase hex |
+| `x-yaos-content-bytes` | `contentBytes` | integer ≥ 0 |
+
+A header wins over the query parameter of the same field. The binary shape skips base64 (4/3
+inflation) and JSON parsing, which is about 1.8x the snapshot in transient JS heap, on a 128 MB
+isolate.
+
+**JSON (legacy, kept).** The forwarded body limit is 8 MiB, so the snapshot tops out near 6 MB:
 
 ```json
 {"leaseId": "…", "expectedEpoch": 1, "coveredSequence": 4242,
@@ -276,12 +310,38 @@ Request (JSON; the forwarded body limit is 8 MiB):
 
 The server checks, and then installs, in order:
 
-0. The snapshot decodes and its state vector covers the merged head SV
-   (`stateVectorCoveredBy(headSV, SV(snapshot))`); otherwise `400 invalid_snapshot`. This catches
-   a snapshot built from a stale or partial state. It does not prove the snapshot is lineage-fresh.
+0. **Structural sanity only:** the snapshot has between 2 bytes and 8 MiB, its state vector
+   decodes (`stateVectorFromUpdate`), and the SV is non-empty unless `contentBytes == 0`.
+   Otherwise the server returns `400 invalid_snapshot`.
+   - **Round 2 removed the SV coverage check** (`SV(snapshot) ⊇ headSV`). A correct client
+     snapshot is *lineage-fresh*: a new Y.Doc holding the text, with a new client id. Its SV
+     never covers the old head SV, so the check rejected every correct reset unless the client
+     prepended GC structs. And it proved nothing about content anyway.
 1. The lease is valid (same `leaseId`, same device, not expired).
 2. `expectedEpoch` equals the head epoch.
 3. `coveredSequence` equals the head `latest_sequence` **exactly**.
+4. The reset cooldown has passed (`409 {"reason": "cooldown", "policy"}`; see §5.1).
+
+**Currency proof.** Steps 1–3 together are the proof that the snapshot is current: epoch CAS,
+plus a lease, plus `coveredSequence == head` exactly. Appends take a `vault_clock` sequence inside
+their commit transaction, and the reset runs in one synchronous transaction that re-reads the head.
+So if any edit landed after the head the client built from, the head moved and the reset fails
+with `head_advanced`. The server cannot check that the snapshot *text* equals the head text
+without a document. That part stays client trust, like the envelope hashes (D6).
+
+**Hot-note CAS starvation.** On a note receiving edits continuously (for example, a live
+transcript), the head can move during every build → upload window, so every reset fails
+`head_advanced` until the lease expires. Mitigations:
+
+- *Client (recommended):* re-read the head, rebuild from the local
+  doc (the rebuild is O(text), about 100 ms at 5 MB), re-POST under the same lease, and add
+  jittered backoff between attempts. Only reset when the note has been idle for a moment, since
+  the policy thresholds make resets rare anyway.
+- *Server (documented, not implemented):* an optional append-pause window. While a lease is held
+  with `pauseAppends: true`, relay appends for that body are deferred (queued in memory, bounded
+  by the lease TTL and by `YAOS_RELAY_MICROBATCH_MS`-style buffering) or rejected with
+  `VAULT_BACKPRESSURE`. That gives the holder a quiet window of at most a few seconds. It trades
+  edit latency for guaranteed progress, and the lease TTL bounds the damage if the holder dies.
 4. `semanticResetFromEncodedState(bodyId, snapshot, {throughSequence: coveredSequence, generation, semanticEpoch: expectedEpoch})`
    installs the snapshot. In one transaction it writes a checkpoint at a new sequence, bumps the
    epoch, advances the head and copies the catalog event. In relay mode that catalog event
@@ -292,21 +352,48 @@ The server checks, and then installs, in order:
 
 Responses:
 
-- `200 {"ok": true, "epoch", "previousEpoch", "sequence", "generation", "fencedSockets"}`
-- `409 {"ok": false, "reason": "lease_invalid"|"lease_expired"|"epoch_mismatch"|"head_advanced", "epoch", "headSequence"}`
+- `200 {"ok": true, "epoch", "previousEpoch", "sequence", "generation", "fencedSockets", "policy"}`
+- `409 {"ok": false, "reason": "lease_invalid"|"lease_expired"|"epoch_mismatch"|"head_advanced"|"cooldown", "epoch", "headSequence", "policy"?}`
   - `head_advanced`: rebuild from the current head and retry while the lease is valid.
 - `400 {"ok": false, "reason": "invalid_request"|"invalid_snapshot"}`
+- `413 {"ok": false, "reason": "too_large"|…}`: the body is over the 8 MiB bound.
+
+A successful reset also drops any resident base-path document (`discardResident`) and prunes the
+old epoch's journal rows, checkpoints and manifests (`pruneUnpinnedDocumentHistory`; bootstrap and
+restore pins are kept).
 
 The server does **not** verify that `contentHash` matches the snapshot text, because it would need
 a doc. Clients are trusted, as with envelope hashes.
 
 ### 5.3 Existing reads, relay mode
 
-`GET/HEAD /vault/:id/body/:bodyId` and `/catch-up` serve merged stored
-bytes (checkpoint + tail, byte merge). Bootstrap body reads are unchanged (boundary-pinned
-reconstruction, §8). The hash comes from the catalog. If the head catalog event
-has a NULL hash, the server materialises lazily once, computes `canonicalMarkdownHash`, and
-backfills that catalog event in place (`materialisations++`).
+- **`GET /vault/:id/body/:bodyId`** returns the merged stored bytes (checkpoint + tail, byte
+  merge). Headers:
+  - `x-yaos-body-epoch`
+  - `x-yaos-generation`
+  - `x-yaos-head-sequence` (the head `latest_sequence`)
+  - `x-yaos-content-hash`, empty when unknown
+  - `x-yaos-size`, empty when unknown
+  - `x-yaos-content-hash-state`: `known`, `materialised` (computed just now by the lazy hash) or
+    `unknown`
+
+  It returns `413 {"error": "relay_merge_budget_exceeded"}` for an over-budget body (§6.2).
+- **`HEAD /vault/:id/body/:bodyId`** (relay mode only; base has no HEAD route) returns the same
+  headers with no body. It reads only the durable head and the catalog: no byte merge and no
+  document. `x-yaos-content-hash-state` is `known` or `unknown`. A client polls it cheaply for
+  sequence, generation and epoch.
+- **`/catch-up`** returns merged stored bytes. `contentHash`/`size` can be `null` (unknown). An
+  over-budget body gets a per-item `{"status": 413, "error": "relay_merge_budget_exceeded"}`.
+- **Bootstrap body reads** (`/bootstrap/:id/body/:bodyId` and the batch route) use a byte merge in
+  relay mode (round 2). They merge the pinned checkpoint at or before the boundary with the
+  journal tail through the boundary (`durableMergedBytes(bodyId, boundarySequence)`), with no
+  document. A reset after the boundary still serves the old lineage, because the pin keeps the
+  old epoch's rows. Over budget, the batch returns 413.
+- **Lazy hash.** If the head catalog event has a NULL hash and the merged bytes are at most
+  `YAOS_RELAY_LAZY_HASH_MAX_BYTES` (default 3 MiB), the server materialises the document once,
+  computes `canonicalMarkdownHash` and backfills that catalog event in place
+  (`materialisations++`). Above that size the hash stays unknown (`lazyHashSkips++`), because a
+  document for a large, struct-dense body can exceed the wasm memory budget (§6.2).
 
 ### 5.4 Diagnostics
 
@@ -319,7 +406,9 @@ backfills that catalog event in place (`materialisations++`).
                   "resets", "leaseGrants", "leaseDenials", "rowsWritten", "rateLimitCloses",
                   "epochFences", "authorityCloses", "commitFailures", "mergedCacheRebuilds",
                   "step2Replies", "envelopeMismatches", "hashAccepted", "hashUnknown",
-                  "incrementalAppends", "stateVectorDrift", "partialCheckpoints", "appendsPerSecond" },
+                  "incrementalAppends", "stateVectorDrift", "partialCheckpoints", "mergeBudgetRejects",
+                  "unmergedStep2Replies", "lazyHashSkips", "appendsPerSecond" },
+    "documentMaterialisations": { "root", "nonRoot", "recentNonRoot": [ { "documentId", "throughSequence", "at" } ] },
     "byteOps": "<ywasm byte-ops backend name>",
     "bodies": [ { "bodyId", "epoch", "latestSequence", "generation", "logRows", "logBytes",
                   "checkpointSequence", "stateVectorBytes", "mergedBytes|null", "stateVectorExact" } ],
@@ -328,7 +417,9 @@ backfills that catalog event in place (`materialisations++`).
     "ywasmLinearMemoryBytes": 0 }
   ```
 
-  Counters are per runtime; they reset when the DO is evicted.
+  Counters are per runtime; they reset when the DO is evicted. `documentMaterialisations` counts
+  every `VaultDocumentStore.reconstructDocument` call, relay or base, for any reason. In relay mode
+  `nonRoot` should move only for the paths listed in §6.1.
 
 - `GET /vault/:id/debug/relay-table-counts`, gated by `YAOS_TEST_ONLY_DEBUG_ROUTES === "true"` AND
   the relay flag, with the operator session: `{tables: {name: rowCount}}` for every table.
@@ -347,6 +438,9 @@ backfills that catalog event in place (`materialisations++`).
 | `YAOS_RELAY_CHECKPOINT_BYTES` | `1048576` | Tail-byte threshold that arms the checkpoint alarm. |
 | `YAOS_RELAY_EXACT_MERGE_BYTES` | `262144` | Bodies up to this merged size use the exact per-append merge; larger ones use the incremental SV. |
 | `YAOS_RELAY_CHECKPOINT_MAX_ROWS` | `200` | Max tail rows merged per checkpoint pass (partial checkpoints beyond). |
+| `YAOS_RELAY_RESET_COOLDOWN_MS` | `86400000` | Minimum ms between two semantic resets of one body (lease → 429 `cooldown`). `0` disables. |
+| `YAOS_RELAY_MAX_MERGE_INPUT_BYTES` | `9437184` | Max summed input of one server byte merge (§6.2). |
+| `YAOS_RELAY_LAZY_HASH_MAX_BYTES` | `3145728` | Bodies above this never get the lazy-hash materialisation. |
 
 Local tests: `YAOS_TEST_FORCE_RELAY_BODIES=true` (or `YAOS_TEST_RELAY_BODIES=true`) makes runtimes
 built without an env (unit suites) default to relay mode (`relayBodiesTestDefault()` in
@@ -354,6 +448,97 @@ built without an env (unit suites) default to relay mode (`relayBodiesTestDefaul
 wrangler launchers (`tests/conformance/launch/wrangler.ts`, `tests/headless/wrangler.ts`) forward
 `YAOS_RELAY_BODIES` from the process env as `--var`, and the Node host reads it from
 `process.env`.
+
+### 6.1 Remaining document materialisations in relay mode
+
+These code paths still build a server Y.Doc for a relay body. Each is counted in
+`documentMaterialisations`:
+
+| Path | When | Why it stays |
+|---|---|---|
+| Lazy hash (`bodyHttpState`) | HTTP GET/catch-up of a body whose head catalog hash is NULL, merged bytes ≤ 3 MiB | This is the only way to get text from bytes without a doc. It is at most once per unknown head, then backfilled. Clients avoid it by sending D6 claims. |
+| HTTP candidate path / create (`vaultLifecycleService.createDocument`, candidate commit) | Closed-file edits and file creates go through the base HTTP candidate path, which loads the body into the document cache | The markdown → CRDT diff (and validation) needs a document. Relay covers only open-editor socket edits. Moving closed-file edits to "client builds the update, server appends" is a client change. |
+| Dirty-doc `writeLiveCheckpoint` | A body resident in the cache (from the candidate path) that is dirty gets a live checkpoint from the doc | This belongs to the base cache lifecycle. `syncDocumentCache` discards a clean resident doc on each relay append, so this happens only while a candidate is in flight. |
+| Semantic docs / base compaction | Server semantic compaction | Disabled for relay bodies (§7.9). It can still run for bodies created before the flag. |
+| Root | All root reads and writes | Out of scope: the relay covers bodies only. |
+
+Paths that do **not** materialise in relay mode: socket accept (step1 = the SV of merged bytes),
+appends, step2 replies, checkpoints, GET with a known hash, HEAD, catch-up with known hashes,
+bootstrap body reads (round 2), lease and reset (structural check only). The unit test
+`HTTP reads: …` asserts this with the counter.
+
+### 6.2 Memory (ywasm byte ops)
+
+Byte ops are stateless: every op copies its inputs into ywasm linear memory, decodes them, and
+encodes the result. The linear memory grows up to a 96 MiB cap (`ywasmByteOps`) and **never
+shrinks**, inside a 128 MB isolate.
+
+Measured with `scripts/relay2-core-reset-loop.ts` on Node, the same wasm build:
+
+| Input | Op | ywasm peak |
+|---|---|---|
+| 10 MB single-lineage text (checkpoint + 211 tail parts) | merge (15 ms) + SV (6 ms) | 39–48 MiB |
+| 8.77 MB bloated 5 MB note (`reset-fixtures/sized-5m.update`, 246k structs) | SV only | 54 MiB |
+| same | `merge([state, 50 tail edits])` | 85 MiB |
+| same | `diff(state, emptySV)` | 88 MiB |
+| same | SV + merge + diffs, sequentially | 95.6 MiB |
+| same | `merge([state, state])` | **trap (`unreachable`, OOM)** |
+
+The rule of thumb is about 4.5x input bytes for sparse text and up to about 10x for struct-dense
+updates.
+
+**Critical: after an OOM trap the ywasm instance is poisoned.** Every later op, even a 100-byte
+merge, fails with an allocation error until the isolate restarts. In the DO that would take down
+every relay body of the vault until eviction. Re-instantiating the module after a trap is owned by
+the ywasm agent. The server side now **refuses before calling into wasm**:
+
+- `YAOS_RELAY_MAX_MERGE_INPUT_BYTES` (default 9 MiB) bounds the summed input of every server
+  merge: `durableMergedBytes` throws `RelayMergeBudgetError`. The 9 MiB default sits above the
+  8 MiB `MAX_CATCH_UP_BYTES` response cap, so any body a GET could return is still merged. A
+  dense 9 MiB input (about 90 MiB) is at the edge; lower the budget if the ywasm agent measures
+  denser fixtures.
+- An over-budget body keeps `bytes: null` and an exact SV (the pointwise max of the per-part SVs;
+  each part is one checkpoint or one ≤1.75 MB frame). Appends keep working.
+  - **Step1** is answered with the stored parts, one `SYNC_STEP_2` per part, unmerged and undiffed
+    (`unmergedStep2Replies++`). y-protocols clients apply them idempotently.
+  - **GET/catch-up/bootstrap** return 413 `relay_merge_budget_exceeded`.
+  - **The checkpoint** is skipped (`mergeBudgetRejects++`), and the alarm stops re-arming for that
+    body until a semantic reset shrinks it.
+- Exact per-append merges only run for bodies ≤ `YAOS_RELAY_EXACT_MERGE_BYTES` (256 KiB), which
+  is far below the budget.
+
+**5 MB bloated note: no server doc is needed.** Server compaction is disabled for relay bodies.
+The reset takes the client's snapshot and runs only the structural SV parse. GET, step2 and the
+checkpoint use byte ops. The lazy hash is skipped above 3 MiB. The bloated fixture's SV-only
+parse, 54 MiB, is the largest single op on the reset path.
+
+**Repeated-reset slowdown (live: 5.0 s → 20.9 s → 116 s `lease_expired`).** A local loop with a
+5 MB note, 10 iterations, real SQLite and the real route
+(`node tests/run-typescript.mjs --test-aliases scripts/relay2-core-reset-loop.ts --mb 5 --n 10`)
+showed nothing growing on the server:
+
+- Each reset takes about 140 ms with the binary body and about 155 ms with JSON, flat across
+  iterations.
+- The post-reset read takes about 132 ms.
+- Table counts stay flat (journal 2, checkpoint chunks 3, manifests 1). Old epochs are pruned.
+- ywasm stays at 20.2 MiB and the heap at about 45 MiB.
+
+So server storage and CPU do not grow per reset. The likely live cause is isolate memory
+pressure: ywasm memory near the cap from the pre-round-2 `snapshotCoversHead` full-state rebuild
+and SV, plus the base64 JSON body (about 3x the snapshot in transient heap), plus the 16 MiB
+merged LRU, on a 128 MB isolate. That slows GC until the isolate is reset. Client or network time
+could also contribute. Round 2 removes the full-state rebuild on reset and adds the binary body.
+
+Live re-measurement after round 2 (`scripts/relay2-core-live-reset.ts --mb 5 --n 6` against
+`yaos-relay2-coresmoke-1`; the 5 MB note is grown by 1 MB relay appends; binary 5.24 MB snapshot
+each time; results in `results/relay2/core2-live-reset-5mb.json`):
+
+- Six consecutive resets all returned 200: 3.7, 3.3, 3.6, 1.7, 3.1 and 3.1 s. That time is
+  dominated by the 5 MB upload from the test machine. There is no growth and no `lease_expired`.
+- The GET after each reset took 1.2–1.7 s for 5.24 MB, with `hashState: known`.
+- HEAD took 180–260 ms.
+- With the 1 s test cooldown, an immediate re-lease got `429 cooldown` (`retry-after: 1`) once. In
+  the other five iterations the reset round-trip had already outlasted the cooldown.
 
 ## 7. Design decisions
 
@@ -389,7 +574,7 @@ wrangler launchers (`tests/conformance/launch/wrangler.ts`, `tests/headless/wran
 - **`vault_operation_outcomes` is not written** for relay appends. Relay receipts are not
   retrievable through `GET /operations/:id/outcome`.
 - **The reset lease is at least as strict as needed**: `coveredSequence` must equal the head
-  exactly, so a busy note can starve resets. The client retries.
+  exactly, so a busy note can starve resets. See §5.2 for the hot-note mitigations.
 - **Incremental SV on large bodies (K3).** For bodies over `YAOS_RELAY_EXACT_MERGE_BYTES` the head
   SV is the pointwise max of the old SV and the update's SV. If an update arrives with a causal
   gap (its structs cannot integrate yet), that max overstates what the merged state contains,
@@ -399,10 +584,11 @@ wrangler launchers (`tests/conformance/launch/wrangler.ts`, `tests/headless/wran
   `counters.stateVectorDrift`; it was 0 in all tests. The growth cap on large bodies only catches
   exact resends, so a covered-but-different re-send (e.g. a reconnect step2) of a large body is
   appended (it is idempotent, and costs one journal row).
-- **Bootstrap body reads are unchanged.** `/bootstrap/:id/body/:bodyId` still reconstructs at the
-  bootstrap boundary through the base path, which costs CPU for large relay bodies. The bootstrap
-  catalog page can carry `contentHash: null` for relay appends whose hash was not accepted;
-  clients must treat that as unknown.
+- **Bootstrap body reads use a byte merge** (round 2; §5.3). The bootstrap catalog page can carry
+  `contentHash: null` for relay appends whose hash was not accepted; clients must treat that as
+  unknown.
+- **Over-budget bodies** (§6.2) are not served by GET, catch-up or bootstrap (413) and are not
+  checkpointed until a client reset shrinks them.
 - **Checkpoints are bounded** to `YAOS_RELAY_CHECKPOINT_MAX_ROWS` rows per pass (partial
   checkpoint + immediate alarm re-arm) instead of one merge of the whole tail.
 

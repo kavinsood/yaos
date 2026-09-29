@@ -168,6 +168,14 @@ export interface CheckpointWriteResult {
 	rowsWritten: number;
 }
 
+/** Relay v2 spike: a byte merge would exceed the relay byte-op memory budget. */
+export class RelayMergeBudgetError extends Error {
+	constructor(readonly documentId: string, readonly inputBytes: number, readonly budgetBytes: number) {
+		super("relay_merge_budget_exceeded");
+		this.name = "RelayMergeBudgetError";
+	}
+}
+
 /** Relay v2 spike: byte-level durable state (see `durableMergedBytes`). */
 export interface DurableMergedBytes {
 	documentId: string;
@@ -403,6 +411,13 @@ function assertCheckpointSummary(row: CheckpointSummaryRow): void {
 /** Document metadata, journal, reconstruction, checkpoint, and feed storage. */
 export abstract class VaultDocumentStore {
 	private initialized = false;
+	/**
+	 * Relay v2 spike diagnostics: every durable-state -> ywasm document
+	 * materialisation goes through `reconstructDocument`, so this counts all of
+	 * them (socket-path loads, HTTP candidates, lazy hashes, bootstrap, ...).
+	 * In relay mode `nonRoot` must stay flat on the relay hot paths.
+	 */
+	readonly documentMaterialisations = { root: 0, nonRoot: 0, recentNonRoot: [] as string[] };
 
 	constructor(protected readonly storage: VaultStoragePort) {}
 
@@ -1423,6 +1438,12 @@ export abstract class VaultDocumentStore {
 
 	reconstructDocument(documentId: string, throughSequence = this.currentSequence()): ReconstructedDocument {
 		this.initialize();
+		if (documentId === "root") this.documentMaterialisations.root++;
+		else {
+			this.documentMaterialisations.nonRoot++;
+			this.documentMaterialisations.recentNonRoot.push(documentId);
+			if (this.documentMaterialisations.recentNonRoot.length > 16) this.documentMaterialisations.recentNonRoot.shift();
+		}
 		if (throughSequence < 0) throw new Error("throughSequence must be non-negative");
 		let rowsRead = 0;
 		const checkpointRows = this.storage.sql.exec<CheckpointStorageRow>(
@@ -1502,7 +1523,21 @@ export abstract class VaultDocumentStore {
 	 * materialising a CRDT document. Same checkpoint/epoch rules as
 	 * {@link reconstructDocument}.
 	 */
-	durableMergedBytes(documentId: string, throughSequence = this.currentSequence()): DurableMergedBytes {
+	durableMergedBytes(documentId: string, throughSequence = this.currentSequence(),
+		maxMergeInputBytes = Number.POSITIVE_INFINITY): DurableMergedBytes {
+		const { parts, ...rest } = this.durableParts(documentId, throughSequence);
+		const inputBytes = parts.reduce((sum, part) => sum + part.byteLength, 0);
+		// Relay v2: stateless byte-op memory is ~10x input bytes for struct-dense
+		// updates, and an OOM trap poisons the shared ywasm instance, so refuse
+		// before calling into wasm (docs/relay2-protocol.md §6.2).
+		if (inputBytes > maxMergeInputBytes) throw new RelayMergeBudgetError(documentId, inputBytes, maxMergeInputBytes);
+		const bytes = parts.length === 1 ? parts[0]! : mergeUpdateBytes(parts);
+		return { ...rest, bytes };
+	}
+
+	/** Relay v2 spike: the checkpoint + journal tail through `throughSequence`, unmerged. */
+	durableParts(documentId: string, throughSequence = this.currentSequence()):
+		Omit<DurableMergedBytes, "bytes"> & { parts: Uint8Array[] } {
 		this.initialize();
 		if (throughSequence < 0) throw new Error("throughSequence must be non-negative");
 		let rowsRead = 0;
@@ -1568,9 +1603,8 @@ export abstract class VaultDocumentStore {
 			tailBytes += update.byteLength;
 		}
 		rowsRead += journal.rowsRead;
-		const bytes = updates.length === 1 ? updates[0]! : mergeUpdateBytes(updates);
 		return { documentId, throughSequence, latestSequence, generation, semanticEpoch, checkpointSequence,
-			tailEntries, tailBytes, bytes, rowsRead };
+			tailEntries, tailBytes, parts: updates, rowsRead };
 	}
 
 	writeCheckpoint(documentId: string, throughSequence = this.currentSequence()): CheckpointWriteResult {
