@@ -1,0 +1,21 @@
+scripts/relay2/k3/lone-surrogate-probe.ts
+  s_9ad601cc7abbf7::t_21d0d424506cc3 1-19
+tests/server/relay2-byteops.ts
+  s_9ad601cc7abbf7::t_dfe3a5307ce21c 1-259
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "6b9788c881592f4748aeed847d85dbf3d87b50f0",
+  "prompts": {},
+  "sessions": {
+    "s_9ad601cc7abbf7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a0c3f851a1219b01f",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
