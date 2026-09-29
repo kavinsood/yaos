@@ -1,0 +1,43 @@
+tests/r2/.gitignore
+  s_3fa8c41e3d4d37::t_88b188c8e0af1b 1-3
+tests/r2/driver-guards.mjs
+  s_06158d5aa75452::t_b20590621091aa 1-35
+tests/r2/local-contract.mjs
+  s_3fa8c41e3d4d37::t_dab64c0c936d24 1-68
+tests/r2/probe.ts
+  s_3fa8c41e3d4d37::t_b07c3a8e3a78b8 1-223
+tests/r2/tsconfig.json
+  s_3fa8c41e3d4d37::t_3426eb3624ac34 1-5
+tests/r2/wrangler.toml
+  s_3fa8c41e3d4d37::t_4443add8b28a4d 1-21
+tests/server/control-plane-sql.ts
+  s_06158d5aa75452::t_f04ccfd203dbac 330-342,398-401
+tests/server/multivault-registry.ts
+  s_06158d5aa75452::t_374abda59db83b 6,19,33,156-165,209-211
+tests/server/vault-store-sqlite-cycle.ts
+  s_06158d5aa75452::t_ad25876752ac34 29,325,332-334,470-481
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a3e6073e93a87126afaf78da294c8ea5b3f63f5e",
+  "prompts": {},
+  "sessions": {
+    "s_06158d5aa75452": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aabbc0b8c933cb988",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_3fa8c41e3d4d37": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a0da75a62b227384a",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
