@@ -1,0 +1,27 @@
+packages/server-node/src/socketHost.ts
+  s_3fa8c41e3d4d37::t_5d146a887fac6e 5-8,24,57-60,66-71,132-139
+server/src/shared/socketLiveness.ts
+  s_3fa8c41e3d4d37::t_b98fa0a6bc6d1b 4-11,19,140-152,257-261,266
+src/runtime/socketLivenessCoordinator.ts
+  s_3fa8c41e3d4d37::t_2d3930ef1307a7 30,49,75,99,114,119,124,134,136-145,233,238
+src/sync/vaultSync.ts
+  s_3fa8c41e3d4d37::t_3e3fa5aa4cac55 8-10,4725-4730,4760,4828,4831-4832,5847
+tests/server/r3-socket-auto-response.ts
+  s_3fa8c41e3d4d37::t_f1774c8792f811 1-252
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "3d10685a1822351ed8d0515504720ab233b8a28a",
+  "prompts": {},
+  "sessions": {
+    "s_3fa8c41e3d4d37": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a0da75a62b227384a",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
