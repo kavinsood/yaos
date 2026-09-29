@@ -2912,6 +2912,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private reviewYaosConflicts(): void {
 		new ConflictListModal(this.app, this.conflictEpisodes?.list() ?? [], (bodyId) => {
 			void this.reviewConflictEpisode(bodyId).catch((error: unknown) => {
+				this.log(`Conflict review remains pending: ${formatUnknown(error)}`);
 				new Notice(`YAOS conflict remains pending: ${formatUnknown(error)}`, 12_000);
 			});
 		}).open();
@@ -2933,17 +2934,24 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			const plannedHash = episode.latestDiskHash;
 			const plannedDisk = await this.diskMirror?.readCanonicalDiskEvidence(episode.path);
 			const proof = runtime.bodies.captureRevision(bodyId);
-			const stillCurrent = () => this.vaultSync === runtime && episodes.get(bodyId) === episode
-				&& episode.latestDiskHash === plannedHash
-				&& runtime.bodies.coordinator.isProjectionCurrent(proof, episode.path)
-				&& yTextToString(body.doc.getText("body")) === current;
+			const stillCurrent = () => {
+				const valid = this.vaultSync === runtime && episodes.get(bodyId) === episode
+					&& episode.latestDiskHash === plannedHash
+					&& runtime.bodies.coordinator.isProjectionCurrent(proof, episode.path)
+					&& yTextToString(body.doc.getText("body")) === current;
+				if (!valid) this.log(`Conflict review plan superseded for "${episode.path}": ${JSON.stringify({ plannedEpoch: proof.bodyEpoch, plannedContentRevision: proof.contentRevision, plannedOwnershipRevision: proof.ownershipRevision, revision: runtime.bodies.coordinator.snapshot(bodyId), diskVersionChanged: episode.latestDiskHash !== plannedHash })}`);
+				return valid;
+			};
 			const merge = base === null ? null : mergeThreeWayText(base, disk, current);
 			const conflict = merge?.kind === "conflict" ? merge : {
 				kind: "conflict" as const, outcome: "conflict" as const, base: "", cleanEdits: [],
 				conflicts: [{ baseStart: 0, baseEnd: 0, base: "", disk: merge?.kind === "clean" ? merge.content : disk, body: current }],
 			};
 			const chosen = await reviewThreeWayConflict(this.app, episode.path, conflict, stillCurrent);
-			if (chosen === null) return;
+			if (chosen === null) {
+				if (!stillCurrent()) throw new Error("The note changed during review. Open review again for the current versions.");
+				return;
+			}
 			if (!stillCurrent()) throw new Error("The note changed during review. Open review again for the current versions.");
 			const actualDisk = await this.diskMirror?.readCanonicalDiskEvidence(episode.path);
 			if (!plannedDisk || !actualDisk || plannedDisk.content !== actualDisk.content || !stillCurrent()) {

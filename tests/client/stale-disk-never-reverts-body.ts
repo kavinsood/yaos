@@ -103,6 +103,7 @@ const SCOPE = "local-db-1";
  */
 async function closedBodyFixture(options: {
 	disk: string;
+	maxFileSizeBytes?: number;
 	baseline: string | null;
 	loadBody: boolean;
 	storedContent?: string;
@@ -338,7 +339,7 @@ async function closedBodyFixture(options: {
 		getConflictEpisodes: () => episodes,
 		app: app as never,
 		getSettings: () => ({ deviceName: "Test device" }) as never,
-		getRuntimeConfig: () => ({ maxFileSizeBytes: 0, maxFileSizeKB: 0, excludePatterns: [], externalEditPolicy: "always" }) as never,
+		getRuntimeConfig: () => ({ maxFileSizeBytes: options.maxFileSizeBytes ?? 0, maxFileSizeKB: 0, excludePatterns: [], externalEditPolicy: "always" }) as never,
 		getVaultSync: () => runtime,
 		getDiskMirror: () => mirror ?? ({
 			isPreservedUnresolved: () => false,
@@ -981,6 +982,20 @@ s.test("G3: after dismissal every subsequent disk variant is preserved in one du
 	assert.equal(fixture.disk(), remote);
 	assert.equal(await fixture.episodes!.readVersion("body-closed", await canonicalMarkdownHash("autosave three")), "autosave three");
 	assert.equal(fixture.episodes!.list().length, 1);
+	await fixture.destroy();
+});
+
+s.test("G3: an impossible pending version survives the ingest size guard with actionable attention", async () => {
+	const limit = 5 * 1024 * 1024;
+	const fixture = await closedBodyFixture({ disk: LOCAL, maxFileSizeBytes: limit, baseline: BASE, loadBody: true, realMirror: true, commonBase: BASE, durableEpisodes: true });
+	fixture.applyRemote(REMOTE);
+	await fixture.mirror!.settleBody({ path: "Closed.md", bodyId: "body-closed", generation: 2, content: REMOTE });
+	const oversized = "x".repeat(limit + 1);
+	fixture.setDisk(oversized);
+	await assert.rejects(fixture.ingest());
+	assert.equal(fixture.disk(), oversized);
+	assert.equal(fixture.runtime.getPathContent("Closed.md"), REMOTE);
+	assert.match(fixture.episodes!.get("body-closed")!.error!, /keep the original file/);
 	await fixture.destroy();
 });
 

@@ -1147,19 +1147,16 @@ export class ReconciliationController {
 			let content = canonicalizeMarkdown(await this.deps.app.vault.read(file));
 
 			const contentBytes = canonicalMarkdownBytes(content).byteLength;
-			if (runtimeConfig.maxFileSizeBytes > 0 && contentBytes > runtimeConfig.maxFileSizeBytes) {
-				this.deps.log(`syncFileFromDisk: skipping "${file.path}" (${Math.round(contentBytes / 1024)} KB exceeds limit)`);
-				return;
-			}
 			const existingText = vaultSync.getTextForPath(file.path);
 			const pendingBodyId = vaultSync.getFileId(file.path);
 			const episodes = this.deps.getConflictEpisodes?.();
 			const episode = pendingBodyId ? episodes?.get(pendingBodyId) : undefined;
 			const pendingBody = yTextToString(existingText);
 			if (pendingBodyId && episodes && episode && pendingBody !== null) {
-				await episodes.preserve({ bodyId: pendingBodyId, path: file.path, disk: content, body: pendingBody, device: this.deps.getSettings().deviceName });
+				await episodes.preserve({ bodyId: pendingBodyId, path: file.path, epoch: vaultSync.bodies.get?.(pendingBodyId)?.bodyEpoch, disk: content, body: pendingBody, device: this.deps.getSettings().deviceName });
 				vaultSync.bodies.coordinator.setDivergence(pendingBodyId, "decision-required");
-				if (episode.baseHash && content !== pendingBody) {
+				if (episode.baseHash && content !== pendingBody
+					&& (runtimeConfig.maxFileSizeBytes <= 0 || contentBytes <= runtimeConfig.maxFileSizeBytes)) {
 					const base = await episodes.readVersion(pendingBodyId, episode.baseHash);
 					const merge = mergeThreeWayText(base, content, pendingBody);
 					if (merge.kind === "clean" && !this.deps.shouldBlockFrontmatterIngest(file.path, pendingBody, merge.content, "pending-conflict-edit")) {
@@ -1171,6 +1168,10 @@ export class ReconciliationController {
 					}
 				}
 				this.deps.refreshStatusBar();
+				return;
+			}
+			if (runtimeConfig.maxFileSizeBytes > 0 && contentBytes > runtimeConfig.maxFileSizeBytes) {
+				this.deps.log(`syncFileFromDisk: skipping "${file.path}" (${Math.round(contentBytes / 1024)} KB exceeds limit)`);
 				return;
 			}
 			this.flushDeferredBaselines(file.path);
@@ -1444,7 +1445,7 @@ export class ReconciliationController {
 		const episodes = this.deps.getConflictEpisodes?.();
 		if (episodes) {
 			try {
-				await episodes.preserve({ bodyId, path, disk: preservedContent, body: bodyContent, base, device: this.deps.getSettings().deviceName });
+				await episodes.preserve({ bodyId, path, epoch: this.deps.getVaultSync()?.bodies.get?.(bodyId)?.bodyEpoch, disk: preservedContent, body: bodyContent, base, device: this.deps.getSettings().deviceName });
 				this.deps.getVaultSync()?.bodies.coordinator.setDivergence(bodyId, "decision-required");
 			} catch (error) {
 				this.deps.log(`Conflict input remains on disk for "${path}": ${String(error)}`);

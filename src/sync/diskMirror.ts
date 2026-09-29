@@ -930,7 +930,7 @@ export class DiskMirror {
 		const episodes = this.settlement?.conflictEpisodes;
 		if (episodes?.get(bodyId)) {
 			try {
-				await episodes.preserve({ bodyId, path, disk: diskContent, body: content, device: this.getDeviceName() });
+				await episodes.preserve({ bodyId, path, epoch: this.vaultSync.bodies.get?.(bodyId)?.bodyEpoch, disk: diskContent, body: content, device: this.getDeviceName() });
 			} catch {
 				this.recordPreservedUnresolved(path, "conflict-artifact-write-failed");
 				return "preserved-unresolved";
@@ -992,7 +992,7 @@ export class DiskMirror {
 				if (this.settlement.conflictEpisodes) {
 					try {
 						await this.settlement.conflictEpisodes.preserve({
-							bodyId, path, disk: diskContent, body: content,
+							bodyId, path, epoch: this.vaultSync.bodies.get?.(bodyId)?.bodyEpoch, disk: diskContent, body: content,
 							base: input.baseContent ?? base?.settlement.content ?? merge.base, device: this.getDeviceName(),
 						});
 					} catch {
@@ -1110,7 +1110,7 @@ export class DiskMirror {
 	): Promise<"settled" | "replan" | "preserved-unresolved"> {
 		try {
 			if (this.settlement?.conflictEpisodes) {
-				await this.settlement.conflictEpisodes.preserve({ bodyId, path, disk: diskContent, body: content, device: this.getDeviceName() });
+				await this.settlement.conflictEpisodes.preserve({ bodyId, path, epoch: this.vaultSync.bodies.get?.(bodyId)?.bodyEpoch, disk: diskContent, body: content, device: this.getDeviceName() });
 			} else await createMarkdownConflictArtifact(this.app, path, diskContent, {
 				deviceName: this.getDeviceName(),
 				reason: "closed-file-both-changed-no-common-base",
