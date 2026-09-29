@@ -1,0 +1,49 @@
+docs/relay2-protocol.md
+  s_3fa8c41e3d4d37::t_4c9f51b8a8e0c1 149-151,262,265-273,277-282,287-304,313-319,323-344,355-356,359-363,370-396,409-411,420-422,441-443,452-542,577,587-591
+scripts/relay2-core-live-reset.ts
+  s_3fa8c41e3d4d37::t_582f1684666756 1-105
+scripts/relay2-core-reset-loop.ts
+  s_3fa8c41e3d4d37::t_ae0207af7ed792 1-198
+server/src/bootstrap.ts
+  s_3fa8c41e3d4d37::t_2676e301a33008 82-87,154-163
+server/src/index.ts
+  s_3fa8c41e3d4d37::t_5f17e9e7e347ca 102
+server/src/relayBodies.ts
+  s_06158d5aa75452::t_40abf04caaf23b 11,28-31,38-39,83-84,125-130,235-236,243,295-298,301-306,308-321,337,388-406,418-424,650,748-758,790,799-801,804-805,809-810,812-818,826,832-843,846-847,857-888,908
+server/src/relayBodyStore.ts
+  s_3fa8c41e3d4d37::t_0254646b1560f8 48-57,59-62,66,194-205,207,219,221-227,235,248,271,277,287-290,292
+server/src/relayFlag.ts
+  s_3fa8c41e3d4d37::t_b4c44728e36136 4,17-20,35-45,48-54,59,65-67,107-108,114-116
+server/src/relayRoutes.ts
+  s_3fa8c41e3d4d37::t_1267145a4bdaaa 7,53-57,61-106,109-110,115-126,129-130,134-135
+server/src/server.ts
+  s_3fa8c41e3d4d37::t_ec2c4d8288e15b 36,341,543,878-885,1017-1018,1028-1031,1044-1048,1081-1085,1089-1090,1105-1115
+server/src/vaultDocumentStore.ts
+  s_3fa8c41e3d4d37::t_03539137506068 171-178,414-420,1441-1446,1526-1540,1607
+tests/server/relay2-server-core.ts
+  s_06158d5aa75452::t_3b18a03d9840fa 15-16,22,25,445,451-452,456-457,459,461-466,472,476-477,480,488-736
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "54cee5150088a4551c9834b56194d1558db80db7",
+  "prompts": {},
+  "sessions": {
+    "s_06158d5aa75452": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aabbc0b8c933cb988",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_3fa8c41e3d4d37": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a0da75a62b227384a",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
