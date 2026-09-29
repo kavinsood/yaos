@@ -891,7 +891,6 @@ export class BootstrapClient {
 			if (cursor === null) break;
 		}
 		progress.stage = "feed-catching-up";
-		progress.feedCursor = progress.highWater;
 		await this.database.putBootstrapProgress(progress);
 		await this.database.putFeedCursor({ sequence: progress.feedCursor, updatedAt: this.now() });
 		return progress;
