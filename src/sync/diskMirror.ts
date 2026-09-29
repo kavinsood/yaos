@@ -921,14 +921,17 @@ export class DiskMirror {
 		}
 
 		let diskContent: string;
+		let rawDiskContent: string;
 		try {
-			diskContent = canonicalizeMarkdown(await this.app.vault.read(existing));
+			rawDiskContent = await this.app.vault.read(existing);
+			diskContent = canonicalizeMarkdown(rawDiskContent);
 		} catch {
 			this.recordPreservedUnresolved(path, "body-settlement-failed");
 			return "preserved-unresolved";
 		}
 		if (!isCurrent()) return "replan";
-		const episodes = this.settlement?.conflictEpisodes;
+		const settlement = this.settlement;
+		const episodes = settlement?.conflictEpisodes;
 		if (episodes?.get(bodyId)) {
 			try {
 				await episodes.preserve({ bodyId, path, epoch: this.vaultSync.bodies.get?.(bodyId)?.bodyEpoch, disk: diskContent, body: content, device: this.getDeviceName() });
@@ -949,6 +952,26 @@ export class DiskMirror {
 			this._onDiskWriteCallback?.(path, remoteHash, content);
 			this.clearPreservedUnresolved(path);
 			return "settled";
+		}
+		if (episodes && settlement && content.length > 0 && diskContent.startsWith(content)) {
+			const artifactHash = episodes.snapshot().artifacts[path];
+			const verified = await episodes.isArtifact(path, rawDiskContent);
+			if (!isCurrent() || this.settlement !== settlement
+				|| artifactHash !== episodes.snapshot().artifacts[path]) return "replan";
+			if (verified) {
+				const currentDisk = await this.app.vault.read(existing);
+				if (!isCurrent() || this.settlement !== settlement || currentDisk !== rawDiskContent
+					|| artifactHash !== episodes.snapshot().artifacts[path]) return "replan";
+				if (this.diskIngestBlocked(bodyId, path, content, diskContent)) return "preserved-unresolved";
+				const committed = await settlement.commitLocalBody({
+					bodyId, path, content: diskContent, expectedBodyContent: content, reason: "external-edit",
+				});
+				if (committed !== "superseded") {
+					this.settlement?.markDivergence?.(bodyId, "none");
+					this.clearPreservedUnresolved(path);
+				}
+				return "replan";
+			}
 		}
 
 		if (this.settlement?.getCommonBase && this.settlement.commitMergedBody) {

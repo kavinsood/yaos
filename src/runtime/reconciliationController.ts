@@ -1144,7 +1144,8 @@ export class ReconciliationController {
 		}
 
 		try {
-			let content = canonicalizeMarkdown(await this.deps.app.vault.read(file));
+			const rawDiskContent = await this.deps.app.vault.read(file);
+			let content = canonicalizeMarkdown(rawDiskContent);
 
 			const contentBytes = canonicalMarkdownBytes(content).byteLength;
 			const existingText = vaultSync.getTextForPath(file.path);
@@ -1267,6 +1268,37 @@ export class ReconciliationController {
 				}
 				content = partial;
 				frontmatterHeld = true;
+			}
+			if (!isOpenInEditor && !frontmatterHeld && episodes && pathBodyId && existingText
+				&& previousContent !== null && previousContent.length > 0
+				&& content !== previousContent && content.startsWith(previousContent)) {
+				const bodyProof = vaultSync.bodies.captureRevision(pathBodyId);
+				const artifactHash = episodes.snapshot().artifacts[file.path];
+				const verified = await episodes.isArtifact(file.path, rawDiskContent);
+				const stillCurrent = () => vaultSync.bodies.coordinator.isProjectionCurrent(bodyProof, file.path)
+					&& this.deps.getConflictEpisodes?.() === episodes
+					&& artifactHash === episodes.snapshot().artifacts[file.path]
+					&& (admission?.isCurrent() ?? true);
+				if (!stillCurrent()) {
+					this.requeueAfterSupersede(file, opId, "the artifact append proof moved");
+					return;
+				}
+				if (verified) {
+					const currentDisk = await this.deps.app.vault.read(file);
+					if (currentDisk !== rawDiskContent || !stillCurrent()) {
+						this.requeueAfterSupersede(file, opId, "the artifact changed during append verification");
+						return;
+					}
+					const outcome = await this.importDiskIfBodyCurrent(vaultSync, file.path, pathBodyId,
+						existingText, previousContent, content, crypto.randomUUID());
+					if (outcome === "superseded") {
+						this.requeueAfterSupersede(file, opId, "the artifact body moved before append commit");
+						return;
+					}
+					this.ingestReplans.delete(file.path);
+					await this.updateDiskIndexForPath(file.path, content);
+					return;
+				}
 			}
 			const bodyMovedSinceBaseline = existingText && pathBodyId && previousContent !== null
 				&& !await this.matchesBaseline(file.path, previousContent);
