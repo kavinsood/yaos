@@ -77,11 +77,11 @@ s.test("ticket HTTP handler signs the authorized device identity", async () => {
 	assert.equal(missingEpoch.status, 400, "epoch-less tickets are never minted");
 });
 
-s.test("revoked membership rejects both root and body sockets before vault allocation", async () => {
+s.test("revoked membership is rejected by the vault without Worker singleton authorization calls", async () => {
 	const rootTicket = (await createTicket(AUTH, await actor(), { purpose: "root", documentId: "root", rootEpoch: 3 })).ticket;
 	const bodyTicket = (await createTicket(AUTH, await actor(), { purpose: "body", documentId: "body-ticket-0001", bodyEpoch: 7 })).ticket;
 	let membershipChecks = 0;
-	const syncTrap = makeTrapNamespace("revoked socket touched YAOS_SYNC");
+	const syncTrap = makeVaultSyncNamespace(async () => Response.json({ error: "unauthorized" }, { status: 401 }));
 	const env = makeEnv({
 		YAOS_SYNC: syncTrap,
 		YAOS_CONFIG: makeConfigNamespace(async (request) => {
@@ -101,8 +101,8 @@ s.test("revoked membership rejects both root and body sockets before vault alloc
 		);
 		assert.equal(response.status, 401);
 	}
-	assert.equal(membershipChecks, 2);
-	assert.deepEqual(syncTrap.touched, []);
+	assert.equal(membershipChecks, 0);
+	assert.equal(syncTrap.calls, 2);
 });
 
 s.test("live membership forwards exact device identity to root and body runtime sockets", async () => {

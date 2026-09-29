@@ -21,7 +21,11 @@ function memoryRuntime(data = new Map<string, unknown>()): ControlPlaneRuntime {
 		...transaction,
 		transaction: async <T>(closure: (txn: ControlPlaneTransactionPort) => Promise<T>) => closure(transaction),
 	};
-	return new ControlPlaneRuntime(storage);
+	return new ControlPlaneRuntime(storage, undefined, { call: async (_name, request) => {
+		const body = await request.json() as { vaultGeneration: string; deletionId: string };
+		return Response.json({ fenced: true, vaultId: request.headers.get("x-yaos-vault-id"),
+			vaultGeneration: body.vaultGeneration, deletionId: body.deletionId });
+	} });
 }
 
 function post(path: string, body: unknown): Request {
