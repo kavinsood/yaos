@@ -23,6 +23,13 @@ export default {
 		let bytesRead = 0;
 		let puts = 0;
 		let created = 0;
+		let preconditionsFailed = 0;
+		let nativeChecksumErrors = 0;
+		let nativePutErrors = 0;
+		let nativeHeads = 0;
+		let nativeHeadsPresent = 0;
+		let inputBytes = 0;
+		const syntheticHead = url.pathname.startsWith("/conditional/");
 		let produced = 0;
 		let maxAhead = 0;
 		const mode = url.pathname.startsWith("/bounded/") ? "bounded" : request.headers.get("X-R4-Mode");
@@ -38,7 +45,13 @@ export default {
 			controller.enqueue(new Uint8Array(64 * 1024).fill(37));
 		} }) : null;
 		if (generated) headers.set("Content-Length", String(10 * 1024 * 1024));
-		const routedRequest = { method: request.method, headers, body: generated ?? request.body } as Request;
+		const input = syntheticHead && request.body ? request.body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+			transform(chunk, controller) {
+				inputBytes += chunk.byteLength;
+				controller.enqueue(chunk);
+			},
+		}, undefined, { highWaterMark: 0 })) : request.body;
+		const routedRequest = { method: request.method, headers, body: generated ?? input } as Request;
 		const bucket = mode ? {
 			head: async () => null,
 			put: async (_key: string, body: ReadableStream<Uint8Array>, options: R2PutOptions) => {
@@ -65,11 +78,24 @@ export default {
 				} finally { reader.releaseLock(); }
 			},
 		} as unknown as R2Bucket : new Proxy(env.BLOBS, { get(target, property) {
+			if (property === "head" && syntheticHead) return async (objectKey: string) => {
+				const object = await target.head(objectKey);
+				nativeHeads++;
+				if (object) nativeHeadsPresent++;
+				return null;
+			};
 			if (property === "put") return async (...args: Parameters<R2Bucket["put"]>) => {
 				puts++;
-				const result = await target.put(...args);
-				if (result) created++;
-				return result;
+				try {
+					const result = await target.put(...args);
+					if (result) created++;
+					else preconditionsFailed++;
+					return result;
+				} catch (error) {
+					nativePutErrors++;
+					if (error instanceof Error && /\(10037\)$/.test(error.message)) nativeChecksumErrors++;
+					throw error;
+				}
 			};
 			const value: unknown = Reflect.get(target, property, target);
 			return typeof value === "function" ? value.bind(target) : value;
@@ -78,6 +104,15 @@ export default {
 			const response = await handleBlobRoute(await routeEnv(new CloudflareObjectStore(bucket)), VAULT_ID, routedRequest, [hash], json);
 			response.headers.set("X-R4-Puts", String(puts));
 			response.headers.set("X-R4-Created", String(created));
+			response.headers.set("X-R4-Precondition-Failed", String(preconditionsFailed));
+			response.headers.set("X-R4-Native-Checksum-Errors", String(nativeChecksumErrors));
+			response.headers.set("X-R4-Native-Put-Errors", String(nativePutErrors));
+			if (syntheticHead) {
+				response.headers.set("X-R4-Fixture", "native-head-read-forced-absent");
+				response.headers.set("X-R4-Native-Heads", String(nativeHeads));
+				response.headers.set("X-R4-Native-Heads-Present", String(nativeHeadsPresent));
+				response.headers.set("X-R4-Input-Bytes", String(inputBytes));
+			}
 			response.headers.set("X-R4-Produced", String(produced));
 			response.headers.set("X-R4-Max-Ahead", String(maxAhead));
 			response.headers.set("X-R4-Bytes-Read", String(bytesRead));

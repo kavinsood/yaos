@@ -1,0 +1,10 @@
+name = "yaos-p0k-r4-probe"
+main = "probe.ts"
+compatibility_date = "2026-03-05"
+
+[[r2_buckets]]
+binding = "YAOS_BUCKET"
+bucket_name = "yaos-p0k-blobs"
+
+[observability]
+enabled = false

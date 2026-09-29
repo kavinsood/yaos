@@ -10,8 +10,9 @@ export default {
 		request.headers.forEach((_value, name) => {
 			if (name.startsWith("x-r4-")) unsafeHeader = true;
 		});
-		if (!/^\/(?:blobs|metadata)\/[a-f0-9]{64}$/.test(path)
+		if (!/^\/(?:blobs|metadata|r2-checksum|conditional)\/[a-f0-9]{64}$/.test(path)
 			|| !["GET", "PUT"].includes(request.method)
+			|| ((path.startsWith("/r2-checksum/") || path.startsWith("/conditional/")) && request.method !== "PUT")
 			|| unsafeHeader) {
 			return new Response(null, { status: 400 });
 		}
