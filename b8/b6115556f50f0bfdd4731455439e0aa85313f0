@@ -1,0 +1,43 @@
+packages/server-node/vendor/ywasm/ywasm.d.ts
+  s_9ad601cc7abbf7::t_a09cbf4f6fb145 1513-1521,1610-1617
+packages/server-node/vendor/ywasm/ywasm.js
+  s_9ad601cc7abbf7::t_2a7ce1139a7ca4 3747-3771,3964-3984
+server/scripts/build-ywasm.mjs
+  s_3fa8c41e3d4d37::t_28fdc7d462b81c 59-60,71-72
+server/src/crdt/vendor/ywasm/ywasm.d.mts
+  s_3fa8c41e3d4d37::t_7ebb538730eee0 48-51
+server/src/crdt/vendor/ywasm/ywasm.mjs
+  s_9ad601cc7abbf7::t_d3b002a5c07e62 3716-3739,3923-3942
+server/vendor/ywasm/README.md
+  s_9ad601cc7abbf7::t_ba5042fcab44a4 7-9
+server/vendor/ywasm/SOURCE.json
+  s_9ad601cc7abbf7::t_cfba8a88e51a29 17-24
+server/vendor/ywasm/patches/0003-byte-level-update-ops.patch
+  s_9ad601cc7abbf7::t_29ac8e9d0b358a 1-24
+server/vendor/ywasm/verify-node-artifact.cjs
+  s_3fa8c41e3d4d37::t_ad57da45a86f46 18-51
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "b8b6115556f50f0bfdd4731455439e0aa85313f0",
+  "prompts": {},
+  "sessions": {
+    "s_3fa8c41e3d4d37": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a0da75a62b227384a",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_9ad601cc7abbf7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a0c3f851a1219b01f",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
