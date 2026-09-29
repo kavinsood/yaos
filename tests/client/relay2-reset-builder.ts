@@ -7,7 +7,8 @@ import * as Y from "yjs";
 import { ywasmCrdtEngine as crdtEngine } from "@yaos/crdt-engine";
 import { prepareSemanticReset } from "../../server/src/semanticCompaction";
 import { canonicalMarkdownHash } from "../../server/src/shared/markdownCodec";
-import { buildFreshSnapshot, buildFreshSnapshotFromContent, documentCensus, semanticResetOperations } from "../../scripts/relay2/reset/builder";
+import { buildFreshSnapshot, buildFreshSnapshotFromContent, documentCensus, lineageCoverUpdate, semanticResetOperations } from "../../scripts/relay2/reset/builder";
+import { stateVectorCoveredBy, stateVectorFromUpdate } from "../../server/src/crdt/ywasmByteOps";
 import { bloatedDoc } from "../../scripts/relay2/reset/bloat";
 import { suite } from "../harness.ts";
 
@@ -106,6 +107,34 @@ s.test("operations and content-seeded build agree with doc build", async () => {
 	s.check(fromContent.contentHash === fromDoc.contentHash, "same hash from content path");
 	const census = documentCensus(doc);
 	s.check(census.encodedStateBytes === fromDoc.before.encodedStateBytes, "documentCensus matches builder before-census");
+	doc.destroy();
+});
+
+s.test("lineage cover: snapshot SV covers the old head (relay snapshotCoversHead) without old content", async () => {
+	const doc = bloatedDoc({ guid: "builder-cover", edits: 3_000, seed: 12 });
+	const headSv = Y.encodeStateVector(doc);
+	const plain = await buildFreshSnapshot(doc);
+	const covered = await buildFreshSnapshot(doc, { coverStateVector: headSv });
+	// Exactly the deployed server's check (ywasm stateless SV + coverage).
+	s.check(!stateVectorCoveredBy(headSv, stateVectorFromUpdate(plain.snapshot)), "plain fresh snapshot fails the server's coverage check");
+	s.check(stateVectorCoveredBy(headSv, stateVectorFromUpdate(covered.snapshot)), "covered snapshot passes it");
+	s.check(covered.content === plain.content && covered.contentHash === plain.contentHash, "same canonical content and hash");
+	const clients = Y.decodeStateVector(headSv).size;
+	const overhead = covered.snapshot.byteLength - plain.snapshot.byteLength;
+	s.check(overhead > 0 && overhead <= clients * 16 && lineageCoverUpdate(headSv).byteLength <= clients * 16 + 2, `overhead ${overhead} B for ${clients} old clients`);
+	const reopened = crdtEngine.openDocument(doc.guid, covered.snapshot);
+	s.check(crdtEngine.readText(reopened, "body") === plain.content, "ywasm reads the same body from the covered snapshot");
+	crdtEngine.destroyDocument(reopened);
+	// A leaked old-lineage update (made on the old doc) is a no-op on the covered lineage.
+	const before = Y.encodeStateVector(doc);
+	doc.getText("body").insert(10, "[LEAK]");
+	const leaked = Y.encodeStateAsUpdate(doc, before);
+	const target = new Y.Doc({ guid: doc.guid });
+	Y.applyUpdate(target, covered.snapshot);
+	Y.applyUpdate(target, leaked);
+	s.check(!target.getText("body").toJSON().includes("[LEAK]") && target.getText("body").toJSON() === plain.content,
+		"leaked old-epoch insert does not resurface on the covered lineage");
+	target.destroy();
 	doc.destroy();
 });
 

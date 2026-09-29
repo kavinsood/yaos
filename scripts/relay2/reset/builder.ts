@@ -32,6 +32,7 @@
  * unknown kind are dropped, which is what the server's reset does to them
  * (they snapshot as an empty map → no operations).
  */
+import * as encoding from "lib0/encoding";
 import * as Y from "yjs";
 import type { CrdtRootOperation, CrdtValueSnapshot } from "../../../server/src/crdt/crdtEngine";
 import { yjsCrdtEngine, type YjsCrdtDocument } from "../../../server/src/crdt/yjsCrdtEngine";
@@ -90,6 +91,35 @@ export interface BuildOptions {
 	clientID?: number;
 	/** Skip the "before" census (caller already has it from the policy check). */
 	before?: DocumentCensus;
+	/**
+	 * Make the snapshot's state vector cover this (old-lineage) state vector by
+	 * prepending one GC struct per old client (`lineageCoverUpdate`). The deployed
+	 * relay server rejects a snapshot whose SV does not cover the head SV
+	 * (`snapshotCoversHead` → 400 invalid_snapshot), which a lineage-fresh doc never
+	 * does. Cost: ~13 B per historical client (measured 52 B for 4); the SV never shrinks. Side effect
+	 * (useful): any leaked old-lineage update at clocks ≤ the cover is a no-op.
+	 */
+	coverStateVector?: Uint8Array;
+}
+
+/**
+ * A Yjs v1 update containing, for each (client, clock) in `stateVector`, a
+ * single GC struct spanning clocks [0, clock). GC = "content known and
+ * discarded": it carries no content and belongs to no shared type.
+ */
+export function lineageCoverUpdate(stateVector: Uint8Array): Uint8Array {
+	const clocks = [...Y.decodeStateVector(stateVector).entries()].filter(([, clock]) => clock > 0).sort((a, b) => b[0] - a[0]);
+	const encoder = encoding.createEncoder();
+	encoding.writeVarUint(encoder, clocks.length);
+	for (const [client, clock] of clocks) {
+		encoding.writeVarUint(encoder, 1); // structs for this client
+		encoding.writeVarUint(encoder, client);
+		encoding.writeVarUint(encoder, 0); // first clock
+		encoding.writeUint8(encoder, 0); // info: GC
+		encoding.writeVarUint(encoder, clock); // length
+	}
+	encoding.writeVarUint(encoder, 0); // empty delete set
+	return encoding.toUint8Array(encoder);
 }
 
 type InternalDoc = Y.Doc & { readonly store: { readonly clients: Map<number, ReadonlyArray<{ readonly deleted?: boolean }>> } };
@@ -192,10 +222,13 @@ export async function buildFreshSnapshot(current: Y.Doc, options: BuildOptions =
 	const freshHandle = yjsCrdtEngine.createDocument(current.guid);
 	const fresh = engineDoc(freshHandle);
 	if (options.clientID !== undefined) fresh.clientID = options.clientID;
+	const cover = options.coverStateVector ? Y.decodeStateVector(options.coverStateVector) : null;
+	while (cover?.has(fresh.clientID)) fresh.clientID = Math.floor(Math.random() * 0xffff_ffff);
 	let kept = false;
 	try {
 		yjsCrdtEngine.applyRootOperations(freshHandle, operations, "semantic-reset");
 		const built = now();
+		if (options.coverStateVector) Y.applyUpdate(fresh, lineageCoverUpdate(options.coverStateVector), "semantic-reset-lineage-cover");
 		const snapshot = Y.encodeStateAsUpdate(fresh);
 		const encoded = now();
 		const content = fresh.getText(BODY_TEXT_ROOT).toJSON();

@@ -196,6 +196,8 @@ export interface CompactionOptions {
 	 *    download of the (bloated) current state.
 	 */
 	snapshotSource?: "local" | "server";
+	/** Prepend GC structs so the snapshot SV covers the old head SV (builder `coverStateVector`; required by the deployed relay server). */
+	coverPreviousLineage?: boolean;
 }
 
 function summarize(fresh: FreshSnapshot): FreshSnapshotSummary {
@@ -357,7 +359,8 @@ export async function runCompaction(
 			source = handle.doc();
 		}
 		const buildStarted = performance.now();
-		try { fresh = await buildFreshSnapshot(source); } finally { scratch?.destroy(); }
+		try { fresh = await buildFreshSnapshot(source, options.coverPreviousLineage ? { coverStateVector: Y.encodeStateVector(source) } : {}); }
+		finally { scratch?.destroy(); }
 		buildMs += performance.now() - buildStarted;
 		if (!options.force) {
 			const decision = confirmAfterBuild(fresh, policyState, now());
