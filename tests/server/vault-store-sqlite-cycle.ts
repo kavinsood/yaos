@@ -26,6 +26,7 @@ const s = suite("vault-store-sqlite-cycle");
 const workerSource = String.raw`
 import * as Y from "yjs";
 import { VaultStore } from "./server/src/vaultStore.ts";
+import { capabilityDigestForRole } from "./server/src/collaboration.ts";
 import { ywasmCrdtEngine as crdtEngine } from "@yaos/crdt-engine";
 import { mapValue, snapshotRootMap } from "./server/src/crdt/rootSchema.ts";
 
@@ -315,30 +316,22 @@ export class StoreCycle {
     store.resetCaptureDelta(capture.captureId, 3_002);
     const deltaReset = store.recoveryCapture(capture.captureId).deltaDigest === null
       && store.deltaPageCommitment(capture.captureId, null) === null;
-    let deletionGenerationRejected = false;
-    try {
-      store.beginVaultDeletion("deletion-sqlite-cycle", "generation-sqlite-cycle-0002", 4_000);
-    } catch {
-      deletionGenerationRejected = true;
-    }
-    const deletion = store.beginVaultDeletion("deletion-sqlite-cycle", vaultGeneration, 4_001);
-    const deletionAuthority = deletionGenerationRejected
-      && deletion.captureJobIds.includes(capture.jobId)
-      && store.vaultDeletionBegun(vaultGeneration);
     catalogBody.destroy();
     crdtEngine.destroyDocument(reconstructed.doc);
     body.destroy();
 
     const ownerActor = { vaultId: "sqlite-cycle-vault", vaultGeneration, principalId: "principal-owner",
       membershipRevision: 1, deviceId: "device-owner", deviceCredentialRevision: 1,
-      role: "owner", policyVersion: 1, capabilityDigest: "owner-digest" };
+      role: "owner", policyVersion: 1, capabilityDigest: await capabilityDigestForRole("owner") };
     const authorityReceipt = store.installAuthorityFence({ changeId: "authority-bootstrap", vaultId: "sqlite-cycle-vault",
       vaultGeneration, subjectDigest: "authority-bootstrap-digest", subjects: [
         { principalId: ownerActor.principalId, role: "owner", state: "active", membershipRevision: 1,
           policyVersion: 1, capabilityDigest: ownerActor.capabilityDigest, displayName: "Owner", colorSeed: "owner-color" },
         { deviceId: ownerActor.deviceId, principalId: ownerActor.principalId, state: "active", credentialRevision: 1 },
       ] });
-    const authorityMirror = store.validateActor(ownerActor) === "allowed"
+    store.activateVaultAdmission("sqlite-cycle-vault", vaultGeneration);
+    const authorityMirror = store.vaultAdmissionActive("sqlite-cycle-vault", vaultGeneration)
+      && store.validateActor(ownerActor) === "allowed"
       && store.authorityFenceReceipt(authorityReceipt.changeId)?.subjectDigest === authorityReceipt.subjectDigest
       && store.validateActor({ ...ownerActor, membershipRevision: 2 }) === "authority_superseded";
 	const originalReconstructDocument = store.reconstructDocument.bind(store);
@@ -473,6 +466,18 @@ export class StoreCycle {
 	const framedRollback = rollbackRejected && failedRows.count === 0
 	  && JSON.stringify(store.documentHead("sqlite-cycle-body")) === JSON.stringify(beforeRollback)
 	  && store.candidateReceipt("sqlite-cycle-body", ownerActor.deviceId, "candidate-rollback-sqlite-cycle") === null;
+
+    let deletionGenerationRejected = false;
+    try {
+      store.beginVaultDeletion("deletion-sqlite-cycle", "generation-sqlite-cycle-0002", 4_000);
+    } catch {
+      deletionGenerationRejected = true;
+    }
+    const deletion = store.beginVaultDeletion("deletion-sqlite-cycle", vaultGeneration, 4_001);
+    const deletionAuthority = deletionGenerationRejected
+      && deletion.captureJobIds.includes(capture.jobId)
+      && store.vaultDeletionBegun(vaultGeneration)
+      && store.validateActor(ownerActor) === "authority_superseded";
 
     return Response.json({
       metadata: {

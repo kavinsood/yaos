@@ -3,7 +3,7 @@
  * sessions, and exact schema admission.
  */
 import { ControlPlaneRuntime } from "../../server/src/config";
-import type { ControlPlaneStoragePort, ControlPlaneTransactionPort } from "../../server/src/platformPorts";
+import type { ActorCallPort, ControlPlaneStoragePort, ControlPlaneTransactionPort } from "../../server/src/platformPorts";
 import { hashSecret, OPERATOR_COOKIE, PAIRING_CODE_TTL_MS, uniqueDeviceName } from "../../server/src/identity";
 import { verifyOperatorSession } from "../../server/src/routes/auth";
 import { handleOperatorLogout } from "../../server/src/routes/operator";
@@ -16,7 +16,7 @@ import { makeConfigNamespace, makeEnv } from "../mocks/workerEnv.ts";
 import { suite } from "../harness.ts";
 
 const s = suite("multivault-registry");
-function makeMemoryConfig(initial: Readonly<Record<string, unknown>> = {}): ControlPlaneRuntime {
+function makeMemoryConfig(initial: Readonly<Record<string, unknown>> = {}, vaults?: ActorCallPort): ControlPlaneRuntime {
 	const data = new Map<string, unknown>(Object.entries(initial));
 	const transaction: ControlPlaneTransactionPort = {
 		get: async <T = unknown>(key: string) => data.get(key) as T | undefined,
@@ -30,7 +30,7 @@ function makeMemoryConfig(initial: Readonly<Record<string, unknown>> = {}): Cont
 		transaction: async <T>(fn: (txn: ControlPlaneTransactionPort) => Promise<T>): Promise<T> =>
 			await fn(transaction),
 	};
-	return new ControlPlaneRuntime(storage);
+	return new ControlPlaneRuntime(storage, undefined, vaults);
 }
 
 function jsonRequest(path: string, body: unknown): Request {
@@ -153,7 +153,16 @@ s.section("enroll uniquifies names on one vault");
 
 s.section("destroy revokes first, persists bounded retry state, and completes only after both stores");
 {
-	const config = makeMemoryConfig();
+	const fences: Array<{ vaultId: string; vaultGeneration: string; deletionId: string }> = [];
+	const config = makeMemoryConfig({}, { call: async (vaultId, request) => {
+		if (request.method !== "POST" || new URL(request.url).pathname !== "/__yaos/fence-vault-admission") throw new Error("unexpected vault call");
+		const body = await request.json() as { vaultGeneration: string; deletionId: string };
+		if (request.headers.get("x-yaos-vault-id") !== vaultId
+			|| request.headers.get("x-yaos-vault-generation") !== body.vaultGeneration) throw new Error("invalid fence identity");
+		const receipt = { vaultId, ...body };
+		fences.push(receipt);
+		return Response.json({ ...receipt, fenced: true });
+	} });
 	const claimed = await config.fetch(jsonRequest("/__yaos/claim", {
 		operatorRecoveryHash: "h".repeat(64),
 		ticketSigningKey: "key",
@@ -197,6 +206,9 @@ s.section("destroy revokes first, persists bounded retry state, and completes on
 		};
 	};
 	s.check(destroyed.status === 200, "registry destroy 200");
+	s.check(fences.length === 1 && fences[0]?.vaultId === "vault-gone-1"
+		&& fences[0]?.vaultGeneration === destroyedBody.pending.vaultGeneration
+		&& fences[0]?.deletionId === destroyedBody.pending.deletionId, "successful destroy acknowledges the exact durable admission fence");
 	s.check(
 		!destroyedBody.pending.roomComplete
 			&& !destroyedBody.pending.r2Complete

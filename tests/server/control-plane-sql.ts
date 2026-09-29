@@ -327,7 +327,19 @@ s.test("session cleanup is visible to the revocation lookup", async () => {
 
 s.test("large global collections do not amplify admission, audit, enrollment, code consume, or destroy SQL", async () => {
 	await withCountedStore(async (store, _sqlite, queries) => {
-		const runtime = new ControlPlaneRuntime(store);
+		let preparationQueries = 0;
+		let fenceCalls = 0;
+		const runtime = new ControlPlaneRuntime(store, undefined, { call: async (vaultId, request) => {
+			assert.equal(new URL(request.url).pathname, "/__yaos/fence-vault-admission");
+			assert.equal(request.method, "POST");
+			const body = await request.json() as { vaultGeneration: string; deletionId: string };
+			assert.equal(request.headers.get("x-yaos-vault-id"), vaultId);
+			assert.equal(request.headers.get("x-yaos-vault-generation"), body.vaultGeneration);
+			assert.equal(body.deletionId, "governance-hotpath");
+			preparationQueries = queries.value;
+			fenceCalls++;
+			return Response.json({ vaultId, ...body, fenced: true });
+		} });
 		const owner = await provisionOwner(runtime, "hotpath");
 		const decoyAudits = Array.from({ length: 10_000 }, (_, index): SecurityAuditEvent => ({
 			eventId: `large-audit-${index}`, vaultId: `unrelated-${index % 100}`,
@@ -383,7 +395,10 @@ s.test("large global collections do not amplify admission, audit, enrollment, co
 			vaultId: owner.vaultId, governanceRequestId: governanceRequest.governanceRequestId,
 		}));
 		assert.equal(destroy.status, 200);
-		assert.ok(queries.value <= 20, `destroy admission/mutation used ${queries.value} SQL statements`);
+		assert.equal(fenceCalls, 1);
+		assert.ok(preparationQueries <= 12, `destroy preparation used ${preparationQueries} SQL statements`);
+		assert.ok(queries.value - preparationQueries <= 20,
+			`destroy mutation used ${queries.value - preparationQueries} SQL statements`);
 		assertNoWholeCollectionRead(queries, "destroy");
 	});
 
