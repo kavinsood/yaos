@@ -169,7 +169,9 @@ New scenarios live in `scenarios/extra.ts`. Cost windows are minute-aligned beca
 Other changes:
 - **X3** now records per-open phases (ticket, upgrade, step1→step2, ready), a ping before/after each open, GET TTFB/download and `inferredServerMs` (step1→step2 − cached-GET download − ping). `--repeats 3`.
 - **L5 `--typing-probe`** types at 2/8/30 cps for 5 s through the real provider and reports update frames per keystroke. The provider sends one frame per keystroke at every rate (no coalescing).
-- **Base closes sockets across DO eviction.** C2 and C5 therefore open their sockets after the idle window. Otherwise base senders are closed with 1008 "socket authority mismatch" (the B1 behaviour).
+- **gql bucket attribution.** A periodic bucket is labelled by the minute in which the DO's reporting period began. Traffic that crosses a minute boundary therefore lands in the earlier bucket. Every phase starts all of its traffic, socket opens included, after its boundary. Periodic `inboundWebsocketMsgCount` is 0 for Hibernation-API sockets, so inbound messages are taken from the `hibernation` invocation count. Relay diagnostics counters are in-memory, and `counterResetInWindow` marks a window in which the DO restarted.
+- **K1 warm-up compact.** `debug/compact` is vault-wide, so K1 runs a warm-up compact first. Without it, the first measured tail also pays for checkpointing every seeded body.
+- **Base closes sockets across DO eviction.** C2, C5 and MB therefore never leave a socket open across a minute-alignment wait. Otherwise base senders are closed with 1008 "socket authority mismatch" (the B1 behaviour).
 - **Server-side ms timers.** `lastCheckpointMs` reads 0 because Date.now() does not advance during DO CPU. Use tail cpuTime or gql instead.
 - **`convergence.ts`** summarises the §8.2 suite from `<ID>-<variant>.json` files (L2, L4, C2-stress, B2, B3, B5, B6, X1, CW). It reports pass/FAIL/unknown for text, state vector, GET, server hash and invariant #7 (`--require-all` exits 1 on any miss).
 - **`runall.sh`** is the resumable full-run orchestrator:

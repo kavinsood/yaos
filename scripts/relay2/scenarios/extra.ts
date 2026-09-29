@@ -5,7 +5,11 @@
  *
  * Cost windows are minute-aligned: Cloudflare's durableObjectsPeriodicGroups (rowsWritten, cpuTime, WS message
  * counts) are per-minute buckets, so each measured phase starts just after a minute boundary and the next phase
- * waits for the following boundary; an idle window (no edits; C2/C5 open no sockets during it) gives the per-minute baseline.
+ * waits for the following boundary. A bucket is labelled by the minute in which the DO's reporting period began:
+ * activity that starts before a boundary and continues past it lands wholly in the earlier bucket (seen: a burst
+ * phase opened at :57 was billed to the idle minute), so every phase starts all of its traffic (socket opens
+ * included) after its boundary and stops before the next one. Periodic inboundWebsocketMsgCount is 0 for
+ * Hibernation-API sockets, so inbound messages come from the hibernation invocation count; an idle window (no edits; C2/C5 open no sockets during it) gives the per-minute baseline.
  * Analytics lag 1-3 min, so gql is queried after `--gql-settle-ms` (default 180 s); `--no-gql` skips it.
  */
 import { readFileSync } from "node:fs";
@@ -121,7 +125,11 @@ const relayCounters = (d: Result) => ((d.relay as { counters?: Counters } | unde
 function counterDelta(a: Result, b: Result): Counters | null {
 	const x = relayCounters(a), y = relayCounters(b);
 	if (!x || !y) return null;
-	return Object.fromEntries(Object.keys(y).filter((k) => typeof y[k] === "number" && y[k] !== (x[k] ?? 0)).map((k) => [k, r2(y[k]! - (x[k] ?? 0))]));
+	const d: Counters = Object.fromEntries(Object.keys(y).filter((k) => typeof y[k] === "number" && y[k] !== (x[k] ?? 0)).map((k) => [k, r2(y[k]! - (x[k] ?? 0))]));
+	// Relay counters are in-memory: a negative delta means the DO was evicted/restarted inside the window, so the
+	// deltas are not usable (gql periodic totals still are).
+	if (Object.entries(d).some(([k, v]) => v < 0 && k !== "appendsPerSecond")) d.counterResetInWindow = 1;
+	return d;
 }
 const relayBody = (d: Result, bodyId: string) =>
 	((d.relay as { bodies?: Result[] } | undefined)?.bodies ?? []).find((b) => b.bodyId === bodyId) ?? null;
@@ -173,17 +181,19 @@ export async function C2(ctx: RunCtx): Promise<Result> {
 	const clientsN = which === "stress" ? ctx.num("clients", 5) : 1;
 	const owners = traceOwners(trace.dir, trace.frames.length, clientsN);
 	const body = await freshTraceBody(ctx, trace, `c2-${which}`);
-	// Idle baseline with no sockets open: a hibernated base DO that is evicted gets a new runtime epoch and closes
-	// surviving non-relay sockets ("socket authority mismatch"), so sockets are opened after the idle window.
+	// No socket may sit idle across a minute-alignment wait: a hibernated base DO that is evicted gets a new
+	// runtime epoch and closes surviving non-relay sockets ("socket authority mismatch", the B1 behaviour). So the
+	// idle baseline has no sockets open, and sockets are opened just after the stream window's minute boundary
+	// (the opens are inside the stream window; `opens` records how many).
 	const windows: Win[] = [];
 	let start = await alignToMinute();
 	await sleep(55_000);
 	windows.push(await closeWindow("idle", start));
+	start = await alignToMinute();
 	const senders: RawClient[] = [];
 	for (let k = 0; k < clientsN; k++) senders.push(await openOrThrow(await ctx.client(k === 0 ? "A" : `S${k}`, body), 120_000));
 	const observer = await openOrThrow(await ctx.client("B", body), 120_000);
 	const d0 = await diagnostics(ctx.context.devices.A!);
-	start = await alignToMinute();
 	const tracker = new CoverageTracker(observer.doc);
 	const sendTimes: number[] = [];
 	const t0 = now();
@@ -202,7 +212,7 @@ export async function C2(ctx: RunCtx): Promise<Result> {
 	const sendMs = r2(now() - t0);
 	const drained = await drain(tracker, 180_000);
 	tracker.stop();
-	windows.push(await closeWindow("stream", start, { edits: sendTimes.length }));
+	windows.push(await closeWindow("stream", start, { edits: sendTimes.length, opens: clientsN + 1 }));
 	const d1 = await diagnostics(ctx.context.devices.A!);
 	const full = sendTimes.length === trace.frames.length;
 	const conv = await convergence({ bodyId: body, clients: [...senders, observer], fresh: await ctx.dev("C"), adapter: ctx.adapter,
@@ -242,16 +252,16 @@ export async function C5(ctx: RunCtx): Promise<Result> {
 	const catchups = ctx.num("catchups", 10);
 	const catchupEdits = ctx.num("catchup-edits", 10);
 	const [body] = await freshNotes(ctx, "c5", 1, () => smallContent(5));
-	// Idle baseline with no sockets open (see C2: an evicted base DO closes surviving sockets).
+	// Sockets never idle across a minute-alignment wait (see C2: an evicted base DO closes surviving sockets).
 	const windows: Win[] = [];
 	let start = await alignToMinute();
 	await sleep(55_000);
 	windows.push(await closeWindow("idle", start));
-	const a = await openOrThrow(await ctx.client("A", body!));
-	let b = await openOrThrow(await ctx.client("B", body!));
-	const bDoc = b.doc;
-	const d0 = await diagnostics(ctx.context.devices.A!);
 	start = await alignToMinute();
+	let a = await openOrThrow(await ctx.client("A", body!));
+	let b = await openOrThrow(await ctx.client("B", body!));
+	const aDoc = a.doc, bDoc = b.doc;
+	const d0 = await diagnostics(ctx.context.devices.A!);
 	const tracker = new CoverageTracker(b.doc);
 	let idx = 0;
 	for (let i = 0; i < bursts; i++) {
@@ -261,9 +271,11 @@ export async function C5(ctx: RunCtx): Promise<Result> {
 	await drain(tracker);
 	tracker.stop();
 	const burstProp = series(tracker.coveredMs, 0);
-	windows.push(await closeWindow("bursts", start, { edits: bursts * burstSize, bursts }));
+	windows.push(await closeWindow("bursts", start, { edits: bursts * burstSize, bursts, opens: 2 }));
 	const d1 = await diagnostics(ctx.context.devices.A!);
+	await a.close(); await b.close();
 	start = await alignToMinute();
+	a = await openOrThrow(await ctx.client("A", body!, aDoc));
 	const catchupRows: Result[] = [];
 	for (let i = 0; i < catchups; i++) {
 		await b.close();
@@ -275,7 +287,7 @@ export async function C5(ctx: RunCtx): Promise<Result> {
 		catchupRows.push({ i, status: o.status, openMs: r2(now() - t0), bytesIn: b.bytesIn, phases: b.openPhases(), textEqual: b.text() === a.text() });
 		await sleep(1000);
 	}
-	windows.push(await closeWindow("catchups", start, { catchups, editsWhileAway: catchupEdits }));
+	windows.push(await closeWindow("catchups", start, { catchups, editsWhileAway: catchupEdits, opens: catchups + 1 }));
 	const d2 = await diagnostics(ctx.context.devices.A!);
 	const conv = await convergence({ bodyId: body!, clients: [a, b], fresh: await ctx.dev("C"), adapter: ctx.adapter });
 	await a.close(); await b.close();
@@ -353,6 +365,15 @@ export async function K1(ctx: RunCtx): Promise<Result> {
 	const trace = loadTrace();
 	const rows: Result[] = [];
 	let lastConv: Result | null = null;
+	// debug/compact is vault-wide: the first call also checkpoints every seeded body (seen: 612 checkpoint rows
+	// for a 50-entry tail). A warm-up compact makes each measured compact cover only the fresh tail body.
+	let warmup: Result | null = null;
+	if (trigger === "compact") {
+		const t0 = now();
+		const res = await operatorVaultPost(ctx, "debug/compact");
+		warmup = { status: res.status, ms: r2(now() - t0), value: typeof res.value === "object" ? res.value : String(res.value).slice(0, 300) };
+		await sleep(1500);
+	}
 	const d00 = await diagnostics(ctx.context.devices.A!);
 	for (const tail of tails) {
 		for (let rep = 0; rep < repeats; rep++) {
@@ -405,7 +426,7 @@ export async function K1(ctx: RunCtx): Promise<Result> {
 		}
 	}
 	const cfg = (d00.relay as { config?: Result } | undefined)?.config ?? null;
-	return { trigger, tails, repeats, rate, relayConfig: cfg,
+	return { trigger, tails, repeats, rate, relayConfig: cfg, warmupCompact: warmup,
 		summary: tails.map((t) => {
 			const mine = rows.filter((x) => x.tail === t);
 			return { tail: t, compactMs: series(mine.map((x) => (x.compact as Result | undefined)?.ms as number | undefined), 0),
@@ -446,10 +467,9 @@ export async function MB(ctx: RunCtx): Promise<Result> {
 	const convs: Result[] = [];
 	for (const p of patterns) {
 		const body = p === "stream" ? await freshTraceBody(ctx, trace, "mb-stream") : (await freshNotes(ctx, `mb-${p}`, 1, () => smallContent(9)))[0]!;
+		start = await alignToMinute();   // before opening: base closes sockets left idle across an eviction
 		const a = await openOrThrow(await ctx.client("A", body), 60_000);
 		const b = await openOrThrow(await ctx.client("B", body), 60_000);
-		await sleep(1000);
-		start = await alignToMinute();
 		const d0 = await diagnostics(ctx.context.devices.A!);
 		const tracker = new CoverageTracker(b.doc);
 		let edits = 0;
