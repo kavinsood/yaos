@@ -1,0 +1,19 @@
+scripts/relay2-core-smoke.ts
+  s_3fa8c41e3d4d37::t_7dcddf26b10db8 1-53
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "e1abb36acb93f074560126dc9429badb1fbddd77",
+  "prompts": {},
+  "sessions": {
+    "s_3fa8c41e3d4d37": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a0da75a62b227384a",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
