@@ -1,0 +1,31 @@
+server/src/relayBodies.ts
+  s_3fa8c41e3d4d37::t_e4ab4b9b507b08 1-790
+server/src/relayBodyStore.ts
+  s_3fa8c41e3d4d37::t_e308a9c0ce309e 1-291
+server/src/relayFlag.ts
+  s_3fa8c41e3d4d37::t_cbdcae6dd7376b 1-88
+server/src/relayRoutes.ts
+  s_3fa8c41e3d4d37::t_65d2c8085c2d96 1-91
+server/src/vaultDocumentStore.ts
+  s_3fa8c41e3d4d37::t_7445ffb1cc4b09 8,46,171-185,1014-1043,1047,1143,1195,1499-1575,1599-1619,1641-1642,1746,1750
+server/src/vaultSocketService.ts
+  s_3fa8c41e3d4d37::t_7af68e81aa631e 40,148-149,211,435-436,454-615,645-647,653,750-762,923,951-958,985
+server/src/vaultStore.ts
+  s_3fa8c41e3d4d37::t_c7328dbc368133 158,161
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "20e0e34f47cd657c4a96b0cb7a0948eab6be40e6",
+  "prompts": {},
+  "sessions": {
+    "s_3fa8c41e3d4d37": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a0da75a62b227384a",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
