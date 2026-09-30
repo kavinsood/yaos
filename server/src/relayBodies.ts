@@ -141,6 +141,27 @@ export interface RelayCounters {
 	floorAdvances: number;
 	/** Journal rows pruned by those floor advances. */
 	floorRowsPruned: number;
+	/**
+	 * Non-empty SYNC_UPDATE frames received. No silent drops (round 4): every one
+	 * ends in exactly one of appendFrames, noopSkips, dedupeHits, dedupeConflicts,
+	 * batchDuplicateCandidates, authorityCloses/authorityDrops, rateLimitCloses,
+	 * epochFences, bodyInactiveCloses, tooLargeCloses, commitFailures, frameErrors
+	 * (the last seven close the socket with an error code).
+	 */
+	updateFrames: number;
+	/** Frames whose processing threw before the append (ywasm/SQL/rebuild error): VAULT_ERROR + close 1011. */
+	frameErrors: number;
+	/** Steps after a successful append that threw (cache/ack/fan-out); the remaining steps still ran. */
+	postCommitErrors: number;
+	/** Frames refused because the body is not active (close 1008). */
+	bodyInactiveCloses: number;
+	/** Frames over the durable value limit (close 1009). */
+	tooLargeCloses: number;
+	/** Lean rows (§6.4): catalog events written by the coalescing pass, and their rows (incl. clock sync). */
+	leanCatalogEvents: number;
+	/** Full checkpoints written from the in-memory merged bytes (no SQLite read, no wasm merge). */
+	checkpointsFromCache: number;
+	leanCoalesceRowsWritten: number;
 }
 
 export interface RelayBodyServiceOptions {
@@ -262,7 +283,11 @@ export class RelayBodyService {
 		mergedCacheRebuilds: 0, step2Replies: 0, incrementalAppends: 0, stateVectorDrift: 0, partialCheckpoints: 0,
 		mergeBudgetRejects: 0, unmergedStep2Replies: 0, lazyHashSkips: 0, lazyHashCacheHits: 0, authorityDrops: 0,
 		batchDuplicateCandidates: 0, residentStaleSkips: 0, floorAdvances: 0, floorRowsPruned: 0,
+		updateFrames: 0, frameErrors: 0, postCommitErrors: 0, bodyInactiveCloses: 0, tooLargeCloses: 0,
+		leanCatalogEvents: 0, leanCoalesceRowsWritten: 0, checkpointsFromCache: 0,
 	};
+	/** Last pre-append frame error (diagnostics only; message text, no payload bytes). */
+	private lastFrameError: { at: number; message: string } | null = null;
 
 	constructor(private readonly options: RelayBodyServiceOptions) {
 		this.config = options.config;
@@ -473,6 +498,7 @@ export class RelayBodyService {
 		const pending = this.pendingEnvelopes.get(attachment.socketId) ?? null;
 		this.pendingEnvelopes.delete(attachment.socketId);
 		if (update.byteLength > MAX_DURABLE_UPDATE_BYTES) {
+			this.counters.tooLargeCloses++;
 			socket.close(1009, "sync update exceeds durable value limit");
 			return;
 		}
@@ -490,6 +516,7 @@ export class RelayBodyService {
 			if (envelope) this.ackNoop(socket, attachment, envelope, digest);
 			return;
 		}
+		this.counters.updateFrames++;
 		// 2. Authority (cached, invalidated by every in-process authority writer).
 		// Before dedupe (G7): a revoked device gets 4403, never a re-ack.
 		if (!this.validateActor(actor)) { this.rejectAuthority(socket); return; }
@@ -615,14 +642,66 @@ export class RelayBodyService {
 		return { live, duplicates };
 	}
 
-	/** Steps 5–7: growth cap, single-transaction commit, then acks and fan-out. */
+	/**
+	 * No silent drops (round 4, invariant #3): a throw before the append (ywasm
+	 * merge/SV, head rebuild, SQL read) used to escape to the socket service,
+	 * which answered VAULT_ERROR and kept the socket open, so the origin never
+	 * learned the frame was lost and every later update of that client stayed
+	 * pending at peers. Now every frame of the failed commit gets VAULT_ERROR and
+	 * a 1011 close (the client reconnects and resends its unacked updates), the
+	 * merged cache of the body is dropped, and `frameErrors` counts it. The
+	 * micro-batch timer path goes through here too, so a throw there can no
+	 * longer escape a setTimeout callback.
+	 */
 	private commitFrames(bodyId: string, frames: QueuedFrame[], batched: boolean): void {
+		let appended = false;
+		try {
+			this.commitFramesUnguarded(bodyId, frames, batched, () => { appended = true; });
+		} catch (error) {
+			if (appended) {
+				// Unreachable in practice: post-commit steps are individually guarded.
+				this.recordPostCommitError(error);
+				return;
+			}
+			this.failFrames(bodyId, frames, error);
+		}
+	}
+
+	/** Pre-append failure of one frame or batch: count, log, VAULT_ERROR, close 1011. */
+	failFrames(bodyId: string, frames: ReadonlyArray<{ socket: VaultSocketPort }>, error: unknown): void {
+		this.counters.frameErrors += Math.max(1, frames.length);
+		const message = error instanceof Error ? error.message : String(error);
+		this.lastFrameError = { at: this.now(), message: message.slice(0, 200) };
+		try { this.invalidate(bodyId); } catch { /* cache already gone */ }
+		console.error("[yaos-relay] frame error", message);
+		for (const frame of frames) {
+			try {
+				this.requireHost().sendControl(frame.socket, { type: "VAULT_ERROR", code: "relay_frame_error",
+					message: "update was not committed; reconnect to resend" });
+			} catch { /* closed */ }
+			try { frame.socket.close(1011, "relay frame error"); } catch { /* closed */ }
+		}
+	}
+
+	private recordPostCommitError(error: unknown): void {
+		this.counters.postCommitErrors++;
+		console.error("[yaos-relay] post-commit step failed", error instanceof Error ? error.message : String(error));
+	}
+
+	/** Runs one post-commit step; a throw is counted and the next steps still run. */
+	private postCommit(step: () => void): void {
+		try { step(); } catch (error) { this.recordPostCommitError(error); }
+	}
+
+	/** Steps 5–7: growth cap, single-transaction commit, then acks and fan-out. */
+	private commitFramesUnguarded(bodyId: string, frames: QueuedFrame[], batched: boolean, markAppended: () => void): void {
 		const host = this.requireHost();
 		const { live, duplicates } = batched ? this.screenBatch(frames) : { live: frames, duplicates: [] as QueuedFrame[] };
 		if (live.length === 0) return;
 		const epoch = live[0]!.attachment.documentEpoch;
 		const state = this.headState(bodyId);
 		if (!state) {
+			this.counters.bodyInactiveCloses += live.length;
 			for (const frame of live) try { frame.socket.close(1008, "body is not active"); } catch { /* closed */ }
 			return;
 		}
@@ -707,10 +786,11 @@ export class RelayBodyService {
 					}
 					return;
 				}
+				this.counters.bodyInactiveCloses += live.length;
 				for (const frame of live) try { frame.socket.close(1008, "body is not active"); } catch { /* closed */ }
 				return;
 			}
-			this.counters.commitFailures++;
+			this.counters.commitFailures += live.length;
 			this.invalidate(bodyId);
 			console.warn("[yaos-relay] append failed", error);
 			for (const frame of live) {
@@ -720,14 +800,21 @@ export class RelayBodyService {
 			}
 			return;
 		}
+		markAppended();
 		this.counters.appends++;
 		this.counters.appendFrames += live.length;
 		this.counters.rowsWritten += result.rowsWritten;
 		if (accepted) this.counters.hashAccepted++;
 		else this.counters.hashUnknown++;
-		const now = this.now();
-		this.appendTimes.push(now);
-		while (this.appendTimes.length > 0 && this.appendTimes[0]! < now - 10_000) this.appendTimes.shift();
+		// Everything below runs after a durable append: each step is guarded so a
+		// throw in one (cache bookkeeping, one origin's ack) can never cost a peer
+		// its fan-out frame (a missing update would leave every later update of
+		// that client pending at the peer).
+		this.postCommit(() => {
+			const now = this.now();
+			this.appendTimes.push(now);
+			while (this.appendTimes.length > 0 && this.appendTimes[0]! < now - 10_000) this.appendTimes.shift();
+		});
 		const entry: MergedEntry = {
 			epoch,
 			latestSequence: result.vaultSequence,
@@ -741,33 +828,37 @@ export class RelayBodyService {
 			checkpointSequence: state.checkpointSequence,
 			...(state.overBudget ? { overBudget: true } : {}),
 		};
-		this.remember(bodyId, entry);
-		this.syncDocumentCache(bodyId);
+		this.postCommit(() => {
+			try { this.remember(bodyId, entry); }
+			catch (error) { this.invalidate(bodyId); throw error; }
+		});
+		this.postCommit(() => this.syncDocumentCache(bodyId));
 		// 7. After commit: origin acks, peer fan-out, base notices.
 		for (const [index, frame] of live.entries()) {
-			if (frame.envelope) {
-				this.ackOrigin(frame.socket, frame.attachment, frame.envelope, frame.digest, {
-					durableGeneration: result.generation, vaultSequence: result.vaultSequence,
-					contentHashAccepted: index === acceptedIndex, deduped: false, noop: false,
-					contentHash: result.contentHash, size: result.size,
-				});
-			}
+			if (!frame.envelope) continue;
+			this.postCommit(() => this.ackOrigin(frame.socket, frame.attachment, frame.envelope!, frame.digest, {
+				durableGeneration: result.generation, vaultSequence: result.vaultSequence,
+				contentHashAccepted: index === acceptedIndex, deduped: false, noop: false,
+				contentHash: result.contentHash, size: result.size,
+			}));
 		}
 		for (const frame of duplicates) {
-			this.ackOrigin(frame.socket, frame.attachment, frame.envelope!, frame.digest, {
+			this.postCommit(() => this.ackOrigin(frame.socket, frame.attachment, frame.envelope!, frame.digest, {
 				durableGeneration: result.generation, vaultSequence: result.vaultSequence,
 				contentHashAccepted: false, deduped: true, noop: false,
 				contentHash: result.contentHash, size: result.size,
-			});
+			}));
 		}
 		const origins = new Set([...live, ...duplicates].map((frame) => frame.attachment.socketId));
 		for (const frame of live) {
-			host.broadcastRelayUpdate(bodyId, epoch, syncFrame(SYNC_UPDATE, frame.update), frame.attachment.socketId);
+			this.postCommit(() => host.broadcastRelayUpdate(bodyId, epoch, syncFrame(SYNC_UPDATE, frame.update),
+				frame.attachment.socketId));
 		}
 		// G16: every origin gets exactly its own ack, never a peer notice as well.
-		host.notifyBodyCommitted(bodyId, result.generation, result.vaultSequence, origins);
-		if (entry.tailEntries >= this.config.checkpointEntries || entry.tailBytes >= this.config.checkpointBytes) {
-			this.options.armCheckpointAlarm();
+		this.postCommit(() => host.notifyBodyCommitted(bodyId, result.generation, result.vaultSequence, origins));
+		// Lean rows: every append leaves a catalog event to coalesce (the host delays this alarm).
+		if (this.options.store().leanRows || entry.tailEntries >= this.config.checkpointEntries || entry.tailBytes >= this.config.checkpointBytes) {
+			this.postCommit(() => this.options.armCheckpointAlarm());
 		}
 	}
 
@@ -878,8 +969,20 @@ export class RelayBodyService {
 			throughSequence = prefix.sequence;
 		}
 		let durable: ReturnType<VaultStore["durableMergedBytes"]>;
+		const cached = this.merged.get(bodyId);
 		try {
-			durable = this.options.store().durableMergedBytes(bodyId, throughSequence, budget);
+			// Round 4 (mb=0 tails): the in-memory merged bytes already equal checkpoint +
+			// tail at the head, so a full checkpoint skips the SQLite read and wasm merge.
+			if (throughSequence === head.latestSequence && cached?.bytes && !cached.overBudget
+				&& cached.epoch === head.semanticEpoch && cached.latestSequence === head.latestSequence
+				&& cached.generation === head.generation) {
+				this.counters.checkpointsFromCache++;
+				durable = { documentId: bodyId, throughSequence: head.latestSequence, latestSequence: head.latestSequence,
+					generation: head.generation, semanticEpoch: head.semanticEpoch, checkpointSequence: tail.checkpointSequence,
+					tailEntries: tail.entries, tailBytes: tail.bytes, bytes: cached.bytes, rowsRead: 0 };
+			} else {
+				durable = this.options.store().durableMergedBytes(bodyId, throughSequence, budget);
+			}
 		} catch (error) {
 			if (!(error instanceof RelayMergeBudgetError)) throw error;
 			// Never call into wasm past the budget (defence in depth; the prefix is sized to fit).
@@ -948,7 +1051,21 @@ export class RelayBodyService {
 		const store = this.options.store();
 		let checkpoints = 0;
 		let retry = false;
+		let coalesceFailed = false;
 		this.evictStaleResidents();
+		if (store.leanRows) {
+			// §6.4: publish coalesced catalog events before any journal row can be pruned.
+			try {
+				const coalesced = this.options.relayStore().coalesceLeanCatalog({ limit: 200 });
+				this.counters.leanCatalogEvents += coalesced.bodies;
+				this.counters.leanCoalesceRowsWritten += coalesced.rowsWritten;
+				if (coalesced.bodies >= 200) retry = true;
+			} catch (error) {
+				retry = true;
+				coalesceFailed = true;
+				console.warn("[yaos-relay] lean catalog coalesce failed", error);
+			}
+		}
 		for (const bodyId of store.listJournalCheckpointCandidates(
 			this.config.checkpointEntries, this.config.checkpointBytes, options.limit ?? 25,
 		)) {
@@ -967,7 +1084,7 @@ export class RelayBodyService {
 		const pins = store.activePins(now);
 		let floor = Math.max(0, store.currentSequence() - options.retainSequences);
 		for (const pin of pins) floor = Math.min(floor, pin.boundarySequence - 1);
-		if (floor > store.journalFloor()) {
+		if (!coalesceFailed && floor > store.journalFloor()) {
 			try {
 				rowsPruned = store.advanceFeedFloor(floor, now).rowsWritten;
 				this.counters.floorAdvances++;
@@ -1112,6 +1229,7 @@ export class RelayBodyService {
 			byteOps: defaultYwasmByteOps.name,
 			config: this.config,
 			counters: { ...this.counters, appendsPerSecond: recent / 10 },
+			lastFrameError: this.lastFrameError,
 			bodies: [...this.merged.entries()].map(([bodyId, entry]) => ({
 				bodyId, epoch: entry.epoch, latestSequence: entry.latestSequence, generation: entry.generation,
 				logRows: entry.tailEntries, logBytes: entry.tailBytes, checkpointSequence: entry.checkpointSequence,

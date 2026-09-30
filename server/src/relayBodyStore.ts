@@ -115,21 +115,56 @@ export class RelayBodyStore {
 			if (!catalog || catalog.lifecycle !== "active" || catalog.file_id !== input.bodyId || catalog.pending) {
 				throw new RelayAppendError("body_not_active", semanticEpoch);
 			}
-			const clock = this.storage.sql.exec<{ sequence: number }>(
-				"UPDATE vault_clock SET sequence = sequence + 1 WHERE id = 1 RETURNING sequence",
-			);
-			const sequence = clock.one().sequence;
-			rowsWritten += clock.rowsWritten;
+			const lean = this.store.leanRows;
+			if (lean) this.store.initialize(); // adds the inline columns (no-op once initialised)
+			const contentHash = input.catalogContent?.contentHash ?? null;
+			const size = input.catalogContent?.size ?? null;
+			let sequence: number;
+			if (lean) {
+				// §6.4: no clock write. MAX(clock, journal head) + 1; every other allocator
+				// and `currentSequence` take the same MAX in lean mode.
+				const next = this.storage.sql.exec<{ sequence: number }>(
+					`SELECT MAX((SELECT sequence FROM vault_clock WHERE id = 1),
+					            (SELECT COALESCE(MAX(sequence), 0) FROM vault_journal)) + 1 AS sequence`,
+				);
+				sequence = next.one().sequence;
+				rowsRead += next.rowsRead;
+			} else {
+				const clock = this.storage.sql.exec<{ sequence: number }>(
+					"UPDATE vault_clock SET sequence = sequence + 1 WHERE id = 1 RETURNING sequence",
+				);
+				sequence = clock.one().sequence;
+				rowsWritten += clock.rowsWritten;
+			}
 			const generation = head.generation + 1;
-			const journal = this.storage.sql.exec(
+			if (lean) {
+				const first = input.attributions[0]!;
+				const journal = this.storage.sql.exec(
+					`INSERT INTO vault_journal(sequence, document_id, generation, semantic_epoch, kind,
+					 update_byte_length, data, created_at, attr_principal_id, attr_membership_revision, attr_device_id,
+					 attr_device_credential_revision, attr_operation_id, attr_request_digest, relay_content_hash, relay_size)
+					 VALUES (?, ?, ?, ?, 'body', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+					sequence, input.bodyId, generation, semanticEpoch, input.update.byteLength,
+					input.update.slice().buffer, now, first.actor.principalId, first.actor.membershipRevision,
+					first.actor.deviceId, first.actor.deviceCredentialRevision, first.operationId ?? null,
+					first.requestDigest ?? null, contentHash, size,
+				);
+				journal.toArray();
+				rowsWritten += journal.rowsWritten;
+			}
+			const journal = lean ? null : this.storage.sql.exec(
 				`INSERT INTO vault_journal(sequence, document_id, generation, semantic_epoch, kind,
 				 update_byte_length, data, created_at) VALUES (?, ?, ?, ?, 'body', ?, ?, ?)`,
 				sequence, input.bodyId, generation, semanticEpoch, input.update.byteLength,
 				input.update.slice().buffer, now,
 			);
-			journal.toArray();
-			rowsWritten += journal.rowsWritten;
+			if (journal) {
+				journal.toArray();
+				rowsWritten += journal.rowsWritten;
+			}
 			for (const [mutationIndex, attribution] of input.attributions.entries()) {
+				// Lean: frame 0 is inline on the journal row; only micro-batch extras get rows.
+				if (lean && mutationIndex === 0) continue;
 				const actor = attribution.actor;
 				const written = this.storage.sql.exec(`INSERT INTO vault_mutation_attribution(
 				 sequence, mutation_index, principal_id, membership_revision, device_id,
@@ -146,17 +181,17 @@ export class RelayBodyStore {
 			);
 			writeHead.toArray();
 			rowsWritten += writeHead.rowsWritten;
-			const contentHash = input.catalogContent?.contentHash ?? null;
-			const size = input.catalogContent?.size ?? null;
-			const catalogWrite = this.storage.sql.exec(
-				`INSERT INTO vault_catalog_events(
-				 sequence, body_id, file_id, path, previous_path, lifecycle, generation, body_epoch,
-				 content_hash, size, mutation_index
-				) VALUES (?, ?, ?, ?, NULL, 'active', ?, ?, ?, ?, 0)`,
-				sequence, input.bodyId, catalog.file_id, catalog.path, generation, semanticEpoch, contentHash, size,
-			);
-			catalogWrite.toArray();
-			rowsWritten += catalogWrite.rowsWritten;
+			if (!lean) {
+				const catalogWrite = this.storage.sql.exec(
+					`INSERT INTO vault_catalog_events(
+					 sequence, body_id, file_id, path, previous_path, lifecycle, generation, body_epoch,
+					 content_hash, size, mutation_index
+					) VALUES (?, ?, ?, ?, NULL, 'active', ?, ?, ?, ?, 0)`,
+					sequence, input.bodyId, catalog.file_id, catalog.path, generation, semanticEpoch, contentHash, size,
+				);
+				catalogWrite.toArray();
+				rowsWritten += catalogWrite.rowsWritten;
+			}
 			for (const receipt of input.receipts) {
 				const written = this.storage.sql.exec(`INSERT INTO vault_candidate_receipts(
 				 body_id, client_id, candidate_id, candidate_digest, body_epoch, durable_generation,
@@ -176,6 +211,16 @@ export class RelayBodyStore {
 
 	/** Records a lazily materialised hash on the catalog event it describes, only if still unknown. */
 	backfillCatalogHash(bodyId: string, sequence: number, contentHash: string, size: number): boolean {
+		if (this.store.leanRows) {
+			// Lean: the overlaid catalog head names the journal row; backfill it inline.
+			const inline = this.storage.sql.exec(
+				`UPDATE vault_journal SET relay_content_hash = ?, relay_size = ?
+				  WHERE document_id = ? AND sequence = ? AND relay_content_hash IS NULL`,
+				contentHash, size, bodyId, sequence,
+			);
+			inline.toArray();
+			if (inline.rowsWritten > 0) return true;
+		}
 		const cursor = this.storage.sql.exec(
 			`UPDATE vault_catalog_events SET content_hash = ?, size = ?
 			  WHERE body_id = ? AND sequence = ? AND content_hash IS NULL`,
@@ -183,6 +228,56 @@ export class RelayBodyStore {
 		);
 		cursor.toArray();
 		return cursor.rowsWritten > 0;
+	}
+
+	/**
+	 * Lean mode (§6.4): one catalog event per body whose journal head is newer
+	 * than its latest catalog event, carrying the head generation and the head
+	 * row's inline hash (NULL when unknown). Run by the alarm (coalescing delay)
+	 * and before a semantic reset. Also raises the clock to the journal head so
+	 * pruning can never free a sequence. Returns bodies coalesced and rows written.
+	 */
+	coalesceLeanCatalog(options: { bodyId?: string; limit?: number } = {}): { bodies: number; rowsWritten: number } {
+		if (!this.store.leanRows) return { bodies: 0, rowsWritten: 0 };
+		let bodies = 0;
+		let rowsWritten = 0;
+		this.storage.transactionSync(() => {
+			rowsWritten += this.store.syncLeanClock();
+			const pending = this.storage.sql.exec<{ document_id: string; generation: number; semantic_epoch: number }>(
+				`SELECT h.document_id, h.generation, h.semantic_epoch FROM vault_document_heads h
+				  WHERE h.document_id <> 'root' ${options.bodyId !== undefined ? "AND h.document_id = ?" : ""}
+				    AND h.latest_sequence > COALESCE(
+				      (SELECT MAX(c.sequence) FROM vault_catalog_events c WHERE c.body_id = h.document_id), 9007199254740991)
+				  LIMIT ?`,
+				...(options.bodyId !== undefined ? [options.bodyId] : []), options.limit ?? 100,
+			).toArray();
+			for (const head of pending) {
+				const catalog = this.storage.sql.exec<{ file_id: string; path: string; lifecycle: string }>(
+					"SELECT file_id, path, lifecycle FROM vault_catalog_events WHERE body_id = ? ORDER BY sequence DESC LIMIT 1",
+					head.document_id,
+				).toArray()[0];
+				if (!catalog || catalog.lifecycle !== "active") continue;
+				const row = this.storage.sql.exec<{ generation: number; relay_content_hash: string | null; relay_size: number | null }>(
+					`SELECT generation, relay_content_hash, relay_size FROM vault_journal
+					  WHERE document_id = ? ORDER BY sequence DESC LIMIT 1`, head.document_id,
+				).toArray()[0];
+				const known = row && row.generation === head.generation && row.relay_content_hash !== null;
+				const clock = this.store.advanceClock();
+				rowsWritten += clock.rowsWritten;
+				const event = this.storage.sql.exec(
+					`INSERT INTO vault_catalog_events(
+					 sequence, body_id, file_id, path, previous_path, lifecycle, generation, body_epoch,
+					 content_hash, size, mutation_index
+					) VALUES (?, ?, ?, ?, NULL, 'active', ?, ?, ?, ?, 0)`,
+					clock.sequence, head.document_id, catalog.file_id, catalog.path, head.generation, head.semantic_epoch,
+					known ? row.relay_content_hash : null, known ? row.relay_size : null,
+				);
+				event.toArray();
+				rowsWritten += event.rowsWritten;
+				bodies++;
+			}
+		});
+		return { bodies, rowsWritten };
 	}
 
 	private ensureLeaseTable(): void {
@@ -327,6 +422,8 @@ export class RelayBodyStore {
 		// the old lineage's client ids.
 		if (head.latestSequence !== input.coveredSequence) return fail("head_advanced");
 		if (this.resetPolicy(input.bodyId, input.cooldownMs ?? 0, now).cooldownRemainingMs > 0) return fail("cooldown");
+		// Lean: the reset's catalog event copies the latest one; publish the head first.
+		this.coalesceLeanCatalog({ bodyId: input.bodyId });
 		const result = this.store.semanticResetFromEncodedState(input.bodyId, input.snapshot, {
 			throughSequence: head.latestSequence, generation: head.generation, semanticEpoch: head.semanticEpoch,
 		}, now, { contentHash: input.contentHash, size: input.contentBytes });
@@ -335,6 +432,14 @@ export class RelayBodyStore {
 	}
 
 	/** TEST-ONLY diagnostics: row counts of every table. */
+	/** Attribution rows plus lean inline attributions (journal rows carrying `attr_*`). */
+	attributionCount(): number {
+		const table = this.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM vault_mutation_attribution").one().count;
+		if (!this.store.leanRows) return table;
+		return table + this.storage.sql.exec<{ count: number }>(
+			"SELECT COUNT(*) AS count FROM vault_journal WHERE attr_principal_id IS NOT NULL").one().count;
+	}
+
 	tableCounts(): Record<string, number> {
 		const tables = this.storage.sql.exec<{ name: string }>(
 			"SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%' ORDER BY name",

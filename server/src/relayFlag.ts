@@ -18,6 +18,9 @@ export interface RelayFlagEnv {
 	YAOS_RELAY_RESET_COOLDOWN_MS?: string;
 	YAOS_RELAY_MAX_MERGE_INPUT_BYTES?: string;
 	YAOS_RELAY_LAZY_HASH_MAX_BYTES?: string;
+	/** Round 4 lean append (docs/relay2-protocol.md §6.4): exactly "true" enables it. */
+	YAOS_RELAY_LEAN_ROWS?: string;
+	YAOS_RELAY_LEAN_CATALOG_DELAY_MS?: string;
 }
 
 export interface RelayConfig {
@@ -43,6 +46,14 @@ export interface RelayConfig {
 	maxMergeInputBytes: number;
 	/** Bodies whose merged bytes exceed this never get the lazy hash materialisation (hash stays unknown). */
 	lazyHashMaxBytes: number;
+	/**
+	 * Lean append (§6.4): no vault_clock write, attribution and the accepted hash
+	 * inline on the journal row, no per-append catalog event (coalesced by the
+	 * alarm `leanCatalogDelayMs` after the first pending append; current catalog
+	 * reads overlay the journal head meanwhile).
+	 */
+	leanRows: boolean;
+	leanCatalogDelayMs: number;
 }
 
 /**
@@ -65,6 +76,8 @@ export const DEFAULT_RELAY_CONFIG: Readonly<RelayConfig> = Object.freeze({
 	resetCooldownMs: RELAY_DEFAULT_RESET_COOLDOWN_MS,
 	maxMergeInputBytes: 9 * 1024 * 1024,
 	lazyHashMaxBytes: 3 * 1024 * 1024,
+	leanRows: false,
+	leanCatalogDelayMs: 2_000,
 });
 
 type ProcessLike = { env?: Record<string, string | undefined> };
@@ -114,5 +127,7 @@ export function readRelayConfig(env: RelayFlagEnv | null | undefined): RelayConf
 		resetCooldownMs: positiveInt(source.YAOS_RELAY_RESET_COOLDOWN_MS, DEFAULT_RELAY_CONFIG.resetCooldownMs, 0, 30 * 24 * 60 * 60_000),
 		maxMergeInputBytes: positiveInt(source.YAOS_RELAY_MAX_MERGE_INPUT_BYTES, DEFAULT_RELAY_CONFIG.maxMergeInputBytes, 1, 64 * 1024 * 1024),
 		lazyHashMaxBytes: positiveInt(source.YAOS_RELAY_LAZY_HASH_MAX_BYTES, DEFAULT_RELAY_CONFIG.lazyHashMaxBytes, 0, 64 * 1024 * 1024),
+		leanRows: source.YAOS_RELAY_LEAN_ROWS === "true",
+		leanCatalogDelayMs: positiveInt(source.YAOS_RELAY_LEAN_CATALOG_DELAY_MS, DEFAULT_RELAY_CONFIG.leanCatalogDelayMs, 0, 600_000),
 	};
 }

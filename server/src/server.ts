@@ -217,6 +217,9 @@ export class VaultRuntime implements DrainPort {
 
 	constructor(private readonly options: VaultRuntimeOptions) {
 		this.store = new VaultStore(options.storage);
+		if ((options.relayBodies ?? relayBodiesTestDefault()) && (options.relayConfig ?? readRelayConfig(null)).leanRows) {
+			this.store.enableLeanRows();
+		}
 		this.settings = new SettingsSyncStore(options.storage);
 		let socketOwner: VaultSocketService;
 		this.cache = new VaultDocumentCache(
@@ -241,7 +244,11 @@ export class VaultRuntime implements DrainPort {
 				armCheckpointAlarm: () => {
 					if (this.relayCheckpointAlarmArmed) return;
 					this.relayCheckpointAlarmArmed = true;
-					this.options.execution.waitUntil(this.armAlarmEarliest(Date.now())
+					// Lean rows (§6.4): the alarm also publishes coalesced catalog events, so
+					// it is delayed to coalesce a burst into one pass (and one event per body).
+					const relayConfig = options.relayConfig ?? readRelayConfig(null);
+					const delay = this.store.leanRows ? relayConfig.leanCatalogDelayMs : 0;
+					this.options.execution.waitUntil(this.armAlarmEarliest(Date.now() + delay)
 						.catch((error) => {
 							this.relayCheckpointAlarmArmed = false;
 							console.warn("[yaos-relay] checkpoint alarm failed", error);
@@ -836,6 +843,7 @@ export class VaultRuntime implements DrainPort {
 		await this.options.alarms.deleteAlarm();
 		await this.options.storage.deleteAll();
 		this.store = new VaultStore(this.options.storage);
+		if (this.relay && this.relay.config.leanRows) this.store.enableLeanRows();
 		this.store.setCommitObserver((observation) => this.afterDurableCommit(observation));
 		if (this.relayStore) this.relayStore = new RelayBodyStore(this.options.storage, this.store);
 		this.settings = new SettingsSyncStore(this.options.storage);

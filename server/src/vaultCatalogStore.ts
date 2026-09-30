@@ -779,7 +779,34 @@ export abstract class VaultCatalogStore extends VaultDocumentStore {
 			generation: row.generation,
 			contentHash: row.content_hash,
 			size: row.size,
-		}));
+		})).map((entry) => this.leanOverlay(boundarySequence, entry));
+	}
+
+	/**
+	 * Lean rows (§6.4): relay appends write no catalog event; the alarm coalesces
+	 * one later. Until then the newest body journal row after the catalog event
+	 * (and at or before the boundary) is the catalog head: its sequence,
+	 * generation and inline accepted hash replace the event's.
+	 */
+	protected leanOverlay(boundarySequence: number, entry: CatalogHeadAtBoundary): CatalogHeadAtBoundary {
+		if (!this.leanRowsEnabled || entry.lifecycle !== "active") return entry;
+		const row = this.storage.sql.exec<{
+			sequence: number; generation: number; relay_content_hash: string | null; relay_size: number | null;
+		}>(
+			`SELECT sequence, generation, relay_content_hash, relay_size FROM vault_journal
+			  WHERE document_id = ? AND kind = 'body' AND sequence > ? AND sequence <= ?
+			  ORDER BY sequence DESC LIMIT 1`,
+			entry.bodyId, entry.sequence, boundarySequence,
+		).toArray()[0];
+		if (!row) return entry;
+		return {
+			...entry,
+			sequence: row.sequence,
+			previousPath: null,
+			generation: row.generation,
+			contentHash: row.relay_content_hash,
+			size: row.relay_size,
+		};
 	}
 
 	getCatalogHeadAt(boundarySequence: number, bodyId: string): CatalogHeadAtBoundary | null {
@@ -797,7 +824,7 @@ export abstract class VaultCatalogStore extends VaultDocumentStore {
 			bodyId,
 			boundarySequence,
 		).toArray()[0];
-		return row ? {
+		return row ? this.leanOverlay(boundarySequence, {
 			sequence: row.sequence,
 			bodyId: row.body_id,
 			bodyEpoch: parseSemanticEpoch(row.body_epoch, "catalog body epoch"),
@@ -808,7 +835,7 @@ export abstract class VaultCatalogStore extends VaultDocumentStore {
 			generation: row.generation,
 			contentHash: row.content_hash,
 			size: row.size,
-		} : null;
+		}) : null;
 	}
 
 	activeCatalogHeadAtPath(boundarySequence: number, path: string): CatalogHeadAtBoundary | null {

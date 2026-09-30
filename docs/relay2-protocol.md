@@ -248,10 +248,34 @@ This is the base `BODY_COMMITTED` frame with extra fields:
 |---|---|
 | 4409 | Semantic epoch fenced. Sent on a frame for a stale epoch and after a `semantic-reset`. Client rebases. |
 | 4403 | Authority superseded (revoked device or membership, authority fence). |
-| 1013 | Backpressure: token bucket empty. (The socket cap refuses the upgrade with 429.) |
+| 1013 | Backpressure: token bucket empty, reason `relay rate limit`, preceded by `VAULT_BACKPRESSURE` `relay_rate_limit` (`rateLimitCloses++`). (The socket cap refuses the upgrade with 429.) See the 1013 note below. |
 | 1009 | Frame too large. |
 | 1008 | Body deleted or not active (`closeBody`), or socket authority mismatch (root sockets only). |
-| 1011 | Durable commit failed. The client reconnects and resends through step2. |
+| 1011 | Durable commit failed (`commitFailures`), or `relay frame error`: any throw before the append (`frameErrors`, preceded by `VAULT_ERROR` `relay_frame_error`). The client reconnects and resends through step2. |
+
+**1013: ours vs the platform (round 4).** The server sends 1013 only with one of these reasons:
+`relay rate limit` (relay token bucket), `semantic compaction pressure`, `body cache budget exceeded`
+and `pending durability budget exceeded` (base socket service). None of them is `Service overloaded`.
+A 1013 with reason `Service overloaded` (or an empty reason) comes from the Cloudflare runtime:
+the Durable Object was overloaded (too many queued requests or events, or CPU saturation), and
+the platform shed the connection. The server never sees these closes, so no counter moves. To tell
+them apart, check the reason string and whether `rateLimitCloses` grew (and whether a
+`VAULT_BACKPRESSURE` frame arrived first). The K1 1013 was the platform: the sender was flooding
+one DO at mb=0 with one transaction and one output-gate flush per frame.
+
+**No silent drops (round 4).** Every non-empty `SYNC_UPDATE` frame (`updateFrames`) ends in exactly
+one outcome. Each outcome has a counter, and the counters satisfy
+
+`updateFrames = appendFrames + noopSkips + dedupeHits + dedupeConflicts + batchDuplicateCandidates
++ authorityCloses + authorityDrops + rateLimitCloses + epochFences + bodyInactiveCloses
++ tooLargeCloses + commitFailures + frameErrors`
+
+Each outcome is one of: appended, acked or skipped as a justified no-op, or the socket is closed
+with an error code. A throw anywhere before the append, including the micro-batch timer path and
+`VaultSocketService.relayMessage`, closes 1011 (`failFrames`); before round 4 the socket path sent
+`VAULT_ERROR` and kept the socket open, so the frame was lost with no close. A throw after the
+append (`postCommitErrors`, `lastFrameError`) is counted and the remaining post-commit steps
+still run, so one failing origin send can never cost a peer its fan-out frame.
 
 ### 4.4 Runtime identity
 
@@ -452,7 +476,10 @@ a doc. Clients are trusted, as with envelope hashes.
                   "incrementalAppends", "stateVectorDrift", "partialCheckpoints", "mergeBudgetRejects",
                   "unmergedStep2Replies", "lazyHashSkips", "lazyHashCacheHits", "authorityDrops",
                   "batchDuplicateCandidates", "residentStaleSkips", "floorAdvances", "floorRowsPruned",
+                  "updateFrames", "frameErrors", "postCommitErrors", "bodyInactiveCloses", "tooLargeCloses",
+                  "leanCatalogEvents", "leanCoalesceRowsWritten", "checkpointsFromCache",
                   "appendsPerSecond" },
+    "lastFrameError": { "at", "message" } | null,
     "documentMaterialisations": { "root", "nonRoot", "recentNonRoot": [ { "documentId", "throughSequence", "at" } ] },
     "byteOps": "<ywasm byte-ops backend name>",
     "bodies": [ { "bodyId", "epoch", "latestSequence", "generation", "logRows", "logBytes",
@@ -489,6 +516,8 @@ a doc. Clients are trusted, as with envelope hashes.
 | `YAOS_RELAY_RESET_COOLDOWN_MS` | `86400000` | Minimum ms between two semantic resets of one body (lease → 429 `cooldown`). `0` disables. |
 | `YAOS_RELAY_MAX_MERGE_INPUT_BYTES` | `9437184` | Max summed input of one server byte merge (§6.2). |
 | `YAOS_RELAY_LAZY_HASH_MAX_BYTES` | `3145728` | Bodies above this never get the lazy-hash materialisation. |
+| `YAOS_RELAY_LEAN_ROWS` | unset | `"true"` enables lean rows (§6.4). |
+| `YAOS_RELAY_LEAN_CATALOG_DELAY_MS` | `2000` | Lean mode: the relay alarm runs this long after the first pending append; it coalesces catalog events and checkpoints. Range 0..600000. |
 
 Local tests: `YAOS_TEST_FORCE_RELAY_BODIES=true` (or `YAOS_TEST_RELAY_BODIES=true`) makes runtimes
 built without an env (unit suites) default to relay mode (`relayBodiesTestDefault()` in
@@ -613,6 +642,91 @@ each time; results in `results/relay2/core2-live-reset-5mb.json`):
 - HEAD took 180–260 ms.
 - With the 1 s test cooldown, an immediate re-lease got `429 cooldown` (`retry-after: 1`) once. In
   the other five iterations the reset round-trip had already outlasted the cooldown.
+
+### 6.4 Lean rows (round 4, `YAOS_RELAY_LEAN_ROWS=true`)
+
+Rows written per append by the default relay transaction are listed below. "Node" is
+`node:sqlite` `rowsWritten`, which counts table rows only. "CF" is Cloudflare `rowsWritten`,
+which also counts index entries.
+
+| Write | Node | CF | Lean |
+|---|---|---|---|
+| `vault_clock` UPDATE (sequence) | 1 | 1 | removed |
+| `vault_journal` INSERT (PK + `(document_id, sequence)` index) | 1 | 2 | kept |
+| `vault_mutation_attribution` INSERT | 1 | 1–2 | frame 0 inline on the journal row; extra micro-batch frames keep a row |
+| `vault_document_heads` UPDATE | 1 | 1 | kept |
+| `vault_catalog_events` INSERT (PK + `(body_id, sequence DESC)` index) | 1 | 2–3 | coalesced by the alarm |
+| `vault_candidate_receipts` INSERT (candidate frames only) | +1 | +2 | kept (G13) |
+
+The deployed numbers come from `scripts/relay2-core-smoke.ts`, which measures 20 acked edits per
+frame kind using the diagnostics `rowsWritten` delta:
+
+- `yaos-relay2-coresmoke-1` (default): 9 CF rows per plain append, 11 per candidate frame.
+- `yaos-relay2-corelean-1` (lean): 3 per plain append, 5 per candidate frame.
+
+Minimum is 2 node rows or 3 CF rows per plain append (journal + index + head), and 3 node or 5 CF
+rows for candidate frames. The default is 5 node / 9 CF rows (6 / 11 with a candidate).
+Amortised over a pass (`scripts/relay2-core-alarmprobe.ts 750 30`, one pass per 50 appends):
+lean 2.13 node rows per append vs 5.07 by default. The coalescing pass writes 3 rows per dirty body
+(clock sync, clock advance, event).
+
+How lean mode works:
+
+- **Sequence.** An append reads `MAX(vault_clock, MAX(vault_journal.sequence)) + 1` and does not
+  write the clock. Every other allocator (`clockAdvanceSql`) and `currentSequence()` use the same
+  MAX, so sequences stay unique and monotonic. Every journal `DELETE` first raises the clock to the
+  journal max (`syncLeanClock`), so pruning can never free a sequence for reuse.
+- **Attribution.** Frame 0's actor, `operationId` and `requestDigest` are stored in nullable
+  `attr_*` columns on the journal row (added by `ALTER TABLE` in `enableLeanRows`). Frames 1..n of a
+  micro-batch keep their `vault_mutation_attribution` rows. `committedOperationOutcome` falls back
+  to the inline columns (G14 still holds).
+- **Accepted hash.** The hash goes to `relay_content_hash` / `relay_size` on the journal row. Lazy
+  backfill updates it in place.
+- **Catalog.** No per-append event. `getCatalogHeadAt` / `listCatalogAt` overlay the newest body
+  journal row after the latest catalog event, at or before the boundary: its sequence, generation
+  and inline hash. Readers of the current head (HTTP reads, rename, bootstrap manifests,
+  `currentBodyHead`) are exact. The relay alarm is armed on every lean append, delayed by
+  `YAOS_RELAY_LEAN_CATALOG_DELAY_MS`. At the start of `runCheckpointPass` it writes one event per
+  dirty body (`coalesceLeanCatalog`), with the head generation and the head row's inline hash, or
+  NULL when that row's hash is unknown. The feed floor does not advance if coalescing failed.
+  `semanticReset` coalesces the body first, because the reset event copies the latest one.
+
+What each removed write costs:
+
+1. **Clock write.** Nothing observable. The cost is a MAX subquery on every allocation and on
+   `currentSequence()` (a PK tail lookup), plus a clock sync before journal deletes. Turning the
+   flag off again requires one coalescing pass first (not automated in the spike).
+2. **Attribution row.** Frame 0's attribution now lives and dies with its journal row. It is
+   pruned at the feed floor, not kept forever. A candidate resend older than about 1000 sequences
+   (and older than its receipt) is re-appended. On the exact path that is a CRDT no-op; the
+   receipt table (kept) covers the normal window.
+3. **Catalog event.** The raw catalog log (`catalogDeltaAt` delta feed, recovery-authority raw
+   queries, historical catalog at boundaries between coalesced events) lags by up to the
+   coalescing delay. Intermediate generations and hashes never appear as events: one event per
+   body per pass. Coalesced events carry no attribution (`mutation_index` 0, no operation). Body
+   hash changes reach peers through the delta feed up to about 2 s later. Socket fan-out is
+   unaffected.
+
+Verdict (go/no-go input). A plain append drops from 9 to 3 CF rows. It cannot go lower without
+dropping the head update (the head is the fence and the merged-cache key) or the journal index.
+Candidate frames cost 5 CF rows. The catalog lag is the only semantic change a client can see.
+
+### 6.5 mb=0 tail latency (round 4)
+
+At mb=0 every frame is its own `transactionSync`, and fan-out waits for the output gate (the SQLite
+flush). Latency therefore follows commit latency, not CPU. The p90 of 0.4–2 s (vs about 68 ms at
+mb10) comes from head-of-line blocking behind the checkpoint alarm. The alarm arms when the tail
+reaches `YAOS_RELAY_CHECKPOINT_ENTRIES` (50) rows. mb=0 makes 1 row per frame instead of 1 per
+batch, so it arms about 3x more often. Each pass is a durable byte merge plus a checkpoint write
+plus a floor advance: about 60 ms CPU, with 0.5–4 s wall time deployed. The alarm runs
+single-threaded with the DO, so every frame that arrives meanwhile queues behind it, and output
+gates add a flush per frame.
+
+Round 4 cheap fix: a full checkpoint uses the in-memory merged bytes when they are at the head
+(`checkpointsFromCache`). That skips the SQLite read and the wasm merge; local checkpoint time
+fell from 3.3 to 1.8 ms per pass for a 30 KiB body. Lean mode also delays and coalesces the alarm.
+The remaining lever is micro-batching (mb 5–10). It turns N frames into one transaction and one
+flush, and is the recommended default.
 
 ## 7. Design decisions
 

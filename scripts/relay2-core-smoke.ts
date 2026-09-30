@@ -35,6 +35,31 @@ const peerAt = await peerUpdate;
 result.peer = { received: peerAt !== null, ms: peerAt === null ? null : Math.round(peerAt - sentAt), text: b.text() };
 const get = await bodyGet(context.devices.A!, bodyId);
 result.httpGet = { status: get.status, text: get.text, contentHashMatches: get.contentHash === contentHashOf(a.text()).contentHash };
+// Round 4: deployed CF rowsWritten per append over SMOKE_APPENDS sequential acked edits (default 20).
+type Counters = Record<string, number>;
+const countersNow = async () => ((await diagnostics(context.devices.A!, true)).relay as { counters: Counters }).counters;
+const appendsWanted = Number(process.env.SMOKE_APPENDS ?? 20);
+const measure = async (client: RawClient) => {
+	const before = await countersNow();
+	for (let index = 0; index < appendsWanted; index++) {
+		const edit = client.editTracked((text) => text.insert(text.length, String(index % 10)));
+		await client.waitAck(edit.frameId, edit.sentAt, 15_000);
+	}
+	const after = await countersNow();
+	const appended = after.appends - before.appends;
+	return { appends: appended, rowsWritten: after.rowsWritten - before.rowsWritten,
+		cfRowsPerAppend: appended > 0 ? +((after.rowsWritten - before.rowsWritten) / appended).toFixed(2) : null };
+};
+const nocand = new RawClient(context.devices.A!, bodyId, undefined, relayAdapter({ includeCandidate: false }));
+if ((await nocand.open(30_000)).status !== "ok") throw new Error("nocand open failed");
+result.rowsPerAppend = {
+	leanRows: (((await diagnostics(context.devices.A!, true)).relay as { config?: { leanRows?: boolean } }).config?.leanRows) ?? false,
+	candidateFrames: await measure(a),
+	plainFrames: await measure(nocand),
+};
+await new Promise((resolve) => setTimeout(resolve, 1000));
+result.nocandConverged = nocand.text() === a.text();
+await nocand.close();
 const diag = await diagnostics(context.devices.A!, true);
 const relay = diag.relay as { counters?: Record<string, unknown> } | undefined;
 result.relayCounters = relay?.counters;
@@ -44,10 +69,12 @@ result.tableCounts = tables ? { status: tables.status, body: tables.ok ? await t
 const deviceTables = await fetch(vaultRoute(context.devices.A!, "debug/relay-table-counts"), {
 	headers: deviceBearerHeaders(context.devices.A!) });
 result.tableCountsWithDeviceBearer = deviceTables.status;
+await new Promise((resolve) => setTimeout(resolve, 1500));
+result.peerConverged = b.text() === a.text();
 await a.close();
 await b.close();
 const ok = !!ack && ack.value.relay === true && ack.value.contentHashAccepted === true && peerAt !== null
-	&& get.status === 200 && get.text === "hello relay + world" && b.text() === "hello relay + world";
+	&& get.status === 200 && get.text === "hello relay + world" && b.text() === a.text();
 result.ok = ok;
 console.log(JSON.stringify(result, null, 2));
 process.exit(ok ? 0 : 1);

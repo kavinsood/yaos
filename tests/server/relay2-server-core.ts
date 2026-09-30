@@ -83,7 +83,7 @@ interface Harness {
 	envelope(socket: FakeSocket, update: Uint8Array, extra?: Record<string, unknown>): void;
 	claim(doc: Y.Doc): Record<string, unknown>;
 	journalRows(): number;
-	catalogHead(): { contentHash: string | null; size: number | null; sequence: number };
+	catalogHead(): NonNullable<ReturnType<VaultStore["getCatalogHeadAt"]>>;
 	/** A second service over the same storage (a new runtime after eviction/hibernation). */
 	freshRelay(): RelayBodyService;
 	revoke(deviceId: string): void;
@@ -105,6 +105,10 @@ async function withRelay(check: (harness: Harness) => void | Promise<void>,
 		root.getMap("sys").set("protocolVersion", 5);
 		store.provisionVault(VAULT_ID, VAULT_GENERATION, Y.encodeStateAsUpdate(root), 1);
 		root.destroy();
+		// Round 4: YAOS_RELAY_LEAN_ROWS=true reruns the whole suite in lean mode (§6.4).
+		const effectiveConfig: RelayConfig = { ...DEFAULT_RELAY_CONFIG,
+			leanRows: process.env.YAOS_RELAY_LEAN_ROWS === "true", ...config };
+		if (effectiveConfig.leanRows) store.enableLeanRows();
 		store.installAuthorityFence({ changeId: "relay2-bootstrap", vaultId: VAULT_ID, vaultGeneration: VAULT_GENERATION,
 			subjectDigest: "relay2-bootstrap-digest", subjects: [
 				{ principalId: owner.principalId, role: owner.role, state: "active", membershipRevision: 1,
@@ -122,7 +126,7 @@ async function withRelay(check: (harness: Harness) => void | Promise<void>,
 		const clock = { now: Date.now() };
 		const sockets: FakeSocket[] = [];
 		const makeRelay = () => new RelayBodyService({
-			config: { ...DEFAULT_RELAY_CONFIG, ...config },
+			config: effectiveConfig,
 			store: () => store,
 			relayStore: () => relayStore,
 			cache,
@@ -266,8 +270,9 @@ s.test("append: one journal row per frame, lean row count, ack + broadcast stric
 		const delta = Object.fromEntries(Object.keys(tablesAfter)
 			.map((name) => [name, tablesAfter[name]! - (tablesBefore[name] ?? 0)])
 			.filter(([, value]) => value !== 0));
-		assert.deepEqual(delta, { vault_catalog_events: 1, vault_journal: 1, vault_mutation_attribution: 1 },
-			"relay append inserts journal + attribution + catalog event only (head and clock are updates)");
+		assert.deepEqual(delta, store.leanRows ? { vault_journal: 1 }
+			: { vault_catalog_events: 1, vault_journal: 1, vault_mutation_attribution: 1 },
+			"relay append inserts journal + attribution + catalog event only (head and clock are updates); lean: journal only");
 		console.log(`[relay2-core] relay append table deltas ${JSON.stringify(delta)} sqlite rowsWritten=${relay.counters.rowsWritten}`);
 		const ack = origin.last("BODY_COMMITTED")!;
 		assert.equal(ack.relay, true);
@@ -420,13 +425,13 @@ s.test("micro-batch: frames merge into one journal row with per-frame attributio
 		const a = socket();
 		const b = socket(peer);
 		const rows = journalRows();
-		const attributions = relayStore.tableCounts().vault_mutation_attribution ?? 0;
+		const attributions = relayStore.attributionCount();
 		update(a, textUpdate(seed, (text) => text.insert(0, "1")));
 		update(b, textUpdate(seed, (text) => text.insert(0, "2")));
 		assert.equal(journalRows(), rows, "queued until flush");
 		relay.flushBatch(BODY);
 		assert.equal(journalRows(), rows + 1);
-		assert.equal(relayStore.tableCounts().vault_mutation_attribution, attributions + 2);
+		assert.equal(relayStore.attributionCount(), attributions + 2);
 		assert.equal(reconstructedText(store), "21hello");
 	}, { microbatchMs: 50 });
 });
@@ -812,7 +817,7 @@ s.test("G2/G11/G16: micro-batch drops revoked frames, collapses duplicate candid
 		writerA.destroy();
 		// Duplicate candidate ids inside one batch.
 		const c = socket(peer);
-		const attributions = relayStore.tableCounts().vault_mutation_attribution!;
+		const attributions = relayStore.attributionCount();
 		const bytes = textUpdate(seed, (text) => text.insert(0, "C"));
 		for (const digest of ["d1", "d1", "d2"]) {
 			envelope(c, bytes, { candidateId: "dup", candidateDigest: digest });
@@ -825,7 +830,7 @@ s.test("G2/G11/G16: micro-batch drops revoked frames, collapses duplicate candid
 		update(d, other);
 		relay.flushBatch(BODY);
 		assert.equal(journalRows(), rows + 2, "one row for the whole batch");
-		assert.equal(relayStore.tableCounts().vault_mutation_attribution, attributions + 2, "duplicate not attributed");
+		assert.equal(relayStore.attributionCount(), attributions + 2, "duplicate not attributed");
 		const acks = c.controls.filter((value) => value.type === "BODY_COMMITTED");
 		assert.equal(acks.length, 2);
 		assert.deepEqual(acks.map((ack) => ack.deduped).sort(), [false, true]);
@@ -961,6 +966,76 @@ s.test("G13/G14: a lost envelope leaves the frame envelope-less (no mis-pairing)
 	});
 });
 
+s.test("round 4 lean rows: 1 journal row + head per append; overlay, coalesced catalog event, clock, outcomes", async () => {
+	await withRelay(({ store, relayStore, socket, update, envelope, seed, relay, claim, catalogHead }) => {
+		assert.equal(store.leanRows, true);
+		const origin = socket();
+		const start = store.currentSequence();
+		const tablesBefore = relayStore.tableCounts();
+		const catalogBefore = catalogHead();
+		const rowsBefore = relay.counters.rowsWritten;
+		const appends = 20;
+		for (let index = 0; index < appends; index++) {
+			const bytes = textUpdate(seed, (text) => text.insert(text.length, String(index % 10)));
+			envelope(origin, bytes, { ...claim(seed), candidateId: `lean-${index}`, candidateDigest: `digest-${index}` });
+			update(origin, bytes);
+		}
+		const tablesAfter = relayStore.tableCounts();
+		const delta = Object.fromEntries(Object.keys(tablesAfter)
+			.map((name) => [name, tablesAfter[name]! - (tablesBefore[name] ?? 0)]).filter(([, value]) => value !== 0));
+		// Candidate frames also keep their receipt row (G13); nothing else is inserted.
+		assert.deepEqual(delta, { vault_journal: appends, vault_candidate_receipts: appends });
+		const perAppend = (relay.counters.rowsWritten - rowsBefore) / appends;
+		console.log(`[relay2-core] lean rows/append (node sqlite, candidate frames) ${perAppend}; deltas ${JSON.stringify(delta)}`);
+		assert.equal(perAppend, 3, "journal + head + receipt");
+		const head = store.documentHead(BODY)!;
+		assert.equal(store.currentSequence(), head.latestSequence, "lean clock = MAX(clock, journal head)");
+		assert.equal(head.latestSequence, start + appends);
+		// Overlay: the catalog head is the latest journal row, with its inline accepted hash.
+		const overlaid = catalogHead();
+		const expected = contentHashOf(seed.getText("body").toString());
+		assert.equal(overlaid.sequence, head.latestSequence);
+		assert.equal(overlaid.generation, head.generation);
+		assert.equal(overlaid.contentHash, expected.hash);
+		assert.equal(overlaid.size, expected.size);
+		assert.equal(overlaid.path, catalogBefore.path);
+		assert.equal(store.listActiveCatalogAt(store.currentSequence()).find((entry) => entry.bodyId === BODY)?.contentHash,
+			expected.hash);
+		const historical = store.getCatalogHeadAt(start + 5, BODY)!;
+		assert.equal(historical.sequence, start + 5, "boundary-respecting overlay");
+		// G14: exact outcomes come from the inline attribution.
+		assert.equal(store.committedOperationOutcome(owner, "lean-7", "digest-7")?.vaultSequence, start + 8);
+		assert.equal(store.committedOperationOutcome(owner, "lean-7", "wrong"), null);
+		// The delta feed lags until the coalescing pass, then carries one body-hash event.
+		const boundary = store.currentSequence();
+		assert.equal(store.catalogDeltaAt(start, boundary, null, 100).length, 0, "no per-append catalog events");
+		relay.runCheckpointPass({ retainSequences: 1000 });
+		assert.equal(relay.counters.leanCatalogEvents, 1);
+		const deltas = store.catalogDeltaAt(boundary, store.currentSequence(), null, 100);
+		assert.equal(deltas.length, 1);
+		assert.equal(deltas[0]!.contentHash, expected.hash);
+		const coalesced = catalogHead();
+		assert.equal(coalesced.sequence, boundary + 1);
+		assert.equal(coalesced.generation, head.generation);
+		assert.equal(coalesced.contentHash, expected.hash);
+		relay.runCheckpointPass({ retainSequences: 1000 });
+		assert.equal(relay.counters.leanCatalogEvents, 1, "idempotent: nothing pending");
+		// Base allocators never collide with lean sequences.
+		const beforeBase = store.currentSequence();
+		store.commitUpdate({ documentId: BODY, kind: "body", update: textUpdate(seed, (text) => text.insert(0, "z")),
+			actorAttributions: [{ actor: owner }] });
+		assert.equal(store.documentHead(BODY)!.latestSequence, beforeBase + 1);
+		// An unknown (stale-claim) hash is NULL inline and backfilled inline.
+		const unknown = textUpdate(seed, (text) => text.insert(0, "q"));
+		update(origin, unknown);
+		assert.equal(catalogHead().contentHash, null);
+		const state = relay.bodyHttpState(BODY)!;
+		assert.equal(state.hashState, "materialised");
+		assert.equal(catalogHead().contentHash, contentHashOf(seed.getText("body").toString()).hash, "inline backfill");
+		assert.equal(reconstructedText(store), seed.getText("body").toString());
+	}, { leanRows: true });
+});
+
 s.test("G1: relay-only workloads keep a bounded journal (checkpoint pass advances the feed floor, respecting pins)", async () => {
 	await withRelay(async ({ socket, update, seed, relay, store, journalRows }) => {
 		const origin = socket();
@@ -1005,6 +1080,111 @@ s.test("G4: the lazy hash is computed once per (body, head sequence) and never o
 		relayStore.backfillCatalogHash = original;
 		assert.equal(catalog.contentHash, null);
 	});
+});
+
+s.test("round 4 no silent drops: a pre-append throw closes 1011 with VAULT_ERROR (direct and micro-batch timer paths)", async () => {
+	for (const microbatchMs of [0, 5]) {
+		await withRelay(({ socket, update, seed, relay, journalRows }) => {
+			const origin = socket();
+			const other = socket(peer);
+			const rowsBefore = journalRows();
+			const original = relay.headState.bind(relay);
+			relay.headState = () => { throw new Error("injected rebuild failure"); };
+			update(origin, textUpdate(seed, (text) => text.insert(0, "x")));
+			relay.flushAllBatches();
+			relay.headState = original;
+			assert.equal(origin.closed?.code, 1011, `mb${microbatchMs}: origin closed 1011`);
+			assert.equal(origin.last("VAULT_ERROR")?.code, "relay_frame_error");
+			assert.equal(relay.counters.frameErrors, 1);
+			assert.equal(journalRows(), rowsBefore, "nothing was appended");
+			assert.equal(other.binary.length, 0, "no fan-out of an uncommitted frame");
+			const diagnostics = relay.diagnostics() as { lastFrameError: { message: string } | null };
+			assert.equal(diagnostics.lastFrameError?.message, "injected rebuild failure");
+			// The service keeps working for later frames (the merged cache was dropped and rebuilds).
+			const later = socket();
+			update(later, textUpdate(seed, (text) => text.insert(0, "y")));
+			relay.flushAllBatches();
+			assert.equal(journalRows(), rowsBefore + 1);
+			assert.equal(other.binary.length, 1);
+		}, { microbatchMs, rateBytesPerSec: 1 << 30 });
+	}
+});
+
+s.test("round 4 no silent drops: a post-commit throw never costs a peer its fan-out frame", async () => {
+	await withRelay(({ socket, update, envelope, seed, relay, journalRows, events }) => {
+		const origin = socket();
+		const other = socket(peer);
+		const rowsBefore = journalRows();
+		const internals = relay as unknown as { syncDocumentCache: (bodyId: string) => void };
+		const original = internals.syncDocumentCache;
+		internals.syncDocumentCache = () => { throw new Error("injected cache failure"); };
+		origin.send = () => { throw new Error("origin socket gone"); };
+		const change = textUpdate(seed, (text) => text.insert(0, "z"));
+		envelope(origin, change);
+		update(origin, change);
+		internals.syncDocumentCache = original;
+		assert.equal(journalRows(), rowsBefore + 1, "appended");
+		assert.equal(other.binary.length, 1, "peer still got the update");
+		assert.ok(events.some((event) => event.kind === "committed"), "base notice still sent");
+		assert.equal(relay.counters.postCommitErrors >= 1, true);
+		assert.equal(relay.counters.frameErrors, 0);
+		assert.equal(origin.closed, null, "a post-commit failure is not reported as a lost frame");
+	});
+});
+
+s.test("round 4 accounting: random interleavings (gaps, resends, empties) at mb0 and mb>0 lose nothing", async () => {
+	for (const microbatchMs of [0, 10]) {
+		await withRelay(({ store, socket, update, envelope, seed, relay }) => {
+			let random = 0x9e3779b9 ^ microbatchMs;
+			const next = () => { random = (Math.imul(random ^ (random >>> 15), 0x2c1b3c6d) + 0x6d2b79f5) >>> 0; return random / 2 ** 32; };
+			const writers = [owner, peer].map((actor) => {
+				const doc = new Y.Doc();
+				Y.applyUpdate(doc, Y.encodeStateAsUpdate(seed));
+				return { actor, doc, socket: socket(actor), queue: [] as Uint8Array[] };
+			});
+			const observer = socket({ ...owner, deviceId: "device-observer" });
+			const truth = new Y.Doc();
+			Y.applyUpdate(truth, Y.encodeStateAsUpdate(seed));
+			for (let step = 0; step < 400; step++) {
+				const writer = writers[Math.floor(next() * writers.length)]!;
+				const change = textUpdate(writer.doc, (text) => text.insert(Math.floor(next() * (text.length + 1)), "abc"[step % 3]!));
+				Y.applyUpdate(truth, change);
+				writer.queue.push(change);
+				// Deliver out of causal order sometimes (a later frame first), resend sometimes, send empties.
+				while (writer.queue.length > 0 && next() < 0.7) {
+					const index = writer.queue.length > 1 && next() < 0.3 ? 1 : 0;
+					const [frame] = writer.queue.splice(index, 1);
+					if (next() < 0.5) envelope(writer.socket, frame!);
+					update(writer.socket, frame!);
+					if (next() < 0.1) update(writer.socket, frame!);
+					if (next() < 0.05) update(writer.socket, new Uint8Array([0, 0]));
+				}
+				if (next() < 0.2) relay.flushAllBatches();
+			}
+			for (const writer of writers) for (const frame of writer.queue.splice(0)) update(writer.socket, frame);
+			relay.flushAllBatches();
+			const c = relay.counters;
+			const outcomes = c.appendFrames + c.noopSkips + c.dedupeHits + c.dedupeConflicts + c.batchDuplicateCandidates
+				+ c.authorityCloses + c.authorityDrops + c.rateLimitCloses + c.epochFences + c.bodyInactiveCloses
+				+ c.tooLargeCloses + c.commitFailures + c.frameErrors;
+			assert.equal(outcomes, c.updateFrames, `mb${microbatchMs}: every update frame has exactly one outcome`);
+			assert.equal(c.frameErrors + c.commitFailures + c.rateLimitCloses, 0);
+			for (const writer of writers) assert.equal(writer.socket.closed, null);
+			assert.equal(reconstructedText(store), truth.getText("body").toString(), `mb${microbatchMs}: durable state equals the writers' union`);
+			const peerView = new Y.Doc();
+			Y.applyUpdate(peerView, Y.encodeStateAsUpdate(seed));
+			for (const frame of observer.binary) {
+				const decoder = decoding.createDecoder(frame);
+				decoding.readVarUint(decoder);
+				decoding.readVarUint(decoder);
+				Y.applyUpdate(peerView, decoding.readVarUint8Array(decoder));
+			}
+			assert.equal(peerView.getText("body").toString(), truth.getText("body").toString(), `mb${microbatchMs}: a peer fed only fan-out converges`);
+			for (const writer of writers) writer.doc.destroy();
+			truth.destroy();
+			peerView.destroy();
+		}, { microbatchMs, rateBytesPerSec: 1 << 30 });
+	}
 });
 
 await s.done();

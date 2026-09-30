@@ -222,7 +222,7 @@ export class VaultStore extends RecoveryAuthorityStore {
 				|| attachmentHead.contentHash !== input.rollbackBlobHash
 				|| attachmentHead.size !== input.rollbackBlobSize) throw new Error("attachment_head_changed");
 			const documentSequence = this.storage.sql.exec<{ sequence: number }>(
-				"UPDATE vault_clock SET sequence = sequence + 1 WHERE id = 1 RETURNING sequence").one().sequence;
+				this.clockAdvanceSql()).one().sequence;
 			documentGeneration = 1;
 			this.storage.sql.exec(`INSERT INTO vault_journal(
 			 sequence, document_id, generation, semantic_epoch, kind, update_byte_length, data, created_at)
@@ -233,7 +233,7 @@ export class VaultStore extends RecoveryAuthorityStore {
 			 VALUES (?, ?, ?, ?)`, input.documentId, documentGeneration, INITIAL_SEMANTIC_EPOCH, documentSequence).toArray();
 
 			rootSequence = this.storage.sql.exec<{ sequence: number }>(
-				"UPDATE vault_clock SET sequence = sequence + 1 WHERE id = 1 RETURNING sequence").one().sequence;
+				this.clockAdvanceSql()).one().sequence;
 			rootGeneration = rootHead.generation + 1;
 			this.storage.sql.exec(`INSERT INTO vault_journal(
 			 sequence, document_id, generation, semantic_epoch, kind, update_byte_length, data, created_at)
@@ -320,7 +320,7 @@ export class VaultStore extends RecoveryAuthorityStore {
 				throw new Error("semantic_catalog_head_changed");
 			}
 			rootSequence = this.storage.sql.exec<{ sequence: number }>(
-				"UPDATE vault_clock SET sequence = sequence + 1 WHERE id = 1 RETURNING sequence").one().sequence;
+				this.clockAdvanceSql()).one().sequence;
 			rootGeneration = rootHead.generation + 1;
 			this.storage.sql.exec(`INSERT INTO vault_journal(
 			 sequence, document_id, generation, semantic_epoch, kind, update_byte_length, data, created_at)
@@ -557,7 +557,7 @@ export class VaultStore extends RecoveryAuthorityStore {
 			if (input.changesState) {
 				generation++;
 				const clock = this.storage.sql.exec<{ sequence: number }>(
-					"UPDATE vault_clock SET sequence = sequence + ? WHERE id = 1 RETURNING sequence",
+					this.clockAdvanceSql(true),
 					updates.length,
 				);
 				vaultSequence = clock.one().sequence;
@@ -754,7 +754,7 @@ export class VaultStore extends RecoveryAuthorityStore {
 				: INITIAL_SEMANTIC_EPOCH;
 			rowsRead += head.rowsRead;
 			const clock = this.storage.sql.exec<{ sequence: number }>(
-				"UPDATE vault_clock SET sequence = sequence + 1 WHERE id = 1 RETURNING sequence",
+				this.clockAdvanceSql(),
 			);
 			sequence = clock.one().sequence;
 			rowsWritten += clock.rowsWritten;

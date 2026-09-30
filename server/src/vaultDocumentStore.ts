@@ -169,6 +169,13 @@ export interface CheckpointWriteResult {
 }
 
 /** Relay v2 spike: a byte merge would exceed the relay byte-op memory budget. */
+/** Nullable lean-mode journal columns (relay v2 §6.4), added only by `enableLeanRows`. */
+export const LEAN_JOURNAL_COLUMNS = [
+	"attr_principal_id TEXT", "attr_membership_revision INTEGER", "attr_device_id TEXT",
+	"attr_device_credential_revision INTEGER", "attr_operation_id TEXT", "attr_request_digest TEXT",
+	"relay_content_hash TEXT", "relay_size INTEGER",
+] as const;
+
 export class RelayMergeBudgetError extends Error {
 	constructor(readonly documentId: string, readonly inputBytes: number, readonly budgetBytes: number) {
 		super("relay_merge_budget_exceeded");
@@ -979,13 +986,76 @@ export abstract class VaultDocumentStore {
 			);
 		`);
 		this.initialized = true;
+		if (this.leanRowsEnabled) this.addLeanColumns();
 	}
 
 	currentSequence(): number {
 		this.initialize();
 		return this.storage.sql.exec<{ sequence: number }>(
-			"SELECT sequence FROM vault_clock WHERE id = 1",
+			this.leanRowsEnabled
+				? `SELECT MAX(sequence, (SELECT COALESCE(MAX(sequence), 0) FROM vault_journal)) AS sequence
+				     FROM vault_clock WHERE id = 1`
+				: "SELECT sequence FROM vault_clock WHERE id = 1",
 		).one().sequence;
+	}
+
+	/**
+	 * Relay v2 lean rows (docs/relay2-protocol.md §6.4). Off (the default) every
+	 * statement is the phase0 text. On: lean relay appends take their sequence
+	 * from MAX(clock, journal head) + 1 without writing `vault_clock`, so every
+	 * clock reader/allocator takes the same MAX (the journal's INTEGER PRIMARY KEY
+	 * makes MAX(sequence) one index probe), and the journal gains nullable inline
+	 * attribution / accepted-hash columns.
+	 */
+	protected leanRowsEnabled = false;
+
+	get leanRows(): boolean {
+		return this.leanRowsEnabled;
+	}
+
+	/**
+	 * Lean mode is on from construction (every allocator takes the MAX form at
+	 * once); the inline journal columns are added with the schema, lazily, so a
+	 * store over storage that is never used stays untouched.
+	 */
+	enableLeanRows(): void {
+		this.leanRowsEnabled = true;
+		if (this.initialized) this.addLeanColumns();
+	}
+
+	private addLeanColumns(): void {
+		for (const column of LEAN_JOURNAL_COLUMNS) {
+			try { this.storage.sql.exec(`ALTER TABLE vault_journal ADD COLUMN ${column}`).toArray(); }
+			catch (error) {
+				if (!/duplicate column/i.test(error instanceof Error ? error.message : String(error))) throw error;
+			}
+		}
+	}
+
+	/** `UPDATE vault_clock ... RETURNING sequence`; `byParam` adds `?` instead of 1. */
+	protected clockAdvanceSql(byParam = false): string {
+		const step = byParam ? "?" : "1";
+		return this.leanRowsEnabled
+			? `UPDATE vault_clock SET sequence = MAX(sequence, (SELECT COALESCE(MAX(sequence), 0) FROM vault_journal)) + ${step}
+			   WHERE id = 1 RETURNING sequence`
+			: `UPDATE vault_clock SET sequence = sequence + ${step} WHERE id = 1 RETURNING sequence`;
+	}
+
+	/** Allocates one vault sequence (lean-aware). */
+	advanceClock(): { sequence: number; rowsWritten: number } {
+		const cursor = this.storage.sql.exec<{ sequence: number }>(this.clockAdvanceSql());
+		const sequence = cursor.one().sequence;
+		return { sequence, rowsWritten: cursor.rowsWritten };
+	}
+
+	/** Lean mode: raise the clock to the journal head (before deleting journal rows). One row. */
+	syncLeanClock(): number {
+		if (!this.leanRowsEnabled) return 0;
+		const cursor = this.storage.sql.exec(`UPDATE vault_clock
+		 SET sequence = (SELECT COALESCE(MAX(sequence), 0) FROM vault_journal)
+		 WHERE id = 1 AND sequence < (SELECT COALESCE(MAX(sequence), 0) FROM vault_journal)`);
+		cursor.toArray();
+		return cursor.rowsWritten;
 	}
 
 	vaultMetadata(): VaultMetadata | null {
@@ -1232,7 +1302,16 @@ export abstract class VaultDocumentStore {
 		   AND device_credential_revision = ? AND operation_id = ? AND request_digest = ?
 		 ORDER BY sequence DESC LIMIT 1`, actor.principalId, actor.membershipRevision, actor.deviceId,
 			actor.deviceCredentialRevision, operationId, requestDigest).toArray()[0];
-		return row ? { operationId, requestDigest, vaultSequence: row.sequence, committed: true } : null;
+		if (row) return { operationId, requestDigest, vaultSequence: row.sequence, committed: true };
+		if (!this.leanRowsEnabled) return null;
+		// Lean relay appends carry frame 0's attribution inline on the journal row (§6.4).
+		const inline = this.storage.sql.exec<{ sequence: number }>(`SELECT sequence
+		 FROM vault_journal
+		 WHERE attr_principal_id = ? AND attr_membership_revision = ? AND attr_device_id = ?
+		   AND attr_device_credential_revision = ? AND attr_operation_id = ? AND attr_request_digest = ?
+		 ORDER BY sequence DESC LIMIT 1`, actor.principalId, actor.membershipRevision, actor.deviceId,
+			actor.deviceCredentialRevision, operationId, requestDigest).toArray()[0];
+		return inline ? { operationId, requestDigest, vaultSequence: inline.sequence, committed: true } : null;
 	}
 
 	documentGenerationAtSequence(documentId: string, sequence: number): number | null {
@@ -1708,9 +1787,7 @@ export abstract class VaultDocumentStore {
 					throw new Error("semantic_reset_blocked_by_unpublished_lifecycle");
 				}
 			}
-			const clock = this.storage.sql.exec<{ sequence: number }>(
-				"UPDATE vault_clock SET sequence = sequence + 1 WHERE id = 1 RETURNING sequence",
-			);
+			const clock = this.storage.sql.exec<{ sequence: number }>(this.clockAdvanceSql());
 			sequence = clock.one().sequence;
 			rowsWritten += clock.rowsWritten;
 			const journal = this.storage.sql.exec(
@@ -1873,7 +1950,7 @@ export abstract class VaultDocumentStore {
 	 * their final relevant pin disappears they are removed immediately.
 	 */
 	protected pruneUnpinnedDocumentHistory(now: number, documentId: string | null = null): number {
-		let rowsWritten = 0;
+		let rowsWritten = this.syncLeanClock();
 		const journal = this.storage.sql.exec(
 			`DELETE FROM vault_journal AS journal
 			 WHERE (? IS NULL OR journal.document_id = ?)
@@ -2102,6 +2179,7 @@ export abstract class VaultDocumentStore {
 			this.assertActivePinRetainedCheckpointCapacity(now);
 			const feedFloor = this.journalFloor();
 			const deleteThrough = Math.min(expectedHead.throughSequence, feedFloor);
+			rowsWritten += this.syncLeanClock();
 			const deleteJournal = this.storage.sql.exec(
 				"DELETE FROM vault_journal WHERE document_id = ? AND sequence <= ?",
 				documentId,
@@ -2232,7 +2310,7 @@ export abstract class VaultDocumentStore {
 				throughSequence,
 			);
 			floor.toArray();
-			rowsWritten += floor.rowsWritten;
+			rowsWritten += floor.rowsWritten + this.syncLeanClock();
 			const prune = this.storage.sql.exec(
 				`DELETE FROM vault_journal
 				 WHERE sequence <= ?

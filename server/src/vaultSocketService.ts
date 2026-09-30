@@ -610,7 +610,10 @@ export class VaultSocketService {
 			if (type !== MESSAGE_SYNC) return;
 			relay.handleSyncFrame(socket, attachment, decoder);
 		} catch (error) {
-			this.sendControl(socket, { type: "VAULT_ERROR", message: error instanceof Error ? error.message : String(error) });
+			// Round 4: never answer a failed binary frame with VAULT_ERROR alone. The
+			// socket stayed open, so the origin never resent the lost update and its
+			// later updates stayed pending at every peer. Count, VAULT_ERROR, close 1011.
+			relay.failFrames(attachment.documentId, [{ socket }], error);
 		}
 	}
 
