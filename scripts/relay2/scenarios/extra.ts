@@ -95,6 +95,20 @@ export async function gqlWindows(ctx: RunCtx, windows: Win[]): Promise<Result[] 
 		} catch (error) { log(`gql probe error: ${String(error).slice(0, 200)}`); }
 		if (attempt < attempts) { log(`gql ${probe.name}: last minute bucket not yet present (attempt ${attempt}); retry in 60 s`); await sleep(60_000); }
 	}
+	// A DO reporting period is emitted when it ends and is labelled with its start minute, so a bucket can grow
+	// after the last minute is visible (seen: a 6368-row bucket arriving minutes after the probe passed). Require the
+	// whole span's periodic totals to be unchanged across two queries 60 s apart.
+	const spanStart = windows[0]!.start, spanEnd = windows[windows.length - 1]!.end;
+	let stable = false, previous = "";
+	for (let attempt = 1; attempt <= attempts && probeReady; attempt++) {
+		try {
+			const q = await queryWindow(ctx.host, spanStart, spanEnd);
+			const sig = JSON.stringify(q.periodicMinutes.map((r) => [r.dimensions.datetimeMinute, r.dimensions.objectId, r.sum.rowsWritten, r.sum.cpuTime]));
+			if (sig === previous) { stable = true; break; }
+			previous = sig;
+		} catch (error) { log(`gql stability probe error: ${String(error).slice(0, 200)}`); }
+		if (attempt < attempts) { log(`gql: waiting for periodic totals to stabilise (attempt ${attempt}); retry in 60 s`); await sleep(60_000); }
+	}
 	const out: Result[] = [];
 	for (const w of windows) {
 		let entry: Result = { ...w };
@@ -113,7 +127,11 @@ export async function gqlWindows(ctx: RunCtx, windows: Win[]): Promise<Result[] 
 				entry = { ...w, ...m, invocations: inv, httpRequests, wsInvocations, alarms,
 					doRequestUnits: r2(httpRequests + alarms + t.inboundWsEffective / 20),
 					doRequestUnitsNote: "HTTP invocations (incl. WS upgrades, tickets, debug routes) + alarms + inbound WS messages / 20 (Workers billing 20:1); inbound = max(periodic inboundWebsocketMsgCount, hibernation invocations)",
-					probeReady, attempt };
+					probeReady, totalsStable: stable, attempt,
+					// Traffic but no rows / missing minute buckets: a reporting period that began outside this
+					// window absorbed (or will absorb) its activity; per-window periodic totals are then unreliable.
+					attributionSuspect: w.name !== "idle" && ((httpRequests + wsInvocations > 0 && !(t.rowsWritten ?? 0))
+						|| m.bucketMinutes < Number(w.minutes ?? 0)) };
 				break;
 			} catch (error) { entry = { ...w, error: String(error).slice(0, 300), attempt }; await sleep(15_000); }
 		}
@@ -196,6 +214,7 @@ export async function C2(ctx: RunCtx): Promise<Result> {
 	// idle baseline has no sockets open, and sockets are opened just after the stream window's minute boundary
 	// (the opens are inside the stream window; `opens` records how many).
 	const windows: Win[] = [];
+	await sleep(ctx.num("quiet-gap-ms", 240_000));   // seeding period closes before the idle window (see MB)
 	let start = await alignToMinute();
 	await sleep(55_000);
 	windows.push(await closeWindow("idle", start));
@@ -264,6 +283,9 @@ export async function C5(ctx: RunCtx): Promise<Result> {
 	const [body] = await freshNotes(ctx, "c5", 1, () => smallContent(5));
 	// Sockets never idle across a minute-alignment wait (see C2: an evicted base DO closes surviving sockets).
 	const windows: Win[] = [];
+	// Quiet gaps let the DO evict so each phase starts its own reporting period (see MB).
+	const quiet = ctx.num("quiet-gap-ms", 240_000);
+	await sleep(quiet);
 	let start = await alignToMinute();
 	await sleep(55_000);
 	windows.push(await closeWindow("idle", start));
@@ -284,6 +306,7 @@ export async function C5(ctx: RunCtx): Promise<Result> {
 	windows.push(await closeWindow("bursts", start, { edits: bursts * burstSize, bursts, opens: 2 }));
 	const d1 = await diagnostics(ctx.context.devices.A!);
 	await a.close(); await b.close();
+	await sleep(quiet);
 	start = await alignToMinute();
 	a = await openOrThrow(await ctx.client("A", body!, aDoc));
 	const catchupRows: Result[] = [];
@@ -470,13 +493,24 @@ export async function MB(ctx: RunCtx): Promise<Result> {
 	const effective = (d00.relay as { config?: Result } | undefined)?.config?.microbatchMs ?? null;
 	const windows: Win[] = [];
 	const parts: Result[] = [];
+	const trace = loadTrace();
+	// Create every body before the idle window: seeding writes rows, and a DO reporting period that begins in a
+	// gap minute is labelled with that minute and absorbs the following window's traffic (seen: stream rows = 0,
+	// stream traffic billed to the burst bucket).
+	const bodies: Record<string, string> = {};
+	for (const p of patterns) bodies[p] = p === "stream" ? await freshTraceBody(ctx, trace, "mb-stream") : (await freshNotes(ctx, `mb-${p}`, 1, () => smallContent(9)))[0]!;
+	// Quiet gap (no sockets, no requests) before the idle window and before every pattern, so the DO is evicted and
+	// its reporting period closes: a period spans pattern boundaries while the DO stays alive (seen: stream traffic
+	// in the burst bucket even with a 1-minute quiet gap).
+	const gapMs = ctx.num("quiet-gap-ms", 240_000);
+	await sleep(gapMs);
 	let start = await alignToMinute();
 	await sleep(55_000);
 	windows.push(await closeWindow("idle", start));
-	const trace = loadTrace();
 	const convs: Result[] = [];
 	for (const p of patterns) {
-		const body = p === "stream" ? await freshTraceBody(ctx, trace, "mb-stream") : (await freshNotes(ctx, `mb-${p}`, 1, () => smallContent(9)))[0]!;
+		const body = bodies[p]!;
+		if (p !== patterns[0]) await sleep(gapMs);
 		start = await alignToMinute();   // before opening: base closes sockets left idle across an eviction
 		const a = await openOrThrow(await ctx.client("A", body), 60_000);
 		const b = await openOrThrow(await ctx.client("B", body), 60_000);
@@ -499,6 +533,9 @@ export async function MB(ctx: RunCtx): Promise<Result> {
 		const drained = await drain(tracker);
 		tracker.stop();
 		const d1 = await diagnostics(ctx.context.devices.A!);
+		// Convergence and socket close stay inside the window (all of this pattern's DO activity is attributed here).
+		convs.push(await convergence({ bodyId: body, clients: [a, b], fresh: await ctx.dev("C"), adapter: ctx.adapter, settleMs: 30_000 }));
+		a.terminate(); b.terminate(); a.doc.destroy(); b.doc.destroy();
 		// Include the following minute (alarm checkpoints triggered by this pattern land there).
 		await sleep(60_000 - (Date.now() % 60_000) + 1500);
 		await sleep(55_000);
@@ -511,8 +548,6 @@ export async function MB(ctx: RunCtx): Promise<Result> {
 			relayRowsWrittenPerEdit: delta?.rowsWritten !== undefined ? r2(delta.rowsWritten / edits) : null,
 			relayAppendsPerEdit: delta?.appends !== undefined ? r2(delta.appends / edits) : null,
 			relayCounterDelta: delta, relayBodyAfter: relayBody(d2, body) });
-		convs.push(await convergence({ bodyId: body, clients: [a, b], fresh: await ctx.dev("C"), adapter: ctx.adapter, settleMs: 30_000 }));
-		a.terminate(); b.terminate(); a.doc.destroy(); b.doc.destroy();
 		log(`MB ${p}: edits=${edits} ${JSON.stringify(parts.at(-1)!.propagationMs)}`);
 	}
 	const gql = await gqlWindows(ctx, windows);
@@ -523,13 +558,22 @@ export async function MB(ctx: RunCtx): Promise<Result> {
 		part.gqlRowsWritten = perEdit(w, idle, Number(part.edits), "rowsWritten");
 		part.gqlCpuUs = perEdit(w, idle, Number(part.edits), "cpuTime");
 	}
+	// Run-level rows per edit (robust to bucket spill between adjacent pattern windows).
+	const active = g.filter((w) => w.name !== "idle" && !w.error);
+	const runRows = active.reduce((sum, w) => sum + Number((w.totals as Counters | undefined)?.rowsWritten ?? 0), 0);
+	const runMinutes = active.reduce((sum, w) => sum + Number(w.bucketMinutes ?? 0), 0);
+	const idleRowsPerMin = idle && !idle.error ? Number((idle.totals as Counters | undefined)?.rowsWritten ?? 0) / Math.max(1, Number(idle.bucketMinutes ?? 1)) : 0;
+	const runEdits = parts.reduce((sum, x) => sum + Number(x.edits), 0);
+	const runLevel = active.length ? { rowsWritten: runRows, idleRowsPerMinute: r2(idleRowsPerMin),
+		rowsPerEdit: runEdits ? r2((runRows - idleRowsPerMin * runMinutes) / runEdits) : null,
+		attributionSuspect: active.some((w) => w.attributionSuspect === true) } : null;
 	return { adapter: ctx.adapter.name, microbatch: { requested, effective,
 		clamped: requested !== null && effective !== null && Number(requested) !== Number(effective) },
 		relayConfig: (d00.relay as { config?: Result } | undefined)?.config ?? null,
 		table: parts.map((x) => ({ pattern: x.pattern, edits: x.edits, rowsPerEditGql: (x.gqlRowsWritten as Result | null)?.perEdit ?? null,
 			rowsPerEditRelayCounter: x.relayRowsWrittenPerEdit, propagationP50: (x.propagationMs as { summary: Result | null }).summary?.p50 ?? null,
 			propagationP90: (x.propagationMs as { summary: Result | null }).summary?.p90 ?? null })),
-		parts, windows, gql,
+		runLevel, parts, windows, gql,
 		convergence: { pass: convs.every((c) => c.pass === true), parts: convs } };
 }
 
