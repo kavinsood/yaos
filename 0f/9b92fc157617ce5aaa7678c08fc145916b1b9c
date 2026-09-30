@@ -1,0 +1,21 @@
+scripts/relay2/README.md
+  s_7b2ef493da42e9::t_d19af2c303ff07 172
+scripts/relay2/scenarios/extra.ts
+  s_7b2ef493da42e9::t_86fe5654bde5d8 101,107-109
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "0f9b92fc157617ce5aaa7678c08fc145916b1b9c",
+  "prompts": {},
+  "sessions": {
+    "s_7b2ef493da42e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aabf15f6ed7b647b5",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
