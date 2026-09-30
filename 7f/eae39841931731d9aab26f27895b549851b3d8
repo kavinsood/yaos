@@ -1,0 +1,39 @@
+scripts/relay2-core-alarmprobe.ts
+  s_3fa8c41e3d4d37::t_578eb4afdd79fd 1-108
+scripts/relay2-core-gapprobe.ts
+  s_3fa8c41e3d4d37::t_c0d4ba9004aa16 1-26
+scripts/relay2-core-keystrokefuzz.ts
+  s_3fa8c41e3d4d37::t_5dd4d93d4c9032 1-29
+scripts/relay2-core-smoke.ts
+  s_3fa8c41e3d4d37::t_e2c97ae94b0cb6 38-62,72-73,77
+server/src/relayBodies.ts
+  s_3fa8c41e3d4d37::t_e7e5becc638c9f 144-164,286-287,289-290,501,519,645-655,657-697,704,789,793,803,809-817,831-835,838-843,846,850,854-855,858-861,972,974-985,1054,1056-1068,1087,1232
+server/src/relayFlag.ts
+  s_3fa8c41e3d4d37::t_a66d552e066897 21-23,49-56,79-80,130-131
+server/src/server.ts
+  s_3fa8c41e3d4d37::t_b05d4b2d6676f4 220-222,247-251,846
+server/src/vaultCatalogStore.ts
+  s_3fa8c41e3d4d37::t_d9efa75bd586e1 782-809,827,838
+server/src/vaultSocketService.ts
+  s_3fa8c41e3d4d37::t_16f0d3ebe1ef06 613-616
+server/src/vaultStore.ts
+  s_3fa8c41e3d4d37::t_c30ec9069daa1e 225,236,323,560,757
+tests/server/relay2-server-core.ts
+  s_3fa8c41e3d4d37::t_0636c2699639d6 86,108-111,129,273-275,428,434,820,833,969-1038,1085-1189
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "7feae39841931731d9aab26f27895b549851b3d8",
+  "prompts": {},
+  "sessions": {
+    "s_3fa8c41e3d4d37": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a0da75a62b227384a",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
