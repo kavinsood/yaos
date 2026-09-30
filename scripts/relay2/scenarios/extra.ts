@@ -98,13 +98,15 @@ export async function gqlWindows(ctx: RunCtx, windows: Win[]): Promise<Result[] 
 	}
 	// A DO reporting period is emitted when it ends and is labelled with its start minute, so a bucket can grow
 	// after the last minute is visible (seen: a 6368-row bucket arriving minutes after the probe passed). Require the
-	// whole span's periodic totals to be unchanged across two queries 60 s apart.
+	// whole span's periodic totals and invocation counts to be unchanged across two queries 60 s apart.
 	const spanStart = windows[0]!.start, spanEnd = windows[windows.length - 1]!.end;
 	let stable = false, previous = "";
 	for (let attempt = 1; attempt <= attempts && probeReady; attempt++) {
 		try {
 			const q = await queryWindow(ctx.host, spanStart, spanEnd);
-			const sig = JSON.stringify(q.periodicMinutes.map((r) => [r.dimensions.datetimeMinute, r.dimensions.objectId, r.sum.rowsWritten, r.sum.cpuTime]));
+			// Invocation groups lag independently (seen: 105 of 305 hibernation invocations when periodic had settled).
+			const sig = JSON.stringify([q.periodicMinutes.map((r) => [r.dimensions.datetimeMinute, r.dimensions.objectId, r.sum.rowsWritten, r.sum.cpuTime]),
+				invocationSummary(q.invocations).map((g) => `${g.type}/${g.status}/${g.requests}`).sort()]);
 			if (sig === previous) { stable = true; break; }
 			previous = sig;
 		} catch (error) { log(`gql stability probe error: ${String(error).slice(0, 200)}`); }
