@@ -1,0 +1,19 @@
+scripts/relay2/runall.sh
+  s_7b2ef493da42e9::t_30be867c82b38d 72-73,202,206,214,261,265,267,269
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "276c16cdb5b68556523f14ddb5c823bca326c8fd",
+  "prompts": {},
+  "sessions": {
+    "s_7b2ef493da42e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aabf15f6ed7b647b5",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
