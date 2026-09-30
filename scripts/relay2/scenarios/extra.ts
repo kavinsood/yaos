@@ -83,10 +83,10 @@ export async function gqlWindows(ctx: RunCtx, windows: Win[]): Promise<Result[] 
 	const wait = lastEnd + settle - Date.now();
 	if (wait > 0) { log(`gql: waiting ${Math.round(wait / 1000)} s for analytics to settle`); await sleep(wait); }
 	// Analytics lag varies (a freshly deployed worker lagged > 5 min; a period is reported only when it ends, which
-	// for the last window can be > 10 min after it, seen on C2 with quiet gaps). Wait until the latest non-idle window's last
+	// for the last window can be > 20 min after it, seen on C2 with quiet gaps; gqlfill.ts backfills those later). Wait until the latest non-idle window's last
 	// minute bucket is present (up to --gql-attempts × 60 s), then query every window; an idle window with no DO
 	// activity legitimately has no buckets.
-	const attempts = ctx.num("gql-attempts", 20);
+	const attempts = ctx.num("gql-attempts", 8);
 	const probe = [...windows].reverse().find((w) => w.name !== "idle") ?? windows[windows.length - 1]!;
 	let probeReady = false;
 	for (let attempt = 1; attempt <= attempts; attempt++) {
@@ -251,18 +251,25 @@ export async function C2(ctx: RunCtx): Promise<Result> {
 		settleMs: 120_000, expectedTextSha: full ? trace.finalSha : undefined });
 	for (const c of [...senders, observer]) { c.terminate(); c.doc.destroy(); }
 	const gql = await gqlWindows(ctx, windows);
-	const g = Array.isArray(gql) ? gql : [];
-	const stream = g.find((w) => w.name === "stream"), idle = g.find((w) => w.name === "idle");
-	const wsInv = ((stream?.invocations as ReturnType<typeof invocationSummary> | undefined) ?? []).filter((x) => x.type === "hibernation");
-	return { trace: which, traceDir: trace.dir, rate, frames: sendTimes.length, clients: clientsN, bodyId: body, sendMs, drained, closedAt,
+	const out: Result = { trace: which, traceDir: trace.dir, rate, frames: sendTimes.length, clients: clientsN, bodyId: body, sendMs, drained, closedAt,
 		perFramePropagationMs: series(tracker.coveredMs, 0),
-		cpu: { perUpdateUsFromMinutes: perEdit(stream, idle, sendTimes.length, "cpuTime"),
-			wsMessageInvocationCpuUs: wsInv.map((x) => ({ status: x.status, requests: x.requests, ...x.cpuUs })),
-			note: "perUpdateUs = (stream-window cpuTime − idle cpuTime/min × minutes) / frames (µs, exact periodic analytics); invocation quantiles are adaptive-sampled per WS message event" },
-		rowsWritten: perEdit(stream, idle, sendTimes.length, "rowsWritten"),
-		inboundWsMessages: perEdit(stream, idle, sendTimes.length, "inboundWsEffective"),
 		relayCounterDelta: counterDelta(d0, d1), relayBody: relayBody(d1, body), windows, gql,
 		diagnostics: { before: d0, after: d1 }, convergence: conv };
+	return deriveC2(out);
+}
+
+/** gql-derived C2 fields (re-run by gqlfill.ts after a late backfill). */
+export function deriveC2(out: Result): Result {
+	const g = Array.isArray(out.gql) ? out.gql as Result[] : [];
+	const frames = Number(out.frames);
+	const stream = g.find((w) => w.name === "stream"), idle = g.find((w) => w.name === "idle");
+	const wsInv = ((stream?.invocations as ReturnType<typeof invocationSummary> | undefined) ?? []).filter((x) => x.type === "hibernation");
+	out.cpu = { perUpdateUsFromMinutes: perEdit(stream, idle, frames, "cpuTime"),
+		wsMessageInvocationCpuUs: wsInv.map((x) => ({ status: x.status, requests: x.requests, ...x.cpuUs })),
+		note: "perUpdateUs = (stream-window cpuTime − idle cpuTime/min × minutes) / frames (µs, exact periodic analytics); invocation quantiles are adaptive-sampled per WS message event" };
+	out.rowsWritten = perEdit(stream, idle, frames, "rowsWritten");
+	out.inboundWsMessages = perEdit(stream, idle, frames, "inboundWsEffective");
+	return out;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -328,7 +335,27 @@ export async function C5(ctx: RunCtx): Promise<Result> {
 	const conv = await convergence({ bodyId: body!, clients: [a, b], fresh: await ctx.dev("C"), adapter: ctx.adapter });
 	await a.close(); await b.close();
 	const gql = await gqlWindows(ctx, windows);
-	const g = Array.isArray(gql) ? gql : [];
+	const l5Path = ctx.str("l5");
+	let l5: Result | null = null;
+	if (l5Path) {
+		try {
+			const j = JSON.parse(readFileSync(l5Path, "utf8")) as { burst?: number; results: Record<string, { wirePerSample: Result }> };
+			l5 = { path: l5Path, burst: j.burst, byMode: Object.fromEntries(Object.entries(j.results).map(([m, r]) => [m, r.wirePerSample])) };
+		} catch (e) { l5 = { path: l5Path, error: String(e) }; }
+	}
+	return deriveC5({ bodyId: body, adapter: ctx.adapter.name, bursts, burstSize, burstIntervalMs: interval, burstGapMs: gap, catchups, catchupEdits,
+		clientWsMessagesPerEdit: ctx.adapter.name === "base" ? 1 : 2,
+		burstPropagationMs: burstProp, catchups: catchupRows,
+		catchupOpenMs: series(catchupRows.map((r) => r.openMs as number), 0),
+		relayCounterDelta: { bursts: counterDelta(d0, d1), catchups: counterDelta(d1, d2) },
+		l5Reference: l5, windows, gql, convergence: conv });
+}
+
+/** gql-derived C5 fields (re-run by gqlfill.ts after a late backfill). */
+export function deriveC5(out: Result): Result {
+	const g = Array.isArray(out.gql) ? out.gql as Result[] : [];
+	const bursts = Number(out.bursts);
+	const catchups = Array.isArray(out.catchups) ? out.catchups.length : Number(out.catchups);
 	const idle = g.find((w) => w.name === "idle"), bw = g.find((w) => w.name === "bursts"), cw = g.find((w) => w.name === "catchups");
 	const idlePerMin = (key: "httpRequests" | "inbound") => {
 		if (!idle || idle.error) return 0;
@@ -345,21 +372,8 @@ export async function C5(ctx: RunCtx): Promise<Result> {
 			outboundWsPerUnit: r2(outbound / units), doRequestUnitsPerUnit: r2((http + inbound / 20) / units),
 			rowsWrittenPerUnit: r2(Number((w.totals as Counters).rowsWritten ?? 0) / units) };
 	};
-	const l5Path = ctx.str("l5");
-	let l5: Result | null = null;
-	if (l5Path) {
-		try {
-			const j = JSON.parse(readFileSync(l5Path, "utf8")) as { burst?: number; results: Record<string, { wirePerSample: Result }> };
-			l5 = { path: l5Path, burst: j.burst, byMode: Object.fromEntries(Object.entries(j.results).map(([m, r]) => [m, r.wirePerSample])) };
-		} catch (e) { l5 = { path: l5Path, error: String(e) }; }
-	}
-	return { bodyId: body, adapter: ctx.adapter.name, bursts, burstSize, burstIntervalMs: interval, burstGapMs: gap, catchups, catchupEdits,
-		clientWsMessagesPerEdit: ctx.adapter.name === "base" ? 1 : 2,
-		derived: { perBurst: derive(bw, bursts, "burst"), perCatchup: derive(cw, catchups, "catch-up (reconnect + step1/step2)") },
-		burstPropagationMs: burstProp, catchups: catchupRows,
-		catchupOpenMs: series(catchupRows.map((r) => r.openMs as number), 0),
-		relayCounterDelta: { bursts: counterDelta(d0, d1), catchups: counterDelta(d1, d2) },
-		l5Reference: l5, windows, gql, convergence: conv };
+	out.derived = { perBurst: derive(bw, bursts, "burst"), perCatchup: derive(cw, catchups, "catch-up (reconnect + step1/step2)") };
+	return out;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -564,7 +578,17 @@ export async function MB(ctx: RunCtx): Promise<Result> {
 		log(`MB ${p}: edits=${edits} ${JSON.stringify(parts.at(-1)!.propagationMs)}`);
 	}
 	const gql = await gqlWindows(ctx, windows);
-	const g = Array.isArray(gql) ? gql : [];
+	return deriveMB({ adapter: ctx.adapter.name, microbatch: { requested, effective,
+		clamped: requested !== null && effective !== null && Number(requested) !== Number(effective) },
+		relayConfig: (d00.relay as { config?: Result } | undefined)?.config ?? null,
+		parts, windows, gql,
+		convergence: { pass: convs.every((c) => c.pass === true), parts: convs } });
+}
+
+/** gql-derived MB fields (re-run by gqlfill.ts after a late backfill). */
+export function deriveMB(out: Result): Result {
+	const g = Array.isArray(out.gql) ? out.gql as Result[] : [];
+	const parts = (out.parts as Result[] | undefined) ?? [];
 	const idle = g.find((w) => w.name === "idle");
 	for (const part of parts) {
 		const w = g.find((x) => x.name === part.pattern);
@@ -577,17 +601,13 @@ export async function MB(ctx: RunCtx): Promise<Result> {
 	const runMinutes = active.reduce((sum, w) => sum + Number(w.bucketMinutes ?? 0), 0);
 	const idleRowsPerMin = idle && !idle.error ? Number((idle.totals as Counters | undefined)?.rowsWritten ?? 0) / Math.max(1, Number(idle.bucketMinutes ?? 1)) : 0;
 	const runEdits = parts.reduce((sum, x) => sum + Number(x.edits), 0);
-	const runLevel = active.length ? { rowsWritten: runRows, idleRowsPerMinute: r2(idleRowsPerMin),
+	out.runLevel = active.length ? { rowsWritten: runRows, idleRowsPerMinute: r2(idleRowsPerMin),
 		rowsPerEdit: runEdits ? r2((runRows - idleRowsPerMin * runMinutes) / runEdits) : null,
 		attributionSuspect: active.some((w) => w.attributionSuspect === true) } : null;
-	return { adapter: ctx.adapter.name, microbatch: { requested, effective,
-		clamped: requested !== null && effective !== null && Number(requested) !== Number(effective) },
-		relayConfig: (d00.relay as { config?: Result } | undefined)?.config ?? null,
-		table: parts.map((x) => ({ pattern: x.pattern, edits: x.edits, rowsPerEditGql: (x.gqlRowsWritten as Result | null)?.perEdit ?? null,
-			rowsPerEditRelayCounter: x.relayRowsWrittenPerEdit, propagationP50: (x.propagationMs as { summary: Result | null }).summary?.p50 ?? null,
-			propagationP90: (x.propagationMs as { summary: Result | null }).summary?.p90 ?? null })),
-		runLevel, parts, windows, gql,
-		convergence: { pass: convs.every((c) => c.pass === true), parts: convs } };
+	out.table = parts.map((x) => ({ pattern: x.pattern, edits: x.edits, rowsPerEditGql: (x.gqlRowsWritten as Result | null)?.perEdit ?? null,
+		rowsPerEditRelayCounter: x.relayRowsWrittenPerEdit, propagationP50: (x.propagationMs as { summary: Result | null }).summary?.p50 ?? null,
+		propagationP90: (x.propagationMs as { summary: Result | null }).summary?.p90 ?? null }));
+	return out;
 }
 
 // ---------------------------------------------------------------------------------------------------------------

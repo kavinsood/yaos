@@ -27,7 +27,7 @@
 #            + K1 alarm on a default-knob relay worker
 #   g-mb     MB sweep: base, relay mb0 (adapters relay and relay-nocand), relay YAOS_RELAY_MICROBATCH_MS=10/50/100/250
 #            (values above the deployed cap are recorded as "clamped" in the JSON)
-#   final    convergence suite summary (scripts/relay2/convergence.ts → $RAW/convergence-suite.json)
+#   final    gql backfill (scripts/relay2/gqlfill.ts) + convergence suite summary (scripts/relay2/convergence.ts → $RAW/convergence-suite.json)
 #
 # Latency scenarios run strictly one at a time; within each pair the order alternates (base first on even steps,
 # relay first on odd) and every choice is appended to $RAW/runall-manifest.jsonl with start/end/status.
@@ -244,6 +244,10 @@ if want g-mb; then
 fi
 
 if want final; then
+  # Late gql backfill: the last window of a C2/C5/MB run can take > 20 min to appear in analytics.
+  say "gql backfill (C2/C5/MB windows still incomplete)"
+  (( DRY )) || (cd $TREE && RELAY2_WORKTREE=$TREE node tests/run-typescript.mjs --test-aliases scripts/relay2/gqlfill.ts --dir $RAW --gql-attempts 30) \
+    >> $LOGS/gqlfill.log 2>&1 || say "gql backfill left incomplete windows (see $LOGS/gqlfill.log; rerun --only final later)"
   say "convergence suite"
   (( DRY )) || (cd $TREE && node tests/run-typescript.mjs --test-aliases scripts/relay2/convergence.ts --dir $RAW --out $RAW/convergence-suite.json) | tee -a $LOGS/runall.log
 fi
