@@ -533,6 +533,16 @@ export async function MB(ctx: RunCtx): Promise<Result> {
 		const drained = await drain(tracker);
 		tracker.stop();
 		const d1 = await diagnostics(ctx.context.devices.A!);
+		// Client-side receipts (a stalled/closed origin socket vs. a server that never relayed): see lost > 0.
+		const clientSide = Object.fromEntries([["A", a], ["B", b]].map(([k, c]) => {
+			const cl = c as typeof a;
+			const acked = new Set(cl.acks.map((x) => x.frameId).filter(Boolean));
+			const unacked = cl.sent.filter((f) => !acked.has(f.clientFrameId));
+			const echo = cl.adapter.requireEcho === true;   // base acks carry no frame id
+			return [k as string, { framesOut: cl.framesOut, sent: cl.sent.length, acks: cl.acks.length, unacked: echo ? unacked.length : null,
+				firstUnackedAtMs: echo && unacked[0] ? r2(unacked[0].at - cl.openAt) : null, updatesIn: cl.updatesIn,
+				rejects: cl.rejects.slice(0, 5).map((x) => x.value), rejectCount: cl.rejects.length, closed: cl.closed }];
+		}));
 		// Convergence and socket close stay inside the window (all of this pattern's DO activity is attributed here).
 		convs.push(await convergence({ bodyId: body, clients: [a, b], fresh: await ctx.dev("C"), adapter: ctx.adapter, settleMs: 30_000 }));
 		a.terminate(); b.terminate(); a.doc.destroy(); b.doc.destroy();
@@ -547,7 +557,7 @@ export async function MB(ctx: RunCtx): Promise<Result> {
 			sequenceDelta: Number(d1.sequence) - Number(d0.sequence),
 			relayRowsWrittenPerEdit: delta?.rowsWritten !== undefined ? r2(delta.rowsWritten / edits) : null,
 			relayAppendsPerEdit: delta?.appends !== undefined ? r2(delta.appends / edits) : null,
-			relayCounterDelta: delta, relayBodyAfter: relayBody(d2, body) });
+			relayCounterDelta: delta, relayBodyAfter: relayBody(d2, body), clientSide });
 		log(`MB ${p}: edits=${edits} ${JSON.stringify(parts.at(-1)!.propagationMs)}`);
 	}
 	const gql = await gqlWindows(ctx, windows);
