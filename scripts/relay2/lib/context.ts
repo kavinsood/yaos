@@ -77,6 +77,19 @@ async function recoverClaim(host: string, operatorRecoveryKey: string): Promise<
 	const state = await json(await fetch(`${host}/operator/state`, { headers: { Cookie: cookie } }));
 	const vaultId = findVaultId(Array.isArray(state?.vaults) && state.vaults.length === 1 ? state.vaults[0] : null);
 	if (!vaultId) return null;
+	// A claim that answered 503 vault_provisioning_failed leaves the vault in "provisioning" (retryable):
+	// re-run provisioning through the operator route until it is active, otherwise enroll answers 409 vault_not_active.
+	for (let attempt = 0; attempt < 6; attempt++) {
+		const provision = await fetch(`${host}/operator/vaults/${encodeURIComponent(vaultId)}/provision`, { method: "POST",
+			headers: { Cookie: cookie, "Content-Type": "application/json" }, body: "{}" });
+		const value = await json(provision);
+		if (provision.ok) {
+			log(`vault provisioning ${attempt === 0 ? "confirmed" : "completed on retry " + attempt} (state ${String(value?.vault?.state ?? "?")})`);
+			break;
+		}
+		log(`operator provision retry ${attempt + 1} returned ${provision.status} (${String(value?.error ?? "")}: ${String(value?.message ?? "").slice(0, 120)})`);
+		await sleep(3000 * (attempt + 1));
+	}
 	const code = await json(await fetch(`${host}/operator/vaults/${encodeURIComponent(vaultId)}/owner-code`, { method: "POST",
 		headers: { Cookie: cookie, "Content-Type": "application/json" }, body: JSON.stringify({ purpose: "owner-bootstrap" }) }));
 	if (typeof code?.pairingCode !== "string") return null;
@@ -95,7 +108,7 @@ export async function claim(host: string, deviceNames = ["A", "B"]): Promise<Con
 	if (!claimResponse.ok || typeof claimed?.vaultId !== "string" || typeof claimed.pairingCode !== "string") {
 		// A just-deployed worker has answered 503 while still committing the claim (the next capabilities probe
 		// says claimed=true). If our recovery key logs in, the claim is ours: mint an owner-bootstrap code.
-		log(`claim returned ${claimResponse.status} (${String(claimed?.error ?? "")}); checking whether it committed`);
+		log(`claim returned ${claimResponse.status} (${String(claimed?.error ?? "")}${claimed?.message ? ": " + String(claimed.message).slice(0, 160) : ""}); checking whether it committed`);
 		claimed = null;
 		for (let attempt = 0; attempt < 6 && !claimed; attempt++) {
 			await sleep(3000 * (attempt + 1));
