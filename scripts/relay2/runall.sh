@@ -69,6 +69,8 @@ PRIMARY_VARS=(--var YAOS_RELAY_LEAN_ROWS=true --var YAOS_RELAY_MICROBATCH_MS=10)
 STRICT_VARS=(--var YAOS_RELAY_LEAN_ROWS=false --var YAOS_RELAY_MICROBATCH_MS=0)
 K1_VARS=(--var YAOS_RELAY_CHECKPOINT_ENTRIES=1000000 --var YAOS_RELAY_CHECKPOINT_BYTES=1073741824 --var YAOS_RELAY_CHECKPOINT_MAX_ROWS=100000)
 STEP=0
+# Smoke mode: shorter quiet gaps (gql attribution is not the point of a smoke) and an MB subset (worker-count cap).
+QG=(); (( SMALL )) && QG=(--quiet-gap-ms 90000)
 
 say() { print -r -- "[runall $(date -u +%H:%M:%S)] $*" | tee -a $LOGS/runall.log; }
 want() { [[ -z $ONLY || ",$ONLY," == *",$1,"* ]]; }
@@ -197,11 +199,11 @@ if want g-cpu; then
     inert cpu
     trio C1 cpu --n $(n 40 12) --tail
     for v in base relay strict; do ad=$v; [[ $v == strict ]] && ad=relay
-      run C2-quick-$v "${BENCH[@]}" C2 --host $(host cpu-$v) --adapter $ad --trace quick --n $(n 5000 300) --tail; done
+      run C2-quick-$v "${BENCH[@]}" C2 --host $(host cpu-$v) --adapter $ad --trace quick --n $(n 5000 300) --tail "${QG[@]}"; done
     trio C4 cpu --n $(n 50 10) --reconnects $(n 20 4)
     for v in base relay; do
       l5=$RAW/L5b8-$v.json
-      run C5-$v "${BENCH[@]}" C5 --host $(host cpu-$v) --adapter $v --n $(n 40 4) --catchups $(n 20 3) $( [[ -f $l5 ]] && print -- --l5 $l5)
+      run C5-$v "${BENCH[@]}" C5 --host $(host cpu-$v) --adapter $v --n $(n 40 4) --catchups $(n 20 3) "${QG[@]}" $( [[ -f $l5 ]] && print -- --l5 $l5)
     done
   }
 fi
@@ -209,7 +211,7 @@ fi
 if want g-stress; then
   setup_base stress && setup_relay stress && setup_strict stress && {
     for v in base relay strict; do ad=$v; [[ $v == strict ]] && ad=relay
-      run C2-stress-$v "${BENCH[@]}" C2 --host $(host stress-$v) --adapter $ad --trace stress --clients 5 --n $(n 50000 500); done
+      run C2-stress-$v "${BENCH[@]}" C2 --host $(host stress-$v) --adapter $ad --trace stress --clients 5 --n $(n 50000 500) "${QG[@]}"; done
   }
 fi
 
@@ -256,14 +258,15 @@ fi
 
 if want g-mb; then
   secs=$(n 110 30)
-  setup_base mb && run MB-base "${BENCH[@]}" MB --host $(host mb-base) --adapter base --pattern-seconds $secs
+  setup_base mb && run MB-base "${BENCH[@]}" MB --host $(host mb-base) --adapter base --pattern-seconds $secs "${QG[@]}"
   for lean in true false; do
     lt=lean; [[ $lean == false ]] && lt=full
     for ms in 0 10 50 100 250; do
+      (( SMALL )) && [[ $lt-$ms != lean-10 && $lt-$ms != full-0 ]] && continue
       setup mb$ms-$lt on --var YAOS_RELAY_LEAN_ROWS=$lean --var YAOS_RELAY_MICROBATCH_MS=$ms || continue
-      run MB-relay-$lt-mb$ms "${BENCH[@]}" MB --host $(host mb$ms-$lt) --adapter relay --pattern-seconds $secs
+      run MB-relay-$lt-mb$ms "${BENCH[@]}" MB --host $(host mb$ms-$lt) --adapter relay --pattern-seconds $secs "${QG[@]}"
       if [[ $lt == lean && $ms == 10 ]]; then
-        run MB-relay-nocand-$lt-mb$ms "${BENCH[@]}" MB --host $(host mb$ms-$lt) --adapter relay-nocand --pattern-seconds $secs
+        run MB-relay-nocand-$lt-mb$ms "${BENCH[@]}" MB --host $(host mb$ms-$lt) --adapter relay-nocand --pattern-seconds $secs "${QG[@]}"
       fi
     done
   done
