@@ -1,0 +1,21 @@
+scripts/relay2/lib/context.ts
+  s_7b2ef493da42e9::t_a72070ae9a49eb 80-92,111
+scripts/relay2/summarize.py
+  s_7b2ef493da42e9::t_3f1ae6150a5a62 1-551
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "66fb78cc74244f56b0fabff324110c614022c8f3",
+  "prompts": {},
+  "sessions": {
+    "s_7b2ef493da42e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aabf15f6ed7b647b5",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
