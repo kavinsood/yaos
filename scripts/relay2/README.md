@@ -186,3 +186,17 @@ zsh scripts/relay2/runall.sh --sha <commit> [--tag rMMDD] [--only g-lat,g-mb,...
   - Outputs go to `results/relay2/raw/` and the manifest to `raw/runall-manifest.jsonl`. Logs go to `logs/relay2/runall-<tag>/`.
   - `--small` writes under `logs/relay2/runall-<tag>-small/` at small n.
   - The final step runs `convergence.ts`.
+- **Round-4 configurations (full run).** `relay` is the production candidate: `YAOS_RELAY_BODIES=true`, `YAOS_RELAY_LEAN_ROWS=true` and `YAOS_RELAY_MICROBATCH_MS=10`. `strict` is `YAOS_RELAY_BODIES=true` with lean off and mb 0; it runs for L2, L4, C1, C2 (quick and stress), C4, B7 and X2. `base` is the flag off with the same lean and mb vars. The `INERT-*-base` diag runs are the evidence that those vars do nothing with the flag off. The MB sweep runs lean on/off × mb 0/10/50/100/250 (`MB-relay-<lean|full>-mb<ms>`), plus `relay-nocand` on the primary config. `final` writes `convergence-suite.json` for relay, and `convergence-suite-<strict|base>.json` for the other two.
+- **Resilient raw client (round 3).** Data-path scenarios, meaning everything except B1–B8, X1, X3, X4, C3 and `diag` (`RESILIENT_OFF` in `lib/run.ts`), use clients with `reconnect=true`:
+  - **Reconnect.** On any close the client did not initiate, it reconnects with backoff. The exceptions are 4409, 4403, 1008 and 1009, where a resend cannot help.
+  - **Resync.** After reconnecting, the client resyncs: it sends its step1, and its step2 answers the server's step1.
+  - **Resend.** Relay resends every unacked frame with its original envelope and `clientFrameId`, so candidate dedupe re-acks it. Base flushes the frames it queued while not open.
+  - **No silent skips.** A send while not open is queued (`queuedWhileClosed`). A non-resilient client counts it in `droppedWhileClosed`.
+  - **Logging.** Every close is recorded with its code, reason, time and origin (`cloudflare-platform` for a 1013 that is not ours). Errors, including `VAULT_ERROR` and `BODY_UPDATE_REJECTED`, and reconnects are recorded too. They land in `connectionEvents` in every JSON and under `convergence.connections`.
+  - **Failed convergence.** A failed convergence sets `connectionLoss` and `failureCause`.
+- **Frame accounting (round 4 counters).** `frameOutcomes` in L4, C2, C4 and MB parts holds:
+  - the diagnostics delta of the no-silent-drops outcome counters;
+  - `sumEqualsUpdateFrames`: whether the outcomes sum to `updateFrames`;
+  - `updateFramesEqualsClientFrames`: whether `updateFrames` equals the number of non-empty update/step2 frames our clients wrote, resends included.
+
+  The delta is `null` when the DO restarted in the window (`counterResetInWindow`) and `available:false` on base.

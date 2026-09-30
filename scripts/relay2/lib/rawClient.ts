@@ -13,7 +13,7 @@ import { PROTOCOL_VERSION, SCHEMA_VERSION } from "../../../src/sync/schema";
 import { canonicalMarkdownBytes } from "../../../server/src/shared/markdownCodec";
 import { vaultRoute } from "../../../tests/live/schema4Live";
 import { fetchSocketTicket, type LiveIdentity } from "../../../tests/live/liveIdentity";
-import { now, r2 } from "./common";
+import { now, r2, sleep } from "./common";
 
 export type Control = Record<string, unknown>;
 
@@ -107,6 +107,34 @@ function rawBytes(data: RawData): Uint8Array {
 
 export type OpenResult = { status: "ok" } | { status: "error"; httpStatus?: number; message: string };
 
+/** `[0,0]`: an empty Yjs v1 update (handshake step2 with nothing missing); the server skips it without counting. */
+function isEmptyUpdate(update: Uint8Array) { return update.byteLength === 0 || (update.byteLength === 2 && update[0] === 0 && update[1] === 0); }
+
+/**
+ * Close codes after which a resilient client does NOT reconnect: the server refused this client/frame
+ * for a reason a resend cannot fix (epoch fence, authority, too large, body inactive / socket authority).
+ */
+const TERMINAL_CLOSE_CODES = new Set([4409, 4403, 1008, 1009]);
+
+/** Our (server) 1013 reasons; any other 1013 (e.g. "Service overloaded", empty) is Cloudflare platform shedding. */
+const SERVER_1013_REASONS = ["relay rate limit", "semantic compaction pressure", "body cache budget exceeded", "pending durability budget exceeded"];
+export function closeOrigin(code: number, reason: string): string {
+	if (code === 1013) return SERVER_1013_REASONS.some((r) => reason.includes(r)) ? "server-backpressure" : "cloudflare-platform";
+	if (code === 1011) return reason.includes("relay frame error") ? "server-frame-error" : "server-internal";
+	if (code === 1006) return "abnormal (no close frame)";
+	if (code === 4409) return "epoch-fence";
+	if (code === 4403) return "authority";
+	if (code === 1009) return "too-large";
+	if (code === 1008) return "policy (body inactive / socket authority)";
+	if (code === 1000 || code === 1005) return "normal";
+	return "other";
+}
+
+type OutFrame = { clientFrameId: string; kind: "update" | "step2"; texts: string[]; frame: Uint8Array; nonEmpty: boolean; createdAt: number };
+
+/** Every RawClient created in this process (connection-event report for the scenario JSON). */
+export const ALL_CLIENTS: RawClient[] = [];
+
 export class RawClient {
 	socket!: WebSocket;
 	bytesIn = 0;
@@ -131,7 +159,7 @@ export class RawClient {
 	step2Bytes = 0;
 	runtimeEpoch: unknown = null;
 	controls: Array<{ at: number; value: Control }> = [];
-	sent: Array<{ at: number; clientFrameId: string; kind: SyncKind; bytes: number }> = [];
+	sent: Array<{ at: number; clientFrameId: string; kind: SyncKind; bytes: number; resend?: boolean }> = [];
 	updateListeners: Array<(at: number, update: Uint8Array) => void> = [];
 	controlListeners: Array<(value: Control, at: number) => void> = [];
 	/** Acks (per adapter) with arrival time and echoed frame id. */
@@ -142,6 +170,31 @@ export class RawClient {
 	/** When false, local doc updates are not forwarded (used for offline edits). */
 	forwardLocal = true;
 	keepControls = true;
+	/**
+	 * Resilient mode (round 3): on an unexpected close, reconnect with backoff, resync (our step1 + our step2
+	 * answering the server step1), then resend every unacked frame (relay: original envelope + bytes, same
+	 * clientFrameId, so candidate dedupe re-acks it) or every frame queued while not open (base). Frames are
+	 * never silently skipped: while not open they are queued (resilient) or counted in `droppedWhileClosed`.
+	 */
+	reconnect = false;
+	maxReconnectAttempts = 30;
+	/** Every socket close (client- or server-initiated) with its time and connection number. */
+	closeLog: Array<{ conn: number; code: number; reason: string; at: number; wall: number; byClient: boolean; origin: string }> = [];
+	/** Socket/open errors and VAULT_ERROR / BODY_UPDATE_REJECTED controls. */
+	errorLog: Array<{ conn: number; at: number; wall: number; message: string }> = [];
+	reconnects: Array<{ afterCode: number; at: number; wall: number; ok: boolean; attempts: number; ms: number; resent: number; error?: string }> = [];
+	/** Relay: sent-but-unacked frames (insertion order). Base: frames queued while not open. */
+	private outbox = new Map<string, OutFrame>();
+	connectionNo = 0;
+	/** Non-empty update/step2 frames actually written to a socket (incl. resends): compare with server `updateFrames`. */
+	nonEmptyFramesSent = 0;
+	updateFramesSent = 0;
+	resentFrames = 0;
+	queuedWhileClosed = 0;
+	droppedWhileClosed = 0;
+	lastFrame: { clientFrameId: string; at: number; queued: boolean } | null = null;
+	private userClosing = false;
+	private reconnectPromise: Promise<boolean> | null = null;
 
 	constructor(
 		readonly identity: LiveIdentity,
@@ -152,9 +205,17 @@ export class RawClient {
 	) {
 		doc.on("update", (update: Uint8Array, origin: unknown) => {
 			if (origin === this || !this.forwardLocal) return;
-			if (this.socket?.readyState === WebSocket.OPEN) this.sendUpdate(update);
+			// Never skip silently: sendSyncFrame queues (resilient) or counts the drop when not open.
+			if (this.socket) this.sendUpdate(update);
 		});
+		ALL_CLIENTS.push(this);
 	}
+
+	/** Frames awaiting an echoed ack (relay) or queued for the next connection (base). */
+	get unacked() { return this.outbox.size; }
+	get reconnecting() { return this.reconnectPromise !== null; }
+	/** Resolves when an in-flight reconnect finishes (true = open). */
+	async settled(): Promise<boolean> { return this.reconnectPromise ? this.reconnectPromise : this.isOpen; }
 
 	get isOpen() { return this.socket?.readyState === WebSocket.OPEN; }
 
@@ -169,12 +230,81 @@ export class RawClient {
 	/** Send a pre-encoded sync frame carrying `update`, preceded by the adapter's envelope. */
 	sendSyncFrame(kind: "update" | "step2", update: Uint8Array, frame: Uint8Array): string {
 		const clientFrameId = `f-${randomBytes(6).toString("hex")}`;
-		for (const text of this.adapter.envelope(this, { kind, update, clientFrameId, text: this.text() })) this.send(text);
-		this.sent.push({ at: now(), clientFrameId, kind, bytes: frame.byteLength });
-		if (this.sent.length > 20_000) this.sent.splice(0, 10_000);
-		this.send(frame);
+		const texts = this.adapter.envelope(this, { kind, update, clientFrameId, text: this.text() });
+		const out: OutFrame = { clientFrameId, kind, texts, frame, nonEmpty: !isEmptyUpdate(update), createdAt: now() };
+		const tracked = this.adapter.requireEcho === true;
+		if (!this.isOpen) {
+			// A handshake step2 is regenerated by the next connection's resync; only updates are queued.
+			if (kind === "update" && (this.reconnect || this.reconnectPromise)) {
+				this.outbox.set(clientFrameId, out);
+				this.queuedWhileClosed++;
+				this.lastFrame = { clientFrameId, at: out.createdAt, queued: true };
+			} else if (kind === "update") this.droppedWhileClosed++;
+			return clientFrameId;
+		}
+		if (tracked && out.nonEmpty) this.outbox.set(clientFrameId, out);
+		this.writeFrame(out, false);
 		return clientFrameId;
 	}
+
+	private writeFrame(out: OutFrame, resend: boolean) {
+		for (const text of out.texts) this.send(text);
+		const at = now();
+		this.sent.push({ at, clientFrameId: out.clientFrameId, kind: out.kind, bytes: out.frame.byteLength, ...(resend ? { resend: true } : {}) });
+		if (this.sent.length > 20_000) this.sent.splice(0, 10_000);
+		this.send(out.frame);
+		this.updateFramesSent++;
+		if (out.nonEmpty) this.nonEmptyFramesSent++;
+		if (resend) this.resentFrames++;
+		else this.lastFrame = { clientFrameId: out.clientFrameId, at, queued: false };
+	}
+
+	/** After a (re)connect: relay resends unacked frames (same ids); base flushes frames queued while closed. */
+	private flushOutbox(): number {
+		const tracked = this.adapter.requireEcho === true;
+		const frames = [...this.outbox.values()];
+		if (!tracked) this.outbox.clear();
+		for (const f of frames) { if (!this.isOpen) break; this.writeFrame(f, true); }
+		return frames.length;
+	}
+
+	private scheduleReconnect(code: number) {
+		if (this.reconnectPromise) return;
+		const started = now();
+		this.reconnectPromise = (async () => {
+			let attempts = 0;
+			let lastError = "";
+			while (!this.userClosing && attempts < this.maxReconnectAttempts) {
+				attempts++;
+				// Platform shedding / our backpressure: back off longer.
+				const base = code === 1013 ? 1000 : 250;
+				await sleep(Math.min(base * 2 ** Math.min(attempts - 1, 5), 8000));
+				if (this.userClosing) break;
+				const o = await this.openSocket(30_000);
+				if (o.status === "ok") {
+					const resent = this.flushOutbox();
+					this.reconnects.push({ afterCode: code, at: r2(now()), wall: Date.now(), ok: true, attempts, ms: r2(now() - started), resent });
+					return true;
+				}
+				lastError = o.message.slice(0, 200);
+				if (this.closed && TERMINAL_CLOSE_CODES.has(this.closed.code)) break;
+			}
+			this.reconnects.push({ afterCode: code, at: r2(now()), wall: Date.now(), ok: false, attempts, ms: r2(now() - started), resent: 0, error: lastError || (this.userClosing ? "closed by client" : "gave up") });
+			return false;
+		})().finally(() => { this.reconnectPromise = null; });
+	}
+
+	/** Connection events for the scenario JSON. */
+	connectionReport() {
+		return { body: this.body, device: this.identity.deviceId, adapter: this.adapter.name, connections: this.connectionNo,
+			closes: this.closeLog, errors: this.errorLog.slice(0, 50), errorCount: this.errorLog.length, reconnects: this.reconnects,
+			unacked: this.adapter.requireEcho === true ? this.outbox.size : null, queuedForNextConnection: this.adapter.requireEcho === true ? null : this.outbox.size,
+			updateFramesSent: this.updateFramesSent, nonEmptyFramesSent: this.nonEmptyFramesSent, resentFrames: this.resentFrames,
+			queuedWhileClosed: this.queuedWhileClosed, droppedWhileClosed: this.droppedWhileClosed };
+	}
+
+	/** True when this client lost its connection other than by its own close(). */
+	get lostConnection() { return this.closeLog.some((c) => !c.byClient) || this.droppedWhileClosed > 0; }
 
 	send(data: Uint8Array | string) {
 		this.bytesOut += typeof data === "string" ? Buffer.byteLength(data) : data.byteLength;
@@ -189,6 +319,13 @@ export class RawClient {
 
 	/** Resolves once VAULT_READY and the server's step2 (answer to our step1) have arrived. */
 	async open(timeoutMs = 20_000): Promise<OpenResult> {
+		this.userClosing = false;
+		const o = await this.openSocket(timeoutMs);
+		if (o.status === "ok" && this.reconnect && this.outbox.size > 0) this.flushOutbox();
+		return o;
+	}
+
+	private async openSocket(timeoutMs: number): Promise<OpenResult> {
 		this.startedAt = now();
 		this.closed = null;
 		this.readyAt = 0;
@@ -206,7 +343,9 @@ export class RawClient {
 		url.searchParams.set("schemaVersion", String(SCHEMA_VERSION));
 		url.searchParams.set("protocolVersion", String(PROTOCOL_VERSION));
 		this.adapter.socketParams?.(url);
-		this.socket = new WebSocket(url.toString());
+		const conn = ++this.connectionNo;
+		const socket = new WebSocket(url.toString());
+		this.socket = socket;
 		return new Promise((resolve) => {
 			let done = false;
 			const finish = (v: OpenResult) => { if (done) return; done = true; clearTimeout(timer); resolve(v); };
@@ -225,11 +364,19 @@ export class RawClient {
 				res.on("data", (c: Buffer) => { body += c.toString(); });
 				res.on("end", () => finish({ status: "error", httpStatus: res.statusCode, message: body.slice(0, 300) }));
 			});
-			this.socket.on("error", (error) => finish({ status: "error", message: String(error) }));
+			this.socket.on("error", (error) => {
+				this.errorLog.push({ conn, at: r2(now()), wall: Date.now(), message: String(error).slice(0, 300) });
+				finish({ status: "error", message: String(error) });
+			});
 			this.socket.on("close", (code, reason) => {
-				this.closed = { code, reason: reason.toString(), at: now(), wall: Date.now() };
-				for (const l of this.closeListeners) l(code, reason.toString());
+				const text = reason.toString();
+				this.closed = { code, reason: text, at: now(), wall: Date.now() };
+				const byClient = this.userClosing;
+				this.closeLog.push({ conn, code, reason: text, at: r2(this.closed.at), wall: this.closed.wall, byClient, origin: closeOrigin(code, text) });
+				for (const l of this.closeListeners) l(code, text);
 				finish({ status: "error", message: `closed ${code} ${reason}` });
+				// Only the current socket drives reconnects (an old socket closing late must not).
+				if (socket === this.socket && done && this.reconnect && !byClient && !TERMINAL_CLOSE_CODES.has(code) && this.readyAt) this.scheduleReconnect(code);
 			});
 			this.socket.on("message", (data, isBinary) => {
 				const at = now();
@@ -244,13 +391,16 @@ export class RawClient {
 					try { value = JSON.parse(text.slice(6)); } catch { return; }
 					if (this.keepControls) this.controls.push({ at, value });
 					if (this.controls.length > 20_000) this.controls.splice(0, 10_000);
-					if (value.type === "BODY_UPDATE_REJECTED" || value.type === "VAULT_BACKPRESSURE" || value.type === "error") {
+					if (value.type === "BODY_UPDATE_REJECTED" || value.type === "VAULT_BACKPRESSURE" || value.type === "error" || value.type === "VAULT_ERROR") {
 						this.rejects.push({ at, value });
+						if (value.type !== "VAULT_BACKPRESSURE") this.errorLog.push({ conn, at: r2(at), wall: Date.now(), message: JSON.stringify(value).slice(0, 300) });
 						if (this.rejects.length > 5000) this.rejects.splice(0, 2500);
 					}
 					if (value.type === "VAULT_READY") { this.readyAt = at; this.runtimeEpoch = value.runtimeEpoch ?? null; }
 					if (this.adapter.isAck(value, this)) {
-						this.acks.push({ at, frameId: this.adapter.ackFrameId(value), value });
+						const fid = this.adapter.ackFrameId(value);
+						if (fid) this.outbox.delete(fid);
+						this.acks.push({ at, frameId: fid, value });
 						if (this.acks.length > 20_000) this.acks.splice(0, 10_000);
 					}
 					for (const l of [...this.controlListeners]) l(value, at);
@@ -311,6 +461,7 @@ export class RawClient {
 	}
 
 	async close() {
+		this.userClosing = true;
 		if (!this.socket || this.socket.readyState === WebSocket.CLOSED) return;
 		await new Promise<void>((resolve) => {
 			const t = setTimeout(() => { this.socket.terminate(); resolve(); }, 500);
@@ -319,7 +470,7 @@ export class RawClient {
 		});
 	}
 
-	terminate() { this.socket?.terminate(); }
+	terminate() { this.userClosing = true; this.socket?.terminate(); }
 
 	waitUpdate(timeoutMs: number): Promise<number | null> {
 		return new Promise((resolve) => {
@@ -342,10 +493,11 @@ export class RawClient {
 
 	/** Local edit (sent via the doc listener); returns the frame id and send time. */
 	editTracked(fn: (text: Y.Text) => void): { frameId: string; sentAt: number } {
-		const before = this.sent.length;
+		const before = this.lastFrame;
 		this.edit(fn);
-		const last = this.sent.at(-1);
-		if (this.sent.length === before || !last) throw new Error("edit produced no frame (socket closed?)");
+		const last = this.lastFrame;
+		// A frame queued during a reconnect counts from its creation (latency includes the outage).
+		if (!last || last === before) throw new Error(`edit produced no frame (socket closed; dropped=${this.droppedWhileClosed})`);
 		return { frameId: last.clientFrameId, sentAt: last.at };
 	}
 

@@ -31,15 +31,24 @@ export interface RunCtx {
 	notes: string[];
 }
 
+/** Scenarios whose clients must NOT auto-reconnect (they test closes/refusals and reopen explicitly). */
+export const RESILIENT_OFF = new Set(["B1", "B2", "B3", "B4", "B6", "B7", "B8", "X1", "X3", "X4", "C3", "diag"]);
+
 export function makeCtx(host: string, context: Context, args: Args, adapter: ProtocolAdapter, scenario: string): RunCtx {
 	const tag = `${scenario.toLowerCase()}-${Date.now().toString(36)}`;
+	// Data-path scenarios reconnect+resend on connection loss; behaviour/limit probes observe closes themselves.
+	const resilient = args.flags["no-reconnect"] ? false : !RESILIENT_OFF.has(scenario);
 	const ctx: RunCtx = {
 		host, context, args, adapter, scenario, tag, notes: [],
 		n: (fallback) => flagNum(args, "n", fallback),
 		num: (name, fallback) => flagNum(args, name, fallback),
 		str: (name, fallback) => flagStr(args, name, fallback),
 		dev: (name) => device(context, name),
-		client: async (deviceName, bodyId, doc) => new RawClient(await device(context, deviceName), bodyId, doc, adapter),
+		client: async (deviceName, bodyId, doc) => {
+			const c = new RawClient(await device(context, deviceName), bodyId, doc, adapter);
+			c.reconnect = resilient;
+			return c;
+		},
 	};
 	return ctx;
 }
@@ -172,7 +181,8 @@ export async function replayTrace(sender: RawClient, frames: readonly Uint8Array
 			while ((sender.socket as unknown as { bufferedAmount: number }).bufferedAmount > 1 << 20) await sleep(5);
 			await sleep(0);
 		}
-		if (sender.closed) { log(`sender closed during replay at ${i}: ${JSON.stringify(sender.closed)}`); break; }
+		// A resilient sender queues through a reconnect (frames resent on reopen); otherwise stop at a close.
+		if (sender.closed && !sender.isOpen && !sender.reconnecting) { log(`sender closed during replay at ${i}: ${JSON.stringify(sender.closed)}`); break; }
 		const at = now();
 		sender.applyAndSend(frames[i]!);
 		sendTimes.push(at);

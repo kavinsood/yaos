@@ -5,7 +5,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { log, now, r2, series, sleep } from "../lib/common";
 import { SMALL_COUNT } from "../context";
 import { smallId } from "../lib/context";
-import { bodyGet, bodyHead, convergence, diagnostics } from "../lib/checks";
+import { bodyGet, bodyHead, convergence, diagnostics, frameAccounting, frameCounters } from "../lib/checks";
 import { contentHashOf } from "../lib/rawClient";
 import { CoverageTracker, freshSmallNote, freshTraceBody, keystrokes, loadTrace, openOrThrow, operatorVaultPost,
 	replayTrace, type RunCtx } from "../lib/run";
@@ -92,6 +92,7 @@ export async function L4(ctx: RunCtx): Promise<Result> {
 	const b = await openOrThrow(await ctx.client("B", body), 60_000);
 	await sleep(1500);
 	const before = await diagnostics(ctx.context.devices.A!);
+	const fc0 = await frameCounters(ctx.context.devices.A!);
 	const acksBefore = a.acks.length;
 	const tracker = new CoverageTracker(b.doc);
 	const windowStart = new Date().toISOString();
@@ -103,7 +104,9 @@ export async function L4(ctx: RunCtx): Promise<Result> {
 	tracker.stop();
 	const windowEnd = new Date().toISOString();
 	await sleep(3000);
+	await Promise.all([a.settled(), b.settled()]);
 	const after = await diagnostics(ctx.context.devices.A!);
+	const frameOutcomes = frameAccounting(fc0, await frameCounters(ctx.context.devices.A!));
 	const full = replay.sent === trace.frames.length;
 	const conv = await convergence({ bodyId: body, clients: [a, b], fresh: await ctx.dev("C"), adapter: ctx.adapter, settleMs: 30_000,
 		expectedTextSha: full ? trace.finalSha : undefined });
@@ -112,7 +115,7 @@ export async function L4(ctx: RunCtx): Promise<Result> {
 		perFramePropagationMs: series(tracker.coveredMs), acksReceived: a.acks.length - acksBefore, updatesReceivedByB: b.updatesIn,
 		manifestMatch: full ? sha(a.text()) === trace.finalSha && sha(b.text()) === trace.finalSha : null,
 		sequenceDelta: Number(after.sequence) - Number(before.sequence), before, after,
-		perFrameSamples: tracker.coveredMs, convergence: conv };
+		perFrameSamples: tracker.coveredMs, frameOutcomes, convergence: conv };
 	await a.close(); await b.close();
 	return result;
 }

@@ -17,7 +17,7 @@ import { join } from "node:path";
 import { queryWindow } from "../gql";
 import { LOG_DIR, deployRecord, log, now, r2, series, sleep, workerName } from "../lib/common";
 import { smallContent } from "../lib/context";
-import { bodyGet, convergence, diagnostics } from "../lib/checks";
+import { bodyGet, convergence, diagnostics, frameAccounting, frameCounters } from "../lib/checks";
 import { contentHashOf, RawClient } from "../lib/rawClient";
 import { CoverageTracker, freshNotes, freshTraceBody, loadTrace, openOrThrow, operatorVaultPost, QUICK_TRACE_DIR,
 	replayTrace, type RunCtx } from "../lib/run";
@@ -226,6 +226,7 @@ export async function C2(ctx: RunCtx): Promise<Result> {
 	for (let k = 0; k < clientsN; k++) senders.push(await openOrThrow(await ctx.client(k === 0 ? "A" : `S${k}`, body), 120_000));
 	const observer = await openOrThrow(await ctx.client("B", body), 120_000);
 	const d0 = await diagnostics(ctx.context.devices.A!);
+	const fc0 = await frameCounters(ctx.context.devices.A!);
 	const tracker = new CoverageTracker(observer.doc);
 	const sendTimes: number[] = [];
 	const t0 = now();
@@ -234,7 +235,7 @@ export async function C2(ctx: RunCtx): Promise<Result> {
 		const wait = t0 + (i * 1000) / rate - now();
 		if (wait > 1) await sleep(wait);
 		const s = senders[owners[i]!]!;
-		if (s.closed) { closedAt = i; log(`C2 sender ${owners[i]} closed at ${i}: ${JSON.stringify(s.closed)}`); break; }
+		if (s.closed && !s.isOpen && !s.reconnecting) { closedAt = i; log(`C2 sender ${owners[i]} closed at ${i}: ${JSON.stringify(s.closed)}`); break; }
 		const at = now();
 		s.applyAndSend(trace.frames[i]!);
 		tracker.sent(i, trace.frames[i]!, at);
@@ -245,7 +246,9 @@ export async function C2(ctx: RunCtx): Promise<Result> {
 	const drained = await drain(tracker, 180_000);
 	tracker.stop();
 	windows.push(await closeWindow("stream", start, { edits: sendTimes.length, opens: clientsN + 1 }));
+	await Promise.all([...senders, observer].map((c) => c.settled()));
 	const d1 = await diagnostics(ctx.context.devices.A!);
+	const frameOutcomes = frameAccounting(fc0, await frameCounters(ctx.context.devices.A!));
 	const full = sendTimes.length === trace.frames.length;
 	const conv = await convergence({ bodyId: body, clients: [...senders, observer], fresh: await ctx.dev("C"), adapter: ctx.adapter,
 		settleMs: 120_000, expectedTextSha: full ? trace.finalSha : undefined });
@@ -254,7 +257,7 @@ export async function C2(ctx: RunCtx): Promise<Result> {
 	const out: Result = { trace: which, traceDir: trace.dir, rate, frames: sendTimes.length, clients: clientsN, bodyId: body, sendMs, drained, closedAt,
 		perFramePropagationMs: series(tracker.coveredMs, 0),
 		relayCounterDelta: counterDelta(d0, d1), relayBody: relayBody(d1, body), windows, gql,
-		diagnostics: { before: d0, after: d1 }, convergence: conv };
+		diagnostics: { before: d0, after: d1 }, frameOutcomes, convergence: conv };
 	return deriveC2(out);
 }
 
@@ -532,6 +535,7 @@ export async function MB(ctx: RunCtx): Promise<Result> {
 		const a = await openOrThrow(await ctx.client("A", body), 60_000);
 		const b = await openOrThrow(await ctx.client("B", body), 60_000);
 		const d0 = await diagnostics(ctx.context.devices.A!);
+		const fc0 = await frameCounters(ctx.context.devices.A!);
 		const tracker = new CoverageTracker(b.doc);
 		let edits = 0;
 		if (p === "stream") {
@@ -549,7 +553,11 @@ export async function MB(ctx: RunCtx): Promise<Result> {
 		}
 		const drained = await drain(tracker);
 		tracker.stop();
+		await Promise.all([a.settled(), b.settled()]);
+		const ackDeadline = now() + 30_000;
+		while (a.unacked > 0 && a.adapter.requireEcho === true && now() < ackDeadline) await sleep(100);
 		const d1 = await diagnostics(ctx.context.devices.A!);
+		const frameOutcomes = frameAccounting(fc0, await frameCounters(ctx.context.devices.A!));
 		// Client-side receipts (a stalled/closed origin socket vs. a server that never relayed): see lost > 0.
 		const clientSide = Object.fromEntries([["A", a], ["B", b]].map(([k, c]) => {
 			const cl = c as typeof a;
@@ -558,7 +566,8 @@ export async function MB(ctx: RunCtx): Promise<Result> {
 			const echo = cl.adapter.requireEcho === true;   // base acks carry no frame id
 			return [k as string, { framesOut: cl.framesOut, sent: cl.sent.length, acks: cl.acks.length, unacked: echo ? unacked.length : null,
 				firstUnackedAtMs: echo && unacked[0] ? r2(unacked[0].at - cl.openAt) : null, updatesIn: cl.updatesIn,
-				rejects: cl.rejects.slice(0, 5).map((x) => x.value), rejectCount: cl.rejects.length, closed: cl.closed }];
+				rejects: cl.rejects.slice(0, 5).map((x) => x.value), rejectCount: cl.rejects.length, closed: cl.closed,
+				connection: cl.connectionReport() }];
 		}));
 		// Convergence and socket close stay inside the window (all of this pattern's DO activity is attributed here).
 		convs.push(await convergence({ bodyId: body, clients: [a, b], fresh: await ctx.dev("C"), adapter: ctx.adapter, settleMs: 30_000 }));
@@ -574,7 +583,7 @@ export async function MB(ctx: RunCtx): Promise<Result> {
 			sequenceDelta: Number(d1.sequence) - Number(d0.sequence),
 			relayRowsWrittenPerEdit: delta?.rowsWritten !== undefined ? r2(delta.rowsWritten / edits) : null,
 			relayAppendsPerEdit: delta?.appends !== undefined ? r2(delta.appends / edits) : null,
-			relayCounterDelta: delta, relayBodyAfter: relayBody(d2, body), clientSide });
+			relayCounterDelta: delta, relayBodyAfter: relayBody(d2, body), clientSide, frameOutcomes });
 		log(`MB ${p}: edits=${edits} ${JSON.stringify(parts.at(-1)!.propagationMs)}`);
 	}
 	const gql = await gqlWindows(ctx, windows);
@@ -650,7 +659,7 @@ export async function CW(ctx: RunCtx): Promise<Result> {
 	const loops = writers.map(async (w, k) => {
 		await sleep(k * (editMs / writersN));
 		for (let i = 0; now() - t0 < seconds * 1000; i++) {
-			if (!w.isOpen) break;
+			if (!w.isOpen && !w.reconnecting) break;
 			w.edit((t) => t.insert(Math.floor(Math.random() * (t.length + 1)), String.fromCharCode(65 + k)));
 			edits++;
 			await sleep(editMs);

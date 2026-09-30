@@ -5,7 +5,7 @@ import * as Y from "yjs";
 import { vaultRoute } from "../../../tests/live/schema4Live";
 import { deviceBearerHeaders, type LiveIdentity } from "../../../tests/live/liveIdentity";
 import { json, log, now, r2, sleep } from "./common";
-import { contentHashOf, RawClient, type ProtocolAdapter } from "./rawClient";
+import { ALL_CLIENTS, contentHashOf, RawClient, type ProtocolAdapter } from "./rawClient";
 
 type Obj = Record<string, unknown>;
 
@@ -98,6 +98,9 @@ export async function convergence(options: {
 	const settleMs = options.settleMs ?? 15_000;
 	const deadline = now() + settleMs;
 	const reference = clients[0]!;
+	// Resilient clients: let in-flight reconnects finish and unacked frames drain before comparing.
+	await Promise.all(clients.map((c) => c.settled()));
+	while (now() < deadline && clients.some((c) => c.unacked > 0 && c.adapter.requireEcho === true && c.isOpen)) await sleep(100);
 	// Live clients converge with each other first.
 	while (now() < deadline && !clients.every((c) => c.text() === reference.text() && svEqual(c.stateVector(), reference.stateVector()))) await sleep(50);
 	const text = reference.text();
@@ -136,11 +139,64 @@ export async function convergence(options: {
 			getHeaderVsStored: get.contentHash == null ? "unknown" : get.contentHash === get.storedHash ? "holds" : "VIOLATED",
 		},
 		getYaosHeaders: get.yaosHeaders ?? null,
+		// Connection loss on any live client (server/platform close, dropped frames, unacked relay frames at check time).
+		connectionLoss: clients.some((x) => x.lostConnection),
+		connections: clients.map((x) => x.connectionReport()),
+		failureCause: null as string | null,
 		pass: false,
 	};
 	result.pass = result.liveClientsAgree && result.liveClientsSvAgree && result.freshC.textEqual && result.freshC.svEqual
 		&& result.httpGet.textEqual && result.httpGet.headerHashEqual && result.recordedHead.contentHashEqual
 		&& result.d6Invariant7.headVsStored !== "VIOLATED" && result.d6Invariant7.getHeaderVsStored !== "VIOLATED";
-	log(`convergence ${bodyId}: ${result.pass ? "PASS" : "FAIL"} ${JSON.stringify({ c: result.freshC, get: result.httpGet, head: result.recordedHead })}`);
+	if (!result.pass) {
+		const unacked = clients.reduce((n, x) => n + (x.adapter.requireEcho === true ? x.unacked : 0), 0);
+		const dropped = clients.reduce((n, x) => n + x.droppedWhileClosed, 0);
+		const open = clients.every((x) => x.isOpen);
+		result.failureCause = result.connectionLoss
+			? `connection-loss (closes=${clients.map((x) => x.closeLog.filter((c) => !c.byClient).map((c) => `${c.code}:${c.reason || c.origin}`).join("|")).join(",")}; dropped=${dropped}; unacked=${unacked}; allOpen=${open})`
+			: unacked > 0 ? `unacked-frames=${unacked} without connection loss` : "divergence without connection loss";
+	}
+	log(`convergence ${bodyId}: ${result.pass ? "PASS" : "FAIL"}${result.failureCause ? ` cause=${result.failureCause}` : ""} ${JSON.stringify({ c: result.freshC, get: result.httpGet, head: result.recordedHead })}`);
 	return result;
+}
+
+/** The round-4 no-silent-drops outcome counters (docs/relay2-protocol.md §3.3/§4.3): each non-empty frame ends in exactly one. */
+export const FRAME_OUTCOMES = ["appendFrames", "noopSkips", "dedupeHits", "dedupeConflicts", "batchDuplicateCandidates", "authorityCloses",
+	"authorityDrops", "rateLimitCloses", "epochFences", "bodyInactiveCloses", "tooLargeCloses", "commitFailures", "frameErrors"] as const;
+const COUNTER_KEYS = ["updateFrames", ...FRAME_OUTCOMES, "emptySkips", "postCommitErrors", "appends", "rowsWritten", "checkpoints",
+	"checkpointsFromCache", "leanCatalogEvents", "leanCoalesceRowsWritten", "envelopeMismatches"];
+
+/** Snapshot of relay counters + every client's sent-frame totals (null counters on base / flag off). */
+export async function frameCounters(identity: LiveIdentity) {
+	const d = await diagnostics(identity, true);
+	const relay = d.relay as Obj | undefined;
+	const counters = (relay?.counters as Obj | undefined) ?? null;
+	return {
+		at: Date.now(), relayEnabled: relay?.enabled ?? null,
+		counters: counters ? Object.fromEntries(COUNTER_KEYS.map((k) => [k, Number(counters[k] ?? 0)])) : null,
+		lastFrameError: relay?.lastFrameError ?? null,
+		clientNonEmptyFrames: ALL_CLIENTS.reduce((n, c) => n + c.nonEmptyFramesSent, 0),
+		clientFrames: ALL_CLIENTS.reduce((n, c) => n + c.updateFramesSent, 0),
+		clientResent: ALL_CLIENTS.reduce((n, c) => n + c.resentFrames, 0),
+	};
+}
+
+/**
+ * Delta between two snapshots, asserting (1) the outcome counters sum to updateFrames and (2) updateFrames equals the
+ * non-empty frames our clients sent in the window. Counters are per DO runtime: a decrease means the DO was evicted in the
+ * window, and then no assertion is possible (counterResetInWindow). Only valid when no other traffic hits the vault.
+ */
+export function frameAccounting(before: Awaited<ReturnType<typeof frameCounters>>, after: Awaited<ReturnType<typeof frameCounters>>) {
+	const clientNonEmptyFrames = after.clientNonEmptyFrames - before.clientNonEmptyFrames;
+	const clientResent = after.clientResent - before.clientResent;
+	if (!before.counters || !after.counters) return { available: false, relayEnabled: after.relayEnabled, clientNonEmptyFrames, clientResent };
+	const delta = Object.fromEntries(Object.keys(after.counters).map((k) => [k, after.counters![k]! - (before.counters![k] ?? 0)]));
+	const counterResetInWindow = Object.values(delta).some((v) => v < 0);
+	const outcomeSum = FRAME_OUTCOMES.reduce((n, k) => n + (delta[k] ?? 0), 0);
+	const pass = counterResetInWindow ? null : outcomeSum === delta.updateFrames && delta.updateFrames === clientNonEmptyFrames;
+	return { available: true, relayEnabled: after.relayEnabled, counterResetInWindow, delta, outcomeSum,
+		updateFrames: delta.updateFrames, clientNonEmptyFrames, clientResent,
+		sumEqualsUpdateFrames: counterResetInWindow ? null : outcomeSum === delta.updateFrames,
+		updateFramesEqualsClientFrames: counterResetInWindow ? null : delta.updateFrames === clientNonEmptyFrames,
+		pass, lastFrameError: after.lastFrameError };
 }

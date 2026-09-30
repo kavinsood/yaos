@@ -57,6 +57,8 @@ function judge(leaf: Obj) {
 		httpGetEqualsClient: tri([get?.textEqual as boolean]),
 		serverHashEqualsClient: hashStatus === "match" ? "pass" : hashStatus === "mismatch" ? "FAIL" : "unknown",
 		invariant7: inv ? tri([inv.headVsStored as string, inv.getHeaderVsStored as string]) : "not recorded",
+		connectionLoss: leaf.connectionLoss ?? null,
+		failureCause: leaf.failureCause ?? null,
 		pass: leaf.pass === true,
 	};
 }

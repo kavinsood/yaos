@@ -136,7 +136,7 @@ export async function X2(ctx: RunCtx): Promise<Result> {
 				if (wait > 1) await sleep(wait);
 				const p = k % pairs.length;
 				const [a] = pairs[p]!;
-				if (!a.isOpen) break;
+				if (!a.isOpen && !a.reconnecting) break;
 				let update: Uint8Array | null = null;
 				const cap = (u: Uint8Array, o: unknown) => { if (o !== a) update = u; };
 				a.doc.on("update", cap);
@@ -152,7 +152,8 @@ export async function X2(ctx: RunCtx): Promise<Result> {
 			const lost = trackers.reduce((s, t) => s + t.outstanding, 0);
 			trackers.forEach((t) => t.stop());
 			const summary = series(covered, 0).summary;
-			const closed = pairs.filter(([a, b]) => a.closed || b.closed).map(([a, b]) => ({ a: a.closed, b: b.closed }));
+			const lostSince = (c: RawClient) => c.closeLog.filter((x) => !x.byClient && x.at >= t0);
+			const closed = pairs.filter(([a, b]) => lostSince(a).length + lostSince(b).length > 0).map(([a, b]) => ({ a: lostSince(a), b: lostSince(b) }));
 			const ok = summary !== null && summary.p50 <= 2 * floor && lost === 0 && closed.length === 0;
 			stepsOut.push({ rate, sent, achievedRate, propagationMs: summary, lost, closed, withinTwiceFloor: ok });
 			log(`X2 bodies=${bodies} rate=${rate} achieved=${achievedRate} p50=${summary?.p50} lost=${lost}`);

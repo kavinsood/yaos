@@ -11,7 +11,7 @@
 import { join } from "node:path";
 import { LOG_DIR, flagStr, log, parseArgs, startMeta, writeResult, workerName } from "./lib/common";
 import { loadContext } from "./lib/context";
-import { adapterFor } from "./lib/rawClient";
+import { adapterFor, ALL_CLIENTS } from "./lib/rawClient";
 import { makeCtx, TailCapture, type RunCtx } from "./lib/run";
 import * as latency from "./scenarios/latency";
 import * as cost from "./scenarios/cost";
@@ -28,6 +28,22 @@ const SCENARIOS: Record<string, Scenario> = {
 	C2: extra.C2, C5: extra.C5, C6: extra.C6, K1: extra.K1, MB: extra.MB, CW: extra.CW,
 	diag: cost.diag,
 };
+
+/** Every socket close / error / reconnect / drop across all raw clients of this run (round-3 robustness record). */
+function connectionEvents() {
+	const eventful = ALL_CLIENTS.filter((c) => c.closeLog.some((x) => !x.byClient) || c.errorLog.length > 0 || c.reconnects.length > 0
+		|| c.droppedWhileClosed > 0 || (c.adapter.requireEcho === true && c.unacked > 0));
+	const closes = ALL_CLIENTS.flatMap((c) => c.closeLog.filter((x) => !x.byClient));
+	const byCode: Record<string, number> = {};
+	for (const c of closes) byCode[`${c.code} ${c.reason || c.origin}`] = (byCode[`${c.code} ${c.reason || c.origin}`] ?? 0) + 1;
+	return { clients: ALL_CLIENTS.length, unexpectedCloses: closes.length, unexpectedClosesByCode: byCode,
+		reconnectsOk: ALL_CLIENTS.reduce((n, c) => n + c.reconnects.filter((r) => r.ok).length, 0),
+		reconnectsFailed: ALL_CLIENTS.reduce((n, c) => n + c.reconnects.filter((r) => !r.ok).length, 0),
+		resentFrames: ALL_CLIENTS.reduce((n, c) => n + c.resentFrames, 0),
+		droppedWhileClosed: ALL_CLIENTS.reduce((n, c) => n + c.droppedWhileClosed, 0),
+		errors: ALL_CLIENTS.reduce((n, c) => n + c.errorLog.length, 0),
+		clientsWithEvents: eventful.slice(0, 200).map((c) => c.connectionReport()) };
+}
 
 async function main() {
 	const args = parseArgs();
@@ -56,7 +72,7 @@ async function main() {
 	}
 	const conv = body.convergence as { pass?: boolean } | undefined;
 	writeResult(out, meta, { ...body, tailFile: tail?.path ?? null, notes: ctx.notes,
-		convergencePass: conv?.pass ?? null });
+		convergencePass: conv?.pass ?? null, connectionEvents: connectionEvents() });
 	log(`${scenario} done; convergence=${conv?.pass ?? "n/a"}${body.error ? " ERROR" : ""}`);
 	process.exit(body.error ? 1 : 0);
 }

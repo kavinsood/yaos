@@ -3,7 +3,7 @@
  */
 import { log, now, r2, series, sleep } from "../lib/common";
 import { saveContext, seedNotes, smallId, wordsContent } from "../lib/context";
-import { convergence, diagnostics } from "../lib/checks";
+import { convergence, diagnostics, frameAccounting, frameCounters } from "../lib/checks";
 import { RawClient } from "../lib/rawClient";
 import { freshSmallNote, freshTraceBody, keystrokes, loadTrace, openOrThrow, replayTrace, type RunCtx } from "../lib/run";
 
@@ -140,11 +140,13 @@ export async function C4(ctx: RunCtx): Promise<Result> {
 	const a = await openOrThrow(await ctx.client("A", body));
 	await sleep(3000);
 	const d0 = await diagnostics(ctx.context.devices.A!);
+	const fc0 = await frameCounters(ctx.context.devices.A!);
 	const editWindow = { start: new Date().toISOString(), end: "" };
 	const samples = await keystrokes(a, null, edits, spacing);
 	await sleep(3000);
 	editWindow.end = new Date().toISOString();
 	const d1 = await diagnostics(ctx.context.devices.A!);
+	const fc1 = await frameCounters(ctx.context.devices.A!);
 	await sleep(5000);
 	const reconnectWindow = { start: new Date().toISOString(), end: "" };
 	for (let i = 0; i < reconnects; i++) {
@@ -156,6 +158,7 @@ export async function C4(ctx: RunCtx): Promise<Result> {
 	await sleep(3000);
 	reconnectWindow.end = new Date().toISOString();
 	const d2 = await diagnostics(ctx.context.devices.A!);
+	const fc2 = await frameCounters(ctx.context.devices.A!);
 	const conv = await convergence({ bodyId: body, clients: [a], fresh: await ctx.dev("C"), adapter: ctx.adapter });
 	await a.close();
 	const seq = (d: Result) => Number(d.sequence);
@@ -164,6 +167,7 @@ export async function C4(ctx: RunCtx): Promise<Result> {
 		ackMs: series(samples.map((s) => s.ackMs)),
 		relayStats: { before: d0.relay ?? null, afterEdits: d1.relay ?? null, afterReconnects: d2.relay ?? null },
 		diagnostics: { before: d0, afterEdits: d1, afterReconnects: d2 },
+		frameOutcomes: { edits: frameAccounting(fc0, fc1), reconnects: frameAccounting(fc1, fc2), total: frameAccounting(fc0, fc2) },
 		gqlHint: `scripts/relay2/gql.ts --worker ${ctx.host} --start <window.start> --end <window.end>`, convergence: conv };
 }
 
