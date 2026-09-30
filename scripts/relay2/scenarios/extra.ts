@@ -82,10 +82,11 @@ export async function gqlWindows(ctx: RunCtx, windows: Win[]): Promise<Result[] 
 	const lastEnd = Math.max(...windows.map((w) => Date.parse(w.end)));
 	const wait = lastEnd + settle - Date.now();
 	if (wait > 0) { log(`gql: waiting ${Math.round(wait / 1000)} s for analytics to settle`); await sleep(wait); }
-	// Analytics lag varies (a freshly deployed worker lagged > 5 min). Wait until the latest non-idle window's last
+	// Analytics lag varies (a freshly deployed worker lagged > 5 min; a period is reported only when it ends, which
+	// for the last window can be > 10 min after it, seen on C2 with quiet gaps). Wait until the latest non-idle window's last
 	// minute bucket is present (up to --gql-attempts × 60 s), then query every window; an idle window with no DO
 	// activity legitimately has no buckets.
-	const attempts = ctx.num("gql-attempts", 8);
+	const attempts = ctx.num("gql-attempts", 20);
 	const probe = [...windows].reverse().find((w) => w.name !== "idle") ?? windows[windows.length - 1]!;
 	let probeReady = false;
 	for (let attempt = 1; attempt <= attempts; attempt++) {
