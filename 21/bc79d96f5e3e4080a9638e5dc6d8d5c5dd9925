@@ -1,0 +1,33 @@
+src/runtime/markdownAdmissionScheduler.ts
+  s_fb9412dd2d776a::t_f04ea38ec82fd5 39-53
+src/runtime/reconciliationController.ts
+  s_df8cfbf01530e3::t_f084a2a39f2aaa 165-170,356
+tests/client/markdown-admission-recovery.ts
+  s_df8cfbf01530e3::t_93e54b7b88029c 105-107
+tests/client/markdown-admission-scheduler.ts
+  s_fb9412dd2d776a::t_63743f69545a31 4-5,161-201
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "21bc79d96f5e3e4080a9638e5dc6d8d5c5dd9925",
+  "prompts": {},
+  "sessions": {
+    "s_df8cfbf01530e3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-afe0db35fdc6eca3b",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_fb9412dd2d776a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a6b9308dcda4dea54",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
