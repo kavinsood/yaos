@@ -37,7 +37,7 @@ HERE=${0:A:h}
 source $EXP/env.sh
 ulimit -n 10240 2>/dev/null || true
 
-SHA="" TAG="f$(date +%m%d)" DRY=0 SMALL=0 JOBS=10 ONLY_PHASES="" ONLY_LANES="" FINAL=1 POOL=""
+SHA="" TAG="f$(date +%m%d)" DRY=0 SMALL=0 JOBS=10 ONLY_PHASES="" ONLY_LANES="" FINAL=1 POOL="" APAR=0
 while (( $# )); do
   case $1 in
     --sha) SHA=$2; shift 2;;
@@ -47,6 +47,7 @@ while (( $# )); do
     --phases) ONLY_PHASES=$2; shift 2;;
     --lanes) ONLY_LANES=$2; shift 2;;
     --no-final) FINAL=0; shift;;
+    --lane-a-parallel) APAR=1; shift;;
     --reuse-pool) POOL=${2:A}; shift 2;;
     --dry-run) DRY=1; shift;;
     *) echo "unknown arg $1" >&2; exit 2;;
@@ -356,7 +357,14 @@ say "lane B finished"
 
 # Lane A (serialized; nothing else runs).
 ev phase=_stage status=laneA
-for id in $ORDER_A; do run_phase $id; done
+if (( APAR )); then
+  # Light latency phases concurrently (own worker/DO each); flood/ramp phases (B7, X2) alone afterwards.
+  for id in $ORDER_A; do [[ $id == B7-* || $id == X2-* ]] || spawn run_phase $id; done
+  while reap; (( ${#PIDS} )); do sleep 5; done
+  for id in $ORDER_A; do [[ $id == B7-* || $id == X2-* ]] && run_phase $id; done
+else
+  for id in $ORDER_A; do run_phase $id; done
+fi
 say "lane A finished"
 
 if (( FINAL )); then
