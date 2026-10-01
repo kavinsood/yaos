@@ -108,7 +108,11 @@ Concurrent rename/delete/create activity is resolved against current heads. If t
 
 ## Ordinary edits
 
-A local Markdown edit enters its body Yjs document and IndexedDB candidate queue. A remote update enters the body first and is then materialized by `DiskMirror`; sockets do not write disk directly.
+A local Markdown edit enters its body Yjs document and IndexedDB candidate queue. A remote update is persisted in the body database before closed-body materialization is scheduled; sockets do not write disk directly. Local candidate acceptance and server receipt are distinct: the filesystem worker can continue after durable local acceptance, while trusted agreements remain deferred until the receipt is verified.
+
+One filesystem worker serializes Markdown reconciliation effects. Its pending callbacks are volatile, so startup discovers unfinished text work from retained body state, pending candidates, agreements, and conflict state rather than replaying stale callbacks. Existing-file projection requires `Vault.process` and checks exact expected text synchronously in its callback. Changed content or identity is a normal replan outcome, never permission for an unconditional overwrite.
+
+Multi-step filesystem rename batches retain a separate, scoped structural intent before the first move. Restart recovery inspects source, staging, and destination contents before resuming; an unexpected occupant or changed input blocks the operation without overwriting it. The intent is retired only after final placement and bookkeeping complete.
 
 Watcher changes are coalesced. YAOS-authored disk writes carry an expected content fingerprint. A matching event is suppressed; a mismatch is new external input. Time alone is never proof that YAOS authored an event.
 
@@ -197,6 +201,20 @@ Authority is selected for each observed transition:
 No pass may apply two incompatible observed-content authorities to the same body. Preservation precedes convergence: read/stat failure is uncertainty, never permission to delete or overwrite.
 
 ### Closed-file divergence
+
+A matching materialized baseline does not establish which version an external editor
+opened. If the synchronized body still matches that baseline, raw disk changes that
+remove or replace existing text require explicit conflict review; insert-only changes
+can be accepted automatically. Editor-origin CRDT deletions retain their normal causal
+meaning. This prevents an external editor holding A from saving C over a completely
+materialized B and silently deleting B's remote additions.
+
+Conflict artifacts retain a bounded unfinished append on the existing episode before
+writing its bytes. Restart completes the same append when the artifact matches
+its expected input or intended output. Foreign content remains untouched; recovery
+persists a replacement path within the same episode before writing the retained
+append there. Exhausted relocation attempts remain actionable rather than overwriting
+an occupant. Unique disk input is retained before base/body copies are written.
 
 With baseline hash `B`, disk hash `D`, and body hash `C`:
 

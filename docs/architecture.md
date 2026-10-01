@@ -104,9 +104,11 @@ After bootstrap, the root socket carries structural changes and body sockets are
 
 ## Filesystem reconciliation
 
-Local watcher events are coalesced. Markdown changes use text diffs rather than replace-all updates. Server-origin changes enter a body document before `DiskMirror` materializes them.
+Local watcher events are coalesced. Markdown changes use text diffs rather than replace-all updates. Server-origin changes are persisted in the body database before closed-body projection is scheduled.
 
-Writes are serialized per path and carry an expected content fingerprint. A watcher event is suppressed only when observed content matches the expected write; elapsed time alone is not evidence of authorship. Disk/editor/CRDT disagreement follows preservation-before-convergence rules in the [sync contract](sync-contract.md).
+One `ReconciliationWorker` serializes the Markdown filesystem bridge. Its FIFO is execution scheduling, not a durable source of truth. Ordinary text recovery uses existing body documents, pending candidates, agreements, and conflict episodes; there is no second per-edit journal. Locally accepted candidates are persisted before background submission, and agreement trust still waits for server receipts. Human review and receipt waits do not hold the filesystem worker.
+
+Existing-file rewrites use `Vault.process` with a synchronous exact-content and file-identity check. A host without that operation fails closed rather than substituting a read followed by an unconditional write. A watcher event is suppressed only when observed content matches the expected write; elapsed time alone is not evidence of authorship. Multi-step rename plans are persisted separately before staging and recovered by checking actual file locations and contents. Disk/editor/CRDT disagreement follows preservation-before-convergence rules in the [sync contract](sync-contract.md).
 
 ## Settings sync
 
