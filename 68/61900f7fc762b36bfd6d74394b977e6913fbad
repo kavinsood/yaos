@@ -1,0 +1,45 @@
+scripts/relay2/bench.ts
+  s_4da03de9eee2de::t_9232ce9c1a0352 21,31-32
+scripts/relay2/context.ts
+  s_4da03de9eee2de::t_adb710cbc35585 16,24-31,47
+scripts/relay2/costmodel.py
+  s_4da03de9eee2de::t_62edbecc58acef 15-17,223-227
+scripts/relay2/lib/rawClient.ts
+  s_4da03de9eee2de::t_ff0fd094ae5d75 341
+scripts/relay2/lib/run.ts
+  s_4da03de9eee2de::t_88621551082ab3 68-71,74-80
+scripts/relay2/summarize.py
+  s_4da03de9eee2de::t_f82cc605bc3263 548-651,666-671
+scripts/relay2/wb/corpus.ts
+  s_4da03de9eee2de::t_572b39c064a6f1 1-260
+scripts/relay2/wb/diff3.ts
+  s_4da03de9eee2de::t_43c0c9d541b57b 1-98
+scripts/relay2/wb/selftest.ts
+  s_2bc1830cee836b::t_a47826b469e4f9 1-125
+scripts/relay2/wb/wbmodel.py
+  s_4da03de9eee2de::t_97cf696ffdb13a 1-280
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "6861900f7fc762b36bfd6d74394b977e6913fbad",
+  "prompts": {},
+  "sessions": {
+    "s_2bc1830cee836b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ada6157df203a32a9",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_4da03de9eee2de": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a09756dc78127a702",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
