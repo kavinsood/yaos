@@ -8,6 +8,7 @@ export interface MarkdownConflictArtifactOptions {
 	reason: string;
 	source?: MarkdownConflictSource;
 	trace?: (message: string, details: Record<string, unknown>) => void;
+	executeHost?<Result>(operation: string, execute: () => Promise<Result>): Promise<Result>;
 }
 
 export function markdownConflictArtifactPath(
@@ -41,7 +42,8 @@ export async function createMarkdownConflictArtifact(
 	for (let index = 0; index < 100; index++) {
 		const candidate = index === 0 ? basePath : basePath.replace(/(\.md)?$/, ` ${index + 1}$1`);
 		if (app.vault.getAbstractFileByPath(candidate)) continue;
-		await app.vault.create(candidate, content);
+		if (options.executeHost) await options.executeHost("conflict-artifact.create", () => app.vault.create(candidate, content));
+		else await app.vault.create(candidate, content);
 		options.trace?.("conflict-artifact-created", {
 			path,
 			conflictPath: candidate,

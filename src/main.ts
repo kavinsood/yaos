@@ -17,6 +17,7 @@ import { ConflictListModal } from "./ui/ConflictListModal";
 import { createConflictAttentionNotice } from "./ui/attentionNoticeQueue";
 import { mergeThreeWayText } from "./sync/threeWayMerge";
 import { VaultIndexedDb } from "./sync/vaultIndexedDb";
+import { VaultIndexedDbStructuralIntentStore } from "./sync/structuralIntent";
 import {
 	BootstrapClient,
 	BootstrapHttpPort,
@@ -83,7 +84,6 @@ import {
 	type DiskIndex,
 	adoptUnscopedBaselines,
 	contentBaselineHash,
-	currentContentHash,
 	discardContentBaselines,
 	isBaselineTrusted,
 	moveIndexEntries,
@@ -132,6 +132,7 @@ import {
 import {
 	ReconciliationController,
 } from "./runtime/reconciliationController";
+import { ReconciliationWorker, reconciliationRetainedBytes } from "./runtime/reconciliationWorker";
 import { getFatalSyncNotice } from "./runtime/fatalSyncNotice";
 import { createMarkdownConflictArtifact } from "./runtime/reconcile/markdownConflictArtifact";
 import { AttachmentOrchestrator } from "./runtime/attachmentOrchestrator";
@@ -172,7 +173,7 @@ import {
 	OperationalResourceSnapshotTracker,
 	type OperationalResourceSnapshot,
 } from "./runtime/operationalResourceSnapshot";
-import { AuthorityCoordinator, readVaultAuthoritySnapshot } from "./collaboration/authority";
+import { AuthorityCoordinator, readVaultAuthoritySnapshot, sameAuthorityIdentity } from "./collaboration/authority";
 import { installClientTimerOverrides, parseClientTimerEnv } from "./runtime/testOnlyTimers";
 import {
 	CollaborationClient,
@@ -268,6 +269,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private settingsSyncCapabilityActive = false;
 	private pendingRecoveryState: PendingRecoveryState = { ...EMPTY_PENDING_RECOVERY_STATE };
 	private reconciliationController!: ReconciliationController;
+	private readonly reconciliationWorker = new ReconciliationWorker();
+	private reconciliationStallNotice: Notice | null = null;
+	private readonly conflictLifecycleUpdates = new Set<string>();
 	private setupLinkController: SetupLinkController | null = null;
 	private folderKey: string | null = null;
 	private vaultRoster: VaultRosterDevice[] = [];
@@ -356,12 +360,13 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private readonly bindDivergencePolicy = new BindDivergencePolicy({
 		getBaseline: (path) => this.bindDivergenceBaseline(path),
 		hash: (content) => contentBaselineHash(content),
-		createArtifact: (path, content, reason) => createMarkdownConflictArtifact(this.app, path, content, {
+		createArtifact: (path, content, reason) => this.reconciliationWorker.run(() => createMarkdownConflictArtifact(this.app, path, content, {
+			executeHost: (operation, execute) => this.reconciliationWorker.io(operation, execute),
 			deviceName: this.settings.deviceName,
 			reason,
 			source: "editor",
 			trace: (message, details) => this.trace("recovery", message, details),
-		}),
+		}), { retainedBytes: reconciliationRetainedBytes(content), label: "editor-conflict-artifact" }),
 		notify: (message) => new Notice(message, 10_000),
 		log: (message) => this.log(message),
 	});
@@ -400,6 +405,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private createReconciliationController(): ReconciliationController {
 		this.reconciliationController = new ReconciliationController({
 			app: this.app,
+			reconciliationWorker: this.reconciliationWorker,
 			getSettings: () => this.settings,
 			getRuntimeConfig: () => this.getRuntimeConfig(),
 			getVaultSync: () => this.vaultSync,
@@ -452,7 +458,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	}
 
 	private isMarkdownPathSyncable(path: string): boolean {
-		return isMarkdownSyncable(path, this.excludePatterns, this.getRuntimeConfig().vaultConfigDir);
+		return !this.diskMirror?.isStructuralPathPending(path)
+			&& isMarkdownSyncable(path, this.excludePatterns, this.getRuntimeConfig().vaultConfigDir);
 	}
 
 	private isBlobPathSyncable(path: string): boolean {
@@ -520,7 +527,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				if (!(file instanceof TFile)) {
 					throw new Error(`recovery disk settlement did not materialize target: ${input.path}`);
 				}
-				const content = canonicalizeMarkdown(await this.app.vault.read(file));
+				const content = canonicalizeMarkdown(await this.reconciliationWorker.run(() => this.reconciliationWorker.io("vault.read", () => this.app.vault.read(file))));
 				return {
 					contentHash: await canonicalMarkdownHash(content),
 					size: canonicalMarkdownBytes(content).byteLength,
@@ -530,7 +537,29 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	}
 
 	async onload() {
+		this.reconciliationWorker.setStallHandler((error) => {
+			const message = `YAOS sync paused: ${error.message}. Resolve the blocked filesystem operation, then use “YAOS: Recover after filesystem stall” or restart Obsidian; pending source files are not discarded.`;
+			this.log(message);
+			this.reconciliationStallNotice ??= new Notice(message, 0);
+			this.refreshStatusBar();
+		});
 		const onloadStartedAt = Date.now();
+		this.addCommand({
+			id: "recover-filesystem-stall",
+			name: "Recover after filesystem stall",
+			callback: () => {
+				if (!this.reconciliationWorker.health().stopped) return;
+				this.reconciliationWorker.reset();
+				if (!this.reconciliationWorker.isOperational) {
+					new Notice("YAOS is still waiting for the blocked operation to settle. Resolve it first, or restart Obsidian.", 10_000);
+					return;
+				}
+				this.reconciliationController.reset();
+				this.refreshStatusBar();
+				void this.runReconciliation(this.vaultSync?.getSafeReconcileMode() ?? "conservative")
+					.catch((error: unknown) => this.log(`Filesystem recovery remains pending: ${formatUnknown(error)}`));
+			},
+		});
 		if (typeof __YAOS_TEST_ONLY_TIMERS__ === "string") {
 			const timers = parseClientTimerEnv(JSON.parse(__YAOS_TEST_ONLY_TIMERS__) as Record<string, string>);
 			installClientTimerOverrides(timers.overrides);
@@ -1066,12 +1095,13 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					this.scheduleSchema4CatchUp(`semantic-epoch-reset:${purpose}`);
 				},
 				onSemanticEpochRebaseConflict: async ({ path, pendingMarkdown, kind }) => {
-					const conflictPath = await createMarkdownConflictArtifact(this.app, path, pendingMarkdown, {
+					const conflictPath = await this.reconciliationWorker.run(() => createMarkdownConflictArtifact(this.app, path, pendingMarkdown, {
+						executeHost: (operation, execute) => this.reconciliationWorker.io(operation, execute),
 						deviceName: this.settings.deviceName,
 						reason: `semantic-epoch-${kind}`,
 						source: "editor",
 						trace: (message, details) => this.trace("recovery", message, details),
-					});
+					}), { retainedBytes: reconciliationRetainedBytes(pendingMarkdown), label: "semantic-epoch-conflict" });
 					new Notice(`YAOS preserved an offline edit as “${conflictPath}” before refreshing its sync history.`, 10_000);
 				},
 			});
@@ -1106,6 +1136,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					colorSeed: this.settings.principalColorSeed,
 				}),
 				(input) => this.resolveEditorBindDivergence(input),
+				this.reconciliationWorker,
 			);
 
 			// 3. Global CM6 extension.
@@ -1149,6 +1180,24 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				canonicalMarkdownHash,
 			);
 			this.bodySettlementRepository = bodySettlements;
+			this.diskMirror.setReconciliationWorker(this.reconciliationWorker);
+			const structuralAuthority = this.authorityCoordinator.capture();
+			const structuralScope = {
+				vaultId: structuralAuthority.vaultId,
+				vaultGeneration: structuralAuthority.vaultGeneration,
+				accountId: structuralAuthority.principalId,
+				folderKey,
+			};
+			this.diskMirror.configureStructuralRecovery({
+				scope: structuralScope,
+				store: new VaultIndexedDbStructuralIntentStore(database, structuralScope),
+				isPathAllowed: (path) => isMarkdownSyncable(path, this.excludePatterns, this.getRuntimeConfig().vaultConfigDir),
+				isSourceCurrent: () => this.vaultSync === runtime && this.vaultDatabase === database
+					&& this.authorityCoordinator.current.state === "active"
+					&& this.authorityCoordinator.current.authority !== null
+					&& sameAuthorityIdentity(structuralAuthority, this.authorityCoordinator.current.authority),
+				persistMaterializedPaths: (moves) => database.setMaterializedPaths(moves),
+			});
 			this.diskMirror.configureSettlement({
 				conflictEpisodes: this.conflictEpisodes ?? undefined,
 				getBaseline: (path) => ({
@@ -1169,6 +1218,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 							content: input.content,
 							candidateId: crypto.randomUUID(),
 							reason: input.reason,
+							waitForReceipt: false,
 						});
 						return outcome.kind;
 					}
@@ -1177,6 +1227,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						path: input.path,
 						content: input.content,
 						reason: input.reason,
+						waitForReceipt: false,
 						...(input.reason === "delete-revive"
 							? { lifecycle: "revive" as const }
 							: {}),
@@ -1192,6 +1243,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						content: input.mergedContent,
 						candidateId: crypto.randomUUID(),
 						reason: "three-way-merge",
+						waitForReceipt: false,
 					});
 					return outcome.kind;
 				},
@@ -1217,7 +1269,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				bootstrapServer,
 				database,
 				runtime.bodies,
-				this.diskMirror,
+				this.diskMirror.getBootstrapDiskPort(),
 				(progress) => {
 					this.bootstrapProgress = progress;
 					this.refreshStatusBar();
@@ -1421,8 +1473,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			this.vaultSync.onRenameBatchFlushed((renames) => {
 				for (const episode of this.conflictEpisodes?.list() ?? []) {
 					const path = renames.get(episode.path);
-					if (path) void this.conflictEpisodes?.rename(episode.bodyId, path)
-						.catch((error: unknown) => this.log(`Conflict rename remains pending: ${formatUnknown(error)}`));
+					if (path) this.queueConflictLifecycleUpdate(episode.bodyId);
 				}
 				this.editorWorkspace?.onRenameBatchFlushed(renames);
 
@@ -1477,6 +1528,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			this.updateStatusBar({ kind: "loading_cache" });
 			const bootstrap = this.bootstrapClient;
 			if (!bootstrap) throw new Error("schema-8 bootstrap client is unavailable");
+			const structuralRecovery = await this.diskMirror.recoverStructuralIntents();
+			if (abortIfStale("structural disk recovery")) return;
+			if (structuralRecovery.some((result) => result.status === "blocked")) {
+				new Notice("YAOS kept an interrupted rename pending because its files changed. Inspect the preserved paths before retrying sync.", 10_000);
+			}
 			const bootstrapState = await bootstrap.run();
 			if (abortIfStale("schema-8 bootstrap")) return;
 			const outstanding = await database.listOutstanding();
@@ -1656,7 +1712,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				if (current.settlement.contentHash === hash && current.settlement.durableGeneration >= body.generation) return;
 				if (current.settlement.durableGeneration > body.generation) return;
 			}
-			const disk = await diskMirror.readCanonicalDiskEvidence(path);
+			const disk = await diskMirror.readCanonicalDiskEvidenceQueued(path);
 			if (!disk || disk.content !== content) return;
 			if (!runtime.bodies.coordinator.isProjectionCurrent(proof, path)) return;
 			await repository.settleComponents({
@@ -2847,6 +2903,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	}
 
 	getSettingsStatusSummary(): { label: string } {
+		if (!this.reconciliationWorker.isOperational) return { label: "sync paused — filesystem stalled" };
 		return {
 			label: getLabelFromConnectionState(
 				this.getCurrentConnectionState(),
@@ -2875,30 +2932,49 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	private setupConflictEpisodes(): void {
 		const scope = `${this.settings.vaultId}\0${this.settings.vaultGeneration}`;
+		const verifyScope = () => {
+			if (!this.reconciliationWorker.isOperational || scope !== `${this.settings.vaultId}\0${this.settings.vaultGeneration}`) {
+				throw new Error("Conflict preservation paused or superseded; the source remains unchanged");
+			}
+		};
 		const state = this.persistedState._conflictEpisodeScope === scope && this.persistedState._conflictEpisodes
 			? this.persistedState._conflictEpisodes : { episodes: {}, artifacts: {} };
 		this.conflictEpisodes = new ConflictEpisodes(state, {
 			read: async (path) => {
+				verifyScope();
 				const file = this.app.vault.getAbstractFileByPath(path);
-				return file instanceof TFile ? this.app.vault.read(file) : null;
+				const content = file instanceof TFile ? await this.reconciliationWorker.io("vault.read", () => this.app.vault.read(file)) : null;
+				verifyScope();
+				return content;
 			},
 			write: async (path, content, expected) => {
+				verifyScope();
 				const file = this.app.vault.getAbstractFileByPath(path);
 				if (expected === null) {
 					if (file) throw new Error("Conflict artifact appeared while creating it");
-					await this.app.vault.create(path, content);
+					await this.reconciliationWorker.io("vault.create", () => this.app.vault.create(path, content));
 				} else {
 					if (!(file instanceof TFile)) throw new Error("Conflict artifact disappeared");
-					await this.app.vault.process(file, (current) => {
+					const processOptions: Parameters<typeof this.app.vault.process>[2] & { retainedBytes: number } = {
+						retainedBytes: reconciliationRetainedBytes(expected, content),
+					};
+					await this.reconciliationWorker.io("vault.process", () => this.app.vault.process(file, (current) => {
+						verifyScope();
 						if (current !== expected) throw new Error("Conflict artifact changed while appending");
 						return content;
-					});
+					}, processOptions));
 				}
+				verifyScope();
 			},
-			persist: async (snapshot) => this.persistPluginState((persisted) => {
-				persisted._conflictEpisodes = snapshot;
-				persisted._conflictEpisodeScope = scope;
-			}),
+			persist: async (snapshot) => {
+				verifyScope();
+				await this.persistPluginState((persisted) => {
+					verifyScope();
+					persisted._conflictEpisodes = snapshot;
+					persisted._conflictEpisodeScope = scope;
+				});
+				verifyScope();
+			},
 			changed: () => this.refreshStatusBar(),
 			notify: (bodyIds) => {
 				const fragment = createConflictAttentionNotice(
@@ -2928,47 +3004,91 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		if (!episodes || !runtime || !episode || !episode.latestDiskHash) return;
 		this.openConflictReviews.add(bodyId);
 		try {
-			const body = await runtime.bodies.load(bodyId);
-			const current = yTextToString(body.doc.getText("body"));
-			if (current === null) throw new Error("Could not read the synchronized body");
-			const disk = await episodes.readVersion(bodyId, episode.latestDiskHash);
-			const base = episode.baseHash ? await episodes.readVersion(bodyId, episode.baseHash) : null;
-			const plannedHash = episode.latestDiskHash;
-			const plannedDisk = await this.diskMirror?.readCanonicalDiskEvidence(episode.path);
-			const proof = runtime.bodies.captureRevision(bodyId);
-			const stillCurrent = () => {
-				const valid = this.vaultSync === runtime && episodes.get(bodyId) === episode
-					&& episode.latestDiskHash === plannedHash
-					&& runtime.bodies.coordinator.isProjectionCurrent(proof, episode.path)
-					&& yTextToString(body.doc.getText("body")) === current;
-				if (!valid) this.log(`Conflict review plan superseded for "${episode.path}": ${JSON.stringify({ plannedEpoch: proof.bodyEpoch, plannedContentRevision: proof.contentRevision, plannedOwnershipRevision: proof.ownershipRevision, revision: runtime.bodies.coordinator.snapshot(bodyId), diskVersionChanged: episode.latestDiskHash !== plannedHash })}`);
-				return valid;
-			};
-			const merge = base === null ? null : mergeThreeWayText(base, disk, current);
-			const conflict = merge?.kind === "conflict" ? merge : {
-				kind: "conflict" as const, outcome: "conflict" as const, base: "", cleanEdits: [],
-				conflicts: [{ baseStart: 0, baseEnd: 0, base: "", disk: merge?.kind === "clean" ? merge.content : disk, body: current }],
-			};
-			const chosen = await reviewThreeWayConflict(this.app, episode.path, conflict, stillCurrent);
+			await runtime.loadBodyForPlanning(bodyId);
+			const body = runtime.bodies.get(bodyId);
+			const diskMirror = this.diskMirror;
+			if (this.vaultSync !== runtime || this.conflictEpisodes !== episodes || !diskMirror || !body) return;
+			const { current, plannedDisk, plannedHash, plannedPath, stillCurrent, conflict } = await this.reconciliationWorker.run(async () => {
+				const current = yTextToString(body.doc.getText("body"));
+				if (current === null) throw new Error("Could not read the synchronized body");
+				const proof = runtime.bodies.captureRevision(bodyId);
+				const plannedHash = episode.latestDiskHash;
+				const plannedPath = episode.path;
+				if (!plannedHash) throw new Error("The conflict has no pending disk version to review.");
+				const disk = await episodes.readVersion(bodyId, plannedHash);
+				const base = episode.baseHash ? await episodes.readVersion(bodyId, episode.baseHash) : null;
+				const plannedEvidence = await diskMirror.readCanonicalDiskEvidenceUnqueued(plannedPath);
+				const plannedDisk = plannedEvidence ? { fingerprint: plannedEvidence.fingerprint, file: plannedEvidence.file } : null;
+				const stillCurrent = () => {
+					const valid = this.reconciliationWorker.isOperational && this.vaultSync === runtime && this.diskMirror === diskMirror && this.conflictEpisodes === episodes
+						&& episodes.get(bodyId) === episode && episode.path === plannedPath
+						&& episode.latestDiskHash === plannedHash
+						&& runtime.bodies.coordinator.isProjectionCurrent(proof, plannedPath)
+						&& yTextToString(body.doc.getText("body")) === current;
+					if (!valid) this.log(`Conflict review plan superseded for "${plannedPath}": ${JSON.stringify({ plannedEpoch: proof.bodyEpoch, plannedContentRevision: proof.contentRevision, plannedOwnershipRevision: proof.ownershipRevision, revision: runtime.bodies.coordinator.snapshot(bodyId), diskVersionChanged: episode.latestDiskHash !== plannedHash })}`);
+					return valid;
+				};
+				const merge = base === null ? null : mergeThreeWayText(base, disk, current);
+				const conflict = merge?.kind === "conflict" ? merge : {
+					kind: "conflict" as const, outcome: "conflict" as const, base: "", cleanEdits: [],
+					conflicts: [{ baseStart: 0, baseEnd: 0, base: "", disk: merge?.kind === "clean" ? merge.content : disk, body: current }],
+				};
+				if (!stillCurrent()) throw new Error("The note changed while preparing review. Open review again.");
+				return { current, plannedDisk, plannedHash, plannedPath, stillCurrent, conflict };
+			});
+			const chosen = await reviewThreeWayConflict(this.app, plannedPath, conflict, stillCurrent);
 			if (chosen === null) {
 				if (!stillCurrent()) throw new Error("The note changed during review. Open review again for the current versions.");
 				return;
 			}
-			if (!stillCurrent()) throw new Error("The note changed during review. Open review again for the current versions.");
-			const actualDisk = await this.diskMirror?.readCanonicalDiskEvidence(episode.path);
-			if (!plannedDisk || !actualDisk || plannedDisk.content !== actualDisk.content || !stillCurrent()) {
-				throw new Error("Disk changed during review. Its new input remains pending; review again.");
-			}
-			if (this.shouldBlockFrontmatterIngest(episode.path, current, chosen, "conflict-resolution")) throw new Error("Selected properties are unsafe; repair the preserved version before resolving.");
-			const outcome = await runtime.commitBodyCandidateIfCurrent({
-				bodyId, path: episode.path, expectedContent: current, content: chosen,
-				candidateId: crypto.randomUUID(), reason: "three-way-merge",
+			await this.reconciliationWorker.run(async () => {
+				if (!stillCurrent()) throw new Error("The note changed during review. Open review again for the current versions.");
+				const actualDisk = await diskMirror.readCanonicalDiskEvidenceUnqueued(plannedPath);
+				if (!plannedDisk || !actualDisk || plannedDisk.file !== actualDisk.file
+					|| plannedDisk.fingerprint.hash !== actualDisk.fingerprint.hash
+					|| plannedDisk.fingerprint.bytes !== actualDisk.fingerprint.bytes || !stillCurrent()) {
+					throw new Error("Disk changed during review. Its new input remains pending; review again.");
+				}
+				if (this.shouldBlockFrontmatterIngest(plannedPath, current, chosen, "conflict-resolution")) throw new Error("Selected properties are unsafe; repair the preserved version before resolving.");
+				const outcome = await runtime.commitBodyCandidateIfCurrent({
+					bodyId, path: plannedPath, expectedContent: current, content: chosen,
+					candidateId: crypto.randomUUID(), reason: "three-way-merge", waitForReceipt: false,
+				});
+				if (outcome.kind === "superseded") throw new Error("The synchronized body changed. Review again.");
+				if (!this.reconciliationWorker.isOperational || this.vaultSync !== runtime || this.diskMirror !== diskMirror || this.conflictEpisodes !== episodes
+					|| episodes.get(bodyId) !== episode || episode.path !== plannedPath || episode.latestDiskHash !== plannedHash
+					|| runtime.getFileId(plannedPath) !== bodyId || runtime.getTextForPath(plannedPath)?.toJSON() !== canonicalizeMarkdown(chosen)) {
+					throw new Error("The note changed while accepting review. Its conflict remains pending.");
+				}
+				const acceptedDisk = await diskMirror.readCanonicalDiskEvidenceUnqueued(plannedPath);
+				if (!acceptedDisk || acceptedDisk.content !== actualDisk.content
+					|| acceptedDisk.fingerprint.hash !== plannedDisk.fingerprint.hash
+					|| acceptedDisk.fingerprint.bytes !== plannedDisk.fingerprint.bytes
+					|| !this.reconciliationWorker.isOperational || this.vaultSync !== runtime || this.diskMirror !== diskMirror || this.conflictEpisodes !== episodes
+					|| episodes.get(bodyId) !== episode || episode.latestDiskHash !== plannedHash || episode.path !== plannedPath) {
+					throw new Error("Disk changed while accepting review. Its conflict remains pending.");
+				}
+				const projection = await diskMirror.projectReviewedContentUnqueued({
+					path: plannedPath, bodyId, content: chosen, expectedDisk: actualDisk,
+				});
+				if (projection !== "written") {
+					throw new Error("The reviewed version could not be safely written. Its conflict remains pending; review again.");
+				}
+				const resolvedDisk = await diskMirror.readCanonicalDiskEvidenceUnqueued(plannedPath);
+				if (!resolvedDisk || resolvedDisk.content !== canonicalizeMarkdown(chosen)
+					|| !this.reconciliationWorker.isOperational || this.vaultSync !== runtime || this.diskMirror !== diskMirror || this.conflictEpisodes !== episodes
+					|| episodes.get(bodyId) !== episode || episode.latestDiskHash !== plannedHash || episode.path !== plannedPath
+					|| runtime.getFileId(plannedPath) !== bodyId || runtime.getTextForPath(plannedPath)?.toJSON() !== canonicalizeMarkdown(chosen)) {
+					throw new Error("The note changed while completing review. Its conflict remains pending.");
+				}
+				await episodes.close(bodyId);
+				if (!this.reconciliationWorker.isOperational) throw new Error("Conflict resolution paused; review remains pending");
+				runtime.bodies.coordinator.setDivergence(bodyId, "none");
+				diskMirror.clearPreservedUnresolved(plannedPath);
+				diskMirror.scheduleWrite(plannedPath);
+			}, {
+				retainedBytes: reconciliationRetainedBytes(current, chosen), label: "accept-conflict-review",
 			});
-			if (outcome.kind === "superseded") throw new Error("The synchronized body changed. Review again.");
-			runtime.bodies.coordinator.setDivergence(bodyId, "none");
-			this.diskMirror?.clearPreservedUnresolved(episode.path);
-			await episodes.close(bodyId);
-			this.diskMirror?.scheduleWrite(episode.path);
 		} finally {
 			this.openConflictReviews.delete(bodyId);
 		}
@@ -2976,13 +3096,26 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	private updateStatusBar(connectionState: ConnectionState = this.getCurrentConnectionState()): void {
 		if (!this.statusBarEl) return;
+		if (!this.reconciliationWorker.isOperational) {
+			this.statusBarEl.setText("YAOS: sync paused — filesystem stalled");
+			this.statusBarEl.setAttribute("title", "Resolve the blocked filesystem operation, then restart YAOS. Pending files remain unchanged.");
+			return;
+		}
+		this.reconciliationStallNotice?.hide();
+		this.reconciliationStallNotice = null;
+		if (this.diskMirror?.isStructuralAdmissionBlocked) {
+			this.statusBarEl.setText("YAOS: rename needs attention — source files preserved");
+			this.statusBarEl.setAttribute("title", "An oversized or backpressured rename was not accepted. Inspect remote path mappings and retry smaller independent batches before restarting sync.");
+			return;
+		}
 		if (connectionState.kind === "online" && this.vaultSync?.provider.synced) {
-			const paths = new Map([...this.vaultSync.pathToId].map(([path, bodyId]) => [bodyId, path]));
-			for (const episode of this.conflictEpisodes?.list() ?? []) {
+			const runtime = this.vaultSync;
+			const episodes = this.conflictEpisodes;
+			const paths = new Map([...runtime.pathToId].map(([path, bodyId]) => [bodyId, path]));
+			for (const episode of episodes?.list() ?? []) {
 				const path = paths.get(episode.bodyId);
 				if (path === episode.path) continue;
-				const update = path ? this.conflictEpisodes?.rename(episode.bodyId, path) : this.conflictEpisodes?.close(episode.bodyId);
-				void update?.catch((error: unknown) => this.log(`Conflict lifecycle update failed: ${formatUnknown(error)}`));
+				this.queueConflictLifecycleUpdate(episode.bodyId);
 			}
 		}
 		const visibleState = this.connectionStateLatch.resolve(connectionState);
@@ -3004,6 +3137,25 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			getRecoveryReadiness(this.pendingRecoveryState, this.capabilityUpdateService?.capabilities?.snapshots ?? null),
 			resourcePressure,
 		);
+	}
+
+	private queueConflictLifecycleUpdate(bodyId: string): void {
+		const runtime = this.vaultSync;
+		const episodes = this.conflictEpisodes;
+		if (!runtime || !episodes || !this.reconciliationWorker.isOperational
+			|| this.conflictLifecycleUpdates.has(bodyId) || this.conflictLifecycleUpdates.size >= 64) return;
+		this.conflictLifecycleUpdates.add(bodyId);
+		void this.reconciliationWorker.run(async () => {
+			if (!this.reconciliationWorker.isOperational || this.vaultSync !== runtime || this.conflictEpisodes !== episodes) return;
+			const episode = episodes.get(bodyId);
+			if (!episode) return;
+			const path = [...runtime.pathToId].find(([, identity]) => identity === bodyId)?.[0];
+			if (path === episode.path) return;
+			if (path) await episodes.rename(bodyId, path);
+			else await episodes.close(bodyId);
+		}, { retainedBytes: reconciliationRetainedBytes(bodyId), label: "conflict-lifecycle" })
+			.catch((error: unknown) => this.log(`Conflict lifecycle update remains pending: ${formatUnknown(error)}`))
+			.finally(() => { this.conflictLifecycleUpdates.delete(bodyId); });
 	}
 
 	/**
@@ -3131,7 +3283,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 			const path = file.path;
 			const editorContent = view.editor.getValue();
-			const diskContent = await this.app.vault.read(file).catch(() => null);
+			const diskContent = await this.reconciliationWorker.run(() => this.reconciliationWorker.io("vault.read", () => this.app.vault.read(file)), { label: "diagnostic-disk-read" }).catch(() => null);
 			const crdtContent = yTextToString(this.vaultSync.getTextForPath(path));
 			const binding = this.editorBindings?.getBindingDebugInfoForView(view) ?? null;
 			const collab = this.editorBindings?.getCollabDebugInfoForView(view) ?? null;
@@ -3204,6 +3356,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	}
 
 	onunload() {
+		this.reconciliationStallNotice?.hide();
+		this.reconciliationStallNotice = null;
 		// Obsidian invokes unload synchronously. Set this gate before any cleanup
 		// so a late init continuation cannot attach a replacement runtime.
 		this.teardownLifecycle.requestPermanentShutdown();

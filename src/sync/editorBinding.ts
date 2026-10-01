@@ -18,6 +18,7 @@ import { ORIGIN_EDITOR_HEALTH_HEAL } from "./origins";
 import { mergeThreeWayText } from "./threeWayMerge";
 import { awarenessCursorUser } from "../utils/deviceCursorColor";
 import { leafIdentity } from "../host/obsidianHostAdapter";
+import { reconciliationRetainedBytes, type ReconciliationWorker } from "../runtime/reconciliationWorker";
 
 /**
  * Manages per-editor CM6 bindings via yCollab.
@@ -224,6 +225,7 @@ export class EditorBindingManager {
 			colorSeed: string;
 		},
 		private readonly resolveBindDivergence?: BindDivergenceResolver,
+		private readonly reconciliationWorker?: ReconciliationWorker,
 	) {
 		this.debug = debug;
 		// Register the reconfigure hook so the harness can trigger CM extension
@@ -1547,22 +1549,34 @@ export class EditorBindingManager {
 			`bind: editor and body differ for "${path}" ` +
 			`(editor=${editorContent.length}, body=${bodyContent.length} chars, leaf=${leafId}); resolving before attach`,
 		);
-		void this.resolveBindDivergence({ path, editorContent, bodyContent }).then(
-			(decision) => {
-				if (this.bindDivergences.get(leafId) !== request) return;
-				request.decision = decision;
-				if (view.file?.path !== path) {
-					this.bindDivergences.delete(leafId);
-					return;
-				}
-				this.bind(view, this.lastDeviceName);
-			},
-			(err: unknown) => {
-				if (this.bindDivergences.get(leafId) !== request) return;
+		const apply = (decision: BindDivergenceDecision) => {
+			if (this.bindDivergences.get(leafId) !== request) return;
+			request.decision = decision;
+			if (view.file?.path !== path) {
 				this.bindDivergences.delete(leafId);
-				this.handleBindDivergenceFailure(view, leafId, path, err);
-			},
-		);
+				return;
+			}
+			this.bind(view, this.lastDeviceName);
+		};
+		const resolve = () => this.resolveBindDivergence!({ path, editorContent, bodyContent });
+		const runtime = this.vaultSync;
+		const generation = this.bodyLoadGeneration;
+		const resolution = resolve().then((decision) => {
+			const applyCurrentDecision = async () => {
+				if (this.vaultSync !== runtime || this.bodyLoadGeneration !== generation
+					|| runtime.getTextForPath(path) !== ytext) return;
+				apply(decision);
+			};
+			return this.reconciliationWorker ? this.reconciliationWorker.run(applyCurrentDecision, {
+				label: "bind divergence decision",
+				retainedBytes: reconciliationRetainedBytes(path, editorContent, bodyContent),
+			}) : applyCurrentDecision();
+		});
+		void resolution.catch((err: unknown) => {
+			if (this.bindDivergences.get(leafId) !== request) return;
+			this.bindDivergences.delete(leafId);
+			this.handleBindDivergenceFailure(view, leafId, path, err);
+		});
 		return false;
 	}
 

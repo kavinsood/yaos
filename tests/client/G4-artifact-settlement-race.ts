@@ -84,6 +84,7 @@ async function fixture(options: {
 		},
 	});
 	const runtime = partialOf<VaultSync>({
+		getFileId: (requestedPath) => requestedPath === path ? bodyId : undefined,
 		bodies: { coordinator, captureRevision: (requested) => coordinator.capture(requested) },
 	});
 	const mirror = new DiskMirror(app, runtime, partialOf<EditorBindingManager>({ isBound: () => false }), false);

@@ -3,6 +3,8 @@ import { TFile } from "obsidian";
 
 import { BootstrapClient, BootstrapHttpPort, prepareBootstrapRoot } from "../../../src/sync/bootstrapClient";
 import { DiskMirror } from "../../../src/sync/diskMirror";
+import { sameStructuralScope } from "../../../src/sync/structuralIntent";
+import { sameAuthorityIdentity } from "../../../src/collaboration/authority";
 import { ObsidianCanvasDiskMirror } from "../../../src/sync/canvas/canvasDiskMirror";
 import { createSocketTicketCache } from "../../../src/sync/socketTicket";
 import { clientTimer } from "../../../src/runtime/testOnlyTimers";
@@ -13,6 +15,7 @@ import {
 	type ReconcileMode,
 } from "../../../src/sync/vaultSync";
 import { ReconciliationController } from "../../../src/runtime/reconciliationController";
+import { PRODUCT_EVENT_KIND } from "../../../src/observability/productEventKinds";
 import { buildRuntimeConfig, type RuntimeConfig } from "../../../src/runtime/runtimeConfig";
 import { DEFAULT_SETTINGS, type VaultSyncSettings } from "../../../src/settings/settingsStore";
 import { FrontmatterGuardCoordinator } from "../../../src/sync/frontmatterGuardCoordinator";
@@ -194,17 +197,20 @@ class CapturedImportSource implements LocalVaultImportSource {
 	constructor(
 		private readonly inventory: readonly LocalInventoryEntry[],
 		private readonly delegate: LocalVaultImportSource,
+		private readonly isPathAllowed: (path: string) => boolean,
 	) {}
 
 	async captureInventory(): Promise<readonly LocalInventoryEntry[]> {
-		return this.inventory;
+		return this.inventory.filter((entry) => this.isPathAllowed(entry.path));
 	}
 
 	async read(path: string): Promise<string> {
+		if (!this.isPathAllowed(path)) throw new Error(`local import path is fenced: ${path}`);
 		return this.delegate.read(path);
 	}
 
 	async stat(path: string): Promise<LocalFileRevision | null> {
+		if (!this.isPathAllowed(path)) return null;
 		return this.delegate.stat(path);
 	}
 }
@@ -236,6 +242,7 @@ export class DaemonEngine {
 	private startInFlight: Promise<void> | null = null;
 	private stopInFlight: Promise<void> | null = null;
 	private periodicBarrierUsed = false;
+	private structuralAdmissionPauseLogged = false;
 
 	private diskIndex: DiskIndex = {};
 	private lastDiskIndexPersistedAt = 0;
@@ -388,9 +395,6 @@ export class DaemonEngine {
 			updateEnrollmentState(enrollmentState, { provisioningProof: provisioning }),
 		);
 		const liveImportSource = new ObsidianLocalVaultImportSource(host.app);
-		const finiteInventory = this.membership.originImportPending
-			? await liveImportSource.captureInventory()
-			: [];
 
 		// Phase 2: open generation-scoped persistence and validate bootstrap root.
 		const database = new NodeVaultDatabase(this.statePaths.databaseFile, {
@@ -440,7 +444,14 @@ export class DaemonEngine {
 			log: (message) => this.log(`[sync] ${message}`),
 			onRemoteRootStructuralUpdate: () => this.scheduleBootstrapCatchUp("remote-root"),
 			onAttachmentReconciliationRequired: () => this.scheduleBootstrapCatchUp("attachment-revision-mismatch"),
-			onDurableBodyCommitted: () => this.scheduleBootstrapCatchUp("body-committed"),
+			onDurableBodyCommitted: () => {
+				this.controller?.notifyLocalWorkSettled();
+				this.scheduleBootstrapCatchUp("body-committed");
+			},
+			onRemoteUpdateToClosedBody: ({ path }) => this.controller?.scheduleRemoteBodyMaterialization(path),
+			onProductEvent: (event) => {
+				if (event.kind === PRODUCT_EVENT_KIND.serverReceiptConfirmed) this.controller?.notifyLocalWorkSettled();
+			},
 			// After a server runtime wake the root socket stays open and gets a
 			// receipt-free hint instead of BODY_COMMITTED; it must still catch up,
 			// or the healthy root would suppress the remote poll (remotePoll.ts)
@@ -478,17 +489,50 @@ export class DaemonEngine {
 			},
 		);
 		this.diskMirror = diskMirror;
+		diskMirror.getReconciliationWorker().setStallHandler((error) => {
+			this.log(`YAOS sync paused: ${error.message}. Resolve the blocked filesystem operation, then restart the daemon; source files remain pending.`);
+		});
 		this.cleanup.defer(() => diskMirror.destroy());
-		diskMirror.setDiskWriteCallback((path, contentHash) => {
-			const existing = this.diskIndex[path];
-			if (existing) setCurrentContentHash(existing, contentHash);
-			else {
-				const entry = { mtime: 0, size: 0 };
-				setCurrentContentHash(entry, contentHash);
-				this.diskIndex[path] = entry;
+		const capturedAuthority = { ...this.membership };
+		const structuralScope = {
+			vaultId: capturedAuthority.vaultId,
+			vaultGeneration: capturedAuthority.vaultGeneration,
+			accountId: capturedAuthority.principalId,
+			folderKey: enrollmentState.folderKey,
+		};
+		diskMirror.configureStructuralRecovery({
+			scope: structuralScope,
+			store: {
+				get: (operationId) => database.getStructuralIntent(structuralScope, operationId),
+				list: () => database.listStructuralIntents(structuralScope),
+				put: (intent) => {
+					if (!sameStructuralScope(intent.scope, structuralScope)) throw new Error("Structural intent scope mismatch");
+					return database.putStructuralIntent(intent);
+				},
+				delete: (operationId) => database.deleteStructuralIntent(structuralScope, operationId),
+			},
+			isSourceCurrent: () => this.vaultSync === vaultSync && this.database === database
+				&& this.host === host && this.diskMirror === diskMirror && !this.fatalAuth && !vaultSync.fatalAuthError
+				&& sameAuthorityIdentity(capturedAuthority, this.membership)
+				&& enrollmentState.realVaultPath === this.realVaultPath,
+			isPathAllowed: (path) => isMarkdownSyncable(
+				path, this.runtimeConfig.excludePatterns, this.runtimeConfig.vaultConfigDir,
+			),
+			persistMaterializedPaths: (moves) => database.setMaterializedPaths(moves),
+		});
+		for (const result of await diskMirror.recoverStructuralIntents()) {
+			if (result.status === "blocked") {
+				this.log(`structural recovery blocked operation=${result.operationId} path="${result.path}" reason=${result.reason}`);
 			}
+		}
+		const finiteInventory = this.membership.originImportPending
+			? (await liveImportSource.captureInventory()).filter((entry) => this.isMarkdownPathSyncable(entry.path))
+			: [];
+		diskMirror.setDiskWriteCallback((path, contentHash, content) => {
+			this.controller?.recordProjectedDiskWrite(path, contentHash, content);
 			this.withdrawDeleteCandidate(path, "the daemon wrote it");
 		});
+		diskMirror.setDiskMovedBeforeWriteHandler((path) => this.controller?.handleDiskMovedBeforeWrite(path));
 		const bodySettlements = new BodySettlementRepository(
 			database,
 			BodySettlementRepository.markdownScope(this.membership.vaultGeneration),
@@ -496,7 +540,8 @@ export class DaemonEngine {
 		);
 		diskMirror.configureSettlement({
 			getBaseline: (path) => ({
-				contentHash: currentContentHash(this.diskIndex[path]) ?? null,
+				contentHash: this.controller?.effectiveBaselineHash(path) ?? null,
+				trustedWhole: true,
 				lastDiskIndexPersistedAt: this.lastDiskIndexPersistedAt,
 			}),
 			commitLocalBody: async (input) => {
@@ -512,6 +557,7 @@ export class DaemonEngine {
 						content: input.content,
 						candidateId: crypto.randomUUID(),
 						reason: input.reason,
+						waitForReceipt: false,
 					});
 					return outcome.kind;
 				}
@@ -522,6 +568,7 @@ export class DaemonEngine {
 					path: input.path,
 					content: input.content,
 					reason: input.reason,
+					waitForReceipt: false,
 					...(input.reason === "delete-revive" ? { lifecycle: "revive" as const } : {}),
 				});
 				return "completed";
@@ -535,6 +582,7 @@ export class DaemonEngine {
 					content: input.mergedContent,
 					candidateId: crypto.randomUUID(),
 					reason: "three-way-merge",
+					waitForReceipt: false,
 				});
 				return outcome.kind;
 			},
@@ -553,7 +601,7 @@ export class DaemonEngine {
 			bootstrapServer,
 			database,
 			vaultSync.bodies,
-			diskMirror,
+			diskMirror.getBootstrapDiskPort(),
 		);
 		bootstrapClient.configureSettlements(bodySettlements);
 		if (vaultSync.canvases) bootstrapClient.configureCanvases(vaultSync.canvases);
@@ -564,7 +612,7 @@ export class DaemonEngine {
 		// Phase 4: durably seed an origin or bootstrap a joining device, then sync.
 		if (this.membership.originImportPending) {
 			const importer = new LocalVaultImporter(
-				new CapturedImportSource(finiteInventory, liveImportSource),
+				new CapturedImportSource(finiteInventory, liveImportSource, (path) => this.isMarkdownPathSyncable(path)),
 				new FreshBodyAdmissionLocalVaultImportSink(() => this.vaultSync, (_paths, work) => work()),
 				database,
 				{
@@ -737,6 +785,10 @@ export class DaemonEngine {
 	 */
 	private handleHint(hint: FsHint): void {
 		if (this.stopped) return;
+		if (this.diskMirror?.getReconciliationWorker().isOperational === false) {
+			this.hintedPaths.set(hint.path, hint.kind);
+			return;
+		}
 		const controller = this.controller;
 		const vaultSync = this.vaultSync;
 		if (!controller || !vaultSync || !controller.isReconciled) return;
@@ -935,6 +987,9 @@ export class DaemonEngine {
 	 * therefore only ever make the daemon more cautious.
 	 */
 	private explainAbsence(path: string, evidence: AbsenceEvidence): AbsenceExplanation | null {
+		if (this.diskMirror?.isStructuralPathPending(path)) {
+			return { reason: "structural recovery owns the path", settled: false };
+		}
 		if (evidence.present.has(path)) {
 			return { reason: "the scan found it on disk", settled: true };
 		}
@@ -972,6 +1027,13 @@ export class DaemonEngine {
 	}
 
 	private runPeriodicReconcile(): Promise<void> {
+		if (this.diskMirror?.isStructuralAdmissionBlocked) {
+			if (!this.structuralAdmissionPauseLogged) {
+				this.structuralAdmissionPauseLogged = true;
+				this.log("YAOS structural sync paused: rename admission was refused and all Markdown paths remain fenced. Inspect remote mappings, replan smaller independent batches, then restart the daemon. Source files remain unchanged.");
+			}
+			return Promise.resolve();
+		}
 		const vaultSync = this.vaultSync;
 		const controller = this.controller;
 		const host = this.host;
@@ -981,6 +1043,7 @@ export class DaemonEngine {
 			|| !vaultSync
 			|| !controller
 			|| !host
+			|| this.diskMirror?.getReconciliationWorker().isOperational === false
 		) return Promise.resolve();
 
 		const work = this.performPeriodicReconcile(vaultSync, controller, host);
@@ -997,12 +1060,16 @@ export class DaemonEngine {
 		controller: ReconciliationController,
 		host: NodeHost,
 	): Promise<void> {
+		const isCurrent = () => this.diskMirror?.getReconciliationWorker().isOperational !== false
+			&& this.vaultSync === vaultSync && this.controller === controller && this.host === host;
+		if (!isCurrent()) return;
 		const mode: ReconcileMode = vaultSync.getSafeReconcileMode();
 		const hintedAtStart = new Set(this.hintedPaths.keys());
 		try {
 			let confirmedDelete = false;
 			if (mode === "authoritative") {
 				const deleteScan = await host.scanMarkdown();
+				if (!isCurrent()) return;
 				for (const path of this.reviewDroppedDeletes(deleteScan)) {
 					const candidate = this.deleteCandidates.get(path);
 					const missingForMs = candidate === undefined ? 0 : Date.now() - candidate.firstMissingAt;
@@ -1024,6 +1091,7 @@ export class DaemonEngine {
 				return;
 			}
 			const pollReason = await this.remotePollReason(vaultSync);
+			if (!isCurrent()) return;
 			if (pollReason !== null) {
 				if (this.config.debug) this.log(`remote-poll reason=${pollReason}`);
 				this.scheduleBootstrapCatchUp(`periodic:${pollReason}`);
@@ -1031,11 +1099,13 @@ export class DaemonEngine {
 			// Join any catch-up already running, including one a live
 			// notification started, before reconciling against the CRDT.
 			await this.bootstrapCatchUp;
+			if (!isCurrent()) return;
 			if (mode === "authoritative") {
 				await this.admitAuthoritativeDiskChanges(await host.scanMarkdown());
 				await this.admitAuthoritativeCanvasChanges(await host.scanCanvases());
 			}
 			await controller.runReconciliation(mode);
+			if (!isCurrent()) return;
 			if (mode === "authoritative") {
 				if (PERIODIC_RECONCILE_BARRIER !== null && !this.periodicBarrierUsed) {
 					this.periodicBarrierUsed = true;
@@ -1125,18 +1195,21 @@ export class DaemonEngine {
 		const host = this.host;
 		const runtime = this.vaultSync;
 		const ingest = this.ingestPort;
-		if (!host || !runtime || !ingest) return;
+		const worker = this.diskMirror?.getReconciliationWorker();
+		if (!host || !runtime || !ingest || !worker?.isOperational) return;
 		const abstractFile = host.app.vault.getAbstractFileByPath(path);
 		if (!(abstractFile instanceof TFile)) return;
 		let content: string;
 		let contentHash: string;
 		try {
-			content = await host.app.vault.read(abstractFile);
+			content = await worker.run(() => worker.io("authoritative-disk-read", () => host.app.vault.read(abstractFile)));
 			contentHash = await contentBaselineHash(content);
 		} catch (error) {
 			this.log(`Authoritative scan could not read "${path}": ${String(error)}`);
 			return;
 		}
+		if (!worker.isOperational || this.host !== host || this.vaultSync !== runtime
+			|| abstractFile.path !== path || host.app.vault.getAbstractFileByPath(path) !== abstractFile) return;
 		const activeBodyId = runtime.getFileId(path);
 		const baseline = this.diskIndex[path];
 		if (activeBodyId && currentContentHash(baseline) === contentHash) {
@@ -1153,8 +1226,9 @@ export class DaemonEngine {
 
 	private async persistDiskIndex(): Promise<void> {
 		const database = this.database;
-		if (!database || this.vaultSync?.hasPendingLocalWork) return;
+		if (!database || this.vaultSync?.hasPendingLocalWork || this.diskMirror?.getReconciliationWorker().isOperational === false) return;
 		const pending = await database.getPendingWorkSummary();
+		if (this.diskMirror?.getReconciliationWorker().isOperational === false) return;
 		if (
 			pending.dirtyDocuments > 0
 			|| pending.pendingCandidates > 0
@@ -1357,6 +1431,8 @@ export class DaemonEngine {
 	}
 
 	private isMarkdownPathSyncable(path: string): boolean {
+		if (/^(?:YAOS)?\.yaos-moving-[a-f0-9-]+\.md$/.test(path.split("/").pop() ?? "")) return false;
+		if (this.diskMirror?.isStructuralPathPending(path)) return false;
 		return isMarkdownSyncable(
 			path,
 			this.runtimeConfig.excludePatterns,

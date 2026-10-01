@@ -18,6 +18,7 @@ import {
 } from "../../src/sync/editorBinding";
 import type { VaultSync } from "../../src/sync/vaultSync";
 import { ORIGIN_EDITOR_HEALTH_HEAL } from "../../src/sync/origins";
+import { ReconciliationWorker } from "../../src/runtime/reconciliationWorker";
 import { partialOf } from "../mocks/productFixture.ts";
 import { suite } from "../harness.ts";
 
@@ -44,6 +45,7 @@ function fixture(
 	editor: string,
 	body: string,
 	decide: (input: Parameters<BindDivergenceResolver>[0]) => BindDivergenceDecision | Promise<BindDivergenceDecision>,
+	worker?: ReconciliationWorker,
 ) {
 	const doc = new Y.Doc();
 	const ytext = doc.getText("body");
@@ -52,7 +54,7 @@ function fixture(
 	doc.on("afterTransaction", (transaction) => { origins.push(transaction.origin); });
 	const requests: Array<Parameters<BindDivergenceResolver>[0]> = [];
 	const manager = new EditorBindingManager(
-		partialOf<VaultSync>({}),
+		partialOf<VaultSync>({ getTextForPath: () => ytext }),
 		partialOf<Workspace>({}),
 		false,
 		undefined,
@@ -60,6 +62,7 @@ function fixture(
 		undefined,
 		undefined,
 		async (input) => { requests.push(input); return decide(input); },
+		worker,
 	);
 	const { cm, read } = fakeCm(editor);
 	const view = partialOf<MarkdownView>({ file: partialOf<TFile>({ path: "Note.md" }) });
@@ -72,10 +75,78 @@ function fixture(
 		blocked: (path: string) => manager.isBindResolutionBlocked(path),
 		unbindAll: () => manager.unbindAll(),
 		unbindByPath: (path: string) => manager.unbindByPath(path),
+		applyOnRebind: () => {
+			(manager as unknown as { bind: () => void }).bind = () => { rebinds++; reconcile(); };
+		},
 	};
 }
 
 const settle = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+s.test("bind decisions cannot bypass the retained snapshot budget", async () => {
+	const worker = new ReconciliationWorker({ maximumRetainedBytes: 1 });
+	const subject = fixture(STALE, CURRENT, () => "adopt-body", worker);
+	try {
+		assert.equal(subject.reconcile(), false);
+		await settle();
+		assert.equal(subject.rebinds(), 0);
+		assert.equal(subject.read(), STALE);
+		assert.equal(subject.ytext.toString(), CURRENT);
+		assert.deepEqual(worker.diagnostics(), { active: 0, queued: 0 });
+		assert.equal(worker.health().retainedBytes, 0);
+	} finally { subject.unbindAll(); }
+});
+
+s.test("an unresolved HUMAN decision leaves the worker free and its eventual mutation queues behind projection", async () => {
+	const worker = new ReconciliationWorker();
+	let releaseProjection!: () => void;
+	let enterProjection!: () => void;
+	const entered = new Promise<void>((resolve) => { enterProjection = resolve; });
+	const held = new Promise<void>((resolve) => { releaseProjection = resolve; });
+	const firstProjection = worker.run(async () => {
+		enterProjection();
+		await held;
+	});
+	await entered;
+	let answer!: (decision: BindDivergenceDecision) => void;
+	const subject = fixture(CURRENT, STALE, () => new Promise((resolve) => { answer = resolve; }), worker);
+	subject.applyOnRebind();
+	assert.equal(subject.reconcile(), false);
+	await settle();
+	assert.equal(subject.requests.length, 1, "waiting for HUMAN is outside the filesystem worker");
+	releaseProjection();
+	await firstProjection;
+	await settle();
+	assert.equal(subject.requests.length, 1);
+	let projected: string | null = null;
+	const nextProjection = worker.run(async () => {
+		projected = subject.ytext.toString();
+	});
+	await settle();
+	await nextProjection;
+	assert.equal(projected, STALE, "projection proceeds while HUMAN has not answered");
+	let releaseNextProjection!: () => void;
+	let enterNextProjection!: () => void;
+	const nextEntered = new Promise<void>((resolve) => { enterNextProjection = resolve; });
+	const nextHeld = new Promise<void>((resolve) => { releaseNextProjection = resolve; });
+	const heldProjection = worker.run(async () => {
+		enterNextProjection();
+		await nextHeld;
+	});
+	await nextEntered;
+	answer("adopt-editor");
+	await settle();
+	assert.equal(subject.ytext.toString(), STALE, "HUMAN's answer cannot mutate the body during filesystem work");
+	assert.equal(worker.diagnostics().queued, 1);
+	releaseNextProjection();
+	await heldProjection;
+	await worker.whenIdle();
+	assert.equal(subject.ytext.toString(), CURRENT);
+	assert.equal(subject.rebinds(), 1);
+	assert.deepEqual(subject.origins, [ORIGIN_EDITOR_HEALTH_HEAL]);
+	await worker.whenIdle();
+	assert.deepEqual(worker.diagnostics(), { active: 0, queued: 0 });
+});
 
 s.test("agreeing editor and body bind immediately without consulting the resolver", async () => {
 	const f = fixture(CURRENT, CURRENT, () => { throw new Error("must not be asked"); });

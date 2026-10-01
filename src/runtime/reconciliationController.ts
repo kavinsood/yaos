@@ -14,6 +14,8 @@ import {
 	trustedContentHash,
 } from "../sync/diskIndex";
 import { mergeThreeWayText } from "../sync/threeWayMerge";
+import { ReconciliationBackpressureError, ReconciliationWorker, reconciliationRetainedBytes } from "./reconciliationWorker";
+import { planMarkdownAgreement } from "../sync/markdownAgreement";
 import type { ConflictEpisodes } from "../sync/conflictEpisodes";
 import {
 	FreshAdmissionCancelledError,
@@ -98,6 +100,7 @@ import { type DiskIngestPort } from "./engineControlPort";
 
 interface ReconciliationControllerDeps {
 	app: App;
+	reconciliationWorker?: ReconciliationWorker;
 	getSettings(): VaultSyncSettings;
 	getRuntimeConfig(): RuntimeConfig;
 	getVaultSync(): VaultSync | null;
@@ -180,6 +183,7 @@ const OPEN_FILE_LOCAL_ONLY_RECOVERY_IDLE_MS = 3000;
 const BOUND_RECOVERY_LOCK_MS = 1500;
 /** Coalesces a burst of remote keystrokes into one closed-note disk write. */
 const REMOTE_BODY_MATERIALIZE_DEBOUNCE_MS = 300;
+const MAX_PENDING_MATERIALIZATIONS = 64;
 /** Bounded re-plans of one closed-note materialization (merge commit, disk moved). */
 const REMOTE_BODY_MATERIALIZE_MAX_REPLANS = 3;
 /** Session cache of baseline contents, so a three-way merge can name its base. */
@@ -307,6 +311,8 @@ export class ReconciliationController {
 	private lastReconcileStats: ReconciliationStats | null = null;
 	private closedOnlyDeferredImports = new Set<string>();
 	private readonly markdownAdmission: MarkdownAdmissionScheduler;
+	private readonly reconciliationWorker: ReconciliationWorker;
+	private generation = 0;
 	private boundRecoveryLocks = new Map<string, number>();
 	private recoveryFingerprints = new Map<string, FingerprintEntry>();
 	/**
@@ -331,7 +337,6 @@ export class ReconciliationController {
 	 */
 	private deferredBaselines = new Map<string, { hash: string; content: string }>();
 	/** Merges this controller committed for a closed note, awaiting projection to disk. */
-	private closedMerges = new Map<string, { disk: string; merged: string }>();
 	private materializeReplans = new Map<string, number>();
 	private blockedDivergenceCount = 0;
 	private lastBlockedDivergenceAt: string | null = null;
@@ -348,9 +353,11 @@ export class ReconciliationController {
 	private static readonly AMPLIFICATION_NOTICE_COOLDOWN_MS = 60_000;
 
 	constructor(private readonly deps: ReconciliationControllerDeps) {
+		this.reconciliationWorker = deps.reconciliationWorker ?? deps.getDiskMirror()?.getReconciliationWorker?.() ?? new ReconciliationWorker();
 		this.markdownAdmission = new MarkdownAdmissionScheduler({
 			process: (intent, isCurrent) => this.processMarkdownAdmission(intent, isCurrent),
 			onError: (error) => this.deps.log(`Markdown admission scheduler failed: ${String(error)}`),
+			onOverflow: () => { this.markdownInventorySweepPending = true; this.kickOverflowSweep(); },
 		});
 		// If a QA harness is attached, register the disk-ingest control port now.
 		// In normal production, registerDiskIngestHarnessPort is absent.
@@ -415,6 +422,9 @@ export class ReconciliationController {
 	}
 
 	reset(): void {
+		this.generation++;
+		this.deps.getDiskMirror()?.resetReconciliationScope?.();
+		this.reconciliationWorker.reset();
 		if (this.reconcileCooldownTimer) {
 			window.clearTimeout(this.reconcileCooldownTimer);
 			this.reconcileCooldownTimer = null;
@@ -433,10 +443,14 @@ export class ReconciliationController {
 		this.lastConflictFingerprints.clear();
 		this.baselineContents.clear();
 		this.deferredBaselines.clear();
-		this.closedMerges.clear();
 		this.materializeReplans.clear();
 		for (const timer of this.remoteMaterializeTimers.values()) window.clearTimeout(timer);
 		this.remoteMaterializeTimers.clear();
+		this.remoteMaterializeActive.clear();
+		if (this.overflowSweepTimer !== null) window.clearTimeout(this.overflowSweepTimer);
+		this.overflowSweepTimer = null;
+		this.remoteMaterializeSweepPending = false;
+		this.markdownInventorySweepPending = false;
 		this.blockedDivergenceCount = 0;
 		this.lastBlockedDivergenceAt = null;
 		this.blockedDivergenceSample = [];
@@ -555,7 +569,7 @@ export class ReconciliationController {
 		for (const file of files) {
 			const missing = !vaultSync.getFileId(file.path);
 			if (missing && options.includeUntracked === false) continue;
-			if (missing || changedPaths.has(file.path)) {
+			if ((missing || changedPaths.has(file.path)) && !this.markdownAdmission.hasPendingPath(file.path)) {
 				this.markMarkdownDirty(file, missing ? "create" : "modify");
 			}
 		}
@@ -577,30 +591,40 @@ export class ReconciliationController {
 				continue;
 			}
 			try {
-				let content = canonicalizeMarkdown(await this.deps.app.vault.read(file));
-				if (this.deps.shouldBlockFrontmatterIngest(
-					path,
-					null,
-					content,
-					"disk-to-crdt-seed",
-				)) {
-					const partial = this.frontmatterBodyOnlyProgress(path, "", content, "disk-to-crdt-seed");
-					if (partial === null) {
-						this.recordFrontmatterIngestBlocked(path, false, "disk-to-crdt-seed");
-						continue;
+				const bodyId = crypto.randomUUID();
+				const isCurrent = this.diskInputCurrent(file, vaultSync);
+				const admitted = await (async () => {
+					if (vaultSync.getFileId(path) || diskMirror?.isPreservedUnresolved(path)) return false;
+					const raw = await this.readDiskInput(file, isCurrent);
+					if (raw === null || !isCurrent()) return false;
+					let content = canonicalizeMarkdown(raw);
+					if (this.deps.shouldBlockFrontmatterIngest(
+						path,
+						null,
+						content,
+						"disk-to-crdt-seed",
+					)) {
+						const partial = this.frontmatterBodyOnlyProgress(path, "", content, "disk-to-crdt-seed");
+						if (partial === null) {
+							this.recordFrontmatterIngestBlocked(path, false, "disk-to-crdt-seed");
+							return false;
+						}
+						content = partial;
 					}
-					content = partial;
-				}
-				await vaultSync.commitDiskBody({
-					bodyId: crypto.randomUUID(),
-					path,
-					content,
-					reason: "external-edit",
-					lifecycle: "create",
-					candidateId: crypto.randomUUID(),
-				});
-				imported++;
+					await vaultSync.commitDiskBody({
+						bodyId,
+						path,
+						content,
+						reason: "external-edit",
+						lifecycle: "create",
+						candidateId: crypto.randomUUID(),
+						admissionStillCurrent: () => isCurrent(),
+					});
+					return true;
+				})();
+				if (admitted && isCurrent()) imported++;
 			} catch (error) {
+				if (error instanceof ReconciliationBackpressureError) this.markMarkdownDirty(file, "create");
 				console.error(`[yaos] importUntracked failed for "${path}":`, error);
 			}
 		}
@@ -614,6 +638,11 @@ export class ReconciliationController {
 	}
 
 	private remoteMaterializeTimers = new Map<string, number>();
+	private readonly remoteMaterializeActive = new Set<string>();
+	private remoteMaterializeSweepPending = false;
+	private markdownInventorySweepPending = false;
+	private overflowSweepTimer: number | null = null;
+	private overflowSweepRunning = false;
 	/** Consecutive superseded disk-import plans per path (see requeueAfterSupersede). */
 	private ingestReplans = new Map<string, number>();
 
@@ -646,13 +675,77 @@ export class ReconciliationController {
 	 */
 	scheduleRemoteBodyMaterialization(path: string): void {
 		const existing = this.remoteMaterializeTimers.get(path);
+		if (this.overflowSweepRunning || this.remoteMaterializeActive.has(path) || (existing === undefined
+			&& this.remoteMaterializeTimers.size + this.remoteMaterializeActive.size >= MAX_PENDING_MATERIALIZATIONS)) {
+			this.remoteMaterializeSweepPending = true;
+			this.kickOverflowSweep();
+			return;
+		}
 		if (existing !== undefined) window.clearTimeout(existing);
+		const generation = this.generation;
 		this.remoteMaterializeTimers.set(path, window.setTimeout(() => {
 			this.remoteMaterializeTimers.delete(path);
+			if (this.remoteMaterializeActive.size > 0 || this.overflowSweepRunning) {
+				this.remoteMaterializeSweepPending = true;
+				return;
+			}
+			if (generation !== this.generation || !this.reconciliationWorker.isOperational) {
+				this.remoteMaterializeSweepPending = true;
+				return;
+			}
+			this.remoteMaterializeActive.add(path);
 			void this.materializeRemoteBodyUpdate(path).catch((error: unknown) => {
 				this.deps.log(`remote body materialization failed for "${path}": ${String(error)}`);
+				if (error instanceof ReconciliationBackpressureError) this.remoteMaterializeSweepPending = true;
+			}).finally(() => {
+				if (generation !== this.generation) return;
+				this.remoteMaterializeActive.delete(path);
+				this.kickOverflowSweep();
 			});
 		}, REMOTE_BODY_MATERIALIZE_DEBOUNCE_MS));
+	}
+
+	private kickOverflowSweep(): void {
+		if ((!this.remoteMaterializeSweepPending && !this.markdownInventorySweepPending)
+			|| this.overflowSweepTimer !== null || this.overflowSweepRunning || this.remoteMaterializeTimers.size > 0
+			|| this.remoteMaterializeActive.size > 0 || !this.reconciliationWorker.isOperational) return;
+		const generation = this.generation;
+		this.overflowSweepTimer = window.setTimeout(() => {
+			this.overflowSweepTimer = null;
+			this.overflowSweepRunning = true;
+			void this.drainOverflowSweep(generation).catch((error: unknown) => {
+				this.deps.log(`Bounded reconciliation sweep remains pending: ${String(error)}`);
+			}).finally(() => {
+				this.overflowSweepRunning = false;
+				this.kickOverflowSweep();
+			});
+		}, REMOTE_BODY_MATERIALIZE_DEBOUNCE_MS);
+	}
+
+	private async drainOverflowSweep(generation: number): Promise<void> {
+		const runtime = this.deps.getVaultSync();
+		const isCurrent = () => generation === this.generation && this.deps.getVaultSync() === runtime && this.reconciliationWorker.isOperational;
+		if (!runtime || !isCurrent()) return;
+		if (this.remoteMaterializeSweepPending) {
+			this.remoteMaterializeSweepPending = false;
+			for (const path of runtime.pathToId.keys()) {
+				if (!isCurrent()) return;
+				if (this.remoteMaterializeTimers.has(path) || this.remoteMaterializeActive.has(path)) continue;
+				try {
+					await this.materializeRemoteBodyUpdate(path);
+				} catch (error) {
+					this.remoteMaterializeSweepPending = true;
+					this.deps.log(`Remote materialization remains pending for "${path}": ${String(error)}`);
+					if (!isCurrent()) return;
+				}
+			}
+		}
+		if (this.markdownInventorySweepPending && isCurrent()) {
+			this.markdownInventorySweepPending = false;
+			await this.reconcileMarkdownInventory("bounded-admission-overflow", {
+				includeUntracked: this.deps.getSettings().originImportPending !== true,
+			});
+		}
 	}
 
 	/**
@@ -677,30 +770,47 @@ export class ReconciliationController {
 		const bodyId = vaultSync?.getFileId(path) ?? null;
 		const existingText = vaultSync?.getTextForPath(path);
 		if (!vaultSync || !bodyId || !existingText) return;
+		const isCurrent = this.diskInputCurrent(file, vaultSync);
 		this.flushDeferredBaselines(path);
 		let content: string;
 		try {
-			content = canonicalizeMarkdown(await this.deps.app.vault.read(file));
+			const raw = await this.readDiskInput(file, isCurrent);
+			if (raw === null || !isCurrent()) return;
+			content = canonicalizeMarkdown(raw);
 		} catch (error) {
+			if (error instanceof ReconciliationBackpressureError) throw error;
 			// Read failure is uncertainty, never permission to overwrite.
 			this.deps.log(`remote update to closed "${path}": disk unreadable (${String(error)}); not writing`);
 			return;
 		}
 		const bodyContent = existingText.toJSON();
+		if (!isCurrent()) return;
 		if (bodyContent === content) {
 			this.materializeReplans.delete(path);
 			return;
 		}
-		if (await this.isUnchangedSinceSettlement(path, content)) {
+		const localMatchesAgreement = await this.isUnchangedSinceSettlement(path, content);
+		const plan = planMarkdownAgreement({
+			local: content,
+			body: bodyContent,
+			base: null,
+			localMatchesAgreement,
+			bodyMatchesAgreement: !localMatchesAgreement && await this.matchesBaseline(path, bodyContent),
+			localInput: "unbound-disk",
+		});
+		if (!isCurrent()) return;
+		if (plan.kind === "project-body") {
 			this.deps.log(`remote update to closed "${path}": writing body to unchanged disk`);
-			this.deps.getDiskMirror()?.scheduleWrite(path, { expectedDiskHash: await contentBaselineHash(content) });
+			const expectedDiskHash = await contentBaselineHash(content);
+			if (!isCurrent()) return;
+			this.deps.getDiskMirror()?.scheduleWrite(path, { expectedDiskHash });
 			return;
 		}
 		if (!this.hasBaseline(path)) {
 			this.deps.log(`remote update to closed "${path}": disk has no trusted baseline; leaving to reconciliation`);
 			return;
 		}
-		if (await this.matchesBaseline(path, bodyContent)) {
+		if (plan.kind === "import-local") {
 			// Only disk moved: it is local input for the normal ingest path.
 			this.markMarkdownDirty(file, "modify");
 			return;
@@ -727,16 +837,6 @@ export class ReconciliationController {
 		const vaultSync = this.deps.getVaultSync();
 		const diskMirror = this.deps.getDiskMirror();
 		if (!vaultSync || !diskMirror) return;
-		const ownMerge = this.closedMerges.get(path);
-		if (ownMerge && ownMerge.disk === diskContent && ownMerge.merged === bodyContent) {
-			// The body holds our own merge of exactly this disk: only the
-			// projection is left, conditional on that disk still being there.
-			this.closedMerges.delete(path);
-			this.deps.log(`closed divergence "${path}": projecting committed merge to disk`);
-			diskMirror.scheduleWrite(path, { expectedDiskHash: await contentBaselineHash(diskContent) });
-			return;
-		}
-		this.closedMerges.delete(path);
 		const baseline = this.effectiveBaselineHash(path);
 		const baseContent = baseline === undefined ? null : await this.lookupBaselineContent(path, bodyId, baseline);
 		this.deps.log(
@@ -771,15 +871,15 @@ export class ReconciliationController {
 			this.materializeReplans.delete(path);
 			return;
 		}
-		const after = vaultSync.getTextForPath(path);
-		const afterContent = after ? yTextToString(after) : null;
-		if (afterContent !== null && afterContent !== bodyContent) {
-			this.closedMerges.set(path, { disk: diskContent, merged: afterContent });
-		}
 		const replans = (this.materializeReplans.get(path) ?? 0) + 1;
 		if (replans > REMOTE_BODY_MATERIALIZE_MAX_REPLANS) {
 			this.materializeReplans.delete(path);
 			this.deps.log(`closed divergence "${path}": still re-planning after ${replans - 1} attempts; leaving to reconciliation`);
+			return;
+		}
+		if (!this.materializeReplans.has(path) && this.materializeReplans.size >= MAX_PENDING_MATERIALIZATIONS) {
+			this.markdownInventorySweepPending = true;
+			this.kickOverflowSweep();
 			return;
 		}
 		this.materializeReplans.set(path, replans);
@@ -846,9 +946,9 @@ export class ReconciliationController {
 	/** Keep session baselines attached to their files across renames. */
 	moveSessionBaselines(renames: ReadonlyMap<string, string>): void {
 		for (const map of [this.deferredBaselines, this.baselineContents] as Map<string, { hash: string; content: string }>[]) {
-			for (const [from, to] of renames) {
-				const value = map.get(from);
-				map.delete(from);
+			const moves = [...renames].map(([from, to]) => ({ from, to, value: map.get(from) }));
+			for (const { from } of moves) map.delete(from);
+			for (const { to, value } of moves) {
 				if (value) map.set(to, value);
 				else map.delete(to);
 			}
@@ -1037,6 +1137,7 @@ export class ReconciliationController {
 		intent: MarkdownAdmissionIntent,
 		isCurrent: () => boolean,
 	): Promise<OperationOutcome> {
+		if (!this.reconciliationWorker.isOperational) return { kind: "retryable_failure", failure: "local_persistence" };
 		if (!isCurrent()) return { kind: "superseded" };
 		try {
 			await this.processDirtyMarkdownPath(
@@ -1046,6 +1147,7 @@ export class ReconciliationController {
 				[...intent.coalescedOpIds],
 				{ bodyId: intent.bodyId, candidateId: intent.candidateId, isCurrent },
 			);
+			if (!this.reconciliationWorker.isOperational) return { kind: "retryable_failure", failure: "local_persistence" };
 			if (!isCurrent()) return { kind: "superseded" };
 			if (intent.reason === "create" && this.deps.getVaultSync()?.getFileId(intent.path)) {
 				this.untrackedFiles = this.untrackedFiles.filter((candidate) => candidate !== intent.path);
@@ -1094,6 +1196,32 @@ export class ReconciliationController {
 		await this.syncFileFromDisk(abstractFile, reason, opId, coalescedOpIds, admission);
 	}
 
+	private diskInputCurrent(file: TFile, runtime: VaultSync): () => boolean {
+		const generation = this.generation;
+		const path = file.path;
+		const bodyId = runtime.getFileId(path) ?? null;
+		return () => this.reconciliationWorker.isOperational && generation === this.generation && this.deps.getVaultSync() === runtime
+			&& file.path === path && this.deps.app.vault.getAbstractFileByPath(path) === file
+			&& (bodyId === null || runtime.getFileId(path) === bodyId);
+	}
+
+	private async readDiskInput(file: TFile, isCurrent: () => boolean): Promise<string | null> {
+		try {
+			return await this.reconciliationWorker.run(() => this.readDiskInputUnqueued(file, isCurrent));
+		} catch (error) {
+			if (error instanceof ReconciliationBackpressureError) throw error;
+			if (!this.reconciliationWorker.isOperational) throw error;
+			if (!isCurrent()) return null;
+			throw error;
+		}
+	}
+
+	private async readDiskInputUnqueued(file: TFile, isCurrent: () => boolean): Promise<string | null> {
+		if (!isCurrent()) return null;
+		const content = await this.reconciliationWorker.io("vault.read", () => this.deps.app.vault.read(file));
+		return isCurrent() ? content : null;
+	}
+
 	private async syncFileFromDisk(
 		file: TFile,
 		sourceReason: "create" | "modify" = "modify",
@@ -1102,11 +1230,13 @@ export class ReconciliationController {
 		admission?: { bodyId: string; candidateId: string; isCurrent: () => boolean },
 		planAttempt = 0,
 	): Promise<void> {
+
 		const vaultSync = this.deps.getVaultSync();
 		const editorBindings = this.deps.getEditorBindings();
 		const runtimeConfig = this.deps.getRuntimeConfig();
 		if (!vaultSync) return;
 		if (!this.deps.isMarkdownPathSyncable(file.path)) return;
+		const isCurrent = this.diskInputCurrent(file, vaultSync);
 
 		// If the user modifies or creates a file that was previously
 		// preserved-unresolved, that is intentional user action. Clear the
@@ -1138,13 +1268,14 @@ export class ReconciliationController {
 				: "external edit policy: closed-only (file is open; deferred)";
 			this.deps.log(`syncFileFromDisk: skipping "${file.path}" (${reason})`);
 			if (policyDecision.reason === "policy-never") {
-				await this.updateDiskIndexForPath(file.path);
+				await this.updateDiskIndexForPath(file.path, isCurrent);
 			}
 			return;
 		}
 
 		try {
-			const rawDiskContent = await this.deps.app.vault.read(file);
+			const rawDiskContent = await this.readDiskInput(file, isCurrent);
+			if (rawDiskContent === null || !isCurrent()) return;
 			let content = canonicalizeMarkdown(rawDiskContent);
 
 			const contentBytes = canonicalMarkdownBytes(content).byteLength;
@@ -1154,16 +1285,22 @@ export class ReconciliationController {
 			const episode = pendingBodyId ? episodes?.get(pendingBodyId) : undefined;
 			const pendingBody = yTextToString(existingText);
 			if (pendingBodyId && episodes && episode && pendingBody !== null) {
-				await episodes.preserve({ bodyId: pendingBodyId, path: file.path, epoch: vaultSync.bodies.get?.(pendingBodyId)?.bodyEpoch, disk: content, body: pendingBody, device: this.deps.getSettings().deviceName });
+				await this.reconciliationWorker.run(async () => {
+					if (!isCurrent()) return;
+					await episodes.preserve({ bodyId: pendingBodyId, path: file.path, epoch: vaultSync.bodies.get?.(pendingBodyId)?.bodyEpoch, disk: content, body: pendingBody, device: this.deps.getSettings().deviceName });
+				}, { retainedBytes: reconciliationRetainedBytes(content, pendingBody), label: "markdown-reconciliation" });
+				if (!isCurrent()) return;
 				vaultSync.bodies.coordinator.setDivergence(pendingBodyId, "decision-required");
 				if (episode.baseHash && content !== pendingBody
 					&& (runtimeConfig.maxFileSizeBytes <= 0 || contentBytes <= runtimeConfig.maxFileSizeBytes)) {
-					const base = await episodes.readVersion(pendingBodyId, episode.baseHash);
+					const baseHash = episode.baseHash;
+					const base = await this.reconciliationWorker.run(() => episodes.readVersion(pendingBodyId, baseHash));
+					if (!isCurrent()) return;
 					const merge = mergeThreeWayText(base, content, pendingBody);
 					if (merge.kind === "clean" && !this.deps.shouldBlockFrontmatterIngest(file.path, pendingBody, merge.content, "pending-conflict-edit")) {
 						const outcome = await vaultSync.commitBodyCandidateIfCurrent({
 							bodyId: pendingBodyId, path: file.path, expectedContent: pendingBody, content: merge.content,
-							candidateId: crypto.randomUUID(), reason: "three-way-merge",
+							candidateId: crypto.randomUUID(), reason: "three-way-merge", waitForReceipt: false,
 						});
 						if (outcome.kind === "superseded") this.requeueAfterSupersede(file, opId, "the pending conflict body moved");
 					}
@@ -1189,8 +1326,8 @@ export class ReconciliationController {
 				&& await this.isUnchangedSinceSettlement(file.path, content)
 			) {
 				this.ingestReplans.delete(file.path);
-				await this.skipUnchangedDisk(file, content, existingText, openViews, wasBound);
-				await this.updateDiskIndexForPath(file.path);
+				await this.skipUnchangedDisk(isCurrent, file, content, existingText, openViews, wasBound);
+				await this.updateDiskIndexForPath(file.path, isCurrent);
 				return;
 			}
 
@@ -1202,11 +1339,13 @@ export class ReconciliationController {
 					throw new Error(`body of "${file.path}" could not be loaded to plan the disk import`);
 				}
 				await this.loadBodyForPlanning(vaultSync, file.path, pathBodyId, content);
+				if (!isCurrent()) return;
 				return this.syncFileFromDisk(file, sourceReason, opId, coalescedOpIds, admission, planAttempt + 1);
 			}
 
 			if (wasBound && isOpenInEditor) {
 				const handledBound = await this.handleBoundFileSyncGap(
+					isCurrent,
 					file,
 					content,
 					existingText,
@@ -1219,6 +1358,7 @@ export class ReconciliationController {
 					// baseline so it keeps describing what YAOS last saw agree.
 					await this.updateDiskIndexForPath(
 						file.path,
+						isCurrent,
 						yTextToString(existingText) === content ? content : undefined,
 					);
 					return;
@@ -1228,7 +1368,7 @@ export class ReconciliationController {
 			const previousContent = existingText?.toJSON() ?? null;
 			if (previousContent === content) {
 				this.ingestReplans.delete(file.path);
-				await this.updateDiskIndexForPath(file.path, content);
+				await this.updateDiskIndexForPath(file.path, isCurrent, content);
 				return;
 			}
 			const boundNow = editorBindings?.isBound(file.path) ?? false;
@@ -1263,7 +1403,7 @@ export class ReconciliationController {
 				if (partial === null) {
 					this.recordFrontmatterIngestBlocked(file.path, false, branch);
 					this.ingestReplans.delete(file.path);
-					await this.updateDiskIndexForPath(file.path);
+					await this.updateDiskIndexForPath(file.path, isCurrent);
 					return;
 				}
 				content = partial;
@@ -1275,43 +1415,46 @@ export class ReconciliationController {
 				const bodyProof = vaultSync.bodies.captureRevision(pathBodyId);
 				const artifactHash = episodes.snapshot().artifacts[file.path];
 				const verified = await episodes.isArtifact(file.path, rawDiskContent);
-				const stillCurrent = () => vaultSync.bodies.coordinator.isProjectionCurrent(bodyProof, file.path)
+				const stillCurrent = () => isCurrent() && vaultSync.bodies.coordinator.isProjectionCurrent(bodyProof, file.path)
 					&& this.deps.getConflictEpisodes?.() === episodes
 					&& artifactHash === episodes.snapshot().artifacts[file.path]
 					&& (admission?.isCurrent() ?? true);
+				const replan = async (reason: string): Promise<void> => {
+					if (!isCurrent()) return;
+					if (this.deps.getConflictEpisodes?.() === episodes && artifactHash === episodes.snapshot().artifacts[file.path]
+						&& vaultSync.getTextForPath(file.path)?.toJSON() === content && planAttempt < SYNC_FROM_DISK_MAX_PLAN_ATTEMPTS) {
+						return this.syncFileFromDisk(file, sourceReason, opId, coalescedOpIds, admission, planAttempt + 1);
+					}
+					this.requeueAfterSupersede(file, opId, reason);
+				};
 				if (!stillCurrent()) {
-					this.requeueAfterSupersede(file, opId, "the artifact append proof moved");
-					return;
+					return replan("the artifact append proof moved");
 				}
 				if (verified) {
-					const currentDisk = await this.deps.app.vault.read(file);
+					const currentDisk = await this.readDiskInput(file, isCurrent);
 					if (currentDisk !== rawDiskContent || !stillCurrent()) {
-						this.requeueAfterSupersede(file, opId, "the artifact changed during append verification");
-						return;
+						return replan("the artifact changed during append verification");
 					}
 					const outcome = await this.importDiskIfBodyCurrent(vaultSync, file.path, pathBodyId,
-						existingText, previousContent, content, crypto.randomUUID());
+						existingText, previousContent, content, crypto.randomUUID(), rawDiskContent);
 					if (outcome === "superseded") {
-						this.requeueAfterSupersede(file, opId, "the artifact body moved before append commit");
-						return;
+						return replan("the artifact body moved before append commit");
 					}
 					this.ingestReplans.delete(file.path);
-					await this.updateDiskIndexForPath(file.path, content);
+					await this.updateDiskIndexForPath(file.path, isCurrent, content);
 					return;
 				}
+			}
+			let merged = false;
+			if (existingText && pathBodyId && previousContent !== null && !isOpenInEditor && !frontmatterHeld) {
+				if (!isCurrent()) return;
+				this.ingestReplans.delete(file.path);
+				await this.reconcileClosedDivergence(file, content, previousContent, pathBodyId, "disk-ingest");
+				await this.updateDiskIndexForPath(file.path, isCurrent);
+				return;
 			}
 			const bodyMovedSinceBaseline = existingText && pathBodyId && previousContent !== null
 				&& !await this.matchesBaseline(file.path, previousContent);
-			let merged = false;
-			if (bodyMovedSinceBaseline && !isOpenInEditor && !frontmatterHeld) {
-				// D != B (the guard above did not fire) and C != B, or no trusted
-				// baseline at all: the body may hold changes disk never saw. A
-				// two-way import would delete them; three-way or preserve both.
-				this.ingestReplans.delete(file.path);
-				await this.reconcileClosedDivergence(file, content, previousContent, pathBodyId, "disk-ingest");
-				await this.updateDiskIndexForPath(file.path);
-				return;
-			}
 			if (bodyMovedSinceBaseline && (frontmatterHeld || (isOpenInEditor && !boundNow))) {
 				// Open but unbound (bind pending, reading view), or disk content
 				// the frontmatter guard transformed (DiskMirror would settle the
@@ -1320,7 +1463,7 @@ export class ReconciliationController {
 				const plan = await this.inPlaceThreeWay(file.path, pathBodyId, content, previousContent, diskContent);
 				if (plan.kind === "preserved") {
 					this.ingestReplans.delete(file.path);
-					await this.updateDiskIndexForPath(file.path);
+					await this.updateDiskIndexForPath(file.path, isCurrent);
 					return;
 				}
 				merged = plan.content !== content;
@@ -1334,11 +1477,12 @@ export class ReconciliationController {
 				// held back, or a merge equal to the body): nothing to commit.
 				this.deps.log(`syncFileFromDisk: "${file.path}" contributes nothing new to its body; settling`);
 				this.ingestReplans.delete(file.path);
-				await this.updateDiskIndexForPath(file.path, settledContent);
+				await this.updateDiskIndexForPath(file.path, isCurrent, settledContent);
 				return;
 			}
 
 			const bodyId = vaultSync.getFileId(file.path);
+			if (!isCurrent()) return;
 			if (bodyId && bodyId !== pathBodyId) {
 				// The path changed hands while planning.
 				this.requeueAfterSupersede(file, opId, "the path changed hands while planning");
@@ -1353,6 +1497,7 @@ export class ReconciliationController {
 					previousContent,
 					content,
 					admission?.candidateId ?? opId ?? crypto.randomUUID(),
+					rawDiskContent,
 				);
 				if (outcome === "superseded") {
 					this.requeueAfterSupersede(file, opId, "the body moved since the plan");
@@ -1370,7 +1515,7 @@ export class ReconciliationController {
 					reason: "external-edit",
 					lifecycle: "create" as const,
 					candidateId: admission?.candidateId ?? opId ?? crypto.randomUUID(),
-					...(admission ? { admissionStillCurrent: admission.isCurrent } : {}),
+					admissionStillCurrent: () => isCurrent() && (admission?.isCurrent() ?? true),
 				});
 			}
 			this.ingestReplans.delete(file.path);
@@ -1390,7 +1535,7 @@ export class ReconciliationController {
 				},
 			});
 
-			await this.updateDiskIndexForPath(file.path, settledContent);
+			await this.updateDiskIndexForPath(file.path, isCurrent, settledContent);
 		} catch (err) {
 			console.error(`[yaos] syncFileFromDisk failed for "${file.path}":`, err);
 			throw err;
@@ -1425,20 +1570,32 @@ export class ReconciliationController {
 		expectedBody: string,
 		content: string,
 		candidateId: string,
+		expectedDiskContent: string,
 	): Promise<"applied" | "superseded"> {
-		if (vaultSync.isBodyOpen(bodyId)) {
-			const outcome = tryApplyDiffToYText(text, expectedBody, content, ORIGIN_DISK_SYNC);
-			return outcome === "superseded" ? "superseded" : "applied";
-		}
-		const outcome = await vaultSync.commitBodyCandidateIfCurrent({
-			bodyId,
-			path,
-			expectedContent: expectedBody,
-			content,
-			candidateId,
-			reason: "external-edit",
-		});
-		return outcome.kind === "completed" ? "applied" : "superseded";
+		const generation = this.generation;
+		const file = this.deps.app.vault.getAbstractFileByPath(path);
+		if (!(file instanceof TFile)) return "superseded";
+		const isCurrent = () => this.reconciliationWorker.isOperational && generation === this.generation && this.deps.getVaultSync() === vaultSync
+			&& file.path === path && this.deps.app.vault.getAbstractFileByPath(path) === file
+			&& vaultSync.getFileId(path) === bodyId && vaultSync.getTextForPath(path) === text;
+		return this.reconciliationWorker.run(async () => {
+			const diskContent = await this.readDiskInputUnqueued(file, isCurrent);
+			if (diskContent !== expectedDiskContent || !isCurrent()) return "superseded";
+			if (vaultSync.isBodyOpen(bodyId)) {
+				const outcome = tryApplyDiffToYText(text, expectedBody, content, ORIGIN_DISK_SYNC);
+				return outcome === "superseded" ? "superseded" : "applied";
+			}
+			const outcome = await vaultSync.commitBodyCandidateIfCurrent({
+				bodyId,
+				path,
+				expectedContent: expectedBody,
+				content,
+				candidateId,
+				reason: "external-edit",
+				waitForReceipt: false,
+			});
+			return outcome.kind === "completed" ? "applied" : "superseded";
+		}, { retainedBytes: reconciliationRetainedBytes(expectedBody, content, expectedDiskContent), label: "markdown-reconciliation" });
 	}
 
 	/**
@@ -1466,21 +1623,21 @@ export class ReconciliationController {
 				base = null;
 			}
 		}
-		if (base !== null) {
-			if (base === bodyContent) return { kind: "import", content: diskContent };
-			const merge = mergeThreeWayText(base, diskContent, bodyContent);
-			if (merge.kind === "clean") {
-				this.deps.log(`syncFileFromDisk: "${path}": merged disk and body on their base in place`);
-				return { kind: "import", content: merge.content };
-			}
+		const plan = planMarkdownAgreement({ local: diskContent, body: bodyContent, base, localInput: "unbound-disk" });
+		if (plan.kind === "agree" || plan.kind === "import-local") return { kind: "import", content: diskContent };
+		if (plan.kind === "project-body") return { kind: "import", content: bodyContent };
+		if (plan.kind === "merge") {
+			this.deps.log(`syncFileFromDisk: "${path}": merged disk and body on their base in place`);
+			return { kind: "import", content: plan.merge.content };
 		}
 		const episodes = this.deps.getConflictEpisodes?.();
 		if (episodes) {
 			try {
-				await episodes.preserve({ bodyId, path, epoch: this.deps.getVaultSync()?.bodies.get?.(bodyId)?.bodyEpoch, disk: preservedContent, body: bodyContent, base, device: this.deps.getSettings().deviceName });
+				await this.reconciliationWorker.run(() => episodes.preserve({ bodyId, path, epoch: this.deps.getVaultSync()?.bodies.get?.(bodyId)?.bodyEpoch, disk: preservedContent, body: bodyContent, base, device: this.deps.getSettings().deviceName }), { retainedBytes: reconciliationRetainedBytes(preservedContent, bodyContent, base), label: "markdown-reconciliation" });
 				this.deps.getVaultSync()?.bodies.coordinator.setDivergence(bodyId, "decision-required");
 			} catch (error) {
 				this.deps.log(`Conflict input remains on disk for "${path}": ${String(error)}`);
+				throw error;
 			}
 			return { kind: "preserved" };
 		}
@@ -1495,6 +1652,7 @@ export class ReconciliationController {
 			);
 		} catch (error) {
 			this.deps.log(`syncFileFromDisk: could not preserve disk of "${path}" (${String(error)}); not importing`);
+			throw error;
 		}
 		return { kind: "preserved" };
 	}
@@ -1517,12 +1675,14 @@ export class ReconciliationController {
 	 * body state to disk); open editors are kept current by their binding.
 	 */
 	private async skipUnchangedDisk(
+		isCurrent: () => boolean,
 		file: TFile,
 		content: string,
 		existingText: ReturnType<VaultSync["getTextForPath"]>,
 		openViews: MarkdownView[],
 		wasBound: boolean,
 	): Promise<void> {
+		if (!isCurrent()) return;
 		const isOpenInEditor = openViews.length > 0;
 		const crdtContent = existingText ? yTextToString(existingText) : null;
 		if (crdtContent === null || crdtContent === content) return;
@@ -1547,8 +1707,10 @@ export class ReconciliationController {
 		});
 		if (!isOpenInEditor) {
 			// Conditional: written only while disk still holds this content.
+			const expectedDiskHash = await contentBaselineHash(content);
+			if (!isCurrent()) return;
 			this.deps.getDiskMirror()?.scheduleWrite(file.path, {
-				expectedDiskHash: await contentBaselineHash(content),
+				expectedDiskHash,
 			});
 			return;
 		}
@@ -1611,6 +1773,7 @@ export class ReconciliationController {
 	}
 
 	private async handleBoundFileSyncGap(
+		isCurrent: () => boolean,
 		file: TFile,
 		content: string,
 		existingText: ReturnType<VaultSync["getTextForPath"]>,
@@ -1774,6 +1937,11 @@ export class ReconciliationController {
 					content = partial;
 				}
 				const threeWay = await this.boundLocalOnlyThreeWay(file.path, content, crdtContent ?? "");
+				if (!isCurrent()) return true;
+				if (vaultSync?.getTextForPath(file.path) !== existingText) {
+					this.requeueAfterSupersede(file, undefined, "the body lineage moved during bound recovery");
+					return true;
+				}
 				if (threeWay.kind === "preservation-failed") return true;
 				if (threeWay.kind === "merged") {
 					editorsNeedBodyAdoption = threeWay.content !== content;
@@ -1869,12 +2037,15 @@ export class ReconciliationController {
 					this.requeueAfterSupersede(file, undefined, "the body moved during bound recovery");
 					return true;
 				}
-				const recoveryResult = applyDiffToYTextWithPostcondition(
-					existingText,
-					crdtContent ?? "",
-					content,
-					ORIGIN_DISK_SYNC_RECOVER_BOUND,
-				);
+				const recoveryResult = await this.reconciliationWorker.run(async () => {
+					if (!isCurrent() || vaultSync?.getTextForPath(file.path) !== existingText
+						|| yTextToString(existingText) !== (crdtContent ?? "")) return null;
+					return applyDiffToYTextWithPostcondition(existingText, crdtContent ?? "", content, ORIGIN_DISK_SYNC_RECOVER_BOUND);
+				}, { retainedBytes: reconciliationRetainedBytes(crdtContent, content), label: "markdown-reconciliation" });
+				if (recoveryResult === null) {
+					if (isCurrent()) this.requeueAfterSupersede(file, undefined, "the body moved before queued recovery");
+					return true;
+				}
 			traceRecoveryPostcondition(
 				(source, message, details) => this.deps.trace(source, message, details),
 				this.deps.recordFlightPathEvent
@@ -1971,6 +2142,7 @@ export class ReconciliationController {
 						reason: "external-edit",
 						lifecycle: "create" as const,
 						candidateId: crypto.randomUUID(),
+						admissionStillCurrent: () => isCurrent(),
 					});
 				}
 				const recoveredContent = vaultSync ? content : null;
@@ -2095,6 +2267,11 @@ export class ReconciliationController {
 				// Disk moved and so may the body (a remote edit disk never saw):
 				// three-way on their agreement rather than a two-way import.
 				const threeWay = await this.boundLocalOnlyThreeWay(file.path, content, crdtContent ?? "");
+				if (!isCurrent()) return true;
+				if (vaultSync?.getTextForPath(file.path) !== existingText) {
+					this.requeueAfterSupersede(file, undefined, "the body lineage moved during idle disk recovery");
+					return true;
+				}
 				if (threeWay.kind === "preservation-failed") return true;
 				if (threeWay.kind === "merged") content = threeWay.content;
 				this.deps.log(
@@ -2151,12 +2328,15 @@ export class ReconciliationController {
 					this.requeueAfterSupersede(file, undefined, "the body moved during idle disk recovery");
 					return true;
 				}
-				const recoveryResult = applyDiffToYTextWithPostcondition(
-					existingText,
-					crdtContent ?? "",
-					content,
-					ORIGIN_DISK_SYNC_OPEN_IDLE_RECOVER,
-				);
+				const recoveryResult = await this.reconciliationWorker.run(async () => {
+					if (!isCurrent() || vaultSync?.getTextForPath(file.path) !== existingText
+						|| yTextToString(existingText) !== (crdtContent ?? "")) return null;
+					return applyDiffToYTextWithPostcondition(existingText, crdtContent ?? "", content, ORIGIN_DISK_SYNC_OPEN_IDLE_RECOVER);
+				}, { retainedBytes: reconciliationRetainedBytes(crdtContent, content), label: "markdown-reconciliation" });
+				if (recoveryResult === null) {
+					if (isCurrent()) this.requeueAfterSupersede(file, undefined, "the body moved before queued recovery");
+					return true;
+				}
 			traceRecoveryPostcondition(
 				(source, message, details) => this.deps.trace(source, message, details),
 				this.deps.recordFlightPathEvent
@@ -2243,6 +2423,7 @@ export class ReconciliationController {
 						reason: "external-edit",
 						lifecycle: "create" as const,
 						candidateId: crypto.randomUUID(),
+						admissionStillCurrent: () => isCurrent(),
 					});
 				}
 				const recoveredContent = vaultSync ? content : null;
@@ -2689,13 +2870,23 @@ export class ReconciliationController {
 		reason: string,
 		source?: "crdt" | "disk" | "editor",
 	): Promise<string> {
+		return this.reconciliationWorker.run(() => this.createMarkdownConflictArtifactUnqueued(path, content, reason, source), { retainedBytes: reconciliationRetainedBytes(content), label: "markdown-reconciliation" });
+	}
+
+	private async createMarkdownConflictArtifactUnqueued(
+		path: string,
+		content: string,
+		reason: string,
+		source?: "crdt" | "disk" | "editor",
+	): Promise<string> {
 		const basePath = this.conflictArtifactPath(path, source);
 		for (let i = 0; i < 100; i++) {
 			const candidate = i === 0
 				? basePath
 				: basePath.replace(/(\.md)?$/, ` ${i + 1}$1`);
 			if (this.deps.app.vault.getAbstractFileByPath(candidate)) continue;
-			await this.deps.app.vault.create(candidate, content);
+			await this.reconciliationWorker.io("vault.create", () => this.deps.app.vault.create(candidate, content));
+			if (!this.reconciliationWorker.isOperational) throw new Error("Conflict preservation paused; the source remains unchanged");
 			this.deps.trace("conflict", "conflict-artifact-created", {
 				path,
 				conflictPath: candidate,
@@ -2742,9 +2933,20 @@ export class ReconciliationController {
 	 * work that is not durably committed, in which case the agreement is kept
 	 * for this session only and persisted once that work settles.
 	 */
-	private async updateDiskIndexForPath(path: string, settledContent?: string): Promise<void> {
+	private async updateDiskIndexForPath(path: string, isCurrent: () => boolean, settledContent?: string): Promise<void> {
 		try {
-			const stat = await this.deps.app.vault.adapter.stat(path);
+			await this.reconciliationWorker.run(() => this.updateDiskIndexForPathUnqueued(path, isCurrent, settledContent), { retainedBytes: reconciliationRetainedBytes(settledContent), label: "markdown-reconciliation" });
+		} catch (error) {
+			if (error instanceof ReconciliationBackpressureError) throw error;
+			return;
+		}
+	}
+
+	private async updateDiskIndexForPathUnqueued(path: string, isCurrent: () => boolean, settledContent?: string): Promise<void> {
+		try {
+			if (!isCurrent()) return;
+			const stat = await this.reconciliationWorker.io("vault.adapter.stat", () => this.deps.app.vault.adapter.stat(path));
+			if (!isCurrent()) return;
 			if (stat) {
 				const existing = this.deps.getDiskIndex()[path];
 				const nextEntry: import("../sync/diskIndex").DiskIndexEntry = {
@@ -2768,6 +2970,7 @@ export class ReconciliationController {
 				}
 				if (settledContent !== undefined) {
 					const settledHash = await contentBaselineHash(settledContent);
+					if (!isCurrent()) return;
 					this.rememberBaselineContent(path, settledHash, settledContent);
 					if (this.hasPendingLocalWorkForPath(path)) {
 						this.deferredBaselines.set(path, { hash: settledHash, content: settledContent });

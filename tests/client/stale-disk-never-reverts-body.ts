@@ -15,6 +15,7 @@ import { strict as assert } from "node:assert";
 import * as Y from "yjs";
 import { MarkdownView, TFile } from "obsidian";
 import { ReconciliationController } from "../../src/runtime/reconciliationController";
+import { PRODUCT_EVENT_KIND } from "../../src/observability/productEventKinds";
 import {
 	contentBaselineHash,
 	currentContentHash,
@@ -72,6 +73,7 @@ interface ClosedFixture {
 	episodes: ConflictEpisodes | null;
 	submissions: CandidateRecord[];
 	scheduledWrites: string[];
+	logs: string[];
 	createCommits: string[];
 	artifacts: Map<string, string>;
 	/** Paths offered for three-way conflict review. */
@@ -191,6 +193,16 @@ async function closedBodyFixture(options: {
 	const runtime = new VaultSync({
 		vaultId: "vault-1", vaultGeneration: "generation-1", deviceId: "device-1",
 		host: "https://sync.test", token: "token", database, server, providerFactory: () => provider,
+		onDurableBodyCommitted: () => {
+			controller?.notifyLocalWorkSettled();
+			if (options.realMirror) controller?.scheduleRemoteBodyMaterialization(path);
+		},
+		onProductEvent: (event) => {
+			if (event.kind !== PRODUCT_EVENT_KIND.serverReceiptConfirmed) return;
+			controller?.notifyLocalWorkSettled();
+			if (options.realMirror) controller?.scheduleRemoteBodyMaterialization(path);
+		},
+		onRemoteUpdateToClosedBody: ({ path: changed }) => controller?.scheduleRemoteBodyMaterialization(changed),
 	});
 	if (options.mapped !== false) {
 		runtime.ydoc.transact(() => runtime.pathToId.set(path, bodyId), "indexeddb-bootstrap");
@@ -228,6 +240,7 @@ async function closedBodyFixture(options: {
 		// reconcile inventory in the deployed trace.
 		: { [path]: await baselineEntry(options.baseline, { mtime: 1, size: 1 }, baselineScope) };
 	const scheduledWrites: string[] = [];
+	const logs: string[] = [];
 	let ingestPort: DiskIngestPort | null = null;
 	const vault = {
 		read: async () => {
@@ -247,7 +260,7 @@ async function closedBodyFixture(options: {
 		},
 		getAbstractFileByPath: (requested: string) => requested === path ? file : null,
 		adapter: { stat: async () => ({ mtime: 2, size: disk.length }) },
-		...(options.withProcess ? {
+		...(options.withProcess !== false ? {
 			process: async (_file: TFile, fn: (data: string) => string) => {
 				disk = fn(disk);
 				return disk;
@@ -365,7 +378,7 @@ async function closedBodyFixture(options: {
 		refreshStatusBar: () => {},
 		trace: () => {},
 		scheduleTraceStateSnapshot: () => {},
-		log: () => {},
+		log: (message) => { logs.push(message); },
 		registerDiskIngestPort: (port) => { ingestPort = port; },
 	});
 	return {
@@ -380,6 +393,7 @@ async function closedBodyFixture(options: {
 		setControllerScope: (scope) => { controllerScope = scope; },
 		submissions,
 		scheduledWrites,
+		logs,
 		createCommits,
 		artifacts,
 		disk: () => disk,
@@ -442,8 +456,9 @@ s.test("stale disk of an evicted body never reverts the body's newer stored stat
 });
 
 s.test("a genuine disk edit is still imported", async () => {
-	const fixture = await closedBodyFixture({ disk: LOCAL, baseline: BASE, loadBody: true });
+	const fixture = await closedBodyFixture({ disk: LOCAL, baseline: BASE, loadBody: true, realMirror: true, commonBase: BASE });
 	await fixture.ingest();
+	assert.equal(await fixture.mirror!.settleBody({ path: "Closed.md", bodyId: "body-closed", generation: 2, content: LOCAL }), "settled");
 	assert.equal(fixture.submissions.length, 1, "disk that changed since its baseline is local input");
 	assert.equal(fixture.runtime.getPathContent("Closed.md"), LOCAL);
 	assert.equal(
@@ -563,6 +578,19 @@ async function boundFixture(options: {
 			ytext.insert(0, remote);
 		}, "provider-remote");
 	};
+	const runtime = {
+		getTextForPath: (requested: string) => requested === path ? ytext : null,
+		getFileIdForText: () => "body-open",
+		getFileId: () => "body-open",
+		isBodyOpen: () => options.bodyOpen !== false,
+		commitBodyCandidateIfCurrent: async (input: { expectedContent: string; content: string }) => {
+			conditionalCommits.push(input.content);
+			if (ytext.toString() !== input.expectedContent) return { kind: "superseded" };
+			if (input.expectedContent === input.content) return { kind: "completed", receipt: null, unchanged: true };
+			doc.transact(() => { ytext.delete(0, ytext.length); ytext.insert(0, input.content); }, "disk-commit");
+			return { kind: "completed", receipt: {} };
+		},
+	};
 	const controller = new ReconciliationController({
 		app: {
 			vault: {
@@ -575,19 +603,7 @@ async function boundFixture(options: {
 		} as never,
 		getSettings: () => ({ deviceName: "Test device" }) as never,
 		getRuntimeConfig: () => ({ maxFileSizeBytes: 0, maxFileSizeKB: 0, excludePatterns: [], externalEditPolicy: "always" }) as never,
-		getVaultSync: () => ({
-			getTextForPath: (requested: string) => requested === path ? ytext : null,
-			getFileIdForText: () => "body-open",
-			getFileId: () => "body-open",
-			isBodyOpen: () => options.bodyOpen !== false,
-			commitBodyCandidateIfCurrent: async (input: { expectedContent: string; content: string }) => {
-				conditionalCommits.push(input.content);
-				if (ytext.toString() !== input.expectedContent) return { kind: "superseded" };
-				if (input.expectedContent === input.content) return { kind: "completed", receipt: null, unchanged: true };
-				doc.transact(() => { ytext.delete(0, ytext.length); ytext.insert(0, input.content); }, "disk-commit");
-				return { kind: "completed", receipt: {} };
-			},
-		}) as never,
+		getVaultSync: () => runtime as never,
 		getDiskMirror: () => ({
 			isPreservedUnresolved: () => false,
 			clearPreservedUnresolved: () => {},
@@ -764,20 +780,34 @@ s.test("S1: a planned write never clobbers a disk save that lands before it runs
 	await fixture.destroy();
 });
 
-for (const withProcess of [true, false]) {
-	s.test(`S1: compare-and-swap refuses a write when disk changes between read and modify (${withProcess ? "vault.process" : "re-read"})`, async () => {
-		const fixture = await closedBodyFixture({
-			disk: BASE, baseline: BASE, loadBody: true, realMirror: true, commonBase: BASE, withProcess,
-		});
+s.test("S1: atomic compare-and-swap retains an intervening disk edit and replans the merge", async () => {
+	const fixture = await closedBodyFixture({
+		disk: BASE, baseline: BASE, loadBody: true, realMirror: true, commonBase: BASE,
+	});
+	try {
 		const mirror = fixture.mirror!;
 		fixture.applyRemote(REMOTE);
 		fixture.onNextRead(() => fixture.setDisk(LOCAL_TOP));
 		await mirror.flushWrite("Closed.md");
 		assert.equal(fixture.disk(), LOCAL_TOP, "the external save survives the racing write");
 		await eventually(() => fixture.disk() === MERGED, "the re-plan merges both edits");
-		await fixture.destroy();
+	} finally { await fixture.destroy(); }
+});
+
+s.test("S1: without atomic vault.process projection fails safe without changing disk", async () => {
+	const fixture = await closedBodyFixture({
+		disk: BASE, baseline: BASE, loadBody: true, realMirror: true, commonBase: BASE, withProcess: false,
 	});
-}
+	const beforeIndex = structuredClone(fixture.diskIndex());
+	try {
+		fixture.applyRemote(REMOTE);
+		await fixture.mirror!.flushWrite("Closed.md");
+		await fixture.mirror!.getReconciliationWorker().whenIdle();
+		assert.equal(fixture.disk(), BASE);
+		assert.equal(fixture.runtime.getPathContent("Closed.md"), REMOTE);
+		assert.deepEqual(fixture.diskIndex(), beforeIndex, "failed atomic projection cannot establish disk agreement");
+	} finally { await fixture.destroy(); }
+});
 
 s.test("S3: a baseline from another local incarnation never makes disk look unchanged", async () => {
 	for (const baselineScope of ["previous-local-db", null]) {
@@ -883,14 +913,14 @@ s.test("P0c N2: a remote edit reaching a closed body between ingest planning and
 	assert.equal(fixture.submissions.length, 0);
 	// The re-plan sees both sides moved and merges them on the baseline.
 	await fixture.ingest();
-	await eventually(() => fixture.disk() === MERGED, "the re-plan merges both edits");
+	await eventually(() => fixture.disk() === MERGED, `the re-plan merges both edits (body=${JSON.stringify(fixture.runtime.getPathContent("Closed.md"))}, disk=${JSON.stringify(fixture.disk())}, candidates=${fixture.submissions.length}, logs=${JSON.stringify(fixture.logs.slice(-5))})`);
 	assert.equal(fixture.runtime.getPathContent("Closed.md"), MERGED);
 	assert.equal(fixture.artifacts.size, 0);
 	await fixture.destroy();
 });
 
 s.test("P0c N2: a disk edit to an evicted body is planned against the loaded body", async () => {
-	const fixture = await closedBodyFixture({ disk: LOCAL, baseline: BASE, loadBody: false });
+	const fixture = await closedBodyFixture({ disk: LOCAL, baseline: BASE, loadBody: false, realMirror: true, commonBase: BASE });
 	await fixture.ingest();
 	assert.equal(fixture.runtime.getPathContent("Closed.md"), LOCAL, "body == baseline: a plain local edit");
 	assert.equal(fixture.submissions.length, 1);
@@ -1126,6 +1156,10 @@ function countRequeues(controller: ReconciliationController, replan: () => Promi
 		requeues.push(file.path);
 		if (requeues.length <= limit) runs.push(replan());
 	};
+	controller.scheduleRemoteBodyMaterialization = (path) => {
+		requeues.push(path);
+		if (requeues.length <= limit) runs.push(Promise.resolve().then(replan));
+	};
 	return { requeues, settle: async () => { while (runs.length) await runs.shift(); } };
 }
 
@@ -1181,7 +1215,7 @@ s.test("round 4 (1b): an unbound open note whose disk edits the closed body alre
 });
 
 s.test("round 4 (1): superseded disk imports re-plan a bounded number of times, then give up", async () => {
-	const fixture = await closedBodyFixture({ disk: LOCAL, baseline: BASE, loadBody: true });
+	const fixture = await closedBodyFixture({ disk: LOCAL, baseline: BASE, loadBody: true, realMirror: true, commonBase: BASE });
 	let attempts = 0;
 	fixture.runtime.commitBodyCandidateIfCurrent = async () => { attempts++; return { kind: "superseded" }; };
 	const loop = countRequeues(fixture.controller, () => fixture.ingest());

@@ -28,6 +28,7 @@ export interface MarkdownAdmissionSchedulerDeps {
 		isCurrent: () => boolean,
 	): Promise<OperationOutcome>;
 	onError(error: unknown): void;
+	onOverflow?(): void;
 }
 
 const browserClock: OverdueWorkClock = {
@@ -51,6 +52,7 @@ export class MarkdownAdmissionScheduler {
 	private readonly store = new ReconstructibleOverdueWorkStore<MarkdownAdmissionIntent>();
 	private readonly kernel: OverdueWorkKernel<MarkdownAdmissionIntent>;
 	private readonly current = new Map<string, { intent: MarkdownAdmissionIntent; firstQueuedAt: number }>();
+	private readonly retainedKeys = new Set<string>();
 	private revisionSequence = 0;
 	private accepting = true;
 
@@ -80,6 +82,13 @@ export class MarkdownAdmissionScheduler {
 		coalescedOpIds?: readonly string[];
 	}): void {
 		if (!this.accepting) return;
+		const key = this.key(input.path);
+		if ((!this.retainedKeys.has(key) && this.retainedKeys.size >= 64)
+			|| (!this.current.has(input.path) && this.current.size >= 64)) {
+			this.deps.onOverflow?.();
+			return;
+		}
+		this.retainedKeys.add(key);
 		const now = this.clock.now();
 		const previous = this.current.get(input.path);
 		const coalescedOpIds = new Set([
@@ -128,6 +137,10 @@ export class MarkdownAdmissionScheduler {
 		return this.current.delete(path);
 	}
 
+	hasPendingPath(path: string): boolean {
+		return this.current.has(path);
+	}
+
 	reset(): void {
 		if (!this.accepting) return;
 		this.current.clear();
@@ -143,6 +156,7 @@ export class MarkdownAdmissionScheduler {
 		if (!this.accepting) return;
 		this.accepting = false;
 		this.current.clear();
+		this.retainedKeys.clear();
 		this.kernel.stop();
 	}
 
@@ -156,7 +170,10 @@ export class MarkdownAdmissionScheduler {
 
 	private async run(work: DurableWorkIntent<MarkdownAdmissionIntent>): Promise<OperationOutcome> {
 		const intent = work.metadata;
-		if (!intent || !this.isCurrent(intent.path, intent.revision)) return { kind: "superseded" };
+		if (!intent || !this.isCurrent(intent.path, intent.revision)) {
+			if (!intent || !this.current.has(intent.path)) this.retainedKeys.delete(work.key);
+			return { kind: "superseded" };
+		}
 		const outcome = await this.deps.process(
 			intent,
 			() => this.isCurrent(intent.path, intent.revision),
@@ -168,6 +185,7 @@ export class MarkdownAdmissionScheduler {
 			|| outcome.kind === "durably_pending"
 		) {
 			if (this.isCurrent(intent.path, intent.revision)) this.current.delete(intent.path);
+			if (!this.current.has(intent.path)) this.retainedKeys.delete(work.key);
 		}
 		return outcome;
 	}

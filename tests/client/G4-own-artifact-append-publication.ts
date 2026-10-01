@@ -120,8 +120,8 @@ async function fixture(options: {
 		conflictEpisodes: episodes,
 		getBaseline: () => ({ contentHash: diskIndex[path]?.contentHash ?? null, trustedWhole: true }),
 		getCommonBase: async () => ({ kind: "missing" }),
-		commitLocalBody: async (input) => (await runtime.commitBodyCandidateIfCurrent({ bodyId: input.bodyId, path: input.path, content: input.content, expectedContent: input.expectedBodyContent!, candidateId: crypto.randomUUID(), reason: input.reason })).kind,
-		commitMergedBody: async (input) => (await runtime.commitBodyCandidateIfCurrent({ bodyId: input.bodyId, path: input.path, content: input.mergedContent, expectedContent: input.expectedBodyContent, candidateId: crypto.randomUUID(), reason: "three-way-merge" })).kind,
+		commitLocalBody: async (input) => (await runtime.commitBodyCandidateIfCurrent({ bodyId: input.bodyId, path: input.path, content: input.content, expectedContent: input.expectedBodyContent!, candidateId: crypto.randomUUID(), reason: input.reason, waitForReceipt: false })).kind,
+		commitMergedBody: async (input) => (await runtime.commitBodyCandidateIfCurrent({ bodyId: input.bodyId, path: input.path, content: input.mergedContent, expectedContent: input.expectedBodyContent, candidateId: crypto.randomUUID(), reason: "three-way-merge", waitForReceipt: false })).kind,
 		shouldBlockDiskIngest: () => options.blockFrontmatter === true,
 	});
 	let ingest: DiskIngestPort | null = null;
@@ -138,7 +138,7 @@ async function fixture(options: {
 		registerDiskIngestPort: (port) => { ingest = port; },
 	});
 	return {
-		path, bodyId, prefix, appended, runtime, mirror, controller, episodes, submissions, artifacts,
+		path, file, bodyId, prefix, appended, runtime, mirror, controller, episodes, submissions, artifacts,
 		disk: () => artifacts.get(path)!,
 		ingest: () => (ingest as unknown as DiskIngestPort).ingestDiskFileNow(path, "modify"),
 		settle: () => mirror.settleBody({ path, bodyId, generation: 2, content: initialBody, onMissingBase: "preserve-disk" }),
@@ -177,7 +177,7 @@ tests.test("an already receipted create operation id is not reused for a newer a
 	const subject = await fixture();
 	try {
 		const internals = subject.controller as unknown as { syncFileFromDisk(file: TFile, reason: "create", opId: string, coalesced: string[], admission: { bodyId: string; candidateId: string; isCurrent(): boolean }): Promise<void> };
-		await internals.syncFileFromDisk(Object.assign(new TFile(), { path: subject.path }), "create", "already-receipted-create", [], { bodyId: subject.bodyId, candidateId: "already-receipted-create", isCurrent: () => true });
+		await internals.syncFileFromDisk(subject.file, "create", "already-receipted-create", [], { bodyId: subject.bodyId, candidateId: "already-receipted-create", isCurrent: () => true });
 		assert.equal(subject.submissions.length, 1);
 		assert.notEqual(subject.submissions[0]!.candidateId, "already-receipted-create");
 		assert.equal(subject.runtime.getTextForPath(subject.path)!.toJSON(), subject.appended);

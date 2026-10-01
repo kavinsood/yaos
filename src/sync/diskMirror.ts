@@ -28,6 +28,16 @@ import { safeMarkdownPath } from "./pathPolicy";
 import { mergeThreeWayText, type ThreeWayMergeResult } from "./threeWayMerge";
 import type { BodySettlementRead, DiskSettlementFingerprint } from "./bodySettlement";
 import type { ConflictEpisodes } from "./conflictEpisodes";
+import { ReconciliationBackpressureError, ReconciliationWorker, reconciliationRetainedBytes } from "../runtime/reconciliationWorker";
+import type { BootstrapDiskPort } from "./bootstrapClient";
+import { planMarkdownAgreement } from "../sync/markdownAgreement";
+import {
+	StructuralIntentRecovery,
+	type StructuralIntentScope,
+	type StructuralIntentStore,
+	type StructuralRecoveryResult,
+	type StoredStructuralIntent,
+} from "./structuralIntent";
 export { isLocalOrigin };
 
 export interface DiskSettlementOptions {
@@ -74,7 +84,41 @@ export interface DiskSettlementOptions {
 	isBodyLive?(bodyId: string): boolean;
 }
 
+export type DiskBodySettlement = "settled" | "replan" | "preserved-unresolved";
+
+export interface DiskStructuralRenamePlan {
+	readonly id: string;
+	readonly moves: readonly {
+		readonly bodyId: string;
+		readonly from: string;
+		readonly to: string;
+		readonly temporaryPath: string;
+		readonly expectedContent: string;
+	}[];
+}
+
+export interface DiskStructuralRenamePlanPort {
+	prepare(plan: DiskStructuralRenamePlan): Promise<void>;
+	staged(plan: DiskStructuralRenamePlan): Promise<void>;
+	complete(plan: DiskStructuralRenamePlan): Promise<void>;
+}
+
+export interface DiskStructuralRecoveryOptions {
+	scope: StructuralIntentScope;
+	store: StructuralIntentStore;
+	isSourceCurrent?(): boolean;
+	isPathAllowed?(path: string): boolean;
+	persistMaterializedPaths(moves: readonly { bodyId: string; path: string }[]): Promise<void>;
+}
+
 export type DeleteSettlement = "deleted" | "revived" | "preserved-unresolved";
+
+interface DiskDeleteRevival {
+	kind: "revive";
+	file: TFile;
+	content: string;
+	settlement: DiskSettlementOptions;
+}
 
 
 /**
@@ -92,8 +136,10 @@ const BODY_OBSERVER_RETRY_MS = 100;
 const BODY_OBSERVER_RETRY_LIMIT = 100;
 const OPEN_FILE_ACTIVE_GRACE_MS = 1200;
 const SUPPRESS_MS = 10_000;
-const MAX_CONCURRENT_WRITES = 5;
 const BURST_THRESHOLD = 20;
+const MAX_PENDING_WRITES = 64;
+const MAX_STRUCTURAL_MOVES = 64;
+const MAX_STRUCTURAL_SOURCE_BYTES = 16 * 1024 * 1024;
 
 function describeOrigin(origin: unknown, provider: unknown): string {
 	if (origin === provider) return "provider-remote";
@@ -107,7 +153,8 @@ function describeOrigin(origin: unknown, provider: unknown): string {
 	return formatUnknown(origin);
 }
 
-/** Aborts a compare-and-swap disk write whose expected content moved. */
+class DiskProjectionChangedError extends Error {}
+
 class DiskMovedBeforeWriteError extends Error {
 	constructor() {
 		super("disk content changed before the write");
@@ -184,7 +231,14 @@ export class DiskMirror {
 	/** True while the drain loop is running. */
 	private draining = false;
 	private drainPromise: Promise<void> | null = null;
-	private pathWriteLocks = new Map<string, Promise<void>>();
+	private reconciliationWorker = new ReconciliationWorker();
+	private diskScopeGeneration = 0;
+	private structuralRenamePlans: DiskStructuralRenamePlanPort | null = null;
+	private structuralRecoveryOptions: DiskStructuralRecoveryOptions | null = null;
+	private structuralRecoveryReady = false;
+	private structuralAdmissionBlocked = false;
+	private pendingStructuralPaths = new Map<string, ReadonlySet<string>>();
+	private structuralBookkeepingApplied = new Set<string>();
 
 	/** Per-file Y.Text observers. Only attached for open/active files. */
 	private textObservers = new Map<
@@ -297,6 +351,208 @@ export class DiskMirror {
 	}
 
 
+	setReconciliationWorker(worker: ReconciliationWorker): void {
+		const diagnostics = this.reconciliationWorker.diagnostics();
+		if (diagnostics.active > 0 || diagnostics.queued > 0) throw new Error("cannot replace an active reconciliation worker");
+		this.resetReconciliationScope();
+		this.reconciliationWorker = worker;
+	}
+
+	getReconciliationWorker(): ReconciliationWorker {
+		return this.reconciliationWorker;
+	}
+
+	getBootstrapDiskPort(): BootstrapDiskPort {
+		return {
+			settleBody: (input) => this.settleBody(input),
+			moveBodies: (moves) => this.moveBodies(moves),
+			settleRename: (input) => this.settleRename(input),
+			deleteBody: (input) => this.deleteBody(input),
+			discardStaleBody: (input) => this.discardStaleBody(input),
+			markPendingPath: (path, bodyId) => this.markPendingPath(path, bodyId),
+			clearPendingPath: (path, bodyId) => this.clearPendingPath(path, bodyId),
+			readCanonicalDiskEvidence: (path) => this.readCanonicalDiskEvidenceQueued(path),
+		};
+	}
+
+	resetReconciliationScope(): void {
+		this.invalidateDiskScope();
+	}
+
+	invalidateDiskScope(): void {
+		this.diskScopeGeneration++;
+	}
+
+	setStructuralRenamePlanPort(port: DiskStructuralRenamePlanPort | null): void {
+		this.structuralRenamePlans = port;
+	}
+
+	configureStructuralRecovery(options: DiskStructuralRecoveryOptions | null): void {
+		const diagnostics = this.reconciliationWorker.diagnostics();
+		if (diagnostics.active > 0 || diagnostics.queued > 0) throw new Error("cannot replace active structural recovery storage");
+		this.structuralRecoveryOptions = options === null ? null : { ...options, scope: { ...options.scope } };
+		this.structuralRecoveryReady = false;
+	}
+
+	isStructuralPathPending(path: string): boolean {
+		if (this.structuralAdmissionBlocked) return true;
+		if (this.isStructuralStagingPath(path)) return true;
+		if (this.structuralRecoveryOptions !== null && !this.structuralRecoveryReady) return true;
+		const normalized = normalizePath(path);
+		return [...this.pendingStructuralPaths.values()].some((paths) => paths.has(normalized));
+	}
+
+	private isStructuralStagingPath(path: string): boolean {
+		const parts = normalizePath(path).split("/");
+		const basename = parts[parts.length - 1] ?? path;
+		return /^(?:YAOS)?\.yaos-moving-[a-f0-9-]+\.md$/.test(basename);
+	}
+
+	async recoverStructuralIntents(): Promise<StructuralRecoveryResult[]> {
+		const options = this.structuralRecoveryOptions;
+		if (!options) return [];
+		const isScopeCurrent = this.captureDiskScope([]);
+		return this.reconciliationWorker.run(async () => {
+			const recovery = this.createStructuralRecovery(options, isScopeCurrent);
+			const intents = await options.store.list();
+			if (!isScopeCurrent() || this.structuralRecoveryOptions !== options) throw new DiskProjectionChangedError();
+			this.pendingStructuralPaths.clear();
+			for (const intent of intents) this.trackStructuralIntent(intent);
+			const results: StructuralRecoveryResult[] = [];
+			for (const intent of intents) {
+				const result = await recovery.recover(intent.operationId);
+				if (!isScopeCurrent()) throw new DiskProjectionChangedError();
+				this.finishStructuralRecovery(intent, result);
+				results.push(result);
+			}
+			this.structuralRecoveryReady = true;
+			return results;
+		});
+	}
+
+	private trackStructuralIntent(intent: StoredStructuralIntent): void {
+		this.pendingStructuralPaths.set(intent.operationId, new Set(intent.moves.flatMap((move) => [move.from, move.staging, move.to])));
+	}
+
+	private finishStructuralRecovery(intent: StoredStructuralIntent, result: StructuralRecoveryResult): void {
+		if (result.status === "blocked") {
+			for (const path of this.pendingStructuralPaths.get(intent.operationId) ?? []) this.recordPreservedUnresolved(path, "structural-batch-failed");
+			this._flightEventHandler?.({
+				priority: "critical", kind: "disk.structural.recovery.blocked", severity: "error", scope: "file",
+				source: "diskMirror", layer: "disk", path: result.path,
+				data: { operationId: result.operationId, reason: result.reason },
+			});
+			return;
+		}
+		this.pendingStructuralPaths.delete(intent.operationId);
+		this.structuralBookkeepingApplied.delete(intent.operationId);
+		for (const path of intent.moves.flatMap((move) => [move.from, move.staging, move.to])) {
+			if (this.preservedUnresolved.get(path)?.reason === "structural-batch-failed") this.clearPreservedUnresolved(path);
+		}
+	}
+
+	private createStructuralRecovery(options: DiskStructuralRecoveryOptions, isScopeCurrent: () => boolean): StructuralIntentRecovery {
+		const verifyScope = () => {
+			if (!isScopeCurrent() || this.structuralRecoveryOptions !== options) throw new DiskProjectionChangedError();
+		};
+		const isPathAllowed = (path: string) => safeMarkdownPath(path) === path
+			&& normalizePath(path) === path && (this.isStructuralStagingPath(path) || options.isPathAllowed?.(path) !== false);
+		const store: StructuralIntentStore = {
+			get: async (operationId) => {
+				verifyScope();
+				const intent = await options.store.get(operationId);
+				verifyScope();
+				return intent;
+			},
+			list: async () => {
+				verifyScope();
+				const intents = await options.store.list();
+				verifyScope();
+				return intents;
+			},
+			put: async (intent) => {
+				verifyScope();
+				await options.store.put(intent);
+				verifyScope();
+			},
+			delete: async (operationId) => {
+				verifyScope();
+				await options.store.delete(operationId);
+				verifyScope();
+			},
+		};
+		return new StructuralIntentRecovery(options.scope, store, {
+			inspect: async (path) => {
+				verifyScope();
+				if (!isPathAllowed(path)) return { kind: "other" };
+				const file = this.app.vault.getAbstractFileByPath(path);
+				if (!file) return { kind: "missing" };
+				if (!(file instanceof TFile)) return { kind: "other" };
+				const content = await this.reconciliationWorker.io("vault.read", () => this.app.vault.read(file));
+				verifyScope();
+				if (!this.isFileCurrent(file, path)) throw new DiskProjectionChangedError();
+				return { kind: "file", content };
+			},
+			moveIfMatches: async (input) => {
+				verifyScope();
+				if (!isPathAllowed(input.from) || !isPathAllowed(input.to)) return false;
+				const file = this.app.vault.getAbstractFileByPath(input.from);
+				if (!(file instanceof TFile) || this.app.vault.getAbstractFileByPath(input.to)) return false;
+				const content = await this.reconciliationWorker.io("vault.read", () => this.app.vault.read(file));
+				const fingerprint = await exactMarkdownDiskFingerprint(content);
+				verifyScope();
+				if (!this.isFileCurrent(file, input.from) || content !== input.expectedContent
+					|| fingerprint.bytes !== input.fingerprint.bytes || fingerprint.hash !== input.fingerprint.hash
+					|| this.app.vault.getAbstractFileByPath(input.to)) return false;
+				this.markPendingPath(input.to, input.bodyId);
+				try {
+					await this.renameFileUnqueued(file, input.from, input.to, input.expectedContent, isScopeCurrent);
+					verifyScope();
+					return true;
+				} catch (error) {
+					if (error instanceof DiskMovedBeforeWriteError) return false;
+					throw error;
+				} finally {
+					this.clearPendingPath(input.to, input.bodyId);
+					this.expireRemoteRenameMarkers([input.to]);
+				}
+			},
+			completeBookkeeping: async (intent) => {
+				verifyScope();
+				await options.persistMaterializedPaths(intent.moves.map((move) => ({ bodyId: move.bodyId, path: move.to })));
+				verifyScope();
+				for (const move of intent.moves) {
+					const file = this.app.vault.getAbstractFileByPath(move.to);
+					if (!(file instanceof TFile)) throw new DiskProjectionChangedError();
+					const content = await this.reconciliationWorker.io("vault.read", () => this.app.vault.read(file));
+					verifyScope();
+					if (!this.isFileCurrent(file, move.to) || content !== move.expectedContent) throw new DiskMovedBeforeWriteError();
+				}
+				if (!this.structuralBookkeepingApplied.has(intent.operationId)) {
+					this.editorBindings.updatePathsAfterRename(new Map(intent.moves.map((move) => [move.from, move.to])));
+					this.structuralBookkeepingApplied.add(intent.operationId);
+				}
+				this.forgetPathPlans(intent.moves.flatMap((move) => [move.from, move.staging, move.to]));
+			},
+		});
+	}
+
+	private captureDiskScope(paths: readonly string[]): () => boolean {
+		const generation = this.diskScopeGeneration;
+		const runtime = this.vaultSync;
+		const bindings = paths.map((path) => [path, runtime.getFileId(path)] as const);
+		const recoveryOptions = this.structuralRecoveryOptions;
+		const isSourceCurrent = () => recoveryOptions?.isSourceCurrent?.() ?? true;
+		return () => this.reconciliationWorker.isOperational && generation === this.diskScopeGeneration && runtime === this.vaultSync && isSourceCurrent()
+			&& bindings.every(([path, bodyId]) => runtime.getFileId(path) === bodyId);
+	}
+
+	private hasPendingBodyWork(bodyId: string): boolean {
+		const body = this.vaultSync.bodies.get?.(bodyId);
+		return body !== null && body !== undefined
+			&& (body.dirty || body.unsettled > 0 || body.pendingLocalUpdates > 0);
+	}
+
 	async settleBody(input: {
 		path: string;
 		bodyId: string;
@@ -314,10 +570,17 @@ export class DiskMirror {
 		 * body (the durable, converged state) to disk.
 		 */
 		onMissingBase?: "preserve" | "preserve-disk";
-	}): Promise<"settled" | "replan" | "preserved-unresolved"> {
+	}): Promise<DiskBodySettlement> {
 		const path = this.acceptPath(input.path);
 		if (!path) return "preserved-unresolved";
-		return this.runPathWriteLocked(path, async () => {
+		const isScopeCurrent = this.captureDiskScope([path]);
+		return this.reconciliationWorker.run<DiskBodySettlement>(async () => {
+			if (!isScopeCurrent() || this.vaultSync.getFileId(path) !== input.bodyId) return "replan";
+			if (this.isStructuralPathPending(path)) return "preserved-unresolved";
+			if (this.hasPendingBodyWork(input.bodyId)) return "replan";
+			const source = this.vaultSync.getTextForPath?.(path);
+			const sourceContent = source ? yTextToString(source) : null;
+			if (sourceContent !== null && canonicalizeMarkdown(sourceContent) !== canonicalizeMarkdown(input.content)) return "replan";
 			let lease;
 			try {
 				lease = this.vaultSync.bodies.coordinator.acquireProjection(
@@ -332,12 +595,14 @@ export class DiskMirror {
 			}
 			try {
 				const proof = this.vaultSync.bodies.captureRevision(input.bodyId);
-				const isCurrent = () => this.vaultSync.bodies.coordinator.isProjectionCurrent(proof, path);
+				const isCurrent = () => isScopeCurrent() && !this.hasPendingBodyWork(input.bodyId)
+					&& this.vaultSync.bodies.coordinator.isProjectionCurrent(proof, path);
 				const outcome = await this.settleBodyUnlocked({
 					...input,
 					path,
 					content: canonicalizeMarkdown(input.content),
-				}, isCurrent);
+				}, isCurrent, isScopeCurrent);
+				if (!isScopeCurrent()) return "replan";
 				if (outcome === "settled") {
 					// Disk and body agree: older closed-write plans are void.
 					this.expectedDiskHashes.delete(path);
@@ -347,7 +612,7 @@ export class DiskMirror {
 			} finally {
 				lease.release();
 			}
-		});
+		}, { retainedBytes: reconciliationRetainedBytes(input.content, input.baseContent), label: "settle-body" });
 	}
 	async discardStaleBody(input: {
 		path: string;
@@ -357,7 +622,12 @@ export class DiskMirror {
 		const path = this.acceptPath(input.path);
 		if (!path) return false;
 		const expectedContent = canonicalizeMarkdown(input.expectedContent);
-		return this.runPathWriteLocked(path, async () => {
+		const isScopeCurrent = this.captureDiskScope([path]);
+		return this.reconciliationWorker.run(async () => {
+			if (!isScopeCurrent()) return false;
+			if (this.isStructuralPathPending(path)) return false;
+			const boundBodyId = this.vaultSync.getFileId(path);
+			if (boundBodyId !== undefined && boundBodyId !== input.bodyId) return false;
 			if (this.openPaths.has(path) || this.editorBindings.isBound(path)) {
 				this.recordPreservedUnresolved(path, "body-open-deferred");
 				return false;
@@ -366,23 +636,26 @@ export class DiskMirror {
 			if (!(file instanceof TFile)) return true;
 			let content: string;
 			try {
-				content = canonicalizeMarkdown(await this.app.vault.read(file));
+				content = canonicalizeMarkdown(await this.reconciliationWorker.io("vault.read", () => this.app.vault.read(file)));
 			} catch {
 				this.recordPreservedUnresolved(path, "body-settlement-failed");
 				return false;
 			}
+			if (!isScopeCurrent() || !this.isFileCurrent(file, path)) return false;
 			if (content !== expectedContent) {
 				this.recordPreservedUnresolved(path, "body-settlement-failed");
 				return false;
 			}
 
 			this.suppressDelete(path, 2);
-			await this.deleteLocalReplica(file);
+			if (!isScopeCurrent()) return false;
+			await this.deleteLocalReplica(file, path);
+			if (!isScopeCurrent()) return false;
 			this.clearPreservedUnresolved(path);
 			this.forgetPathPlans([path]);
 			this.log(`discarded stale settlement for ${input.bodyId} at "${path}"`);
 			return true;
-		});
+		}, { retainedBytes: reconciliationRetainedBytes(input.expectedContent, expectedContent), label: "discard-stale-body" });
 	}
 	async settleRename(input: {
 		from: string;
@@ -393,15 +666,35 @@ export class DiskMirror {
 		const from = this.acceptPath(input.from);
 		const to = this.acceptPath(input.to);
 		if (!from || !to) return "preserved-unresolved";
+		if (from === to) return "moved";
+		const isScopeCurrent = this.captureDiskScope([from, to]);
+		return this.reconciliationWorker.run(() => this.settleRenameUnqueued({ ...input, from, to }, isScopeCurrent), {
+			retainedBytes: reconciliationRetainedBytes(input.currentContent), label: "settle-rename",
+		});
+	}
+
+	private async settleRenameUnqueued(input: {
+		from: string;
+		to: string;
+		bodyId: string;
+		currentContent: string;
+	}, isScopeCurrent: () => boolean): Promise<"moved" | "source-absent" | "source-deleted" | "preserved-unresolved"> {
+		const from = this.acceptPath(input.from);
+		const to = this.acceptPath(input.to);
+		if (!from || !to) return "preserved-unresolved";
+		if (!isScopeCurrent()) return "preserved-unresolved";
+		if (this.isStructuralPathPending(from) || this.isStructuralPathPending(to)) return "preserved-unresolved";
+		const boundBodyId = this.vaultSync.getFileId(to);
+		if (boundBodyId !== undefined && boundBodyId !== input.bodyId) return "preserved-unresolved";
 		const currentContent = canonicalizeMarkdown(input.currentContent);
 		const source = this.app.vault.getAbstractFileByPath(from);
 		if (!(source instanceof TFile)) return "source-absent";
 		const target = this.app.vault.getAbstractFileByPath(to);
 		if (target instanceof TFile) {
-			const [sourceContent, targetContent] = (await Promise.all([
-				this.app.vault.read(source),
-				this.app.vault.read(target),
-			])).map(canonicalizeMarkdown);
+			const sourceContent = canonicalizeMarkdown(await this.reconciliationWorker.io("vault.read", () => this.app.vault.read(source)));
+			if (!isScopeCurrent()) return "preserved-unresolved";
+			const targetContent = canonicalizeMarkdown(await this.reconciliationWorker.io("vault.read", () => this.app.vault.read(target)));
+			if (!isScopeCurrent() || !this.isFileCurrent(source, from) || !this.isFileCurrent(target, to)) return "preserved-unresolved";
 			if (
 				sourceContent !== currentContent
 				|| targetContent !== currentContent
@@ -412,7 +705,9 @@ export class DiskMirror {
 				return "preserved-unresolved";
 			}
 			this.suppressDelete(from, 2);
-			await this.deleteLocalReplica(source);
+			if (!isScopeCurrent()) return "preserved-unresolved";
+			await this.deleteLocalReplica(source, from);
+			if (!isScopeCurrent()) return "preserved-unresolved";
 			this.clearPreservedUnresolved(from);
 			this.forgetPathPlans([from]);
 			this.log(`removed exact previous rename source "${from}" for ${input.bodyId}`);
@@ -422,12 +717,16 @@ export class DiskMirror {
 			this.recordPreservedUnresolved(from, "path-collision");
 			return "preserved-unresolved";
 		}
-		await this.moveBodies([{ from, to, bodyId: input.bodyId }]);
+		await this.moveBodiesUnqueued([{ from, to, bodyId: input.bodyId }], isScopeCurrent);
 		return "moved";
 	}
 
 
 	async moveBodies(moves: Array<{ from: string; to: string; bodyId: string }>): Promise<void> {
+		if (moves.length > MAX_STRUCTURAL_MOVES) {
+			this.blockStructuralAdmission();
+			throw new ReconciliationBackpressureError("Rename batch exceeds 64 moves. Retry smaller independent batches; oversized cycles must remain unresolved with source files unchanged.");
+		}
 		const normalized = moves.map((move) => {
 			const from = this.acceptPath(move.from);
 			const to = this.acceptPath(move.to);
@@ -435,113 +734,172 @@ export class DiskMirror {
 			return { ...move, from, to };
 		}).filter((move) => move.from !== move.to);
 		if (normalized.length === 0) return;
+		const sourceBytes = normalized.reduce((total, move) => {
+			const source = this.app.vault.getAbstractFileByPath(move.from);
+			return total + (source instanceof TFile ? Math.max(0, source.stat.size) * 2 : 0);
+		}, 0);
+		if (sourceBytes > MAX_STRUCTURAL_SOURCE_BYTES) {
+			this.blockStructuralAdmission();
+			throw new ReconciliationBackpressureError("Rename batch exceeds the 16 MiB retained source-text limit. Retry smaller independent batches; source files and durable plans remain unchanged.");
+		}
+		const isScopeCurrent = this.captureDiskScope(normalized.flatMap((move) => [move.from, move.to]));
+		return this.reconciliationWorker.run(() => this.moveBodiesUnqueued(normalized, isScopeCurrent, sourceBytes), {
+			retainedBytes: sourceBytes * 2 + normalized.reduce((total, move) => total + 128
+				+ reconciliationRetainedBytes(move.from, move.to, move.bodyId, move.from, move.to, move.bodyId, move.bodyId), 0),
+			label: "structural-move-batch",
+		}).catch((error: unknown) => {
+			if (error instanceof ReconciliationBackpressureError) this.blockStructuralAdmission();
+			throw error;
+		});
+	}
 
+	private async moveBodiesUnqueued(moves: Array<{ from: string; to: string; bodyId: string }>, isScopeCurrent: () => boolean, reservedSourceBytes = MAX_STRUCTURAL_SOURCE_BYTES): Promise<void> {
+		if (!isScopeCurrent()) throw new DiskProjectionChangedError();
+		if (moves.some((move) => this.isStructuralPathPending(move.from) || this.isStructuralPathPending(move.to))) {
+			throw new Error("Structural recovery must finish before another disk rename");
+		}
+		if (moves.length === 1) {
+			const move = moves[0]!;
+			const boundBodyId = this.vaultSync.getFileId(move.to);
+			if (boundBodyId !== undefined && boundBodyId !== move.bodyId) throw new DiskProjectionChangedError();
+		}
 		const fromPaths = new Set<string>();
 		const toPaths = new Set<string>();
-		for (const move of normalized) {
+		for (const move of moves) {
 			if (fromPaths.has(move.from)) throw new Error(`Duplicate move source: ${move.from}`);
 			if (toPaths.has(move.to)) throw new Error(`Duplicate move destination: ${move.to}`);
 			fromPaths.add(move.from);
 			toPaths.add(move.to);
 		}
-		for (const move of normalized) {
+		const sources: Array<{ move: typeof moves[number]; file: TFile; content: string }> = [];
+		let retainedSourceBytes = 0;
+		for (const move of moves) {
 			const target = this.app.vault.getAbstractFileByPath(move.to);
-			if (target && !fromPaths.has(move.to)) {
-				throw new Error(`Move destination already exists: ${move.to}`);
+			if (target && !fromPaths.has(move.to)) throw new Error(`Move destination already exists: ${move.to}`);
+			const source = this.app.vault.getAbstractFileByPath(move.from);
+			if (!source) continue;
+			if (!(source instanceof TFile)) throw new Error(`Move source is not a file: ${move.from}`);
+			const content = await this.reconciliationWorker.io("vault.read", () => this.app.vault.read(source));
+			if (!this.isFileCurrent(source, move.from)) throw new DiskProjectionChangedError();
+			retainedSourceBytes += reconciliationRetainedBytes(content);
+			if (retainedSourceBytes > MAX_STRUCTURAL_SOURCE_BYTES || retainedSourceBytes > reservedSourceBytes) {
+				this.blockStructuralAdmission();
+				throw new ReconciliationBackpressureError("Rename source text exceeds its bounded reservation or changed during planning. Retry smaller independent batches; all source files and durable plans remain unchanged.");
 			}
+			sources.push({ move, file: source, content });
 		}
-
-		const staged: Array<{
-			move: { from: string; to: string; bodyId: string };
-			temp: string;
-		}> = [];
-		const completed: typeof staged = [];
-		try {
-			for (const move of normalized) {
-				const source = this.app.vault.getAbstractFileByPath(move.from);
-				if (!(source instanceof TFile)) continue;
+		if (sources.length === 0) return;
+		if (sources.length === 1 && !this.app.vault.getAbstractFileByPath(sources[0]!.move.to)) {
+			const source = sources[0]!;
+			await this.renameFileUnqueued(source.file, source.move.from, source.move.to, source.content, isScopeCurrent);
+			if (!isScopeCurrent()) throw new DiskProjectionChangedError();
+			await this.structuralRecoveryOptions?.persistMaterializedPaths([{ bodyId: source.move.bodyId, path: source.move.to }]);
+			if (!isScopeCurrent()) throw new DiskProjectionChangedError();
+			this.editorBindings.updatePathsAfterRename(new Map([[source.move.from, source.move.to]]));
+			this.forgetPathPlans([source.move.from, source.move.to]);
+			this.clearPendingPath(source.move.to, source.move.bodyId);
+			this.expireRemoteRenameMarkers([source.move.to]);
+			return;
+		}
+		const port = this.structuralRenamePlans;
+		const recoveryOptions = this.structuralRecoveryOptions;
+		if (!recoveryOptions && (!port || typeof port.staged !== "function")) throw new Error("Multi-step disk rename requires durable structural plan storage");
+		const temporaryPaths = new Set<string>();
+		const plan: DiskStructuralRenamePlan = Object.freeze({
+			id: crypto.randomUUID(),
+			moves: Object.freeze(sources.map(({ move, content }) => {
 				const slash = move.from.lastIndexOf("/");
-				const dir = slash >= 0 ? move.from.slice(0, slash + 1) : "";
-				let temp: string;
+				const directory = slash >= 0 ? move.from.slice(0, slash + 1) : "";
+				let temporaryPath: string;
 				do {
-					temp = `${dir}.yaos-moving-${move.bodyId}-${Math.random().toString(36).slice(2)}.md`;
-				} while (this.app.vault.getAbstractFileByPath(temp));
-				const content = await this.app.vault.read(source);
-				await this.suppressWrite(temp, content, 2);
-				this.markPendingPath(temp, move.bodyId);
-				this.suppressDelete(move.from, 2);
-				this._pendingRemoteRenameNewPaths.add(temp);
-				await this.app.fileManager.renameFile(source, temp);
-				staged.push({ move, temp });
+					temporaryPath = `${directory}YAOS.yaos-moving-${crypto.randomUUID()}.md`;
+				} while (this.app.vault.getAbstractFileByPath(temporaryPath) || temporaryPaths.has(temporaryPath)
+					|| fromPaths.has(temporaryPath) || toPaths.has(temporaryPath));
+				temporaryPaths.add(temporaryPath);
+				return Object.freeze({ ...move, temporaryPath, expectedContent: content });
+			})),
+		});
+		if (recoveryOptions) {
+			const intent: StoredStructuralIntent = {
+				format: 1, kind: "rename-batch", phase: "staging", operationId: plan.id,
+				scope: { ...recoveryOptions.scope }, createdAt: Date.now(),
+				moves: await Promise.all(plan.moves.map(async (move) => ({
+					bodyId: move.bodyId, from: move.from, staging: move.temporaryPath, to: move.to,
+					expectedContent: move.expectedContent, fingerprint: await exactMarkdownDiskFingerprint(move.expectedContent),
+				}))),
+			};
+			if (!isScopeCurrent()) throw new DiskProjectionChangedError();
+			this.trackStructuralIntent(intent);
+			try {
+				const recovery = this.createStructuralRecovery(recoveryOptions, isScopeCurrent);
+				await recovery.prepare(intent);
+				const result = await recovery.recover(intent.operationId);
+				if (!isScopeCurrent()) throw new DiskProjectionChangedError();
+				this.finishStructuralRecovery(intent, result);
+				if (result.status === "blocked") throw new Error(`Structural rename blocked at ${result.path}: ${result.reason}`);
+			} catch (error) {
+				for (const path of this.pendingStructuralPaths.get(intent.operationId) ?? []) this.recordPreservedUnresolved(path, "structural-batch-failed");
+				throw error;
 			}
-			for (const item of staged) {
-				await this.ensureParentFolder(item.move.to);
-				const temporary = this.app.vault.getAbstractFileByPath(item.temp);
-				if (!(temporary instanceof TFile)) {
-					throw new Error(`Staged move disappeared: ${item.temp}`);
-				}
-				const content = await this.app.vault.read(temporary);
-				await this.suppressWrite(item.move.to, content, 2);
-				this.markPendingPath(item.move.to, item.move.bodyId);
-				this.suppressDelete(item.temp, 2);
-				this._pendingRemoteRenameNewPaths.add(item.move.to);
-				await this.app.fileManager.renameFile(temporary, item.move.to);
-				this.clearPendingPath(item.temp, item.move.bodyId);
-				completed.push(item);
+			return;
+		}
+		await port!.prepare(plan);
+		try {
+			for (const [index, move] of plan.moves.entries()) {
+				if (!isScopeCurrent()) throw new DiskProjectionChangedError();
+				this.markPendingPath(move.temporaryPath, move.bodyId);
+				await this.renameFileUnqueued(sources[index]!.file, move.from, move.temporaryPath, move.expectedContent, isScopeCurrent);
 			}
-			this.editorBindings.updatePathsAfterRename(
-				new Map(normalized.map((move) => [move.from, move.to])),
-			);
-			this.forgetPathPlans(normalized.flatMap((move) => [move.from, move.to]));
-			this.expireRemoteRenameMarkers([
-				...staged.map((item) => item.temp),
-				...normalized.map((move) => move.to),
-			]);
-			for (const move of normalized) this.clearPendingPath(move.to, move.bodyId);
+			if (!isScopeCurrent()) throw new DiskProjectionChangedError();
+			await port!.staged(plan);
+			for (const [index, move] of plan.moves.entries()) {
+				if (!isScopeCurrent()) throw new DiskProjectionChangedError();
+				this.markPendingPath(move.to, move.bodyId);
+				await this.renameFileUnqueued(sources[index]!.file, move.temporaryPath, move.to, move.expectedContent, isScopeCurrent);
+				this.clearPendingPath(move.temporaryPath, move.bodyId);
+			}
+			for (const [index, move] of plan.moves.entries()) {
+				const file = sources[index]!.file;
+				const content = await this.reconciliationWorker.io("vault.read", () => this.app.vault.read(file));
+				if (!isScopeCurrent() || !this.isFileCurrent(file, move.to) || content !== move.expectedContent
+					|| this.app.vault.getAbstractFileByPath(move.temporaryPath)) throw new DiskProjectionChangedError();
+			}
+			if (!isScopeCurrent()) throw new DiskProjectionChangedError();
+			this.editorBindings.updatePathsAfterRename(new Map(plan.moves.map((move) => [move.from, move.to])));
+			this.forgetPathPlans(plan.moves.flatMap((move) => [move.from, move.to]));
+			await port!.complete(plan);
 		} catch (error) {
-			let rollbackFailed = false;
-			for (const item of [...completed].reverse()) {
-				const target = this.app.vault.getAbstractFileByPath(item.move.to);
-				if (!(target instanceof TFile)) continue;
-				try {
-					const content = await this.app.vault.read(target);
-					await this.suppressWrite(item.move.from, content, 2);
-					this.suppressDelete(item.move.to, 2);
-					this._pendingRemoteRenameNewPaths.add(item.move.from);
-					await this.app.fileManager.renameFile(target, item.move.from);
-				} catch {
-					rollbackFailed = true;
-				}
+			for (const move of plan.moves) {
+				this.recordPreservedUnresolved(move.from, "structural-batch-failed");
+				this.recordPreservedUnresolved(move.to, "structural-batch-failed");
+				if (this.app.vault.getAbstractFileByPath(move.temporaryPath)) this.recordPreservedUnresolved(move.temporaryPath, "structural-batch-failed");
 			}
-			for (const item of staged) {
-				if (completed.includes(item)) continue;
-				const temporary = this.app.vault.getAbstractFileByPath(item.temp);
-				if (!(temporary instanceof TFile)) continue;
-				try {
-					const content = await this.app.vault.read(temporary);
-					await this.suppressWrite(item.move.from, content, 2);
-					this.suppressDelete(item.temp, 2);
-					this._pendingRemoteRenameNewPaths.add(item.move.from);
-					await this.app.fileManager.renameFile(temporary, item.move.from);
-				} catch {
-					rollbackFailed = true;
-				}
-			}
-			if (rollbackFailed) {
-				for (const move of normalized) {
-					this.recordPreservedUnresolved(move.from, "structural-batch-failed");
-					this.recordPreservedUnresolved(move.to, "structural-batch-failed");
-				}
-			}
-			this.expireRemoteRenameMarkers([
-				...staged.map((item) => item.temp),
-				...normalized.flatMap((move) => [move.from, move.to]),
-			]);
-			for (const item of staged) this.clearPendingPath(item.temp, item.move.bodyId);
-			for (const move of normalized) this.clearPendingPath(move.to, move.bodyId);
 			throw error;
+		} finally {
+			for (const move of plan.moves) {
+				this.clearPendingPath(move.temporaryPath, move.bodyId);
+				this.clearPendingPath(move.to, move.bodyId);
+			}
+			this.expireRemoteRenameMarkers(plan.moves.flatMap((move) => [move.temporaryPath, move.to]));
 		}
 	}
+
+	private async renameFileUnqueued(file: TFile, from: string, to: string, expectedContent: string, isScopeCurrent: () => boolean): Promise<void> {
+		const verifySource = () => {
+			if (!isScopeCurrent() || !this.isFileCurrent(file, from)) throw new DiskProjectionChangedError();
+			if (this.app.vault.getAbstractFileByPath(to)) throw new Error(`Move destination already exists: ${to}`);
+		};
+		verifySource();
+		await this.ensureParentFolder(to, verifySource);
+		await this.suppressWrite(to, expectedContent, 2);
+		const content = await this.reconciliationWorker.io("vault.read", () => this.app.vault.read(file));
+		verifySource();
+		if (content !== expectedContent) throw new DiskMovedBeforeWriteError();
+		this.suppressDelete(from, 2);
+		this._pendingRemoteRenameNewPaths.add(to);
+		await this.reconciliationWorker.io("fileManager.renameFile", () => this.app.fileManager.renameFile(file, to));
+	}
+
 	private expireRemoteRenameMarkers(paths: readonly string[]): void {
 		window.setTimeout(() => {
 			for (const path of paths) this._pendingRemoteRenameNewPaths.delete(path);
@@ -555,7 +913,42 @@ export class DiskMirror {
 		generation: number;
 		baselineContent?: string | null;
 	}): Promise<DeleteSettlement> {
-		await this.settlement?.conflictEpisodes?.close(input.bodyId);
+		const path = this.acceptPath(input.path);
+		if (!path) return "preserved-unresolved";
+		const isScopeCurrent = this.captureDiskScope([path]);
+		const outcome = await this.reconciliationWorker.run(() => this.deleteBodyUnqueued({ ...input, path }, isScopeCurrent), {
+			retainedBytes: reconciliationRetainedBytes(input.baselineContent), label: "delete-body",
+		});
+		if (typeof outcome === "string") return outcome;
+		if (!isScopeCurrent() || !this.isFileCurrent(outcome.file, path)) return "preserved-unresolved";
+		try {
+			const committed = await outcome.settlement.commitLocalBody({
+				bodyId: input.bodyId, path, content: outcome.content, reason: "delete-revive",
+			});
+			if (!isScopeCurrent() || committed === "superseded") return "preserved-unresolved";
+			return await this.reconciliationWorker.run<DeleteSettlement>(async () => {
+				if (!isScopeCurrent() || !this.isFileCurrent(outcome.file, path)) return "preserved-unresolved";
+				const content = canonicalizeMarkdown(await this.reconciliationWorker.io("vault.read", () => this.app.vault.read(outcome.file)));
+				if (!isScopeCurrent() || !this.isFileCurrent(outcome.file, path) || content !== outcome.content) return "preserved-unresolved";
+				this.clearPreservedUnresolved(path);
+				return "revived";
+			}, { retainedBytes: reconciliationRetainedBytes(outcome.content, input.baselineContent), label: "verify-delete-revival" });
+		} catch {
+			if (isScopeCurrent()) this.recordPreservedUnresolved(path, "body-settlement-failed");
+			return "preserved-unresolved";
+		}
+	}
+
+	private async deleteBodyUnqueued(input: {
+		path: string;
+		bodyId: string;
+		generation: number;
+		baselineContent?: string | null;
+	}, isScopeCurrent: () => boolean): Promise<DeleteSettlement | DiskDeleteRevival> {
+		if (!isScopeCurrent()) return "preserved-unresolved";
+		if (this.isStructuralPathPending(input.path)) return "preserved-unresolved";
+		const boundBodyId = this.vaultSync.getFileId(input.path);
+		if (boundBodyId !== undefined && boundBodyId !== input.bodyId) return "preserved-unresolved";
 		const path = this.acceptPath(input.path);
 		if (!path) return "preserved-unresolved";
 		if (
@@ -568,17 +961,24 @@ export class DiskMirror {
 		}
 		const file = this.app.vault.getAbstractFileByPath(path);
 		if (!(file instanceof TFile)) {
+			if (file) {
+				this.recordPreservedUnresolved(path, "path-collision");
+				return "preserved-unresolved";
+			}
+			await this.settlement?.conflictEpisodes?.close(input.bodyId);
+			if (!isScopeCurrent()) return "preserved-unresolved";
 			this.clearPreservedUnresolved(path);
 			return "deleted";
 		}
 
 		let diskContent: string;
 		try {
-			diskContent = canonicalizeMarkdown(await this.app.vault.read(file));
+			diskContent = canonicalizeMarkdown(await this.reconciliationWorker.io("vault.read", () => this.app.vault.read(file)));
 		} catch {
 			this.recordPreservedUnresolved(path, "remote-delete-read-failed");
 			return "preserved-unresolved";
 		}
+		if (!isScopeCurrent() || !this.isFileCurrent(file, path)) return "preserved-unresolved";
 		if (input.baselineContent == null) {
 			this.recordPreservedUnresolved(path, "remote-delete-missing-baseline");
 			return "preserved-unresolved";
@@ -588,24 +988,24 @@ export class DiskMirror {
 				this.recordPreservedUnresolved(path, "body-settlement-failed");
 				return "preserved-unresolved";
 			}
-			try {
-				await this.settlement.commitLocalBody({
-					bodyId: input.bodyId,
-					path,
-					content: diskContent,
-					reason: "delete-revive",
-				});
-				this.clearPreservedUnresolved(path);
-				return "revived";
-			} catch {
-				this.recordPreservedUnresolved(path, "body-settlement-failed");
-				return "preserved-unresolved";
-			}
+			return { kind: "revive", file, content: diskContent, settlement: this.settlement };
 		}
 
+		if (this.settlement?.isBodyLive?.(input.bodyId) || this.openPaths.has(path) || this.editorBindings.isBound(path)) {
+			this.recordPreservedUnresolved(path, "body-open-deferred");
+			return "preserved-unresolved";
+		}
 		this.editorBindings.unbindByPath(path);
 		this.suppressDelete(path, 2);
-		await this.deleteLocalReplica(file);
+		if (!isScopeCurrent()) return "preserved-unresolved";
+		await this.deleteLocalReplica(file, path);
+		if (!isScopeCurrent()) return "preserved-unresolved";
+		if (this.app.vault.getAbstractFileByPath(path)) {
+			this.recordPreservedUnresolved(path, "path-collision");
+			return "preserved-unresolved";
+		}
+		await this.settlement?.conflictEpisodes?.close(input.bodyId);
+		if (!isScopeCurrent()) return "preserved-unresolved";
 		this.clearPreservedUnresolved(path);
 		this.forgetPathPlans([path]);
 		return "deleted";
@@ -688,8 +1088,9 @@ export class DiskMirror {
 		}
 		this.unobserveText(path);
 		if (this.settlement?.settleClosedBody) {
+			const isScopeCurrent = this.captureDiskScope([path]);
 			void this.settlement.settleClosedBody(path).catch(() => {
-				this.recordPreservedUnresolved(path, "body-settlement-failed");
+				if (isScopeCurrent()) this.recordPreservedUnresolved(path, "body-settlement-failed");
 			});
 		}
 	}
@@ -764,11 +1165,20 @@ export class DiskMirror {
 	 */
 	scheduleWrite(path: string, options: { expectedDiskHash?: string } = {}): void {
 		path = normalizePath(path);
+		if (!this.admitWritePath(path)) return;
 		if (options.expectedDiskHash !== undefined) this.expectedDiskHashes.set(path, options.expectedDiskHash);
+		if (this.writeQueue.has(path)) return;
 		if (this.openPaths.has(path)) {
+			const closedTimer = this.debounceTimers.get(path);
+			if (closedTimer !== undefined) window.clearTimeout(closedTimer);
+			this.debounceTimers.delete(path);
 			this.scheduleOpenWrite(path);
 			return;
 		}
+		const openTimer = this.openWriteTimers.get(path);
+		if (openTimer !== undefined) window.clearTimeout(openTimer);
+		this.openWriteTimers.delete(path);
+		this.pendingOpenWrites.delete(path);
 
 		this.scheduleClosedWrite(path);
 	}
@@ -787,6 +1197,7 @@ export class DiskMirror {
 	}
 
 	private scheduleClosedWrite(path: string): void {
+		if (!this.admitWritePath(path)) return;
 		// Clear existing debounce for this path
 		const existing = this.debounceTimers.get(path);
 		if (existing) window.clearTimeout(existing);
@@ -805,6 +1216,7 @@ export class DiskMirror {
 	}
 
 	private scheduleOpenWrite(path: string): void {
+		if (!this.admitWritePath(path)) return;
 		this.pendingOpenWrites.add(path);
 
 		const existing = this.openWriteTimers.get(path);
@@ -850,37 +1262,31 @@ export class DiskMirror {
 	}
 
 	/**
-	 * Drain the write queue with bounded concurrency.
-	 * Processes up to MAX_CONCURRENT_WRITES in parallel, then loops.
+	 * Drain coalesced projections through the shared worker one at a time.
 	 */
 	private async drain(): Promise<void> {
 		this.draining = true;
 
 		try {
-			while (this.writeQueue.size > 0) {
-				// If the queue is very deep, log a warning and pause briefly
-				if (this.writeQueue.size > BURST_THRESHOLD) {
-					this.log(`drain: ${this.writeQueue.size} writes queued (burst), cooling down 200ms`);
-					await new Promise((r) => window.setTimeout(r, 200));
+			while (this.writeQueue.size > 0 && this.reconciliationWorker.isOperational) {
+				const [path] = this.writeQueue;
+				if (path === undefined) break;
+				this.writeQueue.delete(path);
+				const force = this.forcedWritePaths.delete(path);
+				try {
+					await this.flushWrite(path, force);
+				} catch (error) {
+					if (!this.reconciliationWorker.isOperational || error instanceof ReconciliationBackpressureError) {
+						if (this.admitWritePath(path)) {
+							this.writeQueue.add(path);
+							if (force) this.forcedWritePaths.add(path);
+						}
+						if (!this.reconciliationWorker.isOperational) return;
+						await new Promise<void>((resolve) => window.setTimeout(resolve, BODY_OBSERVER_RETRY_MS));
+						continue;
+					}
+					throw error;
 				}
-
-				// Take up to MAX_CONCURRENT_WRITES from the queue
-				const batch: string[] = [];
-				for (const path of this.writeQueue) {
-					batch.push(path);
-					if (batch.length >= MAX_CONCURRENT_WRITES) break;
-				}
-				for (const path of batch) {
-					this.writeQueue.delete(path);
-				}
-
-				// Execute writes in parallel
-				await Promise.all(
-					batch.map((path) => {
-						const force = this.forcedWritePaths.delete(path);
-						return this.flushWrite(path, force);
-					}),
-				);
 			}
 		} finally {
 			this.draining = false;
@@ -894,7 +1300,7 @@ export class DiskMirror {
 		content: string;
 		baseContent?: string;
 		onMissingBase?: "preserve" | "preserve-disk";
-	}, isCurrent: () => boolean): Promise<"settled" | "replan" | "preserved-unresolved"> {
+	}, isCurrent: () => boolean, isIdentityCurrent: () => boolean): Promise<DiskBodySettlement> {
 		const { path, bodyId, content } = input;
 		if (!isCurrent()) return "replan";
 		if (this.openPaths.has(path) || this.editorBindings.isBound(path)) {
@@ -919,13 +1325,18 @@ export class DiskMirror {
 			});
 			return "settled";
 		}
+		const isProjectionCurrent = isCurrent;
+		const isBindingCurrent = isIdentityCurrent;
+		isCurrent = () => isProjectionCurrent() && this.isFileCurrent(existing, path);
+		isIdentityCurrent = () => isBindingCurrent() && this.isFileCurrent(existing, path);
 
 		let diskContent: string;
 		let rawDiskContent: string;
 		try {
-			rawDiskContent = await this.app.vault.read(existing);
+			rawDiskContent = await this.reconciliationWorker.io("vault.read", () => this.app.vault.read(existing));
 			diskContent = canonicalizeMarkdown(rawDiskContent);
 		} catch {
+			if (!isCurrent()) return "replan";
 			this.recordPreservedUnresolved(path, "body-settlement-failed");
 			return "preserved-unresolved";
 		}
@@ -935,19 +1346,22 @@ export class DiskMirror {
 		if (episodes?.get(bodyId)) {
 			try {
 				await episodes.preserve({ bodyId, path, epoch: this.vaultSync.bodies.get?.(bodyId)?.bodyEpoch, disk: diskContent, body: content, device: this.getDeviceName() });
+				if (!isCurrent()) return "replan";
 			} catch {
+				if (!isCurrent()) return "replan";
 				this.recordPreservedUnresolved(path, "conflict-artifact-write-failed");
 				return "preserved-unresolved";
 			}
 			this.settlement?.markDivergence?.(bodyId, "decision-required");
 			this.recordPreservedUnresolved(path, "body-settlement-failed");
-			if (diskContent !== content) await this.writeSettledBody(path, diskContent, content, isCurrent);
+			if (diskContent !== content) await this.writeSettledBody(path, diskContent, content, isCurrent, rawDiskContent);
 			return "preserved-unresolved";
 		}
 		const [diskHash, remoteHash] = await Promise.all([
 			contentBaselineHash(diskContent),
 			contentBaselineHash(content),
 		]);
+		if (!isCurrent()) return "replan";
 		if (diskHash === remoteHash) {
 			this._onDiskWriteCallback?.(path, remoteHash, content);
 			this.clearPreservedUnresolved(path);
@@ -959,13 +1373,14 @@ export class DiskMirror {
 			if (!isCurrent() || this.settlement !== settlement
 				|| artifactHash !== episodes.snapshot().artifacts[path]) return "replan";
 			if (verified) {
-				const currentDisk = await this.app.vault.read(existing);
+				const currentDisk = await this.reconciliationWorker.io("vault.read", () => this.app.vault.read(existing));
 				if (!isCurrent() || this.settlement !== settlement || currentDisk !== rawDiskContent
 					|| artifactHash !== episodes.snapshot().artifacts[path]) return "replan";
 				if (this.diskIngestBlocked(bodyId, path, content, diskContent)) return "preserved-unresolved";
 				const committed = await settlement.commitLocalBody({
 					bodyId, path, content: diskContent, expectedBodyContent: content, reason: "external-edit",
 				});
+				if (!isIdentityCurrent()) return "replan";
 				if (committed !== "superseded") {
 					this.settlement?.markDivergence?.(bodyId, "none");
 					this.clearPreservedUnresolved(path);
@@ -980,9 +1395,20 @@ export class DiskMirror {
 				: await this.settlement.getCommonBase(bodyId);
 			if (!isCurrent()) return "replan";
 			const baseline = this.settlement.getBaseline(path);
+			const agreement = this.planRawDiskAgreement(diskContent, content,
+				input.baseContent ?? (base?.kind === "available" ? base.settlement.content : null),
+				baseline?.contentHash ?? null, diskHash, remoteHash);
+			if (agreement.kind === "preserve" && agreement.merge === null
+				&& (input.baseContent !== undefined || base?.kind === "available" || baseline?.contentHash === remoteHash)) {
+				return this.preserveRawDiskReplacement(bodyId, path, diskContent, content, diskHash, remoteHash, isCurrent);
+			}
+			if (agreement.kind === "import-local"
+				&& (baseline?.trustedWhole === true || input.baseContent !== undefined || base?.kind === "available")) {
+				return this.commitDiskWinner(bodyId, path, diskContent, "external-edit", diskHash, content, isCurrent, isIdentityCurrent);
+			}
 			if (base !== null && base.kind !== "invalid"
 				&& baseline?.trustedWhole === true && baseline.contentHash === diskHash) {
-				const written = await this.writeSettledBody(path, diskContent, content, isCurrent);
+				const written = await this.writeSettledBody(path, diskContent, content, isCurrent, rawDiskContent);
 				if (written !== "written") return written === "moved" ? "replan" : "preserved-unresolved";
 				this.settlement.markDivergence?.(bodyId, "none");
 				this.clearPreservedUnresolved(path);
@@ -990,7 +1416,7 @@ export class DiskMirror {
 			}
 			if (base !== null && base.kind !== "available") {
 				if (input.onMissingBase === "preserve-disk") {
-					return this.preserveDiskThenProjectBody(bodyId, path, diskContent, content, isCurrent);
+					return this.preserveDiskThenProjectBody(bodyId, path, diskContent, content, isCurrent, rawDiskContent);
 				}
 				this.settlement.markDivergence?.(bodyId, "preserved");
 				this.recordPreservedUnresolved(path, "body-settlement-failed");
@@ -999,7 +1425,7 @@ export class DiskMirror {
 			let merge: ThreeWayMergeResult;
 			let composeMerged = (merged: string): string => merged;
 			if (base === null) {
-				merge = mergeThreeWayText(canonicalizeMarkdown(input.baseContent ?? ""), diskContent, content);
+				merge = this.mergeWholeMarkdownAgreement(canonicalizeMarkdown(input.baseContent ?? ""), diskContent, content);
 			} else if (base.settlement.format === 2 && base.settlement.agreement === "body-only") {
 				const diskComponents = splitMarkdownComponents(diskContent);
 				const remoteComponents = splitMarkdownComponents(content);
@@ -1015,7 +1441,7 @@ export class DiskMirror {
 				);
 				composeMerged = (merged) => composeMarkdownComponents(remoteComponents.propertiesRegion, merged);
 			} else {
-				merge = mergeThreeWayText(base.settlement.content, diskContent, content);
+				merge = this.mergeWholeMarkdownAgreement(base.settlement.content, diskContent, content);
 			}
 			if (merge.kind === "too-large") {
 				this.settlement.markDivergence?.(bodyId, "preserved");
@@ -1029,13 +1455,15 @@ export class DiskMirror {
 							bodyId, path, epoch: this.vaultSync.bodies.get?.(bodyId)?.bodyEpoch, disk: diskContent, body: content,
 							base: input.baseContent ?? base?.settlement.content ?? merge.base, device: this.getDeviceName(),
 						});
+						if (!isCurrent()) return "replan";
 					} catch {
+						if (!isCurrent()) return "replan";
 						this.recordPreservedUnresolved(path, "conflict-artifact-write-failed");
 						return "preserved-unresolved";
 					}
 					this.settlement.markDivergence?.(bodyId, "decision-required");
 					this.recordPreservedUnresolved(path, "body-settlement-failed");
-					await this.writeSettledBody(path, diskContent, content, isCurrent);
+					await this.writeSettledBody(path, diskContent, content, isCurrent, rawDiskContent);
 					return "preserved-unresolved";
 				}
 				const overlapKey = remoteHash;
@@ -1047,12 +1475,15 @@ export class DiskMirror {
 				}
 				try {
 					await createMarkdownConflictArtifact(this.app, path, content, {
+						executeHost: (operation, execute) => this.reconciliationWorker.io(operation, execute),
 						deviceName: this.getDeviceName(),
 						reason: "three-way-overlap",
 						source: "crdt",
 						trace: (message, details) => this.trace?.("conflict", message, details),
 					});
+					if (!isCurrent()) return "replan";
 				} catch {
+					if (!isCurrent()) return "replan";
 					this.recordPreservedUnresolved(path, "conflict-artifact-write-failed");
 					return "preserved-unresolved";
 				}
@@ -1063,12 +1494,13 @@ export class DiskMirror {
 			}
 			const mergedContent = composeMerged(merge.content);
 			if (mergedContent === content) {
-				const written = await this.writeSettledBody(path, diskContent, content, isCurrent);
+				const written = await this.writeSettledBody(path, diskContent, content, isCurrent, rawDiskContent);
 				if (written !== "written") return written === "moved" ? "replan" : "preserved-unresolved";
 				this.settlement.markDivergence?.(bodyId, "none");
 				this.clearPreservedUnresolved(path);
 				return "settled";
 			}
+			if (!isCurrent()) return "replan";
 			if (this.diskIngestBlocked(bodyId, path, content, mergedContent)) return "preserved-unresolved";
 			const committed = await this.settlement.commitMergedBody({
 				bodyId,
@@ -1076,12 +1508,18 @@ export class DiskMirror {
 				expectedBodyContent: content,
 				mergedContent,
 			});
+			if (!isIdentityCurrent()) return "replan";
 			if (committed === "superseded") return "replan";
 			this.settlement.markDivergence?.(bodyId, "none");
 			return "replan";
 		}
 
 		const baseline = this.settlement?.getBaseline(path) ?? null;
+		const agreement = this.planRawDiskAgreement(diskContent, content, input.baseContent ?? null,
+			baseline?.contentHash ?? null, diskHash, remoteHash);
+		if (agreement.kind === "preserve") {
+			return this.preserveRawDiskReplacement(bodyId, path, diskContent, content, diskHash, remoteHash, isCurrent);
+		}
 		const decision = decideClosedFileConflict({
 			baselineHash: baseline?.contentHash ?? null,
 			diskHash,
@@ -1091,13 +1529,13 @@ export class DiskMirror {
 		});
 
 		if (decision.kind === "apply-remote-to-disk") {
-			const written = await this.writeSettledBody(path, diskContent, content, isCurrent);
+			const written = await this.writeSettledBody(path, diskContent, content, isCurrent, rawDiskContent);
 			if (written !== "written") return written === "moved" ? "replan" : "preserved-unresolved";
 			this.clearPreservedUnresolved(path);
 			return "settled";
 		}
 		if (decision.kind === "import-disk-to-crdt") {
-			return this.commitDiskWinner(bodyId, path, diskContent, "external-edit", diskHash, content);
+			return this.commitDiskWinner(bodyId, path, diskContent, "external-edit", diskHash, content, isCurrent, isIdentityCurrent);
 		}
 		if (decision.kind === "no-op") {
 			this._onDiskWriteCallback?.(path, remoteHash, content);
@@ -1109,24 +1547,75 @@ export class DiskMirror {
 		const preservedSource = decision.preserveDisk ? "disk" : "crdt";
 		try {
 			await createMarkdownConflictArtifact(this.app, path, preservedContent, {
+				executeHost: (operation, execute) => this.reconciliationWorker.io(operation, execute),
 				deviceName: this.getDeviceName(),
 				reason: `closed-file-${decision.reason}`,
 				source: preservedSource,
 				trace: (message: string, details: Record<string, unknown>) =>
 					this.trace?.("conflict", message, details),
 			});
+			if (!isCurrent()) return "replan";
 		} catch {
+			if (!isCurrent()) return "replan";
 			this.recordPreservedUnresolved(path, "conflict-artifact-write-failed");
 			return "preserved-unresolved";
 		}
 
 		if (decision.winner === "disk") {
-			return this.commitDiskWinner(bodyId, path, diskContent, "external-edit", diskHash, content);
+			return this.commitDiskWinner(bodyId, path, diskContent, "external-edit", diskHash, content, isCurrent, isIdentityCurrent);
 		}
-		const written = await this.writeSettledBody(path, diskContent, content, isCurrent);
+		const written = await this.writeSettledBody(path, diskContent, content, isCurrent, rawDiskContent);
 		if (written !== "written") return written === "moved" ? "replan" : "preserved-unresolved";
 		this.clearPreservedUnresolved(path);
 		return "settled";
+	}
+
+	private mergeWholeMarkdownAgreement(base: string, local: string, body: string): ThreeWayMergeResult {
+		const plan = planMarkdownAgreement({ local, body, base });
+		if (plan.kind === "merge") return plan.merge;
+		if (plan.kind === "preserve" && plan.merge !== null) return plan.merge;
+		return mergeThreeWayText(base, local, body);
+	}
+
+	private planRawDiskAgreement(local: string, body: string, base: string | null, baselineHash: string | null, diskHash: string, bodyHash: string) {
+		const input = {
+			local, body, base,
+			localMatchesAgreement: baselineHash !== null && diskHash === baselineHash,
+			bodyMatchesAgreement: baselineHash !== null && bodyHash === baselineHash,
+			localInput: "unbound-disk" as const,
+		};
+		return planMarkdownAgreement(input);
+	}
+
+	private async preserveRawDiskReplacement(bodyId: string, path: string, diskContent: string, content: string, diskHash: string, bodyHash: string, isCurrent: () => boolean): Promise<DiskBodySettlement> {
+		const overlapKey = `raw-disk:${diskHash}:${bodyHash}`;
+		if (!isCurrent()) return "replan";
+		if (this.preservedOverlaps.get(path) !== overlapKey) {
+			try {
+				const episodes = this.settlement?.conflictEpisodes;
+				if (episodes) {
+					await episodes.preserve({
+						bodyId, path, epoch: this.vaultSync.bodies.get?.(bodyId)?.bodyEpoch,
+						disk: diskContent, body: content, device: this.getDeviceName(),
+					});
+				} else {
+					await createMarkdownConflictArtifact(this.app, path, diskContent, {
+						executeHost: (operation, execute) => this.reconciliationWorker.io(operation, execute),
+						deviceName: this.getDeviceName(), reason: "raw-disk-unknown-ancestry", source: "disk",
+						trace: (message, details) => this.trace?.("conflict", message, details),
+					});
+				}
+				if (!isCurrent()) return "replan";
+				this.preservedOverlaps.set(path, overlapKey);
+			} catch {
+				if (!isCurrent()) return "replan";
+				this.recordPreservedUnresolved(path, "conflict-artifact-write-failed");
+				return "preserved-unresolved";
+			}
+		}
+		this.settlement?.markDivergence?.(bodyId, "decision-required");
+		this.recordPreservedUnresolved(path, "body-settlement-failed");
+		return "preserved-unresolved";
 	}
 
 	/**
@@ -1141,22 +1630,27 @@ export class DiskMirror {
 		diskContent: string,
 		content: string,
 		isCurrent: () => boolean,
+		rawDiskContent: string,
 	): Promise<"settled" | "replan" | "preserved-unresolved"> {
+		if (!isCurrent()) return "replan";
 		try {
 			if (this.settlement?.conflictEpisodes) {
 				await this.settlement.conflictEpisodes.preserve({ bodyId, path, epoch: this.vaultSync.bodies.get?.(bodyId)?.bodyEpoch, disk: diskContent, body: content, device: this.getDeviceName() });
 			} else await createMarkdownConflictArtifact(this.app, path, diskContent, {
+				executeHost: (operation, execute) => this.reconciliationWorker.io(operation, execute),
 				deviceName: this.getDeviceName(),
 				reason: "closed-file-both-changed-no-common-base",
 				source: "disk",
 				trace: (message, details) => this.trace?.("conflict", message, details),
 			});
+			if (!isCurrent()) return "replan";
 		} catch {
+			if (!isCurrent()) return "replan";
 			this.settlement?.markDivergence?.(bodyId, "preserved");
 			this.recordPreservedUnresolved(path, "conflict-artifact-write-failed");
 			return "preserved-unresolved";
 		}
-		const written = await this.writeSettledBody(path, diskContent, content, isCurrent);
+		const written = await this.writeSettledBody(path, diskContent, content, isCurrent, rawDiskContent);
 		if (written !== "written") return written === "moved" ? "replan" : "preserved-unresolved";
 		if (this.settlement?.conflictEpisodes?.get(bodyId)) {
 			this.settlement.markDivergence?.(bodyId, "decision-required");
@@ -1198,19 +1692,102 @@ export class DiskMirror {
 		return { content: base.settlement.content, hash: base.settlement.contentHash };
 	}
 
-	async readCanonicalDiskEvidence(path: string): Promise<{
+	async readCanonicalDiskEvidenceQueued(path: string): Promise<Awaited<ReturnType<DiskMirror["readCanonicalDiskEvidence"]>>> {
+		return this.readCanonicalDiskEvidence(path);
+	}
+
+	async readCanonicalDiskEvidence(path: string): Promise<Awaited<ReturnType<DiskMirror["readCanonicalDiskEvidenceUnqueued"]>>> {
+		return this.reconciliationWorker.run(() => this.readCanonicalDiskEvidenceUnqueued(path), {
+			retainedBytes: reconciliationRetainedBytes(path), label: "read-disk-evidence",
+		});
+	}
+
+	async readCanonicalDiskEvidenceUnqueued(path: string): Promise<{
 		content: string;
 		fingerprint: DiskSettlementFingerprint;
+		file: TFile;
+		rawContent: string;
 	} | null> {
 		const accepted = this.acceptPath(path);
 		if (!accepted) return null;
 		const file = this.app.vault.getAbstractFileByPath(accepted);
 		if (!(file instanceof TFile)) return null;
-		const raw = await this.app.vault.read(file);
+		const raw = await this.reconciliationWorker.io("vault.read", () => this.app.vault.read(file));
+		const fingerprint = await exactMarkdownDiskFingerprint(raw);
+		if (!this.isFileCurrent(file, accepted)) return null;
 		return {
 			content: canonicalizeMarkdown(raw),
-			fingerprint: await exactMarkdownDiskFingerprint(raw),
+			fingerprint,
+			file,
+			rawContent: raw,
 		};
+	}
+
+	async projectReviewedContentQueued(input: Parameters<DiskMirror["projectReviewedContentUnqueued"]>[0]): Promise<"written" | "moved" | "failed"> {
+		return this.projectReviewedContent(input);
+	}
+
+	async projectReviewedContent(input: Parameters<DiskMirror["projectReviewedContentUnqueued"]>[0]): Promise<"written" | "moved" | "failed"> {
+		return this.reconciliationWorker.run(() => this.projectReviewedContentUnqueued(input), {
+			retainedBytes: reconciliationRetainedBytes(input.content, input.expectedDisk.content, input.expectedDisk.rawContent),
+			label: "project-reviewed-content",
+		});
+	}
+
+	async projectReviewedContentUnqueued(input: {
+		path: string;
+		bodyId: string;
+		content: string;
+		expectedDisk: {
+			content: string;
+			fingerprint: DiskSettlementFingerprint;
+			file?: TFile;
+			rawContent?: string;
+		};
+	}): Promise<"written" | "moved" | "failed"> {
+		const path = this.acceptPath(input.path);
+		if (!path || this.vaultSync.getFileId(path) !== input.bodyId) return "moved";
+		if (this.isStructuralPathPending(path)) return "failed";
+		const file = this.app.vault.getAbstractFileByPath(path);
+		if (!(file instanceof TFile) || (input.expectedDisk.file && input.expectedDisk.file !== file)) return "moved";
+		const content = canonicalizeMarkdown(input.content);
+		const isScopeCurrent = this.captureDiskScope([path]);
+		const runtime = this.vaultSync;
+		const revision = runtime.bodies.captureRevision(input.bodyId);
+		const isCurrent = () => {
+			if (!isScopeCurrent() || this.isStructuralPathPending(path) || !this.isFileCurrent(file, path)
+				|| !runtime.bodies.coordinator.isProjectionCurrent(revision, path)) return false;
+			const text = runtime.getTextForPath(path);
+			return text !== null && yTextToString(text) === content;
+		};
+		try {
+			if (!isCurrent()) return "moved";
+			const raw = await this.reconciliationWorker.io("vault.read", () => this.app.vault.read(file));
+			const fingerprint = await exactMarkdownDiskFingerprint(raw);
+			if (!isCurrent() || canonicalizeMarkdown(raw) !== input.expectedDisk.content
+				|| fingerprint.hash !== input.expectedDisk.fingerprint.hash
+				|| fingerprint.bytes !== input.expectedDisk.fingerprint.bytes
+				|| (input.expectedDisk.rawContent !== undefined && raw !== input.expectedDisk.rawContent)) return "moved";
+			if (this.shouldBlockFrontmatterWrite(path, canonicalizeMarkdown(raw), content)) return "failed";
+			const contentHash = await contentBaselineHash(content);
+			if (!isCurrent()) return "moved";
+			await this.suppressWrite(path, content, 1);
+			const outcome = await this.compareAndModify(file, path, raw, content, isCurrent);
+			if (outcome !== "written") {
+				this.suppressedPaths.delete(path);
+				return outcome;
+			}
+			if (!isCurrent()) return "moved";
+			const projected = await this.reconciliationWorker.io("vault.read", () => this.app.vault.read(file));
+			if (!isCurrent() || projected !== content) return "moved";
+			this.lastDiskWriteOkAt.set(path, Date.now());
+			this.expectedDiskHashes.delete(path);
+			if (!this.hasPendingBodyWork(input.bodyId)) this._onDiskWriteCallback?.(path, contentHash, content);
+			return isCurrent() ? "written" : "moved";
+		} catch {
+			this.suppressedPaths.delete(path);
+			return isCurrent() ? "failed" : "moved";
+		}
 	}
 
 	/**
@@ -1225,8 +1802,11 @@ export class DiskMirror {
 		content: string,
 		reason: "external-edit" | "delete-revive",
 		contentHash: string,
-		plannedBodyContent?: string,
+		plannedBodyContent: string,
+		isCurrent: () => boolean,
+		isIdentityCurrent: () => boolean,
 	): Promise<"settled" | "replan" | "preserved-unresolved"> {
+		if (!isCurrent()) return "replan";
 		if (!this.settlement) {
 			this.recordPreservedUnresolved(path, "body-settlement-failed");
 			return "preserved-unresolved";
@@ -1242,15 +1822,18 @@ export class DiskMirror {
 				reason,
 				...(plannedBodyContent !== undefined ? { expectedBodyContent: plannedBodyContent } : {}),
 			});
+			if (!isIdentityCurrent()) return "replan";
 			if (outcome === "superseded") {
 				this.log(`settle: body of "${path}" moved after the disk-import decision; re-planning`);
 				return "replan";
 			}
+			if (this.hasPendingBodyWork(bodyId)) return "replan";
 			this.expectedDiskHashes.delete(path);
 			this._onDiskWriteCallback?.(path, contentHash, content);
 			this.clearPreservedUnresolved(path);
 			return "settled";
 		} catch {
+			if (!isIdentityCurrent()) return "replan";
 			this.recordPreservedUnresolved(path, "body-settlement-failed");
 			return "preserved-unresolved";
 		}
@@ -1261,6 +1844,7 @@ export class DiskMirror {
 		previousContent: string | null,
 		content: string,
 		isCurrent: () => boolean,
+		rawDiskContent?: string,
 	): Promise<"written" | "moved" | "failed"> {
 		content = canonicalizeMarkdown(content);
 		previousContent = previousContent === null ? null : canonicalizeMarkdown(previousContent);
@@ -1275,63 +1859,69 @@ export class DiskMirror {
 			partial = true;
 		}
 		try {
-			if (!isCurrent()) return "failed";
 			const existing = this.app.vault.getAbstractFileByPath(path);
-			if (existing instanceof TFile && previousContent === null) return "moved";
+			const isProjectionCurrent = isCurrent;
+			let projectedFile = existing instanceof TFile ? existing : null;
+			isCurrent = () => isProjectionCurrent() && (projectedFile === null || this.isFileCurrent(projectedFile, path));
+			if (!isCurrent()) return "moved";
+			if (existing instanceof TFile && (previousContent === null || rawDiskContent === undefined)) return "moved";
 			if (!(existing instanceof TFile) && previousContent !== null) return "moved";
 			await this.suppressWrite(path, content, existing instanceof TFile ? 1 : 2);
-			if (!isCurrent()) return "failed";
+			if (!isCurrent()) return "moved";
 			if (existing instanceof TFile) {
-				const outcome = await this.compareAndModify(existing, previousContent ?? "", content);
+				const outcome = await this.compareAndModify(existing, path, rawDiskContent!, content, isCurrent);
 				if (outcome === "moved") {
 					this.suppressedPaths.delete(path);
 					this.log(`settle: disk at "${path}" changed before the write; not overwriting`);
 					return "moved";
 				}
 			} else {
-				await this.ensureParentFolder(path);
-				await this.app.vault.create(path, content);
+				await this.ensureParentFolder(path, () => {
+					if (!isCurrent()) throw new DiskProjectionChangedError(path);
+				});
+				if (!isCurrent()) return "moved";
+				projectedFile = await this.reconciliationWorker.io("vault.create", () => this.app.vault.create(path, content));
 			}
+			if (!isCurrent()) return "moved";
 			this.lastDiskWriteOkAt.set(path, Date.now());
 			this.expectedDiskHashes.delete(path);
-			if (partial) await this.recordPartialDiskWrite(path, content);
-			else this._onDiskWriteCallback?.(path, await contentBaselineHash(content), content);
+			if (partial) await this.recordPartialDiskWrite(path, content, isCurrent);
+			else {
+				const contentHash = await contentBaselineHash(content);
+				if (!isCurrent()) return "moved";
+				this._onDiskWriteCallback?.(path, contentHash, content);
+			}
+			if (!isCurrent()) return "moved";
 			return "written";
 		} catch {
+			if (!isCurrent()) return "moved";
 			this.recordPreservedUnresolved(path, "body-settlement-failed");
 			return "failed";
 		}
 	}
 
-	/**
-	 * Compare-and-swap disk write: replace the file only if it still holds
-	 * `expected` (canonical). Uses Obsidian's atomic `vault.process` where the
-	 * host provides it; otherwise re-reads immediately before `modify`, which
-	 * narrows the window to the host's own write latency.
-	 */
-	private async compareAndModify(file: TFile, expected: string, next: string): Promise<"written" | "moved"> {
-		const vault = this.app.vault as App["vault"] & {
-			process?: (file: TFile, fn: (data: string) => string) => Promise<string>;
+	private isFileCurrent(file: TFile, path: string): boolean {
+		return this.reconciliationWorker.isOperational && file.path === path && this.app.vault.getAbstractFileByPath(path) === file;
+	}
+
+	private async compareAndModify(file: TFile, path: string, expected: string, next: string, isCurrent: () => boolean): Promise<"written" | "moved"> {
+		if (!this.isFileCurrent(file, path) || !isCurrent()) return "moved";
+		const vault = this.app.vault;
+		if (typeof vault.process !== "function") throw new Error("Safe disk replacement requires Vault.process");
+		const processOptions: Parameters<typeof vault.process>[2] & { retainedBytes: number } = {
+			retainedBytes: reconciliationRetainedBytes(expected, next),
 		};
-		if (typeof vault.process === "function") {
-			let moved = false;
-			try {
-				await vault.process(file, (data) => {
-					if (canonicalizeMarkdown(data) !== expected) {
-						moved = true;
-						throw new DiskMovedBeforeWriteError();
-					}
-					return next;
-				});
-			} catch (error) {
-				if (moved || error instanceof DiskMovedBeforeWriteError) return "moved";
-				throw error;
-			}
-			return "written";
+		try {
+			await this.reconciliationWorker.io("vault.process", () => vault.process(file, (data) => {
+				if (!this.isFileCurrent(file, path) || !isCurrent() || data !== expected) {
+					throw new DiskMovedBeforeWriteError();
+				}
+				return next;
+			}, processOptions));
+		} catch (error) {
+			if (error instanceof DiskMovedBeforeWriteError) return "moved";
+			throw error;
 		}
-		const current = canonicalizeMarkdown(await this.app.vault.read(file));
-		if (current !== expected) return "moved";
-		await this.app.vault.modify(file, next);
 		return "written";
 	}
 
@@ -1341,16 +1931,40 @@ export class DiskMirror {
 		this._onDiskMovedBeforeWrite?.(path);
 	}
 
-	private async ensureParentFolder(path: string): Promise<void> {
+	private admitWritePath(path: string): boolean {
+		if (this.writeQueue.has(path) || this.debounceTimers.has(path) || this.openWriteTimers.has(path)) return true;
+		if (this.writeQueue.size + this.debounceTimers.size + this.openWriteTimers.size < MAX_PENDING_WRITES) return true;
+		this.handDiskMovedBack(path, "projection-backpressure");
+		return false;
+	}
+
+	private blockStructuralAdmission(): void {
+		if (this.structuralAdmissionBlocked) return;
+		this.structuralAdmissionBlocked = true;
+		this.invalidateDiskScope();
+		this.log("Structural reconciliation paused: an oversized or backpressured rename batch was refused before acceptance. Source files are unchanged; inspect the remote mapping and replan smaller independent batches before restarting sync.");
+		this._flightEventHandler?.({
+			priority: "critical", kind: "disk.structural.recovery.blocked", severity: "error", scope: "vault",
+			source: "diskMirror", layer: "disk", data: { reason: "structural-admission-refused" },
+		});
+	}
+
+	get isStructuralAdmissionBlocked(): boolean {
+		return this.structuralAdmissionBlocked;
+	}
+
+	private async ensureParentFolder(path: string, verifySource: () => void): Promise<void> {
 		const slash = path.lastIndexOf("/");
 		if (slash < 0) return;
 		const parts = path.slice(0, slash).split("/");
 		let current = "";
 		for (const part of parts) {
+			verifySource();
 			current = current ? `${current}/${part}` : part;
 			const existing = this.app.vault.getAbstractFileByPath(current);
 			if (!existing) {
-				await this.app.vault.createFolder(current);
+				await this.reconciliationWorker.io("vault.createFolder", () => this.app.vault.createFolder(current));
+				verifySource();
 			} else if (existing instanceof TFile) {
 				throw new Error(`Cannot create sync folder over file: ${current}`);
 			}
@@ -1362,15 +1976,19 @@ export class DiskMirror {
 	// -------------------------------------------------------------------
 
 	async flushWrite(path: string, force = false): Promise<void> {
-		path = normalizePath(path);
-		return this.runPathWriteLocked(path, () => this.flushWriteUnlocked(path, force));
+		const accepted = this.acceptPath(path);
+		if (!accepted) return;
+		path = accepted;
+		const isScopeCurrent = this.captureDiskScope([path]);
+		return this.reconciliationWorker.run(() => this.flushWriteUnlocked(path, force, isScopeCurrent));
 	}
 
-	private async flushWriteUnlocked(path: string, force: boolean): Promise<void> {
+	private async flushWriteUnlocked(path: string, force: boolean, isScopeCurrent: () => boolean): Promise<void> {
 		if (this.isPreservedUnresolved(path)) {
 			this.log(`flushWrite: preserving unresolved disk content at "${path}"`);
 			return;
 		}
+		if (!isScopeCurrent()) return;
 		const ytext = this.vaultSync.getTextForPath(path);
 		if (!ytext) {
 			this.log(`flushWrite: no Y.Text for "${path}", skipping`);
@@ -1379,7 +1997,9 @@ export class DiskMirror {
 		const bodyId = this.vaultSync.getFileId(path);
 		if (!bodyId) return;
 		const proof = this.vaultSync.bodies.captureRevision(bodyId);
-		const isCurrent = () => this.vaultSync.bodies.coordinator.isProjectionCurrent(proof, path);
+		let projectedFile: TFile | null = null;
+		const isSourceCurrent = () => projectedFile === null || this.isFileCurrent(projectedFile, path);
+		const isCurrent = () => isScopeCurrent() && isSourceCurrent() && this.vaultSync.bodies.coordinator.isProjectionCurrent(proof, path);
 		const content = canonicalizeMarkdown(ytext.toJSON());
 
 		if (!force && this.openPaths.has(path)) {
@@ -1404,17 +2024,23 @@ export class DiskMirror {
 			const existing = this.app.vault.getAbstractFileByPath(normalized);
 			const expectedDiskHash = this.expectedDiskHashes.get(normalized);
 			if (existing instanceof TFile) {
-				const currentContent = canonicalizeMarkdown(await this.app.vault.read(existing));
+				projectedFile = existing;
+				const rawDiskContent = await this.reconciliationWorker.io("vault.read", () => this.app.vault.read(existing));
+				const currentContent = canonicalizeMarkdown(rawDiskContent);
 				let writeContent = content;
 				let partial = false;
 				if (!isCurrent()) {
-					this.queueImmediateWrite(path, "superseded-disk-proof", force);
+					if (isScopeCurrent() && isSourceCurrent()) this.queueImmediateWrite(path, "superseded-disk-proof", force);
 					return;
 				}
-				if (
-					expectedDiskHash !== undefined && currentContent !== content
-					&& await contentBaselineHash(currentContent) !== expectedDiskHash
-				) {
+				const currentHash = expectedDiskHash !== undefined && currentContent !== content
+					? await contentBaselineHash(currentContent)
+					: null;
+				if (!isCurrent()) {
+					if (isScopeCurrent() && isSourceCurrent()) this.queueImmediateWrite(path, "superseded-disk-hash", force);
+					return;
+				}
+				if (currentHash !== null && currentHash !== expectedDiskHash) {
 					// Kept until a new plan replaces it: any other flush of this
 					// path must not overwrite the moved disk either.
 					this.handDiskMovedBack(normalized, "expected-disk-hash");
@@ -1434,19 +2060,28 @@ export class DiskMirror {
 
 				await this.suppressWrite(path, writeContent, 1);
 				if (!isCurrent()) {
-					this.queueImmediateWrite(path, "superseded-before-modify", force);
+					if (isScopeCurrent() && isSourceCurrent()) this.queueImmediateWrite(path, "superseded-before-modify", force);
 					return;
 				}
-				if (await this.compareAndModify(existing, currentContent, writeContent) === "moved") {
+				if (await this.compareAndModify(existing, normalized, rawDiskContent, writeContent, isCurrent) === "moved") {
 					this.suppressedPaths.delete(normalized);
 					this.handDiskMovedBack(normalized, "compare-and-swap");
+					return;
+				}
+				if (!isCurrent()) {
+					if (isScopeCurrent() && isSourceCurrent()) this.queueImmediateWrite(path, "superseded-after-modify", force);
 					return;
 				}
 				this.expectedDiskHashes.delete(normalized);
 				this.log(`flushWrite: updated "${path}" (${writeContent.length} chars)`);
 				this.lastDiskWriteOkAt.set(normalized, Date.now());
-				if (partial) await this.recordPartialDiskWrite(normalized, writeContent);
-				else this._onDiskWriteCallback?.(normalized, await contentBaselineHash(writeContent), writeContent);
+				if (partial) await this.recordPartialDiskWrite(normalized, writeContent, isCurrent);
+				else {
+					const contentHash = await contentBaselineHash(writeContent);
+					if (!isCurrent()) return;
+					this._onDiskWriteCallback?.(normalized, contentHash, writeContent);
+				}
+				if (!isCurrent()) return;
 				this._flightEventHandler?.({
 					priority: "important",
 					kind: "disk.write.ok",
@@ -1474,24 +2109,29 @@ export class DiskMirror {
 				}
 				await this.suppressWrite(path, writeContent, 2);
 				if (!isCurrent()) {
-					this.queueImmediateWrite(path, "superseded-before-create", force);
+					if (isScopeCurrent()) this.queueImmediateWrite(path, "superseded-before-create", force);
 					return;
 				}
-				const dir = normalized.substring(0, normalized.lastIndexOf("/"));
-				if (dir) {
-					const dirExists =
-						this.app.vault.getAbstractFileByPath(normalizePath(dir));
-					if (!dirExists) {
-						await this.app.vault.createFolder(dir);
-					}
+				await this.ensureParentFolder(normalized, () => {
+					if (!isCurrent()) throw new DiskProjectionChangedError(path);
+				});
+				if (!isCurrent()) return;
+				projectedFile = await this.reconciliationWorker.io("vault.create", () => this.app.vault.create(normalized, writeContent));
+				if (!isCurrent()) {
+					if (isScopeCurrent() && isSourceCurrent()) this.queueImmediateWrite(path, "superseded-after-create", force);
+					return;
 				}
-				await this.app.vault.create(normalized, writeContent);
 				this.log(
 					`flushWrite: created "${path}" on disk (${writeContent.length} chars)`,
 				);
 				this.lastDiskWriteOkAt.set(normalized, Date.now());
-				if (partial) await this.recordPartialDiskWrite(normalized, writeContent);
-				else this._onDiskWriteCallback?.(normalized, await contentBaselineHash(writeContent), writeContent);
+				if (partial) await this.recordPartialDiskWrite(normalized, writeContent, isCurrent);
+				else {
+					const contentHash = await contentBaselineHash(writeContent);
+					if (!isCurrent()) return;
+					this._onDiskWriteCallback?.(normalized, contentHash, writeContent);
+				}
+				if (!isCurrent()) return;
 				this._flightEventHandler?.({
 					priority: "important",
 					kind: "disk.write.ok",
@@ -1504,6 +2144,10 @@ export class DiskMirror {
 				});
 			}
 		} catch (err) {
+			if (!isCurrent()) {
+				if (isScopeCurrent() && isSourceCurrent()) this.queueImmediateWrite(path, "superseded-during-write", force);
+				return;
+			}
 			console.error(`[yaos] flushWrite failed for "${path}":`, err);
 			this._flightEventHandler?.({
 				priority: "critical",
@@ -1554,20 +2198,22 @@ export class DiskMirror {
 		return partial.content;
 	}
 
-	private async recordPartialDiskWrite(path: string, content: string): Promise<void> {
+	private async recordPartialDiskWrite(path: string, content: string, isCurrent: () => boolean): Promise<void> {
 		const split = splitMarkdownComponents(content);
 		if (split.kind === "ambiguous") return;
 		const [bodyHash, propertiesHash] = await Promise.all([
 			contentBaselineHash(split.body),
 			contentBaselineHash(split.propertiesRegion),
 		]);
+		if (!isCurrent()) return;
 		this._onPartialDiskWriteCallback?.(path, bodyHash, propertiesHash);
 	}
 
 
 
-	private async deleteLocalReplica(file: TFile): Promise<"trash"> {
-		await this.app.fileManager.trashFile(file);
+	private async deleteLocalReplica(file: TFile, path: string): Promise<"trash"> {
+		if (!this.isFileCurrent(file, path)) throw new DiskProjectionChangedError(path);
+		await this.reconciliationWorker.io("fileManager.trashFile", () => this.app.fileManager.trashFile(file));
 		return "trash";
 	}
 
@@ -1591,11 +2237,11 @@ export class DiskMirror {
 	}
 
 	async shouldSuppressModify(file: TFile): Promise<boolean> {
-		return this.shouldSuppressWriteEvent(file, "modify");
+		return this.reconciliationWorker.run(() => this.shouldSuppressWriteEvent(file, "modify"), { label: "verify-modify-suppression" });
 	}
 
 	async shouldSuppressCreate(file: TFile): Promise<boolean> {
-		return this.shouldSuppressWriteEvent(file, "create");
+		return this.reconciliationWorker.run(() => this.shouldSuppressWriteEvent(file, "create"), { label: "verify-create-suppression" });
 	}
 
 	consumeDeleteSuppression(path: string): boolean {
@@ -1616,7 +2262,7 @@ export class DiskMirror {
 	 * auto-reviving tombstones for local files.
 	 */
 	isPreservedUnresolved(path: string): boolean {
-		return this.preservedUnresolvedPaths.has(normalizePath(path));
+		return this.preservedUnresolvedPaths.has(normalizePath(path)) || this.isStructuralPathPending(path);
 	}
 
 	/**
@@ -1762,7 +2408,10 @@ export class DiskMirror {
 		this.openWriteTimers.clear();
 		this.pendingOpenWrites.clear();
 		if (openPending.size > 0) {
-			await Promise.all([...openPending].map((p) => this.flushWrite(p, true)));
+			for (const path of openPending) {
+				this.writeQueue.add(path);
+				this.forcedWritePaths.add(path);
+			}
 		}
 
 		// 2. Also flush anything sitting in the debounce timer queue (those
@@ -1786,12 +2435,11 @@ export class DiskMirror {
 		}
 
 		// 4. Await any outstanding per-path write locks.
-		if (this.pathWriteLocks.size > 0) {
-			await Promise.allSettled(this.pathWriteLocks.values());
-		}
+		await this.reconciliationWorker.whenIdle();
 	}
 
 	destroy(): void {
+		this.resetReconciliationScope();
 		const pendingFinalWrites = new Set<string>();
 		for (const path of this.pendingOpenWrites) {
 			pendingFinalWrites.add(path);
@@ -1800,8 +2448,14 @@ export class DiskMirror {
 			pendingFinalWrites.add(path);
 		}
 		for (const path of pendingFinalWrites) {
-			void this.flushWrite(path, true);
+			this.forcedWritePaths.add(path);
 		}
+		void (async () => {
+			for (const path of pendingFinalWrites) {
+				if (!this.reconciliationWorker.isOperational) return;
+				await this.flushWrite(path, true);
+			}
+		})().catch((error: unknown) => this.log(`final projections remain pending: ${String(error)}`));
 
 
 		for (const [, obs] of this.textObservers) {
@@ -1829,7 +2483,6 @@ export class DiskMirror {
 		this.forcedWritePaths.clear();
 		this.suppressedPaths.clear();
 		this.preservedUnresolved.clear();
-		this.pathWriteLocks.clear();
 		this.lastDiskWriteOkAt.clear();
 		this.log("DiskMirror destroyed");
 	}
@@ -1869,6 +2522,7 @@ export class DiskMirror {
 
 	private queueImmediateWrite(path: string, reason: string, force = false): void {
 		path = normalizePath(path);
+		if (!this.admitWritePath(path)) return;
 		if (force) {
 			this.forcedWritePaths.add(path);
 		}
@@ -1944,8 +2598,9 @@ export class DiskMirror {
 		try {
 			// Read back the file only when a suppression candidate exists. This
 			// keeps the hot path cheap while making self-event detection causal.
-			const content = await this.app.vault.read(file);
+			const content = await this.reconciliationWorker.io("vault.read", () => this.app.vault.read(file));
 			const fingerprint = await this.fingerprintContent(content);
+			if (!this.isFileCurrent(file, path) || this.getActiveSuppression(path) !== entry) return false;
 			if (
 				fingerprint.bytes === entry.expectedBytes
 				&& fingerprint.hash === entry.expectedHash
@@ -2007,21 +2662,4 @@ export class DiskMirror {
 		return exactMarkdownDiskFingerprint(content);
 	}
 
-	private runPathWriteLocked<T>(path: string, work: () => Promise<T>): Promise<T> {
-		// All flush paths funnel through one per-path promise chain so direct
-		// flushes cannot overlap with queued writes for the same file.
-		const previous = this.pathWriteLocks.get(path) ?? Promise.resolve();
-		const next = previous.catch(() => undefined).then(work);
-		let tracked: Promise<void>;
-		tracked = next.then(
-			() => undefined,
-			() => undefined,
-		).finally(() => {
-			if (this.pathWriteLocks.get(path) === tracked) {
-				this.pathWriteLocks.delete(path);
-			}
-		});
-		this.pathWriteLocks.set(path, tracked);
-		return next;
-	}
 }
