@@ -1,0 +1,33 @@
+scripts/relay2/bench.ts
+  s_86bb7b752eea7d::t_2206df0a0eff76 32
+scripts/relay2/lib/common.ts
+  s_86bb7b752eea7d::t_38e95da500627d 66-70
+scripts/relay2/lib/rawClient.ts
+  s_86bb7b752eea7d::t_a1ebfa57063ef7 129-130
+scripts/relay2/wb/realClient.ts
+  s_694286f0c485ac::t_7110e0cfc053ec 1-224
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "91b1face5aac95b7c86a97a2901bfc3cd0359a5f",
+  "prompts": {},
+  "sessions": {
+    "s_694286f0c485ac": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a3a172259d6cb1bf1",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_86bb7b752eea7d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a19062f3ba3d813cf",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
