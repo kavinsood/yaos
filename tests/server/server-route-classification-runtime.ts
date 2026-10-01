@@ -45,6 +45,7 @@ s.test("schema-4 root/body, candidate, lifecycle, and bootstrap shapes classify 
 		["POST", "/vault/vault-route-0001/lifecycle/batch"],
 		["POST", "/vault/vault-route-0001/lifecycle/publish"],
 		["POST", "/vault/vault-route-0001/attachments/publish"],
+		["POST", `/vault/vault-route-0001/blobs/${"a".repeat(64)}/repair`],
 		["POST", "/vault/vault-route-0001/bootstrap/start"],
 		["GET", "/vault/vault-route-0001/bootstrap/bootstrap-route-0001/root"],
 		["POST", "/vault/vault-route-0001/bootstrap/bootstrap-route-0001/bodies"],
@@ -71,6 +72,9 @@ s.test("schema-4 root/body, candidate, lifecycle, and bootstrap shapes classify 
 		["POST", "/vault/vault-route-0001/provision"],
 		["POST", "/operator/vaults/vault-route-0001/collaboration-migrate"],
 		["DELETE", "/vault/vault-route-0001/body/body-route-0001/candidate"],
+		["POST", "/vault/vault-route-0001/blobs/not-a-hash/repair"],
+		["GET", `/vault/vault-route-0001/blobs/${"a".repeat(64)}/repair`],
+		["POST", `/vault/vault-route-0001/blobs/${"a".repeat(64)}/repair/extra`],
 	] as Array<[string, string]>) {
 		assert.equal(classifyWorkerRoute(new Request(`https://example.test${path}`, { method })).kind, "not-found", `${method} ${path}`);
 	}

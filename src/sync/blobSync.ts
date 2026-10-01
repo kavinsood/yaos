@@ -20,6 +20,7 @@ import {
 	requestUrl,
 	arrayBufferToHex,
 	Notice,
+	Platform,
 } from "obsidian";
 import { type AttachmentHead, type BlobRef } from "../types";
 import type { AttachmentIntentOutcome } from "./vaultSync";
@@ -86,6 +87,30 @@ const MIN_TRANSFER_TIMEOUT_MS = 30_000;
 const MAX_TRANSFER_TIMEOUT_MS = 10 * 60_000;
 const TRANSFER_SETUP_BUDGET_MS = 15_000;
 const MIN_TRANSFER_BYTES_PER_SEC = 64 * 1024;
+const REPAIR_DOWNLOAD_RETRIES = 7;
+const REPAIR_BACKOFF_MAX_MS = 60_000;
+const MISSING_BLOB_AUDIT_MS = 5 * 60_000;
+const MISSING_BLOB_AUDIT_BATCH = 50;
+const MISSING_BLOB_AUDIT_BYTES = 20 * 1024 * 1024;
+const MOBILE_BLOB_AUDIT_BATCH = 10;
+const MOBILE_BLOB_AUDIT_BYTES = 10 * 1024 * 1024;
+const EXHAUSTION_NOTICE_BATCH_MS = 100;
+const MAX_REPAIR_HASHES = 512;
+
+interface BlobRepairState {
+	mismatches: number;
+	report?: Promise<boolean | null>;
+	reporting: boolean;
+	retryAt: number;
+}
+
+class BlobDownloadError extends Error {
+	constructor(public readonly status: number, text: string) {
+		super(`blob download failed: ${status} ${text}`);
+	}
+}
+
+class BlobUploadHashMismatchError extends Error {}
 
 class BlobHttpTimeoutError extends Error {
 	constructor(
@@ -174,11 +199,15 @@ class BlobHttpClient {
 				headers: this.authHeaders(),
 				body: data,
 				contentType,
+				throw: false,
 			}),
 			timeoutMs,
 			`blob upload ${hash.slice(0, 12)}…`,
 		);
 		if (res.status !== 204) {
+			if (res.status === 400 && /hash mismatch/i.test(res.text)) {
+				throw new BlobUploadHashMismatchError(`blob upload rejected stale hash: ${res.text}`);
+			}
 			throw new Error(`blob upload failed: ${res.status} ${res.text}`);
 		}
 	}
@@ -189,14 +218,36 @@ class BlobHttpClient {
 				url: this.url(`/${hash}`),
 				method: "GET",
 				headers: this.authHeaders(),
+				throw: false,
 			}),
 			timeoutMs,
 			`blob download ${hash.slice(0, 12)}…`,
 		);
 		if (res.status !== 200) {
-			throw new Error(`blob download failed: ${res.status} ${res.text}`);
+			throw new BlobDownloadError(res.status, res.text);
 		}
 		return res.arrayBuffer;
+	}
+
+	async reportSuspect(hash: string): Promise<void> {
+		const res = await withTimeout(
+			requestUrl({
+				url: this.url(`/${hash}/repair`),
+				method: "POST",
+				headers: this.authHeaders(),
+				throw: false,
+			}),
+			EXISTS_TIMEOUT_MS,
+			`blob suspect report ${hash.slice(0, 12)}…`,
+		);
+		if (res.status !== 200 && res.status !== 202 && res.status !== 204) {
+			throw new Error(`blob suspect report unavailable: ${res.status}`);
+		}
+		if (res.status === 200 && !["healthy", "suspect", "missing", "changed", "busy"].includes(
+			(res.json as { status?: string } | null)?.status ?? "",
+		)) {
+			throw new Error("invalid blob suspect report response");
+		}
 	}
 
 	async exists(hashes: string[]): Promise<string[]> {
@@ -312,6 +363,8 @@ interface UploadItem {
 	retries: number;
 	status: "pending" | "processing";
 	readyAt: number;
+	integrityPaused?: boolean;
+	transportPaused?: boolean;
 }
 
 interface DownloadItem {
@@ -324,6 +377,9 @@ interface DownloadItem {
 	needsRerun?: boolean;
 	/** How many times this item has been reset via needsRerun. Capped at MAX_RERUN_RESETS. */
 	rerunResets: number;
+	repairAware?: boolean;
+	repairAwaitingSource?: boolean;
+	repairPaused?: boolean;
 }
 
 /**
@@ -343,6 +399,8 @@ export interface BlobQueueSnapshot {
 		retries?: number;
 		status?: "pending" | "processing";
 		readyAt?: number;
+		integrityPaused?: boolean;
+		transportPaused?: boolean;
 	}[];
 	downloads: {
 		path: string;
@@ -353,6 +411,9 @@ export interface BlobQueueSnapshot {
 		readyAt?: number;
 		needsRerun?: boolean;
 		rerunResets?: number;
+		repairAware?: boolean;
+		repairAwaitingSource?: boolean;
+		repairPaused?: boolean;
 	}[];
 }
 
@@ -403,6 +464,15 @@ export class BlobSyncManager {
 	private inflightDownloads = new Set<string>();
 	/** Retry timers for failed transfers. */
 	private retryTimers = new Set<number>();
+	private repairReports = new Map<string, BlobRepairState>();
+	private goodBlobUploads = new Map<string, Promise<boolean>>();
+	private missingBlobAuditTimer: number | null = null;
+	private missingBlobAuditRunning = false;
+	private missingBlobAuditStarted = false;
+	private missingBlobAuditCursor = 0;
+	private missingBlobAuditCursorInitialized = false;
+	private exhaustionNoticeTimer: number | null = null;
+	private readonly exhaustionNotices = new Map<string, string>();
 	/** True while upload drain is running. */
 	private uploadDraining = false;
 	/** True while download drain is running. */
@@ -642,6 +712,12 @@ export class BlobSyncManager {
 		path = canonical;
 		const existing = this.downloadQueue.get(path);
 		if (existing) {
+			if (existing.hash === hash && existing.repairAware) return;
+			if (existing.hash !== hash) {
+				existing.repairAware = false;
+				existing.repairAwaitingSource = false;
+				existing.repairPaused = false;
+			}
 			existing.hash = hash;
 			if (sizeBytes && sizeBytes > 0) existing.sizeBytes = sizeBytes;
 			existing.retries = Math.min(existing.retries, retries);
@@ -848,6 +924,11 @@ export class BlobSyncManager {
 		mode: "conservative" | "authoritative",
 		excludePatterns: string[],
 	): { uploadQueued: number; downloadQueued: number; skipped: number } {
+		if (!this.acceptingWork) return { uploadQueued: 0, downloadQueued: 0, skipped: 0 };
+		if (!this.missingBlobAuditStarted) {
+			this.missingBlobAuditStarted = true;
+			void this.auditMissingBlobs();
+		}
 		let uploadQueued = 0;
 		let downloadQueued = 0;
 		let skipped = 0;
@@ -1096,7 +1177,7 @@ export class BlobSyncManager {
 			// only populated from these bytes; it is never trusted as publication
 			// proof because the object-present branch must be just as strict as PUT.
 			const fileStat = { mtime: file.stat.mtime, size: file.stat.size };
-			const data = await this.app.vault.readBinary(file);
+			const data = (await this.app.vault.readBinary(file)).slice(0);
 			if (!this.isCurrentUploadIntent(item)) return;
 			const hash = await hashArrayBuffer(data);
 			if (!this.isCurrentUploadIntent(item)) return;
@@ -1216,6 +1297,25 @@ export class BlobSyncManager {
 			this.log(`upload: success "${item.path}" in ${Date.now() - start}ms`);
 		} catch (err) {
 			if (!this.isCurrentUploadIntent(item)) return;
+			if (err instanceof BlobUploadHashMismatchError) {
+				const current = this.app.vault.getAbstractFileByPath(item.path);
+				if (current instanceof TFile) {
+					removeCachedHash(this.hashCache, item.path);
+					const paused = item.retries >= MAX_RETRIES;
+					const delay = paused ? MISSING_BLOB_AUDIT_MS : 0;
+					const next = this.enqueueUpload(item.path, Math.min(item.retries + 1, MAX_RETRIES), current.stat.size, Date.now() + delay);
+					if (next) {
+						next.integrityPaused = item.integrityPaused || paused;
+						if (paused) {
+							if (!item.integrityPaused) this.queueExhaustionNotice(item.path, `Attachment upload waiting for "${item.path}". The server rejected its checksum; YAOS will re-read and retry periodically.`);
+							this.scheduleRetryKick(delay, "upload");
+						} else this.kickUploadDrain();
+					}
+				} else {
+					this.deleteUploadIntent(item);
+				}
+				return;
+			}
 			const reason = err instanceof Error ? err.message : String(err);
 			if (item.retries < MAX_RETRIES) {
 				const delay = RETRY_BASE_MS * Math.pow(4, item.retries);
@@ -1228,18 +1328,16 @@ export class BlobSyncManager {
 				item.readyAt = Date.now() + delay;
 				this.scheduleRetryKick(delay, "upload");
 			} else {
-				this.deleteUploadIntent(item);
-				this._permanentUploadFailures++;
-				this.trace?.("blob", "upload-permanently-failed", {
+				item.status = "pending";
+				item.readyAt = Date.now() + MISSING_BLOB_AUDIT_MS;
+				this.trace?.("blob", "upload-waiting-for-server", {
 					path: item.path,
 					retries: item.retries,
 					error: err instanceof Error ? err.message : String(err),
-					totalPermanentFailures: this._permanentUploadFailures,
 				});
-				console.error(
-					`[yaos:blob] Upload failed permanently for "${item.path}":`,
-					err,
-				);
+				if (!item.transportPaused) this.queueExhaustionNotice(item.path, `Attachment upload waiting for "${item.path}". YAOS will retry when the server is available.`);
+				item.transportPaused = true;
+				this.scheduleRetryKick(MISSING_BLOB_AUDIT_MS, "upload");
 			}
 		}
 	}
@@ -1349,6 +1447,12 @@ export class BlobSyncManager {
 				this.forcedDownloadWaiters.set(path, waiters);
 			}));
 			this.enqueueDownload(path, ref.hash, ref.size);
+			const item = this.downloadQueue.get(path);
+			if (item?.repairAware) {
+				item.readyAt = 0;
+				item.retries = 0;
+				item.repairPaused = false;
+			}
 			queued++;
 		}
 		if (queued === 0) return 0;
@@ -1371,6 +1475,7 @@ export class BlobSyncManager {
 	}
 
 	private kickDownloadDrain(): void {
+		if (!this.acceptingWork) return;
 		if (!this.downloadGateOpen) return;
 		if (this.downloadDraining) return;
 		void this.drainDownloads();
@@ -1417,7 +1522,9 @@ export class BlobSyncManager {
 	}
 
 	private async processDownload(item: DownloadItem): Promise<void> {
+		if (!this.acceptingWork) return;
 		const start = Date.now();
+		const requestedHash = item.hash;
 		const catalogRef = this.attachmentCatalog.getAttachmentRef(item.path);
 		const normalized = catalogRef
 			? this.validateBlobPath(item.path, "download-before-read", catalogRef)
@@ -1486,13 +1593,19 @@ export class BlobSyncManager {
 
 			const downloadTimeoutMs = transferTimeoutMs(item.sizeBytes);
 			const data = await this.blobClient.download(
-				item.hash,
+				requestedHash,
 				downloadTimeoutMs,
 			);
 			let targetHasRemoteBytes = false;
 
 			// Verify hash of downloaded data
 			const downloadHash = await hashArrayBuffer(data);
+			if (!this.acceptingWork) return;
+			if (item.hash !== requestedHash) {
+				item.status = "pending";
+				item.readyAt = 0;
+				return;
+			}
 			if (downloadHash !== item.hash) {
 				this.recordAttachmentEvent(
 					PRODUCT_EVENT_KIND.attachmentIntegrityFailed,
@@ -1501,6 +1614,7 @@ export class BlobSyncManager {
 					"critical",
 					{ expectedHashPrefix: hashPrefix(item.hash), actualHashPrefix: hashPrefix(downloadHash) },
 				);
+				await this.reportDownloadMismatch(item, downloadHash);
 				throw new Error(
 					`Hash mismatch: expected ${item.hash.slice(0, 12)}… got ${downloadHash.slice(0, 12)}…`,
 				);
@@ -1718,9 +1832,31 @@ export class BlobSyncManager {
 				this.downloadQueue.delete(item.path);
 			}
 		} catch (err) {
+			if (!this.acceptingWork) return;
+			if (item.hash !== requestedHash) {
+				item.status = "pending";
+				item.readyAt = 0;
+				return;
+			}
+			if (err instanceof BlobDownloadError && err.status === 404) {
+				item.repairAware = true;
+				item.repairAwaitingSource = true;
+				this.ensureRepairAudit();
+				try {
+					if (!(await this.blobClient.exists([item.hash])).includes(item.hash)) {
+						await this.reuploadGoodLocalBlob(item.hash);
+					} else {
+						item.repairAwaitingSource = false;
+					}
+				} catch (uploadError) {
+					this.log(`Local blob recovery unavailable: ${String(uploadError)}`);
+				}
+			}
+			if (!this.acceptingWork) return;
 			const reason = err instanceof Error ? err.message : String(err);
-			if (item.retries < MAX_RETRIES) {
-				const delay = RETRY_BASE_MS * Math.pow(4, item.retries);
+			const maxRetries = item.repairAware ? REPAIR_DOWNLOAD_RETRIES : MAX_RETRIES;
+			if (item.retries < maxRetries) {
+				const delay = Math.min(RETRY_BASE_MS * Math.pow(4, item.retries), REPAIR_BACKOFF_MAX_MS);
 				this.log(
 					`download: failed "${item.path}" in ${Date.now() - start}ms ` +
 						`(attempt ${item.retries + 1}): ${reason}; retrying in ${delay}ms`,
@@ -1730,6 +1866,21 @@ export class BlobSyncManager {
 				item.readyAt = Date.now() + delay;
 				this.scheduleRetryKick(delay, "download");
 			} else {
+				if (item.repairAware) {
+					item.status = "pending";
+					item.readyAt = Date.now() + MISSING_BLOB_AUDIT_MS;
+					item.needsRerun = false;
+					const message = item.repairAwaitingSource
+						? `Attachment repair waiting for "${item.path}". Bring a device with a verified copy online; sync will retry periodically. ${reason}`
+						: `Attachment integrity recovery waiting for "${item.path}". Check the server and connection; sync will retry periodically. ${reason}`;
+					this.settleForcedDownload(item.path, item.hash, new Error(message));
+					if (!item.repairPaused) {
+						this.trace?.("blob", "download-repair-paused", { path: item.path, error: message });
+						this.queueExhaustionNotice(item.path, message);
+						item.repairPaused = true;
+					}
+					return;
+				}
 				if (item.needsRerun && item.rerunResets < MAX_RERUN_RESETS) {
 					item.needsRerun = false;
 					item.status = "pending";
@@ -1742,19 +1893,198 @@ export class BlobSyncManager {
 					this.kickDownloadDrain();
 					return;
 				}
-				this.downloadQueue.delete(item.path);
-				this._permanentDownloadFailures++;
-				this.settleForcedDownload(item.path, item.hash, new Error(`attachment recovery download failed: ${reason}`));
-				this.trace?.("blob", "download-permanently-failed", {
-					path: item.path,
-					retries: item.retries,
-					error: err instanceof Error ? err.message : String(err),
-					totalPermanentFailures: this._permanentDownloadFailures,
-				});
-				console.error(
-					`[yaos:blob] Download failed permanently for "${item.path}":`,
-					err,
-				);
+				item.repairAware = true;
+				item.repairAwaitingSource = false;
+				item.retries = REPAIR_DOWNLOAD_RETRIES;
+				item.status = "pending";
+				item.readyAt = Date.now() + MISSING_BLOB_AUDIT_MS;
+				const message = `Attachment download waiting for "${item.path}". YAOS will retry when the server is available. ${reason}`;
+				this.settleForcedDownload(item.path, item.hash, new Error(message));
+				this.trace?.("blob", "download-repair-paused", { path: item.path, error: message });
+				this.queueExhaustionNotice(item.path, message);
+				item.repairPaused = true;
+				this.ensureRepairAudit();
+			}
+		}
+	}
+
+	private pruneRepairReports(protectedHash?: string): void {
+		for (const [hash, state] of this.repairReports) {
+			if (this.repairReports.size <= MAX_REPAIR_HASHES) break;
+			if (!state.reporting && hash !== protectedHash) this.repairReports.delete(hash);
+		}
+	}
+
+	private async reportDownloadMismatch(item: DownloadItem, _bodyHash: string): Promise<void> {
+		const hash = item.hash;
+		const ref = this.attachmentCatalog.getAttachmentRef(item.path);
+		if (!this.acceptingWork || ref?.hash !== hash || this.attachmentCatalog.isAttachmentTombstoned(item.path)) return;
+		const state: BlobRepairState = this.repairReports.get(hash) ?? { mismatches: 0, reporting: false, retryAt: 0 };
+		if (!state.reporting && state.retryAt > 0 && Date.now() >= state.retryAt) state.report = undefined;
+		this.repairReports.delete(hash);
+		this.repairReports.set(hash, state);
+		this.pruneRepairReports(hash);
+		state.mismatches++;
+		if (state.mismatches < 2) return;
+		if (!state.report) {
+			state.reporting = true;
+			state.report = (async () => {
+				try {
+					await this.blobClient.reportSuspect(hash);
+					if (!this.acceptingWork) return null;
+					const present = (await this.blobClient.exists([hash])).includes(hash);
+					if (!this.acceptingWork) return null;
+					this.trace?.("blob", "blob-suspect-verified-exists", { hashPrefix: hashPrefix(hash), present });
+					if (!present) {
+						try {
+							await this.reuploadGoodLocalBlob(hash);
+						} catch (error) {
+							this.log(`Local blob recovery deferred: ${String(error)}`);
+						}
+					}
+					return present;
+				} catch (error) {
+					this.log(`Blob suspect recovery deferred for ${hashPrefix(hash)}: ${String(error)}`);
+					return null;
+				}
+			})().then((present) => {
+				state.reporting = false;
+				state.retryAt = Date.now() + MISSING_BLOB_AUDIT_MS;
+				this.pruneRepairReports();
+				return present;
+			});
+		}
+		const present = await state.report;
+		if (!this.acceptingWork || item.hash !== hash) return;
+		item.repairAware = true;
+		if (present !== null) item.repairAwaitingSource = !present;
+		this.ensureRepairAudit();
+	}
+
+	private ensureRepairAudit(): void {
+		if (!this.acceptingWork || this.missingBlobAuditStarted) return;
+		this.missingBlobAuditStarted = true;
+		this.missingBlobAuditTimer = window.setTimeout(() => {
+			this.missingBlobAuditTimer = null;
+			void this.auditMissingBlobs();
+		}, this.auditDelayMs());
+	}
+
+	private auditDelayMs(): number {
+		return Math.round(MISSING_BLOB_AUDIT_MS * (0.8 + Math.random() * 0.4));
+	}
+
+	private queueExhaustionNotice(path: string, message: string): void {
+		this.exhaustionNotices.set(path, message);
+		if (this.exhaustionNoticeTimer !== null) return;
+		this.exhaustionNoticeTimer = window.setTimeout(() => {
+			this.exhaustionNoticeTimer = null;
+			if (!this.acceptingWork) return;
+			const messages = Array.from(this.exhaustionNotices.values());
+			this.exhaustionNotices.clear();
+			new Notice(messages.length === 1 ? messages[0]!
+				: `${messages.length} attachment transfers waiting. YAOS will retry periodically; check the server, connection, and local verified copies.`, 10_000);
+		}, EXHAUSTION_NOTICE_BATCH_MS);
+	}
+
+	private goodLocalBlobRef(file: TFile, hash: string): BlobRef | null {
+		if (!this.acceptingWork || this.preservedUnresolvedPaths.has(file.path)
+			|| this.localOnlyBlobConflictPaths.has(file.path) || isBlobConflictArtifactPath(file.path)
+			|| this.remoteDeleteInFlight.has(file.path) || this.attachmentCatalog.isAttachmentTombstoned(file.path)) return null;
+		const ref = this.attachmentCatalog.getAttachmentRef(file.path);
+		if (!ref || ref.hash !== hash || file.stat.size !== ref.size
+			|| this.validateBlobPath(file.path, "blob-repair-source", ref) !== file.path) return null;
+		const projected = this.attachmentCatalog.getProjectedAttachmentHead(file.path);
+		const observed = this.attachmentCatalog.getObservedAttachmentHead(file.path);
+		if (projected.kind !== "active" || observed.kind !== "active"
+			|| projected.hash !== hash || observed.hash !== hash
+			|| projected.revision !== ref.revision || observed.revision !== ref.revision) return null;
+		if (this.app.vault.getAbstractFileByPath(file.path) !== file) return null;
+		return ref;
+	}
+
+	private reuploadGoodLocalBlob(hash: string, candidates?: readonly TFile[]): Promise<boolean> {
+		const inflight = this.goodBlobUploads.get(hash);
+		if (inflight) return inflight;
+		const upload = (async () => {
+			for (const file of candidates ?? this.app.vault.getFiles()) {
+				const ref = this.goodLocalBlobRef(file, hash);
+				if (!ref) continue;
+				const mtime = file.stat.mtime;
+				const size = file.stat.size;
+				let data: ArrayBuffer;
+				try {
+					data = (await this.app.vault.readBinary(file)).slice(0);
+					if (await hashArrayBuffer(data) !== hash) continue;
+				} catch {
+					continue;
+				}
+				const currentRef = this.goodLocalBlobRef(file, hash);
+				if (!currentRef || currentRef.revision !== ref.revision
+					|| file.stat.mtime !== mtime || file.stat.size !== size
+					|| data.byteLength !== ref.size || data.byteLength !== size) continue;
+				await this.blobClient.upload(hash, guessMime(file.path), data, transferTimeoutMs(data.byteLength));
+				return true;
+			}
+			return false;
+		})();
+		this.goodBlobUploads.set(hash, upload);
+		void upload.finally(() => this.goodBlobUploads.delete(hash)).catch(() => {});
+		return upload;
+	}
+
+	private async auditMissingBlobs(): Promise<void> {
+		if (!this.acceptingWork || this.missingBlobAuditRunning) return;
+		if (this.missingBlobAuditTimer !== null) window.clearTimeout(this.missingBlobAuditTimer);
+		this.missingBlobAuditTimer = null;
+		this.missingBlobAuditRunning = true;
+		try {
+			const filesByHash = new Map<string, TFile[]>();
+			for (const file of this.app.vault.getFiles()) {
+				const ref = this.attachmentCatalog.getAttachmentRef(file.path);
+				if (ref && this.goodLocalBlobRef(file, ref.hash)) {
+					const files = filesByHash.get(ref.hash) ?? [];
+					files.push(file);
+					filesByHash.set(ref.hash, files);
+				}
+			}
+			const candidates = Array.from(filesByHash.keys());
+			if (candidates.length === 0) return;
+			if (!this.missingBlobAuditCursorInitialized) {
+				this.missingBlobAuditCursor = Math.floor(Math.random() * candidates.length);
+				this.missingBlobAuditCursorInitialized = true;
+			}
+			const batch: string[] = [];
+			const batchLimit = Platform.isMobile ? MOBILE_BLOB_AUDIT_BATCH : MISSING_BLOB_AUDIT_BATCH;
+			for (let offset = 0; offset < Math.min(batchLimit, candidates.length); offset++) {
+				batch.push(candidates[(this.missingBlobAuditCursor + offset) % candidates.length]!);
+			}
+			this.missingBlobAuditCursor = (this.missingBlobAuditCursor + batch.length) % candidates.length;
+			const present = new Set(await this.blobClient.exists(batch));
+			let remainingBytes = Platform.isMobile ? MOBILE_BLOB_AUDIT_BYTES : MISSING_BLOB_AUDIT_BYTES;
+			for (const hash of batch) {
+				if (!this.acceptingWork) return;
+				if (present.has(hash)) continue;
+				const files = filesByHash.get(hash)!;
+				const eligible = files.filter((file) => file.stat.size <= remainingBytes);
+				if (eligible.length === 0) continue;
+				remainingBytes -= eligible[0]!.stat.size;
+				try {
+					await this.reuploadGoodLocalBlob(hash, eligible);
+				} catch (error) {
+					this.log(`Missing blob recovery deferred for ${hashPrefix(hash)}: ${String(error)}`);
+				}
+			}
+		} catch (error) {
+			this.log(`Missing blob audit deferred: ${String(error)}`);
+		} finally {
+			this.missingBlobAuditRunning = false;
+			if (this.acceptingWork) {
+				this.missingBlobAuditTimer = window.setTimeout(() => {
+					this.missingBlobAuditTimer = null;
+					void this.auditMissingBlobs();
+				}, this.auditDelayMs());
+				this.kickDownloadDrain();
 			}
 		}
 	}
@@ -2056,6 +2386,7 @@ export class BlobSyncManager {
 		delayMs: number,
 		channel: "upload" | "download",
 	): void {
+		if (!this.acceptingWork) return;
 		const timer = window.setTimeout(() => {
 			this.retryTimers.delete(timer);
 			if (channel === "upload") this.kickUploadDrain();
@@ -2164,6 +2495,8 @@ export class BlobSyncManager {
 				retries: item.retries,
 				status: "pending",
 				readyAt: 0,
+				integrityPaused: item.integrityPaused,
+				transportPaused: item.transportPaused,
 			});
 		}
 		const downloads: BlobQueueSnapshot["downloads"] = [];
@@ -2177,6 +2510,9 @@ export class BlobSyncManager {
 				readyAt: 0,
 				needsRerun: item.needsRerun,
 				rerunResets: item.rerunResets,
+				repairAware: item.repairAware,
+				repairAwaitingSource: item.repairAwaitingSource,
+				repairPaused: item.repairPaused,
 			});
 		}
 
@@ -2225,6 +2561,8 @@ export class BlobSyncManager {
 					retries: item.retries ?? 0,
 					status: "pending",
 					readyAt: 0,
+					integrityPaused: item.integrityPaused,
+					transportPaused: item.transportPaused,
 				});
 				restored++;
 			}
@@ -2246,6 +2584,9 @@ export class BlobSyncManager {
 					readyAt: 0,
 					needsRerun: item.needsRerun ?? false,
 					rerunResets: item.rerunResets ?? 0,
+					repairAware: item.repairAware,
+					repairAwaitingSource: item.repairAwaitingSource,
+					repairPaused: item.repairPaused,
 				});
 				restored++;
 			}
@@ -2310,6 +2651,11 @@ export class BlobSyncManager {
 	quiesce(): BlobQueueSnapshot {
 		if (this.quiescedSnapshot) return this.quiescedSnapshot;
 		this.acceptingWork = false;
+		if (this.missingBlobAuditTimer !== null) window.clearTimeout(this.missingBlobAuditTimer);
+		this.missingBlobAuditTimer = null;
+		if (this.exhaustionNoticeTimer !== null) window.clearTimeout(this.exhaustionNoticeTimer);
+		this.exhaustionNoticeTimer = null;
+		this.exhaustionNotices.clear();
 		this.runtimeId = crypto.randomUUID();
 		const snapshot = this.exportQueue();
 		for (const item of this.uploadQueue.values()) {
@@ -2349,6 +2695,8 @@ export class BlobSyncManager {
 		this.downloadQueue.clear();
 		this.inflightUploads.clear();
 		this.inflightDownloads.clear();
+		this.repairReports.clear();
+		this.goodBlobUploads.clear();
 		this.suppressedPaths.clear();
 		this.localOnlyBlobConflictPaths.clear();
 		this.remoteDeleteInFlight.clear();

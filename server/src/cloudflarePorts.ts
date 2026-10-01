@@ -6,6 +6,7 @@ import type {
 	ObjectListPage,
 	ObjectMetadata,
 	ObjectStorePort,
+	ObjectStreamBody,
 	ObjectWriteOptions,
 	SocketUpgradePort,
 	VerifiedObjectStreamOptions,
@@ -21,6 +22,8 @@ function metadata(object: R2Object): ObjectMetadata {
 		uploadedAt: object.uploaded.getTime(),
 		contentType: object.httpMetadata?.contentType ?? null,
 		customMetadata: object.customMetadata ?? {},
+		sha256: object.checksums?.sha256 ? Array.from(new Uint8Array(object.checksums.sha256), (byte) => byte.toString(16).padStart(2, "0")).join("") : undefined,
+		etag: object.etag,
 	};
 }
 
@@ -44,6 +47,11 @@ export class CloudflareObjectStore implements ObjectStorePort {
 		const object = await this.bucket.get(key);
 		if (!object) return null;
 		return { ...metadata(object), bytes: new Uint8Array(await object.arrayBuffer()) };
+	}
+
+	async getStream(key: string): Promise<ObjectStreamBody | null> {
+		const object = await this.bucket.get(key);
+		return object ? { ...metadata(object), body: object.body } : null;
 	}
 
 	async put(key: string, bytes: Uint8Array, options?: ObjectWriteOptions): Promise<void> {

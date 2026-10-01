@@ -584,9 +584,9 @@ s.section("Test 11: blob remote delete preserves when no known hash baseline");
 	s.check(!tombstoneCleared, "blob tombstone NOT cleared for unknown-baseline (no auto-resurrection)");
 }
 
-// ── Test 12: rerunResets cap prevents infinite retry loops ───────────────────
+// ── Test 12: rerunResets cap enters visible periodic waiting ────────────────
 
-s.section("Test 12: rerunResets cap triggers permanent failure");
+s.section("Test 12: rerunResets cap keeps a waiting download");
 {
 	const { manager, traces } = makeHarness();
 
@@ -611,24 +611,24 @@ s.section("Test 12: rerunResets cap triggers permanent failure");
 
 	// Mock blobClient to throw
 	stubDownload(manager, async () => { throw new Error("always fails"); });
+	manager["downloadQueue"].set(item.path, item);
 
 	await manager["processDownload"](item);
 
-	// Item should be permanently failed — not restarted
 	s.check(
-		!manager["downloadQueue"].has("capped.png"),
-		"capped item removed from queue (permanent failure)",
+		manager["downloadQueue"].has("capped.png") && item.readyAt > 0,
+		"capped item remains queued for periodic retry",
 	);
 	s.check(
 		traces.some((event) =>
-			event.msg === "download-permanently-failed" &&
+			event.msg === "download-repair-paused" &&
 			event.details?.path === "capped.png"
 		),
-		"permanent failure trace emitted for capped item",
+		"visible waiting trace emitted for capped item",
 	);
 	s.check(
-		manager["_permanentDownloadFailures"] === 1,
-		"permanent download failure counter incremented",
+		manager["_permanentDownloadFailures"] === 0,
+		"waiting download does not count as permanently failed",
 	);
 }
 
@@ -1496,4 +1496,107 @@ s.section("Test 34: durable publication handoff retires the transfer snapshot ow
 		&& event.data?.publication === "durably-pending"), "transfer completion records durable publication handoff without duplicating the publication-owner event");
 	manager.destroy();
 }
+s.section("Test 35: corrupt downloads never reach disk and exhaust retries when the server object is healthy");
+{
+		const { manager, vault, files, productEvents } = makeHarness();
+	try {
+		const path = "attachments/corrupt-missing.bin";
+		const expected = bytes("valid-remote");
+		const corrupt = bytes("wrong-remote");
+		const hash = await sha256Hex(expected);
+		const corruptHash = await sha256Hex(corrupt);
+		await manager["attachmentCatalog"].setAttachmentRef(path, hash, expected.byteLength, "application/octet-stream", {
+			operationId: `seed:${path}`,
+			expectedRevision: null,
+		});
+		let diskWrites = 0;
+		vault.createBinary = async () => { diskWrites++; };
+		vault.modifyBinary = async () => { diskWrites++; };
+		vault.createFolder = async () => { diskWrites++; };
+		let downloads = 0;
+		manager["blobClient"].reportSuspect = async () => {};
+		manager["blobClient"].exists = async () => [hash];
+		stubDownload(manager, async () => {
+			downloads++;
+			return corrupt;
+		});
+		const item = {
+			path,
+			hash,
+			sizeBytes: expected.byteLength,
+			retries: 0,
+			status: "processing" as "pending" | "processing",
+			readyAt: 0,
+			rerunResets: 0,
+		};
+		manager["downloadQueue"].set(path, item);
+		for (let attempt = 0; attempt < 4; attempt++) {
+			item.status = "processing";
+			await manager["processDownload"](item);
+			s.check(diskWrites === 0 && files.size === 0, `corrupt attempt ${attempt + 1} creates neither target nor artifact nor folder`);
+			if (attempt < 3) {
+				s.check(manager["downloadQueue"].get(path) === item && manager["downloadQueue"].get(path)?.status === "pending"
+					&& item.retries === attempt + 1 && item.readyAt > Date.now(), `corrupt attempt ${attempt + 1} retains a backoff retry`);
+			}
+		}
+		s.check(downloads === 4 && manager["downloadQueue"].has(path), "corrupt download remains queued for periodic recovery");
+		s.check(manager["_permanentDownloadFailures"] === 0 && manager["_completedDownloads"] === 0, "corruption remains visibly waiting, never successful sync");
+		const integrityEvents = productEvents.filter((event) => event.kind === "attachment.integrity.failed");
+		s.check(integrityEvents.length === 4 && integrityEvents.every((event) => event.path === path
+			&& event.severity === "error" && event.priority === "critical"
+			&& event.scope === "file" && event.source === "blobSync" && event.layer === "blob"
+			&& event.data?.expectedHashPrefix === hash.slice(0, 12)
+			&& event.data?.actualHashPrefix === corruptHash.slice(0, 12)), "each corrupt attempt exposes a critical attachment.integrity.failed event with expected and actual hashes");
+		s.check(!productEvents.some((event) => event.kind === "attachment.download.complete"), "corrupt bytes never emit download completion");
+		s.check(manager["attachmentCatalog"].getAttachmentRef(path)?.hash === hash, "corruption never replaces the independently seeded catalog hash");
+	} finally {
+		manager.destroy();
+	}
+}
+
+s.section("Test 36: corrupt downloads preserve existing bytes even when local edits race");
+for (const changedDuringDownload of [false, true]) {
+	const { manager, vault, files, put, traces, productEvents } = makeHarness();
+	try {
+		const path = "attachments/corrupt-existing.bin";
+		const expected = bytes("valid-remote");
+		const corrupt = bytes("wrong-remote");
+		const hash = await sha256Hex(expected);
+		let local = put(path, bytes("local-original"));
+		await manager["attachmentCatalog"].setAttachmentRef(path, hash, expected.byteLength, "application/octet-stream", {
+			operationId: `seed:${path}`,
+			expectedRevision: null,
+		});
+		let diskWrites = 0;
+		vault.createBinary = async () => { diskWrites++; };
+		vault.modifyBinary = async () => { diskWrites++; };
+		vault.createFolder = async () => { diskWrites++; };
+		stubDownload(manager, async () => {
+			if (changedDuringDownload) local = put(path, bytes("local-edited"));
+			return corrupt;
+		});
+		await manager["processDownload"]({
+			path,
+			hash,
+			sizeBytes: expected.byteLength,
+			retries: 0,
+			status: "processing",
+			readyAt: 0,
+			rerunResets: 0,
+		});
+		const scenario = changedDuringDownload ? "concurrent local edit" : "unchanged local file";
+		s.check(files.get(path) === local
+			&& text(files.get(path)!.data) === (changedDuringDownload ? "local-edited" : "local-original"), `${scenario}: existing bytes and file state remain untouched`);
+		s.check(diskWrites === 0 && files.size === 1, `${scenario}: corrupt bytes never reach a target write or conflict artifact`);
+		s.check(!traces.some((event) => event.msg === "download-conflict-quarantined"
+			|| event.msg === "download-overwrite-decision"), `${scenario}: corruption is discarded before overwrite or quarantine decisions`);
+		s.check(productEvents.some((event) => event.kind === "attachment.integrity.failed"
+			&& event.path === path && event.severity === "error" && event.priority === "critical"), `${scenario}: critical integrity failure is visible`);
+		s.check(manager["_completedDownloads"] === 0
+			&& !productEvents.some((event) => event.kind === "attachment.download.complete"), `${scenario}: corruption is not reported as synced`);
+	} finally {
+		manager.destroy();
+	}
+}
+
 await s.done();

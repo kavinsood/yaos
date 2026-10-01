@@ -118,6 +118,7 @@ function validVaultRest(method: string, rest: string[]): boolean {
 	if (method === "DELETE" && rest.length === 2 && rest[0] === "auth" && rest[1] === "device") return true;
 	if (method === "GET" && rest.length === 1 && rest[0] === "devices") return true;
 	if (rest[0] === "blobs" && rest.length === 2) return method === "GET" || method === "PUT" || (method === "POST" && rest[1] === "exists");
+	if (method === "POST" && rest[0] === "blobs" && rest.length === 3 && rest[2] === "repair") return /^[0-9a-f]{64}$/.test(rest[1]!);
 	if (rest.length === 2 && rest[0] === "debug") {
 		return (method === "GET" && rest[1] === "recent") || (method === "POST" && rest[1] === "compact")
 			|| (method === "POST" && rest[1] === "simulate-restart");

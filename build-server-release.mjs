@@ -3,8 +3,10 @@ import { createHash } from "node:crypto";
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { guardCloudflareBlobs } from "./scripts/guard-cloudflare-blobs.mjs";
 
 const rootDir = resolve(".");
+guardCloudflareBlobs(rootDir);
 const outputDir = resolve(rootDir, "dist/release-assets");
 const tempDir = mkdtempSync(join(tmpdir(), "yaos-server-release-"));
 const serverTempDir = join(tempDir, "server");

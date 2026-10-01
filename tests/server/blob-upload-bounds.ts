@@ -23,6 +23,11 @@ async function blobEnv(bucket: ObjectStorePort) {
 	const capabilityDigest = await capabilityDigestForRole("member");
 	return makeEnv({
 		YAOS_BUCKET: bucket,
+		YAOS_SYNC: { call: async (_actorName: string, request: Request) => {
+			if (new URL(request.url).pathname === "/blobs/suspects") return json({ suspect: [] });
+			if (new URL(request.url).pathname === "/blobs/clear-suspect") return json({ cleared: true });
+			throw new Error(`unexpected blob authority route: ${new URL(request.url).pathname}`);
+		} },
 		YAOS_CONFIG: makeConfigNamespace(async (request) => {
 			const url = new URL(request.url);
 			if (url.pathname === "/__yaos/collaboration/authorize") {
@@ -83,6 +88,10 @@ async function errorMessage(response: Response): Promise<string | undefined> {
 class MetadataRecordingBucket extends FakeObjectStore {
 	contentType: string | null = null;
 	readonly streamCalls: string[] = [];
+	async head(key: string) {
+		const metadata = await super.head(key);
+		return metadata ? { ...metadata, sha256: createHash("sha256").update(this.objects.get(key)!).digest("hex") } : null;
+	}
 
 	async createOnlyVerifiedStream(key: string, body: ReadableStream<Uint8Array>, options: VerifiedObjectStreamOptions): Promise<"created" | "exists"> {
 		this.streamCalls.push(key);

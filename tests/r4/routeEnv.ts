@@ -28,5 +28,12 @@ export async function routeEnv(bucket: ObjectStorePort): Promise<Env> {
 			}, provisioningError: null });
 			throw new Error(`unexpected authority route: ${url.pathname}`);
 		} },
+		YAOS_SYNC: { call: async (_actorName: string, request: Request) => {
+			if (new URL(request.url).pathname === "/blobs/suspects") {
+				return json({ suspect: [] });
+			}
+			if (new URL(request.url).pathname === "/blobs/clear-suspect") return json({ cleared: true });
+			throw new Error(`unexpected blob authority route: ${new URL(request.url).pathname}`);
+		} },
 	} as Env;
 }

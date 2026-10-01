@@ -6,7 +6,9 @@ import {
 	mkdir,
 	open,
 	opendir,
+	rename,
 	rm,
+	stat,
 	unlink,
 } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
@@ -15,6 +17,7 @@ import type {
 	ObjectListPage,
 	ObjectMetadata,
 	ObjectStorePort,
+	ObjectStreamBody,
 	ObjectWriteOptions,
 	VerifiedObjectStreamOptions,
 } from "../../../server/src/platformPorts";
@@ -47,6 +50,7 @@ export interface FilesystemObjectStoreOperations {
 	link(existingPath: string, newPath: string): Promise<void>;
 	unlink(path: string): Promise<void>;
 	remove(path: string): Promise<void>;
+	rename(from: string, to: string): Promise<void>;
 }
 
 const DEFAULT_OPERATIONS: FilesystemObjectStoreOperations = {
@@ -55,6 +59,7 @@ const DEFAULT_OPERATIONS: FilesystemObjectStoreOperations = {
 	link,
 	unlink,
 	remove: async (path) => await rm(path, { force: true }),
+	rename,
 };
 
 // Keep deletions O(1) in the common case, but do not let the startup index
@@ -161,6 +166,7 @@ export class FilesystemObjectStore implements ObjectStorePort {
 	private sortedKeys: string[] = [];
 	private readonly liveKeys = new Set<string>();
 	private readonly pendingKeys = new Set<string>();
+	private readonly verifiedBlobWrites = new Map<string, Promise<void>>();
 	private indexedTombstones = 0;
 
 	constructor(root: string, operations: Partial<FilesystemObjectStoreOperations> = {}) {
@@ -177,7 +183,9 @@ export class FilesystemObjectStore implements ObjectStorePort {
 		const location = this.location(key);
 		try {
 			const { header } = await this.readHeader(location, key);
-			return objectMetadata(header);
+			const current = await stat(location);
+			return { ...objectMetadata(header), sha256: header.sha256,
+				etag: `${current.dev}:${current.ino}:${current.mtimeMs}:${current.size}` };
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
 			throw error;
@@ -204,6 +212,30 @@ export class FilesystemObjectStore implements ObjectStorePort {
 		}
 	}
 
+	async getStream(key: string): Promise<ObjectStreamBody | null> {
+		const location = this.location(key);
+		try {
+			const { header, bodyOffset } = await this.readHeader(location, key);
+			const file = await this.operations.open(location, "r");
+			let bytes: Uint8Array;
+			try {
+				bytes = new Uint8Array(header.size);
+				await readExactly(file, bytes, bodyOffset);
+			} finally {
+				await file.close();
+			}
+			return { ...objectMetadata(header), body: new ReadableStream<Uint8Array>({
+				start(controller) {
+					controller.enqueue(bytes);
+					controller.close();
+				},
+			}) };
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+			throw error;
+		}
+	}
+
 	async put(key: string, bytes: Uint8Array, options: ObjectWriteOptions = {}): Promise<void> {
 		await this.ensureIndex();
 		await this.publish(key, bytes, options);
@@ -223,6 +255,24 @@ export class FilesystemObjectStore implements ObjectStorePort {
 		body: ReadableStream<Uint8Array>,
 		options: VerifiedObjectStreamOptions,
 	): Promise<"created" | "exists"> {
+		const preceding = this.verifiedBlobWrites.get(key);
+		let release!: () => void;
+		const completion = new Promise<void>((resolve) => { release = resolve; });
+		this.verifiedBlobWrites.set(key, completion);
+		try {
+			if (preceding) await preceding;
+			return await this.createOnlyVerifiedStreamLocked(key, body, options);
+		} finally {
+			if (this.verifiedBlobWrites.get(key) === completion) this.verifiedBlobWrites.delete(key);
+			release();
+		}
+	}
+
+	private async createOnlyVerifiedStreamLocked(
+		key: string,
+		body: ReadableStream<Uint8Array>,
+		options: VerifiedObjectStreamOptions,
+	): Promise<"created" | "exists"> {
 		const location = this.location(key);
 		await this.ensureIndex();
 		const hash = createHash("sha256");
@@ -232,7 +282,8 @@ export class FilesystemObjectStore implements ObjectStorePort {
 			async () => hash.digest("hex"),
 			consume,
 		);
-		if (await this.head(key)) {
+		const existing = await this.head(key);
+		if (existing && (existing.etag !== options.replaceEtag || (existing.sha256 === options.sha256 && !options.replaceEtag))) {
 			await verify(async () => undefined);
 			return "exists";
 		}
@@ -263,12 +314,18 @@ export class FilesystemObjectStore implements ObjectStorePort {
 			} finally {
 				await file.close();
 			}
-			try {
-				await this.operations.link(temporary, location);
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-				this.addIndexedKey(key);
-				return "exists";
+			if (existing) {
+				const current = await this.head(key);
+				if (current?.etag !== existing.etag) return "exists";
+				await this.operations.rename(temporary, location);
+			} else {
+				try {
+					await this.operations.link(temporary, location);
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+					this.addIndexedKey(key);
+					return "exists";
+				}
 			}
 			await fsyncDirectory(directory);
 			this.addIndexedKey(key);

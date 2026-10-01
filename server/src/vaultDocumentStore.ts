@@ -911,6 +911,11 @@ export abstract class VaultDocumentStore {
 			);
 			CREATE INDEX IF NOT EXISTS recovery_key_leases_lease
 				ON recovery_key_leases(lease_id);
+			CREATE TABLE IF NOT EXISTS vault_blob_suspects (
+				object_key TEXT PRIMARY KEY,
+				reported_at INTEGER NOT NULL
+			);
+			DROP TABLE IF EXISTS vault_blob_interest;
 			CREATE TABLE IF NOT EXISTS recovery_defects (
 				capture_id TEXT NOT NULL,
 				kind TEXT NOT NULL,

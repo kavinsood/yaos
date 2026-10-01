@@ -84,6 +84,29 @@ function parseRestoreSelection(value: string): RestoreSelection {
 
 /** Recovery capture, restore, projection, GC, lease, and deletion authority storage. */
 export class RecoveryAuthorityStore extends VaultBootstrapStore {
+	markBlobSuspect(objectKey: string, now = Date.now()): boolean {
+		this.initialize();
+		if (!/\/blobs\/[a-f0-9]{64}$/.test(objectKey)) throw new Error("invalid blob key");
+		const result = this.storage.sql.exec(
+			"INSERT OR IGNORE INTO vault_blob_suspects(object_key, reported_at) VALUES (?, ?)",
+			objectKey, now,
+		);
+		return result.rowsWritten > 0;
+	}
+
+	isBlobSuspect(objectKey: string): boolean {
+		this.initialize();
+		return this.storage.sql.exec<{ count: number }>(
+			"SELECT COUNT(*) AS count FROM vault_blob_suspects WHERE object_key = ?",
+			objectKey,
+		).one().count > 0;
+	}
+
+	clearBlobSuspect(objectKey: string): void {
+		this.initialize();
+		this.storage.sql.exec("DELETE FROM vault_blob_suspects WHERE object_key = ?", objectKey).toArray();
+	}
+
 	acquireVaultMutationLease(owner: string, now = Date.now(), ttlMs = 5 * 60_000): boolean {
 		return this.acquireRecoveryMutex(owner, now, ttlMs);
 	}
@@ -1230,6 +1253,7 @@ export class RecoveryAuthorityStore extends VaultBootstrapStore {
 				if (lease?.lease_kind !== "sweep") throw new Error("object key is not sweep leased");
 				this.storage.sql.exec("DELETE FROM recovery_content_index WHERE object_key = ?", key).toArray();
 				this.storage.sql.exec("DELETE FROM recovery_manifest_index WHERE object_key = ?", key).toArray();
+				this.storage.sql.exec("DELETE FROM vault_blob_suspects WHERE object_key = ?", key).toArray();
 			}
 			this.storage.sql.exec("DELETE FROM recovery_key_leases WHERE lease_id = ?", leaseId).toArray();
 		});

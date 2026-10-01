@@ -229,6 +229,31 @@ export class StoreCycle {
       capabilityExpiresAt: 86_402_000,
     }, 2_000);
     store.advanceGcEpoch(gcTwo.epoch, "sweeping", 2_001);
+    const referencedBlobKey = "vault/sqlite-cycle-vault/" + vaultGeneration + "/blobs/" + attachmentHash;
+    const firstReport = store.markBlobSuspect(referencedBlobKey, 2_001);
+    const duplicateReport = store.markBlobSuspect(referencedBlobKey, 2_002);
+    const suspectSurvivesReload = new VaultStore(this.state.storage).isBlobSuspect(referencedBlobKey);
+    const suspectReportsCoalesced = firstReport && !duplicateReport
+      && this.state.storage.sql.exec<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM vault_blob_suspects WHERE object_key = ?", referencedBlobKey,
+      ).one().count === 1;
+    const referencedSweep = store.acquireSweepLease({
+      leaseId: "sweep-referenced-blob", epoch: gcTwo.epoch,
+      ownerId: "gc:sqlite-cycle-vault:generation-sqlite-cycle-0001", domain: "blob",
+      objectKeys: [referencedBlobKey], expiresAt: 3_000, now: 2_003,
+    });
+    store.clearBlobSuspect(referencedBlobKey);
+    const suspectCleared = !new VaultStore(this.state.storage).isBlobSuspect(referencedBlobKey);
+    const orphanBlobKey = "vault/sqlite-cycle-vault/" + vaultGeneration + "/blobs/" + "e".repeat(64);
+    store.markBlobSuspect(orphanBlobKey, 2_003);
+    const orphanSweep = store.acquireSweepLease({
+      leaseId: "sweep-orphan-blob", epoch: gcTwo.epoch,
+      ownerId: "gc:sqlite-cycle-vault:generation-sqlite-cycle-0001", domain: "blob",
+      objectKeys: [orphanBlobKey], expiresAt: 3_000, now: 2_004,
+    });
+    store.invalidateDeletedObjects(orphanSweep.leaseId, orphanSweep.approvedKeys);
+    const sweptSuspectPruned = !new VaultStore(this.state.storage).isBlobSuspect(orphanBlobKey);
+    store.releaseKeyLease(orphanSweep.leaseId);
     const garbageHash = "f".repeat(64);
     const garbageKey = "vault/sqlite-cycle-vault/generation-sqlite-cycle-0001/recovery-v2/content/sha256/ff/" + garbageHash + ".md.gz";
     store.recordProjectedContent(garbageHash, garbageKey, 10, null, 2_001);
@@ -514,7 +539,13 @@ export class StoreCycle {
 		framedRollback,
 	  },
       authority: {
-		authorityMirror,
+        authorityMirror,
+        suspectSurvivesReload,
+        suspectCleared,
+        suspectReportsCoalesced,
+        referencedSweepBlocked: referencedSweep.approvedKeys.length === 0,
+        orphanSweepApproved: orphanSweep.approvedKeys.includes(orphanBlobKey),
+        sweptSuspectPruned,
         gcEpochAdvanced: gcTwo.epoch === gcOne.epoch + 1,
         indexedGarbageApproved: sweep.approvedKeys.includes(garbageKey),
         activeWriterBlockedSweep: blockedSweep.approvedKeys.length === 0,
@@ -606,6 +637,12 @@ s.test("VaultStore completes journal/checkpoint/pin/feed-floor cycle on real SQL
 			floor: number;
 			authority: {
 				authorityMirror: boolean;
+				suspectSurvivesReload: boolean;
+				suspectCleared: boolean;
+				suspectReportsCoalesced: boolean;
+				referencedSweepBlocked: boolean;
+				orphanSweepApproved: boolean;
+				sweptSuspectPruned: boolean;
 				gcEpochAdvanced: boolean;
 				indexedGarbageApproved: boolean;
 				activeWriterBlockedSweep: boolean;
@@ -652,6 +689,10 @@ s.test("VaultStore completes journal/checkpoint/pin/feed-floor cycle on real SQL
 		s.check(result.textLength === 1_200_060, "chunked checkpoint reconstruction preserves exact body state");
 		s.check(result.authority.deletionAuthority, "vault deletion authority remains generation-fenced");
 		s.check(result.authority.authorityMirror, "collaboration authority mirror and exact fence receipt survive SQLite");
+		s.check(result.authority.suspectSurvivesReload && result.authority.suspectCleared
+			&& result.authority.suspectReportsCoalesced && result.authority.referencedSweepBlocked
+			&& result.authority.orphanSweepApproved && result.authority.sweptSuspectPruned,
+			"blob reports coalesce; live references fence GC and swept orphan suspects are pruned");
 		s.check(
 			result.authority.crashReacquiredMaterializationLease
 				&& result.authority.differentOwnerRejected

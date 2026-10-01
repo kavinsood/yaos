@@ -311,6 +311,56 @@ s.test("R4 verifies existing bytes, preserves mtime and publishes a race exactly
 	} finally { await rm(directory, { recursive: true, force: true }); }
 });
 
+s.test("verified replacement publishes only one concurrent winner", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "yaos-blob-replacement-race-"));
+	try {
+		let replacements = 0;
+		const store = new FilesystemObjectStore(directory, {
+			rename: async (source, target) => {
+				await new Promise((resolve) => setTimeout(resolve, 10));
+				await (await import("node:fs/promises")).rename(source, target);
+				replacements++;
+			},
+		});
+		const bytes = new TextEncoder().encode("verified replacement");
+		const hash = createHash("sha256").update(bytes).digest("hex");
+		const key = `blobs/${hash}`;
+		await store.put(key, new TextEncoder().encode("legacy corrupt bytes"));
+		const existing = await store.head(key);
+		assert.ok(existing?.etag);
+		const options = { length: bytes.length, sha256: hash, replaceEtag: existing.etag };
+		const results = await Promise.all(Array.from({ length: 4 }, () => store.createOnlyVerifiedStream(key, streamedBytes(bytes), options)));
+		assert.deepEqual(results.sort(), ["created", "exists", "exists", "exists"]);
+		assert.equal(replacements, 1);
+		assert.equal((await store.head(key))?.sha256, hash);
+		await assertNoTemporaryFiles(directory);
+	} finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+s.test("attachment reads leave corrupted bytes for the client verifier", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "yaos-node-client-blob-verifier-"));
+	try {
+		const store = new FilesystemObjectStore(directory);
+		const bytes = new TextEncoder().encode("original attachment");
+		const hash = createHash("sha256").update(bytes).digest("hex");
+		const key = `blobs/${hash}`;
+		assert.equal(await store.createOnlyVerifiedStream(key, streamedBytes(bytes), { length: bytes.length, sha256: hash }), "created");
+		const file = await open(join(directory, key), "r+");
+		try {
+			const prefix = Buffer.alloc(12);
+			await file.read(prefix, 0, prefix.length, 0);
+			const bodyOffset = prefix.length + prefix.readUInt32BE(8);
+			await file.write(new TextEncoder().encode("X"), 0, 1, bodyOffset);
+		} finally { await file.close(); }
+		assert.equal((await store.head(key))?.sha256, hash);
+		const download = await store.getStream(key);
+		assert.ok(download);
+		const response = new Response(download.body);
+		assert.equal(new TextDecoder().decode(await response.arrayBuffer()), "Xriginal attachment");
+		await assert.rejects(store.get(key), /checksum mismatch/);
+	} finally { await rm(directory, { recursive: true, force: true }); }
+});
+
 s.test("R4 hash, length and disconnect failures never publish or leak temp files", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "yaos-r4-invalid-"));
 	try {

@@ -80,10 +80,16 @@ export interface ObjectMetadata {
 	uploadedAt: number;
 	contentType: string | null;
 	customMetadata: Readonly<Record<string, string>>;
+	sha256?: string;
+	etag?: string;
 }
 
 export interface ObjectBody extends ObjectMetadata {
 	bytes: Uint8Array;
+}
+
+export interface ObjectStreamBody extends ObjectMetadata {
+	body: ReadableStream<Uint8Array>;
 }
 
 export interface ObjectWriteOptions {
@@ -94,6 +100,7 @@ export interface ObjectWriteOptions {
 export interface VerifiedObjectStreamOptions extends ObjectWriteOptions {
 	length: number;
 	sha256: string;
+	replaceEtag?: string;
 }
 
 export interface ObjectListPage {
@@ -106,6 +113,7 @@ export interface ObjectListPage {
 export interface ObjectStorePort {
 	head(key: string): Promise<ObjectMetadata | null>;
 	get(key: string): Promise<ObjectBody | null>;
+	getStream?(key: string): Promise<ObjectStreamBody | null>;
 	put(key: string, bytes: Uint8Array, options?: ObjectWriteOptions): Promise<void>;
 	createOnly(key: string, bytes: Uint8Array, options?: ObjectWriteOptions): Promise<"created" | "exists">;
 	createOnlyVerifiedStream?(key: string, body: ReadableStream<Uint8Array>, options: VerifiedObjectStreamOptions): Promise<"created" | "exists">;

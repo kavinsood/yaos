@@ -379,6 +379,44 @@ export class VaultRuntime implements DrainPort {
 			if (request.method === "POST" && url.pathname === "/__yaos/delete-all") return this.runAuthorityBoundary(() => this.deleteAll());
 			if (this.store.vaultAdmissionFence(metadata.vaultGeneration) || this.store.vaultDeletionBegun(metadata.vaultGeneration)) return json({ error: "vault_deleting" }, 410);
 			const actor = parseVaultActor(request, metadata.vaultId, metadata.vaultGeneration);
+			if (request.method === "POST" && url.pathname === "/blobs/suspects") {
+				return this.runAuthorityBoundary(async () => {
+					const authorized = this.authorize(actor, "vault.attachments.read");
+					if (authorized instanceof Response) return authorized;
+					const body: unknown = await request.json().catch(() => null);
+					const keys = (body as { keys?: unknown } | null)?.keys;
+					const prefix = blobKey(metadata.vaultId, metadata.vaultGeneration, "0".repeat(64)).slice(0, -64);
+					if (!Array.isArray(keys) || keys.length > 50 || keys.some((key) => typeof key !== "string" || !key.startsWith(prefix)
+						|| !/^[a-f0-9]{64}$/.test(key.slice(prefix.length)))) return json({ error: "invalid_keys" }, 400);
+					return json({ suspect: keys.filter((key: string) => this.store.isBlobSuspect(key)) });
+				});
+			}
+			if (request.method === "POST" && url.pathname === "/blobs/clear-suspect") {
+				return this.runAuthorityBoundary(async () => {
+					const authorized = this.authorize(actor, "vault.attachments.write");
+					if (authorized instanceof Response) return authorized;
+					const body: unknown = await request.json().catch(() => null);
+					const key = (body as { key?: unknown } | null)?.key;
+					if (typeof key !== "string" || !/^[a-f0-9]{64}$/.test(key.split("/").at(-1) ?? "")
+						|| key !== blobKey(metadata.vaultId, metadata.vaultGeneration, key.split("/").at(-1)!)) return json({ error: "invalid_key" }, 400);
+					this.store.clearBlobSuspect(key);
+					return json({ cleared: true });
+				});
+			}
+			if (request.method === "POST" && parts.length === 3 && parts[0] === "blobs" && parts[2] === "repair") {
+				return this.runAuthorityBoundary(async () => {
+					const authorized = this.authorize(actor, "vault.attachments.write");
+					if (authorized instanceof Response) return authorized;
+					const hash = parts[1]!;
+					if (!/^[a-f0-9]{64}$/.test(hash)) return json({ error: "invalid_hash" }, 400);
+					const key = blobKey(metadata.vaultId, metadata.vaultGeneration, hash);
+					if (this.store.markBlobSuspect(key, Date.now())) {
+						console.warn(JSON.stringify({ event: "attachment.integrity.repair", vaultId: metadata.vaultId,
+							vaultGeneration: metadata.vaultGeneration, deviceId: authorized.deviceId, hash, status: "suspect" }));
+					}
+					return json({ status: "suspect" });
+				});
+			}
 			if (parts[0] === "settings-sync") {
 				if (parts.length < 2 || parts.length > 3) return json({ error: "not_found" }, 404);
 				const authorized = this.authorize(actor, "vault.settings.personal.sync", actor?.principalId);
