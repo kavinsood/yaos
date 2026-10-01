@@ -63,6 +63,12 @@ interface CandidateServiceOptions {
 	vaultGeneration: () => string;
 	runtimeEpoch: string;
 	flush: (documentId: string) => Promise<boolean>;
+	/**
+	 * Relay v3 (group commit): commit the body's buffered relay frames before
+	 * the candidate is checked, so an HTTP fallback of bytes the relay already
+	 * holds is validated against them and writes no body rows.
+	 */
+	flushRelay?: (bodyId: string) => void;
 	validateActor: (actor: VaultActorContext) => boolean;
 	shouldPauseAdmission?: (documentId: string) => boolean;
 }
@@ -171,6 +177,7 @@ export class VaultCandidateService {
 	}): Promise<Response> {
 		const { bodyId, bodyEpoch, candidateId, candidateDigest, encodedUpdates, request, actor } = input;
 		const deviceId = actor.deviceId;
+		this.options.flushRelay?.(bodyId);
 		const creation = this.options.store.creationCandidate(bodyId);
 		const catalog = this.options.store.getCatalogHeadAt(this.options.store.currentSequence(), bodyId);
 		if (!creation && (!catalog || catalog.lifecycle !== "active" || catalog.fileId !== bodyId)) return json({ error: "body_not_active" }, 409);

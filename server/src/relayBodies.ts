@@ -65,7 +65,10 @@ export interface RelaySocketHost {
 /** v3: tail frames that trigger a checkpoint regardless of bytes. */
 export const RELAY_GC_TAIL_MAX_FRAMES = 512;
 
-type GroupFlushReason = "idle" | "max" | "bytes" | "forced";
+type GroupFlushReason = "idle" | "max" | "bytes" | "forced" | "read";
+
+/** v3: bound on acks held per socket while its wake re-sync step2 is outstanding (excess acks are dropped; the client resends). */
+const WAKE_HELD_ACKS_MAX = 1024;
 
 interface GroupBuffer {
 	bodyId: string;
@@ -114,6 +117,10 @@ interface QueuedFrame {
 	update: Uint8Array;
 	envelope: RelayEnvelope | null;
 	digest: string | null;
+	/** v3: arrival order across the runtime (cumulative-ack fence, see markFailed). */
+	seq: number;
+	/** v3: held acks released once this frame (a wake re-sync step2) is durable or a no-op. */
+	onDurable?: Array<() => void>;
 }
 
 interface Bucket { tokens: number; at: number }
@@ -168,7 +175,8 @@ export interface RelayCounters {
 	 * ends in exactly one of appendFrames, noopSkips, dedupeHits, dedupeConflicts,
 	 * batchDuplicateCandidates, authorityCloses/authorityDrops, rateLimitCloses,
 	 * epochFences, bodyInactiveCloses, tooLargeCloses, commitFailures, frameErrors
-	 * (the last seven close the socket with an error code).
+	 * (the last seven close the socket with an error code); v3 adds groupDropped
+	 * and failedSocketDrops.
 	 */
 	updateFrames: number;
 	/** Frames whose processing threw before the append (ywasm/SQL/rebuild error): VAULT_ERROR + close 1011. */
@@ -192,6 +200,8 @@ export interface RelayCounters {
 	groupFlushMax: number;
 	groupFlushBytes: number;
 	groupFlushForced: number;
+	/** v3: buffers flushed early by an HTTP candidate or a currentness query for the body. */
+	groupFlushReads: number;
 	/** v3: frames broadcast before commit (fan-out at receipt). */
 	groupBroadcasts: number;
 	/** v3: buffered frames dropped unacked by a simulated crash (the origin resends). */
@@ -206,6 +216,18 @@ export interface RelayCounters {
 	/** v3: wake re-syncs (step1 sent to sockets of an earlier runtime). */
 	wakeResyncs: number;
 	wakeResyncSockets: number;
+	/**
+	 * v3 cumulative-ack safety: update frames dropped unacked because an earlier
+	 * frame of the same socket was refused (rate limit, too large, authority,
+	 * epoch fence, inactive body, commit failure, frame error). The socket is
+	 * already closing; without this a later frame could be acked and the client
+	 * (which treats an ack for frame N as confirming every earlier frame) would
+	 * forget the refused one. A frame outcome.
+	 */
+	failedSocketDrops: number;
+	/** v3: acks held until the socket's wake re-sync step2 was committed (then sent), and acks dropped at the cap. */
+	wakeHeldAcks: number;
+	wakeHeldAcksDropped: number;
 }
 
 export interface RelayBodyServiceOptions {
@@ -331,11 +353,21 @@ export class RelayBodyService {
 		leanCatalogEvents: 0, leanCoalesceRowsWritten: 0, checkpointsFromCache: 0,
 		groupCommits: 0, groupFrames: 0, groupFlushIdle: 0, groupFlushMax: 0, groupFlushBytes: 0, groupFlushForced: 0,
 		groupBroadcasts: 0, groupDropped: 0, groupFlushDedupes: 0, tailCheckpoints: 0, tailJournalFallbacks: 0,
-		pendingReplayFrames: 0, wakeResyncs: 0, wakeResyncSockets: 0,
+		pendingReplayFrames: 0, wakeResyncs: 0, wakeResyncSockets: 0, groupFlushReads: 0, failedSocketDrops: 0,
+		wakeHeldAcks: 0, wakeHeldAcksDropped: 0,
 	};
 	/** v3 group-commit buffers keyed by (body, epoch). */
 	private readonly groups = new Map<string, GroupBuffer>();
 	private wakeResyncDone = false;
+	/**
+	 * v3: socket → arrival seq of its first refused frame. Frames of the socket
+	 * that arrived after it are dropped unacked (cumulative-ack safety); frames
+	 * buffered before it still commit and ack.
+	 */
+	private readonly failedSockets = new Map<string, number>();
+	private frameSeq = 0;
+	/** v3: sockets sent a wake re-sync step1 whose step2 has not arrived yet: their acks are held. */
+	private readonly wakeHeld = new Map<string, Array<() => void>>();
 	/** Last pre-append frame error (diagnostics only; message text, no payload bytes). */
 	private lastFrameError: { at: number; message: string } | null = null;
 
@@ -512,10 +544,30 @@ export class RelayBodyService {
 	socketClosed(socketId: string): void {
 		this.pendingEnvelopes.delete(socketId);
 		this.buckets.delete(socketId);
+		this.failedSockets.delete(socketId);
+		this.wakeHeld.delete(socketId);
+	}
+
+	/**
+	 * v3 cumulative-ack safety: a frame of this socket was refused (not
+	 * committed, not acked) and the socket is being closed. Every later frame
+	 * of the socket is dropped unacked, so no ack can ever cover the refused one.
+	 */
+	private markFailed(socketId: string | undefined, seq = ++this.frameSeq): void {
+		if (!this.config.groupCommit || !socketId) return;
+		const existing = this.failedSockets.get(socketId);
+		if (existing === undefined || seq < existing) this.failedSockets.set(socketId, seq);
+	}
+
+	/** v3: the frame arrived after a refused frame of its socket. */
+	private afterFailure(frame: QueuedFrame): boolean {
+		const point = this.failedSockets.get(frame.attachment.socketId);
+		return point !== undefined && frame.seq > point;
 	}
 
 	/** `count` is false for a queued frame already counted in `authorityDrops` (one outcome per frame). */
-	private rejectAuthority(socket: VaultSocketPort, count = true): void {
+	private rejectAuthority(socket: VaultSocketPort, count = true, socketId?: string, seq?: number): void {
+		this.markFailed(socketId, seq);
 		if (count) this.counters.authorityCloses++;
 		this.requireHost().sendControl(socket, { type: "error", code: "authority_superseded", reason: "socket authority superseded" });
 		try { socket.close(AUTHORITY_SUPERSEDED_SOCKET_CLOSE_CODE, "socket authority superseded"); } catch { /* closed */ }
@@ -528,7 +580,7 @@ export class RelayBodyService {
 		const bodyId = attachment.documentId;
 		if (message.kind === "step-1") {
 			// G6: never serve body bytes to a socket whose authority was superseded (cached check).
-			if (!this.validateActor(actorOf(attachment))) { this.rejectAuthority(socket); return; }
+			if (!this.validateActor(actorOf(attachment))) { this.rejectAuthority(socket, true, attachment.socketId); return; }
 			let state: MergedEntry | null;
 			try { state = this.fullState(bodyId); } catch (error) {
 				if (!(error instanceof RelayMergeBudgetError)) throw error;
@@ -549,7 +601,16 @@ export class RelayBodyService {
 		const update = message.update;
 		const pending = this.pendingEnvelopes.get(attachment.socketId) ?? null;
 		this.pendingEnvelopes.delete(attachment.socketId);
+		// v3: the answer to a wake re-sync step1. Acks held since the step1 are
+		// released once this step2 is durable (or adds nothing): only then can an
+		// ack be cumulative over frames a dropped buffer lost (see ensureWakeResync).
+		let released: Array<() => void> | null = null;
+		if (message.kind === "step-2" && this.wakeHeld.has(attachment.socketId)) {
+			released = this.wakeHeld.get(attachment.socketId)!;
+			this.wakeHeld.delete(attachment.socketId);
+		}
 		if (update.byteLength > MAX_DURABLE_UPDATE_BYTES) {
+			this.markFailed(attachment.socketId);
 			this.counters.tooLargeCloses++;
 			socket.close(1009, "sync update exceeds durable value limit");
 			return;
@@ -565,13 +626,15 @@ export class RelayBodyService {
 		// 1. Empty skip (`[0,0]` handshake step2).
 		if (update.byteLength === 0 || sameBytes(update, EMPTY_UPDATE_V1)) {
 			this.counters.emptySkips++;
+			if (released && !this.failedSockets.has(attachment.socketId)) for (const ack of released) this.postCommit(ack);
 			if (envelope) this.ackNoop(socket, attachment, envelope, digest);
 			return;
 		}
 		this.counters.updateFrames++;
+		if (this.failedSockets.has(attachment.socketId)) { this.counters.failedSocketDrops++; return; }
 		// 2. Authority (cached, invalidated by every in-process authority writer).
 		// Before dedupe (G7): a revoked device gets 4403, never a re-ack.
-		if (!this.validateActor(actor)) { this.rejectAuthority(socket); return; }
+		if (!this.validateActor(actor)) { this.rejectAuthority(socket, true, attachment.socketId); return; }
 		// 3. Candidate dedupe.
 		if (envelope?.candidateId) {
 			const candidateDigest = envelope.candidateDigest ?? envelope.payloadDigest;
@@ -593,12 +656,14 @@ export class RelayBodyService {
 		}
 		// 4. Budget.
 		if (!this.consumeTokens(attachment.socketId, update.byteLength)) {
+			this.markFailed(attachment.socketId);
 			this.counters.rateLimitCloses++;
 			host.sendControl(socket, { type: "VAULT_BACKPRESSURE", reason: "relay_rate_limit" });
 			try { socket.close(1013, "relay rate limit"); } catch { /* closed */ }
 			return;
 		}
-		const frame: QueuedFrame = { socket, attachment, actor, update: update.slice(), envelope, digest };
+		const frame: QueuedFrame = { socket, attachment, actor, update: update.slice(), envelope, digest, seq: ++this.frameSeq,
+			...(released && released.length > 0 ? { onDurable: released } : {}) };
 		if (this.config.groupCommit) {
 			this.groupEnqueue(bodyId, frame);
 			return;
@@ -659,11 +724,13 @@ export class RelayBodyService {
 		const epoch = frame.attachment.documentEpoch;
 		const head = this.options.store().documentHead(bodyId);
 		if (!head) {
+			this.markFailed(frame.attachment.socketId, frame.seq);
 			this.counters.bodyInactiveCloses++;
 			try { frame.socket.close(1008, "body is not active"); } catch { /* closed */ }
 			return;
 		}
 		if (head.semanticEpoch !== epoch) {
+			this.markFailed(frame.attachment.socketId, frame.seq);
 			this.counters.epochFences++;
 			host.fenceRelaySocket(frame.socket, frame.attachment, head.semanticEpoch);
 			return;
@@ -701,8 +768,28 @@ export class RelayBodyService {
 		if (reason === "idle") this.counters.groupFlushIdle++;
 		else if (reason === "max") this.counters.groupFlushMax++;
 		else if (reason === "bytes") this.counters.groupFlushBytes++;
+		else if (reason === "read") this.counters.groupFlushReads++;
 		else this.counters.groupFlushForced++;
 		this.commitFrames(group.bodyId, group.frames, true, true);
+	}
+
+	/**
+	 * v3: an HTTP candidate or a currentness query for this body commits its
+	 * buffered frames first, so the answer reflects every frame the relay has
+	 * already received (no stale "not current" answer, and an HTTP fallback of
+	 * bytes the relay holds finds them durable and is a no-op). Returns whether
+	 * anything was flushed. No-op without group commit.
+	 */
+	flushForRead(bodyId: string): boolean {
+		if (!this.config.groupCommit) return false;
+		const prefix = `${bodyId}\u0000`;
+		let flushed = false;
+		for (const key of [...this.groups.keys()]) {
+			if (!key.startsWith(prefix)) continue;
+			this.flushGroup(key, "read");
+			flushed = true;
+		}
+		return flushed;
 	}
 
 	/** v3: frames buffered for a body/epoch were broadcast before this socket joined; send them after its step2. */
@@ -763,7 +850,14 @@ export class RelayBodyService {
 			}
 			const state = stateVectors.get(bodyId);
 			if (!state || state.epoch !== attachment.documentEpoch) continue;
-			try { socket.send(syncFrame(SYNC_STEP_1, state.stateVector)); sent++; } catch { /* closed */ }
+			try {
+				socket.send(syncFrame(SYNC_STEP_1, state.stateVector));
+				sent++;
+				// Hold this socket's acks until its step2 is durable: a frame it sent
+				// before the wake may have been lost with the dropped buffer, and an
+				// ack for a later frame would confirm it (cumulative acks).
+				this.wakeHeld.set(attachment.socketId, []);
+			} catch { /* closed */ }
 		}
 		this.counters.wakeResyncs++;
 		this.counters.wakeResyncSockets += sent;
@@ -797,9 +891,14 @@ export class RelayBodyService {
 		const seen = new Map<string, string>();
 		const revoked = new Set<string>();
 		for (const frame of frames) {
+			if (groupedBodyId !== null && this.afterFailure(frame)) {
+				// An earlier frame of this socket was refused (e.g. one frame of an over-limit split failed).
+				this.counters.failedSocketDrops++;
+				continue;
+			}
 			if (revoked.has(frame.attachment.socketId) || !this.validateActor(frame.actor)) {
 				this.counters.authorityDrops++;
-				if (!revoked.has(frame.attachment.socketId)) this.rejectAuthority(frame.socket, false);
+				if (!revoked.has(frame.attachment.socketId)) this.rejectAuthority(frame.socket, false, frame.attachment.socketId, frame.seq);
 				revoked.add(frame.attachment.socketId);
 				continue;
 			}
@@ -871,7 +970,9 @@ export class RelayBodyService {
 	}
 
 	/** Pre-append failure of one frame or batch: count, log, VAULT_ERROR, close 1011. */
-	failFrames(bodyId: string, frames: ReadonlyArray<{ socket: VaultSocketPort }>, error: unknown): void {
+	failFrames(bodyId: string, frames: ReadonlyArray<{ socket: VaultSocketPort; attachment?: { socketId: string };
+		seq?: number }>, error: unknown): void {
+		for (const frame of frames) this.markFailed(frame.attachment?.socketId, frame.seq);
 		this.counters.frameErrors += Math.max(1, frames.length);
 		const message = error instanceof Error ? error.message : String(error);
 		this.lastFrameError = { at: this.now(), message: message.slice(0, 200) };
@@ -907,11 +1008,15 @@ export class RelayBodyService {
 		const state = this.headState(bodyId);
 		if (!state) {
 			this.counters.bodyInactiveCloses += live.length;
-			for (const frame of live) try { frame.socket.close(1008, "body is not active"); } catch { /* closed */ }
+			for (const frame of live) {
+				this.markFailed(frame.attachment.socketId, frame.seq);
+				try { frame.socket.close(1008, "body is not active"); } catch { /* closed */ }
+			}
 			return;
 		}
 		if (state.epoch !== epoch) {
 			for (const frame of live) {
+				this.markFailed(frame.attachment.socketId, frame.seq);
 				this.counters.epochFences++;
 				host.fenceRelaySocket(frame.socket, frame.attachment, state.epoch);
 			}
@@ -952,6 +1057,7 @@ export class RelayBodyService {
 			for (const frame of [...live, ...duplicates]) {
 				if (frame.envelope) this.ackNoop(frame.socket, frame.attachment, frame.envelope, frame.digest, state);
 			}
+			this.releaseHeld(live);
 			return;
 		}
 		if (!exact) this.counters.incrementalAppends++;
@@ -1008,19 +1114,24 @@ export class RelayBodyService {
 				if (error.reason === "epoch_mismatch" && error.currentEpoch !== null) {
 					this.invalidate(bodyId);
 					for (const frame of live) {
+						this.markFailed(frame.attachment.socketId, frame.seq);
 						this.counters.epochFences++;
 						host.fenceRelaySocket(frame.socket, frame.attachment, error.currentEpoch);
 					}
 					return;
 				}
 				this.counters.bodyInactiveCloses += live.length;
-				for (const frame of live) try { frame.socket.close(1008, "body is not active"); } catch { /* closed */ }
+				for (const frame of live) {
+					this.markFailed(frame.attachment.socketId, frame.seq);
+					try { frame.socket.close(1008, "body is not active"); } catch { /* closed */ }
+				}
 				return;
 			}
 			this.counters.commitFailures += live.length;
 			this.invalidate(bodyId);
 			console.warn("[yaos-relay] append failed", error);
 			for (const frame of live) {
+				this.markFailed(frame.attachment.socketId, frame.seq);
 				host.sendControl(frame.socket, { type: "VAULT_ERROR", code: "durability_failed",
 					message: "update was not committed; reconnect to resend" });
 				try { frame.socket.close(1011, "durable commit failed"); } catch { /* closed */ }
@@ -1081,6 +1192,7 @@ export class RelayBodyService {
 				contentHash: result.contentHash, size: result.size,
 			}));
 		}
+		this.releaseHeld(live);
 		const origins = new Set([...live, ...duplicates].map((frame) => frame.attachment.socketId));
 		// v3: peers got every frame at receipt (groupEnqueue); no second fan-out.
 		if (!grouped) {
@@ -1165,6 +1277,17 @@ export class RelayBodyService {
 		return this.staleResidents.has(bodyId);
 	}
 
+	/** v3: a wake re-sync step2 in `frames` is durable (or a no-op): send the acks held behind it. */
+	private releaseHeld(frames: QueuedFrame[]): void {
+		for (const frame of frames) {
+			if (!frame.onDurable) continue;
+			const acks = frame.onDurable;
+			delete frame.onDurable;
+			if (this.failedSockets.has(frame.attachment.socketId)) continue;
+			for (const ack of acks) this.postCommit(ack);
+		}
+	}
+
 	private ackNoop(socket: VaultSocketPort, attachment: VaultSocketAttachment, envelope: RelayEnvelope,
 		digest: string | null, state?: MergedEntry): void {
 		const head = state ?? this.headState(attachment.documentId);
@@ -1177,6 +1300,14 @@ export class RelayBodyService {
 	private ackOrigin(socket: VaultSocketPort, attachment: VaultSocketAttachment, envelope: RelayEnvelope,
 		digest: string | null, fields: { durableGeneration: number; vaultSequence: number; contentHashAccepted: boolean;
 			deduped: boolean; noop: boolean; contentHash?: string | null; size?: number | null }): void {
+		const held = this.wakeHeld.get(attachment.socketId);
+		if (held) {
+			// v3: wake re-sync step2 outstanding; sent once that step2 is durable.
+			if (held.length >= WAKE_HELD_ACKS_MAX) { this.counters.wakeHeldAcksDropped++; return; }
+			this.counters.wakeHeldAcks++;
+			held.push(() => this.ackOrigin(socket, attachment, envelope, digest, fields));
+			return;
+		}
 		const catalog = fields.contentHash === undefined
 			? this.options.store().getCatalogHeadAt(this.options.store().currentSequence(), attachment.documentId)
 			: null;

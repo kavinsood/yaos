@@ -590,6 +590,8 @@ export class VaultSocketService {
 				socket.close(1008, "body currentness query authority mismatch");
 				return;
 			}
+			// v3: commit the body's buffered relay frames first so the head is not stale.
+			relay.flushForRead(attachment.documentId);
 			const head = this.options.currentBodyHead(attachment.documentId);
 			this.sendControl(socket, {
 				type: "BODY_CURRENTNESS_RESULT",
@@ -621,7 +623,7 @@ export class VaultSocketService {
 			// Round 4: never answer a failed binary frame with VAULT_ERROR alone. The
 			// socket stayed open, so the origin never resent the lost update and its
 			// later updates stayed pending at every peer. Count, VAULT_ERROR, close 1011.
-			relay.failFrames(attachment.documentId, [{ socket }], error);
+			relay.failFrames(attachment.documentId, [{ socket, attachment }], error);
 		}
 	}
 
@@ -820,6 +822,8 @@ export class VaultSocketService {
 			const heads: BodyCurrentnessHead[] = [];
 			const missingBodyIds: string[] = [];
 			for (const bodyId of query.bodyIds) {
+				// v3: commit the body's buffered relay frames first so the head is not stale.
+				this.options.relay?.flushForRead(bodyId);
 				const head = this.options.currentBodyHead(bodyId);
 				if (head) heads.push({
 					bodyId: head.bodyId,

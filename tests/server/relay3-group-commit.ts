@@ -23,7 +23,9 @@ import { RELAY_RECEIPT_RING, decodeTailRecords } from "../../server/src/relayTai
 import { RELAY_CRASH_RUNTIME_PATH, VaultSyncServer, type CloudflareVaultEnvironment } from "../../server/src/server";
 import { canonicalMarkdownBytes } from "../../server/src/shared/markdownCodec";
 import { sha256HexSync } from "../../server/src/vaultDocumentStore";
-import type { VaultDocumentCache } from "../../server/src/vaultDocumentCache";
+import { VaultDocumentCache } from "../../server/src/vaultDocumentCache";
+import { VaultCandidateService } from "../../server/src/vaultCandidateService";
+import { candidateDigestMaterial } from "../../server/src/shared/candidateDigest";
 import type { VaultSocketAttachment, VaultSocketPort } from "../../server/src/vaultSocketService";
 import { VaultStore, type VaultStoragePort } from "../../server/src/vaultStore";
 import { makeDurableObjectState } from "../mocks/workerEnv.ts";
@@ -300,7 +302,7 @@ function outcomes(relay: RelayBodyService): number {
 	const c = relay.counters;
 	return c.appendFrames + c.noopSkips + c.dedupeHits + c.dedupeConflicts + c.batchDuplicateCandidates
 		+ c.authorityCloses + c.authorityDrops + c.rateLimitCloses + c.epochFences + c.bodyInactiveCloses
-		+ c.tooLargeCloses + c.commitFailures + c.frameErrors + c.groupDropped;
+		+ c.tooLargeCloses + c.commitFailures + c.frameErrors + c.groupDropped + c.failedSocketDrops;
 }
 
 // ---------------------------------------------------------------------------
@@ -563,9 +565,13 @@ s.test("wake re-sync: a new runtime sends step1 once to earlier-runtime relay so
 		next.flushBatch(BODY);
 		assert.equal(store.documentHead(BODY)!.latestSequence, headBefore + 1);
 		assert.equal(reconstructedText(store), peerDoc.getText("body").toString(), "the crash-lost frame is recovered from a peer");
-		// The origin's resend afterwards is a CRDT no-op ack.
+		// The origin's resend afterwards is a CRDT no-op; its ack is held until a's
+		// own wake step2 is durable (cumulative acks), then sent.
 		envelope(a, lost, { candidateId: "lost-1" }, next);
 		update(a, lost, next);
+		next.flushBatch(BODY);
+		assert.equal(a.all("BODY_COMMITTED").length, 0, "held: a has not answered the wake step1");
+		step2(a, Y.encodeStateAsUpdate(lostDoc, Y.encodeStateVector(seed)), next);
 		next.flushBatch(BODY);
 		assert.equal(a.last("BODY_COMMITTED")!.noop, true);
 		assert.equal(store.documentHead(BODY)!.latestSequence, headBefore + 1);
@@ -761,6 +767,204 @@ s.test("no silent drops: random interleavings with drops, resends and step2s kee
 		assert.equal(reconstructedText(store), truth.getText("body").toString());
 		for (const writer of writers) writer.doc.destroy();
 		truth.destroy();
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Cumulative acks: the client treats an ack for frame N as confirming every
+// earlier frame of that socket, so no frame may be refused while a later frame
+// of the same socket is acked.
+// ---------------------------------------------------------------------------
+
+function ackedIds(socket: FakeSocket): string[] {
+	return socket.all("BODY_COMMITTED").map((ack) => String(ack.clientFrameId));
+}
+
+s.test("cumulative acks: after a refused frame no later frame of the socket is acked (rate limit, commit failure, over-limit split)", async () => {
+	// Rate limit (B7): frame 2 is refused with 1013; frame 3 arrives before the close completes.
+	await withRelay(({ relay, socket, update, envelope, seed }) => {
+		const origin = socket();
+		const other = socket(peer);
+		const small = textUpdate(seed, (text) => text.insert(0, "a"));
+		envelope(origin, small, { clientFrameId: "rl-1" });
+		update(origin, small);
+		const big = textUpdate(seed, (text) => text.insert(0, "B".repeat(400)));
+		envelope(origin, big, { clientFrameId: "rl-2" });
+		update(origin, big);
+		assert.equal(origin.closed?.code, 1013);
+		const later = textUpdate(seed, (text) => text.insert(0, "c"));
+		envelope(origin, later, { clientFrameId: "rl-3" });
+		update(origin, later);
+		assert.equal(relay.counters.failedSocketDrops, 1);
+		assert.equal(other.binary.length, 1, "a dropped frame is not broadcast either");
+		relay.flushBatch(BODY);
+		assert.deepEqual(ackedIds(origin), ["rl-1"], "only the frame before the refused one");
+		assert.equal(outcomes(relay), relay.counters.updateFrames);
+		// A new socket of the same device is unaffected (its own budget; a small resend).
+		const reconnect = socket();
+		const resend = later;
+		envelope(reconnect, resend, { clientFrameId: "rl-resend" });
+		update(reconnect, resend);
+		relay.flushBatch(BODY);
+		assert.deepEqual(ackedIds(reconnect), ["rl-resend"]);
+	}, { burstBytes: 300, rateBytesPerSec: 1 });
+	// Commit failure (VAULT_ERROR + 1011): a frame sent after it is dropped unacked.
+	await withRelay(({ relay, relayStore, socket, update, envelope, seed }) => {
+		const origin = socket();
+		const original = relayStore.appendRelayGroupCommit.bind(relayStore);
+		let fail = true;
+		relayStore.appendRelayGroupCommit = (input) => {
+			if (fail) { fail = false; throw new Error("injected SQLITE_FULL"); }
+			return original(input);
+		};
+		const first = textUpdate(seed, (text) => text.insert(0, "x"));
+		envelope(origin, first, { clientFrameId: "cf-1" });
+		update(origin, first);
+		relay.flushBatch(BODY);
+		assert.equal(origin.closed?.code, 1011);
+		assert.equal(relay.counters.commitFailures, 1);
+		const second = textUpdate(seed, (text) => text.insert(0, "y"));
+		envelope(origin, second, { clientFrameId: "cf-2" });
+		update(origin, second);
+		relay.flushBatch(BODY);
+		assert.deepEqual(ackedIds(origin), []);
+		assert.deepEqual(relay.pendingGroups(), []);
+		assert.equal(relay.counters.failedSocketDrops, 1);
+		assert.equal(outcomes(relay), relay.counters.updateFrames);
+	});
+	// Over-limit merge: committed frame by frame; frame 1 fails, so frame 2 of the
+	// same socket must not commit/ack; another socket's frame still commits.
+	await withRelay(({ relay, relayStore, socket, update, envelope, seed }) => {
+		const origin = socket();
+		const other = socket(peer);
+		const otherDoc = cloneOf(seed);
+		const original = relayStore.appendRelayGroupCommit.bind(relayStore);
+		let calls = 0;
+		relayStore.appendRelayGroupCommit = (input) => {
+			if (++calls === 1) throw new Error("injected commit failure");
+			return original(input);
+		};
+		const one = textUpdate(seed, (text) => text.insert(0, "1".repeat(1_000_000)));
+		const two = textUpdate(seed, (text) => text.insert(0, "2".repeat(1_000_000)));
+		const third = textUpdate(otherDoc, (text) => text.insert(0, "peer "));
+		envelope(origin, one, { clientFrameId: "split-1" });
+		update(origin, one);
+		envelope(origin, two, { clientFrameId: "split-2" });
+		update(origin, two);
+		envelope(other, third, { clientFrameId: "split-peer" });
+		update(other, third);
+		relay.flushBatch(BODY);
+		assert.equal(origin.closed?.code, 1011);
+		assert.deepEqual(ackedIds(origin), [], "frame 2 is not acked over the failed frame 1");
+		assert.deepEqual(ackedIds(other), ["split-peer"]);
+		assert.equal(relay.counters.failedSocketDrops, 1);
+		assert.equal(outcomes(relay), relay.counters.updateFrames);
+		otherDoc.destroy();
+	}, { gcMaxBytes: 4_000_000, burstBytes: 1 << 30 });
+});
+
+s.test("wake hold: after a wake, an earlier-runtime socket's acks wait until its re-sync step2 is durable", async () => {
+	await withRelay(({ store, relay, socket, update, envelope, step2, seed, freshRelay }) => {
+		const a = socket();
+		const c = socket(peer);
+		const docA = cloneOf(seed);
+		const lost = textUpdate(docA, (text) => text.insert(0, "lost "));
+		envelope(a, lost, { clientFrameId: "a-1" });
+		update(a, lost);
+		assert.equal(relay.dropPendingGroupCommits(), 1, "crash: a-1 is gone unacked");
+		const next = freshRelay("runtime-v3-hold");
+		const durableVector = Y.encodeStateVector(seed);
+		assert.equal(next.ensureWakeResync(), 2);
+		// a sends a later frame to the new runtime before it answered the step1.
+		const after = textUpdate(docA, (text) => text.insert(text.length, " after"));
+		envelope(a, after, { clientFrameId: "a-2" }, next);
+		update(a, after, next);
+		next.flushBatch(BODY);
+		assert.equal(next.counters.groupCommits, 1, "a-2 is durable");
+		assert.deepEqual(ackedIds(a), [], "but its ack would confirm the lost a-1: held");
+		assert.equal(next.counters.wakeHeldAcks, 1);
+		// a answers the wake step1 with what the server lacks (a-1): durable, then the held ack goes out.
+		step2(a, Y.encodeStateAsUpdate(docA, durableVector), next);
+		assert.deepEqual(ackedIds(a), [], "not before the step2 is durable");
+		next.flushBatch(BODY);
+		assert.deepEqual(ackedIds(a), ["a-2"]);
+		assert.equal(reconstructedText(store), docA.getText("body").toString(), "a-1 recovered before any ack covered it");
+		// Later frames ack normally.
+		const more = textUpdate(docA, (text) => text.insert(0, "+"));
+		envelope(a, more, { clientFrameId: "a-3" }, next);
+		update(a, more, next);
+		next.flushBatch(BODY);
+		assert.deepEqual(ackedIds(a), ["a-2", "a-3"]);
+		// c lost nothing: its empty step2 releases its held ack at once.
+		const fromC = textUpdate(docA, (text) => text.insert(0, "c"));
+		envelope(c, fromC, { clientFrameId: "c-1" }, next);
+		update(c, fromC, next);
+		next.flushBatch(BODY);
+		assert.deepEqual(ackedIds(c), []);
+		step2(c, new Uint8Array([0, 0]), next);
+		assert.deepEqual(ackedIds(c), ["c-1"]);
+		assert.equal(outcomes(next), next.counters.updateFrames);
+		docA.destroy();
+	});
+});
+
+s.test("HTTP reads: candidate and currentness flush the body's buffer first; an HTTP fallback of relayed bytes writes no body rows", async () => {
+	await withRelay(async ({ store, relay, socket, update, envelope, seed, meter, tail, journalRows }) => {
+		const origin = socket();
+		assert.equal(relay.flushForRead(BODY), false, "nothing buffered");
+		const cache = new VaultDocumentCache(store, () => new Set(), () => new Set());
+		const candidates = new VaultCandidateService({
+			store, cache,
+			lifecycle: () => ({ finalizeCreation: () => "committed" }) as never,
+			sockets: () => ({ broadcastDocumentUpdate: () => {}, notifyBodyCommitted: () => {} }) as never,
+			vaultId: () => VAULT_ID, vaultGeneration: () => VAULT_GENERATION, runtimeEpoch: RUNTIME,
+			flush: async () => true,
+			flushRelay: (bodyId) => { relay.flushForRead(bodyId); },
+			validateActor: () => true,
+		});
+		const bytes = textUpdate(seed, (text) => text.insert(text.length, " relayed"));
+		envelope(origin, bytes, { clientFrameId: "http-1" });
+		update(origin, bytes);
+		assert.equal(relay.pendingGroups().length, 1);
+		const head = store.documentHead(BODY)!.latestSequence;
+		const rowsBefore = journalRows();
+		meter.reset();
+		meter.on = true;
+		const response = await candidates.handle(BODY, new Request("https://internal/body/x/candidate", {
+			method: "POST", body: bytes, headers: { "x-yaos-candidate-id": "http-fallback-1",
+				"x-yaos-candidate-digest": sha256HexSync(candidateDigestMaterial([bytes])),
+				"x-yaos-body-epoch": String(store.documentHead(BODY)!.semanticEpoch) } }), owner);
+		meter.on = false;
+		assert.equal(response.status, 200, await response.clone().text());
+		assert.equal(relay.counters.groupFlushReads, 1, "the HTTP candidate flushed the buffer");
+		assert.deepEqual(ackedIds(origin), ["http-1"], "the relay ack goes out at once, not after the idle window");
+		const receipt = await response.json() as Record<string, unknown>;
+		assert.equal(store.documentHead(BODY)!.latestSequence, head + 1, "one commit: the group; the HTTP copy is a no-op");
+		assert.equal(receipt.durableGeneration, store.documentHead(BODY)!.generation);
+		assert.equal(journalRows(), rowsBefore, "no journal row for the HTTP copy");
+		assert.equal(tail()!.frames, 1);
+		console.log(`[relay3-gc] HTTP fallback of relayed bytes (incl. the flushed group commit): rows ${meter.rows}, by table ${JSON.stringify(meter.byTable)}`);
+		// The flushed group commit: tail 1 + head 1. The HTTP copy: its own idempotency
+		// receipt (outcome + candidate receipt, 1 index each); no journal, head, catalog or attribution row.
+		assert.deepEqual(meter.byTable, { relay_body_tail: 1, vault_document_heads: 1, vault_operation_outcomes: 2,
+			vault_candidate_receipts: 2 });
+		assert.equal(reconstructedText(store), seed.getText("body").toString());
+		// A replay of the same HTTP candidate is answered from its receipt.
+		meter.reset();
+		meter.on = true;
+		const replay = await candidates.handle(BODY, new Request("https://internal/body/x/candidate", {
+			method: "POST", body: bytes, headers: { "x-yaos-candidate-id": "http-fallback-1",
+				"x-yaos-candidate-digest": sha256HexSync(candidateDigestMaterial([bytes])),
+				"x-yaos-body-epoch": String(store.documentHead(BODY)!.semanticEpoch) } }), owner);
+		meter.on = false;
+		assert.equal(replay.status, 200);
+		assert.equal(meter.rows, 0, "replay writes nothing");
+		// Currentness: flushForRead commits a buffered frame before the head is read.
+		const next = textUpdate(seed, (text) => text.insert(0, "q"));
+		update(origin, next);
+		assert.equal(relay.flushForRead(BODY), true);
+		assert.equal(store.documentHead(BODY)!.latestSequence, head + 2);
+		assert.equal(relay.counters.groupFlushReads, 2);
 	});
 });
 

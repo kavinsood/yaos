@@ -103,6 +103,18 @@ typing burst.
 5. No silent drops: `updateFrames` = the sum of the v2 outcomes + `groupDropped`. `groupFlushDedupes`
    is a subset of `dedupeHits`. A frame dropped by authority at flush is counted once, in
    `authorityDrops`.
+   `failedSocketDrops` is also an outcome (item 6).
+6. **Acks are cumulative-safe per socket** (the client treats an ack for frame N as confirming every
+   earlier frame of that socket). Frames of one socket are committed in arrival order: one body and one
+   epoch per socket, one buffer per (body, epoch), synchronous byte-cap flushes, one transaction per
+   group. A refused frame (rate limit, too large, authority, epoch fence, inactive body, commit failure,
+   frame error, including one frame of an over-limit split) fences its socket: frames that arrived after
+   it are dropped unacked (`failedSocketDrops`), and frames buffered before it still commit and ack.
+   After a wake, an earlier-runtime socket's acks are held until its re-sync step2 is durable
+   (`wakeHeldAcks`), because a frame it sent before the wake may have been lost with the buffer.
+7. An HTTP candidate or a currentness query for a body flushes that body's buffer first
+   (`groupFlushReads`). Neither ever waits on a timer. An HTTP copy of relayed bytes is therefore a
+   CRDT no-op: it writes no body rows, only its own idempotency receipt.
 
 ## Rows per commit (Cloudflare billing, inferred)
 

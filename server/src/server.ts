@@ -338,6 +338,8 @@ export class VaultRuntime implements DrainPort {
 			flush: (documentId) => this.flushDocument(documentId),
 			validateActor: (actor) => this.store.validateActor(actor) === "allowed",
 			shouldPauseAdmission: (documentId) => this.semanticCompaction.shouldPauseAdmission(documentId),
+			// v3: an HTTP candidate first commits the body's buffered relay frames (no wait, no stale no-op miss).
+			...(this.relay?.config.groupCommit ? { flushRelay: (bodyId: string) => { this.relay!.flushForRead(bodyId); } } : {}),
 		});
 		this.semantic = new VaultSemanticService({
 			store: this.store,

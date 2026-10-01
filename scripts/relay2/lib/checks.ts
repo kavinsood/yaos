@@ -164,12 +164,15 @@ export async function convergence(options: {
 export const FRAME_OUTCOMES = ["appendFrames", "noopSkips", "dedupeHits", "dedupeConflicts", "batchDuplicateCandidates", "authorityCloses",
 	"authorityDrops", "rateLimitCloses", "epochFences", "bodyInactiveCloses", "tooLargeCloses", "commitFailures", "frameErrors",
 	// v3 (YAOS_RELAY_GROUP_COMMIT): a buffered frame dropped by the test-only relay-crash route (absent/0 on v2).
-	"groupDropped"] as const;
+	"groupDropped",
+	// v3: a frame after a refused frame of the same socket, dropped unacked (cumulative-ack safety).
+	"failedSocketDrops"] as const;
 const COUNTER_KEYS = ["updateFrames", ...FRAME_OUTCOMES, "emptySkips", "postCommitErrors", "appends", "rowsWritten", "checkpoints",
 	"checkpointsFromCache", "leanCatalogEvents", "leanCoalesceRowsWritten", "envelopeMismatches",
 	// v3 group commit (absent on v2 deployments).
 	"groupCommits", "groupFrames", "groupFlushIdle", "groupFlushMax", "groupFlushBytes", "groupFlushForced", "groupFlushDedupes",
-	"tailCheckpoints", "tailJournalFallbacks", "pendingReplayFrames", "wakeResyncs", "wakeResyncSockets"];
+	"tailCheckpoints", "tailJournalFallbacks", "pendingReplayFrames", "wakeResyncs", "wakeResyncSockets",
+	"groupFlushReads", "wakeHeldAcks", "wakeHeldAcksDropped"];
 
 /** Snapshot of relay counters + every client's sent-frame totals (null counters on base / flag off). */
 export async function frameCounters(identity: LiveIdentity) {
