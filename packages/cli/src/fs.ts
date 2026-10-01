@@ -2,7 +2,7 @@
  * Durable filesystem primitives for the Node daemon.
  *
  * Adopted from PR #16's `packages/cli/src/fs.ts`. Every write the daemon makes
- * into a user's vault goes through `writeFileAtomic`: a reader must never
+ * into a user's vault uses `writeFileAtomic` or checked replacement: a reader must never
  * observe a half-written note, and a crash must never leave one behind.
  *
  * The `syncDirectoryBestEffort` swallow list is deliberately narrow — EINVAL,
@@ -12,8 +12,10 @@
  */
 
 import { randomBytes } from "node:crypto";
-import { promises as fs } from "node:fs";
+import { promises as fs, type Stats } from "node:fs";
 import nodePath from "node:path";
+import type { NodeFsExecutor } from "./nodeFsExecutor";
+import type { FileIdentity, FilePublication, FileSnapshot } from "./nodeFsHelper";
 
 const DIRECTORY_SYNC_TOLERATED_CODES: Record<string, true> = {
 	EINVAL: true,
@@ -81,7 +83,7 @@ async function readExistingMode(absolutePath: string): Promise<number | undefine
 export async function writeFileAtomic(
 	absolutePath: string,
 	content: string | Uint8Array,
-	options: { mode?: number } = {},
+	options: { mode?: number; onPublished?: (stats: Stats) => void } = {},
 ): Promise<void> {
 	const dir = nodePath.dirname(absolutePath);
 	const mode = options.mode ?? (await readExistingMode(absolutePath));
@@ -90,6 +92,7 @@ export async function writeFileAtomic(
 		`.yaos-write-${process.pid}.${Date.now()}.${randomBytes(8).toString("hex")}.tmp`,
 	);
 	let renamed = false;
+	let publishedStats: Stats | undefined;
 	try {
 		const handle = await fs.open(tmpPath, "wx", mode);
 		try {
@@ -98,17 +101,51 @@ export async function writeFileAtomic(
 			}
 			await handle.writeFile(content);
 			await handle.datasync();
+			publishedStats = await handle.stat();
 		} finally {
 			await handle.close();
 		}
 		await fs.rename(tmpPath, absolutePath);
 		renamed = true;
 		await syncDirectoryBestEffort(dir);
+		if (publishedStats) options.onPublished?.(publishedStats);
 	} finally {
 		if (!renamed) {
 			await fs.rm(tmpPath, { force: true });
 		}
 	}
+}
+
+export async function processFileCheckedReplacement(
+	absolutePath: string,
+	transform: (content: string) => string,
+	options: {
+		maximumBytes: number;
+		root: string;
+		identity: FileIdentity;
+		executor: NodeFsExecutor;
+		assertCurrent: () => void;
+		onPublished?: (stats: FilePublication) => void;
+	},
+): Promise<string> {
+	options.assertCurrent();
+	const original = await options.executor.execute<FileSnapshot>({
+		kind: "read", root: options.root, path: absolutePath,
+		identity: options.identity, maximumBytes: options.maximumBytes,
+	});
+	options.assertCurrent();
+	const content = transform(original.content);
+	if (typeof content !== "string" || Buffer.byteLength(content, "utf8") > options.maximumBytes) {
+		throw new Error("Invalid process output type or size");
+	}
+	options.assertCurrent();
+	const temporary = nodePath.join(nodePath.dirname(absolutePath), `.yaos-write-${process.pid}.${randomBytes(16).toString("hex")}.tmp`);
+	const published = await options.executor.execute<FilePublication>({
+		kind: "replace", root: options.root, path: absolutePath, expected: original,
+		output: content, maximumBytes: options.maximumBytes, temporary,
+	});
+	options.onPublished?.(published);
+	return content;
 }
 
 /**

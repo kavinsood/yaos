@@ -50,9 +50,11 @@ export interface VaultFsStat {
 import {
 	ensureDirectoryDurable,
 	removeFileDurable,
-	renameFileDurable,
 	writeFileAtomic,
+	processFileCheckedReplacement,
 } from "./fs";
+import { NodeFsExecutor, type NodeFsExecutorOptions } from "./nodeFsExecutor";
+import type { FileIdentity, FilePublication } from "./nodeFsHelper";
 import {
 	VaultPathError,
 	assertInsideRoot,
@@ -72,6 +74,7 @@ import {
  * limit after reading.
  */
 export const MAX_MARKDOWN_FILE_BYTES = MAX_CLIENT_MARKDOWN_BYTES * 2 + 3;
+export const DEFAULT_PROCESS_RETAINED_BYTES = 4 * MAX_MARKDOWN_FILE_BYTES;
 
 /** What the index knows about one path. */
 interface IndexEntry {
@@ -189,18 +192,138 @@ function toVaultFsStat(stats: Stats, kind: "file" | "folder"): VaultFsStat {
 	return { kind, size: stats.size, mtime: Math.floor(stats.mtimeMs) };
 }
 
+export interface NodeAppOptions extends NodeFsExecutorOptions {
+	readonly maximumPendingMutations?: number;
+	readonly maximumPendingMutationBytes?: number;
+}
+
 export class NodeApp {
+	readonly criticalIo: NodeFsExecutor;
+	readonly failure: Promise<never>;
 	readonly vault: NodeVault;
 	readonly fileManager: NodeFileManager;
 	readonly workspace: NodeWorkspace;
 	readonly index = new VaultIndex();
 	/** Directories proven to resolve inside the root. See `isContainedDirectory`. */
 	private readonly containedDirectories = new Set<string>();
+	private readonly fileHandles = new Map<string, { file: TFile; dev: number; ino: number }>();
+	private mutationTail: Promise<unknown> = Promise.resolve();
+	private pendingMutations = 0;
+	private activeMutations = 0;
+	private pendingMutationBytes = 0;
+	private rejectedMutations = 0;
+	private readonly maximumPendingMutations: number;
+	private readonly maximumPendingMutationBytes: number;
+
+	get mutationDiagnostics() {
+		return {
+			pending: this.pendingMutations, active: this.activeMutations,
+			payloadBytes: this.pendingMutationBytes, rejected: this.rejectedMutations,
+			maximumPending: this.maximumPendingMutations, maximumPayloadBytes: this.maximumPendingMutationBytes,
+			failed: this.criticalIo.failureError !== undefined,
+		};
+	}
+
+	mutate<Result>(operation: () => Result | Promise<Result>, payloadBytes = 0): Promise<Result> {
+		if (!Number.isSafeInteger(payloadBytes) || payloadBytes < 0) return Promise.reject(new Error("Invalid mutation payload size"));
+		if (this.criticalIo.failureError) return Promise.reject(this.criticalIo.failureError);
+		if (this.pendingMutations >= this.maximumPendingMutations || payloadBytes > this.maximumPendingMutationBytes - this.pendingMutationBytes) {
+			this.rejectedMutations += 1;
+			return Promise.reject(new Error(`Node host mutation admission full: ${payloadBytes} retained bytes requested; ${this.maximumPendingMutationBytes - this.pendingMutationBytes} available of ${this.maximumPendingMutationBytes}; ${this.pendingMutations}/${this.maximumPendingMutations} operations admitted`));
+		}
+		this.pendingMutations += 1;
+		this.pendingMutationBytes += payloadBytes;
+		let started = false;
+		const pending = this.mutationTail.then(() => {
+			if (this.criticalIo.failureError) throw this.criticalIo.failureError;
+			started = true;
+			this.activeMutations += 1;
+			return operation();
+		}).finally(() => {
+			if (started) this.activeMutations -= 1;
+			this.pendingMutations -= 1;
+			this.pendingMutationBytes -= payloadBytes;
+		});
+		this.mutationTail = pending.catch(() => undefined);
+		return pending;
+	}
+
+	assertCurrentFile(file: TFile): void {
+		this.assertWritableSync(file.path, this.absolutePathFor(file.path));
+		if (this.abstractFileFor(file.path) !== file) throw new Error(`File identity changed: ${file.path}`);
+	}
+
+	assertCachedFile(file: TFile, path: string, identity?: FileIdentity): FileIdentity {
+		const cached = this.fileHandles.get(path);
+		if (file.path !== path || cached?.file !== file ||
+			(identity && (cached.dev !== identity.dev || cached.ino !== identity.ino))) {
+			throw new Error(`File identity changed: ${path}`);
+		}
+		return { dev: cached.dev, ino: cached.ino };
+	}
+
+	adoptProcessedFile(path: string, file: TFile, published: FilePublication): void {
+		this.assertCachedFile(file, path);
+		this.fileHandles.set(path, { file, dev: published.dev, ino: published.ino });
+		const stat: VaultFsStat = { kind: "file", size: published.size, mtime: Math.floor(published.mtimeMs) };
+		this.index.set(path, stat, toVaultRelativePath(this.vaultRoot, this.absolutePathFor(path)));
+		file.stat = { ctime: stat.mtime, mtime: stat.mtime, size: stat.size };
+	}
+
+	assertWritableSync(vaultPath: string, absolutePath: string): void {
+		this.assertWritableParentSync(vaultPath, absolutePath);
+		const stats = lstatSync(absolutePath);
+		if (stats.isSymbolicLink() || !stats.isFile()) throw new Error(`Not a regular file: ${vaultPath}`);
+	}
+
+	assertWritableParentSync(vaultPath: string, absolutePath: string): void {
+		const parent = realpathSync(nodePath.dirname(absolutePath));
+		const relative = nodePath.relative(this.rootRealPath, parent);
+		if (relative.startsWith("..") || nodePath.isAbsolute(relative)) {
+			throw new VaultPathError(`Symlink traversal rejected: "${vaultPath}"`, vaultPath);
+		}
+	}
+
+	adoptWrittenFile(vaultPath: string, file?: TFile, published?: Pick<Stats, "dev" | "ino">): TFile {
+		const stats = lstatSync(this.absolutePathFor(vaultPath));
+		if (!stats.isFile() || (published && (stats.dev !== published.dev || stats.ino !== published.ino))) {
+			throw new Error(`Published file replaced externally: ${vaultPath}`);
+		}
+		const existing = file ?? this.fileHandles.get(vaultPath)?.file;
+		if (existing) this.fileHandles.set(vaultPath, { file: existing, dev: stats.dev, ino: stats.ino });
+		const stat = toVaultFsStat(stats, "file");
+		this.index.set(vaultPath, stat, toVaultRelativePath(this.vaultRoot, this.absolutePathFor(vaultPath)));
+		return this.makeTFile(vaultPath, stat);
+	}
+
+	forgetFileHandles(path: string): void {
+		for (const key of this.fileHandles.keys()) {
+			if (key === path || key.startsWith(`${path}/`)) this.fileHandles.delete(key);
+		}
+	}
+
+	moveFileHandles(source: string, target: string): void {
+		const moved = [...this.fileHandles.entries()].filter(([key]) => key === source || key.startsWith(`${source}/`));
+		this.forgetFileHandles(source);
+		for (const [key, entry] of moved) {
+			const destination = `${target}${key.slice(source.length)}`;
+			this.fileHandles.set(destination, entry);
+			const stat = this.statSyncEntry(destination);
+			if (stat?.kind === "file") this.makeTFile(destination, stat);
+		}
+	}
 
 	private constructor(
 		readonly vaultRoot: string,
 		readonly rootRealPath: string,
+		options: NodeAppOptions,
 	) {
+		this.maximumPendingMutations = options.maximumPendingMutations ?? 64;
+		this.maximumPendingMutationBytes = options.maximumPendingMutationBytes ?? 32 * 1024 * 1024;
+		if (!Number.isSafeInteger(this.maximumPendingMutations) || this.maximumPendingMutations < 1) throw new Error("Invalid mutation admission bound");
+		if (!Number.isSafeInteger(this.maximumPendingMutationBytes) || this.maximumPendingMutationBytes < 1) throw new Error("Invalid mutation payload bound");
+		this.criticalIo = new NodeFsExecutor(options);
+		this.failure = this.criticalIo.failure;
 		this.vault = new NodeVault(this);
 		this.fileManager = new NodeFileManager(this);
 		this.workspace = new NodeWorkspace();
@@ -213,10 +336,10 @@ export class NodeApp {
 	 * would both cost a syscall and open a window where the root itself is
 	 * swapped for a link between two checks.
 	 */
-	static async create(vaultRoot: string): Promise<NodeApp> {
+	static async create(vaultRoot: string, options: NodeAppOptions = {}): Promise<NodeApp> {
 		const resolved = nodePath.resolve(vaultRoot);
 		await ensureDirectoryDurable(resolved);
-		return new NodeApp(resolved, await fs.realpath(resolved));
+		return new NodeApp(resolved, await fs.realpath(resolved), options);
 	}
 
 	/**
@@ -261,10 +384,12 @@ export class NodeApp {
 			stats = lstatSync(absolute);
 		} catch {
 			this.index.forget(vaultPath);
+			this.forgetFileHandles(vaultPath);
 			return null;
 		}
 		if (stats.isSymbolicLink()) {
 			this.index.forget(vaultPath);
+			this.forgetFileHandles(vaultPath);
 			return null;
 		}
 		if (!stats.isFile() && !stats.isDirectory()) {
@@ -436,7 +561,10 @@ export class NodeApp {
 
 	/** Build the `TFile` production reads `.path`, `.stat` and `.basename` off. */
 	makeTFile(vaultPath: string, stat: VaultFsStat): TFile {
-		const file = new TFile();
+		const stats = lstatSync(this.absolutePathFor(vaultPath));
+		const cached = this.fileHandles.get(vaultPath);
+		const file = cached?.dev === stats.dev && cached.ino === stats.ino ? cached.file : new TFile();
+		this.fileHandles.set(vaultPath, { file, dev: stats.dev, ino: stats.ino });
 		file.path = vaultPath;
 		file.name = vaultPath.slice(vaultPath.lastIndexOf("/") + 1);
 		const dot = file.name.lastIndexOf(".");
@@ -506,22 +634,47 @@ export class NodeVault {
 
 	async readBinary(file: TFile): Promise<ArrayBuffer> {
 		const bytes = await fs.readFile(this.host.absolutePathFor(file.path));
-		return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+		return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
 	}
 
 	async modify(file: TFile, content: string): Promise<void> {
-		content = canonicalizeMarkdown(content);
-		const absolute = this.host.absolutePathFor(file.path);
-		await this.host.assertWritable(file.path, absolute);
-		await writeFileAtomic(absolute, content);
-		this.refreshAfterWrite(file.path, absolute);
+		return this.host.mutate(async () => {
+			content = canonicalizeMarkdown(content);
+			const absolute = this.host.absolutePathFor(file.path);
+			await this.host.assertWritable(file.path, absolute);
+			this.host.assertCurrentFile(file);
+			await writeFileAtomic(absolute, content, {
+				onPublished: (stats) => { this.host.adoptWrittenFile(file.path, file, stats); },
+			});
+		}, 2 * content.length);
+	}
+
+	async process(file: TFile, transform: (content: string) => string, options: { retainedBytes?: number } = {}): Promise<string> {
+		return this.host.mutate(async () => {
+			const path = file.path;
+			const identity = this.host.assertCachedFile(file, path);
+			const absolute = this.host.absolutePathFor(path);
+			const content = await processFileCheckedReplacement(absolute, transform, {
+				maximumBytes: MAX_MARKDOWN_FILE_BYTES,
+				root: this.host.rootRealPath,
+				identity,
+				executor: this.host.criticalIo,
+				assertCurrent: () => { this.host.assertCachedFile(file, path, identity); },
+				onPublished: (stats) => { this.host.adoptProcessedFile(path, file, stats); },
+			});
+			return content;
+		}, options.retainedBytes ?? DEFAULT_PROCESS_RETAINED_BYTES);
 	}
 
 	async modifyBinary(file: TFile, content: ArrayBuffer): Promise<void> {
-		const absolute = this.host.absolutePathFor(file.path);
-		await this.host.assertWritable(file.path, absolute);
-		await writeFileAtomic(absolute, new Uint8Array(content));
-		this.refreshAfterWrite(file.path, absolute);
+		return this.host.mutate(async () => {
+			const absolute = this.host.absolutePathFor(file.path);
+			await this.host.assertWritable(file.path, absolute);
+			this.host.assertCurrentFile(file);
+			await writeFileAtomic(absolute, new Uint8Array(content), {
+				onPublished: (stats) => { this.host.adoptWrittenFile(file.path, file, stats); },
+			});
+		}, content.byteLength);
 	}
 
 	/**
@@ -529,47 +682,53 @@ export class NodeVault {
 	 * behaviour and the reason `BlobSync`'s already-exists recovery exists.
 	 */
 	async create(path: string, content: string): Promise<TFile> {
-		content = canonicalizeMarkdown(content);
-		const normalized = normalizeVaultPath(path);
-		const absolute = this.host.absolutePathFor(normalized);
-		if (this.host.statSyncEntry(normalized) !== null) {
-			throw new Error(`File already exists: ${normalized}`);
-		}
-		await this.host.assertWritable(normalized, absolute);
-		await ensureDirectoryDurable(nodePath.dirname(absolute));
-		// Again after mkdir: the two are separated by an await, and a directory
-		// created through a symlink planted in between is exactly the escape
-		// this guard exists for.
-		await this.host.assertWritable(normalized, absolute);
-		await writeFileAtomic(absolute, content);
-		const stat = this.refreshAfterWrite(normalized, absolute);
-		return this.host.makeTFile(normalized, stat);
+		return this.host.mutate(async () => {
+			content = canonicalizeMarkdown(content);
+			const normalized = normalizeVaultPath(path);
+			const absolute = this.host.absolutePathFor(normalized);
+			if (this.host.statSyncEntry(normalized) !== null) {
+				throw new Error(`File already exists: ${normalized}`);
+			}
+			await this.host.assertWritable(normalized, absolute);
+			await ensureDirectoryDurable(nodePath.dirname(absolute));
+			// Again after mkdir: the two are separated by an await, and a directory
+			// created through a symlink planted in between is exactly the escape
+			// this guard exists for.
+			await this.host.assertWritable(normalized, absolute);
+			await writeFileAtomic(absolute, content);
+			const stat = this.refreshAfterWrite(normalized, absolute);
+			return this.host.makeTFile(normalized, stat);
+		}, 2 * content.length);
 	}
 
 	async createBinary(path: string, content: ArrayBuffer): Promise<TFile> {
-		const normalized = normalizeVaultPath(path);
-		const absolute = this.host.absolutePathFor(normalized);
-		if (this.host.statSyncEntry(normalized) !== null) throw new Error(`File already exists: ${normalized}`);
-		await this.host.assertWritable(normalized, absolute);
-		await ensureDirectoryDurable(nodePath.dirname(absolute));
-		await this.host.assertWritable(normalized, absolute);
-		await writeFileAtomic(absolute, new Uint8Array(content));
-		return this.host.makeTFile(normalized, this.refreshAfterWrite(normalized, absolute));
+		return this.host.mutate(async () => {
+			const normalized = normalizeVaultPath(path);
+			const absolute = this.host.absolutePathFor(normalized);
+			if (this.host.statSyncEntry(normalized) !== null) throw new Error(`File already exists: ${normalized}`);
+			await this.host.assertWritable(normalized, absolute);
+			await ensureDirectoryDurable(nodePath.dirname(absolute));
+			await this.host.assertWritable(normalized, absolute);
+			await writeFileAtomic(absolute, new Uint8Array(content));
+			return this.host.makeTFile(normalized, this.refreshAfterWrite(normalized, absolute));
+		}, content.byteLength);
 	}
 
 	async createFolder(path: string): Promise<TFolder> {
-		const normalized = normalizeVaultPath(path);
-		const absolute = this.host.absolutePathFor(normalized);
-		if (this.host.statSyncEntry(normalized) !== null) {
-			throw new Error(`Folder already exists: ${normalized}`);
-		}
-		await this.host.assertWritable(normalized, absolute);
-		await ensureDirectoryDurable(absolute);
-		this.host.statSyncEntry(normalized);
-		const folder = new TFolder();
-		folder.path = normalized;
-		folder.name = normalized.slice(normalized.lastIndexOf("/") + 1);
-		return folder;
+		return this.host.mutate(async () => {
+			const normalized = normalizeVaultPath(path);
+			const absolute = this.host.absolutePathFor(normalized);
+			if (this.host.statSyncEntry(normalized) !== null) {
+				throw new Error(`Folder already exists: ${normalized}`);
+			}
+			await this.host.assertWritable(normalized, absolute);
+			await ensureDirectoryDurable(absolute);
+			this.host.statSyncEntry(normalized);
+			const folder = new TFolder();
+			folder.path = normalized;
+			folder.name = normalized.slice(normalized.lastIndexOf("/") + 1);
+			return folder;
+		});
 	}
 
 	/** Re-stat after a write so `cachedStat` reflects what just landed. */
@@ -620,28 +779,42 @@ export class NodeVaultAdapter {
 	async exists(path: string): Promise<boolean> { return (await this.stat(path)) !== null; }
 
 	async mkdir(path: string): Promise<void> {
-		const normalized = normalizeVaultPath(path);
-		const absolute = this.host.absolutePathFor(normalized);
-		await this.host.assertWritable(normalized, absolute);
-		await ensureDirectoryDurable(absolute);
+		return this.host.mutate(async () => {
+			const normalized = normalizeVaultPath(path);
+			const absolute = this.host.absolutePathFor(normalized);
+			await this.host.assertWritable(normalized, absolute);
+			await ensureDirectoryDurable(absolute);
+		});
 	}
 
 	async write(path: string, content: string): Promise<void> {
-		const normalized = normalizeVaultPath(path);
-		const absolute = this.host.absolutePathFor(normalized);
-		await this.host.assertWritable(normalized, absolute);
-		await ensureDirectoryDurable(nodePath.dirname(absolute));
-		await this.host.assertWritable(normalized, absolute);
-		await writeFileAtomic(absolute, content);
+		return this.host.mutate(async () => {
+			const normalized = normalizeVaultPath(path);
+			const existing = this.host.abstractFileFor(normalized);
+			const absolute = this.host.absolutePathFor(normalized);
+			await this.host.assertWritable(normalized, absolute);
+			await ensureDirectoryDurable(nodePath.dirname(absolute));
+			await this.host.assertWritable(normalized, absolute);
+			if (existing instanceof TFile) this.host.assertCurrentFile(existing);
+			await writeFileAtomic(absolute, content, {
+				onPublished: (stats) => { this.host.adoptWrittenFile(normalized, existing instanceof TFile ? existing : undefined, stats); },
+			});
+		}, 2 * content.length);
 	}
 
 	async writeBinary(path: string, content: ArrayBuffer): Promise<void> {
-		const normalized = normalizeVaultPath(path);
-		const absolute = this.host.absolutePathFor(normalized);
-		await this.host.assertWritable(normalized, absolute);
-		await ensureDirectoryDurable(nodePath.dirname(absolute));
-		await this.host.assertWritable(normalized, absolute);
-		await writeFileAtomic(absolute, new Uint8Array(content));
+		return this.host.mutate(async () => {
+			const normalized = normalizeVaultPath(path);
+			const existing = this.host.abstractFileFor(normalized);
+			const absolute = this.host.absolutePathFor(normalized);
+			await this.host.assertWritable(normalized, absolute);
+			await ensureDirectoryDurable(nodePath.dirname(absolute));
+			await this.host.assertWritable(normalized, absolute);
+			if (existing instanceof TFile) this.host.assertCurrentFile(existing);
+			await writeFileAtomic(absolute, new Uint8Array(content), {
+				onPublished: (stats) => { this.host.adoptWrittenFile(normalized, existing instanceof TFile ? existing : undefined, stats); },
+			});
+		}, content.byteLength);
 	}
 }
 
@@ -663,44 +836,73 @@ export class NodeFileManager {
 	 * option in the trace that does not exist.
 	 */
 	async trashFile(file: TAbstractFile): Promise<void> {
-		const absolute = this.host.absolutePathFor(file.path);
-		await this.host.assertWritable(file.path, absolute);
-		await removeFileDurable(absolute);
-		this.host.index.forget(file.path);
+		return this.host.mutate(async () => {
+			const absolute = this.host.absolutePathFor(file.path);
+			await this.host.assertWritable(file.path, absolute);
+			if (file instanceof TFile) this.host.assertCurrentFile(file);
+			await removeFileDurable(absolute);
+			this.host.index.forget(file.path);
+			this.host.forgetFileHandles(file.path);
+		});
 	}
 
 	/**
 	 * Move a file. Throws when the destination is occupied, as Obsidian does.
 	 *
-	 * `beforeMutation` is the `VaultFsRenameOptions` hook, threaded down to here
-	 * rather than run by the caller because the contract requires NO await
-	 * between the hook and the mutation: the marker it sets exists to be
-	 * consumed by the rename event, and an await in between is exactly the race
-	 * it is defending against. Every rejection above it happens before the hook
-	 * runs, so a caller is never left holding a marker for an event that will
-	 * not arrive.
+	 * The hook runs before helper dispatch; the helper repeats the identity,
+	 * containment and vacancy checks before rename. Publication is asynchronous.
 	 */
 	async renameFile(
 		file: TAbstractFile,
 		newPath: string,
 		beforeMutation?: () => void,
 	): Promise<void> {
-		const target = normalizeVaultPath(newPath);
-		const from = this.host.absolutePathFor(file.path);
-		if (this.host.statSyncEntry(target) !== null) {
-			throw new Error(`File already exists: ${target}`);
-		}
-		const to = nodePath.join(this.host.vaultRoot, ...vaultPathParts(target));
-		await this.host.assertWritable(file.path, from);
-		await this.host.assertWritable(target, to);
-		await ensureDirectoryDurable(nodePath.dirname(to));
-		await this.host.assertWritable(target, to);
-		beforeMutation?.();
-		await renameFileDurable(from, to);
-		this.host.index.forgetSubtree(file.path);
-		this.host.statSyncEntry(target);
-		file.path = target;
-		file.name = target.slice(target.lastIndexOf("/") + 1);
+		return this.host.mutate(async () => {
+			const target = normalizeVaultPath(newPath);
+			const source = file.path;
+			const from = this.host.absolutePathFor(file.path);
+			const original = lstatSync(from);
+			if (original.isSymbolicLink() || (!original.isFile() && !original.isDirectory())) {
+				throw new Error(`Not a vault entry: ${source}`);
+			}
+			if (this.host.statSyncEntry(target) !== null) {
+				throw new Error(`File already exists: ${target}`);
+			}
+			const to = nodePath.join(this.host.vaultRoot, ...vaultPathParts(target));
+			await this.host.assertWritable(file.path, from);
+			await this.host.assertWritable(target, to);
+			await ensureDirectoryDurable(nodePath.dirname(to));
+			await this.host.assertWritable(target, to);
+			const assertPublicationCurrent = (): void => {
+				this.host.assertWritableParentSync(source, from);
+				this.host.assertWritableParentSync(target, to);
+				const current = lstatSync(from);
+				if (file.path !== source || current.dev !== original.dev || current.ino !== original.ino) {
+					throw new Error(`File identity changed: ${source}`);
+				}
+				if (file instanceof TFile) this.host.assertCurrentFile(file);
+				let vacant = false;
+				try {
+					lstatSync(to);
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+					vacant = true;
+				}
+				if (!vacant) throw new Error(`File already exists: ${target}`);
+			};
+			assertPublicationCurrent();
+			beforeMutation?.();
+			assertPublicationCurrent();
+			await this.host.criticalIo.execute({
+				kind: "rename", root: this.host.rootRealPath, path: from, target: to,
+				identity: { dev: original.dev, ino: original.ino },
+			});
+			this.host.index.forgetSubtree(file.path);
+			this.host.statSyncEntry(target);
+			this.host.moveFileHandles(source, target);
+			file.path = target;
+			file.name = target.slice(target.lastIndexOf("/") + 1);
+		});
 	}
 }
 
