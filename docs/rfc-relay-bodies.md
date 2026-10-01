@@ -19,6 +19,12 @@ What this RFC describes:
 - The contract document is [`relay2-protocol.md`](relay2-protocol.md). Where the two differ, the code wins, and the
   difference is called out.
 
+**Relay v3 addendum (2026-10-01, runs r3-1002/b/c).** v3 is group commit behind `YAOS_RELAY_GROUP_COMMIT=1`
+(sections 4.4a, 6, 8.8, 9.1, 12 R11–R14, 13). It was measured on deployed reused `yaos-relay2-v1001-*` workers with
+harness `d067cd6`/`8730d32`/`e3a1b85` and server code through `fd52578`. Raw data:
+`experiments/logs/relay2/runall-r3-1002{,b,c}/raw/`. Tables: `experiments/results/relay3/RESULTS.md`; report:
+`REPORT.md`. Latency phases in r3 ran concurrently (`--lane-a-parallel`) and are labelled **[conc]**.
+
 Evidence labels:
 - **measured**: taken on a deployed Worker or in a local run, with n and the scenario ID.
 - **inferred**: derived from measurements through a stated model.
@@ -66,6 +72,39 @@ Design notes that still apply:
    CPU-per-message, memory or scale conditions is triggered. Condition 3 (DO requests) is exceeded on the letter by
    the model (typical day 1.15× base, both at 2–3% of Free) and needs explicit sign-off; condition 7's starvation
    clause was not measured.
+
+### 1.1 Relay v3 addendum (group commit)
+
+**Recommendation: adopt v3 as the relay write path (GO-WITH-CONDITIONS), with B5 off.** It replaces "lean rows +
+mb 10" as the shipping config.
+
+Basis (measured unless labelled):
+- **Rows.** The real client (no `candidateId`) writes **0.29 rows/edit** at 5 keys/s (gql, MB-v3nc-type5, n = 551),
+  against v2's 5.63 in the same run (**−95%**). That is 1.45 rows per typing-second. Spaced edits cost 2.0 rows
+  each (C4 counter).
+- **Free rows** (inferred, section 9.1): typical day **3%** (v2 51–53%, base 30–52%), heavy 8 h day 18%. 100k rows
+  needs 19 h of non-stop typing. A 1 s plugin autosave for 8 h adds 62k rows (open note) or 80k (closed note).
+- **Latency.** Propagation is unchanged or better: L2 p50 / p99 47.7 / 76.3 ms vs v2 63.0 / 396 (n = 290, [conc]).
+  L4 p99 is 231 ms (f1001 v2 2,305). The receipt moves to 0.35 s p50 for a lone edit and 0.9 / 1.6 s p50 / p99
+  while typing continuously (user-approved 0.3–1.5 s window plus RTT). L5 real `VaultSync` edit → cleared is 353 ms
+  p50, with 0 HTTP POSTs (base prod 479).
+- **Crash with a pending buffer:** 10/10 rounds, 0 frames lost, including recovery from the peer when the origin is
+  offline.
+- **Correctness:** convergence suite 9/9. Cumulative-ack fence: too-large 5/5, rate 6/6 rounds that drew a
+  refusal. B1, B5 20/20, B6, B8, CW 121/121 and X4 pass.
+
+Conditions (v3):
+1. **Fix R11 before default-on.** B4-v3 fails convergence: a revoked device's pre-revocation frames reach peers
+   and are dropped at flush. Commit admitted frames at flush, or flush in `closeDevice`.
+2. **Re-run B7 serially on an idle machine (R12).** It passed 1 of 3. In one attempt Cloudflare shed the
+   bystander with `1013 Service overloaded` before our rate limit closed the flooder.
+3. **Keep B5 send-coalescing off at idle = 300 ms (R13).** It multiplies commits by 3.9× and adds 250 ms to
+   propagation. Parameters stay at 300 ms idle / 1.5 s max / 64 KB.
+4. v2 conditions 3–5 still apply (receipts in `VaultSync`, which are now landed and measured in L5; reset
+   starvation; receiving-side validation). v2 condition 1 (lean rows mandatory) is **retired** by v3. v3 requires
+   lean rows by construction, and rows are no longer near the cap. v2 condition 2 (p99 tails) is **largely
+   answered** for the hot path (L2 p99 76 ms, L4 p99 231 ms, [conc]). The checkpoint-alarm CPU part of R9 was not
+   re-measured.
 
 ## 2. Problem
 
@@ -288,6 +327,47 @@ The default relay writes the same row set that base writes per debounced flush (
 often: once per frame or micro-batch, instead of once per 250 ms window per body. Lean mode removes the clock write,
 the frame-0 attribution row and the per-append catalog event.
 
+### 4.4a Relay v3: group commit (`YAOS_RELAY_GROUP_COMMIT=1`)
+
+Full design: [`relay3-group-commit.md`](relay3-group-commit.md) (code through `fd52578`). v3 needs
+`YAOS_RELAY_BODIES=true` and `YAOS_RELAY_LEAN_ROWS=true`. With the flag off, the schema and every path are v2.
+
+- **Share now, save in groups, confirm after saving.** Admission is unchanged: size, envelope, authority, dedupe and
+  rate budget. Then the frame is **broadcast at once** and buffered per (body, epoch). The buffer commits in one
+  `transactionSync` after 300 ms idle (`YAOS_RELAY_GC_IDLE_MS`), 1.5 s after the first frame (`_MAX_MS`), or at
+  64 KB (`_MAX_BYTES`, synchronous). At flush the checks run again: G2 authority, epoch, B6 dedupe, in-buffer
+  duplicates and the growth cap. Receipts (`BODY_COMMITTED`, v2 wire format) go out after the commit returns.
+- **Rows.** One `relay_body_tail` row per body (WITHOUT ROWID, records since the last checkpoint), one
+  `relay_device_receipts` row per device (a 256-entry JSON ring, 15 min TTL), and the head update. No journal row,
+  no attribution rows, no per-commit `setAlarm` (the catalog alarm is armed at most once per 30 s).
+  A tail checkpoint (≈ 12 rows) runs every 64 KB or 512 records.
+- **Cumulative acks and fences** (invariant 3): a refused frame fences its socket, so an ack never passes a refused
+  frame.
+- **Wake re-sync** (invariant 1): a new runtime sends step1 with the durable SV to every surviving relay socket.
+  Each client's step2 returns frames that a crashed runtime broadcast but never committed. A covered step2 writes
+  nothing.
+- **Client resend.** `VaultSync`'s `RelayReceiptChannel` (`relayReceipts`) resends a frame that has no receipt after
+  5 s, and on reconnect. The real client sends no `candidateId` on relay-covered candidates. It confirms them with a
+  synthesized receipt and falls back to HTTP at 15 s. So the realistic v3 client is the `relay-nocand` adapter (spec
+  `v3nc`), which writes no receipt row.
+- **Optional B5 client send-coalescing** (`relaySendCoalesceMs`, 250 ms): the client merges updates for up to 250 ms
+  before sending.
+
+**Rows per edit and per commit** (measured, relay3 run, deployed `yaos-relay2-v1001-*` workers, harness counters =
+`rowsWritten` diagnostics delta; gql values in section 8.8):
+
+| Config | C4 rows/edit (1 edit per 1.5 s, n = 50; every edit is its own commit) | MB type5 rows/edit, counter / **gql** (5 keys/s, 110 s, n = 551) | Commits/s while typing | Rows per commit |
+|---|---:|---:|---:|---:|
+| base | n/a | n/a / 5.58 | n/a | n/a |
+| relay v2 (lean, mb 10) | 5.0 | 5.00 / 5.63 | n/a (1 append per frame) | n/a |
+| v3, harness client with `candidateId` | 3.0 | 0.38 / 0.42 | 0.64 | 3 (tail + head + receipt ring) |
+| **v3, real client (no `candidateId`, `v3nc`)** | **2.0** | **0.25 / 0.29** | 0.64 | 2 (tail + head) |
+| v3 + B5 250 ms | 3.0 | 1.50 / 1.53 | 2.5 | 3 |
+
+While typing continuously, the 1.5 s max-wait sets the commit rate (0.64/s ≈ one per 1.5 s), so rows per
+typing-second are ≈ 2 × 0.65 = 1.3 (counter) / 1.45 (gql), whatever the key rate. MB stream at 25 frames/s:
+0.09 rows/edit. C2-stress 50k frames: 288 commits, 0.05 rows/frame.
+
 ### 4.5 Step1/step2, catch-up, bootstrap, currentness
 
 - **Step1.** The server sends step1 with the head SV at accept. A client step1 is authority-checked first (G6,
@@ -369,6 +449,12 @@ the frame-0 attribution row and the per-append catalog event.
     digest` and `clientFrameId`.
   - The candidate is cleared on the relay `BODY_COMMITTED` whose `candidateId` and `candidateDigest` match. The HTTP
     POST remains the fallback after a socket loss.
+- **v3 receipts** (group commit): a receipt arrives when the group commits, **0.3–1.5 s after the edit** (user-approved;
+  300 ms idle, 1.5 s max). Measured (relay3): C4-v3 ack p50 / p99 351 / 625 ms at 1 edit per 1.5 s; MB type5 ack
+  p50 / p99 907 / 1,642 ms at 5 keys/s (the 1.5 s max-wait bounds it, plus RTT); L2-v3 origin ack 350 / 481 ms
+  (n = 290). Acks are cumulative per socket (invariant 3). The native `VaultSync` `RelayReceiptChannel`
+  (`relayReceipts`, landed with v3, `1a34693`) resends after 5 s without a receipt; the harness client does the same
+  (`--resend-ms`).
 
 ### 4.8 Budgets
 
@@ -489,11 +575,11 @@ Errors: 409 for `lease_invalid`, `lease_expired`, `epoch_mismatch`, `head_advanc
 
 | # | Invariant | How it is enforced | Code | Gaps / status |
 |---|---|---|---|---|
-| 1 | No edit is broadcast to peers before its append transaction commits. | Fan-out (`broadcastRelayUpdate`) and `BODY_COMMITTED` are called only after `appendRelayBodyUpdate` returns. The commit path is synchronous, so nothing can interleave. | `relayBodies.ts` `commitFrames` | none found |
+| 1 | **v2:** no edit is broadcast to peers before its append transaction commits (durable before broadcast). **v3 (`YAOS_RELAY_GROUP_COMMIT`): durable before receipt.** A frame is broadcast as soon as it passes admission; its `BODY_COMMITTED` receipt is sent only after the group commit that contains it returns. HTTP reads (GET/HEAD, bootstrap, feed) only ever see durable state. Precedent: base broadcast before its debounced flush until `e1ae3a4`. | v2: fan-out and `BODY_COMMITTED` only after `appendRelayBodyUpdate` returns. v3: `groupEnqueue` broadcasts, `flushGroup` commits in one `transactionSync` and then acks. A frame lost with the buffer (crash, eviction) was never acked, so the origin resends it (client resend after 5 s without a receipt, and on reconnect), and wake re-sync (`ensureWakeResync`) pulls it back from any peer that applied it. | `relayBodies.ts` `commitFrames` (v2), `groupEnqueue`/`flushGroup`/`ensureWakeResync` (v3) | v2: none found. v3 (measured, relay3 run r3-1002b): CRASH 10/10 rounds (5 origin-online, 5 origin-offline with recovery from the peer), 5–6 buffered frames dropped per round, 0 frames lost, fresh device C converges. Open: a revoked device's buffered frames reach peers but are dropped at flush (row 4, R11). |
 | 2 | Every append has exactly one vault sequence, and the feed returns it after the cursor. | Default: `vault_clock` is bumped in the same transaction as the journal insert. Lean: the sequence is `MAX(clock, journal max) + 1` inside the transaction, and the clock is synced before any journal delete. The sequence is the journal PK. | `relayBodyStore.ts` `appendRelayBodyUpdate`; `syncLeanClock` | A reset uses one sequence too. Feed retention is 1,000 sequences (G1 fixed, round 3). In lean mode the catalog delta feed lags by ≤ 2 s. |
-| 3 | A returned receipt means the bytes are durable. | The origin ack is sent after `transactionSync`. A dedupe re-ack reads a committed receipt row. A no-op ack means the bytes are already contained in durable state. | `commitFrames`, `ackOrigin`, `ackNoop` | The incremental-SV no-op for large bodies only matches identical bytes, which is safe. |
+| 3 | A returned receipt means the bytes are durable. **v3 adds: acks are cumulative per socket.** An ack for frame N confirms every earlier frame of that socket. | The origin ack is sent after `transactionSync`. A dedupe re-ack reads a committed receipt row. A no-op ack means the bytes are already contained in durable state. v3: one body and epoch per socket, one buffer per (body, epoch), synchronous byte-cap flushes and one transaction per group keep commits in arrival order. A refused frame (rate, too large, authority, epoch, inactive body, commit failure, frame error) **fences** its socket: later frames are dropped unacked (`failedSocketDrops`), earlier buffered frames still commit. After a wake, an earlier-runtime socket's acks are held until its re-sync step2 is durable (`wakeHeldAcks`). | `commitFrames`, `ackOrigin`, `ackNoop`; v3 `markFailed`, `afterFailure`, `screenBatch` | The incremental-SV no-op for large bodies only matches identical bytes, which is safe. v3 fence (measured, r3-1002b/c): too-large 5/5 (1009; nothing after the refused frame acked or durable); rate 6/6 rounds that drew our 1013 (0 acked and 0 durable after the refused frame; `failedSocketDrops` 10–76). The ack prefix held in every v3 run (MB, C4, FENCE, CRASH). |
 | 3a (round 4) | No frame is dropped silently. Every non-empty update frame ends appended, acked as a justified no-op or dedupe, or with the socket closed. | Outcome counters satisfy the frame-accounting identity (4.3). Pre-append throws close 1011. | `relayBodies.ts` `failFrames`; `vaultSocketService.ts` `relayMessage` | Covered by a random-interleaving test at mb 0 and mb > 0, and checked on full-n diagnostics deltas. |
-| 4 | A revoked device's frames after the fence sequence are never appended. | Sockets are closed with 4403 on revoke. `validateActorCached` runs on every frame, on step1 (G6), and again at micro-batch flush (G2). `authorityVersion` is bumped synchronously by the writer. The 5 s TTL applies only to cross-isolate changes. | `closeDevice`; `validateActorCached`; `commitFrames` | G2, G6 and G19 fixed in round 3. Full n: B4-relay 4403 after 164 ms, 0 appends after (measured). |
+| 4 | A revoked device's frames after the fence sequence are never appended. | Sockets are closed with 4403 on revoke. `validateActorCached` runs on every frame, on step1 (G6), and again at micro-batch flush (G2). `authorityVersion` is bumped synchronously by the writer. The 5 s TTL applies only to cross-isolate changes. | `closeDevice`; `validateActorCached`; `commitFrames` | G2, G6 and G19 fixed in round 3. Full n: B4-relay 4403 after 164 ms, 0 appends after (measured). v3 (measured, B4-v3): 4403 after 183 ms, 0 appends after the revocation started, so row 4 holds; but 10 frames sent *before* the revocation were broadcast, then dropped at flush (G2), so the live peer holds text the server does not, and the convergence check fails (fresh C and HTTP GET differ from the live clients). See R11. |
 | 5 | Old-epoch frames are never appended after an epoch bump. | Ticket epoch at accept. Head epoch before commit, per (body, epoch) batch. `expectedEpoch` inside the transaction. Reset flushes pending batches and then `fenceSemanticEpoch` closes old sockets. | `commitFrames`; `appendRelayBodyUpdate`; `handleSemanticReset` | G3 fixed (round 3). |
 | 6 | Flag off means baseline behaviour. | Every relay branch is gated on `this.relay !== null` / `relayBodiesEnabled`. | `server.ts`, `vaultSocketService.ts`, `bootstrap.ts` | Measured (`flag-tests.md`). Round 4 flag-off: 3,635 assertions pass, 0 new failures. Round 1: 199/199 steps. |
 | 7 (D6) | A catalog content hash is recorded only if the claimant's SV equals the merged SV after the append, and that SV is exact. | `stateVectorsEqual(envelope.stateVector, nextStateVector) && stateVectorExact`. Otherwise NULL. | `commitFrames` | G8 fixed (round 3): bodies over 256 KiB never accept a claim. The hash is still unverified client data (G10). Smoke CW: 21/21 relay, 21/21 base (v0930). Full n (measured): CW-relay 119/119 (104 materialised, 15 known), CW-base 121/121. The X3-relay "VIOLATED" is a `checks.ts` artifact (empty-string header treated as a claim). |
@@ -509,7 +595,7 @@ Errors: 409 for `lease_invalid`, `lease_expired`, `epoch_mismatch`, `head_advanc
 | **A client bug writes bad bytes** (malformed or structurally wrong Yjs, bad frontmatter root) | The server does not parse structure on the hot path, so it appends any update of 1.75 MB or less. Malformed bytes can make the next `mergeUpdates` or `diffUpdate` throw. That means step1, checkpoint or HTTP read failures for that body only. The error is caught per body, the alarm re-arms, and the body stays checkpoint plus tail. Semantically wrong but valid updates, such as a bad frontmatter shape, propagate to peers. Receiving-client validation (owned elsewhere) must refuse to write them to disk and surface a conflict. Recovery: a client semantic reset from good text (lease) replaces the lineage, and the history is kept per retention and pins. | Until receiving-side validation ships, relay mode loses today's server-side frontmatter/root-shape gate. The failure is per body and does not spread to the vault. There is no poison-pill quarantine yet (open question Q3). |
 | **The lease holder dies** | The lease expires after its TTL (120 s default). No state changed, because reset is a single transaction at install. Another device can acquire the lease after expiry. The holder can release early. | Fixed in round 3 (G19): revocation and fencing delete the holder's lease rows, and the actor is re-validated inside lease and reset. |
 | **Two resets race** | The lease upsert serialises them: the second device gets 409 `held`. If a lease expires mid-upload (B5: 5 MB upload at 115.7 s), `lease_expired` rejects the install. At install, the epoch CAS plus `coveredSequence == latest_sequence` plus the head CAS let exactly one win. The losers' sockets get 4409 and they rebase. | Measured B5: 6/6 (component), and 20/20 at full n (B5-relay), alternating winners, one install per race. Starvation risk: R2 (not measured). |
-| **DO crash mid-append** | `transactionSync` is atomic: either all rows (clock, journal, attribution, head, catalog, receipt) or none. No ack or broadcast happens before commit. On crash the socket drops, the client reconnects and resends (step2), and the growth cap or receipt deduplicates. | An in-memory micro-batch (≤ 250 ms, recommended 10 ms) is lost, but it was never acked. The client resends unacked frames. |
+| **DO crash mid-append** | `transactionSync` is atomic: either all rows (clock, journal, attribution, head, catalog, receipt) or none. No ack or broadcast happens before commit. On crash the socket drops, the client reconnects and resends (step2), and the growth cap or receipt deduplicates. | An in-memory micro-batch (≤ 250 ms, recommended 10 ms) is lost, but it was never acked. The client resends unacked frames. **v3:** the group buffer (≤ 1.5 s) is lost, but peers may already have applied it (durable before receipt). The origin resends after 5 s or on reconnect, and wake re-sync pulls the frames back from any peer. Measured: CRASH-v3 10/10 rounds, 0 frames lost, recovery p50 ≈ 0.8 s; origin offline, recovery from the peer, 5/5. Residual: a frame that reached no peer and whose origin never returns is lost, as in v2 (it was never acked). |
 | **DO crash mid-checkpoint** | `persistCheckpoint` is one transaction: chunks, manifest, journal deletes and prune together. After a crash either the old checkpoint plus the full tail remains, or the new checkpoint with the tail pruned. The alarm re-runs. A partial checkpoint (≤ 200 rows) is itself a complete, consistent checkpoint through its sequence. | none found |
 | **Log growth while all devices are offline** | Without appends no alarm is armed, so nothing grows. With one writer and no readers, each append arms the checkpoint at 50 rows or 1 MiB, so the merged snapshot stays bounded by live size plus tombstones. Journal rows below the checkpoint are deleted only up to the feed floor. | G1 fixed in round 3: `runCheckpointPass` advances the floor to `current − 1000`, below every pin. Over-budget bodies (> 9 MiB merged input) are never checkpointed until a client reset. Their marker is persisted (G20). Full-n check: K1 and `C2-stress-relay` table counts. |
 | **Mobile-only vault** | The routine checkpoint is server-side, so no client is needed. Reset is feasible on phones: K2 inferred 48–586 ms build, duty-cycle bound 1.7 s p50 for 5 MB. Upload speed is the constraint. Before round 2, B5's JSON 5 MB upload took 5–116 s. After round 2, a binary 5.24 MB reset takes 1.7–3.3 s from a desktop (core3, n = 4), with no growth across iterations. The lease TTL (≤ 600 s) and the octet-stream upload (which avoids the 33% base64 overhead) matter here. | The exact-head CAS combined with a slow mobile upload on a hot note is R2. |
@@ -665,6 +751,30 @@ Base n/a. Invariant evidence at full n: 4 (B4 0 appends after the fence), 5/11 (
 (CW-relay 119/119, CW-base 121/121, inv7 pass in every convergence leg), 8 (B6 dedupeHits 3, appendsDelta 1), 10 (K1
 compact → 0 log rows; C2-stress converges at 50k).
 
+### 8.8 Relay v3 (group commit)
+
+All values are measured on deployed workers (runs r3-1002/b/c). Full tables are in
+`experiments/results/relay3/RESULTS.md`. Latency phases are [conc].
+
+| Area | Result |
+|---|---|
+| Rows/edit, MB type5 gql | base 5.58, v2 5.63, v3 0.42, **v3nc 0.29**, v3b5 1.53 |
+| Rows/edit, C4 counter (spaced) | v2 5.0, v3 3.0, v3nc 2.0, v3b5 3.0. Phase-level gql: base 10.0, v2 8.5, v3 4.18, v3nc 3.18 |
+| L2 propagation p50 / p99 (n = 290) | base 299 / 696, v2 63.0 / 396, **v3 47.7 / 76.3**, v3b5 301 / 333 |
+| L2 receipt (origin ack) p50 / p99 | v2 62.9 / 396, **v3 350 / 482**, v3b5 604 / 926 |
+| L4 per-frame p50 / p99 (n = 4,990) | v3 47.2 / 231 (f1001 v2 73.7 / 2,305) |
+| L5 edit → cleared, real `VaultSync` (n = 90) | base prod 479, v2 relay 67.0, **v3 native 353** (p99 1,177), v3 native250 603. 8-edit burst first / last 1,246 / 359. 0 HTTP POSTs |
+| MB type5 receipt p50 / p99 | v3 907 / 1,642, v3nc 949 / 1,603 (max-wait bound) |
+| CRASH (pending buffer dropped) | online 5/5, offline-origin via peer 5/5. 51 frames dropped, **0 lost**, recovery p50 ≈ 0.8 s, fresh C converges |
+| FENCE (cumulative acks) | too-large 5/5. Rate 6/6 refused rounds: 0 acked or durable after the refusal |
+| Convergence suite | 9/9 (L2, L4, C2-stress, B2, B3, B5 20/20, B6, X1, CW 121/121) |
+| B1 / B6 / B8 / X4 | pass / pass / pass / pass |
+| B4 | invariant 4 holds; **convergence FAIL** (R11) |
+| B7 | **1/3 pass** (R12) |
+| Autosave 1 s, open note | v3nc 2.15 rows/save (gql), one commit per save; prop p50 45 ms |
+| Autosave, closed note (HTTP candidate every 5 s) | 13.82 rows/POST (gql phase-level), POST p50 297 ms |
+| Canvas identical re-save | 0 rows, no POST. 1 GET `semantic/<id>/state` (`canvasManager.ts:415/417`), code |
+
 ## 9. Cost model
 
 Workers Free limits were checked on 2026-09-30 in the Cloudflare docs
@@ -759,6 +869,45 @@ Reading the model:
   wall-clock stall for the output gate, though (R9). Base already exceeds 10 ms per WS message.
 - **Spend.** The runs used an unlimited enterprise account, profiled against Free. No quota was hit apart from the
   500-DO-namespace account cap (test-environment note, section 12).
+
+### 9.1 Relay v3 cost model
+
+Calculator: `scripts/relay2/costmodel3.py`. It imports `costmodel.py`, uses the same Free limits and adds the heavy
+and autosave shapes. All values are **inferred** from the measured r3 gql inputs in
+`experiments/logs/relay3/costmodel3-inputs.json`. A second run with the f1001 base 3.10 and relay 5.92 changes
+only the base and v2 rows (base 30%, v2 53% typical); see `RESULTS.md` section 7.
+
+| Day shape | Config | DO req/day | % Free | x base | Worker req/day | Rows written/day | % Free | x base | Notes |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---|
+| typical | base | 2,300 | 2.3% | 1.00 | 342 | 52,344 | 52% | 1.00 | 9,000 frames, 7,200 appends, 180 POSTs, 144 ckpts |
+| typical | relay v2 | 2,648 | 2.6% | 1.15 | 60 | 50,850 | 51% | 0.97 | 9,000 frames, 9,000 appends, 0 POSTs, 180 ckpts |
+| typical | v3 | 2,648 | 2.6% | 1.15 | 60 | 2,790 | 3% | 0.05 | 9,000 frames, 9,000 appends, 0 POSTs, 180 ckpts |
+| typical | v3 (candidateId) | 2,648 | 2.6% | 1.15 | 60 | 3,960 | 4% | 0.08 | 9,000 frames, 9,000 appends, 0 POSTs, 180 ckpts |
+| typical | v3+B5 | 2,198 | 2.2% | 0.96 | 60 | 13,950 | 14% | 0.27 | 9,000 frames, 9,000 appends, 0 POSTs, 180 ckpts |
+| heavy | base | 8,132 | 8.1% | 1.00 | 1,314 | 335,002 | 335% | 1.00 | 57,600 frames, 46,080 appends, 1,152 POSTs, 922 ckpts |
+| heavy | relay v2 | 10,910 | 10.9% | 1.34 | 60 | 325,440 | 325% | 0.97 | 57,600 frames, 57,600 appends, 0 POSTs, 1,152 ckpts |
+| heavy | v3 | 10,910 | 10.9% | 1.34 | 60 | 17,856 | 18% | 0.05 | 57,600 frames, 57,600 appends, 0 POSTs, 1,152 ckpts |
+| heavy | v3 (candidateId) | 10,910 | 10.9% | 1.34 | 60 | 25,344 | 25% | 0.08 | 57,600 frames, 57,600 appends, 0 POSTs, 1,152 ckpts |
+| heavy | v3+B5 | 8,030 | 8.0% | 0.99 | 60 | 89,280 | 89% | 0.27 | 57,600 frames, 57,600 appends, 0 POSTs, 1,152 ckpts |
+| autosave-8h (open note) | base | 32,540 | 32.5% | 1.00 | 29,142 | 480,744 | 481% | 1.00 | inferred: 1 flush + 1 candidate POST per save |
+| autosave-8h (open note) | v3 | 5,528 | 5.5% | 0.17 | 60 | 64,710 | 65% | 0.13 | open note: 1 socket frame per save (MB autosave gql) |
+| autosave-8h (closed note) | v3 | 8,408 | 8.4% | 0.26 | 5,820 | 82,393 | 82% | 0.17 | closed note: 1 HTTP candidate per 5 s (HTTPSAVE gql) |
+
+| Config | Rows per typing-second | Non-stop typing hours/day to 100k rows (excl. idle) |
+|---|---:|---:|
+| base | 29.0 | 0.96 |
+| relay v2 | 28.1 | 0.99 |
+| v3 | 1.4 | 19.16 |
+| v3 (candidateId) | 2.1 | 13.23 |
+| v3+B5 | 7.7 | 3.63 |
+
+Inputs: base_rows_per_edit=5.58, relay_rows_per_edit=5.63, v3_rows_per_edit=0.29, v3c_rows_per_edit=0.42, v3b5_rows_per_edit=1.53, v3b5_frames_per_edit=0.5, autosave_rows_per_save=2.15, httpsave_rows_per_post=13.82, base_autosave_rows_per_save=14.875
+
+- **Rows are no longer the binding limit.** v3 is 3% typical and 18% heavy, against v2 51–53% and 325–342%. 100k
+  rows takes 19.2 h of non-stop typing.
+- **The autosave plugin day fits:** 65% (open note) and 82% (closed note, HTTP path). Base, inferred, is ≈ 460–480%.
+- **DO requests are not changed by v3** (1.15× base typical, 1.34× heavy, both ≤ 11% of Free). R10 stands as in
+  v2. B5 would bring DO requests to 0.96–0.99× base, but at 4.9× the rows (R13).
 
 ## 10. E2EE compatibility
 
@@ -947,6 +1096,8 @@ transport/platform plus the raw harness client, not server merge logic (section 
   - Residual risk:
     - continuous typing above ≈ 0.69–0.94 h/day for the relay (base 1.10–1.67 h), the 100k crossing point
     - import days: a typical day + 2,000 notes is 115–135% for the relay, 88–103% for base
+  - **v3 retires R5 for edit traffic.** Section 9.1: typical 3%, heavy 18%, 19 h of non-stop typing to 100k. The import-day residual is set by
+    lifecycle rows (`import_rows_per_note`), which v3 does not change.
 - **R6 — Tail CPU measurements are lossy.**
   - `wrangler tail` dropped every WS event on a busy Worker (scratch-1 C1: 0 events). It matched 15/15 on a quiet one
     (scratch-2).
@@ -965,6 +1116,35 @@ transport/platform plus the raw harness client, not server merge logic (section 
   1.92). The model puts the typical day at 1.15× base, over the 1.1× reversal bar, but at 2–3% of Free. The real
   base candidate path costs more per burst (L5b1: base prod 1.05 vs relay 0.10 units), which the C5 raw adapter does
   not exercise.
+  - **v3 does not change it.** Group commit changes rows, not WS messages: the typical day is 1.15× and heavy 1.34×
+    (inferred). Measured with the real client, L5b1-v3 native is 0.10 units per edit vs base prod 1.05. B5 halves
+    the WS messages (L5b8 0.80 → 0.40 units per 8-edit burst), but it is not recommended (R13).
+- **R11 — v3: a revoked device's buffered frames reach peers but never become durable (B4-v3, measured).**
+  - In v3, frames broadcast before a revocation and dropped at flush (G2) leave the live peers ahead of the server.
+    B4-v3 dropped 10 of 40 pre-revocation frames, and its convergence check failed (fresh C and GET ≠ live
+    clients). This is the accepted design change "revoked frame may already have reached peers"
+    (`relay3-group-commit.md`, invariant change 2). Under reversal condition 4 it is still a convergence failure.
+  - The drop also buys little. The peer's next re-sync (reconnect step2 or wake re-sync) re-submits those bytes
+    under the peer's own authority, and they become durable anyway.
+  - Proposed fix: commit frames that passed authority at admission, even if the device is revoked before the flush.
+    Invariant 4 only forbids frames after the fence. Alternatively, flush the device's buffers synchronously inside
+    `closeDevice` before the 4403. Either makes B4 converge, and neither weakens the post-fence guarantee.
+- **R12 — v3: flood isolation is flaky (B7-v3 1/3 pass).**
+  - In a 5 MiB/s flood of 64 KiB frames, the v3 flooder could push 63 MB (a3) before our `relay rate limit` closed
+    it, 43 s in. f1001 v2: 2.2 MB, closed at 26.9 s.
+  - In a1 the flooder was not closed within 40 s, and Cloudflare shed the bystander's socket on the same DO with
+    `1013 Service overloaded`. a2 was inconclusive (1006 right after a redeploy).
+  - Suspect: every ≥ 64 KB frame triggers a synchronous byte-cap commit, and admission keeps accepting (and
+    broadcasting) while the commits back up.
+  - Needs a serial re-run on an idle machine, plus a check that the token bucket is debited at admission, not at
+    flush.
+- **R13 — v3: B5 send-coalescing defeats group commit at idle = 300 ms (measured).** With B5 at 250 ms, wire frames
+  are ≥ 250 ms apart. The 300 ms idle timer then fires between most of them: MB type5 went from 70 to 275 commits,
+  0.38 → 1.50 rows/edit (3.9×), and added 250 ms to propagation (L2 48 → 301 ms p50). Keep B5 off. If it is ever
+  wanted, idle must be well above the coalesce window (≥ 2×).
+- **R14 — v3: receipts are 0.3–1.5 s after the edit (user-approved).** Continuous typing at 5 keys/s commits on
+  max-wait, so the receipt p50 is ≈ 0.9 s and p99 ≈ 1.6 s (MB type5). The UI must not treat "unconfirmed for < 2 s"
+  as pending-sync noise. The client resend timer (5 s) and the HTTP fallback (15 s) sit well above the 1.5 s max.
 
 **Open questions:**
 
@@ -1017,6 +1197,20 @@ config:
 | 6 | not triggered | X1 2,000/2,000 ≥ 250; C3 4.06 MB < 37.22 MB |
 | 7 | partly open | 1 MB mobile build 103–155 ms inferred (< 2 s); B5 20/20, no lost edit. Starvation (R2) at 1 frame/s: not measured |
 | 8 | not triggered (partial evidence) | K1-compact → 0 log rows; unit test 5,000 appends → 1,001 rows. Per-body journal row counts after the stress trace: not reported in the full run |
+| 9 | n/a | post-launch |
+
+**Status for relay v3 (r3-1002/b/c, measured unless noted):**
+
+| # | Status | Evidence |
+|---|---|---|
+| 1 | not triggered | L2 p50 299 → 47.7 ms (6.3×), p99 696 → 76.3 ms ([conc], n = 290). The receipt is slower by design (p50 350 ms, R14) |
+| 2 | not triggered, and the margin is now large | v3 is 3% typical and 18% heavy (inferred); 0.29 rows/edit vs v2 5.63. Condition 1 of section 1 (lean mandatory) is retired |
+| 3 | **unchanged: exceeded on the letter; needs sign-off** | group commit does not change WS messages. Model 1.15× base typical, 1.34× heavy (inferred), ≤ 11% of Free. R10 is unchanged |
+| 4 | **triggered on the letter (B4 convergence)** | invariant 4 holds (0 appends after the fence). But a revoked device's pre-fence frames were broadcast and then dropped at flush: 10 frames diverge (R11). Convergence suite 9/9, CRASH 10/10 with 0 lost, FENCE 6/6 refused rounds safe. B7 1/3 (R12). Fix R11 before ship |
+| 5 | not measured for v3 | C1 not re-run. The v3 flush is one batch per 300 ms–1.5 s, so per-append CPU is no worse than v2 (inferred) |
+| 6 | not re-run | X1 not run on v3. CW 121/121 pass |
+| 7 | B5 20/20 | no lost edit across epoch resets under v3. R2 not measured |
+| 8 | not re-run | the commit-row shape is the same as v2 |
 | 9 | n/a | post-launch |
 
 ## 14. Appendix
