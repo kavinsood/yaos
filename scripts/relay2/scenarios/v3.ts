@@ -8,7 +8,11 @@ import * as Y from "yjs";
 import { log, now, r2, series, sleep } from "../lib/common";
 import { bodyGet, convergence, diagnostics } from "../lib/checks";
 import { RawClient } from "../lib/rawClient";
-import { CoverageTracker, freshSmallNote, openOrThrow, operatorVaultPost, type RunCtx } from "../lib/run";
+import { CoverageTracker, freshNotes, openOrThrow, operatorVaultPost, type RunCtx } from "../lib/run";
+import { smallContent } from "../lib/context";
+
+/** One fresh body per call (the shared small-note helper reuses one id/path per run). */
+const note = async (ctx: RunCtx, prefix: string, bytes: number) => (await freshNotes(ctx, prefix, 1, () => smallContent(7, bytes)))[0]!;
 import { vaultRoute } from "../../../tests/live/schema4Live";
 import { deviceBearerHeaders } from "../../../tests/live/liveIdentity";
 
@@ -82,7 +86,7 @@ export async function CRASH(ctx: RunCtx): Promise<Result> {
 }
 
 async function crashRound(ctx: RunCtx, mode: string, r: number, attempt: number): Promise<Result> {
-	const body = await freshSmallNote(ctx, 2048);
+	const body = await note(ctx, `crash-${mode}${r}a${attempt}`, 2048);
 	const a = await openOrThrow(await ctx.client("A", body));
 	const b = await openOrThrow(await ctx.client("B", body));
 	a.resendAfterMs = 5000;
@@ -152,7 +156,7 @@ export async function FENCE(ctx: RunCtx): Promise<Result> {
 	const out: Result[] = [];
 	for (const variant of ["toolarge", "rate"]) {
 		for (let r = 0; r < rounds; r++) {
-			const body = await freshSmallNote(ctx, 1024);
+			const body = await note(ctx, `fence-${variant}${r}`, 1024);
 			const a = await ctx.client("A", body);
 			a.reconnect = false;
 			await openOrThrow(a);
@@ -218,7 +222,7 @@ export async function FENCE(ctx: RunCtx): Promise<Result> {
 export async function HTTPSAVE(ctx: RunCtx): Promise<Result> {
 	const seconds = ctx.num("seconds", 300);
 	const interval = ctx.num("interval-ms", 5000);
-	const body = await freshSmallNote(ctx, 4096);
+	const body = await note(ctx, "httpsave", 4096);
 	const owner = ctx.context.devices.A!;
 	const res = await fetch(vaultRoute(owner, `body/${encodeURIComponent(body)}`), { headers: deviceBearerHeaders(owner) });
 	const doc = new Y.Doc();
