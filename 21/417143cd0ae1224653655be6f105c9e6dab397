@@ -1,0 +1,19 @@
+server/src/relayBodies.ts
+  s_fb9412dd2d776a::t_46266af646bb54 517-519,802,1101-1103
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "21417143cd0ae1224653655be6f105c9e6dab397",
+  "prompts": {},
+  "sessions": {
+    "s_fb9412dd2d776a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a6b9308dcda4dea54",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
