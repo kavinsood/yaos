@@ -1,0 +1,33 @@
+src/main.ts
+  s_df8cfbf01530e3::t_fa0737a3945954 11-18,538-542,1034,3089
+src/sync/fencedWebSocket.ts
+  s_2bc1830cee836b::t_1b8fdc31b9fcee 11-28,50,72,77-84,87,92-101,108-109,113-115,120,122
+src/sync/relayReceipts.ts
+  s_df8cfbf01530e3::t_a8467fc3861e6f 1-444
+tests/client/relay-receipts.ts
+  s_2bc1830cee836b::t_ee08c465299da8 1-557
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "7d70ea93ad45e75ce02cd9e2568ef30ab990bab6",
+  "prompts": {},
+  "sessions": {
+    "s_2bc1830cee836b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ada6157df203a32a9",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_df8cfbf01530e3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-afe0db35fdc6eca3b",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
