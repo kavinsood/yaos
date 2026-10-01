@@ -79,7 +79,7 @@ import {
 } from "../runtime/socketLivenessCoordinator";
 import { fencedWebSocketConstructor, type NativeSocketClose } from "./fencedWebSocket";
 import { OwnAwarenessProvider } from "./ownAwarenessProvider";
-import { sameAuthorityIdentity, type VaultAuthorityIdentity } from "../collaboration/authority";
+import { copyAuthorityIdentity, sameAuthorityIdentity, type VaultAuthorityIdentity } from "../collaboration/authority";
 import { CanvasManager, type CanvasPersistencePort, type CanvasProjectionPort } from "./canvas/canvasManager";
 import { CanvasHttpTransport } from "./canvas/canvasTransport";
 import {
@@ -373,6 +373,7 @@ export interface DiskBodyCommitInput {
 	lifecycle?: "create" | "revive";
 	candidateId?: string;
 	admissionStillCurrent?: () => boolean;
+	waitForReceipt?: boolean;
 }
 export interface DiskBodyCommitResult {
 	lifecycle: "create" | "revive" | null;
@@ -405,6 +406,7 @@ export interface BodyCandidateCommitInput {
 }
 export type CurrentBodyCandidateOutcome =
 	| { kind: "completed"; receipt: BodyReceipt }
+	| { kind: "completed"; receipt: null; pending: true }
 	/**
 	 * The body already holds exactly the requested content (and the
 	 * expected content): nothing to commit, no candidate was captured.
@@ -641,6 +643,7 @@ interface PendingCandidate {
 	record: CandidateRecord;
 	submission: Promise<BodyReceipt> | null;
 	path: string | null;
+	submissionAttempted?: boolean;
 }
 
 const BODY_TEXT_NAME = "body";
@@ -2823,7 +2826,6 @@ export class VaultSync implements SyncRuntimePort {
 			input.content,
 			ORIGIN_DISK_COMMIT,
 		);
-		await this.bodies.markDirty(input.bodyId);
 		const pending = await this.captureCandidate(
 			input.bodyId,
 			Y.encodeStateAsUpdate(body.doc, before),
@@ -2849,7 +2851,7 @@ export class VaultSync implements SyncRuntimePort {
 	}
 
 	async commitBodyCandidateIfCurrent(
-		input: BodyCandidateCommitInput & { expectedContent: string; path?: string },
+		input: BodyCandidateCommitInput & { expectedContent: string; path?: string; waitForReceipt?: boolean },
 	): Promise<CurrentBodyCandidateOutcome> {
 		input = {
 			...input,
@@ -2857,7 +2859,10 @@ export class VaultSync implements SyncRuntimePort {
 			expectedContent: canonicalizeMarkdown(input.expectedContent),
 		};
 		if (this.destroyed) return { kind: "superseded" };
-		const body = await this.loadCurrentBody(input.bodyId);
+		const body = input.waitForReceipt === false
+			? this.bodies.get(input.bodyId)
+			: await this.loadCurrentBody(input.bodyId);
+		if (!body) return { kind: "superseded" };
 		const lease = this.bodies.acquireLease(input.bodyId);
 		try {
 			const proof = this.bodies.captureRevision(input.bodyId);
@@ -2878,7 +2883,6 @@ export class VaultSync implements SyncRuntimePort {
 				|| (input.path && !this.bodies.coordinator.isPathCurrent(input.path, input.bodyId))) {
 				return { kind: "superseded" };
 			}
-			await this.bodies.markDirty(input.bodyId);
 			const pending = await this.captureCandidate(
 				input.bodyId,
 				Y.encodeStateAsUpdate(body.doc, before),
@@ -2886,6 +2890,10 @@ export class VaultSync implements SyncRuntimePort {
 				0,
 				input.path,
 			);
+			if (input.waitForReceipt === false) {
+				this.submitCandidateInBackground(pending);
+				return { kind: "completed", receipt: null, pending: true };
+			}
 			const receipt = await this.submitCandidate(pending);
 			this.log(`current body candidate committed for ${input.bodyId} (${input.reason})`);
 			return { kind: "completed", receipt };
@@ -2940,6 +2948,19 @@ export class VaultSync implements SyncRuntimePort {
 			return { lifecycle, revived, receipt: null };
 		}
 		try {
+			if (input.waitForReceipt === false) {
+				const accepted = await this.commitBodyCandidateIfCurrent({
+					bodyId: input.bodyId,
+					path: input.path,
+					expectedContent: body.doc.getText(BODY_TEXT_NAME).toJSON(),
+					content: input.content,
+					candidateId: input.candidateId ?? crypto.randomUUID(),
+					reason: input.reason,
+					waitForReceipt: false,
+				});
+				if (accepted.kind === "superseded") throw new Error("disk body changed before durable acceptance");
+				return { lifecycle, revived, receipt: accepted.receipt };
+			}
 			const receipt = await this.commitBodyCandidate({
 				bodyId: input.bodyId,
 				content: input.content,
@@ -3344,12 +3365,12 @@ export class VaultSync implements SyncRuntimePort {
 	}
 
 	async flushBodyCandidate(bodyId: string): Promise<void> {
+		await this.awaitBodyPersistence(bodyId);
 		const updates = this.pendingUpdates.get(bodyId);
 		if (updates && updates.length > 0) {
 			this.pendingUpdates.delete(bodyId);
 			const encodedUpdate = updates.length === 1 ? updates[0]! : Y.mergeUpdates(updates);
 			try {
-				await this.bodies.markDirty(bodyId);
 				await this.captureCandidate(
 					bodyId,
 					encodedUpdate,
@@ -3822,16 +3843,17 @@ export class VaultSync implements SyncRuntimePort {
 		const updateObserver = (update: Uint8Array, origin: unknown) => {
 			if (origin === provider.documentOrigin) {
 				this._lastRemoteUpdateAt = this.now();
-				if ((this.sessions.get(body.bodyId)?.consumers.size ?? 0) === 0) {
-					const path = this.pathForBodyId(body.bodyId);
-					if (path) this.options.onRemoteUpdateToClosedBody?.({ bodyId: body.bodyId, path });
-				}
 				void this.bodies.mergeFromServer(
 					body.bodyId,
 					new Uint8Array(),
 					body.bodyEpoch,
 					body.generation,
-				).catch((error) => {
+				).then(() => {
+					if (this.destroyed || this.bodies.get(body.bodyId)?.doc !== body.doc) return;
+					if ((this.sessions.get(body.bodyId)?.consumers.size ?? 0) !== 0) return;
+					const path = this.pathForBodyId(body.bodyId);
+					if (path) this.options.onRemoteUpdateToClosedBody?.({ bodyId: body.bodyId, path });
+				}).catch((error) => {
 					this.log(`remote body persistence failed for ${body.bodyId}: ${String(error)}`);
 				});
 				return;
@@ -4292,14 +4314,39 @@ export class VaultSync implements SyncRuntimePort {
 
 	private async rebaseBodyAcrossSemanticEpoch(body: LoadedBody, state: BodyState): Promise<LoadedBody> {
 		if (state.bodyEpoch <= body.bodyEpoch) throw new Error(`stale semantic epoch for body ${body.bodyId}`);
+		const originalDocument = body.doc;
+		const originalEncodedState = Y.encodeStateAsUpdate(originalDocument);
+		const previousBodyEpoch = body.bodyEpoch;
+		const previousBaseline = body.durableBaseline;
+		const pendingMarkdown = originalDocument.getText(BODY_TEXT_NAME).toJSON();
+		const capturedLocalUpdates = body.pendingLocalUpdates;
+		const authority = this.captureAuthority();
+		const nextBodyEpoch = state.bodyEpoch;
+		const generation = state.generation;
+		const authoritativeEncodedState = new Uint8Array(state.encodedState);
+		const assertSnapshotCurrent = (): void => {
+			if (this.bodies.get(body.bodyId) !== body
+				|| body.doc !== originalDocument || originalDocument.isDestroyed
+				|| body.bodyEpoch !== previousBodyEpoch
+				|| body.durableBaseline !== previousBaseline
+				|| body.pendingLocalUpdates !== capturedLocalUpdates
+				|| !this.isCapturedAuthorityCurrent(authority)) {
+				throw new Error("semantic epoch rebase snapshot superseded");
+			}
+			const currentEncodedState = Y.encodeStateAsUpdate(originalDocument);
+			if (currentEncodedState.byteLength !== originalEncodedState.byteLength
+				|| !currentEncodedState.every((byte, index) => byte === originalEncodedState[index])) {
+				throw new Error("semantic epoch rebase snapshot superseded");
+			}
+		};
 		const session = this.sessions.get(body.bodyId);
 		let transition = prepareSemanticEpochTransition({
 			bodyId: body.bodyId,
-			previousBodyEpoch: body.bodyEpoch,
-			nextBodyEpoch: state.bodyEpoch,
-			previousBaseline: body.durableBaseline,
-			pendingMarkdown: body.doc.getText(BODY_TEXT_NAME).toJSON(),
-			authoritativeEncodedState: state.encodedState,
+			previousBodyEpoch,
+			nextBodyEpoch,
+			previousBaseline,
+			pendingMarkdown,
+			authoritativeEncodedState,
 		});
 		if (transition.kind !== "ready") {
 			const rejected = transition;
@@ -4313,37 +4360,50 @@ export class VaultSync implements SyncRuntimePort {
 			await this.options.onSemanticEpochRebaseConflict({
 				bodyId: body.bodyId,
 				path,
-				previousEpoch: body.bodyEpoch,
-				currentEpoch: state.bodyEpoch,
+				previousEpoch: previousBodyEpoch,
+				currentEpoch: nextBodyEpoch,
 				kind: rejected.kind,
 				pendingMarkdown: rejected.pendingMarkdown,
 				authoritativeContent: rejected.authoritativeContent,
 			});
+			assertSnapshotCurrent();
 			transition = prepareSemanticEpochTransition({
 				bodyId: body.bodyId,
-				previousBodyEpoch: body.bodyEpoch,
-				nextBodyEpoch: state.bodyEpoch,
+				previousBodyEpoch,
+				nextBodyEpoch,
 				previousBaseline: rejected.authoritativeContent,
 				pendingMarkdown: rejected.authoritativeContent,
-				authoritativeEncodedState: state.encodedState,
+				authoritativeEncodedState,
 			});
 			if (transition.kind !== "ready") throw new Error("authoritative semantic epoch transition did not converge");
 		}
 		const candidateId = transition.rebasedUpdate ? crypto.randomUUID() : null;
 		const capturedAt = this.now();
-		const candidateRecord: CandidateRecord | null = transition.rebasedUpdate && candidateId ? {
+		const candidatePath = this.pathForBodyId(body.bodyId);
+		const encodedUpdate = transition.rebasedUpdate ? new Uint8Array(transition.rebasedUpdate) : null;
+		const capturedRecord = encodedUpdate && candidateId ? {
 			vaultId: this.options.vaultId,
 			bodyId: body.bodyId,
 			bodyEpoch: transition.bodyEpoch,
 			previousBaseline: transition.authoritativeContent,
 			pendingMarkdown: transition.rebasedContent,
 			candidateId,
-			candidateDigest: await sha256Hex(transition.rebasedUpdate),
-			encodedUpdate: transition.rebasedUpdate.slice().buffer,
+			encodedUpdate: encodedUpdate.buffer,
 			capturedAt,
-			capturedLocalUpdates: body.pendingLocalUpdates,
-			authority: this.captureAuthority(),
+			capturedLocalUpdates,
+			authority,
 		} : null;
+		let candidateRecord: CandidateRecord | null = null;
+		try {
+			candidateRecord = capturedRecord && encodedUpdate ? {
+				...capturedRecord,
+				candidateDigest: await sha256Hex(encodedUpdate),
+			} : null;
+			assertSnapshotCurrent();
+		} catch (error) {
+			transition.document.destroy();
+			throw error;
+		}
 		const consumers = session ? [...session.consumers] : [];
 		if (session) {
 			for (const consumerId of consumers) {
@@ -4357,9 +4417,10 @@ export class VaultSync implements SyncRuntimePort {
 		}
 		let installed = false;
 		try {
+			assertSnapshotCurrent();
 			const replacement = await this.bodies.installSemanticEpochTransition(
 				transition,
-				state.generation,
+				generation,
 				candidateRecord,
 			);
 			installed = true;
@@ -4371,7 +4432,7 @@ export class VaultSync implements SyncRuntimePort {
 				const pending: PendingCandidate = {
 					record: candidateRecord,
 					submission: null,
-					path: this.pathForBodyId(body.bodyId),
+					path: candidatePath,
 				};
 				this.pendingCandidates.set(candidateRecord.candidateId, pending);
 				this._lastCandidateCapturedAt = capturedAt;
@@ -4382,7 +4443,7 @@ export class VaultSync implements SyncRuntimePort {
 			}
 			await this.notifySemanticEpochReset({
 				purpose: "body", documentId: body.bodyId,
-				previousEpoch: body.bodyEpoch, currentEpoch: state.bodyEpoch,
+				previousEpoch: previousBodyEpoch, currentEpoch: nextBodyEpoch,
 			});
 			return replacement;
 		} catch (error) {
@@ -4608,7 +4669,22 @@ export class VaultSync implements SyncRuntimePort {
 	private queueBodyPersistence(bodyId: string): void {
 		const prior = this.bodyPersistenceWork.get(bodyId);
 		const run = (prior ? prior.catch(() => undefined) : Promise.resolve())
-			.then(() => this.bodies.markLocalUpdate(bodyId));
+			.then(async () => {
+				const updates = this.pendingUpdates.get(bodyId);
+				if (!updates?.length) return;
+				this.pendingUpdates.delete(bodyId);
+				try {
+					await this.captureCandidate(bodyId,
+						updates.length === 1 ? updates[0]! : Y.mergeUpdates(updates),
+						undefined, updates.length);
+					for (let updateIndex = 0; updateIndex < updates.length; updateIndex++) {
+						await this.bodies.markLocalUpdate(bodyId);
+					}
+				} catch (error) {
+					this.pendingUpdates.set(bodyId, [...updates, ...(this.pendingUpdates.get(bodyId) ?? [])]);
+					throw error;
+				}
+			});
 		this.bodyPersistenceWork.set(bodyId, run);
 		void run.catch((error) => {
 			this.log(`body persistence failed for ${bodyId}: ${String(error)}`);
@@ -4890,12 +4966,30 @@ export class VaultSync implements SyncRuntimePort {
 		encodedUpdates?: readonly Uint8Array[],
 	): Promise<PendingCandidate> {
 		if (!candidateId) throw new Error("candidateId is required");
-		const candidateDigest = await sha256Hex(candidateDigestMaterial(encodedUpdates ?? [encodedUpdate]));
+		const body = this.bodies.get(bodyId);
+		if (!body) throw new Error(`cannot capture candidate for unloaded body ${bodyId}`);
+		const capturedUpdate = new Uint8Array(encodedUpdate);
+		const capturedUpdates = encodedUpdates?.map((update) => new Uint8Array(update));
+		const candidatePath = path ?? this.pathForBodyId(bodyId);
+		const capturedRecord = {
+			vaultId: this.options.vaultId,
+			bodyId,
+			bodyEpoch: body.bodyEpoch,
+			previousBaseline: body.durableBaseline,
+			pendingMarkdown: body.doc.getText(BODY_TEXT_NAME).toJSON(),
+			candidateId,
+			encodedUpdate: capturedUpdate.buffer,
+			encodedUpdates: capturedUpdates?.map((update) => update.buffer),
+			capturedAt: this.now(),
+			capturedLocalUpdates,
+			authority: this.captureAuthority(),
+		};
+		const candidateDigest = await sha256Hex(candidateDigestMaterial(capturedUpdates ?? [capturedUpdate]));
 		const existing = this.pendingCandidates.get(candidateId);
 		if (existing) {
 			const prior = new Uint8Array(existing.record.encodedUpdate);
-			const sameBytes = prior.byteLength === encodedUpdate.byteLength
-				&& prior.every((byte, index) => byte === encodedUpdate[index]);
+			const sameBytes = prior.byteLength === capturedUpdate.byteLength
+				&& prior.every((byte, index) => byte === capturedUpdate[index]);
 			if (
 				existing.record.bodyId !== bodyId
 				|| existing.record.candidateDigest !== candidateDigest
@@ -4905,30 +4999,16 @@ export class VaultSync implements SyncRuntimePort {
 			}
 			return existing;
 		}
-		const capturedAt = this.now();
-		const body = this.bodies.get(bodyId);
-		if (!body) throw new Error(`cannot capture candidate for unloaded body ${bodyId}`);
 		const record: CandidateRecord = {
-			vaultId: this.options.vaultId,
-			bodyId,
-			bodyEpoch: body.bodyEpoch,
-			previousBaseline: body.durableBaseline,
-			pendingMarkdown: body.doc.getText(BODY_TEXT_NAME).toJSON(),
-			candidateId,
+			...capturedRecord,
 			candidateDigest,
-			encodedUpdate: encodedUpdate.slice().buffer,
-			encodedUpdates: encodedUpdates?.map((update) => update.slice().buffer),
-			capturedAt,
-			capturedLocalUpdates,
-			authority: this.captureAuthority(),
 		};
-		await this.bodies.markDirty(bodyId);
 		await this.persistCandidate(record);
-		const candidatePath = path ?? this.pathForBodyId(bodyId);
 		const pending: PendingCandidate = { record, submission: null, path: candidatePath };
 		this.pendingCandidates.set(record.candidateId, pending);
 		this.bodies.markUnsettled(bodyId);
-		this._lastCandidateCapturedAt = capturedAt;
+		await this.bodies.markDirty(bodyId);
+		this._lastCandidateCapturedAt = record.capturedAt;
 		if (candidatePath) {
 			this.options.onProductEvent?.({
 				kind: PRODUCT_EVENT_KIND.serverReceiptCandidateCaptured,
@@ -4944,8 +5024,16 @@ export class VaultSync implements SyncRuntimePort {
 		return pending;
 	}
 
+	private submitCandidateInBackground(candidate: PendingCandidate): void {
+		void this.submitCandidate(candidate).catch((error) => {
+			this.log(`durably accepted candidate remains pending for ${candidate.record.bodyId}: ${String(error)}`);
+			if (!this.destroyed) this.scheduleCandidate(candidate.record.bodyId);
+		});
+	}
+
 	private submitCandidate(candidate: PendingCandidate): Promise<BodyReceipt> {
 		if (candidate.submission) return candidate.submission;
+		candidate.submissionAttempted = true;
 		const run = this.performCandidateSubmission(candidate);
 		candidate.submission = run;
 		void run.then(
@@ -5031,6 +5119,7 @@ export class VaultSync implements SyncRuntimePort {
 	}
 
 	private async submitPendingForBody(bodyId: string): Promise<void> {
+		await this.coalesceUnsubmittedEditorCandidates(bodyId);
 		const candidates = Array.from(this.pendingCandidates.values())
 			.filter((candidate) => candidate.record.bodyId === bodyId)
 			.sort((left, right) => left.record.capturedAt - right.record.capturedAt);
@@ -5041,6 +5130,23 @@ export class VaultSync implements SyncRuntimePort {
 				this.log(`candidate ${candidate.record.candidateId} remains pending: ${String(error)}`);
 				break;
 			}
+		}
+	}
+
+	private async coalesceUnsubmittedEditorCandidates(bodyId: string): Promise<void> {
+		const candidates = [...this.pendingCandidates.values()].filter((candidate) =>
+			candidate.record.bodyId === bodyId && !candidate.submissionAttempted
+			&& (candidate.record.capturedLocalUpdates ?? 0) > 0
+			&& this.isCapturedAuthorityCurrent(candidate.record.authority));
+		if (candidates.length < 2 || !this.options.database.deleteCandidate) return;
+		const body = this.bodies.get(bodyId);
+		if (!body || candidates.some((candidate) => candidate.record.bodyEpoch !== body.bodyEpoch)) return;
+		await this.captureCandidate(bodyId,
+			Y.mergeUpdates(candidates.map((candidate) => new Uint8Array(candidate.record.encodedUpdate))),
+			undefined, candidates.reduce((total, candidate) => total + (candidate.record.capturedLocalUpdates ?? 0), 0));
+		for (const candidate of candidates) {
+			await this.options.database.deleteCandidate(bodyId, candidate.record.candidateId);
+			if (this.pendingCandidates.delete(candidate.record.candidateId)) body.unsettled = Math.max(0, body.unsettled - 1);
 		}
 	}
 
@@ -5066,6 +5172,7 @@ export class VaultSync implements SyncRuntimePort {
 		const list = this.options.database.listCandidates;
 		if (!list) return;
 		try {
+			const restoredBodies = new Map<string, CandidateRecord[]>();
 			for (const record of await list.call(this.options.database)) {
 				if (!this.isCapturedAuthorityCurrent(record.authority)) {
 					const candidate: PendingCandidate = { record, submission: null, path: this.pathForBodyId(record.bodyId) };
@@ -5077,10 +5184,21 @@ export class VaultSync implements SyncRuntimePort {
 					record,
 					submission: null,
 					path: this.pathForBodyId(record.bodyId),
+					submissionAttempted: true,
 				});
 				const body = await this.loadBodyWithPriority(record.bodyId, "background", true);
+				if (body.bodyEpoch !== record.bodyEpoch) continue;
+				Y.applyUpdate(body.doc, new Uint8Array(record.encodedUpdate), "indexeddb-bootstrap");
 				this.bodies.markUnsettled(record.bodyId);
-				body.dirty = true;
+				await this.bodies.markDirty(record.bodyId);
+				const records = restoredBodies.get(record.bodyId) ?? [];
+				records.push(record);
+				restoredBodies.set(record.bodyId, records);
+			}
+			for (const [bodyId, records] of restoredBodies) {
+				const body = this.bodies.get(bodyId)!;
+				if (records.some((record) => record.pendingMarkdown === body.doc.getText(BODY_TEXT_NAME).toJSON())) continue;
+				await this.captureCandidate(bodyId, Y.encodeStateAsUpdate(body.doc));
 			}
 			this._candidatePersistenceHealthy = true;
 		} catch (error) {
@@ -5089,7 +5207,8 @@ export class VaultSync implements SyncRuntimePort {
 	}
 
 	private captureAuthority(): VaultAuthorityIdentity | undefined {
-		return this.options.getAuthority?.();
+		const authority = this.options.getAuthority?.();
+		return authority ? copyAuthorityIdentity(authority) : undefined;
 	}
 
 	private isCapturedAuthorityCurrent(captured: VaultAuthorityIdentity | undefined): boolean {
