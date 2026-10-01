@@ -1,0 +1,55 @@
+server/src/index.ts
+  s_fb9412dd2d776a::t_d3e9f0505aa687 143-144
+server/src/server.ts
+  s_fb9412dd2d776a::t_a98a787e5e3440 28,201,322-333,517-522
+server/src/vaultBulkCreateService.ts
+  s_fb9412dd2d776a::t_70089b6d0d5cf6 1-506
+server/src/vaultCandidateService.ts
+  s_4da03de9eee2de::t_a89eb13ad6cc91 174,176,186,199,213,226,273,277
+server/src/vaultCatalogStore.ts
+  s_fb9412dd2d776a::t_2b55270ded28d0 479-481
+server/src/vaultLifecycleService.ts
+  s_df8cfbf01530e3::t_2b2286f97cb5b6 137,143,314-317
+server/src/vaultStore.ts
+  s_df8cfbf01530e3::t_98337316874498 12-13,22,75-103,458,468,739,1063-1300
+tests/server/bulk-create-runtime.ts
+  s_fb9412dd2d776a::t_50ef699786d2d6 1-397
+tests/server/server-route-classification-runtime.ts
+  s_fb9412dd2d776a::t_d8468ec26a3335 43,73-75
+tests/server/settings-sync-route-authority.ts
+  s_fb9412dd2d776a::t_97c39c809244be 156,161
+tests/server/vault-candidate-runtime.ts
+  s_fb9412dd2d776a::t_897d2acbdd79bf 113,115,120-127
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "33e1cc52c96bfe19f69451ed044250454eff993a",
+  "prompts": {},
+  "sessions": {
+    "s_4da03de9eee2de": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a09756dc78127a702",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_df8cfbf01530e3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-afe0db35fdc6eca3b",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_fb9412dd2d776a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a6b9308dcda4dea54",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
