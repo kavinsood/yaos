@@ -1,0 +1,19 @@
+scripts/relay2/costmodel3.py
+  s_82d26342e78308::t_8dfe95989a06b3 1-165
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "e3a1b852ce0cecad439b2af35223c9ff48b79707",
+  "prompts": {},
+  "sessions": {
+    "s_82d26342e78308": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a34dcd41e6604fc76",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
