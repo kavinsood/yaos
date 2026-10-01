@@ -1,0 +1,27 @@
+server/src/dailyLimit.ts
+  s_2bc1830cee836b::t_1eb02f34906c91 1-201
+server/src/index.ts
+  s_2bc1830cee836b::t_3f8af74c15f488 2,128-129,317-321
+server/src/server.ts
+  s_2bc1830cee836b::t_95aa8bdc90ad0b 44,182-189,201-206,212,235,278,407-411,589-592,1548-1549,1566-1569,1572-1573,1578,1580-1583,1601-1607
+server/src/vaultSocketService.ts
+  s_2bc1830cee836b::t_6a727e7e2bd60a 409-410,1377-1379
+tests/server/daily-limit.ts
+  s_2bc1830cee836b::t_85fc9aab029995 1-264
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "5a73cee0c9e07c65037974c2d678be9d48cf0596",
+  "prompts": {},
+  "sessions": {
+    "s_2bc1830cee836b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ada6157df203a32a9",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
