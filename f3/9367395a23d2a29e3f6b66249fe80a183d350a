@@ -1,0 +1,59 @@
+scripts/measure-multiplexing.ts
+  s_fb9412dd2d776a::t_0899fca23f7412 337,339,361
+scripts/relay2/lib/context.ts
+  s_fb9412dd2d776a::t_cde572248cde73 8,229,233
+src/main.ts
+  s_4da03de9eee2de::t_6eb6f63ee35040 1023-1028
+src/onboarding/localVaultImport.ts
+  s_fb9412dd2d776a::t_918f87c0faca0e 12-15,261,411,419
+src/sync/vaultSync.ts
+  s_4da03de9eee2de::t_49444b712d5dca 394-402,404,482-484,490-586,599-600,669-670,682-691,1026-1029,1035,1242,1244,1246-1253,1256-1257,1384-1392,1399-1400,1762,1848-1849,2134-2146,2182-2271,2293-2297,2755-2763,2773-2774,2776-2789,2792-2806,2809-2816,2818-2828,2830-2840,2842-2853,2855-2864,2866-2870,2875-2901,2912,2916,2919,2930-2958,2961-2962,2964-3044,3046-3058,3061-3062,3064-3068,3070-3076,3078-3081,3083-3147,3149-3355,3359-3364,5519-5522,5742-5749,5838-5847,5851
+tests/client/active-lifecycle-replay.ts
+  s_fb9412dd2d776a::t_dbb8038eb812d3 5,15,20-41,61-63,65,69,76,80,87-93,102,108-113,115-148,151-153,156-161,163,167-170
+tests/client/authority-outcome-recovery.ts
+  s_fb9412dd2d776a::t_33cc08b0f5bffb 112
+tests/client/bootstrap-http-boundaries.ts
+  s_fb9412dd2d776a::t_f0052927938ba3 15,216,218-224,231,235-236,241,245,247-250,252,255-257,263,266-275
+tests/client/bulk-create-client.ts
+  s_fb9412dd2d776a::t_865dfdf226c4c8 1-180
+tests/client/fresh-large-http-roundtrips.ts
+  s_fb9412dd2d776a::t_8abdabf9fc92bb 3,9,13,18-29,32,37-38,41,47-61,67,75-76,79,84-87,89-91
+tests/client/helpers/fakeBulkCreateServer.ts
+  s_fb9412dd2d776a::t_815431aff4d83d 1-249
+tests/client/onboarding-import.ts
+  s_fb9412dd2d776a::t_ba7a161ae066f6 289-291
+tests/client/semantic-epoch-runtime.ts
+  s_fb9412dd2d776a::t_64a2722c9412de 314,316,323,325-326
+tests/conformance/client.ts
+  s_fb9412dd2d776a::t_464ae7a9a1271c 272-273,275-277,305-314,316-327
+tests/conformance/fixtures/root-body.ts
+  s_fb9412dd2d776a::t_f6ecdc40e79f7d 9,17
+tests/headless/schema4.ts
+  s_fb9412dd2d776a::t_2ac50477fe9103 289,292,294-295,463-469,471-476,478-482
+tests/live/schema4Live.ts
+  s_fb9412dd2d776a::t_d4841a4f29bf99 188,191,193,197,248-264,266-271,274-282
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "f39367395a23d2a29e3f6b66249fe80a183d350a",
+  "prompts": {},
+  "sessions": {
+    "s_4da03de9eee2de": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a09756dc78127a702",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_fb9412dd2d776a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a6b9308dcda4dea54",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
