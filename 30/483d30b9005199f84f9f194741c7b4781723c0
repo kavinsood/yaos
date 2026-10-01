@@ -1,0 +1,23 @@
+server/src/crdt/rootSchema.ts
+  s_694286f0c485ac::t_597ba0bc2e634c 18-30
+server/src/vaultBulkCreateService.ts
+  s_694286f0c485ac::t_83288be07642e4 7,256-257,340-344
+server/src/vaultStore.ts
+  s_694286f0c485ac::t_467c9e367aa03d 75-79,1268-1274,1279-1282,1287-1294,1296-1334
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "30483d30b9005199f84f9f194741c7b4781723c0",
+  "prompts": {},
+  "sessions": {
+    "s_694286f0c485ac": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a3a172259d6cb1bf1",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
