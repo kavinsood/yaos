@@ -225,12 +225,13 @@ class S:
                 rows.append([trace, v, d.get("frames"), d.get("clients"),
                              num(g(d, "cpu", "perUpdateUsFromMinutes", "perEdit")), num(inv.get("p50")), num(inv.get("p99")),
                              num(g(d, "rowsWritten", "perEdit"), 2), num(g(d, "inboundWsMessages", "perEdit"), 2),
-                             pct(d.get("perFramePropagationMs"), ("p50", "p99")),
+                             pct(d.get("perFramePropagationMs"), ("p50", "p99")) if d.get("latencyUsed", True) else "not used (max-rate)",
+                             num(g(d, "phaseLevel", "cpuTimeUs", "perUnit")), num(g(d, "phaseLevel", "rowsWritten", "perUnit"), 2),
                              num(g(stream, "totals", "exceededCpuErrors")),
                              "yes" if stream.get("attributionSuspect") else "no",
                              "yes" if stream.get("totalsStable") else "no"])
         return table(["trace", "build", "frames", "clients", "CPU µs/edit (periodic)", "WS msg CPU p50 µs", "WS msg CPU p99 µs",
-                      "rows written/edit", "inbound WS/edit", "propagation p50/p99", "exceededCpu", "attribution suspect", "totals stable"], rows)
+                      "rows written/edit", "inbound WS/edit", "propagation p50/p99", "phase CPU µs/edit", "phase rows/edit", "exceededCpu", "attribution suspect", "totals stable"], rows)
 
     def c3(self) -> str:
         rows = []
@@ -271,17 +272,22 @@ class S:
     def c5(self) -> str:
         rows = []
         for v in ("base", "relay"):
-            d = self.v("C5", v)
+          for name in (f"C5-{v}", f"C5-bursts-{v}", f"C5-catchups-{v}"):
+            d = self.r.get(name)
             if not d:
                 continue
             for unit in ("perBurst", "perCatchup"):
-                x = g(d, "derived", unit) or {}
+                x = g(d, "derived", unit)
+                if not x:
+                    continue
                 rows.append([v, x.get("unit"), x.get("units"), num(x.get("httpPlusAlarmRequestsPerUnit"), 2),
                              num(x.get("inboundWsPerUnit"), 2), num(x.get("outboundWsPerUnit"), 2),
-                             num(x.get("doRequestUnitsPerUnit"), 2), num(x.get("rowsWrittenPerUnit"), 2)])
+                             num(x.get("doRequestUnitsPerUnit"), 2), num(x.get("rowsWrittenPerUnit"), 2),
+                             num(g(d, "phaseLevel", "doRequestUnitsPerUnit"), 2), num(g(d, "phaseLevel", "rowsWritten", "perUnit"), 2)])
             rows.append([v, "burst propagation / catch-up open", "", pct(d.get("burstPropagationMs"), ("p50", "p90")),
-                         pct(d.get("catchupOpenMs"), ("p50", "p90")), "", "", ""])
-        return table(["build", "unit", "n", "HTTP+alarm req", "inbound WS", "outbound WS", "DO request units", "rows written"], rows)
+                         pct(d.get("catchupOpenMs"), ("p50", "p90")), "", "", "", "", ""])
+        return table(["build", "unit", "n", "HTTP+alarm req", "inbound WS", "outbound WS", "DO request units", "rows written",
+                      "phase DO units/unit", "phase rows/unit"], rows)
 
     def c6(self) -> str:
         d = self.r.get("C6-relay")
@@ -432,9 +438,12 @@ class S:
         rows = []
         names = [n for n in self.r if n.startswith("MB-")]
 
+        def isbase(n):
+            return n == "MB-base" or n.startswith("MB-base-")
+
         def key(n):
             d = self.r[n]
-            return (0 if n == "MB-base" else 1, str(g(d, "vars", "YAOS_RELAY_LEAN_ROWS")), int(g(d, "microbatch", "effective") or 0), n)
+            return (0 if isbase(n) else 1, str(g(d, "vars", "YAOS_RELAY_LEAN_ROWS")), int(g(d, "microbatch", "effective") or 0), n)
         for n in sorted(names, key=key):
             d = self.r[n]
             lean = g(d, "vars", "YAOS_RELAY_LEAN_ROWS")
@@ -442,12 +451,25 @@ class S:
             for t in d.get("table") or []:
                 part = next((p for p in d.get("parts") or [] if p.get("pattern") == t.get("pattern")), {})
                 fo = part.get("frameOutcomes") or {}
-                rows.append([n.replace("MB-", ""), "off" if n == "MB-base" else lean, "–" if n == "MB-base" else mbms, t.get("pattern"), t.get("edits"),
+                rows.append([n.replace("MB-", ""), "off" if isbase(n) else lean, "–" if isbase(n) else mbms, t.get("pattern"), t.get("edits"),
                              num(t.get("rowsPerEditGql"), 2), num(t.get("rowsPerEditRelayCounter"), 2),
                              num(t.get("propagationP50")), num(t.get("propagationP90")), num(g(part, "propagationMs", "summary", "p99")),
-                             num(g(part, "gqlCpuUs", "perEdit")),
+                             num(g(part, "gqlCpuUs", "perEdit")), num(g(d, "phaseLevel", "cpuTimeUs", "perUnit")), num(g(d, "phaseLevel", "rowsWritten", "perUnit"), 2),
                              "pass" if fo.get("pass") else ("n/a" if fo.get("available") is False else ("FAIL" if fo else "–"))])
-        return table(["config", "lean", "mb ms", "pattern", "edits", "rows/edit (gql, idle-subtracted)", "rows/edit (relay counter)", "p50 ms", "p90 ms", "p99 ms", "CPU µs/edit", "frame accounting"], rows)
+        return table(["config", "lean", "mb ms", "pattern", "edits", "rows/edit (gql, idle-subtracted)", "rows/edit (relay counter)", "p50 ms", "p90 ms", "p99 ms", "CPU µs/edit", "phase CPU µs/edit", "phase rows/edit", "frame accounting"], rows)
+
+    # ---------------------------------------------------------------- per-phase worker totals (runfast.sh + gqlfill --progress)
+    def phases(self) -> str:
+        rows = []
+        for n, d in sorted(self.r.items()):
+            p = d.get("gqlPhase")
+            if not isinstance(p, dict):
+                continue
+            t = p.get("totals") or {}
+            rows.append([n, p.get("worker"), " → ".join(str(x) for x in p.get("window") or []), t.get("cpuTime"), t.get("rowsWritten"),
+                         t.get("inboundWsEffective"), p.get("httpRequests"), p.get("alarms"), p.get("doRequestUnits"),
+                         "yes" if p.get("totalsStable") else "no"])
+        return table(["phase", "worker", "window", "CPU µs", "rows written", "inbound WS", "HTTP", "alarms", "DO request units", "stable"], rows) if rows else "(no gqlPhase)"
 
     # ---------------------------------------------------------------- accounting
     def frame_accounting(self) -> str:
@@ -534,7 +556,7 @@ def main():
         ("Run index", s.index), ("Latency (L1–L7)", s.latency), ("C1 CPU per isolated keystroke (tail)", s.c1),
         ("C2 streaming cost (periodic analytics)", s.c2), ("C3 memory", s.c3), ("C4 rows per edit / reconnect", s.c4),
         ("C5 DO requests", s.c5), ("C6 bundle", s.c6), ("Behaviour (B1–B8, CW)", s.behaviour), ("Limits (X1–X4)", s.limits),
-        ("K1 compaction", s.k1), ("Microbatch / lean sweep", s.mb), ("Frame-outcome accounting", s.frame_accounting),
+        ("K1 compaction", s.k1), ("Microbatch / lean sweep", s.mb), ("Per-phase worker totals", s.phases), ("Frame-outcome accounting", s.frame_accounting),
         ("Connection events", s.connection_events), ("Convergence", s.convergence), ("Free plan: CPU per invocation", s.free_plan),
     ]
     for title, fn in sections:

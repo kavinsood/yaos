@@ -198,7 +198,8 @@ function traceOwners(dir: string, frames: number, clients: number): number[] {
 }
 
 /**
- * `--trace quick|stress` `--rate 25` `--n <frames>` (default: whole trace) `--clients 5` (stress).
+ * `--trace quick|stress` `--rate 25` (0 = max rate, flow-controlled by `--inflight 200`; latency then unused)
+ * `--n <frames>` (default: whole trace) `--clients 5` (stress).
  * Senders replay their own frames (stress: per semantic.jsonl client index) in trace order at `rate`; an observer
  * (device B) measures per-frame propagation. CPU: invocation cpu quantiles for WS messages (hibernation events)
  * and per-minute cpuTime / rowsWritten over the minute-aligned streaming window minus an idle window.
@@ -231,9 +232,33 @@ export async function C2(ctx: RunCtx): Promise<Result> {
 	const sendTimes: number[] = [];
 	const t0 = now();
 	let closedAt: number | null = null;
+	// --rate 0 (max rate): send as fast as the sockets accept, with flow control instead of pacing: at most
+	// --inflight frames sent but not yet seen by the observer, and no sender's ws buffer above 1 MiB. If the relay
+	// budget closes a sender 1013 ("relay rate limit"), fall back to pacing at 80% of the throughput achieved so far.
+	const maxRate = rate <= 0;
+	const inflight = ctx.num("inflight", 200);
+	const rateLimitCloses = () => senders.reduce((n, c) => n + c.closeLog.filter((x) => x.code === 1013).length, 0);
+	const rl0 = rateLimitCloses();
+	let paced: { rate: number; atFrame: number; at: number; achievedBefore: number } | null = null;
+	let stalledAt: number | null = null;
 	for (let i = 0; i < limit; i++) {
-		const wait = t0 + (i * 1000) / rate - now();
-		if (wait > 1) await sleep(wait);
+		if (!maxRate) {
+			const wait = t0 + (i * 1000) / rate - now();
+			if (wait > 1) await sleep(wait);
+		} else if (paced) {
+			const wait = paced.at + ((i - paced.atFrame) * 1000) / paced.rate - now();
+			if (wait > 1) await sleep(wait);
+		} else {
+			const buffered = () => senders.some((c) => (c.socket?.bufferedAmount ?? 0) > 1 << 20);
+			const blockedAt = now();
+			while ((tracker.outstanding >= inflight || buffered()) && now() - blockedAt < 120_000) await sleep(1);
+			if (now() - blockedAt >= 120_000) { stalledAt = i; log(`C2 ${which}: flow control stalled 120 s at frame ${i} (outstanding ${tracker.outstanding}); stopping`); break; }
+			if (rateLimitCloses() > rl0) {
+				const achieved = (i * 1000) / Math.max(1, now() - t0);
+				paced = { rate: Math.max(25, Math.floor(achieved * 0.8)), atFrame: i, at: now(), achievedBefore: r2(achieved) };
+				log(`C2 ${which}: 1013 rate-limit close at frame ${i} (achieved ${r2(achieved)}/s); pacing at ${paced.rate}/s`);
+			}
+		}
 		const s = senders[owners[i]!]!;
 		if (s.closed && !s.isOpen && !s.reconnecting) { closedAt = i; log(`C2 sender ${owners[i]} closed at ${i}: ${JSON.stringify(s.closed)}`); break; }
 		const at = now();
@@ -254,7 +279,12 @@ export async function C2(ctx: RunCtx): Promise<Result> {
 		settleMs: 120_000, expectedTextSha: full ? trace.finalSha : undefined });
 	for (const c of [...senders, observer]) { c.terminate(); c.doc.destroy(); }
 	const gql = await gqlWindows(ctx, windows);
-	const out: Result = { trace: which, traceDir: trace.dir, rate, frames: sendTimes.length, clients: clientsN, bodyId: body, sendMs, drained, closedAt,
+	const achievedRate = r2((sendTimes.length * 1000) / Math.max(1, sendMs));
+	const out: Result = { trace: which, traceDir: trace.dir, rate: maxRate ? "max" : rate, frames: sendTimes.length, clients: clientsN, bodyId: body, sendMs, drained, closedAt,
+		maxRate: maxRate ? { inflight, achievedRate, rateLimitCloses: rateLimitCloses() - rl0, pacedAfterRateLimit: paced, stalledAt,
+			note: "replayed as fast as the sockets accept (flow control: inflight frames / ws buffer), not 25/s; CPU and rows only" } : null,
+		latencyUsed: !maxRate,
+		latencyNote: maxRate ? "perFramePropagationMs from a max-rate replay is queueing delay, NOT a latency measurement; do not report it" : undefined,
 		perFramePropagationMs: series(tracker.coveredMs, 0),
 		relayCounterDelta: counterDelta(d0, d1), relayBody: relayBody(d1, body), windows, gql,
 		diagnostics: { before: d0, after: d1 }, frameOutcomes, convergence: conv };
@@ -293,6 +323,10 @@ export async function C5(ctx: RunCtx): Promise<Result> {
 	const gap = ctx.num("burst-gap", 3000);
 	const catchups = ctx.num("catchups", 10);
 	const catchupEdits = ctx.num("catchup-edits", 10);
+	// `--parts bursts|catchups|bursts,catchups`: runfast.sh runs each part on its own fresh worker so the worker's
+	// whole-phase analytics cover exactly one part (no quiet gaps needed between parts).
+	const parts = ctx.str("parts", "bursts,catchups")!.split(",");
+	const doBursts = parts.includes("bursts"), doCatchups = parts.includes("catchups");
 	const [body] = await freshNotes(ctx, "c5", 1, () => smallContent(5));
 	// Sockets never idle across a minute-alignment wait (see C2: an evicted base DO closes surviving sockets).
 	const windows: Win[] = [];
@@ -307,34 +341,43 @@ export async function C5(ctx: RunCtx): Promise<Result> {
 	let b = await openOrThrow(await ctx.client("B", body!));
 	const aDoc = a.doc, bDoc = b.doc;
 	const d0 = await diagnostics(ctx.context.devices.A!);
-	const tracker = new CoverageTracker(b.doc);
-	let idx = 0;
-	for (let i = 0; i < bursts; i++) {
-		for (let k = 0; k < burstSize; k++) { keystroke(a, tracker, idx++, "abcdefgh"[k % 8]!); if (k < burstSize - 1) await sleep(interval); }
-		await sleep(gap);
+	let burstProp: ReturnType<typeof series> | null = null;
+	let d1 = d0;
+	if (doBursts) {
+		const tracker = new CoverageTracker(b.doc);
+		let idx = 0;
+		for (let i = 0; i < bursts; i++) {
+			for (let k = 0; k < burstSize; k++) { keystroke(a, tracker, idx++, "abcdefgh"[k % 8]!); if (k < burstSize - 1) await sleep(interval); }
+			await sleep(gap);
+		}
+		await drain(tracker);
+		tracker.stop();
+		burstProp = series(tracker.coveredMs, 0);
+		windows.push(await closeWindow("bursts", start, { edits: bursts * burstSize, bursts, opens: 2 }));
+		d1 = await diagnostics(ctx.context.devices.A!);
 	}
-	await drain(tracker);
-	tracker.stop();
-	const burstProp = series(tracker.coveredMs, 0);
-	windows.push(await closeWindow("bursts", start, { edits: bursts * burstSize, bursts, opens: 2 }));
-	const d1 = await diagnostics(ctx.context.devices.A!);
 	await a.close(); await b.close();
-	await sleep(quiet);
-	start = await alignToMinute();
-	a = await openOrThrow(await ctx.client("A", body!, aDoc));
 	const catchupRows: Result[] = [];
-	for (let i = 0; i < catchups; i++) {
-		await b.close();
-		for (let k = 0; k < catchupEdits; k++) { keystroke(a, null, 0, "z"); await sleep(100); }
-		await sleep(500);
-		b = await ctx.client("B", body!, bDoc);
-		const t0 = now();
-		const o = await b.open(30_000);
-		catchupRows.push({ i, status: o.status, openMs: r2(now() - t0), bytesIn: b.bytesIn, phases: b.openPhases(), textEqual: b.text() === a.text() });
-		await sleep(1000);
+	let d2 = d1;
+	if (doCatchups) {
+		if (doBursts) { await sleep(quiet); start = await alignToMinute(); }
+		a = await openOrThrow(await ctx.client("A", body!, aDoc));
+		for (let i = 0; i < catchups; i++) {
+			await b.close();
+			for (let k = 0; k < catchupEdits; k++) { keystroke(a, null, 0, "z"); await sleep(100); }
+			await sleep(500);
+			b = await ctx.client("B", body!, bDoc);
+			const t0 = now();
+			const o = await b.open(30_000);
+			catchupRows.push({ i, status: o.status, openMs: r2(now() - t0), bytesIn: b.bytesIn, phases: b.openPhases(), textEqual: b.text() === a.text() });
+			await sleep(1000);
+		}
+		windows.push(await closeWindow("catchups", start, { catchups, editsWhileAway: catchupEdits, opens: catchups + 1 }));
+		d2 = await diagnostics(ctx.context.devices.A!);
+	} else {
+		a = await openOrThrow(await ctx.client("A", body!, aDoc));
+		b = await openOrThrow(await ctx.client("B", body!, bDoc));
 	}
-	windows.push(await closeWindow("catchups", start, { catchups, editsWhileAway: catchupEdits, opens: catchups + 1 }));
-	const d2 = await diagnostics(ctx.context.devices.A!);
 	const conv = await convergence({ bodyId: body!, clients: [a, b], fresh: await ctx.dev("C"), adapter: ctx.adapter });
 	await a.close(); await b.close();
 	const gql = await gqlWindows(ctx, windows);
@@ -346,11 +389,12 @@ export async function C5(ctx: RunCtx): Promise<Result> {
 			l5 = { path: l5Path, burst: j.burst, byMode: Object.fromEntries(Object.entries(j.results).map(([m, r]) => [m, r.wirePerSample])) };
 		} catch (e) { l5 = { path: l5Path, error: String(e) }; }
 	}
-	return deriveC5({ bodyId: body, adapter: ctx.adapter.name, bursts, burstSize, burstIntervalMs: interval, burstGapMs: gap, catchups, catchupEdits,
+	return deriveC5({ bodyId: body, adapter: ctx.adapter.name, parts, bursts: doBursts ? bursts : 0, burstSize, burstIntervalMs: interval, burstGapMs: gap,
+		catchups: catchupRows, catchupEdits,
 		clientWsMessagesPerEdit: ctx.adapter.name === "base" ? 1 : 2,
-		burstPropagationMs: burstProp, catchups: catchupRows,
-		catchupOpenMs: series(catchupRows.map((r) => r.openMs as number), 0),
-		relayCounterDelta: { bursts: counterDelta(d0, d1), catchups: counterDelta(d1, d2) },
+		burstPropagationMs: burstProp,
+		catchupOpenMs: doCatchups ? series(catchupRows.map((r) => r.openMs as number), 0) : null,
+		relayCounterDelta: { bursts: doBursts ? counterDelta(d0, d1) : null, catchups: doCatchups ? counterDelta(d1, d2) : null },
 		l5Reference: l5, windows, gql, convergence: conv });
 }
 
@@ -375,7 +419,8 @@ export function deriveC5(out: Result): Result {
 			outboundWsPerUnit: r2(outbound / units), doRequestUnitsPerUnit: r2((http + inbound / 20) / units),
 			rowsWrittenPerUnit: r2(Number((w.totals as Counters).rowsWritten ?? 0) / units) };
 	};
-	out.derived = { perBurst: derive(bw, bursts, "burst"), perCatchup: derive(cw, catchups, "catch-up (reconnect + step1/step2)") };
+	out.derived = { perBurst: bursts ? derive(bw, bursts, "burst") : null,
+		perCatchup: catchups ? derive(cw, catchups, "catch-up (reconnect + step1/step2)") : null };
 	return out;
 }
 

@@ -186,6 +186,22 @@ zsh scripts/relay2/runall.sh --sha <commit> [--tag rMMDD] [--only g-lat,g-mb,...
   - Outputs go to `results/relay2/raw/` and the manifest to `raw/runall-manifest.jsonl`. Logs go to `logs/relay2/runall-<tag>/`.
   - `--small` writes under `logs/relay2/runall-<tag>-small/` at small n.
   - The final step runs `convergence.ts`.
+- **`runfast.sh`** (2026-10-01) replaces `runall.sh` for full runs and finishes in about 2 h instead of overnight:
+
+```
+nohup zsh scripts/relay2/runfast.sh --sha <commit> --tag <tag> [--small] [--jobs 10] [--phases id,..] [--lanes A,B] [--no-final] [--dry-run] \
+  > ../logs/relay2/runall-<tag>.nohup 2>&1 &
+```
+
+  - **One fresh worker per phase.** Each phase (scenario × variant) gets its own worker, `yaos-relay2-<tag>-<phase>[-a<k>]`. There are no quiet gaps and no inline gql waits (`--quiet-gap-ms 0 --no-gql`).
+  - **Lane B.** Everything except latency runs `--jobs` at a time, longest first. Lane A workers are provisioned while it runs.
+  - **Lane A.** L1–L7, L5, B7 and X2 run strictly one at a time, alternating variant order.
+  - **Final stage.** C6 runs first. Then a single `gqlfill.ts --progress` pass, at least 20 min after lane B. It adds `gqlPhase`, the whole-worker totals, and for C2, C5 and MB a `phaseLevel` per-unit figure net of the `SEED-<variant>` phase (deploy + claim + seed only). It also backfills the per-window numbers. Then convergence, then `summarize.py` → `tables.md`.
+  - **Trimmed MB.** `MB-<base|strict|lean-mb0|lean-mb10|lean-mb50>-<burst|stream>` only.
+  - **C2-stress.** Runs once per build with `--rate 0`, which is max-rate with ack/bufferedAmount backpressure and drops to pacing if a 1013 appears. Only its CPU and rows are used; `latencyUsed: false`.
+  - **C5 split.** C5 is split into `C5-bursts-*` and `C5-catchups-*` (`--parts`).
+  - **Progress.** `cat <logdir>/progress.json` shows the stage, counts, running/failed lists and per-phase status, worker, start/end and attempt. `progress.jsonl` holds the raw events.
+  - **Resume and retry.** A rerun skips any phase with a valid `raw/<phase>.json`. A failed phase retries once on a fresh worker, then is marked `failed`. The per-phase timeout is 45 min (20 min with `--small`).
 - **Round-4 configurations (full run).** `relay` is the production candidate: `YAOS_RELAY_BODIES=true`, `YAOS_RELAY_LEAN_ROWS=true` and `YAOS_RELAY_MICROBATCH_MS=10`. `strict` is `YAOS_RELAY_BODIES=true` with lean off and mb 0; it runs for L2, L4, C1, C2 (quick and stress), C4, B7 and X2. `base` is the flag off with the same lean and mb vars. The `INERT-*-base` diag runs are the evidence that those vars do nothing with the flag off. The MB sweep runs lean on/off × mb 0/10/50/100/250 (`MB-relay-<lean|full>-mb<ms>`), plus `relay-nocand` on the primary config. `final` writes `convergence-suite.json` for relay, and `convergence-suite-<strict|base>.json` for the other two.
 - **Resilient raw client (round 3).** Data-path scenarios, meaning everything except B1–B8, X1, X3, X4, C3 and `diag` (`RESILIENT_OFF` in `lib/run.ts`), use clients with `reconnect=true`:
   - **Reconnect.** On any close the client did not initiate, it reconnects with backoff. The exceptions are 4409, 4403, 1008 and 1009, where a resend cannot help.
