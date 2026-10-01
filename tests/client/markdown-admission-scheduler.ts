@@ -178,7 +178,7 @@ s.test("default disk batching settles after 2 s quiet and caps a noisy path at 5
 	// Quiet path: one change, processed once 2 s later (not at 350 ms).
 	scheduler.queue({ path: "quiet.md", reason: "modify" });
 	await step(1_900);
-	assert.deepEqual(processed, []);
+	assert.equal(processed.length, 0);
 	await step(200);
 	await settle(scheduler, clock);
 	assert.deepEqual(processed.map((entry) => entry.path), ["quiet.md"]);
