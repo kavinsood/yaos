@@ -64,7 +64,7 @@ ev() { (( DRY )) && return 0; python3 $HERE/progress.py event $LOGS "$@" || true
 n() { (( SMALL )) && print -r -- $2 || print -r -- $1; }   # n <full> <small>
 iso() { date -u +%FT%TZ; }
 host_of() { print -r -- "https://$1.kavinsood.workers.dev"; }
-done_json() { [[ -s $1 ]] && ! grep -q '^  "error":' $1; }
+done_json() { [[ -s $1 ]] && ! grep -qE '^  "error": [^n]' $1; }   # "error": null (L5) is fine
 
 # ------------------------------------------------------------------------------------------------ plan
 typeset -A LANE SPEC KIND ARGS EST

@@ -6,7 +6,7 @@
 
 progress.jsonl: one event per line {"at", "phase", "status", ...}; phase "_stage" lines mark run stages.
 progress.json: {"stage", "counts", "phases": {id: {lane, variant, est_min, status, worker, attempt, start, end, ...}}}.
-Statuses: pending → provisioning → provisioned → running → done | retry | failed (after the last attempt) | skip
+Statuses: pending → provisioning → deploy → provisioned → running → done | retry | failed (after the last attempt) | skip
 (an earlier run's valid output exists).
 """
 from __future__ import annotations
@@ -66,7 +66,7 @@ def snapshot(d: str) -> None:
     for p in plan.values():
         counts[p["status"]] = counts.get(p["status"], 0) + 1
     out = {**meta, "stage": stage, "updatedAt": now(), "counts": counts,
-           "running": [k for k in order if plan[k]["status"] in ("running", "provisioning")],
+           "running": [k for k in order if plan[k]["status"] in ("running", "provisioning", "deploy")],
            "failed": [k for k in order if plan[k]["status"] == "failed"],
            "phases": {k: plan[k] for k in order}}
     fd, tmp = tempfile.mkstemp(dir=d, prefix=".progress.", suffix=".tmp")
