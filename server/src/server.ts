@@ -255,7 +255,9 @@ export class VaultRuntime implements DrainPort {
 					// Lean rows (§6.4): the alarm also publishes coalesced catalog events, so
 					// it is delayed to coalesce a burst into one pass (and one event per body).
 					const relayConfig = options.relayConfig ?? readRelayConfig(null);
-					const delay = this.store.leanRows ? relayConfig.leanCatalogDelayMs : 0;
+					// v3: one alarm per (longer) window instead of one per burst.
+					const delay = relayConfig.groupCommit ? relayConfig.gcCatalogDelayMs
+						: this.store.leanRows ? relayConfig.leanCatalogDelayMs : 0;
 					this.options.execution.waitUntil(this.armAlarmEarliest(Date.now() + delay)
 						.catch((error) => {
 							this.relayCheckpointAlarmArmed = false;

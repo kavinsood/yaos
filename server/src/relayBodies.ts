@@ -514,8 +514,9 @@ export class RelayBodyService {
 		this.buckets.delete(socketId);
 	}
 
-	private rejectAuthority(socket: VaultSocketPort): void {
-		this.counters.authorityCloses++;
+	/** `count` is false for a queued frame already counted in `authorityDrops` (one outcome per frame). */
+	private rejectAuthority(socket: VaultSocketPort, count = true): void {
+		if (count) this.counters.authorityCloses++;
 		this.requireHost().sendControl(socket, { type: "error", code: "authority_superseded", reason: "socket authority superseded" });
 		try { socket.close(AUTHORITY_SUPERSEDED_SOCKET_CLOSE_CODE, "socket authority superseded"); } catch { /* closed */ }
 	}
@@ -798,7 +799,7 @@ export class RelayBodyService {
 		for (const frame of frames) {
 			if (revoked.has(frame.attachment.socketId) || !this.validateActor(frame.actor)) {
 				this.counters.authorityDrops++;
-				if (!revoked.has(frame.attachment.socketId)) this.rejectAuthority(frame.socket);
+				if (!revoked.has(frame.attachment.socketId)) this.rejectAuthority(frame.socket, false);
 				revoked.add(frame.attachment.socketId);
 				continue;
 			}
@@ -1097,6 +1098,9 @@ export class RelayBodyService {
 				|| result.journalFallback) {
 				this.postCommit(() => { this.checkpointTail(bodyId); });
 			}
+			// The catalog delta feed lags until a coalescing pass; the host arms the
+			// alarm at most once per gcCatalogDelayMs window (deduped in-memory).
+			if (this.config.gcCatalogDelayMs > 0) this.postCommit(() => this.options.armCheckpointAlarm());
 			return;
 		}
 		// Lean rows: every append leaves a catalog event to coalesce (the host delays this alarm).

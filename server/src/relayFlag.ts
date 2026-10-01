@@ -32,6 +32,8 @@ export interface RelayFlagEnv {
 	YAOS_RELAY_GC_MAX_BYTES?: string;
 	/** v3: tail row cap; a group commit that leaves the tail at or over it checkpoints the body. */
 	YAOS_RELAY_GC_TAIL_BYTES?: string;
+	/** v3: delay of the (one per window) alarm that publishes coalesced catalog events; 0 = tail checkpoints only. */
+	YAOS_RELAY_GC_CATALOG_DELAY_MS?: string;
 }
 
 export interface RelayConfig {
@@ -76,6 +78,14 @@ export interface RelayConfig {
 	gcMaxMs: number;
 	gcMaxBytes: number;
 	gcTailBytes: number;
+	/**
+	 * v3: a group commit arms the relay alarm at most once per window, this far
+	 * out (one setAlarm row per window, not per commit). The alarm publishes the
+	 * coalesced catalog events of every body committed since (the catalog head
+	 * is already right via the overlay; only the delta feed lags). 0 disables
+	 * it: events are then published only by tail checkpoints and other alarms.
+	 */
+	gcCatalogDelayMs: number;
 }
 
 /**
@@ -105,6 +115,7 @@ export const DEFAULT_RELAY_CONFIG: Readonly<RelayConfig> = Object.freeze({
 	gcMaxMs: 1_500,
 	gcMaxBytes: 65_536,
 	gcTailBytes: 65_536,
+	gcCatalogDelayMs: 30_000,
 });
 
 /** v3 flag value: "1" (brief) or "true" (the other relay flags' spelling). */
@@ -167,5 +178,6 @@ export function readRelayConfig(env: RelayFlagEnv | null | undefined): RelayConf
 		gcMaxMs: positiveInt(source.YAOS_RELAY_GC_MAX_MS, DEFAULT_RELAY_CONFIG.gcMaxMs, 1, 60_000),
 		gcMaxBytes: positiveInt(source.YAOS_RELAY_GC_MAX_BYTES, DEFAULT_RELAY_CONFIG.gcMaxBytes, 1, MAX_DURABLE_UPDATE_BYTES),
 		gcTailBytes: positiveInt(source.YAOS_RELAY_GC_TAIL_BYTES, DEFAULT_RELAY_CONFIG.gcTailBytes, 1, 1024 * 1024),
+		gcCatalogDelayMs: positiveInt(source.YAOS_RELAY_GC_CATALOG_DELAY_MS, DEFAULT_RELAY_CONFIG.gcCatalogDelayMs, 0, 3_600_000),
 	};
 }
