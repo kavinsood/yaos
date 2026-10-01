@@ -1,0 +1,49 @@
+docs/rfc-relay-bodies.md
+  s_df8cfbf01530e3::t_df69e73424ffb2 211-215,292-329,402-406,540,542,560-561
+scripts/guard-schema-version.mjs
+  s_df8cfbf01530e3::t_eeb9afe5be5f27 100-126,151
+scripts/relay2/README.md
+  s_df8cfbf01530e3::t_18cbaab8fbb99a 220-235
+scripts/relay2/lib/rawClient.ts
+  s_df8cfbf01530e3::t_10ed7560d633fe 48-52,99-122,128,196-201,251-277,464,466-467,574-575,578,581-583
+scripts/relay2/wb-typing-rows.ts
+  s_df8cfbf01530e3::t_de08c1e44384b3 1-291
+server/src/index.ts
+  s_df8cfbf01530e3::t_24e0a97adba82d 2,102-104,319-324
+server/src/relayBodies.ts
+  s_df8cfbf01530e3::t_8b64b7ebc0141c 67-73,106-139,206-222,235-236,277-283,335-339,360-362,527-538,549,552-560,591,639-652,661-664,696,700,705-888,956,959,966,996-1003,1005-1007,1009-1010,1014-1015,1019,1027-1028,1050-1051,1077-1092,1099,1105,1112,1118-1119,1122,1125,1165-1177,1246-1323,1335-1336,1360-1361,1519-1524,1546-1547,1603-1604,1674-1676
+server/src/relayBodyStore.ts
+  s_df8cfbf01530e3::t_72d3741c019fdd 38-43,47-55,98,106-107,224-239,523-558
+server/src/relayFlag.ts
+  s_df8cfbf01530e3::t_aacf194570a851 24-28,62-73,98-101,153-157
+server/src/server.ts
+  s_df8cfbf01530e3::t_817310af7156f4 43,173,182-183,186-189,394-403,728-742,756,767-768,1570-1572,1574,1579,1581,1583,1592-1593,1607,1612,1614-1615
+server/src/sqlRowCounter.ts
+  s_df8cfbf01530e3::t_095946d54addb5 1-125
+server/src/vaultDocumentStore.ts
+  s_df8cfbf01530e3::t_ec2ef2e01c0457 502-506,519-520
+server/src/vaultSocketService.ts
+  s_df8cfbf01530e3::t_10415e3e4330e7 990
+tests/contracts/schema-version-guard.ts
+  s_df8cfbf01530e3::t_0c0332514b7d75 111-134
+tests/server/relay2-server-core.ts
+  s_df8cfbf01530e3::t_d3ea868f147604 19,72-100,110-112,119-123,162-163,165,177-185,211-217,225-228,1186-1188,1214,1238-1447,1451-1585
+tests/server/wb-w1-schema-trims.ts
+  s_df8cfbf01530e3::t_a5d649a1947712 1-200
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c5dc60b02a8f43b4f293289a7f9bba7e68055a70",
+  "prompts": {},
+  "sessions": {
+    "s_df8cfbf01530e3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-afe0db35fdc6eca3b",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
