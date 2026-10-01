@@ -130,7 +130,7 @@ export function closeOrigin(code: number, reason: string): string {
 	return "other";
 }
 
-type OutFrame = { clientFrameId: string; kind: "update" | "step2"; texts: string[]; frame: Uint8Array; nonEmpty: boolean; createdAt: number };
+type OutFrame = { clientFrameId: string; kind: "update" | "step2"; texts: string[]; frame: Uint8Array; nonEmpty: boolean; createdAt: number; lastSentAt?: number };
 
 /** Every RawClient created in this process (connection-event report for the scenario JSON). */
 export const ALL_CLIENTS: RawClient[] = [];
@@ -195,6 +195,23 @@ export class RawClient {
 	lastFrame: { clientFrameId: string; at: number; queued: boolean } | null = null;
 	private userClosing = false;
 	private reconnectPromise: Promise<boolean> | null = null;
+	/**
+	 * Relay v3 B5 emulation (client send-coalescing, VaultSync `relaySendCoalesceMs`): local updates are held and
+	 * sent as ONE merged frame (Y.mergeUpdates) `coalesceMs` after the first held update (fixed timer, like
+	 * RelayReceiptChannel). The frame id is allocated at the first held update so editTracked can return it; the
+	 * edit's `sentAt` is the edit time, so propagation/ack latency include the hold. 0 = off.
+	 */
+	coalesceMs = 0;
+	private held: { clientFrameId: string; updates: Uint8Array[]; timer: ReturnType<typeof setTimeout> } | null = null;
+	coalescedFrames = 0;
+	coalescedUpdates = 0;
+	/**
+	 * Relay v3 client resend emulation (RelayReceiptChannel RECEIPT_RESEND_MS): an unacked frame whose last send is
+	 * older than `resendAfterMs` is resent (same envelope / clientFrameId) while the socket is open. 0 = off.
+	 */
+	resendAfterMs = 0;
+	private resendTimer: ReturnType<typeof setInterval> | null = null;
+	timeoutResends = 0;
 
 	constructor(
 		readonly identity: LiveIdentity,
@@ -205,6 +222,7 @@ export class RawClient {
 	) {
 		doc.on("update", (update: Uint8Array, origin: unknown) => {
 			if (origin === this || !this.forwardLocal) return;
+			if (this.coalesceMs > 0) { this.holdForCoalesce(update); return; }
 			// Never skip silently: sendSyncFrame queues (resilient) or counts the drop when not open.
 			if (this.socket) this.sendUpdate(update);
 		});
@@ -220,16 +238,53 @@ export class RawClient {
 	get isOpen() { return this.socket?.readyState === WebSocket.OPEN; }
 
 	/** Send an update frame (envelope first per adapter). Returns the client frame id. */
-	sendUpdate(update: Uint8Array): string {
+	sendUpdate(update: Uint8Array, presetFrameId?: string): string {
 		const e = encoding.createEncoder();
 		encoding.writeVarUint(e, 0);
 		syncProtocol.writeUpdate(e, update);
-		return this.sendSyncFrame("update", update, encoding.toUint8Array(e));
+		return this.sendSyncFrame("update", update, encoding.toUint8Array(e), presetFrameId);
+	}
+
+	private holdForCoalesce(update: Uint8Array) {
+		if (!this.held) {
+			const clientFrameId = `f-${randomBytes(6).toString("hex")}`;
+			this.held = { clientFrameId, updates: [], timer: setTimeout(() => this.flushCoalesced(), this.coalesceMs) };
+		}
+		this.held.updates.push(update);
+		this.lastFrame = { clientFrameId: this.held.clientFrameId, at: now(), queued: false };
+	}
+
+	/** Send the held updates now as one merged frame (timer, close, or explicit). */
+	flushCoalesced() {
+		const h = this.held;
+		if (!h) return;
+		this.held = null;
+		clearTimeout(h.timer);
+		this.coalescedFrames++;
+		this.coalescedUpdates += h.updates.length;
+		const merged = h.updates.length === 1 ? h.updates[0]! : Y.mergeUpdates(h.updates);
+		const before = this.lastFrame;
+		if (this.socket) this.sendUpdate(merged, h.clientFrameId);
+		this.lastFrame = before;
+	}
+
+	private ensureResendTimer() {
+		if (this.resendAfterMs <= 0 || this.resendTimer) return;
+		this.resendTimer = setInterval(() => {
+			if (!this.isOpen || this.adapter.requireEcho !== true) return;
+			const t = now();
+			for (const f of this.outbox.values()) {
+				if (t - (f.lastSentAt ?? f.createdAt) < this.resendAfterMs) continue;
+				this.timeoutResends++;
+				this.writeFrame(f, true);
+			}
+		}, 250);
+		(this.resendTimer as unknown as { unref?: () => void }).unref?.();
 	}
 
 	/** Send a pre-encoded sync frame carrying `update`, preceded by the adapter's envelope. */
-	sendSyncFrame(kind: "update" | "step2", update: Uint8Array, frame: Uint8Array): string {
-		const clientFrameId = `f-${randomBytes(6).toString("hex")}`;
+	sendSyncFrame(kind: "update" | "step2", update: Uint8Array, frame: Uint8Array, presetFrameId?: string): string {
+		const clientFrameId = presetFrameId ?? `f-${randomBytes(6).toString("hex")}`;
 		const texts = this.adapter.envelope(this, { kind, update, clientFrameId, text: this.text() });
 		const out: OutFrame = { clientFrameId, kind, texts, frame, nonEmpty: !isEmptyUpdate(update), createdAt: now() };
 		const tracked = this.adapter.requireEcho === true;
@@ -250,6 +305,8 @@ export class RawClient {
 	private writeFrame(out: OutFrame, resend: boolean) {
 		for (const text of out.texts) this.send(text);
 		const at = now();
+		out.lastSentAt = at;
+		if (this.resendAfterMs > 0) this.ensureResendTimer();
 		this.sent.push({ at, clientFrameId: out.clientFrameId, kind: out.kind, bytes: out.frame.byteLength, ...(resend ? { resend: true } : {}) });
 		if (this.sent.length > 20_000) this.sent.splice(0, 10_000);
 		this.send(out.frame);
@@ -300,7 +357,9 @@ export class RawClient {
 			closes: this.closeLog, errors: this.errorLog.slice(0, 50), errorCount: this.errorLog.length, reconnects: this.reconnects,
 			unacked: this.adapter.requireEcho === true ? this.outbox.size : null, queuedForNextConnection: this.adapter.requireEcho === true ? null : this.outbox.size,
 			updateFramesSent: this.updateFramesSent, nonEmptyFramesSent: this.nonEmptyFramesSent, resentFrames: this.resentFrames,
-			queuedWhileClosed: this.queuedWhileClosed, droppedWhileClosed: this.droppedWhileClosed };
+			queuedWhileClosed: this.queuedWhileClosed, droppedWhileClosed: this.droppedWhileClosed,
+			...(this.coalesceMs > 0 ? { coalesceMs: this.coalesceMs, coalescedFrames: this.coalescedFrames, coalescedUpdates: this.coalescedUpdates } : {}),
+			...(this.resendAfterMs > 0 ? { resendAfterMs: this.resendAfterMs, timeoutResends: this.timeoutResends } : {}) };
 	}
 
 	/** True when this client lost its connection other than by its own close(). */
@@ -461,6 +520,8 @@ export class RawClient {
 	}
 
 	async close() {
+		this.flushCoalesced();
+		if (this.resendTimer) { clearInterval(this.resendTimer); this.resendTimer = null; }
 		this.userClosing = true;
 		if (!this.socket || this.socket.readyState === WebSocket.CLOSED) return;
 		await new Promise<void>((resolve) => {
@@ -470,7 +531,21 @@ export class RawClient {
 		});
 	}
 
-	terminate() { this.userClosing = true; this.socket?.terminate(); }
+	terminate() {
+		if (this.held) { clearTimeout(this.held.timer); this.held = null; }
+		if (this.resendTimer) { clearInterval(this.resendTimer); this.resendTimer = null; }
+		this.userClosing = true; this.socket?.terminate();
+	}
+
+	/** Relay acks in send order: index of the first unacked non-empty frame and whether any LATER frame was acked. */
+	ackPrefixCheck() {
+		const acked = new Set(this.acks.map((a) => a.frameId).filter(Boolean));
+		const sent = this.sent.filter((s) => !s.resend && s.kind === "update");
+		const firstUnacked = sent.findIndex((s) => !acked.has(s.clientFrameId));
+		const ackedAfter = firstUnacked < 0 ? [] : sent.slice(firstUnacked + 1).filter((s) => acked.has(s.clientFrameId));
+		return { sent: sent.length, acked: sent.filter((s) => acked.has(s.clientFrameId)).length, firstUnacked,
+			ackedAfterFirstUnacked: ackedAfter.length, prefix: ackedAfter.length === 0 };
+	}
 
 	waitUpdate(timeoutMs: number): Promise<number | null> {
 		return new Promise((resolve) => {

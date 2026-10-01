@@ -32,7 +32,7 @@ export interface RunCtx {
 }
 
 /** Scenarios whose clients must NOT auto-reconnect (they test closes/refusals and reopen explicitly). */
-export const RESILIENT_OFF = new Set(["B1", "B2", "B3", "B4", "B6", "B7", "B8", "X1", "X3", "X4", "C3", "diag"]);
+export const RESILIENT_OFF = new Set(["B1", "B2", "B3", "B4", "B6", "B7", "B8", "X1", "X3", "X4", "C3", "diag", "FENCE"]);
 
 export function makeCtx(host: string, context: Context, args: Args, adapter: ProtocolAdapter, scenario: string): RunCtx {
 	const tag = `${scenario.toLowerCase()}-${Date.now().toString(36)}`;
@@ -47,6 +47,10 @@ export function makeCtx(host: string, context: Context, args: Args, adapter: Pro
 		client: async (deviceName, bodyId, doc) => {
 			const c = new RawClient(await device(context, deviceName), bodyId, doc, adapter);
 			c.reconnect = resilient;
+			// Relay v3 harness knobs: B5 client send-coalescing (`--coalesce-ms 250`) and the client's receipt-timeout
+			// resend (`--resend-ms 5000`, RelayReceiptChannel RECEIPT_RESEND_MS). Both off by default.
+			c.coalesceMs = flagNum(args, "coalesce-ms", 0);
+			c.resendAfterMs = flagNum(args, "resend-ms", 0);
 			return c;
 		},
 	};

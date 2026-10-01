@@ -177,6 +177,23 @@ function keystroke(a: RawClient, tracker: CoverageTracker | null, index: number,
 	return sentAt;
 }
 
+/** Autosave-style rewrite: replace a fixed-width stamp at the start of the note (one transaction = one frame). */
+function autosaveEdit(a: RawClient, tracker: CoverageTracker | null, index: number) {
+	let update: Uint8Array | null = null;
+	const capture = (u: Uint8Array, origin: unknown) => { if (origin !== a) update = u; };
+	a.doc.on("update", capture);
+	let sentAt = now();
+	const stamp = `[autosave ${String(index).padStart(6, "0")} ${Date.now().toString(36)}]`.padEnd(32, " ").slice(0, 32);
+	try {
+		sentAt = a.editTracked((t) => {
+			if (t.toString().startsWith("[autosave ")) t.delete(0, 32);
+			t.insert(0, stamp);
+		}).sentAt;
+	} finally { a.doc.off("update", capture); }
+	if (tracker && update) tracker.sent(index, update, sentAt);
+	return sentAt;
+}
+
 async function drain(tracker: CoverageTracker, timeoutMs = 60_000) {
 	const t0 = now();
 	while (tracker.outstanding > 0 && now() - t0 < timeoutMs) await sleep(50);
@@ -586,8 +603,29 @@ export async function MB(ctx: RunCtx): Promise<Result> {
 		if (p === "stream") {
 			const r = await replayTrace(a, trace.frames, rate, { tracker, limit: Math.min(trace.frames.length, Math.floor(seconds * rate)) });
 			edits = r.sent;
+		} else if (p === "bursty") {
+			// Relay v3: typing bursts (8 keys at 125 ms) separated by 3 s pauses, so every burst ends in an idle flush.
+			const t0 = now();
+			for (let i = 0; now() - t0 < seconds * 1000; i++) {
+				const burst = Math.floor(i / 8), k = i % 8;
+				const wait = t0 + burst * (7 * 125 + 3000) + k * 125 - now();
+				if (wait > 1) await sleep(wait);
+				keystroke(a, tracker, i, String.fromCharCode(97 + (i % 26)));
+				edits++;
+			}
+		} else if (p === "autosave") {
+			// Relay v3: a plugin rewriting an open note every 1 s with a small change (a status line replaced in place:
+			// delete the old 24-char stamp, insert a new one) — the open-note path sends it as an immediate raw frame.
+			const t0 = now();
+			for (let i = 0; now() - t0 < seconds * 1000; i++) {
+				const wait = t0 + i * 1000 - now();
+				if (wait > 1) await sleep(wait);
+				autosaveEdit(a, tracker, i);
+				edits++;
+			}
 		} else {
-			const spacing = p === "l2" ? 500 : 125;
+			// l2: 2 keys/s; type5: 5 keys/s (relay v3 MB-style typing); burst: 8 keys/s continuous.
+			const spacing = p === "l2" ? 500 : p === "type5" ? 200 : 125;
 			const t0 = now();
 			for (let i = 0; now() - t0 < seconds * 1000; i++) {
 				const wait = t0 + i * spacing - now();
@@ -627,6 +665,13 @@ export async function MB(ctx: RunCtx): Promise<Result> {
 			propagationSamplesMs: tracker.coveredMs.map((x) => (x == null ? null : r2(x))),
 			sequenceDelta: Number(d1.sequence) - Number(d0.sequence),
 			relayRowsWrittenPerEdit: delta?.rowsWritten !== undefined ? r2(delta.rowsWritten / edits) : null,
+			relayGroupCommitsPerEdit: delta?.groupCommits !== undefined ? r2(delta.groupCommits / edits) : null,
+			relayRowsPerCommit: delta?.groupCommits ? r2((delta.rowsWritten ?? 0) / delta.groupCommits) : null,
+			typingSeconds: p === "stream" ? r2(edits / rate) : seconds,
+			ackMs: series(a.sent.filter((f) => f.kind === "update" && !f.resend).map((f) => {
+				const k = a.acks.find((x) => x.frameId === f.clientFrameId); return k ? r2(k.at - f.at) : null; }), 0),
+			ackPrefix: a.ackPrefixCheck(),
+			clientCoalesce: a.coalesceMs > 0 ? { coalesceMs: a.coalesceMs, frames: a.coalescedFrames, updates: a.coalescedUpdates } : null,
 			relayAppendsPerEdit: delta?.appends !== undefined ? r2(delta.appends / edits) : null,
 			relayCounterDelta: delta, relayBodyAfter: relayBody(d2, body), clientSide, frameOutcomes });
 		log(`MB ${p}: edits=${edits} ${JSON.stringify(parts.at(-1)!.propagationMs)}`);

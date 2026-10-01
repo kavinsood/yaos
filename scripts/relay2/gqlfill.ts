@@ -109,6 +109,8 @@ function summarise(q: Awaited<ReturnType<typeof queryWindow>>) {
 /** Units for phase-level per-unit numbers (null: scenario has no per-unit cost). */
 function units(d: Obj): { units: number; unit: string } | null {
 	const s = String(d.scenario ?? "");
+	if (s === "C4") return { units: Number(d.edits ?? 0), unit: Number(d.reconnects ?? 0) > 0 ? "edit (phase also has reconnects)" : "edit" };
+	if (s === "HTTPSAVE") return { units: Number(d.posts ?? 0), unit: "HTTP candidate POST" };
 	if (s === "C2") return { units: Number(d.frames ?? 0), unit: "edit (trace frame)" };
 	if (s === "MB") return { units: ((d.parts as Obj[] | undefined) ?? []).reduce((n, p) => n + Number(p.edits ?? 0), 0), unit: "edit" };
 	if (s === "C5") {
@@ -120,7 +122,7 @@ function units(d: Obj): { units: number; unit: string } | null {
 	return null;
 }
 
-const seedVariant = (v: string) => (v === "base" ? "base" : v === "strict" || v.startsWith("full") ? "strict" : "relay");
+const seedVariant = (v: string) => (v === "base" ? "base" : v === "strict" || v.startsWith("full") ? "strict" : v.startsWith("v3") ? "v3" : "relay");
 
 async function phasePass(dir: string, progress: string, jobs: number, passes: number) {
 	const recs = phases(progress).filter((p) => existsSync(join(dir, `${p.phase}.json`)));
@@ -143,7 +145,7 @@ async function phasePass(dir: string, progress: string, jobs: number, passes: nu
 		});
 	}
 	const seeds: Record<string, Obj | undefined> = {};
-	for (const v of ["base", "relay", "strict"]) {
+	for (const v of ["base", "relay", "strict", "v3"]) {
 		const s = results.get(`SEED-${v}`);
 		seeds[v] = s ? { phase: `SEED-${v}`, totals: s.totals, httpRequests: s.httpRequests, alarms: s.alarms } : undefined;
 	}
@@ -155,7 +157,7 @@ async function phasePass(dir: string, progress: string, jobs: number, passes: nu
 		d.gqlPhase = { worker: r.worker, variant: r.variant, totalsStable: stable.has(r.phase), queriedAt: new Date().toISOString(),
 			note: "whole-phase analytics of this phase's own worker: deploy + claim + standard seed + scenario (end padded 3 min)", ...s };
 		const u = units(d);
-		const seed = seeds[seedVariant(r.variant)];
+		const seed = seeds[seedVariant(r.variant)] ?? (r.variant.startsWith("v3") ? seeds.relay : undefined);
 		if (u && u.units > 0 && !r.phase.startsWith("SEED-")) {
 			const st = (seed?.totals ?? {}) as Record<string, number>;
 			const per = (key: string) => {

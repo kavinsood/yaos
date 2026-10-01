@@ -37,7 +37,7 @@ HERE=${0:A:h}
 source $EXP/env.sh
 ulimit -n 10240 2>/dev/null || true
 
-SHA="" TAG="f$(date +%m%d)" DRY=0 SMALL=0 JOBS=10 ONLY_PHASES="" ONLY_LANES="" FINAL=1 POOL="" APAR=0
+SHA="" TAG="f$(date +%m%d)" DRY=0 SMALL=0 JOBS=10 ONLY_PHASES="" ONLY_LANES="" FINAL=1 POOL="" APAR=0 PLAN=default PTXT=""
 while (( $# )); do
   case $1 in
     --sha) SHA=$2; shift 2;;
@@ -48,6 +48,8 @@ while (( $# )); do
     --lanes) ONLY_LANES=$2; shift 2;;
     --no-final) FINAL=0; shift;;
     --lane-a-parallel) APAR=1; shift;;
+    --plan) PLAN=$2; shift 2;;
+    --progress-txt) PTXT=${2:A}; shift 2;;
     --reuse-pool) POOL=${2:A}; shift 2;;
     --dry-run) DRY=1; shift;;
     *) echo "unknown arg $1" >&2; exit 2;;
@@ -75,7 +77,7 @@ BENCH=(node tests/run-typescript.mjs --test-aliases scripts/relay2/bench.ts)
 L5=(node tests/run-typescript.mjs --test-aliases scripts/relay2/l5-cli-baseline.ts)
 B5=(node tests/run-typescript.mjs --test-aliases scripts/relay2/reset/b5.ts)
 
-say() { print -r -- "[runfast $(date -u +%H:%M:%S)] $*" >> $LOGS/runall.log; print -ru2 -- "[runfast $(date -u +%H:%M:%S)] $*"; }
+say() { print -r -- "[runfast $(date -u +%H:%M:%S)] $*" >> $LOGS/runall.log; [[ -n $PTXT ]] && print -r -- "[$(date -u +%H:%M:%S)] $*" >> $PTXT; print -ru2 -- "[runfast $(date -u +%H:%M:%S)] $*"; }
 ev() { (( DRY )) && return 0; python3 $HERE/progress.py event $LOGS "$@" || true; }
 n() { (( SMALL )) && print -r -- $2 || print -r -- $1; }   # n <full> <small>
 iso() { date -u +%FT%TZ; }
@@ -153,6 +155,50 @@ P X2-strict A strict 3 bench X2 $( (( SMALL )) && print -- --rates 25,50,100 --s
 P X2-relay A relay 3 bench X2 $( (( SMALL )) && print -- --rates 25,50,100 --step-ms 4000)
 P X2-base A base 3 bench X2 $( (( SMALL )) && print -- --rates 25,50,100 --step-ms 4000)
 
+# --plan v3: relay v3 write-reduction run (group commit). Replaces the default plan. Specs: v3 (harness client with
+# candidateId), v3nc (relay-nocand adapter = the real client, which sends no candidateId), v3b5 (v3 deploy, harness
+# client send-coalescing 250 ms = B5), relay (v2 BODIES+LEAN+MB10), base.
+if [[ $PLAN == v3 ]]; then
+  LANE=() SPEC=() KIND=() ARGS=() EST=() ORDER_B=() ORDER_A=()
+  B5C=(--coalesce-ms 250)
+  P C2-stress-v3 B v3 12 bench C2 --trace stress --clients 5 --rate 0 --n $(n 50000 500) $NOGAP
+  P X1-v3 B v3 10 bench X1 --steps $(n 100,250,500,1000,2000 20,40) --probe-n $(n 30 12)
+  P MB-v3-autosave B v3 7 bench MB --patterns autosave --pattern-seconds $(n 320 30) $NOGAP
+  P MB-v3nc-autosave B v3nc 7 bench MB --patterns autosave --pattern-seconds $(n 320 30) $NOGAP
+  P HTTPSAVE-v3 B v3 6 bench HTTPSAVE --seconds $(n 300 30) --interval-ms 5000
+  for pat in type5 burst bursty stream; do P MB-v3-$pat B v3 4 bench MB --patterns $pat --pattern-seconds $(n 110 30) $NOGAP; done
+  for pat in type5 burst; do P MB-v3nc-$pat B v3nc 4 bench MB --patterns $pat --pattern-seconds $(n 110 30) $NOGAP; done
+  for pat in type5 burst bursty; do P MB-v3b5-$pat B v3b5 4 bench MB --patterns $pat --pattern-seconds $(n 110 30) $B5C $NOGAP; done
+  for pat in type5 burst; do P MB-relay-$pat B relay 4 bench MB --patterns $pat --pattern-seconds $(n 110 30) $NOGAP; done
+  P MB-base-type5 B base 4 bench MB --patterns type5 --pattern-seconds $(n 110 30) $NOGAP
+  for v in base relay v3 v3nc; do P C4-$v B $v 3 bench C4 --n $(n 50 10) --reconnects 0; done
+  P C4-v3b5 B v3b5 3 bench C4 --n $(n 50 10) --reconnects 0 $B5C
+  P CRASH-v3 B v3 5 bench CRASH --rounds $(n 5 2) --modes online,offline
+  P FENCE-v3 B v3 3 bench FENCE --rounds $(n 5 2)
+  P CW-v3 B v3 3 bench CW --writers 4 --seconds $(n 120 20)
+  P B1-v3 B v3 6 bench B1 $( (( SMALL )) && print -- --idle 30000)
+  P C5-bursts-v3 B v3 6 bench C5 --parts bursts --n $(n 40 4) $NOGAP
+  P C5-catchups-v3 B v3 4 bench C5 --parts catchups --catchups $(n 20 3) $NOGAP
+  P X4-v3 B v3 5 bench X4 --bodies $(n 100 10) --edits $(n 50 5)
+  P B2-v3 B v3 4 bench B2 --edits 50
+  P B3-v3 B v3 3 bench B3 --edited 20
+  P B4-v3 B v3 2 bench B4
+  P B6-v3 B v3 2 bench B6
+  P B8-v3 B v3 2 bench B8 --n $(n 20 5)
+  P B5-v3 B v3 3 b5 --no-cover --races $(n 20 2) --upload-n $(n 5 1)
+  for v in base relay v3; do P SEED-$v B $v 1 diag; done
+  for v in base relay v3; do P L2-$v A $v 3.5 bench L2 --n $(n 300 20); done
+  P L2-v3b5 A v3b5 3.5 bench L2 --n $(n 300 20) $B5C
+  P L4-v3 A v3 4.5 bench L4 --n $(n 5000 300)
+  L5F=(--n $(n 100 12) --burst-interval 125 --spacing 1500 --typing-probe)
+  P L5b1-base A base 8 l5 --mode prod,nodebounce --burst 1 $L5F
+  P L5b1-relay A relay 8 l5 --mode relay,relay250 --burst 1 $L5F
+  P L5b1-v3 A v3 8 l5 --mode relay,native --burst 1 $L5F
+  P L5b1-v3b5 A v3b5 8 l5 --mode native250,relay250 --burst 1 $L5F
+  P L5b8-v3 A v3 9 l5 --mode native,native250 --burst 8 $L5F
+  P B7-v3 A v3 2.5 bench B7 --n $(n 40 12) $( (( SMALL )) && print -- --flood-ms 10000)
+fi
+
 write_plan() {
   { print -r -- "# phase	lane	variant	est_min	kind	args"
     for id in $ORDER_B $ORDER_A; do print -r -- "$id	${LANE[$id]}	${SPEC[$id]}	${EST[$id]}	${KIND[$id]}	${ARGS[$id]}"; done
@@ -222,13 +268,13 @@ deploy_args() {   # deploy_args <spec> -> --relay on|off + vars
     strict) print -r -- --relay on $STRICT_VARS;;
     lean0) print -r -- --relay on --var YAOS_RELAY_LEAN_ROWS=true --var YAOS_RELAY_MICROBATCH_MS=0;;
     lean50) print -r -- --relay on --var YAOS_RELAY_LEAN_ROWS=true --var YAOS_RELAY_MICROBATCH_MS=50;;
-    v3) print -r -- --relay on $V3_VARS;;
+    v3|v3b5|v3nc) print -r -- --relay on $V3_VARS;;
     k1base) print -r -- --relay off $PRIMARY_VARS $K1_VARS;;
     k1relay) print -r -- --relay on $PRIMARY_VARS $K1_VARS;;
     *) return 1;;
   esac
 }
-adapter_of() { [[ $1 == base || $1 == k1base ]] && print base || print relay; }
+adapter_of() { [[ $1 == base || $1 == k1base ]] && print base || { [[ $1 == v3nc ]] && print relay-nocand || print relay; }; }
 
 # Fresh worker name for a phase: attempt k = number of earlier deploys of this phase + 1.
 # With --reuse-pool: the next unclaimed pool worker (atomic mkdir claim; one phase attempt per worker).

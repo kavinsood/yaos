@@ -18,6 +18,7 @@ import * as cost from "./scenarios/cost";
 import * as behaviour from "./scenarios/behaviour";
 import * as limits from "./scenarios/limits";
 import * as extra from "./scenarios/extra";
+import * as v3 from "./scenarios/v3";
 
 type Scenario = (ctx: RunCtx) => Promise<Record<string, unknown>>;
 const SCENARIOS: Record<string, Scenario> = {
@@ -26,6 +27,7 @@ const SCENARIOS: Record<string, Scenario> = {
 	B1: behaviour.B1, B2: behaviour.B2, B3: behaviour.B3, B4: behaviour.B4, B6: behaviour.B6, B7: behaviour.B7, B8: behaviour.B8,
 	X1: limits.X1, X2: limits.X2, X3: limits.X3, X4: limits.X4,
 	C2: extra.C2, C5: extra.C5, C6: extra.C6, K1: extra.K1, MB: extra.MB, CW: extra.CW,
+	CRASH: v3.CRASH, FENCE: v3.FENCE, HTTPSAVE: v3.HTTPSAVE,
 	diag: cost.diag,
 };
 
