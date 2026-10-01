@@ -1,0 +1,23 @@
+scripts/relay2/wb/bulk-rows.ts
+  s_694286f0c485ac::t_3a59d68367ad32 1-90
+tests/server/bulk-create-runtime.ts
+  s_694286f0c485ac::t_d3cf90263b6566 24,48,81-82,87-88,112,339-342,344,347-375,377-383,386-391,394-396
+tests/server/helpers/cfRowModel.ts
+  s_694286f0c485ac::t_f8b2b3aa75e7a7 1-93
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "f17b9eb7f4ea01454023bee3a40a37147b2e3938",
+  "prompts": {},
+  "sessions": {
+    "s_694286f0c485ac": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a3a172259d6cb1bf1",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
