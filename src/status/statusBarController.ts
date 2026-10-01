@@ -119,7 +119,9 @@ export function getServerReceiptStatusLabel(
 	if (receipt.serverAppliedLocalState === true && connected) {
 		label = "Receipt: server saved latest local state";
 	} else if (receipt.serverAppliedLocalState === false && connected) {
-		label = "Receipt: local state not yet received by server";
+		// Under relay group commit the server holds a frame for 0.3-1.5 s before
+		// saving it, so this state is normal and brief while typing.
+		label = "Receipt: saving latest local state…";
 	} else if (receipt.serverAppliedLocalState === false && !connected) {
 		label = "Receipt: offline — local state not yet received by server";
 	} else if (receipt.serverAppliedLocalState === true && !connected && receipt.lastServerReceiptEchoAt !== null) {

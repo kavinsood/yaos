@@ -102,7 +102,7 @@ s.check(
 );
 s.check(
 	getServerReceiptStatusLabel({ ...receiptBase, serverAppliedLocalState: false }, true)
-		=== "Receipt: local state not yet received by server",
+		=== "Receipt: saving latest local state…",
 	"connected false identifies the local state as not yet received",
 );
 s.check(
