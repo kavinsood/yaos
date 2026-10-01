@@ -1,7 +1,7 @@
 import { canonicalizeMarkdown } from "@shared/markdownCodec";
 import { splitMarkdownComponents } from "./frontmatterBoundary";
-import { mergeThreeWayText } from "./threeWayMerge";
 import type { BindDivergenceDecision } from "./editorBinding";
+import { planMarkdownAgreement } from "./markdownAgreement";
 
 /**
  * What the disk index knows about the last disk/body agreement of a path,
@@ -77,18 +77,14 @@ export class BindDivergencePolicy {
 		const baseline = await this.deps.getBaseline(input.path);
 
 		if (baseline.kind === "whole") {
-			if (editorHash === baseline.hash) return "adopt-body";
-			if (bodyHash === baseline.hash) return "adopt-editor";
-			if (baseline.content !== null) {
-				const merge = mergeThreeWayText(canonicalizeMarkdown(baseline.content), editor, body);
-				if (merge.kind === "clean") {
-					// Everything the editor changed is already in the body.
-					if (merge.content === body) return "adopt-body";
-					// Everything the body changed is already in the editor.
-					if (merge.content === editor) return "adopt-editor";
-					// Disjoint edits on both sides: both are kept in the merge.
-					return { kind: "adopt-merged", content: merge.content };
-				}
+			const plan = planMarkdownAgreement({ local: editor, body, base: baseline.content,
+				localMatchesAgreement: editorHash === baseline.hash, bodyMatchesAgreement: bodyHash === baseline.hash });
+			if (plan.kind === "agree" || plan.kind === "project-body") return "adopt-body";
+			if (plan.kind === "import-local") return "adopt-editor";
+			if (plan.kind === "merge") {
+				if (plan.merge.content === body) return "adopt-body";
+				if (plan.merge.content === editor) return "adopt-editor";
+				return { kind: "adopt-merged", content: plan.merge.content };
 			}
 			return this.preserveEditor(input.path, editor, editorHash, "bind-divergence-both-changed");
 		}
