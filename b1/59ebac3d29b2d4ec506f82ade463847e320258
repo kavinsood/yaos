@@ -1,0 +1,53 @@
+packages/server-node/src/index.ts
+  s_694286f0c485ac::t_3edfcca57a5174 8,113
+server/src/relayFlag.ts
+  s_694286f0c485ac::t_a76ae8e2d07396 29-31,163-189
+server/src/routes/auth.ts
+  s_694286f0c485ac::t_c267e66a8358a9 28,294,316-317
+server/src/routes/types.ts
+  s_694286f0c485ac::t_58dd1bbae18243 23-25
+server/src/server.ts
+  s_694286f0c485ac::t_cee139819732f0 41,182-183,350,1656
+server/src/vaultBulkCreateService.ts
+  s_694286f0c485ac::t_a4c634ea0713e6 29,31-32,38,98-99,132,145,166,203-207,216,219-225
+src/main.ts
+  s_694286f0c485ac::t_af81d1e201f9e1 932,1011
+src/onboarding/localVaultImport.ts
+  s_694286f0c485ac::t_7a549978bba9b9 11,103-104,260,263-267,401,416,424
+src/sync/bulkCreateCaps.ts
+  s_694286f0c485ac::t_5cbab1cf06677c 1-50
+src/sync/serverCapabilities.ts
+  s_694286f0c485ac::t_ce1b0feeadc3cc 20-21
+src/sync/vaultSync.ts
+  s_694286f0c485ac::t_1317b389ca0a83 83-89,492-494,500-501,575-579,585-586,682-683,1044-1048,1064,1422-1423,2181,2234,2873-2875,2907,2975,3150-3152,3154,3385-3386,3398-3415
+tests/client/bulk-create-client.ts
+  s_82d26342e78308::t_50137cb909fa07 10,181-210
+tests/conformance/fixtures/capabilities.ts
+  s_694286f0c485ac::t_0ff22c36c6a50c 10,31-32
+tests/server/server-hardening.ts
+  s_694286f0c485ac::t_67789cef7c50f5 115
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "b159ebac3d29b2d4ec506f82ade463847e320258",
+  "prompts": {},
+  "sessions": {
+    "s_694286f0c485ac": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a3a172259d6cb1bf1",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_82d26342e78308": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a34dcd41e6604fc76",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
