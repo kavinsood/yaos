@@ -1,0 +1,31 @@
+scripts/relay2/bench.ts
+  s_86bb7b752eea7d::t_6c4f484d6c6689 32
+scripts/relay2/runfast.sh
+  s_86bb7b752eea7d::t_ed9c74b6dc1c8c 176,178-190
+scripts/relay2/wb/adapters.ts
+  s_86bb7b752eea7d::t_770925defdc893 329-358
+scripts/relay2/wb/realClient.ts
+  s_86bb7b752eea7d::t_0664410229a27d 211-216,218-223
+scripts/relay2/wb/realScenarios.ts
+  s_86bb7b752eea7d::t_3fc6b1add7bdd1 187-196,334-339,380-389,398,427-430,432,441-442,484-485,492-495,498-501,506-518,573
+scripts/relay2/wb/scenarios.ts
+  s_86bb7b752eea7d::t_9ac30460ede2b9 4,12,14,25,556,747-810
+scripts/relay2/wb/selftest.ts
+  s_86bb7b752eea7d::t_b87deaa12b1396 12-15,17,153-170
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "4f36c9e35e59459abb5d6d05ac4cf58ac6b99862",
+  "prompts": {},
+  "sessions": {
+    "s_86bb7b752eea7d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a19062f3ba3d813cf",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
