@@ -1,0 +1,27 @@
+src/main.ts
+  s_2bc1830cee836b::t_e6216fcc1f9a95 149,1045,2873,2877-2884
+src/status/statusBarController.ts
+  s_2bc1830cee836b::t_2843c91d43fdb5 5,32,92-96,155,164,175-176
+src/sync/dailyLimit.ts
+  s_2bc1830cee836b::t_de4e902c3f0b77 1-116
+src/sync/vaultSync.ts
+  s_2bc1830cee836b::t_3bd599fb01559a 82,364,595-600,832-836,1007-1009,1349-1351,1385-1386,1391,1398,4821-4822,4888-4907,4909
+tests/client/daily-limit.ts
+  s_2bc1830cee836b::t_4fd59bc1697eae 1-305
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "fef2127ae005ce3d0932b93c4a48121acaedb4cf",
+  "prompts": {},
+  "sessions": {
+    "s_2bc1830cee836b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ada6157df203a32a9",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
