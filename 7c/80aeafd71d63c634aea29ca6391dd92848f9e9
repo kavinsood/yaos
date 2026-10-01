@@ -1,0 +1,35 @@
+src/sync/fencedWebSocket.ts
+  s_82d26342e78308::t_fad78b5962b464 11-12,34-35,57,62-68,70,82-83,93
+src/sync/relayReceipts.ts
+  s_82d26342e78308::t_bdd242417e6be8 1-486
+src/sync/vaultSync.ts
+  s_694286f0c485ac::t_d609fc577b21af 83,625-631,682-688,763-782,1433-1434,3968-3970,3973,3979-3985,4148-4155,4260,4417-4425,4427-4430,4485-4486,4514,4675,5649-5653,5656,5680,5709-5803,5812-5814,6453-6454
+tests/client/relay-receipts.ts
+  s_694286f0c485ac::t_e3cd8208910f87 1-311
+tests/server/relay-client-receipts.ts
+  s_82d26342e78308::t_e4a5a0b350c781 1-444
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "7c80aeafd71d63c634aea29ca6391dd92848f9e9",
+  "prompts": {},
+  "sessions": {
+    "s_694286f0c485ac": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a3a172259d6cb1bf1",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_82d26342e78308": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a34dcd41e6604fc76",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
