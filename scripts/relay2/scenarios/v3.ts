@@ -147,14 +147,14 @@ async function crashRound(ctx: RunCtx, mode: string, r: number, attempt: number)
 /**
  * FENCE `--rounds 5`: cumulative-ack safety. Variant toolarge: 3 small frames, one frame over the durable value
  * limit (close 1009), 3 small frames, all in one tick (they reach the server before the close takes effect).
- * Variant rate: 80 × 32 KiB frames in one tick (2.6 MB, over the 1.75 MB burst → 1013). Pass = no frame sent after the
+ * Variant rate: `--rate-frames` (default 80) × 32 KiB frames in one tick (2.6 MB, over the 1.75 MB burst → 1013). Pass = no frame sent after the
  * refused one is acked (ackPrefix), none of them is durable, and the frames before it are durable (their acks may
  * be lost with the closed socket: group commit acks after the close, the client resends on reconnect).
  */
 export async function FENCE(ctx: RunCtx): Promise<Result> {
 	const rounds = ctx.num("rounds", 5);
 	const out: Result[] = [];
-	for (const variant of ["toolarge", "rate"]) {
+	for (const variant of (ctx.str("variants", "toolarge,rate") ?? "toolarge,rate").split(",")) {
 		for (let r = 0; r < rounds; r++) {
 			const body = await note(ctx, `fence-${variant}${r}`, 1024);
 			const a = await ctx.client("A", body);
@@ -179,7 +179,7 @@ export async function FENCE(ctx: RunCtx): Promise<Result> {
 				for (let i = 0; i < 3; i++) push(post, postIds, (t) => t.insert(0, `q${i}`));
 			} else {
 				const chunk = "y".repeat(32 * 1024);
-				for (let i = 0; i < 80; i++) push(post, postIds, (t) => t.insert(0, `${i}:${chunk}`));
+				for (let i = 0; i < ctx.num("rate-frames", 80); i++) push(post, postIds, (t) => t.insert(0, `${i}:${chunk}`));
 			}
 			const closed = await a.waitClose(10_000);
 			await sleep(2500);   // group commit window + slack

@@ -175,6 +175,7 @@ if [[ $PLAN == v3 ]]; then
   P C4-v3b5 B v3b5 3 bench C4 --n $(n 50 10) --reconnects 0 $B5C
   P CRASH-v3 B v3 5 bench CRASH --rounds $(n 5 2) --modes online,offline
   P FENCE-v3 B v3 3 bench FENCE --rounds $(n 5 2)
+  P FENCE2-v3 B v3 3 bench FENCE --rounds $(n 5 2) --variants rate --rate-frames 200
   P CW-v3 B v3 3 bench CW --writers 4 --seconds $(n 120 20)
   P B1-v3 B v3 6 bench B1 $( (( SMALL )) && print -- --idle 30000)
   P C5-bursts-v3 B v3 6 bench C5 --parts bursts --n $(n 40 4) $NOGAP
