@@ -1,0 +1,27 @@
+scripts/relay2/wb/plan-compare.ts
+  s_694286f0c485ac::t_d4f0c0035bb4df 1-60
+scripts/relay2/wb/sql-capture.mjs
+  s_694286f0c485ac::t_f49dea9f6cf4c7 1-24
+server/src/vaultDocumentStore.ts
+  s_694286f0c485ac::t_3571307d728090 456-466,511,528,544,632,810,1003-1021
+tests/server/helpers/planCompare.ts
+  s_694286f0c485ac::t_a5e67c593f5281 1-80
+tests/server/wb-int-bulk.ts
+  s_694286f0c485ac::t_e124168b277b9f 1-323
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "38865c2c95354cc61fed4cc60e01be85cab67340",
+  "prompts": {},
+  "sessions": {
+    "s_694286f0c485ac": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a3a172259d6cb1bf1",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
