@@ -1,13 +1,14 @@
 # RFC: Relay Markdown body updates
 
-Status: **draft** (relay v2 spike, branch `relay-v2-spike`, base `5dd32f3`). Sections 1, 2, 8, 9 and 14 still
-contain `<<MEASURED: …>>` placeholders. Each one names the full-n scenario id that fills it (raw output:
-`experiments/results/relay2/raw/<id>.json`). All other sections are complete.
+Status: **final** (relay v2 spike, branch `relay-v2-spike`, base `5dd32f3`), 2026-10-01. All measured values come
+from the full run, tag **f1001** (raw output: `experiments/logs/relay2/runall-f1001/raw/<id>.json`; tables in
+`experiments/results/relay2/RESULTS.md`, report in `REPORT.md`). Each cell names its scenario id and n.
 
 What this RFC describes:
 - The server implementation as committed through `7feae39` (round 4) on 2026-10-01. Earlier rounds: `20e0e34`/`e1abb36`
   (round 1), `54cee51` (round 2), `4cdc37e` (round 3). Harness: `35b2882`, `276c16c`, `66fb78c`. Nothing described
-  here is uncommitted. The earlier "(WIP)" marks are gone.
+  here is uncommitted. The earlier "(WIP)" marks are gone. The full run used harness SHAs `d929410` (lane B, fresh
+  `yaos-relay2-f1001-*` workers), `45f3705` (reused phases) and `35e8b06`; the server code is identical in all three.
 - Full-run configurations (`scripts/relay2/runall.sh`):
   - **relay** (the v2 candidate) = `YAOS_RELAY_BODIES=true` + `YAOS_RELAY_LEAN_ROWS=true` + `YAOS_RELAY_MICROBATCH_MS=10`
   - **relay-strict** = relay on, lean off, mb 0. This is the per-frame transaction variant, run for L2, L4, C1, C2,
@@ -22,33 +23,49 @@ Evidence labels:
 - **measured**: taken on a deployed Worker or in a local run, with n and the scenario ID.
 - **inferred**: derived from measurements through a stated model.
 - **code**: read from `server/src`.
+- **smoke**: small n (v0930 = `8e194a4` default rows; w0930 = `276c16c` primary configs). Directional only.
+
+Full-run concurrency labels (RESULTS.md run index):
+- **[serial]**: L1, L2 ×3, L3 ×2, L4-strict.
+- **[conc]**: run concurrently, each on its own worker/DO (user-approved): L4-base/relay, L5 ×4, L6 ×2, L7 ×2.
+- **[B∥10]**: lane B, non-latency phases, 10 in parallel (C1, C2, C4, C5, X1, X3, X4, K1, MB).
+- **[serial-after]**: B7 ×3 and X2 ×3, after everything else.
 
 ## 1. Summary and recommendation
 
-<<MEASURED: final recommendation after L1–L7, C1–C6, B1–B8, X1–X4, K1–K3 at full n (all ids in raw/)>>
+**Recommendation: GO-WITH-CONDITIONS.** Ship relay bodies behind `YAOS_RELAY_BODIES`, configured as lean rows +
+mb 10. Basis: full run f1001, L1–L7, C1–C6, B1–B8, CW, X1–X4, K1 deployed at full n, plus K2/K3 local (section 8).
 
-Draft position, based on small-n and component evidence: **go with conditions**.
+Conditions:
+1. **Lean rows are mandatory.** Strict (lean off, mb 0) is 107–119% of the Free rows/day budget on a typical day
+   (inferred, costmodel runs B/D, section 9). Relay lean + mb 10 is 53–73%.
+2. **Fix or explain the relay p99 tails before default-on.** L4-relay p99 was 2,305 ms (measured, n = 4,990, [conc]),
+   C2-quick-relay propagation p99 9,132 ms (measured, n = 5,000, max-rate, [B∥10]), and the checkpoint alarm reached
+   p99 1.04 s CPU on a 50k-edit body (measured, C2-stress-relay). Cause open; the likely suspect is the alarm.
+3. Socket-ack receipts in `VaultSync` (section 11, phase 2).
+4. Decide reset starvation (G9/R2) before reset ships.
+5. Add receiving-side validation (R7).
 
-1. On the propagation path the relay is at or near the network floor.
-   - Small-n L2 p50 (measured, scratch / scratch-3, n = 30): relay 90 ms, base 412 ms.
-   - Small-n MB smoke (measured, v0930): at mb10, propagation p50/p90 is 65/74 ms (l2) and 62/68 ms (burst), against
-     base 310/403 and 301/413.
-   - The relay path also survives hibernation and scales past the base 32-socket cap.
-2. Conditions:
-   - Write amplification fits the Workers Free rows-written budget (section 9). Lean rows cut the per-append cost to
-     3 CF rows (plain) or 5 (candidate), measured on corelean-1. The typical-day model then sits at 47–65% of
-     100k/day (inferred). It is 85% if the smoke per-edit rows (7.26) hold at full n.
-   - The feed-floor gap G1 is fixed (round 3) and measured in the unit suite. Full-n confirmation comes from K1 and
-     `C2-stress-relay` table counts.
-   - The unenveloped-client lazy-hash path (G4) has its bounds proven. It is capped at 3 MiB, with a 256-body
-     lazy-hash cache.
-   - Socket-ack receipts are integrated into `VaultSync` (section 11, phase 2).
-   - The micro-batch default is mb 5–10 (round 4). Strict mb 0 has 0.4–2 s p90 tails behind the checkpoint alarm.
-3. Semantic reset moves to clients under a lease. That is a prerequisite for large notes, because only clients can
+Basis (all measured, full n):
+- **Propagation:** 4.67× faster at p50 (L2 308 → 66.0 ms, n = 290, [serial]) with a better p99 (608 → 314 ms).
+  Reversal condition 1 is not triggered.
+- **Receipts:** edit → cleared receipt 6.2× faster (L5b1 prod 480 → 77.0 ms p50, n = 90, [conc]).
+- **Sockets:** no 32-socket cap (X1-relay 2,000/2,000, highest step tested; base 429 at #33).
+- **Hibernation:** the relay socket survives idle and 2 restarts; base loses all 4 sockets with 1008 (B1).
+- **Flood control:** our 1013 at 26.9 s with the bystander −1.3% (B7-relay).
+- **CPU:** relay WS CPU p99 4.6 ms vs base 30.7 ms (C2-quick, n = 5,000). Base already exceeds the 10 ms bar.
+- **Correctness:** relay convergence 9/9 (B5 20/20 races), strict 3/3, and the frame-accounting identity holds in
+  16/16 relay/strict runs.
+
+Design notes that still apply:
+1. Semantic reset moves to clients under a lease. That is a prerequisite for large notes, because only clients can
    compact past the 96 MiB Wasm cap.
-4. ywasm stays on the server, for the root document, Canvas semantic documents and the base fallback. It leaves the
+2. ywasm stays on the server, for the root document, Canvas semantic documents and the base fallback. It leaves the
    Markdown body hot path.
-5. Reversal conditions are listed in section 13.
+3. Reversal conditions are listed in section 13 with their full-n status. None of the latency, rows, correctness,
+   CPU-per-message, memory or scale conditions is triggered. Condition 3 (DO requests) is exceeded on the letter by
+   the model (typical day 1.15× base, both at 2–3% of Free) and needs explicit sign-off; condition 7's starvation
+   clause was not measured.
 
 ## 2. Problem
 
@@ -70,16 +87,21 @@ The costs below were measured before this spike.
 | Time from edit to cleared settled receipt p50 is 531 ms. The debounce accounts for 250 ms of it and the candidate POST for ≈ 280 ms | L5 baseline, D8, n = 14, scratch-2 | measured (small n) |
 | Every Worker → DO hop costs ≈ 44–47 ms; a HEAD is 4 hops at ≈ 215 ms | A2/A4 | measured |
 
-Baseline tables for this spike, flag off, same code and harness:
+Baseline tables for this spike, flag off, same code and harness (measured, full run f1001, 2026-10-01, base `5dd32f3`
++ spike flag off; deploy version ids in section 14.2):
 
-| ID | Metric | Base p50 / p90 / p99 | n | Date | Worker |
+| ID | Metric | Base p50 / p90 / p99 (ms) | n | Date (UTC) | Worker |
 |---|---|---|---|---|---|
-| L1 | ping RTT | <<MEASURED: L1-base>> | 100 | | |
-| L2 | propagation A→B, 4 KiB | <<MEASURED: L2-base>> (small n: 412 ms p50, n = 30, scratch) | 300 | | |
-| L3 | propagation, 64k chars, after the quick trace | <<MEASURED: L3-base>> | 50 + 50 | | |
-| L4 | per-frame at 25 edits/s | <<MEASURED: L4-base>> (small n: 293 / 458 ms, n = 300, scratch) | 5,000 | | |
-| L5 | edit → cleared receipt | <<MEASURED: L5b1-base / L5b8-base, modes prod + nodebounce>> (small n: prod 531 ms, nodebounce 277 ms, n = 14, scratch-2) | 100 | | |
-| C1 | CPU per keystroke, small / heavy | <<MEASURED: C1-base>> | ≥ 40 each | | |
+| L1 | ping RTT | 50.0 / 53.9 / 247 [serial] | 90 | 2026-10-01 15:12 | `yaos-relay2-v1001-c1-relay` (reused, fresh vault) |
+| L2 | propagation A→B, 4 KiB | 308 / 334 / 608 [serial] (small n was 412 p50, n = 30) | 290 | 2026-10-01 15:13 | `yaos-relay2-v1001-c1-strict` (reused) |
+| L3 | propagation, 64k chars, before / after the quick trace | before 304 / 322 / 614; after 340 / 349 / 356; trace replay per frame 261 / 366 / 597 [serial] | 40 + 40 (+ 5,000) | 2026-10-01 15:22 | `yaos-relay2-v1001-c2-stress-base` (reused) |
+| L4 | per-frame at 25 edits/s | 213 / 313 / 543 [conc] (small n was 293 / 458) | 4,990 | 2026-10-01 15:29 | `yaos-relay2-v1001-l1-relay` (reused) |
+| L5 | edit → cleared receipt, 1-edit burst | prod 480 / 553; nodebounce 237 / 326 [conc]. 8-edit burst first / last: prod 1,356 / 475, nodebounce 1,165 / 280 | 90 per mode | 2026-10-01 15:29 | `yaos-relay2-v1001-c5-{bursts,catchups}-base` (reused) |
+| C1 | propagation small / heavy; WS CPU per invocation | 303 / 385 ms p50; WS CPU p50 / p90 / p99 1.36 / 2.27 / **64.3 ms** (5,101 invocations, gql) [B∥10] | 40 each | 2026-10-01 13:48 | `yaos-relay2-f1001-c1-base` |
+
+Reused workers: 40 phases ran on idle `yaos-relay2-v1001-*` workers with fresh vaults because of the account's
+500-DO-namespace cap (test-environment note, section 12). Worker names on reused workers are historical; the
+variant comes from the deployed vars, recorded per run.
 
 The base suites pass on the base SHA (measured, `base-tests.md`):
 - `test:regressions`: 179/179 suites, 3,135 assertions, 59 s
@@ -325,8 +347,11 @@ the frame-0 attribution row and the per-append catalog event.
 - The base `writeLiveCheckpoint` path routes relay bodies to the same function.
 - **Alarm cost and mb 0 tails** (round 4, deployed small n): a pass is about 60 ms CPU, with 0.5–4 s wall time
   deployed. At mb 0 each frame is its own transaction plus an output-gate flush, and frames queue behind the alarm.
-  That is the source of the 0.4–2 s p90 at mb 0 against about 68 ms at mb 10 (MB smoke, v0930). Full-n:
-  `MB-relay-{lean,full}-mb{0,10,50,100,250}`.
+  That is the source of the 0.4–2 s p90 at mb 0 against about 68 ms at mb 10 (MB smoke, v0930). Full n (measured,
+  MB sweep, section 8.1): stream p90 / p99 lean mb 0 92.9 / 416 vs lean mb 10 80.6 / 316 ms.
+- **Alarm CPU grows with body history** (measured, full run): relay alarm p99 59 ms (C1), 108 ms (C2-quick) and
+  **1,041 ms** (C2-stress, 50k edits); strict up to 817 ms. Under the 30 s DO limit, but the output gate waits behind
+  it. Open (R9).
 
 ### 4.7 Receipts
 
@@ -468,14 +493,14 @@ Errors: 409 for `lease_invalid`, `lease_expired`, `epoch_mismatch`, `head_advanc
 | 2 | Every append has exactly one vault sequence, and the feed returns it after the cursor. | Default: `vault_clock` is bumped in the same transaction as the journal insert. Lean: the sequence is `MAX(clock, journal max) + 1` inside the transaction, and the clock is synced before any journal delete. The sequence is the journal PK. | `relayBodyStore.ts` `appendRelayBodyUpdate`; `syncLeanClock` | A reset uses one sequence too. Feed retention is 1,000 sequences (G1 fixed, round 3). In lean mode the catalog delta feed lags by ≤ 2 s. |
 | 3 | A returned receipt means the bytes are durable. | The origin ack is sent after `transactionSync`. A dedupe re-ack reads a committed receipt row. A no-op ack means the bytes are already contained in durable state. | `commitFrames`, `ackOrigin`, `ackNoop` | The incremental-SV no-op for large bodies only matches identical bytes, which is safe. |
 | 3a (round 4) | No frame is dropped silently. Every non-empty update frame ends appended, acked as a justified no-op or dedupe, or with the socket closed. | Outcome counters satisfy the frame-accounting identity (4.3). Pre-append throws close 1011. | `relayBodies.ts` `failFrames`; `vaultSocketService.ts` `relayMessage` | Covered by a random-interleaving test at mb 0 and mb > 0, and checked on full-n diagnostics deltas. |
-| 4 | A revoked device's frames after the fence sequence are never appended. | Sockets are closed with 4403 on revoke. `validateActorCached` runs on every frame, on step1 (G6), and again at micro-batch flush (G2). `authorityVersion` is bumped synchronously by the writer. The 5 s TTL applies only to cross-isolate changes. | `closeDevice`; `validateActorCached`; `commitFrames` | G2, G6 and G19 fixed in round 3. Full-n: `B4-{base,relay}`. |
+| 4 | A revoked device's frames after the fence sequence are never appended. | Sockets are closed with 4403 on revoke. `validateActorCached` runs on every frame, on step1 (G6), and again at micro-batch flush (G2). `authorityVersion` is bumped synchronously by the writer. The 5 s TTL applies only to cross-isolate changes. | `closeDevice`; `validateActorCached`; `commitFrames` | G2, G6 and G19 fixed in round 3. Full n: B4-relay 4403 after 164 ms, 0 appends after (measured). |
 | 5 | Old-epoch frames are never appended after an epoch bump. | Ticket epoch at accept. Head epoch before commit, per (body, epoch) batch. `expectedEpoch` inside the transaction. Reset flushes pending batches and then `fenceSemanticEpoch` closes old sockets. | `commitFrames`; `appendRelayBodyUpdate`; `handleSemanticReset` | G3 fixed (round 3). |
 | 6 | Flag off means baseline behaviour. | Every relay branch is gated on `this.relay !== null` / `relayBodiesEnabled`. | `server.ts`, `vaultSocketService.ts`, `bootstrap.ts` | Measured (`flag-tests.md`). Round 4 flag-off: 3,635 assertions pass, 0 new failures. Round 1: 199/199 steps. |
-| 7 (D6) | A catalog content hash is recorded only if the claimant's SV equals the merged SV after the append, and that SV is exact. | `stateVectorsEqual(envelope.stateVector, nextStateVector) && stateVectorExact`. Otherwise NULL. | `commitFrames` | G8 fixed (round 3): bodies over 256 KiB never accept a claim. The hash is still unverified client data (G10). Measured CW: 21/21 relay (20 materialised, 1 known), 21/21 base (small n, v0930). Full-n: `CW-{base,relay}`. |
-| 8 (added) | Idempotent retries: one append per (device, candidateId), always with the same receipt. | Receipt lookup after the authority check (G7). In-batch duplicate detection (G11). `ON CONFLICT DO NOTHING` inside the transaction. | `handleSyncFrame`; `appendRelayBodyUpdate` | G7 and G11 fixed. In lean mode a candidate resend older than about 1,000 sequences and its receipt is re-appended, which is a CRDT no-op on the exact path. Full-n: `B6-{base,relay}`. |
+| 7 (D6) | A catalog content hash is recorded only if the claimant's SV equals the merged SV after the append, and that SV is exact. | `stateVectorsEqual(envelope.stateVector, nextStateVector) && stateVectorExact`. Otherwise NULL. | `commitFrames` | G8 fixed (round 3): bodies over 256 KiB never accept a claim. The hash is still unverified client data (G10). Smoke CW: 21/21 relay, 21/21 base (v0930). Full n (measured): CW-relay 119/119 (104 materialised, 15 known), CW-base 121/121. The X3-relay "VIOLATED" is a `checks.ts` artifact (empty-string header treated as a claim). |
+| 8 (added) | Idempotent retries: one append per (device, candidateId), always with the same receipt. | Receipt lookup after the authority check (G7). In-batch duplicate detection (G11). `ON CONFLICT DO NOTHING` inside the transaction. | `handleSyncFrame`; `appendRelayBodyUpdate` | G7 and G11 fixed. In lean mode a candidate resend older than about 1,000 sequences and its receipt is re-appended, which is a CRDT no-op on the exact path. Full n (measured): B6-relay appendsDelta 1, dedupeHits 3, same receipt. |
 | 9 (added) | The server never calls into Wasm with more than the merge budget of input. | `durableMergedBytes(…, maxMergeInputBytes)` throws `RelayMergeBudgetError` before merging. The lazy hash is capped at 3 MiB, and partial checkpoint prefixes are bounded (G20). A ywasm OOM trap poisons the instance, so the refusal happens before the call. | `durableMergedBytes`; `bodyHttpState`; `checkpointBody` | G5 fixed: `syncDocumentCache` no longer applies updates. |
-| 10 (added) | A checkpoint never loses a journal row. Journal rows are deleted only in the same transaction that writes a checkpoint covering them, and never above the feed floor. | `persistCheckpoint` deletes `≤ min(through, journalFloor())` inside the checkpoint transaction. The floor advances only in `runCheckpointPass`, and stays below every pin. | `persistCheckpoint`; `runCheckpointPass` | G1 fixed. Measured locally: 5,000 appends leave 1,001 rows. Full-n: K1 rows before and after, plus `C2-stress-relay` table counts. |
-| 11 (added) | At most one semantic reset per epoch. | Lease upsert is one transaction. Reset requires the lease, an epoch CAS, the exact head sequence, and a head CAS inside `semanticResetFromEncodedState`. | `acquireLease`, `semanticReset` | Measured: B5 6/6, exactly one install per race (e1abb36). Full-n: `B5-relay`. |
+| 10 (added) | A checkpoint never loses a journal row. Journal rows are deleted only in the same transaction that writes a checkpoint covering them, and never above the feed floor. | `persistCheckpoint` deletes `≤ min(through, journalFloor())` inside the checkpoint transaction. The floor advances only in `runCheckpointPass`, and stays below every pin. | `persistCheckpoint`; `runCheckpointPass` | G1 fixed. Measured locally: 5,000 appends leave 1,001 rows. Full n (measured): K1-compact-relay → 0 log rows; C2-stress relay/strict converge at 50k. Per-body journal row counts after the stress trace: not reported in the full-run tables. |
+| 11 (added) | At most one semantic reset per epoch. | Lease upsert is one transaction. Reset requires the lease, an epoch CAS, the exact head sequence, and a head CAS inside `semanticResetFromEncodedState`. | `acquireLease`, `semanticReset` | Measured: B5 6/6 (e1abb36); full n B5-relay 20/20, exactly one install per race. |
 
 ## 7. Failure modes
 
@@ -483,23 +508,25 @@ Errors: 409 for `lease_invalid`, `lease_expired`, `epoch_mismatch`, `head_advanc
 |---|---|---|
 | **A client bug writes bad bytes** (malformed or structurally wrong Yjs, bad frontmatter root) | The server does not parse structure on the hot path, so it appends any update of 1.75 MB or less. Malformed bytes can make the next `mergeUpdates` or `diffUpdate` throw. That means step1, checkpoint or HTTP read failures for that body only. The error is caught per body, the alarm re-arms, and the body stays checkpoint plus tail. Semantically wrong but valid updates, such as a bad frontmatter shape, propagate to peers. Receiving-client validation (owned elsewhere) must refuse to write them to disk and surface a conflict. Recovery: a client semantic reset from good text (lease) replaces the lineage, and the history is kept per retention and pins. | Until receiving-side validation ships, relay mode loses today's server-side frontmatter/root-shape gate. The failure is per body and does not spread to the vault. There is no poison-pill quarantine yet (open question Q3). |
 | **The lease holder dies** | The lease expires after its TTL (120 s default). No state changed, because reset is a single transaction at install. Another device can acquire the lease after expiry. The holder can release early. | Fixed in round 3 (G19): revocation and fencing delete the holder's lease rows, and the actor is re-validated inside lease and reset. |
-| **Two resets race** | The lease upsert serialises them: the second device gets 409 `held`. If a lease expires mid-upload (B5: 5 MB upload at 115.7 s), `lease_expired` rejects the install. At install, the epoch CAS plus `coveredSequence == latest_sequence` plus the head CAS let exactly one win. The losers' sockets get 4409 and they rebase. | Measured B5: 6/6, alternating winners. Starvation risk: R2. |
+| **Two resets race** | The lease upsert serialises them: the second device gets 409 `held`. If a lease expires mid-upload (B5: 5 MB upload at 115.7 s), `lease_expired` rejects the install. At install, the epoch CAS plus `coveredSequence == latest_sequence` plus the head CAS let exactly one win. The losers' sockets get 4409 and they rebase. | Measured B5: 6/6 (component), and 20/20 at full n (B5-relay), alternating winners, one install per race. Starvation risk: R2 (not measured). |
 | **DO crash mid-append** | `transactionSync` is atomic: either all rows (clock, journal, attribution, head, catalog, receipt) or none. No ack or broadcast happens before commit. On crash the socket drops, the client reconnects and resends (step2), and the growth cap or receipt deduplicates. | An in-memory micro-batch (≤ 250 ms, recommended 10 ms) is lost, but it was never acked. The client resends unacked frames. |
 | **DO crash mid-checkpoint** | `persistCheckpoint` is one transaction: chunks, manifest, journal deletes and prune together. After a crash either the old checkpoint plus the full tail remains, or the new checkpoint with the tail pruned. The alarm re-runs. A partial checkpoint (≤ 200 rows) is itself a complete, consistent checkpoint through its sequence. | none found |
 | **Log growth while all devices are offline** | Without appends no alarm is armed, so nothing grows. With one writer and no readers, each append arms the checkpoint at 50 rows or 1 MiB, so the merged snapshot stays bounded by live size plus tombstones. Journal rows below the checkpoint are deleted only up to the feed floor. | G1 fixed in round 3: `runCheckpointPass` advances the floor to `current − 1000`, below every pin. Over-budget bodies (> 9 MiB merged input) are never checkpointed until a client reset. Their marker is persisted (G20). Full-n check: K1 and `C2-stress-relay` table counts. |
 | **Mobile-only vault** | The routine checkpoint is server-side, so no client is needed. Reset is feasible on phones: K2 inferred 48–586 ms build, duty-cycle bound 1.7 s p50 for 5 MB. Upload speed is the constraint. Before round 2, B5's JSON 5 MB upload took 5–116 s. After round 2, a binary 5.24 MB reset takes 1.7–3.3 s from a desktop (core3, n = 4), with no growth across iterations. The lease TTL (≤ 600 s) and the octet-stream upload (which avoids the 33% base64 overhead) matter here. | The exact-head CAS combined with a slow mobile upload on a hot note is R2. |
-| **Hibernation** | Relay attachments keep the admission `runtimeEpoch` and are exempt from the mismatch close. The merged cache rebuilds from SQL on the first frame. Measured small-n B1: the socket survives idle plus simulate-restart, with the edit propagated at 309 ms; base gets 1008 plus a ≈ 1.33 s reconnect. | Lost on wake: pending envelopes (G13, memory-only by design and documented as a deviation; the next echo is unenveloped), rate buckets (they refill), and the micro-batch queue (unacked, so it is resent). |
+| **Hibernation** | Relay attachments keep the admission `runtimeEpoch` and are exempt from the mismatch close. The merged cache rebuilds from SQL on the first frame. Measured full-n B1: the relay socket survives 150 s idle plus 2 restarts (afterIdle 118 ms, afterRestart2 71.9 ms); base loses all 4 sockets with 1008 "socket authority mismatch". | Lost on wake: pending envelopes (G13, memory-only by design and documented as a deviation; the next echo is unenveloped), rate buckets (they refill), and the micro-batch queue (unacked, so it is resent). |
 | **Revoked device with an offline queue** | On reconnect the ticket issue fails, because the control plane rejects the revoked credential. If a socket survived, the first frame fails `validateActorCached` with 4403. Queued edits never append. Attribution rows record device and credential revision for anything appended before the revocation. | The revoked user's local edits stay local by design. G7 fixed in round 3: authority now runs before dedupe, so there is no receipt re-ack for a revoked device. |
 | **Transport loss mid-stream / DO stall** (round 4 smoke data-loss finding) | Root cause in smoke mb0, worker v0930: the transport/platform plus harness behaviour. Server merge logic was not involved.<br>• l2: the DO stalled (alarm `internalError` after 27 s wall, 2 hibernation `internalError`s). Both sockets died about 49 s into a 60 s drain. All 61 edits were durable, but the raw harness client never reconnected, so B missed #37–60.<br>• burst: the sender's socket ended `clientDisconnected` about 38 s in. The raw client silently skipped sends while the socket was not OPEN, so 27 tail frames never reached the server.<br>Repros were clean, and the keystroke fuzz (n = 61 / 241 / 2,000) was clean. A real client must reconnect, re-sync with step1, and resend unacked frames. The harness now does all three (35b2882). | Server side: one latent silent drop was found and fixed (4.3, `frameErrors`). Client side: `VaultSync` integration must keep resending until it receives a receipt (phase 2). |
-| **Platform overload** (`1013 Service overloaded`) | Cloudflare sheds the connection when the DO queue or CPU saturates. Seen once in K1 at mb 0 under a flood. The server never sees it, so no counter moves. | Mitigated by micro-batching (fewer transactions and output-gate flushes). Clients treat it as a reconnect and resend. Full-n: `B7-*`, `X2-*`. |
+| **Platform overload** (`1013 Service overloaded`) | Cloudflare sheds the connection when the DO queue or CPU saturates. Seen once in K1 at mb 0 under a flood. The server never sees it, so no counter moves. | Mitigated by micro-batching (fewer transactions and output-gate flushes). Clients treat it as a reconnect and resend. Full n: recurred at X2-strict 400/s on 1 body (1 reconnect, 1,520 frames resent); B7 closes were our own `relay rate limit`. |
 | **Malicious member** (valid credential, hostile client) | Rate limit (1013) and frame cap bound flooding. A malicious member can: append arbitrary valid Yjs, which propagates, just as with base once server validation is gone; claim false content hashes that equal the merged SV (the server cannot verify, G10), poisoning catalog hashes and currentness until the next honest claim; take the lease and install a reset with arbitrary text (the history is kept per retention; the reset is attributable); and hold leases to block resets. | Same trust model as today for members: members can write content. Hash poisoning (G10) is new: today the server computes hashes. Mitigation options: receiving clients verify hashes and report mismatches; the server re-hashes on the lazy path whenever a hash is disputed. |
 
 ## 8. Measurements
 
-Dates, Workers, deploy version IDs and spike SHAs come from each run's JSON metadata. Full-n raw output is
-`experiments/results/relay2/raw/<scenario-id>.json`; the index is in section 14. "Base" means the same branch and the
-same vars with the flag off. Each placeholder names the scenario id that fills it. "relay" means lean + mb 10, and
-"strict" means lean off + mb 0.
+Dates, Workers, deploy version IDs and spike SHAs come from each run's JSON metadata (full run f1001, 2026-10-01;
+lane B 13:37–13:58 UTC, reused phases from 15:07 UTC). Full-n raw output is
+`experiments/logs/relay2/runall-f1001/raw/<scenario-id>.json`; the index is in section 14. "Base" means the same branch
+and the same vars with the flag off. "relay" means lean + mb 10, and "strict" means lean off + mb 0. Every full-n cell
+is **measured** unless labelled otherwise; latency n excludes 10 discarded warm-up samples. Concurrency labels are
+defined at the top of this document.
 
 Small-n values marked "smoke" come from v0930 (`8e194a4`, default rows) or w0930 (`276c16c`, primary configs). They
 are directional only.
@@ -508,13 +535,14 @@ are directional only.
 
 | ID | Metric | Base p50 / p90 / p99 | Relay p50 / p90 / p99 | Strict p50 / p90 / p99 | n | Notes |
 |---|---|---|---|---|---|---|
-| L1 | ping RTT | <<MEASURED: L1-base>> | <<MEASURED: L1-relay>> | — | 100 | floor; v1 45.4 / 50.1 ms (A5) |
-| L2 | propagation (+ origin ack) | <<MEASURED: L2-base>> | <<MEASURED: L2-relay>> | <<MEASURED: L2-strict>> | 300 | small n: 412 vs 90 ms p50 (scratch / scratch-3, n = 30). MB smoke l2 mb10: 65 / 74 vs base 310 / 403 |
-| L3 | propagation on 64k chars, before / after the quick trace | <<MEASURED: L3-base>> | <<MEASURED: L3-relay>> | — | 50 + 50 | v1: 302 → 318.7 vs 52 → 52.5 ms (A5) |
-| L4 | per-frame at 25 edits/s | <<MEASURED: L4-base>> | <<MEASURED: L4-relay>> | <<MEASURED: L4-strict>> | 5,000 | small n: 293 vs 116 ms p50. MB smoke burst mb10: 62 / 68 vs base 301 / 413 |
-| L5 | edit → cleared receipt (HTTP candidate vs socket ack), 1-edit and 8-edit bursts | <<MEASURED: L5b1-base, L5b8-base (prod, nodebounce)>> | <<MEASURED: L5b1-relay, L5b8-relay (relay, relay250)>> | — | 100 | small n base: prod 531 ms, nodebounce 277 ms (n = 14, D8) |
-| L6 | open → synced, cold / warm | <<MEASURED: L6-base>> | <<MEASURED: L6-relay>> | — | 100 each | |
-| L7 | HEAD/GET visible + hash matches client | <<MEASURED: L7-base>> | <<MEASURED: L7-relay>> | — | 100 | |
+| L1 | ping RTT | 50.0 / 53.9 / 247 | 50.2 / 60.2 / 115 | — | 90 | [serial]. Floor; v1 45.4 / 50.1 ms (A5) |
+| L2 | propagation (+ origin ack) | 308 / 334 / 608 (ack p50 309) | **66.0 / 100 / 314** (ack p50 65.8) | 56.2 / 115 / 333 (ack p50 56.2) | 290 | [serial]. **4.67× p50**, p99 0.52× base: target met. Strict 5.48× p50. Seq delta base 300, relay 373 (lean catalog coalescing), strict 300. v1: 300 / 572 → 51.8 / 279 (n = 200) |
+| L3 | propagation on 64k chars, before / trace replay per frame / after | 304 / 322 / 614; 261 / 366 / 597; 340 / 349 / 356 | 66.9 / 158 / 400; 71.5 / 153 / 504; 71.2 / 102 / 618 | — | 40 / 5,000 / 40 | [serial]. Relay p99 after (618) ≈ base before (614); p50 4.8× better after. v1: 302 → 318.7 vs 52 → 52.5 ms (A5) |
+| L4 | per-frame at 25 edits/s (quick trace) | 213 / 313 / 543 (max 785) | 73.7 / 532 / **2,305** (max 3,435) | 60.0 / 273 / 866 (max 2,183) | 4,990 | Base/relay **[conc]** with L5–L7; strict [serial]. Relay tails (0.3–3.4 s) recur throughout the run, including after L6/L7 ended; p50 per 250-frame window ≈ 70 ms. Same config in lane B (MB-lean-mb10-stream, n = 2,750, [B∥10]): 63.3 / 80.6 / 316. **Relay p99 tail is open** (section 12, R9). v1: 226 / 688 → 51.4 / 757 |
+| L5 | edit → cleared receipt (HTTP candidate vs socket ack), 1-edit burst p50 / p90 | prod 480 / 553; nodebounce 237 / 326 | relay **77.0 / 357**; relay250 322 / 546 | — | 90 per mode | [conc]. 6.2× vs prod. DO units/burst: base prod 1.05 (1 HTTP req), relay 0.10 (0 HTTP). relay250 shows the debounce explains most of the base gap |
+| L5 | 8-edit burst, first / last edit p50 (p90) | prod 1,356 / 475 (1,393 / 508); nodebounce 1,165 / 280 (1,309 / 416) | relay 959 / 67.7 (1,006 / 116); relay250 1,217 / 333 (1,305 / 425) | — | 90 per mode | [conc]. DO units/burst: base prod 1.40, nodebounce 5.40 (5 HTTP); relay 0.80, relay250 0.45 (0 HTTP) |
+| L6 | open → synced, cold / warm | cold 365 / 396 / 496; warm 363 / 402 / 710 | cold 362 / 393 / 451; warm 369 / 397 / 776 | — | 100 cold / 90 warm | [conc]. ≈ equal |
+| L7 | HEAD after ack; edit → HEAD shows edit | 218 / 242 / 275; **758 / 834 / 1,343** | 211 / 228 / 539; **505 / 580 / 815**; hash correct in all | — | 90 | [conc]. GET after ack: base 217 / 239 / 266, relay 214 / 233 / 307. 1.5× faster edit → visible |
 
 **Micro-batch sweep (MB).** Propagation p50 / p90 in ms, for l2, burst and stream patterns. Smoke, v0930, default rows,
 small n, measured:
@@ -528,47 +556,62 @@ small n, measured:
 | mb100 | 153 / 156 | 151 / 155 | 115 / 152 |
 | mb250 | 303 / 2343 | 187 / 309 | 189 / 305 |
 
-Full n: <<MEASURED: MB-base, MB-relay-{lean,full}-mb{0,10,50,100,250}, MB-relay-nocand-lean-mb10>>.
+Full n (measured, f1001, [B∥10]; trimmed with user approval to base, strict and lean × mb {0, 10, 50}; mb100, mb250
+and nocand were **not run at full n**, smoke values above only). n = 881 frames per burst run and 2,750 per stream run.
+Rows/edit is gql, idle-subtracted; CPU is periodic µs per edit (idle-subtracted phase µs in brackets). Every relay run
+passed the frame-accounting identity.
+
+| Config | Burst p50 / p90 / p99 | Stream p50 / p90 / p99 | Rows/edit burst / stream | CPU µs/edit burst / stream | Source |
+|---|---|---|---|---|---|
+| base | 203 / 323 / 546 | 246 / 467 / 1,046 | 5.10 / 3.10 | 2,528 (2,335) / 6,550 (6,599) | `MB-base-{burst,stream}` |
+| strict (full rows, mb 0) | 56.5 / 78 / 701 | 60.1 / 132 / 506 | 11.23 / 11.84 | 2,053 (2,306) / 3,866 (4,076) | `MB-strict-*` |
+| lean mb 0 | 66 / 116 / 539 | 54.1 / 92.9 / 416 | 5.55 / 5.95 | 1,728 (1,212) / 2,314 (2,054) | `MB-lean-mb0-*` |
+| **lean mb 10 (relay config)** | 63.4 / 132 / 517 | **63.3 / 80.6 / 316** | 5.54 / 5.92 | 1,979 (1,421) / 2,664 (2,422) | `MB-lean-mb10-*` |
+| lean mb 50 | 106 / 310 / 1,711 | 114 / 145 / 463 | 5.54 / 4.88 | 2,495 (2,260) / 1,528 (1,367) | `MB-lean-mb50-*` |
+
+Reading: mb 10 does not reduce rows at typing rates (5.54 vs 5.55). Its value is p99 (316 vs 416 stream) and
+output-gate smoothing. mb 50 doubles p50 and saves only ≈ 1 row/edit when streaming.
 
 ### 8.2 Server cost
 
 | ID | Metric | Base | Relay | Strict | n / source |
 |---|---|---|---|---|---|
-| C1 | CPU per keystroke, small / heavy (gql per-invocation) | <<MEASURED: C1-base>> | <<MEASURED: C1-relay>> | <<MEASURED: C1-strict>> | ≥ 40 each. v1: heavy 19 ms vs ≈ 0 ms (A5) |
-| C2 | CPU per update, quick trace; stress trace (50k edits, 5 clients) | <<MEASURED: C2-quick-base, C2-stress-base>> | <<MEASURED: C2-quick-relay, C2-stress-relay>> | <<MEASURED: C2-quick-strict, C2-stress-strict>> | gql aggregate. Smoke w0930 quick (300 frames): perUpdate CPU 2,607 / 2,348 / 1,965 µs; WS-invocation p99 11.2 / 3.2 / 2.2 ms |
-| C3 | Wasm linear memory / resident docs at 1, 8, 32, 100 bodies; 32 × 512 KiB | <<MEASURED: C3-base>> | <<MEASURED: C3-relay>> | — | v1: base 37.5 MB vs relay 1.11 MB (A5) |
-| C4 | rows written per edit / per reconnect | <<MEASURED: C4-base>> | <<MEASURED: C4-relay>> | <<MEASURED: C4-strict>> | **Component, measured:** 9 / 11 CF rows per plain / candidate append in default mode (coresmoke-1, n = 20 each), 3 / 5 in lean (corelean-1, n = 20 each). Smoke w0930 C2-quick rows per edit: base 3.03, relay 7.26, strict 13.16. Smoke C4 sequences per edit: 1 / 1.5 / 1, and per reconnect 0 / 0 / 0. |
-| C5 | DO requests per edit burst / per catch-up (20:1) | <<MEASURED: C5-base>> | <<MEASURED: C5-relay>> | — | smoke v0930 (default rows): base 1.45 / 2.0, relay 1.63 / 3.23 DO units; rows 44 / 48 vs 88 / 151 |
-| C6 | bundle raw / gzip KiB; startup ms | 2,537.10 / 610.56 KiB at base SHA (dry run, K3) | 2,652.13 / 636.21 KiB at `276c16c` (w0930 deploy; the same bundle serves every flag) | same bundle | **measured, one deploy each.** Startup: base 10 ms, relay 8 ms, strict 13 ms (w0930); v0930: 11 / 15 ms. The spike adds +115 KiB raw / +25.7 KiB gzip, of which patch 0003 is +3,358 B raw / +379 B gzip. Free limit: 3 MiB compressed. v1 relay: 2,757.68 / 651.81 KiB. Full-n record: `C6-relay`. |
+| C1 | propagation small / heavy p50; WS CPU per invocation p50 / p90 / p99 (gql); checkpoint alarm CPU p50 / p90 / p99 | 303 / 385 ms; 1.36 / 2.27 / **64.3 ms** (5,101 inv.; HTTP CPU p99 244 ms); n/a | 73.9 / 90.8 ms; 0.22 / 2.92 / 4.19 ms (10,188 inv.); alarm 3.4 / 6.8 / 59.3 ms (n = 105) | 70.1 / 60.2 ms; 0.46 / 3.74 / 5.70 ms; alarm 52 / 81 / 98 ms (n = 96) | n = 40 each, [B∥10]. Phase CPU base 18.9 s, relay 12.3 s, strict 23.0 s. Heavy prop 4.2× faster, WS p99 15× lower. Tail files matched 0/40 (R6), not used. v1: heavy 19 ms vs ≈ 0 ms (A5) |
+| C2 | quick trace (5,000 frames): WS CPU p50 / p90 / p99; µs/edit; rows/edit; propagation p50 / p99; alarm CPU | 2,077 / 16,830 / **30,697 µs** (p90 and p99 > 10 ms); 4,786 µs/edit; 3.10 rows/edit; 243 / 704 ms | 381 / — / 4,639 µs; 3,325 µs/edit; 6.20 rows/edit; 64.0 / **9,132 ms**; alarm 5.22 / 54.8 / 108 ms | 1,506 / — / 5,722 µs; 4,271 µs/edit; 12.19 rows/edit; 68.7 / 790 ms; alarm 22 / 79 / 102 ms | n = 5,000, [B∥10], max-rate lane B. Accounting PASS relay/strict. Relay propagation p99 9.1 s is open (R9). Smoke w0930 (300 frames) WS p99 was 11.2 / 3.2 / 2.2 ms |
+| C2 | stress trace (50k edits, 5 clients, max-rate replay, latency not used): WS CPU p50 / p99; µs/edit; rows/edit; alarm CPU | 1,429 / 7,342 µs; 2,181 µs/edit; 2.02 rows/edit — **provisional**: 10,226 frames only (gql window incomplete; base semantic reset at frame 10,226), not comparable | 242 / 2,829 µs; 3,375 µs/edit; 5.84 rows/edit; **alarm p90 760 / p99 1,041 ms** | 439 / 1,855 µs; 7,271 µs/edit; 13.03 rows/edit; alarm p50 445 / p99 817 ms | n = 50,000 relay/strict, [B∥10]. Accounting PASS relay/strict. Alarm CPU grows with body history (R9) |
+| C3 | Wasm linear memory / resident docs at 1, 8, 32, 100 bodies; 32 × 512 KiB | 32 resident; 1.51 MB at 32 small; **37.22 MB at 32 × 512 KiB**; the 100-small step is capped at 32 sockets (6 open failures); opens p50 / p90 570 / 712 ms | 0 resident; 1.18 MB at 100 small; **4.06 MB at 32 × 512 KiB**; 0 failures; opens 553 / 720 ms | — | steps 1/8/32/100, reused worker. 9.2× less. v1: base 37.5 MB vs relay 1.11 MB (A5) |
+| C4 | rows written per edit / per reconnect; sequences per edit (50 edits, 20 reconnects) | 3.10 rows/edit (MB/C2 gql); 0 / reconnect; 1 seq/edit; ack 321 / 414 ms | **5.00** (relay counter; 5.54–5.92 gql in MB); 0 / reconnect; 1.5 seq/edit (lean catalog events); ack 69.6 / 103 ms | **11.00** (relay counter; 11.23–11.84 gql in MB); 0 / reconnect; 1 seq/edit; ack 55.0 / 68.6 ms | n = 50 + 20, [B∥10]. Whole-phase gql rows are dominated by the seed, so the relay counter is the per-edit source. **Component, measured:** 9 / 11 CF rows per plain / candidate append in default mode (coresmoke-1, n = 20 each), 3 / 5 in lean (corelean-1, n = 20 each). Smoke w0930 C2-quick rows per edit: base 3.03, relay 7.26, strict 13.16. Smoke C4 sequences per edit: 1 / 1.5 / 1, and per reconnect 0 / 0 / 0. |
+| C5 | DO units per edit burst / per catch-up (20:1); rows per burst / catch-up | 0.51 / 1.92 units; 43.05 / 47.95 rows (phase-level idle-subtracted 0.72 / 2.28 units, 44.08 / 50 rows) | 1.88 / 3.43 units; 45.93 / 56.45 rows (phase-level 2.13 / 3.79, 46.95 / 58.50) | — | n = 40 bursts / 20 catch-ups, [B∥10]. Propagation 299 vs 65.2 ms; catch-up open 380 vs 367 ms. In absolute terms both are small (section 9: DO requests 2–3% of Free). Smoke v0930 (default rows): base 1.45 / 2.0, relay 1.63 / 3.23 DO units; rows 44 / 48 vs 88 / 151 |
+| C6 | bundle raw / gzip KiB; startup ms | 2,537.10 / 610.56 KiB at base SHA (dry run, K3) | 2,652.13 / 636.21 KiB at `276c16c` (w0930 deploy; the same bundle serves every flag) | same bundle | **measured, one deploy each.** Full run (C6-relay, deployed `45f3705`): 2,652.13 / 636.21 KiB, startup relay worker 15 ms, base worker 12 ms. Startup: base 10 ms, relay 8 ms, strict 13 ms (w0930); v0930: 11 / 15 ms. The spike adds +115 KiB raw / +25.7 KiB gzip, of which patch 0003 is +3,358 B raw / +379 B gzip. Free limit: 3 MiB compressed. v1 relay: 2,757.68 / 651.81 KiB. |
 
 ### 8.3 Behaviour
 
 | ID | Pass criteria | Base | Relay | Strict |
 |---|---|---|---|---|
-| B1 | socket survives hibernation and restart | <<MEASURED: B1-base>> (small n: 1008 + ≈ 1.33 s reconnect) | <<MEASURED: B1-relay>> (small n: survives, 309 ms) | — |
-| B2 | catch-up after 50 / 5,000 edits: time, bytes, rows scanned, text equal | <<MEASURED: B2-base>> | <<MEASURED: B2-relay>> | — |
-| B3 | bootstrap of 100 notes (20 relay-edited) | <<MEASURED: B3-base>> | <<MEASURED: B3-relay>> | — |
-| B4 | revocation mid-stream: 4403 ≤ 1 s, no append after the fence | <<MEASURED: B4-base>> | <<MEASURED: B4-relay>> | — |
-| B5 | reset race: one install, zero lost edits | n/a | **measured: 6/6 pass**, winners A, B, A, B, A, B; race p50 1,813 ms, p90 2,097 ms (`B5-2026-09-29T20-16-32-720Z.json`, yaos-relay2-reset, e1abb36). Full-n: <<MEASURED: B5-relay>> | — |
-| B6 | 3× resend → one append, same receipt | <<MEASURED: B6-base>> | <<MEASURED: B6-relay>> | — |
-| B7 | 5 MiB/s flooder → 1013; victim L2 within 20% | <<MEASURED: B7-base>> | <<MEASURED: B7-relay>> (small n: 1013, victim flat) | <<MEASURED: B7-strict>> |
-| B8 | delete with sockets open | <<MEASURED: B8-base>> | <<MEASURED: B8-relay>> | — |
-| CW | invariant #7 under concurrent writers | <<MEASURED: CW-base>> (smoke: 21/21) | <<MEASURED: CW-relay>> (smoke: 21/21; 20 materialised, 1 known) | — |
+| B1 | socket survives hibernation and restart | **lost**: after 150 s idle the runtime epoch changed and all 4 sockets closed 1008 "socket authority mismatch"; warm 298 ms (n = 1 run) | **survived** idle + 2 restarts: warm 130, afterIdle 118, second 3,633, afterRestart 1,591, afterRestart2 71.9 ms (n = 1 run) | — |
+| B2 | catch-up after 50 / 5,000 edits: time, bytes, rows scanned, text equal | pass, text equal; 50-edit p50 / p90 363 / 373 ms; 5,000-edit 394 ms, 108,892 B (n = 50 × 10 + 1) | pass, text equal; 366 / 388 ms; 5,000-edit 429 ms, 100,287 B (n = 50 × 10 + 1). Rows scanned: not measured (not recorded by the harness) | — |
+| B3 | bootstrap of 100 notes (20 relay-edited) | pass, all match; p50 / p90 1,713 / 2,394 ms (n = 3) | pass, all match; 1,936 / 2,243 ms (n = 3) | — |
+| B4 | revocation mid-stream: 4403 ≤ 1 s, no append after the fence | pass: 4403 after 182 ms, 0 appends after (n = 1) | pass: 4403 after 164 ms, 0 appends after (n = 1) | — |
+| B5 | reset race: one install, zero lost edits | n/a | **measured: 6/6 pass**, winners A, B, A, B, A, B; race p50 1,813 ms, p90 2,097 ms (`B5-2026-09-29T20-16-32-720Z.json`, yaos-relay2-reset, e1abb36). Full-n (`B5-relay`, n = 20 races): **20/20 pass**; race p50 / p90 / p99 1,384 / 1,693 / 1,964 ms; winners alternate A/B; the loser gets lease-denied `held`, then 4409, and rebases onto epoch 2; all 14 checks ok (one install, zero lost edits, GET hash matches). Uploads (n = 5 each, all installed): 100k 315 ms, 1m 958 ms, 5m 4,081 ms (request 6,765,332 B) | — |
+| B6 | 3× resend → one append, same receipt | **skipped by design**: base idempotence lives in the HTTP candidate path, and the relay candidate adapter does not apply | pass: appendsDelta 1, dedupeHits 3, same receipt; a reused candidate id with different bytes is rejected | — |
+| B7 | 5 MiB/s flooder → 1013; victim L2 within 20% | pass: no rate limit, flood achieved 5.01 MiB/s with no close; bystander p50 306 → 321 ms (+5.0%), absorbed by the 250 ms debounce | **pass**: our 1013 "relay rate limit" at 26.9 s; achieved 0.10 MiB/s; bystander 63.2 → 62.4 ms (−1.3%) | pass: 1013 "relay rate limit" at 26.3 s; 0.26 MiB/s; bystander 57.5 → 57.4 ms (−0.3%) |
+| B8 | delete with sockets open | pass: delete 666 ms; sockets 1008 "body deleted" +214 ms; reopen refused 409; GET 404 | pass: delete 673 ms; same close / 409 / 404 behaviour | — |
+| CW | invariant #7 under concurrent writers | pass: 121/121 hash claims hold (2,372 edits; smoke 21/21) | pass: **119/119** hold, 104 materialised, 15 known (2,375 edits; smoke 21/21) | — |
 
 ### 8.4 Limits
 
 | ID | Metric | Base | Relay | Strict |
 |---|---|---|---|---|
-| X1 | max concurrent body sockets (100 → 2,000) | <<MEASURED: X1-base>> (small n: 429 at #33) | <<MEASURED: X1-relay>> (small n: 100 OK) | — |
-| X2 | max sustained append rate, 1 body / 10 bodies | <<MEASURED: X2-base>> | <<MEASURED: X2-relay>> | <<MEASURED: X2-strict>> |
-| X3 | largest note for step2 and checkpoint (1 / 5 / 10 MB) | <<MEASURED: X3-base>> | <<MEASURED: X3-relay>> (smoke: 5 MB opens in 0.9–1.2 s) | — |
-| X4 | catch-up of 100 bodies × 50 edits stale | <<MEASURED: X4-base>> (A3: 676 ms) | <<MEASURED: X4-relay>> | — |
+| X1 | max concurrent body sockets (100 → 2,000) | **32**: 429 `body_socket_limit` at #33 (75 attempted, 43 failed); probe 307 / 315 ms | **2,000/2,000**, 0 failures (highest step tested; no limit found). Probe p50 / p90: 69.8 / 253 at 100, 89 / 108 at 250, 77 / 86.5 at 500, 101 / 201 at 1,000, 106 / 232 at 2,000 ms; linear memory 2.36 MB; open-all 94.7 s at 2,000 | — |
+| X2 | max sustained append rate, 1 body / 10 bodies (10 s steps; limit = propagation p50 > 2× floor) [serial-after] | criterion n/a: the 250 ms debounce keeps p50 above 2× floor (195–312 ms vs floor 50.8), so the harness reports "max 0" (artifact). Sustained 100/s on 1 and 10 bodies, 0 lost, 0 closes (p50 230 / 225 ms) | **≥ 400/s** on 1 and 10 bodies (p50 86.6 / 87.7 ms, floor 47.5). At 800/s (highest step tested): p50 122 / 113 ms, 0 loss, 0 closes | **200/s**. At 400/s on 1 body: platform 1013 "Service overloaded", p50 3,142 ms, 1 reconnect, 1,520 frames resent; 10 bodies p50 304 ms (floor 61) |
+| X3 | largest note for step2 and checkpoint (1 / 5 / 10 MB) | 1 MB ok (open ≈ 755 ms, compact 946 ms, 200); **5 MB compact HTTP 500** (164 ms). 10 MB: not measured (seed only) | 1 / 5 MB ok: open 688 / 1,124 ms; edit ack 82 / 72 ms; compact 786 / 846 ms (200). 10 MB: not measured (seed only). The convergence "fail" is a **checker artifact** (section 8.7) | — |
+| X4 | catch-up of 100 bodies × 50 edits stale | ok: HTTP catch-up 437 ms, 608,662 B; socket reopen 9,313 ms, 226,992 B (A3: 676 ms) | ok: HTTP catch-up 385 ms, 536,753 B; socket reopen 9,446 ms, 157,678 B | — |
 
 ### 8.5 Compaction
 
 | ID | Metric | Value |
 |---|---|---|
-| K1 | alarm merge at tails of 50 / 500 / 5,000: ms, memory, rows before and after | <<MEASURED: K1-compact-base, K1-compact-relay, K1-alarm-relay>>. Smoke (vault-wide compact, small n): relay 193–368 ms for tails of 50–2,000, base 515–559 ms. Local: `checkpointsFromCache` 3.3 → 1.8 ms per pass for a 30 KiB body. |
+| K1 | alarm merge at tails of 50 / 500 / 5,000: ms, memory, rows before and after | **Compact (measured, n = 3 per tail, [B∥10]):** base 362 / 556 / 555 ms; relay 220 / 213 / 226 ms, log rows go to 0 afterwards. **Alarm (`K1-alarm-relay`): inconclusive** — the alarm had already checkpointed during the appends (lastCheckpointMs 0 at < 1 ms resolution; log rows 14–21 before = after; 0 checkpoint rows written). Real alarm cost is taken from C1/C2 alarm CPU instead: p99 59 ms (C1), 108 ms (C2-quick), 1,041 ms (C2-stress, 50k history). Memory per alarm: not measured. Smoke (vault-wide compact, small n): relay 193–368 ms for tails of 50–2,000, base 515–559 ms. Local: `checkpointsFromCache` 3.3 → 1.8 ms per pass for a 30 KiB body. |
 | K2 | reset build, desktop lease path p50 / p90 (measured, n = 10, M4 Pro, Node v26.5, fd38e71) | 100k: 12.1 / 12.8 ms. 1m: 25.9 / 26.3 ms. 5m: 97.7 / 104 ms. stress: 13.6 / 14.2 ms. Duty-cycle worker (measured): 1m at duty 25 is 166 / 205 ms and at duty 17 is 469 / 605 ms; 5m at duty 25 is 610 / 1,052 ms and at duty 17 is 1,742 / 2,667 ms. Mobile ×4–6 (**inferred**): 1m 103–155 ms, 5m 391–586 ms. Upload ≈ live size + 120 B. 5m peak heap 176 MiB. A 5m server-side reset traps (`prepareSemanticReset`, 96 MiB cap). |
 | K2-upload | deployed reset upload | Pre-round-2 JSON (B5, measured): 100k p50 395 ms (n = 5, lease p50 284 ms, 134,071 B); 1m p50 1.08 s; 5m 5.0 → 20.9 s, then `lease_expired` at 115.7 s. Round-2+ binary (core3-live-reset-5mb, coresmoke-1, 5.24 MB, n = 4, all 200): 1,740 / 3,114 / 1,839 / 3,272 ms; the GET after reset takes 1.5–3.0 s with `hashState: known`; HEAD 192–269 ms; cooldown lease 429 with `retry-after: 1`. Round-2 core2 (n = 6): 3.7, 3.3, 3.6, 1.7, 3.1, 3.1 s. |
 | K3 | stateless byte ops (c) vs transient doc (a) vs JS yjs (b) | **Measured, Node, not workerd** (K3.md). Merge: (c) is ≈ 2.5× faster than yjs and super-linear (50k frames: 4.4 s vs 12.8 s). SV/diff (c): 0.26 ms quick, 1.2 ms 1 MB, 6.7 ms 5 MB, 14 ms 10 MB. Wasm high-water ≈ 4–5× merged size for merge (10 MB → 48 MiB); ≈ 20 MB merged reaches the cap. Memory never shrinks, and does not grow on repeat. Lone-surrogate loss occurs only on the ywasm Doc path. Bundle: 2,537.10 → 2,541.45 KiB raw, 610.56 → 611.11 KiB gzip; Wasm is ≈ 340 KB of the gzip. |
@@ -577,11 +620,11 @@ Full n: <<MEASURED: MB-base, MB-relay-{lean,full}-mb{0,10,50,100,250}, MB-relay-
 
 | Projection (v1, A5) | v1 evidence | v2 measured | Held? |
 |---|---|---|---|
-| 10–50× less memory | 32 × 512 KiB: 37.5 MB base vs 1.11 MB relay | <<MEASURED: C3-base / C3-relay>> | <<MEASURED: C3>> |
-| 30–100× more concurrent notes | 100/100 vs 429 at #33 | <<MEASURED: X1-relay ceiling / 32>> | <<MEASURED: X1>> |
-| 3–5× faster propagation | 300 → 52 ms | <<MEASURED: L2-base / L2-relay>> (small n: 412 / 90 ≈ 4.6×) | <<MEASURED: L2>> |
-| 30–100× less CPU on heavy notes | 19 ms → < 1 ms | <<MEASURED: C1-base heavy / C1-relay heavy>> | <<MEASURED: C1>> |
-| Near-zero idle cost | hibernation survives | <<MEASURED: C5 idle DO requests/day + B1-relay>> (model: idle equal, 1,056/day, 1%) | <<MEASURED: C5, B1>> |
+| 10–50× less memory | 32 × 512 KiB: 37.5 MB base vs 1.11 MB relay | C3: 37.22 MB vs 4.06 MB = **9.2×** (32 resident vs 0) | **Nearly**: just under the 10× floor (v1 measured ≈ 34×). The cause of the higher v2 figure was not isolated |
+| 30–100× more concurrent notes | 100/100 vs 429 at #33 | X1: 2,000/2,000 vs 32 = **≥ 62×** (no ceiling found) | **Yes** (lower bound) |
+| 3–5× faster propagation | 300 → 52 ms | L2: 308 / 66.0 ms = **4.67×** p50 (strict 5.48×), p99 608 → 314 | **Yes** at p50 and p99 on L2. L4-relay p99 is worse than base (2,305 vs 543, open) |
+| 30–100× less CPU on heavy notes | 19 ms → < 1 ms | C1 WS CPU per invocation p99 64.3 → 4.19 ms = **15×**; p50 1.36 → 0.22 ms = 6.3×. Per-keystroke heavy-only CPU: not measured separately (gql is whole-phase, R6) | **Partly**: 6–15×, not 30–100×. CPU moves into the checkpoint alarm (p99 up to 1.04 s) |
+| Near-zero idle cost | hibernation survives | B1-relay survives 150 s idle + 2 restarts (base: 1008 on all sockets). Idle DO requests/day: inferred 1,056 (1%) in both modes; idle DO requests were not measured directly (C5 measures bursts and catch-ups) | **Yes**: idle cost equal to base and ≈ 1%; relay avoids the post-eviction reconnect |
 
 ### 8.7 Convergence
 
@@ -591,19 +634,36 @@ and the recorded hash equals the client's canonical hash. Summaries: `convergenc
 
 | Scenario | Smoke (v0930) | Full n relay | Full n strict | Full n base |
 |---|---|---|---|---|
-| L2 | pass | <<MEASURED: conv L2-relay>> | <<MEASURED: conv L2-strict>> | <<MEASURED: conv L2-base>> |
-| L4 | pass | <<MEASURED: conv L4-relay>> | <<MEASURED: conv L4-strict>> | <<MEASURED: conv L4-base>> |
-| quick trace | — | <<MEASURED: conv C2-quick-relay>> | <<MEASURED: conv C2-quick-strict>> | <<MEASURED: conv C2-quick-base>> |
-| stress trace | pass | <<MEASURED: conv C2-stress-relay>> | <<MEASURED: conv C2-stress-strict>> | <<MEASURED: conv C2-stress-base>> |
-| B2 | pass | <<MEASURED: conv B2-relay>> | — | <<MEASURED: conv B2-base>> |
-| B3 | pass | <<MEASURED: conv B3-relay>> | — | <<MEASURED: conv B3-base>> |
-| B5 | pass (6/6, component) | <<MEASURED: conv B5-relay>> | — | n/a |
-| B6 | pass | <<MEASURED: conv B6-relay>> | — | <<MEASURED: conv B6-base>> |
-| X1 sample | pass | <<MEASURED: conv X1-relay>> | — | <<MEASURED: conv X1-base>> |
-| CW (#7) | pass 21/21 | <<MEASURED: conv CW-relay>> | — | <<MEASURED: conv CW-base>> |
+| L2 | pass | **pass** | pass | pass |
+| L4 | pass | **pass** | pass | pass |
+| quick trace | — | not in suite (accounting PASS) | not in suite (accounting PASS) | not in suite |
+| stress trace | pass | **pass** (50k) | pass (50k) | **FAIL**: base semantic reset (4409), see below |
+| B2 | pass | **pass** | — | pass |
+| B3 | pass | **pass** | — | pass |
+| B5 | pass (6/6, component) | **pass 20/20** | — | n/a |
+| B6 | pass | **pass** | — | no block (skipped by design) |
+| X1 sample | pass | **pass** | — | pass |
+| CW (#7) | pass 21/21 | **pass 119/119** | — | pass 121/121 |
 
-Frame accounting (4.3): the identity must hold on every relay and strict run's diagnostics delta. Full-n:
-<<MEASURED: accounting identity per run (runall summary)>>.
+Totals (measured): relay **9/9 pass**; strict 3/3 run, all pass; base 6 pass, 1 fail, 1 n/a, 1 skipped.
+
+- **C2-stress-base FAIL is base hitting its own semantic reset under stress, which the raw harness cannot follow. It
+  is not relay data loss.** Server-side semantic compaction bumped the body to epoch 2 at frame 10,226 and sent 4409
+  to all 6 sockets; 165 frames were outstanding at drain (GET 210,869 B vs client 210,844 B). Local yjs census at
+  frame 10,226 (inferred): 20,478 structs, deleted ratio 0.311, which crosses the soft deleted-ratio threshold
+  (≥ 0.25 with ≥ 10k structs, projected reduction ≥ 0.40). Ruled out: size limits, hard limits, the ywasm cap
+  (13.1 MB of 96 MiB). The real client rebases on 4409; the raw harness client does not reconnect. Relay and strict
+  have no server-side doc and no server-initiated reset, and converged at 50k.
+- **C3-base** (outside the suite): a fresh C cannot open a 33rd socket. This is the real base limit.
+- **X3-relay "fail" is a checker artifact** (outside the suite): text and SV are equal on A, B, fresh C and GET. A
+  5 MB body gets no hash claim by design (> 256 KiB), and `checks.ts` treats the empty-string hash header as
+  non-null, which produces a false inv7 "VIOLATED". Harness only; not fixed.
+
+Frame accounting (4.3): **PASS in all 16** relay/strict runs with diagnostics (measured): C2-quick relay/strict
+(5,000), C2-stress relay/strict (50,000), C4 relay/strict (50), L4 relay/strict (5,000), MB lean ×6 + strict ×2.
+Base n/a. Invariant evidence at full n: 4 (B4 0 appends after the fence), 5/11 (B5 20/20, one install per race), 7
+(CW-relay 119/119, CW-base 121/121, inv7 pass in every convergence leg), 8 (B6 dedupeHits 3, appendsDelta 1), 10 (K1
+compact → 0 log rows; C2-stress converges at 50k).
 
 ## 9. Cost model
 
@@ -625,101 +685,80 @@ Workers Free limits were checked on 2026-09-30 in the Cloudflare docs
 | Max SQL row / BLOB | 2 MB | This is why `MAX_DURABLE_UPDATE_BYTES` is 1.75 MB. |
 
 The calculator is `scripts/relay2/costmodel.py`. Every input is a named parameter with a provenance tag, and it
-reruns with measured values (`--set name=value` or `--json`). It was re-run on 2026-10-01 without edits. Its
-docstring still says the micro-batch maximum is 50, which is stale; the cap is 250.
+reruns with measured values (`--set name=value` or `--json`). It was re-run on 2026-10-01 with the full-run (f1001)
+inputs below. Its docstring still says the micro-batch maximum is 50, which is stale; the cap is 250.
 
 The model does not cover two things:
-- the lean coalescing pass
-- CPU
+- the lean coalescing pass (runs A, B and E use whole-phase gql rows, which already include it)
+- CPU (taken from gql directly, below)
 
-Every output below is **inferred**. Its inputs are labelled.
+Every output below is **inferred** from **measured** inputs. Model: 3 devices, 4 sockets each, 60 s pings, 270 s
+ticket refresh, 2 h editing per day at 25% typing duty, 5 frames per typing second, Free limits (100k DO
+requests/day, 100k rows/day).
 
-**Inputs** (the rest are model defaults: 3 devices, 4 sockets each, 60 s pings, 270 s ticket refresh, 2 h editing per
-day at 25% typing duty, 5 frames/s, 10 s bursts, checkpoint 8 fixed rows + 2 rows per pruned journal row):
+**Inputs** (measured, f1001):
+- `base_rows_per_flush` = 3.10 rows/edit (MB/C2 gql) × 9,000 / 7,200 flushes = **3.875**.
+- Runs A, B and E use whole-phase gql rows/edit (MB-lean-mb10-stream 5.92, MB-strict-stream 11.84). These already
+  include checkpoint, floor, coalescing and candidate rows, so A and B set `checkpoint_fixed_rows=0` and
+  `journal_delete_rows_per_entry=0`. E keeps the modelled checkpoint rows as well (double-counted, pessimistic) and
+  uses base 3.10 per flush.
+- Runs C and D use the C4 relay counter (append rows only: relay 5.00, strict 11.00) plus the modelled checkpoint
+  rows (8 fixed + 2 per pruned journal row).
 
-| Run | `relay_rows_per_append` | `base_rows_per_flush` | `relay_microbatch_ms` | Provenance |
-|---|---:|---:|---:|---|
-| (a) old defaults | 11 | 10 | 0 | pre-lean model defaults (coresmoke candidate frame; base assumed) |
-| (b) **relay, lean plain** | 3 | 3 | 10 | relay: measured corelean-1, n = 20. Base: smoke w0930 C2-quick rows per edit, which already includes base batching, so this favours base. |
-| (c) relay, lean candidate | 5 | 3 | 10 | relay: measured corelean-1 candidate frame, n = 20 |
-| (d) strict | 9 | 3 | 0 | measured coresmoke-1 plain frame, n = 20 |
-| (e) sensitivity: base per flush | 3 | 9 | 10 | base: same row set per flush as default relay (flag-tests.md), CF ≈ 9 |
-| (f) relay, lean + mb 250 | 3 | 3 | 250 | micro-batch effect **inferred** |
-| (g) pessimistic: smoke per-edit | 7.26 | 3.03 | 10 | smoke w0930 C2-quick rows per edit, which already include checkpoint, floor, coalescing and candidate rows. The model adds checkpoint rows again, so this over-counts. |
+**Output** (`costmodel.py --set …`):
 
-**Output, typical day** (rows written/day; Workers Free limit 100,000):
+| Run | Inputs | Typical base rows/day | Typical relay rows/day | Typical + 2,000-note import base / relay | DO req/day typical base / relay | Typing h/day to 100k rows base / relay |
+|---|---|---|---|---|---|---|
+| A relay (gql) | relay 5.92, mb 10; base 3.875/flush; ckpt rows included (0/0) | 30,024 (30%) | **53,460 (53%)** | 88% / **115%** | 2% / 3% | 1.67 / 0.94 |
+| B strict (gql) | relay 11.84, mb 0 | 30,024 (30%) | **106,740 (107%)** | 88% / 180% | 2% / 3% | 1.67 / 0.47 |
+| C relay (C4 counter + modelled ckpt) | relay 5.0, mb 10 | 45,576 (46%) | **64,620 (65%)** | 103% / 125% | 2% / 3% | 1.10 / 0.77 |
+| D strict (C4 counter + modelled ckpt) | relay 11.0, mb 0 | 45,576 (46%) | **118,620 (119%)** | 103% / 191% | 2% / 3% | 1.10 / 0.42 |
+| E relay (gql, ckpt double-counted, pessimistic) | relay 5.92, base 3.10/flush, mb 10 | 39,996 (40%) | 72,900 (73%) | 96% / 135% | 2% / 3% | 1.25 / 0.69 |
 
-| Run | Base rows/day | Relay rows/day | Base + import | Relay + import | Rows per typing-s (base / relay) | Typing h/day to hit 100k (base / relay) |
-|---|---:|---:|---:|---:|---|---|
-| (a) | 89,676 (90%) | 118,620 (119%) | 159,676 (160%) | 190,620 (191%) | 49.8 / 65.9 | 0.56 / 0.42 |
-| (b) | 39,276 (39%) | **46,620 (47%)** | 95,276 (95%) | 102,620 (103%) | 21.8 / 25.9 | 1.27 / 1.07 |
-| (c) | 39,276 (39%) | 64,620 (65%) | 95,276 (95%) | 124,620 (125%) | 21.8 / 35.9 | 1.27 / 0.77 |
-| (d) | 39,276 (39%) | 100,620 (101%) | 95,276 (95%) | ≈ 169% | 21.8 / 55.9 | 1.27 / 0.50 |
-| (e) | 82,476 (82%) | 46,620 (47%) | ≈ 150% | 102,620 (103%) | 45.8 / 25.9 | 0.61 / 1.07 |
-| (f) | 39,276 (39%) | 37,296 (37%; 7,200 appends) | 95,276 (95%) | ≈ 93% | 21.8 / 20.7 | 1.27 / 1.34 |
-| (g) | 39,492 (39%) | 84,960 (85%) | 95,552 (96%) | 149,480 (149%) | 21.9 / 47.2 | 1.27 / 0.59 |
+Run A output (verbatim):
 
-The other outputs do not depend on the row inputs:
+```
+| Day shape | Mode | DO req/day | % free | Worker req/day | % free | Rows written/day | % free | Notes |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| idle | base | 1,056 | 1% | 0 | 0% | 0 | 0% | 12 sockets, 21,120 WS msgs |
+| idle | relay | 1,056 | 1% | 0 | 0% | 0 | 0% | 12 sockets, 21,120 WS msgs |
+| typical | base | 2,300 | 2% | 342 | 0% | 30,024 | 30% | 9,000 frames, 7,200 appends, 180 POSTs, 144 ckpts |
+| typical | relay | 2,648 | 3% | 60 | 0% | 53,460 | 53% | 9,000 frames, 9,000 appends, 0 POSTs, 180 ckpts |
+| typical+import | base | 5,000 | 5% | 2,742 | 3% | 87,774 | 88% | +2,000 notes |
+| typical+import | relay | 5,648 | 6% | 2,460 | 2% | 115,300 | 115% | +2,000 notes |
+```
 
-| Day shape | Mode | DO req/day | % free | Worker req/day |
-|---|---|---:|---:|---:|
-| idle | base / relay | 1,056 / 1,056 | 1% / 1% | 0 / 0 |
-| typical | base / relay | 2,300 / 2,648 | 2% / 3% | 342 / 60 |
-| typical + import | base / relay | 5,000 / 5,648 | 5% / 6% | 2,742 / 2,460 |
+**CPU** (measured, gql per-invocation; not in the model). The 10 ms limit applies to the Worker entry; a DO request
+gets 30 s CPU on Free. 10 ms is still the bar for a cheap body edit. Per WS message, p99:
 
-**CPU against the 10 ms Worker-Free limit.** The model does not cover CPU. Small-n deployed evidence (smoke w0930,
-C2-quick, 300 frames, gql; measured, small n) gives per-WS-invocation CPU p50 / p90 / p99:
+| | base | relay | strict |
+|---|---|---|---|
+| C2-quick WS p99 (n = 5,000) | **30.7 ms (over)** | 4.6 ms | 5.7 ms |
+| C1 WS p99 (5,101 / 10,188 invocations) | **64.3 ms (over)** | 4.2 ms | 5.7 ms |
+| C2-stress WS p99 | 7.3 ms (10,226 frames, provisional) | 2.8 ms (50k) | 1.9 ms (50k) |
+| checkpoint alarm p99 | n/a | 59 ms (C1) / 108 ms (C2-quick) / **1,041 ms (C2-stress)** | 98 / 102 / 817 ms |
 
-| Mode | p50 | p90 | p99 |
-|---|---:|---:|---:|
-| base | 1,513 µs | 6,709 µs | **11,184 µs** (over 10 ms) |
-| relay | 1,066 µs | 1,732 µs | 3,224 µs |
-| strict | 716 µs | 1,531 µs | 2,239 µs |
-
-The DO's own limit is 30 s per request, so 10 ms is not a hard limit for DO invocations. It applies to the Worker
-entry. It is still the reference bar for keeping a body edit cheap. K3 shows an exact SV or diff on a 5–10 MB body
-costs 7–14 ms, above 10 ms. That is why bodies over 256 KiB use the incremental SV (R4). Full n:
-<<MEASURED: C1-*, C2-quick-*, C2-stress-* gql p99>>.
+`exceededCpu` = 0 in every phase. K3 shows an exact SV or diff on a 5–10 MB body costs 7–14 ms, which is why bodies
+over 256 KiB use the incremental SV (R4).
 
 Reading the model:
-- **Idle cost is equal, and small (≈ 1% of DO requests)**, now that phase 0 made pings survive. Before phase 0 it was
-  ≈ 160k/day (A1). The relay's extra benefit is not reconnecting after eviction (B1). In base those reconnects appear
-  on the first edit, not while idle.
-- **Rows written, not requests, is the binding free-tier limit.**
-  - The pre-lean relay (a) was at 119%.
-  - With lean rows and plain frames (b), a typical day is 47% for relay against 39% for base (1.19×). With candidate
-    frames on every append (c) it is 65% (1.65×).
-  - In practice only some frames carry a `candidateId`, so the per-append range is 47–65% (inferred). The smoke
-    per-edit figure gives a pessimistic 85% (g).
-  - With the fairer per-flush base input (e), base is at 82% and relay is below it.
-- **Micro-batching (inferred).**
-  - At 5 frames/s (≈ 200 ms apart), mb 10 does not merge appends: `min(5, 1000/10)` is still 5 appends/s. Its value is
-    in latency tails (8.1, MB) and under bursts.
-  - **Caveat.** The smoke w0930 C2-quick rows per edit (relay 7.26, strict 13.16, base 3.03; small n) are well above
-    the 3 / 5 per-append component cost. They include checkpoint passes, floor advances, coalescing and candidate
-    rows at trace cadence. If full-n C2/C4 confirms ≈ 7 rows per edit, the relay typical day is ≈ 85% (g): under
-    100k, but 2.2× base. Reversal condition 2 is then not triggered, but the margin is thin. The full-n `C2-quick-*`
-    and `C4-*` values decide this.
-  - Only mb ≥ 200–250 coalesces at typing cadence (f: 37%, below base). It gives back much of the latency win
-    (MB mb250 p50 ≈ 190–300 ms).
-- **Lean coalescing (inferred, not in the model)** adds 3 rows per dirty body per pass. At 5 frames/s with a 2 s delay
-  that is ≈ +0.3 rows per append, i.e. ≈ +2.7k rows on a typical day: (b) becomes ≈ 49%.
-- **The heavy import** is dominated by lifecycle rows (`import_rows_per_note`, assumed 25). Both modes reach or exceed
-  the free budget on an import day (95% base, 103% relay in b). An import of about 3,000 notes or more is a two-day
-  operation on Free in either mode.
-- **Feed floor.** The model charges 2 rows per pruned journal row. With G1 fixed this pruning now happens; it is
-  included.
-
-To fill (rerun the model with full-n inputs):
-
-| Input | Placeholder |
-|---|---|
-| `relay_rows_per_append`, `base_rows_per_flush`, rows per reconnect | <<MEASURED: C4-base, C4-relay, C4-strict>> |
-| DO requests per burst and per catch-up | <<MEASURED: C5-base, C5-relay>> |
-| `checkpoint_fixed_rows`, rows per checkpoint | <<MEASURED: K1-alarm-relay rows before/after>> |
-| `base_candidate_rows` | <<MEASURED: C4-base with the real VaultSync candidate path (L5b1-base)>> |
-| `frames_per_typing_s` | <<MEASURED: L4 trace frame rate / C2-quick>> |
-| rows per edit at trace cadence | <<MEASURED: C2-quick-{base,relay,strict}, C2-stress-{base,relay,strict}>> |
+- **Relay with lean rows fits Free on a typical day at 53–73%**, vs base at 30–46% (≈ 1.7× base rows). **Strict does
+  not fit** (107–119%), so lean rows are a requirement.
+- **Rows written, not requests, is the binding free-tier limit.** Typing hours/day to reach 100k rows: relay
+  0.69–0.94 h vs base 1.10–1.67 h.
+- **Import days.** A typical day plus a 2,000-note import exceeds 100k rows for the relay (115–135%); base sits at the
+  edge (88–103%). The import is dominated by lifecycle rows (`import_rows_per_note`, assumed 25). A large import is a
+  two-day operation on Free in either mode.
+- **DO requests are not binding**: 2–3% on a typical day (≤ 6% with import), 1% idle in both modes. Worker
+  requests/day: base 342, relay 60 (no candidate POSTs). Typical-day relay DO requests are 1.15× base (2,648 vs 2,300),
+  which strictly exceeds reversal condition 3's 1.1× bar while both sit at 2–3% of Free (section 13).
+- **Micro-batching.** At 5 frames/s, mb 10 does not merge appends (MB: 5.54 vs 5.55 rows/edit). Its value is the
+  latency tail (stream p99 316 vs 416). Only mb ≥ 200–250 coalesces at typing cadence, and it gives back much of the
+  latency win (smoke mb250 p50 ≈ 190–300 ms).
+- **CPU does not bind for the relay**: WS p99 ≤ 5.7 ms and alarms ≤ 1.04 s, under the 30 s DO limit. The alarm is a
+  wall-clock stall for the output gate, though (R9). Base already exceeds 10 ms per WS message.
+- **Spend.** The runs used an unlimited enterprise account, profiled against Free. No quota was hit apart from the
+  500-DO-namespace account cap (test-environment note, section 12).
 
 ## 10. E2EE compatibility
 
@@ -819,11 +858,12 @@ the lazy hash in phase 5.
 
 Design gaps found while checking this RFC against the code are labelled **G#**. Risks are labelled **R#**.
 
-**Gaps.** These were found while checking the RFC against the code in rounds 1–2. Status is as of `7feae39`.
+**Gaps.** G1–G23 were found while checking the RFC against the code in rounds 1–4; G24–G26 come from the full run f1001.
+Status is as of `7feae39` (server) and f1001 (measurements).
 
 | G | Gap (as found) | Status | Fix |
 |---|---|---|---|
-| G1 | The feed floor never advanced for relay-only workloads, so `vault_journal` grew without bound. | **fixed, round 3** | `runCheckpointPass` advances the floor to `current − 1000`, below every pin. Unit test: 5,000 appends leave 1,001 rows (floor 4002, 41 advances). Full-n check: K1 and `C2-stress-relay` table counts. |
+| G1 | The feed floor never advanced for relay-only workloads, so `vault_journal` grew without bound. | **fixed, round 3** | `runCheckpointPass` advances the floor to `current − 1000`, below every pin. Unit test: 5,000 appends leave 1,001 rows (floor 4002, 41 advances). Full n: K1-compact-relay → 0 log rows; C2-stress-relay converges at 50k (K1-alarm inconclusive). |
 | G2 | With micro-batching, authority was checked only at enqueue, so a revocation inside the window still committed. | **fixed, round 3** | Re-validated at flush; dropped frames close 4403 (`authorityDrops`). |
 | G3 | Batches were keyed by body only, mixed epochs were fenced together, and reset did not flush pending batches. | **fixed, round 3** | Batches keyed by (bodyId, epoch); reset flushes pending batches before its CAS. |
 | G4 | Unenveloped clients make the lazy hash the normal read path (ywasm Doc, plaintext, R1). | **bounded, round 3**; structural until phase 2 | 3 MiB cap plus a 256-body cache keyed by (epoch, head sequence). Above the cap the hash state is `unknown`. |
@@ -844,8 +884,26 @@ Design gaps found while checking this RFC against the code are labelled **G#**. 
 | G19 | Reset and lease authorized once before a long upload; revocation left lease rows behind. | **fixed, round 3** | Actor re-validated inside lease and reset; leases deleted on revoke and fence. |
 | G20 | Over-budget bodies: a 413 inside a batched bootstrap, and an in-memory marker that was lost on eviction. | **fixed, round 3** | Bounded prefix checkpoint, persisted `relay_body_budget` marker, and bootstrap 413 before reserving. Only a client reset recovers the body. |
 | G21 | A throw in `relayMessage` sent `VAULT_ERROR` and kept the socket open, which silently lost the frame. | **fixed, round 4** | Pre-append throws close 1011 (`frameErrors`); post-commit throws are counted and never skip fan-out. A frame-accounting identity test covers it. |
-| G22 | mb 0 head-of-line tails (0.4–2 s p90) behind the checkpoint alarm. | **mitigated, round 4** | `checkpointsFromCache`, the lean delayed alarm, and mb 5–10 as the default. Full-n: MB sweep, `L2-strict`, `L4-strict`. |
+| G22 | mb 0 head-of-line tails (0.4–2 s p90) behind the checkpoint alarm. | **mitigated, round 4** | `checkpointsFromCache`, the lean delayed alarm, and mb 5–10 as the default. Full n: L2-strict p99 333, L4-strict p99 866 (max 2,183), MB strict stream p99 506 ms. Relay mb 10 still shows tails (G24). |
 | G23 | Lean mode: the raw catalog log lags by ≤ 2 s; frame-0 attribution is pruned at the feed floor; turning lean off needs a coalescing pass first. | **accepted** (round 4) | Documented in `relay2-protocol.md` §6.4. Flag-off migration is not automated. |
+| G24 | **Relay p99 tails at full n** (new, f1001): L4-relay p99 2,305 ms / max 3,435 (n = 4,990, [conc]) and C2-quick-relay propagation p99 9,132 ms (n = 5,000, max-rate, [B∥10]). The same config in lane B gave p99 316 (MB-lean-mb10-stream) and L4-strict (serial) 866. | **open** — GO condition 2 | Cause not isolated; tails recur across the run, not cleanly attributable to concurrency. Likely suspect: the checkpoint alarm (G25). Needs a per-frame trace correlated with alarm start/stop. |
+| G25 | **Checkpoint-alarm CPU grows with body history** (new, f1001): relay alarm p99 59 ms (C1), 108 ms (C2-quick), **1,041 ms** (C2-stress, 50k edits); strict up to 817 ms. | **open** — GO condition 2 | Under the 30 s DO limit, but a wall-clock stall for the output gate. Candidates: bound the merge work per pass by bytes, not rows; checkpoint more often on hot bodies; move the merge off the output-gate path. |
+| G26 | `checks.ts` treats an empty-string hash header as a claim, producing a false inv7 "VIOLATED" on X3-relay (5 MB body, no claim above 256 KiB by design). | **open, harness only** | Text and SV are equal everywhere; not a server bug. Fix the checker to treat "" as no claim. |
+
+**Base findings at full n** (not relay defects, but they bear on the comparison):
+- **Base semantic reset fires on a realistic 10k-edit trace** (C2-stress-base): deleted ratio 0.311 at 20,478
+  structs crosses the soft threshold, epoch 2 at frame 10,226, 4409 to all 6 sockets. With base, every client gets a
+  mid-session rebase on a heavily edited note. Relay has no server-initiated reset.
+- **Base 5 MB compact returns HTTP 500** (X3-base, 164 ms). Relay compacts 5 MB in 846 ms.
+- **Base exceeds 10 ms CPU per WS message** (C2-quick p99 30.7 ms, p90 16.8 ms; C1 p99 64.3 ms).
+- **B1-base lost all sockets after 150 s idle** (1008 "socket authority mismatch").
+
+**Test-environment note.** Cloudflare caps an account at 500 Durable Object namespaces (error 10067). The full run hit
+it, so 40 phases (C3, B2–B6, B8, SEED, all L, B7, X2) ran on reused idle `yaos-relay2-v1001-*` workers, each with a
+fresh vault and redeployed vars. The server code is identical. A self-hosted single-vault deployment is far below this
+cap; it matters only to harnesses that deploy one Worker per scenario. Other run trims (user-approved): MB sweep cut to
+mb {0, 10, 50}; C2-stress replayed at max rate (CPU/rows only); 10 MB X3, X2 above 800/s and X1 above 2,000 not run;
+C2-stress-base gql provisional (10,226 frames); K1-alarm inconclusive.
 
 **Not a server bug: the smoke data-loss finding (round 4).** In smoke mb0 (v0930), B missed edits. The root cause was
 transport/platform plus the raw harness client, not server merge logic (section 7). The harness was fixed in
@@ -883,14 +941,12 @@ transport/platform plus the raw harness client, not server merge logic (section 
 - **R5 — Write amplification against the free tier (section 9).**
   - Before lean rows: one append per frame at 9–11 CF rows, ≈ 55 rows per typing-second at 5 frames/s. The model put
     a typical 2 h editing day at 119% of 100k rows/day.
-  - Lean rows (round 4, measured 3 / 5 CF rows per plain / candidate append) bring the model to 47–65% for the relay,
-    against 39% (base, rows per edit) or 82% (base, rows per flush). That is inferred. Using the smoke per-edit rows
-    (7.26) gives 85%.
-  - Strict (lean off, mb 0) stays at 101%. Lean is required on Free.
+  - Full run (inferred from measured f1001 inputs, section 9): relay lean + mb 10 is 53–73% of 100k rows/day on a
+    typical day, against base 30–46% (≈ 1.7×). Measured rows/edit: relay 5.00 (C4 counter) to 5.92 (gql), base 3.10.
+  - Strict (lean off, mb 0) is 107–119%. Lean is required on Free.
   - Residual risk:
-    - continuous typing above ≈ 1.1–1.3 h/day (the 100k crossing point)
-    - import days, where both modes reach the limit
-  - Confirm with full-n `C4-*` and `C2-*` rows per edit.
+    - continuous typing above ≈ 0.69–0.94 h/day for the relay (base 1.10–1.67 h), the 100k crossing point
+    - import days: a typical day + 2,000 notes is 115–135% for the relay, 88–103% for base
 - **R6 — Tail CPU measurements are lossy.**
   - `wrangler tail` dropped every WS event on a busy Worker (scratch-1 C1: 0 events). It matched 15/15 on a quiet one
     (scratch-2).
@@ -900,6 +956,15 @@ transport/platform plus the raw harness client, not server merge logic (section 
   frontmatter/root-shape gate.
 - **R8 — Measurements taken in Node** (K3, K2) and on an enterprise account. Workers Free DO limits are the same
   tables, but CPU and memory accounting on the edge may differ.
+- **R9 — Relay p99 tails and alarm CPU growth (new at full n; G24, G25).**
+  - L4-relay p99 2,305 ms and C2-quick-relay propagation p99 9,132 ms, while p50 stays ≈ 64–74 ms and lane-B mb 10
+    p99 is 316 ms.
+  - The checkpoint alarm's CPU scales with body history (p99 1.04 s at 50k edits) and blocks the output gate.
+  - This is GO condition 2: fix or explain before default-on.
+- **R10 — DO requests per edit burst are higher on the relay** (C5: 1.88 vs 0.51 units per burst; catch-up 3.43 vs
+  1.92). The model puts the typical day at 1.15× base, over the 1.1× reversal bar, but at 2–3% of Free. The real
+  base candidate path costs more per burst (L5b1: base prod 1.05 vs relay 0.10 units), which the C5 raw adapter does
+  not exercise.
 
 **Open questions:**
 
@@ -923,9 +988,7 @@ config:
 
 1. **Latency.** Relay L2 p50 is not at least 2× better than base, or relay L2 p99 is worse than base p99.
 2. **Rows written.** With measured C4 on the lean + mb 10 config, the costmodel typical day (2 h, 3 devices,
-   5 frames/s) is > 100% of 100k rows/day for the relay **and** > 1.25× base. Pre-filled model (inferred): 47–65%
-   relay (85% pessimistic, using smoke per-edit rows) against 39–82% base. That is under 100%, so the condition is
-   not triggered. Full-n C4 and C2 confirm or refute this.
+   5 frames/s) is > 100% of 100k rows/day for the relay **and** > 1.25× base.
 3. **DO requests.** Idle or typical-day DO requests for the relay are > 1.1× base (C5).
 4. **Correctness.** Any convergence failure (section 8.7), any violation of invariants 1–5, 3a, 7, 8 or 11 in tests
    or deployed runs, or any frame-accounting identity mismatch. Examples: an append after the revocation fence
@@ -941,6 +1004,20 @@ config:
    checkpoint entries + feed retention) after the stress trace.
 9. **Post-launch regression.** A support-visible rise in conflict copies, attributable to rebase, of more than 2× base
    in the first release.
+
+**Status at full n (f1001):**
+
+| # | Status | Evidence |
+|---|---|---|
+| 1 | not triggered | L2 p50 308 → 66.0 ms (4.67×), p99 608 → 314 ms (measured, n = 290) |
+| 2 | not triggered | relay 53–73% of 100k rows/day (inferred, measured inputs); > 100% only for strict (107–119%) and import days |
+| 3 | **exceeded on the letter; needs sign-off** | model typical day 2,648 vs 2,300 DO req/day = 1.15× base, both 2–3% of Free; idle equal (1,056). Measured C5 per burst 1.88 vs 0.51 units (raw adapter); L5b1 with the real candidate path 0.10 vs 1.05 units (R10) |
+| 4 | not triggered | relay convergence 9/9, strict 3/3; invariants 1–8, 3a, 10, 11 hold; accounting 16/16. The base C2-stress FAIL is base's own semantic reset |
+| 5 | not triggered | C1 WS CPU p50 0.22 vs 1.36 ms; relay WS p99 4.2–4.6 ms ≤ 10 ms. The checkpoint alarm (p99 up to 1.04 s) is not per append and is tracked as R9 |
+| 6 | not triggered | X1 2,000/2,000 ≥ 250; C3 4.06 MB < 37.22 MB |
+| 7 | partly open | 1 MB mobile build 103–155 ms inferred (< 2 s); B5 20/20, no lost edit. Starvation (R2) at 1 frame/s: not measured |
+| 8 | not triggered (partial evidence) | K1-compact → 0 log rows; unit test 5,000 appends → 1,001 rows. Per-body journal row counts after the stress trace: not reported in the full run |
+| 9 | n/a | post-launch |
 
 ## 14. Appendix
 
@@ -980,7 +1057,7 @@ Local tests (round 4 unless noted):
 
 | Data | Location |
 |---|---|
-| Full-n run JSONs (per scenario id) | `experiments/results/relay2/raw/<id>.json`, manifest `raw/runall-manifest.jsonl` |
+| Full-n run JSONs (per scenario id) | `experiments/logs/relay2/runall-f1001/raw/<id>.json` (tag f1001, 2026-10-01); `tables.md`, `progress.jsonl`, `runall.log`, `gqlfill-final.log` alongside. Manifest copy: `experiments/results/relay2/raw/runall-manifest.jsonl` |
 | Small-n / smoke run JSONs | `experiments/logs/relay2/runs/`, `experiments/logs/relay2/runall-w0930-small/raw/` (not in git; contexts hold tokens) |
 | Deploy records | `experiments/logs/relay2/deploy-<name>.json` |
 | Results tables | `experiments/results/relay2/RESULTS.md`; report `REPORT.md` |
@@ -990,5 +1067,26 @@ Local tests (round 4 unless noted):
 | Live reset (round 2/3) | `experiments/results/relay2/core2-live-reset-5mb.json`, `core3-live-reset-5mb.json` |
 | Flag / base tests | `experiments/results/relay2/flag-tests.md`, `base-tests.md`, `base-tests.json`, `core{,2,3,4}-flag-*` logs |
 | Prior art | `experiments/results/A1.md`, `A2-A4.md`, `A3.md`, `A5.md` |
-| Convergence | <<MEASURED: raw/convergence-suite.json, convergence-suite-strict.json, convergence-suite-base.json>> |
-| Final deploy version IDs (base / relay / strict) | <<MEASURED: runall full tag; workers yaos-relay2-<tag>-<group>-<variant>, version ids + spike SHA>> |
+| Convergence | `experiments/logs/relay2/runall-f1001/raw/convergence-suite.json` (relay 9/9), `convergence-suite-strict.json` (3/3), `convergence-suite-base.json` (6 pass, 1 fail, 1 n/a, 1 skipped) |
+| Final deploy version IDs (base / relay / strict) | Tag f1001. Lane B: fresh `yaos-relay2-f1001-<scenario>-<variant>` workers at spike `d929410`. Reused phases: `yaos-relay2-v1001-*` workers redeployed at `45f3705` with per-phase vars (the worker name is historical; the variant is recorded in each JSON's `vars` and `protocolAdapter`). Every raw JSON records `workerName`, `deploymentVersionId`, `baseSha` and `deployedSpikeSha`. Selected below. |
+
+Selected deploy records (from raw JSON metadata; base SHA `5dd32f3` throughout):
+
+| Scenario | Worker | Deployment version id | Spike SHA | Started (UTC) |
+|---|---|---|---|---|
+| L2-base | `yaos-relay2-v1001-c1-strict` | `c3bcd97d-f79c-4aa1-8f47-be9d03d4545f` | `45f3705` | 2026-10-01 15:13 |
+| L2-relay | `yaos-relay2-v1001-c2-quick-relay` | `ebb06898-a491-4cc0-9a59-15f816046962` | `45f3705` | 2026-10-01 15:15 |
+| L2-strict | `yaos-relay2-v1001-c2-quick-base` | `b9e93e19-f7cf-4565-8d2b-3eb78f55ef4a` | `45f3705` | 2026-10-01 15:18 |
+| L4-base | `yaos-relay2-v1001-l1-relay` | `007698a0-8b09-461e-9dde-e9813fa58a0f` | `45f3705` | 2026-10-01 15:29 |
+| L4-relay | `yaos-relay2-v1001-c3-base` | `aef12799-e63a-4e38-8078-76dc16b40614` | `45f3705` | 2026-10-01 15:29 |
+| L4-strict | `yaos-relay2-v1001-c2-stress-relay` | `de5bb064-881e-4f43-97c1-569575d74c33` | `45f3705` | 2026-10-01 15:24 |
+| C1-base | `yaos-relay2-f1001-c1-base` | `4b67ae31-f85b-46bb-a68a-7bb87bfda1a6` | `d929410` | 2026-10-01 13:48 |
+| C1-relay | `yaos-relay2-f1001-c1-relay` | `be47a71b-43c8-434a-9851-76c978347368` | `d929410` | 2026-10-01 13:48 |
+| C1-strict | `yaos-relay2-f1001-c1-strict-a2` | `0ef690be-fde1-4c95-b6c4-95c4e7c22476` | `d929410` | 2026-10-01 13:53 |
+| C2-quick-base | `yaos-relay2-f1001-c2-quick-base` | `52b8570b-6ef9-428b-a5da-85e38555d16e` | `d929410` | 2026-10-01 13:46 |
+| C2-quick-relay | `yaos-relay2-f1001-c2-quick-relay` | `7259077d-3faa-44cd-92b5-b96110e14a4a` | `d929410` | 2026-10-01 13:46 |
+| C2-quick-strict | `yaos-relay2-f1001-c2-quick-strict` | `15175c87-d554-4cf0-a412-bf30f871b0e5` | `d929410` | 2026-10-01 13:47 |
+| C2-stress-relay | `yaos-relay2-f1001-c2-stress-relay` | `07dbcf83-05a3-4e2a-9b88-3f77d5d59a35` | `d929410` | 2026-10-01 13:38 |
+| X1-relay | `yaos-relay2-f1001-x1-relay` | `5f82c76b-4a8a-4112-8504-f9fd086703fb` | `d929410` | 2026-10-01 13:37 |
+| B5-relay | `yaos-relay2-v1001-b7-relay` | `e2fae91c-386d-4680-97f5-670c437c4108` | `45f3705` | 2026-10-01 15:08 |
+| C6-relay | `yaos-relay2-v1001-c1-base` | `ee378cd6-1574-424f-a7d2-d04f6fdd1f23` | `45f3705` (harness `35e8b06`) | 2026-10-01 15:50 |
