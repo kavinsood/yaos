@@ -16,6 +16,12 @@ export class ConflictListModal extends Modal {
 				this.review(episode.bodyId);
 			});
 			for (const part of episode.parts) row.createEl("p", { text: part });
+			for (const obstruction of episode.obstructions ?? []) {
+				row.createEl("p", { text: `Left untouched during artifact recovery: ${obstruction}` });
+			}
+			for (const [previous, current] of Object.entries(episode.relocations ?? {})) {
+				row.createEl("p", { text: `Recovered artifact: ${previous} → ${current}. Historical links may still reference the previous path.` });
+			}
 			if (episode.error) row.createEl("p", { text: episode.error });
 		}
 	}
