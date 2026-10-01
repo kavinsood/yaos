@@ -1,0 +1,27 @@
+src/runtime/reconcile/closedFilePlanner.ts
+  s_4da03de9eee2de::t_261e36b0935669 17-20
+src/runtime/reconciliationController.ts
+  s_4da03de9eee2de::t_82d8dcfc83e861 17,1416-1417
+src/sync/closedFileConflict.ts
+  s_4da03de9eee2de::t_a40d2afea22645 1-22
+src/sync/diskMirror.ts
+  s_4da03de9eee2de::t_123f1952632976 28-29,953,962,969
+tests/client/line-merge.ts
+  s_4da03de9eee2de::t_f332be098c6cfe 1-375
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "653e60a88e2af63e35506db631ebb3acf393b738",
+  "prompts": {},
+  "sessions": {
+    "s_4da03de9eee2de": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a09756dc78127a702",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
