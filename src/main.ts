@@ -8,6 +8,14 @@ import {
 } from "./settings";
 import { SettingsStore } from "./settings/settingsStore";
 import { VaultSync, type ReconcileMode } from "./sync/vaultSync";
+import { RELAY_SEND_COALESCE_MS } from "./sync/relayReceipts";
+
+/**
+ * B5 relay send coalescing (merge body update frames for 250 ms). Off by
+ * default: editor typing is sent frame by frame. Harnesses enable it with
+ * `VaultSync.create({ relaySendCoalesceMs: RELAY_SEND_COALESCE_MS })`.
+ */
+const RELAY_SEND_COALESCE_ENABLED = false;
 import { SCHEMA_VERSION } from "./sync/schema";
 import { computeFolderKey, folderKeySeedFromVault } from "./sync/vaultPersistence";
 import { EditorBindingManager } from "./sync/editorBinding";
@@ -527,6 +535,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			console.warn("[yaos] TEST-ONLY fast timers installed", timers.overrides, timers.rejected);
 		}
 		this.installPublicApi();
+		// B5: coalesced body updates must not sit in a buffer while the app is
+		// backgrounded or closing.
+		this.registerDomEvent(window, "blur", () => this.vaultSync?.flushRelaySends());
+		this.registerDomEvent(window, "pagehide", () => this.vaultSync?.flushRelaySends());
+		this.registerDomEvent(window, "beforeunload", () => this.vaultSync?.flushRelaySends());
 
 		// Initialize QA harness state before any component construction so that
 		// registerDiskIngestPort (called from createReconciliationController) and
@@ -1018,6 +1031,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					);
 				},
 				log: (message) => this.log(`[sync] ${message}`),
+				relaySendCoalesceMs: RELAY_SEND_COALESCE_ENABLED ? RELAY_SEND_COALESCE_MS : 0,
 				onRemoteRootStructuralUpdate: () => this.scheduleSchema4CatchUp("remote-root"),
 				onBodyChangedHint: () => this.scheduleSchema4CatchUp("body-changed-hint"),
 				onAttachmentReconciliationRequired: () => {
@@ -3072,6 +3086,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		// Obsidian invokes unload synchronously. Set this gate before any cleanup
 		// so a late init continuation cannot attach a replacement runtime.
 		this.teardownLifecycle.requestPermanentShutdown();
+		this.vaultSync?.flushRelaySends();
 		this.publicApiService?.dispose();
 		this.publicApiService = null;
 		this.api = null;

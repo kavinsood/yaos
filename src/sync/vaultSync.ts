@@ -74,7 +74,8 @@ import {
 	SocketLivenessCoordinator,
 	type SocketLivenessSnapshot,
 } from "../runtime/socketLivenessCoordinator";
-import { fencedWebSocketConstructor, type NativeSocketClose } from "./fencedWebSocket";
+import { fencedWebSocketConstructor, type NativeSocketClose, type SocketTapFactory } from "./fencedWebSocket";
+import { RelayReceiptChannel, type RelayReceiptDiagnostics, type RelayReceiptInfo } from "./relayReceipts";
 import { OwnAwarenessProvider } from "./ownAwarenessProvider";
 import { sameAuthorityIdentity, type VaultAuthorityIdentity } from "../collaboration/authority";
 import { CanvasManager, type CanvasPersistencePort, type CanvasProjectionPort } from "./canvas/canvasManager";
@@ -514,6 +515,11 @@ export interface ProviderFactoryInput {
 	documentEpoch: SemanticEpoch;
 	doc: Y.Doc;
 	onClose: (event: NativeSocketClose) => void;
+	/**
+	 * Body sockets only: relay receipt tap. A provider that sends through it
+	 * gets envelopes, socket-ack receipts, re-sends and optional coalescing.
+	 */
+	socketTap?: SocketTapFactory;
 }
 export type ProviderFactory = (input: ProviderFactoryInput) => SyncProviderPort;
 export type WebSocketImplementation = typeof WebSocket;
@@ -562,6 +568,18 @@ export interface VaultSyncOptions {
 	candidateDebounceMs?: number;
 	bodySyncTimeoutMs?: number;
 	candidateMaxWaitMs?: number;
+	/**
+	 * Socket-ack receipts on relay body sockets (`relayBodies >= 2`). Default
+	 * true; only takes effect when the server advertises the capability.
+	 */
+	relayReceipts?: boolean;
+	/**
+	 * B5: coalesce outgoing body update frames for this many ms and send them
+	 * as one `Y.mergeUpdates` frame. 0 (default) sends every update at once.
+	 * `RELAY_SEND_COALESCE_MS` (250) is the suggested enabled value. Awareness
+	 * is never delayed; held frames flush on close, blur and unload.
+	 */
+	relaySendCoalesceMs?: number;
 	now?: () => number;
 	workClock?: OverdueWorkClock;
 	workRandom?: OverdueWorkRandom;
@@ -620,6 +638,7 @@ interface BodySession {
 	ready: Promise<void>;
 	pendingCommitted: BodyCommittedNotification | null;
 	watermarkWork: Promise<void>;
+	relay: RelayReceiptChannel | null;
 }
 
 interface SocketSession {
@@ -638,7 +657,31 @@ interface PendingCandidate {
 	record: CandidateRecord;
 	submission: Promise<BodyReceipt> | null;
 	path: string | null;
+	/**
+	 * Captured from updates all observed by this relay channel, up to `seq`.
+	 * A relay receipt covering `seq` makes the candidate durable without HTTP.
+	 */
+	relayMark?: RelayMark | null;
 }
+
+interface RelayMark {
+	readonly channel: RelayReceiptChannel;
+	readonly seq: number;
+}
+
+type CandidateSubmitMode = "http" | "defer" | "await-relay";
+
+/**
+ * While a body's relay socket can deliver receipts, its candidates skip the
+ * HTTP POST and wait for a socket receipt. Receipts arrive 0.3–1.5 s after the
+ * frame (group commit); the channel re-sends after RECEIPT_RESEND_MS (5 s).
+ * Only a candidate still unconfirmed this long falls back to HTTP.
+ */
+const RELAY_HTTP_FALLBACK_MS = 15_000;
+/** Closing a note waits this long for a relay receipt before posting over HTTP. */
+const RELAY_SETTLE_WAIT_MS = 3_000;
+/** Remote, server and bootstrap origins: never local edits for receipts. */
+const RELAY_NON_LOCAL_ORIGINS = new Set<unknown>(["server-catch-up", "server-bootstrap", "indexeddb-bootstrap"]);
 
 const BODY_TEXT_NAME = "body";
 
@@ -1269,6 +1312,12 @@ export class VaultSync implements SyncRuntimePort {
 	private readonly textToBodyId = new WeakMap<Y.Text, string>();
 	private readonly pendingCandidates = new Map<string, PendingCandidate>();
 	private readonly pendingUpdates = new Map<string, Uint8Array[]>();
+	private readonly pendingRelayMarks = new Map<string, RelayMark | null>();
+	private readonly relayFallbackTimers = new Map<string, unknown>();
+	private readonly relayConfirmationWaiters = new Set<{
+		channel: RelayReceiptChannel; seq: number; resolve: (confirmed: boolean) => void;
+	}>();
+	private relayClock!: OverdueWorkClock;
 	private readonly bodyPersistenceWork = new Map<string, Promise<void>>();
 	private readonly attachmentOperations = new Map<string, StoredAttachmentPublicationOperation>();
 	private readonly attachmentOperationDurability = new Map<string, Promise<StoredAttachmentPublicationOperation>>();
@@ -1459,6 +1508,7 @@ export class VaultSync implements SyncRuntimePort {
 			setTimer: (callback: () => void, delayMs: number) => window.setTimeout(callback, delayMs),
 			clearTimer: (handle: unknown) => window.clearTimeout(handle as number),
 		};
+		this.relayClock = workClock;
 		this.socketLiveness = new SocketLivenessCoordinator(workClock);
 		const workRandom = options.workRandom;
 		this.flapBackoff = new ShortLivedConnectionBackoff(workRandom ? { random: () => workRandom.next() } : {});
@@ -2973,7 +3023,7 @@ export class VaultSync implements SyncRuntimePort {
 
 	async settleBodyOnClose(bodyId: string): Promise<void> {
 		if (this.isBodyOpen(bodyId)) return;
-		await this.flushBodyCandidate(bodyId);
+		await this.flushBodyCandidate(bodyId, "await-relay");
 		const hasPendingCandidate = Array.from(this.pendingCandidates.values()).some(
 			(candidate) => candidate.record.bodyId === bodyId,
 		);
@@ -3340,26 +3390,41 @@ export class VaultSync implements SyncRuntimePort {
 		}
 	}
 
-	async flushBodyCandidate(bodyId: string): Promise<void> {
+	async flushBodyCandidate(bodyId: string, mode: CandidateSubmitMode = "http"): Promise<void> {
 		const updates = this.pendingUpdates.get(bodyId);
 		if (updates && updates.length > 0) {
 			this.pendingUpdates.delete(bodyId);
+			const relayMark = this.pendingRelayMarks.get(bodyId) ?? null;
+			this.pendingRelayMarks.delete(bodyId);
 			const encodedUpdate = updates.length === 1 ? updates[0]! : Y.mergeUpdates(updates);
 			try {
 				await this.bodies.markDirty(bodyId);
-				await this.captureCandidate(
+				const pending = await this.captureCandidate(
 					bodyId,
 					encodedUpdate,
 					undefined,
 					updates.length,
 				);
+				if (pending.relayMark === undefined) pending.relayMark = relayMark;
 			} catch (error) {
 				const newer = this.pendingUpdates.get(bodyId) ?? [];
 				this.pendingUpdates.set(bodyId, [...updates, ...newer]);
+				// Re-queued updates may now span channels: HTTP only.
+				this.pendingRelayMarks.set(bodyId, null);
 				throw error;
 			}
 		}
-		await this.submitPendingForBody(bodyId);
+		await this.submitPendingForBody(bodyId, mode);
+	}
+
+	/** B5: sends coalesced body updates now (window blur, plugin unload). */
+	flushRelaySends(): void {
+		for (const session of this.sessions.values()) session.relay?.flush();
+	}
+
+	/** Relay receipt counters for one body session, or null without one. */
+	getRelayReceiptDiagnostics(bodyId: string): RelayReceiptDiagnostics | null {
+		return this.sessions.get(bodyId)?.relay?.diagnostics() ?? null;
 	}
 
 	async retryPendingCandidates(): Promise<void> {
@@ -3512,9 +3577,9 @@ export class VaultSync implements SyncRuntimePort {
 	private async runCandidateWork(bodyId: string): Promise<OperationOutcome> {
 		if (this.destroyed) return { kind: "cancelled" };
 		try {
-			await this.flushBodyCandidate(bodyId);
+			await this.flushBodyCandidate(bodyId, "defer");
 			const remainsPending = [...this.pendingCandidates.values()]
-				.some((candidate) => candidate.record.bodyId === bodyId);
+				.some((candidate) => candidate.record.bodyId === bodyId && !this.isRelayDeferred(candidate));
 			if (remainsPending) return { kind: "retryable_failure", failure: "network" };
 			return { kind: "completed", value: undefined };
 		} catch (error) {
@@ -3610,6 +3675,9 @@ export class VaultSync implements SyncRuntimePort {
 			this.renameTimer = null;
 			await this.flushRenameBatch();
 		}
+		this.flushRelaySends();
+		for (const timer of this.relayFallbackTimers.values()) this.relayClock.clearTimer(timer);
+		this.relayFallbackTimers.clear();
 		for (const bodyId of Array.from(this.pendingUpdates.keys())) {
 			await this.flushBodyCandidate(bodyId).catch(() => undefined);
 		}
@@ -3622,7 +3690,9 @@ export class VaultSync implements SyncRuntimePort {
 			session.doc.off("update", session.updateObserver);
 			this.terminateProvider(session.provider);
 			session.provider.destroy();
+			session.relay?.destroy();
 		}
+		this.settleRelayWaiters(null);
 		this.sessions.clear();
 		for (const semantic of this.semanticMirrors.values()) semantic.mirror.destroy();
 		this.semanticMirrors.clear();
@@ -3776,9 +3846,37 @@ export class VaultSync implements SyncRuntimePort {
 	private createBodySession(body: LoadedBody): BodySession {
 		this.ensureSemanticMirror(body);
 		const factory = this.options.providerFactory ?? ((input) => this.createDefaultProvider(input));
-		const provider = factory({ kind: "body", documentId: body.bodyId,
-			documentEpoch: body.bodyEpoch, doc: body.doc,
-			onClose: (event) => this.handleNativeSocketClose(event) });
+		// Created before the provider so its doc observer numbers each local
+		// update before the provider's update handler sends it.
+		let relayProvider: SyncProviderPort | null = null;
+		const relay = new RelayReceiptChannel({
+			bodyId: body.bodyId,
+			doc: body.doc,
+			bodyEpoch: () => this.bodies.get(body.bodyId)?.bodyEpoch ?? body.bodyEpoch,
+			isLocalOrigin: (origin) => relayProvider !== null
+				&& origin !== relayProvider.documentOrigin
+				&& !RELAY_NON_LOCAL_ORIGINS.has(origin),
+			receipts: this.options.relayReceipts !== false,
+			coalesceMs: this.options.relaySendCoalesceMs ?? 0,
+			setTimer: (callback, delayMs) => this.relayClock.setTimer(callback, delayMs),
+			clearTimer: (handle) => this.relayClock.clearTimer(handle),
+			...(this.options.workRandom ? { random: () => this.options.workRandom!.next() } : {}),
+			newFrameId: () => crypto.randomUUID(),
+			onConfirmed: (_seq, info) => this.handleRelayConfirmed(body.bodyId, relay, info),
+			onRelayActiveChanged: (active) => this.handleRelayActiveChanged(body.bodyId, relay, active),
+			log: (message) => this.log(message),
+		});
+		let provider: SyncProviderPort;
+		try {
+			provider = factory({ kind: "body", documentId: body.bodyId,
+				documentEpoch: body.bodyEpoch, doc: body.doc,
+				onClose: (event) => this.handleNativeSocketClose(event),
+				socketTap: relay.tapFactory });
+		} catch (error) {
+			relay.destroy();
+			throw error;
+		}
+		relayProvider = provider;
 		this.registerSocketLiveness(body.bodyId, provider);
 		const lifetimeLease = this.bodies.acquireLease(body.bodyId);
 		let session!: BodySession;
@@ -3843,6 +3941,10 @@ export class VaultSync implements SyncRuntimePort {
 			this._lastLocalUpdateAt = now;
 			if (this.connected) this._lastLocalUpdateWhileConnectedAt = now;
 			const updates = this.pendingUpdates.get(body.bodyId) ?? [];
+			const mark = this.pendingRelayMarks.get(body.bodyId);
+			this.pendingRelayMarks.set(body.bodyId, updates.length === 0 || mark?.channel === relay
+				? { channel: relay, seq: relay.seq }
+				: null);
 			updates.push(update.slice());
 			this.pendingUpdates.set(body.bodyId, updates);
 			this.queueBodyPersistence(body.bodyId);
@@ -3860,6 +3962,7 @@ export class VaultSync implements SyncRuntimePort {
 			ready: Promise.resolve(),
 			pendingCommitted: null,
 			watermarkWork: Promise.resolve(),
+			relay,
 		};
 		provider.on("sync", (synced) => {
 			if (synced && session.pendingCommitted) this.handleBodySessionCommitted(session, session.pendingCommitted);
@@ -4020,9 +4123,12 @@ export class VaultSync implements SyncRuntimePort {
 		if (this.sessions.get(session.bodyId) === session) this.sessions.delete(session.bodyId);
 		this.socketLiveness.unregister(session.bodyId);
 		session.doc.off("update", session.updateObserver);
+		session.relay?.flush();
 		session.lifetimeLease.release();
 		this.terminateProvider(session.provider);
 		session.provider.destroy();
+		session.relay?.destroy();
+		this.settleRelayWaiters(session.relay);
 	}
 
 	private ensureSemanticMirror(body: LoadedBody): FrontmatterSemanticMirror {
@@ -5020,18 +5126,158 @@ export class VaultSync implements SyncRuntimePort {
 		return receipt;
 	}
 
-	private async submitPendingForBody(bodyId: string): Promise<void> {
+	private async submitPendingForBody(bodyId: string, mode: CandidateSubmitMode = "http"): Promise<void> {
 		const candidates = Array.from(this.pendingCandidates.values())
 			.filter((candidate) => candidate.record.bodyId === bodyId)
 			.sort((left, right) => left.record.capturedAt - right.record.capturedAt);
 		for (const candidate of candidates) {
+			if (this.pendingCandidates.get(candidate.record.candidateId) !== candidate) continue;
 			try {
+				if (await this.confirmFromRelayIfCovered(candidate)) continue;
+				if (mode === "defer" && this.isRelayDeferred(candidate)) {
+					this.scheduleRelayFallback(candidate);
+					continue;
+				}
+				if (mode === "await-relay" && candidate.relayMark && candidate.relayMark.channel.relayActive
+					&& await this.waitForRelayConfirmation(candidate.relayMark, RELAY_SETTLE_WAIT_MS)
+					&& await this.confirmFromRelayIfCovered(candidate)) continue;
+				if (this.pendingCandidates.get(candidate.record.candidateId) !== candidate) continue;
 				await this.submitCandidate(candidate);
 			} catch (error) {
 				this.log(`candidate ${candidate.record.candidateId} remains pending: ${String(error)}`);
 				break;
 			}
 		}
+	}
+
+	/** The candidate waits for a socket receipt instead of an HTTP POST. */
+	private isRelayDeferred(candidate: PendingCandidate): boolean {
+		const mark = candidate.relayMark;
+		if (!mark || candidate.submission) return false;
+		const session = this.sessions.get(candidate.record.bodyId);
+		return session?.relay === mark.channel
+			&& mark.channel.relayActive
+			&& this.now() - candidate.record.capturedAt < RELAY_HTTP_FALLBACK_MS;
+	}
+
+	private scheduleRelayFallback(candidate: PendingCandidate): void {
+		const bodyId = candidate.record.bodyId;
+		if (this.relayFallbackTimers.has(bodyId) || this.destroyed) return;
+		const delay = Math.max(0, candidate.record.capturedAt + RELAY_HTTP_FALLBACK_MS - this.now());
+		this.relayFallbackTimers.set(bodyId, this.relayClock.setTimer(() => {
+			this.relayFallbackTimers.delete(bodyId);
+			if (this.destroyed) return;
+			if (![...this.pendingCandidates.values()].some((pending) => pending.record.bodyId === bodyId)) return;
+			this.log(`relay receipt fallback: posting pending candidates for ${bodyId} over HTTP`);
+			void this.workScheduler.queueCandidateNow(bodyId).catch((error) => {
+				this.log(`relay fallback scheduling failed for ${bodyId}: ${String(error)}`);
+			});
+		}, delay));
+	}
+
+	private handleRelayActiveChanged(bodyId: string, channel: RelayReceiptChannel, active: boolean): void {
+		if (active || this.destroyed) {
+			if (active) this.log(`relay receipts active for ${bodyId}`);
+			return;
+		}
+		this.settleRelayWaiters(channel);
+		const deferred = [...this.pendingCandidates.values()]
+			.some((candidate) => candidate.record.bodyId === bodyId && candidate.relayMark?.channel === channel);
+		if (!deferred) return;
+		// The socket that would deliver the receipt is gone: HTTP is the fallback.
+		void this.workScheduler.queueCandidateNow(bodyId).catch((error) => {
+			this.log(`relay fallback scheduling failed for ${bodyId}: ${String(error)}`);
+		});
+	}
+
+	private handleRelayConfirmed(bodyId: string, channel: RelayReceiptChannel, _info: RelayReceiptInfo): void {
+		for (const waiter of [...this.relayConfirmationWaiters]) {
+			if (waiter.channel === channel && channel.confirmedSeq >= waiter.seq) {
+				this.relayConfirmationWaiters.delete(waiter);
+				waiter.resolve(true);
+			}
+		}
+		const covered = [...this.pendingCandidates.values()]
+			.filter((candidate) => candidate.record.bodyId === bodyId
+				&& candidate.relayMark?.channel === channel
+				&& candidate.relayMark.seq <= channel.confirmedSeq)
+			.sort((left, right) => left.record.capturedAt - right.record.capturedAt);
+		if (covered.length === 0) return;
+		void (async () => {
+			for (const candidate of covered) {
+				try {
+					await this.confirmFromRelayIfCovered(candidate);
+				} catch (error) {
+					this.log(`relay receipt did not settle candidate ${candidate.record.candidateId}: ${String(error)}`);
+				}
+			}
+		})();
+	}
+
+	private waitForRelayConfirmation(mark: RelayMark, timeoutMs: number): Promise<boolean> {
+		if (mark.channel.confirmedSeq >= mark.seq) return Promise.resolve(true);
+		return new Promise<boolean>((resolve) => {
+			const waiter = {
+				channel: mark.channel,
+				seq: mark.seq,
+				resolve: (confirmed: boolean) => {
+					this.relayClock.clearTimer(timer);
+					resolve(confirmed);
+				},
+			};
+			const timer = this.relayClock.setTimer(() => {
+				if (this.relayConfirmationWaiters.delete(waiter)) resolve(false);
+			}, timeoutMs);
+			this.relayConfirmationWaiters.add(waiter);
+		});
+	}
+
+	/** Resolves waiters on `channel` (or every waiter for null) as unconfirmed. */
+	private settleRelayWaiters(channel: RelayReceiptChannel | null): void {
+		for (const waiter of [...this.relayConfirmationWaiters]) {
+			if (channel !== null && waiter.channel !== channel) continue;
+			this.relayConfirmationWaiters.delete(waiter);
+			waiter.resolve(false);
+		}
+	}
+
+	/**
+	 * Settles a candidate from a relay receipt when the channel has confirmed
+	 * every update it captured. The receipt is synthesized from the socket
+	 * `BODY_COMMITTED` and goes through the same completion as an HTTP receipt.
+	 */
+	private async confirmFromRelayIfCovered(candidate: PendingCandidate): Promise<boolean> {
+		const mark = candidate.relayMark;
+		const info = mark?.channel.lastConfirmation;
+		if (!mark || !info || mark.channel.confirmedSeq < mark.seq) return false;
+		if (candidate.submission) {
+			await candidate.submission.catch(() => undefined);
+			return !this.pendingCandidates.has(candidate.record.candidateId);
+		}
+		if (this.pendingCandidates.get(candidate.record.candidateId) !== candidate) return true;
+		if (info.vaultGeneration !== this.options.vaultGeneration
+			|| info.bodyId !== candidate.record.bodyId
+			|| info.bodyEpoch !== candidate.record.bodyEpoch
+			|| !this.isCapturedAuthorityCurrent(candidate.record.authority)) return false;
+		const receipt: BodyReceipt = {
+			vaultId: candidate.record.vaultId,
+			vaultGeneration: info.vaultGeneration,
+			bodyId: candidate.record.bodyId,
+			bodyEpoch: info.bodyEpoch as SemanticEpoch,
+			clientId: candidate.record.authority?.deviceId ?? this.options.deviceId,
+			candidateId: candidate.record.candidateId,
+			candidateDigest: candidate.record.candidateDigest,
+			durableGeneration: info.durableGeneration,
+			runtimeEpoch: `relay:${info.commitRuntimeEpoch ?? info.runtimeEpoch}`,
+		};
+		const run = this.completeCandidateSubmission(candidate, receipt);
+		candidate.submission = run;
+		try {
+			await run;
+		} finally {
+			if (candidate.submission === run) candidate.submission = null;
+		}
+		return true;
 	}
 
 	private validateReceipt(candidate: CandidateRecord, receipt: BodyReceipt): void {
@@ -5809,7 +6055,7 @@ export class VaultSync implements SyncRuntimePort {
 			prefix,
 			connect: false,
 			maxBackoffTime: MAX_BACKOFF_TIME_MS,
-			WebSocketPolyfill: fencedWebSocketConstructor(baseWebSocket, input.onClose),
+			WebSocketPolyfill: fencedWebSocketConstructor(baseWebSocket, input.onClose, input.socketTap),
 			params: async () => {
 				if (!this.options.getSocketTicket) {
 					throw new Error("a short-lived socket ticket is required");

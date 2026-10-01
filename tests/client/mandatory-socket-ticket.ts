@@ -18,7 +18,7 @@ s.section("Provider credentials");
 	s.check(
 		vaultSync.includes("const baseWebSocket =")
 			&& vaultSync.includes("this.options.webSocket ?? WebSocket")
-			&& vaultSync.includes("WebSocketPolyfill: fencedWebSocketConstructor(baseWebSocket, input.onClose)"),
+			&& vaultSync.includes("WebSocketPolyfill: fencedWebSocketConstructor(baseWebSocket, input.onClose, input.socketTap)"),
 		"default provider accepts a caller-supplied WebSocket implementation",
 	);
 	const ticketClient = readSource("src/sync/socketTicket.ts");

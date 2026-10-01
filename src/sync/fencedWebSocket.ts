@@ -8,6 +8,24 @@ export interface TerminableWebSocket {
 	removeEventListener(type: string, listener: EventListenerOrEventListenerObject): void;
 }
 
+export type SocketSendData = string | ArrayBufferLike | Blob | ArrayBufferView;
+
+/**
+ * Per-socket send/receive hook. A tap owns every outgoing frame of its socket:
+ * it may forward it unchanged, prefix it (relay envelopes), or hold and merge
+ * it (send coalescing). `raw` returns false when the socket can no longer send.
+ */
+export interface SocketTap {
+	send(data: SocketSendData): void;
+	/** Every inbound message, before the provider's own listeners run. */
+	onMessage(data: unknown): void;
+	/** Last chance to send while the socket is still open (close/terminate). */
+	beforeClose(): void;
+	/** The socket closed or was abandoned; no further frames are delivered. */
+	onClose(): void;
+}
+export type SocketTapFactory = (raw: (data: SocketSendData) => boolean) => SocketTap | null;
+
 type WebSocketConstructor = new (url: string | URL, protocols?: string | string[]) => WebSocket;
 export interface NativeSocketClose {
 	readonly code: number;
@@ -29,6 +47,7 @@ function callListener(listener: EventListenerOrEventListenerObject, event: Event
 export function fencedWebSocketConstructor(
 	Base: WebSocketConstructor,
 	onNativeClose?: (event: NativeSocketClose) => void,
+	tapFactory?: SocketTapFactory,
 ): typeof WebSocket {
 	class FencedWebSocket {
 		static readonly CONNECTING = 0;
@@ -50,14 +69,34 @@ export function fencedWebSocketConstructor(
 		private readonly socket: ExtendedWebSocket;
 		private readonly listeners = new Map<string, Map<EventListenerOrEventListenerObject, EventListener>>();
 		private fenced = false;
+		private readonly tap: SocketTap | null;
 
 		constructor(url: string | URL, protocols?: string | string[]) {
 			this.url = String(url);
 			this.socket = new Base(url, protocols);
+			this.tap = tapFactory?.((data) => this.rawSend(data)) ?? null;
+			if (this.tap) {
+				// Registered before any provider listener, so the tap sees a
+				// control frame (VAULT_READY, BODY_COMMITTED) first.
+				this.socket.addEventListener("message", (event) => {
+					if (!this.fenced) this.tap?.onMessage((event as MessageEvent).data);
+				});
+			}
 			this.socket.addEventListener("close", (event) => {
 				const close = event as CloseEvent;
+				this.tap?.onClose();
 				onNativeClose?.({ code: close.code, reason: close.reason });
 			});
+		}
+
+		private rawSend(data: SocketSendData): boolean {
+			if (this.fenced || this.socket.readyState !== FencedWebSocket.OPEN) return false;
+			try {
+				this.socket.send(data);
+				return true;
+			} catch {
+				return false;
+			}
 		}
 
 		get readyState(): number { return this.fenced ? FencedWebSocket.CLOSED : this.socket.readyState; }
@@ -66,16 +105,21 @@ export function fencedWebSocketConstructor(
 
 		send(data: string | ArrayBufferLike | Blob | ArrayBufferView): void {
 			if (this.fenced) throw new Error("WebSocket transport was superseded");
-			this.socket.send(data);
+			if (this.tap) this.tap.send(data);
+			else this.socket.send(data);
 		}
 
 		close(code?: number, reason?: string): void {
-			if (!this.fenced) this.socket.close(code, reason);
+			if (this.fenced) return;
+			this.tap?.beforeClose();
+			this.socket.close(code, reason);
 		}
 
 		terminate(): void {
 			if (this.fenced) return;
+			this.tap?.beforeClose();
 			this.fenced = true;
+			this.tap?.onClose();
 			const abandonmentErrorSink = (): void => undefined;
 			const releaseAbandonmentSink = (): void => {
 				this.socket.removeEventListener("error", abandonmentErrorSink);
