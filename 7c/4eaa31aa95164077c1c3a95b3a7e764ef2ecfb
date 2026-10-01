@@ -1,0 +1,31 @@
+server/src/routes/vault.ts
+  s_4da03de9eee2de::t_ab51f897f3fb0e 11,46-47
+server/src/vaultBulkCreateService.ts
+  s_fb9412dd2d776a::t_f6a15e2c6ab367 40,205,207
+tests/server/settings-sync-route-authority.ts
+  s_fb9412dd2d776a::t_a659c836bf7535 6,169-204
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "7c4eaa31aa95164077c1c3a95b3a7e764ef2ecfb",
+  "prompts": {},
+  "sessions": {
+    "s_4da03de9eee2de": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a09756dc78127a702",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_fb9412dd2d776a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a6b9308dcda4dea54",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
