@@ -1,0 +1,25 @@
+server/src/vaultCatalogStore.ts
+  s_694286f0c485ac::t_01d89b1ddfdbf1 515-518
+server/src/vaultStore.ts
+  s_694286f0c485ac::t_b478d13c9a051e 558-560,597-598,600-603,675-680
+tests/server/bulk-create-runtime.ts
+  s_694286f0c485ac::t_9b2106fd5da2ae 85
+tests/server/helpers/cfRowModel.ts
+  s_694286f0c485ac::t_081b09529ea0f1 15-17,36,73-88,109-115
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "4a0070888b8a22fec6998a219f93098922b1c754",
+  "prompts": {},
+  "sessions": {
+    "s_694286f0c485ac": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a3a172259d6cb1bf1",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
