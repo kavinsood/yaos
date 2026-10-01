@@ -36,8 +36,21 @@ const browserClock: OverdueWorkClock = {
 	clearTimer: (handle) => window.clearTimeout(handle as number),
 };
 
-const DEFAULT_SETTLE_MS = 350;
-const DEFAULT_MAX_WAIT_MS = 2_000;
+/**
+ * Disk-originated Markdown changes (vault create/modify events: external
+ * editors, git, other plugins on closed notes, Obsidian's own autosave of an
+ * open note) are coalesced per path. Editor typing never comes through here:
+ * the editor binding writes Y.Text directly and the provider sends it at once.
+ *
+ * A path is processed once it has been quiet for the settle window, and at
+ * the latest max-wait after its first queued change. 2 s / 5 s (was 350 ms /
+ * 2 s) turns a burst of disk writes (sync tools, formatters, scripts that
+ * rewrite a file several times) into one body update and one server commit.
+ * Self-write suppression lives for 10 s (diskMirror SUPPRESS_MS), so it still
+ * outlasts the max wait.
+ */
+export const DEFAULT_SETTLE_MS = 2_000;
+export const DEFAULT_MAX_WAIT_MS = 5_000;
 
 /**
  * Revision-fenced, per-path ownership for Markdown work that has not reached

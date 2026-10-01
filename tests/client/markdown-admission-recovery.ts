@@ -102,6 +102,9 @@ function fixture(
 		trace: () => {},
 		scheduleTraceStateSnapshot: () => {},
 		log: () => {},
+		// These cases exercise retry, not disk batching: keep the pre-relay3
+		// 350 ms / 2 s windows so the real-timer waits stay short.
+		markdownAdmissionTiming: { settleMs: 350, maxWaitMs: 2_000 },
 	});
 	return {
 		controller,

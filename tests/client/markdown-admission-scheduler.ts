@@ -1,6 +1,8 @@
 import { strict as assert } from "node:assert";
 import type { OperationOutcome } from "../../src/runtime/operationLifecycle";
 import {
+	DEFAULT_MAX_WAIT_MS,
+	DEFAULT_SETTLE_MS,
 	MarkdownAdmissionScheduler,
 	type MarkdownAdmissionIntent,
 } from "../../src/runtime/markdownAdmissionScheduler";
@@ -153,6 +155,47 @@ s.test("redirect and drop invalidate obsolete path revisions", async () => {
 	clock.fireDue();
 	await settle(scheduler, clock);
 	assert.deepEqual(paths, ["new.md"]);
+	scheduler.stop();
+});
+
+s.test("default disk batching settles after 2 s quiet and caps a noisy path at 5 s", async () => {
+	assert.equal(DEFAULT_SETTLE_MS, 2_000);
+	assert.equal(DEFAULT_MAX_WAIT_MS, 5_000);
+	const clock = new FakeClock();
+	const processed: Array<{ path: string; at: number }> = [];
+	const scheduler = new MarkdownAdmissionScheduler({
+		clock,
+		process: async (intent) => { processed.push({ path: intent.path, at: clock.now() }); return completed(); },
+		onError: assert.fail,
+	});
+	const step = async (ms: number) => {
+		for (let elapsed = 0; elapsed < ms; elapsed += 100) {
+			clock.advance(100);
+			clock.fireDue();
+			for (let index = 0; index < 5; index++) await Promise.resolve();
+		}
+	};
+	// Quiet path: one change, processed once 2 s later (not at 350 ms).
+	scheduler.queue({ path: "quiet.md", reason: "modify" });
+	await step(1_900);
+	assert.deepEqual(processed, []);
+	await step(200);
+	await settle(scheduler, clock);
+	assert.deepEqual(processed.map((entry) => entry.path), ["quiet.md"]);
+	assert.ok(processed[0]!.at >= 2_000 && processed[0]!.at <= 2_100);
+	// Noisy path: a write every second never goes quiet for 2 s, so max wait
+	// (5 s after the first change) forces one coalesced admission.
+	processed.length = 0;
+	const start = clock.now();
+	scheduler.queue({ path: "noisy.md", reason: "modify", opId: "op-0" });
+	for (let index = 1; index < 8 && processed.length === 0; index++) {
+		await step(1_000);
+		if (processed.length === 0) scheduler.queue({ path: "noisy.md", reason: "modify", opId: `op-${index}` });
+	}
+	await settle(scheduler, clock);
+	assert.equal(processed.length, 1);
+	assert.equal(processed[0]!.path, "noisy.md");
+	assert.ok(processed[0]!.at - start >= 5_000 && processed[0]!.at - start <= 5_100, `noisy at ${processed[0]!.at - start}`);
 	scheduler.stop();
 });
 

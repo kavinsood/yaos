@@ -162,6 +162,12 @@ interface ReconciliationControllerDeps {
 	 * Must not be wired in production main.ts.
 	 */
 	registerDiskIngestPort?(port: DiskIngestPort): void;
+	/**
+	 * Disk-change batching windows for the Markdown admission scheduler.
+	 * Production leaves this unset (DEFAULT_SETTLE_MS / DEFAULT_MAX_WAIT_MS);
+	 * tests that exercise retry rather than batching shorten it.
+	 */
+	markdownAdmissionTiming?: { settleMs?: number; maxWaitMs?: number };
 }
 
 const OPEN_FILE_EXTERNAL_EDIT_IDLE_GRACE_MS = 1200;
@@ -347,6 +353,7 @@ export class ReconciliationController {
 
 	constructor(private readonly deps: ReconciliationControllerDeps) {
 		this.markdownAdmission = new MarkdownAdmissionScheduler({
+			...deps.markdownAdmissionTiming,
 			process: (intent, isCurrent) => this.processMarkdownAdmission(intent, isCurrent),
 			onError: (error) => this.deps.log(`Markdown admission scheduler failed: ${String(error)}`),
 		});
