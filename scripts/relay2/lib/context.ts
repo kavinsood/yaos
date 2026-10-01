@@ -3,7 +3,7 @@
  * operator login. Persisted (secrets included) to logs/relay2/context-<worker>.json; never printed.
  */
 import { randomBytes } from "node:crypto";
-import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { mutateLifecycle, requestJson, sha256Hex, vaultRoute } from "../../../tests/live/schema4Live";
 import { ProductionImportSession } from "../../../tests/live/productionImport";
@@ -20,6 +20,8 @@ export interface Context {
 	devices: Record<string, LiveIdentity>;
 	createdAt: string;
 	seeded?: Record<string, unknown>;
+	/** Set when this context is a fresh vault created on a reused (already claimed) worker. */
+	freshVault?: { label: string; previousVaultId: string; createdAt: string };
 }
 
 export function contextPath(host: string) { return join(LOG_DIR, `context-${workerName(host)}.json`); }
@@ -139,6 +141,37 @@ export async function claim(host: string, deviceNames = ["A", "B"]): Promise<Con
 	saveContext(context);
 	for (const name of deviceNames.slice(1)) await addDevice(context, name);
 	log(`claimed ${workerName(host)} vault; devices ${Object.keys(context.devices).join(",")}`);
+	return context;
+}
+
+/**
+ * Worker reuse (runfast.sh --reuse-pool): on an already-claimed worker, create a NEW vault through the operator
+ * console (POST /operator/vaults, random 16-byte vaultId → YAOS_SYNC idFromName(vaultId) = a brand-new DO
+ * instance), mint an owner-bootstrap code and enroll fresh devices. The previous context is kept as
+ * context-<worker>.pre-<label>.json. Idempotent per label: a context already created for <label> is returned.
+ */
+export async function freshVault(host: string, label: string, deviceNames = ["A", "B"]): Promise<Context> {
+	const old = loadContext(host);
+	if (old.freshVault?.label === label) { log(`fresh vault for ${label} already present`); return old; }
+	const backup = contextPath(host).replace(/\.json$/, `.pre-${label}.json`);
+	if (!existsSync(backup)) { copyFileSync(contextPath(host), backup); chmodSync(backup, 0o600); }
+	const cookie = await operatorLogin(host, old.operatorRecoveryKey);
+	const headers = { Cookie: cookie, "Content-Type": "application/json" };
+	const created = await fetch(`${host}/operator/vaults`, { method: "POST", headers, body: JSON.stringify({ name: `relay2-${label}` }) });
+	const value = await json(created);
+	const vaultId = findVaultId(value?.vault ?? null);
+	if (!created.ok || !vaultId) throw new Error(`create vault failed ${created.status} ${String(value?.error ?? "")}`);
+	if (vaultId === old.vaultId) throw new Error("create vault returned the previous vault id");
+	const code = await json(await fetch(`${host}/operator/vaults/${encodeURIComponent(vaultId)}/owner-code`, { method: "POST",
+		headers, body: JSON.stringify({ purpose: "owner-bootstrap" }) }));
+	if (typeof code?.pairingCode !== "string") throw new Error(`owner-code failed (${String(code?.error ?? "")})`);
+	const first = await enroll(host, code.pairingCode, `relay2-${deviceNames[0]}`, vaultId);
+	const context: Context = { host, vaultId, vaultGeneration: first.vaultGeneration, operatorRecoveryKey: old.operatorRecoveryKey,
+		operatorCookie: cookie, devices: { [deviceNames[0]!]: first.identity }, createdAt: new Date().toISOString(),
+		freshVault: { label, previousVaultId: old.vaultId, createdAt: new Date().toISOString() } };
+	saveContext(context);
+	for (const name of deviceNames.slice(1)) await addDevice(context, name);
+	log(`fresh vault ${vaultId.slice(0, 8)}... on ${workerName(host)} for ${label}; devices ${Object.keys(context.devices).join(",")}`);
 	return context;
 }
 

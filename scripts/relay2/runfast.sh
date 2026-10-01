@@ -21,6 +21,15 @@
 # per line), progress.json (snapshot: stage, counts, running, failed, per-phase status/worker/start/end).
 # Resumable: a phase whose raw/<phase>.json exists without an "error" key is skipped. A failed phase is retried once
 # on a fresh worker, then recorded as failed; the run continues. Per-phase timeout (default 45 min, small 20 min).
+#
+# --reuse-pool <file> (account DO-namespace cap, CF error 10067: each worker = 3 namespaces, max 500): instead of a
+# new worker name per phase, (re)deploy onto an existing idle yaos-relay2-* worker listed in <file> (one per line,
+# taken in order). Same script name + same DO classes = same namespaces (no new ones). Each pool worker is used by at
+# most one phase attempt of the run (claimed atomically: state/pool/<worker>; mapping in state/pool.tsv), and its
+# state is fresh because context.ts --fresh-vault creates a NEW vault (random vaultId → new YAOS_SYNC DO instance)
+# with new devices + standard seed. gql (scriptName + namespaceId + [deploy start, phase end]) then sees only this
+# phase's traffic, the worker's previous traffic being hours older. The previous context / deploy record are kept as
+# context-<w>.pre-<label>.json / deploy-<w>.pre-<tag>.json. Workers are never deleted.
 set -uo pipefail
 EXP=/Users/kavin/personal/obsidiansync/experiments
 MAIN=$EXP/yaos-relay2
@@ -28,7 +37,7 @@ HERE=${0:A:h}
 source $EXP/env.sh
 ulimit -n 10240 2>/dev/null || true
 
-SHA="" TAG="f$(date +%m%d)" DRY=0 SMALL=0 JOBS=10 ONLY_PHASES="" ONLY_LANES="" FINAL=1
+SHA="" TAG="f$(date +%m%d)" DRY=0 SMALL=0 JOBS=10 ONLY_PHASES="" ONLY_LANES="" FINAL=1 POOL=""
 while (( $# )); do
   case $1 in
     --sha) SHA=$2; shift 2;;
@@ -38,11 +47,13 @@ while (( $# )); do
     --phases) ONLY_PHASES=$2; shift 2;;
     --lanes) ONLY_LANES=$2; shift 2;;
     --no-final) FINAL=0; shift;;
+    --reuse-pool) POOL=${2:A}; shift 2;;
     --dry-run) DRY=1; shift;;
     *) echo "unknown arg $1" >&2; exit 2;;
   esac
 done
-[[ -n $SHA ]] || { echo "usage: runfast.sh --sha <commit> [--tag t] [--small] [--jobs n] [--phases a,b] [--lanes A,B] [--no-final] [--dry-run]" >&2; exit 2; }
+[[ -n $SHA ]] || { echo "usage: runfast.sh --sha <commit> [--tag t] [--small] [--jobs n] [--phases a,b] [--lanes A,B] [--no-final] [--reuse-pool file] [--dry-run]" >&2; exit 2; }
+[[ -z $POOL || -s $POOL ]] || { echo "reuse pool $POOL missing/empty" >&2; exit 2; }
 SHA=$(git -C $MAIN rev-parse --verify "$SHA^{commit}") || exit 2
 TREE=$EXP/yaos-relay2-run-${SHA[1,8]}
 LOGS=$EXP/logs/relay2/runall-$TAG; (( SMALL )) && LOGS=$LOGS-small
@@ -214,8 +225,20 @@ deploy_args() {   # deploy_args <spec> -> --relay on|off + vars
 adapter_of() { [[ $1 == base || $1 == k1base ]] && print base || print relay; }
 
 # Fresh worker name for a phase: attempt k = number of earlier deploys of this phase + 1.
+# With --reuse-pool: the next unclaimed pool worker (atomic mkdir claim; one phase attempt per worker).
 next_worker() {
-  local id=$1 k=1 base=yaos-relay2-$TAG-${(L)1}
+  local id=$1 k=1 base=yaos-relay2-$TAG-${(L)1} w
+  if [[ -n $POOL ]]; then
+    (( DRY )) && { print -r -- "<pool>"; return 0; }
+    mkdir -p $STATE/pool
+    for w in ${(f)"$(grep -E '^yaos-relay2-[a-z0-9-]+$' $POOL)"}; do
+      if mkdir $STATE/pool/$w 2>/dev/null; then
+        print -r -- "$id	$w	$(iso)" >> $STATE/pool.tsv; print -r -- $id > $STATE/pool/$w/phase
+        print -r -- $w; return 0
+      fi
+    done
+    say "reuse pool exhausted ($POOL)"; return 1
+  fi
   [[ -f $LOGS/progress.jsonl ]] && k=$(( $(grep -F "\"phase\": \"$id\"," $LOGS/progress.jsonl | grep -c '"status": "deploy"') + 1 ))
   (( k == 1 )) && print -r -- $base || print -r -- $base-a$k
 }
@@ -223,15 +246,23 @@ next_worker() {
 # provision <id> <log>: deploy a fresh worker + claim + standard seed; prints "<worker> <start>" on success.
 provision() {
   local id=$1 log=$2 spec=${SPEC[$1]} w t0
-  w=$(next_worker $id); t0=$(iso)
-  ev phase=$id lane=${LANE[$id]} variant=$spec status=deploy worker=$w start=$t0
+  w=$(next_worker $id) || return 1; t0=$(iso)
+  local ctxflags=()
+  if [[ -n $POOL ]]; then
+    ctxflags=(--fresh-vault $TAG-$id)
+    local dj=$EXP/logs/relay2/deploy-$w.json
+    [[ -f $dj && ! -f ${dj%.json}.pre-$TAG.json ]] && cp -p $dj ${dj%.json}.pre-$TAG.json
+    ev phase=$id lane=${LANE[$id]} variant=$spec status=deploy worker=$w start=$t0 reused=1
+  else
+    ev phase=$id lane=${LANE[$id]} variant=$spec status=deploy worker=$w start=$t0
+  fi
   ensure_token
   zsh $TREE/scripts/relay2/deploy.sh $w ${=$(deploy_args $spec)} $COMMON_VARS --src $TREE --require-clean >> $log 2>&1 \
     || { print -r -- "[runfast] DEPLOY FAILED $w" >> $log; return 1; }
   local attempt
   for attempt in 1 2 3 4; do
     (cd $TREE && RELAY2_WORKTREE=$TREE node tests/run-typescript.mjs --test-aliases scripts/relay2/context.ts \
-      --host $(host_of $w) --devices A,B,C --seed standard) >> $log 2>&1 && { print -r -- "$w $t0"; return 0; }
+      --host $(host_of $w) --devices A,B,C --seed standard $ctxflags) >> $log 2>&1 && { print -r -- "$w $t0"; return 0; }
     print -r -- "[runfast] context attempt $attempt failed" >> $log; sleep 20
   done
   return 1
@@ -309,8 +340,8 @@ if (( DRY )); then
   exit 0
 fi
 prepare_tree
-ev phase=_stage status=start tag=$TAG sha=$SHA small=$SMALL pid=$$ jobs=$JOBS
-say "runfast tag=$TAG sha=${SHA[1,8]} small=$SMALL jobs=$JOBS lanes B=${#ORDER_B} A=${#ORDER_A} logs=$LOGS"
+ev phase=_stage status=start tag=$TAG sha=$SHA small=$SMALL pid=$$ jobs=$JOBS pool=${POOL:-none}
+say "runfast tag=$TAG sha=${SHA[1,8]} small=$SMALL jobs=$JOBS lanes B=${#ORDER_B} A=${#ORDER_A} pool=${POOL:-none} logs=$LOGS"
 
 # Lane B (parallel) + lane A provisioning.
 ev phase=_stage status=laneB
