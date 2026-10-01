@@ -1,0 +1,45 @@
+server/src/relayBodies.ts
+  s_fb9412dd2d776a::t_7140f705a7c8ba 6-11,29,37,61-75,187-208,332-334,336-338,545,601-604,636,640,645-769,792-793,809-828,858,861,899-900,902-903,922,940-947,976-977,979-993,1033-1037,1084-1089,1093-1101,1108-1124,1221-1229,1239,1352-1359,1519
+server/src/relayBodyStore.ts
+  s_fb9412dd2d776a::t_f666dfda34bd5d 13-16,57-78,238-369,372-381,432-439,448-449
+server/src/relayTail.ts
+  s_df8cfbf01530e3::t_85596e9e369c0b 1-95
+server/src/vaultCatalogStore.ts
+  s_2bc1830cee836b::t_8bff907c4d25a8 5,445-455,480-485,819-823,835-858
+server/src/vaultDocumentStore.ts
+  s_df8cfbf01530e3::t_a19a48bb6716a8 9-11,246-258,1006,1013,1043-1070,1084,1089-1096,1107,1109-1110,1368-1383,1562-1574,1648,1650-1651,1654,1724-1752,1761,1763,1769-1780,1783-1860,2021-2023,2367,2393-2414,2445,2468
+server/src/vaultStore.ts
+  s_df8cfbf01530e3::t_fb313a396ed5ae 453-456
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "28ed06b9d7f67997a6c859daa28a86d0b4d7eae5",
+  "prompts": {},
+  "sessions": {
+    "s_2bc1830cee836b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ada6157df203a32a9",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_df8cfbf01530e3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-afe0db35fdc6eca3b",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_fb9412dd2d776a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a6b9308dcda4dea54",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
