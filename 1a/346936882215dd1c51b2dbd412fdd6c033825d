@@ -1,0 +1,31 @@
+src/status/statusBarController.ts
+  s_4da03de9eee2de::t_08c0960f67e731 122-124
+tests/client/relay-receipts-vaultsync.ts
+  s_fb9412dd2d776a::t_5bc37ba863c297 1-513
+tests/client/status-label.ts
+  s_4da03de9eee2de::t_8b67f572937150 105
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "1a346936882215dd1c51b2dbd412fdd6c033825d",
+  "prompts": {},
+  "sessions": {
+    "s_4da03de9eee2de": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a09756dc78127a702",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_fb9412dd2d776a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a6b9308dcda4dea54",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
