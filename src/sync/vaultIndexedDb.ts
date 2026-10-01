@@ -2,6 +2,14 @@ import { vaultIdbName } from "./vaultPersistence";
 import type { StoredBodySettlement } from "./bodySettlement";
 import type { VaultAuthorityIdentity } from "../collaboration/authority";
 import type { SemanticEpoch } from "@shared/semanticEpoch";
+import {
+	cloneStructuralIntent,
+	sameStructuralPlan,
+	sameStructuralScope,
+	validateStructuralIntent,
+	type StoredStructuralIntent,
+	type StructuralIntentScope,
+} from "./structuralIntent";
 
 interface StoredDocumentFields {
 	documentId: string;
@@ -228,7 +236,7 @@ export function assertResetAllowed(
 }
 
 
-const DATABASE_VERSION = 7;
+const DATABASE_VERSION = 8;
 const DOCUMENTS = "documents";
 const CANDIDATES = "pendingCandidates";
 const LIFECYCLE = "lifecycleOperations";
@@ -243,6 +251,7 @@ const BODY_SETTLEMENTS = "bodySettlements";
 const CANVAS_CANDIDATES = "canvasCandidates";
 const CANVAS_SETTLEMENTS = "canvasSettlements";
 const CANVAS_LIFECYCLE = "canvasLifecycle";
+const STRUCTURAL_INTENTS = "structural-intents";
 const SCHEMA_8_DATABASE_SUFFIX = ":schema-8";
 const LOCAL_IDENTITY_KEY = "localIdentity";
 
@@ -281,9 +290,9 @@ export class VaultIndexedDb {
 	private readonly databaseName: string;
 
 	constructor(
-		vaultId: string,
-		vaultGeneration: string,
-		folderKey: string,
+		private readonly vaultId: string,
+		private readonly vaultGeneration: string,
+		private readonly folderKey: string,
 		private readonly indexedDb: IDBFactory = window.indexedDB,
 	) {
 		this.databaseName = schema8VaultIdbName(vaultId, vaultGeneration, folderKey);
@@ -313,10 +322,72 @@ export class VaultIndexedDb {
 					db.createObjectStore(CANVAS_SETTLEMENTS, { keyPath: "documentId" });
 				}
 				if (event.oldVersion < 7) db.createObjectStore(CANVAS_LIFECYCLE, { keyPath: "operationId" });
+				if (event.oldVersion < 8) db.createObjectStore(STRUCTURAL_INTENTS, { keyPath: "operationId" });
 			};
 			request.onsuccess = () => resolve(request.result);
 			request.onerror = () => reject(request.error ?? new Error(`Failed to open ${this.databaseName}`));
 		});
+	}
+
+	private assertStructuralScope(scope: StructuralIntentScope): void {
+		if (scope.vaultId !== this.vaultId || scope.vaultGeneration !== this.vaultGeneration
+			|| scope.folderKey !== this.folderKey || !scope.accountId?.trim()) {
+			throw new Error("Structural intent scope does not match the vault database");
+		}
+	}
+
+	async getStructuralIntent(scope: StructuralIntentScope, operationId: string): Promise<StoredStructuralIntent | null> {
+		this.assertStructuralScope(scope);
+		const db = await this.database;
+		const transaction = db.transaction(STRUCTURAL_INTENTS, "readonly");
+		const done = transactionDone(transaction);
+		const value = await requestValue(transaction.objectStore(STRUCTURAL_INTENTS).get(operationId)) as StoredStructuralIntent | undefined;
+		await done;
+		return value && sameStructuralScope(value.scope, scope) ? cloneStructuralIntent(value) : null;
+	}
+
+	async listStructuralIntents(scope: StructuralIntentScope): Promise<StoredStructuralIntent[]> {
+		this.assertStructuralScope(scope);
+		const db = await this.database;
+		const transaction = db.transaction(STRUCTURAL_INTENTS, "readonly");
+		const done = transactionDone(transaction);
+		const values = await requestValue(transaction.objectStore(STRUCTURAL_INTENTS).getAll()) as StoredStructuralIntent[];
+		await done;
+		return values.filter((value) => sameStructuralScope(value.scope, scope))
+			.sort((left, right) => left.createdAt - right.createdAt || left.operationId.localeCompare(right.operationId))
+			.map(cloneStructuralIntent);
+	}
+
+	async putStructuralIntent(intent: StoredStructuralIntent): Promise<void> {
+		const value = cloneStructuralIntent(intent);
+		validateStructuralIntent(value);
+		this.assertStructuralScope(value.scope);
+		const db = await this.database;
+		const transaction = db.transaction(STRUCTURAL_INTENTS, "readwrite", { durability: "strict" });
+		const done = transactionDone(transaction);
+		const store = transaction.objectStore(STRUCTURAL_INTENTS);
+		const current = await requestValue(store.get(value.operationId)) as StoredStructuralIntent | undefined;
+		if (current && (!sameStructuralPlan(current, value) || (current.phase === "placing" && value.phase === "staging"))) {
+			await done;
+			throw new Error("Structural operation ID already has a different plan or later phase");
+		}
+		store.put(value);
+		await done;
+	}
+
+	async deleteStructuralIntent(scope: StructuralIntentScope, operationId: string): Promise<void> {
+		this.assertStructuralScope(scope);
+		const db = await this.database;
+		const transaction = db.transaction(STRUCTURAL_INTENTS, "readwrite", { durability: "strict" });
+		const done = transactionDone(transaction);
+		const store = transaction.objectStore(STRUCTURAL_INTENTS);
+		const current = await requestValue(store.get(operationId)) as StoredStructuralIntent | undefined;
+		if (current && !sameStructuralScope(current.scope, scope)) {
+			await done;
+			throw new Error("Structural intent belongs to another account");
+		}
+		store.delete(operationId);
+		await done;
 	}
 
 	async getDocument(documentId: string): Promise<StoredDocument | null> {
@@ -823,10 +894,11 @@ export class VaultIndexedDb {
 	): Promise<void> {
 		if (moves.length === 0) return;
 		const db = await this.database;
-		const transaction = db.transaction(PATHS, "readwrite");
+		const transaction = db.transaction(PATHS, "readwrite", { durability: "strict" });
+		const done = transactionDone(transaction);
 		const store = transaction.objectStore(PATHS);
 		for (const move of moves) store.put(move.path, move.bodyId);
-		await transactionDone(transaction);
+		await done;
 	}
 
 
@@ -871,7 +943,7 @@ export class VaultIndexedDb {
 		const db = await this.database;
 		const transaction = db.transaction(
 			[DOCUMENTS, CANDIDATES, LIFECYCLE, ATTACHMENT_OPERATIONS, OUTSTANDING, RECOVERY_STATE,
-				CANVAS_CANDIDATES, CANVAS_LIFECYCLE],
+				CANVAS_CANDIDATES, CANVAS_LIFECYCLE, STRUCTURAL_INTENTS],
 			"readonly",
 		);
 		const summary = await this.readPendingWorkSummary(transaction);
@@ -905,6 +977,7 @@ export class VaultIndexedDb {
 			CANVAS_CANDIDATES,
 			CANVAS_SETTLEMENTS,
 			CANVAS_LIFECYCLE,
+			STRUCTURAL_INTENTS,
 		];
 		const transaction = db.transaction(stores, "readwrite");
 		const summary = await this.readPendingWorkSummary(transaction);
@@ -974,6 +1047,7 @@ export class VaultIndexedDb {
 			attachmentOperations,
 			outstandingSettlements,
 			recoveryState,
+			structuralIntents,
 		] = await Promise.all([
 			requestValue(transaction.objectStore(DOCUMENTS).getAll()) as Promise<StoredDocument[]>,
 			Promise.all([requestValue(transaction.objectStore(CANDIDATES).count()),
@@ -983,6 +1057,7 @@ export class VaultIndexedDb {
 			requestValue(transaction.objectStore(ATTACHMENT_OPERATIONS).count()),
 			requestValue(transaction.objectStore(OUTSTANDING).count()),
 			requestValue<unknown>(transaction.objectStore(RECOVERY_STATE).get("state")),
+			requestValue(transaction.objectStore(STRUCTURAL_INTENTS).count()),
 		]);
 		const recovery = typeof recoveryState === "object" && recoveryState !== null
 			? recoveryState as { activeCaptureId?: unknown; activeRestore?: unknown }
@@ -994,7 +1069,7 @@ export class VaultIndexedDb {
 			attachmentOperations,
 			outstandingSettlements,
 			activeRecoveryOperations:
-				(typeof recovery?.activeCaptureId === "string" ? 1 : 0)
+				structuralIntents + (typeof recovery?.activeCaptureId === "string" ? 1 : 0)
 				+ (typeof recovery?.activeRestore === "object" && recovery.activeRestore !== null ? 1 : 0),
 		};
 	}

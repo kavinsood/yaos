@@ -30,6 +30,14 @@ import type {
 import type { PreservedUnresolvedEntry } from "../../../src/sync/preservedUnresolved";
 import type { StoredBodySettlement } from "../../../src/sync/bodySettlement";
 import { readDiskIndex, type DiskIndex } from "../../../src/sync/diskIndex";
+import {
+	cloneStructuralIntent,
+	sameStructuralPlan,
+	sameStructuralScope,
+	validateStructuralIntent,
+	type StoredStructuralIntent,
+	type StructuralIntentScope,
+} from "../../../src/sync/structuralIntent";
 
 /**
  * Convert a binary binding without allocating or copying its bytes.
@@ -201,6 +209,10 @@ export class NodeVaultDatabase implements VaultDatabasePort, BootstrapDatabasePo
 				singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
 				value_json TEXT NOT NULL
 			) STRICT;
+			CREATE TABLE IF NOT EXISTS structural_intents (
+				operation_id TEXT PRIMARY KEY,
+				value_json TEXT NOT NULL
+			) STRICT;
 			CREATE TABLE IF NOT EXISTS initial_import (
 				vault_id TEXT PRIMARY KEY,
 				value_json TEXT NOT NULL
@@ -271,6 +283,69 @@ export class NodeVaultDatabase implements VaultDatabasePort, BootstrapDatabasePo
 			}
 			throw error;
 		}
+	}
+
+	private assertStructuralScope(scope: StructuralIntentScope): void {
+		const identity = this.statement("SELECT vault_id, vault_generation, folder_key FROM client_identity WHERE singleton = 1")
+			.get() as SqlRow | undefined;
+		if (!identity || scope.vaultId !== identity.vault_id || scope.vaultGeneration !== identity.vault_generation
+			|| scope.folderKey !== identity.folder_key || typeof scope.accountId !== "string" || !scope.accountId.trim()) {
+			throw new Error("Structural intent scope does not match the vault database");
+		}
+	}
+
+	private decodeStructuralIntent(row: SqlRow): StoredStructuralIntent {
+		const value = jsonValue<StoredStructuralIntent>(row.value_json, "structural_intents.value_json");
+		validateStructuralIntent(value);
+		if (value.operationId !== row.operation_id) throw new Error("Structural intent operation ID does not match its key");
+		return value;
+	}
+
+	private readStructuralIntent(operationId: string): StoredStructuralIntent | null {
+		const row = this.statement("SELECT operation_id, value_json FROM structural_intents WHERE operation_id = ?")
+			.get(operationId) as SqlRow | undefined;
+		return row ? this.decodeStructuralIntent(row) : null;
+	}
+
+	async getStructuralIntent(scope: StructuralIntentScope, operationId: string): Promise<StoredStructuralIntent | null> {
+		this.assertStructuralScope(scope);
+		const value = this.readStructuralIntent(operationId);
+		return value && sameStructuralScope(value.scope, scope) ? cloneStructuralIntent(value) : null;
+	}
+
+	async listStructuralIntents(scope: StructuralIntentScope): Promise<StoredStructuralIntent[]> {
+		this.assertStructuralScope(scope);
+		return (this.statement("SELECT operation_id, value_json FROM structural_intents").all() as SqlRow[])
+			.map((row) => this.decodeStructuralIntent(row))
+			.filter((value) => sameStructuralScope(value.scope, scope))
+			.sort((left, right) => left.createdAt - right.createdAt || left.operationId.localeCompare(right.operationId))
+			.map(cloneStructuralIntent);
+	}
+
+	async putStructuralIntent(intent: StoredStructuralIntent): Promise<void> {
+		const value = cloneStructuralIntent(intent);
+		validateStructuralIntent(value);
+		this.assertStructuralScope(value.scope);
+		this.transaction(() => {
+			const current = this.readStructuralIntent(value.operationId);
+			if (current && (!sameStructuralPlan(current, value) || (current.phase === "placing" && value.phase === "staging"))) {
+				throw new Error("Structural operation ID already has a different plan or later phase");
+			}
+			this.statement(`INSERT INTO structural_intents(operation_id, value_json) VALUES (?, ?)
+				ON CONFLICT(operation_id) DO UPDATE SET value_json=excluded.value_json`)
+				.run(value.operationId, JSON.stringify(value));
+		});
+	}
+
+	async deleteStructuralIntent(scope: StructuralIntentScope, operationId: string): Promise<void> {
+		this.assertStructuralScope(scope);
+		this.transaction(() => {
+			const current = this.readStructuralIntent(operationId);
+			if (current && !sameStructuralScope(current.scope, scope)) {
+				throw new Error("Structural intent belongs to another account");
+			}
+			this.statement("DELETE FROM structural_intents WHERE operation_id = ?").run(operationId);
+		});
 	}
 
 	async getDocument(documentId: string): Promise<StoredDocument | null> {
@@ -794,9 +869,10 @@ export class NodeVaultDatabase implements VaultDatabasePort, BootstrapDatabasePo
 		this.statement("DELETE FROM recovery_state WHERE singleton = 1").run();
 	}
 
-	async getPendingWorkSummary(): Promise<PendingWorkSummary> {
+	private readPendingWorkSummary(): PendingWorkSummary {
 		const scalar = (sql: string): number => Number((this.statement(sql).get() as SqlRow).count);
-		const recovery = await this.getRecoveryState() as { activeCaptureId?: unknown; activeRestore?: unknown } | null;
+		const row = this.statement("SELECT value_json FROM recovery_state WHERE singleton = 1").get() as SqlRow | undefined;
+		const recovery = row ? jsonValue<{ activeCaptureId?: unknown; activeRestore?: unknown }>(row.value_json, "recovery_state.value_json") : null;
 		return {
 			dirtyDocuments: scalar("SELECT COUNT(*) AS count FROM documents WHERE dirty = 1"),
 			pendingCandidates: scalar("SELECT COUNT(*) AS count FROM pending_candidates") + scalar("SELECT COUNT(*) AS count FROM canvas_candidates"),
@@ -804,8 +880,13 @@ export class NodeVaultDatabase implements VaultDatabasePort, BootstrapDatabasePo
 			attachmentOperations: scalar("SELECT COUNT(*) AS count FROM attachment_operations"),
 			outstandingSettlements: scalar("SELECT COUNT(*) AS count FROM outstanding_settlements"),
 			activeRecoveryOperations: (typeof recovery?.activeCaptureId === "string" ? 1 : 0)
-				+ (typeof recovery?.activeRestore === "object" && recovery.activeRestore !== null ? 1 : 0),
+				+ (typeof recovery?.activeRestore === "object" && recovery.activeRestore !== null ? 1 : 0)
+				+ scalar("SELECT COUNT(*) AS count FROM structural_intents"),
 		};
+	}
+
+	async getPendingWorkSummary(): Promise<PendingWorkSummary> {
+		return this.readPendingWorkSummary();
 	}
 
 	async hasPendingWork(): Promise<boolean> {
@@ -813,17 +894,17 @@ export class NodeVaultDatabase implements VaultDatabasePort, BootstrapDatabasePo
 	}
 
 	async clearLocalCache(options: { discardPendingWork?: boolean } = {}): Promise<PendingWorkSummary> {
-		const summary = await this.getPendingWorkSummary();
-		assertResetAllowed(summary, options.discardPendingWork);
-		this.transaction(() => {
+		return this.transaction(() => {
+			const summary = this.readPendingWorkSummary();
+			assertResetAllowed(summary, options.discardPendingWork);
 			for (const table of ["documents", "pending_candidates", "lifecycle_operations", "attachment_operations",
 				"bootstrap_progress", "feed_cursor", "outstanding_settlements", "materialized_paths", "recovery_state",
 				"initial_import", "disk_index", "preserved_unresolved", "body_settlements", "canvas_candidates",
-				"canvas_lifecycle", "canvas_settlements"]) {
+				"canvas_lifecycle", "canvas_settlements", "structural_intents"]) {
 				this.database.exec(`DELETE FROM ${table}`);
 			}
+			return summary;
 		});
-		return summary;
 	}
 
 	async getDiagnosticsSnapshot(): Promise<{
