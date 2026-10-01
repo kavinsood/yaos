@@ -13,6 +13,10 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { createJiti } from "jiti";
+import { exactMarkdownDiskFingerprint } from "../../server/src/shared/markdownCodec.ts";
+import type { StoredStructuralIntent } from "../../src/sync/structuralIntent.ts";
 import { suite } from "../harness.ts";
 import {
 	enroll,
@@ -36,6 +40,16 @@ import { launchLossyProxy, launchWrangler, type LossyProxy, type WranglerTarget 
 
 const WATCH_MS = 25_000;
 const RECONCILE_MS = 45_000;
+
+const databaseLoader = createJiti(import.meta.url, {
+	alias: {
+		"@shared": fileURLToPath(new URL("../../server/src/shared", import.meta.url)),
+		obsidian: fileURLToPath(new URL("../../packages/cli/src/obsidian-shim.ts", import.meta.url)),
+	},
+});
+const { NodeVaultDatabase } = await databaseLoader.import<typeof import("../../packages/cli/src/nodeVaultDatabase.ts")>(
+	fileURLToPath(new URL("../../packages/cli/src/nodeVaultDatabase.ts", import.meta.url)),
+);
 const BURST_MS = 90_000;
 const DROPPED_RECOVERY_INTERVAL_MS = 6_000;
 const RECONCILE_INTERVAL_MS = 1_500;
@@ -290,7 +304,10 @@ try {
 	joiningVault = await mkdtemp(join(tmpdir(), "yaos-headless-join-"));
 	externalStore = await mkdtemp(join(tmpdir(), "yaos-headless-external-"));
 	const originText = "# imported before enrollment\n\norigin authority must publish this exact text\n";
+	const originReservedPath = `YAOS.yaos-moving-${crypto.randomUUID()}.md`;
+	const originReservedContent = "reserved visible stage must never become a fresh body\n";
 	await writeFile(join(originVault, "origin.md"), originText, "utf8");
+	await writeFile(join(originVault, originReservedPath), originReservedContent, "utf8");
 	await mkdir(join(originVault, ".obsidian"));
 	await writeFile(join(originVault, ".obsidian", "ignored.md"), "must not sync\n", "utf8");
 	await writeFile(join(originVault, "ignored.txt"), "headless is markdown-only\n", "utf8");
@@ -368,6 +385,8 @@ try {
 		"origin import was durably published before the daemon announced readiness",
 	);
 	s.check(!catalog.has("ignored.txt") && !catalog.has(".obsidian/ignored.md"), "origin import is Markdown-only and excludes .obsidian");
+	s.check(!catalog.has(originReservedPath) && await readIfExists(join(originVault, originReservedPath)) === originReservedContent,
+		"origin import excludes reserved visible structural stages without deleting their bytes");
 	await checked("originImport reaches the second device over its public WebSocket", () => waitFor(
 		() => remoteEquals(requirePeer(), "origin.md", originText),
 		"the public peer to read origin.md",
@@ -446,6 +465,17 @@ try {
 	const renameText = "# rename\n\ncontent survives, identity does not\n";
 	await writeFile(join(originVault, renameBefore), renameText, "utf8");
 	await waitFor(() => remoteEquals(requirePeer(), renameBefore, renameText), `remote baseline ${renameBefore}`, WATCH_MS);
+	await checked("rename starts after the local fresh admission is durably completed", () => waitFor(
+		() => lockOwner?.stderr().includes(`fresh body committed for ${renameBefore} (external-edit)`) === true,
+		() => `local rename baseline receipt\n${lockOwner?.dump() ?? "no origin daemon"}`,
+		WATCH_MS,
+	));
+	const renameAdmissionScan = lockOwner?.authoritativeReconciles().length ?? 0;
+	await checked("rename starts after its accepted disk baseline has an authoritative scan", () => waitFor(
+		() => (lockOwner?.authoritativeReconciles().length ?? 0) > renameAdmissionScan,
+		() => `completed local rename baseline admission\n${lockOwner?.dump() ?? "no origin daemon"}`,
+		RECONCILE_MS,
+	));
 	const oldBodyId = requirePeer().activePaths().get(renameBefore);
 	await rename(join(originVault, renameBefore), join(originVault, renameAfter));
 	await checked("rename publishes exact content at the new path", () => waitFor(
@@ -536,6 +566,147 @@ try {
 			+ `expected=${JSON.stringify(remoteOfflineEdit)}\n${resumedDaemon.dump()}`,
 		RECONCILE_MS,
 	));
+
+	s.section("remote structural batches and durable restart recovery");
+	const originEnrollment: unknown = JSON.parse(await readFile(enrollmentPath, "utf8"));
+	const folderKey = deepString(originEnrollment, ["folderKey"]);
+	const realVaultPath = deepString(originEnrollment, ["realVaultPath"]);
+	if (!folderKey || !realVaultPath) throw new Error("origin enrollment omitted its physical folder identity");
+	const structuralScope = {
+		vaultId: originIdentity.vaultId,
+		vaultGeneration: originIdentity.vaultGeneration,
+		accountId: originIdentity.principalId,
+		folderKey,
+	};
+	const openOriginDatabase = () => new NodeVaultDatabase(originSqlite, {
+		host: originIdentity!.host,
+		realVaultPath,
+		vaultId: structuralScope.vaultId,
+		vaultGeneration: structuralScope.vaultGeneration,
+		deviceId: originIdentity!.deviceId,
+		folderKey,
+	});
+	const batchNotes = [
+		{ from: "batch-first.md", to: "batch-first-moved.md", content: "first batch body\n", bodyId: "" },
+		{ from: "batch-second.md", to: "batch-second-moved.md", content: "second batch body\n", bodyId: "" },
+	];
+	for (const note of batchNotes) note.bodyId = await requirePeer().create(note.from, note.content);
+	await waitFor(async () => (await Promise.all(batchNotes.map(async (note) =>
+		await readIfExists(join(originVault, note.from)) === note.content))).every(Boolean),
+		() => `initial structural sources\n${requireOriginDaemon().dump()}`, RECONCILE_MS);
+	await requirePeer().renameBatch(batchNotes);
+	await checked("remote disjoint rename batch preserves exact contents and stable body identities", () => waitFor(async () =>
+		(await Promise.all(batchNotes.map(async (note) =>
+			await readIfExists(join(originVault, note.to)) === note.content
+			&& await readIfExists(join(originVault, note.from)) === null
+			&& requirePeer().activePaths().get(note.to) === note.bodyId))).every(Boolean),
+		() => `remote disjoint batch\n${requireOriginDaemon().dump()}`, RECONCILE_MS));
+	await requirePeer().renameBatch([
+		{ from: batchNotes[0]!.to, to: batchNotes[1]!.to },
+		{ from: batchNotes[1]!.to, to: batchNotes[0]!.to },
+	]);
+	await checked("remote rename cycle preserves both exact bodies without duplicate admission", () => waitFor(async () =>
+		await readIfExists(join(originVault, batchNotes[1]!.to)) === batchNotes[0]!.content
+		&& await readIfExists(join(originVault, batchNotes[0]!.to)) === batchNotes[1]!.content
+		&& requirePeer().activePaths().get(batchNotes[1]!.to) === batchNotes[0]!.bodyId
+		&& requirePeer().activePaths().get(batchNotes[0]!.to) === batchNotes[1]!.bodyId
+		&& ![...requirePeer().activePaths().keys()].some((path) => /(?:^|\/)YAOS\.yaos-moving-[a-f0-9-]+\.md$/.test(path)),
+		() => `remote cycle\n${requireOriginDaemon().dump()}`, RECONCILE_MS));
+
+	for (const blocked of [false, true]) {
+		const prefix = blocked ? "blocked-recovery" : "successful-recovery";
+		const notes = ["first", "second"].map((suffix) => ({
+			from: `${prefix}-${suffix}.md`, to: `${prefix}-${suffix}-moved.md`,
+			content: `${prefix} ${suffix} retained body\n`, bodyId: "",
+			staging: `YAOS.yaos-moving-${crypto.randomUUID()}.md`,
+		}));
+		for (const note of notes) note.bodyId = await requirePeer().create(note.from, note.content);
+		await waitFor(async () => (await Promise.all(notes.map(async (note) =>
+			await readIfExists(join(originVault, note.from)) === note.content))).every(Boolean),
+			() => `recovery source bodies\n${requireOriginDaemon().dump()}`, RECONCILE_MS);
+		await stopOrigin();
+		await requirePeer().renameBatch(notes);
+		await waitFor(() => notes.every((note) => requirePeer().activePaths().get(note.to) === note.bodyId),
+			"remote recovery catalog identities", WATCH_MS);
+		const intent: StoredStructuralIntent = {
+			format: 1, kind: "rename-batch", phase: blocked ? "placing" : "staging",
+			operationId: crypto.randomUUID(), scope: structuralScope, createdAt: Date.now(),
+			moves: await Promise.all(notes.map(async (note) => ({
+				bodyId: note.bodyId, from: note.from, to: note.to, staging: note.staging,
+				expectedContent: note.content, fingerprint: await exactMarkdownDiskFingerprint(note.content),
+			}))),
+		};
+		const seedDatabase = openOriginDatabase();
+		try {
+			await seedDatabase.putStructuralIntent(intent);
+		} finally {
+			await seedDatabase.close();
+		}
+		for (const note of blocked ? notes : notes.slice(0, 1)) {
+			await rename(join(originVault, note.from), join(originVault, note.staging));
+		}
+		const obstruction = "UNKNOWN DESTINATION BYTES MUST SURVIVE\n";
+		const unknownSource = "UNKNOWN SOURCE BYTES MUST SURVIVE\n";
+		const reservedPath = `YAOS.yaos-moving-${crypto.randomUUID()}.md`;
+		if (blocked) {
+			await writeFile(join(originVault, notes[0]!.to), obstruction, "utf8");
+			await writeFile(join(originVault, notes[1]!.from), unknownSource, "utf8");
+			await writeFile(join(originVault, reservedPath), "orphan stage remains local\n", "utf8");
+		}
+		const recoveryDaemon = await bootOrigin(prefix);
+		if (blocked) {
+			const unrelatedPath = "unrelated-during-blocked-recovery.md";
+			const unrelatedContent = "unrelated local admission continues\n";
+			await writeFile(join(originVault, unrelatedPath), unrelatedContent, "utf8");
+			await checked("blocked structural restart permits unrelated-note progress", () => waitFor(
+				() => remoteEquals(requirePeer(), unrelatedPath, unrelatedContent),
+				() => `unrelated admission during recovery\n${recoveryDaemon.dump()}`, RECONCILE_MS));
+			await checked("blocked recovery preserves all staged, source and destination inputs without admission", () => holdFor(async () => {
+				const remoteCatalog = await bootstrapCatalog(requirePeer().identity);
+				return await readIfExists(join(originVault, notes[0]!.to)) === obstruction
+					&& await readIfExists(join(originVault, notes[1]!.from)) === unknownSource
+					&& await readIfExists(join(originVault, reservedPath)) === "orphan stage remains local\n"
+					&& (await Promise.all(notes.map(async (note) =>
+						await readIfExists(join(originVault, note.staging)) === note.content
+						&& remoteCatalog.get(note.to)?.bodyId === note.bodyId
+						&& remoteCatalog.get(note.to)?.content === note.content
+						&& !remoteCatalog.has(note.from) && !remoteCatalog.has(note.staging)))).every(Boolean)
+					&& !remoteCatalog.has(reservedPath);
+			}, "blocked structural inputs and catalog identities", RECONCILE_INTERVAL_MS * 2));
+			await stopOrigin();
+			const blockedDatabase = openOriginDatabase();
+			try {
+				s.check(await blockedDatabase.getStructuralIntent(structuralScope, intent.operationId) !== null,
+					"blocked restart retains its durable structural intent");
+				s.check((await Promise.all(notes.map(async (note) =>
+					await blockedDatabase.getMaterializedPath(note.bodyId) === note.from))).every(Boolean),
+					"blocked recovery does not advance materialized bookkeeping");
+			} finally {
+				await blockedDatabase.close();
+			}
+			await rename(join(originVault, notes[0]!.to), join(externalStore, "retained-recovery-target.md"));
+			await rename(join(originVault, notes[1]!.from), join(externalStore, "retained-recovery-source.md"));
+			await bootOrigin("resolved blocked structural restart");
+		}
+		await checked(`${prefix} completes exact placement before admitting planned paths`, () => waitFor(async () =>
+			(await Promise.all(notes.map(async (note) =>
+				await readIfExists(join(originVault, note.to)) === note.content
+				&& await readIfExists(join(originVault, note.from)) === null
+				&& await readIfExists(join(originVault, note.staging)) === null))).every(Boolean),
+			() => `completed structural recovery\n${requireOriginDaemon().dump()}`, RECONCILE_MS));
+		await stopOrigin();
+		const recoveredDatabase = openOriginDatabase();
+		try {
+			s.check(await recoveredDatabase.getStructuralIntent(structuralScope, intent.operationId) === null,
+				`${prefix} removes intent only after placement and bookkeeping`);
+			s.check((await Promise.all(notes.map(async (note) =>
+				await recoveredDatabase.getMaterializedPath(note.bodyId) === note.to))).every(Boolean),
+				`${prefix} durably advances both materialized identities`);
+		} finally {
+			await recoveredDatabase.close();
+		}
+		await bootOrigin(`${prefix} bookkeeping reopen`);
+	}
 
 	s.section("dirty-local remote delete and unresolved external rename retirement");
 	const dirtyPath = "dirty-delete.md";
@@ -725,7 +896,7 @@ try {
 	await writeFile(join(originVault, atomicPath), atomicText, "utf8");
 	await waitFor(() => remoteEquals(requirePeer(), atomicPath, atomicText), `remote ${atomicPath}`, RECONCILE_MS);
 	for (let version = 1; version <= 5; version++) {
-		atomicText = `atomic version ${String(version)}\n`;
+		atomicText += `atomic version ${String(version)}\n`;
 		const temporary = join(originVault, `.atomic-${String(version)}.tmp`);
 		await writeFile(temporary, atomicText, "utf8");
 		await rename(temporary, join(originVault, atomicPath));
@@ -741,7 +912,7 @@ try {
 		NEGATIVE_HOLD_MS,
 	));
 	s.check(!diagnosticFor(blind.confirmedDeletes(), atomicPath), "atomic save path was never confirmed as deleted");
-	const unlinkReplacement = "atomic unlink-then-rename replacement\n";
+	const unlinkReplacement = `${atomicText}atomic unlink-then-rename replacement\n`;
 	const unlinkTemporary = join(originVault, ".atomic-unlink-replacement.tmp");
 	await writeFile(unlinkTemporary, unlinkReplacement, "utf8");
 	await rm(join(originVault, atomicPath));
@@ -770,6 +941,36 @@ try {
 			+ blind.dump(),
 		RECONCILE_MS,
 	));
+	const destructivePath = `${DROP_MARKER}destructive.md`;
+	const destructiveAccepted = "retained baseline paragraph\naccepted remote paragraph\n";
+	const destructiveDisk = "retained baseline paragraph\n";
+	await writeFile(join(originVault, destructivePath), destructiveAccepted, "utf8");
+	await waitFor(() => remoteEquals(requirePeer(), destructivePath, destructiveAccepted),
+		`accepted destructive-save baseline ${destructivePath}`, RECONCILE_MS);
+	const destructiveBodyId = requirePeer().activePaths().get(destructivePath);
+	await writeFile(join(originVault, destructivePath), destructiveDisk, "utf8");
+	await checked("destructive unbound disk removal is explicitly preserved instead of published", () => waitFor(
+		() => diagnosticFor(blind.preservedUnresolved(), destructivePath),
+		() => `preserved destructive disk input ${destructivePath}\n${blind.dump()}`,
+		RECONCILE_MS,
+	));
+	await checked("destructive save retains exact local bytes and previously accepted remote paragraphs", () => holdFor(
+		async () => await readIfExists(join(originVault, destructivePath)) === destructiveDisk
+			&& await remoteEquals(requirePeer(), destructivePath, destructiveAccepted)
+			&& requirePeer().activePaths().get(destructivePath) === destructiveBodyId
+			&& !diagnosticFor(blind.confirmedDeletes(), destructivePath),
+		`both destructive-save inputs and original body identity ${destructivePath}`,
+		NEGATIVE_HOLD_MS,
+	));
+	const destructiveArtifacts = async () => (await listVaultFiles(originVault))
+		.filter((path) => path.startsWith(`${destructivePath.slice(0, -3)} (YAOS conflict`) && path.endsWith(".md"));
+	await checked("destructive disk input has an exact independently verifiable conflict artifact", async () => {
+		const artifacts = await destructiveArtifacts();
+		for (const artifact of artifacts) {
+			if (await readFile(join(originVault, artifact), "utf8") === destructiveDisk) return;
+		}
+		throw new Error("no conflict artifact preserves the exact rejected disk bytes");
+	});
 
 	const unreadableDir = `${DROP_MARKER}unreadable`;
 	const unreadablePath = `${unreadableDir}/note.md`;
@@ -831,10 +1032,30 @@ try {
 	s.section("slow-clock reconciliation deferral");
 	await stopOrigin();
 	const slow = await bootOrigin("slow-clock daemon", DROP_MARKER, SLOW_INTERVAL_MS);
+	await checked("destructive conflict retains disk, artifact, and accepted remote input after host restart", () => holdFor(
+		async () => {
+			if (await readIfExists(join(originVault, destructivePath)) !== destructiveDisk
+				|| !await remoteEquals(requirePeer(), destructivePath, destructiveAccepted)
+				|| requirePeer().activePaths().get(destructivePath) !== destructiveBodyId
+				|| diagnosticFor(slow.confirmedDeletes(), destructivePath)) return false;
+			for (const artifact of await destructiveArtifacts()) {
+				if (await readIfExists(join(originVault, artifact)) === destructiveDisk) return true;
+			}
+			return false;
+		},
+		`preserved destructive disk and durable accepted remote input after restart ${destructivePath}`,
+		NEGATIVE_HOLD_MS,
+	));
 	const slowPath = `${DROP_MARKER}slow-delete.md`;
 	const slowText = "slow clock deletion\n";
+	const slowAdmissionScan = slow.authoritativeReconciles().length;
 	await writeFile(join(originVault, slowPath), slowText, "utf8");
 	await waitFor(() => remoteEquals(requirePeer(), slowPath, slowText), `remote ${slowPath}`, SLOW_WAIT_MS);
+	await checked("slow delete starts only after local authoritative admission completes", () => waitFor(
+		() => slow.authoritativeReconciles().length > slowAdmissionScan,
+		() => `accepted local slow-delete baseline\n${slow.dump()}`,
+		SLOW_WAIT_MS,
+	));
 	const deferralsBefore = slow.reconcileDeferrals().length;
 	await rm(join(originVault, slowPath));
 	await waitFor(() => diagnosticFor(slow.deleteCandidates(), slowPath), () => `slow candidate\n${slow.dump()}`, SLOW_WAIT_MS);
@@ -863,12 +1084,12 @@ try {
 	const finalCreateText = "created immediately before SIGTERM\n";
 	const finalModifyPath = "last-instant-modify.md";
 	const finalModifyV1 = "modify baseline\n";
-	const finalModifyV2 = "modified immediately before SIGTERM\n";
+	const finalModifyV2 = `${finalModifyV1}modified immediately before SIGTERM\n`;
 	const finalDeletePath = "last-instant-delete.md";
 	const finalDeleteText = "delete baseline\n";
 	const finalAtomicPath = "last-instant-atomic.md";
 	const finalAtomicV1 = "atomic shutdown baseline\n";
-	const finalAtomicV2 = "atomic shutdown replacement\n";
+	const finalAtomicV2 = `${finalAtomicV1}atomic shutdown replacement\n`;
 	await writeFile(join(originVault, finalModifyPath), finalModifyV1, "utf8");
 	await writeFile(join(originVault, finalDeletePath), finalDeleteText, "utf8");
 	await writeFile(join(originVault, finalAtomicPath), finalAtomicV1, "utf8");

@@ -301,6 +301,10 @@ async function postLifecycle(identity: Identity, request: LifecycleRequest): Pro
 }
 
 async function publishRoot(identity: Identity, request: LifecycleRequest, receipt: LifecycleReceipt): Promise<void> {
+	return publishRoots(identity, [request], [receipt]);
+}
+
+async function publishRoots(identity: Identity, requests: LifecycleRequest[], receipts: LifecycleReceipt[]): Promise<void> {
 	const current = await fetchBounded(route(identity, "root"), { headers: headers(identity) });
 	if (!current.ok) throw new Error(`root read failed (${current.status})`);
 	const rootEpoch = Number(current.headers.get("x-yaos-root-epoch"));
@@ -309,10 +313,12 @@ async function publishRoot(identity: Identity, request: LifecycleRequest, receip
 	Y.applyUpdate(root, new Uint8Array(await current.arrayBuffer()));
 	const before = Y.encodeStateVector(root);
 	const paths = root.getMap<string>("pathToId");
-	if (request.kind === "delete") paths.delete(receipt.path);
-	else {
+	for (const [index, request] of requests.entries()) {
+		if (request.kind === "delete") paths.delete(receipts[index]!.path);
 		if (request.kind === "rename" && request.fromPath) paths.delete(request.fromPath);
-		paths.set(receipt.path, request.fileId);
+	}
+	for (const [index, request] of requests.entries()) {
+		if (request.kind !== "delete") paths.set(receipts[index]!.path, request.fileId);
 	}
 	const update = Y.encodeStateAsUpdate(root, before);
 	root.destroy();
@@ -320,14 +326,14 @@ async function publishRoot(identity: Identity, request: LifecycleRequest, receip
 		method: "POST",
 		headers: headers(identity, { "Content-Type": YAOS_BINARY_CONTENT_TYPE }),
 		body: encodeBinaryEnvelope({
-			operations: [{ ...request, vaultSequence: receipt.vaultSequence }],
+			operations: requests.map((request, index) => ({ ...request, vaultSequence: receipts[index]!.vaultSequence })),
 			rootUpdate: update,
 			rootEpoch,
 		}),
 	}), "root publication");
 	if (publication.vaultGeneration !== identity.vaultGeneration
 		|| !Array.isArray(publication.operationIds)
-		|| !publication.operationIds.includes(request.operationId)
+		|| !requests.every((request) => (publication.operationIds as unknown[]).includes(request.operationId))
 		|| !Number.isSafeInteger(publication.vaultSequence)
 		|| !Number.isSafeInteger(publication.rootGeneration)) {
 		throw new Error(`root publication returned an invalid receipt: ${JSON.stringify(publication)}`);
@@ -522,6 +528,41 @@ export class PublicPeer {
 		};
 		const receipt = await postLifecycle(this.identity, request);
 		await publishRoot(this.identity, request, receipt);
+	}
+
+	async renameBatch(moves: readonly { from: string; to: string }[]): Promise<void> {
+		const paths = this.activePaths();
+		const requests = await Promise.all(moves.map(async (move): Promise<LifecycleRequest> => {
+			const bodyId = paths.get(move.from);
+			if (!bodyId) throw new Error(`cannot rename missing remote path ${move.from}`);
+			return {
+				operationId: `rename-${crypto.randomUUID()}`,
+				kind: "rename",
+				fileId: bodyId,
+				bodyId,
+				bodyEpoch: (await bodyUpdate(this.identity, bodyId)).bodyEpoch,
+				fromPath: move.from,
+				toPath: move.to,
+			};
+		}));
+		const result = await json(await fetchBounded(route(this.identity, "lifecycle/batch"), {
+			method: "POST",
+			headers: headers(this.identity, { "Content-Type": "application/json" }),
+			body: JSON.stringify({ operations: requests }),
+		}), "rename batch");
+		if (!Array.isArray(result.receipts) || result.receipts.length !== requests.length) {
+			throw new Error("rename batch omitted lifecycle receipts");
+		}
+		const receipts = result.receipts.map(parseReceipt);
+		for (const [index, receipt] of receipts.entries()) {
+			const request = requests[index]!;
+			if (receipt.vaultId !== this.identity.vaultId || receipt.vaultGeneration !== this.identity.vaultGeneration
+				|| receipt.bodyId !== request.bodyId || receipt.fileId !== request.fileId
+				|| receipt.operationId !== request.operationId || receipt.kind !== "rename" || receipt.path !== request.toPath) {
+				throw new Error("rename batch receipt crossed an identity boundary");
+			}
+		}
+		await publishRoots(this.identity, requests, receipts);
 	}
 
 	close(): void {
