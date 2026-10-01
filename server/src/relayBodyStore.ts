@@ -10,6 +10,10 @@
 import type { VaultActorContext } from "./collaboration";
 import { parseSemanticEpoch, type SemanticEpoch } from "./shared/semanticEpoch";
 import type { SemanticResetResult, VaultStoragePort } from "./vaultDocumentStore";
+import {
+	decodeTailRecords, encodeTailRecords, parseReceiptRing, RELAY_RECEIPT_RING, RELAY_TAIL_HARD_MAX_BYTES,
+	type RelayReceiptEntry,
+} from "./relayTail";
 import type { VaultStore } from "./vaultStore";
 
 export type RelayAppendFailure = "epoch_mismatch" | "body_not_active";
@@ -48,6 +52,28 @@ export interface RelayAppendResult {
 	size: number | null;
 	rowsRead: number;
 	rowsWritten: number;
+}
+
+/** Relay v3 group commit: one merged update for a buffered group of frames. */
+export interface RelayGroupCommitInput {
+	bodyId: string;
+	expectedEpoch: SemanticEpoch;
+	/** The group's frames merged into one update (one tail record). */
+	update: Uint8Array;
+	/** Actor of the group's last frame (recorded on the tail row). */
+	lastActor: VaultActorContext;
+	catalogContent: { contentHash: string; size: number } | null;
+	receipts: Array<{ actor: VaultActorContext; candidateId: string; candidateDigest: string; runtimeEpoch: string }>;
+	/** Receipt TTL (entries older than this leave the ring). */
+	receiptTtlMs: number;
+	now?: number;
+}
+
+export interface RelayGroupCommitResult extends RelayAppendResult {
+	/** True when the group did not fit the tail (hard max) and became a lean journal row. */
+	journalFallback: boolean;
+	tailFrames: number;
+	tailBytes: number;
 }
 
 /** Server-side reset policy state, returned with every lease response. */
@@ -209,8 +235,150 @@ export class RelayBodyStore {
 		return result;
 	}
 
+	/**
+	 * Relay v3 (B1-B4): commits one buffered group in one transaction. Rows
+	 * written (WITHOUT ROWID tables, no secondary indexes; see SERVER-NOTES):
+	 *   1. `relay_body_tail` UPSERT (the body's tail row, record appended)  = 1
+	 *   2. `vault_document_heads` UPDATE (generation, latest_sequence)       = 1
+	 *   3. `relay_device_receipts` UPSERT per device with a candidate frame = 1 each
+	 * No clock write (lean allocation over journal and tail heads), no journal
+	 * row, no attribution rows, no catalog event, no candidate receipt rows.
+	 * Fences on the body epoch only (appends commute, as v2 D5.1).
+	 */
+	appendRelayGroupCommit(input: RelayGroupCommitInput): RelayGroupCommitResult {
+		if (input.update.byteLength === 0) throw new Error("empty relay update is not a commit");
+		if (!this.store.relayTail) throw new Error("relay group commit requires the relay tail");
+		this.store.initialize();
+		const now = input.now ?? Date.now();
+		let rowsRead = 0;
+		let rowsWritten = 0;
+		let result!: RelayGroupCommitResult;
+		this.storage.transactionSync(() => {
+			const headCursor = this.storage.sql.exec<{ generation: number; semantic_epoch: number }>(
+				"SELECT generation, semantic_epoch FROM vault_document_heads WHERE document_id = ?", input.bodyId);
+			const head = headCursor.toArray()[0];
+			rowsRead += headCursor.rowsRead;
+			if (!head) throw new RelayAppendError("body_not_active", null);
+			const semanticEpoch = parseSemanticEpoch(head.semantic_epoch);
+			if (semanticEpoch !== input.expectedEpoch) throw new RelayAppendError("epoch_mismatch", semanticEpoch);
+			const catalogCursor = this.storage.sql.exec<{ file_id: string; path: string; lifecycle: string; pending: number }>(
+				`SELECT file_id, path, lifecycle,
+				        EXISTS(SELECT 1 FROM vault_creation_candidates WHERE body_id = ?) AS pending
+				   FROM vault_catalog_events WHERE body_id = ? ORDER BY sequence DESC LIMIT 1`,
+				input.bodyId, input.bodyId,
+			);
+			const catalog = catalogCursor.toArray()[0];
+			rowsRead += catalogCursor.rowsRead;
+			if (!catalog || catalog.lifecycle !== "active" || catalog.file_id !== input.bodyId || catalog.pending) {
+				throw new RelayAppendError("body_not_active", semanticEpoch);
+			}
+			const next = this.store.leanNextSequence();
+			const sequence = next.sequence;
+			rowsRead += next.rowsRead;
+			const generation = head.generation + 1;
+			const contentHash = input.catalogContent?.contentHash ?? null;
+			const size = input.catalogContent?.size ?? null;
+			const tail = this.store.relayTailRow(input.bodyId);
+			rowsRead += tail ? 1 : 0;
+			if (tail && tail.epoch !== semanticEpoch) throw new Error("relay tail crosses a semantic epoch");
+			const records = tail ? decodeTailRecords(tail.data) : [];
+			records.push({ sequence, generation, update: input.update });
+			const data = encodeTailRecords(records);
+			const tailBytes = (tail?.byteLength ?? 0) + input.update.byteLength;
+			let journalFallback = false;
+			if (data.byteLength > RELAY_TAIL_HARD_MAX_BYTES) {
+				// The tail cannot take this group (its checkpoint is not progressing):
+				// fall back to one lean journal row, the v2 shape; readers merge both.
+				journalFallback = true;
+				const journal = this.storage.sql.exec(
+					`INSERT INTO vault_journal(sequence, document_id, generation, semantic_epoch, kind,
+					 update_byte_length, data, created_at, attr_principal_id, attr_membership_revision, attr_device_id,
+					 attr_device_credential_revision, relay_content_hash, relay_size)
+					 VALUES (?, ?, ?, ?, 'body', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+					sequence, input.bodyId, generation, semanticEpoch, input.update.byteLength,
+					input.update.slice().buffer, now, input.lastActor.principalId, input.lastActor.membershipRevision,
+					input.lastActor.deviceId, input.lastActor.deviceCredentialRevision, contentHash, size,
+				);
+				journal.toArray();
+				rowsWritten += journal.rowsWritten;
+			} else {
+				const write = this.storage.sql.exec(
+					`INSERT INTO relay_body_tail(body_id, body_epoch, base_sequence, latest_sequence, generation, frames,
+					 byte_length, data, content_hash, size, attr_principal_id, attr_device_id, updated_at)
+					 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+					 ON CONFLICT(body_id) DO UPDATE SET body_epoch = excluded.body_epoch,
+					   latest_sequence = excluded.latest_sequence, generation = excluded.generation,
+					   frames = excluded.frames, byte_length = excluded.byte_length, data = excluded.data,
+					   content_hash = excluded.content_hash, size = excluded.size,
+					   attr_principal_id = excluded.attr_principal_id, attr_device_id = excluded.attr_device_id,
+					   updated_at = excluded.updated_at`,
+					input.bodyId, semanticEpoch, records[0]!.sequence, sequence, generation, records.length, tailBytes,
+					data.slice().buffer, contentHash, size, input.lastActor.principalId, input.lastActor.deviceId, now,
+				);
+				write.toArray();
+				rowsWritten += write.rowsWritten;
+			}
+			const writeHead = this.storage.sql.exec(
+				"UPDATE vault_document_heads SET generation = ?, latest_sequence = ? WHERE document_id = ?",
+				generation, sequence, input.bodyId,
+			);
+			writeHead.toArray();
+			rowsWritten += writeHead.rowsWritten;
+			const byDevice = new Map<string, RelayReceiptEntry[]>();
+			for (const receipt of input.receipts) {
+				const entries = byDevice.get(receipt.actor.deviceId) ?? [];
+				entries.push({ b: input.bodyId, c: receipt.candidateId, d: receipt.candidateDigest, e: semanticEpoch,
+					g: generation, s: sequence, r: receipt.runtimeEpoch, t: now, p: receipt.actor.principalId,
+					m: receipt.actor.membershipRevision, k: receipt.actor.deviceCredentialRevision });
+				byDevice.set(receipt.actor.deviceId, entries);
+			}
+			for (const [clientId, entries] of byDevice) {
+				const previous = this.storage.sql.exec<{ recent: string }>(
+					"SELECT recent FROM relay_device_receipts WHERE client_id = ?", clientId);
+				const prior = parseReceiptRing(previous.toArray()[0]?.recent);
+				rowsRead += previous.rowsRead;
+				const fresh = new Set(entries.map((entry) => `${entry.b}\u0000${entry.c}`));
+				const ring = [...entries.reverse(), ...prior.filter((entry) => entry.t > now - input.receiptTtlMs
+					&& !fresh.has(`${entry.b}\u0000${entry.c}`))].slice(0, RELAY_RECEIPT_RING);
+				const write = this.storage.sql.exec(
+					`INSERT INTO relay_device_receipts(client_id, last_sequence, recent, updated_at) VALUES (?, ?, ?, ?)
+					 ON CONFLICT(client_id) DO UPDATE SET last_sequence = excluded.last_sequence,
+					   recent = excluded.recent, updated_at = excluded.updated_at`,
+					clientId, sequence, JSON.stringify(ring), now,
+				);
+				write.toArray();
+				rowsWritten += write.rowsWritten;
+			}
+			result = { vaultSequence: sequence, generation, semanticEpoch, fileId: catalog.file_id, path: catalog.path,
+				contentHash, size, rowsRead, rowsWritten, journalFallback,
+				tailFrames: journalFallback ? tail?.frames ?? 0 : records.length,
+				tailBytes: journalFallback ? tail?.byteLength ?? 0 : tailBytes };
+		});
+		return result;
+	}
+
+	/** v3: bodies whose tail row is at or over the cap (alarm pass). */
+	tailCheckpointCandidates(bytes: number, frames: number, limit: number): string[] {
+		if (!this.store.relayTail) return [];
+		this.store.initialize();
+		return this.storage.sql.exec<{ body_id: string }>(
+			`SELECT body_id FROM relay_body_tail WHERE byte_length >= ? OR frames >= ? ORDER BY base_sequence LIMIT ?`,
+			bytes, frames, limit,
+		).toArray().map((row) => row.body_id);
+	}
+
 	/** Records a lazily materialised hash on the catalog event it describes, only if still unknown. */
 	backfillCatalogHash(bodyId: string, sequence: number, contentHash: string, size: number): boolean {
+		if (this.store.relayTail) {
+			// v3: the overlaid head names the tail's last commit; backfill it on the tail row.
+			const tailed = this.storage.sql.exec(
+				`UPDATE relay_body_tail SET content_hash = ?, size = ?
+				  WHERE body_id = ? AND latest_sequence = ? AND content_hash IS NULL`,
+				contentHash, size, bodyId, sequence,
+			);
+			tailed.toArray();
+			if (tailed.rowsWritten > 0) return true;
+		}
 		if (this.store.leanRows) {
 			// Lean: the overlaid catalog head names the journal row; backfill it inline.
 			const inline = this.storage.sql.exec(
@@ -261,7 +429,14 @@ export class RelayBodyStore {
 					`SELECT generation, relay_content_hash, relay_size FROM vault_journal
 					  WHERE document_id = ? ORDER BY sequence DESC LIMIT 1`, head.document_id,
 				).toArray()[0];
-				const known = row && row.generation === head.generation && row.relay_content_hash !== null;
+				let known = row && row.generation === head.generation && row.relay_content_hash !== null;
+				let tailHash: { hash: string | null; size: number | null } | null = null;
+				const tail = this.store.relayTailRow(head.document_id);
+				if (tail && tail.generation === head.generation) {
+					// v3: the head commit is the tail's last record.
+					tailHash = { hash: tail.contentHash, size: tail.size };
+					known = false;
+				}
 				const clock = this.store.advanceClock();
 				rowsWritten += clock.rowsWritten;
 				const event = this.storage.sql.exec(
@@ -270,7 +445,8 @@ export class RelayBodyStore {
 					 content_hash, size, mutation_index
 					) VALUES (?, ?, ?, ?, NULL, 'active', ?, ?, ?, ?, 0)`,
 					clock.sequence, head.document_id, catalog.file_id, catalog.path, head.generation, head.semantic_epoch,
-					known ? row.relay_content_hash : null, known ? row.relay_size : null,
+					tailHash ? tailHash.hash : known ? row!.relay_content_hash : null,
+					tailHash ? tailHash.size : known ? row!.relay_size : null,
 				);
 				event.toArray();
 				rowsWritten += event.rowsWritten;

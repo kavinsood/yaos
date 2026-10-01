@@ -3,6 +3,12 @@
 // (checkpoint + journal tail, merged with ywasm byte ops) and appends each
 // client update to `vault_journal` in one lean transaction. Only reached when
 // `YAOS_RELAY_BODIES === "true"`. See docs/relay2-protocol.md.
+//
+// Relay v3 (`YAOS_RELAY_GROUP_COMMIT`, docs/relay3-group-commit.md): a validated
+// frame is broadcast at once and buffered per (body, epoch); the buffer commits
+// in one transaction (one tail row, the head, one receipt row per device) on
+// idle / max age / bytes, and origins are acked only after that commit. The
+// invariant is "durable before receipt" (v2: "durable before broadcast").
 import * as decoding from "lib0/decoding";
 import * as encoding from "lib0/encoding";
 import { ywasmCrdtEngine as crdtEngine } from "@yaos/crdt-engine";
@@ -20,7 +26,7 @@ import {
 	stateVectorsEqual,
 	ywasmLinearMemoryBytes,
 } from "./crdt/ywasmByteOps";
-import { readSyncMessage, SYNC_STEP_2, SYNC_UPDATE } from "./crdt/syncFraming";
+import { readSyncMessage, SYNC_STEP_1, SYNC_STEP_2, SYNC_UPDATE } from "./crdt/syncFraming";
 import { AUTHORITY_SUPERSEDED_SOCKET_CLOSE_CODE } from "./shared/socketCloseCodes";
 import { canonicalMarkdownBytes } from "./shared/markdownCodec";
 import type { SemanticEpoch } from "./shared/semanticEpoch";
@@ -28,6 +34,7 @@ import type { RelayConfig } from "./relayFlag";
 import {
 	RelayAppendError, RelayBodyStore, type RelayLeaseResult, type RelayResetOutcome, type RelayResetPolicyState,
 } from "./relayBodyStore";
+import { CANDIDATE_RECEIPT_TTL_MS } from "./vaultCatalogStore";
 import { RelayMergeBudgetError, sha256HexSync } from "./vaultDocumentStore";
 import type { VaultDocumentCache } from "./vaultDocumentCache";
 import type { VaultStore } from "./vaultStore";
@@ -51,6 +58,21 @@ export interface RelaySocketHost {
 	/** Base BODY_COMMITTED to root sockets and peer body sockets (never the origins: they get their own ack). */
 	notifyBodyCommitted(bodyId: string, durableGeneration: number, vaultSequence: number,
 		excludeSocketIds?: ReadonlySet<string>): void;
+	/** v3 wake re-sync: open relay body sockets with their attachments. */
+	relayBodySockets?(): Array<{ socket: VaultSocketPort; attachment: VaultSocketAttachment }>;
+}
+
+/** v3: tail frames that trigger a checkpoint regardless of bytes. */
+export const RELAY_GC_TAIL_MAX_FRAMES = 512;
+
+type GroupFlushReason = "idle" | "max" | "bytes" | "forced";
+
+interface GroupBuffer {
+	bodyId: string;
+	frames: QueuedFrame[];
+	bytes: number;
+	idleTimer: ReturnType<typeof setTimeout> | null;
+	maxTimer: ReturnType<typeof setTimeout> | null;
 }
 
 export interface RelayEnvelope {
@@ -162,6 +184,28 @@ export interface RelayCounters {
 	/** Full checkpoints written from the in-memory merged bytes (no SQLite read, no wasm merge). */
 	checkpointsFromCache: number;
 	leanCoalesceRowsWritten: number;
+	/** v3: group commits (one transaction each) and the frames they covered. */
+	groupCommits: number;
+	groupFrames: number;
+	/** v3: why each buffer flushed. */
+	groupFlushIdle: number;
+	groupFlushMax: number;
+	groupFlushBytes: number;
+	groupFlushForced: number;
+	/** v3: frames broadcast before commit (fan-out at receipt). */
+	groupBroadcasts: number;
+	/** v3: buffered frames dropped unacked by a simulated crash (the origin resends). */
+	groupDropped: number;
+	/** v3: frames found already committed (receipt ring) at flush; acked as dedupes. */
+	groupFlushDedupes: number;
+	/** v3: checkpoints triggered by the tail cap, and groups that fell back to a journal row. */
+	tailCheckpoints: number;
+	tailJournalFallbacks: number;
+	/** v3: buffered frames replayed to a socket after its step2 (they were broadcast before it joined). */
+	pendingReplayFrames: number;
+	/** v3: wake re-syncs (step1 sent to sockets of an earlier runtime). */
+	wakeResyncs: number;
+	wakeResyncSockets: number;
 }
 
 export interface RelayBodyServiceOptions {
@@ -285,7 +329,13 @@ export class RelayBodyService {
 		batchDuplicateCandidates: 0, residentStaleSkips: 0, floorAdvances: 0, floorRowsPruned: 0,
 		updateFrames: 0, frameErrors: 0, postCommitErrors: 0, bodyInactiveCloses: 0, tooLargeCloses: 0,
 		leanCatalogEvents: 0, leanCoalesceRowsWritten: 0, checkpointsFromCache: 0,
+		groupCommits: 0, groupFrames: 0, groupFlushIdle: 0, groupFlushMax: 0, groupFlushBytes: 0, groupFlushForced: 0,
+		groupBroadcasts: 0, groupDropped: 0, groupFlushDedupes: 0, tailCheckpoints: 0, tailJournalFallbacks: 0,
+		pendingReplayFrames: 0, wakeResyncs: 0, wakeResyncSockets: 0,
 	};
+	/** v3 group-commit buffers keyed by (body, epoch). */
+	private readonly groups = new Map<string, GroupBuffer>();
+	private wakeResyncDone = false;
 	/** Last pre-append frame error (diagnostics only; message text, no payload bytes). */
 	private lastFrameError: { at: number; message: string } | null = null;
 
@@ -492,6 +542,7 @@ export class RelayBodyService {
 			}
 			this.counters.step2Replies++;
 			try { socket.send(syncFrame(SYNC_STEP_2, diffUpdate(state.bytes, message.stateVector))); } catch { /* closed */ }
+			this.replayPendingGroup(socket, attachment);
 			return;
 		}
 		const update = message.update;
@@ -547,6 +598,10 @@ export class RelayBodyService {
 			return;
 		}
 		const frame: QueuedFrame = { socket, attachment, actor, update: update.slice(), envelope, digest };
+		if (this.config.groupCommit) {
+			this.groupEnqueue(bodyId, frame);
+			return;
+		}
 		if (this.config.microbatchMs > 0) {
 			this.enqueue(bodyId, frame);
 			return;
@@ -578,14 +633,140 @@ export class RelayBodyService {
 		this.commitFrames(bodyId, batch.frames, true);
 	}
 
-	/** Commits every pending micro-batch of a body now (timer, reset, tests, drain). */
+	/** Commits every pending micro-batch (and v3 group buffer) of a body now (timer, reset, tests, drain). */
 	flushBatch(bodyId: string): void {
 		const prefix = `${bodyId}\u0000`;
 		for (const key of [...this.batches.keys()]) if (key.startsWith(prefix)) this.flushKey(bodyId, key);
+		for (const key of [...this.groups.keys()]) if (key.startsWith(prefix)) this.flushGroup(key, "forced");
 	}
 
 	flushAllBatches(): void {
 		for (const key of [...this.batches.keys()]) this.flushKey(key.slice(0, key.indexOf("\u0000")), key);
+		for (const key of [...this.groups.keys()]) this.flushGroup(key, "forced");
+	}
+
+	// ---- v3 group commit ------------------------------------------------------
+
+	/**
+	 * v3 B1: epoch-check, broadcast now, buffer for the group commit. The frame
+	 * already passed authority, dedupe and the rate budget (handleSyncFrame).
+	 * Frames are re-screened at flush (authority G2, epoch, receipt ring, growth
+	 * cap); an origin is acked only after the commit that made its frame durable.
+	 */
+	private groupEnqueue(bodyId: string, frame: QueuedFrame): void {
+		const host = this.requireHost();
+		const epoch = frame.attachment.documentEpoch;
+		const head = this.options.store().documentHead(bodyId);
+		if (!head) {
+			this.counters.bodyInactiveCloses++;
+			try { frame.socket.close(1008, "body is not active"); } catch { /* closed */ }
+			return;
+		}
+		if (head.semanticEpoch !== epoch) {
+			this.counters.epochFences++;
+			host.fenceRelaySocket(frame.socket, frame.attachment, head.semanticEpoch);
+			return;
+		}
+		this.counters.groupBroadcasts++;
+		try {
+			host.broadcastRelayUpdate(bodyId, epoch, syncFrame(SYNC_UPDATE, frame.update), frame.attachment.socketId);
+		} catch (error) { this.recordPostCommitError(error); }
+		const key = RelayBodyService.batchKey(bodyId, epoch);
+		let group = this.groups.get(key);
+		if (!group) {
+			group = { bodyId, frames: [], bytes: 0, idleTimer: null, maxTimer: null };
+			group.maxTimer = setTimeout(() => this.flushGroup(key, "max"), this.config.gcMaxMs);
+			this.groups.set(key, group);
+		}
+		group.frames.push(frame);
+		group.bytes += frame.update.byteLength;
+		if (group.idleTimer) clearTimeout(group.idleTimer);
+		group.idleTimer = setTimeout(() => this.flushGroup(key, "idle"), this.config.gcIdleMs);
+		if (group.bytes >= this.config.gcMaxBytes) this.flushGroup(key, "bytes");
+	}
+
+	private takeGroup(key: string): GroupBuffer | null {
+		const group = this.groups.get(key);
+		if (!group) return null;
+		if (group.idleTimer) clearTimeout(group.idleTimer);
+		if (group.maxTimer) clearTimeout(group.maxTimer);
+		this.groups.delete(key);
+		return group;
+	}
+
+	private flushGroup(key: string, reason: GroupFlushReason): void {
+		const group = this.takeGroup(key);
+		if (!group) return;
+		if (reason === "idle") this.counters.groupFlushIdle++;
+		else if (reason === "max") this.counters.groupFlushMax++;
+		else if (reason === "bytes") this.counters.groupFlushBytes++;
+		else this.counters.groupFlushForced++;
+		this.commitFrames(group.bodyId, group.frames, true, true);
+	}
+
+	/** v3: frames buffered for a body/epoch were broadcast before this socket joined; send them after its step2. */
+	private replayPendingGroup(socket: VaultSocketPort, attachment: VaultSocketAttachment): void {
+		const group = this.groups.get(RelayBodyService.batchKey(attachment.documentId, attachment.documentEpoch));
+		if (!group) return;
+		for (const frame of group.frames) {
+			if (frame.attachment.socketId === attachment.socketId) continue;
+			this.counters.pendingReplayFrames++;
+			try { socket.send(syncFrame(SYNC_UPDATE, frame.update)); } catch { return; }
+		}
+	}
+
+	/** v3 pending group-commit state (diagnostics, tests). */
+	pendingGroups(): Array<{ bodyId: string; frames: number; bytes: number }> {
+		return [...this.groups.values()].map((group) => ({ bodyId: group.bodyId, frames: group.frames.length,
+			bytes: group.bytes }));
+	}
+
+	/**
+	 * TEST-ONLY crash simulation: drops every buffered group without committing
+	 * or acking (an isolate eviction loses exactly this). Peers already have the
+	 * frames (broadcast at receipt); origins resend their unacked frames on
+	 * reconnect, and the next runtime's wake re-sync pulls state from peers.
+	 */
+	dropPendingGroupCommits(): number {
+		let dropped = 0;
+		for (const key of [...this.groups.keys()]) dropped += this.takeGroup(key)?.frames.length ?? 0;
+		this.counters.groupDropped += dropped;
+		return dropped;
+	}
+
+	/**
+	 * v3 wake re-sync: once per runtime, send step1 (the durable state vector) to
+	 * every open relay body socket admitted by an earlier runtime whose epoch is
+	 * still current. Each client answers with a step2 of what the server lacks
+	 * (e.g. frames a crashed runtime broadcast but never committed); a step2 the
+	 * server already covers is a growth-cap no-op and writes no rows.
+	 */
+	ensureWakeResync(): number {
+		if (!this.config.groupCommit || this.wakeResyncDone) return 0;
+		const host = this.host;
+		if (!host?.relayBodySockets) return 0;
+		this.wakeResyncDone = true;
+		const stateVectors = new Map<string, { epoch: SemanticEpoch; stateVector: Uint8Array } | null>();
+		let sent = 0;
+		for (const { socket, attachment } of host.relayBodySockets()) {
+			if (attachment.runtimeEpoch === this.options.runtimeEpoch) continue;
+			const bodyId = attachment.documentId;
+			if (!stateVectors.has(bodyId)) {
+				try {
+					const state = this.headState(bodyId);
+					stateVectors.set(bodyId, state ? { epoch: state.epoch, stateVector: state.stateVector } : null);
+				} catch (error) {
+					this.recordPostCommitError(error);
+					stateVectors.set(bodyId, null);
+				}
+			}
+			const state = stateVectors.get(bodyId);
+			if (!state || state.epoch !== attachment.documentEpoch) continue;
+			try { socket.send(syncFrame(SYNC_STEP_1, state.stateVector)); sent++; } catch { /* closed */ }
+		}
+		this.counters.wakeResyncs++;
+		this.counters.wakeResyncSockets += sent;
+		return sent;
 	}
 
 	private consumeTokens(socketId: string, bytes: number): boolean {
@@ -608,7 +789,8 @@ export class RelayBodyService {
 	 * rejected `candidate_id_reused`. Returns the frames to commit and the
 	 * duplicates to ack after the commit.
 	 */
-	private screenBatch(frames: QueuedFrame[]): { live: QueuedFrame[]; duplicates: QueuedFrame[] } {
+	private screenBatch(frames: QueuedFrame[], groupedBodyId: string | null = null):
+		{ live: QueuedFrame[]; duplicates: QueuedFrame[] } {
 		const live: QueuedFrame[] = [];
 		const duplicates: QueuedFrame[] = [];
 		const seen = new Map<string, string>();
@@ -624,6 +806,26 @@ export class RelayBodyService {
 			if (candidateId) {
 				const key = `${frame.attachment.deviceId}\u0000${candidateId}`;
 				const digest = frame.envelope!.candidateDigest ?? frame.envelope!.payloadDigest;
+				if (groupedBodyId !== null && !seen.has(key)) {
+					// v3: a resend that arrived while its first copy was still buffered
+					// is found committed here (receipt ring): ack it as a dedupe (B6).
+					const receipt = this.options.store().candidateReceipt(groupedBodyId, frame.attachment.deviceId, candidateId);
+					if (receipt) {
+						if (receipt.candidateDigest === digest) {
+							this.counters.dedupeHits++;
+							this.counters.groupFlushDedupes++;
+							this.postCommit(() => this.ackOrigin(frame.socket, frame.attachment, frame.envelope!, frame.digest, {
+								durableGeneration: receipt.durableGeneration, vaultSequence: receipt.vaultSequence,
+								contentHashAccepted: false, deduped: true, noop: false,
+							}));
+						} else {
+							this.counters.dedupeConflicts++;
+							this.requireHost().sendControl(frame.socket, { type: "BODY_UPDATE_REJECTED",
+								clientFrameId: frame.envelope!.clientFrameId, candidateId, reason: "candidate_id_reused" });
+						}
+						continue;
+					}
+				}
 				const first = seen.get(key);
 				if (first !== undefined) {
 					this.counters.batchDuplicateCandidates++;
@@ -653,10 +855,10 @@ export class RelayBodyService {
 	 * micro-batch timer path goes through here too, so a throw there can no
 	 * longer escape a setTimeout callback.
 	 */
-	private commitFrames(bodyId: string, frames: QueuedFrame[], batched: boolean): void {
+	private commitFrames(bodyId: string, frames: QueuedFrame[], batched: boolean, grouped = false): void {
 		let appended = false;
 		try {
-			this.commitFramesUnguarded(bodyId, frames, batched, () => { appended = true; });
+			this.commitFramesUnguarded(bodyId, frames, batched, () => { appended = true; }, grouped);
 		} catch (error) {
 			if (appended) {
 				// Unreachable in practice: post-commit steps are individually guarded.
@@ -694,9 +896,11 @@ export class RelayBodyService {
 	}
 
 	/** Steps 5–7: growth cap, single-transaction commit, then acks and fan-out. */
-	private commitFramesUnguarded(bodyId: string, frames: QueuedFrame[], batched: boolean, markAppended: () => void): void {
+	private commitFramesUnguarded(bodyId: string, frames: QueuedFrame[], batched: boolean, markAppended: () => void,
+		grouped = false): void {
 		const host = this.requireHost();
-		const { live, duplicates } = batched ? this.screenBatch(frames) : { live: frames, duplicates: [] as QueuedFrame[] };
+		const { live, duplicates } = batched ? this.screenBatch(frames, grouped ? bodyId : null)
+			: { live: frames, duplicates: [] as QueuedFrame[] };
 		if (live.length === 0) return;
 		const epoch = live[0]!.attachment.documentEpoch;
 		const state = this.headState(bodyId);
@@ -715,7 +919,7 @@ export class RelayBodyService {
 		const update = live.length === 1 ? live[0]!.update : mergeUpdates(live.map((frame) => frame.update));
 		if (update.byteLength > MAX_DURABLE_UPDATE_BYTES) {
 			// Only reachable by micro-batching many near-limit frames: commit one by one.
-			for (const frame of live) this.commitFrames(bodyId, [frame], false);
+			for (const frame of live) this.commitFrames(bodyId, [frame], grouped, grouped);
 			for (const frame of duplicates) this.ackNoop(frame.socket, frame.attachment, frame.envelope!, frame.digest);
 			return;
 		}
@@ -733,7 +937,14 @@ export class RelayBodyService {
 			nextStateVector = noop ? state.stateVector : stateVectorFromUpdate(nextMerged);
 		} else {
 			noop = state.lastUpdate !== null && sameBytes(state.lastUpdate, update);
-			nextStateVector = noop ? state.stateVector : maxStateVector(state.stateVector, stateVectorFromUpdate(update));
+			const updateStateVector = stateVectorFromUpdate(update);
+			if (!noop && grouped && state.bytes !== null && !state.overBudget
+				&& stateVectorCoveredBy(updateStateVector, state.stateVector)) {
+				// v3: a covered update on a large body (a wake re-sync step2, a resend)
+				// gets the exact check, so it writes no tail row when it adds nothing.
+				noop = sameBytes(mergeUpdates([state.bytes, update]), state.bytes);
+			}
+			nextStateVector = noop ? state.stateVector : maxStateVector(state.stateVector, updateStateVector);
 		}
 		if (noop) {
 			this.counters.noopSkips += live.length + duplicates.length;
@@ -762,9 +973,24 @@ export class RelayBodyService {
 			candidateDigest: frame.envelope.candidateDigest ?? frame.envelope.payloadDigest,
 			runtimeEpoch: frame.attachment.runtimeEpoch,
 		}] : []);
-		let result;
+		let result: ReturnType<RelayBodyStore["appendRelayBodyUpdate"]> & { tailFrames?: number; tailBytes?: number;
+			journalFallback?: boolean };
 		try {
-			result = this.options.relayStore().appendRelayBodyUpdate({
+			result = grouped ? this.options.relayStore().appendRelayGroupCommit({
+				bodyId,
+				expectedEpoch: epoch,
+				update,
+				lastActor: live[live.length - 1]!.actor,
+				catalogContent: accepted ? { contentHash: accepted.contentHash!, size: accepted.size! } : null,
+				receipts: live.flatMap((frame) => frame.envelope?.candidateId ? [{
+					actor: frame.actor,
+					candidateId: frame.envelope.candidateId,
+					candidateDigest: frame.envelope.candidateDigest ?? frame.envelope.payloadDigest,
+					runtimeEpoch: frame.attachment.runtimeEpoch,
+				}] : []),
+				receiptTtlMs: CANDIDATE_RECEIPT_TTL_MS,
+				now: this.now(),
+			}) : this.options.relayStore().appendRelayBodyUpdate({
 				bodyId,
 				expectedEpoch: epoch,
 				update,
@@ -804,6 +1030,11 @@ export class RelayBodyService {
 		this.counters.appends++;
 		this.counters.appendFrames += live.length;
 		this.counters.rowsWritten += result.rowsWritten;
+		if (grouped) {
+			this.counters.groupCommits++;
+			this.counters.groupFrames += live.length;
+			if (result.journalFallback) this.counters.tailJournalFallbacks++;
+		}
 		if (accepted) this.counters.hashAccepted++;
 		else this.counters.hashUnknown++;
 		// Everything below runs after a durable append: each step is guarded so a
@@ -850,16 +1081,45 @@ export class RelayBodyService {
 			}));
 		}
 		const origins = new Set([...live, ...duplicates].map((frame) => frame.attachment.socketId));
-		for (const frame of live) {
-			this.postCommit(() => host.broadcastRelayUpdate(bodyId, epoch, syncFrame(SYNC_UPDATE, frame.update),
-				frame.attachment.socketId));
+		// v3: peers got every frame at receipt (groupEnqueue); no second fan-out.
+		if (!grouped) {
+			for (const frame of live) {
+				this.postCommit(() => host.broadcastRelayUpdate(bodyId, epoch, syncFrame(SYNC_UPDATE, frame.update),
+					frame.attachment.socketId));
+			}
 		}
 		// G16: every origin gets exactly its own ack, never a peer notice as well.
 		this.postCommit(() => host.notifyBodyCommitted(bodyId, result.generation, result.vaultSequence, origins));
+		if (grouped) {
+			// v3: no alarm per commit (setAlarm is a written row). The tail cap
+			// checkpoints inline, off the ack path; catalog coalescing rides along.
+			if ((result.tailBytes ?? 0) >= this.config.gcTailBytes || (result.tailFrames ?? 0) >= RELAY_GC_TAIL_MAX_FRAMES
+				|| result.journalFallback) {
+				this.postCommit(() => { this.checkpointTail(bodyId); });
+			}
+			return;
+		}
 		// Lean rows: every append leaves a catalog event to coalesce (the host delays this alarm).
 		if (this.options.store().leanRows || entry.tailEntries >= this.config.checkpointEntries || entry.tailBytes >= this.config.checkpointBytes) {
 			this.postCommit(() => this.options.armCheckpointAlarm());
 		}
+	}
+
+	/**
+	 * v3 B2: checkpoint a body whose tail reached the cap. Coalesces its catalog
+	 * event first (the tail row carries the accepted hash; the checkpoint drops
+	 * it), then writes the byte-merged checkpoint at the head, which deletes the
+	 * tail row in the same transaction (records an active pin needs move to
+	 * journal rows). Returns the checkpoint result, or null when nothing ran.
+	 */
+	checkpointTail(bodyId: string): ReturnType<RelayBodyService["checkpointBody"]> {
+		if (this.isOverBudget(bodyId)) return null;
+		const coalesced = this.options.relayStore().coalesceLeanCatalog({ bodyId });
+		this.counters.leanCatalogEvents += coalesced.bodies;
+		this.counters.leanCoalesceRowsWritten += coalesced.rowsWritten;
+		const written = this.checkpointBody(bodyId);
+		if (written) this.counters.tailCheckpoints++;
+		return written;
 	}
 
 	/**
@@ -958,6 +1218,15 @@ export class RelayBodyService {
 		const budget = this.config.maxMergeInputBytes;
 		let throughSequence = head.latestSequence;
 		if (tail.entries > this.config.checkpointMaxRows || checkpointBytes + tail.bytes > budget) {
+			if (this.options.store().relayTailRow(bodyId)) {
+				// v3: prefix checkpoints are journal-only; a tailed body over the budget
+				// stays checkpoint + tail (the tail is hard-capped; past it groups fall
+				// back to journal rows) until a client semantic reset shrinks it.
+				if (checkpointBytes + tail.bytes > budget) {
+					this.markOverBudget(bodyId, head.semanticEpoch, checkpointBytes + tail.bytes);
+					return null;
+				}
+			} else {
 			const prefix = relayStore.tailPrefixBounded(bodyId, tail.checkpointSequence, this.config.checkpointMaxRows,
 				budget - checkpointBytes);
 			if (!prefix) {
@@ -967,6 +1236,7 @@ export class RelayBodyService {
 				return null;
 			}
 			throughSequence = prefix.sequence;
+			}
 		}
 		let durable: ReturnType<VaultStore["durableMergedBytes"]>;
 		const cached = this.merged.get(bodyId);
@@ -1077,6 +1347,14 @@ export class RelayBodyService {
 			} catch (error) {
 				retry = true;
 				console.warn("[yaos-relay] checkpoint failed", error);
+			}
+		}
+		if (store.relayTail) {
+			for (const bodyId of this.options.relayStore().tailCheckpointCandidates(this.config.gcTailBytes,
+				RELAY_GC_TAIL_MAX_FRAMES, options.limit ?? 25)) {
+				if (options.skip?.(bodyId)) continue;
+				try { if (this.checkpointTail(bodyId)) checkpoints++; }
+				catch (error) { retry = true; console.warn("[yaos-relay] tail checkpoint failed", error); }
 			}
 		}
 		let rowsPruned = 0;
@@ -1238,6 +1516,7 @@ export class RelayBodyService {
 			mergedCacheBytes: this.mergedBytesTotal,
 			pendingEnvelopes: this.pendingEnvelopes.size,
 			pendingBatches: this.batches.size,
+			pendingGroups: this.pendingGroups(),
 			staleResidents: this.staleResidents.size,
 			overBudgetBodies: [...this.overBudgetMarkers().keys()],
 			// COUNT(*) over the journal: this method backs /diagnostics only (G15).

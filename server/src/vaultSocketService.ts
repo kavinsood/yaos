@@ -469,6 +469,14 @@ export class VaultSocketService {
 			notifyBodyCommitted: (bodyId, durableGeneration, vaultSequence, excludeSocketIds) => {
 				this.notifyBodyCommitted(bodyId, durableGeneration, vaultSequence, excludeSocketIds);
 			},
+			relayBodySockets: () => {
+				const sockets: Array<{ socket: VaultSocketPort; attachment: VaultSocketAttachment }> = [];
+				for (const socket of this.options.sockets.sockets()) {
+					const attachment = parseVaultSocketAttachment(socket.deserializeAttachment());
+					if (attachment?.kind === "body" && attachment.relay === true) sockets.push({ socket, attachment });
+				}
+				return sockets;
+			},
 		});
 	}
 

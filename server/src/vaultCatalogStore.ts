@@ -2,6 +2,7 @@ import { VaultDocumentStore } from "./vaultDocumentStore";
 import type { DurableCommitResult, VaultCommitKind } from "./vaultDocumentStore";
 import { parseSemanticEpoch, type SemanticEpoch } from "./shared/semanticEpoch";
 import type { VaultActorContext } from "./collaboration";
+import { decodeTailRecords, parseReceiptRing } from "./relayTail";
 
 export const MAX_CANDIDATE_RECEIPTS_PER_BODY = 256;
 export const MAX_CANDIDATE_RECEIPTS_GLOBAL = 4096;
@@ -441,6 +442,17 @@ export abstract class VaultCatalogStore extends VaultDocumentStore {
 			clientId,
 			candidateId,
 		).toArray()[0];
+		if (!row && this.relayTailEnabled) {
+			// v3 (B3): relay group commits keep receipts in the device's ring row.
+			const hit = this.relayReceiptRing(clientId).find((entry) => entry.b === bodyId && entry.c === candidateId);
+			if (!hit || hit.t <= Date.now() - CANDIDATE_RECEIPT_TTL_MS) return null;
+			return {
+				bodyId, clientId, candidateId, candidateDigest: hit.d,
+				bodyEpoch: parseSemanticEpoch(hit.e, "candidate receipt body epoch"),
+				durableGeneration: hit.g, vaultSequence: hit.s,
+				vaultGeneration: this.currentVaultGeneration(), runtimeEpoch: hit.r,
+			};
+		}
 		if (row && row.created_at <= Date.now() - CANDIDATE_RECEIPT_TTL_MS) {
 			this.storage.sql.exec(
 				"DELETE FROM vault_candidate_receipts WHERE body_id = ? AND client_id = ? AND candidate_id = ?",
@@ -465,6 +477,12 @@ export abstract class VaultCatalogStore extends VaultDocumentStore {
 
 	hasCandidateReceipt(bodyId: string, candidateId: string, candidateDigest: string): boolean {
 		this.initialize();
+		if (this.relayTailEnabled) {
+			const cutoff = Date.now() - CANDIDATE_RECEIPT_TTL_MS;
+			const rings = this.storage.sql.exec<{ recent: string }>("SELECT recent FROM relay_device_receipts").toArray();
+			if (rings.some((row) => parseReceiptRing(row.recent).some((entry) => entry.b === bodyId
+				&& entry.c === candidateId && entry.d === candidateDigest && entry.t > cutoff))) return true;
+		}
 		return this.storage.sql.exec<{ found: number }>(
 			`SELECT 1 AS found FROM vault_candidate_receipts
 			 WHERE body_id = ? AND candidate_id = ? AND candidate_digest = ?
@@ -798,6 +816,11 @@ export abstract class VaultCatalogStore extends VaultDocumentStore {
 			  ORDER BY sequence DESC LIMIT 1`,
 			entry.bodyId, entry.sequence, boundarySequence,
 		).toArray()[0];
+		const tailed = this.relayTailEnabled ? this.tailOverlay(boundarySequence, entry, row?.sequence ?? 0) : null;
+		if (tailed) {
+			return { ...entry, sequence: tailed.sequence, previousPath: null, generation: tailed.generation,
+				contentHash: tailed.contentHash, size: tailed.size };
+		}
 		if (!row) return entry;
 		return {
 			...entry,
@@ -807,6 +830,30 @@ export abstract class VaultCatalogStore extends VaultDocumentStore {
 			contentHash: row.relay_content_hash,
 			size: row.relay_size,
 		};
+	}
+
+	/**
+	 * v3: group commits write neither a journal row nor a catalog event, so the
+	 * newest relay commit after the catalog event is the head (when at or before
+	 * the boundary; its hash is the tail row's when the tail ends at the head) or
+	 * else the newest tail record at or before the boundary (hash unknown).
+	 * Returns null when the journal row (or the event itself) is newer.
+	 */
+	private tailOverlay(boundarySequence: number, entry: CatalogHeadAtBoundary, journalSequence: number):
+		{ sequence: number; generation: number; contentHash: string | null; size: number | null } | null {
+		const floor = Math.max(entry.sequence, journalSequence);
+		const head = this.documentHead(entry.bodyId);
+		if (!head || head.latestSequence <= floor) return null;
+		const tail = this.relayTailRow(entry.bodyId);
+		if (head.latestSequence <= boundarySequence) {
+			const known = tail !== null && tail.latestSequence === head.latestSequence;
+			return { sequence: head.latestSequence, generation: head.generation,
+				contentHash: known ? tail.contentHash : null, size: known ? tail.size : null };
+		}
+		if (!tail || tail.baseSequence > boundarySequence) return null;
+		const record = decodeTailRecords(tail.data)
+			.filter((candidate) => candidate.sequence > floor && candidate.sequence <= boundarySequence).at(-1);
+		return record ? { sequence: record.sequence, generation: record.generation, contentHash: null, size: null } : null;
 	}
 
 	getCatalogHeadAt(boundarySequence: number, bodyId: string): CatalogHeadAtBoundary | null {

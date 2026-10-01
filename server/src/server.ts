@@ -169,7 +169,7 @@ export interface VaultRuntimeOptions {
 	 * Test-only restart simulation, provided by a host that can rebuild the
 	 * runtime. Absent (production hosts), the runtime path is a plain 404.
 	 */
-	simulateRestart?: () => Promise<Response>;
+	simulateRestart?: (mode?: "restart" | "relay-crash") => Promise<Response>;
 	/**
 	 * Relay v2 spike: `YAOS_RELAY_BODIES === "true"`. Absent, the TEST-ONLY
 	 * process default (`YAOS_TEST_FORCE_RELAY_BODIES`) applies; false in Workers.
@@ -188,6 +188,13 @@ export const RELAY_TABLE_COUNTS_RUNTIME_PATH = "/__yaos/test-only/relay-table-co
  * gated Worker route `POST /vault/:id/debug/simulate-restart`.
  */
 export const SIMULATE_RESTART_RUNTIME_PATH = "/__yaos/test-only/simulate-restart";
+
+/**
+ * Runtime path of the experiment-only relay v3 crash simulation: drops every
+ * buffered group commit unacked, then swaps the runtime like simulate-restart.
+ * Reached only via the gated Worker route `POST /vault/:id/debug/relay-crash`.
+ */
+export const RELAY_CRASH_RUNTIME_PATH = "/__yaos/test-only/relay-crash";
 
 /** Schema-8 root/Markdown/Canvas composition, independent of a worker or process host. */
 export class VaultRuntime implements DrainPort {
@@ -219,6 +226,7 @@ export class VaultRuntime implements DrainPort {
 		this.store = new VaultStore(options.storage);
 		if ((options.relayBodies ?? relayBodiesTestDefault()) && (options.relayConfig ?? readRelayConfig(null)).leanRows) {
 			this.store.enableLeanRows();
+			if ((options.relayConfig ?? readRelayConfig(null)).groupCommit) this.store.enableRelayTail();
 		}
 		this.settings = new SettingsSyncStore(options.storage);
 		let socketOwner: VaultSocketService;
@@ -367,8 +375,16 @@ export class VaultRuntime implements DrainPort {
 		});
 	}
 
+	/** v3: once per runtime, step1 to relay sockets of an earlier runtime (see RelayBodyService.ensureWakeResync). */
+	private wakeResync(): void {
+		if (!this.relay?.config.groupCommit || this.deleted) return;
+		try { this.relay.ensureWakeResync(); }
+		catch (error) { console.warn("[yaos-relay] wake re-sync failed", error); }
+	}
+
 	async fetch(request: Request): Promise<Response> {
 		if (this.drainPromise) return json({ error: "vault_draining" }, 503);
+		this.wakeResync();
 		const vaultId = request.headers.get("x-yaos-vault-id");
 		if (!isCanonicalVaultId(vaultId)) return json({ error: "invalid_vault_identity" }, 400);
 		const url = new URL(request.url);
@@ -385,6 +401,11 @@ export class VaultRuntime implements DrainPort {
 			}
 			if (request.method === "POST" && url.pathname === SIMULATE_RESTART_RUNTIME_PATH) {
 				return this.options.simulateRestart ? await this.options.simulateRestart() : json({ error: "not_found" }, 404);
+			}
+			if (request.method === "POST" && url.pathname === RELAY_CRASH_RUNTIME_PATH) {
+				return this.options.simulateRestart && this.relay?.config.groupCommit && this.options.relayDebugRoutes
+					? await this.options.simulateRestart("relay-crash")
+					: json({ error: "not_found" }, 404);
 			}
 			if (request.method === "GET" && url.pathname === RELAY_TABLE_COUNTS_RUNTIME_PATH) {
 				return this.relayStore && this.options.relayDebugRoutes
@@ -674,7 +695,10 @@ export class VaultRuntime implements DrainPort {
 
 	async webSocketMessage(socket: VaultSocketPort, message: string | ArrayBuffer): Promise<void> {
 		if (this.deleted || this.drainPromise) socket.close(1001, "vault maintenance");
-		else await this.sockets.message(socket, message);
+		else {
+			this.wakeResync();
+			await this.sockets.message(socket, message);
+		}
 	}
 
 	/** Hosts pass the closed socket; presence of its awareness identity is removed for peers. */
@@ -709,8 +733,14 @@ export class VaultRuntime implements DrainPort {
 	 * debounced flush is a no-op. The host then builds a fresh runtime over
 	 * the same storage and hibernated sockets, as a cold wake would.
 	 */
-	async retireForSimulatedRestart(): Promise<{ runtimeEpoch: string; flushedDocuments: number }> {
+	async retireForSimulatedRestart(mode: "restart" | "relay-crash" = "restart"):
+		Promise<{ runtimeEpoch: string; flushedDocuments: number; droppedRelayFrames: number }> {
 		let flushedDocuments = 0;
+		// v3: a restart commits buffered group commits (as a graceful drain would);
+		// the relay-crash simulation drops them unacked (an isolate eviction).
+		let droppedRelayFrames = 0;
+		if (mode === "relay-crash") droppedRelayFrames = this.relay?.dropPendingGroupCommits() ?? 0;
+		else this.relay?.flushAllBatches();
 		for (let round = 0; round < 10; round++) {
 			await Promise.all([...this.scheduledFlushes.values()]);
 			const pending = Object.keys(this.cache.diagnostics().pending);
@@ -723,7 +753,7 @@ export class VaultRuntime implements DrainPort {
 		if (Object.keys(this.cache.diagnostics().pending).length > 0) throw new Error("pending persistence did not settle");
 		this.deleted = true;
 		this.cache.clear();
-		return { runtimeEpoch: this.runtimeEpoch, flushedDocuments };
+		return { runtimeEpoch: this.runtimeEpoch, flushedDocuments, droppedRelayFrames };
 	}
 
 	/** Current runtime epoch (test-only restart simulation reports it). */
@@ -744,6 +774,7 @@ export class VaultRuntime implements DrainPort {
 	}
 
 	async alarm(): Promise<void> {
+		this.wakeResync();
 		for (const documentId of Object.keys(this.cache.diagnostics().pending)) await this.flushDocument(documentId);
 		// Relay v2: relay bodies are checkpointed only by the relay pass (byte merge,
 		// merge budget, feed floor advance: G1/G20); the base loop skips them so an
@@ -844,6 +875,7 @@ export class VaultRuntime implements DrainPort {
 		await this.options.storage.deleteAll();
 		this.store = new VaultStore(this.options.storage);
 		if (this.relay && this.relay.config.leanRows) this.store.enableLeanRows();
+		if (this.relay && this.relay.config.groupCommit) this.store.enableRelayTail();
 		this.store.setCommitObserver((observation) => this.afterDurableCommit(observation));
 		if (this.relayStore) this.relayStore = new RelayBodyStore(this.options.storage, this.store);
 		this.settings = new SettingsSyncStore(this.options.storage);
@@ -1552,7 +1584,7 @@ export class VaultSyncServer implements DurableObject {
 			controlPlane: env.YAOS_CONFIG ? new CloudflareActorCalls(env.YAOS_CONFIG) : undefined,
 			...(testOnlyFastTimersEnabled(env) ? { timers: readServerTimers(env) } : {}),
 			// The Worker gate checks the same var plus the operator session.
-			...(testOnlyDebugRoutesEnabled(env) ? { simulateRestart: () => this.simulateRestart() } : {}),
+			...(testOnlyDebugRoutesEnabled(env) ? { simulateRestart: (mode?: "restart" | "relay-crash") => this.simulateRestart(mode) } : {}),
 			relayBodies: relayBodiesEnabled(env),
 			...(relayBodiesEnabled(env) ? { relayConfig: readRelayConfig(env),
 				relayDebugRoutes: testOnlyDebugRoutesEnabled(env) } : {}),
@@ -1566,16 +1598,16 @@ export class VaultSyncServer implements DurableObject {
 	 * hibernatable sockets stay attached, exactly the state a cold wake
 	 * constructor sees. Module-level isolate state is not reset.
 	 */
-	private async simulateRestart(): Promise<Response> {
+	private async simulateRestart(mode: "restart" | "relay-crash" = "restart"): Promise<Response> {
 		if (this.restarting) return json({ error: "restart_in_progress" }, 409);
 		let release!: () => void;
 		this.restarting = new Promise<void>((resolve) => { release = resolve; });
 		try {
-			const retired = await this.runtime.retireForSimulatedRestart();
+			const retired = await this.runtime.retireForSimulatedRestart(mode);
 			this.runtime = this.createRuntime(this.state, this.env);
-			return json({ simulated: "restart", previousRuntimeEpoch: retired.runtimeEpoch,
+			return json({ simulated: mode, previousRuntimeEpoch: retired.runtimeEpoch,
 				runtimeEpoch: this.runtime.currentRuntimeEpoch, flushedDocuments: retired.flushedDocuments,
-				sockets: this.state.getWebSockets().length });
+				droppedRelayFrames: retired.droppedRelayFrames, sockets: this.state.getWebSockets().length });
 		} finally {
 			this.restarting = null;
 			release();

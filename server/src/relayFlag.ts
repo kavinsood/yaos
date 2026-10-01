@@ -21,6 +21,17 @@ export interface RelayFlagEnv {
 	/** Round 4 lean append (docs/relay2-protocol.md §6.4): exactly "true" enables it. */
 	YAOS_RELAY_LEAN_ROWS?: string;
 	YAOS_RELAY_LEAN_CATALOG_DELAY_MS?: string;
+	/**
+	 * Relay v3 write reduction (docs/relay3-group-commit.md): "1" or "true" enables
+	 * group commit + one tail row per body + one receipt row per device. Requires
+	 * YAOS_RELAY_BODIES and YAOS_RELAY_LEAN_ROWS; ignored otherwise.
+	 */
+	YAOS_RELAY_GROUP_COMMIT?: string;
+	YAOS_RELAY_GC_IDLE_MS?: string;
+	YAOS_RELAY_GC_MAX_MS?: string;
+	YAOS_RELAY_GC_MAX_BYTES?: string;
+	/** v3: tail row cap; a group commit that leaves the tail at or over it checkpoints the body. */
+	YAOS_RELAY_GC_TAIL_BYTES?: string;
 }
 
 export interface RelayConfig {
@@ -54,6 +65,17 @@ export interface RelayConfig {
 	 */
 	leanRows: boolean;
 	leanCatalogDelayMs: number;
+	/**
+	 * Relay v3 (requires leanRows): validated frames are broadcast at once and
+	 * buffered per (body, epoch); the buffer commits in one transaction after
+	 * `gcIdleMs` without a frame, `gcMaxMs` after its first frame, or at
+	 * `gcMaxBytes`, whichever is first. Receipts are sent after that commit.
+	 */
+	groupCommit: boolean;
+	gcIdleMs: number;
+	gcMaxMs: number;
+	gcMaxBytes: number;
+	gcTailBytes: number;
 }
 
 /**
@@ -78,7 +100,17 @@ export const DEFAULT_RELAY_CONFIG: Readonly<RelayConfig> = Object.freeze({
 	lazyHashMaxBytes: 3 * 1024 * 1024,
 	leanRows: false,
 	leanCatalogDelayMs: 2_000,
+	groupCommit: false,
+	gcIdleMs: 300,
+	gcMaxMs: 1_500,
+	gcMaxBytes: 65_536,
+	gcTailBytes: 65_536,
 });
+
+/** v3 flag value: "1" (brief) or "true" (the other relay flags' spelling). */
+export function groupCommitFlag(value: string | undefined): boolean {
+	return value === "1" || value === "true";
+}
 
 type ProcessLike = { env?: Record<string, string | undefined> };
 
@@ -129,5 +161,11 @@ export function readRelayConfig(env: RelayFlagEnv | null | undefined): RelayConf
 		lazyHashMaxBytes: positiveInt(source.YAOS_RELAY_LAZY_HASH_MAX_BYTES, DEFAULT_RELAY_CONFIG.lazyHashMaxBytes, 0, 64 * 1024 * 1024),
 		leanRows: source.YAOS_RELAY_LEAN_ROWS === "true",
 		leanCatalogDelayMs: positiveInt(source.YAOS_RELAY_LEAN_CATALOG_DELAY_MS, DEFAULT_RELAY_CONFIG.leanCatalogDelayMs, 0, 600_000),
+		// v3 requires lean rows (sequence allocation and catalog overlay build on them).
+		groupCommit: groupCommitFlag(source.YAOS_RELAY_GROUP_COMMIT) && source.YAOS_RELAY_LEAN_ROWS === "true",
+		gcIdleMs: positiveInt(source.YAOS_RELAY_GC_IDLE_MS, DEFAULT_RELAY_CONFIG.gcIdleMs, 1, 60_000),
+		gcMaxMs: positiveInt(source.YAOS_RELAY_GC_MAX_MS, DEFAULT_RELAY_CONFIG.gcMaxMs, 1, 60_000),
+		gcMaxBytes: positiveInt(source.YAOS_RELAY_GC_MAX_BYTES, DEFAULT_RELAY_CONFIG.gcMaxBytes, 1, MAX_DURABLE_UPDATE_BYTES),
+		gcTailBytes: positiveInt(source.YAOS_RELAY_GC_TAIL_BYTES, DEFAULT_RELAY_CONFIG.gcTailBytes, 1, 1024 * 1024),
 	};
 }

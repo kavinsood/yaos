@@ -1,5 +1,5 @@
 import { ControlPlaneRuntime, ServerConfig } from "./config";
-import { RELAY_TABLE_COUNTS_RUNTIME_PATH, SIMULATE_RESTART_RUNTIME_PATH, VaultRuntime, VaultSyncServer } from "./server";
+import { RELAY_CRASH_RUNTIME_PATH, RELAY_TABLE_COUNTS_RUNTIME_PATH, SIMULATE_RESTART_RUNTIME_PATH, VaultRuntime, VaultSyncServer } from "./server";
 import { relayBodiesEnabled } from "./relayFlag";
 import { ActorRecoveryRouteAuthority } from "./recoveryPublicAuthority";
 import { handleRecoveryRoute, isPublicRecoveryRouteShape } from "./recoveryRoutes";
@@ -99,6 +99,7 @@ function validVaultRest(method: string, rest: string[], relayBodies = false): bo
 	if (relayBodies && method === "POST" && rest.length === 3 && rest[0] === "body" && !!rest[1]
 		&& (rest[2] === "compaction-lease" || rest[2] === "semantic-reset")) return true;
 	if (relayBodies && method === "GET" && rest.length === 2 && rest[0] === "debug" && rest[1] === "relay-table-counts") return true;
+	if (relayBodies && method === "POST" && rest.length === 2 && rest[0] === "debug" && rest[1] === "relay-crash") return true;
 	if (relayBodies && method === "HEAD" && rest.length === 2 && rest[0] === "body" && !!rest[1]) return true;
 	if (method === "GET" && rest.length === 1 && ["me", "members", "audit"].includes(rest[0]!)) return true;
 	if ((method === "PATCH" || method === "DELETE") && rest.length === 1 && rest[0] === "governance") return true;
@@ -313,6 +314,13 @@ export async function handleWorkerRequest(request: Request, env: Env): Promise<R
 				if (!testOnlyDebugRoutesEnabled(env) || !relayBodiesEnabled(env)) response = withCors(json({ error: "not found" }, 404));
 				else if (!await verifyOperatorSession(env, request)) response = withCors(json({ error: "unauthorized" }, 401));
 				else response = withCors(await handleOperatorVaultRuntimeRoute(request, env, route.vaultId, RELAY_TABLE_COUNTS_RUNTIME_PATH));
+			} else if (route.rest[0] === "debug" && route.rest[1] === "relay-crash") {
+				// Relay v3, experiment-only: drop the pending group-commit buffers and
+				// retire the runtime (a crash between broadcast and commit). Same gate as
+				// relay-table-counts; the runtime also requires YAOS_RELAY_GROUP_COMMIT.
+				if (!testOnlyDebugRoutesEnabled(env) || !relayBodiesEnabled(env)) response = withCors(json({ error: "not found" }, 404));
+				else if (!await verifyOperatorSession(env, request)) response = withCors(json({ error: "unauthorized" }, 401));
+				else response = withCors(await handleOperatorVaultRuntimeRoute(request, env, route.vaultId, RELAY_CRASH_RUNTIME_PATH));
 			} else if (route.rest[0] === "debug" && route.rest[1] === "simulate-restart") {
 				// Experiment-only: gated like the admin routes (404 without the var,
 				// operator session when enabled). See testOnlyTimers.ts.

@@ -450,6 +450,10 @@ export class VaultStore extends RecoveryAuthorityStore {
 			]) {
 				this.storage.sql.exec(`DELETE FROM ${table}`).toArray();
 			}
+			if (this.relayTailEnabled) {
+				this.storage.sql.exec("DELETE FROM relay_body_tail").toArray();
+				this.storage.sql.exec("DELETE FROM relay_device_receipts").toArray();
+			}
 			this.storage.sql.exec(
 				"DELETE FROM vault_operation_pages WHERE operation_id IN (SELECT operation_id FROM vault_operations WHERE kind = 'bootstrap')",
 			).toArray();

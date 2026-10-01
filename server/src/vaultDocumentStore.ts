@@ -7,6 +7,9 @@ import type { VaultActorContext, VaultRole } from "./collaboration";
 import { MAX_DURABLE_UPDATE_BYTES, SQLITE_ROW_SAFE_BYTES } from "./shared/durableLimits";
 import { mergeUpdates as mergeUpdateBytes } from "./crdt/ywasmByteOps";
 import {
+	decodeTailRecords, encodeTailRecords, parseReceiptRing, RELAY_TAIL_SCHEMA, type RelayReceiptEntry, type RelayTailRecord,
+} from "./relayTail";
+import {
 	INITIAL_SEMANTIC_EPOCH,
 	nextSemanticEpoch,
 	parseSemanticEpoch,
@@ -238,6 +241,19 @@ export interface JournalFeedEntry {
 	kind: VaultCommitKind;
 	catalogs: CatalogHeadAtBoundary[];
 	semanticCatalogs: SemanticCatalogHead[];
+}
+
+export interface RelayTailRow {
+	bodyId: string;
+	epoch: number;
+	baseSequence: number;
+	latestSequence: number;
+	generation: number;
+	frames: number;
+	byteLength: number;
+	data: Uint8Array;
+	contentHash: string | null;
+	size: number | null;
 }
 
 export interface JournalFeedPage {
@@ -987,13 +1003,14 @@ export abstract class VaultDocumentStore {
 		`);
 		this.initialized = true;
 		if (this.leanRowsEnabled) this.addLeanColumns();
+		if (this.relayTailEnabled) this.storage.sql.exec(RELAY_TAIL_SCHEMA);
 	}
 
 	currentSequence(): number {
 		this.initialize();
 		return this.storage.sql.exec<{ sequence: number }>(
 			this.leanRowsEnabled
-				? `SELECT MAX(sequence, (SELECT COALESCE(MAX(sequence), 0) FROM vault_journal)) AS sequence
+				? `SELECT MAX(sequence, ${this.leanHeadSql()}) AS sequence
 				     FROM vault_clock WHERE id = 1`
 				: "SELECT sequence FROM vault_clock WHERE id = 1",
 		).one().sequence;
@@ -1023,6 +1040,34 @@ export abstract class VaultDocumentStore {
 		if (this.initialized) this.addLeanColumns();
 	}
 
+	/**
+	 * Relay v3 (YAOS_RELAY_GROUP_COMMIT, requires lean rows): relay group commits
+	 * write one `relay_body_tail` row per body instead of journal rows, and one
+	 * `relay_device_receipts` row per device instead of candidate receipts. Every
+	 * lean allocator then takes MAX(clock, journal head, tail head), and every
+	 * journal reader (reconstruct, durable parts, tail stats, feed, catalog
+	 * overlay) also reads the tail. Off: no statement text changes.
+	 */
+	protected relayTailEnabled = false;
+
+	get relayTail(): boolean {
+		return this.relayTailEnabled;
+	}
+
+	enableRelayTail(): void {
+		if (!this.leanRowsEnabled) throw new Error("relay tail requires lean rows");
+		this.relayTailEnabled = true;
+		if (this.initialized) this.storage.sql.exec(RELAY_TAIL_SCHEMA);
+	}
+
+	/** Lean-mode sequence head expression: the journal head, and in v3 the tail head too. */
+	protected leanHeadSql(): string {
+		return this.relayTailEnabled
+			? `MAX((SELECT COALESCE(MAX(sequence), 0) FROM vault_journal),
+			       (SELECT COALESCE(MAX(latest_sequence), 0) FROM relay_body_tail))`
+			: "(SELECT COALESCE(MAX(sequence), 0) FROM vault_journal)";
+	}
+
 	private addLeanColumns(): void {
 		for (const column of LEAN_JOURNAL_COLUMNS) {
 			try { this.storage.sql.exec(`ALTER TABLE vault_journal ADD COLUMN ${column}`).toArray(); }
@@ -1036,9 +1081,17 @@ export abstract class VaultDocumentStore {
 	protected clockAdvanceSql(byParam = false): string {
 		const step = byParam ? "?" : "1";
 		return this.leanRowsEnabled
-			? `UPDATE vault_clock SET sequence = MAX(sequence, (SELECT COALESCE(MAX(sequence), 0) FROM vault_journal)) + ${step}
+			? `UPDATE vault_clock SET sequence = MAX(sequence, ${this.leanHeadSql()}) + ${step}
 			   WHERE id = 1 RETURNING sequence`
 			: `UPDATE vault_clock SET sequence = sequence + ${step} WHERE id = 1 RETURNING sequence`;
+	}
+
+	/** Lean mode: the next sequence, MAX(clock, journal head[, tail head]) + 1, without writing the clock. */
+	leanNextSequence(): { sequence: number; rowsRead: number } {
+		const next = this.storage.sql.exec<{ sequence: number }>(
+			`SELECT MAX((SELECT sequence FROM vault_clock WHERE id = 1), ${this.leanHeadSql()}) + 1 AS sequence`,
+		);
+		return { sequence: next.one().sequence, rowsRead: next.rowsRead };
 	}
 
 	/** Allocates one vault sequence (lean-aware). */
@@ -1051,9 +1104,10 @@ export abstract class VaultDocumentStore {
 	/** Lean mode: raise the clock to the journal head (before deleting journal rows). One row. */
 	syncLeanClock(): number {
 		if (!this.leanRowsEnabled) return 0;
+		const head = this.leanHeadSql();
 		const cursor = this.storage.sql.exec(`UPDATE vault_clock
-		 SET sequence = (SELECT COALESCE(MAX(sequence), 0) FROM vault_journal)
-		 WHERE id = 1 AND sequence < (SELECT COALESCE(MAX(sequence), 0) FROM vault_journal)`);
+		 SET sequence = ${head}
+		 WHERE id = 1 AND sequence < ${head}`);
 		cursor.toArray();
 		return cursor.rowsWritten;
 	}
@@ -1311,7 +1365,22 @@ export abstract class VaultDocumentStore {
 		   AND attr_device_credential_revision = ? AND attr_operation_id = ? AND attr_request_digest = ?
 		 ORDER BY sequence DESC LIMIT 1`, actor.principalId, actor.membershipRevision, actor.deviceId,
 			actor.deviceCredentialRevision, operationId, requestDigest).toArray()[0];
-		return inline ? { operationId, requestDigest, vaultSequence: inline.sequence, committed: true } : null;
+		if (inline) return { operationId, requestDigest, vaultSequence: inline.sequence, committed: true };
+		// v3: group commits record candidates in the device's receipt ring (B3).
+		const ring = this.relayReceiptRing(actor.deviceId);
+		const hit = ring.find((entry) => entry.c === operationId && entry.d === requestDigest
+			&& entry.p === actor.principalId && entry.m === actor.membershipRevision
+			&& entry.k === actor.deviceCredentialRevision);
+		return hit ? { operationId, requestDigest, vaultSequence: hit.s, committed: true } : null;
+	}
+
+	/** v3: a device's receipt ring, newest first (empty when v3 is off). */
+	relayReceiptRing(clientId: string): RelayReceiptEntry[] {
+		if (!this.relayTailEnabled) return [];
+		this.initialize();
+		const row = this.storage.sql.exec<{ recent: string }>(
+			"SELECT recent FROM relay_device_receipts WHERE client_id = ?", clientId).toArray()[0];
+		return parseReceiptRing(row?.recent);
 	}
 
 	documentGenerationAtSequence(documentId: string, sequence: number): number | null {
@@ -1490,6 +1559,19 @@ export abstract class VaultDocumentStore {
 		  LEFT JOIN vault_journal journal
 		    ON journal.document_id = ? AND journal.sequence > checkpoint.checkpoint_sequence`,
 			documentId, documentId).one();
+		if (this.relayTailEnabled) {
+			const tail = this.relayTailRow(documentId);
+			if (tail && tail.latestSequence > row.checkpoint_sequence) {
+				if (tail.baseSequence > row.checkpoint_sequence) {
+					return { entries: row.entries + tail.frames, bytes: row.bytes + tail.byteLength,
+						checkpointSequence: row.checkpoint_sequence };
+				}
+				const records = decodeTailRecords(tail.data).filter((record) => record.sequence > row.checkpoint_sequence);
+				return { entries: row.entries + records.length,
+					bytes: row.bytes + records.reduce((sum, record) => sum + record.update.byteLength, 0),
+					checkpointSequence: row.checkpoint_sequence };
+			}
+		}
 		return { entries: row.entries, bytes: row.bytes, checkpointSequence: row.checkpoint_sequence };
 	}
 
@@ -1563,28 +1645,13 @@ export abstract class VaultDocumentStore {
 			if (checkpoint) {
 				crdtEngine.applyUpdate(doc, checkpoint.bytes, "checkpoint-load");
 			}
-		const journal = this.storage.sql.exec<{
-			sequence: number; generation: number; semantic_epoch: number;
-			update_byte_length: number; data: DurableChunkValue;
-		}>(
-			`SELECT sequence, generation, semantic_epoch, update_byte_length, data
-			 FROM vault_journal
-			 WHERE document_id = ? AND sequence > ? AND sequence <= ?
-			 ORDER BY sequence`,
-			documentId,
-			checkpointSequence,
-			throughSequence,
-		);
+		const journal = this.journalUpdatesAfter(documentId, checkpointSequence, throughSequence);
 		let journalUpdates = 0;
-		for (const row of journal) {
-			const update = new Uint8Array(row.data);
-			if (update.byteLength !== row.update_byte_length || update.byteLength === 0) {
-				throw new Error("journal update length mismatch");
-			}
-			if (parseSemanticEpoch(row.semantic_epoch) !== semanticEpoch) {
+		for (const row of journal.rows) {
+			if (parseSemanticEpoch(row.semanticEpoch) !== semanticEpoch) {
 				throw new Error("journal crosses a semantic epoch without a checkpoint");
 			}
-			crdtEngine.applyUpdate(doc, update, "journal-load");
+			crdtEngine.applyUpdate(doc, row.update, "journal-load");
 			generation = row.generation;
 			journalUpdates++;
 		}
@@ -1654,25 +1721,13 @@ export abstract class VaultDocumentStore {
 		let generation = checkpoint?.generation ?? 0;
 		const semanticEpoch = checkpoint?.semanticEpoch ?? INITIAL_SEMANTIC_EPOCH;
 		const updates: Uint8Array[] = checkpoint ? [checkpoint.bytes] : [];
-		const journal = this.storage.sql.exec<{
-			sequence: number; generation: number; semantic_epoch: number;
-			update_byte_length: number; data: DurableChunkValue;
-		}>(
-			`SELECT sequence, generation, semantic_epoch, update_byte_length, data
-			 FROM vault_journal
-			 WHERE document_id = ? AND sequence > ? AND sequence <= ?
-			 ORDER BY sequence`,
-			documentId, checkpointSequence, throughSequence,
-		);
+		const journal = this.journalUpdatesAfter(documentId, checkpointSequence, throughSequence);
 		let tailEntries = 0;
 		let tailBytes = 0;
 		let latestSequence = checkpointSequence;
-		for (const row of journal) {
-			const update = new Uint8Array(row.data);
-			if (update.byteLength !== row.update_byte_length || update.byteLength === 0) {
-				throw new Error("journal update length mismatch");
-			}
-			if (parseSemanticEpoch(row.semantic_epoch) !== semanticEpoch) {
+		for (const row of journal.rows) {
+			const update = row.update;
+			if (parseSemanticEpoch(row.semanticEpoch) !== semanticEpoch) {
 				throw new Error("journal crosses a semantic epoch without a checkpoint");
 			}
 			updates.push(update);
@@ -1684,6 +1739,125 @@ export abstract class VaultDocumentStore {
 		rowsRead += journal.rowsRead;
 		return { documentId, throughSequence, latestSequence, generation, semanticEpoch, checkpointSequence,
 			tailEntries, tailBytes, parts: updates, rowsRead };
+	}
+
+	/**
+	 * Journal rows of a document in (after, through], ordered by sequence; in v3
+	 * also the records of its tail row in that range (merge-ordered with the
+	 * journal: a group commit too large for the tail falls back to a journal row).
+	 */
+	protected journalUpdatesAfter(documentId: string, after: number, through: number): {
+		rows: Array<{ sequence: number; generation: number; semanticEpoch: number; update: Uint8Array }>;
+		rowsRead: number;
+	} {
+		const journal = this.storage.sql.exec<{
+			sequence: number; generation: number; semantic_epoch: number;
+			update_byte_length: number; data: DurableChunkValue;
+		}>(
+			`SELECT sequence, generation, semantic_epoch, update_byte_length, data
+			 FROM vault_journal
+			 WHERE document_id = ? AND sequence > ? AND sequence <= ?
+			 ORDER BY sequence`,
+			documentId, after, through,
+		);
+		const rows: Array<{ sequence: number; generation: number; semanticEpoch: number; update: Uint8Array }> = [];
+		for (const row of journal) {
+			const update = new Uint8Array(row.data);
+			if (update.byteLength !== row.update_byte_length || update.byteLength === 0) {
+				throw new Error("journal update length mismatch");
+			}
+			rows.push({ sequence: row.sequence, generation: row.generation, semanticEpoch: row.semantic_epoch, update });
+		}
+		let rowsRead = journal.rowsRead;
+		if (this.relayTailEnabled) {
+			const tail = this.relayTailRecords(documentId, after, through);
+			rowsRead += tail.rowsRead;
+			if (tail.records.length > 0) {
+				for (const record of tail.records) {
+					rows.push({ sequence: record.sequence, generation: record.generation, semanticEpoch: tail.epoch!,
+						update: record.update });
+				}
+				rows.sort((left, right) => left.sequence - right.sequence);
+			}
+		}
+		return { rows, rowsRead };
+	}
+
+	/** v3: the raw tail row of a body (null when it has none or v3 is off). */
+	relayTailRow(documentId: string): RelayTailRow | null {
+		if (!this.relayTailEnabled) return null;
+		this.initialize();
+		const row = this.storage.sql.exec<{
+			body_epoch: number; base_sequence: number; latest_sequence: number; generation: number; frames: number;
+			byte_length: number; data: DurableChunkValue; content_hash: string | null; size: number | null;
+		}>(`SELECT body_epoch, base_sequence, latest_sequence, generation, frames, byte_length, data, content_hash, size
+		    FROM relay_body_tail WHERE body_id = ?`, documentId).toArray()[0];
+		return row ? { bodyId: documentId, epoch: row.body_epoch, baseSequence: row.base_sequence,
+			latestSequence: row.latest_sequence, generation: row.generation, frames: row.frames,
+			byteLength: row.byte_length, data: new Uint8Array(row.data), contentHash: row.content_hash,
+			size: row.size } : null;
+	}
+
+	/** v3: tail records of a body in (after, through]. */
+	relayTailRecords(documentId: string, after: number, through: number):
+		{ epoch: number | null; records: RelayTailRecord[]; rowsRead: number } {
+		if (!this.relayTailEnabled) return { epoch: null, records: [], rowsRead: 0 };
+		const row = this.relayTailRow(documentId);
+		if (!row || row.latestSequence <= after || row.baseSequence > through) {
+			return { epoch: row?.epoch ?? null, records: [], rowsRead: row ? 1 : 0 };
+		}
+		const records = decodeTailRecords(row.data)
+			.filter((record) => record.sequence > after && record.sequence <= through);
+		return { epoch: row.epoch, records, rowsRead: 1 };
+	}
+
+	/**
+	 * v3: drops the tail records a new checkpoint at `through` covers (inside the
+	 * checkpoint / reset transaction; the caller has already raised the clock to
+	 * the tail head). A record an active history pin still needs (the pin's
+	 * boundary is at or after it but before the new checkpoint, and it is above
+	 * the feed floor, which never passes a pin) is moved to a journal row first,
+	 * so the existing pin rules keep it. Returns rows written.
+	 */
+	protected trimRelayTail(documentId: string, through: number, now: number): number {
+		if (!this.relayTailEnabled) return 0;
+		const row = this.relayTailRow(documentId);
+		if (!row || row.baseSequence > through) return 0;
+		let rowsWritten = 0;
+		const records = decodeTailRecords(row.data);
+		const covered = records.filter((record) => record.sequence <= through);
+		const kept = records.filter((record) => record.sequence > through);
+		const floor = this.journalFloor();
+		const pins = this.storage.sql.exec<{ boundary_sequence: number }>(
+			`SELECT boundary_sequence FROM vault_history_pins
+			  WHERE soft_expires_at > ? AND hard_expires_at > ? AND boundary_sequence < ?`,
+			now, now, through,
+		).toArray().map((pin) => pin.boundary_sequence);
+		for (const record of covered) {
+			if (record.sequence <= floor || !pins.some((boundary) => boundary >= record.sequence)) continue;
+			const spilled = this.storage.sql.exec(
+				`INSERT INTO vault_journal(sequence, document_id, generation, semantic_epoch, kind,
+				 update_byte_length, data, created_at) VALUES (?, ?, ?, ?, 'body', ?, ?, ?)`,
+				record.sequence, documentId, record.generation, row.epoch, record.update.byteLength,
+				record.update.slice().buffer, now,
+			);
+			spilled.toArray();
+			rowsWritten += spilled.rowsWritten;
+		}
+		if (kept.length === 0) {
+			const deleted = this.storage.sql.exec("DELETE FROM relay_body_tail WHERE body_id = ?", documentId);
+			deleted.toArray();
+			return rowsWritten + deleted.rowsWritten;
+		}
+		const data = encodeTailRecords(kept);
+		const rewritten = this.storage.sql.exec(
+			`UPDATE relay_body_tail SET base_sequence = ?, frames = ?, byte_length = ?, data = ?, updated_at = ?
+			  WHERE body_id = ?`,
+			kept[0]!.sequence, kept.length, kept.reduce((sum, record) => sum + record.update.byteLength, 0),
+			data.slice().buffer, now, documentId,
+		);
+		rewritten.toArray();
+		return rowsWritten + rewritten.rowsWritten;
 	}
 
 	writeCheckpoint(documentId: string, throughSequence = this.currentSequence()): CheckpointWriteResult {
@@ -1844,6 +2018,9 @@ export abstract class VaultDocumentStore {
 			head.toArray();
 			if (head.rowsWritten !== 1) throw new Error("checkpoint head mismatch");
 			rowsWritten += head.rowsWritten;
+			// v3: the abandoned lineage's tail records (the relay service checkpoints
+			// the tail before a reset, so this is normally a no-op).
+			rowsWritten += this.trimRelayTail(documentId, expectedHead.throughSequence, now);
 			if (documentId !== "root") {
 				// Publish the new body lineage as catalog authority in the same
 				// transaction. Catalog epochs must not be reconstructed from journal
@@ -2187,6 +2364,7 @@ export abstract class VaultDocumentStore {
 			);
 			deleteJournal.toArray();
 			rowsWritten += deleteJournal.rowsWritten;
+			rowsWritten += this.trimRelayTail(documentId, expectedHead.throughSequence, now);
 			rowsWritten += this.pruneUnpinnedDocumentHistory(now, documentId);
 		});
 		return {
@@ -2212,6 +2390,28 @@ export abstract class VaultDocumentStore {
 			sequence,
 			boundedLimit,
 		).toArray();
+		if (this.relayTailEnabled) {
+			// v3: group commits write no journal row; a body's head sequence stands
+			// for every tail commit since its last journal row (the feed reports
+			// "document changed at S", so intermediate tail sequences collapse into
+			// the head). Merged into the page by sequence, then re-limited.
+			const synthetic = this.storage.sql.exec<{
+				sequence: number; document_id: string; generation: number; semantic_epoch: number; kind: VaultCommitKind;
+			}>(
+				`SELECT h.latest_sequence AS sequence, h.document_id, h.generation, h.semantic_epoch, 'body' AS kind
+				   FROM vault_document_heads h
+				  WHERE h.latest_sequence > ?
+				    AND NOT EXISTS (SELECT 1 FROM vault_journal j WHERE j.sequence = h.latest_sequence)
+				  ORDER BY h.latest_sequence LIMIT ?`,
+				sequence, boundedLimit,
+			).toArray();
+			if (synthetic.length > 0) {
+				rows.push(...synthetic);
+				rows.sort((left, right) => left.sequence - right.sequence);
+				rows.length = Math.min(rows.length, boundedLimit);
+			}
+		}
+		const pageMax = rows.length > 0 ? rows[rows.length - 1]!.sequence : sequence;
 		const catalogs = this.storage.sql.exec<{
 			sequence: number; body_id: string; file_id: string; path: string; previous_path: string | null;
 			lifecycle: BodyLifecycle; generation: number; body_epoch: number; content_hash: string | null; size: number | null;
@@ -2242,6 +2442,7 @@ export abstract class VaultDocumentStore {
 				contentHash: catalog.content_hash,
 				size: catalog.size,
 			};
+			if (catalog.sequence > pageMax) continue;
 			const entries = catalogsBySequence.get(catalog.sequence);
 			if (entries) entries.push(mapped);
 			else catalogsBySequence.set(catalog.sequence, [mapped]);
@@ -2264,6 +2465,7 @@ export abstract class VaultDocumentStore {
 				generation: value.generation,
 				bodyEpoch: parseSemanticEpoch(value.document_epoch, "feed semantic document epoch"),
 				contentHash: value.content_hash, size: value.size };
+			if (value.sequence > pageMax) continue;
 			const entries = semanticBySequence.get(value.sequence);
 			if (entries) entries.push(mapped); else semanticBySequence.set(value.sequence, [mapped]);
 		}
