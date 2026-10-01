@@ -1,0 +1,39 @@
+scripts/relay2/wb/adapters.ts
+  s_694286f0c485ac::t_a074af29c7e851 37-38,51-76,112-115,121-122,145,166
+scripts/relay2/wb/scenarios.ts
+  s_bc4d2a1dc6ba9d::t_8ca7f7c520d91b 677-685,714-715,717,730
+scripts/relay2/wb/selftest.ts
+  s_82d26342e78308::t_9195e08da9eaa0 12-13,125-149
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "11e2e7ea42806c8b36bd06868eb550238ab66919",
+  "prompts": {},
+  "sessions": {
+    "s_694286f0c485ac": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a3a172259d6cb1bf1",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_82d26342e78308": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a34dcd41e6604fc76",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_bc4d2a1dc6ba9d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a171c7400d4ef1a6c",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
