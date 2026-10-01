@@ -1,0 +1,35 @@
+scripts/relay2/wb/adapters.ts
+  s_86bb7b752eea7d::t_e7c953d4ddbfdd 37-38,51-76,112-115,121-122,145,166
+scripts/relay2/wb/scenarios.ts
+  s_86bb7b752eea7d::t_cc30a5a0079f62 688-696,725-726,728,741
+scripts/relay2/wb/selftest.ts
+  s_86bb7b752eea7d::t_4e70139baf435b 12-13,125-149
+src/sync/fencedWebSocket.ts
+  s_86bb7b752eea7d::t_66a30b2bf59730 11-12,34-35,57,62-68,70,82-83,93
+src/sync/relayReceipts.ts
+  s_86bb7b752eea7d::t_729f7f940345f8 1-486
+src/sync/vaultSync.ts
+  s_86bb7b752eea7d::t_d1d0ecf90d22a2 83,625-631,682-688,763-782,1433-1434,3968-3970,3973,3979-3985,4148-4155,4260,4417-4425,4427-4430,4485-4486,4514,4675,5649-5653,5656,5680,5709-5803,5812-5814,6453-6454
+tests/client/mandatory-socket-ticket.ts
+  s_86bb7b752eea7d::t_b9a3da105f8ea0 21
+tests/client/relay-receipts.ts
+  s_86bb7b752eea7d::t_78604c487c65fc 1-311
+tests/server/relay-client-receipts.ts
+  s_86bb7b752eea7d::t_86fb9678b1bb37 1-444
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "9079ec29d4c9705d5ecd318b7ad68c74d4c1ce60",
+  "prompts": {},
+  "sessions": {
+    "s_86bb7b752eea7d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a19062f3ba3d813cf",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
