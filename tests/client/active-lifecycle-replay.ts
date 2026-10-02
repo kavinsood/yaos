@@ -86,6 +86,56 @@ s.test("b3-int: a revive answered body_not_tombstoned is dropped once the body i
 	await runtime.destroy();
 });
 
+s.test("b3-int: concurrent disk revives of one deleted note issue exactly one revive", async () => {
+	const vault = memoryVault();
+	const server = new FakeBulkCreateServer();
+	const revives: string[] = [];
+	let sequence = 1;
+	const runtime = new VaultSync({
+		vaultId: "vault-1", vaultGeneration: "generation-1", deviceId: "device-1",
+		host: "https://sync.test", token: "token", database: vault.database,
+		server: server.port({
+			commitLifecycleBatch: async (requests): Promise<LifecycleBatchReceipt> => {
+				for (const request of requests) if (request.kind === "revive") revives.push(request.operationId);
+				// Hold the commit open so a second revive would overlap it.
+				await new Promise((resolve) => setTimeout(resolve, 20));
+				sequence++;
+				return {
+					receipts: requests.map((next): LifecycleReceipt => ({
+						vaultId: "vault-1", vaultGeneration: "generation-1", bodyId: next.bodyId,
+						bodyEpoch: next.bodyEpoch, operationId: next.operationId, kind: next.kind,
+						durableGeneration: 1, vaultSequence: sequence, runtimeEpoch: "runtime-1",
+					})),
+					vaultSequence: sequence, runtimeEpoch: "runtime-1",
+				};
+			},
+			publishLifecycleRoot: async (operations, _update, rootEpoch) => ({
+				vaultGeneration: "generation-1", operationIds: operations.map((operation) => operation.operationId),
+				vaultSequence: sequence, rootGeneration: sequence, rootEpoch, runtimeEpoch: "runtime-1",
+			}),
+		}),
+		providerFactory: testProvider, createCollectorDelayMs: 0,
+	});
+	await runtime.commitFreshBody({ bodyId: "body-1", path: "Revived.md", content: "dirty work", reason: "test", candidateId: "candidate-1" });
+	await runtime.commitLifecycle({
+		operationId: "delete-1", kind: "delete", fileId: "body-1", bodyId: "body-1",
+		bodyEpoch: await runtime.currentBodyEpoch("body-1"), path: "Revived.md",
+	});
+	assert.equal(runtime.getFileId("Revived.md") ?? null, null);
+
+	// Two delete-revive paths (e.g. restart reconcile and the remote-delete
+	// observer) bring the dirty note back at the same moment.
+	const revive = () => runtime.commitDiskBody({
+		bodyId: "body-1", path: "Revived.md", content: "dirty work", reason: "test", lifecycle: "revive",
+	});
+	const results = await Promise.all([revive(), revive()]);
+	assert.equal(revives.length, 1, `exactly one revive request reaches the server (got ${revives.length})`);
+	assert.deepEqual(results.map((result) => result.revived), [true, true]);
+	assert.equal(runtime.getFileId("Revived.md"), "body-1");
+	assert.equal(vault.lifecycle.size, 0, "no revive is left to replay");
+	await runtime.destroy();
+});
+
 s.test("teardown fences an in-flight replay and startup reconstructs it", async () => {
 	const documents = new Map<string, StoredDocument>();
 	const lifecycle = new Map<string, StoredLifecycleOperation>([["delete-1", {

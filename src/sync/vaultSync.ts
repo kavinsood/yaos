@@ -1460,6 +1460,8 @@ export class VaultSync implements SyncRuntimePort {
 	private readonly unconfirmedCreates = new Map<string, string>();
 	/** Paths whose create batch is in flight; resolves after local settlement. */
 	private readonly createsInFlight = new Map<string, Promise<BulkCreateItemResult>>();
+	/** One in-flight disk revive per body; concurrent delete-revive paths share it. */
+	private readonly revivesInFlight = new Map<string, { path: string; settled: Promise<void> }>();
 	private readonly createCollector = new Map<string, CreateCollectorEntry>();
 	private createCollectorBytes = 0;
 	/** Create-bulk caps learned from a 413 body (tighter than or equal to the advertised ones). */
@@ -3673,16 +3675,7 @@ export class VaultSync implements SyncRuntimePort {
 				receipt: fresh.receipt,
 			};
 		}
-		if (lifecycle === "revive") {
-			await this.commitLifecycle({
-				operationId: crypto.randomUUID(),
-				kind: "revive",
-				fileId: input.bodyId,
-				bodyId: input.bodyId,
-				bodyEpoch: await this.currentBodyEpoch(input.bodyId),
-				path: input.path,
-			});
-		}
+		if (lifecycle === "revive") await this.reviveOnce(input.bodyId, input.path);
 		const revived = lifecycle === "revive";
 		const body = await this.loadCurrentBody(input.bodyId);
 		if (body.doc.getText(BODY_TEXT_NAME).toJSON() === input.content) {
@@ -3703,6 +3696,44 @@ export class VaultSync implements SyncRuntimePort {
 		}
 	}
 
+
+	/**
+	 * Revives a body at most once at a time. Two delete-revive paths (restart
+	 * reconcile and the remote-delete observer) used to each store and send a
+	 * revive; the loser got 409 body_not_tombstoned. A caller that finds a
+	 * revive in flight for the same body and path shares its outcome; for a
+	 * different path it waits and re-checks. isRedundantRevive stays as the
+	 * defence for revives that still race (another device, a stored replay).
+	 */
+	private async reviveOnce(bodyId: string, path: string): Promise<void> {
+		for (;;) {
+			if (this.getFileId(path) === bodyId) return;
+			const inFlight = this.revivesInFlight.get(bodyId);
+			if (!inFlight) break;
+			if (inFlight.path === path) {
+				await inFlight.settled;
+				return;
+			}
+			await inFlight.settled.catch(() => undefined);
+		}
+		const settled = (async () => {
+			await this.commitLifecycle({
+				operationId: crypto.randomUUID(),
+				kind: "revive",
+				fileId: bodyId,
+				bodyId,
+				bodyEpoch: await this.currentBodyEpoch(bodyId),
+				path,
+			});
+		})();
+		const entry = { path, settled };
+		this.revivesInFlight.set(bodyId, entry);
+		try {
+			await settled;
+		} finally {
+			if (this.revivesInFlight.get(bodyId) === entry) this.revivesInFlight.delete(bodyId);
+		}
+	}
 
 	isBodyLoaded(bodyId: string): boolean {
 		return this.bodies.get(bodyId) !== null;
