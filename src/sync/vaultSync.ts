@@ -1,4 +1,5 @@
 import * as Y from "yjs";
+import { isMarkdownConflictArtifactPath } from "./markdownConflictArtifact";
 import YSyncProvider from "y-partyserver/provider";
 import { IndexeddbPersistence } from "y-indexeddb";
 import { normalizePath } from "obsidian";
@@ -1191,7 +1192,11 @@ export class VaultSync {
 		let skipped = 0;
 
 		this.ensurePathIndexes();
-		const crdtPaths = new Set<string>(this._pathIndex.keys());
+		// Keep legacy synced artifacts in the document for recovery, but never
+		// plan disk creates/overwrites for these now-local-only safety copies.
+		const crdtPaths = new Set<string>(
+			[...this._pathIndex.keys()].filter((path) => !isMarkdownConflictArtifactPath(path)),
+		);
 
 		// CRDT files not on disk → create on disk
 		// IMPORTANT: use diskPresentPaths (all known disk paths), not
@@ -1221,6 +1226,7 @@ export class VaultSync {
 
 		// Disk files not in CRDT
 		for (const path of diskPresentPaths) {
+			if (isMarkdownConflictArtifactPath(path)) continue;
 			const classification = classifyDiskPathForReconcile(
 				path,
 				crdtPaths.has(path),
