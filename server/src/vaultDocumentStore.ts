@@ -442,7 +442,40 @@ export abstract class VaultDocumentStore {
 	 */
 	readonly documentMaterialisations = { root: 0, nonRoot: 0, recentNonRoot: [] as string[] };
 
-	constructor(protected readonly storage: VaultStoragePort) {}
+	protected readonly storage: VaultStoragePort;
+
+	constructor(storage: VaultStoragePort) {
+		this.storage = this.guardRollbacks(storage);
+	}
+
+	/**
+	 * Wraps `transactionSync` so a rolled-back transaction drops in-memory state
+	 * derived from rows it may have read before the rollback (see
+	 * `VaultCatalogStore.catalogPathIndex`). Other stores sharing the storage
+	 * (`RelayBodyStore`) route their transactions through this too.
+	 */
+	guardRollbacks<T extends VaultStoragePort>(storage: T): T {
+		const onRollback = () => this.discardDerivedState();
+		return new Proxy(storage, {
+			get(target, property) {
+				if (property === "transactionSync") {
+					return <R>(closure: () => R): R => {
+						try {
+							return target.transactionSync(closure);
+						} catch (error) {
+							onRollback();
+							throw error;
+						}
+					};
+				}
+				const value = Reflect.get(target, property, target) as unknown;
+				return typeof value === "function" ? (value as (...args: unknown[]) => unknown).bind(target) : value;
+			},
+		});
+	}
+
+	/** Drop caches derived from SQLite rows; called after any transaction rollback. */
+	protected discardDerivedState(): void {}
 
 	abstract activePins(now?: number): HistoryPin[];
 
@@ -1586,21 +1619,40 @@ export abstract class VaultDocumentStore {
 		if (!Number.isSafeInteger(entryThreshold) || entryThreshold < 1
 			|| !Number.isSafeInteger(byteThreshold) || byteThreshold < 1
 			|| !Number.isSafeInteger(limit) || limit < 1) throw new Error("invalid checkpoint candidate query");
-		return this.storage.sql.exec<{ document_id: string }>(`WITH checkpoint AS (
-		  SELECT head.document_id, COALESCE(MAX(manifest.checkpoint_sequence), 0) AS checkpoint_sequence
-		    FROM vault_document_heads head
-		    LEFT JOIN vault_checkpoint_manifests manifest
-		      ON manifest.document_id = head.document_id AND manifest.complete = 1
-		   GROUP BY head.document_id
-		)
-		SELECT journal.document_id
-		  FROM vault_journal journal
-		  JOIN checkpoint ON checkpoint.document_id = journal.document_id
-		   AND journal.sequence > checkpoint.checkpoint_sequence
-		 GROUP BY journal.document_id
-		HAVING COUNT(*) >= ? OR COALESCE(SUM(journal.update_byte_length), 0) >= ?
-		 ORDER BY MIN(journal.sequence), journal.document_id LIMIT ?`,
-			entryThreshold, byteThreshold, limit).toArray().map((row) => row.document_id);
+		// Skip-scan the journal's documents (journal rows exist only for bodies
+		// edited since their checkpoint) instead of joining every document head:
+		// rows read are ~3 per journaled document plus its rows after the
+		// checkpoint, independent of vault size. Runs on every vault alarm.
+		const candidates: Array<{ documentId: string; first: number }> = [];
+		let cursor = "";
+		for (;;) {
+			const next = this.storage.sql.exec<{ document_id: string }>(
+				"SELECT document_id FROM vault_journal WHERE document_id > ? ORDER BY document_id LIMIT 1", cursor,
+			).toArray()[0];
+			if (!next) break;
+			cursor = next.document_id;
+			const present = this.storage.sql.exec<{ present: number }>(
+				"SELECT 1 AS present FROM vault_document_heads WHERE document_id = ?", cursor,
+			).toArray().length > 0;
+			if (!present) continue;
+			const checkpointSequence = this.storage.sql.exec<{ sequence: number | null }>(
+				`SELECT MAX(checkpoint_sequence) AS sequence FROM vault_checkpoint_manifests
+				 WHERE document_id = ? AND complete = 1`, cursor,
+			).one().sequence ?? 0;
+			const journal = this.storage.sql.exec<{ entries: number; bytes: number; first: number | null }>(
+				`SELECT COUNT(*) AS entries, COALESCE(SUM(update_byte_length), 0) AS bytes, MIN(sequence) AS first
+				 FROM vault_journal WHERE document_id = ? AND sequence > ?`, cursor, checkpointSequence,
+			).one();
+			if (journal.first === null) continue;
+			if (journal.entries >= entryThreshold || journal.bytes >= byteThreshold) {
+				candidates.push({ documentId: cursor, first: journal.first });
+			}
+		}
+		return candidates
+			.sort((left, right) => left.first - right.first
+				|| (left.documentId < right.documentId ? -1 : left.documentId > right.documentId ? 1 : 0))
+			.slice(0, limit)
+			.map((candidate) => candidate.documentId);
 	}
 
 	reconstructDocument(documentId: string, throughSequence = this.currentSequence()): ReconstructedDocument {

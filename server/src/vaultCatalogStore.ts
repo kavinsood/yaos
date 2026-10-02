@@ -203,111 +203,125 @@ export interface CatalogDeltaEntry {
 
 /** File, body, attachment, candidate, and lifecycle catalog storage. */
 export abstract class VaultCatalogStore extends VaultDocumentStore {
+	/** See `catalogPathIndex`. */
+	private catalogIndex: CatalogPathIndex | null = null;
+
 	rootAuthoritySnapshotAt(boundarySequence: number): RootAuthoritySnapshot {
 		this.initialize();
 		if (!Number.isSafeInteger(boundarySequence) || boundarySequence < 0) {
 			throw new Error("invalid root authority boundary");
 		}
-		const markdown = this.storage.sql.exec<{
+		const markdown: RootAuthoritySnapshot["markdown"] = [];
+		for (const row of this.latestEventPerKey<{
 			sequence: number; body_id: string; file_id: string; path: string; previous_path: string | null;
 			lifecycle: BodyLifecycle; generation: number; body_epoch: number; content_hash: string | null; size: number | null;
-		}>(`SELECT e.sequence, e.body_id, e.file_id, e.path, e.previous_path, e.lifecycle,
-		          e.generation, e.body_epoch, e.content_hash, e.size
-		   FROM vault_catalog_events e JOIN (
-		     SELECT body_id, MAX(sequence) AS sequence FROM vault_catalog_events
-		     WHERE sequence <= ? GROUP BY body_id
-		   ) latest ON latest.body_id = e.body_id AND latest.sequence = e.sequence
-		   ORDER BY e.body_id`, boundarySequence).toArray().map((row) => ({
-			sequence: row.sequence,
-			bodyId: row.body_id,
-			bodyEpoch: parseSemanticEpoch(row.body_epoch, "root authority body epoch"),
-			fileId: row.file_id,
-			path: row.path,
-			previousPath: row.previous_path,
-			lifecycle: row.lifecycle,
-			generation: row.generation,
-			contentHash: row.content_hash,
-			size: row.size,
-		}));
-		const semantic = this.storage.sql.exec<{
-			sequence: number; document_id: string; file_id: string; kind: "canvas"; format: "json-canvas";
-			format_version: 1; path: string; previous_path: string | null; lifecycle: SemanticCatalogHead["lifecycle"];
-			generation: number; document_epoch: number; content_hash: string | null; size: number | null;
-		}>(`SELECT e.sequence, e.document_id, e.file_id, e.kind, e.format, e.format_version,
-		          e.path, e.previous_path, e.lifecycle, e.generation, e.document_epoch,
-		          e.content_hash, e.size
-		   FROM vault_semantic_catalog_events e JOIN (
-		     SELECT document_id, MAX(sequence) AS sequence FROM vault_semantic_catalog_events
-		     WHERE sequence <= ? GROUP BY document_id
-		   ) latest ON latest.document_id = e.document_id AND latest.sequence = e.sequence
-		   ORDER BY e.document_id`, boundarySequence).toArray().map((row) => ({
-			sequence: row.sequence,
-			documentId: row.document_id,
-			fileId: row.file_id,
-			kind: row.kind,
-			format: row.format,
-			formatVersion: row.format_version,
-			path: row.path,
-			previousPath: row.previous_path,
-			lifecycle: row.lifecycle,
-			generation: row.generation,
-			bodyEpoch: parseSemanticEpoch(row.document_epoch, "root authority semantic epoch"),
-			contentHash: row.content_hash,
-			size: row.size,
-		}));
-		const attachments = this.storage.sql.exec<{
+		}>("vault_catalog_events", "body_id", `e.sequence, e.body_id, e.file_id, e.path, e.previous_path, e.lifecycle,
+		          e.generation, e.body_epoch, e.content_hash, e.size`, boundarySequence)) {
+			markdown.push({
+				sequence: row.sequence,
+				bodyId: row.body_id,
+				bodyEpoch: parseSemanticEpoch(row.body_epoch, "root authority body epoch"),
+				fileId: row.file_id,
+				path: row.path,
+				previousPath: row.previous_path,
+				lifecycle: row.lifecycle,
+				generation: row.generation,
+				contentHash: row.content_hash,
+				size: row.size,
+			});
+		}
+		const semantic: RootAuthoritySnapshot["semantic"] = [...this.semanticHeadsAt(boundarySequence)];
+		const attachments: RootAuthoritySnapshot["attachments"] = [];
+		for (const row of this.latestEventPerKey<{
 			sequence: number; path: string; content_hash: string | null; size: number | null;
 			mime: string | null; lifecycle: AttachmentCatalogEvent["lifecycle"]; operation_id: string;
 			created_at: number;
-		}>(`SELECT e.sequence, e.path, e.content_hash, e.size, e.mime, e.lifecycle,
-		          e.operation_id, COALESCE(a.created_at, s.created_at, 0) AS created_at
-		   FROM vault_attachment_catalog_events e JOIN (
-		     SELECT path, MAX(sequence) AS sequence FROM vault_attachment_catalog_events
-		     WHERE sequence <= ? GROUP BY path
-		   ) latest ON latest.path = e.path AND latest.sequence = e.sequence
-		   LEFT JOIN vault_attachment_operations a ON a.operation_id = e.operation_id
-		   LEFT JOIN vault_semantic_authority_receipts s ON s.operation_id = e.operation_id
-		   ORDER BY e.path`, boundarySequence).toArray().map((row) => ({
-			sequence: row.sequence,
-			path: row.path,
-			contentHash: row.content_hash,
-			size: row.size,
-			mime: row.mime,
-			lifecycle: row.lifecycle,
-			operationId: row.operation_id,
-			createdAt: row.created_at,
-		}));
-		const blobs = this.storage.sql.exec<{
-			content_hash: string; size: number | null; mime: string | null; created_at: number;
-		}>(`WITH current_paths AS (
-		     SELECT e.content_hash FROM vault_attachment_catalog_events e JOIN (
-		       SELECT path, MAX(sequence) AS sequence FROM vault_attachment_catalog_events
-		       WHERE sequence <= ? GROUP BY path
-		     ) latest ON latest.path = e.path AND latest.sequence = e.sequence
-		     WHERE e.content_hash IS NOT NULL
-		   ), first_blob AS (
-		     SELECT e.content_hash, MIN(e.sequence) AS sequence
-		     FROM vault_attachment_catalog_events e JOIN current_paths c ON c.content_hash = e.content_hash
-		     WHERE e.sequence <= ? AND e.lifecycle = 'active' GROUP BY e.content_hash
-		   ), first_blob_row AS (
-		     SELECT e.content_hash, e.sequence, MIN(e.path) AS path
-		     FROM vault_attachment_catalog_events e JOIN first_blob f
-		       ON f.content_hash = e.content_hash AND f.sequence = e.sequence
-		     WHERE e.lifecycle = 'active' GROUP BY e.content_hash, e.sequence
-		   )
-		   SELECT e.content_hash, e.size, e.mime,
-		          COALESCE(a.created_at, s.created_at, 0) AS created_at
-		   FROM vault_attachment_catalog_events e JOIN first_blob_row f
-		     ON f.content_hash = e.content_hash AND f.sequence = e.sequence AND f.path = e.path
-		   LEFT JOIN vault_attachment_operations a ON a.operation_id = e.operation_id
-		   LEFT JOIN vault_semantic_authority_receipts s ON s.operation_id = e.operation_id
-		   ORDER BY e.content_hash`, boundarySequence, boundarySequence).toArray().map((row) => ({
-			contentHash: row.content_hash,
-			size: row.size,
-			mime: row.mime,
-			createdAt: row.created_at,
-		}));
+		}>("vault_attachment_catalog_events", "path", `e.sequence, e.path, e.content_hash, e.size, e.mime, e.lifecycle,
+		          e.operation_id, COALESCE(a.created_at, s.created_at, 0) AS created_at`, boundarySequence, "",
+		`LEFT JOIN vault_attachment_operations a ON a.operation_id = e.operation_id
+		   LEFT JOIN vault_semantic_authority_receipts s ON s.operation_id = e.operation_id`)) {
+			attachments.push({
+				sequence: row.sequence,
+				path: row.path,
+				contentHash: row.content_hash,
+				size: row.size,
+				mime: row.mime,
+				lifecycle: row.lifecycle,
+				operationId: row.operation_id,
+				createdAt: row.created_at,
+			});
+		}
+		// Each blob still referenced by a current attachment head is described by
+		// its first active event (lowest sequence, then path). There is no
+		// content-hash index (P3: none added), so this is one forward pass over
+		// attachment history in primary-key order that stops once every current
+		// hash is found: O(attachment events), never a GROUP BY or temp B-tree.
+		const wanted = new Set(attachments.flatMap((entry) => entry.contentHash === null ? [] : [entry.contentHash]));
+		const blobs: RootAuthoritySnapshot["blobs"] = [];
+		if (wanted.size > 0) {
+			const cursor = this.storage.sql.exec<{
+				content_hash: string; size: number | null; mime: string | null; created_at: number;
+			}>(`SELECT e.content_hash, e.size, e.mime, COALESCE(a.created_at, s.created_at, 0) AS created_at
+			   FROM vault_attachment_catalog_events e
+			   LEFT JOIN vault_attachment_operations a ON a.operation_id = e.operation_id
+			   LEFT JOIN vault_semantic_authority_receipts s ON s.operation_id = e.operation_id
+			   WHERE e.sequence <= ? AND e.lifecycle = 'active' AND e.content_hash IS NOT NULL
+			   ORDER BY e.sequence, e.path`, boundarySequence);
+			for (const row of cursor) {
+				if (!wanted.delete(row.content_hash)) continue;
+				blobs.push({ contentHash: row.content_hash, size: row.size, mime: row.mime, createdAt: row.created_at });
+				if (wanted.size === 0) break;
+			}
+			blobs.sort((left, right) => left.contentHash < right.contentHash ? -1 : left.contentHash > right.contentHash ? 1 : 0);
+		}
 		return { boundarySequence, markdown, semantic, attachments, blobs };
+	}
+
+	/**
+	 * Newest event at or before `boundarySequence` for each key after `afterKey`,
+	 * in key order, as an indexed skip-scan over the table's `(key, sequence DESC)`
+	 * index. Each step is one seek: `+e.sequence` keeps the planner off the
+	 * `(sequence, key)` primary key (which would need a temp B-tree for the order).
+	 * Rows read are one per key plus the events newer than the boundary, never the
+	 * whole history the old `GROUP BY key` read.
+	 */
+	protected *latestEventPerKey<R extends Record<string, SqlStorageValue>>(
+		table: "vault_catalog_events" | "vault_semantic_catalog_events" | "vault_attachment_catalog_events",
+		key: "body_id" | "document_id" | "path",
+		columns: string,
+		boundarySequence: number,
+		afterKey = "",
+		joins = "",
+	): Generator<R> {
+		let cursor = afterKey;
+		for (;;) {
+			const row = this.storage.sql.exec<R & { skip_key: string }>(
+				`SELECT e.${key} AS skip_key, ${columns} FROM ${table} e ${joins}
+				 WHERE e.${key} > ? AND +e.sequence <= ? ORDER BY e.${key}, e.sequence DESC LIMIT 1`,
+				cursor, boundarySequence,
+			).toArray()[0];
+			if (!row) return;
+			cursor = row.skip_key;
+			yield row;
+		}
+	}
+
+	protected *semanticHeadsAt(boundarySequence: number, afterDocumentId = ""): Generator<SemanticCatalogHead> {
+		for (const row of this.latestEventPerKey<{
+			sequence: number; document_id: string; file_id: string; kind: "canvas"; format: "json-canvas";
+			format_version: 1; path: string; previous_path: string | null; lifecycle: SemanticCatalogHead["lifecycle"];
+			generation: number; document_epoch: number; content_hash: string | null; size: number | null;
+		}>("vault_semantic_catalog_events", "document_id", `e.sequence, e.document_id, e.file_id, e.kind, e.format,
+		          e.format_version, e.path, e.previous_path, e.lifecycle, e.generation, e.document_epoch,
+		          e.content_hash, e.size`, boundarySequence, afterDocumentId)) {
+			yield {
+				sequence: row.sequence, documentId: row.document_id, fileId: row.file_id, kind: row.kind,
+				format: row.format, formatVersion: row.format_version, path: row.path, previousPath: row.previous_path,
+				lifecycle: row.lifecycle, generation: row.generation,
+				bodyEpoch: parseSemanticEpoch(row.document_epoch, "semantic catalog document epoch"),
+				contentHash: row.content_hash, size: row.size,
+			};
+		}
 	}
 
 	semanticHeadAt(boundarySequence: number, documentId: string): SemanticCatalogHead | null {
@@ -329,34 +343,21 @@ export abstract class VaultCatalogStore extends VaultDocumentStore {
 
 	listActiveSemanticAt(boundarySequence: number, afterDocumentId = "", limit = 1000): SemanticCatalogHead[] {
 		this.initialize();
-		return this.storage.sql.exec<{
-			sequence: number; document_id: string; file_id: string; kind: "canvas"; format: "json-canvas";
-			format_version: 1; path: string; previous_path: string | null; lifecycle: "active";
-			generation: number; document_epoch: number; content_hash: string | null; size: number | null;
-		}>(`SELECT e.sequence, e.document_id, e.file_id, e.kind, e.format, e.format_version, e.path,
-		          e.previous_path, e.lifecycle, e.generation, e.document_epoch, e.content_hash, e.size
-		   FROM vault_semantic_catalog_events e JOIN (
-		     SELECT document_id, MAX(sequence) AS sequence FROM vault_semantic_catalog_events
-		     WHERE sequence <= ? GROUP BY document_id
-		   ) latest ON latest.document_id = e.document_id AND latest.sequence = e.sequence
-		   WHERE e.lifecycle = 'active' AND e.document_id > ? ORDER BY e.document_id LIMIT ?`,
-		boundarySequence, afterDocumentId, Math.min(1000, Math.max(1, limit))).toArray().map((row) => ({
-			sequence: row.sequence, documentId: row.document_id, fileId: row.file_id, kind: row.kind,
-			format: row.format, formatVersion: row.format_version, path: row.path, previousPath: row.previous_path,
-			lifecycle: row.lifecycle, generation: row.generation,
-			bodyEpoch: parseSemanticEpoch(row.document_epoch, "semantic catalog document epoch"),
-			contentHash: row.content_hash, size: row.size,
-		}));
+		const bounded = Math.min(1000, Math.max(1, limit));
+		const result: SemanticCatalogHead[] = [];
+		for (const head of this.semanticHeadsAt(boundarySequence, afterDocumentId)) {
+			if (head.lifecycle !== "active") continue;
+			result.push(head);
+			if (result.length === bounded) break;
+		}
+		return result;
 	}
 
 	countActiveSemanticAt(boundarySequence: number): number {
 		this.initialize();
-		return this.storage.sql.exec<{ count: number }>(`SELECT COUNT(*) AS count
-		 FROM vault_semantic_catalog_events e JOIN (
-		   SELECT document_id, MAX(sequence) AS sequence FROM vault_semantic_catalog_events
-		   WHERE sequence <= ? GROUP BY document_id
-		 ) latest ON latest.document_id = e.document_id AND latest.sequence = e.sequence
-		 WHERE e.lifecycle = 'active'`, boundarySequence).one().count;
+		let count = 0;
+		for (const head of this.semanticHeadsAt(boundarySequence)) if (head.lifecycle === "active") count++;
+		return count;
 	}
 
 	semanticCandidateReceipt(documentId: string, clientId: string, candidateId: string): SemanticCandidateReceipt | null {
@@ -921,70 +922,55 @@ export abstract class VaultCatalogStore extends VaultDocumentStore {
 
 	countActiveCatalogAt(boundarySequence: number): number {
 		this.initialize();
-		return this.storage.sql.exec<{ count: number }>(
-			`SELECT COUNT(*) AS count FROM vault_catalog_events e
-			 JOIN (
-			   SELECT body_id, MAX(sequence) AS sequence
-			   FROM vault_catalog_events
-			   WHERE sequence <= ? GROUP BY body_id
-			 ) latest ON latest.body_id = e.body_id AND latest.sequence = e.sequence
-			 WHERE e.lifecycle = 'active'`,
-			boundarySequence,
-		).one().count;
+		const index = this.catalogPathIndex();
+		if (boundarySequence >= index.through) return index.active;
+		let count = index.active;
+		for (const bodyId of this.catalogBodiesChangedAfter(boundarySequence)) {
+			if (index.heads.get(bodyId)?.active) count--;
+			if (this.rawCatalogHeadAt(boundarySequence, bodyId)?.lifecycle === "active") count++;
+		}
+		return count;
 	}
 
 	attachmentCatalogAt(boundarySequence: number, afterPath = "", limit = 1000): AttachmentCatalogEvent[] {
 		this.initialize();
 		const bounded = Math.min(1000, Math.max(1, limit));
-		return this.storage.sql.exec<{
-			sequence: number; path: string; content_hash: string | null; size: number | null;
-			mime: string | null; lifecycle: AttachmentCatalogEvent["lifecycle"]; operation_id: string;
-		}>(
-			`SELECT e.sequence, e.path, e.content_hash, e.size, e.mime, e.lifecycle, e.operation_id
-			 FROM vault_attachment_catalog_events e
-			 JOIN (
-			   SELECT path, MAX(sequence) AS sequence
-			   FROM vault_attachment_catalog_events WHERE sequence <= ? GROUP BY path
-			 ) latest ON latest.path = e.path AND latest.sequence = e.sequence
-			 WHERE e.path > ? ORDER BY e.path LIMIT ?`,
-			boundarySequence,
-			afterPath,
-			bounded,
-		).toArray().map((row) => ({
-			sequence: row.sequence,
-			path: row.path,
-			contentHash: row.content_hash,
-			size: row.size,
-			mime: row.mime,
-			lifecycle: row.lifecycle,
-			operationId: row.operation_id,
-		}));
+		const result: AttachmentCatalogEvent[] = [];
+		for (const event of this.attachmentHeadsAt(boundarySequence, afterPath)) {
+			result.push(event);
+			if (result.length === bounded) break;
+		}
+		return result;
 	}
 
 	activeAttachmentCatalogAt(boundarySequence: number, afterPath = "", limit = 1000): AttachmentCatalogEvent[] {
 		this.initialize();
-		return this.storage.sql.exec<{
-			sequence: number; path: string; content_hash: string | null; size: number | null; mime: string | null; operation_id: string;
-		}>(
-			`SELECT e.sequence, e.path, e.content_hash, e.size, e.mime, e.operation_id
-			 FROM vault_attachment_catalog_events e
-			 JOIN (
-			   SELECT path, MAX(sequence) AS sequence
-			   FROM vault_attachment_catalog_events WHERE sequence <= ? GROUP BY path
-			 ) latest ON latest.path = e.path AND latest.sequence = e.sequence
-			 WHERE e.lifecycle = 'active' AND e.path > ? ORDER BY e.path LIMIT ?`,
-			boundarySequence,
-			afterPath,
-			Math.min(1001, Math.max(1, limit)),
-		).toArray().map((row) => ({
-			sequence: row.sequence,
-			path: row.path,
-			contentHash: row.content_hash,
-			size: row.size,
-			mime: row.mime,
-			lifecycle: "active",
-			operationId: row.operation_id,
-		}));
+		const bounded = Math.min(1001, Math.max(1, limit));
+		const result: AttachmentCatalogEvent[] = [];
+		for (const event of this.attachmentHeadsAt(boundarySequence, afterPath)) {
+			if (event.lifecycle !== "active") continue;
+			result.push(event);
+			if (result.length === bounded) break;
+		}
+		return result;
+	}
+
+	protected *attachmentHeadsAt(boundarySequence: number, afterPath = ""): Generator<AttachmentCatalogEvent> {
+		for (const row of this.latestEventPerKey<{
+			sequence: number; path: string; content_hash: string | null; size: number | null;
+			mime: string | null; lifecycle: AttachmentCatalogEvent["lifecycle"]; operation_id: string;
+		}>("vault_attachment_catalog_events", "path",
+			"e.sequence, e.path, e.content_hash, e.size, e.mime, e.lifecycle, e.operation_id", boundarySequence, afterPath)) {
+			yield {
+				sequence: row.sequence,
+				path: row.path,
+				contentHash: row.content_hash,
+				size: row.size,
+				mime: row.mime,
+				lifecycle: row.lifecycle,
+				operationId: row.operation_id,
+			};
+		}
 	}
 
 	attachmentEventsForOperation(operationId: string): AttachmentCatalogEvent[] {
@@ -1140,16 +1126,118 @@ export abstract class VaultCatalogStore extends VaultDocumentStore {
 	}
 
 	protected activeBodiesAtPath(boundarySequence: number, path: string): string[] {
-		return this.storage.sql.exec<{ body_id: string }>(
-			`SELECT e.body_id FROM vault_catalog_events e
-			 JOIN (
-			   SELECT body_id, MAX(sequence) AS sequence
-			   FROM vault_catalog_events
-			   WHERE sequence <= ? GROUP BY body_id
-			 ) latest ON latest.body_id = e.body_id AND latest.sequence = e.sequence
-			 WHERE e.path = ? AND e.lifecycle = 'active'`,
-			boundarySequence,
-			path,
-		).toArray().map((row) => row.body_id);
+		this.initialize();
+		const index = this.catalogPathIndex();
+		const owners = new Set(index.owners.get(path) ?? []);
+		if (boundarySequence < index.through) {
+			for (const bodyId of this.catalogBodiesChangedAfter(boundarySequence)) {
+				owners.delete(bodyId);
+				const head = this.rawCatalogHeadAt(boundarySequence, bodyId);
+				if (head?.lifecycle === "active" && head.path === path) owners.add(bodyId);
+			}
+		}
+		return [...owners].sort();
+	}
+
+	/**
+	 * Current Markdown path ownership, derived from `vault_catalog_events` alone
+	 * (lean/tail overlays never change a body's path or lifecycle). There is no
+	 * path index on catalog events and P3 adds none, so the vault keeps this map
+	 * in memory: built once per instance by a skip-scan (one row per body), then
+	 * advanced by a primary-key range read of only the events appended since.
+	 * Path uniqueness on every create/rename is O(1) map lookups instead of a
+	 * GROUP BY over the whole catalog history. Zero rows written.
+	 *
+	 * Coherence: catalog events are append-only and the map re-reads the events
+	 * at its own `through` sequence on every refresh, so it rebuilds when those
+	 * changed (a rolled-back transaction whose sequence was reused). Any
+	 * `transactionSync` rollback through the store also discards it outright.
+	 */
+	protected catalogPathIndex(): CatalogPathIndex {
+		const index = this.catalogIndex;
+		if (index) {
+			const rows = this.storage.sql.exec<{ sequence: number; body_id: string; path: string; lifecycle: BodyLifecycle }>(
+				`SELECT sequence, body_id, path, lifecycle FROM vault_catalog_events
+				 WHERE sequence >= ? ORDER BY sequence, body_id`, index.through,
+			).toArray();
+			const atTip = rows.filter((row) => row.sequence === index.through);
+			if (catalogTipFingerprint(atTip) === index.tip) {
+				const newer = rows.filter((row) => row.sequence > index.through);
+				for (const row of newer) applyCatalogHead(index, row.body_id, row.path, row.lifecycle === "active");
+				if (newer.length > 0) {
+					index.through = newer.at(-1)!.sequence;
+					index.tip = catalogTipFingerprint(newer.filter((row) => row.sequence === index.through));
+				}
+				return index;
+			}
+		}
+		return this.rebuildCatalogPathIndex();
+	}
+
+	private rebuildCatalogPathIndex(): CatalogPathIndex {
+		const through = this.storage.sql.exec<{ sequence: number | null }>(
+			"SELECT MAX(sequence) AS sequence FROM vault_catalog_events",
+		).one().sequence ?? 0;
+		const index: CatalogPathIndex = { through, tip: "", heads: new Map(), owners: new Map(), active: 0 };
+		for (const row of this.latestEventPerKey<{ body_id: string; path: string; lifecycle: BodyLifecycle }>(
+			"vault_catalog_events", "body_id", "e.body_id, e.path, e.lifecycle", through,
+		)) applyCatalogHead(index, row.body_id, row.path, row.lifecycle === "active");
+		index.tip = catalogTipFingerprint(this.storage.sql.exec<{ body_id: string; path: string; lifecycle: BodyLifecycle }>(
+			"SELECT body_id, path, lifecycle FROM vault_catalog_events WHERE sequence = ? ORDER BY body_id", through,
+		).toArray());
+		this.catalogIndex = index;
+		return index;
+	}
+
+	protected override discardDerivedState(): void {
+		super.discardDerivedState();
+		this.catalogIndex = null;
+	}
+
+	/** Bodies with a catalog event after `boundarySequence` (primary-key range read). */
+	protected catalogBodiesChangedAfter(boundarySequence: number): Set<string> {
+		return new Set(this.storage.sql.exec<{ body_id: string }>(
+			"SELECT body_id FROM vault_catalog_events WHERE sequence > ?", boundarySequence,
+		).toArray().map((row) => row.body_id));
+	}
+
+	/** Raw newest catalog event (no lean overlay) for one body at a boundary: one index seek. */
+	protected rawCatalogHeadAt(boundarySequence: number, bodyId: string): { path: string; lifecycle: BodyLifecycle } | null {
+		return this.storage.sql.exec<{ path: string; lifecycle: BodyLifecycle }>(
+			`SELECT path, lifecycle FROM vault_catalog_events
+			 WHERE body_id = ? AND sequence <= ? ORDER BY sequence DESC LIMIT 1`, bodyId, boundarySequence,
+		).toArray()[0] ?? null;
+	}
+}
+
+interface CatalogPathIndex {
+	/** Newest catalog event sequence absorbed. */
+	through: number;
+	/** Fingerprint of the events at `through`, re-checked on every refresh. */
+	tip: string;
+	heads: Map<string, { path: string; active: boolean }>;
+	/** Active bodies by path (normally one; more only if history already violates uniqueness). */
+	owners: Map<string, Set<string>>;
+	active: number;
+}
+
+function catalogTipFingerprint(rows: Array<{ body_id: string; path: string; lifecycle: string }>): string {
+	return JSON.stringify(rows.map((row) => [row.body_id, row.path, row.lifecycle]));
+}
+
+function applyCatalogHead(index: CatalogPathIndex, bodyId: string, path: string, active: boolean): void {
+	const previous = index.heads.get(bodyId);
+	if (previous?.active) {
+		index.active--;
+		const owners = index.owners.get(previous.path);
+		owners?.delete(bodyId);
+		if (owners?.size === 0) index.owners.delete(previous.path);
+	}
+	index.heads.set(bodyId, { path, active });
+	if (active) {
+		index.active++;
+		const owners = index.owners.get(path) ?? new Set<string>();
+		owners.add(bodyId);
+		index.owners.set(path, owners);
 	}
 }

@@ -9,8 +9,8 @@ import { installLiveAccessTransport, type LiveIdentity, type LiveIdentityContext
 installLiveAccessTransport();
 
 const DEPLOYED_HOST = process.env.YAOS_TEST_DEPLOYED_HOST?.trim().replace(/\/+$/, "") || null;
-// YAOS_LIVE_PORT lets parallel worktrees run local wrangler suites without colliding on 8787.
-const LIVE_PORT = /^\d+$/.test(process.env.YAOS_LIVE_PORT ?? "") ? process.env.YAOS_LIVE_PORT! : "8787";
+// Local wrangler port; YAOS_TEST_LIVE_PORT lets concurrent worktrees avoid clashing on 8787.
+const LIVE_PORT = /^[0-9]{2,5}$/.test(process.env.YAOS_TEST_LIVE_PORT ?? "") ? process.env.YAOS_TEST_LIVE_PORT! : "8787";
 const HOST = DEPLOYED_HOST ?? `http://127.0.0.1:${LIVE_PORT}`;
 const WRANGLER_BIN = resolve("server/node_modules/.bin/wrangler");
 const SETTINGS_CONFIG_KEY = ".obsidian-live";
