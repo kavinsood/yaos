@@ -1,4 +1,5 @@
 import { strict as assert } from "node:assert";
+import { releaseUnreadBody } from "../../server/src/server";
 import { invalidateStoredServerConfigCache } from "../../server/src/routes/auth";
 import { handleOperatorVaultRuntimeRoute } from "../../server/src/routes/vault";
 import { BULK_CREATE_MAX_REQUEST_BYTES } from "../../server/src/vaultBulkCreateService";
@@ -74,6 +75,22 @@ s.test("no declared length keeps the bounded buffered read", async () => {
 	assert.deepEqual(await response.json(), { bytes: 10_000, last: 7 });
 	assert.equal(forwarded.length, 1);
 	assert.ok(pulls.n >= 3, "front Worker read the chunks itself");
+});
+
+s.test("b3-int: the vault runtime drains a forwarded body its route answered without reading", async () => {
+	// A DO answer that leaves the forwarded client stream unread made workerd read
+	// it after the response was sent ("Can't read from request stream after
+	// response has been sent") and restart the isolate. Draining before the
+	// response goes out is what the live forward-unread-body suite checks end to end.
+	const pulls = { n: 0 };
+	const request = streamed(new Uint8Array(10_000).fill(7), "10000", pulls);
+	await releaseUnreadBody(request);
+	assert.equal(request.bodyUsed, true, "the body was consumed");
+	assert.ok(pulls.n >= 3, "every chunk was pulled");
+	const read = streamed(new Uint8Array(16), "16", { n: 0 });
+	await read.arrayBuffer();
+	await releaseUnreadBody(read);
+	await releaseUnreadBody(new Request("https://internal/x"));
 });
 
 await s.done();

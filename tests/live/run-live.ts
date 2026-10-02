@@ -31,6 +31,7 @@ const LIVE_COMMANDS: readonly LiveCommand[] = [
 	{ file: "live-seed-check.ts", extraEnv: { YAOS_TEST_MODE: "seed" } },
 	{ file: "snapshots.ts" },
 	{ file: "hardening-worker.ts" },
+	{ file: "forward-unread-body.ts" },
 	{ file: "ws-ticket-reconnect.ts" },
 	{ file: "ws-admission-protocol.ts" },
 	{ file: "settings-sync.ts" },
@@ -207,8 +208,16 @@ async function main(): Promise<void> {
 	});
 	const wranglerExit = new Promise<void>((resolvePromise) => { wrangler.once("exit", () => resolvePromise()); });
 	let output = "";
+	// b3-int: an unread forwarded body must never surface as a workerd stream error.
+	const STREAM_ERROR = "Can't read from request stream after response has been sent";
+	let streamErrors = 0;
+	let tail = "";
 	const capture = (chunk: Buffer) => {
-		output += chunk.toString();
+		const text = chunk.toString();
+		const window = tail + text;
+		streamErrors += window.split(STREAM_ERROR).length - 1 - (tail.split(STREAM_ERROR).length - 1);
+		tail = window.slice(-STREAM_ERROR.length);
+		output += text;
 		if (output.length > 8_000) output = output.slice(-8_000);
 	};
 	if (!wrangler.stdout || !wrangler.stderr) throw new Error("wrangler dev did not expose piped output");
@@ -218,6 +227,9 @@ async function main(): Promise<void> {
 		await waitForWorker();
 		const context = await claimEnrollAndProvision();
 		for (const command of LIVE_COMMANDS) await runCommand(command, context);
+		await new Promise((resolvePromise) => setTimeout(resolvePromise, 500));
+		if (streamErrors > 0) throw new Error(`wrangler logged "${STREAM_ERROR}" ${String(streamErrors)} time(s)`);
+		console.log("wrangler log is free of request-stream errors");
 	} catch (error) {
 		if (output.trim()) console.error(`\n[wrangler output]\n${output.trim()}`);
 		throw error;

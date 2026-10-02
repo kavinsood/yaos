@@ -287,6 +287,30 @@ function watchProjectionInputs<T extends VaultRuntimeStoragePort>(storage: T, on
 	});
 }
 
+/**
+ * The front Worker forwards Content-Length-framed bodies as the unread client
+ * stream (687fe08). A route that answers without consuming it (early 4xx,
+ * draining, auth or epoch rejection, a typed 503) left that stream pending:
+ * workerd then read it after the response was sent and threw "Can't read from
+ * request stream after response has been sent", and the next request on the
+ * connection could fail. Drain any unread body before the response leaves.
+ */
+export async function releaseUnreadBody(request: Request): Promise<void> {
+	const body = request.body;
+	if (!body || request.bodyUsed || body.locked) return;
+	const reader = body.getReader();
+	try {
+		for (;;) {
+			const { done } = await reader.read();
+			if (done) return;
+		}
+	} catch {
+		// The client went away mid-body; nothing is left to read.
+	} finally {
+		reader.releaseLock();
+	}
+}
+
 /** Schema-8 root/Markdown/Canvas composition, independent of a worker or process host. */
 export class VaultRuntime implements DrainPort {
 	private store: VaultStore;
@@ -524,6 +548,14 @@ export class VaultRuntime implements DrainPort {
 	}
 
 	async fetch(request: Request): Promise<Response> {
+		try {
+			return await this.route(request);
+		} finally {
+			await releaseUnreadBody(request);
+		}
+	}
+
+	private async route(request: Request): Promise<Response> {
 		if (this.drainPromise) return json({ error: "vault_draining" }, 503);
 		this.wakeResync();
 		const vaultId = request.headers.get("x-yaos-vault-id");
