@@ -12,6 +12,28 @@ export class BoundedBodyError extends Error {
 }
 
 /**
+ * The request's declared Content-Length, or null when absent. Throws `invalid_content_length` for a
+ * malformed value and `body_too_large` above `maxBytes`, before any body access. HTTP framing bounds the
+ * body to the declared length, so a non-null result is a trusted upper bound on the bytes that follow.
+ */
+export function declaredBodyLength(request: Request, maxBytes: number): number | null {
+	const declaredHeader = request.headers.get("Content-Length");
+	if (declaredHeader === null) return null;
+	const trimmed = declaredHeader.trim();
+	if (!/^\d+$/.test(trimmed)) {
+		throw new BoundedBodyError("invalid_content_length");
+	}
+	const declared = Number(trimmed);
+	if (!Number.isSafeInteger(declared)) {
+		throw new BoundedBodyError("invalid_content_length");
+	}
+	if (declared > maxBytes) {
+		throw new BoundedBodyError("body_too_large");
+	}
+	return declared;
+}
+
+/**
  * Read a request body without retaining more than `maxBytes` of accepted chunks.
  * A chunk that crosses the limit is cancelled and rejected before it is retained.
  */
@@ -24,21 +46,7 @@ export async function readBoundedBytes(
 		throw new RangeError("maxBytes must be a non-negative safe integer");
 	}
 
-	const declaredHeader = request.headers.get("Content-Length");
-	let declared: number | null = null;
-	if (declaredHeader !== null) {
-		const trimmed = declaredHeader.trim();
-		if (!/^\d+$/.test(trimmed)) {
-			throw new BoundedBodyError("invalid_content_length");
-		}
-		declared = Number(trimmed);
-		if (!Number.isSafeInteger(declared)) {
-			throw new BoundedBodyError("invalid_content_length");
-		}
-		if (declared > maxBytes) {
-			throw new BoundedBodyError("body_too_large");
-		}
-	}
+	const declared = declaredBodyLength(request, maxBytes);
 
 	const body = request.body;
 	if (!body) {

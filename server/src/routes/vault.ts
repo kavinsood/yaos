@@ -7,7 +7,7 @@ import {
 	MAX_SETTINGS_ITEM_REQUEST_BYTES,
 	MAX_SETTINGS_SNAPSHOT_REQUEST_BYTES,
 } from "../settingsSyncStore";
-import { BoundedBodyError, readBoundedBytes } from "../readBoundedBytes";
+import { BoundedBodyError, declaredBodyLength, readBoundedBytes } from "../readBoundedBytes";
 import { BULK_CREATE_MAX_REQUEST_BYTES } from "../vaultBulkCreateService";
 import { SERVER_PROTOCOL_VERSION, SERVER_SCHEMA_VERSION } from "../version";
 import type { VaultRecord } from "../identity";
@@ -80,11 +80,22 @@ async function forward(env: Env, vault: VaultRecord, request: Request, runtimePa
 	const maximumBodyBytes = forwardedBodyLimit(request, runtimePath);
 	if (maximumBodyBytes !== null) {
 		try {
-			const bytes = await readBoundedBytes(request, maximumBodyBytes, { allowEmpty: true });
-			if (bytes.byteLength > 0) {
-				const owned = new Uint8Array(bytes.byteLength);
-				owned.set(bytes);
-				init.body = owned.buffer;
+			const declared = declaredBodyLength(request, maximumBodyBytes);
+			if (declared !== null) {
+				// Framed by Content-Length and within the cap: pass the stream through untouched. Reading it
+				// here (chunk loop or arrayBuffer) cost the front Worker ~2-15 ms CPU per MiB (b3-cpu).
+				if (declared > 0) {
+					init.body = request.body;
+					// Required by Node's fetch for a stream body (self-host runtime); harmless on Workers.
+					(init as RequestInit & { duplex?: "half" }).duplex = "half";
+				}
+			} else {
+				const bytes = await readBoundedBytes(request, maximumBodyBytes, { allowEmpty: true });
+				if (bytes.byteLength > 0) {
+					const owned = new Uint8Array(bytes.byteLength);
+					owned.set(bytes);
+					init.body = owned.buffer;
+				}
 			}
 		} catch (error) {
 			const kind = error instanceof BoundedBodyError ? error.kind : "body_read_failed";
