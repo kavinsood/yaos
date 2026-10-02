@@ -1,0 +1,21 @@
+server/src/server.ts
+  s_da4ca900883079::t_2a1164d302611d 200-205,322-323,441-450,683,687-693,1111-1117,1137-1152,1555-1556
+tests/server/bulk-create-inline-projection.ts
+  s_da4ca900883079::t_b8f132ce5a64ce 1-238
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "f63255de685955ae1b2ca07d6a2de3c2569e2581",
+  "prompts": {},
+  "sessions": {
+    "s_da4ca900883079": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ad8127dcef3a8a877",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
