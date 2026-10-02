@@ -1,7 +1,7 @@
 # Relay v3: cutting Cloudflare rows written — complete record
 
 Status as of 2026-10-02. Code: worktree `/Users/kavin/personal/obsidiansync/experiments/yaos-relay2`, branch
-`relay-v2-spike`, HEAD `ba57c63` (19 commits on top of `3b66f1b`, where the v2 spike ended). Not pushed.
+`relay-v2-spike`, HEAD `5656740` (21 commits on top of `3b66f1b`, where the v2 spike ended). Not pushed.
 `yaos/` and `yaos-phase0/` untouched. Workers left deployed (reused `yaos-relay2-v1001-*` pool).
 
 Labels: **measured** = deployed Cloudflare run; **local** = local tests / row accounting; **inferred** = arithmetic
@@ -73,6 +73,7 @@ Checks that needed no work (client @ `a67aaca`): identical-content saves already
 | `7d70ea9` | Socket-ack receipts: cumulative confirmation, resend unconfirmed after 5 s (backoff to 60 s, ±20%), resend on reconnect, HTTP fallback after 15 s; settle without HTTP POST |
 | `1a34693` | 7 VaultSync end-to-end-in-process receipt tests; status bar says "saving latest local state…" while waiting |
 | `3aa7c44` | B5 removed from client, harness, deploy spec and cost model |
+| `5656740` | Canvas identical re-save skips the `semantic/<id>/state` GET when the stored settlement already records this exact content at the current epoch (saves one DO request per identical re-save, incl. YAOS's own materialisation writes). Reset detection verified independent of that GET: socket `SEMANTIC_EPOCH_RESET_REQUIRED` fence, catalog-event feed on catch-up, fenced edits |
 
 **Harness / docs**: `21ff4a3`, `d067cd6`, `8730d32`, `e3a1b85` (v3 deploy spec, CRASH/FENCE/HTTPSAVE/autosave
 scenarios, `costmodel3.py`); RFC `129c4eb`, `5f91664`, `ba57c63`.
@@ -143,7 +144,9 @@ fence 5/5. **Failed:** B4 revoke convergence (R11 — fixed since, section 6); B
 4. R10: DO requests 1.15× base (bar 1.1×) still needs sign-off.
 5. Not re-run on v3: C1 CPU, X1 at scale, R2 starvation, stored-state growth.
 6. HTTP fallback replay still writes a 4-row idempotency receipt path in rare cases (after 15 s without receipt).
-7. Imports (batch-import API) belong to the other agent; "files written most today" panel deferred.
+7. Existing gap (not caused by v3): a semantic reset sends nothing to root sockets, so a connected client with that
+   canvas closed and otherwise idle notices only at its next catch-up or edit; writes stay fenced, no data risk.
+8. Imports (batch-import API) belong to the other agent; "files written most today" panel deferred.
 
 ## 9. Files
 
