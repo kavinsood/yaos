@@ -1,0 +1,35 @@
+build-server-release.mjs
+  s_42343c074f2618::t_baa879e3ad8755 63-64
+server/src/recoveryJob.ts
+  s_42343c074f2618::t_7f50a234ca9df2 61,2179
+server/src/recoveryManifestTree.ts
+  s_42343c074f2618::t_d145192c113167 17
+server/src/recoveryReadService.ts
+  s_42343c074f2618::t_c6aafa7fd885f6 2,20,28,87-88,95-96,105,120-121,136,152,192-200
+server/src/recoveryRoutes.ts
+  s_42343c074f2618::t_da392f0b78a438 1,234,241,294,304-307
+server/src/shared/productVersions.ts
+  s_42343c074f2618::t_3c38f1959aacab 10
+src/snapshots/recoveryStateDecode.ts
+  s_42343c074f2618::t_be8d8e583e8960 1-27
+src/sync/schema.ts
+  s_42343c074f2618::t_5b194d5781771b 10
+tests/conformance/target.ts
+  s_42343c074f2618::t_5d1ceca6eff59d 4
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "6687b207976f824fadae116a15a09bd502f030ba",
+  "prompts": {},
+  "sessions": {
+    "s_42343c074f2618": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a2c0077a38f8fdd35",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
