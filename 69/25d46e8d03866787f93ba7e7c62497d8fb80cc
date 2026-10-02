@@ -1,0 +1,21 @@
+src/runtime/reconciliationController.ts
+  s_919033a84b1dc9::t_b025f4c3a1e6d4 2,2634-2641
+tests/headless/run-headless.ts
+  s_919033a84b1dc9::t_6881a40dc4cc83 16,540-577
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "6925d46e8d03866787f93ba7e7c62497d8fb80cc",
+  "prompts": {},
+  "sessions": {
+    "s_919033a84b1dc9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a927207854e0683fc",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
