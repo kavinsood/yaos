@@ -87,6 +87,7 @@ import {
 	type BulkCreateClientCaps,
 	type BulkCreateServerCaps,
 } from "./bulkCreateCaps";
+import { validateBulkCreateRootUpdate } from "./bulkCreateRootValidation";
 import {
 	INITIAL_SEMANTIC_EPOCH,
 	parseSemanticEpochMismatchPayload,
@@ -1415,6 +1416,8 @@ export class VaultSyncHttpPort implements VaultServerPort {
  */
 export class VaultSync implements SyncRuntimePort {
 	ydoc = new Y.Doc({ guid: ROOT_DOCUMENT_ID });
+	private bulkRootRejectionCount = 0;
+	private lastBulkRootRejection: { batchId: string; reason: string; at: number } | null = null;
 	pathToId = this.ydoc.getMap<string>("pathToId");
 	pathToBlob = this.ydoc.getMap<BlobRef>("pathToBlob");
 	pathToSemantic = this.ydoc.getMap<SemanticPathRef>("pathToSemantic");
@@ -3233,11 +3236,53 @@ export class VaultSync implements SyncRuntimePort {
 			throw new Error("bulk create receipt mismatch");
 		}
 		if (response.rootUpdate instanceof Uint8Array && response.rootUpdate.byteLength > 0) {
+			// P5: validate on a clone; the live root (and so disk) never sees a bad delta.
+			const verdict = validateBulkCreateRootUpdate(this.ydoc, response.rootUpdate, {
+				files: files.map((file, index) => ({ path: file.path, bodyId: file.bodyId,
+					outcome: response.outcomes[index]!.outcome })),
+				attachments: attachments.map((item, index) => ({ path: item.path, operationId: item.operationId,
+					hash: item.hash, outcome: response.outcomes[files.length + index]!.outcome })),
+			});
+			if (!verdict.ok) {
+				await this.recoverRootAfterRejectedBulkUpdate(batchId, verdict.reason);
+				return response;
+			}
 			Y.applyUpdate(this.ydoc, response.rootUpdate, ORIGIN_DURABLE_ROOT_PUBLICATION);
 		}
 		this._rootGeneration = Math.max(this._rootGeneration, response.rootGeneration);
 		await this.persistRoot();
 		return response;
+	}
+
+	/** Diagnostics for bulk-create root deltas rejected by pre-validation (P5). */
+	bulkCreateRootRejections(): { count: number; last: { batchId: string; reason: string; at: number } | null } {
+		return { count: this.bulkRootRejectionCount, last: this.lastBulkRootRejection };
+	}
+
+	/**
+	 * A bulk receipt's root delta failed validation: it is dropped and the root
+	 * is re-read from the server and applied through the ordinary remote-root
+	 * path (provider origin: invalid-path guard, persistence, catch-up). The
+	 * batch itself is durable, so failure here only logs; the root socket
+	 * delivers the same state on its next sync.
+	 */
+	private async recoverRootAfterRejectedBulkUpdate(batchId: string, reason: string): Promise<void> {
+		this.bulkRootRejectionCount++;
+		this.lastBulkRootRejection = { batchId, reason, at: this.now() };
+		this.log(`bulk create root update rejected batch=${batchId}: ${reason}; resyncing root from the server`);
+		try {
+			if (!this.server.currentRoot) throw new Error("root state fetch is unavailable");
+			const state = await this.server.currentRoot();
+			if (state.rootEpoch > this._rootEpoch) {
+				await this.recoverRootSemanticEpoch(state.rootEpoch);
+				return;
+			}
+			if (state.rootEpoch !== this._rootEpoch) throw new Error("root state fetch returned an older epoch");
+			Y.applyUpdate(this.ydoc, state.encodedState, this.provider.documentOrigin);
+			this._rootGeneration = Math.max(this._rootGeneration, state.generation);
+		} catch (error) {
+			this.log(`root resync after rejected bulk update failed (socket sync will retry): ${String(error)}`);
+		}
 	}
 
 	/**
