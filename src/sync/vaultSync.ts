@@ -1961,6 +1961,12 @@ export class VaultSync implements SyncRuntimePort {
 		try {
 			receipts = await this.commitLifecycleRequests(requests);
 		} catch (error) {
+			if (this.isRedundantRevive(error, requests)) {
+				// Another revive of the same body already won (concurrent
+				// delete-revive paths): the stored op could never commit.
+				if (requests.length > 1) await removeBatch!.call(this.options.database, requests.map((request) => request.operationId));
+				else await remove.call(this.options.database, requests[0]!.operationId);
+			}
 			const recovered = this.shouldQueryOperationOutcome(error)
 				? await this.recoverLifecycleReceipts(requests, requests.map(() => capturedAuthority))
 				: null;
@@ -6310,8 +6316,33 @@ export class VaultSync implements SyncRuntimePort {
 					this.log(`recovered lifecycle root publication remains pending: ${String(publicationError)}`);
 				}
 			}
+			if (this.isRedundantRevive(error, attempted)) {
+				await this.deleteLifecycleGroup(attempted);
+				this.log("lifecycle replay dropped: the body is already revived at its path");
+				return;
+			}
 			this.log(`lifecycle replay remains pending: ${String(error)}`);
 		}
+	}
+
+	/**
+	 * A revive answered `body_not_tombstoned` while the root already maps each
+	 * revived path to that body: a concurrent revive committed and published
+	 * first, so this one is settled, not pending (b3-int: two delete-revive
+	 * paths on daemon restart left a revive replaying 409 forever, and startup
+	 * publication never settled).
+	 */
+	private isRedundantRevive(
+		error: unknown,
+		operations: ReadonlyArray<{ kind: string; bodyId?: string | null; path?: string | null }>,
+	): boolean {
+		return error instanceof VaultMutationRequestError
+			&& error.status === 409
+			&& error.code === "body_not_tombstoned"
+			&& operations.length > 0
+			&& operations.every((operation) => operation.kind === "revive"
+				&& !!operation.bodyId && !!operation.path
+				&& this.getFileId(operation.path) === operation.bodyId);
 	}
 
 	private async recoverLifecycleReceipts(

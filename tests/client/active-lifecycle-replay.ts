@@ -1,6 +1,7 @@
 import { strict as assert } from "node:assert";
 import {
 	FreshAdmissionDurablyPendingError,
+	VaultMutationRequestError,
 	VaultSync,
 	type LifecycleBatchReceipt,
 	type LifecycleRequest,
@@ -40,6 +41,49 @@ s.test("bulk create faults before and after commit hand off to replay under the 
 		assert.equal(server.bodyText("body-1"), "durable");
 		await runtime.destroy();
 	}
+});
+
+s.test("b3-int: a revive answered body_not_tombstoned is dropped once the body is already active at its path", async () => {
+	const vault = memoryVault();
+	const server = new FakeBulkCreateServer();
+	let lifecycleCalls = 0;
+	const runtime = new VaultSync({
+		vaultId: "vault-1", vaultGeneration: "generation-1", deviceId: "device-1",
+		host: "https://sync.test", token: "token", database: vault.database,
+		server: server.port({
+			commitLifecycleBatch: async () => {
+				lifecycleCalls++;
+				throw new VaultMutationRequestError(409, "body_not_tombstoned", "lifecycle batch commit");
+			},
+		}),
+		providerFactory: testProvider, createCollectorDelayMs: 0,
+	});
+	await runtime.commitFreshBody({ bodyId: "body-1", path: "Revived.md", content: "dirty work", reason: "test", candidateId: "candidate-1" });
+	assert.equal(runtime.getFileId("Revived.md"), "body-1");
+
+	// Live path: a second, concurrent delete-revive loses the race.
+	await assert.rejects(runtime.commitLifecycle({
+		operationId: "revive-live", kind: "revive", fileId: "body-1", bodyId: "body-1", bodyEpoch: 1, path: "Revived.md",
+	}), VaultMutationRequestError);
+	assert.equal(vault.lifecycle.has("revive-live"), false, "the losing revive is not left to replay forever");
+
+	// Replay path (daemon restart): a stored redundant revive settles.
+	const stored = (operationId: string, path: string): StoredLifecycleOperation => ({
+		operationId, kind: "revive", bodyId: "body-1", path, previousPath: null,
+		bodyEpoch: 1, content: null, createdAt: 1, attempts: 0, lastAttemptAt: 0,
+	});
+	vault.lifecycle.set("revive-stored", stored("revive-stored", "Revived.md"));
+	const replay = (key: string) => (runtime as unknown as { runLifecycleReplayWork(key: string): Promise<{ kind: string }> }).runLifecycleReplayWork(key);
+	assert.equal((await replay("single:revive-stored")).kind, "completed");
+	assert.equal(vault.lifecycle.has("revive-stored"), false);
+
+	// Not redundant: the root does not map that path to the body, so it stays pending.
+	vault.lifecycle.set("revive-other", stored("revive-other", "Elsewhere.md"));
+	assert.equal((await replay("single:revive-other")).kind, "retryable_failure");
+	assert.equal(vault.lifecycle.has("revive-other"), true, "a 409 for an unmapped path is not silently dropped");
+	assert.ok(lifecycleCalls >= 3);
+	vault.lifecycle.delete("revive-other");
+	await runtime.destroy();
 });
 
 s.test("teardown fences an in-flight replay and startup reconstructs it", async () => {
