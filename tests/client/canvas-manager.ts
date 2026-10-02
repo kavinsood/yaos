@@ -765,4 +765,172 @@ s.test("sends both Canvas lifecycle epochs and exposes typed root fencing", asyn
 	assert.equal(sentRootEpoch, 7);
 });
 
+class CountingTransport extends MemoryTransport {
+	stateReads = 0;
+	fenceStaleSubmissions = false;
+	override async state(documentId: string): Promise<CanvasState> {
+		this.stateReads++;
+		return super.state(documentId);
+	}
+	override async submit(candidate: StoredCanvasCandidate): Promise<CanvasCandidateReceipt> {
+		const current = this.epoch.get(candidate.documentId) ?? 1;
+		if (this.fenceStaleSubmissions && candidate.bodyEpoch < current) {
+			this.submitted.push(candidate);
+			throw new CanvasSemanticEpochMismatchError({ error: "semantic_epoch_mismatch", purpose: "body",
+				documentId: candidate.documentId, expectedEpoch: current, receivedEpoch: candidate.bodyEpoch,
+				reset: "fetch_fresh_baseline" });
+		}
+		return super.submit(candidate);
+	}
+}
+
+const SKIP_REF = { documentId: "canvas-skip", kind: "canvas", format: "json-canvas", formatVersion: 1 } as const;
+
+async function settledSkipFixture(text = "base", projection: CanvasProjectionPort & { files: Map<string, Uint8Array> } = new MemoryProjection()) {
+	const persistence = new MemoryPersistence();
+	const transport = new CountingTransport();
+	const parsed = parseCanvasBytes(bytes(text));
+	if (parsed.kind !== "valid") throw new Error("fixture Canvas must be valid");
+	transport.docs.set("canvas-skip", createCanvasDocument(parsed.data));
+	transport.paths.set("canvas-skip", "Skip.canvas");
+	transport.generation.set("canvas-skip", 1);
+	transport.epoch.set("canvas-skip", 1);
+	projection.files.set("Skip.canvas", bytes(text));
+	const manager = new CanvasManager("generation", persistence, transport, projection);
+	await manager.initialize([["Skip.canvas", SKIP_REF]]);
+	assert.equal(persistence.settlements.get("canvas-skip")?.bodyEpoch, 1, "initial refresh records the baseline");
+	return { persistence, projection, transport, manager };
+}
+
+function reformatted(text: string): Uint8Array {
+	return encoder.encode(JSON.stringify(JSON.parse(new TextDecoder().decode(bytes(text))), null, 2));
+}
+
+s.test("identical Canvas re-save with a matching settlement issues no state read", async () => {
+	const { persistence, transport, manager } = await settledSkipFixture();
+	const before = transport.stateReads;
+	const revision = persistence.settlements.get("canvas-skip")?.localSettlementRevision;
+	assert.equal(await manager.ingest("Skip.canvas", bytes("base")), "formatting-only");
+	assert.equal(await manager.ingest("Skip.canvas", reformatted("base")), "formatting-only");
+	assert.equal(transport.stateReads, before, "neither the identical nor the reformatted re-save hits the server");
+	assert.equal(persistence.settlements.get("canvas-skip")?.localSettlementRevision, revision, "baseline untouched");
+	assert.equal(manager.stats().identicalStateReadsSkipped, 2);
+	assert.equal(manager.stats().identicalStateReads, 0);
+	manager.destroy();
+	for (const doc of transport.docs.values()) doc.destroy();
+});
+
+s.test("identical Canvas re-save without a matching settlement reads state and settles as before", async () => {
+	const { persistence, transport, manager } = await settledSkipFixture();
+	persistence.settlements.delete("canvas-skip");
+	let before = transport.stateReads;
+	assert.equal(await manager.ingest("Skip.canvas", bytes("base")), "formatting-only");
+	assert.equal(transport.stateReads, before + 1, "missing settlement keeps the server proof");
+	const settled = persistence.settlements.get("canvas-skip");
+	const base = parseCanvasBytes(bytes("base"));
+	if (base.kind !== "valid") throw new Error("fixture Canvas must be valid");
+	assert.equal(settled?.contentHash, await sha256BytesHex(base.canonicalBytes));
+	// A settlement for different content (or another epoch) must not authorise the skip.
+	persistence.settlements.set("canvas-skip", { ...settled!, contentHash: "0".repeat(64) });
+	before = transport.stateReads;
+	assert.equal(await manager.ingest("Skip.canvas", bytes("base")), "formatting-only");
+	assert.equal(transport.stateReads, before + 1, "different settled content keeps the server proof");
+	assert.equal(persistence.settlements.get("canvas-skip")?.contentHash, settled?.contentHash, "re-settled exactly");
+	persistence.settlements.set("canvas-skip", { ...persistence.settlements.get("canvas-skip")!,
+		bodyEpoch: 2 as StoredCanvasSettlement["bodyEpoch"] });
+	before = transport.stateReads;
+	assert.equal(await manager.ingest("Skip.canvas", bytes("base")), "formatting-only");
+	assert.equal(transport.stateReads, before + 1, "settlement from another epoch keeps the server proof");
+	assert.equal(manager.stats().identicalStateReads, 3);
+	assert.equal(manager.stats().identicalStateReadsSkipped, 0);
+	manager.destroy();
+	for (const doc of transport.docs.values()) doc.destroy();
+});
+
+s.test("server Canvas epoch bump after a skipped read is still recovered via the catalog feed and fenced edits", async () => {
+	const { persistence, projection, transport, manager } = await settledSkipFixture();
+	const fresh = parseCanvasBytes(bytesWithServerNode("base"));
+	if (fresh.kind !== "valid") throw new Error("fixture Canvas must be valid");
+	// Server-side compaction: new lineage, new epoch (content may also have moved on).
+	transport.docs.get("canvas-skip")?.destroy();
+	transport.docs.set("canvas-skip", createCanvasDocument(fresh.data));
+	transport.epoch.set("canvas-skip", 2);
+	const before = transport.stateReads;
+	assert.equal(await manager.ingest("Skip.canvas", bytes("base")), "formatting-only");
+	assert.equal(transport.stateReads, before, "the identical re-save is not the reset detector");
+	assert.equal(manager.bodyEpoch("canvas-skip"), 1);
+	// Path 1: the feed's semantic-reset catalog event (bootstrapClient.catchUpFeed -> applyCatalogEvents).
+	await manager.applyCatalogEvents([{ documentId: "canvas-skip", path: "Skip.canvas", lifecycle: "active",
+		kind: "canvas", format: "json-canvas", formatVersion: 1 }]);
+	assert.equal(manager.bodyEpoch("canvas-skip"), 2, "feed-driven refresh recovers the new epoch");
+	assert.equal(persistence.settlements.get("canvas-skip")?.bodyEpoch, 2);
+	const projected = parseCanvasBytes(projection.files.get("Skip.canvas")!);
+	assert.ok(projected.kind === "valid" && projected.data.nodes.get("server"), "fresh baseline projected");
+	manager.destroy();
+	for (const doc of transport.docs.values()) doc.destroy();
+
+	// Path 2: a later local edit's candidate is fenced by the server and triggers recovery.
+	const second = await settledSkipFixture();
+	second.transport.fenceStaleSubmissions = true;
+	second.transport.docs.get("canvas-skip")?.destroy();
+	second.transport.docs.set("canvas-skip", createCanvasDocument(fresh.data));
+	second.transport.epoch.set("canvas-skip", 2);
+	assert.equal(await second.manager.ingest("Skip.canvas", bytes("base")), "formatting-only");
+	assert.equal(second.manager.bodyEpoch("canvas-skip"), 1);
+	second.projection.files.set("Skip.canvas", bytes("local-edit"));
+	await second.manager.ingest("Skip.canvas", bytes("local-edit")).catch(() => undefined);
+	await waitFor(() => second.manager.bodyEpoch("canvas-skip") === 2 && second.persistence.candidates.size === 0);
+	const authoritative = await materializeCanvasDocument(second.transport.docs.get("canvas-skip")!);
+	assert.equal(authoritative.nodes.get("n")?.text, "local-edit", "the edit crosses the reset");
+	assert.equal(authoritative.nodes.get("server")?.text, "server-only", "server lineage content survives");
+	second.manager.destroy();
+	for (const doc of second.transport.docs.values()) doc.destroy();
+});
+
+s.test("identical Canvas re-save with pending local work keeps its existing behaviour", async () => {
+	const { persistence, transport, manager } = await settledSkipFixture();
+	transport.submit = async () => { throw new Error("submission paused"); };
+	await assert.rejects(manager.ingest("Skip.canvas", bytes("pending")), /submission paused/);
+	assert.ok(persistence.candidates.size > 0, "local work is pending");
+	const before = transport.stateReads;
+	assert.equal(await manager.ingest("Skip.canvas", bytes("pending")), "formatting-only");
+	assert.equal(transport.stateReads, before, "pending documents never read state on identical re-save");
+	assert.equal(manager.stats().identicalStateReadsSkipped, 0, "the pending branch is not counted as a skip");
+	assert.equal(manager.stats().identicalStateReads, 0);
+	manager.destroy();
+	for (const doc of transport.docs.values()) doc.destroy();
+});
+
+s.test("YAOS materialising a remote Canvas change and the resulting modify event issue one state read", async () => {
+	class ModifyFiringProjection extends MemoryProjection {
+		onWrite: ((path: string, value: Uint8Array) => void) | null = null;
+		override async write(path: string, value: Uint8Array) {
+			await super.write(path, value);
+			this.onWrite?.(path, value);
+		}
+		// A real disk read-back is slow enough for the modify echo to overtake the settle.
+		async fingerprint(path: string) { await delay(30); return this.files.get(path) ?? null; }
+	}
+	const projection = new ModifyFiringProjection();
+	const { persistence, transport, manager } = await settledSkipFixture("base", projection);
+	const ingests: Array<Promise<string>> = [];
+	// Mirrors main.ts: vault "modify" -> readBinary -> ingest, fire-and-forget, racing the refresh's settle.
+	projection.onWrite = (path, value) => { ingests.push(manager.ingest(path, value)); };
+	const remote = parseCanvasBytes(bytes("remote"));
+	if (remote.kind !== "valid") throw new Error("fixture Canvas must be valid");
+	await applyCanvasSnapshot(transport.docs.get("canvas-skip")!, remote.data, "remote-peer");
+	transport.generation.set("canvas-skip", 2);
+	const before = transport.stateReads;
+	await manager.refresh("canvas-skip");
+	assert.equal(ingests.length, 1, "the materialisation write fired one modify-driven ingest");
+	assert.equal(await ingests[0], "formatting-only");
+	assert.equal(transport.stateReads, before + 1, "only the refresh read state; the echo ingest skipped");
+	assert.equal(manager.stats().identicalStateReadsSkipped, 1);
+	const settled = persistence.settlements.get("canvas-skip");
+	assert.equal(settled?.durableGeneration, 2);
+	assert.equal(settled?.contentHash, settled?.serverContentHash);
+	manager.destroy();
+	for (const doc of transport.docs.values()) doc.destroy();
+});
+
 await s.done();

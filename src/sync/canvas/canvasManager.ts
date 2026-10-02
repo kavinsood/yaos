@@ -110,6 +110,10 @@ export interface CanvasManagerStats {
 	degradedDocuments: number;
 	pendingDocuments: number;
 	pendingSubmissions: number;
+	/** Identical disk re-saves that still issued a semantic state GET. */
+	identicalStateReads: number;
+	/** Identical disk re-saves whose GET was skipped because the settlement already matched. */
+	identicalStateReadsSkipped: number;
 }
 
 export interface CanvasLiveReview {
@@ -151,6 +155,8 @@ export class CanvasManager {
 	private readonly refreshes = new Map<string, Promise<void>>();
 	private readonly refreshAttempts = new Map<string, number>();
 	private readonly epochRecoveries = new Map<string, Promise<void>>();
+	private identicalStateReads = 0;
+	private identicalStateReadsSkipped = 0;
 	private readonly pendingDocuments = new Set<string>();
 	private readonly pathStates = new Map<string, "semantic" | "invalid" | "oversized" | "conflict" | "degraded">();
 	private readonly liveSessions = new Map<string, CanvasLiveSession>();
@@ -322,7 +328,8 @@ export class CanvasManager {
 			oversizedDocuments: countCanvasState(this.pathStates, "oversized"),
 			conflictDocuments: countCanvasState(this.pathStates, "conflict"),
 			degradedDocuments: countCanvasState(this.pathStates, "degraded"),
-			pendingDocuments: this.pendingDocuments.size, pendingSubmissions: this.submissions.size };
+			pendingDocuments: this.pendingDocuments.size, pendingSubmissions: this.submissions.size,
+			identicalStateReads: this.identicalStateReads, identicalStateReadsSkipped: this.identicalStateReadsSkipped };
 	}
 
 	async promote(path: string, bytes: Uint8Array, expected: { revision: string; hash: string; size: number }): Promise<CanvasAuthorityReceipt> {
@@ -412,15 +419,24 @@ export class CanvasManager {
 		const resident = await this.load(documentId, path);
 		const proof = { revision: resident.revision, path: resident.path };
 		const shared = await materializeCanvasDocument(resident.doc);
-		if (await sha256BytesHex(canonicalCanvasBytes(shared)) === await sha256BytesHex(parsed.canonicalBytes)) {
+		const contentHash = await sha256BytesHex(parsed.canonicalBytes);
+		if (await sha256BytesHex(canonicalCanvasBytes(shared)) === contentHash) {
 			if (!this.pendingDocuments.has(documentId)) {
+				if (await this.alreadySettled(resident, proof, contentHash, parsed.canonicalBytes.byteLength)) {
+					// The settlement (the only three-way merge base) already records this exact
+					// content at this epoch, so a state GET could only rewrite the same base.
+					// Epoch resets reach us via the socket fence, the catalog feed, or a fenced
+					// submission; this incidental read is not the detector.
+					this.identicalStateReadsSkipped++;
+					return "formatting-only";
+				}
+				this.identicalStateReads++;
 				const remote = await this.transport.state(documentId);
 				if (remote.bodyEpoch > resident.bodyEpoch) {
 					await this.recoverSemanticEpoch(documentId, remote.bodyEpoch, remote);
 					return "formatting-only";
 				}
 				if (remote.bodyEpoch < resident.bodyEpoch) throw new Error("Canvas state returned a stale semantic epoch");
-				const contentHash = await sha256BytesHex(parsed.canonicalBytes);
 				if (remote.contentHash === contentHash && remote.size === parsed.canonicalBytes.byteLength) {
 					await this.settle(resident, parsed.canonicalBytes, bytes, remote.generation, remote.contentHash);
 				}
@@ -1162,6 +1178,26 @@ export class CanvasManager {
 		await this.persistence.putDocument({ kind: "semantic", documentId: resident.documentId,
 			bodyEpoch: resident.bodyEpoch, generation: resident.generation,
 			encodedState: ownedBuffer(encoded), dirty, updatedAt: this.now() });
+	}
+
+	/**
+	 * True when the stored settlement already proves disk == server for exactly this
+	 * canonical content at the resident's epoch. Generation is deliberately ignored:
+	 * merges read only `canonicalContent` + `bodyEpoch`, so an A->B->A server history
+	 * yields the same base. A refresh in flight (YAOS materialising a remote change,
+	 * whose write fires this modify) is awaited first so its settle lands before we look.
+	 */
+	private async alreadySettled(resident: ResidentCanvas, proof: { revision: number; path: string },
+		contentHash: string, size: number): Promise<boolean> {
+		const refreshing = this.refreshes.get(resident.documentId);
+		if (refreshing) await refreshing.catch(() => undefined);
+		if (!this.current(resident, proof) || this.pendingDocuments.has(resident.documentId)) return false;
+		const settlement = await this.persistence.getCanvasSettlement(resident.documentId);
+		return settlement !== null && settlement.documentId === resident.documentId
+			&& settlement.vaultGeneration === this.vaultGeneration
+			&& settlement.bodyEpoch === resident.bodyEpoch
+			&& settlement.contentHash === contentHash && settlement.serverContentHash === contentHash
+			&& settlement.canonicalContent.byteLength === size;
 	}
 
 	private parseSettlement(settlement: StoredCanvasSettlement): CanvasSemanticData | null {
