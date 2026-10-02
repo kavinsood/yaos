@@ -1,0 +1,169 @@
+scripts/relay2/wb/wbmodel.py
+  s_3c20a746b820c6::t_4dffd488164b4f 1-281
+scripts/relay2/wb/realClient.ts
+  s_3c20a746b820c6::t_5cb63682402480 1-233
+tests/server/relay3-bulk-create.ts
+  s_3c20a746b820c6::t_f446750baa0051 1-498
+scripts/relay2/lib/rawClient.ts
+  s_3c20a746b820c6::t_0fc96c92d20849 365
+src/sync/bulkCreateCaps.ts
+  s_3c20a746b820c6::t_4610d6b6d6ec02 1-50
+tests/conformance/fixtures/root-body.ts
+  s_3c20a746b820c6::t_31a848f46db689 9,17
+server/src/vaultCandidateService.ts
+  s_3c20a746b820c6::t_df24f3b1dbc55a 201,203,213,226,240,253,281,288,327,331
+scripts/measure-multiplexing.ts
+  s_3c20a746b820c6::t_51b30d94f69a73 337,339,361
+scripts/relay2/summarize.py
+  s_3c20a746b820c6::t_3e120b229a9ce5 548-651,666-671
+server/src/relayFlag.ts
+  s_3c20a746b820c6::t_6d33e32fd56b58 39-41,201-227
+src/onboarding/localVaultImport.ts
+  s_3c20a746b820c6::t_478819a3c2525c 11,103-104,260,263-267,401,416,424
+tests/server/wb-int-bulk.ts
+  s_3c20a746b820c6::t_fcf8b971d0472a 1-365
+server/src/vaultStore.ts
+  s_3c20a746b820c6::t_35ef11ac4667d3 12-13,22,80-108,463,473,748,1072-1271,1279-1282,1287-1290,1299,1339-1346
+  s_694286f0c485ac::t_467c9e367aa03d 75-79,1272-1278,1283-1286,1291-1298,1300-1338
+server/src/routes/auth.ts
+  s_3c20a746b820c6::t_16361a3d7cb76b 28,294,316-317
+tests/client/active-lifecycle-replay.ts
+  s_3c20a746b820c6::t_35a26d6986156f 5,15,20-41,61-63,65,69,76,80,87-93,102,108-113,115-148,151-153,156-161,163,167-170
+tests/conformance/client.ts
+  s_3c20a746b820c6::t_66e41f6d866b4f 272-273,275-277,305-314,316-327
+scripts/relay2/wb/realScenarios.ts
+  s_3c20a746b820c6::t_c79441027a8b09 1-130
+scripts/relay2/lib/common.ts
+  s_3c20a746b820c6::t_df19be6e471749 66-70
+tests/live/run-live.ts
+  s_2bdf60f4c6d977::t_a399a4397e1607 12-14,198
+server/src/routes/vault.ts
+  s_3c20a746b820c6::t_9892d0e0537d1b 11,46-47
+src/sync/serverCapabilities.ts
+  s_3c20a746b820c6::t_c1b0c9dd8830a4 20-21
+server/src/vaultCatalogStore.ts
+  s_3c20a746b820c6::t_73a907d63cc31a 497-499
+scripts/relay2/lib/context.ts
+  s_3c20a746b820c6::t_3fc821aedb83dc 8,229,233
+server/src/vaultBulkCreateService.ts
+  s_694286f0c485ac::t_83288be07642e4 7,300-301,384-388
+  s_3c20a746b820c6::t_9ca333fad4fdcb 1-6,8-299,302-383,389-581
+tests/client/bulk-create-client.ts
+  s_3c20a746b820c6::t_529c267eac4465 2-14,16-17,19-27,31-33,35-49,52-71,74-105,108-167,169-208
+src/sync/vaultSync.ts
+  s_3c20a746b820c6::t_6a7e500ff05075 83-89,402-410,412,490-494,500-597,610-611,685-688,705-714,1069-1073,1079-1082,1088-1089,1296,1298,1300-1307,1310-1311,1438-1448,1461-1462,1825,1911-1912,2197-2210,2246-2335,2357-2361,2819-2827,2837-2838,2840-2853,2856-2870,2873-2880,2882-2892,2894-2905,2907-2918,2920-2929,2931-2935,2940-2966,2977,2981,2984,2995-3024,3027-3028,3030-3110,3112-3124,3127-3128,3130-3134,3136-3142,3144-3147,3149-3212,3214-3418,3422-3445,5648-5651,6011-6018,6107-6116,6120
+server/src/vaultLifecycleService.ts
+  s_3c20a746b820c6::t_9187a158fd14c1 137,143,314-317
+server/src/routes/types.ts
+  s_3c20a746b820c6::t_42c33e2f833ec3 23-25
+tests/client/authority-outcome-recovery.ts
+  s_3c20a746b820c6::t_3a370822b10b00 112
+tests/server/server-route-classification-runtime.ts
+  s_3c20a746b820c6::t_534fa6edf8ed29 43,73-75
+packages/server-node/src/index.ts
+  s_3c20a746b820c6::t_e3ecde9344b848 8,113
+scripts/relay2/context.ts
+  s_3c20a746b820c6::t_2b3263a3ad8aaa 16,24-31,47
+server/src/crdt/rootSchema.ts
+  s_694286f0c485ac::t_597ba0bc2e634c 18-30
+tests/server/server-hardening.ts
+  s_3c20a746b820c6::t_7f2786997adbe0 115
+scripts/relay2/wb/selftest.ts
+  s_3c20a746b820c6::t_574fd2995e0943 1-86
+tests/live/schema4Live.ts
+  s_3c20a746b820c6::t_b385e0ffc39283 188,191,193,197,248-264,266-271,274-282
+tests/server/helpers/cfRowModel.ts
+  s_3c20a746b820c6::t_362af7272b86f8 1-117
+scripts/relay2/lib/run.ts
+  s_3c20a746b820c6::t_5a3516ef8cb871 71-74,77-83
+tests/server/settings-sync-route-authority.ts
+  s_3c20a746b820c6::t_36428e05a2967d 6,157,162,169-204
+tests/server/bulk-create-runtime.ts
+  s_3c20a746b820c6::t_c76ff48873194a 1-394
+tests/client/helpers/fakeBulkCreateServer.ts
+  s_3c20a746b820c6::t_6243046ec70619 1-249
+scripts/relay2/runfast.sh
+  s_3c20a746b820c6::t_15bf1d5eb4325b 4,40,44,59-60,64,78-87,111,171-187,301-302,306-311,332-333,348-350,355,483-484,490,492-494
+server/src/sqlRowCounter.ts
+  s_3c20a746b820c6::t_7ad3d417505c41 1-125
+tests/client/onboarding-import.ts
+  s_3c20a746b820c6::t_223f9c5b1db641 289-291
+server/src/server.ts
+  s_3c20a746b820c6::t_ad99f1cffa47e2 28,41,44,181-182,185-188,191-194,219,343-356,444-450,567-572,1620-1621,1624,1629,1631,1633,1643-1644
+scripts/relay2/wb/corpus.ts
+  s_3c20a746b820c6::t_a5e02593645545 1-260
+tests/client/fresh-large-http-roundtrips.ts
+  s_3c20a746b820c6::t_ad1a081676bd41 3,9,13,18-29,32,37-38,41,47-61,67,75-76,79,84-87,89-91
+scripts/relay2/wb/adapters.ts
+  s_3c20a746b820c6::t_045ecee26b2887 1-396
+tests/server/vault-candidate-runtime.ts
+  s_3c20a746b820c6::t_cec140d7c1264a 113,115,120-127
+tests/client/semantic-epoch-runtime.ts
+  s_3c20a746b820c6::t_5968319a8b9279 314,316,323,325-326
+tests/server/relay3-group-commit.ts
+  s_3c20a746b820c6::t_e72e0e7423b756 1167-1170
+scripts/relay2/wb/sql-capture.mjs
+  s_3c20a746b820c6::t_1b6facde29695d 1-24
+server/src/index.ts
+  s_3c20a746b820c6::t_265fbf821c54ac 2,103-105,147-148,320-325
+tests/server/helpers/planCompare.ts
+  s_3c20a746b820c6::t_34fb714a3bbf65 1-80
+docs/relay2-protocol.md
+  s_3c20a746b820c6::t_949c2c48ca1405 521-522
+tests/conformance/fixtures/capabilities.ts
+  s_3c20a746b820c6::t_d009343d8a2de1 10,31-32
+scripts/relay2/wb/plan-compare.ts
+  s_3c20a746b820c6::t_6983bc8a2539e5 1-60
+tests/client/bulk-create-relay-receipts.ts
+  s_3c20a746b820c6::t_1a0e1d6533e3db 1-286
+scripts/relay2/wb/bulk-rows.ts
+  s_3c20a746b820c6::t_7c96e6c4047ef9 1-90
+tests/headless/schema4.ts
+  s_3c20a746b820c6::t_cdc17a3a4b21ef 289,292,294-295,463-469,471-476,478-482
+scripts/relay2/wb/scenarios.ts
+  s_3c20a746b820c6::t_3ccda8df18cb1e 1-373
+scripts/relay2/costmodel.py
+  s_3c20a746b820c6::t_b62b4a7d1b4b71 15-17,223-227
+tests/client/bootstrap-http-boundaries.ts
+  s_3c20a746b820c6::t_7043bf7fdec5bd 15,216,218-224,231,235-236,241,245,247-250,252,255-257,263,266-275
+src/main.ts
+  s_3c20a746b820c6::t_5a4cfb00f74ee9 931,1010,1025-1030
+scripts/relay2/deploy.sh
+  s_3c20a746b820c6::t_aef063d85e21c6 5-8,33,43,84-89
+scripts/relay2/bench.ts
+  s_3c20a746b820c6::t_52b8ed77192e80 22,33-35
+server/src/vaultDocumentStore.ts
+  s_3c20a746b820c6::t_d8d66b0db453a9 472-482,527-532,544-546,560,648,826,1020-1047
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c3b2fdb26e5294409d75c86a4eced3c92ca5ccad",
+  "prompts": {},
+  "sessions": {
+    "s_2bdf60f4c6d977": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a6bb0187127ea11f8",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_3c20a746b820c6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a2b43feb19d9e9a0e",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_694286f0c485ac": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a3a172259d6cb1bf1",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
