@@ -36,6 +36,9 @@ export interface RelayFlagEnv {
 	YAOS_RELAY_GC_TAIL_BYTES?: string;
 	/** v3: delay of the (one per window) alarm that publishes coalesced catalog events; 0 = tail checkpoints only. */
 	YAOS_RELAY_GC_CATALOG_DELAY_MS?: string;
+	/** Write-budget spike (int-bulk): create-bulk caps; see `readBulkCreateLimits`. Not relay-gated. */
+	YAOS_BULK_CREATE_MAX_ITEMS?: string;
+	YAOS_BULK_CREATE_MAX_BYTES?: string;
 }
 
 export interface RelayConfig {
@@ -193,5 +196,32 @@ export function readRelayConfig(env: RelayFlagEnv | null | undefined): RelayConf
 		gcMaxBytes: positiveInt(source.YAOS_RELAY_GC_MAX_BYTES, DEFAULT_RELAY_CONFIG.gcMaxBytes, 1, MAX_DURABLE_UPDATE_BYTES),
 		gcTailBytes: positiveInt(source.YAOS_RELAY_GC_TAIL_BYTES, DEFAULT_RELAY_CONFIG.gcTailBytes, 1, 1024 * 1024),
 		gcCatalogDelayMs: positiveInt(source.YAOS_RELAY_GC_CATALOG_DELAY_MS, DEFAULT_RELAY_CONFIG.gcCatalogDelayMs, 0, 3_600_000),
+	};
+}
+
+/**
+ * Effective `POST /lifecycle/create-bulk` caps. The defaults are the protocol
+ * maxima (500 items, 4 MiB of decoded frame bytes); the env vars can only lower
+ * them (a smaller batch keeps one request under a CPU budget, e.g. the Workers
+ * Free plan). Out-of-range or non-numeric values clamp / fall back like the
+ * relay knobs. Advertised as `bulkCreate` in `/api/capabilities` and in every
+ * 413 body, so clients split by the server's numbers. A single-file batch keeps
+ * its own (larger) per-file limit.
+ */
+export interface BulkCreateLimits {
+	maxItems: number;
+	maxBytes: number;
+}
+
+export const BULK_CREATE_DEFAULT_MAX_ITEMS = 500;
+export const BULK_CREATE_DEFAULT_MAX_BYTES = 4 * 1024 * 1024;
+export const BULK_CREATE_MIN_MAX_BYTES = 64 * 1024;
+
+export function readBulkCreateLimits(env: RelayFlagEnv | null | undefined): BulkCreateLimits {
+	const source: RelayFlagEnv = { ...(testProcessEnv() as RelayFlagEnv | undefined ?? {}), ...(env ?? {}) };
+	return {
+		maxItems: positiveInt(source.YAOS_BULK_CREATE_MAX_ITEMS, BULK_CREATE_DEFAULT_MAX_ITEMS, 1, BULK_CREATE_DEFAULT_MAX_ITEMS),
+		maxBytes: positiveInt(source.YAOS_BULK_CREATE_MAX_BYTES, BULK_CREATE_DEFAULT_MAX_BYTES,
+			BULK_CREATE_MIN_MAX_BYTES, BULK_CREATE_DEFAULT_MAX_BYTES),
 	};
 }

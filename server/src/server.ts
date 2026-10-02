@@ -25,6 +25,7 @@ import { validateCanvasDocument } from "./crdt/canvasSemanticDocument";
 import { blobKey } from "./vaultObjectStore";
 import { VaultDocumentCache, type PendingVaultUpdate } from "./vaultDocumentCache";
 import { VaultLifecycleService } from "./vaultLifecycleService";
+import { VaultBulkCreateService, type BulkCreateCommittedEvent } from "./vaultBulkCreateService";
 import { VaultSocketService, type VaultSocketPort, type VaultSocketRegistryPort, hasSafeRootAttachmentSemantics, rootUpdateChangesProtectedAttachmentMaps, rootUpdateHasSafeAttachmentSemantics } from "./vaultSocketService";
 import { VaultStore, type CatalogMutation, type SemanticCatalogHead, type SemanticCatalogMutation } from "./vaultStore";
 import { isCanonicalVaultId } from "./vaultId";
@@ -37,9 +38,10 @@ import { RelayMergeBudgetError } from "./vaultDocumentStore";
 import { SemanticCompactionRuntime } from "./semanticCompactionRuntime";
 import { BODY_EPOCH_HEADER, ROOT_EPOCH_HEADER, parseSemanticEpoch, parseSemanticEpochHeader } from "./shared/semanticEpoch";
 import { SOCKET_CLIENT_CAPABILITIES_PARAM, parseSocketClientCapabilities } from "./shared/socketLiveness";
-import { readRelayConfig, relayBodiesEnabled, relayBodiesTestDefault, type RelayConfig, type RelayFlagEnv } from "./relayFlag";
+import { readBulkCreateLimits, readRelayConfig, relayBodiesEnabled, relayBodiesTestDefault, type BulkCreateLimits, type RelayConfig, type RelayFlagEnv } from "./relayFlag";
 import { RelayBodyService } from "./relayBodies";
 import { RelayBodyStore } from "./relayBodyStore";
+import { SqlRowCounter } from "./sqlRowCounter";
 import { handleCompactionLease, handleSemanticReset, type RelayRouteDeps } from "./relayRoutes";
 
 // Production PERSIST_DEBOUNCE_MS (250 ms) lives in testOnlyTimers.ts so the
@@ -176,9 +178,19 @@ export interface VaultRuntimeOptions {
 	 */
 	relayBodies?: boolean;
 	relayConfig?: RelayConfig;
+	/** Effective create-bulk caps (`YAOS_BULK_CREATE_MAX_*`); absent, the protocol defaults. */
+	bulkCreateLimits?: BulkCreateLimits;
 	/** Relay v2 spike: TEST-ONLY relay debug routes (Worker-gated like simulate-restart). */
 	relayDebugRoutes?: boolean;
+	/** TEST-ONLY exact SQL row counter (debug hosts only; ported from write-budget W1). */
+	sqlRowCounter?: SqlRowCounter;
+	/** Bulk-create post-commit hook (VaultBulkCreateService.onBulkCreateCommitted); b3-recovery's R2 mirror. */
+	onBulkCreateCommitted?: (event: BulkCreateCommittedEvent) => void;
 }
+
+/** Runtime paths of the experiment-only exact SQL row counter. */
+export const SQL_ROWS_RUNTIME_PATH = "/__yaos/test-only/sql-rows";
+export const SQL_ROWS_RESET_RUNTIME_PATH = "/__yaos/test-only/sql-rows/reset";
 
 /** Runtime path of the experiment-only relay table-count route. */
 export const RELAY_TABLE_COUNTS_RUNTIME_PATH = "/__yaos/test-only/relay-table-counts";
@@ -204,6 +216,7 @@ export class VaultRuntime implements DrainPort {
 	private readonly cache: VaultDocumentCache;
 	private readonly sockets: VaultSocketService;
 	private readonly lifecycle: VaultLifecycleService;
+	private readonly bulkCreate: VaultBulkCreateService;
 	private readonly candidates: VaultCandidateService;
 	private readonly semantic: VaultSemanticService;
 	private readonly bootstrap: BootstrapService;
@@ -327,6 +340,20 @@ export class VaultRuntime implements DrainPort {
 			flush: (documentId) => this.flushDocument(documentId),
 			validateActor: (actor) => this.store.validateActor(actor) === "allowed",
 		});
+		this.bulkCreate = new VaultBulkCreateService({
+			...(options.bulkCreateLimits ? { limits: options.bulkCreateLimits } : {}),
+			...(options.onBulkCreateCommitted ? { onBulkCreateCommitted: options.onBulkCreateCommitted } : {}),
+			store: this.store,
+			cache: this.cache,
+			sockets: () => this.sockets,
+			hasBlob: async (hash) => options.objectStore
+				? await options.objectStore.head(blobKey(vaultId(), vaultGeneration(), hash)) !== null
+				: false,
+			vaultGeneration,
+			runtimeEpoch: this.runtimeEpoch,
+			flush: (documentId) => this.flushDocument(documentId),
+			validateActor: (actor) => this.store.validateActor(actor) === "allowed",
+		});
 		this.candidates = new VaultCandidateService({
 			store: this.store,
 			cache: this.cache,
@@ -413,6 +440,13 @@ export class VaultRuntime implements DrainPort {
 				return this.options.simulateRestart && this.relay?.config.groupCommit && this.options.relayDebugRoutes
 					? await this.options.simulateRestart("relay-crash")
 					: json({ error: "not_found" }, 404);
+			}
+			if (url.pathname === SQL_ROWS_RUNTIME_PATH || url.pathname === SQL_ROWS_RESET_RUNTIME_PATH) {
+				const counter = this.options.sqlRowCounter;
+				if (!counter) return json({ error: "not_found" }, 404);
+				if (request.method === "GET" && url.pathname === SQL_ROWS_RUNTIME_PATH) return json(counter.snapshot());
+				if (request.method === "POST" && url.pathname === SQL_ROWS_RESET_RUNTIME_PATH) return json({ reset: true, previous: counter.reset() });
+				return json({ error: "not_found" }, 404);
 			}
 			if (request.method === "GET" && url.pathname === RELAY_TABLE_COUNTS_RUNTIME_PATH) {
 				return this.relayStore && this.options.relayDebugRoutes
@@ -530,8 +564,12 @@ export class VaultRuntime implements DrainPort {
 			if (request.method === "POST" && url.pathname.startsWith("/lifecycle")) {
 				const authorized = this.authorize(actor, "vault.lifecycle.write");
 				if (authorized instanceof Response) return authorized;
-				if (url.pathname === "/lifecycle") return this.lifecycle.handle(request, authorized);
-				if (url.pathname === "/lifecycle/admissions") return this.lifecycle.handleCreateAdmissionsBatch(request, authorized);
+				if (url.pathname === "/lifecycle/create-bulk") {
+					return this.bulkCreate.handle(request, authorized, () => {
+						const attachments = this.authorize(actor, "vault.attachments.write");
+						return attachments instanceof Response ? attachments : null;
+					});
+				}
 				if (url.pathname === "/lifecycle/batch") return this.lifecycle.handleBatch(request, authorized);
 				if (url.pathname === "/lifecycle/publish") return this.lifecycle.publish(request, authorized);
 			}
@@ -1579,16 +1617,20 @@ export class VaultSyncServer implements DurableObject {
 	private runtime: VaultRuntime;
 	/** Test-only: set while a simulated restart swaps the runtime. */
 	private restarting: Promise<void> | null = null;
+	/** TEST-ONLY: lives on the DO (not the runtime) so it survives simulated restarts. */
+	private readonly sqlRowCounter: SqlRowCounter | null;
 
 	constructor(private readonly state: DurableObjectState, private readonly env: CloudflareVaultEnvironment) {
+		this.sqlRowCounter = testOnlyDebugRoutesEnabled(env) ? new SqlRowCounter() : null;
 		this.runtime = this.createRuntime(state, env);
 	}
 
 	private createRuntime(state: DurableObjectState, env: CloudflareVaultEnvironment): VaultRuntime {
+		const storage = this.sqlRowCounter ? this.sqlRowCounter.wrap(state.storage) : state.storage;
 		return new VaultRuntime({
-			storage: state.storage as VaultRuntimeStoragePort,
+			storage: storage as VaultRuntimeStoragePort,
 			sockets: new CloudflareSocketRegistry(state),
-			alarms: new CloudflareAlarmPort(state.storage),
+			alarms: new CloudflareAlarmPort(storage),
 			execution: new CloudflareExecutionPort(state),
 			objectStore: env.YAOS_BUCKET ? new CloudflareObjectStore(env.YAOS_BUCKET) : undefined,
 			recoveryJobs: env.YAOS_RECOVERY_JOBS
@@ -1598,6 +1640,8 @@ export class VaultSyncServer implements DurableObject {
 			...(testOnlyFastTimersEnabled(env) ? { timers: readServerTimers(env) } : {}),
 			// The Worker gate checks the same var plus the operator session.
 			...(testOnlyDebugRoutesEnabled(env) ? { simulateRestart: (mode?: "restart" | "relay-crash") => this.simulateRestart(mode) } : {}),
+			...(this.sqlRowCounter ? { sqlRowCounter: this.sqlRowCounter } : {}),
+			bulkCreateLimits: readBulkCreateLimits(env),
 			relayBodies: relayBodiesEnabled(env),
 			...(relayBodiesEnabled(env) ? { relayConfig: readRelayConfig(env),
 				relayDebugRoutes: testOnlyDebugRoutesEnabled(env) } : {}),

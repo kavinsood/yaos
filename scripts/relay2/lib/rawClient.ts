@@ -362,7 +362,7 @@ export class RawClient {
 		catch (error) { return { status: "error", message: String(error) }; }
 		this.ticketAt = now();
 		const url = new URL(vaultRoute(this.identity, `ws/body/${encodeURIComponent(this.body)}`));
-		url.protocol = "wss:";
+		url.protocol = url.protocol === "http:" ? "ws:" : "wss:"; // local wrangler dev is plain http
 		url.searchParams.set("ticket", ticket);
 		url.searchParams.set("schemaVersion", String(SCHEMA_VERSION));
 		url.searchParams.set("protocolVersion", String(PROTOCOL_VERSION));

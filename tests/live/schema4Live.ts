@@ -185,16 +185,16 @@ export async function connectDocument(
 }
 
 async function postLifecycle(identity: LiveIdentity, request: LifecycleRequest): Promise<LifecycleReceipt> {
-	const { response, body } = await requestJson(identity, "lifecycle", {
+	const { response, body } = await requestJson(identity, "lifecycle/batch", {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify(request),
+		body: JSON.stringify({ operations: [request] }),
 	});
-	if (response.status !== 200 || !body) {
+	if (response.status !== 200 || !body || !Array.isArray(body.receipts)) {
 		throw new Error(`lifecycle ${request.kind} failed (${response.status}): ${JSON.stringify(body)}`);
 	}
 	try {
-		return parseLifecycleReceipt(body);
+		return parseLifecycleReceipt(body.receipts[0]);
 	} catch (error) {
 		const detail = error instanceof Error ? error.message : String(error);
 		throw new Error(`lifecycle ${request.kind} returned an invalid receipt: ${detail}`);
@@ -245,33 +245,41 @@ export async function createBody(
 	body.getText("body").insert(0, content);
 	const update = Y.encodeStateAsUpdate(body);
 	body.destroy();
-	const candidateId = `candidate-create-${crypto.randomUUID()}`;
-	const candidateDigest = await sha256Hex(update);
-	const lifecycle: LifecycleRequest = {
-		operationId: `create-${crypto.randomUUID()}`,
-		kind: "create",
-		fileId: bodyId,
-		bodyId,
-		bodyEpoch: 1,
-		path,
-		candidateId,
-		candidateDigest,
-	};
-	await postLifecycle(identity, lifecycle);
-	const candidate = await fetch(vaultRoute(identity, `body/${encodeURIComponent(bodyId)}/candidate`), {
+	return createBodyFromUpdates(identity, bodyId, path, [update]);
+}
+
+/** One `POST /lifecycle/create-bulk` whose body state is exactly `updates`; returns a create receipt. */
+export async function createBodyFromUpdates(
+	identity: LiveIdentity,
+	bodyId: string,
+	path: string,
+	updates: Uint8Array[],
+): Promise<LifecycleReceipt> {
+	const operationId = `create-${crypto.randomUUID()}`;
+	const current = await fetch(vaultRoute(identity, "root"), { headers: deviceBearerHeaders(identity) });
+	if (!current.ok) throw new Error(`root read failed (${current.status})`);
+	const rootEpoch = Number(current.headers.get("x-yaos-root-epoch"));
+	await current.arrayBuffer();
+	if (!Number.isSafeInteger(rootEpoch) || rootEpoch < 1) throw new Error("root read omitted root epoch");
+	const { response, body: result } = await requestJson(identity, "lifecycle/create-bulk", {
 		method: "POST",
-		headers: deviceBearerHeaders(identity, {
-			"Content-Type": "application/octet-stream",
-			"x-yaos-candidate-id": candidateId,
-			"x-yaos-candidate-digest": candidateDigest,
-			"x-yaos-body-epoch": "1",
+		headers: { "Content-Type": YAOS_BINARY_CONTENT_TYPE },
+		body: encodeBinaryEnvelope({
+			batchId: `batch-${crypto.randomUUID()}`,
+			rootEpoch,
+			files: [{ operationId, bodyId, path, updates }],
+			attachments: [],
 		}),
-		body: update,
 	});
-	if (candidate.status !== 200) throw new Error(`creation candidate failed (${candidate.status}): ${await candidate.text()}`);
-	const receipt = await postLifecycle(identity, lifecycle);
-	await publishRoot(identity, lifecycle, receipt);
-	return receipt;
+	const outcome = Array.isArray(result?.outcomes) ? result.outcomes[0] as Record<string, unknown> | undefined : undefined;
+	if (response.status !== 200 || !result || outcome?.outcome !== "created") {
+		throw new Error(`bulk create failed (${response.status}): ${JSON.stringify(result)}`);
+	}
+	return {
+		vaultId: identity.vaultId, vaultGeneration: String(result.vaultGeneration), bodyId, bodyEpoch: 1, fileId: bodyId,
+		operationId, kind: "create", lifecycle: "active", path, durableGeneration: 1,
+		vaultSequence: Number(result.vaultSequence), runtimeEpoch: String(result.runtimeEpoch),
+	};
 }
 
 export async function submitBodyUpdate(

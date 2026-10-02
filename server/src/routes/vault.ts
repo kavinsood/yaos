@@ -8,6 +8,7 @@ import {
 	MAX_SETTINGS_SNAPSHOT_REQUEST_BYTES,
 } from "../settingsSyncStore";
 import { BoundedBodyError, readBoundedBytes } from "../readBoundedBytes";
+import { BULK_CREATE_MAX_REQUEST_BYTES } from "../vaultBulkCreateService";
 import { SERVER_PROTOCOL_VERSION, SERVER_SCHEMA_VERSION } from "../version";
 import type { VaultRecord } from "../identity";
 import { inspectTicket } from "./ticket";
@@ -42,6 +43,8 @@ function forwardedBodyLimit(request: Request, runtimePath: string): number | nul
 		|| runtimePath === "/semantic/authority/promote") return MAX_CANDIDATE_BYTES;
 	if (runtimePath === "/body/candidates") return MAX_CATCH_UP_BYTES;
 	if (runtimePath === "/catch-up") return MAX_CATCH_UP_BYTES;
+	// Write-budget W2: the bulk create envelope (≤ 4 MiB of frames, or one ≤ 6 MiB note).
+	if (runtimePath === "/lifecycle/create-bulk") return BULK_CREATE_MAX_REQUEST_BYTES;
 	// Relay v2 spike: the base64 snapshot of a client semantic reset (route exists only with the flag on).
 	if (/^\/body\/[^/]+\/semantic-reset$/.test(runtimePath)) return MAX_CATCH_UP_BYTES;
 	if (runtimePath.startsWith("/settings-sync/") && request.method === "PUT") {

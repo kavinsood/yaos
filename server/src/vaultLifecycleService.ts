@@ -7,10 +7,8 @@ import { readBoundedBytes } from "./readBoundedBytes";
 import { safeBlobPath, safeMarkdownPath } from "./shared/vaultPath";
 import type {
 	CatalogMutation,
-	DurableCandidateReceipt,
 	DurableLifecycleRecord,
 	DurableRootPublication,
-	PendingCreationCandidate,
 	VaultStore,
 	AttachmentCatalogEvent,
 } from "./vaultStore";
@@ -132,103 +130,17 @@ interface LifecycleServiceOptions {
 	validateActor: (actor: VaultActorContext) => boolean;
 }
 
-interface BodyMetadata {
-	contentHash: string;
-	size: number;
-}
-
 interface LifecyclePublicationOperation extends LifecycleRequest {
 	vaultSequence: number;
 }
 
-/** Owns create/rename/delete/revive fences and exact root publication. */
+/** Owns rename/delete/revive lifecycle and exact root publication. Creates go through VaultBulkCreateService (W2). */
 export class VaultLifecycleService {
 	constructor(private readonly options: LifecycleServiceOptions) {}
 
 	activeBodyHead(bodyId: string) {
 		const head = this.options.store.getCatalogHeadAt(this.options.store.currentSequence(), bodyId);
-		return head?.lifecycle === "active" && head.fileId === bodyId && !this.options.store.creationCandidate(bodyId) ? head : null;
-	}
-
-	async handle(request: Request, actor: VaultActorContext): Promise<Response> {
-		let decoded: unknown;
-		try { decoded = await boundedJson(request); }
-		catch (error) { return json({ error: error instanceof Error ? error.message : "invalid_json" }, 400); }
-		const input = parseLifecycleRequest(decoded);
-		return this.handleInput(input, actor);
-	}
-
-	async handleCreateAdmissionsBatch(request: Request, actor: VaultActorContext): Promise<Response> {
-		let decoded: unknown;
-		try { decoded = await boundedJson(request); }
-		catch { return json({ error: "invalid_json" }, 400); }
-		if (typeof decoded !== "object" || decoded === null || Array.isArray(decoded)
-			|| !("operations" in decoded) || !Array.isArray(decoded.operations)
-			|| decoded.operations.length === 0 || decoded.operations.length > MAX_CATCH_UP_BODIES) {
-			return json({ error: "invalid_create_admission_batch" }, 400);
-		}
-		const operations: LifecycleRequest[] = [];
-		const operationIds = new Set<string>();
-		const bodyIds = new Set<string>();
-		const paths = new Set<string>();
-		const candidateIds = new Set<string>();
-		for (const candidate of decoded.operations) {
-			const operation = parseLifecycleRequest(candidate);
-			if (!operation || operation.kind !== "create" || operation.bodyId !== operation.fileId
-				|| !validIdentity(operation.candidateId)
-				|| typeof operation.candidateDigest !== "string"
-				|| !/^[a-f0-9]{64}$/.test(operation.candidateDigest.toLowerCase())
-				|| typeof operation.path !== "string" || safeMarkdownPath(operation.path) !== operation.path
-				|| operationIds.has(operation.operationId) || bodyIds.has(operation.bodyId)
-				|| paths.has(operation.path) || candidateIds.has(operation.candidateId)) {
-				return json({ error: "invalid_create_admission_batch_item" }, 400);
-			}
-			operations.push(operation);
-			operationIds.add(operation.operationId);
-			bodyIds.add(operation.bodyId);
-			paths.add(operation.path);
-			candidateIds.add(operation.candidateId);
-		}
-		const receipts: LifecycleReceipt[] = [];
-		for (const operation of operations) {
-			const response = await this.handleInput(operation, actor);
-			if (response.status !== 200) return response;
-			receipts.push(await response.json());
-		}
-		return json({
-			receipts,
-			vaultSequence: Math.max(...receipts.map((receipt) => receipt.vaultSequence)),
-			runtimeEpoch: this.options.runtimeEpoch,
-		});
-	}
-
-	private async handleInput(input: LifecycleRequest | null, actor: VaultActorContext): Promise<Response> {
-		if (!input || input.bodyId !== input.fileId) {
-			return json({ error: "invalid_lifecycle_request" }, 400);
-		}
-		if (input.kind === "create" && (!validIdentity(input.candidateId)
-			|| typeof input.candidateDigest !== "string" || !/^[a-f0-9]{64}$/.test(input.candidateDigest.toLowerCase()))) {
-			return json({ error: "creation_candidate_required" }, 400);
-		}
-		const existing = this.options.store.lifecycleRecord(input.operationId);
-		if (existing) {
-			if (existing.bodyEpoch !== input.bodyEpoch) return this.bodyEpochMismatch(input.bodyId, input.bodyEpoch);
-			if (!this.inputMatchesRecord(input, existing)) return json({ error: "operation_identity_mismatch" }, 409);
-			// A root publication is the terminal durable outcome. Once it exists,
-			// replaying the immutable lifecycle request must keep returning its
-			// receipt even if a later semantic reset makes the historical body
-			// epoch non-current. This is what lets a restarted client retire a local
-			// row after losing the original response.
-			if (!this.isCurrent(existing) && !this.options.store.lifecyclePublication(existing.operationId)) {
-				return json({ error: "lifecycle_operation_superseded" }, 409);
-			}
-			return json(this.receipt(existing));
-		}
-		const requestDigest = await this.lifecycleRequestDigest(input);
-		const currentEpoch = this.options.store.documentHead(input.bodyId)?.semanticEpoch ?? INITIAL_SEMANTIC_EPOCH;
-		if (currentEpoch !== input.bodyEpoch) return this.bodyEpochMismatch(input.bodyId, input.bodyEpoch, currentEpoch);
-		if (input.kind === "create") return this.admitCreate(input, actor, requestDigest);
-		return this.commitLifecycle(input, actor, requestDigest);
+		return head?.lifecycle === "active" && head.fileId === bodyId ? head : null;
 	}
 
 	async handleBatch(request: Request, actor: VaultActorContext): Promise<Response> {
@@ -399,6 +311,10 @@ export class VaultLifecycleService {
 		const requestDigest = await this.attachmentRequestDigest(mutation);
 		const replay = this.options.store.attachmentOperation(mutation.operationId);
 		const replayEvents = this.options.store.attachmentEventsForOperation(mutation.operationId);
+		if (!replay && replayEvents.length > 0 && this.options.store.bulkCreateCommittedAttachment?.(mutation.operationId)) {
+			// W2: committed by /lifecycle/create-bulk (no per-operation attachment row).
+			return json({ error: "attachment_operation_committed_by_bulk_create" }, 409);
+		}
 		if (replay || replayEvents.length > 0) return this.attachmentReplayResult(mutation, requestDigest, replay, replayEvents);
 		const currentRootEpoch = this.options.store.documentHead("root")?.semanticEpoch ?? INITIAL_SEMANTIC_EPOCH;
 		if (mutation.rootEpoch !== currentRootEpoch) return this.rootEpochMismatch(mutation.rootEpoch, currentRootEpoch);
@@ -528,123 +444,9 @@ export class VaultLifecycleService {
 		}
 	}
 
-	finalizeCreation(
-		creation: PendingCreationCandidate,
-		candidate: DurableCandidateReceipt,
-		metadata: BodyMetadata,
-		actor: VaultActorContext,
-	): "committed" | "busy" | "superseded" {
-		const owner = `lifecycle-create:${creation.operationId}:${crypto.randomUUID()}`;
-		if (!this.options.store.acquireRecoveryMutex(owner)) return "busy";
-		try {
-			if (creation.bodyEpoch !== candidate.bodyEpoch) throw new Error("creation candidate body epoch mismatch");
-			const existing = this.options.store.lifecycleRecord(creation.operationId);
-			if (existing) {
-				if (existing.candidateId !== creation.candidateId || existing.candidateDigest !== creation.candidateDigest) {
-					throw new Error("completed creation identity mismatch");
-				}
-				this.options.store.completeCreationCandidate(creation.bodyId, creation.candidateId, creation.candidateDigest);
-				return "committed";
-			}
-			const pathOwner = this.options.store.activeCatalogHeadAtPath(
-				this.options.store.currentSequence(), creation.path,
-			);
-			if (pathOwner) {
-				// A concurrent/replayed creation won this path before this exact fence
-				// could publish. Retire the fence so it cannot retry forever. The body
-				// candidate remains a harmless orphan until normal retention reaps it.
-				this.options.store.completeCreationCandidate(
-					creation.bodyId, creation.candidateId, creation.candidateDigest,
-				);
-				return "superseded";
-			}
-			const request: LifecycleRequest = { operationId: creation.operationId, kind: "create", fileId: creation.fileId,
-				bodyEpoch: creation.bodyEpoch,
-				bodyId: creation.bodyId, path: creation.path, candidateId: creation.candidateId, candidateDigest: creation.candidateDigest };
-			const rootUpdate = this.markerUpdate([request]);
-			const commit = this.options.store.commitRootLifecycle({
-				rootUpdate,
-				kind: "create",
-				catalog: { bodyId: creation.bodyId, fileId: creation.fileId, path: creation.path, previousPath: null,
-					lifecycle: "active", bodyGeneration: candidate.durableGeneration, contentHash: metadata.contentHash, size: metadata.size },
-				lifecycleReceipt: { operationId: creation.operationId, kind: "create", bodyId: creation.bodyId, fileId: creation.fileId,
-					bodyEpoch: candidate.bodyEpoch,
-					candidateId: creation.candidateId, candidateDigest: creation.candidateDigest, sourcePath: null, resultPath: creation.path,
-					resultLifecycle: "active", durableGeneration: candidate.durableGeneration,
-					vaultGeneration: this.options.vaultGeneration(), runtimeEpoch: creation.runtimeEpoch },
-				completeCreation: { bodyId: creation.bodyId, candidateId: creation.candidateId, candidateDigest: creation.candidateDigest },
-				actorAttributions: [{ actor, operationId: creation.operationId, requestDigest: creation.candidateDigest }],
-			});
-			this.applyRoot(rootUpdate, commit.generation, creation);
-			return "committed";
-		} finally {
-			this.options.store.releaseRecoveryMutex(owner);
-		}
-	}
-
-	private admitCreate(input: LifecycleRequest, actor: VaultActorContext, requestDigest: string): Response {
-		if (typeof input.path !== "string" || safeMarkdownPath(input.path) !== input.path) return json({ error: "path_required" }, 400);
-		const candidateId = input.candidateId!;
-		const candidateDigest = input.candidateDigest!.toLowerCase();
-		const existing = this.options.store.creationCandidate(input.bodyId);
-		if (existing && (existing.operationId !== input.operationId || existing.path !== input.path
-			|| existing.candidateId !== candidateId || existing.candidateDigest !== candidateDigest)) {
-			return json({ error: "creation_candidate_fence_mismatch" }, 409);
-		}
-		const pathOwner = this.options.store.activeCatalogHeadAtPath(
-			this.options.store.currentSequence(), input.path,
-		);
-		if (pathOwner) {
-			if (existing) {
-				this.options.store.completeCreationCandidate(input.bodyId, existing.candidateId, existing.candidateDigest);
-			}
-			return json({ error: "creation_path_superseded", path: input.path, ownerBodyId: pathOwner.bodyId }, 409);
-		}
-		if (existing) {
-			return json(this.pendingReceipt(existing));
-		}
-		if (this.options.store.getCatalogHeadAt(this.options.store.currentSequence(), input.bodyId)) return json({ error: "body_identity_already_exists" }, 409);
-		if (!this.options.validateActor(actor)) return json({ error: "authority_superseded" }, 409);
-		let bodyHead = this.options.store.documentHead(input.bodyId);
-		if (!bodyHead) {
-			const empty = crdtEngine.createDocument(input.bodyId);
-			const commit = this.options.store.commitUpdate({ documentId: input.bodyId,
-				update: crdtEngine.encodeStateAsUpdate(empty), kind: "body",
-				actorAttributions: [{ actor, operationId: input.operationId, requestDigest }] });
-			crdtEngine.destroyDocument(empty);
-			bodyHead = {
-				generation: commit.generation,
-				semanticEpoch: commit.semanticEpoch,
-				latestSequence: commit.vaultSequence,
-			};
-		}
-		const fence = this.options.store.expectCreationCandidate({ bodyId: input.bodyId, fileId: input.fileId, path: input.path,
-			bodyEpoch: bodyHead.semanticEpoch,
-			operationId: input.operationId, candidateId, candidateDigest, durableGeneration: bodyHead.generation,
-			vaultSequence: bodyHead.latestSequence, vaultGeneration: this.options.vaultGeneration(), runtimeEpoch: this.options.runtimeEpoch });
-		return json(this.pendingReceipt(fence));
-	}
-
-	private async commitLifecycle(input: LifecycleRequest, actor: VaultActorContext, requestDigest: string): Promise<Response> {
-		if (!await this.options.flush("root")) return json({ error: "root_persistence_unavailable" }, 503);
-		if (!await this.options.flush(input.bodyId)) return json({ error: "body_persistence_unavailable" }, 503);
-		if (!this.options.validateActor(actor)) return json({ error: "authority_superseded" }, 409);
-		const prepared = this.prepareMutation(input);
-		if (prepared instanceof Response) return prepared;
-		const rootUpdate = this.markerUpdate([input]);
-		const commit = this.options.store.commitRootLifecycle({ rootUpdate, kind: input.kind, catalog: prepared.catalog,
-			lifecycleReceipt: prepared.receipt, actorAttributions: [{ actor, operationId: input.operationId, requestDigest }] });
-		const record = this.options.store.lifecycleRecord(input.operationId)!;
-		this.applyRoot(rootUpdate, commit.generation, input);
-		if (input.kind === "delete") this.options.sockets().closeBody(input.bodyId);
-		this.options.sockets().notifyBodyCommitted(input.bodyId, prepared.receipt.durableGeneration, commit.vaultSequence);
-		return json(this.receipt(record));
-	}
-
 	private prepareMutation(input: LifecycleRequest): { catalog: CatalogMutation; receipt: Omit<DurableLifecycleRecord, "vaultSequence" | "rootGeneration"> } | Response {
 		const current = this.options.store.getCatalogHeadAt(this.options.store.currentSequence(), input.bodyId);
 		if (!current || current.fileId !== input.fileId) return json({ error: "body_not_found" }, 404);
-		if (this.options.store.creationCandidate(input.bodyId)) return json({ error: "body_creation_not_committed" }, 409);
 		if ((input.kind === "delete" || input.kind === "rename") && current.lifecycle !== "active") return json({ error: "body_not_active" }, 409);
 		if (input.kind === "revive" && current.lifecycle !== "tombstoned") return json({ error: "body_not_tombstoned" }, 409);
 		if (input.kind === "rename" && input.fromPath !== current.path) return json({ error: "stale_source_path" }, 409);
@@ -952,13 +754,6 @@ export class VaultLifecycleService {
 		return { vaultId: this.options.vaultId(), vaultGeneration: record.vaultGeneration, bodyId: record.bodyId, fileId: record.fileId,
 			bodyEpoch: record.bodyEpoch,
 			operationId: record.operationId, kind: record.kind, lifecycle: record.resultLifecycle, path: record.resultPath,
-			durableGeneration: record.durableGeneration, vaultSequence: record.vaultSequence, runtimeEpoch: record.runtimeEpoch };
-	}
-
-	private pendingReceipt(record: PendingCreationCandidate): LifecycleReceipt {
-		return { vaultId: this.options.vaultId(), vaultGeneration: record.vaultGeneration, bodyId: record.bodyId, fileId: record.fileId,
-			bodyEpoch: record.bodyEpoch,
-			operationId: record.operationId, kind: "create", lifecycle: "active", path: record.path,
 			durableGeneration: record.durableGeneration, vaultSequence: record.vaultSequence, runtimeEpoch: record.runtimeEpoch };
 	}
 

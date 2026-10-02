@@ -928,6 +928,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					maxFileSizeBytes: this.getRuntimeConfig().maxFileSizeBytes,
 					excludePatterns: this.excludePatterns,
 					configDir: this.app.vault.configDir,
+					bulkCreateCaps: () => this.capabilityUpdateService?.capabilities?.bulkCreate,
 					onProgress: (summary) => {
 						this.initialImportSummary = summary;
 					},
@@ -1006,6 +1007,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				},
 				host: this.settings.host,
 				token: this.settings.deviceToken,
+				bulkCreateCaps: () => this.capabilityUpdateService?.capabilities?.bulkCreate,
 				database,
 				canvasProjection,
 				getSocketTicket: async (scope, force = false) => {
@@ -1020,6 +1022,12 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				log: (message) => this.log(`[sync] ${message}`),
 				onRemoteRootStructuralUpdate: () => this.scheduleSchema4CatchUp("remote-root"),
 				onBodyChangedHint: () => this.scheduleSchema4CatchUp("body-changed-hint"),
+				onCreatePathOwned: ({ path }) => {
+					// D3: the server already has this path; the local file goes through
+					// reconcile (identical content plans to a no-op, 0 rows).
+					const file = this.app.vault.getAbstractFileByPath(path);
+					if (file instanceof TFile) this.reconciliationController.markMarkdownDirty(file, "modify");
+				},
 				onAttachmentReconciliationRequired: () => {
 					this.attachmentReconciliationPending = true;
 					this.reconciliationController.markPending();

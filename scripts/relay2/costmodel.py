@@ -12,6 +12,9 @@ Every input is a named parameter, so the table can be re-run with measured C4/C5
     python3 scripts/relay2/costmodel.py --json measured.json     # {"param": value, ...}
     python3 scripts/relay2/costmodel.py --list                   # show every parameter + provenance
     python3 scripts/relay2/costmodel.py --format json            # machine-readable output
+    python3 scripts/relay2/costmodel.py --wb [--measured <raw dir>] [--set k=v]   # write-budget model (wb/wbmodel.py):
+                                                                 # rows/day vs 100k for typical / heavy / autosave /
+                                                                 # first open 2k/10k/25k, measured vs assumed labels
 
 Provenance tags in PARAMS: "measured:<id>" (a spike or A-series number), "code:<file>" (a
 constant read from server/src), "doc:<url>" (Cloudflare docs), "assumed" (a modelling choice,
@@ -217,6 +220,11 @@ def render(rows: list[Row], p: dict[str, float]) -> str:
 
 
 def main(argv: list[str]) -> int:
+    if "--wb" in argv:  # write-budget spike model (separate parameter set; see wb/wbmodel.py)
+        import os
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "wb"))
+        import wbmodel  # noqa: PLC0415
+        return wbmodel.main([x for x in argv if x != "--wb"])
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--set", action="append", default=[], metavar="NAME=VALUE")
     ap.add_argument("--json", help="JSON object of parameter overrides")

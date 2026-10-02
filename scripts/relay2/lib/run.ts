@@ -68,10 +68,19 @@ export async function ensureOpen(client: RawClient) {
 	return client;
 }
 
-/** Create fresh notes via the production import path; returns body ids. */
+/**
+ * Create fresh notes; returns body ids. Default: the production import path (legacy admissions). With `--create bulk`
+ * or WB_CREATE=bulk: W2's lifecycle/create-bulk (W2 servers have no admissions route).
+ */
 export async function freshNotes(ctx: RunCtx, prefix: string, count: number, content: (i: number) => string): Promise<string[]> {
 	const ids = Array.from({ length: count }, (_v, i) => `${ctx.tag}-${prefix}-${i}`.replace(/[^A-Za-z0-9_-]/g, "-"));
-	await seedNotes(ctx.context, ids.map((bodyId, i) => ({ bodyId, path: `R2/${ctx.tag}/${prefix}-${i}.md`, content: content(i) })));
+	const inputs = ids.map((bodyId, i) => ({ bodyId, path: `R2/${ctx.tag}/${prefix}-${i}.md`, content: content(i) }));
+	if ((ctx.str("create") ?? process.env.WB_CREATE ?? "bulk") === "bulk") { // b3: the only create path (D2)
+		const { bulkCreate } = await import("../wb/adapters");
+		const r = await bulkCreate().create(ctx.context, inputs.map((i) => ({ kind: "note" as const, ...i })));
+		const bad = r.outcomes.filter((o) => o.outcome !== "created");
+		if (bad.length) throw new Error(`bulk seed failed for ${bad.length}/${inputs.length}: ${JSON.stringify(bad[0])}`);
+	} else await seedNotes(ctx.context, inputs);
 	return ids;
 }
 

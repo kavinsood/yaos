@@ -112,6 +112,7 @@ s.section("Test 9: capabilities expose one final identity-neutral shape");
 	s.check(
 		JSON.stringify(Object.keys(caps).sort()) === JSON.stringify([
 			"attachments",
+			"bulkCreate",
 			"claimed",
 			"maxBlobUploadBytes",
 			"protocolVersion",

@@ -2,7 +2,10 @@
 # Relay v2 spike deploy helper.
 #
 #   scripts/relay2/deploy.sh <name> [--relay on|off] [--var KEY=VALUE]... [--no-debug-routes] [--dry-run]
-#        [--src <tree>] [--require-clean]
+#        [--src <tree>] [--require-clean] [--r2 <bucket>]
+#
+# --r2 binds YAOS_BUCKET to <bucket> (the generated config strips [[r2_buckets]] by default, which leaves
+# the recovery projection off); use it to exercise the RecoveryJob path on a deployed worker.
 #
 # --src deploys server/ from another checkout (e.g. a clean `git worktree add` at a pinned SHA) instead of
 # this worktree; --require-clean aborts when server/src, server/scripts or server/vendor have uncommitted
@@ -27,6 +30,7 @@ RELAY=off
 DEBUG_ROUTES=1
 DRY=0
 CLEAN=0
+R2=
 typeset -a VARS
 while (( $# )); do
   case $1 in
@@ -36,6 +40,7 @@ while (( $# )); do
     --dry-run) DRY=1; shift;;
     --src) WT=${2:A}; shift 2;;
     --require-clean) CLEAN=1; shift;;
+    --r2) R2=$2; shift 2;;
     *) echo "unknown arg $1" >&2; exit 2;;
   esac
 done
@@ -76,6 +81,12 @@ typeset -a ALLVARS
 ALLVARS+=("${VARS[@]}")
 {
   print -r -- "$CONFIG"
+  if [[ -n $R2 ]]; then
+    print ""
+    print "[[r2_buckets]]"
+    print "binding = \"YAOS_BUCKET\""
+    print -r -- "bucket_name = \"$R2\""
+  fi
   if (( ${#ALLVARS} )); then
     print ""
     print "[vars]"

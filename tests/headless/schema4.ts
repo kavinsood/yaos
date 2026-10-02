@@ -286,12 +286,13 @@ function parseReceipt(value: unknown): LifecycleReceipt {
 }
 
 async function postLifecycle(identity: Identity, request: LifecycleRequest): Promise<LifecycleReceipt> {
-	const response = await fetchBounded(route(identity, "lifecycle"), {
+	const response = await fetchBounded(route(identity, "lifecycle/batch"), {
 		method: "POST",
 		headers: headers(identity, { "Content-Type": "application/json" }),
-		body: JSON.stringify(request),
+		body: JSON.stringify({ operations: [request] }),
 	});
-	const receipt = parseReceipt(await json(response, `lifecycle ${request.kind}`));
+	const batch = await json(response, `lifecycle ${request.kind}`);
+	const receipt = parseReceipt(Array.isArray(batch.receipts) ? batch.receipts[0] : null);
 	if (receipt.vaultId !== identity.vaultId || receipt.vaultGeneration !== identity.vaultGeneration
 		|| receipt.bodyId !== request.bodyId || receipt.fileId !== request.fileId
 		|| receipt.operationId !== request.operationId || receipt.kind !== request.kind) {
@@ -459,38 +460,27 @@ export class PublicPeer {
 		doc.getText("body").insert(0, content);
 		const update = Y.encodeStateAsUpdate(doc);
 		doc.destroy();
-		const candidateId = `create-${crypto.randomUUID()}`;
-		const candidateDigest = await sha256Hex(update);
-		const request: LifecycleRequest = {
-			operationId: `create-${crypto.randomUUID()}`,
-			kind: "create",
-			fileId: bodyId,
-			bodyId,
-			bodyEpoch: 1,
-			path,
-			candidateId,
-			candidateDigest,
-		};
-		await postLifecycle(this.identity, request);
-		const candidate = await fetchBounded(route(this.identity, `body/${encodeURIComponent(bodyId)}/candidate`), {
+		const operationId = `create-${crypto.randomUUID()}`;
+		const current = await fetchBounded(route(this.identity, "root"), { headers: headers(this.identity) });
+		if (!current.ok) throw new Error(`root read failed (${current.status})`);
+		const rootEpoch = Number(current.headers.get("x-yaos-root-epoch"));
+		await current.arrayBuffer();
+		if (!Number.isSafeInteger(rootEpoch) || rootEpoch < 1) throw new Error("root read omitted root epoch");
+		const result = await json(await fetchBounded(route(this.identity, "lifecycle/create-bulk"), {
 			method: "POST",
-			headers: headers(this.identity, {
-				"Content-Type": "application/octet-stream",
-				"x-yaos-candidate-id": candidateId,
-				"x-yaos-candidate-digest": candidateDigest,
-					"x-yaos-body-epoch": "1",
+			headers: headers(this.identity, { "Content-Type": YAOS_BINARY_CONTENT_TYPE }),
+			body: encodeBinaryEnvelope({
+				batchId: `batch-${crypto.randomUUID()}`,
+				rootEpoch,
+				files: [{ operationId, bodyId, path, updates: [update] }],
+				attachments: [],
 			}),
-			body: update,
-		});
-		const candidateReceipt = await json(candidate, "creation candidate");
-		if (candidateReceipt.vaultId !== this.identity.vaultId
-			|| candidateReceipt.vaultGeneration !== this.identity.vaultGeneration
-			|| candidateReceipt.bodyId !== bodyId || candidateReceipt.candidateId !== candidateId
-			|| candidateReceipt.candidateDigest !== candidateDigest) {
-			throw new Error(`creation candidate receipt crossed an identity boundary: ${JSON.stringify(candidateReceipt)}`);
+		}), "bulk create");
+		const outcome = Array.isArray(result.outcomes) ? record(result.outcomes[0], "bulk create outcome") : null;
+		if (result.vaultGeneration !== this.identity.vaultGeneration || outcome?.operationId !== operationId
+			|| outcome.outcome !== "created" || outcome.bodyId !== bodyId) {
+			throw new Error(`bulk create did not create ${path}: ${JSON.stringify(result.outcomes)}`);
 		}
-		const receipt = await postLifecycle(this.identity, request);
-		await publishRoot(this.identity, request, receipt);
 		return bodyId;
 	}
 

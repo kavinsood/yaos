@@ -269,10 +269,12 @@ export function parseLifecycleReceipt(body: Record<string, unknown> | null): Lif
 }
 
 export async function postLifecycle(identity: DeviceIdentity, request: LifecycleRequest): Promise<{ result: JsonResult; receipt: LifecycleReceipt | null }> {
-	const result = await vaultJson(identity, "lifecycle", {
-		method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(request),
+	const result = await vaultJson(identity, "lifecycle/batch", {
+		method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ operations: [request] }),
 	});
-	return { result, receipt: result.response.ok ? parseLifecycleReceipt(result.body) : null };
+	const receipts = result.body?.receipts;
+	return { result, receipt: result.response.ok && Array.isArray(receipts)
+		? parseLifecycleReceipt(receipts[0] as Record<string, unknown>) : null };
 }
 
 export async function publishLifecycle(identity: DeviceIdentity, request: LifecycleRequest, receipt: LifecycleReceipt): Promise<JsonResult> {
@@ -300,23 +302,29 @@ export async function createBody(identity: DeviceIdentity, path: string, content
 	doc.getText("body").insert(0, content);
 	const update = Y.encodeStateAsUpdate(doc);
 	doc.destroy();
-	const candidateId = `candidate_${randomBytes(12).toString("hex")}`;
-	const candidateDigest = await sha256Hex(update);
-	const request: LifecycleRequest = { operationId: `create_${randomBytes(12).toString("hex")}`, kind: "create",
-		fileId: bodyId, bodyId, bodyEpoch: 1, path, candidateId, candidateDigest };
-	const admission = await postLifecycle(identity, request);
-	assert.equal(admission.result.response.status, 200, `create lifecycle admits its named candidate fence: ${JSON.stringify(admission.result.body)}`);
-	assert.ok(admission.receipt);
-	const candidate = await fetch(vaultUrl(identity, `body/${encodeURIComponent(bodyId)}/candidate`), {
-		method: "POST", headers: bearer(identity, { "content-type": "application/octet-stream", "x-yaos-candidate-id": candidateId, "x-yaos-candidate-digest": candidateDigest, "x-yaos-body-epoch": "1" }), body: update,
+	const operationId = `create_${randomBytes(12).toString("hex")}`;
+	const request: LifecycleRequest = { operationId, kind: "create", fileId: bodyId, bodyId, bodyEpoch: 1, path };
+	const current = await fetch(vaultUrl(identity, "root"), { headers: bearer(identity) });
+	assert.equal(current.status, 200);
+	const rootEpoch = Number(current.headers.get("x-yaos-root-epoch"));
+	await current.arrayBuffer();
+	const response = await fetch(vaultUrl(identity, "lifecycle/create-bulk"), {
+		method: "POST", headers: bearer(identity, { "content-type": YAOS_BINARY_CONTENT_TYPE }),
+		body: encodeBinaryEnvelope({ batchId: `batch_${randomBytes(12).toString("hex")}`, rootEpoch,
+			files: [{ operationId, bodyId, path, updates: [update] }], attachments: [] }),
 	});
-	assert.equal(candidate.status, 200, `candidate failed: ${await candidate.clone().text()}`);
-	const committed = await postLifecycle(identity, request);
-	assert.equal(committed.result.response.status, 200);
-	assert.ok(committed.receipt);
-	const published = await publishLifecycle(identity, request, committed.receipt);
-	assert.equal(published.response.status, 200, `root publication failed: ${JSON.stringify(published.body)}`);
-	return { bodyId, request, receipt: committed.receipt };
+	assert.equal(response.status, 200, `bulk create failed: ${await response.clone().text()}`);
+	const result = decodeBinaryEnvelope(new Uint8Array(await response.arrayBuffer())) as {
+		outcomes: Array<{ outcome: string; operationId: string }>; vaultSequence: number; runtimeEpoch: string;
+		vaultGeneration: string;
+	};
+	assert.equal(result.outcomes[0]?.outcome, "created", `bulk create outcome: ${JSON.stringify(result.outcomes)}`);
+	const receipt: LifecycleReceipt = {
+		vaultId: identity.vaultId, vaultGeneration: result.vaultGeneration, bodyId, bodyEpoch: 1, fileId: bodyId,
+		operationId, kind: "create", lifecycle: "active", path, durableGeneration: 1,
+		vaultSequence: result.vaultSequence, runtimeEpoch: result.runtimeEpoch,
+	};
+	return { bodyId, request, receipt };
 }
 
 export async function bodyText(identity: DeviceIdentity, bodyId: string): Promise<string> {

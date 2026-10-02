@@ -19,6 +19,7 @@ import * as behaviour from "./scenarios/behaviour";
 import * as limits from "./scenarios/limits";
 import * as extra from "./scenarios/extra";
 import * as v3 from "./scenarios/v3";
+import * as wb from "./wb/scenarios";
 
 type Scenario = (ctx: RunCtx) => Promise<Record<string, unknown>>;
 const SCENARIOS: Record<string, Scenario> = {
@@ -29,6 +30,9 @@ const SCENARIOS: Record<string, Scenario> = {
 	C2: extra.C2, C5: extra.C5, C6: extra.C6, K1: extra.K1, MB: extra.MB, CW: extra.CW,
 	CRASH: v3.CRASH, FENCE: v3.FENCE, HTTPSAVE: v3.HTTPSAVE,
 	diag: cost.diag,
+	// Write-budget spike (PHASE3-WRITE-BUDGET-SPIKE §3 W4); see wb/scenarios.ts.
+	// b3-bulk: bulk-create scenarios only (C4W/XCRASH = W1 typing, R1 = W3 merge, A1/L5R not in scope).
+	I1: wb.I1, I2: wb.I2, I3: wb.I3, I4: wb.I4,
 };
 
 /** Every socket close / error / reconnect / drop across all raw clients of this run (round-3 robustness record). */

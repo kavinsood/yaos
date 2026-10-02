@@ -17,6 +17,8 @@ export interface ServerCapabilities {
 	updateProvider: "github" | "gitlab" | "unknown" | null;
 	updateRepoUrl: string | null;
 	updateRepoBranch?: string | null;
+	/** Effective create-bulk caps; parsed tolerantly by `parseBulkCreateServerCaps` (src/sync/bulkCreateCaps.ts). */
+	bulkCreate?: { maxItems: number; maxBytes: number };
 }
 
 export async function fetchServerCapabilities(host: string, deviceToken?: string): Promise<ServerCapabilities> {
