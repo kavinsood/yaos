@@ -1,0 +1,21 @@
+scripts/relay2/lib/checks.ts
+  s_10751b4e7b6e44::t_83fd74b3a2515f 175
+tests/server/relay3-group-commit.ts
+  s_10751b4e7b6e44::t_216454d6858fbf 600-610,612,620-621,626-638,683-769,1200-1228
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "d3b4db8cf68dd5ba9db80213557533c8b5bada7d",
+  "prompts": {},
+  "sessions": {
+    "s_10751b4e7b6e44": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-abc5124919d4c6f6e",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
