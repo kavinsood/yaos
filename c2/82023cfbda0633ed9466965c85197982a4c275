@@ -1,0 +1,23 @@
+scripts/b3cpu/analyze.py
+  s_2bdf60f4c6d977::t_580bd38c1cedcb 1-27
+scripts/b3cpu/gql-front.ts
+  s_2bdf60f4c6d977::t_c0a15701f2ee2d 1-17
+scripts/relay2/gql.ts
+  s_2bdf60f4c6d977::t_4eddb899a6db4f 24
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c282023cfbda0633ed9466965c85197982a4c275",
+  "prompts": {},
+  "sessions": {
+    "s_2bdf60f4c6d977": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a6bb0187127ea11f8",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
