@@ -1,0 +1,21 @@
+src/sync/vaultSync.ts
+  s_da4ca900883079::t_006ba5c17c161f 1463-1464,3678,3700-3737
+tests/client/active-lifecycle-replay.ts
+  s_da4ca900883079::t_059367297bda77 89-138
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "557dfd32ecb6160f20496d3a0a9e9e4a9b6ac8ac",
+  "prompts": {},
+  "sessions": {
+    "s_da4ca900883079": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ad8127dcef3a8a877",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
