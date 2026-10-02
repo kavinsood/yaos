@@ -13,7 +13,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { suite } from "../harness.ts";
+import { sleep, suite } from "../harness.ts";
 import {
 	enroll,
 	orphanPids,
@@ -536,6 +536,44 @@ try {
 			+ `expected=${JSON.stringify(remoteOfflineEdit)}\n${resumedDaemon.dump()}`,
 		RECONCILE_MS,
 	));
+
+	s.section("overlap conflict copy is idempotent across daemon restarts");
+	const overlapPath = "overlap-restart.md";
+	const overlapBase = "first line\nshared middle\nlast line\n";
+	await writeFile(join(originVault, overlapPath), overlapBase, "utf8");
+	await waitFor(() => remoteEquals(requirePeer(), overlapPath, overlapBase), `remote baseline ${overlapPath}`, WATCH_MS);
+	await sleep(RECONCILE_INTERVAL_MS * 2);
+	await stopOrigin();
+	const overlapLocal = "first line\nLOCAL middle while stopped\nlast line\n";
+	const overlapRemote = "first line\nREMOTE middle while stopped\nlast line\n";
+	await writeFile(join(originVault, overlapPath), overlapLocal, "utf8");
+	await requirePeer().edit(overlapPath, overlapRemote);
+	const overlapCopies = async (): Promise<string[]> => (await listVaultFiles(originVault))
+		.filter((path) => path.startsWith("overlap-restart (YAOS conflict"));
+	const overlapDaemon = await bootOrigin("overlap restart");
+	await checked("an overlapping offline edit produces a conflict copy", () => waitFor(
+		async () => (await overlapCopies()).length > 0,
+		() => `conflict copy for ${overlapPath}\n${overlapDaemon.dump()}`,
+		RECONCILE_MS,
+	));
+	// Kill mid-reconcile (the copy was just written; its own create may still be in flight), then restart twice.
+	await overlapDaemon.stop("SIGKILL");
+	originDaemon = null;
+	await bootOrigin("overlap restart after kill");
+	await sleep(RECONCILE_INTERVAL_MS * 3);
+	await stopOrigin();
+	const overlapFinal = await bootOrigin("overlap clean restart");
+	await checked("daemon restarts never add a second conflict copy for the same divergence", () => holdFor(
+		async () => (await overlapCopies()).length === 1,
+		`exactly one conflict copy for ${overlapPath}`,
+		NEGATIVE_HOLD_MS,
+	));
+	const overlapCopyList = await overlapCopies();
+	if (overlapCopyList.length !== 1) console.log(`overlap copies: ${overlapCopyList.join(" | ")}\n${overlapFinal.dump().slice(-3000)}`);
+	// Resolve the divergence (take the remote side) so later sections see no lingering conflict.
+	await writeFile(join(originVault, overlapPath), overlapRemote, "utf8");
+	for (const copy of overlapCopyList) await rm(join(originVault, copy), { force: true });
+	await waitFor(() => remoteEquals(requirePeer(), overlapPath, overlapRemote), `resolved ${overlapPath}`, RECONCILE_MS);
 
 	s.section("dirty-local remote delete and unresolved external rename retirement");
 	const dirtyPath = "dirty-delete.md";
