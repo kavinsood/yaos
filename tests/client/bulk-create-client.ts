@@ -71,6 +71,65 @@ s.test("D5 hold: edits during an in-flight create are sent only after its receip
 	await runtime.destroy();
 });
 
+s.test("b3-int D5: typing into a new note within 50 ms of its create loses no keystroke and sends nothing before the create", async () => {
+	const vault = memoryVault();
+	const server = new FakeBulkCreateServer();
+	const runtime = runtimeFor(vault, server, { createCollectorDelayMs: 20 });
+	server.hold();
+	const typed = "Hello, new note!";
+	const started = Date.now();
+	// The first save folds away (cancelled) once later keystrokes replace it.
+	const create = runtime.commitFreshBody(input("fresh", typed.slice(0, 1))).then((value) => value, (error: unknown) => error);
+	// The editor's bind retry waits on the create; it must not resolve before the receipt.
+	let settled: boolean | null = null;
+	void runtime.whenCreateSettled("fresh.md").then((value) => { settled = value; });
+	const saves: Array<Promise<unknown>> = [];
+	const issueTimes: number[] = [];
+	// One save per keystroke, every 3 ms (all inside 50 ms): the early ones fold
+	// into the unsent create, the later ones hold behind the in-flight create.
+	for (let index = 2; index <= typed.length; index++) {
+		await new Promise((resolve) => setTimeout(resolve, 3));
+		const before = Date.now();
+		saves.push(runtime.commitFreshBody({ ...input("fresh", typed.slice(0, index)), bodyId: `body-fresh-${index}`, candidateId: `candidate-fresh-${index}` })
+			.then((value) => value, (error: unknown) => error));
+		issueTimes.push(Date.now() - before);
+	}
+	assert.ok(Date.now() - started < 200, "typing loop is not throttled");
+	assert.ok(Math.max(...issueTimes) < 5, `issuing a save never blocks (max ${Math.max(...issueTimes)} ms)`);
+	await until(() => server.calls.length === 1, { timeoutMs: 1_000, intervalMs: 1, message: "create in flight" });
+	await runtime.retryPendingCandidates();
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	assert.equal(server.candidateCalls, 0, "nothing reaches the server before the create");
+	assert.equal(settled, null, "the bind retry waits for the receipt");
+	server.release();
+	await create;
+	const outcomes = await Promise.all(saves);
+	assert.ok(outcomes.some((outcome) => !(outcome instanceof Error)), "the folded create and the held edits commit");
+	await until(() => settled !== null, { timeoutMs: 1_000, intervalMs: 1, message: "bind retry released" });
+	assert.equal(settled, true);
+	assert.equal(server.events[0], "bulk:fresh.md", "the create is the first thing the server sees");
+	assert.ok(server.events.slice(1).every((event) => event.startsWith("candidate:")));
+	assert.equal(server.calls.length, 1, "one create request");
+	assert.ok(server.candidateCalls >= 1, "some keystrokes were held behind the in-flight create (hold path exercised)");
+	assert.ok(outcomes.some((outcome) => outcome instanceof FreshAdmissionCancelledError), "some keystrokes folded into the unsent create (fold path exercised)");
+	const bodyId = runtime.getFileId("fresh.md")!;
+	assert.ok(bodyId);
+	assert.equal(server.bodyText(bodyId), typed, "every keystroke reached the server");
+	await runtime.destroy();
+});
+
+s.test("b3-int D5: whenCreateSettled is false with no pending create and after destroy", async () => {
+	const vault = memoryVault();
+	const server = new FakeBulkCreateServer();
+	const runtime = runtimeFor(vault, server, { createCollectorDelayMs: 10_000 });
+	assert.equal(await runtime.whenCreateSettled("none.md"), false);
+	const pending = runtime.commitFreshBody(input("late", "x")).catch(() => undefined);
+	const waiting = runtime.whenCreateSettled("late.md");
+	await runtime.destroy();
+	assert.equal(await waiting, false);
+	await pending;
+});
+
 s.test("mixed outcomes: exists-* route to reconcile, rejected items keep no local identity", async () => {
 	const vault = memoryVault();
 	const server = new FakeBulkCreateServer();

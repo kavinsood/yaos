@@ -214,6 +214,8 @@ export interface SyncRuntimePort {
 	clearPendingRenameTarget(path: string, bodyId?: string): void;
 	isMarkdownTombstoned(path: string): boolean;
 	acquireEditorBody?(path: string, consumerId: string): Promise<void>;
+	/** b3-int D5: resolves true once a pending create for `path` has its receipt (false: none pending / not created). */
+	whenCreateSettled?(path: string): Promise<boolean>;
 	isEditorBodyReady?(path: string, consumerId: string): boolean;
 	releaseEditorBody?(path: string, consumerId: string): void;
 	completeEditorBodyBinding?(consumerId: string): void;
@@ -561,6 +563,8 @@ interface CreateCollectorEntry {
 	input: FreshBodyCommitInput;
 	bytes: number;
 	resolve(result: BulkCreateItemResult): void;
+	/** {@link VaultSync.whenCreateSettled} waiters: woken when this entry is folded or sent. */
+	observers: Array<() => void>;
 }
 
 interface PreparedCreate {
@@ -2913,7 +2917,8 @@ export class VaultSync implements SyncRuntimePort {
 				previous.resolve({ outcome: "cancelled" });
 			}
 			const bytes = utf8ByteLength(input.content) + BULK_CREATE_ITEM_OVERHEAD_BYTES;
-			this.createCollector.set(input.path, { input, bytes, resolve });
+			this.createCollector.set(input.path, { input, bytes, resolve, observers: [] });
+			for (const wake of previous?.observers ?? []) wake();
 			this.createCollectorBytes += bytes;
 			const caps = this.bulkCreateCaps();
 			if (this.createCollector.size >= caps.maxItems
@@ -2955,6 +2960,37 @@ export class VaultSync implements SyncRuntimePort {
 				void items[index]!.then((result) => entry.resolve(result));
 			});
 		}
+		// Waiters re-check: a sent entry is now in createsInFlight, a cancelled one is gone.
+		for (const entry of entries) for (const wake of entry.observers) wake();
+	}
+
+	/**
+	 * b3-int D5: the editor of a brand-new note cannot bind before the note's
+	 * create receipt (the root catalog has no active body for it yet), but the
+	 * user keeps typing into the unbound editor: those keystrokes stay in the
+	 * editor/disk and reach the server only through the D5 fold/hold, so typing
+	 * never blocks and only sending waits. This lets the editor binding retry
+	 * the bind as soon as the create lands instead of waiting for the next
+	 * layout event. Resolves true when the path has an active body after a
+	 * pending create (folded or in flight) settled as created, or already has
+	 * one; false when nothing is pending or the create did not commit.
+	 */
+	async whenCreateSettled(path: string): Promise<boolean> {
+		for (let round = 0; round < 64; round++) {
+			if (this.destroyed) return false;
+			if (this.getFileId(path)) return true;
+			const inFlight = this.createsInFlight.get(path);
+			if (inFlight) {
+				const result = await inFlight;
+				if (result.outcome === "created") return !this.destroyed && Boolean(this.getFileId(path));
+				if (result.outcome !== "cancelled") return false;
+				continue;
+			}
+			const collected = this.createCollector.get(path);
+			if (!collected) return false;
+			await new Promise<void>((resolve) => { collected.observers.push(resolve); });
+		}
+		return false;
 	}
 
 	/**
@@ -4264,6 +4300,7 @@ export class VaultSync implements SyncRuntimePort {
 		if (this.destroyed) return;
 		this.destroyed = true;
 		for (const wake of Array.from(this.submissionWindowWakers)) wake();
+		for (const entry of this.createCollector.values()) for (const wake of entry.observers.splice(0)) wake();
 		this.residencyRuntime.stop();
 		this.workScheduler.stop();
 		this.runtimeScope.stopAdmission();

@@ -1903,9 +1903,36 @@ export class EditorBindingManager {
 					this.pendingBodyLoads.delete(leafId);
 				}
 				this.log(`bind: body load failed for "${path}" (leaf=${leafId}): ${String(error)}`);
+				this.rebindAfterPendingCreate(view, deviceName, leafId, path, error);
 			},
 		);
 		return false;
+	}
+
+	/**
+	 * b3-int D5: a brand-new note's editor fails to acquire its body until the
+	 * create receipt (no active body in the root catalog yet). Typing continues
+	 * in the unbound editor and reaches the server only through the D5 fold/hold
+	 * (disk ingest), so nothing blocks and nothing is lost; once the create
+	 * lands, bind again (the bind-divergence path reconciles any keystrokes the
+	 * created body does not have yet) instead of waiting for a layout event.
+	 */
+	private rebindAfterPendingCreate(
+		view: MarkdownView,
+		deviceName: string,
+		leafId: string,
+		path: string,
+		error: unknown,
+	): void {
+		if (!/no active body/.test(String(error))) return;
+		const wait = this.vaultSync.whenCreateSettled?.(path);
+		if (!wait) return;
+		void wait.then((created) => {
+			if (!created || view.file?.path !== path) return;
+			if (this.pendingBodyLoads.has(leafId) || this.bindings.get(leafId)?.path === path) return;
+			this.log(`bind: create for "${path}" landed; binding (leaf=${leafId})`);
+			this.bind(view, deviceName);
+		}, () => undefined);
 	}
 
 	private cancelPendingBodyLoad(leafId: string): void {
