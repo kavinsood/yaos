@@ -45,7 +45,7 @@ import { RelayBodyService } from "./relayBodies";
 import { RelayBodyStore } from "./relayBodyStore";
 import { SqlRowCounter } from "./sqlRowCounter";
 import { handleCompactionLease, handleSemanticReset, type RelayRouteDeps } from "./relayRoutes";
-import { DailyLimitLatch, dailyLimitResponse, instrumentStorageForDailyLimit } from "./dailyLimit";
+import { armAlarmUnderDailyLimit, type DailyLimitAlarmOutcome, DailyLimitLatch, dailyLimitResponse, instrumentStorageForDailyLimit } from "./dailyLimit";
 
 // Production PERSIST_DEBOUNCE_MS (250 ms) lives in testOnlyTimers.ts so the
 // test-only override can never drift from it.
@@ -226,7 +226,7 @@ export const RELAY_CRASH_RUNTIME_PATH = "/__yaos/test-only/relay-crash";
 export const SIMULATE_DAILY_LIMIT_RUNTIME_PATH = "/__yaos/test-only/simulate-daily-limit";
 
 /** D8: result of arming an alarm (`failed`: setAlarm itself hit the daily row limit). */
-type AlarmArmOutcome = "armed" | "kept" | "failed";
+type AlarmArmOutcome = DailyLimitAlarmOutcome;
 
 /** Delay before retrying a relay checkpoint pass that threw (not latched by the daily limit). */
 const RELAY_CHECKPOINT_FAILURE_BACKOFF_MS = 5_000;
@@ -1794,26 +1794,9 @@ export class VaultRuntime implements DrainPort {
 	 * unacknowledged work after the reset, which re-arms what is needed.
 	 */
 	private async setAlarmGuarded(scheduledTime: number, earliest: boolean): Promise<AlarmArmOutcome> {
-		const resetAt = this.dailyLimit.body()?.resetAt ?? null;
-		const at = resetAt === null ? scheduledTime : Math.max(scheduledTime, resetAt);
-		if (earliest || resetAt !== null) {
-			const current = await this.options.alarms.getAlarm?.();
-			if (current !== undefined && current !== null && current <= at) {
-				if (resetAt !== null) this.dailyLimitAlarmHolds++;
-				return "kept";
-			}
-		}
-		if (resetAt !== null) this.dailyLimitAlarmHolds++;
-		try {
-			await this.options.alarms.setAlarm(at);
-			return "armed";
-		} catch (error) {
-			if (this.dailyLimit.note(error)) {
-				console.warn("[yaos-vault] alarm not armed: Cloudflare daily row limit");
-				return "failed";
-			}
-			throw error;
-		}
+		const { outcome, held } = await armAlarmUnderDailyLimit(this.options.alarms, this.dailyLimit, scheduledTime, earliest, "yaos-vault");
+		if (held) this.dailyLimitAlarmHolds++;
+		return outcome;
 	}
 
 	private writeLiveCheckpoint(documentId: string): void {

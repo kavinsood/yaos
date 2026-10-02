@@ -222,3 +222,42 @@ export function instrumentStorageForDailyLimit<T extends object>(
 		},
 	});
 }
+
+/** Outcome of {@link armAlarmUnderDailyLimit}: `kept` = an earlier-or-equal alarm already stands; `failed` = setAlarm hit the limit. */
+export type DailyLimitAlarmOutcome = "armed" | "kept" | "failed";
+
+/**
+ * The one D8 alarm policy, shared by the vault runtime (`setAlarmGuarded`) and
+ * the RecoveryJob alarm port (`dailyLimitGuardedAlarms`). While the latch is
+ * active no alarm is armed before the 00:00 UTC reset (each `setAlarm` is a
+ * billed row write, and the work it schedules would fail on the same limit). An
+ * alarm already due at or before the target is kept. A `setAlarm` that itself
+ * fails on the limit is noted and dropped. `earliest` keeps an earlier standing
+ * alarm even when not latched (the vault alarm is shared by several subsystems).
+ * `held` reports whether the latch shaped this decision (vault diagnostics).
+ */
+export async function armAlarmUnderDailyLimit(
+	alarms: { setAlarm(scheduledTime: number): Promise<void>; getAlarm?(): Promise<number | null> },
+	latch: DailyLimitLatch,
+	scheduledTime: number,
+	earliest: boolean,
+	label: string,
+): Promise<{ outcome: DailyLimitAlarmOutcome; held: boolean }> {
+	const resetAt = latch.body()?.resetAt ?? null;
+	const held = resetAt !== null;
+	const at = resetAt === null ? scheduledTime : Math.max(scheduledTime, resetAt);
+	if (earliest || held) {
+		const current = await alarms.getAlarm?.();
+		if (current !== undefined && current !== null && current <= at) return { outcome: "kept", held };
+	}
+	try {
+		await alarms.setAlarm(at);
+		return { outcome: "armed", held };
+	} catch (error) {
+		if (latch.note(error)) {
+			console.warn(`[${label}] alarm not armed: Cloudflare daily row limit`);
+			return { outcome: "failed", held };
+		}
+		throw error;
+	}
+}

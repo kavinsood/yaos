@@ -82,7 +82,7 @@ import type { ActorCallPort, AlarmPort, ObjectStorePort, RecoveryRuntimeStorageP
 import { CloudflareActorCalls, CloudflareAlarmPort, CloudflareObjectStore } from "./cloudflarePorts.js";
 import { decodeBinaryEnvelope, encodeBinaryEnvelope, YAOS_BINARY_CONTENT_TYPE } from "./shared/binaryEnvelope.js";
 import { MAX_BLOB_UPLOAD_BYTES } from "./contracts.js";
-import { DAILY_LIMIT_ERROR_CODE, DailyLimitLatch, instrumentStorageForDailyLimit } from "./dailyLimit.js";
+import { armAlarmUnderDailyLimit, DAILY_LIMIT_ERROR_CODE, DailyLimitLatch, instrumentStorageForDailyLimit } from "./dailyLimit.js";
 import { MAX_RECOVERY_STATE_OBJECT_BYTES, RECOVERY_STATE_CONTENT_TYPE } from "./shared/recoveryStateObject.js";
 import {
 	RecoveryMemoryBudget,
@@ -1142,21 +1142,10 @@ class CaptureManifestStore implements ManifestNodeStore {
 export function dailyLimitGuardedAlarms(alarms: AlarmPort, latch: DailyLimitLatch): AlarmPort {
 	return {
 		async setAlarm(scheduledTime: number): Promise<void> {
-			const resetAt = latch.body()?.resetAt ?? null;
-			const at = resetAt === null ? scheduledTime : Math.max(scheduledTime, resetAt);
-			if (resetAt !== null) {
-				const current = await alarms.getAlarm?.();
-				if (current !== undefined && current !== null && current <= at) return;
-			}
-			try {
-				await alarms.setAlarm(at);
-			} catch (error) {
-				if (latch.note(error)) {
-					console.warn("[yaos-recovery-job] alarm not armed: Cloudflare daily row limit");
-					return;
-				}
-				throw error;
-			}
+			// Same policy object as the vault runtime's setAlarmGuarded (never armed
+			// before the reset while latched; a limited setAlarm is noted and dropped).
+			// Not `earliest`: the job owns its alarm and may move it later.
+			await armAlarmUnderDailyLimit(alarms, latch, scheduledTime, false, "yaos-recovery-job");
 		},
 		async deleteAlarm(): Promise<void> {
 			try {
