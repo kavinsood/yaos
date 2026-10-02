@@ -1,0 +1,27 @@
+scripts/relay2/catalog-rows-read.ts
+  s_42343c074f2618::t_12eee812cd1b3b 1-218
+server/src/relayBodyStore.ts
+  s_42343c074f2618::t_e8dec553894be3 110-116
+server/src/vaultCatalogStore.ts
+  s_42343c074f2618::t_ff10b0f489de36 206-208,214-215,218-235,239-276,280-326,346-353,358-360,925-932,938-943,948-973,1129-1241
+server/src/vaultDocumentStore.ts
+  s_42343c074f2618::t_967121236379d9 445-478,1622-1655
+tests/server/catalog-query-plans.ts
+  s_42343c074f2618::t_7bc663f316599a 1-273
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "2ad0ef1f6c0ff031071f92e719fcee69da52f415",
+  "prompts": {},
+  "sessions": {
+    "s_42343c074f2618": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a2c0077a38f8fdd35",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
