@@ -98,8 +98,9 @@ Conditions (v3):
    and are dropped at flush. Commit admitted frames at flush, or flush in `closeDevice`.
 2. **Re-run B7 serially on an idle machine (R12).** It passed 1 of 3. In one attempt Cloudflare shed the
    bystander with `1013 Service overloaded` before our rate limit closed the flooder.
-3. **Keep B5 send-coalescing off at idle = 300 ms (R13).** It multiplies commits by 3.9× and adds 250 ms to
-   propagation. Parameters stay at 300 ms idle / 1.5 s max / 64 KB.
+3. **B5 send-coalescing was measured and removed (R13).** At idle = 300 ms it gave 1.53 rows/keystroke vs 0.29
+   (v3nc) and added about 280 ms to propagation, so the client has no coalescing knob. Parameters stay at
+   300 ms idle / 1.5 s max / 64 KB.
 4. v2 conditions 3–5 still apply (receipts in `VaultSync`, which are now landed and measured in L5; reset
    starvation; receiving-side validation). v2 condition 1 (lean rows mandatory) is **retired** by v3. v3 requires
    lean rows by construction, and rows are no longer near the cap. v2 condition 2 (p99 tails) is **largely
@@ -350,8 +351,8 @@ Full design: [`relay3-group-commit.md`](relay3-group-commit.md) (code through `f
   5 s, and on reconnect. The real client sends no `candidateId` on relay-covered candidates. It confirms them with a
   synthesized receipt and falls back to HTTP at 15 s. So the realistic v3 client is the `relay-nocand` adapter (spec
   `v3nc`), which writes no receipt row.
-- **Optional B5 client send-coalescing** (`relaySendCoalesceMs`, 250 ms): the client merges updates for up to 250 ms
-  before sending.
+- **B5 client send-coalescing** (250 ms, measured as `v3b5`, since removed from client and harness): the client merged
+  updates for up to 250 ms before sending.
 
 **Rows per edit and per commit** (measured, relay3 run, deployed `yaos-relay2-v1001-*` workers, harness counters =
 `rowsWritten` diagnostics delta; gql values in section 8.8):

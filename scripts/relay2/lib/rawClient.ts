@@ -196,16 +196,6 @@ export class RawClient {
 	private userClosing = false;
 	private reconnectPromise: Promise<boolean> | null = null;
 	/**
-	 * Relay v3 B5 emulation (client send-coalescing, VaultSync `relaySendCoalesceMs`): local updates are held and
-	 * sent as ONE merged frame (Y.mergeUpdates) `coalesceMs` after the first held update (fixed timer, like
-	 * RelayReceiptChannel). The frame id is allocated at the first held update so editTracked can return it; the
-	 * edit's `sentAt` is the edit time, so propagation/ack latency include the hold. 0 = off.
-	 */
-	coalesceMs = 0;
-	private held: { clientFrameId: string; updates: Uint8Array[]; timer: ReturnType<typeof setTimeout> } | null = null;
-	coalescedFrames = 0;
-	coalescedUpdates = 0;
-	/**
 	 * Relay v3 client resend emulation (RelayReceiptChannel RECEIPT_RESEND_MS): an unacked frame whose last send is
 	 * older than `resendAfterMs` is resent (same envelope / clientFrameId) while the socket is open. 0 = off.
 	 */
@@ -222,7 +212,6 @@ export class RawClient {
 	) {
 		doc.on("update", (update: Uint8Array, origin: unknown) => {
 			if (origin === this || !this.forwardLocal) return;
-			if (this.coalesceMs > 0) { this.holdForCoalesce(update); return; }
 			// Never skip silently: sendSyncFrame queues (resilient) or counts the drop when not open.
 			if (this.socket) this.sendUpdate(update);
 		});
@@ -243,29 +232,6 @@ export class RawClient {
 		encoding.writeVarUint(e, 0);
 		syncProtocol.writeUpdate(e, update);
 		return this.sendSyncFrame("update", update, encoding.toUint8Array(e), presetFrameId);
-	}
-
-	private holdForCoalesce(update: Uint8Array) {
-		if (!this.held) {
-			const clientFrameId = `f-${randomBytes(6).toString("hex")}`;
-			this.held = { clientFrameId, updates: [], timer: setTimeout(() => this.flushCoalesced(), this.coalesceMs) };
-		}
-		this.held.updates.push(update);
-		this.lastFrame = { clientFrameId: this.held.clientFrameId, at: now(), queued: false };
-	}
-
-	/** Send the held updates now as one merged frame (timer, close, or explicit). */
-	flushCoalesced() {
-		const h = this.held;
-		if (!h) return;
-		this.held = null;
-		clearTimeout(h.timer);
-		this.coalescedFrames++;
-		this.coalescedUpdates += h.updates.length;
-		const merged = h.updates.length === 1 ? h.updates[0]! : Y.mergeUpdates(h.updates);
-		const before = this.lastFrame;
-		if (this.socket) this.sendUpdate(merged, h.clientFrameId);
-		this.lastFrame = before;
 	}
 
 	private ensureResendTimer() {
@@ -358,7 +324,6 @@ export class RawClient {
 			unacked: this.adapter.requireEcho === true ? this.outbox.size : null, queuedForNextConnection: this.adapter.requireEcho === true ? null : this.outbox.size,
 			updateFramesSent: this.updateFramesSent, nonEmptyFramesSent: this.nonEmptyFramesSent, resentFrames: this.resentFrames,
 			queuedWhileClosed: this.queuedWhileClosed, droppedWhileClosed: this.droppedWhileClosed,
-			...(this.coalesceMs > 0 ? { coalesceMs: this.coalesceMs, coalescedFrames: this.coalescedFrames, coalescedUpdates: this.coalescedUpdates } : {}),
 			...(this.resendAfterMs > 0 ? { resendAfterMs: this.resendAfterMs, timeoutResends: this.timeoutResends } : {}) };
 	}
 
@@ -520,7 +485,6 @@ export class RawClient {
 	}
 
 	async close() {
-		this.flushCoalesced();
 		if (this.resendTimer) { clearInterval(this.resendTimer); this.resendTimer = null; }
 		this.userClosing = true;
 		if (!this.socket || this.socket.readyState === WebSocket.CLOSED) return;
@@ -532,7 +496,6 @@ export class RawClient {
 	}
 
 	terminate() {
-		if (this.held) { clearTimeout(this.held.timer); this.held = null; }
 		if (this.resendTimer) { clearInterval(this.resendTimer); this.resendTimer = null; }
 		this.userClosing = true; this.socket?.terminate();
 	}

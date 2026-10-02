@@ -60,12 +60,12 @@ interface CandidateEvent { at: number; op: "put" | "confirm" | "delete"; candida
  * Base.send(data), where Base = VaultSyncOptions.webSocket. `lib/socketReceipts.ts` is that Base: passive
  * (counting only) in the base modes, and the §5.3 harness receipt client in the relay modes (see RECEIPTS.md).
  */
-// native / native250 (relay v3): the REAL VaultSync relay receipt channel (src/sync/relayReceipts.ts, client 7d70ea9;
-// candidates settle from socket receipts, HTTP only as a 15 s fallback), passive wrapper; native250 = relaySendCoalesceMs 250 (B5).
+// native (relay v3): the REAL VaultSync relay receipt channel (src/sync/relayReceipts.ts, client 7d70ea9;
+// candidates settle from socket receipts, HTTP only as a 15 s fallback), passive wrapper. (native250 = B5 send-coalescing was measured and removed.)
 // relay / relay250 disable the native channel (relayReceipts:false) so frames are not enveloped twice.
-type Mode = "prod" | "nodebounce" | "relay" | "relay250" | "native" | "native250";
-const MODES: Mode[] = ["prod", "nodebounce", "relay", "relay250", "native", "native250"];
-const DEVICE: Record<Mode, string> = { prod: "L5p", nodebounce: "L5n", relay: "L5r", relay250: "L5d", native: "L5v", native250: "L5w" };
+type Mode = "prod" | "nodebounce" | "relay" | "relay250" | "native";
+const MODES: Mode[] = ["prod", "nodebounce", "relay", "relay250", "native"];
+const DEVICE: Record<Mode, string> = { prod: "L5p", nodebounce: "L5n", relay: "L5r", relay250: "L5d", native: "L5v" };
 
 async function runMode(host: string, mode: Mode, opts: { n: number; offlineProbe: boolean; typingProbe: boolean; persist: "before-send" | "after-send"; burst: number; burstInterval: number; spacing: number; tag: string }) {
 	const { VaultSync } = await import("../../src/sync/vaultSync");
@@ -149,7 +149,6 @@ async function runMode(host: string, mode: Mode, opts: { n: number; offlineProbe
 		...(mode === "nodebounce" ? { candidateDebounceMs: 0, candidateMaxWaitMs: 0 } : {}),
 		// Relay modes: VaultSync's own HTTP candidate path is parked (10 min debounce) and stays the fallback.
 		...(relayMode ? { candidateDebounceMs: RELAY_PARKED_DEBOUNCE_MS, candidateMaxWaitMs: RELAY_PARKED_DEBOUNCE_MS, relayReceipts: false } : {}),
-		...(mode === "native250" ? { relaySendCoalesceMs: 250 } : {}),
 	});
 	vaultSync.setResidencyRuntimeContext("desktop", "foreground");
 	const createMs = r2(now() - t0);
@@ -268,7 +267,7 @@ async function runMode(host: string, mode: Mode, opts: { n: number; offlineProbe
 				await sleep(1000 / cps);
 			}
 			const typedMs = now() - t0;
-			await sleep(mode === "relay250" || mode === "native250" ? 2500 : 500);
+			await sleep(mode === "relay250" ? 2500 : 500);
 			const mine = sendLog.slice(from).filter((f) => f.bodyId === realBodyId && f.kind === "update");
 			out.push({ charsPerSec: cps, keystrokes: keys, typedMs: r2(typedMs), providerUpdateFrames: mine.length,
 				framesPerKeystroke: r2(mine.length / keys), framesPerSec: r2(mine.length / (typedMs / 1000)),
@@ -308,7 +307,7 @@ async function runMode(host: string, mode: Mode, opts: { n: number; offlineProbe
 		mode, bodyId, deviceName: DEVICE[mode],
 		debounce: mode === "prod" ? { candidateDebounceMs: "production default (250)", candidateMaxWaitMs: "production default (2000)" }
 			: mode === "nodebounce" ? { candidateDebounceMs: 0, candidateMaxWaitMs: 0 }
-			: mode === "native" || mode === "native250" ? { receiptPath: "socket (native VaultSync RelayReceiptChannel)", relaySendCoalesceMs: mode === "native250" ? 250 : 0,
+			: mode === "native" ? { receiptPath: "socket (native VaultSync RelayReceiptChannel)",
 				vaultSyncHttpPath: "production debounce; relay-covered candidates confirmed by synthesized receipt, HTTP fallback 15 s" }
 			: { receiptPath: "socket (harness receipt client)", harnessDebounceMs: mode === "relay250" ? 250 : 0, harnessMaxWaitMs: 2000,
 				vaultSyncHttpPath: `parked (candidateDebounceMs=${RELAY_PARKED_DEBOUNCE_MS}); fallback via restoreCandidates` },

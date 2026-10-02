@@ -8,7 +8,6 @@ import { OwnAwarenessProvider } from "../../src/sync/ownAwarenessProvider";
 import {
 	RECEIPT_RESEND_MAX_MS,
 	RECEIPT_RESEND_MS,
-	RELAY_SEND_COALESCE_MS,
 	RelayReceiptChannel,
 	parseSyncFrame,
 	type RelayReceiptInfo,
@@ -181,7 +180,7 @@ interface Rig {
 	destroy(): void;
 }
 
-function rig(options: { coalesceMs?: number; random?: number; receipts?: boolean } = {}): Rig {
+function rig(options: { random?: number; receipts?: boolean } = {}): Rig {
 	FakeSocket.instances = [];
 	const clock = new FakeClock();
 	const doc = new Y.Doc();
@@ -196,7 +195,6 @@ function rig(options: { coalesceMs?: number; random?: number; receipts?: boolean
 		bodyEpoch: () => 1,
 		isLocalOrigin: (origin) => provider !== null && origin !== provider,
 		receipts: options.receipts,
-		coalesceMs: options.coalesceMs ?? 0,
 		random: () => options.random ?? 0.5,
 		setTimer: (callback, delayMs) => clock.setTimer(callback, delayMs),
 		clearTimer: (handle) => clock.clearTimer(handle),
@@ -484,59 +482,13 @@ s.test("no relay capability: frames pass through unchanged, no envelopes, no re-
 	} finally { off.destroy(); }
 });
 
-s.test("B5 off (default): every update is its own frame, sent at once", async () => {
+s.test("every local update is its own frame, sent at once (no send coalescing)", async () => {
 	const r = rig();
 	try {
 		const socket = await r.connect();
 		const from = socket.sent.length;
 		for (const char of "typing") r.type(char);
 		assert.equal(readFrames(socket, from).length, 6);
-		assert.equal(r.channel.diagnostics().coalescedFrames, 0);
-	} finally { r.destroy(); }
-});
-
-s.test("B5 on: updates within the window merge into one enveloped frame; awareness is not delayed", async () => {
-	assert.equal(RELAY_SEND_COALESCE_MS, 250);
-	const r = rig({ coalesceMs: RELAY_SEND_COALESCE_MS });
-	try {
-		const socket = await r.connect();
-		const from = socket.sent.length;
-		for (const char of "typing") r.type(char);
-		r.provider.awareness.setLocalStateField("cursor", { anchor: 1 });
-		const early = readFrames(socket, from);
-		assert.deepEqual(early.map((frame) => frame.kind), ["awareness"], "awareness goes out immediately");
-		r.clock.advance(RELAY_SEND_COALESCE_MS - 1);
-		assert.equal(readFrames(socket, from).length, 1);
-		r.clock.advance(1);
-		const frames = readFrames(socket, from).filter((frame) => frame.kind === "update");
-		assert.equal(frames.length, 1);
-		assert.equal(frames[0]!.envelope!.payloadDigest, sha(frames[0]!.inner!));
-		const probe = new Y.Doc();
-		Y.applyUpdate(probe, frames[0]!.inner!);
-		assert.equal(probe.getText("body").toString(), "typing");
-		assert.equal(r.channel.diagnostics().coalescedFrames, 5);
-		receipt(socket, frames[0]!.envelope!, 2);
-		assert.equal(r.channel.confirmedSeq, r.channel.seq);
-	} finally { r.destroy(); }
-});
-
-s.test("B5 on: flush() (blur/unload) and socket close send held updates immediately", async () => {
-	const r = rig({ coalesceMs: RELAY_SEND_COALESCE_MS });
-	try {
-		const socket = await r.connect();
-		const from = socket.sent.length;
-		r.type("blur");
-		assert.equal(readFrames(socket, from).length, 0);
-		r.channel.flush();
-		assert.equal(readFrames(socket, from).length, 1);
-		r.type("close");
-		assert.equal(readFrames(socket, from).length, 1);
-		r.provider.disconnect();
-		const frames = readFrames(socket, from).filter((frame) => frame.kind === "update");
-		assert.equal(frames.length, 2, "close flushed the held update before the socket closed");
-		const probe = new Y.Doc();
-		for (const frame of frames) Y.applyUpdate(probe, frame.inner!);
-		assert.equal(probe.getText("body").toString(), "blurclose");
 	} finally { r.destroy(); }
 });
 

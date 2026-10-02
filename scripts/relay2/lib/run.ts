@@ -47,9 +47,8 @@ export function makeCtx(host: string, context: Context, args: Args, adapter: Pro
 		client: async (deviceName, bodyId, doc) => {
 			const c = new RawClient(await device(context, deviceName), bodyId, doc, adapter);
 			c.reconnect = resilient;
-			// Relay v3 harness knobs: B5 client send-coalescing (`--coalesce-ms 250`) and the client's receipt-timeout
-			// resend (`--resend-ms 5000`, RelayReceiptChannel RECEIPT_RESEND_MS). Both off by default.
-			c.coalesceMs = flagNum(args, "coalesce-ms", 0);
+			// Relay v3 harness knob: the client's receipt-timeout resend (`--resend-ms 5000`, RelayReceiptChannel
+			// RECEIPT_RESEND_MS). Off by default.
 			c.resendAfterMs = flagNum(args, "resend-ms", 0);
 			return c;
 		},

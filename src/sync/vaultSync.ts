@@ -517,7 +517,7 @@ export interface ProviderFactoryInput {
 	onClose: (event: NativeSocketClose) => void;
 	/**
 	 * Body sockets only: relay receipt tap. A provider that sends through it
-	 * gets envelopes, socket-ack receipts, re-sends and optional coalescing.
+	 * gets envelopes, socket-ack receipts, and re-sends.
 	 */
 	socketTap?: SocketTapFactory;
 }
@@ -573,13 +573,6 @@ export interface VaultSyncOptions {
 	 * true; only takes effect when the server advertises the capability.
 	 */
 	relayReceipts?: boolean;
-	/**
-	 * B5: coalesce outgoing body update frames for this many ms and send them
-	 * as one `Y.mergeUpdates` frame. 0 (default) sends every update at once.
-	 * `RELAY_SEND_COALESCE_MS` (250) is the suggested enabled value. Awareness
-	 * is never delayed; held frames flush on close, blur and unload.
-	 */
-	relaySendCoalesceMs?: number;
 	now?: () => number;
 	workClock?: OverdueWorkClock;
 	workRandom?: OverdueWorkRandom;
@@ -3417,11 +3410,6 @@ export class VaultSync implements SyncRuntimePort {
 		await this.submitPendingForBody(bodyId, mode);
 	}
 
-	/** B5: sends coalesced body updates now (window blur, plugin unload). */
-	flushRelaySends(): void {
-		for (const session of this.sessions.values()) session.relay?.flush();
-	}
-
 	/** Relay receipt counters for one body session, or null without one. */
 	getRelayReceiptDiagnostics(bodyId: string): RelayReceiptDiagnostics | null {
 		return this.sessions.get(bodyId)?.relay?.diagnostics() ?? null;
@@ -3675,7 +3663,6 @@ export class VaultSync implements SyncRuntimePort {
 			this.renameTimer = null;
 			await this.flushRenameBatch();
 		}
-		this.flushRelaySends();
 		for (const timer of this.relayFallbackTimers.values()) this.relayClock.clearTimer(timer);
 		this.relayFallbackTimers.clear();
 		for (const bodyId of Array.from(this.pendingUpdates.keys())) {
@@ -3857,7 +3844,6 @@ export class VaultSync implements SyncRuntimePort {
 				&& origin !== relayProvider.documentOrigin
 				&& !RELAY_NON_LOCAL_ORIGINS.has(origin),
 			receipts: this.options.relayReceipts !== false,
-			coalesceMs: this.options.relaySendCoalesceMs ?? 0,
 			setTimer: (callback, delayMs) => this.relayClock.setTimer(callback, delayMs),
 			clearTimer: (handle) => this.relayClock.clearTimer(handle),
 			...(this.options.workRandom ? { random: () => this.options.workRandom!.next() } : {}),
@@ -4123,7 +4109,6 @@ export class VaultSync implements SyncRuntimePort {
 		if (this.sessions.get(session.bodyId) === session) this.sessions.delete(session.bodyId);
 		this.socketLiveness.unregister(session.bodyId);
 		session.doc.off("update", session.updateObserver);
-		session.relay?.flush();
 		session.lifetimeLease.release();
 		this.terminateProvider(session.provider);
 		session.provider.destroy();

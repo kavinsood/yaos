@@ -12,8 +12,7 @@ export type SocketSendData = string | ArrayBufferLike | Blob | ArrayBufferView;
 
 /**
  * Per-socket send/receive hook. A tap owns every outgoing frame of its socket:
- * it may forward it unchanged, prefix it (relay envelopes), or hold and merge
- * it (send coalescing). `raw` returns false when the socket can no longer send.
+ * it may forward it unchanged or prefix it (relay envelopes). `raw` returns false when the socket can no longer send.
  */
 export interface SocketTap {
 	send(data: SocketSendData): void;

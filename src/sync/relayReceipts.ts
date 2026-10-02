@@ -36,8 +36,6 @@ export const RECEIPT_RESEND_MS = 5_000;
 export const RECEIPT_RESEND_MAX_MS = 60_000;
 /** Re-send delays are spread by ±20 % so reconnecting devices do not align. */
 export const RECEIPT_RESEND_JITTER_RATIO = 0.2;
-/** B5: suggested coalescing window when send coalescing is enabled (default off). */
-export const RELAY_SEND_COALESCE_MS = 250;
 /** VAULT_READY `capabilities.relayBodies` version that pairs envelopes with receipts. */
 export const RELAY_BODIES_RECEIPT_CAPABILITY = 2;
 /** Above this many unconfirmed entries the log is merged into one entry. */
@@ -70,8 +68,6 @@ export interface RelayReceiptChannelOptions {
 	readonly isLocalOrigin: (origin: unknown) => boolean;
 	/** Envelopes and receipts on (still gated by the server capability). Default true. */
 	readonly receipts?: boolean;
-	/** B5 send coalescing window; 0 or undefined disables it. */
-	readonly coalesceMs?: number;
 	readonly resendBaseMs?: number;
 	readonly resendMaxMs?: number;
 	readonly jitterRatio?: number;
@@ -93,7 +89,6 @@ export interface RelayReceiptDiagnostics {
 	envelopesSent: number;
 	receipts: number;
 	resends: { timeout: number; reconnect: number };
-	coalescedFrames: number;
 	resendAttempt: number;
 	relayActive: boolean;
 }
@@ -149,8 +144,6 @@ class RelayTap implements SocketTap {
 	syncPoint = false;
 	closed = false;
 	readonly frames: SentFrame[] = [];
-	buffer: Uint8Array[] = [];
-	bufferTimer: unknown = null;
 
 	constructor(
 		private readonly channel: RelayReceiptChannel,
@@ -159,7 +152,7 @@ class RelayTap implements SocketTap {
 
 	send(data: SocketSendData): void { this.channel.handleOutgoing(this, data); }
 	onMessage(data: unknown): void { this.channel.handleIncoming(this, data); }
-	beforeClose(): void { this.channel.flush(this); }
+	beforeClose(): void {}
 	onClose(): void { this.channel.handleClose(this); }
 }
 
@@ -173,7 +166,7 @@ export class RelayReceiptChannel {
 	private destroyed = false;
 	private lastInfo: RelayReceiptInfo | null = null;
 	private readonly stats = {
-		envelopesSent: 0, receipts: 0, timeoutResends: 0, reconnectResends: 0, coalescedFrames: 0,
+		envelopesSent: 0, receipts: 0, timeoutResends: 0, reconnectResends: 0,
 	};
 	private readonly observer = (update: Uint8Array, origin: unknown): void => {
 		if (this.destroyed || !this.options.isLocalOrigin(origin)) return;
@@ -210,7 +203,6 @@ export class RelayReceiptChannel {
 	}
 
 	private get receiptsEnabled(): boolean { return this.options.receipts !== false; }
-	private get coalesceMs(): number { return Math.max(0, this.options.coalesceMs ?? 0); }
 
 	diagnostics(): RelayReceiptDiagnostics {
 		return {
@@ -221,29 +213,13 @@ export class RelayReceiptChannel {
 			envelopesSent: this.stats.envelopesSent,
 			receipts: this.stats.receipts,
 			resends: { timeout: this.stats.timeoutResends, reconnect: this.stats.reconnectResends },
-			coalescedFrames: this.stats.coalescedFrames,
 			resendAttempt: this.resendAttempt,
 			relayActive: this.relayActive,
 		};
 	}
 
-	/** Sends any coalesced (B5) updates now: blur, close, unload, teardown. */
-	flush(tap: RelayTap | null = this.current): void {
-		if (!tap || tap.closed) return;
-		if (tap.bufferTimer !== null) {
-			this.options.clearTimer(tap.bufferTimer);
-			tap.bufferTimer = null;
-		}
-		if (tap.buffer.length === 0) return;
-		const items = tap.buffer;
-		tap.buffer = [];
-		if (items.length > 1) this.stats.coalescedFrames += items.length - 1;
-		this.emitUpdate(tap, items.length === 1 ? items[0]! : Y.mergeUpdates(items), "update");
-	}
-
 	destroy(): void {
 		if (this.destroyed) return;
-		this.flush();
 		this.destroyed = true;
 		this.options.doc.off("update", this.observer);
 		this.clearResendTimer();
@@ -259,30 +235,16 @@ export class RelayReceiptChannel {
 		}
 		const bytes = toBytes(data);
 		if (!bytes) {
-			// Text control frames keep their order relative to updates.
-			this.flush(tap);
 			tap.raw(data);
 			return;
 		}
 		const frame = parseSyncFrame(bytes);
 		if (frame.type !== MESSAGE_SYNC) {
-			// Awareness and anything else is never held behind coalesced updates.
 			tap.raw(data);
 			return;
 		}
 		if (frame.sync !== SYNC_UPDATE || !frame.inner) {
-			this.flush(tap);
 			tap.raw(data);
-			return;
-		}
-		if (this.coalesceMs > 0) {
-			tap.buffer.push(frame.inner.slice());
-			if (tap.bufferTimer === null) {
-				tap.bufferTimer = this.options.setTimer(() => {
-					tap.bufferTimer = null;
-					this.flush(tap);
-				}, this.coalesceMs);
-			}
 			return;
 		}
 		this.emitUpdate(tap, frame.inner, "update", bytes);
@@ -306,11 +268,6 @@ export class RelayReceiptChannel {
 	handleClose(tap: RelayTap): void {
 		if (tap.closed) return;
 		tap.closed = true;
-		if (tap.bufferTimer !== null) this.options.clearTimer(tap.bufferTimer);
-		tap.bufferTimer = null;
-		// Held updates stay in the unconfirmed log; the next sync point (or the
-		// next socket's step2 on a non-relay server) carries them.
-		tap.buffer = [];
 		const wasActive = tap.relay && tap.syncPoint;
 		if (this.current === tap) {
 			this.clearResendTimer();
@@ -325,9 +282,6 @@ export class RelayReceiptChannel {
 		const version = capabilities?.relayBodies;
 		if (typeof version !== "number" || version < RELAY_BODIES_RECEIPT_CAPABILITY) return;
 		tap.relay = true;
-		// Whatever is held was produced before the sync point; send it plain
-		// and let the sync-point frame cover it.
-		this.flush(tap);
 		tap.syncPoint = true;
 		if (this.unconfirmed().length > 0) {
 			this.stats.reconnectResends++;
@@ -428,7 +382,6 @@ export class RelayReceiptChannel {
 			if (this.destroyed || !tap || !this.relayActive) return;
 			if (this.unconfirmed().length === 0) return;
 			this.resendAttempt++;
-			this.flush(tap);
 			this.stats.timeoutResends++;
 			this.options.log?.(`relay receipt overdue for ${this.options.bodyId}; re-sending unconfirmed updates (attempt ${this.resendAttempt})`);
 			this.resend(tap, "timeout");

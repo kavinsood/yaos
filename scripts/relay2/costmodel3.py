@@ -8,8 +8,6 @@ Inputs (JSON object; every key optional, defaults are the f1001 / relay3 values 
   relay_rows_per_edit      relay v2 rows per keystroke (gql)
   v3_rows_per_edit         v3 rows per keystroke, real client (no candidateId; MB-v3nc-type5 gql)
   v3c_rows_per_edit        v3 rows per keystroke, harness client with candidateId (MB-v3-type5 gql)
-  v3b5_rows_per_edit       v3 + B5 send-coalesce 250 ms rows per keystroke (MB-v3b5-type5 gql)
-  v3b5_frames_per_edit     wire update frames per keystroke with B5 (MB-v3b5-type5 clientCoalesce)
   autosave_rows_per_save   v3 rows per 1 s plugin rewrite, open note (MB-v3nc-autosave gql)
   httpsave_rows_per_post   v3 rows per HTTP candidate POST, closed note (HTTPSAVE phaseLevel)
   base_autosave_rows_per_save  base rows per 1 s rewrite (inferred: one flush + one candidate POST)
@@ -36,8 +34,6 @@ DEFAULTS = {
     "relay_rows_per_edit": 5.92,       # f1001 MB-lean-mb10-stream gql
     "v3_rows_per_edit": 1.0,
     "v3c_rows_per_edit": 1.5,
-    "v3b5_rows_per_edit": 1.0,
-    "v3b5_frames_per_edit": 0.5,
     "autosave_rows_per_save": 3.0,
     "httpsave_rows_per_post": 15.0,
     "base_autosave_rows_per_save": 3.875 + 11,
@@ -67,14 +63,10 @@ def config(m: dict[str, float], name: str) -> tuple[str, dict[str, float]]:
         return "relay", {"relay_rows_per_append": m["v3_rows_per_edit"]}
     if name == "v3 (candidateId)":
         return "relay", {"relay_rows_per_append": m["v3c_rows_per_edit"]}
-    if name == "v3+B5":
-        # rows per keystroke measured; envelope + binary per WIRE frame, B5 sends fewer wire frames
-        return "relay", {"relay_rows_per_append": m["v3b5_rows_per_edit"],
-                         "relay_ws_msgs_per_frame": 2 * m["v3b5_frames_per_edit"]}
     raise KeyError(name)
 
 
-CONFIGS = ["base", "relay v2", "v3", "v3 (candidateId)", "v3+B5"]
+CONFIGS = ["base", "relay v2", "v3", "v3 (candidateId)"]  # v3+B5 measured (1.53 rows/keystroke) and removed
 
 
 def rows_per_typing_s(m: dict[str, float], name: str) -> float:

@@ -671,7 +671,6 @@ export async function MB(ctx: RunCtx): Promise<Result> {
 			ackMs: series(a.sent.filter((f) => f.kind === "update" && !f.resend).map((f) => {
 				const k = a.acks.find((x) => x.frameId === f.clientFrameId); return k ? r2(k.at - f.at) : null; }), 0),
 			ackPrefix: a.ackPrefixCheck(),
-			clientCoalesce: a.coalesceMs > 0 ? { coalesceMs: a.coalesceMs, frames: a.coalescedFrames, updates: a.coalescedUpdates } : null,
 			relayAppendsPerEdit: delta?.appends !== undefined ? r2(delta.appends / edits) : null,
 			relayCounterDelta: delta, relayBodyAfter: relayBody(d2, body), clientSide, frameOutcomes });
 		log(`MB ${p}: edits=${edits} ${JSON.stringify(parts.at(-1)!.propagationMs)}`);
