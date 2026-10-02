@@ -197,6 +197,12 @@ export interface VaultRuntimeOptions {
 	sqlRowCounter?: SqlRowCounter;
 	/** Bulk-create post-commit hook (VaultBulkCreateService.onBulkCreateCommitted); b3-recovery's R2 mirror. */
 	onBulkCreateCommitted?: (event: BulkCreateCommittedEvent) => void;
+	/**
+	 * b3 P2: project a committed bulk create's bodies to R2 right after the
+	 * receipt (best effort; the watermark alarm is the guarantee). Default on;
+	 * `false` leaves projection to the alarm alone (tests).
+	 */
+	inlineRecoveryProjection?: boolean;
 }
 
 /** Runtime paths of the experiment-only exact SQL row counter. */
@@ -313,6 +319,8 @@ export class VaultRuntime implements DrainPort {
 	private relayCheckpointAlarmArmed = false;
 	/** D8 diagnostics: alarms held back to (or not armed before) the daily-limit reset. */
 	private dailyLimitAlarmHolds = 0;
+	/** b3 P2 diagnostics: inline (post-bulk-create) recovery projection. */
+	private readonly inlineProjection = { scheduled: 0, projected: 0, skippedDailyLimit: 0 };
 
 	constructor(private readonly options: VaultRuntimeOptions) {
 		this.dailyLimit = options.dailyLimit ?? new DailyLimitLatch();
@@ -430,7 +438,16 @@ export class VaultRuntime implements DrainPort {
 		});
 		this.bulkCreate = new VaultBulkCreateService({
 			...(options.bulkCreateLimits ? { limits: options.bulkCreateLimits } : {}),
-			...(options.onBulkCreateCommitted ? { onBulkCreateCommitted: options.onBulkCreateCommitted } : {}),
+			// b3 P2: every host (Worker DO, server-node) gets the inline recovery
+			// projection; a host hook (tests, harness) runs after it. Neither may
+			// throw into the bulk service (it also guards), nor delay the receipt.
+			onBulkCreateCommitted: (event) => {
+				if (options.inlineRecoveryProjection !== false) {
+					try { this.recoveryBulkCreateCommitted(event); }
+					catch (error) { console.warn("[yaos-vault] inline recovery projection not scheduled", error); }
+				}
+				options.onBulkCreateCommitted?.(event);
+			},
 			store: this.store,
 			cache: this.cache,
 			sockets: () => this.sockets,
@@ -663,10 +680,17 @@ export class VaultRuntime implements DrainPort {
 				const authorized = this.authorize(actor, "vault.lifecycle.write");
 				if (authorized instanceof Response) return authorized;
 				if (url.pathname === "/lifecycle/create-bulk") {
-					return this.bulkCreate.handle(request, authorized, () => {
+					const response = await this.bulkCreate.handle(request, authorized, () => {
 						const attachments = this.authorize(actor, "vault.attachments.write");
 						return attachments instanceof Response ? attachments : null;
 					});
+					// D8: a limit error thrown by the commit is typed by the catch below;
+					// a 5xx the service answered itself (e.g. the root flush failed on
+					// the limit → root_persistence_unavailable) is typed here.
+					if (response.status >= 500 && this.dailyLimit.active()) {
+						return dailyLimitResponse(Date.now(), this.dailyLimit.body()?.kind);
+					}
+					return response;
 				}
 				if (url.pathname === "/lifecycle/batch") return this.lifecycle.handleBatch(request, authorized);
 				if (url.pathname === "/lifecycle/publish") return this.lifecycle.publish(request, authorized);
@@ -1084,6 +1108,13 @@ export class VaultRuntime implements DrainPort {
 	 * without R2 or after deletion.
 	 */
 	async projectRecoveryStateInline(documentIds: readonly string[]): Promise<{ projected: number; skipped: number }> {
+		// D8: while the daily row limit is latched the content-index upsert would
+		// fail (after a wasted R2 put); the watermark wake, held to the reset,
+		// projects these ids later.
+		if (this.dailyLimit.active()) {
+			this.inlineProjection.skippedDailyLimit++;
+			return { projected: 0, skipped: documentIds.length };
+		}
 		const metadata = this.store.vaultMetadata();
 		if (!this.options.objectStore || this.deleted || !metadata) return { projected: 0, skipped: documentIds.length };
 		try {
@@ -1103,8 +1134,22 @@ export class VaultRuntime implements DrainPort {
 	 */
 	recoveryBulkCreateCommitted(event: { readonly bodies: ReadonlyArray<{ readonly bodyId: string }> }): void {
 		const ids = event.bodies.map((body) => body.bodyId);
-		if (ids.length === 0 || !this.options.objectStore) return;
-		this.options.execution.waitUntil(this.projectRecoveryStateInline(ids));
+		if (ids.length === 0 || !this.options.objectStore || this.deleted) return;
+		if (this.dailyLimit.active()) {
+			// D8: skip, don't attempt-and-swallow (see projectRecoveryStateInline).
+			this.inlineProjection.skippedDailyLimit++;
+			return;
+		}
+		this.inlineProjection.scheduled++;
+		// The projection's first step (head + checkpoint read + envelope build) is
+		// synchronous; started here it would run inside the bulk-create request and
+		// delay the receipt. A macrotask lets the response go out first.
+		const task = new Promise<void>((resolve) => setTimeout(resolve, 0))
+			.then(async () => {
+				const result = await this.projectRecoveryStateInline(ids);
+				this.inlineProjection.projected += result.projected;
+			});
+		this.options.execution.waitUntil(task);
 	}
 
 	private async provision(vaultId: string, request: Request): Promise<Response> {
@@ -1507,7 +1552,8 @@ export class VaultRuntime implements DrainPort {
 			persistence: Object.fromEntries(this.persistence),
 			...(this.relay ? { relay: this.relay.diagnostics() } : {}),
 			dailyLimit: { active: this.dailyLimit.active(), resetAt: this.dailyLimit.body()?.resetAt ?? null,
-				alarmHolds: this.dailyLimitAlarmHolds } });
+				alarmHolds: this.dailyLimitAlarmHolds },
+			recoveryInlineProjection: { ...this.inlineProjection } });
 	}
 
 	private statusObject() {
