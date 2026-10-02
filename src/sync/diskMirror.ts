@@ -884,6 +884,17 @@ export class DiskMirror {
 		}
 	}
 
+	/**
+	 * True when `path` is absent on disk but the disk-index baseline says disk
+	 * last held exactly `content`: the absence is a local delete (possibly not
+	 * yet observed by a watcher), so a settle must not re-create the file.
+	 */
+	private async isUnreviewedLocalAbsence(path: string, content: string): Promise<boolean> {
+		const baseline = this.settlement?.getBaseline(path)?.contentHash ?? null;
+		if (baseline === null) return false;
+		return baseline === await contentBaselineHash(content);
+	}
+
 	private async settleBodyUnlocked(input: {
 		path: string;
 		bodyId: string;
@@ -905,6 +916,16 @@ export class DiskMirror {
 			return "preserved-unresolved";
 		}
 		if (!(existing instanceof TFile)) {
+			if (await this.isUnreviewedLocalAbsence(path, content)) {
+				// Disk last held exactly this content and the file is gone: that
+				// is a local delete awaiting review, not a missing projection.
+				// Re-creating it here would resurrect the file the user just
+				// removed (b3-int: the post-create catch-up after a bulk create
+				// landed after a local rm). Leave disk alone; the delete review
+				// publishes the tombstone, or a later settle retries.
+				this.log(`settle: "${path}" is absent but disk last held this body; not re-creating`);
+				return "preserved-unresolved";
+			}
 			const written = await this.writeSettledBody(path, null, content, isCurrent);
 			if (written !== "written") return written === "moved" ? "replan" : "preserved-unresolved";
 			this.clearPreservedUnresolved(path);

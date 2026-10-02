@@ -84,6 +84,10 @@ interface ClosedFixture {
 	setControllerScope: (scope: string | null) => void;
 	disk: () => string;
 	setDisk: (content: string) => void;
+	/** Remove the note from disk (a local rm no watcher reported). */
+	removeDisk: () => void;
+	/** Whether the note exists on disk. */
+	present: () => boolean;
 	onNextRead: (hook: (() => void) | null) => void;
 	diskIndex: () => DiskIndex;
 	ingest: (reason?: "create" | "modify") => Promise<void>;
@@ -206,6 +210,7 @@ async function closedBodyFixture(options: {
 	file.path = path;
 	Object.assign(file, { stat: { ctime: 1, mtime: 1, size: options.disk.length } });
 	let disk = options.disk;
+	let present = true;
 	let readHook: (() => void) | null = null;
 	const artifacts = new Map<string, string>();
 	const artifactWrites: string[] = [];
@@ -236,13 +241,18 @@ async function closedBodyFixture(options: {
 		},
 		modify: async (_file: TFile, content: string) => { disk = content; },
 		create: async (created: string, content: string) => {
+			if (created === path && !present) {
+				present = true;
+				disk = content;
+				return file;
+			}
 			artifacts.set(created, content);
 			artifactWrites.push(content);
 			const artifact = new TFile();
 			artifact.path = created;
 			return artifact;
 		},
-		getAbstractFileByPath: (requested: string) => requested === path ? file : null,
+		getAbstractFileByPath: (requested: string) => requested === path && present ? file : null,
 		adapter: { stat: async () => ({ mtime: 2, size: disk.length }) },
 		...(options.withProcess ? {
 			process: async (_file: TFile, fn: (data: string) => string) => {
@@ -365,6 +375,8 @@ async function closedBodyFixture(options: {
 		artifacts,
 		disk: () => disk,
 		setDisk: (content) => { disk = content; },
+		removeDisk: () => { present = false; },
+		present: () => present,
 		onNextRead: (hook) => { readHook = hook; },
 		diskIndex: () => diskIndex,
 		ingest: async (reason = "modify") => {
@@ -852,6 +864,37 @@ function beforeNextConditionalCommit(fixture: ClosedFixture, hook: () => void, s
 		return original(input);
 	};
 }
+
+s.test("b3-int: a settle never re-creates a note that disk last held with exactly that content (unreviewed local delete)", async () => {
+	// The headless "transient/slow candidate" race: a bulk create commits,
+	// the user removes the file, then the post-create catch-up settles the
+	// (unchanged) body and used to re-create the file, so the daemon never
+	// saw the absence and no delete candidate formed.
+	const fixture = await closedBodyFixture({ disk: BASE, baseline: BASE, loadBody: true, realMirror: true });
+	fixture.removeDisk();
+	const outcome = await fixture.mirror!.settleBody({ path: "Closed.md", bodyId: "body-closed", generation: 1, content: BASE });
+	assert.equal(outcome, "preserved-unresolved", "the absence is left for the delete review");
+	assert.equal(fixture.present(), false, "the removed note is not resurrected");
+	assert.equal(fixture.mirror!.isPreservedUnresolved("Closed.md"), false, "nothing blocks later ingest or delete review");
+	await fixture.destroy();
+});
+
+s.test("b3-int: a settle still materializes an absent note with no baseline, or with content disk never held", async () => {
+	const fresh = await closedBodyFixture({ disk: BASE, baseline: null, loadBody: true, realMirror: true });
+	fresh.removeDisk();
+	assert.equal(await fresh.mirror!.settleBody({ path: "Closed.md", bodyId: "body-closed", generation: 1, content: BASE }), "settled");
+	assert.equal(fresh.present(), true, "a note this disk never held is materialized");
+	assert.equal(fresh.disk(), BASE);
+	await fresh.destroy();
+
+	const moved = await closedBodyFixture({ disk: BASE, baseline: BASE, loadBody: true, realMirror: true });
+	moved.applyRemote(REMOTE);
+	moved.removeDisk();
+	assert.equal(await moved.mirror!.settleBody({ path: "Closed.md", bodyId: "body-closed", generation: 2, content: REMOTE }), "settled");
+	assert.equal(moved.present(), true, "a remote edit to a locally removed note still revives it");
+	assert.equal(moved.disk(), REMOTE);
+	await moved.destroy();
+});
 
 s.test("P0c N2: a remote edit reaching a closed body after the closed-file import decision is never diffed away", async () => {
 	// The deployed shape: git overwrote a closed note (D != B, C == B), the
