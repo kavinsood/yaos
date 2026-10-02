@@ -1,0 +1,33 @@
+src/sync/editorBinding.ts
+  s_919033a84b1dc9::t_b475d1b5b443c9 1906,1912-1937
+src/sync/vaultSync.ts
+  s_919033a84b1dc9::t_6aafba83cfa80f 217-218,566-567,2920-2921,2963-2993,4303
+tests/client/bulk-create-client.ts
+  s_da4ca900883079::t_7bf549f3fcd13c 74-132
+tests/client/editor-bind-after-create.ts
+  s_da4ca900883079::t_e2916631a04a10 1-75
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "686ca444801d5fe9c0d406837591e483f569c19e",
+  "prompts": {},
+  "sessions": {
+    "s_919033a84b1dc9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a927207854e0683fc",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_da4ca900883079": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ad8127dcef3a8a877",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
