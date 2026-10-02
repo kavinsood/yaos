@@ -107,7 +107,7 @@ s.test("a delta that drops an unrelated path or maps the created path elsewhere 
 	}
 });
 
-s.test("pure validator: unrelated blob edits and foreign blobMeta are rejected, batch paths may map an existing owner", () => {
+s.test("pure validator: unrelated blob edits and changed blobMeta are rejected; new keys and existing owners are accepted", () => {
 	const live = new Y.Doc();
 	live.getMap("pathToBlob").set("img.png", { hash: "h1", size: 1, revision: "r1" });
 	live.getMap("blobMeta").set("h1", { size: 1, mime: "image/png", createdAt: 1 });
@@ -120,12 +120,17 @@ s.test("pure validator: unrelated blob edits and foreign blobMeta are rejected, 
 	const expect = { files: [{ path: "n.md", bodyId: "mine", outcome: "exists-identical" }], attachments: [] };
 	assert.deepEqual(validateBulkCreateRootUpdate(live,
 		fork((doc) => doc.getMap("pathToId").set("n.md", "theirs")), expect), { ok: true });
-	assert.equal(validateBulkCreateRootUpdate(live,
-		fork((doc) => doc.getMap("pathToId").set("n.md", "mine")), expect).ok, false);
+	assert.deepEqual(validateBulkCreateRootUpdate(live,
+		fork((doc) => doc.getMap("pathToId").set("n.md", "mine")), expect), { ok: true },
+		"exists-identical may map this client's own body (replay after a lost response)");
 	assert.equal(validateBulkCreateRootUpdate(live,
 		fork((doc) => doc.getMap("pathToBlob").set("img.png", { hash: "h2", size: 1, revision: "r2" })), expect).ok, false);
 	assert.equal(validateBulkCreateRootUpdate(live,
-		fork((doc) => doc.getMap("blobMeta").set("h9", { size: 9, mime: "x", createdAt: 1 })), expect).ok, false);
+		fork((doc) => doc.getMap("blobMeta").set("h1", { size: 9, mime: "x", createdAt: 1 })), expect).ok, false);
+	assert.deepEqual(validateBulkCreateRootUpdate(live, fork((doc) => {
+		doc.getMap("pathToId").set("other-device.md", "theirs");
+		doc.getMap("blobMeta").set("h9", { size: 9, mime: "x", createdAt: 1 });
+	}), expect), { ok: true }, "unseen concurrent creates of new keys are accepted");
 	assert.equal(validateBulkCreateRootUpdate(live, new Uint8Array([1, 2, 3, 4, 5]), expect).ok, false);
 });
 
