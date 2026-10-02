@@ -1,5 +1,7 @@
 import { strict as assert } from "node:assert";
+import { MAX_CATCH_UP_BODIES } from "../../server/src/contracts";
 import {
+	BOOTSTRAP_BODY_BATCH_MAX,
 	BootstrapHttpPort,
 	type BootstrapHttpRequest,
 	type BootstrapHttpResponse,
@@ -140,6 +142,31 @@ s.test("oversized bootstrap batches split and a single oversized body falls back
 	assert.deepEqual(states.get("large-b")?.encodedState, new Uint8Array([4, 5, 6]));
 	assert.equal(requests.filter((entry) => entry.method === "POST").length, 3);
 	assert.equal(requests.filter((entry) => entry.method === "GET").length, 2);
+});
+
+s.test("bootstrap body and catch-up batches above the server cap are paged (260 notes)", async () => {
+	assert.equal(BOOTSTRAP_BODY_BATCH_MAX, MAX_CATCH_UP_BODIES, "client page matches the server contract cap");
+	const sizes: Array<[string, number]> = [];
+	const request = async (input: BootstrapHttpRequest): Promise<BootstrapHttpResponse> => {
+		const parsed = JSON.parse(String(input.body)) as { bodyIds?: string[]; bodies?: Array<{ bodyId: string }> };
+		const ids = parsed.bodyIds ?? parsed.bodies?.map((item) => item.bodyId) ?? [];
+		const route = input.url.endsWith("/catch-up") ? "catch-up" : "bodies";
+		sizes.push([route, ids.length]);
+		// The server answers 400 above MAX_CATCH_UP_BODIES (invalid_body_batch / invalid_catch_up_batch).
+		if (ids.length > MAX_CATCH_UP_BODIES) return response({ status: 400, json: { error: "invalid_body_batch" } });
+		const bodies = ids.map((bodyId) => route === "bodies"
+			? { bodyId, bodyEpoch: 1, generation: 1, encodedState: new Uint8Array([1]) }
+			: { bodyId, fileId: bodyId, path: `${bodyId}.md`, previousPath: null, lifecycle: "active", bodyEpoch: 1,
+				generation: 2, contentHash: "b".repeat(64), size: 1, status: 200, update: new Uint8Array([2]) });
+		return response({ arrayBuffer: encodeBinaryEnvelope({ bodies }).slice().buffer });
+	};
+	const port = new BootstrapHttpPort("https://sync.test", "vault", "token", {} as never, request);
+	const ids = Array.from({ length: 260 }, (_, index) => `note-${index}`);
+	const states = await port.bodies("boot", ids);
+	assert.equal(states.size, 260);
+	const caught = await port.catchUpBodies(ids.map((bodyId) => ({ bodyId, bodyEpoch: 1, generation: 1 })));
+	assert.equal(caught.size, 260);
+	assert.deepEqual(sizes, [["bodies", 100], ["bodies", 100], ["bodies", 60], ["catch-up", 100], ["catch-up", 100], ["catch-up", 60]]);
 });
 
 s.test("a single oversized catch-up body falls back to generation-matched raw state", async () => {

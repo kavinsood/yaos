@@ -197,6 +197,13 @@ export interface BootstrapProgressEvent {
 }
 
 const PAGE_SIZE = 1000;
+/**
+ * Per-request body cap of `POST bootstrap/:id/bodies` and `POST catch-up`
+ * (server `MAX_CATCH_UP_BODIES`; larger requests are rejected with 400).
+ * Catalog and feed pages may hold up to {@link PAGE_SIZE} entries, so body
+ * fetches are split into requests of at most this many ids.
+ */
+export const BOOTSTRAP_BODY_BATCH_MAX = 100;
 
 
 async function runBounded<T, R>(
@@ -418,6 +425,15 @@ export class BootstrapHttpPort implements BootstrapServerPort {
 
 	async bodies(bootstrapId: string, bodyIds: string[]): Promise<Map<string, ClientBodyState>> {
 		if (bodyIds.length === 0) return new Map();
+		if (bodyIds.length > BOOTSTRAP_BODY_BATCH_MAX) {
+			const out = new Map<string, ClientBodyState>();
+			for (let start = 0; start < bodyIds.length; start += BOOTSTRAP_BODY_BATCH_MAX) {
+				for (const [id, state] of await this.bodies(bootstrapId, bodyIds.slice(start, start + BOOTSTRAP_BODY_BATCH_MAX))) {
+					out.set(id, state);
+				}
+			}
+			return out;
+		}
 		const response = await this.request({
 			url: this.route(`bootstrap/${encodeURIComponent(bootstrapId)}/bodies`),
 			method: "POST",
@@ -515,6 +531,15 @@ export class BootstrapHttpPort implements BootstrapServerPort {
 		requests: Array<{ bodyId: string; bodyEpoch: SemanticEpoch; generation: number; contentHash?: string | null }>,
 	): Promise<Map<string, ClientCatchUpBody>> {
 		if (requests.length === 0) return new Map();
+		if (requests.length > BOOTSTRAP_BODY_BATCH_MAX) {
+			const out = new Map<string, ClientCatchUpBody>();
+			for (let start = 0; start < requests.length; start += BOOTSTRAP_BODY_BATCH_MAX) {
+				for (const [id, body] of await this.catchUpBodies(requests.slice(start, start + BOOTSTRAP_BODY_BATCH_MAX))) {
+					out.set(id, body);
+				}
+			}
+			return out;
+		}
 		const response = await this.request({
 			url: this.route("catch-up"),
 			method: "POST",
