@@ -28,11 +28,6 @@ export interface CaptureStartDescriptor extends DescriptorBase {
 	pinHardExpiresAt: number;
 }
 
-export interface ProjectionDescriptor extends DescriptorBase {
-	kind?: "projection";
-	leaseId: string;
-}
-
 export type RestoreSelection =
 	| { kind: "all" }
 	| { kind: "markdown-paths"; paths: string[] }
@@ -63,7 +58,6 @@ export interface PurgeDescriptor extends DescriptorBase {
 
 export type RecoveryJobDescriptor =
 	| CaptureStartDescriptor
-	| ProjectionDescriptor
 	| RestoreDescriptor
 	| GcDescriptor
 	| PurgeDescriptor;
@@ -105,7 +99,6 @@ export interface RecoveryJobStatus {
 
 export interface RecoveryJobExecutor {
 	startCapture(descriptor: CaptureStartDescriptor): Promise<JobHandle>;
-	startProjection(descriptor: ProjectionDescriptor): Promise<JobHandle>;
 	startRestore(descriptor: RestoreDescriptor): Promise<JobHandle>;
 	startGc(descriptor: GcDescriptor): Promise<JobHandle>;
 	startPurge(descriptor: PurgeDescriptor): Promise<JobHandle>;
@@ -139,7 +132,7 @@ export function recoveryJobId(
 ): string {
 	if (!isCanonicalVaultId(vaultId) || !isCanonicalVaultId(vaultGeneration)) throw new Error("invalid vault identity");
 	const identity = `${vaultId}:${vaultGeneration}`;
-	if (kind === "gc" || kind === "projection" || kind === "purge") {
+	if (kind === "gc" || kind === "purge") {
 		if (operationId !== undefined) throw new Error(`${kind} job identity has no operation suffix`);
 		return `${kind}:${identity}`;
 	}
@@ -150,7 +143,6 @@ export function recoveryJobId(
 
 function descriptorKind(descriptor: RecoveryJobDescriptor): RecoveryJobKind {
 	if ("captureId" in descriptor) return "capture";
-	if ("leaseId" in descriptor) return "projection";
 	if ("restoreId" in descriptor) return "restore";
 	if ("epoch" in descriptor) return "gc";
 	return "purge";
@@ -180,8 +172,6 @@ function validateDescriptor(descriptor: RecoveryJobDescriptor): string {
 		if (capture.pinSoftExpiresAt <= capture.createdAt || capture.pinHardExpiresAt < capture.pinSoftExpiresAt) {
 			throw new Error("invalid capture pin expiry");
 		}
-	} else if (kind === "projection") {
-		assertSafeId((descriptor as ProjectionDescriptor).leaseId, "projection lease id");
 	} else if (kind === "restore") {
 		const restore = descriptor as RestoreDescriptor;
 		assertSafeId(restore.restoreId, "restore id");
@@ -257,10 +247,6 @@ export class ActorRecoveryJobExecutor implements RecoveryJobExecutor {
 		return this.start(descriptor);
 	}
 
-	startProjection(descriptor: ProjectionDescriptor): Promise<JobHandle> {
-		return this.start(descriptor);
-	}
-
 	startRestore(descriptor: RestoreDescriptor): Promise<JobHandle> {
 		return this.start(descriptor);
 	}
@@ -294,7 +280,7 @@ export function parseRecoveryJobId(jobId: string): {
 	const segments = jobId.split(":");
 	if (segments.length < 3 || segments.length > 4) throw new Error("invalid recovery job id arity");
 	const [kindValue, vaultId, vaultGeneration, operationId] = segments;
-	if (kindValue !== "capture" && kindValue !== "projection" && kindValue !== "restore"
+	if (kindValue !== "capture" && kindValue !== "restore"
 		&& kindValue !== "gc" && kindValue !== "purge") throw new Error("invalid recovery job kind");
 	const needsOperation = kindValue === "capture" || kindValue === "restore";
 	if (needsOperation !== (operationId !== undefined)) throw new Error("invalid recovery job id arity");

@@ -12,6 +12,9 @@ import { sha256Hex } from "../../server/src/hex";
 import { blobObjectKey, recoveryPrefix } from "../../server/src/recoveryProtocol";
 import { RecoveryReadError, RecoveryReadService } from "../../server/src/recoveryReadService";
 import { FakeObjectStore } from "../mocks/workerEnv.ts";
+import * as Y from "yjs";
+import { encodeRecoveryStateObject, MAX_RECOVERY_STATE_OBJECT_BYTES } from "../../server/src/shared/recoveryStateObject";
+import { decodeRecoveryStateObject } from "../../src/snapshots/recoveryStateDecode";
 import { suite } from "../harness.ts";
 
 const s = suite("snapshot-v2-lookup");
@@ -20,6 +23,18 @@ const decoder = new TextDecoder();
 const vaultId = "vault-lookup-aa";
 const vaultGeneration = "generation-lookup-aa";
 const prefix = recoveryPrefix(vaultId, vaultGeneration);
+
+/** Format 4: content is an opaque state object the client decodes (the server never does). */
+function stateObject(text: string, contentHash: string, size: number): Uint8Array {
+	const doc = new Y.Doc();
+	doc.getText("body").insert(0, text);
+	const update = Y.encodeStateAsUpdate(doc);
+	doc.destroy();
+	return encodeRecoveryStateObject({ kind: "markdown", contentHash, size, updates: [update] });
+}
+async function decodedText(bytes: Uint8Array): Promise<string> {
+	return decoder.decode((await decodeRecoveryStateObject(bytes)).plain);
+}
 
 async function seededSnapshot() {
 	const bucket = new FakeObjectStore();
@@ -65,13 +80,13 @@ async function seededSnapshot() {
 		encodeManifestNode(prefix, { format: "yaos-manifest-leaf-v1", depth: 0, entries: [attachmentEntry] }),
 	]);
 	for (const node of [active, deleted, attachments]) bucket.objects.set(node.objectKey, node.compressedBytes);
-	bucket.objects.set(recoveryContentObjectKey(prefix, contentHash), gzipRecoveryBytes(markdown));
-	bucket.objects.set(recoveryContentObjectKey(prefix, deletedHash), gzipRecoveryBytes(deletedMarkdown));
+	bucket.objects.set(recoveryContentObjectKey(prefix, contentHash), stateObject(decoder.decode(markdown), contentHash, markdown.byteLength));
+	bucket.objects.set(recoveryContentObjectKey(prefix, deletedHash), stateObject(decoder.decode(deletedMarkdown), deletedHash, deletedMarkdown.byteLength));
 	bucket.objects.set(blobObjectKey(vaultId, vaultGeneration, attachmentHash), attachment);
-	bucket.objects.set(`${prefix}/content/sha256/ff/${"f".repeat(64)}.md.gz`, gzipRecoveryBytes(encoder.encode("unreachable")));
+	bucket.objects.set(`${prefix}/state/sha256/ff/${"f".repeat(64)}.ystate`, gzipRecoveryBytes(encoder.encode("unreachable")));
 	const rootValue: SnapshotRootV2 = {
 		format: "yaos-recovery-v2",
-		snapshotFormatVersion: 3,
+		snapshotFormatVersion: 4,
 		snapshotId: "snapshot-lookup-1",
 		vaultIdHash,
 		vaultGenerationHash,
@@ -128,7 +143,7 @@ s.test("canonical root-tree-content reads fetch only reachable verified Markdown
 	const { bucket, retained, markdown } = await seededSnapshot();
 	const reader = new RecoveryReadService(bucket, vaultId, vaultGeneration);
 	const result = await reader.activeFile(retained, "notes/reachable.md");
-	if (decoder.decode(result.bytes) !== decoder.decode(markdown)) throw new Error("reachable Markdown changed");
+	if (await decodedText(result.bytes) !== decoder.decode(markdown)) throw new Error("reachable Markdown changed");
 	if (bucket.gets.length !== 3) throw new Error(`reader used ${bucket.gets.length} reads instead of root, node, content`);
 	if (bucket.gets.some((key) => key.includes("f".repeat(64)))) throw new Error("reader fetched unreachable content");
 	if (await reader.activeEntry(retained, "notes/missing.md") !== null) throw new Error("missing path resolved to another entry");
@@ -139,7 +154,7 @@ s.test("deleted and attachment paths use their own verified trees and storage do
 	const reader = new RecoveryReadService(bucket, vaultId, vaultGeneration);
 	const deleted = await reader.deletedFile(retained, "deleted-body-1");
 	const binary = await reader.file(retained, "assets/reachable.bin");
-	if (decoder.decode(deleted.bytes) !== decoder.decode(deletedMarkdown)) throw new Error("deleted content changed");
+	if (await decodedText(deleted.bytes) !== decoder.decode(deletedMarkdown)) throw new Error("deleted content changed");
 	if (binary.contentType !== "application/octet-stream" || binary.bytes.join(",") !== attachment.join(",")) {
 		throw new Error("attachment read changed bytes or MIME");
 	}
@@ -189,11 +204,16 @@ s.test("missing, oversized, unavailable, and hash-mismatched content are explici
 	if ((await readError(() => reader.activeFile(retained, active.path))).code !== "recovery_object_missing") {
 		throw new Error("missing content was not explicit");
 	}
-	bucket.objects.set(contentKey, gzipRecoveryBytes(encoder.encode("same-size-wrong-content")));
-	const mismatch = await readError(() => reader.activeFile(retained, active.path));
-	if (mismatch.code !== "snapshot_content_corrupt" && mismatch.code !== "snapshot_content_hash_mismatch") {
-		throw new Error("content corruption was not explicit");
+	bucket.objects.set(contentKey, new Uint8Array(MAX_RECOVERY_STATE_OBJECT_BYTES + 1));
+	if ((await readError(() => reader.activeFile(retained, active.path))).code !== "recovery_object_too_large") {
+		throw new Error("oversized content object was not explicit");
 	}
+	// The server is opaque: a state object that decodes to other text is served as stored,
+	// and the client's decode + sha256 check is what reports it (content_corrupt).
+	bucket.objects.set(contentKey, stateObject("same-size-wrong-content", active.contentHash, active.size));
+	const served = await reader.activeFile(retained, active.path);
+	const plain = (await decodeRecoveryStateObject(served.bytes)).plain;
+	if (await sha256Hex(plain) === active.contentHash) throw new Error("wrong content passed the client hash check");
 });
 
 await s.done();

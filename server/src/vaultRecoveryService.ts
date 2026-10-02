@@ -1,3 +1,4 @@
+import { materializeCaptureState, type CaptureStateResult } from "./recoveryStateProjection";
 import { bytesToBase64Url } from "./base64url";
 import { sha256Hex } from "./hex";
 import type { VaultStore } from "./vaultStore";
@@ -11,7 +12,6 @@ import {
 	MAX_DEFECTS_PER_CALL,
 	MAX_LEASE_KEYS,
 	MAX_RECIPE_BODIES,
-	MAX_RECIPE_BYTES,
 	RECOVERY_RPC_HEADER,
 	RECOVERY_DELTA_DIGEST_SEED,
 	RECOVERY_PLAN_DIGEST_SEED,
@@ -19,7 +19,6 @@ import {
 	contentObjectKey,
 	manifestObjectKey,
 	snapshotRootObjectKey,
-	type BodyRecipeDescriptor,
 	type CaptureDescriptor,
 	type CapturePlanEntry,
 	type CapturePlanRequest,
@@ -41,13 +40,6 @@ import {
 	type ManifestNodeMaterialized,
 	type MaterializationLease,
 	type MaterializationLeaseRequest,
-	type RecipeChunk,
-	type ProjectionLease,
-	type ProjectionRecipeRequest,
-	type ProjectionWorkPage,
-	type ProjectionWorkPageRequest,
-	type RecipeChunkRequest,
-	type RecipeDescriptorRequest,
 	type RecordRecoveryDefectsRequest,
 	type RecoveryJobLeaseRequest,
 	type RecoveryJobLeaseStatus,
@@ -100,18 +92,9 @@ export class VaultRecoveryService {
 	private get store(): VaultStore { return this.options.store(); }
 	private get runtimeEpoch(): string { return this.options.runtimeEpoch; }
 	private flushLoadedDocuments(): Promise<void> { return this.options.flushLoadedDocuments(); }
-	async initializeProjection(vaultId: string): Promise<void> {
-		await this.ensureRecoveryProjection(vaultId);
-	}
-
 	async startRecoveryCapture(input: StartCaptureRequest): Promise<CaptureStarted> {
 
 		if (this.store.vaultMetadata()?.vaultId !== input.vaultId) throw new Error("vault identity mismatch");
-		try {
-			await this.ensureRecoveryProjection(input.vaultId);
-		} catch (error) {
-			console.warn("[yaos-vault] recovery projection refresh failed", errorMessage(error));
-		}
 		if (!this.objectStore) throw new Error("recovery storage unavailable");
 		this.store.reapExpiredRecoveryCaptures();
 		const gc = this.store.latestGcEpoch();
@@ -356,36 +339,12 @@ export class VaultRecoveryService {
 		return { ...canonical, casHints, pageHash, planDigest };
 	}
 
-	async getRecipeDescriptors(request: RecipeDescriptorRequest): Promise<BodyRecipeDescriptor[]> {
-		const capture = await this.assertCaptureAuthority(request);
-		if (request.entries.length > MAX_RECIPE_BODIES) throw new Error("recipe descriptor batch too large");
-		return request.entries.map((entry) => this.store.bindRecipe(
-			capture.captureId,
-			entry.bodyId,
-			entry.generation,
-			`${capture.captureId}:${entry.bodyId}:${entry.generation}`,
-		));
-	}
-
-	async getRecipeChunk(request: RecipeChunkRequest): Promise<RecipeChunk> {
-		await this.assertCaptureAuthority(request);
-		if (!Number.isSafeInteger(request.maxResponseBytes) || request.maxResponseBytes <= 0 || request.maxResponseBytes > MAX_RECIPE_BYTES) {
-			throw new Error("invalid recipe byte bound");
-		}
-		const chunk = this.store.rawRecipeChunk(request.recipeId, request.cursor, request.maxResponseBytes);
-		if (chunk.encodedBytes > MAX_RECIPE_BYTES) throw new Error("durable update exceeds recipe hard bound");
-		return { recipeId: request.recipeId, cursor: request.cursor, ...chunk };
-	}
-
 	async acquireMaterializationLease(request: MaterializationLeaseRequest): Promise<MaterializationLease> {
 		if (request.objectKeys.length === 0 || request.objectKeys.length > MAX_LEASE_KEYS || new Set(request.objectKeys).size !== request.objectKeys.length) {
 			throw new Error("invalid materialization lease keys");
 		}
-		if (request.ownerKind === "capture") {
-			await this.assertCaptureAuthority({ captureId: request.ownerId, capability: request.capability });
-		} else {
-			await this.assertProjectionAuthority(request.ownerId, request.capability);
-		}
+		if (request.ownerKind !== "capture") throw new Error("invalid materialization lease owner");
+		await this.assertCaptureAuthority({ captureId: request.ownerId, capability: request.capability });
 		const ttl = Math.min(KEY_LEASE_TTL_MS, Math.max(1_000, request.ttlMs ?? KEY_LEASE_TTL_MS));
 		return this.store.acquireMaterializationLease({
 			leaseId: crypto.randomUUID(),
@@ -399,13 +358,6 @@ export class VaultRecoveryService {
 	async releaseMaterializationLease(leaseId: string): Promise<void> {
 		if (!leaseId) throw new Error("invalid lease ID");
 		this.store.releaseKeyLease(leaseId);
-	}
-
-	async acknowledgeContentMaterialized(request: ContentMaterialized): Promise<void> {
-		const capture = await this.assertCaptureAuthority(request);
-		if (request.objectKey !== contentObjectKey(capture.vaultId, capture.vaultGeneration, request.contentHash)) throw new Error("invalid content object key");
-		if (!this.store.hasMaterializationLease(capture.captureId, request.objectKey)) throw new Error("content materialization lease missing");
-		this.store.recordContentMaterialized({ ...request });
 	}
 
 	async acknowledgeManifestNodeMaterialized(request: ManifestNodeMaterialized): Promise<void> {
@@ -442,193 +394,21 @@ export class VaultRecoveryService {
 	}
 
 
-	async rotateRecoveryProjectionLease(input: { vaultId: string; enabled: boolean; ttlMs?: number }): Promise<{
-		lease: ProjectionLease; capability: string;
-	}> {
-		if (this.store.vaultMetadata()?.vaultId !== input.vaultId) throw new Error("vault identity mismatch");
-		const capability = bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)));
-		const capabilityHash = await sha256Hex(new TextEncoder().encode(capability));
-		const leaseId = crypto.randomUUID();
-		const now = Date.now();
-		const expiresAt = now + Math.min(CAPTURE_HARD_TTL_MS, Math.max(60_000, input.ttlMs ?? CAPTURE_HARD_TTL_MS));
-		this.store.rotateProjectionLease({
-
-			vaultId: input.vaultId,
-			vaultGeneration: this.requireVaultGeneration(input.vaultId),
-			leaseId,
-			capabilityHash,
-			expiresAt,
-			runtimeEpoch: this.runtimeEpoch,
-			enabled: input.enabled,
-			now,
-		});
-		return {
-			lease: {
-				vaultId: input.vaultId,
-				vaultGeneration: this.requireVaultGeneration(input.vaultId),
-				leaseId,
-				capabilityHash,
-				expiresAt,
-				enabled: input.enabled,
-				runtimeEpoch: this.runtimeEpoch,
-			},
-			capability,
-		};
-	}
-	private async ensureRecoveryProjection(vaultId: string): Promise<void> {
-		if (!this.objectStore) return;
-		const jobId = recoveryJobId("projection", vaultId, this.requireVaultGeneration(vaultId));
-		const initialized = await this.recoveryJobJson<
-			{ initialized: false } | {
-				initialized: true;
-				jobId: string;
-				kind: string;
-				capabilityHash: string;
-				capabilityExpiresAt: number | null;
-			}
-		>(vaultId, jobId, "/__yaos/recovery-job/initialization", "GET");
-		const current = this.store.projectionLease();
-		const now = Date.now();
-		if (
-			initialized.initialized
-			&& initialized.jobId === jobId
-			&& initialized.kind === "projection"
-			&& current?.enabled
-			&& current.expiresAt > now + 60_000
-			&& initialized.capabilityHash === current.capabilityHash
-		) {
-			const status = await this.recoveryJobJson<{ state: string }>(
-				vaultId,
-				jobId,
-				"/__yaos/recovery-job/status",
-				"GET",
-			);
-			if (status.state !== "failed" && status.state !== "cancelled") {
-				await this.recoveryJobJson(
-					vaultId,
-					jobId,
-					"/__yaos/recovery-job/projection/wake",
-					"POST",
-				);
-				return;
-			}
-		}
-		const rotated = await this.rotateRecoveryProjectionLease({
-			vaultId,
-			enabled: true,
-			ttlMs: CAPTURE_HARD_TTL_MS,
-		});
-		const descriptor = {
-			jobId,
-			vaultId,
-			vaultGeneration: this.requireVaultGeneration(vaultId),
-			createdAt: now,
-			capability: rotated.capability,
-			capabilityExpiresAt: rotated.lease.expiresAt,
-			leaseId: rotated.lease.leaseId,
-		};
-		await this.recoveryJobJson(
-			vaultId,
-			jobId,
-			initialized.initialized
-				? "/__yaos/recovery-job/projection/refresh"
-				: "/__yaos/recovery-job/initialize",
-			"POST",
-			descriptor,
-		);
+	/**
+	 * Capture fallback (b3 P2): the content at the capture boundary was not
+	 * projected yet. The vault builds the opaque state object from its stored
+	 * recipe, puts it and records it; the job never reads or decodes history.
+	 */
+	async materializeCaptureContent(request: {
+		captureId: string; boundarySequence: number; capability: string; bodyId: string; generation: number;
+	}): Promise<CaptureStateResult> {
+		const capture = await this.assertCaptureAuthority(request);
+		if (!this.objectStore) throw new Error("recovery storage unavailable");
+		return materializeCaptureState({
+			store: this.store, objectStore: this.objectStore, vaultId: capture.vaultId, vaultGeneration: capture.vaultGeneration,
+		}, { captureId: capture.captureId, documentId: request.bodyId, generation: request.generation });
 	}
 
-	async getProjectionWorkPage(request: ProjectionWorkPageRequest): Promise<ProjectionWorkPage> {
-		await this.assertProjectionAuthority(request.leaseId, request.capability);
-		if (this.store.vaultMetadata()?.vaultId !== request.vaultId) throw new Error("vault identity mismatch");
-		if (request.maxEntries <= 0 || request.maxEntries > MAX_CAPTURE_PLAN_ENTRIES
-			|| request.maxResponseBytes <= 0 || request.maxResponseBytes > MAX_CAPTURE_PLAN_BYTES) {
-			throw new Error("invalid projection work bounds");
-		}
-		const boundary = this.store.currentSequence();
-		const scanned = this.store.listActiveCatalogAt(boundary, request.cursor ?? "", request.maxEntries + 1);
-		const page = scanned.slice(0, request.maxEntries);
-		const hashes = page.flatMap((entry) => entry.contentHash ? [entry.contentHash] : []);
-		const missing = new Set(this.store.missingIndexedContent(hashes));
-		const entries = page.flatMap((entry) => {
-			if (entry.contentHash === null || entry.size === null) throw new Error("projection catalog identity missing");
-			return missing.has(entry.contentHash) ? [{
-				bodyId: entry.bodyId, generation: entry.generation, contentHash: entry.contentHash, size: entry.size,
-			}] : [];
-		});
-		if (recoveryCanonicalJsonBytes(entries).byteLength > request.maxResponseBytes) throw new Error("projection work page exceeds byte bound");
-		const terminal = scanned.length <= request.maxEntries;
-		return { entries, nextCursor: terminal ? null : page.at(-1)!.bodyId, terminal };
-	}
-
-	async checkProjectionLease(
-		request: { vaultId: string; vaultGeneration: string; leaseId: string; capability: string },
-	): Promise<ProjectionLease> {
-		if (this.store.vaultMetadata()?.vaultId !== request.vaultId) throw new Error("vault identity mismatch");
-		await this.assertProjectionAuthority(request.leaseId, request.capability);
-		const lease = this.store.projectionLease()!;
-		return { vaultId: request.vaultId, ...lease };
-	}
-
-	async getProjectionRecipeDescriptor(request: ProjectionRecipeRequest): Promise<BodyRecipeDescriptor> {
-		await this.assertProjectionAuthority(request.leaseId, request.capability);
-		if (this.store.vaultMetadata()?.vaultId !== request.vaultId) throw new Error("vault identity mismatch");
-		const boundary = this.store.currentSequence();
-		const head = this.store.getCatalogHeadAt(boundary, request.bodyId);
-		const durableHead = this.store.documentHead(request.bodyId);
-		if (!head || head.lifecycle !== "active" || !durableHead || durableHead.generation !== request.expectedHeadGeneration
-			|| head.generation !== request.expectedHeadGeneration || head.contentHash === null || head.size === null) {
-			throw new Error("projection head superseded");
-		}
-		return {
-			recipeId: `projection:${request.leaseId}:${request.bodyId}:${request.expectedHeadGeneration}:${boundary}`,
-			bodyId: request.bodyId,
-			generation: request.expectedHeadGeneration,
-			expectedContentHash: head.contentHash,
-			expectedSize: head.size,
-			encodedHistoryBytes: this.store.documentEncodedHistoryBytes(request.bodyId, boundary),
-			firstCursor: "0",
-		};
-	}
-
-	async getProjectionRecipeChunk(request: ProjectionRecipeRequest & {
-		recipeId: string; cursor: string; maxResponseBytes: number;
-	}): Promise<RecipeChunk> {
-		await this.assertProjectionAuthority(request.leaseId, request.capability);
-		if (request.maxResponseBytes <= 0 || request.maxResponseBytes > MAX_RECIPE_BYTES) throw new Error("invalid recipe byte bound");
-		const parts = request.recipeId.split(":");
-		const boundary = Number(parts.at(-1));
-		const generation = Number(parts.at(-2));
-		if (!Number.isSafeInteger(boundary) || !Number.isSafeInteger(generation)
-			|| generation !== request.expectedHeadGeneration
-			|| request.recipeId !== `projection:${request.leaseId}:${request.bodyId}:${generation}:${boundary}`) {
-			throw new Error("invalid projection recipe");
-		}
-		const head = this.store.getCatalogHeadAt(this.store.currentSequence(), request.bodyId);
-		if (!head || head.lifecycle !== "active" || head.generation !== generation) throw new Error("projection head superseded");
-		const chunk = this.store.rawDocumentRecipeChunk(request.bodyId, boundary, request.cursor, request.maxResponseBytes);
-		return { recipeId: request.recipeId, cursor: request.cursor, ...chunk };
-	}
-
-	async acknowledgeProjectionContentMaterialized(request: ProjectionRecipeRequest & {
-		contentHash: string; plainBytes: number; objectKey: string;
-	}): Promise<void> {
-		await this.assertProjectionAuthority(request.leaseId, request.capability);
-		const head = this.store.getCatalogHeadAt(this.store.currentSequence(), request.bodyId);
-		if (!head || head.lifecycle !== "active" || head.generation !== request.expectedHeadGeneration
-			|| head.contentHash !== request.contentHash || head.size !== request.plainBytes
-			|| request.objectKey !== contentObjectKey(request.vaultId, request.vaultGeneration, request.contentHash)) {
-			throw new Error("projection materialization superseded or mismatched");
-		}
-		if (!this.store.hasMaterializationLease(request.leaseId, request.objectKey)) throw new Error("projection materialization lease missing");
-		const gc = this.store.latestGcEpoch();
-		this.store.recordProjectedContent(
-			request.contentHash,
-			request.objectKey,
-			request.plainBytes,
-			gc?.state === "sweeping" ? gc.epoch : null,
-		);
-	}
 	async getIncrementalBase(request: RecoveryJobLeaseRequest): Promise<IncrementalBase | null> {
 		const capture = await this.assertCaptureAuthority(request);
 		if (!capture.baseSnapshotId) return null;
@@ -1018,17 +798,11 @@ export class VaultRecoveryService {
 
 	async getRecoveryStatus(input: { vaultId: string }): Promise<unknown> {
 		if (this.store.vaultMetadata()?.vaultId !== input.vaultId) throw new Error("vault identity mismatch");
-		try {
-			await this.ensureRecoveryProjection(input.vaultId);
-		} catch (error) {
-			console.warn("[yaos-vault] recovery projection status refresh failed", errorMessage(error));
-		}
 		const active = this.store.activeRecoveryCapture();
 		const snapshots = this.store.listSnapshots(null, 1000);
 		const latest = [...snapshots].sort((left, right) => right.completedAt - left.completedAt)[0] ?? null;
 		const historyPins = this.store.historyPinHealth();
 		const oldestPin = [...historyPins.pins].sort((left, right) => right.ageMs - left.ageMs)[0] ?? null;
-		const projectionLease = this.store.projectionLease();
 		type ProjectionStatusView = {
 			state: string;
 			processedEntries: number;
@@ -1037,31 +811,19 @@ export class VaultRecoveryService {
 			lagSequences: number;
 			lastProgressAt: number | null;
 		};
+		// b3 P2: the vault-side state projection's watermark; two point reads plus one
+		// LIMIT 1 probe per change source, never a catalog scan.
 		let projectionStatus: ProjectionStatusView | null = null;
-		if (projectionLease) {
-			let rawStatus: { state: string; updatedAt: number } | null = null;
-			try {
-				rawStatus = await this.recoveryJobJson<{ state: string; updatedAt: number }>(
-					input.vaultId,
-					recoveryJobId("projection", input.vaultId, this.requireVaultGeneration(input.vaultId)),
-					"/__yaos/recovery-job/status",
-					"GET",
-				);
-			} catch {
-				rawStatus = null;
-			}
+		if (this.objectStore) {
 			const summary = this.store.recoveryProjectionSummary();
+			const owed = summary.pendingDocuments + (summary.lagSequences > 0 ? 1 : 0);
 			projectionStatus = {
-				state: !projectionLease.enabled
-					? "paused"
-					: summary.remainingEntries === 0
-						? "ready"
-						: rawStatus?.state ?? "queued",
-				processedEntries: summary.totalEntries - summary.remainingEntries,
-				totalEntries: summary.totalEntries,
-				remainingEntries: summary.remainingEntries,
+				state: owed === 0 ? "ready" : "queued",
+				processedEntries: 0,
+				totalEntries: 0,
+				remainingEntries: summary.pendingDocuments,
 				lagSequences: summary.lagSequences,
-				lastProgressAt: rawStatus?.updatedAt ?? null,
+				lastProgressAt: summary.updatedAt,
 			};
 		}
 		const storageAvailable = this.objectStore !== undefined;
@@ -1335,16 +1097,6 @@ export class VaultRecoveryService {
 		const capabilityHash = await sha256Hex(new TextEncoder().encode(request.capability));
 		if (capabilityHash !== capture.capabilityHash) throw new Error("capture capability mismatch");
 		return capture;
-	}
-
-	private async assertProjectionAuthority(leaseId: string, capability: string): Promise<void> {
-		const lease = this.store.projectionLease();
-		if (!lease || !lease.enabled || lease.leaseId !== leaseId || lease.expiresAt <= Date.now()) {
-			throw new Error("projection authority expired");
-		}
-		if (await sha256Hex(new TextEncoder().encode(capability)) !== lease.capabilityHash) {
-			throw new Error("projection capability mismatch");
-		}
 	}
 
 	private requireVaultGeneration(vaultId: string): string {

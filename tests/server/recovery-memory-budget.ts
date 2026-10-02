@@ -2,11 +2,11 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { gzipSync } from "fflate";
 
 import { NodeSqliteStorage } from "../../packages/server-node/src/storage";
 import { encodeHashedRecoveryObject } from "../../server/src/recoveryCanonicalJson";
-import { assertRecoveryRecipeChunkAccounting, RecoveryJobRuntime } from "../../server/src/recoveryJob";
+import { RecoveryJobRuntime } from "../../server/src/recoveryJob";
+import { encodeRecoveryStateObject, MAX_RECOVERY_STATE_OBJECT_BYTES, RECOVERY_STATE_CONTENT_TYPE } from "../../server/src/shared/recoveryStateObject";
 import { RecoveryJobStateStore } from "../../server/src/recoveryJobState";
 import { recoveryContentObjectKey, recoveryV2Prefix } from "../../server/src/recoveryManifestTree";
 import {
@@ -67,23 +67,6 @@ s.test("reconstruction reservation accounts for complete-state allocations", () 
 	assert.throws(() => new RecoveryMemoryBudget().reserve("saturated", saturated), RecoveryMemoryOperationTooLargeError);
 });
 
-s.test("recipe byte declarations and durable row bounds are exact", () => {
-	const valid = {
-		recipeId: "recipe",
-		cursor: "0",
-		nextCursor: null,
-		parts: [{ kind: "journal" as const, sequence: 1, fragmentIndex: 0, fragmentCount: 1, bytes: Uint8Array.of(1, 2, 3) }],
-		encodedBytes: 3,
-	};
-	assert.doesNotThrow(() => assertRecoveryRecipeChunkAccounting(valid));
-	assert.throws(() => assertRecoveryRecipeChunkAccounting({ ...valid, encodedBytes: 2 }), /declaration mismatch/u);
-	assert.throws(() => assertRecoveryRecipeChunkAccounting({
-		...valid,
-		parts: [{ ...valid.parts[0]!, bytes: new Uint8Array(1_750_001) }],
-		encodedBytes: 1_750_001,
-	}), /durable row bound/u);
-});
-
 s.test("canonical recovery objects reject oversized output before publication", async () => {
 	await assert.rejects(
 		encodeHashedRecoveryObject(["x".repeat(1024)], { canonicalBytes: 100, compressedBytes: 100 }),
@@ -108,50 +91,7 @@ s.test("SQLite reconstruction stats do not materialize BLOB payloads", async () 
 	}
 });
 
-s.test("oversized reconstruction is rejected before object storage, RPC, or Yjs", async () => {
-	const directory = await mkdtemp(join(tmpdir(), "yaos-recovery-preflight-"));
-	const storage = NodeSqliteStorage.open(join(directory, "state.sqlite"));
-	const bucket = new FakeObjectStore();
-	const runtime = new RecoveryJobRuntime({
-		storage,
-		alarms: { setAlarm: async () => {}, deleteAlarm: async () => {} },
-		objectStore: bucket,
-		recoveryAuthority: { call: async () => { throw new Error("RPC must not run"); } },
-		controlPlane: { call: async () => { throw new Error("unused"); } },
-	});
-	type Harness = {
-		advanceCaptureReconstruction(descriptor: unknown, authority: unknown, entry: unknown, reconstruction: unknown): Promise<boolean>;
-	};
-	let recipeCalls = 0;
-	try {
-		await assert.rejects((runtime as unknown as Harness).advanceCaptureReconstruction(
-			{
-				vaultId: "vault-preflight-aa", vaultGeneration: "generation-preflight-aa",
-				captureId: "capture", snapshotId: "snapshot", boundarySequence: 1, rootGeneration: 1,
-				runtimeEpoch: "epoch", reason: "manual", createdAt: 1, capability: "capability",
-				capabilityExpiresAt: 2, pinSoftExpiresAt: 2, pinHardExpiresAt: 2,
-			},
-			{ getRecipeChunk: async () => { recipeCalls++; throw new Error("unreachable"); } },
-			{
-				kind: "active", bodyId: "body", fileId: "file", canonicalPath: "Large.md",
-				generation: 1, contentHash: "a".repeat(64), size: 1_500_000,
-			},
-			{
-				bodyId: "body", generation: 1, recipeId: "recipe", expectedContentHash: "a".repeat(64),
-				expectedSize: 1_500_000, cursor: "0", stagingKey: null, stagingHash: null,
-				stagingBytes: 0, expectedHistoryBytes: 30 * 1024 * 1024, encodedBytes: 0, attempts: 0,
-			},
-		), /memory budget/u);
-		assert.equal(recipeCalls, 0);
-		assert.deepEqual(bucket.heads, []);
-		assert.deepEqual(bucket.gets, []);
-	} finally {
-		storage.close();
-		await rm(directory, { recursive: true, force: true });
-	}
-});
-
-s.test("Canvas restore reads and decompresses recovery content, with head-before-get", async () => {
+s.test("Canvas restore serves the opaque state object bounded, with head-before-get", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "yaos-recovery-canvas-"));
 	const storage = NodeSqliteStorage.open(join(directory, "state.sqlite"));
 	const bucket = new FakeObjectStore();
@@ -178,7 +118,8 @@ s.test("Canvas restore reads and decompresses recovery content, with head-before
 		const bytes = new TextEncoder().encode('{"edges":[],"nodes":[]}');
 		const hash = await sha256Hex(bytes);
 		const key = recoveryContentObjectKey(recoveryV2Prefix(vaultGenerationPrefix("vault-canvas-aa", "generation-canvas-aa")), hash);
-		bucket.objects.set(key, gzipSync(bytes, { level: 6 }));
+		const object = encodeRecoveryStateObject({ kind: "canvas", contentHash: hash, size: bytes.byteLength, updates: [new Uint8Array([1, 2, 3])] });
+		bucket.objects.set(key, object);
 		(runtime as unknown as Harness).store.putRestoreItems([{
 			itemId: "canvas-item",
 			cursorOrder: 1,
@@ -192,11 +133,13 @@ s.test("Canvas restore reads and decompresses recovery content, with head-before
 		}]);
 		const response = await runtime.getItemContent({ itemId: "canvas-item" });
 		assert.equal(response.status, 200);
-		assert.equal(response.headers.get("content-type"), "application/json");
-		assert.deepEqual(new Uint8Array(await response.arrayBuffer()), bytes);
+		assert.equal(response.headers.get("content-type"), RECOVERY_STATE_CONTENT_TYPE);
+		assert.equal(response.headers.get("x-yaos-content-sha256"), hash);
+		assert.equal(response.headers.get("x-yaos-content-size"), String(bytes.byteLength));
+		assert.deepEqual(new Uint8Array(await response.arrayBuffer()), object, "the server must serve the stored bytes without decoding");
 		assert.deepEqual(bucket.heads, [key]);
 		assert.deepEqual(bucket.gets, [key]);
-		bucket.objects.set(key, new Uint8Array(4 * 1024 * 1024 + 1));
+		bucket.objects.set(key, new Uint8Array(MAX_RECOVERY_STATE_OBJECT_BYTES + 1));
 		assert.equal((await runtime.getItemContent({ itemId: "canvas-item" })).status, 409);
 		assert.equal(bucket.heads.length, 2, "oversized immutable object was not preflighted");
 		assert.equal(bucket.gets.length, 1, "oversized immutable object was materialized before rejection");

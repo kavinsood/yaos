@@ -229,7 +229,7 @@ export class StoreCycle {
     }, 2_000);
     store.advanceGcEpoch(gcTwo.epoch, "sweeping", 2_001);
     const garbageHash = "f".repeat(64);
-    const garbageKey = "vault/sqlite-cycle-vault/generation-sqlite-cycle-0001/recovery-v2/content/sha256/ff/" + garbageHash + ".md.gz";
+    const garbageKey = "vault/sqlite-cycle-vault/generation-sqlite-cycle-0001/recovery-v2/state/sha256/ff/" + garbageHash + ".ystate";
     store.recordProjectedContent(garbageHash, garbageKey, 10, null, 2_001);
     store.acquireMaterializationLease({
       leaseId: "capture-writer-lease",

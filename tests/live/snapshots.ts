@@ -1,5 +1,16 @@
 import { deviceBearerHeaders, requireLiveIdentity } from "./liveIdentity.ts";
 import { requestJson, vaultRoute } from "./schema4Live.ts";
+import * as Y from "yjs";
+import { parseRecoveryStateObject } from "../../server/src/shared/recoveryStateObject.ts";
+
+/** Format 4: recovery content is an opaque state object the client decodes. */
+function decodeStateText(bytes: Uint8Array): string {
+	const doc = new Y.Doc();
+	for (const update of parseRecoveryStateObject(bytes).updates) Y.applyUpdate(doc, update);
+	const text = doc.getText("body").toString();
+	doc.destroy();
+	return text;
+}
 
 const identity = requireLiveIdentity();
 const TERMINAL = new Set(["complete", "complete_with_gaps", "failed", "cancelled"]);
@@ -51,13 +62,14 @@ assert(catalog.response.status === 200 && Array.isArray(catalog.body?.snapshots)
 assert((catalog.body.snapshots as Array<{ snapshotId?: unknown }>).some((entry) => entry.snapshotId === snapshotId), "catalog contains the completed capture");
 
 const root = await requestJson(identity, `recovery/snapshots/${encodeURIComponent(snapshotId)}`);
-assert(root.response.status === 200 && root.body?.format === "yaos-recovery-v2" && root.body.snapshotFormatVersion === 3, "snapshot root carries product snapshot format 3");
+assert(root.response.status === 200 && root.body?.format === "yaos-recovery-v2" && root.body.snapshotFormatVersion === 4, "snapshot root carries product snapshot format 4");
 const entry = await requestJson(identity, `recovery/snapshots/${encodeURIComponent(snapshotId)}/entry?path=${encodeURIComponent("redeploy-test.md")}`);
 assert(entry.response.status === 200 && entry.body?.path === "redeploy-test.md", "one snapshot manifest entry is readable");
 const file = await fetch(vaultRoute(identity, `recovery/snapshots/${encodeURIComponent(snapshotId)}/file?path=${encodeURIComponent("redeploy-test.md")}`), {
 	headers: deviceBearerHeaders(identity),
 });
-const fileText = await file.text();
+const fileBytes = new Uint8Array(await file.arrayBuffer());
+const fileText = decodeStateText(fileBytes);
 assert(file.status === 200 && fileText.includes("SQL redeploy durability"), "one recovery content object is readable and verified");
 
 const restore = await requestJson(identity, "recovery/restores", {
@@ -85,7 +97,7 @@ assert(typeof itemId === "string", "restore item has a stable identity");
 const restoreContent = await fetch(vaultRoute(identity, `recovery/restores/${encodeURIComponent(restoreId)}/items/${encodeURIComponent(itemId)}/content`), {
 	headers: deviceBearerHeaders(identity),
 });
-assert(restoreContent.status === 200 && (await restoreContent.text()) === fileText, "restore item content matches the snapshot read");
+assert(restoreContent.status === 200 && decodeStateText(new Uint8Array(await restoreContent.arrayBuffer())) === fileText, "restore item content matches the snapshot read");
 const recorded = await requestJson(identity, `recovery/restores/${encodeURIComponent(restoreId)}/results`, {
 	method: "POST",
 	headers: { "Content-Type": "application/json" },

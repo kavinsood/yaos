@@ -1,3 +1,4 @@
+import { RECOVERY_STATE_CONTENT_TYPE } from "./shared/recoveryStateObject";
 import type { CaptureStarted, CaptureStatus, RecoverySnapshotCatalogEntry } from "./recoveryProtocol";
 import { isSafeRecoveryIdentity } from "./recoveryProtocol";
 import {
@@ -230,14 +231,14 @@ async function retainedRoot(authority: RecoveryRouteAuthority, vaultId: string, 
 	return retained;
 }
 
-function contentResponse(bytes: Uint8Array, hash: string, contentType = "text/markdown; charset=utf-8"): Response {
+function contentResponse(bytes: Uint8Array, hash: string, contentType: string, size: number): Response {
 	return new Response(bytes.slice().buffer, {
 		headers: {
 			"cache-control": "no-store",
 			"content-type": contentType,
 			"content-length": String(bytes.byteLength),
 			"x-yaos-content-sha256": hash,
-			"x-yaos-content-size": String(bytes.byteLength),
+			"x-yaos-content-size": String(size),
 		},
 	});
 }
@@ -290,7 +291,7 @@ export async function handleRecoveryRoute(request: Request, parts: string[], opt
 						return entry ? json(entry) : json({ error: "snapshot_entry_not_found" }, 404);
 					}
 					const file = await readService.file(retained, path);
-					return contentResponse(file.bytes, file.hash, file.contentType);
+					return contentResponse(file.bytes, file.hash, file.contentType, file.size);
 				}
 				if (parts.length === 5 && parts[3] === "deleted") {
 					const bodyId = decodedId(parts[4]!, "invalid_body_id");
@@ -300,7 +301,10 @@ export async function handleRecoveryRoute(request: Request, parts: string[], opt
 				if (parts.length === 6 && parts[3] === "deleted" && parts[5] === "file") {
 					const bodyId = decodedId(parts[4]!, "invalid_body_id");
 					const file = await readService.deletedFile(retained, bodyId);
-					return contentResponse(file.bytes, file.entry.availability === "available" ? file.entry.baselineContentHash : "");
+					const entry = file.entry;
+					return entry.availability === "available"
+						? contentResponse(file.bytes, entry.baselineContentHash, RECOVERY_STATE_CONTENT_TYPE, entry.baselineSize)
+						: contentResponse(file.bytes, "", RECOVERY_STATE_CONTENT_TYPE, 0);
 				}
 			}
 		}

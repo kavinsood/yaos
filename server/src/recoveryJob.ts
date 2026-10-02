@@ -1,25 +1,18 @@
-import { gzipSync } from "fflate";
-import type { YwasmCrdtDocument } from "./crdt/ywasmCrdtEngine.js";
-import { ywasmCrdtEngine as crdtEngine } from "./crdt/ywasmWorkerCrdtEngine.js";
-import { validateCanvasDocument } from "./crdt/canvasSemanticDocument.js";
 import { sha256Hex } from "./hex.js";
 import {
 	decodeHashedRecoveryObject,
 	encodeHashedRecoveryObject,
-	gunzipRecoveryBytes,
 	MAX_RECOVERY_COMPRESSED_NODE_BYTES,
 	MAX_RECOVERY_NODE_BYTES,
 } from "./recoveryCanonicalJson.js";
 import {
 	CAPTURE_PLAN_STREAMS,
 	MAX_CAPTURE_PLAN_BYTES,
-	MAX_RECIPE_BYTES,
 	RECOVERY_RPC_HEADER,
 	RECOVERY_RPC_MAX_JSON_BYTES,
 	RECOVERY_RPC_PATH,
 	decodeRecoveryRpcPayload,
 	encodeRecoveryRpcPayload,
-	type BodyRecipeDescriptor,
 	type CapturePlanEntry,
 	type CapturePlanRequest,
 	type CapturePlanResponse,
@@ -34,9 +27,6 @@ import {
 	type ManifestNodeMaterialized,
 	type MaterializationLease,
 	type MaterializationLeaseRequest,
-	type RecipeChunk,
-	type RecipeChunkRequest,
-	type RecipeDescriptorRequest,
 	type RecoveryDefectRecord,
 	type SweepLease,
 	type SweepLeaseRequest,
@@ -68,13 +58,13 @@ import {
 	type ManifestTreeMutation,
 	type ReachableManifestNode,
 	type SnapshotRootV2,
+	RECOVERY_SNAPSHOT_FORMAT_VERSION,
 } from "./recoveryManifestTree.js";
 import type { ImmutableArtifactStore } from "./bootstrap.js";
 import {
 	recoveryJobId,
 	type CaptureStartDescriptor,
 	type GcDescriptor,
-	type ProjectionDescriptor,
 	type PurgeDescriptor,
 	type RecoveryJobDescriptor,
 	type RecoveryJobStatus,
@@ -85,7 +75,6 @@ import {
 	RecoveryJobStateStore,
 	isTerminalRecoveryState,
 	type RecoveryJobRecord,
-	type ReconstructionPart,
 	type RestoreItemOutcome,
 	type StoredRestoreItem,
 } from "./recoveryJobState.js";
@@ -93,13 +82,12 @@ import type { ActorCallPort, AlarmPort, ObjectStorePort, RecoveryRuntimeStorageP
 import { CloudflareActorCalls, CloudflareAlarmPort, CloudflareObjectStore } from "./cloudflarePorts.js";
 import { decodeBinaryEnvelope, encodeBinaryEnvelope, YAOS_BINARY_CONTENT_TYPE } from "./shared/binaryEnvelope.js";
 import { MAX_BLOB_UPLOAD_BYTES } from "./contracts.js";
-import { MAX_CLIENT_MARKDOWN_BYTES, SQLITE_ROW_SAFE_BYTES } from "./shared/durableLimits.js";
-import { CANVAS_LIMITS } from "./shared/canvasLimits.js";
+import { DAILY_LIMIT_ERROR_CODE, DailyLimitLatch, instrumentStorageForDailyLimit } from "./dailyLimit.js";
+import { MAX_RECOVERY_STATE_OBJECT_BYTES, RECOVERY_STATE_CONTENT_TYPE } from "./shared/recoveryStateObject.js";
 import {
 	RecoveryMemoryBudget,
 	RecoveryMemoryOperationTooLargeError,
 	RecoveryMemoryPressureError,
-	reconstructionReservationBytes,
 	type RecoveryMemoryLease,
 } from "./recoveryMemoryBudget.js";
 
@@ -164,79 +152,6 @@ function concatenateBytes(parts: readonly Uint8Array[], knownTotal?: number): Ui
 	return bytes;
 }
 
-export function createRecoveryDocument(guid: string): YwasmCrdtDocument {
-	return crdtEngine.createDocument(guid);
-}
-
-/** Applies only complete logical Yjs updates; an incomplete checkpoint stays durable for the next slice. */
-export function applyCompleteRecoveryRecipeParts(doc: YwasmCrdtDocument, parts: readonly ReconstructionPart[]): boolean {
-	for (let index = 0; index < parts.length;) {
-		const first = parts[index]!;
-		if (first.kind === "journal") {
-			if (first.fragmentIndex !== 0 || first.fragmentCount !== 1) throw new Error("journal recipe part is fragmented");
-			crdtEngine.applyUpdate(doc, first.bytes, "journal-load");
-			index++;
-			continue;
-		}
-		if (first.fragmentIndex !== 0) throw new Error("checkpoint recipe starts mid-fragment");
-		const fragments = parts.slice(index, index + first.fragmentCount);
-		if (fragments.length !== first.fragmentCount) return false;
-		for (let fragmentIndex = 0; fragmentIndex < fragments.length; fragmentIndex++) {
-			const fragment = fragments[fragmentIndex]!;
-			if (fragment.kind !== "checkpoint" || fragment.sequence !== first.sequence
-				|| fragment.fragmentCount !== first.fragmentCount || fragment.fragmentIndex !== fragmentIndex) {
-				throw new Error("checkpoint recipe fragments are inconsistent");
-			}
-		}
-		crdtEngine.applyUpdate(doc, concatenateBytes(fragments.map((fragment) => fragment.bytes)), "checkpoint-load");
-		index += fragments.length;
-	}
-	return true;
-}
-
-/** Applies durable parts without ever loading an array of their BLOB payloads. */
-export function applyStoredRecoveryRecipeParts(doc: YwasmCrdtDocument, store: RecoveryJobStateStore): boolean {
-	let ordinal = store.reconstructionPartMetadataAtOrAfter(0)?.ordinal ?? 0;
-	for (;;) {
-		const first = store.reconstructionPartMetadataAtOrAfter(ordinal);
-		if (!first) return true;
-		if (first.ordinal !== ordinal) throw new Error("reconstruction recipe has an ordinal gap");
-		if (first.kind === "journal") {
-			if (first.fragmentIndex !== 0 || first.fragmentCount !== 1) throw new Error("journal recipe part is fragmented");
-			const bytes = store.readReconstructionPart(first.ordinal);
-			if (!bytes || bytes.byteLength !== first.byteLength) throw new Error("journal recipe part disappeared");
-			crdtEngine.applyUpdate(doc, bytes, "journal-load");
-			ordinal++;
-			continue;
-		}
-		if (first.fragmentIndex !== 0) throw new Error("checkpoint recipe starts mid-fragment");
-		const metadata = [first];
-		let total = first.byteLength;
-		for (let fragmentIndex = 1; fragmentIndex < first.fragmentCount; fragmentIndex++) {
-			const fragment = store.reconstructionPartMetadataAtOrAfter(first.ordinal + fragmentIndex);
-			if (!fragment) return false;
-			if (fragment.ordinal !== first.ordinal + fragmentIndex || fragment.kind !== "checkpoint"
-				|| fragment.sequence !== first.sequence || fragment.fragmentCount !== first.fragmentCount
-				|| fragment.fragmentIndex !== fragmentIndex) {
-				throw new Error("checkpoint recipe fragments are inconsistent");
-			}
-			total += fragment.byteLength;
-			if (!Number.isSafeInteger(total)) throw new Error("checkpoint recipe byte count overflow");
-			metadata.push(fragment);
-		}
-		const checkpoint = new Uint8Array(total);
-		let offset = 0;
-		for (const fragment of metadata) {
-			const bytes = store.readReconstructionPart(fragment.ordinal);
-			if (!bytes || bytes.byteLength !== fragment.byteLength) throw new Error("checkpoint recipe fragment disappeared");
-			checkpoint.set(bytes, offset);
-			offset += bytes.byteLength;
-		}
-		crdtEngine.applyUpdate(doc, checkpoint, "checkpoint-load");
-		ordinal += first.fragmentCount;
-	}
-}
-
 export interface RecoveryJobRuntimeOptions {
 	storage: RecoveryRuntimeStoragePort;
 	alarms: AlarmPort;
@@ -256,12 +171,6 @@ interface LeaseStatus {
 }
 
 
-interface ProjectionWorkPage {
-	entries: Array<{ bodyId: string; generation: number; contentHash: string; size: number }>;
-	nextCursor: string | null;
-	terminal: boolean;
-}
-
 
 interface GcRootPage {
 	roots: Array<{ objectKey: string; domain: "recovery" | "blob" }>;
@@ -273,11 +182,9 @@ interface GcRootPage {
 interface RecoveryAuthorityRpc {
 	checkRecoveryJobLease(input: { captureId: string; boundarySequence: number; capability: string; progress?: number }): Promise<LeaseStatus>;
 	getCapturePlanPage(request: CapturePlanRequest): Promise<CapturePlanResponse>;
-	getRecipeDescriptors(request: RecipeDescriptorRequest): Promise<BodyRecipeDescriptor[]>;
-	getRecipeChunk(request: RecipeChunkRequest): Promise<RecipeChunk>;
+	materializeCaptureContent(input: { captureId: string; boundarySequence: number; capability: string; bodyId: string; generation: number }): Promise<CaptureContentResult>;
 	acquireMaterializationLease(request: MaterializationLeaseRequest): Promise<MaterializationLease>;
 	releaseMaterializationLease(leaseId: string): Promise<void>;
-	acknowledgeContentMaterialized(request: ContentMaterialized): Promise<void>;
 	acknowledgeManifestNodesMaterialized(input: { captureId: string; boundarySequence: number; capability: string; nodes: ManifestNodeMaterialized[] }): Promise<void>;
 	resetCaptureDelta(input: { captureId: string; boundarySequence: number; capability: string }): Promise<void>;
 	checkRecoveryCoverage(request: CoverageCheckRequest): Promise<CoverageCheckResponse>;
@@ -286,10 +193,6 @@ interface RecoveryAuthorityRpc {
 	recordRecoveryDefects(input: { captureId: string; boundarySequence: number; capability: string; defects: RecoveryDefectRecord[] }): Promise<void>;
 	finalizeCapture(request: FinalizeCaptureRequest): Promise<FinalizedCapture>;
 	acknowledgeJobCancelled(input: { captureId: string; boundarySequence: number; capability: string }): Promise<void>;
-	getProjectionWorkPage(input: { vaultId: string; vaultGeneration: string; leaseId: string; capability: string; cursor: string | null; maxEntries: number; maxResponseBytes: number }): Promise<ProjectionWorkPage>;
-	getProjectionRecipeDescriptor(input: { vaultId: string; vaultGeneration: string; leaseId: string; capability: string; bodyId: string; expectedHeadGeneration: number }): Promise<BodyRecipeDescriptor>;
-	getProjectionRecipeChunk(input: { vaultId: string; vaultGeneration: string; leaseId: string; capability: string; bodyId: string; expectedHeadGeneration: number; recipeId: string; cursor: string; maxResponseBytes: number }): Promise<RecipeChunk>;
-	acknowledgeProjectionContentMaterialized(input: { vaultId: string; vaultGeneration: string; leaseId: string; capability: string; bodyId: string; expectedHeadGeneration: number; contentHash: string; plainBytes: number; objectKey: string }): Promise<void>;
 	validateRestoreAuthority(input: { vaultId: string; vaultGeneration: string; restoreId: string; snapshotId: string; capability: string }): Promise<{ rootKey: string; rootHash: string; selection: RestoreDescriptor["selection"]; capabilityExpiresAt: number }>;
 	completeRestore(input: { vaultId: string; vaultGeneration: string; restoreId: string; snapshotId: string; capability: string }): Promise<void>;
 	getGcRootPage(input: { vaultId: string; vaultGeneration: string; epoch: number; capability: string; cursor: string | null; maxEntries: number }): Promise<GcRootPage>;
@@ -564,10 +467,6 @@ function parseStoredDescriptor(record: RecoveryJobRecord, value: unknown): Recov
 			pinHardExpiresAt: metadataInteger(descriptor.pinHardExpiresAt, "capture hard pin expiry"),
 		};
 	}
-	if (record.kind === "projection") {
-		assertMetadataKeys(descriptor, [...baseKeys, "leaseId"], "projection descriptor");
-		return { ...common, leaseId: metadataString(descriptor.leaseId, "projection lease ID") };
-	}
 	if (record.kind === "restore") {
 		assertMetadataKeys(descriptor, [...baseKeys, "restoreId", "snapshotId", "selection"], "restore descriptor");
 		return {
@@ -638,9 +537,28 @@ function parseGcSweepMetadata(value: unknown): { domainIndex: number; cursor: st
 	};
 }
 
-function descriptorKind(descriptor: RecoveryJobDescriptor): "capture" | "projection" | "restore" | "gc" | "purge" {
+export type CaptureContentResult =
+	| { status: "materialized"; objectKey: string; contentHash: string; plainBytes: number }
+	| { status: "busy" }
+	| { status: "defect"; code: "missing_history" | "corrupt_history"; message: string };
+
+function parseCaptureContentResult(value: unknown): CaptureContentResult {
+	const invalid = () => new TerminalRecoveryError("invalid_authority_response", "invalid capture content response");
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw invalid();
+	const record = value as Record<string, unknown>;
+	if (record.status === "busy") return { status: "busy" };
+	if (record.status === "defect") {
+		if ((record.code !== "missing_history" && record.code !== "corrupt_history") || typeof record.message !== "string") throw invalid();
+		return { status: "defect", code: record.code, message: record.message.slice(0, 512) };
+	}
+	if (record.status !== "materialized" || typeof record.objectKey !== "string" || typeof record.contentHash !== "string"
+		|| !/^[a-f0-9]{64}$/.test(record.contentHash) || typeof record.plainBytes !== "number"
+		|| !Number.isSafeInteger(record.plainBytes) || record.plainBytes < 0) throw invalid();
+	return { status: "materialized", objectKey: record.objectKey, contentHash: record.contentHash, plainBytes: record.plainBytes };
+}
+
+function descriptorKind(descriptor: RecoveryJobDescriptor): "capture" | "restore" | "gc" | "purge" {
 	if ("captureId" in descriptor) return "capture";
-	if ("leaseId" in descriptor) return "projection";
 	if ("restoreId" in descriptor) return "restore";
 	if ("epoch" in descriptor) return "gc";
 	return "purge";
@@ -751,17 +669,6 @@ export function advanceRecoveryPurgeProgress(
 	return listedObjects === 0
 		? { prefixIndex: prefixIndex + 1, pageComplete: true }
 		: { prefixIndex, pageComplete: false };
-}
-
-export function recoveryProjectionPageAction(
-	entryCount: number,
-	terminal: boolean,
-	nextCursor: string | null,
-): { kind: "work" } | { kind: "sleep" } | { kind: "advance"; cursor: string } {
-	if (entryCount > 0) return { kind: "work" };
-	if (terminal) return { kind: "sleep" };
-	if (nextCursor === null) throw new Error("non-terminal projection page omitted its cursor");
-	return { kind: "advance", cursor: nextCursor };
 }
 
 export function shouldTraverseRecoveryGcObject(
@@ -906,75 +813,10 @@ function parseCapturePlanResponse(value: unknown): CapturePlanResponse {
 	};
 }
 
-function parseRecipeDescriptor(value: unknown): BodyRecipeDescriptor {
-	const descriptor = metadataRecord(value, "recipe descriptor");
-	assertMetadataKeys(descriptor, ["recipeId", "bodyId", "generation", "expectedContentHash", "expectedSize", "encodedHistoryBytes", "firstCursor"], "recipe descriptor");
-	return {
-		recipeId: metadataString(descriptor.recipeId, "recipe ID"),
-		bodyId: metadataString(descriptor.bodyId, "recipe body ID"),
-		generation: metadataInteger(descriptor.generation, "recipe generation"),
-		expectedContentHash: rpcHash(descriptor.expectedContentHash, "recipe content hash"),
-		expectedSize: metadataInteger(descriptor.expectedSize, "recipe expected size"),
-		encodedHistoryBytes: metadataInteger(descriptor.encodedHistoryBytes, "recipe encoded byte count"),
-		firstCursor: metadataString(descriptor.firstCursor, "recipe cursor"),
-	};
-}
-
-function parseRecipeChunk(value: unknown): RecipeChunk {
-	const chunk = metadataRecord(value, "recipe chunk");
-	assertMetadataKeys(chunk, ["recipeId", "cursor", "nextCursor", "parts", "encodedBytes"], "recipe chunk");
-	if (!Array.isArray(chunk.parts)) throw new TerminalRecoveryError("invalid_authority_response", "invalid recipe chunk parts");
-	let actualEncodedBytes = 0;
-	const parts = chunk.parts.map((candidate) => {
-		const part = metadataRecord(candidate, "recipe chunk part");
-		assertMetadataKeys(part, ["kind", "sequence", "fragmentIndex", "fragmentCount", "bytes"], "recipe chunk part");
-		let kind: "checkpoint" | "journal";
-		if (part.kind === "checkpoint") kind = "checkpoint";
-		else if (part.kind === "journal") kind = "journal";
-		else throw new TerminalRecoveryError("invalid_authority_response", "invalid recipe chunk part kind");
-		if (!(part.bytes instanceof Uint8Array) || part.bytes.byteLength === 0
-			|| part.bytes.byteLength > SQLITE_ROW_SAFE_BYTES) {
-			throw new TerminalRecoveryError("invalid_authority_response", "invalid or oversized recipe part bytes");
-		}
-		actualEncodedBytes += part.bytes.byteLength;
-		if (!Number.isSafeInteger(actualEncodedBytes) || actualEncodedBytes > MAX_RECIPE_BYTES) {
-			throw new TerminalRecoveryError("invalid_authority_response", "recipe chunk actual bytes exceed bound");
-		}
-		const fragmentIndex = metadataInteger(part.fragmentIndex, "recipe chunk fragment index");
-		const fragmentCount = metadataInteger(part.fragmentCount, "recipe chunk fragment count");
-		if (fragmentCount < 1 || fragmentIndex < 0 || fragmentIndex >= fragmentCount) {
-			throw new TerminalRecoveryError("invalid_authority_response", "invalid recipe chunk fragment bounds");
-		}
-		return { kind, sequence: metadataInteger(part.sequence, "recipe chunk sequence"), fragmentIndex, fragmentCount, bytes: part.bytes };
-	});
-	const declaredEncodedBytes = metadataInteger(chunk.encodedBytes, "recipe chunk encoded byte count");
-	if (declaredEncodedBytes !== actualEncodedBytes) {
-		throw new TerminalRecoveryError("invalid_authority_response", "recipe chunk encoded byte declaration mismatch");
-	}
-	return {
-		recipeId: metadataString(chunk.recipeId, "recipe chunk ID"),
-		cursor: metadataString(chunk.cursor, "recipe chunk cursor"),
-		nextCursor: rpcNullableString(chunk.nextCursor, "next recipe cursor"),
-		parts,
-		encodedBytes: declaredEncodedBytes,
-	};
-}
-
-export function assertRecoveryRecipeChunkAccounting(chunk: RecipeChunk): void {
-	let actual = 0;
-	for (const part of chunk.parts) {
-		if (!(part.bytes instanceof Uint8Array) || part.bytes.byteLength === 0
-			|| part.bytes.byteLength > SQLITE_ROW_SAFE_BYTES) throw new Error("recipe part exceeds durable row bound");
-		actual += part.bytes.byteLength;
-		if (!Number.isSafeInteger(actual) || actual > MAX_RECIPE_BYTES) throw new Error("recipe chunk actual bytes exceed bound");
-	}
-	if (chunk.encodedBytes !== actual) throw new Error("recipe chunk encoded byte declaration mismatch");
-}
-
 function parseMaterializationLease(value: unknown): MaterializationLease {
 	const lease = metadataRecord(value, "materialization lease");
 	assertMetadataKeys(lease, ["leaseId", "ownerKind", "ownerId", "objectKeys", "expiresAt"], "materialization lease");
-	if (lease.ownerKind !== "capture" && lease.ownerKind !== "projection") throw new TerminalRecoveryError("invalid_authority_response", "invalid materialization lease owner");
+	if (lease.ownerKind !== "capture") throw new TerminalRecoveryError("invalid_authority_response", "invalid materialization lease owner");
 	return {
 		leaseId: metadataString(lease.leaseId, "materialization lease ID"),
 		ownerKind: lease.ownerKind,
@@ -1037,26 +879,6 @@ function parseCatalogDeltaResponse(value: unknown): CatalogDeltaPageResponse {
 		terminal: rpcBoolean(page.terminal, "catalog delta terminal state"),
 		pageHash: rpcHash(page.pageHash, "catalog delta page hash"),
 		deltaDigest: rpcHash(page.deltaDigest, "catalog delta digest"),
-	};
-}
-
-function parseProjectionWorkPage(value: unknown): ProjectionWorkPage {
-	const page = metadataRecord(value, "projection work page");
-	assertMetadataKeys(page, ["entries", "nextCursor", "terminal"], "projection work page");
-	if (!Array.isArray(page.entries)) throw new TerminalRecoveryError("invalid_authority_response", "invalid projection work entries");
-	return {
-		entries: page.entries.map((candidate) => {
-			const entry = metadataRecord(candidate, "projection work entry");
-			assertMetadataKeys(entry, ["bodyId", "generation", "contentHash", "size"], "projection work entry");
-			return {
-				bodyId: metadataString(entry.bodyId, "projection body ID"),
-				generation: metadataInteger(entry.generation, "projection generation"),
-				contentHash: rpcHash(entry.contentHash, "projection content hash"),
-				size: metadataInteger(entry.size, "projection content size"),
-			};
-		}),
-		nextCursor: rpcNullableString(page.nextCursor, "projection work cursor"),
-		terminal: rpcBoolean(page.terminal, "projection terminal state"),
 	};
 }
 
@@ -1164,11 +986,9 @@ function parseStagedDelta(value: unknown): { kind: string; identity: string; pat
 const RECOVERY_AUTHORITY_METHODS: Record<keyof RecoveryAuthorityRpc, true> = {
 	checkRecoveryJobLease: true,
 	getCapturePlanPage: true,
-	getRecipeDescriptors: true,
-	getRecipeChunk: true,
+	materializeCaptureContent: true,
 	acquireMaterializationLease: true,
 	releaseMaterializationLease: true,
-	acknowledgeContentMaterialized: true,
 	acknowledgeManifestNodesMaterialized: true,
 	resetCaptureDelta: true,
 	checkRecoveryCoverage: true,
@@ -1177,10 +997,6 @@ const RECOVERY_AUTHORITY_METHODS: Record<keyof RecoveryAuthorityRpc, true> = {
 	recordRecoveryDefects: true,
 	finalizeCapture: true,
 	acknowledgeJobCancelled: true,
-	getProjectionWorkPage: true,
-	getProjectionRecipeDescriptor: true,
-	getProjectionRecipeChunk: true,
-	acknowledgeProjectionContentMaterialized: true,
 	validateRestoreAuthority: true,
 	completeRestore: true,
 	getGcRootPage: true,
@@ -1315,15 +1131,63 @@ class CaptureManifestStore implements ManifestNodeStore {
 }
 
 
+/**
+ * b3-merge's `setAlarmGuarded` policy (D8, server/src/dailyLimit.ts) for a
+ * RecoveryJob alarm port: while the daily row limit is latched no alarm is armed
+ * before the 00:00 UTC reset (each `setAlarm` is a billed row write and the
+ * slice it schedules would fail on the same limit); an alarm already due at or
+ * before that target is kept; a `setAlarm`/`deleteAlarm` that itself fails on
+ * the limit is noted and dropped.
+ */
+export function dailyLimitGuardedAlarms(alarms: AlarmPort, latch: DailyLimitLatch): AlarmPort {
+	return {
+		async setAlarm(scheduledTime: number): Promise<void> {
+			const resetAt = latch.body()?.resetAt ?? null;
+			const at = resetAt === null ? scheduledTime : Math.max(scheduledTime, resetAt);
+			if (resetAt !== null) {
+				const current = await alarms.getAlarm?.();
+				if (current !== undefined && current !== null && current <= at) return;
+			}
+			try {
+				await alarms.setAlarm(at);
+			} catch (error) {
+				if (latch.note(error)) {
+					console.warn("[yaos-recovery-job] alarm not armed: Cloudflare daily row limit");
+					return;
+				}
+				throw error;
+			}
+		},
+		async deleteAlarm(): Promise<void> {
+			try {
+				await alarms.deleteAlarm();
+			} catch (error) {
+				if (!latch.note(error)) throw error;
+			}
+		},
+		...(alarms.getAlarm ? { getAlarm: () => alarms.getAlarm!() } : {}),
+	};
+}
+
 /** Alarm-driven, SQLite-backed recovery state machine, independent of the alarm host. */
 export class RecoveryJobRuntime {
 	private readonly store: RecoveryJobStateStore;
 	private readonly memoryBudget: RecoveryMemoryBudget;
 
 	private deferredAlarmAt: number | null = null;
+	/** D8: latched when a storage or alarm write fails on Cloudflare's daily free-tier row limit. */
+	private readonly dailyLimit: DailyLimitLatch;
+	private readonly alarms: AlarmPort;
 	constructor(private readonly options: RecoveryJobRuntimeOptions) {
 		this.memoryBudget = new RecoveryMemoryBudget(options.memoryBudgetBytes);
-		this.store = new RecoveryJobStateStore(options.storage);
+		this.dailyLimit = new DailyLimitLatch();
+		this.store = new RecoveryJobStateStore(instrumentStorageForDailyLimit(options.storage, this.dailyLimit));
+		this.alarms = dailyLimitGuardedAlarms(options.alarms, this.dailyLimit);
+	}
+
+	/** Test/diagnostic view of the D8 latch. */
+	dailyLimitResetAt(): number | null {
+		return this.dailyLimit.body()?.resetAt ?? null;
 	}
 
 	recoveryMemorySnapshot(): ReturnType<RecoveryMemoryBudget["snapshot"]> {
@@ -1361,17 +1225,6 @@ export class RecoveryJobRuntime {
 			}
 			if (route === "/__yaos/recovery-job/cancel" && request.method === "POST") {
 				await this.cancel();
-				return Response.json(null);
-			}
-			if (route === "/__yaos/recovery-job/projection/refresh" && request.method === "POST") {
-				const descriptor = await this.readJobRequest<ProjectionDescriptor>(request);
-				if (descriptor.vaultId !== routedVaultId || descriptor.vaultGeneration !== routedVaultGeneration) return new Response("not found", { status: 404 });
-				return Response.json(await this.refreshProjection(descriptor));
-			}
-			if (route === "/__yaos/recovery-job/projection/wake" && request.method === "POST") {
-				const record = this.store.load();
-				if (!record || record.kind !== "projection") throw new Error("projection job is not initialized");
-				await this.options.alarms.setAlarm(Date.now());
 				return Response.json(null);
 			}
 			if (route === "/__yaos/recovery-job/purge/rotate-capability" && request.method === "POST") {
@@ -1432,15 +1285,9 @@ export class RecoveryJobRuntime {
 		return {
 			checkRecoveryJobLease: async (input) => parseLeaseStatus(await call("checkRecoveryJobLease", input)),
 			getCapturePlanPage: async (input) => parseCapturePlanResponse(await call("getCapturePlanPage", input)),
-			getRecipeDescriptors: async (input) => {
-				const value = await call("getRecipeDescriptors", input);
-				if (!Array.isArray(value)) throw new TerminalRecoveryError("invalid_authority_response", "invalid recipe descriptor list");
-				return value.map(parseRecipeDescriptor);
-			},
-			getRecipeChunk: async (input) => parseRecipeChunk(await call("getRecipeChunk", input)),
 			acquireMaterializationLease: async (input) => parseMaterializationLease(await call("acquireMaterializationLease", input)),
 			releaseMaterializationLease: async (input) => requireNullAuthorityResponse(await call("releaseMaterializationLease", input), "releaseMaterializationLease"),
-			acknowledgeContentMaterialized: async (input) => requireNullAuthorityResponse(await call("acknowledgeContentMaterialized", input), "acknowledgeContentMaterialized"),
+			materializeCaptureContent: async (input) => parseCaptureContentResult(await call("materializeCaptureContent", input)),
 			acknowledgeManifestNodesMaterialized: async (input) => requireNullAuthorityResponse(await call("acknowledgeManifestNodesMaterialized", input), "acknowledgeManifestNodesMaterialized"),
 			resetCaptureDelta: async (input) => requireNullAuthorityResponse(await call("resetCaptureDelta", input), "resetCaptureDelta"),
 			checkRecoveryCoverage: async (input) => parseCoverageResponse(await call("checkRecoveryCoverage", input)),
@@ -1449,10 +1296,6 @@ export class RecoveryJobRuntime {
 			recordRecoveryDefects: async (input) => requireNullAuthorityResponse(await call("recordRecoveryDefects", input), "recordRecoveryDefects"),
 			finalizeCapture: async (input) => parseFinalizedCapture(await call("finalizeCapture", input)),
 			acknowledgeJobCancelled: async (input) => requireNullAuthorityResponse(await call("acknowledgeJobCancelled", input), "acknowledgeJobCancelled"),
-			getProjectionWorkPage: async (input) => parseProjectionWorkPage(await call("getProjectionWorkPage", input)),
-			getProjectionRecipeDescriptor: async (input) => parseRecipeDescriptor(await call("getProjectionRecipeDescriptor", input)),
-			getProjectionRecipeChunk: async (input) => parseRecipeChunk(await call("getProjectionRecipeChunk", input)),
-			acknowledgeProjectionContentMaterialized: async (input) => requireNullAuthorityResponse(await call("acknowledgeProjectionContentMaterialized", input), "acknowledgeProjectionContentMaterialized"),
 			validateRestoreAuthority: async (input) => parseRestoreAuthority(await call("validateRestoreAuthority", input)),
 			completeRestore: async (input) => requireNullAuthorityResponse(await call("completeRestore", input), "completeRestore"),
 			getGcRootPage: async (input) => parseGcRootPage(await call("getGcRootPage", input)),
@@ -1466,12 +1309,11 @@ export class RecoveryJobRuntime {
 	}
 
 	private descriptor(kind: "capture"): CaptureStartDescriptor;
-	private descriptor(kind: "projection"): ProjectionDescriptor;
 	private descriptor(kind: "restore"): RestoreDescriptor;
 	private descriptor(kind: "gc"): GcDescriptor;
 	private descriptor(kind: "purge"): PurgeDescriptor;
 	private descriptor(kind: RecoveryJobRecord["kind"]): RecoveryJobDescriptor;
-	private descriptor(kind: "capture" | "projection" | "restore" | "gc" | "purge"): RecoveryJobDescriptor {
+	private descriptor(kind: "capture" | "restore" | "gc" | "purge"): RecoveryJobDescriptor {
 		const record = this.store.load();
 		if (!record || record.kind !== kind || !record.capability || record.capabilityExpiresAt === null) {
 			throw new TerminalRecoveryError("corrupt_job_state", "job capability or kind mismatch");
@@ -1520,43 +1362,8 @@ export class RecoveryJobRuntime {
 			createdAt: descriptor.createdAt,
 			metadata,
 		});
-		await this.options.alarms.setAlarm(Date.now());
+		await this.alarms.setAlarm(Date.now());
 		return { jobId: expectedId, kind, capabilityHash: await sha256Hex(encoder.encode(capability)), created: initialized.created };
-	}
-
-	async refreshProjection(
-		descriptor: ProjectionDescriptor,
-	): Promise<{ jobId: string; kind: "projection"; capabilityHash: string; created: false }> {
-		const record = this.store.load();
-		const expectedId = recoveryJobId("projection", descriptor.vaultId, descriptor.vaultGeneration);
-		if (!record || record.kind !== "projection" || record.jobId !== expectedId || record.vaultId !== descriptor.vaultId || record.vaultGeneration !== descriptor.vaultGeneration) {
-			throw new Error("projection job identity mismatch");
-		}
-		const metadata: Record<string, unknown> = { ...descriptor };
-		delete metadata.capability;
-		delete metadata.jobId;
-		delete metadata.kind;
-		this.store.setMetadata("descriptor", metadata);
-		this.store.clearReconstruction();
-		this.store.setMetadata("projection-cursor", { cursor: null });
-		this.commit(record, {
-			state: "queued",
-			capability: descriptor.capability,
-			capabilityExpiresAt: descriptor.capabilityExpiresAt,
-			nextAttemptAt: null,
-			errorCode: null,
-			errorRef: null,
-			internalError: null,
-			completedAt: null,
-			updatedAt: Date.now(),
-		});
-		await this.options.alarms.setAlarm(Date.now());
-		return {
-			jobId: expectedId,
-			kind: "projection",
-			capabilityHash: await sha256Hex(encoder.encode(descriptor.capability)),
-			created: false,
-		};
 	}
 
 	async rotatePurgeCapability(input: {
@@ -1585,7 +1392,7 @@ export class RecoveryJobRuntime {
 			completedAt: state === "complete" ? record.completedAt : null,
 			updatedAt: Date.now(),
 		});
-		if (!isTerminalRecoveryState(state)) await this.options.alarms.setAlarm(Date.now());
+		if (!isTerminalRecoveryState(state)) await this.alarms.setAlarm(Date.now());
 		return {
 			capabilityHash: await sha256Hex(encoder.encode(input.capability)),
 			state,
@@ -1598,7 +1405,7 @@ export class RecoveryJobRuntime {
 			|| (record.state !== "queued" && record.state !== "purging")) {
 			throw new Error("purge job is not wakeable");
 		}
-		await this.options.alarms.setAlarm(Date.now());
+		await this.alarms.setAlarm(Date.now());
 	}
 
 	async republishPurge(): Promise<void> {
@@ -1677,7 +1484,7 @@ export class RecoveryJobRuntime {
 		if (record.state === "complete" || record.state === "complete_with_gaps") throw new Error("completed recovery job cannot be cancelled");
 		if (!canCancelRecoveryJob(record.state)) return;
 		this.store.requestCancellation(Date.now());
-		await this.options.alarms.setAlarm(Date.now());
+		await this.alarms.setAlarm(Date.now());
 	}
 
 	requestCancellation(): Promise<void> {
@@ -1687,26 +1494,43 @@ export class RecoveryJobRuntime {
 	async deleteState(): Promise<void> {
 		const record = this.store.load();
 		if (record && !isTerminalRecoveryState(record.state)) throw new Error("active recovery job state cannot be deleted");
-		await this.options.alarms.deleteAlarm();
+		await this.alarms.deleteAlarm();
 		await this.options.storage.deleteAll();
 		this.store.resetAfterDeleteAll();
 	}
 
 	async dispatch(dispatchId: string): Promise<void> {
+		try {
+			await this.dispatchSlices(dispatchId);
+		} catch (error) {
+			// D8: a dispatch that failed on the latched daily row limit must not throw (the
+			// platform would retry the alarm with backoff, each retry failing on the same
+			// limit). The guarded port arms the successor at the 00:00 UTC reset.
+			if (this.dailyLimit.note(error) || this.dailyLimit.active()) {
+				console.warn("[yaos-recovery-job] dispatch stopped: Cloudflare daily row limit");
+				await this.alarms.setAlarm(Date.now()).catch(() => undefined);
+				return;
+			}
+			throw error;
+		}
+	}
+
+	private async dispatchSlices(dispatchId: string): Promise<void> {
 		if (!/^[A-Za-z0-9:_-]{1,256}$/.test(dispatchId)) throw new Error("invalid recovery dispatch identity");
 		const startedAt = Date.now();
 		this.store.setMetadata("dispatch-identity", { dispatchId, startedAt, completedAt: null });
 		this.deferredAlarmAt = null;
+		let watchdogArmedAt: number | null = null;
 		try {
 			for (let unit = 0; unit < MAX_BODIES_PER_ALARM; unit++) {
 				let record = this.store.load();
 				if (!record || isTerminalRecoveryState(record.state)) {
-					await this.options.alarms.deleteAlarm();
+					await this.alarms.deleteAlarm();
 					return;
 				}
 				const now = Date.now();
 				if (record.nextAttemptAt !== null && record.nextAttemptAt > now) {
-					await this.options.alarms.setAlarm(record.nextAttemptAt);
+					await this.alarms.setAlarm(record.nextAttemptAt);
 					return;
 				}
 				if (record.cancelRequested) {
@@ -1718,7 +1542,12 @@ export class RecoveryJobRuntime {
 				}
 				// Persist the successor before any authority call or state transition. If the
 				// process dies inside the slice, the host will durably redispatch this actor.
-				await this.options.alarms.setAlarm(now + DISPATCH_WATCHDOG_MS);
+				// One watchdog covers the whole dispatch (it is bounded by ALARM_SLICE_WALL_MS);
+				// it is refreshed only if a dispatch runs past half the watchdog window.
+				if (watchdogArmedAt === null || now - watchdogArmedAt >= DISPATCH_WATCHDOG_MS / 2) {
+					await this.alarms.setAlarm(now + DISPATCH_WATCHDOG_MS);
+					watchdogArmedAt = now;
+				}
 				const authority = this.authority(record.vaultId, record.vaultGeneration);
 				if (record.kind === "capture") {
 					const capture = this.descriptor("capture");
@@ -1730,22 +1559,25 @@ export class RecoveryJobRuntime {
 					});
 				}
 				if (record.kind === "capture") await this.runCaptureSlice(record, authority);
-				else if (record.kind === "projection") await this.runProjectionSlice(record, authority);
 				else if (record.kind === "restore") await this.runRestoreSlice(record, authority);
 				else if (record.kind === "gc") await this.runGcSlice(record, authority);
 				else await this.runPurgeSlice(record);
 				record = this.store.load();
 				if (!record || isTerminalRecoveryState(record.state)) {
-					await this.options.alarms.deleteAlarm();
+					await this.alarms.deleteAlarm();
 					return;
 				}
 				if (this.deferredAlarmAt !== null || Date.now() - startedAt >= ALARM_SLICE_WALL_MS) break;
 			}
-			await this.options.alarms.setAlarm(this.deferredAlarmAt ?? Date.now());
+			await this.alarms.setAlarm(this.deferredAlarmAt ?? Date.now());
 		} catch (error) {
 			await this.handleFailure(error);
 		} finally {
-			this.store.setMetadata("dispatch-identity", { dispatchId, startedAt, completedAt: Date.now() });
+			try {
+				this.store.setMetadata("dispatch-identity", { dispatchId, startedAt, completedAt: Date.now() });
+			} catch (error) {
+				if (!this.dailyLimit.note(error)) throw error;
+			}
 		}
 	}
 
@@ -1767,13 +1599,13 @@ export class RecoveryJobRuntime {
 			errorRef: null,
 			updatedAt: Date.now(),
 		});
-		await this.options.alarms.deleteAlarm();
+		await this.alarms.deleteAlarm();
 	}
 
 	private async handleFailure(error: unknown): Promise<void> {
 		const record = this.store.load();
 		if (!record || isTerminalRecoveryState(record.state)) {
-			await this.options.alarms.deleteAlarm();
+			await this.alarms.deleteAlarm();
 			return;
 		}
 		if (record.cancelRequested) {
@@ -1781,6 +1613,25 @@ export class RecoveryJobRuntime {
 			return;
 		}
 		const now = Date.now();
+		if (this.dailyLimit.note(error) || this.dailyLimit.active()) {
+			// D8: not a backoff retry; the slice resumes after the reset with no retry
+			// counted. The state write may itself fail on the limit: then only the alarm.
+			const resetAt = this.dailyLimit.body()?.resetAt ?? now;
+			try {
+				this.commit(record, {
+					state: "retrying",
+					nextAttemptAt: resetAt,
+					errorCode: DAILY_LIMIT_ERROR_CODE,
+					errorRef: null,
+					internalError: RecoveryJobStateStore.safeInternalError(error),
+					updatedAt: now,
+				});
+			} catch (writeError) {
+				if (!this.dailyLimit.note(writeError)) throw writeError;
+			}
+			await this.alarms.setAlarm(resetAt);
+			return;
+		}
 		if (isRetryableFailure(error)) {
 			const retryCount = record.retryCount + 1;
 			console.warn("[yaos-recovery-job] retrying", {
@@ -1799,7 +1650,7 @@ export class RecoveryJobRuntime {
 				internalError: RecoveryJobStateStore.safeInternalError(error),
 				updatedAt: now,
 			});
-			await this.options.alarms.setAlarm(nextAttemptAt);
+			await this.alarms.setAlarm(nextAttemptAt);
 			return;
 		}
 		const code = error instanceof TerminalRecoveryError ? error.code : "recovery_failed";
@@ -1817,7 +1668,7 @@ export class RecoveryJobRuntime {
 			internalError: RecoveryJobStateStore.safeInternalError(error),
 			updatedAt: now,
 		});
-		await this.options.alarms.deleteAlarm();
+		await this.alarms.deleteAlarm();
 	}
 
 	private initialCaptureProgress(): CaptureProgress {
@@ -2080,10 +1931,7 @@ export class RecoveryJobRuntime {
 		const documentId = entry.kind === "canvas" ? entry.documentId : entry.bodyId;
 		const identity = `${documentId}:${entry.generation}`;
 		const written = this.store.getArtifact("content-object", identity);
-		if (written) {
-			await authority.acknowledgeContentMaterialized({ captureId: descriptor.captureId, boundarySequence: descriptor.boundarySequence, capability: descriptor.capability, bodyId: documentId, generation: entry.generation, contentHash: hash, plainBytes: size, objectKey: written.objectKey });
-			return true;
-		}
+		if (written) return true;
 		const reused = this.store.getArtifact("content-reused", identity);
 		if (reused) return true;
 		const coverage = await authority.checkRecoveryCoverage({ captureId: descriptor.captureId, boundarySequence: descriptor.boundarySequence, capability: descriptor.capability, contentHashes: [hash] });
@@ -2093,138 +1941,25 @@ export class RecoveryJobRuntime {
 			if (record) this.commit(record, { contentObjectsReused: record.contentObjectsReused + 1, updatedAt: Date.now() });
 			return true;
 		}
-		let reconstruction = this.store.getReconstruction();
-		if (!reconstruction) {
-			let recipes: BodyRecipeDescriptor[];
-			try {
-				recipes = await authority.getRecipeDescriptors({ vaultId: descriptor.vaultId, vaultGeneration: descriptor.vaultGeneration, captureId: descriptor.captureId, boundarySequence: descriptor.boundarySequence, capability: descriptor.capability, entries: [{ bodyId: documentId, generation: entry.generation }] });
-			} catch (error) {
-				if (isRetryableFailure(error)) throw new RetryableRecoveryError("recipe_descriptor_transient", RecoveryJobStateStore.safeInternalError(error));
-				throw new BodyDefectError("missing_history", entry, RecoveryJobStateStore.safeInternalError(error));
-			}
-			const recipe = recipes[0];
-			if (!recipe || recipe.expectedContentHash !== hash || recipe.expectedSize !== size) throw new BodyDefectError("corrupt_history", entry, "recipe descriptor mismatch");
-			reconstruction = {
-				bodyId: documentId, generation: entry.generation, recipeId: recipe.recipeId,
-				expectedContentHash: hash, expectedSize: size, cursor: recipe.firstCursor,
-				stagingKey: null, stagingHash: null, stagingBytes: 0,
-				expectedHistoryBytes: recipe.encodedHistoryBytes, encodedBytes: 0, attempts: 0,
-			};
-			this.store.setReconstruction(reconstruction);
-		}
-		return this.advanceCaptureReconstruction(descriptor, authority, entry, reconstruction);
-	}
-
-	private async advanceCaptureReconstruction(descriptor: CaptureStartDescriptor, authority: RecoveryAuthorityRpc, entry: Extract<CapturePlanEntry, { kind: "active" | "canvas" | "deleted" }>, reconstruction: NonNullable<ReturnType<RecoveryJobStateStore["getReconstruction"]>>): Promise<boolean> {
-		const documentId = entry.kind === "canvas" ? entry.documentId : entry.bodyId;
-		const partStats = this.store.reconstructionPartsStats();
-		let memoryLease: RecoveryMemoryLease;
+		// b3 P2: the vault builds the opaque state object at the capture boundary;
+		// the job never reads recipes or decodes CRDT bytes.
+		let result: CaptureContentResult;
 		try {
-			memoryLease = this.memoryBudget.reserve(`capture:${documentId}`, reconstructionReservationBytes({
-				expectedHistoryBytes: reconstruction.expectedHistoryBytes,
-				stagingBytes: reconstruction.stagingBytes,
-				bufferedPartBytes: partStats.bytes,
-				nextChunkBytes: Math.min(MAX_RECIPE_BYTES, Math.max(0, reconstruction.expectedHistoryBytes - reconstruction.encodedBytes)),
-				expectedContentBytes: reconstruction.expectedSize,
-			}));
-			this.persistMemoryDiagnostics();
+			result = await authority.materializeCaptureContent({ captureId: descriptor.captureId, boundarySequence: descriptor.boundarySequence, capability: descriptor.capability, bodyId: documentId, generation: entry.generation });
 		} catch (error) {
-			this.persistMemoryDiagnostics();
-			if (error instanceof RecoveryMemoryOperationTooLargeError) {
-				throw new BodyDefectError("corrupt_history", entry, "reconstruction exceeds the per-job memory budget");
-			}
-			throw error;
+			if (error instanceof TerminalRecoveryError) throw error;
+			throw new RetryableRecoveryError("capture_content_transient", RecoveryJobStateStore.safeInternalError(error));
 		}
-		const doc = createRecoveryDocument(documentId);
-		let oldStagingKey: string | null = null;
-		try {
-			if (reconstruction.stagingKey) {
-				const staged = await getBoundedObject(this.bucket(), reconstruction.stagingKey, reconstruction.stagingBytes);
-				if (!staged || !reconstruction.stagingHash) throw new BodyDefectError("missing_history", entry, "staged reconstruction missing");
-				const encoded = staged.bytes;
-				if (await sha256Hex(encoded) !== reconstruction.stagingHash) throw new BodyDefectError("corrupt_history", entry, "staged reconstruction corrupt");
-				crdtEngine.applyUpdate(doc, encoded, "staging-load");
-				oldStagingKey = reconstruction.stagingKey;
-			}
-			let chunk: RecipeChunk;
-			try {
-				chunk = await authority.getRecipeChunk({ captureId: descriptor.captureId, boundarySequence: descriptor.boundarySequence, capability: descriptor.capability, recipeId: reconstruction.recipeId, cursor: reconstruction.cursor, maxResponseBytes: MAX_RECIPE_BYTES });
-			} catch (error) {
-				if (isRetryableFailure(error)) throw new RetryableRecoveryError("recipe_chunk_transient", RecoveryJobStateStore.safeInternalError(error));
-				throw new BodyDefectError("missing_history", entry, RecoveryJobStateStore.safeInternalError(error));
-			}
-			assertRecoveryRecipeChunkAccounting(chunk);
-			if (chunk.encodedBytes > MAX_RECIPE_BYTES) throw new BodyDefectError("corrupt_history", entry, "recipe chunk exceeds bound");
-			const nextEncodedBytes = reconstruction.encodedBytes + chunk.encodedBytes;
-			if (!Number.isSafeInteger(nextEncodedBytes) || nextEncodedBytes > reconstruction.expectedHistoryBytes
-				|| (chunk.nextCursor === null && nextEncodedBytes !== reconstruction.expectedHistoryBytes)) {
-				throw new BodyDefectError("corrupt_history", entry, "recipe byte total does not match its descriptor");
-			}
-			const ordinal = Number(chunk.cursor);
-			if (!Number.isSafeInteger(ordinal) || chunk.parts.length === 0) throw new BodyDefectError("corrupt_history", entry, "recipe chunk made no progress");
-			this.store.putReconstructionParts(chunk.parts.map((part, index) => ({ ordinal: ordinal + index, ...part })));
-			const completeParts = applyStoredRecoveryRecipeParts(doc, this.store);
-			if (!completeParts) {
-				if (chunk.nextCursor === null) throw new BodyDefectError("corrupt_history", entry, "checkpoint recipe ended mid-fragment");
-				this.store.setReconstruction({ ...reconstruction, cursor: chunk.nextCursor, encodedBytes: nextEncodedBytes });
-				return false;
-			}
-			this.store.clearReconstructionParts();
-			if (chunk.nextCursor !== null) {
-				const encoded = crdtEngine.encodeStateAsUpdate(doc);
-				const hash = await sha256Hex(encoded);
-				const key = `${recoveryStagingPrefix(recoveryV2Prefix(vaultPrefix(descriptor.vaultId, descriptor.vaultGeneration)), recoveryJobId("capture", descriptor.vaultId, descriptor.vaultGeneration, descriptor.captureId))}/body/${documentId}/${hash}.yjs`;
-				await this.bucket().put(key, encoded, { contentType: "application/octet-stream" });
-				this.store.setReconstruction({ ...reconstruction, cursor: chunk.nextCursor, stagingKey: key, stagingHash: hash, stagingBytes: encoded.byteLength, encodedBytes: nextEncodedBytes });
-				if (oldStagingKey && oldStagingKey !== key) await this.bucket().delete(oldStagingKey);
-				return false;
-			}
-			let plain: Uint8Array;
-			if (entry.kind === "canvas") {
-				const validation = await validateCanvasDocument(doc);
-				if (validation.error !== null) throw new BodyDefectError("corrupt_history", entry, validation.error);
-				plain = validation.canonicalBytes;
-			} else plain = encoder.encode(crdtEngine.readText(doc, "body"));
-			if (plain.byteLength !== reconstruction.expectedSize || await sha256Hex(plain) !== reconstruction.expectedContentHash) {
-				throw new BodyDefectError("hash_mismatch", entry, "reconstructed Markdown mismatch");
-			}
-			const key = recoveryContentObjectKey(recoveryV2Prefix(vaultPrefix(descriptor.vaultId, descriptor.vaultGeneration)), reconstruction.expectedContentHash);
-			const lease = await authority.acquireMaterializationLease({ ownerKind: "capture", ownerId: descriptor.captureId, capability: descriptor.capability, objectKeys: [key] });
-			try {
-				const compressed = gzipSync(plain, { level: 6 });
-				const maximumPlainBytes = entry.kind === "canvas" ? CANVAS_LIMITS.canonicalBytes : MAX_CLIENT_MARKDOWN_BYTES;
-				const existing = await getBoundedObject(this.bucket(), key, MAX_RECOVERY_COMPRESSED_NODE_BYTES);
-				if (existing) {
-					try {
-						const current = gunzipRecoveryBytes(existing.bytes, MAX_RECOVERY_COMPRESSED_NODE_BYTES, maximumPlainBytes);
-						if (await sha256Hex(current) !== reconstruction.expectedContentHash) {
-							throw new TerminalRecoveryError("content_collision", "content-addressed object collision");
-						}
-					} catch (error) {
-						if (error instanceof TerminalRecoveryError) throw error;
-						throw new TerminalRecoveryError("content_collision", "content-addressed object is corrupt");
-					}
-				} else {
-					await this.bucket().put(key, compressed, { contentType: "application/gzip" });
-				}
-				this.store.putArtifact({ artifactKind: "content-object", logicalKey: `${documentId}:${entry.generation}`, objectKey: key, objectHash: reconstruction.expectedContentHash, entries: 1, bytes: plain.byteLength, metadata: null });
-				await authority.acknowledgeContentMaterialized({ captureId: descriptor.captureId, boundarySequence: descriptor.boundarySequence, capability: descriptor.capability, bodyId: documentId, generation: entry.generation, contentHash: reconstruction.expectedContentHash, plainBytes: plain.byteLength, objectKey: key });
-				const record = this.store.load();
-				if (record) this.commit(record, { contentObjectsWritten: record.contentObjectsWritten + 1, bytesRead: record.bytesRead + reconstruction.encodedBytes + chunk.encodedBytes, bytesWritten: record.bytesWritten + compressed.byteLength, updatedAt: Date.now() });
-			} finally {
-				await authority.releaseMaterializationLease(lease.leaseId);
-			}
-			if (oldStagingKey) await this.bucket().delete(oldStagingKey);
-			return true;
-		} catch (error) {
-			if (error instanceof BodyDefectError || error instanceof TerminalRecoveryError || error instanceof RetryableRecoveryError) throw error;
-			if (isRetryableFailure(error)) throw new RetryableRecoveryError("reconstruction_transient", RecoveryJobStateStore.safeInternalError(error));
-			throw new BodyDefectError("corrupt_history", entry, RecoveryJobStateStore.safeInternalError(error));
-		} finally {
-			crdtEngine.destroyDocument(doc);
-			memoryLease.release();
-			this.persistMemoryDiagnostics();
+		if (result.status === "busy") throw new RetryableRecoveryError("capture_content_busy", "content object write in flight");
+		if (result.status === "defect") throw new BodyDefectError(result.code, entry, result.message);
+		const expectedKey = recoveryContentObjectKey(recoveryV2Prefix(vaultPrefix(descriptor.vaultId, descriptor.vaultGeneration)), hash);
+		if (result.contentHash !== hash || result.plainBytes !== size || result.objectKey !== expectedKey) {
+			throw new BodyDefectError("corrupt_history", entry, "materialized content does not match the capture plan");
 		}
+		this.store.putArtifact({ artifactKind: "content-object", logicalKey: identity, objectKey: result.objectKey, objectHash: hash, entries: 1, bytes: size, metadata: null });
+		const record = this.store.load();
+		if (record) this.commit(record, { contentObjectsWritten: record.contentObjectsWritten + 1, updatedAt: Date.now() });
+		return true;
 	}
 
 	private async recordBodyDefect(descriptor: CaptureStartDescriptor, authority: RecoveryAuthorityRpc, error: BodyDefectError): Promise<void> {
@@ -2441,7 +2176,7 @@ export class RecoveryJobRuntime {
 		if (!rootArtifact) {
 			const root: SnapshotRootV2 = {
 				format: "yaos-recovery-v2",
-				snapshotFormatVersion: 3,
+				snapshotFormatVersion: RECOVERY_SNAPSHOT_FORMAT_VERSION,
 				snapshotId: descriptor.snapshotId,
 				vaultIdHash: await sha256Hex(encoder.encode(descriptor.vaultId)),
 				vaultGenerationHash: await sha256Hex(encoder.encode(descriptor.vaultGeneration)),
@@ -2496,173 +2231,6 @@ export class RecoveryJobRuntime {
 			errorRef: null,
 			updatedAt: Date.now(),
 		});
-	}
-
-	private async runProjectionSlice(record: RecoveryJobRecord, authority: RecoveryAuthorityRpc): Promise<void> {
-		const descriptor = this.descriptor("projection");
-		const cursor = this.store.getParsedMetadata(
-			"projection-cursor",
-			(value) => parseCursorMetadata(value, "projection progress"),
-		)?.cursor ?? null;
-		const page = await authority.getProjectionWorkPage({
-			vaultId: descriptor.vaultId,
-				vaultGeneration: descriptor.vaultGeneration,
-			leaseId: descriptor.leaseId,
-			capability: descriptor.capability,
-			cursor,
-			maxEntries: 1,
-			maxResponseBytes: MAX_CAPTURE_PLAN_BYTES,
-		});
-		const action = recoveryProjectionPageAction(page.entries.length, page.terminal, page.nextCursor);
-		if (action.kind !== "work") {
-			if (action.kind === "sleep") {
-				this.store.setMetadata("projection-cursor", { cursor: null });
-				this.deferredAlarmAt = Date.now() + 30_000;
-			} else {
-				this.store.setMetadata("projection-cursor", { cursor: action.cursor });
-			}
-			return;
-		}
-		const entry = page.entries[0]!;
-		let reconstruction = this.store.getReconstruction();
-		if (!reconstruction) {
-			const recipe = await authority.getProjectionRecipeDescriptor({
-				vaultId: descriptor.vaultId,
-				vaultGeneration: descriptor.vaultGeneration,
-				leaseId: descriptor.leaseId,
-				capability: descriptor.capability,
-				bodyId: entry.bodyId,
-				expectedHeadGeneration: entry.generation,
-			});
-			if (recipe.bodyId !== entry.bodyId || recipe.generation !== entry.generation
-				|| recipe.expectedContentHash !== entry.contentHash || recipe.expectedSize !== entry.size) {
-				throw new TerminalRecoveryError("projection_recipe_corrupt", "projection recipe descriptor mismatch");
-			}
-			reconstruction = {
-				bodyId: entry.bodyId,
-				generation: entry.generation,
-				recipeId: recipe.recipeId,
-				expectedContentHash: entry.contentHash,
-				expectedSize: entry.size,
-				cursor: recipe.firstCursor,
-				stagingKey: null,
-				stagingHash: null,
-				stagingBytes: 0,
-				expectedHistoryBytes: recipe.encodedHistoryBytes,
-				encodedBytes: 0,
-				attempts: 0,
-			};
-			this.store.setReconstruction(reconstruction);
-		}
-		if (reconstruction.bodyId !== entry.bodyId || reconstruction.generation !== entry.generation) {
-			this.store.clearReconstruction();
-			return;
-		}
-		const partStats = this.store.reconstructionPartsStats();
-		let memoryLease: RecoveryMemoryLease;
-		try {
-			memoryLease = this.memoryBudget.reserve(`projection:${entry.bodyId}`, reconstructionReservationBytes({
-				expectedHistoryBytes: reconstruction.expectedHistoryBytes,
-				stagingBytes: reconstruction.stagingBytes,
-				bufferedPartBytes: partStats.bytes,
-				nextChunkBytes: Math.min(MAX_RECIPE_BYTES, Math.max(0, reconstruction.expectedHistoryBytes - reconstruction.encodedBytes)),
-				expectedContentBytes: reconstruction.expectedSize,
-			}));
-			this.persistMemoryDiagnostics();
-		} catch (error) {
-			this.persistMemoryDiagnostics();
-			if (error instanceof RecoveryMemoryOperationTooLargeError) {
-				throw new TerminalRecoveryError("projection_memory_bound", error.message);
-			}
-			throw error;
-		}
-		const doc = createRecoveryDocument(entry.bodyId);
-		let oldStagingKey: string | null = null;
-		try {
-			if (reconstruction.stagingKey) {
-				const staged = await getBoundedObject(this.bucket(), reconstruction.stagingKey, reconstruction.stagingBytes);
-				if (!staged || !reconstruction.stagingHash) throw new RetryableRecoveryError("projection_staging_missing", "projection staging state missing");
-				const encoded = staged.bytes;
-				if (await sha256Hex(encoded) !== reconstruction.stagingHash) throw new TerminalRecoveryError("projection_staging_corrupt", "projection staging state corrupt");
-				crdtEngine.applyUpdate(doc, encoded, "staging-load");
-				oldStagingKey = reconstruction.stagingKey;
-			}
-			const chunk = await authority.getProjectionRecipeChunk({
-				vaultId: descriptor.vaultId,
-				vaultGeneration: descriptor.vaultGeneration,
-				leaseId: descriptor.leaseId,
-				capability: descriptor.capability,
-				bodyId: entry.bodyId,
-				expectedHeadGeneration: entry.generation,
-				recipeId: reconstruction.recipeId,
-				cursor: reconstruction.cursor,
-				maxResponseBytes: MAX_RECIPE_BYTES,
-			});
-			assertRecoveryRecipeChunkAccounting(chunk);
-			if (chunk.encodedBytes > MAX_RECIPE_BYTES) throw new TerminalRecoveryError("projection_recipe_oversized", "projection recipe chunk exceeds bound");
-			const nextEncodedBytes = reconstruction.encodedBytes + chunk.encodedBytes;
-			if (!Number.isSafeInteger(nextEncodedBytes) || nextEncodedBytes > reconstruction.expectedHistoryBytes
-				|| (chunk.nextCursor === null && nextEncodedBytes !== reconstruction.expectedHistoryBytes)) {
-				throw new TerminalRecoveryError("projection_recipe_corrupt", "projection recipe byte total does not match its descriptor");
-			}
-			const ordinal = Number(chunk.cursor);
-			if (!Number.isSafeInteger(ordinal) || chunk.parts.length === 0) throw new TerminalRecoveryError("projection_recipe_empty", "projection recipe chunk made no progress");
-			this.store.putReconstructionParts(chunk.parts.map((part, index) => ({ ordinal: ordinal + index, ...part })));
-			const completeParts = applyStoredRecoveryRecipeParts(doc, this.store);
-			if (!completeParts) {
-				if (chunk.nextCursor === null) throw new TerminalRecoveryError("projection_recipe_corrupt", "checkpoint recipe ended mid-fragment");
-				this.store.setReconstruction({ ...reconstruction, cursor: chunk.nextCursor, encodedBytes: nextEncodedBytes });
-				return;
-			}
-			this.store.clearReconstructionParts();
-			if (chunk.nextCursor !== null) {
-				const encoded = crdtEngine.encodeStateAsUpdate(doc);
-				const hash = await sha256Hex(encoded);
-				const key = `${recoveryStagingPrefix(recoveryV2Prefix(vaultPrefix(descriptor.vaultId, descriptor.vaultGeneration)), recoveryJobId("projection", descriptor.vaultId, descriptor.vaultGeneration))}/body/${entry.bodyId}/${hash}.yjs`;
-				await this.bucket().put(key, encoded, { contentType: "application/octet-stream" });
-				this.store.setReconstruction({ ...reconstruction, cursor: chunk.nextCursor, stagingKey: key, stagingHash: hash, stagingBytes: encoded.byteLength, encodedBytes: nextEncodedBytes });
-				if (oldStagingKey && oldStagingKey !== key) await this.bucket().delete(oldStagingKey);
-				return;
-			}
-			const bodyText = crdtEngine.readText(doc, "body");
-			const plain = encoder.encode(bodyText);
-			if (plain.byteLength !== entry.size || await sha256Hex(plain) !== entry.contentHash) {
-				throw new TerminalRecoveryError("projection_hash_mismatch", "projection content mismatch");
-			}
-			const key = recoveryContentObjectKey(recoveryV2Prefix(vaultPrefix(descriptor.vaultId, descriptor.vaultGeneration)), entry.contentHash);
-			const lease = await authority.acquireMaterializationLease({
-				ownerKind: "projection",
-				ownerId: descriptor.leaseId,
-				capability: descriptor.capability,
-				objectKeys: [key],
-			});
-			try {
-				if (!await this.bucket().head(key)) {
-					await this.bucket().put(key, gzipSync(plain, { level: 6 }), { contentType: "application/gzip" });
-				}
-				await authority.acknowledgeProjectionContentMaterialized({
-					vaultId: descriptor.vaultId,
-				vaultGeneration: descriptor.vaultGeneration,
-					leaseId: descriptor.leaseId,
-					capability: descriptor.capability,
-					bodyId: entry.bodyId,
-					expectedHeadGeneration: entry.generation,
-					contentHash: entry.contentHash,
-					plainBytes: plain.byteLength,
-					objectKey: key,
-				});
-			} finally {
-				await authority.releaseMaterializationLease(lease.leaseId);
-			}
-			if (oldStagingKey) await this.bucket().delete(oldStagingKey);
-			this.store.clearReconstruction();
-			this.store.setMetadata("projection-cursor", { cursor: page.nextCursor });
-			this.commit(record, { state: "materializing", processedEntries: record.processedEntries + 1, updatedAt: Date.now() });
-		} finally {
-			crdtEngine.destroyDocument(doc);
-			memoryLease.release();
-			this.persistMemoryDiagnostics();
-		}
 	}
 
 	private async runRestoreSlice(record: RecoveryJobRecord, authority: RecoveryAuthorityRpc): Promise<void> {
@@ -2874,9 +2442,9 @@ export class RecoveryJobRuntime {
 		const key = recoveryContent
 			? recoveryContentObjectKey(recoveryV2Prefix(vaultPrefix(record.vaultId, record.vaultGeneration)), item.contentHash)
 			: blobObjectKey(record.vaultId, record.vaultGeneration, item.contentHash);
-		const maximum = item.kind === "markdown" ? MAX_CLIENT_MARKDOWN_BYTES
-			: item.kind === "canvas" ? CANVAS_LIMITS.canonicalBytes : MAX_BLOB_UPLOAD_BYTES;
-		const storedMaximum = recoveryContent ? MAX_RECOVERY_COMPRESSED_NODE_BYTES : maximum;
+		// Format 4: Markdown/Canvas items are opaque state objects. The client decodes
+		// them and verifies size and sha256; the server only bounds the size.
+		const storedMaximum = recoveryContent ? MAX_RECOVERY_STATE_OBJECT_BYTES : MAX_BLOB_UPLOAD_BYTES;
 		let object: Awaited<ReturnType<ObjectStorePort["get"]>>;
 		try {
 			object = await getBoundedObject(this.bucket(), key, storedMaximum);
@@ -2884,10 +2452,9 @@ export class RecoveryJobRuntime {
 			return new Response("restore content corrupt", { status: 409 });
 		}
 		if (!object || object.size > storedMaximum) return new Response("restore content missing", { status: 409 });
-		let bytes = object.bytes;
-		if (recoveryContent) bytes = gunzipRecoveryBytes(bytes, storedMaximum, maximum);
-		if (bytes.byteLength !== item.size || await sha256Hex(bytes) !== item.contentHash) return new Response("restore content corrupt", { status: 409 });
-		return new Response(bytes, { headers: { "content-type": item.kind === "markdown" ? "text/markdown; charset=utf-8" : item.kind === "canvas" ? "application/json" : "application/octet-stream", "x-yaos-content-sha256": item.contentHash, "x-yaos-content-size": String(item.size) } });
+		const bytes = object.bytes;
+		if (!recoveryContent && (bytes.byteLength !== item.size || await sha256Hex(bytes) !== item.contentHash)) return new Response("restore content corrupt", { status: 409 });
+		return new Response(bytes, { headers: { "content-type": recoveryContent ? RECOVERY_STATE_CONTENT_TYPE : "application/octet-stream", "x-yaos-content-sha256": item.contentHash, "x-yaos-content-size": String(item.size) } });
 	}
 
 	async recordResults(input: { results: Array<{ itemId: string; outcome: RestoreItemOutcome; errorCode?: string }> }): Promise<{ accepted: number; complete: boolean; terminal: boolean }> {
@@ -2905,7 +2472,7 @@ export class RecoveryJobRuntime {
 		const record = this.store.load();
 		if (record) {
 			this.commit(record, { processedEntries: progress.processedEntries, totalEntries: progress.totalEntries, updatedAt: Date.now() });
-			await this.options.alarms.setAlarm(Date.now());
+			await this.alarms.setAlarm(Date.now());
 		}
 		return { accepted, complete: progress.complete, terminal: progress.complete };
 	}

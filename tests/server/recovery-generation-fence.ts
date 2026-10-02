@@ -32,12 +32,11 @@ const vaultId = "vault-fence-aa";
 const vaultGeneration = "generation-fence-aa";
 
 const internalMethods = [
-	"checkRecoveryJobLease", "getCapturePlanPage", "getRecipeDescriptors", "getRecipeChunk",
-	"acquireMaterializationLease", "releaseMaterializationLease", "acknowledgeContentMaterialized",
+	"checkRecoveryJobLease", "getCapturePlanPage", "materializeCaptureContent",
+	"acquireMaterializationLease", "releaseMaterializationLease",
 	"acknowledgeManifestNodeMaterialized", "acknowledgeManifestNodesMaterialized", "checkRecoveryCoverage",
 	"getIncrementalBase", "getCatalogDeltaPage", "resetCaptureDelta", "recordRecoveryDefects",
-	"finalizeCapture", "acknowledgeJobCancelled", "getProjectionWorkPage", "getProjectionRecipeDescriptor",
-	"getProjectionRecipeChunk", "acknowledgeProjectionContentMaterialized", "validateRestoreAuthority",
+	"finalizeCapture", "acknowledgeJobCancelled", "validateRestoreAuthority",
 	"completeRestore", "getGcRootPage", "completeGcMark", "acquireSweepLease", "releaseSweepLease",
 	"invalidateSweptObjects", "completeGcSweep", "abortRecoveryGc",
 ] as const;
@@ -111,42 +110,46 @@ s.test("every internal and public recovery RPC rejects stale generations before 
 	if (calls !== 0) throw new Error(`stale generation dispatched ${calls} recovery methods`);
 });
 
-s.test("projection work dispatches only with exact generation and private header", async () => {
+s.test("capture content materialization dispatches only with exact generation and private header", async () => {
 	let calls = 0;
-	let dispatchedGeneration: string | null = null;
+	let dispatchedBody: string | null = null;
 	const service: RecoveryRpcServicePort = {
-		async getProjectionWorkPage(input) {
+		async materializeCaptureContent(input) {
 			calls++;
-			dispatchedGeneration = input.vaultGeneration;
-			return { entries: [], nextCursor: null, terminal: true };
+			dispatchedBody = input.bodyId;
+			return { status: "busy" };
 		},
 	};
 	const store = recoveryStore({ vaultId, vaultGeneration });
-	const projectionParams = {
-		vaultId,
-		vaultGeneration,
-		leaseId: "lease-fence-aa",
+	const params = {
+		captureId: "capture-fence-aa",
+		boundarySequence: 7,
 		capability: "capability-fence-aa",
-		cursor: null,
-		maxEntries: 10,
-		maxResponseBytes: 16_384,
+		bodyId: "body-fence-aa",
+		generation: 1,
 	};
 	const wrongHeader = await handleVaultRecoveryRpc(
-		rpcRequest(RECOVERY_RPC_PATH, RECOVERY_PUBLIC_RPC_HEADER, vaultGeneration, "getProjectionWorkPage", projectionParams),
+		rpcRequest(RECOVERY_RPC_PATH, RECOVERY_PUBLIC_RPC_HEADER, vaultGeneration, "materializeCaptureContent", params),
+		vaultId,
+		store,
+		service,
+	);
+	const stale = await handleVaultRecoveryRpc(
+		rpcRequest(RECOVERY_RPC_PATH, RECOVERY_RPC_HEADER, "generation-stale-aa", "materializeCaptureContent", params),
 		vaultId,
 		store,
 		service,
 	);
 	const accepted = await handleVaultRecoveryRpc(
-		rpcRequest(RECOVERY_RPC_PATH, RECOVERY_RPC_HEADER, vaultGeneration, "getProjectionWorkPage", projectionParams),
+		rpcRequest(RECOVERY_RPC_PATH, RECOVERY_RPC_HEADER, vaultGeneration, "materializeCaptureContent", params),
 		vaultId,
 		store,
 		service,
 	);
-	const envelope = await decodedResponse(accepted) as { ok?: boolean; result?: { terminal?: boolean } } | undefined;
-	if (wrongHeader?.status !== 404 || accepted?.status !== 200 || envelope?.ok !== true
-		|| envelope.result?.terminal !== true || dispatchedGeneration !== vaultGeneration || calls !== 1) {
-		throw new Error("projection generation/header fence changed");
+	const envelope = await decodedResponse(accepted) as { ok?: boolean; result?: { status?: string } } | undefined;
+	if (wrongHeader?.status !== 404 || stale?.status !== 404 || accepted?.status !== 200 || envelope?.ok !== true
+		|| envelope.result?.status !== "busy" || dispatchedBody !== "body-fence-aa" || calls !== 1) {
+		throw new Error("capture content generation/header fence changed");
 	}
 });
 

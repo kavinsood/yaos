@@ -442,7 +442,40 @@ export abstract class VaultDocumentStore {
 	 */
 	readonly documentMaterialisations = { root: 0, nonRoot: 0, recentNonRoot: [] as string[] };
 
-	constructor(protected readonly storage: VaultStoragePort) {}
+	protected readonly storage: VaultStoragePort;
+
+	constructor(storage: VaultStoragePort) {
+		this.storage = this.guardRollbacks(storage);
+	}
+
+	/**
+	 * Wraps `transactionSync` so a rolled-back transaction drops in-memory state
+	 * derived from rows it may have read before the rollback (see
+	 * `VaultCatalogStore.catalogPathIndex`). Other stores sharing the storage
+	 * (`RelayBodyStore`) route their transactions through this too.
+	 */
+	guardRollbacks<T extends VaultStoragePort>(storage: T): T {
+		const onRollback = () => this.discardDerivedState();
+		return new Proxy(storage, {
+			get(target, property) {
+				if (property === "transactionSync") {
+					return <R>(closure: () => R): R => {
+						try {
+							return target.transactionSync(closure);
+						} catch (error) {
+							onRollback();
+							throw error;
+						}
+					};
+				}
+				const value = Reflect.get(target, property, target) as unknown;
+				return typeof value === "function" ? (value as (...args: unknown[]) => unknown).bind(target) : value;
+			},
+		});
+	}
+
+	/** Drop caches derived from SQLite rows; called after any transaction rollback. */
+	protected discardDerivedState(): void {}
 
 	abstract activePins(now?: number): HistoryPin[];
 
@@ -958,14 +991,22 @@ export abstract class VaultDocumentStore {
 				created_at INTEGER NOT NULL,
 				updated_at INTEGER NOT NULL
 			);
-			CREATE TABLE IF NOT EXISTS recovery_projection_lease (
+			-- Vault-side opaque recovery projection (snapshot format 4): every document whose
+			-- head moved at or before watermark has its state object in R2, except the ids in
+			-- pending (no content identity yet) and the window being drained from cursor.
+			CREATE TABLE IF NOT EXISTS recovery_state_projection (
 				id INTEGER PRIMARY KEY CHECK(id = 1),
-				lease_id TEXT NOT NULL,
-				capability_hash TEXT NOT NULL,
-				expires_at INTEGER NOT NULL,
-				enabled INTEGER NOT NULL,
-				runtime_epoch TEXT NOT NULL,
+				watermark INTEGER NOT NULL,
+				target INTEGER,
+				cursor TEXT,
+				pending TEXT NOT NULL,
 				updated_at INTEGER NOT NULL
+			);
+			-- Durable "projection wake owed" marker: a note/catalog mutation happened and the
+			-- recovery projection must be woken at due_at (it no longer polls).
+			CREATE TABLE IF NOT EXISTS recovery_projection_wake (
+				id INTEGER PRIMARY KEY CHECK(id = 1),
+				due_at INTEGER NOT NULL
 			);
 			CREATE TABLE IF NOT EXISTS recovery_key_leases (
 				object_key TEXT PRIMARY KEY,
@@ -1621,21 +1662,40 @@ export abstract class VaultDocumentStore {
 		if (!Number.isSafeInteger(entryThreshold) || entryThreshold < 1
 			|| !Number.isSafeInteger(byteThreshold) || byteThreshold < 1
 			|| !Number.isSafeInteger(limit) || limit < 1) throw new Error("invalid checkpoint candidate query");
-		return this.storage.sql.exec<{ document_id: string }>(`WITH checkpoint AS (
-		  SELECT head.document_id, COALESCE(MAX(manifest.checkpoint_sequence), 0) AS checkpoint_sequence
-		    FROM vault_document_heads head
-		    LEFT JOIN vault_checkpoint_manifests manifest
-		      ON manifest.document_id = head.document_id AND manifest.complete = 1
-		   GROUP BY head.document_id
-		)
-		SELECT journal.document_id
-		  FROM vault_journal journal
-		  JOIN checkpoint ON checkpoint.document_id = journal.document_id
-		   AND journal.sequence > checkpoint.checkpoint_sequence
-		 GROUP BY journal.document_id
-		HAVING COUNT(*) >= ? OR COALESCE(SUM(journal.update_byte_length), 0) >= ?
-		 ORDER BY MIN(journal.sequence), journal.document_id LIMIT ?`,
-			entryThreshold, byteThreshold, limit).toArray().map((row) => row.document_id);
+		// Skip-scan the journal's documents (journal rows exist only for bodies
+		// edited since their checkpoint) instead of joining every document head:
+		// rows read are ~3 per journaled document plus its rows after the
+		// checkpoint, independent of vault size. Runs on every vault alarm.
+		const candidates: Array<{ documentId: string; first: number }> = [];
+		let cursor = "";
+		for (;;) {
+			const next = this.storage.sql.exec<{ document_id: string }>(
+				"SELECT document_id FROM vault_journal WHERE document_id > ? ORDER BY document_id LIMIT 1", cursor,
+			).toArray()[0];
+			if (!next) break;
+			cursor = next.document_id;
+			const present = this.storage.sql.exec<{ present: number }>(
+				"SELECT 1 AS present FROM vault_document_heads WHERE document_id = ?", cursor,
+			).toArray().length > 0;
+			if (!present) continue;
+			const checkpointSequence = this.storage.sql.exec<{ sequence: number | null }>(
+				`SELECT MAX(checkpoint_sequence) AS sequence FROM vault_checkpoint_manifests
+				 WHERE document_id = ? AND complete = 1`, cursor,
+			).one().sequence ?? 0;
+			const journal = this.storage.sql.exec<{ entries: number; bytes: number; first: number | null }>(
+				`SELECT COUNT(*) AS entries, COALESCE(SUM(update_byte_length), 0) AS bytes, MIN(sequence) AS first
+				 FROM vault_journal WHERE document_id = ? AND sequence > ?`, cursor, checkpointSequence,
+			).one();
+			if (journal.first === null) continue;
+			if (journal.entries >= entryThreshold || journal.bytes >= byteThreshold) {
+				candidates.push({ documentId: cursor, first: journal.first });
+			}
+		}
+		return candidates
+			.sort((left, right) => left.first - right.first
+				|| (left.documentId < right.documentId ? -1 : left.documentId > right.documentId ? 1 : 0))
+			.slice(0, limit)
+			.map((candidate) => candidate.documentId);
 	}
 
 	reconstructDocument(documentId: string, throughSequence = this.currentSequence()): ReconstructedDocument {
@@ -2612,6 +2672,9 @@ export abstract class VaultDocumentStore {
 			checkpointSequence,
 			throughSequence,
 		).one().bytes;
+		for (const record of this.relayTailRecords(documentId, checkpointSequence, throughSequence).records) {
+			bytes += record.update.byteLength;
+		}
 		return bytes;
 	}
 
@@ -2730,6 +2793,27 @@ export abstract class VaultDocumentStore {
 				expectedBytes: row.update_byte_length, bytes: new Uint8Array(row.data),
 			});
 		}
+		const journalCount = this.storage.sql.exec<{ count: number }>(
+			`SELECT COUNT(*) AS count FROM vault_journal
+			 WHERE document_id = ? AND sequence > ? AND sequence <= ?`,
+			documentId,
+			checkpointSequence,
+			throughSequence,
+		).one().count;
+		// Relay v3: group commits live in the body's tail row, not the journal. Its records
+		// in (checkpoint, through] are the third recipe segment, after the journal rows (Yjs
+		// updates commute, so segment order does not change the merged state).
+		const tail = this.relayTailRecords(documentId, checkpointSequence, throughSequence).records;
+		const journalExhausted = checkpointExhausted && journalOffset + journalRows.length >= journalCount;
+		if (journalExhausted && tail.length > 0) {
+			const tailOffset = Math.max(0, offset - checkpointCount - journalCount);
+			for (const record of tail.slice(tailOffset, tailOffset + Math.max(0, 256 - candidates.length))) {
+				candidates.push({
+					kind: "journal", sequence: record.sequence, fragmentIndex: 0, fragmentCount: 1,
+					expectedBytes: record.update.byteLength, bytes: record.update,
+				});
+			}
+		}
 		const selected: typeof candidates = [];
 		let encodedBytes = 0;
 		for (const item of candidates) {
@@ -2742,13 +2826,7 @@ export abstract class VaultDocumentStore {
 		const parts = selected.map(({ kind, sequence, fragmentIndex, fragmentCount, bytes }) =>
 			({ kind, sequence, fragmentIndex, fragmentCount, bytes }));
 		const consumed = offset + selected.length;
-		const total = checkpointCount + this.storage.sql.exec<{ count: number }>(
-			`SELECT COUNT(*) AS count FROM vault_journal
-			 WHERE document_id = ? AND sequence > ? AND sequence <= ?`,
-			documentId,
-			checkpointSequence,
-			throughSequence,
-		).one().count;
+		const total = checkpointCount + journalCount + tail.length;
 		return { parts, nextCursor: consumed < total ? String(consumed) : null, encodedBytes };
 	}
 }

@@ -159,7 +159,7 @@ s.section("Settings capability is optional for note sync");
 		schemaVersion: 8,
 		storageFormatVersion: 4,
 		protocolVersion: 5,
-		snapshotFormatVersion: 3,
+		snapshotFormatVersion: 4,
 		recoveryJobs: false,
 		updateProvider: null,
 		updateRepoUrl: null,

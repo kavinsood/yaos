@@ -107,7 +107,13 @@ export class RelayBodyStore {
 	private leaseTableReady = false;
 	private budgetTableReady = false;
 
-	constructor(private readonly storage: VaultStoragePort, private readonly store: VaultStore) {}
+	private readonly storage: VaultStoragePort;
+
+	constructor(storage: VaultStoragePort, private readonly store: VaultStore) {
+		// Catalog events this store writes feed the vault store's path index;
+		// a rollback here must invalidate it like one in the vault store.
+		this.storage = store.guardRollbacks(storage);
+	}
 
 	appendRelayBodyUpdate(input: RelayAppendInput): RelayAppendResult {
 		if (input.update.byteLength === 0) throw new Error("empty relay update is not a commit");
@@ -229,6 +235,7 @@ export class RelayBodyStore {
 				written.toArray();
 				rowsWritten += written.rowsWritten;
 			}
+			if (input.receipts.length > 0) this.store.noteCandidateReceiptInserts(input.receipts.length);
 			result = { vaultSequence: sequence, generation, semanticEpoch, fileId: catalog.file_id, path: catalog.path,
 				contentHash, size, rowsRead, rowsWritten };
 		});

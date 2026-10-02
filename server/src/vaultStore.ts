@@ -702,6 +702,7 @@ export class VaultStore extends RecoveryAuthorityStore {
 				now,
 			).toArray();
 		});
+		this.noteCandidateReceiptInserts(1);
 		if (input.changesState) {
 			this.observeCommit({ documentId: input.bodyId, ingressBytes,
 				commitLatencyMs: performance.now() - commitStartedAt, vaultSequence: receipt.vaultSequence });

@@ -1,3 +1,5 @@
+import { projectStateDocuments, runStateProjectionPass, type StateProjectionPorts } from "./recoveryStateProjection";
+import { DAILY_LIMIT_ERROR_CODE, isCloudflareDailyLimitError, nextUtcMidnight } from "./dailyLimit";
 import type { YwasmCrdtDocument } from "./crdt/ywasmCrdtEngine";
 import { ywasmCrdtEngine as crdtEngine } from "@yaos/crdt-engine";
 import { encodeBinaryEnvelope, YAOS_BINARY_CONTENT_TYPE } from "./shared/binaryEnvelope";
@@ -229,9 +231,62 @@ type AlarmArmOutcome = "armed" | "kept" | "failed";
 /** Delay before retrying a relay checkpoint pass that threw (not latched by the daily limit). */
 const RELAY_CHECKPOINT_FAILURE_BACKOFF_MS = 5_000;
 
+/**
+ * Recovery projection is woken by change, not polling: a write to a projection
+ * input owes one debounced wake. Inputs are everything that moves a Markdown or
+ * Canvas head: catalog events, the body journal (lean rows overlay it), the
+ * semantic catalog, and on relay v3 the group-commit tail (`relay_body_tail`
+ * appends and accepted-hash backfills; the checkpoint trim `UPDATE ... SET
+ * base_sequence` and DELETEs move no head). Projection bookkeeping writes other
+ * tables, so a pass never wakes itself.
+ */
+const PROJECTION_INPUT_WRITE = new RegExp(
+	"^\\s*(?:(?:INSERT(?:\\s+OR\\s+\\w+)?\\s+INTO|REPLACE\\s+INTO|UPDATE(?:\\s+OR\\s+\\w+)?)\\s+"
+	+ "(?:vault_catalog_events|vault_journal|vault_semantic_catalog_events)\\b"
+	+ "|INSERT\\s+INTO\\s+relay_body_tail\\b"
+	+ "|UPDATE\\s+relay_body_tail\\s+SET\\s+content_hash\\b)",
+	"i",
+);
+const PROJECTION_WAKE_DELAY_MS = 60_000;
+const PROJECTION_WAKE_RETRY_MS = 5 * 60_000;
+/** A bounded pass left work (budget or window truncated): continue soon. */
+const PROJECTION_MORE_WORK_MS = 1_000;
+
+/** Exported for tests: does this statement owe a projection wake? */
+export function isProjectionInputWrite(query: string): boolean {
+	return PROJECTION_INPUT_WRITE.test(query);
+}
+
+function watchProjectionInputs<T extends VaultRuntimeStoragePort>(storage: T, onWrite: () => void): T {
+	const target = storage.sql;
+	const sql = new Proxy(target, {
+		get(inner, property) {
+			if (property === "exec") {
+				return (query: string, ...bindings: unknown[]) => {
+					const cursor = (inner.exec as (query: string, ...bindings: unknown[]) => unknown)(query, ...bindings);
+					if (PROJECTION_INPUT_WRITE.test(query)) onWrite();
+					return cursor;
+				};
+			}
+			const value = Reflect.get(inner, property, inner) as unknown;
+			return typeof value === "function" ? (value as (...args: unknown[]) => unknown).bind(inner) : value;
+		},
+	});
+	return new Proxy(storage, {
+		get(inner, property) {
+			if (property === "sql") return sql;
+			const value = Reflect.get(inner, property, inner) as unknown;
+			return typeof value === "function" ? (value as (...args: unknown[]) => unknown).bind(inner) : value;
+		},
+	});
+}
+
 /** Schema-8 root/Markdown/Canvas composition, independent of a worker or process host. */
 export class VaultRuntime implements DrainPort {
 	private store: VaultStore;
+	private readonly storage: VaultRuntimeStoragePort;
+	/** In-memory twin of the durable `recovery_projection_wake` marker (see markProjectionDirty). */
+	private projectionWakeOwed = false;
 	private settings: SettingsSyncStore;
 	private readonly runtimeEpoch = crypto.randomUUID();
 	private readonly dailyLimit: DailyLimitLatch;
@@ -261,12 +316,15 @@ export class VaultRuntime implements DrainPort {
 
 	constructor(private readonly options: VaultRuntimeOptions) {
 		this.dailyLimit = options.dailyLimit ?? new DailyLimitLatch();
-		this.store = new VaultStore(options.storage);
+		this.storage = options.objectStore
+			? watchProjectionInputs(options.storage, () => this.markProjectionDirty())
+			: options.storage;
+		this.store = new VaultStore(this.storage);
 		if ((options.relayBodies ?? relayBodiesTestDefault()) && (options.relayConfig ?? readRelayConfig(null)).leanRows) {
 			this.store.enableLeanRows();
 			if ((options.relayConfig ?? readRelayConfig(null)).groupCommit) this.store.enableRelayTail();
 		}
-		this.settings = new SettingsSyncStore(options.storage);
+		this.settings = new SettingsSyncStore(this.storage);
 		let socketOwner: VaultSocketService;
 		this.cache = new VaultDocumentCache(
 			this.store,
@@ -280,7 +338,7 @@ export class VaultRuntime implements DrainPort {
 		const vaultId = () => this.requireMetadata().vaultId;
 		const vaultGeneration = () => this.requireMetadata().vaultGeneration;
 		if (options.relayBodies ?? relayBodiesTestDefault()) {
-			this.relayStore = new RelayBodyStore(options.storage, this.store);
+			this.relayStore = new RelayBodyStore(this.storage, this.store);
 			this.relay = new RelayBodyService({
 				config: options.relayConfig ?? readRelayConfig(null),
 				store: () => this.store,
@@ -422,7 +480,9 @@ export class VaultRuntime implements DrainPort {
 		this.recovery = new VaultRecoveryService({
 			alarms: {
 				setAlarm: (scheduledTime) => this.armAlarmEarliest(scheduledTime).then(() => undefined),
-				deleteAlarm: () => options.alarms.deleteAlarm(),
+				// The vault alarm is shared (relay checkpoint, compaction, maintenance,
+				// projection wake): a subsystem may only arm it earlier, never delete it.
+				deleteAlarm: async () => {},
 				getAlarm: () => options.alarms.getAlarm?.() ?? Promise.resolve(null),
 			},
 			objectStore: options.objectStore,
@@ -952,6 +1012,99 @@ export class VaultRuntime implements DrainPort {
 			|| gc?.state === "marking" || gc?.state === "sweeping") {
 			await this.armAlarmEarliest(Date.now() + 60_000);
 		}
+		await this.runOwedProjectionWake();
+	}
+
+	/**
+	 * A projection input changed: owe one wake of the projection, debounced so a
+	 * burst of edits costs one marker row, one alarm and one projection pass. The
+	 * marker is durable so the wake survives eviction before the alarm fires. The
+	 * alarm is shared with relay checkpoints and maintenance: it is only ever armed
+	 * earlier (armAlarmEarliest), and alarm() re-arms whichever deadline remains.
+	 */
+	private markProjectionDirty(): void {
+		if (this.projectionWakeOwed || this.deleted) return;
+		this.projectionWakeOwed = true;
+		const dueAt = Date.now() + PROJECTION_WAKE_DELAY_MS;
+		// Out of band of the observed statement (its cursor may still be open, or it may
+		// sit inside a transactionSync closure): record the marker, then arm the alarm.
+		this.options.execution.waitUntil(Promise.resolve().then(async () => {
+			if (this.deleted) return;
+			try { this.store.oweProjectionWake(dueAt); }
+			catch (error) { console.warn("[yaos-vault] projection wake marker failed", error); }
+			await this.armAlarmEarliest(dueAt);
+		}).catch((error: unknown) => console.warn("[yaos-vault] projection wake alarm failed", error)));
+	}
+
+	private async runOwedProjectionWake(): Promise<void> {
+		if (!this.options.objectStore || this.deleted) return;
+		const marked = this.store.projectionWakeDueAt();
+		if (marked === null && !this.projectionWakeOwed) return;
+		const dueAt = marked ?? Date.now();
+		if (dueAt > Date.now()) {
+			await this.armAlarmEarliest(dueAt);
+			return;
+		}
+		// Clear before waking: a mutation from here on owes (and durably records) a new wake.
+		this.projectionWakeOwed = false;
+		if (marked !== null) this.store.clearProjectionWake();
+		const metadata = this.store.vaultMetadata();
+		if (!metadata) return;
+		let retryAt: number | null = null;
+		try {
+			const result = await runStateProjectionPass(this.stateProjectionPorts(metadata));
+			if (result.more) retryAt = Date.now() + PROJECTION_MORE_WORK_MS;
+		} catch (error) {
+			// Daily limit: owe the wake at the reset, never a tight retry loop. Other
+			// failures (R2, eviction-adjacent storage errors) retry later; progress was
+			// not saved, and content already indexed is a one-read skip on retry.
+			const limited = isCloudflareDailyLimitError(error);
+			console.warn("[yaos-vault] recovery state projection failed", limited ? DAILY_LIMIT_ERROR_CODE : error);
+			retryAt = limited ? nextUtcMidnight(Date.now()) : Date.now() + PROJECTION_WAKE_RETRY_MS;
+		}
+		if (retryAt !== null) {
+			this.projectionWakeOwed = true;
+			try { this.store.oweProjectionWake(retryAt); } catch { /* the in-memory owed flag still retries */ }
+			try { await this.armAlarmEarliest(retryAt); }
+			catch (error) { if (!isCloudflareDailyLimitError(error)) throw error; }
+		}
+	}
+
+	private stateProjectionPorts(metadata: { vaultId: string; vaultGeneration: string }): StateProjectionPorts {
+		if (!this.options.objectStore) throw new Error("recovery storage unavailable");
+		return { store: this.store, objectStore: this.options.objectStore, vaultId: metadata.vaultId, vaultGeneration: metadata.vaultGeneration };
+	}
+
+	/**
+	 * Inline best-effort recovery projection (b3 P2 hook for bulk create). Await it
+	 * after the bulk-create transaction commits, under `waitUntil` so the response
+	 * is not held. Never throws and never moves the watermark: the next watermark
+	 * pass rechecks these ids (an indexed hash costs it one read and no put).
+	 * Bounded to 64 ids / 24 MiB of history; the rest is left to the alarm. A no-op
+	 * without R2 or after deletion.
+	 */
+	async projectRecoveryStateInline(documentIds: readonly string[]): Promise<{ projected: number; skipped: number }> {
+		const metadata = this.store.vaultMetadata();
+		if (!this.options.objectStore || this.deleted || !metadata) return { projected: 0, skipped: documentIds.length };
+		try {
+			return await projectStateDocuments(this.stateProjectionPorts(metadata), documentIds);
+		} catch {
+			return { projected: 0, skipped: documentIds.length };
+		}
+	}
+
+	/**
+	 * Adapter for b3-bulk's `VaultRuntimeOptions.onBulkCreateCommitted`
+	 * (`VaultBulkCreateService.onBulkCreateCommitted`, branch b3-bulk): synchronous,
+	 * returns at once, and schedules `projectRecoveryStateInline` for the batch's
+	 * body ids under `waitUntil`, so the receipt is never delayed. The event's
+	 * bytes are not reused: the pass re-reads the committed checkpoint so head and
+	 * bytes come from one synchronous read. The watermark alarm is the guarantee.
+	 */
+	recoveryBulkCreateCommitted(event: { readonly bodies: ReadonlyArray<{ readonly bodyId: string }> }): void {
+		const ids = event.bodies.map((body) => body.bodyId);
+		if (ids.length === 0 || !this.options.objectStore) return;
+		this.options.execution.waitUntil(this.projectRecoveryStateInline(ids));
 	}
 
 	private async provision(vaultId: string, request: Request): Promise<Response> {
@@ -966,11 +1119,6 @@ export class VaultRuntime implements DrainPort {
 		const result = this.store.provisionVault(vaultId, body.vaultGeneration, crdtEngine.encodeStateAsUpdate(root));
 		crdtEngine.destroyDocument(root);
 		this.deleted = false;
-		try {
-			await this.recovery.initializeProjection(vaultId);
-		} catch (error) {
-			console.warn("[yaos-vault] recovery projection unavailable", error);
-		}
 		return json(result, result.created ? 201 : 200);
 	}
 
@@ -994,12 +1142,13 @@ export class VaultRuntime implements DrainPort {
 		this.persistence.clear();
 		await this.options.alarms.deleteAlarm();
 		await this.options.storage.deleteAll();
-		this.store = new VaultStore(this.options.storage);
+		this.projectionWakeOwed = false;
+		this.store = new VaultStore(this.storage);
 		if (this.relay && this.relay.config.leanRows) this.store.enableLeanRows();
 		if (this.relay && this.relay.config.groupCommit) this.store.enableRelayTail();
 		this.store.setCommitObserver((observation) => this.afterDurableCommit(observation));
-		if (this.relayStore) this.relayStore = new RelayBodyStore(this.options.storage, this.store);
-		this.settings = new SettingsSyncStore(this.options.storage);
+		if (this.relayStore) this.relayStore = new RelayBodyStore(this.storage, this.store);
+		this.settings = new SettingsSyncStore(this.storage);
 		return json({ deleted: true });
 	}
 
@@ -1488,7 +1637,9 @@ export class VaultRuntime implements DrainPort {
 				const prior = this.persistence.get(documentId);
 				this.persistence.set(documentId, { status: "degraded", lastError: reason,
 					lastSuccessAt: prior?.lastSuccessAt ?? null, failures: (prior?.failures ?? 0) + 1 });
-				await this.setAlarmGuarded(Date.now() + PERSIST_RETRY_MS, false);
+				// Shared alarm: never push out an earlier deadline (relay checkpoint, projection wake).
+				// D8-guarded like every other arm (armAlarmEarliest → setAlarmGuarded).
+				await this.armAlarmEarliest(Date.now() + PERSIST_RETRY_MS);
 			}
 		}));
 		this.flushLanes.set(documentId, flush);
