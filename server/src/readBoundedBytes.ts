@@ -25,12 +25,13 @@ export async function readBoundedBytes(
 	}
 
 	const declaredHeader = request.headers.get("Content-Length");
+	let declared: number | null = null;
 	if (declaredHeader !== null) {
 		const trimmed = declaredHeader.trim();
 		if (!/^\d+$/.test(trimmed)) {
 			throw new BoundedBodyError("invalid_content_length");
 		}
-		const declared = Number(trimmed);
+		declared = Number(trimmed);
 		if (!Number.isSafeInteger(declared)) {
 			throw new BoundedBodyError("invalid_content_length");
 		}
@@ -43,6 +44,24 @@ export async function readBoundedBytes(
 	if (!body) {
 		if (options.allowEmpty) return new Uint8Array();
 		throw new BoundedBodyError("missing_body");
+	}
+
+	// Declared length within the cap: HTTP framing bounds the body to `declared` bytes, so read it natively
+	// in one call. The chunk loop below pulls ~4 KiB edge chunks through JS one await at a time, which cost
+	// the front Worker ~12–15 ms CPU per MiB on deployed Workers (b3-cpu handoff).
+	if (declared !== null) {
+		let buffer: ArrayBuffer;
+		try {
+			buffer = await request.arrayBuffer();
+		} catch {
+			throw new BoundedBodyError("body_read_failed");
+		}
+		if (buffer.byteLength > maxBytes) throw new BoundedBodyError("body_too_large");
+		if (buffer.byteLength === 0) {
+			if (options.allowEmpty) return new Uint8Array();
+			throw new BoundedBodyError("missing_body");
+		}
+		return new Uint8Array(buffer);
 	}
 
 	let reader: ReadableStreamDefaultReader<unknown>;
