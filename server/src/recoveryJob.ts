@@ -94,6 +94,7 @@ import { CloudflareActorCalls, CloudflareAlarmPort, CloudflareObjectStore } from
 import { decodeBinaryEnvelope, encodeBinaryEnvelope, YAOS_BINARY_CONTENT_TYPE } from "./shared/binaryEnvelope.js";
 import { MAX_BLOB_UPLOAD_BYTES } from "./contracts.js";
 import { MAX_CLIENT_MARKDOWN_BYTES, SQLITE_ROW_SAFE_BYTES } from "./shared/durableLimits.js";
+import { DAILY_LIMIT_ERROR_CODE, DailyLimitLatch, instrumentStorageForDailyLimit } from "./dailyLimit.js";
 import { CANVAS_LIMITS } from "./shared/canvasLimits.js";
 import {
 	RecoveryMemoryBudget,
@@ -1336,6 +1337,44 @@ class CaptureManifestStore implements ManifestNodeStore {
 }
 
 
+/**
+ * b3-merge's `setAlarmGuarded` policy (D8, server/src/dailyLimit.ts) for a
+ * RecoveryJob alarm port: while the daily row limit is latched no alarm is armed
+ * before the 00:00 UTC reset (each `setAlarm` is a billed row write and the
+ * slice it schedules would fail on the same limit); an alarm already due at or
+ * before that target is kept; a `setAlarm`/`deleteAlarm` that itself fails on
+ * the limit is noted and dropped.
+ */
+export function dailyLimitGuardedAlarms(alarms: AlarmPort, latch: DailyLimitLatch): AlarmPort {
+	return {
+		async setAlarm(scheduledTime: number): Promise<void> {
+			const resetAt = latch.body()?.resetAt ?? null;
+			const at = resetAt === null ? scheduledTime : Math.max(scheduledTime, resetAt);
+			if (resetAt !== null) {
+				const current = await alarms.getAlarm?.();
+				if (current !== undefined && current !== null && current <= at) return;
+			}
+			try {
+				await alarms.setAlarm(at);
+			} catch (error) {
+				if (latch.note(error)) {
+					console.warn("[yaos-recovery-job] alarm not armed: Cloudflare daily row limit");
+					return;
+				}
+				throw error;
+			}
+		},
+		async deleteAlarm(): Promise<void> {
+			try {
+				await alarms.deleteAlarm();
+			} catch (error) {
+				if (!latch.note(error)) throw error;
+			}
+		},
+		...(alarms.getAlarm ? { getAlarm: () => alarms.getAlarm!() } : {}),
+	};
+}
+
 /** Alarm-driven, SQLite-backed recovery state machine, independent of the alarm host. */
 export class RecoveryJobRuntime {
 	private readonly store: RecoveryJobStateStore;
@@ -1344,9 +1383,19 @@ export class RecoveryJobRuntime {
 	private deferredAlarmAt: number | null = null;
 	/** Set by a projection slice that found nothing to do: the dispatch ends with no successor alarm. */
 	private projectionIdle = false;
+	/** D8: latched when a storage or alarm write fails on Cloudflare's daily free-tier row limit. */
+	private readonly dailyLimit: DailyLimitLatch;
+	private readonly alarms: AlarmPort;
 	constructor(private readonly options: RecoveryJobRuntimeOptions) {
 		this.memoryBudget = new RecoveryMemoryBudget(options.memoryBudgetBytes);
-		this.store = new RecoveryJobStateStore(options.storage);
+		this.dailyLimit = new DailyLimitLatch();
+		this.store = new RecoveryJobStateStore(instrumentStorageForDailyLimit(options.storage, this.dailyLimit));
+		this.alarms = dailyLimitGuardedAlarms(options.alarms, this.dailyLimit);
+	}
+
+	/** Test/diagnostic view of the D8 latch. */
+	dailyLimitResetAt(): number | null {
+		return this.dailyLimit.body()?.resetAt ?? null;
 	}
 
 	recoveryMemorySnapshot(): ReturnType<RecoveryMemoryBudget["snapshot"]> {
@@ -1396,7 +1445,7 @@ export class RecoveryJobRuntime {
 				if (!record || record.kind !== "projection") throw new Error("projection job is not initialized");
 				const wake = this.store.getParsedMetadata("projection-wake", parseProjectionWake) ?? { requested: 0, consumed: 0 };
 				this.store.setMetadata("projection-wake", { requested: wake.requested + 1, consumed: wake.consumed });
-				await this.options.alarms.setAlarm(Date.now());
+				await this.alarms.setAlarm(Date.now());
 				return Response.json(null);
 			}
 			if (route === "/__yaos/recovery-job/purge/rotate-capability" && request.method === "POST") {
@@ -1545,7 +1594,7 @@ export class RecoveryJobRuntime {
 			createdAt: descriptor.createdAt,
 			metadata,
 		});
-		await this.options.alarms.setAlarm(Date.now());
+		await this.alarms.setAlarm(Date.now());
 		return { jobId: expectedId, kind, capabilityHash: await sha256Hex(encoder.encode(capability)), created: initialized.created };
 	}
 
@@ -1575,7 +1624,7 @@ export class RecoveryJobRuntime {
 			completedAt: null,
 			updatedAt: Date.now(),
 		});
-		await this.options.alarms.setAlarm(Date.now());
+		await this.alarms.setAlarm(Date.now());
 		return {
 			jobId: expectedId,
 			kind: "projection",
@@ -1610,7 +1659,7 @@ export class RecoveryJobRuntime {
 			completedAt: state === "complete" ? record.completedAt : null,
 			updatedAt: Date.now(),
 		});
-		if (!isTerminalRecoveryState(state)) await this.options.alarms.setAlarm(Date.now());
+		if (!isTerminalRecoveryState(state)) await this.alarms.setAlarm(Date.now());
 		return {
 			capabilityHash: await sha256Hex(encoder.encode(input.capability)),
 			state,
@@ -1623,7 +1672,7 @@ export class RecoveryJobRuntime {
 			|| (record.state !== "queued" && record.state !== "purging")) {
 			throw new Error("purge job is not wakeable");
 		}
-		await this.options.alarms.setAlarm(Date.now());
+		await this.alarms.setAlarm(Date.now());
 	}
 
 	async republishPurge(): Promise<void> {
@@ -1702,7 +1751,7 @@ export class RecoveryJobRuntime {
 		if (record.state === "complete" || record.state === "complete_with_gaps") throw new Error("completed recovery job cannot be cancelled");
 		if (!canCancelRecoveryJob(record.state)) return;
 		this.store.requestCancellation(Date.now());
-		await this.options.alarms.setAlarm(Date.now());
+		await this.alarms.setAlarm(Date.now());
 	}
 
 	requestCancellation(): Promise<void> {
@@ -1712,12 +1761,28 @@ export class RecoveryJobRuntime {
 	async deleteState(): Promise<void> {
 		const record = this.store.load();
 		if (record && !isTerminalRecoveryState(record.state)) throw new Error("active recovery job state cannot be deleted");
-		await this.options.alarms.deleteAlarm();
+		await this.alarms.deleteAlarm();
 		await this.options.storage.deleteAll();
 		this.store.resetAfterDeleteAll();
 	}
 
 	async dispatch(dispatchId: string): Promise<void> {
+		try {
+			await this.dispatchSlices(dispatchId);
+		} catch (error) {
+			// D8: a dispatch that failed on the latched daily row limit must not throw (the
+			// platform would retry the alarm with backoff, each retry failing on the same
+			// limit). The guarded port arms the successor at the 00:00 UTC reset.
+			if (this.dailyLimit.note(error) || this.dailyLimit.active()) {
+				console.warn("[yaos-recovery-job] dispatch stopped: Cloudflare daily row limit");
+				await this.alarms.setAlarm(Date.now()).catch(() => undefined);
+				return;
+			}
+			throw error;
+		}
+	}
+
+	private async dispatchSlices(dispatchId: string): Promise<void> {
 		if (!/^[A-Za-z0-9:_-]{1,256}$/.test(dispatchId)) throw new Error("invalid recovery dispatch identity");
 		const startedAt = Date.now();
 		this.store.setMetadata("dispatch-identity", { dispatchId, startedAt, completedAt: null });
@@ -1728,12 +1793,12 @@ export class RecoveryJobRuntime {
 			for (let unit = 0; unit < MAX_BODIES_PER_ALARM; unit++) {
 				let record = this.store.load();
 				if (!record || isTerminalRecoveryState(record.state)) {
-					await this.options.alarms.deleteAlarm();
+					await this.alarms.deleteAlarm();
 					return;
 				}
 				const now = Date.now();
 				if (record.nextAttemptAt !== null && record.nextAttemptAt > now) {
-					await this.options.alarms.setAlarm(record.nextAttemptAt);
+					await this.alarms.setAlarm(record.nextAttemptAt);
 					return;
 				}
 				if (record.cancelRequested) {
@@ -1748,7 +1813,7 @@ export class RecoveryJobRuntime {
 				// One watchdog covers the whole dispatch (it is bounded by ALARM_SLICE_WALL_MS);
 				// it is refreshed only if a dispatch runs past half the watchdog window.
 				if (watchdogArmedAt === null || now - watchdogArmedAt >= DISPATCH_WATCHDOG_MS / 2) {
-					await this.options.alarms.setAlarm(now + DISPATCH_WATCHDOG_MS);
+					await this.alarms.setAlarm(now + DISPATCH_WATCHDOG_MS);
 					watchdogArmedAt = now;
 				}
 				const authority = this.authority(record.vaultId, record.vaultGeneration);
@@ -1768,7 +1833,7 @@ export class RecoveryJobRuntime {
 				else await this.runPurgeSlice(record);
 				record = this.store.load();
 				if (!record || isTerminalRecoveryState(record.state)) {
-					await this.options.alarms.deleteAlarm();
+					await this.alarms.deleteAlarm();
 					return;
 				}
 				if (this.projectionIdle || this.deferredAlarmAt !== null || Date.now() - startedAt >= ALARM_SLICE_WALL_MS) break;
@@ -1776,16 +1841,20 @@ export class RecoveryJobRuntime {
 			if (this.projectionIdle) {
 				// Nothing to project: no successor. A wake that raced the pass end is either
 				// visible here (re-arm now) or arrives after the delete and arms its own alarm.
-				await this.options.alarms.deleteAlarm();
+				await this.alarms.deleteAlarm();
 				const wake = this.store.getParsedMetadata("projection-wake", parseProjectionWake);
-				if (wake && wake.requested !== wake.consumed) await this.options.alarms.setAlarm(Date.now());
+				if (wake && wake.requested !== wake.consumed) await this.alarms.setAlarm(Date.now());
 				return;
 			}
-			await this.options.alarms.setAlarm(this.deferredAlarmAt ?? Date.now());
+			await this.alarms.setAlarm(this.deferredAlarmAt ?? Date.now());
 		} catch (error) {
 			await this.handleFailure(error);
 		} finally {
-			this.store.setMetadata("dispatch-identity", { dispatchId, startedAt, completedAt: Date.now() });
+			try {
+				this.store.setMetadata("dispatch-identity", { dispatchId, startedAt, completedAt: Date.now() });
+			} catch (error) {
+				if (!this.dailyLimit.note(error)) throw error;
+			}
 		}
 	}
 
@@ -1807,13 +1876,13 @@ export class RecoveryJobRuntime {
 			errorRef: null,
 			updatedAt: Date.now(),
 		});
-		await this.options.alarms.deleteAlarm();
+		await this.alarms.deleteAlarm();
 	}
 
 	private async handleFailure(error: unknown): Promise<void> {
 		const record = this.store.load();
 		if (!record || isTerminalRecoveryState(record.state)) {
-			await this.options.alarms.deleteAlarm();
+			await this.alarms.deleteAlarm();
 			return;
 		}
 		if (record.cancelRequested) {
@@ -1821,6 +1890,25 @@ export class RecoveryJobRuntime {
 			return;
 		}
 		const now = Date.now();
+		if (this.dailyLimit.note(error) || this.dailyLimit.active()) {
+			// D8: not a backoff retry; the slice resumes after the reset with no retry
+			// counted. The state write may itself fail on the limit: then only the alarm.
+			const resetAt = this.dailyLimit.body()?.resetAt ?? now;
+			try {
+				this.commit(record, {
+					state: "retrying",
+					nextAttemptAt: resetAt,
+					errorCode: DAILY_LIMIT_ERROR_CODE,
+					errorRef: null,
+					internalError: RecoveryJobStateStore.safeInternalError(error),
+					updatedAt: now,
+				});
+			} catch (writeError) {
+				if (!this.dailyLimit.note(writeError)) throw writeError;
+			}
+			await this.alarms.setAlarm(resetAt);
+			return;
+		}
 		if (isRetryableFailure(error)) {
 			const retryCount = record.retryCount + 1;
 			console.warn("[yaos-recovery-job] retrying", {
@@ -1839,7 +1927,7 @@ export class RecoveryJobRuntime {
 				internalError: RecoveryJobStateStore.safeInternalError(error),
 				updatedAt: now,
 			});
-			await this.options.alarms.setAlarm(nextAttemptAt);
+			await this.alarms.setAlarm(nextAttemptAt);
 			return;
 		}
 		const code = error instanceof TerminalRecoveryError ? error.code : "recovery_failed";
@@ -1857,7 +1945,7 @@ export class RecoveryJobRuntime {
 			internalError: RecoveryJobStateStore.safeInternalError(error),
 			updatedAt: now,
 		});
-		await this.options.alarms.deleteAlarm();
+		await this.alarms.deleteAlarm();
 	}
 
 	private initialCaptureProgress(): CaptureProgress {
@@ -2955,7 +3043,7 @@ export class RecoveryJobRuntime {
 		const record = this.store.load();
 		if (record) {
 			this.commit(record, { processedEntries: progress.processedEntries, totalEntries: progress.totalEntries, updatedAt: Date.now() });
-			await this.options.alarms.setAlarm(Date.now());
+			await this.alarms.setAlarm(Date.now());
 		}
 		return { accepted, complete: progress.complete, terminal: progress.complete };
 	}
