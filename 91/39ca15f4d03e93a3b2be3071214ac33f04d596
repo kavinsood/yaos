@@ -46,6 +46,7 @@ scripts/relay2/wb/wbmodel.py
   s_3c20a746b820c6::t_4dffd488164b4f 1-281
 server/src/crdt/rootSchema.ts
   s_3c20a746b820c6::t_6fdfa24048d843 18-30
+  s_694286f0c485ac::t_597ba0bc2e634c 18-30
 server/src/index.ts
   s_3c20a746b820c6::t_265fbf821c54ac 2,103-105,147-148,320-325
 server/src/relayFlag.ts
@@ -62,6 +63,7 @@ server/src/sqlRowCounter.ts
   s_3c20a746b820c6::t_7ad3d417505c41 1-125
 server/src/vaultBulkCreateService.ts
   s_3c20a746b820c6::t_9ca333fad4fdcb 1-581
+  s_694286f0c485ac::t_83288be07642e4 7,300-301,384-388
 server/src/vaultCandidateService.ts
   s_3c20a746b820c6::t_df24f3b1dbc55a 201,203,213,226,240,253,281,288,327,331
 server/src/vaultCatalogStore.ts
@@ -72,6 +74,7 @@ server/src/vaultLifecycleService.ts
   s_3c20a746b820c6::t_9187a158fd14c1 137,143,314-317
 server/src/vaultStore.ts
   s_3c20a746b820c6::t_35ef11ac4667d3 12-13,22,75-108,463,473,748,1072-1346
+  s_694286f0c485ac::t_467c9e367aa03d 75-79,1272-1278,1283-1286,1291-1298,1300-1338
 src/main.ts
   s_3c20a746b820c6::t_5a4cfb00f74ee9 931,1010,1025-1030
 src/onboarding/localVaultImport.ts
@@ -151,6 +154,14 @@ tests/server/wb-int-bulk.ts
       "agent_id": {
         "tool": "claude",
         "id": "agent-a2b43feb19d9e9a0e",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_694286f0c485ac": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a3a172259d6cb1bf1",
         "model": "unknown"
       },
       "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
