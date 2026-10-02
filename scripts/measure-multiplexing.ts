@@ -334,9 +334,9 @@ function importBatches<T extends { content: string }>(inputs: readonly T[]): T[]
 	return batches;
 }
 
-function assertFourRequestImport(requests: readonly ProductionImportRequestMeasurement[]): void {
+function assertOneRequestImport(requests: readonly ProductionImportRequestMeasurement[]): void {
 	const resources = requests.map((request) => request.pathname.replace(/^\/vault\/[^/]+\//, ""));
-	const expected = ["lifecycle/admissions", "body/candidates", "lifecycle/admissions", "lifecycle/publish"];
+	const expected = ["lifecycle/create-bulk"];
 	if (requests.length !== expected.length || resources.some((resource, index) => resource !== expected[index])) {
 		throw new Error(`production import made ${requests.length} requests: ${resources.join(", ")}`);
 	}
@@ -358,7 +358,7 @@ async function importThroughProductionPath(
 			const batchStartedAt = performance.now();
 			await session.commitFreshBodies(batch);
 			const requests = session.requests.slice(requestStart);
-			assertFourRequestImport(requests);
+			assertOneRequestImport(requests);
 			const measurement = {
 				batch: index + 1,
 				notes: batch.length,

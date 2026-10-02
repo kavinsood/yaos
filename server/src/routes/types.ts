@@ -20,6 +20,9 @@ export interface Env {
 	YAOS_TEST_ONLY_DEBUG_ROUTES?: string;
 	/** Relay v2 spike: relay body path; inert unless exactly "true". */
 	YAOS_RELAY_BODIES?: string;
+	/** Write-budget spike: create-bulk caps (relayFlag.ts `readBulkCreateLimits`). */
+	YAOS_BULK_CREATE_MAX_ITEMS?: string;
+	YAOS_BULK_CREATE_MAX_BYTES?: string;
 }
 
 export type JsonResponse = (body: unknown, status?: number) => Response;

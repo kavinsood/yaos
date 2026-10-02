@@ -15,6 +15,19 @@ export function snapshotRootMap(doc: YwasmCrdtDocument, name: string): ReadonlyM
 	return new Map(root.value.entries.map(([key, value]) => [key, plainValue(value)]));
 }
 
+/** Several root maps from one snapshot of the document (each `snapshotRootMap` call snapshots every root). */
+export function snapshotRootMaps(doc: YwasmCrdtDocument, names: readonly string[]): Map<string, ReadonlyMap<string, unknown>> {
+	const roots = crdtEngine.snapshotRoots(doc);
+	const out = new Map<string, ReadonlyMap<string, unknown>>();
+	for (const name of names) {
+		const root = roots.find((candidate) => candidate.name === name);
+		if (!root) { out.set(name, new Map()); continue; }
+		if (root.value.shared !== "map") throw new Error(`CRDT root ${name} is not a map`);
+		out.set(name, new Map(root.value.entries.map(([key, value]) => [key, plainValue(value)])));
+	}
+	return out;
+}
+
 export function mapValue(value: unknown): CrdtValueSnapshot {
 	return { shared: "value", value };
 }

@@ -1,5 +1,5 @@
 import { ControlPlaneRuntime, ServerConfig } from "./config";
-import { RELAY_CRASH_RUNTIME_PATH, RELAY_TABLE_COUNTS_RUNTIME_PATH, SIMULATE_DAILY_LIMIT_RUNTIME_PATH, SIMULATE_RESTART_RUNTIME_PATH, VaultRuntime, VaultSyncServer } from "./server";
+import { RELAY_CRASH_RUNTIME_PATH, RELAY_TABLE_COUNTS_RUNTIME_PATH, SIMULATE_DAILY_LIMIT_RUNTIME_PATH, SIMULATE_RESTART_RUNTIME_PATH, SQL_ROWS_RESET_RUNTIME_PATH, SQL_ROWS_RUNTIME_PATH, VaultRuntime, VaultSyncServer } from "./server";
 import { relayBodiesEnabled } from "./relayFlag";
 import { ActorRecoveryRouteAuthority } from "./recoveryPublicAuthority";
 import { handleRecoveryRoute, isPublicRecoveryRouteShape } from "./recoveryRoutes";
@@ -100,6 +100,9 @@ function validVaultRest(method: string, rest: string[], relayBodies = false): bo
 		&& (rest[2] === "compaction-lease" || rest[2] === "semantic-reset")) return true;
 	if (relayBodies && method === "GET" && rest.length === 2 && rest[0] === "debug" && rest[1] === "relay-table-counts") return true;
 	if (relayBodies && method === "POST" && rest.length === 2 && rest[0] === "debug" && rest[1] === "relay-crash") return true;
+	// Experiment-only exact SQL row counter (any mode; ported from write-budget W1).
+	if (method === "GET" && rest.length === 2 && rest[0] === "debug" && rest[1] === "sql-rows") return true;
+	if (method === "POST" && rest.length === 3 && rest[0] === "debug" && rest[1] === "sql-rows" && rest[2] === "reset") return true;
 	if (relayBodies && method === "HEAD" && rest.length === 2 && rest[0] === "body" && !!rest[1]) return true;
 	if (method === "GET" && rest.length === 1 && ["me", "members", "audit"].includes(rest[0]!)) return true;
 	if ((method === "PATCH" || method === "DELETE") && rest.length === 1 && rest[0] === "governance") return true;
@@ -142,8 +145,8 @@ function validVaultRest(method: string, rest: string[], relayBodies = false): bo
 		&& (rest[2] === "head" || rest[2] === "state")) return true;
 	if (method === "GET" && rest.length === 3 && rest[0] === "operations" && !!rest[1] && rest[2] === "outcome") return true;
 	if (method === "GET" && rest.length === 2 && (rest[0] === "body" || rest[0] === "head") && !!rest[1]) return true;
-	if (method === "POST" && rest.length === 1 && (rest[0] === "lifecycle" || rest[0] === "catch-up")) return true;
-	if (method === "POST" && rest.length === 2 && rest[0] === "lifecycle") return rest[1] === "admissions" || rest[1] === "batch" || rest[1] === "publish";
+	if (method === "POST" && rest.length === 1 && rest[0] === "catch-up") return true;
+	if (method === "POST" && rest.length === 2 && rest[0] === "lifecycle") return rest[1] === "create-bulk" || rest[1] === "batch" || rest[1] === "publish";
 	if (method === "POST" && rest.length === 2 && rest[0] === "attachments" && rest[1] === "publish") return true;
 	if (method === "POST" && rest.length === 2 && rest[0] === "bootstrap" && rest[1] === "start") return true;
 	if (rest.length === 3 && rest[0] === "bootstrap" && !!rest[1]) {
@@ -315,6 +318,12 @@ export async function handleWorkerRequest(request: Request, env: Env): Promise<R
 				if (!testOnlyDebugRoutesEnabled(env) || !relayBodiesEnabled(env)) response = withCors(json({ error: "not found" }, 404));
 				else if (!await verifyOperatorSession(env, request)) response = withCors(json({ error: "unauthorized" }, 401));
 				else response = withCors(await handleOperatorVaultRuntimeRoute(request, env, route.vaultId, RELAY_TABLE_COUNTS_RUNTIME_PATH));
+			} else if (route.rest[0] === "debug" && route.rest[1] === "sql-rows") {
+				// Experiment-only exact row counter: same gate as simulate-restart.
+				if (!testOnlyDebugRoutesEnabled(env)) response = withCors(json({ error: "not found" }, 404));
+				else if (!await verifyOperatorSession(env, request)) response = withCors(json({ error: "unauthorized" }, 401));
+				else response = withCors(await handleOperatorVaultRuntimeRoute(request, env, route.vaultId,
+					route.rest[2] === "reset" ? SQL_ROWS_RESET_RUNTIME_PATH : SQL_ROWS_RUNTIME_PATH));
 			} else if (route.rest[0] === "debug" && route.rest[1] === "relay-crash") {
 				// Relay v3, experiment-only: drop the pending group-commit buffers and
 				// retire the runtime (a crash between broadcast and commit). Same gate as

@@ -5,7 +5,7 @@ import { handleWorkerRequest, type WorkerRuntimeEnvironment } from "../../../ser
 import type { ActorCallPort, ExecutionPort } from "../../../server/src/platformPorts";
 import { RecoveryJobRuntime } from "../../../server/src/recoveryJob";
 import { VaultRuntime } from "../../../server/src/server";
-import { readRelayConfig, relayBodiesEnabled } from "../../../server/src/relayFlag";
+import { readBulkCreateLimits, readRelayConfig, relayBodiesEnabled } from "../../../server/src/relayFlag";
 import type { VaultSocketPort } from "../../../server/src/vaultSocketService";
 import { FilesystemObjectStore } from "./objectStore";
 import {
@@ -110,6 +110,7 @@ class VaultActor implements RuntimeActor {
 			recoveryJobs,
 			controlPlane,
 			// Relay v2 spike: YAOS_RELAY_BODIES (test default YAOS_TEST_FORCE_RELAY_BODIES).
+			bulkCreateLimits: readBulkCreateLimits(process.env),
 			relayBodies: relayBodiesEnabled(process.env),
 			...(relayBodiesEnabled(process.env) ? { relayConfig: readRelayConfig(process.env) } : {}),
 		});

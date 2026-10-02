@@ -1,7 +1,7 @@
 #!/bin/zsh
 # Relay v2 fast full-run orchestrator (user-approved restructure, 2026-10-01). One detached process:
 #
-#   nohup zsh scripts/relay2/runfast.sh --sha <commit> --tag <tag> [--small] [--jobs 10] [--phases id,id] [--lanes A,B]
+#   nohup zsh scripts/relay2/runfast.sh --sha <commit> [--suite relay2|wb] --tag <tag> [--small] [--jobs 10] [--phases id,id] [--lanes A,B]
 #         [--no-final] [--dry-run] > ../logs/relay2/runall-<tag>.nohup 2>&1 &
 #
 # Every phase (one scenario × one variant) runs on its OWN freshly deployed worker
@@ -37,10 +37,11 @@ HERE=${0:A:h}
 source $EXP/env.sh
 ulimit -n 10240 2>/dev/null || true
 
-SHA="" TAG="f$(date +%m%d)" DRY=0 SMALL=0 JOBS=10 ONLY_PHASES="" ONLY_LANES="" FINAL=1 POOL="" APAR=0 PLAN=default PTXT=""
+SUITE=relay2 SHA="" TAG="f$(date +%m%d)" DRY=0 SMALL=0 JOBS=10 ONLY_PHASES="" ONLY_LANES="" FINAL=1 POOL="" APAR=0 PLAN=default PTXT=""
 while (( $# )); do
   case $1 in
     --sha) SHA=$2; shift 2;;
+    --suite) SUITE=$2; shift 2;;
     --tag) TAG=$2; shift 2;;
     --small) SMALL=1; shift;;
     --jobs) JOBS=$2; shift 2;;
@@ -55,11 +56,12 @@ while (( $# )); do
     *) echo "unknown arg $1" >&2; exit 2;;
   esac
 done
-[[ -n $SHA ]] || { echo "usage: runfast.sh --sha <commit> [--tag t] [--small] [--jobs n] [--phases a,b] [--lanes A,B] [--no-final] [--reuse-pool file] [--dry-run]" >&2; exit 2; }
+[[ $SUITE == relay2 || $SUITE == wb ]] || { echo "--suite must be relay2 or wb" >&2; exit 2; }
+[[ -n $SHA ]] || { echo "usage: runfast.sh --sha <commit> [--suite relay2|wb] [--tag t] [--small] [--jobs n] [--phases a,b] [--lanes A,B] [--no-final] [--reuse-pool file] [--dry-run]" >&2; exit 2; }
 [[ -z $POOL || -s $POOL ]] || { echo "reuse pool $POOL missing/empty" >&2; exit 2; }
 SHA=$(git -C $MAIN rev-parse --verify "$SHA^{commit}") || exit 2
 TREE=$EXP/yaos-relay2-run-${SHA[1,8]}
-LOGS=$EXP/logs/relay2/runall-$TAG; (( SMALL )) && LOGS=$LOGS-small
+LOGS=$EXP/logs/relay2/runall-$TAG; [[ $SUITE == wb ]] && LOGS=$EXP/logs/wb/runall-$TAG; (( SMALL )) && LOGS=$LOGS-small
 RAW=$LOGS/raw STATE=$LOGS/state
 mkdir -p $RAW $STATE $RAW/failed
 rm -rf $LOGS/.token.lock
@@ -73,6 +75,16 @@ STRICT_VARS=(--var YAOS_RELAY_LEAN_ROWS=false --var YAOS_RELAY_MICROBATCH_MS=0)
 V3_VARS=(--var YAOS_RELAY_LEAN_ROWS=true --var YAOS_RELAY_MICROBATCH_MS=0 --var YAOS_RELAY_GROUP_COMMIT=1
   --var YAOS_RELAY_GC_IDLE_MS=300 --var YAOS_RELAY_GC_MAX_MS=1500 --var YAOS_RELAY_GC_MAX_BYTES=65536
   --var YAOS_RELAY_GC_MIN_INTERVAL_MS=1000)
+# Write-budget suite (--suite wb), batch 3 (b3-bulk): spec `wb` = relay v3 (group commit + tail row + receipt
+# ring, V3_VARS) with bulk create. Override with WB_EXTRA_VARS="--var YAOS_RELAY_GC_IDLE_MS=… …".
+WB_VARS=(${=WB_EXTRA_VARS:-$V3_VARS})
+# Protocol adapter for spec wb: relay = the harness client with candidateId (relay3 socket receipts).
+WB_ADAPTER=${WB_ADAPTER:-relay}
+# Create path for I1–I4: bulk = POST lifecycle/create-bulk (the only create path after D2).
+WB_CREATE=${WB_CREATE:-bulk}
+# R2 bucket bound as YAOS_BUCKET on wb/wbbase workers (production config binds R2; without it the recovery projection
+# never starts). WB_R2=none deploys without R2. (deploy.sh --r2 hunk taken from write-budget-spike dd57761, harness only.)
+WB_R2=${WB_R2:-yaos-relay2-idle}
 K1_VARS=(--var YAOS_RELAY_CHECKPOINT_ENTRIES=1000000 --var YAOS_RELAY_CHECKPOINT_BYTES=1073741824 --var YAOS_RELAY_CHECKPOINT_MAX_ROWS=100000)
 BENCH=(node tests/run-typescript.mjs --test-aliases scripts/relay2/bench.ts)
 L5=(node tests/run-typescript.mjs --test-aliases scripts/relay2/l5-cli-baseline.ts)
@@ -96,6 +108,7 @@ P() {
   LANE[$id]=$lane SPEC[$id]=$spec KIND[$id]=$kind ARGS[$id]="$*" EST[$id]=$est
   if [[ $lane == A ]]; then ORDER_A+=($id); else ORDER_B+=($id); fi
 }
+if [[ $SUITE == relay2 ]]; then
 NOGAP=(--quiet-gap-ms 0 --no-gql)
 # Lane B, longest first.
 for v in base relay strict; do P C2-stress-$v B $v 12 bench C2 --trace stress --clients 5 --rate 0 --n $(n 50000 500) $NOGAP; done
@@ -155,6 +168,23 @@ P B7-strict A strict 2.5 bench B7 --n $(n 40 12) $( (( SMALL )) && print -- --fl
 P X2-strict A strict 3 bench X2 $( (( SMALL )) && print -- --rates 25,50,100 --step-ms 4000)
 P X2-relay A relay 3 bench X2 $( (( SMALL )) && print -- --rates 25,50,100 --step-ms 4000)
 P X2-base A base 3 bench X2 $( (( SMALL )) && print -- --rates 25,50,100 --step-ms 4000)
+fi
+
+# ---- write-budget suite (PHASE3-WRITE-BUDGET-SPIKE §3 W4). Scenarios in wb/scenarios.ts; rows via the W1 exact counter.
+WBC=(--create $WB_CREATE)
+if [[ $SUITE == wb ]]; then
+  # Lane B (parallel, longest first). Each phase gets its own worker + fresh vault (reuse-pool compatible).
+  P I3-wb B wb 14 bench I3 --prefill $(n 2k tiny) $WBC --tail
+  P I2-wb B wb 14 bench I2 --preset $(n 2k tiny) $WBC
+  P I1-wb B wb 12 bench I1 --preset $(n 2k tiny) $WBC --tail
+  # I4 drives a real VaultSync (D5 fold / hold / after); --client emulated keeps the RawClient model.
+  P I4-wb B wb 3 bench I4 --reps $(n 5 1) $WBC
+  P I4-emu-wb B wb 3 bench I4 --reps $(n 5 1) --client emulated $WBC
+  # Base (flag off, same SHA) comparator for I1 (1808293).
+  P I1-base B wbbase 12 bench I1 --preset $(n 2k tiny) $WBC --tail
+  # Lane A (latency, serialized).
+  P L2-wb A wb 3.5 bench L2 --n $(n 300 20) $WBC
+fi
 
 # --plan v3: relay v3 write-reduction run (group commit). Replaces the default plan. Specs: v3 (harness client with
 # candidateId), v3nc (relay-nocand adapter = the real client, which sends no candidateId), relay (v2 BODIES+LEAN+MB10),
@@ -273,10 +303,17 @@ deploy_args() {   # deploy_args <spec> -> --relay on|off + vars
     v3|v3nc) print -r -- --relay on $V3_VARS;;
     k1base) print -r -- --relay off $PRIMARY_VARS $K1_VARS;;
     k1relay) print -r -- --relay on $PRIMARY_VARS $K1_VARS;;
+    wb) print -r -- --relay on $WB_VARS;;
+    wbbase) print -r -- --relay off $PRIMARY_VARS;;
     *) return 1;;
   esac
 }
-adapter_of() { [[ $1 == base || $1 == k1base ]] && print base || { [[ $1 == v3nc ]] && print relay-nocand || print relay; }; }
+adapter_of() {
+  [[ $1 == base || $1 == k1base || $1 == wbbase ]] && { print base; return; }
+  [[ $1 == wb ]] && { print $WB_ADAPTER; return; }
+  [[ $1 == v3nc ]] && { print relay-nocand; return; }
+  print relay
+}
 
 # Fresh worker name for a phase: attempt k = number of earlier deploys of this phase + 1.
 # With --reuse-pool: the next unclaimed pool worker (atomic mkdir claim; one phase attempt per worker).
@@ -297,6 +334,8 @@ next_worker() {
   (( k == 1 )) && print -r -- $base || print -r -- $base-a$k
 }
 
+# W2 trees (specs wb, wbbase: same merged tree, relay on/off) have no legacy admissions route: seed with create-bulk.
+seed_create() { [[ $1 == wb || $1 == wbbase ]] && print -- --create $WB_CREATE; }
 # provision <id> <log>: deploy a fresh worker + claim + standard seed; prints "<worker> <start>" on success.
 provision() {
   local id=$1 log=$2 spec=${SPEC[$1]} w t0
@@ -311,12 +350,14 @@ provision() {
     ev phase=$id lane=${LANE[$id]} variant=$spec status=deploy worker=$w start=$t0
   fi
   ensure_token
-  zsh $TREE/scripts/relay2/deploy.sh $w ${=$(deploy_args $spec)} $COMMON_VARS --src $TREE --require-clean >> $log 2>&1 \
+  local r2flags=()
+  [[ ( $spec == wb || $spec == wbbase ) && $WB_R2 != none ]] && r2flags=(--r2 $WB_R2)
+  zsh $TREE/scripts/relay2/deploy.sh $w ${=$(deploy_args $spec)} $COMMON_VARS $r2flags --src $TREE --require-clean >> $log 2>&1 \
     || { print -r -- "[runfast] DEPLOY FAILED $w" >> $log; return 1; }
   local attempt
   for attempt in 1 2 3 4; do
     (cd $TREE && RELAY2_WORKTREE=$TREE node tests/run-typescript.mjs --test-aliases scripts/relay2/context.ts \
-      --host $(host_of $w) --devices A,B,C --seed ${SEEDOF[$id]:-standard} $ctxflags) >> $log 2>&1 && { print -r -- "$w $t0"; return 0; }
+      --host $(host_of $w) --devices A,B,C --seed ${SEEDOF[$id]:-standard} $ctxflags $(seed_create $spec)) >> $log 2>&1 && { print -r -- "$w $t0"; return 0; }
     print -r -- "[runfast] context attempt $attempt failed" >> $log; sleep 20
   done
   return 1
@@ -444,12 +485,18 @@ if (( FINAL )); then
     say "gqlfill pass $try left incomplete windows/phases (see $LOGS/gqlfill.log)"; (( try < 3 )) && sleep 600
   done
   ev phase=_stage status=summary
+  # wb suite: per-scenario convergence is in each JSON and in summarize.py's WB tables (convergence.ts knows only relay2 ids).
+  if [[ $SUITE == relay2 ]]; then
   for v in relay strict base; do
     suffix=""; [[ $v != relay ]] && suffix=-$v
     (cd $TREE && node tests/run-typescript.mjs --test-aliases scripts/relay2/convergence.ts --dir $RAW --variant $v \
       --out $RAW/convergence-suite$suffix.json) >> $LOGS/runall.log 2>&1
   done
+  fi
   python3 $TREE/scripts/relay2/summarize.py --dir $RAW > $LOGS/tables.md 2>> $LOGS/runall.log || say "summarize failed"
+  if [[ $SUITE == wb ]]; then
+    python3 $TREE/scripts/relay2/costmodel.py --wb --measured $RAW > $LOGS/costmodel-wb.md 2>> $LOGS/runall.log || say "costmodel --wb failed"
+  fi
 fi
 python3 $HERE/progress.py snapshot $LOGS
 ev phase=_stage status=done

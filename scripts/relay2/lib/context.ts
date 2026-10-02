@@ -5,10 +5,9 @@
 import { randomBytes } from "node:crypto";
 import { chmodSync, copyFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { mutateLifecycle, requestJson, sha256Hex, vaultRoute } from "../../../tests/live/schema4Live";
+import { createBodyFromUpdates, vaultRoute } from "../../../tests/live/schema4Live";
 import { ProductionImportSession } from "../../../tests/live/productionImport";
 import { deviceBearerHeaders, type LiveIdentity } from "../../../tests/live/liveIdentity";
-import type { LifecycleRequest } from "../../../server/src/contracts";
 import { LOG_DIR, json, log, sleep, workerName } from "./common";
 
 export interface Context {
@@ -227,22 +226,11 @@ export async function seedNotes(context: Context, inputs: readonly SeedInput[], 
 }
 
 /**
- * Create a body whose server state is exactly `update` (lifecycle admission → candidate → root publish).
+ * Create a body whose server state is exactly `update` (one bulk create).
  * Used for the frozen trace base (v1 createBodyFromUpdate).
  */
 export async function createBodyFromUpdate(identity: LiveIdentity, id: string, path: string, update: Uint8Array) {
-	const candidateId = `candidate-create-${crypto.randomUUID()}`;
-	const candidateDigest = await sha256Hex(update);
-	const lifecycle: LifecycleRequest = { operationId: `create-${crypto.randomUUID()}`, kind: "create", fileId: id, bodyId: id,
-		bodyEpoch: 1, path, candidateId, candidateDigest };
-	const admitted = await requestJson(identity, "lifecycle", { method: "POST", headers: { "Content-Type": "application/json" },
-		body: JSON.stringify(lifecycle) });
-	if (admitted.response.status !== 200) throw new Error(`admission failed ${admitted.response.status} ${JSON.stringify(admitted.body)}`);
-	const candidate = await fetch(vaultRoute(identity, `body/${encodeURIComponent(id)}/candidate`), { method: "POST",
-		headers: deviceBearerHeaders(identity, { "Content-Type": "application/octet-stream", "x-yaos-candidate-id": candidateId,
-			"x-yaos-candidate-digest": candidateDigest, "x-yaos-body-epoch": "1" }), body: update });
-	if (candidate.status !== 200) throw new Error(`candidate failed ${candidate.status} ${await candidate.text()}`);
-	await mutateLifecycle(identity, lifecycle);
+	await createBodyFromUpdates(identity, id, path, [update]);
 }
 
 // ---------------------------------------------------------------- deterministic content

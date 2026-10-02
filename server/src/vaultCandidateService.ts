@@ -198,12 +198,9 @@ export class VaultCandidateService {
 		const { bodyId, bodyEpoch, candidateId, candidateDigest, encodedUpdates, request, actor } = input;
 		const deviceId = actor.deviceId;
 		this.options.flushRelay?.(bodyId);
-		const creation = this.options.store.creationCandidate(bodyId);
+		// W2: bodies only exist once bulk create committed them active; there is no creation fence.
 		const catalog = this.options.store.getCatalogHeadAt(this.options.store.currentSequence(), bodyId);
-		if (!creation && (!catalog || catalog.lifecycle !== "active" || catalog.fileId !== bodyId)) return json({ error: "body_not_active" }, 409);
-		if (creation && (creation.candidateId !== candidateId || creation.candidateDigest !== candidateDigest)) {
-			return json({ error: "candidate_does_not_match_creation_fence" }, 409);
-		}
+		if (!catalog || catalog.lifecycle !== "active" || catalog.fileId !== bodyId) return json({ error: "body_not_active" }, 409);
 		const currentHead = this.options.store.documentHead(bodyId);
 		if (!currentHead) return json({ error: "body_state_missing" }, 409);
 		if (currentHead.semanticEpoch !== bodyEpoch) return this.epochMismatch(bodyId, currentHead.semanticEpoch, bodyEpoch);
@@ -213,10 +210,7 @@ export class VaultCandidateService {
 			if (replay.candidateDigest !== candidateDigest) {
 				return json({ error: "candidate_id_reused_with_different_digest" }, 409);
 			}
-			// A durable creation candidate may still have an unfinished root
-			// lifecycle transaction after a restart. Only ordinary active-body
-			// replays can return without re-entering exact-fence finalization.
-			if (!creation) return json(this.receipt(replay));
+			return json(this.receipt(replay));
 		}
 		const updates = boundedFrames(encodedUpdates);
 		if (!updates) return json({ error: "invalid_candidate_frames" }, 400);
@@ -229,7 +223,7 @@ export class VaultCandidateService {
 		if (this.options.shouldPauseAdmission?.(bodyId)) return this.compactionBackpressure();
 		if (!await this.options.flush(bodyId)) return json({ error: "body_persistence_unavailable" }, 503);
 		return this.options.cache.serializeDocument(bodyId, async () => this.commitValidatedCandidate({
-			bodyId, bodyEpoch, request, actor, deviceId, candidateId, candidateDigest, creation, updates,
+			bodyId, bodyEpoch, request, actor, deviceId, candidateId, candidateDigest, updates,
 		}));
 	}
 
@@ -241,10 +235,9 @@ export class VaultCandidateService {
 		deviceId: string;
 		candidateId: string;
 		candidateDigest: string;
-		creation: ReturnType<VaultStore["creationCandidate"]>;
 		updates: readonly Uint8Array[];
 	}): Promise<Response> {
-		const { bodyId, bodyEpoch, request, actor, deviceId, candidateId, candidateDigest, creation, updates } = input;
+		const { bodyId, bodyEpoch, request, actor, deviceId, candidateId, candidateDigest, updates } = input;
 		const currentHead = this.options.store.documentHead(bodyId);
 		if (!currentHead) return json({ error: "body_state_missing" }, 409);
 		// Compaction may have advanced the lineage while this request was being
@@ -257,7 +250,7 @@ export class VaultCandidateService {
 			if (replay.candidateDigest !== candidateDigest) {
 				return json({ error: "candidate_id_reused_with_different_digest" }, 409);
 			}
-			if (!creation) return json(this.receipt(replay));
+			return json(this.receipt(replay));
 		}
 		let state: Awaited<ReturnType<VaultCandidateService["candidateCatalog"]>>;
 		try {
@@ -285,14 +278,14 @@ export class VaultCandidateService {
 			// store. The exact hash is only claimed if no commit landed since validation.
 			// (The base commitCandidate re-checks the receipt in its transaction; do the
 			// same here: a relay frame with this candidate id may have committed meanwhile.)
-			const late = creation || !this.options.relayCommit ? null
+			const late = !this.options.relayCommit ? null
 				: this.options.store.candidateReceipt(bodyId, deviceId, candidateId);
 			if (late) {
 				this.options.cache.discardValidatedBodyUpdate(bodyId);
 				if (late.candidateDigest !== candidateDigest) return json({ error: "candidate_id_reused_with_different_digest" }, 409);
 				return json(this.receipt(late));
 			}
-			const relayed = creation ? null : this.options.relayCommit?.({
+			const relayed = this.options.relayCommit?.({
 				bodyId, bodyEpoch, actor, candidateId, candidateDigest, updates, changesState: state.changesState,
 				content: sameHead(this.options.store.documentHead(bodyId), state.expectedHead) ? state.metadata : null,
 				runtimeEpoch: this.options.runtimeEpoch,
@@ -330,27 +323,12 @@ export class VaultCandidateService {
 			}
 			durable = current;
 		}
-		const creationResult = creation
-			? this.options.lifecycle().finalizeCreation(creation, durable, state.metadata, actor)
-			: "committed";
-		if (creationResult === "busy") {
-			// The body candidate is already durable even though root publication is
-			// temporarily fenced. Keep the resident document aligned with storage;
-			// lifecycle recovery will publish or retire it.
-			this.options.cache.commitValidatedBodyUpdate(bodyId, updates, durable.durableGeneration,
-				this.options.cache.get(bodyId)!.semanticEpoch, request, state.validated);
-			this.options.cache.removePendingDigest(bodyId, candidateDigest);
-			return json({ error: "recovery_boundary_in_progress" }, 409);
-		}
 		if (this.options.cache.commitValidatedBodyUpdate(bodyId, updates, durable.durableGeneration,
-			this.options.cache.get(bodyId)!.semanticEpoch, request, state.validated)
-			&& creationResult !== "superseded") {
+			this.options.cache.get(bodyId)!.semanticEpoch, request, state.validated)) {
 			for (const update of updates) this.options.sockets().broadcastDocumentUpdate(bodyId, update, request);
 		}
 		this.options.cache.removePendingDigest(bodyId, candidateDigest);
-		if (creationResult !== "superseded") {
-			this.options.sockets().notifyBodyCommitted(bodyId, durable.durableGeneration, durable.vaultSequence);
-		}
+		this.options.sockets().notifyBodyCommitted(bodyId, durable.durableGeneration, durable.vaultSequence);
 		return json(this.receipt(durable));
 	}
 

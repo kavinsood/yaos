@@ -1,6 +1,6 @@
 /**
  * Real client for the R1 live / DL harness scenarios (ported from the write-budget spike, yaos-wb-int wb/realClient.ts):
- * production `VaultSync` (src/sync/vaultSync.ts, untouched) in Node,
+ * also used by b3-bulk's I4 real-client scenario; production `VaultSync` (src/sync/vaultSync.ts, untouched) in Node,
  * set up exactly like scripts/relay2/l5-cli-baseline.ts:
  *   - DEFAULT providerFactory (OwnAwarenessProvider over fencedWebSocket) with a recording `ws` subclass as
  *     `VaultSyncOptions.webSocket` (counts/timestamps frames only; never alters them);
@@ -39,6 +39,7 @@ export interface RealClientOptions {
 	label: string;
 	candidateDebounceMs?: number;
 	candidateMaxWaitMs?: number;
+	createCollectorDelayMs?: number;
 	/** Reuse a previous client's SQLite dir (same folderKey) — e.g. to restart after a daily-limit trip. */
 	reuse?: { dir: string; folderKey: string };
 }
@@ -160,6 +161,7 @@ export async function openRealClient(host: string, context: Context, identity: L
 		onDailyLimit: (info) => { dailyLimits.push({ at: r2(now()), info }); },
 		...(opts.candidateDebounceMs !== undefined ? { candidateDebounceMs: opts.candidateDebounceMs } : {}),
 		...(opts.candidateMaxWaitMs !== undefined ? { candidateMaxWaitMs: opts.candidateMaxWaitMs } : {}),
+		...(opts.createCollectorDelayMs !== undefined ? { createCollectorDelayMs: opts.createCollectorDelayMs } : {}),
 	});
 	vs.setResidencyRuntimeContext("desktop", "foreground");
 	const setupMs = r2(now() - t0);

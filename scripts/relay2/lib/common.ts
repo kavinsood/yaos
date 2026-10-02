@@ -63,7 +63,11 @@ export async function json(response: Response): Promise<Record<string, unknown> 
 }
 
 export function workerName(host: string): string {
-	return new URL(host).hostname.split(".")[0]!;
+	const url = new URL(host);
+	const name = url.hostname.split(".")[0]!;
+	// Local wrangler dev on a non-default port gets its own context file (several local workers run side by side).
+	const local = url.hostname === "localhost" || url.hostname === "127.0.0.1";
+	return local && url.port && url.port !== "8787" ? `${name}-${url.port}` : name;
 }
 
 function sh(cmd: string, args: string[]): string {

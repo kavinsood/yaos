@@ -494,90 +494,9 @@ export abstract class VaultCatalogStore extends VaultDocumentStore {
 		).toArray().length > 0;
 	}
 
-	creationCandidate(bodyId: string): PendingCreationCandidate | null {
-		this.initialize();
-		const row = this.storage.sql.exec<{
-			body_id: string; file_id: string; path: string; operation_id: string;
-			candidate_id: string; candidate_digest: string; durable_generation: number;
-			body_epoch: number; vault_sequence: number; runtime_epoch: string;
-		}>(
-			`SELECT body_id, file_id, path, operation_id, candidate_id, candidate_digest,
-			        body_epoch, durable_generation, vault_sequence, runtime_epoch
-			 FROM vault_creation_candidates WHERE body_id = ?`,
-			bodyId,
-		).toArray()[0];
-		return row ? {
-			bodyId: row.body_id,
-			bodyEpoch: parseSemanticEpoch(row.body_epoch, "creation candidate body epoch"),
-			fileId: row.file_id,
-			path: row.path,
-			operationId: row.operation_id,
-			candidateId: row.candidate_id,
-			candidateDigest: row.candidate_digest,
-			durableGeneration: row.durable_generation,
-			vaultSequence: row.vault_sequence,
-			vaultGeneration: this.currentVaultGeneration(),
-			runtimeEpoch: row.runtime_epoch,
-		} : null;
-	}
-
-	expectCreationCandidate(input: PendingCreationCandidate): PendingCreationCandidate {
-		this.initialize();
-		this.assertVaultGeneration(input.vaultGeneration);
-		const existing = this.creationCandidate(input.bodyId);
-		if (existing) {
-			if (existing.operationId !== input.operationId || existing.fileId !== input.fileId
-				|| existing.path !== input.path || existing.candidateId !== input.candidateId
-				|| existing.candidateDigest !== input.candidateDigest
-				|| existing.bodyEpoch !== input.bodyEpoch
-				|| existing.durableGeneration !== input.durableGeneration
-				|| existing.vaultSequence !== input.vaultSequence
-				|| existing.vaultGeneration !== input.vaultGeneration
-				|| existing.runtimeEpoch !== input.runtimeEpoch) {
-				throw new Error("creation candidate fence mismatch");
-			}
-			return existing;
-		}
-		this.storage.sql.exec(
-			`INSERT INTO vault_creation_candidates(
-			 body_id, file_id, path, operation_id, candidate_id, candidate_digest,
-			 body_epoch, durable_generation, vault_sequence, runtime_epoch
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			input.bodyId,
-			input.fileId,
-			input.path,
-			input.operationId,
-			input.candidateId,
-			input.candidateDigest,
-			parseSemanticEpoch(input.bodyEpoch, "creation candidate body epoch"),
-			input.durableGeneration,
-			input.vaultSequence,
-			input.runtimeEpoch,
-		).toArray();
-		return input;
-	}
-
-	completeCreationCandidate(bodyId: string, candidateId: string, candidateDigest: string): boolean {
-		this.initialize();
-		const existing = this.creationCandidate(bodyId);
-		if (!existing) return false;
-		if (existing.candidateId !== candidateId || existing.candidateDigest !== candidateDigest) {
-			throw new Error("candidate does not match creation fence");
-		}
-		const deleted = this.storage.sql.exec(
-			"DELETE FROM vault_creation_candidates WHERE body_id = ?",
-			bodyId,
-		);
-		deleted.toArray();
-		return deleted.rowsWritten > 0;
-	}
-
-	pendingCreationCount(): number {
-		this.initialize();
-		return this.storage.sql.exec<{ count: number }>(
-			"SELECT COUNT(*) AS count FROM vault_creation_candidates",
-		).one().count;
-	}
+	// W2: creation candidates/fences are removed (bulk create is the only create
+	// path). The legacy `vault_creation_candidates` table stays in the schema and
+	// is always empty; readers that still probe it see "no pending creation".
 
 	candidateReceiptCount(bodyId?: string): number {
 		this.initialize();

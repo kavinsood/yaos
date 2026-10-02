@@ -1,66 +1,44 @@
 /**
- * Harness adapters for the R1 (closed-file merge) and DL (D8 daily limit) scenarios, ported from the write-budget
- * spike (yaos-wb-int scripts/relay2/wb/adapters.ts) and trimmed to what R1/DL need on relay v3:
+ * W4 adapters: the seams where W1/W2/W3 plug into the measurement harness.
  *
- *  - RowsCounter   cumulative SQLite rows of the vault DO: `debug/sql-rows` when the server has it (not on relay v3),
- *                  else the relay in-memory counter from /diagnostics (labelled `relay-diagnostics`, inexact), else none.
- *  - create        `legacyCreate` = today's production import path (lib/context.seedNotes). `bulkCreate` = the spike's W2
- *                  `lifecycle/create-bulk` (NOT on relay v3); `bulkCreateAvailable` probes for it so DL's bulk phase can skip.
- *  - catalog       listHeads (GET /heads, all pages).
- *  - candidate     closed-file HTTP candidate POST (VaultServerPort.submitCandidate shape) for the DL probe.
- *  - merge (R1)    src/sync/lineMerge.ts (`--merge-module` / WB_MERGE_MODULE) or the harness reference diff3.
+ * Every hook that depends on unfinished work is marked `TODO(W1)`, `TODO(W2)` or `TODO(W3)`. Each adapter reports
+ * `implemented` / `source` in the scenario JSON, so no run can silently present a fallback as the real thing.
+ *
+ *  - RowsCounter   exact cumulative SQLite rows of the vault DO (W1 debug route), tolerant reader, with fallbacks
+ *                  (relay in-memory counter = relay appends only; "none").
+ *  - CreateAdapter file creation: `legacy` = today's production import path (admission + candidate + finalize + publish,
+ *                  blobs PUT + attachments/publish per attachment); `bulk` = W2 `POST /lifecycle/create-bulk`.
+ *  (b3-bulk: the W1 receipt/crash and W3 merge adapters are not ported; see experiments/results/b3/handoff-bulk.md.)
  */
-import { createHash } from "node:crypto";
-import { pathToFileURL } from "node:url";
 import * as Y from "yjs";
 import { vaultRoute } from "../../../tests/live/schema4Live";
 import { deviceBearerHeaders, type LiveIdentity } from "../../../tests/live/liveIdentity";
 import { json, log, now, r2 } from "../lib/common";
 import { refreshOperatorCookie, seedNotes, type Context } from "../lib/context";
-import { mergeNoBase, merge3, type MergeResult, type NoBaseResult } from "./diff3";
+import { sha256 } from "./corpus";
 import { decodeBinaryEnvelope, encodeBinaryEnvelope, YAOS_BINARY_CONTENT_TYPE } from "../../../server/src/shared/binaryEnvelope";
 
 type Obj = Record<string, unknown>;
-
-export const sha256 = (data: string | Uint8Array) => createHash("sha256").update(data).digest("hex");
 
 // =================================================================================================== rows counter
 export interface RowsReading {
 	at: number; wall: number;
 	rowsWritten: number | null; rowsRead: number | null;
-	/** debug-route = exact per-DO counter; relay-diagnostics = relay in-memory counter (relay appends + checkpoints only). */
+	/** debug-route = W1 exact counter; relay-diagnostics = relay in-memory counter (relay appends + checkpoints only). */
 	source: "debug-route" | "relay-diagnostics" | "none";
 	exact: boolean;
 	httpStatus?: number; error?: string;
-	/** Requests of this reading that hit ROWS_READ_TIMEOUT_MS and were retried (see fetchRows). */
-	timeouts?: number;
-	/** Extra fields the route returned (e.g. setAlarms), passed through untouched. */
+	/** Extra fields the route returned (e.g. per-statement breakdown), passed through untouched. */
 	extra?: Obj;
 }
 
-/** Exact rows route of the write-budget spike (absent on relay v3; RowsCounter falls back, labelled). */
-export const DEFAULT_ROWS_ROUTE = process.env.WB_ROWS_ROUTE ?? "debug/sql-rows";
-
 /**
- * Per-request timeout for rows reads. Local `wrangler dev` can park a proxied GET until the next request reaches its
- * ProxyWorker; aborting and retrying is that next request. The count is reported so a real server stall stays visible.
+ * W1 (c5dc60b): GET /vault/:id/debug/sql-rows (operator session; YAOS_TEST_ONLY_DEBUG_ROUTES=true), cumulative per DO:
+ *   { rowsWritten, rowsRead, setAlarms, billedRowsWritten (= rowsWritten + setAlarms, the Free-plan figure), ... }
+ * The harness reads billedRowsWritten first (raw rowsWritten stays in `extra`). POST …/sql-rows/reset exists but the
+ * harness uses deltas (rowsDelta flags a counter reset on DO restart). Older shapes are still accepted.
  */
-export const ROWS_READ_TIMEOUT_MS = Number(process.env.WB_ROWS_TIMEOUT_MS ?? 10_000);
-
-export async function fetchRows(url: string, init: RequestInit, onTimeout: () => void, timeoutMs = ROWS_READ_TIMEOUT_MS): Promise<Response> {
-	for (let attempt = 1; ; attempt++) {
-		try {
-			const r = await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
-			const body = await r.arrayBuffer();
-			return new Response(body, { status: r.status, statusText: r.statusText, headers: r.headers });
-		} catch (error) {
-			const timedOut = error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError");
-			if (!timedOut || attempt >= 3) throw error;
-			onTimeout();
-			log(`rows read timed out after ${timeoutMs} ms (attempt ${attempt}); retrying ${new URL(url).pathname}`);
-		}
-	}
-}
+export const DEFAULT_ROWS_ROUTE = process.env.WB_ROWS_ROUTE ?? "debug/sql-rows";
 
 const WRITTEN_KEYS = ["billedRowsWritten", "rowsWritten", "rows_written", "written", "rowsWrittenTotal", "totalRowsWritten"];
 const READ_KEYS = ["rowsRead", "rows_read", "read", "rowsReadTotal", "totalRowsRead"];
@@ -97,16 +75,13 @@ export class RowsCounter {
 		this.mode = (mode ?? process.env.WB_ROWS_MODE ?? "auto") as RowsCounter["mode"];
 	}
 	get source() { return this.resolved; }
-	timeouts = 0;
-	private pendingTimeouts = 0;
-	private readonly countTimeout = () => { this.timeouts++; this.pendingTimeouts++; };
 
 	private async viaRoute(): Promise<RowsReading | null> {
 		const id = this.context.devices.A!;
 		const url = vaultRoute(id, this.route);
 		const tries: Array<() => Promise<Response>> = [
-			() => fetchRows(url, { headers: { cookie: this.context.operatorCookie } }, this.countTimeout),
-			() => fetchRows(url, { headers: deviceBearerHeaders(id) }, this.countTimeout),
+			() => fetch(url, { headers: { cookie: this.context.operatorCookie } }),
+			() => fetch(url, { headers: deviceBearerHeaders(id) }),
 		];
 		let last: Response | null = null;
 		for (const [i, go] of tries.entries()) {
@@ -129,7 +104,7 @@ export class RowsCounter {
 
 	private async viaRelayDiagnostics(): Promise<RowsReading> {
 		const id = this.context.devices.A!;
-		const r = await fetchRows(vaultRoute(id, "diagnostics"), { headers: deviceBearerHeaders(id) }, this.countTimeout).catch(() => null);
+		const r = await fetch(vaultRoute(id, "diagnostics"), { headers: deviceBearerHeaders(id) }).catch(() => null);
 		const v = r?.ok ? await json(r) : null;
 		const counters = (v?.relay as Obj | undefined)?.counters as Obj | undefined;
 		const w = asNum(counters?.rowsWritten);
@@ -150,7 +125,6 @@ export class RowsCounter {
 		} catch (error) {
 			reading = { at: now(), wall: Date.now(), rowsWritten: null, rowsRead: null, source: "none", exact: false, error: String(error).slice(0, 200) };
 		}
-		if (this.pendingTimeouts > 0) { reading.timeouts = this.pendingTimeouts; this.pendingTimeouts = 0; }
 		if (this.resolved === null && reading.rowsWritten !== null) { this.resolved = reading.source; log(`rows counter source: ${reading.source}`); }
 		this.readings.push(reading);
 		if (this.readings.length > 5000) this.readings.splice(0, 2500);
@@ -170,44 +144,44 @@ export function rowsDelta(a: RowsReading, b: RowsReading): RowsDelta {
 
 // =================================================================================================== create
 export interface NoteInput { kind: "note"; path: string; bodyId: string; content: string }
+export interface AttachmentInput { kind: "attachment"; path: string; bytes: Uint8Array; mime: string }
+export type CreateInput = NoteInput | AttachmentInput;
 export type ItemOutcome = "created" | "exists-identical" | "exists-different" | "rejected" | "error";
+export interface CreateBatch {
+	index: number; files: number; notes: number; attachments: number; bytes: number;
+	startedAtWall: number; endedAtWall: number; ms: number; httpStatus: number | null; requests: number; error?: string;
+	/** Rows counter delta for this batch when the scenario reads the counter between batches. */
+	rows?: RowsDelta;
+}
 export interface CreateResult {
-	adapter: string;
+	adapter: string; implemented: boolean;
 	outcomes: Array<{ path: string; outcome: ItemOutcome; detail?: string }>;
-	requests: number; wallMs: number;
+	batches: CreateBatch[];
+	requests: number; blobUploads: number; wallMs: number;
+	oversizeSingles: number;
+}
+export interface CreateOptions {
+	maxFiles?: number; maxBytes?: number;
+	/** Called after each batch (scenarios read the rows counter here). */
+	afterBatch?: (b: CreateBatch) => Promise<void>;
+	device?: string;
+	onProgress?: (done: number, total: number) => void;
+}
+export interface CreateAdapter {
+	readonly name: string;
+	readonly implemented: boolean;
+	create(context: Context, items: readonly CreateInput[], options?: CreateOptions): Promise<CreateResult>;
 }
 
-/** Today's production import path (VaultSync.commitFreshBodies via lib/context.seedNotes, 32 notes per call). */
-export async function legacyCreate(context: Context, items: readonly NoteInput[]): Promise<CreateResult> {
-	const t0 = now();
-	const result: CreateResult = { adapter: "legacy", outcomes: [], requests: 0, wallMs: 0 };
-	try {
-		const r = await seedNotes(context, items.map((i) => ({ bodyId: i.bodyId, path: i.path, content: i.content })), 64 * 1024 * 1024);
-		result.requests = r.requests;
-		for (const i of items) result.outcomes.push({ path: i.path, outcome: "created" });
-	} catch (error) {
-		const detail = String(error).slice(0, 300);
-		for (const i of items) result.outcomes.push({ path: i.path, outcome: "error", detail });
-	}
-	result.wallMs = r2(now() - t0);
-	return result;
-}
-
-/** W2 bulk create route of the write-budget spike. Not on relay v3 (owned by the b3-bulk work). */
-export const BULK_ROUTE = process.env.WB_BULK_ROUTE ?? "lifecycle/create-bulk";
 /**
- * Does the server expose the bulk create route? An empty POST: 404 = absent (the Worker allowlist answers 404 for
- * unknown vault routes); anything else (400/409/415/…) = present.
+ * Bytes an item adds to a create REQUEST body. Attachment bytes go up separately (PUT blobs/:sha256 first), so only their
+ * metadata counts (confirmed by W2: the bulk request carries {hash,size,mime}; bulk measures update-frame bytes).
  */
-export async function bulkCreateAvailable(identity: LiveIdentity): Promise<{ available: boolean; status: number }> {
-	const r = await fetch(vaultRoute(identity, BULK_ROUTE), { method: "POST",
-		headers: deviceBearerHeaders(identity, { "Content-Type": "application/octet-stream" }), body: new Uint8Array(0) });
-	await r.arrayBuffer().catch(() => null);
-	return { available: r.status !== 404, status: r.status };
-}
+export const ATTACHMENT_META_BYTES = 256;
+const inputBytes = (i: CreateInput) => (i.kind === "note" ? Buffer.byteLength(i.content) : ATTACHMENT_META_BYTES);
 
-/** Split by caps (≤ maxFiles, ≤ maxBytes); an item larger than maxBytes travels alone. */
-export function splitBatches<T>(items: readonly T[], maxFiles: number, maxBytes: number, size: (i: T) => number): T[][] {
+/** Split by the W2 caps (≤ maxFiles, ≤ maxBytes); an item larger than maxBytes travels alone. */
+export function splitBatches<T extends CreateInput>(items: readonly T[], maxFiles: number, maxBytes: number, size: (i: T) => number = inputBytes): T[][] {
 	const out: T[][] = [];
 	let cur: T[] = [], bytes = 0;
 	for (const it of items) {
@@ -218,6 +192,82 @@ export function splitBatches<T>(items: readonly T[], maxFiles: number, maxBytes:
 	if (cur.length) out.push(cur);
 	return out;
 }
+
+async function putBlob(identity: LiveIdentity, bytes: Uint8Array): Promise<{ hash: string; status: number; ms: number }> {
+	const hash = sha256(bytes);
+	const t0 = now();
+	const r = await fetch(vaultRoute(identity, `blobs/${hash}`), { method: "PUT",
+		headers: deviceBearerHeaders(identity, { "Content-Type": "application/octet-stream" }), body: bytes });
+	await r.arrayBuffer().catch(() => null);
+	return { hash, status: r.status, ms: r2(now() - t0) };
+}
+
+/**
+ * Today's production path (what relay v2 / 3b66f1b clients do). Comparator for I1/I3; cannot express I2 outcomes.
+ * NOTE: W2 removes lifecycle/admissions, so this adapter only works against a pre-W2 server (wbbase / 3b66f1b).
+ */
+export const legacyCreate: CreateAdapter = {
+	name: "legacy", implemented: true,
+	async create(context, items, options = {}) {
+		const identity = context.devices[options.device ?? "A"]!;
+		const t0 = now();
+		const result: CreateResult = { adapter: "legacy", implemented: true, outcomes: [], batches: [], requests: 0, blobUploads: 0, wallMs: 0, oversizeSingles: 0 };
+		const notes = items.filter((i): i is NoteInput => i.kind === "note");
+		const atts = items.filter((i): i is AttachmentInput => i.kind === "attachment");
+		// Notes: seedNotes = VaultSync.commitFreshBodies, 32 per call (the production import batch size).
+		for (const [k, batch] of splitBatches(notes, 32, 4 * 1024 * 1024).entries()) {
+			const b: CreateBatch = { index: result.batches.length, files: batch.length, notes: batch.length, attachments: 0,
+				bytes: batch.reduce((s, i) => s + inputBytes(i), 0), startedAtWall: Date.now(), endedAtWall: 0, ms: 0, httpStatus: null, requests: 0 };
+			const s0 = now();
+			try {
+				const r = await seedNotes(context, batch.map((i) => ({ bodyId: i.bodyId, path: i.path, content: i.content })), 64 * 1024 * 1024);
+				b.requests = r.requests; b.httpStatus = 200;
+				for (const i of batch) result.outcomes.push({ path: i.path, outcome: "created" });
+			} catch (error) {
+				b.error = String(error).slice(0, 300);
+				for (const i of batch) result.outcomes.push({ path: i.path, outcome: "error", detail: b.error });
+			}
+			b.ms = r2(now() - s0); b.endedAtWall = Date.now(); result.requests += b.requests; result.batches.push(b);
+			await options.afterBatch?.(b);
+			options.onProgress?.(result.outcomes.length, items.length);
+			void k;
+		}
+		// Attachments: blob PUT + one attachments/publish per file (≤ 2 root events per commit today).
+		const rootEpoch = atts.length ? await currentRootEpoch(identity) : 1;
+		for (const a of atts) {
+			const b: CreateBatch = { index: result.batches.length, files: 1, notes: 0, attachments: 1, bytes: a.bytes.byteLength,
+				startedAtWall: Date.now(), endedAtWall: 0, ms: 0, httpStatus: null, requests: 0 };
+			const s0 = now();
+			const blob = await putBlob(identity, a.bytes);
+			result.blobUploads++;
+			const r = await fetch(vaultRoute(identity, "attachments/publish"), { method: "POST",
+				headers: deviceBearerHeaders(identity, { "Content-Type": "application/json" }),
+				body: JSON.stringify({ rootEpoch, operationId: `wb-att-${crypto.randomUUID()}`, kind: "upsert", path: a.path,
+					expectedRevision: null, hash: blob.hash, size: a.bytes.byteLength, mime: a.mime }) });
+			const body = await json(r);
+			b.httpStatus = r.status; b.requests = 2; b.ms = r2(now() - s0); b.endedAtWall = Date.now();
+			result.outcomes.push({ path: a.path, outcome: r.ok && blob.status < 300 ? "created" : "error",
+				...(r.ok ? {} : { detail: `${blob.status}/${r.status} ${String(body?.error ?? "")}` }) });
+			result.requests += 2; result.batches.push(b);
+			await options.afterBatch?.(b);
+			options.onProgress?.(result.outcomes.length, items.length);
+		}
+		result.wallMs = r2(now() - t0);
+		return result;
+	},
+};
+
+/**
+ * W2 bulk create, wired to wb-w2 @33e1cc5 (server/src/vaultBulkCreateService.ts):
+ *   POST /vault/:id/lifecycle/create-bulk, body = binary envelope (server/src/shared/binaryEnvelope.ts)
+ *     { batchId, rootEpoch, files: [{ operationId, bodyId, path, updates: Uint8Array[] }],
+ *       attachments: [{ operationId, path, hash, size, mime }] }   (blob bytes PUT to /blobs/:hash first, D6)
+ *   200 → binary envelope { batchId, outcomes: [{ kind, operationId, path, outcome, reason?, ... }], vaultSequence,
+ *         rootGeneration, rootEpoch, replayed, rootUpdate? }; errors → JSON { error } (409 epoch mismatch, 413 caps).
+ * Caps: ≤ 500 items, ≤ 4 MiB of update-frame bytes (one lone note may use up to 6 MiB). Frames ≤ 1.75 MB, ≤ 16/file.
+ * The batch byte budget is measured on the encoded frames, not on the text.
+ */
+export const BULK_ROUTE = process.env.WB_BULK_ROUTE ?? "lifecycle/create-bulk";
 const FRAME_CHARS = 400_000; // ≤ 1.6 MB per frame even at 4 bytes/char (server row-safe cap 1.75 MB)
 export function bodyFrames(text: string): Uint8Array[] {
 	const doc = new Y.Doc();
@@ -237,57 +287,83 @@ export async function currentRootEpoch(identity: LiveIdentity): Promise<number> 
 	if (!r.ok || !Number.isSafeInteger(epoch) || epoch < 1) throw new Error(`root read for epoch failed (${r.status})`);
 	return epoch;
 }
-export interface BulkBatch { index: number; files: number; httpStatus: number | null; ms: number; error?: string }
-/**
- * Notes-only bulk create in the write-budget spike's W2 wire format (binary envelope
- * { batchId, rootEpoch, files: [{ operationId, bodyId, path, updates }], attachments: [] } → { outcomes: [...] }).
- * Only used by DL when `bulkCreateAvailable` says the route exists; if a later branch changes the wire format, this
- * adapter must follow it.
- */
-export async function bulkCreate(context: Context, items: readonly NoteInput[], options: { device?: string; maxFiles?: number; maxBytes?: number;
-	afterBatch?: (b: BulkBatch) => Promise<void> } = {}): Promise<CreateResult & { batches: BulkBatch[] }> {
-	const identity = context.devices[options.device ?? "A"]!;
-	const t0 = now();
-	const result: CreateResult & { batches: BulkBatch[] } = { adapter: "bulk", outcomes: [], requests: 0, wallMs: 0, batches: [] };
-	const frames = new Map(items.map((i) => [i, bodyFrames(i.content)] as const));
-	const sizeOf = (i: NoteInput) => frames.get(i)!.reduce((s, f) => s + f.byteLength, 0);
-	let rootEpoch = await currentRootEpoch(identity); result.requests++;
-	for (const batch of splitBatches(items, options.maxFiles ?? 500, options.maxBytes ?? 4 * 1024 * 1024, sizeOf)) {
-		const s0 = now();
-		const opOf = new Map<string, NoteInput>();
-		const files = batch.map((i) => { const operationId = `wb-file-${crypto.randomUUID()}`; opOf.set(operationId, i);
-			return { operationId, bodyId: i.bodyId, path: i.path, updates: frames.get(i)! }; });
-		const batchId = `wb-${crypto.randomUUID()}`;
-		const send = () => fetch(vaultRoute(identity, BULK_ROUTE), { method: "POST",
-			headers: deviceBearerHeaders(identity, { "Content-Type": YAOS_BINARY_CONTENT_TYPE }),
-			body: encodeBinaryEnvelope({ batchId, rootEpoch, files, attachments: [] }) });
-		let r = await send(); result.requests++;
-		const read = async () => r.headers.get("content-type")?.includes(YAOS_BINARY_CONTENT_TYPE)
-			? decodeBinaryEnvelope(new Uint8Array(await r.arrayBuffer())) as Obj : await json(r);
-		let body = await read();
-		if (r.status === 409 && /epoch/i.test(String(body?.error ?? body?.code ?? ""))) { // root epoch moved: re-read, retry once
-			rootEpoch = await currentRootEpoch(identity);
-			r = await send(); result.requests += 2; body = await read();
-		}
-		const b: BulkBatch = { index: result.batches.length, files: batch.length, httpStatus: r.status, ms: r2(now() - s0),
-			...(r.ok ? {} : { error: `${r.status} ${String(body?.error ?? "").slice(0, 200)}` }) };
-		const list = (r.ok ? body?.outcomes : undefined) as Obj[] | undefined;
-		const byOp = new Map((Array.isArray(list) ? list : []).map((x) => [String(x.operationId ?? ""), x]));
-		const known: ItemOutcome[] = ["created", "exists-identical", "exists-different", "rejected"];
-		for (const [op, i] of opOf) {
-			const x = byOp.get(op);
-			const o = String(x?.outcome ?? "") as ItemOutcome;
-			result.outcomes.push(known.includes(o) ? { path: i.path, outcome: o, ...(x?.reason ? { detail: String(x.reason) } : {}) }
-				: { path: i.path, outcome: "error", detail: r.ok ? `missing outcome for ${op}` : `${r.status} ${String(body?.error ?? "")}` });
-		}
-		result.batches.push(b);
-		await options.afterBatch?.(b);
-	}
-	result.wallMs = r2(now() - t0);
-	return result;
+export function bulkCreate(_contentHash?: (text: string) => { contentHash: string; size: number }): CreateAdapter {
+	return {
+		name: "bulk", implemented: true,
+		async create(context, items, options = {}) {
+			const identity = context.devices[options.device ?? "A"]!;
+			const maxFiles = options.maxFiles ?? 500, maxBytes = options.maxBytes ?? 4 * 1024 * 1024;
+			const t0 = now();
+			const result: CreateResult = { adapter: "bulk", implemented: true, outcomes: [], batches: [], requests: 0, blobUploads: 0, wallMs: 0, oversizeSingles: 0 };
+			const frames = new Map<CreateInput, Uint8Array[]>();
+			for (const i of items) if (i.kind === "note") frames.set(i, bodyFrames(i.content));
+			const sizeOf = (i: CreateInput) => i.kind === "note" ? frames.get(i)!.reduce((s, f) => s + f.byteLength, 0) : 0;
+			let rootEpoch = await currentRootEpoch(identity); result.requests++;
+			for (const batch of splitBatches(items, maxFiles, maxBytes, sizeOf)) {
+				const bytes = batch.reduce((s, i) => s + sizeOf(i), 0);
+				if (batch.length === 1 && bytes > maxBytes) result.oversizeSingles++;
+				const b: CreateBatch = { index: result.batches.length, files: batch.length, notes: batch.filter((i) => i.kind === "note").length,
+					attachments: batch.filter((i) => i.kind === "attachment").length, bytes, startedAtWall: Date.now(), endedAtWall: 0, ms: 0, httpStatus: null, requests: 0 };
+				const s0 = now();
+				const opOf = new Map<string, CreateInput>();
+				const attachments: Obj[] = [];
+				for (const a of batch) if (a.kind === "attachment") {
+					const blob = await putBlob(identity, a.bytes); result.blobUploads++; b.requests++;
+					const operationId = `wb-att-${crypto.randomUUID()}`; opOf.set(operationId, a);
+					attachments.push({ operationId, path: a.path, hash: blob.hash, size: a.bytes.byteLength, mime: a.mime });
+				}
+				const files = batch.filter((i): i is NoteInput => i.kind === "note").map((i) => {
+					const operationId = `wb-file-${crypto.randomUUID()}`; opOf.set(operationId, i);
+					return { operationId, bodyId: i.bodyId, path: i.path, updates: frames.get(i)! };
+				});
+				const batchId = `wb-${crypto.randomUUID()}`;
+				const send = () => fetch(vaultRoute(identity, BULK_ROUTE), { method: "POST",
+					headers: deviceBearerHeaders(identity, { "Content-Type": YAOS_BINARY_CONTENT_TYPE }),
+					body: encodeBinaryEnvelope({ batchId, rootEpoch, files, attachments }) });
+				let r = await send(); b.requests++;
+				let body: Obj | null = null;
+				const read = async () => r.headers.get("content-type")?.includes(YAOS_BINARY_CONTENT_TYPE)
+					? decodeBinaryEnvelope(new Uint8Array(await r.arrayBuffer())) as Obj : await json(r);
+				body = await read();
+				if (r.status === 409 && /epoch/i.test(String(body?.error ?? body?.code ?? ""))) { // root epoch moved: re-read, retry once
+					rootEpoch = await currentRootEpoch(identity); b.requests++;
+					r = await send(); b.requests++; body = await read();
+				}
+				b.httpStatus = r.status; b.ms = r2(now() - s0); b.endedAtWall = Date.now();
+				const list = (r.ok ? body?.outcomes : undefined) as Obj[] | undefined;
+				const byOp = new Map((Array.isArray(list) ? list : []).map((x) => [String(x.operationId ?? ""), x]));
+				const known: ItemOutcome[] = ["created", "exists-identical", "exists-different", "rejected"];
+				for (const [op, i] of opOf) {
+					const x = byOp.get(op);
+					const o = String(x?.outcome ?? "") as ItemOutcome;
+					result.outcomes.push(known.includes(o) ? { path: i.path, outcome: o, ...(x?.reason ? { detail: String(x.reason) } : {}) }
+						: { path: i.path, outcome: "error", detail: r.ok ? `missing outcome for ${op}` : `${r.status} ${String(body?.error ?? "")}` });
+				}
+				if (!r.ok) b.error = `${r.status} ${String(body?.error ?? "").slice(0, 200)}`;
+				result.requests += b.requests; result.batches.push(b);
+				await options.afterBatch?.(b);
+				options.onProgress?.(result.outcomes.length, items.length);
+			}
+			result.wallMs = r2(now() - t0);
+			return result;
+		},
+	};
 }
 
-// =================================================================================================== catalog
+export function createAdapterFor(name: string | undefined, contentHash: (text: string) => { contentHash: string; size: number }): CreateAdapter {
+	const n = name ?? process.env.WB_CREATE ?? "legacy";
+	if (n === "legacy") return legacyCreate;
+	if (n === "bulk") return bulkCreate(contentHash);
+	throw new Error(`unknown create adapter ${n} (legacy|bulk)`);
+}
+
+export function outcomeCounts(r: CreateResult) {
+	const c: Record<string, number> = {};
+	for (const o of r.outcomes) c[o.outcome] = (c[o.outcome] ?? 0) + 1;
+	return c;
+}
+
+// =================================================================================================== catalog / root
 export interface HeadEntry { bodyId: string; path: string; contentHash: string | null; size: number | null; lifecycle?: string }
 /** GET /heads, all pages (active catalog: path + contentHash per body). */
 export async function listHeads(identity: LiveIdentity): Promise<{ entries: HeadEntry[]; requests: number; ms: number }> {
@@ -307,71 +383,14 @@ export async function listHeads(identity: LiveIdentity): Promise<{ entries: Head
 	return { entries, requests, ms: r2(now() - t0) };
 }
 
-// =================================================================================================== closed-file candidate
-/**
- * Closed-file HTTP candidate (the real client's VaultServerPort.submitCandidate, src/sync/vaultSync.ts): one Yjs update
- * as `application/octet-stream` to `POST body/:bodyId/candidate` with x-yaos-body-epoch / x-yaos-candidate-id /
- * x-yaos-candidate-digest. A single frame's digest is SHA-256(frame) (server/src/shared/candidateDigest.ts).
- * 200 → DurableReceipt; daily limit → typed 503 `cf_daily_limit` (see DL).
- */
-export function candidateRequest(bodyId: string, bodyEpoch: number, update: Uint8Array, candidateId: string) {
-	return {
-		path: `body/${encodeURIComponent(bodyId)}/candidate`,
-		headers: { "content-type": "application/octet-stream", "x-yaos-body-epoch": String(bodyEpoch),
-			"x-yaos-candidate-id": candidateId, "x-yaos-candidate-digest": sha256(update) },
-		body: update,
-	};
-}
-export interface CandidatePost { status: number; ms: number; reqBytes: number; retryAfter: string | null; value: Obj | null }
-export async function postCandidate(identity: LiveIdentity, bodyId: string, bodyEpoch: number, update: Uint8Array, candidateId: string): Promise<CandidatePost> {
-	const req = candidateRequest(bodyId, bodyEpoch, update, candidateId);
-	const t0 = now();
-	const r = await fetch(vaultRoute(identity, req.path), { method: "POST", headers: { ...deviceBearerHeaders(identity), ...req.headers }, body: req.body });
-	const value = await json(r).catch(() => null) as Obj | null;
-	return { status: r.status, ms: r2(now() - t0), reqBytes: update.byteLength, retryAfter: r.headers.get("retry-after"), value };
-}
-/** GET body → { doc, epoch } (the epoch a candidate must carry). */
-export async function bodyDocWithEpoch(identity: LiveIdentity, bodyId: string): Promise<{ doc: Y.Doc; epoch: number; status: number }> {
-	const r = await fetch(vaultRoute(identity, `body/${encodeURIComponent(bodyId)}`), { headers: deviceBearerHeaders(identity) });
+/** GET /root → Y root doc maps (pathToId, pathToBlob). */
+export async function rootMaps(identity: LiveIdentity): Promise<{ pathToId: Map<string, unknown>; pathToBlob: Map<string, unknown>; bytes: number }> {
+	const r = await fetch(vaultRoute(identity, "root"), { headers: deviceBearerHeaders(identity) });
 	const bytes = new Uint8Array(await r.arrayBuffer());
+	if (!r.ok) throw new Error(`root ${r.status}`);
 	const doc = new Y.Doc();
-	if (r.ok) Y.applyUpdate(doc, bytes);
-	return { doc, epoch: Number(r.headers.get("x-yaos-body-epoch")), status: r.status };
-}
-
-// =================================================================================================== merge (R1)
-export interface MergeAdapter {
-	name: string; source: "product-module" | "harness-reference";
-	merge(base: string, ours: string, theirs: string): MergeResult | Promise<MergeResult>;
-	noBase(ours: string, theirs: string): NoBaseResult | Promise<NoBaseResult>;
-}
-function normalizeMerge(v: unknown): MergeResult {
-	const o = (v ?? {}) as Obj;
-	const kind = String(o.kind ?? o.status ?? o.outcome ?? "");
-	if (o.conflict === true || kind === "conflict" || kind === "conflict-copy" || kind === "too-large") return { kind: "conflict", reason: String(o.reason ?? kind) };
-	const text = (o.text ?? o.content ?? o.merged ?? o.result) as unknown; // mergeThreeWayLines → {kind:"clean", content}
-	if (typeof text === "string") return { kind: "clean", text };
-	if (typeof v === "string") return { kind: "clean", text: v };
-	return { kind: "conflict", reason: `unrecognised merge result ${JSON.stringify(v).slice(0, 80)}` };
-}
-/**
- * `--merge-module src/sync/lineMerge.ts` (or WB_MERGE_MODULE) exports mergeThreeWayLines(base, disk, body) →
- * ThreeWayMergeResult {kind: clean(content) | conflict | too-large}. The product has no separate no-base function
- * (no-base is identical → settle, else conflict artifact, in the closed-file planner), so noBase falls back to the
- * reference rule (same policy). The product merges adjacent-line edits cleanly; the reference conflicts ("either").
- */
-export async function mergeAdapter(modulePath?: string): Promise<MergeAdapter> {
-	const path = modulePath ?? process.env.WB_MERGE_MODULE;
-	if (!path) return { name: "reference-diff3", source: "harness-reference", merge: merge3, noBase: mergeNoBase };
-	const m = await import(pathToFileURL(path).href) as Obj;
-	const fn = (m.mergeThreeWayLines ?? m.merge3 ?? m.threeWayMerge ?? m.diff3Merge ?? m.mergeLines ?? m.default) as ((...a: string[]) => unknown) | undefined;
-	if (typeof fn !== "function") throw new Error(`merge module ${path} has no mergeThreeWayLines/merge3/threeWayMerge/diff3Merge/mergeLines export`);
-	const nb = (m.mergeNoBase ?? m.reconcileNoBase) as ((a: string, b: string) => unknown) | undefined;
-	return { name: `module:${path}`, source: "product-module",
-		merge: async (b, o, t) => normalizeMerge(await fn(b, o, t)),
-		noBase: async (o, t) => {
-			if (typeof nb !== "function") return mergeNoBase(o, t);
-			const v = (await nb(o, t)) as Obj;
-			return v?.kind === "skip" || v?.skip === true ? { kind: "skip" } : { kind: "conflict", reason: String(v?.reason ?? "conflict") };
-		} };
+	Y.applyUpdate(doc, bytes);
+	const out = { pathToId: new Map(doc.getMap("pathToId").entries()), pathToBlob: new Map(doc.getMap("pathToBlob").entries()), bytes: bytes.byteLength };
+	doc.destroy();
+	return out;
 }

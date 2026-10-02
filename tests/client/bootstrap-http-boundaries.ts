@@ -12,7 +12,7 @@ import {
 	type HttpResponse,
 } from "../../src/utils/http";
 import { suite } from "../harness.ts";
-import { decodeBinaryEnvelope, encodeBinaryEnvelope } from "../../server/src/shared/binaryEnvelope";
+import { decodeBinaryEnvelope, encodeBinaryEnvelope, YAOS_BINARY_CONTENT_TYPE } from "../../server/src/shared/binaryEnvelope";
 
 const s = suite("bootstrap-http-boundaries");
 
@@ -213,59 +213,70 @@ s.test("VaultSync HTTP injection sends candidate bytes without copying", async (
 	assert.equal(requests[0]?.headers?.Authorization, "Bearer token");
 });
 
-s.test("VaultSync HTTP adapter batches create admissions and candidate updates into one request each", async () => {
+s.test("VaultSync HTTP adapter sends bulk creates as one binary envelope and batches candidates", async () => {
 	const requests: HttpRequest[] = [];
+	const bulkResponse = {
+		batchId: "batch-1", outcomes: [
+			{ kind: "file", operationId: "operation-a", path: "a.md", outcome: "created", bodyId: "body-a" },
+			{ kind: "file", operationId: "operation-b", path: "b.md", outcome: "exists-different", bodyId: "body-b", existingBodyId: "body-x" },
+		], vaultSequence: 2, rootGeneration: 3, rootEpoch: 1, vaultGeneration: "generation", runtimeEpoch: "runtime",
+		replayed: false, rootUpdate: Uint8Array.of(9, 9),
+	};
 	const port = new VaultSyncHttpPort(
 		"https://sync.test",
 		"vault",
 		"token",
 		async (request) => {
 			requests.push(request);
+			const bulk = request.url.endsWith("/lifecycle/create-bulk");
 			return {
 				status: 200,
 				headers: {},
-				arrayBuffer: new ArrayBuffer(0),
-				json: request.url.endsWith("/lifecycle/admissions")
-					? { receipts: [], vaultSequence: 2, runtimeEpoch: "runtime" }
-					: { receipts: [], highWater: 4 },
+				arrayBuffer: bulk ? encodeBinaryEnvelope(bulkResponse).slice().buffer : new ArrayBuffer(0),
+				json: bulk ? null : { receipts: [], highWater: 4 },
 				text: "",
 			};
 		},
 	);
-	const operations = ["a", "b"].map((suffix) => ({
+	const files = ["a", "b"].map((suffix, index) => ({
 		operationId: `operation-${suffix}`,
-		kind: "create" as const,
-		fileId: `body-${suffix}`,
 		bodyId: `body-${suffix}`,
-		bodyEpoch: 1 as const,
 		path: `${suffix}.md`,
-		candidateId: `candidate-${suffix}`,
-		candidateDigest: suffix.repeat(64),
+		updates: [Uint8Array.of(index + 1, index + 2)],
 	}));
-	await port.commitCreateAdmissionsBatch(operations);
-	await port.submitCandidates(operations.map((operation, index) => ({
+	const response = await port.commitCreateBulk({
+		batchId: "batch-1", rootEpoch: 1, rootStateVector: Uint8Array.of(0), files, attachments: [],
+	});
+	await port.submitCandidates(files.map((file, index) => ({
 		vaultId: "vault",
-		bodyId: operation.bodyId,
+		bodyId: file.bodyId,
 		bodyEpoch: 1,
 		previousBaseline: "",
-		pendingMarkdown: operation.path,
-		candidateId: operation.candidateId,
-		candidateDigest: operation.candidateDigest,
+		pendingMarkdown: file.path,
+		candidateId: `candidate-${index}`,
+		candidateDigest: String(index).repeat(64),
 		encodedUpdate: Uint8Array.of(index + 1, index + 2).buffer,
 		capturedAt: index,
 	})));
 
 	assert.deepEqual(requests.map((request) => request.url), [
-		"https://sync.test/vault/vault/lifecycle/admissions",
+		"https://sync.test/vault/vault/lifecycle/create-bulk",
 		"https://sync.test/vault/vault/body/candidates",
 	]);
-	assert.deepEqual(JSON.parse(requests[0]!.body as string), { operations });
+	assert.equal(requests[0]!.contentType, YAOS_BINARY_CONTENT_TYPE);
+	const sent = decodeBinaryEnvelope(new Uint8Array(requests[0]!.body as ArrayBuffer)) as {
+		batchId: string; files: Array<{ path: string; updates: Uint8Array[] }>; attachments: unknown[];
+	};
+	assert.equal(sent.batchId, "batch-1");
+	assert.deepEqual(sent.files.map((file) => [file.path, file.updates.map((update) => [...update])]),
+		[["a.md", [[1, 2]]], ["b.md", [[2, 3]]]]);
+	assert.deepEqual(sent.attachments, []);
+	assert.deepEqual(response.outcomes.map((outcome) => outcome.outcome), ["created", "exists-different"]);
+	assert.deepEqual([...response.rootUpdate!], [9, 9]);
 	const envelope = decodeBinaryEnvelope(new Uint8Array(requests[1]!.body as ArrayBuffer)) as {
 		candidates: Array<{ bodyId: string; encodedUpdates: Uint8Array[] }>;
 	};
 	assert.deepEqual(envelope.candidates.map((candidate) => candidate.bodyId), ["body-a", "body-b"]);
-	assert.deepEqual(envelope.candidates.map((candidate) => candidate.encodedUpdates.map((update) => [...update])),
-		[[[1, 2]], [[2, 3]]]);
 	assert.ok(requests.every((request) => request.headers?.Authorization === "Bearer token"));
 });
 

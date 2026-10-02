@@ -518,6 +518,8 @@ a doc. Clients are trusted, as with envelope hashes.
 | `YAOS_RELAY_LAZY_HASH_MAX_BYTES` | `3145728` | Bodies above this never get the lazy-hash materialisation. |
 | `YAOS_RELAY_LEAN_ROWS` | unset | `"true"` enables lean rows (§6.4). |
 | `YAOS_RELAY_LEAN_CATALOG_DELAY_MS` | `2000` | Lean mode: the relay alarm runs this long after the first pending append; it coalesces catalog events and checkpoints. Range 0..600000. |
+| `YAOS_BULK_CREATE_MAX_ITEMS` | `500` | Create-bulk item cap (files + attachments) per request; clamped to 1..500 (can only lower). Not relay-gated. |
+| `YAOS_BULK_CREATE_MAX_BYTES` | `4194304` | Create-bulk byte cap over all file frames per request; clamped to 65536..4194304. A single-file batch keeps the per-note ceiling. Not relay-gated. The effective caps are advertised as `bulkCreate: {maxItems, maxBytes}` in `/api/capabilities` and in every create-bulk 413 body; the client splits by them (byte budget = 7/8 of `maxBytes`) and still halves on a 413 without caps. |
 
 Local tests: `YAOS_TEST_FORCE_RELAY_BODIES=true` (or `YAOS_TEST_RELAY_BODIES=true`) makes runtimes
 built without an env (unit suites) default to relay mode (`relayBodiesTestDefault()` in

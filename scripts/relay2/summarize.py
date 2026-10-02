@@ -545,6 +545,110 @@ class S:
                                  "YES" if cpu["p99"] > 10_000 else "no", num(g(w, "totals", "exceededCpuErrors")), num(g(w, "totals", "rowsWritten"))])
         return table(["file", "window", "invocation", "status", "requests", "cpu p50 ms", "cpu p90 ms", "cpu p99 ms", "p99 > 10 ms", "exceededCpu", "rows written (window)"], rows)
 
+    # ---------------------------------------------------------------- write-budget spike (wb/scenarios.ts)
+    def wbruns(self, scenario: str):
+        return [(n, d) for n, d in sorted(self.r.items()) if isinstance(d, dict) and d.get("scenario") == scenario]
+
+    @staticmethod
+    def rows_cell(rows):
+        """rowsWritten with its counter source; '~' = relay in-memory fallback (relay appends only, not exact)."""
+        if not isinstance(rows, dict) or rows.get("rowsWritten") is None:
+            return "–"
+        return f"{rows['rowsWritten']}" + ("" if rows.get("exact") else " ~")
+
+    def wb_c4(self) -> str:
+        out = []
+        for n, d in self.wbruns("C4W"):
+            for p in d.get("parts") or []:
+                out.append([f"`{n}`", "off" if d.get("relay") is False else "on", p.get("part"), p.get("edits"), self.rows_cell(p.get("rows")),
+                            p.get("rowsPerEdit"), p.get("rowsPerTypingSecond"), pct(p.get("receiptMs")), pct(p.get("lastOfBurstReceiptMs")),
+                            p.get("framesWithoutReceipt"), g(p, "rows", "source")])
+        return table(["file", "relay", "part", "edits", "rows", "rows/edit", "rows/typing-s", "receipt ms p50/p90/p99", "last-of-burst receipt",
+                      "no receipt", "counter"], out) + "\n\nTarget (spike §2): ≤ 9 rows/typing-second. `~` = not exact (relay fallback counter)."
+
+    def wb_l5r(self) -> str:
+        out = [[f"`{n}`", d.get("burst"), pct(d.get("receiptMs")), pct(d.get("firstFrameReceiptMs")), d.get("meetsTarget"), g(d, "convergence", "pass")]
+               for n, d in self.wbruns("L5R")]
+        return table(["file", "burst", "durable receipt ms p50/p90/p99", "first frame receipt", "p50 ≤ 1 s", "converged"], out)
+
+    def wb_create(self) -> str:
+        out = []
+        for sc in ("I1", "I2", "I3"):
+            for n, d in self.wbruns(sc):
+                src = d if sc != "I2" else (d.get("bulk") if isinstance(d.get("bulk"), dict) and "totalRowsWritten" in d["bulk"] else d.get("seedRun") or {})
+                fit = src.get("fit") or {}
+                rows = src.get("totalRowsWritten")
+                out.append([f"`{n}`", sc, g(d, "corpus", "preset"), src.get("adapter"), json.dumps(src.get("outcomes")) if src.get("outcomes") else "–",
+                            "–" if rows is None else f"{rows}{'' if src.get('rowsExact') else ' ~'}", src.get("rowsPerFile"),
+                            fit.get("rowsPerNote"), fit.get("rowsPerAttachment"), fit.get("rowsPerBatch"), src.get("requests"), src.get("batches"),
+                            src.get("wallMs"), g(src, "batchMs", "p50"), g(d, "convergence", "pass")])
+        t = table(["file", "scen", "preset", "adapter", "outcomes", "rows", "rows/file", "fit rows/note", "fit rows/att", "fit rows/batch",
+                   "requests", "batches", "wall ms", "batch ms p50", "pass"], out)
+        extra = []
+        for n, d in self.wbruns("I2"):
+            c = d.get("catalog") or {}
+            extra.append([f"`{n}`", "catalog", c.get("identical"), c.get("different"), c.get("absent"), self.rows_cell(c.get("rows")), c.get("pass")])
+            b = d.get("bulk") or {}
+            if b.get("skipped"):
+                extra.append([f"`{n}`", "bulk", "–", "–", "–", "–", "skipped: " + b["skipped"]])
+            else:
+                o = b.get("outcomes") or {}
+                extra.append([f"`{n}`", "bulk", o.get("exists-identical"), o.get("exists-different"), o.get("created"),
+                              "–" if b.get("totalRowsWritten") is None else str(b.get("totalRowsWritten")), b.get("pass")])
+        if extra:
+            t += "\n\nI2 second device (expect ~0 rows):\n\n" + table(["file", "mode", "identical", "different", "absent/created", "rows", "pass"], extra)
+        peers = []
+        for n, d in self.wbruns("I3"):
+            for peer, v in (d.get("peers") or {}).items():
+                peers.append([f"`{n}`", peer, f"{v.get('visible')}/{v.get('of')}", v.get("allVisibleMs"), pct(v.get("notesMs")), pct(v.get("imagesMs"))])
+        if peers:
+            t += "\n\nI3 time to visible on peers (ms from drop start):\n\n" + table(["file", "peer", "visible", "all visible", "notes p50/p90/p99", "images p50/p90/p99"], peers)
+        return t + "\n\nCPU per batch: join perBatch[].startedAtWall/endedAtWall with the tail capture (--tail). `~` = not exact."
+
+    def wb_i4(self) -> str:
+        out = []
+        for n, d in self.wbruns("I4"):
+            for case, v in (d.get("byCase") or {}).items():
+                out.append([f"`{n}`", case, pct(v.get("rows"), ("p50", "max")), pct(v.get("peerVisibleMs")), v.get("allTextOk")])
+        return table(["file", "case", "rows p50/max", "peer visible ms", "text ok"], out) + \
+            "\n\nfold = paste inside the 300 ms collector; hold = paste while the create is in flight; after = paste 3 s later."
+
+    def wb_r1(self) -> str:
+        out = []
+        for n, d in self.wbruns("R1"):
+            live = {e.get("id"): e for e in d.get("live") or []}
+            for c in g(d, "mergeTable", "results", default=[]) or []:
+                lv = live.get(c.get("id")) or {}
+                out.append([f"`{n}`", c.get("id"), c.get("expect"), c.get("got"), c.get("pass"), lv.get("got", "–"), lv.get("pass", "–")])
+        return table(["file", "case", "expect", "merge got", "table pass", "live got", "live pass"], out)
+
+    def wb_xcrash(self) -> str:
+        out = []
+        for n, d in self.wbruns("XCRASH"):
+            rs = d.get("rounds") or []
+            out.append([f"`{n}`", len(rs), d.get("roundsCrashInsideWindow"), sum(r.get("receiptedBeforeCrash") or 0 for r in rs),
+                        sum(r.get("missingRightAfterCrash") or 0 for r in rs), d.get("noReceiptViolation"), d.get("noLoss"), d.get("crashModeHonoured"),
+                        g(d, "convergence", "pass")])
+        return table(["file", "rounds", "crash in window", "receipted", "missing after crash", "no receipt for unpersisted", "no loss",
+                      "crash mode honoured", "converged"], out) + \
+            "\n\n'crash in window' counts rounds where some frames were not yet persisted when the DO restarted (the test only bites then)."
+
+    def wb_a1(self) -> str:
+        out = [[f"`{n}`", d.get("mode"), d.get("writes"), self.rows_cell(d.get("rows")), d.get("rowsPerWrite"), d.get("rowsPerHour"), d.get("rowsPer8hDay"),
+                pct(d.get("changedSpanChars") or d.get("diffBytes"), ("p50", "max")), g(d, "convergence", "pass")] for n, d in self.wbruns("A1")]
+        return table(["file", "mode", "writes", "rows", "rows/write", "rows/hour", "rows/8 h", "changed span p50/max", "converged"], out)
+
+    def wb_budget(self) -> str:
+        sys.path.insert(0, os.path.join(HERE, "wb"))
+        import wbmodel  # noqa: PLC0415
+        vals, prov, notes = wbmodel.extract_measured(self.dir)
+        p = {k: float(v[0]) for k, v in wbmodel.WB_PARAMS.items()}
+        pv = {k: v[1] for k, v in wbmodel.WB_PARAMS.items()}
+        p.update(vals)
+        pv.update(prov)
+        rows = wbmodel.model(p, pv)
+        return wbmodel.render(rows, p, pv, wbmodel.headroom(p, pv), notes)
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -559,6 +663,12 @@ def main():
         ("K1 compaction", s.k1), ("Microbatch / lean sweep", s.mb), ("Per-phase worker totals", s.phases), ("Frame-outcome accounting", s.frame_accounting),
         ("Connection events", s.connection_events), ("Convergence", s.convergence), ("Free plan: CPU per invocation", s.free_plan),
     ]
+    wb = [("WB C4 rows per edit (exact counter)", s.wb_c4), ("WB L5' durable receipt latency", s.wb_l5r),
+          ("WB I1–I3 create / first open / folder drop", s.wb_create), ("WB I4 create-then-paste", s.wb_i4), ("WB R1 merge correctness", s.wb_r1),
+          ("WB X-crash", s.wb_xcrash), ("WB A1 autosave", s.wb_a1), ("WB rows/day vs Free 100k", s.wb_budget)]
+    if any(isinstance(d, dict) and d.get("scenario") in ("C4W", "L5R", "I1", "I2", "I3", "I4", "R1", "XCRASH", "A1") for d in s.r.values()):
+        sections = [sections[0]] + wb + [x for x in sections[1:] if x[0] in ("Per-phase worker totals", "Connection events")] \
+            if not any(isinstance(d, dict) and d.get("scenario") in ("L1", "C1", "C2", "B1", "X1") for d in s.r.values()) else sections + wb
     for title, fn in sections:
         if a.section != "all" and a.section.lower() not in title.lower():
             continue

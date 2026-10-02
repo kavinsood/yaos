@@ -469,7 +469,17 @@ export abstract class VaultDocumentStore {
 				generation INTEGER NOT NULL,
 				semantic_epoch INTEGER NOT NULL CHECK(semantic_epoch >= 1),
 				latest_sequence INTEGER NOT NULL
-			);
+			) WITHOUT ROWID;
+			-- Write-budget spike (int-bulk): the bulk-create hot tables (heads, checkpoints,
+			-- manifests, catalog events, attribution, attachment catalog events) are created
+			-- WITHOUT ROWID. A rowid table with a non-INTEGER PRIMARY KEY stores every row
+			-- twice (table b-tree + PK autoindex) and Cloudflare bills both; a WITHOUT ROWID
+			-- table is clustered on its PK, so the same INSERT is one billed row. No code
+			-- reads rowid on these tables and every lookup is by PK prefix or an unchanged
+			-- secondary index (EXPLAIN QUERY PLAN proof: tests/server/wb-bulk-trims.ts).
+			-- Same D7 pattern: CREATE TABLE IF NOT EXISTS only shapes *new* databases; an
+			-- existing database keeps its rowid tables (identical columns, constraints and
+			-- semantics) and is never rebuilt, so there is no schema-version bump.
 			CREATE TABLE IF NOT EXISTS vault_semantic_compaction_state (
 				document_id TEXT PRIMARY KEY,
 				last_compacted_at INTEGER CHECK(last_compacted_at IS NULL OR last_compacted_at >= 0),
@@ -514,9 +524,12 @@ export abstract class VaultDocumentStore {
 					CHECK(typeof(data) = 'blob' AND length(data) = chunk_byte_length
 						AND length(data) <= ${SQLITE_BLOB_CHUNK_BYTES}),
 				PRIMARY KEY(document_id, checkpoint_sequence, chunk_index)
-			);
-			CREATE INDEX IF NOT EXISTS vault_checkpoint_lookup
-				ON vault_checkpoints(document_id, checkpoint_sequence DESC);
+			) WITHOUT ROWID;
+			-- Write-budget spike D7: this index duplicated the primary key prefix
+			-- (document_id, checkpoint_sequence); every lookup is served by the PK
+			-- autoindex (EXPLAIN QUERY PLAN, tests/server/wb-w1-schema-trims.ts). Dropped
+			-- idempotently: same schema version, safe for base and relay alike.
+			DROP INDEX IF EXISTS vault_checkpoint_lookup;
 			CREATE TABLE IF NOT EXISTS vault_checkpoint_manifests (
 				document_id TEXT NOT NULL,
 				checkpoint_sequence INTEGER NOT NULL,
@@ -528,9 +541,9 @@ export abstract class VaultDocumentStore {
 				complete INTEGER NOT NULL CHECK(complete = 1),
 				created_at INTEGER NOT NULL,
 				PRIMARY KEY(document_id, checkpoint_sequence)
-			);
-			CREATE INDEX IF NOT EXISTS vault_checkpoint_manifest_lookup
-				ON vault_checkpoint_manifests(document_id, checkpoint_sequence DESC);
+			) WITHOUT ROWID;
+			-- D7: redundant with PRIMARY KEY(document_id, checkpoint_sequence), see above.
+			DROP INDEX IF EXISTS vault_checkpoint_manifest_lookup;
 			CREATE TABLE IF NOT EXISTS vault_catalog_events (
 				sequence INTEGER NOT NULL,
 				body_id TEXT NOT NULL,
@@ -544,7 +557,7 @@ export abstract class VaultDocumentStore {
 				size INTEGER,
 				mutation_index INTEGER NOT NULL,
 				PRIMARY KEY(sequence, body_id)
-			);
+			) WITHOUT ROWID;
 			CREATE INDEX IF NOT EXISTS vault_catalog_body_sequence
 				ON vault_catalog_events(body_id, sequence DESC);
 			CREATE TABLE IF NOT EXISTS vault_history_pins (
@@ -632,7 +645,7 @@ export abstract class VaultDocumentStore {
 				operation_id TEXT,
 				request_digest TEXT,
 				PRIMARY KEY(sequence, mutation_index)
-			);
+			) WITHOUT ROWID;
 			CREATE TABLE IF NOT EXISTS vault_operation_outcomes (
 				principal_id TEXT NOT NULL,
 				membership_revision INTEGER NOT NULL,
@@ -810,7 +823,7 @@ export abstract class VaultDocumentStore {
 				operation_id TEXT NOT NULL,
 				PRIMARY KEY(sequence, path),
 				UNIQUE(operation_id, path)
-			);
+			) WITHOUT ROWID;
 			CREATE INDEX IF NOT EXISTS vault_attachment_path_sequence
 				ON vault_attachment_catalog_events(path, sequence DESC);
 			CREATE TABLE IF NOT EXISTS vault_attachment_operations (
@@ -1004,6 +1017,34 @@ export abstract class VaultDocumentStore {
 		this.initialized = true;
 		if (this.leanRowsEnabled) this.addLeanColumns();
 		if (this.relayTailEnabled) this.storage.sql.exec(RELAY_TAIL_SCHEMA);
+		if (!this.relayTailEnabled) this.reconcileClockAfterLean();
+	}
+
+	/**
+	 * Write-budget spike (int-bulk), ported to relay3 (b3-bulk): a database written
+	 * in lean mode holds journal sequences above `vault_clock` (lean appends and lean
+	 * bulk create allocate MAX(clock, journal head[, tail head]) + 1 without writing
+	 * the clock), and a relay3 database also holds tail sequences in
+	 * `relay_body_tail`. Base mode allocates `sequence + 1` and reads the clock alone,
+	 * and lean mode without the tail ignores tail sequences, so after a flag goes
+	 * on -> off the store would reissue an existing sequence (UNIQUE constraint
+	 * failed: vault_journal.sequence) and hide the newest changes from
+	 * currentSequence(). A flag change always arrives with a new object instance, so
+	 * raising the clock once on open to every sequence this mode does not already
+	 * MAX over closes the gap. It writes nothing (0 rows) when the clock is already
+	 * at or above that head, which is every vault that never ran lean / relay3.
+	 */
+	private reconcileClockAfterLean(): void {
+		const sources: string[] = [];
+		if (!this.leanRowsEnabled) sources.push("(SELECT COALESCE(MAX(sequence), 0) FROM vault_journal)");
+		const hasTail = this.storage.sql.exec<{ present: number }>(
+			"SELECT COUNT(*) AS present FROM sqlite_master WHERE type = 'table' AND name = 'relay_body_tail'",
+		).one().present > 0;
+		if (hasTail) sources.push("(SELECT COALESCE(MAX(latest_sequence), 0) FROM relay_body_tail)");
+		if (sources.length === 0) return;
+		const head = sources.length === 1 ? sources[0]! : `MAX(${sources.join(", ")})`;
+		this.storage.sql.exec(`UPDATE vault_clock SET sequence = ${head}
+		 WHERE id = 1 AND sequence < ${head}`).toArray();
 	}
 
 	currentSequence(): number {

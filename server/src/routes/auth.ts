@@ -25,7 +25,7 @@ import {
 	SERVER_VERSION,
 } from "../version";
 import { json } from "./http";
-import { relayBodiesEnabled } from "../relayFlag";
+import { readBulkCreateLimits, relayBodiesEnabled, type BulkCreateLimits } from "../relayFlag";
 import { RELAY_BODIES_CAPABILITY_VERSION } from "../relayBodies";
 import { provisionReservedVault } from "./provisioning";
 import type { AuthState, AuthStateCached, Env, UpdateProvider } from "./types";
@@ -291,6 +291,7 @@ export function getCapabilities(
 	updateProvider: UpdateProvider | null;
 	updateRepoUrl: string | null;
 	updateRepoBranch: string | null;
+	bulkCreate: BulkCreateLimits;
 	relayBodies?: number;
 } {
 	const bucketEnabled = supportsBuckets(env);
@@ -312,6 +313,8 @@ export function getCapabilities(
 		updateProvider: options.includePrivateUpdateMetadata ? (config?.updateProvider ?? null) : null,
 		updateRepoUrl: options.includePrivateUpdateMetadata ? (config?.updateRepoUrl ?? null) : null,
 		updateRepoBranch: options.includePrivateUpdateMetadata ? (config?.updateRepoBranch ?? null) : null,
+		// Effective `POST /lifecycle/create-bulk` caps; the vault runtime reads the same env.
+		bulkCreate: readBulkCreateLimits(env),
 		// Relay v2 spike: present only with the flag on (flag-off output unchanged).
 		...(relayBodiesEnabled(env) ? { relayBodies: RELAY_BODIES_CAPABILITY_VERSION } : {}),
 	};

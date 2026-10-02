@@ -6,7 +6,7 @@ import { targetFromEnv } from "../target.ts";
 const target = targetFromEnv();
 const created = await createBody(target.deviceA, "root-body.md", "candidate/lifecycle/publication");
 expectReceipt(created.receipt);
-pass("body creation fences the lifecycle, durably accepts its candidate, then returns a replay-safe receipt");
+pass("bulk create commits the body, catalog entry and root path in one durable request");
 
 const rootResponse = await fetch(vaultUrl(target.deviceA, "root"), { headers: bearer(target.deviceA) });
 assert.equal(rootResponse.status, 200);
@@ -14,7 +14,7 @@ const root = new Y.Doc({ guid: "root-check" });
 Y.applyUpdate(root, new Uint8Array(await rootResponse.arrayBuffer()));
 assert.equal(root.getMap<string>("pathToId").get("root-body.md"), created.bodyId);
 root.destroy();
-pass("root publication follows the durable lifecycle receipt");
+pass("the bulk create receipt is reflected in the durable root");
 
 const rootSocket = await connectDocument(target.deviceB, "root", "root");
 try {

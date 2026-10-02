@@ -3,6 +3,7 @@ import { handleWorkerRequest } from "../../server/src/index";
 import { hashSecret } from "../../server/src/identity";
 import { invalidateStoredServerConfigCache } from "../../server/src/routes/auth";
 import { handleOperatorVaultRuntimeRoute } from "../../server/src/routes/vault";
+import { BULK_CREATE_MAX_REQUEST_BYTES } from "../../server/src/vaultBulkCreateService";
 import { makeConfigNamespace, makeEnv, makeVaultSyncNamespace } from "../mocks/workerEnv.ts";
 import { suite } from "../harness.ts";
 import { COLLABORATION_POLICY_VERSION, capabilityDigestForRole } from "../../server/src/collaboration";
@@ -153,16 +154,52 @@ s.test("actor forwarding owns request bytes before the public response lifetime 
 			return new Response(null, { status: 204 });
 		}),
 	});
-	const request = new Request(`https://example.test/vault/${VAULT_ID}/lifecycle`, {
+	const request = new Request(`https://example.test/vault/${VAULT_ID}/lifecycle/create-bulk`, {
 		method: "POST",
 		body: source,
 		duplex: "half",
 	} as RequestInit & { duplex: "half" });
-	const response = await handleOperatorVaultRuntimeRoute(request, env, VAULT_ID, "/lifecycle");
+	const response = await handleOperatorVaultRuntimeRoute(request, env, VAULT_ID, "/lifecycle/create-bulk");
 	publicResponseSent = true;
 	assert.equal(response.status, 204);
 	assert.equal(forwarded.length, 1);
 	assert.deepEqual(new Uint8Array(await forwarded[0]!.arrayBuffer()), expected);
+});
+
+s.test("bulk create route forwards bodies above the 1 MiB JSON limit up to its own envelope cap", async () => {
+	invalidateStoredServerConfigCache();
+	const forwarded: number[] = [];
+	const env = makeEnv({
+		YAOS_CONFIG: makeConfigNamespace(async () => Response.json({
+			vault: {
+				vaultId: VAULT_ID,
+				vaultGeneration: VAULT_GENERATION,
+				name: "Settings",
+				state: "active",
+				createdAt: 1,
+				provisionedAt: 2,
+			},
+		})),
+		YAOS_SYNC: makeVaultSyncNamespace(async (request) => {
+			forwarded.push((await request.arrayBuffer()).byteLength);
+			return new Response(null, { status: 204 });
+		}),
+	});
+	const send = (bytes: number) => handleOperatorVaultRuntimeRoute(
+		new Request(`https://example.test/vault/${VAULT_ID}/lifecycle/create-bulk`, {
+			method: "POST",
+			body: new Uint8Array(bytes),
+		}),
+		env,
+		VAULT_ID,
+		"/lifecycle/create-bulk",
+	);
+	const accepted = await send(3 * 1024 * 1024);
+	assert.equal(accepted.status, 204);
+	assert.deepEqual(forwarded, [3 * 1024 * 1024]);
+	const tooLarge = await send(BULK_CREATE_MAX_REQUEST_BYTES + 1);
+	assert.equal(tooLarge.status, 413);
+	assert.equal(forwarded.length, 1);
 });
 
 await s.done();

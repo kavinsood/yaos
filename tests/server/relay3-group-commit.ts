@@ -1171,8 +1171,10 @@ s.test("HTTP save row accounting: a closed-note candidate POST, base path (befor
 	const before = await run(false);
 	for (const value of before) assert.equal(value.status, 200);
 	console.log(`[relay3-gc] HTTP save, base path (before): rows ${before[1]!.rows}, by table ${JSON.stringify(before[1]!.byTable)}`);
-	assert.deepEqual(before[1]!.byTable, { vault_clock: 1, vault_journal: 2, vault_mutation_attribution: 2, vault_document_heads: 2,
-		vault_catalog_events: 3, vault_operation_outcomes: 2, vault_candidate_receipts: 2 }, "14 rows (HTTPSAVE measured 13.82)");
+	// b3-bulk: heads, catalog events and attribution are WITHOUT ROWID now (no PK autoindex to bill), so the base path
+	// is 11 rows, not relay3's 14 (HTTPSAVE measured 13.82 on rowid tables): -1 each on those three tables.
+	assert.deepEqual(before[1]!.byTable, { vault_clock: 1, vault_journal: 2, vault_mutation_attribution: 1, vault_document_heads: 1,
+		vault_catalog_events: 2, vault_operation_outcomes: 2, vault_candidate_receipts: 2 }, "11 rows (14 on rowid tables, HTTPSAVE measured 13.82)");
 	const after = await run(true, async ({ store, relay, relayStore, post, seed, meter }) => {
 		assert.equal(relay.counters.httpRelayCommits, 6);
 		assert.equal(relay.counters.appendFrames, 0, "not frame outcomes");

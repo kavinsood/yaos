@@ -9,6 +9,8 @@ import {
 	CANDIDATE_RECEIPT_TTL_MS,
 	MAX_CANDIDATE_RECEIPTS_PER_BODY,
 	type AttachmentCatalogEvent,
+	type BodyLifecycle,
+	type CatalogHeadAtBoundary,
 	type CatalogMutation,
 	type SemanticCatalogMutation,
 	type SemanticCatalogHead,
@@ -17,6 +19,7 @@ import {
 	type DurableCandidateReceipt,
 	type DurableLifecycleRecord,
 } from "./vaultCatalogStore";
+import { SQLITE_BLOB_CHUNK_BYTES } from "./vaultDocumentStore";
 import type {
 	CheckpointExpectedHead,
 	DurableCommitResult,
@@ -66,6 +69,40 @@ export interface SemanticAuthorityReceipt {
 	rollbackBlobHash: string | null;
 	vaultGeneration: string;
 	runtimeEpoch: string;
+	createdAt: number;
+}
+
+/** Checkpoint chunks per multi-row INSERT: 1 + 5 x 19 = 96 bound parameters (under the 100 per-query cap). */
+const BULK_CHUNK_ROWS_PER_STATEMENT = 19;
+/** JSON array parameter split point (UTF-16 units; <= ~768 KB UTF-8, far below the 2 MB value limit). */
+const BULK_JSON_PARAMETER_CHARS = 256 * 1024;
+
+export interface BulkCreateFileWrite {
+	bodyId: string;
+	path: string;
+	/** Full encoded Yjs state (no edit history). */
+	state: Uint8Array;
+	stateSha256: string;
+	chunks: Array<{ byteLength: number; sha256: string }>;
+	contentHash: string;
+	size: number;
+}
+
+export interface BulkCreateAttachmentWrite {
+	operationId: string;
+	path: string;
+	hash: string;
+	size: number;
+	mime: string;
+}
+
+export interface BulkCreateReceiptRecord {
+	batchId: string;
+	requestDigest: string;
+	vaultSequence: number;
+	rootGeneration: number;
+	rootEpoch: SemanticEpoch;
+	outcomes: unknown;
 	createdAt: number;
 }
 
@@ -423,7 +460,7 @@ export class VaultStore extends RecoveryAuthorityStore {
 		if (rootUpdate.byteLength === 0 || rootUpdate.byteLength > MAX_DURABLE_UPDATE_BYTES) {
 			throw new Error("root update exceeds durable value limit");
 		}
-		this.initialize();
+		this.ensureBulkCreateReceipts();
 		if (this.activePins(now).length > 0) throw new Error("active_state_reset_blocked_by_history_pin");
 		this.storage.transactionSync(() => {
 			for (const table of [
@@ -433,6 +470,7 @@ export class VaultStore extends RecoveryAuthorityStore {
 				"vault_lifecycle_publications",
 				"vault_lifecycle_receipts",
 				"vault_creation_candidates",
+				"vault_bulk_create_receipts",
 				"vault_candidate_receipts",
 				"vault_semantic_lifecycle_receipts",
 				"vault_semantic_authority_receipts",
@@ -683,8 +721,6 @@ export class VaultStore extends RecoveryAuthorityStore {
 		semanticLifecycleReceipt?: Omit<SemanticLifecycleReceipt, "vaultSequence" | "rootGeneration">;
 		lifecycleReceipt?: Omit<DurableLifecycleRecord, "vaultSequence" | "rootGeneration">;
 		lifecycleReceipts?: Array<Omit<DurableLifecycleRecord, "vaultSequence" | "rootGeneration">>;
-		completeCreation?: { bodyId: string; candidateId: string; candidateDigest: string };
-		completeCreations?: Array<{ bodyId: string; candidateId: string; candidateDigest: string }>;
 		rootPublications?: Array<{ operationId: string; lifecycleSequence: number; rootEpoch: SemanticEpoch;
 			vaultGeneration: string; runtimeEpoch: string }>;
 		actorAttributions?: Array<{
@@ -709,15 +745,8 @@ export class VaultStore extends RecoveryAuthorityStore {
 			if (receipt) this.assertVaultGeneration(receipt.vaultGeneration);
 		}
 		for (const publication of input.rootPublications ?? []) this.assertVaultGeneration(publication.vaultGeneration);
-		if ((input.lifecycleReceipt || input.lifecycleReceipts || input.completeCreation
-			|| input.completeCreations || input.rootPublications || input.attachmentCatalog || input.attachmentOperation) && input.documentId !== "root") {
+		if ((input.lifecycleReceipt || input.lifecycleReceipts || input.rootPublications || input.attachmentCatalog || input.attachmentOperation) && input.documentId !== "root") {
 			throw new Error("root publication metadata must commit through root");
-		}
-		if (input.completeCreation && !input.lifecycleReceipt) {
-			throw new Error("creation fence completion requires an atomic lifecycle receipt");
-		}
-		if (input.completeCreations && input.completeCreations.length !== (input.lifecycleReceipts?.length ?? 0)) {
-			throw new Error("creation fence batch requires matching atomic lifecycle receipts");
 		}
 		if (input.provisioning && input.documentId !== "root") {
 			throw new Error("provisioning metadata must commit with the root");
@@ -918,20 +947,6 @@ export class VaultStore extends RecoveryAuthorityStore {
 				lifecycle.toArray();
 				rowsWritten += lifecycle.rowsWritten;
 			}
-			for (const creation of [
-				...(input.completeCreation ? [input.completeCreation] : []),
-				...(input.completeCreations ?? []),
-			]) {
-				const completed = this.storage.sql.exec(
-					`DELETE FROM vault_creation_candidates
-					 WHERE body_id = ? AND candidate_id = ? AND candidate_digest = ?`,
-					creation.bodyId,
-					creation.candidateId,
-					creation.candidateDigest,
-				);
-				completed.toArray();
-				rowsWritten += completed.rowsWritten;
-			}
 			for (const publication of input.rootPublications ?? []) {
 				const inserted = this.storage.sql.exec(
 					`INSERT INTO vault_lifecycle_publications(
@@ -1008,8 +1023,6 @@ export class VaultStore extends RecoveryAuthorityStore {
 		catalog: CatalogMutation | CatalogMutation[];
 		lifecycleReceipt?: Omit<DurableLifecycleRecord, "vaultSequence" | "rootGeneration">;
 		lifecycleReceipts?: Array<Omit<DurableLifecycleRecord, "vaultSequence" | "rootGeneration">>;
-		completeCreation?: { bodyId: string; candidateId: string; candidateDigest: string };
-		completeCreations?: Array<{ bodyId: string; candidateId: string; candidateDigest: string }>;
 		rootPublications?: Array<{ operationId: string; lifecycleSequence: number; rootEpoch: SemanticEpoch;
 			vaultGeneration: string; runtimeEpoch: string }>;
 		actorAttributions?: Array<{
@@ -1025,8 +1038,6 @@ export class VaultStore extends RecoveryAuthorityStore {
 			kind: input.kind,
 			catalog: input.catalog,
 			lifecycleReceipt: input.lifecycleReceipt,
-			completeCreation: input.completeCreation,
-			completeCreations: input.completeCreations,
 			lifecycleReceipts: input.lifecycleReceipts,
 			rootPublications: input.rootPublications,
 			actorAttributions: input.actorAttributions,
@@ -1057,5 +1068,280 @@ export class VaultStore extends RecoveryAuthorityStore {
 		if (operation.rootEpoch !== expectedHead.semanticEpoch) throw new Error("attachment_root_epoch_changed");
 		return this.commitUpdate({ documentId: "root", update: rootUpdate, kind: "blob", expectedHead, attachmentCatalog: events,
 			attachmentOperation: operation, actorAttributions, now });
+	}
+
+	// ---- Write-budget spike W2: bulk create (one transaction per batch) ----
+
+	private bulkReceiptTableReady = false;
+
+	/** Lazily created (flag-free) so the base schema is untouched until the first bulk create. */
+	ensureBulkCreateReceipts(): void {
+		this.initialize();
+		if (this.bulkReceiptTableReady) return;
+		// WITHOUT ROWID: the TEXT primary key is the table, so one receipt is one row
+		// write (no separate autoindex entry).
+		this.storage.sql.exec(`CREATE TABLE IF NOT EXISTS vault_bulk_create_receipts (
+			batch_id TEXT PRIMARY KEY,
+			request_digest TEXT NOT NULL CHECK(length(request_digest) = 64),
+			vault_sequence INTEGER NOT NULL,
+			root_generation INTEGER NOT NULL,
+			root_epoch INTEGER NOT NULL CHECK(root_epoch >= 1),
+			outcomes TEXT NOT NULL,
+			created_at INTEGER NOT NULL
+		) WITHOUT ROWID`).toArray();
+		this.bulkReceiptTableReady = true;
+	}
+
+	bulkCreateReceipt(batchId: string): BulkCreateReceiptRecord | null {
+		this.ensureBulkCreateReceipts();
+		const row = this.storage.sql.exec<{
+			batch_id: string; request_digest: string; vault_sequence: number; root_generation: number;
+			root_epoch: number; outcomes: string; created_at: number;
+		}>("SELECT * FROM vault_bulk_create_receipts WHERE batch_id = ?", batchId).toArray()[0];
+		if (!row) return null;
+		return { batchId: row.batch_id, requestDigest: row.request_digest, vaultSequence: row.vault_sequence,
+			rootGeneration: row.root_generation, rootEpoch: parseSemanticEpoch(row.root_epoch, "bulk receipt root epoch"),
+			outcomes: JSON.parse(row.outcomes) as unknown, createdAt: row.created_at };
+	}
+
+	/**
+	 * True when an attachment operation was committed by a bulk-create batch
+	 * (those carry no per-operation attachment ledger row). Rare path: only a
+	 * per-operation replay of an already bulk-committed id reaches it, so a
+	 * receipt scan is acceptable.
+	 */
+	bulkCreateCommittedAttachment(operationId: string): boolean {
+		this.ensureBulkCreateReceipts();
+		const needle = `"operationId":${JSON.stringify(operationId)}`;
+		const rows = this.storage.sql.exec<{ outcomes: string }>(
+			"SELECT outcomes FROM vault_bulk_create_receipts WHERE instr(outcomes, ?) > 0", needle).toArray();
+		return rows.some((row) => (JSON.parse(row.outcomes) as Array<{ kind?: string; operationId?: string; outcome?: string }>)
+			.some((item) => item.kind === "attachment" && item.operationId === operationId && item.outcome === "created"));
+	}
+
+	/**
+	 * Current active Markdown owners of any of `paths` (one scan for the whole
+	 * batch, instead of one `activeBodiesAtPath` scan per path), lean-overlaid.
+	 */
+	activeCatalogHeadsAtPaths(paths: readonly string[]): Map<string, CatalogHeadAtBoundary> {
+		this.initialize();
+		const result = new Map<string, CatalogHeadAtBoundary>();
+		if (paths.length === 0) return result;
+		const boundary = this.currentSequence();
+		const rows = this.storage.sql.exec<{
+			sequence: number; body_id: string; file_id: string; path: string; previous_path: string | null;
+			lifecycle: BodyLifecycle; generation: number; body_epoch: number; content_hash: string | null; size: number | null;
+		}>(
+			`SELECT e.sequence, e.body_id, e.file_id, e.path, e.previous_path, e.lifecycle, e.generation,
+			        e.body_epoch, e.content_hash, e.size
+			   FROM vault_catalog_events e
+			   JOIN (SELECT body_id, MAX(sequence) AS sequence FROM vault_catalog_events
+			          WHERE sequence <= ? GROUP BY body_id) latest
+			     ON latest.body_id = e.body_id AND latest.sequence = e.sequence
+			  WHERE e.lifecycle = 'active' AND e.path IN (SELECT value FROM json_each(?))`,
+			boundary, JSON.stringify(paths),
+		).toArray();
+		for (const row of rows) {
+			if (result.has(row.path)) continue;
+			result.set(row.path, this.leanOverlay(boundary, {
+				sequence: row.sequence, bodyId: row.body_id,
+				bodyEpoch: parseSemanticEpoch(row.body_epoch, "catalog body epoch"),
+				fileId: row.file_id, path: row.path, previousPath: row.previous_path, lifecycle: row.lifecycle,
+				generation: row.generation, contentHash: row.content_hash, size: row.size,
+			}));
+		}
+		return result;
+	}
+
+	/** Read-only check (no row write) used by fully synchronous mutation sections. */
+	recoveryMutexHeld(now = Date.now()): boolean {
+		this.initialize();
+		const row = this.storage.sql.exec<{ expires_at: number }>(
+			"SELECT expires_at FROM vault_recovery_mutex WHERE id = 1",
+		).toArray()[0];
+		return !!row && row.expires_at > now;
+	}
+
+	/** Body ids (of `bodyIds`) that already have any durable state (head or catalog). */
+	existingBodyIds(bodyIds: readonly string[]): Set<string> {
+		this.initialize();
+		if (bodyIds.length === 0) return new Set();
+		const ids = JSON.stringify(bodyIds);
+		return new Set(this.storage.sql.exec<{ id: string }>(
+			`SELECT document_id AS id FROM vault_document_heads WHERE document_id IN (SELECT value FROM json_each(?))
+			 UNION SELECT body_id AS id FROM vault_catalog_events WHERE body_id IN (SELECT value FROM json_each(?))`,
+			ids, ids,
+		).toArray().map((row) => row.id));
+	}
+
+	/** Attachment operation ids (of `operationIds`) that are already committed. */
+	committedAttachmentOperationIds(operationIds: readonly string[]): Set<string> {
+		this.initialize();
+		if (operationIds.length === 0) return new Set();
+		const ids = JSON.stringify(operationIds);
+		return new Set(this.storage.sql.exec<{ id: string }>(
+			`SELECT operation_id AS id FROM vault_attachment_operations WHERE operation_id IN (SELECT value FROM json_each(?))
+			 UNION SELECT operation_id AS id FROM vault_attachment_catalog_events WHERE operation_id IN (SELECT value FROM json_each(?))`,
+			ids, ids,
+		).toArray().map((row) => row.id));
+	}
+
+	/**
+	 * W2 bulk create: one transaction, one sequence. Per file: a finished
+	 * checkpoint (chunked at SQLITE_BLOB_CHUNK_BYTES) + manifest, a body head and
+	 * one catalog event. Per batch: one root journal row + root head, one clock
+	 * advance (none in lean mode: the root journal row carries the sequence), one
+	 * attribution row and one receipt row. Bodies need no journal row: a
+	 * reconstruct reads checkpoint + journal rows after it.
+	 */
+	commitBulkCreate(input: {
+		batchId: string;
+		requestDigest: string;
+		rootUpdate: Uint8Array;
+		expectedRootHead: { generation: number; semanticEpoch: SemanticEpoch; latestSequence: number };
+		files: BulkCreateFileWrite[];
+		attachments: BulkCreateAttachmentWrite[];
+		actor: VaultActorContext;
+		/** JSON-serialisable per-item outcomes; stored verbatim for idempotent replay. */
+		outcomes: unknown;
+		now?: number;
+	}): DurableCommitResult {
+		const commitStartedAt = performance.now();
+		if (input.rootUpdate.byteLength === 0 || input.rootUpdate.byteLength > MAX_DURABLE_UPDATE_BYTES) {
+			throw new Error("bulk create root update exceeds durable value limit");
+		}
+		if (!/^[a-f0-9]{64}$/.test(input.requestDigest)) throw new Error("invalid bulk create request digest");
+		this.ensureBulkCreateReceipts();
+		const now = input.now ?? Date.now();
+		const ingressBytes = input.files.reduce((sum, file) => sum + file.state.byteLength, input.rootUpdate.byteLength);
+		let rowsRead = 0;
+		let rowsWritten = 0;
+		let sequence = 0;
+		const generation = input.expectedRootHead.generation + 1;
+		const semanticEpoch = input.expectedRootHead.semanticEpoch;
+		const exec = (sql: string, ...bindings: unknown[]): void => {
+			const cursor = this.storage.sql.exec(sql, ...bindings);
+			cursor.toArray();
+			rowsRead += cursor.rowsRead;
+			rowsWritten += cursor.rowsWritten;
+		};
+		this.storage.transactionSync(() => {
+			this.assertActorCurrent(input.actor);
+			if (this.recoveryMutexHeld(now)) throw new Error("recovery_boundary_in_progress");
+			const head = this.storage.sql.exec<{ generation: number; semantic_epoch: number; latest_sequence: number }>(
+				"SELECT generation, semantic_epoch, latest_sequence FROM vault_document_heads WHERE document_id = 'root'",
+			).toArray()[0];
+			if (!head || head.generation !== input.expectedRootHead.generation
+				|| head.semantic_epoch !== input.expectedRootHead.semanticEpoch
+				|| head.latest_sequence !== input.expectedRootHead.latestSequence) {
+				throw new Error("document_head_changed");
+			}
+			if (this.storage.sql.exec("SELECT 1 FROM vault_bulk_create_receipts WHERE batch_id = ?", input.batchId).toArray()[0]) {
+				throw new Error("bulk_create_batch_exists");
+			}
+			const bodyIds = input.files.map((file) => file.bodyId);
+			if (new Set(bodyIds).size !== bodyIds.length || this.existingBodyIds(bodyIds).size > 0) {
+				throw new Error("bulk_create_body_exists");
+			}
+			const paths = input.files.map((file) => file.path);
+			if (new Set(paths).size !== paths.length || this.activeCatalogHeadsAtPaths(paths).size > 0) {
+				throw new Error("active_path_conflict");
+			}
+			if (this.leanRowsEnabled) {
+				// Lean (§6.4): the root journal row below carries the sequence, as relay appends do.
+				// Relay3: leanNextSequence() also takes the relay_body_tail head, so a bulk sequence never
+				// reuses a sequence already handed to a tail record (group commits write no journal row).
+				const next = this.leanNextSequence();
+				sequence = next.sequence;
+				rowsRead += next.rowsRead;
+			} else {
+				const clock = this.storage.sql.exec<{ sequence: number }>(this.clockAdvanceSql());
+				sequence = clock.one().sequence;
+				rowsWritten += clock.rowsWritten;
+			}
+			exec(`INSERT INTO vault_journal(sequence, document_id, generation, semantic_epoch, kind,
+			 update_byte_length, data, created_at) VALUES (?, 'root', ?, ?, 'create', ?, ?, ?)`,
+			sequence, generation, semanticEpoch, input.rootUpdate.byteLength, input.rootUpdate.slice().buffer, now);
+			exec(`UPDATE vault_document_heads SET generation = ?, latest_sequence = ? WHERE document_id = 'root'`,
+				generation, sequence);
+			exec(`INSERT INTO vault_mutation_attribution(
+			 sequence, mutation_index, principal_id, membership_revision, device_id,
+			 device_credential_revision, operation_id, request_digest
+			) VALUES (?, 0, ?, ?, ?, ?, ?, ?)`, sequence, input.actor.principalId, input.actor.membershipRevision,
+			input.actor.deviceId, input.actor.deviceCredentialRevision, input.batchId, input.requestDigest);
+			// Set-based writes (write-budget int-bulk, CPU): the same rows as one INSERT per row, in
+			// a handful of statements per batch instead of four per note. Blob chunks go as multi-row
+			// VALUES (?1 = sequence, 5 parameters per chunk, <= 96 bound parameters per statement); the
+			// blob-free rows go as one JSON array parameter through json_each, split so the parameter
+			// stays far below the 2 MB SQLite value limit (paths may be up to 16 KiB).
+			const chunkRows: unknown[] = [];
+			for (const file of input.files) {
+				if (file.chunks.length === 0) throw new Error("bulk create body requires a checkpoint chunk");
+				let offset = 0;
+				for (const [chunkIndex, chunk] of file.chunks.entries()) {
+					if (chunk.byteLength < 1 || chunk.byteLength > SQLITE_BLOB_CHUNK_BYTES) throw new Error("invalid bulk create chunk");
+					const whole = offset === 0 && chunk.byteLength === file.state.byteLength
+						&& file.state.byteOffset === 0 && file.state.byteLength === file.state.buffer.byteLength;
+					chunkRows.push(file.bodyId, chunkIndex, chunk.byteLength, chunk.sha256,
+						whole ? file.state.buffer : file.state.slice(offset, offset + chunk.byteLength).buffer);
+					offset += chunk.byteLength;
+				}
+				if (offset !== file.state.byteLength) throw new Error("bulk create chunks do not cover the state");
+			}
+			for (let start = 0; start < chunkRows.length; start += BULK_CHUNK_ROWS_PER_STATEMENT * 5) {
+				const rows = chunkRows.slice(start, start + BULK_CHUNK_ROWS_PER_STATEMENT * 5);
+				const values = Array.from({ length: rows.length / 5 }, (_value, row) => {
+					const base = 2 + row * 5;
+					return `(?${base}, ?1, 1, 1, ?${base + 1}, ?${base + 2}, ?${base + 3}, ?${base + 4})`;
+				}).join(", ");
+				exec(`INSERT INTO vault_checkpoints(document_id, checkpoint_sequence, generation, semantic_epoch,
+				 chunk_index, chunk_byte_length, chunk_sha256, data) VALUES ${values}`, sequence, ...rows);
+			}
+			const jsonRows = (sql: string, rows: unknown[][]): void => {
+				let parts: string[] = [];
+				let length = 0;
+				const flush = (): void => {
+					if (parts.length === 0) return;
+					exec(sql, sequence, now, `[${parts.join(",")}]`);
+					parts = [];
+					length = 0;
+				};
+				for (const row of rows) {
+					const text = JSON.stringify(row);
+					if (length + text.length > BULK_JSON_PARAMETER_CHARS) flush();
+					parts.push(text);
+					length += text.length + 1;
+				}
+				flush();
+			};
+			jsonRows(`INSERT INTO vault_checkpoint_manifests(document_id, checkpoint_sequence, generation,
+			 semantic_epoch, chunk_count, total_byte_length, state_sha256, complete, created_at)
+			 SELECT json_extract(value, '$[0]'), ?1, 1, 1, json_extract(value, '$[1]'), json_extract(value, '$[2]'),
+			        json_extract(value, '$[3]'), 1, ?2
+			 FROM json_each(?3)`,
+			input.files.map((file) => [file.bodyId, file.chunks.length, file.state.byteLength, file.stateSha256]));
+			jsonRows(`INSERT INTO vault_document_heads(document_id, generation, semantic_epoch, latest_sequence)
+			 SELECT json_extract(value, '$[0]'), 1, 1, ?1 FROM json_each(?3)`,
+			input.files.map((file) => [file.bodyId]));
+			jsonRows(`INSERT INTO vault_catalog_events(
+			 sequence, body_id, file_id, path, previous_path, lifecycle, generation, body_epoch,
+			 content_hash, size, mutation_index
+			) SELECT ?1, json_extract(value, '$[0]'), json_extract(value, '$[0]'), json_extract(value, '$[1]'), NULL,
+			         'active', 1, 1, json_extract(value, '$[2]'), json_extract(value, '$[3]'), json_extract(value, '$[4]')
+			  FROM json_each(?3)`,
+			input.files.map((file, mutationIndex) => [file.bodyId, file.path, file.contentHash, file.size, mutationIndex]));
+			jsonRows(`INSERT INTO vault_attachment_catalog_events(
+			 sequence, path, content_hash, size, mime, lifecycle, operation_id
+			) SELECT ?1, json_extract(value, '$[0]'), json_extract(value, '$[1]'), json_extract(value, '$[2]'),
+			         json_extract(value, '$[3]'), 'active', json_extract(value, '$[4]')
+			  FROM json_each(?3)`,
+			input.attachments.map((item) => [item.path, item.hash, item.size, item.mime, item.operationId]));
+			exec(`INSERT INTO vault_bulk_create_receipts(batch_id, request_digest, vault_sequence, root_generation,
+			 root_epoch, outcomes, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			input.batchId, input.requestDigest, sequence, generation, semanticEpoch, JSON.stringify(input.outcomes), now);
+		});
+		this.observeCommit({ documentId: "root", ingressBytes, commitLatencyMs: performance.now() - commitStartedAt,
+			vaultSequence: sequence });
+		return { vaultSequence: sequence, documentId: "root", generation, semanticEpoch, kind: "create", rowsRead, rowsWritten };
 	}
 }

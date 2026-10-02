@@ -8,6 +8,7 @@ import {
 	prepareCanonicalMarkdown,
 } from "@shared/markdownCodec";
 import { MAX_CLIENT_MARKDOWN_BYTES } from "@shared/durableLimits";
+import { bulkCreateClientCaps, parseBulkCreateServerCaps, type BulkCreateClientCaps } from "../sync/bulkCreateCaps";
 
 export const LOCAL_VAULT_IMPORT_FORMAT = 1 as const;
 
@@ -99,6 +100,8 @@ export interface LocalVaultImportOptions {
 	configDir: string;
 	concurrency?: number;
 	pageSize?: number;
+	/** The server's advertised create-bulk caps (`/api/capabilities` `bulkCreate`); absent, the defaults. */
+	bulkCreateCaps?: () => unknown;
 	maxEditRetries?: number;
 	now?: () => number;
 	makeId?: () => string;
@@ -254,9 +257,14 @@ export class LocalVaultImporter {
 		this.now = options.now ?? Date.now;
 		this.makeId = options.makeId ?? randomBase64UrlId;
 		this.concurrency = Math.max(1, Math.min(16, Math.floor(options.concurrency ?? 4)));
-		this.pageSize = Math.max(1, Math.min(1000, Math.floor(options.pageSize ?? 250)));
+		this.pageSize = Math.max(1, Math.min(1000, Math.floor(options.pageSize ?? this.bulkCreateCaps().maxItems)));
 		this.maxEditRetries = Math.max(1, Math.min(20, Math.floor(options.maxEditRetries ?? 4)));
 	}
+	/** Batches follow the server's create-bulk caps (the runtime still splits and halves on 413). */
+	private bulkCreateCaps(): BulkCreateClientCaps {
+		return bulkCreateClientCaps(parseBulkCreateServerCaps(this.options.bulkCreateCaps?.()));
+	}
+
 	async loadState(): Promise<LocalVaultImportState | null> {
 		const state = await this.store.load(this.options.vaultId);
 		return state ? this.normalizeResumedState(state) : null;
@@ -390,6 +398,7 @@ export class LocalVaultImporter {
 				// network batches for ordinary small notes.
 				let batch: PreparedLocalImport[] = [];
 				let batchBytes = 0;
+				const caps = this.bulkCreateCaps();
 				const flush = async (): Promise<void> => {
 					if (batch.length === 0) return;
 					const current = batch;
@@ -404,7 +413,7 @@ export class LocalVaultImporter {
 					const value = await this.prepareItem(state, item);
 					if (value) {
 						const bytes = value.canonicalBytes.byteLength;
-						if (batch.length > 0 && (batch.length >= 32 || batchBytes + bytes > 4 * 1024 * 1024)) {
+						if (batch.length > 0 && (batch.length >= caps.maxItems || batchBytes + bytes > caps.byteBudget)) {
 							await flush();
 						}
 						batch.push(value);
@@ -412,7 +421,7 @@ export class LocalVaultImporter {
 						// A legal note can be larger than the ordinary aggregate batch
 						// target; publish it alone instead of retaining it beside another
 						// preparation window.
-						if (bytes > 4 * 1024 * 1024) await flush();
+						if (bytes > caps.byteBudget) await flush();
 					}
 				}
 				await flush();

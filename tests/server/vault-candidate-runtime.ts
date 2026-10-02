@@ -110,47 +110,21 @@ function makeService(
 	return { service, flushes: () => flushes, notifications: () => notifications };
 }
 
-s.test("durable creation replay re-enters exact lifecycle finalization after restart", async () => {
+s.test("a candidate for a body that has no active catalog row (an unconfirmed create) is rejected without a write", async () => {
 	const document = new Y.Doc({ guid: BODY_ID });
-	document.getText("body").insert(0, "restart-safe creation");
+	document.getText("body").insert(0, "edit before the bulk create receipt");
 	const update = Y.encodeStateAsUpdate(document);
 	document.destroy();
 	const candidateDigest = await digest(update);
 	const store = new CandidateStore();
-	store.creation = {
-		bodyId: BODY_ID,
-		fileId: BODY_ID,
-		path: "restart-safe.md",
-		operationId: "create-restart-safe",
-		candidateId: CANDIDATE_ID,
-		candidateDigest,
-		bodyEpoch: 1,
-		durableGeneration: 1,
-		vaultSequence: 1,
-		vaultGeneration: "generation-candidate-0001",
-		runtimeEpoch: "epoch-candidate-0001",
-	};
-	let firstFinalizations = 0;
-	const beforeRestart = makeService(store, () => false, () => {
-		firstFinalizations++;
-		return "busy";
-	});
-	const interrupted = await beforeRestart.service.handle(BODY_ID, candidateRequest(candidateDigest, update));
-	assert.equal(interrupted.status, 409);
-	assert.deepEqual(await interrupted.json(), { error: "recovery_boundary_in_progress" });
-	assert.equal(store.commits, 1);
-	assert.equal(firstFinalizations, 1);
-
-	let replayFinalizations = 0;
-	const afterRestart = makeService(store, () => false, () => {
-		replayFinalizations++;
-		return "committed";
-	});
-	const replayed = await afterRestart.service.handle(BODY_ID, candidateRequest(candidateDigest, update));
-	assert.equal(replayed.status, 200);
-	assert.equal(store.commits, 1, "restart replay does not create another durable commit");
-	assert.equal(store.receipts.size, 1, "creation replay remains exactly idempotent");
-	assert.equal(replayFinalizations, 1, "restart replay retries the missing root lifecycle transaction");
+	// W2 removed creation fences: a body exists on the server only after its bulk create committed.
+	store.creation = { bodyId: BODY_ID } as never;
+	const { service } = makeService(store);
+	const rejected = await service.handle(BODY_ID, candidateRequest(candidateDigest, update));
+	assert.equal(rejected.status, 409);
+	assert.deepEqual(await rejected.json(), { error: "body_not_active" });
+	assert.equal(store.commits, 0);
+	assert.equal(store.receipts.size, 0);
 });
 
 s.test("compaction pressure rejects new candidates before body work but preserves receipt replay", async () => {

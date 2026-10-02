@@ -311,17 +311,19 @@ s.test("a stale Markdown lifecycle intent rebinds durably and succeeds after res
 	let commits = 0;
 	const server = partialOf<VaultServerPort>({
 		currentBody: async () => ({ bodyId, bodyEpoch: 2, generation: 1, encodedState: authoritativeState }),
-		commitLifecycle: async (request) => {
+		commitLifecycleBatch: async (requests) => {
 			commits++;
+			const request = requests[0]!;
 			if (request.bodyEpoch === 1) {
 				throw new VaultMutationRequestError(409, "semantic_epoch_mismatch", "lifecycle", {
 					error: "semantic_epoch_mismatch", purpose: "body", documentId: bodyId,
 					expectedEpoch: 2, receivedEpoch: 1, reset: "fetch_fresh_baseline",
 				});
 			}
-			return { vaultId: "vault-lifecycle", vaultGeneration: "generation-lifecycle",
+			return { receipts: [{ vaultId: "vault-lifecycle", vaultGeneration: "generation-lifecycle",
 				bodyId, bodyEpoch: request.bodyEpoch, operationId, kind: "delete",
-				durableGeneration: 1, vaultSequence: 8, runtimeEpoch: "runtime-2" };
+				durableGeneration: 1, vaultSequence: 8, runtimeEpoch: "runtime-2" }],
+				vaultSequence: 8, runtimeEpoch: "runtime-2" };
 		},
 		publishLifecycleRoot: async (operations, _update, rootEpoch) => ({
 			operationIds: operations.map((operation) => operation.operationId),

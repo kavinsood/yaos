@@ -251,34 +251,6 @@ s.test("body reset waits for a durable Markdown lifecycle receipt to reach the r
 	});
 });
 
-s.test("body reset cannot strand an admitted creation fence in the retired epoch", async () => {
-	await withRuntime(({ store }) => {
-		const vaultGeneration = "semantic-creation-generation";
-		const root = new Y.Doc({ guid: "root" });
-		store.provisionVault("semantic-creation-vault", vaultGeneration,
-			delta(root, () => root.getMap("sys").set("schemaVersion", 8)), 1);
-		const bodyId = "creation-before-compaction";
-		const body = new Y.Doc({ guid: bodyId });
-		const commit = store.commitUpdate({ documentId: bodyId,
-			update: delta(body, () => body.getText("body").insert(0, "pending creation\n")), kind: "body" });
-		store.expectCreationCandidate({ bodyId, bodyEpoch: commit.semanticEpoch, fileId: bodyId,
-			path: "pending.md", operationId: "pending-creation-operation",
-			candidateId: "pending-creation-candidate", candidateDigest: "a".repeat(64),
-			durableGeneration: commit.generation, vaultSequence: commit.vaultSequence,
-			vaultGeneration, runtimeEpoch: "runtime-1" });
-		const expectedHead = store.documentHead(bodyId)!;
-		assert.throws(() => store.semanticResetFromEncodedState(bodyId, Y.encodeStateAsUpdate(body), {
-			throughSequence: expectedHead.latestSequence,
-			generation: expectedHead.generation,
-			semanticEpoch: expectedHead.semanticEpoch,
-		}, 2), /semantic_reset_blocked_by_unpublished_lifecycle/);
-		assert.equal(store.creationCandidate(bodyId)?.bodyEpoch, expectedHead.semanticEpoch);
-		assert.deepEqual(store.documentHead(bodyId), expectedHead);
-		body.destroy();
-		root.destroy();
-	});
-});
-
 s.test("root reset migrates unpublished lifecycle authority and exact replay survives a later body reset", async () => {
 	await withRuntime(async ({ store, cache, compaction }) => {
 		const vaultId = "semantic-migration-vault";
@@ -414,14 +386,6 @@ s.test("root reset migrates unpublished lifecycle authority and exact replay sur
 			deviceId: "migration-device", deviceCredentialRevision: 1, role: "member" as const,
 			policyVersion: 1, capabilityDigest: "migration-capability",
 		};
-		const exactReplay = await service.handle(new Request("https://internal/lifecycle", {
-			method: "POST",
-			headers: { "content-type": "application/json" },
-			body: JSON.stringify(staleExactOperation),
-		}), actor);
-		assert.equal(exactReplay.status, 200,
-			"an already-published lifecycle receipt remains replayable after body and root compaction");
-		assert.equal((await exactReplay.json() as { operationId?: string }).operationId, operationId);
 		const batchReplay = await service.handleBatch(new Request("https://internal/lifecycle/batch", {
 			method: "POST",
 			headers: { "content-type": "application/json" },

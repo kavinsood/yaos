@@ -7,7 +7,7 @@ const { response, body } = await jsonRequest(`${target.baseUrl}/api/capabilities
 assert.equal(response.status, 200);
 expect(body !== null, "capabilities endpoint returns JSON");
 assert.deepEqual(Object.keys(body).sort(), [
-	"attachments", "claimed", "maxBlobUploadBytes", "protocolVersion", "recoveryJobs", "schemaVersion",
+	"attachments", "bulkCreate", "claimed", "maxBlobUploadBytes", "protocolVersion", "recoveryJobs", "schemaVersion",
 	"semanticCanvas", "serverVersion", "settingsFormatVersion", "settingsSync", "snapshotFormatVersion", "snapshots",
 	"storageFormatVersion", "updateProvider", "updateRepoBranch", "updateRepoUrl",
 ].sort());
@@ -28,5 +28,7 @@ assert.ok(typeof body.serverVersion === "string" && body.serverVersion.length > 
 assert.equal(body.updateProvider, null);
 assert.equal(body.updateRepoUrl, null);
 assert.equal(body.updateRepoBranch, null);
+// Effective create-bulk caps (defaults unless YAOS_BULK_CREATE_MAX_* lowers them).
+assert.deepEqual(body.bulkCreate, { maxItems: 500, maxBytes: 4 * 1024 * 1024 });
 assert.match(response.headers.get("content-type") ?? "", /^application\/json\b/);
 pass("capabilities freeze schema8/storage4/protocol5/snapshot3/settings2 and the complete feature surface");

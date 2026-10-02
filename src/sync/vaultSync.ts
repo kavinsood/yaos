@@ -82,6 +82,13 @@ import { CanvasManager, type CanvasPersistencePort, type CanvasProjectionPort } 
 import { CanvasHttpTransport } from "./canvas/canvasTransport";
 import { dailyLimitBackoffUntil, detectDailyLimitResponses, parseDailyLimitSignal, type DailyLimitInfo } from "./dailyLimit";
 import {
+	bulkCreateClientCaps,
+	DEFAULT_BULK_CREATE_CLIENT_CAPS,
+	parseBulkCreateServerCaps,
+	type BulkCreateClientCaps,
+	type BulkCreateServerCaps,
+} from "./bulkCreateCaps";
+import {
 	INITIAL_SEMANTIC_EPOCH,
 	parseSemanticEpochMismatchPayload,
 	parseSemanticEpochResetFrame,
@@ -393,8 +400,17 @@ export interface FreshBodyCommitResult {
 	receipt: BodyReceipt;
 }
 
+export interface FreshBodyBatchItemResult {
+	fileId: string;
+	/** The created body, or the server's existing body for `exists-*`. */
+	bodyId: string;
+	lifecycleOperationId: string;
+	outcome: BulkCreateOutcomeKind;
+	receipt: BodyReceipt | null;
+	reason?: string;
+}
 export interface FreshBodyBatchCommitResult {
-	results: FreshBodyCommitResult[];
+	results: FreshBodyBatchItemResult[];
 }
 export interface BodyCandidateCommitInput {
 	bodyId: string;
@@ -472,10 +488,112 @@ export class AttachmentPublicationError extends Error {
 
 export class VaultMutationRequestError extends Error {
 	constructor(readonly status: number, readonly code: string, operation: string,
-		readonly semanticMismatch: SemanticEpochMismatchPayload | null = null) {
+		readonly semanticMismatch: SemanticEpochMismatchPayload | null = null,
+		/** Operation IDs named by the server (e.g. `bulk_create_partial_overlap`). */
+		readonly operationIds: readonly string[] = [],
+		/** Effective create-bulk caps carried by a create-bulk 413. */
+		readonly bulkCreateCaps: BulkCreateServerCaps | null = null) {
 		super(`${operation} failed (${status}: ${code})`);
 		this.name = "VaultMutationRequestError";
 	}
+}
+
+/** Default caps for `POST /lifecycle/create-bulk`; the effective ones follow the server (bulkCreateCaps.ts). */
+export { BULK_CREATE_MAX_ITEMS, BULK_CREATE_MAX_BYTES, BULK_CREATE_CLIENT_BYTE_BUDGET } from "./bulkCreateCaps";
+/** Coalescing window for editor/file-system creates before one bulk request. */
+export const CREATE_COLLECTOR_DELAY_MS = 300;
+
+export interface BulkCreateFileRequest {
+	operationId: string;
+	bodyId: string;
+	path: string;
+	updates: Uint8Array[];
+}
+export interface BulkCreateAttachmentRequest {
+	operationId: string;
+	path: string;
+	hash: string;
+	size: number;
+	mime: string;
+}
+export interface BulkCreateRequest {
+	batchId: string;
+	rootEpoch: SemanticEpoch;
+	rootStateVector?: Uint8Array;
+	files: BulkCreateFileRequest[];
+	attachments: BulkCreateAttachmentRequest[];
+}
+export type BulkCreateOutcomeKind = "created" | "exists-identical" | "exists-different" | "rejected";
+export interface BulkCreateItemOutcome {
+	kind: "file" | "attachment";
+	operationId: string;
+	path: string;
+	outcome: BulkCreateOutcomeKind;
+	bodyId?: string;
+	reason?: string;
+	existingBodyId?: string;
+	existingRevision?: string;
+	contentHash?: string;
+	size?: number;
+}
+export interface BulkCreateResponse {
+	batchId: string;
+	outcomes: BulkCreateItemOutcome[];
+	vaultSequence: number;
+	rootGeneration: number;
+	rootEpoch: SemanticEpoch;
+	vaultGeneration: string;
+	runtimeEpoch: string;
+	replayed: boolean;
+	rootUpdate?: Uint8Array;
+}
+/** Per-item envelope/frame overhead added to the canonical text size when splitting. */
+const BULK_CREATE_ITEM_OVERHEAD_BYTES = 256;
+
+type BulkCreateItemResult =
+	| { outcome: "created"; result: FreshBodyCommitResult }
+	| { outcome: "exists-identical" | "exists-different"; existingBodyId: string | null; operationId: string }
+	| { outcome: "rejected"; reason: string; operationId: string }
+	| { outcome: "cancelled" }
+	| { outcome: "pending"; operationId: string; error: unknown };
+
+interface CreateCollectorEntry {
+	input: FreshBodyCommitInput;
+	bytes: number;
+	resolve(result: BulkCreateItemResult): void;
+}
+
+interface PreparedCreate {
+	operation: StoredLifecycleOperation;
+	pending: PendingCandidate;
+}
+
+function utf8ByteLength(value: string): number {
+	return new TextEncoder().encode(value).byteLength;
+}
+
+/** Splits by the bulk create caps; an item above the byte budget travels alone. */
+export function splitByBulkCreateCaps<T>(
+	items: readonly T[],
+	bytesOf: (item: T) => number,
+	caps: BulkCreateClientCaps = DEFAULT_BULK_CREATE_CLIENT_CAPS,
+): T[][] {
+	const chunks: T[][] = [];
+	let current: T[] = [];
+	let currentBytes = 0;
+	for (const item of items) {
+		const bytes = bytesOf(item);
+		if (current.length > 0 && (current.length >= caps.maxItems
+			|| currentBytes + bytes > caps.byteBudget)) {
+			chunks.push(current);
+			current = [];
+			currentBytes = 0;
+		}
+		current.push(item);
+		currentBytes += bytes;
+	}
+	if (current.length > 0) chunks.push(current);
+	return chunks;
 }
 
 export class AttachmentPublicationProofError extends Error {
@@ -490,10 +608,8 @@ export interface VaultServerPort {
 	currentRoot?(): Promise<RootState>;
 	submitCandidate(record: CandidateRecord): Promise<BodyReceipt>;
 	submitCandidates?(records: readonly CandidateRecord[]): Promise<CandidateBatchReceipt>;
-	commitLifecycle(request: LifecycleRequest): Promise<LifecycleReceipt>;
-	commitCreateAdmissionsBatch?(
-		requests: readonly LifecycleRequest[],
-	): Promise<LifecycleBatchReceipt>;
+	/** The only create path: files and new attachments in one durable batch. */
+	commitCreateBulk(request: BulkCreateRequest): Promise<BulkCreateResponse>;
 	publishLifecycleRoot(
 		operations: readonly LifecyclePublicationOperation[],
 		rootUpdate: Uint8Array,
@@ -567,6 +683,10 @@ export interface VaultSyncOptions {
 	maxLoadedBodies?: number;
 	residencyAdmissionLimits?: Partial<ResidencyAdmissionLimits>;
 	candidateDebounceMs?: number;
+	/** Create collector window (default {@link CREATE_COLLECTOR_DELAY_MS}). */
+	createCollectorDelayMs?: number;
+	/** The server's advertised create-bulk caps (`/api/capabilities` `bulkCreate`); absent, the defaults. */
+	bulkCreateCaps?: () => unknown;
 	bodySyncTimeoutMs?: number;
 	candidateMaxWaitMs?: number;
 	/**
@@ -583,6 +703,16 @@ export interface VaultSyncOptions {
 		paths: readonly string[],
 		reason: "revision-mismatch",
 	) => void | Promise<void>;
+	/**
+	 * D3: a bulk create found the path already active on the server (the root
+	 * now maps it to `existingBodyId`). The local file must go through
+	 * reconcile, never create.
+	 */
+	onCreatePathOwned?: (input: {
+		path: string;
+		existingBodyId: string | null;
+		identical: boolean;
+	}) => void | Promise<void>;
 	/**
 	 * A body committed while this client's socket belongs to an earlier
 	 * server runtime (after a hibernation wake), so no `BODY_COMMITTED`
@@ -947,16 +1077,27 @@ async function operationRequestDigest(value: unknown): Promise<string> {
 	return sha256Hex(new TextEncoder().encode(canonicalOperationJson(value)));
 }
 
+function isBulkCreateTooBig(error: VaultMutationRequestError): boolean {
+	return error.status === 413
+		&& (error.code === "bulk_create_too_large" || error.code === "bulk_create_too_many_items");
+}
+
 function mutationRequestError(response: { status: number; json?: unknown }, operation: string): VaultMutationRequestError {
 	const value = response.json;
 	const code = value && typeof value === "object" && "error" in value && typeof value.error === "string"
 		? value.error
 		: "request_failed";
+	const operationIds = value && typeof value === "object" && "operationIds" in value
+		&& Array.isArray(value.operationIds)
+		? value.operationIds.filter((id): id is string => typeof id === "string")
+		: [];
 	return new VaultMutationRequestError(
 		response.status,
 		code,
 		operation,
 		parseSemanticEpochMismatchPayload(value),
+		operationIds,
+		value && typeof value === "object" && "bulkCreate" in value ? parseBulkCreateServerCaps(value.bulkCreate) : null,
 	);
 }
 function parseAttachmentHead(value: unknown): AttachmentHead | null {
@@ -1166,32 +1307,22 @@ export class VaultSyncHttpPort implements VaultServerPort {
 		return response.json as CandidateBatchReceipt;
 	}
 
-	async commitLifecycle(request: LifecycleRequest): Promise<LifecycleReceipt> {
+	async commitCreateBulk(request: BulkCreateRequest): Promise<BulkCreateResponse> {
 		const response = await this.request({
-			url: this.route("lifecycle"),
+			url: this.route("lifecycle/create-bulk"),
 			method: "POST",
-			contentType: "application/json",
-			body: JSON.stringify(request),
+			contentType: YAOS_BINARY_CONTENT_TYPE,
+			body: encodeBinaryEnvelope({
+				batchId: request.batchId,
+				rootEpoch: request.rootEpoch,
+				...(request.rootStateVector ? { rootStateVector: request.rootStateVector } : {}),
+				files: request.files,
+				attachments: request.attachments,
+			}).slice().buffer,
 			headers: this.headers(),
 		});
-		if (response.status !== 200) throw mutationRequestError(response, "lifecycle commit");
-		return response.json as LifecycleReceipt;
-	}
-
-	async commitCreateAdmissionsBatch(
-		requests: readonly LifecycleRequest[],
-	): Promise<LifecycleBatchReceipt> {
-		const response = await this.request({
-			url: this.route("lifecycle/admissions"),
-			method: "POST",
-			contentType: "application/json",
-			body: JSON.stringify({ operations: requests }),
-			headers: this.headers(),
-		});
-		if (response.status !== 200) {
-			throw mutationRequestError(response, "create admission batch request");
-		}
-		return response.json as LifecycleBatchReceipt;
+		if (response.status !== 200) throw mutationRequestError(response, "bulk create");
+		return decodeBinaryEnvelope(new Uint8Array(response.arrayBuffer)) as BulkCreateResponse;
 	}
 
 	async commitLifecycleBatch(
@@ -1318,6 +1449,17 @@ export class VaultSync implements SyncRuntimePort {
 	private readonly consumerGenerations = new Map<string, number>();
 	private readonly textToBodyId = new WeakMap<Y.Text, string>();
 	private readonly pendingCandidates = new Map<string, PendingCandidate>();
+	/** D5 guard: bodies whose create has no receipt yet (bodyId → path). Nothing is submitted for them. */
+	private readonly unconfirmedCreates = new Map<string, string>();
+	/** Paths whose create batch is in flight; resolves after local settlement. */
+	private readonly createsInFlight = new Map<string, Promise<BulkCreateItemResult>>();
+	private readonly createCollector = new Map<string, CreateCollectorEntry>();
+	private createCollectorBytes = 0;
+	/** Create-bulk caps learned from a 413 body (tighter than or equal to the advertised ones). */
+	private learnedBulkCreateCaps: BulkCreateServerCaps | null = null;
+	private createCollectorTimer: ReturnType<typeof setTimeout> | null = null;
+	private createBatchChain: Promise<void> = Promise.resolve();
+	private readonly activeCreateBatches = new Set<string>();
 	private readonly pendingUpdates = new Map<string, Uint8Array[]>();
 	private readonly pendingRelayMarks = new Map<string, RelayMark | null>();
 	private readonly relayFallbackTimers = new Map<string, unknown>();
@@ -1330,6 +1472,8 @@ export class VaultSync implements SyncRuntimePort {
 	private readonly attachmentOperationDurability = new Map<string, Promise<StoredAttachmentPublicationOperation>>();
 	private readonly attachmentTerminalOutcomes = new Map<string, AttachmentIntentOutcome>();
 	private readonly attachmentOutcomeWaiters = new Set<string>();
+	/** Attachment operations that must use the single publication route. */
+	private readonly attachmentBulkIneligible = new Set<string>();
 	private readonly fatalAttachmentPublicationIds = new Set<string>();
 	private attachmentPublicationDrain: Promise<void> | null = null;
 	private attachmentPublicationWork: Promise<void> = Promise.resolve();
@@ -1699,6 +1843,7 @@ export class VaultSync implements SyncRuntimePort {
 			}
 		}
 		await this.canvases?.initialize(this.pathToSemantic.entries());
+		await this.restoreUnconfirmedCreates();
 		await this.restoreCandidates();
 		await this.queueStoredLifecycleOperations();
 		await this.workScheduler.whenIdle();
@@ -1784,11 +1929,8 @@ export class VaultSync implements SyncRuntimePort {
 		for (let index = 0; index < requests.length; index++) {
 			const request = requests[index]!;
 			this.assertLifecyclePaths(request);
-			if (
-				request.kind === "create"
-				&& (!request.candidateId || !request.candidateDigest)
-			) {
-				throw new Error("fresh create requires an exact candidate fence");
+			if (request.kind === "create") {
+				throw new Error("creates travel only through bulk create (commitFreshBody/commitFreshBodies)");
 			}
 			await save.call(this.options.database, {
 				...this.toStoredLifecycleOperation(request),
@@ -2073,6 +2215,20 @@ export class VaultSync implements SyncRuntimePort {
 
 	private async drainAttachmentPublications(): Promise<void> {
 		while (true) {
+			// D6: leading new-attachment upserts travel together in one bulk create.
+			const run = this.leadingBulkAttachmentRun();
+			if (run.length >= 2) {
+				try {
+					await this.publishAttachmentBulk(run);
+				} catch (error) {
+					// The single route owns every precise error path (mismatch chains,
+					// proofs, durable pending); fall back to it for this run.
+					if (error instanceof VaultMutationRequestError) this.learnBulkCreateCaps(error);
+					for (const operation of run) this.attachmentBulkIneligible.add(operation.mutation.operationId);
+					this.log(`bulk attachment publication fell back to single publication: ${String(error)}`);
+				}
+				continue;
+			}
 			const operation = this.sortedAttachmentOperations().find((candidate) => candidate.localSequence > 0);
 			if (!operation) return;
 			try {
@@ -2108,6 +2264,96 @@ export class VaultSync implements SyncRuntimePort {
 		}
 	}
 
+	private leadingBulkAttachmentRun(): StoredAttachmentPublicationOperation[] {
+		const run: StoredAttachmentPublicationOperation[] = [];
+		const paths = new Set<string>();
+		for (const operation of this.sortedAttachmentOperations()) {
+			if (operation.localSequence <= 0) continue;
+			const mutation = operation.mutation;
+			if (mutation.kind !== "upsert" || mutation.expectedRevision !== null || paths.has(mutation.path)
+				|| this.attachmentBulkIneligible.has(mutation.operationId)
+				|| operation.rootEpoch !== this._rootEpoch
+				|| !this.isCapturedAuthorityCurrent(operation.authority)) break;
+			paths.add(mutation.path);
+			run.push(operation);
+			if (run.length >= this.bulkCreateCaps().maxItems) break;
+		}
+		return run;
+	}
+
+	private async publishAttachmentBulk(run: readonly StoredAttachmentPublicationOperation[]): Promise<void> {
+		const attempted: StoredAttachmentPublicationOperation[] = [];
+		for (const operation of run) {
+			const next = { ...operation, attempts: operation.attempts + 1, lastAttemptAt: this.now() };
+			const stored = await this.options.database.putAttachmentOperation(next);
+			this.assertStoredAttachmentOperation(next, stored);
+			this.attachmentOperations.set(stored.mutation.operationId, stored);
+			attempted.push(stored);
+		}
+		const ids = attempted.map((operation) => operation.mutation.operationId);
+		// Deterministic identity: the same run retried is an exact replay.
+		const batchId = `att-${(await sha256Hex(new TextEncoder().encode(ids.join("\n")))).slice(0, 40)}`;
+		const attachments = attempted.map((operation): BulkCreateAttachmentRequest => {
+			const mutation = operation.mutation as Extract<AttachmentPublicationMutation, { kind: "upsert" }>;
+			return { operationId: mutation.operationId, path: mutation.path, hash: mutation.hash,
+				size: mutation.size, mime: mutation.mime };
+		});
+		let response: BulkCreateResponse;
+		try {
+			response = await this.sendCreateBatch(batchId, [], attachments);
+		} catch (error) {
+			if (error instanceof VaultMutationRequestError && error.status === 409
+				&& error.code === "bulk_create_partial_overlap") {
+				const committed = new Set(error.operationIds);
+				for (const operation of attempted) {
+					if (committed.has(operation.mutation.operationId)) {
+						await this.finishBulkAttachment(operation, operation.mutation.operationId);
+					} else {
+						this.attachmentBulkIneligible.add(operation.mutation.operationId);
+					}
+				}
+				return;
+			}
+			throw error;
+		}
+		for (let index = 0; index < attempted.length; index++) {
+			const operation = attempted[index]!;
+			const mutation = operation.mutation as Extract<AttachmentPublicationMutation, { kind: "upsert" }>;
+			const outcome = response.outcomes[index]!;
+			if (outcome.outcome === "created") {
+				const head = this.pathToBlob.get(mutation.path);
+				if (!head || head.revision !== mutation.operationId || head.hash !== mutation.hash) {
+					this.log(`bulk attachment receipt for ${mutation.path} is not reflected in the local root yet`);
+				}
+				await this.finishBulkAttachment(operation, mutation.operationId);
+			} else if (outcome.outcome === "exists-identical") {
+				await this.finishBulkAttachment(operation, outcome.existingRevision ?? mutation.operationId);
+			} else {
+				// exists-different / rejected: the single route yields the precise
+				// revision mismatch or error for this operation.
+				this.attachmentBulkIneligible.add(mutation.operationId);
+			}
+		}
+	}
+
+	private async finishBulkAttachment(operation: StoredAttachmentPublicationOperation, revision: string): Promise<void> {
+		const operationId = operation.mutation.operationId;
+		await this.options.database.deleteAttachmentOperation(operationId);
+		this.attachmentOperations.delete(operationId);
+		this.fatalAttachmentPublicationIds.delete(operationId);
+		this.attachmentBulkIneligible.delete(operationId);
+		if (revision !== operationId && this.attachmentOutcomeWaiters.has(operationId)) {
+			this.attachmentTerminalOutcomes.set(operationId, { kind: "committed", revision });
+		}
+		this.emitAttachmentPublicationEvent(
+			operation.attempts > 1
+				? PRODUCT_EVENT_KIND.attachmentPublicationReplayed
+				: PRODUCT_EVENT_KIND.attachmentPublicationCommitted,
+			operation,
+			"info",
+		);
+	}
+
 	private async publishStoredAttachmentOperation(
 		operation: StoredAttachmentPublicationOperation,
 	): Promise<void> {
@@ -2129,6 +2375,11 @@ export class VaultSync implements SyncRuntimePort {
 		try {
 			receipt = await this.server.publishAttachment(attempted.mutation, attempted.rootEpoch);
 		} catch (error) {
+			if (error instanceof AttachmentPublicationError && error.status === 409
+				&& error.code === "attachment_operation_committed_by_bulk_create") {
+				await this.finishBulkAttachment(storedAttempt, attempted.mutation.operationId);
+				return;
+			}
 			if (this.shouldQueryAttachmentOutcome(error) && await this.recoverAttachmentOutcome(attempted)) return;
 			if (error instanceof AttachmentPublicationError
 				&& error.semanticMismatch?.purpose === "root"
@@ -2586,9 +2837,15 @@ export class VaultSync implements SyncRuntimePort {
 		};
 	}
 	/**
-	 * Creates a fresh identity without publishing it empty: local lifecycle and
-	 * candidate records first, durable server admission second, durable body
-	 * receipt third, and root publication last.
+	 * Creates a fresh identity through the one create path (D2): the create is
+	 * collected for {@link CREATE_COLLECTOR_DELAY_MS} and sent in one
+	 * `POST /lifecycle/create-bulk` batch with every other pending create.
+	 *
+	 * D5: a newer revision of a create that is still in the collector replaces
+	 * it (fold; the older caller is cancelled). A revision of a create that is
+	 * already in flight waits for that create's receipt and is then committed
+	 * as an ordinary body candidate (hold), so edits never reach the server
+	 * before their file.
 	 */
 	async commitFreshBody(
 		input: FreshBodyCommitInput,
@@ -2598,132 +2855,136 @@ export class VaultSync implements SyncRuntimePort {
 		if (input.admissionStillCurrent?.() === false) {
 			throw new FreshAdmissionCancelledError(input.path);
 		}
+		const inFlight = this.createsInFlight.get(input.path);
+		if (inFlight) return this.commitAfterInFlightCreate(input, inFlight);
 		if (this.getFileId(input.path)) throw new Error(`path ${input.path} is already active`);
-		const save = this.options.database.putLifecycleOperation;
-		const remove = this.options.database.deleteLifecycleOperation;
-		if (!save || !remove) throw new Error("lifecycle persistence is unavailable");
-		const operationId = crypto.randomUUID();
-		const request: LifecycleRequest = {
-			operationId,
-			kind: "create",
-			fileId: input.bodyId,
-			bodyId: input.bodyId,
-			bodyEpoch: INITIAL_SEMANTIC_EPOCH,
-			path: input.path,
-		};
-		const storedOperation: StoredLifecycleOperation = {
-			...this.toStoredLifecycleOperation(request),
+		const result = await this.enqueueCollectedCreate(input);
+		return this.freshResultOrThrow(input, result);
+	}
+
+	private freshResultOrThrow(input: FreshBodyCommitInput, result: BulkCreateItemResult): FreshBodyCommitResult {
+		switch (result.outcome) {
+			case "created":
+				this.log(`fresh body committed for ${input.path} (${input.reason})`);
+				return result.result;
+			case "pending":
+				throw new FreshAdmissionDurablyPendingError(input.path, result.operationId, result.error);
+			case "rejected":
+				throw new Error(`bulk create rejected ${input.path}: ${result.reason}`);
+			default:
+				throw new FreshAdmissionCancelledError(input.path);
+		}
+	}
+
+	/** D5 hold: the file's create is in flight; commit this revision only after its receipt. */
+	private async commitAfterInFlightCreate(
+		input: FreshBodyCommitInput,
+		inFlight: Promise<BulkCreateItemResult>,
+	): Promise<FreshBodyCommitResult> {
+		const prior = await inFlight;
+		if (prior.outcome === "pending") {
+			// The file itself is not confirmed. Keep the edit on the device: the
+			// disk file still holds it and is re-planned after the create replays.
+			throw new FreshAdmissionDurablyPendingError(input.path, prior.operationId, new Error("create_unconfirmed"));
+		}
+		if (prior.outcome !== "created") throw new FreshAdmissionCancelledError(input.path);
+		if (this.destroyed || input.admissionStillCurrent?.() === false) {
+			throw new FreshAdmissionCancelledError(input.path);
+		}
+		const bodyId = prior.result.bodyId;
+		const body = await this.loadCurrentBody(bodyId);
+		if (body.doc.getText(BODY_TEXT_NAME).toJSON() === input.content) return prior.result;
+		const receipt = await this.commitBodyCandidate({
+			bodyId,
 			content: input.content,
-		};
-		await save.call(this.options.database, storedOperation);
-		try {
-		if (input.admissionStillCurrent?.() === false) {
-			await remove.call(this.options.database, operationId);
-			throw new FreshAdmissionCancelledError(input.path);
-		}
-		let pending = this.pendingCandidates.get(input.candidateId);
-		if (pending && pending.record.bodyId !== input.bodyId) {
-			throw new Error("candidate ID belongs to a different body");
-		}
-		if (!pending) {
-			const body = await this.loadBodyWithPriority(input.bodyId, "foreground");
-			if (input.admissionStillCurrent?.() === false) {
-				await remove.call(this.options.database, operationId);
-				this.bodies.discardTransient(input.bodyId);
-				await this.options.database.deleteDocument?.(input.bodyId);
-				throw new FreshAdmissionCancelledError(input.path);
-			}
-			const materialized = materializeFreshMarkdownUpdates(
-				body.doc,
-				input.content,
-				() => this.ensureSemanticMirror(body).seedCurrent(),
-			);
-			pending = await this.captureCandidate(
-				input.bodyId,
-				materialized.encodedUpdate,
-				input.candidateId,
-				0,
-				input.path,
-				materialized.encodedUpdates,
-			);
-		}
-		if (input.admissionStillCurrent?.() === false) {
-			await this.cancelFreshAdmission(pending, operationId);
-			throw new FreshAdmissionCancelledError(input.path);
-		}
-		request.candidateId = pending.record.candidateId;
-		request.candidateDigest = pending.record.candidateDigest;
-		// The server's first lifecycle commit binds this exact candidate fence.
-		// Persist it before that request so a crash after candidate settlement
-		// cannot leave replay to invent a different, permanently rejected fence.
-		await save.call(this.options.database, {
-			...storedOperation,
-			candidateId: request.candidateId,
-			candidateDigest: request.candidateDigest,
+			candidateId: crypto.randomUUID(),
+			reason: input.reason,
 		});
-		let admissionReceipt: LifecycleReceipt;
-		try {
-			admissionReceipt = await this.server.commitLifecycle(request);
-		} catch (error) {
-			if (this.isCreationPathSuperseded(error)) {
-				await this.cancelFreshAdmission(pending, operationId);
-				throw new FreshAdmissionCancelledError(input.path);
+		return { ...prior.result, receipt };
+	}
+
+	private enqueueCollectedCreate(input: FreshBodyCommitInput): Promise<BulkCreateItemResult> {
+		return new Promise<BulkCreateItemResult>((resolve) => {
+			const previous = this.createCollector.get(input.path);
+			if (previous) {
+				// D5 fold: the create is unsent, so its snapshot becomes the newer text.
+				this.createCollectorBytes -= previous.bytes;
+				this.createCollector.delete(input.path);
+				previous.resolve({ outcome: "cancelled" });
 			}
-			throw error;
-		}
-		this.validateLifecycleReceipt(request, admissionReceipt);
-		// Admission is the distributed commitment point: the server now owns an
-		// exact operation/candidate fence and exposes no cancellation mutation.
-		// A newer local revision may supersede this snapshot, but abandoning it
-		// here would orphan that server fence and make the newer revision fail
-		// forever. Finish this admission; the scheduler will apply the newer
-		// revision as the next body candidate.
-		const receipt = await this.submitCandidate(pending);
-		await save.call(this.options.database, {
-			...storedOperation,
-			candidateId: request.candidateId,
-			candidateDigest: request.candidateDigest,
-			content: null,
+			const bytes = utf8ByteLength(input.content) + BULK_CREATE_ITEM_OVERHEAD_BYTES;
+			this.createCollector.set(input.path, { input, bytes, resolve });
+			this.createCollectorBytes += bytes;
+			const caps = this.bulkCreateCaps();
+			if (this.createCollector.size >= caps.maxItems
+				|| this.createCollectorBytes >= caps.byteBudget) {
+				this.flushCreateCollector();
+			} else if (this.createCollectorTimer === null) {
+				this.createCollectorTimer = globalThis.setTimeout(() => {
+					this.createCollectorTimer = null;
+					this.flushCreateCollector();
+				}, this.options.createCollectorDelayMs ?? CREATE_COLLECTOR_DELAY_MS);
+			}
 		});
-		let lifecycleReceipt: LifecycleReceipt;
-		try {
-			lifecycleReceipt = await this.server.commitLifecycle(request);
-		} catch (error) {
-			if (this.isCreationPathSuperseded(error)) {
-				await this.retireSupersededCreations([{
-					...storedOperation,
-					candidateId: request.candidateId,
-					candidateDigest: request.candidateDigest,
-					content: null,
-				}]);
-				throw new FreshAdmissionCancelledError(input.path);
+	}
+
+	/** Sends every collected create now (split by the server caps). */
+	flushPendingCreates(): void {
+		this.flushCreateCollector();
+	}
+
+	private flushCreateCollector(): void {
+		if (this.createCollectorTimer !== null) {
+			globalThis.clearTimeout(this.createCollectorTimer);
+			this.createCollectorTimer = null;
+		}
+		const entries = [...this.createCollector.values()];
+		this.createCollector.clear();
+		this.createCollectorBytes = 0;
+		const live: CreateCollectorEntry[] = [];
+		for (const entry of entries) {
+			if (this.destroyed || entry.input.admissionStillCurrent?.() === false) {
+				entry.resolve({ outcome: "cancelled" });
+			} else {
+				live.push(entry);
 			}
-			throw error;
 		}
-		this.validateLifecycleReceipt(request, lifecycleReceipt);
-		if (lifecycleReceipt.vaultSequence < admissionReceipt.vaultSequence) {
-			throw new Error("fresh lifecycle final sequence regressed");
-		}
-		await this.publishLifecycleRoot([request], [lifecycleReceipt]);
-		await remove.call(this.options.database, operationId);
-		this.log(`fresh body committed for ${input.path} (${input.reason})`);
-		return {
-			fileId: input.bodyId,
-			bodyId: input.bodyId,
-			lifecycleOperationId: operationId,
-			receipt,
-		};
-		} catch (error) {
-			if (error instanceof FreshAdmissionCancelledError) throw error;
-			await this.queueLifecycleReplaySafely(`single:${operationId}`);
-			throw new FreshAdmissionDurablyPendingError(input.path, operationId, error);
+		for (const chunk of splitByBulkCreateCaps(live, (entry) => entry.bytes, this.bulkCreateCaps())) {
+			const items = this.scheduleCreateBatch(chunk.map((entry) => entry.input), "foreground");
+			chunk.forEach((entry, index) => {
+				void items[index]!.then((result) => entry.resolve(result));
+			});
 		}
 	}
 
 	/**
-	 * Initial import path: one bounded admission request, one candidate request,
-	 * one lifecycle readback, and one root publication for the whole batch.
-	 * Durable local operations remain resumable if any network step fails.
+	 * Queues one bulk-create batch behind earlier batches and registers each
+	 * path as in flight until the batch has settled locally (root applied,
+	 * candidates settled), which is what the D5 hold waits for.
+	 */
+	private scheduleCreateBatch(
+		inputs: readonly FreshBodyCommitInput[],
+		priority: "foreground" | "background",
+	): Promise<BulkCreateItemResult>[] {
+		const run = this.createBatchChain.then(() => this.runCreateBatch(inputs, priority));
+		this.createBatchChain = run.then(() => undefined, () => undefined);
+		return inputs.map((input, index) => {
+			const item = run.then(
+				(results) => results[index]!,
+				(error): BulkCreateItemResult => ({ outcome: "rejected", reason: String(error), operationId: "" }),
+			);
+			this.createsInFlight.set(input.path, item);
+			void item.then(() => {
+				if (this.createsInFlight.get(input.path) === item) this.createsInFlight.delete(input.path);
+			});
+			return item;
+		});
+	}
+
+	/**
+	 * Initial import / folder drop: the same bulk path without the collector
+	 * delay, split by the server caps. `exists-*` items report the server's
+	 * existing body and are routed to reconcile through `onCreatePathOwned`.
 	 */
 	async commitFreshBodies(
 		inputs: readonly FreshBodyCommitInput[],
@@ -2734,27 +2995,14 @@ export class VaultSync implements SyncRuntimePort {
 		}));
 		if (this.destroyed) throw new Error("runtime is destroyed");
 		if (inputs.length === 0) return { results: [] };
-		if (inputs.length > 100) throw new Error("fresh body batch exceeds 100 items");
-		const save = this.options.database.putLifecycleOperation;
-		const removeBatch = this.options.database.deleteLifecycleOperations;
-		if (!save || !removeBatch) throw new Error("batch lifecycle persistence is unavailable");
+		if (!this.options.database.putLifecycleOperation) throw new Error("lifecycle persistence is unavailable");
 		const paths = new Set<string>();
 		const bodyIds = new Set<string>();
 		const candidateIds = new Set<string>();
-		const prepared: Array<{
-			input: FreshBodyCommitInput;
-			request: LifecycleRequest;
-			pending: PendingCandidate;
-		}> = [];
-		const batchId = crypto.randomUUID();
-		try {
-		for (let index = 0; index < inputs.length; index++) {
-			const input = inputs[index]!;
-			if (input.admissionStillCurrent?.() === false) {
-				throw new FreshAdmissionCancelledError(input.path);
-			}
+		for (const input of inputs) {
 			if (
 				this.getFileId(input.path)
+				|| this.createsInFlight.has(input.path)
 				|| paths.has(input.path)
 				|| bodyIds.has(input.bodyId)
 				|| candidateIds.has(input.candidateId)
@@ -2764,102 +3012,456 @@ export class VaultSync implements SyncRuntimePort {
 			paths.add(input.path);
 			bodyIds.add(input.bodyId);
 			candidateIds.add(input.candidateId);
-			const operationId = crypto.randomUUID();
-			const request: LifecycleRequest = {
-				operationId,
-				kind: "create",
-				fileId: input.bodyId,
-				bodyId: input.bodyId,
-				bodyEpoch: INITIAL_SEMANTIC_EPOCH,
-				path: input.path,
-			};
-			await save.call(this.options.database, {
-				...this.toStoredLifecycleOperation(request),
-				content: input.content,
-				batchId,
-				batchIndex: index,
-			});
-			const body = await this.loadBodyWithPriority(input.bodyId, "background");
-			const materialized = materializeFreshMarkdownUpdates(
-				body.doc,
-				input.content,
-				() => this.ensureSemanticMirror(body).seedCurrent(),
-			);
-			const pending = await this.captureCandidate(
-				input.bodyId,
-				materialized.encodedUpdate,
-				input.candidateId,
-				0,
-				input.path,
-				materialized.encodedUpdates,
-			);
-			request.candidateId = pending.record.candidateId;
-			request.candidateDigest = pending.record.candidateDigest;
-			await save.call(this.options.database, {
-				...this.toStoredLifecycleOperation(request),
-				content: input.content,
-				batchId,
-				batchIndex: index,
-			});
-			prepared.push({ input, request, pending });
 		}
+		const results: FreshBodyBatchItemResult[] = [];
+		for (const chunk of splitByBulkCreateCaps(
+			inputs,
+			(input) => utf8ByteLength(input.content) + BULK_CREATE_ITEM_OVERHEAD_BYTES,
+			this.bulkCreateCaps(),
+		)) {
+			const items = await Promise.all(this.scheduleCreateBatch(chunk, "background"));
+			for (let index = 0; index < chunk.length; index++) {
+				const input = chunk[index]!;
+				const item = items[index]!;
+				switch (item.outcome) {
+					case "created":
+						results.push({ ...item.result, outcome: "created" });
+						break;
+					case "exists-identical":
+					case "exists-different": {
+						const bodyId = item.existingBodyId ?? input.bodyId;
+						results.push({ fileId: bodyId, bodyId, lifecycleOperationId: item.operationId,
+							outcome: item.outcome, receipt: null });
+						break;
+					}
+					case "rejected":
+						results.push({ fileId: input.bodyId, bodyId: input.bodyId, lifecycleOperationId: item.operationId,
+							outcome: "rejected", receipt: null, reason: item.reason });
+						break;
+					case "pending":
+						throw new FreshAdmissionDurablyPendingError(input.path, item.operationId, item.error);
+					default:
+						throw new FreshAdmissionCancelledError(input.path);
+				}
+			}
+		}
+		return { results };
+	}
 
-		const requests = prepared.map((item) => item.request);
-		if (this.server.commitCreateAdmissionsBatch) {
-			await this.commitCreateAdmissionRequests(requests);
-		} else {
-			for (const request of requests) {
-				this.validateLifecycleReceipt(request, await this.server.commitLifecycle(request));
-			}
+	/**
+	 * Persists every create (operation + exact candidate) before one bulk
+	 * request. Never throws: each item resolves to its outcome; a failure after
+	 * local persistence leaves the batch durably pending for lifecycle replay.
+	 */
+	private async runCreateBatch(
+		inputs: readonly FreshBodyCommitInput[],
+		priority: "foreground" | "background",
+	): Promise<BulkCreateItemResult[]> {
+		const results: Array<BulkCreateItemResult | null> = inputs.map(() => null);
+		const save = this.options.database.putLifecycleOperation;
+		if (!save) {
+			return inputs.map(() => ({ outcome: "rejected", reason: "lifecycle persistence is unavailable", operationId: "" }));
 		}
-
-		let bodyReceipts: BodyReceipt[];
-		if (this.server.submitCandidates) {
-			const batch = await this.server.submitCandidates(prepared.map((item) => item.pending.record));
-			bodyReceipts = batch.receipts;
-			if (bodyReceipts.length !== prepared.length) {
-				throw new Error("candidate batch receipt count mismatch");
+		const batchId = crypto.randomUUID();
+		const prepared: Array<{ index: number; item: PreparedCreate }> = [];
+		const saved = new Map<number, StoredLifecycleOperation>();
+		try {
+			for (let index = 0; index < inputs.length; index++) {
+				const input = inputs[index]!;
+				if (this.destroyed || input.admissionStillCurrent?.() === false || this.getFileId(input.path)) {
+					results[index] = { outcome: "cancelled" };
+					continue;
+				}
+				const operationId = crypto.randomUUID();
+				const request: LifecycleRequest = {
+					operationId,
+					kind: "create",
+					fileId: input.bodyId,
+					bodyId: input.bodyId,
+					bodyEpoch: INITIAL_SEMANTIC_EPOCH,
+					path: input.path,
+				};
+				let operation: StoredLifecycleOperation = {
+					...this.toStoredLifecycleOperation(request),
+					content: input.content,
+					batchId,
+					batchIndex: index,
+				};
+				await save.call(this.options.database, operation);
+				saved.set(index, operation);
+				// Guard before the candidate exists: nothing for this body may be
+				// submitted until the create receipt (D5).
+				this.unconfirmedCreates.set(input.bodyId, input.path);
+				let pending = this.pendingCandidates.get(input.candidateId);
+				if (pending && pending.record.bodyId !== input.bodyId) {
+					throw new Error("candidate ID belongs to a different body");
+				}
+				if (!pending) {
+					const body = await this.loadBodyWithPriority(input.bodyId, priority);
+					if (input.admissionStillCurrent?.() === false) {
+						await this.options.database.deleteLifecycleOperation?.(operationId);
+						saved.delete(index);
+						this.unconfirmedCreates.delete(input.bodyId);
+						this.bodies.discardTransient(input.bodyId);
+						await this.options.database.deleteDocument?.(input.bodyId);
+						results[index] = { outcome: "cancelled" };
+						continue;
+					}
+					const materialized = materializeFreshMarkdownUpdates(
+						body.doc,
+						input.content,
+						() => this.ensureSemanticMirror(body).seedCurrent(),
+					);
+					pending = await this.captureCandidate(
+						input.bodyId,
+						materialized.encodedUpdate,
+						input.candidateId,
+						0,
+						input.path,
+						materialized.encodedUpdates,
+					);
+				}
+				operation = {
+					...operation,
+					candidateId: pending.record.candidateId,
+					candidateDigest: pending.record.candidateDigest,
+				};
+				await save.call(this.options.database, operation);
+				saved.set(index, operation);
+				prepared.push({ index, item: { operation, pending } });
 			}
-			const byBody = new Map(bodyReceipts.map((receipt) => [receipt.bodyId, receipt]));
-			for (const item of prepared) {
-				const receipt = byBody.get(item.pending.record.bodyId);
-				if (!receipt) throw new Error("candidate batch omitted body receipt");
-				await this.completeCandidateSubmission(item.pending, receipt);
+			if (prepared.length > 0) {
+				const settled = await this.sendAndSettleCreateBatch(batchId, prepared.map((entry) => entry.item));
+				prepared.forEach((entry, position) => { results[entry.index] = settled[position]!; });
 			}
-		} else {
-			bodyReceipts = [];
-			for (const item of prepared) bodyReceipts.push(await this.submitCandidate(item.pending));
-		}
-
-		let lifecycleReceipts: LifecycleReceipt[];
-		if (this.server.commitCreateAdmissionsBatch) {
-			lifecycleReceipts = await this.commitCreateAdmissionRequests(requests);
-		} else {
-			lifecycleReceipts = [];
-			for (const request of requests) {
-				const receipt = await this.server.commitLifecycle(request);
-				this.validateLifecycleReceipt(request, receipt);
-				lifecycleReceipts.push(receipt);
-			}
-		}
-		await this.publishLifecycleRoot(requests, lifecycleReceipts);
-		await removeBatch.call(
-			this.options.database,
-			requests.map((request) => request.operationId),
-		);
-		const receiptByBody = new Map(bodyReceipts.map((receipt) => [receipt.bodyId, receipt]));
-		return {
-			results: prepared.map(({ input, request }) => ({
-				fileId: input.bodyId,
-				bodyId: input.bodyId,
-				lifecycleOperationId: request.operationId,
-				receipt: receiptByBody.get(input.bodyId)!,
-			})),
-		};
 		} catch (error) {
-			await this.queueLifecycleReplaySafely(`batch:${batchId}`);
-			throw error;
+			this.log(`create batch ${batchId} remains durably pending: ${String(error)}`);
+			if (saved.size > 0) await this.queueStoredLifecycleOperationsSafely();
+			for (let index = 0; index < inputs.length; index++) {
+				if (results[index]) continue;
+				const operation = saved.get(index);
+				results[index] = operation
+					? { outcome: "pending", operationId: operation.operationId, error }
+					: { outcome: "rejected", reason: String(error), operationId: "" };
+			}
 		}
+		return results.map((result) => result ?? { outcome: "cancelled" });
+	}
+
+	private async queueStoredLifecycleOperationsSafely(): Promise<void> {
+		try {
+			await this.queueStoredLifecycleOperations();
+		} catch (error) {
+			this.log(`lifecycle replay remains reconstructible after scheduler handoff failed: ${String(error)}`);
+		}
+	}
+
+	private bulkCreateFileRequest(item: PreparedCreate): BulkCreateFileRequest {
+		const record = item.pending.record;
+		const frames = record.encodedUpdates && record.encodedUpdates.length > 0
+			? record.encodedUpdates.map((frame) => new Uint8Array(frame))
+			: [new Uint8Array(record.encodedUpdate)];
+		return {
+			operationId: item.operation.operationId,
+			bodyId: item.operation.bodyId,
+			path: item.operation.path,
+			updates: frames,
+		};
+	}
+
+	/** Re-files persisted creates under a new batch identity (split / overlap / lost frames). */
+	private async rebatchCreates(items: readonly PreparedCreate[], batchId: string): Promise<PreparedCreate[]> {
+		const save = this.options.database.putLifecycleOperation;
+		if (!save) throw new Error("lifecycle persistence is unavailable");
+		const out: PreparedCreate[] = [];
+		for (let index = 0; index < items.length; index++) {
+			const operation = { ...items[index]!.operation, batchId, batchIndex: index };
+			await save.call(this.options.database, operation);
+			out.push({ operation, pending: items[index]!.pending });
+		}
+		return out;
+	}
+
+	private async sendAndSettleCreateBatch(
+		batchId: string,
+		items: readonly PreparedCreate[],
+	): Promise<BulkCreateItemResult[]> {
+		this.activeCreateBatches.add(batchId);
+		let response: BulkCreateResponse;
+		try {
+			try {
+				response = await this.sendCreateBatch(batchId, items.map((item) => this.bulkCreateFileRequest(item)), []);
+			} catch (error) {
+				if (error instanceof VaultMutationRequestError && isBulkCreateTooBig(error) && items.length > 1) {
+					// Nothing was written: split (by the server's caps, else in halves)
+					// and send each part under its own batch.
+					const out: BulkCreateItemResult[] = [];
+					for (const half of this.splitAfterBulkCreate413(items, error)) {
+						const halfId = crypto.randomUUID();
+						out.push(...await this.sendAndSettleCreateBatch(halfId, await this.rebatchCreates(half, halfId)));
+					}
+					return out;
+				}
+				throw error;
+			}
+			return await this.settleCreateBatch(items, response);
+		} finally {
+			this.activeCreateBatches.delete(batchId);
+		}
+	}
+
+	/**
+	 * One bulk request; recovers a stale root epoch once. Applies the server's
+	 * root delta (files and attachments created by this batch, plus anything
+	 * this client had not seen) before returning.
+	 */
+	private async sendCreateBatch(
+		batchId: string,
+		files: BulkCreateFileRequest[],
+		attachments: BulkCreateAttachmentRequest[],
+	): Promise<BulkCreateResponse> {
+		await this.waitForSubmissionWindow();
+		const build = (): BulkCreateRequest => ({
+			batchId,
+			rootEpoch: this._rootEpoch,
+			rootStateVector: Y.encodeStateVector(this.ydoc),
+			files,
+			attachments,
+		});
+		let response: BulkCreateResponse;
+		try {
+			response = await this.server.commitCreateBulk(build());
+		} catch (error) {
+			if (!(error instanceof VaultMutationRequestError)
+				|| error.semanticMismatch?.purpose !== "root"
+				|| error.semanticMismatch.documentId !== ROOT_DOCUMENT_ID
+				|| error.semanticMismatch.receivedEpoch !== this._rootEpoch) throw error;
+			await this.recoverRootSemanticEpoch(error.semanticMismatch.expectedEpoch);
+			response = await this.server.commitCreateBulk(build());
+		}
+		const expected = [...files.map((file) => file.operationId), ...attachments.map((item) => item.operationId)];
+		if (
+			response.batchId !== batchId
+			|| !Array.isArray(response.outcomes)
+			|| response.outcomes.length !== expected.length
+			|| response.outcomes.some((outcome, index) => outcome.operationId !== expected[index])
+			|| response.vaultGeneration !== this.options.vaultGeneration
+			|| typeof response.runtimeEpoch !== "string" || !response.runtimeEpoch
+			|| !Number.isSafeInteger(response.vaultSequence) || response.vaultSequence < 0
+			|| !Number.isSafeInteger(response.rootGeneration) || response.rootGeneration < 0
+			|| response.rootEpoch !== this._rootEpoch
+		) {
+			throw new Error("bulk create receipt mismatch");
+		}
+		if (response.rootUpdate instanceof Uint8Array && response.rootUpdate.byteLength > 0) {
+			Y.applyUpdate(this.ydoc, response.rootUpdate, ORIGIN_DURABLE_ROOT_PUBLICATION);
+		}
+		this._rootGeneration = Math.max(this._rootGeneration, response.rootGeneration);
+		await this.persistRoot();
+		return response;
+	}
+
+	/**
+	 * Local settlement after a bulk receipt: lifecycle records first (a crash
+	 * after this point falls back to an idempotent candidate replay), then the
+	 * create candidates are settled from the batch receipt, then the D5 guard
+	 * is lifted. Non-created items discard their local fresh identity.
+	 */
+	private async settleCreateBatch(
+		items: readonly PreparedCreate[],
+		response: BulkCreateResponse,
+	): Promise<BulkCreateItemResult[]> {
+		const ids = items.map((item) => item.operation.operationId);
+		if (ids.length > 1 && this.options.database.deleteLifecycleOperations) {
+			await this.options.database.deleteLifecycleOperations(ids);
+		} else {
+			for (const id of ids) await this.options.database.deleteLifecycleOperation?.(id);
+		}
+		const results: BulkCreateItemResult[] = [];
+		for (let index = 0; index < items.length; index++) {
+			const { operation, pending } = items[index]!;
+			const outcome = response.outcomes[index]!;
+			const bodyId = operation.bodyId;
+			if (outcome.outcome === "created") {
+				if (this.getFileId(operation.path) !== bodyId) {
+					this.log(`bulk create receipt for ${operation.path} did not map it to ${bodyId} in the local root`);
+				}
+				const receipt: BodyReceipt = {
+					vaultId: pending.record.vaultId,
+					vaultGeneration: response.vaultGeneration,
+					bodyId,
+					bodyEpoch: pending.record.bodyEpoch,
+					clientId: this.options.deviceId,
+					candidateId: pending.record.candidateId,
+					candidateDigest: pending.record.candidateDigest,
+					durableGeneration: 1,
+					runtimeEpoch: response.runtimeEpoch,
+				};
+				this.unconfirmedCreates.delete(bodyId);
+				try {
+					await this.completeCandidateSubmission(pending, receipt);
+				} catch (error) {
+					this.log(`create candidate for ${operation.path} settles through candidate replay: ${String(error)}`);
+				}
+				this.emitCreatedProductEvent(operation.path, bodyId, operation.operationId);
+				if (Array.from(this.pendingCandidates.values()).some((candidate) => candidate.record.bodyId === bodyId)) {
+					void this.submitPendingForBody(bodyId);
+				}
+				results.push({
+					outcome: "created",
+					result: { fileId: bodyId, bodyId, lifecycleOperationId: operation.operationId, receipt },
+				});
+				continue;
+			}
+			await this.cancelFreshAdmission(pending, operation.operationId);
+			this.unconfirmedCreates.delete(bodyId);
+			if (outcome.outcome === "exists-identical" || outcome.outcome === "exists-different") {
+				const existingBodyId = outcome.existingBodyId ?? outcome.bodyId ?? null;
+				results.push({ outcome: outcome.outcome, existingBodyId, operationId: operation.operationId });
+				this.notifyCreatePathOwned(operation.path, existingBodyId, outcome.outcome === "exists-identical");
+			} else {
+				this.log(`bulk create rejected ${operation.path}: ${outcome.reason ?? "rejected"}`);
+				results.push({ outcome: "rejected", reason: outcome.reason ?? "rejected", operationId: operation.operationId });
+			}
+		}
+		return results;
+	}
+
+	private notifyCreatePathOwned(path: string, existingBodyId: string | null, identical: boolean): void {
+		const callback = this.options.onCreatePathOwned;
+		if (!callback) return;
+		void Promise.resolve()
+			.then(() => callback({ path, existingBodyId, identical }))
+			.catch((error) => this.log(`create path reconcile handoff failed for ${path}: ${String(error)}`));
+	}
+
+	private emitCreatedProductEvent(path: string, bodyId: string, operationId: string): void {
+		this.options.onProductEvent?.({
+			kind: PRODUCT_EVENT_KIND.crdtFileCreated,
+			severity: "info",
+			scope: "file",
+			source: "vaultSync",
+			layer: "crdt",
+			priority: "important",
+			path,
+			opId: operationId,
+			data: { bodyId, fromPath: null, toPath: null },
+		});
+	}
+
+	/**
+	 * Lifecycle replay for persisted creates: resend the same batch identity
+	 * with the same frames (exact retry → stored receipt). Items already
+	 * committed under another batch are settled by an idempotent candidate
+	 * replay; the rest are re-filed under a new batch.
+	 */
+	private async retryCreateGroup(operations: readonly StoredLifecycleOperation[]): Promise<void> {
+		const save = this.options.database.putLifecycleOperation;
+		if (!save || operations.length === 0) return;
+		const batchId = operations[0]!.batchId ?? operations[0]!.operationId;
+		if (this.activeCreateBatches.has(batchId)) return;
+		this.activeCreateBatches.add(batchId);
+		try {
+			const items: PreparedCreate[] = [];
+			let rebatch = false;
+			for (const stored of operations) {
+				const operation = { ...stored };
+				this.unconfirmedCreates.set(operation.bodyId, operation.path);
+				let pending = Array.from(this.pendingCandidates.values()).find(
+					(candidate) => candidate.record.bodyId === operation.bodyId
+						&& (!operation.candidateId || candidate.record.candidateId === operation.candidateId),
+				);
+				if (!pending) {
+					if (operation.content === null) {
+						await this.options.database.deleteLifecycleOperation?.(operation.operationId);
+						this.unconfirmedCreates.delete(operation.bodyId);
+						continue;
+					}
+					// The exact frames may already have been sent under this batch;
+					// new frames must travel under a new batch identity.
+					if (operation.candidateId) rebatch = true;
+					const body = await this.loadBodyWithPriority(operation.bodyId, "background", true);
+					const text = body.doc.getText(BODY_TEXT_NAME);
+					if (text.toJSON() !== operation.content) {
+						applyDiffToYText(text, text.toJSON(), operation.content, ORIGIN_DISK_COMMIT);
+						await this.bodies.markDirty(operation.bodyId);
+					}
+					pending = await this.captureCandidate(
+						operation.bodyId,
+						Y.encodeStateAsUpdate(body.doc),
+						crypto.randomUUID(),
+						0,
+						operation.path,
+					);
+					operation.candidateId = pending.record.candidateId;
+					operation.candidateDigest = pending.record.candidateDigest;
+					await save.call(this.options.database, operation);
+				}
+				items.push({ operation, pending });
+			}
+			if (items.length === 0 || this.destroyed) return;
+			if (rebatch) {
+				await this.requeueCreates(items);
+				return;
+			}
+			try {
+				const response = await this.sendCreateBatch(batchId, items.map((item) => this.bulkCreateFileRequest(item)), []);
+				await this.settleCreateBatch(items, response);
+				this.log(`create batch ${batchId} settled by replay${response.replayed ? " (stored receipt)" : ""}`);
+			} catch (error) {
+				if (!(error instanceof VaultMutationRequestError)) throw error;
+				if (error.status === 409 && error.code === "bulk_create_partial_overlap") {
+					const committed = new Set(error.operationIds);
+					for (const item of items) {
+						if (!committed.has(item.operation.operationId)) continue;
+						await this.options.database.deleteLifecycleOperation?.(item.operation.operationId);
+						this.unconfirmedCreates.delete(item.operation.bodyId);
+						void this.submitPendingForBody(item.operation.bodyId);
+					}
+					const rest = items.filter((item) => !committed.has(item.operation.operationId));
+					if (rest.length > 0) await this.requeueCreates(rest);
+					this.log(`create batch ${batchId} overlapped ${committed.size} committed item(s); rest re-filed`);
+					return;
+				}
+				if (error.status === 409 && error.code === "bulk_create_batch_identity_mismatch") {
+					await this.requeueCreates(items);
+					return;
+				}
+				if (isBulkCreateTooBig(error) && items.length > 1) {
+					for (const part of this.splitAfterBulkCreate413(items, error)) await this.requeueCreates(part);
+					return;
+				}
+				throw error;
+			}
+		} catch (error) {
+			this.log(`create batch ${batchId} remains pending: ${String(error)}`);
+		} finally {
+			this.activeCreateBatches.delete(batchId);
+		}
+	}
+
+	/** Effective create-bulk caps: the defaults, the advertised server caps and any 413-learned caps. */
+	private bulkCreateCaps(): BulkCreateClientCaps {
+		return bulkCreateClientCaps(parseBulkCreateServerCaps(this.options.bulkCreateCaps?.()), this.learnedBulkCreateCaps);
+	}
+
+	private learnBulkCreateCaps(error: VaultMutationRequestError): void {
+		if (error.bulkCreateCaps) this.learnedBulkCreateCaps = error.bulkCreateCaps;
+	}
+
+	/** A create-bulk 413 wrote nothing: split by the (learned) item cap, else halve (bytes are estimated). */
+	private splitAfterBulkCreate413<T>(items: readonly T[], error: VaultMutationRequestError): T[][] {
+		this.learnBulkCreateCaps(error);
+		const byCount = splitByBulkCreateCaps(items, () => 0, this.bulkCreateCaps());
+		if (byCount.length > 1) return byCount;
+		const middle = Math.ceil(items.length / 2);
+		return [items.slice(0, middle), items.slice(middle)];
+	}
+
+	private async requeueCreates(items: readonly PreparedCreate[]): Promise<void> {
+		const batchId = crypto.randomUUID();
+		await this.rebatchCreates(items, batchId);
+		await this.queueLifecycleReplaySafely(`batch:${batchId}`);
 	}
 
 	/** Durable exact-candidate write for an already admitted body. */
@@ -5114,6 +5716,10 @@ export class VaultSync implements SyncRuntimePort {
 	private async performCandidateSubmission(
 		candidate: PendingCandidate,
 	): Promise<BodyReceipt> {
+		if (this.unconfirmedCreates.has(candidate.record.bodyId)) {
+			// D5: edits never reach the server before their file.
+			throw new Error(`create of body ${candidate.record.bodyId} is unconfirmed; candidate held on device`);
+		}
 		if (!this.isCapturedAuthorityCurrent(candidate.record.authority)) {
 			const recovered = await this.recoverCandidateOutcome(candidate);
 			if (recovered) return recovered;
@@ -5473,6 +6079,14 @@ export class VaultSync implements SyncRuntimePort {
 			: `single:${operation.operationId}`;
 	}
 
+	private async restoreUnconfirmedCreates(): Promise<void> {
+		const list = this.options.database.listLifecycleOperations;
+		if (!list) return;
+		for (const operation of await list.call(this.options.database)) {
+			if (operation.kind === "create") this.unconfirmedCreates.set(operation.bodyId, operation.path);
+		}
+	}
+
 	private async queueStoredLifecycleOperations(): Promise<void> {
 		const list = this.options.database.listLifecycleOperations;
 		if (!list) return;
@@ -5561,101 +6175,20 @@ export class VaultSync implements SyncRuntimePort {
 			for (const operation of attempted) this.noteAuthoritySuperseded("lifecycle", operation.operationId, operation.authority);
 			return;
 		}
+		if (attempted.every((operation) => operation.kind === "create")) {
+			await this.retryCreateGroup(attempted);
+			return;
+		}
+		if (attempted.some((operation) => operation.kind === "create")) {
+			// Pre-W2 mixed groups: creates are bulk-only now and must not ride a
+			// structural batch. Leave them for an explicit decision.
+			this.log("lifecycle replay remains pending: a structural group contains a create");
+			return;
+		}
 		const requests = attempted.map((operation) => this.fromStoredLifecycleOperation(operation));
 		try {
-			for (let index = 0; index < attempted.length; index++) {
-				const operation = attempted[index]!;
-				if (operation.kind !== "create" || operation.content === null) continue;
-				const request = requests[index]!;
-				let pending = Array.from(this.pendingCandidates.values()).find(
-					(candidate) => candidate.record.bodyId === operation.bodyId
-						&& (!operation.candidateId || candidate.record.candidateId === operation.candidateId),
-				);
-				if (!pending) {
-					// A missing persisted candidate with a known fence can mean the
-					// candidate receipt was committed immediately before a crash.  Prove
-					// that outcome first; the admission can then be finalized without
-					// manufacturing a second candidate for the already-bound creation.
-					if (operation.candidateId && operation.candidateDigest) {
-						const outcome = await this.exactCommittedOutcome(
-							operation.candidateId,
-							operation.candidateDigest,
-							operation.authority,
-						);
-						if (outcome) {
-							operation.content = null;
-							await save.call(this.options.database, operation);
-							continue;
-						}
-					}
-					const body = await this.loadBodyWithPriority(operation.bodyId, "background", true);
-					const text = body.doc.getText(BODY_TEXT_NAME);
-					if (text.toJSON() !== operation.content) {
-						applyDiffToYText(
-							text,
-							text.toJSON(),
-							operation.content,
-							ORIGIN_DISK_COMMIT,
-						);
-						await this.bodies.markDirty(operation.bodyId);
-					}
-					const encodedUpdate = Y.encodeStateAsUpdate(body.doc);
-					if (operation.candidateDigest
-						&& await sha256Hex(encodedUpdate) !== operation.candidateDigest) {
-						throw new Error(`fresh body ${operation.bodyId} cannot reproduce its creation candidate`);
-					}
-					pending = await this.captureCandidate(
-						operation.bodyId,
-						encodedUpdate,
-						operation.candidateId,
-					);
-				}
-				request.candidateId = pending.record.candidateId;
-				request.candidateDigest = pending.record.candidateDigest;
-				operation.candidateId = pending.record.candidateId;
-				operation.candidateDigest = pending.record.candidateDigest;
-				await save.call(this.options.database, operation);
-			}
 			if (this.destroyed) return;
-			const allCreates = requests.every((request) => request.kind === "create");
-			const receipts = allCreates && this.server.commitCreateAdmissionsBatch
-				? await this.commitCreateAdmissionRequests(requests)
-				: await this.commitLifecycleRequests(requests);
-			if (this.destroyed) return;
-			for (const operation of attempted) {
-				if (this.destroyed) return;
-				if (operation.kind !== "create" || operation.content === null) continue;
-				await this.submitPendingForBody(operation.bodyId);
-				const stillPending = Array.from(this.pendingCandidates.values()).some(
-					(candidate) => candidate.record.bodyId === operation.bodyId,
-				);
-				if (stillPending) throw new Error(`fresh body ${operation.bodyId} is not durable`);
-				await save.call(this.options.database, {
-					...operation,
-					content: null,
-				});
-			}
-			if (allCreates && this.server.commitCreateAdmissionsBatch) {
-				const finalReceipts = await this.commitCreateAdmissionRequests(requests);
-				for (let index = 0; index < receipts.length; index++) {
-					if (finalReceipts[index]!.vaultSequence < receipts[index]!.vaultSequence) {
-						throw new Error("fresh lifecycle final sequence regressed");
-					}
-					receipts[index] = finalReceipts[index]!;
-				}
-			}
-			for (let index = 0; index < attempted.length; index++) {
-				if (this.destroyed) return;
-				const operation = attempted[index]!;
-				if (allCreates || operation.kind !== "create" || operation.content === null) continue;
-				const finalReceipt = await this.server.commitLifecycle(requests[index]!);
-				this.validateLifecycleReceipt(requests[index]!, finalReceipt);
-				if (finalReceipt.vaultSequence < receipts[index]!.vaultSequence) {
-					throw new Error("fresh lifecycle final sequence regressed");
-
-				}
-				receipts[index] = finalReceipt;
-			}
+			const receipts = await this.commitLifecycleRequests(requests);
 			if (this.destroyed) return;
 			await this.publishLifecycleRoot(requests, receipts);
 			if (attempted.length > 1) {
@@ -5676,24 +6209,11 @@ export class VaultSync implements SyncRuntimePort {
 					const body = await this.recoverBodySemanticEpoch(mismatch.documentId, mismatch.expectedEpoch);
 					for (const operation of stale) {
 						operation.bodyEpoch = body.bodyEpoch;
-						if (operation.kind === "create") {
-							// The candidate belongs to the retired CRDT lineage.  The next
-							// replay binds the same semantic lifecycle intent to the fresh
-							// epoch's persisted rebase candidate.
-							delete operation.candidateId;
-							delete operation.candidateDigest;
-						}
 						await save.call(this.options.database, operation);
 					}
 					this.log(`lifecycle group rebound to body semantic epoch ${body.bodyEpoch}`);
 					return;
 				}
-			}
-			if (this.isCreationPathSuperseded(error)
-				&& attempted.every((operation) => operation.kind === "create")) {
-				await this.retireSupersededCreations(attempted);
-				this.log("superseded creation lifecycle was retired after authoritative path ownership changed");
-				return;
 			}
 			const recovered = this.shouldQueryOperationOutcome(error)
 				? await this.recoverLifecycleReceipts(requests, attempted.map((operation) => operation.authority))
@@ -5764,34 +6284,6 @@ export class VaultSync implements SyncRuntimePort {
 		await this.options.database.deleteLifecycleOperation?.(operationId);
 	}
 
-	private isCreationPathSuperseded(error: unknown): boolean {
-		return error instanceof VaultMutationRequestError
-			&& error.status === 409
-			&& error.code === "creation_path_superseded";
-	}
-
-	private async retireSupersededCreations(
-		operations: readonly StoredLifecycleOperation[],
-	): Promise<void> {
-		for (const operation of operations) {
-			const pending = Array.from(this.pendingCandidates.values()).find(
-				(candidate) => candidate.record.bodyId === operation.bodyId
-					&& (!operation.candidateId || candidate.record.candidateId === operation.candidateId),
-			);
-			if (pending) {
-				await this.cancelFreshAdmission(pending, operation.operationId);
-				continue;
-			}
-			const loaded = this.bodies.get(operation.bodyId);
-			if (loaded && !loaded.dirty && loaded.unsettled === 0
-				&& loaded.pendingLocalUpdates === 0 && loaded.pins === 0) {
-				this.bodies.discardTransient(operation.bodyId);
-			}
-			await this.options.database.deleteDocument?.(operation.bodyId);
-			await this.options.database.deleteLifecycleOperation?.(operation.operationId);
-		}
-	}
-
 	private toStoredLifecycleOperation(request: LifecycleRequest): StoredLifecycleOperation {
 		const path = request.toPath ?? request.path;
 		if (!path) throw new Error(`lifecycle ${request.kind} requires a path`);
@@ -5832,11 +6324,6 @@ export class VaultSync implements SyncRuntimePort {
 		requests: readonly LifecycleRequest[],
 	): Promise<LifecycleReceipt[]> {
 		await this.waitForSubmissionWindow();
-		if (requests.length === 1) {
-			const receipt = await this.server.commitLifecycle(requests[0]!);
-			this.validateLifecycleReceipt(requests[0]!, receipt);
-			return [receipt];
-		}
 		const batch = await this.server.commitLifecycleBatch(requests);
 		if (
 			batch.receipts.length !== requests.length
@@ -5854,29 +6341,6 @@ export class VaultSync implements SyncRuntimePort {
 		);
 		if (batch.vaultSequence < maxReceiptSequence) {
 			throw new Error("lifecycle batch sequence mismatch");
-		}
-		return batch.receipts;
-	}
-
-	private async commitCreateAdmissionRequests(
-		requests: readonly LifecycleRequest[],
-	): Promise<LifecycleReceipt[]> {
-		if (!this.server.commitCreateAdmissionsBatch || requests.length === 0
-			|| requests.some((request) => request.kind !== "create")) {
-			throw new Error("create admission batch is unavailable");
-		}
-		await this.waitForSubmissionWindow();
-		const batch = await this.server.commitCreateAdmissionsBatch(requests);
-		if (
-			batch.receipts.length !== requests.length
-			|| !Number.isSafeInteger(batch.vaultSequence)
-			|| batch.vaultSequence < 0
-			|| !batch.runtimeEpoch
-		) {
-			throw new Error("create admission batch receipt mismatch");
-		}
-		for (let index = 0; index < requests.length; index++) {
-			this.validateLifecycleReceipt(requests[index]!, batch.receipts[index]!);
 		}
 		return batch.receipts;
 	}

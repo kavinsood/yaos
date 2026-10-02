@@ -286,8 +286,9 @@ s.test("large initial import uses bounded bulk submissions instead of one reques
 	assert.equal(state.stage, "complete");
 	assert.equal(sink.commits.length, 1000);
 	assert.equal(sink.batches.reduce((sum, count) => sum + count, 0), 1000);
-	assert.ok(sink.batches.every((count) => count > 0 && count <= 32));
-	assert.ok(sink.batches.length <= 32, `expected at most 32 network batches, got ${sink.batches.length}`);
+	// One bulk create carries at most 500 notes (server cap), so 1000 notes are two requests.
+	assert.ok(sink.batches.every((count) => count > 0 && count <= 500));
+	assert.equal(sink.batches.length, 2, `expected two bulk-create batches, got ${sink.batches.join(",")}`);
 });
 
 s.test("bulk preparation reads only one potentially 5 MiB note at a time", async () => {

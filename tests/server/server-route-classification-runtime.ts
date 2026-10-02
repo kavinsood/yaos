@@ -40,8 +40,7 @@ s.test("schema-4 root/body, candidate, lifecycle, and bootstrap shapes classify 
 		["GET", "/vault/vault-route-0001/ws/body/body-route-0001"],
 		["POST", "/vault/vault-route-0001/body/body-route-0001/candidate"],
 		["POST", "/vault/vault-route-0001/body/candidates"],
-		["POST", "/vault/vault-route-0001/lifecycle"],
-		["POST", "/vault/vault-route-0001/lifecycle/admissions"],
+		["POST", "/vault/vault-route-0001/lifecycle/create-bulk"],
 		["POST", "/vault/vault-route-0001/lifecycle/batch"],
 		["POST", "/vault/vault-route-0001/lifecycle/publish"],
 		["POST", "/vault/vault-route-0001/attachments/publish"],
@@ -71,6 +70,9 @@ s.test("schema-4 root/body, candidate, lifecycle, and bootstrap shapes classify 
 		["POST", "/vault/vault-route-0001/provision"],
 		["POST", "/operator/vaults/vault-route-0001/collaboration-migrate"],
 		["DELETE", "/vault/vault-route-0001/body/body-route-0001/candidate"],
+		// W2: single create and the admissions batch are gone; bulk create is the only create path.
+		["POST", "/vault/vault-route-0001/lifecycle"],
+		["POST", "/vault/vault-route-0001/lifecycle/admissions"],
 	] as Array<[string, string]>) {
 		assert.equal(classifyWorkerRoute(new Request(`https://example.test${path}`, { method })).kind, "not-found", `${method} ${path}`);
 	}

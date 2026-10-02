@@ -13,7 +13,7 @@ import { claim, device, freshVault, hasContext, loadContext, saveContext, seedNo
 
 export const SMALL_COUNT = 100;
 
-export async function standardSeed(host: string) {
+export async function standardSeed(host: string, create = process.env.WB_CREATE ?? "bulk") {
 	const context = loadContext(host);
 	if (context.seeded?.standard) { log("standard seed already present"); return; }
 	const inputs = [
@@ -21,7 +21,14 @@ export async function standardSeed(host: string) {
 		{ bodyId: "r2-lat", path: "R2/latency.md", content: smallContent(9999) },
 	];
 	const started = Date.now();
-	const r = await seedNotes(context, inputs);
+	let r: { requests: number };
+	if (create === "bulk") { // W2 servers have no lifecycle/admissions route: seed through create-bulk
+		const { bulkCreate } = await import("./wb/adapters");
+		const res = await bulkCreate().create(context, inputs.map((i) => ({ kind: "note" as const, ...i })));
+		const bad = res.outcomes.filter((o) => o.outcome !== "created" && o.outcome !== "exists-identical");
+		if (bad.length) throw new Error(`bulk standard seed failed for ${bad.length}/${inputs.length}: ${JSON.stringify(bad[0])}`);
+		r = { requests: res.requests };
+	} else r = await seedNotes(context, inputs);
 	context.seeded = { ...(context.seeded ?? {}), standard: { bodies: inputs.length, ms: Date.now() - started, requests: r.requests } };
 	saveContext(context);
 }
@@ -37,7 +44,7 @@ async function main() {
 	} else if (fresh) await freshVault(host, fresh, devices.slice(0, 2));
 	const context = loadContext(host);
 	for (const name of devices) await device(context, name);
-	if ((flagStr(args, "seed", "standard")) === "standard") await standardSeed(host);
+	if ((flagStr(args, "seed", "standard")) === "standard") await standardSeed(host, flagStr(args, "create") ?? process.env.WB_CREATE);
 	log(`context ready: vault devices=${Object.keys(loadContext(host).devices).join(",")}`);
 	process.exit(0);
 }

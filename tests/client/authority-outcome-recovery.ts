@@ -109,7 +109,7 @@ s.test("stale lifecycle recovery uses the exact outcome then only publishes its 
 		listAttachmentOperations: async () => [], deleteAttachmentOperation: async () => {}, close: async () => {},
 	});
 	const server = partialOf<VaultServerPort>({
-		commitLifecycle: async () => { lifecycleMutations++; throw new Error("must not recommit lifecycle"); },
+		commitLifecycleBatch: async () => { lifecycleMutations++; throw new Error("must not recommit lifecycle"); },
 		committedOperationOutcome: async ({ operationId, requestDigest }) => ({ operationId, requestDigest, vaultSequence: 11, committed: true }),
 		publishLifecycleRoot: async (operations) => {
 			rootPublications++;

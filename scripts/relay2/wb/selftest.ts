@@ -1,80 +1,52 @@
 /**
- * Offline self-test for the R1 / DL harness (no server needed):
- *   node tests/run-typescript.mjs --test-aliases scripts/relay2/wb/selftest.ts [--merge-module <path>|reference]
- * Checks: reference diff3 properties, the R1 fixture table through the reference AND the product module
- * (default src/sync/lineMerge.ts; must be 15/15), rows-payload parsing + deltas, the rows-read timeout retry,
- * the closed-file candidate request shape (DL probe), bulk batch splitting, and the DL verdict (bulk skipped →
- * not applicable; destroy timeout / unhandled rejection → failure).
+ * Offline self-test for the W4 harness (no server needed):
+ *   node tests/run-typescript.mjs --test-aliases scripts/relay2/wb/selftest.ts [--manifests <dir>]
+ * Checks: corpus determinism + shape, rows-payload parsing, batch splitting caps, the batch fit. `--manifests` writes 2k/10k/25k/drop manifests (never into git).
  */
-import { createHash } from "node:crypto";
-import { createServer, type ServerResponse } from "node:http";
-import * as Y from "yjs";
-import { candidateDigestMaterial } from "../../../server/src/shared/candidateDigest";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { flagStr, parseArgs } from "../lib/common";
-import { candidateRequest, fetchRows, parseRowsPayload, rowsDelta, splitBatches } from "./adapters";
-import { merge3, mergeNoBase } from "./diff3";
-import { dlChecks, DL_BULK_SKIPPED } from "./realScenarios";
-import { applyMinimalDiff, MERGE_CASES, mergeModulePath, runMergeCases } from "./scenarios";
+import { buildCorpus, corpusDigest, corpusStats, manifestJson, noteText, presetSpec, rng } from "./corpus";
+import { parseRowsPayload, rowsDelta, splitBatches, type CreateInput } from "./adapters";
+import { applyMinimalDiff, fitBatches } from "./scenarios";
+import * as Y from "yjs";
 
 let failures = 0, checks = 0;
 function ok(cond: unknown, what: string) { checks++; if (!cond) { failures++; console.error(`FAIL ${what}`); } }
 
-/** Deterministic PRNG (mulberry32) for the diff3 property run. */
-function rng(seed: number) {
-	let a = seed >>> 0;
-	const next = () => { a = (a + 0x6d2b79f5) >>> 0; let t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
-	return { int: (lo: number, hi: number) => lo + Math.floor(next() * (hi - lo + 1)), pick: <T>(xs: readonly T[]) => xs[Math.floor(next() * xs.length)]! };
-}
-
-// ---------------------------------------------------------------- diff3 properties (harness reference)
+// ---------------------------------------------------------------- corpus
 {
-	const r = rng(0xd1ff3);
-	const words = ["alpha", "beta", "gamma", "delta", "eps", "zeta", "eta", "theta"];
-	const randText = () => Array.from({ length: r.int(0, 12) }, () => r.pick(words)).map((w) => w + "\n").join("");
-	const mutate = (t: string) => {
-		const lines = t.split(/(?<=\n)/).filter(Boolean);
-		const ops = r.int(1, 3);
-		for (let i = 0; i < ops; i++) {
-			const at = r.int(0, lines.length);
-			const op = r.int(0, 2);
-			if (op === 0) lines.splice(at, 0, `new-${r.int(0, 999)}\n`);
-			else if (op === 1 && lines.length) lines.splice(Math.min(at, lines.length - 1), 1);
-			else if (lines.length) lines[Math.min(at, lines.length - 1)] = `chg-${r.int(0, 999)}\n`;
-		}
-		return lines.join("");
-	};
-	for (let i = 0; i < 2000; i++) {
-		const base = randText(), x = mutate(base), y = mutate(base);
-		const m1 = merge3(base, x, base), m2 = merge3(base, base, y), m3 = merge3(base, x, x);
-		ok(m1.kind === "clean" && m1.text === x, `diff3: merge(b,x,b)=x #${i}`);
-		ok(m2.kind === "clean" && m2.text === y, `diff3: merge(b,b,y)=y #${i}`);
-		ok(m3.kind === "clean" && m3.text === x, `diff3: merge(b,x,x)=x #${i}`);
-		const m4 = merge3(base, x, y);
-		if (m4.kind === "clean") {
-			const sym = merge3(base, y, x);
-			ok(sym.kind === "clean" && sym.text === m4.text, `diff3: clean merge symmetric #${i}`);
-		}
-	}
-	ok(merge3("a\nb\nc\n", "a\nX\nc\n", "a\nY\nc\n").kind === "conflict", "diff3: overlapping differing → conflict");
-	ok(mergeNoBase("x", "x").kind === "skip" && mergeNoBase("x", "x\ny").kind === "conflict", "diff3: no-base rules");
-}
-
-// ---------------------------------------------------------------- R1 fixture table
-{
-	ok(MERGE_CASES.length === 15, `R1: 15 fixture cases (got ${MERGE_CASES.length})`);
-	const ref = await runMergeCases(undefined);
-	for (const c of ref.results) ok(c.pass, `R1 fixture ${c.id} (${ref.adapter}): expect ${c.expect} got ${c.got}`);
-	console.log(`R1 fixtures via ${ref.adapter}: ${ref.passed}/${ref.total} pass; adjacent-lines → ${ref.results.find((c) => c.id === "adjacent-lines")?.got}`);
-	const modulePath = mergeModulePath(flagStr(parseArgs(), "merge-module"));
-	if (modulePath) {
-		const fx = await runMergeCases(modulePath);
-		ok(fx.source === "product-module", `R1: module ${modulePath} loaded (${fx.source})`);
-		for (const c of fx.results) ok(c.pass, `R1 fixture ${c.id} (${fx.adapter}): expect ${c.expect} got ${c.got}`);
-		console.log(`R1 merge cases via ${fx.adapter}: ${fx.passed}/${fx.total} pass; adjacent-lines → ${fx.results.find((c) => c.id === "adjacent-lines")?.got}`);
+	const a = buildCorpus(presetSpec("2k", "wb1"), "p"), b = buildCorpus(presetSpec("2k", "wb1"), "p"), c = buildCorpus(presetSpec("2k", "wb2"), "p");
+	ok(corpusDigest(a) === corpusDigest(b), "corpus: same seed → same manifest digest");
+	ok(corpusDigest(a, true) === corpusDigest(b, true), "corpus: same seed → same content digest");
+	ok(corpusDigest(a) !== corpusDigest(c), "corpus: different seed → different digest");
+	const s = corpusStats(a) as Record<string, any>;
+	ok(a.notes.length === 2000 && a.attachments.length === 100, "corpus: 2k counts");
+	ok(a.notes.filter((n) => n.huge).length >= 2 && a.notes.some((n) => n.bytes > 1_750_000), "corpus: >1.75 MB notes present");
+	ok(new Set(a.notes.map((n) => n.path)).size === a.notes.length, "corpus: unique note paths");
+	ok(new Set(a.notes.map((n) => n.bodyId)).size === a.notes.length, "corpus: unique body ids");
+	for (const n of a.notes.slice(0, 200)) ok(Buffer.byteLength(noteText(n, a)) === n.bytes, `corpus: exact byte length ${n.path}`);
+	const sorted = a.notes.map((n) => n.bytes).sort((x, y) => x - y);
+	const p50 = sorted[Math.floor(sorted.length / 2)]!;
+	ok(p50 > 1500 && p50 < 2800, `corpus: median ~2 KB (got ${p50})`);
+	ok(a.notes.filter((n) => !n.huge).every((n) => n.bytes <= 200 * 1024), "corpus: non-huge tail ≤ 200 KB");
+	ok(a.folders.some((f) => f.split("/").length >= 3), "corpus: nested folders");
+	const d = buildCorpus(presetSpec("drop", "wb1"), "p");
+	ok(d.notes.length === 200 && d.attachments.length === 50 && d.attachments.every((x) => x.mime === "image/png"), "corpus: drop set 200 + 50 png");
+	ok(!d.notes.some((n) => a.notes.some((m) => m.path === n.path)), "corpus: drop paths disjoint from 2k");
+	const t = buildCorpus(presetSpec("10k", "wb1"), "p"), u = buildCorpus(presetSpec("25k", "wb1"), "p");
+	ok(t.notes.length === 10000 && u.notes.length === 25000, "corpus: 10k/25k counts");
+	console.log(`corpus 2k: ${JSON.stringify({ digest: corpusDigest(a).slice(0, 12), p50: s.noteBytes?.p50 ?? p50, folders: a.folders.length })}`);
+	const dir = flagStr(parseArgs(), "manifests");
+	if (dir) {
+		mkdirSync(dir, { recursive: true });
+		for (const [name, corpus] of [["2k", a], ["10k", t], ["25k", u], ["drop", d]] as const)
+			writeFileSync(join(dir, `manifest-${name}.json`), JSON.stringify(manifestJson(corpus), null, 1));
+		console.log(`manifests → ${dir}`);
 	}
 }
 
-// ---------------------------------------------------------------- rows payloads + deltas
+// ---------------------------------------------------------------- rows payloads
 {
 	const cases: Array<[unknown, number | null, number | null]> = [
 		[{ rowsWritten: 10, rowsRead: 4 }, 10, 4],
@@ -85,80 +57,29 @@ function rng(seed: number) {
 		[{ nothing: true }, null, null],
 	];
 	for (const [v, w, rd] of cases) { const p = parseRowsPayload(v); ok(p.rowsWritten === w && p.rowsRead === rd, `rows payload ${JSON.stringify(v)} → ${JSON.stringify(p)}`); }
-	const base = { rowsWritten: 100, rowsRead: 10, source: "debug-route", exact: true, at: 0, wall: 0 } as const;
-	const d = rowsDelta(base, { ...base, rowsWritten: 130, rowsRead: 12, at: 1 });
+	const base = { rowsWritten: 100, rowsRead: 10, source: "debug-route", exact: true, at: 0, ms: 1 } as never;
+	const d = rowsDelta(base, { rowsWritten: 130, rowsRead: 12, source: "debug-route", exact: true, at: 1, ms: 1 } as never);
 	ok(d.rowsWritten === 30 && !d.counterReset, "rowsDelta simple");
-	ok(rowsDelta(base, { ...base, rowsWritten: 5, rowsRead: 1, at: 1 }).counterReset, "rowsDelta flags counter reset (DO restart)");
+	const reset = rowsDelta(base, { rowsWritten: 5, rowsRead: 1, source: "debug-route", exact: true, at: 1, ms: 1 } as never);
+	ok(reset.counterReset, "rowsDelta flags counter reset (DO restart)");
 }
 
-// ---------------------------------------------------------------- rows read survives wrangler-dev proxy parking
+// ---------------------------------------------------------------- batching + fit + minimal diff
 {
-	let parked: ServerResponse | null = null, served = 0;
-	const srv = createServer((req, res) => {
-		if (req.url === "/park" && served === 0 && !parked) { parked = res; return; }
-		const prev = parked as ServerResponse | null; parked = null;
-		if (prev && !prev.destroyed) prev.end(JSON.stringify({ released: true }));
-		served++; res.end(JSON.stringify({ rowsWritten: 42 }));
-	});
-	await new Promise<void>((done) => srv.listen(0, "127.0.0.1", done));
-	const port = (srv.address() as { port: number }).port;
-	let timeouts = 0;
-	const t0 = Date.now();
-	const r = await fetchRows(`http://127.0.0.1:${port}/park`, {}, () => timeouts++, 300);
-	const body = await r.json() as { rowsWritten?: number };
-	ok(r.ok && body.rowsWritten === 42, `fetchRows: retry answered after parking ${JSON.stringify(body)}`);
-	ok(timeouts === 1, `fetchRows: one timeout counted (got ${timeouts})`);
-	ok(Date.now() - t0 < 5000, `fetchRows: bounded by the timeout (${Date.now() - t0} ms)`);
-	let hardFail = false;
-	await fetchRows(`http://127.0.0.1:1/x`, {}, () => {}, 300).catch(() => { hardFail = true; });
-	ok(hardFail, "fetchRows: non-timeout errors propagate");
-	srv.closeAllConnections(); srv.close();
-}
-
-// ---------------------------------------------------------------- DL closed-file candidate probe shape + minimal diff
-{
+	const items: CreateInput[] = Array.from({ length: 1203 }, (_v, i) => ({ kind: "note", path: `n${i}.md`, bodyId: `b${i}`, content: "x".repeat(i === 7 ? 5_000_000 : 3000) }));
+	const batches = splitBatches(items, 500, 4 * 1024 * 1024);
+	ok(batches.flat().length === items.length, "splitBatches keeps every item");
+	ok(batches.every((b) => b.length <= 500), "splitBatches ≤ 500 files");
+	const big = batches.find((b) => b.some((x) => x.kind === "note" && x.content.length === 5_000_000));
+	ok(big?.length === 1, "splitBatches: oversize item travels alone");
+	ok(batches.filter((b) => b !== big).every((b) => b.reduce((s, x) => s + (x.kind === "note" ? x.content.length : x.bytes.byteLength), 0) <= 4 * 1024 * 1024), "splitBatches ≤ 4 MB");
+	const fit = fitBatches([{ notes: 500, attachments: 0, rows: 2005 }, { notes: 300, attachments: 0, rows: 1205 }, { notes: 100, attachments: 0, rows: 405 }]);
+	ok(fit && Math.abs(fit.rowsPerNote - 4) < 0.01 && Math.abs(fit.rowsPerBatch - 5) < 0.01, `fitBatches ${JSON.stringify(fit)}`);
+	const fit2 = fitBatches([{ notes: 500, attachments: 10, rows: 2005 + 30 }, { notes: 300, attachments: 0, rows: 1205 }, { notes: 100, attachments: 40, rows: 405 + 120 }, { notes: 50, attachments: 5, rows: 205 + 15 }]);
+	ok(fit2 && Math.abs(fit2.rowsPerAttachment! - 3) < 0.01, `fitBatches with attachments ${JSON.stringify(fit2)}`);
 	const doc = new Y.Doc(); const t = doc.getText("body"); t.insert(0, "hello brave new world");
-	const got: Uint8Array[] = []; doc.on("update", (u: Uint8Array) => { got.push(u); });
 	const r = applyMinimalDiff(t, "hello cruel new world");
 	ok(t.toString() === "hello cruel new world" && r.deleted === 5 && r.inserted === 5, `applyMinimalDiff ${JSON.stringify(r)}`);
-	const update = got.length === 1 ? got[0]! : Y.mergeUpdates(got);
-	const req = candidateRequest("b-1", 3, update, "cand-1");
-	const serverDigest = createHash("sha256").update(candidateDigestMaterial([update])).digest("hex");
-	ok(req.headers["x-yaos-candidate-digest"] === serverDigest, "DL probe: digest = server candidateDigestMaterial (single frame)");
-	ok(req.path === "body/b-1/candidate" && req.headers["x-yaos-body-epoch"] === "3" && req.headers["content-type"] === "application/octet-stream",
-		"DL probe: route + headers match VaultServerPort.submitCandidate");
-	const batches = splitBatches(Array.from({ length: 25 }, (_v, i) => i), 10, 1_000_000, () => 1);
-	ok(batches.length === 3 && batches.flat().length === 25 && batches.every((b) => b.length <= 10), "splitBatches ≤ maxFiles, keeps every item");
-}
-
-// ---------------------------------------------------------------- DL verdict
-{
-	const typed503 = { status: 503, retryAfter: "3600", body: { error: "cf_daily_limit", resetAt: Date.now() + 3_600_000 } };
-	const good = () => ({
-		typing: { raw: { vaultErrors: 1, firstVaultError: { type: "VAULT_ERROR", code: "cf_daily_limit" } },
-			realClient: { http503Sample: [], vaultErrorSample: [], vaultErrors: 0, onDailyLimit: [{ atMsAfterEnable: 10 }] } },
-		candidateProbeWhileLimited: { status: 503, retryAfter: "3600", value: typed503.body },
-		typingNoLoss: { convergence: { pass: true } },
-		bulk: { skipped: DL_BULK_SKIPPED, realClientDailyLimitState: null, realClient503: [] } as Record<string, unknown>,
-		trippedClientClose: { destroyMs: 12, destroyTimedOut: false }, finalClientClose: { destroyMs: 8, destroyTimedOut: false },
-		unhandledRejections: { count: 0, distinct: [] },
-	});
-	const skipped = dlChecks(good());
-	ok(skipped.assertionsPass && skipped.noLoss, `DL verdict: bulk skipped + all typed signals → pass ${JSON.stringify(skipped.checks)}`);
-	ok(skipped.notApplicable.includes("createBulkTyped503") && skipped.notApplicable.includes("bulkNoLossAfterDisable"), "DL verdict: bulk checks n/a when skipped");
-	const hung = good(); hung.trippedClientClose.destroyTimedOut = true;
-	ok(!dlChecks(hung).assertionsPass, "DL verdict: destroy timeout while tripped → fail");
-	const hungFinal = good(); hungFinal.finalClientClose.destroyTimedOut = true;
-	ok(!dlChecks(hungFinal).assertionsPass, "DL verdict: final close timeout → fail");
-	const rej = good(); rej.unhandledRejections.count = 1;
-	ok(!dlChecks(rej).assertionsPass, "DL verdict: unhandled rejection → fail");
-	const untyped = good(); untyped.candidateProbeWhileLimited = { status: 503, retryAfter: "", value: { error: "body_persistence_unavailable" } } as never;
-	ok(!dlChecks(untyped).assertionsPass, "DL verdict: untyped 503 → fail");
-	const withBulk = good(); withBulk.bulk = { http503Probes: [typed503], missingAfterRetry: 0, realClientDailyLimitState: null, realClient503: [] };
-	const wb = dlChecks(withBulk);
-	ok(wb.assertionsPass && wb.notApplicable.length === 0, "DL verdict: bulk present, typed 503, nothing missing → pass");
-	const lost = good(); lost.bulk = { http503Probes: [typed503], missingAfterRetry: 2, realClientDailyLimitState: null, realClient503: [] };
-	ok(!dlChecks(lost).noLoss && !dlChecks(lost).assertionsPass, "DL verdict: bulk notes missing after retry → fail");
 }
 
 console.log(`${checks - failures}/${checks} checks passed`);
