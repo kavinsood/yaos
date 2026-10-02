@@ -1,0 +1,19 @@
+scripts/relay2/wb/wbmodel.py
+  s_10751b4e7b6e44::t_3de4bd5a0fa883 31-47,139-140,146,149-150,153-154,168-170,183,188-190,193-196,200-212,214,216,220-224,228-251,254-270,276-284,286-294,296-298,302-305,311-312,315-324,328-329,331-332,334-335,338,348,364-367
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "1a56c79e3140209d54d82f7b5d23e121cac35902",
+  "prompts": {},
+  "sessions": {
+    "s_10751b4e7b6e44": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-abc5124919d4c6f6e",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
