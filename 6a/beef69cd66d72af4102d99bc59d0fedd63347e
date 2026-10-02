@@ -1,0 +1,39 @@
+server/src/recoveryAuthorityStore.ts
+  s_3c20a746b820c6::t_0f97eacf5dfd85 38,86-109,1049-1052,1054,1057-1065,1067-1070,1074-1292,1316,1379,1383,1401,1407,1471,1482,1730,1734
+server/src/recoveryExecutor.ts
+  s_42343c074f2618::t_370201dbd840c6 135,283
+server/src/recoveryJobState.ts
+  s_42343c074f2618::t_5e6cb3348b51a2 5
+server/src/recoveryManifestTree.ts
+  s_42343c074f2618::t_8bb2577f079022 561
+server/src/recoveryProtocol.ts
+  s_42343c074f2618::t_a64bf67f96ccb5 170-171
+server/src/recoveryRpcRouter.ts
+  s_42343c074f2618::t_198da508929b7d 17-18,21,45-46,49,126
+server/src/vaultDocumentStore.ts
+  s_42343c074f2618::t_e39375b2bbd7f6 981-984,986-989
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "6abeef69cd66d72af4102d99bc59d0fedd63347e",
+  "prompts": {},
+  "sessions": {
+    "s_3c20a746b820c6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a2b43feb19d9e9a0e",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_42343c074f2618": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a2c0077a38f8fdd35",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
