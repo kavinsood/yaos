@@ -20,12 +20,20 @@ typing burst.
 
 **B1. Share now, save in groups, confirm after saving** (`RelayBodyService.groupEnqueue` / `flushGroup`).
 
-- A frame is checked exactly as in v2: authority, envelope, receipt dedupe and rate budget.
+- Every message of a relay socket is first charged to the socket's rate budget on its raw size (R12, below).
+  Then a frame is checked as in v2: authority, envelope and receipt dedupe.
 - After the check, the frame is broadcast at once and buffered under its (body, epoch).
 - The buffer is committed in one `transactionSync` when the first of these happens:
-  - `YAOS_RELAY_GC_IDLE_MS` passes with no new frame (default 300)
+  - `YAOS_RELAY_GC_IDLE_MS` passes with no new frame (default 300) **and** at least
+    `YAOS_RELAY_GC_MIN_INTERVAL_MS` (default 1000; 0 = off) has passed since the body's previous commit
   - `YAOS_RELAY_GC_MAX_MS` passes after the first frame (default 1500)
   - the buffer reaches `YAOS_RELAY_GC_MAX_BYTES` (default 65536; this flush is synchronous)
+  - a forced flush: HTTP candidate/currentness read, authority fence, semantic reset (immediate)
+- Commit-rate cap (commit 4a34f56): the idle timer is re-armed on every frame at
+  max(last frame + idle, previous commit + min interval). A deferred idle commit is therefore scheduled
+  for previous commit + min interval; it never waits for the next frame. Idle commits of a body are at
+  least 1 s apart whatever the typing rhythm, and every frame still waits at most `GC_MAX_MS`. Without
+  the cap, typing with gaps over 300 ms (1–3 keys/s, mobile, pauses) committed once per frame.
 - Both timers use `setTimeout`. v3 never calls `setAlarm` per commit.
 - At flush, these checks run again:
   - G2 revocation: the frame is dropped and the socket closed with 4403
@@ -171,6 +179,67 @@ inferred and have not been run on a deployment:
 
 For the HTTPSAVE shape (one POST every 5 s to one closed note), that is (6 × 3 + 5 + 1) / 6 ≈ 4.0 rows
 per POST. Tail checkpoints add about 12 rows per 512 records or 64 KB.
+
+Typing rhythm, one body, one device, 30 s per pattern. Local virtual-time accounting
+(`tests/server/relay3-group-commit.ts`, "commit-rate cap"), inferred and not deployed. Rows are
+3 per commit (tail, head, receipt ring) with candidate ids:
+
+| Pattern | Rows/keystroke without cap | With cap (1000 ms) | Max commits/s (without / with) | Receipt p50 / max with cap |
+| --- | --- | --- | --- | --- |
+| 1 key/s | 3.00 | 3.00 | 1 / 1 | 300 / 300 ms |
+| 2 keys/s | 3.00 | 1.55 | 2 / 1 | 800 / 800 ms |
+| 3 keys/s | 3.00 | 1.03 | 3 / 1 | 633 / 967 ms |
+| 5 keys/s | 0.38 | 0.38 | 1 / 1 | 900 / 1,500 ms |
+| 8 keys/s | 0.25 | 0.25 | 1 / 1 | 875 / 1,500 ms |
+| Bursty, gaps 100–2000 ms | 2.61 | 2.23 | 2 / 1 | 300 / 1,362 ms |
+
+At or below 1 key/s the cap cannot help: one commit per keystroke is already one per second, so the
+cost is 3 rows per keystroke (3 rows per second of typing). The cap bounds rows per second of activity
+at 3 per body, not rows per keystroke.
+
+## Rate limit (R12, commit 4a34f56)
+
+Why B7-v3 closed the flooder late (code reading; the deployed timings are measured, the cause is
+inferred):
+
+- The bucket was checked at step 4 of `handleSyncFrame`. Before it, every frame paid: attachment
+  parse; for text, `JSON.parse` of the envelope (envelopes were never charged); outer and sync
+  decode; SHA-256 of the whole update when an envelope was pending; the authority check; and a
+  `candidateReceipt` SQL read when the envelope had a candidate id.
+- It charged `update.byteLength` only. Envelopes, step1, empty frames and dedupe hits (replays)
+  were free.
+- After the 1013, the close takes time to complete, and frames already queued kept arriving.
+  Each one still paid the decode and the digest before the failed-socket check. On v2 there was
+  no failed-socket mark at all.
+- Each accepted 64 KiB frame hits the 64 KB bytes cap, so it triggers a synchronous group commit
+  and often a tail checkpoint (a merge of a growing body). The DO is single-threaded, so it
+  processed the flooder's queue more slowly than the queue filled. The bucket measures processing
+  time, so the overdraft frame was reached only after the backlog: 43 s and 63 MB in a3. In a1,
+  Cloudflare shed the DO (`1013 Service overloaded`) first.
+- The bucket is per socket and starts full on every new socket.
+
+The fix:
+
+- `VaultSocketService.message` calls `relay.admitKnown` as its very first step: a WeakMap lookup by
+  socket object, the refused flag, a size compare and the bucket arithmetic. The first message of a
+  socket in a runtime parses the attachment once, then calls `admitRelay` (bucket keyed by socket id).
+- Every message is charged its raw size: bytes for binary, UTF-16 units for text.
+- The hard size cap is checked at the same point (binary 1,750,064 B, text 64 KiB; close 1009).
+- On the first overdraft: `VAULT_BACKPRESSURE`, close 1013 `relay rate limit`, and the cumulative-ack
+  fence (`markFailed`): frames buffered before it still commit and ack, nothing later is acked.
+  Every later message of the socket is dropped in O(1) (`rawGateDrops`): no parse, decode, digest,
+  authority check or broadcast. A dropped sync update still counts in `updateFrames` and
+  `failedSocketDrops` (a 5-byte peek), so the outcome sum holds.
+- The burst floor is now `MAX_DURABLE_UPDATE_BYTES + 64 + 64 KiB`, so one maximum raw frame plus its
+  envelope always fits.
+- There is no earlier hook. After the upgrade, Cloudflare delivers WebSocket messages straight to the
+  Durable Object; they never pass through the Worker. Platform shedding (`Service overloaded`) of a deep
+  inbound queue cannot be prevented in the DO, only made less likely by cheap drops.
+- Local (virtual time): 5 MiB/s of 64 KiB frames at the defaults (256 KiB/s, ~1.82 MB burst) closes the
+  flooder after 375 ms of input. About 29 frames (≈ the burst) are accepted with full work. Bystander
+  frames on the same body all commit, ack and broadcast. Not deployed.
+- Still open: per-socket (not per-device) budget; a fresh burst on reconnect. Envelopes and replays are
+  now charged, so a reconnect resend backlog above the burst gets a 1013 and is resent later.
 
 ## Test-only crash route
 

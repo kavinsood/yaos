@@ -98,11 +98,17 @@ Conditions (v3):
    device's pre-revocation frames reached peers and were dropped at flush. Now the revocation and authority-fence
    paths flush every group-commit buffer in the same DO turn, before the authority write. A frame admitted after
    the fence is refused (4403) before any broadcast. Re-run B4-v3 before default-on.
-2. **Re-run B7 serially on an idle machine (R12).** It passed 1 of 3. In one attempt Cloudflare shed the
-   bystander with `1013 Service overloaded` before our rate limit closed the flooder.
+2. **R12: fixed locally (4a34f56), not re-measured on a deployment.** B7-v3 passed 1 of 3. In one attempt
+   Cloudflare shed the bystander with `1013 Service overloaded` before our rate limit closed the flooder. The
+   bucket was checked late (after decode, digest and a SQL read) and charged update bytes only. Now every message
+   is charged its raw size as the first step of the DO message handler, and later messages of a refused socket
+   are dropped in O(1). Locally (virtual time) the 5 MiB/s flooder is closed after 375 ms of input. Re-run B7-v3
+   serially before default-on.
 3. **B5 send-coalescing was measured and removed (R13).** At idle = 300 ms it gave 1.53 rows/keystroke vs 0.29
    (v3nc) and added about 280 ms to propagation, so the client has no coalescing knob. Parameters stay at
-   300 ms idle / 1.5 s max / 64 KB.
+   300 ms idle / 1.5 s max / 64 KB, plus a commit-rate cap (4a34f56, `YAOS_RELAY_GC_MIN_INTERVAL_MS` = 1000):
+   an idle commit waits until 1 s after the body's previous commit. Without it, typing at 2–3 keys/s committed
+   per keystroke (3.00 rows/key, local accounting); with it 1.55 / 1.03 (inferred, section 9.1 note).
 4. v2 conditions 3–5 still apply (receipts in `VaultSync`, which are now landed and measured in L5; reset
    starvation; receiving-side validation). v2 condition 1 (lean rows mandatory) is **retired** by v3. v3 requires
    lean rows by construction, and rows are no longer near the cap. v2 condition 2 (p99 tails) is **largely
@@ -335,10 +341,12 @@ the frame-0 attribution row and the per-append catalog event.
 Full design: [`relay3-group-commit.md`](relay3-group-commit.md) (code through `fd52578`). v3 needs
 `YAOS_RELAY_BODIES=true` and `YAOS_RELAY_LEAN_ROWS=true`. With the flag off, the schema and every path are v2.
 
-- **Share now, save in groups, confirm after saving.** Admission is unchanged: size, envelope, authority, dedupe and
-  rate budget. Then the frame is **broadcast at once** and buffered per (body, epoch). The buffer commits in one
-  `transactionSync` after 300 ms idle (`YAOS_RELAY_GC_IDLE_MS`), 1.5 s after the first frame (`_MAX_MS`), or at
-  64 KB (`_MAX_BYTES`, synchronous). At flush the checks run again: G2 authority, epoch, B6 dedupe, in-buffer
+- **Share now, save in groups, confirm after saving.** Every message is first charged to the socket's rate budget
+  on its raw size (R12). Admission is then as in v2: size, envelope, authority and dedupe. The frame is
+  **broadcast at once** and buffered per (body, epoch). The buffer commits in one `transactionSync` after 300 ms
+  idle (`YAOS_RELAY_GC_IDLE_MS`) and at least 1 s after the body's previous commit (`_MIN_INTERVAL_MS`), 1.5 s
+  after the first frame (`_MAX_MS`), or at 64 KB (`_MAX_BYTES`, synchronous). HTTP reads, the authority fence
+  and semantic resets flush at once. At flush the checks run again: G2 authority, epoch, B6 dedupe, in-buffer
   duplicates and the growth cap. Receipts (`BODY_COMMITTED`, v2 wire format) go out after the commit returns.
 - **Rows.** One `relay_body_tail` row per body (WITHOUT ROWID, records since the last checkpoint), one
   `relay_device_receipts` row per device (a 256-entry JSON ring, 15 min TTL), and the head update. No journal row,
@@ -470,8 +478,9 @@ typing-second are ≈ 2 × 0.65 = 1.3 (counter) / 1.45 (gql), whatever the key r
 
 | Budget | Default | Enforced at |
 |---|---|---|
-| Frame size | 1,750,000 B | `handleSyncFrame` (close 1009) |
-| Per-socket rate / burst | 256 KiB/s; burst `max(1 MiB, 1.75 MB)` | `consumeTokens` (close 1013) |
+| Frame size | 1,750,000 B (+64 outer); text 64 KiB | raw gate, first step of `VaultSocketService.message` (close 1009) |
+| Per-socket rate / burst | 256 KiB/s on raw message bytes, envelopes included; burst `max(1 MiB, 1,750,064 B + 64 KiB)` | raw gate (`admitKnown`; close 1013, later messages dropped O(1)) |
+| Group-commit min interval | 1,000 ms (`YAOS_RELAY_GC_MIN_INTERVAL_MS`, 0 = off) | idle timer (forced flushes exempt) |
 | Micro-batch window | 0 ms (clamped 0..250; full-run relay config 10) | `handleSyncFrame` / batch timer |
 | Relay + semantic sockets per vault | 5,000 | `acceptRelayBody` (429) |
 | Merged-bytes cache | 16 MiB LRU | `remember` |
@@ -578,7 +587,7 @@ Errors: 409 for `lease_invalid`, `lease_expired`, `epoch_mismatch`, `head_advanc
 | Hibernation survival | Base closes with 1008 after eviction (runtime-epoch fence) | Relay socket survives | Idle product shape. |
 | Revocation, membership, namespace, lifecycle, root doc | Authoritative server | **Unchanged**, authoritative server | Authority lives in the namespace. |
 | Canvas semantic documents | Server-validated semantic docs | **Unchanged** | Out of scope. |
-| Rate limiting | Cache pressure and backpressure | Per-socket token bucket, then 1013 `relay rate limit` (distinct from platform `Service overloaded`) | Explicit budget. |
+| Rate limiting | Cache pressure and backpressure | Per-socket token bucket on raw bytes, checked first in the DO message handler, then 1013 `relay rate limit` (distinct from platform `Service overloaded`). After the upgrade, WebSocket messages go straight to the DO and never pass the Worker, so there is no earlier enforcement point. | Explicit budget. |
 | Socket cap | 32 (memory envelope) | 5,000 (config) | Bytes, not docs. |
 
 ## 6. Invariants
@@ -920,6 +929,15 @@ Inputs: base_rows_per_edit=5.58, relay_rows_per_edit=5.63, v3_rows_per_edit=0.29
   POST drops to 3 rows (≈ 4.0 amortized with the alarm-coalesced catalog event). Scaling the measured 82,393 rows by
   4.0 / 13.82 gives ≈ 24k rows, about 24% of Free for autosave-8h closed note. This is arithmetic only; re-measure
   HTTPSAVE before relying on it.
+- **Typing rhythm (local accounting, inferred; added with 4a34f56).** The 0.29 rows/edit input is a best case:
+  steady typing at 5 keys/s, where most commits happen on max-wait. Before the commit-rate cap, any gap over 300 ms
+  committed, so typing at 1–3 keys/s cost one commit per keystroke: 3.00 rows/key with candidate ids, about 2 without.
+  Applying that to the heavy shape (57,600 frames, 2 keys/s for 8 h) would give ≈ 115k–173k rows, over Free. With
+  the cap (idle commits ≥ 1 s apart per body), local virtual-time accounting gives 1.55 rows/key at 2 keys/s,
+  1.03 at 3, 0.38 at 5, 0.25 at 8 and 2.23 for bursty 100–2000 ms gaps (candidate ids). That bounds a body at
+  3 rows per second of activity. The heavy shape at 2 keys/s becomes ≈ 89k rows with candidate ids
+  (arithmetic, not measured). The rows/edit inputs above should be re-measured at 1–3 keys/s before relying on
+  the 18% heavy figure.
 - **DO requests are not changed by v3** (1.15× base typical, 1.34× heavy, both ≤ 11% of Free). R10 stands as in
   v2. B5 would bring DO requests to 0.96–0.99× base, but at 4.9× the rows (R13).
 
@@ -1157,8 +1175,26 @@ transport/platform plus the raw harness client, not server merge logic (section 
     `1013 Service overloaded`. a2 was inconclusive (1006 right after a redeploy).
   - Suspect: every ≥ 64 KB frame triggers a synchronous byte-cap commit, and admission keeps accepting (and
     broadcasting) while the commits back up.
-  - Needs a serial re-run on an idle machine, plus a check that the token bucket is debited at admission, not at
-    flush.
+  - Cause (code reading; the timings above are measured, the cause is inferred): the bucket was checked at
+    step 4 of `handleSyncFrame`. Before it, each frame paid the attachment parse, `JSON.parse` of the envelope
+    (envelopes were never charged), decode, SHA-256 of the whole update, the authority check and a
+    `candidateReceipt` SQL read. It charged `update.byteLength` only (envelopes, step1, empty frames and replays
+    were free). Each 64 KiB frame also hit the 64 KB cap and committed synchronously. So the DO processed the
+    queue more slowly than it filled, and the bucket (which refills over processing time) reached overdraft only
+    after the backlog. After the close, queued frames still paid decode and digest (v2 had no failed-socket mark).
+  - **Fixed locally (4a34f56):** `VaultSocketService.message` charges the raw message size as its first step: a
+    WeakMap lookup by socket, the size cap (1009) and the bucket. On the first overdraft: backpressure, close 1013
+    `relay rate limit` and the cumulative-ack fence. Every later message of that socket is dropped in O(1), with
+    no parse, decode, digest, authority check or broadcast. WebSocket messages bypass the Worker after the
+    upgrade, so this is the earliest point there is.
+  - Local (virtual time, defaults): a 5 MiB/s flood of 64 KiB frames is closed after 375 ms of input. 740 later
+    messages are dropped in O(1), and bystander frames on the same body all commit, ack and broadcast. A DO-level
+    test uses spies to assert that drops never reach attachment parse, frame handling or authority. Not deployed.
+  - Still open: about one burst (≈ 1.8 MB) of frames is accepted with full work; a deep inbound queue can still
+    make the platform shed the DO; the budget is per socket, not per device, and a reconnect gets a fresh burst.
+    Envelopes and replays are now charged, so a reconnect resend backlog above the burst is refused (1013) and
+    resent later.
+  - Re-run B7-v3 serially on an idle machine.
 - **R13 — v3: B5 send-coalescing defeats group commit at idle = 300 ms (measured).** With B5 at 250 ms, wire frames
   are ≥ 250 ms apart. The 300 ms idle timer then fires between most of them: MB type5 went from 70 to 275 commits,
   0.38 → 1.50 rows/edit (3.9×), and added 250 ms to propagation (L2 48 → 301 ms p50). Keep B5 off. If it is ever
@@ -1225,7 +1261,7 @@ config:
 | # | Status | Evidence |
 |---|---|---|
 | 1 | not triggered | L2 p50 299 → 47.7 ms (6.3×), p99 696 → 76.3 ms ([conc], n = 290). The receipt is slower by design (p50 350 ms, R14) |
-| 2 | not triggered, and the margin is now large | v3 is 3% typical and 18% heavy (inferred); 0.29 rows/edit vs v2 5.63. Condition 1 of section 1 (lean mandatory) is retired |
+| 2 | not triggered, and the margin is now large | v3 is 3% typical and 18% heavy (inferred); 0.29 rows/edit vs v2 5.63 (a 5 keys/s best case; slower typing cost up to 3 rows/key before the 4a34f56 commit-rate cap, section 9.1). Condition 1 of section 1 (lean mandatory) is retired |
 | 3 | **unchanged: exceeded on the letter; needs sign-off** | group commit does not change WS messages. Model 1.15× base typical, 1.34× heavy (inferred), ≤ 11% of Free. R10 is unchanged |
 | 4 | **triggered on the letter at measurement (B4 convergence); fixed locally, re-measure pending** | invariant 4 holds (0 appends after the fence). At measurement, a revoked device's pre-fence frames were broadcast and then dropped at flush, so 10 frames diverged (R11). d3b4db8 flushes before the fence and commits rather than drops at flush; local tests converge. Not re-run deployed. Convergence suite 9/9, CRASH 10/10 with 0 lost, FENCE 6/6 refused rounds safe. B7 1/3 (R12) |
 | 5 | not measured for v3 | C1 not re-run. The v3 flush is one batch per 300 ms–1.5 s, so per-append CPU is no worse than v2 (inferred) |
