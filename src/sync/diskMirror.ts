@@ -25,7 +25,8 @@ import {
 } from "../runtime/reconcile/markdownConflictArtifact";
 import { PreservedUnresolvedRegistry, type PreservedUnresolvedEntry, type PreservedUnresolvedReason } from "./preservedUnresolved";
 import { safeMarkdownPath } from "./pathPolicy";
-import { mergeThreeWayText, type ThreeWayMergeResult } from "./threeWayMerge";
+import { type ThreeWayMergeResult } from "./threeWayMerge";
+import { mergeThreeWayLines } from "./lineMerge";
 import type { BodySettlementRead, DiskSettlementFingerprint } from "./bodySettlement";
 export { isLocalOrigin };
 
@@ -949,7 +950,7 @@ export class DiskMirror {
 			let merge: ThreeWayMergeResult;
 			let composeMerged = (merged: string): string => merged;
 			if (base === null) {
-				merge = mergeThreeWayText(canonicalizeMarkdown(input.baseContent ?? ""), diskContent, content);
+				merge = mergeThreeWayLines(canonicalizeMarkdown(input.baseContent ?? ""), diskContent, content);
 			} else if (base.settlement.format === 2 && base.settlement.agreement === "body-only") {
 				const diskComponents = splitMarkdownComponents(diskContent);
 				const remoteComponents = splitMarkdownComponents(content);
@@ -958,14 +959,14 @@ export class DiskMirror {
 					this.recordPreservedUnresolved(path, "body-settlement-failed");
 					return "preserved-unresolved";
 				}
-				merge = mergeThreeWayText(
+				merge = mergeThreeWayLines(
 					base.settlement.bodyBase.content,
 					diskComponents.body,
 					remoteComponents.body,
 				);
 				composeMerged = (merged) => composeMarkdownComponents(remoteComponents.propertiesRegion, merged);
 			} else {
-				merge = mergeThreeWayText(base.settlement.content, diskContent, content);
+				merge = mergeThreeWayLines(base.settlement.content, diskContent, content);
 			}
 			if (merge.kind === "too-large") {
 				this.settlement.markDivergence?.(bodyId, "preserved");

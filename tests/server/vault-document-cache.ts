@@ -21,6 +21,7 @@ import { VaultRuntime } from "../../server/src/server";
 import { materializeCanvasDocument } from "../../server/src/crdt/canvasSemanticDocument";
 import { initializeCanvasDocument } from "../../server/src/shared/canvasSemanticDocument";
 import { suite } from "../harness.ts";
+import { DailyLimitLatch } from "../../server/src/dailyLimit";
 
 const s = suite("vault-document-cache");
 const MIB = 1024 * 1024;
@@ -455,6 +456,8 @@ function flushProbe(
 		} },
 		persistence: { value: new Map() },
 		flushLanes: { value: new Map() },
+		// b3 D8: the flush-failure retry alarm goes through the daily-limit guard.
+		dailyLimit: { value: new DailyLimitLatch() },
 	});
 	return { runtime, events };
 }

@@ -146,6 +146,7 @@ import {
 	getLabelFromConnectionState,
 	renderConnectionState,
 } from "./status/statusBarController";
+import { DAILY_LIMIT_NOTICE, DailyLimitNoticeGate, type DailyLimitInfo } from "./sync/dailyLimit";
 import { CoalescedStatusRefresh } from "./status/coalescedStatusRefresh";
 import { formatUnknown, yTextToString } from "./utils/format";
 import { randomId } from "./utils/randomId";
@@ -1041,6 +1042,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					}
 				},
 				onControlFrame: () => this.queueReceiptStatusRefresh(),
+				onDailyLimit: (info) => this.noticeDailyLimit(info),
 				onSemanticEpochReset: ({ purpose, documentId }) => {
 					// Detach first: validation/rebinding is allowed to fail or retry, but
 					// no editor may remain connected to the Y.Doc retired by the reset.
@@ -2868,7 +2870,16 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			attentionCount,
 			getRecoveryReadiness(this.pendingRecoveryState),
 			resourcePressure,
+			this.vaultSync?.getDailyLimitState() != null,
 		);
+	}
+
+	/** D8: one notice per UTC reset window; the status bar carries the standing state. */
+	private readonly dailyLimitNotices = new DailyLimitNoticeGate();
+
+	private noticeDailyLimit(info: DailyLimitInfo): void {
+		if (this.dailyLimitNotices.trip(info)) new Notice(DAILY_LIMIT_NOTICE, 20000);
+		this.updateStatusBar();
 	}
 
 	/**

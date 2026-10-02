@@ -29,6 +29,7 @@ import { VaultCandidateService } from "../../server/src/vaultCandidateService";
 import { candidateDigestMaterial } from "../../server/src/shared/candidateDigest";
 import type { VaultSocketAttachment, VaultSocketPort } from "../../server/src/vaultSocketService";
 import { VaultStore, type VaultStoragePort } from "../../server/src/vaultStore";
+import { DAILY_LIMIT_ERROR_CODE, DailyLimitLatch, instrumentStorageForDailyLimit } from "../../server/src/dailyLimit";
 import { makeDurableObjectState } from "../mocks/workerEnv.ts";
 import { suite } from "../harness.ts";
 
@@ -134,7 +135,7 @@ interface Harness {
 }
 
 async function withRelay(check: (harness: Harness) => void | Promise<void>, config: Partial<RelayConfig> = {},
-	options: { virtualTime?: boolean } = {}): Promise<void> {
+	options: { virtualTime?: boolean; dailyLimit?: { latch: DailyLimitLatch; simulate: () => boolean } } = {}): Promise<void> {
 	const directory = await mkdtemp(join(tmpdir(), "yaos-relay3-gc-"));
 	const sqlite = NodeSqliteStorage.open(join(directory, "vault.sqlite"));
 	const indexes = new Map<string, Array<{ name: string; columns: string[] }>>();
@@ -174,7 +175,7 @@ async function withRelay(check: (harness: Harness) => void | Promise<void>, conf
 		meter.statements++;
 		meter.byTable[table] = (meter.byTable[table] ?? 0) + rows;
 	};
-	const storage = {
+	const rawStorage = {
 		sql: { exec: (query: string, ...bindings: unknown[]) => {
 			const cursor = sqlite.sql.exec(query, ...bindings);
 			if (meter.on && /^\s*(?:INSERT|UPDATE|DELETE|REPLACE|WITH)\b/i.test(query)) account(query, cursor.rowsWritten);
@@ -182,6 +183,10 @@ async function withRelay(check: (harness: Harness) => void | Promise<void>, conf
 		} },
 		transactionSync: <T>(closure: () => T): T => sqlite.transactionSync(closure),
 	} as unknown as VaultStoragePort;
+	// D8 (b3): the DO instruments storage the same way (server.ts createRuntime).
+	const storage = options.dailyLimit
+		? instrumentStorageForDailyLimit(rawStorage, options.dailyLimit.latch, options.dailyLimit.simulate)
+		: rawStorage;
 	const seed = new Y.Doc({ guid: BODY });
 	const services: RelayBodyService[] = [];
 	try {
@@ -236,7 +241,9 @@ async function withRelay(check: (harness: Harness) => void | Promise<void>, conf
 		let alarmArmed = false;
 		const host: RelaySocketHost = {
 			sockets: () => sockets,
-			sendControl: (socket, value) => socket.send(`__YPS:${JSON.stringify(value)}`),
+			// Like VaultSocketService.sendControl with the DO's decorateControl (D8).
+			sendControl: (socket, value) => socket.send(`__YPS:${JSON.stringify(
+				options.dailyLimit ? options.dailyLimit.latch.decorateControl(value) : value)}`),
 			fenceRelaySocket: (socket) => { socket.close(4409, "semantic epoch mismatch"); },
 			broadcastRelayUpdate: (_bodyId, _epoch, frame, exclude) => {
 				for (const socket of sockets) if (socket.attachment.socketId !== exclude && !socket.closed) socket.send(frame);
@@ -1430,6 +1437,53 @@ async function typing(gaps: number[], minIntervalMs: number): Promise<TypingRun>
 	}, { gcIdleMs: 300, gcMaxMs: 1_500, gcMinIntervalMs: minIntervalMs }, { virtualTime: true });
 	return run!;
 }
+
+s.test("D8: a group flush that hits the daily row limit sends no receipt, types the error, keeps the origin's frames resendable, and arms no alarm/timer loop", async () => {
+	let limited = false;
+	const latch = new DailyLimitLatch();
+	await withRelay(({ store, relay, socket, update, envelope, seed, alarmCalls, advance, tail }) => {
+		const origin = socket();
+		const other = socket(peer);
+		const before = seed.getText("body").toString();
+		const head = store.documentHead(BODY)!.latestSequence;
+		const bytes = textUpdate(seed, (text) => text.insert(0, "limited "));
+		envelope(origin, bytes, { clientFrameId: "dl-1", candidateId: "dl-c1", candidateDigest: "dl-d1" });
+		update(origin, bytes);
+		assert.equal(other.binary.length, 1, "broadcast at receipt, as always");
+		limited = true;
+		const alarmsBefore = alarmCalls.value;
+		advance(120_000); // idle/max timers fire; the flush fails on the limit
+		assert.equal(origin.all("BODY_COMMITTED").length, 0, "no receipt for an uncommitted frame");
+		assert.equal(origin.closed?.code, 1011, "the origin is closed so its client holds and resends later");
+		const error = origin.last("VAULT_ERROR")!;
+		assert.equal(error.code, DAILY_LIMIT_ERROR_CODE, JSON.stringify(error));
+		assert.equal(error.cause, "durability_failed");
+		assert.equal(typeof error.resetAt, "number");
+		assert.equal(latch.active(), true);
+		assert.equal(relay.counters.commitFailures, 1);
+		assert.deepEqual(relay.pendingGroups(), [], "the failed buffer is not retried in a loop");
+		assert.equal(store.documentHead(BODY)!.latestSequence, head, "nothing durable");
+		assert.equal(tail(), null);
+		assert.equal(reconstructedText(store), before);
+		// Time passes while limited: no flush retries, no alarm re-arms.
+		advance(600_000);
+		assert.equal(relay.counters.commitFailures, 1, "no flush retry loop");
+		assert.equal(alarmCalls.value, alarmsBefore, "no checkpoint alarm armed by failed commits");
+		// After the reset (here: the simulation is switched off) the client's resend
+		// of the same candidate on a new socket commits exactly once: nothing was lost.
+		limited = false;
+		const reconnect = socket();
+		envelope(reconnect, bytes, { clientFrameId: "dl-1r", candidateId: "dl-c1", candidateDigest: "dl-d1" });
+		update(reconnect, bytes);
+		relay.flushBatch(BODY);
+		const ack = reconnect.last("BODY_COMMITTED")!;
+		assert.equal(ack.deduped, false);
+		assert.equal(ack.vaultSequence, head + 1);
+		assert.equal(reconstructedText(store), seed.getText("body").toString());
+		assert.equal(latch.active(), false, "the first successful row write clears the latch");
+		assert.equal(outcomes(relay), relay.counters.updateFrames);
+	}, { gcIdleMs: 200, gcMaxMs: 1_000 }, { virtualTime: true, dailyLimit: { latch, simulate: () => limited } });
+});
 
 s.test("commit-rate cap: <= 1 commit/s per body at any typing rhythm; receipt <= gcMaxMs; rows/keystroke before vs after", async () => {
 	const seconds = 30;

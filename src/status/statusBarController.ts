@@ -2,6 +2,7 @@ import type { ConnectionState } from "../runtime/connectionController";
 import type { VaultSyncReceiptSnapshot } from "../sync/vaultSync";
 import type { RecoveryReadiness } from "../snapshots/recoveryState";
 import type { OperationalResourcePressure } from "../runtime/operationalResourceSnapshot";
+import { DAILY_LIMIT_NOTICE, DAILY_LIMIT_STATUS_LABEL } from "../sync/dailyLimit";
 
 
 export type ServerReceiptStatus = Readonly<
@@ -28,6 +29,7 @@ export function getLabelFromConnectionState(
 	attentionCount = 0,
 	recovery?: RecoveryReadiness | null,
 	resourcePressure?: OperationalResourcePressure | null,
+	dailyLimitActive = false,
 ): string {
 	let base: string;
 	switch (state.kind) {
@@ -86,6 +88,11 @@ export function getLabelFromConnectionState(
 	// is exactly what makes this failure invisible.
 	if (serverReceipt?.serverPersistenceDegraded === true) {
 		base = `${base} · Server not saving`;
+	}
+	// D8: ranked with server persistence; the socket may look healthy while
+	// every write is refused until 00:00 UTC.
+	if (dailyLimitActive) {
+		base = `${base} · ${DAILY_LIMIT_STATUS_LABEL}`;
 	}
 	if (recovery) {
 		base = `${base} · Recovery ${recovery}`;
@@ -147,6 +154,7 @@ export function renderConnectionState(
 	attentionCount = 0,
 	recovery?: RecoveryReadiness | null,
 	resourcePressure?: OperationalResourcePressure | null,
+	dailyLimitActive = false,
 ): void {
 	statusBarEl.setText(getLabelFromConnectionState(
 		state,
@@ -155,6 +163,7 @@ export function renderConnectionState(
 		attentionCount,
 		recovery,
 		resourcePressure,
+		dailyLimitActive,
 	));
 	const receiptTitle = serverReceipt && shouldShowReceiptStatus(state)
 		? getServerReceiptStatusTitle()
@@ -165,5 +174,6 @@ export function renderConnectionState(
 	const resourceTitle = resourcePressure?.actionable
 		? `${resourcePressure.label}. ${resourcePressure.guidance}`
 		: "";
-	statusBarEl.setAttr("title", [receiptTitle, recoveryTitle, resourceTitle].filter(Boolean).join(" "));
+	const dailyLimitTitle = dailyLimitActive ? DAILY_LIMIT_NOTICE : "";
+	statusBarEl.setAttr("title", [dailyLimitTitle, receiptTitle, recoveryTitle, resourceTitle].filter(Boolean).join(" "));
 }

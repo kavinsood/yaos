@@ -14,6 +14,10 @@
  *   - No trace calls
  *   - No `this`
  *   - Pure: same inputs → same output
+ *
+ * Merge policy (D4) lives in DiskMirror.settleBody + src/sync/lineMerge.ts;
+ * see the header of src/sync/closedFileConflict.ts. A "create-conflict-artifact"
+ * here means both sides are kept; it is never resolved by a content heuristic.
  */
 
 import {

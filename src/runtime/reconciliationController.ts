@@ -14,6 +14,7 @@ import {
 	trustedContentHash,
 } from "../sync/diskIndex";
 import { mergeThreeWayText } from "../sync/threeWayMerge";
+import { mergeThreeWayLines } from "../sync/lineMerge";
 import {
 	FreshAdmissionCancelledError,
 	FreshAdmissionDurablyPendingError,
@@ -1419,7 +1420,8 @@ export class ReconciliationController {
 		}
 		if (base !== null) {
 			if (base === bodyContent) return { kind: "import", content: diskContent };
-			const merge = mergeThreeWayText(base, diskContent, bodyContent);
+			// D4: disk-vs-server reconcile merges by line (diff3), like closed files.
+			const merge = mergeThreeWayLines(base, diskContent, bodyContent);
 			if (merge.kind === "clean") {
 				this.deps.log(`syncFileFromDisk: "${path}": merged disk and body on their base in place`);
 				return { kind: "import", content: merge.content };

@@ -411,6 +411,8 @@ export const bodyUpdateFrontmatterSemanticError = bodyUpdateAdmissionError;
 
 export interface SocketServiceOptions {
 	crdtEngine: CrdtEngine;
+	/** Rewrites outgoing control frames (D8 daily-limit typing); identity when absent. */
+	decorateControl?: (value: unknown) => unknown;
 	sockets: VaultSocketRegistryPort;
 	cache: VaultDocumentCache;
 	vaultId: () => string;
@@ -1398,6 +1400,8 @@ export class VaultSocketService {
 	}
 
 	private sendControl(socket: VaultSocketPort, value: unknown): void {
-		try { socket.send(`__YPS:${JSON.stringify(value)}`); } catch { /* peer closed */ }
+		// D8: VAULT_ERROR frames carry the typed daily-limit code while it is latched.
+		const framed = this.options.decorateControl ? this.options.decorateControl(value) : value;
+		try { socket.send(`__YPS:${JSON.stringify(framed)}`); } catch { /* peer closed */ }
 	}
 }

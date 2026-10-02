@@ -1,5 +1,5 @@
 import { ControlPlaneRuntime, ServerConfig } from "./config";
-import { RELAY_CRASH_RUNTIME_PATH, RELAY_TABLE_COUNTS_RUNTIME_PATH, SIMULATE_RESTART_RUNTIME_PATH, VaultRuntime, VaultSyncServer } from "./server";
+import { RELAY_CRASH_RUNTIME_PATH, RELAY_TABLE_COUNTS_RUNTIME_PATH, SIMULATE_DAILY_LIMIT_RUNTIME_PATH, SIMULATE_RESTART_RUNTIME_PATH, VaultRuntime, VaultSyncServer } from "./server";
 import { relayBodiesEnabled } from "./relayFlag";
 import { ActorRecoveryRouteAuthority } from "./recoveryPublicAuthority";
 import { handleRecoveryRoute, isPublicRecoveryRouteShape } from "./recoveryRoutes";
@@ -126,7 +126,8 @@ function validVaultRest(method: string, rest: string[], relayBodies = false): bo
 	if (rest[0] === "blobs" && rest.length === 2) return method === "GET" || method === "PUT" || (method === "POST" && rest[1] === "exists");
 	if (rest.length === 2 && rest[0] === "debug") {
 		return (method === "GET" && rest[1] === "recent") || (method === "POST" && rest[1] === "compact")
-			|| (method === "POST" && rest[1] === "simulate-restart");
+			|| (method === "POST" && rest[1] === "simulate-restart")
+			|| (method === "POST" && rest[1] === "simulate-daily-limit");
 	}
 	if (method === "GET" && rest.length === 2 && rest[0] === "ws" && rest[1] === "root") return true;
 	if (method === "GET" && rest.length === 3 && rest[0] === "ws" && rest[1] === "body" && !!rest[2]) return true;
@@ -321,6 +322,11 @@ export async function handleWorkerRequest(request: Request, env: Env): Promise<R
 				if (!testOnlyDebugRoutesEnabled(env) || !relayBodiesEnabled(env)) response = withCors(json({ error: "not found" }, 404));
 				else if (!await verifyOperatorSession(env, request)) response = withCors(json({ error: "unauthorized" }, 401));
 				else response = withCors(await handleOperatorVaultRuntimeRoute(request, env, route.vaultId, RELAY_CRASH_RUNTIME_PATH));
+			} else if (route.rest[0] === "debug" && route.rest[1] === "simulate-daily-limit") {
+				// Write-budget D8, experiment-only: same gate as simulate-restart.
+				if (!testOnlyDebugRoutesEnabled(env)) response = withCors(json({ error: "not found" }, 404));
+				else if (!await verifyOperatorSession(env, request)) response = withCors(json({ error: "unauthorized" }, 401));
+				else response = withCors(await handleOperatorVaultRuntimeRoute(request, env, route.vaultId, SIMULATE_DAILY_LIMIT_RUNTIME_PATH));
 			} else if (route.rest[0] === "debug" && route.rest[1] === "simulate-restart") {
 				// Experiment-only: gated like the admin routes (404 without the var,
 				// operator session when enabled). See testOnlyTimers.ts.

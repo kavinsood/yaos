@@ -1,3 +1,25 @@
+/**
+ * Closed-file reconcile policy (write-budget spike D4). The production path is
+ * DiskMirror.settleBody (configured with getCommonBase + commitMergedBody in
+ * main.ts); this hash-only decision is its fallback when that API is absent.
+ *
+ * - With a last-synced base (disk-index baseline content or the stored common
+ *   base from BodySettlementRepository): three-way LINE merge
+ *   (src/sync/lineMerge.ts, diff3 with base = last-synced text, ours = disk,
+ *   theirs = server body).
+ *   - Clean: the merged text is committed as a normal CRDT edit (minimal
+ *     diff via commitBodyCandidateIfCurrent) and then written to disk.
+ *   - Overlapping, differing changes: the server side is written as a
+ *     conflict copy (existing artifact mechanism), disk stays at the path,
+ *     the path is marked decision-required and ThreeWayConflictModal is
+ *     offered once per unresolved overlap (its regions are whole lines).
+ * - No base: identical content settles with no write (0 rows); different
+ *   content preserves disk as a conflict copy and projects the server body
+ *   to the path. No "superset wins" heuristic.
+ * - The mtime tiebreak below only picks which side stays at the path in this
+ *   legacy hash-only fallback; both sides are always kept, so it never
+ *   decides what content is lost.
+ */
 export type ClosedFileConflictDecision =
 	| { kind: "no-op" }
 	| { kind: "apply-remote-to-disk"; reason: "disk-at-baseline" }
