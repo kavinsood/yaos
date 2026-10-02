@@ -1,0 +1,37 @@
+scripts/relay2/deploy.sh
+  s_afaf4ce6451fa4::t_076770f44cbf86 5-8,33,43,84-89
+server/src/recoveryAuthorityStore.ts
+  s_afaf4ce6451fa4::t_31af56b1c860e7 1543-1563
+server/src/recoveryJob.ts
+  s_afaf4ce6451fa4::t_c5fbf7110d5316 109-114,626-640,1345-1346,1397-1398,1725-1726,1748-1753,1774-1782,2547-2553,2556,2560,2566-2570
+server/src/relayBodyStore.ts
+  s_afaf4ce6451fa4::t_7ff13ce29cde26 224
+server/src/server.ts
+  s_afaf4ce6451fa4::t_d753b8293fef78 221-254,257-259,287-290,294,308,941-991,1034-1035,1038-1039
+server/src/vaultCatalogStore.ts
+  s_afaf4ce6451fa4::t_49ce661431402c 10-17,503-510,512-515,693-718,784,787-790
+server/src/vaultDocumentStore.ts
+  s_afaf4ce6451fa4::t_0e156d7eb9438d 955-960
+server/src/vaultRecoveryService.ts
+  s_afaf4ce6451fa4::t_4153fd855d2d9f 107-117,560-584
+server/src/vaultStore.ts
+  s_afaf4ce6451fa4::t_a3fc434c6394b3 711
+tests/server/recovery-projection-idle.ts
+  s_afaf4ce6451fa4::t_98a4d39869a3ce 1-357
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "dd577618fdf0910a50f439f5e3c27dfe7d802914",
+  "prompts": {},
+  "sessions": {
+    "s_afaf4ce6451fa4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a2652d7c530160f3c",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
