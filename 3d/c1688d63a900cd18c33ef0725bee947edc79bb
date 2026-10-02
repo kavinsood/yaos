@@ -1,0 +1,23 @@
+tests/conformance/fixtures/recovery.ts
+  s_42343c074f2618::t_1acf013c20df21 13-14,111-118
+tests/live/snapshots.ts
+  s_42343c074f2618::t_2c917ef487300f 3-13,71-72,100
+tests/server/snapshot-lookup.ts
+  s_42343c074f2618::t_eef7506af09cf3 15-17,27-38,83-84,146,157,207-209,211-216
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "3dc1688d63a900cd18c33ef0725bee947edc79bb",
+  "prompts": {},
+  "sessions": {
+    "s_42343c074f2618": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a2c0077a38f8fdd35",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
