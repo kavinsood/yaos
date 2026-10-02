@@ -1,0 +1,23 @@
+server/src/readBoundedBytes.ts
+  s_3c20a746b820c6::t_32bd90d09d3e63 14-35,49
+server/src/routes/vault.ts
+  s_3c20a746b820c6::t_89bb65854bb1ee 10,85-100
+tests/server/forward-body-passthrough.ts
+  s_3c20a746b820c6::t_b2f2e4788ba000 1-79
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c9e691bbac67671f4ad628650aa37662dbb420c7",
+  "prompts": {},
+  "sessions": {
+    "s_3c20a746b820c6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a2b43feb19d9e9a0e",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
