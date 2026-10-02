@@ -1,5 +1,16 @@
 import { deviceBearerHeaders, requireLiveIdentity } from "./liveIdentity.ts";
 import { requestJson, vaultRoute } from "./schema4Live.ts";
+import * as Y from "yjs";
+import { parseRecoveryStateObject } from "../../server/src/shared/recoveryStateObject.ts";
+
+/** Format 4: recovery content is an opaque state object the client decodes. */
+function decodeStateText(bytes: Uint8Array): string {
+	const doc = new Y.Doc();
+	for (const update of parseRecoveryStateObject(bytes).updates) Y.applyUpdate(doc, update);
+	const text = doc.getText("body").toString();
+	doc.destroy();
+	return text;
+}
 
 const identity = requireLiveIdentity();
 const TERMINAL = new Set(["complete", "complete_with_gaps", "failed", "cancelled"]);
@@ -57,7 +68,8 @@ assert(entry.response.status === 200 && entry.body?.path === "redeploy-test.md",
 const file = await fetch(vaultRoute(identity, `recovery/snapshots/${encodeURIComponent(snapshotId)}/file?path=${encodeURIComponent("redeploy-test.md")}`), {
 	headers: deviceBearerHeaders(identity),
 });
-const fileText = await file.text();
+const fileBytes = new Uint8Array(await file.arrayBuffer());
+const fileText = decodeStateText(fileBytes);
 assert(file.status === 200 && fileText.includes("SQL redeploy durability"), "one recovery content object is readable and verified");
 
 const restore = await requestJson(identity, "recovery/restores", {
@@ -85,7 +97,7 @@ assert(typeof itemId === "string", "restore item has a stable identity");
 const restoreContent = await fetch(vaultRoute(identity, `recovery/restores/${encodeURIComponent(restoreId)}/items/${encodeURIComponent(itemId)}/content`), {
 	headers: deviceBearerHeaders(identity),
 });
-assert(restoreContent.status === 200 && (await restoreContent.text()) === fileText, "restore item content matches the snapshot read");
+assert(restoreContent.status === 200 && decodeStateText(new Uint8Array(await restoreContent.arrayBuffer())) === fileText, "restore item content matches the snapshot read");
 const recorded = await requestJson(identity, `recovery/restores/${encodeURIComponent(restoreId)}/results`, {
 	method: "POST",
 	headers: { "Content-Type": "application/json" },

@@ -10,6 +10,8 @@ import {
 	vaultUrl,
 } from "../client.ts";
 import { SNAPSHOT_FORMAT_VERSION, targetFromEnv } from "../target.ts";
+import * as Y from "yjs";
+import { parseRecoveryStateObject, RECOVERY_STATE_CONTENT_TYPE } from "../../../server/src/shared/recoveryStateObject.ts";
 
 const target = targetFromEnv();
 const CAPTURE_WORKLOAD_BODY_COUNT = 30;
@@ -106,7 +108,14 @@ assert.equal(entry.response.status, 200);
 assert.equal(entry.body?.path, "recovery.md");
 const file = await fetch(`${vaultUrl(target.deviceA, `recovery/snapshots/${snapshotId}/file`)}?path=${encodeURIComponent("recovery.md")}`, { headers: bearer(target.deviceA) });
 assert.equal(file.status, 200);
-assert.equal(await file.text(), "recovery restart and bounded reads");
+// Format 4: the server serves the opaque state object; the client decodes it.
+assert.equal(file.headers.get("content-type"), RECOVERY_STATE_CONTENT_TYPE);
+const state = parseRecoveryStateObject(new Uint8Array(await file.arrayBuffer()));
+const stateDoc = new Y.Doc();
+for (const update of state.updates) Y.applyUpdate(stateDoc, update);
+assert.equal(stateDoc.getText("body").toString(), "recovery restart and bounded reads");
+assert.equal(file.headers.get("x-yaos-content-sha256"), state.contentHash);
+stateDoc.destroy();
 pass("recovery-v2 catalog and bounded object reads expose verified snapshot content");
 
 const restore = await vaultJson(target.deviceA, "recovery/restores", {
