@@ -95,14 +95,28 @@ typing burst.
 1. **"Durable before broadcast" becomes "durable before receipt".** Peers can apply a frame that is
    later lost in a crash. The origin never received a receipt for it, so it resends; wake re-sync also
    pulls it back from any peer. HTTP reads (GET/HEAD, bootstrap, feed) only ever see durable state.
-2. If a device is revoked while its frame is buffered, that frame may already have reached peers. It
-   is never made durable and never acked (4403).
+2. **Revocation fence (R11).** Peers and durable state must agree across a revocation, and no frame
+   received after the fence is ever broadcast or appended. Every authority write in the DO
+   (`/__yaos/authority-fence`, `/__yaos/revoke-device-sockets`) first calls
+   `relay.flushForAuthorityFence()` in the same turn, with no await in between. Frames relayed before
+   the fence (already broadcast) are committed and acked under the authority that relayed them. The
+   write bumps `authorityVersion` synchronously, so the next frame of the revoked device misses the
+   actor cache (the 5 s TTL never serves a stale "allowed" across a bump). It fails the fresh check at
+   receipt (4403) and is never broadcast or buffered; later frames of that socket hit
+   `failedSocketDrops`. There is no cross-isolate window: one DO instance per vault holds both the
+   relay buffers and the authority tables, and it is single-threaded. Safety net: if a buffered
+   frame's device has lost authority at flush (an authority writer that skipped the fence flush),
+   v3 commits it anyway, because it was authorised at receipt and peers already applied it. It is
+   counted in `revokedBroadcastCommits` and the socket is closed with 4403. v2 micro-batching
+   broadcasts only after the commit, so it still drops such frames (`authorityDrops`).
+   (Before d3b4db8, the deployed B4 run broadcast 10 frames of a revoked device and then dropped
+   them at flush, so peers diverged from durable state.)
 3. Tail attribution only covers the last commit: `attr_*` holds the last committer. No per-frame
    `vault_mutation_attribution` rows are written. G14 outcomes come from the receipt ring.
 4. Receipts are bounded to 256 per device. An older resend is answered as a CRDT no-op.
 5. No silent drops: `updateFrames` = the sum of the v2 outcomes + `groupDropped`. `groupFlushDedupes`
-   is a subset of `dedupeHits`. A frame dropped by authority at flush is counted once, in
-   `authorityDrops`.
+   is a subset of `dedupeHits`. On v3 no frame is dropped by authority at flush (item 2), so
+   `authorityDrops` stays 0. `revokedBroadcastCommits` is a subset of the commit outcomes.
    `failedSocketDrops` is also an outcome (item 6).
 6. **Acks are cumulative-safe per socket** (the client treats an ack for frame N as confirming every
    earlier frame of that socket). Frames of one socket are committed in arrival order: one body and one
@@ -114,7 +128,21 @@ typing burst.
    (`wakeHeldAcks`), because a frame it sent before the wake may have been lost with the buffer.
 7. An HTTP candidate or a currentness query for a body flushes that body's buffer first
    (`groupFlushReads`). Neither ever waits on a timer. An HTTP copy of relayed bytes is therefore a
-   CRDT no-op: it writes no body rows, only its own idempotency receipt.
+   CRDT no-op: it writes no body rows, only its receipt ring entry (1 row).
+8. **HTTP save through the group-commit store.** A non-creation HTTP candidate (`POST
+   body/:id/candidate`, or one item of `/body/candidates`) is still validated by
+   `VaultCandidateService`: ywasm apply, canonical markdown and the exact content hash. It is then
+   committed by `relay.commitHttpCandidate`: tail 1 + head 1 + receipt ring 1 = 3 rows. The base path
+   would write clock, journal, attribution, head upsert, catalog event, operation outcome and
+   candidate receipt (14 rows). A candidate that changes nothing writes only its ring entry (1 row).
+   The receipt JSON is unchanged. The ring answers replay, digest reuse
+   (`candidate_id_reused_with_different_digest`) and `GET operations/:id/outcome`, matching on
+   principal, membership revision and credential revision. The ring is bounded (256 per device, TTL
+   as before). Because CRDT re-application is idempotent, a replay older than the ring re-validates
+   as a no-op. The exact hash is claimed only if no commit landed between validation and commit;
+   otherwise the hash is left unknown and materialised lazily. The catalog event is coalesced by the
+   alarm, as for relay frames. Creation candidates and merged updates over the durable value limit
+   keep the base path. No client change is needed.
 
 ## Rows per commit (Cloudflare billing, inferred)
 
@@ -130,6 +158,19 @@ costs about 3 rows instead of about 5N. Each tail checkpoint (one per about 64 K
 writes about 12 rows: checkpoint chunk + manifest, catalog event, clock, and the tail delete.
 `tests/server/relay3-group-commit.ts` measures all of this as statement changes × (1 + index
 entries).
+
+HTTP candidate POST (closed-note save), measured locally with the same meter. These numbers are
+inferred and have not been run on a deployment:
+
+| Path | Rows per POST | By table |
+| --- | --- | --- |
+| Base (before) | 14 | clock 1, journal 2, attribution 2, head 2, catalog event 3, operation outcome 2, candidate receipt 2 (deployed gql: 13.82) |
+| v3 relay path (after) | 3 | tail 1, head 1, receipt ring 1 |
+| v3, identical re-save | 1 | receipt ring 1 |
+| Deferred catalog coalesce | 5 per body per 30 s window, plus 1 alarm | clock 2, catalog event 3 |
+
+For the HTTPSAVE shape (one POST every 5 s to one closed note), that is (6 × 3 + 5 + 1) / 6 ≈ 4.0 rows
+per POST. Tail checkpoints add about 12 rows per 512 records or 64 KB.
 
 ## Test-only crash route
 

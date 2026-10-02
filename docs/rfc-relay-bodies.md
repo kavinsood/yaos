@@ -94,8 +94,10 @@ Basis (measured unless labelled):
   refusal. B1, B5 20/20, B6, B8, CW 121/121 and X4 pass.
 
 Conditions (v3):
-1. **Fix R11 before default-on.** B4-v3 fails convergence: a revoked device's pre-revocation frames reach peers
-   and are dropped at flush. Commit admitted frames at flush, or flush in `closeDevice`.
+1. **R11: fixed locally (d3b4db8), not re-measured on a deployment.** B4-v3 failed convergence because a revoked
+   device's pre-revocation frames reached peers and were dropped at flush. Now the revocation and authority-fence
+   paths flush every group-commit buffer in the same DO turn, before the authority write. A frame admitted after
+   the fence is refused (4403) before any broadcast. Re-run B4-v3 before default-on.
 2. **Re-run B7 serially on an idle machine (R12).** It passed 1 of 3. In one attempt Cloudflare shed the
    bystander with `1013 Service overloaded` before our rate limit closed the flooder.
 3. **B5 send-coalescing was measured and removed (R13).** At idle = 300 ms it gave 1.53 rows/keystroke vs 0.29
@@ -441,6 +443,13 @@ typing-second are ≈ 2 × 0.65 = 1.3 (counter) / 1.45 (gql), whatever the key r
   The same row lands in `vault_candidate_receipts`, so an HTTP candidate replay or a socket resend of that candidate
   resolves to the same receipt. Since round 3 (G14), `GET /operations/:candidateId/outcome` also resolves. It uses the
   attribution `operation_id` by default, or the inline journal columns in lean mode.
+- **HTTP candidate under v3 (14e5250, inferred, not deployed).** With group commit on, a non-creation HTTP candidate
+  commits through `relay.commitHttpCandidate`: 1 tail record + 1 head + 1 `relay_device_receipts` ring entry =
+  **3 rows** (base path 14: clock 1, journal 2, attribution 2, head 2, catalog_events 3, operation_outcomes 2,
+  candidate_receipts 2). A no-op save writes only the ring entry (1 row). The catalog event is coalesced by the
+  checkpoint alarm (≤ 5 rows per body per 30 s window). Replay, digest reuse (409) and
+  `GET /operations/:id/outcome` resolve from the ring (256 per device; older replays rely on CRDT idempotence).
+  The receipt JSON is unchanged, so the client needs no change. Creations still use the base path.
 - D7: `src/sync/vaultSync.ts` is not modified in this spike. The harness implements socket-ack receipts
   (`scripts/relay2/lib/socketReceipts.ts`).
 - Integration sketch:
@@ -773,7 +782,7 @@ All values are measured on deployed workers (runs r3-1002/b/c). Full tables are 
 | B4 | invariant 4 holds; **convergence FAIL** (R11) |
 | B7 | **1/3 pass** (R12) |
 | Autosave 1 s, open note | v3nc 2.15 rows/save (gql), one commit per save; prop p50 45 ms |
-| Autosave, closed note (HTTP candidate every 5 s) | 13.82 rows/POST (gql phase-level), POST p50 297 ms |
+| Autosave, closed note (HTTP candidate every 5 s) | 13.82 rows/POST (gql phase-level), POST p50 297 ms. After 14e5250: **3 rows/POST, ≈ 4.0 amortized with the coalesced catalog event (inferred, local row accounting; not deployed)** |
 | Canvas identical re-save | 0 rows, no POST. 1 GET `semantic/<id>/state` (`canvasManager.ts:415/417`), code |
 
 ## 9. Cost model
@@ -907,6 +916,10 @@ Inputs: base_rows_per_edit=5.58, relay_rows_per_edit=5.63, v3_rows_per_edit=0.29
 - **Rows are no longer the binding limit.** v3 is 3% typical and 18% heavy, against v2 51–53% and 325–342%. 100k
   rows takes 19.2 h of non-stop typing.
 - **The autosave plugin day fits:** 65% (open note) and 82% (closed note, HTTP path). Base, inferred, is ≈ 460–480%.
+- **HTTP path after 14e5250 (inferred, not deployed; the table above still uses the measured 13.82).** The closed-note
+  POST drops to 3 rows (≈ 4.0 amortized with the alarm-coalesced catalog event). Scaling the measured 82,393 rows by
+  4.0 / 13.82 gives ≈ 24k rows, about 24% of Free for autosave-8h closed note. This is arithmetic only; re-measure
+  HTTPSAVE before relying on it.
 - **DO requests are not changed by v3** (1.15× base typical, 1.34× heavy, both ≤ 11% of Free). R10 stands as in
   v2. B5 would bring DO requests to 0.96–0.99× base, but at 4.9× the rows (R13).
 
@@ -1127,9 +1140,16 @@ transport/platform plus the raw harness client, not server merge logic (section 
     (`relay3-group-commit.md`, invariant change 2). Under reversal condition 4 it is still a convergence failure.
   - The drop also buys little. The peer's next re-sync (reconnect step2 or wake re-sync) re-submits those bytes
     under the peer's own authority, and they become durable anyway.
-  - Proposed fix: commit frames that passed authority at admission, even if the device is revoked before the flush.
-    Invariant 4 only forbids frames after the fence. Alternatively, flush the device's buffers synchronously inside
-    `closeDevice` before the 4403. Either makes B4 converge, and neither weakens the post-fence guarantee.
+  - **Fixed locally in d3b4db8 (not re-measured on a deployment).** (a) Primary: `flushForAuthorityFence()` runs in
+    the same DO turn, before `revokeDevice` / `installAuthorityFence` write authority. Already-broadcast pre-fence
+    frames therefore commit before the fence, and any later frame fails `validateActorCached` (the authorityVersion
+    bump invalidates the cache) and is refused 4403 before broadcast. (b) Safety net: if a buffered frame's device is
+    found revoked at flush, v3 commits it (it was admitted and broadcast) and closes the socket. Counters:
+    `authorityFenceFlushes`, `revokedBroadcastCommits`; `authorityDrops` stays 0 on v3. v2 micro-batch still drops,
+    because it broadcasts only after commit. Flushing only in `closeDevice` was rejected because the fence is
+    vault-wide (membership/credential revisions), not per-device. Tests (`tests/server/relay3-group-commit.ts`):
+    revocation with 10 buffered frames, revocation racing broadcast, and wiring order flush → fence/revoke. Peers
+    and durable state converge, and the post-fence frame is never broadcast or appended.
 - **R12 — v3: flood isolation is flaky (B7-v3 1/3 pass).**
   - In a 5 MiB/s flood of 64 KiB frames, the v3 flooder could push 63 MB (a3) before our `relay rate limit` closed
     it, 43 s in. f1001 v2: 2.2 MB, closed at 26.9 s.
@@ -1207,7 +1227,7 @@ config:
 | 1 | not triggered | L2 p50 299 → 47.7 ms (6.3×), p99 696 → 76.3 ms ([conc], n = 290). The receipt is slower by design (p50 350 ms, R14) |
 | 2 | not triggered, and the margin is now large | v3 is 3% typical and 18% heavy (inferred); 0.29 rows/edit vs v2 5.63. Condition 1 of section 1 (lean mandatory) is retired |
 | 3 | **unchanged: exceeded on the letter; needs sign-off** | group commit does not change WS messages. Model 1.15× base typical, 1.34× heavy (inferred), ≤ 11% of Free. R10 is unchanged |
-| 4 | **triggered on the letter (B4 convergence)** | invariant 4 holds (0 appends after the fence). But a revoked device's pre-fence frames were broadcast and then dropped at flush: 10 frames diverge (R11). Convergence suite 9/9, CRASH 10/10 with 0 lost, FENCE 6/6 refused rounds safe. B7 1/3 (R12). Fix R11 before ship |
+| 4 | **triggered on the letter at measurement (B4 convergence); fixed locally, re-measure pending** | invariant 4 holds (0 appends after the fence). At measurement, a revoked device's pre-fence frames were broadcast and then dropped at flush, so 10 frames diverged (R11). d3b4db8 flushes before the fence and commits rather than drops at flush; local tests converge. Not re-run deployed. Convergence suite 9/9, CRASH 10/10 with 0 lost, FENCE 6/6 refused rounds safe. B7 1/3 (R12) |
 | 5 | not measured for v3 | C1 not re-run. The v3 flush is one batch per 300 ms–1.5 s, so per-append CPU is no worse than v2 (inferred) |
 | 6 | not re-run | X1 not run on v3. CW 121/121 pass |
 | 7 | B5 20/20 | no lost edit across epoch resets under v3. R2 not measured |
