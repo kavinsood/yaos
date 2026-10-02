@@ -1,0 +1,21 @@
+server/src/dailyLimit.ts
+  s_42343c074f2618::t_62b787ad08fd4e 1-224
+server/src/recoveryJob.ts
+  s_42343c074f2618::t_5ff6277e337b47 97,1340-1377,1386-1388,1391-1398,1448,1597,1627,1662,1675,1754,1764,1770-1785,1796,1801,1816,1836,1844,1846,1849,1853-1857,1879,1885,1893-1911,1930,1948,3046
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "adf2afdaf9ec25b9108a4b66fe28699eafbca6da",
+  "prompts": {},
+  "sessions": {
+    "s_42343c074f2618": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a2c0077a38f8fdd35",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
