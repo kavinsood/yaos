@@ -954,6 +954,12 @@ export abstract class VaultDocumentStore {
 				runtime_epoch TEXT NOT NULL,
 				updated_at INTEGER NOT NULL
 			);
+			-- Durable "projection wake owed" marker: a note/catalog mutation happened and the
+			-- recovery projection must be woken at due_at (it no longer polls).
+			CREATE TABLE IF NOT EXISTS recovery_projection_wake (
+				id INTEGER PRIMARY KEY CHECK(id = 1),
+				due_at INTEGER NOT NULL
+			);
 			CREATE TABLE IF NOT EXISTS recovery_key_leases (
 				object_key TEXT PRIMARY KEY,
 				lease_id TEXT NOT NULL,
@@ -2571,6 +2577,9 @@ export abstract class VaultDocumentStore {
 			checkpointSequence,
 			throughSequence,
 		).one().bytes;
+		for (const record of this.relayTailRecords(documentId, checkpointSequence, throughSequence).records) {
+			bytes += record.update.byteLength;
+		}
 		return bytes;
 	}
 
@@ -2689,6 +2698,27 @@ export abstract class VaultDocumentStore {
 				expectedBytes: row.update_byte_length, bytes: new Uint8Array(row.data),
 			});
 		}
+		const journalCount = this.storage.sql.exec<{ count: number }>(
+			`SELECT COUNT(*) AS count FROM vault_journal
+			 WHERE document_id = ? AND sequence > ? AND sequence <= ?`,
+			documentId,
+			checkpointSequence,
+			throughSequence,
+		).one().count;
+		// Relay v3: group commits live in the body's tail row, not the journal. Its records
+		// in (checkpoint, through] are the third recipe segment, after the journal rows (Yjs
+		// updates commute, so segment order does not change the merged state).
+		const tail = this.relayTailRecords(documentId, checkpointSequence, throughSequence).records;
+		const journalExhausted = checkpointExhausted && journalOffset + journalRows.length >= journalCount;
+		if (journalExhausted && tail.length > 0) {
+			const tailOffset = Math.max(0, offset - checkpointCount - journalCount);
+			for (const record of tail.slice(tailOffset, tailOffset + Math.max(0, 256 - candidates.length))) {
+				candidates.push({
+					kind: "journal", sequence: record.sequence, fragmentIndex: 0, fragmentCount: 1,
+					expectedBytes: record.update.byteLength, bytes: record.update,
+				});
+			}
+		}
 		const selected: typeof candidates = [];
 		let encodedBytes = 0;
 		for (const item of candidates) {
@@ -2701,13 +2731,7 @@ export abstract class VaultDocumentStore {
 		const parts = selected.map(({ kind, sequence, fragmentIndex, fragmentCount, bytes }) =>
 			({ kind, sequence, fragmentIndex, fragmentCount, bytes }));
 		const consumed = offset + selected.length;
-		const total = checkpointCount + this.storage.sql.exec<{ count: number }>(
-			`SELECT COUNT(*) AS count FROM vault_journal
-			 WHERE document_id = ? AND sequence > ? AND sequence <= ?`,
-			documentId,
-			checkpointSequence,
-			throughSequence,
-		).one().count;
+		const total = checkpointCount + journalCount + tail.length;
 		return { parts, nextCursor: consumed < total ? String(consumed) : null, encodedBytes };
 	}
 }

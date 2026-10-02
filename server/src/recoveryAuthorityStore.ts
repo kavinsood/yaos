@@ -1540,6 +1540,27 @@ export class RecoveryAuthorityStore extends VaultBootstrapStore {
 		).toArray();
 	}
 
+	projectionWakeDueAt(): number | null {
+		this.initialize();
+		return this.storage.sql.exec<{ due_at: number }>(
+			"SELECT due_at FROM recovery_projection_wake WHERE id = 1",
+		).toArray()[0]?.due_at ?? null;
+	}
+
+	/** Records a projection wake owed at `dueAt`; an earlier owed wake is kept. */
+	oweProjectionWake(dueAt: number): void {
+		this.initialize();
+		this.storage.sql.exec(
+			"INSERT INTO recovery_projection_wake(id, due_at) VALUES (1, ?) ON CONFLICT(id) DO NOTHING",
+			dueAt,
+		).toArray();
+	}
+
+	clearProjectionWake(): void {
+		this.initialize();
+		this.storage.sql.exec("DELETE FROM recovery_projection_wake WHERE id = 1").toArray();
+	}
+
 	projectionLease(): { vaultGeneration: string; leaseId: string; capabilityHash: string; expiresAt: number; enabled: boolean; runtimeEpoch: string } | null {
 		this.initialize();
 		const row = this.storage.sql.exec<{

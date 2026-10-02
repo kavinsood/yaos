@@ -229,6 +229,7 @@ export class RelayBodyStore {
 				written.toArray();
 				rowsWritten += written.rowsWritten;
 			}
+			if (input.receipts.length > 0) this.store.noteCandidateReceiptInserts(input.receipts.length);
 			result = { vaultSequence: sequence, generation, semanticEpoch, fileId: catalog.file_id, path: catalog.path,
 				contentHash, size, rowsRead, rowsWritten };
 		});

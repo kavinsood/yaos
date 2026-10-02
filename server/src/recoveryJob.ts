@@ -106,6 +106,12 @@ import {
 const MAX_BODIES_PER_ALARM = 25;
 const ALARM_SLICE_WALL_MS = 4_000;
 const DISPATCH_WATCHDOG_MS = 15_000;
+/**
+ * Bodies scanned per projection work page. The vault answers with at most one
+ * entry (the first body whose content is not yet indexed), so one page walks the
+ * whole indexed catalog in O(page) indexed reads instead of one RPC per body.
+ */
+const PROJECTION_PAGE_SCAN_ENTRIES = 256;
 const MAX_OBJECT_STORE_IN_FLIGHT = 4;
 const RETRY_BASE_MS = 1_000;
 const RETRY_CAP_MS = 15 * 60_000;
@@ -615,6 +621,21 @@ function parseCursorMetadata(value: unknown, label: string): { cursor: string | 
 	const metadata = metadataRecord(value, label);
 	assertMetadataKeys(metadata, ["cursor"], label);
 	return { cursor: rpcNullableString(metadata.cursor, `${label} cursor`) };
+}
+
+/**
+ * Projection wake ledger. `requested` counts vault wakes (a note/catalog mutation
+ * happened); a pass that starts from the catalog head copies it into `consumed`.
+ * A pass that ends with `requested !== consumed` saw a wake after it started and
+ * runs again; otherwise the job sleeps with no alarm until the next wake.
+ */
+function parseProjectionWake(value: unknown): { requested: number; consumed: number } {
+	const metadata = metadataRecord(value, "projection wake");
+	assertMetadataKeys(metadata, ["requested", "consumed"], "projection wake");
+	return {
+		requested: metadataInteger(metadata.requested, "projection wake requested"),
+		consumed: metadataInteger(metadata.consumed, "projection wake consumed"),
+	};
 }
 
 function parseIndexMetadata(value: unknown, label: string, field: "index" | "prefixIndex"): number {
@@ -1321,6 +1342,8 @@ export class RecoveryJobRuntime {
 	private readonly memoryBudget: RecoveryMemoryBudget;
 
 	private deferredAlarmAt: number | null = null;
+	/** Set by a projection slice that found nothing to do: the dispatch ends with no successor alarm. */
+	private projectionIdle = false;
 	constructor(private readonly options: RecoveryJobRuntimeOptions) {
 		this.memoryBudget = new RecoveryMemoryBudget(options.memoryBudgetBytes);
 		this.store = new RecoveryJobStateStore(options.storage);
@@ -1371,6 +1394,8 @@ export class RecoveryJobRuntime {
 			if (route === "/__yaos/recovery-job/projection/wake" && request.method === "POST") {
 				const record = this.store.load();
 				if (!record || record.kind !== "projection") throw new Error("projection job is not initialized");
+				const wake = this.store.getParsedMetadata("projection-wake", parseProjectionWake) ?? { requested: 0, consumed: 0 };
+				this.store.setMetadata("projection-wake", { requested: wake.requested + 1, consumed: wake.consumed });
 				await this.options.alarms.setAlarm(Date.now());
 				return Response.json(null);
 			}
@@ -1697,6 +1722,8 @@ export class RecoveryJobRuntime {
 		const startedAt = Date.now();
 		this.store.setMetadata("dispatch-identity", { dispatchId, startedAt, completedAt: null });
 		this.deferredAlarmAt = null;
+		this.projectionIdle = false;
+		let watchdogArmedAt: number | null = null;
 		try {
 			for (let unit = 0; unit < MAX_BODIES_PER_ALARM; unit++) {
 				let record = this.store.load();
@@ -1718,7 +1745,12 @@ export class RecoveryJobRuntime {
 				}
 				// Persist the successor before any authority call or state transition. If the
 				// process dies inside the slice, the host will durably redispatch this actor.
-				await this.options.alarms.setAlarm(now + DISPATCH_WATCHDOG_MS);
+				// One watchdog covers the whole dispatch (it is bounded by ALARM_SLICE_WALL_MS);
+				// it is refreshed only if a dispatch runs past half the watchdog window.
+				if (watchdogArmedAt === null || now - watchdogArmedAt >= DISPATCH_WATCHDOG_MS / 2) {
+					await this.options.alarms.setAlarm(now + DISPATCH_WATCHDOG_MS);
+					watchdogArmedAt = now;
+				}
 				const authority = this.authority(record.vaultId, record.vaultGeneration);
 				if (record.kind === "capture") {
 					const capture = this.descriptor("capture");
@@ -1739,7 +1771,15 @@ export class RecoveryJobRuntime {
 					await this.options.alarms.deleteAlarm();
 					return;
 				}
-				if (this.deferredAlarmAt !== null || Date.now() - startedAt >= ALARM_SLICE_WALL_MS) break;
+				if (this.projectionIdle || this.deferredAlarmAt !== null || Date.now() - startedAt >= ALARM_SLICE_WALL_MS) break;
+			}
+			if (this.projectionIdle) {
+				// Nothing to project: no successor. A wake that raced the pass end is either
+				// visible here (re-arm now) or arrives after the delete and arms its own alarm.
+				await this.options.alarms.deleteAlarm();
+				const wake = this.store.getParsedMetadata("projection-wake", parseProjectionWake);
+				if (wake && wake.requested !== wake.consumed) await this.options.alarms.setAlarm(Date.now());
+				return;
 			}
 			await this.options.alarms.setAlarm(this.deferredAlarmAt ?? Date.now());
 		} catch (error) {
@@ -2504,20 +2544,30 @@ export class RecoveryJobRuntime {
 			"projection-cursor",
 			(value) => parseCursorMetadata(value, "projection progress"),
 		)?.cursor ?? null;
+		if (cursor === null) {
+			// A pass (re)starts from the catalog head: it observes every wake requested so far.
+			const wake = this.store.getParsedMetadata("projection-wake", parseProjectionWake);
+			if (wake && wake.consumed !== wake.requested) {
+				this.store.setMetadata("projection-wake", { requested: wake.requested, consumed: wake.requested });
+			}
+		}
 		const page = await authority.getProjectionWorkPage({
 			vaultId: descriptor.vaultId,
-				vaultGeneration: descriptor.vaultGeneration,
+			vaultGeneration: descriptor.vaultGeneration,
 			leaseId: descriptor.leaseId,
 			capability: descriptor.capability,
 			cursor,
-			maxEntries: 1,
+			maxEntries: PROJECTION_PAGE_SCAN_ENTRIES,
 			maxResponseBytes: MAX_CAPTURE_PLAN_BYTES,
 		});
 		const action = recoveryProjectionPageAction(page.entries.length, page.terminal, page.nextCursor);
 		if (action.kind !== "work") {
 			if (action.kind === "sleep") {
-				this.store.setMetadata("projection-cursor", { cursor: null });
-				this.deferredAlarmAt = Date.now() + 30_000;
+				// End of a pass. No polling: the job sleeps until the vault wakes it on a
+				// mutation, unless a wake already arrived while this pass was running.
+				if (cursor !== null) this.store.setMetadata("projection-cursor", { cursor: null });
+				const wake = this.store.getParsedMetadata("projection-wake", parseProjectionWake);
+				if (!wake || wake.requested === wake.consumed) this.projectionIdle = true;
 			} else {
 				this.store.setMetadata("projection-cursor", { cursor: action.cursor });
 			}

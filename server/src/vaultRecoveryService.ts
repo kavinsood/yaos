@@ -104,6 +104,17 @@ export class VaultRecoveryService {
 		await this.ensureRecoveryProjection(vaultId);
 	}
 
+	/**
+	 * Mutation-driven projection wake (the job does not poll). A GC mark pauses the
+	 * projection lease; the GC completion path re-enables it with a full pass.
+	 */
+	async wakeProjection(vaultId: string): Promise<void> {
+		if (!this.objectStore) return;
+		const lease = this.store.projectionLease();
+		if (lease && !lease.enabled) return;
+		await this.ensureRecoveryProjection(vaultId);
+	}
+
 	async startRecoveryCapture(input: StartCaptureRequest): Promise<CaptureStarted> {
 
 		if (this.store.vaultMetadata()?.vaultId !== input.vaultId) throw new Error("vault identity mismatch");
@@ -546,19 +557,33 @@ export class VaultRecoveryService {
 			throw new Error("invalid projection work bounds");
 		}
 		const boundary = this.store.currentSequence();
-		const scanned = this.store.listActiveCatalogAt(boundary, request.cursor ?? "", request.maxEntries + 1);
-		const page = scanned.slice(0, request.maxEntries);
-		const hashes = page.flatMap((entry) => entry.contentHash ? [entry.contentHash] : []);
-		const missing = new Set(this.store.missingIndexedContent(hashes));
-		const entries = page.flatMap((entry) => {
-			if (entry.contentHash === null || entry.size === null) throw new Error("projection catalog identity missing");
-			return missing.has(entry.contentHash) ? [{
-				bodyId: entry.bodyId, generation: entry.generation, contentHash: entry.contentHash, size: entry.size,
-			}] : [];
-		});
-		if (recoveryCanonicalJsonBytes(entries).byteLength > request.maxResponseBytes) throw new Error("projection work page exceeds byte bound");
-		const terminal = scanned.length <= request.maxEntries;
-		return { entries, nextCursor: terminal ? null : page.at(-1)!.bodyId, terminal };
+		// Walk active heads after the cursor with indexed per-body lookups, in growing
+		// chunks, and stop at the first body whose content is not yet indexed. The page
+		// carries at most that one entry and its cursor is that body, so the job resumes
+		// right after it; an all-indexed vault costs one bounded pass, not one RPC per body.
+		let cursor = request.cursor ?? "";
+		let scanned = 0;
+		let chunk = 4;
+		while (scanned < request.maxEntries) {
+			const want = Math.min(chunk, request.maxEntries - scanned);
+			const batch = this.store.listActiveCatalogAt(boundary, cursor, want + 1);
+			const usable = batch.slice(0, want);
+			const missing = new Set(this.store.missingIndexedContent(usable.flatMap((entry) => entry.contentHash ? [entry.contentHash] : [])));
+			for (const entry of usable) {
+				scanned++;
+				cursor = entry.bodyId;
+				// Relay v3: a group-committed head whose claimed hash was not accepted has no
+				// content identity yet; the checkpoint pass publishes one and wakes projection again.
+				if (entry.contentHash === null || entry.size === null) continue;
+				if (!missing.has(entry.contentHash)) continue;
+				const entries = [{ bodyId: entry.bodyId, generation: entry.generation, contentHash: entry.contentHash, size: entry.size }];
+				if (recoveryCanonicalJsonBytes(entries).byteLength > request.maxResponseBytes) throw new Error("projection work page exceeds byte bound");
+				return { entries, nextCursor: entry.bodyId, terminal: false };
+			}
+			if (batch.length <= want) return { entries: [], nextCursor: null, terminal: true };
+			chunk *= 2;
+		}
+		return { entries: [], nextCursor: cursor, terminal: false };
 	}
 
 	async checkProjectionLease(

@@ -8,6 +8,14 @@ export const MAX_CANDIDATE_RECEIPTS_PER_BODY = 256;
 export const MAX_CANDIDATE_RECEIPTS_GLOBAL = 4096;
 export const MAX_CANDIDATE_RECEIPT_LEDGER_BYTES = 8 * 1024 * 1024;
 export const CANDIDATE_RECEIPT_TTL_MS = 30 * 24 * 60 * 60_000;
+/**
+ * Global receipt/outcome pruning scans whole tables (no created_at index: an index
+ * would bill one more written row per receipt). It runs at most once per interval
+ * or per batch of inserts; lookups already ignore expired rows, and the per-body
+ * cap is enforced on every insert, so the global bounds only drift transiently.
+ */
+export const CANDIDATE_RECEIPT_PRUNE_INTERVAL_MS = 60 * 60_000;
+export const CANDIDATE_RECEIPT_PRUNE_INSERTS = 1024;
 
 export type BodyLifecycle = "active" | "tombstoned" | "reaped";
 
@@ -591,8 +599,19 @@ export abstract class VaultCatalogStore extends VaultDocumentStore {
 			).one().count;
 	}
 
-	pruneCandidateReceipts(now = Date.now()): number {
+	private nextCandidateReceiptPruneAt = 0;
+	private candidateReceiptInsertsSincePrune = 0;
+
+	noteCandidateReceiptInserts(count: number): void {
+		this.candidateReceiptInsertsSincePrune += count;
+	}
+
+	pruneCandidateReceipts(now = Date.now(), force = false): number {
 		this.initialize();
+		if (!force && now < this.nextCandidateReceiptPruneAt
+			&& this.candidateReceiptInsertsSincePrune < CANDIDATE_RECEIPT_PRUNE_INSERTS) return 0;
+		this.nextCandidateReceiptPruneAt = now + CANDIDATE_RECEIPT_PRUNE_INTERVAL_MS;
+		this.candidateReceiptInsertsSincePrune = 0;
 		let rowsWritten = 0;
 		for (const cursor of [
 			this.storage.sql.exec(
@@ -769,35 +788,32 @@ export abstract class VaultCatalogStore extends VaultDocumentStore {
 	listCatalogAt(boundarySequence: number, afterBodyId = "", limit = 1000): CatalogHeadAtBoundary[] {
 		this.initialize();
 		const boundedLimit = Math.min(1000, Math.max(1, limit));
-		return this.storage.sql.exec<{
-			sequence: number; body_id: string; file_id: string; path: string; previous_path: string | null;
-			lifecycle: BodyLifecycle; generation: number; body_epoch: number; content_hash: string | null; size: number | null;
-		}>(
-			`SELECT e.sequence, e.body_id, e.file_id, e.path, e.previous_path, e.lifecycle,
-			        e.generation, e.body_epoch, e.content_hash, e.size
-			 FROM vault_catalog_events e
-			 JOIN (
-			   SELECT body_id, MAX(sequence) AS sequence
-			   FROM vault_catalog_events
-			   WHERE sequence <= ? GROUP BY body_id
-			 ) latest ON latest.body_id = e.body_id AND latest.sequence = e.sequence
-			 WHERE e.body_id > ?
-			 ORDER BY e.body_id LIMIT ?`,
-			boundarySequence,
-			afterBodyId,
-			boundedLimit,
-		).toArray().map((row) => ({
-			sequence: row.sequence,
-			bodyId: row.body_id,
-			bodyEpoch: parseSemanticEpoch(row.body_epoch, "catalog body epoch"),
-			fileId: row.file_id,
-			path: row.path,
-			previousPath: row.previous_path,
-			lifecycle: row.lifecycle,
-			generation: row.generation,
-			contentHash: row.content_hash,
-			size: row.size,
-		})).map((entry) => this.leanOverlay(boundarySequence, entry));
+		const result: CatalogHeadAtBoundary[] = [];
+		for (const entry of this.catalogHeadsAfter(boundarySequence, afterBodyId)) {
+			result.push(entry);
+			if (result.length === boundedLimit) break;
+		}
+		return result;
+	}
+
+	/**
+	 * Catalog heads at a boundary in body order, as an indexed skip-scan over
+	 * `vault_catalog_body_sequence(body_id, sequence DESC)`: one seek to the next
+	 * body and one to its newest event at or before the boundary. Cost is O(bodies
+	 * visited), independent of catalog history, unlike a GROUP BY over every event.
+	 */
+	protected *catalogHeadsAfter(boundarySequence: number, afterBodyId: string): Generator<CatalogHeadAtBoundary> {
+		let cursor = afterBodyId;
+		for (;;) {
+			const next = this.storage.sql.exec<{ body_id: string }>(
+				"SELECT body_id FROM vault_catalog_events WHERE body_id > ? ORDER BY body_id LIMIT 1",
+				cursor,
+			).toArray()[0];
+			if (!next) return;
+			cursor = next.body_id;
+			const head = this.getCatalogHeadAt(boundarySequence, cursor);
+			if (head) yield head;
+		}
 	}
 
 	/**
@@ -892,19 +908,13 @@ export abstract class VaultCatalogStore extends VaultDocumentStore {
 	}
 
 	listActiveCatalogAt(boundarySequence: number, afterBodyId = "", limit = 1000): CatalogHeadAtBoundary[] {
+		this.initialize();
 		const result: CatalogHeadAtBoundary[] = [];
-		let cursor = afterBodyId;
 		const boundedLimit = Math.min(1000, Math.max(1, limit));
-		while (result.length < boundedLimit) {
-			const page = this.listCatalogAt(boundarySequence, cursor, 1000);
-			for (const entry of page) {
-				if (entry.lifecycle === "active") {
-					result.push(entry);
-					if (result.length === boundedLimit) return result;
-				}
-			}
-			if (page.length < 1000) break;
-			cursor = page.at(-1)!.bodyId;
+		for (const entry of this.catalogHeadsAfter(boundarySequence, afterBodyId)) {
+			if (entry.lifecycle !== "active") continue;
+			result.push(entry);
+			if (result.length === boundedLimit) break;
 		}
 		return result;
 	}
