@@ -41,6 +41,7 @@ import { readRelayConfig, relayBodiesEnabled, relayBodiesTestDefault, type Relay
 import { RelayBodyService } from "./relayBodies";
 import { RelayBodyStore } from "./relayBodyStore";
 import { handleCompactionLease, handleSemanticReset, type RelayRouteDeps } from "./relayRoutes";
+import { DailyLimitLatch, dailyLimitResponse, instrumentStorageForDailyLimit } from "./dailyLimit";
 
 // Production PERSIST_DEBOUNCE_MS (250 ms) lives in testOnlyTimers.ts so the
 // test-only override can never drift from it.
@@ -178,6 +179,14 @@ export interface VaultRuntimeOptions {
 	relayConfig?: RelayConfig;
 	/** Relay v2 spike: TEST-ONLY relay debug routes (Worker-gated like simulate-restart). */
 	relayDebugRoutes?: boolean;
+	/**
+	 * Write-budget D8: records Cloudflare's free-tier daily row limit (see
+	 * dailyLimit.ts). Hosts that instrument storage share one latch across
+	 * runtime swaps; absent, the runtime keeps its own.
+	 */
+	dailyLimit?: DailyLimitLatch;
+	/** TEST-ONLY daily-limit simulation switch (Worker-gated like simulate-restart). */
+	simulateDailyLimit?: (enabled: boolean) => Response;
 }
 
 /** Runtime path of the experiment-only relay table-count route. */
@@ -196,11 +205,24 @@ export const SIMULATE_RESTART_RUNTIME_PATH = "/__yaos/test-only/simulate-restart
  */
 export const RELAY_CRASH_RUNTIME_PATH = "/__yaos/test-only/relay-crash";
 
+/**
+ * Runtime path of the experiment-only daily-limit simulation (D8). Reached only
+ * via the gated Worker route `POST /vault/:id/debug/simulate-daily-limit`.
+ */
+export const SIMULATE_DAILY_LIMIT_RUNTIME_PATH = "/__yaos/test-only/simulate-daily-limit";
+
+/** D8: result of arming an alarm (`failed`: setAlarm itself hit the daily row limit). */
+type AlarmArmOutcome = "armed" | "kept" | "failed";
+
+/** Delay before retrying a relay checkpoint pass that threw (not latched by the daily limit). */
+const RELAY_CHECKPOINT_FAILURE_BACKOFF_MS = 5_000;
+
 /** Schema-8 root/Markdown/Canvas composition, independent of a worker or process host. */
 export class VaultRuntime implements DrainPort {
 	private store: VaultStore;
 	private settings: SettingsSyncStore;
 	private readonly runtimeEpoch = crypto.randomUUID();
+	private readonly dailyLimit: DailyLimitLatch;
 	private readonly cache: VaultDocumentCache;
 	private readonly sockets: VaultSocketService;
 	private readonly lifecycle: VaultLifecycleService;
@@ -221,8 +243,11 @@ export class VaultRuntime implements DrainPort {
 	private readonly relay: RelayBodyService | null = null;
 	private relayStore: RelayBodyStore | null = null;
 	private relayCheckpointAlarmArmed = false;
+	/** D8 diagnostics: alarms held back to (or not armed before) the daily-limit reset. */
+	private dailyLimitAlarmHolds = 0;
 
 	constructor(private readonly options: VaultRuntimeOptions) {
+		this.dailyLimit = options.dailyLimit ?? new DailyLimitLatch();
 		this.store = new VaultStore(options.storage);
 		if ((options.relayBodies ?? relayBodiesTestDefault()) && (options.relayConfig ?? readRelayConfig(null)).leanRows) {
 			this.store.enableLeanRows();
@@ -259,6 +284,10 @@ export class VaultRuntime implements DrainPort {
 					const delay = relayConfig.groupCommit ? relayConfig.gcCatalogDelayMs
 						: this.store.leanRows ? relayConfig.leanCatalogDelayMs : 0;
 					this.options.execution.waitUntil(this.armAlarmEarliest(Date.now() + delay)
+						.then((outcome) => {
+							// D8: not armed (daily limit): let the next commit after the reset arm it.
+							if (outcome === "failed") this.relayCheckpointAlarmArmed = false;
+						})
 						.catch((error) => {
 							this.relayCheckpointAlarmArmed = false;
 							console.warn("[yaos-relay] checkpoint alarm failed", error);
@@ -268,6 +297,7 @@ export class VaultRuntime implements DrainPort {
 		}
 		socketOwner = new VaultSocketService({
 			crdtEngine,
+			decorateControl: (value) => this.dailyLimit.decorateControl(value),
 			sockets: options.sockets,
 			cache: this.cache,
 			vaultId,
@@ -364,7 +394,7 @@ export class VaultRuntime implements DrainPort {
 		);
 		this.recovery = new VaultRecoveryService({
 			alarms: {
-				setAlarm: (scheduledTime) => this.armAlarmEarliest(scheduledTime),
+				setAlarm: (scheduledTime) => this.armAlarmEarliest(scheduledTime).then(() => undefined),
 				deleteAlarm: () => options.alarms.deleteAlarm(),
 				getAlarm: () => options.alarms.getAlarm?.() ?? Promise.resolve(null),
 			},
@@ -398,6 +428,9 @@ export class VaultRuntime implements DrainPort {
 		const parts = pathParts(url.pathname);
 		if (!parts) return json({ error: "not_found" }, 404);
 		try {
+			// D8: await every route (an un-awaited rejected promise would skip the catch below
+			// and surface as an untyped 500 instead of the typed daily-limit 503).
+			return await (async (): Promise<Response> => {
 			if (request.method === "POST" && url.pathname === "/__yaos/provision") return await this.provision(vaultId, request);
 			const metadata = this.store.vaultMetadata();
 			if (!metadata) return json({ error: "vault_not_provisioned" }, 409);
@@ -413,6 +446,11 @@ export class VaultRuntime implements DrainPort {
 				return this.options.simulateRestart && this.relay?.config.groupCommit && this.options.relayDebugRoutes
 					? await this.options.simulateRestart("relay-crash")
 					: json({ error: "not_found" }, 404);
+			}
+			if (request.method === "POST" && url.pathname === SIMULATE_DAILY_LIMIT_RUNTIME_PATH) {
+				if (!this.options.simulateDailyLimit) return json({ error: "not_found" }, 404);
+				const body = await request.json().catch(() => ({})) as { enabled?: unknown };
+				return this.options.simulateDailyLimit(body.enabled !== false);
 			}
 			if (request.method === "GET" && url.pathname === RELAY_TABLE_COUNTS_RUNTIME_PATH) {
 				return this.relayStore && this.options.relayDebugRoutes
@@ -591,8 +629,13 @@ export class VaultRuntime implements DrainPort {
 			if (request.method === "GET" && url.pathname === "/health") return this.health();
 			if (request.method === "GET" && url.pathname === "/diagnostics") return this.diagnostics();
 			return json({ error: "not_found" }, 404);
+			})();
 		} catch (error) {
 			console.error("[yaos-vault] request failed", error);
+			// D8: Cloudflare's free-tier daily row limit is a typed, retry-after answer.
+			if (this.dailyLimit.note(error) || this.dailyLimit.active()) {
+				return dailyLimitResponse(Date.now(), this.dailyLimit.body()?.kind);
+			}
 			return json({ error: error instanceof Error ? error.message : "vault_runtime_failed" }, 500);
 		}
 	}
@@ -787,6 +830,22 @@ export class VaultRuntime implements DrainPort {
 	}
 
 	async alarm(): Promise<void> {
+		try {
+			await this.alarmPass();
+		} catch (error) {
+			// D8: a pass that failed on the latched daily row limit must not throw
+			// (the platform would retry the alarm with backoff, each retry failing
+			// on the same limit). Work resumes after the reset; see setAlarmGuarded.
+			if (this.dailyLimit.note(error) || this.dailyLimit.active()) {
+				console.warn("[yaos-vault] alarm pass stopped: Cloudflare daily row limit");
+				await this.setAlarmGuarded(Date.now(), true).catch(() => undefined);
+				return;
+			}
+			throw error;
+		}
+	}
+
+	private async alarmPass(): Promise<void> {
 		this.wakeResync();
 		for (const documentId of Object.keys(this.cache.diagnostics().pending)) await this.flushDocument(documentId);
 		// Relay v2: relay bodies are checkpointed only by the relay pass (byte merge,
@@ -796,16 +855,27 @@ export class VaultRuntime implements DrainPort {
 		if (this.relay) {
 			this.relayCheckpointAlarmArmed = false;
 			let relayRetry = false;
+			let relayFailed = false;
 			try {
 				relayRetry = this.relay.runCheckpointPass({ retainSequences: FEED_RETAIN_SEQUENCES,
 					skip: (documentId) => !this.isRelayBody(documentId) || this.cache.get(documentId)?.dirty === true }).retry;
 			} catch (error) {
 				relayRetry = true;
+				relayFailed = true;
+				this.dailyLimit.note(error);
 				console.warn("[yaos-relay] checkpoint pass failed", error);
 			}
 			try { this.store.pruneCandidateReceipts(Date.now()); }
 			catch (error) { console.warn("[yaos-relay] receipt pruning failed", error); }
-			if (relayRetry) await this.armAlarmEarliest(Date.now() + 1);
+			if (relayRetry) {
+				// More work: next tick. A failed pass backs off; while the daily row limit
+				// is latched, every retry would fail (and bill a setAlarm row), so hold
+				// until the reset instead of re-arming every millisecond.
+				const resetAt = this.dailyLimit.body()?.resetAt;
+				const at = typeof resetAt === "number" && resetAt > Date.now() ? resetAt
+					: relayFailed ? Date.now() + RELAY_CHECKPOINT_FAILURE_BACKOFF_MS : Date.now() + 1;
+				await this.armAlarmEarliest(at);
+			}
 		}
 		for (const documentId of this.store.listJournalCheckpointCandidates(
 			JOURNAL_COMPACT_ENTRIES, JOURNAL_COMPACT_BYTES, 25,
@@ -1248,7 +1318,9 @@ export class VaultRuntime implements DrainPort {
 			semanticCompactionDurable: durableCompaction,
 			semanticCompactionNextRetryAt: this.semanticCompaction.nextRetryAt(),
 			persistence: Object.fromEntries(this.persistence),
-			...(this.relay ? { relay: this.relay.diagnostics() } : {}) });
+			...(this.relay ? { relay: this.relay.diagnostics() } : {}),
+			dailyLimit: { active: this.dailyLimit.active(), resetAt: this.dailyLimit.body()?.resetAt ?? null,
+				alarmHolds: this.dailyLimitAlarmHolds } });
 	}
 
 	private statusObject() {
@@ -1378,7 +1450,7 @@ export class VaultRuntime implements DrainPort {
 				const prior = this.persistence.get(documentId);
 				this.persistence.set(documentId, { status: "degraded", lastError: reason,
 					lastSuccessAt: prior?.lastSuccessAt ?? null, failures: (prior?.failures ?? 0) + 1 });
-				await this.options.alarms.setAlarm(Date.now() + PERSIST_RETRY_MS);
+				await this.setAlarmGuarded(Date.now() + PERSIST_RETRY_MS, false);
 			}
 		}));
 		this.flushLanes.set(documentId, flush);
@@ -1517,10 +1589,42 @@ export class VaultRuntime implements DrainPort {
 		this.options.execution.waitUntil(task);
 	}
 
-	private async armAlarmEarliest(scheduledTime: number): Promise<void> {
-		const current = await this.options.alarms.getAlarm?.();
-		if (current !== undefined && current !== null && current <= scheduledTime) return;
-		await this.options.alarms.setAlarm(scheduledTime);
+	private async armAlarmEarliest(scheduledTime: number): Promise<AlarmArmOutcome> {
+		return await this.setAlarmGuarded(scheduledTime, true);
+	}
+
+	/**
+	 * Every alarm this runtime arms goes through here (b3 D8). While the daily
+	 * row limit is latched, no alarm is armed before the 00:00 UTC reset: each
+	 * `setAlarm` is a billed row write and the work it schedules (flush retry,
+	 * relay checkpoint/tail pass, windowed catalog alarm, compaction retry)
+	 * would fail on the same limit, so re-arming at +1 ms / +1 s turned into a
+	 * loop of failing writes. An alarm already due at or before the target is
+	 * kept (it fires once, fails, and re-arms at the reset). A `setAlarm` that
+	 * itself fails on the limit is noted and dropped: clients resend their
+	 * unacknowledged work after the reset, which re-arms what is needed.
+	 */
+	private async setAlarmGuarded(scheduledTime: number, earliest: boolean): Promise<AlarmArmOutcome> {
+		const resetAt = this.dailyLimit.body()?.resetAt ?? null;
+		const at = resetAt === null ? scheduledTime : Math.max(scheduledTime, resetAt);
+		if (earliest || resetAt !== null) {
+			const current = await this.options.alarms.getAlarm?.();
+			if (current !== undefined && current !== null && current <= at) {
+				if (resetAt !== null) this.dailyLimitAlarmHolds++;
+				return "kept";
+			}
+		}
+		if (resetAt !== null) this.dailyLimitAlarmHolds++;
+		try {
+			await this.options.alarms.setAlarm(at);
+			return "armed";
+		} catch (error) {
+			if (this.dailyLimit.note(error)) {
+				console.warn("[yaos-vault] alarm not armed: Cloudflare daily row limit");
+				return "failed";
+			}
+			throw error;
+		}
 	}
 
 	private writeLiveCheckpoint(documentId: string): void {
@@ -1563,6 +1667,8 @@ export class VaultRuntime implements DrainPort {
 }
 
 export interface CloudflareVaultEnvironment extends TestOnlyServerTimerEnv, TestOnlyDebugRouteEnv, RelayFlagEnv {
+	/** TEST-ONLY (D8): start with the daily-limit simulation on; needs YAOS_TEST_ONLY_DEBUG_ROUTES. */
+	YAOS_TEST_ONLY_SIMULATE_DAILY_LIMIT?: string;
 	YAOS_BUCKET?: R2Bucket;
 	YAOS_RECOVERY_JOBS?: DurableObjectNamespace;
 	/** The Worker's control-plane namespace; Durable Objects share the Worker's bindings. */
@@ -1579,16 +1685,29 @@ export class VaultSyncServer implements DurableObject {
 	private runtime: VaultRuntime;
 	/** Test-only: set while a simulated restart swaps the runtime. */
 	private restarting: Promise<void> | null = null;
+	/** D8: shared across simulated restarts, like the isolate it models. */
+	private readonly dailyLimit: DailyLimitLatch;
+	/** TEST-ONLY: write statements throw Cloudflare's rows-written limit error while set. */
+	private simulatedDailyLimit: boolean;
 
 	constructor(private readonly state: DurableObjectState, private readonly env: CloudflareVaultEnvironment) {
+		this.dailyLimit = new DailyLimitLatch();
+		this.simulatedDailyLimit = testOnlyDebugRoutesEnabled(env) && env.YAOS_TEST_ONLY_SIMULATE_DAILY_LIMIT === "true";
 		this.runtime = this.createRuntime(state, env);
 	}
 
 	private createRuntime(state: DurableObjectState, env: CloudflareVaultEnvironment): VaultRuntime {
+		const debugRoutes = testOnlyDebugRoutesEnabled(env);
 		return new VaultRuntime({
-			storage: state.storage as VaultRuntimeStoragePort,
+			storage: instrumentStorageForDailyLimit(state.storage as VaultRuntimeStoragePort, this.dailyLimit,
+				debugRoutes ? () => this.simulatedDailyLimit : undefined),
+			dailyLimit: this.dailyLimit,
+			...(debugRoutes ? { simulateDailyLimit: (enabled: boolean) => this.setSimulatedDailyLimit(enabled) } : {}),
 			sockets: new CloudflareSocketRegistry(state),
-			alarms: new CloudflareAlarmPort(state.storage),
+			// D8: alarm writes are billed rows too; instrumented so a limited
+			// setAlarm is latched (and simulated) like every other write.
+			alarms: new CloudflareAlarmPort(instrumentStorageForDailyLimit(state.storage, this.dailyLimit,
+				debugRoutes ? () => this.simulatedDailyLimit : undefined)),
 			execution: new CloudflareExecutionPort(state),
 			objectStore: env.YAOS_BUCKET ? new CloudflareObjectStore(env.YAOS_BUCKET) : undefined,
 			recoveryJobs: env.YAOS_RECOVERY_JOBS
@@ -1602,6 +1721,13 @@ export class VaultSyncServer implements DurableObject {
 			...(relayBodiesEnabled(env) ? { relayConfig: readRelayConfig(env),
 				relayDebugRoutes: testOnlyDebugRoutesEnabled(env) } : {}),
 		});
+	}
+
+	/** TEST-ONLY (D8). Toggle the simulated free-tier rows-written limit. */
+	private setSimulatedDailyLimit(enabled: boolean): Response {
+		this.simulatedDailyLimit = enabled;
+		if (!enabled) this.dailyLimit.clear();
+		return json({ simulated: "daily-limit", enabled });
 	}
 
 	/**

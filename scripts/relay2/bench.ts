@@ -19,6 +19,7 @@ import * as behaviour from "./scenarios/behaviour";
 import * as limits from "./scenarios/limits";
 import * as extra from "./scenarios/extra";
 import * as v3 from "./scenarios/v3";
+import * as wb from "./wb/scenarios";
 
 type Scenario = (ctx: RunCtx) => Promise<Record<string, unknown>>;
 const SCENARIOS: Record<string, Scenario> = {
@@ -28,6 +29,8 @@ const SCENARIOS: Record<string, Scenario> = {
 	X1: limits.X1, X2: limits.X2, X3: limits.X3, X4: limits.X4,
 	C2: extra.C2, C5: extra.C5, C6: extra.C6, K1: extra.K1, MB: extra.MB, CW: extra.CW,
 	CRASH: v3.CRASH, FENCE: v3.FENCE, HTTPSAVE: v3.HTTPSAVE,
+	// Closed-file merge (R1 emulated, R1LIVE = real CLI daemon) and D8 daily limit (DL); see wb/scenarios.ts.
+	R1: wb.R1, R1LIVE: wb.R1LIVE, DL: wb.DL,
 	diag: cost.diag,
 };
 

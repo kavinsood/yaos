@@ -86,7 +86,7 @@ host_of() { print -r -- "https://$1.kavinsood.workers.dev"; }
 done_json() { [[ -s $1 ]] && ! grep -qE '^  "error": [^n]' $1; }   # "error": null (L5) is fine
 
 # ------------------------------------------------------------------------------------------------ plan
-typeset -A LANE SPEC KIND ARGS EST
+typeset -A LANE SPEC KIND ARGS EST SEEDOF   # SEEDOF[id]: context seed (default standard)
 typeset -a ORDER_B ORDER_A
 # P <id> <lane A|B> <spec> <est min> <kind bench|l5|b5|c3|diag> <args...>
 P() {
@@ -194,6 +194,11 @@ if [[ $PLAN == v3 ]]; then
   P L5b1-v3 A v3 8 l5 --mode relay,native --burst 1 $L5F
   P L5b8-v3 A v3 9 l5 --mode native --burst 8 $L5F
   P B7-v3 A v3 2.5 bench B7 --n $(n 40 12) $( (( SMALL )) && print -- --flood-ms 10000)
+  # R1 (closed-file merge via src/sync/lineMerge.ts), R1LIVE (real daemon; needs <=100 active notes, so seed none),
+  # DL (D8 daily limit; needs debug routes; bulk phase self-skips when create-bulk is absent).
+  P R1-v3 B v3 3 bench R1 --merge-module src/sync/lineMerge.ts
+  P R1LIVE-v3 B v3 4 bench R1LIVE --merge-module src/sync/lineMerge.ts; SEEDOF[R1LIVE-v3]=none
+  P DL-v3 B v3 4 bench DL --seconds $(n 8 6) --bulk-notes $(n 60 40)
 fi
 
 write_plan() {
@@ -311,7 +316,7 @@ provision() {
   local attempt
   for attempt in 1 2 3 4; do
     (cd $TREE && RELAY2_WORKTREE=$TREE node tests/run-typescript.mjs --test-aliases scripts/relay2/context.ts \
-      --host $(host_of $w) --devices A,B,C --seed standard $ctxflags) >> $log 2>&1 && { print -r -- "$w $t0"; return 0; }
+      --host $(host_of $w) --devices A,B,C --seed ${SEEDOF[$id]:-standard} $ctxflags) >> $log 2>&1 && { print -r -- "$w $t0"; return 0; }
     print -r -- "[runfast] context attempt $attempt failed" >> $log; sleep 20
   done
   return 1

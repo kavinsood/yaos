@@ -80,6 +80,7 @@ import { OwnAwarenessProvider } from "./ownAwarenessProvider";
 import { sameAuthorityIdentity, type VaultAuthorityIdentity } from "../collaboration/authority";
 import { CanvasManager, type CanvasPersistencePort, type CanvasProjectionPort } from "./canvas/canvasManager";
 import { CanvasHttpTransport } from "./canvas/canvasTransport";
+import { dailyLimitBackoffUntil, detectDailyLimitResponses, parseDailyLimitSignal, type DailyLimitInfo } from "./dailyLimit";
 import {
 	INITIAL_SEMANTIC_EPOCH,
 	parseSemanticEpochMismatchPayload,
@@ -361,7 +362,7 @@ export type VaultControlFrame =
 	}
 	| SemanticEpochResetFrame
 	| { type: "VAULT_BACKPRESSURE"; reason: string }
-	| { type: "VAULT_ERROR"; message: string };
+	| { type: "VAULT_ERROR"; message: string; code?: string; resetAt?: number };
 export interface DiskBodyCommitInput {
 	bodyId: string;
 	path: string;
@@ -602,6 +603,12 @@ export interface VaultSyncOptions {
 	onRemoteUpdateToClosedBody?: (event: { bodyId: string; path: string }) => void;
 	onProductEvent?: (event: ProductFlightPathEventInput) => void;
 	onControlFrame?: (frame: VaultControlFrame) => void;
+	/**
+	 * D8: the server reported Cloudflare's free-tier daily row limit (typed
+	 * HTTP 503 or VAULT_ERROR code). Called on every trip; the runtime has
+	 * already backed off. The host decides how often to notify.
+	 */
+	onDailyLimit?: (info: DailyLimitInfo) => void;
 	onSemanticEpochReset?: (event: SemanticEpochResetEvent) => void | Promise<void>;
 	onSemanticEpochRebaseConflict?: (event: {
 		bodyId: string;
@@ -858,7 +865,11 @@ export function parseVaultControlFrame(payload: string): VaultControlFrame | nul
 				: null;
 		case "VAULT_ERROR":
 			return typeof record.message === "string" && record.message
-				? { type: "VAULT_ERROR", message: record.message }
+				? {
+					type: "VAULT_ERROR", message: record.message,
+					...(typeof record.code === "string" ? { code: record.code } : {}),
+					...(typeof record.resetAt === "number" ? { resetAt: record.resetAt } : {}),
+				}
 				: null;
 		default:
 			return null;
@@ -1029,6 +1040,9 @@ function adaptProvider(provider: YSyncProvider): SyncProviderPort {
 }
 
 /** Authenticated production HTTP adapter for currentness checks and durable candidates. */
+/** reconnectFloors key for the D8 back-off (not a document id). */
+const DAILY_LIMIT_FLOOR_KEY = "\0daily-limit";
+
 export class VaultSyncHttpPort implements VaultServerPort {
 	private readonly base: string;
 
@@ -1374,6 +1388,11 @@ export class VaultSync implements SyncRuntimePort {
 	private _candidatePersistenceFailureCount = 0;
 	private _rootGeneration = 0;
 	private submissionPausedUntil = 0;
+	/** D8 back-off; unlike submissionPausedUntil, VAULT_READY does not clear it. */
+	private dailyLimitPausedUntil = 0;
+	private dailyLimit: DailyLimitInfo | null = null;
+	/** Pending waitForSubmissionWindow sleeps; destroy() wakes them. */
+	private readonly submissionWindowWakers = new Set<() => void>();
 	private backpressureLevel = 0;
 	private readonly editorAdmissionSamples: EditorAdmissionSample[] = [];
 	private readonly editorAdmissionPending = new Map<string, { sample: EditorAdmissionSample; startedAt: number }>();
@@ -1407,18 +1426,20 @@ export class VaultSync implements SyncRuntimePort {
 			}
 		}
 		this.deviceId = options.deviceId;
+		const request = detectDailyLimitResponses(options.request ?? obsidianRequest,
+			(info) => this.tripDailyLimit(info), () => this.now());
 		this.server = options.server ?? new VaultSyncHttpPort(
 			options.host,
 			options.vaultId,
 			options.token,
-			options.request,
+			request,
 		);
 		const factory = options.providerFactory ?? ((input: ProviderFactoryInput) => this.createDefaultProvider(input));
 		const canvasDatabase = this.canvasPersistence(options.database);
 		this.canvases = canvasDatabase && options.canvasProjection ? new CanvasManager(
 			options.vaultGeneration,
 			canvasDatabase,
-			new CanvasHttpTransport(options.host, options.vaultId, options.token, options.request),
+			new CanvasHttpTransport(options.host, options.vaultId, options.token, request),
 			options.canvasProjection,
 			options.now,
 			32,
@@ -3640,6 +3661,7 @@ export class VaultSync implements SyncRuntimePort {
 	async destroy(): Promise<void> {
 		if (this.destroyed) return;
 		this.destroyed = true;
+		for (const wake of Array.from(this.submissionWindowWakers)) wake();
 		this.residencyRuntime.stop();
 		this.workScheduler.stop();
 		this.runtimeScope.stopAdmission();
@@ -3782,7 +3804,9 @@ export class VaultSync implements SyncRuntimePort {
 			if (committed && session
 				&& committed.vaultGeneration === this.options.vaultGeneration
 				&& committed.runtimeEpoch === session.runtimeEpoch) {
-				void this.handleDurableBodyCommitted(committed);
+				void this.handleDurableBodyCommitted(committed).catch((error) => {
+					this.log(`durable body commit handling failed: ${String(error)}`);
+				});
 			}
 			const semanticDocumentId = semanticCommittedDocumentId(payload);
 			if (semanticDocumentId) void this.canvases?.refresh(semanticDocumentId).catch((error) => {
@@ -4737,15 +4761,24 @@ export class VaultSync implements SyncRuntimePort {
 			}
 			return;
 		}
+		// b3 fix: a BODY_COMMITTED frame can arrive after destroy() stopped the
+		// scheduler; queueBodyWake then rejects ("vault work scheduler is stopped")
+		// and the caller's `void` turned it into an unhandled rejection.
+		if (this.destroyed) return;
 		const session = this.sessions.get(notification.bodyId);
 		if (!session || !session.provider.synced || !session.provider.wsconnected
 			|| session.provider.ws?.readyState !== 1) {
-			await this.workScheduler.queueBodyWake(
-				notification.bodyId,
-				notification.durableGeneration,
-				"background",
-			);
-			await this.workScheduler.whenIdle();
+			try {
+				await this.workScheduler.queueBodyWake(
+					notification.bodyId,
+					notification.durableGeneration,
+					"background",
+				);
+				await this.workScheduler.whenIdle();
+			} catch (error) {
+				if (this.destroyed) return;
+				throw error;
+			}
 		}
 	}
 
@@ -4890,6 +4923,8 @@ export class VaultSync implements SyncRuntimePort {
 		} else {
 			this.submissionPausedUntil = Math.max(this.submissionPausedUntil, this.now() + 1_000);
 			this.log(`server vault error: ${frame.message}`);
+			const dailyLimit = parseDailyLimitSignal(frame, this.now());
+			if (dailyLimit) this.tripDailyLimit(dailyLimit);
 		}
 		this.options.onControlFrame?.(frame);
 	}
@@ -4955,10 +4990,46 @@ export class VaultSync implements SyncRuntimePort {
 		}
 	}
 
+	/**
+	 * D8: Cloudflare's free-tier daily row limit. Hold submissions and every
+	 * reconnect until the UTC reset (probing at most hourly), instead of the
+	 * 1 s VAULT_ERROR pause that would retry writes all day.
+	 */
+	tripDailyLimit(info: DailyLimitInfo): void {
+		const until = dailyLimitBackoffUntil(info, this.now());
+		this.dailyLimit = info;
+		this.dailyLimitPausedUntil = Math.max(this.dailyLimitPausedUntil, until);
+		this.holdReconnectFloor(DAILY_LIMIT_FLOOR_KEY, until - this.now());
+		this.log(`cloudflare daily limit (${info.kind}); backing off until ${new Date(until).toISOString()}`);
+		this.options.onDailyLimit?.(info);
+	}
+
+	/** The active daily-limit trip, or null once its reset time has passed. */
+	getDailyLimitState(): DailyLimitInfo | null {
+		if (this.dailyLimit && this.now() >= this.dailyLimit.resetAt) this.dailyLimit = null;
+		return this.dailyLimit;
+	}
+
+	/**
+	 * Waits out the VAULT_ERROR pause and the D8 daily-limit back-off (up to an
+	 * hour). Cancellable: destroy() wakes every waiter so teardown never waits
+	 * for the back-off (b3 fix: destroy() used to hang here via whenIdle()).
+	 * b3-bulk hook: bulk create admission goes through here too
+	 * (commitCreateAdmissionRequests), so it is held by the same back-off.
+	 */
 	private async waitForSubmissionWindow(): Promise<void> {
-		const remaining = this.submissionPausedUntil - this.now();
+		if (this.destroyed) throw new Error("runtime destroyed during submission backoff");
+		const remaining = Math.max(this.submissionPausedUntil, this.dailyLimitPausedUntil) - this.now();
 		if (remaining <= 0) return;
-		await new Promise<void>((resolve) => window.setTimeout(resolve, remaining));
+		await new Promise<void>((resolve) => {
+			const wake = () => {
+				window.clearTimeout(timer);
+				this.submissionWindowWakers.delete(wake);
+				resolve();
+			};
+			const timer = window.setTimeout(wake, remaining);
+			this.submissionWindowWakers.add(wake);
+		});
 		if (this.destroyed) throw new Error("runtime destroyed during submission backoff");
 	}
 

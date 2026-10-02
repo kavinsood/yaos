@@ -88,6 +88,8 @@ interface ClosedFixture {
 	diskIndex: () => DiskIndex;
 	ingest: (reason?: "create" | "modify") => Promise<void>;
 	applyRemote: (content: string) => void;
+	/** A remote peer's arbitrary (non-append) edit to the body, as a Yjs update. */
+	replaceRemote: (content: string) => void;
 	releaseSubmissions: () => void;
 	destroy: () => Promise<void>;
 }
@@ -375,6 +377,23 @@ async function closedBodyFixture(options: {
 			const text = peer.getText("body");
 			const before = Y.encodeStateVector(peer);
 			text.insert(text.length, content.slice(text.length));
+			const target = runtime.getTextForPath(path)?.doc;
+			if (!target) throw new Error("body is not loaded");
+			Y.applyUpdate(target, Y.encodeStateAsUpdate(peer, before), "server-catch-up");
+		},
+		replaceRemote: (content: string) => {
+			const text = peer.getText("body");
+			const current = text.toString();
+			let prefix = 0;
+			while (prefix < current.length && prefix < content.length && current[prefix] === content[prefix]) prefix++;
+			let suffix = 0;
+			while (suffix < current.length - prefix && suffix < content.length - prefix
+				&& current[current.length - 1 - suffix] === content[content.length - 1 - suffix]) suffix++;
+			const before = Y.encodeStateVector(peer);
+			peer.transact(() => {
+				text.delete(prefix, current.length - prefix - suffix);
+				text.insert(prefix, content.slice(prefix, content.length - suffix));
+			});
 			const target = runtime.getTextForPath(path)?.doc;
 			if (!target) throw new Error("body is not loaded");
 			Y.applyUpdate(target, Y.encodeStateAsUpdate(peer, before), "server-catch-up");
@@ -1147,6 +1166,109 @@ s.test("round 4 (3): a remote materialization never commits a disk merge the gua
 	assert.equal(fixture.runtime.getPathContent("Closed.md"), fmRemote, "the stripped-YAML merge is not committed");
 	assert.equal(fixture.submissions.length, 0);
 	assert.equal(fixture.disk(), `local heading\n${BASE}`);
+	await fixture.destroy();
+});
+
+// ---------------------------------------------------------------------------
+// Write-budget spike W3 / D4: closed-file reconcile is a three-way LINE merge
+// (diff3: base = last-synced common base, ours = disk, theirs = server body).
+// ---------------------------------------------------------------------------
+
+const DOC = "# Title\n\nalpha line\n\nbeta line\n\ngamma line\n";
+const DOC_DISK = DOC.replace("alpha line", "alpha line (edited on disk while closed)");
+const DOC_REMOTE = DOC.replace("gamma line", "gamma line (edited on device A)");
+const DOC_BOTH = DOC_DISK.replace("gamma line", "gamma line (edited on device A)");
+
+s.test("D4: closed-file edit on the disk side only is imported as a CRDT edit", async () => {
+	const fixture = await closedBodyFixture({
+		disk: DOC_DISK, baseline: DOC, loadBody: true, realMirror: true, commonBase: DOC, seedContent: DOC,
+	});
+	await fixture.ingest();
+	await eventually(() => fixture.runtime.getPathContent("Closed.md") === DOC_DISK, "the disk edit is imported");
+	assert.equal(fixture.submissions.length, 1, "one candidate");
+	assert.equal(fixture.artifacts.size, 0);
+	assert.equal(fixture.disk(), DOC_DISK);
+	await fixture.destroy();
+});
+
+s.test("D4: closed-file edit on the server side only is written to disk", async () => {
+	const fixture = await closedBodyFixture({
+		disk: DOC, baseline: DOC, loadBody: true, realMirror: true, commonBase: DOC, seedContent: DOC,
+	});
+	fixture.replaceRemote(DOC_REMOTE);
+	fixture.controller.scheduleRemoteBodyMaterialization("Closed.md");
+	await eventually(() => fixture.disk() === DOC_REMOTE, "the remote edit reaches disk");
+	assert.equal(fixture.submissions.length, 0, "no candidate: disk carried no local edit");
+	assert.equal(fixture.artifacts.size, 0);
+	await fixture.destroy();
+});
+
+for (const trigger of ["remote materialization", "disk ingest"] as const) {
+	s.test(`D4: both sides changed different lines -> merged into the body and disk, no conflict copy (${trigger})`, async () => {
+		const fixture = await closedBodyFixture({
+			disk: DOC_DISK, baseline: DOC, loadBody: true, realMirror: true, commonBase: DOC, seedContent: DOC,
+		});
+		fixture.replaceRemote(DOC_REMOTE);
+		if (trigger === "disk ingest") await fixture.ingest();
+		else fixture.controller.scheduleRemoteBodyMaterialization("Closed.md");
+		await eventually(() => fixture.disk() === DOC_BOTH, "the merge reaches disk");
+		assert.equal(fixture.runtime.getPathContent("Closed.md"), DOC_BOTH, "the body holds both edits");
+		assert.equal(fixture.submissions.length, 1, "the merge is committed once, as a normal CRDT edit");
+		assert.equal(fixture.artifacts.size, 0, "a clean merge needs no conflict note");
+		assert.deepEqual(fixture.reviews, []);
+		await fixture.destroy();
+	});
+}
+
+s.test("D4: both sides changed the same line -> conflict copy, nothing is lost", async () => {
+	// A character merge would combine these two edits of one line into a line
+	// neither side wrote ("Alpha line!"); the line merge reports a conflict.
+	const disk = DOC.replace("alpha line", "Alpha line");
+	const remote = DOC.replace("alpha line", "alpha line!");
+	const fixture = await closedBodyFixture({
+		disk, baseline: DOC, loadBody: true, realMirror: true, commonBase: DOC, seedContent: DOC,
+	});
+	fixture.replaceRemote(remote);
+	fixture.controller.scheduleRemoteBodyMaterialization("Closed.md");
+	await eventually(() => fixture.artifacts.size > 0, "a conflict note is written");
+	await new Promise((resolve) => setTimeout(resolve, 300));
+	assert.equal(fixture.disk(), disk, "the disk edit stays at the path");
+	assert.equal(fixture.runtime.getPathContent("Closed.md"), remote, "the server edit stays in the body");
+	assert.deepEqual([...fixture.artifacts.values()], [remote], "the server side is preserved as a conflict copy");
+	assert.equal(fixture.submissions.length, 0, "nothing was merged or imported");
+	assert.deepEqual(fixture.reviews, ["Closed.md"], "the overlap is offered for review once");
+	await fixture.destroy();
+});
+
+s.test("D4: no base, identical content -> skipped (no candidate, no write, no conflict copy)", async () => {
+	const fixture = await closedBodyFixture({
+		disk: DOC_REMOTE, baseline: null, loadBody: true, realMirror: true, commonBase: null, seedContent: DOC,
+	});
+	fixture.replaceRemote(DOC_REMOTE);
+	await fixture.ingest();
+	await new Promise((resolve) => setTimeout(resolve, 200));
+	assert.equal(fixture.submissions.length, 0, "0 rows: nothing is sent");
+	assert.equal(fixture.artifacts.size, 0);
+	assert.equal(fixture.disk(), DOC_REMOTE);
+	assert.equal(fixture.runtime.getPathContent("Closed.md"), DOC_REMOTE);
+	assert.equal(fixture.diskIndex()["Closed.md"]?.contentHash, await contentBaselineHash(DOC_REMOTE),
+		"agreement is recorded as the new baseline");
+	await fixture.destroy();
+});
+
+s.test("D4: no base, different content -> disk conflict copy, server version at the path (no superset heuristic)", async () => {
+	// Disk is a strict superset of the server text. "Superset wins" would import
+	// it (and resurrect anything the server deleted); D4 preserves a copy instead.
+	const superset = `${DOC_REMOTE}extra local line\n`;
+	const fixture = await closedBodyFixture({
+		disk: superset, baseline: null, loadBody: true, realMirror: true, commonBase: null, seedContent: DOC,
+	});
+	fixture.replaceRemote(DOC_REMOTE);
+	await fixture.ingest();
+	await eventually(() => fixture.disk() === DOC_REMOTE, "the server body is projected");
+	assert.deepEqual([...fixture.artifacts.values()], [superset], "the disk side survives as a conflict copy");
+	assert.equal(fixture.runtime.getPathContent("Closed.md"), DOC_REMOTE);
+	assert.equal(fixture.submissions.length, 0, "nothing is imported without a base");
 	await fixture.destroy();
 });
 
