@@ -1,0 +1,21 @@
+tests/client/bootstrap-http-boundaries.ts
+  s_919033a84b1dc9::t_22d4f3990236da 2,4,147-171
+tests/live/cli-bootstrap-paging.ts
+  s_919033a84b1dc9::t_4d469f1ed54507 1-76
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c0826d918508e20fcc1b2c4515f6c029a7f60cf8",
+  "prompts": {},
+  "sessions": {
+    "s_919033a84b1dc9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a927207854e0683fc",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
