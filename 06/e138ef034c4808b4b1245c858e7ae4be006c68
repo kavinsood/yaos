@@ -1,0 +1,145 @@
+docs/relay2-protocol.md
+  s_da4ca900883079::t_744de552084434 521-522
+packages/server-node/src/index.ts
+  s_da4ca900883079::t_306696d63bb77b 8,113
+scripts/measure-multiplexing.ts
+  s_da4ca900883079::t_7d8feac4634f4c 337,339,361
+scripts/relay2/context.ts
+  s_da4ca900883079::t_8f25f11842e254 16,24-31,47
+scripts/relay2/costmodel.py
+  s_da4ca900883079::t_82fd0755d6c8c4 15-17,223-227
+scripts/relay2/deploy.sh
+  s_da4ca900883079::t_3abc1683a068ab 5-8,33,43,84-89
+scripts/relay2/lib/common.ts
+  s_da4ca900883079::t_6a5bc7f4b54ead 66-70
+scripts/relay2/lib/context.ts
+  s_da4ca900883079::t_f334b0d7d148f0 8,229,233
+scripts/relay2/lib/rawClient.ts
+  s_da4ca900883079::t_713d55f68f45f5 365
+scripts/relay2/lib/run.ts
+  s_da4ca900883079::t_9bac617fb1ef8a 71-74,77-83
+scripts/relay2/summarize.py
+  s_da4ca900883079::t_297592b4b6e59c 548-651,666-671
+scripts/relay2/wb/bulk-rows.ts
+  s_da4ca900883079::t_9e07a7acb8b517 1-90
+scripts/relay2/wb/corpus.ts
+  s_da4ca900883079::t_e576b498d2cca1 1-260
+scripts/relay2/wb/plan-compare.ts
+  s_da4ca900883079::t_5660c394169e13 1-60
+scripts/relay2/wb/realClient.ts
+  s_919033a84b1dc9::t_ef746189ba6aca 3,42,164
+scripts/relay2/wb/sql-capture.mjs
+  s_da4ca900883079::t_c414565ed2e2e6 1-24
+scripts/relay2/wb/wbmodel.py
+  s_da4ca900883079::t_5bfcdca6f9e875 1-281
+server/src/crdt/rootSchema.ts
+  s_da4ca900883079::t_e2b25e2358dddd 18-30
+server/src/index.ts
+  s_da4ca900883079::t_a4037e8e2be660 2,103-105,148-149,321-326
+server/src/relayFlag.ts
+  s_da4ca900883079::t_2f8654613f9957 39-41,201-227
+server/src/routes/auth.ts
+  s_da4ca900883079::t_e046d5b0d39f24 28,294,316-317
+server/src/routes/types.ts
+  s_da4ca900883079::t_0d7b73c741e181 23-25
+server/src/routes/vault.ts
+  s_da4ca900883079::t_ef40fe6226cf65 11,46-47
+server/src/server.ts
+  s_da4ca900883079::t_f1c5240a36aec1 28,41,44,182-183,194-197,200-203,241,373-386,482-488,605-610,1730-1731,1736,1742-1746,1748,1754,1765-1766
+server/src/sqlRowCounter.ts
+  s_da4ca900883079::t_9d55cef4c5568b 1-125
+server/src/vaultBulkCreateService.ts
+  s_da4ca900883079::t_5b5c60c6bb3216 1-581
+server/src/vaultCandidateService.ts
+  s_da4ca900883079::t_f43ef409e75813 201,203,213,226,240,253,281,288,327,331
+server/src/vaultCatalogStore.ts
+  s_da4ca900883079::t_8ff215d30c6d9b 497-499
+server/src/vaultDocumentStore.ts
+  s_da4ca900883079::t_d69d8ac7bf1513 472-482,527-532,544-546,560,648,826,1020-1047
+server/src/vaultLifecycleService.ts
+  s_da4ca900883079::t_ae84e21b898c93 137,143,314-317
+server/src/vaultStore.ts
+  s_da4ca900883079::t_756d9970c71bb6 12-13,22,75-108,463,473,748,1072-1346
+src/main.ts
+  s_da4ca900883079::t_c5189cc384957e 932,1011,1026-1031
+src/onboarding/localVaultImport.ts
+  s_da4ca900883079::t_0f5a9bac2b66c9 11,103-104,260,263-267,401,416,424
+src/sync/bulkCreateCaps.ts
+  s_da4ca900883079::t_3c9bf9858ce38b 1-50
+src/sync/serverCapabilities.ts
+  s_da4ca900883079::t_4cc1eeb2b21019 20-21
+src/sync/vaultSync.ts
+  s_da4ca900883079::t_e4280884929bd5 84-90,403-411,413,491-495,501-598,611-612,686-689,706-715,1080-1084,1090-1093,1099-1100,1310,1312,1314-1321,1324-1325,1452-1462,1475-1476,1846,1932-1933,2218-2231,2267-2356,2378-2382,2840-2848,2858-2859,2861-2874,2877-2891,2894-2901,2903-2913,2915-2926,2928-2939,2941-2950,2952-2956,2961-2987,2998,3002,3005,3016-3045,3048-3049,3051-3131,3133-3145,3148-3149,3151-3155,3157-3163,3165-3168,3170-3233,3235-3254,3256-3464,5719-5722,6082-6089,6178-6187,6191
+tests/client/active-lifecycle-replay.ts
+  s_da4ca900883079::t_012315b478ccb5 5,15,20-41,61-63,65,69,76,80,87-93,102,108-113,115-148,151-153,156-161,163,167-170
+tests/client/authority-outcome-recovery.ts
+  s_da4ca900883079::t_51e3871825b54f 112
+tests/client/bootstrap-http-boundaries.ts
+  s_da4ca900883079::t_b60199acc638a6 15,216,218-224,231,235-236,241,245,247-250,252,255-257,263,266-275
+tests/client/bulk-create-client.ts
+  s_da4ca900883079::t_0ae4a1f3c83f5a 2-14,16-17,19-27,31-33,35-49,52-71,74-105,108-167,169-208
+tests/client/bulk-create-relay-receipts.ts
+  s_da4ca900883079::t_18d971809e0232 1-286
+tests/client/fresh-large-http-roundtrips.ts
+  s_da4ca900883079::t_16967231741c46 3,9,13,18-29,32,37-38,41,47-61,67,75-76,79,84-87,89-91
+tests/client/helpers/fakeBulkCreateServer.ts
+  s_da4ca900883079::t_6bdf2795e007e7 1-249
+tests/client/onboarding-import.ts
+  s_da4ca900883079::t_20c32bbb87cbc3 289-291
+tests/client/semantic-epoch-runtime.ts
+  s_da4ca900883079::t_0caf097648edc6 314,316,323,325-326
+tests/conformance/client.ts
+  s_da4ca900883079::t_6e011139fa2b45 272-273,275-277,305-314,316-327
+tests/conformance/fixtures/capabilities.ts
+  s_da4ca900883079::t_07d207bb70909c 10,31-32
+tests/conformance/fixtures/root-body.ts
+  s_da4ca900883079::t_0fba67da47214e 9,17
+tests/headless/schema4.ts
+  s_da4ca900883079::t_144f1abc1f2f28 289,292,294-295,463-469,471-476,478-482
+tests/live/schema4Live.ts
+  s_da4ca900883079::t_a832d9f4904d4f 188,191,193,197,248-264,266-271,274-282
+tests/server/bulk-create-runtime.ts
+  s_da4ca900883079::t_1b93df01502fa2 1-394
+tests/server/helpers/cfRowModel.ts
+  s_da4ca900883079::t_628d26f067d59e 1-117
+tests/server/helpers/planCompare.ts
+  s_da4ca900883079::t_dfab1894676119 1-80
+tests/server/relay3-bulk-create.ts
+  s_da4ca900883079::t_c382a274f7660f 1-498
+tests/server/relay3-group-commit.ts
+  s_da4ca900883079::t_3484a7bf01b26f 1174-1177
+tests/server/server-hardening.ts
+  s_da4ca900883079::t_010cdeec4bb8fc 115
+tests/server/server-route-classification-runtime.ts
+  s_da4ca900883079::t_cef2210cd6dd42 43,73-75
+tests/server/settings-sync-route-authority.ts
+  s_da4ca900883079::t_ee091712e9374f 6,157,162,169-204
+tests/server/vault-candidate-runtime.ts
+  s_da4ca900883079::t_c4ecd71de30600 113,115,120-127
+tests/server/wb-int-bulk.ts
+  s_da4ca900883079::t_93b80ebdb3ba38 1-365
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "06e138ef034c4808b4b1245c858e7ae4be006c68",
+  "prompts": {},
+  "sessions": {
+    "s_919033a84b1dc9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a927207854e0683fc",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_da4ca900883079": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ad8127dcef3a8a877",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
