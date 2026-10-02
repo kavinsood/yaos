@@ -597,8 +597,19 @@ s.test("a socket joining while frames are buffered gets them after its step2 (no
 	});
 });
 
-s.test("G2/epoch at flush: a device revoked while buffered is dropped (4403); an epoch change fences the buffer", async () => {
+/** What a peer socket holds: the durable base it synced plus every relayed frame it received. */
+function peerView(base: Uint8Array, socket: FakeSocket): string {
+	const view = new Y.Doc();
+	try {
+		Y.applyUpdate(view, base);
+		for (const value of socket.frames()) Y.applyUpdate(view, value.payload);
+		return view.getText("body").toString();
+	} finally { view.destroy(); }
+}
+
+s.test("G2/epoch at flush (R11 safety net): a device revoked while buffered without a fence flush is still committed (it was broadcast), then 4403; an epoch change fences the buffer", async () => {
 	await withRelay(({ store, relay, socket, update, seed, revoke, tail, envelope }) => {
+		const base = Y.encodeStateAsUpdate(seed);
 		const a = socket();
 		const b = socket(peer);
 		const writerA = cloneOf(seed);
@@ -606,15 +617,25 @@ s.test("G2/epoch at flush: a device revoked while buffered is dropped (4403); an
 		envelope(a, fromA, { candidateId: "rev-a" });
 		update(a, fromA);
 		update(b, textUpdate(seed, (text) => text.insert(0, "B")));
-		assert.equal(b.binary.length, 1, "documented: a revoked device's buffered frame has already reached peers");
+		assert.equal(b.binary.length, 1, "a's frame reached the peer at receipt");
+		// An authority writer that skipped flushForAuthorityFence (R11 deployed shape).
 		revoke(owner.deviceId);
 		relay.flushBatch(BODY);
 		assert.equal(a.closed?.code, 4403);
-		assert.equal(a.all("BODY_COMMITTED").length, 0, "never acked");
 		assert.equal(b.closed, null);
-		assert.equal(relay.counters.authorityDrops, 1);
-		assert.equal(tail()!.frames, 1);
-		assert.equal(reconstructedText(store), "Bhello");
+		assert.equal(relay.counters.authorityDrops, 0, "v3 never drops a broadcast frame");
+		assert.equal(relay.counters.revokedBroadcastCommits, 1);
+		assert.equal(relay.counters.appendFrames, 2);
+		assert.equal(peerView(base, b).includes("A"), true, "b holds a's frame");
+		Y.applyUpdate(seed, fromA);
+		assert.equal(reconstructedText(store), seed.getText("body").toString(), "durable == the merged peer state");
+		assert.ok(reconstructedText(store).includes("A") && reconstructedText(store).includes("B"));
+		// A later frame from the revoked socket never reaches peers or storage.
+		const late = textUpdate(writerA, (text) => text.insert(0, "Z"));
+		update(a, late);
+		relay.flushBatch(BODY);
+		assert.equal(b.binary.length, 1);
+		assert.equal(relay.counters.appendFrames, 2);
 		assert.equal(outcomes(relay), relay.counters.updateFrames);
 		writerA.destroy();
 	});
@@ -657,6 +678,93 @@ s.test("G2/epoch at flush: a device revoked while buffered is dropped (4403); an
 		assert.equal(tail()!.frames, 1);
 		assert.equal(reconstructedText(store), "Qhello");
 	}, { resetCooldownMs: 0 });
+});
+
+s.test("R11: revocation while frames are buffered: the fence flush commits every broadcast frame first; peers and durable state converge", async () => {
+	await withRelay(({ store, relay, socket, update, envelope, seed, revoke, tail, clock }) => {
+		const base = Y.encodeStateAsUpdate(seed);
+		const a = socket();
+		const b = socket(peer);
+		const writerA = cloneOf(seed);
+		const ids: string[] = [];
+		for (let index = 0; index < 10; index++) {
+			const bytes = textUpdate(writerA, (text) => text.insert(text.length, `${index}`));
+			const clientFrameId = `r11-${index}`;
+			ids.push(clientFrameId);
+			envelope(a, bytes, { clientFrameId, candidateId: `r11-c${index}` });
+			update(a, bytes);
+		}
+		assert.equal(b.frames().length, 10, "10 frames broadcast while buffered (the B4 shape)");
+		assert.equal(ackedIds(a).length, 0);
+		// Server order (server.ts installAuthorityFence / revoke-device-sockets): fence flush, then the write, same turn.
+		relay.flushForAuthorityFence();
+		revoke(owner.deviceId);
+		assert.equal(relay.counters.authorityFenceFlushes, 1);
+		assert.deepEqual(ackedIds(a), ids, "all 10 committed under the authority that relayed them");
+		assert.equal(relay.counters.appendFrames, 10);
+		// The same socket sends again inside the actor-cache TTL (same clock): the bump makes the check fresh.
+		const after = textUpdate(writerA, (text) => text.insert(0, "LATE"));
+		envelope(a, after, { clientFrameId: "r11-late", candidateId: "r11-late" });
+		update(a, after);
+		assert.equal(a.closed?.code, 4403, "refused at receipt");
+		assert.equal(b.frames().length, 10, "never broadcast");
+		relay.flushBatch(BODY);
+		clock.now += 60_000;
+		relay.flushAllBatches();
+		assert.equal(relay.counters.appendFrames, 10, "never appended");
+		assert.equal(relay.counters.revokedBroadcastCommits, 0, "the safety net was not needed");
+		assert.equal(relay.counters.authorityDrops, 0);
+		assert.equal(reconstructedText(store), peerView(base, b), "peer == durable");
+		assert.ok(!reconstructedText(store).includes("LATE"));
+		assert.equal(outcomes(relay), relay.counters.updateFrames);
+		writerA.destroy();
+	});
+});
+
+s.test("R11: revocation racing broadcast: frames before the fence are broadcast and committed, frames after it neither; the other device keeps relaying", async () => {
+	await withRelay(({ store, relay, socket, update, envelope, seed, revoke, tail }) => {
+		const base = Y.encodeStateAsUpdate(seed);
+		const a = socket();
+		const b = socket(peer);
+		const c = socket(peer);
+		const writerA = cloneOf(seed);
+		const writerB = cloneOf(seed);
+		// Interleave: a, b, a | fence | a, b, a.
+		const sendA = (label: string) => {
+			const bytes = textUpdate(writerA, (text) => text.insert(text.length, label));
+			envelope(a, bytes, { clientFrameId: label, candidateId: label });
+			update(a, bytes);
+		};
+		const sendB = (label: string) => {
+			const bytes = textUpdate(writerB, (text) => text.insert(0, label));
+			envelope(b, bytes, { clientFrameId: label, candidateId: label });
+			update(b, bytes);
+		};
+		sendA("a1"); sendB("b1"); sendA("a2");
+		relay.flushForAuthorityFence();
+		revoke(owner.deviceId);
+		sendA("a3"); sendB("b2"); sendA("a4");
+		relay.flushBatch(BODY);
+		assert.equal(a.closed?.code, 4403);
+		assert.equal(relay.counters.authorityCloses, 1, "a3 refused at receipt; a4 dropped after the refusal");
+		assert.equal(relay.counters.failedSocketDrops, 1);
+		assert.deepEqual(ackedIds(a), ["a1", "a2"]);
+		assert.deepEqual(ackedIds(b), ["b1", "b2"]);
+		assert.equal(relay.counters.appendFrames, 4, "a1 b1 a2 b2");
+		const durable = reconstructedText(store);
+		for (const label of ["a1", "a2", "b1", "b2"]) assert.ok(durable.includes(label), label);
+		for (const label of ["a3", "a4"]) assert.ok(!durable.includes(label), label);
+		assert.equal(peerView(base, c), durable, "an observer peer converges with durable state");
+		// b's view: base + what it sent + what it received.
+		const viewB = new Y.Doc();
+		Y.applyUpdate(viewB, Y.encodeStateAsUpdate(writerB));
+		for (const value of b.frames()) Y.applyUpdate(viewB, value.payload);
+		assert.equal(viewB.getText("body").toString(), durable, "the writing peer converges too");
+		viewB.destroy();
+		assert.equal(outcomes(relay), relay.counters.updateFrames);
+		writerA.destroy();
+		writerB.destroy();
+	});
 });
 
 s.test("B2: the tail cap checkpoints from the tail (snapshot overwritten, tail cleared, catalog coalesced, pins kept)", async () => {
@@ -1086,6 +1194,35 @@ s.test("relay-crash route: 404 unless test routes + group commit; otherwise drop
 			const again = await server.fetch(internal("/__yaos/provision", { method: "POST",
 				headers: { "content-type": "application/json" }, body: JSON.stringify({ vaultGeneration: DO_GENERATION }) }));
 			assert.ok(again.ok, "the new runtime serves the same storage");
+		});
+});
+
+s.test("R11 wiring: the DO flushes every group buffer in the same turn right before each authority write (fence, revoke-device-sockets)", async () => {
+	await withVaultObject({ YAOS_RELAY_BODIES: "true", YAOS_RELAY_LEAN_ROWS: "true", YAOS_RELAY_GROUP_COMMIT: "1" } as CloudflareVaultEnvironment,
+		async (server) => {
+			const provision = await server.fetch(internal("/__yaos/provision", { method: "POST",
+				headers: { "content-type": "application/json" }, body: JSON.stringify({ vaultGeneration: DO_GENERATION }) }));
+			assert.ok(provision.ok, `provision ${provision.status}`);
+			const inner = (server as unknown as { runtime: { relay: RelayBodyService; store: VaultStore } }).runtime;
+			const order: string[] = [];
+			const flush = inner.relay.flushForAuthorityFence.bind(inner.relay);
+			inner.relay.flushForAuthorityFence = () => { order.push("flush"); flush(); };
+			const install = inner.store.installAuthorityFence.bind(inner.store);
+			inner.store.installAuthorityFence = (input) => { order.push("fence"); return install(input); };
+			const revokeDevice = inner.store.revokeDevice.bind(inner.store);
+			inner.store.revokeDevice = (deviceId, now) => { order.push("revoke"); revokeDevice(deviceId, now); };
+			const fence = await server.fetch(internal("/__yaos/authority-fence", { method: "POST",
+				headers: { "content-type": "application/json" }, body: JSON.stringify({ changeId: "r11-wiring",
+					vaultId: DO_VAULT, vaultGeneration: DO_GENERATION, subjects: [
+						{ principalId: "principal-r11", role: "owner", state: "active", membershipRevision: 1 },
+						{ deviceId: "device-r11", principalId: "principal-r11", state: "active", credentialRevision: 1 },
+					] }) }));
+			assert.equal(fence.status, 200, await fence.clone().text());
+			const revoked = await server.fetch(internal("/__yaos/revoke-device-sockets", { method: "POST",
+				headers: { "content-type": "application/json" }, body: JSON.stringify({ deviceId: "device-r11" }) }));
+			assert.equal(revoked.status, 200);
+			assert.deepEqual(order, ["flush", "fence", "flush", "revoke"]);
+			assert.equal(inner.relay.counters.authorityFenceFlushes, 2);
 		});
 });
 

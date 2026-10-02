@@ -228,6 +228,16 @@ export interface RelayCounters {
 	/** v3: acks held until the socket's wake re-sync step2 was committed (then sent), and acks dropped at the cap. */
 	wakeHeldAcks: number;
 	wakeHeldAcksDropped: number;
+	/** v3 R11: synchronous flushes of every group buffer right before an authority write (fence/revoke). */
+	authorityFenceFlushes: number;
+	/**
+	 * v3 R11: buffered frames whose device lost authority before the flush but
+	 * that passed authority at receipt and were already broadcast: committed (so
+	 * durable state matches what peers applied) and the socket closed 4403.
+	 * Reachable only for an authority writer that skipped the fence flush. A
+	 * subset of appendFrames/noopSkips, not a separate outcome.
+	 */
+	revokedBroadcastCommits: number;
 }
 
 export interface RelayBodyServiceOptions {
@@ -354,7 +364,7 @@ export class RelayBodyService {
 		groupCommits: 0, groupFrames: 0, groupFlushIdle: 0, groupFlushMax: 0, groupFlushBytes: 0, groupFlushForced: 0,
 		groupBroadcasts: 0, groupDropped: 0, groupFlushDedupes: 0, tailCheckpoints: 0, tailJournalFallbacks: 0,
 		pendingReplayFrames: 0, wakeResyncs: 0, wakeResyncSockets: 0, groupFlushReads: 0, failedSocketDrops: 0,
-		wakeHeldAcks: 0, wakeHeldAcksDropped: 0,
+		wakeHeldAcks: 0, wakeHeldAcksDropped: 0, authorityFenceFlushes: 0, revokedBroadcastCommits: 0,
 	};
 	/** v3 group-commit buffers keyed by (body, epoch). */
 	private readonly groups = new Map<string, GroupBuffer>();
@@ -792,6 +802,21 @@ export class RelayBodyService {
 		return flushed;
 	}
 
+	/**
+	 * v3 R11: call synchronously (same turn, no await in between) right before
+	 * any authority write. Every buffered frame was authorised at receipt and
+	 * already broadcast, so it is committed now, under the authority that relayed
+	 * it; the writer then bumps the store's authorityVersion in the same turn, so
+	 * the next frame of a revoked device misses the actor cache, fails the fresh
+	 * check at receipt and is never broadcast nor buffered. Peers and durable
+	 * state stay equal across the fence. No-op without group commit.
+	 */
+	flushForAuthorityFence(): void {
+		if (!this.config.groupCommit) return;
+		this.counters.authorityFenceFlushes++;
+		for (const key of [...this.groups.keys()]) this.flushGroup(key, "forced");
+	}
+
 	/** v3: frames buffered for a body/epoch were broadcast before this socket joined; send them after its step2. */
 	private replayPendingGroup(socket: VaultSocketPort, attachment: VaultSocketAttachment): void {
 		const group = this.groups.get(RelayBodyService.batchKey(attachment.documentId, attachment.documentEpoch));
@@ -878,7 +903,8 @@ export class RelayBodyService {
 
 	/**
 	 * G2 + G11 for queued frames: drop frames whose device lost authority since
-	 * they were queued (4403, invariant #4 holds with batching on), and collapse
+	 * they were queued (4403, invariant #4 holds with batching on; v2 micro-batch
+	 * only: v2 broadcasts after the commit; v3 commits them, see R11), and collapse
 	 * repeated (device, candidateId) pairs inside the batch: the same digest is
 	 * acked as a dedupe of the first frame's commit, a different digest is
 	 * rejected `candidate_id_reused`. Returns the frames to commit and the
@@ -897,10 +923,20 @@ export class RelayBodyService {
 				continue;
 			}
 			if (revoked.has(frame.attachment.socketId) || !this.validateActor(frame.actor)) {
-				this.counters.authorityDrops++;
-				if (!revoked.has(frame.attachment.socketId)) this.rejectAuthority(frame.socket, false, frame.attachment.socketId, frame.seq);
-				revoked.add(frame.attachment.socketId);
-				continue;
+				if (groupedBodyId !== null) {
+					// v3 R11: the frame passed authority at receipt and peers already applied
+					// it (broadcast at receipt). Dropping it here diverged peers from durable
+					// state, so commit it; close the socket 4403 with a fence after every
+					// buffered frame (later frames are refused at receipt anyway).
+					this.counters.revokedBroadcastCommits++;
+					if (!revoked.has(frame.attachment.socketId)) this.rejectAuthority(frame.socket, false, frame.attachment.socketId);
+					revoked.add(frame.attachment.socketId);
+				} else {
+					this.counters.authorityDrops++;
+					if (!revoked.has(frame.attachment.socketId)) this.rejectAuthority(frame.socket, false, frame.attachment.socketId, frame.seq);
+					revoked.add(frame.attachment.socketId);
+					continue;
+				}
 			}
 			const candidateId = frame.envelope?.candidateId;
 			if (candidateId) {

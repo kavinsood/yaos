@@ -440,6 +440,8 @@ export class VaultRuntime implements DrainPort {
 				if (typeof body.deviceId !== "string" || !body.deviceId || body.deviceId.length > 128) {
 					return json({ error: "invalid_device_identity" }, 400);
 				}
+				// v3 R11: commit buffered (already broadcast) frames before the fence, same turn.
+				this.relay?.flushForAuthorityFence();
 				this.store.revokeDevice(body.deviceId);
 				this.relayStore?.releaseLeasesFor({ deviceIds: [body.deviceId] });
 				return json({ closed: this.sockets.closeDevice(body.deviceId) });
@@ -675,6 +677,10 @@ export class VaultRuntime implements DrainPort {
 		const subjectDigest = suppliedSubjectDigest ?? await canonicalJsonHash(subjects);
 		try {
 			await this.flushLoadedDocuments();
+			// v3 R11: no await between this flush and the fence: every frame relayed
+			// (broadcast) before the fence is committed before it, and every frame after
+			// it fails the uncached authority check at receipt (never broadcast/appended).
+			this.relay?.flushForAuthorityFence();
 			const receipt = this.store.installAuthorityFence({ changeId: input.changeId, vaultId: input.vaultId,
 				vaultGeneration: input.vaultGeneration, subjectDigest, subjects });
 			const principalIds = new Set(subjects.filter((subject) => !("deviceId" in subject))
