@@ -39,6 +39,14 @@ function validIdentity(value: string | null): value is string {
 		});
 }
 
+function sameHead(
+	a: { generation: number; semanticEpoch: SemanticEpoch; latestSequence: number } | null,
+	b: { generation: number; semanticEpoch: SemanticEpoch; latestSequence: number } | null,
+): boolean {
+	return a !== null && b !== null && a.generation === b.generation && a.semanticEpoch === b.semanticEpoch
+		&& a.latestSequence === b.latestSequence;
+}
+
 function boundedFrames(value: unknown): readonly Uint8Array[] | null {
 	const frames = value instanceof Uint8Array
 		? [value]
@@ -69,6 +77,18 @@ interface CandidateServiceOptions {
 	 * holds is validated against them and writes no body rows.
 	 */
 	flushRelay?: (bodyId: string) => void;
+	/**
+	 * Relay v3 HTTP save: commits a validated, non-creation candidate through the
+	 * relay group-commit store (tail + head + receipt ring). Returns null when it
+	 * does not apply; the base `commitCandidate` path runs instead.
+	 */
+	relayCommit?: (input: {
+		bodyId: string; bodyEpoch: SemanticEpoch; actor: VaultActorContext; candidateId: string; candidateDigest: string;
+		updates: readonly Uint8Array[]; changesState: boolean; content: { contentHash: string; size: number } | null;
+		runtimeEpoch: string;
+	}) => | { ok: true; durableGeneration: number; vaultSequence: number; bodyEpoch: SemanticEpoch }
+		| { ok: false; reason: "epoch_mismatch" | "body_not_active"; epoch: SemanticEpoch | null }
+		| null;
 	validateActor: (actor: VaultActorContext) => boolean;
 	shouldPauseAdmission?: (documentId: string) => boolean;
 }
@@ -261,7 +281,34 @@ export class VaultCandidateService {
 				this.options.cache.discardValidatedBodyUpdate(bodyId);
 				return json({ error: "authority_superseded" }, 409);
 			}
-				durable = this.options.store.commitCandidate({
+			// v3: an ordinary (non-creation) save of a relay body takes the group-commit
+			// store. The exact hash is only claimed if no commit landed since validation.
+			// (The base commitCandidate re-checks the receipt in its transaction; do the
+			// same here: a relay frame with this candidate id may have committed meanwhile.)
+			const late = creation || !this.options.relayCommit ? null
+				: this.options.store.candidateReceipt(bodyId, deviceId, candidateId);
+			if (late) {
+				this.options.cache.discardValidatedBodyUpdate(bodyId);
+				if (late.candidateDigest !== candidateDigest) return json({ error: "candidate_id_reused_with_different_digest" }, 409);
+				return json(this.receipt(late));
+			}
+			const relayed = creation ? null : this.options.relayCommit?.({
+				bodyId, bodyEpoch, actor, candidateId, candidateDigest, updates, changesState: state.changesState,
+				content: sameHead(this.options.store.documentHead(bodyId), state.expectedHead) ? state.metadata : null,
+				runtimeEpoch: this.options.runtimeEpoch,
+			}) ?? null;
+			if (relayed && !relayed.ok) {
+				this.options.cache.discardValidatedBodyUpdate(bodyId);
+				if (relayed.reason === "epoch_mismatch" && relayed.epoch !== null) {
+					return this.epochMismatch(bodyId, relayed.epoch, bodyEpoch);
+				}
+				return json({ error: "body_not_active" }, 409);
+			}
+			durable = relayed ? {
+				bodyId, clientId: deviceId, candidateId, candidateDigest, bodyEpoch: relayed.bodyEpoch,
+				durableGeneration: relayed.durableGeneration, vaultSequence: relayed.vaultSequence,
+				vaultGeneration: this.options.vaultGeneration(), runtimeEpoch: this.options.runtimeEpoch,
+			} : this.options.store.commitCandidate({
 				bodyId,
 				bodyEpoch,
 				clientId: deviceId,

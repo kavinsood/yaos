@@ -324,35 +324,78 @@ export class RelayBodyStore {
 			);
 			writeHead.toArray();
 			rowsWritten += writeHead.rowsWritten;
-			const byDevice = new Map<string, RelayReceiptEntry[]>();
-			for (const receipt of input.receipts) {
-				const entries = byDevice.get(receipt.actor.deviceId) ?? [];
-				entries.push({ b: input.bodyId, c: receipt.candidateId, d: receipt.candidateDigest, e: semanticEpoch,
-					g: generation, s: sequence, r: receipt.runtimeEpoch, t: now, p: receipt.actor.principalId,
-					m: receipt.actor.membershipRevision, k: receipt.actor.deviceCredentialRevision });
-				byDevice.set(receipt.actor.deviceId, entries);
-			}
-			for (const [clientId, entries] of byDevice) {
-				const previous = this.storage.sql.exec<{ recent: string }>(
-					"SELECT recent FROM relay_device_receipts WHERE client_id = ?", clientId);
-				const prior = parseReceiptRing(previous.toArray()[0]?.recent);
-				rowsRead += previous.rowsRead;
-				const fresh = new Set(entries.map((entry) => `${entry.b}\u0000${entry.c}`));
-				const ring = [...entries.reverse(), ...prior.filter((entry) => entry.t > now - input.receiptTtlMs
-					&& !fresh.has(`${entry.b}\u0000${entry.c}`))].slice(0, RELAY_RECEIPT_RING);
-				const write = this.storage.sql.exec(
-					`INSERT INTO relay_device_receipts(client_id, last_sequence, recent, updated_at) VALUES (?, ?, ?, ?)
-					 ON CONFLICT(client_id) DO UPDATE SET last_sequence = excluded.last_sequence,
-					   recent = excluded.recent, updated_at = excluded.updated_at`,
-					clientId, sequence, JSON.stringify(ring), now,
-				);
-				write.toArray();
-				rowsWritten += write.rowsWritten;
-			}
+			const ring = this.writeReceiptRings(input.bodyId, semanticEpoch, generation, sequence, input.receipts,
+				input.receiptTtlMs, now);
+			rowsRead += ring.rowsRead;
+			rowsWritten += ring.rowsWritten;
 			result = { vaultSequence: sequence, generation, semanticEpoch, fileId: catalog.file_id, path: catalog.path,
 				contentHash, size, rowsRead, rowsWritten, journalFallback,
 				tailFrames: journalFallback ? tail?.frames ?? 0 : records.length,
 				tailBytes: journalFallback ? tail?.byteLength ?? 0 : tailBytes };
+		});
+		return result;
+	}
+
+	/**
+	 * v3: rewrites each receiving device's receipt ring (newest first, TTL and
+	 * RELAY_RECEIPT_RING bounded): one UPSERT = 1 written row per device. Runs
+	 * inside the caller's transaction.
+	 */
+	private writeReceiptRings(bodyId: string, semanticEpoch: SemanticEpoch, generation: number, sequence: number,
+		receipts: RelayGroupCommitInput["receipts"], receiptTtlMs: number, now: number): { rowsRead: number; rowsWritten: number } {
+		let rowsRead = 0;
+		let rowsWritten = 0;
+		const byDevice = new Map<string, RelayReceiptEntry[]>();
+		for (const receipt of receipts) {
+			const entries = byDevice.get(receipt.actor.deviceId) ?? [];
+			entries.push({ b: bodyId, c: receipt.candidateId, d: receipt.candidateDigest, e: semanticEpoch,
+				g: generation, s: sequence, r: receipt.runtimeEpoch, t: now, p: receipt.actor.principalId,
+				m: receipt.actor.membershipRevision, k: receipt.actor.deviceCredentialRevision });
+			byDevice.set(receipt.actor.deviceId, entries);
+		}
+		for (const [clientId, entries] of byDevice) {
+			const previous = this.storage.sql.exec<{ recent: string }>(
+				"SELECT recent FROM relay_device_receipts WHERE client_id = ?", clientId);
+			const prior = parseReceiptRing(previous.toArray()[0]?.recent);
+			rowsRead += previous.rowsRead;
+			const fresh = new Set(entries.map((entry) => `${entry.b}\u0000${entry.c}`));
+			const ring = [...entries.reverse(), ...prior.filter((entry) => entry.t > now - receiptTtlMs
+				&& !fresh.has(`${entry.b}\u0000${entry.c}`))].slice(0, RELAY_RECEIPT_RING);
+			const write = this.storage.sql.exec(
+				`INSERT INTO relay_device_receipts(client_id, last_sequence, recent, updated_at) VALUES (?, ?, ?, ?)
+				 ON CONFLICT(client_id) DO UPDATE SET last_sequence = MAX(last_sequence, excluded.last_sequence),
+				   recent = excluded.recent, updated_at = excluded.updated_at`,
+				clientId, sequence, JSON.stringify(ring), now,
+			);
+			write.toArray();
+			rowsWritten += write.rowsWritten;
+		}
+		return { rowsRead, rowsWritten };
+	}
+
+	/**
+	 * v3 HTTP save: records a candidate that changed nothing (its bytes are
+	 * already durable) in the device's receipt ring only (1 row), so replay,
+	 * digest-reuse detection and the operation-outcome lookup behave as for a
+	 * committed candidate. Fences on the body epoch.
+	 */
+	recordRelayReceipts(input: { bodyId: string; expectedEpoch: SemanticEpoch;
+		receipts: RelayGroupCommitInput["receipts"]; receiptTtlMs: number; now?: number }):
+		{ generation: number; vaultSequence: number; semanticEpoch: SemanticEpoch; rowsWritten: number } {
+		if (!this.store.relayTail) throw new Error("relay receipts require the relay tail");
+		this.store.initialize();
+		const now = input.now ?? Date.now();
+		let result!: { generation: number; vaultSequence: number; semanticEpoch: SemanticEpoch; rowsWritten: number };
+		this.storage.transactionSync(() => {
+			const head = this.storage.sql.exec<{ generation: number; semantic_epoch: number; latest_sequence: number }>(
+				"SELECT generation, semantic_epoch, latest_sequence FROM vault_document_heads WHERE document_id = ?",
+				input.bodyId).toArray()[0];
+			if (!head) throw new RelayAppendError("body_not_active", null);
+			const semanticEpoch = parseSemanticEpoch(head.semantic_epoch);
+			if (semanticEpoch !== input.expectedEpoch) throw new RelayAppendError("epoch_mismatch", semanticEpoch);
+			const ring = this.writeReceiptRings(input.bodyId, semanticEpoch, head.generation, head.latest_sequence,
+				input.receipts, input.receiptTtlMs, now);
+			result = { generation: head.generation, vaultSequence: head.latest_sequence, semanticEpoch, rowsWritten: ring.rowsWritten };
 		});
 		return result;
 	}

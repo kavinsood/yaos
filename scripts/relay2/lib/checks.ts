@@ -172,7 +172,7 @@ const COUNTER_KEYS = ["updateFrames", ...FRAME_OUTCOMES, "emptySkips", "postComm
 	// v3 group commit (absent on v2 deployments).
 	"groupCommits", "groupFrames", "groupFlushIdle", "groupFlushMax", "groupFlushBytes", "groupFlushForced", "groupFlushDedupes",
 	"tailCheckpoints", "tailJournalFallbacks", "pendingReplayFrames", "wakeResyncs", "wakeResyncSockets",
-	"groupFlushReads", "wakeHeldAcks", "wakeHeldAcksDropped", "authorityFenceFlushes", "revokedBroadcastCommits"];
+	"groupFlushReads", "wakeHeldAcks", "wakeHeldAcksDropped", "authorityFenceFlushes", "revokedBroadcastCommits", "httpRelayCommits", "httpRelayNoops"];
 
 /** Snapshot of relay counters + every client's sent-frame totals (null counters on base / flag off). */
 export async function frameCounters(identity: LiveIdentity) {

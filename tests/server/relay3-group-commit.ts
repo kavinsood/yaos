@@ -1028,6 +1028,7 @@ s.test("HTTP reads: candidate and currentness flush the body's buffer first; an 
 			vaultId: () => VAULT_ID, vaultGeneration: () => VAULT_GENERATION, runtimeEpoch: RUNTIME,
 			flush: async () => true,
 			flushRelay: (bodyId) => { relay.flushForRead(bodyId); },
+			relayCommit: (input) => relay.commitHttpCandidate(input),
 			validateActor: () => true,
 		});
 		const bytes = textUpdate(seed, (text) => text.insert(text.length, " relayed"));
@@ -1052,10 +1053,10 @@ s.test("HTTP reads: candidate and currentness flush the body's buffer first; an 
 		assert.equal(journalRows(), rowsBefore, "no journal row for the HTTP copy");
 		assert.equal(tail()!.frames, 1);
 		console.log(`[relay3-gc] HTTP fallback of relayed bytes (incl. the flushed group commit): rows ${meter.rows}, by table ${JSON.stringify(meter.byTable)}`);
-		// The flushed group commit: tail 1 + head 1. The HTTP copy: its own idempotency
-		// receipt (outcome + candidate receipt, 1 index each); no journal, head, catalog or attribution row.
-		assert.deepEqual(meter.byTable, { relay_body_tail: 1, vault_document_heads: 1, vault_operation_outcomes: 2,
-			vault_candidate_receipts: 2 });
+		// The flushed group commit: tail 1 + head 1. The HTTP copy (a no-op): its receipt
+		// ring entry only (1 row; was outcome 2 + candidate receipt 2 before the HTTP relay path).
+		assert.deepEqual(meter.byTable, { relay_body_tail: 1, vault_document_heads: 1, relay_device_receipts: 1 });
+		assert.equal(relay.counters.httpRelayNoops, 1);
 		assert.equal(reconstructedText(store), seed.getText("body").toString());
 		// A replay of the same HTTP candidate is answered from its receipt.
 		meter.reset();
@@ -1074,6 +1075,93 @@ s.test("HTTP reads: candidate and currentness flush the body's buffer first; an 
 		assert.equal(store.documentHead(BODY)!.latestSequence, head + 2);
 		assert.equal(relay.counters.groupFlushReads, 2);
 	});
+});
+
+s.test("HTTP save row accounting: a closed-note candidate POST, base path (before) vs relay group-commit path (after)", async () => {
+	type Post = { status: number; rows: number; byTable: Record<string, number>; receipt: Record<string, unknown> };
+	const run = async (relayPath: boolean, check?: (context: { store: VaultStore; relay: RelayBodyService; relayStore: RelayBodyStore;
+		post: (bytes: Uint8Array, candidateId: string) => Promise<Post>; seed: Y.Doc; meter: Meter }) => Promise<void>) => {
+		const posts: Post[] = [];
+		await withRelay(async ({ store, relay, relayStore, seed, meter }) => {
+			const cache = new VaultDocumentCache(store, () => new Set(), () => new Set());
+			const candidates = new VaultCandidateService({
+				store, cache,
+				lifecycle: () => ({ finalizeCreation: () => "committed" }) as never,
+				sockets: () => ({ broadcastDocumentUpdate: () => {}, notifyBodyCommitted: () => {} }) as never,
+				vaultId: () => VAULT_ID, vaultGeneration: () => VAULT_GENERATION, runtimeEpoch: RUNTIME,
+				flush: async () => true,
+				flushRelay: (bodyId) => { relay.flushForRead(bodyId); },
+				...(relayPath ? { relayCommit: (input: Parameters<RelayBodyService["commitHttpCandidate"]>[0]) => relay.commitHttpCandidate(input) } : {}),
+				validateActor: () => true,
+			});
+			const post = async (bytes: Uint8Array, candidateId: string, digest = sha256HexSync(candidateDigestMaterial([bytes]))): Promise<Post> => {
+				meter.reset();
+				meter.on = true;
+				const response = await candidates.handle(BODY, new Request("https://internal/body/x/candidate", {
+					method: "POST", body: bytes, headers: { "x-yaos-candidate-id": candidateId, "x-yaos-candidate-digest": digest,
+						"x-yaos-body-epoch": String(store.documentHead(BODY)!.semanticEpoch) } }), owner);
+				meter.on = false;
+				return { status: response.status, rows: meter.rows, byTable: { ...meter.byTable },
+					receipt: await response.json() as Record<string, unknown> };
+			};
+			for (let index = 0; index < 6; index++) {
+				posts.push(await post(textUpdate(seed, (text) => text.insert(text.length, ` save${index}`)), `save-${index}`));
+			}
+			await check?.({ store, relay, relayStore, post, seed, meter });
+		});
+		return posts;
+	};
+	const before = await run(false);
+	for (const value of before) assert.equal(value.status, 200);
+	console.log(`[relay3-gc] HTTP save, base path (before): rows ${before[1]!.rows}, by table ${JSON.stringify(before[1]!.byTable)}`);
+	assert.deepEqual(before[1]!.byTable, { vault_clock: 1, vault_journal: 2, vault_mutation_attribution: 2, vault_document_heads: 2,
+		vault_catalog_events: 3, vault_operation_outcomes: 2, vault_candidate_receipts: 2 }, "14 rows (HTTPSAVE measured 13.82)");
+	const after = await run(true, async ({ store, relay, relayStore, post, seed, meter }) => {
+		assert.equal(relay.counters.httpRelayCommits, 6);
+		assert.equal(relay.counters.appendFrames, 0, "not frame outcomes");
+		assert.equal(reconstructedText(store), seed.getText("body").toString());
+		// The catalog head (tail overlay) already names the exact saved content.
+		assert.equal(store.getCatalogHeadAt(store.currentSequence(), BODY)!.contentHash,
+			contentHashOf(seed.getText("body").toString()).hash);
+		// Replay: same id and digest -> the same receipt, nothing written.
+		const ring = store.relayReceiptRing(owner.deviceId);
+		assert.equal(ring[0]!.c, "save-5");
+		const saved = textUpdate(seed, (text) => text.insert(0, "R"));
+		const first = await post(saved, "replay-1");
+		assert.equal(first.status, 200);
+		assert.equal(first.rows, 3);
+		const replay = await post(saved, "replay-1");
+		assert.equal(replay.status, 200);
+		assert.equal(replay.rows, 0, "replay is answered from the ring");
+		assert.deepEqual(replay.receipt, first.receipt);
+		const reused = await post(textUpdate(seed, (text) => text.insert(0, "X")), "replay-1");
+		assert.equal(reused.status, 409);
+		assert.equal(reused.receipt.error, "candidate_id_reused_with_different_digest");
+		// Outcome lookup (client recoverCandidateOutcome) from the ring.
+		const outcome = store.committedOperationOutcome(owner, "replay-1", sha256HexSync(candidateDigestMaterial([saved])));
+		assert.equal(outcome?.vaultSequence, store.relayReceiptRing(owner.deviceId).find((entry) => entry.c === "replay-1")!.s);
+		assert.ok(outcome!.vaultSequence > 0);
+		assert.equal(store.candidateReceipt(BODY, owner.deviceId, "replay-1")?.durableGeneration, first.receipt.durableGeneration);
+		// An identical re-save under a new id (bytes already durable): ring row only.
+		const copy = await post(saved, "copy-1");
+		assert.equal(copy.status, 200);
+		assert.deepEqual(copy.byTable, { relay_device_receipts: 1 });
+		assert.equal(relay.counters.httpRelayNoops, 1);
+		// Deferred catalog event (alarm, once per gcCatalogDelayMs window) for the six saves.
+		meter.reset();
+		meter.on = true;
+		relayStore.coalesceLeanCatalog({ bodyId: BODY });
+		meter.on = false;
+		console.log(`[relay3-gc] HTTP save, deferred catalog coalesce per window: rows ${meter.rows}, by table ${JSON.stringify(meter.byTable)}`);
+		assert.ok(meter.rows <= 5);
+	});
+	for (const value of after) assert.equal(value.status, 200);
+	console.log(`[relay3-gc] HTTP save, relay path (after): rows ${after[1]!.rows}, by table ${JSON.stringify(after[1]!.byTable)}`);
+	assert.deepEqual(after[1]!.byTable, { relay_body_tail: 1, vault_document_heads: 1, relay_device_receipts: 1 });
+	for (const [index, value] of after.entries()) {
+		assert.equal(value.receipt.durableGeneration, before[index]!.receipt.durableGeneration, "same receipt contract");
+		assert.deepEqual(Object.keys(value.receipt).sort(), Object.keys(before[index]!.receipt).sort());
+	}
 });
 
 // ---------------------------------------------------------------------------
@@ -1223,6 +1311,11 @@ s.test("R11 wiring: the DO flushes every group buffer in the same turn right bef
 			assert.equal(revoked.status, 200);
 			assert.deepEqual(order, ["flush", "fence", "flush", "revoke"]);
 			assert.equal(inner.relay.counters.authorityFenceFlushes, 2);
+			// HTTP save wiring (same flag): candidates commit through the relay group-commit store.
+			const candidateOptions = (server as unknown as { runtime: { candidates: { options: Record<string, unknown> } } })
+				.runtime.candidates.options;
+			assert.equal(typeof candidateOptions.relayCommit, "function");
+			assert.equal(typeof candidateOptions.flushRelay, "function");
 		});
 });
 

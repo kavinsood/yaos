@@ -238,6 +238,13 @@ export interface RelayCounters {
 	 * subset of appendFrames/noopSkips, not a separate outcome.
 	 */
 	revokedBroadcastCommits: number;
+	/**
+	 * v3 HTTP save: candidate POSTs for a body committed through the group-commit
+	 * store (tail + head + receipt ring) instead of the base path, and those that
+	 * changed nothing (receipt ring row only). Not frame outcomes.
+	 */
+	httpRelayCommits: number;
+	httpRelayNoops: number;
 }
 
 export interface RelayBodyServiceOptions {
@@ -365,6 +372,7 @@ export class RelayBodyService {
 		groupBroadcasts: 0, groupDropped: 0, groupFlushDedupes: 0, tailCheckpoints: 0, tailJournalFallbacks: 0,
 		pendingReplayFrames: 0, wakeResyncs: 0, wakeResyncSockets: 0, groupFlushReads: 0, failedSocketDrops: 0,
 		wakeHeldAcks: 0, wakeHeldAcksDropped: 0, authorityFenceFlushes: 0, revokedBroadcastCommits: 0,
+		httpRelayCommits: 0, httpRelayNoops: 0,
 	};
 	/** v3 group-commit buffers keyed by (body, epoch). */
 	private readonly groups = new Map<string, GroupBuffer>();
@@ -815,6 +823,67 @@ export class RelayBodyService {
 		if (!this.config.groupCommit) return;
 		this.counters.authorityFenceFlushes++;
 		for (const key of [...this.groups.keys()]) this.flushGroup(key, "forced");
+	}
+
+	/**
+	 * v3 HTTP save (closed-note path): commits a candidate POST that
+	 * VaultCandidateService already validated (ywasm apply, canonical markdown,
+	 * exact content hash) through the group-commit store: tail 1 + head 1 +
+	 * receipt ring 1 = 3 rows, instead of the base path's clock, journal,
+	 * attribution, head upsert, catalog event, operation outcome and candidate
+	 * receipt (14 rows). A candidate that changes nothing writes its ring entry
+	 * only (1 row). The ring answers replay (candidateReceipt), digest reuse and
+	 * GET operations/:id/outcome exactly like the base receipt rows. The catalog
+	 * event is coalesced later from the tail's hash (as for relay frames).
+	 * Buffered relay frames of the body commit first (same turn). Returns null
+	 * when the path does not apply (flag off, merged update over the durable
+	 * value limit): the caller uses the base path.
+	 */
+	commitHttpCandidate(input: { bodyId: string; bodyEpoch: SemanticEpoch; actor: VaultActorContext; candidateId: string;
+		candidateDigest: string; updates: readonly Uint8Array[]; changesState: boolean;
+		content: { contentHash: string; size: number } | null; runtimeEpoch: string }):
+		| { ok: true; durableGeneration: number; vaultSequence: number; bodyEpoch: SemanticEpoch }
+		| { ok: false; reason: "epoch_mismatch" | "body_not_active"; epoch: SemanticEpoch | null }
+		| null {
+		if (!this.config.groupCommit || !this.options.store().relayTail || input.updates.length === 0) return null;
+		const update = input.updates.length === 1 ? input.updates[0]! : mergeUpdates([...input.updates]);
+		if (update.byteLength > MAX_DURABLE_UPDATE_BYTES) return null;
+		this.flushForRead(input.bodyId);
+		const receipts = [{ actor: input.actor, candidateId: input.candidateId, candidateDigest: input.candidateDigest,
+			runtimeEpoch: input.runtimeEpoch }];
+		try {
+			if (!input.changesState) {
+				const recorded = this.options.relayStore().recordRelayReceipts({ bodyId: input.bodyId,
+					expectedEpoch: input.bodyEpoch, receipts, receiptTtlMs: CANDIDATE_RECEIPT_TTL_MS, now: this.now() });
+				this.counters.httpRelayNoops++;
+				this.counters.rowsWritten += recorded.rowsWritten;
+				return { ok: true, durableGeneration: recorded.generation, vaultSequence: recorded.vaultSequence,
+					bodyEpoch: recorded.semanticEpoch };
+			}
+			const result = this.options.relayStore().appendRelayGroupCommit({
+				bodyId: input.bodyId, expectedEpoch: input.bodyEpoch, update, lastActor: input.actor,
+				catalogContent: input.content, receipts, receiptTtlMs: CANDIDATE_RECEIPT_TTL_MS, now: this.now(),
+			});
+			this.counters.httpRelayCommits++;
+			this.counters.rowsWritten += result.rowsWritten;
+			if (result.journalFallback) this.counters.tailJournalFallbacks++;
+			if (result.tailBytes >= this.config.gcTailBytes || result.tailFrames >= RELAY_GC_TAIL_MAX_FRAMES
+				|| result.journalFallback) {
+				this.postCommit(() => { this.checkpointTail(input.bodyId); });
+			}
+			if (this.config.gcCatalogDelayMs > 0) this.postCommit(() => this.options.armCheckpointAlarm());
+			// The merged-bytes cache revalidates against the durable head (headState).
+			return { ok: true, durableGeneration: result.generation, vaultSequence: result.vaultSequence,
+				bodyEpoch: result.semanticEpoch };
+		} catch (error) {
+			if (error instanceof RelayAppendError) {
+				if (error.reason === "epoch_mismatch") this.invalidate(input.bodyId);
+				return { ok: false, reason: error.reason === "epoch_mismatch" ? "epoch_mismatch" : "body_not_active",
+					epoch: error.currentEpoch };
+			}
+			this.invalidate(input.bodyId);
+			throw error;
+		}
 	}
 
 	/** v3: frames buffered for a body/epoch were broadcast before this socket joined; send them after its step2. */
