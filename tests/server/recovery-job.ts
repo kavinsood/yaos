@@ -12,7 +12,6 @@ import {
 	isRecoveryGcSweepCandidate,
 	isRetryableRecoveryFailure,
 	putCreateOnlyRecoveryRoot,
-	recoveryProjectionPageAction,
 	recoveryRestoreProgress,
 	recoveryRetryDelay,
 	RecoveryJobRuntime,
@@ -88,10 +87,8 @@ s.section("Cancellation, projection, restore, purge, and GC progress");
 	const nextPrefix = advanceRecoveryPurgeProgress(0, 0);
 	s.check(!deleting.pageComplete && deleting.prefixIndex === 0, "purge repeats a nonempty generation prefix");
 	s.check(nextPrefix.pageComplete && nextPrefix.prefixIndex === 1, "purge advances only after a prefix is empty");
-	const projection = recoveryProjectionPageAction(0, false, "body-25");
-	s.check(projection.kind === "advance" && projection.cursor === "body-25", "empty nonterminal projection pages durably advance");
 	s.check(
-		!shouldTraverseRecoveryGcObject("recovery", `${recoveryPrefix(vaultId, vaultGeneration)}/content/sha256/aa/${hashA}.md.gz`, undefined)
+		!shouldTraverseRecoveryGcObject("recovery", `${recoveryPrefix(vaultId, vaultGeneration)}/state/sha256/aa/${hashA}.ystate`, undefined)
 			&& shouldTraverseRecoveryGcObject("recovery", `${recoveryPrefix(vaultId, vaultGeneration)}/manifest/sha256/aa/${hashA}.json.gz`, "active"),
 		"GC marks content directly and traverses only graph nodes",
 	);
@@ -226,7 +223,7 @@ s.test("create-only root publication reuses exact bytes and rejects poisoned obj
 	const prefix = recoveryPrefix(vaultId, vaultGeneration);
 	const encoded = await encodeSnapshotRoot(prefix, {
 		format: "yaos-recovery-v2",
-		snapshotFormatVersion: 3,
+		snapshotFormatVersion: 4,
 		snapshotId: "snapshot_1",
 		vaultIdHash: hashA,
 		vaultGenerationHash: hashB,
@@ -318,22 +315,16 @@ s.test("dispatch arms a durable successor before a slice can be lost with transi
 	}
 });
 
-s.test("capture pause and restart do not advance a fragmented recipe before its terminal cursor", async () => {
+s.test("capture content fallback retries a busy vault write and advances once on the vault's state object", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "yaos-capture-pause-"));
 	const storage = NodeSqliteStorage.open(join(directory, "state.sqlite"));
 	const bucket = new FakeObjectStore();
-	const bodyId = "fragmented-body";
+	const bodyId = "fallback-body";
 	const generation = 3;
-	const markdown = "fragmented checkpoint recovery";
-	const plain = new TextEncoder().encode(markdown);
+	const plain = new TextEncoder().encode("vault-built recovery state");
 	const contentHash = await sha256Hex(plain);
-	const source = new Y.Doc({ guid: bodyId });
-	source.getText("body").insert(0, markdown);
-	const checkpoint = Y.encodeStateAsUpdate(source);
-	const midpoint = Math.max(1, Math.floor(checkpoint.byteLength / 2));
-	const fragments = [checkpoint.slice(0, midpoint), checkpoint.slice(midpoint)];
-	let recipeCalls = 0;
-	let acknowledgements = 0;
+	const objectKey = `${recoveryPrefix(vaultId, vaultGeneration)}/state/sha256/${contentHash.slice(0, 2)}/${contentHash}.ystate`;
+	const requests: Array<{ bodyId: string; generation: number }> = [];
 
 	const options = {
 		storage,
@@ -354,8 +345,8 @@ s.test("capture pause and restart do not advance a fragmented recipe before its 
 			entries: [{
 				kind: "active" as const,
 				bodyId,
-				fileId: "fragmented-file",
-				canonicalPath: "Fragmented.md",
+				fileId: "fallback-file",
+				canonicalPath: "Fallback.md",
 				generation,
 				contentHash,
 				size: plain.byteLength,
@@ -367,41 +358,12 @@ s.test("capture pause and restart do not advance a fragmented recipe before its 
 			planDigest: hashB,
 		}),
 		checkRecoveryCoverage: async () => ({ missingContentHashes: [contentHash], missingNodeHashes: [] }),
-		getRecipeDescriptors: async () => [{
-			recipeId: "fragmented-recipe",
-			bodyId,
-			generation,
-			expectedContentHash: contentHash,
-			expectedSize: plain.byteLength,
-			encodedHistoryBytes: checkpoint.byteLength,
-			firstCursor: "0",
-		}],
-		getRecipeChunk: async () => {
-			const index = recipeCalls++;
-			assert.ok(index < fragments.length, "capture fetched beyond the terminal recipe cursor");
-			return {
-				recipeId: "fragmented-recipe",
-				cursor: String(index),
-				nextCursor: index === fragments.length - 1 ? null : String(index + 1),
-				parts: [{
-					kind: "checkpoint" as const,
-					sequence: 17,
-					fragmentIndex: index,
-					fragmentCount: fragments.length,
-					bytes: fragments[index]!,
-				}],
-				encodedBytes: fragments[index]!.byteLength,
-			};
+		materializeCaptureContent: async (input: { bodyId: string; generation: number }) => {
+			requests.push({ bodyId: input.bodyId, generation: input.generation });
+			return requests.length === 1
+				? { status: "busy" as const }
+				: { status: "materialized" as const, objectKey, contentHash, plainBytes: plain.byteLength };
 		},
-		acquireMaterializationLease: async () => ({
-			leaseId: "capture-materialization-lease",
-			ownerKind: "capture" as const,
-			ownerId: "capture_1",
-			objectKeys: [],
-			expiresAt: Date.now() + 60_000,
-		}),
-		releaseMaterializationLease: async () => {},
-		acknowledgeContentMaterialized: async () => { acknowledgements++; },
 	};
 	type CaptureSliceHarness = {
 		store: RecoveryJobStateStore;
@@ -428,24 +390,19 @@ s.test("capture pause and restart do not advance a fragmented recipe before its 
 		await runtime.runCaptureSlice(runtime.store.load()!, authority);
 		assert.equal(runtime.store.getMetadata("capture-progress")?.entryIndex, 0, "staging a plan page advanced its entry");
 
-		await runtime.runCaptureSlice(runtime.store.load()!, authority);
-		assert.equal(runtime.store.getMetadata("capture-progress")?.entryIndex, 0, "partial checkpoint advanced the plan entry");
-		assert.equal(runtime.store.load()?.processedEntries, 0, "partial checkpoint advanced durable progress");
-		assert.equal(runtime.store.getReconstruction()?.cursor, "1", "partial checkpoint did not persist its continuation cursor");
-		assert.equal(runtime.store.reconstructionParts().length, 1, "partial checkpoint fragment was not retained");
-		assert.equal(acknowledgements, 0, "partial checkpoint was acknowledged as materialized");
+		await assert.rejects(runtime.runCaptureSlice(runtime.store.load()!, authority), /in flight/u);
+		assert.equal(runtime.store.getMetadata("capture-progress")?.entryIndex, 0, "a busy vault write advanced the plan entry");
+		assert.equal(runtime.store.load()?.processedEntries, 0, "a busy vault write advanced durable progress");
 
 		// Recreate the runtime over the same SQLite state to exercise the alarm/process-loss boundary.
 		runtime = new RecoveryJobRuntime(options) as unknown as CaptureSliceHarness;
 		await runtime.runCaptureSlice(runtime.store.load()!, authority);
-		assert.equal(runtime.store.getMetadata("capture-progress")?.entryIndex, 1, "terminal checkpoint did not advance the plan entry");
-		assert.equal(runtime.store.load()?.processedEntries, 1, "terminal checkpoint did not advance durable progress");
-		assert.equal(runtime.store.getReconstruction(), null, "completed reconstruction progress was not cleared");
-		assert.deepEqual(runtime.store.reconstructionParts(), [], "completed reconstruction fragments were not cleared");
-		assert.equal(acknowledgements, 1, "completed body was not acknowledged exactly once");
-		assert.equal(recipeCalls, 2, "capture did not resume at the persisted recipe cursor");
+		assert.equal(runtime.store.getMetadata("capture-progress")?.entryIndex, 1, "materialized content did not advance the plan entry");
+		assert.equal(runtime.store.load()?.processedEntries, 1, "materialized content did not advance durable progress");
+		assert.equal(runtime.store.load()?.contentObjectsWritten, 1, "materialized content was not counted once");
+		assert.deepEqual(requests, [{ bodyId, generation }, { bodyId, generation }], "capture did not ask the vault for exactly the plan entry");
+		assert.ok(!bucket.puts.some((put) => put.key.includes("/state/") || put.key.includes("/content/")), "the job wrote content itself instead of delegating to the vault");
 	} finally {
-		source.destroy();
 		storage.close();
 		await rm(directory, { recursive: true, force: true });
 	}

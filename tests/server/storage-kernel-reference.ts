@@ -33,9 +33,9 @@ s.check(
 	SCHEMA_VERSION === 8
 		&& STORAGE_FORMAT_VERSION === 4
 		&& PROTOCOL_VERSION === 5
-		&& SNAPSHOT_FORMAT_VERSION === 3
+		&& SNAPSHOT_FORMAT_VERSION === 4
 		&& SETTINGS_FORMAT_VERSION === 2,
-	"schema/storage/protocol/snapshot/settings formats remain independently pinned to 8/4/5/3/2",
+	"schema/storage/protocol/snapshot/settings formats remain independently pinned to 8/4/5/4/2",
 );
 
 function withVersion(component: keyof ProductVersions, version: number): ProductVersions {

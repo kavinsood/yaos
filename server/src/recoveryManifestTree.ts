@@ -14,7 +14,7 @@ import { safeBlobPath, safeCanvasPath, safeMarkdownPath } from "./shared/vaultPa
 import { MAX_CLIENT_MARKDOWN_BYTES } from "./shared/durableLimits.js";
 
 export const RECOVERY_SNAPSHOT_FORMAT = "yaos-recovery-v2" as const;
-export const RECOVERY_SNAPSHOT_FORMAT_VERSION = 3 as const;
+export const RECOVERY_SNAPSHOT_FORMAT_VERSION = 4 as const;
 export const MANIFEST_BRANCH_FORMAT = "yaos-manifest-branch-v1" as const;
 export const MANIFEST_LEAF_FORMAT = "yaos-manifest-leaf-v1" as const;
 export const MANIFEST_MAX_ENTRIES = 512;

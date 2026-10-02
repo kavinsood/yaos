@@ -73,7 +73,7 @@ async function rejects(work: () => unknown | Promise<unknown>, label: string): P
 function rootFixture(): SnapshotRootV2 {
 	return {
 		format: "yaos-recovery-v2",
-		snapshotFormatVersion: 3,
+		snapshotFormatVersion: 4,
 		snapshotId: "snapshot-1",
 		vaultIdHash: "a".repeat(64),
 		vaultGenerationHash: "b".repeat(64),

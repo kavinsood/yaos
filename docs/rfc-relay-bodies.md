@@ -958,6 +958,7 @@ relay-mode server operation that reads update bytes as more than opaque blobs.
 | **Merged-bytes cache** | `MergedEntry` | Opaque storage of plaintext merged state | Disappears with the merges. |
 | **`syncDocumentCache`** (since round 3 it only discards or marks a resident base doc stale; no apply) | after append | None now (no ywasm call) | Delete it together with the base body path (section 11). |
 | **Reset structural check** (`snapshotStructurallyValid`: SV parse) | reset route | Plaintext structure (SV parse only) | Replace with a size check plus a client-signed header. |
+| **Recovery projection** (snapshot format 4, b3 P2) | vault wake alarm → `runStateProjectionPass`; capture fallback `materializeCaptureContent` | **Opaque bytes.** The stored checkpoint, journal, and tail bytes are written to R2 unchanged as a content-addressed state object. Yjs is not decoded on the server. | Done: the RecoveryJob no longer decodes, and clients decode and verify size and sha256 on restore. Under E2EE the stored bytes are ciphertext and the key hash must be keyed (see lazy hash). A wrong claimed hash is detected only on the client. |
 | **Semantic reset** | client builds | None on the server (opaque install); the server trusts `coveredSequence` | Already on the client. |
 | Frame size, rate, epochs, authority, receipts, sequence, attribution digests | throughout | **Opaque bytes** (length and sha256 of ciphertext) | No change. |
 

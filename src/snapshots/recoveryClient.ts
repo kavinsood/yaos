@@ -1,9 +1,11 @@
 import type { VaultSyncSettings } from "../settings";
 import { appendTraceParams, type TraceHttpContext } from "../observability/traceContext";
 import { obsidianRequest } from "../utils/http";
+import { MAX_RECOVERY_STATE_OBJECT_BYTES, RECOVERY_STATE_CONTENT_TYPE } from "@shared/recoveryStateObject";
+import { decodeRecoveryStateObject } from "./recoveryStateDecode";
 
 export const RECOVERY_SCHEMA_VERSION = 8 as const;
-export const RECOVERY_SNAPSHOT_FORMAT_VERSION = 3 as const;
+export const RECOVERY_SNAPSHOT_FORMAT_VERSION = 4 as const;
 export const RECOVERY_MANIFEST_TREE_FORMAT_VERSION = 1 as const;
 const MAX_RECOVERY_CONTENT_BYTES = 10 * 1024 * 1024;
 
@@ -994,13 +996,26 @@ export class RecoveryClient {
 		}
 		if (response.status !== 200) throw this.responseError("recovery content download", response);
 		const declaredLength = header(response.headers, "content-length");
+		const contentType = header(response.headers, "content-type");
+		// Format 4: Markdown/Canvas arrive as opaque state objects (stored CRDT bytes);
+		// the client decodes them and verifies the plaintext size and sha256 here.
+		const opaque = contentType !== undefined && contentType.split(";")[0]!.trim().toLowerCase() === RECOVERY_STATE_CONTENT_TYPE;
+		const transferBound = opaque ? MAX_RECOVERY_STATE_OBJECT_BYTES : expectedSize;
+		const raw = new Uint8Array(response.arrayBuffer);
 		if (
 			declaredLength !== undefined
-			&& (!/^\d+$/.test(declaredLength) || Number(declaredLength) !== expectedSize)
+			&& (!/^\d+$/.test(declaredLength) || (opaque ? Number(declaredLength) !== raw.byteLength : Number(declaredLength) !== expectedSize))
 		) {
 			throw new RecoveryTerminalItemError("content_corrupt", "recovery content length is invalid");
 		}
-		const bytes = new Uint8Array(response.arrayBuffer);
+		if (raw.byteLength > transferBound) {
+			throw new RecoveryTerminalItemError("content_corrupt", "recovery content exceeds its transfer bound");
+		}
+		let bytes = raw;
+		if (opaque) {
+			try { bytes = new Uint8Array((await decodeRecoveryStateObject(raw)).plain); }
+			catch { throw new RecoveryTerminalItemError("content_corrupt", "recovery state object does not decode"); }
+		}
 		if (bytes.byteLength !== expectedSize || bytes.byteLength > MAX_RECOVERY_CONTENT_BYTES) {
 			throw new RecoveryTerminalItemError("content_corrupt", "recovery content size does not match its descriptor");
 		}

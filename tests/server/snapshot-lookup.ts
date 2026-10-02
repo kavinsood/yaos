@@ -68,10 +68,10 @@ async function seededSnapshot() {
 	bucket.objects.set(recoveryContentObjectKey(prefix, contentHash), gzipRecoveryBytes(markdown));
 	bucket.objects.set(recoveryContentObjectKey(prefix, deletedHash), gzipRecoveryBytes(deletedMarkdown));
 	bucket.objects.set(blobObjectKey(vaultId, vaultGeneration, attachmentHash), attachment);
-	bucket.objects.set(`${prefix}/content/sha256/ff/${"f".repeat(64)}.md.gz`, gzipRecoveryBytes(encoder.encode("unreachable")));
+	bucket.objects.set(`${prefix}/state/sha256/ff/${"f".repeat(64)}.ystate`, gzipRecoveryBytes(encoder.encode("unreachable")));
 	const rootValue: SnapshotRootV2 = {
 		format: "yaos-recovery-v2",
-		snapshotFormatVersion: 3,
+		snapshotFormatVersion: 4,
 		snapshotId: "snapshot-lookup-1",
 		vaultIdHash,
 		vaultGenerationHash,

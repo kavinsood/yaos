@@ -282,7 +282,7 @@ With recovery capability available:
 - **Browse and restore snapshots** lists immutable recovery roots and looks up bounded manifest branches;
 - restore can select Markdown paths, attachment paths, deleted identities, or the complete recovery point.
 
-Capture and restore continue in alarm-driven `RecoveryJob` objects after Obsidian closes. `queued`, active phase, `retrying`, `complete`, `complete_with_gaps`, `failed`, and `cancelled` are meaningful states. Do not report a retry or terminal gap as complete coverage.
+Projection runs inside the vault object about 60 s after a change. It writes opaque, content-addressed state objects (stored CRDT bytes, snapshot format 4) that the client decodes and verifies. "Projection queued" means changes after the watermark are not yet projected. Capture and restore continue in alarm-driven `RecoveryJob` objects after Obsidian closes. `queued`, active phase, `retrying`, `complete`, `complete_with_gaps`, `failed`, and `cancelled` are meaningful states. Do not report a retry or terminal gap as complete coverage.
 
 Before applying a restore item, the client creates a local backup and verifies that the target has not changed since review. Changed targets are skipped rather than overwritten. Markdown, Canvas, lifecycle, and attachment mutations still pass through normal schema-8 actor authority, semantic epochs, durable receipts, and attachment revision checks. Recovery contains content only; it cannot restore or roll back principals, memberships, devices, codes, transfers, revocations, audit, or settings.
 
@@ -314,7 +314,7 @@ The socket ticket endpoint exchanges that bearer for a short-lived protocol-5 ti
 - the current root or body semantic epoch;
 - active matching authority in both the control plane and vault mirror.
 
-The complete version set is document schema `8`, durable SQL format `4`, socket protocol `5`, recovery snapshot format `3`, settings sync format `2`, and control-plane identity format `3`. These pins change only through a coordinated client/server/storage cutover.
+The complete version set is document schema `8`, durable SQL format `4`, socket protocol `5`, recovery snapshot format `4`, settings sync format `2`, and control-plane identity format `3`. These pins change only through a coordinated client/server/storage cutover.
 
 ## Installing the schema-8 boundary
 

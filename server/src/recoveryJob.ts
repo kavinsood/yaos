@@ -58,6 +58,7 @@ import {
 	type ManifestTreeMutation,
 	type ReachableManifestNode,
 	type SnapshotRootV2,
+	RECOVERY_SNAPSHOT_FORMAT_VERSION,
 } from "./recoveryManifestTree.js";
 import type { ImmutableArtifactStore } from "./bootstrap.js";
 import {
@@ -2175,7 +2176,7 @@ export class RecoveryJobRuntime {
 		if (!rootArtifact) {
 			const root: SnapshotRootV2 = {
 				format: "yaos-recovery-v2",
-				snapshotFormatVersion: 3,
+				snapshotFormatVersion: RECOVERY_SNAPSHOT_FORMAT_VERSION,
 				snapshotId: descriptor.snapshotId,
 				vaultIdHash: await sha256Hex(encoder.encode(descriptor.vaultId)),
 				vaultGenerationHash: await sha256Hex(encoder.encode(descriptor.vaultGeneration)),

@@ -87,7 +87,7 @@ s.test("persisted capture and restore identities survive restart without persist
 
 s.test("complete-with-gaps roots and unavailable entries remain visible but lack restorable content", async () => {
 	const root = {
-		format: "yaos-recovery-v2", snapshotFormatVersion: 3, snapshotId: "snapshot-1", vaultIdHash: HASH,
+		format: "yaos-recovery-v2", snapshotFormatVersion: 4, snapshotId: "snapshot-1", vaultIdHash: HASH,
 		vaultGenerationHash: OTHER_HASH, runtimeEpoch: "epoch-1", boundarySequence: 42, rootGeneration: 4, sourcePlanDigest: HASH,
 		manifestGraphDigest: HASH, manifestNodeCount: 3, createdAt: "2026-08-24T00:00:00.000Z",
 		completedAt: "2026-08-24T00:01:00.000Z", health: "complete_with_gaps", reason: "manual",

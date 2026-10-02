@@ -1,9 +1,10 @@
 // Write-budget spike (idle drain), ported to relay v3 (batch 3): an idle vault does zero periodic work.
 //
-// The recovery projection job used to poll every 30 s (one RPC per body, each a GROUP BY over
-// the whole catalog, plus a watchdog setAlarm and a cursor row per body). It is now woken by
-// change: a catalog/journal write owes one debounced wake, and a pass that finds nothing to
-// project sleeps with no alarm. Relay v3 group commits write neither a journal row nor a
+// Recovery projection used to be a polling RecoveryJob (one RPC per body, each a GROUP BY over
+// the whole catalog). Since b3 P2 (snapshot format 4) it is a vault-local watermark pass that
+// writes opaque, content-addressed state objects (stored CRDT bytes) to R2 on the debounced
+// wake alarm: a catalog/journal write owes one wake, and an idle pass writes nothing and arms
+// no alarm. Relay v3 group commits write neither a journal row nor a
 // catalog event (only `relay_body_tail` and the head), so the tail is a projection input too.
 // This suite wires a real VaultRuntime and RecoveryJobRuntime
 // over real SQLite (NodeSqliteStorage) with a simulated clock and manual alarm hosts, seeds
@@ -22,11 +23,14 @@ import { VaultRuntime, isProjectionInputWrite } from "../../server/src/server";
 import type { RelayBodyStore } from "../../server/src/relayBodyStore";
 import { RecoveryJobRuntime } from "../../server/src/recoveryJob";
 import { readRelayConfig } from "../../server/src/relayFlag";
-import { RECOVERY_RPC_HEADER } from "../../server/src/recoveryProtocol";
+import { contentObjectKey } from "../../server/src/recoveryProtocol";
 import { VaultStore } from "../../server/src/vaultStore";
 import { actorHeaders } from "../../server/src/vaultAuthority";
 import type { VaultActorContext } from "../../server/src/collaboration";
 import { FakeObjectStore } from "../mocks/workerEnv.ts";
+import { decodeRecoveryStateObject } from "../../src/snapshots/recoveryStateDecode";
+import { runStateProjectionPass, STATE_PROJECTION_LIMITS } from "../../server/src/recoveryStateProjection";
+import { nextUtcMidnight } from "../../server/src/dailyLimit";
 import { suite } from "../harness.ts";
 
 const s = suite("recovery-projection-idle");
@@ -115,10 +119,11 @@ interface World {
 	advanceTo(target: number): Promise<void>;
 	settle(): Promise<void>;
 	indexed(): Set<string>;
-	/** Runs after the vault answered a recovery-authority RPC, before the job sees the answer. */
-	authorityHook: ((method: string) => Promise<void>) | null;
-	/** Posts a projection wake straight to the job (as the vault's wake call does). */
-	wakeJob(): Promise<void>;
+	objects: FakeObjectStore;
+	/** Runs inside every R2 put, before the object is stored (may throw or mutate the vault). */
+	putHook: ((key: string) => void | Promise<void>) | null;
+	/** The stored state object for a plaintext hash, if projected. */
+	stateObject(contentHash: string): Uint8Array | undefined;
 }
 
 async function withWorld(mode: Mode, check: (world: World) => Promise<void>): Promise<void> {
@@ -134,21 +139,14 @@ async function withWorld(mode: Mode, check: (world: World) => Promise<void>): Pr
 		const vaultAlarm = new ManualAlarm();
 		const jobAlarm = new ManualAlarm();
 		const tasks = new Set<Promise<unknown>>();
-		const objects = new FakeObjectStore();
+		const objects = new FakeObjectStore({ onPut: (key) => { const result = world.putHook?.(key); if (result instanceof Promise) throw new Error("putHook must be synchronous"); } });
 		let vault!: VaultRuntime;
 		let job!: RecoveryJobRuntime;
 		job = new RecoveryJobRuntime({
 			storage: jobSide.storage as never,
 			alarms: jobAlarm.port,
 			objectStore: objects,
-			recoveryAuthority: { call: async (_name, request) => {
-				// The RPC body is a binary envelope; the method name is carried as plain bytes.
-				const method = new TextDecoder().decode(await request.clone().arrayBuffer())
-					.includes("getProjectionWorkPage") ? "getProjectionWorkPage" : "";
-				const response = await vault.fetch(request);
-				if (world.authorityHook) await world.authorityHook(method);
-				return response;
-			} },
+			recoveryAuthority: { call: async (_name, request) => await vault.fetch(request) },
 			controlPlane: { call: async () => { throw new Error("control plane is not used by projection"); } },
 		});
 		vault = new VaultRuntime({
@@ -228,14 +226,9 @@ async function withWorld(mode: Mode, check: (world: World) => Promise<void>): Pr
 				}
 				clock = Math.max(clock, target);
 			},
-			authorityHook: null,
-			wakeJob: async () => {
-				const response = await job.fetch(new Request("https://internal/__yaos/recovery-job/projection/wake", {
-					method: "POST",
-					headers: { [RECOVERY_RPC_HEADER]: "1", "x-yaos-vault-id": VAULT_ID, "x-yaos-vault-generation": GENERATION },
-				}));
-				assert.equal(response.status, 200);
-			},
+			objects,
+			putHook: null,
+			stateObject: (contentHash) => objects.objects.get(contentObjectKey(VAULT_ID, GENERATION, contentHash)),
 			indexed: () => new Set(vaultSqlite.sql.exec<{ content_hash: string }>(
 				"SELECT content_hash FROM recovery_content_index").toArray().map((row) => row.content_hash)),
 		};
@@ -308,6 +301,10 @@ for (const mode of ["base", "relay lean", "relay v3"] as const) {
 			assert.equal(world.indexed().has(hashOf(fresh.text)), false, "not projected before the wake");
 			await world.advanceTo(Date.now() + 5 * 60_000);
 			assert.ok(world.indexed().has(hashOf(fresh.text)), "the mutated note is projected without polling");
+			const object = world.stateObject(hashOf(fresh.text));
+			assert.ok(object, "the mutation produced a content-addressed state object");
+			const decoded = await decodeRecoveryStateObject(object);
+			assert.deepEqual(decoded.plain, canonicalMarkdownBytes(fresh.text), "the client decodes the opaque object to the exact plaintext");
 			assert.equal(world.vaultAlarm.at, null, "vault idle again after the wake");
 			assert.equal(world.jobAlarm.at, null, "projection job idle again after the pass");
 			const wakeRows = world.vaultSqlite.sql.exec<{ count: number }>(
@@ -317,31 +314,23 @@ for (const mode of ["base", "relay lean", "relay v3"] as const) {
 	});
 }
 
-s.test("a wake that arrives while a pass is running is not lost when the pass ends", async () => {
+s.test("a mutation that lands while a pass is putting is projected by the next pass, then idle", async () => {
 	await withWorld("base", async (world) => {
 		await world.createNotes("seed", NOTES.slice(0, 5));
-		await world.advanceTo(Date.now() + 10 * 60_000);
-		// "aaa-" sorts before every seeded body: a pass already past it cannot see it.
+		await world.settle();
 		const fresh = { name: "aaa-racing-note", text: note(7, " racing") };
 		let injected = false;
-		world.authorityHook = async (method) => {
-			if (injected || method !== "getProjectionWorkPage") return;
+		world.putHook = () => {
+			if (injected) return;
 			injected = true;
-			// The vault has answered this pass's (terminal) page; now a mutation lands and its
-			// wake reaches the job before the pass ends. The vault's own owed wake is dropped
-			// so only the job's wake ledger can catch it.
-			await world.createNotes("race", [fresh]);
-			await world.settle();
-			world.vaultSqlite.sql.exec("DELETE FROM recovery_projection_wake").toArray();
-			(world.vault as unknown as { projectionWakeOwed: boolean }).projectionWakeOwed = false;
-			world.vaultAlarm.at = null;
-			await world.wakeJob();
+			// Inside the pass's first R2 put: a new body commits after the pass fixed its target.
+			void world.createNotes("race", [fresh]);
 		};
-		await world.wakeJob();
-		await world.advanceTo(Date.now() + 60_000);
+		await world.advanceTo(Date.now() + 10 * 60_000);
 		assert.ok(injected, "the hook ran inside a pass");
-		assert.ok(world.indexed().has(hashOf(fresh.text)), "the racing wake reran the pass");
-		assert.equal(world.jobAlarm.at, null, "then the job sleeps");
+		assert.ok(world.indexed().has(hashOf(fresh.text)), "the racing mutation was projected by a later pass");
+		assert.equal(world.vaultAlarm.at, null, "then the vault sleeps");
+		assert.equal(world.jobAlarm.at, null, "no RecoveryJob is involved in projection");
 	});
 });
 
@@ -401,6 +390,10 @@ s.test("[relay v3] a group commit alone (tail row, no journal, no catalog event)
 		assert.equal(world.vaultSqlite.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM recovery_projection_wake").one().count, 1);
 		await world.advanceTo(Date.now() + 5 * 60_000);
 		assert.ok(world.indexed().has(hashOf(after)), "the group-committed content is projected");
+		const tailObject = world.stateObject(hashOf(after));
+		assert.ok(tailObject, "the tail-only head has a state object");
+		assert.equal(new TextDecoder().decode((await decodeRecoveryStateObject(tailObject)).plain), after,
+			"checkpoint + tail record bytes decode on the client to the group-committed text");
 		assert.equal(world.vaultAlarm.at, null, "vault idle again");
 		assert.equal(world.jobAlarm.at, null, "job idle again");
 		world.vaultStats.reset();
@@ -455,6 +448,199 @@ s.test("projection inputs: relay v3 tail appends and hash backfills owe a wake; 
 		"INSERT INTO recovery_content_index(content_hash) VALUES (?)",
 		"SELECT * FROM vault_catalog_events",
 	]) assert.equal(isProjectionInputWrite(query), false, query);
+});
+
+const stateRow = (world: World) => world.vaultSqlite.sql.exec<{ watermark: number; pending: string; updated_at: number }>(
+	"SELECT watermark, pending, updated_at FROM recovery_state_projection WHERE id = 1").toArray()[0] ?? null;
+
+s.test("rows: seeding 100 notes projects in bounded passes (64 puts each), then one edit costs a few rows", async () => {
+	await withWorld("base", async (world) => {
+		await world.createNotes("seed", NOTES);
+		await world.settle();
+		world.vaultStats.reset();
+		world.vaultAlarm.resetCounts();
+		const putsBefore = world.objects.puts.length;
+		await world.advanceTo(Date.now() + 10 * 60_000);
+		const seedPuts = world.objects.puts.length - putsBefore;
+		const seedWritten = world.vaultStats.written;
+		const seedStatements = world.vaultStats.statements;
+		assert.equal(seedPuts, NOTES.length, "one state object per changed note");
+		assert.ok(world.vaultAlarm.sets >= 1, "a truncated pass re-owes a wake");
+		// 1 content-index row per note + per pass: wake clear, state row, re-owed wake.
+		assert.ok(seedWritten <= NOTES.length + 8, `seed projection wrote ${seedWritten} rows for ${NOTES.length} notes`);
+		console.log(`[rows] seed: ${NOTES.length} notes, ${seedPuts} puts, ${seedWritten} rows written, ${seedStatements} statements (local)`);
+
+		world.vaultStats.reset();
+		const before = stateRow(world)!;
+		const edited = { name: NOTES[5]!.name, text: `${NOTES[5]!.text}edited\n` };
+		const store = (world.vault as unknown as { store: VaultStore }).store;
+		const doc = new Y.Doc();
+		doc.getText("body").insert(0, edited.text);
+		store.commitUpdate({ documentId: `body-${edited.name}`, kind: "body", update: Y.encodeStateAsUpdate(doc),
+			catalog: [{ bodyId: `body-${edited.name}`, fileId: `body-${edited.name}`, path: `${edited.name}.md`,
+				previousPath: null, lifecycle: "active", bodyGeneration: 1, contentHash: hashOf(edited.text), size: sizeOf(edited.text) }] });
+		doc.destroy();
+		await world.settle();
+		const mutationWritten = world.vaultStats.written;
+		world.vaultStats.reset();
+		const pass = await runStateProjectionPass({ store, objectStore: world.objects, vaultId: VAULT_ID, vaultGeneration: GENERATION });
+		const passWritten = world.vaultStats.written;
+		const passStatements = world.vaultStats.statements;
+		assert.equal(pass.projected, 1, "the pass projects only the edited note");
+		await world.advanceTo(Date.now() + 5 * 60_000);
+		assert.ok(world.indexed().has(hashOf(edited.text)), "the edit is projected");
+		assert.ok(stateRow(world)!.watermark > before.watermark, "the watermark advanced");
+		// content index (1) + state row (1)
+		assert.ok(passWritten <= 3, `one-note pass wrote ${passWritten} rows`);
+		console.log(`[rows] one edit: mutation ${mutationWritten} rows; projection pass ${passWritten} rows written, ${passStatements} statements (local)`);
+	});
+});
+
+s.test("an idle pass (watermark at head) reads two rows and writes none", async () => {
+	await withWorld("base", async (world) => {
+		await world.createNotes("seed", NOTES.slice(0, 3));
+		await world.advanceTo(Date.now() + 10 * 60_000);
+		const store = (world.vault as unknown as { store: VaultStore }).store;
+		world.vaultStats.reset();
+		const result = await runStateProjectionPass({ store, objectStore: world.objects, vaultId: VAULT_ID, vaultGeneration: GENERATION });
+		assert.equal(result.idle, true);
+		assert.equal(world.vaultStats.written, 0, "idle pass writes no rows");
+		assert.ok(world.vaultStats.statements <= 3, `idle pass ran ${world.vaultStats.statements} statements`);
+	});
+});
+
+s.test("R2 failure: no progress row and no index rows are written; the wake retries at +5 min, then projects", async () => {
+	await withWorld("base", async (world) => {
+		await world.createNotes("seed", NOTES.slice(0, 3));
+		await world.advanceTo(Date.now() + 10 * 60_000);
+		const before = stateRow(world)!;
+		const fresh = { name: "r2-down-note", text: note(11, " r2") };
+		await world.createNotes("r2", [fresh]);
+		await world.settle();
+		let failures = 0;
+		world.putHook = () => { failures++; throw new Error("R2 internal error"); };
+		world.vaultStats.reset();
+		const dueAt = world.vaultAlarm.at!;
+		await world.advanceTo(dueAt);
+		assert.equal(failures, 1, "one put attempted, no tight retry");
+		assert.deepEqual(stateRow(world), before, "the progress row is untouched by a failed pass");
+		assert.equal(world.indexed().has(hashOf(fresh.text)), false);
+		// wake marker clear + re-owed wake marker
+		assert.ok(world.vaultStats.written <= 2, `failed pass wrote ${world.vaultStats.written} rows`);
+		assert.ok(world.vaultAlarm.at !== null && world.vaultAlarm.at >= dueAt + 4 * 60_000, "the retry is minutes out");
+		world.putHook = null;
+		await world.advanceTo(Date.now() + 10 * 60_000);
+		assert.equal(failures, 1);
+		assert.ok(world.indexed().has(hashOf(fresh.text)), "projected on retry");
+		assert.equal(world.vaultAlarm.at, null);
+	});
+});
+
+s.test("daily row limit: the pass stops, owes the wake at 00:00 UTC, and does not loop", async () => {
+	await withWorld("base", async (world) => {
+		await world.createNotes("seed", NOTES.slice(0, 2));
+		await world.advanceTo(Date.now() + 10 * 60_000);
+		const fresh = { name: "limited-note", text: note(12, " limited") };
+		await world.createNotes("limited", [fresh]);
+		await world.settle();
+		let attempts = 0;
+		world.putHook = () => { attempts++; throw new Error("Exceeded allowed rows written in Durable Objects free tier."); };
+		const dueAt = world.vaultAlarm.at!;
+		await world.advanceTo(dueAt);
+		assert.equal(attempts, 1);
+		assert.equal(world.vaultAlarm.at, nextUtcMidnight(dueAt), "the wake is owed at the daily reset");
+		world.vaultStats.reset();
+		world.vaultAlarm.resetCounts();
+		await world.advanceTo(Math.min(Date.now() + 60 * 60_000, nextUtcMidnight(dueAt) - 1));
+		assert.equal(attempts, 1, "no retry before the reset");
+		assert.deepEqual([world.vaultStats.statements, world.vaultAlarm.sets], [0, 0], "no tight alarm loop while limited");
+		world.putHook = null;
+		await world.advanceTo(nextUtcMidnight(dueAt) + 1);
+		assert.ok(world.indexed().has(hashOf(fresh.text)), "projected after the reset");
+	});
+});
+
+s.test("eviction mid-pass: a fresh store redoes the window, skips indexed content, and re-puts only the rest", async () => {
+	await withWorld("base", async (world) => {
+		await world.createNotes("seed", NOTES.slice(0, 6));
+		await world.settle();
+		const store = (world.vault as unknown as { store: VaultStore }).store;
+		let puts = 0;
+		world.putHook = () => { if (++puts === 3) throw new Error("isolate evicted"); };
+		await assert.rejects(runStateProjectionPass({ store, objectStore: world.objects, vaultId: VAULT_ID, vaultGeneration: GENERATION }), /evicted/u);
+		assert.equal(stateRow(world), null, "the interrupted pass saved no progress");
+		assert.equal(world.indexed().size, 2, "content put before the eviction is indexed");
+		assert.equal(store.stateObjectWritesInFlight(), 0, "the in-memory guard is released");
+		world.putHook = null;
+		const fresh = new VaultStore(world.vaultSqlite as never);
+		const putsBefore = world.objects.puts.length;
+		const result = await runStateProjectionPass({ store: fresh, objectStore: world.objects, vaultId: VAULT_ID, vaultGeneration: GENERATION });
+		assert.equal(result.projected, 4, "only the unindexed bodies are put again");
+		assert.ok(result.skipped >= 2, "indexed bodies are skipped (one read each)");
+		assert.equal(world.objects.puts.length - putsBefore, 4);
+		assert.equal(world.indexed().size, 6);
+	});
+});
+
+s.test("budget: a pass stops at maxPuts and resumes from pending ids without losing any", async () => {
+	await withWorld("base", async (world) => {
+		await world.createNotes("seed", NOTES.slice(0, 10));
+		await world.settle();
+		const store = (world.vault as unknown as { store: VaultStore }).store;
+		const ports = { store, objectStore: world.objects, vaultId: VAULT_ID, vaultGeneration: GENERATION };
+		const limits = { ...STATE_PROJECTION_LIMITS, maxPuts: 4 };
+		const first = await runStateProjectionPass(ports, limits);
+		assert.deepEqual([first.projected, first.deferred, first.more], [4, 6, true]);
+		const second = await runStateProjectionPass(ports, limits);
+		const third = await runStateProjectionPass(ports, limits);
+		assert.deepEqual([second.projected, third.projected, third.more], [4, 2, false]);
+		assert.equal(world.indexed().size, 10);
+		assert.equal((await runStateProjectionPass(ports, limits)).idle, true);
+	});
+});
+
+s.test("inline hook (bulk create): projects named bodies best-effort without moving the watermark", async () => {
+	await withWorld("base", async (world) => {
+		await world.createNotes("seed", NOTES.slice(0, 4));
+		await world.settle();
+		const result = await world.vault.projectRecoveryStateInline(NOTES.slice(0, 4).map((entry) => `body-${entry.name}`));
+		assert.deepEqual(result, { projected: 4, skipped: 0 });
+		assert.equal(stateRow(world), null, "the inline hook does not move the watermark");
+		const putsBefore = world.objects.puts.length;
+		await world.advanceTo(Date.now() + 10 * 60_000);
+		assert.equal(world.objects.puts.length, putsBefore, "the next watermark pass re-checks the ids and puts nothing");
+		world.putHook = () => { throw new Error("R2 down"); };
+		const failed = await world.vault.projectRecoveryStateInline(["body-unknown", `body-${NOTES[0]!.name}`]);
+		assert.equal(failed.projected, 0, "never throws");
+		world.vault.recoveryBulkCreateCommitted({ bodies: [{ bodyId: `body-${NOTES[1]!.name}` }] });
+		await world.settle();
+	});
+});
+
+s.test("query plans: watermark change collection and head resolution are index seeks", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "yaos-state-plan-"));
+	const sqlite = NodeSqliteStorage.open(join(directory, "vault.sqlite"));
+	try {
+		const store = new VaultStore(sqlite as never);
+		store.vaultMetadata();
+		store.recoveryStateChanges(0, 1, null, 1, 1);
+		const plan = (query: string, ...bindings: unknown[]) => sqlite.sql.exec<{ detail: string }>(
+			`EXPLAIN QUERY PLAN ${query}`, ...(bindings as never[])).toArray().map((row) => row.detail).join(" | ");
+		const plans = {
+			catalog: plan("SELECT sequence, body_id AS id FROM vault_catalog_events WHERE sequence > ? AND sequence <= ? ORDER BY sequence, body_id LIMIT ?", 0, 1, 1),
+			catalogResume: plan("SELECT sequence, body_id AS id FROM vault_catalog_events WHERE (sequence, body_id) > (?, ?) AND sequence <= ? ORDER BY sequence, body_id LIMIT ?", 0, "", 1, 1),
+			semantic: plan("SELECT sequence, document_id AS id FROM vault_semantic_catalog_events WHERE sequence > ? AND sequence <= ? ORDER BY sequence, document_id LIMIT ?", 0, 1, 1),
+			journal: plan("SELECT sequence, document_id AS id FROM vault_journal WHERE sequence > ? AND sequence <= ? ORDER BY sequence LIMIT ?", 0, 1, 1),
+		};
+		for (const [name, detail] of Object.entries(plans)) {
+			assert.match(detail, /SEARCH/, `${name}: ${detail}`);
+			assert.doesNotMatch(detail, /TEMP B-TREE|SCAN/, `${name}: ${detail}`);
+			console.log(`[plan] ${name}: ${detail}`);
+		}
+	} finally {
+		sqlite.close();
+		await rm(directory, { recursive: true, force: true });
+	}
 });
 
 await s.done();
