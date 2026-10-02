@@ -1,0 +1,21 @@
+src/sync/canvas/canvasManager.ts
+  s_ec23ccc59851d9::t_433cd968972b69 113-116,158-159,331-332,422-423,425-433,1183-1202
+tests/client/canvas-manager.ts
+  s_ec23ccc59851d9::t_1207dc4026de10 768-935
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "56567406a365cb0e9ab42e1210d024d38004bf1b",
+  "prompts": {},
+  "sessions": {
+    "s_ec23ccc59851d9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a3f18d03128fc36e0",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
