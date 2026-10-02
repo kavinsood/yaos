@@ -1,0 +1,21 @@
+server/src/index.ts
+  s_42343c074f2618::t_2f2cb1add5f7f1 269-272
+server/src/routes/vault.ts
+  s_42343c074f2618::t_2f02a4ae192010 60,81-83,202-224
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a688723d4047433c361311a7201e220bcd4d17e7",
+  "prompts": {},
+  "sessions": {
+    "s_42343c074f2618": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a2c0077a38f8fdd35",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
