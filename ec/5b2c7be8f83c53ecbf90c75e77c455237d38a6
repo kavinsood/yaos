@@ -1,0 +1,21 @@
+src/sync/diskMirror.ts
+  s_da4ca900883079::t_107c7928cb2490 887-897,919-928
+tests/client/stale-disk-never-reverts-body.ts
+  s_da4ca900883079::t_5025e614238c03 87-90,213,244-248,255,378-379,868-898
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "ec5b2c7be8f83c53ecbf90c75e77c455237d38a6",
+  "prompts": {},
+  "sessions": {
+    "s_da4ca900883079": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ad8127dcef3a8a877",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
