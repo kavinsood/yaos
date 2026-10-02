@@ -1,0 +1,21 @@
+src/sync/bulkCreateRootValidation.ts
+  s_919033a84b1dc9::t_4663d85075c3f7 10-14,16-19,65-67,81-84,89-90
+tests/client/bulk-create-root-validation.ts
+  s_919033a84b1dc9::t_fbcca3a9a1022c 110,123-125,129-133
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "28584373b8df888773d362d4a1b4d1d051061b7e",
+  "prompts": {},
+  "sessions": {
+    "s_919033a84b1dc9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a927207854e0683fc",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
