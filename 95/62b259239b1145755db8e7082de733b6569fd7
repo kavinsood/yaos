@@ -1,0 +1,47 @@
+scripts/relay2/deploy.sh
+  s_42343c074f2618::t_dc8a7141b84ea4 5-8,33,43,84-89
+server/src/recoveryAuthorityStore.ts
+  s_2bdf60f4c6d977::t_d9276726d73668 1543-1563
+server/src/recoveryJob.ts
+  s_42343c074f2618::t_9b5ecb762a2741 109-114,626-640,1345-1346,1397-1398,1725-1726,1748-1753,1774-1782,2547-2553,2556,2560,2566-2570
+server/src/relayBodyStore.ts
+  s_42343c074f2618::t_592816a379056e 232
+server/src/server.ts
+  s_42343c074f2618::t_b7c34581bf1bdc 199-246,250-252,277-280,285,299,422-424,903-951,994-995,999-1000,1487-1488
+server/src/vaultCatalogStore.ts
+  s_42343c074f2618::t_d08c7d96a2bb09 11-18,602-609,611-614,791-816,911,914-917
+server/src/vaultDocumentStore.ts
+  s_42343c074f2618::t_079370ba6a81cc 957-962,2580-2582,2701-2721,2734
+server/src/vaultRecoveryService.ts
+  s_42343c074f2618::t_876b9964b6a9a0 107-117,560-586
+server/src/vaultStore.ts
+  s_42343c074f2618::t_c686b342c07193 667
+tests/live/run-live.ts
+  s_42343c074f2618::t_89a9f277645c21 12-14,198
+tests/server/recovery-projection-idle.ts
+  s_42343c074f2618::t_5c64c546eeb919 1-460
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "9562b259239b1145755db8e7082de733b6569fd7",
+  "prompts": {},
+  "sessions": {
+    "s_2bdf60f4c6d977": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a6bb0187127ea11f8",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_42343c074f2618": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a2c0077a38f8fdd35",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
