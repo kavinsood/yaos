@@ -153,13 +153,15 @@ export class RelayBodyStore {
 			const size = input.catalogContent?.size ?? null;
 			let sequence: number;
 			if (lean) {
-				// §6.4: no clock write. MAX(clock, journal head) + 1; every other allocator
-				// and `currentSequence` take the same MAX in lean mode.
-				const next = this.storage.sql.exec<{ sequence: number }>(
-					`SELECT MAX((SELECT sequence FROM vault_clock WHERE id = 1),
-					            (SELECT COALESCE(MAX(sequence), 0) FROM vault_journal)) + 1 AS sequence`,
-				);
-				sequence = next.one().sequence;
+				// §6.4: no clock write. The one lean allocator: MAX(clock, journal head
+				// [, relay_body_tail head when the tail is on]) + 1, exactly what every
+				// other allocator and `currentSequence` take. (b3-int: this used its own
+				// MAX(clock, journal) and so could reissue a tail-only sequence whenever
+				// this path ran with the tail on; with the tail off the SQL is identical,
+				// and a tail left behind by a flag change is folded into the clock on open
+				// by reconcileClockAfterLean.)
+				const next = this.store.leanNextSequence();
+				sequence = next.sequence;
 				rowsRead += next.rowsRead;
 			} else {
 				const clock = this.storage.sql.exec<{ sequence: number }>(

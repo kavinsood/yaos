@@ -284,6 +284,37 @@ s.test("the bulk sequence is allocated past the relay tail head (no reuse of a t
 	});
 });
 
+s.test("b3-int 4a: the legacy (non-group) relay append allocates past the tail head, with the tail flag on or off", async () => {
+	await withHarness(async ({ store, relayStore, relay, socket, update, seed }) => {
+		const writer = socket(SEEDED);
+		for (let index = 0; index < 3; index++) {
+			update(writer, textUpdate(seed, (value) => value.insert(value.length, ` g${index}`)));
+			relay.flushBatch(SEEDED);
+		}
+		const tailHead = store.relayTailRow(SEEDED)!.latestSequence;
+		const clock = sqlOf(store).exec<{ sequence: number }>("SELECT sequence FROM vault_clock WHERE id = 1").one().sequence;
+		const journalMax = sqlOf(store).exec<{ sequence: number }>("SELECT COALESCE(MAX(sequence), 0) AS sequence FROM vault_journal").one().sequence;
+		assert.ok(Math.max(clock, journalMax) < tailHead, "precondition: the tail is ahead of clock and journal");
+		const epoch = store.documentHead(SEEDED)!.semanticEpoch;
+		const legacy = (bodyId: string, target: RelayBodyStore, insert: string) => target.appendRelayBodyUpdate({
+			bodyId, expectedEpoch: epoch, update: textUpdate(seed, (value) => value.insert(value.length, insert)),
+			attributions: [{ actor: owner }], catalogContent: null, receipts: [] });
+		// Tail flag on: the non-group path (grouped=false) must not reissue a tail-only sequence.
+		const first = legacy(SEEDED, relayStore, " legacy-on");
+		assert.equal(first.vaultSequence, tailHead + 1, "legacy append takes MAX(clock, journal, tail) + 1");
+		assert.equal(store.currentSequence(), first.vaultSequence);
+		// Flag change: tail rows exist but this instance runs lean without the tail.
+		const storage = (store as unknown as { storage: VaultStoragePort }).storage;
+		const off = new VaultStore(storage);
+		off.enableLeanRows();
+		assert.ok(off.currentSequence() >= first.vaultSequence, "the flag-off store sees the newest sequence");
+		const second = legacy(SEEDED, new RelayBodyStore(storage, off), " legacy-off");
+		assert.equal(second.vaultSequence, first.vaultSequence + 1, "flag off: still above the tail and journal heads");
+		const third = legacy(SEEDED, new RelayBodyStore(storage, off), " legacy-off-2");
+		assert.equal(third.vaultSequence, second.vaultSequence + 1);
+	});
+});
+
 s.test("first relay typing on a bulk body: step1 serves the checkpoint, one tail row, reconstruct = checkpoint + tail, overlay follows", async () => {
 	await withHarness(async ({ store, relay, socket, update, step1, envelope, docs, bulk, text }) => {
 		const cursor = store.currentSequence();
