@@ -1,0 +1,25 @@
+server/src/server.ts
+  s_da4ca900883079::t_33e6f69bc0484e 290-313,551-558
+tests/live/forward-unread-body.ts
+  s_da4ca900883079::t_450b11d0869d2a 1-39
+tests/live/run-live.ts
+  s_da4ca900883079::t_2e38eac0119584 34,211-214,216-220,230-232
+tests/server/forward-body-passthrough.ts
+  s_da4ca900883079::t_0a49f994b1f5d2 2,80-95
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "8a2a5d55a0b43eedef3c5a0af7953ab6969f4859",
+  "prompts": {},
+  "sessions": {
+    "s_da4ca900883079": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ad8127dcef3a8a877",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
