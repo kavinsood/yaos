@@ -1,0 +1,21 @@
+server/src/readBoundedBytes.ts
+  s_3c20a746b820c6::t_a842e8184b2cb0 28,34,49-66
+tests/server/read-bounded-bytes-fast-path.ts
+  s_3c20a746b820c6::t_59b5637cc50391 1-55
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "85aa9de1655e508f3c99465bdccfeb898cb72ea8",
+  "prompts": {},
+  "sessions": {
+    "s_3c20a746b820c6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a2b43feb19d9e9a0e",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
