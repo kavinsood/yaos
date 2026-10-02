@@ -14,8 +14,25 @@ export const RECOVERY_STATE_FORMAT = "yaos-recovery-state";
 export const RECOVERY_STATE_VERSION = 1;
 export const RECOVERY_STATE_CONTENT_TYPE = "application/vnd.yaos.recovery-state";
 
-/** Upper bound on one stored state object (24 MiB of history plus envelope framing). */
-export const MAX_RECOVERY_STATE_HISTORY_BYTES = 24 * 1024 * 1024;
+/**
+ * Upper bound on one stored state object's history (plus envelope framing below).
+ *
+ * b3-int: 32 MiB, above the 24 MiB per-pass byte budget (`STATE_PROJECTION_LIMITS.maxBytes`):
+ * a body whose stored history exceeds what is left of a pass is deferred and then
+ * projected alone at the start of a fresh pass (a solo pass). The bound is set by
+ * the 128 MB Durable Object memory limit, since the vault DO builds the object in
+ * memory: peak = history read from SQLite (N; a checkpoint's fragments are
+ * concatenated, transiently 2x that checkpoint) + the encoded object (N + framing)
+ * while encoding, then the history is released and only the object (plus any
+ * runtime copy made by the R2 put) is live during the put. At N = 32 MiB that is
+ * about 64-66 MiB, leaving at least ~60 MB for the isolate baseline (wasm CRDT
+ * engine, document cache). Above the bound the body is not projected and capture
+ * records `missing_history`, as before. Streaming the put from the SQLite chunks
+ * was not adopted: the object store port takes bytes, and the DO's input gate
+ * opens during the R2 request, so a checkpoint/compaction could rewrite the rows
+ * mid-stream under a content-addressed key.
+ */
+export const MAX_RECOVERY_STATE_HISTORY_BYTES = 32 * 1024 * 1024;
 export const MAX_RECOVERY_STATE_OBJECT_BYTES = MAX_RECOVERY_STATE_HISTORY_BYTES + 1024 * 1024;
 
 export type RecoveryStateKind = "markdown" | "canvas";

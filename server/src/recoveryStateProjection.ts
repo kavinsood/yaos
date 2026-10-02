@@ -22,7 +22,12 @@ export const STATE_PROJECTION_LIMITS = {
 	maxPuts: 64,
 	/** History bytes put per pass. */
 	maxBytes: 24 * 1024 * 1024,
-	/** Largest single state object; larger bodies are left to the capture fallback. */
+	/**
+	 * Largest single state object (32 MiB, above `maxBytes`): a body larger than
+	 * what is left of a pass is deferred and then projected alone in a fresh pass
+	 * (solo pass). Larger bodies are left to the capture fallback (`missing_history`).
+	 * See MAX_RECOVERY_STATE_HISTORY_BYTES for the memory bound.
+	 */
 	maxObjectBytes: MAX_RECOVERY_STATE_HISTORY_BYTES,
 	/** Head resolutions per pass. */
 	maxIds: 256,
@@ -60,7 +65,7 @@ type Outcome =
 	| { kind: "present" }
 	| { kind: "dropped" }
 	| { kind: "pending" }
-	| { kind: "deferred" };
+	| { kind: "deferred"; solo?: boolean };
 
 interface Budget { puts: number; bytes: number; deadline: number }
 
@@ -89,6 +94,9 @@ async function putState(
 	if (built.updates.length === 0 && head.size > 0) return { kind: "missing" };
 	const key = stateKey(ports, head.contentHash);
 	const object = encodeRecoveryStateObject({ kind: head.kind, contentHash: head.contentHash, size: head.size, updates: built.updates });
+	const bytes = built.bytes;
+	// Release the history before the put: only the encoded object stays live (memory bound).
+	built.updates.length = 0;
 	if (!ports.store.beginStateObjectWrite(key)) return { kind: "busy" };
 	try {
 		await ports.objectStore.put(key, object, {
@@ -99,7 +107,7 @@ async function putState(
 	} finally {
 		ports.store.endStateObjectWrite(key);
 	}
-	return { kind: "projected", bytes: built.bytes };
+	return { kind: "projected", bytes };
 }
 
 async function projectDocument(ports: StateProjectionPorts, documentId: string, budget: Budget, limits: StateProjectionLimits): Promise<Outcome> {
@@ -111,7 +119,11 @@ async function projectDocument(ports: StateProjectionPorts, documentId: string, 
 	if (head === "pending") return { kind: "pending" };
 	if (ports.store.missingIndexedContent([head.contentHash], ports.store.sweepingGcEpoch()).length === 0) return { kind: "present" };
 	if (budget.puts <= 0 || budget.bytes <= 0) return { kind: "deferred" };
-	const result = await putState(ports, documentId, head, boundary, Math.min(limits.maxObjectBytes, budget.bytes),
+	// A fresh pass (nothing put yet) may spend up to the per-object bound on one
+	// body, which then uses up the pass: the solo pass for an oversized note.
+	const fresh = budget.puts === limits.maxPuts && budget.bytes === limits.maxBytes;
+	const allowance = fresh ? limits.maxObjectBytes : Math.min(limits.maxObjectBytes, budget.bytes);
+	const result = await putState(ports, documentId, head, boundary, allowance,
 		(key) => ports.store.recordProjectedContent(head.contentHash, key, head.size, ports.store.sweepingGcEpoch()));
 	if (result.kind === "projected") {
 		budget.puts--;
@@ -119,9 +131,9 @@ async function projectDocument(ports: StateProjectionPorts, documentId: string, 
 		return result;
 	}
 	if (result.kind === "busy") return { kind: "deferred" };
-	// Too large for what is left of this pass: retry with a fresh budget, unless it
-	// exceeds the per-object bound (then the capture fallback records a defect).
-	if (result.kind === "too_large" && budget.bytes < limits.maxObjectBytes) return { kind: "deferred" };
+	// Too large for what is left of this pass: retry first in a fresh pass (solo),
+	// unless it exceeds the per-object bound (then the capture fallback records a defect).
+	if (result.kind === "too_large" && allowance < limits.maxObjectBytes) return { kind: "deferred", solo: true };
 	console.warn("[yaos-recovery-state] body not projected", { reason: result.kind });
 	return { kind: "dropped" };
 }
@@ -152,6 +164,7 @@ export async function runStateProjectionPass(
 	for (const id of collected.ids) work.add(id);
 	const budget = budgetFor(limits, now());
 	const deferred: string[] = [];
+	const solo: string[] = [];
 	const pending: string[] = [];
 	let projected = 0;
 	let skipped = 0;
@@ -160,9 +173,11 @@ export async function runStateProjectionPass(
 		if (outcome.kind === "projected") projected++;
 		else if (outcome.kind === "present" || outcome.kind === "dropped") skipped++;
 		else if (outcome.kind === "pending") pending.push(id);
+		else if (outcome.solo) solo.push(id);
 		else deferred.push(id);
 	}
-	let carried = [...deferred, ...pending];
+	// Oversized bodies go first so the next pass starts fresh for them (solo pass).
+	let carried = [...solo, ...deferred, ...pending];
 	if (carried.length > limits.maxPending) {
 		console.warn("[yaos-recovery-state] pending projection ids truncated", { carried: carried.length });
 		carried = carried.slice(0, limits.maxPending);
@@ -176,10 +191,10 @@ export async function runStateProjectionPass(
 	if (!unchanged) ports.store.saveRecoveryStateProjection(next, now());
 	return {
 		idle: false,
-		more: deferred.length > 0 || collected.cursor !== null,
+		more: deferred.length > 0 || solo.length > 0 || collected.cursor !== null,
 		projected,
 		skipped,
-		deferred: deferred.length,
+		deferred: deferred.length + solo.length,
 		pending: pending.length,
 		sourceRows: collected.rowsRead,
 		watermark: next.watermark,

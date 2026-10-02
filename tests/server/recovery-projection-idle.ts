@@ -599,6 +599,37 @@ s.test("budget: a pass stops at maxPuts and resumes from pending ids without los
 	});
 });
 
+s.test("b3-int 4c: an oversized body is projected alone in a fresh pass (solo); above the per-object bound it is dropped", async () => {
+	await withWorld("base", async (world) => {
+		const big = (name: string, bytes: number) => ({ name, text: `# ${name}\n\n${"x".repeat(bytes)}\n` });
+		const notes = [
+			{ name: "solo-a", text: note(901) }, { name: "solo-b", text: note(902) },
+			big("solo-big", 6_000), big("solo-huge", 12_000),
+			{ name: "solo-c", text: note(903) }, { name: "solo-d", text: note(904) },
+		];
+		await world.createNotes("solo", notes);
+		await world.settle();
+		const store = (world.vault as unknown as { store: VaultStore }).store;
+		const ports = { store, objectStore: world.objects, vaultId: VAULT_ID, vaultGeneration: GENERATION };
+		// Scaled-down limits: a 4 KB pass budget and an 8 KB per-object bound.
+		const limits = { ...STATE_PROJECTION_LIMITS, maxBytes: 4_000, maxObjectBytes: 8_000 };
+		const has = (name: string) => world.indexed().has(hashOf(notes.find((entry) => entry.name === name)!.text));
+		const first = await runStateProjectionPass(ports, limits);
+		assert.ok(first.more, "the oversized body is owed another pass");
+		assert.ok(!has("solo-big"), "too large for what is left of a shared pass");
+		assert.ok(has("solo-a") && has("solo-b"));
+		const second = await runStateProjectionPass(ports, limits);
+		assert.equal(second.projected, 1, "the next pass starts with the oversized body and spends itself on it");
+		assert.ok(has("solo-big"), "projected alone, though larger than the per-pass budget");
+		const state = await decodeRecoveryStateObject(world.stateObject(hashOf(notes[2]!.text))!);
+		assert.equal(new TextDecoder().decode(state.plain), notes[2]!.text);
+		for (let pass = 0; pass < 5 && (await runStateProjectionPass(ports, limits)).more; pass++);
+		assert.ok(has("solo-c") && has("solo-d"), "the rest follows in later passes");
+		assert.ok(!has("solo-huge"), "above the per-object bound: not projected (capture records missing_history)");
+		assert.equal((await runStateProjectionPass(ports, limits)).idle, true, "no retry loop on the dropped body");
+	});
+});
+
 s.test("inline hook (bulk create): projects named bodies best-effort without moving the watermark", async () => {
 	await withWorld("base", async (world) => {
 		await world.createNotes("seed", NOTES.slice(0, 4));
