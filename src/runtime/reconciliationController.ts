@@ -1,4 +1,5 @@
 import { App, MarkdownView, Notice, TFile } from "obsidian";
+import { createMarkdownConflictArtifact as createSharedMarkdownConflictArtifact } from "./reconcile/markdownConflictArtifact";
 import { canonicalMarkdownBytes, canonicalizeMarkdown } from "@shared/markdownCodec";
 import { composeBodyOnlyProgress } from "../sync/frontmatterBoundary";
 import type { BlobSyncManager } from "../sync/blobSync";
@@ -2630,51 +2631,14 @@ export class ReconciliationController {
 		reason: string,
 		source?: "crdt" | "disk" | "editor",
 	): Promise<string> {
-		const basePath = this.conflictArtifactPath(path, source);
-		for (let i = 0; i < 100; i++) {
-			const candidate = i === 0
-				? basePath
-				: basePath.replace(/(\.md)?$/, ` ${i + 1}$1`);
-			if (this.deps.app.vault.getAbstractFileByPath(candidate)) continue;
-			await this.deps.app.vault.create(candidate, content);
-			this.deps.trace("conflict", "conflict-artifact-created", {
-				path,
-				conflictPath: candidate,
-				reason,
-				source: source ?? null,
-				contentLength: content.length,
-			});
-			return candidate;
-		}
-		throw new Error(`could not create conflict artifact for ${path}`);
-	}
-
-	private conflictArtifactPath(path: string, source?: "crdt" | "disk" | "editor"): string {
-		const slash = path.lastIndexOf("/");
-		const dir = slash >= 0 ? path.slice(0, slash + 1) : "";
-		const name = slash >= 0 ? path.slice(slash + 1) : path;
-		const dot = name.toLowerCase().endsWith(".md") ? name.length - 3 : -1;
-		const base = dot >= 0 ? name.slice(0, dot) : name;
-		const ext = dot >= 0 ? name.slice(dot) : ".md";
-		// Cap device name to 50 chars to prevent overly long paths
-		const device = (this.deps.getSettings().deviceName
-			.replace(/[\\/:*?"<>|]/g, "-")
-			.trim() || "unknown-device").slice(0, 50);
-		const stamp = new Date().toISOString()
-			.replace(/\.\d{3}Z$/, "Z")
-			.replace(/[:]/g, "-");
-		// Cap base name to 100 chars to prevent filesystem path length issues
-		const cappedBase = base.slice(0, 100);
-		const sourcePart = source ? ` - ${source}` : "";
-		const suffix = ` (YAOS conflict${sourcePart} from ${device} ${stamp})`;
-		// Guard total filename length: suffix + ext + base + margin for
-		// counter suffix (" 99") ≈ suffix.length + ext.length + 4.
-		// Most filesystems cap at 255 bytes per component.
-		const maxBase = Math.max(20, 255 - suffix.length - ext.length - 4);
-		const finalBase = cappedBase.length > maxBase
-			? cappedBase.slice(0, maxBase)
-			: cappedBase;
-		return `${dir}${finalBase}${suffix}${ext}`;
+		// Shared implementation: reuses an existing same-content copy so a
+		// restart that re-detects the same divergence does not add another.
+		return createSharedMarkdownConflictArtifact(this.deps.app, path, content, {
+			deviceName: this.deps.getSettings().deviceName,
+			reason,
+			source,
+			trace: (message, details) => this.deps.trace("conflict", message, details),
+		});
 	}
 
 	/**
