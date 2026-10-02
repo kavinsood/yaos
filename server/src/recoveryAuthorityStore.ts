@@ -35,7 +35,7 @@ export interface BodyRecipeDescriptor {
 	recipeId: string; bodyId: string; generation: number; expectedContentHash: string; expectedSize: number;
 	encodedHistoryBytes: number; firstCursor: string;
 }
-export interface MaterializationLease { leaseId: string; ownerKind: "capture" | "projection"; ownerId: string; objectKeys: string[]; expiresAt: number }
+export interface MaterializationLease { leaseId: string; ownerKind: "capture"; ownerId: string; objectKeys: string[]; expiresAt: number }
 export interface RecoveryDefectRecord {
 	captureId: string; kind: "active" | "canvas" | "deleted" | "attachment"; identity: string; generation: number | null;
 	code: string; referenceHash: string; createdAt: number;
@@ -83,6 +83,30 @@ function parseRestoreSelection(value: string): RestoreSelection {
 }
 
 /** Recovery capture, restore, projection, GC, lease, and deletion authority storage. */
+/** Read granularity for building a state object from the stored recipe. */
+const RECOVERY_STATE_CHUNK_BYTES = 4 * 1024 * 1024;
+/** Matches the binary envelope's segment bound. */
+const RECOVERY_STATE_MAX_SEGMENTS = 10_000;
+
+export interface RecoveryStateCursor { source: number; sequence: number; id: string | null }
+export interface RecoveryStateProjectionState {
+	watermark: number; target: number | null; cursor: RecoveryStateCursor | null; pending: string[];
+}
+export interface RecoveryStateHead { kind: "markdown" | "canvas"; generation: number; contentHash: string; size: number }
+
+function concatenate(parts: readonly Uint8Array[]): Uint8Array {
+	if (parts.length === 1) return parts[0]!;
+	const out = new Uint8Array(parts.reduce((total, part) => total + part.byteLength, 0));
+	let offset = 0;
+	for (const part of parts) { out.set(part, offset); offset += part.byteLength; }
+	return out;
+}
+
+/** Content hashes named in an object key (a content-addressed key carries one). */
+function objectKeyHashes(key: string): string[] {
+	return key.match(/[a-f0-9]{64}/g) ?? [];
+}
+
 export class RecoveryAuthorityStore extends VaultBootstrapStore {
 	acquireVaultMutationLease(owner: string, now = Date.now(), ttlMs = 5 * 60_000): boolean {
 		return this.acquireRecoveryMutex(owner, now, ttlMs);
@@ -1022,40 +1046,248 @@ export class RecoveryAuthorityStore extends VaultBootstrapStore {
 		});
 	}
 
+	/**
+	 * Projection lag for status: the sequences not yet covered by the vault-side
+	 * state projection watermark (b3 P2). Two point reads; no catalog scan.
+	 */
 	recoveryProjectionSummary(boundarySequence = this.currentSequence()): {
-		totalEntries: number;
-		remainingEntries: number;
-		lagSequences: number;
+		watermark: number; pendingDocuments: number; lagSequences: number; updatedAt: number | null;
 	} {
 		this.initialize();
-		const row = this.storage.sql.exec<{
-			total_entries: number;
-			remaining_entries: number;
-			oldest_missing_sequence: number | null;
-		}>(
-			`SELECT
-			   COUNT(*) AS total_entries,
-			   SUM(CASE WHEN i.content_hash IS NULL THEN 1 ELSE 0 END) AS remaining_entries,
-			   MIN(CASE WHEN i.content_hash IS NULL THEN e.sequence ELSE NULL END) AS oldest_missing_sequence
-			 FROM vault_catalog_events e
-			 JOIN (
-			   SELECT body_id, MAX(sequence) AS sequence
-			   FROM vault_catalog_events
-			   WHERE sequence <= ?
-			   GROUP BY body_id
-			 ) latest ON latest.body_id = e.body_id AND latest.sequence = e.sequence
-			 LEFT JOIN recovery_content_index i ON i.content_hash = e.content_hash
-			 WHERE e.lifecycle = 'active' AND e.content_hash IS NOT NULL`,
-			boundarySequence,
-		).one();
-		const remainingEntries = row.remaining_entries ?? 0;
+		const state = this.recoveryStateProjection();
+		const updatedAt = this.storage.sql.exec<{ updated_at: number }>(
+			"SELECT updated_at FROM recovery_state_projection WHERE id = 1",
+		).toArray()[0]?.updated_at ?? null;
+		// Sequences also advance for writes that move no Markdown/Canvas head (they owe
+		// no projection wake), so lag counts only if a change source has a row after
+		// the watermark: one LIMIT 1 probe per source.
+		const lagging = boundarySequence > state.watermark
+			&& (state.cursor !== null || this.recoveryStateChanges(state.watermark, boundarySequence, null, 1, 1).ids.length > 0);
 		return {
-			totalEntries: row.total_entries,
-			remainingEntries,
-			lagSequences: remainingEntries === 0 || row.oldest_missing_sequence === null
-				? 0
-				: Math.max(0, boundarySequence - row.oldest_missing_sequence),
+			watermark: state.watermark,
+			pendingDocuments: state.pending.length,
+			lagSequences: lagging ? boundarySequence - state.watermark : 0,
+			updatedAt,
 		};
+	}
+
+	/** In-memory guard for vault-side state-object puts; see `beginStateObjectWrite`. */
+	private readonly inflightStateKeys = new Set<string>();
+
+	/**
+	 * Registers an in-flight vault-side put of `objectKey`. Sweep approval (same
+	 * DO) treats a registered key as leased, and a new GC epoch cannot start while
+	 * any is registered, so no lease rows are written per note. Refuses (false) if
+	 * the key already holds a live sweep lease or is already in flight.
+	 */
+	beginStateObjectWrite(objectKey: string, now = Date.now()): boolean {
+		this.initialize();
+		if (this.inflightStateKeys.has(objectKey)) return false;
+		const swept = this.storage.sql.exec<{ count: number }>(
+			"SELECT COUNT(*) AS count FROM recovery_key_leases WHERE object_key = ? AND lease_kind = 'sweep' AND expires_at > ?",
+			objectKey, now,
+		).one().count > 0;
+		if (swept) return false;
+		this.inflightStateKeys.add(objectKey);
+		return true;
+	}
+
+	endStateObjectWrite(objectKey: string): void {
+		this.inflightStateKeys.delete(objectKey);
+	}
+
+	stateObjectWritesInFlight(): number {
+		return this.inflightStateKeys.size;
+	}
+
+	/** The epoch content writes must be verified against (sweeping GC), else null. */
+	sweepingGcEpoch(): number | null {
+		const gc = this.latestGcEpoch();
+		return gc?.state === "sweeping" ? gc.epoch : null;
+	}
+
+	recoveryStateProjection(): RecoveryStateProjectionState {
+		this.initialize();
+		const row = this.storage.sql.exec<{ watermark: number; target: number | null; cursor: string | null; pending: string }>(
+			"SELECT watermark, target, cursor, pending FROM recovery_state_projection WHERE id = 1",
+		).toArray()[0];
+		if (!row) return { watermark: 0, target: null, cursor: null, pending: [] };
+		const cursor = row.cursor === null ? null : JSON.parse(row.cursor) as RecoveryStateCursor;
+		return { watermark: row.watermark, target: row.target, cursor, pending: JSON.parse(row.pending) as string[] };
+	}
+
+	/** One row written. */
+	saveRecoveryStateProjection(state: RecoveryStateProjectionState, now = Date.now()): void {
+		this.initialize();
+		this.storage.sql.exec(
+			`INSERT INTO recovery_state_projection(id, watermark, target, cursor, pending, updated_at)
+			 VALUES (1, ?, ?, ?, ?, ?)
+			 ON CONFLICT(id) DO UPDATE SET watermark = excluded.watermark, target = excluded.target,
+			 cursor = excluded.cursor, pending = excluded.pending, updated_at = excluded.updated_at`,
+			state.watermark, state.target, state.cursor === null ? null : JSON.stringify(state.cursor),
+			JSON.stringify(state.pending), now,
+		).toArray();
+	}
+
+	/**
+	 * Document ids whose head may have changed in (after, through], resuming at
+	 * `cursor`. Sources, each a LIMIT-bounded primary-key range seek: catalog events,
+	 * the body journal, semantic catalog events; then (relay v3) the group-commit
+	 * tail, whose rows are deleted at checkpoint (a small table; the lean clock
+	 * already scans it). Returns `cursor: null` once the window is exhausted.
+	 */
+	recoveryStateChanges(after: number, through: number, cursor: RecoveryStateCursor | null, maxIds: number, maxRows: number): {
+		ids: string[]; cursor: RecoveryStateCursor | null; rowsRead: number;
+	} {
+		this.initialize();
+		const ids = new Set<string>();
+		let at: RecoveryStateCursor = cursor ?? { source: 0, sequence: after, id: null };
+		let rowsRead = 0;
+		const sources = this.relayTailEnabled ? 4 : 3;
+		while (at.source < sources) {
+			if (ids.size >= maxIds || rowsRead >= maxRows) return { ids: [...ids], cursor: at, rowsRead };
+			const limit = Math.max(1, Math.min(maxIds - ids.size, maxRows - rowsRead));
+			let rows: Array<{ sequence: number; id: string }>;
+			if (at.source === 0 || at.source === 2) {
+				const table = at.source === 0 ? "vault_catalog_events" : "vault_semantic_catalog_events";
+				const key = at.source === 0 ? "body_id" : "document_id";
+				rows = at.id === null
+					? this.storage.sql.exec<{ sequence: number; id: string }>(
+						`SELECT sequence, ${key} AS id FROM ${table} WHERE sequence > ? AND sequence <= ?
+						 ORDER BY sequence, ${key} LIMIT ?`, at.sequence, through, limit).toArray()
+					: this.storage.sql.exec<{ sequence: number; id: string }>(
+						`SELECT sequence, ${key} AS id FROM ${table} WHERE (sequence, ${key}) > (?, ?) AND sequence <= ?
+						 ORDER BY sequence, ${key} LIMIT ?`, at.sequence, at.id, through, limit).toArray();
+			} else if (at.source === 1) {
+				rows = this.storage.sql.exec<{ sequence: number; id: string }>(
+					`SELECT sequence, document_id AS id FROM vault_journal WHERE sequence > ? AND sequence <= ?
+					 ORDER BY sequence LIMIT ?`, at.sequence, through, limit).toArray();
+			} else {
+				// No upper bound: a tail that moved past `through` is projected now, not missed.
+				rows = this.storage.sql.exec<{ sequence: number; id: string }>(
+					`SELECT latest_sequence AS sequence, body_id AS id FROM relay_body_tail
+					 WHERE latest_sequence > ? AND body_id > ? ORDER BY body_id LIMIT ?`,
+					after, at.id ?? "", limit).toArray();
+			}
+			rowsRead += rows.length;
+			for (const row of rows) ids.add(row.id);
+			const last = rows.at(-1);
+			if (rows.length < limit || !last) {
+				at = { source: at.source + 1, sequence: after, id: null };
+				continue;
+			}
+			at = at.source === 3 ? { source: 3, sequence: after, id: last.id }
+				: at.source === 1 ? { source: 1, sequence: last.sequence, id: null }
+					: { source: at.source, sequence: last.sequence, id: last.id };
+		}
+		return { ids: [...ids], cursor: null, rowsRead };
+	}
+
+	/**
+	 * The recoverable head of a Markdown body or Canvas document at `boundary`:
+	 * active or tombstoned with a content identity. "pending" when the head is
+	 * active but its content hash is not yet known (relay v3 before acceptance).
+	 */
+	recoveryStateHead(documentId: string, boundary: number): RecoveryStateHead | "pending" | null {
+		this.initialize();
+		const markdown = this.getCatalogHeadAt(boundary, documentId);
+		const head = markdown ?? this.semanticHeadAt(boundary, documentId);
+		if (!head || (head.lifecycle !== "active" && head.lifecycle !== "tombstoned")) return null;
+		if (head.contentHash === null || head.size === null) return head.lifecycle === "active" ? "pending" : null;
+		return { kind: markdown ? "markdown" : "canvas", generation: head.generation, contentHash: head.contentHash, size: head.size };
+	}
+
+	/**
+	 * A body's stored history at `boundary` as opaque Yjs updates, never decoded:
+	 * each checkpoint's sha-verified fragments concatenated, then each journal row
+	 * and relay-tail record as stored. "too_large" past `maximumBytes` or the
+	 * segment bound; throws on a malformed recipe (corrupt history).
+	 */
+	recoveryStateUpdates(documentId: string, boundary: number, maximumBytes: number): {
+		updates: Uint8Array[]; bytes: number;
+	} | "too_large" {
+		this.initialize();
+		if (this.documentEncodedHistoryBytes(documentId, boundary) > maximumBytes) return "too_large";
+		const updates: Uint8Array[] = [];
+		let fragments: Uint8Array[] = [];
+		let bytes = 0;
+		let cursor: string | null = "0";
+		while (cursor !== null) {
+			const chunk = this.rawDocumentRecipeChunk(documentId, boundary, cursor, Math.min(RECOVERY_STATE_CHUNK_BYTES, maximumBytes));
+			if (chunk.parts.length === 0) throw new Error("recipe chunk made no progress");
+			for (const part of chunk.parts) {
+				bytes += part.bytes.byteLength;
+				if (bytes > maximumBytes || updates.length >= RECOVERY_STATE_MAX_SEGMENTS) return "too_large";
+				if (part.kind === "journal") {
+					if (fragments.length > 0) throw new Error("recipe journal part inside checkpoint");
+					updates.push(part.bytes);
+					continue;
+				}
+				if (part.fragmentIndex !== fragments.length) throw new Error("recipe checkpoint fragment out of order");
+				fragments.push(part.bytes);
+				if (fragments.length === part.fragmentCount) {
+					updates.push(concatenate(fragments));
+					fragments = [];
+				}
+			}
+			cursor = chunk.nextCursor;
+		}
+		if (fragments.length > 0) throw new Error("recipe ended mid-checkpoint");
+		return { updates, bytes };
+	}
+
+	/**
+	 * Capture fallback: the head a capture planned at its boundary (Markdown or
+	 * Canvas), checked against the planned generation and content.
+	 */
+	captureStateHead(captureId: string, documentId: string, generation: number): (RecoveryStateHead & { boundarySequence: number; gcEpoch: number | null }) | null {
+		this.initialize();
+		const capture = this.recoveryCapture(captureId);
+		if (!capture) return null;
+		const markdown = this.getCatalogHeadAt(capture.boundarySequence, documentId);
+		const head = markdown ?? this.semanticHeadAt(capture.boundarySequence, documentId);
+		if (!head || head.generation !== generation || head.contentHash === null || head.size === null) return null;
+		return { kind: markdown ? "markdown" : "canvas", generation, contentHash: head.contentHash, size: head.size,
+			boundarySequence: capture.boundarySequence, gcEpoch: capture.gcEpoch };
+	}
+
+	/** Content index plus capture membership for a capture-fallback state object (Markdown or Canvas). */
+	recordCaptureStateMaterialized(input: {
+		captureId: string; documentId: string; generation: number; contentHash: string; objectKey: string; plainBytes: number; gcEpoch: number | null; now?: number;
+	}): void {
+		this.initialize();
+		this.storage.transactionSync(() => {
+			this.recordProjectedContent(input.contentHash, input.objectKey, input.plainBytes, input.gcEpoch, input.now ?? Date.now());
+			this.storage.sql.exec(
+				`INSERT OR IGNORE INTO recovery_capture_content(capture_id, body_id, generation, content_hash)
+				 VALUES (?, ?, ?, ?)`,
+				input.captureId, input.documentId, input.generation, input.contentHash,
+			).toArray();
+		});
+	}
+
+	/**
+	 * Content hashes the sweep must keep: every current Markdown and Canvas head
+	 * (active, tombstoned or reaped) plus relay-tail hashes. One indexed skip-scan
+	 * per table (one row per key), built once per sweep page instead of a
+	 * GROUP BY over all history per object key.
+	 */
+	private liveHeadContentHashes(): Set<string> {
+		const live = new Set<string>();
+		const boundary = Number.MAX_SAFE_INTEGER;
+		for (const row of this.latestEventPerKey<{ lifecycle: string; content_hash: string | null }>(
+			"vault_catalog_events", "body_id", "e.lifecycle, e.content_hash", boundary)) {
+			if (row.content_hash !== null && row.lifecycle !== "purged") live.add(row.content_hash);
+		}
+		for (const row of this.latestEventPerKey<{ lifecycle: string; content_hash: string | null }>(
+			"vault_semantic_catalog_events", "document_id", "e.lifecycle, e.content_hash", boundary)) {
+			if (row.content_hash !== null && row.lifecycle !== "purged") live.add(row.content_hash);
+		}
+		if (this.relayTailEnabled) {
+			for (const row of this.storage.sql.exec<{ content_hash: string }>(
+				"SELECT content_hash FROM relay_body_tail WHERE content_hash IS NOT NULL")) live.add(row.content_hash);
+		}
+		return live;
 	}
 
 	recordRecoveryDefects(defects: RecoveryDefectRecord[]): void {
@@ -1081,7 +1313,7 @@ export class RecoveryAuthorityStore extends VaultBootstrapStore {
 	}
 
 	acquireMaterializationLease(input: {
-		leaseId: string; ownerKind: "capture" | "projection"; ownerId: string; objectKeys: string[]; expiresAt: number; now?: number;
+		leaseId: string; ownerKind: "capture"; ownerId: string; objectKeys: string[]; expiresAt: number; now?: number;
 	}): MaterializationLease {
 		this.initialize();
 		const now = input.now ?? Date.now();
@@ -1144,9 +1376,11 @@ export class RecoveryAuthorityStore extends VaultBootstrapStore {
 			throw new Error("GC epoch cannot sweep");
 		}
 		const approved: string[] = [];
+		const liveHashes = this.liveHeadContentHashes();
 		this.storage.transactionSync(() => {
 			this.storage.sql.exec("DELETE FROM recovery_key_leases WHERE expires_at <= ?", now).toArray();
 			for (const key of input.objectKeys) {
+				if (this.inflightStateKeys.has(key)) continue;
 				const leased = this.storage.sql.exec<{ count: number }>(
 					"SELECT COUNT(*) AS count FROM recovery_key_leases WHERE object_key = ?",
 					key,
@@ -1164,31 +1398,13 @@ export class RecoveryAuthorityStore extends VaultBootstrapStore {
 					   (SELECT COUNT(*) FROM recovery_capture_content cc
 					    JOIN recovery_content_index i ON i.content_hash = cc.content_hash
 					    JOIN recovery_captures r ON r.capture_id = cc.capture_id
-					    WHERE i.object_key = ? AND r.state NOT IN ('complete','complete_with_gaps','failed','cancelled')) +
-					   (SELECT COUNT(*) FROM vault_catalog_events e
-					    JOIN (
-					      SELECT body_id, MAX(sequence) AS sequence
-					      FROM vault_catalog_events GROUP BY body_id
-					    ) latest ON latest.body_id = e.body_id AND latest.sequence = e.sequence
-					    WHERE e.lifecycle IN ('active','tombstoned','reaped')
-					      AND e.content_hash IS NOT NULL
-					      AND instr(?, e.content_hash) > 0) +
-					   (SELECT COUNT(*) FROM vault_semantic_catalog_events e
-					    JOIN (
-					      SELECT document_id, MAX(sequence) AS sequence
-					      FROM vault_semantic_catalog_events GROUP BY document_id
-					    ) latest ON latest.document_id = e.document_id AND latest.sequence = e.sequence
-					    WHERE e.lifecycle IN ('active','tombstoned','reaped')
-					      AND e.content_hash IS NOT NULL
-					      AND instr(?, e.content_hash) > 0)
+					    WHERE i.object_key = ? AND r.state NOT IN ('complete','complete_with_gaps','failed','cancelled'))
 					 ) AS count`,
 					key,
 					key,
 					key,
 					key,
-					key,
-					key,
-				).one().count > 0;
+				).one().count > 0 || objectKeyHashes(key).some((hash) => liveHashes.has(hash));
 				const attachmentLive = input.domain === "blob" && this.storage.sql.exec<{ count: number }>(
 					`SELECT (
 					 (SELECT COUNT(*) FROM vault_attachment_catalog_events e
@@ -1252,22 +1468,20 @@ export class RecoveryAuthorityStore extends VaultBootstrapStore {
 			"SELECT COUNT(*) AS count FROM recovery_key_leases WHERE lease_kind = 'materialize' AND expires_at > ?",
 			now,
 		).one().count;
-		if (activeRestore > 0 || materializers > 0) throw new Error("GC mark authority is busy");
+		if (activeRestore > 0 || materializers > 0 || this.inflightStateKeys.size > 0) throw new Error("GC mark authority is busy");
 		const epoch = this.storage.sql.exec<{ epoch: number }>(
 			"SELECT COALESCE(MAX(epoch), 0) + 1 AS epoch FROM recovery_gc_epochs",
 		).one().epoch;
 		const deadlineAt = now + 24 * 60 * 60_000;
-		const projectionWasEnabled = this.projectionLease()?.enabled ?? false;
 		this.storage.transactionSync(() => {
 			this.storage.sql.exec(
 				`INSERT INTO recovery_gc_epochs(
 				 epoch, request_id, vault_id, projection_was_enabled, job_id, capability_hash, capability_expires_at,
 				 state, mark_boundary_sequence, mark_started_at, deadline_at
 				 ) VALUES (?, ?, ?, ?, ?, ?, ?, 'marking', ?, ?, ?)`,
-				epoch, input.requestId, input.vaultId, projectionWasEnabled ? 1 : 0, input.jobId,
+				epoch, input.requestId, input.vaultId, 0, input.jobId,
 				input.capabilityHash, input.capabilityExpiresAt, this.currentSequence(), now, deadlineAt,
 			).toArray();
-			this.storage.sql.exec("UPDATE recovery_projection_lease SET enabled = 0, updated_at = ? WHERE id = 1", now).toArray();
 		});
 		return this.gcEpoch(epoch)!;
 	}
@@ -1342,16 +1556,6 @@ export class RecoveryAuthorityStore extends VaultBootstrapStore {
 				now,
 				epoch,
 			).toArray();
-			if (state === "sweeping" || state === "complete" || state === "aborted") {
-				this.storage.sql.exec(
-					`UPDATE recovery_projection_lease
-					 SET enabled = COALESCE((SELECT projection_was_enabled FROM recovery_gc_epochs WHERE epoch = ?), 0),
-					     updated_at = ?
-					 WHERE id = 1`,
-					epoch,
-					now,
-				).toArray();
-			}
 		});
 		return this.gcEpoch(epoch)!;
 	}
@@ -1515,30 +1719,6 @@ export class RecoveryAuthorityStore extends VaultBootstrapStore {
 		return row ? this.snapshot(row.snapshot_id) : null;
 	}
 
-	rotateProjectionLease(input: {
-		vaultId: string; vaultGeneration: string; leaseId: string; capabilityHash: string; expiresAt: number; runtimeEpoch: string; enabled: boolean; now?: number;
-	}): void {
-		this.initialize();
-		const metadata = this.assertVaultGeneration(input.vaultGeneration);
-		if (metadata.vaultId !== input.vaultId) throw new Error("vault identity mismatch");
-		const now = input.now ?? Date.now();
-		if (input.expiresAt <= now) throw new Error("invalid projection lease expiry");
-		this.storage.sql.exec(
-			`INSERT INTO recovery_projection_lease(
-			 id, lease_id, capability_hash, expires_at, enabled, runtime_epoch, updated_at
-			 ) VALUES (1, ?, ?, ?, ?, ?, ?)
-			 ON CONFLICT(id) DO UPDATE SET
-			 lease_id = excluded.lease_id, capability_hash = excluded.capability_hash,
-			 expires_at = excluded.expires_at, enabled = excluded.enabled,
-			 runtime_epoch = excluded.runtime_epoch, updated_at = excluded.updated_at`,
-			input.leaseId,
-			input.capabilityHash,
-			input.expiresAt,
-			input.enabled ? 1 : 0,
-			input.runtimeEpoch,
-			now,
-		).toArray();
-	}
 
 	projectionWakeDueAt(): number | null {
 		this.initialize();
@@ -1547,11 +1727,11 @@ export class RecoveryAuthorityStore extends VaultBootstrapStore {
 		).toArray()[0]?.due_at ?? null;
 	}
 
-	/** Records a projection wake owed at `dueAt`; an earlier owed wake is kept. */
+	/** Records a projection wake owed at `dueAt`; the earlier of the two owed wakes is kept. */
 	oweProjectionWake(dueAt: number): void {
 		this.initialize();
 		this.storage.sql.exec(
-			"INSERT INTO recovery_projection_wake(id, due_at) VALUES (1, ?) ON CONFLICT(id) DO NOTHING",
+			"INSERT INTO recovery_projection_wake(id, due_at) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET due_at = MIN(due_at, excluded.due_at)",
 			dueAt,
 		).toArray();
 	}
@@ -1561,20 +1741,6 @@ export class RecoveryAuthorityStore extends VaultBootstrapStore {
 		this.storage.sql.exec("DELETE FROM recovery_projection_wake WHERE id = 1").toArray();
 	}
 
-	projectionLease(): { vaultGeneration: string; leaseId: string; capabilityHash: string; expiresAt: number; enabled: boolean; runtimeEpoch: string } | null {
-		this.initialize();
-		const row = this.storage.sql.exec<{
-			lease_id: string; capability_hash: string; expires_at: number; enabled: number; runtime_epoch: string;
-		}>("SELECT lease_id, capability_hash, expires_at, enabled, runtime_epoch FROM recovery_projection_lease WHERE id = 1").toArray()[0];
-		return row ? {
-			vaultGeneration: this.currentVaultGeneration(),
-			leaseId: row.lease_id,
-			capabilityHash: row.capability_hash,
-			expiresAt: row.expires_at,
-			enabled: row.enabled === 1,
-			runtimeEpoch: row.runtime_epoch,
-		} : null;
-	}
 
 	planPageCommitment(captureId: string, stream: CapturePlanStream, startCursor: string | null): {
 		pageHash: string; endCursor: string | null; rollingDigest: string; terminal: boolean;
@@ -1728,7 +1894,6 @@ export class RecoveryAuthorityStore extends VaultBootstrapStore {
 				now,
 			).toArray();
 			for (const pinId of capturePinIds) this.releaseHistoryPinInTransaction(pinId, now);
-			this.storage.sql.exec("UPDATE recovery_projection_lease SET enabled = 0, capability_hash = '', updated_at = ? WHERE id = 1", now).toArray();
 			this.storage.sql.exec(
 				"UPDATE recovery_gc_epochs SET state = 'aborted', capability_hash = '' WHERE state IN ('marking','sweeping')",
 			).toArray();

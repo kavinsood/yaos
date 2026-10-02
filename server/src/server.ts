@@ -1,3 +1,5 @@
+import { projectStateDocuments, runStateProjectionPass, type StateProjectionPorts } from "./recoveryStateProjection";
+import { DAILY_LIMIT_ERROR_CODE, isCloudflareDailyLimitError, nextUtcMidnight } from "./dailyLimit";
 import type { YwasmCrdtDocument } from "./crdt/ywasmCrdtEngine";
 import { ywasmCrdtEngine as crdtEngine } from "@yaos/crdt-engine";
 import { encodeBinaryEnvelope, YAOS_BINARY_CONTENT_TYPE } from "./shared/binaryEnvelope";
@@ -214,6 +216,8 @@ const PROJECTION_INPUT_WRITE = new RegExp(
 );
 const PROJECTION_WAKE_DELAY_MS = 60_000;
 const PROJECTION_WAKE_RETRY_MS = 5 * 60_000;
+/** A bounded pass left work (budget or window truncated): continue soon. */
+const PROJECTION_MORE_WORK_MS = 1_000;
 
 /** Exported for tests: does this statement owe a projection wake? */
 export function isProjectionInputWrite(query: string): boolean {
@@ -936,19 +940,63 @@ export class VaultRuntime implements DrainPort {
 		// Clear before waking: a mutation from here on owes (and durably records) a new wake.
 		this.projectionWakeOwed = false;
 		if (marked !== null) this.store.clearProjectionWake();
-		const vaultId = this.store.vaultMetadata()?.vaultId;
-		if (!vaultId) return;
+		const metadata = this.store.vaultMetadata();
+		if (!metadata) return;
+		let retryAt: number | null = null;
 		try {
-			await this.recovery.wakeProjection(vaultId);
+			const result = await runStateProjectionPass(this.stateProjectionPorts(metadata));
+			if (result.more) retryAt = Date.now() + PROJECTION_MORE_WORK_MS;
 		} catch (error) {
-			console.warn("[yaos-vault] recovery projection wake failed", error);
-			if (!this.projectionWakeOwed) {
-				this.projectionWakeOwed = true;
-				const retryAt = Date.now() + PROJECTION_WAKE_RETRY_MS;
-				try { this.store.oweProjectionWake(retryAt); } catch { /* the in-memory owed flag still retries */ }
-				await this.armAlarmEarliest(retryAt);
-			}
+			// Daily limit: owe the wake at the reset, never a tight retry loop. Other
+			// failures (R2, eviction-adjacent storage errors) retry later; progress was
+			// not saved, and content already indexed is a one-read skip on retry.
+			const limited = isCloudflareDailyLimitError(error);
+			console.warn("[yaos-vault] recovery state projection failed", limited ? DAILY_LIMIT_ERROR_CODE : error);
+			retryAt = limited ? nextUtcMidnight(Date.now()) : Date.now() + PROJECTION_WAKE_RETRY_MS;
 		}
+		if (retryAt !== null) {
+			this.projectionWakeOwed = true;
+			try { this.store.oweProjectionWake(retryAt); } catch { /* the in-memory owed flag still retries */ }
+			try { await this.armAlarmEarliest(retryAt); }
+			catch (error) { if (!isCloudflareDailyLimitError(error)) throw error; }
+		}
+	}
+
+	private stateProjectionPorts(metadata: { vaultId: string; vaultGeneration: string }): StateProjectionPorts {
+		if (!this.options.objectStore) throw new Error("recovery storage unavailable");
+		return { store: this.store, objectStore: this.options.objectStore, vaultId: metadata.vaultId, vaultGeneration: metadata.vaultGeneration };
+	}
+
+	/**
+	 * Inline best-effort recovery projection (b3 P2 hook for bulk create). Await it
+	 * after the bulk-create transaction commits, under `waitUntil` so the response
+	 * is not held. Never throws and never moves the watermark: the next watermark
+	 * pass rechecks these ids (an indexed hash costs it one read and no put).
+	 * Bounded to 64 ids / 24 MiB of history; the rest is left to the alarm. A no-op
+	 * without R2 or after deletion.
+	 */
+	async projectRecoveryStateInline(documentIds: readonly string[]): Promise<{ projected: number; skipped: number }> {
+		const metadata = this.store.vaultMetadata();
+		if (!this.options.objectStore || this.deleted || !metadata) return { projected: 0, skipped: documentIds.length };
+		try {
+			return await projectStateDocuments(this.stateProjectionPorts(metadata), documentIds);
+		} catch {
+			return { projected: 0, skipped: documentIds.length };
+		}
+	}
+
+	/**
+	 * Adapter for b3-bulk's `VaultRuntimeOptions.onBulkCreateCommitted`
+	 * (`VaultBulkCreateService.onBulkCreateCommitted`, branch b3-bulk): synchronous,
+	 * returns at once, and schedules `projectRecoveryStateInline` for the batch's
+	 * body ids under `waitUntil`, so the receipt is never delayed. The event's
+	 * bytes are not reused: the pass re-reads the committed checkpoint so head and
+	 * bytes come from one synchronous read. The watermark alarm is the guarantee.
+	 */
+	recoveryBulkCreateCommitted(event: { readonly bodies: ReadonlyArray<{ readonly bodyId: string }> }): void {
+		const ids = event.bodies.map((body) => body.bodyId);
+		if (ids.length === 0 || !this.options.objectStore) return;
+		this.options.execution.waitUntil(this.projectRecoveryStateInline(ids));
 	}
 
 	private async provision(vaultId: string, request: Request): Promise<Response> {
@@ -963,11 +1011,6 @@ export class VaultRuntime implements DrainPort {
 		const result = this.store.provisionVault(vaultId, body.vaultGeneration, crdtEngine.encodeStateAsUpdate(root));
 		crdtEngine.destroyDocument(root);
 		this.deleted = false;
-		try {
-			await this.recovery.initializeProjection(vaultId);
-		} catch (error) {
-			console.warn("[yaos-vault] recovery projection unavailable", error);
-		}
 		return json(result, result.created ? 201 : 200);
 	}
 

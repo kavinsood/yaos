@@ -120,13 +120,6 @@ export interface GcDescriptor {
 	jobId?: string; vaultId: string; vaultGeneration: string; createdAt: number; capability: string; capabilityExpiresAt: number;
 	epoch: number; markStartedAt: number; deadlineAt: number; gracePeriodMs: number; domains: Array<"recovery" | "blob">;
 }
-export interface ProjectionWorkPageRequest {
-	vaultId: string; vaultGeneration: string; leaseId: string; capability: string; cursor: string | null; maxEntries: number; maxResponseBytes: number;
-}
-export interface ProjectionWorkPage {
-	entries: Array<{ bodyId: string; generation: number; contentHash: string; size: number }>;
-	nextCursor: string | null; terminal: boolean;
-}
 export interface GcRootPageRequest {
 	vaultId: string; vaultGeneration: string; epoch: number; capability: string; cursor: string | null; maxEntries: number;
 }
@@ -174,8 +167,8 @@ export interface RecipeChunkPart {
 }
 export interface RecipeChunk { recipeId: string; cursor: string; nextCursor: string | null; parts: RecipeChunkPart[]; encodedBytes: number }
 
-export interface MaterializationLeaseRequest { ownerKind: "capture" | "projection"; ownerId: string; capability: string; objectKeys: string[]; ttlMs?: number }
-export interface MaterializationLease { leaseId: string; ownerKind: "capture" | "projection"; ownerId: string; objectKeys: string[]; expiresAt: number }
+export interface MaterializationLeaseRequest { ownerKind: "capture"; ownerId: string; capability: string; objectKeys: string[]; ttlMs?: number }
+export interface MaterializationLease { leaseId: string; ownerKind: "capture"; ownerId: string; objectKeys: string[]; expiresAt: number }
 export interface ContentMaterialized {
 	captureId: string; boundarySequence: number; capability: string; bodyId: string; generation: number;
 	contentHash: string; plainBytes: number; objectKey: string;
@@ -224,8 +217,6 @@ export interface AttachmentCatalogEvent {
 	sequence: number; path: string; contentHash: string | null; size: number | null; mime: string | null; lifecycle: "active" | "deleted";
 }
 
-export interface ProjectionLease { vaultId: string; vaultGeneration: string; leaseId: string; capabilityHash: string; expiresAt: number; enabled: boolean; runtimeEpoch: string }
-export interface ProjectionRecipeRequest { vaultId: string; vaultGeneration: string; leaseId: string; capability: string; bodyId: string; expectedHeadGeneration: number }
 
 export interface RecoverySnapshotDependency { operationKind: "capture" | "restore"; operationId: string; snapshotId: string }
 export interface GcEpoch { epoch: number; requestId: string; state: "marking" | "sweeping" | "complete" | "aborted"; markBoundarySequence: number; markStartedAt: number; markCompletedAt: number | null; sweepCompletedAt: number | null; deadlineAt: number }

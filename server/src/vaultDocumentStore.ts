@@ -978,13 +978,15 @@ export abstract class VaultDocumentStore {
 				created_at INTEGER NOT NULL,
 				updated_at INTEGER NOT NULL
 			);
-			CREATE TABLE IF NOT EXISTS recovery_projection_lease (
+			-- Vault-side opaque recovery projection (snapshot format 4): every document whose
+			-- head moved at or before watermark has its state object in R2, except the ids in
+			-- pending (no content identity yet) and the window being drained from cursor.
+			CREATE TABLE IF NOT EXISTS recovery_state_projection (
 				id INTEGER PRIMARY KEY CHECK(id = 1),
-				lease_id TEXT NOT NULL,
-				capability_hash TEXT NOT NULL,
-				expires_at INTEGER NOT NULL,
-				enabled INTEGER NOT NULL,
-				runtime_epoch TEXT NOT NULL,
+				watermark INTEGER NOT NULL,
+				target INTEGER,
+				cursor TEXT,
+				pending TEXT NOT NULL,
 				updated_at INTEGER NOT NULL
 			);
 			-- Durable "projection wake owed" marker: a note/catalog mutation happened and the

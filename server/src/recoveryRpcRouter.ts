@@ -14,12 +14,11 @@ import {
 import type { VaultRecoveryService } from "./vaultRecoveryService";
 
 export type RecoveryRpcMethod =
-	| "checkRecoveryJobLease" | "getCapturePlanPage" | "getRecipeDescriptors" | "getRecipeChunk"
-	| "acquireMaterializationLease" | "releaseMaterializationLease" | "acknowledgeContentMaterialized"
+	| "checkRecoveryJobLease" | "getCapturePlanPage" | "materializeCaptureContent"
+	| "acquireMaterializationLease" | "releaseMaterializationLease"
 	| "acknowledgeManifestNodeMaterialized" | "acknowledgeManifestNodesMaterialized" | "checkRecoveryCoverage"
 	| "getIncrementalBase" | "getCatalogDeltaPage" | "resetCaptureDelta" | "recordRecoveryDefects"
-	| "finalizeCapture" | "acknowledgeJobCancelled" | "getProjectionWorkPage" | "getProjectionRecipeDescriptor"
-	| "getProjectionRecipeChunk" | "acknowledgeProjectionContentMaterialized" | "validateRestoreAuthority"
+	| "finalizeCapture" | "acknowledgeJobCancelled" | "validateRestoreAuthority"
 	| "completeRestore" | "getGcRootPage" | "completeGcMark" | "acquireSweepLease" | "releaseSweepLease"
 	| "invalidateSweptObjects" | "completeGcSweep" | "abortRecoveryGc"
 	| "startRecoveryCapture" | "getRecoveryCaptureStatus" | "cancelRecoveryCapture" | "listRecoverySnapshots"
@@ -43,12 +42,11 @@ export interface RecoveryRpcStorePort {
 export type RecoveryRpcServicePort = Partial<Pick<VaultRecoveryService, RecoveryRpcMethod>>;
 
 const INTERNAL_METHODS: Record<InternalRecoveryRpcMethod, true> = {
-	checkRecoveryJobLease: true, getCapturePlanPage: true, getRecipeDescriptors: true, getRecipeChunk: true,
-	acquireMaterializationLease: true, releaseMaterializationLease: true, acknowledgeContentMaterialized: true,
+	checkRecoveryJobLease: true, getCapturePlanPage: true, materializeCaptureContent: true,
+	acquireMaterializationLease: true, releaseMaterializationLease: true,
 	acknowledgeManifestNodeMaterialized: true, acknowledgeManifestNodesMaterialized: true, checkRecoveryCoverage: true,
 	getIncrementalBase: true, getCatalogDeltaPage: true, resetCaptureDelta: true, recordRecoveryDefects: true,
-	finalizeCapture: true, acknowledgeJobCancelled: true, getProjectionWorkPage: true, getProjectionRecipeDescriptor: true,
-	getProjectionRecipeChunk: true, acknowledgeProjectionContentMaterialized: true, validateRestoreAuthority: true,
+	finalizeCapture: true, acknowledgeJobCancelled: true, validateRestoreAuthority: true,
 	completeRestore: true, getGcRootPage: true, completeGcMark: true, acquireSweepLease: true, releaseSweepLease: true,
 	invalidateSweptObjects: true, completeGcSweep: true, abortRecoveryGc: true,
 };
@@ -125,11 +123,9 @@ function dispatchRecoveryRpc(
 	switch (method) {
 		case "checkRecoveryJobLease": return invokeSelected(service.checkRecoveryJobLease, service, objectParams);
 		case "getCapturePlanPage": return invokeSelected(service.getCapturePlanPage, service, objectParams);
-		case "getRecipeDescriptors": return invokeSelected(service.getRecipeDescriptors, service, objectParams);
-		case "getRecipeChunk": return invokeSelected(service.getRecipeChunk, service, objectParams);
+		case "materializeCaptureContent": return invokeSelected(service.materializeCaptureContent, service, objectParams);
 		case "acquireMaterializationLease": return invokeSelected(service.acquireMaterializationLease, service, objectParams);
 		case "releaseMaterializationLease": return invokeSelected(service.releaseMaterializationLease, service, requireStringParams(params));
-		case "acknowledgeContentMaterialized": return invokeSelected(service.acknowledgeContentMaterialized, service, objectParams);
 		case "acknowledgeManifestNodeMaterialized": return invokeSelected(service.acknowledgeManifestNodeMaterialized, service, objectParams);
 		case "acknowledgeManifestNodesMaterialized": return invokeSelected(service.acknowledgeManifestNodesMaterialized, service, objectParams);
 		case "checkRecoveryCoverage": return invokeSelected(service.checkRecoveryCoverage, service, objectParams);
@@ -139,10 +135,6 @@ function dispatchRecoveryRpc(
 		case "recordRecoveryDefects": return invokeSelected(service.recordRecoveryDefects, service, objectParams);
 		case "finalizeCapture": return invokeSelected(service.finalizeCapture, service, objectParams);
 		case "acknowledgeJobCancelled": return invokeSelected(service.acknowledgeJobCancelled, service, objectParams);
-		case "getProjectionWorkPage": return invokeSelected(service.getProjectionWorkPage, service, objectParams);
-		case "getProjectionRecipeDescriptor": return invokeSelected(service.getProjectionRecipeDescriptor, service, objectParams);
-		case "getProjectionRecipeChunk": return invokeSelected(service.getProjectionRecipeChunk, service, objectParams);
-		case "acknowledgeProjectionContentMaterialized": return invokeSelected(service.acknowledgeProjectionContentMaterialized, service, objectParams);
 		case "validateRestoreAuthority": return invokeSelected(service.validateRestoreAuthority, service, objectParams);
 		case "completeRestore": return invokeSelected(service.completeRestore, service, objectParams);
 		case "getGcRootPage": return invokeSelected(service.getGcRootPage, service, objectParams);

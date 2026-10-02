@@ -558,7 +558,7 @@ export function manifestNodeObjectKey(prefix: string, hash: string): string {
 
 export function recoveryContentObjectKey(prefix: string, hash: string): string {
 	assertHash(hash, "content object hash");
-	return `${prefix.replace(/\/+$/, "")}/content/sha256/${hash.slice(0, 2)}/${hash}.md.gz`;
+	return `${prefix.replace(/\/+$/, "")}/state/sha256/${hash.slice(0, 2)}/${hash}.ystate`;
 }
 
 export function snapshotRootObjectKey(prefix: string, hash: string): string {
