@@ -1,0 +1,89 @@
+scripts/relay2/bench.ts
+  s_fb7ffe1f2bec90::t_129051668124d1 22,32-33
+scripts/relay2/runfast.sh
+  s_fb7ffe1f2bec90::t_bd8300d089ba4f 89,197-201,319
+scripts/relay2/wb/adapters.ts
+  s_fb7ffe1f2bec90::t_c64dcd774cb96c 1-377
+scripts/relay2/wb/diff3.ts
+  s_3c20a746b820c6::t_a915b62e393e9b 1-98
+scripts/relay2/wb/realClient.ts
+  s_fb7ffe1f2bec90::t_909ab066e2ce6b 1-235
+scripts/relay2/wb/realScenarios.ts
+  s_fb7ffe1f2bec90::t_3dad3ea62b49e7 1-451
+scripts/relay2/wb/scenarios.ts
+  s_fb7ffe1f2bec90::t_b61e7a58e3af90 1-165
+scripts/relay2/wb/selftest.ts
+  s_fb7ffe1f2bec90::t_7deae54852adc7 1-165
+server/src/dailyLimit.ts
+  s_0b4b3d886e1db9::t_4d1af63d08c079 1-224
+server/src/index.ts
+  s_0b4b3d886e1db9::t_8e9e32f215e6b7 2,129-130,325-329
+server/src/server.ts
+  s_0b4b3d886e1db9::t_f3f9cd797ff9fd 44,182-189,208-219,225,246-247,250,287-290,300,397,431-433,450-454,632,635-638,833-848,858,864-865,870-878,1321-1323,1453,1592-1627,1670-1671,1688-1691,1694-1695,1700,1702-1705,1707-1710,1726-1732
+server/src/vaultSocketService.ts
+  s_0b4b3d886e1db9::t_6d8f79a763feab 414-415,1403-1405
+src/main.ts
+  s_0b4b3d886e1db9::t_4044aef6ad17d7 149,1045,2873,2877-2884
+src/runtime/reconcile/closedFilePlanner.ts
+  s_0b4b3d886e1db9::t_fa3e08cb20b0fc 17-20
+src/runtime/reconciliationController.ts
+  s_0b4b3d886e1db9::t_74c401753d9ad1 17,1423-1424
+src/status/statusBarController.ts
+  s_0b4b3d886e1db9::t_c128c68cba04bd 5,32,92-96,157,166,177-178
+src/sync/closedFileConflict.ts
+  s_0b4b3d886e1db9::t_ec47b324e040b1 1-22
+src/sync/dailyLimit.ts
+  s_0b4b3d886e1db9::t_a076db77337ede 1-116
+src/sync/diskMirror.ts
+  s_0b4b3d886e1db9::t_4a306be9da110c 28-29,953,962,969
+src/sync/lineMerge.ts
+  s_0b4b3d886e1db9::t_c48cf2f90ef122 1-457
+src/sync/vaultSync.ts
+  s_0b4b3d886e1db9::t_7f04fd7e25d7ff 83,365,606-611,868-872,1043-1045,1391-1395,1429-1430,1435,1442,3664,3807-3809,4764-4767,4771-4781,4926-4927,4993-5019,5021-5022,5024-5032
+tests/client/daily-limit.ts
+  s_0b4b3d886e1db9::t_9b7b4dfc69f498 1-370
+tests/client/line-merge.ts
+  s_0b4b3d886e1db9::t_a7de45e16302ac 1-375
+tests/client/stale-disk-never-reverts-body.ts
+  s_0b4b3d886e1db9::t_975a688b05b7ba 91-92,384-400,1172-1274
+tests/live/run-live.ts
+  s_0b4b3d886e1db9::t_74bc8b40993e3e 12-14,198
+tests/server/daily-limit.ts
+  s_0b4b3d886e1db9::t_97333f3a41fdee 1-348
+tests/server/relay3-group-commit.ts
+  s_0b4b3d886e1db9::t_7f78c049111302 32,138,178,186-189,244-246,1441-1487
+tests/server/vault-document-cache.ts
+  s_0b4b3d886e1db9::t_7cd0c53cc4fb26 24,459-460
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "1a19f4ca9d776dcb59ec4c5e5b6592616753013d",
+  "prompts": {},
+  "sessions": {
+    "s_0b4b3d886e1db9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a2264016c012f02e6",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_3c20a746b820c6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a2b43feb19d9e9a0e",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_fb7ffe1f2bec90": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a35f074c8450cceb9",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
