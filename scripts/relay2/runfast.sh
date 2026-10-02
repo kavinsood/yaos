@@ -71,7 +71,8 @@ STRICT_VARS=(--var YAOS_RELAY_LEAN_ROWS=false --var YAOS_RELAY_MICROBATCH_MS=0)
 # Relay v3 write reduction (group commit + tail row + receipt ring; server/src/relayFlag.ts). Micro-batch 0:
 # group commit replaces it. Explicit GC knobs = the defaults, so the deploy log records them.
 V3_VARS=(--var YAOS_RELAY_LEAN_ROWS=true --var YAOS_RELAY_MICROBATCH_MS=0 --var YAOS_RELAY_GROUP_COMMIT=1
-  --var YAOS_RELAY_GC_IDLE_MS=300 --var YAOS_RELAY_GC_MAX_MS=1500 --var YAOS_RELAY_GC_MAX_BYTES=65536)
+  --var YAOS_RELAY_GC_IDLE_MS=300 --var YAOS_RELAY_GC_MAX_MS=1500 --var YAOS_RELAY_GC_MAX_BYTES=65536
+  --var YAOS_RELAY_GC_MIN_INTERVAL_MS=1000)
 K1_VARS=(--var YAOS_RELAY_CHECKPOINT_ENTRIES=1000000 --var YAOS_RELAY_CHECKPOINT_BYTES=1073741824 --var YAOS_RELAY_CHECKPOINT_MAX_ROWS=100000)
 BENCH=(node tests/run-typescript.mjs --test-aliases scripts/relay2/bench.ts)
 L5=(node tests/run-typescript.mjs --test-aliases scripts/relay2/l5-cli-baseline.ts)

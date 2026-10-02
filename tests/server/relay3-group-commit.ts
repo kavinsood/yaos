@@ -16,7 +16,8 @@ import { NodeSqliteStorage } from "../../packages/server-node/src/storage";
 import { bytesToBase64 } from "../../server/src/base64url";
 import { BootstrapService } from "../../server/src/bootstrap";
 import { classifyWorkerRoute } from "../../server/src/index";
-import { RelayBodyService, type RelaySocketHost } from "../../server/src/relayBodies";
+import { RelayBodyService, type RelaySocketHost, type RelayTimers } from "../../server/src/relayBodies";
+import { MAX_DURABLE_UPDATE_BYTES } from "../../server/src/contracts";
 import { RelayBodyStore } from "../../server/src/relayBodyStore";
 import { DEFAULT_RELAY_CONFIG, groupCommitFlag, readRelayConfig, type RelayConfig } from "../../server/src/relayFlag";
 import { RELAY_RECEIPT_RING, decodeTailRecords } from "../../server/src/relayTail";
@@ -128,9 +129,12 @@ interface Harness {
 	/** A new runtime (eviction/hibernation wake) over the same storage and sockets. */
 	freshRelay(runtimeEpoch: string): RelayBodyService;
 	revoke(deviceId: string): void;
+	/** Virtual time (withRelay(..., { virtualTime: true })): moves clock.now, firing due group-commit timers in order. */
+	advance(ms: number): void;
 }
 
-async function withRelay(check: (harness: Harness) => void | Promise<void>, config: Partial<RelayConfig> = {}): Promise<void> {
+async function withRelay(check: (harness: Harness) => void | Promise<void>, config: Partial<RelayConfig> = {},
+	options: { virtualTime?: boolean } = {}): Promise<void> {
 	const directory = await mkdtemp(join(tmpdir(), "yaos-relay3-gc-"));
 	const sqlite = NodeSqliteStorage.open(join(directory, "vault.sqlite"));
 	const indexes = new Map<string, Array<{ name: string; columns: string[] }>>();
@@ -205,6 +209,28 @@ async function withRelay(check: (harness: Harness) => void | Promise<void>, conf
 				bodyGeneration: 1, contentHash: initial.hash, size: initial.size }] });
 		const relayStore = new RelayBodyStore(storage, store);
 		const clock = { now: Date.now() };
+		const due = new Map<number, { at: number; fn: () => void }>();
+		let nextTimer = 0;
+		const virtualTimers: RelayTimers = {
+			set: (fn, ms) => { const id = ++nextTimer; due.set(id, { at: clock.now + ms, fn }); return id; },
+			clear: (handle) => { due.delete(handle as number); },
+		};
+		const advance = (ms: number) => {
+			const until = clock.now + ms;
+			for (;;) {
+				let nextId: number | null = null;
+				for (const [id, timer] of due) {
+					if (timer.at > until) continue;
+					if (nextId === null || timer.at < due.get(nextId)!.at) nextId = id;
+				}
+				if (nextId === null) break;
+				const timer = due.get(nextId)!;
+				due.delete(nextId);
+				clock.now = Math.max(clock.now, timer.at);
+				timer.fn();
+			}
+			clock.now = until;
+		};
 		const sockets: FakeSocket[] = [];
 		const alarmCalls = { value: 0 };
 		let alarmArmed = false;
@@ -233,6 +259,7 @@ async function withRelay(check: (harness: Harness) => void | Promise<void>, conf
 					if (meter.on) meter.alarms++;
 				},
 				now: () => clock.now,
+				...(options.virtualTime ? { timers: virtualTimers } : {}),
 			});
 			service.bindHost(host);
 			services.push(service);
@@ -240,6 +267,7 @@ async function withRelay(check: (harness: Harness) => void | Promise<void>, conf
 		};
 		const relay = makeRelay(RUNTIME);
 		let nextSocket = 0;
+		// R12: like VaultSocketService.message, every message is charged raw before parsing.
 		const frame = (kind: number, payload: Uint8Array): decoding.Decoder => {
 			const encoder = encoding.createEncoder();
 			encoding.writeVarUint(encoder, 0);
@@ -248,6 +276,22 @@ async function withRelay(check: (harness: Harness) => void | Promise<void>, conf
 			const decoder = decoding.createDecoder(encoding.toUint8Array(encoder));
 			decoding.readVarUint(decoder);
 			return decoder;
+		};
+		const raw = (kind: number, payload: Uint8Array): ArrayBuffer => {
+			const encoder = encoding.createEncoder();
+			encoding.writeVarUint(encoder, 0);
+			encoding.writeVarUint(encoder, kind);
+			encoding.writeVarUint8Array(encoder, payload);
+			const bytes = encoding.toUint8Array(encoder);
+			return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+		};
+		const binary = (via: RelayBodyService, socket: FakeSocket, kind: number, payload: Uint8Array) => {
+			if (via.admitRaw(socket, socket.attachment, raw(kind, payload), MAX_DURABLE_UPDATE_BYTES + 64)) {
+				via.handleSyncFrame(socket, socket.attachment, frame(kind, payload));
+			}
+		};
+		const text = (via: RelayBodyService, socket: FakeSocket, message: string) => {
+			if (via.admitRaw(socket, socket.attachment, message, 64 * 1024)) via.handleControl(socket, socket.attachment, message);
 		};
 		const harness: Harness = {
 			store, relayStore, relay, config: effective, meter, seed, clock, alarmCalls,
@@ -258,11 +302,11 @@ async function withRelay(check: (harness: Harness) => void | Promise<void>, conf
 				sockets.push(socket);
 				return socket;
 			},
-			update(socket, update, via = relay) { via.handleSyncFrame(socket, socket.attachment, frame(2, update)); },
-			step1(socket, stateVector, via = relay) { via.handleSyncFrame(socket, socket.attachment, frame(0, stateVector)); },
-			step2(socket, update, via = relay) { via.handleSyncFrame(socket, socket.attachment, frame(1, update)); },
+			update(socket, update, via = relay) { binary(via, socket, 2, update); },
+			step1(socket, stateVector, via = relay) { binary(via, socket, 0, stateVector); },
+			step2(socket, update, via = relay) { binary(via, socket, 1, update); },
 			envelope(socket, update, extra = {}, via = relay) {
-				via.handleControl(socket, socket.attachment, `__YPS:${JSON.stringify({
+				text(via, socket, `__YPS:${JSON.stringify({
 					type: "BODY_UPDATE_ENVELOPE", bodyId: BODY, bodyEpoch: socket.attachment.documentEpoch,
 					clientFrameId: `frame-${Math.random().toString(36).slice(2)}`, payloadDigest: sha256HexSync(update),
 					...extra,
@@ -276,6 +320,7 @@ async function withRelay(check: (harness: Harness) => void | Promise<void>, conf
 			tail: () => store.relayTailRow(BODY),
 			catalogHead: () => store.getCatalogHeadAt(store.currentSequence(), BODY)!,
 			freshRelay: (runtimeEpoch) => makeRelay(runtimeEpoch),
+			advance,
 			revoke(deviceId) {
 				store.installAuthorityFence({ changeId: `relay3-revoke-${deviceId}-${Math.random()}`, vaultId: VAULT_ID,
 					vaultGeneration: VAULT_GENERATION, subjectDigest: `relay3-revoke-${deviceId}`, subjects: [
@@ -319,6 +364,9 @@ s.test("flag: '1' or 'true', requires lean rows; tunables parse and clamp; relay
 	const tuned = readRelayConfig({ YAOS_RELAY_GROUP_COMMIT: "true", YAOS_RELAY_LEAN_ROWS: "true", YAOS_RELAY_GC_IDLE_MS: "50",
 		YAOS_RELAY_GC_MAX_MS: "400", YAOS_RELAY_GC_MAX_BYTES: "999999999", YAOS_RELAY_GC_TAIL_BYTES: "4096" });
 	assert.deepEqual([tuned.gcIdleMs, tuned.gcMaxMs, tuned.gcTailBytes], [50, 400, 4096]);
+	assert.equal(on.gcMinIntervalMs, 1000, "commit-rate cap default");
+	assert.equal(readRelayConfig({ YAOS_RELAY_GC_MIN_INTERVAL_MS: "0" }).gcMinIntervalMs, 0);
+	assert.equal(readRelayConfig({ YAOS_RELAY_GC_MIN_INTERVAL_MS: "2500" }).gcMinIntervalMs, 2500);
 	assert.ok(tuned.gcMaxBytes <= 2 * 1024 * 1024, "gcMaxBytes is bounded by the durable update limit");
 	const v2 = readRelayConfig({ YAOS_RELAY_LEAN_ROWS: "true", YAOS_RELAY_MICROBATCH_MS: "100" });
 	assert.equal(v2.groupCommit, false);
@@ -903,7 +951,9 @@ s.test("cumulative acks: after a refused frame no later frame of the socket is a
 		const later = textUpdate(seed, (text) => text.insert(0, "c"));
 		envelope(origin, later, { clientFrameId: "rl-3" });
 		update(origin, later);
+		assert.equal(relay.counters.rateLimitCloses, 1, "refused at the over-budget update frame");
 		assert.equal(relay.counters.failedSocketDrops, 1);
+		assert.equal(relay.counters.rawGateDrops, 2, "rl-3 envelope + update dropped at the raw gate");
 		assert.equal(other.binary.length, 1, "a dropped frame is not broadcast either");
 		relay.flushBatch(BODY);
 		assert.deepEqual(ackedIds(origin), ["rl-1"], "only the frame before the refused one");
@@ -915,7 +965,7 @@ s.test("cumulative acks: after a refused frame no later frame of the socket is a
 		update(reconnect, resend);
 		relay.flushBatch(BODY);
 		assert.deepEqual(ackedIds(reconnect), ["rl-resend"]);
-	}, { burstBytes: 300, rateBytesPerSec: 1 });
+	}, { burstBytes: 650, rateBytesPerSec: 1 }); // R12: envelopes (~200 chars) are charged too
 	// Commit failure (VAULT_ERROR + 1011): a frame sent after it is dropped unacked.
 	await withRelay(({ relay, relayStore, socket, update, envelope, seed }) => {
 		const origin = socket();
@@ -1317,6 +1367,254 @@ s.test("R11 wiring: the DO flushes every group buffer in the same turn right bef
 			assert.equal(typeof candidateOptions.relayCommit, "function");
 			assert.equal(typeof candidateOptions.flushRelay, "function");
 		});
+});
+
+// ---------------------------------------------------------------------------
+// Commit-rate cap (YAOS_RELAY_GC_MIN_INTERVAL_MS): cost must not depend on the
+// typing rhythm. Virtual time; one origin, one observer, one body.
+// ---------------------------------------------------------------------------
+
+function seeded(seed: number): () => number {
+	let state = seed >>> 0;
+	return () => {
+		state = (state + 0x6d2b79f5) >>> 0;
+		let t = state;
+		t = Math.imul(t ^ (t >>> 15), t | 1);
+		t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+		return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+	};
+}
+
+interface TypingRun { keys: number; commits: number; rows: number; minGapMs: number; maxCommitsPerSecond: number;
+	maxReceiptMs: number; p50ReceiptMs: number }
+
+async function typing(gaps: number[], minIntervalMs: number): Promise<TypingRun> {
+	let run: TypingRun | null = null;
+	await withRelay(({ relay, relayStore, socket, update, envelope, seed, clock, meter, advance }) => {
+		const origin = socket();
+		socket(peer);
+		const commitTimes: number[] = [];
+		const original = relayStore.appendRelayGroupCommit.bind(relayStore);
+		relayStore.appendRelayGroupCommit = (input) => { commitTimes.push(clock.now); return original(input); };
+		const sentAt = new Map<string, number>();
+		const ackAt = new Map<string, number>();
+		const send = origin.send.bind(origin);
+		origin.send = (message) => {
+			send(message);
+			const ack = origin.controls.at(-1);
+			if (typeof message === "string" && ack?.type === "BODY_COMMITTED") ackAt.set(String(ack.clientFrameId), clock.now);
+		};
+		meter.reset();
+		meter.on = true;
+		gaps.forEach((gap, index) => {
+			advance(gap);
+			const frame = textUpdate(seed, (text) => text.insert(text.length, "k"));
+			const id = `key-${index}`;
+			envelope(origin, frame, { clientFrameId: id, candidateId: `cand-${index}`, candidateDigest: `cand-${index}` });
+			update(origin, frame);
+			sentAt.set(id, clock.now);
+		});
+		advance(5_000);
+		meter.on = false;
+		assert.equal(ackAt.size, gaps.length, "every keystroke is acked");
+		const receipts = [...sentAt].map(([id, at]) => ackAt.get(id)! - at).sort((a, b) => a - b);
+		let minGapMs = Infinity;
+		for (let index = 1; index < commitTimes.length; index++) {
+			minGapMs = Math.min(minGapMs, commitTimes[index]! - commitTimes[index - 1]!);
+		}
+		const perSecond = new Map<number, number>();
+		for (const at of commitTimes) perSecond.set(Math.floor(at / 1000), (perSecond.get(Math.floor(at / 1000)) ?? 0) + 1);
+		run = { keys: gaps.length, commits: commitTimes.length, rows: meter.rows, minGapMs,
+			maxCommitsPerSecond: Math.max(...perSecond.values()), maxReceiptMs: receipts.at(-1)!,
+			p50ReceiptMs: receipts[Math.floor(receipts.length / 2)]! };
+	}, { gcIdleMs: 300, gcMaxMs: 1_500, gcMinIntervalMs: minIntervalMs }, { virtualTime: true });
+	return run!;
+}
+
+s.test("commit-rate cap: <= 1 commit/s per body at any typing rhythm; receipt <= gcMaxMs; rows/keystroke before vs after", async () => {
+	const seconds = 30;
+	const patterns: Array<[string, number[]]> = [1, 2, 3, 5, 8].map((rate) =>
+		[`${rate} keys/s`, Array.from({ length: seconds * rate }, () => 1000 / rate)]);
+	const random = seeded(12);
+	const bursty: number[] = [];
+	for (let total = 0; total < seconds * 1000;) {
+		const gap = 100 + Math.floor(random() * 1900);
+		bursty.push(gap);
+		total += gap;
+	}
+	patterns.push(["bursty 100-2000 ms", bursty]);
+	for (const [name, gaps] of patterns) {
+		const before = await typing(gaps, 0);
+		const after = await typing(gaps, 1_000);
+		console.log(`[relay3-gc] typing ${name}: before ${before.commits} commits, ${(before.rows / before.keys).toFixed(2)} rows/key, `
+			+ `max ${before.maxCommitsPerSecond} commits/s, receipt p50/max ${before.p50ReceiptMs}/${before.maxReceiptMs} ms | `
+			+ `after ${after.commits} commits, ${(after.rows / after.keys).toFixed(2)} rows/key, max ${after.maxCommitsPerSecond} commits/s, `
+			+ `min gap ${after.minGapMs} ms, receipt p50/max ${after.p50ReceiptMs}/${after.maxReceiptMs} ms`);
+		assert.ok(after.minGapMs >= 1_000, `${name}: commits of one body are >= 1 s apart (${after.minGapMs})`);
+		assert.ok(after.maxCommitsPerSecond <= 1, `${name}: <= 1 commit per wall-clock second`);
+		assert.ok(after.maxReceiptMs <= 1_500, `${name}: receipt <= gcMaxMs (${after.maxReceiptMs})`);
+		assert.ok(after.rows <= before.rows, `${name}: never more rows than without the cap`);
+		assert.equal(after.rows, after.commits * 3, `${name}: 3 rows per commit (tail, head, ring)`);
+	}
+});
+
+s.test("commit-rate cap: a deferred idle flush is scheduled (no waiting for the next frame); exempt flushes are immediate", async () => {
+	await withRelay(({ relay, socket, update, envelope, seed, advance, tail }) => {
+		const origin = socket();
+		const first = textUpdate(seed, (text) => text.insert(0, "a"));
+		envelope(origin, first, { clientFrameId: "d-1" });
+		update(origin, first);
+		advance(300);
+		assert.equal(relay.counters.groupCommits, 1, "first idle commit (no previous commit)");
+		advance(100);
+		const second = textUpdate(seed, (text) => text.insert(0, "b"));
+		envelope(origin, second, { clientFrameId: "d-2" });
+		update(origin, second);
+		advance(400);
+		assert.equal(relay.counters.groupCommits, 1, "idle reached but the min interval has not");
+		assert.equal(relay.counters.groupIdleDeferred, 1);
+		advance(499);
+		assert.equal(relay.counters.groupCommits, 1);
+		advance(1);
+		assert.equal(relay.counters.groupCommits, 2, "commits at previous commit + 1000 ms with no further frame");
+		assert.deepEqual(ackedIds(origin), ["d-1", "d-2"]);
+		// Exempt: a read flush (HTTP candidate / currentness), the authority fence and a semantic reset flush now.
+		const third = textUpdate(seed, (text) => text.insert(0, "c"));
+		update(origin, third);
+		assert.equal(relay.flushForRead(BODY), true);
+		assert.equal(relay.counters.groupCommits, 3);
+		const fourth = textUpdate(seed, (text) => text.insert(0, "d"));
+		update(origin, fourth);
+		relay.flushForAuthorityFence();
+		assert.equal(relay.counters.groupCommits, 4);
+		const fifth = textUpdate(seed, (text) => text.insert(0, "e"));
+		update(origin, fifth);
+		relay.flushBatch(BODY);
+		assert.equal(relay.counters.groupCommits, 5);
+		void tail;
+	}, { gcIdleMs: 300, gcMaxMs: 1_500, gcMinIntervalMs: 1_000 }, { virtualTime: true });
+	// Bytes cap is exempt too.
+	await withRelay(({ relay, socket, update, seed, advance }) => {
+		const origin = socket();
+		update(origin, textUpdate(seed, (text) => text.insert(0, "x".repeat(2_000))));
+		update(origin, textUpdate(seed, (text) => text.insert(0, "y".repeat(2_000))));
+		advance(1);
+		assert.equal(relay.counters.groupFlushBytes, 2);
+		assert.equal(relay.counters.groupCommits, 2);
+	}, { gcMaxBytes: 1_000, gcMinIntervalMs: 1_000 }, { virtualTime: true });
+});
+
+// ---------------------------------------------------------------------------
+// R12: rate limit charged on raw bytes before any work; refused socket = O(1) drops.
+// ---------------------------------------------------------------------------
+
+s.test("R12 flood: 5 MiB/s of 64 KiB frames closes the flooder 1013 within 2 s; bystander frames still commit and broadcast", async () => {
+	await withRelay(({ relay, socket, update, envelope, seed, clock, advance, store }) => {
+		const flooder = socket();
+		const bystander = socket(peer);
+		const observer = socket(peer);
+		const bystanderDoc = cloneOf(seed);
+		const base = Y.encodeStateAsUpdate(seed);
+		const start = clock.now;
+		let floodBytes = 0;
+		let closedAt: number | null = null;
+		let frames = 0;
+		let sent = 0;
+		for (let step = 0; step < 400; step++) {
+			advance(12.5); // 80 frames/s x 64 KiB = 5 MiB/s
+			const frame = textUpdate(seed, (text) => text.insert(0, "x".repeat(64 * 1024)));
+			envelope(flooder, frame, { clientFrameId: `flood-${step}` });
+			update(flooder, frame);
+			floodBytes += frame.byteLength;
+			frames++;
+			if (flooder.closed && closedAt === null) closedAt = clock.now;
+			if (step % 40 === 0) {
+				const edit = textUpdate(bystanderDoc, (text) => text.insert(0, `b${step} `));
+				envelope(bystander, edit, { clientFrameId: `by-${step}` });
+				update(bystander, edit);
+				sent++;
+			}
+		}
+		advance(3_000);
+		relay.flushBatch(BODY);
+		assert.equal(flooder.closed?.code, 1013);
+		assert.equal(flooder.closed?.reason, "relay rate limit");
+		const elapsed = closedAt! - start;
+		console.log(`[relay3-gc] R12 flood: closed after ${elapsed} ms (local, virtual time), `
+			+ `${relay.counters.rawGateDrops} messages dropped O(1) after it, flood frames ${frames}`);
+		assert.ok(elapsed <= 2_000, `closed within 2 s of over-rate input (${elapsed} ms)`);
+		assert.equal(relay.counters.rateLimitCloses, 1);
+		assert.ok(relay.counters.rawGateDrops >= 2 * (frames - 30), "every later message dropped at the gate");
+		assert.equal(bystander.closed, null);
+		assert.equal(ackedIds(bystander).length, sent, "every bystander frame acked");
+		const view = peerView(base, observer);
+		assert.equal(view, reconstructedText(store), "observer = durable (refused frames were never broadcast)");
+		for (let step = 0; step < 400; step += 40) assert.ok(view.includes(`b${step} `));
+		bystanderDoc.destroy();
+		void floodBytes;
+	}, { rateBytesPerSec: DEFAULT_RELAY_CONFIG.rateBytesPerSec, burstBytes: DEFAULT_RELAY_CONFIG.burstBytes },
+	{ virtualTime: true });
+});
+
+s.test("R12 gate in VaultSocketService: charged before the attachment parse; a refused socket's messages cost O(1) (no parse, digest, authority, broadcast)", async () => {
+	await withVaultObject({ YAOS_RELAY_BODIES: "true", YAOS_RELAY_LEAN_ROWS: "true", YAOS_RELAY_GROUP_COMMIT: "1",
+		YAOS_RELAY_RATE_BYTES_PER_SEC: "1" } as CloudflareVaultEnvironment, async (server) => {
+		const provision = await server.fetch(internal("/__yaos/provision", { method: "POST",
+			headers: { "content-type": "application/json" }, body: JSON.stringify({ vaultGeneration: DO_GENERATION }) }));
+		assert.ok(provision.ok, `provision ${provision.status}`);
+		const inner = (server as unknown as { runtime: { relay: RelayBodyService;
+			webSocketMessage(socket: VaultSocketPort, message: string | ArrayBuffer): Promise<void> } }).runtime;
+		const calls = { parse: 0, sync: 0, control: 0, validate: 0 };
+		const relay = inner.relay;
+		const sync = relay.handleSyncFrame.bind(relay);
+		relay.handleSyncFrame = (...args) => { calls.sync++; sync(...args); };
+		const control = relay.handleControl.bind(relay);
+		relay.handleControl = (...args) => { calls.control++; return control(...args); };
+		const validate = relay.validateActor.bind(relay);
+		relay.validateActor = (actor) => { calls.validate++; return validate(actor); };
+		const socket = new FakeSocket({ ...owner, vaultId: DO_VAULT, vaultGeneration: DO_GENERATION, runtimeEpoch: "runtime-r12",
+			documentId: "body-r12", kind: "body", documentEpoch: 1, socketId: "socket-r12", relay: true });
+		const deserialize = socket.deserializeAttachment.bind(socket);
+		socket.deserializeAttachment = () => { calls.parse++; return deserialize(); };
+		const burst = relay.config.burstBytes;
+		// 1: a non-sync binary message the size of most of the burst passes the gate (and is ignored).
+		const filler = new Uint8Array(MAX_DURABLE_UPDATE_BYTES);
+		assert.ok(burst - filler.byteLength < 100_000);
+		filler[0] = 99;
+		await inner.webSocketMessage(socket, filler.buffer);
+		assert.equal(calls.parse, 1);
+		assert.equal(socket.closed, null);
+		// 2: a sync update over the remaining budget is refused before any parse/decode.
+		const encoder = encoding.createEncoder();
+		encoding.writeVarUint(encoder, 0);
+		encoding.writeVarUint(encoder, 2);
+		encoding.writeVarUint8Array(encoder, new Uint8Array(100_000).fill(7));
+		const over = encoding.toUint8Array(encoder);
+		await inner.webSocketMessage(socket, over.slice().buffer);
+		assert.equal((socket.closed as FakeSocket["closed"])?.code, 1013);
+		assert.equal(relay.counters.rateLimitCloses, 1);
+		const parsesAtRefusal = calls.parse;
+		// 3..N: every later message (binary or text) is dropped with O(1) work.
+		for (let index = 0; index < 500; index++) {
+			await inner.webSocketMessage(socket, over.slice().buffer);
+			await inner.webSocketMessage(socket, `__YPS:${JSON.stringify({ type: "BODY_UPDATE_ENVELOPE", bodyId: "body-r12" })}`);
+		}
+		assert.equal(calls.parse, parsesAtRefusal, "no attachment parse after the refusal");
+		assert.ok(parsesAtRefusal <= 2, "one parse to register the socket, at most one to fence it");
+		assert.deepEqual({ sync: calls.sync, control: calls.control, validate: calls.validate }, { sync: 0, control: 0, validate: 0 },
+			"no decode, digest, envelope parse or authority check for any gated message");
+		assert.equal(relay.counters.rawGateDrops, 1000);
+		assert.equal(relay.counters.failedSocketDrops, 500, "dropped sync updates keep the outcome sum");
+		assert.equal(relay.counters.updateFrames, 501);
+		assert.equal(relay.counters.groupBroadcasts, 0);
+		// Hard size cap first: an oversize message refuses the socket 1009 without parsing it.
+		const big = new FakeSocket({ ...socket.attachment, socketId: "socket-r12-big" });
+		await inner.webSocketMessage(big, new Uint8Array([99, 0, 0, 0]).buffer);
+		assert.equal(big.closed, null);
+		await inner.webSocketMessage(big, new Uint8Array(MAX_DURABLE_UPDATE_BYTES + 65).buffer);
+		assert.equal((big.closed as FakeSocket["closed"])?.code, 1009);
+		assert.equal(relay.counters.rateGateCloses, 2);
+	});
 });
 
 await s.done();

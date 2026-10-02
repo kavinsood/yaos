@@ -74,8 +74,8 @@ interface GroupBuffer {
 	bodyId: string;
 	frames: QueuedFrame[];
 	bytes: number;
-	idleTimer: ReturnType<typeof setTimeout> | null;
-	maxTimer: ReturnType<typeof setTimeout> | null;
+	idleTimer: unknown;
+	maxTimer: unknown;
 }
 
 export interface RelayEnvelope {
@@ -123,7 +123,36 @@ interface QueuedFrame {
 	onDurable?: Array<() => void>;
 }
 
-interface Bucket { tokens: number; at: number }
+/**
+ * R12 raw admission gate of one relay socket: a token bucket charged with every
+ * received message's raw size before any parsing, and the refused flag that
+ * turns every later message of the socket into an O(1) drop.
+ */
+interface RawGate { tokens: number; at: number; refused: boolean }
+
+/** Timer seam (tests drive virtual time); defaults to the global timers. */
+export interface RelayTimers {
+	set(callback: () => void, ms: number): unknown;
+	clear(handle: unknown): void;
+}
+
+const GLOBAL_TIMERS: RelayTimers = {
+	set: (callback, ms) => setTimeout(callback, ms),
+	clear: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+};
+
+/**
+ * O(1) peek: a binary MESSAGE_SYNC step2/update frame with a non-empty update
+ * (what handleSyncFrame would count in updateFrames). Reads at most 5 bytes.
+ */
+function peekSyncUpdate(message: string | ArrayBuffer): boolean {
+	if (typeof message === "string" || message.byteLength < 3) return false;
+	const head = new Uint8Array(message, 0, Math.min(5, message.byteLength));
+	if (head[0] !== 0 || (head[1] !== SYNC_STEP_2 && head[1] !== SYNC_UPDATE)) return false;
+	if (head[2] === 0) return false;
+	if (head[2] === 2 && head[3] === 0 && head[4] === 0) return false;
+	return true;
+}
 
 export interface RelayCounters {
 	appends: number;
@@ -245,6 +274,17 @@ export interface RelayCounters {
 	 */
 	httpRelayCommits: number;
 	httpRelayNoops: number;
+	/** v3 commit-rate cap: idle flushes pushed out to the body's previous commit + gcMinIntervalMs. */
+	groupIdleDeferred: number;
+	/**
+	 * R12 raw gate: sockets closed by it (1013 rate, 1009 size; any message
+	 * kind), and messages dropped in O(1) after it refused one (no attachment
+	 * parse, decode, digest, authority check or broadcast). An over-rate sync
+	 * update also counts in updateFrames + rateLimitCloses/tooLargeCloses, and a
+	 * dropped one in updateFrames + failedSocketDrops, so the outcome sum holds.
+	 */
+	rateGateCloses: number;
+	rawGateDrops: number;
 }
 
 export interface RelayBodyServiceOptions {
@@ -257,6 +297,8 @@ export interface RelayBodyServiceOptions {
 	/** Arms the DO alarm (checkpoint). */
 	armCheckpointAlarm: () => void;
 	now?: () => number;
+	/** Group-commit timers (tests: virtual time). */
+	timers?: RelayTimers;
 }
 
 function isEnvelopeId(value: unknown): value is string {
@@ -344,7 +386,12 @@ export class RelayBodyService {
 	readonly config: RelayConfig;
 	private host: RelaySocketHost | null = null;
 	private readonly pendingEnvelopes = new Map<string, RelayEnvelope>();
-	private readonly buckets = new Map<string, Bucket>();
+	/** R12: raw gates by socket id (survive a re-parse) and by socket object (O(1) lookup before any parse). */
+	private readonly buckets = new Map<string, RawGate>();
+	private readonly gates = new WeakMap<object, RawGate>();
+	/** v3 commit-rate cap: time of the last group commit per (body, epoch). */
+	private readonly lastGroupCommit = new Map<string, number>();
+	private readonly timers: RelayTimers;
 	private readonly merged = new Map<string, MergedEntry>();
 	private mergedBytesTotal = 0;
 	private readonly batches = new Map<string, { frames: QueuedFrame[]; timer: ReturnType<typeof setTimeout> }>();
@@ -372,7 +419,7 @@ export class RelayBodyService {
 		groupBroadcasts: 0, groupDropped: 0, groupFlushDedupes: 0, tailCheckpoints: 0, tailJournalFallbacks: 0,
 		pendingReplayFrames: 0, wakeResyncs: 0, wakeResyncSockets: 0, groupFlushReads: 0, failedSocketDrops: 0,
 		wakeHeldAcks: 0, wakeHeldAcksDropped: 0, authorityFenceFlushes: 0, revokedBroadcastCommits: 0,
-		httpRelayCommits: 0, httpRelayNoops: 0,
+		httpRelayCommits: 0, httpRelayNoops: 0, groupIdleDeferred: 0, rateGateCloses: 0, rawGateDrops: 0,
 	};
 	/** v3 group-commit buffers keyed by (body, epoch). */
 	private readonly groups = new Map<string, GroupBuffer>();
@@ -391,6 +438,7 @@ export class RelayBodyService {
 
 	constructor(private readonly options: RelayBodyServiceOptions) {
 		this.config = options.config;
+		this.timers = options.timers ?? GLOBAL_TIMERS;
 	}
 
 	bindHost(host: RelaySocketHost): void {
@@ -672,14 +720,7 @@ export class RelayBodyService {
 				return;
 			}
 		}
-		// 4. Budget.
-		if (!this.consumeTokens(attachment.socketId, update.byteLength)) {
-			this.markFailed(attachment.socketId);
-			this.counters.rateLimitCloses++;
-			host.sendControl(socket, { type: "VAULT_BACKPRESSURE", reason: "relay_rate_limit" });
-			try { socket.close(1013, "relay rate limit"); } catch { /* closed */ }
-			return;
-		}
+		// 4. Budget: charged on the raw message before any parsing (admitRaw, R12).
 		const frame: QueuedFrame = { socket, attachment, actor, update: update.slice(), envelope, digest, seq: ++this.frameSeq,
 			...(released && released.length > 0 ? { onDurable: released } : {}) };
 		if (this.config.groupCommit) {
@@ -761,21 +802,54 @@ export class RelayBodyService {
 		let group = this.groups.get(key);
 		if (!group) {
 			group = { bodyId, frames: [], bytes: 0, idleTimer: null, maxTimer: null };
-			group.maxTimer = setTimeout(() => this.flushGroup(key, "max"), this.config.gcMaxMs);
+			group.maxTimer = this.timers.set(() => this.flushGroup(key, "max"), this.config.gcMaxMs);
 			this.groups.set(key, group);
 		}
 		group.frames.push(frame);
 		group.bytes += frame.update.byteLength;
-		if (group.idleTimer) clearTimeout(group.idleTimer);
-		group.idleTimer = setTimeout(() => this.flushGroup(key, "idle"), this.config.gcIdleMs);
+		if (group.idleTimer) this.timers.clear(group.idleTimer);
+		group.idleTimer = this.timers.set(() => this.flushGroup(key, "idle"), this.idleDelay(key));
 		if (group.bytes >= this.config.gcMaxBytes) this.flushGroup(key, "bytes");
+	}
+
+	/**
+	 * v3 commit-rate cap: the idle timer fires at max(last frame + gcIdleMs,
+	 * previous commit of the body + gcMinIntervalMs). Re-armed on every frame,
+	 * so when it fires both conditions hold; a deferred idle flush is scheduled
+	 * (never left waiting for the next frame). The max window (gcMaxMs after
+	 * the group's first frame) still bounds every frame's wait.
+	 */
+	private idleDelay(key: string): number {
+		const idle = this.config.gcIdleMs;
+		const min = this.config.gcMinIntervalMs;
+		if (min <= 0) return idle;
+		const last = this.lastGroupCommit.get(key);
+		if (last === undefined) return idle;
+		const wait = last + min - this.now();
+		if (wait <= idle) return idle;
+		this.counters.groupIdleDeferred++;
+		return wait;
+	}
+
+	private noteGroupCommit(key: string): void {
+		if (this.config.gcMinIntervalMs <= 0) return;
+		const now = this.now();
+		this.lastGroupCommit.delete(key);
+		this.lastGroupCommit.set(key, now);
+		// Bounded: entries older than the interval no longer defer anything (insertion order = commit order).
+		if (this.lastGroupCommit.size > 1024) {
+			for (const [entry, at] of this.lastGroupCommit) {
+				if (now - at < this.config.gcMinIntervalMs) break;
+				this.lastGroupCommit.delete(entry);
+			}
+		}
 	}
 
 	private takeGroup(key: string): GroupBuffer | null {
 		const group = this.groups.get(key);
 		if (!group) return null;
-		if (group.idleTimer) clearTimeout(group.idleTimer);
-		if (group.maxTimer) clearTimeout(group.maxTimer);
+		if (group.idleTimer) this.timers.clear(group.idleTimer);
+		if (group.maxTimer) this.timers.clear(group.maxTimer);
 		this.groups.delete(key);
 		return group;
 	}
@@ -788,6 +862,8 @@ export class RelayBodyService {
 		else if (reason === "bytes") this.counters.groupFlushBytes++;
 		else if (reason === "read") this.counters.groupFlushReads++;
 		else this.counters.groupFlushForced++;
+		// Every commit (exempt reasons included) restarts the body's min interval.
+		this.noteGroupCommit(key);
 		this.commitFrames(group.bodyId, group.frames, true, true);
 	}
 
@@ -958,16 +1034,89 @@ export class RelayBodyService {
 		return sent;
 	}
 
-	private consumeTokens(socketId: string, bytes: number): boolean {
+	/**
+	 * R12 raw admission, step 1: the very first thing the socket handler does
+	 * with a message, before the attachment is parsed. O(1): a WeakMap lookup,
+	 * the refused flag, a size compare and the bucket arithmetic. "unknown" =
+	 * first message of this socket in this runtime (the caller parses the
+	 * attachment and, for a relay socket, calls admitRelay).
+	 */
+	admitKnown(socket: object, message: string | ArrayBuffer, maxBytes: number): "pass" | "drop" | "unknown" {
+		const gate = this.gates.get(socket);
+		if (!gate) return "unknown";
+		return this.charge(socket as VaultSocketPort, null, gate, message, maxBytes) ? "pass" : "drop";
+	}
+
+	/** R12: both admission steps for a socket whose attachment is already parsed (tests, direct callers). */
+	admitRaw(socket: VaultSocketPort, attachment: VaultSocketAttachment, message: string | ArrayBuffer,
+		maxBytes: number): boolean {
+		const known = this.admitKnown(socket, message, maxBytes);
+		return known === "unknown" ? this.admitRelay(socket, attachment, message, maxBytes) : known === "pass";
+	}
+
+	/** R12 raw admission, step 2: first message of a relay socket in this runtime (bucket keyed by socket id). */
+	admitRelay(socket: VaultSocketPort, attachment: VaultSocketAttachment, message: string | ArrayBuffer,
+		maxBytes: number): boolean {
+		let gate = this.buckets.get(attachment.socketId);
+		if (!gate) {
+			gate = { tokens: this.config.burstBytes, at: this.now(), refused: false };
+			this.buckets.set(attachment.socketId, gate);
+		}
+		this.gates.set(socket, gate);
+		return this.charge(socket, attachment.socketId, gate, message, maxBytes);
+	}
+
+	/**
+	 * Charges the raw received size (bytes for binary, UTF-16 units for text;
+	 * every message kind: envelopes, step1/step2, updates, awareness, pings).
+	 * The first overdraft or oversize message refuses the socket: cumulative-ack
+	 * fence (frames buffered before it still commit and ack, nothing later is
+	 * acked), 1013 "relay rate limit" (or 1009), and every later message of the
+	 * socket is dropped here without any further work.
+	 */
+	private charge(socket: VaultSocketPort, socketId: string | null, gate: RawGate, message: string | ArrayBuffer,
+		maxBytes: number): boolean {
+		if (gate.refused) {
+			this.counters.rawGateDrops++;
+			if (peekSyncUpdate(message)) { this.counters.updateFrames++; this.counters.failedSocketDrops++; }
+			return false;
+		}
+		const size = typeof message === "string" ? message.length : message.byteLength;
 		const now = this.now();
-		const bucket = this.buckets.get(socketId) ?? { tokens: this.config.burstBytes, at: now };
-		const elapsed = Math.max(0, now - bucket.at);
-		bucket.tokens = Math.min(this.config.burstBytes, bucket.tokens + (elapsed * this.config.rateBytesPerSec) / 1000);
-		bucket.at = now;
-		this.buckets.set(socketId, bucket);
-		if (bucket.tokens < bytes) return false;
-		bucket.tokens -= bytes;
-		return true;
+		const elapsed = Math.max(0, now - gate.at);
+		gate.tokens = Math.min(this.config.burstBytes, gate.tokens + (elapsed * this.config.rateBytesPerSec) / 1000);
+		gate.at = now;
+		const oversize = size > maxBytes;
+		if (!oversize && gate.tokens >= size) {
+			gate.tokens -= size;
+			return true;
+		}
+		gate.refused = true;
+		this.counters.rateGateCloses++;
+		const id = socketId ?? this.socketIdOf(socket);
+		this.markFailed(id ?? undefined);
+		if (id !== null) this.pendingEnvelopes.delete(id);
+		if (peekSyncUpdate(message)) {
+			this.counters.updateFrames++;
+			if (oversize) this.counters.tooLargeCloses++;
+			else this.counters.rateLimitCloses++;
+		}
+		if (oversize) {
+			try { socket.close(1009, "frame exceeds relay admission limit"); } catch { /* closed */ }
+		} else {
+			try { this.requireHost().sendControl(socket, { type: "VAULT_BACKPRESSURE", reason: "relay_rate_limit" }); }
+			catch { /* closed */ }
+			try { socket.close(1013, "relay rate limit"); } catch { /* closed */ }
+		}
+		return false;
+	}
+
+	/** Socket id of a gated socket (refusal path only: one attachment read per refused socket). */
+	private socketIdOf(socket: VaultSocketPort): string | null {
+		try {
+			const value = socket.deserializeAttachment() as { socketId?: unknown } | null;
+			return typeof value?.socketId === "string" ? value.socketId : null;
+		} catch { return null; }
 	}
 
 	/**

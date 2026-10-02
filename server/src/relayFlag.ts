@@ -29,6 +29,8 @@ export interface RelayFlagEnv {
 	YAOS_RELAY_GROUP_COMMIT?: string;
 	YAOS_RELAY_GC_IDLE_MS?: string;
 	YAOS_RELAY_GC_MAX_MS?: string;
+	/** v3: minimum time between two idle-triggered group commits of one body (0 = off). */
+	YAOS_RELAY_GC_MIN_INTERVAL_MS?: string;
 	YAOS_RELAY_GC_MAX_BYTES?: string;
 	/** v3: tail row cap; a group commit that leaves the tail at or over it checkpoints the body. */
 	YAOS_RELAY_GC_TAIL_BYTES?: string;
@@ -70,12 +72,20 @@ export interface RelayConfig {
 	/**
 	 * Relay v3 (requires leanRows): validated frames are broadcast at once and
 	 * buffered per (body, epoch); the buffer commits in one transaction after
-	 * `gcIdleMs` without a frame, `gcMaxMs` after its first frame, or at
+	 * `gcIdleMs` without a frame (and at least `gcMinIntervalMs` after the
+	 * body's previous commit), `gcMaxMs` after its first frame, or at
 	 * `gcMaxBytes`, whichever is first. Receipts are sent after that commit.
 	 */
 	groupCommit: boolean;
 	gcIdleMs: number;
 	gcMaxMs: number;
+	/**
+	 * v3 commit-rate cap: an idle flush waits until this long after the body's
+	 * previous commit, so idle-triggered commits are at most one per interval
+	 * whatever the typing rhythm. The max window, the bytes cap and forced
+	 * flushes (HTTP read/save, authority fence, semantic reset) are exempt.
+	 */
+	gcMinIntervalMs: number;
 	gcMaxBytes: number;
 	gcTailBytes: number;
 	/**
@@ -90,9 +100,11 @@ export interface RelayConfig {
 
 /**
  * The token bucket must hold at least one maximum-size frame, otherwise frames
- * between the burst and MAX_DURABLE_UPDATE_BYTES are rejected forever.
+ * between the burst and MAX_DURABLE_UPDATE_BYTES are rejected forever. R12: the
+ * bucket is charged with raw messages, so it also covers the frame header (the
+ * admission cap is MAX_CANDIDATE_BYTES + 64) and one maximum text envelope.
  */
-export const RELAY_MIN_BURST_BYTES = MAX_DURABLE_UPDATE_BYTES;
+export const RELAY_MIN_BURST_BYTES = MAX_DURABLE_UPDATE_BYTES + 64 + 64 * 1024;
 export const RELAY_DEFAULT_RESET_COOLDOWN_MS = 24 * 60 * 60_000;
 
 export const DEFAULT_RELAY_CONFIG: Readonly<RelayConfig> = Object.freeze({
@@ -113,6 +125,7 @@ export const DEFAULT_RELAY_CONFIG: Readonly<RelayConfig> = Object.freeze({
 	groupCommit: false,
 	gcIdleMs: 300,
 	gcMaxMs: 1_500,
+	gcMinIntervalMs: 1_000,
 	gcMaxBytes: 65_536,
 	gcTailBytes: 65_536,
 	gcCatalogDelayMs: 30_000,
@@ -176,6 +189,7 @@ export function readRelayConfig(env: RelayFlagEnv | null | undefined): RelayConf
 		groupCommit: groupCommitFlag(source.YAOS_RELAY_GROUP_COMMIT) && source.YAOS_RELAY_LEAN_ROWS === "true",
 		gcIdleMs: positiveInt(source.YAOS_RELAY_GC_IDLE_MS, DEFAULT_RELAY_CONFIG.gcIdleMs, 1, 60_000),
 		gcMaxMs: positiveInt(source.YAOS_RELAY_GC_MAX_MS, DEFAULT_RELAY_CONFIG.gcMaxMs, 1, 60_000),
+		gcMinIntervalMs: positiveInt(source.YAOS_RELAY_GC_MIN_INTERVAL_MS, DEFAULT_RELAY_CONFIG.gcMinIntervalMs, 0, 60_000),
 		gcMaxBytes: positiveInt(source.YAOS_RELAY_GC_MAX_BYTES, DEFAULT_RELAY_CONFIG.gcMaxBytes, 1, MAX_DURABLE_UPDATE_BYTES),
 		gcTailBytes: positiveInt(source.YAOS_RELAY_GC_TAIL_BYTES, DEFAULT_RELAY_CONFIG.gcTailBytes, 1, 1024 * 1024),
 		gcCatalogDelayMs: positiveInt(source.YAOS_RELAY_GC_CATALOG_DELAY_MS, DEFAULT_RELAY_CONFIG.gcCatalogDelayMs, 0, 3_600_000),

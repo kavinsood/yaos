@@ -20,7 +20,7 @@ import {
 } from "../../server/src/relayBodies";
 import { RelayBodyStore } from "../../server/src/relayBodyStore";
 import { handleCompactionLease, handleSemanticReset } from "../../server/src/relayRoutes";
-import { DEFAULT_RELAY_CONFIG, readRelayConfig, relayBodiesEnabled, type RelayConfig } from "../../server/src/relayFlag";
+import { DEFAULT_RELAY_CONFIG, RELAY_MIN_BURST_BYTES, readRelayConfig, relayBodiesEnabled, type RelayConfig } from "../../server/src/relayFlag";
 import { canonicalMarkdownBytes } from "../../server/src/shared/markdownCodec";
 import { RelayMergeBudgetError, sha256HexSync } from "../../server/src/vaultDocumentStore";
 import type { VaultDocumentCache } from "../../server/src/vaultDocumentCache";
@@ -153,6 +153,7 @@ async function withRelay(check: (harness: Harness) => void | Promise<void>,
 		};
 		relay.bindHost(host);
 		let nextSocket = 0;
+		// R12: like VaultSocketService.message, every message is charged raw before parsing.
 		const frame = (kind: number, payload: Uint8Array): decoding.Decoder => {
 			const encoder = encoding.createEncoder();
 			encoding.writeVarUint(encoder, 0);
@@ -161,6 +162,22 @@ async function withRelay(check: (harness: Harness) => void | Promise<void>,
 			const decoder = decoding.createDecoder(encoding.toUint8Array(encoder));
 			decoding.readVarUint(decoder);
 			return decoder;
+		};
+		const raw = (kind: number, payload: Uint8Array): ArrayBuffer => {
+			const encoder = encoding.createEncoder();
+			encoding.writeVarUint(encoder, 0);
+			encoding.writeVarUint(encoder, kind);
+			encoding.writeVarUint8Array(encoder, payload);
+			const bytes = encoding.toUint8Array(encoder);
+			return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+		};
+		const binary = (via: RelayBodyService, socket: FakeSocket, kind: number, payload: Uint8Array) => {
+			if (via.admitRaw(socket, socket.attachment, raw(kind, payload), MAX_DURABLE_UPDATE_BYTES + 64)) {
+				via.handleSyncFrame(socket, socket.attachment, frame(kind, payload));
+			}
+		};
+		const text = (via: RelayBodyService, socket: FakeSocket, message: string) => {
+			if (via.admitRaw(socket, socket.attachment, message, 64 * 1024)) via.handleControl(socket, socket.attachment, message);
 		};
 		const harness: Harness = {
 			store, relayStore, relay, events, alarms, clock, seed,
@@ -171,10 +188,10 @@ async function withRelay(check: (harness: Harness) => void | Promise<void>,
 				sockets.push(socket);
 				return socket;
 			},
-			update(socket, update) { relay.handleSyncFrame(socket, socket.attachment, frame(2, update)); },
-			step1(socket, stateVector) { relay.handleSyncFrame(socket, socket.attachment, frame(0, stateVector)); },
+			update(socket, update) { binary(relay, socket, 2, update); },
+			step1(socket, stateVector) { binary(relay, socket, 0, stateVector); },
 			envelope(socket, update, extra = {}) {
-				relay.handleControl(socket, socket.attachment, `__YPS:${JSON.stringify({
+				text(relay, socket, `__YPS:${JSON.stringify({
 					type: "BODY_UPDATE_ENVELOPE", bodyId: BODY, bodyEpoch: socket.attachment.documentEpoch,
 					clientFrameId: `frame-${Math.random().toString(36).slice(2)}`, payloadDigest: sha256HexSync(update),
 					...extra,
@@ -613,7 +630,8 @@ s.test("reset cooldown: lease denied (429 + policy state) until the cooldown ela
 });
 
 s.test("rate-limit burst holds one max-size frame: a 1.5 MB frame is accepted", async () => {
-	assert.equal(readRelayConfig({ YAOS_RELAY_BURST_BYTES: "1024" }).burstBytes, MAX_DURABLE_UPDATE_BYTES);
+	assert.equal(readRelayConfig({ YAOS_RELAY_BURST_BYTES: "1024" }).burstBytes, RELAY_MIN_BURST_BYTES);
+	assert.equal(RELAY_MIN_BURST_BYTES >= MAX_DURABLE_UPDATE_BYTES + 64, true, "R12: a max raw frame fits the bucket");
 	assert.equal(readRelayConfig({}).burstBytes >= MAX_DURABLE_UPDATE_BYTES, true);
 	assert.equal(DEFAULT_RELAY_CONFIG.burstBytes >= MAX_DURABLE_UPDATE_BYTES, true);
 	assert.equal(readRelayConfig({ YAOS_RELAY_BURST_BYTES: String(4 * 1024 * 1024) }).burstBytes, 4 * 1024 * 1024);

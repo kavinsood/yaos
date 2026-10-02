@@ -50,6 +50,11 @@ const MESSAGE_AWARENESS = 1;
 const MAX_IDENTITY_LENGTH = 256;
 const MAX_TEXT_FRAME = 64 * 1024;
 
+/** R12 hard per-message cap of a relay socket (same limits relayMessage enforces after parsing). */
+function relayAdmissionLimit(message: string | ArrayBuffer): number {
+	return typeof message === "string" ? MAX_TEXT_FRAME : MAX_CANDIDATE_BYTES + 64;
+}
+
 /**
  * A hibernation wake constructs a new runtime (new runtimeEpoch) while sockets
  * admitted by the previous runtime stay connected. Frames that touch runtime
@@ -754,6 +759,13 @@ export class VaultSocketService {
 	}
 
 	async message(socket: VaultSocketPort, message: string | ArrayBuffer): Promise<void> {
+		// R12: a relay socket's message is charged (raw size) and size-capped before
+		// anything else, and a refused socket's later messages are dropped here in
+		// O(1). There is no earlier hook: after the upgrade, WebSocket messages are
+		// delivered to the Durable Object directly and never pass the Worker.
+		const relay = this.options.relay;
+		const gate = relay ? relay.admitKnown(socket, message, relayAdmissionLimit(message)) : "unknown";
+		if (gate === "drop") return;
 		const attachment = parseVaultSocketAttachment(socket.deserializeAttachment());
 		const control = typeof message === "string" ? parseControlFrame(message) : null;
 		if (!attachment
@@ -772,6 +784,8 @@ export class VaultSocketService {
 				socket.close(1008, "socket authority mismatch");
 				return;
 			}
+			if (gate === "unknown"
+				&& !this.options.relay.admitRelay(socket, attachment, message, relayAdmissionLimit(message))) return;
 			this.relayMessage(this.options.relay, socket, attachment, message, control);
 			return;
 		}
