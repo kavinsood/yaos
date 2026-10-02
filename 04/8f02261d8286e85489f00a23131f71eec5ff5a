@@ -1,0 +1,23 @@
+server/src/recoveryStateProjection.ts
+  s_da4ca900883079::t_7b79085a865007 25-30,68,97-99,110,122-126,134-136,167,176,179-180,194,197
+server/src/shared/recoveryStateObject.ts
+  s_da4ca900883079::t_ea388047f75b05 17-35
+tests/server/recovery-projection-idle.ts
+  s_da4ca900883079::t_328285dfcf88ed 602-632
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "048f02261d8286e85489f00a23131f71eec5ff5a",
+  "prompts": {},
+  "sessions": {
+    "s_da4ca900883079": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ad8127dcef3a8a877",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
