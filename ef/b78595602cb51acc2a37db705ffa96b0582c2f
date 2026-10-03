@@ -1,0 +1,25 @@
+server/src/relayBodies.ts
+  s_870afe9a19f5b7::t_cf8989a01528bf 1721
+server/src/relayBodyStore.ts
+  s_870afe9a19f5b7::t_9dc0d624dda293 58-60,220,333-334,341,423-445,486-487,490-502,505-524,559-567
+server/src/vaultDocumentStore.ts
+  s_870afe9a19f5b7::t_90f57351c846ea 1145-1159,1163,1167-1197,2191
+server/src/vaultStore.ts
+  s_870afe9a19f5b7::t_0ee3acb34ef5ca 495,644,835
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "efb78595602cb51acc2a37db705ffa96b0582c2f",
+  "prompts": {},
+  "sessions": {
+    "s_870afe9a19f5b7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a38341bee0d04eefc",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
