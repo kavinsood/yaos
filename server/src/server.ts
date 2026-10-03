@@ -604,7 +604,11 @@ export class VaultRuntime implements DrainPort {
 			if (url.pathname === SQL_ROWS_RUNTIME_PATH || url.pathname === SQL_ROWS_RESET_RUNTIME_PATH) {
 				const counter = this.options.sqlRowCounter;
 				if (!counter) return json({ error: "not_found" }, 404);
-				if (request.method === "GET" && url.pathname === SQL_ROWS_RUNTIME_PATH) return json(counter.snapshot());
+				if (request.method === "GET" && url.pathname === SQL_ROWS_RUNTIME_PATH) {
+					return json(url.searchParams.has("statements")
+						? { ...counter.snapshot(), statements: counter.statementRows(Number(url.searchParams.get("statements")) || 40) }
+						: counter.snapshot());
+				}
 				if (request.method === "POST" && url.pathname === SQL_ROWS_RESET_RUNTIME_PATH) return json({ reset: true, previous: counter.reset() });
 				return json({ error: "not_found" }, 404);
 			}

@@ -1124,35 +1124,32 @@ export class VaultStore extends RecoveryAuthorityStore {
 	}
 
 	/**
-	 * Current active Markdown owners of any of `paths` (one scan for the whole
-	 * batch, instead of one `activeBodiesAtPath` scan per path), lean-overlaid.
+	 * Current active Markdown owners of any of `paths`, lean-overlaid.
+	 *
+	 * b3-n2: O(batch) reads. The owners come from the in-memory catalog path
+	 * index (`catalogPathIndex`: one refresh read of the events at and after its
+	 * tip, i.e. the last batch's rows, instead of the former GROUP BY over every
+	 * catalog event, which read ~2 rows per vault body twice per create-bulk
+	 * batch). Only an occupied path then costs one `vault_catalog_body_sequence`
+	 * seek (plus the lean overlay seeks) for its owner's head. No new index (P3).
 	 */
 	activeCatalogHeadsAtPaths(paths: readonly string[]): Map<string, CatalogHeadAtBoundary> {
 		this.initialize();
 		const result = new Map<string, CatalogHeadAtBoundary>();
 		if (paths.length === 0) return result;
 		const boundary = this.currentSequence();
-		const rows = this.storage.sql.exec<{
-			sequence: number; body_id: string; file_id: string; path: string; previous_path: string | null;
-			lifecycle: BodyLifecycle; generation: number; body_epoch: number; content_hash: string | null; size: number | null;
-		}>(
-			`SELECT e.sequence, e.body_id, e.file_id, e.path, e.previous_path, e.lifecycle, e.generation,
-			        e.body_epoch, e.content_hash, e.size
-			   FROM vault_catalog_events e
-			   JOIN (SELECT body_id, MAX(sequence) AS sequence FROM vault_catalog_events
-			          WHERE sequence <= ? GROUP BY body_id) latest
-			     ON latest.body_id = e.body_id AND latest.sequence = e.sequence
-			  WHERE e.lifecycle = 'active' AND e.path IN (SELECT value FROM json_each(?))`,
-			boundary, JSON.stringify(paths),
-		).toArray();
-		for (const row of rows) {
-			if (result.has(row.path)) continue;
-			result.set(row.path, this.leanOverlay(boundary, {
-				sequence: row.sequence, bodyId: row.body_id,
-				bodyEpoch: parseSemanticEpoch(row.body_epoch, "catalog body epoch"),
-				fileId: row.file_id, path: row.path, previousPath: row.previous_path, lifecycle: row.lifecycle,
-				generation: row.generation, contentHash: row.content_hash, size: row.size,
-			}));
+		const index = this.catalogPathIndex();
+		for (const path of new Set(paths)) {
+			// Every catalog event is at or below the current sequence, so the index (through its
+			// newest event) is the boundary state; the slow branch is defensive only.
+			const owners = boundary >= index.through ? [...(index.owners.get(path) ?? [])].sort()
+				: this.activeBodiesAtPath(boundary, path);
+			for (const owner of owners) {
+				const head = this.getCatalogHeadAt(boundary, owner);
+				if (head?.lifecycle !== "active" || head.path !== path) continue;
+				result.set(path, head);
+				break;
+			}
 		}
 		return result;
 	}

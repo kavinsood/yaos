@@ -13,7 +13,11 @@ interface Tracked {
 	cursor: CountedCursor;
 	written: number;
 	read: number;
+	/** Normalised statement text (b3-n2: per-statement read attribution). */
+	key: string;
 }
+
+export interface SqlStatementRows { statement: string; execs: number; rowsRead: number; rowsWritten: number }
 
 /** Cursors whose counters may still grow (lazy iteration); older ones are folded and dropped. */
 const RING_SIZE = 64;
@@ -36,6 +40,7 @@ export class SqlRowCounter {
 	private execs = 0;
 	private since = Date.now();
 	private ring: Tracked[] = [];
+	private statements = new Map<string, SqlStatementRows>();
 
 	/** Returns a storage object whose `sql.exec` and `setAlarm` are counted. */
 	wrap<T extends object>(storage: T): T {
@@ -47,7 +52,7 @@ export class SqlRowCounter {
 				if (property === "exec" && typeof value === "function") {
 					return (...args: unknown[]) => {
 						const cursor = (value as (...input: unknown[]) => CountedCursor).apply(target, args);
-						counter.track(cursor);
+						counter.track(cursor, typeof args[0] === "string" ? args[0] : "");
 						return cursor;
 					};
 				}
@@ -69,10 +74,14 @@ export class SqlRowCounter {
 		});
 	}
 
-	private track(cursor: CountedCursor): void {
+	private track(cursor: CountedCursor, query: string): void {
 		this.execs++;
 		this.fold();
-		const tracked: Tracked = { cursor, written: 0, read: 0 };
+		const key = query.replace(/\s+/g, " ").trim().slice(0, 240);
+		const entry = this.statements.get(key) ?? { statement: key, execs: 0, rowsRead: 0, rowsWritten: 0 };
+		entry.execs++;
+		this.statements.set(key, entry);
+		const tracked: Tracked = { cursor, written: 0, read: 0, key };
 		this.foldOne(tracked);
 		this.ring.push(tracked);
 		if (this.ring.length > RING_SIZE) {
@@ -88,8 +97,16 @@ export class SqlRowCounter {
 			written = Number(tracked.cursor.rowsWritten) || 0;
 			read = Number(tracked.cursor.rowsRead) || 0;
 		} catch { /* cursor without counters */ }
-		this.rowsWritten += Math.max(0, written - tracked.written);
-		this.rowsRead += Math.max(0, read - tracked.read);
+		const dw = Math.max(0, written - tracked.written);
+		const dr = Math.max(0, read - tracked.read);
+		this.rowsWritten += dw;
+		this.rowsRead += dr;
+		if (dw > 0 || dr > 0) {
+			const entry = this.statements.get(tracked.key) ?? { statement: tracked.key, execs: 0, rowsRead: 0, rowsWritten: 0 };
+			entry.rowsRead += dr;
+			entry.rowsWritten += dw;
+			this.statements.set(tracked.key, entry);
+		}
 		tracked.written = Math.max(tracked.written, written);
 		tracked.read = Math.max(tracked.read, read);
 	}
@@ -111,6 +128,12 @@ export class SqlRowCounter {
 		};
 	}
 
+	/** Per-statement totals since the last reset, most rows read first (test-only attribution). */
+	statementRows(limit = 40): SqlStatementRows[] {
+		this.fold();
+		return [...this.statements.values()].sort((a, b) => b.rowsRead - a.rowsRead || b.execs - a.execs).slice(0, limit);
+	}
+
 	/** Returns the totals so far, then starts again from zero. */
 	reset(now = Date.now()): SqlRowSnapshot {
 		const snapshot = this.snapshot(now);
@@ -118,6 +141,7 @@ export class SqlRowCounter {
 		this.rowsRead = 0;
 		this.setAlarms = 0;
 		this.execs = 0;
+		this.statements = new Map();
 		this.since = now;
 		// Later growth of already-seen cursors still counts (from their current values).
 		return snapshot;
