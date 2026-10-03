@@ -105,6 +105,19 @@ export interface ObjectStorePort {
 	createOnly(key: string, bytes: Uint8Array, options?: ObjectWriteOptions): Promise<"created" | "exists">;
 	delete(key: string): Promise<void>;
 	list(input: { prefix: string; cursor?: string; limit?: number }): Promise<ObjectListPage>;
+	/**
+	 * Optional (b3-clientblob): store `length` bytes streamed from `body`, verified
+	 * by the store against `sha256` (lowercase hex) before the object becomes
+	 * visible. A store that implements it neither buffers nor hashes in the
+	 * caller's isolate; `digest_mismatch` means nothing was stored.
+	 */
+	putVerifiedStream?(
+		key: string,
+		body: ReadableStream<Uint8Array>,
+		length: number,
+		sha256: string,
+		options?: ObjectWriteOptions,
+	): Promise<"stored" | "digest_mismatch">;
 }
 
 /** Calls one stable named actor without exposing a platform namespace or actor identifier type. */

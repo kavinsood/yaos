@@ -744,6 +744,8 @@ export interface VaultSyncOptions {
 	 * already backed off. The host decides how often to notify.
 	 */
 	onDailyLimit?: (info: DailyLimitInfo) => void;
+	/** TEST-ONLY: first D8 probe interval (default DAILY_LIMIT_FIRST_PROBE_MS, doubling to hourly). */
+	dailyLimitProbeBaseMs?: number;
 	onSemanticEpochReset?: (event: SemanticEpochResetEvent) => void | Promise<void>;
 	onSemanticEpochRebaseConflict?: (event: {
 		bodyId: string;
@@ -1544,6 +1546,8 @@ export class VaultSync implements SyncRuntimePort {
 	/** D8 back-off; unlike submissionPausedUntil, VAULT_READY does not clear it. */
 	private dailyLimitPausedUntil = 0;
 	private dailyLimit: DailyLimitInfo | null = null;
+	/** D8: consecutive limited probes in this trip streak (sets the next probe interval). */
+	private dailyLimitProbes = 0;
 	/** Pending waitForSubmissionWindow sleeps; destroy() wakes them. */
 	private readonly submissionWindowWakers = new Set<() => void>();
 	private backpressureLevel = 0;
@@ -3286,6 +3290,7 @@ export class VaultSync implements SyncRuntimePort {
 			await this.recoverRootSemanticEpoch(error.semanticMismatch.expectedEpoch);
 			response = await this.server.commitCreateBulk(build());
 		}
+		this.noteDailyLimitWriteSucceeded();
 		const expected = [...files.map((file) => file.operationId), ...attachments.map((item) => item.operationId)];
 		if (
 			response.batchId !== batchId
@@ -5717,12 +5722,34 @@ export class VaultSync implements SyncRuntimePort {
 	 * 1 s VAULT_ERROR pause that would retry writes all day.
 	 */
 	tripDailyLimit(info: DailyLimitInfo): void {
-		const until = dailyLimitBackoffUntil(info, this.now());
+		const now = this.now();
+		if (this.dailyLimit && now >= this.dailyLimit.resetAt) this.dailyLimitProbes = 0;
 		this.dailyLimit = info;
-		this.dailyLimitPausedUntil = Math.max(this.dailyLimitPausedUntil, until);
-		this.holdReconnectFloor(DAILY_LIMIT_FLOOR_KEY, until - this.now());
-		this.log(`cloudflare daily limit (${info.kind}); backing off until ${new Date(until).toISOString()}`);
+		// b3-clientblob A4: one back-off step per probe round. Concurrent requests
+		// answered 503 while this round's pause stands do not escalate it.
+		if (now >= this.dailyLimitPausedUntil) {
+			const until = dailyLimitBackoffUntil(info, now, this.dailyLimitProbes, this.options.dailyLimitProbeBaseMs);
+			this.dailyLimitProbes++;
+			this.dailyLimitPausedUntil = until;
+			this.holdReconnectFloor(DAILY_LIMIT_FLOOR_KEY, until - now);
+			this.log(`cloudflare daily limit (${info.kind}); backing off until ${new Date(until).toISOString()}`);
+		}
 		this.options.onDailyLimit?.(info);
+	}
+
+	/**
+	 * b3-clientblob A4: the server committed a write for this device, so the
+	 * rows-written limit no longer applies. Clear D8 (state, back-off, reconnect
+	 * floor) and release parked submissions now rather than at the next probe.
+	 */
+	private noteDailyLimitWriteSucceeded(): void {
+		if (!this.dailyLimit && this.dailyLimitPausedUntil === 0) return;
+		this.dailyLimit = null;
+		this.dailyLimitPausedUntil = 0;
+		this.dailyLimitProbes = 0;
+		this.reconnectFloors.delete(DAILY_LIMIT_FLOOR_KEY);
+		this.log("cloudflare daily limit cleared: a write succeeded");
+		for (const wake of Array.from(this.submissionWindowWakers)) wake();
 	}
 
 	/** The active daily-limit trip, or null once its reset time has passed. */
@@ -5739,19 +5766,21 @@ export class VaultSync implements SyncRuntimePort {
 	 * (commitCreateAdmissionRequests), so it is held by the same back-off.
 	 */
 	private async waitForSubmissionWindow(): Promise<void> {
-		if (this.destroyed) throw new Error("runtime destroyed during submission backoff");
-		const remaining = Math.max(this.submissionPausedUntil, this.dailyLimitPausedUntil) - this.now();
-		if (remaining <= 0) return;
-		await new Promise<void>((resolve) => {
-			const wake = () => {
-				window.clearTimeout(timer);
-				this.submissionWindowWakers.delete(wake);
-				resolve();
-			};
-			const timer = window.setTimeout(wake, remaining);
-			this.submissionWindowWakers.add(wake);
-		});
-		if (this.destroyed) throw new Error("runtime destroyed during submission backoff");
+		for (;;) {
+			if (this.destroyed) throw new Error("runtime destroyed during submission backoff");
+			const remaining = Math.max(this.submissionPausedUntil, this.dailyLimitPausedUntil) - this.now();
+			if (remaining <= 0) return;
+			// Woken early (destroy, or a D8 clear): re-check rather than assume the window opened.
+			await new Promise<void>((resolve) => {
+				const wake = () => {
+					window.clearTimeout(timer);
+					this.submissionWindowWakers.delete(wake);
+					resolve();
+				};
+				const timer = window.setTimeout(wake, remaining);
+				this.submissionWindowWakers.add(wake);
+			});
+		}
 	}
 
 	private async captureCandidate(
@@ -5877,6 +5906,7 @@ export class VaultSync implements SyncRuntimePort {
 	): Promise<BodyReceipt> {
 		await this.awaitBodyPersistence(candidate.record.bodyId);
 		this.validateReceipt(candidate.record, receipt);
+		this.noteDailyLimitWriteSucceeded();
 		await this.confirmPersistedCandidate(candidate.record, receipt);
 		this.pendingCandidates.delete(candidate.record.candidateId);
 		await this.bodies.markCandidateSettled(
@@ -6469,6 +6499,7 @@ export class VaultSync implements SyncRuntimePort {
 	): Promise<LifecycleReceipt[]> {
 		await this.waitForSubmissionWindow();
 		const batch = await this.server.commitLifecycleBatch(requests);
+		this.noteDailyLimitWriteSucceeded();
 		if (
 			batch.receipts.length !== requests.length
 			|| !Number.isSafeInteger(batch.vaultSequence)

@@ -227,6 +227,33 @@ s.test("YAOS_TEST_ONLY_SIMULATE_DAILY_LIMIT starts the object limited (with the 
 	});
 });
 
+s.test("b3-clientblob: the simulated limit survives a cold restart of the object (hibernation/eviction)", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "yaos-daily-limit-restart-"));
+	const sqlite = NodeSqliteStorage.open(join(directory, "vault.sqlite"));
+	const storage = Object.assign(sqlite, {
+		setAlarm: async () => {}, getAlarm: async () => null, deleteAlarm: async () => {}, deleteAll: async () => {},
+	});
+	const state = { ...makeDurableObjectState({ getWebSockets: () => [] }), storage: storage as never } as DurableObjectState;
+	const env = { YAOS_TEST_ONLY_DEBUG_ROUTES: "true" } as CloudflareVaultEnvironment;
+	try {
+		const first = new VaultSyncServer(state, env);
+		assert.ok((await first.fetch(provisionRequest())).ok);
+		assert.equal((await first.fetch(simulate(true))).status, 200);
+		// A new object over the same storage = the constructor a hibernation wake or eviction runs.
+		const woken = new VaultSyncServer(state, env);
+		assert.equal((await woken.fetch(writeRequest())).status, 503, "the switch is still on after the wake");
+		assert.equal((await woken.fetch(simulate(false))).status, 200, "a woken, simulated object can still be switched off");
+		assert.equal((await woken.fetch(writeRequest())).status, 200);
+		const again = new VaultSyncServer(state, env);
+		assert.equal((await again.fetch(writeRequest())).status, 200, "switching off is persisted too");
+		const plain = new VaultSyncServer(state, {} as CloudflareVaultEnvironment);
+		assert.equal((await plain.fetch(writeRequest())).status, 200, "inert without the debug var");
+	} finally {
+		sqlite.database.close();
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
 // ---------------------------------------------------------------------------
 // Alarms (b3, relay3): every setAlarm is a billed row; none may loop while limited.
 // ---------------------------------------------------------------------------

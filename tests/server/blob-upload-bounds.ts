@@ -4,6 +4,7 @@ import type { ObjectStorePort, ObjectWriteOptions } from "../../server/src/platf
 import { FakeObjectStore, makeConfigNamespace, makeEnv } from "../mocks/workerEnv.ts";
 import { suite } from "../harness.ts";
 import { COLLABORATION_POLICY_VERSION, capabilityDigestForRole } from "../../server/src/collaboration";
+import { CloudflareObjectStore, isR2DigestMismatch } from "../../server/src/cloudflarePorts";
 
 const s = suite("blob-upload-bounds");
 const encoder = new TextEncoder();
@@ -245,6 +246,84 @@ s.section("Hash verification precedes publication");
 	s.check(response.status === 400, "a streamed body with the wrong hash is rejected");
 	s.check(await errorMessage(response) === "hash mismatch", "hash mismatch preserves its response message");
 	s.check(bucket.puts.length === 0, "a hash mismatch never publishes to R2");
+}
+
+// ---------------------------------------------------------------------------
+// b3-clientblob: declared-length uploads stream to a digest-verifying store
+// (R2 `sha256` put option); the front Worker neither buffers nor hashes them.
+// ---------------------------------------------------------------------------
+
+/** Models R2: consumes the stream, checks length and sha256, stores nothing on mismatch. */
+class VerifyingBucket extends FakeObjectStore {
+	streamed: Array<{ key: string; length: number; sha256: string; contentType: string | null }> = [];
+	async putVerifiedStream(key: string, body: ReadableStream<Uint8Array>, length: number, sha256: string,
+		options?: ObjectWriteOptions): Promise<"stored" | "digest_mismatch"> {
+		const bytes = new Uint8Array(await new Response(body).arrayBuffer());
+		if (bytes.byteLength !== length) throw new Error("stream length does not match");
+		this.streamed.push({ key, length, sha256, contentType: options?.contentType ?? null });
+		if (await sha256Hex(bytes) !== sha256) return "digest_mismatch";
+		await super.put(key, bytes, options);
+		return "stored";
+	}
+}
+
+function bodyStream(body: Uint8Array): ReadableStream<Uint8Array> {
+	return new ReadableStream<Uint8Array>({ start(controller) { controller.enqueue(body); controller.close(); } });
+}
+
+s.section("Declared length streams to a verifying store");
+{
+	const body = encoder.encode("streamed straight to the object store");
+	const hash = await sha256Hex(body);
+	const bucket = new VerifyingBucket();
+	const response = await handleBlobRoute(await blobEnv(bucket), VAULT_ID,
+		uploadRequest(hash, bodyStream(body), { "Content-Length": String(body.byteLength), "Content-Type": "image/png" }),
+		[hash], json);
+	s.check(response.status === 204, "a declared-length upload is accepted");
+	s.check(bucket.streamed.length === 1 && bucket.streamed[0]!.sha256 === hash
+		&& bucket.streamed[0]!.length === body.byteLength, "it goes to the store's verified stream put with the addressed hash");
+	s.check(bucket.streamed[0]?.contentType === "image/png", "Content-Type is preserved");
+	s.check(bucket.puts.length === 1, "stored exactly once");
+
+	const wrong = "0".repeat(64);
+	const mismatchBucket = new VerifyingBucket();
+	const mismatch = await handleBlobRoute(await blobEnv(mismatchBucket), VAULT_ID,
+		uploadRequest(wrong, bodyStream(body), { "Content-Length": String(body.byteLength) }), [wrong], json);
+	s.check(mismatch.status === 400 && await errorMessage(mismatch) === "hash mismatch", "a store digest mismatch is a 400 hash mismatch");
+	s.check(mismatchBucket.puts.length === 0, "nothing is stored on a digest mismatch");
+
+	const oversize = await handleBlobRoute(await blobEnv(new VerifyingBucket()), VAULT_ID,
+		uploadRequest(hash, bodyStream(body), { "Content-Length": String(MAX_BLOB_UPLOAD_BYTES + 1) }), [hash], json);
+	s.check(oversize.status === 413, "an oversize declaration is still rejected before the store");
+
+	const undeclaredBucket = new VerifyingBucket();
+	const undeclared = await handleBlobRoute(await blobEnv(undeclaredBucket), VAULT_ID,
+		uploadRequest(hash, bodyStream(body)), [hash], json);
+	s.check(undeclared.status === 204 && undeclaredBucket.streamed.length === 0 && undeclaredBucket.puts.length === 1,
+		"without Content-Length the bounded buffered path (front hash) still applies");
+}
+
+s.section("CloudflareObjectStore.putVerifiedStream maps R2's checksum rejection");
+{
+	const calls: Array<{ key: string; sha256: unknown }> = [];
+	let fail: Error | null = null;
+	const r2 = { put: async (key: string, value: ReadableStream<Uint8Array>, options: { sha256?: unknown }) => {
+		calls.push({ key, sha256: options.sha256 });
+		await new Response(value).arrayBuffer();
+		if (fail) throw fail;
+		return {};
+	} };
+	const store = new CloudflareObjectStore(r2 as never);
+	const body = encoder.encode("x");
+	s.check(await store.putVerifiedStream("k", bodyStream(body), 1, "a".repeat(64)) === "stored", "a passing put is stored");
+	s.check(calls[0]?.sha256 === "a".repeat(64), "the addressed hash is passed as R2's sha256 option");
+	fail = new Error("put: The SHA-256 checksum you specified did not match what we received. (10037)");
+	s.check(await store.putVerifiedStream("k", bodyStream(body), 1, "a".repeat(64)) === "digest_mismatch", "R2 10037 is a digest mismatch");
+	fail = new Error("put: We encountered an internal error. Please try again. (10001)");
+	let threw = false;
+	try { await store.putVerifiedStream("k", bodyStream(body), 1, "a".repeat(64)); } catch { threw = true; }
+	s.check(threw, "other R2 failures are not reported as a mismatch");
+	s.check(!isR2DigestMismatch(new Error("network connection lost")), "unrelated errors do not match");
 }
 
 await s.done();

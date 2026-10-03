@@ -1993,6 +1993,42 @@ export interface CloudflareVaultEnvironment extends TestOnlyServerTimerEnv, Test
 // eslint-disable-next-line @typescript-eslint/no-empty-object-type, @typescript-eslint/no-unsafe-declaration-merging -- Workers RPC requires the exported class type to carry its brand.
 export interface VaultSyncServer extends Rpc.DurableObjectBranded {}
 
+/** TEST-ONLY: one-row table holding the persisted simulate-daily-limit switch (debug-route Workers only). */
+const SIMULATED_DAILY_LIMIT_TABLE = "yaos_test_only_simulated_daily_limit";
+
+type RawSql = { exec(query: string, ...bindings: unknown[]): { toArray(): unknown[] } };
+
+function rawSql(state: DurableObjectState): RawSql | null {
+	const sql = (state.storage as unknown as { sql?: RawSql }).sql;
+	return sql && typeof sql.exec === "function" ? sql : null;
+}
+
+/** TEST-ONLY: whether a persisted simulate-daily-limit switch is on (false when absent or unreadable). */
+function readPersistedDailyLimitSimulation(state: DurableObjectState): boolean {
+	const sql = rawSql(state);
+	if (!sql) return false;
+	try {
+		const exists = sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+			SIMULATED_DAILY_LIMIT_TABLE).toArray();
+		if (exists.length === 0) return false;
+		return sql.exec(`SELECT 1 FROM ${SIMULATED_DAILY_LIMIT_TABLE} WHERE id = 1`).toArray().length > 0;
+	} catch {
+		return false;
+	}
+}
+
+/** TEST-ONLY: persist (row present) or clear (row deleted) the simulate-daily-limit switch. */
+function persistDailyLimitSimulation(state: DurableObjectState, enabled: boolean): void {
+	const sql = rawSql(state);
+	if (!sql) return;
+	if (enabled) {
+		sql.exec(`CREATE TABLE IF NOT EXISTS ${SIMULATED_DAILY_LIMIT_TABLE} (id INTEGER PRIMARY KEY CHECK (id = 1))`);
+		sql.exec(`INSERT OR IGNORE INTO ${SIMULATED_DAILY_LIMIT_TABLE} (id) VALUES (1)`);
+	} else if (readPersistedDailyLimitSimulation(state)) {
+		sql.exec(`DELETE FROM ${SIMULATED_DAILY_LIMIT_TABLE}`);
+	}
+}
+
 /** Cloudflare Durable Object wrapper for the portable schema-8 vault runtime. */
 // eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging -- Declaration merging preserves the Workers RPC brand on the Cloudflare wrapper.
 export class VaultSyncServer implements DurableObject {
@@ -2008,7 +2044,8 @@ export class VaultSyncServer implements DurableObject {
 
 	constructor(private readonly state: DurableObjectState, private readonly env: CloudflareVaultEnvironment) {
 		this.dailyLimit = new DailyLimitLatch();
-		this.simulatedDailyLimit = testOnlyDebugRoutesEnabled(env) && env.YAOS_TEST_ONLY_SIMULATE_DAILY_LIMIT === "true";
+		this.simulatedDailyLimit = testOnlyDebugRoutesEnabled(env)
+			&& (env.YAOS_TEST_ONLY_SIMULATE_DAILY_LIMIT === "true" || readPersistedDailyLimitSimulation(state));
 		this.sqlRowCounter = testOnlyDebugRoutesEnabled(env) ? new SqlRowCounter() : null;
 		this.runtime = this.createRuntime(state, env);
 	}
@@ -2048,8 +2085,17 @@ export class VaultSyncServer implements DurableObject {
 
 	/** TEST-ONLY (D8). Toggle the simulated free-tier rows-written limit. */
 	private setSimulatedDailyLimit(enabled: boolean): Response {
+		// b3-clientblob: the switch is persisted (raw storage, before the flag is
+		// set / after it is cleared, so the simulation never blocks its own row)
+		// and re-read by the constructor. An in-memory flag was lost whenever the
+		// object hibernated or was evicted mid-hold, so deployed alarms ran
+		// unlimited and the D8 alarm hold was never exercised.
+		if (enabled) persistDailyLimitSimulation(this.state, true);
 		this.simulatedDailyLimit = enabled;
-		if (!enabled) this.dailyLimit.clear();
+		if (!enabled) {
+			this.dailyLimit.clear();
+			persistDailyLimitSimulation(this.state, false);
+		}
 		return json({ simulated: "daily-limit", enabled });
 	}
 
@@ -2078,6 +2124,14 @@ export class VaultSyncServer implements DurableObject {
 
 	async fetch(request: Request): Promise<Response> {
 		if (this.restarting) await this.restarting;
+		// TEST-ONLY (D8): toggle the switch before the runtime. A cold object that
+		// wakes already simulated fails its first storage writes, so the runtime
+		// route would answer 503 and the switch could never be turned off.
+		if (request.method === "POST" && testOnlyDebugRoutesEnabled(this.env)
+			&& new URL(request.url).pathname === SIMULATE_DAILY_LIMIT_RUNTIME_PATH) {
+			const body = await request.json().catch(() => ({})) as { enabled?: unknown };
+			return this.setSimulatedDailyLimit(body.enabled !== false);
+		}
 		return this.runtime.fetch(request);
 	}
 
