@@ -1142,12 +1142,57 @@ export abstract class VaultDocumentStore {
 		if (this.initialized) this.storage.sql.exec(RELAY_TAIL_SCHEMA);
 	}
 
+	/**
+	 * b3-a1fix (A1): documents whose head moved since the last full lean-coalesce
+	 * scan of `vault_document_heads` (null = cold: this runtime has not completed a
+	 * full scan yet). Every non-root head write that can leave the head ahead of
+	 * its latest catalog event notes the document here, so a warm alarm pass seeks
+	 * only the changed heads (O(changed)) instead of scanning every head (O(N)).
+	 */
+	leanHeadsDirty: Set<string> | null = null;
+	/** b3-a1fix (A1): v3 tail rows appended since the last full tail-candidate scan (null = cold). */
+	tailDirty: Set<string> | null = null;
+
+	noteHeadAdvanced(documentId: string): void {
+		if (documentId !== "root") this.leanHeadsDirty?.add(documentId);
+	}
+
 	/** Lean-mode sequence head expression: the journal head, and in v3 the tail head too. */
 	protected leanHeadSql(): string {
 		return this.relayTailEnabled
-			? `MAX((SELECT COALESCE(MAX(sequence), 0) FROM vault_journal),
-			       (SELECT COALESCE(MAX(latest_sequence), 0) FROM relay_body_tail))`
+			? `MAX((SELECT COALESCE(MAX(sequence), 0) FROM vault_journal), ${this.tailHeadSequence()})`
 			: "(SELECT COALESCE(MAX(sequence), 0) FROM vault_journal)";
+	}
+
+	/**
+	 * b3-a1fix (A1): `relay_body_tail` has no index on latest_sequence, so its MAX
+	 * is a full scan, and it was embedded in every clock read and allocation. This
+	 * runtime reads it once and then tracks it: tail sequences only grow through
+	 * the tail INSERT (noted below), and a tail row is only deleted after the clock
+	 * was raised past it (syncLeanClock), so MAX(clock, journal, cached) is the same
+	 * value. A rolled-back append can leave the cache one allocation high (a gap in
+	 * the sequence, never a reuse).
+	 */
+	private tailHeadCache: number | null = null;
+
+	private tailHeadSequence(): number {
+		if (this.tailHeadCache === null) {
+			this.tailHeadCache = this.storage.sql.exec<{ sequence: number }>(
+				"SELECT COALESCE(MAX(latest_sequence), 0) AS sequence FROM relay_body_tail",
+			).one().sequence;
+		}
+		return this.tailHeadCache;
+	}
+
+	noteTailSequence(sequence: number): void {
+		if (this.tailHeadCache !== null && sequence > this.tailHeadCache) this.tailHeadCache = sequence;
+	}
+
+	/** b3-a1fix: storage was wiped or rewritten wholesale; every in-memory index goes cold. */
+	protected resetLeanCaches(): void {
+		this.tailHeadCache = null;
+		this.leanHeadsDirty = null;
+		this.tailDirty = null;
 	}
 
 	private addLeanColumns(): void {
@@ -2143,6 +2188,7 @@ export abstract class VaultDocumentStore {
 			);
 			head.toArray();
 			if (head.rowsWritten !== 1) throw new Error("checkpoint head mismatch");
+			this.noteHeadAdvanced(documentId);
 			rowsWritten += head.rowsWritten;
 			// v3: the abandoned lineage's tail records (the relay service checkpoints
 			// the tail before a reset, so this is normally a no-op).

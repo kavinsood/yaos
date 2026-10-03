@@ -55,6 +55,9 @@ export interface RelayAppendResult {
 }
 
 /** Relay v3 group commit: one merged update for a buffered group of frames. */
+/** b3-a1fix (A1): dirty heads checked per warm coalesce pass (each a primary-key seek). */
+const LEAN_COALESCE_DIRTY_PER_PASS = 1_000;
+
 export interface RelayGroupCommitInput {
 	bodyId: string;
 	expectedEpoch: SemanticEpoch;
@@ -214,6 +217,7 @@ export class RelayBodyStore {
 				generation, sequence, input.bodyId,
 			);
 			writeHead.toArray();
+			this.store.noteHeadAdvanced(input.bodyId);
 			rowsWritten += writeHead.rowsWritten;
 			if (!lean) {
 				const catalogWrite = this.storage.sql.exec(
@@ -326,12 +330,15 @@ export class RelayBodyStore {
 				);
 				write.toArray();
 				rowsWritten += write.rowsWritten;
+				this.store.tailDirty?.add(input.bodyId);
+				this.store.noteTailSequence(sequence);
 			}
 			const writeHead = this.storage.sql.exec(
 				"UPDATE vault_document_heads SET generation = ?, latest_sequence = ? WHERE document_id = ?",
 				generation, sequence, input.bodyId,
 			);
 			writeHead.toArray();
+			this.store.noteHeadAdvanced(input.bodyId);
 			rowsWritten += writeHead.rowsWritten;
 			const ring = this.writeReceiptRings(input.bodyId, semanticEpoch, generation, sequence, input.receipts,
 				input.receiptTtlMs, now);
@@ -413,10 +420,29 @@ export class RelayBodyStore {
 	tailCheckpointCandidates(bytes: number, frames: number, limit: number): string[] {
 		if (!this.store.relayTail) return [];
 		this.store.initialize();
-		return this.storage.sql.exec<{ body_id: string }>(
-			`SELECT body_id FROM relay_body_tail WHERE byte_length >= ? OR frames >= ? ORDER BY base_sequence LIMIT ?`,
-			bytes, frames, limit,
-		).toArray().map((row) => row.body_id);
+		const dirty = this.store.tailDirty;
+		if (dirty === null) {
+			// Cold (first pass of this runtime): one full scan. Fewer than `limit` hits
+			// means every over-cap row is known; from then on only appended rows are checked.
+			const cold = this.storage.sql.exec<{ body_id: string }>(
+				`SELECT body_id FROM relay_body_tail WHERE byte_length >= ? OR frames >= ? ORDER BY base_sequence LIMIT ?`,
+				bytes, frames, limit,
+			).toArray().map((row) => row.body_id);
+			if (cold.length < limit) this.store.tailDirty = new Set(cold);
+			return cold;
+		}
+		// b3-a1fix (A1): warm, O(appended): a primary-key seek per tail row appended
+		// since the last check. Rows under the cap leave the set (the next append
+		// re-adds them); over-cap rows stay until their checkpoint shrinks them.
+		const over: Array<{ id: string; base: number }> = [];
+		for (const id of [...dirty]) {
+			const row = this.storage.sql.exec<{ base_sequence: number; byte_length: number; frames: number }>(
+				"SELECT base_sequence, byte_length, frames FROM relay_body_tail WHERE body_id = ?", id,
+			).toArray()[0];
+			if (!row || (row.byte_length < bytes && row.frames < frames)) dirty.delete(id);
+			else over.push({ id, base: row.base_sequence });
+		}
+		return over.sort((left, right) => left.base - right.base).slice(0, limit).map((entry) => entry.id);
 	}
 
 	/** Records a lazily materialised hash on the catalog event it describes, only if still unknown. */
@@ -457,20 +483,45 @@ export class RelayBodyStore {
 	 * and before a semantic reset. Also raises the clock to the journal head so
 	 * pruning can never free a sequence. Returns bodies coalesced and rows written.
 	 */
-	coalesceLeanCatalog(options: { bodyId?: string; limit?: number } = {}): { bodies: number; rowsWritten: number } {
-		if (!this.store.leanRows) return { bodies: 0, rowsWritten: 0 };
+	coalesceLeanCatalog(options: { bodyId?: string; limit?: number } = {}): { bodies: number; rowsWritten: number; more: boolean } {
+		if (!this.store.leanRows) return { bodies: 0, rowsWritten: 0, more: false };
 		let bodies = 0;
 		let rowsWritten = 0;
-		this.storage.transactionSync(() => {
-			rowsWritten += this.store.syncLeanClock();
-			const pending = this.storage.sql.exec<{ document_id: string; generation: number; semantic_epoch: number }>(
-				`SELECT h.document_id, h.generation, h.semantic_epoch FROM vault_document_heads h
-				  WHERE h.document_id <> 'root' ${options.bodyId !== undefined ? "AND h.document_id = ?" : ""}
+		const limit = options.limit ?? 100;
+		// b3-a1fix (A1): a warm runtime seeks only the heads noted dirty since its last
+		// full scan (primary-key seek each) instead of scanning every head per alarm.
+		const dirty = options.bodyId === undefined ? this.store.leanHeadsDirty : null;
+		const taken: string[] = [];
+		if (dirty !== null) {
+			for (const id of dirty) {
+				if (taken.length >= LEAN_COALESCE_DIRTY_PER_PASS) break;
+				taken.push(id);
+			}
+		}
+		const headSql = (byId: boolean) => `SELECT h.document_id, h.generation, h.semantic_epoch FROM vault_document_heads h
+				  WHERE h.document_id <> 'root' ${byId ? "AND h.document_id = ?" : ""}
 				    AND h.latest_sequence > COALESCE(
 				      (SELECT MAX(c.sequence) FROM vault_catalog_events c WHERE c.body_id = h.document_id), 9007199254740991)
-				  LIMIT ?`,
-				...(options.bodyId !== undefined ? [options.bodyId] : []), options.limit ?? 100,
-			).toArray();
+				  LIMIT ?`;
+		let scanned = 0;
+		try {
+		this.storage.transactionSync(() => {
+			rowsWritten += this.store.syncLeanClock();
+			type PendingHead = { document_id: string; generation: number; semantic_epoch: number };
+			let pending: PendingHead[];
+			if (options.bodyId !== undefined) {
+				pending = this.storage.sql.exec<PendingHead>(headSql(true), options.bodyId, limit).toArray();
+			} else if (dirty !== null) {
+				pending = [];
+				for (const id of taken) {
+					if (pending.length >= limit) break;
+					dirty.delete(id);
+					pending.push(...this.storage.sql.exec<PendingHead>(headSql(true), id, 1).toArray());
+				}
+			} else {
+				pending = this.storage.sql.exec<PendingHead>(headSql(false), limit).toArray();
+				scanned = pending.length;
+			}
 			for (const head of pending) {
 				const catalog = this.storage.sql.exec<{ file_id: string; path: string; lifecycle: string }>(
 					"SELECT file_id, path, lifecycle FROM vault_catalog_events WHERE body_id = ? ORDER BY sequence DESC LIMIT 1",
@@ -505,7 +556,15 @@ export class RelayBodyStore {
 				bodies++;
 			}
 		});
-		return { bodies, rowsWritten };
+		} catch (error) {
+			// Rolled back: the taken ids stay owed.
+			if (dirty !== null) for (const id of taken) dirty.add(id);
+			throw error;
+		}
+		// Cold full scan that found fewer than `limit` heads: every pending head was
+		// coalesced, so this runtime is warm from here on.
+		if (options.bodyId === undefined && dirty === null && scanned < limit) this.store.leanHeadsDirty = new Set();
+		return { bodies, rowsWritten, more: dirty !== null && dirty.size > 0 };
 	}
 
 	private ensureLeaseTable(): void {

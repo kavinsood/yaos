@@ -1718,7 +1718,7 @@ export class RelayBodyService {
 				const coalesced = this.options.relayStore().coalesceLeanCatalog({ limit: 200 });
 				this.counters.leanCatalogEvents += coalesced.bodies;
 				this.counters.leanCoalesceRowsWritten += coalesced.rowsWritten;
-				if (coalesced.bodies >= 200) retry = true;
+				if (coalesced.bodies >= 200 || coalesced.more) retry = true;
 			} catch (error) {
 				retry = true;
 				coalesceFailed = true;
