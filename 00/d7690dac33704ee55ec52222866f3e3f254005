@@ -1,0 +1,23 @@
+server/src/recoveryAuthorityStore.ts
+  s_870afe9a19f5b7::t_6b66e22ae3168d 1800-1832
+server/src/server.ts
+  s_870afe9a19f5b7::t_64a6f7d4ec2434 261-269,329-331,586,1003,1017-1029,1132-1144,1154,1157-1162,1164-1187,1921-1924
+tests/server/recovery-projection-idle.ts
+  s_870afe9a19f5b7::t_d37160ad2a067f 131-132,158,179,189,194,206,213,231,237,752-827
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "00d7690dac33704ee55ec52222866f3e3f254005",
+  "prompts": {},
+  "sessions": {
+    "s_870afe9a19f5b7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a38341bee0d04eefc",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
