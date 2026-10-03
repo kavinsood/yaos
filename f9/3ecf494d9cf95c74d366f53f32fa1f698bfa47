@@ -1,0 +1,29 @@
+scripts/b3ckpt/memloop.ts
+  s_195fd92da5b147::t_f2e164a7c0df19 1-35
+scripts/b3ckpt/memprobe.ts
+  s_195fd92da5b147::t_cd5a350fb1baa1 1-44
+server/src/relayBodies.ts
+  s_195fd92da5b147::t_e0a206b4f6a268 304-307,428-429,445,531-533,584,973,1323-1325,1492,1695,1728-1777,1841
+server/src/relayBodyStore.ts
+  s_195fd92da5b147::t_f7c0d1f5c55bae 420-421,428-429,431-434,445
+server/src/relayFlag.ts
+  s_195fd92da5b147::t_002f09fb9547e1 35-36,96-106,147-148,213-214
+server/src/server.ts
+  s_195fd92da5b147::t_11f9d45db6b289 334-335,609-619
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "f93ecf494d9cf95c74d366f53f32fa1f698bfa47",
+  "prompts": {},
+  "sessions": {
+    "s_195fd92da5b147": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ac60493b6f950b4b4",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
