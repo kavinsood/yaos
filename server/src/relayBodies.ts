@@ -64,6 +64,19 @@ export interface RelaySocketHost {
 
 /** v3: tail frames that trigger a checkpoint regardless of bytes. */
 export const RELAY_GC_TAIL_MAX_FRAMES = 512;
+/**
+ * b3-a1fix: a full checkpoint whose byte-merged state is over this size is
+ * re-encoded through a GC'd ywasm document before it is written. Byte merges
+ * (mergeUpdates) keep the content of deleted items, so a whole-text rewrite
+ * grew the checkpoint by the full note size on every save (measured A1: the
+ * 50 KB note passed exactMergeBytes by save ~6, then every save rewrote a
+ * multi-chunk checkpoint). The re-encode keeps every CRDT identity and the
+ * state vector (deleted items become ContentDeleted, as in any gc:true Y.Doc);
+ * it is not a semantic reset and needs no client fence.
+ */
+export const RELAY_GC_COMPACT_MIN_BYTES = 128 * 1024;
+/** Upper bound for the in-checkpoint GC re-encode (wasm decode cost is linear in input). */
+export const RELAY_GC_COMPACT_MAX_BYTES = 4 * 1024 * 1024;
 
 type GroupFlushReason = "idle" | "max" | "bytes" | "forced" | "read";
 
@@ -220,6 +233,9 @@ export interface RelayCounters {
 	leanCatalogEvents: number;
 	/** Full checkpoints written from the in-memory merged bytes (no SQLite read, no wasm merge). */
 	checkpointsFromCache: number;
+	/** b3-a1fix: full checkpoints re-encoded through a GC'd document, and the bytes that dropped. */
+	checkpointGcCompactions: number;
+	checkpointGcBytesDropped: number;
 	leanCoalesceRowsWritten: number;
 	/** v3: group commits (one transaction each) and the frames they covered. */
 	groupCommits: number;
@@ -414,7 +430,7 @@ export class RelayBodyService {
 		mergeBudgetRejects: 0, unmergedStep2Replies: 0, lazyHashSkips: 0, lazyHashCacheHits: 0, authorityDrops: 0,
 		batchDuplicateCandidates: 0, residentStaleSkips: 0, floorAdvances: 0, floorRowsPruned: 0,
 		updateFrames: 0, frameErrors: 0, postCommitErrors: 0, bodyInactiveCloses: 0, tooLargeCloses: 0,
-		leanCatalogEvents: 0, leanCoalesceRowsWritten: 0, checkpointsFromCache: 0,
+		leanCatalogEvents: 0, leanCoalesceRowsWritten: 0, checkpointsFromCache: 0, checkpointGcCompactions: 0, checkpointGcBytesDropped: 0,
 		groupCommits: 0, groupFrames: 0, groupFlushIdle: 0, groupFlushMax: 0, groupFlushBytes: 0, groupFlushForced: 0,
 		groupBroadcasts: 0, groupDropped: 0, groupFlushDedupes: 0, tailCheckpoints: 0, tailJournalFallbacks: 0,
 		pendingReplayFrames: 0, wakeResyncs: 0, wakeResyncSockets: 0, groupFlushReads: 0, failedSocketDrops: 0,
@@ -1650,6 +1666,7 @@ export class RelayBodyService {
 		}
 		if (durable.tailEntries === 0) return null;
 		const partial = throughSequence < head.latestSequence;
+		if (!partial) durable = { ...durable, bytes: this.gcCompacted(durable.bytes) };
 		const written = partial
 			? this.options.store().writeRelayCheckpointThrough(bodyId, durable.bytes, {
 				throughSequence, generation: durable.generation, semanticEpoch: head.semanticEpoch })
@@ -1675,6 +1692,24 @@ export class RelayBodyService {
 		}
 		return { rowsWritten: written.rowsWritten, ms, tailEntries: durable.tailEntries,
 			bytes: durable.bytes.byteLength, partial };
+	}
+
+	/** Drops deleted-item content from a byte-merged state (same identities, same state vector); never throws. */
+	private gcCompacted(bytes: Uint8Array): Uint8Array {
+		if (bytes.byteLength <= RELAY_GC_COMPACT_MIN_BYTES || bytes.byteLength > RELAY_GC_COMPACT_MAX_BYTES) return bytes;
+		let doc: ReturnType<typeof crdtEngine.openDocument> | null = null;
+		try {
+			doc = crdtEngine.openDocument("relay-checkpoint-gc", bytes);
+			const compacted = crdtEngine.encodeStateAsUpdate(doc);
+			if (compacted.byteLength >= bytes.byteLength) return bytes;
+			this.counters.checkpointGcCompactions++;
+			this.counters.checkpointGcBytesDropped += bytes.byteLength - compacted.byteLength;
+			return compacted;
+		} catch {
+			return bytes;
+		} finally {
+			if (doc) crdtEngine.destroyDocument(doc);
+		}
 	}
 
 	private overBudgetMarkers(): Map<string, number> {

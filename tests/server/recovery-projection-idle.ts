@@ -121,6 +121,8 @@ interface World {
 	createNotes(batch: string, notes: Array<{ name: string; text: string }>): Promise<void>;
 	/** Relay v3: appends `suffix` to a note through a group commit (tail row + head; no journal, no catalog event). */
 	groupCommit(name: string, before: string, suffix: string, unknownHash?: boolean): string;
+	/** Relay v3: whole-text rewrite (delete all + insert `next`, the A1 autosave shape) through a group commit. */
+	rewriteCommit(name: string, next: string, unknownHash?: boolean): void;
 	advanceTo(target: number): Promise<void>;
 	settle(): Promise<void>;
 	indexed(): Set<string>;
@@ -216,6 +218,17 @@ async function withWorld(mode: Mode, check: (world: World) => Promise<void>): Pr
 					update: Y.encodeStateAsUpdate(doc, vector), lastActor: OWNER,
 					catalogContent: unknownHash ? null : { contentHash: hashOf(after), size: sizeOf(after) }, receipts: [], receiptTtlMs: 60_000 });
 				return after;
+			},
+			rewriteCommit: (name, next, unknownHash = false) => {
+				const relayStore = (world.vault as unknown as { relayStore: RelayBodyStore | null }).relayStore;
+				assert.ok(relayStore, "relay v3 store");
+				const doc = docs.get(name)!;
+				const vector = Y.encodeStateVector(doc);
+				doc.transact(() => { const text = doc.getText("body"); text.delete(0, text.length); text.insert(0, next); });
+				const store = (world.vault as unknown as { store: VaultStore }).store;
+				relayStore.appendRelayGroupCommit({ bodyId: `body-${name}`, expectedEpoch: store.documentHead(`body-${name}`)!.semanticEpoch,
+					update: Y.encodeStateAsUpdate(doc, vector), lastActor: OWNER,
+					catalogContent: unknownHash ? null : { contentHash: hashOf(next), size: sizeOf(next) }, receipts: [], receiptTtlMs: 60_000 });
 			},
 			settle,
 			advanceTo: async (target) => {
@@ -747,6 +760,37 @@ s.test("[relay v3] a large-state note with an unknown hash still gets projected 
 		});
 		await assert.rejects(forged.downloadRestoreItemVerified("22222222-2222-4222-8222-222222222222", { ...item, contentHash: "d".repeat(64) }),
 			/identity mismatch/, "an object served for another identity fails closed");
+	});
+});
+
+s.test("[relay v3] A1 whole-text rewrites: the checkpoint drops deleted content and stays near the note size (b3-a1fix)", async () => {
+	await withWorld("relay v3", async (world) => {
+		const version = (v: number) => Array.from({ length: 1000 }, (_, i) => `{"id":"el-${i}","x":${(i * 17 + v * 13) % 2000},"v":${v}}`).join("\n") + "\n";
+		await world.createNotes("seed", [{ name: "drawing", text: version(0) }]);
+		await world.advanceTo(Date.now() + 10 * 60_000);
+		const noteBytes = sizeOf(version(0));
+		const checkpointBytes = () => world.vaultSqlite.sql.exec<{ bytes: number }>(
+			"SELECT total_byte_length AS bytes FROM vault_checkpoint_manifests WHERE document_id = ? ORDER BY checkpoint_sequence DESC LIMIT 1",
+			"body-drawing").toArray()[0]?.bytes ?? 0;
+		let peak = 0;
+		for (let save = 1; save <= 12; save++) {
+			world.rewriteCommit("drawing", version(save), true);
+			if (save % 2 === 0) { await world.advanceTo(Date.now() + 10 * 60_000); peak = Math.max(peak, checkpointBytes()); }
+		}
+		assert.ok(peak > 0, "the tail was checkpointed");
+		// Without the GC re-encode a byte merge keeps every deleted version: ~12 x note size by save 12.
+		assert.ok(peak < 3 * noteBytes, `checkpoint stays near the note size (peak ${peak} B, note ${noteBytes} B)`);
+		const store = (world.vault as unknown as { store: VaultStore }).store;
+		const head = store.documentHead("body-drawing")!;
+		const merged = store.durableMergedBytes("body-drawing", head.latestSequence, 9 * 1024 * 1024);
+		const doc = new Y.Doc();
+		Y.applyUpdate(doc, merged.bytes);
+		assert.equal(doc.getText("body").toString(), version(12), "the compacted checkpoint holds the latest text");
+		doc.destroy();
+		const revision = recoveryRevisionIdentity("body-drawing", head.generation, head.latestSequence);
+		const object = world.stateObject(revision);
+		assert.ok(object, "R2 holds the latest revision");
+		assert.equal(new TextDecoder().decode((await decodeRecoveryStateObject(object)).plain), version(12));
 	});
 });
 
