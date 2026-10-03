@@ -1285,6 +1285,143 @@ s.test("row accounting: v2 lean vs v3 (statements x index entries, CF-style)", a
 });
 
 // ---------------------------------------------------------------------------
+// b3-ckpt: checkpoint hysteresis + memory bound for large whole-note rewrites.
+// ---------------------------------------------------------------------------
+
+function rewriteText(seed: number, bytes: number): string {
+	const random = seeded(seed);
+	let out = "";
+	while (out.length < bytes) out += String.fromCharCode(97 + Math.floor(random() * 26));
+	return out;
+}
+
+interface RewriteRun { rows: number; saves: number; checkpoints: number; deferred: number; hashUnknown: number;
+	hashAccepted: number; compactions: number; mergedBytes: number | null; wasmGrowth: number }
+
+async function rewrites(config: Partial<RelayConfig>, saves: number, noteBytes = 50_000): Promise<RewriteRun> {
+	let result!: RewriteRun;
+	await withRelay(({ store, relay, socket, update, envelope, seed, claim, meter, clock }) => {
+		const origin = socket();
+		socket(peer);
+		const wasmBefore = (relay.diagnostics().ywasmLinearMemoryBytes as number | null) ?? 0;
+		meter.reset();
+		meter.on = true;
+		for (let index = 0; index < saves; index++) {
+			clock.now += 5_000; // A1 cadence; also refills the per-socket byte bucket
+			const text = rewriteText(index + 1, noteBytes);
+			const bytes = textUpdate(seed, (value) => { value.delete(0, value.length); value.insert(0, text); });
+			envelope(origin, bytes, { ...claim(seed), candidateId: `rw-${index}`, candidateDigest: `rw-${index}` });
+			update(origin, bytes);
+			relay.flushBatch(BODY);
+		}
+		meter.on = false;
+		const got = reconstructedText(store), want = seed.getText("body").toString();
+		assert.ok(got === want, `rewrites reconstruct exactly (${JSON.stringify(config)}: ${got.length} vs ${want.length}, ${got.slice(0, 12)} vs ${want.slice(0, 12)})`);
+		const body = (relay.diagnostics().bodies as Array<{ bodyId: string; mergedBytes: number | null }>).find((entry) => entry.bodyId === BODY);
+		const wasmAfter = (relay.diagnostics().ywasmLinearMemoryBytes as number | null) ?? 0;
+		result = { rows: meter.rows, saves, checkpoints: relay.counters.checkpoints, deferred: relay.counters.tailCheckpointsDeferred,
+			hashUnknown: relay.counters.hashUnknown, hashAccepted: relay.counters.hashAccepted,
+			compactions: relay.counters.mergedGcCompactions, mergedBytes: body?.mergedBytes ?? null, wasmGrowth: wasmAfter - wasmBefore };
+	}, config);
+	return result;
+}
+
+s.test("ckpt: 50 KB whole rewrites checkpoint every >= 10 saves (hysteresis) and stay hash-exact", async () => {
+	const saves = 40;
+	const old = await rewrites({ gcTailRatio: 0 }, saves);
+	const tuned = await rewrites({}, saves);
+	const line = (name: string, run: RewriteRun) => console.log(`[relay3-ckpt] ${name}: ${run.saves} saves, rows ${run.rows} `
+		+ `(${(run.rows / run.saves).toFixed(2)}/save), checkpoints ${run.checkpoints}, deferred ${run.deferred}, hash `
+		+ `${run.hashAccepted}/${run.hashAccepted + run.hashUnknown}, gc ${run.compactions}, merged ${run.mergedBytes} B, wasm +${run.wasmGrowth} B`);
+	line("old trigger (64 KiB tail)", old);
+	line("hysteresis (16x checkpoint, 768 KiB cap)", tuned);
+	assert.ok(old.checkpoints >= saves / 3, `the old trigger checkpoints about every 2 saves (${old.checkpoints})`);
+	assert.ok(tuned.checkpoints <= saves / 10, `hysteresis checkpoints at most every 10 saves (${tuned.checkpoints})`);
+	assert.ok(tuned.checkpoints >= 1, "the cap still checkpoints");
+	assert.ok(tuned.deferred > 0, "deferrals are counted");
+	assert.ok(tuned.rows / saves < 4.5, `rows/save ${tuned.rows / saves} < 4.5`);
+	assert.ok(tuned.rows < old.rows * 0.7, `hysteresis writes fewer rows (${tuned.rows} vs ${old.rows})`);
+	assert.equal(tuned.hashUnknown, 0, "every content-hash claim stays accepted (exact merge window kept)");
+	assert.ok(tuned.compactions > 0, "the in-memory GC compaction ran");
+	assert.ok(tuned.mergedBytes !== null && tuned.mergedBytes <= DEFAULT_RELAY_CONFIG.exactMergeBytes,
+		`merged bytes stay in the exact window (${tuned.mergedBytes})`);
+	assert.ok(tuned.wasmGrowth < 16 * 1024 * 1024, `wasm linear memory growth bounded (${tuned.wasmGrowth})`);
+});
+
+s.test("ckpt: small-edit typing keeps the old checkpoint cadence (frame cap / 64 KiB), alarm pass defers big tails only", async () => {
+	const typing = async (config: Partial<RelayConfig>) => {
+		let checkpoints = 0, deferred = 0;
+		await withRelay(({ store, relay, socket, update, seed }) => {
+			const origin = socket();
+			for (let index = 0; index < 1200; index++) {
+				update(origin, textUpdate(seed, (text) => text.insert(text.length, "k")));
+				relay.flushBatch(BODY);
+			}
+			assert.equal(reconstructedText(store), seed.getText("body").toString());
+			checkpoints = relay.counters.checkpoints;
+			deferred = relay.counters.tailCheckpointsDeferred;
+		}, config);
+		return { checkpoints, deferred };
+	};
+	const old = await typing({ gcTailRatio: 0 });
+	const tuned = await typing({});
+	console.log(`[relay3-ckpt] typing 1200 commits: old ${old.checkpoints} checkpoints, hysteresis ${tuned.checkpoints} (deferred ${tuned.deferred})`);
+	assert.ok(old.checkpoints >= 2);
+	assert.equal(tuned.checkpoints, old.checkpoints, "typing cadence unchanged");
+	assert.equal(tuned.deferred, 0, "small tails never reach the deferral path");
+	// The alarm pass leaves a big-but-under-threshold tail alone, and takes it with the old policy.
+	for (const [config, expectTail] of [[{}, true], [{ gcTailRatio: 0 }, false]] as const) {
+		await withRelay(({ relay, socket, update, seed, tail, clock }) => {
+			const origin = socket();
+			// Prime: one rewrite + checkpoint, so the checkpoint is ~30 KB (threshold 16x that).
+			update(origin, textUpdate(seed, (value) => { value.delete(0, value.length); value.insert(0, rewriteText(99, 30_000)); }));
+			relay.flushBatch(BODY);
+			relay.checkpointTail(BODY);
+			for (let index = 0; index < 3; index++) {
+				clock.now += 5_000;
+				const text = rewriteText(100 + index, 30_000);
+				update(origin, textUpdate(seed, (value) => { value.delete(0, value.length); value.insert(0, text); }));
+				relay.flushBatch(BODY);
+			}
+			const before = relay.counters.checkpoints;
+			if (expectTail) assert.ok(tail() !== null && tail()!.byteLength > relay.config.gcTailBytes,
+				`tail is over the soft cap (${tail()?.byteLength}, deferred ${relay.counters.tailCheckpointsDeferred})`);
+			relay.runCheckpointPass({ retainSequences: 1000 });
+			if (expectTail) {
+				assert.ok(tail() !== null, "the alarm pass defers a tail under the hysteresis threshold");
+				assert.equal(relay.counters.checkpoints, before);
+			} else {
+				assert.equal(tail(), null, "the old policy checkpoints it");
+			}
+		}, config);
+	}
+});
+
+s.test("ckpt: a cold rebuild over a large rewrite tail compacts back into the exact window", async () => {
+	await withRelay(({ store, relay, socket, update, envelope, seed, claim, freshRelay, clock }) => {
+		const origin = socket();
+		for (let index = 0; index < 8; index++) {
+			clock.now += 5_000;
+			const text = rewriteText(200 + index, 50_000);
+			update(origin, textUpdate(seed, (value) => { value.delete(0, value.length); value.insert(0, text); }));
+			relay.flushBatch(BODY);
+		}
+		clock.now += 5_000;
+		const cold = freshRelay("runtime-cold");
+		const bytes = textUpdate(seed, (value) => value.insert(0, "z"));
+		envelope(origin, bytes, { ...claim(seed), candidateId: "cold-1", candidateDigest: "cold-1" }, cold);
+		update(origin, bytes, cold);
+		cold.flushBatch(BODY);
+		assert.equal(cold.counters.hashUnknown, 0, "hash claim accepted after a cold rebuild");
+		assert.ok(cold.counters.mergedGcCompactions >= 1, "the rebuild compacted the merged state");
+		const body = (cold.diagnostics().bodies as Array<{ bodyId: string; mergedBytes: number | null }>).find((entry) => entry.bodyId === BODY);
+		assert.ok(body?.mergedBytes != null && body.mergedBytes <= DEFAULT_RELAY_CONFIG.exactMergeBytes, `merged ${body?.mergedBytes}`);
+		assert.equal(reconstructedText(store), seed.getText("body").toString());
+	});
+});
+
+
+// ---------------------------------------------------------------------------
 // Durable Object: the test-only relay-crash route.
 // ---------------------------------------------------------------------------
 
