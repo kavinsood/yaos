@@ -571,8 +571,10 @@ export class VaultBootstrapStore extends VaultCatalogStore {
 			progress: number;
 		}>("SELECT * FROM vault_history_pins").toArray().map((row) => this.mapPin(row));
 		const active = pins.filter((pin) => pin.softExpiresAt > now && pin.hardExpiresAt > now);
-		const retainedByPin = this.retainedCheckpointBytesByPin(now);
-		const retainedCheckpointBytes = this.retainedCheckpointBytes(now);
+		// b3-a1fix: both aggregates join every checkpoint in the vault (~2 reads per note per
+		// recovery/status call, measured 42k at 10.5k notes); with no active pin both are empty.
+		const retainedByPin = active.length > 0 ? this.retainedCheckpointBytesByPin(now) : new Map<string, number>();
+		const retainedCheckpointBytes = active.length > 0 ? this.retainedCheckpointBytes(now) : 0;
 		return {
 			active: active.length,
 			softExpired: pins.filter((pin) => pin.softExpiresAt <= now && pin.hardExpiresAt > now).length,

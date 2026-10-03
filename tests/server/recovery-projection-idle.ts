@@ -813,6 +813,29 @@ s.test("[relay v3] A1 whole-text rewrites: the checkpoint drops deleted content 
 	});
 });
 
+s.test("recovery/status with no active pin reads no checkpoint aggregate and no catalog count (EXPLAIN QUERY PLAN, b3-a1fix)", async () => {
+	await withWorld("relay v3", async (world) => {
+		await world.createNotes("seed", Array.from({ length: 30 }, (_, i) => ({ name: `status-${i}`, text: note(i) })));
+		await world.advanceTo(Date.now() + 10 * 60_000);
+		const recovery = (world.vault as unknown as { recovery: { getRecoveryStatus(input: { vaultId: string }): Promise<unknown> } }).recovery;
+		await recovery.getRecoveryStatus({ vaultId: VAULT_ID });
+		world.vaultStats.log = [];
+		const status = await recovery.getRecoveryStatus({ vaultId: VAULT_ID }) as { recoveryReady: boolean; projection: { state: string } };
+		const log = world.vaultStats.log; world.vaultStats.log = null;
+		assert.equal(status.recoveryReady, true);
+		assert.equal(status.projection.state, "ready");
+		const offending: string[] = [];
+		for (const entry of log) {
+			if (!/^\s*(SELECT|WITH)/i.test(entry.query)) continue;
+			const detail = world.vaultSqlite.sql.exec<{ detail: string }>(`EXPLAIN QUERY PLAN ${entry.query}`, ...(entry.bindings as never[]))
+				.toArray().map((row) => row.detail).join(" | ");
+			if (/SCAN (vault_checkpoints|vault_checkpoint_manifests|vault_catalog_events|vault_document_heads|vault_journal|c|m|h|catalog|checkpoint|manifest)\b/.test(detail)
+				&& !/CO-ROUTINE (c|checkpoint)\b/.test(detail)) offending.push(`${detail} :: ${entry.query.replace(/\s+/g, " ").slice(0, 120)}`);
+		}
+		assert.deepEqual(offending, [], "a status poll is O(1) in the vault size");
+	});
+});
+
 s.test("A2: an isolate that dies mid-pass (put never returns) still owes the wake; a new runtime projects it, then idles", async () => {
 	await withWorld("base", async (world) => {
 		await world.createNotes("seed", NOTES.slice(0, 3));
