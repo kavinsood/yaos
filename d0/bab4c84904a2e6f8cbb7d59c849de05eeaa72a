@@ -1,0 +1,35 @@
+server/src/recoveryAuthorityStore.ts
+  s_870afe9a19f5b7::t_be805de0255fce 3,96-117,589-597,600,603,628-629,636-637,1222,1227-1244,1296-1298,1326-1333,1340-1344
+server/src/recoveryStateProjection.ts
+  s_870afe9a19f5b7::t_e4febea7b91819 95-96,118-119,179,197
+server/src/shared/recoveryStateObject.ts
+  s_870afe9a19f5b7::t_eb501d3e792649 42,44,47-52,58-59,68,80-81,84-85
+server/src/vaultDocumentStore.ts
+  s_870afe9a19f5b7::t_77ecc8b7a5ec21 1902-1926
+src/snapshots/recoveryClient.ts
+  s_b04c88f01f67f1::t_b5ba9cba400b33 814-828,832,845-846,1004-1007,1034-1035,1037-1049,1062
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "d0bab4c84904a2e6f8cbb7d59c849de05eeaa72a",
+  "prompts": {},
+  "sessions": {
+    "s_870afe9a19f5b7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a38341bee0d04eefc",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_b04c88f01f67f1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aa818e9484dac5aad",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
