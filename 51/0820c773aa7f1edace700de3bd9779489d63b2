@@ -1,0 +1,19 @@
+scripts/b3measure/bulkreads.ts
+  s_d97cfc4b0e65fc::t_66d4d8051c1d09 8
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "510820c773aa7f1edace700de3bd9779489d63b2",
+  "prompts": {},
+  "sessions": {
+    "s_d97cfc4b0e65fc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aa96b45067dee5884",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
