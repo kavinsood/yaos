@@ -1,0 +1,19 @@
+scripts/b3ckpt/gqlrestart.ts
+  s_d97cfc4b0e65fc::t_294a8476e00180 1-41
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a8ff06f03110524deea010379db4ac502d15e49e",
+  "prompts": {},
+  "sessions": {
+    "s_d97cfc4b0e65fc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aa96b45067dee5884",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
