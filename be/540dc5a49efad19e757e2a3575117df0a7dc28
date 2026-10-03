@@ -1,0 +1,31 @@
+scripts/b3measure/analyze.py
+  s_1a6b330a70102a::t_06ef3fce59db27 1-27
+scripts/b3measure/blobcpu.ts
+  s_1a6b330a70102a::t_e6a74f131fe93e 1-78
+scripts/b3measure/tailstats.py
+  s_1a6b330a70102a::t_a4c125e10bb84b 1-35
+scripts/relay2/bench.ts
+  s_1a6b330a70102a::t_3d2202796f5eef 24,40-41
+scripts/relay2/wb/mimport.ts
+  s_1a6b330a70102a::t_5ec0e213afe01f 1-168
+scripts/relay2/wb/realScenarios.ts
+  s_1a6b330a70102a::t_58d3a805b59467 21
+scripts/relay2/wb/scenarios.ts
+  s_1a6b330a70102a::t_d9083894011f07 80,88,105,122,154,172,205-209,238
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "be540dc5a49efad19e757e2a3575117df0a7dc28",
+  "prompts": {},
+  "sessions": {
+    "s_1a6b330a70102a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-afac0f449bc45c2f3",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
