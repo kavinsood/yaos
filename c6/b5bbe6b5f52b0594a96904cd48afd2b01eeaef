@@ -1,0 +1,33 @@
+scripts/b3clientblob/blobcheck.ts
+  s_d97cfc4b0e65fc::t_50f7107258cefe 1-19
+scripts/b3clientblob/heads.ts
+  s_d97cfc4b0e65fc::t_8cbefada9ffebe 1-9
+scripts/relay2/cf-cred.sh
+  s_d97cfc4b0e65fc::t_77ca0aa7b1d19e 1-3
+scripts/relay2/cf-token.mjs
+  s_d97cfc4b0e65fc::t_b5a7709a9deea9 1-21
+scripts/relay2/deploy.sh
+  s_d97cfc4b0e65fc::t_1c7e187a4fe299 25
+scripts/relay2/gql.ts
+  s_d97cfc4b0e65fc::t_03adda4289cbb8 13,17-18,23-24
+scripts/relay2/lib/run.ts
+  s_d97cfc4b0e65fc::t_2f0365f3b40595 4-5,242
+scripts/relay2/wb/mimport.ts
+  s_d97cfc4b0e65fc::t_5b5349997154f8 150-162,179-181
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c6b5bbe6b5f52b0594a96904cd48afd2b01eeaef",
+  "prompts": {},
+  "sessions": {
+    "s_d97cfc4b0e65fc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aa96b45067dee5884",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
