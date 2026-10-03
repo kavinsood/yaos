@@ -1,0 +1,21 @@
+server/src/vaultDocumentStore.ts
+  s_870afe9a19f5b7::t_c52129a78906fc 2303-2307,2310,2328,2337,2364,2373,2400,2427-2430
+tests/server/recovery-projection-idle.ts
+  s_870afe9a19f5b7::t_d3adfdc3199266 52,56,63,65,779-796
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "8b35eaae1320138dce04068933a8899cdb42f2f6",
+  "prompts": {},
+  "sessions": {
+    "s_870afe9a19f5b7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a38341bee0d04eefc",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
