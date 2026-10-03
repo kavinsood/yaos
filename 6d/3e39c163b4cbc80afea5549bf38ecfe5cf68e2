@@ -1,0 +1,31 @@
+scripts/relay2/b3/gqlclasses.ts
+  s_5dc6c4699a1c29::t_0aae6125eac486 1-52
+scripts/relay2/b3/r2list.ts
+  s_5dc6c4699a1c29::t_91f5c34bda36b1 1-37
+scripts/relay2/b3/rowsTimeline.ts
+  s_5dc6c4699a1c29::t_120e1e884dc340 1-81
+scripts/relay2/b3/scenarios.ts
+  s_5dc6c4699a1c29::t_a5b5ce17d18543 1-146
+scripts/relay2/bench.ts
+  s_5dc6c4699a1c29::t_caaf9da05abcf9 24,40-41
+scripts/relay2/gql.ts
+  s_5dc6c4699a1c29::t_cce283aceab3a0 24
+scripts/relay2/scenarios/extra.ts
+  s_5dc6c4699a1c29::t_9ab0cce948a31a 22,603-607,643,649,669-671,686-687
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "6d3e39c163b4cbc80afea5549bf38ecfe5cf68e2",
+  "prompts": {},
+  "sessions": {
+    "s_5dc6c4699a1c29": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a6a4263dca749353c",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
