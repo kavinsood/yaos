@@ -8,7 +8,8 @@
  *
  * The client turns either into one notice per reset window, a status-bar
  * state, and a long back-off (no retry loop against a server that cannot
- * write until 00:00 UTC). There is no queue or next-day scheduler: local
+ * write until 00:00 UTC; probes back off 2 min doubling to hourly, and the
+ * first successful write clears the state at once). There is no queue or next-day scheduler: local
  * edits stay in the local CRDT and sync normally when the limit resets.
  */
 import type { HttpRequester } from "../utils/http";
@@ -58,9 +59,34 @@ export function parseDailyLimitSignal(value: unknown, now: number): DailyLimitIn
 	};
 }
 
-/** Back-off target for one trip: the reset or one probe interval, whichever is first. */
-export function dailyLimitBackoffUntil(info: DailyLimitInfo, now: number): number {
-	return Math.min(info.resetAt, now + DAILY_LIMIT_MAX_BACKOFF_MS);
+/**
+ * First probe after a trip (b3-clientblob A4). The probe interval doubles per
+ * consecutive limited probe up to {@link DAILY_LIMIT_MAX_BACKOFF_MS}: 2, 4, 8,
+ * 16, 32, then 60 min. A limit lifted mid-day (Workers Paid, or a reset this
+ * clock did not expect) is noticed within one interval instead of up to an
+ * hour later; while still limited it costs five extra probes before the
+ * hourly cadence, each a rejected request (rows read, no rows written).
+ */
+export const DAILY_LIMIT_FIRST_PROBE_MS = 2 * 60 * 1000;
+
+/** Probe interval after `probeIndex` consecutive limited probes (0 = first trip). */
+export function dailyLimitProbeIntervalMs(probeIndex: number, firstProbeMs = DAILY_LIMIT_FIRST_PROBE_MS): number {
+	const exponent = Math.min(Math.max(0, Math.floor(probeIndex)), 20);
+	return Math.min(DAILY_LIMIT_MAX_BACKOFF_MS, firstProbeMs * 2 ** exponent);
+}
+
+/**
+ * Back-off target for one trip: the reset or the next probe, whichever is
+ * first. Without `probeIndex` the probe is the hourly one.
+ */
+export function dailyLimitBackoffUntil(
+	info: DailyLimitInfo,
+	now: number,
+	probeIndex?: number,
+	firstProbeMs = DAILY_LIMIT_FIRST_PROBE_MS,
+): number {
+	const interval = probeIndex === undefined ? DAILY_LIMIT_MAX_BACKOFF_MS : dailyLimitProbeIntervalMs(probeIndex, firstProbeMs);
+	return Math.min(info.resetAt, now + interval);
 }
 
 /**
