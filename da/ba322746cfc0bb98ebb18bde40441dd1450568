@@ -1,0 +1,19 @@
+tests/server/relay3-group-commit.ts
+  s_195fd92da5b147::t_196a39c5692739 1287-1423
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "daba322746cfc0bb98ebb18bde40441dd1450568",
+  "prompts": {},
+  "sessions": {
+    "s_195fd92da5b147": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ac60493b6f950b4b4",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
