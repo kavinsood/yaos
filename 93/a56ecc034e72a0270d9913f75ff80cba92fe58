@@ -1,0 +1,19 @@
+tests/server/recovery-projection-idle.ts
+  s_870afe9a19f5b7::t_0372dc72c1a06d 816-838
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "93a56ecc034e72a0270d9913f75ff80cba92fe58",
+  "prompts": {},
+  "sessions": {
+    "s_870afe9a19f5b7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a38341bee0d04eefc",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
