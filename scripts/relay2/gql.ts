@@ -21,7 +21,7 @@ const ACCOUNT = "261336883158b276696d7181091ba1a6";
 const CONFIG = `${process.env.HOME}/Library/Preferences/.wrangler/config/default.toml`;
 const WRANGLER = process.env.WRANGLER ?? "/Users/kavin/personal/obsidiansync/node_modules/.bin/wrangler";
 
-function token(): string {
+export function token(): string {
 	const read = () => {
 		const cfg = readFileSync(CONFIG, "utf8");
 		return { tok: cfg.match(/oauth_token\s*=\s*"([^"]+)"/)?.[1], exp: cfg.match(/expiration_time\s*=\s*"([^"]+)"/)?.[1] };
