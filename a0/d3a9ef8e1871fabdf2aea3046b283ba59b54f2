@@ -1,0 +1,19 @@
+scripts/b3ckpt/tailsum.mjs
+  s_195fd92da5b147::t_0511e8b9273fcf 1-35
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a0d3a9ef8e1871fabdf2aea3046b283ba59b54f2",
+  "prompts": {},
+  "sessions": {
+    "s_195fd92da5b147": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ac60493b6f950b4b4",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
