@@ -1,0 +1,21 @@
+server/src/server.ts
+  s_b04c88f01f67f1::t_d41e9eeeadfc76 1932-1967,1983-1984,2024-2029,2031-2034,2063-2070
+tests/server/daily-limit.ts
+  s_b04c88f01f67f1::t_b306b7d2de594e 230-256
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "add1985f552ec60849aa40dee689a54221aae43f",
+  "prompts": {},
+  "sessions": {
+    "s_b04c88f01f67f1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aa818e9484dac5aad",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
