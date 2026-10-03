@@ -49,16 +49,17 @@ const OWNER: VaultActorContext = {
 const realNow = Date.now;
 let clock = realNow();
 
-interface Counted { statements: number; written: number; reset(): void }
+interface Counted { statements: number; written: number; log: Array<{ query: string; bindings: unknown[] }> | null; reset(): void }
 
 /** Counts every SQL statement and Node-written row an actor issues. */
 function counted(sqlite: NodeSqliteStorage): { storage: NodeSqliteStorage; stats: Counted } {
-	const stats: Counted = { statements: 0, written: 0, reset() { this.statements = 0; this.written = 0; } };
+	const stats: Counted = { statements: 0, written: 0, log: null, reset() { this.statements = 0; this.written = 0; } };
 	const sql = new Proxy(sqlite.sql, {
 		get(target, property) {
 			if (property === "exec") {
 				return (query: string, ...bindings: unknown[]) => {
 					stats.statements++;
+					stats.log?.push({ query, bindings });
 					const cursor = target.exec(query, ...(bindings as never[]));
 					stats.written += cursor.rowsWritten;
 					return cursor;
@@ -822,6 +823,57 @@ s.test("A2: a maintenance step that throws does not starve the projection wake",
 		assert.ok(threw > 0);
 		assert.ok(world.indexed().has(hashOf(fresh.text)), "the wake ran despite the maintenance error");
 		store.reapExpiredRecoveryCaptures = reap;
+	});
+});
+
+s.test("A1: a warm relay v3 alarm pass seeks only changed heads and tails (EXPLAIN QUERY PLAN: no SCAN of heads or tails)", async () => {
+	await withWorld("relay v3", async (world) => {
+		const scale = NOTES.slice(0, 60);
+		await world.createNotes("seed", scale);
+		const plans = (log: Array<{ query: string; bindings: unknown[] }>) => {
+			const seen = new Map<string, string>();
+			for (const entry of log) {
+				if (seen.has(entry.query) || !/^\s*(SELECT|WITH|UPDATE|INSERT|DELETE)/i.test(entry.query)) continue;
+				const detail = world.vaultSqlite.sql.exec<{ detail: string }>(`EXPLAIN QUERY PLAN ${entry.query}`, ...(entry.bindings as never[]))
+					.toArray().map((row) => row.detail).join(" | ");
+				seen.set(entry.query, detail);
+			}
+			return seen;
+		};
+		const fullScan = /SCAN (h|vault_document_heads|relay_body_tail)\b/;
+		// Cold: the first alarm of this runtime does one full scan (and proves the detector sees it).
+		world.vaultStats.log = [];
+		await world.advanceTo(Date.now() + 10 * 60_000);
+		const cold = [...plans(world.vaultStats.log).values()].filter((detail) => fullScan.test(detail));
+		assert.ok(cold.length > 0, "the cold pass scans heads/tails once");
+		// Warm: two edits (one tail append, one more) and their wake.
+		let text = scale[3]!.text;
+		text = world.groupCommit(scale[3]!.name, text, " warm edit one");
+		const other = world.groupCommit(scale[7]!.name, scale[7]!.text, " warm edit two");
+		world.vaultStats.log = [];
+		await world.advanceTo(Date.now() + 10 * 60_000);
+		assert.ok(world.indexed().has(hashOf(text)) && world.indexed().has(hashOf(other)), "both edits projected");
+		const warm = plans(world.vaultStats.log);
+		const scans = [...warm.entries()].filter(([, detail]) => fullScan.test(detail));
+		if (process.env.A1FIX_PLANS) for (const [query, detail] of warm) if (/SCAN/.test(detail)) console.log("[warm-scan]", detail, "::", query.replace(/\s+/g, " ").slice(0, 160));
+		assert.deepEqual(scans.map(([query]) => query.replace(/\s+/g, " ").slice(0, 120)), [],
+			"no warm statement scans vault_document_heads or relay_body_tail");
+		const coalesce = [...warm.entries()].find(([query]) => /FROM vault_document_heads h/.test(query));
+		assert.ok(coalesce, "the warm pass ran the coalesce check");
+		assert.match(coalesce[1], /SEARCH h USING PRIMARY KEY \(document_id=\?\)/, coalesce[1]);
+		const tail = [...warm.entries()].find(([query]) => /SELECT base_sequence, byte_length, frames FROM relay_body_tail/.test(query));
+		assert.ok(tail, "the warm pass checked the appended tail rows");
+		assert.match(tail[1], /SEARCH relay_body_tail USING PRIMARY KEY \(body_id=\?\)/, tail[1]);
+		// The coalesced catalog events and the clock are what the cold scan would have produced.
+		const store = (world.vault as unknown as { store: VaultStore }).store;
+		const pending = world.vaultSqlite.sql.exec<{ count: number }>(`SELECT COUNT(*) AS count FROM vault_document_heads h
+			WHERE h.document_id <> 'root' AND h.latest_sequence > COALESCE(
+			  (SELECT MAX(c.sequence) FROM vault_catalog_events c WHERE c.body_id = h.document_id), 9007199254740991)`).one().count;
+		assert.equal(pending, 0, "no head is left ahead of its catalog event");
+		const truth = world.vaultSqlite.sql.exec<{ sequence: number }>(`SELECT MAX((SELECT sequence FROM vault_clock WHERE id = 1),
+			(SELECT COALESCE(MAX(sequence), 0) FROM vault_journal), (SELECT COALESCE(MAX(latest_sequence), 0) FROM relay_body_tail)) AS sequence`).one().sequence;
+		assert.equal(store.currentSequence(), truth, "the cached tail head gives the scanned clock value");
+		world.vaultStats.log = null;
 	});
 });
 
