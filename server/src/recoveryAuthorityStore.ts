@@ -1,5 +1,6 @@
 import { canonicalJsonText } from "./recoveryCanonicalJson";
 import { DEFAULT_SOFT_TTL_MS, VaultBootstrapStore } from "./vaultBootstrapStore";
+import { sha256HexSync } from "./vaultDocumentStore";
 import type { BodyLifecycle } from "./vaultCatalogStore";
 
 export type RecoveryReason = "initial" | "daily" | "manual" | "pre-bulk-operation";
@@ -92,7 +93,28 @@ export interface RecoveryStateCursor { source: number; sequence: number; id: str
 export interface RecoveryStateProjectionState {
 	watermark: number; target: number | null; cursor: RecoveryStateCursor | null; pending: string[];
 }
-export interface RecoveryStateHead { kind: "markdown" | "canvas"; generation: number; contentHash: string; size: number }
+/**
+ * `revision`: the head's plaintext hash is unknown (relay v3: no accepted client
+ * claim, e.g. a large rewritten body), so `contentHash` is the revision identity
+ * (`recoveryRevisionIdentity`) and `size` is 0. See `stateIdentityAt`.
+ */
+export interface RecoveryStateHead { kind: "markdown" | "canvas"; generation: number; contentHash: string; size: number; revision: boolean }
+
+const identityEncoder = new TextEncoder();
+
+/**
+ * b3-a1fix: the content identity of a body revision whose plaintext hash is not
+ * known. Derived from the body id, generation and the sequence of its newest
+ * stored update at the boundary (`documentContentSequenceAt`), so projection,
+ * capture planning, capture fallback and GC liveness all compute the same value
+ * from catalog/head rows without reading or decoding content (P2). It is shaped
+ * like a sha256 hex so the content index, object keys, manifests, GC and purge
+ * are unchanged; the state object carries `identity: "revision"` so the client
+ * binds the object to it instead of checking the plaintext hash.
+ */
+export function recoveryRevisionIdentity(documentId: string, generation: number, contentSequence: number): string {
+	return sha256HexSync(identityEncoder.encode(`yaos-recovery-revision/v1\u0000${documentId}\u0000${generation}\u0000${contentSequence}`));
+}
 
 function concatenate(parts: readonly Uint8Array[]): Uint8Array {
 	if (parts.length === 1) return parts[0]!;
@@ -564,13 +586,21 @@ export class RecoveryAuthorityStore extends VaultBootstrapStore {
 			 ) SELECT item_kind, identity, file_id, path, generation, content_hash, size FROM active_documents
 			 WHERE path > ? ORDER BY path, identity LIMIT ?`, capture.boundarySequence, capture.boundarySequence, after, bounded).toArray();
 			return rows.map((row): CapturePlanEntry => {
-				if (!row.content_hash || row.size === null) throw new Error("catalog entry is missing durable content identity");
+				// b3-a1fix: Markdown heads go through the lean/relay-tail overlay (the same
+				// head `captureStateHead` and the projection resolve), and a head without a
+				// known plaintext hash gets its revision identity instead of failing the plan.
+				const overlaid = row.item_kind === "active" && this.leanRows
+					? this.getCatalogHeadAt(capture.boundarySequence, row.identity) : null;
+				const head = overlaid && overlaid.lifecycle === "active"
+					? { generation: overlaid.generation, contentHash: overlaid.contentHash, size: overlaid.size }
+					: { generation: row.generation, contentHash: row.content_hash || null, size: row.size };
+				const identity = this.stateIdentityAt(row.identity, head, capture.boundarySequence);
 				return row.item_kind === "canvas"
 					? { kind: "canvas", documentId: row.identity, fileId: row.file_id, canonicalPath: row.path,
-						generation: row.generation, contentHash: row.content_hash, size: row.size,
+						generation: head.generation, contentHash: identity.contentHash, size: identity.size,
 						format: "json-canvas", formatVersion: 1 }
 					: { kind: "active", bodyId: row.identity, fileId: row.file_id, canonicalPath: row.path,
-						generation: row.generation, contentHash: row.content_hash, size: row.size };
+						generation: head.generation, contentHash: identity.contentHash, size: identity.size };
 			});
 		}
 		const orderColumn = "body_id";
@@ -595,15 +625,16 @@ export class RecoveryAuthorityStore extends VaultBootstrapStore {
 			bounded,
 		).toArray();
 		return rows.flatMap((row): CapturePlanEntry[] => {
-			if (row.content_hash === null || row.size === null) throw new Error("catalog entry is missing durable content identity");
+			const identity = this.stateIdentityAt(row.body_id,
+				{ generation: row.generation, contentHash: row.content_hash, size: row.size }, capture.boundarySequence);
 			return [{
 				kind: "deleted",
 				bodyId: row.body_id,
 				fileId: row.file_id,
 				lastPath: row.path,
 				generation: row.generation,
-				baselineContentHash: row.content_hash,
-				baselineSize: row.size,
+				baselineContentHash: identity.contentHash,
+				baselineSize: identity.size,
 				bodyReaped: row.lifecycle === "reaped",
 				deletedAtSequence: row.sequence,
 			}];
@@ -1188,13 +1219,29 @@ export class RecoveryAuthorityStore extends VaultBootstrapStore {
 	 * active or tombstoned with a content identity. "pending" when the head is
 	 * active but its content hash is not yet known (relay v3 before acceptance).
 	 */
-	recoveryStateHead(documentId: string, boundary: number): RecoveryStateHead | "pending" | null {
+	recoveryStateHead(documentId: string, boundary: number): RecoveryStateHead | null {
 		this.initialize();
 		const markdown = this.getCatalogHeadAt(boundary, documentId);
 		const head = markdown ?? this.semanticHeadAt(boundary, documentId);
 		if (!head || (head.lifecycle !== "active" && head.lifecycle !== "tombstoned")) return null;
-		if (head.contentHash === null || head.size === null) return head.lifecycle === "active" ? "pending" : null;
-		return { kind: markdown ? "markdown" : "canvas", generation: head.generation, contentHash: head.contentHash, size: head.size };
+		return { kind: markdown ? "markdown" : "canvas", generation: head.generation,
+			...this.stateIdentityAt(documentId, head, boundary) };
+	}
+
+	/**
+	 * b3-a1fix: the content identity recovery uses for a head at `boundary`: its
+	 * plaintext hash and size when known, else the revision identity (size 0).
+	 * Never depends on a client hash claim being accepted, so a body whose hash
+	 * stays unknown (relay v3 large-body path) is still projected and captured.
+	 */
+	stateIdentityAt(documentId: string, head: { generation: number; contentHash: string | null; size: number | null },
+		boundary: number): { contentHash: string; size: number; revision: boolean } {
+		if (head.contentHash !== null && head.size !== null) return { contentHash: head.contentHash, size: head.size, revision: false };
+		return {
+			contentHash: recoveryRevisionIdentity(documentId, head.generation, this.documentContentSequenceAt(documentId, boundary)),
+			size: 0,
+			revision: true,
+		};
 	}
 
 	/**
@@ -1246,8 +1293,9 @@ export class RecoveryAuthorityStore extends VaultBootstrapStore {
 		if (!capture) return null;
 		const markdown = this.getCatalogHeadAt(capture.boundarySequence, documentId);
 		const head = markdown ?? this.semanticHeadAt(capture.boundarySequence, documentId);
-		if (!head || head.generation !== generation || head.contentHash === null || head.size === null) return null;
-		return { kind: markdown ? "markdown" : "canvas", generation, contentHash: head.contentHash, size: head.size,
+		if (!head || head.generation !== generation) return null;
+		return { kind: markdown ? "markdown" : "canvas", generation,
+			...this.stateIdentityAt(documentId, head, capture.boundarySequence),
 			boundarySequence: capture.boundarySequence, gcEpoch: capture.gcEpoch };
 	}
 
@@ -1275,17 +1323,25 @@ export class RecoveryAuthorityStore extends VaultBootstrapStore {
 	private liveHeadContentHashes(): Set<string> {
 		const live = new Set<string>();
 		const boundary = Number.MAX_SAFE_INTEGER;
-		for (const row of this.latestEventPerKey<{ lifecycle: string; content_hash: string | null }>(
-			"vault_catalog_events", "body_id", "e.lifecycle, e.content_hash", boundary)) {
-			if (row.content_hash !== null && row.lifecycle !== "purged") live.add(row.content_hash);
+		const revision = (documentId: string, generation: number) =>
+			live.add(this.stateIdentityAt(documentId, { generation, contentHash: null, size: null }, boundary).contentHash);
+		for (const row of this.latestEventPerKey<{ body_id: string; generation: number; lifecycle: string; content_hash: string | null }>(
+			"vault_catalog_events", "body_id", "e.body_id, e.generation, e.lifecycle, e.content_hash", boundary)) {
+			if (row.lifecycle === "purged") continue;
+			// b3-a1fix: a head without a plaintext hash is projected under its revision identity.
+			if (row.content_hash !== null) live.add(row.content_hash);
+			else revision(row.body_id, row.generation);
 		}
 		for (const row of this.latestEventPerKey<{ lifecycle: string; content_hash: string | null }>(
 			"vault_semantic_catalog_events", "document_id", "e.lifecycle, e.content_hash", boundary)) {
 			if (row.content_hash !== null && row.lifecycle !== "purged") live.add(row.content_hash);
 		}
 		if (this.relayTailEnabled) {
-			for (const row of this.storage.sql.exec<{ content_hash: string }>(
-				"SELECT content_hash FROM relay_body_tail WHERE content_hash IS NOT NULL")) live.add(row.content_hash);
+			for (const row of this.storage.sql.exec<{ body_id: string; generation: number; content_hash: string | null }>(
+				"SELECT body_id, generation, content_hash FROM relay_body_tail").toArray()) {
+				if (row.content_hash !== null) live.add(row.content_hash);
+				else revision(row.body_id, row.generation);
+			}
 		}
 		return live;
 	}

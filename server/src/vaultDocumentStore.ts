@@ -1899,6 +1899,31 @@ export abstract class VaultDocumentStore {
 			size: row.size } : null;
 	}
 
+	/**
+	 * b3-a1fix: the sequence of the newest stored update of a document at or before
+	 * `through`: the max over its checkpoint, journal rows and relay-tail records
+	 * (exactly the parts the recovery recipe at `through` is built from). Stable
+	 * under checkpointing (a checkpoint is written at the head it folds) and under
+	 * feed-floor pruning (pruned rows are covered by a checkpoint at or above them).
+	 * Index seeks only; reads no update bytes except the tail row's framing.
+	 */
+	documentContentSequenceAt(documentId: string, through: number): number {
+		this.initialize();
+		const stored = this.storage.sql.exec<{ sequence: number | null }>(
+			`SELECT MAX(
+			   COALESCE((SELECT MAX(checkpoint_sequence) FROM vault_checkpoint_manifests WHERE document_id = ? AND checkpoint_sequence <= ?), 0),
+			   COALESCE((SELECT MAX(checkpoint_sequence) FROM vault_checkpoints WHERE document_id = ? AND checkpoint_sequence <= ?), 0),
+			   COALESCE((SELECT MAX(sequence) FROM vault_journal WHERE document_id = ? AND sequence <= ?), 0)
+			 ) AS sequence`,
+			documentId, through, documentId, through, documentId, through,
+		).toArray()[0]?.sequence ?? 0;
+		let sequence = stored ?? 0;
+		for (const record of this.relayTailRecords(documentId, sequence, through).records) {
+			if (record.sequence > sequence) sequence = record.sequence;
+		}
+		return sequence;
+	}
+
 	/** v3: tail records of a body in (after, through]. */
 	relayTailRecords(documentId: string, after: number, through: number):
 		{ epoch: number | null; records: RelayTailRecord[]; rowsRead: number } {

@@ -64,7 +64,6 @@ type Outcome =
 	| { kind: "projected"; bytes: number }
 	| { kind: "present" }
 	| { kind: "dropped" }
-	| { kind: "pending" }
 	| { kind: "deferred"; solo?: boolean };
 
 interface Budget { puts: number; bytes: number; deadline: number }
@@ -93,7 +92,8 @@ async function putState(
 	if (built === "too_large") return { kind: "too_large" };
 	if (built.updates.length === 0 && head.size > 0) return { kind: "missing" };
 	const key = stateKey(ports, head.contentHash);
-	const object = encodeRecoveryStateObject({ kind: head.kind, contentHash: head.contentHash, size: head.size, updates: built.updates });
+	const object = encodeRecoveryStateObject({ kind: head.kind, contentHash: head.contentHash, size: head.size, updates: built.updates,
+		...(head.revision ? { identity: "revision" as const } : {}) });
 	const bytes = built.bytes;
 	// Release the history before the put: only the encoded object stays live (memory bound).
 	built.updates.length = 0;
@@ -115,8 +115,9 @@ async function projectDocument(ports: StateProjectionPorts, documentId: string, 
 	if (now() >= budget.deadline) return { kind: "deferred" };
 	const boundary = ports.store.currentSequence();
 	const head = ports.store.recoveryStateHead(documentId, boundary);
+	// b3-a1fix: a head without a known plaintext hash resolves to its revision
+	// identity (never "pending"), so it is projected like any other head.
 	if (head === null) return { kind: "dropped" };
-	if (head === "pending") return { kind: "pending" };
 	if (ports.store.missingIndexedContent([head.contentHash], ports.store.sweepingGcEpoch()).length === 0) return { kind: "present" };
 	if (budget.puts <= 0 || budget.bytes <= 0) return { kind: "deferred" };
 	// A fresh pass (nothing put yet) may spend up to the per-object bound on one
@@ -165,19 +166,17 @@ export async function runStateProjectionPass(
 	const budget = budgetFor(limits, now());
 	const deferred: string[] = [];
 	const solo: string[] = [];
-	const pending: string[] = [];
 	let projected = 0;
 	let skipped = 0;
 	for (const id of work) {
 		const outcome = await projectDocument(ports, id, budget, limits);
 		if (outcome.kind === "projected") projected++;
 		else if (outcome.kind === "present" || outcome.kind === "dropped") skipped++;
-		else if (outcome.kind === "pending") pending.push(id);
 		else if (outcome.solo) solo.push(id);
 		else deferred.push(id);
 	}
 	// Oversized bodies go first so the next pass starts fresh for them (solo pass).
-	let carried = [...solo, ...deferred, ...pending];
+	let carried = [...solo, ...deferred];
 	if (carried.length > limits.maxPending) {
 		console.warn("[yaos-recovery-state] pending projection ids truncated", { carried: carried.length });
 		carried = carried.slice(0, limits.maxPending);
@@ -195,7 +194,7 @@ export async function runStateProjectionPass(
 		projected,
 		skipped,
 		deferred: deferred.length + solo.length,
-		pending: pending.length,
+		pending: 0,
 		sourceRows: collected.rowsRead,
 		watermark: next.watermark,
 	};
