@@ -22,7 +22,7 @@ import {
 	nextUtcMidnight,
 } from "../../server/src/dailyLimit";
 import { NodeSqliteStorage } from "../../packages/server-node/src/storage";
-import { makeConfigNamespace, makeDurableObjectState, makeEnv, makeVaultSyncNamespace } from "../mocks/workerEnv.ts";
+import { FakeObjectStore, makeConfigNamespace, makeDurableObjectState, makeEnv, makeVaultSyncNamespace } from "../mocks/workerEnv.ts";
 import { suite } from "../harness.ts";
 
 const s = suite("daily-limit (D8 server)");
@@ -321,6 +321,39 @@ s.test("simulated limit: setAlarm itself fails -> noted, alarm() never throws, t
 		assert.equal(alarms.calls.length, 1, "after the reset the next commit arms the window alarm normally");
 		assert.ok(alarms.calls[0]! < nextUtcMidnight(Date.now()));
 	});
+});
+
+s.test("b3-int2: a persisted simulated limit reaches the cold object's alarm; the owed projection wake is held, then runs after the clear", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "yaos-daily-limit-wake-"));
+	const sqlite = NodeSqliteStorage.open(join(directory, "vault.sqlite"));
+	let alarm: number | null = null;
+	const calls: number[] = [];
+	const storage = Object.assign(sqlite, {
+		setAlarm: async (time: number) => { calls.push(time); alarm = time; },
+		getAlarm: async () => alarm, deleteAlarm: async () => { alarm = null; }, deleteAll: async () => {},
+	});
+	const state = { ...makeDurableObjectState({ getWebSockets: () => [] }), storage: storage as never } as DurableObjectState;
+	const env = { ...RELAY_ENV, YAOS_BUCKET: new FakeObjectStore() } as unknown as CloudflareVaultEnvironment;
+	const wakeRows = () => sqlite.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM recovery_projection_wake").one().count;
+	try {
+		const first = new VaultSyncServer(state, env);
+		assert.ok((await first.fetch(provisionRequest())).ok);
+		(first as unknown as { runtime: { store: { oweProjectionWake(at: number): void } } }).runtime.store.oweProjectionWake(Date.now() - 1);
+		assert.equal(wakeRows(), 1);
+		assert.equal((await first.fetch(simulate(true))).status, 200);
+		// Cold object (hibernation/eviction): only the persisted switch can reach its alarm.
+		const woken = new VaultSyncServer(state, env);
+		calls.length = 0;
+		for (let index = 0; index < 20; index++) await woken.alarm(); // must not throw (no platform retry loop)
+		assert.deepEqual(calls, [], "no alarm row is written while simulated");
+		assert.equal(wakeRows(), 1, "the owed projection wake survives the held alarms");
+		assert.equal((await woken.fetch(simulate(false))).status, 200);
+		await woken.alarm();
+		assert.equal(wakeRows(), 0, "after the clear the alarm runs the projection wake and settles it");
+	} finally {
+		sqlite.database.close();
+		await rm(directory, { recursive: true, force: true });
+	}
 });
 
 // ---------------------------------------------------------------------------
