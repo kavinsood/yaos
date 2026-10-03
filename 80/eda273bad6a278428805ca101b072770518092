@@ -1,0 +1,21 @@
+src/sync/dailyLimit.ts
+  s_b04c88f01f67f1::t_ed4f6cb13be459 11-12,62-89
+src/sync/vaultSync.ts
+  s_b04c88f01f67f1::t_e247d7b75a3ad9 747-748,1549-1550,3293,5725-5726,5728-5736,5740-5754,5769-5783,5909,6502
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "80eda273bad6a278428805ca101b072770518092",
+  "prompts": {},
+  "sessions": {
+    "s_b04c88f01f67f1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aa818e9484dac5aad",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
