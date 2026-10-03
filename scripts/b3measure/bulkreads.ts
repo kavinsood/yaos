@@ -5,7 +5,7 @@
  *
  *   node tests/run-typescript.mjs --test-aliases scripts/b3measure/bulkreads.ts --host <url> --n 10000 [--batch 350]
  *        [--settle-ms 400] [--top 12] [--out <json>] [--tag t]
- * [--assert-ratio 1.5] exits 2 unless batch 20 / batch 1 rows read <= the limit.
+ * [--assert-ratio 1.5] exits 2 unless batch 20 / batch 1 (1-based) rows read <= the limit.
  * Needs a context (scripts/relay2/context.ts --host <url> --devices A --seed none).
  */
 import { writeFileSync } from "node:fs";
