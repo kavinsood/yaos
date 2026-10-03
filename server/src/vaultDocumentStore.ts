@@ -2300,9 +2300,14 @@ export abstract class VaultDocumentStore {
 	 */
 	protected pruneUnpinnedDocumentHistory(now: number, documentId: string | null = null): number {
 		let rowsWritten = this.syncLeanClock();
+		// b3-a1fix: a per-document prune (every checkpoint write) must seek that document's rows.
+		// `(? IS NULL OR x.document_id = ?)` cannot use an index, so it scanned the whole vault's
+		// journal, checkpoints and manifests on every checkpoint (EXPLAIN-tested).
+		const scope = (alias: string) => documentId === null ? "1 = 1" : `${alias}.document_id = ?`;
+		const scoped: string[] = documentId === null ? [] : [documentId];
 		const journal = this.storage.sql.exec(
 			`DELETE FROM vault_journal AS journal
-			 WHERE (? IS NULL OR journal.document_id = ?)
+			 WHERE ${scope("journal")}
 			   AND EXISTS (
 			     SELECT 1 FROM vault_document_heads head
 			      WHERE head.document_id = journal.document_id
@@ -2320,8 +2325,7 @@ export abstract class VaultDocumentStore {
 			             AND manifest.checkpoint_sequence <= pin.boundary_sequence
 			        ), 0)
 			   )`,
-			documentId,
-			documentId,
+			...scoped,
 			now,
 			now,
 		);
@@ -2330,7 +2334,7 @@ export abstract class VaultDocumentStore {
 
 		const checkpoints = this.storage.sql.exec(
 			`DELETE FROM vault_checkpoints AS checkpoint
-			 WHERE (? IS NULL OR checkpoint.document_id = ?)
+			 WHERE ${scope("checkpoint")}
 			   AND EXISTS (
 			     SELECT 1 FROM vault_document_heads head
 			      WHERE head.document_id = checkpoint.document_id
@@ -2357,8 +2361,7 @@ export abstract class VaultDocumentStore {
 			             AND protected.checkpoint_sequence <= pin.boundary_sequence
 			        )
 			   )`,
-			documentId,
-			documentId,
+			...scoped,
 			now,
 			now,
 		);
@@ -2367,7 +2370,7 @@ export abstract class VaultDocumentStore {
 
 		const manifests = this.storage.sql.exec(
 			`DELETE FROM vault_checkpoint_manifests AS manifest
-			 WHERE (? IS NULL OR manifest.document_id = ?)
+			 WHERE ${scope("manifest")}
 			   AND EXISTS (
 			     SELECT 1 FROM vault_document_heads head
 			      WHERE head.document_id = manifest.document_id
@@ -2394,8 +2397,7 @@ export abstract class VaultDocumentStore {
 			             AND protected.checkpoint_sequence <= pin.boundary_sequence
 			        )
 			   )`,
-			documentId,
-			documentId,
+			...scoped,
 			now,
 			now,
 		);
@@ -2422,6 +2424,10 @@ export abstract class VaultDocumentStore {
 	 * writers call this after inserting their manifest but before committing.
 	 */
 	protected retainedCheckpointBytes(now: number, candidateBoundary: number | null = null): number {
+		// b3-a1fix: with no active pin and no candidate boundary nothing is retained (the outer
+		// predicate needs one), so skip the whole-vault checkpoint aggregate (every checkpoint write).
+		if (candidateBoundary === null && this.storage.sql.exec(
+			"SELECT 1 FROM vault_history_pins WHERE soft_expires_at > ? AND hard_expires_at > ? LIMIT 1", now, now).toArray().length === 0) return 0;
 		const row = this.storage.sql.exec<{ bytes: number }>(
 			`WITH logical_checkpoint AS (
 			   SELECT checkpoint.document_id, checkpoint.checkpoint_sequence,

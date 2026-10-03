@@ -49,19 +49,20 @@ const OWNER: VaultActorContext = {
 const realNow = Date.now;
 let clock = realNow();
 
-interface Counted { statements: number; written: number; log: Array<{ query: string; bindings: unknown[] }> | null; reset(): void }
+interface Counted { statements: number; written: number; read: number; log: Array<{ query: string; bindings: unknown[]; cursor?: { rowsRead: number; rowsWritten: number } }> | null; reset(): void }
 
 /** Counts every SQL statement and Node-written row an actor issues. */
 function counted(sqlite: NodeSqliteStorage): { storage: NodeSqliteStorage; stats: Counted } {
-	const stats: Counted = { statements: 0, written: 0, log: null, reset() { this.statements = 0; this.written = 0; } };
+	const stats: Counted = { statements: 0, written: 0, read: 0, log: null, reset() { this.statements = 0; this.written = 0; this.read = 0; } };
 	const sql = new Proxy(sqlite.sql, {
 		get(target, property) {
 			if (property === "exec") {
 				return (query: string, ...bindings: unknown[]) => {
 					stats.statements++;
-					stats.log?.push({ query, bindings });
 					const cursor = target.exec(query, ...(bindings as never[]));
+					stats.log?.push({ query, bindings, cursor });
 					stats.written += cursor.rowsWritten;
+					stats.read += cursor.rowsRead;
 					return cursor;
 				};
 			}
@@ -775,6 +776,24 @@ s.test("[relay v3] A1 whole-text rewrites: the checkpoint drops deleted content 
 		let peak = 0;
 		for (let save = 1; save <= 12; save++) {
 			world.rewriteCommit("drawing", version(save), true);
+			if (save === 9) {
+				// One checkpoint, statement by statement: no whole-vault scan of journal/checkpoints/manifests.
+				const relay = (world.vault as unknown as { relay: { checkpointTail(id: string): unknown } }).relay;
+				world.vaultStats.log = [];
+				assert.ok(relay.checkpointTail("body-drawing"), "the checkpoint ran");
+				const log = world.vaultStats.log; world.vaultStats.log = null;
+				const scans: string[] = [];
+				for (const entry of log) {
+					if (/^\s*(EXPLAIN|PRAGMA|BEGIN|COMMIT|SAVEPOINT|RELEASE|ROLLBACK)/i.test(entry.query)) continue;
+					const detail = world.vaultSqlite.sql.exec<{ detail: string }>(`EXPLAIN QUERY PLAN ${entry.query}`, ...(entry.bindings as never[]))
+						.toArray().map((row) => row.detail).join(" | ");
+					const scanned = /SCAN (vault_journal|vault_checkpoints|vault_checkpoint_manifests|journal|manifest)\b/.test(detail)
+						|| (/SCAN checkpoint\b/.test(detail) && !/CO-ROUTINE checkpoint\b/.test(detail));
+					if (process.env.A1FIX_PROBE && /SCAN/.test(detail)) console.log(`[probe] ${detail.slice(0, 200)} :: ${entry.query.replace(/\s+/g, " ").slice(0, 100)}`);
+					if (scanned) scans.push(`${detail} :: ${entry.query.replace(/\s+/g, " ").slice(0, 120)}`);
+				}
+				assert.deepEqual(scans, [], "a checkpoint seeks its own document's history rows");
+			}
 			if (save % 2 === 0) { await world.advanceTo(Date.now() + 10 * 60_000); peak = Math.max(peak, checkpointBytes()); }
 		}
 		assert.ok(peak > 0, "the tail was checkpointed");
