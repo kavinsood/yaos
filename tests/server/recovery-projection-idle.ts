@@ -32,6 +32,10 @@ import { decodeRecoveryStateObject } from "../../src/snapshots/recoveryStateDeco
 import { runStateProjectionPass, STATE_PROJECTION_LIMITS } from "../../server/src/recoveryStateProjection";
 import { nextUtcMidnight } from "../../server/src/dailyLimit";
 import { suite } from "../harness.ts";
+import { recoveryRevisionIdentity } from "../../server/src/recoveryAuthorityStore";
+import { RECOVERY_STATE_CONTENT_TYPE } from "../../server/src/shared/recoveryStateObject";
+import { RecoveryClient, type RestoreItem } from "../../src/snapshots/recoveryClient";
+import { DEFAULT_SETTINGS } from "../../src/settings";
 
 const s = suite("recovery-projection-idle");
 
@@ -115,7 +119,7 @@ interface World {
 	vaultFetch(path: string, init?: RequestInit): Promise<Response>;
 	createNotes(batch: string, notes: Array<{ name: string; text: string }>): Promise<void>;
 	/** Relay v3: appends `suffix` to a note through a group commit (tail row + head; no journal, no catalog event). */
-	groupCommit(name: string, before: string, suffix: string): string;
+	groupCommit(name: string, before: string, suffix: string, unknownHash?: boolean): string;
 	advanceTo(target: number): Promise<void>;
 	settle(): Promise<void>;
 	indexed(): Set<string>;
@@ -195,7 +199,7 @@ async function withWorld(mode: Mode, check: (world: World) => Promise<void>): Pr
 							contentHash: hashOf(entry.text), size: sizeOf(entry.text) }] });
 				}
 			},
-			groupCommit: (name, before, suffix) => {
+			groupCommit: (name, before, suffix, unknownHash = false) => {
 				const relayStore = (vault as unknown as { relayStore: RelayBodyStore | null }).relayStore;
 				assert.ok(relayStore, "relay v3 store");
 				const doc = docs.get(name)!;
@@ -206,7 +210,7 @@ async function withWorld(mode: Mode, check: (world: World) => Promise<void>): Pr
 				const store = (vault as unknown as { store: VaultStore }).store;
 				relayStore.appendRelayGroupCommit({ bodyId: `body-${name}`, expectedEpoch: store.documentHead(`body-${name}`)!.semanticEpoch,
 					update: Y.encodeStateAsUpdate(doc, vector), lastActor: OWNER,
-					catalogContent: { contentHash: hashOf(after), size: sizeOf(after) }, receipts: [], receiptTtlMs: 60_000 });
+					catalogContent: unknownHash ? null : { contentHash: hashOf(after), size: sizeOf(after) }, receipts: [], receiptTtlMs: 60_000 });
 				return after;
 			},
 			settle,
@@ -672,6 +676,73 @@ s.test("query plans: watermark change collection and head resolution are index s
 		sqlite.close();
 		await rm(directory, { recursive: true, force: true });
 	}
+});
+
+
+s.test("[relay v3] a large-state note with an unknown hash still gets projected and restored (b3-a1fix)", async () => {
+	await withWorld("relay v3", async (world) => {
+		const seed = { name: "big-note", text: `${"x".repeat(50_000)}\n` };
+		await world.createNotes("seed", [seed]);
+		await world.advanceTo(Date.now() + 10 * 60_000);
+		assert.ok(world.indexed().has(hashOf(seed.text)), "the seed is projected under its plaintext hash");
+		// As on the large-state path (state > exactMergeBytes): the client's hash claim is not
+		// accepted, so the tail row and the coalesced catalog event carry no content hash.
+		let text = seed.text;
+		for (let save = 0; save < 3; save++) text = world.groupCommit(seed.name, text, `\nrewrite ${save}\n`, true);
+		const store = (world.vault as unknown as { store: VaultStore }).store;
+		const tail = world.vaultSqlite.sql.exec<{ content_hash: string | null; latest_sequence: number; generation: number }>(
+			"SELECT content_hash, latest_sequence, generation FROM relay_body_tail WHERE body_id = ?", `body-${seed.name}`).toArray()[0];
+		assert.ok(tail, "the rewrites live in a tail row");
+		assert.equal(tail.content_hash, null, "the server holds no plaintext hash for the head");
+		await world.advanceTo(Date.now() + 10 * 60_000);
+		const revision = recoveryRevisionIdentity(`body-${seed.name}`, tail.generation, tail.latest_sequence);
+		assert.ok(world.indexed().has(revision), "the unknown-hash head is projected under its revision identity");
+		const object = world.stateObject(revision);
+		assert.ok(object, "R2 holds the latest revision, not just the stale seed");
+		const decoded = await decodeRecoveryStateObject(object);
+		assert.equal(decoded.state.identity, "revision");
+		assert.equal(new TextDecoder().decode(decoded.plain), text, "the opaque object decodes to the latest text");
+		assert.equal(world.vaultAlarm.at, null, "nothing stays pending: the vault idles");
+		assert.equal(world.vaultSqlite.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM recovery_projection_wake").one().count, 0);
+
+		// Capture: the plan names the revision identity (no "missing durable content identity" throw)
+		// and the projection already covers it, so no materialisation is needed.
+		const now = Date.now();
+		const capture = store.createRecoveryCapture({
+			captureId: "capture-a1fix", requestId: "request-a1fix", vaultId: VAULT_ID, vaultGeneration: GENERATION,
+			boundarySequence: store.currentSequence(), rootGeneration: store.documentHead("root")?.generation ?? 0,
+			runtimeEpoch: "epoch", reason: "manual", jobId: "job-a1fix", capabilityHash: "c".repeat(64),
+			capabilityExpiresAt: now + 3_600_000, softExpiresAt: now + 1_800_000, hardExpiresAt: now + 3_600_000, now,
+		});
+		const plan = store.listCapturePlanAt(capture.captureId, "active", null, 100);
+		const entry = plan.find((candidate) => candidate.kind === "active" && candidate.bodyId === `body-${seed.name}`);
+		assert.ok(entry && entry.kind === "active", "the note is in the capture plan");
+		assert.equal(entry.contentHash, revision, "the capture plan uses the projected identity");
+		assert.deepEqual(store.missingCoverage(capture.captureId, [revision], [], capture.gcEpoch).contentHashes, [],
+			"the projected object covers the capture");
+
+		// Restore: the client binds the object to the revision identity and derives the plaintext hash and size.
+		const arrayBuffer = new ArrayBuffer(object.byteLength);
+		new Uint8Array(arrayBuffer).set(object);
+		const client = new RecoveryClient({ ...DEFAULT_SETTINGS, host: "https://sync.example", deviceToken: "token", vaultId: VAULT_ID }, undefined, {
+			request: async () => ({ status: 200, json: null, text: "", arrayBuffer, headers: {
+				"content-type": RECOVERY_STATE_CONTENT_TYPE, "content-length": String(object.byteLength), "x-yaos-content-sha256": revision,
+			} }),
+		});
+		const item: Extract<RestoreItem, { kind: "markdown" }> = { kind: "markdown", itemId: "item-1", path: `${seed.name}.md`, sourceKind: "active",
+			sourceFileId: `body-${seed.name}`, sourceBodyId: `body-${seed.name}`, contentHash: entry.contentHash, size: entry.size, contentUrl: "/content" };
+		const restored = await client.downloadRestoreItemVerified("22222222-2222-4222-8222-222222222222", item);
+		assert.equal(new TextDecoder().decode(restored.bytes), text, "restore yields the latest text");
+		assert.equal(restored.item.contentHash, hashOf(text), "the restore continues under the real plaintext hash");
+		assert.equal(restored.item.size, sizeOf(text));
+		const forged = new RecoveryClient({ ...DEFAULT_SETTINGS, host: "https://sync.example", deviceToken: "token", vaultId: VAULT_ID }, undefined, {
+			request: async () => ({ status: 200, json: null, text: "", arrayBuffer, headers: {
+				"content-type": RECOVERY_STATE_CONTENT_TYPE, "content-length": String(object.byteLength), "x-yaos-content-sha256": "d".repeat(64),
+			} }),
+		});
+		await assert.rejects(forged.downloadRestoreItemVerified("22222222-2222-4222-8222-222222222222", { ...item, contentHash: "d".repeat(64) }),
+			/identity mismatch/, "an object served for another identity fails closed");
+	});
 });
 
 await s.done();
