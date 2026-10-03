@@ -1,0 +1,19 @@
+scripts/b3clientblob/heads.ts
+  s_b04c88f01f67f1::t_107a5746d30e64 1-9
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "035ec3ff54311c4d424f971b186f469e0cd9d092",
+  "prompts": {},
+  "sessions": {
+    "s_b04c88f01f67f1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aa818e9484dac5aad",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
