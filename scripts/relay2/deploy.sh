@@ -22,6 +22,7 @@
 # everything else via --var.
 set -euo pipefail
 source /Users/kavin/personal/obsidiansync/experiments/env.sh
+source ${0:A:h}/cf-cred.sh  # wrangler OAuth expired: feed wrangler the cf CLI credentials (never printed)
 WT=${0:A:h:h:h}
 NAME=${1:?usage: deploy.sh <yaos-relay2-name> [--relay on|off] [--var K=V]...}
 shift

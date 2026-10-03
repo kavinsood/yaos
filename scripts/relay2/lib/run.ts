@@ -1,6 +1,8 @@
 /**
  * Scenario runtime: context, device clients, fresh fixtures, frame-coverage tracking, tail capture.
  */
+// @ts-ignore plain mjs helper
+import { cfToken } from "../cf-token.mjs";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createWriteStream, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -237,7 +239,7 @@ export class TailCapture {
 	async start(host: string, warmupMs = 8000) {
 		const wrangler = process.env.WRANGLER ?? "/Users/kavin/personal/obsidiansync/node_modules/.bin/wrangler";
 		const env: NodeJS.ProcessEnv = { ...process.env, CLOUDFLARE_ACCOUNT_ID: "261336883158b276696d7181091ba1a6" };
-		delete env.CLOUDFLARE_API_TOKEN;
+		env.CLOUDFLARE_API_TOKEN = cfToken(); // wrangler OAuth expired: cf CLI credentials, never printed
 		const out = createWriteStream(this.path);
 		this.child = spawn(wrangler, ["tail", workerName(host), "--format", "json"], { env, stdio: ["ignore", "pipe", "pipe"] });
 		this.child.stdout!.pipe(out);

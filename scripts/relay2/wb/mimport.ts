@@ -147,6 +147,19 @@ export async function DLI(ctx: RunCtx): Promise<Result> {
 	const corpusPaths = new Set(corpus.notes.map((n) => n.path));
 	const extra = paths.filter((p) => !corpusPaths.has(p) && !p.startsWith(`DLI/${ctx.tag}/`));
 	(out.realClientAfter as Result).rcNoteOnServer = paths.includes(path);
+	// b3-clientblob A4: the RC replays its parked create at its next D8 probe (2 min doubling) or on its
+	// next successful write; poll the catalog (one heads listing per 15 s) up to --rc-wait-ms for it.
+	{
+		const rcWait = ctx.num("rc-wait-ms", 15 * 60_000);
+		const t = now();
+		let found = paths.filter((p) => p === path).length;
+		while (found === 0 && now() - t < rcWait) {
+			await sleep(15_000);
+			found = (await listHeads(await ctx.dev("B"))).entries.filter((e) => e.path === path).length;
+		}
+		Object.assign(out.realClientAfter as Result, { rcNoteOnServerEventually: found > 0, rcNoteCopies: found,
+			rcNoteMsAfterDisable: found > 0 ? r2(now() - dis.at) : null, rcStateAfter: rc.vs.getDailyLimitState() });
+	}
 	out.noLoss = { verification, catalogEntries: paths.length, duplicatePaths: dupPaths, unexpectedPaths: extra.slice(0, 10), unexpectedCount: extra.length };
 	await snap("after-phase2");
 	const proj = await waitProjection(A, ctx.num("projection-timeout-ms", 30 * 60_000), ctx.num("poll-ms", 30_000));
@@ -163,6 +176,8 @@ export async function DLI(ctx: RunCtx): Promise<Result> {
 	out.checks = { probe503, d8Notice: d8, holdRowsWrittenCounted: holdRows, noLoss: verification.pass, noDuplicates: dupPaths === 0, projectionReady: proj.ready,
 		phase2Errors: (p2.res.outcomes.filter((o) => o.outcome === "error" || o.outcome === "rejected")).length,
 		note: "rows/setAlarms rejected while simulated are NOT seen by sql-rows; alarm loop judged from GraphQL alarm invocations over holdWindow + dailyLimit.alarmHolds" };
-	out.convergence = { pass: probe503 && d8 && verification.pass && dupPaths === 0 && proj.ready };
+	const rcOk = (out.realClientAfter as Result).rcNoteCopies === 1;
+	(out.checks as Result).rcNoteCreatedOnce = rcOk;
+	out.convergence = { pass: probe503 && d8 && verification.pass && dupPaths === 0 && proj.ready && rcOk };
 	return out;
 }

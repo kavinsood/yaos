@@ -10,31 +10,18 @@
  * Periodic groups are minute-granular: pad windows or use windows ≥ 2 min and subtract an idle baseline.
  * Analytics lag ~1-3 min behind real time; query after the window has settled.
  *
- * Auth: wrangler OAuth token from ~/Library/Preferences/.wrangler/config/default.toml (refreshed via
- * `wrangler whoami` if expired). The token is never printed or written.
+ * Auth: `cf` CLI OAuth token via ./cf-token.mjs (refreshed via `cf auth whoami`). The token is never printed or written.
  */
-import { execFileSync } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
 import { flagStr, parseArgs } from "./lib/common";
+// @ts-ignore plain mjs helper
+import { cfToken } from "./cf-token.mjs";
 
 const ACCOUNT = "261336883158b276696d7181091ba1a6";
-const CONFIG = `${process.env.HOME}/Library/Preferences/.wrangler/config/default.toml`;
-const WRANGLER = process.env.WRANGLER ?? "/Users/kavin/personal/obsidiansync/node_modules/.bin/wrangler";
 
 export function token(): string {
-	const read = () => {
-		const cfg = readFileSync(CONFIG, "utf8");
-		return { tok: cfg.match(/oauth_token\s*=\s*"([^"]+)"/)?.[1], exp: cfg.match(/expiration_time\s*=\s*"([^"]+)"/)?.[1] };
-	};
-	let { tok, exp } = read();
-	if (!tok || !exp || new Date(exp).getTime() < Date.now() + 60_000) {
-		const env: NodeJS.ProcessEnv = { ...process.env, CLOUDFLARE_ACCOUNT_ID: ACCOUNT };
-		delete env.CLOUDFLARE_API_TOKEN;
-		execFileSync(WRANGLER, ["whoami"], { env, stdio: "ignore" });
-		({ tok } = read());
-	}
-	if (!tok) throw new Error("no wrangler oauth token");
-	return tok;
+	// wrangler OAuth expired; use the `cf` CLI OAuth token (refreshed via `cf auth whoami`). Never printed.
+	return (cfToken as () => string)();
 }
 
 async function api(tok: string, path: string, init?: RequestInit) {
