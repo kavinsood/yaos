@@ -29,6 +29,26 @@ function r2Options(options?: ObjectWriteOptions): R2PutOptions | undefined {
 	};
 }
 
+/** R2 rejects a put whose bytes do not match the supplied checksum (S3 BadDigest; R2 error 10037). */
+export function isR2DigestMismatch(error: unknown): boolean {
+	const message = error instanceof Error ? error.message : String(error);
+	return /\b10037\b|BadDigest|checksum|digest.*(?:match|mismatch)|did not match/i.test(message);
+}
+
+/**
+ * R2 needs a stream of known length. A request body with a declared
+ * Content-Length already is one; FixedLengthStream (workerd only) restates the
+ * length and errors if the body is shorter or longer. Piped natively.
+ */
+function knownLengthStream(body: ReadableStream<Uint8Array>, length: number): ReadableStream<Uint8Array> {
+	const Fixed = (globalThis as { FixedLengthStream?: new (length: number) => TransformStream<Uint8Array, Uint8Array> })
+		.FixedLengthStream;
+	if (!Fixed) return body;
+	const fixed = new Fixed(length);
+	void body.pipeTo(fixed.writable).catch(() => undefined);
+	return fixed.readable;
+}
+
 export class CloudflareObjectStore implements ObjectStorePort {
 	constructor(private readonly bucket: R2Bucket) {}
 
@@ -45,6 +65,28 @@ export class CloudflareObjectStore implements ObjectStorePort {
 
 	async put(key: string, bytes: Uint8Array, options?: ObjectWriteOptions): Promise<void> {
 		await this.bucket.put(key, bytes, r2Options(options));
+	}
+
+	/**
+	 * b3-clientblob: R2 checks the `sha256` put option against the bytes it
+	 * received and rejects the put (nothing stored) on mismatch, so the front
+	 * Worker passes the declared-length request stream through without reading
+	 * or hashing it (measured ~2.2 ms CPU/MiB for the buffered read + digest).
+	 */
+	async putVerifiedStream(
+		key: string,
+		body: ReadableStream<Uint8Array>,
+		length: number,
+		sha256: string,
+		options?: ObjectWriteOptions,
+	): Promise<"stored" | "digest_mismatch"> {
+		try {
+			await this.bucket.put(key, knownLengthStream(body, length), { ...(r2Options(options) ?? {}), sha256 });
+			return "stored";
+		} catch (error) {
+			if (isR2DigestMismatch(error)) return "digest_mismatch";
+			throw error;
+		}
 	}
 
 	async createOnly(key: string, bytes: Uint8Array, options?: ObjectWriteOptions): Promise<"created" | "exists"> {

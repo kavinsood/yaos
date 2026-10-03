@@ -1,6 +1,6 @@
 import { MAX_BLOB_UPLOAD_BYTES } from "../contracts";
 import { sha256Hex } from "../hex";
-import { BoundedBodyError, readBoundedBytes } from "../readBoundedBytes";
+import { BoundedBodyError, declaredBodyLength, readBoundedBytes } from "../readBoundedBytes";
 import { blobKey } from "../vaultObjectStore";
 import { mapWithConcurrency } from "../shared/concurrency";
 import type { Env, JsonResponse } from "./types";
@@ -117,38 +117,55 @@ async function handleBlobUpload(
 		return json({ error: "invalid hash: must be 64 hex chars (SHA-256)" }, 400);
 	}
 
+	const contentType = req.headers.get("Content-Type") ?? "application/octet-stream";
+	const key = blobKey(vaultId, vaultGeneration, hash);
+	// b3-clientblob: with a declared length and a store that verifies the digest
+	// itself (R2), stream the body through: the front Worker neither buffers nor
+	// hashes it. Otherwise (no Content-Length, empty, server-node) buffer + hash.
+	let declared: number | null;
+	try {
+		declared = declaredBodyLength(req, MAX_BLOB_UPLOAD_BYTES);
+	} catch (error) {
+		return boundedBodyErrorResponse(error, json);
+	}
+	if (declared !== null && declared > 0 && req.body && bucket.putVerifiedStream) {
+		const stored = await bucket.putVerifiedStream(key, req.body, declared, hash, { contentType });
+		if (stored === "digest_mismatch") return json({ error: "hash mismatch" }, 400);
+		return new Response(null, { status: 204 });
+	}
+
 	let body: Uint8Array;
 	try {
 		body = await readBoundedBytes(req, MAX_BLOB_UPLOAD_BYTES);
 	} catch (error) {
-		if (error instanceof BoundedBodyError) {
-			if (error.kind === "invalid_content_length") {
-				return json({ error: "invalid Content-Length" }, 400);
-			}
-			if (error.kind === "body_too_large") {
-				return json({
-					error: `contentLength exceeds max upload size (${MAX_BLOB_UPLOAD_BYTES} bytes)`,
-				}, 413);
-			}
-			if (error.kind === "missing_body") {
-				return json({ error: "missing request body" }, 400);
-			}
-			return json({ error: "failed to read request body" }, 400);
-		}
-		throw error;
+		return boundedBodyErrorResponse(error, json);
 	}
 	const actualHash = await sha256Hex(body);
 	if (actualHash !== hash) {
 		return json({ error: "hash mismatch" }, 400);
 	}
 
-	await bucket.put(
-		blobKey(vaultId, vaultGeneration, hash),
-		body,
-		{ contentType: req.headers.get("Content-Type") ?? "application/octet-stream" },
-	);
+	await bucket.put(key, body, { contentType });
 
 	return new Response(null, { status: 204 });
+}
+
+function boundedBodyErrorResponse(error: unknown, json: JsonResponse): Response {
+	if (error instanceof BoundedBodyError) {
+		if (error.kind === "invalid_content_length") {
+			return json({ error: "invalid Content-Length" }, 400);
+		}
+		if (error.kind === "body_too_large") {
+			return json({
+				error: `contentLength exceeds max upload size (${MAX_BLOB_UPLOAD_BYTES} bytes)`,
+			}, 413);
+		}
+		if (error.kind === "missing_body") {
+			return json({ error: "missing request body" }, 400);
+		}
+		return json({ error: "failed to read request body" }, 400);
+	}
+	throw error;
 }
 
 async function handleBlobDownload(
