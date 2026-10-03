@@ -21,6 +21,7 @@ import * as extra from "./scenarios/extra";
 import * as v3 from "./scenarios/v3";
 import * as wb from "./wb/scenarios";
 import * as r1dl from "./wb/r1dl/scenarios";
+import * as mimport from "./wb/mimport";
 
 type Scenario = (ctx: RunCtx) => Promise<Record<string, unknown>>;
 const SCENARIOS: Record<string, Scenario> = {
@@ -36,6 +37,8 @@ const SCENARIOS: Record<string, Scenario> = {
 	// Write-budget spike (PHASE3-WRITE-BUDGET-SPIKE §3 W4); see wb/scenarios.ts.
 	// b3-bulk: bulk-create scenarios only (C4W/XCRASH = W1 typing, R1 = W3 merge, A1/L5R not in scope).
 	I1: wb.I1, I2: wb.I2, I3: wb.I3, I4: wb.I4,
+	// b3-m-import: I1 + projection wait, 2k import across a D8 daily-limit trip; see wb/mimport.ts.
+	I1P: mimport.I1P, DLI: mimport.DLI,
 };
 
 /** Every socket close / error / reconnect / drop across all raw clients of this run (round-3 robustness record). */

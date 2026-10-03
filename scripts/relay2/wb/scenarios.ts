@@ -77,7 +77,7 @@ export function fitBatches(batches: Array<{ notes: number; attachments: number; 
 		: { rowsPerNote: r2(sol[0]!), rowsPerAttachment: null, rowsPerBatch: r2(sol[1]!), batches: pts.length };
 }
 
-function corpusInputs(corpus: Corpus, withAttachments: boolean): CreateInput[] {
+export function corpusInputs(corpus: Corpus, withAttachments: boolean): CreateInput[] {
 	const items: CreateInput[] = corpus.notes.map((n) => ({ kind: "note" as const, path: n.path, bodyId: n.bodyId, content: noteText(n, corpus) }));
 	if (withAttachments) for (const a of corpus.attachments) items.push({ kind: "attachment", path: a.path, bytes: attachmentBytes(a), mime: a.mime });
 	// Folder order, like a vault walk / folder drop (attachments interleave with notes of the same folder).
@@ -85,7 +85,7 @@ function corpusInputs(corpus: Corpus, withAttachments: boolean): CreateInput[] {
 }
 
 /** Create items through the adapter, reading the rows counter after every batch (exact per-batch rows). */
-async function measuredCreate(ctx: RunCtx, rows: RowsCounter, adapter: CreateAdapter, items: CreateInput[], device = "A") {
+export async function measuredCreate(ctx: RunCtx, rows: RowsCounter, adapter: CreateAdapter, items: CreateInput[], device = "A") {
 	const r0 = await rows.read();
 	let prev: RowsReading = r0;
 	const window = { start: iso(), end: "" };
@@ -102,7 +102,7 @@ async function measuredCreate(ctx: RunCtx, rows: RowsCounter, adapter: CreateAda
 	return { res, wallMs, window, total: rowsDelta(r0, r1), settleRows: rowsDelta(prev, r1) };
 }
 
-function createSummary(res: CreateResult, total: ReturnType<typeof rowsDelta>, files: { notes: number; attachments: number }, wallMs: number) {
+export function createSummary(res: CreateResult, total: ReturnType<typeof rowsDelta>, files: { notes: number; attachments: number }, wallMs: number) {
 	const fit = fitBatches(res.batches.filter((b) => b.rows?.rowsWritten != null && !b.error)
 		.map((b) => ({ notes: b.notes, attachments: b.attachments, rows: b.rows!.rowsWritten! })));
 	const totalFiles = files.notes + files.attachments;
@@ -119,7 +119,7 @@ function createSummary(res: CreateResult, total: ReturnType<typeof rowsDelta>, f
 }
 
 /** Verify every note via the active catalog (path → contentHash) and attachments via the root's pathToBlob. */
-async function verifyCorpus(ctx: RunCtx, corpus: Corpus, device = "B", withAttachments = true) {
+export async function verifyCorpus(ctx: RunCtx, corpus: Corpus, device = "B", withAttachments = true) {
 	const id = await ctx.dev(device);
 	const heads = await listHeads(id);
 	const byPath = new Map(heads.entries.map((e) => [e.path, e]));
@@ -151,7 +151,7 @@ async function verifyCorpus(ctx: RunCtx, corpus: Corpus, device = "B", withAttac
 }
 
 // ================================================================================================= I1 / I2
-async function firstOpen(ctx: RunCtx, rows: RowsCounter, corpus: Corpus, withAtt: boolean) {
+export async function firstOpen(ctx: RunCtx, rows: RowsCounter, corpus: Corpus, withAtt: boolean) {
 	const items = corpusInputs(corpus, withAtt);
 	log(`I1: ${corpus.notes.length} notes + ${withAtt ? corpus.attachments.length : 0} attachments via ${creator(ctx).name}`);
 	const m = await measuredCreate(ctx, rows, creator(ctx), items, "A");
@@ -169,7 +169,7 @@ async function firstOpen(ctx: RunCtx, rows: RowsCounter, corpus: Corpus, withAtt
  * (local dry-runs). runfast phases get a fresh vault each and use the corpus paths as generated. Links are by
  * basename, so the prefix does not change note content.
  */
-function corpusFor(ctx: RunCtx, preset = ctx.str("preset", "2k")!) {
+export function corpusFor(ctx: RunCtx, preset = ctx.str("preset", "2k")!) {
 	const corpus = buildCorpus(presetSpec(preset, ctx.str("seed", "wb1")), `${ctx.tag}-${preset}`); // bodyIds unique per preset (I3 prefill + drop)
 	const flag = ctx.str("path-prefix");
 	const prefix = !flag ? "" : flag === "auto" ? `WB-${ctx.tag}/` : flag.replace(/\/?$/, "/");
@@ -202,9 +202,11 @@ export async function I2(ctx: RunCtx): Promise<Result> {
 	const rows = rowsCounter(ctx);
 	const { corpus, info } = corpusFor(ctx);
 	const withAtt = !ctx.args.flags["no-attachments"];
-	const seed = await firstOpen(ctx, rows, corpus, withAtt);
-	await sleep(ctx.num("settle-ms", 5000));
-	const out: Result = { corpus: info, seedRun: seed };
+	// --no-seed: the vault already holds this corpus (e.g. an I1P run on the same vault); bodyIds differ, content/paths match.
+	const noSeed = Boolean(ctx.args.flags["no-seed"]);
+	const seed = noSeed ? null : await firstOpen(ctx, rows, corpus, withAtt);
+	if (seed) await sleep(ctx.num("settle-ms", 5000));
+	const out: Result = { corpus: info, seedRun: seed ?? "skipped (--no-seed)" };
 	// catalog mode
 	{
 		const r0 = await rows.read(); const start = iso();
@@ -233,7 +235,7 @@ export async function I2(ctx: RunCtx): Promise<Result> {
 			window: m.window, pass: (counts["exists-identical"] ?? 0) === items.length && (m.total.rowsWritten ?? 1) <= ctx.num("max-rows", 10) };
 	} else out.bulk = { skipped: "create adapter is legacy (run with --create bulk against a W2 server)" };
 	const c = out.catalog as Result, bk = out.bulk as Result;
-	out.convergence = { pass: seed.verification.pass && createErrors(seed) === 0 && c.pass === true && (bk.skipped ? true : bk.pass === true), seedCreateErrors: createErrors(seed) };
+	out.convergence = { pass: (seed ? seed.verification.pass && createErrors(seed) === 0 : true) && c.pass === true && (bk.skipped ? true : bk.pass === true), seedCreateErrors: seed ? createErrors(seed) : null };
 	return out;
 }
 
