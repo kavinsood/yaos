@@ -1,0 +1,21 @@
+server/src/server.ts
+  s_d97cfc4b0e65fc::t_6be659f0ca9be5 607-611
+server/src/sqlRowCounter.ts
+  s_d97cfc4b0e65fc::t_9a18a56d5edf30 16-17,20-21,43,55,77,80-84,100-109,131-136,144
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "039d73f97fd886a0a1616fb7ee6b33155b914c88",
+  "prompts": {},
+  "sessions": {
+    "s_d97cfc4b0e65fc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aa96b45067dee5884",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
