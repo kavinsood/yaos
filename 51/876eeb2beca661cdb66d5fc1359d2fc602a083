@@ -1,0 +1,19 @@
+tests/server/daily-limit.ts
+  s_b4fdd1b24c9d09::t_61a2bce23e62e3 25,326-358
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "51876eeb2beca661cdb66d5fc1359d2fc602a083",
+  "prompts": {},
+  "sessions": {
+    "s_b4fdd1b24c9d09": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-af1f7bef4fd31e500",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
