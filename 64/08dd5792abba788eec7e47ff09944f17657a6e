@@ -1,0 +1,19 @@
+scripts/relay2/wb/mimport.ts
+  s_870afe9a19f5b7::t_c1ee6fae950e71 150-162,179-181
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "6408dd5792abba788eec7e47ff09944f17657a6e",
+  "prompts": {},
+  "sessions": {
+    "s_870afe9a19f5b7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a38341bee0d04eefc",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
