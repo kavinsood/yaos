@@ -1,0 +1,25 @@
+server/src/cloudflarePorts.ts
+  s_b04c88f01f67f1::t_e3e81ca74f1e05 32-51,70-91
+server/src/platformPorts.ts
+  s_b04c88f01f67f1::t_8e641a97eae8bd 108-120
+server/src/routes/blobs.ts
+  s_b04c88f01f67f1::t_86615aba753065 3,120-136,141,148,153-170
+tests/server/blob-upload-bounds.ts
+  s_b04c88f01f67f1::t_066b05c84652cc 7,251-328
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "13a64321e0926b748f746e857ecdd9c135e286bb",
+  "prompts": {},
+  "sessions": {
+    "s_b04c88f01f67f1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aa818e9484dac5aad",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
