@@ -1,0 +1,21 @@
+server/src/relayBodies.ts
+  s_870afe9a19f5b7::t_ee7a6687429389 67-79,236-238,433,1669,1697-1714
+tests/server/recovery-projection-idle.ts
+  s_870afe9a19f5b7::t_92d7858c9b4c46 124-125,222-232,766-796
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "2fa02272d49246261a6d8331d45d3acb01ac21e4",
+  "prompts": {},
+  "sessions": {
+    "s_870afe9a19f5b7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a38341bee0d04eefc",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
