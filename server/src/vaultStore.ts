@@ -492,6 +492,7 @@ export class VaultStore extends RecoveryAuthorityStore {
 				this.storage.sql.exec("DELETE FROM relay_body_tail").toArray();
 				this.storage.sql.exec("DELETE FROM relay_device_receipts").toArray();
 			}
+			this.resetLeanCaches();
 			this.storage.sql.exec(
 				"DELETE FROM vault_operation_pages WHERE operation_id IN (SELECT operation_id FROM vault_operations WHERE kind = 'bootstrap')",
 			).toArray();
@@ -640,6 +641,7 @@ export class VaultStore extends RecoveryAuthorityStore {
 					semanticEpoch,
 					vaultSequence,
 				).toArray();
+				this.noteHeadAdvanced(input.bodyId);
 				if (input.catalog) {
 					this.assertCatalogPathUniqueness([input.catalog], vaultSequence - 1);
 					this.storage.sql.exec(
@@ -830,6 +832,7 @@ export class VaultStore extends RecoveryAuthorityStore {
 				sequence,
 			);
 			writeHead.toArray();
+			this.noteHeadAdvanced(input.documentId);
 			rowsWritten += writeHead.rowsWritten;
 			const mutations = input.catalog
 				? (Array.isArray(input.catalog) ? input.catalog : [input.catalog])

@@ -852,13 +852,14 @@ export class VaultRecoveryService {
 			};
 		}
 		const currentSequence = this.store.currentSequence();
-		const emptyVault = this.store.countActiveCatalogAt(currentSequence) === 0
+		// Only consulted without the vault-side projection (b3-a1fix: no catalog count per status poll).
+		const emptyVault = () => this.store.countActiveCatalogAt(currentSequence) === 0
 			&& this.store.activeAttachmentCatalogAt(currentSequence, "", 1).length === 0;
 		return {
 			syncReady: !this.options.hasPendingPersistence(),
 			recoveryReady: storageAvailable && (
 				(projectionStatus !== null && projectionStatus.remainingEntries === 0 && projectionStatus.lagSequences === 0)
-				|| (projectionStatus === null && emptyVault)
+				|| (projectionStatus === null && emptyVault())
 			),
 			storageAvailable,
 			projection: projectionStatus,

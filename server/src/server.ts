@@ -258,6 +258,15 @@ const PROJECTION_WAKE_RETRY_MS = 5 * 60_000;
 /** A bounded pass left work (budget or window truncated): continue soon. */
 const PROJECTION_MORE_WORK_MS = 1_000;
 
+/** b3-a1fix: a loggable one-line description (name, message, top stack frames) for wrangler tail. */
+function describeError(error: unknown): string {
+	if (error instanceof Error) {
+		const frames = (error.stack ?? "").split("\n").slice(1, 6).map((line) => line.trim()).join(" <- ");
+		return `${error.name}: ${error.message}${frames ? ` @ ${frames}` : ""}`;
+	}
+	return String(error);
+}
+
 /** Exported for tests: does this statement owe a projection wake? */
 export function isProjectionInputWrite(query: string): boolean {
 	return PROJECTION_INPUT_WRITE.test(query);
@@ -317,6 +326,9 @@ export class VaultRuntime implements DrainPort {
 	private readonly storage: VaultRuntimeStoragePort;
 	/** In-memory twin of the durable `recovery_projection_wake` marker (see markProjectionDirty). */
 	private projectionWakeOwed = false;
+	private projectionWakeChecked = false;
+	private projectionLeaseActive = false;
+	private projectionLeaseAlarmKept = false;
 	private settings: SettingsSyncStore;
 	private readonly runtimeEpoch = crypto.randomUUID();
 	private readonly dailyLimit: DailyLimitLatch;
@@ -571,6 +583,7 @@ export class VaultRuntime implements DrainPort {
 			const metadata = this.store.vaultMetadata();
 			if (!metadata) return json({ error: "vault_not_provisioned" }, 409);
 			if (metadata.vaultId !== vaultId) return json({ error: "vault_identity_mismatch" }, 409);
+			this.ensureProjectionWakeArmed();
 			const forwardedGeneration = request.headers.get(INTERNAL_GENERATION_HEADER);
 			if (forwardedGeneration !== metadata.vaultGeneration) {
 				return json({ error: "vault_generation_mismatch" }, 409);
@@ -987,6 +1000,7 @@ export class VaultRuntime implements DrainPort {
 		try {
 			await this.alarmPass();
 		} catch (error) {
+			console.error("[yaos-vault] alarm pass threw", describeError(error));
 			// D8: a pass that failed on the latched daily row limit must not throw
 			// (the platform would retry the alarm with backoff, each retry failing
 			// on the same limit). Work resumes after the reset; see setAlarmGuarded.
@@ -1000,6 +1014,19 @@ export class VaultRuntime implements DrainPort {
 	}
 
 	private async alarmPass(): Promise<void> {
+		// b3-a1fix (A2): the projection wake runs even if maintenance throws, so one
+		// failing maintenance step cannot starve the projection; the error is rethrown.
+		let maintenanceError: unknown = null;
+		try { await this.alarmMaintenance(); }
+		catch (error) {
+			maintenanceError = error;
+			console.error("[yaos-vault] alarm maintenance threw", describeError(error));
+		}
+		await this.runOwedProjectionWake();
+		if (maintenanceError !== null) throw maintenanceError;
+	}
+
+	private async alarmMaintenance(): Promise<void> {
 		this.wakeResync();
 		for (const documentId of Object.keys(this.cache.diagnostics().pending)) await this.flushDocument(documentId);
 		// Relay v2: relay bodies are checkpointed only by the relay pass (byte merge,
@@ -1068,7 +1095,6 @@ export class VaultRuntime implements DrainPort {
 			|| gc?.state === "marking" || gc?.state === "sweeping") {
 			await this.armAlarmEarliest(Date.now() + 60_000);
 		}
-		await this.runOwedProjectionWake();
 	}
 
 	/**
@@ -1101,11 +1127,21 @@ export class VaultRuntime implements DrainPort {
 			await this.armAlarmEarliest(dueAt);
 			return;
 		}
-		// Clear before waking: a mutation from here on owes (and durably records) a new wake.
-		this.projectionWakeOwed = false;
-		if (marked !== null) this.store.clearProjectionWake();
 		const metadata = this.store.vaultMetadata();
 		if (!metadata) return;
+		// b3-a1fix (A2): take the wake as a durable lease (marker moved to the crash
+		// retry time, alarm armed there) before the pass. If the isolate dies or the
+		// handler throws mid-pass, the marker and the alarm survive and the wake is
+		// retried; the marker is cleared only after the pass returns with no more work.
+		// The in-memory flag is reset so a mutation during the pass re-owes (MIN) a wake.
+		const leaseAt = Date.now() + PROJECTION_WAKE_RETRY_MS;
+		this.projectionWakeOwed = false;
+		this.store.leaseProjectionWake(leaseAt);
+		let leaseArmed = false;
+		try { leaseArmed = (await this.armAlarmEarliest(leaseAt)) === "armed"; }
+		catch (error) { console.error("[yaos-vault] projection lease alarm failed", describeError(error)); }
+		this.projectionLeaseAlarmKept = false;
+		this.projectionLeaseActive = leaseArmed;
 		let retryAt: number | null = null;
 		try {
 			const result = await runStateProjectionPass(this.stateProjectionPorts(metadata));
@@ -1115,15 +1151,40 @@ export class VaultRuntime implements DrainPort {
 			// failures (R2, eviction-adjacent storage errors) retry later; progress was
 			// not saved, and content already indexed is a one-read skip on retry.
 			const limited = isCloudflareDailyLimitError(error);
-			console.warn("[yaos-vault] recovery state projection failed", limited ? DAILY_LIMIT_ERROR_CODE : error);
+			console.error("[yaos-vault] recovery state projection failed", limited ? DAILY_LIMIT_ERROR_CODE : describeError(error));
 			retryAt = limited ? nextUtcMidnight(Date.now()) : Date.now() + PROJECTION_WAKE_RETRY_MS;
 		}
-		if (retryAt !== null) {
-			this.projectionWakeOwed = true;
-			try { this.store.oweProjectionWake(retryAt); } catch { /* the in-memory owed flag still retries */ }
-			try { await this.armAlarmEarliest(retryAt); }
-			catch (error) { if (!isCloudflareDailyLimitError(error)) throw error; }
+		let owed: number | null = retryAt;
+		try { owed = this.store.settleProjectionWake(leaseAt, retryAt); }
+		catch (error) {
+			// The lease marker (at leaseAt) still stands; the in-memory flag covers this runtime.
+			console.error("[yaos-vault] projection wake settle failed", describeError(error));
+			if (retryAt !== null) this.projectionWakeOwed = true;
 		}
+		// The lease alarm is ours alone if this pass armed it, it is still the armed
+		// alarm, and no other deadline was folded into it meanwhile ("kept"). Then it
+		// is dropped (done) or moved (a later retry, e.g. the daily reset), so a
+		// finished wake costs no trailing alarm.
+		const leaseOwned = this.projectionLeaseActive && !this.projectionLeaseAlarmKept;
+		this.projectionLeaseActive = false;
+		try {
+			const current = leaseOwned && this.options.alarms.getAlarm ? await this.options.alarms.getAlarm() : undefined;
+			if (current === leaseAt && owed === null) await this.options.alarms.deleteAlarm();
+			else if (current === leaseAt && owed !== null && owed > leaseAt) await this.setAlarmGuarded(owed, false);
+			else if (owed !== null && owed !== leaseAt) await this.armAlarmEarliest(owed);
+		} catch (error) { if (!isCloudflareDailyLimitError(error)) throw error; }
+	}
+
+	/** b3-a1fix (A2): once per runtime, an owed projection wake re-arms the alarm (cold start after a lost alarm). */
+	private ensureProjectionWakeArmed(): void {
+		if (this.projectionWakeChecked || this.deleted || !this.options.objectStore) return;
+		this.projectionWakeChecked = true;
+		let dueAt: number | null;
+		try { dueAt = this.store.projectionWakeDueAt(); }
+		catch { return; }
+		if (dueAt === null) return;
+		this.options.execution.waitUntil(this.armAlarmEarliest(Math.max(dueAt, Date.now()))
+			.catch((error: unknown) => console.warn("[yaos-vault] projection wake re-arm failed", describeError(error))));
 	}
 
 	private stateProjectionPorts(metadata: { vaultId: string; vaultGeneration: string }): StateProjectionPorts {
@@ -1857,7 +1918,10 @@ export class VaultRuntime implements DrainPort {
 	}
 
 	private async armAlarmEarliest(scheduledTime: number): Promise<AlarmArmOutcome> {
-		return await this.setAlarmGuarded(scheduledTime, true);
+		const outcome = await this.setAlarmGuarded(scheduledTime, true);
+		// b3-a1fix (A2): a deadline folded into the projection lease alarm keeps it alive.
+		if (outcome === "kept" && this.projectionLeaseActive) this.projectionLeaseAlarmKept = true;
+		return outcome;
 	}
 
 	/**

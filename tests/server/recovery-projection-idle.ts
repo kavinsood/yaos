@@ -32,6 +32,10 @@ import { decodeRecoveryStateObject } from "../../src/snapshots/recoveryStateDeco
 import { runStateProjectionPass, STATE_PROJECTION_LIMITS } from "../../server/src/recoveryStateProjection";
 import { nextUtcMidnight } from "../../server/src/dailyLimit";
 import { suite } from "../harness.ts";
+import { recoveryRevisionIdentity } from "../../server/src/recoveryAuthorityStore";
+import { RECOVERY_STATE_CONTENT_TYPE } from "../../server/src/shared/recoveryStateObject";
+import { RecoveryClient, type RestoreItem } from "../../src/snapshots/recoveryClient";
+import { DEFAULT_SETTINGS } from "../../src/settings";
 
 const s = suite("recovery-projection-idle");
 
@@ -45,18 +49,20 @@ const OWNER: VaultActorContext = {
 const realNow = Date.now;
 let clock = realNow();
 
-interface Counted { statements: number; written: number; reset(): void }
+interface Counted { statements: number; written: number; read: number; log: Array<{ query: string; bindings: unknown[]; cursor?: { rowsRead: number; rowsWritten: number } }> | null; reset(): void }
 
 /** Counts every SQL statement and Node-written row an actor issues. */
 function counted(sqlite: NodeSqliteStorage): { storage: NodeSqliteStorage; stats: Counted } {
-	const stats: Counted = { statements: 0, written: 0, reset() { this.statements = 0; this.written = 0; } };
+	const stats: Counted = { statements: 0, written: 0, read: 0, log: null, reset() { this.statements = 0; this.written = 0; this.read = 0; } };
 	const sql = new Proxy(sqlite.sql, {
 		get(target, property) {
 			if (property === "exec") {
 				return (query: string, ...bindings: unknown[]) => {
 					stats.statements++;
 					const cursor = target.exec(query, ...(bindings as never[]));
+					stats.log?.push({ query, bindings, cursor });
 					stats.written += cursor.rowsWritten;
+					stats.read += cursor.rowsRead;
 					return cursor;
 				};
 			}
@@ -115,7 +121,9 @@ interface World {
 	vaultFetch(path: string, init?: RequestInit): Promise<Response>;
 	createNotes(batch: string, notes: Array<{ name: string; text: string }>): Promise<void>;
 	/** Relay v3: appends `suffix` to a note through a group commit (tail row + head; no journal, no catalog event). */
-	groupCommit(name: string, before: string, suffix: string): string;
+	groupCommit(name: string, before: string, suffix: string, unknownHash?: boolean): string;
+	/** Relay v3: whole-text rewrite (delete all + insert `next`, the A1 autosave shape) through a group commit. */
+	rewriteCommit(name: string, next: string, unknownHash?: boolean): void;
 	advanceTo(target: number): Promise<void>;
 	settle(): Promise<void>;
 	indexed(): Set<string>;
@@ -124,6 +132,8 @@ interface World {
 	putHook: ((key: string) => void | Promise<void>) | null;
 	/** The stored state object for a plaintext hash, if projected. */
 	stateObject(contentHash: string): Uint8Array | undefined;
+	/** A new runtime (isolate) over the same storage, alarm and object store; the old one is abandoned. */
+	restart(): void;
 }
 
 async function withWorld(mode: Mode, check: (world: World) => Promise<void>): Promise<void> {
@@ -149,7 +159,7 @@ async function withWorld(mode: Mode, check: (world: World) => Promise<void>): Pr
 			recoveryAuthority: { call: async (_name, request) => await vault.fetch(request) },
 			controlPlane: { call: async () => { throw new Error("control plane is not used by projection"); } },
 		});
-		vault = new VaultRuntime({
+		const makeVault = () => new VaultRuntime({
 			storage: vaultSide.storage as never,
 			sockets: {
 				sockets: () => [],
@@ -170,6 +180,7 @@ async function withWorld(mode: Mode, check: (world: World) => Promise<void>): Pr
 			...(mode === "relay lean" ? { relayConfig: readRelayConfig({ YAOS_RELAY_LEAN_ROWS: "true" }) } : {}),
 			...(mode === "relay v3" ? { relayConfig: readRelayConfig({ YAOS_RELAY_LEAN_ROWS: "true", YAOS_RELAY_GROUP_COMMIT: "true" }) } : {}),
 		});
+		vault = makeVault();
 		const settle = async () => { while (tasks.size > 0) await Promise.all([...tasks]); };
 		let dispatches = 0;
 		const world: World = {
@@ -179,12 +190,12 @@ async function withWorld(mode: Mode, check: (world: World) => Promise<void>): Pr
 				new Headers(init.headers).forEach((value, name) => headers.set(name, value));
 				headers.set("x-yaos-vault-id", VAULT_ID);
 				headers.set("x-yaos-vault-generation", GENERATION);
-				return await vault.fetch(new Request(`https://internal${path}`, { ...init, headers }));
+				return await world.vault.fetch(new Request(`https://internal${path}`, { ...init, headers }));
 			},
 			// Seeds through the runtime's own (wake-watched) store, one body commit with its
 			// catalog creation each, as the candidate/lifecycle paths finally do.
 			createNotes: async (_batch, notes) => {
-				const store = (vault as unknown as { store: VaultStore }).store;
+				const store = (world.vault as unknown as { store: VaultStore }).store;
 				for (const entry of notes) {
 					const doc = new Y.Doc();
 					docs.set(entry.name, doc);
@@ -195,19 +206,30 @@ async function withWorld(mode: Mode, check: (world: World) => Promise<void>): Pr
 							contentHash: hashOf(entry.text), size: sizeOf(entry.text) }] });
 				}
 			},
-			groupCommit: (name, before, suffix) => {
-				const relayStore = (vault as unknown as { relayStore: RelayBodyStore | null }).relayStore;
+			groupCommit: (name, before, suffix, unknownHash = false) => {
+				const relayStore = (world.vault as unknown as { relayStore: RelayBodyStore | null }).relayStore;
 				assert.ok(relayStore, "relay v3 store");
 				const doc = docs.get(name)!;
 				assert.equal(doc.getText("body").toString(), before);
 				const vector = Y.encodeStateVector(doc);
 				doc.getText("body").insert(before.length, suffix);
 				const after = doc.getText("body").toString();
-				const store = (vault as unknown as { store: VaultStore }).store;
+				const store = (world.vault as unknown as { store: VaultStore }).store;
 				relayStore.appendRelayGroupCommit({ bodyId: `body-${name}`, expectedEpoch: store.documentHead(`body-${name}`)!.semanticEpoch,
 					update: Y.encodeStateAsUpdate(doc, vector), lastActor: OWNER,
-					catalogContent: { contentHash: hashOf(after), size: sizeOf(after) }, receipts: [], receiptTtlMs: 60_000 });
+					catalogContent: unknownHash ? null : { contentHash: hashOf(after), size: sizeOf(after) }, receipts: [], receiptTtlMs: 60_000 });
 				return after;
+			},
+			rewriteCommit: (name, next, unknownHash = false) => {
+				const relayStore = (world.vault as unknown as { relayStore: RelayBodyStore | null }).relayStore;
+				assert.ok(relayStore, "relay v3 store");
+				const doc = docs.get(name)!;
+				const vector = Y.encodeStateVector(doc);
+				doc.transact(() => { const text = doc.getText("body"); text.delete(0, text.length); text.insert(0, next); });
+				const store = (world.vault as unknown as { store: VaultStore }).store;
+				relayStore.appendRelayGroupCommit({ bodyId: `body-${name}`, expectedEpoch: store.documentHead(`body-${name}`)!.semanticEpoch,
+					update: Y.encodeStateAsUpdate(doc, vector), lastActor: OWNER,
+					catalogContent: unknownHash ? null : { contentHash: hashOf(next), size: sizeOf(next) }, receipts: [], receiptTtlMs: 60_000 });
 			},
 			settle,
 			advanceTo: async (target) => {
@@ -221,12 +243,13 @@ async function withWorld(mode: Mode, check: (world: World) => Promise<void>): Pr
 					if (!due) break;
 					clock = Math.max(clock, due.at);
 					// As on Cloudflare: a fired alarm is cleared before its handler runs.
-					if (due.kind === "vault") { vaultAlarm.at = null; await vault.alarm(); }
+					if (due.kind === "vault") { vaultAlarm.at = null; await world.vault.alarm(); }
 					else { jobAlarm.at = null; await job.dispatch(`dispatch-${++dispatches}`); }
 				}
 				clock = Math.max(clock, target);
 			},
 			objects,
+			restart: () => { vault = makeVault(); world.vault = vault; },
 			putHook: null,
 			stateObject: (contentHash) => objects.objects.get(contentObjectKey(VAULT_ID, GENERATION, contentHash)),
 			indexed: () => new Set(vaultSqlite.sql.exec<{ content_hash: string }>(
@@ -672,6 +695,272 @@ s.test("query plans: watermark change collection and head resolution are index s
 		sqlite.close();
 		await rm(directory, { recursive: true, force: true });
 	}
+});
+
+
+s.test("[relay v3] a large-state note with an unknown hash still gets projected and restored (b3-a1fix)", async () => {
+	await withWorld("relay v3", async (world) => {
+		const seed = { name: "big-note", text: `${"x".repeat(50_000)}\n` };
+		await world.createNotes("seed", [seed]);
+		await world.advanceTo(Date.now() + 10 * 60_000);
+		assert.ok(world.indexed().has(hashOf(seed.text)), "the seed is projected under its plaintext hash");
+		// As on the large-state path (state > exactMergeBytes): the client's hash claim is not
+		// accepted, so the tail row and the coalesced catalog event carry no content hash.
+		let text = seed.text;
+		for (let save = 0; save < 3; save++) text = world.groupCommit(seed.name, text, `\nrewrite ${save}\n`, true);
+		const store = (world.vault as unknown as { store: VaultStore }).store;
+		const tail = world.vaultSqlite.sql.exec<{ content_hash: string | null; latest_sequence: number; generation: number }>(
+			"SELECT content_hash, latest_sequence, generation FROM relay_body_tail WHERE body_id = ?", `body-${seed.name}`).toArray()[0];
+		assert.ok(tail, "the rewrites live in a tail row");
+		assert.equal(tail.content_hash, null, "the server holds no plaintext hash for the head");
+		await world.advanceTo(Date.now() + 10 * 60_000);
+		const revision = recoveryRevisionIdentity(`body-${seed.name}`, tail.generation, tail.latest_sequence);
+		assert.ok(world.indexed().has(revision), "the unknown-hash head is projected under its revision identity");
+		const object = world.stateObject(revision);
+		assert.ok(object, "R2 holds the latest revision, not just the stale seed");
+		const decoded = await decodeRecoveryStateObject(object);
+		assert.equal(decoded.state.identity, "revision");
+		assert.equal(new TextDecoder().decode(decoded.plain), text, "the opaque object decodes to the latest text");
+		assert.equal(world.vaultAlarm.at, null, "nothing stays pending: the vault idles");
+		assert.equal(world.vaultSqlite.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM recovery_projection_wake").one().count, 0);
+
+		// Capture: the plan names the revision identity (no "missing durable content identity" throw)
+		// and the projection already covers it, so no materialisation is needed.
+		const now = Date.now();
+		const capture = store.createRecoveryCapture({
+			captureId: "capture-a1fix", requestId: "request-a1fix", vaultId: VAULT_ID, vaultGeneration: GENERATION,
+			boundarySequence: store.currentSequence(), rootGeneration: store.documentHead("root")?.generation ?? 0,
+			runtimeEpoch: "epoch", reason: "manual", jobId: "job-a1fix", capabilityHash: "c".repeat(64),
+			capabilityExpiresAt: now + 3_600_000, softExpiresAt: now + 1_800_000, hardExpiresAt: now + 3_600_000, now,
+		});
+		const plan = store.listCapturePlanAt(capture.captureId, "active", null, 100);
+		const entry = plan.find((candidate) => candidate.kind === "active" && candidate.bodyId === `body-${seed.name}`);
+		assert.ok(entry && entry.kind === "active", "the note is in the capture plan");
+		assert.equal(entry.contentHash, revision, "the capture plan uses the projected identity");
+		assert.deepEqual(store.missingCoverage(capture.captureId, [revision], [], capture.gcEpoch).contentHashes, [],
+			"the projected object covers the capture");
+
+		// Restore: the client binds the object to the revision identity and derives the plaintext hash and size.
+		const arrayBuffer = new ArrayBuffer(object.byteLength);
+		new Uint8Array(arrayBuffer).set(object);
+		const client = new RecoveryClient({ ...DEFAULT_SETTINGS, host: "https://sync.example", deviceToken: "token", vaultId: VAULT_ID }, undefined, {
+			request: async () => ({ status: 200, json: null, text: "", arrayBuffer, headers: {
+				"content-type": RECOVERY_STATE_CONTENT_TYPE, "content-length": String(object.byteLength), "x-yaos-content-sha256": revision,
+			} }),
+		});
+		const item: Extract<RestoreItem, { kind: "markdown" }> = { kind: "markdown", itemId: "item-1", path: `${seed.name}.md`, sourceKind: "active",
+			sourceFileId: `body-${seed.name}`, sourceBodyId: `body-${seed.name}`, contentHash: entry.contentHash, size: entry.size, contentUrl: "/content" };
+		const restored = await client.downloadRestoreItemVerified("22222222-2222-4222-8222-222222222222", item);
+		assert.equal(new TextDecoder().decode(restored.bytes), text, "restore yields the latest text");
+		assert.equal(restored.item.contentHash, hashOf(text), "the restore continues under the real plaintext hash");
+		assert.equal(restored.item.size, sizeOf(text));
+		const forged = new RecoveryClient({ ...DEFAULT_SETTINGS, host: "https://sync.example", deviceToken: "token", vaultId: VAULT_ID }, undefined, {
+			request: async () => ({ status: 200, json: null, text: "", arrayBuffer, headers: {
+				"content-type": RECOVERY_STATE_CONTENT_TYPE, "content-length": String(object.byteLength), "x-yaos-content-sha256": "d".repeat(64),
+			} }),
+		});
+		await assert.rejects(forged.downloadRestoreItemVerified("22222222-2222-4222-8222-222222222222", { ...item, contentHash: "d".repeat(64) }),
+			/identity mismatch/, "an object served for another identity fails closed");
+	});
+});
+
+s.test("[relay v3] A1 whole-text rewrites: the checkpoint drops deleted content and stays near the note size (b3-a1fix)", async () => {
+	await withWorld("relay v3", async (world) => {
+		const version = (v: number) => Array.from({ length: 1000 }, (_, i) => `{"id":"el-${i}","x":${(i * 17 + v * 13) % 2000},"v":${v}}`).join("\n") + "\n";
+		await world.createNotes("seed", [{ name: "drawing", text: version(0) }]);
+		await world.advanceTo(Date.now() + 10 * 60_000);
+		const noteBytes = sizeOf(version(0));
+		const checkpointBytes = () => world.vaultSqlite.sql.exec<{ bytes: number }>(
+			"SELECT total_byte_length AS bytes FROM vault_checkpoint_manifests WHERE document_id = ? ORDER BY checkpoint_sequence DESC LIMIT 1",
+			"body-drawing").toArray()[0]?.bytes ?? 0;
+		let peak = 0;
+		for (let save = 1; save <= 12; save++) {
+			world.rewriteCommit("drawing", version(save), true);
+			if (save === 9) {
+				// One checkpoint, statement by statement: no whole-vault scan of journal/checkpoints/manifests.
+				const relay = (world.vault as unknown as { relay: { checkpointTail(id: string): unknown } }).relay;
+				world.vaultStats.log = [];
+				assert.ok(relay.checkpointTail("body-drawing"), "the checkpoint ran");
+				const log = world.vaultStats.log; world.vaultStats.log = null;
+				const scans: string[] = [];
+				for (const entry of log) {
+					if (/^\s*(EXPLAIN|PRAGMA|BEGIN|COMMIT|SAVEPOINT|RELEASE|ROLLBACK)/i.test(entry.query)) continue;
+					const detail = world.vaultSqlite.sql.exec<{ detail: string }>(`EXPLAIN QUERY PLAN ${entry.query}`, ...(entry.bindings as never[]))
+						.toArray().map((row) => row.detail).join(" | ");
+					const scanned = /SCAN (vault_journal|vault_checkpoints|vault_checkpoint_manifests|journal|manifest)\b/.test(detail)
+						|| (/SCAN checkpoint\b/.test(detail) && !/CO-ROUTINE checkpoint\b/.test(detail));
+					if (process.env.A1FIX_PROBE && /SCAN/.test(detail)) console.log(`[probe] ${detail.slice(0, 200)} :: ${entry.query.replace(/\s+/g, " ").slice(0, 100)}`);
+					if (scanned) scans.push(`${detail} :: ${entry.query.replace(/\s+/g, " ").slice(0, 120)}`);
+				}
+				assert.deepEqual(scans, [], "a checkpoint seeks its own document's history rows");
+			}
+			if (save % 2 === 0) { await world.advanceTo(Date.now() + 10 * 60_000); peak = Math.max(peak, checkpointBytes()); }
+		}
+		assert.ok(peak > 0, "the tail was checkpointed");
+		// Without the GC re-encode a byte merge keeps every deleted version: ~12 x note size by save 12.
+		assert.ok(peak < 3 * noteBytes, `checkpoint stays near the note size (peak ${peak} B, note ${noteBytes} B)`);
+		const store = (world.vault as unknown as { store: VaultStore }).store;
+		const head = store.documentHead("body-drawing")!;
+		const merged = store.durableMergedBytes("body-drawing", head.latestSequence, 9 * 1024 * 1024);
+		const doc = new Y.Doc();
+		Y.applyUpdate(doc, merged.bytes);
+		assert.equal(doc.getText("body").toString(), version(12), "the compacted checkpoint holds the latest text");
+		doc.destroy();
+		const revision = recoveryRevisionIdentity("body-drawing", head.generation, head.latestSequence);
+		const object = world.stateObject(revision);
+		assert.ok(object, "R2 holds the latest revision");
+		assert.equal(new TextDecoder().decode((await decodeRecoveryStateObject(object)).plain), version(12));
+	});
+});
+
+s.test("recovery/status with no active pin reads no checkpoint aggregate and no catalog count (EXPLAIN QUERY PLAN, b3-a1fix)", async () => {
+	await withWorld("relay v3", async (world) => {
+		await world.createNotes("seed", Array.from({ length: 30 }, (_, i) => ({ name: `status-${i}`, text: note(i) })));
+		await world.advanceTo(Date.now() + 10 * 60_000);
+		const recovery = (world.vault as unknown as { recovery: { getRecoveryStatus(input: { vaultId: string }): Promise<unknown> } }).recovery;
+		await recovery.getRecoveryStatus({ vaultId: VAULT_ID });
+		world.vaultStats.log = [];
+		const status = await recovery.getRecoveryStatus({ vaultId: VAULT_ID }) as { recoveryReady: boolean; projection: { state: string } };
+		const log = world.vaultStats.log; world.vaultStats.log = null;
+		assert.equal(status.recoveryReady, true);
+		assert.equal(status.projection.state, "ready");
+		const offending: string[] = [];
+		for (const entry of log) {
+			if (!/^\s*(SELECT|WITH)/i.test(entry.query)) continue;
+			const detail = world.vaultSqlite.sql.exec<{ detail: string }>(`EXPLAIN QUERY PLAN ${entry.query}`, ...(entry.bindings as never[]))
+				.toArray().map((row) => row.detail).join(" | ");
+			if (/SCAN (vault_checkpoints|vault_checkpoint_manifests|vault_catalog_events|vault_document_heads|vault_journal|c|m|h|catalog|checkpoint|manifest)\b/.test(detail)
+				&& !/CO-ROUTINE (c|checkpoint)\b/.test(detail)) offending.push(`${detail} :: ${entry.query.replace(/\s+/g, " ").slice(0, 120)}`);
+		}
+		assert.deepEqual(offending, [], "a status poll is O(1) in the vault size");
+	});
+});
+
+s.test("A2: an isolate that dies mid-pass (put never returns) still owes the wake; a new runtime projects it, then idles", async () => {
+	await withWorld("base", async (world) => {
+		await world.createNotes("seed", NOTES.slice(0, 3));
+		await world.advanceTo(Date.now() + 10 * 60_000);
+		assert.equal(world.vaultAlarm.at, null);
+		const fresh = { name: "crash-note", text: note(11, " crash") };
+		await world.createNotes("crash", [fresh]);
+		await world.settle();
+		const due = world.vaultAlarm.at;
+		assert.notEqual(due, null, "the mutation armed the wake");
+		// The next projection put hangs forever: the isolate is reset inside the pass.
+		const put = world.objects.put.bind(world.objects);
+		let hung = false;
+		world.objects.put = (async (...args: Parameters<typeof put>) => {
+			if (!hung) { hung = true; return await new Promise<void>(() => {}); }
+			return await put(...args);
+		}) as typeof world.objects.put;
+		clock = Math.max(clock, due!);
+		world.vaultAlarm.at = null; // fired: cleared before the handler runs
+		void world.vault.alarm();
+		for (let spin = 0; spin < 200 && !hung; spin++) await new Promise((resolve) => setImmediate(resolve));
+		assert.ok(hung, "the pass reached its put");
+		assert.notEqual(world.vaultSqlite.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM recovery_projection_wake").one().count, 0,
+			"the durable wake marker is not cleared before the pass completes");
+		assert.notEqual(world.vaultAlarm.at, null, "the lease armed a retry alarm before the pass");
+		world.restart();
+		await world.advanceTo(Date.now() + 15 * 60_000);
+		assert.ok(world.indexed().has(hashOf(fresh.text)), "the retry alarm projected the note in a new runtime");
+		assert.equal(world.vaultSqlite.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM recovery_projection_wake").one().count, 0,
+			"the marker is cleared after the successful pass");
+		assert.equal(world.vaultAlarm.at, null, "then the vault idles");
+	});
+});
+
+s.test("A2: an owed wake whose alarm was lost is re-armed by the next request to a new runtime", async () => {
+	await withWorld("base", async (world) => {
+		await world.createNotes("seed", NOTES.slice(0, 2));
+		await world.advanceTo(Date.now() + 10 * 60_000);
+		const fresh = { name: "lost-alarm-note", text: note(12, " lost") };
+		await world.createNotes("lost", [fresh]);
+		await world.settle();
+		assert.notEqual(world.vaultSqlite.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM recovery_projection_wake").one().count, 0);
+		world.vaultAlarm.at = null; // the alarm is lost (never fires)
+		world.restart();
+		await world.advanceTo(Date.now() + 10 * 60_000);
+		assert.equal(world.indexed().has(hashOf(fresh.text)), false, "nothing fires without an alarm");
+		const probe = await world.vaultFetch("/__yaos/a1fix-probe");
+		await probe.arrayBuffer().catch(() => undefined);
+		await world.settle();
+		assert.notEqual(world.vaultAlarm.at, null, "the first request of the new runtime re-armed the owed wake");
+		await world.advanceTo(Date.now() + 10 * 60_000);
+		assert.ok(world.indexed().has(hashOf(fresh.text)), "projected after the re-arm");
+	});
+});
+
+s.test("A2: a maintenance step that throws does not starve the projection wake", async () => {
+	await withWorld("base", async (world) => {
+		await world.createNotes("seed", NOTES.slice(0, 2));
+		await world.advanceTo(Date.now() + 10 * 60_000);
+		const fresh = { name: "maint-note", text: note(13, " maint") };
+		await world.createNotes("maint", [fresh]);
+		await world.settle();
+		const store = (world.vault as unknown as { store: VaultStore }).store;
+		const reap = store.reapExpiredRecoveryCaptures.bind(store);
+		let threw = 0;
+		store.reapExpiredRecoveryCaptures = () => { threw++; throw new Error("maintenance boom"); };
+		const due = world.vaultAlarm.at!;
+		clock = Math.max(clock, due);
+		world.vaultAlarm.at = null;
+		await assert.rejects(world.vault.alarm(), /maintenance boom/, "the alarm still reports the failure (platform retry)");
+		assert.ok(threw > 0);
+		assert.ok(world.indexed().has(hashOf(fresh.text)), "the wake ran despite the maintenance error");
+		store.reapExpiredRecoveryCaptures = reap;
+	});
+});
+
+s.test("A1: a warm relay v3 alarm pass seeks only changed heads and tails (EXPLAIN QUERY PLAN: no SCAN of heads or tails)", async () => {
+	await withWorld("relay v3", async (world) => {
+		const scale = NOTES.slice(0, 60);
+		await world.createNotes("seed", scale);
+		const plans = (log: Array<{ query: string; bindings: unknown[] }>) => {
+			const seen = new Map<string, string>();
+			for (const entry of log) {
+				if (seen.has(entry.query) || !/^\s*(SELECT|WITH|UPDATE|INSERT|DELETE)/i.test(entry.query)) continue;
+				const detail = world.vaultSqlite.sql.exec<{ detail: string }>(`EXPLAIN QUERY PLAN ${entry.query}`, ...(entry.bindings as never[]))
+					.toArray().map((row) => row.detail).join(" | ");
+				seen.set(entry.query, detail);
+			}
+			return seen;
+		};
+		const fullScan = /SCAN (h|vault_document_heads|relay_body_tail)\b/;
+		// Cold: the first alarm of this runtime does one full scan (and proves the detector sees it).
+		world.vaultStats.log = [];
+		await world.advanceTo(Date.now() + 10 * 60_000);
+		const cold = [...plans(world.vaultStats.log).values()].filter((detail) => fullScan.test(detail));
+		assert.ok(cold.length > 0, "the cold pass scans heads/tails once");
+		// Warm: two edits (one tail append, one more) and their wake.
+		let text = scale[3]!.text;
+		text = world.groupCommit(scale[3]!.name, text, " warm edit one");
+		const other = world.groupCommit(scale[7]!.name, scale[7]!.text, " warm edit two");
+		world.vaultStats.log = [];
+		await world.advanceTo(Date.now() + 10 * 60_000);
+		assert.ok(world.indexed().has(hashOf(text)) && world.indexed().has(hashOf(other)), "both edits projected");
+		const warm = plans(world.vaultStats.log);
+		const scans = [...warm.entries()].filter(([, detail]) => fullScan.test(detail));
+		if (process.env.A1FIX_PLANS) for (const [query, detail] of warm) if (/SCAN/.test(detail)) console.log("[warm-scan]", detail, "::", query.replace(/\s+/g, " ").slice(0, 160));
+		assert.deepEqual(scans.map(([query]) => query.replace(/\s+/g, " ").slice(0, 120)), [],
+			"no warm statement scans vault_document_heads or relay_body_tail");
+		const coalesce = [...warm.entries()].find(([query]) => /FROM vault_document_heads h/.test(query));
+		assert.ok(coalesce, "the warm pass ran the coalesce check");
+		assert.match(coalesce[1], /SEARCH h USING PRIMARY KEY \(document_id=\?\)/, coalesce[1]);
+		const tail = [...warm.entries()].find(([query]) => /SELECT base_sequence, byte_length, frames FROM relay_body_tail/.test(query));
+		assert.ok(tail, "the warm pass checked the appended tail rows");
+		assert.match(tail[1], /SEARCH relay_body_tail USING PRIMARY KEY \(body_id=\?\)/, tail[1]);
+		// The coalesced catalog events and the clock are what the cold scan would have produced.
+		const store = (world.vault as unknown as { store: VaultStore }).store;
+		const pending = world.vaultSqlite.sql.exec<{ count: number }>(`SELECT COUNT(*) AS count FROM vault_document_heads h
+			WHERE h.document_id <> 'root' AND h.latest_sequence > COALESCE(
+			  (SELECT MAX(c.sequence) FROM vault_catalog_events c WHERE c.body_id = h.document_id), 9007199254740991)`).one().count;
+		assert.equal(pending, 0, "no head is left ahead of its catalog event");
+		const truth = world.vaultSqlite.sql.exec<{ sequence: number }>(`SELECT MAX((SELECT sequence FROM vault_clock WHERE id = 1),
+			(SELECT COALESCE(MAX(sequence), 0) FROM vault_journal), (SELECT COALESCE(MAX(latest_sequence), 0) FROM relay_body_tail)) AS sequence`).one().sequence;
+		assert.equal(store.currentSequence(), truth, "the cached tail head gives the scanned clock value");
+		world.vaultStats.log = null;
+	});
 });
 
 await s.done();

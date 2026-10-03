@@ -39,15 +39,24 @@ export type RecoveryStateKind = "markdown" | "canvas";
 
 export interface RecoveryStateObject {
 	kind: RecoveryStateKind;
+	/** Plaintext sha256, or the revision identity when `identity` is "revision". */
 	contentHash: string;
+	/** Plaintext bytes; 0 (unknown) when `identity` is "revision". */
 	size: number;
 	updates: Uint8Array[];
+	/**
+	 * b3-a1fix: "revision" when the server held no plaintext hash for this body
+	 * revision (relay v3 large-body path). The client then binds the object to the
+	 * requested identity and derives the plaintext hash and size from the decode.
+	 */
+	identity?: "revision";
 }
 
 const HASH = /^[a-f0-9]{64}$/;
 
 export function encodeRecoveryStateObject(value: RecoveryStateObject, maximumBytes = Number.MAX_SAFE_INTEGER): Uint8Array {
-	if (!HASH.test(value.contentHash) || !Number.isSafeInteger(value.size) || value.size < 0) {
+	if (!HASH.test(value.contentHash) || !Number.isSafeInteger(value.size) || value.size < 0
+		|| (value.identity !== undefined && (value.identity !== "revision" || value.size !== 0))) {
 		throw new Error("invalid recovery state object");
 	}
 	return encodeBinaryEnvelope({
@@ -56,6 +65,7 @@ export function encodeRecoveryStateObject(value: RecoveryStateObject, maximumByt
 		kind: value.kind,
 		contentHash: value.contentHash,
 		size: value.size,
+		...(value.identity ? { identity: value.identity } : {}),
 		updates: value.updates,
 	}, maximumBytes);
 }
@@ -67,8 +77,10 @@ export function parseRecoveryStateObject(bytes: Uint8Array, maximumBytes = Numbe
 		|| typeof value.contentHash !== "string" || !HASH.test(value.contentHash)
 		|| typeof value.size !== "number" || !Number.isSafeInteger(value.size) || value.size < 0
 		|| !Array.isArray(value.updates)
-		|| !value.updates.every((update) => update instanceof Uint8Array)) {
+		|| !value.updates.every((update) => update instanceof Uint8Array)
+		|| (value.identity !== undefined && (value.identity !== "revision" || value.size !== 0))) {
 		throw new Error("invalid recovery state object");
 	}
-	return { kind: value.kind, contentHash: value.contentHash, size: value.size, updates: value.updates as Uint8Array[] };
+	return { kind: value.kind, contentHash: value.contentHash, size: value.size, updates: value.updates as Uint8Array[],
+		...(value.identity === "revision" ? { identity: "revision" as const } : {}) };
 }

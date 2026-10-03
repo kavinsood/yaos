@@ -811,11 +811,25 @@ export class RecoveryClient {
 	}
 
 	async downloadRestoreItem(restoreId: string, item: RestoreItem): Promise<Uint8Array> {
-		const bytes = await this.verifiedContent(`restores/${encodeURIComponent(restoreId)}/items/${encodeURIComponent(item.itemId)}/content`, item.size);
+		return (await this.downloadRestoreItemVerified(restoreId, item)).bytes;
+	}
+
+	/**
+	 * b3-a1fix: the downloaded bytes plus the descriptor they verify. For a
+	 * revision-identity state object (the server held no plaintext hash) the item's
+	 * hash is the revision identity and its size 0, so the plaintext hash and size
+	 * come from the decode and replace them for the rest of the restore.
+	 */
+	async downloadRestoreItemVerified<T extends RestoreItem>(restoreId: string, item: T): Promise<{ bytes: Uint8Array; item: T }> {
+		const content = await this.verifiedContentDetailed(`restores/${encodeURIComponent(restoreId)}/items/${encodeURIComponent(item.itemId)}/content`, item.size);
+		if (content.revision) {
+			return { bytes: content.bytes, item: { ...item, contentHash: await sha256Hex(content.bytes), size: content.bytes.byteLength } };
+		}
+		const bytes = content.bytes;
 		if (bytes.byteLength !== item.size || await sha256Hex(bytes) !== item.contentHash) {
 			throw new RecoveryTerminalItemError("content_corrupt", "restore item content does not match its descriptor");
 		}
-		return bytes;
+		return { bytes, item };
 	}
 
 	async reportRestoreResults(restoreId: string, results: RestoreItemResult[]): Promise<RestoreStatus> {
@@ -828,8 +842,8 @@ export class RecoveryClient {
 		return this.getRestoreStatusFromDelete(restoreId);
 	}
 
-	async applyMarkdownItem(restoreId: string, snapshotId: string, item: Extract<RestoreItem, { kind: "markdown" }>, liveAtReview: RecoveryLiveFile | null, runtime: RecoveryRuntimePort): Promise<RestoreItemResult> {
-		const bytes = await this.downloadRestoreItem(restoreId, item);
+	async applyMarkdownItem(restoreId: string, snapshotId: string, described: Extract<RestoreItem, { kind: "markdown" }>, liveAtReview: RecoveryLiveFile | null, runtime: RecoveryRuntimePort): Promise<RestoreItemResult> {
+		const { bytes, item } = await this.downloadRestoreItemVerified(restoreId, described);
 		let content: string;
 		try {
 			content = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
@@ -987,6 +1001,10 @@ export class RecoveryClient {
 	}
 
 	private async verifiedContent(resource: string, expectedSize: number): Promise<Uint8Array> {
+		return (await this.verifiedContentDetailed(resource, expectedSize)).bytes;
+	}
+
+	private async verifiedContentDetailed(resource: string, expectedSize: number): Promise<{ bytes: Uint8Array; revision: boolean }> {
 		if (!Number.isSafeInteger(expectedSize) || expectedSize < 0 || expectedSize > MAX_RECOVERY_CONTENT_BYTES) {
 			throw new RecoveryTerminalItemError("content_too_large", "recovery content exceeds the client read bound");
 		}
@@ -1013,8 +1031,22 @@ export class RecoveryClient {
 		}
 		let bytes = raw;
 		if (opaque) {
-			try { bytes = new Uint8Array((await decodeRecoveryStateObject(raw)).plain); }
+			let decoded: Awaited<ReturnType<typeof decodeRecoveryStateObject>>;
+			try { decoded = await decodeRecoveryStateObject(raw); }
 			catch { throw new RecoveryTerminalItemError("content_corrupt", "recovery state object does not decode"); }
+			bytes = new Uint8Array(decoded.plain);
+			if (decoded.state.identity === "revision") {
+				// b3-a1fix: no plaintext hash existed server-side; bind the object to the
+				// requested revision identity and let the decode define hash and size.
+				const identity = header(response.headers, "x-yaos-content-sha256");
+				if (!isHexHash(identity) || identity !== decoded.state.contentHash) {
+					throw new RecoveryTerminalItemError("content_corrupt", "recovery state object identity mismatch");
+				}
+				if (bytes.byteLength > MAX_RECOVERY_CONTENT_BYTES) {
+					throw new RecoveryTerminalItemError("content_too_large", "recovery content exceeds the client read bound");
+				}
+				return { bytes, revision: true };
+			}
 		}
 		if (bytes.byteLength !== expectedSize || bytes.byteLength > MAX_RECOVERY_CONTENT_BYTES) {
 			throw new RecoveryTerminalItemError("content_corrupt", "recovery content size does not match its descriptor");
@@ -1027,7 +1059,7 @@ export class RecoveryClient {
 		if (contentSize !== undefined && (!/^\d+$/.test(contentSize) || Number(contentSize) !== bytes.byteLength)) {
 			throw new RecoveryTerminalItemError("content_corrupt", "recovery content size mismatch");
 		}
-		return bytes;
+		return { bytes, revision: false };
 	}
 
 	private async json<T>(resource: string, method: "GET" | "POST" | "DELETE", body?: Record<string, unknown>): Promise<T> {

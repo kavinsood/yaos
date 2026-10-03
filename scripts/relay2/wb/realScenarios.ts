@@ -18,7 +18,7 @@ const realDevice = (ctx: RunCtx) => ctx.str("real-device", "RC")!;
 const settled = <T>(p: Promise<T>) => p.then((value) => ({ ok: true as const, value, at: now() }),
 	(error: unknown) => ({ ok: false as const, error: error instanceof Error ? `${error.name}: ${error.message}` : String(error), at: now() }));
 
-async function openRC(ctx: RunCtx, label: string, extra: Partial<Parameters<typeof openRealClient>[3]> = {}) {
+export async function openRC(ctx: RunCtx, label: string, extra: Partial<Parameters<typeof openRealClient>[3]> = {}) {
 	const id = await ctx.dev(realDevice(ctx));
 	const collector = ctx.args.flags["collector-ms"] !== undefined ? ctx.num("collector-ms", 300) : undefined;
 	return openRealClient(ctx.host, ctx.context, id, { device: realDevice(ctx), label: `${label}-${ctx.tag}`,

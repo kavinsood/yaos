@@ -19,6 +19,7 @@ import { LOG_DIR, deployRecord, log, now, r2, series, sleep, workerName } from "
 import { smallContent } from "../lib/context";
 import { bodyGet, convergence, diagnostics, frameAccounting, frameCounters } from "../lib/checks";
 import { contentHashOf, RawClient } from "../lib/rawClient";
+import { RowsTimeline } from "../b3/rowsTimeline";
 import { CoverageTracker, freshNotes, freshTraceBody, loadTrace, openOrThrow, operatorVaultPost, QUICK_TRACE_DIR,
 	replayTrace, type RunCtx } from "../lib/run";
 
@@ -599,6 +600,11 @@ export async function MB(ctx: RunCtx): Promise<Result> {
 		const d0 = await diagnostics(ctx.context.devices.A!);
 		const fc0 = await frameCounters(ctx.context.devices.A!);
 		const tracker = new CoverageTracker(b.doc);
+		// b3-m-typing: exact vault-DO counter timeline (--rows-poll-ms > 0), typingStart → typingEnd → acked → end.
+		const pollMs = ctx.num("rows-poll-ms", 0);
+		const tl = pollMs > 0 ? new RowsTimeline(ctx.context, pollMs) : null;
+		if (tl) { await tl.start(); await sleep(2 * pollMs); }
+		tl?.mark("typingStart");
 		let edits = 0;
 		if (p === "stream") {
 			const r = await replayTrace(a, trace.frames, rate, { tracker, limit: Math.min(trace.frames.length, Math.floor(seconds * rate)) });
@@ -634,11 +640,13 @@ export async function MB(ctx: RunCtx): Promise<Result> {
 				edits++;
 			}
 		}
+		tl?.mark("typingEnd");
 		const drained = await drain(tracker);
 		tracker.stop();
 		await Promise.all([a.settled(), b.settled()]);
 		const ackDeadline = now() + 30_000;
 		while (a.unacked > 0 && a.adapter.requireEcho === true && now() < ackDeadline) await sleep(100);
+		tl?.mark("acked");
 		const d1 = await diagnostics(ctx.context.devices.A!);
 		const frameOutcomes = frameAccounting(fc0, await frameCounters(ctx.context.devices.A!));
 		// Client-side receipts (a stalled/closed origin socket vs. a server that never relayed): see lost > 0.
@@ -658,6 +666,9 @@ export async function MB(ctx: RunCtx): Promise<Result> {
 		// Include the following minute (alarm checkpoints triggered by this pattern land there).
 		await sleep(60_000 - (Date.now() % 60_000) + 1500);
 		await sleep(55_000);
+		const postWait = ctx.num("post-wait-ms", 0);
+		if (postWait > 0) await sleep(postWait);
+		const sqlRows = tl ? await tl.stop() : null;
 		const d2 = await diagnostics(ctx.context.devices.A!);
 		windows.push(await closeWindow(p, start, { edits }));
 		const delta = counterDelta(d0, d2);
@@ -672,7 +683,8 @@ export async function MB(ctx: RunCtx): Promise<Result> {
 				const k = a.acks.find((x) => x.frameId === f.clientFrameId); return k ? r2(k.at - f.at) : null; }), 0),
 			ackPrefix: a.ackPrefixCheck(),
 			relayAppendsPerEdit: delta?.appends !== undefined ? r2(delta.appends / edits) : null,
-			relayCounterDelta: delta, relayBodyAfter: relayBody(d2, body), clientSide, frameOutcomes });
+			relayCounterDelta: delta, relayBodyAfter: relayBody(d2, body), clientSide, frameOutcomes,
+			...(sqlRows ? { sqlRows, sqlRowsPerEdit: (() => { const t = (sqlRows.total as { rowsWritten: number | null }).rowsWritten; return t === null ? null : r2(t / edits); })() } : {}) });
 		log(`MB ${p}: edits=${edits} ${JSON.stringify(parts.at(-1)!.propagationMs)}`);
 	}
 	const gql = await gqlWindows(ctx, windows);

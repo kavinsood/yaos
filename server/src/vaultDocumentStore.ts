@@ -1142,12 +1142,57 @@ export abstract class VaultDocumentStore {
 		if (this.initialized) this.storage.sql.exec(RELAY_TAIL_SCHEMA);
 	}
 
+	/**
+	 * b3-a1fix (A1): documents whose head moved since the last full lean-coalesce
+	 * scan of `vault_document_heads` (null = cold: this runtime has not completed a
+	 * full scan yet). Every non-root head write that can leave the head ahead of
+	 * its latest catalog event notes the document here, so a warm alarm pass seeks
+	 * only the changed heads (O(changed)) instead of scanning every head (O(N)).
+	 */
+	leanHeadsDirty: Set<string> | null = null;
+	/** b3-a1fix (A1): v3 tail rows appended since the last full tail-candidate scan (null = cold). */
+	tailDirty: Set<string> | null = null;
+
+	noteHeadAdvanced(documentId: string): void {
+		if (documentId !== "root") this.leanHeadsDirty?.add(documentId);
+	}
+
 	/** Lean-mode sequence head expression: the journal head, and in v3 the tail head too. */
 	protected leanHeadSql(): string {
 		return this.relayTailEnabled
-			? `MAX((SELECT COALESCE(MAX(sequence), 0) FROM vault_journal),
-			       (SELECT COALESCE(MAX(latest_sequence), 0) FROM relay_body_tail))`
+			? `MAX((SELECT COALESCE(MAX(sequence), 0) FROM vault_journal), ${this.tailHeadSequence()})`
 			: "(SELECT COALESCE(MAX(sequence), 0) FROM vault_journal)";
+	}
+
+	/**
+	 * b3-a1fix (A1): `relay_body_tail` has no index on latest_sequence, so its MAX
+	 * is a full scan, and it was embedded in every clock read and allocation. This
+	 * runtime reads it once and then tracks it: tail sequences only grow through
+	 * the tail INSERT (noted below), and a tail row is only deleted after the clock
+	 * was raised past it (syncLeanClock), so MAX(clock, journal, cached) is the same
+	 * value. A rolled-back append can leave the cache one allocation high (a gap in
+	 * the sequence, never a reuse).
+	 */
+	private tailHeadCache: number | null = null;
+
+	private tailHeadSequence(): number {
+		if (this.tailHeadCache === null) {
+			this.tailHeadCache = this.storage.sql.exec<{ sequence: number }>(
+				"SELECT COALESCE(MAX(latest_sequence), 0) AS sequence FROM relay_body_tail",
+			).one().sequence;
+		}
+		return this.tailHeadCache;
+	}
+
+	noteTailSequence(sequence: number): void {
+		if (this.tailHeadCache !== null && sequence > this.tailHeadCache) this.tailHeadCache = sequence;
+	}
+
+	/** b3-a1fix: storage was wiped or rewritten wholesale; every in-memory index goes cold. */
+	protected resetLeanCaches(): void {
+		this.tailHeadCache = null;
+		this.leanHeadsDirty = null;
+		this.tailDirty = null;
 	}
 
 	private addLeanColumns(): void {
@@ -1899,6 +1944,31 @@ export abstract class VaultDocumentStore {
 			size: row.size } : null;
 	}
 
+	/**
+	 * b3-a1fix: the sequence of the newest stored update of a document at or before
+	 * `through`: the max over its checkpoint, journal rows and relay-tail records
+	 * (exactly the parts the recovery recipe at `through` is built from). Stable
+	 * under checkpointing (a checkpoint is written at the head it folds) and under
+	 * feed-floor pruning (pruned rows are covered by a checkpoint at or above them).
+	 * Index seeks only; reads no update bytes except the tail row's framing.
+	 */
+	documentContentSequenceAt(documentId: string, through: number): number {
+		this.initialize();
+		const stored = this.storage.sql.exec<{ sequence: number | null }>(
+			`SELECT MAX(
+			   COALESCE((SELECT MAX(checkpoint_sequence) FROM vault_checkpoint_manifests WHERE document_id = ? AND checkpoint_sequence <= ?), 0),
+			   COALESCE((SELECT MAX(checkpoint_sequence) FROM vault_checkpoints WHERE document_id = ? AND checkpoint_sequence <= ?), 0),
+			   COALESCE((SELECT MAX(sequence) FROM vault_journal WHERE document_id = ? AND sequence <= ?), 0)
+			 ) AS sequence`,
+			documentId, through, documentId, through, documentId, through,
+		).toArray()[0]?.sequence ?? 0;
+		let sequence = stored ?? 0;
+		for (const record of this.relayTailRecords(documentId, sequence, through).records) {
+			if (record.sequence > sequence) sequence = record.sequence;
+		}
+		return sequence;
+	}
+
 	/** v3: tail records of a body in (after, through]. */
 	relayTailRecords(documentId: string, after: number, through: number):
 		{ epoch: number | null; records: RelayTailRecord[]; rowsRead: number } {
@@ -2118,6 +2188,7 @@ export abstract class VaultDocumentStore {
 			);
 			head.toArray();
 			if (head.rowsWritten !== 1) throw new Error("checkpoint head mismatch");
+			this.noteHeadAdvanced(documentId);
 			rowsWritten += head.rowsWritten;
 			// v3: the abandoned lineage's tail records (the relay service checkpoints
 			// the tail before a reset, so this is normally a no-op).
@@ -2229,9 +2300,14 @@ export abstract class VaultDocumentStore {
 	 */
 	protected pruneUnpinnedDocumentHistory(now: number, documentId: string | null = null): number {
 		let rowsWritten = this.syncLeanClock();
+		// b3-a1fix: a per-document prune (every checkpoint write) must seek that document's rows.
+		// `(? IS NULL OR x.document_id = ?)` cannot use an index, so it scanned the whole vault's
+		// journal, checkpoints and manifests on every checkpoint (EXPLAIN-tested).
+		const scope = (alias: string) => documentId === null ? "1 = 1" : `${alias}.document_id = ?`;
+		const scoped: string[] = documentId === null ? [] : [documentId];
 		const journal = this.storage.sql.exec(
 			`DELETE FROM vault_journal AS journal
-			 WHERE (? IS NULL OR journal.document_id = ?)
+			 WHERE ${scope("journal")}
 			   AND EXISTS (
 			     SELECT 1 FROM vault_document_heads head
 			      WHERE head.document_id = journal.document_id
@@ -2249,8 +2325,7 @@ export abstract class VaultDocumentStore {
 			             AND manifest.checkpoint_sequence <= pin.boundary_sequence
 			        ), 0)
 			   )`,
-			documentId,
-			documentId,
+			...scoped,
 			now,
 			now,
 		);
@@ -2259,7 +2334,7 @@ export abstract class VaultDocumentStore {
 
 		const checkpoints = this.storage.sql.exec(
 			`DELETE FROM vault_checkpoints AS checkpoint
-			 WHERE (? IS NULL OR checkpoint.document_id = ?)
+			 WHERE ${scope("checkpoint")}
 			   AND EXISTS (
 			     SELECT 1 FROM vault_document_heads head
 			      WHERE head.document_id = checkpoint.document_id
@@ -2286,8 +2361,7 @@ export abstract class VaultDocumentStore {
 			             AND protected.checkpoint_sequence <= pin.boundary_sequence
 			        )
 			   )`,
-			documentId,
-			documentId,
+			...scoped,
 			now,
 			now,
 		);
@@ -2296,7 +2370,7 @@ export abstract class VaultDocumentStore {
 
 		const manifests = this.storage.sql.exec(
 			`DELETE FROM vault_checkpoint_manifests AS manifest
-			 WHERE (? IS NULL OR manifest.document_id = ?)
+			 WHERE ${scope("manifest")}
 			   AND EXISTS (
 			     SELECT 1 FROM vault_document_heads head
 			      WHERE head.document_id = manifest.document_id
@@ -2323,8 +2397,7 @@ export abstract class VaultDocumentStore {
 			             AND protected.checkpoint_sequence <= pin.boundary_sequence
 			        )
 			   )`,
-			documentId,
-			documentId,
+			...scoped,
 			now,
 			now,
 		);
@@ -2351,6 +2424,10 @@ export abstract class VaultDocumentStore {
 	 * writers call this after inserting their manifest but before committing.
 	 */
 	protected retainedCheckpointBytes(now: number, candidateBoundary: number | null = null): number {
+		// b3-a1fix: with no active pin and no candidate boundary nothing is retained (the outer
+		// predicate needs one), so skip the whole-vault checkpoint aggregate (every checkpoint write).
+		if (candidateBoundary === null && this.storage.sql.exec(
+			"SELECT 1 FROM vault_history_pins WHERE soft_expires_at > ? AND hard_expires_at > ? LIMIT 1", now, now).toArray().length === 0) return 0;
 		const row = this.storage.sql.exec<{ bytes: number }>(
 			`WITH logical_checkpoint AS (
 			   SELECT checkpoint.document_id, checkpoint.checkpoint_sequence,
