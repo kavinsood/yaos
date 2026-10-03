@@ -32,6 +32,8 @@ export interface RelayFlagEnv {
 	/** v3: minimum time between two idle-triggered group commits of one body (0 = off). */
 	YAOS_RELAY_GC_MIN_INTERVAL_MS?: string;
 	YAOS_RELAY_GC_MAX_BYTES?: string;
+	YAOS_RELAY_GC_TAIL_MAX_BYTES?: string;
+	YAOS_RELAY_GC_TAIL_RATIO?: string;
 	/** v3: tail row cap; a group commit that leaves the tail at or over it checkpoints the body. */
 	YAOS_RELAY_GC_TAIL_BYTES?: string;
 	/** v3: delay of the (one per window) alarm that publishes coalesced catalog events; 0 = tail checkpoints only. */
@@ -92,6 +94,17 @@ export interface RelayConfig {
 	gcMaxBytes: number;
 	gcTailBytes: number;
 	/**
+	 * b3-ckpt tail hysteresis: a tail at or over `gcTailBytes` checkpoints only
+	 * once it also reaches `gcTailRatio` x the body's checkpoint size, capped at
+	 * `gcTailMaxBytes` (well inside RELAY_TAIL_HARD_MAX_BYTES and the SQLite row
+	 * limit). Small-edit bodies (tiny tails, frame cap first) are unaffected; a
+	 * whole-file rewrite (one note-sized update per save) gets ~ratio saves per
+	 * checkpoint instead of ~2. Replay on load reads at most checkpoint x (1 +
+	 * ratio) bytes. `gcTailMaxBytes <= gcTailBytes` restores the fixed soft cap.
+	 */
+	gcTailMaxBytes: number;
+	gcTailRatio: number;
+	/**
 	 * v3: a group commit arms the relay alarm at most once per window, this far
 	 * out (one setAlarm row per window, not per commit). The alarm publishes the
 	 * coalesced catalog events of every body committed since (the catalog head
@@ -131,6 +144,8 @@ export const DEFAULT_RELAY_CONFIG: Readonly<RelayConfig> = Object.freeze({
 	gcMinIntervalMs: 1_000,
 	gcMaxBytes: 65_536,
 	gcTailBytes: 65_536,
+	gcTailMaxBytes: 768 * 1024,
+	gcTailRatio: 16,
 	gcCatalogDelayMs: 30_000,
 });
 
@@ -195,6 +210,8 @@ export function readRelayConfig(env: RelayFlagEnv | null | undefined): RelayConf
 		gcMinIntervalMs: positiveInt(source.YAOS_RELAY_GC_MIN_INTERVAL_MS, DEFAULT_RELAY_CONFIG.gcMinIntervalMs, 0, 60_000),
 		gcMaxBytes: positiveInt(source.YAOS_RELAY_GC_MAX_BYTES, DEFAULT_RELAY_CONFIG.gcMaxBytes, 1, MAX_DURABLE_UPDATE_BYTES),
 		gcTailBytes: positiveInt(source.YAOS_RELAY_GC_TAIL_BYTES, DEFAULT_RELAY_CONFIG.gcTailBytes, 1, 1024 * 1024),
+		gcTailMaxBytes: positiveInt(source.YAOS_RELAY_GC_TAIL_MAX_BYTES, DEFAULT_RELAY_CONFIG.gcTailMaxBytes, 1, 1024 * 1024),
+		gcTailRatio: positiveInt(source.YAOS_RELAY_GC_TAIL_RATIO, DEFAULT_RELAY_CONFIG.gcTailRatio, 0, 1024),
 		gcCatalogDelayMs: positiveInt(source.YAOS_RELAY_GC_CATALOG_DELAY_MS, DEFAULT_RELAY_CONFIG.gcCatalogDelayMs, 0, 3_600_000),
 	};
 }

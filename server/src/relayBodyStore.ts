@@ -417,19 +417,21 @@ export class RelayBodyStore {
 	}
 
 	/** v3: bodies whose tail row is at or over the cap (alarm pass). */
-	tailCheckpointCandidates(bytes: number, frames: number, limit: number): string[] {
+	tailCheckpointCandidates(bytes: number, frames: number, limit: number,
+		due: (bodyId: string, byteLength: number, frames: number) => boolean = () => true): string[] {
 		if (!this.store.relayTail) return [];
 		this.store.initialize();
 		const dirty = this.store.tailDirty;
 		if (dirty === null) {
 			// Cold (first pass of this runtime): one full scan. Fewer than `limit` hits
 			// means every over-cap row is known; from then on only appended rows are checked.
-			const cold = this.storage.sql.exec<{ body_id: string }>(
-				`SELECT body_id FROM relay_body_tail WHERE byte_length >= ? OR frames >= ? ORDER BY base_sequence LIMIT ?`,
+			const cold = this.storage.sql.exec<{ body_id: string; byte_length: number; frames: number }>(
+				`SELECT body_id, byte_length, frames FROM relay_body_tail WHERE byte_length >= ? OR frames >= ? ORDER BY base_sequence LIMIT ?`,
 				bytes, frames, limit,
-			).toArray().map((row) => row.body_id);
-			if (cold.length < limit) this.store.tailDirty = new Set(cold);
-			return cold;
+			).toArray();
+			// b3-ckpt: over-cap rows the hysteresis defers stay in the dirty set (rechecked by seek).
+			if (cold.length < limit) this.store.tailDirty = new Set(cold.map((row) => row.body_id));
+			return cold.filter((row) => due(row.body_id, row.byte_length, row.frames)).map((row) => row.body_id);
 		}
 		// b3-a1fix (A1): warm, O(appended): a primary-key seek per tail row appended
 		// since the last check. Rows under the cap leave the set (the next append
@@ -440,7 +442,7 @@ export class RelayBodyStore {
 				"SELECT base_sequence, byte_length, frames FROM relay_body_tail WHERE body_id = ?", id,
 			).toArray()[0];
 			if (!row || (row.byte_length < bytes && row.frames < frames)) dirty.delete(id);
-			else over.push({ id, base: row.base_sequence });
+			else if (due(id, row.byte_length, row.frames)) over.push({ id, base: row.base_sequence });
 		}
 		return over.sort((left, right) => left.base - right.base).slice(0, limit).map((entry) => entry.id);
 	}

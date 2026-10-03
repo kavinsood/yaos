@@ -301,6 +301,10 @@ export interface RelayCounters {
 	 */
 	rateGateCloses: number;
 	rawGateDrops: number;
+	/** b3-ckpt: in-memory merged bytes GC'd back into the exact window. */
+	mergedGcCompactions: number;
+	/** b3-ckpt: tails over gcTailBytes left to grow by the hysteresis. */
+	tailCheckpointsDeferred: number;
 }
 
 export interface RelayBodyServiceOptions {
@@ -421,6 +425,8 @@ export class RelayBodyService {
 	private readonly staleResidents = new Set<string>();
 	/** Lazily materialised hashes keyed by body, valid for one (epoch, head sequence) (G4). */
 	private readonly lazyHashes = new Map<string, { epoch: SemanticEpoch; sequence: number; contentHash: string; size: number }>();
+	/** b3-ckpt: stored checkpoint bytes per body (tail hysteresis input), bounded LRU; a miss costs one SQL read. */
+	private readonly checkpointSizes = new Map<string, number>();
 	readonly counters: RelayCounters = {
 		appends: 0, appendFrames: 0, emptySkips: 0, noopSkips: 0, dedupeHits: 0, dedupeConflicts: 0,
 		envelopeMismatches: 0, hashAccepted: 0, hashUnknown: 0, materialisations: 0, checkpoints: 0,
@@ -436,6 +442,7 @@ export class RelayBodyService {
 		pendingReplayFrames: 0, wakeResyncs: 0, wakeResyncSockets: 0, groupFlushReads: 0, failedSocketDrops: 0,
 		wakeHeldAcks: 0, wakeHeldAcksDropped: 0, authorityFenceFlushes: 0, revokedBroadcastCommits: 0,
 		httpRelayCommits: 0, httpRelayNoops: 0, groupIdleDeferred: 0, rateGateCloses: 0, rawGateDrops: 0,
+		mergedGcCompactions: 0, tailCheckpointsDeferred: 0,
 	};
 	/** v3 group-commit buffers keyed by (body, epoch). */
 	private readonly groups = new Map<string, GroupBuffer>();
@@ -521,6 +528,9 @@ export class RelayBodyService {
 		let stateVector: Uint8Array;
 		try {
 			durable = this.options.store().durableMergedBytes(bodyId, throughSequence, this.config.maxMergeInputBytes);
+			// b3-ckpt: checkpoint + a hysteresis-sized tail of whole rewrites is byte-merged
+			// with every deleted copy; GC it back into the exact window (same SV, same text).
+			durable = { ...durable, bytes: this.compactMerged(durable.bytes!) };
 			stateVector = stateVectorFromUpdate(durable.bytes!);
 		} catch (error) {
 			if (!(error instanceof RelayMergeBudgetError)) throw error;
@@ -571,6 +581,7 @@ export class RelayBodyService {
 	}
 
 	invalidate(bodyId: string): void {
+		this.checkpointSizes.delete(bodyId);
 		const previous = this.merged.get(bodyId);
 		if (!previous) return;
 		this.merged.delete(bodyId);
@@ -959,8 +970,7 @@ export class RelayBodyService {
 			this.counters.httpRelayCommits++;
 			this.counters.rowsWritten += result.rowsWritten;
 			if (result.journalFallback) this.counters.tailJournalFallbacks++;
-			if (result.tailBytes >= this.config.gcTailBytes || result.tailFrames >= RELAY_GC_TAIL_MAX_FRAMES
-				|| result.journalFallback) {
+			if (this.tailCheckpointDue(input.bodyId, result.tailBytes, result.tailFrames, result.journalFallback)) {
 				this.postCommit(() => { this.checkpointTail(input.bodyId); });
 			}
 			if (this.config.gcCatalogDelayMs > 0) this.postCommit(() => this.options.armCheckpointAlarm());
@@ -1310,6 +1320,9 @@ export class RelayBodyService {
 		if (exact) {
 			nextMerged = mergeUpdates([state.bytes!, update]);
 			noop = sameBytes(nextMerged, state.bytes!);
+			// b3-ckpt: the tail now outlives several whole rewrites; keep the in-memory
+			// merged bytes GC'd so the body stays in the exact window (hash claims accepted).
+			if (!noop) nextMerged = this.compactMerged(nextMerged);
 			nextStateVector = noop ? state.stateVector : stateVectorFromUpdate(nextMerged);
 		} else {
 			noop = state.lastUpdate !== null && sameBytes(state.lastUpdate, update);
@@ -1476,8 +1489,7 @@ export class RelayBodyService {
 		if (grouped) {
 			// v3: no alarm per commit (setAlarm is a written row). The tail cap
 			// checkpoints inline, off the ack path; catalog coalescing rides along.
-			if ((result.tailBytes ?? 0) >= this.config.gcTailBytes || (result.tailFrames ?? 0) >= RELAY_GC_TAIL_MAX_FRAMES
-				|| result.journalFallback) {
+			if (this.tailCheckpointDue(bodyId, result.tailBytes ?? 0, result.tailFrames ?? 0, result.journalFallback === true)) {
 				this.postCommit(() => { this.checkpointTail(bodyId); });
 			}
 			// The catalog delta feed lags until a coalescing pass; the host arms the
@@ -1680,6 +1692,7 @@ export class RelayBodyService {
 		if (partial) {
 			this.invalidate(bodyId);
 		} else {
+			this.noteCheckpointSize(bodyId, durable.bytes.byteLength);
 			const previous = this.merged.get(bodyId);
 			const stateVector = stateVectorFromUpdate(durable.bytes);
 			if (previous && !previous.stateVectorExact && previous.latestSequence === head.latestSequence
@@ -1710,6 +1723,56 @@ export class RelayBodyService {
 		} finally {
 			if (doc) crdtEngine.destroyDocument(doc);
 		}
+	}
+
+	/**
+	 * b3-ckpt: in-memory merged bytes over the exact-merge window are GC
+	 * re-encoded (`gcCompacted`: same identities and state vector, deleted
+	 * content dropped). Without it a hysteresis-sized tail of whole rewrites
+	 * would push the body out of the exact window and its hash claims would
+	 * stop being accepted. Never throws; returns the input when it cannot help.
+	 */
+	private compactMerged(bytes: Uint8Array): Uint8Array {
+		if (bytes.byteLength <= this.config.exactMergeBytes) return bytes;
+		const compacted = this.gcCompacted(bytes);
+		if (compacted !== bytes) this.counters.mergedGcCompactions++;
+		return compacted;
+	}
+
+	/**
+	 * b3-ckpt tail hysteresis (see RelayConfig.gcTailMaxBytes): the tail byte
+	 * size at which a body checkpoints. `gcTailBytes` is the floor (small
+	 * bodies keep the measured relay3 cadence), `gcTailRatio` x the stored
+	 * checkpoint size the target, `gcTailMaxBytes` the cap.
+	 */
+	tailCheckpointThreshold(bodyId: string): number {
+		const { gcTailBytes, gcTailMaxBytes, gcTailRatio } = this.config;
+		if (gcTailMaxBytes <= gcTailBytes || gcTailRatio <= 0) return gcTailBytes;
+		return Math.min(gcTailMaxBytes, Math.max(gcTailBytes, gcTailRatio * this.checkpointSize(bodyId)));
+	}
+
+	/** True when a tail of this size must checkpoint now (frame cap and journal fallback always do). */
+	tailCheckpointDue(bodyId: string, tailBytes: number, tailFrames: number, journalFallback: boolean): boolean {
+		if (journalFallback || tailFrames >= RELAY_GC_TAIL_MAX_FRAMES) return true;
+		if (tailBytes < this.config.gcTailBytes) return false;
+		if (tailBytes >= this.tailCheckpointThreshold(bodyId)) return true;
+		this.counters.tailCheckpointsDeferred++;
+		return false;
+	}
+
+	private checkpointSize(bodyId: string): number {
+		const cached = this.checkpointSizes.get(bodyId);
+		if (cached !== undefined) return cached;
+		const sequence = this.options.store().documentJournalTailStats(bodyId).checkpointSequence;
+		const size = this.options.relayStore().checkpointByteLength(bodyId, sequence);
+		this.noteCheckpointSize(bodyId, size);
+		return size;
+	}
+
+	private noteCheckpointSize(bodyId: string, bytes: number): void {
+		this.checkpointSizes.delete(bodyId);
+		this.checkpointSizes.set(bodyId, bytes);
+		if (this.checkpointSizes.size > 4096) this.checkpointSizes.delete(this.checkpointSizes.keys().next().value!);
 	}
 
 	private overBudgetMarkers(): Map<string, number> {
@@ -1775,7 +1838,7 @@ export class RelayBodyService {
 		}
 		if (store.relayTail) {
 			for (const bodyId of this.options.relayStore().tailCheckpointCandidates(this.config.gcTailBytes,
-				RELAY_GC_TAIL_MAX_FRAMES, options.limit ?? 25)) {
+				RELAY_GC_TAIL_MAX_FRAMES, options.limit ?? 25, (id, bytes, frames) => this.tailCheckpointDue(id, bytes, frames, false))) {
 				if (options.skip?.(bodyId)) continue;
 				try { if (this.checkpointTail(bodyId)) checkpoints++; }
 				catch (error) { retry = true; console.warn("[yaos-relay] tail checkpoint failed", error); }

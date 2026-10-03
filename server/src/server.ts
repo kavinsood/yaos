@@ -331,6 +331,8 @@ export class VaultRuntime implements DrainPort {
 	private projectionLeaseAlarmKept = false;
 	private settings: SettingsSyncStore;
 	private readonly runtimeEpoch = crypto.randomUUID();
+	/** b3-ckpt: runtime construction time (debug sql-rows: a change of epoch/start is a DO restart). */
+	private readonly runtimeStartedAt = Date.now();
 	private readonly dailyLimit: DailyLimitLatch;
 	private readonly cache: VaultDocumentCache;
 	private readonly sockets: VaultSocketService;
@@ -604,7 +606,17 @@ export class VaultRuntime implements DrainPort {
 			if (url.pathname === SQL_ROWS_RUNTIME_PATH || url.pathname === SQL_ROWS_RESET_RUNTIME_PATH) {
 				const counter = this.options.sqlRowCounter;
 				if (!counter) return json({ error: "not_found" }, 404);
-				if (request.method === "GET" && url.pathname === SQL_ROWS_RUNTIME_PATH) return json(counter.snapshot());
+				if (request.method === "GET" && url.pathname === SQL_ROWS_RUNTIME_PATH) {
+					// b3-ckpt: restart and memory attribution on deployed runs (test-gated route).
+					const memory = crdtEngine.memoryDiagnostics();
+					const c = this.relay?.counters;
+					return json({ ...counter.snapshot(), runtime: { epoch: this.runtimeEpoch.slice(0, 8),
+						startedAt: this.runtimeStartedAt, wasmLinearBytes: memory?.linearMemoryBytes ?? null,
+						relay: c ? { checkpoints: c.checkpoints, tailCheckpoints: c.tailCheckpoints,
+							tailCheckpointsDeferred: c.tailCheckpointsDeferred, checkpointGcCompactions: c.checkpointGcCompactions,
+							mergedGcCompactions: c.mergedGcCompactions, mergedCacheRebuilds: c.mergedCacheRebuilds,
+							hashAccepted: c.hashAccepted, hashUnknown: c.hashUnknown, lastCheckpointMs: c.lastCheckpointMs } : null } });
+				}
 				if (request.method === "POST" && url.pathname === SQL_ROWS_RESET_RUNTIME_PATH) return json({ reset: true, previous: counter.reset() });
 				return json({ error: "not_found" }, 404);
 			}
