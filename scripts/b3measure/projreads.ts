@@ -59,9 +59,11 @@ try {
 	for (let s = 0, b = 0; s < N; s += 350, b++) {
 		const ids = Array.from({ length: Math.min(350, N - s) }, (_v, k) => s + k);
 		const body = encodeBinaryEnvelope({ batchId: `b${b}`, rootEpoch: 1, attachments: [], files: ids.map((i) => ({ operationId: `op-${i}`, bodyId: `body-${i}`, path: `f${i % 40}/n-${i}.md`, updates: [frame(text(i))] })) });
+		if (process.env.BATCH_ROWS) tally = new Map();
 		const r = await fetchVault("/lifecycle/create-bulk", { method: "POST", body: body.slice().buffer });
 		if (r.status !== 200) throw new Error(`bulk ${r.status} ${await r.text()}`);
 		await settle();
+		if (tally) { const t = [...tally.values()]; tally = null; console.log(`batch ${b} notes=${ids.length} written=${t.reduce((a, e) => a + e.cursors.reduce((x, c) => x + (c.rowsWritten || 0), 0), 0)} statements=${t.reduce((a, e) => a + e.n, 0)}`); }
 	}
 	console.log(`seeded ${N} notes; puts after inline: ${puts}; alarm ${alarm !== null}`);
 	for (let p = 0; p < PASSES; p++) {
