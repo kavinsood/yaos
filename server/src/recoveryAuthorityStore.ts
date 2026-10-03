@@ -1797,6 +1797,39 @@ export class RecoveryAuthorityStore extends VaultBootstrapStore {
 		this.storage.sql.exec("DELETE FROM recovery_projection_wake WHERE id = 1").toArray();
 	}
 
+	/**
+	 * b3-a1fix (A2): a pass about to run takes the wake as a lease: the durable
+	 * marker moves to `leaseAt` (the crash retry time) instead of being deleted, so
+	 * an isolate that dies mid-pass still owes the wake to any later alarm or start.
+	 */
+	leaseProjectionWake(leaseAt: number): void {
+		this.initialize();
+		this.storage.sql.exec(
+			"INSERT INTO recovery_projection_wake(id, due_at) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET due_at = excluded.due_at",
+			leaseAt,
+		).toArray();
+	}
+
+	/**
+	 * b3-a1fix (A2): end the lease taken by `leaseProjectionWake`. Done (`retryAt`
+	 * null): the marker is deleted only if no mutation re-owed an earlier wake
+	 * during the pass. More work or a failure: the marker moves to `retryAt` (an
+	 * earlier wake owed meanwhile is kept). Returns the wake still owed, if any.
+	 */
+	settleProjectionWake(leaseAt: number, retryAt: number | null): number | null {
+		this.initialize();
+		if (retryAt === null) {
+			this.storage.sql.exec("DELETE FROM recovery_projection_wake WHERE id = 1 AND due_at = ?", leaseAt).toArray();
+		} else {
+			this.storage.sql.exec(
+				`INSERT INTO recovery_projection_wake(id, due_at) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET
+				 due_at = CASE WHEN due_at = ? THEN excluded.due_at ELSE MIN(due_at, excluded.due_at) END`,
+				retryAt, leaseAt,
+			).toArray();
+		}
+		return this.projectionWakeDueAt();
+	}
+
 
 	planPageCommitment(captureId: string, stream: CapturePlanStream, startCursor: string | null): {
 		pageHash: string; endCursor: string | null; rollingDigest: string; terminal: boolean;

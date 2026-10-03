@@ -128,6 +128,8 @@ interface World {
 	putHook: ((key: string) => void | Promise<void>) | null;
 	/** The stored state object for a plaintext hash, if projected. */
 	stateObject(contentHash: string): Uint8Array | undefined;
+	/** A new runtime (isolate) over the same storage, alarm and object store; the old one is abandoned. */
+	restart(): void;
 }
 
 async function withWorld(mode: Mode, check: (world: World) => Promise<void>): Promise<void> {
@@ -153,7 +155,7 @@ async function withWorld(mode: Mode, check: (world: World) => Promise<void>): Pr
 			recoveryAuthority: { call: async (_name, request) => await vault.fetch(request) },
 			controlPlane: { call: async () => { throw new Error("control plane is not used by projection"); } },
 		});
-		vault = new VaultRuntime({
+		const makeVault = () => new VaultRuntime({
 			storage: vaultSide.storage as never,
 			sockets: {
 				sockets: () => [],
@@ -174,6 +176,7 @@ async function withWorld(mode: Mode, check: (world: World) => Promise<void>): Pr
 			...(mode === "relay lean" ? { relayConfig: readRelayConfig({ YAOS_RELAY_LEAN_ROWS: "true" }) } : {}),
 			...(mode === "relay v3" ? { relayConfig: readRelayConfig({ YAOS_RELAY_LEAN_ROWS: "true", YAOS_RELAY_GROUP_COMMIT: "true" }) } : {}),
 		});
+		vault = makeVault();
 		const settle = async () => { while (tasks.size > 0) await Promise.all([...tasks]); };
 		let dispatches = 0;
 		const world: World = {
@@ -183,12 +186,12 @@ async function withWorld(mode: Mode, check: (world: World) => Promise<void>): Pr
 				new Headers(init.headers).forEach((value, name) => headers.set(name, value));
 				headers.set("x-yaos-vault-id", VAULT_ID);
 				headers.set("x-yaos-vault-generation", GENERATION);
-				return await vault.fetch(new Request(`https://internal${path}`, { ...init, headers }));
+				return await world.vault.fetch(new Request(`https://internal${path}`, { ...init, headers }));
 			},
 			// Seeds through the runtime's own (wake-watched) store, one body commit with its
 			// catalog creation each, as the candidate/lifecycle paths finally do.
 			createNotes: async (_batch, notes) => {
-				const store = (vault as unknown as { store: VaultStore }).store;
+				const store = (world.vault as unknown as { store: VaultStore }).store;
 				for (const entry of notes) {
 					const doc = new Y.Doc();
 					docs.set(entry.name, doc);
@@ -200,14 +203,14 @@ async function withWorld(mode: Mode, check: (world: World) => Promise<void>): Pr
 				}
 			},
 			groupCommit: (name, before, suffix, unknownHash = false) => {
-				const relayStore = (vault as unknown as { relayStore: RelayBodyStore | null }).relayStore;
+				const relayStore = (world.vault as unknown as { relayStore: RelayBodyStore | null }).relayStore;
 				assert.ok(relayStore, "relay v3 store");
 				const doc = docs.get(name)!;
 				assert.equal(doc.getText("body").toString(), before);
 				const vector = Y.encodeStateVector(doc);
 				doc.getText("body").insert(before.length, suffix);
 				const after = doc.getText("body").toString();
-				const store = (vault as unknown as { store: VaultStore }).store;
+				const store = (world.vault as unknown as { store: VaultStore }).store;
 				relayStore.appendRelayGroupCommit({ bodyId: `body-${name}`, expectedEpoch: store.documentHead(`body-${name}`)!.semanticEpoch,
 					update: Y.encodeStateAsUpdate(doc, vector), lastActor: OWNER,
 					catalogContent: unknownHash ? null : { contentHash: hashOf(after), size: sizeOf(after) }, receipts: [], receiptTtlMs: 60_000 });
@@ -225,12 +228,13 @@ async function withWorld(mode: Mode, check: (world: World) => Promise<void>): Pr
 					if (!due) break;
 					clock = Math.max(clock, due.at);
 					// As on Cloudflare: a fired alarm is cleared before its handler runs.
-					if (due.kind === "vault") { vaultAlarm.at = null; await vault.alarm(); }
+					if (due.kind === "vault") { vaultAlarm.at = null; await world.vault.alarm(); }
 					else { jobAlarm.at = null; await job.dispatch(`dispatch-${++dispatches}`); }
 				}
 				clock = Math.max(clock, target);
 			},
 			objects,
+			restart: () => { vault = makeVault(); world.vault = vault; },
 			putHook: null,
 			stateObject: (contentHash) => objects.objects.get(contentObjectKey(VAULT_ID, GENERATION, contentHash)),
 			indexed: () => new Set(vaultSqlite.sql.exec<{ content_hash: string }>(
@@ -742,6 +746,82 @@ s.test("[relay v3] a large-state note with an unknown hash still gets projected 
 		});
 		await assert.rejects(forged.downloadRestoreItemVerified("22222222-2222-4222-8222-222222222222", { ...item, contentHash: "d".repeat(64) }),
 			/identity mismatch/, "an object served for another identity fails closed");
+	});
+});
+
+s.test("A2: an isolate that dies mid-pass (put never returns) still owes the wake; a new runtime projects it, then idles", async () => {
+	await withWorld("base", async (world) => {
+		await world.createNotes("seed", NOTES.slice(0, 3));
+		await world.advanceTo(Date.now() + 10 * 60_000);
+		assert.equal(world.vaultAlarm.at, null);
+		const fresh = { name: "crash-note", text: note(11, " crash") };
+		await world.createNotes("crash", [fresh]);
+		await world.settle();
+		const due = world.vaultAlarm.at;
+		assert.notEqual(due, null, "the mutation armed the wake");
+		// The next projection put hangs forever: the isolate is reset inside the pass.
+		const put = world.objects.put.bind(world.objects);
+		let hung = false;
+		world.objects.put = (async (...args: Parameters<typeof put>) => {
+			if (!hung) { hung = true; return await new Promise<void>(() => {}); }
+			return await put(...args);
+		}) as typeof world.objects.put;
+		clock = Math.max(clock, due!);
+		world.vaultAlarm.at = null; // fired: cleared before the handler runs
+		void world.vault.alarm();
+		for (let spin = 0; spin < 200 && !hung; spin++) await new Promise((resolve) => setImmediate(resolve));
+		assert.ok(hung, "the pass reached its put");
+		assert.notEqual(world.vaultSqlite.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM recovery_projection_wake").one().count, 0,
+			"the durable wake marker is not cleared before the pass completes");
+		assert.notEqual(world.vaultAlarm.at, null, "the lease armed a retry alarm before the pass");
+		world.restart();
+		await world.advanceTo(Date.now() + 15 * 60_000);
+		assert.ok(world.indexed().has(hashOf(fresh.text)), "the retry alarm projected the note in a new runtime");
+		assert.equal(world.vaultSqlite.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM recovery_projection_wake").one().count, 0,
+			"the marker is cleared after the successful pass");
+		assert.equal(world.vaultAlarm.at, null, "then the vault idles");
+	});
+});
+
+s.test("A2: an owed wake whose alarm was lost is re-armed by the next request to a new runtime", async () => {
+	await withWorld("base", async (world) => {
+		await world.createNotes("seed", NOTES.slice(0, 2));
+		await world.advanceTo(Date.now() + 10 * 60_000);
+		const fresh = { name: "lost-alarm-note", text: note(12, " lost") };
+		await world.createNotes("lost", [fresh]);
+		await world.settle();
+		assert.notEqual(world.vaultSqlite.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM recovery_projection_wake").one().count, 0);
+		world.vaultAlarm.at = null; // the alarm is lost (never fires)
+		world.restart();
+		await world.advanceTo(Date.now() + 10 * 60_000);
+		assert.equal(world.indexed().has(hashOf(fresh.text)), false, "nothing fires without an alarm");
+		const probe = await world.vaultFetch("/__yaos/a1fix-probe");
+		await probe.arrayBuffer().catch(() => undefined);
+		await world.settle();
+		assert.notEqual(world.vaultAlarm.at, null, "the first request of the new runtime re-armed the owed wake");
+		await world.advanceTo(Date.now() + 10 * 60_000);
+		assert.ok(world.indexed().has(hashOf(fresh.text)), "projected after the re-arm");
+	});
+});
+
+s.test("A2: a maintenance step that throws does not starve the projection wake", async () => {
+	await withWorld("base", async (world) => {
+		await world.createNotes("seed", NOTES.slice(0, 2));
+		await world.advanceTo(Date.now() + 10 * 60_000);
+		const fresh = { name: "maint-note", text: note(13, " maint") };
+		await world.createNotes("maint", [fresh]);
+		await world.settle();
+		const store = (world.vault as unknown as { store: VaultStore }).store;
+		const reap = store.reapExpiredRecoveryCaptures.bind(store);
+		let threw = 0;
+		store.reapExpiredRecoveryCaptures = () => { threw++; throw new Error("maintenance boom"); };
+		const due = world.vaultAlarm.at!;
+		clock = Math.max(clock, due);
+		world.vaultAlarm.at = null;
+		await assert.rejects(world.vault.alarm(), /maintenance boom/, "the alarm still reports the failure (platform retry)");
+		assert.ok(threw > 0);
+		assert.ok(world.indexed().has(hashOf(fresh.text)), "the wake ran despite the maintenance error");
+		store.reapExpiredRecoveryCaptures = reap;
 	});
 });
 
