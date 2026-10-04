@@ -19,7 +19,8 @@ type Result = Record<string, unknown>;
 const iso = () => new Date().toISOString();
 
 async function getJson(url: string, headers: Record<string, string>) {
-	const r = await fetch(url, { headers }).catch((e) => ({ ok: false, status: 0, json: async () => ({ error: String(e) }) }) as unknown as Response);
+	// b3-n2b: bounded per request; a host sleep (lid close) otherwise hangs the poll for the whole sleep.
+	const r = await fetch(url, { headers, signal: AbortSignal.timeout(30_000) }).catch((e) => ({ ok: false, status: 0, json: async () => ({ error: String(e) }) }) as unknown as Response);
 	let v: Result | null = null; try { v = await r.json() as Result; } catch { /* non-json */ }
 	return { status: r.status, v };
 }
@@ -37,15 +38,24 @@ export async function waitProjection(id: LiveIdentity, timeoutMs: number, pollMs
 	const t0 = now(); const startedAt = iso();
 	const samples: Result[] = [];
 	let polls = 0, last: Awaited<ReturnType<typeof projectionStatus>> | null = null;
+	// b3-n2b: wall gaps between polls well above pollMs mean the host slept (pmset 'Clamshell Sleep' killed
+	// the n2 I1-10k poll and tail at 16:12Z); recorded so the run is flagged instead of read as "never ready".
+	const gaps: Array<{ atS: number; gapS: number }> = [];
+	let prev = now();
 	while (now() - t0 < timeoutMs) {
 		last = await projectionStatus(id); polls++;
 		const p = last.projection;
-		samples.push({ s: r2((now() - t0) / 1000), st: last.status, state: p?.state, rem: p?.remainingEntries, lag: p?.lagSequences });
+		const gap = now() - prev; prev = now();
+		if (gap > pollMs + 90_000) gaps.push({ atS: r2((now() - t0) / 1000), gapS: r2(gap / 1000) });
+		samples.push({ s: r2((now() - t0) / 1000), st: last.status, state: p?.state, rem: p?.remainingEntries, lag: p?.lagSequences, lp: p?.lastProgressAt ?? null });
 		if (p && p.state === "ready" && Number(p.remainingEntries) === 0 && Number(p.lagSequences) === 0) break;
 		await sleep(pollMs);
 	}
 	const ready = last?.projection?.state === "ready";
-	return { ready, readyAfterMs: ready ? r2(now() - t0) : null, startedAt, endedAt: iso(), polls, last, samples: samples.length > 60 ? [...samples.slice(0, 30), ...samples.slice(-30)] : samples };
+	// Server-side ready moment: lastProgressAt is the save that emptied the projection (independent of poll cadence or host sleep).
+	const lp = Number(last?.projection?.lastProgressAt ?? NaN);
+	const serverReadyAfterMs = ready && Number.isFinite(lp) ? r2(Math.max(0, lp - Date.parse(startedAt))) : null;
+	return { ready, readyAfterMs: ready ? r2(now() - t0) : null, serverReadyAfterMs, hostGaps: gaps, startedAt, endedAt: iso(), polls, last, samples: samples.length > 60 ? [...samples.slice(0, 30), ...samples.slice(-30)] : samples };
 }
 
 /** I1 + projection wait. Rows split: create (bulk incl. inline projection) vs projection tail (after verification). */
