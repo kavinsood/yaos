@@ -610,7 +610,9 @@ export class VaultRuntime implements DrainPort {
 					// b3-ckpt: restart and memory attribution on deployed runs (test-gated route).
 					const memory = crdtEngine.memoryDiagnostics();
 					const c = this.relay?.counters;
-					return json({ ...counter.snapshot(), runtime: { epoch: this.runtimeEpoch.slice(0, 8),
+					const statements = url.searchParams.has("statements")
+						? { statements: counter.statementRows(Number(url.searchParams.get("statements")) || 40) } : {};
+					return json({ ...counter.snapshot(), ...statements, runtime: { epoch: this.runtimeEpoch.slice(0, 8),
 						startedAt: this.runtimeStartedAt, wasmLinearBytes: memory?.linearMemoryBytes ?? null,
 						relay: c ? { checkpoints: c.checkpoints, tailCheckpoints: c.tailCheckpoints,
 							tailCheckpointsDeferred: c.tailCheckpointsDeferred, checkpointGcCompactions: c.checkpointGcCompactions,

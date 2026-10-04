@@ -653,6 +653,44 @@ s.test("b3-int 4c: an oversized body is projected alone in a fresh pass (solo); 
 	});
 });
 
+s.test("b3-n2b: deadline-bound passes with a flat pending set, a busy key and an oversized body still drain (no starvation)", async () => {
+	// Deployed n2 I1-10k shape: every alarm pass hit maxWallMs, `rem` (pending) stayed ~226 and `lag` stayed 29
+	// for 28 min while the projection was in fact draining (ready at +3580 s). Scaled down: a fake clock that
+	// spends the pass deadline after 3 puts, a pending set larger than what one pass reaches, maxIds that
+	// leaves little room for new ids, one key held busy (inline put in flight) for 3 passes, and one solo body.
+	await withWorld("base", async (world) => {
+		const big = { name: "starve-big", text: `# big\n\n${"y".repeat(6_000)}\n` };
+		const notes = [...NOTES.slice(0, 30), big];
+		await world.createNotes("starve", notes);
+		await world.settle();
+		const store = (world.vault as unknown as { store: VaultStore }).store;
+		let clock = 1_000_000;
+		const objects = world.objects;
+		const timed = { put: async (...a: Parameters<typeof objects.put>) => { clock += 400; return objects.put(...a); } } as typeof objects;
+		const ports = { store, objectStore: new Proxy(objects, { get: (o, k) => k === "put" ? timed.put : (o as any)[k] }) as typeof objects,
+			vaultId: VAULT_ID, vaultGeneration: GENERATION, now: () => clock };
+		const limits = { ...STATE_PROJECTION_LIMITS, maxWallMs: 1_000, maxIds: 12, maxBytes: 4_000, maxObjectBytes: 8_000 };
+		const busyKey = contentObjectKey(VAULT_ID, GENERATION, hashOf(notes[0]!.text));
+		assert.ok(store.beginStateObjectWrite(busyKey), "simulated in-flight inline put");
+		const remaining: number[] = [];
+		let passes = 0;
+		for (; passes < 60; passes++) {
+			if (passes === 3) store.endStateObjectWrite(busyKey);
+			const pass = await runStateProjectionPass(ports, limits);
+			clock += 1_000; // next alarm
+			if (pass.idle) break;
+			if (passes === 0) assert.ok(pass.deferred > 0 && pass.projected <= 3, "the first pass is deadline-bound and defers");
+			if (passes < 3) assert.ok(!world.indexed().has(hashOf(notes[0]!.text)), "busy key is deferred, not dropped");
+			remaining.push(notes.filter((entry) => !world.indexed().has(hashOf(entry.text))).length);
+		}
+		assert.ok(passes < 60, `drains in bounded passes (took ${passes})`);
+		assert.equal(remaining.at(-1), 0, "every body projected, including the busy one and the solo body");
+		for (let i = 1; i < remaining.length; i++) assert.ok(remaining[i]! <= remaining[i - 1]!, `monotone drain at pass ${i}: ${remaining.join(",")}`);
+		const summary = store.recoveryProjectionSummary();
+		assert.deepEqual([summary.pendingDocuments, summary.lagSequences], [0, 0], "status reads ready");
+	});
+});
+
 s.test("inline hook (bulk create): projects named bodies best-effort without moving the watermark", async () => {
 	await withWorld("base", async (world) => {
 		await world.createNotes("seed", NOTES.slice(0, 4));
