@@ -1,0 +1,115 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import {
+	applyControl, CONTROL_KEYS, connectionRows, engineAcceptsCommands, engineRows, isControlKey, isPaused, parseExcludePatterns,
+	phaseLabel, readControl, runStateLabel, validateControl,
+} from "./settingsModel";
+import { defaultPluginData, MIB, sanitizePluginData, type PairedIdentity } from "./api";
+import type { EnginePhase, StatusSnapshot } from "../../protocol/status";
+
+const TOKEN = "tok_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+const IDENTITY: PairedIdentity = {
+	host: "https://sync.example.com", vaultId: "vault-1", deviceId: "dev_AAAAAAAAAAAAAAAA", deviceToken: TOKEN, deviceName: "Mac", vaultGeneration: null,
+};
+
+test("every control key reads back what it writes, through the sanitizer", () => {
+	const base = defaultPluginData("Mac");
+	const values: Record<(typeof CONTROL_KEYS)[number], unknown> = {
+		deviceLabel: "Work laptop",
+		excludePatterns: "private/**\n\n  *.tmp  \nprivate/**",
+		syncAttachments: false,
+		maxAttachmentMb: 200,
+		syncSettings: true,
+		trashMode: "system-trash",
+		provisionalBroadcast: false,
+		snapshotsEnabled: false,
+		snapshotsKeepDaily: 30,
+		showStatusBar: false,
+	};
+	let data = base;
+	for (const key of CONTROL_KEYS) data = applyControl(data, key, values[key]);
+	const round = sanitizePluginData(JSON.parse(JSON.stringify(data)), "Mac");
+	assert.deepEqual(round, data);
+	assert.equal(readControl(round, "excludePatterns"), "private/**\n*.tmp");
+	assert.equal(round.engine.maxAttachmentBytes, 200 * MIB);
+	for (const key of CONTROL_KEYS) if (key !== "excludePatterns") assert.equal(readControl(round, key), values[key], key);
+	// The default data object is never mutated.
+	assert.deepEqual(base, defaultPluginData("Mac"));
+});
+
+test("applyControl returns the same object when nothing changes", () => {
+	const d = defaultPluginData("Mac");
+	assert.equal(applyControl(d, "syncAttachments", true), d);
+	assert.equal(applyControl(d, "deviceLabel", "  Mac "), d);
+	assert.equal(applyControl(d, "excludePatterns", "\n\n"), d);
+	assert.equal(applyControl(d, "maxAttachmentMb", 50), d);
+});
+
+test("validation rejects bad values with readable messages and applyControl throws", () => {
+	const bad: [(typeof CONTROL_KEYS)[number], unknown][] = [
+		["deviceLabel", "   "], ["deviceLabel", "x".repeat(65)], ["deviceLabel", 5],
+		["excludePatterns", Array.from({ length: 501 }, (_, i) => `p${i}`).join("\n")], ["excludePatterns", "y".repeat(513)],
+		["maxAttachmentMb", 0], ["maxAttachmentMb", 1025], ["maxAttachmentMb", 2.5], ["maxAttachmentMb", Number.NaN], ["maxAttachmentMb", "5"],
+		["snapshotsKeepDaily", 0], ["snapshotsKeepDaily", 91],
+		["trashMode", "rm"], ["syncAttachments", "yes"],
+	];
+	const d = defaultPluginData("Mac");
+	for (const [key, value] of bad) {
+		const msg = validateControl(key, value);
+		assert.ok(msg && msg.length > 5, `${key}=${String(value)}`);
+		assert.throws(() => applyControl(d, key, value), RangeError);
+	}
+	assert.equal(validateControl("maxAttachmentMb", 1024), null);
+	assert.equal(validateControl("snapshotsKeepDaily", 90), null);
+});
+
+test("isControlKey and parseExcludePatterns", () => {
+	assert.equal(isControlKey("trashMode"), true);
+	assert.equal(isControlKey("deviceToken"), false);
+	assert.deepEqual(parseExcludePatterns("a\r\nb\n a \n\n"), ["a", "b"]);
+});
+
+test("connectionRows mask the device token and never show it", () => {
+	const rows = connectionRows(IDENTITY);
+	const text = JSON.stringify(rows);
+	assert.ok(!text.includes(TOKEN));
+	assert.ok(!text.includes(TOKEN.slice(-4)));
+	assert.deepEqual(rows.map((r) => r.name), ["Server", "Vault ID", "Device name", "Device token"]);
+	assert.equal(rows[3]?.value, "••••••••••••");
+	assert.equal(connectionRows(null).length, 1);
+});
+
+function snap(phase: EnginePhase, over: Partial<StatusSnapshot> = {}): StatusSnapshot {
+	return {
+		phase, deviceClass: "desktop", transport: "worker", vaultEpoch: "e", vaultSeq: 1, headSeq: 1,
+		relay: { connected: true, lastCloseCode: null, reconnectInMs: null, rttMs: 30 },
+		counts: {
+			liveDocs: 0, staleStreams: 0, outboxFrames: 2, outboxBytes: 0, unreceiptedFrames: 1, residentDocs: 0, residentBytesEstimate: 0,
+			pendingDiskOps: 0, pendingBlobs: 0, quarantinedRows: 1, frozenDocs: 0, conflictCopiesToday: 0,
+		},
+		bootstrap: null, brake: null, lastFullReconcileAtMs: null, lastSyncedAtMs: null, dailyFramesUsed: 0, notices: [],
+		...over,
+	};
+}
+
+test("engine rows and labels", () => {
+	const running = { phase: "running", transport: "worker", lastError: null } as const;
+	assert.deepEqual(engineRows({ phase: "unpaired", transport: null, lastError: null }, null, 0), [{ name: "Engine", value: "Not paired" }]);
+	assert.match(runStateLabel({ phase: "failed", transport: null, lastError: "boom" }), /boom/);
+	assert.match(runStateLabel({ ...running, transport: "inline" }), /main thread/);
+	const rows = engineRows(running, snap("live", { lastSyncedAtMs: 0 }), 120_000);
+	const byName = Object.fromEntries(rows.map((r) => [r.name, r.value]));
+	assert.equal(byName["Phase"], "Live");
+	assert.equal(byName["Server connection"], "Connected (30 ms round trip)");
+	assert.equal(byName["Unsynced changes"], "3 changes");
+	assert.equal(byName["Last synced"], "2 min ago");
+	assert.match(byName["Needs attention"] ?? "", /1 quarantined change/);
+	const off = engineRows(running, snap("offline", { relay: { connected: false, lastCloseCode: 1006, reconnectInMs: 5000, rttMs: null } }), 0);
+	assert.ok(off.some((r) => r.value === "Disconnected, retrying in 5 s"));
+	const phases: EnginePhase[] = ["starting", "recovering", "bootstrapping", "catching-up", "live", "offline", "paused", "braked", "daily-limit", "superseded", "revoked", "epoch-migrating", "upgrade-required", "error"];
+	assert.equal(new Set(phases.map(phaseLabel)).size, phases.length);
+	assert.equal(engineAcceptsCommands(running), true);
+	assert.equal(engineAcceptsCommands({ phase: "stopped", transport: null, lastError: null }), false);
+	assert.equal(isPaused(snap("paused")), true);
+	assert.equal(isPaused(null), false);
+});

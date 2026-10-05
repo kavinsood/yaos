@@ -17,6 +17,7 @@
 		"strictBindCallApply": true,
 		"allowSyntheticDefaultImports": true,
 		"useUnknownInCatchVariables": true,
+		"skipLibCheck": true,
 		"types": [],
 		"lib": [
 			"DOM",
