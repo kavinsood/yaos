@@ -157,3 +157,45 @@ test("crash at every point of local rename + local delete + remote edit of the r
 		assert.equal(w.vault.trashed.length, 0, where);
 	});
 });
+
+test("crash at every point of remote deletes vs a local edit (restore) and an untouched file (trash)", async () => {
+	const make = async (): Promise<World> => {
+		const w = new World();
+		await w.boot();
+		const keep = w.log.remoteCreate(P("keep.md"), "v1\n");
+		const gone = w.log.remoteCreate(P("gone.md"), "g\n");
+		await w.sync();
+		w.log.remoteDelete(keep);
+		w.log.remoteDelete(gone);
+		w.vault.userWrite("keep.md", "v1\nmine\n");
+		return w;
+	};
+	await everyCrashPoint(make, (w, where) => {
+		assert.deepEqual(visible(w), { "keep.md": "v1\nmine\n" }, where);
+		assert.deepEqual(w.vault.trashed.map((t) => t.path), ["gone.md"], where);
+	});
+});
+
+test("crash at every point of a conflict merge on a doc that was also renamed remotely", async () => {
+	const make = async (): Promise<World> => {
+		const w = new World();
+		await w.boot();
+		const id = w.log.remoteCreate(P("n/c.md"), "one\ntwo\n");
+		await w.sync();
+		w.log.remoteRename(id, P("m/c2.md"));
+		w.log.remoteEdit(id, (t) => {
+			t.delete(0, 3);
+			t.insert(0, "ONE-remote");
+		});
+		w.vault.userWrite("n/c.md", "one-local\ntwo\n");
+		return w;
+	};
+	await everyCrashPoint(make, (w, where) => {
+		const snap = visible(w);
+		assert.equal(snap["m/c2.md"], "ONE-remote\ntwo\n", where);
+		const copies = w.conflictCopies();
+		assert.equal(copies.length, 1, `${where}: ${JSON.stringify(Object.keys(snap))}`);
+		assert.equal(w.vault.text(copies[0]!), "one-local\ntwo\n", where);
+		assert.equal(Object.keys(snap).length, 2, where);
+	});
+});
