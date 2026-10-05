@@ -92,6 +92,8 @@ export class SimDevice {
 	engine: StandinEngine | null = null;
 	private pair: InlinePair | null = null;
 	engineStarts = 0;
+	/** Texts that existed only in host memory when the app crashed (pending conflict copies; known gap). */
+	readonly crashLost: string[] = [];
 	readonly deviceId: DeviceId;
 
 	constructor(readonly opts: SimDeviceOptions) {
@@ -170,6 +172,7 @@ export class SimDevice {
 
 	/** Whole app dies: unsaved editor buffers are lost, nothing flushes. Restart with `restartApp`. */
 	crashApp(): void {
+		for (const c of this.runtime.bindings.pendingConflictCopies()) this.crashLost.push(c.text);
 		this.engine?.dispose();
 		this.pair?.kill("app crash");
 		this.workspace.crashAll();

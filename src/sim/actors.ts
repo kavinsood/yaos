@@ -34,6 +34,20 @@ export function tokensIn(text: string): string[] {
 	return tokenSpans(text).map((s) => s.token);
 }
 
+const TOKEN_ID_RE = /[A-Z]\.\d+(?:\.\d+)?/g;
+
+/**
+ * Tokens by identity ("A.15" -> "[A.15]"), ignoring their brackets. Survival checks use this:
+ * a disk write reaches the CRDT as a minimal diff (DESIGN §f: prefix/suffix trim), which may
+ * reuse a neighbour's "[" or "]" for a new token ("[Z.1]" -> "[A.15] " diffs as "Z.1]" ->
+ * "A.15] " after the shared "["); a concurrent delete of that neighbour then takes the
+ * bracket with it although every character the user wrote for the new token survives.
+ * Greedy matching keeps "A.1" distinct from "A.15" and "A.12.3".
+ */
+export function tokenIdsIn(text: string): string[] {
+	return [...text.matchAll(TOKEN_ID_RE)].map((m) => `[${m[0]}]`);
+}
+
 /**
  * A position not strictly inside any token, chosen by `pick` in [0,1).
  * With `first` (disk writes): also not right before that character. A disk

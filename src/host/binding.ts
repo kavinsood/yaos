@@ -40,7 +40,7 @@ export const MAIN_EDITOR: unique symbol = Symbol("yaos.main-editor");
 
 const BOUND_SAVED_DEBOUNCE_MS = 50;
 /** Backoff for conflict-copy writes that hit an I/O error (the last value repeats). */
-export const CONFLICT_COPY_RETRY_MS: readonly number[] = [1_000, 2_000, 5_000, 10_000, 30_000];
+export const CONFLICT_COPY_RETRY_MS: readonly number[] = [250, 1_000, 2_000, 5_000, 10_000, 30_000];
 
 export interface BindingLink {
 	/** Post to the engine (the host handles [T] ownership). */
@@ -148,6 +148,7 @@ export class BindingManager {
 	private readonly replicas = new Map<string, Replica>();
 	private running = false;
 	private offWorkspace: Unsubscribe | null = null;
+	private readonly pendingCopies = new Set<{ readonly path: string; readonly text: string }>();
 	readonly stats: BindingStats = { localUpdatesPosted: 0, mergeUpdatesPosted: 0, bindDeltasPosted: 0, docUpdatesApplied: 0, creditsSent: 0, boundSavedPosted: 0, externalMerges: 0, conflictCopies: 0 };
 
 	constructor(private readonly deps: BindingDeps) {}
@@ -529,18 +530,35 @@ export class BindingManager {
 	 */
 	private async writeConflictCopy(path: string, text: string): Promise<boolean> {
 		let attempt = 0;
-		for (;;) {
-			const r = await this.tryConflictCopy(path, text);
-			if (r === "ok") return true;
-			if (r === "give-up") break;
-			if (attempt === 0) this.deps.notice("warn", "conflict-copy-retrying", `Could not write a conflict copy for ${path} (disk error); retrying.`);
-			const delay = CONFLICT_COPY_RETRY_MS[Math.min(attempt, CONFLICT_COPY_RETRY_MS.length - 1)] ?? 30_000;
-			attempt++;
-			await new Promise<void>((resolve) => this.deps.clock.setTimer(delay, resolve));
-			if (!this.running) break;
+		const pending = { path, text };
+		try {
+			for (;;) {
+				const r = await this.tryConflictCopy(path, text);
+				if (r === "ok") return true;
+				if (r === "give-up") break;
+				if (attempt === 0) {
+					this.pendingCopies.add(pending);
+					this.deps.notice("warn", "conflict-copy-retrying", `Could not write a conflict copy for ${path} (disk error); retrying.`);
+				}
+				const delay = CONFLICT_COPY_RETRY_MS[Math.min(attempt, CONFLICT_COPY_RETRY_MS.length - 1)] ?? 30_000;
+				attempt++;
+				await new Promise<void>((resolve) => this.deps.clock.setTimer(delay, resolve));
+				if (!this.running) break;
+			}
+		} finally {
+			this.pendingCopies.delete(pending);
 		}
 		this.deps.notice("error", "conflict-copy-failed", `Could not write a conflict copy for ${path}; the other version is kept in the editor history only.`);
 		return false;
+	}
+
+	/**
+	 * Conflict copies that hit a disk error and live only in memory until a retry lands. Known gap
+	 * (wp-d-notes): if the process dies in that window after Obsidian's own autosave replaced the disk
+	 * side, the copy is gone. The sim records these at an app crash (SimDevice.crashLost).
+	 */
+	pendingConflictCopies(): { readonly path: string; readonly text: string }[] {
+		return [...this.pendingCopies];
 	}
 
 	private async tryConflictCopy(path: string, text: string): Promise<"ok" | "io" | "give-up"> {
