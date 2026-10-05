@@ -1,0 +1,43 @@
+src/engine/reconcile/deps.ts
+  s_3f1e78c1a8c300::t_b3b6c24a9488cf 1-84
+src/engine/reconcile/testkit/fakeGateway.ts
+  s_89e23cccdabada::t_8a2d63051938d5 1-107
+src/engine/reconcile/testkit/fakeStorage.ts
+  s_89e23cccdabada::t_fcfda9efd9c4e9 1-294
+src/engine/reconcile/testkit/fakeVault.ts
+  s_89e23cccdabada::t_22f97c2dde2312 1-265
+src/engine/reconcile/testkit/stubLog.ts
+  s_808e98640ec653::t_0608cadee4f256 1-394
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "819e4a11d6205bbec870fdc27bb22cb8e7c4ee51",
+  "prompts": {},
+  "sessions": {
+    "s_3f1e78c1a8c300": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a393e5c0d70814322",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_808e98640ec653": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a6d246dbda3daef6a",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_89e23cccdabada": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-abc25b91847c93c47",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
