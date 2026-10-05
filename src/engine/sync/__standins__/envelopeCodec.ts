@@ -6,7 +6,7 @@
 import { Inflate, deflateSync } from "fflate";
 import {
 	AAD_CHECKPOINT_PREFIX, AAD_FRAME_PREFIX, CheckpointEncoding, EnvelopeFlag, EnvelopeKindCode, ENVELOPE_FORMAT_VERSION,
-	type BodyUpdateRefContent, type CheckpointContent, type CryptoSuite, type EnvelopeHeader, type EnvelopeKind, type InnerEnvelope,
+	type BlobChunkContent, type BodyUpdateRefContent, type CheckpointContent, type CryptoSuite, type EnvelopeHeader, type EnvelopeKind, type InnerEnvelope,
 } from "../../../core/envelope";
 import type { ClientFrameId, ContentHash, Seq, StreamName, VaultId } from "../../../core/types";
 import { CodecError, Reader, Writer, fromHex, toHex, utf8 } from "./bytes";
@@ -120,4 +120,18 @@ export function decodeBodyRef(bytes: Uint8Array): BodyUpdateRefContent {
 	const size = r.varuint();
 	r.end();
 	return { hash, size };
+}
+
+/** blobChunk: 32B sha256, varuint index, varuint total, varuint totalSize, bytes chunk (DESIGN §b, §j.1). */
+export function encodeBlobChunk(c: BlobChunkContent): Uint8Array {
+	return new Writer().bytes(fromHex(c.hash)).varuint(c.index).varuint(c.total).varuint(c.totalSize).bytes(c.chunk).finish();
+}
+export function decodeBlobChunk(bytes: Uint8Array): BlobChunkContent {
+	const r = new Reader(bytes);
+	const hash = toHex(r.bytes(32)) as ContentHash;
+	const index = r.varuint();
+	const total = r.varuint();
+	const totalSize = r.varuint();
+	if (total === 0 || index >= total) throw new CodecError("bad chunk index");
+	return { hash, index, total, totalSize, chunk: r.rest().slice() };
 }
