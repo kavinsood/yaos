@@ -1,0 +1,23 @@
+src/host/collab.ts
+  s_3e0c71be916d35::t_ed72b9f79c8795 1-47
+src/host/obsidianWorkspace.test.ts
+  s_3e0c71be916d35::t_457b8ef889bf2e 1-178
+src/host/obsidianWorkspace.ts
+  s_3e0c71be916d35::t_c5c11da22d77d8 1-252
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "dcf7e785b6a7654840c66fc38ad9a7edd7532e35",
+  "prompts": {},
+  "sessions": {
+    "s_3e0c71be916d35": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a024e58aa7ba38180",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
