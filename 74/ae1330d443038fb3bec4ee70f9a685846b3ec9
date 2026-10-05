@@ -1,0 +1,21 @@
+src/core/ns/fuzz.test.ts
+  s_3f1e78c1a8c300::t_29365c9555ce50 1-378
+src/core/paths/validate.ts
+  s_3f1e78c1a8c300::t_2455a633f531b7 44-52,59,73,77,85-86
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "74ae1330d443038fb3bec4ee70f9a685846b3ec9",
+  "prompts": {},
+  "sessions": {
+    "s_3f1e78c1a8c300": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a393e5c0d70814322",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
