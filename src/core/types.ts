@@ -471,12 +471,15 @@ export interface BrakeConfig {
 	/** Hold when the listing shrank below this fraction of synced files (vault not mounted). */
 	readonly listingFloorRatio: number;
 	readonly maxConflictCopies: number;
+	/** A disk write counts as destructive when the old file is >= overwriteMinBytes and shrinks below overwriteShrinkRatio. */
+	readonly overwriteMinBytes: number;
+	readonly overwriteShrinkRatio: number;
 }
 
 export interface BrakeReport {
 	/** Stable id: hash of the sorted held ops; approval references it. */
 	readonly id: string;
-	readonly reason: "mass-delete-local" | "mass-delete-remote" | "listing-shrank" | "conflict-flood";
+	readonly reason: "mass-delete-local" | "mass-delete-remote" | "mass-overwrite" | "listing-shrank" | "conflict-flood" | "ns-divergence";
 	readonly heldCount: number;
 	readonly syncedCount: number;
 	readonly samplePaths: readonly VaultPath[];

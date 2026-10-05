@@ -86,6 +86,8 @@ export const BRAKE_MIN_COUNT = 50;
 export const BRAKE_RATIO = 0.2;
 export const BRAKE_LISTING_FLOOR_RATIO = 0.5;
 export const BRAKE_MAX_CONFLICT_COPIES = 200;
+export const BRAKE_OVERWRITE_MIN_BYTES = 4096;
+export const BRAKE_OVERWRITE_SHRINK_RATIO = 0.5;
 
 // --- Stores -----------------------------------------------------------------
 

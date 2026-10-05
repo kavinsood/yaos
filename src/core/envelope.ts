@@ -68,7 +68,9 @@ export interface InnerEnvelope {
  * Kind-specific content layouts (lib0 encoding):
  *
  * nsOps:          varuint opCount, then per op: u8 tag, varuint bodyLen, body
- *                 (NsOpTag below; unknown tags skipped by length).
+ *                 (NsOpTag below). Trailing bytes inside a body are ignored
+ *                 (optional fields that never affect the fold); an unknown tag
+ *                 makes the whole frame malformed, folded as empty (DESIGN §c.3).
  * bodyUpdate:     Yjs update v1 bytes.
  * canvasUpdate:   Yjs update v1 bytes.
  * cfgOps:         varuint opCount, then per op: u8 tag, varuint bodyLen, body (CfgOpTag).

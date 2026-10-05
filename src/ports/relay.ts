@@ -8,7 +8,8 @@
  *     frame with seq > H appended by OTHER sessions, in seq order, without gaps,
  *     until it closes. Frames appended on this session are never echoed; their
  *     outcome is a receipt. (Other sessions of the same device see them as
- *     ordinary committed frames.)
+ *     ordinary committed frames.) A receipt for seq s arrives after every
+ *     committed frame with seq < s has been delivered on this session.
  *  R3 Frames appended on one session are committed in send order. A per-frame
  *     rejection does NOT fence later frames; a close (1009/1013/4403) drops
  *     every unreceipted frame. The client never relies on fencing: ns ops are

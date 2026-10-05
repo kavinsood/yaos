@@ -11,7 +11,7 @@
 
 import type { StoreSpec, KeyRange } from "../../ports/storage";
 import type {
-	BodyVersion, ClientFrameId, ContentHash, DeviceId, DiskFingerprint, DocId, DocKind, PathKey, Seq, StreamClass,
+	BodyVersion, ClientFrameId, ConfigRelPath, ContentHash, DeviceId, DiskFingerprint, DocId, DocKind, PathKey, Seq, StreamClass,
 	StreamName, SyncedEntry, VaultEpoch, VaultId, VaultPath,
 } from "../../core/types";
 import type { EnvelopeKind, CheckpointEncoding } from "../../core/envelope";
@@ -145,7 +145,13 @@ export type OutboxState =
 	/** Written to a session; awaiting receipt. */
 	| "sent"
 	/** Refused as oversize/invalid; kept for recovery, never resent automatically. */
-	| "poisoned";
+	| "poisoned"
+	/**
+	 * Another device's PROVISIONAL applied to a bound doc (DESIGN §d.5). Deleted
+	 * when its commit arrives; re-appended under this record's clientFrameId with
+	 * EnvelopeFlag.adopted if dropped or not committed within PROVISIONAL_ADOPT_MS.
+	 */
+	| "adoptable";
 
 export interface OutboxRecord {
 	readonly clientFrameId: ClientFrameId;
@@ -161,6 +167,8 @@ export interface OutboxRecord {
 	readonly flags: number;
 	/** held only: the ns create frame this waits for. */
 	readonly dependsOn: ClientFrameId | null;
+	/** adoptable only: identity of the provisional frame being shadowed. */
+	readonly adoptOf: { readonly deviceId: DeviceId; readonly clientFrameId: ClientFrameId; readonly receivedAtMs: number } | null;
 	readonly attempts: number;
 	readonly createdAtMs: number;
 	readonly lastSentAtMs: number;
@@ -250,6 +258,20 @@ export interface IntentRecord {
 }
 
 // ---------------------------------------------------------------------------
+// cfgBase — settings sync base per config file, keyPath "file" (DESIGN §j.3)
+// ---------------------------------------------------------------------------
+
+export interface CfgBaseRecord {
+	readonly file: ConfigRelPath;
+	/** Exact bytes hash at the sync point (local file == fold value). */
+	readonly fingerprint: DiskFingerprint;
+	readonly size: number;
+	readonly mtimeMs: number;
+	/** JSON files: top-level key -> sha256 of the canonical JSON value at the sync point. */
+	readonly keyHashes: Readonly<Record<string, ContentHash>> | null;
+}
+
+// ---------------------------------------------------------------------------
 // blobQueue — pending transfers, keyPath "hash"
 // ---------------------------------------------------------------------------
 
@@ -281,6 +303,7 @@ export const STORE = {
 	baseText: "baseText",
 	localTree: "localTree",
 	intents: "intents",
+	cfgBase: "cfgBase",
 	blobQueue: "blobQueue",
 } as const;
 
@@ -307,6 +330,7 @@ export interface YaosSchema {
 	readonly [STORE.baseText]: { readonly record: BaseTextRecord; readonly key: DocId; readonly indexes: never };
 	readonly [STORE.localTree]: { readonly record: LocalTreeRecord; readonly key: PathKey; readonly indexes: never };
 	readonly [STORE.intents]: { readonly record: IntentRecord; readonly key: string; readonly indexes: never };
+	readonly [STORE.cfgBase]: { readonly record: CfgBaseRecord; readonly key: ConfigRelPath; readonly indexes: never };
 	readonly [STORE.blobQueue]: { readonly record: BlobQueueRecord; readonly key: ContentHash; readonly indexes: typeof INDEX.blobQueueByDue };
 }
 
@@ -334,6 +358,7 @@ export const STORE_SPECS: Readonly<Record<keyof YaosSchema, StoreSpec>> = {
 	baseText: { keyPath: "docId", indexes: {} },
 	localTree: { keyPath: "pathKey", indexes: {} },
 	intents: { keyPath: "id", indexes: {} },
+	cfgBase: { keyPath: "file", indexes: {} },
 	blobQueue: { keyPath: "hash", indexes: { [INDEX.blobQueueByDue]: { keyPath: ["active", "nextAttemptAtMs"], unique: false } } },
 };
 
@@ -359,6 +384,7 @@ export interface OutboxMirrorFrame {
 	readonly state: OutboxState;
 	readonly authorNsSeq: Seq;
 	readonly dependsOn: ClientFrameId | null;
+	readonly adoptOf: { readonly deviceId: DeviceId; readonly clientFrameId: ClientFrameId } | null;
 	readonly sealed: Uint8Array;
 }
 
