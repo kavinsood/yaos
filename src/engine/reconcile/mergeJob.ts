@@ -7,7 +7,11 @@
  *   4. conflict: T_intent_begin(conflict-copy), write the copy (absent)
  *   5. write M over the path (precondition fingerprint F)
  *   6. T_synced (S, base, L) + T_intent_end, one tx
- * A failed step-5 precondition leaves S at B: the next pass merges (B, D', M).
+ * A failed step-5 precondition (the user typed again) rebases S on the disk
+ * side D (hash, stat, base D) but keeps S.bodyVersion: the CRDT already holds
+ * D's edits, so the next pass merges (D, D', M) and Rc stays true even if the
+ * disk returns to D. Keeping B as the base would turn the user's continued
+ * typing into a false conflict against their own first edit.
  *
  * Bound docs (open in an editor, §d.2): the replica is merged, the file is never
  * written; S records the disk side (hash(D), F, base D) and the editor's save
@@ -15,7 +19,7 @@
  */
 
 import type * as Y from "yjs";
-import type { DocId, LocalEntry, MergeResult, PlannerOp, VaultPath } from "../../core/types";
+import type { DiskFingerprint, DocId, LocalEntry, MergeResult, PlannerOp, SyncedEntry, VaultPath } from "../../core/types";
 import { canonicalizeMarkdown, exactFingerprint, markdownContentHash } from "../../core/hash/markdownLf";
 import { utf8Decode, utf8Length } from "../../core/hash/utf8";
 import { merge } from "../../core/merge/merge";
@@ -155,8 +159,14 @@ async function mergeMarkdown(env: Env, op: ReconcileOp, h: BodyHandle): Promise<
 		const res = await ctx.exec({ t: "write", area: "vault", path: diskPath, data: { t: "text", text: M }, precondition: { t: "fingerprint", fingerprint: F }, docId, purpose: "merge" });
 		const out = writeOk(res);
 		if (!out) {
-			// The user edited again: S stays at B, the next pass merges (B, D', M).
-			await ctx.commit(intent ? { intentDrop: [intent.id] } : {}, local);
+			// The user edited again: rebase S on D (see header), keep bodyVersion so Rc stays true.
+			const rebased = s ? rebaseOnDisk(ctx, s, D, F, rd.stat) : null;
+			await ctx.commit({
+				intentDrop: intent ? [intent.id] : [],
+				syncedPut: rebased ? [rebased.entry] : [],
+				basePut: rebased?.base ? [rebased.base] : [],
+				baseDrop: rebased && !rebased.base ? [docId] : [],
+			}, local);
 			env.scan.markDirty(diskPath, null);
 			return "fail";
 		}
@@ -181,4 +191,11 @@ async function mergeMarkdown(env: Env, op: ReconcileOp, h: BodyHandle): Promise<
 		local,
 	);
 	return "ok";
+}
+
+function rebaseOnDisk(ctx: Env["ctx"], s: SyncedEntry, D: string, F: DiskFingerprint, stat: { size: number; mtimeMs: number }) {
+	const hash = markdownContentHash(D);
+	const base = makeBase(s.docId, D, hash);
+	const entry = ctx.record({ ...s, contentHash: hash, fingerprint: F, size: stat.size, mtimeMs: stat.mtimeMs, hasBase: base !== null });
+	return { entry, base };
 }
