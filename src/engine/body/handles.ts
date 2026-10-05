@@ -32,6 +32,8 @@ export interface Handle {
 	lastAccessMono: number;
 	/** Tail ref rows whose update is not available yet (doc shows wait/blob-unavailable). */
 	unresolvedRefs: number;
+	/** Those rows, retried when x: rows arrive or the blob store answers. */
+	unresolvedRows: TailRecord[];
 	/** Builder close timer. */
 	timer: number | null;
 }
@@ -64,6 +66,13 @@ export class HandleManager {
 	}
 	isResident(stream: StreamName): boolean {
 		return this.handles.has(stream);
+	}
+	/**
+	 * In-flight load of the stream. Rows committed while a load is between its
+	 * read tx and registration must be applied after it (idempotent either way).
+	 */
+	loadingOf(stream: StreamName): Promise<Handle> | undefined {
+		return this.loading.get(stream);
 	}
 	all(): IterableIterator<Handle> {
 		return this.handles.values();
@@ -116,7 +125,7 @@ export class HandleManager {
 		const doc = new Y.Doc({ gc: true });
 		const h: Handle = {
 			stream, docId, cls, doc, builder: new FrameBuilder(), bytesEstimate: 0, bound: 0, pins: 0,
-			lastAccessMono: this.hooks.monotonic(), unresolvedRefs: 0, timer: null,
+			lastAccessMono: this.hooks.monotonic(), unresolvedRefs: 0, unresolvedRows: [], timer: null,
 		};
 		this.hooks.onCreate(h);
 		let bytes = 0;
@@ -136,7 +145,10 @@ export class HandleManager {
 					if (u) {
 						Y.applyUpdate(doc, u, ORIGIN.LOAD);
 						bytes += u.length;
-					} else h.unresolvedRefs++;
+					} else {
+						h.unresolvedRefs++;
+						h.unresolvedRows.push(row);
+					}
 				}
 			}
 			for (const r of outbox) {

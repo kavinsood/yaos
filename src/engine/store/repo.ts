@@ -584,7 +584,9 @@ export class Repo {
 						const n: OutboxRecord = { ...r, state: c.state, dependsOn: c.state === "pending" ? null : r.dependsOn };
 						tx.put(STORE.outbox, n);
 						updated.push(n);
-						if (r.state === "adoptable") updated.push(...(await releaseDependents(tx, r)));
+						// adoptable -> pending keeps its dependents held until the adopted frame's receipt (causal
+						// order on the relay); a poisoned dependency releases them.
+						if (c.state === "poisoned") updated.push(...(await releaseDependents(tx, r)));
 					}
 				}
 			});
@@ -755,7 +757,8 @@ function advance(r: Mut<StreamRecord>, seq: Seq, vAfter: Seq): void {
  */
 async function releaseDependents(tx: Tx, gone: OutboxRecord): Promise<OutboxRecord[]> {
 	const isChunk = streamClass(gone.stream) === "blobchunk";
-	if (gone.state !== "adoptable" && !isChunk) return [];
+	// Adoption dependencies: an adoptable, or an adopted record re-appended as pending (dependents wait for its receipt).
+	if (gone.adoptOf === null && !isChunk) return [];
 	if (gone.stream === NS_STREAM || gone.stream === CFG_STREAM) return [];
 	const held = await tx.getAllByIndex(STORE.outbox, INDEX.outboxByState, stateOrderRange("held"));
 	const out: OutboxRecord[] = [];
@@ -765,7 +768,7 @@ async function releaseDependents(tx: Tx, gone: OutboxRecord): Promise<OutboxReco
 		// x: streams sort by (stream, order): the newest remaining own chunk is the max order, not the last iterated.
 		const candidates = h.kind === "bodyUpdateRef"
 			? await tx.getAllByIndex(STORE.outbox, INDEX.outboxByStream, { lower: ["x:", 0], upper: ["x;", 0], upperOpen: true })
-			: (await tx.getAllByIndex(STORE.outbox, INDEX.outboxByStream, streamOrderRange(h.stream))).filter((c) => c.state === "adoptable");
+			: (await tx.getAllByIndex(STORE.outbox, INDEX.outboxByStream, streamOrderRange(h.stream))).filter((c) => c.adoptOf !== null && c.state !== "poisoned");
 		for (const c of candidates) {
 			if (c.clientFrameId !== gone.clientFrameId && c.order < h.order && (!best || c.order > best.order)) best = c;
 		}
