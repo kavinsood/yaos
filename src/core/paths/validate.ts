@@ -41,14 +41,22 @@ export function isAssigned15_1(cp: number): boolean {
 
 const RESERVED = new Set(RESERVED_STEMS);
 
+/** 0 = fine, 1 = control (C0, DEL), 2 = FORBIDDEN_PATH_CHARS. */
+const ASCII_CLASS = (() => {
+	const t = new Uint8Array(128);
+	for (let c = 0; c < 0x20; c++) t[c] = 1;
+	t[0x7f] = 1;
+	for (const ch of FORBIDDEN_PATH_CHARS) t[ch.charCodeAt(0)] = 2;
+	return t;
+})();
+
 /** Segment-level problems (no NFC / assignment / total-length checks). */
 export function segmentInvalidReason(seg: string): PathInvalidReason | null {
 	if (seg.length === 0) return "empty-segment";
 	if (seg.charCodeAt(0) === 0x2e) return "dot-segment";
 	for (let i = 0; i < seg.length; i++) {
 		const c = seg.charCodeAt(i);
-		if (c <= 0x1f || c === 0x7f) return "control-char";
-		if (FORBIDDEN_PATH_CHARS.indexOf(seg[i]!) >= 0) return "forbidden-char";
+		if (c < 0x80 && ASCII_CLASS[c] !== 0) return ASCII_CLASS[c] === 1 ? "control-char" : "forbidden-char";
 	}
 	const last = seg.charCodeAt(seg.length - 1);
 	if (last === 0x2e || last === 0x20) return "trailing-dot-or-space";
@@ -62,9 +70,11 @@ export function segmentInvalidReason(seg: string): PathInvalidReason | null {
 /** DESIGN §c.2. null = valid. */
 export function pathInvalidReason(path: string): PathInvalidReason | null {
 	if (path.length === 0) return "empty";
+	let ascii = true;
 	for (let i = 0; i < path.length; i++) {
 		const c = path.charCodeAt(i);
 		if (c < 0x80) continue;
+		ascii = false;
 		let cp = c;
 		if (c >= 0xd800 && c <= 0xdbff && i + 1 < path.length) {
 			const d = path.charCodeAt(i + 1);
@@ -72,8 +82,8 @@ export function pathInvalidReason(path: string): PathInvalidReason | null {
 		}
 		if (!isAssigned15_1(cp)) return "unassigned";
 	}
-	if (path.normalize("NFC") !== path) return "not-nfc";
-	if (utf8ByteLength(path) > MAX_PATH_BYTES) return "path-too-long";
+	if (!ascii && path.normalize("NFC") !== path) return "not-nfc";
+	if ((ascii ? path.length : utf8ByteLength(path)) > MAX_PATH_BYTES) return "path-too-long";
 	for (const seg of path.split("/")) {
 		const reason = segmentInvalidReason(seg);
 		if (reason) return reason;
