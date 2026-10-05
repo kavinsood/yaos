@@ -1,0 +1,23 @@
+src/engine/runtime/engine.ts
+  s_e6caedb1ffebff::t_ea413e86aa07a0 284-288
+src/engine/runtime/quarantine.test.ts
+  s_e6caedb1ffebff::t_7f743ac05c9b6e 1-241
+src/engine/store/repo.ts
+  s_e6caedb1ffebff::t_5abfb9d78b84ed 642,726-727,729
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c9ce0ff5dbf700deaf6e9b40430c5cf0bcafffad",
+  "prompts": {},
+  "sessions": {
+    "s_e6caedb1ffebff": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a4f41693fa2dd700a",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
