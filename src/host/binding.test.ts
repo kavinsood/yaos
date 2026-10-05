@@ -171,6 +171,26 @@ test("binding: external reload of a bound view is intercepted and merged (no clo
 	assert.ok(v.getText().includes("more") || copies.some(([, t]) => t.includes("more")), "external edit is kept in the doc or in a conflict copy");
 });
 
+test("binding: a conflict copy that hits disk errors is retried until written (the external side is never dropped)", async () => {
+	const { clock, vault, ws, engine, bm, notices } = setup();
+	vault.userWrite("n.md", "seed line\n");
+	engine.add("n.md", "seed line\n");
+	bm.start();
+	const v = ws.openFile("n.md");
+	assert.ok(v);
+	await clock.advance(10);
+	v.edit(1, 0, "[mine]"); // unsaved typing on the same line the other app edits
+	vault.externalWrite("n.md", "s[theirs]eed line\n");
+	vault.failNextOps = 2;
+	await clock.advance(300);
+	assert.ok(notices.includes("conflict-copy-retrying"));
+	await clock.advance(10_000);
+	const copies = [...vault.snapshot().entries()].filter(([p]) => p.includes("(conflict"));
+	assert.ok(copies.some(([, t]) => t.includes("[theirs]")), `external side kept in a conflict copy: ${JSON.stringify(copies)}`);
+	assert.ok(v.getText().includes("[mine]"));
+	assert.ok(!notices.includes("conflict-copy-failed"), JSON.stringify(notices));
+});
+
 test("binding: worker killed mid-typing loses nothing (suspend, keep typing, rebind with bindDelta)", async () => {
 	const { clock, vault, ws, engine, bm } = setup();
 	vault.userWrite("k.md", "start");

@@ -39,6 +39,8 @@ export const MAIN_MERGE: unique symbol = Symbol("yaos.main-merge");
 export const MAIN_EDITOR: unique symbol = Symbol("yaos.main-editor");
 
 const BOUND_SAVED_DEBOUNCE_MS = 50;
+/** Backoff for conflict-copy writes that hit an I/O error (the last value repeats). */
+export const CONFLICT_COPY_RETRY_MS: readonly number[] = [1_000, 2_000, 5_000, 10_000, 30_000];
 
 export interface BindingLink {
 	/** Post to the engine (the host handles [T] ownership). */
@@ -520,7 +522,28 @@ export class BindingManager {
 		return "handled";
 	}
 
-	private async writeConflictCopy(path: string, text: string): Promise<void> {
+	/**
+	 * The copy text exists only in memory once the merge has replaced it in the editor/CRDT, so an I/O
+	 * failure is retried (backoff, capped) for as long as the binding runs; callers that save over the
+	 * disk side await this first. Gives up on unload, a non-transient refusal, or when every candidate name is taken.
+	 */
+	private async writeConflictCopy(path: string, text: string): Promise<boolean> {
+		let attempt = 0;
+		for (;;) {
+			const r = await this.tryConflictCopy(path, text);
+			if (r === "ok") return true;
+			if (r === "give-up") break;
+			if (attempt === 0) this.deps.notice("warn", "conflict-copy-retrying", `Could not write a conflict copy for ${path} (disk error); retrying.`);
+			const delay = CONFLICT_COPY_RETRY_MS[Math.min(attempt, CONFLICT_COPY_RETRY_MS.length - 1)] ?? 30_000;
+			attempt++;
+			await new Promise<void>((resolve) => this.deps.clock.setTimer(delay, resolve));
+			if (!this.running) break;
+		}
+		this.deps.notice("error", "conflict-copy-failed", `Could not write a conflict copy for ${path}; the other version is kept in the editor history only.`);
+		return false;
+	}
+
+	private async tryConflictCopy(path: string, text: string): Promise<"ok" | "io" | "give-up"> {
 		const now = this.deps.clock.now();
 		const tz = this.deps.timeZone ?? "local";
 		for (let n = 1; n <= 12; n++) {
@@ -529,14 +552,15 @@ export class BindingManager {
 				const out = await this.deps.vault.write(target, text, { t: "absent" });
 				if (out.ok) {
 					this.stats.conflictCopies++;
-					return;
+					return "ok";
 				}
-				if (out.reason !== "precondition") break;
+				if (out.reason === "io") return "io";
+				if (out.reason !== "precondition") return "give-up"; // invalid path / parent is a file: not transient
 			} catch {
-				break;
+				return "io";
 			}
 		}
-		this.deps.notice("error", "conflict-copy-failed", `Could not write a conflict copy for ${path}; the other version is kept in the editor history only.`);
+		return "give-up"; // every candidate name is taken
 	}
 
 	private async checkSaved(rep: Replica): Promise<void> {
