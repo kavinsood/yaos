@@ -1,0 +1,21 @@
+src/host/pluginController.ts
+  s_3e0c71be916d35::t_f57a8af800561c 1-195
+src/sim/device.ts
+  s_3e0c71be916d35::t_45be1e3d0b06db 21-22,131-134,141-154
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "8069cb94a6d3b1e31b2bbedb00aa8d222faf871b",
+  "prompts": {},
+  "sessions": {
+    "s_3e0c71be916d35": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a024e58aa7ba38180",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
