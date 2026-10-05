@@ -1,0 +1,31 @@
+src/sim/a-relay-engine.ts
+  s_3f1e78c1a8c300::t_1b8849366da19d 1-434
+src/sim/a-relay-link.ts
+  s_3f1e78c1a8c300::t_ff56474c9ac575 1-68
+src/sim/a-relay-session.ts
+  s_3f1e78c1a8c300::t_d00b292af2644a 1-264
+src/sim/a-relay-store.ts
+  s_3f1e78c1a8c300::t_40101e73e2304e 1-278
+src/sim/a-relay-testkit.ts
+  s_3f1e78c1a8c300::t_007c45ec79c636 1-95
+src/sim/a-relay-util.ts
+  s_3f1e78c1a8c300::t_6bdd616a53edf7 1-210
+src/sim/relay.ts
+  s_3f1e78c1a8c300::t_30f95efaea628b 1-450
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "927f46402af1865b1fda062de7f200885ccc4153",
+  "prompts": {},
+  "sessions": {
+    "s_3f1e78c1a8c300": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a393e5c0d70814322",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
