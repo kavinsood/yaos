@@ -1,0 +1,23 @@
+src/core/paths/pathKey.ts
+  s_3f1e78c1a8c300::t_3a78ebd59f3b4a 1-68
+src/core/paths/segments.ts
+  s_3f1e78c1a8c300::t_d4fc0c886b73e9 1-86
+src/core/paths/validate.ts
+  s_3f1e78c1a8c300::t_6404c384038957 1-86
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "1cf29ea1cd4554b2faca16615a2ec1b62fb02783",
+  "prompts": {},
+  "sessions": {
+    "s_3f1e78c1a8c300": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a393e5c0d70814322",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
