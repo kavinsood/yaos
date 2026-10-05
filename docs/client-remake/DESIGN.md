@@ -1081,3 +1081,895 @@ count × { varstring docId, varstring path, u8 kindCode, 32B contentHash, varuin
 - Lets recovery tell "unchanged since sync" (hash equal) from "edited offline", so an IDB loss does not produce
   conflict copies.
 - Base texts are not mirrored. Recovered docs merge without a base only when both sides changed.
+
+---
+
+## f. Three trees, planner, merge
+
+Sync is a pure function of three trees, recomputed for a scope. Events only choose the scope.
+
+- **Remote (R):** what the log says.
+- **Local (L):** what the disk says.
+- **Synced (S):** the last state known equal on both, i.e. the merge base.
+
+### f.1 Entry shapes
+
+All are in `src/core/types.ts`.
+
+- **`RemoteEntry`** = **OptimisticRemote**(committed `NsFoldState` + own pending ns frames) joined with
+  `RemoteBodyInfo`.
+  - The overlay re-folds own `pending` / `sent` / `held` ns frames, in outbox order, on a copy-on-write view of the
+    committed state, with pseudo-seqs above `coversSeq`.
+  - Entries touched by the overlay have `pendingLocal = true`. The planner never moves, deletes or replaces local
+    files for them, so local state stays pinned until the fold confirms or rejects.
+  - The overlay is a prediction. Only the committed fold decides (§c.13).
+  - `body` comes from `streams`: `version = bodyVersion`; `caughtUp = !stale && no causal hole`; `hasContent`;
+    `frozen`.
+- **`LocalEntry`**: a git-index-style stat cache (`localTree` store) with hash confirmation.
+  - `hash = null` means the stat changed since the last hash.
+  - **Racy-clean rule:** an entry whose `mtimeMs ≥ hashedAtMs − RACY_WINDOW_MS` is re-hashed on the next pass even
+    if the stat is equal.
+  - `bound = true` while an editor owns the file.
+- **`SyncedEntry`**: per docId, holding `path`, `contentHash` (logical), `fingerprint` (exact bytes), stat,
+  `bodyVersion` / `blobRev` / `nsTouchSeq` at the sync point, and `hasBase` (`baseText` stored).
+- **Hashes.**
+  - `ContentHash` is the logical hash: markdown-lf-v1 canonical bytes for markdown, canonical JSON for canvas, raw
+    bytes for blobs.
+  - `DiskFingerprint` is the exact-bytes hash, used only for echo suppression and CAS.
+
+### f.2 Planner
+
+`PlanFn(PlannerInput) → Plan` is pure (WP-B, `src/core/plan/planner.ts`).
+
+- **Scope:** `docs` (hint-driven: the docIds and pathKeys touched) or `full` (periodic every
+  `fullReconcileIntervalMs`, on resume, after catch-up and after recovery).
+- **Gates:**
+  - no ns ops until ns has been caught up once in this session, and none while ns is halted;
+  - destructive local decisions (local delete, rename inference) need `localComplete`;
+  - content decisions need `body.caughtUp`.
+- **Join.** By docId for R ⋈ S. L is looked up by `pathKey` (S.pathKey for synced docs, R.pathKey otherwise).
+  Leftover L entries are new local files, after rename inference (§f.6).
+- **Notation.** `Lc` = L hash ≠ S.contentHash. `Rc` = R.body.version ≠ S.bodyVersion (markdown/canvas) or
+  R.blob.rev ≠ S.blobRev (blob). `Rm` = R.path ≠ S.path.
+
+| R | S | L at key | Ops |
+|---|---|---|---|
+| live | present | present | 1. If `Rm` and not `pendingLocal`: `diskRename(S.path → R.path, expect hash)` (remote move; plain rename; case-only via temp on case-insensitive FS; folder-casing-only differences tolerated there). 2. Content: neither changed → `syncedPut` if the stat moved; `Rc` only → `reconcileContent` (crdt-only write) / blob `fetchBlob`; `Lc` only → `reconcileContent` (disk-only, frames) / blob `pushBlob` + `nsSetBlob(baseRev = R.blob.rev)`; both → `reconcileContent` (3-way) / blob keep-both (`conflictCopy`, `fetchBlob`, `nsCreate` for the copy). |
+| live | present | absent | Inferred or observed rename to a leftover L entry → `nsRename` (+ content step at the new path). Else if `Rc` (remote edited since sync) → `diskMaterialize(R.path, expect absent)` (edit beats delete). Else → `nsDelete(baseBodySeq = streams.appliedSeq)` (brake: mass-delete-local). |
+| deleted | present | absent | `syncedDrop`. |
+| deleted | present | present, ¬`Lc` | If the doc has own pending body frames and the restore condition holds → `nsRestore`. Else → `diskTrash(S.path, expect hash = S.contentHash)` + `syncedDrop` (brake: mass-delete-remote). |
+| deleted | present | present, `Lc` | Local edit beats remote delete: `nsRestore(path = S.path, againstDeleteSeq = R.deletedSeq)` + `reconcileContent`. |
+| merged → W | present | any | `rebind(S.docId → W)`, then plan as W. |
+| absent (pruned) | present | ¬`Lc` / absent | `diskTrash` (braked) + `syncedDrop` / `syncedDrop`. |
+| absent (pruned) | present | `Lc` | `nsCreate` (fresh docId) + `reconcileContent`; `syncedDrop(old)`. |
+| live | absent | absent | `diskMaterialize(R.path, expect absent)` once `body.caughtUp && (hasContent ∨ createSize = 0)`, else `wait(body-empty / body-not-caught-up)`. Blob: `fetchBlob`. |
+| live | absent | present | L hash = remote hash (`streams.textHash` / `blob.hash` / `createHash` at initial version) → `syncedPut` (adopt, no I/O). Else `reconcileContent(hasBase: false)`, which gives a no-base conflict copy unless identical. Path-keyed bases from recovery or epoch migration supply a base when present. |
+| absent | absent | present | Portable and not excluded → `nsCreate(freshDocId, path, hash, size)` + initial `reconcileContent` / `pushBlob`. Not portable (§c.2 validity) → notice, skip. |
+| frozen body | any | any | `wait(frozen)`. No disk write and no frames from disk. |
+
+- **Precondition ops** (`nsDelete`, `nsRestore`, `nsSetBlob`) are emitted only if the doc has no pending own ns op
+  (§c.13). Otherwise the result is `wait(pending-ns)`.
+- **Plan order:**
+  1. ns ops, in dependency order, split into frames;
+  2. `diskRename`, topologically sorted, with cycles broken through temp names;
+  3. `removeEmptyFolder`;
+  4. `diskMaterialize` and writes;
+  5. `conflictCopy` before the overwrite it protects;
+  6. `diskTrash`;
+  7. content ops;
+  8. bookkeeping.
+- **Disk ops** become `DiskOp`s with `WritePrecondition`s (`expect hash` → `{t: "hash"}`; for fresh writes, `{t:
+  "fingerprint"}` with the fingerprint read by the job). They are sent in `diskOps` batches of ≤ `diskOpsPerBatch`,
+  tagged with the lane.
+- **Failed precondition:** that doc is re-planned in the next scoped pass. Nothing is retried blindly.
+- **Bound docs.** `reconcileContent` merges into the worker replica (origin `MERGE` → `docUpdate` → editor), and
+  Obsidian's save writes the disk. The projection never writes a bound file (§d.2).
+
+### f.3 The merge engine (one)
+
+**Decision: M2 = diff3 over texts + minimal `Y.Text` diff applied with a CAS.** `MergeFn` lives in
+`src/core/merge/merge.ts`. It is pure and bounded by `MergeLimits`.
+
+- **Justification.** M1 (branch a `Y.Doc` at the sync point, apply the disk diff to the branch, merge the branches)
+  needs Yjs history at the sync point. `gc: true` destroys it. Keeping `gc: false` grows docs without bound, and IDB
+  loss loses the branch point anyway. M2 needs only the base text (`baseText`, deflated), the disk text and the CRDT
+  text. It behaves the same on main (bind and external reload) and in the worker.
+  - Alternative: M1 with gc-off snapshots. Rejected for the reasons above.
+- **Algorithm:**
+  1. `disk === crdt` → `identical`.
+  2. `base === null` → `conflict(no-base)`: the CRDT keeps its text, and the full disk text goes to a conflict copy.
+  3. `crdt === base` → `disk-only`. `disk === base` → `crdt-only`.
+  4. If either input > `maxInputChars` → `conflict(too-large)`.
+  5. Otherwise run a line-level diff3: Myers diff of base→disk and base→crdt, each capped at `maxEditsPerSide`, with
+     a common prefix/suffix trim first.
+     - Non-overlapping hunks, and identical changes on both sides, merge cleanly → `clean`.
+     - Overlapping, differing hunks → `conflict(both-edited)`: `text` = CRDT text plus the disk hunks that do not
+       overlap, and `conflictCopy` = the full disk text.
+     - Exceeding the edit cap → `too-large`.
+- **Canvas** uses the same `MergeFn` over canonical canvas text: one node or edge record per line, with stable key
+  order (§j.2). The merged text must parse and validate, else `conflict(both-edited)`.
+- **Applying to the CRDT** (worker job, or main for bound reloads):
+  1. Read `crdt0 = ytext.toString()`.
+  2. Merge.
+  3. Within one synchronous section: **CAS** `ytext.toString() === crdt0`, compute the minimal diff `crdt0 → text`
+     (prefix/suffix trim, then a bounded char-level Myers, falling back to line granularity), and apply it as
+     `delete` / `insert` ops in one transaction (origin `MERGE`).
+  - On a CAS miss (a remote update arrived during an async gap), re-run up to 3 times, then re-plan.
+  - `Y.Text` is **never** wholesale-replaced. Canvas applies record-level changes (§j.2).
+- **Order** in a merge job (the invariant I1 ordering):
+  1. read disk (text D, fingerprint F);
+  2. `MergeFn(B, D, C) → M`;
+  3. apply M to the CRDT, and `T_edit` the frames;
+  4. if conflict: `T_intent_begin(conflict-copy)`, then write the copy (precondition `absent`);
+  5. write M to the path (precondition `fingerprint F`);
+  6. `T_synced` (base = M, hashes, bodyVersion) + `T_intent_end`.
+  - If step 5's precondition fails, the user edited again. S stays at B, the next round merges (B, D′, M), and diff3
+    treats the already-applied identical hunks as non-conflicting.
+- **Bounded time.** Inputs above the caps never run diff (`too-large`). Merge jobs run in lane 3 (or 0/1 for open
+  docs) and yield between docs.
+
+### f.4 Echo suppression
+
+- For every completed host write, rename or trash (`DiskOpResult` with stat + fingerprint), record `echo[pathKey] =
+  {kind, size, mtimeMs, fingerprint, expiresAt: now + ECHO_TTL_MS}`. Writes also update `localTree` directly with the
+  known hash.
+- A matching `VaultEvent` is dropped: modify/create with equal size + mtime, or the exact expected rename or delete.
+  Each echo entry is consumed once.
+- A non-matching event marks the path dirty (`hash = null`), and the scoped plan re-hashes.
+- Echo suppression only drops hints. The full reconcile re-checks stats, with racy-clean re-hashing, so a wrongly
+  dropped event costs latency, never correctness.
+- Saves of bound files arrive as `boundSaved`. The matching modify event only refreshes the stat cache.
+
+### f.5 Safety brake
+
+`BrakeConfig` defaults come from `limits.ts` (`BRAKE_*`). The brake evaluates every `Plan` before execution:
+
+| Reason | Counts | Holds when |
+|---|---|---|
+| `listing-shrank` | Live L entries vs synced docs | `|L| < BRAKE_LISTING_FLOOR_RATIO × |S|` (vault not mounted, sync folder moved): **every** destructive op |
+| `mass-delete-local` | `nsDelete` | `> max(BRAKE_MIN_COUNT, BRAKE_RATIO × |S|)` |
+| `mass-delete-remote` | `diskTrash` | same |
+| `mass-overwrite` | Writes over a file ≥ `BRAKE_OVERWRITE_MIN_BYTES` leaving < `BRAKE_OVERWRITE_SHRINK_RATIO` of its size | same |
+| `conflict-flood` | `conflictCopy` | `> BRAKE_MAX_CONFLICT_COPIES` |
+| `ns-divergence` | All destructive ops | V3 mismatch (§b.5) |
+
+- **Held ops** go to `Plan.held`. The rest of the plan runs.
+- **Report.** `BrakeReport.id = sha256(sorted canonical held ops)`, and the engine posts a `brake` event.
+- **Approval.** `approveBrake{id}` sets `brakeApproval`. The next plan releases the held set only if it recomputes to
+  the same id. A recovery snapshot of the affected files is taken first (§j.4). `rejectBrake` converts held remote
+  deletes into nothing (the files stay; `syncedDrop`) and held local deletes into re-creates.
+- Counting is per plan **and** per rolling 10-minute window, so slow drips also trip it.
+
+### f.6 Startup scan and rename inference
+
+- **Scan.**
+  - The host sends `observations` (the full `list()`) in chunks, flow-controlled by `rid`.
+  - The engine diffs them against `localTree`. Entries whose stat is unchanged and not racy keep their hash.
+  - Others need a hash: they are batched into `readRequest`s within `maxDiskIoBytesInFlight`, then hashed in the
+    engine (`HashPort`; markdown is canonicalized first).
+  - `localComplete = true` after the last chunk and its hashes.
+  - Excluded and non-portable files are kept with `excluded = true`, so they are never planned.
+- **Rename inference** runs only when `localComplete`, and **by hash only**:
+  - *Missing* = synced docs whose `S.pathKey` has no L entry. *New* = L entries with no R or S match.
+  - Pair by `(kind, contentHash)`. A unique pair is a rename. Several equal hashes are paired by score (same leaf
+    name, then same parent folder), with ties broken by path code-unit order. Unpaired ones become delete + create.
+  - Observed `rename` events that the scan verified (the target exists) win over inference, and may carry a content
+    change (rename + edit).
+  - Folder renames arrive as per-child events, and become one `nsRename` per child, packed into frames.
+  - Alternative: similarity-based inference. Rejected: non-deterministic and expensive.
+
+### f.7 Conflict copies and intents
+
+- **Name:** `${stem} (conflict ${label} ${YYYY-MM-DD HHmm})${ext}` in the same folder.
+  - `label` = `deviceLabel` with forbidden characters removed, ≤ 32 chars. The time is local, from `ClockPort.now()`.
+  - If the name is taken, append ` 2`, ` 3`, … inside the parentheses.
+  - If the result is not a valid fold path (§c.2), fall back to `${stem} (conflict ${docId8})${ext}`.
+  - Blob keep-both uses the same pattern.
+- **Intents.** Multi-step ops (`conflict-copy`, `loser-rename`, `rebind`, `keep-both-blob`, `epoch-migration`) write
+  an `IntentRecord` (`subjectHash`, from, to, step) before step 1 and delete it after the last step.
+  - At startup each intent is resumed by checking disk. Example: the copy exists with `subjectHash` → continue with
+    the overwrite under its precondition. Otherwise restart from step 1.
+  - A resumed step never runs a destructive op without its precondition.
+
+### f.8 Planner–fold interaction summary
+
+- Loser renames, merged rebinds, identical-loser collapse and restore duty: §c.13.
+- Blob `rev-mismatch` keep-both: §c.8.
+- Pruned docs: rows "absent (pruned)" above.
+
+---
+
+## g. Main ↔ worker protocol
+
+Types are in `src/protocol/*.ts`. `PROTOCOL_VERSION = 1`.
+
+### g.1 Carriers
+
+- **Worker.** The engine bundle is built as a string by esbuild (WP-D) and embedded in `main.js`. The host starts it
+  with `new Worker(URL.createObjectURL(new Blob([src], {type: "text/javascript"})))`.
+  - `PlatformInfo.workerSupported` is **probed**: construct the worker, `init`, `ping`, and expect a `pong` within 5 s.
+  - IDB is opened inside the worker. If it is unavailable there (risk OR-1), fall back to inline.
+- **Inline.** The same engine runs on main through `InlineTransport`: structured clone, FIFO, delivery on a macrotask.
+  - Used when the worker cannot start, after `MAX_WORKER_RESTARTS`, and always in Node (simulation and tests).
+  - Inline uses `mainSliceMs` for engine slices and one device class lower for budgets.
+- **No `SharedArrayBuffer`.** Data crosses only as messages and transferables.
+
+### g.2 Messages
+
+`rid` is a per-sender increasing u32. Each request gets exactly one `result` or `error` with `re = rid`. `[T]` marks
+transferred buffers.
+
+**Main → engine:**
+
+| Message | rid | Purpose | Answer |
+|---|---|---|---|
+| `init{config}` | yes | Identity, device class, settings, relay URL + credential (secret), side files `[T]` | `ready{protocolVersion, vaultEpoch, recovered}` / `error(version-mismatch)` |
+| `shutdown{reason}` | yes | Flush builders, `T_edit`, mirror, close relay and IDB | `ok` |
+| `lifecycle{event}` | — | visible / hidden / pagehide / freeze / resume / online / offline / memory-pressure (§i.4) | — |
+| `ping` | yes | Liveness every 10 s | `pong` (no pong within `PING_TIMEOUT_MS` → restart) |
+| `observations{scanId, chunk, complete}` | yes | Listing chunks (≤ 2000 stats) | `ok` (the host sends the next chunk after it) |
+| `vaultEvents{events}` | — | Hints, batched ≤ 50 ms / 256 | — |
+| `openDoc{path, viewId}` | yes | Bind request | `bind{BindInfo [T]}` / `notBindable{reason}` |
+| `closeDoc{docId, viewId}` | — | Unbind | — |
+| `localUpdate{docId, update [T], origin}` | — | Main replica update (editor / merge), coalesced ≤ 16 ms, never dropped | — |
+| `bindDelta{docId, update [T]}` | — | Main delta against `BindInfo.stateVector` after (re)bind | — |
+| `boundSaved{docId, path, text, fingerprint, stat}` | — | Obsidian saved a bound view: new synced base | — |
+| `boundExternalMerged{docId, result, conflictReason}` | — | Interceptor merged an external change | — |
+| `docCredit{bytes}` | — | `docUpdate` flow control | — |
+| `command{UserCommand}` | yes | pause, resume, reconcileNow, approve/rejectBrake, snapshots, diagnostics, rebuildLocalCache, updateSettings, releaseQuarantine | `ok` / `snapshots` / `diagnostics` |
+| `result` / `error` `{re}` | — | Answers to engine requests | — |
+
+**Engine → main:**
+
+| Message | rid | Purpose | Answer |
+|---|---|---|---|
+| `docUpdate{docId, update [T], origin}` | — | Remote / merge / provisional / resync update for a bound doc, FIFO per doc, within credit | `docCredit` |
+| `docRetarget{docId, change}` | — | renamed / merged / deleted / frozen: the host unbinds and re-opens (§d.2) | — |
+| `bindable{path}` | — | A path became bindable | Host `openDoc` |
+| `readRequest{reads}` | yes | Disk reads (area vault/config, maxBytes) | `reads{DiskReadResult[] [T]}` |
+| `diskOps{lane, ops}` | yes | Ordered ops with preconditions. A failed op does not stop independent later ones; dependents report `skipped` | `diskOps{DiskOpResult[]}` |
+| `saveViews{docIds}` | yes | Force Obsidian saves (before hidden, before rebuild) | `viewSaved{saved}` |
+| `sideFileWrite{name, bytes [T]}` / `sideFileRead{name}` | yes | Mirrors and snapshots | `sideFileWritten` / `sideFile{bytes [T]}` |
+| `status{StatusSnapshot}` | — | Throttled to ≤ 4/s and sent on phase change | — |
+| `brake{BrakeReport}` | — | User approval needed | Host shows UI → `command` |
+| `notice{level, code, message}` | — | User-facing notice | — |
+| `fatal{error}` | — | Engine cannot continue | Host stops, shows error |
+| `result` / `error` `{re}` | — | Answers to main requests | — |
+
+### g.3 Ids
+
+- **`rid`** is per sender, starts at 1 and increases. Ids are never reused within one transport instance.
+- **`opId`** is unique per engine instance across all `diskOps` batches, and is used in diagnostics and intents.
+- **`scanId`** increases per listing.
+- **`viewId`** is assigned by the host per editor leaf.
+- **`docId`** is the fold docId.
+
+### g.4 Transferables, backpressure, errors
+
+- **Transferables.** Every `[T]` buffer must be exclusively owned (`byteOffset 0`, `byteLength = buffer.byteLength`).
+  The sender copies with `slice()` otherwise (Yjs encoders usually return owned buffers), and never touches it after
+  `post`.
+- **Backpressure:**
+  - `docUpdate` uses a credit window per doc (§d.3);
+  - `observations` are chunked and acknowledged;
+  - `readRequest` is bounded by `maxDiskIoBytesInFlight`;
+  - `diskOps` batches are ≤ `diskOpsPerBatch`, and the host runs lane 0 batches before others, within `mainSliceMs`
+    slices;
+  - `vaultEvents` and `localUpdate` are small and unbounded by design. Main never drops them.
+- **Timeouts.** Engine requests time out after `DISK_REQUEST_TIMEOUT_MS` / `SIDE_FILE_TIMEOUT_MS` → `error(timeout)`.
+  The engine re-plans the scope, and nothing is assumed done.
+- **Errors.** `ProtocolError{code, message, retryable}`. `message` never contains credentials or file contents.
+  `TERMINAL_ERROR_CODES` (`version-mismatch`, `revoked`) stop automatic retries.
+- **Worker failure** (`onFailure`, or missed pongs):
+  - The host terminates the worker and starts a new one.
+  - Bound views re-run `openDoc`. Their `bindDelta` carries any main edits the dead worker never persisted, because
+    the main replica still holds them, so a worker crash loses nothing.
+  - After `MAX_WORKER_RESTARTS` within 10 min, the host switches to inline.
+
+### g.5 Inline fallback
+
+- The protocol, messages and ordering are identical. Only the transport changes.
+- Long engine jobs yield via `ClockPort.yieldNow()` every `mainSliceMs`.
+- The phone/constrained budgets apply, and status shows `transport: "inline"`.
+
+---
+
+## h. Ports
+
+The port files in `src/ports/*.ts` are normative, including their doc comments with semantics. These are their
+exact signatures.
+
+```ts
+// common.ts
+type Unsubscribe = () => void;
+interface PortError { readonly code: string; readonly message: string; readonly retryable: boolean }
+
+// clock.ts — virtual in simulation
+interface ClockPort {
+  now(): number;                 // wall clock: names, diagnostics, daily budget only
+  monotonic(): number;           // timers, backoff, racy windows
+  setTimer(delayMs: number, fn: () => void): TimerHandle;
+  clearTimer(handle: TimerHandle): void;
+  yieldNow(): Promise<void>;
+}
+
+// random.ts — seeded in simulation
+interface RandomPort { bytes(length: number): Uint8Array; float(): number }
+
+// crypto.ts — suite 0 = identity
+type BlobAddress = Brand<string, "BlobAddress">;
+type OpenFailure = "unknown-key" | "auth-failed" | "unsupported-suite";
+interface CryptoPort {
+  readonly suite: CryptoSuite;
+  readonly keyEpoch: number;
+  seal(input: { aad: Uint8Array; plaintext: Uint8Array }): Promise<Uint8Array>;
+  open(input: { suite: CryptoSuite; keyEpoch: number; aad: Uint8Array; sealed: Uint8Array }):
+    Promise<{ ok: true; plaintext: Uint8Array } | { ok: false; reason: OpenFailure }>;
+  sealBlob(plaintext: Uint8Array): Promise<Uint8Array>;
+  openBlob(sealed: Uint8Array): Promise<Uint8Array | null>;
+  blobAddress(hash: ContentHash): Promise<BlobAddress>;
+}
+interface HashPort { sha256(bytes: Uint8Array): Promise<Uint8Array> }
+
+// blob.ts — engine receives BlobPort | null
+interface BlobPort {
+  readonly maxBlobBytes: number;
+  has(addresses: readonly BlobAddress[]): Promise<ReadonlySet<BlobAddress>>;
+  put(address: BlobAddress, bytes: Uint8Array): Promise<void>;
+  get(address: BlobAddress): Promise<Uint8Array | null>;
+}
+
+// platform.ts
+interface PlatformInfo {
+  readonly os: PlatformOs; readonly isMobile: boolean; readonly isTablet: boolean;
+  readonly hardwareConcurrency: number; readonly deviceMemoryGiB: number | null; readonly workerSupported: boolean;
+}
+type LifecycleEvent = "visible" | "hidden" | "pagehide" | "freeze" | "resume" | "online" | "offline" | "memory-pressure";
+interface PlatformPort {
+  readonly info: PlatformInfo;
+  isVisible(): boolean;
+  isOnline(): boolean;
+  onLifecycle(listener: (event: LifecycleEvent) => void): Unsubscribe;
+}
+
+// vault.ts — main thread only
+type WritePrecondition = { t: "absent" } | { t: "fingerprint"; fingerprint: DiskFingerprint }
+  | { t: "hash"; hash: ContentHash } | { t: "any" };
+interface VaultPort {
+  readonly configDir: string;
+  readonly caseInsensitive: boolean;
+  list(): Promise<readonly VaultStat[]>;
+  stat(path: string): Promise<VaultStat | null>;
+  readText(path: string): Promise<string>;
+  readBytes(path: string): Promise<Uint8Array>;
+  write(path: VaultPath, data: string | Uint8Array, precondition: WritePrecondition): Promise<WriteOutcome>;
+  rename(from: string, to: VaultPath, precondition: WritePrecondition): Promise<RenameOutcome>;   // vault.rename, never fileManager.renameFile
+  trash(path: string, mode: TrashMode, precondition: WritePrecondition): Promise<RenameOutcome>;  // no permanent delete
+  removeEmptyFolder(path: VaultPath): Promise<void>;
+  onEvent(listener: (event: VaultEvent) => void): Unsubscribe;
+}
+interface ConfigDirPort {
+  list(dir: string): Promise<readonly { path: string; size: number; mtimeMs: number; isFolder: boolean }[]>;
+  readBytes(path: string): Promise<Uint8Array | null>;
+  writeBytes(path: string, bytes: Uint8Array): Promise<void>;   // atomic replace
+  remove(path: string): Promise<void>;
+}
+interface SideFilePort {
+  read(name: SideFileName): Promise<Uint8Array | null>;
+  write(name: SideFileName, bytes: Uint8Array): Promise<void>;
+  remove(name: SideFileName): Promise<void>;
+  list(prefix: "snapshots/"): Promise<readonly SideFileName[]>;
+}
+
+// workspace.ts — main thread only
+interface EditorViewRef {
+  readonly viewId: number; readonly path: VaultPath | null;
+  hasEditor(): boolean; getText(): string; getLastSavedText(): string;
+  applyMinimalReplace(text: string): void;
+  bind(spec: EditorBindingSpec): Unsubscribe;                       // y-codemirror
+  interceptExternalReload(handler: ExternalReloadHandler): Unsubscribe; // per-instance setViewData wrap
+  save(): Promise<void>;
+}
+interface WorkspacePort {
+  listMarkdownViews(): readonly EditorViewRef[];
+  onViewEvent(listener: (event: ViewEvent) => void): Unsubscribe;
+}
+
+// storage.ts — IndexedDB / in-memory
+interface StorageTx<S> {
+  get(store, key): Promise<record | undefined>;
+  getAll(store, range?, limit?): Promise<record[]>;
+  getAllKeys(store, range?, limit?): Promise<key[]>;
+  getAllByIndex(store, index, range?, limit?): Promise<record[]>;
+  count(store, range?): Promise<number>;
+  countByIndex(store, index, range?): Promise<number>;
+  put(store, record): void; delete(store, key): void; deleteRange(store, range): void; abort(): void;
+}
+interface StorageDb<S> {
+  readonly name: string;
+  tx<T>(stores: readonly StoreName<S>[], mode: "readonly" | "readwrite", body: (tx: StorageTx<S>) => Promise<T>): Promise<T>;
+  close(): void;
+  onLost(listener: (failure: StorageFailure) => void): Unsubscribe;
+}
+interface StoragePort {
+  open<S>(name: string, version: number, stores: Record<StoreName<S>, StoreSpec>): Promise<StorageDb<S>>;
+  deleteDatabase(name: string): Promise<void>;
+  listDatabases(): Promise<readonly string[]>;
+  requestPersistence(): Promise<boolean>;
+}
+
+// relay.ts — contract R1–R7 in the file header
+interface RelaySession {
+  readonly vaultEpoch: VaultEpoch; readonly headSeq: Seq; readonly canWrite: boolean; readonly limits: RelayLimits;
+  append(frame: AppendFrame): void;
+  bufferedBytes(): number;
+  feed(afterSeq: Seq): Promise<FeedPage>;
+  read(stream: StreamName, afterSeq: Seq, preferCheckpoint: boolean): Promise<ReadPage>;
+  putCheckpoint(stream: StreamName, coversSeq: Seq, expectedPrevCoversSeq: Seq, bytes: Uint8Array): Promise<PutCheckpointResult>;
+  onEvent(listener: (event: RelayEvent) => void): Unsubscribe;   // buffers until the first listener
+  close(code: number, reason: string): void;
+}
+interface RelayPort { connect(params: { vaultId: VaultId; deviceId: DeviceId }): Promise<RelayConnectResult> }
+
+// index.ts — bundles
+interface EnginePorts { relay; storage; clock; random; crypto; hash; blob: BlobPort | null }
+interface HostPorts { vault; configDir; sideFiles; workspace; platform; clock; random; hash }
+```
+
+- **Production adapters:**
+  - `ObsidianVaultPort`, `ObsidianWorkspacePort`, `SideFilePort`, `ConfigDirPort` and `PlatformPort` in `src/host/`
+    (WP-D);
+  - `IdbStoragePort`, `WsRelayPort` (+ HTTP), `HttpBlobPort` and `NoopCryptoPort` in `src/engine/adapters/` (WP-C);
+  - WebCrypto `HashPort`.
+- **Simulation adapters** (`src/sim/`, WP-A): `MemStoragePort` (crash = keep committed transactions), `SimRelay`
+  (implements relay-wire semantics including the dedupe window, restarts, provisional/notice and group commit),
+  `SimVault` (case-insensitive or case-sensitive profile), `SimWorkspace`, and virtual `ClockPort` / seeded
+  `RandomPort`.
+
+---
+
+## i. Runtime
+
+### i.1 Priority lanes
+
+| Lane | `LANE` | Work |
+|---|---|---|
+| 0 | `openNote` | `localUpdate` apply, frame close and **send** for bound docs, receipts, `docUpdate` forwarding, provisionals for bound docs, bind requests |
+| 1 | `openCatchUp` | Reads, union and merges for bound or just-opened docs; hard-limit compaction |
+| 2 | `namespace` | ns/cfg ingest, fold, ns/cfg reads, planner runs, ns frames, settings projection |
+| 3 | `background` | Body reads for stale streams, merges, projection writes, materialization, scan hashing |
+| 4 | `bulk` | Blobs, compaction, remote checkpoints, retired checkpoints, snapshots, mirrors |
+
+- **Scheduler.** Cooperative and single-threaded in the engine.
+  - Each slice runs jobs from the highest non-empty lane until `sliceMs` has elapsed, then calls `yieldNow()`.
+  - **Aging:** every 8th slice serves the oldest job of lanes ≥ 3, so bulk work never starves.
+  - Relay events are queued immediately (O(1)). Their processing is scheduled by lane.
+- **Sender** order: lane 0 frames, ns, cfg, background, then bulk (`x:` chunks, adopted frames).
+- **Host** executes `diskOps` batches lane-first within `mainSliceMs` slices, and puts editor work ahead of all of
+  it.
+
+### i.2 Device classes and budgets
+
+The host picks the class and passes it in `EngineInitConfig.deviceClass`:
+
+| Class | Selected when |
+|---|---|
+| `desktop` | not mobile |
+| `tablet` | `isTablet` |
+| `phone` | mobile and not a tablet |
+| `constrained` | mobile with (`deviceMemoryGiB` < 3, or `hardwareConcurrency` ≤ 2), or phone/tablet running inline |
+
+Budgets (`BUDGETS` in `limits.ts`):
+
+| | desktop | tablet | phone | constrained |
+|---|---|---|---|---|
+| Resident docs / bytes | 400 / 256 MiB | 120 / 96 MiB | 60 / 48 MiB | 24 / 24 MiB |
+| Engine slice / main slice | 10 / 8 ms | 10 / 6 ms | 8 / 5 ms | 6 / 4 ms |
+| Catch-up / blob concurrency | 8 / 4 | 4 / 2 | 3 / 2 | 2 / 1 |
+| In-flight append bytes | 1 MiB | 512 KiB | 512 KiB | 256 KiB |
+| Disk I/O in flight / ops per batch | 8 MiB / 32 | 4 MiB / 16 | 2 MiB / 16 | 1 MiB / 8 |
+| Full reconcile interval | 5 min | 10 min | 10 min | 15 min |
+| Daily frame soft budget | 20 000 | 10 000 | 6 000 | 4 000 |
+| `docUpdate` credit window | 512 KiB | 256 KiB | 256 KiB | 128 KiB |
+
+Further caps:
+- live queue: 4 MiB / 1000 rows;
+- merge inputs: `MERGE_MAX_INPUT_CHARS`;
+- doc text: `MAX_DOC_TEXT_CHARS`;
+- base text: `MAX_BASE_TEXT_CHARS`.
+
+### i.3 Residency
+
+- Clean-only LRU, described in §d.1.
+- Bound docs are pinned. Docs with an open frame builder or a running job are pinned until done.
+- Catch-up of cold docs never loads a `Y.Doc`. Rows are stored after gate stages 1–2.
+- A doc is loaded only for:
+  - bind;
+  - a merge or projection (planner `reconcileContent` / `diskMaterialize`);
+  - a union or compaction job;
+  - a causal-hole check.
+
+### i.4 Lifecycle
+
+| Event | Action |
+|---|---|
+| `hidden` | Close all frame builders (`T_edit`); `saveViews` for bound docs; write the outbox and synced mirrors; pause lanes 3–4. Desktop keeps the socket. Mobile closes it (1000) after 30 s hidden. |
+| `pagehide` / `freeze` | Same flush, started synchronously (IDB transactions start in the event turn), then close the socket. Expect to be killed: nothing is held in memory only, beyond the ≤ 316 ms builder window that disk covers. |
+| `resume` / `visible` | Reconnect at once (reset backoff), feed, full reconcile. Check the IDB connection: `onLost` → §i.5. |
+| `online` / `offline` | Connect at once / stop reconnect attempts. The outbox keeps accumulating. |
+| `memory-pressure` | Evict all clean docs, drop live-queue payloads for cold docs (stale-record), drop candidate caches except the newest. |
+
+### i.5 IDB loss and recovery
+
+**Detection.** Any one of:
+- `open` fails;
+- `StorageFailure` is `connection-lost` and the reopened DB lacks `meta.identity`;
+- the identity mismatches;
+- the DB is empty while the side-file mirrors have generation > 0.
+
+**Procedure** (phase `recovering`):
+1. Open a fresh DB under the same name. On a WebKit connection loss, try reopening first.
+2. Import the outbox mirror: same `clientFrameId`s, `order`s and states (sent → pending), and `outboxOrder.next =
+   max + 1`.
+3. Import the synced mirror as `SyncedEntry` with `hasBase = false` and `bodyVersion = null`. With `bodyVersion =
+   null` the planner compares content instead: `Rc := streams.textHash ≠ S.contentHash`.
+4. `identity.recoveredFromMirror = true` and cursor 0.
+5. Full catch-up: feed from 0, ns first, then reads with `preferCheckpoint`.
+6. Full scan, with every file hashed.
+7. Plan:
+   - L = S → adopt;
+   - only L changed → disk-only;
+   - both changed → no-base conflict copy.
+   - Nothing is destroyed.
+
+**Without mirrors**, recovery is the fresh-device onboarding path (§j.5): identical files are adopted and differing
+ones get conflict copies.
+
+**`rebuildLocalCache`:** flush the outbox to the mirror, close and delete the DB, then run the same procedure.
+
+**`StorageFailure: quota`:** §e.3.
+
+### i.6 Relay conditions
+
+| Condition (relay-wire) | Engine response |
+|---|---|
+| `refused daily-limit` (VAULT_ERROR `cf_daily_limit`, `resetAt`) / connect `daily-limit` | Phase `daily-limit`. Hold all appends and checkpoint puts until `retryAfterMs` + jitter (first probe 2 min after reset). Reads continue. Local edits keep filling the outbox. Notice (ported `dailyLimit` strings). |
+| Daily soft budget (per device, local day) | At 80 %: notice. Above 100 %: frame timers ×4, background merges coalesced to ≥ 10 s per doc, onboarding creates throttled (§j.5). |
+| `backpressure` (VAULT_BACKPRESSURE), then 1013 | Stop sending at once. Reconnect after ≥ 5 s. Client token bucket at 50 % for 10 min. |
+| 1009 oversize / 1008 malformed APPEND | Probe mode, poison (§d.6). |
+| 1008 + upgrade error `unauthorized` | Re-ticket once. Connect `unauthorized` (ticket 401) → phase `revoked`, stop, "re-pair device" notice. |
+| `update_required` / connect `update-required` | Phase `upgrade-required`, no reconnect until the plugin updates. |
+| `unclaimed` / `not-found` | Phase `error` with notice, retry hourly. |
+| 4403 `authority_superseded` / connect `superseded` | Re-ticket and reconnect. Repeated: phase `superseded`, retry every `SUPERSEDED_RETRY_MS`. |
+| 4409 | Not sent on streams sockets. If seen: reconnect and compare `VAULT_READY.vaultEpoch` (§c.12). |
+| HTTP 409 `vault_generation_mismatch` | Epoch change (§c.12). |
+| `refused durability` | Resend the same frame (same id) after 1 s backoff. |
+| `refused frame-id-conflict` | Poison it. Body: rebuild from disk. ns/cfg: re-plan the ops under a fresh frame id. Diagnostics. |
+| `refused forbidden` / `canWrite = false` | Read-only: no appends or checkpoints. Outbox kept. Notice. |
+| `resendUnreceipted` (STREAM_RESEND) | §d.5. |
+| 1001 / 1006 / network | Reconnect with full-jitter exponential backoff `RECONNECT_BASE_MS` → `RECONNECT_MAX_MS`. Immediate on `online` / `visible`. |
+| Ticket TTL 5 min | The adapter fetches a fresh ticket for every connect. |
+
+---
+
+## j. Shorter specs
+
+### j.1 Blobs
+
+- **With a blob store** (`BlobPort`):
+  - **Upload** (`blobQueue up`): hash → `crypto.blobAddress(hash)` → `has` → `put(sealBlob(bytes))`. Only **after**
+    the put succeeds does the planner emit `nsCreate` / `nsSetBlob` for that hash, so readers can always fetch what
+    ns references.
+  - **Download:** `get` → `openBlob` → verify sha256 → write with precondition. A missing blob is retried with backoff
+    (`wait(blob-unavailable)`).
+  - Files larger than `BlobPort.maxBlobBytes` (10 MiB) or `settings.maxAttachmentBytes` are not synced (notice) and
+    never deleted.
+- **Without a blob store** (`blob = null`; the relay answers 503 `attachments_unavailable`):
+  - Attachments ≤ `MAX_LOG_BLOB_BYTES` (8 MiB) ride stream `x:<sha256>` as `blobChunk` frames (768 KiB, ≤ 11 rows).
+    The ns op is emitted after every chunk is receipted.
+  - Readers `read(x:…)`, assemble by index (duplicates ignored), and verify the hash.
+  - Larger files are not synced (notice).
+  - `x:` streams get `retired` checkpoints once no ns entry or cfg file references the hash.
+  - The same path carries `bodyUpdateRef` payloads.
+- `syncAttachments = false` excludes blobs entirely: no ns ops, and remote blobs are not fetched.
+
+### j.2 Canvas
+
+- **CRDT.** Stream `c:<docId>`. Roots:
+  - `Y.Map "nodes"`: id → `Y.Map` of fields. Values are JSON (`ContentAny`), except a text node's `text`, which is a
+    `Y.Text`. Each node also has `"rank"`, a fractional order key (ported `canvasOrdering`).
+  - `Y.Map "edges"`: same shape, keyed by id.
+  - `Y.Map "doc"`: other top-level keys, as JSON values.
+  - The gate rejects any other root or type.
+- **Projection.** Nodes and edges are sorted by `(rank, id)`. Disk bytes use Obsidian's formatting
+  (`JSON.stringify(_, null, "\t")`, ported `formatCanvasBytes`). The logical hash uses `canonicalCanvasBytes`.
+  - **Validation:** unique string ids; node `type ∈ {text, file, link, group}`; numeric `x / y / width / height`;
+    edges reference existing nodes (dangling edges are dropped from the projection, kept in the CRDT). Invalid →
+    freeze `canvas-invalid`.
+- **Merge.** The ONE `MergeFn` runs over the canonical record-per-line text (`canonicalCanvasItemBytes` with rank),
+  so concurrent edits to different nodes merge, and the same node conflicts.
+  - The CRDT apply is record-level: changed fields are set, and the `text` field gets a minimal `Y.Text` diff. Node
+    maps are never replaced wholesale.
+  - Canvas views are not bound. Every user edit reaches the CRDT through a disk save and merge.
+
+### j.3 Settings sync (`cfg`)
+
+- **Allowlist:**
+  - `app.json`, `appearance.json`, `hotkeys.json`, `core-plugins.json`: `jsonSet` / `jsonDel` per top-level key,
+    canonical JSON. A device-local key denylist per file is never emitted.
+  - `community-plugins.json`: projected from `plugins` (`pluginSet` / `pluginDel`).
+  - `plugins/<id>/data.json`: `filePut` with `pluginVersion`, applied only on an equal local version.
+  - `snippets/*.css`, `themes/<name>/{theme.css, manifest.json}`: `filePut`. Content > 64 KiB or binary goes as a
+    blob ref.
+- **Never synced:** `plugins/yaos/**`, `workspace*.json`, plugin code (`main.js`, `styles.css` of plugins), caches.
+- **Detection.** On full reconcile and focus, `ConfigDirPort.list` / `readBytes` are compared with `cfgBase`. Changed
+  keys or files become cfg ops, sent through the send window.
+- **Projection.** For each register whose fold value ≠ local:
+  - local = `cfgBase` → write (`ConfigDirPort.writeBytes`, atomic);
+  - local changed too → emit the local op first. The fold then orders the two, and the later seq wins.
+  - `T_cfg` updates `cfgBase`.
+- **Ops cover only settings changes**, never whole-file rewrites. Each key holds a single value, so a register cannot
+  grow.
+- **Reload notice.** When applied settings need an Obsidian reload, show a notice. YAOS never reloads Obsidian itself.
+- Port the legacy `settingsSync/{allowlist, dataJsonGate, configDirKey, lwwReconcile(json canonicalization only)}`.
+
+### j.4 Client snapshots and recovery
+
+- **Snapshot:** a zip (fflate) of markdown and canvas files, plus blobs ≤ 1 MiB, with a manifest of path, hash and
+  size. Written as side file `snapshots/<id>.zip`. Capped at 256 MiB; skipped above with a notice.
+- **When taken:**
+  - daily, keeping `keepDaily`;
+  - before a brake approval, an epoch migration, an IDB recovery, and `restoreSnapshot`.
+- **Optional R2 upload:** with `uploadToBlobStore` and a `BlobPort`, the sealed zip is `put` under its hash address.
+  The local index keeps the address. Cross-device restore is out of scope for v1.
+- **Restore** (`restoreSnapshot{id, paths|null}`):
+  - files are written as ordinary local edits (precondition `any`, after a `conflictCopy` of any differing current
+    file);
+  - they sync normally and are subject to the brake (overwrite counting).
+
+### j.5 Onboarding and import
+
+- **Pairing** (UI out of scope; port the legacy provisioning client) yields `vaultId`, `deviceId` and a credential
+  (secret, kept in plugin data).
+- **First engine start against a vault:**
+  1. ns catch-up (§j.6);
+  2. full scan;
+  3. plan:
+     - `R live, S absent, L present` → equal hash: adopt, with no frames. Different: a no-base conflict copy of the
+       local file, and the remote content takes the path.
+     - L-only files → `nsCreate` (+ held initial body frames).
+- **Concurrent onboarding.** Two devices importing the same files into an empty vault converge through the fold:
+  - identical files → `merged`: no copies, no body rows;
+  - differing files → suffixed;
+  - identical-loser collapse removes the rest (§c.5, §c.13).
+- **Row budget.** About 1 ns row per 512 creates, plus ≥ 1 body row per note (`ceil(chars / 192 Ki)`), plus ≤ 11 per
+  log-carried attachment.
+  - A 10k-note vault is about 10k rows/day of the 100k free-plan rows.
+  - Larger imports are paced by the daily soft budget, in order: most recently modified first, then small before
+    large. Status shows progress. The daily-limit hold (§i.6) is the backstop.
+- **Legacy YAOS vault data is not migrated.** A new client connects to a new vault epoch, and existing files import
+  as local files.
+  - Alternative: migrating legacy CRDT state. Rejected: a different log, and disk is the source of truth at import.
+
+### j.6 Fresh-device bootstrap
+
+1. **Connect, then feed from 0.** All streams are recorded stale with priorities. There are about streams/1000 pages.
+2. **ns first.** `read("ns", 0, true)`: verify the checkpoint (V1 + V2), then fold the rows. The Remote tree is now
+   complete, and status shows `bootstrap {docsTotal}`.
+3. **Bodies lazily, by priority.** Bound or opened docs (lane 1) first, then live docs by `lastTouchSeq` descending,
+   small first within a bucket (`priority = bucket(lastTouchSeq) × 4 + sizeClass`), then blobs (lane 4).
+   - Reads use `preferCheckpoint = true`, so a body costs about one checkpoint plus few rows.
+4. **Progressive disk writes.** Each doc is materialized as soon as its body is caught up (`diskMaterialize`, expect
+   absent), so `docsMaterialized` rises steadily. Folders are created implicitly by writes.
+5. **Afterwards.** A full reconcile runs, then `live`. Files present locally before bootstrap follow §j.5.
+
+### j.7 Status and diagnostics
+
+- **`StatusSnapshot`** (`src/protocol/status.ts`): phase, transport, epoch, seqs, relay connection, counts (stale
+  streams, outbox, unreceipted, resident, pending disk ops and blobs, quarantined rows, frozen docs, conflict copies
+  today), bootstrap progress, brake, last reconcile and sync times, daily frames, notices.
+  - Posted on phase change, and otherwise at most 4/s.
+  - The status bar shows phase + unsynced count.
+- **`DiagnosticsBundle`:**
+  - recent events (a 2000-entry ring of `DiagnosticsEvent`: numbers, booleans, stream classes and **hashed** paths),
+    quarantine summary, frozen docs, per-store counts and bytes;
+  - real paths only on opt-in;
+  - never credentials, tickets or file contents.
+  - Exported by command. The host writes it under `<configDir>/plugins/yaos/diagnostics/` and offers copy to
+    clipboard.
+
+---
+
+## k. Module layout and build plan
+
+### k.1 Layout
+
+```
+src/
+  core/                      PURE: no I/O, timers, Date, Math.random, yjs, DOM
+    types.ts envelope.ts limits.ts            [architect, frozen]
+    codec/   lib0 helpers, envelope, nsOps, cfgOps, nsFoldV1, cfgFoldV1, blobChunk, mirrors   [WP-A]
+    paths/   pathKey (+ generated casefold15_1, assigned15_1), validate, segments              [WP-A]
+    ns/      fold, index, place, overlay, verify (V1/V2), candidate (V3 digest rule)          [WP-A]
+    cfg/     fold, projection (pure JSON register → file bytes)                               [WP-A]
+    hash/    markdownLf (ported markdownCodec), canvasCanonical (ported canvasCodec/Ordering) [WP-B]
+    merge/   merge (MergeFn), myers, diff3, minimalDiff                                        [WP-B]
+    plan/    planner (PlanFn), brake, renames, conflictName, order                            [WP-B]
+  ports/                     [architect, frozen]
+  protocol/                  messages/errors/status/transport types [architect]; workerTransport, inlineTransport [WP-D]
+  engine/                    worker or inline; yjs allowed; no obsidian, no DOM except adapters/
+    store/   schema.ts [architect]; repo.ts (all §e.2 transactions)                           [WP-C]
+    adapters/ idbStorage, wsRelay (+http feed/read/checkpoint), httpBlob, noopCrypto, webHash [WP-C]
+    ingest/  gate, yjsCheck                                                                   [WP-C]
+    body/    handles, frameBuilder, sender, provisional, compaction, checkpoints, canvasDoc    [WP-C]
+    sync/    cursor, catchUp, nsRuntime (fold host, overlay, duties), cfgRuntime              [WP-C]
+    runtime/ engine.ts (createEngine), lanes, budgets, lifecycle, status, diagnostics, recovery [WP-C]
+    reconcile/ localTree, scan, planRunner, mergeJob, echo, intents                           [WP-B]
+    blobs/   blobQueue (store + x: log carrier)                                               [WP-B]
+    settings/ cfgScan, cfgProject                                                             [WP-B]
+    snapshots/ snapshotJob                                                                    [WP-B]
+    workerMain.ts            worker entry glue                                                [WP-D]
+  host/                      Obsidian main thread; obsidian, yjs, y-codemirror allowed
+    plugin.ts engineHost.ts (spawn, restart, inline fallback) diskExecutor.ts binding.ts
+    obsidianVault.ts obsidianWorkspace.ts configDir.ts sideFiles.ts platform.ts ui/          [WP-D]
+  sim/                       tests only, never bundled
+    relay.ts storage.ts clock.ts random.ts                                                    [WP-A]
+    vault.ts workspace.ts actors.ts faults.ts invariants.ts run.ts                            [WP-D]
+```
+
+### k.2 Dependency rules
+
+These are enforced by `scripts/check-deps.mjs` (WP-D), a regex import scan run in CI.
+
+- `core/**` imports only `core/**`, `lib0`, `fflate`, and type-only `ports/**`.
+- `ports/**` and `protocol/**` (types) import only `core/**` types (plus the `yjs` type in workspace.ts).
+- `engine/**` imports `core`, `ports`, `protocol`, `yjs`, `lib0` and `fflate`.
+  - Never `obsidian` or `host/**`.
+  - Browser globals (`indexedDB`, `WebSocket`, `fetch`, `crypto.subtle`) only in `engine/adapters/**`.
+- `host/**` imports `core`, `ports`, `protocol`, `obsidian`, `yjs`, `y-codemirror.next` and `@codemirror/*`. From
+  `engine/` it imports only `engine/runtime/engine.ts` (inline fallback) and the bundled worker source string.
+- `sim/**` may import anything. Nothing imports `sim/**` except tests.
+- Shared shapes change only through the architect files plus this document.
+
+### k.3 Build plan (4 parallel work packages)
+
+The only shared files are the frozen architect files. Each WP owns its directories. WPs integrate through ports, the
+`PlanFn` / `MergeFn` / `FoldNsFrame` signatures, `YaosSchema` and the protocol.
+
+| WP | Owns | Acceptance tests |
+|---|---|---|
+| **WP-A: fold, codecs, paths, sim log** | `src/core/{codec,paths,ns,cfg}/**`, `src/sim/{relay,storage,clock,random}.ts` | (1) Every codec round-trips. Canonical re-encode rejects non-minimal input. Malformed ns/cfg frames fold as empty. (2) E1–E12 (§c.14) as unit tests. (3) 10k-op fold fuzz (§l.4) passes 1000 seeds. (4) pathKey: ß/ss, Σ/σ/ς, İ, NFC/NFD, unassigned code points rejected. Table generator reproducible from UCD 15.1. (5) `SimRelay` conformance with relay-wire: contiguous seqs, receipts after broadcasts, dedupe window expiry, older-seq notice, STREAM_RESEND loss, provisional/notice/dropped, feed/read paging, checkpoint CAS + GC, 1 MiB close, rate close, daily limit. (6) `MemStoragePort` crash semantics and tx-inactive detection. |
+| **WP-B: planner, merge, disk side** | `src/core/{hash,merge,plan}/**`, `src/engine/{reconcile,blobs,settings,snapshots}/**` | (1) MergeFn properties: no line of disk or crdt is lost (each appears in `text` or `conflictCopy`); identical/one-sided cases exact; bounded on 2M-char inputs. (2) `minimalDiff` applied to crdt0 equals the target, and its edit size is ≤ the line-diff size. (3) One test per planner table row. Brake thresholds and approval id stability. (4) Rename inference determinism (shuffle-invariant). (5) Conflict names always valid. (6) Reconcile job against `SimVault` + `MemStorage` + a stub log: CAS failures re-plan, echo suppression, intents resume at every crash point. (7) Settings projection gates (yaos dir, data.json version). |
+| **WP-C: log-side engine** | `src/engine/{store/repo.ts,adapters,ingest,body,sync,runtime}/**` | (1) Crash at every transaction boundary (§e.2): the state reconstructs, no outbox frame is lost, and the cursor never passes an unaccounted seq. (2) Gate: malformed, disallowed types, oversize, causal hole → re-read → freeze; `releaseQuarantine`. (3) Frame builder: per-keystroke cost independent of doc size (benchmark: 5 MB doc, 1000 keystrokes, no `encodeStateAsUpdate` calls), size caps, initial chunking, `bodyUpdateRef`. (4) Provisional adopt/settle/drop, R7 settle, STREAM_RESEND resend, send window. (5) Catch-up with GC'd rows → checkpoint union. Compaction exactness: snapshot = fold of rows ≤ C. Checkpoint CAS outcomes. (6) Smoke against the local relay (`scripts/relay-dev`, e2e/relay/smoke.ts scenarios through `WsRelayPort`). |
+| **WP-D: host, protocol carriers, worker, sim runner** | `src/protocol/{workerTransport,inlineTransport}.ts`, `src/engine/workerMain.ts`, `src/host/**`, `src/sim/{vault,workspace,actors,faults,invariants,run}.ts`, `scripts/check-deps.mjs`, esbuild config (worker string bundle) | (1) Worker and inline transport parity on recorded message traces; transfer ownership asserted. (2) Disk executor honours every `WritePrecondition`; rename uses `vault.rename`; trash only. (3) Binding: bind-time merge, no echo loop (update counts), external-reload interception, `docCredit` resync, worker kill mid-typing loses nothing (`bindDelta`). (4) Lifecycle flush on `pagehide`. (5) Full simulation suite (§l) green on 200 CI seeds. (6) Obsidian smoke on desktop + iOS: the worker starts and IDB opens in the worker (or inline fallback is reported). |
+
+- **Sequencing.** All four start at once against the frozen types.
+  - WP-B and WP-C use stubs of each other's functions until the integration week.
+  - WP-D's simulation runner integrates last.
+  - The first integration milestone is 2 simulated devices, markdown only, with no faults.
+  - Spikes on day 1 (WP-D): Blob-URL worker plus IDB-in-worker on Obsidian iOS/Android (OR-1), and `setViewData`
+    interception (OR-2).
+
+---
+
+## l. Simulation test plan
+
+### l.1 Actors
+
+All actors run in one Node process with a virtual `ClockPort` and a seeded `RandomPort`.
+
+- **`SimRelay`**: relay-wire semantics. Group commit (300 ms idle / 1500 ms max / 64 KiB), per-stream dedupe window,
+  provisional + notice for `b:`/`c:`, receipts after broadcasts, feed/read/checkpoint with GC, limits, daily-limit
+  latch, restarts.
+- **Device × N (2–5).** Each is engine (inline transport) + host + `SimVault` (case-insensitive or case-sensitive
+  profile, Obsidian-like event semantics including per-child folder rename events) + `SimWorkspace` (views,
+  y-codemirror stand-in, 2 s save debounce, `setViewData` reloads) + `MemStoragePort` + `SideFilePort`.
+- **User actors**, per device: type into open notes (unique tokens), open/close/switch views, create/edit/rename/
+  delete files and folders, case-only renames, paste large text, import a folder of files, attachments, settings
+  edits.
+- **External-writer actor:** another app modifying files on disk, including files open in editors.
+
+### l.2 Seeded faults
+
+- Socket close at random points: before append, after commit before receipt, between provisional and notice. This
+  produces drop, duplicate (resend), and cross-device reorder through independent socket delays. The relay keeps
+  per-socket order.
+- Relay restart → STREAM_RESEND, with unreceipted frames lost.
+- Dedupe window expiry before a resend.
+- **Crash** at every persistence step: before and after each `StorageTx` commit, between `T_edit` and `append`,
+  between a disk write and `T_synced`, inside intents.
+- **IDB wipe:** with mirrors, with stale mirrors, without mirrors.
+- Offline for long periods, including past ns pruning (> 20k tombstones).
+- Clock skew and jumps (wall clock ± days, monotonic intact).
+- **Storms:** 2000 renames (folder moves), mass delete (must trip the brake), mass overwrite, 10k-file import.
+- **Two devices onboarding** the same vault concurrently: identical, partially different, and case-different paths.
+- Vault epoch change mid-session. 4403. Daily limit hit mid-onboarding. 1 MiB oversize injected (poison path).
+- Malicious peer frames: malformed, disallowed Yjs types, oversize text, bad checkpoint (must quarantine or be
+  rejected without spreading).
+
+### l.3 Quiescence invariants
+
+After healing (all faults off, all online, run until every queue is idle and no timer is pending inside the horizon):
+
+1. **Convergence.** All devices hold the same file set, compared by `(pathKey, leaf display)` on case-insensitive
+   profiles and by exact path otherwise.
+   - Contents are **byte-for-byte equal**. Generated content is LF-only. A separate CRDT-vs-CRLF test asserts logical
+     equality.
+   - Every `NsFoldState` encodes to identical bytes, and every body CRDT has the same text.
+2. **No lost acknowledged or local edit.** Every token typed into an editor, or written by a user actor to disk, and
+   not deleted by a later user action, appears in the converged vault or in a conflict copy. "Acknowledged" means the
+   editor buffer was saved, or `T_edit` committed.
+3. **Nothing destroyed without a copy.** Every file version that existed on any disk and was not superseded by a user
+   edit containing it is present in the vault, in the trash, in a conflict copy, or in a snapshot. Every trash
+   happened with a passing precondition.
+4. **Fold determinism.** For every device and every candidate seq, the V3 digests match. Folding from any checkpoint
+   plus the rest equals the full fold.
+5. **Clean state.** Outbox empty, no `held` or `adoptable` records, cursors at head, no frozen docs unless a malicious
+   frame was injected, no open intents.
+6. **Resource bounds held throughout:** resident docs/bytes ≤ budget (+1 doc), tail ≤ hard rows, live queue ≤ bound,
+   no `encodeStateAsUpdate` on the keystroke path (instrumented counter).
+
+### l.4 10k-op fold fuzz (WP-A)
+
+- **Generator:** 3–8 devices emitting random op frames (1–20 ops) against their own lagged view of the fold, with
+  random `authorNsSeq` lag.
+  - Paths are drawn from a small adversarial alphabet: case variants, ß/SS, NFC/NFD forms, a file vs folder of the
+    same name, reserved stems, over-long segments, dots and spaces.
+  - It also produces duplicates/resends of past frames at new seqs (inside and outside the ring), malformed frames,
+    and `upgradeRules` (rare).
+- **Per seed:** 10k ops. After every frame, check every V2 invariant on the state.
+  - At 50 random cut points: `decode(encode(state))` folding the rest gives byte-identical final bytes.
+  - Folding the same row sequence twice gives identical bytes and identical event streams.
+- **Seeds.** CI runs 1000. Nightly runs 100k. A failure reproduces from the seed and minimizes by delta-debugging
+  frames.
+
+---
+
+## m. Ported utilities and dropped list
+
+### m.1 Port
+
+Port means copying the logic with tests, adapted to the new types. No runtime coupling to legacy code.
+
+| Legacy | New location | Notes |
+|---|---|---|
+| `server/src/shared/markdownCodec.ts` | `src/core/hash/markdownLf.ts` | markdown-lf-v1 canonicalization, logical hash, exact fingerprint |
+| `server/src/shared/vaultPath.ts`, `legacy-src/paths/canonicalPath.ts` | `src/core/paths/validate.ts` | Reworked to §c.2 rules (frozen Unicode, reserved stems) |
+| `legacy-src/paths/pathCollision.ts` | `src/core/paths/pathKey.ts` (tests) | Collision fixtures only. The key function is new (frozen case fold) |
+| `legacy-src/paths/pathCategory.ts`, `legacy-src/sync/exclude.ts` | `src/engine/reconcile/localTree.ts` | Exclude patterns, kind classification |
+| `server/src/shared/canvasCodec.ts`, `canvasOrdering.ts`, `canvasTypes.ts`, `canvasLimits.ts` | `src/core/hash/canvasCanonical.ts`, `src/engine/body/canvasDoc.ts` | Canonical bytes, Obsidian formatting, ranks, validation |
+| `legacy-src/sync/lineMerge.ts`, `threeWayMerge.ts` | `src/core/merge/{myers,diff3}.ts` | Line diff3 core and limits. Policy wrappers dropped |
+| `legacy-src/sync/boundedTextDiff.ts`, `diff.ts` (`tryApplyDiffToYText` only) | `src/core/merge/minimalDiff.ts`, `src/engine/reconcile/mergeJob.ts` | Minimal diff + CAS apply. `forceReplaceYText` is **dropped** |
+| `legacy-src/sync/dailyLimit.ts` | `src/engine/runtime/lifecycle.ts` (+ notice strings) | `resetAt` parsing, probe schedule, notice gate |
+| `server/src/shared/socketCloseCodes.ts` | `src/engine/adapters/wsRelay.ts` | Mapped onto `RELAY_CLOSE` / `RelayEvent.closed` |
+| `legacy-src/sync/settingsSync/{allowlist,dataJsonGate,configDirKey}.ts`, `lwwReconcile.ts` (canonical JSON) | `src/engine/settings/*`, `src/core/cfg/projection.ts` | Allowlist, plugin version gate, canonical JSON |
+| `legacy-src/utils/{randomId,sha256,semver,defaultDeviceName,format}.ts` | `src/core/codec/ids.ts`, `src/engine/adapters/webHash.ts`, `src/host/*` | Ids become 16-byte base64url |
+| `legacy-src/snapshots/{snapshotService,vaultExport}.ts` | `src/engine/snapshots/snapshotJob.ts` | Zip writing only |
+| `legacy-src/onboarding/{provisioningClient,localVaultImport}.ts` | `src/host/ui/pairing.ts`, §j.5 | Pairing HTTP calls. Import is now just "plan L-only files" |
+| `legacy-src/settings/{settingsTab,PairDeviceModal,DeviceCredentialsModal}.ts` | `src/host/ui/*` | UI shells only |
+| `legacy-src/status/statusBarController.ts` | `src/host/ui/statusBar.ts` | Render `StatusSnapshot` |
+
+### m.2 Deliberately dropped
+
+- **`legacy-src/main.ts`, `VaultSync`, the runtime coordinators** (`runtime/*`: admission, residency, overdue-work
+  kernels, connection controllers). Replaced by lanes, budgets, the pure planner and ports.
+- **Server-side CRDT and WASM engine** (`@yaos/crdt-engine`, ywasm). Pure JS Yjs only, client-side.
+- **Semantic epochs, fenced WebSocket, legacy receipts, bootstrap client** (`semanticEpochTransition`,
+  `fencedWebSocket`, `relayReceipts`, `bootstrapClient`, `serverCapabilities`). Replaced by the streams relay
+  (relay-wire.md), `vaultEpoch` and the sequence cursor.
+- **Frontmatter guard/projection/quarantine family** (`frontmatter*`). Frontmatter is plain text under the one merge
+  engine and the ingest gate.
+- **Multiple merge/divergence policies** (`bindDivergencePolicy`, `closedFileConflict`, `externalEditPolicy`,
+  `preservedUnresolved`, `runtime/reconcile/*` policies, `ThreeWayConflictModal`). One `MergeFn` + conflict copies,
+  and no interactive merge UI.
+  - `server/src/shared/canvasMerge.ts` is also dropped: canvas uses the same `MergeFn` (§j.2).
+- **`forceReplaceYText`** and any whole-text replacement.
+- **Full-doc IDB persistence** (`vaultIndexedDb`, `vaultPersistence`, `diskMirror`). Replaced by the snapshot + tail
+  + outbox schema.
+- **`fileManager.renameFile`** for remote moves.
+- **Awareness/cursor presence** (`ownAwarenessProvider`, `deviceCursorColor`). `EditorBindingSpec.awareness = null` in
+  v1.
+- **Telemetry and observability runtime** (`telemetry/*`, `observability/*`). Replaced by `DiagnosticsBundle`, and
+  nothing leaves the device.
+- **Plugin install/update flows** (`update/*`, `obsidianPluginInstall`, `pluginIntent`). Not part of sync.
+- **Public API** (`publicApi.ts`). Can be re-added on top of `StatusSnapshot` later.
