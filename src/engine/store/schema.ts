@@ -165,7 +165,12 @@ export interface OutboxRecord {
 	readonly content: Uint8Array;
 	readonly authorNsSeq: Seq;
 	readonly flags: number;
-	/** held only: the ns create frame this waits for. */
+	/**
+	 * held only: the frame this waits for (DESIGN §e.1): the doc's ns create
+	 * (released when it folds), the newest adoptable of the same stream
+	 * (released when that record is gone), or the last x: chunk of a
+	 * bodyUpdateRef (released when no own frame of that x: stream remains).
+	 */
 	readonly dependsOn: ClientFrameId | null;
 	/** adoptable only: identity of the provisional frame being shadowed. */
 	readonly adoptOf: { readonly deviceId: DeviceId; readonly clientFrameId: ClientFrameId; readonly receivedAtMs: number } | null;
