@@ -1,0 +1,23 @@
+src/engine/__standins__/diskSync.ts
+  s_3e0c71be916d35::t_90da37e6734da1 34-40,196
+src/engine/__standins__/engine.ts
+  s_3e0c71be916d35::t_e29bdf16fd6479 143-152
+src/engine/__standins__/engineMessages.ts
+  s_3e0c71be916d35::t_30cef446cf505b 122
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c7ff5e9c2e9724163867a62ef4b1d1da80f139c4",
+  "prompts": {},
+  "sessions": {
+    "s_3e0c71be916d35": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a024e58aa7ba38180",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
