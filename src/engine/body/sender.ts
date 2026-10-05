@@ -299,7 +299,7 @@ export class Sender {
 			this.schedule(this.holdUntilMono - now);
 			return;
 		}
-		const window = this.window();
+		const nsWindow = this.window();
 		const maxInflight = this.deps.maxInflightBytes();
 		let nextWake = Infinity;
 		for (const e of this.order()) {
@@ -307,7 +307,7 @@ export class Sender {
 			if (this.inflight.has(cfid)) continue;
 			if (this.probe && this.inflight.size > 0) break;
 			const isNs = e.rec.stream === NS_STREAM || e.rec.stream === CFG_STREAM;
-			if (isNs && (!this.nsOpen || !window.has(cfid))) continue;
+			if (isNs && (!this.nsOpen || !nsWindow.has(cfid))) continue;
 			if (e.retryAtMono > now) {
 				nextWake = Math.min(nextWake, e.retryAtMono - now);
 				continue;
