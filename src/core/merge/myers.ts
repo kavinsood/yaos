@@ -109,7 +109,12 @@ export function myers(a: Tokens, aStart: number, aEnd: number, b: Tokens, bStart
 	return hunks;
 }
 
-/** Common prefix/suffix trim, then Myers; coarse single hunk when over budget. */
+/**
+ * Common prefix/suffix trim, then Myers. Over budget: patience-style anchors
+ * (tokens unique on both sides, longest increasing run), bounded Myers per gap,
+ * a coarse hunk for any gap still over budget. Total work stays bounded by
+ * ~3 x budget.maxWork.
+ */
 export function diffTokens(a: Tokens, b: Tokens, budget: MyersBudget, stats?: MyersStats): { hunks: Hunk[]; exact: boolean } {
 	let prefix = 0;
 	const limit = Math.min(a.length, b.length);
@@ -118,9 +123,98 @@ export function diffTokens(a: Tokens, b: Tokens, budget: MyersBudget, stats?: My
 	while (suffix < limit - prefix && a[a.length - 1 - suffix] === b[b.length - 1 - suffix]) suffix++;
 	const aEnd = a.length - suffix;
 	const bEnd = b.length - suffix;
-	const exact = myers(a, prefix, aEnd, b, prefix, bEnd, budget, stats);
+	const local: MyersStats = { work: 0 };
+	const exact = myers(a, prefix, aEnd, b, prefix, bEnd, budget, local);
+	if (stats) stats.work += local.work;
 	if (exact) return { hunks: exact, exact: true };
-	return { hunks: [{ aStart: prefix, aEnd, bStart: prefix, bEnd }], exact: false };
+	return { hunks: anchoredDiff(a, prefix, aEnd, b, prefix, bEnd, budget, stats), exact: false };
+}
+
+/** Indices (into `values`) of one longest strictly increasing subsequence. */
+function longestIncreasing(values: Int32Array): Int32Array {
+	const n = values.length;
+	if (n === 0) return new Int32Array(0);
+	const tails = new Int32Array(n);
+	const tailIdx = new Int32Array(n);
+	const prev = new Int32Array(n).fill(-1);
+	let len = 0;
+	for (let i = 0; i < n; i++) {
+		const v = values[i]!;
+		let lo = 0;
+		let hi = len;
+		while (lo < hi) {
+			const mid = (lo + hi) >>> 1;
+			if (tails[mid]! < v) lo = mid + 1;
+			else hi = mid;
+		}
+		if (lo > 0) prev[i] = tailIdx[lo - 1]!;
+		tails[lo] = v;
+		tailIdx[lo] = i;
+		if (lo === len) len++;
+	}
+	const out = new Int32Array(len);
+	let k = tailIdx[len - 1]!;
+	for (let j = len - 1; j >= 0; j--) {
+		out[j] = k;
+		k = prev[k]!;
+	}
+	return out;
+}
+
+function anchoredDiff(a: Tokens, aStart: number, aEnd: number, b: Tokens, bStart: number, bEnd: number, budget: MyersBudget, stats?: MyersStats): Hunk[] {
+	// Tokens occurring exactly once in each range.
+	const seenA = new Map<number, number>(); // token -> position, or -1 if repeated
+	for (let i = aStart; i < aEnd; i++) {
+		const t = a[i]!;
+		seenA.set(t, seenA.has(t) ? -1 : i);
+	}
+	const seenB = new Map<number, number>();
+	for (let j = bStart; j < bEnd; j++) {
+		const t = b[j]!;
+		seenB.set(t, seenB.has(t) ? -1 : j);
+	}
+	const anchorA: number[] = [];
+	const anchorB: number[] = [];
+	for (let j = bStart; j < bEnd; j++) {
+		const t = b[j]!;
+		if (seenB.get(t) !== j) continue;
+		const i = seenA.get(t);
+		if (i === undefined || i < 0) continue;
+		anchorA.push(i);
+		anchorB.push(j);
+	}
+	const keep = longestIncreasing(Int32Array.from(anchorA));
+	const hunks: Hunk[] = [];
+	const total: MyersStats = { work: 0 };
+	const gap = (a0: number, a1: number, b0: number, b1: number) => {
+		if (a0 === a1 && b0 === b1) return;
+		let sub: Hunk[] | null = null;
+		if (total.work < 2 * budget.maxWork) {
+			sub = myers(a, a0, a1, b, b0, b1, { maxD: budget.maxD, maxWork: Math.max(1, 2 * budget.maxWork - total.work) }, total);
+		}
+		if (sub === null) sub = [{ aStart: a0, aEnd: a1, bStart: b0, bEnd: b1 }];
+		for (const h of sub) hunks.push(h);
+	};
+	let ai = aStart;
+	let bj = bStart;
+	for (let k = 0; k < keep.length; k++) {
+		const i = anchorA[keep[k]!]!;
+		const j = anchorB[keep[k]!]!;
+		gap(ai, i, bj, j);
+		ai = i + 1;
+		bj = j + 1;
+	}
+	gap(ai, aEnd, bj, bEnd);
+	if (stats) stats.work += total.work;
+	// Merge hunks that became adjacent (gap boundaries).
+	const merged: Hunk[] = [];
+	for (const h of hunks) {
+		const last = merged[merged.length - 1];
+		if (last && last.aEnd === h.aStart && last.bEnd === h.bStart) {
+			merged[merged.length - 1] = { aStart: last.aStart, aEnd: h.aEnd, bStart: last.bStart, bEnd: h.bEnd };
+		} else merged.push(h);
+	}
+	return merged;
 }
 
 // ---------------------------------------------------------------------------
