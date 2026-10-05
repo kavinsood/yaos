@@ -423,6 +423,9 @@ export class YaosSettingTab extends PluginSettingTab {
 	hide(): void {
 		void this.flushText();
 		super.hide();
+		// Rows normally unregister through their render cleanup; this covers hosts that skip it.
+		this.live.clear();
+		this.lastStructure = "";
 	}
 
 	dispose(): void {
