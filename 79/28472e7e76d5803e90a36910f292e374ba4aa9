@@ -1,0 +1,31 @@
+src/engine/settings/allowlist.ts
+  s_3e0c71be916d35::t_75ef45551d69d6 1-104
+src/engine/settings/cfgSync.ts
+  s_89e23cccdabada::t_3a714dcb6fc0d1 1-169
+src/engine/settings/testkit.ts
+  s_3e0c71be916d35::t_c79759a41ccd1d 1-110
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "7928472e7e76d5803e90a36910f292e374ba4aa9",
+  "prompts": {},
+  "sessions": {
+    "s_3e0c71be916d35": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a024e58aa7ba38180",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_89e23cccdabada": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-abc25b91847c93c47",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
