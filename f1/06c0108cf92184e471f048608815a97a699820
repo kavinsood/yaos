@@ -1,0 +1,23 @@
+esbuild.config.mjs
+  s_3e0c71be916d35::t_2cf1b2e97be7bf 1-9,11-25,27-45,47,49-63,65,67,69,72,74-76,79-81,83-107
+src/host/plugin.ts
+  s_3e0c71be916d35::t_163a27c4648ef7 1-132
+src/host/virtualWorker.d.ts
+  s_3e0c71be916d35::t_07f350caed475c 1-5
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "f106c0108cf92184e471f048608815a97a699820",
+  "prompts": {},
+  "sessions": {
+    "s_3e0c71be916d35": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a024e58aa7ba38180",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
