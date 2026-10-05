@@ -1,0 +1,23 @@
+scripts/relay-dev/config.sh
+  s_9adab62ccde099::t_d7571cfe64a205 1-22
+scripts/relay-dev/start-local.sh
+  s_9adab62ccde099::t_aa330afd2949ad 1-56
+scripts/relay-dev/stop-local.sh
+  s_9adab62ccde099::t_aa56afba8c7381 1-21
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "47136894765073bd9e4e6042d6000160be6038e3",
+  "prompts": {},
+  "sessions": {
+    "s_9adab62ccde099": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a698224553da115bf",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
