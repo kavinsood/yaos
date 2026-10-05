@@ -1,0 +1,19 @@
+tests/server/streams-relay.ts
+  s_9adab62ccde099::t_a7fe8c1a7e50de 1-663
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "216462b2d73d27ec43bcae0b2f9725681e803c62",
+  "prompts": {},
+  "sessions": {
+    "s_9adab62ccde099": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a698224553da115bf",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
