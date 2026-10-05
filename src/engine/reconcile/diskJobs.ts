@@ -72,7 +72,12 @@ export async function diskRename(env: Env, op: Op<"diskRename">): Promise<JobOut
 	const entry = old
 		? { ...old, diskPath: stat.path, path: op.to, pathKey: toKey, size: stat.size, mtimeMs: stat.mtimeMs, hashedAtMs: ctx.now() }
 		: ctx.localEntry(op.to, stat, kind, op.expect.t === "hash" ? op.expect.hash : null, null);
-	await ctx.commit({}, [entry], fromKey === toKey ? [] : [fromKey]);
+	// S follows the file in the same tx as L: a crash between the renames of a
+	// cycle (or before the plan's final syncedPut) never leaves two synced
+	// records at one path, and a temp name stays tracked as the doc's file.
+	const s = op.docId === null ? undefined : ctx.synced(op.docId);
+	const moved = s && s.pathKey === fromKey && fromKey !== toKey ? [ctx.record({ ...s, path: op.to, pathKey: toKey })] : [];
+	await ctx.commit({ syncedPut: moved }, [entry], fromKey === toKey ? [] : [fromKey]);
 	return "ok";
 }
 

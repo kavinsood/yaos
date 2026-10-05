@@ -3,6 +3,13 @@
  *   - docs with an open intent are skipped entirely (intents.ts resolves them first);
  *   - rebinds run first, then every ns op goes to the log in ONE submitNs,
  *     except blob nsCreate / nsSetBlob, which wait for their pushBlob upload;
+ *   - a markdown nsCreate with content first gets a "born empty" synced record
+ *     (contentHash = hash(""), bodyVersion of the empty body, no base), committed
+ *     BEFORE the submit: the initial content is then an ordinary disk-only merge
+ *     from base "", and a crash between the create and the initial frames leaves
+ *     S ≠ L, so the next pass re-runs the merge instead of waiting forever on
+ *     "body-empty" (the planner cannot tell an own unwritten body from another
+ *     device's in-flight one);
  *   - disk / content / bookkeeping ops run one by one (per-op gateway exec);
  *   - when an op of a doc fails (or is held) the doc's later ops are skipped;
  *   - after the run, folders emptied by renames / trashes are removed, deepest first.
@@ -11,6 +18,8 @@
 
 import type { DocId, NsOp, PlannerOp, VaultPath } from "../../core/types";
 import { ancestorsOf } from "../../core/plan/pathRules";
+import { EMPTY_CONTENT_HASH } from "../../core/plan/planner";
+import type { SyncedRecord } from "../store/schema";
 import { conflictCopy, fetchBlob, pushBlob } from "./blobJobs";
 import { diskMaterialize, diskRename, diskTrash, rebind, syncedDrop, syncedPut, type Env, type JobOutcome } from "./diskJobs";
 import { reconcileContent } from "./mergeJob";
@@ -91,6 +100,7 @@ export async function runPlan(env: Env, ops: readonly PlannerOp[]): Promise<RunR
 	}
 
 	const ns: NsOp[] = [];
+	const born: SyncedRecord[] = [];
 	for (; i < ops.length && toNsOp(ops[i]!) !== null; i++) {
 		const op = ops[i]!;
 		if (blocked(op)) {
@@ -103,8 +113,13 @@ export async function runPlan(env: Env, ops: readonly PlannerOp[]): Promise<RunR
 			continue;
 		}
 		if (nsOp.t === "delete") ctx.noteDestructive("nsDelete");
+		if (nsOp.t === "create" && nsOp.kind === "markdown" && nsOp.contentHash !== EMPTY_CONTENT_HASH) {
+			const b = bornEmpty(env, nsOp.docId, nsOp.path);
+			if (b) born.push(b);
+		}
 		ns.push(nsOp);
 	}
+	if (born.length > 0) await ctx.commit({ syncedPut: born });
 	if (ns.length > 0) {
 		await ctx.log.submitNs(ns);
 		nsSubmitted += ns.length;
@@ -134,6 +149,18 @@ export async function runPlan(env: Env, ops: readonly PlannerOp[]): Promise<RunR
 	env.deferred.clear();
 	await removeEmptied(env, vacated);
 	return { ok, failed, held, skipped, waits, needHash, nsSubmitted, failedDocs };
+}
+
+/** S for a markdown doc about to be created: the empty body, stat of the local file. */
+function bornEmpty(env: Env, docId: DocId, path: VaultPath): SyncedRecord | null {
+	const { ctx } = env;
+	if (ctx.synced(docId)) return null;
+	const l = ctx.localAt(path);
+	if (!l || l.fingerprint === null) return null;
+	return ctx.record({
+		docId, path, pathKey: ctx.pk(path), kind: "markdown", contentHash: EMPTY_CONTENT_HASH, fingerprint: l.fingerprint, size: l.size,
+		mtimeMs: l.mtimeMs, bodyVersion: { remoteSeq: 0, localOrder: 0 }, blobRev: 0, nsTouchSeq: 0, hasBase: false,
+	});
 }
 
 /** Remove folders left empty by renames / trashes (the host never removes non-empty ones). */

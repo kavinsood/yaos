@@ -24,6 +24,7 @@ import { applyOwnFold } from "./ownFold";
 import type { OwnFoldEvent } from "./deps";
 import { runPlan, type RunReport } from "./runner";
 import { Scanner } from "./scan";
+import { recoverTempNames } from "./tempRecovery";
 import { ReconcileStore } from "./store";
 
 const B64URL = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -110,6 +111,7 @@ export class Reconciler {
 		const { ctx } = this;
 		const openIntents = await resumeIntents(this.env);
 		await this.scan.hashPending();
+		await recoverTempNames(this.env);
 		this.scan.dirty.clear();
 		ctx.echo.sweep();
 		const view = ctx.log.view();
