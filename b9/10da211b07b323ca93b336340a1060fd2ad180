@@ -1,0 +1,53 @@
+src/engine/body/refs.ts
+  s_e6caedb1ffebff::t_ac87c17ae31b3a 1-80
+src/engine/body/yjsCounters.ts
+  s_9d19ca921f10e2::t_711672ff6c1eac 39-40
+src/engine/runtime/outboxCache.ts
+  s_808e98640ec653::t_2b37319b927670 1-103
+src/engine/store/repo.ts
+  s_9d19ca921f10e2::t_041c09da82b928 125-127,577-581
+src/engine/sync/ingestRow.ts
+  s_40cab75849ffee::t_32bec8e74cf699 1-67
+src/engine/sync/nsRuntime.ts
+  s_e6caedb1ffebff::t_7cad3b97b3e4ae 1-194
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "b910da211b07b323ca93b336340a1060fd2ad180",
+  "prompts": {},
+  "sessions": {
+    "s_40cab75849ffee": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a0efa7727ce0c852e",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_808e98640ec653": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a6d246dbda3daef6a",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_9d19ca921f10e2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a55b3c285e3f74a1a",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_e6caedb1ffebff": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a4f41693fa2dd700a",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
