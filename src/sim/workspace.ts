@@ -177,7 +177,15 @@ export class SimEditorView implements EditorViewRef {
 	/** TextFileView.setViewData(data, clear). */
 	setViewData(incoming: string, clear: boolean): void {
 		this.counters.setViewDataCalls++;
-		if (!clear && this.interceptor) {
+		if (clear) {
+			// Another file is loaded into this leaf. The Obsidian adapter's instance
+			// wrapper (host/obsidianWorkspace.ts) detaches the binding and drops the
+			// interceptor BEFORE Obsidian replaces the editor text; mirror that.
+			const b = this.binding;
+			if (b) b.ytext.unobserve(b.observer);
+			this.binding = null;
+			this.interceptor = null;
+		} else if (this.interceptor) {
 			if (this.interceptor(incoming) === "handled") {
 				this.counters.intercepted++;
 				return;
@@ -247,6 +255,8 @@ export class SimWorkspace implements WorkspacePort {
 	private readonly listeners = new Set<(event: ViewEvent) => void>();
 	private nextViewId = 1;
 	private readonly offVault: Unsubscribe;
+	/** Every view ever opened here (closed ones included), for invariant counters. */
+	readonly history: SimEditorView[] = [];
 
 	constructor(opts: SimWorkspaceOptions) {
 		this.clock = opts.clock;
@@ -279,8 +289,18 @@ export class SimWorkspace implements WorkspacePort {
 		const v = new SimEditorView(this.nextViewId++, this.displayPath(path), this);
 		v.setViewData(text, true);
 		this.views.set(v.viewId, v);
+		this.history.push(v);
 		this.emit({ t: "opened", view: v });
 		return v;
+	}
+
+	/** Source <-> reading mode switch: Obsidian keeps the leaf and file; the adapter reports file-changed (same path). */
+	setMode(viewId: number, mode: "source" | "reading"): boolean {
+		const v = this.views.get(viewId);
+		if (!v || v.mode === mode) return false;
+		v.mode = mode;
+		this.emit({ t: "file-changed", view: v, previousPath: v.path });
+		return true;
 	}
 
 	/** Switch a leaf to another file (Obsidian saves the old one first). */

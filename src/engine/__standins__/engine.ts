@@ -154,6 +154,13 @@ export class StandinEngine implements SyncCtx {
 		});
 	}
 
+	later(ms: number, fn: () => void): void {
+		if (this.disposed) return;
+		this.options.clock.setTimer(ms, () => {
+			if (!this.disposed) fn();
+		});
+	}
+
 	answer(rid: number, value: EngineResultValue): void {
 		this.post({ t: "result", re: rid, value });
 	}

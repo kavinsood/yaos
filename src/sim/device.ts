@@ -86,6 +86,8 @@ export class SimDevice {
 	readonly store: StandinStore = new Map();
 	readonly ui: SimUiLog = { statuses: [], brakes: [], notices: [], fatals: [], carriers: [] };
 	workspace: SimWorkspace;
+	/** Every workspace this device had (one per app incarnation), for invariant counters. */
+	readonly workspaces: SimWorkspace[] = [];
 	runtime: HostRuntime;
 	engine: StandinEngine | null = null;
 	private pair: InlinePair | null = null;
@@ -100,6 +102,7 @@ export class SimDevice {
 		const mobile = opts.mobile ?? false;
 		this.platform = new SimPlatform({ os: mobile ? "ios" : "macos", isMobile: mobile, isTablet: false, hardwareConcurrency: mobile ? 6 : 8, deviceMemoryGiB: mobile ? 4 : null, workerSupported: true });
 		this.workspace = new SimWorkspace({ clock: opts.clock, vault: this.vault });
+		this.workspaces.push(this.workspace);
 		this.runtime = this.makeRuntime();
 	}
 
@@ -176,6 +179,7 @@ export class SimDevice {
 	/** Fresh app process over the same disk, side files and engine store. */
 	async restartApp(): Promise<void> {
 		this.workspace = new SimWorkspace({ clock: this.opts.clock, vault: this.vault });
+		this.workspaces.push(this.workspace);
 		this.runtime = this.makeRuntime();
 		await this.runtime.start();
 	}

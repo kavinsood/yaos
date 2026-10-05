@@ -40,12 +40,26 @@ interface SimFile {
 	mtimeMs: number;
 	ctimeMs: number;
 	version: number;
+	/** Version written by an external app whose watcher event Obsidian has not delivered yet. */
+	unseenExternal: number | null;
 }
 
 export interface VersionRecord {
 	readonly path: string;
 	readonly text: string;
 	readonly by: WriterKind;
+	readonly atMs: number;
+}
+
+/**
+ * Obsidian's own race: an editor save (vault.modify, no precondition) replaced
+ * an external write before the watcher reported it. YAOS never saw that
+ * version; `lost` = its tokens absent from the saved text (exempt in §l.3).
+ */
+export interface ClobberRecord {
+	readonly path: string;
+	readonly text: string;
+	readonly savedText: string;
 	readonly atMs: number;
 }
 
@@ -104,6 +118,7 @@ export class SimVault implements VaultPort {
 	private eventsInFlight = 0;
 	readonly history: VersionRecord[] = [];
 	readonly trashed: TrashRecord[] = [];
+	readonly clobbered: ClobberRecord[] = [];
 	/** Counts of port calls (acceptance: rename via rename(), deletes via trash()). */
 	readonly calls = { write: 0, rename: 0, trash: 0, removeEmptyFolder: 0, list: 0, readBytes: 0 };
 	/** Fault hook: make the next N port operations throw (I/O error). */
@@ -237,7 +252,9 @@ export class SimVault implements VaultPort {
 
 	/** Obsidian saves an open editor view (vault.modify on an existing file). */
 	editorSave(path: string, text: string): boolean {
-		if (!this.files.has(this.key(path))) return false;
+		const cur = this.files.get(this.key(path));
+		if (!cur) return false;
+		if (cur.unseenExternal === cur.version) this.clobbered.push({ path: cur.path, text: fromUtf8(cur.bytes), savedText: text, atMs: this.opts.clock.now() });
 		this.commit(path, utf8(text), "save");
 		return true;
 	}
@@ -360,11 +377,12 @@ export class SimVault implements VaultPort {
 			cur.mtimeMs = Math.max(now, cur.mtimeMs + 1);
 			cur.version++;
 			f = cur;
-			this.emit({ t: "modify", path: f.path, stat: this.stamp(f) }, by);
+			f.unseenExternal = by === "external" ? f.version : null;
+			this.emit({ t: "modify", path: f.path, stat: this.stamp(f) }, by, this.seen(f));
 		} else {
-			f = { path, bytes, mtimeMs: now, ctimeMs: now, version: 0 };
+			f = { path, bytes, mtimeMs: now, ctimeMs: now, version: 0, unseenExternal: by === "external" ? 0 : null };
 			this.files.set(k, f);
-			this.emit({ t: "create", path: f.path, stat: this.stamp(f) }, by);
+			this.emit({ t: "create", path: f.path, stat: this.stamp(f) }, by, this.seen(f));
 		}
 		this.history.push({ path: f.path, text: fromUtf8(bytes), by, atMs: now });
 		this.opts.onMutation?.({ kind: "write", by, path: f.path });
@@ -398,7 +416,14 @@ export class SimVault implements VaultPort {
 		this.emit({ t: "delete", path: f.path }, mode === "user" ? "user" : "sync");
 	}
 
-	private emit(event: VaultEvent, by: WriterKind): void {
+	private seen(f: SimFile): () => void {
+		const v = f.version;
+		return () => {
+			if (f.unseenExternal === v) f.unseenExternal = null;
+		};
+	}
+
+	private emit(event: VaultEvent, by: WriterKind, delivered?: () => void): void {
 		const path = event.t === "rename" ? event.to : event.path;
 		if (this.hidden(path) && (event.t !== "rename" || this.hidden(event.from))) return;
 		const delay = by === "external" ? (this.opts.watcherDelayMs?.() ?? 100) : (this.opts.apiEventDelayMs ?? 0);
@@ -408,6 +433,7 @@ export class SimVault implements VaultPort {
 		this.eventsInFlight++;
 		this.opts.clock.setTimer(due - now, () => {
 			this.eventsInFlight--;
+			delivered?.();
 			for (const l of [...this.listeners]) l(event);
 		});
 	}

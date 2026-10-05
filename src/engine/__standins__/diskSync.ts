@@ -13,6 +13,8 @@ import type { HubMemberHandle } from "./hub";
 
 export const LOCAL_DISK = Symbol("standin-local-disk");
 export const READ_BATCH = 32;
+/** Retry delay after an I/O failure (read, projection, conflict copy). */
+export const IO_RETRY_MS = 1_000;
 const MAX_READ_BYTES = 8 * 1024 * 1024;
 
 type HostRequest = Extract<EngineToMain, { rid: number }>;
@@ -31,6 +33,8 @@ export interface SyncCtx {
 	persist(st: DocState): void;
 	post(message: EngineToMain): void;
 	hostRequest(body: HostRequestBody): Promise<MainResultValue>;
+	/** Run `fn` after `ms` unless the engine is disposed by then (I/O retry). */
+	later(ms: number, fn: () => void): void;
 	readonly stats: { reads: number; projections: number; conflictCopies: number; ingests: number };
 }
 
@@ -62,10 +66,16 @@ export async function readPaths(ctx: SyncCtx, paths: readonly string[]): Promise
 		try {
 			res = await ctx.hostRequest({ t: "readRequest", reads: slice.map((path) => ({ area: "vault" as const, path, maxBytes: MAX_READ_BYTES })) });
 		} catch {
+			ctx.later(IO_RETRY_MS, () => void readPaths(ctx, slice));
 			continue;
 		}
 		if (res.t !== "reads") continue;
-		for (const r of res.results) await ingestRead(ctx, r);
+		const retry: string[] = [];
+		for (const r of res.results) {
+			if (!r.ok && r.reason === "io") retry.push(r.path);
+			else await ingestRead(ctx, r);
+		}
+		if (retry.length > 0) ctx.later(IO_RETRY_MS, () => void readPaths(ctx, retry));
 	}
 }
 
@@ -104,7 +114,12 @@ export async function ingest(ctx: SyncCtx, path: string, text: string, _stat: Va
 	const target = st;
 	await enqueue(target, async () => {
 		if (target.bound.size > 0) return; // the editor owns it: boundSaved / interceptor
-		if (text === target.diskText) return; // our own projection, or unchanged
+		if (text === target.diskText) {
+			// Our own projection, or unchanged. The doc may still be ahead of the disk
+			// (edited while bound, then the app died before the editor saved): project.
+			if (target.ytext.toString() !== text) await projectLocked(ctx, target);
+			return;
+		}
 		target.diskText = text;
 		target.diskFp = await fingerprintOf(ctx.hash, text);
 		await mergeDiskLocked(ctx, target, text);
@@ -142,6 +157,11 @@ async function mergeDiskLocked(ctx: SyncCtx, st: DocState, disk: string): Promis
 			return;
 		case "conflict":
 			if (await writeConflictCopy(ctx, st.path, r.conflictCopy)) await projectLocked(ctx, st);
+			else {
+				// The disk text is not preserved anywhere yet: forget we saw it and re-read.
+				st.diskText = null;
+				ctx.later(IO_RETRY_MS, () => void readPaths(ctx, [st.path]));
+			}
 			return;
 	}
 }
@@ -173,7 +193,10 @@ async function projectLocked(ctx: SyncCtx, st: DocState): Promise<void> {
 	};
 	const result = await runOps(ctx, [op]);
 	const r = result[0];
-	if (!r || r.t !== "write") return;
+	if (!r || r.t !== "write") {
+		ctx.later(IO_RETRY_MS, () => project(ctx, st));
+		return;
+	}
 	if (r.outcome.ok) {
 		ctx.stats.projections++;
 		st.diskText = text;
@@ -185,6 +208,8 @@ async function projectLocked(ctx: SyncCtx, st: DocState): Promise<void> {
 	if (r.outcome.reason === "precondition" && r.outcome.message !== "bound") {
 		// Disk changed under us: re-read and merge (after this job).
 		void readPaths(ctx, [st.path]);
+	} else if (r.outcome.reason === "io") {
+		ctx.later(IO_RETRY_MS, () => project(ctx, st));
 	}
 }
 
