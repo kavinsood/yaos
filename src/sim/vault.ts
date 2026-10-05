@@ -15,10 +15,21 @@
  *    the folder itself: VaultEvent carries files only).
  * Events are delivered FIFO (due times never decrease).
  *
- * An external write counts as "unseen" (ClobberRecord on an editor save over
- * it) until Obsidian has had the chance to reload open views: event delivery
- * plus `reloadLagMs` (Obsidian re-reads the file and calls setViewData ~25 ms
- * after the modify event, measured on Android; SimWorkspace models the same).
+ * Reloads of open views (spike OR-2, Android, Obsidian 1.13.8): after a
+ * modify/create event Obsidian calls setData on every open view of the file
+ * whose data differs. Through the vault API (vault.modify / vault.process:
+ * the engine's writes, user ops, editor saves) that happens right after the
+ * event (spike A: event 8.5 ms, setData 8.8 ms, before modify() resolved), so
+ * the reload lag is 0. For a raw disk write by another app it comes
+ * `reloadLagMs` after the watcher event (spike B: event 12.7 ms, setData
+ * 25.5 ms after the write; the default 25 ms is conservative). SimWorkspace
+ * reloads its views from `onReload`, which fires at exactly that moment.
+ *
+ * A write by anyone but the editor (another app, or another Obsidian UI op /
+ * plugin through vault.modify) counts as "unseen" (ClobberRecord on an editor
+ * save over it) until that reload. In the window Obsidian's autosave writes
+ * the editor over it without looking at the disk; nothing YAOS does runs in
+ * between.
  *
  * Dot-folders and the config dir are invisible to list() and events.
  * Every version that ever existed is kept in `history` and every trashed file
@@ -36,7 +47,7 @@ import { fromUtf8, utf8 } from "../host/hashing";
 
 export type CaseProfile = "case-insensitive" | "case-sensitive";
 
-/** Obsidian's modify event -> setViewData lag (spike OR-2 B: 25.8 ms on Android). */
+/** External (watcher) modify event -> setViewData lag (spike OR-2 B: 12.8 ms after the event, 25.5 ms after the write; conservative). */
 export const OBSIDIAN_RELOAD_DELAY_MS = 25;
 
 /** sync = the engine through VaultPort; save = Obsidian saving an open editor; user = other Obsidian UI ops; external = another app. */
@@ -48,7 +59,7 @@ interface SimFile {
 	mtimeMs: number;
 	ctimeMs: number;
 	version: number;
-	/** Version written by an external app whose watcher event Obsidian has not delivered yet. */
+	/** Version written by a non-editor writer (external/user) that open views have not reloaded yet. */
 	unseenExternal: number | null;
 }
 
@@ -61,8 +72,9 @@ export interface VersionRecord {
 
 /**
  * Obsidian's own race: an editor save (vault.modify, no precondition) replaced
- * an external write before the watcher reported it. YAOS never saw that
- * version; `lost` = its tokens absent from the saved text (exempt in §l.3).
+ * an external or user write before Obsidian reloaded the view with it (watcher
+ * delay + reload lag). YAOS never saw that version; its tokens absent from
+ * the saved text are exempt in §l.3.
  */
 export interface ClobberRecord {
 	readonly path: string;
@@ -87,7 +99,7 @@ export interface SimVaultOptions {
 	readonly apiEventDelayMs?: number;
 	/** Delay of external-writer events (file watcher), drawn per event. */
 	readonly watcherDelayMs?: () => number;
-	/** After delivery, how long an external write stays "unseen" (default OBSIDIAN_RELOAD_DELAY_MS). */
+	/** External writes: event delivery -> view reload lag (default OBSIDIAN_RELOAD_DELAY_MS). API writes reload at delivery. */
 	readonly reloadLagMs?: number;
 	/** Called on every completed mutation (for invariants/tracing). */
 	readonly onMutation?: (m: { readonly kind: "write" | "rename" | "trash"; readonly by: WriterKind; readonly path: string; readonly to?: string }) => void;
@@ -124,6 +136,7 @@ export class SimVault implements VaultPort {
 	private readonly files = new Map<string, SimFile>();
 	private readonly folders = new Map<string, string>();
 	private readonly listeners = new Set<(event: VaultEvent) => void>();
+	private readonly reloadListeners = new Set<(path: string) => void>();
 	private lastEventDue = 0;
 	private eventsInFlight = 0;
 	readonly history: VersionRecord[] = [];
@@ -251,6 +264,12 @@ export class SimVault implements VaultPort {
 	onEvent(listener: (event: VaultEvent) => void): Unsubscribe {
 		this.listeners.add(listener);
 		return () => this.listeners.delete(listener);
+	}
+
+	/** Sim-only: the moment Obsidian reloads open views of a modified/created file (see header). */
+	onReload(listener: (path: string) => void): Unsubscribe {
+		this.reloadListeners.add(listener);
+		return () => this.reloadListeners.delete(listener);
 	}
 
 	// --- actors (user through Obsidian, external app) -------------------------
@@ -387,12 +406,12 @@ export class SimVault implements VaultPort {
 			cur.mtimeMs = Math.max(now, cur.mtimeMs + 1);
 			cur.version++;
 			f = cur;
-			f.unseenExternal = by === "external" ? f.version : null;
-			this.emit({ t: "modify", path: f.path, stat: this.stamp(f) }, by, this.seen(f));
+			f.unseenExternal = by === "external" || by === "user" ? f.version : null;
+			this.emit({ t: "modify", path: f.path, stat: this.stamp(f) }, by, this.reload(f));
 		} else {
-			f = { path, bytes, mtimeMs: now, ctimeMs: now, version: 0, unseenExternal: by === "external" ? 0 : null };
+			f = { path, bytes, mtimeMs: now, ctimeMs: now, version: 0, unseenExternal: by === "external" || by === "user" ? 0 : null };
 			this.files.set(k, f);
-			this.emit({ t: "create", path: f.path, stat: this.stamp(f) }, by, this.seen(f));
+			this.emit({ t: "create", path: f.path, stat: this.stamp(f) }, by, this.reload(f));
 		}
 		this.history.push({ path: f.path, text: fromUtf8(bytes), by, atMs: now });
 		this.opts.onMutation?.({ kind: "write", by, path: f.path });
@@ -426,14 +445,16 @@ export class SimVault implements VaultPort {
 		this.emit({ t: "delete", path: f.path }, mode === "user" ? "user" : "sync");
 	}
 
-	private seen(f: SimFile): () => void {
+	/** Obsidian reloads open views of `f` (wherever it lives now); from then on this version is seen. */
+	private reload(f: SimFile): () => void {
 		const v = f.version;
 		return () => {
+			if (this.files.get(this.key(f.path)) === f) for (const l of [...this.reloadListeners]) l(f.path);
 			if (f.unseenExternal === v) f.unseenExternal = null;
 		};
 	}
 
-	private emit(event: VaultEvent, by: WriterKind, delivered?: () => void): void {
+	private emit(event: VaultEvent, by: WriterKind, reload?: () => void): void {
 		const path = event.t === "rename" ? event.to : event.path;
 		if (this.hidden(path) && (event.t !== "rename" || this.hidden(event.from))) return;
 		const delay = by === "external" ? (this.opts.watcherDelayMs?.() ?? 100) : (this.opts.apiEventDelayMs ?? 0);
@@ -444,11 +465,10 @@ export class SimVault implements VaultPort {
 		this.opts.clock.setTimer(due - now, () => {
 			this.eventsInFlight--;
 			for (const l of [...this.listeners]) l(event);
-			if (!delivered) return;
-			// Inserted after the listeners' reload timers, so at equal due times the reload runs first.
-			const lag = this.opts.reloadLagMs ?? OBSIDIAN_RELOAD_DELAY_MS;
-			if (lag > 0) this.opts.clock.setTimer(lag, delivered);
-			else delivered();
+			if (!reload) return;
+			const lag = by === "external" ? (this.opts.reloadLagMs ?? OBSIDIAN_RELOAD_DELAY_MS) : 0;
+			if (lag > 0) this.opts.clock.setTimer(lag, reload);
+			else reload();
 		});
 	}
 }

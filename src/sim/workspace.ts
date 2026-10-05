@@ -13,10 +13,12 @@
  *    it leaves the editor alone the next save overwrites the incoming text
  *    (spike C: the data loss the binding must avoid);
  *  - file open / leaf switch: setData(text, clear=true);
- *  - external reloads: every modify/create event of an open file makes
- *    Obsidian re-read it `reloadDelayMs` (25 ms, spike B) after the event and,
- *    if it differs from view.data, call setData(text, false) on every view of
- *    that file: split views, and reading-mode views too (spike R). The
+ *  - external reloads: after every modify/create of an open file Obsidian
+ *    calls setData(text, false) on every view of that file whose view.data
+ *    differs: split views, and reading-mode views too (spike R). Timing comes
+ *    from SimVault.onReload: right after the event for vault-API writes
+ *    (spike A), ~25 ms after the watcher event for another app's write
+ *    (spike B). The
  *    per-instance interceptor (WorkspacePort.interceptExternalReload) sees it
  *    first; otherwise the default replaces the buffer, which a bound editor
  *    turns into a local CRDT edit (the clobber the interceptor exists to
@@ -34,7 +36,7 @@ import type { Unsubscribe } from "../ports/common";
 import type { ClockPort, TimerHandle } from "../ports/clock";
 import type { EditorBindingSpec, EditorViewRef, ExternalReloadHandler, ViewEvent, WorkspacePort } from "../ports/workspace";
 import type { VaultEvent } from "../ports/vault";
-import { OBSIDIAN_RELOAD_DELAY_MS, type SimVault } from "./vault";
+import type { SimVault } from "./vault";
 
 export const OBSIDIAN_SAVE_DEBOUNCE_MS = 2_000;
 
@@ -66,7 +68,6 @@ export class SimEditorView implements EditorViewRef {
 	private binding: Binding | null = null;
 	private interceptor: ExternalReloadHandler | null = null;
 	private saveTimer: TimerHandle | null = null;
-	private reloadTimer: TimerHandle | null = null;
 	private dirty = false;
 	closed = false;
 	readonly counters: ViewCounters = { localTx: 0, remoteApplied: 0, saves: 0, setViewDataCalls: 0, intercepted: 0, defaultReloadWhileBound: 0, bindMismatch: 0 };
@@ -192,15 +193,11 @@ export class SimEditorView implements EditorViewRef {
 		this.setViewData(text, clear);
 	}
 
-	/** Obsidian's modify/create handler for this view's file: re-read after the reload lag, reload if != data. */
-	noteFileModified(): void {
-		if (this.reloadTimer !== null || this.closed) return;
-		this.reloadTimer = this.ws.clock.setTimer(this.ws.reloadDelayMs, () => {
-			this.reloadTimer = null;
-			if (this.closed || this.path === null) return;
-			const text = this.ws.vault.textOf(this.path);
-			if (text !== null && text !== this.data) this.setData(text, false);
-		});
+	/** Obsidian reloading this view after a modify/create of its file: setData(disk, false) if it differs from data. */
+	reloadFromDisk(): void {
+		if (this.closed || this.path === null) return;
+		const text = this.ws.vault.textOf(this.path);
+		if (text !== null && text !== this.data) this.setData(text, false);
 	}
 
 	/** MarkdownView.setViewData(data, clear). Called by setData only (data is already assigned). */
@@ -268,9 +265,7 @@ export class SimEditorView implements EditorViewRef {
 
 	private stopTimers(): void {
 		if (this.saveTimer !== null) this.ws.clock.clearTimer(this.saveTimer);
-		if (this.reloadTimer !== null) this.ws.clock.clearTimer(this.reloadTimer);
 		this.saveTimer = null;
-		this.reloadTimer = null;
 	}
 }
 
@@ -278,15 +273,12 @@ export interface SimWorkspaceOptions {
 	readonly clock: ClockPort;
 	readonly vault: SimVault;
 	readonly saveDebounceMs?: number;
-	/** Modify event -> setViewData lag (default OBSIDIAN_RELOAD_DELAY_MS, spike B). */
-	readonly reloadDelayMs?: number;
 }
 
 export class SimWorkspace implements WorkspacePort {
 	readonly clock: ClockPort;
 	readonly vault: SimVault;
 	readonly saveDebounceMs: number;
-	readonly reloadDelayMs: number;
 	private readonly views = new Map<number, SimEditorView>();
 	private readonly listeners = new Set<(event: ViewEvent) => void>();
 	private nextViewId = 1;
@@ -298,8 +290,14 @@ export class SimWorkspace implements WorkspacePort {
 		this.clock = opts.clock;
 		this.vault = opts.vault;
 		this.saveDebounceMs = opts.saveDebounceMs ?? OBSIDIAN_SAVE_DEBOUNCE_MS;
-		this.reloadDelayMs = opts.reloadDelayMs ?? OBSIDIAN_RELOAD_DELAY_MS;
-		this.offVault = this.vault.onEvent((e) => this.onVaultEvent(e));
+		const offEvents = this.vault.onEvent((e) => this.onVaultEvent(e));
+		const offReload = this.vault.onReload((path) => {
+			for (const v of [...this.views.values()]) if (this.same(v.path, path)) v.reloadFromDisk();
+		});
+		this.offVault = () => {
+			offEvents();
+			offReload();
+		};
 	}
 
 	listMarkdownViews(): readonly EditorViewRef[] {
@@ -391,11 +389,9 @@ export class SimWorkspace implements WorkspacePort {
 	private onVaultEvent(e: VaultEvent): void {
 		switch (e.t) {
 			case "modify":
-			case "create": {
-				// Obsidian re-reads the file ~25 ms later and reloads views (any mode) whose data differs.
-				for (const v of this.views.values()) if (this.same(v.path, e.path) && !v.closed) v.noteFileModified();
-				return;
-			}
+			case "create":
+				return; // views reload from SimVault.onReload
+
 			case "rename":
 				for (const v of this.views.values()) if (this.same(v.path, e.from)) v.path = e.to;
 				return;

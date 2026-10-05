@@ -73,7 +73,7 @@ export function checkConvergence(devs: readonly SimDevice[], hub: StandinHub): V
 	return out;
 }
 
-/** Tokens Obsidian itself destroyed (editor save over an unseen external write; vault.ts ClobberRecord). */
+/** Tokens Obsidian itself destroyed (editor save over an unseen external/user write; vault.ts ClobberRecord). */
 export function clobberedTokens(devs: readonly SimDevice[]): Set<string> {
 	const out = new Set<string>();
 	for (const d of devs) {

@@ -43,16 +43,22 @@ test("sim fidelity A: vault.modify reloads through setData; view.data is already
 	const { clock, vault, ws } = world();
 	vault.userWrite("a.md", "textA\n");
 	const v = open(ws, "a.md");
+	await clock.advance(0); // the create event's reload finds nothing new
 	const seen: { incoming: string; data: string; editor: string }[] = [];
 	v.interceptExternalReload((incoming) => {
 		seen.push({ incoming, data: v.getLastSavedText(), editor: v.getText() });
 		return "default";
 	});
+	let atEvent = -1;
+	const off = vault.onEvent((e) => {
+		if (e.t === "modify") atEvent = seen.length;
+	});
 	vault.userWrite("a.md", "textB\n");
-	await clock.advance(OBSIDIAN_RELOAD_DELAY_MS - 1);
-	assert.equal(seen.length, 0, "the reload comes ~25 ms after the modify event");
-	await clock.advance(1);
-	assert.deepEqual(seen, [{ incoming: "textB\n", data: "textB\n", editor: "textA\n" }]);
+	assert.equal(seen.length, 0, "events are asynchronous");
+	await clock.advance(0);
+	off();
+	assert.equal(atEvent, 0, "the modify event comes first");
+	assert.deepEqual(seen, [{ incoming: "textB\n", data: "textB\n", editor: "textA\n" }], "then the reload, with no lag (spike A: 0.3 ms)");
 	assert.equal(v.getText(), "textB\n", "default: the editor shows the new text");
 });
 
@@ -268,20 +274,21 @@ test("binding contract C2/D: after the reload, view.data, editor and disk equal 
 });
 
 test("binding contract E: a dirty editor keeps its unsaved edits; the external edit is kept too", async () => {
-	const { clock, vault, engine, views } = await bound({ "e.md": "# title\nbody\n" }, ["e.md"]);
+	const { clock, vault, engine, views } = await bound({ "e.md": "# title\nbody\nend\n" }, ["e.md"]);
 	const v = views[0]!;
-	v.edit(13, 0, " more"); // "body more", unsaved
+	v.edit(7, 0, " more"); // "# title more", unsaved
 	await clock.advance(500);
 	assert.equal(v.isDirty(), true);
-	vault.externalWrite("e.md", "# title\nbody\nfooter from E\n");
+	vault.externalWrite("e.md", "# title\nbody\nend\nfooter from E\n");
 	await clock.advance(WATCHER_MS + OBSIDIAN_RELOAD_DELAY_MS + 3_000);
-	assertSettled(v, vault, engine, "e.md", "# title\nbody more\nfooter from E\n");
+	assertSettled(v, vault, engine, "e.md", "# title more\nbody\nend\nfooter from E\n");
+	assert.equal(copies(vault).length, 0);
 	// Same line on both sides: the editor keeps the local side, the external side goes to a conflict copy.
 	v.edit(0, 1, "%");
-	vault.externalWrite("e.md", "! title\nbody more\nfooter from E\n");
+	vault.externalWrite("e.md", "! title more\nbody\nend\nfooter from E\n");
 	await clock.advance(WATCHER_MS + OBSIDIAN_RELOAD_DELAY_MS + 3_000);
-	assertSettled(v, vault, engine, "e.md", "% title\nbody more\nfooter from E\n");
-	assert.deepEqual(copies(vault).map((p) => vault.textOf(p)), ["! title\nbody more\nfooter from E\n"]);
+	assertSettled(v, vault, engine, "e.md", "% title more\nbody\nend\nfooter from E\n");
+	assert.deepEqual(copies(vault).map((p) => vault.textOf(p)), ["! title more\nbody\nend\nfooter from E\n"]);
 });
 
 test("binding contract R: a reading-mode view is unbound and reloaded by default; back in source mode the CRDT gets the change", async () => {
