@@ -300,6 +300,7 @@ export class SimRelay implements RelayPort {
 			this.engine.latchUntil = 0;
 			return;
 		}
+		this.engine.envDailyUntil = 0;
 		this.engine.latchDaily(retryAfterMs);
 		this.engine.envDailyUntil = this.engine.latchUntil;
 	}

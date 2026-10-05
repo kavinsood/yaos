@@ -150,10 +150,10 @@ export class RelayEngine {
 		return this.clock.now() < this.envDailyUntil;
 	}
 
-	/** Records a daily-limit failure: latch until retryAfterMs from now, else the next 00:00 UTC. */
+	/** Records a daily-limit failure: latch until retryAfterMs from now, else until the env limit lifts, else the next 00:00 UTC. */
 	latchDaily(retryAfterMs: number | null): void {
 		const now = this.clock.now();
-		this.latchUntil = retryAfterMs !== null ? now + retryAfterMs : Math.max(this.envDailyUntil, nextUtcMidnight(now));
+		this.latchUntil = retryAfterMs !== null ? now + retryAfterMs : this.envDailyUntil > now ? this.envDailyUntil : nextUtcMidnight(now);
 	}
 
 	serverClose(session: SimRelaySession, code: number, errorCode: string | null, wasClean: boolean): void {
