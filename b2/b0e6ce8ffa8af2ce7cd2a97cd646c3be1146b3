@@ -1,0 +1,29 @@
+src/core/codec/cfgOps.ts
+  s_3f1e78c1a8c300::t_ae9b84fb597a4f 1-112
+src/core/codec/contents.ts
+  s_3f1e78c1a8c300::t_1fa0688dc325a1 1-80
+src/core/codec/envelope.ts
+  s_3f1e78c1a8c300::t_76905e39ae484e 1-255
+src/core/codec/ids.ts
+  s_3f1e78c1a8c300::t_d7ef2e2179cf29 1-84
+src/core/codec/lib0.ts
+  s_3f1e78c1a8c300::t_0455b4beffac20 1-222
+src/core/codec/nsOps.ts
+  s_3f1e78c1a8c300::t_5dbd01dfebf6d4 1-150
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "b2b0e6ce8ffa8af2ce7cd2a97cd646c3be1146b3",
+  "prompts": {},
+  "sessions": {
+    "s_3f1e78c1a8c300": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a393e5c0d70814322",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
