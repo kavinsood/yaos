@@ -1,0 +1,25 @@
+src/core/codec/cfgFoldV1.ts
+  s_3f1e78c1a8c300::t_949cf9714d2c70 1-102
+src/core/codec/folds.test.ts
+  s_3f1e78c1a8c300::t_b2855b598ba7a6 1-150
+src/core/codec/mirrors.ts
+  s_3f1e78c1a8c300::t_e44bea3e8beaeb 1-205
+src/core/codec/nsFoldV1.ts
+  s_3f1e78c1a8c300::t_f1e618ce07aa4a 1-124
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a3bf1e5707d4dabc9cd7e1d80f26f2bd8153c8d1",
+  "prompts": {},
+  "sessions": {
+    "s_3f1e78c1a8c300": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a393e5c0d70814322",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
