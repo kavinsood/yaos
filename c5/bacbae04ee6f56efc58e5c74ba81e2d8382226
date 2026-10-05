@@ -1,0 +1,27 @@
+src/host/configDir.test.ts
+  s_3e0c71be916d35::t_4b3da323052642 1-38
+src/host/configDir.ts
+  s_3e0c71be916d35::t_63eab8c9381dd9 1-74
+src/host/platform.test.ts
+  s_3e0c71be916d35::t_ab596f06612812 1-55
+src/host/platform.ts
+  s_3e0c71be916d35::t_db034b6cb6f4c1 1-127
+src/host/sideFiles.ts
+  s_3e0c71be916d35::t_d234b42c58bab1 1-49
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c5bacbae04ee6f56efc58e5c74ba81e2d8382226",
+  "prompts": {},
+  "sessions": {
+    "s_3e0c71be916d35": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a024e58aa7ba38180",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
