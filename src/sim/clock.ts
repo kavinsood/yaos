@@ -1,0 +1,259 @@
+/**
+ * Virtual clock for deterministic simulation (DESIGN §m). Implements the
+ * frozen ClockPort; API-compatible superset of the WP-D stand-in
+ * (src/sim/__standins__/clock.ts there), so integration is an import swap.
+ *
+ * Determinism:
+ * - Timers fire in (dueAt, insertion order); a binary heap keyed on that pair.
+ * - Before every timer the loop awaits one REAL macrotask (setImmediate when
+ *   available, else MessageChannel, else setTimeout 0) so all promise chains
+ *   settle before virtual time moves. Nothing else in the sim may use real
+ *   timers; then the order of events is a pure function of the seed.
+ * - monotonic() starts at 0 and only moves when a timer fires or advance()
+ *   runs past the last timer. now() = wallStart + monotonic + skew.
+ *
+ * Errors thrown by timer callbacks go to onError (default: rethrow from the
+ * run loop, failing the test).
+ */
+
+import type { ClockPort, TimerHandle } from "../ports/clock";
+
+interface Timer {
+	readonly id: number;
+	readonly at: number;
+	readonly seq: number;
+	readonly fn: () => void;
+	readonly label: string;
+}
+
+type ImmediateFn = (fn: () => void) => unknown;
+
+/** A real macrotask (used to let microtask chains settle). Never use for logic timing. */
+export function realMacrotask(): () => Promise<void> {
+	const g = globalThis as unknown as {
+		setImmediate?: ImmediateFn;
+		MessageChannel?: new () => { port1: { onmessage: (() => void) | null; close(): void }; port2: { postMessage(v: unknown): void; close(): void } };
+	};
+	if (typeof g.setImmediate === "function") {
+		const si = g.setImmediate;
+		return () => new Promise<void>((resolve) => void si(resolve));
+	}
+	if (typeof g.MessageChannel === "function") {
+		const MC = g.MessageChannel;
+		return () =>
+			new Promise<void>((resolve) => {
+				const ch = new MC();
+				ch.port1.onmessage = () => {
+					ch.port1.close();
+					ch.port2.close();
+					resolve();
+				};
+				ch.port2.postMessage(0);
+			});
+	}
+	return () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+}
+
+/** Callback form of realMacrotask (fire-and-forget). */
+export function realMacrotaskCallback(): (fn: () => void) => void {
+	const settle = realMacrotask();
+	return (fn) => {
+		void settle().then(fn);
+	};
+}
+
+export const DEFAULT_WALL_START_MS = Date.UTC(2026, 0, 1);
+
+export class VirtualClock implements ClockPort {
+	private mono = 0;
+	private readonly wallBase: number;
+	private wallSkew = 0;
+	private seq = 0;
+	private nextId = 1;
+	private readonly timers = new Map<number, Timer>();
+	private heap: Timer[] = [];
+	private readonly settle = realMacrotask();
+	/** Timers fired so far. */
+	fired = 0;
+	/** Called on every timer throw; the sim records it as a failure. Default: rethrow. */
+	onError: (error: unknown, label: string) => void = (error) => {
+		throw error;
+	};
+
+	constructor(wallStartMs = DEFAULT_WALL_START_MS) {
+		this.wallBase = wallStartMs;
+	}
+
+	now(): number {
+		return this.wallBase + this.mono + this.wallSkew;
+	}
+
+	monotonic(): number {
+		return this.mono;
+	}
+
+	/** Wall clock jump (fault): monotonic is untouched. */
+	skewWall(deltaMs: number): void {
+		this.wallSkew += deltaMs;
+	}
+
+	setTimer(delayMs: number, fn: () => void, label = "timer"): TimerHandle {
+		const id = this.nextId++;
+		const d = Number.isFinite(delayMs) ? Math.max(0, delayMs) : 0;
+		const t: Timer = { id, at: this.mono + d, seq: this.seq++, fn, label };
+		this.timers.set(id, t);
+		this.push(t);
+		return id;
+	}
+
+	clearTimer(handle: TimerHandle): void {
+		this.timers.delete(handle);
+	}
+
+	yieldNow(): Promise<void> {
+		return new Promise<void>((resolve) => {
+			this.setTimer(0, resolve, "yield");
+		});
+	}
+
+	/** Promise resolved after `ms` of virtual time. */
+	sleep(ms: number, label = "sleep"): Promise<void> {
+		return new Promise<void>((resolve) => {
+			this.setTimer(ms, resolve, label);
+		});
+	}
+
+	/** Inline-transport delivery on virtual time (0 ms, FIFO). */
+	readonly schedule = (fn: () => void): void => {
+		this.setTimer(0, fn, "deliver");
+	};
+
+	pendingTimers(): number {
+		return this.timers.size;
+	}
+
+	/** Labels of pending timers, earliest first (deadlock diagnostics). */
+	pendingLabels(): string[] {
+		return [...this.timers.values()].sort((a, b) => a.at - b.at || a.seq - b.seq).map((t) => `${t.label}@${t.at}`);
+	}
+
+	nextDueAt(): number | null {
+		this.prune();
+		const top = this.heap[0];
+		return top ? top.at : null;
+	}
+
+	/** Let every promise chain settle (one real macrotask). */
+	async settleMicrotasks(): Promise<void> {
+		await this.settle();
+	}
+
+	/**
+	 * Fire the next timer (advancing virtual time to it). Returns false if none
+	 * is due at or before `limit`.
+	 */
+	async step(limit = Number.POSITIVE_INFINITY): Promise<boolean> {
+		await this.settle();
+		this.prune();
+		const top = this.heap[0];
+		if (!top || top.at > limit) return false;
+		this.pop();
+		this.timers.delete(top.id);
+		if (top.at > this.mono) this.mono = top.at;
+		this.fired++;
+		try {
+			top.fn();
+		} catch (error) {
+			this.onError(error, top.label);
+		}
+		return true;
+	}
+
+	/** Run timers until virtual time passes `ms` from now (timers at exactly the end fire). */
+	async advance(ms: number, maxSteps = 5_000_000): Promise<void> {
+		const end = this.mono + ms;
+		let steps = 0;
+		while (await this.step(end)) {
+			if (++steps > maxSteps) throw new Error(`VirtualClock.advance: more than ${maxSteps} steps (${this.pendingLabels().slice(0, 5).join(", ")})`);
+		}
+		await this.settle();
+		if (this.mono < end) this.mono = end;
+	}
+
+	/** Run until `done()` holds (checked after every step) or `horizonMs` of virtual time passes. */
+	async runUntil(done: () => boolean, horizonMs: number, maxSteps = 5_000_000): Promise<boolean> {
+		const end = this.mono + horizonMs;
+		let steps = 0;
+		for (;;) {
+			await this.settle();
+			if (done()) return true;
+			if (!(await this.step(end))) {
+				await this.settle();
+				if (done()) return true;
+				if (this.mono < end) this.mono = end;
+				return done();
+			}
+			if (++steps > maxSteps) throw new Error(`VirtualClock.runUntil: more than ${maxSteps} steps`);
+		}
+	}
+
+	/**
+	 * Run until no timer is pending (or `horizonMs` passes). Returns the number
+	 * of timers fired. Periodic timers never go idle: use the horizon.
+	 */
+	async runUntilIdle(horizonMs = Number.POSITIVE_INFINITY, maxSteps = 5_000_000): Promise<number> {
+		const end = this.mono + horizonMs;
+		let steps = 0;
+		while (await this.step(end)) {
+			if (++steps > maxSteps) throw new Error(`VirtualClock.runUntilIdle: more than ${maxSteps} steps (${this.pendingLabels().slice(0, 5).join(", ")})`);
+		}
+		await this.settle();
+		return steps;
+	}
+
+	// --- binary heap on (at, seq) -------------------------------------------
+
+	private less(a: Timer, b: Timer): boolean {
+		return a.at < b.at || (a.at === b.at && a.seq < b.seq);
+	}
+
+	private push(t: Timer): void {
+		const h = this.heap;
+		h.push(t);
+		let i = h.length - 1;
+		while (i > 0) {
+			const p = (i - 1) >> 1;
+			if (!this.less(h[i] as Timer, h[p] as Timer)) break;
+			[h[i], h[p]] = [h[p] as Timer, h[i] as Timer];
+			i = p;
+		}
+	}
+
+	private pop(): void {
+		const h = this.heap;
+		const last = h.pop();
+		if (!last || h.length === 0) return;
+		h[0] = last;
+		let i = 0;
+		for (;;) {
+			const l = 2 * i + 1;
+			const r = l + 1;
+			let m = i;
+			if (l < h.length && this.less(h[l] as Timer, h[m] as Timer)) m = l;
+			if (r < h.length && this.less(h[r] as Timer, h[m] as Timer)) m = r;
+			if (m === i) break;
+			[h[i], h[m]] = [h[m] as Timer, h[i] as Timer];
+			i = m;
+		}
+	}
+
+	private prune(): void {
+		while (this.heap.length > 0 && !this.timers.has((this.heap[0] as Timer).id)) this.pop();
+		// Keep the heap from growing without bound under heavy set/clear churn.
+		if (this.heap.length > 1024 && this.heap.length > 4 * this.timers.size) {
+			const live = this.heap.filter((t) => this.timers.has(t.id));
+			this.heap = [];
+			for (const t of live) this.push(t);
+		}
+	}
+}
