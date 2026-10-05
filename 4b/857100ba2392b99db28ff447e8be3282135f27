@@ -1,0 +1,31 @@
+src/sim/clock.ts
+  s_3f1e78c1a8c300::t_7bae8104462577 76,127-135,167-178
+src/sim/storage.test.ts
+  s_3e0c71be916d35::t_e2cbbaa5b36a9e 1-177
+src/sim/storage.ts
+  s_3f1e78c1a8c300::t_50fc795a5bd114 1-972
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "4b857100ba2392b99db28ff447e8be3282135f27",
+  "prompts": {},
+  "sessions": {
+    "s_3e0c71be916d35": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a024e58aa7ba38180",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_3f1e78c1a8c300": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a393e5c0d70814322",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
