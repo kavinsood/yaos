@@ -639,7 +639,7 @@ export class Repo {
 				for (const q of dismiss) {
 					if (!q.detail.startsWith("dismissed:")) tx.put(STORE.quarantine, { ...q, detail: `dismissed: ${q.detail}` });
 				}
-				r.quarantinedRows = dismiss.length;
+				r.quarantinedRows = 0; // dismissed records stay for diagnostics (evicted by age) but no longer count
 				r.frozen = 0;
 				r.frozenReason = null;
 				tx.put(STORE.streams, r);
@@ -723,9 +723,10 @@ async function putTail(tx: Tx, r: Mut<StreamRecord>, row: TailRecord): Promise<b
 }
 
 async function putQuarantine(tx: Tx, r: Mut<StreamRecord>, q: QuarantineRecord): Promise<void> {
-	const existing = await tx.count(STORE.quarantine, { lower: [q.stream, q.seq], upper: [q.stream, q.seq] });
+	// quarantinedRows counts undismissed records (a dismissed record re-quarantined by a re-read counts again).
+	const existing = await tx.get(STORE.quarantine, [q.stream, q.seq]);
 	tx.put(STORE.quarantine, q);
-	if (existing === 0) r.quarantinedRows++;
+	if (existing === undefined || existing.detail.startsWith("dismissed:")) r.quarantinedRows++;
 	r.frozen = 1;
 	r.frozenReason = q.reason;
 }

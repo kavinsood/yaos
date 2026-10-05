@@ -281,7 +281,11 @@ export class LogEngine {
 		}
 		await c.repo.tReleaseQuarantine(stream, pass, dismiss, c.now());
 		c.docs.clearCausal(stream);
-		c.clearNotice("frozen:causal-hole");
+		for (const n of c.noticeList()) {
+			if (!n.code.startsWith("frozen:")) continue;
+			const reason = n.code.slice("frozen:".length);
+			if (![...c.repo.streams()].some((r) => r.frozen === 1 && r.frozenReason === reason)) c.clearNotice(n.code);
+		}
 		const h = c.handles.peek(stream);
 		if (h) {
 			if (pass.length > 0) await c.docs.applyToHandle(h, pass);
