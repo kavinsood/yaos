@@ -1,0 +1,27 @@
+src/core/plan/brake.ts
+  s_89e23cccdabada::t_8de660c89823aa 15-19,92-93,102-106
+src/core/plan/planFixtures.ts
+  s_89e23cccdabada::t_eba04fe20bc74f 1-77
+src/core/plan/planHelpers.test.ts
+  s_89e23cccdabada::t_f0e65c842a41ca 1-203
+src/core/plan/planner.test.ts
+  s_89e23cccdabada::t_34723123c4494b 1-554
+src/core/plan/planner.ts
+  s_89e23cccdabada::t_c87c49802a885c 1-491
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "8d423b4ddcb5ed04b4724efe5f60f528917f1cdb",
+  "prompts": {},
+  "sessions": {
+    "s_89e23cccdabada": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-abc25b91847c93c47",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
