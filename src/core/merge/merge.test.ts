@@ -1,9 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import * as Y from "yjs"; // tests only: the Y.Text interleaving check (shipped core stays Yjs-free)
 import type { MergeResult } from "../types";
 import { DEFAULT_MERGE_LIMITS, merge, mergeValidated } from "./merge";
 import { splitLines } from "./myers";
-import { applyTextEdits, editSize, lineDiffSize, minimalDiff } from "./minimalDiff";
+import { applyTextEdits, editSize, isTokenBoundary, lineDiffSize, minimalDiff } from "./minimalDiff";
 import { prng } from "./prng";
 
 const VOCAB = ["", "a", "b", "# heading", "- item", "same", "same", "😀 emoji", "\t tab", "x y z", "}", "{"];
@@ -183,7 +184,7 @@ function assertCodePointSafe(text: string, offset: number, label: string): void 
 	assert.ok(!(before >= 0xd800 && before <= 0xdbff && after >= 0xdc00 && after <= 0xdfff), `${label} splits a surrogate pair at ${offset}`);
 }
 
-test("minimalDiff property: applies to target, code-point safe, size <= line diff (seeded, 4000 rounds)", () => {
+test("minimalDiff property: applies to target, code-point safe, token-aligned, size <= line diff (seeded, 4000 rounds)", () => {
 	for (let seed = 1; seed <= 4000; seed++) {
 		const rnd = prng(seed * 104729);
 		const from = randomChars(rnd, Math.floor(rnd() * 120));
@@ -192,8 +193,15 @@ test("minimalDiff property: applies to target, code-point safe, size <= line dif
 		assert.equal(applyTextEdits(from, edits), to, `seed ${seed}`);
 		assert.ok(editSize(edits) <= lineDiffSize(from, to), `seed ${seed}: ${editSize(edits)} > ${lineDiffSize(from, to)}`);
 		let cursor = 0;
+		let shift = 0;
 		for (const edit of edits) {
 			assert.ok(edit.start >= cursor && edit.end >= edit.start && (edit.end > edit.start || edit.text.length > 0), `seed ${seed}: bad edit order`);
+			const b0 = edit.start + shift;
+			const b1 = b0 + edit.text.length;
+			for (const [str, at] of [[from, edit.start], [from, edit.end], [to, b0], [to, b1]] as const) {
+				assert.ok(isTokenBoundary(str, at), `seed ${seed}: edit ${JSON.stringify(edit)} ends inside a token at ${at}`);
+			}
+			shift += edit.text.length - (edit.end - edit.start);
 			assertCodePointSafe(from, edit.start, `seed ${seed} start`);
 			assertCodePointSafe(from, edit.end, `seed ${seed} end`);
 			const first = edit.text.charCodeAt(0);
@@ -205,8 +213,56 @@ test("minimalDiff property: applies to target, code-point safe, size <= line dif
 	}
 	assert.deepEqual(minimalDiff("same", "same"), []);
 	assert.deepEqual(minimalDiff("hello world", "hello brave world"), [{ start: 6, end: 6, text: "brave " }]);
-	// Shared high surrogate, different low: the whole pair is replaced.
-	assert.deepEqual(minimalDiff("a\u{1d400}b", "a\u{1d401}b"), [{ start: 1, end: 3, text: "\u{1d401}" }]);
+	// Shared high surrogate, different low: the whole pair is replaced (an emoji is a token of its own).
+	assert.deepEqual(minimalDiff("a\u{1f600}b", "a\u{1f601}b"), [{ start: 1, end: 3, text: "\u{1f601}" }]);
+	// U+1D400 is a letter: "a\u{1d400}b" is one word, replaced whole.
+	assert.deepEqual(minimalDiff("a\u{1d400}b", "a\u{1d401}b"), [{ start: 0, end: 4, text: "a\u{1d401}b" }]);
+});
+
+test("minimalDiff: edits are whole tokens; punctuation between changed words is not reused; lines stay anchors", () => {
+	assert.deepEqual(minimalDiff("the cat sat", "the cart sat"), [{ start: 4, end: 7, text: "cart" }]);
+	assert.deepEqual(minimalDiff("x=1;", "x=12;"), [{ start: 2, end: 3, text: "12" }]);
+	assert.deepEqual(minimalDiff("caf\u00e9 ok", "cafe\u0301 ok"), [{ start: 0, end: 4, text: "cafe\u0301" }], "combining marks belong to the word");
+	assert.deepEqual(minimalDiff("[A.2]\n", "[B.27] \n"), [{ start: 1, end: 5, text: "B.27] " }], "sim seed 961: only the leading [ is shared");
+	assert.deepEqual(minimalDiff("[A.6] x\n", "[A.53] x\n"), [{ start: 3, end: 4, text: "53" }]);
+	assert.deepEqual(minimalDiff("one\ntwo\n", "One\nTwo\n"), [{ start: 0, end: 3, text: "One" }, { start: 4, end: 7, text: "Two" }], "a kept \\n is never absorbed");
+	assert.deepEqual(minimalDiff("a.b", "x.y"), [{ start: 0, end: 3, text: "x.y" }]);
+	assert.deepEqual(minimalDiff("a, b", "x, y"), [{ start: 0, end: 1, text: "x" }, { start: 3, end: 4, text: "y" }], "a two-char equality between one-char edits stays");
+});
+
+test("minimalDiff: concurrent Y.Text edits never interleave inside a word", () => {
+	// Device 1 rewrites a token through a disk write (minimalDiff), device 2 concurrently
+	// deletes the old token or inserts a new one right after it.
+	const cases: { base: string; disk: string; remote: (t: Y.Text) => void; want: RegExp }[] = [
+		{ base: "[A.2]\n", disk: "[B.27] \n", remote: (t) => t.delete(0, 5), want: /B\.27\]/ },
+		{ base: "[A.6] \n", disk: "[A.53] \n", remote: (t) => t.insert(6, "[B.23] "), want: /\[A\.53\] [^\n]*\[B\.23\]|\[B\.23\] [^\n]*\[A\.53\]/ },
+		{ base: "the cat sat\n", disk: "the cart sat\n", remote: (t) => t.insert(7, "s"), want: /cart/ },
+	];
+	for (const c of cases) {
+		for (const order of [0, 1]) {
+			const d1 = new Y.Doc();
+			d1.clientID = order === 0 ? 1 : 2;
+			const d2 = new Y.Doc();
+			d2.clientID = order === 0 ? 2 : 1;
+			d1.getText("t").insert(0, c.base);
+			Y.applyUpdate(d2, Y.encodeStateAsUpdate(d1));
+			const t1 = d1.getText("t");
+			d1.transact(() => {
+				const edits = minimalDiff(c.base, c.disk);
+				for (let i = edits.length - 1; i >= 0; i--) {
+					const e = edits[i]!;
+					if (e.end > e.start) t1.delete(e.start, e.end - e.start);
+					if (e.text.length > 0) t1.insert(e.start, e.text);
+				}
+			});
+			c.remote(d2.getText("t"));
+			Y.applyUpdate(d1, Y.encodeStateAsUpdate(d2));
+			Y.applyUpdate(d2, Y.encodeStateAsUpdate(d1));
+			const merged = t1.toString();
+			assert.equal(merged, d2.getText("t").toString());
+			assert.match(merged, c.want, `${JSON.stringify(c.base)} -> ${JSON.stringify(c.disk)} (order ${order}): ${JSON.stringify(merged)}`);
+		}
+	}
 });
 
 test("minimalDiff: far-apart edits in a long single line stay small", () => {
