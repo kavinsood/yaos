@@ -1,0 +1,21 @@
+src/core/types.ts
+  s_f672049613e497::t_ba9121e6cc584a 362
+src/ports/relay.ts
+  s_f672049613e497::t_334867a6e41274 4-5,8-15,17-18,22-26,62-66,98-108,114-121,128-129
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a618c4f167f54bde9c39978217e624b7089fe152",
+  "prompts": {},
+  "sessions": {
+    "s_f672049613e497": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aeb3c0a846ccf5793",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
