@@ -35,6 +35,7 @@ export function tokensIn(text: string): string[] {
 }
 
 const TOKEN_ID_RE = /[A-Z]\.\d+(?:\.\d+)?/g;
+const WHOLE_TOKEN_RE = /\[[A-Z]\.\d+(?:\.\d+)?\]\s?/g;
 
 /**
  * Tokens by identity ("A.15" -> "[A.15]"), ignoring their brackets. Survival checks use this:
@@ -42,10 +43,21 @@ const TOKEN_ID_RE = /[A-Z]\.\d+(?:\.\d+)?/g;
  * reuse a neighbour's "[" or "]" for a new token ("[Z.1]" -> "[A.15] " diffs as "Z.1]" ->
  * "A.15] " after the shared "["); a concurrent delete of that neighbour then takes the
  * bracket with it although every character the user wrote for the new token survives.
+ * The same trim may reuse more ("[A.6]" -> "[A.53] " when the engine sees a token delete
+ * and an external insert as one change keeps "[A."), and a concurrent remote insert at that
+ * spot lands inside the identity: "[A.[B.23] 53]". So whole tokens are peeled off and the
+ * remainder is matched again, until nothing changes; every character of both tokens is there.
  * Greedy matching keeps "A.1" distinct from "A.15" and "A.12.3".
  */
 export function tokenIdsIn(text: string): string[] {
-	return [...text.matchAll(TOKEN_ID_RE)].map((m) => `[${m[0]}]`);
+	const ids = new Set<string>();
+	let cur = text;
+	for (;;) {
+		for (const m of cur.matchAll(TOKEN_ID_RE)) ids.add(`[${m[0]}]`);
+		const next = cur.replace(WHOLE_TOKEN_RE, "");
+		if (next === cur) return [...ids];
+		cur = next;
+	}
 }
 
 /**

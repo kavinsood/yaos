@@ -5,7 +5,8 @@
  *                      every hub doc equals the disk; every markdown file has a hub doc
  *   2 tokens           every live (not user-deleted, not crash-unacknowledged) token
  *                      survives somewhere in the converged vault (conflict copies count),
- *                      matched by identity ("A.15"): a minimal diff may move a bracket.
+ *                      matched by identity ("A.15"): a minimal diff may move a bracket,
+ *                      and a concurrent token may land inside a reused prefix (tokenIdsIn).
  *                      Exempt: tokens Obsidian itself overwrote (an editor save landing
  *                      before the watcher reported an external write; ClobberRecord)
  *   3 destroyed        every token that ever reached any disk is in the vault, in a
