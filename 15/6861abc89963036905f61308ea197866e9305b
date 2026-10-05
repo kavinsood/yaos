@@ -1,0 +1,33 @@
+src/host/binding.ts
+  s_89e23cccdabada::t_ddee5d15e23fdc 43,151,533-549,555-563
+src/sim/actors.ts
+  s_3e0c71be916d35::t_e1270880cdd2c7 37-50
+src/sim/device.ts
+  s_89e23cccdabada::t_3d964f7380b0c7 95-96,175
+src/sim/invariants.ts
+  s_89e23cccdabada::t_f27b81b5dbc138 7-8,12-13,25,87,90,103,105-106
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "156861abc89963036905f61308ea197866e9305b",
+  "prompts": {},
+  "sessions": {
+    "s_3e0c71be916d35": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a024e58aa7ba38180",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_89e23cccdabada": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-abc25b91847c93c47",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
