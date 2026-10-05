@@ -30,6 +30,13 @@ export interface DiskChange {
 	readonly intentDrop?: readonly string[];
 }
 
+/**
+ * YaosSchema is an interface, which TypeScript does not treat as having an
+ * index signature, so it does not satisfy SchemaShape directly. The mapped
+ * alias is structurally identical and does (frozen schema.ts left untouched).
+ */
+export type DiskSchema = { readonly [K in keyof YaosSchema]: YaosSchema[K] };
+
 const TX_STORES = [STORE.synced, STORE.baseText, STORE.localTree, STORE.intents] as const;
 
 /** Base record for `text`, or null when it is too large to keep (hasBase = false). */
@@ -54,9 +61,9 @@ export class ReconcileStore {
 	readonly localTree = new Map<PathKey, LocalTreeRecord>();
 	readonly intents = new Map<string, IntentRecord>();
 
-	private constructor(readonly db: StorageDb<YaosSchema>) {}
+	private constructor(readonly db: StorageDb<DiskSchema>) {}
 
-	static async open(db: StorageDb<YaosSchema>): Promise<ReconcileStore> {
+	static async open(db: StorageDb<DiskSchema>): Promise<ReconcileStore> {
 		const s = new ReconcileStore(db);
 		const [synced, local, intents] = await db.tx(TX_STORES, "readonly", async (tx) =>
 			Promise.all([tx.getAll(STORE.synced), tx.getAll(STORE.localTree), tx.getAll(STORE.intents)]),
