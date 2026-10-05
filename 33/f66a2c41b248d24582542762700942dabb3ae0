@@ -1,0 +1,33 @@
+src/engine/adapters/idbStorage.ts
+  s_ce7a7e162aef4a::t_04d6cb8d3b7d31 1-591
+src/engine/adapters/storageConformance.test.ts
+  s_ce7a7e162aef4a::t_861e84b4cc762e 1-653
+src/engine/sync/__standins__/memStorage.test.ts
+  s_3e0c71be916d35::t_ecf49ea27955b6 1-343
+src/engine/sync/__standins__/memStorage.ts
+  s_ce7a7e162aef4a::t_e72051fa702e49 1-823
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "33f66a2c41b248d24582542762700942dabb3ae0",
+  "prompts": {},
+  "sessions": {
+    "s_3e0c71be916d35": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a024e58aa7ba38180",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_ce7a7e162aef4a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ae3796a4493ad958d",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
