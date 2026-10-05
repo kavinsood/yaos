@@ -1,17 +1,27 @@
 /**
  * SimWorkspace: Obsidian markdown views for the simulation (DESIGN §l.1).
  *
- * Models what matters for sync:
- *  - an editor buffer per view, `data` = what Obsidian last loaded/saved
- *    (view.data), and Obsidian's 2 s trailing save debounce (any editor change,
- *    local or remote, schedules a save; the save writes the buffer through the
- *    vault as writer "save");
- *  - external reloads: on a vault modify of an open file Obsidian re-reads the
- *    file and, if it differs from view.data, calls setViewData(text, false) on
- *    every view of that file (split views included). The per-instance
- *    interceptor (WorkspacePort.interceptExternalReload) sees it first;
- *    otherwise the default replaces the buffer, which a bound editor turns into
- *    a local CRDT edit (the clobber the interceptor exists to prevent);
+ * Models what matters for sync, matching what the Android spike measured on
+ * Obsidian 1.13.8 (docs/client-remake/spike-reports/android-2026-10-06.md):
+ *  - an editor buffer per view, `data` = view.data, and Obsidian's 2 s trailing
+ *    save debounce (any editor change, local or remote, schedules a save);
+ *  - save(): `data = getViewData()` FIRST, then the write (writer "save"). So a
+ *    save always writes the editor, whatever `data` held (spike C);
+ *  - setData(text, clear) (TextFileView.setData): `data = text` is assigned
+ *    BEFORE setViewData(text, clear) is called. An interceptor that returns
+ *    "handled" therefore sees view.data === incoming already (spike A), and if
+ *    it leaves the editor alone the next save overwrites the incoming text
+ *    (spike C: the data loss the binding must avoid);
+ *  - file open / leaf switch: setData(text, clear=true);
+ *  - external reloads: every modify/create event of an open file makes
+ *    Obsidian re-read it `reloadDelayMs` (25 ms, spike B) after the event and,
+ *    if it differs from view.data, call setData(text, false) on every view of
+ *    that file: split views, and reading-mode views too (spike R). The
+ *    per-instance interceptor (WorkspacePort.interceptExternalReload) sees it
+ *    first; otherwise the default replaces the buffer, which a bound editor
+ *    turns into a local CRDT edit (the clobber the interceptor exists to
+ *    prevent). Not modelled: Obsidian's own merge of unsaved edits into an
+ *    unbound dirty editor (spike E); the default here is a plain replace;
  *  - a y-codemirror.next stand-in with the same origin rules: editor changes
  *    go to the Y.Text in one transaction tagged with the binding's origin;
  *    Y.Text changes from any other origin are applied to the buffer and are
@@ -24,7 +34,7 @@ import type { Unsubscribe } from "../ports/common";
 import type { ClockPort, TimerHandle } from "../ports/clock";
 import type { EditorBindingSpec, EditorViewRef, ExternalReloadHandler, ViewEvent, WorkspacePort } from "../ports/workspace";
 import type { VaultEvent } from "../ports/vault";
-import type { SimVault } from "./vault";
+import { OBSIDIAN_RELOAD_DELAY_MS, type SimVault } from "./vault";
 
 export const OBSIDIAN_SAVE_DEBOUNCE_MS = 2_000;
 
@@ -56,6 +66,7 @@ export class SimEditorView implements EditorViewRef {
 	private binding: Binding | null = null;
 	private interceptor: ExternalReloadHandler | null = null;
 	private saveTimer: TimerHandle | null = null;
+	private reloadTimer: TimerHandle | null = null;
 	private dirty = false;
 	closed = false;
 	readonly counters: ViewCounters = { localTx: 0, remoteApplied: 0, saves: 0, setViewDataCalls: 0, intercepted: 0, defaultReloadWhileBound: 0, bindMismatch: 0 };
@@ -136,9 +147,10 @@ export class SimEditorView implements EditorViewRef {
 		if (this.closed || this.path === null) return;
 		const text = this.buffer;
 		this.dirty = false;
-		// Obsidian skips the write when nothing changed since the last load/save.
+		// Skipped only when it would rewrite identical bytes (no observable difference).
 		if (text === this.data && this.ws.vault.textOf(this.path) === text) return;
-		this.data = text;
+		this.data = text; // view.data = getViewData(), then vault.modify
+
 		this.counters.saves++;
 		this.ws.vault.editorSave(this.path, text);
 	}
@@ -174,7 +186,24 @@ export class SimEditorView implements EditorViewRef {
 
 	// --- Obsidian internals ---------------------------------------------------
 
-	/** TextFileView.setViewData(data, clear). */
+	/** TextFileView.setData(data, clear): view.data is assigned before setViewData runs. */
+	setData(text: string, clear: boolean): void {
+		this.data = text;
+		this.setViewData(text, clear);
+	}
+
+	/** Obsidian's modify/create handler for this view's file: re-read after the reload lag, reload if != data. */
+	noteFileModified(): void {
+		if (this.reloadTimer !== null || this.closed) return;
+		this.reloadTimer = this.ws.clock.setTimer(this.ws.reloadDelayMs, () => {
+			this.reloadTimer = null;
+			if (this.closed || this.path === null) return;
+			const text = this.ws.vault.textOf(this.path);
+			if (text !== null && text !== this.data) this.setData(text, false);
+		});
+	}
+
+	/** MarkdownView.setViewData(data, clear). Called by setData only (data is already assigned). */
 	setViewData(incoming: string, clear: boolean): void {
 		this.counters.setViewDataCalls++;
 		if (clear) {
@@ -212,7 +241,6 @@ export class SimEditorView implements EditorViewRef {
 		} else {
 			this.buffer = incoming;
 		}
-		this.data = incoming;
 		this.dirty = false;
 	}
 
@@ -228,16 +256,21 @@ export class SimEditorView implements EditorViewRef {
 	/** Close: Obsidian saves a dirty view before closing it. */
 	async close(): Promise<void> {
 		if (this.dirty) await this.save();
-		if (this.saveTimer !== null) this.ws.clock.clearTimer(this.saveTimer);
-		this.saveTimer = null;
+		this.stopTimers();
 		this.closed = true;
 	}
 
 	/** Device crash: unsaved buffer content is lost, no save. */
 	crash(): void {
-		if (this.saveTimer !== null) this.ws.clock.clearTimer(this.saveTimer);
-		this.saveTimer = null;
+		this.stopTimers();
 		this.closed = true;
+	}
+
+	private stopTimers(): void {
+		if (this.saveTimer !== null) this.ws.clock.clearTimer(this.saveTimer);
+		if (this.reloadTimer !== null) this.ws.clock.clearTimer(this.reloadTimer);
+		this.saveTimer = null;
+		this.reloadTimer = null;
 	}
 }
 
@@ -245,12 +278,15 @@ export interface SimWorkspaceOptions {
 	readonly clock: ClockPort;
 	readonly vault: SimVault;
 	readonly saveDebounceMs?: number;
+	/** Modify event -> setViewData lag (default OBSIDIAN_RELOAD_DELAY_MS, spike B). */
+	readonly reloadDelayMs?: number;
 }
 
 export class SimWorkspace implements WorkspacePort {
 	readonly clock: ClockPort;
 	readonly vault: SimVault;
 	readonly saveDebounceMs: number;
+	readonly reloadDelayMs: number;
 	private readonly views = new Map<number, SimEditorView>();
 	private readonly listeners = new Set<(event: ViewEvent) => void>();
 	private nextViewId = 1;
@@ -262,6 +298,7 @@ export class SimWorkspace implements WorkspacePort {
 		this.clock = opts.clock;
 		this.vault = opts.vault;
 		this.saveDebounceMs = opts.saveDebounceMs ?? OBSIDIAN_SAVE_DEBOUNCE_MS;
+		this.reloadDelayMs = opts.reloadDelayMs ?? OBSIDIAN_RELOAD_DELAY_MS;
 		this.offVault = this.vault.onEvent((e) => this.onVaultEvent(e));
 	}
 
@@ -287,7 +324,7 @@ export class SimWorkspace implements WorkspacePort {
 		const text = this.vault.textOf(path);
 		if (text === null) return null;
 		const v = new SimEditorView(this.nextViewId++, this.displayPath(path), this);
-		v.setViewData(text, true);
+		v.setData(text, true);
 		this.views.set(v.viewId, v);
 		this.history.push(v);
 		this.emit({ t: "opened", view: v });
@@ -311,7 +348,7 @@ export class SimWorkspace implements WorkspacePort {
 		if (v.isDirty()) await v.save();
 		const previousPath = v.path;
 		v.path = this.displayPath(path);
-		v.setViewData(text, true);
+		v.setData(text, true);
 		this.emit({ t: "file-changed", view: v, previousPath });
 		return true;
 	}
@@ -355,13 +392,8 @@ export class SimWorkspace implements WorkspacePort {
 		switch (e.t) {
 			case "modify":
 			case "create": {
-				// Obsidian re-reads the file and reloads views whose data differs.
-				const text = this.vault.textOf(e.path);
-				if (text === null) return;
-				for (const v of this.views.values()) {
-					if (!this.same(v.path, e.path) || v.closed) continue;
-					if (v.data !== text) v.setViewData(text, false);
-				}
+				// Obsidian re-reads the file ~25 ms later and reloads views (any mode) whose data differs.
+				for (const v of this.views.values()) if (this.same(v.path, e.path) && !v.closed) v.noteFileModified();
 				return;
 			}
 			case "rename":

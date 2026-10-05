@@ -15,6 +15,11 @@
  *    the folder itself: VaultEvent carries files only).
  * Events are delivered FIFO (due times never decrease).
  *
+ * An external write counts as "unseen" (ClobberRecord on an editor save over
+ * it) until Obsidian has had the chance to reload open views: event delivery
+ * plus `reloadLagMs` (Obsidian re-reads the file and calls setViewData ~25 ms
+ * after the modify event, measured on Android; SimWorkspace models the same).
+ *
  * Dot-folders and the config dir are invisible to list() and events.
  * Every version that ever existed is kept in `history` and every trashed file
  * in `trashed`, for the "nothing destroyed without a copy" invariant (§l.3.3).
@@ -30,6 +35,9 @@ import type { Hasher } from "../host/hashing";
 import { fromUtf8, utf8 } from "../host/hashing";
 
 export type CaseProfile = "case-insensitive" | "case-sensitive";
+
+/** Obsidian's modify event -> setViewData lag (spike OR-2 B: 25.8 ms on Android). */
+export const OBSIDIAN_RELOAD_DELAY_MS = 25;
 
 /** sync = the engine through VaultPort; save = Obsidian saving an open editor; user = other Obsidian UI ops; external = another app. */
 export type WriterKind = "sync" | "save" | "user" | "external";
@@ -79,6 +87,8 @@ export interface SimVaultOptions {
 	readonly apiEventDelayMs?: number;
 	/** Delay of external-writer events (file watcher), drawn per event. */
 	readonly watcherDelayMs?: () => number;
+	/** After delivery, how long an external write stays "unseen" (default OBSIDIAN_RELOAD_DELAY_MS). */
+	readonly reloadLagMs?: number;
 	/** Called on every completed mutation (for invariants/tracing). */
 	readonly onMutation?: (m: { readonly kind: "write" | "rename" | "trash"; readonly by: WriterKind; readonly path: string; readonly to?: string }) => void;
 }
@@ -433,8 +443,12 @@ export class SimVault implements VaultPort {
 		this.eventsInFlight++;
 		this.opts.clock.setTimer(due - now, () => {
 			this.eventsInFlight--;
-			delivered?.();
 			for (const l of [...this.listeners]) l(event);
+			if (!delivered) return;
+			// Inserted after the listeners' reload timers, so at equal due times the reload runs first.
+			const lag = this.opts.reloadLagMs ?? OBSIDIAN_RELOAD_DELAY_MS;
+			if (lag > 0) this.opts.clock.setTimer(lag, delivered);
+			else delivered();
 		});
 	}
 }
