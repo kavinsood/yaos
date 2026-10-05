@@ -1,0 +1,25 @@
+src/engine/body/handles.ts
+  s_e6caedb1ffebff::t_ceb631d835835a 35-36,70-76,128,148-151
+src/engine/runtime/outboxCache.ts
+  s_e6caedb1ffebff::t_a25b25ea0383da 60-63,68
+src/engine/runtime/relayPolicy.ts
+  s_e6caedb1ffebff::t_9af58464cbff3b 1-84
+src/engine/store/repo.ts
+  s_e6caedb1ffebff::t_f2e3eca92b277b 587-589,760-761,771
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "3b4f7039870a8fc327fb477015692549a6d0dfa4",
+  "prompts": {},
+  "sessions": {
+    "s_e6caedb1ffebff": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a4f41693fa2dd700a",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
