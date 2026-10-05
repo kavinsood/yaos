@@ -73,6 +73,7 @@ export class VirtualClock implements ClockPort {
 	private readonly timers = new Map<number, Timer>();
 	private heap: Timer[] = [];
 	private readonly settle = realMacrotask();
+	private idleHooks: (() => void)[] = [];
 	/** Timers fired so far. */
 	fired = 0;
 	/** Called on every timer throw; the sim records it as a failure. Default: rethrow. */
@@ -123,6 +124,15 @@ export class VirtualClock implements ClockPort {
 		});
 	}
 
+	/**
+	 * Run `fn` once every current promise chain has settled and before the next
+	 * timer fires (MemStoragePort's idle check uses this so a body awaiting
+	 * virtual time is always detected before that time passes).
+	 */
+	readonly beforeNextTimer = (fn: () => void): void => {
+		this.idleHooks.push(fn);
+	};
+
 	/** Inline-transport delivery on virtual time (0 ms, FIFO). */
 	readonly schedule = (fn: () => void): void => {
 		this.setTimer(0, fn, "deliver");
@@ -154,6 +164,18 @@ export class VirtualClock implements ClockPort {
 	 */
 	async step(limit = Number.POSITIVE_INFINITY): Promise<boolean> {
 		await this.settle();
+		while (this.idleHooks.length > 0) {
+			const hooks = this.idleHooks;
+			this.idleHooks = [];
+			for (const h of hooks) {
+				try {
+					h();
+				} catch (error) {
+					this.onError(error, "beforeNextTimer");
+				}
+			}
+			await this.settle();
+		}
 		this.prune();
 		const top = this.heap[0];
 		if (!top || top.at > limit) return false;
