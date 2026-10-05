@@ -26,14 +26,16 @@ interface TicketPayloadFields extends VaultActorContext {
 
 /** The signed ticket binds one actor to one CRDT identity lineage. */
 type TicketEpochScope = SemanticEpochScope
-	| { purpose: "semantic"; documentId: string; bodyEpoch: SemanticEpoch };
+	| { purpose: "semantic"; documentId: string; bodyEpoch: SemanticEpoch }
+	/** Opaque streams socket (YAOS_STREAMS): vault-wide, no CRDT epoch. */
+	| { purpose: "streams"; documentId: "streams" };
 
 export type TicketPayload = TicketPayloadFields & TicketEpochScope;
 
 export interface ExpectedTicketScope {
 	vaultId: string;
 	vaultGeneration?: string;
-	purpose?: "root" | "body" | "semantic";
+	purpose?: "root" | "body" | "semantic" | "streams";
 	documentId?: string;
 	rootEpoch?: number;
 	bodyEpoch?: number;
@@ -59,7 +61,9 @@ export async function createTicket(authState: AuthState, actor: VaultActorContex
 	scope: TicketEpochScope, ttlMs = TICKET_TTL_MS,
 ): Promise<{ ticket: string; expiresAt: number; ttlMs: number }> {
 	if (authState.mode !== "claim") throw new Error("cannot sign ticket: server is unavailable");
-	if (scope.purpose === "semantic") {
+	if (scope.purpose === "streams") {
+		if (scope.documentId !== "streams") throw new Error("invalid streams ticket scope");
+	} else if (scope.purpose === "semantic") {
 		if (!scope.documentId || scope.documentId === "root") throw new Error("invalid semantic epoch scope identity");
 		parseSemanticEpoch(scope.bodyEpoch, "semantic document epoch");
 	} else semanticEpochOf(scope);
@@ -113,12 +117,16 @@ function isTicketPayload(value: unknown): value is TicketPayload {
 	const payload = value as Record<string, unknown>;
 	return payload.v === 4 && payload.aud === "yaos-vault-ws"
 		&& typeof payload.deploymentId === "string" && payload.deploymentId.length > 0
-		&& (payload.purpose === "root" || payload.purpose === "body" || payload.purpose === "semantic")
+		&& (payload.purpose === "root" || payload.purpose === "body" || payload.purpose === "semantic"
+			|| payload.purpose === "streams")
 		&& typeof payload.documentId === "string" && payload.documentId.length > 0
 		&& (payload.purpose === "root") === (payload.documentId === "root")
-		&& (payload.purpose === "root"
-			? Number.isSafeInteger(payload.rootEpoch) && (payload.rootEpoch as number) >= 1 && payload.bodyEpoch === undefined
-			: Number.isSafeInteger(payload.bodyEpoch) && (payload.bodyEpoch as number) >= 1 && payload.rootEpoch === undefined)
+		&& (payload.purpose !== "streams" || payload.documentId === "streams")
+		&& (payload.purpose === "streams"
+			? payload.rootEpoch === undefined && payload.bodyEpoch === undefined
+			: payload.purpose === "root"
+				? Number.isSafeInteger(payload.rootEpoch) && (payload.rootEpoch as number) >= 1 && payload.bodyEpoch === undefined
+				: Number.isSafeInteger(payload.bodyEpoch) && (payload.bodyEpoch as number) >= 1 && payload.rootEpoch === undefined)
 		&& typeof payload.vaultId === "string" && payload.vaultId.length > 0
 		&& typeof payload.vaultGeneration === "string" && payload.vaultGeneration.length > 0
 		&& typeof payload.principalId === "string" && payload.principalId.length > 0
@@ -184,9 +192,18 @@ export async function handleTicketRoute(req: Request, authState: AuthState, acto
 	try {
 		let input: { purpose?: unknown; documentId?: unknown; rootEpoch?: unknown; bodyEpoch?: unknown } = {};
 		try { input = await req.json(); } catch { /* invalid below */ }
+		if (input.purpose === "streams") {
+			// Opaque streams (YAOS_STREAMS; the socket route is gated, so a ticket alone opens nothing).
+			if ((input.documentId !== undefined && input.documentId !== "streams")
+				|| input.rootEpoch !== undefined || input.bodyEpoch !== undefined) return json({ error: "invalid_ticket_scope" }, 400);
+			const result = await createTicket(authState, actor, { purpose: "streams", documentId: "streams" },
+				readTicketTtlMs(env?.YAOS_TICKET_TTL_MS));
+			if (env) scheduleTouchDevice(env, actor);
+			return json(result);
+		}
 		if ((input.purpose !== "root" && input.purpose !== "body" && input.purpose !== "semantic")
 			|| typeof input.documentId !== "string" || input.documentId.length === 0) return json({ error: "invalid_ticket_scope" }, 400);
-		let scope: TicketEpochScope;
+		let scope: Exclude<TicketEpochScope, { purpose: "streams" }>;
 		try {
 			scope = input.purpose === "root"
 				? { purpose: "root", documentId: "root", rootEpoch: parseSemanticEpoch(input.rootEpoch, "root epoch") }

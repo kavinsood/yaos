@@ -1,6 +1,7 @@
 import { ControlPlaneRuntime, ServerConfig } from "./config";
 import { RELAY_CRASH_RUNTIME_PATH, RELAY_TABLE_COUNTS_RUNTIME_PATH, SIMULATE_DAILY_LIMIT_RUNTIME_PATH, SIMULATE_RESTART_RUNTIME_PATH, SQL_ROWS_RESET_RUNTIME_PATH, SQL_ROWS_RUNTIME_PATH, VaultRuntime, VaultSyncServer } from "./server";
 import { relayBodiesEnabled } from "./relayFlag";
+import { streamsEnabled } from "./streams/protocol";
 import { ActorRecoveryRouteAuthority } from "./recoveryPublicAuthority";
 import { handleRecoveryRoute, isPublicRecoveryRouteShape } from "./recoveryRoutes";
 import type { VaultRecord } from "./identity";
@@ -94,7 +95,11 @@ type WorkerRoute =
 	| { kind: "vault"; vaultId: string; rest: string[] }
 	| { kind: "not-found" };
 
-function validVaultRest(method: string, rest: string[], relayBodies = false): boolean {
+function validVaultRest(method: string, rest: string[], relayBodies = false, streams = false): boolean {
+	// Opaque streams (client remake): routes that exist only with YAOS_STREAMS === "true".
+	if (streams && method === "GET" && rest.length === 2 && rest[0] === "ws" && rest[1] === "streams") return true;
+	if (streams && method === "GET" && rest.length === 2 && rest[0] === "streams" && (rest[1] === "feed" || rest[1] === "read")) return true;
+	if (streams && method === "PUT" && rest.length === 2 && rest[0] === "streams" && rest[1] === "checkpoint") return true;
 	// Relay v2 spike: routes that exist only with YAOS_RELAY_BODIES === "true".
 	if (relayBodies && method === "POST" && rest.length === 3 && rest[0] === "body" && !!rest[1]
 		&& (rest[2] === "compaction-lease" || rest[2] === "semantic-reset")) return true;
@@ -173,7 +178,7 @@ function parseVault(pathname: string): { vaultId: string; rest: string[] } | nul
 	return { vaultId, rest };
 }
 
-export function classifyWorkerRoute(request: Request, url = new URL(request.url), relayBodies = false): WorkerRoute {
+export function classifyWorkerRoute(request: Request, url = new URL(request.url), relayBodies = false, streams = false): WorkerRoute {
 	if (request.method === "OPTIONS" && (url.pathname.startsWith("/vault/") || url.pathname.startsWith("/api/") || url.pathname === "/enroll" || url.pathname.startsWith("/operator/"))) return { kind: "cors-preflight" };
 	if (request.method === "GET" && url.pathname === "/") return { kind: "home" };
 	if (request.method === "GET" && url.pathname === "/mobile-setup") return { kind: "mobile-setup" };
@@ -232,7 +237,7 @@ export function classifyWorkerRoute(request: Request, url = new URL(request.url)
 		return id ? { kind: "operator-pairing-revoke", id } : { kind: "not-found" };
 	}
 	const vault = parseVault(url.pathname);
-	return vault && validVaultRest(request.method, vault.rest, relayBodies) ? { kind: "vault", ...vault } : { kind: "not-found" };
+	return vault && validVaultRest(request.method, vault.rest, relayBodies, streams) ? { kind: "vault", ...vault } : { kind: "not-found" };
 }
 
 function logRequest(route: WorkerRoute, request: Request, response: Response, start: number, auth: string): void {
@@ -259,7 +264,7 @@ async function authorizedVaultControl(request: Request, env: Env, authState: Aut
 export async function handleWorkerRequest(request: Request, env: Env): Promise<Response> {
 		const start = Date.now();
 		const url = new URL(request.url);
-		const route = classifyWorkerRoute(request, url, relayBodiesEnabled(env));
+		const route = classifyWorkerRoute(request, url, relayBodiesEnabled(env), streamsEnabled(env));
 		if (route.kind === "cors-preflight") return corsPreflight();
 		if (route.kind === "not-found") {
 			const response = withCors(json({ error: "not found" }, 404));

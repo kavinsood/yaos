@@ -27,6 +27,7 @@ import {
 import { json } from "./http";
 import { readBulkCreateLimits, relayBodiesEnabled, type BulkCreateLimits } from "../relayFlag";
 import { RELAY_BODIES_CAPABILITY_VERSION } from "../relayBodies";
+import { STREAMS_CAPABILITY_VERSION, streamsEnabled } from "../streams/protocol";
 import { provisionReservedVault } from "./provisioning";
 import type { AuthState, AuthStateCached, Env, UpdateProvider } from "./types";
 
@@ -293,6 +294,8 @@ export function getCapabilities(
 	updateRepoBranch: string | null;
 	bulkCreate: BulkCreateLimits;
 	relayBodies?: number;
+	/** Opaque streams surface version (client remake); present only with YAOS_STREAMS. */
+	streams?: number;
 } {
 	const bucketEnabled = supportsBuckets(env);
 	const recoveryJobs = bucketEnabled && Boolean(env.YAOS_RECOVERY_JOBS);
@@ -317,6 +320,7 @@ export function getCapabilities(
 		bulkCreate: readBulkCreateLimits(env),
 		// Relay v2 spike: present only with the flag on (flag-off output unchanged).
 		...(relayBodiesEnabled(env) ? { relayBodies: RELAY_BODIES_CAPABILITY_VERSION } : {}),
+		...(streamsEnabled(env) ? { streams: STREAMS_CAPABILITY_VERSION } : {}),
 	};
 }
 

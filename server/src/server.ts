@@ -45,6 +45,9 @@ import { RelayBodyService } from "./relayBodies";
 import { RelayBodyStore } from "./relayBodyStore";
 import { SqlRowCounter } from "./sqlRowCounter";
 import { handleCompactionLease, handleSemanticReset, type RelayRouteDeps } from "./relayRoutes";
+import { streamsEnabled } from "./streams/protocol";
+import { DEFAULT_STREAM_RELAY_CONFIG, readStreamRelayConfig, StreamRelayService, type StreamRelayConfig, type StreamsEnv } from "./streams/relay";
+import { StreamStore } from "./streams/store";
 import { armAlarmUnderDailyLimit, type DailyLimitAlarmOutcome, DailyLimitLatch, dailyLimitResponse, instrumentStorageForDailyLimit } from "./dailyLimit";
 
 // Production PERSIST_DEBOUNCE_MS (250 ms) lives in testOnlyTimers.ts so the
@@ -185,6 +188,9 @@ export interface VaultRuntimeOptions {
 	bulkCreateLimits?: BulkCreateLimits;
 	/** Relay v2 spike: TEST-ONLY relay debug routes (Worker-gated like simulate-restart). */
 	relayDebugRoutes?: boolean;
+	/** Client remake: opaque streams surface (`YAOS_STREAMS === "true"`); off when absent. */
+	streams?: boolean;
+	streamsConfig?: StreamRelayConfig;
 	/**
 	 * Write-budget D8: records Cloudflare's free-tier daily row limit (see
 	 * dailyLimit.ts). Hosts that instrument storage share one latch across
@@ -355,6 +361,9 @@ export class VaultRuntime implements DrainPort {
 	private readonly relay: RelayBodyService | null = null;
 	private relayStore: RelayBodyStore | null = null;
 	private relayCheckpointAlarmArmed = false;
+	/** Client remake: opaque streams (streams/); null with the flag off. Never touches the CRDT engine. */
+	private readonly streams: StreamRelayService | null = null;
+	private readonly streamStore: StreamStore | null = null;
 	/** D8 diagnostics: alarms held back to (or not armed before) the daily-limit reset. */
 	private dailyLimitAlarmHolds = 0;
 	/** b3 P2 diagnostics: inline (post-bulk-create) recovery projection. */
@@ -410,6 +419,24 @@ export class VaultRuntime implements DrainPort {
 							console.warn("[yaos-relay] checkpoint alarm failed", error);
 						}));
 				},
+			});
+		}
+		if (options.streams) {
+			this.streamStore = new StreamStore(this.storage);
+			this.streams = new StreamRelayService({
+				config: options.streamsConfig ?? { ...DEFAULT_STREAM_RELAY_CONFIG },
+				store: () => this.streamStore!,
+				sockets: options.sockets,
+				sendControl: (socket, value) => {
+					try { socket.send(`__YPS:${JSON.stringify(this.dailyLimit.decorateControl(value))}`); }
+					catch { /* closed */ }
+				},
+				validateActor: (actor) => this.store.validateActorCached(actor, Date.now()) === "allowed",
+				dailyLimitActive: () => this.dailyLimit.active(),
+				noteCommitError: (error) => { this.dailyLimit.note(error); },
+				vaultId,
+				vaultGeneration,
+				runtimeEpoch: this.runtimeEpoch,
 			});
 		}
 		socketOwner = new VaultSocketService({
@@ -556,6 +583,10 @@ export class VaultRuntime implements DrainPort {
 
 	/** v3: once per runtime, step1 to relay sockets of an earlier runtime (see RelayBodyService.ensureWakeResync). */
 	private wakeResync(): void {
+		if (this.streams && !this.deleted) {
+			try { this.streams.ensureWakeNotice(); }
+			catch (error) { console.warn("[yaos-streams] wake notice failed", error); }
+		}
 		if (!this.relay?.config.groupCommit || this.deleted) return;
 		try { this.relay.ensureWakeResync(); }
 		catch (error) { console.warn("[yaos-relay] wake re-sync failed", error); }
@@ -653,9 +684,10 @@ export class VaultRuntime implements DrainPort {
 				}
 				// v3 R11: commit buffered (already broadcast) frames before the fence, same turn.
 				this.relay?.flushForAuthorityFence();
+				this.streams?.flushForAuthorityFence();
 				this.store.revokeDevice(body.deviceId);
 				this.relayStore?.releaseLeasesFor({ deviceIds: [body.deviceId] });
-				return json({ closed: this.sockets.closeDevice(body.deviceId) });
+				return json({ closed: this.sockets.closeDevice(body.deviceId) + (this.streams?.closeDevice(body.deviceId) ?? 0) });
 			}
 			if (request.method === "POST" && url.pathname === "/__yaos/begin-vault-deletion") return this.beginDeletion(request);
 			if (request.method === "POST" && url.pathname === "/__yaos/delete-all") return this.deleteAll();
@@ -669,6 +701,19 @@ export class VaultRuntime implements DrainPort {
 					() => this.store.validateActor(authorized) === "allowed", authorized);
 			}
 			if (request.method === "POST" && url.pathname === "/compact") return this.compact();
+			if (this.streams && parts[0] === "streams" && parts.length === 2) {
+				// Opaque streams HTTP surface: feed / catch-up read (read) and checkpoint CAS (write).
+				if (request.method === "GET" && (parts[1] === "feed" || parts[1] === "read")) {
+					const authorized = this.authorize(actor, "vault.content.read");
+					if (authorized instanceof Response) return authorized;
+					return parts[1] === "feed" ? this.streams.feed(url) : this.streams.read(url);
+				}
+				if (request.method === "PUT" && parts[1] === "checkpoint") {
+					const authorized = this.authorize(actor, "vault.content.write");
+					if (authorized instanceof Response) return authorized;
+					return await this.streams.putCheckpoint(request, url);
+				}
+			}
 
 			if (request.method === "GET" && request.headers.get("upgrade")?.toLowerCase() === "websocket") {
 				const authorized = this.authorize(actor, "vault.content.read");
@@ -676,6 +721,9 @@ export class VaultRuntime implements DrainPort {
 				const acceptOptions = {
 					capabilities: parseSocketClientCapabilities(url.searchParams.get(SOCKET_CLIENT_CAPABILITIES_PARAM)),
 				};
+				if (this.streams && url.pathname === "/ws/streams") {
+					return this.streams.accept(authorized, !(this.authorize(actor, "vault.content.write") instanceof Response));
+				}
 				if (url.pathname === "/ws/root") {
 					let rootEpoch;
 					try { rootEpoch = parseSemanticEpochHeader(request.headers, "root"); }
@@ -908,12 +956,16 @@ export class VaultRuntime implements DrainPort {
 			// (broadcast) before the fence is committed before it, and every frame after
 			// it fails the uncached authority check at receipt (never broadcast/appended).
 			this.relay?.flushForAuthorityFence();
+			this.streams?.flushForAuthorityFence();
 			const receipt = this.store.installAuthorityFence({ changeId: input.changeId, vaultId: input.vaultId,
 				vaultGeneration: input.vaultGeneration, subjectDigest, subjects });
 			const principalIds = new Set(subjects.filter((subject) => !("deviceId" in subject))
 				.map((subject) => subject.principalId));
 			for (const subject of subjects) {
-				if ("deviceId" in subject) this.sockets.closeDevice(subject.deviceId);
+				if ("deviceId" in subject) {
+					this.sockets.closeDevice(subject.deviceId);
+					this.streams?.closeDevice(subject.deviceId);
+				}
 			}
 			// Relay v2 (G19): any authority change to a device or principal releases its
 			// compaction leases (the reset install re-checks authority regardless).
@@ -923,7 +975,10 @@ export class VaultRuntime implements DrainPort {
 					principalIds: principalIds,
 				});
 			}
-			for (const principalId of principalIds) this.sockets.closePrincipal(principalId);
+			for (const principalId of principalIds) {
+				this.sockets.closePrincipal(principalId);
+				this.streams?.closePrincipal(principalId);
+			}
 			return json({ ...receipt, runtimeEpoch: this.runtimeEpoch });
 		} catch (error) {
 			return json({ error: error instanceof Error ? error.message : "authorization_fence_failed" }, 409);
@@ -934,18 +989,23 @@ export class VaultRuntime implements DrainPort {
 		if (this.deleted || this.drainPromise) socket.close(1001, "vault maintenance");
 		else {
 			this.wakeResync();
-			await this.sockets.message(socket, message);
+			// Streams sockets carry their own attachment kind; the legacy service would 1008 them.
+			if (this.streams?.owns(socket)) this.streams.message(socket, message);
+			else await this.sockets.message(socket, message);
 		}
 	}
 
 	/** Hosts pass the closed socket; presence of its awareness identity is removed for peers. */
 	webSocketClose(socket?: VaultSocketPort): void {
-		if (socket) this.sockets.socketClosed(socket);
+		if (!socket) return;
+		if (this.streams?.owns(socket)) this.streams.socketClosed(socket);
+		else this.sockets.socketClosed(socket);
 	}
 
 	webSocketError(socket: VaultSocketPort): void {
 		try { socket.close(1011, "socket error"); } catch { /* already closed */ }
-		this.sockets.socketClosed(socket);
+		if (this.streams?.owns(socket)) this.streams.socketClosed(socket);
+		else this.sockets.socketClosed(socket);
 	}
 
 	/**
@@ -976,8 +1036,13 @@ export class VaultRuntime implements DrainPort {
 		// v3: a restart commits buffered group commits (as a graceful drain would);
 		// the relay-crash simulation drops them unacked (an isolate eviction).
 		let droppedRelayFrames = 0;
-		if (mode === "relay-crash") droppedRelayFrames = this.relay?.dropPendingGroupCommits() ?? 0;
-		else this.relay?.flushAllBatches();
+		if (mode === "relay-crash") {
+			droppedRelayFrames = this.relay?.dropPendingGroupCommits() ?? 0;
+			droppedRelayFrames += this.streams?.dropPending() ?? 0;
+		} else {
+			this.relay?.flushAllBatches();
+			this.streams?.flush("forced");
+		}
 		for (let round = 0; round < 10; round++) {
 			await Promise.all([...this.scheduledFlushes.values()]);
 			const pending = Object.keys(this.cache.diagnostics().pending);
@@ -1001,6 +1066,8 @@ export class VaultRuntime implements DrainPort {
 	drain(): Promise<void> {
 		if (!this.drainPromise) {
 			this.drainPromise = (async () => {
+				// Streams: commit (and receipt) buffered appends before the sockets go.
+				try { this.streams?.flush("forced"); } catch (error) { console.warn("[yaos-streams] drain flush failed", error); }
 				this.sockets.closeAll("server draining");
 				await Promise.all([...this.scheduledFlushes.values()]);
 				await this.flushLoadedDocuments();
@@ -1288,6 +1355,7 @@ export class VaultRuntime implements DrainPort {
 
 	private async deleteAll(): Promise<Response> {
 		this.deleted = true;
+		this.streams?.dropPending();
 		this.sockets.closeAll("vault deleted");
 		await this.waitForFlushLanes();
 		this.cache.clear();
@@ -1301,6 +1369,7 @@ export class VaultRuntime implements DrainPort {
 		this.store.setCommitObserver((observation) => this.afterDurableCommit(observation));
 		if (this.relayStore) this.relayStore = new RelayBodyStore(this.storage, this.store);
 		this.settings = new SettingsSyncStore(this.storage);
+		this.streams?.reset();
 		return json({ deleted: true });
 	}
 
@@ -1658,6 +1727,7 @@ export class VaultRuntime implements DrainPort {
 			semanticCompactionNextRetryAt: this.semanticCompaction.nextRetryAt(),
 			persistence: Object.fromEntries(this.persistence),
 			...(this.relay ? { relay: this.relay.diagnostics() } : {}),
+			...(this.streams ? { streams: this.streams.diagnostics() } : {}),
 			dailyLimit: { active: this.dailyLimit.active(), resetAt: this.dailyLimit.body()?.resetAt ?? null,
 				alarmHolds: this.dailyLimitAlarmHolds },
 			recoveryInlineProjection: { ...this.inlineProjection } });
@@ -1994,7 +2064,7 @@ export class VaultRuntime implements DrainPort {
 	}
 }
 
-export interface CloudflareVaultEnvironment extends TestOnlyServerTimerEnv, TestOnlyDebugRouteEnv, RelayFlagEnv {
+export interface CloudflareVaultEnvironment extends TestOnlyServerTimerEnv, TestOnlyDebugRouteEnv, RelayFlagEnv, StreamsEnv {
 	/** TEST-ONLY (D8): start with the daily-limit simulation on; needs YAOS_TEST_ONLY_DEBUG_ROUTES. */
 	YAOS_TEST_ONLY_SIMULATE_DAILY_LIMIT?: string;
 	YAOS_BUCKET?: R2Bucket;
@@ -2092,6 +2162,7 @@ export class VaultSyncServer implements DurableObject {
 			...(this.sqlRowCounter ? { sqlRowCounter: this.sqlRowCounter } : {}),
 			bulkCreateLimits: readBulkCreateLimits(env),
 			relayBodies: relayBodiesEnabled(env),
+			...(streamsEnabled(env) ? { streams: true, streamsConfig: readStreamRelayConfig(env) } : {}),
 			...(relayBodiesEnabled(env) ? { relayConfig: readRelayConfig(env),
 				relayDebugRoutes: testOnlyDebugRoutesEnabled(env) } : {}),
 		});

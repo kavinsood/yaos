@@ -9,6 +9,7 @@ import {
 } from "../settingsSyncStore";
 import { BoundedBodyError, declaredBodyLength, readBoundedBytes } from "../readBoundedBytes";
 import { BULK_CREATE_MAX_REQUEST_BYTES } from "../vaultBulkCreateService";
+import { MAX_STREAM_CHECKPOINT_BYTES, STREAMS_CAPABILITY_VERSION } from "../streams/protocol";
 import { SERVER_PROTOCOL_VERSION, SERVER_SCHEMA_VERSION } from "../version";
 import type { VaultRecord } from "../identity";
 import { inspectTicket } from "./ticket";
@@ -47,6 +48,8 @@ function forwardedBodyLimit(request: Request, runtimePath: string): number | nul
 	if (runtimePath === "/lifecycle/create-bulk") return BULK_CREATE_MAX_REQUEST_BYTES;
 	// Relay v2 spike: the base64 snapshot of a client semantic reset (route exists only with the flag on).
 	if (/^\/body\/[^/]+\/semantic-reset$/.test(runtimePath)) return MAX_CATCH_UP_BYTES;
+	// Opaque streams: one checkpoint body (route exists only with YAOS_STREAMS on).
+	if (runtimePath === "/streams/checkpoint") return MAX_STREAM_CHECKPOINT_BYTES;
 	if (runtimePath.startsWith("/settings-sync/") && request.method === "PUT") {
 		const action = runtimePath.split("/")[3];
 		return action === "seed" || action === "replace"
@@ -157,8 +160,9 @@ export async function handleVaultSocketRoute(
 	if (!authState.claimed) return rejectSocket(request, env, "unclaimed");
 	const url = new URL(request.url);
 	const ticket = url.searchParams.get("ticket");
-	const purpose = runtimePath === "/ws/root" ? "root" : runtimePath.startsWith("/ws/semantic/") ? "semantic" : "body";
-	const documentId = purpose === "root" ? "root" : runtimePath.split("/").at(-1) ?? "";
+	const purpose = runtimePath === "/ws/root" ? "root" : runtimePath === "/ws/streams" ? "streams"
+		: runtimePath.startsWith("/ws/semantic/") ? "semantic" : "body";
+	const documentId = purpose === "root" ? "root" : purpose === "streams" ? "streams" : runtimePath.split("/").at(-1) ?? "";
 	const payload = ticket ? await inspectTicket(ticket, authState, { vaultId, purpose, documentId }) : null;
 	if (!payload) return rejectSocket(request, env, "unauthorized");
 	const membership = await configFetch(env, "/__yaos/verify-device", {
@@ -167,14 +171,22 @@ export async function handleVaultSocketRoute(
 		body: JSON.stringify({ vaultId, deviceId: payload.deviceId }),
 	});
 	if (!membership.ok) return rejectSocket(request, env, "unauthorized");
-	const schemaVersion = declaredVersion(url, "schemaVersion");
-	if (schemaVersion !== SERVER_SCHEMA_VERSION) return rejectSocket(request, env, "update_required", {
-		reason: "schema_mismatch", clientSchemaVersion: schemaVersion, serverSchemaVersion: SERVER_SCHEMA_VERSION,
-	});
-	const protocolVersion = declaredVersion(url, "protocolVersion");
-	if (protocolVersion !== SERVER_PROTOCOL_VERSION) return rejectSocket(request, env, "update_required", {
-		reason: "protocol_mismatch", clientProtocolVersion: protocolVersion, serverProtocolVersion: SERVER_PROTOCOL_VERSION,
-	});
+	if (purpose === "streams") {
+		// The streams wire is versioned on its own (no CRDT schema/protocol on this path).
+		const streamsVersion = declaredVersion(url, "streamsVersion");
+		if (streamsVersion !== STREAMS_CAPABILITY_VERSION) return rejectSocket(request, env, "update_required", {
+			reason: "streams_version_mismatch", clientStreamsVersion: streamsVersion, serverStreamsVersion: STREAMS_CAPABILITY_VERSION,
+		});
+	} else {
+		const schemaVersion = declaredVersion(url, "schemaVersion");
+		if (schemaVersion !== SERVER_SCHEMA_VERSION) return rejectSocket(request, env, "update_required", {
+			reason: "schema_mismatch", clientSchemaVersion: schemaVersion, serverSchemaVersion: SERVER_SCHEMA_VERSION,
+		});
+		const protocolVersion = declaredVersion(url, "protocolVersion");
+		if (protocolVersion !== SERVER_PROTOCOL_VERSION) return rejectSocket(request, env, "update_required", {
+			reason: "protocol_mismatch", clientProtocolVersion: protocolVersion, serverProtocolVersion: SERVER_PROTOCOL_VERSION,
+		});
+	}
 	let vault: VaultRecord | null;
 	try { vault = await readVault(env, vaultId); } catch { return rejectSocket(request, env, "unauthorized"); }
 	if (!vault || vault.state !== "active") return rejectSocket(request, env, "unauthorized");
@@ -186,6 +198,7 @@ export async function handleVaultSocketRoute(
 		...(payload.deviceName ? { deviceName: payload.deviceName } : {}),
 		role: payload.role, policyVersion: payload.policyVersion, capabilityDigest: payload.capabilityDigest,
 	};
+	if (payload.purpose === "streams") return forward(env, vault, request, runtimePath, actor, false);
 	const semanticScope: SemanticEpochScope = payload.purpose === "root"
 		? { purpose: "root", documentId: "root", rootEpoch: payload.rootEpoch }
 		: { purpose: "body", documentId: payload.documentId, bodyEpoch: payload.bodyEpoch };
