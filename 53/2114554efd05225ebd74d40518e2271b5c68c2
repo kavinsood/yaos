@@ -1,0 +1,21 @@
+src/engine/reconcile/testkit/fakes.ts
+  s_89e23cccdabada::t_34f0c010ef39c9 1-86
+src/engine/reconcile/testkit/world.ts
+  s_89e23cccdabada::t_ef4d7ebc3e0753 1-124
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "532114554efd05225ebd74d40518e2271b5c68c2",
+  "prompts": {},
+  "sessions": {
+    "s_89e23cccdabada": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-abc25b91847c93c47",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
