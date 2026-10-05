@@ -1,0 +1,23 @@
+src/core/cfg/fold.ts
+  s_3f1e78c1a8c300::t_c3190b47d5a555 1-281
+src/core/cfg/json.ts
+  s_3f1e78c1a8c300::t_639d6bba93931e 1-62
+src/core/cfg/projection.ts
+  s_3f1e78c1a8c300::t_f2ca5fc6ca3dcb 1-221
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "f85dff79730530ddf48a846748b0063c0e673706",
+  "prompts": {},
+  "sessions": {
+    "s_3f1e78c1a8c300": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a393e5c0d70814322",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
