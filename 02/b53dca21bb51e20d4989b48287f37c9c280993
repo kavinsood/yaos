@@ -1,0 +1,45 @@
+src/host/ui/brake.test.ts
+  s_808e98640ec653::t_6d6639b3cb21a6 1-41
+src/host/ui/brake.ts
+  s_808e98640ec653::t_bf0eda0746ed69 1-81
+src/host/ui/diagnostics.test.ts
+  s_3f1e78c1a8c300::t_0057bc34860008 1-133
+src/host/ui/diagnostics.ts
+  s_808e98640ec653::t_60e66103802e05 1-99
+src/host/ui/statusBar.test.ts
+  s_40cab75849ffee::t_f0365ab72c026e 1-268
+src/host/ui/statusBar.ts
+  s_808e98640ec653::t_f2b1ac4a47780c 1-299
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "02b53dca21bb51e20d4989b48287f37c9c280993",
+  "prompts": {},
+  "sessions": {
+    "s_3f1e78c1a8c300": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a393e5c0d70814322",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_40cab75849ffee": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a0efa7727ce0c852e",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_808e98640ec653": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a6d246dbda3daef6a",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
