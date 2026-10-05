@@ -1,0 +1,23 @@
+src/engine/__standins__/webPorts.ts
+  s_3e0c71be916d35::t_1d9a2830267cf6 1-46
+src/engine/workerMain.test.ts
+  s_3e0c71be916d35::t_d2f287e81f9690 1-71
+src/engine/workerMain.ts
+  s_3e0c71be916d35::t_38ba260c6b8dea 1-26
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "4d718b2927cd3d8788bbbd33793c9115575a2448",
+  "prompts": {},
+  "sessions": {
+    "s_3e0c71be916d35": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a024e58aa7ba38180",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
