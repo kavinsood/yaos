@@ -18,7 +18,8 @@ import type { EngineSettings } from "../protocol/messages";
 import type { StatusSnapshot } from "../protocol/status";
 import type { EngineCarrier } from "../host/engineHost";
 import { createHasher } from "../host/hashing";
-import { HostRuntime } from "../host/hostRuntime";
+import { HostRuntime, type HostUiSink } from "../host/hostRuntime";
+import type { HostIdentity } from "../host/runtimeSupport";
 import { createStandinEngine, type StandinEngine } from "../engine/__standins__/engine";
 import type { StandinStore } from "../engine/__standins__/docs";
 import type { StandinHub } from "../engine/__standins__/hub";
@@ -127,23 +128,30 @@ export class SimDevice {
 	}
 
 	private makeRuntime(): HostRuntime {
-		const hasher = createHasher(simHashPort());
-		return new HostRuntime({
-			clock: this.opts.clock, vault: this.vault, configDir: this.configDir, sideFiles: this.sideFiles,
-			workspace: this.workspace, platform: this.platform, hasher,
-			identity: { vaultId: "sim-vault" as VaultId, deviceId: this.deviceId, deviceLabel: this.opts.name, relay: { url: "sim://hub", credential: "sim" } },
-			settings: () => SIM_SETTINGS,
-			createWorker: () => (this.opts.workerMode === "unavailable" ? null : this.carrier("worker")),
-			createInline: () => this.carrier("inline"),
-			pingEnabled: true,
-			timeZone: "utc",
-			ui: {
+		return this.runtimeFor(
+			{ vaultId: "sim-vault" as VaultId, deviceId: this.deviceId, deviceLabel: this.opts.name, relay: { url: "sim://hub", credential: "sim" } },
+			() => SIM_SETTINGS,
+			{
 				onStatus: (s) => this.ui.statuses.push(s),
 				onBrake: (b) => this.ui.brakes.push(b),
 				onNotice: (level, code, message) => this.ui.notices.push({ level, code, message }),
 				onCarrier: (c) => this.ui.carriers.push({ carrier: c.carrier, ready: c.ready, fallbackReason: c.fallbackReason }),
 				onFatal: (e) => this.ui.fatals.push(e),
 			},
+		);
+	}
+
+	/** A HostRuntime over this device's vault/workspace/platform/carriers (plugin controller tests). */
+	runtimeFor(identity: HostIdentity, settings: () => EngineSettings, ui: HostUiSink): HostRuntime {
+		return new HostRuntime({
+			clock: this.opts.clock, vault: this.vault, configDir: this.configDir, sideFiles: this.sideFiles,
+			workspace: this.workspace, platform: this.platform, hasher: createHasher(simHashPort()),
+			identity, settings,
+			createWorker: () => (this.opts.workerMode === "unavailable" ? null : this.carrier("worker")),
+			createInline: () => this.carrier("inline"),
+			pingEnabled: true,
+			timeZone: "utc",
+			ui,
 		});
 	}
 
