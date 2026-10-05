@@ -1,0 +1,23 @@
+src/engine/reconcile/ownFold.ts
+  s_89e23cccdabada::t_91fe6d62da33b3 1-71
+src/engine/reconcile/reconciler.ts
+  s_89e23cccdabada::t_d52560306a27f3 1-158
+src/engine/reconcile/runner.ts
+  s_89e23cccdabada::t_630925972b0e74 1-149
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "0dfa481b7e172661375b1878e815a6e5e352f33f",
+  "prompts": {},
+  "sessions": {
+    "s_89e23cccdabada": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-abc25b91847c93c47",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
