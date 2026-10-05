@@ -1,0 +1,75 @@
+src/engine/adapters/httpBlob.test.ts
+  s_808e98640ec653::t_bcb1442447ec64 1-85
+src/engine/adapters/httpBlob.ts
+  s_9d19ca921f10e2::t_6f6a7164f32c05 1-125
+src/engine/adapters/noopCrypto.test.ts
+  s_808e98640ec653::t_b153e0c1692a65 1-35
+src/engine/adapters/noopCrypto.ts
+  s_9d19ca921f10e2::t_6c81bc632af3af 1-33
+src/engine/adapters/relayFrames.test.ts
+  s_9d19ca921f10e2::t_2a77a5991259f6 1-126
+src/engine/adapters/relayFrames.ts
+  s_9d19ca921f10e2::t_2c4ed76c706f32 1-304
+src/engine/adapters/relayHttp.test.ts
+  s_89e23cccdabada::t_5fb75549cd887e 1-206
+src/engine/adapters/relayHttp.ts
+  s_9d19ca921f10e2::t_055a9ccd48fe28 1-269
+src/engine/adapters/relayTestFakes.ts
+  s_96eb21d7f7a5f4::t_1621baae4a1945 1-159
+src/engine/adapters/webClock.test.ts
+  s_808e98640ec653::t_25e713f022deb2 1-37
+src/engine/adapters/webClock.ts
+  s_9d19ca921f10e2::t_0b7953d7014c40 1-53
+src/engine/adapters/webHash.test.ts
+  s_808e98640ec653::t_7f896ee8fed180 1-19
+src/engine/adapters/webHash.ts
+  s_9d19ca921f10e2::t_01a29437da092f 1-12
+src/engine/adapters/webRandom.test.ts
+  s_808e98640ec653::t_f7aa16be6efda9 1-27
+src/engine/adapters/webRandom.ts
+  s_9d19ca921f10e2::t_d9ebf03be888c6 1-24
+src/engine/adapters/wsRelay.test.ts
+  s_808e98640ec653::t_f5cfcb31cfec0c 1-500
+src/engine/adapters/wsRelay.ts
+  s_808e98640ec653::t_f39c6b53c554c7 1-577
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "5f49af9a488fc147b4ccde26f994252fa2cad210",
+  "prompts": {},
+  "sessions": {
+    "s_808e98640ec653": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a6d246dbda3daef6a",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_89e23cccdabada": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-abc25b91847c93c47",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_96eb21d7f7a5f4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aeffd1cd2e13b02cf",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_9d19ca921f10e2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a55b3c285e3f74a1a",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
