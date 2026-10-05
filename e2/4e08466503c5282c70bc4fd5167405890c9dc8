@@ -1,0 +1,21 @@
+src/engine/blobs/blobQueue.ts
+  s_89e23cccdabada::t_b26b2d71726726 1-185
+src/engine/blobs/chunks.ts
+  s_89e23cccdabada::t_777dac0cd41c26 1-62
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "e24e08466503c5282c70bc4fd5167405890c9dc8",
+  "prompts": {},
+  "sessions": {
+    "s_89e23cccdabada": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-abc25b91847c93c47",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
