@@ -1,0 +1,29 @@
+src/engine/reconcile/diskJobs.ts
+  s_89e23cccdabada::t_5e67ea9afca519 75-80
+src/engine/reconcile/reconciler.crash.test.ts
+  s_89e23cccdabada::t_4d6577ceb00f97 1-159
+src/engine/reconcile/reconciler.ts
+  s_89e23cccdabada::t_a673d89b3e3dcb 27,114
+src/engine/reconcile/runner.ts
+  s_89e23cccdabada::t_3043272b4c8a3c 6-12,21-22,103,116-119,122,154-165
+src/engine/reconcile/tempRecovery.ts
+  s_89e23cccdabada::t_fffb13b76a40ed 1-37
+src/engine/reconcile/testkit/crash.ts
+  s_89e23cccdabada::t_2bc52eab3cef22 1-97
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "25cd02d104a65f98bc7c26ebe372b74b027b9554",
+  "prompts": {},
+  "sessions": {
+    "s_89e23cccdabada": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-abc25b91847c93c47",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
