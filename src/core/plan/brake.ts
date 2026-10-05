@@ -12,7 +12,11 @@
  *   which would change the id on every re-plan and make approval impossible.
  * - Rolling 10-minute window counts are state, so the engine passes them in
  *   (`BrakeWindow`); the planner adds them to the per-plan counts.
- * - listing-shrank is evaluated only against a complete listing count.
+ * - listing-shrank is evaluated only against a complete listing count, and
+ *   only when at least LISTING_SHRANK_MIN_MISSING synced files are missing
+ *   (deviation: the bare ratio rule braked "delete 1 of a 1-file vault"; an
+ *   unmounted vault of >= 10 files is still caught, smaller ones are below
+ *   every other threshold anyway and recoverable from trash/snapshots).
  * - Several tripped reasons: all their units are held; the report names the
  *   first in priority order ns-divergence, listing-shrank, mass-delete-local,
  *   mass-delete-remote, mass-overwrite, conflict-flood.
@@ -85,6 +89,8 @@ export function isShrinkingOverwrite(config: BrakeConfig, oldSize: number, newSi
 	return oldSize >= config.overwriteMinBytes && newSize < config.overwriteShrinkRatio * oldSize;
 }
 
+export const LISTING_SHRANK_MIN_MISSING = 10;
+
 const DESTRUCTIVE: readonly DestructiveKind[] = ["nsDelete", "diskTrash", "overwrite"];
 
 export function applyBrake(units: readonly PlanUnit[], input: BrakeInput): BrakeOutcome {
@@ -93,7 +99,11 @@ export function applyBrake(units: readonly PlanUnit[], input: BrakeInput): Brake
 	const count = (kind: DestructiveKind) => units.filter((u) => u.destructive === kind).length;
 	const tripped: { reason: BrakeReport["reason"]; kinds: readonly DestructiveKind[] }[] = [];
 	if (input.divergence) tripped.push({ reason: "ns-divergence", kinds: DESTRUCTIVE });
-	if (input.liveLocalCount !== null && input.syncedCount > 0 && input.liveLocalCount < config.listingFloorRatio * input.syncedCount) {
+	if (
+		input.liveLocalCount !== null &&
+		input.syncedCount - input.liveLocalCount >= LISTING_SHRANK_MIN_MISSING &&
+		input.liveLocalCount < config.listingFloorRatio * input.syncedCount
+	) {
 		tripped.push({ reason: "listing-shrank", kinds: DESTRUCTIVE });
 	}
 	if (count("nsDelete") > 0 && count("nsDelete") + input.window.nsDelete > threshold) tripped.push({ reason: "mass-delete-local", kinds: ["nsDelete"] });
