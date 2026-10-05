@@ -1,0 +1,19 @@
+src/engine/reconcile/reconciler.crash.test.ts
+  s_3e0c71be916d35::t_44cff696937ff8 160-201
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a96b6ab581eebe50d540de368b04140b48ec8dba",
+  "prompts": {},
+  "sessions": {
+    "s_3e0c71be916d35": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a024e58aa7ba38180",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
