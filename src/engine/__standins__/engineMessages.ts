@@ -119,7 +119,7 @@ export function handleMessage(e: StandinEngine, m: MainToEngine): void {
 			st.diskText = m.text;
 			st.diskFp = m.fingerprint;
 			e.seen.set(st.key, { size: m.stat.size, mtimeMs: m.stat.mtimeMs });
-			e.persist(st);
+			e.persistNow(st);
 			return;
 		}
 		case "boundExternalMerged":

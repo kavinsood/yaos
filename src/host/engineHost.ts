@@ -99,6 +99,8 @@ export class EngineHost {
 	private restartTimes: number[] = [];
 	private inlineOnly: boolean;
 	private stopped = false;
+	/** Set the moment stop() begins: no restart/bring-up may start a new carrier after this. */
+	private halting = false;
 	private started = false;
 	private workerSupported = false;
 	private restarting = false;
@@ -121,6 +123,10 @@ export class EngineHost {
 
 	get isStopped(): boolean {
 		return this.stopped;
+	}
+
+	private get down(): boolean {
+		return this.stopped || this.halting;
 	}
 
 	get probedWorkerSupported(): boolean {
@@ -149,7 +155,8 @@ export class EngineHost {
 
 	/** Graceful stop (plugin unload). */
 	async stop(): Promise<void> {
-		if (this.stopped) return;
+		if (this.stopped || this.halting) return;
+		this.halting = true;
 		const live = this.live;
 		if (live && live.ready) {
 			try {
@@ -159,7 +166,8 @@ export class EngineHost {
 			}
 		}
 		this.stopped = true;
-		if (live) this.teardown(live, "stopped");
+		const cur = this.live; // may differ from `live` (half-started carrier); teardown is not idempotent
+		if (cur) this.teardown(cur, "stopped");
 	}
 
 	/** Test/diagnostic hook: treat the current carrier as failed. */
@@ -175,12 +183,12 @@ export class EngineHost {
 	}
 
 	private async bringUp(restart: boolean): Promise<void> {
-		if (this.stopped) return;
+		if (this.down) return;
 		if (!this.inlineOnly) {
 			const worker = this.safeCreateWorker();
 			if (worker) {
 				const outcome = await this.tryStart(worker, restart);
-				if (outcome === "ok" || outcome === "fatal" || this.stopped) return;
+				if (outcome === "ok" || outcome === "fatal" || this.down) return;
 				this.lastFallbackReason = outcome;
 				this.log(`worker start failed (${outcome}); falling back to inline`);
 				this.inlineOnly = true;
@@ -191,7 +199,7 @@ export class EngineHost {
 		}
 		const inline = this.deps.createInline();
 		const outcome = await this.tryStart(inline, restart);
-		if (outcome !== "ok" && outcome !== "fatal" && !this.stopped) {
+		if (outcome !== "ok" && outcome !== "fatal" && !this.down) {
 			this.log(`inline start failed (${outcome}); retrying in ${this.inlineBackoffMs} ms`);
 			const delay = this.inlineBackoffMs;
 			this.inlineBackoffMs = Math.min(this.inlineBackoffMs * 2, 60_000);
@@ -215,13 +223,14 @@ export class EngineHost {
 			if (carrier.kind === "worker") {
 				await this.requestOn(live, { t: "ping" }, STARTUP_PING_TIMEOUT_MS);
 				this.workerSupported = true;
+				if (this.abandon(live)) return "superseded";
 			}
 			const config = await this.deps.initConfig(carrier.kind, this.workerSupported);
-			if (this.live !== live) return "superseded";
+			if (this.abandon(live)) return "superseded";
 			const ready = await this.requestOn(live, { t: "init", config }, INIT_TIMEOUT_MS);
 			if (ready.t !== "ready") throw new HostRequestError(protocolError("bad-request", `unexpected init answer ${ready.t}`));
 			if (ready.protocolVersion !== PROTOCOL_VERSION) throw new HostRequestError(protocolError("version-mismatch", `engine protocol ${ready.protocolVersion}, host ${PROTOCOL_VERSION}`, false));
-			if (this.live !== live) return "superseded";
+			if (this.abandon(live)) return "superseded";
 			live.ready = true;
 			this.inlineBackoffMs = 1_000;
 			this.schedulePing(live);
@@ -297,11 +306,19 @@ export class EngineHost {
 		});
 	}
 
+	/** After an await in tryStart: superseded, or stop() began (tear the half-started carrier down). */
+	private abandon(live: Live): boolean {
+		if (this.live !== live) return true;
+		if (!this.down) return false;
+		this.teardown(live, "stopped");
+		return true;
+	}
+
 	private schedulePing(live: Live): void {
 		if (!this.deps.pingEnabled) return;
 		live.pingTimer = this.deps.clock.setTimer(PING_INTERVAL_MS, () => {
 			live.pingTimer = null;
-			if (this.live !== live || this.stopped) return;
+			if (this.live !== live || this.down) return;
 			this.requestOn(live, { t: "ping" }, PING_TIMEOUT_MS).then(
 				() => {
 					if (this.live === live) this.schedulePing(live);
@@ -317,7 +334,7 @@ export class EngineHost {
 	}
 
 	private onCarrierFailure(live: Live, reason: string): void {
-		if (this.live !== live || this.stopped) return;
+		if (this.live !== live || this.down) return;
 		const wasReady = live.ready;
 		this.teardown(live, reason);
 		if (!wasReady) return; // tryStart handles startup failures
@@ -327,7 +344,7 @@ export class EngineHost {
 	}
 
 	private restart(): void {
-		if (this.restarting || this.stopped) return;
+		if (this.restarting || this.down) return;
 		this.restarting = true;
 		this.restarts++;
 		const now = this.deps.clock.monotonic();

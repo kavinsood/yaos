@@ -140,6 +140,16 @@ export class StandinEngine implements SyncCtx {
 		});
 	}
 
+	persistNow(st: DocState): void {
+		const store = this.options.store;
+		if (!store || this.disposed) return;
+		if (st.persistTimer !== null) {
+			this.options.clock.clearTimer(st.persistTimer);
+			st.persistTimer = null;
+		}
+		store.set(st.key, persistedOf(st));
+	}
+
 	post(message: EngineToMain): void {
 		if (this.disposed) return;
 		postOwned(this.transport, message);

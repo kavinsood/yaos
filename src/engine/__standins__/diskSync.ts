@@ -31,6 +31,13 @@ export interface SyncCtx {
 	/** Create + register a doc state (attaches update listeners). */
 	addDoc(key: string, path: string): DocState;
 	persist(st: DocState): void;
+	/**
+	 * Persist now (no lag). Called before the disk is made to reflect the CRDT
+	 * (projection) and when a bound save lands: the real engine commits its
+	 * intent / T_synced before or with the disk write, so a crash never leaves a
+	 * store older than the disk (which would re-derive edits by diff).
+	 */
+	persistNow(st: DocState): void;
 	post(message: EngineToMain): void;
 	hostRequest(body: HostRequestBody): Promise<MainResultValue>;
 	/** Run `fn` after `ms` unless the engine is disposed by then (I/O retry). */
@@ -186,6 +193,7 @@ async function projectLocked(ctx: SyncCtx, st: DocState): Promise<void> {
 		}
 		return;
 	}
+	ctx.persistNow(st);
 	const op: DiskOp = {
 		t: "write", opId: 1, area: "vault", path: st.path, data: { t: "text", text },
 		precondition: st.diskFp ? { t: "fingerprint", fingerprint: st.diskFp } : { t: "absent" },

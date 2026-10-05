@@ -283,6 +283,34 @@ test("engine requests are answered on the same generation", async () => {
 	await stopHost(h);
 });
 
+test("carrier dies while stop() awaits shutdown: no zombie restart", async () => {
+	const h = harness({ worker: () => "ok" });
+	await startAndSettle(h);
+	const first = h.engines[0];
+	assert.ok(first);
+	first.hang = true; // shutdown never answered
+	first.pair.kill("app crash"); // failure listeners fire on the next tick, after stop() began
+	const p = h.host.stop();
+	await h.clock.advance(10_000);
+	await p;
+	assert.equal(h.engines.length, 1, "no new carrier after stop() began");
+	assert.equal(h.host.restarts, 0);
+	assert.equal(h.host.isStopped, true);
+	assert.equal(first.disposed, true);
+});
+
+test("stop() while a carrier is still starting disposes it and never reports ready", async () => {
+	const h = harness({ worker: () => "silent" });
+	void h.host.start();
+	await h.clock.advance(100); // startup ping outstanding
+	const p = h.host.stop();
+	await h.clock.advance(STARTUP_PING_TIMEOUT_MS + 1_000);
+	await p;
+	assert.equal(h.engines.length, 1, "no inline fallback after stop()");
+	assert.equal(h.engines[0]?.disposed, true);
+	assert.deepEqual(h.readies, []);
+});
+
 /** stop() awaits the shutdown answer, which needs virtual time to pass. */
 async function stopHost(h: Harness): Promise<void> {
 	const p = h.host.stop();
