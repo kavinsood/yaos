@@ -1,0 +1,27 @@
+src/sim/a-relay-engine.ts
+  s_3f1e78c1a8c300::t_3ef1464f432803 153,156
+src/sim/relay-close.test.ts
+  s_3f1e78c1a8c300::t_9f89c2ff6cdcad 1-193
+src/sim/relay-dedupe.test.ts
+  s_3f1e78c1a8c300::t_5acc1ea7594215 1-97
+src/sim/relay-faults.test.ts
+  s_3f1e78c1a8c300::t_8703c70cbc78aa 1-153
+src/sim/relay.ts
+  s_3f1e78c1a8c300::t_ef349105eb28b0 303
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "4c4127770763dfb3dbf32527ac5783486f119d2c",
+  "prompts": {},
+  "sessions": {
+    "s_3f1e78c1a8c300": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a393e5c0d70814322",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
