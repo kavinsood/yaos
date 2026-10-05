@@ -1,0 +1,29 @@
+src/core/hash/canvasCanonical.ts
+  s_89e23cccdabada::t_7fe2ab51d7c98e 1-499
+src/core/hash/canvasOrdering.ts
+  s_89e23cccdabada::t_c1b455a4f4044d 1-127
+src/core/hash/hash.test.ts
+  s_89e23cccdabada::t_7da7a8c70ef4b0 1-128
+src/core/hash/markdownLf.ts
+  s_89e23cccdabada::t_704fdfe147535f 1-41
+src/core/hash/sha256.ts
+  s_89e23cccdabada::t_06683a240143ff 1-90
+src/core/hash/utf8.ts
+  s_89e23cccdabada::t_77112d91f7af18 1-127
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "30ff7c5dafbb8169fb74f78739ebcecb99dfeb1a",
+  "prompts": {},
+  "sessions": {
+    "s_89e23cccdabada": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-abc25b91847c93c47",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
