@@ -1,0 +1,25 @@
+src/core/merge/merge.test.ts
+  s_3e0c71be916d35::t_a15c44cdf7ba44 1-288
+src/core/merge/myers.test.ts
+  s_3e0c71be916d35::t_5b5ccf2347dd70 1-72
+src/core/merge/myers.ts
+  s_3e0c71be916d35::t_f47e6a36cebce1 112-117,126-128,130-217
+src/core/merge/prng.ts
+  s_3e0c71be916d35::t_f57b1679392040 1-11
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "6cfd3ed041526cc6a75b66d30a8d1f5d53b3dcb8",
+  "prompts": {},
+  "sessions": {
+    "s_3e0c71be916d35": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a024e58aa7ba38180",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
