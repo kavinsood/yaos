@@ -1,0 +1,33 @@
+src/engine/body/checkpoints.ts
+  s_3f1e78c1a8c300::t_52253d7a5db736 1-212
+src/engine/body/compaction.ts
+  s_e6caedb1ffebff::t_ad29ddcfdd991f 1-140
+src/engine/body/frames.ts
+  s_e6caedb1ffebff::t_2dfabf1879db9b 17,98-114
+src/engine/store/repo.ts
+  s_e6caedb1ffebff::t_f4d4906f5d4f62 764-770,772
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "832ada4429199771630efb7916a531d666803b57",
+  "prompts": {},
+  "sessions": {
+    "s_3f1e78c1a8c300": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a393e5c0d70814322",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_e6caedb1ffebff": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a4f41693fa2dd700a",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
