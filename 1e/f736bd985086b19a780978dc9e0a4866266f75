@@ -1,0 +1,23 @@
+src/engine/reconcile/echo.ts
+  s_89e23cccdabada::t_609c6c9ebd0e55 1-88
+src/engine/reconcile/localState.ts
+  s_89e23cccdabada::t_193764b029f59c 1-115
+src/engine/reconcile/store.ts
+  s_89e23cccdabada::t_7daeb2013f168f 1-105
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "1ef736bd985086b19a780978dc9e0a4866266f75",
+  "prompts": {},
+  "sessions": {
+    "s_89e23cccdabada": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-abc25b91847c93c47",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
