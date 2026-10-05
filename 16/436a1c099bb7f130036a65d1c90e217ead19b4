@@ -1,0 +1,19 @@
+src/core/plan/pathRules.ts
+  s_89e23cccdabada::t_5acc1e6f103334 1-91
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "16436a1c099bb7f130036a65d1c90e217ead19b4",
+  "prompts": {},
+  "sessions": {
+    "s_89e23cccdabada": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-abc25b91847c93c47",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
