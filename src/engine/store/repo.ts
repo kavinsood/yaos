@@ -761,14 +761,15 @@ async function releaseDependents(tx: Tx, gone: OutboxRecord): Promise<OutboxReco
 	const out: OutboxRecord[] = [];
 	for (const h of held) {
 		if (h.dependsOn !== gone.clientFrameId) continue;
-		let dep: ClientFrameId | null = null;
-		if (h.kind === "bodyUpdateRef") {
-			const chunks = await tx.getAllByIndex(STORE.outbox, INDEX.outboxByStream, { lower: ["x:", 0], upper: ["x;", 0], upperOpen: true });
-			for (const c of chunks) if (c.clientFrameId !== gone.clientFrameId && c.order < h.order) dep = c.clientFrameId;
-		} else {
-			const same = await tx.getAllByIndex(STORE.outbox, INDEX.outboxByStream, streamOrderRange(h.stream));
-			for (const c of same) if (c.state === "adoptable" && c.clientFrameId !== gone.clientFrameId && c.order < h.order) dep = c.clientFrameId;
+		let best: OutboxRecord | null = null;
+		// x: streams sort by (stream, order): the newest remaining own chunk is the max order, not the last iterated.
+		const candidates = h.kind === "bodyUpdateRef"
+			? await tx.getAllByIndex(STORE.outbox, INDEX.outboxByStream, { lower: ["x:", 0], upper: ["x;", 0], upperOpen: true })
+			: (await tx.getAllByIndex(STORE.outbox, INDEX.outboxByStream, streamOrderRange(h.stream))).filter((c) => c.state === "adoptable");
+		for (const c of candidates) {
+			if (c.clientFrameId !== gone.clientFrameId && c.order < h.order && (!best || c.order > best.order)) best = c;
 		}
+		const dep: ClientFrameId | null = best ? best.clientFrameId : null;
 		const n: OutboxRecord = dep ? { ...h, dependsOn: dep } : { ...h, state: "pending", dependsOn: null };
 		tx.put(STORE.outbox, n);
 		out.push(n);

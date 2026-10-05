@@ -14,7 +14,7 @@
 import * as Y from "yjs";
 import { EnvelopeFlag, type EnvelopeKind } from "../../core/envelope";
 import { BLOB_CHUNK_BYTES, INITIAL_INSERT_CHUNK_CHARS, MAX_INLINE_UPDATE_BYTES, MAX_LOG_BLOB_BYTES } from "../../core/limits";
-import { blobChunkStream, streamClass, type ClientFrameId, type ContentHash, type NsOp, type Seq, type StreamName, type VaultId } from "../../core/types";
+import { blobChunkStream, streamClass, type ClientFrameId, type ContentHash, type DeviceId, type NsOp, type Seq, type StreamName, type VaultId } from "../../core/types";
 import type { BlobPort } from "../../ports/blob";
 import type { CryptoPort, HashPort } from "../../ports/crypto";
 import type { RandomPort } from "../../ports/random";
@@ -93,6 +93,23 @@ export async function buildBodyFrames(ctx: FrameCtx, input: BodyFrameInput): Pro
 	const dep = input.dependsOn ?? out[out.length - 1]!.clientFrameId;
 	out.push(await seal(ctx, input.stream, "bodyUpdateRef", input.authorNsSeq, input.flags, refContent, input.content, "held", dep, input.nowMs));
 	return out;
+}
+
+/**
+ * T_adopt record (DESIGN §d.5): another device's provisional update re-sealed
+ * under a fresh own clientFrameId (own AAD), flag `adopted`, state adoptable.
+ */
+export async function buildAdoptFrame(
+	ctx: FrameCtx, stream: StreamName, kind: EnvelopeKind, authorNsSeq: Seq, flags: number, content: Uint8Array,
+	adoptOf: { readonly deviceId: DeviceId; readonly clientFrameId: ClientFrameId; readonly receivedAtMs: number }, nowMs: number,
+): Promise<NewOutboxFrame> {
+	const clientFrameId = newFrameId(ctx.random);
+	const f = flags | EnvelopeFlag.adopted;
+	const s = await sealFrame(ctx.crypto, ctx.vaultId, stream, clientFrameId, kind, authorNsSeq, f, content);
+	return {
+		clientFrameId, stream, kind, state: "adoptable", sealed: s.sealed, content, authorNsSeq, flags: s.flags & ~EnvelopeFlag.deflate,
+		dependsOn: null, adoptOf, createdAtMs: nowMs,
+	};
 }
 
 export async function buildNsFrame(ctx: FrameCtx, stream: StreamName, ops: readonly NsOp[], authorNsSeq: Seq, nowMs: number): Promise<NewOutboxFrame> {
