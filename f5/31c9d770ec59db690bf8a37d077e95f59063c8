@@ -1,0 +1,27 @@
+src/core/limits.ts
+  s_f672049613e497::t_9a67dcd154e965 22,24-30,44-51,122-123,127,130
+src/core/types.ts
+  s_f672049613e497::t_d18b9f2430e25a 31-35,42-43,88-94,96,98,222-227,308-309
+src/engine/store/schema.ts
+  s_f672049613e497::t_d87f9c3462f182 22,24
+src/ports/index.ts
+  s_f672049613e497::t_001fe4f807e7fd 18
+src/ports/relay.ts
+  s_f672049613e497::t_ec03ae339535e0 2-4,6-36,46,48,51,53-57,73-75,88,90,99-102,110-112,114-119,122,126,132,134,138-142,144,146,148-149,152,154-155,159,164-165,167,174-184
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "f531c9d770ec59db690bf8a37d077e95f59063c8",
+  "prompts": {},
+  "sessions": {
+    "s_f672049613e497": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aeb3c0a846ccf5793",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
