@@ -1,0 +1,21 @@
+src/engine/sync/__standins__/simRelay.test.ts
+  s_96eb21d7f7a5f4::t_3be59d07385ded 1-541
+src/engine/sync/__standins__/simRelay.ts
+  s_96eb21d7f7a5f4::t_c1867f31aa198c 1-875
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "3fd851601856658fccc6bab9067c667fa2bdabbc",
+  "prompts": {},
+  "sessions": {
+    "s_96eb21d7f7a5f4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aeffd1cd2e13b02cf",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
