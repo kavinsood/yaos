@@ -1,0 +1,23 @@
+src/host/ui/brakeModal.ts
+  s_808e98640ec653::t_20953a455400e0 1-79
+src/host/ui/pairModal.ts
+  s_808e98640ec653::t_d64c07100e1ff7 1-227
+src/host/ui/settingsTab.ts
+  s_808e98640ec653::t_5793e21b493deb 1-436
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "2c9c03e91c105016a75024d28ed83d402e1faf59",
+  "prompts": {},
+  "sessions": {
+    "s_808e98640ec653": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a6d246dbda3daef6a",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
