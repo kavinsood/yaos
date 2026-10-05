@@ -134,6 +134,8 @@ export class Repo {
 	priorityFn: PriorityFn = defaultPriority;
 	/** Monotonic clock for the cursor gap timer. */
 	monotonic: () => number = () => 0;
+	/** Name of the §e.2 transaction running on the serial queue (crash tests label commits with it). */
+	txLabel: string | null = null;
 
 	private constructor(
 		readonly db: StorageDb<YS>,
@@ -191,8 +193,16 @@ export class Repo {
 	}
 
 	/** Serial queue for read-write transactions. */
-	private serial<T>(fn: () => Promise<T>): Promise<T> {
-		const p = this.queue.then(fn, fn);
+	private serial<T>(label: string, fn: () => Promise<T>): Promise<T> {
+		const run = async () => {
+			this.txLabel = label;
+			try {
+				return await fn();
+			} finally {
+				this.txLabel = null;
+			}
+		};
+		const p = this.queue.then(run, run);
 		this.queue = p.then(() => undefined, () => undefined);
 		return p;
 	}
@@ -262,7 +272,7 @@ export class Repo {
 
 	/** T_edit (touchStream=true) or T_adopt (touchStream=false). Commits BEFORE any append. */
 	tEdit(frames: readonly NewOutboxFrame[], nowMs: number, touchStream = true): Promise<OutboxRecord[]> {
-		return this.serial(async () => {
+		return this.serial("tEdit", async () => {
 			const touched = new Map<StreamName, StreamRecord>();
 			const out = await this.db.tx([STORE.outbox, STORE.meta, STORE.streams], "readwrite", async (tx) => {
 				const meta = (await tx.get(STORE.meta, "outboxOrder") as MetaOutboxOrder | undefined) ?? { key: "outboxOrder", next: 1 };
@@ -294,7 +304,7 @@ export class Repo {
 
 	tSent(updates: readonly { readonly clientFrameId: ClientFrameId; readonly attempts: number; readonly lastSentAtMs: number }[]): Promise<void> {
 		if (updates.length === 0) return Promise.resolve();
-		return this.serial(() => this.db.tx([STORE.outbox], "readwrite", async (tx) => {
+		return this.serial("tSent", () => this.db.tx([STORE.outbox], "readwrite", async (tx) => {
 			for (const u of updates) {
 				const r = await tx.get(STORE.outbox, u.clientFrameId);
 				if (!r || (r.state !== "pending" && r.state !== "sent")) continue;
@@ -308,7 +318,7 @@ export class Repo {
 	// -------------------------------------------------------------------------
 
 	tLive(items: readonly LiveItem[], nowMs: number, day: string): Promise<LiveResult> {
-		return this.serial(async () => {
+		return this.serial("tLive", async () => {
 			const seqs = items.map((i) => (i.t === "row" ? i.row.seq : i.t === "quarantine" ? i.rec.seq : i.seq));
 			const vAfter = this.cursor.preview(seqs);
 			const self = this.deviceId;
@@ -420,7 +430,7 @@ export class Repo {
 	// -------------------------------------------------------------------------
 
 	tFeedPage(entries: readonly { readonly stream: StreamName; readonly lastSeq: Seq }[], throughSeq: Seq, headSeq: Seq, nowMs: number): Promise<{ vaultSeq: Seq; changed: StreamRecord[] }> {
-		return this.serial(async () => {
+		return this.serial("tFeedPage", async () => {
 			const vAfter = this.cursor.preview([], throughSeq);
 			const changed: Mut<StreamRecord>[] = [];
 			const v = await this.db.tx([STORE.streams, STORE.meta], "readwrite", async (tx) => {
@@ -451,7 +461,7 @@ export class Repo {
 	// -------------------------------------------------------------------------
 
 	tReadPage(input: ReadPageInput, nowMs: number): Promise<{ stream: StreamRecord; removed: OutboxRecord[]; updated: OutboxRecord[]; tailPut: TailRecord[] }> {
-		return this.serial(async () => {
+		return this.serial("tReadPage", async () => {
 			const self = this.deviceId;
 			const removed: OutboxRecord[] = [];
 			const updated: OutboxRecord[] = [];
@@ -521,7 +531,7 @@ export class Repo {
 
 	/** null = CAS failed (snapshotCoversSeq moved). */
 	tSnapshot(input: SnapshotInput): Promise<StreamRecord | null> {
-		return this.serial(async () => {
+		return this.serial("tSnapshot", async () => {
 			const out = await this.db.tx([STORE.snapshots, STORE.tail, STORE.streams], "readwrite", async (tx) => {
 				const cur = await tx.get(STORE.streams, input.stream);
 				if (!cur || cur.snapshotCoversSeq !== input.expectSnapshotCoversSeq) return null;
@@ -558,7 +568,7 @@ export class Repo {
 	// -------------------------------------------------------------------------
 
 	tOutbox(changes: readonly OutboxChange[]): Promise<{ removed: OutboxRecord[]; updated: OutboxRecord[] }> {
-		return this.serial(async () => {
+		return this.serial("tOutbox", async () => {
 			const removed: OutboxRecord[] = [];
 			const updated: OutboxRecord[] = [];
 			await this.db.tx([STORE.outbox], "readwrite", async (tx) => {
@@ -600,7 +610,7 @@ export class Repo {
 
 	tPatchStreams(patches: readonly { readonly stream: StreamName; readonly patch: (r: Mut<StreamRecord>) => void }[], nowMs: number): Promise<StreamRecord[]> {
 		if (patches.length === 0) return Promise.resolve([]);
-		return this.serial(async () => {
+		return this.serial("tPatchStreams", async () => {
 			const out = await this.db.tx([STORE.streams], "readwrite", async (tx) => {
 				const res = new Map<StreamName, Mut<StreamRecord>>();
 				for (const p of patches) {
@@ -619,7 +629,7 @@ export class Repo {
 
 	/** releaseQuarantine (DESIGN §d.6): rows that pass go to tail; the rest are marked dismissed; the doc unfreezes. */
 	tReleaseQuarantine(stream: StreamName, pass: readonly TailRecord[], dismiss: readonly QuarantineRecord[], nowMs: number): Promise<StreamRecord> {
-		return this.serial(async () => {
+		return this.serial("tReleaseQuarantine", async () => {
 			const out = await this.db.tx([STORE.quarantine, STORE.tail, STORE.streams], "readwrite", async (tx) => {
 				const r: Mut<StreamRecord> = { ...((await tx.get(STORE.streams, stream)) ?? newStreamRecord(stream, nowMs)) };
 				for (const row of pass) {
@@ -642,7 +652,7 @@ export class Repo {
 
 	/** Recovery (DESIGN §i.5): import mirrored outbox frames (sent -> pending), outboxOrder.next = max + 1. */
 	tImportOutbox(records: readonly OutboxRecord[]): Promise<void> {
-		return this.serial(async () => {
+		return this.serial("tImportOutbox", async () => {
 			const next = await this.db.tx([STORE.outbox, STORE.meta], "readwrite", async (tx) => {
 				let max = 0;
 				for (const r of records) {
@@ -662,7 +672,7 @@ export class Repo {
 
 	/** Delete every record of a stream (retired checkpoint ok, or prune without duty). */
 	tDropStream(stream: StreamName): Promise<void> {
-		return this.serial(async () => {
+		return this.serial("tDropStream", async () => {
 			await this.db.tx([STORE.streams, STORE.snapshots, STORE.tail, STORE.quarantine], "readwrite", async (tx) => {
 				tx.delete(STORE.streams, stream);
 				tx.delete(STORE.snapshots, stream);
@@ -675,7 +685,7 @@ export class Repo {
 
 	/** Wait for every queued write. */
 	drain(): Promise<void> {
-		return this.serial(async () => undefined);
+		return this.serial("drain", async () => undefined);
 	}
 
 	close(): void {

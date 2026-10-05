@@ -12,7 +12,7 @@
 
 import * as Y from "yjs";
 import { EnvelopeFlag } from "../../core/envelope";
-import { NS_STREAM, docStream, kindOfPath, streamClass, type ContentHash, type DocId, type DocKind, type NsOp, type StreamName, type VaultPath } from "../../core/types";
+import { NS_STREAM, docStream, kindOfPath, streamClass, type ContentHash, type DocId, type DocKind, type NsOp, type StreamName, type VaultEpoch, type VaultPath } from "../../core/types";
 import type { DiagnosticsEvent, StatusSnapshot } from "../../protocol/status";
 import type { RelaySession } from "../../ports/relay";
 import { buildBodyFrames, buildNsFrame, initialTextUpdates } from "../body/frames";
@@ -63,16 +63,25 @@ export class LogEngine {
 	}
 
 	static async start(opts: EngineOptions): Promise<LogEngine> {
-		const c = new EngineCtx(opts);
-		const { storage, relay } = opts.ports;
 		let first: RelaySession | null = null;
 		let epoch = opts.vaultEpoch;
 		if (!epoch) {
-			const r = await relay.connect({ vaultId: opts.vaultId, deviceId: opts.deviceId });
+			const r = await opts.ports.relay.connect({ vaultId: opts.vaultId, deviceId: opts.deviceId });
 			if (!r.ok) throw new EngineStartError(r.reason);
 			first = r.session;
 			epoch = r.session.vaultEpoch;
 		}
+		try {
+			return await LogEngine.boot(opts, epoch, first);
+		} catch (e) {
+			first?.close(1000, "start failed");
+			throw e;
+		}
+	}
+
+	private static async boot(opts: EngineOptions, epoch: VaultEpoch, first: RelaySession | null): Promise<LogEngine> {
+		const c = new EngineCtx(opts);
+		const { storage } = opts.ports;
 		const ident = { vaultId: opts.vaultId, vaultEpoch: epoch, deviceId: opts.deviceId, clientVersion: opts.clientVersion };
 		let o = await Repo.open(storage, ident, c.now());
 		if (!o.repo) {
