@@ -36,6 +36,8 @@ export function mergeSmallBatch(updates: readonly Uint8Array[]): Uint8Array {
 export const ORIGIN = {
 	MAIN: Symbol("yaos.main"),
 	REMOTE: Symbol("yaos.remote"),
+	/** Another device's provisional frame applied to a bound doc (DESIGN §d.5). */
+	PROVISIONAL: Symbol("yaos.provisional"),
 	MERGE: Symbol("yaos.merge"),
 	LOAD: Symbol("yaos.load"),
 	/** Initial content of a new doc (frames are built explicitly, not by the builder). */

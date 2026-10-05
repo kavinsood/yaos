@@ -122,7 +122,9 @@ export interface SnapshotInput {
 export type OutboxChange =
 	| { readonly t: "release"; readonly clientFrameId: ClientFrameId }
 	| { readonly t: "delete"; readonly clientFrameId: ClientFrameId }
-	| { readonly t: "state"; readonly clientFrameId: ClientFrameId; readonly state: OutboxState };
+	| { readonly t: "state"; readonly clientFrameId: ClientFrameId; readonly state: OutboxState }
+	/** held only: wait for another frame instead (a ref whose own x: chunks remain). */
+	| { readonly t: "repoint"; readonly clientFrameId: ClientFrameId; readonly dependsOn: ClientFrameId };
 
 export class Repo {
 	readonly cursor: CursorTracker;
@@ -570,6 +572,11 @@ export class Repo {
 					} else if (c.t === "release") {
 						if (r.state !== "held") continue;
 						const n: OutboxRecord = { ...r, state: "pending", dependsOn: null };
+						tx.put(STORE.outbox, n);
+						updated.push(n);
+					} else if (c.t === "repoint") {
+						if (r.state !== "held" || r.dependsOn === c.dependsOn) continue;
+						const n: OutboxRecord = { ...r, dependsOn: c.dependsOn };
 						tx.put(STORE.outbox, n);
 						updated.push(n);
 					} else {
