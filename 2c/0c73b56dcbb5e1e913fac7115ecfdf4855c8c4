@@ -1,0 +1,19 @@
+src/engine/sync/cursor.ts
+  s_808e98640ec653::t_b55fcf7c821ef3 1-83
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "2c0c73b56dcbb5e1e913fac7115ecfdf4855c8c4",
+  "prompts": {},
+  "sessions": {
+    "s_808e98640ec653": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a6d246dbda3daef6a",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
