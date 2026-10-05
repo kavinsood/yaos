@@ -83,6 +83,8 @@ export interface EngineOptions {
 	readonly autoReconnect?: boolean;
 	/** Updates applied to a bound doc that the host did not author. */
 	onDocUpdate?(docId: DocId, update: Uint8Array, origin: DocUpdateOrigin): void;
+	/** A doc stream was frozen (DESIGN §d.6; protocol docRetarget{frozen}): the host unbinds and re-opens read-only. */
+	onDocFrozen?(docId: DocId, reason: string): void;
 	onStatus?(status: StatusSnapshot): void;
 	onDiag?(event: DiagnosticsEvent): void;
 }

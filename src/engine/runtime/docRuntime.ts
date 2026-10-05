@@ -110,8 +110,14 @@ export class DocRuntime {
 				c.ckpt.lastActivity.set(h.stream, c.mono());
 				this.stats.framesClosed++;
 			} catch (e) {
-				if (e instanceof FrameTooLargeError) await c.freeze(h.stream, "oversize-local");
-				else c.diag("frame-close-failed", { error: String(e) });
+				if (e instanceof FrameTooLargeError) {
+					// The update (and keystrokes typed on top of it) can never be sent: discard them and drop the
+					// replica so it reloads from durable state; later frames never depend on unsent structs.
+					// The disk file still holds the text (DESIGN §b.6); the host re-binds read-only on onDocFrozen.
+					h.builder.take();
+					await c.freeze(h.stream, "oversize-local");
+					c.handles.drop(h.stream);
+				} else c.diag("frame-close-failed", { error: String(e) });
 			} finally {
 				c.handles.unpin(h);
 			}

@@ -6,7 +6,7 @@
  */
 
 import type { Budgets, DeviceClass } from "../../core/limits";
-import type { ClientFrameId, DeviceId, StreamName } from "../../core/types";
+import { streamDocId, type ClientFrameId, type DeviceId, type StreamName } from "../../core/types";
 import type { EnginePorts } from "../../ports";
 import type { TimerHandle } from "../../ports/clock";
 import type { RelaySession } from "../../ports/relay";
@@ -241,6 +241,8 @@ export class EngineCtx {
 		} }], this.now());
 		this.diag("doc-frozen", { reason, cls: rec?.cls ?? null });
 		this.notice(`frozen:${reason}`);
+		const docId = streamDocId(stream);
+		if (docId) this.opts.onDocFrozen?.(docId, reason);
 	}
 
 	/** Open-frame timer multiplier: x4 beyond the daily soft frame budget (DESIGN §i.6). */
