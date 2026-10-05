@@ -6,6 +6,7 @@
 import * as Y from "yjs";
 import type { DeviceClass } from "../../core/limits";
 import { MERGE_MAX_EDITS_PER_SIDE, MERGE_MAX_INPUT_CHARS } from "../../core/limits";
+import { minimalDiff } from "../../core/merge/minimalDiff";
 import type { DiskFingerprint, DocId, MergeFn, MergeLimits } from "../../core/types";
 import type { StatusSnapshot } from "../../protocol/status";
 
@@ -15,7 +16,7 @@ export const LOAD = Symbol("standin-load");
 
 export const STANDIN_MERGE_LIMITS: MergeLimits = { maxInputChars: MERGE_MAX_INPUT_CHARS, maxEditsPerSide: MERGE_MAX_EDITS_PER_SIDE };
 
-/** Conservative merge (same as host/__standins__/merge.ts): two-sided edits conflict. */
+/** Conservative merge: two-sided edits conflict (the real engine runs core merge). */
 export const conservativeMerge: MergeFn = ({ base, disk, crdt, limits }) => {
 	if (disk === crdt) return { kind: "identical" };
 	if (base === null) return { kind: "conflict", text: crdt, conflictCopy: disk, reason: "no-base" };
@@ -25,24 +26,20 @@ export const conservativeMerge: MergeFn = ({ base, disk, crdt, limits }) => {
 	return { kind: "conflict", text: crdt, conflictCopy: disk, reason: "both-edited" };
 };
 
-/** Replace `from` with `to` in ytext as one prefix/suffix-trimmed hunk. */
+/** Apply core minimalDiff(current -> to) to ytext in one transaction (end to start, offsets stay valid). */
 export function applyTextDiff(ytext: Y.Text, to: string, origin: unknown): boolean {
 	const from = ytext.toString();
 	if (from === to) return false;
-	let start = 0;
-	const max = Math.min(from.length, to.length);
-	while (start < max && from.charCodeAt(start) === to.charCodeAt(start)) start++;
-	let ef = from.length;
-	let et = to.length;
-	while (ef > start && et > start && from.charCodeAt(ef - 1) === to.charCodeAt(et - 1)) {
-		ef--;
-		et--;
-	}
+	const edits = minimalDiff(from, to);
 	const doc = ytext.doc;
 	if (!doc) throw new Error("ytext without doc");
 	doc.transact(() => {
-		if (ef > start) ytext.delete(start, ef - start);
-		if (et > start) ytext.insert(start, to.slice(start, et));
+		for (let i = edits.length - 1; i >= 0; i--) {
+			const e = edits[i];
+			if (!e) continue;
+			if (e.end > e.start) ytext.delete(e.start, e.end - e.start);
+			if (e.text.length > 0) ytext.insert(e.start, e.text);
+		}
 	}, origin);
 	return true;
 }
