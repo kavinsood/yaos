@@ -79,6 +79,8 @@ export interface WsRelayOptions {
 	readonly provisionalCacheEntries?: number;
 	/** A listener threw. Default: rethrow asynchronously (queueMicrotask) so the frame loop keeps going. */
 	readonly onListenerError?: (error: unknown) => void;
+	/** Overrides VAULT_READY.liveness (power tuning, e2e). */
+	readonly liveness?: { readonly idleMs?: number; readonly timeoutMs?: number };
 }
 
 export const DEFAULT_RELAY_LIMITS: RelayLimits = {
@@ -208,6 +210,7 @@ interface SessionInit {
 	readonly ready: Extract<WireControl, { type: "VAULT_READY" }>;
 	readonly join: ProvisionalJoin;
 	readonly onListenerError: (error: unknown) => void;
+	readonly liveness: { readonly idleMs?: number; readonly timeoutMs?: number } | undefined;
 }
 
 class WsRelaySession implements RelaySession {
@@ -247,8 +250,8 @@ class WsRelaySession implements RelaySession {
 		this.headSeq = init.ready.head;
 		this.canWrite = init.ready.canWrite;
 		this.limits = mapLimits(init.ready.limits);
-		this.idleMs = init.ready.liveness?.idleMs ?? DEFAULT_LIVENESS.idleMs;
-		this.timeoutMs = init.ready.liveness?.timeoutMs ?? DEFAULT_LIVENESS.timeoutMs;
+		this.idleMs = init.liveness?.idleMs ?? init.ready.liveness?.idleMs ?? DEFAULT_LIVENESS.idleMs;
+		this.timeoutMs = init.liveness?.timeoutMs ?? init.ready.liveness?.timeoutMs ?? DEFAULT_LIVENESS.timeoutMs;
 		this.lastRx = this.clock.monotonic();
 
 		this.ws.onmessage = (ev) => this.onMessage(ev.data);
@@ -567,6 +570,7 @@ export function createWsRelayPort(opts: WsRelayOptions): RelayPort {
 					ready: control,
 					join: new ProvisionalJoin(cacheBytes, cacheEntries),
 					onListenerError,
+					liveness: opts.liveness,
 				});
 				settle({ ok: true, session });
 			};

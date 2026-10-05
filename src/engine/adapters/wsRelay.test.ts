@@ -473,6 +473,15 @@ describe("wsRelay liveness", () => {
 		assert.equal(pings(socket).length, 2, "next ping after another idle window");
 	});
 
+	it("opts.liveness overrides VAULT_READY.liveness", async () => {
+		const { socket, session, clock } = await open({ liveness: { idleMs: 100, timeoutMs: 50 } });
+		const events = collect(session);
+		clock.advance(100);
+		assert.equal(pings(socket).length, 1);
+		clock.advance(50);
+		assert.deepEqual(events, [{ t: "closed", code: LIVENESS_CLOSE_CODE, errorCode: "liveness_timeout", wasClean: false }]);
+	});
+
 	it("traffic postpones the ping", async () => {
 		const { socket, clock } = await open();
 		clock.advance(30_000);
