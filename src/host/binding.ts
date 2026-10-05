@@ -18,6 +18,14 @@
  * new state is applied in place and bindDelta = encodeStateAsUpdate(replica,
  * new stateVector) carries every edit the new engine lacks, so a worker
  * killed mid-typing loses nothing and the editor is never detached.
+ *
+ * External reloads (OR-2): Obsidian's setData assigns view.data = incoming
+ * BEFORE it calls setViewData, and save() writes the editor whatever
+ * view.data holds (Android spike A/C). So inside the interceptor view.data is
+ * not a merge base, and "handled" must always leave the merge in the editor.
+ * The base is tracked per replica instead (Replica.diskText: the last disk
+ * text the replica has absorbed), updated only from disk-verified reads and
+ * from reloads it merged; see reloadBase() and checkSaved().
  */
 
 import * as Y from "yjs";
@@ -26,12 +34,13 @@ import { kindOfPath } from "../core/types";
 import { FORBIDDEN_PATH_CHARS, MAIN_UPDATE_COALESCE_MS } from "../core/limits";
 import type { ClockPort, TimerHandle } from "../ports/clock";
 import type { Unsubscribe } from "../ports/common";
-import type { VaultEvent, VaultPort } from "../ports/vault";
+import type { VaultEvent, VaultPort, VaultStat } from "../ports/vault";
 import type { EditorViewRef, ViewEvent, WorkspacePort } from "../ports/workspace";
 import type { BindInfo, EngineResultValue, MainToEngine } from "../protocol/messages";
 import type { Hasher } from "./hashing";
 import { utf8 } from "./hashing";
-import { DEFAULT_MERGE_LIMITS, merge, minimalDiff } from "./__standins__/merge";
+import { DEFAULT_MERGE_LIMITS, merge } from "../core/merge/merge";
+import { minimalDiff } from "../core/merge/minimalDiff";
 
 export const REMOTE_IN: unique symbol = Symbol("yaos.remote-in");
 export const BIND_LOCAL: unique symbol = Symbol("yaos.bind-local");
@@ -39,6 +48,8 @@ export const MAIN_MERGE: unique symbol = Symbol("yaos.main-merge");
 export const MAIN_EDITOR: unique symbol = Symbol("yaos.main-editor");
 
 const BOUND_SAVED_DEBOUNCE_MS = 50;
+/** checkSaved retry after a disk read error. */
+const CHECK_SAVED_RETRY_MS = 1_000;
 /** Backoff for conflict-copy writes that hit an I/O error (the last value repeats). */
 export const CONFLICT_COPY_RETRY_MS: readonly number[] = [250, 1_000, 2_000, 5_000, 10_000, 30_000];
 
@@ -71,6 +82,16 @@ class Replica {
 	suspended = false;
 	/** Last text reported through boundSaved (starts at the engine's synced base). */
 	lastReported: string | null = null;
+	/**
+	 * Merge base for external reloads: the last disk text this replica has absorbed (its content is
+	 * in the replica, or was preserved in a conflict copy). Set at replica creation from view.data
+	 * (outside setViewData, where it is what Obsidian loaded/saved), by every reload merged, and by
+	 * checkSaved from a disk read that matches something the replica already holds.
+	 */
+	diskText = "";
+	/** checkSaved runs serialized per replica (posts never reorder); at most one queued. */
+	checkChain: Promise<void> = Promise.resolve();
+	checkQueued = false;
 	constructor(readonly docId: DocId) {}
 }
 
@@ -273,11 +294,7 @@ export class BindingManager {
 		for (const rep of this.replicas.values()) {
 			const first = [...rep.slots][0];
 			if (!first || first.view.path === null || !this.samePath(first.view.path, path)) continue;
-			if (rep.savedTimer !== null) this.deps.clock.clearTimer(rep.savedTimer);
-			rep.savedTimer = this.deps.clock.setTimer(BOUND_SAVED_DEBOUNCE_MS, () => {
-				rep.savedTimer = null;
-				void this.checkSaved(rep);
-			});
+			this.scheduleCheckSaved(rep, BOUND_SAVED_DEBOUNCE_MS);
 		}
 	}
 
@@ -367,6 +384,7 @@ export class BindingManager {
 		if (!rep) {
 			rep = this.createReplica(info.docId);
 			rep.lastReported = info.baseText;
+			rep.diskText = view.getLastSavedText();
 		}
 		Y.applyUpdate(rep.doc, info.state, REMOTE_IN);
 		const editorText = view.getText();
@@ -500,27 +518,51 @@ export class BindingManager {
 
 	// --- internals: external reload + saves -----------------------------------
 
+	/**
+	 * Obsidian is reloading a bound view with `incoming` (the file's current text). view.data of THIS
+	 * view already equals `incoming` here, so the base comes from reloadBase(). The merge goes into the
+	 * replica (MAIN_MERGE), and so into every bound editor, synchronously: returning "handled" with the
+	 * editor unchanged would let the next save write the old editor text over the external edit.
+	 * Saves run after setData has returned, so view.data, the editor and the disk end equal.
+	 */
 	private onExternalReload(slot: ViewSlot, incoming: string): "handled" | "default" {
 		const rep = slot.rep;
 		if (!rep || slot.state !== "bound") return "default";
-		const base = slot.view.getLastSavedText();
+		const base = this.reloadBase(rep, slot, incoming);
 		const crdt = rep.ytext.toString();
-		if (incoming === base && incoming !== crdt) return "handled"; // nothing external; editor keeps its unsaved edits
 		const r = merge({ base, disk: incoming, crdt, limits: DEFAULT_MERGE_LIMITS });
 		if (r.kind === "disk-only" || r.kind === "clean" || r.kind === "conflict") applyTextDiff(rep.ytext, crdt, r.text, MAIN_MERGE);
+		rep.diskText = incoming; // absorbed: merged into the replica, or kept by the conflict copy below
 		const copy = r.kind === "conflict" ? r.conflictCopy : null;
+		const report = r.kind === "disk-only" || r.kind === "clean" || r.kind === "conflict" || (r.kind === "identical" && incoming !== base);
 		const path = slot.view.path ?? "";
 		void (async () => {
+			await Promise.resolve(); // never call save() from inside Obsidian's setData
 			if (copy !== null) await this.writeConflictCopy(path, copy);
-			if (r.kind !== "crdt-only" && !(r.kind === "identical" && incoming === base)) {
+			if (report) {
 				this.stats.externalMerges++;
-				this.deps.link.post({ t: "boundExternalMerged", docId: rep.docId, result: r.kind, conflictReason: r.kind === "conflict" ? r.reason : null });
+				this.deps.link.post({ t: "boundExternalMerged", docId: rep.docId, result: r.kind as "identical" | "disk-only" | "clean" | "conflict", conflictReason: r.kind === "conflict" ? r.reason : null });
 			}
-			// Make disk and view.data match the merged buffer (next merge uses it as base).
-			for (const s of [...rep.slots]) await s.view.save();
+			if (this.replicas.get(rep.docId) !== rep) return;
+			for (const s of [...rep.slots]) {
+				if (s.view.getText() !== s.view.getLastSavedText()) await s.view.save();
+			}
 			await this.checkSaved(rep);
 		})();
 		return "handled";
+	}
+
+	/**
+	 * Base for merging a reload of `slot`. If a sibling bound view of the same doc already holds
+	 * `incoming` as its view.data, the replica has absorbed it (that sibling saved it from the shared
+	 * replica, or already took this same reload), so the reload is not external: base = incoming.
+	 * Otherwise the replica's last absorbed disk text. Never this view's own view.data (pre-assigned).
+	 * A base that is stale (an ancestor of the true one, e.g. a reload racing checkSaved right after
+	 * our own save) can only turn a clean merge into a spurious conflict copy; it never drops text.
+	 */
+	private reloadBase(rep: Replica, slot: ViewSlot, incoming: string): string {
+		for (const s of rep.slots) if (s !== slot && s.view.getLastSavedText() === incoming) return incoming;
+		return rep.diskText;
 	}
 
 	/**
@@ -581,17 +623,59 @@ export class BindingManager {
 		return "give-up"; // every candidate name is taken
 	}
 
-	private async checkSaved(rep: Replica): Promise<void> {
-		const slot = [...rep.slots][0];
-		if (!slot || slot.view.path === null) return;
-		const text = slot.view.getLastSavedText();
+	/** Serialized per replica; a request while one is queued joins it (the queued run reads the disk later). */
+	private checkSaved(rep: Replica): Promise<void> {
+		if (rep.checkQueued) return rep.checkChain;
+		rep.checkQueued = true;
+		rep.checkChain = rep.checkChain.then(async () => {
+			rep.checkQueued = false;
+			await this.checkSavedNow(rep);
+		}).catch(() => undefined);
+		return rep.checkChain;
+	}
+
+	/**
+	 * Report a save of a bound file as boundSaved (the engine's new synced base). Disk-verified: stat,
+	 * read, stat (unchanged in between), and only a disk text the replica has absorbed (its last disk
+	 * text, its current text, or some bound view's view.data, read here outside setViewData) is
+	 * reported, with its own stat and fingerprint, and becomes the reload base. Anything else on disk is
+	 * an external write whose reload is still pending: the interceptor merges it, and reporting it here
+	 * would make unmerged text the engine's base.
+	 */
+	private async checkSavedNow(rep: Replica): Promise<void> {
+		const first = [...rep.slots][0];
+		if (!first || first.view.path === null) return;
+		const path = first.view.path;
+		let text: string;
+		let stat: VaultStat | null;
+		try {
+			const before = await this.deps.vault.stat(path);
+			if (!before) return;
+			text = await this.deps.vault.readText(path);
+			stat = await this.deps.vault.stat(path);
+			// Changed while reading: the write's own vault event schedules another check.
+			if (!stat || stat.size !== before.size || stat.mtimeMs !== before.mtimeMs) return;
+		} catch {
+			this.scheduleCheckSaved(rep, CHECK_SAVED_RETRY_MS);
+			return;
+		}
+		if (this.replicas.get(rep.docId) !== rep) return;
+		const absorbed = text === rep.diskText || text === rep.ytext.toString() || [...rep.slots].some((s) => s.view.getLastSavedText() === text);
+		if (!absorbed) return;
+		rep.diskText = text;
 		if (text === rep.lastReported) return;
-		rep.lastReported = text;
-		const path = slot.view.path;
-		const stat = await this.deps.vault.stat(path);
-		if (!stat) return;
 		const fingerprint = await this.deps.hasher.fingerprint(utf8(text));
+		if (this.replicas.get(rep.docId) !== rep) return;
+		rep.lastReported = text;
 		this.stats.boundSavedPosted++;
 		this.deps.link.post({ t: "boundSaved", docId: rep.docId, path, text, fingerprint, stat });
+	}
+
+	private scheduleCheckSaved(rep: Replica, delayMs: number): void {
+		if (rep.savedTimer !== null) this.deps.clock.clearTimer(rep.savedTimer);
+		rep.savedTimer = this.deps.clock.setTimer(delayMs, () => {
+			rep.savedTimer = null;
+			if (this.replicas.get(rep.docId) === rep) void this.checkSaved(rep);
+		});
 	}
 }
