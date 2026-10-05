@@ -1,0 +1,55 @@
+scripts/build-spike.mjs
+  s_40cab75849ffee::t_56c11a32bb6866 1-246
+src/host/spike/idbProbe.ts
+  s_3e0c71be916d35::t_028503cafcc966 1-173
+src/host/spike/main.ts
+  s_3f1e78c1a8c300::t_922d5ad272bea6 1-198
+src/host/spike/probes.test.ts
+  s_40cab75849ffee::t_781cb637f5c5c6 1-200
+src/host/spike/report.test.ts
+  s_40cab75849ffee::t_902db790e94350 1-267
+src/host/spike/report.ts
+  s_40cab75849ffee::t_fa73d695bb6579 1-617
+src/host/spike/resultsModal.ts
+  s_3f1e78c1a8c300::t_54c34f6e3b2427 1-86
+src/host/spike/spikeWorker.ts
+  s_40cab75849ffee::t_f2f245156eae4d 1-38
+src/host/spike/spikeWorkerHandler.ts
+  s_40cab75849ffee::t_33a81f0756c0bf 1-162
+src/host/spike/viewProbe.ts
+  s_40cab75849ffee::t_0133f691282c56 1-601
+src/host/spike/workerProbe.ts
+  s_40cab75849ffee::t_093401253921a0 1-221
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "ea3a756180041596cc8774a929891aa8be084104",
+  "prompts": {},
+  "sessions": {
+    "s_3e0c71be916d35": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a024e58aa7ba38180",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_3f1e78c1a8c300": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a393e5c0d70814322",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_40cab75849ffee": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a0efa7727ce0c852e",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
