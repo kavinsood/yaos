@@ -1,0 +1,19 @@
+docs/client-remake/spike-reports/android-2026-10-06.md
+  s_e6caedb1ffebff::t_c76e13c4a588b9 1-23
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "9b2dcf23150ea22b1ce4e3b13e1576c6645c51a3",
+  "prompts": {},
+  "sessions": {
+    "s_e6caedb1ffebff": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a4f41693fa2dd700a",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
