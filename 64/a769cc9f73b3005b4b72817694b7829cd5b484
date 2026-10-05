@@ -1,0 +1,29 @@
+src/engine/body/sender.ts
+  s_e6caedb1ffebff::t_0d0951cd9a777c 302,310
+src/engine/runtime/hygiene.test.ts
+  s_c67947467526d9::t_916c1ff8d26a56 1-80
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "64a769cc9f73b3005b4b72817694b7829cd5b484",
+  "prompts": {},
+  "sessions": {
+    "s_c67947467526d9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ac48f9ed9af2beea7",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_e6caedb1ffebff": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a4f41693fa2dd700a",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
