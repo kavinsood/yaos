@@ -1,0 +1,19 @@
+src/engine/__standins__/docs.ts
+  s_1a35cb80c7073a::t_2de8d81d70db97 9,19,29,33,37-42
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "71104698b4da799c58c27236aa3ab34cf6365eba",
+  "prompts": {},
+  "sessions": {
+    "s_1a35cb80c7073a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a89afd77513d78071",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
