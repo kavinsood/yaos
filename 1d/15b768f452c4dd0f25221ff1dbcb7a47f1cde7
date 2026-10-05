@@ -1,0 +1,21 @@
+src/sim/vault.ts
+  s_3e0c71be916d35::t_ac98ff9bd0ae42 34-35,238-244
+src/sim/workspace.ts
+  s_3e0c71be916d35::t_8fd2a23d63cf2c 1-361
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "1d15b768f452c4dd0f25221ff1dbcb7a47f1cde7",
+  "prompts": {},
+  "sessions": {
+    "s_3e0c71be916d35": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a024e58aa7ba38180",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
