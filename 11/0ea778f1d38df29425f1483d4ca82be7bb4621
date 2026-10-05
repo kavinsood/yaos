@@ -1,0 +1,31 @@
+e2e/conformance/lib/codec.ts
+  s_355da1e4743c56::t_5ec46e408a84ed 1-119
+e2e/conformance/lib/context.ts
+  s_355da1e4743c56::t_839ad5ba2484ed 1-48
+e2e/conformance/lib/fixture.ts
+  s_355da1e4743c56::t_498523b76b630f 1-127
+e2e/conformance/lib/http.ts
+  s_355da1e4743c56::t_8d3f0a61b3fc28 1-42
+e2e/conformance/lib/results.ts
+  s_355da1e4743c56::t_48153d47ef08dc 1-92
+e2e/conformance/lib/socket.ts
+  s_355da1e4743c56::t_14252f8fa494e4 1-212
+e2e/conformance/lib/util.ts
+  s_355da1e4743c56::t_62eb85cc9b5907 1-62
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "110ea778f1d38df29425f1483d4ca82be7bb4621",
+  "prompts": {},
+  "sessions": {
+    "s_355da1e4743c56": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ac9ef885397678b86",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
