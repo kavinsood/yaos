@@ -359,7 +359,7 @@ export interface LocalEntry {
 	/** null = stat changed since last hash, content unknown. */
 	readonly hash: ContentHash | null;
 	readonly fingerprint: DiskFingerprint | null;
-	/** Monotonic-clock time the hash was taken (racy-git check). */
+	/** ClockPort.now() (wall clock, comparable with mtimes) when the hash was taken: racy-git check. */
 	readonly hashedAtMs: number;
 	/** Matches an exclude rule or is not portable: never planned as create/delete. */
 	readonly excluded: boolean;

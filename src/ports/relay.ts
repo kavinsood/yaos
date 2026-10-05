@@ -1,21 +1,29 @@
 /**
  * RelayPort: the opaque ordered mailbox. DESIGN §b, §h, §i.6.
  *
- * Contract assumptions this client depends on (to reconcile with
- * docs/client-remake/relay-wire.md when it lands):
+ * Contract assumptions this client depends on (checked against
+ * server/src/streams/{protocol,relay}.ts; relay-wire.md is authoritative):
  *  R1 Every committed frame gets a vault-wide seq within vaultEpoch.
  *  R2 After subscribe() returns headSeq H, the session delivers every committed
- *     frame with seq > H from OTHER devices, in seq order, without gaps, until
- *     the session closes. Own frames are either echoed in the same order
- *     (payload may be elided) or only receipted; the client handles both.
- *  R3 Frames appended on one session are committed in send order; a refused
- *     frame fences the session (later frames on it are dropped, not committed).
+ *     frame with seq > H appended by OTHER sessions, in seq order, without gaps,
+ *     until it closes. Frames appended on this session are never echoed; their
+ *     outcome is a receipt. (Other sessions of the same device see them as
+ *     ordinary committed frames.)
+ *  R3 Frames appended on one session are committed in send order. A per-frame
+ *     rejection does NOT fence later frames; a close (1009/1013/4403) drops
+ *     every unreceipted frame. The client never relies on fencing: ns ops are
+ *     intents re-derived by the planner, body updates tolerate causal holes.
  *  R4 append is idempotent by (deviceId, clientFrameId): a resend returns the
- *     original seq with deduped = true.
+ *     original seq with deduped = true; the same id with different bytes is
+ *     refused ("frame-id-conflict").
  *  R5 read() returns the latest checkpoint (if its coversSeq > afterSeq) plus
  *     every row of the stream with seq > max(afterSeq, checkpoint.coversSeq).
  *  R6 putCheckpoint is a CAS on the stream's current checkpoint coversSeq.
- */
+ *  R7 b:/c: frames are broadcast PROVISIONAL (no seq) before the commit, then
+ *     a COMMIT_NOTICE (seq, no payload) to sockets holding the provisional.
+ *     The adapter joins them into "committed"; a failed commit yields
+ *     "provisionalDropped".
+  */
 
 import type { Unsubscribe } from "./common";
 import type { ClientFrameId, DeviceId, Seq, StreamName, VaultEpoch, VaultId } from "../core/types";
@@ -44,8 +52,6 @@ export interface AppendFrame {
 	readonly clientFrameId: ClientFrameId;
 	/** Sealed envelope bytes. */
 	readonly payload: Uint8Array;
-	/** Ask the relay for an early provisional broadcast (b:/c: only). */
-	readonly provisional: boolean;
 }
 
 export interface CommittedFrame {
@@ -53,7 +59,11 @@ export interface CommittedFrame {
 	readonly seq: Seq;
 	readonly deviceId: DeviceId;
 	readonly clientFrameId: ClientFrameId;
-	/** null only for own frames when the relay elides the echo payload. */
+	/**
+	 * null only when the relay sent a COMMIT_NOTICE and the adapter no longer
+	 * holds the matching PROVISIONAL payload; the engine then fetches the row
+	 * with read(stream, seq - 1).
+	 */
 	readonly payload: Uint8Array | null;
 }
 
@@ -85,20 +95,38 @@ export type PutCheckpointResult =
 	| { readonly t: "ok" }
 	| { readonly t: "conflict"; readonly currentCoversSeq: Seq };
 
-export type RefusalReason = "oversize" | "rate" | "invalid" | "quota" | "forbidden";
+export type RefusalReason =
+	| "oversize"
+	| "rate"
+	| "invalid"
+	| "forbidden"
+	/** Free-plan daily row limit latched; resend after resetAtMs. */
+	| "daily-limit"
+	/** Commit failed server-side; nothing was written; resend. */
+	| "durability"
+	/** Same clientFrameId already committed with different bytes (seq given). */
+	| "frame-id-conflict";
 
 export type RelayEvent =
 	| { readonly t: "receipt"; readonly stream: StreamName; readonly clientFrameId: ClientFrameId; readonly seq: Seq; readonly deduped: boolean }
 	| { readonly t: "committed"; readonly frame: CommittedFrame }
 	| { readonly t: "provisional"; readonly stream: StreamName; readonly deviceId: DeviceId; readonly clientFrameId: ClientFrameId; readonly payload: Uint8Array }
-	/** Session is fenced after a refusal (R3): reconnect and resend from this frame. */
-	| { readonly t: "refused"; readonly clientFrameId: ClientFrameId; readonly reason: RefusalReason; readonly retryAfterMs: number | null }
+	/** One frame was not committed (R3: later frames are unaffected unless the session closes). */
+	| { readonly t: "refused"; readonly stream: StreamName; readonly clientFrameId: ClientFrameId; readonly reason: RefusalReason; readonly retryAfterMs: number | null; readonly conflictSeq: Seq | null }
+	/** A PROVISIONAL from another device will never commit under that id. */
+	| { readonly t: "provisionalDropped"; readonly stream: StreamName; readonly deviceId: DeviceId; readonly clientFrameId: ClientFrameId }
+	/** Relay restarted and may have lost buffered frames: resend every unreceipted frame (deduped by R4). */
+	| { readonly t: "resendUnreceipted"; readonly headSeq: Seq }
+	/** Relay asks the client to slow down before it closes with 1013. */
+	| { readonly t: "backpressure" }
 	/** Optional heartbeat letting the cursor advance past own-only commits. */
 	| { readonly t: "head"; readonly headSeq: Seq }
 	| { readonly t: "closed"; readonly code: number; readonly reason: string; readonly wasClean: boolean };
 
 export interface RelaySession {
 	readonly vaultEpoch: VaultEpoch;
+	/** false for read-only members: the engine never appends or puts checkpoints. */
+	readonly canWrite: boolean;
 	readonly limits: RelayLimits;
 	subscribe(spec: SubscribeSpec): Promise<{ readonly headSeq: Seq }>;
 	/** Queued and sent in call order. Outcome arrives as receipt/refused/closed events. */
