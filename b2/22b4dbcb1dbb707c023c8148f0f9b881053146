@@ -1,0 +1,25 @@
+src/sim/invariants.ts
+  s_1a35cb80c7073a::t_ed800c67315a00 76
+src/sim/vault.ts
+  s_1a35cb80c7073a::t_19ac4d3c5a2228 18-32,50,62,75-77,102,139,269-274,409-410,412,414,448-449,452,457,468-471
+src/sim/workspace.ts
+  s_1a35cb80c7073a::t_276899c459a580 16-21,39,196-200,293-300,392-394
+src/sim/workspaceContract.test.ts
+  s_1a35cb80c7073a::t_1015f40f8702ba 46,52-55,57-61,277,279,282,284-285,288,290-291
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "b222b4dbcb1dbb707c023c8148f0f9b881053146",
+  "prompts": {},
+  "sessions": {
+    "s_1a35cb80c7073a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a89afd77513d78071",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
