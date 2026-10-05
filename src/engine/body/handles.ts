@@ -58,6 +58,10 @@ export class HandleManager {
 		if (h) h.lastAccessMono = this.hooks.monotonic();
 		return h;
 	}
+	/** Like get() without touching the LRU clock. */
+	peek(stream: StreamName): Handle | undefined {
+		return this.handles.get(stream);
+	}
 	isResident(stream: StreamName): boolean {
 		return this.handles.has(stream);
 	}
@@ -123,6 +127,8 @@ export class HandleManager {
 			}
 			for (const row of tail) {
 				if (row.kind === "bodyUpdate" || row.kind === "canvasUpdate") {
+					// Empty content: an own ref frame recovered from the mirror without its update (gap, see notes).
+					if (row.content.length === 0) continue;
 					Y.applyUpdate(doc, row.content, ORIGIN.LOAD);
 					bytes += row.content.length;
 				} else if (row.kind === "bodyUpdateRef") {
