@@ -1,0 +1,19 @@
+docs/rfc-relay-bodies.md
+  s_9adab62ccde099::t_0f97c2e0f715ec 208-209,765,1658,1771
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "1545b3a2f0658d8deb44ee470956676b1514ef05",
+  "prompts": {},
+  "sessions": {
+    "s_9adab62ccde099": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a698224553da115bf",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
