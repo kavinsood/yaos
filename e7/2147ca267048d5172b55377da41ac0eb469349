@@ -1,0 +1,29 @@
+src/engine/body/sender.test.ts
+  s_e6caedb1ffebff::t_c9d687540f619b 1-301
+src/engine/runtime/relayPolicy.test.ts
+  s_79f99412223799::t_6aa3fef12d55ec 1-82
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "e72147ca267048d5172b55377da41ac0eb469349",
+  "prompts": {},
+  "sessions": {
+    "s_79f99412223799": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ae29bc5b63c902bcd",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_e6caedb1ffebff": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a4f41693fa2dd700a",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
