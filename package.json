@@ -53,7 +53,11 @@
 		"lab:pathology": "node --expose-gc tests/run-typescript.mjs scripts/pathology-lab/run.ts",
 		"lab:pathology:self-test": "node tests/run-typescript.mjs scripts/pathology-lab/self-test.ts",
 		"lab:pathology:typecheck": "tsc -noEmit -p scripts/pathology-lab/tsconfig.json",
-		"clean:src-js-artifacts": "find src -name '*.js' -o -name '*.js.map' | xargs rm -f 2>/dev/null; echo 'cleaned'"
+		"clean:src-js-artifacts": "find src -name '*.js' -o -name '*.js.map' | xargs rm -f 2>/dev/null; echo 'cleaned'",
+		"test:client": "node scripts/client-test.mjs",
+		"typecheck:client": "tsc -noEmit -p tsconfig.json && tsc -noEmit -p tsconfig.client-tests.json",
+		"check:deps": "node scripts/check-deps.mjs",
+		"check:client": "npm run typecheck:client && npm run check:deps && npm run test:client"
 	},
 	"license": "0-BSD",
 	"engines": {
@@ -69,6 +73,7 @@
 		"esbuild": "0.25.5",
 		"eslint": "^9.39.1",
 		"eslint-plugin-obsidianmd": "0.4.1",
+		"fake-indexeddb": "^6.2.5",
 		"globals": "14.0.0",
 		"jiti": "2.6.1",
 		"tslib": "^2.4.0",
