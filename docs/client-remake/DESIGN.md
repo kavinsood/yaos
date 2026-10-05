@@ -594,3 +594,490 @@ changes.
   - The ns fold halts with `coversSeq 9099` and phase `upgrade-required`. Rows ≥ 9100 stay in `tail` until the
     client is upgraded.
   - Bodies keep syncing. No ns ops are emitted and no remote moves or deletes are applied locally.
+
+---
+
+## d. Body engine
+
+The body engine lives in the engine (the worker, or inline). It owns one **worker replica** `Y.Doc` per resident doc.
+The main thread owns a **main replica** only for docs bound to an open editor. Yjs is pure JS, and every doc uses
+`gc: true`.
+
+- **Root types.**
+  - Markdown: exactly one `Y.Text` named `"text"`.
+  - Canvas: see §j.2.
+- **Origins.** Origin tags are module-level symbols:
+  - `MAIN`: updates received from the main replica;
+  - `REMOTE`: committed or provisional rows;
+  - `MERGE`: worker-side merge engine output;
+  - `LOAD`: building a replica from storage.
+
+### d.1 Handle lifecycle and residency
+
+```
+cold ──load──▶ resident ──bind──▶ bound
+  ▲               │  ▲              │
+  └──evict(clean)─┘  └────unbind────┘
+```
+
+- **cold.** Only IDB records exist: `streams`, `snapshots`, `tail`, `outbox`. Rows for cold docs are gated (§d.6
+  stages 1–2) and stored without building a `Y.Doc`.
+- **load** (lane of the requester), in one `Y.transact(doc, …, LOAD)`:
+  1. apply the `snapshot`;
+  2. apply every `tail` row of the stream in seq order, resolving `bodyUpdateRef` rows (§d.6);
+  3. apply the `content` of every own outbox record of the stream (held, pending, sent, adoptable) in `order`.
+  - Poisoned records are skipped.
+  - Cost is O(doc) and happens once per residency, never per edit.
+- **resident.** The replica is in memory, and the frame builder and merge jobs may use it.
+  - Estimated heap: `3 × (snapshot bytes + tail bytes + applied update bytes)`.
+- **bound.** Resident, with a main replica attached (§d.2). A bound doc is pinned and never evicted.
+- **evict.** LRU (`streams.lastAccessMs`) over **clean** handles only. A handle is clean when:
+  - its frame builder is empty (flushed through `T_edit`);
+  - no merge, projection, catch-up or compaction job holds it;
+  - it is not bound.
+  - Eviction just drops the `Y.Doc`. Everything it holds is already in IDB.
+- **Budgets.** `maxResidentDocs` and `maxResidentBytes` per device class (§i.2).
+  - When over budget with no clean handle, new loads wait: lane 3/4 jobs queue, and lane 0/1 loads may exceed the
+    budget by one doc.
+  - `memory-pressure` evicts every clean handle.
+
+### d.2 Main replicas (open notes) vs worker replicas
+
+- **Opening a note.**
+  - The host sends `openDoc{path, viewId}`.
+  - The engine resolves the docId via `remoteByPathKey` (optimistic remote, so own pending creates are bindable), loads
+    the doc, and answers `bind{docId, state, stateVector, baseText, baseHash, frozen}`.
+  - It answers `notBindable` for excluded or untracked paths and for non-markdown files.
+  - When a create is planned later, `bindable{path}` makes the host retry.
+- **Bind-time merge**, on main, before attaching y-codemirror:
+  1. `editorText = view.getText()`, `crdtText = ytext.toString()` on a fresh main `Y.Doc` loaded from `state`.
+  2. If they are equal, bind.
+  3. Otherwise run `MergeFn{base: baseText, disk: editorText, crdt: crdtText}`. This is the ONE merge engine (§f.3),
+     pure, in `src/core/merge`.
+     - Apply the result to the main `Y.Text` as a minimal diff (origin `MAIN`), then `view.applyMinimalReplace(result
+       text)`.
+     - On a conflict the host writes the conflict copy (`write`, precondition `absent`, non-destructive) and reports
+       `boundExternalMerged`. The next reconcile creates the copy as a new doc.
+  4. `view.bind({ytext, localOrigin: MAIN_EDITOR, awareness: null})`.
+  5. Send `bindDelta{Y.encodeStateAsUpdate(mainDoc, stateVector)}`, which is empty unless step 3 changed text.
+- **While bound:**
+  - The editor buffer **is** the Local-tree content of the file, and Obsidian's own save writes it (2 s debounce, or
+    on request via `saveViews`).
+  - The projection never writes a bound file.
+  - `boundSaved{text, fingerprint, stat}` sets the synced base: `baseText` is persisted lazily (`BOUND_BASE_PERSIST_MS`),
+    and `synced` immediately.
+- **External change to a bound file.** Another app or plugin writes it, and Obsidian calls `setViewData(data,
+  false)`.
+  - The per-view interceptor runs `MergeFn{base: view.getLastSavedText(), disk: incoming, crdt: mainYText}` on main.
+  - It applies the result as a minimal diff (origin `MAIN`, sent as `localUpdate{origin: "merge"}`), requests a save,
+    and returns `"handled"`.
+  - If interception is unavailable (risk OR-2), the periodic reconcile catches it: L ≠ S for a bound doc → the engine
+    sends `saveViews` and then plans `reconcileContent`, which merges against the main text.
+- **Unbind** (`closeDoc` or `file-changed`): detach y-codemirror, destroy the main replica, and keep the worker
+  replica resident (clean, LRU).
+- **`docRetarget`** (renamed, merged, deleted, frozen, rebuilding): the host unbinds. For `renamed`, `merged` and
+  `frozen` it re-runs `openDoc` (`frozen` binds read-only with a banner). A deleted doc stays unbound until the next
+  `bindable`.
+
+### d.3 Two-way flow without double apply
+
+```
+editor ─CM tx─▶ main Y.Doc ──update(origin≠REMOTE_IN)──▶ coalesce ≤16 ms ──localUpdate──▶ worker Y.Doc (origin MAIN)
+                     ▲                                                                       │
+                     └────── docUpdate (FIFO per doc, docCredit window) ◀── origin ∈ {REMOTE, MERGE} ┘
+                                                                                             │
+                                                                                 frame builder (origin ∈ {MAIN, MERGE})
+```
+
+- **Main.**
+  - Listens to `doc.on("update")` and forwards only updates whose origin is not `REMOTE_IN`, the origin it uses to
+    apply `docUpdate`.
+  - Coalesces within `MAIN_UPDATE_COALESCE_MS` with `Y.mergeUpdates` over the small batch.
+  - Posts `localUpdate` with the buffer transferred. It never drops one.
+- **Worker.**
+  - Applies `localUpdate` with origin `MAIN`.
+  - The **same bytes** go to the frame builder. Nothing is re-encoded and there is no state-vector diff per keystroke.
+  - Updates with origin `REMOTE` or `MERGE` are forwarded to main as `docUpdate` when the doc is bound, and are never
+    sent back.
+  - `MERGE` updates also go to the frame builder. `REMOTE` updates never do.
+- **Idempotence.** `Y.applyUpdate` is idempotent, so a duplicate (resent row, adopted provisional, rebind) is
+  harmless. Origin filtering only prevents loops and wasted work.
+- **Backpressure.** `docUpdate` is sent within a per-doc credit window (`docUpdateWindowBytes`). Main returns
+  `docCredit{bytes}` after applying.
+  - When the window is exhausted the worker keeps applying to its own replica and queues the forwards.
+  - If the queue exceeds 4× the window, it replaces the queue with one `Y.encodeStateAsUpdate(workerDoc,
+    mainStateVector)` (origin `resync`), using the main state vector learned at bind and updated with every
+    `localUpdate`.
+- **Unbound docs → disk.** A remote change marks the doc `bodyVersion`-dirty. The planner (§f.2) emits
+  `reconcileContent`, which writes the CRDT text with a CAS precondition (`fingerprint = synced.fingerprint`). Disk
+  changes flow back the same way. Echo suppression is in §f.4.
+
+### d.4 Batching into outbox frames
+
+- **One frame builder per stream.** It holds raw update buffers: `MAIN` updates from `localUpdate`, and `MERGE`
+  updates from `doc.on("update")` during a merge job.
+- **Closing.**
+  - **Bound docs:** after `OPEN_FRAME_IDLE_MS` (100 ms) idle or `OPEN_FRAME_MAX_MS` (300 ms) age, or at
+    `FRAME_MAX_UPDATES` / `FRAME_MAX_BYTES`.
+  - **Merge jobs:** close immediately when the job ends.
+  - On `hidden`, `pagehide` or `freeze`: close all builders at once (§i.4).
+  - When the daily soft budget is exceeded, the timers stretch up to 10× (§i.6).
+- **Building a frame:**
+  1. `content = n === 1 ? u[0] : Y.mergeUpdates(u)`. This is O(batch), never O(doc). Large state never goes through
+     `mergeUpdates`.
+  2. If `content` exceeds `MAX_INLINE_UPDATE_BYTES` after deflate, use `bodyUpdateRef` (§b.6). Sources of such an update:
+     a huge paste, or an initial insert with no chunking.
+  3. Envelope: `authorNsSeq = ns.coversSeq` (committed fold), flags `initial` / `fromDisk`, deflate per §b.1. Seal
+     with a fresh `clientFrameId` (`RandomPort`).
+  4. `T_edit`: put the outbox record (`pending`, or `held` with `dependsOn`) and bump `outboxOrder`.
+  5. Hand the record to the sender.
+- **Durability window.** From keystroke to `T_edit` commit is ≤ 16 + 300 ms plus IDB commit time.
+  - During that window the edit is durable only through Obsidian's save of the bound file.
+  - After a crash, startup bind or reconcile finds disk ≠ CRDT and merges the disk text in with base = synced (§f.3).
+  - Alternative: one `T_edit` per localUpdate. Rejected: about 60 IDB transactions per second while typing.
+- **Initial content of a new markdown/canvas doc** (planner `nsCreate` + `reconcileContent`, or the first bind):
+  - inserted in `INITIAL_INSERT_CHUNK_CHARS` transactions, one frame each, flag `initial`;
+  - every initial frame is `held` with `dependsOn` = the ns create frame, and released when that create folds as
+    `applied` / `suffixed`;
+  - if it folds as `merged`, the held frames are deleted, and the doc is rebound to the winner (§c.13);
+  - if it folds as `duplicate-docid`, which cannot happen with fresh random ids, the frames are deleted and the file
+    is re-planned.
+  - Alternative: send body frames before the create commits. Rejected: wasted rows, and junk streams for merged
+    duplicates during onboarding.
+- **Sender.**
+  - Picks `pending` records by lane (§i.1), then by `order`.
+  - Respects all of: the token bucket (`APPEND_BYTES_PER_SEC`, burst ≤ `limits.burstBytes`), `maxInflightAppendBytes`
+    of sent-unreceipted bytes, `session.bufferedBytes()`, and the ns/cfg send window (§c.3).
+  - Record state `sent` is persisted lazily and only for diagnostics. After any restart, `pending` and `sent` are both
+    "maybe sent" and are resent. Correctness relies only on idempotence (R4).
+
+### d.5 Provisional vs committed
+
+- **Provisionals.** `b:`/`c:` frames from other devices arrive first as `provisional`; the adapter joins
+  PROVISIONAL + COMMIT_NOTICE into `committed`.
+  - A provisional is applied **only to bound docs**, and only when `settings.provisionalBroadcast` is on. All other
+    provisionals are ignored, because the committed event brings the payload.
+- **Applying one.**
+  1. Gate stages 1–3 (§d.6).
+  2. Apply with origin `REMOTE` and forward to main.
+  3. `T_adopt` puts an **adoptable** outbox record: a fresh own `clientFrameId`, `adoptOf = {deviceId, clientFrameId,
+     receivedAtMs}`, the content re-sealed under the own AAD, flag `adopted`.
+  - Frames the builder seals for that stream while an adoptable exists are `held` with `dependsOn` = the newest
+    adoptable, so own edits built on provisional structs never reach the log before those structs do.
+- **Settling an adoptable:**
+  - **commit observed** (`committed` with matching `(deviceId, clientFrameId)`, live or in a read page): store the
+    row in `tail`, delete the adoptable without re-applying, and release its dependents (same transaction);
+  - **`provisionalDropped`, or `PROVISIONAL_ADOPT_MS` (60 s) passes without a commit:** the adoptable becomes
+    `pending`, is re-appended, and its receipt settles it like an own frame.
+  - A duplicate (the original also commits later) is harmless (CRDT).
+- **`resendUnreceipted`:**
+  - The adapter has discarded un-noticed provisionals.
+  - Adoptables keep their timers, because the author resends its own frames after the same STREAM_RESEND.
+  - Every own `pending` / `sent` record is resent in `order`, body frames immediately. For ns/cfg, the late-receipt
+    pass runs first (§d.7).
+- **Older-seq notices (R7).** A `committed` or receipt with `seq ≤ streams[stream].appliedSeq` is a **settle**: delete
+  the matching outbox or adoptable record and put the tail row idempotently. Nothing advances.
+- **Never.** Provisionals are never stored in `tail`, never advance a cursor, and never feed a checkpoint.
+
+### d.6 Ingest gate
+
+Everything that changes a replica or the fold passes through one function, `gate(stream, row | checkpoint |
+provisional)`: live commits, read rows, checkpoints, provisionals and resolved refs.
+
+1. **Verify the envelope.**
+   - Parse the header.
+   - `CryptoPort.open` with the binding AAD.
+   - Decode the inner envelope.
+   - Check the kind against `ALLOWED_KINDS[class]`, and the checkpoint coversSeq binding.
+2. **Decode and bound** (no doc needed).
+   - **ns / cfg:** the full op decode (§b.3).
+   - **body / canvas:** `Y.decodeUpdate` (structural). Then all of:
+     - root parent names ⊆ the allowed roots of the class;
+     - content types limited to strings, deletes, `ContentType` (`Y.Text`/`Y.Map` per §j.2), `ContentAny` and
+       `ContentDeleted`, with no subdocs, embeds, formats or binary;
+     - total inserted UTF-16 units ≤ `MAX_DOC_TEXT_CHARS`;
+     - content ≤ `MAX_FRAME_CONTENT_BYTES`.
+   - **`bodyUpdateRef`:** fetch from `BlobPort` (or read the `x:` stream), check the sha256, open the bytes, then gate
+     stage 2 on them.
+     - If they are unavailable yet, the ref row is stored and retried with backoff, and the doc shows
+       `wait/blob-unavailable`.
+     - Once resolved, the tail row is rewritten as `bodyUpdate` (a local cache only).
+   - Cold docs stop here: the row is stored in `tail` (§e.2 `T_ingest`), and nothing is loaded.
+3. **Check** (resident docs, at apply time):
+   - **Causal hole:** after apply, `doc.store.pendingStructs` or `pendingDs` is non-null while the stream is caught up.
+     Re-read the stream up to 3 times over ≥ 3 min (≥ 2 × `PROVISIONAL_ADOPT_MS`, because the missing structs may be
+     an adoption in flight), then freeze `causal-hole`.
+   - **Size:** a post-apply text length > `MAX_DOC_TEXT_CHARS` freezes the doc as `oversize-remote`. This is not
+     quarantine: the row is valid and stays in tail. The doc just stops projecting.
+   - **Canvas:** the projection validates the JSON canvas (§j.2). Invalid → freeze `canvas-invalid`.
+4. **Apply or quarantine.**
+   - Apply: `Y.applyUpdate(doc, update, REMOTE)`, or fold the ns/cfg frame.
+   - Quarantine: put a `quarantine` record and set `streams.frozen = 1` for the doc.
+
+**Failures by stream class:**
+
+| Failure | ns / cfg | body / canvas / x |
+|---|---|---|
+| Deterministic malformation (bytes, decode) | Fold as empty frame (§c.3); diagnostics event | Quarantine, freeze doc |
+| Reader-dependent (unknown version, suite or key; auth failure) | **Halt** the fold at the row (`upgrade-required` / `key-missing`); rows wait in `tail` | Quarantine, freeze doc (retried on upgrade or new keys) |
+| Kind not allowed | Fold as empty | Quarantine, freeze |
+
+- **The cursor always advances.** Quarantined, stored-cold, stale-recorded and halted rows are all *accounted*.
+- **Frozen docs:**
+  - no projection writes and no frames from disk;
+  - a bound view goes read-only with a banner;
+  - the disk file is left alone, so its bytes stay recoverable.
+- **`releaseQuarantine{stream}`** re-runs the gate on the quarantined rows. Rows that pass are applied. The rest are
+  marked dismissed and stay in the store for diagnostics. The doc is unfrozen, and from then on disk edits merge
+  normally.
+- **Own poisoned frames.**
+  - After a close 1008 (malformed APPEND) or 1009 (oversize), the sender **probes**: it resends unreceipted frames one
+    at a time. A frame that triggers the close again becomes `poisoned` and is never resent.
+  - Its doc is rebuilt without it: `saveViews` first if bound, then `docRetarget{frozen, "rebuilding"}`, reload
+    without the poisoned record, then `reconcileContent` from disk (which holds the edit). The doc then re-binds via
+    `bindable`.
+
+### d.7 Catch-up and the cursor
+
+**State.**
+- `meta.cursor.vaultSeq` (V): every commit ≤ V is accounted. One of: ingested, receipted, stored-cold,
+  stale-recorded, quarantined, or own-in-outbox.
+- Per stream: `appliedSeq` (watermark: every committed row of the stream ≤ it is in snapshot/tail), `remoteHeadSeq`,
+  and `stale`.
+
+**Session start.** `VAULT_READY` gives `head H` and `vaultEpoch`.
+
+1. **Epoch.** `vaultEpoch ≠ identity.vaultEpoch` → §c.12.
+2. **Live queue.** Attach the event listener at once. The adapter buffers until then (port contract), so every seq > H
+   is captured.
+   - Live events go to an in-memory **live queue**.
+   - Rows for resident or bound docs are processed at lane priority. The rest are processed after gate stages 1–2.
+   - **Overflow** (> 4 MiB or > 1000 queued rows): drop payloads of rows for non-resident docs. Record those streams
+     as stale with `remoteHeadSeq = max(…, seq)`. The seq counts as accounted, and the rows are read later.
+3. **Feed.** If V < H: run `feed(V)` pages. Each page runs `T_feed_page`:
+   - for each `{stream, lastSeq}`: set `remoteHeadSeq` to the max, `stale = appliedSeq < remoteHeadSeq`, and the
+     priority (§j.6);
+   - unknown stream classes are skipped;
+   - set V to `throughSeq`.
+   - V reaches H after about `streams / 1000` pages, with no row reads.
+4. **Reads.** Catch-up jobs take stale streams by `byStalePriority`, up to `catchUpConcurrency` at once. Open notes
+   run in lane 1 and ns/cfg in lane 2, first.
+   - Each job calls `read(stream, appliedSeq, preferCheckpoint = appliedSeq === 0)` and gates each page.
+   - **`T_read_page`:** put tail rows. An own row (`deviceId` = self) whose `clientFrameId` is in the outbox is a
+     **late receipt**, handled exactly like `T_receipt`. An own row without an outbox record is a plain row.
+   - **Checkpoint** `coversSeq > snapshotCoversSeq`:
+     - fresh stream: store it as the snapshot after the gate (for ns, V1 + V2);
+     - otherwise: **union job**: scratch doc = local snapshot + every local tail row ≤ coversSeq + the checkpoint →
+       `T_snapshot`. For ns: verify, then replace the fold state, and own pending ops re-overlay (§f.1).
+   - **Caught up:** when a read completes (`more = false`) in the current session, every row of the stream ≤
+     `max(H, lastSeq)` is known, because the read started after `VAULT_READY` and everything ≤ H was committed then.
+     Every row > H arrives live (R2). So `appliedSeq := remoteHeadSeq` and `stale := 0`.
+   - Reads may lag live delivery (relay-wire §12): the group-commit buffer is not flushed. This is harmless, because
+     tail puts are idempotent and rows above the read arrive live.
+5. **Live rows for a stale stream:**
+   - **body/canvas:** stored, and applied at once if resident. Yjs is order-independent, so latency stays low while
+     catching up.
+   - **ns/cfg:** stored and **not folded** until the stream is caught up. After that, rows arrive live in order (R2)
+     and fold immediately.
+
+**Cursor advance.**
+- V advances while V+1 is accounted. Accounted seqs above V are tracked in memory.
+- V is persisted only inside the transaction that accounts the seq (`T_ingest`, `T_receipt`, `T_feed_page`,
+  `T_stale`).
+- **Gap:** V+1 is unaccounted for > 5 s while higher seqs are, or a `head` hint is above V. Run `feed(V)`. The page
+  marks the affected streams stale.
+- **`committed` with `payload: null`:** stale, read.
+
+**Reconnect order:**
+1. feed;
+2. ns and cfg reads (their late receipts remove outbox records);
+3. resend the remaining ns/cfg frames under the send window;
+4. body frames are resent right after `VAULT_READY`, because CRDT idempotence makes duplicates harmless.
+
+The planner does no destructive work until ns is caught up (§f.2).
+
+### d.8 Local compaction
+
+- **Trigger:** `tailRows > LOCAL_COMPACT_ROWS` or `tailBytes > LOCAL_COMPACT_BYTES`, run in lane 4 when idle. At
+  `tailRows > TAIL_HARD_ROWS` it runs in lane 1.
+- **Preconditions:**
+  - the stream is not stale;
+  - no own outbox record of the stream is `pending`, `sent` or `held`. A late receipt could otherwise land at a seq ≤
+    the new snapshot. It would still be loaded, since load applies all tail rows, but the snapshot would no longer be
+    exact.
+- **Job:**
+  1. `C = appliedSeq`.
+  2. Scratch `Y.Doc({gc: true})`: apply the snapshot, then every tail row with seq ≤ C (including any below the old
+     coversSeq).
+  3. `bytes = Y.encodeStateAsUpdate(scratch)`.
+  4. `T_compact`: CAS on `snapshotCoversSeq` unchanged; put the snapshot `{coversSeq: C}`; delete exactly the loaded
+     tail keys; update the counters.
+  - ns and cfg compact the same way. Their "replay" is the fold, and their snapshot is the `nsFoldV1` / `cfgFoldV1`
+    bytes at `coversSeq`.
+- **The resident replica is not touched.** Compaction never runs `Y.mergeUpdates` over stored arrays.
+- **Cost:** O(doc) per ≥ 200 rows or 256 KiB of tail.
+- Alternative: compaction by `Y.mergeUpdates(snapshot, ...tail)`. Rejected: memory spikes and no GC (a fixed
+  decision).
+
+### d.9 Remote checkpoints (CAS)
+
+- **Body/canvas duty.**
+  - Primary: the author of the stream's newest row (`meta.ckptDuty`), when `rowsSinceRemoteCheckpoint ≥
+    REMOTE_CHECKPOINT_ROWS` or `bytesSinceRemoteCheckpoint ≥ REMOTE_CHECKPOINT_BYTES`, and the stream has been idle
+    for `REMOTE_CHECKPOINT_IDLE_MS`.
+  - Fallback: any device, when the condition has held for 10 min, plus jitter.
+- **Preconditions:** the local compaction preconditions, plus a fresh local compaction so that `snapshotCoversSeq =
+  appliedSeq = C`, and a sealed size ≤ `limits.maxCheckpointBytes`.
+- **Write.** `putCheckpoint(stream, C, remoteCheckpointCoversSeq, sealed)` (checkpoint AAD, §b.1).
+
+| Result | Action |
+|---|---|
+| `ok` | `remoteCheckpointCoversSeq = C`; reset counters |
+| `conflict{current}` | Record `current`. Retry later only if `current < C`. ns: run the V3 check on `current` |
+| `refused not-advancing` | Refresh with `read(stream, C, false)` |
+| `refused ahead-of-stream` | Bug: diagnostics, skip |
+| `refused stream-not-found` | Skip |
+| `refused too-large` | Mark the stream `no-checkpoint` until its snapshot shrinks by 25 % |
+| `refused daily-limit` | Hold all checkpoints until `retryAfterMs` |
+| `refused forbidden` | Treat as `canWrite = false` |
+
+- **ns.**
+  - Only candidate seqs (§b.5). The device keeps the `nsFoldV1` bytes of its newest candidate in memory.
+  - Duty: the author of the candidate row, when ≥ `NS_CHECKPOINT_ROWS` ns rows or ≥ `NS_CHECKPOINT_BYTES` have
+    accumulated since the last checkpoint. Others take over after 10 min.
+  - cfg uses the same candidate rule.
+- **`retired`.**
+  - For streams of docIds in a fold `pruned` event, or merged aliases that have rows.
+  - Duty: the device whose frame caused the prune or merge. Fallback: 10 min.
+  - `coversSeq` = the stream's `lastSeq` from `read(stream, 0, false)`.
+  - After `ok`, the local stream records are deleted.
+- **Budget.** Checkpoints are at most 1 per 512 rows of a stream (1 per 1000 for ns), so they are a small fraction of
+  daily rows written.
+
+---
+
+## e. IndexedDB schema and transactions
+
+One database per `(vaultId, vaultEpoch, deviceId)`: `dbName()` gives `yaos2:<vaultId>:<vaultEpoch>:<deviceId>`.
+
+IDB is a **rebuildable cache**: everything can be rebuilt from relay + disk + side files (§i.5). The engine opens it
+through `StoragePort`. The same semantics hold for the in-memory simulation implementation, including "a crash keeps
+exactly the committed transactions". Types are in `src/engine/store/schema.ts`.
+
+### e.1 Stores
+
+| Store | Key path | Indexes | Value | Bound |
+|---|---|---|---|---|
+| `meta` | `key` | — | `identity`, `cursor`, `outboxOrder`, `daily`, `ckptDuty` | 5 records |
+| `streams` | `stream` | `byStalePriority [stale, priority]`, `byAccess lastAccessMs` | `StreamRecord` | 1 per live doc / retained tombstone with rows, + ns, cfg, active `x:`; deleted after `retired` |
+| `snapshots` | `stream` | — | `SnapshotRecord` (EXACT: committed rows ≤ coversSeq) | 1 per stream; ≤ about 3 × doc text |
+| `tail` | `[stream, seq]` | — | `TailRecord` (opened inner content) | Compaction keeps ≤ 200 rows / 256 KiB typical, hard 2000 rows per stream |
+| `outbox` | `clientFrameId` | `byOrder order` (unique), `byStreamOrder [stream, order]` (unique), `byStateOrder [state, order]` (unique) | `OutboxRecord` | Soft `OUTBOX_SOFT_BYTES` (16 MiB): builders stretch, notice. **Never dropped** |
+| `quarantine` | `[stream, seq]` | `byAt atMs` | `QuarantineRecord` (bytes ≤ 256 KiB + hash) | `QUARANTINE_MAX_RECORDS` / `_BYTES`; oldest evicted (the doc stays frozen) |
+| `synced` | `docId` | `byPathKey pathKey` (non-unique: transient during rebind) | `SyncedRecord` | 1 per synced doc |
+| `baseText` | `docId` | — | `BaseTextRecord` (deflated, ≤ `MAX_BASE_TEXT_CHARS`) | markdown/canvas synced docs |
+| `localTree` | `pathKey` | — | `LocalTreeRecord` | 1 per vault file |
+| `intents` | `id` | — | `IntentRecord` | In-flight multi-step disk ops (< 1000); deleted on completion |
+| `cfgBase` | `file` | — | `CfgBaseRecord` | Allowlisted config files |
+| `blobQueue` | `hash` | `byActiveDue [active, nextAttemptAtMs]` | `BlobQueueRecord` | 1 per pending transfer |
+
+- **`dependsOn` rule.** A `held` record waits for one of three things:
+  - the doc's ns create (released when it folds);
+  - the newest adoptable of the stream (released when that record is gone);
+  - the last `x:` chunk of a `bodyUpdateRef` (released when no own `x:` frame of that stream remains).
+  - Releasing a record means `held → pending` in the same transaction that removes the dependency.
+- **IDB booleans.** `stale`, `frozen` and `active` are `0 | 1` because IDB cannot index booleans.
+
+### e.2 Transactions
+
+Rules:
+- A transaction awaits only its own requests (`StorageTx` contract).
+- Rows are gated **before** the transaction. CPU work is never done inside one.
+- The cursor advances only in the transaction that makes the seq accounted.
+- Replicas are updated optimistically right after the gate. A crash before commit loses only memory: the seq stays
+  unaccounted, so it is fetched again, and union is idempotent.
+
+| Tx | Stores | Writes | Crash reasoning |
+|---|---|---|---|
+| `T_edit` (frame close) | outbox, meta, streams | Outbox record (`pending` / `held`); `outboxOrder.next++`; `bodyVersion.localOrder`, `lastAccessMs` | **Commits before `append`.** Before commit: the edit is on disk via the editor save (§d.4). After commit: resent at startup. |
+| `T_sent` (lazy, coalesced) | outbox | `state: sent`, `attempts`, `lastSentAtMs` | Diagnostics only: `pending` / `sent` are both "maybe sent". |
+| `T_receipt` (one per `STREAM_RECEIPTS` batch) | outbox, tail, streams, meta | Per receipt: tail put `(stream, seq)` with outbox content; outbox delete; release dependents; `lastOwnSeq`, `remoteHeadSeq`, `appliedSeq` (if not stale), checkpoint counters, `ckptDuty`; cursor | A missing outbox record is a no-op (idempotent). Before commit: re-delivered as a late receipt via read, or resent and then deduped (relay window, fold ring, or CRDT). |
+| `T_ingest` (batch ≤ 64 rows / 1 MiB per slice) | tail, quarantine, streams, outbox, meta | Tail or quarantine puts; adoptable deletes and releases; `remoteHeadSeq`, `appliedSeq`, `bodyVersion.remoteSeq`, counters; cursor | Before commit: the rows are unaccounted and re-fetched. Replica already applied: idempotent. |
+| `T_stale` | streams, meta | `remoteHeadSeq`, `stale = 1`; cursor | Overflow or null payload: the row is read later. |
+| `T_feed_page` | streams, meta | Stream heads, stale, priority; cursor = `throughSeq` | Before commit: the page is re-fetched. |
+| `T_read_page` | tail, quarantine, outbox, streams, snapshots | Rows; late receipts; fresh-stream checkpoint snapshot + exact-key deletes of tail ≤ coversSeq; `appliedSeq` / `stale` when complete | Idempotent puts. The page is re-read from `appliedSeq`. |
+| `T_snapshot` (checkpoint union) / `T_compact` | snapshots, tail, streams | CAS on `snapshotCoversSeq`; snapshot put; exact-key tail deletes | Old snapshot + tail and new snapshot + less tail reconstruct the same state. |
+| `T_adopt` | outbox, meta | Adoptable record | Before commit: the provisional was applied to the bound replica only. The edit reaches disk through the editor and is re-merged. The commit or the author's resend brings it anyway. |
+| `T_intent_begin` / `T_intent_end` | intents | Put / delete the intent | §f.7: startup completes or rolls back each intent from disk state. |
+| `T_synced` (after a disk-op batch) | synced, baseText, localTree, intents | Synced put/drop, base put, stat cache, intent end | Before commit: the next reconcile sees L = R ≠ S, which is the "identical" path. Only S advances. |
+| `T_cfg` | cfgBase, streams, meta | Settings sync base after projection | As `T_synced`. |
+
+- **Compaction and remote checkpoint gate.** They require "no own unreceipted frames of the stream". This is the only
+  coupling between outbox and snapshots.
+- **ns fold persistence.** The fold state lives in memory. On disk it is the ns `snapshot` (`nsFoldV1`) plus ns
+  `tail` rows. Load = decode, then fold the tail. Halted rows stay in tail.
+
+### e.3 Bounds and eviction summary
+
+- Tail is bounded by compaction (§d.8). If compaction is blocked by unreceipted frames for long (offline), the tail
+  stays bounded by what this device received.
+- Quarantine is bounded with oldest-first eviction.
+- The outbox is never evicted; it is bounded only by user activity while offline, and the soft limit triggers a notice
+  plus frame stretching.
+- `streams` / `snapshots` / `tail` of pruned docs are deleted after their `retired` checkpoint, or locally after the
+  prune if this device has no duty.
+- **Quota error:**
+  1. evict `quarantine` bytes;
+  2. compact everything eligible;
+  3. drop snapshots/tail of cold docs whose disk file equals `synced`. They are refetched on demand, because the relay
+     has them;
+  4. as a last resort, phase `error` + notice. The outbox is untouched.
+
+### e.4 Side files
+
+Side files live in `<configDir>/plugins/yaos/state/` (`SideFilePort`). The host reads them at startup and passes them
+in `EngineInitConfig.sideState`. The engine asks for writes with `sideFileWrite`.
+
+**Outbox mirror** (`outbox-a.bin` / `outbox-b.bin`, A/B by generation):
+
+```
+8B  magic "YAOSOBX1"
+u8  formatVersion (1)
+varstring vaultId, varstring vaultEpoch, varstring deviceId
+varuint generation, varuint writtenAtMs
+varuint frameCount
+frameCount × {
+  varstring clientFrameId, varstring stream, varuint order,
+  u8 state (1 held, 2 pending, 3 sent, 4 poisoned, 5 adoptable),
+  varuint authorNsSeq,
+  u8 hasDep [varstring dependsOn],
+  u8 hasAdopt [varstring deviceId, varstring clientFrameId],
+  varbytes sealed
+}
+32B sha256(all preceding bytes)
+```
+
+- **Write:**
+  - debounce `OUTBOX_MIRROR_DEBOUNCE_MS` after any outbox put, and `OUTBOX_MIRROR_TRIM_DEBOUNCE_MS` after
+    receipts;
+  - immediately on `hidden` / `pagehide`;
+  - the target is the slot with the lower or invalid generation.
+- **Size limit.** Over `OUTBOX_MIRROR_MAX_BYTES`, the mirror keeps all ns/cfg frames first, then body frames by
+  `order` until full. Unmirrored body edits are still on disk and are re-derived by reconcile.
+- **Why it exists.** It preserves **frame identity** (`clientFrameId`) across IDB loss:
+  - a resent ns frame is deduped by the relay window or the fold ring instead of creating duplicate docs;
+  - body frames would converge anyway.
+- **Reader.** Takes the valid file (magic, checksum, identity match) with the highest generation.
+
+**Synced mirror** (`synced-a.bin` / `synced-b.bin`, debounce `SYNCED_MIRROR_DEBOUNCE_MS`):
+
+```
+8B magic "YAOSSYN1", u8 version, varstring vaultId, varstring vaultEpoch, varstring deviceId,
+varuint generation, varuint writtenAtMs, varuint nsCoversSeq, varuint count,
+count × { varstring docId, varstring path, u8 kindCode, 32B contentHash, varuint nsTouchSeq, varuint bodyRemoteSeq, varuint blobRev },
+32B sha256
+```
+
+- Lets recovery tell "unchanged since sync" (hash equal) from "edited offline", so an IDB loss does not produce
+  conflict copies.
+- Base texts are not mirrored. Recovered docs merge without a base only when both sides changed.
