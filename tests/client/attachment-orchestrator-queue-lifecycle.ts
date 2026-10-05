@@ -1,9 +1,9 @@
 import type { App, Stat, TFolder } from "obsidian";
 import { TFile } from "obsidian";
-import { AttachmentOrchestrator } from "../../src/runtime/attachmentOrchestrator";
-import type { RuntimeConfig } from "../../src/runtime/runtimeConfig";
-import type { BlobQueueSnapshot } from "../../src/sync/blobSync";
-import type { VaultSync } from "../../src/sync/vaultSync";
+import { AttachmentOrchestrator } from "../../legacy-src/runtime/attachmentOrchestrator";
+import type { RuntimeConfig } from "../../legacy-src/runtime/runtimeConfig";
+import type { BlobQueueSnapshot } from "../../legacy-src/sync/blobSync";
+import type { VaultSync } from "../../legacy-src/sync/vaultSync";
 import { partialOf } from "../mocks/productFixture.ts";
 import { suite, until } from "../harness.ts";
 

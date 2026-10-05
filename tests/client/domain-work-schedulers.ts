@@ -1,8 +1,8 @@
 import { strict as assert } from "node:assert";
-import type { OperationOutcome } from "../../src/runtime/operationLifecycle";
-import type { OverdueWorkClock } from "../../src/runtime/overdueWorkKernel";
-import { RecoveryWorkScheduler } from "../../src/snapshots/recoveryWorkScheduler";
-import { SettingsWorkScheduler } from "../../src/sync/settingsSync/workScheduler";
+import type { OperationOutcome } from "../../legacy-src/runtime/operationLifecycle";
+import type { OverdueWorkClock } from "../../legacy-src/runtime/overdueWorkKernel";
+import { RecoveryWorkScheduler } from "../../legacy-src/snapshots/recoveryWorkScheduler";
+import { SettingsWorkScheduler } from "../../legacy-src/sync/settingsSync/workScheduler";
 import { suite } from "../harness.ts";
 
 interface TimerRecord {

@@ -5,8 +5,8 @@
  * authoritative reconciliation. No Obsidian, no Yjs, no disk I/O.
  */
 
-import { planClosedFileReconcile } from "../../src/runtime/reconcile/closedFilePlanner";
-import type { ClosedFileReconcileInput } from "../../src/runtime/reconcile/closedFilePlanner";
+import { planClosedFileReconcile } from "../../legacy-src/runtime/reconcile/closedFilePlanner";
+import type { ClosedFileReconcileInput } from "../../legacy-src/runtime/reconcile/closedFilePlanner";
 import { suite } from "../harness.ts";
 
 const s = suite("closed-file-planner");

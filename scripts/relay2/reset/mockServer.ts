@@ -23,7 +23,7 @@
  */
 import * as Y from "yjs";
 import { canonicalMarkdownHash } from "@shared/markdownCodec";
-import type { ReadySemanticEpochTransition } from "../../../src/sync/semanticEpochTransition";
+import type { ReadySemanticEpochTransition } from "../../../legacy-src/sync/semanticEpochTransition";
 import { BODY_TEXT_ROOT } from "./builder";
 import type { SemanticCompactionState } from "./policy";
 import {

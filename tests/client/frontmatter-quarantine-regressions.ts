@@ -4,8 +4,8 @@ import {
 	clearResolvedFrontmatterQuarantinePath,
 	readPersistedFrontmatterQuarantine,
 	upsertFrontmatterQuarantineEntry,
-} from "../../src/sync/frontmatterQuarantine";
-import type { FrontmatterQuarantineEntry } from "../../src/sync/frontmatterQuarantine";
+} from "../../legacy-src/sync/frontmatterQuarantine";
+import type { FrontmatterQuarantineEntry } from "../../legacy-src/sync/frontmatterQuarantine";
 import { suite } from "../harness.ts";
 
 const s = suite("frontmatter-quarantine-regressions");

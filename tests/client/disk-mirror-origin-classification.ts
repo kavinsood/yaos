@@ -28,7 +28,7 @@ import {
 	ORIGIN_EDITOR_HEALTH_HEAL,
 	ORIGIN_SEED,
 	ORIGIN_RESTORE,
-} from "../../src/sync/origins";
+} from "../../legacy-src/sync/origins";
 import { suite } from "../harness.ts";
 
 const s = suite("disk-mirror-origin-classification");

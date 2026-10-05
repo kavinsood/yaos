@@ -1,7 +1,7 @@
 import { strict as assert } from "node:assert";
 import * as Y from "yjs";
-import { VaultSync, type BulkCreateRequest, type VaultSyncOptions } from "../../src/sync/vaultSync";
-import { validateBulkCreateRootUpdate } from "../../src/sync/bulkCreateRootValidation";
+import { VaultSync, type BulkCreateRequest, type VaultSyncOptions } from "../../legacy-src/sync/vaultSync";
+import { validateBulkCreateRootUpdate } from "../../legacy-src/sync/bulkCreateRootValidation";
 import { suite } from "../harness.ts";
 import { installDomCrypto } from "./helpers/installDomCrypto.ts";
 import { FakeBulkCreateServer, memoryVault, testProvider, type MemoryVault } from "./helpers/fakeBulkCreateServer.ts";

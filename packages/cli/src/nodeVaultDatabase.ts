@@ -15,21 +15,21 @@ import type {
 	StoredFeedCursor,
 	StoredLifecycleOperation,
 	StoredOutstandingBody,
-} from "../../../src/sync/vaultIndexedDb";
+} from "../../../legacy-src/sync/vaultIndexedDb";
 import {
 	PendingWorkError,
 	assertResetAllowed,
 	type PendingWorkSummary,
-} from "../../../src/sync/vaultIndexedDb";
-import type { VaultDatabasePort } from "../../../src/sync/vaultSync";
-import type { BootstrapDatabasePort } from "../../../src/sync/bootstrapClient";
+} from "../../../legacy-src/sync/vaultIndexedDb";
+import type { VaultDatabasePort } from "../../../legacy-src/sync/vaultSync";
+import type { BootstrapDatabasePort } from "../../../legacy-src/sync/bootstrapClient";
 import type {
 	LocalVaultImportState,
 	LocalVaultImportStateStore,
-} from "../../../src/onboarding/localVaultImport";
-import type { PreservedUnresolvedEntry } from "../../../src/sync/preservedUnresolved";
-import type { StoredBodySettlement } from "../../../src/sync/bodySettlement";
-import { readDiskIndex, type DiskIndex } from "../../../src/sync/diskIndex";
+} from "../../../legacy-src/onboarding/localVaultImport";
+import type { PreservedUnresolvedEntry } from "../../../legacy-src/sync/preservedUnresolved";
+import type { StoredBodySettlement } from "../../../legacy-src/sync/bodySettlement";
+import { readDiskIndex, type DiskIndex } from "../../../legacy-src/sync/diskIndex";
 
 /**
  * Convert a binary binding without allocating or copying its bytes.

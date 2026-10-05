@@ -5,7 +5,7 @@ import {
 	type AdmissionReservation,
 	type ResidencyAdmissionLimits,
 	type ResidencyBodyObservation,
-} from "../../src/runtime/residencyAdmissionCoordinator";
+} from "../../legacy-src/runtime/residencyAdmissionCoordinator";
 import { suite } from "../harness.ts";
 
 const s = suite("residency-admission-coordinator");

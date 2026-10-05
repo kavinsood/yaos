@@ -15,9 +15,9 @@ import {
 	EditorBindingManager,
 	type BindDivergenceDecision,
 	type BindDivergenceResolver,
-} from "../../src/sync/editorBinding";
-import type { VaultSync } from "../../src/sync/vaultSync";
-import { ORIGIN_EDITOR_HEALTH_HEAL } from "../../src/sync/origins";
+} from "../../legacy-src/sync/editorBinding";
+import type { VaultSync } from "../../legacy-src/sync/vaultSync";
+import { ORIGIN_EDITOR_HEALTH_HEAL } from "../../legacy-src/sync/origins";
 import { partialOf } from "../mocks/productFixture.ts";
 import { suite } from "../harness.ts";
 

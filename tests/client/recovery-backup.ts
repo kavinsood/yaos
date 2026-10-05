@@ -1,6 +1,6 @@
 import { TFile } from "obsidian";
 import { installDomCrypto } from "./helpers/installDomCrypto.ts";
-import { RecoveryBackupHook } from "../../src/snapshots/recoveryBackup";
+import { RecoveryBackupHook } from "../../legacy-src/snapshots/recoveryBackup";
 import { suite } from "../harness.ts";
 
 installDomCrypto();

@@ -19,7 +19,7 @@ import {
 	AMPLIFICATION_QUARANTINE_THRESHOLD,
 	AMPLIFICATION_WINDOW_MS,
 	type AmplificationEntry,
-} from "../../src/runtime/reconcile/amplificationQuarantinePolicy";
+} from "../../legacy-src/runtime/reconcile/amplificationQuarantinePolicy";
 import { suite } from "../harness.ts";
 
 const s = suite("amplification-quarantine-policy");

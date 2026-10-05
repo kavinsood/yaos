@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { PreservedUnresolvedRegistry, type PreservedUnresolvedEntry } from "../../src/sync/preservedUnresolved";
+import { PreservedUnresolvedRegistry, type PreservedUnresolvedEntry } from "../../legacy-src/sync/preservedUnresolved";
 import { suite } from "../harness.ts";
 
 // The assertions here are node:assert's structural equality checks, kept as

@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert";
 import * as Y from "yjs";
-import type { OverdueWorkClock } from "../../src/runtime/overdueWorkKernel";
+import type { OverdueWorkClock } from "../../legacy-src/runtime/overdueWorkKernel";
 import {
 	VaultSync,
 	type ProviderFactory,
@@ -9,11 +9,11 @@ import {
 	type SyncProviderPort,
 	type VaultDatabasePort,
 	type VaultServerPort,
-} from "../../src/sync/vaultSync";
-import type { StoredDocument } from "../../src/sync/vaultIndexedDb";
+} from "../../legacy-src/sync/vaultSync";
+import type { StoredDocument } from "../../legacy-src/sync/vaultIndexedDb";
 import { SOCKET_CONTROL_CAPABILITIES, SOCKET_LIVENESS_DESCRIPTOR } from "../../server/src/shared/socketLiveness";
-import { ConnectionController } from "../../src/runtime/connectionController";
-import { VaultWorkScheduler } from "../../src/sync/vaultWorkScheduler";
+import { ConnectionController } from "../../legacy-src/runtime/connectionController";
+import { VaultWorkScheduler } from "../../legacy-src/sync/vaultWorkScheduler";
 import { sleep, suite, until } from "../harness.ts";
 import { partialOf } from "../mocks/productFixture.ts";
 import { installDomCrypto } from "./helpers/installDomCrypto.ts";

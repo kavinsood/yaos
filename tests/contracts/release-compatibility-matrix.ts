@@ -3,15 +3,15 @@ import { resolve } from "node:path";
 import {
 	CapabilityUpdateService,
 	serverCapabilityProtocolError,
-} from "../../src/runtime/capabilityUpdateService";
+} from "../../legacy-src/runtime/capabilityUpdateService";
 import {
 	PROTOCOL_VERSION,
 	SCHEMA_VERSION,
 	SNAPSHOT_FORMAT_VERSION,
 	STORAGE_FORMAT_VERSION,
-} from "../../src/sync/schema";
-import type { ServerCapabilities } from "../../src/sync/serverCapabilities";
-import { isUpdateManifest, type UpdateManifest } from "../../src/update/updateManifest";
+} from "../../legacy-src/sync/schema";
+import type { ServerCapabilities } from "../../legacy-src/sync/serverCapabilities";
+import { isUpdateManifest, type UpdateManifest } from "../../legacy-src/update/updateManifest";
 import { SERVER_VERSION } from "../../server/src/version";
 import { readSource, repoRoot, suite } from "../harness.ts";
 

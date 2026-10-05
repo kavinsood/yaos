@@ -4,8 +4,8 @@ import {
 	AuthoritySupersededError,
 	capabilitiesForRole,
 	readVaultAuthoritySnapshot,
-} from "../../src/collaboration/authority";
-import { readVaultSyncSettings } from "../../src/settings/settingsStore";
+} from "../../legacy-src/collaboration/authority";
+import { readVaultSyncSettings } from "../../legacy-src/settings/settingsStore";
 import { suite } from "../harness.ts";
 
 const s = suite("collaboration-authority");

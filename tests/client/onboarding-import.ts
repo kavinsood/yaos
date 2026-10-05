@@ -6,9 +6,9 @@ import {
 	type LocalVaultImportSink,
 	type LocalVaultImportSinkInput,
 	type LocalVaultImportSource,
-} from "../../src/onboarding/localVaultImport";
-import { MemoryLocalVaultImportStateStore } from "../../src/onboarding/localVaultImportStore";
-import { fetchVaultProvisioningProof, readVaultProvisioningProof } from "../../src/onboarding/provisioningClient";
+} from "../../legacy-src/onboarding/localVaultImport";
+import { MemoryLocalVaultImportStateStore } from "../../legacy-src/onboarding/localVaultImportStore";
+import { fetchVaultProvisioningProof, readVaultProvisioningProof } from "../../legacy-src/onboarding/provisioningClient";
 import { suite } from "../harness.ts";
 import { MAX_CLIENT_MARKDOWN_BYTES } from "../../server/src/shared/durableLimits";
 

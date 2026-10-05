@@ -1,7 +1,7 @@
 import { strict as assert } from "node:assert";
 import * as Y from "yjs";
 import YSyncProvider from "y-partyserver/provider";
-import { fencedWebSocketConstructor } from "../../src/sync/fencedWebSocket";
+import { fencedWebSocketConstructor } from "../../legacy-src/sync/fencedWebSocket";
 import { suite } from "../harness.ts";
 
 class FakeWebSocket {

@@ -6,7 +6,7 @@ import {
 import {
 	SocketLivenessCoordinator,
 	type SocketLivenessClock,
-} from "../../src/runtime/socketLivenessCoordinator";
+} from "../../legacy-src/runtime/socketLivenessCoordinator";
 import { suite } from "../harness.ts";
 
 class ManualClock implements SocketLivenessClock {

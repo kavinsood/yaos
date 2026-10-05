@@ -22,7 +22,7 @@
 
 import { promises as fs } from "node:fs";
 import nodePath from "node:path";
-import { canonicalizeVaultPath } from "../../../src/paths/canonicalPath";
+import { canonicalizeVaultPath } from "../../../legacy-src/paths/canonicalPath";
 
 /** A path that cannot be used, with a message naming the offending input. */
 export class VaultPathError extends Error {

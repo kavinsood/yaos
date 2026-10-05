@@ -1,8 +1,8 @@
 import { strict as assert } from "node:assert";
 import { TFile } from "obsidian";
-import { ReconciliationController } from "../../src/runtime/reconciliationController";
-import type { DiskIndex } from "../../src/sync/diskIndex";
-import type { DiskBodyCommitInput, DiskBodyCommitResult, VaultSync } from "../../src/sync/vaultSync";
+import { ReconciliationController } from "../../legacy-src/runtime/reconciliationController";
+import type { DiskIndex } from "../../legacy-src/sync/diskIndex";
+import type { DiskBodyCommitInput, DiskBodyCommitResult, VaultSync } from "../../legacy-src/sync/vaultSync";
 import { suite, until } from "../harness.ts";
 import { partialOf } from "../mocks/productFixture.ts";
 import { installDomCrypto } from "./helpers/installDomCrypto.ts";

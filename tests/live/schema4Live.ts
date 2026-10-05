@@ -1,6 +1,6 @@
 import * as Y from "yjs";
-import { OwnAwarenessProvider as YSyncProvider } from "../../src/sync/ownAwarenessProvider.ts";
-import { PROTOCOL_VERSION, SCHEMA_VERSION } from "../../src/sync/schema.ts";
+import { OwnAwarenessProvider as YSyncProvider } from "../../legacy-src/sync/ownAwarenessProvider.ts";
+import { PROTOCOL_VERSION, SCHEMA_VERSION } from "../../legacy-src/sync/schema.ts";
 import type {
 	LifecycleReceipt as ServerLifecycleReceipt,
 	LifecycleRequest,

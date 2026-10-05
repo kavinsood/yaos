@@ -1,13 +1,13 @@
 import { strict as assert } from "node:assert";
 import {
 	OperationalResourceSnapshotTracker,
-} from "../../src/runtime/operationalResourceSnapshot";
+} from "../../legacy-src/runtime/operationalResourceSnapshot";
 import {
 	ResidencyAdmissionCoordinator,
 	type ResidencyAdmissionLimits,
-} from "../../src/runtime/residencyAdmissionCoordinator";
-import type { OverdueWorkDiagnostics } from "../../src/runtime/overdueWorkKernel";
-import type { BodyResidencySnapshot } from "../../src/sync/bodyResidencyAccounting";
+} from "../../legacy-src/runtime/residencyAdmissionCoordinator";
+import type { OverdueWorkDiagnostics } from "../../legacy-src/runtime/overdueWorkKernel";
+import type { BodyResidencySnapshot } from "../../legacy-src/sync/bodyResidencyAccounting";
 import { suite } from "../harness.ts";
 
 const limits: ResidencyAdmissionLimits = {

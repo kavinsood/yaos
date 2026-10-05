@@ -8,7 +8,7 @@ import {
 	type SyncProviderPort,
 	type VaultDatabasePort,
 	type VaultServerPort,
-} from "../../src/sync/vaultSync";
+} from "../../legacy-src/sync/vaultSync";
 import { SOCKET_CONTROL_CAPABILITIES, SOCKET_LIVENESS_DESCRIPTOR } from "../../server/src/shared/socketLiveness";
 import {
 	DAILY_LIMIT_MAX_BACKOFF_MS,
@@ -19,10 +19,10 @@ import {
 	nextUtcMidnight,
 	parseDailyLimitSignal,
 	type DailyLimitInfo,
-} from "../../src/sync/dailyLimit";
-import { getLabelFromConnectionState } from "../../src/status/statusBarController";
+} from "../../legacy-src/sync/dailyLimit";
+import { getLabelFromConnectionState } from "../../legacy-src/status/statusBarController";
 import { DailyLimitLatch, dailyLimitResponse } from "../../server/src/dailyLimit";
-import type { HttpRequest, HttpResponse } from "../../src/utils/http";
+import type { HttpRequest, HttpResponse } from "../../legacy-src/utils/http";
 import { sleep, suite, until } from "../harness.ts";
 import { partialOf } from "../mocks/productFixture.ts";
 import { installDomCrypto } from "./helpers/installDomCrypto.ts";

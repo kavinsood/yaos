@@ -5,7 +5,7 @@ import {
 	isFrontmatterBlocked,
 	validateFrontmatterTransition,
 	type FrontmatterValidationResult,
-} from "../../src/sync/frontmatterGuard.ts";
+} from "../../legacy-src/sync/frontmatterGuard.ts";
 
 const s = suite("frontmatter-guard-regressions");
 

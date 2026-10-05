@@ -1,7 +1,7 @@
 import {
 	isAllowlistedConfigPath,
 	listUnknownRootJson,
-} from "../../src/sync/settingsSync/allowlist";
+} from "../../legacy-src/sync/settingsSync/allowlist";
 import { suite } from "../harness.ts";
 
 const s = suite("settings-sync-allowlist");

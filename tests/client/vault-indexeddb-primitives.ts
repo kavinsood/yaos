@@ -6,11 +6,11 @@ import {
 	VaultIndexedDb,
 	type PendingWorkSummary,
 	type StoredCanvasLifecycle,
-} from "../../src/sync/vaultIndexedDb";
-import { parsePendingRecoveryState } from "../../src/snapshots/recoveryState";
+} from "../../legacy-src/sync/vaultIndexedDb";
+import { parsePendingRecoveryState } from "../../legacy-src/snapshots/recoveryState";
 import { FakeIndexedDb } from "../mocks/indexedDb";
-import { vaultIdbName } from "../../src/sync/vaultPersistence";
-import { localVaultImportIdbName } from "../../src/onboarding/localVaultImportStore";
+import { vaultIdbName } from "../../legacy-src/sync/vaultPersistence";
+import { localVaultImportIdbName } from "../../legacy-src/onboarding/localVaultImportStore";
 import { suite } from "../harness.ts";
 
 const s = suite("vault-indexeddb-primitives");

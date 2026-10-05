@@ -36,11 +36,11 @@
  *   (C) unmapped/non-path events are dropped observably.
  */
 
-import { FlightTraceSink } from "../../src/telemetry/debug/flightTraceSink";
-import { NoopTraceSink } from "../../src/observability/noopTraceSink";
-import { FLIGHT_KIND } from "../../src/observability/flightTaxonomy";
-import { PRODUCT_EVENT_KIND } from "../../src/observability/productEventKinds";
-import type { DomainPathTraceEvent } from "../../src/observability/traceSink";
+import { FlightTraceSink } from "../../legacy-src/telemetry/debug/flightTraceSink";
+import { NoopTraceSink } from "../../legacy-src/observability/noopTraceSink";
+import { FLIGHT_KIND } from "../../legacy-src/observability/flightTaxonomy";
+import { PRODUCT_EVENT_KIND } from "../../legacy-src/observability/productEventKinds";
+import type { DomainPathTraceEvent } from "../../legacy-src/observability/traceSink";
 import { suite } from "../harness.ts";
 
 const s = suite("trace-sink");

@@ -1,7 +1,7 @@
 import { strict as assert } from "node:assert";
-import { CollaborationClient } from "../../src/collaboration/client";
-import { capabilitiesForRole } from "../../src/collaboration/authority";
-import type { HttpRequester } from "../../src/utils/http";
+import { CollaborationClient } from "../../legacy-src/collaboration/client";
+import { capabilitiesForRole } from "../../legacy-src/collaboration/authority";
+import type { HttpRequester } from "../../legacy-src/utils/http";
 import { suite } from "../harness.ts";
 
 const s = suite("collaboration-client");

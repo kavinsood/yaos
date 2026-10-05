@@ -2,8 +2,8 @@ import { strict as assert } from "node:assert";
 import {
 	BodyCoordinator,
 	BodyProjectionOwnershipError,
-} from "../../src/sync/bodyCoordinator";
-import { RuntimeScope } from "../../src/runtime/operationLifecycle";
+} from "../../legacy-src/sync/bodyCoordinator";
+import { RuntimeScope } from "../../legacy-src/runtime/operationLifecycle";
 import { suite } from "../harness.ts";
 
 const s = suite("body-coordinator");

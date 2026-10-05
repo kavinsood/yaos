@@ -2,7 +2,7 @@ import {
 	detectSettingsSyncClash,
 	SETTINGS_SYNC_CLASH_COMMUNITY,
 	SETTINGS_SYNC_CLASH_CORE,
-} from "../../src/sync/settingsSync/clash";
+} from "../../legacy-src/sync/settingsSync/clash";
 import { suite } from "../harness.ts";
 
 const s = suite("settings-sync-clash");

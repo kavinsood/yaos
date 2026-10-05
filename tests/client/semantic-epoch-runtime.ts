@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert";
 import * as Y from "yjs";
-import { SCHEMA_VERSION } from "../../src/sync/schema";
+import { SCHEMA_VERSION } from "../../legacy-src/sync/schema";
 import {
 	ROOT_DOCUMENT_ID,
 	VaultSync,
@@ -14,13 +14,13 @@ import {
 	type SyncProviderPort,
 	type VaultDatabasePort,
 	type VaultServerPort,
-} from "../../src/sync/vaultSync";
+} from "../../legacy-src/sync/vaultSync";
 import type {
 	StoredBodyCandidate,
 	StoredDocument,
 	StoredLifecycleOperation,
 	StoredSemanticEpochReplacement,
-} from "../../src/sync/vaultIndexedDb";
+} from "../../legacy-src/sync/vaultIndexedDb";
 import { suite, until } from "../harness.ts";
 import { partialOf } from "../mocks/productFixture.ts";
 import { installDomCrypto } from "./helpers/installDomCrypto.ts";

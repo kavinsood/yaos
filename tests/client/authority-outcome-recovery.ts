@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert";
 import * as Y from "yjs";
-import type { VaultAuthorityIdentity } from "../../src/collaboration/authority";
+import type { VaultAuthorityIdentity } from "../../legacy-src/collaboration/authority";
 import {
 	VaultSync,
 	type CandidateRecord,
@@ -8,12 +8,12 @@ import {
 	type SyncProviderPort,
 	type VaultDatabasePort,
 	type VaultServerPort,
-} from "../../src/sync/vaultSync";
-import type { StoredDocument, StoredLifecycleOperation } from "../../src/sync/vaultIndexedDb";
+} from "../../legacy-src/sync/vaultSync";
+import type { StoredDocument, StoredLifecycleOperation } from "../../legacy-src/sync/vaultIndexedDb";
 import { suite } from "../harness.ts";
 import { partialOf } from "../mocks/productFixture.ts";
 import { installDomCrypto } from "./helpers/installDomCrypto.ts";
-import { PROTOCOL_VERSION, SCHEMA_VERSION } from "../../src/sync/schema";
+import { PROTOCOL_VERSION, SCHEMA_VERSION } from "../../legacy-src/sync/schema";
 
 installDomCrypto();
 const s = suite("authority-outcome-recovery");

@@ -2,8 +2,8 @@ import { strict as assert } from "node:assert";
 import {
 	FreshBodyAdmissionLocalVaultImportSink,
 	type FreshBodyAdmissionPort,
-} from "../../src/onboarding/obsidianLocalVaultImport";
-import type { LocalVaultImportSinkInput } from "../../src/onboarding/localVaultImport";
+} from "../../legacy-src/onboarding/obsidianLocalVaultImport";
+import type { LocalVaultImportSinkInput } from "../../legacy-src/onboarding/localVaultImport";
 import { suite } from "../harness.ts";
 
 const s = suite("local-vault-import-adapter");

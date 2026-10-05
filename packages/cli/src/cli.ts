@@ -13,7 +13,7 @@ import { enrollDevice, EnrollmentError } from "./enrollment";
 import { acquireProcessLock, LockHeldError } from "./lock";
 import { NodeVaultDatabaseIdentityError } from "./nodeVaultDatabase";
 import { createAccessFetch } from "./access";
-import { installClientTimerOverrides } from "../../../src/runtime/testOnlyTimers";
+import { installClientTimerOverrides } from "../../../legacy-src/runtime/testOnlyTimers";
 import {
 	prepareStatePaths,
 	readEnrollmentState,

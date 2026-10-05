@@ -12,13 +12,13 @@ import {
 	parseSemanticEpochResetFrame,
 	semanticEpochHeaders,
 } from "../../server/src/shared/semanticEpoch";
-import { BodyCoordinator } from "../../src/sync/bodyCoordinator";
-import { parseVaultControlFrame } from "../../src/sync/vaultSync";
-import { SCHEMA_VERSION } from "../../src/sync/schema";
+import { BodyCoordinator } from "../../legacy-src/sync/bodyCoordinator";
+import { parseVaultControlFrame } from "../../legacy-src/sync/vaultSync";
+import { SCHEMA_VERSION } from "../../legacy-src/sync/schema";
 import {
 	prepareRootSemanticEpochTransition,
 	prepareSemanticEpochTransition,
-} from "../../src/sync/semanticEpochTransition";
+} from "../../legacy-src/sync/semanticEpochTransition";
 import { suite } from "../harness.ts";
 
 const s = suite("semantic-epoch-protocol");

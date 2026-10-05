@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import os from "node:os";
 
 import type { EnrollmentConfig } from "./config";
-import { readVaultAuthoritySnapshot } from "../../../src/collaboration/authority";
+import { readVaultAuthoritySnapshot } from "../../../legacy-src/collaboration/authority";
 import {
 	ENROLLMENT_FORMAT,
 	type EnrollmentMembership,

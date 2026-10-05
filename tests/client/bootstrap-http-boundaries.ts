@@ -5,14 +5,14 @@ import {
 	BootstrapHttpPort,
 	type BootstrapHttpRequest,
 	type BootstrapHttpResponse,
-} from "../../src/sync/bootstrapClient";
-import type { StoredDocument } from "../../src/sync/vaultIndexedDb";
-import { VaultSyncHttpPort } from "../../src/sync/vaultSync";
+} from "../../legacy-src/sync/bootstrapClient";
+import type { StoredDocument } from "../../legacy-src/sync/vaultIndexedDb";
+import { VaultSyncHttpPort } from "../../legacy-src/sync/vaultSync";
 import {
 	createFetchRequester,
 	type HttpRequest,
 	type HttpResponse,
-} from "../../src/utils/http";
+} from "../../legacy-src/utils/http";
 import { suite } from "../harness.ts";
 import { decodeBinaryEnvelope, encodeBinaryEnvelope, YAOS_BINARY_CONTENT_TYPE } from "../../server/src/shared/binaryEnvelope";
 

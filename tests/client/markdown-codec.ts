@@ -12,8 +12,8 @@ import {
 	currentContentHash,
 	readDiskIndex,
 	updateIndex,
-} from "../../src/sync/diskIndex";
-import { decodeVerifiedBodyContent, type ClientCatalogEntry } from "../../src/sync/bootstrapClient";
+} from "../../legacy-src/sync/diskIndex";
+import { decodeVerifiedBodyContent, type ClientCatalogEntry } from "../../legacy-src/sync/bootstrapClient";
 import { suite } from "../harness.ts";
 
 const s = suite("markdown-codec");

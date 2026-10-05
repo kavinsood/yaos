@@ -15,9 +15,9 @@ import {
 	DAILY_LIMIT_MAX_BACKOFF_MS,
 	dailyLimitBackoffUntil,
 	dailyLimitProbeIntervalMs,
-} from "../../src/sync/dailyLimit";
-import { FreshAdmissionDurablyPendingError, VaultSync, type BulkCreateRequest } from "../../src/sync/vaultSync";
-import type { HttpRequest, HttpResponse } from "../../src/utils/http";
+} from "../../legacy-src/sync/dailyLimit";
+import { FreshAdmissionDurablyPendingError, VaultSync, type BulkCreateRequest } from "../../legacy-src/sync/vaultSync";
+import type { HttpRequest, HttpResponse } from "../../legacy-src/utils/http";
 import { suite, until } from "../harness.ts";
 import { installDomCrypto } from "./helpers/installDomCrypto.ts";
 import { FakeBulkCreateServer, memoryVault, testProvider } from "./helpers/fakeBulkCreateServer.ts";

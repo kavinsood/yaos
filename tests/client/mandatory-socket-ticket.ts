@@ -1,5 +1,5 @@
 import { strict as assert } from "node:assert";
-import { createSocketTicketCache, patchTicketInUrl, SocketTicketHttpError } from "../../src/sync/socketTicket";
+import { createSocketTicketCache, patchTicketInUrl, SocketTicketHttpError } from "../../legacy-src/sync/socketTicket";
 import { readSource, suite } from "../harness.ts";
 
 const s = suite("mandatory-socket-ticket");

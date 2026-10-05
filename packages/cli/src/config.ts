@@ -1,7 +1,7 @@
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import nodePath from "node:path";
-import { parseClientTimerEnv, type ClientTimerOverrides } from "../../../src/runtime/testOnlyTimers.ts";
+import { parseClientTimerEnv, type ClientTimerOverrides } from "../../../legacy-src/runtime/testOnlyTimers.ts";
 
 export const EXIT = {
 	ok: 0,

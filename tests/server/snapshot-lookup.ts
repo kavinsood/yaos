@@ -14,7 +14,7 @@ import { RecoveryReadError, RecoveryReadService } from "../../server/src/recover
 import { FakeObjectStore } from "../mocks/workerEnv.ts";
 import * as Y from "yjs";
 import { encodeRecoveryStateObject, MAX_RECOVERY_STATE_OBJECT_BYTES } from "../../server/src/shared/recoveryStateObject";
-import { decodeRecoveryStateObject } from "../../src/snapshots/recoveryStateDecode";
+import { decodeRecoveryStateObject } from "../../legacy-src/snapshots/recoveryStateDecode";
 import { suite } from "../harness.ts";
 
 const s = suite("snapshot-v2-lookup");

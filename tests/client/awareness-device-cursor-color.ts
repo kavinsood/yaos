@@ -1,4 +1,4 @@
-import { awarenessCursorUser, deviceCursorColor } from "../../src/utils/deviceCursorColor";
+import { awarenessCursorUser, deviceCursorColor } from "../../legacy-src/utils/deviceCursorColor";
 import { suite } from "../harness.ts";
 
 const s = suite("awareness-device-cursor-color");

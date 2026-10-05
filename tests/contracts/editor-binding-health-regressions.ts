@@ -1,6 +1,6 @@
 import { MarkdownView, type TFile, type Workspace } from "obsidian";
-import { EditorBindingManager } from "../../src/sync/editorBinding";
-import type { VaultSync } from "../../src/sync/vaultSync";
+import { EditorBindingManager } from "../../legacy-src/sync/editorBinding";
+import type { VaultSync } from "../../legacy-src/sync/vaultSync";
 import { partialOf } from "../mocks/productFixture.ts";
 import { suite } from "../harness.ts";
 

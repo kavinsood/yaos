@@ -3,7 +3,7 @@ import {
 	composeBodyOnlyProgress,
 	composeMarkdownComponents,
 	splitMarkdownComponents,
-} from "../../src/sync/frontmatterBoundary";
+} from "../../legacy-src/sync/frontmatterBoundary";
 import { suite } from "../harness.ts";
 
 const s = suite("frontmatter-boundary");

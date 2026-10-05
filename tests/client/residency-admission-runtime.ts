@@ -2,11 +2,11 @@ import { strict as assert } from "node:assert";
 import {
 	ResidencyAdmissionCoordinator,
 	type AdmissionReservation,
-} from "../../src/runtime/residencyAdmissionCoordinator";
+} from "../../legacy-src/runtime/residencyAdmissionCoordinator";
 import {
 	ResidencyAdmissionBackpressureError,
 	ResidencyAdmissionRuntime,
-} from "../../src/runtime/residencyAdmissionRuntime";
+} from "../../legacy-src/runtime/residencyAdmissionRuntime";
 import { suite } from "../harness.ts";
 
 const s = suite("residency-admission-runtime");

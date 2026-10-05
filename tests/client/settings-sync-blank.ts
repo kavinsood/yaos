@@ -1,4 +1,4 @@
-import { isBlankConfigDir } from "../../src/sync/settingsSync/blank";
+import { isBlankConfigDir } from "../../legacy-src/sync/settingsSync/blank";
 import { suite } from "../harness.ts";
 
 const s = suite("settings-sync-blank");

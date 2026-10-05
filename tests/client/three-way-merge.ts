@@ -1,5 +1,5 @@
 import { strict as assert } from "node:assert";
-import { mergeThreeWayText, resolveThreeWayText } from "../../src/sync/threeWayMerge";
+import { mergeThreeWayText, resolveThreeWayText } from "../../legacy-src/sync/threeWayMerge";
 import { suite } from "../harness.ts";
 
 const s = suite("three-way-merge");

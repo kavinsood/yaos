@@ -3,7 +3,7 @@ import {
 	BodySettlementRepository,
 	validateBodySettlement,
 	type StoredBodySettlement,
-} from "../../src/sync/bodySettlement";
+} from "../../legacy-src/sync/bodySettlement";
 import { canonicalMarkdownHash } from "../../server/src/shared/markdownCodec";
 import { suite } from "../harness.ts";
 

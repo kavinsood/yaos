@@ -2,7 +2,7 @@ import { strict as assert } from "node:assert";
 import * as Y from "yjs";
 import { SOCKET_LIVENESS_DESCRIPTOR } from "../../server/src/shared/socketLiveness";
 import { AUTHORITY_SUPERSEDED_SOCKET_CLOSE_CODE } from "../../server/src/shared/socketCloseCodes";
-import type { OverdueWorkClock } from "../../src/runtime/overdueWorkKernel";
+import type { OverdueWorkClock } from "../../legacy-src/runtime/overdueWorkKernel";
 import {
 	VaultSync,
 	type AttachmentPublicationReceipt,
@@ -12,12 +12,12 @@ import {
 	type SyncProviderPort,
 	type VaultDatabasePort,
 	type VaultServerPort,
-} from "../../src/sync/vaultSync";
-import type { StoredAttachmentPublicationOperation, StoredDocument } from "../../src/sync/vaultIndexedDb";
+} from "../../legacy-src/sync/vaultSync";
+import type { StoredAttachmentPublicationOperation, StoredDocument } from "../../legacy-src/sync/vaultIndexedDb";
 import { readSource, suite, until } from "../harness.ts";
 import { partialOf } from "../mocks/productFixture.ts";
 import { installDomCrypto } from "./helpers/installDomCrypto.ts";
-import { PROTOCOL_VERSION, SCHEMA_VERSION } from "../../src/sync/schema";
+import { PROTOCOL_VERSION, SCHEMA_VERSION } from "../../legacy-src/sync/schema";
 
 installDomCrypto();
 const s = suite("vault-work-scheduler-integration");

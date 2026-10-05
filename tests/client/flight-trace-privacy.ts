@@ -19,10 +19,10 @@ import { suite } from "../harness.ts";
 
 const s = suite("flight-trace-privacy");
 
-import { FLIGHT_EVENT_SCHEMA_VERSION } from "../../src/observability/flightEnvelope";
-import { FLIGHT_TAXONOMY_VERSION, FLIGHT_KIND } from "../../src/observability/flightTaxonomy";
-import { PathIdentityResolver, deriveVaultPathSalt } from "../../src/telemetry/debug/pathIdentity";
-import { FlightRecorder } from "../../src/telemetry/debug/flightRecorder";
+import { FLIGHT_EVENT_SCHEMA_VERSION } from "../../legacy-src/observability/flightEnvelope";
+import { FLIGHT_TAXONOMY_VERSION, FLIGHT_KIND } from "../../legacy-src/observability/flightTaxonomy";
+import { PathIdentityResolver, deriveVaultPathSalt } from "../../legacy-src/telemetry/debug/pathIdentity";
+import { FlightRecorder } from "../../legacy-src/telemetry/debug/flightRecorder";
 import { createHash } from "node:crypto";
 
 async function sha256Hex(input: string): Promise<string> {

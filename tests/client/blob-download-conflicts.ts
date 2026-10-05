@@ -2,9 +2,9 @@ import { App, TFile, type FileStats } from "obsidian";
 import {
 	BlobSyncManager,
 	type AttachmentCatalogPort,
-} from "../../src/sync/blobSync";
-import type { BlobRef } from "../../src/types";
-import type { ProductFlightPathEventInput } from "../../src/observability/traceSink";
+} from "../../legacy-src/sync/blobSync";
+import type { BlobRef } from "../../legacy-src/types";
+import type { ProductFlightPathEventInput } from "../../legacy-src/observability/traceSink";
 import { suite } from "../harness.ts";
 
 const s = suite("blob-download-conflicts");

@@ -4,12 +4,12 @@ import * as encoding from "lib0/encoding";
 import * as Y from "yjs";
 import { messageAwareness, messageQueryAwareness } from "y-partyserver/provider";
 import { Awareness, encodeAwarenessUpdate } from "y-protocols/awareness";
-import { fencedWebSocketConstructor } from "../../src/sync/fencedWebSocket";
+import { fencedWebSocketConstructor } from "../../legacy-src/sync/fencedWebSocket";
 import {
 	AWARENESS_REMOTE_TIMEOUT_MS,
 	AWARENESS_RENEW_MS,
 	OwnAwarenessProvider,
-} from "../../src/sync/ownAwarenessProvider";
+} from "../../legacy-src/sync/ownAwarenessProvider";
 import { suite } from "../harness.ts";
 
 // The server binds exactly one awareness client per socket and closes a socket

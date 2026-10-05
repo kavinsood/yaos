@@ -13,7 +13,7 @@
 import { createHash } from "node:crypto";
 import { vaultRoute } from "../../../tests/live/schema4Live";
 import { deviceBearerHeaders } from "../../../tests/live/liveIdentity";
-import { applyDiffToYText } from "../../../src/sync/diff";
+import { applyDiffToYText } from "../../../legacy-src/sync/diff";
 import { dist, log, now, r2, sleep } from "../lib/common";
 import { bodyGet, convergence, diagnostics } from "../lib/checks";
 import { freshNotes, openOrThrow, type RunCtx } from "../lib/run";

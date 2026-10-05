@@ -1,42 +1,42 @@
 import { access } from "node:fs/promises";
 import { TFile } from "obsidian";
 
-import { BootstrapClient, BootstrapHttpPort, prepareBootstrapRoot } from "../../../src/sync/bootstrapClient";
-import { DiskMirror } from "../../../src/sync/diskMirror";
-import { ObsidianCanvasDiskMirror } from "../../../src/sync/canvas/canvasDiskMirror";
-import { createSocketTicketCache } from "../../../src/sync/socketTicket";
-import { clientTimer } from "../../../src/runtime/testOnlyTimers";
-import { BodySettlementRepository } from "../../../src/sync/bodySettlement";
+import { BootstrapClient, BootstrapHttpPort, prepareBootstrapRoot } from "../../../legacy-src/sync/bootstrapClient";
+import { DiskMirror } from "../../../legacy-src/sync/diskMirror";
+import { ObsidianCanvasDiskMirror } from "../../../legacy-src/sync/canvas/canvasDiskMirror";
+import { createSocketTicketCache } from "../../../legacy-src/sync/socketTicket";
+import { clientTimer } from "../../../legacy-src/runtime/testOnlyTimers";
+import { BodySettlementRepository } from "../../../legacy-src/sync/bodySettlement";
 import { canonicalMarkdownHash } from "../../../server/src/shared/markdownCodec";
 import {
 	VaultSync,
 	type ReconcileMode,
-} from "../../../src/sync/vaultSync";
-import { ReconciliationController } from "../../../src/runtime/reconciliationController";
-import { buildRuntimeConfig, type RuntimeConfig } from "../../../src/runtime/runtimeConfig";
-import { DEFAULT_SETTINGS, type VaultSyncSettings } from "../../../src/settings/settingsStore";
-import { FrontmatterGuardCoordinator } from "../../../src/sync/frontmatterGuardCoordinator";
-import type { FrontmatterQuarantineEntry } from "../../../src/sync/frontmatterQuarantine";
+} from "../../../legacy-src/sync/vaultSync";
+import { ReconciliationController } from "../../../legacy-src/runtime/reconciliationController";
+import { buildRuntimeConfig, type RuntimeConfig } from "../../../legacy-src/runtime/runtimeConfig";
+import { DEFAULT_SETTINGS, type VaultSyncSettings } from "../../../legacy-src/settings/settingsStore";
+import { FrontmatterGuardCoordinator } from "../../../legacy-src/sync/frontmatterGuardCoordinator";
+import type { FrontmatterQuarantineEntry } from "../../../legacy-src/sync/frontmatterQuarantine";
 import {
 	contentBaselineHash,
 	currentContentHash,
 	setCurrentContentHash,
 	type DiskIndex,
-} from "../../../src/sync/diskIndex";
-import type { DiskIngestPort } from "../../../src/runtime/engineControlPort";
-import { isCanvasSyncable, isMarkdownSyncable } from "../../../src/types";
-import { createFetchRequester } from "../../../src/utils/http";
-import { fetchVaultProvisioningProof } from "../../../src/onboarding/provisioningClient";
-import { LocalVaultImporter } from "../../../src/onboarding/localVaultImport";
+} from "../../../legacy-src/sync/diskIndex";
+import type { DiskIngestPort } from "../../../legacy-src/runtime/engineControlPort";
+import { isCanvasSyncable, isMarkdownSyncable } from "../../../legacy-src/types";
+import { createFetchRequester } from "../../../legacy-src/utils/http";
+import { fetchVaultProvisioningProof } from "../../../legacy-src/onboarding/provisioningClient";
+import { LocalVaultImporter } from "../../../legacy-src/onboarding/localVaultImport";
 import {
 	FreshBodyAdmissionLocalVaultImportSink,
 	ObsidianLocalVaultImportSource,
-} from "../../../src/onboarding/obsidianLocalVaultImport";
+} from "../../../legacy-src/onboarding/obsidianLocalVaultImport";
 import type {
 	LocalFileRevision,
 	LocalInventoryEntry,
 	LocalVaultImportSource,
-} from "../../../src/onboarding/localVaultImport";
+} from "../../../legacy-src/onboarding/localVaultImport";
 
 import type { CleanupStack } from "./cleanup";
 import { createAccessFetch, createAccessWebSocketImplementation } from "./access";

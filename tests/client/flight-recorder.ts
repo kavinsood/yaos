@@ -9,10 +9,10 @@
  *   - Event model: FLIGHT_KIND constants, FlightKind type
  */
 
-import { PathIdentityResolver, deriveVaultPathSalt, deriveSaltFingerprint } from "../../src/telemetry/debug/pathIdentity";
-import { FlightRecorder } from "../../src/telemetry/debug/flightRecorder";
-import { ensureAdapterDirectory } from "../../src/utils/adapterDirectory";
-import { FLIGHT_KIND } from "../../src/observability/flightTaxonomy";
+import { PathIdentityResolver, deriveVaultPathSalt, deriveSaltFingerprint } from "../../legacy-src/telemetry/debug/pathIdentity";
+import { FlightRecorder } from "../../legacy-src/telemetry/debug/flightRecorder";
+import { ensureAdapterDirectory } from "../../legacy-src/utils/adapterDirectory";
+import { FLIGHT_KIND } from "../../legacy-src/observability/flightTaxonomy";
 import { suite } from "../harness.ts";
 
 const s = suite("flight-recorder");

@@ -1,10 +1,10 @@
 import { strict as assert } from "node:assert";
 import * as Y from "yjs";
-import { BootstrapClient, type ClientBodyState, type ClientCatalogEntry } from "../../src/sync/bootstrapClient";
-import { BodyManager } from "../../src/sync/bodyManager";
-import type { StoredBootstrapProgress, StoredDocument, StoredOutstandingBody } from "../../src/sync/vaultIndexedDb";
+import { BootstrapClient, type ClientBodyState, type ClientCatalogEntry } from "../../legacy-src/sync/bootstrapClient";
+import { BodyManager } from "../../legacy-src/sync/bodyManager";
+import type { StoredBootstrapProgress, StoredDocument, StoredOutstandingBody } from "../../legacy-src/sync/vaultIndexedDb";
 import { suite } from "../harness.ts";
-import { SCHEMA_VERSION } from "../../src/sync/schema";
+import { SCHEMA_VERSION } from "../../legacy-src/sync/schema";
 
 const s = suite("bootstrap-rename-race");
 

@@ -1,5 +1,5 @@
 import { strict as assert } from "node:assert";
-import type { OperationOutcome } from "../../src/runtime/operationLifecycle";
+import type { OperationOutcome } from "../../legacy-src/runtime/operationLifecycle";
 import {
 	OverdueWorkKernel,
 	ReconstructibleOverdueWorkStore,
@@ -11,7 +11,7 @@ import {
 	type TerminalWorkOutcome,
 	type WorkBlocker,
 	type WorkRetry,
-} from "../../src/runtime/overdueWorkKernel";
+} from "../../legacy-src/runtime/overdueWorkKernel";
 import { suite } from "../harness.ts";
 
 interface Metadata {

@@ -3,7 +3,7 @@ import {
 	type ClosedFileConflictDecision,
 	decideClosedFileConflict,
 	type MissingBaselineWinnerPolicy,
-} from "../../src/sync/closedFileConflict";
+} from "../../legacy-src/sync/closedFileConflict";
 import { suite } from "../harness.ts";
 
 // The assertions are node:assert's structural comparisons, unchanged: they

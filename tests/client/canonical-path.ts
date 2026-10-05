@@ -5,7 +5,7 @@
  * displayPath preservation, and canonicalKey determinism.
  */
 
-import { canonicalizeVaultPath } from "../../src/paths/canonicalPath";
+import { canonicalizeVaultPath } from "../../legacy-src/paths/canonicalPath";
 import { suite } from "../harness.ts";
 
 const s = suite("canonical-path");

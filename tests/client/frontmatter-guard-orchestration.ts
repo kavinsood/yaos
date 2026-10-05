@@ -49,17 +49,17 @@
 
 import { MarkdownView, TFile } from "obsidian";
 import * as Y from "yjs";
-import { ReconciliationController } from "../../src/runtime/reconciliationController";
-import type { DiskIngestPort } from "../../src/runtime/engineControlPort";
-import { FLIGHT_KIND } from "../../src/observability/flightTaxonomy";
+import { ReconciliationController } from "../../legacy-src/runtime/reconciliationController";
+import type { DiskIngestPort } from "../../legacy-src/runtime/engineControlPort";
+import { FLIGHT_KIND } from "../../legacy-src/observability/flightTaxonomy";
 import type {
 	FlightEventInput,
 	FlightPathEventInput,
-} from "../../src/observability/flightEnvelope";
+} from "../../legacy-src/observability/flightEnvelope";
 import {
 	ORIGIN_DISK_SYNC_RECOVER_BOUND,
 	ORIGIN_DISK_SYNC_OPEN_IDLE_RECOVER,
-} from "../../src/sync/origins";
+} from "../../legacy-src/sync/origins";
 import { suite } from "../harness.ts";
 
 const s = suite("frontmatter-guard-orchestration");

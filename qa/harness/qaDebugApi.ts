@@ -14,14 +14,14 @@
  */
 
 import { MarkdownView, type App } from "obsidian";
-import type { VaultSync } from "../../src/sync/vaultSync";
-import type { ReconciliationController } from "../../src/runtime/reconciliationController";
-import type { ConnectionController } from "../../src/runtime/connectionController";
-import type { FlightTraceController } from "../../src/telemetry/debug/flightTraceController";
-import type { EditorBindingManager } from "../../src/sync/editorBinding";
-import { FLIGHT_KIND } from "../../src/observability/flightTaxonomy";
-import { yTextToString } from "../../src/utils/format";
-import { forceReplaceYText } from "../../src/sync/diff";
+import type { VaultSync } from "../../legacy-src/sync/vaultSync";
+import type { ReconciliationController } from "../../legacy-src/runtime/reconciliationController";
+import type { ConnectionController } from "../../legacy-src/runtime/connectionController";
+import type { FlightTraceController } from "../../legacy-src/telemetry/debug/flightTraceController";
+import type { EditorBindingManager } from "../../legacy-src/sync/editorBinding";
+import { FLIGHT_KIND } from "../../legacy-src/observability/flightTaxonomy";
+import { yTextToString } from "../../legacy-src/utils/format";
+import { forceReplaceYText } from "../../legacy-src/sync/diff";
 import {
 	isReceiptWaitReadyAfter,
 	isReceiptWaitReadyAfterCheckpoint,
@@ -233,7 +233,7 @@ export interface YaosQaDebugApi {
 // YaosUnsafeQaPort. If any method signature drifts, this file will fail
 // to compile with a clear type error showing the incompatibility.
 // -----------------------------------------------------------------------
-import type { YaosDebugPort } from "../../src/telemetry/debug/ports/yaosDebugPort";
+import type { YaosDebugPort } from "../../legacy-src/telemetry/debug/ports/yaosDebugPort";
 import type { YaosUnsafeQaPort } from "./ports/yaosUnsafeQaPort";
 
 // Full assignability checks — not just method names, but full signatures.
@@ -267,7 +267,7 @@ interface PluginHandle {
 	/** Fingerprint of the derived path salt, `sha256:<hex>`, or null when idle. */
 	getPathSaltFingerprint(): string | null;
 	/** Engine control port — present when the QA automation harness is active. */
-	getEngineControlPort(): import("../../src/runtime/engineControlPort").EngineControlPort;
+	getEngineControlPort(): import("../../legacy-src/runtime/engineControlPort").EngineControlPort;
 }
 
 // -----------------------------------------------------------------------

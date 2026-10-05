@@ -1,5 +1,5 @@
 import type { App, PluginManifest } from "obsidian";
-import { runSmokeInstallCalendar } from "../../src/sync/settingsSync/obsidianPluginInstall";
+import { runSmokeInstallCalendar } from "../../legacy-src/sync/settingsSync/obsidianPluginInstall";
 import { suite } from "../harness.ts";
 
 const s = suite("obsidian-plugin-install");

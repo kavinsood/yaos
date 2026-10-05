@@ -1,11 +1,11 @@
 import { strict as assert } from "node:assert";
-import type { OperationOutcome } from "../../src/runtime/operationLifecycle";
-import type { DurableWorkIntent, OverdueWorkClock } from "../../src/runtime/overdueWorkKernel";
+import type { OperationOutcome } from "../../legacy-src/runtime/operationLifecycle";
+import type { DurableWorkIntent, OverdueWorkClock } from "../../legacy-src/runtime/overdueWorkKernel";
 import {
 	VaultWorkScheduler,
 	type VaultWorkMetadata,
 	type VaultWorkSchedulerDeps,
-} from "../../src/sync/vaultWorkScheduler";
+} from "../../legacy-src/sync/vaultWorkScheduler";
 import { suite } from "../harness.ts";
 
 interface TimerRecord {

@@ -19,7 +19,7 @@ import {
 	FINGERPRINT_QUARANTINE_TTL_MS,
 	FINGERPRINT_MAP_MAX_SIZE,
 	type FingerprintEntry,
-} from "../../src/runtime/reconcile/fingerprintQuarantinePolicy";
+} from "../../legacy-src/runtime/reconcile/fingerprintQuarantinePolicy";
 import { suite } from "../harness.ts";
 
 const s = suite("fingerprint-quarantine-policy");

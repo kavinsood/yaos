@@ -14,7 +14,7 @@
 import * as Y from "yjs";
 import { bloatedDoc, mulberry32 } from "../../scripts/relay2/reset/bloat";
 import { runCompaction, type CompactionOutcome } from "../../scripts/relay2/reset/leaseClient";
-import { prepareSemanticEpochTransition } from "../../src/sync/semanticEpochTransition";
+import { prepareSemanticEpochTransition } from "../../legacy-src/sync/semanticEpochTransition";
 import { MockRelayBody, SimDevice } from "../../scripts/relay2/reset/mockServer";
 import { suite } from "../harness.ts";
 

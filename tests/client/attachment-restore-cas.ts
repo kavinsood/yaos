@@ -1,10 +1,10 @@
 import { strict as assert } from "node:assert";
 import { suite } from "../harness.ts";
-import { BlobSyncManager, type AttachmentCatalogPort } from "../../src/sync/blobSync";
-import type { AttachmentIntentOutcome } from "../../src/sync/vaultSync";
-import type { AttachmentHead } from "../../src/types";
-import { SnapshotService } from "../../src/snapshots/snapshotService";
-import type { RestoreItem } from "../../src/snapshots/recoveryClient";
+import { BlobSyncManager, type AttachmentCatalogPort } from "../../legacy-src/sync/blobSync";
+import type { AttachmentIntentOutcome } from "../../legacy-src/sync/vaultSync";
+import type { AttachmentHead } from "../../legacy-src/types";
+import { SnapshotService } from "../../legacy-src/snapshots/snapshotService";
+import type { RestoreItem } from "../../legacy-src/snapshots/recoveryClient";
 
 const s = suite("attachment-restore-cas");
 

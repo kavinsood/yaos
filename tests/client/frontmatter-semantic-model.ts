@@ -1,14 +1,14 @@
 import { strict as assert } from "node:assert";
 import * as Y from "yjs";
-import { projectFrontmatterSemantics } from "../../src/sync/frontmatterProjection";
-import { FrontmatterSemanticMirror } from "../../src/sync/frontmatterSemanticMirror";
+import { projectFrontmatterSemantics } from "../../legacy-src/sync/frontmatterProjection";
+import { FrontmatterSemanticMirror } from "../../legacy-src/sync/frontmatterSemanticMirror";
 import {
 	FRONTMATTER_SET_ADDS_ROOT,
 	FRONTMATTER_SET_REMOVES_ROOT,
 	FRONTMATTER_PRESENCE_ROOT,
 	applyFrontmatterSemanticTransition,
 	readFrontmatterSemanticSnapshot,
-} from "../../src/sync/frontmatterSemanticModel";
+} from "../../legacy-src/sync/frontmatterSemanticModel";
 import { suite } from "../harness.ts";
 
 const s = suite("frontmatter-semantic-model");

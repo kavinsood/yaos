@@ -14,17 +14,17 @@
 import { strict as assert } from "node:assert";
 import * as Y from "yjs";
 import { MarkdownView, TFile } from "obsidian";
-import { ReconciliationController } from "../../src/runtime/reconciliationController";
+import { ReconciliationController } from "../../legacy-src/runtime/reconciliationController";
 import {
 	contentBaselineHash,
 	currentContentHash,
 	setCurrentContentHash,
 	type DiskIndex,
 	type DiskIndexEntry,
-} from "../../src/sync/diskIndex";
-import { DiskMirror } from "../../src/sync/diskMirror";
-import type { EditorBindingManager } from "../../src/sync/editorBinding";
-import type { StoredBodySettlementV1 } from "../../src/sync/bodySettlement";
+} from "../../legacy-src/sync/diskIndex";
+import { DiskMirror } from "../../legacy-src/sync/diskMirror";
+import type { EditorBindingManager } from "../../legacy-src/sync/editorBinding";
+import type { StoredBodySettlementV1 } from "../../legacy-src/sync/bodySettlement";
 import {
 	VaultSync,
 	type CandidateRecord,
@@ -33,9 +33,9 @@ import {
 	type SyncProviderPort,
 	type VaultDatabasePort,
 	type VaultServerPort,
-} from "../../src/sync/vaultSync";
-import type { StoredDocument } from "../../src/sync/vaultIndexedDb";
-import type { DiskIngestPort } from "../../src/runtime/engineControlPort";
+} from "../../legacy-src/sync/vaultSync";
+import type { StoredDocument } from "../../legacy-src/sync/vaultIndexedDb";
+import type { DiskIngestPort } from "../../legacy-src/runtime/engineControlPort";
 import { suite } from "../harness.ts";
 import { partialOf } from "../mocks/productFixture.ts";
 import { installDomCrypto } from "./helpers/installDomCrypto.ts";

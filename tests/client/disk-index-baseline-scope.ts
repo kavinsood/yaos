@@ -18,8 +18,8 @@ import {
 	trustedContentHash,
 	type DiskIndex,
 	type DiskIndexEntry,
-} from "../../src/sync/diskIndex";
-import { VaultIndexedDb } from "../../src/sync/vaultIndexedDb";
+} from "../../legacy-src/sync/diskIndex";
+import { VaultIndexedDb } from "../../legacy-src/sync/vaultIndexedDb";
 import { FakeIndexedDb } from "../mocks/indexedDb";
 import { installDomCrypto } from "./helpers/installDomCrypto.ts";
 import { suite } from "../harness.ts";

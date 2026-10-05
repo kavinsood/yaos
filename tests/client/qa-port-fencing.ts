@@ -19,7 +19,7 @@
  * nothing.
  */
 
-import type { YaosDebugPort } from "../../src/telemetry/debug/ports/yaosDebugPort";
+import type { YaosDebugPort } from "../../legacy-src/telemetry/debug/ports/yaosDebugPort";
 import { suite } from "../harness.ts";
 
 const s = suite("qa-port-fencing");

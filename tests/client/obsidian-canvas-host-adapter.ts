@@ -1,5 +1,5 @@
 import { strict as assert } from "node:assert";
-import { ObsidianCanvasHostAdapter } from "../../src/host/obsidianCanvasHostAdapter";
+import { ObsidianCanvasHostAdapter } from "../../legacy-src/host/obsidianCanvasHostAdapter";
 import { suite } from "../harness.ts";
 
 const s = suite("obsidian-canvas-host-adapter");

@@ -44,7 +44,7 @@
  */
 
 import * as Y from "yjs";
-import { applyDiffToYText } from "../../src/sync/diff";
+import { applyDiffToYText } from "../../legacy-src/sync/diff";
 import {
 	isLocalOrigin,
 	isLocalStringOrigin,
@@ -55,7 +55,7 @@ import {
 	ORIGIN_EDITOR_HEALTH_HEAL,
 	ORIGIN_RESTORE,
 	ORIGIN_SEED,
-} from "../../src/sync/origins";
+} from "../../legacy-src/sync/origins";
 import { suite } from "../harness.ts";
 
 const s = suite("recovery-amplifier");

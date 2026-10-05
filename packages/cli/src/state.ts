@@ -3,8 +3,8 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import nodePath from "node:path";
 
-import type { VaultProvisioningProof } from "../../../src/onboarding/provisioningClient";
-import type { VaultCapability, VaultRole } from "../../../src/collaboration/authority";
+import type { VaultProvisioningProof } from "../../../legacy-src/onboarding/provisioningClient";
+import type { VaultCapability, VaultRole } from "../../../legacy-src/collaboration/authority";
 import { ConfigError, resolveStateDirectoryOverride } from "./config";
 import { ensureDirectoryDurable, writeFileAtomic } from "./fs";
 

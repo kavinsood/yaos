@@ -1,10 +1,10 @@
-import { sha256TextHex } from "../../src/utils/sha256";
+import { sha256TextHex } from "../../legacy-src/utils/sha256";
 import {
 	computeFolderKey,
 	folderKeySeed,
 	vaultIdbName,
-} from "../../src/sync/vaultPersistence";
-import { schema6VaultIdbName } from "../../src/sync/vaultIndexedDb";
+} from "../../legacy-src/sync/vaultPersistence";
+import { schema6VaultIdbName } from "../../legacy-src/sync/vaultIndexedDb";
 import { readSource, suite } from "../harness.ts";
 
 const s = suite("vault-persistence");

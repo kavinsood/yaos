@@ -1,5 +1,5 @@
-import { HostPatchRegistry } from "../../src/host/hostPatchRegistry";
-import { createObsidianHostAdapter, leafIdentity } from "../../src/host/obsidianHostAdapter";
+import { HostPatchRegistry } from "../../legacy-src/host/hostPatchRegistry";
+import { createObsidianHostAdapter, leafIdentity } from "../../legacy-src/host/obsidianHostAdapter";
 import { suite } from "../harness.ts";
 
 const s = suite("obsidian-host-adapter");

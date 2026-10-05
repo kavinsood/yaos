@@ -61,10 +61,10 @@ import {
 	type TraceHeaderInput,
 	type TraceHeaderStateInput,
 	type TraceHeaderTraceFacts,
-} from "../../src/telemetry/diagnostics/diagnosticsBundle";
-import { BodyManager } from "../../src/sync/bodyManager";
-import { ResidencyAdmissionCoordinator } from "../../src/runtime/residencyAdmissionCoordinator";
-import { OperationalResourceSnapshotTracker } from "../../src/runtime/operationalResourceSnapshot";
+} from "../../legacy-src/telemetry/diagnostics/diagnosticsBundle";
+import { BodyManager } from "../../legacy-src/sync/bodyManager";
+import { ResidencyAdmissionCoordinator } from "../../legacy-src/runtime/residencyAdmissionCoordinator";
+import { OperationalResourceSnapshotTracker } from "../../legacy-src/runtime/operationalResourceSnapshot";
 import { suite } from "../harness.ts";
 
 const s = suite("diagnostics-bundle");

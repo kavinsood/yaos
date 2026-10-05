@@ -6,7 +6,7 @@
 //     2. authAccepted is false for explicit server rejections.
 //     3. pendingLocalCount stays null even when connected; socket-open is not server receipt.
 
-import { deriveSyncFacts, type SyncFactsSnapshot, type SyncFacts } from "../../src/runtime/connectionFacts";
+import { deriveSyncFacts, type SyncFactsSnapshot, type SyncFacts } from "../../legacy-src/runtime/connectionFacts";
 import { suite } from "../harness.ts";
 
 const s = suite("sync-facts");

@@ -4,12 +4,12 @@ import * as Y from "yjs";
 import { canonicalCanvasBytes, parseCanvasBytes } from "../../server/src/shared/canvasCodec";
 import { applyCanvasSnapshot, createCanvasDocument, materializeCanvasDocument } from "../../server/src/shared/canvasSemanticDocument";
 import type { SemanticPathRef } from "../../server/src/shared/canvasTypes";
-import { CanvasManager, type CanvasProjectionPort, type CanvasProviderPort } from "../../src/sync/canvas/canvasManager";
-import { CanvasHttpTransport, CanvasSemanticEpochMismatchError } from "../../src/sync/canvas/canvasTransport";
+import { CanvasManager, type CanvasProjectionPort, type CanvasProviderPort } from "../../legacy-src/sync/canvas/canvasManager";
+import { CanvasHttpTransport, CanvasSemanticEpochMismatchError } from "../../legacy-src/sync/canvas/canvasTransport";
 import type { CanvasAuthorityReceipt, CanvasCandidateReceipt, CanvasDemotionRequest, CanvasLifecycleRequest,
-	CanvasPromotionRequest, CanvasState } from "../../src/sync/canvas/canvasTransport";
-import type { StoredCanvasCandidate, StoredCanvasEpochReplacement, StoredCanvasLifecycle, StoredCanvasSettlement, StoredDocument } from "../../src/sync/vaultIndexedDb";
-import { sha256BytesHex } from "../../src/utils/sha256";
+	CanvasPromotionRequest, CanvasState } from "../../legacy-src/sync/canvas/canvasTransport";
+import type { StoredCanvasCandidate, StoredCanvasEpochReplacement, StoredCanvasLifecycle, StoredCanvasSettlement, StoredDocument } from "../../legacy-src/sync/vaultIndexedDb";
+import { sha256BytesHex } from "../../legacy-src/utils/sha256";
 import { suite } from "../harness.ts";
 
 const s = suite("canvas-manager");

@@ -3,16 +3,16 @@ import { createHash, randomBytes } from "node:crypto";
 import * as decoding from "lib0/decoding";
 import * as encoding from "lib0/encoding";
 import * as Y from "yjs";
-import { fencedWebSocketConstructor } from "../../src/sync/fencedWebSocket";
-import { OwnAwarenessProvider } from "../../src/sync/ownAwarenessProvider";
+import { fencedWebSocketConstructor } from "../../legacy-src/sync/fencedWebSocket";
+import { OwnAwarenessProvider } from "../../legacy-src/sync/ownAwarenessProvider";
 import {
 	RECEIPT_RESEND_MAX_MS,
 	RECEIPT_RESEND_MS,
 	RelayReceiptChannel,
 	parseSyncFrame,
 	type RelayReceiptInfo,
-} from "../../src/sync/relayReceipts";
-import { sha256HexSync } from "../../src/utils/sha256Sync";
+} from "../../legacy-src/sync/relayReceipts";
+import { sha256HexSync } from "../../legacy-src/utils/sha256Sync";
 import { suite } from "../harness.ts";
 
 const s = suite("relay-receipts");

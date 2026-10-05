@@ -23,7 +23,7 @@ import { actorHeaders } from "../../server/src/vaultAuthority";
 import type { VaultActorContext } from "../../server/src/collaboration";
 import { CF_DO_ROWS_WRITTEN_LIMIT_MESSAGE, DAILY_LIMIT_ERROR_CODE, DailyLimitLatch, instrumentStorageForDailyLimit } from "../../server/src/dailyLimit";
 import { FakeObjectStore } from "../mocks/workerEnv.ts";
-import { decodeRecoveryStateObject } from "../../src/snapshots/recoveryStateDecode";
+import { decodeRecoveryStateObject } from "../../legacy-src/snapshots/recoveryStateDecode";
 import { suite } from "../harness.ts";
 
 const s = suite("bulk-create-inline-projection");

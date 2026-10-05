@@ -5,7 +5,7 @@
 import {
 	findCanonicalPathCollisions,
 	isCanonicalPathFileIdCollision,
-} from "../../src/paths/pathCollision";
+} from "../../legacy-src/paths/pathCollision";
 import { suite } from "../harness.ts";
 
 const s = suite("path-collision");

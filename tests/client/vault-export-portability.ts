@@ -1,6 +1,6 @@
 import { strFromU8, unzipSync } from "fflate";
-import { buildPortableVaultArchive } from "../../src/snapshots/vaultExport";
-import { VAULT_LIFECYCLE_COPY } from "../../src/snapshots/vaultLifecycleCopy";
+import { buildPortableVaultArchive } from "../../legacy-src/snapshots/vaultExport";
+import { VAULT_LIFECYCLE_COPY } from "../../legacy-src/snapshots/vaultLifecycleCopy";
 import { suite } from "../harness.ts";
 
 const s = suite("vault-export-portability");

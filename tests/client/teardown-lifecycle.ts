@@ -2,7 +2,7 @@ import {
 	RuntimeTeardownCoordinator,
 	runTeardownStages,
 	TeardownStagesError,
-} from "../../src/runtime/teardownLifecycle";
+} from "../../legacy-src/runtime/teardownLifecycle";
 import { readSource, suite } from "../harness.ts";
 
 const s = suite("teardown-lifecycle");

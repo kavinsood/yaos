@@ -10,14 +10,14 @@ import {
 	type SyncProviderPort,
 	type VaultDatabasePort,
 	type VaultServerPort,
-} from "../../../src/sync/vaultSync";
+} from "../../../legacy-src/sync/vaultSync";
 import type {
 	StoredAttachmentPublicationOperation,
 	StoredDocument,
 	StoredLifecycleOperation,
-} from "../../../src/sync/vaultIndexedDb";
+} from "../../../legacy-src/sync/vaultIndexedDb";
 import { partialOf } from "../../mocks/productFixture.ts";
-import { PROTOCOL_VERSION, SCHEMA_VERSION } from "../../../src/sync/schema";
+import { PROTOCOL_VERSION, SCHEMA_VERSION } from "../../../legacy-src/sync/schema";
 
 /**
  * In-memory model of `POST /lifecycle/create-bulk` with the server's

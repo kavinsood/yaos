@@ -4,7 +4,7 @@ import {
 	applyDiffToYTextWithPostcondition,
 	forceReplaceYText,
 	tryApplyDiffToYText,
-} from "../../src/sync/diff";
+} from "../../legacy-src/sync/diff";
 import { suite } from "../harness.ts";
 
 const s = suite("diff-regressions");

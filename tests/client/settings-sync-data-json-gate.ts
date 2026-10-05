@@ -1,4 +1,4 @@
-import { canApplyPluginData, canPutPluginData } from "../../src/sync/settingsSync/dataJsonGate";
+import { canApplyPluginData, canPutPluginData } from "../../legacy-src/sync/settingsSync/dataJsonGate";
 import { suite } from "../harness.ts";
 
 const s = suite("settings-sync-data-json-gate");

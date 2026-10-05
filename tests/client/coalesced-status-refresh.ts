@@ -1,4 +1,4 @@
-import { CoalescedStatusRefresh } from "../../src/status/coalescedStatusRefresh";
+import { CoalescedStatusRefresh } from "../../legacy-src/status/coalescedStatusRefresh";
 import { sleep, suite } from "../harness.ts";
 
 const s = suite("coalesced-status-refresh");

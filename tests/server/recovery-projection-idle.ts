@@ -28,14 +28,14 @@ import { VaultStore } from "../../server/src/vaultStore";
 import { actorHeaders } from "../../server/src/vaultAuthority";
 import type { VaultActorContext } from "../../server/src/collaboration";
 import { FakeObjectStore } from "../mocks/workerEnv.ts";
-import { decodeRecoveryStateObject } from "../../src/snapshots/recoveryStateDecode";
+import { decodeRecoveryStateObject } from "../../legacy-src/snapshots/recoveryStateDecode";
 import { runStateProjectionPass, STATE_PROJECTION_LIMITS } from "../../server/src/recoveryStateProjection";
 import { nextUtcMidnight } from "../../server/src/dailyLimit";
 import { suite } from "../harness.ts";
 import { recoveryRevisionIdentity } from "../../server/src/recoveryAuthorityStore";
 import { RECOVERY_STATE_CONTENT_TYPE } from "../../server/src/shared/recoveryStateObject";
-import { RecoveryClient, type RestoreItem } from "../../src/snapshots/recoveryClient";
-import { DEFAULT_SETTINGS } from "../../src/settings";
+import { RecoveryClient, type RestoreItem } from "../../legacy-src/snapshots/recoveryClient";
+import { DEFAULT_SETTINGS } from "../../legacy-src/settings";
 
 const s = suite("recovery-projection-idle");
 

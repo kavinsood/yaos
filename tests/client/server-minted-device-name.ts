@@ -1,7 +1,7 @@
 import {
 	defaultDeviceName,
 	type DevicePlatform,
-} from "../../src/utils/defaultDeviceName";
+} from "../../legacy-src/utils/defaultDeviceName";
 import { readSource, suite } from "../harness.ts";
 
 const s = suite("server-minted-device-name");

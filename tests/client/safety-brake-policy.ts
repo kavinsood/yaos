@@ -14,7 +14,7 @@ import {
 	evaluateSafetyBrake,
 	SAFETY_BRAKE_MIN_COUNT,
 	SAFETY_BRAKE_MIN_RATIO,
-} from "../../src/runtime/reconcile/safetyBrakePolicy";
+} from "../../legacy-src/runtime/reconcile/safetyBrakePolicy";
 import { suite } from "../harness.ts";
 
 const s = suite("safety-brake-policy");

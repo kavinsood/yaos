@@ -33,7 +33,7 @@
 		"noEmit": true
 	},
 	"include": [
-		"src/**/*.ts",
+		"legacy-src/**/*.ts",
 		"server/src/**/*.ts",
 		"tests/**/*.ts"
 	]

@@ -1,11 +1,11 @@
 import { strict as assert } from "node:assert";
-import { RuntimeScope } from "../../src/runtime/operationLifecycle";
+import { RuntimeScope } from "../../legacy-src/runtime/operationLifecycle";
 import {
 	ShortLivedConnectionBackoff,
 	SocketAdmissionCoordinator,
 	SocketAdmissionGate,
 	type SocketAdmissionProvider,
-} from "../../src/runtime/socketAdmissionCoordinator";
+} from "../../legacy-src/runtime/socketAdmissionCoordinator";
 import { suite, until } from "../harness.ts";
 
 const s = suite("socket-admission-coordinator");

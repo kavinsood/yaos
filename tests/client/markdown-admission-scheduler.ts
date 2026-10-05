@@ -1,12 +1,12 @@
 import { strict as assert } from "node:assert";
-import type { OperationOutcome } from "../../src/runtime/operationLifecycle";
+import type { OperationOutcome } from "../../legacy-src/runtime/operationLifecycle";
 import {
 	DEFAULT_MAX_WAIT_MS,
 	DEFAULT_SETTLE_MS,
 	MarkdownAdmissionScheduler,
 	type MarkdownAdmissionIntent,
-} from "../../src/runtime/markdownAdmissionScheduler";
-import type { OverdueWorkClock } from "../../src/runtime/overdueWorkKernel";
+} from "../../legacy-src/runtime/markdownAdmissionScheduler";
+import type { OverdueWorkClock } from "../../legacy-src/runtime/overdueWorkKernel";
 import { suite } from "../harness.ts";
 import { installDomCrypto } from "./helpers/installDomCrypto.ts";
 

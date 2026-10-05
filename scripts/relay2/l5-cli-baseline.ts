@@ -68,10 +68,10 @@ const MODES: Mode[] = ["prod", "nodebounce", "relay", "relay250", "native"];
 const DEVICE: Record<Mode, string> = { prod: "L5p", nodebounce: "L5n", relay: "L5r", relay250: "L5d", native: "L5v" };
 
 async function runMode(host: string, mode: Mode, opts: { n: number; offlineProbe: boolean; typingProbe: boolean; persist: "before-send" | "after-send"; burst: number; burstInterval: number; spacing: number; tag: string }) {
-	const { VaultSync } = await import("../../src/sync/vaultSync");
-	const { createSocketTicketCache } = await import("../../src/sync/socketTicket");
-	const { createFetchRequester } = await import("../../src/utils/http");
-	const { BootstrapHttpPort, prepareBootstrapRoot } = await import("../../src/sync/bootstrapClient");
+	const { VaultSync } = await import("../../legacy-src/sync/vaultSync");
+	const { createSocketTicketCache } = await import("../../legacy-src/sync/socketTicket");
+	const { createFetchRequester } = await import("../../legacy-src/utils/http");
+	const { BootstrapHttpPort, prepareBootstrapRoot } = await import("../../legacy-src/sync/bootstrapClient");
 	const { NodeVaultDatabase } = await import("../../packages/cli/src/nodeVaultDatabase");
 
 	const context = loadContext(host);

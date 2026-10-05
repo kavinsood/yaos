@@ -2,8 +2,8 @@ import {
 	FlightTraceController,
 	setupFlightTraceBestEffort,
 	type FlightTraceDeps,
-} from "../../src/telemetry/debug/flightTraceController";
-import { FLIGHT_KIND } from "../../src/observability/flightTaxonomy";
+} from "../../legacy-src/telemetry/debug/flightTraceController";
+import { FLIGHT_KIND } from "../../legacy-src/observability/flightTaxonomy";
 import { suite } from "../harness.ts";
 
 const s = suite("flight-trace-controller-lifecycle");

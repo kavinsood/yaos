@@ -4,7 +4,7 @@ import {
 	decideLwwMissingRemote,
 	mutationRev,
 	shouldPutMissingRemotePluginData,
-} from "../../src/sync/settingsSync/lwwReconcile";
+} from "../../legacy-src/sync/settingsSync/lwwReconcile";
 import { suite } from "../harness.ts";
 
 const s = suite("settings-sync-lww-reconcile");

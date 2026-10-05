@@ -4,7 +4,7 @@ import {
 	planPluginApply,
 	type PluginInstallCapability,
 	type PluginIntent,
-} from "../../src/sync/settingsSync/pluginIntent";
+} from "../../legacy-src/sync/settingsSync/pluginIntent";
 import { suite } from "../harness.ts";
 
 const s = suite("plugin-intent");

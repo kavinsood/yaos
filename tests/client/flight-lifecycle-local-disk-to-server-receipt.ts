@@ -28,10 +28,10 @@ globalThis.indexedDB = new FakeIndexedDb();
 // Now import the real modules
 // ---------------------------------------------------------------------------
 
-import { FlightRecorder } from "../../src/telemetry/debug/flightRecorder";
-import { FlightTraceController, type FlightTraceDeps } from "../../src/telemetry/debug/flightTraceController";
-import { FLIGHT_KIND } from "../../src/observability/flightTaxonomy";
-import type { FlightEvent } from "../../src/observability/flightEnvelope";
+import { FlightRecorder } from "../../legacy-src/telemetry/debug/flightRecorder";
+import { FlightTraceController, type FlightTraceDeps } from "../../legacy-src/telemetry/debug/flightTraceController";
+import { FLIGHT_KIND } from "../../legacy-src/observability/flightTaxonomy";
+import type { FlightEvent } from "../../legacy-src/observability/flightEnvelope";
 import { suite } from "../harness.ts";
 
 const s = suite("flight-lifecycle-local-disk-to-server-receipt");

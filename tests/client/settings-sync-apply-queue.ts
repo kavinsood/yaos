@@ -5,8 +5,8 @@ import {
 	type ApplyBatch,
 	type ApplyContext,
 	type ApplyStep,
-} from "../../src/sync/settingsSync/apply";
-import { loadApplyQueue } from "../../src/sync/settingsSync/applyQueue";
+} from "../../legacy-src/sync/settingsSync/apply";
+import { loadApplyQueue } from "../../legacy-src/sync/settingsSync/applyQueue";
 import { suite } from "../harness.ts";
 import { FakeIndexedDb } from "../mocks/indexedDb";
 

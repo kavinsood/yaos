@@ -1,13 +1,13 @@
 import { strict as assert } from "node:assert";
 import * as Y from "yjs";
-import { BodyManager } from "../../src/sync/bodyManager";
+import { BodyManager } from "../../legacy-src/sync/bodyManager";
 import {
 	BODY_RESIDENCY_ESTIMATOR_VERSION,
 	estimateReconstructionReservation,
 	measureBodyResidency,
 	numericDistribution,
-} from "../../src/sync/bodyResidencyAccounting";
-import type { StoredDocument } from "../../src/sync/vaultIndexedDb";
+} from "../../legacy-src/sync/bodyResidencyAccounting";
+import type { StoredDocument } from "../../legacy-src/sync/vaultIndexedDb";
 import { suite } from "../harness.ts";
 
 const s = suite("body-residency-accounting");

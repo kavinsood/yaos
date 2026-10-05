@@ -55,11 +55,11 @@ const toBytes = (d: unknown) => (d instanceof Uint8Array ? d : d instanceof Arra
 export async function openRealClient(host: string, context: Context, identity: LiveIdentity, opts: RealClientOptions) {
 	// @ts-expect-error globals.ts is a side-effect script (no exports), loaded lazily so RawClient-only runs never see `window`.
 	await import("../../../packages/cli/src/globals");
-	const { VaultSync } = await import("../../../src/sync/vaultSync");
-	const { PRODUCT_EVENT_KIND } = await import("../../../src/observability/productEventKinds");
-	const { createSocketTicketCache } = await import("../../../src/sync/socketTicket");
-	const { createFetchRequester } = await import("../../../src/utils/http");
-	const { BootstrapHttpPort, prepareBootstrapRoot } = await import("../../../src/sync/bootstrapClient");
+	const { VaultSync } = await import("../../../legacy-src/sync/vaultSync");
+	const { PRODUCT_EVENT_KIND } = await import("../../../legacy-src/observability/productEventKinds");
+	const { createSocketTicketCache } = await import("../../../legacy-src/sync/socketTicket");
+	const { createFetchRequester } = await import("../../../legacy-src/utils/http");
+	const { BootstrapHttpPort, prepareBootstrapRoot } = await import("../../../legacy-src/sync/bootstrapClient");
 	const { NodeVaultDatabase } = await import("../../../packages/cli/src/nodeVaultDatabase");
 
 	const dir = opts.reuse?.dir ?? join(WB_LOG_DIR, "wb-real", `${workerName(host)}-${opts.label}-${Date.now().toString(36)}`);

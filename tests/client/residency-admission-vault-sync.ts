@@ -7,8 +7,8 @@ import {
 	type SyncProviderPort,
 	type VaultDatabasePort,
 	type VaultServerPort,
-} from "../../src/sync/vaultSync";
-import type { StoredDocument } from "../../src/sync/vaultIndexedDb";
+} from "../../legacy-src/sync/vaultSync";
+import type { StoredDocument } from "../../legacy-src/sync/vaultIndexedDb";
 import { suite, until } from "../harness.ts";
 import { partialOf } from "../mocks/productFixture.ts";
 import { installDomCrypto } from "./helpers/installDomCrypto.ts";

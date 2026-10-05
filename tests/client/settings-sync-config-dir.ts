@@ -1,4 +1,4 @@
-import { sanitizeConfigDirKey } from "../../src/sync/settingsSync/configDirKey";
+import { sanitizeConfigDirKey } from "../../legacy-src/sync/settingsSync/configDirKey";
 import { suite } from "../harness.ts";
 
 const s = suite("settings-sync-config-dir");

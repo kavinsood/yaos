@@ -3,7 +3,7 @@ import {
 	SettingsSyncClient,
 	SettingsSyncHttpError,
 	parseSettingsSyncState,
-} from "../../src/sync/settingsSync/protocol";
+} from "../../legacy-src/sync/settingsSync/protocol";
 import { decodeBinaryEnvelope, encodeBinaryEnvelope, YAOS_BINARY_CONTENT_TYPE } from "../../server/src/shared/binaryEnvelope";
 import { suite } from "../harness.ts";
 

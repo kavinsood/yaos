@@ -1,8 +1,8 @@
-import { ConnectionController } from "../../src/runtime/connectionController";
-import { getFatalSyncNotice } from "../../src/runtime/fatalSyncNotice";
-import { getLabelFromConnectionState } from "../../src/status/statusBarController";
-import { parseFatalAuthMessage } from "../../src/sync/fatalAuth";
-import type { VaultSync } from "../../src/sync/vaultSync";
+import { ConnectionController } from "../../legacy-src/runtime/connectionController";
+import { getFatalSyncNotice } from "../../legacy-src/runtime/fatalSyncNotice";
+import { getLabelFromConnectionState } from "../../legacy-src/status/statusBarController";
+import { parseFatalAuthMessage } from "../../legacy-src/sync/fatalAuth";
+import type { VaultSync } from "../../legacy-src/sync/vaultSync";
 import { readSource, suite } from "../harness.ts";
 
 const s = suite("fatal-auth-state");

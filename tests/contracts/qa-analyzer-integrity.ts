@@ -2,7 +2,7 @@ import { join, resolve } from "path";
 import { analyzeTrace } from "../../qa/analyzers/analyzer";
 import { isAnalyzerReport } from "../../qa/analyzers/report";
 import { resolveTraceExportPath } from "../../qa/controllers/trace-path";
-import { FlightTraceController, type FlightTraceDeps } from "../../src/telemetry/debug/flightTraceController";
+import { FlightTraceController, type FlightTraceDeps } from "../../legacy-src/telemetry/debug/flightTraceController";
 import { suite } from "../harness.ts";
 
 const s = suite("qa-analyzer-integrity");

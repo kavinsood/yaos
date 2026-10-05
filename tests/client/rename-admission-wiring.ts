@@ -7,9 +7,9 @@
  * This exercises the actual planner used in production, not a copy.
  */
 
-import { classifySyncPath } from "../../src/paths/pathCategory";
-import { planCategoryRenameAction } from "../../src/sync/policy/renameAdmissionPolicy";
-import type { RenameAction } from "../../src/sync/policy/renameAdmissionPolicy";
+import { classifySyncPath } from "../../legacy-src/paths/pathCategory";
+import { planCategoryRenameAction } from "../../legacy-src/sync/policy/renameAdmissionPolicy";
+import type { RenameAction } from "../../legacy-src/sync/policy/renameAdmissionPolicy";
 import { suite } from "../harness.ts";
 
 const s = suite("rename-admission-wiring");

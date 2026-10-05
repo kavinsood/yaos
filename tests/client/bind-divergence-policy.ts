@@ -12,8 +12,8 @@ import {
 	BindDivergencePolicy,
 	BindDivergenceQuarantinedError,
 	type BindDivergenceBaseline,
-} from "../../src/sync/bindDivergencePolicy";
-import { contentBaselineHash } from "../../src/sync/diskIndex";
+} from "../../legacy-src/sync/bindDivergencePolicy";
+import { contentBaselineHash } from "../../legacy-src/sync/diskIndex";
 import { installDomCrypto } from "./helpers/installDomCrypto.ts";
 import { suite } from "../harness.ts";
 

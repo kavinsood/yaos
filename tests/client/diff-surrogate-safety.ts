@@ -38,8 +38,8 @@
 
 import * as Y from "yjs";
 import diff from "fast-diff";
-import { boundedTextDiff, MAX_EXACT_DIFF_TOTAL_CHARACTERS } from "../../src/sync/boundedTextDiff";
-import { applyDiffToYText } from "../../src/sync/diff";
+import { boundedTextDiff, MAX_EXACT_DIFF_TOTAL_CHARACTERS } from "../../legacy-src/sync/boundedTextDiff";
+import { applyDiffToYText } from "../../legacy-src/sync/diff";
 import { suite } from "../harness.ts";
 
 const s = suite("diff-surrogate-safety");

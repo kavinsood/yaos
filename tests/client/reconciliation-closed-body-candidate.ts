@@ -1,8 +1,8 @@
 import { strict as assert } from "node:assert";
 import * as Y from "yjs";
 import { TFile } from "obsidian";
-import { ReconciliationController } from "../../src/runtime/reconciliationController";
-import { contentBaselineHash, currentContentHash, setCurrentContentHash, type DiskIndex } from "../../src/sync/diskIndex";
+import { ReconciliationController } from "../../legacy-src/runtime/reconciliationController";
+import { contentBaselineHash, currentContentHash, setCurrentContentHash, type DiskIndex } from "../../legacy-src/sync/diskIndex";
 import {
 	VaultSync,
 	type CandidateRecord,
@@ -11,9 +11,9 @@ import {
 	type SyncProviderPort,
 	type VaultDatabasePort,
 	type VaultServerPort,
-} from "../../src/sync/vaultSync";
-import type { StoredDocument } from "../../src/sync/vaultIndexedDb";
-import type { DiskIngestPort } from "../../src/runtime/engineControlPort";
+} from "../../legacy-src/sync/vaultSync";
+import type { StoredDocument } from "../../legacy-src/sync/vaultIndexedDb";
+import type { DiskIngestPort } from "../../legacy-src/runtime/engineControlPort";
 import { suite, until } from "../harness.ts";
 import { partialOf } from "../mocks/productFixture.ts";
 import { installDomCrypto } from "./helpers/installDomCrypto.ts";

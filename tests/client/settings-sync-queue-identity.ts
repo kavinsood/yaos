@@ -5,7 +5,7 @@ import {
 	persistApplyQueue,
 	retireApplyQueue,
 	type ApplyQueueScope,
-} from "../../src/sync/settingsSync/applyQueue";
+} from "../../legacy-src/sync/settingsSync/applyQueue";
 import { suite } from "../harness.ts";
 import { FakeIndexedDb } from "../mocks/indexedDb";
 

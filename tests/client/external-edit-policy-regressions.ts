@@ -1,4 +1,4 @@
-import { decideExternalEditImport } from "../../src/sync/externalEditPolicy";
+import { decideExternalEditImport } from "../../legacy-src/sync/externalEditPolicy";
 import { suite } from "../harness.ts";
 
 const s = suite("external-edit-policy-regressions");

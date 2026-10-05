@@ -5,10 +5,10 @@
  * main.ts uses for rename admission.
  */
 
-import { classifySyncPath } from "../../src/paths/pathCategory";
-import { isExcluded } from "../../src/sync/exclude";
-import { planCategoryRenameAction } from "../../src/sync/policy/renameAdmissionPolicy";
-import type { RenameAction } from "../../src/sync/policy/renameAdmissionPolicy";
+import { classifySyncPath } from "../../legacy-src/paths/pathCategory";
+import { isExcluded } from "../../legacy-src/sync/exclude";
+import { planCategoryRenameAction } from "../../legacy-src/sync/policy/renameAdmissionPolicy";
+import type { RenameAction } from "../../legacy-src/sync/policy/renameAdmissionPolicy";
 import { suite } from "../harness.ts";
 
 const s = suite("path-category");

@@ -10,16 +10,16 @@ import {
 	type SyncProviderPort,
 	type VaultDatabasePort,
 	type VaultServerPort,
-} from "../../src/sync/vaultSync";
+} from "../../legacy-src/sync/vaultSync";
 import type {
 	StoredAttachmentPublicationOperation,
 	StoredDocument,
-} from "../../src/sync/vaultIndexedDb";
+} from "../../legacy-src/sync/vaultIndexedDb";
 import { suite } from "../harness.ts";
 import { installDomCrypto } from "./helpers/installDomCrypto";
 import { partialOf } from "../mocks/productFixture.ts";
-import type { VaultAuthorityIdentity } from "../../src/collaboration/authority";
-import { PROTOCOL_VERSION, SCHEMA_VERSION } from "../../src/sync/schema";
+import type { VaultAuthorityIdentity } from "../../legacy-src/collaboration/authority";
+import { PROTOCOL_VERSION, SCHEMA_VERSION } from "../../legacy-src/sync/schema";
 
 installDomCrypto();
 const s = suite("attachment-publication-replay");

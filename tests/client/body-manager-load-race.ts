@@ -1,7 +1,7 @@
 import { strict as assert } from "node:assert";
 import * as Y from "yjs";
-import { BodyManager, DEFAULT_BODY_ESTIMATED_COST_BUDGET } from "../../src/sync/bodyManager";
-import type { StoredDocument } from "../../src/sync/vaultIndexedDb";
+import { BodyManager, DEFAULT_BODY_ESTIMATED_COST_BUDGET } from "../../legacy-src/sync/bodyManager";
+import type { StoredDocument } from "../../legacy-src/sync/vaultIndexedDb";
 import { suite } from "../harness.ts";
 
 const s = suite("body-manager-load-race");

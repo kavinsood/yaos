@@ -18,7 +18,7 @@
  */
 
 import type { App } from "obsidian";
-import type { EditorBindingManager } from "../../../src/sync/editorBinding";
+import type { EditorBindingManager } from "../../../legacy-src/sync/editorBinding";
 import { NodeApp, type MarkdownWalk, type PathProbe } from "./nodeApp";
 import { startWatcher, type FsHint, type FsWatcher } from "./watcher";
 

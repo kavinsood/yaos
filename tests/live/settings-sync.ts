@@ -1,5 +1,5 @@
 import { strict as nodeAssert } from "node:assert";
-import { SCHEMA_VERSION } from "../../src/sync/schema.ts";
+import { SCHEMA_VERSION } from "../../legacy-src/sync/schema.ts";
 import { deviceBearerHeaders, type LiveIdentity, requireLiveIdentityContext } from "./liveIdentity.ts";
 import { connectDocument, sha256Hex } from "./schema4Live.ts";
 import { decodeBinaryEnvelope, encodeBinaryEnvelope, YAOS_BINARY_CONTENT_TYPE } from "../../server/src/shared/binaryEnvelope.ts";

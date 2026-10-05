@@ -1,13 +1,13 @@
 import { installDomCrypto } from "./helpers/installDomCrypto.ts";
-import { DEFAULT_SETTINGS } from "../../src/settings";
+import { DEFAULT_SETTINGS } from "../../legacy-src/settings";
 import {
 	RecoveryClient,
 	type CaptureStatus,
 	type RecoveryTransport,
 	type RecoveryTransportResponse,
 	type RestoreItem,
-} from "../../src/snapshots/recoveryClient";
-import { parsePendingRecoveryState } from "../../src/snapshots/recoveryState";
+} from "../../legacy-src/snapshots/recoveryClient";
+import { parsePendingRecoveryState } from "../../legacy-src/snapshots/recoveryState";
 import { suite } from "../harness.ts";
 
 installDomCrypto();

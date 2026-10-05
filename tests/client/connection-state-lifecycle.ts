@@ -2,9 +2,9 @@ import {
 	ConnectionController,
 	ConnectionStateLatch,
 	type ConnectionState,
-} from "../../src/runtime/connectionController";
-import type { VaultSync } from "../../src/sync/vaultSync";
-import { getLabelFromConnectionState } from "../../src/status/statusBarController";
+} from "../../legacy-src/runtime/connectionController";
+import type { VaultSync } from "../../legacy-src/sync/vaultSync";
+import { getLabelFromConnectionState } from "../../legacy-src/status/statusBarController";
 import { suite } from "../harness.ts";
 
 const s = suite("connection-state-lifecycle");

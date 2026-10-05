@@ -6,9 +6,9 @@ import {
 	VaultSync,
 	splitByBulkCreateCaps,
 	type VaultSyncOptions,
-} from "../../src/sync/vaultSync";
-import { bulkCreateClientCaps, parseBulkCreateServerCaps } from "../../src/sync/bulkCreateCaps";
-import type { StoredAttachmentPublicationOperation } from "../../src/sync/vaultIndexedDb";
+} from "../../legacy-src/sync/vaultSync";
+import { bulkCreateClientCaps, parseBulkCreateServerCaps } from "../../legacy-src/sync/bulkCreateCaps";
+import type { StoredAttachmentPublicationOperation } from "../../legacy-src/sync/vaultIndexedDb";
 import { suite, until } from "../harness.ts";
 import { installDomCrypto } from "./helpers/installDomCrypto.ts";
 import { FakeBulkCreateServer, memoryVault, testProvider, type MemoryVault } from "./helpers/fakeBulkCreateServer.ts";

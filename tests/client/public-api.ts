@@ -3,7 +3,7 @@ import {
 	YaosPublicApiService,
 	YaosPublicApiStaleHandleError,
 	type YaosPublicSnapshotInput,
-} from "../../src/publicApi";
+} from "../../legacy-src/publicApi";
 import { suite } from "../harness.ts";
 
 const s = suite("public-api");

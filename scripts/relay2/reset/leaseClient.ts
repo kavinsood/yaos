@@ -37,7 +37,7 @@ import {
 	type ReadySemanticEpochTransition,
 	type SemanticEpochTransitionInput,
 	type SemanticEpochTransitionResult,
-} from "../../../src/sync/semanticEpochTransition";
+} from "../../../legacy-src/sync/semanticEpochTransition";
 import { canonicalizeMarkdown } from "@shared/markdownCodec";
 import { buildFreshSnapshot, BODY_TEXT_ROOT, type FreshSnapshot } from "./builder";
 import { confirmAfterBuild, evaluateClientTrigger, type SemanticCompactionState } from "./policy";

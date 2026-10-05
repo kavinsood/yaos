@@ -1,5 +1,5 @@
 import { strict as assert } from "node:assert";
-import { safeBlobPath, safeMarkdownPath } from "../../src/sync/pathPolicy";
+import { safeBlobPath, safeMarkdownPath } from "../../legacy-src/sync/pathPolicy";
 import { suite } from "../harness.ts";
 
 const s = suite("schema4-path-policy");

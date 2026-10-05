@@ -1,17 +1,17 @@
 import type { App, RequestUrlParam, RequestUrlResponse } from "obsidian";
-import { SettingsSyncEngine } from "../../src/sync/settingsSync/engine";
-import { SettingsSyncClient } from "../../src/sync/settingsSync/protocol";
+import { SettingsSyncEngine } from "../../legacy-src/sync/settingsSync/engine";
+import { SettingsSyncClient } from "../../legacy-src/sync/settingsSync/protocol";
 import {
 	loadEnvironmentAcceptance,
 	markEnvironmentAccepted,
 	persistApplyQueue,
 	type ApplyQueueScope,
-} from "../../src/sync/settingsSync/applyQueue";
-import { sha256TextHex } from "../../src/utils/sha256";
+} from "../../legacy-src/sync/settingsSync/applyQueue";
+import { sha256TextHex } from "../../legacy-src/utils/sha256";
 import { suite } from "../harness.ts";
 import { installDomCrypto } from "./helpers/installDomCrypto";
 import { FakeIndexedDb } from "../mocks/indexedDb";
-import type { SettingsDirAdapter } from "../../src/sync/settingsSync/watch";
+import type { SettingsDirAdapter } from "../../legacy-src/sync/settingsSync/watch";
 import { encodeBinaryEnvelope, YAOS_BINARY_CONTENT_TYPE } from "../../server/src/shared/binaryEnvelope";
 
 installDomCrypto();

@@ -1,5 +1,5 @@
 import * as Y from "yjs";
-import { applyDiffToYText } from "../../src/sync/diff";
+import { applyDiffToYText } from "../../legacy-src/sync/diff";
 import { suite } from "../harness.ts";
 
 const s = suite("bound-recovery-regressions");

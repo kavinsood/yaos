@@ -1,4 +1,4 @@
-import type { StoredAttachmentPublicationOperation, StoredDocument, StoredLifecycleOperation } from "../../src/sync/vaultIndexedDb.ts";
+import type { StoredAttachmentPublicationOperation, StoredDocument, StoredLifecycleOperation } from "../../legacy-src/sync/vaultIndexedDb.ts";
 import {
 	VaultSync,
 	type CandidateRecord,
@@ -7,8 +7,8 @@ import {
 	type SyncAwarenessPort,
 	type SyncProviderPort,
 	type VaultDatabasePort,
-} from "../../src/sync/vaultSync.ts";
-import { createFetchRequester, type HttpRequest, type HttpRequester } from "../../src/utils/http.ts";
+} from "../../legacy-src/sync/vaultSync.ts";
+import { createFetchRequester, type HttpRequest, type HttpRequester } from "../../legacy-src/utils/http.ts";
 import type { LiveIdentity } from "./liveIdentity.ts";
 
 export interface ProductionImportRequestMeasurement {

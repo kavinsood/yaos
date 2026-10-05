@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { NodeVaultDatabase } from "../../packages/cli/src/nodeVaultDatabase";
-import type { StoredBodySettlement } from "../../src/sync/bodySettlement";
+import type { StoredBodySettlement } from "../../legacy-src/sync/bodySettlement";
 import { suite } from "../harness.ts";
 
 const s = suite("node-body-settlement");

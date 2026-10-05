@@ -1,12 +1,12 @@
-import { DEFAULT_SETTINGS, type VaultSyncSettings } from "../../src/settings";
+import { DEFAULT_SETTINGS, type VaultSyncSettings } from "../../legacy-src/settings";
 import {
 	SetupLinkController,
 	startEnrollmentRuntime,
 	type SetupLinkControllerDeps,
-} from "../../src/runtime/setupLinkController";
-import { RuntimeTeardownCoordinator } from "../../src/runtime/teardownLifecycle";
+} from "../../legacy-src/runtime/setupLinkController";
+import { RuntimeTeardownCoordinator } from "../../legacy-src/runtime/teardownLifecycle";
 import { readSource, suite } from "../harness.ts";
-import { MEMBER_CAPABILITIES } from "../../src/collaboration/authority";
+import { MEMBER_CAPABILITIES } from "../../legacy-src/collaboration/authority";
 
 const s = suite("multivault-enrollment-contract");
 

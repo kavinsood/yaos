@@ -8,7 +8,7 @@ import type {
 	StoredCanvasCandidate,
 	StoredCanvasLifecycle,
 	StoredCanvasSettlement,
-} from "../../src/sync/vaultIndexedDb";
+} from "../../legacy-src/sync/vaultIndexedDb";
 import { suite } from "../harness.ts";
 
 const s = suite("node-canvas-lifecycle");

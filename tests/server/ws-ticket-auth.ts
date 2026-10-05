@@ -5,7 +5,7 @@ import type { AuthState } from "../../server/src/routes/types";
 import { capabilityDigestForRole, COLLABORATION_POLICY_VERSION, type VaultActorContext } from "../../server/src/collaboration";
 import { makeConfigNamespace, makeEnv, makeTrapNamespace, makeVaultSyncNamespace } from "../mocks/workerEnv.ts";
 import { suite } from "../harness.ts";
-import { PROTOCOL_VERSION, SCHEMA_VERSION } from "../../src/sync/schema";
+import { PROTOCOL_VERSION, SCHEMA_VERSION } from "../../legacy-src/sync/schema";
 
 const s = suite("ws-ticket-auth");
 const VAULT_ID = "ticket-vault-0001";

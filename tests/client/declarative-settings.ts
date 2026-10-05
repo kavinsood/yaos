@@ -1,9 +1,9 @@
 import { App, Plugin, type SettingDefinition, type SettingDefinitionItem } from "obsidian";
-import { DEFAULT_SETTINGS, type VaultSyncSettings } from "../../src/settings/settingsStore";
-import { VaultSyncSettingTab, type VaultSyncSettingsHost } from "../../src/settings/settingsTab";
-import { emptySettingsSyncStatus, type SettingsSyncStatus } from "../../src/sync/settingsSync/types";
+import { DEFAULT_SETTINGS, type VaultSyncSettings } from "../../legacy-src/settings/settingsStore";
+import { VaultSyncSettingTab, type VaultSyncSettingsHost } from "../../legacy-src/settings/settingsTab";
+import { emptySettingsSyncStatus, type SettingsSyncStatus } from "../../legacy-src/sync/settingsSync/types";
 import { readSource, suite } from "../harness.ts";
-import type { OperationalResourceSnapshot } from "../../src/runtime/operationalResourceSnapshot";
+import type { OperationalResourceSnapshot } from "../../legacy-src/runtime/operationalResourceSnapshot";
 import { MAX_CLIENT_MARKDOWN_KB } from "../../server/src/shared/durableLimits";
 
 const s = suite("declarative-settings");

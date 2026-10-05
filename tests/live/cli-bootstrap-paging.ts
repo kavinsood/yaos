@@ -1,6 +1,6 @@
 import * as Y from "yjs";
-import { BootstrapHttpPort } from "../../src/sync/bootstrapClient.ts";
-import { createFetchRequester } from "../../src/utils/http.ts";
+import { BootstrapHttpPort } from "../../legacy-src/sync/bootstrapClient.ts";
+import { createFetchRequester } from "../../legacy-src/utils/http.ts";
 import { encodeBinaryEnvelope, YAOS_BINARY_CONTENT_TYPE } from "../../server/src/shared/binaryEnvelope.ts";
 import { deviceBearerHeaders, requireLiveIdentity } from "./liveIdentity.ts";
 import { requestJson, vaultRoute } from "./schema4Live.ts";

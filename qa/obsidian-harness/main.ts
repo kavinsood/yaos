@@ -19,13 +19,13 @@ import { buildQaConsoleApi } from "./api";
 import type { QaScenario } from "./types";
 import { buildQaDebugApi } from "../harness/qaDebugApi";
 import { getPluginRegistry, type ObsidianPluginInstance } from "../harness/ports/obsidianInternalsPort";
-import type { TelemetryRuntimeHandle } from "../../src/telemetry/installTelemetryRuntime";
-import type { VaultSync } from "../../src/sync/vaultSync";
-import type { ReconciliationController } from "../../src/runtime/reconciliationController";
-import type { ConnectionController } from "../../src/runtime/connectionController";
-import type { EditorBindingManager } from "../../src/sync/editorBinding";
-import type { EngineControlPort } from "../../src/runtime/engineControlPort";
-import { sha256TextHex } from "../../src/utils/sha256";
+import type { TelemetryRuntimeHandle } from "../../legacy-src/telemetry/installTelemetryRuntime";
+import type { VaultSync } from "../../legacy-src/sync/vaultSync";
+import type { ReconciliationController } from "../../legacy-src/runtime/reconciliationController";
+import type { ConnectionController } from "../../legacy-src/runtime/connectionController";
+import type { EditorBindingManager } from "../../legacy-src/sync/editorBinding";
+import type { EngineControlPort } from "../../legacy-src/runtime/engineControlPort";
+import { sha256TextHex } from "../../legacy-src/utils/sha256";
 
 /**
  * The private surface of the product plugin that this harness reaches for.

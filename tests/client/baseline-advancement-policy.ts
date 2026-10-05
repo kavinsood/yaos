@@ -7,7 +7,7 @@
  * - Reason strings remain descriptive
  */
 
-import { planBaselineAdvancement } from "../../src/runtime/reconcile/baselineAdvancementPolicy";
+import { planBaselineAdvancement } from "../../legacy-src/runtime/reconcile/baselineAdvancementPolicy";
 import { suite } from "../harness.ts";
 
 const s = suite("baseline-advancement-policy");

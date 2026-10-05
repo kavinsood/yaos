@@ -2,10 +2,10 @@ import { strict as assert } from "node:assert";
 import * as decoding from "lib0/decoding";
 import * as encoding from "lib0/encoding";
 import * as Y from "yjs";
-import type { OverdueWorkClock } from "../../src/runtime/overdueWorkKernel";
-import { fencedWebSocketConstructor } from "../../src/sync/fencedWebSocket";
-import { OwnAwarenessProvider } from "../../src/sync/ownAwarenessProvider";
-import { parseSyncFrame } from "../../src/sync/relayReceipts";
+import type { OverdueWorkClock } from "../../legacy-src/runtime/overdueWorkKernel";
+import { fencedWebSocketConstructor } from "../../legacy-src/sync/fencedWebSocket";
+import { OwnAwarenessProvider } from "../../legacy-src/sync/ownAwarenessProvider";
+import { parseSyncFrame } from "../../legacy-src/sync/relayReceipts";
 import {
 	VaultSync,
 	type BodyReceipt,
@@ -15,8 +15,8 @@ import {
 	type SyncProviderPort,
 	type VaultDatabasePort,
 	type VaultServerPort,
-} from "../../src/sync/vaultSync";
-import type { StoredDocument } from "../../src/sync/vaultIndexedDb";
+} from "../../legacy-src/sync/vaultSync";
+import type { StoredDocument } from "../../legacy-src/sync/vaultIndexedDb";
 import { suite, until } from "../harness.ts";
 import { partialOf } from "../mocks/productFixture.ts";
 import { installDomCrypto } from "./helpers/installDomCrypto.ts";

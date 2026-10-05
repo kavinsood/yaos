@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert";
-import { lineEditsFromBase, mergeThreeWayLines, splitLines } from "../../src/sync/lineMerge";
-import { resolveThreeWayText, type ThreeWayMergeResult } from "../../src/sync/threeWayMerge";
+import { lineEditsFromBase, mergeThreeWayLines, splitLines } from "../../legacy-src/sync/lineMerge";
+import { resolveThreeWayText, type ThreeWayMergeResult } from "../../legacy-src/sync/threeWayMerge";
 import { suite } from "../harness.ts";
 
 const s = suite("line-merge (diff3)");

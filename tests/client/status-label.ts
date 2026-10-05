@@ -15,8 +15,8 @@ import {
 	SERVER_RECEIPT_STATUS_TITLE,
 	getServerReceiptStatusTitle,
 	type ServerReceiptStatus,
-} from "../../src/status/statusBarController";
-import type { ConnectionState } from "../../src/runtime/connectionController";
+} from "../../legacy-src/status/statusBarController";
+import type { ConnectionState } from "../../legacy-src/runtime/connectionController";
 import { suite } from "../harness.ts";
 
 const s = suite("status-label");

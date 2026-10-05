@@ -1,6 +1,6 @@
 import WebSocket from "ws";
 
-import type { WebSocketImplementation } from "../../../src/sync/vaultSync";
+import type { WebSocketImplementation } from "../../../legacy-src/sync/vaultSync";
 import type { AccessServiceCredentials } from "./config";
 
 function serviceHeaders(credentials: AccessServiceCredentials): Record<string, string> {

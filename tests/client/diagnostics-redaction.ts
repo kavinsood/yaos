@@ -20,8 +20,8 @@ import {
 	createPathRedactor,
 	createPassthroughRedactor,
 	generateBundleSalt,
-} from "../../src/telemetry/diagnostics/pathRedactor.ts";
-import { PathIdentityResolver } from "../../src/telemetry/debug/pathIdentity.ts";
+} from "../../legacy-src/telemetry/diagnostics/pathRedactor.ts";
+import { PathIdentityResolver } from "../../legacy-src/telemetry/debug/pathIdentity.ts";
 import { suite } from "../harness.ts";
 
 // `globalThis.crypto` is a getter on older runtimes, so it is defined rather

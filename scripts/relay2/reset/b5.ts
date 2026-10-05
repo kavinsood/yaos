@@ -18,7 +18,7 @@
 import { join } from "node:path";
 import * as Y from "yjs";
 import { canonicalizeMarkdown, canonicalMarkdownHash } from "@shared/markdownCodec";
-import type { ReadySemanticEpochTransition, SemanticEpochTransitionResult } from "../../../src/sync/semanticEpochTransition";
+import type { ReadySemanticEpochTransition, SemanticEpochTransitionResult } from "../../../legacy-src/sync/semanticEpochTransition";
 import type { LiveIdentity } from "../../../tests/live/liveIdentity";
 import { claim, createBodyFromUpdate, device, hasContext, loadContext, type Context } from "../lib/context";
 import { EXP_ROOT, dist, flagNum, flagStr, log, parseArgs, sleep, startMeta, writeResult } from "../lib/common";

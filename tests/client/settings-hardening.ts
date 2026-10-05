@@ -1,16 +1,16 @@
-import { isServerCapabilities } from "../../src/runtime/capabilityUpdateService";
-import { capabilitiesForRole } from "../../src/collaboration/authority";
+import { isServerCapabilities } from "../../legacy-src/runtime/capabilityUpdateService";
+import { capabilitiesForRole } from "../../legacy-src/collaboration/authority";
 import {
 	attachmentSizeCapKB,
 	DEFAULT_SETTINGS,
 	MAX_ATTACHMENT_SIZE_KB,
 	readVaultSyncSettings,
-} from "../../src/settings/settingsStore";
+} from "../../legacy-src/settings/settingsStore";
 import {
 	MAX_CLIENT_MARKDOWN_BYTES,
 	MAX_CLIENT_MARKDOWN_KB,
 } from "../../server/src/shared/durableLimits";
-import { buildRuntimeConfig } from "../../src/runtime/runtimeConfig";
+import { buildRuntimeConfig } from "../../legacy-src/runtime/runtimeConfig";
 import { suite } from "../harness.ts";
 
 const s = suite("settings-hardening");

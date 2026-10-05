@@ -1,4 +1,4 @@
-import { SettingsSyncWatcher, type SettingsDirAdapter } from "../../src/sync/settingsSync/watch";
+import { SettingsSyncWatcher, type SettingsDirAdapter } from "../../legacy-src/sync/settingsSync/watch";
 import { suite } from "../harness.ts";
 
 const s = suite("settings-sync-watch");

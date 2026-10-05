@@ -7,7 +7,7 @@
 		]
 	},
 	"include": [
-		"src/**/*.ts",
+		"legacy-src/**/*.ts",
 		"yaos-plugin-api.d.ts",
 		"tests/**/*.ts",
 		"eslint.config.mts"

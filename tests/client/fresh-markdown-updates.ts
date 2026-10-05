@@ -1,11 +1,11 @@
 import { strict as assert } from "node:assert";
 import * as Y from "yjs";
 import { MAX_DURABLE_UPDATE_BYTES, MAX_CLIENT_MARKDOWN_BYTES } from "../../server/src/shared/durableLimits";
-import { FrontmatterSemanticMirror } from "../../src/sync/frontmatterSemanticMirror";
+import { FrontmatterSemanticMirror } from "../../legacy-src/sync/frontmatterSemanticMirror";
 import {
 	materializeFreshMarkdownUpdates,
 	splitUtf8Text,
-} from "../../src/sync/freshMarkdownUpdates";
+} from "../../legacy-src/sync/freshMarkdownUpdates";
 import { suite } from "../harness.ts";
 
 const s = suite("fresh-markdown-updates");

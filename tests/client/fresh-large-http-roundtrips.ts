@@ -6,8 +6,8 @@ import {
 	MAX_CLIENT_MARKDOWN_BYTES,
 	MAX_DURABLE_UPDATE_BYTES,
 } from "../../server/src/shared/durableLimits";
-import { VaultSync, type BulkCreateRequest } from "../../src/sync/vaultSync";
-import type { HttpRequest, HttpResponse } from "../../src/utils/http";
+import { VaultSync, type BulkCreateRequest } from "../../legacy-src/sync/vaultSync";
+import type { HttpRequest, HttpResponse } from "../../legacy-src/utils/http";
 import { suite } from "../harness.ts";
 import { installDomCrypto } from "./helpers/installDomCrypto.ts";
 import { FakeBulkCreateServer, memoryVault, testProvider } from "./helpers/fakeBulkCreateServer.ts";

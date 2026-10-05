@@ -6,17 +6,17 @@ import {
 	decodeVerifiedBodyContent,
 	decodeBootstrapRoot,
 	type ClientCatalogEntry,
-} from "../../src/sync/bootstrapClient";
+} from "../../legacy-src/sync/bootstrapClient";
 import type {
 	StoredBootstrapProgress,
 	StoredOutstandingBody,
 	StoredDocument,
-} from "../../src/sync/vaultIndexedDb";
+} from "../../legacy-src/sync/vaultIndexedDb";
 import { suite } from "../harness.ts";
-import { BodyManager } from "../../src/sync/bodyManager";
-import { BodySettlementRepository, type StoredBodySettlement } from "../../src/sync/bodySettlement";
+import { BodyManager } from "../../legacy-src/sync/bodyManager";
+import { BodySettlementRepository, type StoredBodySettlement } from "../../legacy-src/sync/bodySettlement";
 import { canonicalMarkdownHash, exactMarkdownDiskFingerprint } from "../../server/src/shared/markdownCodec";
-import { SCHEMA_VERSION } from "../../src/sync/schema";
+import { SCHEMA_VERSION } from "../../legacy-src/sync/schema";
 
 const s = suite("bootstrap-settlement");
 
