@@ -1,0 +1,25 @@
+src/host/ui/confirmModal.ts
+  s_808e98640ec653::t_70670114c340e3 1-52
+src/host/ui/obsidianEnv.ts
+  s_808e98640ec653::t_b6f77da0a2ad56 1-44
+src/host/ui/settingsModel.test.ts
+  s_808e98640ec653::t_f85be9473d76a5 1-115
+src/host/ui/settingsModel.ts
+  s_808e98640ec653::t_6e4fb8d13c61f1 1-221
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "b2f7c37c59ab66b9905683af044d539ef1dad41f",
+  "prompts": {},
+  "sessions": {
+    "s_808e98640ec653": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a6d246dbda3daef6a",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
