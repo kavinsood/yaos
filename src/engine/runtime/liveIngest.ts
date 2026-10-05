@@ -24,6 +24,11 @@ import type { EngineCtx } from "./context";
 
 type QueuedEvent = Extract<RelayEvent, { t: "receipt" | "committed" | "provisional" | "provisionalDropped" }>;
 
+/** Events that hold a payload (the residency the overflow bounds; payload-less events are a few dozen bytes). */
+function heavy(ev: QueuedEvent): 0 | 1 {
+	return (ev.t === "committed" && ev.frame.payload !== null) || ev.t === "provisional" ? 1 : 0;
+}
+
 function eventBytes(ev: QueuedEvent): number {
 	if (ev.t === "committed") return ev.frame.payload?.length ?? 0;
 	if (ev.t === "provisional") return ev.payload.length;
@@ -33,6 +38,7 @@ function eventBytes(ev: QueuedEvent): number {
 export class LiveIngest {
 	private q: QueuedEvent[] = [];
 	private qBytes = 0;
+	private qRows = 0;
 	private draining = false;
 	enabled = false;
 	stats = { batches: 0, rows: 0, receipts: 0, stale: 0, overflows: 0, failedBatches: 0 };
@@ -49,7 +55,8 @@ export class LiveIngest {
 	push(ev: QueuedEvent): void {
 		this.q.push(ev);
 		this.qBytes += eventBytes(ev);
-		if (this.qBytes > this.c.tuning.liveQueueMaxBytes || this.q.length > this.c.tuning.liveQueueMaxRows) this.overflow();
+		this.qRows += heavy(ev);
+		if (this.qBytes > this.c.tuning.liveQueueMaxBytes || this.qRows > this.c.tuning.liveQueueMaxRows) this.overflow();
 		this.kick();
 	}
 
@@ -74,6 +81,7 @@ export class LiveIngest {
 		};
 		const next: QueuedEvent[] = [];
 		let bytes = 0;
+		let rows = 0;
 		for (const e of this.q) {
 			if (e.t === "committed" && e.frame.payload && !keep(e.frame.stream)) {
 				next.push({ t: "committed", frame: { ...e.frame, payload: null } });
@@ -82,9 +90,11 @@ export class LiveIngest {
 			if (e.t === "provisional" && !this.c.handles.isResident(e.stream)) continue;
 			next.push(e);
 			bytes += eventBytes(e);
+			rows += heavy(e);
 		}
 		this.q = next;
 		this.qBytes = bytes;
+		this.qRows = rows;
 		this.c.diag("live-overflow", { rows: next.length, bytes });
 	}
 
@@ -102,6 +112,7 @@ export class LiveIngest {
 	private shift(): QueuedEvent {
 		const e = this.q.shift()!;
 		this.qBytes -= eventBytes(e);
+		this.qRows -= heavy(e);
 		return e;
 	}
 

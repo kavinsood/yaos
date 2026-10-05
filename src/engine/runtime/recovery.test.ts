@@ -1,0 +1,94 @@
+/**
+ * Recovery paths: outbox mirror after IDB loss (DESIGN §e.4, §i.5) and live
+ * queue overflow -> T_stale -> read (DESIGN §d.7).
+ */
+
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import type { ClientFrameId } from "../../core/types";
+import { SimRelay } from "../sync/__standins__/simRelay";
+import type { LogEngine } from "./engine";
+import { MemSideFiles, converged, sleep, startTestEngine, until } from "./testHarness";
+
+async function live(...es: LogEngine[]): Promise<void> {
+	await until(() => es.every((e) => e.status().phase === "live"), 3_000, "live");
+}
+
+function countsByFrame(relay: SimRelay): Map<string, number> {
+	const m = new Map<string, number>();
+	for (const s of relay.streams()) for (const r of relay.rows(s, { includeGc: true })) if (r.deviceId === "dev-a") m.set(r.clientFrameId, (m.get(r.clientFrameId) ?? 0) + 1);
+	return m;
+}
+
+for (const committed of [false, true]) {
+	const what = committed ? "relay committed them (receipts lost)" : "relay lost them (restart)";
+	test(`mirror recovery: IDB lost with unreceipted frames, ${what} -> fresh DB imports the mirror, resends, each frame once`, async () => {
+		const relay = new SimRelay();
+		const side = new MemSideFiles();
+		const { engine: b } = await startTestEngine({ relay, deviceId: "dev-b" });
+		const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a", sideFiles: side });
+		let a2: LogEngine | null = null;
+		try {
+			await live(a, b);
+			const id = await a.createDoc("m.md", "base;");
+			await converged([a, b]);
+			relay.pauseCommits();
+			await a.editDoc(id, (t) => t.insert(t.length, "lost1;"));
+			const made = await a.createDoc("new.md", "made offline-ish;");
+			await a.renameDoc(id, "m-renamed.md");
+			await until(() => a.c.sender.inflightCount >= 3, 2_000, "sent");
+			const frames = [...a.c.outbox.values()].map((r) => r.clientFrameId as ClientFrameId);
+			assert.ok(frames.length >= 4);
+			await sleep(60); // mirror debounce
+			const w = side.writes;
+			assert.ok(w > 0, "outbox mirror written");
+			a.disconnect();
+			await a.stop();
+			if (committed) relay.resumeCommits();
+			else {
+				relay.restart();
+				relay.resumeCommits();
+			}
+			await relay.settled();
+			a2 = (await startTestEngine({ relay, deviceId: "dev-a", sideFiles: side })).engine; // new MemStoragePort: the DB is gone
+			assert.ok(a2.status().notices.some((n) => n.code === "recovered-from-mirror"));
+			await converged([a2, b], 10_000);
+			assert.equal(await b.docText(id), "base;lost1;");
+			assert.equal(await b.docText(made), "made offline-ish;");
+			assert.equal(b.listDocs().find((d) => d.docId === id)?.path, "m-renamed.md");
+			const counts = countsByFrame(relay);
+			for (const f of frames) assert.equal(counts.get(f), 1, `frame ${f} committed exactly once`);
+			assert.equal(a2.c.outbox.size, 0);
+			assert.equal(a2.c.repo.cursor.vaultSeq, relay.head());
+			await a2.editDoc(id, (t) => t.insert(0, "A2;"));
+			await converged([a2, b]);
+			assert.equal(await b.docText(id), "A2;base;lost1;");
+		} finally {
+			await b.stop();
+			await a2?.stop();
+		}
+	});
+}
+
+test("live overflow: queue over liveQueueMaxRows drops cold payloads -> stale -> read later; converges", async () => {
+	const relay = new SimRelay();
+	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a" });
+	const { engine: b } = await startTestEngine({ relay, deviceId: "dev-b", tuning: { liveQueueMaxRows: 3 } });
+	try {
+		await live(a, b);
+		relay.pauseCommits();
+		const ids = [];
+		for (let i = 0; i < 12; i++) ids.push(await a.createDoc(`o${i}.md`, `body ${i};`));
+		await until(() => a.c.sender.inflightCount >= 12, 2_000, "ns creates sent (bodies held on them)");
+		relay.resumeCommits();
+		await converged([a, b], 10_000);
+		assert.ok(b.c.live.stats.overflows > 0, "overflowed");
+		assert.ok(b.c.live.stats.stale > 0, "rows recorded stale");
+		for (let i = 0; i < ids.length; i++) assert.equal(await b.docText(ids[i]!), `body ${i};`);
+		assert.equal(b.c.repo.cursor.vaultSeq, relay.head());
+		assert.equal([...b.c.repo.streams()].filter((r) => r.stale).length, 0);
+	} finally {
+		await a.stop();
+		await b.stop();
+	}
+});
