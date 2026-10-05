@@ -31,7 +31,8 @@ import { fromUtf8, utf8 } from "../host/hashing";
 
 export type CaseProfile = "case-insensitive" | "case-sensitive";
 
-export type WriterKind = "sync" | "user" | "external";
+/** sync = the engine through VaultPort; save = Obsidian saving an open editor; user = other Obsidian UI ops; external = another app. */
+export type WriterKind = "sync" | "save" | "user" | "external";
 
 interface SimFile {
 	path: string;
@@ -232,6 +233,13 @@ export class SimVault implements VaultPort {
 	/** User edit/create through Obsidian (not through an open editor). */
 	userWrite(path: string, text: string): void {
 		this.actorWrite(path, utf8(text), "user");
+	}
+
+	/** Obsidian saves an open editor view (vault.modify on an existing file). */
+	editorSave(path: string, text: string): boolean {
+		if (!this.files.has(this.key(path))) return false;
+		this.commit(path, utf8(text), "save");
+		return true;
 	}
 
 	/** Another app writes the file on disk; Obsidian notices via its watcher. */
