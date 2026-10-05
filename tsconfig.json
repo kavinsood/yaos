@@ -1,22 +1,14 @@
 {
 	"compilerOptions": {
-		"baseUrl": "src",
-		"paths": {
-			"@yaos/crdt-engine": [
-				"../server/src/crdt/ywasmWorkerCrdtEngine.ts"
-			],
-			"@shared/*": [
-				"../server/src/shared/*"
-			]
-		},
 		"inlineSourceMap": true,
 		"inlineSources": true,
 		"module": "ESNext",
-		"target": "ES6",
-		"allowJs": true,
+		"target": "ES2020",
+		"strict": true,
 		"noImplicitAny": true,
 		"noImplicitThis": true,
 		"noImplicitReturns": true,
+		"noFallthroughCasesInSwitch": true,
 		"moduleResolution": "bundler",
 		"importHelpers": true,
 		"noUncheckedIndexedAccess": true,
@@ -25,6 +17,7 @@
 		"strictBindCallApply": true,
 		"allowSyntheticDefaultImports": true,
 		"useUnknownInCatchVariables": true,
+		"types": [],
 		"lib": [
 			"DOM",
 			"ES2020"
