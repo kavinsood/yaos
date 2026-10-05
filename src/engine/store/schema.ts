@@ -19,9 +19,9 @@ import type { EnvelopeKind, CheckpointEncoding } from "../../core/envelope";
 export const DB_SCHEMA_VERSION = 1;
 export const DB_NAME_PREFIX = "yaos2";
 
-/** `yaos2:<vaultId>:<vaultEpoch>:<deviceId>` */
+/** `yaos2:<vaultId>:<vaultEpoch>:<deviceId>`, each part URI-component encoded (the epoch is an opaque string). */
 export function dbName(vaultId: VaultId, vaultEpoch: VaultEpoch, deviceId: DeviceId): string {
-	return `${DB_NAME_PREFIX}:${vaultId}:${vaultEpoch}:${deviceId}`;
+	return `${DB_NAME_PREFIX}:${encodeURIComponent(vaultId)}:${encodeURIComponent(vaultEpoch)}:${encodeURIComponent(deviceId)}`;
 }
 
 // ---------------------------------------------------------------------------

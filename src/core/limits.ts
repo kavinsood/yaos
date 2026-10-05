@@ -19,8 +19,15 @@ export const SUFFIX_DOCID_CHARS = 8;
 /** FOLD. Tombstone pool (deleted + merged) cap; prune to cap - hysteresis when exceeded. */
 export const TOMBSTONE_CAP = 20_000;
 export const TOMBSTONE_PRUNE_HYSTERESIS = 1_000;
-/** FOLD. clientFrameIds remembered per device for duplicate-frame suppression. */
+/** FOLD. clientFrameIds remembered per device for duplicate-frame suppression (ns and cfg). */
 export const NS_DEDUPE_RING = 64;
+/**
+ * Send window for ns/cfg frames: own frame k of a stream may be sent only when
+ * every own frame <= k - NS_SEND_WINDOW of that stream is receipted. With
+ * NS_SEND_WINDOW <= NS_DEDUPE_RING / 2 a resend outside the relay's dedupe
+ * window is always still in the fold's ring (DESIGN §c.3).
+ */
+export const NS_SEND_WINDOW = 32;
 /** FOLD. Windows reserved stems (case-insensitive, with or without extension). */
 export const RESERVED_STEMS: readonly string[] = [
 	"con", "prn", "aux", "nul",
@@ -34,8 +41,14 @@ export const FORBIDDEN_PATH_CHARS = "\\*\"<>:|?";
 
 /** Max ns ops per frame. */
 export const MAX_NS_OPS_PER_FRAME = 512;
-/** Max encoded inner content per frame (all kinds). Relay hard limit is 1.75 MB per frame. */
-export const MAX_FRAME_CONTENT_BYTES = 1024 * 1024;
+/**
+ * Max encoded inner content per frame (all kinds). The relay payload limit is
+ * 1 MiB for the whole sealed envelope (1009 close above it); 4 KiB is left for
+ * the envelope header and AEAD overhead.
+ */
+export const MAX_FRAME_CONTENT_BYTES = 1024 * 1024 - 4096;
+/** Initial content of a large new note is inserted in chunks of this many UTF-16 units, one frame each (DESIGN §b.6). */
+export const INITIAL_INSERT_CHUNK_CHARS = 192 * 1024;
 export const MAX_NS_FRAME_BYTES = 256 * 1024;
 /** Body update larger than this goes through the blob store as BODY_UPDATE_REF (or freezes the doc without one). */
 export const MAX_INLINE_UPDATE_BYTES = MAX_FRAME_CONTENT_BYTES;
@@ -106,12 +119,15 @@ export const RELAY_CLOSE = {
 	normal: 1000,
 	goingAway: 1001,
 	abnormal: 1006,
+	/** Malformed APPEND or Worker upgrade rejection (error code precedes it). */
+	policy: 1008,
 	oversize: 1009,
 	rate: 1013,
 	superseded: 4403,
+	/** Legacy semantic-epoch reset; never sent on streams sockets (epoch change = VAULT_READY mismatch). */
 	epoch: 4409,
 } as const;
-/** Client-side token bucket; the relay limit is 256 KiB/s per socket. */
+/** Client-side token bucket; the relay limit is 256 KiB/s with a 2 MiB burst per socket. */
 export const APPEND_BYTES_PER_SEC = 192 * 1024;
 export const RECONNECT_BASE_MS = 1_000;
 export const RECONNECT_MAX_MS = 5 * 60_000;

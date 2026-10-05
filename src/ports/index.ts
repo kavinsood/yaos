@@ -15,7 +15,7 @@ export type {
 } from "./vault";
 export type { WorkspacePort, EditorViewRef, ViewEvent, EditorBindingSpec, ExternalReloadHandler } from "./workspace";
 export type {
-	RelayPort, RelaySession, RelayConnectParams, RelayConnectResult, RelayLimits, RelayEvent, SubscribeSpec,
+	RelayPort, RelaySession, RelayConnectParams, RelayConnectResult, RelayLimits, RelayEvent,
 	AppendFrame, CommittedFrame, RelayRow, FeedPage, ReadPage, PutCheckpointResult, RefusalReason,
 } from "./relay";
 export type { StoragePort, StorageDb, StorageTx, StorageKey, KeyRange, StoreSpec, SchemaShape, StoreName, StorageFailure, StorageError } from "./storage";

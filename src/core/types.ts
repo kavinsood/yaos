@@ -28,15 +28,19 @@ export type VaultId = Brand<string, "VaultId">;
 export type ContentHash = Brand<string, "ContentHash">;
 /** Lowercase hex SHA-256 of the exact on-disk bytes. Echo suppression only. */
 export type DiskFingerprint = Brand<string, "DiskFingerprint">;
-/** NFC(lowerCase(NFC(path))). The only key used for path collision decisions. */
+/**
+ * NFC(caseFold(NFC(path))) with a FROZEN Unicode 15.1 full case-folding table
+ * (DESIGN §c.2), never String.prototype.toLowerCase (engine Unicode versions
+ * differ). The only key used for path collision decisions.
+ */
 export type PathKey = Brand<string, "PathKey">;
 /** Relay stream name: "ns" | "cfg" | "b:<docId>" | "c:<docId>" | "x:<hash>". */
 export type StreamName = Brand<string, "StreamName">;
 
 /** Vault-wide relay clock position within one vaultEpoch. 0 = before the first row. */
 export type Seq = number;
-/** Relay vault epoch. A change invalidates every cursor (close 4409). */
-export type VaultEpoch = number;
+/** Relay vault epoch (VAULT_READY.vaultEpoch = vaultGeneration), opaque string. A change invalidates every cursor and the DB (DESIGN §c.12). */
+export type VaultEpoch = string;
 /** NFC, "/"-separated, no leading or trailing "/", vault-relative. */
 export type VaultPath = string;
 /** Path relative to the Obsidian config dir (e.g. "app.json", "plugins/x/data.json"). */
@@ -81,14 +85,17 @@ export function streamDocId(stream: StreamName): DocId | null {
 	return cls === "body" || cls === "canvas" ? (stream.slice(2) as DocId) : null;
 }
 
-/** The single path-key definition (DESIGN §c.2). Input must already be a valid VaultPath. */
-export function pathKeyOf(path: VaultPath): PathKey {
-	return path.normalize("NFC").toLowerCase().normalize("NFC") as PathKey;
-}
+/**
+ * The single path-key function (DESIGN §c.2), implemented by WP-A in
+ * src/core/paths/pathKey.ts with the frozen case-fold table. Input must
+ * already be a valid VaultPath (§c.2 validity, which rejects code points
+ * unassigned in Unicode 15.1 so NFC and folding are version-stable).
+ */
+export type PathKeyFn = (path: VaultPath) => PathKey;
 
-/** Kind is a pure function of the extension (DESIGN §c.2). */
+/** Kind is a pure function of the extension, ASCII case-insensitive (DESIGN §c.2). */
 export function kindOfPath(path: VaultPath): DocKind {
-	const leaf = path.slice(path.lastIndexOf("/") + 1).toLowerCase();
+	const leaf = path.slice(path.lastIndexOf("/") + 1).replace(/[A-Z]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 32));
 	if (leaf.endsWith(".md")) return "markdown";
 	if (leaf.endsWith(".canvas")) return "canvas";
 	return "blob";
@@ -212,8 +219,12 @@ export interface NsFoldState {
 export interface NsFoldIndex {
 	/** pathKey -> docId, live entries only. */
 	readonly byPathKey: Map<PathKey, DocId>;
-	/** Folder pathKey -> number of live entries strictly beneath it. */
-	readonly folderRefs: Map<PathKey, number>;
+	/**
+	 * Folder pathKey -> display casing of that folder prefix (shared by every
+	 * live entry beneath it, DESIGN §c.4 casing rule) and the number of live
+	 * entries strictly beneath it.
+	 */
+	readonly folderRefs: Map<PathKey, { path: VaultPath; count: number }>;
 	/** Count of deleted + merged entries (tombstone pool). */
 	tombstones: number;
 }
@@ -294,6 +305,8 @@ export interface CfgRegister<T> {
 export interface CfgFoldState {
 	readonly formatVersion: 1;
 	coversSeq: Seq;
+	/** Same duplicate-frame ring as NsFoldState (DESIGN §c.3, §c.11). */
+	readonly recentFrames: Map<DeviceId, ClientFrameId[]>;
 	/** Key = file + "\u0000" + topLevelKey. */
 	readonly json: Map<string, CfgRegister<string>>;
 	readonly files: Map<ConfigRelPath, CfgRegister<{ readonly content: CfgFileContent; readonly pluginVersion: string | null }>>;
