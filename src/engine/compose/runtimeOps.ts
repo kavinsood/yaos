@@ -5,6 +5,7 @@
 
 import * as Y from "yjs";
 import { pathKey } from "../../core/paths/pathKey";
+import { EMPTY_CONTENT_HASH } from "../../core/plan/planner";
 import { streamDocId, type DocId, type PathKey, type RemoteEntry, type StreamName, type VaultEpoch, type VaultPath } from "../../core/types";
 import type { EngineResultValue, UserCommand } from "../../protocol/messages";
 import type { DiagnosticsBundle } from "../../protocol/status";
@@ -51,12 +52,18 @@ export async function openDoc(rt: VaultRuntime, path: VaultPath, viewId: number)
  * synced elsewhere with its file still there (the remote moved it onto a file this device has and the mover never
  * saw). Binding then merges one doc's file into another's CRDT. The view waits: `bindable` follows the pass that
  * settles the path, or the host asks again at the path the file moves to.
+ *
+ * Nor while the create's initial content is still missing from the body (another device's frames in flight, or an
+ * own create whose first merge has not run yet, e.g. the re-create right after an epoch migration): the bind-time
+ * merge would take the empty text, with no base, as the other side of a conflict, empty the editor and write it out
+ * as a conflict copy. Same gate as the planner's "body-empty" wait; the pass that fills the body posts `bindable`.
  */
 export function bindTarget(rt: VaultRuntime, key: PathKey): RemoteEntry | undefined {
 	const view = rt.port.view();
 	const id = view.remoteByPathKey.get(key);
 	const e = id ? view.remote.get(id) : undefined;
 	if (!e || e.state !== "live") return undefined;
+	if (e.body !== null && !e.body.hasContent && e.createHash !== EMPTY_CONTENT_HASH) return undefined;
 	const ctx = rt.rec.ctx;
 	const s = ctx.synced(e.docId);
 	if (s && s.pathKey !== key && ctx.local.has(s.pathKey)) return undefined;

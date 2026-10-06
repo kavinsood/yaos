@@ -184,3 +184,55 @@ test("relay epoch reset (§c.12): both devices migrate, re-upload, and keep sync
 	assert.equal(o.error, null);
 	assert.deepEqual(o.docs.map((x) => [x.path, x.text]).sort(), want, "the new epoch holds the whole vault");
 });
+
+test("IndexedDB evicted after an own edit reached the relay but not the disk: recovery writes it to disk", async () => {
+	// Sim seed 690 F DEV3. Every row of x.md is A's own, so reading the stream back after the wipe does not move
+	// bodyVersion.remoteSeq. A mirror-imported sync point that kept remoteSeq read as "remote unchanged" (Rc false),
+	// and the disk, equal to S, never got the typed text the relay and B hold (§i.5: import with bodyVersion null).
+	const { clock, devs } = world();
+	const [a, b] = pair(devs);
+	a.vault.userWrite("x.md", "one\n");
+	await boot(clock, devs);
+	await clock.advance(10_000); // synced, mirrors written
+	const v = a.workspace.openFile("x.md");
+	assert.ok(v);
+	await clock.advance(1_000);
+	assert.ok(v.isBound(), "bound");
+	v.edit(3, 0, " typed");
+	await clock.advance(1_000); // frame acked; the editor's 2 s save has not run
+	assert.equal(a.vault.textOf("x.md"), "one\n");
+	assert.equal(b.vault.textOf("x.md"), "one typed\n");
+	a.crashApp({ wipe: true });
+	await clock.advance(1_000);
+	void a.restartApp();
+	await clock.advance(30_000);
+	for (const d of [a, b]) {
+		assert.deepEqual([...d.vault.snapshot().entries()], [["x.md", "one typed\n"]], `${d.name}`);
+		assert.equal(d.vault.trashed.length, 0);
+	}
+});
+
+test("epoch reset with the note open: the view re-binds once the re-create holds the text, no conflict copy", async () => {
+	// The restart re-opens bound views at once. openDoc bound the own re-create (or the winner, whose frames were
+	// in flight) while its body was still empty: the bind-time merge, with no base, took "" as the other side of a
+	// conflict, emptied the editor and wrote the editor's text out as a conflict copy.
+	const { clock, net, devs } = world();
+	const [a, b] = pair(devs);
+	a.vault.userWrite("x.md", "one\n");
+	await boot(clock, devs);
+	await clock.advance(10_000);
+	assert.equal(b.vault.textOf("x.md"), "one\n");
+	const views = [a.workspace.openFile("x.md"), b.workspace.openFile("x.md")];
+	await clock.advance(1_000);
+	for (const v of views) assert.ok(v?.isBound(), "bound");
+
+	net.relay.resetEpoch("sim-epoch-2" as VaultEpoch);
+	await clock.advance(30_000);
+	for (const v of views) assert.ok(v?.isBound(), "bound again after the migration");
+	views[0]?.edit(3, 0, " typed");
+	await clock.advance(10_000);
+	for (const d of [a, b]) assert.deepEqual([...d.vault.snapshot().entries()], [["x.md", "one typed\n"]], `${d.name}`);
+	for (const v of views) assert.equal(v?.getText(), "one typed\n");
+	const o = await net.oracle();
+	assert.deepEqual(o.docs.map((x) => [x.path, x.text]), [["x.md", "one typed\n"]]);
+});
