@@ -596,6 +596,21 @@ Raised during the fold, now resolved:
   rewrite: config-DO-run steps, alarm resume, `pending_restore_id` marker, re-rewind on writes, authority freeze,
   flag TTL, PK reservation, synchronous 200, error codes.
 
+P1 gap calls (accepted by the coordinator; each is marked `DECISIONS-GAP` in code):
+
+- G1 No `update-manifest.json` in the release (§1 removes update-metadata).
+- G2 Config DDL runs on the singleton's first construction.
+- G3 `shared/socketLiveness.ts` trimmed to what the relay uses (semanticEpoch is gone).
+- G4 `version.ts` keeps only `SERVER_VERSION`.
+- G5 `/enroll` body cap 64 KiB (same as claim).
+- G6 `:deviceId` path segment uses the legacy enroll deviceId pattern.
+- G7 `GET /` and `GET /mobile-setup` are placeholders until P4.
+- G8 Unexpected Worker failure → `500 internal_error`.
+- G9 Non-JSON enroll body → `400 invalid_code`.
+- G10 The Worker checks `streamsVersion` before forwarding; the ticket is checked in the vault DO.
+- G11 Malformed blob address → `400 invalid_address`.
+- G12 `compatibility_date = "2026-04-07"` (`web_socket_auto_reply_to_close` on); wrangler 4.147.0.
+
 ## 9. Work plan
 
 | Phase | Work | Exit criterion |
