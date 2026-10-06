@@ -45,3 +45,23 @@ test("openDoc: a path the remote moved a doc onto, holding a file of this device
 	assert.equal(v.path, "r7 (2).md");
 	assert.equal(v.getText(), "two\n");
 });
+
+test("bindTarget: a doc whose delete waits (fileGone) does not bind at its synced path; at its remote path the file is its own", async () => {
+	const { bindTarget } = await import("./runtimeOps");
+	const live = (docId: string, path: string) => ({ docId, path, pathKey: path, state: "live", createHash: "h0", body: { hasContent: true } });
+	const fake = (remote: ReturnType<typeof live>[], synced: { docId: string; pathKey: string; fileGone?: true }[], local: string[]) => {
+		const s = new Map(synced.map((e) => [e.docId, e]));
+		return {
+			port: { view: () => ({ remote: new Map(remote.map((r) => [r.docId, r])), remoteByPathKey: new Map(remote.map((r) => [r.pathKey, r.docId])) }) },
+			rec: { ctx: { synced: (id: string) => s.get(id), local: new Map(local.map((k) => [k, {}])), store: { synced: s } } },
+		} as never;
+	};
+	// gone at a.md, the doc still live there: a file at a.md is new
+	assert.equal(bindTarget(fake([live("d1", "a.md")], [{ docId: "d1", pathKey: "a.md", fileGone: true }], ["a.md"]), "a.md" as never), undefined);
+	// gone at a.md, the doc moved to b.md (an own rename marked offline): the file at b.md is the doc's, a new file at a.md does not block it
+	const moved = fake([live("d1", "b.md")], [{ docId: "d1", pathKey: "a.md", fileGone: true }], ["a.md", "b.md"]);
+	assert.equal(bindTarget(moved, "b.md" as never)?.docId, "d1");
+	// not gone: the doc's file still at a.md blocks the bind at b.md (the planner has not moved it yet)
+	const notGone = fake([live("d1", "b.md")], [{ docId: "d1", pathKey: "a.md" }], ["a.md", "b.md"]);
+	assert.equal(bindTarget(notGone, "b.md" as never), undefined);
+});

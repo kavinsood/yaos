@@ -58,8 +58,8 @@ export async function openDoc(rt: VaultRuntime, path: VaultPath, viewId: number)
  * merge would take the empty text, with no base, as the other side of a conflict, empty the editor and write it out
  * as a conflict copy. Same gate as the planner's "body-empty" wait; the pass that fills the body posts `bindable`.
  *
- * Nor a doc whose delete is decided and waits on its own body records (`fileGone`): a file at the path now is new,
- * and the pass that creates its doc posts `bindable`.
+ * Nor a doc whose delete is decided and waits on its own body records (`fileGone`), at its synced path: a file there
+ * now is new, and the pass that creates its doc posts `bindable`. At the doc's remote path the file is its own.
  */
 export function bindTarget(rt: VaultRuntime, key: PathKey): RemoteEntry | undefined {
 	const view = rt.port.view();
@@ -69,8 +69,8 @@ export function bindTarget(rt: VaultRuntime, key: PathKey): RemoteEntry | undefi
 	if (e.body !== null && !e.body.hasContent && e.createHash !== EMPTY_CONTENT_HASH) return undefined;
 	const ctx = rt.rec.ctx;
 	const s = ctx.synced(e.docId);
-	if (s?.fileGone) return undefined;
-	if (s && s.pathKey !== key && ctx.local.has(s.pathKey)) return undefined;
+	if (s?.fileGone && s.pathKey === key) return undefined;
+	if (s && !s.fileGone && s.pathKey !== key && ctx.local.has(s.pathKey)) return undefined;
 	if (!ctx.local.has(key)) return e;
 	for (const o of ctx.store.synced.values()) if (o.pathKey === key && o.docId !== e.docId) return undefined;
 	return e;
