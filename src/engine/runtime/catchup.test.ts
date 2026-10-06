@@ -125,3 +125,32 @@ test("union: engine with a local tail below a GC'd checkpoint catches up via che
 		await stopAll(a, b);
 	}
 });
+
+test("catch-up: a body read that finds only own rows still reports the doc (the planner waits on caughtUp)", async () => {
+	// Same deviceId on fresh storage (IndexedDB evicted): every row of the doc is "own", none is foreign and there is
+	// no checkpoint. The read flips the stream to caught up; without onBodyChange nothing re-plans the doc's
+	// body-not-caught-up wait before the periodic full reconcile (minutes), so a local edit to it is not uploaded.
+	const relay = new SimRelay();
+	const { engine: a1 } = await startTestEngine({ relay, deviceId: "dev-a", tuning: { checkpoint: NO_CKPT } });
+	let a2: LogEngine | null = null;
+	try {
+		await live(a1);
+		const id = await a1.createDoc("own.md", "mine");
+		await a1.editDoc(id, (t) => t.insert(t.length, "!"));
+		await converged([a1]);
+		const stream = a1.streamOf(id);
+		await a1.stop();
+		const seen: string[] = [];
+		a2 = (await startTestEngine({ relay, deviceId: "dev-a", tuning: { checkpoint: NO_CKPT }, extra: { onBodyChange: (ids) => seen.push(...ids) } })).engine;
+		const e2 = a2;
+		await live(e2);
+		await until(() => {
+			const r = e2.c.repo.stream(stream);
+			return !!r && r.remoteHeadSeq > 0 && r.appliedSeq >= r.remoteHeadSeq;
+		}, 3_000, "body caught up");
+		assert.equal(await e2.docText(id), "mine!");
+		await until(() => seen.includes(id), 1_000, "onBodyChange for the caught-up doc");
+	} finally {
+		await stopAll(a1, ...(a2 ? [a2] : []));
+	}
+});

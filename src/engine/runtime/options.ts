@@ -101,8 +101,9 @@ export interface EngineOptions {
 	 * Docs whose body changed from outside this engine's own edits: committed
 	 * rows of other devices stored (bodyVersion.remoteSeq moved, resident or
 	 * not), a body checkpoint adopted by a read, a provisional update applied
-	 * (and adopted). Fires after the change is durable / applied; onDocUpdate
-	 * still fires for bound docs.
+	 * (and adopted), and a catch-up read that completed (the body became caught
+	 * up, even from own rows only). Fires after the change is durable / applied;
+	 * onDocUpdate still fires for bound docs.
 	 */
 	onBodyChange?(docIds: readonly DocId[]): void;
 	/** The last own body / canvas record of these docs left the outbox (receipt): own edits are all sequenced. */
