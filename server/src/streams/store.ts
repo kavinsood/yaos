@@ -13,19 +13,8 @@
 // writes 2 rows per touched stream (head UPDATE/INSERT + its last_seq index
 // entry), plus 1 per sealed segment. There is no clock row, receipt row or
 // per-frame row.
+import type { SqlValue, StoragePort } from "../ports";
 import { bytesEqual, decodeRows, encodeRow, type StreamRow } from "./protocol";
-
-/** The subset of DO storage (ctx.storage / NodeSqliteStorage) the streams store uses. */
-export interface StreamStoragePort {
-	sql: {
-		exec<T extends Record<string, SqlStorageValue>>(query: string, ...bindings: unknown[]): {
-			toArray(): T[];
-			one(): T;
-			[Symbol.iterator](): Iterator<T>;
-		};
-	};
-	transactionSync<T>(closure: () => T): T;
-}
 
 /** The open segment is sealed (moved to stream_segment) once it reaches this size. */
 export const STREAM_SEGMENT_SEAL_BYTES = 64 * 1024;
@@ -39,7 +28,11 @@ export const STREAM_CHECKPOINT_CHUNK_BYTES = 1_000_000;
  */
 export const STREAM_DEDUPE_TAIL_ROWS = 64;
 
-const STREAM_SCHEMA = `
+/**
+ * The three stream tables. The vault DO runs this at vault init only (DECISIONS §6.1) and constructs the store with
+ * `schemaReady: true`; a store without that flag (WB tests) runs it lazily on first use.
+ */
+export const STREAM_SCHEMA = `
 	CREATE TABLE IF NOT EXISTS stream_head (
 		stream TEXT NOT NULL PRIMARY KEY,
 		last_seq INTEGER NOT NULL,
@@ -111,7 +104,7 @@ export type StreamCheckpointResult =
 	| { ok: false; status: 409; error: "checkpoint_ahead_of_stream"; lastSeq: number; current: { coversSeq: number } }
 	| { ok: false; status: 400; error: "checkpoint_not_advancing"; current: { coversSeq: number } };
 
-interface HeadRow extends Record<string, SqlStorageValue> {
+interface HeadRow extends Record<string, SqlValue> {
 	last_seq: number;
 	ckpt_seq: number;
 	gc_seq: number;
@@ -159,15 +152,24 @@ function concat(parts: readonly Uint8Array[], size: number): Uint8Array {
 	return out;
 }
 
+export interface StreamStoreOptions {
+	/** The owner has run STREAM_SCHEMA (vault init): the store never runs DDL on a request path. */
+	schemaReady?: boolean;
+}
+
 export class StreamStore {
-	private schemaReady = false;
+	private readonly schemaManaged: boolean;
+	private schemaReady: boolean;
 	private headCache: number | null = null;
 
-	constructor(private readonly storage: StreamStoragePort) {}
+	constructor(private readonly storage: StoragePort, options: StreamStoreOptions = {}) {
+		this.schemaManaged = options.schemaReady === true;
+		this.schemaReady = this.schemaManaged;
+	}
 
 	/** Storage was wiped (vault deleted): forget every cached fact. */
 	reset(): void {
-		this.schemaReady = false;
+		this.schemaReady = this.schemaManaged;
 		this.headCache = null;
 	}
 

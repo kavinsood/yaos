@@ -1,4 +1,4 @@
-// Client remake: opaque streams relay (YAOS_STREAMS, server/src/streams/).
+// Client remake: opaque streams relay (server/src/streams/), white-box through the injected ports.
 // Real SQLite (NodeSqliteStorage) under StreamStore + StreamRelayService with
 // fake sockets and virtual timers. Row accounting uses the Cloudflare billing
 // model (helpers/cfRowModel.ts). Wire contract: docs/client-remake/relay-wire.md.
@@ -10,11 +10,7 @@ import { join } from "node:path";
 import { NodeSqliteStorage } from "./helpers/nodeSqliteStorage";
 import { base64ToBytes } from "../../server/src/base64url";
 import { DailyLimitLatch } from "../../server/src/dailyLimit";
-import { classifyWorkerRoute } from "../../server/src/index";
-import { getCapabilities } from "../../server/src/routes/auth";
-import { createTicket, handleTicketRoute, inspectTicket } from "../../server/src/routes/ticket";
-import type { AuthState, Env } from "../../server/src/routes/types";
-import { capabilityDigestForRole, COLLABORATION_POLICY_VERSION, type VaultActorContext } from "../../server/src/collaboration";
+import type { SocketPort, SocketRegistryPort, StoragePort, TimerPort } from "../../server/src/ports";
 import {
 	MAX_STREAM_BINARY_MESSAGE_BYTES,
 	MAX_STREAM_PAYLOAD_BYTES,
@@ -26,17 +22,15 @@ import {
 	encodeCommitted,
 	encodeProvisional,
 	encodeRow,
-	streamsEnabled,
 } from "../../server/src/streams/protocol";
 import {
 	DEFAULT_STREAM_RELAY_CONFIG,
 	StreamRelayService,
 	readStreamRelayConfig,
+	type StreamActor,
 	type StreamRelayConfig,
-	type StreamTimers,
 } from "../../server/src/streams/relay";
-import { STREAM_SEGMENT_SEAL_BYTES, StreamStore, type StreamStoragePort } from "../../server/src/streams/store";
-import type { VaultSocketPort, VaultSocketRegistryPort } from "../../server/src/vaultSocketService";
+import { STREAM_SEGMENT_SEAL_BYTES, StreamStore } from "../../server/src/streams/store";
 import { CfRowModel } from "./helpers/cfRowModel.ts";
 import { suite } from "../harness.ts";
 
@@ -45,15 +39,15 @@ const s = suite("streams-relay");
 const VAULT_ID = "streams-vault-0001";
 const GENERATION = "streams-generation-0001";
 
-const ownerA: VaultActorContext = { vaultId: VAULT_ID, vaultGeneration: GENERATION, principalId: "principal-a",
+const ownerA: StreamActor = { vaultId: VAULT_ID, vaultGeneration: GENERATION, principalId: "principal-a",
 	membershipRevision: 1, deviceId: "device-a", deviceCredentialRevision: 1, role: "owner",
-	policyVersion: COLLABORATION_POLICY_VERSION, capabilityDigest: "digest" };
-const deviceB: VaultActorContext = { ...ownerA, deviceId: "device-b" };
-const deviceC: VaultActorContext = { ...ownerA, deviceId: "device-c" };
+	policyVersion: 1, capabilityDigest: "digest" };
+const deviceB: StreamActor = { ...ownerA, deviceId: "device-b" };
+const deviceC: StreamActor = { ...ownerA, deviceId: "device-c" };
 
 type Control = Record<string, unknown> & { type: string };
 
-class FakeSocket implements VaultSocketPort {
+class FakeSocket implements SocketPort {
 	readonly binary: Uint8Array[] = [];
 	readonly controls: Control[] = [];
 	closed: { code?: number; reason?: string } | null = null;
@@ -80,16 +74,16 @@ class FakeSocket implements VaultSocketPort {
 	}
 }
 
-class FakeRegistry implements VaultSocketRegistryPort {
+class FakeRegistry implements SocketRegistryPort {
 	readonly list: FakeSocket[] = [];
 	lastClient: FakeSocket | null = null;
-	sockets(): readonly VaultSocketPort[] { return this.list.filter((socket) => !socket.closed); }
+	sockets(): readonly SocketPort[] { return this.list.filter((socket) => !socket.closed); }
 	createPair() { const server = new FakeSocket(); return { client: server, server }; }
-	accept(socket: VaultSocketPort): void { this.list.push(socket as FakeSocket); }
+	accept(socket: SocketPort): void { this.list.push(socket as FakeSocket); }
 	upgradeResponse(client: unknown): Response { this.lastClient = client as FakeSocket; return new Response(null, { status: 200 }); }
 }
 
-class VirtualTimers implements StreamTimers {
+class VirtualTimers implements TimerPort {
 	now = 1_000_000;
 	private nextId = 0;
 	private readonly timers = new Map<number, { at: number; callback: () => void }>();
@@ -125,7 +119,7 @@ interface Harness {
 	latch: DailyLimitLatch;
 	revoked: Set<string>;
 	failWrites: { on: boolean };
-	connect(actor?: VaultActorContext, canWrite?: boolean): FakeSocket;
+	connect(actor?: StreamActor, canWrite?: boolean): FakeSocket;
 	append(socket: FakeSocket, stream: string, clientFrameId: string, payload: Uint8Array | string): void;
 	/** A new runtime over the same storage and sockets (hibernation wake / eviction). */
 	fresh(runtimeEpoch: string): StreamRelayService;
@@ -142,7 +136,7 @@ async function withStreams(check: (harness: Harness) => void | Promise<void>, co
 	const sqlite = NodeSqliteStorage.open(join(directory, "vault.sqlite"));
 	const model = new CfRowModel(sqlite);
 	const failWrites = { on: false };
-	const storage: StreamStoragePort = {
+	const storage: StoragePort = {
 		sql: {
 			exec: (query: string, ...bindings: unknown[]) => {
 				if (failWrites.on && /^\s*(INSERT|UPDATE|DELETE)/i.test(query)) throw new Error(DAILY_LIMIT_MESSAGE);
@@ -168,7 +162,7 @@ async function withStreams(check: (harness: Harness) => void | Promise<void>, co
 		vaultId: () => VAULT_ID,
 		vaultGeneration: () => GENERATION,
 		runtimeEpoch,
-		now: () => timers.now,
+		clock: { now: () => timers.now },
 		timers,
 	});
 	const harness: Harness = {
@@ -228,50 +222,12 @@ s.test("codec: APPEND round-trips; malformed, trailing, invalid names and oversi
 		rows.map((row) => ({ ...row, payload: [...row.payload] })));
 });
 
-s.test("flag, capabilities, routes and config: inert unless YAOS_STREAMS is exactly \"true\"", () => {
-	assert.equal(streamsEnabled({ YAOS_STREAMS: "true" }), true);
-	assert.equal(streamsEnabled({ YAOS_STREAMS: "1" }), false);
-	assert.equal(streamsEnabled({}), false);
-	const auth: AuthState = { mode: "unclaimed", claimed: false };
-	const off = getCapabilities(auth, {} as Env);
-	assert.equal("streams" in off, false, "flag-off capabilities unchanged");
-	assert.equal(getCapabilities(auth, { YAOS_STREAMS: "true" } as Env).streams, 1);
-	const base = "https://example.test/vault/vault-route-0001";
-	for (const [method, path] of [["GET", "/ws/streams"], ["GET", "/streams/feed"], ["GET", "/streams/read"], ["PUT", "/streams/checkpoint"]] as const) {
-		const request = new Request(`${base}${path}`, { method });
-		assert.equal(classifyWorkerRoute(request, new URL(request.url), false, false).kind, "not-found", `${method} ${path} off`);
-		assert.equal(classifyWorkerRoute(request, new URL(request.url), false, true).kind, "vault", `${method} ${path} on`);
-	}
-	for (const [method, path] of [["POST", "/streams/feed"], ["GET", "/streams/checkpoint"], ["GET", "/streams/other"], ["GET", "/ws/streams/x"]] as const) {
-		const request = new Request(`${base}${path}`, { method });
-		assert.equal(classifyWorkerRoute(request, new URL(request.url), false, true).kind, "not-found", `${method} ${path}`);
-	}
-	const config = readStreamRelayConfig({ YAOS_STREAMS: "true", YAOS_STREAMS_BURST_BYTES: "10" });
+s.test("config: env overrides are clamped; the burst holds one maximum message", () => {
+	const config = readStreamRelayConfig({ YAOS_STREAMS_BURST_BYTES: "10" });
 	assert.equal(config.burstBytes, MAX_STREAM_BINARY_MESSAGE_BYTES, "burst floored at one max message");
 	assert.equal(config.gcIdleMs, 300);
 	assert.equal(config.gcMaxMs, 1500);
 	assert.equal(config.gcMaxBytes, 64 * 1024);
-});
-
-s.test("tickets: purpose streams signs and inspects; other scopes do not open a streams socket", async () => {
-	const auth: AuthState = { mode: "claim", claimed: true, operatorRecoveryHash: "hash", ticketSigningKey: "streams-test-key" };
-	const actor = { ...ownerA, capabilityDigest: await capabilityDigestForRole("owner") };
-	const response = await handleTicketRoute(new Request("https://example.test/ticket", { method: "POST",
-		body: JSON.stringify({ purpose: "streams" }) }), auth, actor, (body, status = 200) => Response.json(body, { status }));
-	assert.equal(response.status, 200);
-	const { ticket } = await response.json() as { ticket: string };
-	const payload = await inspectTicket(ticket, auth, { vaultId: VAULT_ID, purpose: "streams", documentId: "streams" });
-	assert.equal(payload?.purpose, "streams");
-	assert.equal(payload?.deviceId, "device-a");
-	assert.equal(await inspectTicket(ticket, auth, { vaultId: VAULT_ID, purpose: "root", documentId: "root" }), null);
-	const root = await createTicket(auth, actor, { purpose: "root", documentId: "root", rootEpoch: 1 });
-	assert.equal(await inspectTicket(root.ticket, auth, { vaultId: VAULT_ID, purpose: "streams", documentId: "streams" }), null);
-	const bad = await handleTicketRoute(new Request("https://example.test/ticket", { method: "POST",
-		body: JSON.stringify({ purpose: "streams", documentId: "root" }) }), auth, actor, (body, status = 200) => Response.json(body, { status }));
-	assert.equal(bad.status, 400);
-	const body = await createTicket(auth, actor, { purpose: "body", documentId: "streams", bodyEpoch: 1 });
-	assert.equal((await inspectTicket(body.ticket, auth, { vaultId: VAULT_ID, purpose: "body", documentId: "streams", bodyEpoch: 1 }))?.purpose,
-		"body", "a body named \"streams\" keeps working");
 });
 
 // ---- live path ------------------------------------------------------------------

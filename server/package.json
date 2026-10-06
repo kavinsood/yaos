@@ -17,9 +17,9 @@
 		"yjs": "^13.6.20"
 	},
 	"devDependencies": {
-		"@cloudflare/workers-types": "4.20260305.0",
+		"@cloudflare/workers-types": "5.20261001.1",
 		"typescript": "^5.8.3",
-		"wrangler": "4.69.0"
+		"wrangler": "4.147.0"
 	},
 	"overrides": {
 		"nanoid": "5.1.16"
