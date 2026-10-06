@@ -8,7 +8,7 @@
  * load can retry it once) and removes it on a definitive refusal. Nothing here logs it.
  */
 
-import { sanitizeDeviceLabel, type PairedIdentity, type YaosPluginData, type YaosUiHost } from "./api";
+import { sameIdentity, sanitizeDeviceLabel, type PairedIdentity, type YaosPluginData, type YaosUiHost } from "./api";
 import {
 	attemptMatches, pairDevice, prepareEnrollment, PairingError, runEnrollment,
 	type EnrollInput, type EnrollmentAttempt, type PairingDeps,
@@ -101,21 +101,23 @@ export function clearIdentity(data: YaosPluginData): YaosPluginData {
 }
 
 export type ResumedEnrollment =
-	| { readonly ok: true; readonly identity: PairedIdentity }
+	/** `replaced`: the identity this one replaced (to revoke on its server), else null. */
+	| { readonly ok: true; readonly identity: PairedIdentity; readonly replaced: PairedIdentity | null }
 	| { readonly ok: false; readonly error: unknown; readonly final: boolean };
 
 /**
  * On load: one more try of the enrollment a previous session sent without seeing the answer.
  * Success stores the identity; a definitive refusal drops the attempt; anything else keeps it for
- * the next load. Returns null when nothing was pending.
+ * the next load. Returns null when nothing was pending. The caller revokes `replaced` on its server
+ * (retireDeviceEnrollment), as PairModal does when a pairing replaces another.
  */
 export async function resumePendingEnrollment(host: Pick<YaosUiHost, "data" | "updateData">, deps: PairingDeps): Promise<ResumedEnrollment | null> {
-	const pending = host.data().pendingEnrollment;
+	const { pendingEnrollment: pending, identity: previous } = host.data();
 	if (!pending) return null;
 	try {
 		const identity = await runEnrollment(pending, deps);
 		await host.updateData((d) => applyPairedIdentity(d, identity));
-		return { ok: true, identity };
+		return { ok: true, identity, replaced: previous && !sameIdentity(previous, identity) ? previous : null };
 	} catch (error) {
 		const final = enrollmentFailureIsFinal(error);
 		if (final) await host.updateData((d) => withoutPendingEnrollment(d, pending.enrollmentRequestId));

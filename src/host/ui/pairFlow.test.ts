@@ -135,6 +135,16 @@ test("resumePendingEnrollment sends the stored attempt once with the identical i
 	assert.deepEqual([body?.enrollmentRequestId, body?.deviceId, body?.deviceToken], [attempt.enrollmentRequestId, attempt.deviceId, attempt.deviceToken]);
 	assert.equal(h.data().identity?.deviceToken, attempt.deviceToken);
 	assert.equal(h.data().pendingEnrollment, undefined);
+	assert.equal(r?.ok && r.replaced, null, "nothing was paired before");
+});
+
+test("resumePendingEnrollment reports the identity it replaced, for the caller to revoke", async () => {
+	const old: PairedIdentity = { host: "https://old.example", vaultId: "v0", deviceId: "dev_OLDOLDOLDOLDOLDO", deviceToken: "o".repeat(43), deviceName: "Mac", vaultGeneration: null };
+	const h = memHost({ ...pendingData(), identity: old });
+	const r = await resumePendingEnrollment(h, scripted([okEnroll]).deps);
+	assert.ok(r?.ok);
+	assert.equal(r.replaced, old);
+	assert.equal(h.data().identity?.vaultId, "vault-1");
 });
 
 test("resumePendingEnrollment keeps the attempt on a server error, drops it on a refusal; nothing pending sends nothing", async () => {
